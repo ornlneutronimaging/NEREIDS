@@ -1662,14 +1662,15 @@ impl TabulatedResolution {
     /// which generates `(tof_offset_µs, weight)` kernels at a set of reference
     /// energies and then rides the exact same broadening machinery as a
     /// Monte-Carlo file. Validates the same invariants `from_text` enforces:
-    /// non-empty, strictly ascending reference energies, one kernel per energy,
-    /// and matching offset/weight lengths within each kernel.
+    /// non-empty + strictly ascending reference energies, one kernel per energy,
+    /// each kernel non-empty with matching offset/weight lengths, and all-finite
+    /// offsets/weights.
     ///
     /// # Errors
     /// Returns [`ResolutionParseError::InvalidFormat`] if the reference
     /// energies are empty / not strictly ascending, if the energy and kernel
-    /// counts differ, or if any kernel's offset and weight vectors differ in
-    /// length.
+    /// counts differ, if any kernel is empty, if a kernel's offset and weight
+    /// vectors differ in length, or if any offset/weight is non-finite.
     pub fn from_kernels(
         ref_energies: Vec<f64>,
         kernels: Vec<(Vec<f64>, Vec<f64>)>,
@@ -1699,6 +1700,14 @@ impl TabulatedResolution {
             }
         }
         for (i, (offsets, weights)) in kernels.iter().enumerate() {
+            // Reject empty kernels: an empty `(offsets, weights)` passes the
+            // length-match check (0 == 0) but later makes `broaden_presorted`
+            // accumulate `norm == 0` and silently fall back to pass-through.
+            if offsets.is_empty() {
+                return Err(ResolutionParseError::InvalidFormat(format!(
+                    "Kernel {i} is empty; each kernel needs at least one (offset, weight) point"
+                )));
+            }
             if offsets.len() != weights.len() {
                 return Err(ResolutionParseError::InvalidFormat(format!(
                     "Kernel {i} offset length {} != weight length {}",
@@ -2659,6 +2668,22 @@ mod tests {
                 "expected InvalidWidthCorrection for s0={s0}, p={p}, e_ref={e_ref}"
             );
         }
+    }
+
+    #[test]
+    fn from_kernels_rejects_empty_kernel() {
+        // An empty kernel passes the length-match check (0 == 0) but makes
+        // broadening silently fall back to pass-through; reject it up front.
+        let err = TabulatedResolution::from_kernels(vec![10.0], vec![(vec![], vec![])], 25.0);
+        assert!(
+            matches!(err, Err(ResolutionParseError::InvalidFormat(_))),
+            "empty kernel should be rejected, got {err:?}"
+        );
+        // A non-empty kernel still constructs fine.
+        assert!(
+            TabulatedResolution::from_kernels(vec![10.0], vec![(vec![0.0], vec![1.0])], 25.0)
+                .is_ok()
+        );
     }
 
     // ── Smoke tests for the test_support oracles (`interp_spectrum` +
