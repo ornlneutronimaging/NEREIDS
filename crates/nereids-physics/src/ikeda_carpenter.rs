@@ -59,13 +59,13 @@
 //! `t_r+τ`, apparent energy `E' = (TOF_FACTOR·L/(t_r+τ))²`. Sampling `I(τ)` on
 //! a τ-grid and mapping to TOF-offsets yields exactly the `(offset, weight)`
 //! kernel representation that [`crate::resolution::TabulatedResolution`]
-//! consumes — so IC rides the *same* verified broadening machinery (the
-//! log-energy interref interpolation is moot for IC, which evaluates a kernel
-//! directly at every reference energy on a dense grid). The kernel is anchored
-//! with its **mode at offset 0** (peak-centering): with the TOF energy-scale
-//! `t0/L` fit separately to resonance positions, mode-centering keeps the
-//! broadened peak at the nominal energy, whereas mean-centering would force
-//! `t0/L` to absorb the IC skewness.
+//! consumes — so IC rides the *same* verified broadening machinery. The
+//! log-energy interref interpolation still acts at apply time, but IC synthesizes
+//! a dense reference grid (default 64 energies), so the interpolation error
+//! between adjacent references is negligible. The kernel is anchored with its
+//! **mode at offset 0** (peak-centering); `interpolated_kernel` does not
+//! re-center it, so — with the TOF energy-scale `t0/L` fit separately to
+//! resonance positions — the broadened peak stays at the nominal energy.
 //!
 //! ## Optional instrument convolutions
 //!
@@ -315,6 +315,19 @@ impl IkedaCarpenter {
         let ref_energies: Vec<f64> = (0..grid.n_energies)
             .map(|i| (ln_lo + (i as f64 / denom) * (ln_hi - ln_lo)).exp())
             .collect();
+
+        // Reject parameter laws that yield a non-positive fast rate α(E): the
+        // pulse would otherwise degenerate (synthesis clamps α to a tiny floor,
+        // producing a meaningless near-flat kernel rather than failing loudly).
+        if let Some(&bad) = ref_energies.iter().find(|&&e| {
+            let a = params.alpha.eval(e);
+            !a.is_finite() || a <= 0.0
+        }) {
+            return Err(ResolutionParseError::InvalidFormat(format!(
+                "Ikeda–Carpenter α(E) must be > 0, but α({bad}) = {} is not",
+                params.alpha.eval(bad)
+            )));
+        }
 
         let kernels: Vec<(Vec<f64>, Vec<f64>)> = ref_energies
             .iter()
@@ -697,6 +710,12 @@ mod tests {
         };
         assert!(IkedaCarpenter::new(p.clone(), 25.0, &bad).is_err());
         assert!(IkedaCarpenter::new(p, -1.0, &SynthesisGrid::new(1.0, 10.0)).is_err());
+        // A parameter law that yields α(E) ≤ 0 is rejected, not silently clamped.
+        let neg_alpha = IkedaCarpenterParams {
+            alpha: EnergyLaw::Const(-1.0),
+            ..IkedaCarpenterParams::constant(1.0, 0.1, 0.0)
+        };
+        assert!(IkedaCarpenter::new(neg_alpha, 25.0, &SynthesisGrid::new(1.0, 100.0)).is_err());
     }
 
     #[test]

@@ -21,7 +21,9 @@
 //! - **UddCorr** — fit a shape-preserving width correction `s(E)=s0·(E/Eref)^p`
 //!   on a base tabulated UDD ([`TabulatedResolution::width_corrected`]); trusts
 //!   the Monte-Carlo shape, calibrates its width/energy-dependence.
-//! - **IkedaCarpenter** — fit `α(E)=a0√E+a1` and `β` (free analytic shape).
+//! - **IkedaCarpenter** — fit `α(E)=a0√E+a1` (free analytic prompt-width shape);
+//!   `β` is held fixed because `R≈0` in the eV regime makes the storage term, and
+//!   hence `β`, unidentifiable.
 
 use std::sync::Arc;
 
@@ -39,6 +41,10 @@ const UDD_E_REF: f64 = 10.0;
 /// Width-scale clamp for the UDD correction (`s0 = clamp(exp(log_s0), …)`).
 const UDD_S0_MIN: f64 = 0.2;
 const UDD_S0_MAX: f64 = 5.0;
+/// Fixed storage rate for the IC calibration family. `R(E)≈0` across the eV
+/// resonance regime makes the slow/storage term — and hence `β` — unidentifiable,
+/// so it is held fixed rather than reported as a meaningless fit result.
+const IC_FIXED_BETA: f64 = 0.1;
 
 /// The resolution-model family to calibrate.
 #[derive(Debug, Clone)]
@@ -50,7 +56,8 @@ pub enum ResolutionFamily {
         /// Base Monte-Carlo kernel to correct.
         base: Arc<TabulatedResolution>,
     },
-    /// Ikeda–Carpenter: fit `(a0, a1, β)` with `α(E)=a0√E+a1`.
+    /// Ikeda–Carpenter: fit `(a0, a1)` with `α(E)=a0√E+a1`; `β` held fixed
+    /// (`IC_FIXED_BETA`) because it is unidentifiable in the eV regime.
     IkedaCarpenter,
 }
 
@@ -59,8 +66,9 @@ impl ResolutionFamily {
     #[must_use]
     pub fn n_params(&self) -> usize {
         match self {
-            ResolutionFamily::Gaussian | ResolutionFamily::UddCorr { .. } => 2,
-            ResolutionFamily::IkedaCarpenter => 3,
+            ResolutionFamily::Gaussian
+            | ResolutionFamily::UddCorr { .. }
+            | ResolutionFamily::IkedaCarpenter => 2,
         }
     }
 
@@ -84,10 +92,7 @@ impl ResolutionFamily {
                     vec![(UDD_S0_MIN.ln(), UDD_S0_MAX.ln()), (-4.0, 4.0)],
                 )
             }
-            ResolutionFamily::IkedaCarpenter => (
-                vec![0.30, 0.0, 0.10],
-                vec![(0.01, 5.0), (-2.0, 2.0), (1e-3, 2.0)],
-            ),
+            ResolutionFamily::IkedaCarpenter => (vec![0.30, 0.0], vec![(0.01, 5.0), (-2.0, 2.0)]),
         }
     }
 }
@@ -166,12 +171,15 @@ fn build_resolution(
             Ok(ResolutionFunction::Tabulated(Arc::new(corrected)))
         }
         ResolutionFamily::IkedaCarpenter => {
+            // R(E)=exp(-E_meV/25) -> ~0 across the eV resonance regime, so the
+            // slow/storage term vanishes and β is unidentifiable; hold β fixed
+            // and fit only the prompt-width law α(E)=a0·√E + a1.
             let params = IkedaCarpenterParams {
                 alpha: EnergyLaw::SqrtE {
                     a0: theta[0].abs(),
                     a1: theta[1],
                 },
-                beta: theta[2].abs().max(1e-3),
+                beta: IC_FIXED_BETA,
                 r: EnergyLaw::ExpMilliEv { kappa: 25.0 },
                 burst_sigma_us: None,
                 channel_fwhm_us: None,
@@ -300,6 +308,17 @@ pub fn calibrate_resolution(
             field: "energies/unc vs data",
         });
     }
+    // Reject non-finite inputs up front: a NaN datum would otherwise propagate
+    // to a NaN χ², and since `NaN < x` is false the optimizer could retain it as
+    // "best" and return a NaN-objective fit silently.
+    if !energies.iter().all(|v| v.is_finite())
+        || !data.iter().all(|v| v.is_finite())
+        || !unc.iter().all(|v| v.is_finite() && *v > 0.0)
+    {
+        return Err(FittingError::InvalidConfig(
+            "energies, data must be finite and uncertainty finite and > 0".into(),
+        ));
+    }
     let e_min = energies.first().copied().unwrap_or(1.0);
     let e_max = energies.last().copied().unwrap_or(1.0);
     let (x0, bounds) = family.x0_bounds();
@@ -367,6 +386,12 @@ mod tests {
 
     #[test]
     fn udd_corr_recovers_known_width_scale() {
+        // Loop-closure / OPTIMIZER test: truth and fit both use width_corrected, so
+        // this checks that the calibrator finds the s0=1.5 minimum — NOT that
+        // width_corrected itself is physically correct. The width-scale physics
+        // (centroid invariance + std scaling) is independently verified by
+        // `width_corrected_preserves_centroid_scales_width_and_energy_dependence`
+        // in nereids-physics.
         // Synthetic Hf-178-like resonance at 20 eV; calibrant generated with a
         // UDD truth scaled by s0=1.5; udd_corr must recover s0≈1.5 at χ²≈0.
         let iso = synthetic_isotope(72, 178, 20.0, 0.05, 0.06);
@@ -424,7 +449,7 @@ mod tests {
             let label = fam.label().to_string();
             let r = calibrate_resolution(fam, &energies, &data, &unc, &sample, &cfg).unwrap();
             assert!(r.chi2_dof.is_finite(), "{label} χ² not finite");
-            assert_eq!(r.theta.len(), if label == "ic" { 3 } else { 2 });
+            assert_eq!(r.theta.len(), 2, "{label} should fit 2 params");
         }
     }
 
@@ -438,11 +463,12 @@ mod tests {
             .n_params(),
             2
         );
-        assert_eq!(ResolutionFamily::IkedaCarpenter.n_params(), 3);
+        // IC fits only (a0, a1); β is held fixed (unidentifiable in the eV regime).
+        assert_eq!(ResolutionFamily::IkedaCarpenter.n_params(), 2);
     }
 
     #[test]
-    fn rejects_empty_and_mismatched_inputs() {
+    fn rejects_empty_mismatched_and_non_finite_inputs() {
         let iso = synthetic_isotope(72, 178, 20.0, 0.05, 0.06);
         let sample = SampleParams::new(300.0, vec![(iso, 2.0e-3)]).unwrap();
         let cfg = CalibrationConfig::default();
@@ -456,6 +482,30 @@ mod tests {
         assert!(matches!(
             calibrate_resolution(ResolutionFamily::Gaussian, &e, &d, &u, &sample, &cfg),
             Err(FittingError::LengthMismatch { .. })
+        ));
+        // Non-finite data and non-positive uncertainty are rejected up front.
+        let e = vec![1.0, 2.0, 3.0];
+        assert!(matches!(
+            calibrate_resolution(
+                ResolutionFamily::Gaussian,
+                &e,
+                &[0.5, f64::NAN, 0.7],
+                &[0.1; 3],
+                &sample,
+                &cfg
+            ),
+            Err(FittingError::InvalidConfig(_))
+        ));
+        assert!(matches!(
+            calibrate_resolution(
+                ResolutionFamily::Gaussian,
+                &e,
+                &[0.5; 3],
+                &[0.1, 0.0, 0.1],
+                &sample,
+                &cfg
+            ),
+            Err(FittingError::InvalidConfig(_))
         ));
     }
 

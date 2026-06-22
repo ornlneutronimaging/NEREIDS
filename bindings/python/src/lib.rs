@@ -1166,9 +1166,9 @@ impl PyResolutionCalibration {
                 d.set_item("delta_l_m", self.inner.theta[1].abs())?;
             }
             _ => {
+                // IC fits (a0, a1); β is held fixed (unidentifiable in the eV regime).
                 d.set_item("a0", self.inner.theta[0].abs())?;
                 d.set_item("a1", self.inner.theta[1])?;
-                d.set_item("beta", self.inner.theta[2].abs())?;
             }
         }
         Ok(d)

@@ -856,11 +856,9 @@ impl TabulatedResolution {
     /// Shape-preserving instrument-resolution calibration knob: each
     /// reference-energy block's TOF offsets are scaled by
     /// `s(E) = s0 · (E / e_ref)^p` **about the block's intensity centroid**, so
-    /// the kernel widens/narrows without moving the resonance position. Weights
-    /// are unchanged (the apply-time trapezoidal renormalization preserves unit
-    /// area, and the apply-time mean-centering — see `interpolated_kernel` —
-    /// makes the absolute offset position irrelevant, so width and position stay
-    /// orthogonal; `t0`/`L` handle absolute position).
+    /// the kernel widens/narrows without moving its centroid — width and position
+    /// stay orthogonal (`t0`/`L` handle absolute position). Weights are unchanged;
+    /// the apply-time trapezoidal renormalization preserves unit area.
     ///
     /// `s0 = 1, p = 0` returns a width-identical copy. This is the fittable model
     /// behind the `udd_corr` resolution-calibration family: it trusts the
@@ -973,11 +971,14 @@ impl TabulatedResolution {
 /// than a deep copy.
 ///
 /// `IkedaCarpenter` synthesizes a [`TabulatedResolution`] at construction and
-/// is applied through the *same* convolution path as `Tabulated` — only the
-/// kernel *source* differs (analytic IC pulse vs Monte-Carlo file). This is
-/// deliberate: it keeps the three-way resolution cross-validation
-/// (Gaussian | tabulated-UDD | Ikeda–Carpenter) fair, with identical
-/// application machinery for the two kernel-based models.
+/// is applied through the *same* per-call convolution path as `Tabulated`
+/// (`broaden` / `broaden_presorted` / `plan`) — only the kernel *source* differs
+/// (analytic IC pulse vs Monte-Carlo file). This keeps the three-way resolution
+/// cross-validation (Gaussian | tabulated-UDD | Ikeda–Carpenter) fair on the
+/// reference broadening path. Note: `IkedaCarpenter` does **not** opt into the
+/// spatial-map surrogate fast-paths (the scalar/cubature plans gate on
+/// `Tabulated`); it falls back to the general path, which is correct but
+/// unoptimized — see the resolution-calibration notes for the W6 follow-up.
 #[derive(Debug, Clone)]
 pub enum ResolutionFunction {
     /// Analytical Gaussian resolution from instrument parameters.
@@ -2039,19 +2040,13 @@ impl TabulatedResolution {
         let e_lo = self.ref_energies[idx];
         let e_hi = self.ref_energies[idx + 1];
 
-        // Linear-energy interpolation fraction — matches SAMMY's UDR kernel
-        // interpolation, which is linear in BOTH time and energy
-        // (sammy/src/udr/mudr3.f90:246-251; manual exp-conditions.tex:1914).
-        // Previously this was log-energy; with only ~25 widely-spaced references
-        // the log vs linear weight diverges most where references are far apart
-        // (7-10 eV), driving the ~2.5% overall / 5-13% local NEREIDS-vs-SAMMY
-        // broadening mismatch.
-        let frac = (energy - e_lo) / (e_hi - e_lo);
+        // Log-space interpolation fraction
+        let frac = (energy.ln() - e_lo.ln()) / (e_hi.ln() - e_lo.ln());
 
         let (off_lo, w_lo) = &self.kernels[idx];
         let (off_hi, w_hi) = &self.kernels[idx + 1];
 
-        let (mut offsets, weights) = if off_lo.len() == off_hi.len() {
+        let (offsets, weights) = if off_lo.len() == off_hi.len() {
             // Both kernels have the same number of points: interpolate element-wise.
             let offsets: Vec<f64> = off_lo
                 .iter()
@@ -2074,25 +2069,6 @@ impl TabulatedResolution {
             (k.0.clone(), k.1.clone())
         };
 
-        // Re-zero the interpolated kernel to its weighted centroid so resolution
-        // BROADENS without shifting the mean (SAMMY udr/mudr3.f90:268-292). The
-        // tabulated kernels are peak-centred (peak at offset 0) but carry a positive
-        // first moment from the moderator decay tail; without this, broadening
-        // introduces an energy-dependent TOF shift (~0.3% at the resonances) that the
-        // energy-scale (t0/L_scale) cannot absorb. The offset grid is uniform within
-        // each kernel, so the weighted mean is the trapezoidal centroid.
-        let wsum: f64 = weights.iter().sum();
-        if wsum > 0.0 {
-            let centroid: f64 = offsets
-                .iter()
-                .zip(weights.iter())
-                .map(|(&o, &w)| o * w)
-                .sum::<f64>()
-                / wsum;
-            for o in offsets.iter_mut() {
-                *o -= centroid;
-            }
-        }
         (offsets, weights)
     }
 }

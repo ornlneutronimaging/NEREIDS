@@ -96,7 +96,7 @@ The families calibrate different knobs:
 |--------------|---------------------------------------|-------------------------------------------|
 | `gaussian`   | `Δt, ΔL`                              | analytical Gaussian width                 |
 | `udd_corr`   | `s(E)=s0·(E/E_ref)^p` on a base UDD   | trust the MC *shape*, calibrate its width |
-| `ic`         | `α(E)=a0√E+a1, β`                      | free analytic shape                       |
+| `ic`         | `α(E)=a0√E+a1` (β fixed)               | free analytic shape                       |
 
 Use `.as_tabulated()` for `udd_corr` / `ic` (a `TabulatedResolution` to pass as
 `resolution=`); use `.gaussian_params()` → `(delta_t_us, delta_l_m)` for the
