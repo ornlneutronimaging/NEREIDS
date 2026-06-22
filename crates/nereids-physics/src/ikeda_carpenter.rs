@@ -64,14 +64,28 @@
 //! have equal point counts, else it falls back to the nearer reference; because
 //! IC trims each kernel's tail independently the point counts often differ, so the
 //! nearest-reference path is common. Either way IC synthesizes a dense reference
-//! grid (default 64 energies), so the between-reference error is negligible. The kernel is anchored with its
-//! **mode at offset 0** (peak-centering), matching the UDD file convention
-//! (peak at offset 0); `interpolated_kernel` does not re-center it. Because the
-//! IC pulse is skewed, its *mean* lags its mode, so a broadened resonance's
-//! centroid carries a small TOF lag whose constant part is absorbed by the fitted
-//! `t0/L` energy-scale. Its residual energy-dependent part (the mode→mean offset
-//! varies with α(E)) is a known, bounded limitation shared with the peak-centered
-//! UDD kernel — it does not move the broadened *peak* off the nominal energy.
+//! grid (default 64 energies), so the between-reference error is negligible. The
+//! kernel is anchored with its **mode at offset 0** (peak-centering), matching the
+//! UDD file convention (peak at offset 0); `interpolated_kernel` does not
+//! re-center it. Because the IC pulse is right-skewed, its *mean* lags its mode by
+//! ~1/α(E) in TOF, so the centroid — and even the minimum — of a broadened
+//! resonance shifts in apparent energy by an α(E)-dependent amount (order 1e-2 eV,
+//! ~1e-3 relative, for α≈1.5 in the eV regime; larger toward lower energy). So it
+//! *does* move the broadened dip off the nominal energy, by a small amount.
+//!
+//! Two regimes differ in whether that lag is absorbed:
+//! - **Run-time fitting** fits the `t0`/`L` energy-scale, which absorbs the
+//!   *constant* part of the lag; only the energy-dependent residual remains — a
+//!   bounded limitation shared with the peak-centered UDD kernel.
+//! - **Resolution calibration** (the `nereids-fitting` calibrator) holds `t0`/`L`
+//!   FIXED, so the lag is *not* absorbed: it folds into the fitted α(E) and into
+//!   the cross-family χ² ranking. The symmetric Gaussian family carries no such
+//!   lag, so a Gaussian-vs-IC/UDD comparison is fair on shape/width but carries a
+//!   small *position* bias on the asymmetric families.
+//!
+//! `ic_centering_shifts_broadened_symmetric_dip_with_alpha` quantifies and guards
+//! this shift; re-centering the kernel on its centroid (a future convention
+//! change spanning the UDD path too) would remove it.
 //!
 //! ## Optional instrument convolutions
 //!
@@ -776,6 +790,53 @@ mod tests {
         for v in &out[40..energies.len() - 40] {
             assert!((v - 0.7).abs() < 1e-3, "flat broadening drifted: {v}");
         }
+    }
+
+    #[test]
+    fn ic_centering_shifts_broadened_symmetric_dip_with_alpha() {
+        // The IC kernel anchors its MODE at offset 0, but the right-skewed pulse's
+        // intensity centroid lags the mode by ~1/α in TOF (module docstring).
+        // Broadening a symmetric-in-energy resonance therefore moves the dip
+        // minimum off the nominal energy by an α-dependent amount. This guards the
+        // documented bias (the loop-closure calibration tests cannot see it) and
+        // pins it against a silent "fix" (e.g. re-centering on the centroid).
+        const E0: f64 = 20.0;
+        // Absorption-weighted centroid of the broadened dip — a robust position
+        // estimator (the bare minimum is fragile under the wide low-α kernel).
+        fn dip_centroid_energy(alpha: f64) -> f64 {
+            // Constant-α kernel so the shape (hence the mode→mean lag) is uniform.
+            let p = IkedaCarpenterParams::constant(alpha, 0.1, 0.0);
+            let ic = IkedaCarpenter::new(p, 25.0, &SynthesisGrid::new(1.0, 200.0)).unwrap();
+            let res = ResolutionFunction::IkedaCarpenter(Arc::new(ic));
+            // Fine uniform grid; symmetric (in energy) Gaussian dip centered at E0.
+            let energies: Vec<f64> = (0..4000).map(|i| 10.0 + i as f64 * 0.005).collect();
+            let spectrum: Vec<f64> = energies
+                .iter()
+                .map(|&e| 1.0 - 0.8 * (-((e - E0) / 0.1).powi(2)).exp())
+                .collect();
+            let out = apply_resolution(&energies, &spectrum, &res).unwrap();
+            let (mut num, mut den) = (0.0, 0.0);
+            for (&e, &t) in energies.iter().zip(&out) {
+                if (e - E0).abs() <= 2.0 {
+                    let a = (1.0 - t).max(0.0); // absorption weight
+                    num += e * a;
+                    den += a;
+                }
+            }
+            num / den
+        }
+        let shift_small_alpha = (dip_centroid_energy(0.8) - E0).abs();
+        let shift_large_alpha = (dip_centroid_energy(2.0) - E0).abs();
+        // The bias is real (resolvable at the 1e-3 eV level)…
+        assert!(
+            shift_small_alpha > 1e-3,
+            "centering shift vanished: {shift_small_alpha}"
+        );
+        // …and shrinks with increasing α (the ~1/α scaling of the mode→mean lag).
+        assert!(
+            shift_small_alpha > 1.3 * shift_large_alpha,
+            "shift should scale ~1/α: α=0.8 {shift_small_alpha} vs α=2.0 {shift_large_alpha}"
+        );
     }
 
     #[test]

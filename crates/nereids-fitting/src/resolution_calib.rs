@@ -39,8 +39,11 @@ use crate::nelder_mead::{NelderMeadConfig, NelderMeadResult, nelder_mead_minimiz
 /// Reference energy (eV) for the UDD width-correction power law `s(E)`.
 const UDD_E_REF: f64 = 10.0;
 /// Width-scale clamp for the UDD correction (`s0 = clamp(exp(log_s0), …)`).
-const UDD_S0_MIN: f64 = 0.2;
-const UDD_S0_MAX: f64 = 5.0;
+/// `pub` so the Python binding decodes the reported `s0` against the *same*
+/// bounds the optimizer used, rather than duplicating the literals.
+pub const UDD_S0_MIN: f64 = 0.2;
+/// Upper width-scale clamp; see [`UDD_S0_MIN`].
+pub const UDD_S0_MAX: f64 = 5.0;
 /// Fixed storage rate for the IC calibration family. `R(E)≈0` across the eV
 /// resonance regime makes the slow/storage term — and hence `β` — unidentifiable,
 /// so it is held fixed rather than reported as a meaningless fit result.
@@ -171,7 +174,9 @@ fn build_resolution(
         }
         ResolutionFamily::UddCorr { base } => {
             let s0 = theta[0].exp().clamp(UDD_S0_MIN, UDD_S0_MAX);
-            let corrected = base.width_corrected(s0, theta[1], UDD_E_REF);
+            let corrected = base
+                .width_corrected(s0, theta[1], UDD_E_REF)
+                .map_err(|e| FittingError::EvaluationFailed(format!("udd_corr width: {e}")))?;
             Ok(ResolutionFunction::Tabulated(Arc::new(corrected)))
         }
         ResolutionFamily::IkedaCarpenter => {
@@ -338,6 +343,22 @@ pub fn calibrate_resolution(
             "energies, data must be finite and uncertainty finite and > 0".into(),
         ));
     }
+    // Energy grid must be strictly positive and strictly ascending — mirror the
+    // Python entry point's `validate_energy_grid` so both public APIs reject the
+    // same inputs up front. Without this, a zero/negative energy panics deep in
+    // the Reich–Moore cross-section assert, a descending grid errors late as a
+    // generic "forward model failed", and duplicate energies are silently
+    // accepted (the recurring NEREIDS sibling-path validation gap).
+    if energies[0] <= 0.0 {
+        return Err(FittingError::InvalidConfig(
+            "energies must be strictly positive".into(),
+        ));
+    }
+    if !energies.windows(2).all(|w| w[1] > w[0]) {
+        return Err(FittingError::InvalidConfig(
+            "energies must be strictly ascending (no duplicates)".into(),
+        ));
+    }
     // Reject under-determined calibrants: need more data points than the total
     // free parameters (resolution params + the anorm/baseline columns), else the
     // reported χ²/dof is meaningless.
@@ -450,8 +471,9 @@ mod tests {
         let sample = SampleParams::new(300.0, vec![(iso, 2.0e-3)]).unwrap();
         let energies: Vec<f64> = (0..400).map(|i| 12.0 + i as f64 * 0.04).collect();
         let base = synthetic_base_udd();
-        let truth =
-            ResolutionFunction::Tabulated(Arc::new(base.width_corrected(1.5, 0.0, UDD_E_REF)));
+        let truth = ResolutionFunction::Tabulated(Arc::new(
+            base.width_corrected(1.5, 0.0, UDD_E_REF).unwrap(),
+        ));
         let data = forward_model(
             &energies,
             &sample,
@@ -487,8 +509,9 @@ mod tests {
         let sample = SampleParams::new(300.0, vec![(iso, 2.0e-3)]).unwrap();
         let energies: Vec<f64> = (0..300).map(|i| 12.0 + i as f64 * 0.05).collect();
         let base = synthetic_base_udd();
-        let truth =
-            ResolutionFunction::Tabulated(Arc::new(base.width_corrected(1.2, 0.0, UDD_E_REF)));
+        let truth = ResolutionFunction::Tabulated(Arc::new(
+            base.width_corrected(1.2, 0.0, UDD_E_REF).unwrap(),
+        ));
         let data = forward_model(
             &energies,
             &sample,
@@ -502,6 +525,9 @@ mod tests {
             let r = calibrate_resolution(fam, &energies, &data, &unc, &sample, &cfg).unwrap();
             assert!(r.chi2_dof.is_finite(), "{label} χ² not finite");
             assert_eq!(r.theta.len(), 2, "{label} should fit 2 params");
+            // The objective is smooth and noise-free, so Nelder–Mead reaches its
+            // tolerance well within max_iter — guard the "_and_converge" promise.
+            assert!(r.converged, "{label} did not self-converge");
         }
     }
 
@@ -562,6 +588,38 @@ mod tests {
     }
 
     #[test]
+    fn rejects_nonascending_and_nonpositive_energy_grid() {
+        // Sibling-path parity with the Python `validate_energy_grid`: descending,
+        // duplicate, zero, and negative energy grids must be rejected up front
+        // rather than panicking deep in the cross-section assert or erroring late.
+        let iso = synthetic_isotope(72, 178, 20.0, 0.05, 0.06);
+        let sample = SampleParams::new(300.0, vec![(iso, 2.0e-3)]).unwrap();
+        let cfg = CalibrationConfig::default();
+        for grid in [
+            vec![4.0, 3.0, 2.0, 1.0],  // descending
+            vec![1.0, 2.0, 2.0, 3.0],  // duplicate
+            vec![0.0, 1.0, 2.0, 3.0],  // zero
+            vec![-1.0, 1.0, 2.0, 3.0], // negative
+        ] {
+            let n = grid.len();
+            assert!(
+                matches!(
+                    calibrate_resolution(
+                        ResolutionFamily::Gaussian,
+                        &grid,
+                        &vec![0.5; n],
+                        &vec![0.1; n],
+                        &sample,
+                        &cfg
+                    ),
+                    Err(FittingError::InvalidConfig(_))
+                ),
+                "expected InvalidConfig for grid {grid:?}"
+            );
+        }
+    }
+
+    #[test]
     fn invalid_flight_path_propagates_build_error() {
         // flight_path <= 0 makes ResolutionParams::new fail on every eval, so the
         // calibration cannot build a resolution and returns an error.
@@ -598,8 +656,9 @@ mod tests {
         let sample = SampleParams::new(300.0, vec![(iso, 2.0e-3)]).unwrap();
         let energies: Vec<f64> = (0..200).map(|i| 14.0 + i as f64 * 0.06).collect();
         let base = synthetic_base_udd();
-        let truth =
-            ResolutionFunction::Tabulated(Arc::new(base.width_corrected(1.3, 0.0, UDD_E_REF)));
+        let truth = ResolutionFunction::Tabulated(Arc::new(
+            base.width_corrected(1.3, 0.0, UDD_E_REF).unwrap(),
+        ));
         let data = forward_model(
             &energies,
             &sample,

@@ -131,5 +131,14 @@ calibrant yields a contaminated, non-transferable result:
 - **Density / isotopic characterization** is robust to the resolution-model
   choice; **temperature** is sensitive — calibrate carefully before trusting a
   fitted temperature.
+- **Cross-family χ² is fair on shape/width, not absolute position.** The
+  asymmetric kernels (`ic`, `udd_corr`) anchor their *mode* at zero offset, but
+  a right-skewed pulse's centroid lags the mode by ~1/α(E) in TOF, shifting a
+  broadened dip's apparent energy by an energy-dependent amount (order 1e-2 eV in
+  the eV regime). Calibration holds `t0`/`L` fixed, so unlike a run-time fit it
+  does not absorb that lag — it folds into the fitted shape and the χ² ranking.
+  The symmetric `gaussian` family has no such bias. Treat the χ² comparison as a
+  *shape/width* discriminator; for absolute energy positioning, fit `t0`/`L`
+  jointly on the sample afterwards.
 - A worked end-to-end example (build the models, calibrate, pin, fit) is in
   `examples/notebooks/workflows/06_resolution_calibration.ipynb`.

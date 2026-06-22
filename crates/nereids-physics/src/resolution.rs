@@ -80,6 +80,11 @@ pub enum ResolutionError {
     /// Same semantics as [`Self::PlanGridMismatch`] but for the CSR
     /// path (see [`apply_r`]).
     MatrixGridMismatch { first_diff_index: usize },
+    /// [`TabulatedResolution::width_corrected`] was called with invalid
+    /// parameters: `s0` must be finite and `> 0`, `e_ref` finite and `> 0`,
+    /// and `p` finite. A non-positive `s0` would reverse/collapse the
+    /// (ascending) offset ordering the broadening loop assumes.
+    InvalidWidthCorrection { s0: f64, p: f64, e_ref: f64 },
 }
 
 impl fmt::Display for ResolutionError {
@@ -105,6 +110,11 @@ impl fmt::Display for ResolutionError {
                 "resolution matrix was compiled for a different energy grid than was \
                  passed to apply_resolution_with_matrix (first differing index: {})",
                 first_diff_index,
+            ),
+            Self::InvalidWidthCorrection { s0, p, e_ref } => write!(
+                f,
+                "width_corrected requires finite s0 > 0, finite e_ref > 0, and finite p; \
+                 got s0={s0}, p={p}, e_ref={e_ref}"
             ),
         }
     }
@@ -864,13 +874,20 @@ impl TabulatedResolution {
     /// behind the `udd_corr` resolution-calibration family: it trusts the
     /// Monte-Carlo *shape* and calibrates only its width / energy-dependence.
     ///
-    /// **Precondition: `s0 > 0`.** A non-positive scale would reverse/collapse the
-    /// (ascending) offset ordering the broadening loop assumes; `s0` is clamped to
-    /// a tiny positive floor as a guard (`debug_assert` flags it in debug builds).
-    #[must_use]
-    pub fn width_corrected(&self, s0: f64, p: f64, e_ref: f64) -> TabulatedResolution {
-        debug_assert!(s0 > 0.0, "width_corrected requires s0 > 0, got {s0}");
-        let s0 = s0.max(f64::MIN_POSITIVE);
+    /// # Errors
+    /// Returns [`ResolutionError::InvalidWidthCorrection`] unless `s0` is finite
+    /// and `> 0`, `e_ref` is finite and `> 0`, and `p` is finite. A non-positive
+    /// `s0` would reverse/collapse the (ascending) offset ordering the broadening
+    /// loop assumes, so it is rejected up front rather than silently clamped.
+    pub fn width_corrected(
+        &self,
+        s0: f64,
+        p: f64,
+        e_ref: f64,
+    ) -> Result<TabulatedResolution, ResolutionError> {
+        if !(s0.is_finite() && s0 > 0.0 && e_ref.is_finite() && e_ref > 0.0 && p.is_finite()) {
+            return Err(ResolutionError::InvalidWidthCorrection { s0, p, e_ref });
+        }
         let kernels = self
             .ref_energies
             .iter()
@@ -890,11 +907,11 @@ impl TabulatedResolution {
                 (scaled, weights.clone())
             })
             .collect();
-        TabulatedResolution {
+        Ok(TabulatedResolution {
             ref_energies: self.ref_energies.clone(),
             kernels,
             flight_path_m: self.flight_path_m,
-        }
+        })
     }
 
     /// Kernel support at energy `e_ev`, in eV.
@@ -2485,7 +2502,7 @@ mod tests {
 
         // Uniform 2.5x width scale (p=0): centroid fixed, std scales by s0, weights unchanged.
         let s0 = 2.5;
-        let wc = tab.width_corrected(s0, 0.0, 10.0);
+        let wc = tab.width_corrected(s0, 0.0, 10.0).unwrap();
         for (orig, scaled) in tab.kernels().iter().zip(wc.kernels()) {
             let (c0, std0) = kernel_centroid_std(&orig.0, &orig.1);
             let (c1, std1) = kernel_centroid_std(&scaled.0, &scaled.1);
@@ -2503,11 +2520,11 @@ mod tests {
         );
 
         // s0=1,p=0 is an exact width-identical copy.
-        let id = tab.width_corrected(1.0, 0.0, 10.0);
+        let id = tab.width_corrected(1.0, 0.0, 10.0).unwrap();
         assert_eq!(id.kernels()[0].0, tab.kernels()[0].0);
 
         // p<0 -> higher energy is narrower (energy-dependent width).
-        let wc2 = tab.width_corrected(1.0, -0.5, 10.0);
+        let wc2 = tab.width_corrected(1.0, -0.5, 10.0).unwrap();
         let (_, std_lo) = kernel_centroid_std(&wc2.kernels()[0].0, &wc2.kernels()[0].1); // 5 eV
         let (_, std_hi) = kernel_centroid_std(&wc2.kernels()[1].0, &wc2.kernels()[1].1); // 50 eV
         assert!(
@@ -2526,8 +2543,37 @@ mod tests {
             25.0,
         )
         .unwrap();
-        let wc = tab.width_corrected(2.0, 0.0, 10.0);
+        let wc = tab.width_corrected(2.0, 0.0, 10.0).unwrap();
         assert_eq!(wc.kernels()[0].0, vec![-2.0, 0.0, 4.0]); // scaled about 0
+    }
+
+    #[test]
+    fn width_corrected_rejects_invalid_params() {
+        // Public API: invalid whole-configuration inputs must hard-error up front
+        // (not silently clamp), since a non-positive s0 reverses the offset order.
+        let tab = TabulatedResolution::from_kernels(
+            vec![10.0],
+            vec![(vec![-1.0, 0.0, 2.0], vec![0.1, 1.0, 0.1])],
+            25.0,
+        )
+        .unwrap();
+        for (s0, p, e_ref) in [
+            (0.0, 0.0, 10.0),          // s0 == 0
+            (-1.0, 0.0, 10.0),         // s0 < 0
+            (f64::NAN, 0.0, 10.0),     // s0 non-finite
+            (1.0, f64::NAN, 10.0),     // p non-finite
+            (1.0, 0.0, 0.0),           // e_ref == 0
+            (1.0, 0.0, -5.0),          // e_ref < 0
+            (1.0, 0.0, f64::INFINITY), // e_ref non-finite
+        ] {
+            assert!(
+                matches!(
+                    tab.width_corrected(s0, p, e_ref),
+                    Err(ResolutionError::InvalidWidthCorrection { .. })
+                ),
+                "expected InvalidWidthCorrection for s0={s0}, p={p}, e_ref={e_ref}"
+            );
+        }
     }
 
     // ── Smoke tests for the test_support oracles (`interp_spectrum` +

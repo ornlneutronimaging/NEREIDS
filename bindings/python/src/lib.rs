@@ -50,7 +50,8 @@ use nereids_endf::resonance::{
 };
 use nereids_endf::retrieval::{EndfLibrary, EndfRetriever, mat_number};
 use nereids_fitting::resolution_calib::{
-    CalibrationConfig, ResolutionFamily, calibrate_resolution as rust_calibrate_resolution,
+    CalibrationConfig, ResolutionFamily, UDD_S0_MAX, UDD_S0_MIN,
+    calibrate_resolution as rust_calibrate_resolution,
 };
 use nereids_io::normalization::{self as norm, NormalizationParams};
 use nereids_io::tof::BeamlineParams;
@@ -1171,7 +1172,9 @@ impl PyResolutionCalibration {
         let d = pyo3::types::PyDict::new(py);
         match self.inner.family.as_str() {
             "udd_corr" => {
-                let s0 = self.inner.theta[0].exp().clamp(0.2, 5.0);
+                // Decode against the SAME clamp bounds the Rust optimizer used
+                // (resolution_calib::UDD_S0_MIN/MAX), not duplicated literals.
+                let s0 = self.inner.theta[0].exp().clamp(UDD_S0_MIN, UDD_S0_MAX);
                 d.set_item("s0", s0)?;
                 d.set_item("p", self.inner.theta[1])?;
             }
