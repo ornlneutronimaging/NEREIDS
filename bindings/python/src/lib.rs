@@ -50,7 +50,7 @@ use nereids_endf::resonance::{
 };
 use nereids_endf::retrieval::{EndfLibrary, EndfRetriever, mat_number};
 use nereids_fitting::resolution_calib::{
-    CalibrationConfig, ResolutionFamily, UDD_S0_MAX, UDD_S0_MIN,
+    CalibrationConfig, ResolutionFamily, UDR_S0_MAX, UDR_S0_MIN,
     calibrate_resolution as rust_calibrate_resolution,
 };
 use nereids_io::normalization::{self as norm, NormalizationParams};
@@ -1137,7 +1137,7 @@ struct PyResolutionCalibration {
 
 #[pymethods]
 impl PyResolutionCalibration {
-    /// Family label (`"gaussian"` | `"udd_corr"` | `"ic"`).
+    /// Family label (`"gaussian"` | `"udr_corr"` | `"ic"`).
     #[getter]
     fn family(&self) -> String {
         self.inner.family.clone()
@@ -1171,10 +1171,10 @@ impl PyResolutionCalibration {
     fn params<'py>(&self, py: Python<'py>) -> PyResult<Bound<'py, pyo3::types::PyDict>> {
         let d = pyo3::types::PyDict::new(py);
         match self.inner.family.as_str() {
-            "udd_corr" => {
+            "udr_corr" => {
                 // Decode against the SAME clamp bounds the Rust optimizer used
-                // (resolution_calib::UDD_S0_MIN/MAX), not duplicated literals.
-                let s0 = self.inner.theta[0].exp().clamp(UDD_S0_MIN, UDD_S0_MAX);
+                // (resolution_calib::UDR_S0_MIN/MAX), not duplicated literals.
+                let s0 = self.inner.theta[0].exp().clamp(UDR_S0_MIN, UDR_S0_MAX);
                 d.set_item("s0", s0)?;
                 d.set_item("p", self.inner.theta[1])?;
             }
@@ -1228,10 +1228,10 @@ impl PyResolutionCalibration {
 ///
 /// Args:
 ///     energies, data, uncertainty: calibrant transmission spectrum.
-///     family: ``"gaussian"`` | ``"udd_corr"`` | ``"ic"``.
+///     family: ``"gaussian"`` | ``"udr_corr"`` | ``"ic"``.
 ///     isotopes / groups: known calibrant composition + density (exactly one).
 ///     temperature_k: known calibrant temperature.
-///     base_udd: base UDD kernel (required for ``family="udd_corr"``).
+///     base_udr: base UDR kernel (required for ``family="udr_corr"``).
 ///     fit_background: also fit anorm + linear baseline (default anorm only).
 ///     restarts: optimizer restarts (keep the best).
 ///
@@ -1241,7 +1241,7 @@ impl PyResolutionCalibration {
 #[pyfunction]
 #[pyo3(signature = (
     energies, data, uncertainty, family, isotopes=None, groups=None,
-    temperature_k=293.6, base_udd=None, flight_path_m=25.0, fit_background=false,
+    temperature_k=293.6, base_udr=None, flight_path_m=25.0, fit_background=false,
     restarts=1, ic_n_energies=64, ic_n_tau=500
 ))]
 #[allow(clippy::too_many_arguments)]
@@ -1254,7 +1254,7 @@ fn calibrate_resolution(
     isotopes: Option<Vec<(PyResonanceData, f64)>>,
     groups: Option<Vec<(PyIsotopeGroup, f64)>>,
     temperature_k: f64,
-    base_udd: Option<PyTabulatedResolution>,
+    base_udr: Option<PyTabulatedResolution>,
     flight_path_m: f64,
     fit_background: bool,
     restarts: usize,
@@ -1320,17 +1320,17 @@ fn calibrate_resolution(
     let fam = match family {
         "gaussian" => ResolutionFamily::Gaussian,
         "ic" => ResolutionFamily::IkedaCarpenter,
-        "udd_corr" => {
-            let base = base_udd.ok_or_else(|| {
+        "udr_corr" => {
+            let base = base_udr.ok_or_else(|| {
                 pyo3::exceptions::PyValueError::new_err(
-                    "family='udd_corr' requires base_udd (a TabulatedResolution).",
+                    "family='udr_corr' requires base_udr (a TabulatedResolution).",
                 )
             })?;
-            ResolutionFamily::UddCorr { base: base.inner }
+            ResolutionFamily::UdrCorr { base: base.inner }
         }
         other => {
             return Err(pyo3::exceptions::PyValueError::new_err(format!(
-                "unknown family '{other}'; expected 'gaussian', 'udd_corr', or 'ic'"
+                "unknown family '{other}'; expected 'gaussian', 'udr_corr', or 'ic'"
             )));
         }
     };
@@ -1338,7 +1338,7 @@ fn calibrate_resolution(
     // For family='ic' these size the kernel-synthesis grid; validate up front so an
     // out-of-range value gives a precise error instead of the generic "no finite-χ²
     // resolution" (every IkedaCarpenter::new eval would otherwise fail). They are
-    // inert for the gaussian/udd_corr families.
+    // inert for the gaussian/udr_corr families.
     if matches!(fam, ResolutionFamily::IkedaCarpenter) {
         if ic_n_energies < 2 {
             return Err(pyo3::exceptions::PyValueError::new_err(format!(

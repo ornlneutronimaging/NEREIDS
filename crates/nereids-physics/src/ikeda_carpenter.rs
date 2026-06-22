@@ -4,7 +4,7 @@
 //! ([`crate::resolution::ResolutionParams`]) and the Monte-Carlo tabulated
 //! kernel ([`crate::resolution::TabulatedResolution`]). It exists to settle a
 //! methodological dispute about the VENUS instrument resolution: one camp
-//! trusts the MC-simulated tabulated kernel (UDD/FTS file); the instrument
+//! trusts the MC-simulated tabulated kernel (UDR/FTS file); the instrument
 //! scientist distrusts the unproven MC and prefers an analytical
 //! Ikeda–Carpenter moderator model. NEREIDS implements IC as a first-class
 //! model so all three can be cross-validated against synthetic loop-closure
@@ -66,7 +66,7 @@
 //! nearest-reference path is common. Either way IC synthesizes a dense reference
 //! grid (default 64 energies), so the between-reference error is negligible. The
 //! kernel is anchored with its **mode at offset 0** (peak-centering), matching the
-//! UDD file convention (peak at offset 0); `interpolated_kernel` does not
+//! UDR file convention (peak at offset 0); `interpolated_kernel` does not
 //! re-center it. Because the IC pulse is right-skewed, its *mean* lags its mode by
 //! ~1/α(E) in TOF, so the centroid — and even the minimum — of a broadened
 //! resonance shifts in apparent energy by an α(E)-dependent amount (order 1e-2 eV,
@@ -76,16 +76,16 @@
 //! Two regimes differ in whether that lag is absorbed:
 //! - **Run-time fitting** fits the `t0`/`L` energy-scale, which absorbs the
 //!   *constant* part of the lag; only the energy-dependent residual remains — a
-//!   bounded limitation shared with the peak-centered UDD kernel.
+//!   bounded limitation shared with the peak-centered UDR kernel.
 //! - **Resolution calibration** (the `nereids-fitting` calibrator) holds `t0`/`L`
 //!   FIXED, so the lag is *not* absorbed: it folds into the fitted α(E) and into
 //!   the cross-family χ² ranking. The symmetric Gaussian family carries no such
-//!   lag, so a Gaussian-vs-IC/UDD comparison is fair on shape/width but carries a
+//!   lag, so a Gaussian-vs-IC/UDR comparison is fair on shape/width but carries a
 //!   small *position* bias on the asymmetric families.
 //!
 //! `ic_centering_shifts_broadened_symmetric_dip_with_alpha` quantifies and guards
 //! this shift; re-centering the kernel on its centroid (a future convention
-//! change spanning the UDD path too) would remove it.
+//! change spanning the UDR path too) would remove it.
 //!
 //! ## Optional instrument convolutions
 //!

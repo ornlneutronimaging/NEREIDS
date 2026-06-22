@@ -300,7 +300,7 @@ class ResolutionCalibration:
 
     @property
     def family(self) -> str:
-        """Resolution-model family (``"gaussian"`` | ``"udd_corr"`` | ``"ic"``)."""
+        """Resolution-model family (``"gaussian"`` | ``"udr_corr"`` | ``"ic"``)."""
         ...
 
     @property
@@ -329,7 +329,7 @@ class ResolutionCalibration:
 
     def as_tabulated(self) -> TabulatedResolution | None:
         """The calibrated resolution as a kernel to pin into a fit
-        (``udd_corr`` / ``ic``); ``None`` for the Gaussian family."""
+        (``udr_corr`` / ``ic``); ``None`` for the Gaussian family."""
         ...
 
     def gaussian_params(self) -> tuple[float, float] | None:
@@ -587,7 +587,7 @@ def calibrate_resolution(
     isotopes: list[tuple[ResonanceData, float]] | None = None,
     groups: list[tuple[IsotopeGroup, float]] | None = None,
     temperature_k: float = 293.6,
-    base_udd: TabulatedResolution | None = None,
+    base_udr: TabulatedResolution | None = None,
     flight_path_m: float = 25.0,
     fit_background: bool = False,
     restarts: int = 1,
@@ -596,9 +596,9 @@ def calibrate_resolution(
 ) -> ResolutionCalibration:
     """Calibrate instrument-resolution parameters against a known-(rho,T) calibrant.
 
-    Fits the resolution parameters of ``family`` (``"gaussian"`` | ``"udd_corr"``
+    Fits the resolution parameters of ``family`` (``"gaussian"`` | ``"udr_corr"``
     | ``"ic"``) while holding the calibrant density (in ``isotopes``/``groups``)
-    and ``temperature_k`` fixed. ``base_udd`` is required for ``"udd_corr"``.
+    and ``temperature_k`` fixed. ``base_udr`` is required for ``"udr_corr"``.
     Pin the returned resolution into a sample fit via ``.as_tabulated()`` (or
     ``.gaussian_params()`` for the Gaussian family).
     """

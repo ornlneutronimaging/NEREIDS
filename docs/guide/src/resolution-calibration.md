@@ -33,13 +33,16 @@ T = nereids.forward_model(
 )
 ```
 
-### Tabulated UDD (Monte-Carlo file)
+### Tabulated UDR (Monte-Carlo file)
 
-A measured/simulated asymmetric kernel (e.g. a VENUS FTS file):
+**UDR** = *User-Defined Resolution* — SAMMY's term for a numerical resolution
+function supplied as a `(time/energy, weight)` table (SAMMY manual,
+"User-Defined Numerical Resolution Function"). In NEREIDS this is a
+measured/simulated asymmetric kernel, e.g. a VENUS FTS file:
 
 ```python
-udd = nereids.load_resolution("fts_bl10.txt", flight_path_m=25.0)
-T = nereids.forward_model(energies, [(hf, 5e-5)], temperature_k=300.0, resolution=udd)
+udr = nereids.load_resolution("fts_bl10.txt", flight_path_m=25.0)
+T = nereids.forward_model(energies, [(hf, 5e-5)], temperature_k=300.0, resolution=udr)
 ```
 
 ### Ikeda–Carpenter (analytical moderator model)
@@ -86,13 +89,13 @@ density, temperature, background and normalization are **per-measurement**. So:
 ```python
 cal = nereids.calibrate_resolution(
     energies, data, uncertainty,
-    family="udd_corr",                  # "gaussian" | "udd_corr" | "ic"
+    family="udr_corr",                  # "gaussian" | "udr_corr" | "ic"
     isotopes=[(hf, 5e-5)],              # KNOWN calibrant composition + density
     temperature_k=300.0,                # KNOWN calibrant temperature
-    base_udd=udd,                       # required for family="udd_corr"
+    base_udr=udr,                       # required for family="udr_corr"
     restarts=2,
 )
-print(cal)                # ResolutionCalibration(family=udd_corr, chi2/dof=..., converged=...)
+print(cal)                # ResolutionCalibration(family=udr_corr, chi2/dof=..., converged=...)
 print(cal.params())       # decoded fitted parameters
 calibrated = cal.as_tabulated()         # pin this into the sample fit
 ```
@@ -102,10 +105,10 @@ The families calibrate different knobs:
 | family       | fits                                  | meaning                                   |
 |--------------|---------------------------------------|-------------------------------------------|
 | `gaussian`   | `Δt, ΔL`                              | analytical Gaussian width                 |
-| `udd_corr`   | `s(E)=s0·(E/E_ref)^p` on a base UDD   | trust the MC *shape*, calibrate its width |
+| `udr_corr`   | `s(E)=s0·(E/E_ref)^p` on a base UDR   | trust the MC *shape*, calibrate its width |
 | `ic`         | `α(E)=a0√E+a1` (β fixed)               | free analytic shape                       |
 
-Use `.as_tabulated()` for `udd_corr` / `ic` (a `TabulatedResolution` to pass as
+Use `.as_tabulated()` for `udr_corr` / `ic` (a `TabulatedResolution` to pass as
 `resolution=`); use `.gaussian_params()` → `(delta_t_us, delta_l_m)` for the
 Gaussian family.
 
@@ -141,10 +144,10 @@ calibrant yields a contaminated, non-transferable result:
 - **Cross-family χ² is fair on shape/width, not absolute position.** The `ic`
   kernel anchors its *mode* at zero offset, but a right-skewed pulse's centroid
   lags the mode by ~1/α(E) in TOF, shifting a broadened dip's apparent energy by
-  an energy-dependent amount (order 1e-2 eV in the eV regime). The `udd_corr`
+  an energy-dependent amount (order 1e-2 eV in the eV regime). The `udr_corr`
   width correction is *centroid-preserving* (it scales offsets about the kernel's
   centroid), so it adds no position bias of its own — any residual comes from the
-  base UDD file's own mode-vs-centroid offset, held fixed during width
+  base UDR file's own mode-vs-centroid offset, held fixed during width
   calibration. The symmetric `gaussian` has no such bias. Calibration holds
   `t0`/`L` fixed, so unlike a run-time fit it does not absorb these lags — treat
   the χ² comparison as a *shape/width* discriminator and recover absolute

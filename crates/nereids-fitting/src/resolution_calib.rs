@@ -18,9 +18,11 @@
 //!
 //! Families ([`ResolutionFamily`]):
 //! - **Gaussian** — fit `(Δt, ΔL)`.
-//! - **UddCorr** — fit a shape-preserving width correction `s(E)=s0·(E/Eref)^p`
-//!   on a base tabulated UDD ([`TabulatedResolution::width_corrected`]); trusts
-//!   the Monte-Carlo shape, calibrates its width/energy-dependence.
+//! - **UdrCorr** — fit a shape-preserving width correction `s(E)=s0·(E/Eref)^p`
+//!   on a base tabulated UDR ([`TabulatedResolution::width_corrected`]); trusts
+//!   the Monte-Carlo shape, calibrates its width/energy-dependence. **UDR** =
+//!   *User-Defined Resolution*, SAMMY's term for a numerical (table-supplied)
+//!   resolution function.
 //! - **IkedaCarpenter** — fit `α(E)=a0√E+a1` (free analytic prompt-width shape);
 //!   `β` is held fixed because `R≈0` in the eV regime makes the storage term, and
 //!   hence `β`, unidentifiable.
@@ -36,14 +38,14 @@ use nereids_physics::transmission::{InstrumentParams, SampleParams, forward_mode
 use crate::error::FittingError;
 use crate::nelder_mead::{NelderMeadConfig, NelderMeadResult, nelder_mead_minimize};
 
-/// Reference energy (eV) for the UDD width-correction power law `s(E)`.
-const UDD_E_REF: f64 = 10.0;
-/// Width-scale clamp for the UDD correction (`s0 = clamp(exp(log_s0), …)`).
+/// Reference energy (eV) for the UDR width-correction power law `s(E)`.
+const UDR_E_REF: f64 = 10.0;
+/// Width-scale clamp for the UDR correction (`s0 = clamp(exp(log_s0), …)`).
 /// `pub` so the Python binding decodes the reported `s0` against the *same*
 /// bounds the optimizer used, rather than duplicating the literals.
-pub const UDD_S0_MIN: f64 = 0.2;
-/// Upper width-scale clamp; see [`UDD_S0_MIN`].
-pub const UDD_S0_MAX: f64 = 5.0;
+pub const UDR_S0_MIN: f64 = 0.2;
+/// Upper width-scale clamp; see [`UDR_S0_MIN`].
+pub const UDR_S0_MAX: f64 = 5.0;
 /// Fixed storage rate for the IC calibration family. `R(E)≈0` across the eV
 /// resonance regime makes the slow/storage term — and hence `β` — unidentifiable,
 /// so it is held fixed rather than reported as a meaningless fit result.
@@ -54,8 +56,8 @@ const IC_FIXED_BETA: f64 = 0.1;
 pub enum ResolutionFamily {
     /// Gaussian `(Δt_µs, ΔL_m)`.
     Gaussian,
-    /// Width-corrected tabulated UDD: fit `(log s0, p)` against `base`.
-    UddCorr {
+    /// Width-corrected tabulated UDR: fit `(log s0, p)` against `base`.
+    UdrCorr {
         /// Base Monte-Carlo kernel to correct.
         base: Arc<TabulatedResolution>,
     },
@@ -70,7 +72,7 @@ impl ResolutionFamily {
     pub fn n_params(&self) -> usize {
         match self {
             ResolutionFamily::Gaussian
-            | ResolutionFamily::UddCorr { .. }
+            | ResolutionFamily::UdrCorr { .. }
             | ResolutionFamily::IkedaCarpenter => 2,
         }
     }
@@ -78,21 +80,21 @@ impl ResolutionFamily {
     fn label(&self) -> &'static str {
         match self {
             ResolutionFamily::Gaussian => "gaussian",
-            ResolutionFamily::UddCorr { .. } => "udd_corr",
+            ResolutionFamily::UdrCorr { .. } => "udr_corr",
             ResolutionFamily::IkedaCarpenter => "ic",
         }
     }
 
     /// `(start vector, box bounds)` for the optimizer (mirrors the validated
-    /// Python reference: `udd_corr` uses log-`s0`; bounds keep widths positive).
+    /// Python reference: `udr_corr` uses log-`s0`; bounds keep widths positive).
     fn x0_bounds(&self) -> (Vec<f64>, Vec<(f64, f64)>) {
         match self {
             ResolutionFamily::Gaussian => (vec![2.0, 1e-3], vec![(1e-3, 50.0), (0.0, 0.5)]),
-            ResolutionFamily::UddCorr { .. } => {
+            ResolutionFamily::UdrCorr { .. } => {
                 // (log s0, p): s0 = exp(log_s0) clamped to [0.2, 5].
                 (
                     vec![0.0, 0.0],
-                    vec![(UDD_S0_MIN.ln(), UDD_S0_MAX.ln()), (-4.0, 4.0)],
+                    vec![(UDR_S0_MIN.ln(), UDR_S0_MAX.ln()), (-4.0, 4.0)],
                 )
             }
             ResolutionFamily::IkedaCarpenter => (vec![0.30, 0.0], vec![(0.01, 5.0), (-2.0, 2.0)]),
@@ -144,7 +146,7 @@ impl Default for CalibrationConfig {
 /// Result of a resolution calibration.
 #[derive(Debug, Clone)]
 pub struct CalibrationResult {
-    /// Family label (`"gaussian"` | `"udd_corr"` | `"ic"`).
+    /// Family label (`"gaussian"` | `"udr_corr"` | `"ic"`).
     pub family: String,
     /// Fitted parameter vector (raw optimizer space; see [`ResolutionFamily`]).
     pub theta: Vec<f64>,
@@ -172,11 +174,11 @@ fn build_resolution(
                     .map_err(|e| FittingError::EvaluationFailed(format!("gaussian res: {e:?}")))?;
             Ok(ResolutionFunction::Gaussian(params))
         }
-        ResolutionFamily::UddCorr { base } => {
-            let s0 = theta[0].exp().clamp(UDD_S0_MIN, UDD_S0_MAX);
+        ResolutionFamily::UdrCorr { base } => {
+            let s0 = theta[0].exp().clamp(UDR_S0_MIN, UDR_S0_MAX);
             let corrected = base
-                .width_corrected(s0, theta[1], UDD_E_REF)
-                .map_err(|e| FittingError::EvaluationFailed(format!("udd_corr width: {e}")))?;
+                .width_corrected(s0, theta[1], UDR_E_REF)
+                .map_err(|e| FittingError::EvaluationFailed(format!("udr_corr width: {e}")))?;
             Ok(ResolutionFunction::Tabulated(Arc::new(corrected)))
         }
         ResolutionFamily::IkedaCarpenter => {
@@ -400,7 +402,7 @@ pub fn calibrate_resolution(
     for r in 0..config.restarts.max(1) {
         // Additive perturbation (a fraction of each parameter's bound range) so
         // restarts move even for zero-valued start components — a multiplicative
-        // `x0·(1+0.1r)` left `udd_corr`'s `[0, 0]` start identical every restart.
+        // `x0·(1+0.1r)` left `udr_corr`'s `[0, 0]` start identical every restart.
         let start: Vec<f64> = x0
             .iter()
             .zip(&bounds)
@@ -451,7 +453,7 @@ mod tests {
     use super::*;
     use nereids_endf::resonance::test_support::synthetic_isotope;
 
-    fn synthetic_base_udd() -> TabulatedResolution {
+    fn synthetic_base_udr() -> TabulatedResolution {
         // Asymmetric kernel (sharp rise, +TOF tail), at two reference energies.
         let offs = vec![-1.0, -0.5, 0.0, 0.5, 1.0, 1.5, 2.0, 2.5];
         let wts = vec![0.05, 0.3, 1.0, 0.8, 0.5, 0.3, 0.15, 0.05];
@@ -472,7 +474,7 @@ mod tests {
     }
 
     #[test]
-    fn udd_corr_recovers_known_width_scale() {
+    fn udr_corr_recovers_known_width_scale() {
         // Loop-closure / OPTIMIZER test: truth and fit both use width_corrected, so
         // this checks that the calibrator finds the s0=1.5 minimum — NOT that
         // width_corrected itself is physically correct. The width-scale physics
@@ -480,13 +482,13 @@ mod tests {
         // `width_corrected_preserves_centroid_scales_width_and_energy_dependence`
         // in nereids-physics.
         // Synthetic Hf-178-like resonance at 20 eV; calibrant generated with a
-        // UDD truth scaled by s0=1.5; udd_corr must recover s0≈1.5 at χ²≈0.
+        // UDR truth scaled by s0=1.5; udr_corr must recover s0≈1.5 at χ²≈0.
         let iso = synthetic_isotope(72, 178, 20.0, 0.05, 0.06);
         let sample = SampleParams::new(300.0, vec![(iso, 2.0e-3)]).unwrap();
         let energies: Vec<f64> = (0..400).map(|i| 12.0 + i as f64 * 0.04).collect();
-        let base = synthetic_base_udd();
+        let base = synthetic_base_udr();
         let truth = ResolutionFunction::Tabulated(Arc::new(
-            base.width_corrected(1.5, 0.0, UDD_E_REF).unwrap(),
+            base.width_corrected(1.5, 0.0, UDR_E_REF).unwrap(),
         ));
         let data = forward_model(
             &energies,
@@ -501,7 +503,7 @@ mod tests {
             ..Default::default()
         };
         let r = calibrate_resolution(
-            ResolutionFamily::UddCorr {
+            ResolutionFamily::UdrCorr {
                 base: Arc::new(base),
             },
             &energies,
@@ -511,14 +513,14 @@ mod tests {
             &cfg,
         )
         .unwrap();
-        let s0 = r.theta[0].exp().clamp(UDD_S0_MIN, UDD_S0_MAX);
+        let s0 = r.theta[0].exp().clamp(UDR_S0_MIN, UDR_S0_MAX);
         assert!((s0 - 1.5).abs() < 0.05, "recovered s0={s0}, expected 1.5");
         assert!(r.chi2_dof < 1e-2, "matched χ²/dof={} too high", r.chi2_dof);
         assert!(matches!(r.resolution, ResolutionFunction::Tabulated(_)));
     }
 
     #[test]
-    fn udd_corr_recovers_known_width_scale_and_exponent() {
+    fn udr_corr_recovers_known_width_scale_and_exponent() {
         // Two resonances at well-separated energies make the width EXPONENT p
         // identifiable — a single resonance constrains only s(E) at one energy (a
         // ridge in (s0, p)). Truth: s0=1.3, p=-0.5; the calibrator must recover
@@ -527,10 +529,10 @@ mod tests {
         let iso_hi = synthetic_isotope(72, 179, 45.0, 0.05, 0.06);
         let sample = SampleParams::new(300.0, vec![(iso_lo, 2.0e-3), (iso_hi, 2.0e-3)]).unwrap();
         let energies: Vec<f64> = (0..700).map(|i| 8.0 + i as f64 * 0.06).collect();
-        let base = synthetic_base_udd();
+        let base = synthetic_base_udr();
         let (s0_true, p_true) = (1.3, -0.5);
         let truth = ResolutionFunction::Tabulated(Arc::new(
-            base.width_corrected(s0_true, p_true, UDD_E_REF).unwrap(),
+            base.width_corrected(s0_true, p_true, UDR_E_REF).unwrap(),
         ));
         let data = forward_model(
             &energies,
@@ -544,7 +546,7 @@ mod tests {
             ..Default::default()
         };
         let r = calibrate_resolution(
-            ResolutionFamily::UddCorr {
+            ResolutionFamily::UdrCorr {
                 base: Arc::new(base),
             },
             &energies,
@@ -554,7 +556,7 @@ mod tests {
             &cfg,
         )
         .unwrap();
-        let s0 = r.theta[0].exp().clamp(UDD_S0_MIN, UDD_S0_MAX);
+        let s0 = r.theta[0].exp().clamp(UDR_S0_MIN, UDR_S0_MAX);
         let p = r.theta[1];
         assert!(
             (s0 - s0_true).abs() < 0.1,
@@ -618,9 +620,9 @@ mod tests {
         let iso = synthetic_isotope(72, 178, 20.0, 0.05, 0.06);
         let sample = SampleParams::new(300.0, vec![(iso, 2.0e-3)]).unwrap();
         let energies: Vec<f64> = (0..300).map(|i| 12.0 + i as f64 * 0.05).collect();
-        let base = synthetic_base_udd();
+        let base = synthetic_base_udr();
         let truth = ResolutionFunction::Tabulated(Arc::new(
-            base.width_corrected(1.2, 0.0, UDD_E_REF).unwrap(),
+            base.width_corrected(1.2, 0.0, UDR_E_REF).unwrap(),
         ));
         let data = forward_model(
             &energies,
@@ -645,8 +647,8 @@ mod tests {
     fn n_params_matches_family() {
         assert_eq!(ResolutionFamily::Gaussian.n_params(), 2);
         assert_eq!(
-            ResolutionFamily::UddCorr {
-                base: Arc::new(synthetic_base_udd())
+            ResolutionFamily::UdrCorr {
+                base: Arc::new(synthetic_base_udr())
             }
             .n_params(),
             2
@@ -797,9 +799,9 @@ mod tests {
         let iso = synthetic_isotope(72, 178, 20.0, 0.05, 0.06);
         let sample = SampleParams::new(300.0, vec![(iso, 2.0e-3)]).unwrap();
         let energies: Vec<f64> = (0..200).map(|i| 14.0 + i as f64 * 0.06).collect();
-        let base = synthetic_base_udd();
+        let base = synthetic_base_udr();
         let truth = ResolutionFunction::Tabulated(Arc::new(
-            base.width_corrected(1.3, 0.0, UDD_E_REF).unwrap(),
+            base.width_corrected(1.3, 0.0, UDR_E_REF).unwrap(),
         ));
         let data = forward_model(
             &energies,
@@ -813,7 +815,7 @@ mod tests {
             ..Default::default()
         };
         let r = calibrate_resolution(
-            ResolutionFamily::UddCorr {
+            ResolutionFamily::UdrCorr {
                 base: Arc::new(base),
             },
             &energies,
@@ -828,7 +830,7 @@ mod tests {
 
     #[test]
     fn ic_recovers_known_alpha() {
-        // Loop-closure / optimizer test (same caveat as udd_corr): truth and fit
+        // Loop-closure / optimizer test (same caveat as udr_corr): truth and fit
         // both use the IC synthesis, so this checks the optimizer recovers a0 —
         // the IC pulse physics is independently covered by the ic_pulse tests in
         // nereids-physics. Truth a0 = 0.35; the calibration must recover it.

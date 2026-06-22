@@ -878,7 +878,7 @@ impl TabulatedResolution {
     /// where the trapezoidal and plain centroids happen to coincide.
     ///
     /// `s0 = 1, p = 0` returns a width-identical copy. This is the fittable model
-    /// behind the `udd_corr` resolution-calibration family: it trusts the
+    /// behind the `udr_corr` resolution-calibration family: it trusts the
     /// Monte-Carlo *shape* and calibrates only its width / energy-dependence.
     ///
     /// # Errors
@@ -1027,7 +1027,7 @@ impl TabulatedResolution {
 /// is applied through the *same* per-call convolution path as `Tabulated`
 /// (`broaden` / `broaden_presorted` / `plan`) — only the kernel *source* differs
 /// (analytic IC pulse vs Monte-Carlo file). This keeps the three-way resolution
-/// cross-validation (Gaussian | tabulated-UDD | Ikeda–Carpenter) fair on the
+/// cross-validation (Gaussian | tabulated-UDR | Ikeda–Carpenter) fair on the
 /// reference broadening path. Note: `IkedaCarpenter` does **not** opt into the
 /// spatial-map surrogate fast-paths (the scalar/cubature plans gate on
 /// `Tabulated`); it falls back to the general path, which is correct but
