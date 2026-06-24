@@ -1220,6 +1220,53 @@ mod tests {
     }
 
     #[test]
+    fn fit_l_scale_only_pins_t0() {
+        // Per-coordinate control: fitting ONLY L_scale (fit_t0=false) must fit
+        // position_l_scale while pinning t0 at its center — locks the
+        // `unpack_position` indexing when only the SECOND position coordinate is
+        // active (the single-coordinate path the round-2 review flagged).
+        let iso_lo = synthetic_isotope(72, 178, 15.0, 0.05, 0.06);
+        let iso_hi = synthetic_isotope(72, 179, 45.0, 0.05, 0.06);
+        let sample = SampleParams::new(300.0, vec![(iso_lo, 2.0e-3), (iso_hi, 2.0e-3)]).unwrap();
+        let energies: Vec<f64> = (0..700).map(|i| 8.0 + i as f64 * 0.06).collect();
+        let base = synthetic_base_udr();
+        let truth = ResolutionFunction::Tabulated(Arc::new(base.clone()));
+        let data = forward_model(
+            &energies,
+            &sample,
+            Some(&InstrumentParams { resolution: truth }),
+        )
+        .unwrap();
+        let unc = vec![0.004; energies.len()];
+        let cfg = CalibrationConfig {
+            restarts: 2,
+            fit_l_scale: true,
+            ..Default::default()
+        };
+        let r = calibrate_resolution(
+            ResolutionFamily::UdrCorr {
+                base: Arc::new(base),
+            },
+            &energies,
+            &data,
+            &unc,
+            &sample,
+            &cfg,
+        )
+        .unwrap();
+        assert_eq!(
+            r.position_t0_us, 0.0,
+            "t0 must stay pinned when fit_t0=false"
+        );
+        assert!(
+            (r.position_l_scale - 1.0).abs() < 0.02,
+            "L_scale fit within bound (~1 for a self-fit), got {}",
+            r.position_l_scale
+        );
+        assert!(r.chi2_dof < 1e-1, "self-fit χ²/dof={} too high", r.chi2_dof);
+    }
+
+    #[test]
     fn cross_family_chi2_selects_the_true_shape() {
         // Model-family discrimination at a KNOWN (pinned) energy scale: an
         // asymmetric IC-broadened calibrant generated at the nominal position
