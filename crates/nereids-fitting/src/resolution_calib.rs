@@ -185,10 +185,11 @@ pub struct CalibrationConfig {
     pub ic_n_energies: usize,
     pub ic_n_tau: usize,
     /// Fit the SAMMY TOF-zero `t0` (µs) as a SHARED energy-scale parameter.
-    /// **Default `false`** — position is pinned at [`position_t0_center_us`] so
-    /// calibration is a pure shape/width fit (matching SAMMY, where `t0`/`L` are a
-    /// separate energy-scale calibration). Opt in only *with* a metrology prior;
-    /// see [`with_position_prior`](CalibrationConfig::with_position_prior).
+    /// **Default `false`** — position is pinned at
+    /// [`position_t0_center_us`](Self::position_t0_center_us) so calibration is a
+    /// pure shape/width fit (matching SAMMY, where `t0`/`L` are a separate
+    /// energy-scale calibration). Opt in only *with* a metrology prior; see
+    /// [`with_position_prior`](CalibrationConfig::with_position_prior).
     pub fit_t0: bool,
     /// Fit the flight-path scale `L_scale` as a shared energy-scale parameter.
     /// **Default `false`.** A free `L_scale` shares the asymmetric-kernel lag's
