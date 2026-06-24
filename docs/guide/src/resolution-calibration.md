@@ -143,16 +143,25 @@ calibrant yields a contaminated, non-transferable result:
 - **Density / isotopic characterization** is robust to the resolution-model
   choice; **temperature** is sensitive — calibrate carefully before trusting a
   fitted temperature.
-- **The cross-family χ² compares shape/width fairly.** The `ic` kernel anchors its
-  *mode* at zero offset, so a right-skewed pulse's centroid lags by ~1/α(E),
-  shifting a broadened dip's apparent energy (order 1e-2 eV in the eV regime). To
-  keep the model-selection χ² from penalizing the asymmetric families on this
-  position artifact, `calibrate_resolution` fits **and discards** a small per-family
-  *position nuisance* (a TOF shift; reported as
-  `ResolutionCalibration.position_nuisance_us`), so each family's χ² reflects
-  shape/width only. (The `udr_corr` width correction is itself centroid-preserving;
-  the symmetric `gaussian` has no lag.) The nuisance is *not* part of the
-  calibrated resolution — it pins at the calibrant's real, fixed geometry; recover
-  the sample's absolute position by fitting `t0`/`L` on the sample.
+- **The resolution *width* is well-determined; the resolution *family* is not,
+  from a calibrant alone.** The `ic` kernel anchors its *mode* at zero offset, so a
+  right-skewed pulse's centroid lags by ~1/α(E), shifting a broadened dip's
+  apparent energy. That lag is **pure 1/√E — the same basis as a flight-path
+  (`L_scale`) error** — so absolute dip position cannot distinguish an asymmetric
+  kernel from a small `L` miscalibration. By default `calibrate_resolution`
+  **pins** the energy scale (`fit_t0=fit_l_scale=False`): a pure shape/width fit on
+  the already energy-calibrated grid. The cross-family χ² then discriminates on
+  shape **and** position, which is honest only when `(t0, L)` are independently
+  known; otherwise the position part is confounded with `L`.
+- **To handle position honestly, fit the *shared* energy scale under a metrology
+  prior.** Set `fit_t0=True` / `fit_l_scale=True` (centered at `t0_center_us` /
+  `l_scale_center`, with Gaussian priors `t0_prior_us` / `l_scale_prior` from the
+  instrument's flight-path / timing metrology). The fit reports `position_t0_us`,
+  `position_l_scale`, and `prior_penalty`. **Do not fit position with a flat
+  prior** — a free `L_scale` absorbs the asymmetric-kernel lag and corrupts the
+  calibrated width. With a weak prior, family discrimination collapses toward the
+  position-independent *skew/tail* evidence only (χ²/dof ≈ 1.1–1.3 in synthetic
+  Hf-177 studies), so report it as a function of the prior strength rather than
+  claiming strong discrimination.
 - A worked end-to-end example (build the models, calibrate, pin, fit) is in
   `examples/notebooks/workflows/06_resolution_calibration.ipynb`.

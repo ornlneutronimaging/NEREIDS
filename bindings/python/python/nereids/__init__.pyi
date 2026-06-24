@@ -324,12 +324,26 @@ class ResolutionCalibration:
         ...
 
     @property
-    def position_nuisance_us(self) -> float:
-        """Fitted-and-discarded position nuisance (TOF zero-shift, µs). Not part
-        of the calibrated resolution; it makes the cross-family chi-squared compare
-        shape/width rather than the asymmetric kernels' mode-to-centroid position
-        lag. A value near +/-5 us flags a position artifact the calibrant could
-        not reconcile."""
+    def position_t0_us(self) -> float:
+        """Fitted (or pinned) SAMMY energy-scale TOF zero t0 (us). Equals
+        t0_center_us when fit_t0=False (the default; position pinned). When fit, a
+        SHARED energy-scale parameter under a metrology prior, not a per-family
+        nuisance (the asymmetric-kernel lag is confounded with flight-path
+        L_scale)."""
+        ...
+
+    @property
+    def position_l_scale(self) -> float:
+        """Fitted (or pinned) flight-path scale L_scale. Equals l_scale_center when
+        fit_l_scale=False (the default)."""
+        ...
+
+    @property
+    def prior_penalty(self) -> float:
+        """Gaussian-prior penalty on the fitted (t0, L_scale) at the solution
+        (0 when position is pinned or has no prior). objective = chi2_data +
+        prior_penalty; a large value flags a family that needed a big position move
+        to fit."""
         ...
 
     def params(self) -> dict[str, float]:
@@ -602,6 +616,12 @@ def calibrate_resolution(
     restarts: int = 1,
     ic_n_energies: int = 64,
     ic_n_tau: int = 500,
+    fit_t0: bool = False,
+    fit_l_scale: bool = False,
+    t0_center_us: float = 0.0,
+    l_scale_center: float = 1.0,
+    t0_prior_us: float | None = None,
+    l_scale_prior: float | None = None,
 ) -> ResolutionCalibration:
     """Calibrate instrument-resolution parameters against a known-(rho,T) calibrant.
 
@@ -610,6 +630,15 @@ def calibrate_resolution(
     and ``temperature_k`` fixed. ``base_udr`` is required for ``"udr_corr"``.
     Pin the returned resolution into a sample fit via ``.as_tabulated()`` (or
     ``.gaussian_params()`` for the Gaussian family).
+
+    By default position is PINNED (``fit_t0=fit_l_scale=False``): a pure
+    shape/width fit on the already energy-calibrated grid. Set ``fit_t0`` /
+    ``fit_l_scale`` to also fit the SHARED SAMMY energy-scale ``(t0, L_scale)``
+    under a Gaussian metrology prior (``t0_prior_us`` / ``l_scale_prior``, centered
+    at ``t0_center_us`` / ``l_scale_center``) — for joint energy-scale or cross-
+    family identifiability work. Do NOT fit position with a flat prior in
+    production: the asymmetric-kernel lag is the same ``1/sqrt(E)`` basis as
+    ``L_scale``, so a free ``L_scale`` absorbs the lag and corrupts the width.
     """
     ...
 
