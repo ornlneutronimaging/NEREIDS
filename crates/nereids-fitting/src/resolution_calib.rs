@@ -61,11 +61,12 @@ const IC_FIXED_BETA: f64 = 0.1;
 ///
 /// History: a previous design fit a *free per-family* constant `t0` and discarded
 /// it ("position nuisance") to make the cross-family χ² compare shape/width. That
-/// was wrong — the asymmetric-kernel mode→centroid lag is pure `1/√E`, the SAME
-/// basis as an `L_scale` error, so a free per-family `t0`/`L_scale` lets a wrong
-/// (symmetric) family imitate the lag and buy back the strongest evidence against
-/// it (χ² 6.0 → 1.3 in the Hf-177 study). Position is now a SHARED energy-scale
-/// parameter with a metrology prior, never a free per-family knob.
+/// was wrong — the asymmetric-kernel mode→centroid lag is `≈1/√E` (exact for the
+/// `a1=0` prompt law `α=a0√E`, leading-order otherwise), the SAME basis as an
+/// `L_scale` error, so a free per-family `t0`/`L_scale` lets a wrong (symmetric)
+/// family imitate the lag and buy back the strongest evidence against it (χ² 6.0 →
+/// 1.3 in the Hf-177 study). Position is now a SHARED energy-scale parameter with a
+/// metrology prior, never a free per-family knob.
 const POSITION_T0_US_MAX: f64 = 5.0;
 /// Guard-rail bounds (±2%) on the optional fitted flight-path scale `L_scale`.
 /// The IC mode→centroid lag needs only `ΔL/L ≈ 0.22%` to be mimicked, so a *free*
@@ -84,7 +85,12 @@ const POSITION_L_SCALE_MAX: f64 = 1.02;
 /// it raises the corrected energy) — this is the shipped energy-scale convention,
 /// opposite to the `+t0` form used by the retired position nuisance. Errors if any
 /// corrected TOF `tof − t0 ≤ 0` (a `t0` past the shortest flight time).
-fn corrected_energy_grid(
+///
+/// `pub(crate)` so the equivalence to the runtime
+/// [`EnergyScaleTransmissionModel::corrected_energies`] is *pinned by a test*
+/// (`corrected_energy_grid_matches_energy_scale_model`) rather than only asserted
+/// in prose — a future edit to either convention then fails fast.
+pub(crate) fn corrected_energy_grid(
     energies: &[f64],
     t0_us: f64,
     l_scale: f64,
@@ -566,6 +572,16 @@ pub fn calibrate_resolution(
             baseline_cols,
         )));
     }
+    // Flight path is a physical positive length. A non-positive / non-finite value
+    // would invert the t0 feasibility bound below (min_tof < 0 ⇒ t0_hi < t0_lo ⇒
+    // `clamp(lo, hi)` panic) as soon as `fit_t0` appends a bounded coordinate, and
+    // otherwise only surfaces as a generic "no finite-objective" error. Reject it
+    // precisely up front (covers every family and the fit/pin paths alike).
+    if !(config.flight_path_m.is_finite() && config.flight_path_m > 0.0) {
+        return Err(FittingError::InvalidConfig(
+            "flight_path_m must be finite and > 0".into(),
+        ));
+    }
     // Validate the energy-scale (t0, L_scale) prior/center configuration up front.
     if !config.position_t0_center_us.is_finite()
         || !config.position_l_scale_center.is_finite()
@@ -606,6 +622,17 @@ pub fn calibrate_resolution(
     // every energy, i.e. `t0 < min(tof) = TOF_FACTOR·L/√E_max`. Far outside ±5 µs in
     // the eV regime, but clamp defensively so a wide window can never make it bite.
     let min_tof = TOF_FACTOR * config.flight_path_m / e_max.max(1e-12).sqrt();
+    // The (pinned or prior-mean) t0 center must itself be feasible: corrected_energy_grid
+    // needs `t0 < min(tof)` for every energy. In the eV regime min_tof ≫ 5 µs, but a
+    // short flight path or very high E_max can shrink it — reject up front with a precise
+    // message instead of a late, generic "corrected TOF ≤ 0" from the final recompute.
+    if config.position_t0_center_us >= min_tof {
+        return Err(FittingError::InvalidConfig(format!(
+            "position_t0_center_us ({:.3} µs) must be below the shortest flight time \
+             min_tof = TOF_FACTOR·L/√E_max = {min_tof:.3} µs",
+            config.position_t0_center_us
+        )));
+    }
     let t0_lo = -POSITION_T0_US_MAX;
     let t0_hi = POSITION_T0_US_MAX.min(min_tof - 1e-6);
 

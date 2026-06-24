@@ -146,9 +146,9 @@ calibrant yields a contaminated, non-transferable result:
 - **The resolution *width* is well-determined; the resolution *family* is not,
   from a calibrant alone.** The `ic` kernel anchors its *mode* at zero offset, so a
   right-skewed pulse's centroid lags by ~1/α(E), shifting a broadened dip's
-  apparent energy. That lag is **pure 1/√E — the same basis as a flight-path
-  (`L_scale`) error** — so absolute dip position cannot distinguish an asymmetric
-  kernel from a small `L` miscalibration. By default `calibrate_resolution`
+  apparent energy. For the `a1=0` prompt law that lag is **≈1/√E — the same basis as
+  a flight-path (`L_scale`) error** (leading-order for `a1≠0`) — so absolute dip
+  position cannot distinguish an asymmetric kernel from a small `L` miscalibration. By default `calibrate_resolution`
   **pins** the energy scale (`fit_t0=fit_l_scale=False`): a pure shape/width fit on
   the already energy-calibrated grid. The cross-family χ² then discriminates on
   shape **and** position, which is honest only when `(t0, L)` are independently

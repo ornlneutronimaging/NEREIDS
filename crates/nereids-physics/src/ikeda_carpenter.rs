@@ -73,9 +73,13 @@
 //! ~1e-3 relative, for α≈1.5 in the eV regime; larger toward lower energy). So it
 //! *does* move the broadened dip off the nominal energy, by a small amount.
 //!
-//! That lag is the SAME `1/√E` basis as a flight-path (`L_scale`) error: the
-//! centroid offset scales as `c/√E`, and an `L → L(1+δ)` change shifts every TOF
-//! by `δ·K·L/√E`, also `∝ 1/√E`. So the lag is **confounded with the energy
+//! For the prompt-only law `α(E) = a0·√E + a1` with `R≈0`, the lag `~1/α(E)` is
+//! **exactly** the `1/√E` basis of a flight-path (`L_scale`) error *iff* `a1 = 0`:
+//! then the centroid offset scales as `c/√E`, and an `L → L(1+δ)` change shifts
+//! every TOF by `δ·K·L/√E`, also `∝ 1/√E`, so the two are degenerate. With `a1 ≠ 0`
+//! the lag `1/(a0√E + a1)` only *approximately* follows that basis (and the
+//! storage term `R/β`, negligible in the eV regime, adds a further small
+//! departure). To leading order, then, the lag is **confounded with the energy
 //! scale**, and is handled by the SHARED `(t0, L_scale)` energy scale, not by any
 //! per-family knob:
 //! - **Run-time fitting** fits the `t0`/`L_scale` energy-scale, which absorbs the
