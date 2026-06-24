@@ -73,22 +73,33 @@
 //! ~1e-3 relative, for α≈1.5 in the eV regime; larger toward lower energy). So it
 //! *does* move the broadened dip off the nominal energy, by a small amount.
 //!
-//! Two regimes handle that lag, both absorbing it so it does not bias results:
-//! - **Run-time fitting** fits the `t0`/`L` energy-scale, which absorbs the
-//!   *constant* part of the lag; only the energy-dependent residual remains — a
-//!   bounded limitation shared with the peak-centered UDR kernel.
-//! - **Resolution calibration** (the `nereids-fitting` calibrator) holds the real
-//!   `t0`/`L` fixed but fits **and discards** a small per-family *position
-//!   nuisance* (a TOF shift) so the mode→centroid lag is absorbed and does NOT
-//!   bias the cross-family χ² model-selection. Without it the asymmetric IC/UDR
-//!   families would be unfairly penalized on position relative to the symmetric
-//!   Gaussian.
+//! For the prompt-only law `α(E) = a0·√E + a1` with `R≈0`, the lag `~1/α(E)` is
+//! **exactly** the `1/√E` basis of a flight-path (`L_scale`) error *iff* `a1 = 0`:
+//! then the centroid offset scales as `c/√E`, and an `L → L(1+δ)` change shifts
+//! every TOF by `δ·K·L/√E`, also `∝ 1/√E`, so the two are degenerate. With `a1 ≠ 0`
+//! the lag `1/(a0√E + a1)` only *approximately* follows that basis (and the
+//! storage term `R/β`, negligible in the eV regime, adds a further small
+//! departure). To leading order, then, the lag is **confounded with the energy
+//! scale**, and is handled by the SHARED `(t0, L_scale)` energy scale, not by any
+//! per-family knob:
+//! - **Run-time fitting** fits the `t0`/`L_scale` energy-scale, which absorbs the
+//!   constant-`L` part of the lag exactly (same basis); only the *shape*
+//!   (skew/tail) of the asymmetry is not absorbable by position.
+//! - **Resolution calibration** (the `nereids-fitting` calibrator) **pins** the
+//!   energy scale by default — a pure shape/width fit. It can optionally fit a
+//!   SHARED `(t0, L_scale)` under a metrology prior (`with_position_prior`) for
+//!   joint energy-scale / identifiability work. A *free, per-family* position knob
+//!   is deliberately NOT used: because the lag is the same basis as `L_scale`, a
+//!   free position lets a wrong (symmetric) family imitate the asymmetric shift
+//!   and erodes the model-selection χ² (the discriminator is then only the
+//!   position-independent skew/tail). See `nereids-fitting`'s
+//!   `free_l_scale_absorbs_asymmetric_lag_and_erodes_discrimination`.
 //!
 //! `ic_centering_shifts_broadened_symmetric_dip_with_alpha` quantifies the bare
-//! mode→centroid shift; the calibrator's `position_nuisance_recovers_injected_tof_shift`
-//! checks the nuisance neutralizes it. Re-centering the kernel on its centroid
-//! (a future convention change spanning the UDR path too) would remove the shift
-//! at the source.
+//! mode→centroid shift; the calibrator's `fit_t0_recovers_injected_energy_scale_shift`
+//! checks the energy-scale fit recovers an injected offset. Re-centering the kernel
+//! on its centroid (a future convention change spanning the UDR path too) would
+//! remove the shift at the source.
 //!
 //! ## Optional instrument convolutions
 //!

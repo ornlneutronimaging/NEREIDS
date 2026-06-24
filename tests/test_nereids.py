@@ -2684,3 +2684,146 @@ class TestCalibrateEnergySmoke:
         np.testing.assert_array_equal(energies, e_before)
         np.testing.assert_array_equal(transmission, t_before)
         np.testing.assert_array_equal(uncertainty, s_before)
+
+
+class TestCalibrateResolution:
+    """Resolution calibration binding: position is PINNED by default; the shared
+    SAMMY energy-scale ``(t0, L_scale)`` is an explicit, prior-constrained opt-in
+    (replacing the retired per-family ``position_nuisance_us``)."""
+
+    @staticmethod
+    def _calibrant():
+        # Synthetic IC-broadened, non-black calibrant with TWO well-separated
+        # resonances (15 + 45 eV) so the width is identifiable (no width<->position
+        # ridge) — mirrors the Rust erosion test, so a chi2 change is attributable to
+        # the 1/sqrt(E) lag / L_scale confounding, not mere over-parameterization.
+        iso = nereids.create_resonance_data(
+            72,
+            177,
+            175.0,
+            0.7,
+            [(15.0, 3.5, 0.05, 0.06), (45.0, 3.5, 0.05, 0.06)],
+            target_spin=3.5,
+        )
+        flight = 25.0
+        energies = np.linspace(5.0, 60.0, 1000)
+        ic = nereids.IkedaCarpenter(
+            flight_path_m=flight,
+            e_min_ev=0.5e-3,
+            e_max_ev=1000.0,
+            alpha=nereids.EnergyLaw.sqrt_e(0.30, 0.0),
+            beta=0.10,
+            r=nereids.EnergyLaw.exp_mev(25.0),
+        )
+        t = np.asarray(
+            nereids.forward_model(
+                energies,
+                [(iso, 5.0e-4)],
+                temperature_k=300.0,
+                resolution=ic.as_tabulated(),
+            )
+        )
+        unc = np.full_like(t, 0.004)
+        return iso, energies, t, unc
+
+    def test_pins_position_by_default(self):
+        iso, e, t, unc = self._calibrant()
+        cal = nereids.calibrate_resolution(
+            e, t, unc, "ic", isotopes=[(iso, 5.0e-4)], temperature_k=300.0
+        )
+        assert np.isfinite(cal.chi2)
+        # Default config pins position at its center and incurs no prior penalty.
+        assert cal.position_t0_us == 0.0
+        assert cal.position_l_scale == 1.0
+        assert cal.prior_penalty == 0.0
+
+    def test_fit_position_kwargs_accepted_with_prior(self):
+        iso, e, t, unc = self._calibrant()
+        cal = nereids.calibrate_resolution(
+            e,
+            t,
+            unc,
+            "ic",
+            isotopes=[(iso, 5.0e-4)],
+            temperature_k=300.0,
+            fit_t0=True,
+            fit_l_scale=True,
+            t0_prior_us=0.5,
+            l_scale_prior=0.002,
+            restarts=2,
+        )
+        assert np.isfinite(cal.chi2)
+        assert np.isfinite(cal.position_t0_us)
+        assert np.isfinite(cal.position_l_scale)
+        assert cal.prior_penalty >= 0.0
+        # L_scale must respect the ±2% guard rail.
+        assert 0.98 <= cal.position_l_scale <= 1.02
+        # t0 within the ±5 µs guard rail.
+        assert abs(cal.position_t0_us) <= 5.0
+
+    def test_result_exposes_new_position_fields_not_old_nuisance(self):
+        iso, e, t, unc = self._calibrant()
+        cal = nereids.calibrate_resolution(
+            e, t, unc, "gaussian", isotopes=[(iso, 5.0e-4)], temperature_k=300.0
+        )
+        for attr in ("position_t0_us", "position_l_scale", "prior_penalty"):
+            assert hasattr(cal, attr), f"missing new result field {attr}"
+        # The retired per-family nuisance getter must be gone.
+        assert not hasattr(cal, "position_nuisance_us")
+
+    def test_udr_corr_requires_base(self):
+        iso, e, t, unc = self._calibrant()
+        with pytest.raises(ValueError, match="base_udr"):
+            nereids.calibrate_resolution(
+                e,
+                t,
+                unc,
+                "udr_corr",
+                isotopes=[(iso, 5.0e-4)],
+                temperature_k=300.0,
+            )
+
+    def test_free_l_scale_erodes_wrong_family_penalty(self):
+        # Binding-level mirror of the Rust test, on a TWO-resonance calibrant (width
+        # identifiable): a Gaussian fitting an IC calibrant fits better with a free
+        # physical (t0, L_scale) than pinned, because the asymmetric-kernel lag
+        # shares the 1/sqrt(E) basis of an L_scale error — not just more parameters.
+        iso, e, t, unc = self._calibrant()
+        kw = dict(isotopes=[(iso, 5.0e-4)], temperature_k=300.0, restarts=2)
+        pinned = nereids.calibrate_resolution(e, t, unc, "gaussian", **kw)
+        free = nereids.calibrate_resolution(
+            e, t, unc, "gaussian", fit_t0=True, fit_l_scale=True, **kw
+        )
+        assert free.chi2 < pinned.chi2
+
+    def test_invalid_position_prior_rejected(self):
+        iso, e, t, unc = self._calibrant()
+        with pytest.raises(ValueError):
+            nereids.calibrate_resolution(
+                e,
+                t,
+                unc,
+                "ic",
+                isotopes=[(iso, 5.0e-4)],
+                temperature_k=300.0,
+                fit_t0=True,
+                t0_prior_us=-1.0,  # σ must be > 0 when set
+            )
+
+    def test_invalid_flight_path_rejected_not_panicked(self):
+        # Regression for the fit_t0 panic path: a non-positive flight_path_m must
+        # raise ValueError (graceful) rather than panic via the inverted t0 clamp
+        # bound (min > max). Covers both the pinned default and the fit_t0 opt-in.
+        iso, e, t, unc = self._calibrant()
+        for kw in ({}, {"fit_t0": True}):
+            with pytest.raises(ValueError):
+                nereids.calibrate_resolution(
+                    e,
+                    t,
+                    unc,
+                    "ic",
+                    isotopes=[(iso, 5.0e-4)],
+                    temperature_k=300.0,
+                    flight_path_m=-1.0,
+                    **kw,
+                )

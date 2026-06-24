@@ -5454,6 +5454,43 @@ mod tests {
         }
     }
 
+    #[test]
+    fn corrected_energy_grid_matches_energy_scale_model() {
+        // Pin the resolution calibrator's `corrected_energy_grid` to the runtime
+        // `EnergyScaleTransmissionModel::corrected_energies`: they are separate
+        // implementations of the SAME (t0, L_scale) energy-scale convention, and the
+        // calibrated (t0, L_scale) must be consumable by the runtime model. This test
+        // makes a future sign/numerator/L_scale/TOF_FACTOR drift in *either* fail
+        // fast, and anchors the calibrator's recovery tests (which otherwise inject
+        // and recover through the same helper — a self-consistent loop). Probes use
+        // feasible t0 (≪ min_tof) so the runtime clamp never engages and the two are
+        // bit-for-bit comparable.
+        let energies = vec![5.0, 8.0, 12.0, 20.0, 50.0, 120.0];
+        let flight = 25.0;
+        let model = make_energy_scale_u238(energies.clone(), None);
+        for &(t0, l_scale) in &[
+            (0.0, 1.0),
+            (1.5, 1.0),
+            (-2.0, 1.0),
+            (0.0, 1.005),
+            (0.0, 0.995),
+            (1.0, 1.003),
+            (-1.0, 0.997),
+        ] {
+            let runtime = model.corrected_energies(t0, l_scale);
+            let calib =
+                crate::resolution_calib::corrected_energy_grid(&energies, t0, l_scale, flight)
+                    .expect("feasible t0 must not error");
+            for (i, (&r, &c)) in runtime.iter().zip(calib.iter()).enumerate() {
+                assert!(
+                    (r - c).abs() / r < 1e-12,
+                    "convention drift at bin {i} (t0={t0}, L_scale={l_scale}): \
+                     runtime={r}, calibrator={c}"
+                );
+            }
+        }
+    }
+
     /// Issue #608: at identity calibration (t0=0, l_scale=1) the corrected grid
     /// equals the nominal grid, so EnergyScale must evaluate the SAME true σ as
     /// `forward_model` — the independent oracle — to machine precision.

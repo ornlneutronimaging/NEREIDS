@@ -1167,13 +1167,30 @@ impl PyResolutionCalibration {
         self.inner.iterations
     }
 
-    /// Fitted-and-discarded position nuisance (TOF zero-shift, µs). Not part of
-    /// the calibrated resolution; it makes the cross-family χ² compare shape/width
-    /// rather than the asymmetric kernels' mode→centroid position lag. A value
-    /// near ±5 µs flags a position artifact the calibrant could not reconcile.
+    /// Fitted (or pinned) SAMMY energy-scale TOF zero ``t0`` (µs). Equals
+    /// ``t0_center_us`` when ``fit_t0=False`` (the default — position pinned).
+    /// When fit, this is a SHARED energy-scale parameter under a metrology prior,
+    /// not a per-family nuisance (the asymmetric-kernel lag is confounded with
+    /// flight-path ``L_scale``).
     #[getter]
-    fn position_nuisance_us(&self) -> f64 {
-        self.inner.position_nuisance_us
+    fn position_t0_us(&self) -> f64 {
+        self.inner.position_t0_us
+    }
+
+    /// Fitted (or pinned) flight-path scale ``L_scale``. Equals ``l_scale_center``
+    /// when ``fit_l_scale=False`` (the default).
+    #[getter]
+    fn position_l_scale(&self) -> f64 {
+        self.inner.position_l_scale
+    }
+
+    /// Gaussian-prior penalty on the fitted ``(t0, L_scale)`` at the solution
+    /// (0 when position is pinned or has no prior). ``objective = chi2_data +
+    /// prior_penalty``; a large value flags a family that needed a big position
+    /// move (e.g. ΔL/L ≫ the metrology σ) to fit.
+    #[getter]
+    fn prior_penalty(&self) -> f64 {
+        self.inner.prior_penalty
     }
 
     /// Decoded, human-readable fitted parameters.
@@ -1243,15 +1260,28 @@ impl PyResolutionCalibration {
 ///     base_udr: base UDR kernel (required for ``family="udr_corr"``).
 ///     fit_background: also fit anorm + linear baseline (default anorm only).
 ///     restarts: optimizer restarts (keep the best).
+///     fit_t0, fit_l_scale: also fit the SHARED SAMMY energy-scale ``(t0,
+///         L_scale)``. Default ``False`` — position is PINNED at its center (a pure
+///         shape/width calibration on the already energy-calibrated grid). Opt in
+///         only WITH a prior: the asymmetric-kernel mode→centroid lag is the same
+///         ``1/√E`` basis as ``L_scale``, so a free ``L_scale`` absorbs the lag and
+///         corrupts the calibrated width. Use this for joint energy-scale / cross-
+///         family identifiability work, with ``t0_prior_us`` / ``l_scale_prior``
+///         set from the instrument's flight-path / timing metrology.
+///     t0_center_us, l_scale_center: prior means / pinned values (default 0.0, 1.0).
+///     t0_prior_us, l_scale_prior: Gaussian prior σ (``None`` = flat/bounded only).
 ///
 /// Returns:
-///     ResolutionCalibration with the fitted params, χ²/dof, and the calibrated
-///     resolution (``.as_tabulated()`` / ``.gaussian_params()``).
+///     ResolutionCalibration with the fitted params, data χ²/dof, the fitted (or
+///     pinned) ``position_t0_us`` / ``position_l_scale`` / ``prior_penalty``, and
+///     the calibrated resolution (``.as_tabulated()`` / ``.gaussian_params()``).
 #[pyfunction]
 #[pyo3(signature = (
     energies, data, uncertainty, family, isotopes=None, groups=None,
     temperature_k=293.6, base_udr=None, flight_path_m=25.0, fit_background=false,
-    restarts=1, ic_n_energies=64, ic_n_tau=500
+    restarts=1, ic_n_energies=64, ic_n_tau=500,
+    fit_t0=false, fit_l_scale=false, t0_center_us=0.0, l_scale_center=1.0,
+    t0_prior_us=None, l_scale_prior=None
 ))]
 #[allow(clippy::too_many_arguments)]
 fn calibrate_resolution(
@@ -1269,6 +1299,12 @@ fn calibrate_resolution(
     restarts: usize,
     ic_n_energies: usize,
     ic_n_tau: usize,
+    fit_t0: bool,
+    fit_l_scale: bool,
+    t0_center_us: f64,
+    l_scale_center: f64,
+    t0_prior_us: Option<f64>,
+    l_scale_prior: Option<f64>,
 ) -> PyResult<PyResolutionCalibration> {
     if isotopes.is_some() == groups.is_some() {
         return Err(pyo3::exceptions::PyValueError::new_err(
@@ -1370,6 +1406,12 @@ fn calibrate_resolution(
         restarts,
         ic_n_energies,
         ic_n_tau,
+        fit_t0,
+        fit_l_scale,
+        position_t0_center_us: t0_center_us,
+        position_l_scale_center: l_scale_center,
+        position_t0_prior_us: t0_prior_us,
+        position_l_scale_prior: l_scale_prior,
         ..Default::default()
     };
     let (e_owned, d_owned, u_owned) = (e.to_vec(), d.to_vec(), u.to_vec());

@@ -52,31 +52,65 @@ pub const UDR_S0_MAX: f64 = 5.0;
 /// resonance regime makes the slow/storage term — and hence `β` — unidentifiable,
 /// so it is held fixed rather than reported as a meaningless fit result.
 const IC_FIXED_BETA: f64 = 0.1;
-/// Bound (µs) on the per-family **position nuisance** — a TOF zero-shift fit
-/// and discarded during calibration so the cross-family χ² compares *shape/width*
-/// rather than absolute position. The asymmetric IC/UDR kernels are mode-anchored,
-/// so their broadened centroid lags by ~1/α(E); at run time the fitted `t0`/`L`
-/// energy-scale absorbs that lag, but calibration holds `t0`/`L` fixed, so without
-/// this nuisance the lag would bias the model-selection χ² toward the symmetric
-/// Gaussian. ±5 µs is wide enough to absorb the constant part of the lag and tight
-/// enough not to fit real resonance positions (fixed by the known calibrant).
-const POSITION_NUISANCE_US_MAX: f64 = 5.0;
+/// Guard-rail bound (µs) on the optional fitted TOF zero `t0`. `t0` and `L_scale`
+/// are the SAMMY *energy-scale* parameters; resolution calibration pins them by
+/// default and fits them only as an explicit, prior-constrained opt-in (see
+/// [`CalibrationConfig::with_position_prior`]). ±5 µs is a guard rail far inside
+/// the feasible `|t0| < min(TOF)`; the *real* constraint on `t0` is the metrology
+/// prior, not this bound.
+///
+/// History: a previous design fit a *free per-family* constant `t0` and discarded
+/// it ("position nuisance") to make the cross-family χ² compare shape/width. That
+/// was wrong — the asymmetric-kernel mode→centroid lag is `≈1/√E` (exact for the
+/// `a1=0` prompt law `α=a0√E`, leading-order otherwise), the SAME basis as an
+/// `L_scale` error, so a free per-family `t0`/`L_scale` lets a wrong (symmetric)
+/// family imitate the lag and buy back the strongest evidence against it (χ² 6.0 →
+/// 1.3 in the Hf-177 study). Position is now a SHARED energy-scale parameter with a
+/// metrology prior, never a free per-family knob.
+const POSITION_T0_US_MAX: f64 = 5.0;
+/// Guard-rail bounds (±2%) on the optional fitted flight-path scale `L_scale`.
+/// The IC mode→centroid lag needs only `ΔL/L ≈ 0.22%` to be mimicked, so a *free*
+/// `L_scale` absorbs the lag and corrupts the calibrated width — fit it only under
+/// a prior, for an explicit energy-scale / identifiability study.
+const POSITION_L_SCALE_MIN: f64 = 0.98;
+/// Upper guard-rail bound on `L_scale`; see [`POSITION_L_SCALE_MIN`].
+const POSITION_L_SCALE_MAX: f64 = 1.02;
 
-/// Apply a TOF zero-shift `t0_us` to an energy grid: a feature at nominal energy
-/// `E` is observed at TOF `TOF(E) + t0`, i.e. apparent energy
-/// `E / (1 + t0·√E/(TOF_FACTOR·L))²`. Monotonic and positivity-preserving for the
-/// bounded `|t0| ≤ POSITION_NUISANCE_US_MAX`. Used as the per-family position
-/// nuisance (see [`POSITION_NUISANCE_US_MAX`]).
-fn shift_energy_grid(energies: &[f64], t0_us: f64, flight_path_m: f64) -> Vec<f64> {
-    if t0_us == 0.0 {
-        return energies.to_vec();
+/// Map an energy grid through the SAMMY energy-scale `(t0, L_scale)`, using the
+/// SAME convention as `EnergyScaleTransmissionModel::corrected_energies`: with
+/// nominal `tof(E) = TOF_FACTOR·L/√E`, the corrected energy is
+/// `E' = (TOF_FACTOR·L·L_scale / (tof − t0))²`. Identity at `(t0, L_scale) = (0, 1)`.
+///
+/// Note the `−t0` sign (a positive `t0` is *subtracted* from the measured TOF, so
+/// it raises the corrected energy) — this is the shipped energy-scale convention,
+/// opposite to the `+t0` form used by the retired position nuisance. Errors if any
+/// corrected TOF `tof − t0 ≤ 0` (a `t0` past the shortest flight time).
+///
+/// `pub(crate)` so the equivalence to the runtime
+/// [`EnergyScaleTransmissionModel::corrected_energies`] is *pinned by a test*
+/// (`corrected_energy_grid_matches_energy_scale_model`) rather than only asserted
+/// in prose — a future edit to either convention then fails fast.
+pub(crate) fn corrected_energy_grid(
+    energies: &[f64],
+    t0_us: f64,
+    l_scale: f64,
+    flight_path_m: f64,
+) -> Result<Vec<f64>, FittingError> {
+    if t0_us == 0.0 && l_scale == 1.0 {
+        return Ok(energies.to_vec());
     }
     let kl = TOF_FACTOR * flight_path_m;
     energies
         .iter()
         .map(|&e| {
-            let denom = 1.0 + t0_us * e.sqrt() / kl;
-            e / (denom * denom)
+            let tof = kl / e.sqrt();
+            let denom = tof - t0_us;
+            if denom <= 0.0 || !denom.is_finite() {
+                return Err(FittingError::EvaluationFailed(
+                    "corrected TOF ≤ 0: t0 exceeds the shortest flight time".into(),
+                ));
+            }
+            Ok((kl * l_scale / denom).powi(2))
         })
         .collect()
 }
@@ -150,6 +184,29 @@ pub struct CalibrationConfig {
     /// IC synthesis grid resolution (energies × τ-samples per kernel).
     pub ic_n_energies: usize,
     pub ic_n_tau: usize,
+    /// Fit the SAMMY TOF-zero `t0` (µs) as a SHARED energy-scale parameter.
+    /// **Default `false`** — position is pinned at
+    /// [`position_t0_center_us`](Self::position_t0_center_us) so calibration is a
+    /// pure shape/width fit (matching SAMMY, where `t0`/`L` are a separate
+    /// energy-scale calibration). Opt in only *with* a metrology prior; see
+    /// [`with_position_prior`](CalibrationConfig::with_position_prior).
+    pub fit_t0: bool,
+    /// Fit the flight-path scale `L_scale` as a shared energy-scale parameter.
+    /// **Default `false`.** A free `L_scale` shares the asymmetric-kernel lag's
+    /// `1/√E` basis and corrupts the calibrated width — fit it only under a prior.
+    pub fit_l_scale: bool,
+    /// Prior mean (and pinned value when [`fit_t0`](Self::fit_t0) is false) of the
+    /// TOF zero `t0` (µs). Default `0.0`. Lets a caller inject a pre-calibrated `t0`.
+    pub position_t0_center_us: f64,
+    /// Prior mean (and pinned value when [`fit_l_scale`](Self::fit_l_scale) is
+    /// false) of `L_scale`. Default `1.0`.
+    pub position_l_scale_center: f64,
+    /// Gaussian prior σ on `t0` (µs); `None` = flat (bounded only). When set, adds
+    /// `((t0 − center)/σ)²` to the data χ² (a metrology penalty, *not* part of the
+    /// reported `chi2_dof`).
+    pub position_t0_prior_us: Option<f64>,
+    /// Gaussian prior σ on `L_scale`; `None` = flat. See [`position_t0_prior_us`](Self::position_t0_prior_us).
+    pub position_l_scale_prior: Option<f64>,
 }
 
 impl Default for CalibrationConfig {
@@ -169,7 +226,42 @@ impl Default for CalibrationConfig {
             max_iter: 800,
             ic_n_energies: 64,
             ic_n_tau: 500,
+            // Position is PINNED by default: pure shape/width calibration on the
+            // (already energy-calibrated) grid. Energy-scale fitting is an explicit
+            // opt-in via `with_position_prior`.
+            fit_t0: false,
+            fit_l_scale: false,
+            position_t0_center_us: 0.0,
+            position_l_scale_center: 1.0,
+            position_t0_prior_us: None,
+            position_l_scale_prior: None,
         }
+    }
+}
+
+impl CalibrationConfig {
+    /// Enable a SHARED, metrology-priored energy-scale `(t0, L_scale)` fit: sets
+    /// [`fit_t0`](Self::fit_t0)/[`fit_l_scale`](Self::fit_l_scale), the prior means
+    /// (`*_center`), and the Gaussian prior σ. Use this for joint energy-scale or
+    /// cross-family identifiability work; the default config pins position (pure
+    /// shape/width calibration). Pass the prior σ from the instrument's independent
+    /// flight-path / timing metrology — a loose σ marginalizes position (weak,
+    /// honest shape-only discrimination), a tight σ pins it.
+    #[must_use]
+    pub fn with_position_prior(
+        mut self,
+        t0_center_us: f64,
+        l_scale_center: f64,
+        sigma_t0_us: f64,
+        sigma_l_scale: f64,
+    ) -> Self {
+        self.fit_t0 = true;
+        self.fit_l_scale = true;
+        self.position_t0_center_us = t0_center_us;
+        self.position_l_scale_center = l_scale_center;
+        self.position_t0_prior_us = Some(sigma_t0_us);
+        self.position_l_scale_prior = Some(sigma_l_scale);
+        self
     }
 }
 
@@ -180,7 +272,9 @@ pub struct CalibrationResult {
     pub family: String,
     /// Fitted parameter vector (raw optimizer space; see [`ResolutionFamily`]).
     pub theta: Vec<f64>,
-    /// χ²/dof of the best fit (after anorm/baseline).
+    /// Reduced **data** χ²/dof of the best fit (after anorm/baseline). The
+    /// energy-scale prior penalty is *excluded* — it is reported separately as
+    /// [`prior_penalty`](Self::prior_penalty).
     pub chi2_dof: f64,
     /// The calibrated resolution, ready to pin into a sample fit.
     pub resolution: ResolutionFunction,
@@ -188,12 +282,21 @@ pub struct CalibrationResult {
     pub iterations: usize,
     /// Whether the winning restart self-converged.
     pub converged: bool,
-    /// Fitted-and-discarded per-family **position nuisance** (TOF zero-shift, µs,
-    /// bounded to ±5). This is *not* part of the calibrated resolution; it exists
-    /// only so the cross-family χ² compares shape/width rather than the asymmetric
-    /// kernels' mode→centroid position lag. A value near the ±5 µs bound flags a
-    /// position artifact the calibrant could not otherwise reconcile.
-    pub position_nuisance_us: f64,
+    /// Fitted (or pinned) SAMMY energy-scale TOF zero `t0` (µs). Equals
+    /// `config.position_t0_center_us` when `fit_t0` is false (pinned). When fit, it
+    /// is a SHARED energy-scale parameter (not a per-family nuisance): the resonance
+    /// dip position is confounded with flight-path geometry (the asymmetric-kernel
+    /// lag is the same `1/√E` basis as `L_scale`), so `t0`/`L_scale` are constrained
+    /// by the metrology prior, not free.
+    pub position_t0_us: f64,
+    /// Fitted (or pinned) flight-path scale `L_scale`. Equals
+    /// `config.position_l_scale_center` when `fit_l_scale` is false.
+    pub position_l_scale: f64,
+    /// Gaussian-prior penalty `Σ((θ−center)/σ)²` on the fitted `(t0, L_scale)` at the
+    /// solution (0 when no position prior is active). `objective = χ²_data +
+    /// prior_penalty`; report it alongside `chi2_dof` so a large position move
+    /// (e.g. a wrong family needing ΔL/L ≫ the metrology σ) is visible, not hidden.
+    pub prior_penalty: f64,
 }
 
 fn build_resolution(
@@ -244,13 +347,16 @@ fn build_resolution(
     }
 }
 
-/// χ²/dof after analytically fitting `anorm` (+ optional constant+linear
-/// baseline): `data ≈ a·model (+ b0 + b1·x)`, weighted by `1/unc`. `n_res_params`
-/// is the number of resolution parameters fit by the outer loop; it is subtracted
-/// from the dof alongside the linear `anorm`/baseline columns so the reported
-/// χ²/dof counts *all* free parameters (the outer-loop resolution params are not
-/// in the linear system but still consume degrees of freedom).
-fn inner_chi2(data: &[f64], unc: &[f64], model: &[f64], fit_bg: bool, n_res_params: usize) -> f64 {
+/// Weighted residual sum of squares after analytically profiling out `anorm`
+/// (+ optional constant+linear baseline): `data ≈ a·model (+ b0 + b1·x)`, weighted
+/// by `1/unc²`. Returns `(ssr, k)` where `k` is the number of linear nuisance
+/// columns (1 = anorm only, 3 = anorm+const+linear). This is the **raw** χ² (not
+/// divided by dof) so an energy-scale **prior penalty** can be added to it in the
+/// same units before the optimizer minimizes — adding a penalty to a *reduced* χ²
+/// would silently rescale the prior by the dof. Returns `None` on a singular
+/// normal-equations system (a degenerate/constant model column), so the caller can
+/// treat the point as infeasible rather than as a spuriously zeroed fit.
+fn inner_ssr(data: &[f64], unc: &[f64], model: &[f64], fit_bg: bool) -> Option<(f64, usize)> {
     let n = data.len();
     let k = if fit_bg { 3 } else { 1 };
     let mut ata = vec![0.0f64; k * k];
@@ -270,13 +376,7 @@ fn inner_chi2(data: &[f64], unc: &[f64], model: &[f64], fit_bg: bool, n_res_para
             }
         }
     }
-    // A singular normal-equations system (e.g. a degenerate/constant model
-    // column) means anorm/baseline are unfit-able for this θ — report the point
-    // as infeasible so the optimizer steps away, rather than a spuriously
-    // inflated finite χ² from a zeroed solution.
-    let Some(coef) = solve_small(&ata, &atb, k) else {
-        return f64::INFINITY;
-    };
+    let coef = solve_small(&ata, &atb, k)?;
     let mut ssr = 0.0;
     for i in 0..n {
         let w2 = 1.0 / unc[i].max(1e-9).powi(2);
@@ -292,8 +392,40 @@ fn inner_chi2(data: &[f64], unc: &[f64], model: &[f64], fit_bg: bool, n_res_para
         };
         ssr += (data[i] - pred).powi(2) * w2;
     }
-    let dof = n.saturating_sub(k + n_res_params).max(1) as f64;
-    ssr / dof
+    Some((ssr, k))
+}
+
+/// Reduced χ²/dof = [`inner_ssr`] `/ (n − k − n_res_params)`, ∞ on a singular
+/// system. `n_res_params` counts the outer-loop parameters (resolution + any free
+/// position) which are not in the linear system but still consume dof. Test-only:
+/// the calibrator minimizes raw `inner_ssr` (+ prior) and reduces at the solution.
+#[cfg(test)]
+fn inner_chi2(data: &[f64], unc: &[f64], model: &[f64], fit_bg: bool, n_res_params: usize) -> f64 {
+    match inner_ssr(data, unc, model, fit_bg) {
+        Some((ssr, k)) => {
+            let dof = data.len().saturating_sub(k + n_res_params).max(1) as f64;
+            ssr / dof
+        }
+        None => f64::INFINITY,
+    }
+}
+
+/// Gaussian-prior penalty `Σ((θ − center)/σ)²` on the fitted energy-scale
+/// `(t0, L_scale)`. Only active coordinates (fit + prior σ set) contribute; a flat
+/// (σ = `None`) or pinned coordinate contributes 0.
+fn position_prior_penalty(t0_us: f64, l_scale: f64, cfg: &CalibrationConfig) -> f64 {
+    let mut penalty = 0.0;
+    if cfg.fit_t0
+        && let Some(sigma) = cfg.position_t0_prior_us
+    {
+        penalty += ((t0_us - cfg.position_t0_center_us) / sigma).powi(2);
+    }
+    if cfg.fit_l_scale
+        && let Some(sigma) = cfg.position_l_scale_prior
+    {
+        penalty += ((l_scale - cfg.position_l_scale_center) / sigma).powi(2);
+    }
+    penalty
 }
 
 /// Solve a small `k×k` linear system `A x = b` (k ≤ 3) by Gaussian elimination
@@ -345,13 +477,28 @@ fn solve_small(a: &[f64], b: &[f64], k: usize) -> Option<Vec<f64>> {
 /// Calibrate the resolution parameters of `family` against a known-(ρ,T)
 /// calibrant.
 ///
-/// `sample` carries the FIXED density and temperature (and isotopes/groups);
-/// only the resolution parameters are optimized. Returns the fitted parameters,
-/// χ²/dof, and the calibrated [`ResolutionFunction`] (ready to pin).
+/// `sample` carries the FIXED density and temperature (and isotopes/groups). By
+/// default **only the resolution shape/width is optimized**, at the pinned energy
+/// scale `(t0, L_scale) = (center, center)` — a pure broadening calibration on an
+/// already energy-calibrated grid (this is the SAMMY split: resolution is a
+/// broadening kernel; `t0`/`L` are a *separate* energy-scale calibration).
+///
+/// Set [`CalibrationConfig::fit_t0`]/[`fit_l_scale`](CalibrationConfig::fit_l_scale)
+/// (e.g. via [`CalibrationConfig::with_position_prior`]) to *also* fit the SHARED
+/// energy-scale `(t0, L_scale)` under a Gaussian metrology prior — for joint
+/// energy-scale work or a cross-family identifiability study. Do **not** fit
+/// position with a flat prior in production: the asymmetric-kernel mode→centroid
+/// lag is the same `1/√E` basis as `L_scale`, so a free `L_scale` absorbs the lag
+/// and corrupts the calibrated width.
+///
+/// Returns the fitted shape parameters, the reduced **data** χ²/dof, the fitted (or
+/// pinned) `(t0, L_scale)`, the prior penalty, and the calibrated
+/// [`ResolutionFunction`] (ready to pin).
 ///
 /// # Errors
 /// [`FittingError::EmptyData`] / [`FittingError::LengthMismatch`] for bad
-/// inputs; propagates optimizer errors.
+/// inputs; [`FittingError::InvalidConfig`] for a bad grid or position config;
+/// propagates optimizer errors.
 pub fn calibrate_resolution(
     family: ResolutionFamily,
     energies: &[f64],
@@ -411,32 +558,125 @@ pub fn calibrate_resolution(
             "calibrant must have at least one isotope with a finite, positive density".into(),
         ));
     }
-    // Reject under-determined calibrants: need more data points than the total
-    // free parameters (resolution params + 1 position nuisance + the anorm/baseline
-    // columns), else the reported χ²/dof is meaningless.
+    // Reject under-determined calibrants: need strictly more data points than the
+    // total free parameters (resolution + any *fitted* position + anorm/baseline).
     let n_res = family.n_params();
+    let n_pos = usize::from(config.fit_t0) + usize::from(config.fit_l_scale);
     let baseline_cols = if config.fit_background { 3 } else { 1 };
-    if data.len() <= n_res + 1 + baseline_cols {
+    if data.len() <= n_res + n_pos + baseline_cols {
         return Err(FittingError::InvalidConfig(format!(
-            "calibrant has {} points but the model has {} resolution + 1 position + {} baseline \
+            "calibrant has {} points but the model has {} resolution + {} position + {} baseline \
              parameters; need strictly more data points than parameters",
             data.len(),
             n_res,
+            n_pos,
             baseline_cols,
         )));
     }
+    // Flight path is a physical positive length. A non-positive / non-finite value
+    // would invert the t0 feasibility bound below (min_tof < 0 ⇒ t0_hi < t0_lo ⇒
+    // `clamp(lo, hi)` panic) as soon as `fit_t0` appends a bounded coordinate, and
+    // otherwise only surfaces as a generic "no finite-objective" error. Reject it
+    // precisely up front (covers every family and the fit/pin paths alike).
+    if !(config.flight_path_m.is_finite() && config.flight_path_m > 0.0) {
+        return Err(FittingError::InvalidConfig(
+            "flight_path_m must be finite and > 0".into(),
+        ));
+    }
+    // Validate the energy-scale (t0, L_scale) prior/center configuration up front.
+    if !config.position_t0_center_us.is_finite()
+        || !config.position_l_scale_center.is_finite()
+        || config.position_l_scale_center <= 0.0
+    {
+        return Err(FittingError::InvalidConfig(
+            "position centers must be finite and the L_scale center > 0".into(),
+        ));
+    }
+    if config.position_t0_center_us.abs() >= POSITION_T0_US_MAX {
+        return Err(FittingError::InvalidConfig(format!(
+            "position_t0_center_us must lie within ±{POSITION_T0_US_MAX} µs"
+        )));
+    }
+    if config.position_l_scale_center < POSITION_L_SCALE_MIN
+        || config.position_l_scale_center > POSITION_L_SCALE_MAX
+    {
+        return Err(FittingError::InvalidConfig(format!(
+            "position_l_scale_center must lie within [{POSITION_L_SCALE_MIN}, {POSITION_L_SCALE_MAX}]"
+        )));
+    }
+    for (sigma, name) in [
+        (config.position_t0_prior_us, "position_t0_prior_us"),
+        (config.position_l_scale_prior, "position_l_scale_prior"),
+    ] {
+        if let Some(s) = sigma
+            && !(s.is_finite() && s > 0.0)
+        {
+            return Err(FittingError::InvalidConfig(format!(
+                "{name} must be finite and > 0 when set"
+            )));
+        }
+    }
+
     let e_min = energies.first().copied().unwrap_or(1.0);
     let e_max = energies.last().copied().unwrap_or(1.0);
-    // Append the per-family position nuisance (TOF shift, µs) as the last optimizer
-    // coordinate; it shifts the model grid but does not enter the resolution kernel.
+    // Feasible t0 upper bound: the corrected TOF `tof − t0` must stay positive for
+    // every energy, i.e. `t0 < min(tof) = TOF_FACTOR·L/√E_max`. Far outside ±5 µs in
+    // the eV regime, but clamp defensively so a wide window can never make it bite.
+    let min_tof = TOF_FACTOR * config.flight_path_m / e_max.max(1e-12).sqrt();
+    // The (pinned or prior-mean) t0 center must itself be feasible: corrected_energy_grid
+    // needs `t0 < min(tof)` for every energy. In the eV regime min_tof ≫ 5 µs, but a
+    // short flight path or very high E_max can shrink it — reject up front with a precise
+    // message instead of a late, generic "corrected TOF ≤ 0" from the final recompute.
+    if config.position_t0_center_us >= min_tof {
+        return Err(FittingError::InvalidConfig(format!(
+            "position_t0_center_us ({:.3} µs) must be below the shortest flight time \
+             min_tof = TOF_FACTOR·L/√E_max = {min_tof:.3} µs",
+            config.position_t0_center_us
+        )));
+    }
+    let t0_lo = -POSITION_T0_US_MAX;
+    let t0_hi = POSITION_T0_US_MAX.min(min_tof - 1e-6);
+
+    // Optimizer coordinates: [resolution params (n_res)..., t0?, L_scale?]. A
+    // position coordinate is appended only when fit; otherwise it is pinned at its
+    // center. (Position is a SHARED energy-scale parameter, not a per-family
+    // nuisance — fitting it is an explicit, prior-constrained opt-in.)
     let (mut x0, mut bounds) = family.x0_bounds();
-    x0.push(0.0);
-    bounds.push((-POSITION_NUISANCE_US_MAX, POSITION_NUISANCE_US_MAX));
+    if config.fit_t0 {
+        x0.push(config.position_t0_center_us.clamp(t0_lo, t0_hi));
+        bounds.push((t0_lo, t0_hi));
+    }
+    if config.fit_l_scale {
+        x0.push(
+            config
+                .position_l_scale_center
+                .clamp(POSITION_L_SCALE_MIN, POSITION_L_SCALE_MAX),
+        );
+        bounds.push((POSITION_L_SCALE_MIN, POSITION_L_SCALE_MAX));
+    }
     let nm = NelderMeadConfig {
         xatol: config.xatol,
         fatol: config.fatol,
         max_iter: config.max_iter,
         ..Default::default()
+    };
+
+    // Read the (possibly pinned) position coordinates out of an optimizer vector.
+    let unpack_position = |theta: &[f64]| -> (f64, f64) {
+        let mut idx = n_res;
+        let t0 = if config.fit_t0 {
+            let v = theta[idx];
+            idx += 1;
+            v
+        } else {
+            config.position_t0_center_us
+        };
+        let l_scale = if config.fit_l_scale {
+            theta[idx]
+        } else {
+            config.position_l_scale_center
+        };
+        (t0, l_scale)
     };
 
     let mut best: Option<NelderMeadResult> = None;
@@ -450,25 +690,27 @@ pub fn calibrate_resolution(
             .map(|(&v, &(lo, hi))| (v + 0.1 * r as f64 * (hi - lo)).clamp(lo, hi))
             .collect();
         let obj = |theta: &[f64]| -> Result<f64, FittingError> {
-            // theta = [resolution params (n_res)..., position nuisance t0]. The
-            // resolution kernel uses only the first n_res; t0 shifts the model grid.
+            // theta = [resolution params (n_res)..., t0?, L_scale?]. The resolution
+            // kernel uses only the first n_res; (t0, L_scale) set the energy scale.
             let res = build_resolution(&family, theta, e_min, e_max, config)?;
             let inst = InstrumentParams { resolution: res };
-            let t0 = theta[n_res];
-            let grid = shift_energy_grid(energies, t0, config.flight_path_m);
+            let (t0, l_scale) = unpack_position(theta);
+            // Infeasible energy scale (corrected TOF ≤ 0) → step away.
+            let Ok(grid) = corrected_energy_grid(energies, t0, l_scale, config.flight_path_m)
+            else {
+                return Ok(f64::INFINITY);
+            };
             let model = forward_model(&grid, sample, Some(&inst))
                 .map_err(|e| FittingError::EvaluationFailed(format!("forward: {e:?}")))?;
             if !model.iter().all(|v| v.is_finite()) {
                 return Err(FittingError::EvaluationFailed("non-finite model".into()));
             }
-            // +1 dof for the position nuisance.
-            Ok(inner_chi2(
-                data,
-                unc,
-                &model,
-                config.fit_background,
-                n_res + 1,
-            ))
+            // Minimize RAW χ²_data + metrology prior penalty (same units — adding
+            // the penalty to a reduced χ² would rescale the prior by the dof).
+            let Some((ssr, _k)) = inner_ssr(data, unc, &model, config.fit_background) else {
+                return Ok(f64::INFINITY);
+            };
+            Ok(ssr + position_prior_penalty(t0, l_scale, config))
         };
         let res = nelder_mead_minimize(obj, &start, Some(&bounds), &nm)?;
         if best.as_ref().is_none_or(|b| res.fun < b.fun) {
@@ -478,25 +720,43 @@ pub fn calibrate_resolution(
     let best = best.expect("at least one restart runs");
     if !best.fun.is_finite() {
         return Err(FittingError::EvaluationFailed(
-            "calibration found no finite-χ² resolution (the forward model failed for every \
-             parameter vector tried)"
+            "calibration found no finite-objective resolution (the forward model failed for \
+             every parameter vector tried)"
                 .into(),
         ));
     }
+    let (position_t0_us, position_l_scale) = unpack_position(&best.x);
+    let prior_penalty = position_prior_penalty(position_t0_us, position_l_scale, config);
+    // Recompute the reduced DATA χ²/dof at the solution: the objective carries the
+    // prior penalty, so `best.fun` is the penalized objective, not the data χ². dof
+    // subtracts the linear anorm/baseline columns AND the outer-loop params
+    // (resolution + any fitted position).
     let resolution = build_resolution(&family, &best.x, e_min, e_max, config)?;
-    // The position nuisance is the last coordinate; report it as a diagnostic but
-    // keep `theta` the resolution params only (the nuisance is discarded — the
-    // calibrated resolution is pinned at the calibrant's real, fixed geometry).
-    let position_nuisance_us = best.x[n_res];
+    let grid = corrected_energy_grid(
+        energies,
+        position_t0_us,
+        position_l_scale,
+        config.flight_path_m,
+    )?;
+    let inst = InstrumentParams { resolution };
+    let model = forward_model(&grid, sample, Some(&inst))
+        .map_err(|e| FittingError::EvaluationFailed(format!("forward: {e:?}")))?;
+    let (ssr, k) = inner_ssr(data, unc, &model, config.fit_background).ok_or_else(|| {
+        FittingError::EvaluationFailed("singular anorm/baseline at the solution".into())
+    })?;
+    let dof = data.len().saturating_sub(k + n_res + n_pos).max(1) as f64;
+    let chi2_dof = ssr / dof;
     let theta = best.x[..n_res].to_vec();
     Ok(CalibrationResult {
         family: family.label().to_string(),
         theta,
-        chi2_dof: best.fun,
-        resolution,
+        chi2_dof,
+        resolution: inst.resolution,
         iterations: best.iterations,
         converged: best.self_converged,
-        position_nuisance_us,
+        position_t0_us,
+        position_l_scale,
+        prior_penalty,
     })
 }
 
@@ -533,10 +793,10 @@ mod tests {
         // (centroid invariance + std scaling) is independently verified by
         // `width_corrected_preserves_centroid_scales_width_and_energy_dependence`
         // in nereids-physics.
-        // Two well-separated resonances (15 + 45 eV) so width is identifiable
-        // alongside the per-family position nuisance (a single resonance leaves a
-        // width↔position ridge). Calibrant generated with a UDR truth scaled by
-        // s0=1.5; udr_corr must recover s0≈1.5 at χ²≈0.
+        // Two well-separated resonances (15 + 45 eV) so the width is identifiable
+        // (a single resonance leaves a width↔position ridge). Position is pinned by
+        // default. Calibrant generated with a UDR truth scaled by s0=1.5; udr_corr
+        // must recover s0≈1.5 at χ²≈0.
         let iso_lo = synthetic_isotope(72, 178, 15.0, 0.05, 0.06);
         let iso_hi = synthetic_isotope(72, 179, 45.0, 0.05, 0.06);
         let sample = SampleParams::new(300.0, vec![(iso_lo, 2.0e-3), (iso_hi, 2.0e-3)]).unwrap();
@@ -713,22 +973,23 @@ mod tests {
     }
 
     #[test]
-    fn position_nuisance_recovers_injected_tof_shift() {
-        // Inject a known TOF zero-shift into the calibrant and confirm the position
-        // nuisance recovers it while the width is still recovered — i.e. position
-        // is fit + discarded, not folded into the resolution. This is the mechanism
-        // that makes the cross-family χ² compare shape/width, not absolute position.
+    fn fit_t0_recovers_injected_energy_scale_shift() {
+        // With fit_t0 enabled, an injected TOF-zero offset in the calibrant is
+        // recovered as the SHARED energy-scale t0 while the width is still
+        // recovered — position is a fitted energy-scale parameter (−t0 convention),
+        // not folded into the resolution. (Default config pins position; this test
+        // opts in.) L_scale stays pinned at 1.
         let iso_lo = synthetic_isotope(72, 178, 15.0, 0.05, 0.06);
         let iso_hi = synthetic_isotope(72, 179, 45.0, 0.05, 0.06);
         let sample = SampleParams::new(300.0, vec![(iso_lo, 2.0e-3), (iso_hi, 2.0e-3)]).unwrap();
         let energies: Vec<f64> = (0..700).map(|i| 8.0 + i as f64 * 0.06).collect();
         let base = synthetic_base_udr();
-        let (s0_true, t0_inject) = (1.4, 1.5_f64); // µs
+        let (s0_true, t0_inject) = (1.4, 1.5_f64); // µs (energy-scale −t0 convention)
         let truth = ResolutionFunction::Tabulated(Arc::new(
             base.width_corrected(s0_true, 0.0, UDR_E_REF).unwrap(),
         ));
-        // Generate the calibrant on a TOF-shifted grid (resonances displaced by t0).
-        let shifted = shift_energy_grid(&energies, t0_inject, 25.0);
+        // Calibrant generated on a grid displaced by the energy-scale t0.
+        let shifted = corrected_energy_grid(&energies, t0_inject, 1.0, 25.0).unwrap();
         let data = forward_model(
             &shifted,
             &sample,
@@ -736,8 +997,10 @@ mod tests {
         )
         .unwrap();
         let unc = vec![0.004; energies.len()];
+        // Opt into fitting t0 (flat prior); L_scale stays pinned at 1.
         let cfg = CalibrationConfig {
             restarts: 3,
+            fit_t0: true,
             ..Default::default()
         };
         let r = calibrate_resolution(
@@ -757,21 +1020,265 @@ mod tests {
             "recovered s0={s0}, expected {s0_true}"
         );
         assert!(
-            (r.position_nuisance_us - t0_inject).abs() < 0.3,
+            (r.position_t0_us - t0_inject).abs() < 0.3,
             "recovered t0={}, expected {t0_inject}",
-            r.position_nuisance_us
+            r.position_t0_us
+        );
+        assert!(
+            (r.position_l_scale - 1.0).abs() < 1e-9,
+            "L_scale should stay pinned at 1, got {}",
+            r.position_l_scale
         );
         assert!(r.chi2_dof < 1e-2, "χ²/dof={} too high", r.chi2_dof);
     }
 
     #[test]
+    fn pinned_position_is_the_default_and_works_for_udr() {
+        // The default config pins position (fit_t0/fit_l_scale = false) — a pure
+        // shape/width fit. This is the no-position reference that the retired design
+        // could NOT construct for the UDR family in Python (the width-correction was
+        // Rust-internal). Self-fit must recover s0≈1 with position reported at its
+        // pinned center and zero prior penalty.
+        let iso_lo = synthetic_isotope(72, 178, 15.0, 0.05, 0.06);
+        let iso_hi = synthetic_isotope(72, 179, 45.0, 0.05, 0.06);
+        let sample = SampleParams::new(300.0, vec![(iso_lo, 2.0e-3), (iso_hi, 2.0e-3)]).unwrap();
+        let energies: Vec<f64> = (0..700).map(|i| 8.0 + i as f64 * 0.06).collect();
+        let base = synthetic_base_udr();
+        let truth = ResolutionFunction::Tabulated(Arc::new(base.clone()));
+        let data = forward_model(
+            &energies,
+            &sample,
+            Some(&InstrumentParams { resolution: truth }),
+        )
+        .unwrap();
+        let unc = vec![0.004; energies.len()];
+        let cfg = CalibrationConfig::default();
+        assert!(!cfg.fit_t0 && !cfg.fit_l_scale, "default must pin position");
+        let r = calibrate_resolution(
+            ResolutionFamily::UdrCorr {
+                base: Arc::new(base),
+            },
+            &energies,
+            &data,
+            &unc,
+            &sample,
+            &cfg,
+        )
+        .unwrap();
+        let s0 = r.theta[0].exp().clamp(UDR_S0_MIN, UDR_S0_MAX);
+        assert!((s0 - 1.0).abs() < 0.1, "recovered s0={s0}, expected ~1.0");
+        assert_eq!(r.position_t0_us, 0.0, "t0 pinned at center 0");
+        assert_eq!(r.position_l_scale, 1.0, "L_scale pinned at center 1");
+        assert_eq!(r.prior_penalty, 0.0, "no prior active when pinned");
+        assert!(r.chi2_dof < 1e-2, "χ²/dof={} too high", r.chi2_dof);
+    }
+
+    #[test]
+    fn free_l_scale_absorbs_asymmetric_lag_and_erodes_discrimination() {
+        // The asymmetric IC mode→centroid lag is pure 1/√E — the SAME basis as an
+        // L_scale error. So a Gaussian fitting an IC-broadened calibrant fits much
+        // BETTER when L_scale is free than when position is pinned: a free physical
+        // position lets the wrong (symmetric) family buy back the position evidence.
+        // This is exactly why fitting position with a flat prior is unsafe for
+        // family discrimination (and why the default pins it).
+        let iso_lo = synthetic_isotope(72, 178, 15.0, 0.05, 0.06);
+        let iso_hi = synthetic_isotope(72, 179, 45.0, 0.05, 0.06);
+        let sample = SampleParams::new(300.0, vec![(iso_lo, 2.0e-3), (iso_hi, 2.0e-3)]).unwrap();
+        let energies: Vec<f64> = (0..700).map(|i| 8.0 + i as f64 * 0.06).collect();
+        let ic = IkedaCarpenter::new(
+            IkedaCarpenterParams {
+                alpha: EnergyLaw::SqrtE { a0: 0.30, a1: 0.0 },
+                beta: IC_FIXED_BETA,
+                r: EnergyLaw::ExpMilliEv { kappa: 25.0 },
+                burst_sigma_us: None,
+                channel_fwhm_us: None,
+            },
+            25.0,
+            &SynthesisGrid {
+                e_min_ev: 4.0,
+                e_max_ev: 100.0,
+                n_energies: 64,
+                n_tau: 500,
+            },
+        )
+        .unwrap();
+        let truth = ResolutionFunction::IkedaCarpenter(Arc::new(ic));
+        let data = forward_model(
+            &energies,
+            &sample,
+            Some(&InstrumentParams { resolution: truth }),
+        )
+        .unwrap();
+        let unc = vec![0.004; energies.len()];
+        let pinned = CalibrationConfig {
+            restarts: 3,
+            ..Default::default()
+        };
+        // Free physical position (flat priors): fit_t0 + fit_l_scale, sigmas None.
+        let free_pos = CalibrationConfig {
+            restarts: 3,
+            fit_t0: true,
+            fit_l_scale: true,
+            ..Default::default()
+        };
+        let gau = |cfg: &CalibrationConfig| {
+            calibrate_resolution(
+                ResolutionFamily::Gaussian,
+                &energies,
+                &data,
+                &unc,
+                &sample,
+                cfg,
+            )
+            .unwrap()
+            .chi2_dof
+        };
+        let gau_pinned = gau(&pinned);
+        let gau_free = gau(&free_pos);
+        assert!(
+            gau_free < 0.5 * gau_pinned,
+            "free (t0,L_scale) should sharply erode the wrong-family penalty: \
+             pinned χ²={gau_pinned}, free χ²={gau_free}"
+        );
+    }
+
+    #[test]
+    fn position_prior_penalizes_displacement() {
+        // A tight prior on t0 (center 0) penalizes a calibrant whose true t0 is
+        // displaced: the fit cannot freely move to the displacement, so it pays a
+        // prior penalty and leaves residual data χ². A loose prior recovers the
+        // displacement with ~zero penalty. (Demonstrates the prior is the real
+        // constraint on position, per the metrology-prior design.)
+        let iso_lo = synthetic_isotope(72, 178, 15.0, 0.05, 0.06);
+        let iso_hi = synthetic_isotope(72, 179, 45.0, 0.05, 0.06);
+        let sample = SampleParams::new(300.0, vec![(iso_lo, 2.0e-3), (iso_hi, 2.0e-3)]).unwrap();
+        let energies: Vec<f64> = (0..700).map(|i| 8.0 + i as f64 * 0.06).collect();
+        let base = synthetic_base_udr();
+        let t0_inject = 1.5_f64;
+        let truth = ResolutionFunction::Tabulated(Arc::new(
+            base.width_corrected(1.0, 0.0, UDR_E_REF).unwrap(),
+        ));
+        let shifted = corrected_energy_grid(&energies, t0_inject, 1.0, 25.0).unwrap();
+        let data = forward_model(
+            &shifted,
+            &sample,
+            Some(&InstrumentParams { resolution: truth }),
+        )
+        .unwrap();
+        let unc = vec![0.004; energies.len()];
+        let mk = |sigma_t0: f64| CalibrationConfig {
+            restarts: 3,
+            fit_t0: true,
+            position_t0_prior_us: Some(sigma_t0),
+            ..Default::default()
+        };
+        let mkbase = || ResolutionFamily::UdrCorr {
+            base: Arc::new(base.clone()),
+        };
+        // Tight prior (σ=0.2 µs ≪ 1.5 µs displacement): can't reach t0, pays penalty.
+        let tight =
+            calibrate_resolution(mkbase(), &energies, &data, &unc, &sample, &mk(0.2)).unwrap();
+        // Loose prior (σ=100 µs): recovers the displacement, ~no penalty.
+        let loose =
+            calibrate_resolution(mkbase(), &energies, &data, &unc, &sample, &mk(100.0)).unwrap();
+        assert!(
+            tight.prior_penalty > 1.0,
+            "tight prior should incur a real penalty, got {}",
+            tight.prior_penalty
+        );
+        assert!(
+            tight.position_t0_us.abs() < t0_inject,
+            "tight prior should pull t0 toward the center, got {}",
+            tight.position_t0_us
+        );
+        assert!(
+            (loose.position_t0_us - t0_inject).abs() < 0.3,
+            "loose prior should recover the displacement, got {}",
+            loose.position_t0_us
+        );
+        assert!(
+            loose.prior_penalty < tight.prior_penalty,
+            "loose penalty {} should be below tight penalty {}",
+            loose.prior_penalty,
+            tight.prior_penalty
+        );
+        assert!(
+            loose.chi2_dof < tight.chi2_dof,
+            "loose data χ² {} should beat tight data χ² {} (tight can't reach t0)",
+            loose.chi2_dof,
+            tight.chi2_dof
+        );
+    }
+
+    #[test]
+    fn with_position_prior_builder_sets_fields() {
+        let cfg = CalibrationConfig::default().with_position_prior(0.5, 1.001, 0.3, 0.002);
+        assert!(cfg.fit_t0 && cfg.fit_l_scale);
+        assert_eq!(cfg.position_t0_center_us, 0.5);
+        assert_eq!(cfg.position_l_scale_center, 1.001);
+        assert_eq!(cfg.position_t0_prior_us, Some(0.3));
+        assert_eq!(cfg.position_l_scale_prior, Some(0.002));
+    }
+
+    #[test]
+    fn fit_l_scale_only_pins_t0() {
+        // Per-coordinate control: fitting ONLY L_scale (fit_t0=false) must fit
+        // position_l_scale while pinning t0 at its center — locks the
+        // `unpack_position` indexing when only the SECOND position coordinate is
+        // active (the single-coordinate path the round-2 review flagged).
+        let iso_lo = synthetic_isotope(72, 178, 15.0, 0.05, 0.06);
+        let iso_hi = synthetic_isotope(72, 179, 45.0, 0.05, 0.06);
+        let sample = SampleParams::new(300.0, vec![(iso_lo, 2.0e-3), (iso_hi, 2.0e-3)]).unwrap();
+        let energies: Vec<f64> = (0..700).map(|i| 8.0 + i as f64 * 0.06).collect();
+        let base = synthetic_base_udr();
+        let truth = ResolutionFunction::Tabulated(Arc::new(base.clone()));
+        let data = forward_model(
+            &energies,
+            &sample,
+            Some(&InstrumentParams { resolution: truth }),
+        )
+        .unwrap();
+        let unc = vec![0.004; energies.len()];
+        let cfg = CalibrationConfig {
+            restarts: 2,
+            fit_l_scale: true,
+            ..Default::default()
+        };
+        let r = calibrate_resolution(
+            ResolutionFamily::UdrCorr {
+                base: Arc::new(base),
+            },
+            &energies,
+            &data,
+            &unc,
+            &sample,
+            &cfg,
+        )
+        .unwrap();
+        assert_eq!(
+            r.position_t0_us, 0.0,
+            "t0 must stay pinned when fit_t0=false"
+        );
+        assert!(
+            (r.position_l_scale - 1.0).abs() < 0.02,
+            "L_scale fit within bound (~1 for a self-fit), got {}",
+            r.position_l_scale
+        );
+        assert!(r.chi2_dof < 1e-1, "self-fit χ²/dof={} too high", r.chi2_dof);
+    }
+
+    #[test]
     fn cross_family_chi2_selects_the_true_shape() {
-        // Model-family discrimination: an asymmetric IC-broadened calibrant must be
-        // best-fit by the IC family and clearly worse by the symmetric Gaussian.
-        // Because the position nuisance lets the Gaussian absorb the centroid
-        // offset, the discrimination is on SHAPE, not position — the whole point of
-        // the fairness fix. Truth has NO width-correction/Gaussian generator, so the
-        // Gaussian arm is a genuinely different shape (not loop-closure).
+        // Model-family discrimination at a KNOWN (pinned) energy scale: an
+        // asymmetric IC-broadened calibrant generated at the nominal position
+        // (t0=0, L_scale=1) must be best-fit by the IC family and clearly worse by
+        // the symmetric Gaussian. With position pinned (the default), the Gaussian
+        // is penalized for both shape AND the asymmetry-induced dip shift it cannot
+        // reproduce — legitimate here because the truth's position is known exactly.
+        // (When position is uncertain, that shift is confounded with flight-path L —
+        // see `free_l_scale_absorbs_asymmetric_lag_and_erodes_discrimination`.)
+        // Truth has NO width-correction/Gaussian generator, so the Gaussian arm is a
+        // genuinely different shape (not loop-closure).
         let iso_lo = synthetic_isotope(72, 178, 15.0, 0.05, 0.06);
         let iso_hi = synthetic_isotope(72, 179, 45.0, 0.05, 0.06);
         let sample = SampleParams::new(300.0, vec![(iso_lo, 2.0e-3), (iso_hi, 2.0e-3)]).unwrap();
