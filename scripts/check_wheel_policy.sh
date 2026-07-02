@@ -28,6 +28,17 @@ set -euo pipefail
 MAX_GLIBC_MINOR=28 # ORNL RHEL 8 ceiling — see header before changing.
 CEILING="manylinux_2_${MAX_GLIBC_MINOR}"
 
+# Wheel-extraction temp dirs are removed inline on the success path,
+# but set -e can abort between mktemp and that rm (unzip/objdump
+# failure) — the EXIT trap guarantees no leak on the runner either way.
+TMPDIRS=()
+cleanup() {
+    if [ "${#TMPDIRS[@]}" -gt 0 ]; then
+        rm -rf "${TMPDIRS[@]}"
+    fi
+}
+trap cleanup EXIT
+
 if ! command -v auditwheel >/dev/null 2>&1; then
     pipx install auditwheel >/dev/null
     # pipx's bin dir is normally on PATH on GitHub runners; hash again.
@@ -91,6 +102,7 @@ for whl in "$@"; do
 
     # (d) versioned GLIBC symbols in every contained ELF
     tmp=$(mktemp -d)
+    TMPDIRS+=("$tmp")
     unzip -q "$whl" -d "$tmp"
     while IFS= read -r elf; do
         max=$(objdump -T "$elf" 2>/dev/null | grep -oE 'GLIBC_2\.[0-9]+' | sort -uV | tail -1 || true)

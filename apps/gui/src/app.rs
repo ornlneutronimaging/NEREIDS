@@ -159,16 +159,24 @@ impl eframe::App for NereidsApp {
         if let Some(msg) = self.state.file_dialogs.take_warning() {
             self.state.native_dialog_warning = Some(msg);
         }
-        if let Some(msg) = self.state.native_dialog_warning.clone() {
+        if let Some(msg) = &self.state.native_dialog_warning {
+            // Dismissal is recorded in a flag and applied after the
+            // panel closure so the banner text renders by reference —
+            // no per-frame clone of a message that may stay visible for
+            // many frames.
+            let mut dismissed = false;
             egui::TopBottomPanel::top("native_dialog_warning").show(ctx, |ui| {
                 ui.horizontal_wrapped(|ui| {
                     ui.label(egui::RichText::new("\u{26A0}").color(ui.visuals().warn_fg_color));
-                    ui.label(msg);
+                    ui.label(msg.as_str());
                     if ui.small_button("Dismiss").clicked() {
-                        self.state.native_dialog_warning = None;
+                        dismissed = true;
                     }
                 });
             });
+            if dismissed {
+                self.state.native_dialog_warning = None;
+            }
         }
 
         // Bottom status bar
