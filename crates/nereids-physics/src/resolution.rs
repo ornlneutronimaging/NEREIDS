@@ -965,12 +965,21 @@ impl TabulatedResolution {
     ///
     /// 1. Find the bracketing reference kernel(s) for `e_ev` via
     ///    binary search on the sorted `ref_energies` grid.
-    /// 2. Over all bracketing kernels' entries with positive weight,
-    ///    take the extreme offsets `dt⁺ = max(dt, 0)` and
-    ///    `dt⁻ = max(−dt, 0)`.  Using both bracketing kernels (rather
-    ///    than the single nearest) is conservative — blended kernels
-    ///    are convex combinations, so their extremes are bounded by
-    ///    the bracketing extremes.
+    /// 2. Take the extreme offsets `dt⁺ = max(dt, 0)` and
+    ///    `dt⁻ = max(−dt, 0)` over the kernel entries that can carry
+    ///    weight at `e_ev`.  When the two bracketing kernels have
+    ///    equal point counts — the same condition under which
+    ///    `interpolated_kernel` blends element-wise — a blended entry
+    ///    has positive weight if EITHER endpoint's weight is
+    ///    positive, so a zero-weight padding offset in one kernel is
+    ///    activated by the other kernel's weight at the same index.
+    ///    The scan therefore uses the **joint** mask: wherever either
+    ///    kernel's weight is positive, BOTH kernels' offsets at that
+    ///    index are considered, which bounds every convex combination
+    ///    of the two offsets (and, a fortiori, the nearest-kernel
+    ///    fallback).  When the point counts differ, apply time falls
+    ///    back to the nearer reference kernel, so each kernel is
+    ///    scanned with its own positive-weight mask.
     /// 3. Map each extreme through the **exact** TOF→E relation
     ///    `E' = (TOF_FACTOR·L/(t∓dt))²` with `t = TOF_FACTOR·L/√E`
     ///    and return the larger energy excursion:
@@ -1011,12 +1020,21 @@ impl TabulatedResolution {
         let n = self.ref_energies.len();
         let mut max_dt_pos: f64 = 0.0;
         let mut max_dt_neg: f64 = 0.0;
-        let mut visit = |idx: usize| {
+        // `consider` folds one offset into the extremes; `visit` scans
+        // one kernel with its own positive-weight mask.  Both take the
+        // accumulators as explicit arguments so the joint-mask arm
+        // below can also fold offsets directly.
+        let consider = |dt: f64, pos: &mut f64, neg: &mut f64| {
+            if dt.is_finite() {
+                *pos = pos.max(dt);
+                *neg = neg.max(-dt);
+            }
+        };
+        let visit = |idx: usize, pos: &mut f64, neg: &mut f64| {
             let (offsets, weights) = &self.kernels[idx];
             for (&dt, &w) in offsets.iter().zip(weights.iter()) {
-                if w > 0.0 && dt.is_finite() {
-                    max_dt_pos = max_dt_pos.max(dt);
-                    max_dt_neg = max_dt_neg.max(-dt);
+                if w > 0.0 {
+                    consider(dt, pos, neg);
                 }
             }
         };
@@ -1025,12 +1043,36 @@ impl TabulatedResolution {
                 .partial_cmp(&e_ev)
                 .unwrap_or(std::cmp::Ordering::Equal)
         }) {
-            Ok(idx) => visit(idx),
-            Err(0) => visit(0),
-            Err(idx) if idx >= n => visit(n - 1),
+            Ok(idx) => visit(idx, &mut max_dt_pos, &mut max_dt_neg),
+            Err(0) => visit(0, &mut max_dt_pos, &mut max_dt_neg),
+            Err(idx) if idx >= n => visit(n - 1, &mut max_dt_pos, &mut max_dt_neg),
             Err(idx) => {
-                visit(idx - 1);
-                visit(idx);
+                let (off_lo, w_lo) = &self.kernels[idx - 1];
+                let (off_hi, w_hi) = &self.kernels[idx];
+                if off_lo.len() == off_hi.len() {
+                    // Element-wise blend (same condition as
+                    // `interpolated_kernel`): a blended entry carries
+                    // positive weight if EITHER endpoint weight is
+                    // positive, and its offset is a convex combination
+                    // of the two endpoint offsets — so fold BOTH
+                    // offsets wherever either weight is positive.
+                    for ((&o_lo, &wl), (&o_hi, &wh)) in off_lo
+                        .iter()
+                        .zip(w_lo.iter())
+                        .zip(off_hi.iter().zip(w_hi.iter()))
+                    {
+                        if wl > 0.0 || wh > 0.0 {
+                            consider(o_lo, &mut max_dt_pos, &mut max_dt_neg);
+                            consider(o_hi, &mut max_dt_pos, &mut max_dt_neg);
+                        }
+                    }
+                } else {
+                    // Different point counts: apply time falls back to
+                    // the nearer reference kernel, so per-kernel
+                    // positive-weight scans bound it.
+                    visit(idx - 1, &mut max_dt_pos, &mut max_dt_neg);
+                    visit(idx, &mut max_dt_pos, &mut max_dt_neg);
+                }
             }
         }
         let t = TOF_FACTOR * self.flight_path_m / e_ev.sqrt();
@@ -1668,7 +1710,15 @@ impl TabulatedResolution {
             ));
         }
 
-        // Validate strictly ascending reference energies
+        // Validate finite, strictly ascending reference energies.  The
+        // finiteness check must come first: NaN compares false against
+        // everything, so a NaN energy would slip through the ascending
+        // check below and then poison the bracketing binary search.
+        if let Some(bad) = ref_energies.iter().find(|e| !e.is_finite()) {
+            return Err(ResolutionParseError::InvalidFormat(format!(
+                "Reference energies must be finite, got {bad}"
+            )));
+        }
         for i in 1..ref_energies.len() {
             if ref_energies[i] <= ref_energies[i - 1] {
                 return Err(ResolutionParseError::InvalidFormat(format!(
@@ -1677,6 +1727,39 @@ impl TabulatedResolution {
                     ref_energies[i],
                     i - 1,
                     ref_energies[i - 1],
+                )));
+            }
+        }
+
+        // Per-block kernel invariants — the same set `from_kernels`
+        // enforces, because both constructors feed the same broadener:
+        //
+        // * non-empty: an empty block would make `broaden_presorted`
+        //   accumulate `norm == 0` and silently pass the spectrum
+        //   through;
+        // * strictly ascending offsets: the monotonic two-pointer
+        //   bracket walk and the trapezoidal `dt` widths
+        //   (`offsets[k+1] − offsets[k−1]`) both assume sorted offsets
+        //   — an unsorted block would broaden silently-wrong;
+        // * all-finite offsets and weights: a NaN weight poisons the
+        //   kernel norm and bypasses the division guard.
+        for (i, (offsets, weights)) in kernels.iter().enumerate() {
+            if offsets.is_empty() {
+                return Err(ResolutionParseError::InvalidFormat(format!(
+                    "Kernel {i} (E = {} eV) has no (offset, weight) points",
+                    ref_energies[i],
+                )));
+            }
+            if !offsets.windows(2).all(|w| w[0] < w[1]) {
+                return Err(ResolutionParseError::InvalidFormat(format!(
+                    "Kernel {i} (E = {} eV) TOF offsets must be strictly ascending",
+                    ref_energies[i],
+                )));
+            }
+            if offsets.iter().any(|v| !v.is_finite()) || weights.iter().any(|v| !v.is_finite()) {
+                return Err(ResolutionParseError::InvalidFormat(format!(
+                    "Kernel {i} (E = {} eV) contains non-finite offsets or weights",
+                    ref_energies[i],
                 )));
             }
         }
@@ -1718,6 +1801,14 @@ impl TabulatedResolution {
                 "Reference-energy count {} != kernel count {}",
                 ref_energies.len(),
                 kernels.len(),
+            )));
+        }
+        // Finiteness first: NaN compares false against everything, so a
+        // NaN energy would slip through the ascending check below and
+        // then poison the bracketing binary search.
+        if let Some(bad) = ref_energies.iter().find(|e| !e.is_finite()) {
+            return Err(ResolutionParseError::InvalidFormat(format!(
+                "Reference energies must be finite, got {bad}"
             )));
         }
         for i in 1..ref_energies.len() {
@@ -1787,6 +1878,15 @@ impl TabulatedResolution {
     /// 2. Convert TOF offsets to energy offsets using exact TOF↔energy relation
     /// 3. Convolve spectrum with interpolated kernel (trapezoidal integration)
     ///
+    /// Kernel points whose delayed-emission offset reaches the nominal
+    /// flight time at the target energy (`dt ≥ TOF(E)`) gather from
+    /// past infinite energy; they are dropped and the kernel
+    /// renormalized over the surviving points, mirroring the grid-edge
+    /// handling — see the tail-truncation note on `broaden_presorted`.
+    /// [`Self::kernel_support_ev`] returns `f64::INFINITY` in exactly
+    /// that regime, so callers consuming it as a fit-range margin
+    /// already have the signal.
+    ///
     /// # Errors
     /// Returns [`ResolutionError::LengthMismatch`] if the arrays differ in
     /// length, or [`ResolutionError::UnsortedEnergies`] if the energy grid is
@@ -1812,6 +1912,23 @@ impl TabulatedResolution {
     /// computes `Cc(Tc) = ∫Bb(τ)·Aa(Tc−τ)dτ` (the theory-segment search
     /// binds `Tc−Ta` to the kernel grid), and `Ud_Mesh_Time` (line 7)
     /// sizes the needed theory window as `[T0−UdT_last, T0−UdT_first]`.
+    ///
+    /// ## Delayed-tail truncation at short nominal flight times
+    ///
+    /// A kernel point with `dt ≥ tof_center` would gather at
+    /// `tof_prime = tof_center − dt ≤ 0`, i.e. from past infinite
+    /// energy where no theory value exists.  Such points are silently
+    /// dropped and the trapezoidal normalisation runs over the
+    /// surviving points — the same truncate-and-renormalize treatment
+    /// applied when `e_prime` falls outside the target grid
+    /// (`[e_min, e_max]`).  This engages when the nominal TOF at the
+    /// target energy is shorter than the kernel's delayed-emission
+    /// reach — very high energy and/or a short flight path — and is
+    /// reachable at *any* target energy because `interpolated_kernel`
+    /// clamps to the nearest reference kernel outside the tabulated
+    /// range.  [`Self::kernel_support_ev`] returns `f64::INFINITY` in
+    /// exactly this regime, so margin-consuming callers already have
+    /// the signal that the kernel footprint is unbounded there.
     ///
     /// ## Inner-loop optimization
     ///
@@ -2059,6 +2176,9 @@ impl TabulatedResolution {
 
                 // Convolution gather: theory at t − dt (see
                 // broaden_presorted; SAMMY mudr4.f90 Ud_Convolute).
+                // Points with dt ≥ tof_center gather from past infinite
+                // energy and are dropped, renormalizing over the
+                // survivors (see the tail-truncation note there).
                 let tof_prime = tof_center - dt;
                 if tof_prime <= 0.0 {
                     continue;
@@ -2547,6 +2667,9 @@ pub mod test_support {
 
                 // Convolution gather: theory at t − dt (see
                 // broaden_presorted; SAMMY mudr4.f90 Ud_Convolute).
+                // Points with dt ≥ tof_center gather from past infinite
+                // energy and are dropped, renormalizing over the
+                // survivors (see the tail-truncation note there).
                 let tof_prime = tof_center - dt;
                 if tof_prime <= 0.0 {
                     continue;
@@ -2777,6 +2900,115 @@ mod tests {
             25.0,
         );
         assert!(matches!(dup, Err(ResolutionParseError::InvalidFormat(_))));
+    }
+
+    #[test]
+    fn from_text_rejects_unsorted_offsets_within_block() {
+        // The second energy block has an out-of-order offset pair
+        // (1.0 followed by 0.0): the trapezoidal `dt_width` quadrature
+        // and the two-pointer bracket walk both assume sorted offsets,
+        // so the parser must error rather than construct a
+        // silently-corrupt kernel (same invariant `from_kernels`
+        // enforces).
+        let text = "\
+Resolution file
+---------------
+5.0 0.0
+-1.0 0.1
+0.0 1.0
+1.0 0.5
+
+10.0 0.0
+-1.0 0.1
+1.0 0.5
+0.0 1.0
+";
+        let err = TabulatedResolution::from_text(text, 25.0);
+        let Err(ResolutionParseError::InvalidFormat(msg)) = err else {
+            panic!("unsorted offsets must be rejected, got {err:?}");
+        };
+        assert!(
+            msg.contains("Kernel 1") && msg.contains("E = 10 eV"),
+            "error must name the offending block and reference energy: {msg}"
+        );
+        // The same file with sorted offsets parses fine.
+        let sorted = "\
+Resolution file
+---------------
+5.0 0.0
+-1.0 0.1
+0.0 1.0
+1.0 0.5
+
+10.0 0.0
+-1.0 0.1
+0.0 1.0
+1.0 0.5
+";
+        assert!(TabulatedResolution::from_text(sorted, 25.0).is_ok());
+    }
+
+    /// The remaining `from_kernels` invariants hold for parsed files too:
+    /// empty energy blocks (silent pass-through at broaden time), non-finite
+    /// kernel values (NaN norm bypasses the division guard), and non-finite
+    /// reference energies (NaN compares false, slipping through the
+    /// ascending check into the bracketing binary search) must all error.
+    #[test]
+    fn from_text_rejects_empty_block_and_non_finite_values() {
+        // Empty block: header line for E=10 with no data lines.
+        let empty_block = "\
+Resolution file
+---------------
+5.0 0.0
+-1.0 0.1
+0.0 1.0
+
+10.0 0.0
+
+";
+        let err = TabulatedResolution::from_text(empty_block, 25.0);
+        let Err(ResolutionParseError::InvalidFormat(msg)) = err else {
+            panic!("empty energy block must be rejected, got {err:?}");
+        };
+        assert!(
+            msg.contains("E = 10 eV") && msg.contains("no (offset, weight) points"),
+            "error must name the empty block: {msg}"
+        );
+
+        // Non-finite kernel weight.
+        let nan_weight = "\
+Resolution file
+---------------
+5.0 0.0
+-1.0 0.1
+0.0 NaN
+1.0 0.5
+";
+        let err = TabulatedResolution::from_text(nan_weight, 25.0);
+        let Err(ResolutionParseError::InvalidFormat(msg)) = err else {
+            panic!("non-finite weight must be rejected, got {err:?}");
+        };
+        assert!(
+            msg.contains("non-finite"),
+            "error must name the non-finite value class: {msg}"
+        );
+
+        // Non-finite reference energy.
+        let nan_energy = "\
+Resolution file
+---------------
+NaN 0.0
+-1.0 0.1
+0.0 1.0
+";
+        let err = TabulatedResolution::from_text(nan_energy, 25.0);
+        let Err(ResolutionParseError::InvalidFormat(msg)) = err else {
+            panic!("non-finite reference energy must be rejected, got {err:?}");
+        };
+        assert!(
+            msg.contains("finite"),
+            "error must name the finiteness requirement: {msg}"
+        );
     }
 
     #[test]
@@ -4296,6 +4528,111 @@ mod tests {
         assert!(
             (got - expected).abs() / expected < 1e-12,
             "support should ignore zero-weight entries: got {got}, expected {expected}"
+        );
+    }
+
+    /// Between two equal-count reference kernels, `interpolated_kernel`
+    /// blends element-wise, and a blended entry has positive weight if
+    /// EITHER endpoint's weight is positive — so a zero-weight padding
+    /// offset in one kernel is activated by the other kernel's weight
+    /// at the same index.  The support must bound the blend-activated
+    /// offset region (joint mask), not just the per-kernel
+    /// positive-weight extremes.
+    #[test]
+    fn test_tabulated_kernel_support_covers_blend_activated_offsets() {
+        // Kernel A pads its tail with zero-weight entries reaching
+        // offset 20; kernel B carries positive weight at every index.
+        // Per-kernel positive-weight maxima are 5 (A) and 12 (B), but
+        // the blend at the last index has offset `20 + frac·(12 − 20)`
+        // with weight `0 + frac·0.1 > 0` — beyond both maxima.
+        let r = TabulatedResolution {
+            ref_energies: vec![10.0, 1000.0],
+            kernels: vec![
+                (vec![0.0, 5.0, 10.0, 20.0], vec![1.0, 0.1, 0.0, 0.0]),
+                (vec![0.0, 4.0, 8.0, 12.0], vec![1.0, 0.5, 0.3, 0.1]),
+            ],
+            flight_path_m: 25.0,
+        };
+        let e: f64 = 100.0; // strictly between the reference energies
+        let expected = exact_support(e, 20.0, 0.0, 25.0);
+        let got = r.kernel_support_ev(e);
+        assert!(
+            (got - expected).abs() / expected < 1e-12,
+            "support must cover blend-activated zero-weight offsets: \
+             got {got}, expected {expected}"
+        );
+        // Non-vacuity: the joint bound strictly exceeds what the
+        // per-kernel positive-weight extremes (dt⁺ = 12) would give.
+        assert!(got > exact_support(e, 12.0, 0.0, 25.0));
+    }
+
+    /// The support must contain the footprint of the ACTUAL broadener:
+    /// broadening a flat baseline with a single narrow dip must leave
+    /// every target untouched whose window
+    /// `[e − support(e), e + support(e)]` excludes the dip.
+    /// Non-circular by construction — the oracle here is `broaden`
+    /// itself, not the `exact_support` formula mirror.
+    #[test]
+    fn test_tabulated_kernel_support_contains_broadener_footprint() {
+        // Asymmetric kernel with a dominant delayed (positive) tail.
+        let r = TabulatedResolution {
+            ref_energies: vec![100.0],
+            kernels: vec![(vec![-1.0, 0.0, 6.0], vec![0.2, 1.0, 0.7])],
+            flight_path_m: 25.0,
+        };
+        // Dense uniform grid; flat baseline with a single-point dip.
+        let de = 0.05;
+        let energies: Vec<f64> = (0..2001).map(|j| 50.0 + de * j as f64).collect();
+        let f = 1000; // dip mid-grid, at ~100 eV
+        let e_f = energies[f];
+        let mut spectrum = vec![1.0; energies.len()];
+        spectrum[f] = 0.0;
+        let out = r.broaden(&energies, &spectrum).unwrap();
+
+        // Piecewise-linear reads touch spectrum[f] only for
+        // e′ ∈ (energies[f−1], energies[f+1]); require one extra grid
+        // step of margin so bracketing/interpolation edge effects
+        // cannot straddle the window boundary.
+        let margin = 2.0 * de;
+        let (mut excluded_below, mut excluded_above) = (0usize, 0usize);
+        let mut included_differs = false;
+        let mut upside_differs = false;
+        for (&e, &o) in energies.iter().zip(out.iter()) {
+            let s = r.kernel_support_ev(e);
+            if e + s + margin < e_f || e - s - margin > e_f {
+                assert!(
+                    (o - 1.0).abs() < 1e-12,
+                    "target {e} eV (support {s}) must be untouched by a \
+                     dip at {e_f} eV outside its window; got {o}"
+                );
+                if e < e_f {
+                    excluded_below += 1;
+                } else {
+                    excluded_above += 1;
+                }
+            } else if (o - 1.0).abs() > 1e-3 {
+                included_differs = true;
+                if e < e_f - margin {
+                    upside_differs = true;
+                }
+            }
+        }
+        // Non-vacuity: both exclusion regions were exercised, the dip
+        // measurably alters at least one in-window target, and the
+        // delayed tail reaches the dip from BELOW — the direction the
+        // convolution gather loads.
+        assert!(
+            excluded_below > 0 && excluded_above > 0,
+            "grid must exercise both exclusion regions \
+             (below: {excluded_below}, above: {excluded_above})"
+        );
+        assert!(
+            included_differs,
+            "the dip must measurably alter at least one in-window target"
+        );
+        assert!(
+            upside_differs,
+            "the delayed tail must reach the dip from a target below it"
         );
     }
 }
