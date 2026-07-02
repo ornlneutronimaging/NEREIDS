@@ -83,6 +83,16 @@ external review + user gates + iteration logic + Copilot phase.
 | A | Claude self-audit + Codex CLI (inside `/review-pipeline`) | Before push |
 | B | GitHub Copilot (manual trigger, fetched inside `/review-pipeline`) | After push |
 
+### Finding disposition: fix ALL by default
+
+**Fixing every defect located during review — P0, P1, and P2 alike — is
+the de facto choice.** Deferring a finding to a GitHub issue is the rare
+exception, reserved for findings that genuinely belong to a different
+crate/subsystem than the PR touches AND would materially expand the
+diff. Deferral requires an explicit engineering reason; reviewer load,
+effort, or "top-N" batching are never valid reasons. Never propose a
+narrower fix list as the recommended option.
+
 **Post-merge**: run `/post-merge` for the integration gate on merged main.
 
 ## Validation Patterns
