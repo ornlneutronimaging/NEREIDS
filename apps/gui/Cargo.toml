@@ -21,7 +21,6 @@ eframe = { workspace = true }
 egui = { workspace = true }
 egui_extras = { workspace = true }
 egui_plot = { workspace = true }
-rfd = { workspace = true }
 ndarray = { workspace = true }
 image = { workspace = true }
 serde = { workspace = true }
@@ -35,6 +34,17 @@ log = { workspace = true }
 tracing-appender = { workspace = true }
 tracing-subscriber = { workspace = true }
 time = { workspace = true }
+
+# Dialogs: native rfd on every platform, but on Linux only the portal
+# backend (zero link-time C deps: dlopens libdbus, falls back to the
+# zenity CLI) plus the pure-egui in-app fallback tier — this keeps the
+# PyPI wheel manylinux_2_28 with no GTK link and no vendored libraries.
+[target.'cfg(not(target_os = "linux"))'.dependencies]
+rfd = { workspace = true }
+
+[target.'cfg(target_os = "linux")'.dependencies]
+rfd = { workspace = true, features = ["xdg-portal", "wayland"] }
+egui-file-dialog = { workspace = true }
 
 [dev-dependencies]
 tempfile = { workspace = true }

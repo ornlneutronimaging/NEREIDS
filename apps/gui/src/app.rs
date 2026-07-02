@@ -150,9 +150,17 @@ impl eframe::App for NereidsApp {
 
         // Native-dialog failure banner: the log bridge latches rfd
         // backend errors (which never fire on user-cancel), so a dead
-        // file-picker environment is surfaced instead of silent (#526).
+        // file-picker environment is surfaced instead of silent (#526),
+        // and the dialog facade downgrades to its in-app tier.
         if let Some(msg) = crate::logging::take_dialog_backend_failure() {
-            self.state.native_dialog_warning = Some(format!("Native file dialog failed: {msg}"));
+            self.state.file_dialogs.note_backend_failure();
+            self.state.native_dialog_warning = Some(format!(
+                "Native file dialog failed: {msg} — switched to the built-in file browser."
+            ));
+        }
+        // Environment problems found by the facade's probe/canary.
+        if let Some(msg) = self.state.file_dialogs.take_warning() {
+            self.state.native_dialog_warning = Some(msg);
         }
         if let Some(msg) = self.state.native_dialog_warning.clone() {
             egui::TopBottomPanel::top("native_dialog_warning").show(ctx, |ui| {

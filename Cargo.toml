@@ -42,11 +42,28 @@ tiff = "0.11"
 image = "0.25"
 pyo3 = { version = "0.29", features = ["extension-module"] }
 numpy = "0.29"
+# NOTE: keep eframe default features ON — winit's default wayland-dlopen /
+# x11 features make the display stack dlopen'ed rather than linked.
+# Disabling defaults would hard-link libwayland and re-trigger wheel
+# vendoring (see scripts/check_wheel_policy.sh).
 eframe = { version = "0.33", features = ["persistence"] }
 egui = "0.33"
 egui_extras = { version = "0.33", features = ["image", "svg"] }
 egui_plot = "0.34"
-rfd = { version = "0.17", default-features = false, features = ["gtk3"] }
+# Native file dialogs. default-features = false retires the gtk3 backend
+# permanently: rfd's gtk3 feature pins gtk-sys's v3_24 feature
+# (gtk+-3.0 >= 3.24 at BUILD time), which forced the Linux wheel from
+# manylinux_2_28 (AlmaLinux 8: GTK 3.22, glibc 2.28 — the ORNL RHEL 8
+# floor) up to manylinux_2_34 AND made maturin vendor a fragile
+# 64-library GTK stack into the wheel (0.2.0 yank, 0.2.1 glibc bump).
+# The portal backend has no link-time C deps (dlopens libdbus, zenity
+# CLI fallback) and the GUI adds a pure-egui in-app fallback tier.
+# Do NOT re-enable "gtk3". Per-target features live in apps/gui/Cargo.toml.
+rfd = { version = "0.17", default-features = false }
+# Pure-egui in-app file browser (Linux fallback dialog tier). LOCKSTEP
+# with egui minors: 0.12 <-> egui 0.33, 0.13 <-> 0.34, 0.14 <-> 0.35 —
+# any egui/eframe bump MUST bump this together.
+egui-file-dialog = "0.12"
 hdf5 = { package = "hdf5-metno", version = "0.12", features = ["static", "zlib"] }
 rand = "0.9"
 rand_distr = "0.5"
@@ -57,6 +74,9 @@ tracing = "0.1"
 log = "0.4"
 tracing-appender = "0.2"
 tracing-subscriber = { version = "0.3", default-features = false, features = ["fmt", "env-filter", "registry", "ansi"] }
+# NOTE: opener's default dbus-vendored feature statically links libdbus.
+# Never set default-features = false here — dynamic libdbus would break
+# the manylinux_2_28 container build and trigger wheel vendoring.
 opener = { version = "0.7", features = ["reveal"] }
 time = { version = "0.3", default-features = false, features = ["formatting", "macros"] }
 tempfile = "3"
