@@ -31,17 +31,18 @@ jobs:
     steps:
       - uses: actions/checkout@v4
 
-      # Same action SHA, container selection, and before-script as
-      # publish.yml's build-gui job — the gate must reproduce the
-      # release environment exactly. --find-interpreter is omitted:
-      # bin bindings produce a single py3-none wheel.
+      # Same action SHA, container selection, before-script, and args
+      # as publish.yml's build-gui job — the gate must reproduce the
+      # release build. The single intentional divergence is sccache
+      # (build acceleration only; it does not affect the produced
+      # wheel's platform-tag policy).
       - name: Build GUI wheel (manylinux_2_28 container)
         uses: PyO3/maturin-action@e83996d129638aa358a18fbd1dfb82f0b0fb5d3b # v1
         with:
           working-directory: apps/gui
           target: x86_64-unknown-linux-gnu
           manylinux: "2_28"
-          args: --release --out dist
+          args: --release --out dist --find-interpreter
           sccache: true
           before-script-linux: |
             yum install -y cmake3 || yum install -y cmake

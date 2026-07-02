@@ -47,8 +47,10 @@ for whl in "$@"; do
     seen_linux=1
     whl_fail=0
 
-    # (a) filename platform tag
-    tag=$(basename "$whl" | grep -oE 'manylinux_2_[0-9]+' | sort -t_ -k3 -n | tail -1 || true)
+    # (a) filename platform tag — a multi-tagged wheel (e.g.
+    # manylinux_2_17.manylinux_2_34) is installable via its LOWEST tag,
+    # so the minimum governs fleet installability.
+    tag=$(basename "$whl" | grep -oE 'manylinux_2_[0-9]+' | sort -t_ -k3 -n | head -1 || true)
     if [ -z "$tag" ]; then
         echo "FAIL: $whl has no manylinux_2_N platform tag"
         fail=1

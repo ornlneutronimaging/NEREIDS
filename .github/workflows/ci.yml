@@ -32,10 +32,14 @@ jobs:
       # forces the PyPI wheel off manylinux_2_28 (ORNL RHEL 8 ceiling)
       # and into vendoring an entire GTK stack (the 0.2.0/0.2.1
       # regression). See scripts/check_wheel_policy.sh.
+      # Capture the graph first: the default shell has no pipefail, so
+      # a cargo tree failure inside a pipeline would read as "no GTK"
+      # and silently disarm the tripwire; a plain assignment under -e
+      # aborts the step instead.
       - name: Assert no GTK in the Linux GUI dependency graph
         run: |
-          if cargo tree -p nereids-gui --target x86_64-unknown-linux-gnu -e normal,build \
-              | grep -iE 'gtk|glib-sys|gobject-sys|gdk-sys|atk-sys|cairo-sys|pango-sys'; then
+          graph=$(cargo tree -p nereids-gui --target x86_64-unknown-linux-gnu -e normal,build)
+          if echo "$graph" | grep -iE 'gtk|glib-sys|gobject-sys|gdk-sys|atk-sys|cairo-sys|pango-sys'; then
             echo "::error::GTK-family crate found in the Linux nereids-gui graph"
             exit 1
           fi
