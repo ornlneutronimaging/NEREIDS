@@ -130,13 +130,14 @@ pub fn summary_card(
 ///
 /// Takes split borrows to avoid conflicting with `&state.spatial_result`
 /// references held by the caller (density map data lives in spatial_result).
+/// The PNG save itself happens in [`save_tile_png`] when the dialog
+/// resolves through the dispatcher.
 pub fn tile_toolbelt(
     ui: &mut egui::Ui,
-    data: &ndarray::Array2<f64>,
     tile_idx: usize,
     label: &str,
     tile_display: &mut [TileDisplayState],
-    status_message: &mut String,
+    dialogs: &mut crate::file_dialog::FileDialogs,
 ) {
     ui.horizontal(|ui| {
         // Colormap selector
@@ -156,27 +157,60 @@ pub fn tile_toolbelt(
         }
 
         // Save PNG button
-        if ui.small_button("Save PNG").clicked()
-            && let Some(path) = rfd::FileDialog::new()
-                .set_file_name(format!("{label}.png"))
-                .add_filter("PNG", &["png"])
-                .save_file()
-        {
-            let colormap = tile_display
-                .get(tile_idx)
-                .map_or(Colormap::Viridis, |t| t.colormap);
-            let rgba = render_to_rgba(data, colormap);
-            let (h, w) = (data.shape()[0] as u32, data.shape()[1] as u32);
-            match image::save_buffer(&path, &rgba, w, h, image::ColorType::Rgba8) {
-                Ok(()) => {
-                    *status_message = format!("Saved PNG: {}", path.display());
-                }
-                Err(e) => {
-                    *status_message = format!("PNG save error: {e}");
-                }
-            }
+        if ui.small_button("Save PNG").clicked() {
+            dialogs.save_file(
+                crate::file_dialog::DialogIntent::SaveTilePng {
+                    tile_idx,
+                    label: label.to_string(),
+                },
+                crate::file_dialog::DialogOptions {
+                    file_name: Some(format!("{label}.png")),
+                    filters: vec![("PNG", &["png"])],
+                    ..Default::default()
+                },
+            );
         }
     });
+}
+
+/// Save the tile's map (density map, or the temperature map for the
+/// index one past the densities) as a colormapped PNG. Dispatch handler
+/// for [`crate::file_dialog::DialogIntent::SaveTilePng`]; re-derives the
+/// map from `spatial_result` exactly like the Studio analysis column so
+/// a pick that resolves on a later frame still targets the right tile.
+pub(crate) fn save_tile_png(
+    state: &mut AppState,
+    tile_idx: usize,
+    _label: &str,
+    path: &std::path::Path,
+) {
+    let msg = {
+        let Some(result) = state.spatial_result.as_ref() else {
+            state.status_message = "PNG save error: no results available".into();
+            return;
+        };
+        let n_density = result.density_maps.len();
+        let data = if tile_idx < n_density {
+            result.density_maps.get(tile_idx)
+        } else {
+            result.temperature_map.as_ref()
+        };
+        let Some(data) = data else {
+            state.status_message = format!("PNG save error: tile {tile_idx} no longer exists");
+            return;
+        };
+        let colormap = state
+            .tile_display
+            .get(tile_idx)
+            .map_or(Colormap::Viridis, |t| t.colormap);
+        let rgba = render_to_rgba(data, colormap);
+        let (h, w) = (data.shape()[0] as u32, data.shape()[1] as u32);
+        match image::save_buffer(path, &rgba, w, h, image::ColorType::Rgba8) {
+            Ok(()) => format!("Saved PNG: {}", path.display()),
+            Err(e) => format!("PNG save error: {e}"),
+        }
+    };
+    state.status_message = msg;
 }
 
 /// Draw a vertical colorbar gradient strip next to an image.

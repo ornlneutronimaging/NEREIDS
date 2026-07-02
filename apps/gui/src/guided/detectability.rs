@@ -283,6 +283,8 @@ pub(crate) fn detect_resolution_card(ui: &mut egui::Ui, state: &mut AppState) {
         &mut state.detect_resolution_enabled,
         &mut state.detect_resolution_mode,
         state.beamline.flight_path_m,
+        &mut state.file_dialogs,
+        crate::file_dialog::ResolutionTarget::Detectability,
     );
     if res.changed {
         state.detect_results.clear();

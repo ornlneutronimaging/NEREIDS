@@ -537,25 +537,34 @@ pub fn save_modal(ctx: &egui::Context, state: &mut AppState) {
     }
 }
 
-/// Show the native file dialog and save with the currently selected mode.
+/// Open the "Save As" dialog; the pick is applied by
+/// [`on_save_project_picked`] via the dialog dispatcher.
 fn execute_save_with_dialog(state: &mut AppState) {
-    let mut dialog = rfd::FileDialog::new()
-        .set_title("Save NEREIDS Project")
-        .add_filter("NEREIDS Project", &["nrd.h5"]);
+    let mut opts = crate::file_dialog::DialogOptions {
+        title: Some("Save NEREIDS Project"),
+        filters: vec![("NEREIDS Project", &["nrd.h5"])],
+        ..Default::default()
+    };
 
     if let Some(ref existing) = state.project_file_path {
         if let Some(parent) = existing.parent() {
-            dialog = dialog.set_directory(parent);
+            opts.directory = Some(parent.to_path_buf());
         }
         if let Some(name) = existing.file_name() {
-            dialog = dialog.set_file_name(name.to_string_lossy());
+            opts.file_name = Some(name.to_string_lossy().into_owned());
         }
     }
 
-    if let Some(path) = dialog.save_file() {
-        let path = ensure_extension(path);
-        execute_save(state, &path, state.save_data_mode);
-    }
+    state
+        .file_dialogs
+        .save_file(crate::file_dialog::DialogIntent::SaveProjectAs, opts);
+}
+
+/// Apply a picked "Save As" path: normalize the extension and save with
+/// the mode chosen in the save modal.
+pub(crate) fn on_save_project_picked(state: &mut AppState, path: PathBuf) {
+    let path = ensure_extension(path);
+    execute_save(state, &path, state.save_data_mode);
 }
 
 /// Execute the actual save to `path` with the given mode.
@@ -665,15 +674,17 @@ fn days_to_ymd(days: u64) -> (u64, u64, u64) {
 // Load
 // ---------------------------------------------------------------------------
 
-/// Show a native open dialog and load a project file.
+/// Open the project-file dialog; the pick is routed to
+/// [`load_project_from_path`] via the dialog dispatcher.
 pub fn load_project_dialog(state: &mut AppState) {
-    let dialog = rfd::FileDialog::new()
-        .set_title("Open NEREIDS Project")
-        .add_filter("NEREIDS Project", &["nrd.h5", "h5"]);
-
-    if let Some(path) = dialog.pick_file() {
-        load_project_from_path(state, &path);
-    }
+    state.file_dialogs.pick_file(
+        crate::file_dialog::DialogIntent::OpenProject,
+        crate::file_dialog::DialogOptions {
+            title: Some("Open NEREIDS Project"),
+            filters: vec![("NEREIDS Project", &["nrd.h5", "h5"])],
+            ..Default::default()
+        },
+    );
 }
 
 /// Load a project file from `path` and apply the snapshot to `state`.

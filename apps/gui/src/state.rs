@@ -829,6 +829,9 @@ pub struct AppState {
     pub is_fetching_endf: bool,
     /// Cloned egui context for background threads to request repaints.
     pub egui_ctx: Option<egui::Context>,
+    /// Poll-based file-dialog service; picks are routed by
+    /// `crate::file_dialog::dispatch_results` each frame.
+    pub file_dialogs: crate::file_dialog::FileDialogs,
 
     /// Prevents auto-load retry after a loading failure; cleared when file paths change.
     pub load_error: bool,
@@ -1527,6 +1530,7 @@ impl Default for AppState {
             is_fitting: false,
             is_fetching_endf: false,
             egui_ctx: None,
+            file_dialogs: Default::default(),
 
             hdf5_path: None,
             hdf5_ob_path: None,

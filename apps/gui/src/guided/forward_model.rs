@@ -86,6 +86,8 @@ pub(crate) fn fm_resolution_card(ui: &mut egui::Ui, state: &mut AppState) {
         &mut state.fm_resolution_enabled,
         &mut state.fm_resolution_mode,
         state.beamline.flight_path_m,
+        &mut state.file_dialogs,
+        crate::file_dialog::ResolutionTarget::ForwardModel,
     );
     if res.changed {
         state.fm_spectrum = None;

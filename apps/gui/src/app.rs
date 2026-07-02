@@ -180,6 +180,12 @@ impl eframe::App for NereidsApp {
 
         // Periodic table modal overlay
         crate::widgets::periodic_table::periodic_table_modal(ctx, &mut self.state);
+
+        // File dialogs: drive any retained dialog, then route completed
+        // picks. Runs after all panels so results are applied exactly
+        // once per frame regardless of which panel opened the dialog.
+        self.state.file_dialogs.update(ctx);
+        crate::file_dialog::dispatch_results(&mut self.state);
     }
 }
 
