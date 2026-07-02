@@ -9,6 +9,27 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
 
 ### Fixed
 
+- **Between-reference tabulated/IC kernel widths follow the physical
+  power law** (#632): `interpolated_kernel` blended bracketing
+  reference kernels element-wise — an arithmetic width chord over the
+  convex σ_t ∝ ~E^(−1/2) law that systematically over-widened every
+  between-reference energy (+7.8 % at a synthetic 10/50 eV midpoint;
+  +4.1–7.2 % across the production VENUS 5→50 eV reference gap,
+  spanning nearly all Ta-181 thermometry resonances — fitted
+  temperatures read low as a result). Kernels are now interpolated as
+  width-normalized shape blends with geometrically interpolated widths
+  (exact for power-law files); the unequal-point-count
+  nearest-reference fallback and its ±few-% IC width sawtooth are gone.
+  This is a documented intentional departure from SAMMY, whose UDR
+  interpolation takes the same arithmetic chord (`udr/mudr3.f90`).
+  Fit-range support margins now track the true (narrower)
+  between-reference kernel. **Action required: `calibrate_resolution`
+  results and fits whose energy window lies between resolution-file
+  reference energies, obtained with earlier versions under tabulated or
+  IC resolution, are invalidated and must be re-fit**; externally
+  maintained bit-exact broadener baselines must be regenerated.
+  Gaussian-resolution and Doppler-only results are unaffected.
+
 - **Tabulated/Ikeda–Carpenter resolution kernels were applied
   time-mirrored** (#631): the broadener gathered theory at `t + Δt`
   (a correlation) instead of `t − Δt` (the convolution — SAMMY
