@@ -822,6 +822,14 @@ pub(crate) fn resolution_broaden_presorted(
 /// TOF-offset space (μs). Kernels are interpolated between reference energies
 /// and converted from TOF to energy space when applied.
 ///
+/// ## Offset orientation
+///
+/// Positive `Δt` = delayed emission (the moderator storage tail); the
+/// kernel mode sits at `Δt = 0`. At apply time the broadener gathers
+/// theory at `t − Δt` (convolution — see [`Self::broaden`]), so the
+/// positive-`Δt` tail reads theory from earlier TOF = higher energy and
+/// broadened dips acquire their tail toward lower apparent energy.
+///
 /// ## File Format (VENUS/FTS)
 ///
 /// ```text
@@ -1768,15 +1776,31 @@ impl TabulatedResolution {
     /// Tabulated resolution broadening assuming the energy grid is already
     /// validated (sorted ascending, same length as spectrum).
     ///
+    /// ## Convolution orientation
+    ///
+    /// The broadened value at measured TOF `t` gathers theory at
+    /// `t − dt`: a neutron *measured* at `t` whose emission was delayed
+    /// by `dt` really flew for `t − dt`, i.e. it is faster than nominal,
+    /// so the kernel's positive-offset (delayed-emission) tail pulls
+    /// theory from earlier TOF = **higher** energy, and a resonance dip
+    /// acquires its tail toward lower apparent energy. This is the
+    /// convolution ∫R(τ)·S(t−τ)dτ, matching SAMMY's user-defined
+    /// resolution: `sammy/src/udr/mudr4.f90` `Ud_Convolute` (line 288)
+    /// computes `Cc(Tc) = ∫Bb(τ)·Aa(Tc−τ)dτ` (the theory-segment search
+    /// binds `Tc−Ta` to the kernel grid), and `Ud_Mesh_Time` (line 7)
+    /// sizes the needed theory window as `[T0−UdT_last, T0−UdT_first]`.
+    ///
     /// ## Inner-loop optimization
     ///
     /// The per-kernel-point spectrum interpolation uses a **two-pointer
     /// walk** instead of a binary search: `e_prime` is monotonically
-    /// decreasing in `k` (since `dt = offsets[k]` is non-decreasing,
-    /// `TOF' = tof_center + dt` is non-decreasing, and `E' = (L/TOF')²`
-    /// is non-increasing).  We maintain `bracket_hi` as the smallest
-    /// index into `energies[]` whose value is `>= e_prime`, and walk it
-    /// downward as `k` advances.  Amortized O(1) per kernel point.
+    /// increasing in `k` (since `dt = offsets[k]` is non-decreasing,
+    /// `TOF' = tof_center − dt` is non-increasing, and `E' = (L/TOF')²`
+    /// is non-decreasing).  We maintain `bracket_hi` as the smallest
+    /// index into `energies[]` whose value is `>= e_prime`; the walk is
+    /// a bidirectional fixed-point search (first kernel point descends
+    /// from `n−1`, subsequent points walk upward).  Amortized O(1) per
+    /// kernel point within a target.
     ///
     /// Math is identical to the reference implementation pinned by
     /// `broaden_presorted_reference` in the test module.
@@ -1827,7 +1851,9 @@ impl TabulatedResolution {
                     continue;
                 }
 
-                let tof_prime = tof_center + dt;
+                // Convolution gather: theory at t − dt (see docstring;
+                // SAMMY mudr4.f90 Ud_Convolute).
+                let tof_prime = tof_center - dt;
                 if tof_prime <= 0.0 {
                     continue;
                 }
@@ -2008,7 +2034,9 @@ impl TabulatedResolution {
                     continue;
                 }
 
-                let tof_prime = tof_center + dt;
+                // Convolution gather: theory at t − dt (see
+                // broaden_presorted; SAMMY mudr4.f90 Ud_Convolute).
+                let tof_prime = tof_center - dt;
                 if tof_prime <= 0.0 {
                     continue;
                 }
@@ -2494,7 +2522,9 @@ pub mod test_support {
                     continue;
                 }
 
-                let tof_prime = tof_center + dt;
+                // Convolution gather: theory at t − dt (see
+                // broaden_presorted; SAMMY mudr4.f90 Ud_Convolute).
+                let tof_prime = tof_center - dt;
                 if tof_prime <= 0.0 {
                     continue;
                 }
