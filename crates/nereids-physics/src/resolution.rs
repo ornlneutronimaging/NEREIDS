@@ -965,18 +965,30 @@ impl TabulatedResolution {
     ///
     /// 1. Find the bracketing reference kernel(s) for `e_ev` via
     ///    binary search on the sorted `ref_energies` grid.
-    /// 2. Take `max(|tof_offset|)` over all bracketing kernels'
-    ///    entries with positive weight.  Using both bracketing
-    ///    kernels (rather than the single nearest) is conservative —
-    ///    over-estimating the margin is safer than under-estimating
-    ///    when the kernel is interpolated between references.
-    /// 3. Convert TOF offset to energy offset via
-    ///    `|ΔE| = 2·E^(3/2) / (TOF_FACTOR·L) · |Δt|`,
-    ///    the magnitude of `dE/dt` at `e_ev` along the TOF→E mapping
-    ///    `t = TOF_FACTOR·L/√E` (chain rule).
+    /// 2. Over all bracketing kernels' entries with positive weight,
+    ///    take the extreme offsets `dt⁺ = max(dt, 0)` and
+    ///    `dt⁻ = max(−dt, 0)`.  Using both bracketing kernels (rather
+    ///    than the single nearest) is conservative — blended kernels
+    ///    are convex combinations, so their extremes are bounded by
+    ///    the bracketing extremes.
+    /// 3. Map each extreme through the **exact** TOF→E relation
+    ///    `E' = (TOF_FACTOR·L/(t∓dt))²` with `t = TOF_FACTOR·L/√E`
+    ///    and return the larger energy excursion:
+    ///    `max( E·((t/(t−dt⁺))² − 1), E·(1 − (t/(t+dt⁻))²) )`.
+    ///    The convolution gather reads theory at `t − dt` (see
+    ///    [`Self::broaden`]), so the positive-offset tail reaches
+    ///    *up* in energy — and because the map is convex in `t`, the
+    ///    up-side excursion strictly exceeds the linear chain-rule
+    ///    estimate `2·E^{3/2}·dt/(TOF_FACTOR·L)` that this function
+    ///    previously returned, which under-covered exactly the side
+    ///    the delayed-emission tail loads.
     ///
     /// Returns `0.0` for non-positive `e_ev`, an empty kernel set, or
-    /// a non-positive flight path.  Used by the GUI's
+    /// a non-positive flight path, and `f64::INFINITY` when the
+    /// positive-offset extreme reaches or exceeds the nominal flight
+    /// time (`t − dt⁺ ≤ 0`: the kernel maps past infinite energy — the
+    /// caller must clamp to its grid, which the GUI's
+    /// `partition_point` slicing already does).  Used by the GUI's
     /// fit-energy-range slicing to extend the model-evaluation grid
     /// beyond the user's `[E_min, E_max]` so the SAMMY EMIN/EMAX-
     /// equivalent broadening at the boundaries is correct (#514).
@@ -997,12 +1009,14 @@ impl TabulatedResolution {
         //              (upper); clip to grid bounds when e_ev falls
         //              outside the ref range.
         let n = self.ref_energies.len();
-        let mut max_dt_us: f64 = 0.0;
-        let visit = |idx: usize, max_dt_us: &mut f64| {
+        let mut max_dt_pos: f64 = 0.0;
+        let mut max_dt_neg: f64 = 0.0;
+        let mut visit = |idx: usize| {
             let (offsets, weights) = &self.kernels[idx];
             for (&dt, &w) in offsets.iter().zip(weights.iter()) {
                 if w > 0.0 && dt.is_finite() {
-                    *max_dt_us = max_dt_us.max(dt.abs());
+                    max_dt_pos = max_dt_pos.max(dt);
+                    max_dt_neg = max_dt_neg.max(-dt);
                 }
             }
         };
@@ -1011,17 +1025,26 @@ impl TabulatedResolution {
                 .partial_cmp(&e_ev)
                 .unwrap_or(std::cmp::Ordering::Equal)
         }) {
-            Ok(idx) => visit(idx, &mut max_dt_us),
-            Err(0) => visit(0, &mut max_dt_us),
-            Err(idx) if idx >= n => visit(n - 1, &mut max_dt_us),
+            Ok(idx) => visit(idx),
+            Err(0) => visit(0),
+            Err(idx) if idx >= n => visit(n - 1),
             Err(idx) => {
-                visit(idx - 1, &mut max_dt_us);
-                visit(idx, &mut max_dt_us);
+                visit(idx - 1);
+                visit(idx);
             }
         }
-        // |dE/dt| = 2·E^(3/2)/(TOF_FACTOR·L)
-        let de_per_dt = 2.0 * e_ev.powf(1.5) / (TOF_FACTOR * self.flight_path_m);
-        de_per_dt * max_dt_us
+        let t = TOF_FACTOR * self.flight_path_m / e_ev.sqrt();
+        // Up-side excursion: the positive-offset (delayed-emission)
+        // tail gathers theory at t − dt⁺, i.e. from HIGHER energy.
+        let up = if max_dt_pos >= t {
+            return f64::INFINITY;
+        } else {
+            e_ev * ((t / (t - max_dt_pos)).powi(2) - 1.0)
+        };
+        // Down-side excursion: negative offsets gather at t + dt⁻,
+        // i.e. from lower energy (bounded below by E' → 0).
+        let down = e_ev * (1.0 - (t / (t + max_dt_neg)).powi(2));
+        up.max(down)
     }
 }
 
@@ -4131,16 +4154,28 @@ mod tests {
         half - 2.0 * half / (n - 1) as f64
     }
 
+    /// Exact-map expected support: the larger of the up-side excursion
+    /// `E·((t/(t−dt⁺))²−1)` and the down-side `E·(1−(t/(t+dt⁻))²)`
+    /// with `t = TOF_FACTOR·L/√E` — the same map the broadener applies
+    /// per kernel point, so this oracle is exact by construction.
+    fn exact_support(e: f64, dt_pos: f64, dt_neg: f64, l: f64) -> f64 {
+        let t = TOF_FACTOR * l / e.sqrt();
+        let up = e * ((t / (t - dt_pos)).powi(2) - 1.0);
+        let down = e * (1.0 - (t / (t + dt_neg)).powi(2));
+        up.max(down)
+    }
+
     /// At a reference energy with a known kernel half-width in TOF, the
-    /// support in eV must satisfy `|ΔE| = 2·E^(3/2)/(TOF_FACTOR·L)·|Δt|`.
-    /// At E = 50 eV the triangle kernel has half = 1.0 μs, n = 41, so
-    /// the largest non-zero offset is `1.0 · (1 − 1/40) = 0.975`.
+    /// support must equal the exact TOF→E excursion of the outermost
+    /// non-zero offsets.  At E = 50 eV the triangle kernel has
+    /// half = 1.0 μs, n = 41, so the largest non-zero offset is
+    /// `1.0 · (1 − 1/40) = 0.975` on both sides.
     #[test]
-    fn test_tabulated_kernel_support_at_ref_energy_matches_chain_rule() {
+    fn test_tabulated_kernel_support_at_ref_energy_matches_exact_map() {
         let r = synthetic_tab_resolution();
         let e: f64 = 50.0;
         let dt_max = triangle_dt_max(1.0, 41);
-        let expected = 2.0 * e.powf(1.5) / (TOF_FACTOR * 25.0) * dt_max;
+        let expected = exact_support(e, dt_max, dt_max, 25.0);
         let got = r.kernel_support_ev(e);
         assert!(
             (got - expected).abs() / expected < 1e-12,
@@ -4148,7 +4183,7 @@ mod tests {
         );
     }
 
-    /// Between two reference energies the support uses the larger of
+    /// Between two reference energies the support uses the extreme of
     /// the two bracketing kernels (conservative).  At E = 100 eV the
     /// brackets are 50 eV (half = 1.0, n = 41) and 500 eV (half = 2.0,
     /// n = 51); the larger non-zero offset is `2.0 · (1 − 1/50) = 1.96`.
@@ -4157,7 +4192,7 @@ mod tests {
         let r = synthetic_tab_resolution();
         let e: f64 = 100.0;
         let dt_max = triangle_dt_max(2.0, 51);
-        let expected = 2.0 * e.powf(1.5) / (TOF_FACTOR * 25.0) * dt_max;
+        let expected = exact_support(e, dt_max, dt_max, 25.0);
         let got = r.kernel_support_ev(e);
         assert!(
             (got - expected).abs() / expected < 1e-12,
@@ -4172,12 +4207,63 @@ mod tests {
         let r = synthetic_tab_resolution();
         // Below grid (ref_min = 5 eV; triangle(half=0.5, n=31)).
         let e_low: f64 = 1.0;
-        let exp_low = 2.0 * e_low.powf(1.5) / (TOF_FACTOR * 25.0) * triangle_dt_max(0.5, 31);
+        let dt_low = triangle_dt_max(0.5, 31);
+        let exp_low = exact_support(e_low, dt_low, dt_low, 25.0);
         assert!((r.kernel_support_ev(e_low) - exp_low).abs() / exp_low < 1e-12);
         // Above grid (ref_max = 500 eV; triangle(half=2.0, n=51)).
         let e_hi: f64 = 1000.0;
-        let exp_hi = 2.0 * e_hi.powf(1.5) / (TOF_FACTOR * 25.0) * triangle_dt_max(2.0, 51);
+        let dt_hi = triangle_dt_max(2.0, 51);
+        let exp_hi = exact_support(e_hi, dt_hi, dt_hi, 25.0);
         assert!((r.kernel_support_ev(e_hi) - exp_hi).abs() / exp_hi < 1e-12);
+    }
+
+    /// The exact up-side excursion strictly exceeds the linear
+    /// chain-rule estimate for a wide positive (delayed-emission) tail
+    /// at high energy — the case where the old linear margin
+    /// under-covered exactly the side the convolution gather loads.
+    #[test]
+    fn test_tabulated_kernel_support_exceeds_linear_estimate_for_wide_tail() {
+        let offsets = vec![-1.0, 0.0, 15.0];
+        let weights = vec![0.3, 1.0, 0.2];
+        let r = TabulatedResolution {
+            ref_energies: vec![100.0],
+            kernels: vec![(offsets, weights)],
+            flight_path_m: 25.0,
+        };
+        let e: f64 = 100.0;
+        let linear = 2.0 * e.powf(1.5) / (TOF_FACTOR * 25.0) * 15.0;
+        let got = r.kernel_support_ev(e);
+        assert!(
+            got > linear,
+            "exact support must exceed the linear estimate on the \
+             high-E side: got {got}, linear {linear}"
+        );
+        let expected = exact_support(e, 15.0, 1.0, 25.0);
+        assert!(
+            (got - expected).abs() / expected < 1e-12,
+            "exact support: got {got}, expected {expected}"
+        );
+    }
+
+    /// A positive-offset extreme reaching the nominal flight time maps
+    /// past infinite energy: the support is unbounded and the caller
+    /// must clamp to its grid.
+    #[test]
+    fn test_tabulated_kernel_support_infinite_when_tail_exceeds_flight_time() {
+        let offsets = vec![0.0, 10.0];
+        let weights = vec![1.0, 0.5];
+        let r = TabulatedResolution {
+            ref_energies: vec![100.0],
+            kernels: vec![(offsets, weights)],
+            flight_path_m: 25.0,
+        };
+        // Choose E high enough that t = K·L/√E ≤ 10 μs.
+        let t_at = |e: f64| TOF_FACTOR * 25.0 / e.sqrt();
+        let mut e: f64 = 100.0;
+        while t_at(e) > 10.0 {
+            e *= 10.0;
+        }
+        assert_eq!(r.kernel_support_ev(e), f64::INFINITY);
     }
 
     /// Non-positive / non-finite energy → 0.0 (no broadening footprint).
@@ -4203,9 +4289,9 @@ mod tests {
             flight_path_m: 25.0,
         };
         let e: f64 = 100.0;
-        // Expected support uses dt_max = 1.0 (the outermost zero-weight
-        // entries at ±10 are ignored), not 10.0.
-        let expected = 2.0 * e.powf(1.5) / (TOF_FACTOR * 25.0) * 1.0;
+        // Expected support uses dt = ±1.0 (the outermost zero-weight
+        // entries at ±10 are ignored), not ±10.0.
+        let expected = exact_support(e, 1.0, 1.0, 25.0);
         let got = r.kernel_support_ev(e);
         assert!(
             (got - expected).abs() / expected < 1e-12,
