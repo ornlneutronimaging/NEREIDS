@@ -668,10 +668,14 @@ fn render_failed_cache_hint(ui: &mut egui::Ui, state: &AppState) {
 }
 
 /// Open the local-ENDF picker; the pick is applied by
-/// [`install_local_endf`] via the dialog dispatcher.
+/// [`install_local_endf`] via the dialog dispatcher. The target library
+/// is captured now: the dialog can resolve later, and switching the
+/// library ComboBox meanwhile must not redirect a pending install.
 fn install_local_endf_dialog(state: &mut AppState) {
     state.file_dialogs.pick_file(
-        crate::file_dialog::DialogIntent::InstallLocalEndf,
+        crate::file_dialog::DialogIntent::InstallLocalEndf {
+            library: state.endf_library,
+        },
         crate::file_dialog::DialogOptions {
             filters: vec![("ENDF", &["endf", "dat", "txt", "zip"])],
             ..Default::default()
@@ -685,7 +689,11 @@ fn install_local_endf_dialog(state: &mut AppState) {
 /// parses the file exactly once to discover its (Z, A); we then look
 /// that (Z, A) up in the user's selection and write the cached body
 /// directly — no trial-install loop, no re-extraction.
-pub(crate) fn install_local_endf(state: &mut AppState, path: &std::path::Path) {
+pub(crate) fn install_local_endf(
+    state: &mut AppState,
+    path: &std::path::Path,
+    library: EndfLibrary,
+) {
     use nereids_core::types::Isotope;
     use nereids_endf::retrieval::EndfRetriever;
 
@@ -718,7 +726,7 @@ pub(crate) fn install_local_endf(state: &mut AppState, path: &std::path::Path) {
         }
     };
     let retriever = EndfRetriever::new();
-    if let Err(e) = retriever.install_endf_text(&isotope, state.endf_library, &endf_text) {
+    if let Err(e) = retriever.install_endf_text(&isotope, library, &endf_text) {
         state.status_message = format!("Could not install local ENDF for {label}: {e}");
         return;
     }

@@ -140,8 +140,13 @@ impl eframe::App for NereidsApp {
             }
         }
 
-        // Cmd+O / Ctrl+O — open project
-        if ctx.input(|i| i.modifiers.command && i.key_pressed(egui::Key::O)) {
+        // Cmd+O / Ctrl+O — open project. Gated on no dialog being open:
+        // ctx.input() bypasses widget modality, so without the gate the
+        // shortcut would silently discard an in-progress in-app dialog
+        // (Linux fallback tier) that pointer input cannot bypass.
+        if ctx.input(|i| i.modifiers.command && i.key_pressed(egui::Key::O))
+            && !self.state.file_dialogs.dialog_in_flight()
+        {
             crate::project::load_project_dialog(&mut self.state);
         }
 

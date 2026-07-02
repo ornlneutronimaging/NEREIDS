@@ -32,25 +32,35 @@
 use std::path::PathBuf;
 
 use crate::state::{AppState, InputMode, SaveDataMode};
+use nereids_endf::retrieval::EndfLibrary;
 
 /// Which UI feature requested the dialog — routes the picked path in
 /// [`dispatch_results`].
+///
+/// Capture rule: any state that determines how a picked path is
+/// INTERPRETED (save mode, input mode, binning, target library) is
+/// carried in the intent, snapshotted when the dialog is requested —
+/// the dialog can resolve frames (or, on the Linux native tier,
+/// seconds) later, and reading such state at resolution time would let
+/// mid-dialog edits retroactively change what the pick does. State the
+/// result is VALIDATED AGAINST (current selection, loaded sample) is
+/// deliberately read at dispatch: validation must reflect what is
+/// loaded when the pick lands.
 #[derive(Clone, Debug, PartialEq)]
 pub enum DialogIntent {
     /// Open a `.nrd.h5` project (toolbar, Ctrl/Cmd+O).
     OpenProject,
     /// "Save As" target for the current project (save modal). Carries
-    /// the data mode chosen in the modal at request time: the dialog
-    /// can resolve frames (or, on the Linux native tier, seconds)
-    /// later, and reading `state.save_data_mode` at resolution would
-    /// let a reopened modal retroactively change a pending Save-As.
+    /// the data mode chosen in the modal at request time.
     SaveProjectAs { mode: SaveDataMode },
     /// Export directory for spatial-map results (Studio dock).
     ExportDirectory,
     /// Save one result tile as a colormapped PNG (tile toolbelt).
     SaveTilePng { tile_idx: usize, label: String },
     /// Install a local ENDF file into the cache (Configure step, #523).
-    InstallLocalEndf,
+    /// Carries the library selected when the picker was opened; the
+    /// isotope-in-selection check stays on current state.
+    InstallLocalEndf { library: EndfLibrary },
     /// Sample TIFF stack — file or folder (Load step). Also used for the
     /// pre-normalized transmission stack, which lands in the same
     /// `sample_path` field with the same invalidation set.
@@ -63,13 +73,10 @@ pub enum DialogIntent {
     Hdf5Sample,
     /// Optional open-beam NeXus/HDF5 file (Load step). Carries the
     /// input mode and event-binning parameters captured at request
-    /// time: the dialog can resolve frames (or, on the Linux native
-    /// tier, seconds) later, and reading `state.input_mode` / the
-    /// `event_*` fields at resolution would let edits made while the
-    /// dialog is pending retroactively change how the picked file is
-    /// loaded (a same-shape, differently-binned OB would install
-    /// silently). Validation against the sample stays on current
-    /// state — the OB must match whatever is loaded when it lands.
+    /// time (a same-shape, differently-binned OB would otherwise
+    /// install silently); validation against the sample stays on
+    /// current state — the OB must match whatever is loaded when it
+    /// lands.
     Hdf5OpenBeam {
         mode: InputMode,
         event_params: nereids_io::nexus::EventBinningParams,
@@ -244,9 +251,13 @@ impl FileDialogs {
             // request would orphan a live dialog whose eventual pick is
             // silently discarded (its receiver is gone). Refuse the new
             // request and make the refusal visible by forcing the
-            // waiting overlay. The in-app tier needs no such guard:
-            // its dialog is modal (`as_modal(true)`), so re-clicks
-            // cannot reach the picker buttons while one is open.
+            // waiting overlay. The in-app tier needs no such guard for
+            // pointer input — its dialog is modal (`as_modal(true)`) so
+            // clicks cannot reach picker buttons — and the only
+            // modality bypass, `ctx.input()`-based keyboard shortcuts,
+            // is gated in app.rs via `dialog_in_flight()`. Superseding
+            // an in-app dialog is safe regardless (it is fully owned;
+            // no orphaned window, no lost pick).
             if let Some(req) = self.linux.active_native.as_mut() {
                 req.overlay_forced = true;
                 return;
@@ -299,6 +310,22 @@ impl FileDialogs {
     /// app in the native-dialog warning banner.
     pub fn take_warning(&mut self) -> Option<String> {
         self.warning.take()
+    }
+
+    /// Is a dialog currently open? Used to gate keyboard shortcuts:
+    /// pointer input cannot reach picker buttons while a dialog is up
+    /// (native dialogs refuse re-open; the in-app dialog is modal), but
+    /// `ctx.input()`-based shortcuts bypass widget modality entirely.
+    /// Always `false` off-Linux, where dialogs block inside `open()`.
+    pub fn dialog_in_flight(&self) -> bool {
+        #[cfg(target_os = "linux")]
+        {
+            self.linux.active_native.is_some() || self.linux.active_in_app.is_some()
+        }
+        #[cfg(not(target_os = "linux"))]
+        {
+            false
+        }
     }
 
     fn remember_dir(&mut self, path: &std::path::Path) {
@@ -355,14 +382,14 @@ impl FileDialogs {
         match rx.try_recv() {
             Ok(verdict) => {
                 self.linux.canary_rx = None;
-                self.apply_canary_verdict(verdict);
+                self.apply_canary_verdict(verdict, which_on_path("zenity"));
             }
             Err(std::sync::mpsc::TryRecvError::Empty) => {}
             Err(std::sync::mpsc::TryRecvError::Disconnected) => {
                 // Canary worker died without reporting: no evidence
                 // either way.
                 self.linux.canary_rx = None;
-                self.apply_canary_verdict(CanaryVerdict::Inconclusive);
+                self.apply_canary_verdict(CanaryVerdict::Inconclusive, which_on_path("zenity"));
             }
         }
     }
@@ -379,13 +406,16 @@ impl FileDialogs {
     ///   surface the stashed warning now.
     /// - A latch or escape-hatch downgrade (`canary_may_upgrade`
     ///   cleared) is never overturned.
-    fn apply_canary_verdict(&mut self, verdict: CanaryVerdict) {
+    ///
+    /// `has_zenity` is passed in (rather than read from `$PATH` here)
+    /// so both `Broken` arms are deterministically testable.
+    fn apply_canary_verdict(&mut self, verdict: CanaryVerdict, has_zenity: bool) {
         match self.linux.tier {
             Some(LinuxTier::Native) => {
                 if let CanaryVerdict::Broken(msg) = verdict {
                     // Zenity alone still makes the native chain viable —
                     // rfd falls back to it without touching the portal.
-                    if which_on_path("zenity") {
+                    if has_zenity {
                         tracing::info!(
                             reason = %msg,
                             "portal canary failed; keeping native dialogs via zenity fallback"
@@ -758,8 +788,8 @@ pub fn dispatch_results(state: &mut AppState) {
         DialogIntent::SaveTilePng { tile_idx, label } => {
             crate::guided::result_widgets::save_tile_png(state, tile_idx, &label, &path);
         }
-        DialogIntent::InstallLocalEndf => {
-            crate::guided::configure::install_local_endf(state, &path);
+        DialogIntent::InstallLocalEndf { library } => {
+            crate::guided::configure::install_local_endf(state, &path, library);
         }
         DialogIntent::TiffSample => crate::guided::load::on_tiff_sample_picked(state, path),
         DialogIntent::TiffOpenBeam => crate::guided::load::on_tiff_open_beam_picked(state, path),
@@ -775,37 +805,37 @@ pub fn dispatch_results(state: &mut AppState) {
 /// Apply a picked tabulated-resolution file to the card identified by
 /// `target`, mirroring the invalidation each card performs for its
 /// other (non-file) changes.
+///
+/// Pick-wins semantics: the resolving file replaces the whole mode. On
+/// the Linux native tier the dialog can resolve seconds later, so the
+/// user may have switched the card to Gaussian and tuned it meanwhile —
+/// the replacement is then announced in the status bar instead of
+/// silently discarding those edits.
 fn on_resolution_file_picked(state: &mut AppState, target: ResolutionTarget, path: PathBuf) {
+    use crate::state::ResolutionMode;
+
     let flight_path_m = state.beamline.flight_path_m;
-    match target {
-        ResolutionTarget::Configure => {
-            if crate::widgets::design::apply_resolution_file(
-                &mut state.resolution_mode,
-                path,
-                flight_path_m,
-            ) {
-                state.spatial_result = None;
-                state.pixel_fit_result = None;
-            }
-        }
-        ResolutionTarget::ForwardModel => {
-            if crate::widgets::design::apply_resolution_file(
-                &mut state.fm_resolution_mode,
-                path,
-                flight_path_m,
-            ) {
-                state.fm_spectrum = None;
-                state.fm_per_isotope_spectra.clear();
-            }
-        }
-        ResolutionTarget::Detectability => {
-            if crate::widgets::design::apply_resolution_file(
-                &mut state.detect_resolution_mode,
-                path,
-                flight_path_m,
-            ) {
-                state.detect_results.clear();
-            }
+    let (mode, invalidate): (&mut ResolutionMode, fn(&mut AppState)) = match target {
+        ResolutionTarget::Configure => (&mut state.resolution_mode, |s| {
+            s.spatial_result = None;
+            s.pixel_fit_result = None;
+        }),
+        ResolutionTarget::ForwardModel => (&mut state.fm_resolution_mode, |s| {
+            s.fm_spectrum = None;
+            s.fm_per_isotope_spectra.clear();
+        }),
+        ResolutionTarget::Detectability => (&mut state.detect_resolution_mode, |s| {
+            s.detect_results.clear();
+        }),
+    };
+    let replaced_gaussian = matches!(mode, ResolutionMode::Gaussian { .. });
+    if crate::widgets::design::apply_resolution_file(mode, path, flight_path_m) {
+        invalidate(state);
+        if replaced_gaussian {
+            state.status_message =
+                "Tabulated resolution selected — replaced the Gaussian settings edited \
+                 while the dialog was open"
+                    .into();
         }
     }
 }
@@ -1020,10 +1050,51 @@ mod tests {
         dialogs.linux.tier = Some(LinuxTier::InApp);
         dialogs.linux.canary_may_upgrade = true;
         dialogs.linux.pending_probe_warning = Some("probe failed".into());
-        dialogs.apply_canary_verdict(CanaryVerdict::Working);
+        dialogs.apply_canary_verdict(CanaryVerdict::Working, false);
         assert!(dialogs.linux.tier == Some(LinuxTier::Native));
         assert!(dialogs.warning.is_none(), "rescued probe must not warn");
         assert!(dialogs.linux.pending_probe_warning.is_none());
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn broken_canary_with_zenity_keeps_native_tier() {
+        // Portal backend missing but zenity present: rfd's fallback
+        // still serves native dialogs — no downgrade, no warning, and
+        // any in-flight request keeps waiting on its worker.
+        let mut dialogs = FileDialogs::default();
+        dialogs.linux.tier = Some(LinuxTier::Native);
+        dialogs.linux.active_native = Some(native_request(DialogIntent::ExportDirectory));
+        dialogs.apply_canary_verdict(CanaryVerdict::Broken("no backend".into()), true);
+        assert!(dialogs.linux.tier == Some(LinuxTier::Native));
+        assert!(dialogs.warning.is_none());
+        assert!(dialogs.linux.active_native.is_some());
+        assert!(dialogs.linux.active_in_app.is_none());
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn broken_canary_without_zenity_downgrades_and_reopens_in_app() {
+        // Portal backend missing and no zenity: the native chain is
+        // dead — downgrade, warn, and reopen the in-flight request in
+        // the built-in browser so the user's click still lands.
+        let mut dialogs = FileDialogs::default();
+        dialogs.linux.tier = Some(LinuxTier::Native);
+        dialogs.linux.active_native = Some(native_request(DialogIntent::ExportDirectory));
+        dialogs.apply_canary_verdict(CanaryVerdict::Broken("no backend".into()), false);
+        assert!(dialogs.linux.tier == Some(LinuxTier::InApp));
+        assert!(
+            dialogs
+                .warning
+                .as_deref()
+                .is_some_and(|w| w.contains("zenity")),
+            "warning must name the fix"
+        );
+        assert!(dialogs.linux.active_native.is_none());
+        assert!(
+            dialogs.linux.active_in_app.is_some(),
+            "pending request must reopen in-app"
+        );
     }
 
     #[cfg(target_os = "linux")]
@@ -1033,7 +1104,7 @@ mod tests {
         dialogs.linux.tier = Some(LinuxTier::InApp);
         dialogs.linux.canary_may_upgrade = true;
         dialogs.linux.pending_probe_warning = Some("probe failed".into());
-        dialogs.apply_canary_verdict(CanaryVerdict::Inconclusive);
+        dialogs.apply_canary_verdict(CanaryVerdict::Inconclusive, false);
         assert!(dialogs.linux.tier == Some(LinuxTier::InApp));
         assert_eq!(dialogs.warning.as_deref(), Some("probe failed"));
         assert!(!dialogs.linux.canary_may_upgrade);
@@ -1043,6 +1114,11 @@ mod tests {
     /// receiver never gets a message — `apply_native_outcome` takes the
     /// resolution as a parameter, mirroring how `poll_native` hands it
     /// the drained channel + latch.
+    ///
+    /// ORACLE COUPLING: the latched-message strings used by the
+    /// outcome tests below are hand-copies of rfd 0.17.2 emissions,
+    /// valid only under the exact `rfd = "=0.17.2"` pin (workspace
+    /// Cargo.toml) — re-verify and update them on any deliberate bump.
     #[cfg(target_os = "linux")]
     fn native_request(intent: DialogIntent) -> NativeRequest {
         let (_tx, rx) = std::sync::mpsc::channel();
@@ -1164,7 +1240,7 @@ mod tests {
             Some("Failed to pick file with zenity: exit status 1".into()),
         );
         assert!(dialogs.linux.tier == Some(LinuxTier::InApp));
-        dialogs.apply_canary_verdict(CanaryVerdict::Working);
+        dialogs.apply_canary_verdict(CanaryVerdict::Working, true);
         assert!(dialogs.linux.tier == Some(LinuxTier::InApp));
     }
 

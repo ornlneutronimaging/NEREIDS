@@ -495,6 +495,11 @@ mod tests {
     /// 0.17.2's real emission sites (`module_path!` targets:
     /// src/backend/xdg_desktop_portal/portal/libdbus.rs for the portal
     /// leg, src/backend/xdg_desktop_portal.rs for the zenity leg).
+    ///
+    /// ORACLE COUPLING: these strings are hand-copies, valid only under
+    /// the exact `rfd = "=0.17.2"` pin (workspace Cargo.toml) — they
+    /// cannot detect upstream rewording by themselves. Re-verify the
+    /// emission sites and update them on any deliberate rfd bump.
     #[test]
     fn log_bridge_latches_only_rfd_errors() {
         let bridge = LogBridge;
