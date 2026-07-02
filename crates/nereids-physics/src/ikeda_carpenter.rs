@@ -56,10 +56,15 @@
 //!
 //! For a flight path `L`, a resonance at `E_r` has nominal TOF
 //! `t_r = TOF_FACTOR·L/√E_r`. A neutron with emission delay τ arrives at TOF
-//! `t_r+τ`, apparent energy `E' = (TOF_FACTOR·L/(t_r+τ))²`. Sampling `I(τ)` on
+//! `t_r+τ`, apparent energy `E' = (TOF_FACTOR·L/(t_r+τ))²` — that is the kernel's
+//! *definition* (its positive-τ tail is delayed emission). Sampling `I(τ)` on
 //! a τ-grid and mapping to TOF-offsets yields exactly the `(offset, weight)`
 //! kernel representation that [`crate::resolution::TabulatedResolution`]
-//! consumes — so IC rides the *same* verified broadening machinery. At apply time
+//! consumes — so IC rides the *same* verified broadening machinery, whose
+//! *application* is the convolution gather: the broadened value at measured TOF
+//! `t` reads theory at `t−τ` (a neutron measured at `t` with delay τ really flew
+//! `t−τ`; see `resolution::broaden` and SAMMY `udr/mudr4.f90` `Ud_Convolute`).
+//! At apply time
 //! `interpolated_kernel` blends the two bracketing reference kernels when they
 //! have equal point counts, else it falls back to the nearer reference; because
 //! IC trims each kernel's tail independently the point counts often differ, so the
@@ -69,9 +74,10 @@
 //! UDR file convention (peak at offset 0); `interpolated_kernel` does not
 //! re-center it. Because the IC pulse is right-skewed, its *mean* lags its mode by
 //! ~1/α(E) in TOF, so the centroid — and even the minimum — of a broadened
-//! resonance shifts in apparent energy by an α(E)-dependent amount (order 1e-2 eV,
-//! ~1e-3 relative, for α≈1.5 in the eV regime; larger toward lower energy). So it
-//! *does* move the broadened dip off the nominal energy, by a small amount.
+//! resonance shifts toward **lower apparent energy** by an α(E)-dependent amount
+//! (order 1e-2 eV, ~1e-3 relative, for α≈1.5 in the eV regime; larger toward
+//! lower energy). So it *does* move the broadened dip off the nominal energy,
+//! by a small amount.
 //!
 //! For the prompt-only law `α(E) = a0·√E + a1` with `R≈0`, the lag `~1/α(E)` is
 //! **exactly** the `1/√E` basis of a flight-path (`L_scale`) error *iff* `a1 = 0`:
@@ -877,8 +883,19 @@ mod tests {
             }
             num / den
         }
-        let shift_small_alpha = (dip_centroid_energy(0.8) - E0).abs();
-        let shift_large_alpha = (dip_centroid_energy(2.0) - E0).abs();
+        let signed_small_alpha = dip_centroid_energy(0.8) - E0;
+        let signed_large_alpha = dip_centroid_energy(2.0) - E0;
+        // The shift is toward LOWER apparent energy: the delayed-emission
+        // tail gathers theory from earlier TOF (higher E), so the theory
+        // dip at E0 surfaces at measured energies below E0. A positive
+        // shift here means the kernel was applied time-mirrored.
+        assert!(
+            signed_small_alpha < 0.0 && signed_large_alpha < 0.0,
+            "centering shift must be toward lower energy: \
+             α=0.8 {signed_small_alpha:+e}, α=2.0 {signed_large_alpha:+e}"
+        );
+        let shift_small_alpha = signed_small_alpha.abs();
+        let shift_large_alpha = signed_large_alpha.abs();
         // The bias is real (resolvable at the 1e-3 eV level)…
         assert!(
             shift_small_alpha > 1e-3,

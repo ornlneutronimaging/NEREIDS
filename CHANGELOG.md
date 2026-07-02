@@ -9,6 +9,30 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
 
 ### Fixed
 
+- **Tabulated/Ikeda–Carpenter resolution kernels were applied
+  time-mirrored** (#631): the broadener gathered theory at `t + Δt`
+  (a correlation) instead of `t − Δt` (the convolution — SAMMY
+  `udr/mudr4.f90 Ud_Convolute`), putting every kernel's
+  delayed-emission tail on the wrong (high-energy) side of every
+  resonance. Consequences on strongly asymmetric kernels: mirrored
+  model asymmetry in residuals, ~2–3.7 % inflated energy-space model
+  width, fitted temperature biased low ~2.5 % at 300 K, and fitted
+  `(t0, L_scale)` absorbing the kernel centroid lag with the wrong
+  sign. **Action required: any fitted `(t0, L_scale)` energy scales and
+  any `calibrate_resolution` results (α(E), width scales) obtained with
+  earlier versions under tabulated or IC resolution are invalidated and
+  must be re-fit**, and externally maintained bit-exact baselines of
+  the broadener must be regenerated. Gaussian-resolution and
+  Doppler-only results are unaffected. New sign-pinning regression
+  tests cover both application paths in Rust and the
+  `load_resolution`/`apply_resolution` Python bindings.
+- **Fit-range resolution margin now uses the exact TOF→E map** (#626):
+  `kernel_support_ev` previously used the linear chain-rule estimate,
+  which under-covers on the high-energy side — the side the corrected
+  convolution's delayed-emission tail actually reads from. Extreme
+  tails that reach the nominal flight time now report an unbounded
+  support, which the GUI clamps to the loaded grid.
+
 - **Linux GUI wheel restored to `manylinux_2_28`** (glibc ≥ 2.28:
   RHEL/AlmaLinux 8+, Ubuntu 20.04+) — reverses 0.2.1's jump to
   `manylinux_2_34`, which made `pip install "nereids[gui]"` unresolvable

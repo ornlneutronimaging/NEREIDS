@@ -1944,10 +1944,12 @@ const FIT_RANGE_MARGIN_FWHM: f64 = 5.0;
 ///   the eV distance over which the discrete kernel has positive
 ///   weight at `E`.  Past this distance the kernel is exactly zero,
 ///   so 1× the support fully captures the broadening footprint — no
-///   safety multiplier needed.  The support is computed from the
-///   actual kernel offsets via the chain-rule TOF→eV conversion (see
-///   `TabulatedResolution::kernel_support_ev`), so the margin tracks
-///   the loaded resolution file rather than a hand-picked constant.
+///   safety multiplier needed.  The support maps the actual kernel
+///   offsets through the exact TOF→E relation (see
+///   `TabulatedResolution::kernel_support_ev`; it may return
+///   `f64::INFINITY` for extreme tails, which the `partition_point`
+///   slicing below clamps to the grid), so the margin tracks the
+///   loaded resolution file rather than a hand-picked constant.
 fn kernel_margin_ev(e_ev: f64, resolution: Option<&ResolutionFunction>) -> f64 {
     match resolution {
         None => 0.0,
