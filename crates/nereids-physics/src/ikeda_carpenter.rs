@@ -65,10 +65,12 @@
 //! `t` reads theory at `t−τ` (a neutron measured at `t` with delay τ really flew
 //! `t−τ`; see `resolution::broaden` and SAMMY `udr/mudr4.f90` `Ud_Convolute`).
 //! At apply time
-//! `interpolated_kernel` blends the two bracketing reference kernels when they
-//! have equal point counts, else it falls back to the nearer reference; because
-//! IC trims each kernel's tail independently the point counts often differ, so the
-//! nearest-reference path is common. Either way IC synthesizes a dense reference
+//! `interpolated_kernel` blends the two bracketing reference kernels as a
+//! width-normalized shape blend (offsets scaled to the geometrically
+//! interpolated width, shapes merged on the union grid) — unequal point counts
+//! from IC's per-kernel tail trimming no longer trigger a nearest-reference
+//! fallback, so the between-reference width follows the physical power law
+//! smoothly. IC also synthesizes a dense reference
 //! grid (default 64 energies), so the between-reference error is negligible. The
 //! kernel is anchored with its **mode at offset 0** (peak-centering), matching the
 //! UDR file convention (peak at offset 0); `interpolated_kernel` does not

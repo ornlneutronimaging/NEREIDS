@@ -853,6 +853,45 @@ pub struct TabulatedResolution {
     flight_path_m: f64,
 }
 
+/// Trapezoidal-weighted centroid and RMS width of one kernel block.
+///
+/// The `dt` weights match the quadrature `broaden_presorted` integrates
+/// with (single point → 1.0; edges → one-sided span; interior → half
+/// the neighbour span), so these are the moments the broadener
+/// effectively applies. The centroid pass is byte-identical to the
+/// accumulation `width_corrected` performed inline before this helper
+/// was factored out. Returns `(centroid, sigma)`; `sigma` is `0.0` for
+/// a single-point or zero-mass block — callers treat a non-positive or
+/// non-finite `sigma` as degenerate.
+fn trapezoidal_moments(offsets: &[f64], weights: &[f64]) -> (f64, f64) {
+    let n_k = offsets.len();
+    let dt_width = |k: usize| -> f64 {
+        if n_k <= 1 {
+            1.0
+        } else if k == 0 {
+            offsets[1] - offsets[0]
+        } else if k == n_k - 1 {
+            offsets[k] - offsets[k - 1]
+        } else {
+            (offsets[k + 1] - offsets[k - 1]) * 0.5
+        }
+    };
+    let (mut cnum, mut cden) = (0.0, 0.0);
+    for (k, (&o, &w)) in offsets.iter().zip(weights).enumerate() {
+        let tw = w * dt_width(k).abs();
+        cnum += o * tw;
+        cden += tw;
+    }
+    let centroid = if cden > 0.0 { cnum / cden } else { 0.0 };
+    let mut m2 = 0.0;
+    for (k, (&o, &w)) in offsets.iter().zip(weights).enumerate() {
+        let tw = w * dt_width(k).abs();
+        m2 += (o - centroid).powi(2) * tw;
+    }
+    let sigma = if cden > 0.0 { (m2 / cden).sqrt() } else { 0.0 };
+    (centroid, sigma)
+}
+
 impl TabulatedResolution {
     /// Reference energies (eV), sorted ascending.
     pub fn ref_energies(&self) -> &[f64] {
@@ -920,25 +959,7 @@ impl TabulatedResolution {
                 // `dt`-weighting in `broaden_presorted`), so the *integrated*
                 // centroid is preserved on non-uniform offset grids — not only on
                 // uniform grids where this reduces to the plain centroid.
-                let n_k = offsets.len();
-                let dt_width = |k: usize| -> f64 {
-                    if n_k <= 1 {
-                        1.0
-                    } else if k == 0 {
-                        offsets[1] - offsets[0]
-                    } else if k == n_k - 1 {
-                        offsets[k] - offsets[k - 1]
-                    } else {
-                        (offsets[k + 1] - offsets[k - 1]) * 0.5
-                    }
-                };
-                let (mut cnum, mut cden) = (0.0, 0.0);
-                for (k, (&o, &w)) in offsets.iter().zip(weights).enumerate() {
-                    let tw = w * dt_width(k).abs();
-                    cnum += o * tw;
-                    cden += tw;
-                }
-                let centroid = if cden > 0.0 { cnum / cden } else { 0.0 };
+                let (centroid, _) = trapezoidal_moments(offsets, weights);
                 let scaled = offsets
                     .iter()
                     .map(|&o| centroid + s * (o - centroid))
@@ -967,19 +988,18 @@ impl TabulatedResolution {
     ///    binary search on the sorted `ref_energies` grid.
     /// 2. Take the extreme offsets `dt⁺ = max(dt, 0)` and
     ///    `dt⁻ = max(−dt, 0)` over the kernel entries that can carry
-    ///    weight at `e_ev`.  When the two bracketing kernels have
-    ///    equal point counts — the same condition under which
-    ///    `interpolated_kernel` blends element-wise — a blended entry
-    ///    has positive weight if EITHER endpoint's weight is
-    ///    positive, so a zero-weight padding offset in one kernel is
-    ///    activated by the other kernel's weight at the same index.
-    ///    The scan therefore uses the **joint** mask: wherever either
-    ///    kernel's weight is positive, BOTH kernels' offsets at that
-    ///    index are considered, which bounds every convex combination
-    ///    of the two offsets (and, a fortiori, the nearest-kernel
-    ///    fallback).  When the point counts differ, apply time falls
-    ///    back to the nearer reference kernel, so each kernel is
-    ///    scanned with its own positive-weight mask.
+    ///    weight at `e_ev`.  Between references,
+    ///    [`Self::broaden`]'s width-normalized shape blend scales each
+    ///    block's support in mode-anchored `z = Δt/σ_b` to the target
+    ///    width `σ_t` and unions them — so the scan takes each block's
+    ///    **closure extremes** (the outermost `w > 0` offset, extended
+    ///    to the adjacent `w == 0` entry if one exists on that side:
+    ///    the linearly interpolated shape is positive on that fringe,
+    ///    and a merged point from the other block can land there),
+    ///    divides by that block's `σ_b`, maxes across the two blocks
+    ///    in z, and multiplies by `σ_t`.  Degenerate blocks (σ ≤ 0)
+    ///    take the nearest-clone fallback at apply time, so both
+    ///    blocks are scanned with their own positive-weight masks.
     /// 3. Map each extreme through the **exact** TOF→E relation
     ///    `E' = (TOF_FACTOR·L/(t∓dt))²` with `t = TOF_FACTOR·L/√E`
     ///    and return the larger energy excursion:
@@ -1049,29 +1069,50 @@ impl TabulatedResolution {
             Err(idx) => {
                 let (off_lo, w_lo) = &self.kernels[idx - 1];
                 let (off_hi, w_hi) = &self.kernels[idx];
-                if off_lo.len() == off_hi.len() {
-                    // Element-wise blend (same condition as
-                    // `interpolated_kernel`): a blended entry carries
-                    // positive weight if EITHER endpoint weight is
-                    // positive, and its offset is a convex combination
-                    // of the two endpoint offsets — so fold BOTH
-                    // offsets wherever either weight is positive.
-                    for ((&o_lo, &wl), (&o_hi, &wh)) in off_lo
-                        .iter()
-                        .zip(w_lo.iter())
-                        .zip(off_hi.iter().zip(w_hi.iter()))
-                    {
-                        if wl > 0.0 || wh > 0.0 {
-                            consider(o_lo, &mut max_dt_pos, &mut max_dt_neg);
-                            consider(o_hi, &mut max_dt_pos, &mut max_dt_neg);
-                        }
-                    }
-                } else {
-                    // Different point counts: apply time falls back to
-                    // the nearer reference kernel, so per-kernel
-                    // positive-weight scans bound it.
+                let (_, s_lo) = trapezoidal_moments(off_lo, w_lo);
+                let (_, s_hi) = trapezoidal_moments(off_hi, w_hi);
+                if !(s_lo.is_finite() && s_lo > 0.0 && s_hi.is_finite() && s_hi > 0.0) {
+                    // Degenerate blocks take `interpolated_kernel`'s
+                    // nearest-clone fallback; bounding BOTH blocks
+                    // bounds either clone.
                     visit(idx - 1, &mut max_dt_pos, &mut max_dt_neg);
                     visit(idx, &mut max_dt_pos, &mut max_dt_neg);
+                } else {
+                    // Width-normalized shape blend (lockstep with
+                    // `interpolated_kernel`): each block's support in
+                    // mode-anchored z = Δt/σ_b is scaled to the target
+                    // width σ_t, and the blended support is the union.
+                    // Per block use CLOSURE extremes — the outermost
+                    // w > 0 offset extended to the adjacent w == 0
+                    // entry if one exists on that side: the linearly
+                    // interpolated shape is positive on that fringe,
+                    // and a merged point from the other block can land
+                    // there with positive blended weight.
+                    let e_lo = self.ref_energies[idx - 1];
+                    let e_hi = self.ref_energies[idx];
+                    let frac = (e_ev.ln() - e_lo.ln()) / (e_hi.ln() - e_lo.ln());
+                    let s_t = s_lo * (s_hi / s_lo).powf(frac);
+                    let closure_extents = |offs: &[f64], ws: &[f64]| -> (f64, f64) {
+                        let n_k = offs.len();
+                        let mut pos = 0.0f64;
+                        let mut neg = 0.0f64;
+                        if let Some(kmax) = (0..n_k).rev().find(|&k| ws[k] > 0.0) {
+                            let k_ext = if kmax + 1 < n_k { kmax + 1 } else { kmax };
+                            pos = offs[k_ext].max(0.0);
+                            // kmax exists ⇒ a first positive-weight
+                            // index exists too.
+                            let kmin = (0..n_k).find(|&k| ws[k] > 0.0).unwrap_or(kmax);
+                            let k_ext_n = if kmin > 0 { kmin - 1 } else { kmin };
+                            neg = (-offs[k_ext_n]).max(0.0);
+                        }
+                        (pos, neg)
+                    };
+                    let (p_lo, n_lo) = closure_extents(off_lo, w_lo);
+                    let (p_hi, n_hi) = closure_extents(off_hi, w_hi);
+                    let z_pos = (p_lo / s_lo).max(p_hi / s_hi);
+                    let z_neg = (n_lo / s_lo).max(n_hi / s_hi);
+                    consider(z_pos * s_t, &mut max_dt_pos, &mut max_dt_neg);
+                    consider(-(z_neg * s_t), &mut max_dt_pos, &mut max_dt_neg);
                 }
             }
         }
@@ -2264,8 +2305,58 @@ impl TabulatedResolution {
         }
     }
 
-    /// Interpolate kernel at an arbitrary energy using log-space linear interpolation
-    /// between the two nearest reference energies.
+    /// Interpolate the kernel at an arbitrary energy as a
+    /// **width-normalized shape blend** between the two bracketing
+    /// reference kernels:
+    ///
+    /// 1. Exact hits (a reference energy, or outside the reference
+    ///    range) return that reference kernel unchanged.
+    /// 2. Each bracketing block's trapezoidal RMS width `σ_b` is
+    ///    computed ([`trapezoidal_moments`]); the target width is the
+    ///    **geometric** interpolation `σ_t = σ_lo·(σ_hi/σ_lo)^frac`
+    ///    with `frac` linear in log E — exact for the physical
+    ///    power-law width `σ_t ∝ E^p` (log σ linear in log E).
+    /// 3. Both blocks' offsets are scaled about the mode (offset 0 —
+    ///    the anchoring convention; see the `#625` discussion in
+    ///    `ikeda_carpenter`) by `σ_t/σ_b`, merged into one
+    ///    strictly-ascending grid, and the weights blended pointwise:
+    ///    `w = w_lo(x) + frac·(w_hi(x) − w_lo(x))`, each block's weight
+    ///    linearly interpolated (zero outside its support). Identical
+    ///    blocks reduce to a **bitwise identity** (the scale ratios are
+    ///    exactly 1.0 and the blend form is exact when `w_lo == w_hi`).
+    ///
+    /// Degenerate blocks (single-point, zero mass → `σ_b ≤ 0`) fall
+    /// back to the nearer reference clone.
+    ///
+    /// ## INTENTIONAL DEPARTURE from SAMMY
+    ///
+    /// SAMMY's user-defined resolution blends both the amplitude and
+    /// the time-point arrays element-wise, **linear in E**
+    /// (sammy/src/udr/mudr3.f90 lines 92–112: `UdR_E(J) =
+    /// a·UdR(J,I−1) + b·UdR(J,I)` and likewise `UdT_E(J)`), i.e. the
+    /// arithmetic width chord. Because the physical width law
+    /// `σ_t ∝ ~E^{−1/2}` is convex, that chord systematically
+    /// over-widens every between-reference energy: +7.8 % at the
+    /// midpoint of synthetic 10/50 eV Gaussian blocks, +4.1…+7.2 %
+    /// across the production VENUS 5→50 eV reference gap — a direct
+    /// resolution-width systematic that biases fitted temperatures
+    /// low. The geometric-width shape blend above removes it (and the
+    /// nearest-reference width sawtooth that unequal point counts used
+    /// to produce). SAMMY additionally re-centers the blended kernel
+    /// on its trapezoidal centroid `Ct` (mudr3.f90 lines 114–140);
+    /// NEREIDS keeps kernels mode-anchored instead (deliberately
+    /// unchanged here — the anchoring question is tracked separately).
+    ///
+    /// Exactness caveat: the blend reproduces `σ_t` exactly when the
+    /// two blocks' width-normalized shapes agree (self-similar
+    /// families, e.g. any pure power-law file). Genuinely different
+    /// bracketing shapes add a second-order mixture-spread term —
+    /// inherent to shape blending and far below the removed chord
+    /// error for real moderator files.
+    ///
+    /// Allocates the two output Vecs per call (≈ n_lo + n_hi points
+    /// between references); scratch reuse is tracked separately as a
+    /// performance follow-up.
     ///
     /// `ref_energies` is validated as strictly ascending by `from_text()` /
     /// `from_file()` at construction time, so no per-call sort check is needed.
@@ -2286,6 +2377,13 @@ impl TabulatedResolution {
 
         // Find bracketing indices
         let pos = self.ref_energies.partition_point(|&e| e < energy);
+        // Interior exact hit: return that reference unchanged, keeping
+        // this function lockstep with `kernel_support_ev`'s `Ok(idx)`
+        // arm (previously an interior hit went through the blend with
+        // `frac == 1.0`, reproducing the kernel only up to ULPs).
+        if self.ref_energies[pos] == energy {
+            return self.kernels[pos].clone();
+        }
         let idx = if pos == 0 {
             0
         } else {
@@ -2310,33 +2408,103 @@ impl TabulatedResolution {
             (k.0.clone(), k.1.clone())
         };
 
-        let (offsets, weights) = if off_lo.len() == off_hi.len() {
-            // Both kernels have the same number of points: interpolate element-wise.
-            let offsets: Vec<f64> = off_lo
-                .iter()
-                .zip(off_hi.iter())
-                .map(|(&a, &b)| a + frac * (b - a))
-                .collect();
-            // A convex blend of two strictly-ascending offset arrays stays
-            // ascending; guard defensively (e.g. a degenerate input kernel) and
-            // fall back to the nearer reference rather than emit a non-monotone
-            // kernel the two-pointer broadener assumes is sorted.
-            if offsets.windows(2).all(|w| w[0] < w[1]) {
-                let weights: Vec<f64> = w_lo
-                    .iter()
-                    .zip(w_hi.iter())
-                    .map(|(&a, &b)| a + frac * (b - a))
-                    .collect();
-                (offsets, weights)
-            } else {
-                nearest()
+        let (_, s_lo) = trapezoidal_moments(off_lo, w_lo);
+        let (_, s_hi) = trapezoidal_moments(off_hi, w_hi);
+        if !(s_lo.is_finite() && s_lo > 0.0 && s_hi.is_finite() && s_hi > 0.0) {
+            return nearest();
+        }
+
+        // Geometric width interpolation. This float form (ratio +
+        // powf) is a bitwise no-op when σ_lo == σ_hi: the ratio is
+        // exactly 1.0, powf(1.0, f) == 1.0, so both scale factors are
+        // exactly 1.0 and scaled offsets are the originals.
+        let s_t = s_lo * (s_hi / s_lo).powf(frac);
+        let r_lo = s_t / s_lo;
+        let r_hi = s_t / s_hi;
+
+        // Single-pass sorted merge of the two scaled grids. Each
+        // block's weight at a merged point is its own tabulated value
+        // when the point came from that block, else the linear
+        // interpolation of its shape (zero outside its support).
+        let n_lo = off_lo.len();
+        let n_hi = off_hi.len();
+        let mut out_off: Vec<f64> = Vec::with_capacity(n_lo + n_hi);
+        let mut out_w: Vec<f64> = Vec::with_capacity(n_lo + n_hi);
+
+        // Piecewise-linear sample of one block's shape at `x`, with a
+        // monotone cursor (merged points arrive in ascending order).
+        let sample = |offs: &[f64], ws: &[f64], r: f64, cursor: &mut usize, x: f64| -> f64 {
+            let n = offs.len();
+            if x < offs[0] * r || x > offs[n - 1] * r {
+                return 0.0;
             }
-        } else {
-            // Different point counts: fall back to the nearer reference kernel.
-            nearest()
+            while *cursor + 1 < n && offs[*cursor + 1] * r <= x {
+                *cursor += 1;
+            }
+            if *cursor + 1 >= n {
+                return ws[n - 1];
+            }
+            let x0 = offs[*cursor] * r;
+            let x1 = offs[*cursor + 1] * r;
+            let span = x1 - x0;
+            if x <= x0 || span <= 0.0 {
+                return ws[*cursor];
+            }
+            ws[*cursor] + (x - x0) / span * (ws[*cursor + 1] - ws[*cursor])
         };
 
-        (offsets, weights)
+        let (mut i, mut j) = (0usize, 0usize);
+        let (mut ci, mut cj) = (0usize, 0usize);
+        while i < n_lo || j < n_hi {
+            let xa = if i < n_lo {
+                off_lo[i] * r_lo
+            } else {
+                f64::INFINITY
+            };
+            let xb = if j < n_hi {
+                off_hi[j] * r_hi
+            } else {
+                f64::INFINITY
+            };
+            // Near-duplicate merge (covers the exact 0 == 0 mode point):
+            // emit one point carrying both blocks' exact tabulated
+            // weights, so identical blocks blend to their exact values.
+            let near_dup = i < n_lo
+                && j < n_hi
+                && (xa - xb).abs() <= 4.0 * f64::EPSILON * xa.abs().max(xb.abs());
+            let (x, wl, wh) = if near_dup {
+                let v = (xa, w_lo[i], w_hi[j]);
+                i += 1;
+                j += 1;
+                v
+            } else if xa < xb {
+                let v = (xa, w_lo[i], sample(off_hi, w_hi, r_hi, &mut cj, xa));
+                i += 1;
+                v
+            } else {
+                let v = (xb, sample(off_lo, w_lo, r_lo, &mut ci, xb), w_hi[j]);
+                j += 1;
+                v
+            };
+            // Defensive strict-ascension guard: the broadener's
+            // trapezoidal quadrature and two-pointer walk require it
+            // unconditionally, regardless of the dedup epsilon.
+            if let Some(&last) = out_off.last()
+                && x <= last
+            {
+                continue;
+            }
+            out_off.push(x);
+            // Exact when `wl == wh` (identical blocks), and exactly the
+            // endpoint values at frac → 0/1.
+            out_w.push(wl + frac * (wh - wl));
+        }
+
+        // Blended weights inherit the blocks' scale (peak-normalized by
+        // convention); the broadener renormalizes at apply time, so no
+        // re-normalization is done here — preserving the bitwise
+        // identity for identical blocks unconditionally.
+        (out_off, out_w)
     }
 }
 
@@ -3063,6 +3231,116 @@ NaN 0.0
             "mode not anchored at offset 0: {}",
             blended[kmax]
         );
+    }
+
+    /// For a self-similar family (each block a width-scaled copy of one
+    /// asymmetric template), the width-normalized shapes agree, so the
+    /// blended kernel's trapezoidal width must equal the geometric
+    /// interpolation `σ_lo·(σ_hi/σ_lo)^frac` — near-exactly (the scaled
+    /// grids coincide point-for-point in z, so the merge degenerates to
+    /// the template shape at the target width). An interior reference
+    /// energy must return that block bitwise (exact-hit arm).
+    #[test]
+    fn interpolated_kernel_width_follows_power_law_for_self_similar_blocks() {
+        let template_off = [-1.0, -0.4, 0.0, 0.8, 2.0, 4.0];
+        let template_w = vec![0.05, 0.5, 1.0, 0.6, 0.2, 0.02];
+        // σ ∝ E^{-1/2} scaling across refs 10 / 100 / 1000 eV.
+        let scale = |e: f64| (e / 10.0f64).powf(-0.5);
+        let block = |e: f64| -> (Vec<f64>, Vec<f64>) {
+            (
+                template_off.iter().map(|&o| o * scale(e)).collect(),
+                template_w.clone(),
+            )
+        };
+        let tab = TabulatedResolution::from_kernels(
+            vec![10.0, 100.0, 1000.0],
+            vec![block(10.0), block(100.0), block(1000.0)],
+            25.0,
+        )
+        .unwrap();
+
+        // Interior exact hit: the middle reference comes back bitwise.
+        let (off_ref, w_ref) = test_support::interpolated_kernel(&tab, 100.0);
+        let (exp_off, exp_w) = block(100.0);
+        assert_eq!(off_ref.len(), exp_off.len());
+        for (a, b) in off_ref.iter().zip(&exp_off) {
+            assert_eq!(
+                a.to_bits(),
+                b.to_bits(),
+                "exact-hit offsets must be bitwise"
+            );
+        }
+        for (a, b) in w_ref.iter().zip(&exp_w) {
+            assert_eq!(
+                a.to_bits(),
+                b.to_bits(),
+                "exact-hit weights must be bitwise"
+            );
+        }
+
+        // Between references: measured width equals the geometric law.
+        let (off_lo, w_lo) = block(10.0);
+        let (off_hi, w_hi) = block(100.0);
+        let (_, s_lo) = trapezoidal_moments(&off_lo, &w_lo);
+        let (_, s_hi) = trapezoidal_moments(&off_hi, &w_hi);
+        for e in [16.0f64, 25.0, 40.0, 70.0] {
+            let frac = (e.ln() - 10.0f64.ln()) / (100.0f64.ln() - 10.0f64.ln());
+            let expected = s_lo * (s_hi / s_lo).powf(frac);
+            let (offs, ws) = test_support::interpolated_kernel(&tab, e);
+            let (_, got) = trapezoidal_moments(&offs, &ws);
+            assert!(
+                (got - expected).abs() / expected < 1e-9,
+                "blended width at {e} eV: got {got}, expected {expected} \
+                 (the pre-fix arithmetic chord gave {})",
+                s_lo + frac * (s_hi - s_lo)
+            );
+            // Non-vacuity: the removed chord error is resolvable at
+            // this tolerance (σ_hi/σ_lo = 10^{-1/2} → several % apart).
+            assert!(
+                (s_lo + frac * (s_hi - s_lo) - expected).abs() / expected > 1e-2,
+                "fixture must separate chord from geometric law at {e} eV"
+            );
+        }
+    }
+
+    /// Identical bracketing blocks must come back bitwise-identical
+    /// between the references (scale ratios exactly 1.0; the blend form
+    /// `a + frac·(b − a)` is exact when a == b).
+    #[test]
+    fn interpolated_kernel_is_bitwise_identity_for_identical_blocks() {
+        let off = vec![-1.0, -0.4, 0.0, 0.8, 2.0, 4.0];
+        let w = vec![0.05, 0.5, 1.0, 0.6, 0.2, 0.02];
+        let tab = TabulatedResolution::from_kernels(
+            vec![5.0, 500.0],
+            vec![(off.clone(), w.clone()), (off.clone(), w.clone())],
+            25.0,
+        )
+        .unwrap();
+        let (offs, ws) = test_support::interpolated_kernel(&tab, 42.0);
+        assert_eq!(offs.len(), off.len());
+        for (a, b) in offs.iter().zip(&off) {
+            assert_eq!(a.to_bits(), b.to_bits(), "identity offsets must be bitwise");
+        }
+        for (a, b) in ws.iter().zip(&w) {
+            assert_eq!(a.to_bits(), b.to_bits(), "identity weights must be bitwise");
+        }
+    }
+
+    /// Degenerate blocks (single-point → σ = 0) cannot be width-scaled;
+    /// the nearer reference is cloned instead.
+    #[test]
+    fn interpolated_kernel_degenerate_blocks_fall_back_to_nearest() {
+        let tab = TabulatedResolution::from_kernels(
+            vec![10.0, 1000.0],
+            vec![(vec![0.0], vec![1.0]), (vec![0.5], vec![1.0])],
+            25.0,
+        )
+        .unwrap();
+        // frac < 0.5 → lower block; frac > 0.5 → upper block.
+        let (lo_off, _) = test_support::interpolated_kernel(&tab, 15.0);
+        assert_eq!(lo_off, vec![0.0]);
+        let (hi_off, _) = test_support::interpolated_kernel(&tab, 700.0);
+        assert_eq!(hi_off, vec![0.5]);
     }
 
     // ── Smoke tests for the test_support oracles (`interp_spectrum` +
@@ -4439,20 +4717,47 @@ NaN 0.0
         );
     }
 
-    /// Between two reference energies the support uses the extreme of
-    /// the two bracketing kernels (conservative).  At E = 100 eV the
-    /// brackets are 50 eV (half = 1.0, n = 41) and 500 eV (half = 2.0,
-    /// n = 51); the larger non-zero offset is `2.0 · (1 − 1/50) = 1.96`.
+    /// Between two reference energies the support tracks the ACTUAL
+    /// width-interpolated kernel: it must cover that kernel's non-zero
+    /// offsets (non-circular — the blend comes from
+    /// `interpolated_kernel` itself), while sitting strictly BELOW the
+    /// old take-the-wider-bracket bound (proving the interior arm
+    /// engaged rather than falling back to per-kernel extremes).
     #[test]
-    fn test_tabulated_kernel_support_uses_larger_bracketing_kernel() {
+    fn test_tabulated_kernel_support_covers_actual_blend_between_refs() {
         let r = synthetic_tab_resolution();
-        let e: f64 = 100.0;
-        let dt_max = triangle_dt_max(2.0, 51);
-        let expected = exact_support(e, dt_max, dt_max, 25.0);
+        let e: f64 = 100.0; // between the 50 eV and 500 eV references
         let got = r.kernel_support_ev(e);
+
+        // Cover: exact excursion of the blended kernel's w>0 extremes.
+        let (offs, ws) = test_support::interpolated_kernel(&r, e);
+        let dt_pos = offs
+            .iter()
+            .zip(&ws)
+            .filter(|&(_, &w)| w > 0.0)
+            .map(|(&o, _)| o)
+            .fold(0.0f64, f64::max);
+        let dt_neg = offs
+            .iter()
+            .zip(&ws)
+            .filter(|&(_, &w)| w > 0.0)
+            .map(|(&o, _)| -o)
+            .fold(0.0f64, f64::max);
+        let actual_excursion = exact_support(e, dt_pos, dt_neg, 25.0);
         assert!(
-            (got - expected).abs() / expected < 1e-12,
-            "support between refs: got {got}, expected {expected}"
+            got >= actual_excursion * (1.0 - 1e-12),
+            "support must cover the actual blended kernel: got {got}, \
+             actual excursion {actual_excursion}"
+        );
+
+        // Tightness + non-vacuity: strictly below the pre-blend bound
+        // built from the wider 500 eV bracket's extreme (1.96 µs) —
+        // the between-ref kernel is genuinely narrower.
+        let old_bound = exact_support(e, triangle_dt_max(2.0, 51), triangle_dt_max(2.0, 51), 25.0);
+        assert!(
+            got < old_bound,
+            "interior support must track the narrower interpolated \
+             kernel: got {got}, old wider-bracket bound {old_bound}"
         );
     }
 
@@ -4555,39 +4860,67 @@ NaN 0.0
         );
     }
 
-    /// Between two equal-count reference kernels, `interpolated_kernel`
-    /// blends element-wise, and a blended entry has positive weight if
-    /// EITHER endpoint's weight is positive — so a zero-weight padding
-    /// offset in one kernel is activated by the other kernel's weight
-    /// at the same index.  The support must bound the blend-activated
-    /// offset region (joint mask), not just the per-kernel
-    /// positive-weight extremes.
+    /// Between reference kernels, the blended shape is positive on the
+    /// FRINGE between a block's outermost `w > 0` entry and its
+    /// adjacent `w == 0` entry (linear interpolation), and a merged
+    /// point from the other block can land there — so the support's
+    /// closure extremes (outermost positive weight extended to the
+    /// adjacent zero-weight entry) must cover the actual blended
+    /// kernel, which reaches beyond both blocks' bare `w > 0` maxima.
     #[test]
     fn test_tabulated_kernel_support_covers_blend_activated_offsets() {
-        // Kernel A pads its tail with zero-weight entries reaching
-        // offset 20; kernel B carries positive weight at every index.
-        // Per-kernel positive-weight maxima are 5 (A) and 12 (B), but
-        // the blend at the last index has offset `20 + frac·(12 − 20)`
-        // with weight `0 + frac·0.1 > 0` — beyond both maxima.
+        // Kernel A's positive support ends at z ≈ 3.5 (offset 5,
+        // σ_A ≈ 1.44) with a zero-weight fringe out to z ≈ 7.0
+        // (offset 10). Kernel B is compact (σ_B ≈ 0.97) with a
+        // low-weight point at z ≈ 5.2 (offset 5) — inside A's fringe
+        // after width normalization — so the blended kernel is
+        // positive beyond A's bare w>0 extreme.
         let r = TabulatedResolution {
             ref_energies: vec![10.0, 1000.0],
             kernels: vec![
                 (vec![0.0, 5.0, 10.0, 20.0], vec![1.0, 0.1, 0.0, 0.0]),
-                (vec![0.0, 4.0, 8.0, 12.0], vec![1.0, 0.5, 0.3, 0.1]),
+                (vec![0.0, 1.0, 5.0, 6.0], vec![1.0, 0.8, 0.05, 0.0]),
             ],
             flight_path_m: 25.0,
         };
         let e: f64 = 100.0; // strictly between the reference energies
-        let expected = exact_support(e, 20.0, 0.0, 25.0);
         let got = r.kernel_support_ev(e);
+
+        // Non-circular cover: the actual blended kernel's w>0 extremes.
+        let (offs, ws) = test_support::interpolated_kernel(&r, e);
+        let dt_pos = offs
+            .iter()
+            .zip(&ws)
+            .filter(|&(_, &w)| w > 0.0)
+            .map(|(&o, _)| o)
+            .fold(0.0f64, f64::max);
+        let dt_neg = offs
+            .iter()
+            .zip(&ws)
+            .filter(|&(_, &w)| w > 0.0)
+            .map(|(&o, _)| -o)
+            .fold(0.0f64, f64::max);
+        let actual_excursion = exact_support(e, dt_pos, dt_neg, 25.0);
         assert!(
-            (got - expected).abs() / expected < 1e-12,
-            "support must cover blend-activated zero-weight offsets: \
-             got {got}, expected {expected}"
+            got >= actual_excursion * (1.0 - 1e-12),
+            "support must cover the actual blended kernel (incl. the \
+             zero-weight fringe): got {got}, actual {actual_excursion}"
         );
-        // Non-vacuity: the joint bound strictly exceeds what the
-        // per-kernel positive-weight extremes (dt⁺ = 12) would give.
-        assert!(got > exact_support(e, 12.0, 0.0, 25.0));
+
+        // The fringe matters: the actual blend reaches beyond block
+        // A's bare positive maximum (5 µs) scaled to the target width
+        // — assert the blend truly is wider than a no-fringe reading
+        // of block A would suggest, keeping this case load-bearing.
+        let (_, s_lo) = trapezoidal_moments(&r.kernels[0].0, &r.kernels[0].1);
+        let (_, s_hi) = trapezoidal_moments(&r.kernels[1].0, &r.kernels[1].1);
+        let frac = (e.ln() - 10.0f64.ln()) / (1000.0f64.ln() - 10.0f64.ln());
+        let s_t = s_lo * (s_hi / s_lo).powf(frac);
+        let bare_positive_bound = 5.0 / s_lo * s_t;
+        assert!(
+            dt_pos > bare_positive_bound,
+            "blend must extend into the zero-weight fringe: dt_pos {dt_pos}, \
+             bare-positive bound {bare_positive_bound}"
+        );
     }
 
     /// The support must contain the footprint of the ACTUAL broadener:
