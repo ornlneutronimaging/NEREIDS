@@ -1737,12 +1737,15 @@ impl TabulatedResolution {
         // * non-empty: an empty block would make `broaden_presorted`
         //   accumulate `norm == 0` and silently pass the spectrum
         //   through;
+        // * all-finite offsets and weights (checked BEFORE sortedness:
+        //   a NaN offset fails the ascending comparison too, and the
+        //   "must be strictly ascending" message would mislead): a NaN
+        //   weight poisons the kernel norm and bypasses the division
+        //   guard;
         // * strictly ascending offsets: the monotonic two-pointer
         //   bracket walk and the trapezoidal `dt` widths
         //   (`offsets[k+1] − offsets[k−1]`) both assume sorted offsets
-        //   — an unsorted block would broaden silently-wrong;
-        // * all-finite offsets and weights: a NaN weight poisons the
-        //   kernel norm and bypasses the division guard.
+        //   — an unsorted block would broaden silently-wrong.
         for (i, (offsets, weights)) in kernels.iter().enumerate() {
             if offsets.is_empty() {
                 return Err(ResolutionParseError::InvalidFormat(format!(
@@ -1750,15 +1753,15 @@ impl TabulatedResolution {
                     ref_energies[i],
                 )));
             }
-            if !offsets.windows(2).all(|w| w[0] < w[1]) {
-                return Err(ResolutionParseError::InvalidFormat(format!(
-                    "Kernel {i} (E = {} eV) TOF offsets must be strictly ascending",
-                    ref_energies[i],
-                )));
-            }
             if offsets.iter().any(|v| !v.is_finite()) || weights.iter().any(|v| !v.is_finite()) {
                 return Err(ResolutionParseError::InvalidFormat(format!(
                     "Kernel {i} (E = {} eV) contains non-finite offsets or weights",
+                    ref_energies[i],
+                )));
+            }
+            if !offsets.windows(2).all(|w| w[0] < w[1]) {
+                return Err(ResolutionParseError::InvalidFormat(format!(
+                    "Kernel {i} (E = {} eV) TOF offsets must be strictly ascending",
                     ref_energies[i],
                 )));
             }
@@ -2991,6 +2994,27 @@ Resolution file
         assert!(
             msg.contains("non-finite"),
             "error must name the non-finite value class: {msg}"
+        );
+
+        // Non-finite kernel OFFSET: must report the finiteness problem,
+        // not the misleading "must be strictly ascending" (a NaN offset
+        // fails the ascending comparison too — finiteness is checked
+        // first so the message stays accurate).
+        let nan_offset = "\
+Resolution file
+---------------
+5.0 0.0
+-1.0 0.1
+NaN 1.0
+1.0 0.5
+";
+        let err = TabulatedResolution::from_text(nan_offset, 25.0);
+        let Err(ResolutionParseError::InvalidFormat(msg)) = err else {
+            panic!("non-finite offset must be rejected, got {err:?}");
+        };
+        assert!(
+            msg.contains("non-finite") && !msg.contains("ascending"),
+            "NaN offset must report finiteness, not sortedness: {msg}"
         );
 
         // Non-finite reference energy.
