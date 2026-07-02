@@ -33,12 +33,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
 ### Added
 
 - **Wheel-policy CI gate** (`scripts/check_wheel_policy.sh` +
-  `.github/workflows/wheel-policy.yml`): Linux wheels are built in the
+  `.github/workflows/wheel-policy.yml`): both published Linux wheels —
+  the GUI wheel and the `nereids` bindings wheel — are built in the
   `manylinux_2_28` container at PR time and checked against the ORNL
   RHEL 8 ceiling (filename tag, `auditwheel` grade, no vendored
-  libraries, max versioned-GLIBC symbol) — release-time-only breakage of
-  the GUI wheel (the 0.2.0 yank) is now a PR failure. The publish
-  workflow enforces the same policy on release artifacts.
+  libraries, max versioned-GLIBC symbol) — release-time-only breakage
+  (the 0.2.0 yank) is now a PR failure. The publish workflow enforces
+  the same policy on release artifacts.
 
 ## [0.2.1] - 2026-06-16
 
