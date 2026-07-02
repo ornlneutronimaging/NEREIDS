@@ -99,44 +99,52 @@ Building from source requires CMake (for HDF5) and a Rust toolchain.
 
 ### Linux system dependencies
 
-NEREIDS uses GTK 3 for native file dialogs (no `xdg-desktop-portal`
-daemon needed) and the standard egui/winit/wgpu stack for the rest of
-the UI. Desktop Linux distros usually ship these, but minimal /
-container / server installs do not.
+The Linux wheel is built for `manylinux_2_28`, so it runs on any
+x86_64 distribution with glibc ≥ 2.28: RHEL/AlmaLinux/Rocky 8+,
+Ubuntu 20.04+, Debian 10+, Fedora 29+, and newer.
+
+File dialogs use a three-tier chain with **no hard system
+dependencies**:
+
+1. **XDG desktop portal** (`org.freedesktop.portal.FileChooser` over
+   D-Bus) — native dialogs on any desktop session (GNOME, KDE, …).
+   Preinstalled on every mainstream desktop, including RHEL 8's GNOME.
+2. **zenity** — automatic fallback when no portal is reachable.
+   Recommended for `ssh -X` sessions and containers:
+   `sudo dnf install zenity` / `sudo apt-get install zenity`.
+3. **Built-in file browser** — rendered by the GUI itself, works in
+   every environment (root, containers, no D-Bus). Selected
+   automatically when neither portal nor zenity is available; the GUI
+   shows a banner saying so.
+
+The rest of the UI is the standard egui/winit/GL stack. Desktop Linux
+distros ship these; minimal / container / server installs may not:
 
 **Debian / Ubuntu (apt):**
 
 ```bash
 sudo apt-get install -y \
-  libgtk-3-0 libxcursor1 libx11-xcb1 libxi6 libxrandr2 \
+  libxcursor1 libx11-xcb1 libxi6 libxrandr2 \
   libxinerama1 libxxf86vm1 libxkbcommon-x11-0 libwayland-client0 \
   libgl1 libgl1-mesa-dri libegl1
 ```
 
-`libgtk-3-0` is portable across Debian and all current Ubuntu LTS
-releases. On Ubuntu 24.04 (Noble) it pulls in `libgtk-3-0t64` under
-the hood via the t64 transitional package. `libgl1-mesa-dri` is
-needed even with `LIBGL_ALWAYS_SOFTWARE=1` (below) because the
-software rasteriser is shipped as a Mesa DRI driver.
-
-Contributors building from source additionally need the GTK 3
-development headers and `pkg-config`:
-
-```bash
-sudo apt-get install -y libgtk-3-dev pkg-config
-```
+`libgl1-mesa-dri` is needed even with `LIBGL_ALWAYS_SOFTWARE=1`
+(below) because the software rasteriser is shipped as a Mesa DRI
+driver.
 
 **Fedora / RHEL (dnf):**
 
 ```bash
 sudo dnf install -y \
-  gtk3 libXcursor libXi libXrandr libXinerama libxkbcommon-x11 \
+  libXcursor libXi libXrandr libXinerama libxkbcommon-x11 \
   libwayland-client libwayland-cursor \
   mesa-libGL mesa-libEGL mesa-dri-drivers
 ```
 
-Contributors building from source additionally need `gtk3-devel` and
-`pkgconf-pkg-config`.
+No GTK packages and no development headers are required — neither at
+runtime nor for building from source (the dialog stack has no
+build-time system libraries; only CMake for HDF5, as noted above).
 
 **Headless / Docker / VM fallback:**
 

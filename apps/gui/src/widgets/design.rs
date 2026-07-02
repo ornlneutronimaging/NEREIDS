@@ -578,12 +578,18 @@ pub struct ResolutionCardResult {
 
 /// Shared resolution broadening card: Gaussian parametric or tabulated file.
 ///
-/// Used identically in Configure, Forward Model, and Detectability.
+/// Used identically in Configure, Forward Model, and Detectability —
+/// `target` tells the dialog dispatcher which card's state a picked
+/// resolution file belongs to. `changed` covers the inline edits only;
+/// file picks resolve through `file_dialog::dispatch_results`, which
+/// applies the same per-card invalidation as the callers.
 pub fn resolution_card(
     ui: &mut Ui,
     enabled: &mut bool,
     mode: &mut ResolutionMode,
     flight_path_m: f64,
+    dialogs: &mut crate::file_dialog::FileDialogs,
+    target: crate::file_dialog::ResolutionTarget,
 ) -> ResolutionCardResult {
     let mut changed = false;
 
@@ -648,35 +654,14 @@ pub fn resolution_card(
             }
             ResolutionMode::Tabulated { path, data, error } => {
                 ui.horizontal(|ui| {
-                    if ui.button("Load resolution file\u{2026}").clicked()
-                        && let Some(file) = rfd::FileDialog::new()
-                            .add_filter("Resolution", &["txt", "dat"])
-                            .pick_file()
-                    {
-                        if let Some(path_str) = file.to_str() {
-                            match TabulatedResolution::from_file(path_str, flight_path_m) {
-                                Ok(tab) => {
-                                    *path = file;
-                                    *data = Some(Arc::new(tab));
-                                    *error = None;
-                                    changed = true;
-                                }
-                                Err(e) => {
-                                    *path = file;
-                                    *data = None;
-                                    *error = Some(format!("{e}"));
-                                    changed = true;
-                                }
-                            }
-                        } else {
-                            *path = file;
-                            *data = None;
-                            *error = Some(
-                                "File path is not valid UTF-8; please choose a different file"
-                                    .into(),
-                            );
-                            changed = true;
-                        }
+                    if ui.button("Load resolution file\u{2026}").clicked() {
+                        dialogs.pick_file(
+                            crate::file_dialog::DialogIntent::ResolutionFile(target),
+                            crate::file_dialog::DialogOptions {
+                                filters: vec![("Resolution", &["txt", "dat"])],
+                                ..Default::default()
+                            },
+                        );
                     }
                     if let Some(name) = path.file_name() {
                         ui.label(
@@ -711,6 +696,35 @@ pub fn resolution_card(
     });
 
     ResolutionCardResult { changed }
+}
+
+/// Apply a picked tabulated-resolution file to `mode` (dispatch handler
+/// for `DialogIntent::ResolutionFile`). Overwrites `mode` with a fresh
+/// `Tabulated` variant so a pick that resolves on a later frame wins
+/// even if the user toggled the radio in between. Returns `true` when
+/// the mode changed (always — parse failures are recorded in `error`,
+/// matching the previous inline behaviour).
+pub fn apply_resolution_file(
+    mode: &mut ResolutionMode,
+    file: std::path::PathBuf,
+    flight_path_m: f64,
+) -> bool {
+    let (data, error) = match file.to_str() {
+        Some(path_str) => match TabulatedResolution::from_file(path_str, flight_path_m) {
+            Ok(tab) => (Some(Arc::new(tab)), None),
+            Err(e) => (None, Some(format!("{e}"))),
+        },
+        None => (
+            None,
+            Some("File path is not valid UTF-8; please choose a different file".into()),
+        ),
+    };
+    *mode = ResolutionMode::Tabulated {
+        path: file,
+        data,
+        error,
+    };
+    true
 }
 
 // ── ENDF Library Name ──────────────────────────────────────────

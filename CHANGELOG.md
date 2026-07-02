@@ -7,6 +7,40 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
 
 ## [Unreleased]
 
+### Fixed
+
+- **Linux GUI wheel restored to `manylinux_2_28`** (glibc ≥ 2.28:
+  RHEL/AlmaLinux 8+, Ubuntu 20.04+) — reverses 0.2.1's jump to
+  `manylinux_2_34`, which made `pip install "nereids[gui]"` unresolvable
+  on the ORNL RHEL 8 analysis fleet. The root cause — rfd's gtk3 dialog
+  backend pinning `gtk+-3.0 >= 3.24` at build time and dragging a
+  vendored 64-library GTK stack into the wheel — is retired for good:
+  Linux file dialogs now use the XDG desktop portal (native dialogs on
+  any desktop session, with automatic `zenity` fallback) and a pure-egui
+  built-in file browser as the final tier. No GTK packages are needed at
+  runtime or build time, and the wheel vendors no shared libraries
+  (40 MB → ~13 MB).
+- **File dialogs can no longer hang or fail silently on Linux** (#526):
+  portal dialogs run on a worker thread (rfd 0.17's portal wait loop has
+  no timeout and could freeze the UI thread indefinitely), a startup
+  probe + portal canary select the built-in browser when no native chain
+  works, an escape-hatch overlay offers the built-in browser while a
+  native dialog is pending, and dialog-backend failures now surface as a
+  visible in-app banner instead of dead buttons. `log`-crate diagnostics
+  from dependencies (rfd, opener) are now bridged into the tracing log
+  files instead of being discarded.
+
+### Added
+
+- **Wheel-policy CI gate** (`scripts/check_wheel_policy.sh` +
+  `.github/workflows/wheel-policy.yml`): both published Linux wheels —
+  the GUI wheel and the `nereids` bindings wheel — are built in the
+  `manylinux_2_28` container at PR time and checked against the ORNL
+  RHEL 8 ceiling (filename tag, `auditwheel` grade, no vendored
+  libraries, max versioned-GLIBC symbol) — release-time-only breakage
+  (the 0.2.0 yank) is now a PR failure. The publish workflow enforces
+  the same policy on release artifacts.
+
 ## [0.2.1] - 2026-06-16
 
 ### Fixed

@@ -4,6 +4,7 @@
 //! isotope identification, and spatial composition mapping.
 
 mod app;
+mod file_dialog;
 mod guided;
 mod logging;
 mod pipeline;

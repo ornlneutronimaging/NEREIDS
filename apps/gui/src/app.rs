@@ -140,13 +140,44 @@ impl eframe::App for NereidsApp {
             }
         }
 
-        // Cmd+O / Ctrl+O — open project
-        if ctx.input(|i| i.modifiers.command && i.key_pressed(egui::Key::O)) {
+        // Cmd+O / Ctrl+O — open project. Gated on no dialog being open:
+        // ctx.input() bypasses widget modality, so without the gate the
+        // shortcut would silently discard an in-progress in-app dialog
+        // (Linux fallback tier) that pointer input cannot bypass.
+        if ctx.input(|i| i.modifiers.command && i.key_pressed(egui::Key::O))
+            && !self.state.file_dialogs.dialog_in_flight()
+        {
             crate::project::load_project_dialog(&mut self.state);
         }
 
         // Top toolbar
         widgets::toolbar::toolbar(ctx, &mut self.state);
+
+        // Dialog problems surfaced by the facade: probe/canary
+        // verdicts and native-backend failures (the facade classifies
+        // the log-bridge latch against each request's outcome).
+        if let Some(msg) = self.state.file_dialogs.take_warning() {
+            self.state.native_dialog_warning = Some(msg);
+        }
+        if let Some(msg) = &self.state.native_dialog_warning {
+            // Dismissal is recorded in a flag and applied after the
+            // panel closure so the banner text renders by reference —
+            // no per-frame clone of a message that may stay visible for
+            // many frames.
+            let mut dismissed = false;
+            egui::TopBottomPanel::top("native_dialog_warning").show(ctx, |ui| {
+                ui.horizontal_wrapped(|ui| {
+                    ui.label(egui::RichText::new("\u{26A0}").color(ui.visuals().warn_fg_color));
+                    ui.label(msg.as_str());
+                    if ui.small_button("Dismiss").clicked() {
+                        dismissed = true;
+                    }
+                });
+            });
+            if dismissed {
+                self.state.native_dialog_warning = None;
+            }
+        }
 
         // Bottom status bar
         widgets::statusbar::status_bar(ctx, &self.state, self.memory.rss_bytes);
@@ -180,6 +211,12 @@ impl eframe::App for NereidsApp {
 
         // Periodic table modal overlay
         crate::widgets::periodic_table::periodic_table_modal(ctx, &mut self.state);
+
+        // File dialogs: drive any retained dialog, then route completed
+        // picks. Runs after all panels so results are applied exactly
+        // once per frame regardless of which panel opened the dialog.
+        self.state.file_dialogs.update(ctx);
+        crate::file_dialog::dispatch_results(&mut self.state);
     }
 }
 

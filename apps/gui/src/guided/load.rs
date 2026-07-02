@@ -5,6 +5,7 @@
 
 use std::sync::Arc;
 
+use crate::file_dialog::{DialogIntent, DialogOptions};
 use crate::state::{AppState, InputMode, ProvenanceEventKind};
 use crate::theme::ThemeColors;
 use crate::widgets::design;
@@ -104,28 +105,22 @@ fn tiff_pair_tab(ui: &mut egui::Ui, state: &mut AppState) {
         );
         ui.add_space(8.0);
 
-        let sample_changed = tiff_drop_zone(ui, "Sample", &mut state.sample_path);
-        if sample_changed {
-            state.sample_data = None;
-            state.normalized = None;
-            state.dead_pixels = None;
-            state.energies = None;
-            state.pixel_fit_result = None;
-            state.spatial_result = None;
-            state.load_error = false;
-        }
+        tiff_drop_zone(
+            ui,
+            &mut state.file_dialogs,
+            DialogIntent::TiffSample,
+            "Sample",
+            &state.sample_path,
+        );
 
         ui.add_space(6.0);
-        let ob_changed = tiff_drop_zone(ui, "Open Beam", &mut state.open_beam_path);
-        if ob_changed {
-            state.open_beam_data = None;
-            state.normalized = None;
-            state.dead_pixels = None;
-            state.energies = None;
-            state.pixel_fit_result = None;
-            state.spatial_result = None;
-            state.load_error = false;
-        }
+        tiff_drop_zone(
+            ui,
+            &mut state.file_dialogs,
+            DialogIntent::TiffOpenBeam,
+            "Open Beam",
+            &state.open_beam_path,
+        );
 
         ui.add_space(8.0);
         spectrum_section(ui, state);
@@ -157,16 +152,15 @@ fn transmission_tiff_tab(ui: &mut egui::Ui, state: &mut AppState) {
         );
         ui.add_space(8.0);
 
-        let changed = tiff_drop_zone(ui, "Transmission", &mut state.sample_path);
-        if changed {
-            state.sample_data = None;
-            state.normalized = None;
-            state.dead_pixels = None;
-            state.energies = None;
-            state.pixel_fit_result = None;
-            state.spatial_result = None;
-            state.load_error = false;
-        }
+        // Same destination + invalidation as the raw sample stack, so the
+        // pick shares DialogIntent::TiffSample.
+        tiff_drop_zone(
+            ui,
+            &mut state.file_dialogs,
+            DialogIntent::TiffSample,
+            "Transmission",
+            &state.sample_path,
+        );
 
         ui.add_space(8.0);
         spectrum_section(ui, state);
@@ -189,8 +183,15 @@ fn transmission_tiff_tab(ui: &mut egui::Ui, state: &mut AppState) {
 
 /// TIFF drop zone: click-to-browse file, with "or browse folder" link below.
 ///
-/// Returns `true` if the user selected a new path.
-fn tiff_drop_zone(ui: &mut egui::Ui, label: &str, path: &mut Option<std::path::PathBuf>) -> bool {
+/// Opens a dialog tagged with `intent`; the pick (file or folder — both
+/// land in the same path field) is applied by the dispatch handler.
+fn tiff_drop_zone(
+    ui: &mut egui::Ui,
+    dialogs: &mut crate::file_dialog::FileDialogs,
+    intent: DialogIntent,
+    label: &str,
+    path: &Option<std::path::PathBuf>,
+) {
     let loaded = path.is_some();
     let display = path
         .as_ref()
@@ -203,23 +204,19 @@ fn tiff_drop_zone(ui: &mut egui::Ui, label: &str, path: &mut Option<std::path::P
     let hint = "TIFF file or folder of TIFFs";
 
     let resp = design::drop_zone(ui, loaded, &display, hint);
-    let mut changed = false;
-    if resp.clicked()
-        && let Some(f) = rfd::FileDialog::new()
-            .add_filter("TIFF", &["tif", "tiff"])
-            .pick_file()
-    {
-        *path = Some(f);
-        changed = true;
+    if resp.clicked() {
+        dialogs.pick_file(
+            intent.clone(),
+            DialogOptions {
+                filters: vec![("TIFF", &["tif", "tiff"])],
+                ..Default::default()
+            },
+        );
     }
     // Secondary: folder browse
-    if ui.small_button("or browse folder\u{2026}").clicked()
-        && let Some(d) = rfd::FileDialog::new().pick_folder()
-    {
-        *path = Some(d);
-        changed = true;
+    if ui.small_button("or browse folder\u{2026}").clicked() {
+        dialogs.pick_folder(intent, Default::default());
     }
-    changed
 }
 
 // ── Spectrum section ───────────────────────────────────────────
@@ -245,18 +242,14 @@ fn spectrum_section(ui: &mut egui::Ui, state: &mut AppState) {
         &display,
         "CSV/TXT/DAT with TOF bin edges or centers",
     );
-    if resp.clicked()
-        && let Some(f) = rfd::FileDialog::new()
-            .add_filter("Spectrum", &["csv", "txt", "dat"])
-            .pick_file()
-    {
-        state.spectrum_path = Some(f);
-        state.spectrum_values = None;
-        state.sample_data = None;
-        state.open_beam_data = None;
-        state.energies = None;
-        state.normalized = None;
-        state.load_error = false;
+    if resp.clicked() {
+        state.file_dialogs.pick_file(
+            DialogIntent::SpectrumFile,
+            DialogOptions {
+                filters: vec![("Spectrum", &["csv", "txt", "dat"])],
+                ..Default::default()
+            },
+        );
     }
 
     // Show parsed info (no unit/kind toggles — auto-detected in load_all_data)
@@ -387,117 +380,27 @@ fn hdf5_ob_picker(ui: &mut egui::Ui, state: &mut AppState) {
             .map(|p| p.display().to_string())
             .unwrap_or_else(|| "Click to select open beam...".to_string());
         let resp = design::drop_zone(ui, loaded, &display, "Open beam HDF5 (.h5, .hdf5, .nxs)");
-        if resp.clicked()
-            && let Some(path) = rfd::FileDialog::new()
-                .add_filter("HDF5", &["h5", "hdf5", "nxs", "nx5"])
-                .pick_file()
-        {
-            state.hdf5_ob_path = Some(path.clone());
-            // Dispatch event vs histogram loading based on input mode
-            let ob_result = if state.input_mode == InputMode::Hdf5Event {
-                // Use same binning params as sample
-                let params = nereids_io::nexus::EventBinningParams {
-                    n_bins: state.event_n_bins,
-                    tof_min_us: state.event_tof_min_us,
-                    tof_max_us: state.event_tof_max_us,
-                    height: state.event_height,
-                    width: state.event_width,
-                };
-                nereids_io::nexus::load_nexus_events(&path, &params)
-                    .map(|d| (d.counts, d.tof_edges_us, d.n_rotation_angles))
-            } else {
-                // Issue #430: the loader refuses multi-angle files by
-                // default to prevent silent sum-over-angles.  The GUI
-                // makes the explicit opt-in to preserve existing
-                // single-volume analysis behaviour on OB input.
-                //
-                // Issue #462: surface the rotation-angle count to the
-                // user via the status banner, mirroring the sample-load
-                // path below.  `data.n_rotation_angles` is carried
-                // through the tuple so the success arm can build the
-                // same `angle_note` suffix.
-                nereids_io::nexus::load_nexus_histogram_with_mode(
-                    &path,
-                    nereids_io::nexus::MultiAngleMode::Sum,
-                )
-                .map(|d| (d.counts, d.tof_edges_us, d.n_rotation_angles))
-            };
-            match ob_result {
-                Ok((ob_counts, ob_tof_edges, n_rotation_angles)) => {
-                    // P1-7: Validate shape matches sample
-                    if let Some(ref sample) = state.sample_data
-                        && sample.shape() != ob_counts.shape()
-                    {
-                        state.status_message = format!(
-                            "OB shape {:?} != sample {:?}",
-                            ob_counts.shape(),
-                            sample.shape()
-                        );
-                        state.hdf5_ob_path = None;
-                        state.open_beam_data = None;
-                        return;
-                    }
-                    // Validate TOF grid matches sample — reject if edges differ.
-                    // Positional bin pairing in the counts path is only correct
-                    // when sample and OB share the exact same TOF grid.
-                    if let Some(ref sv) = state.spectrum_values {
-                        if ob_tof_edges.len() != sv.len() {
-                            state.status_message = format!(
-                                "OB rejected: {} TOF edges vs sample {} — grids must match",
-                                ob_tof_edges.len(),
-                                sv.len()
-                            );
-                            state.hdf5_ob_path = None;
-                            state.open_beam_data = None;
-                            return;
-                        }
-                        let max_edge_diff: f64 = ob_tof_edges
-                            .iter()
-                            .zip(sv.iter())
-                            .map(|(a, b)| (a - b).abs())
-                            .fold(0.0f64, f64::max);
-                        let edge_scale = sv.last().copied().unwrap_or(1.0).max(1.0);
-                        if max_edge_diff > 1e-6 * edge_scale {
-                            state.status_message = format!(
-                                "OB rejected: TOF edges differ (max delta = {:.3} µs) — \
-                                 sample and OB must use the same TOF grid",
-                                max_edge_diff
-                            );
-                            state.hdf5_ob_path = None;
-                            state.open_beam_data = None;
-                            return;
-                        }
-                    }
-                    state.open_beam_data = Some(Arc::new(ob_counts));
-                    // OB swap invalidates normalization + fit results,
-                    // but NOT the sample's TOF spectrum, energies,
-                    // preview image, ROIs, or rebin state.  The broad
-                    // `invalidate_results()` would clear `spectrum_values`,
-                    // which gates the Continue button on Hdf5Histogram
-                    // mode (`has_required_data`) — using the narrow
-                    // variant keeps Continue enabled.
-                    state.invalidate_fit_results();
-                    // #462: mirror the sample-load rotation-angle note
-                    // so OB and sample banners use identical wording
-                    // when angles were collapsed.
-                    let angle_note = if n_rotation_angles > 1 {
-                        format!(
-                            " ({} rotation angles summed — multi-angle analysis not yet supported, \
-                             see #430)",
-                            n_rotation_angles
-                        )
-                    } else {
-                        String::new()
-                    };
-                    state.status_message = format!("Open beam loaded{angle_note}");
-                }
-                Err(e) => {
-                    state.status_message = format!("Open beam load failed: {e}");
-                    state.hdf5_ob_path = None;
-                    // P1-8: Clear data on failure
-                    state.open_beam_data = None;
-                }
-            }
+        if resp.clicked() {
+            // Capture the interpretation inputs (mode + binning) at
+            // click time — see the `DialogIntent::Hdf5OpenBeam` doc
+            // comment. Params are captured unconditionally: cheap, and
+            // correct regardless of which mode is active at resolution.
+            state.file_dialogs.pick_file(
+                DialogIntent::Hdf5OpenBeam {
+                    mode: state.input_mode,
+                    event_params: nereids_io::nexus::EventBinningParams {
+                        n_bins: state.event_n_bins,
+                        tof_min_us: state.event_tof_min_us,
+                        tof_max_us: state.event_tof_max_us,
+                        height: state.event_height,
+                        width: state.event_width,
+                    },
+                },
+                DialogOptions {
+                    filters: vec![("HDF5", &["h5", "hdf5", "nxs", "nx5"])],
+                    ..Default::default()
+                },
+            );
         }
         if loaded && ui.small_button("Clear OB").clicked() {
             state.hdf5_ob_path = None;
@@ -526,41 +429,14 @@ fn hdf5_drop_zone(ui: &mut egui::Ui, state: &mut AppState) {
                     .to_string()
             });
     let resp = design::drop_zone(ui, loaded, &display, "HDF5/NeXus (.h5, .hdf5, .nxs, .nx5)");
-    if resp.clicked()
-        && let Some(file) = rfd::FileDialog::new()
-            .add_filter("NeXus/HDF5", &["h5", "hdf5", "nxs", "nx5"])
-            .pick_file()
-    {
-        state.hdf5_path = Some(file.clone());
-        state.invalidate_results();
-        state.sample_data = None;
-        state.open_beam_data = None;
-        state.hdf5_ob_path = None;
-        state.load_error = false;
-        state.nexus_probe_error = None;
-
-        // Probe the file immediately
-        match nereids_io::nexus::probe_nexus(&file) {
-            Ok(meta) => {
-                if let Some(shape) = meta.histogram_shape {
-                    state.event_height = shape[1];
-                    state.event_width = shape[2];
-                }
-                state.nexus_metadata = Some(meta);
-                state.status_message = "NeXus file probed".into();
-            }
-            Err(e) => {
-                state.nexus_metadata = None;
-                state.nexus_probe_error = Some(format!("Probe failed: {e}"));
-                state.status_message = format!("Probe failed: {e}");
-            }
-        }
-
-        // Build HDF5 tree structure for browser display
-        match nereids_io::nexus::list_hdf5_tree(&file, 3) {
-            Ok(tree) => state.hdf5_tree = Some(tree),
-            Err(_) => state.hdf5_tree = None,
-        }
+    if resp.clicked() {
+        state.file_dialogs.pick_file(
+            DialogIntent::Hdf5Sample,
+            DialogOptions {
+                filters: vec![("NeXus/HDF5", &["h5", "hdf5", "nxs", "nx5"])],
+                ..Default::default()
+            },
+        );
     }
 }
 
@@ -869,6 +745,197 @@ fn load_all_data(state: &mut AppState) {
                 state.status_message = format!("Failed to parse spectrum: {}", e);
                 state.load_error = true;
             }
+        }
+    }
+}
+
+// ── Dialog-dispatch handlers ───────────────────────────────────
+// Invoked from `crate::file_dialog::dispatch_results` when a Load-step
+// picker resolves. Each mirrors the invalidation set the corresponding
+// inline block used before the picks were routed through the facade.
+
+/// Sample TIFF stack picked (raw pair tab), or pre-normalized
+/// transmission stack picked — both land in `sample_path` with the same
+/// downstream invalidation.
+pub(crate) fn on_tiff_sample_picked(state: &mut AppState, path: std::path::PathBuf) {
+    state.sample_path = Some(path);
+    state.sample_data = None;
+    state.normalized = None;
+    state.dead_pixels = None;
+    state.energies = None;
+    state.pixel_fit_result = None;
+    state.spatial_result = None;
+    state.load_error = false;
+}
+
+/// Open-beam TIFF stack picked.
+pub(crate) fn on_tiff_open_beam_picked(state: &mut AppState, path: std::path::PathBuf) {
+    state.open_beam_path = Some(path);
+    state.open_beam_data = None;
+    state.normalized = None;
+    state.dead_pixels = None;
+    state.energies = None;
+    state.pixel_fit_result = None;
+    state.spatial_result = None;
+    state.load_error = false;
+}
+
+/// TOF spectrum file picked.
+pub(crate) fn on_spectrum_picked(state: &mut AppState, path: std::path::PathBuf) {
+    state.spectrum_path = Some(path);
+    state.spectrum_values = None;
+    state.sample_data = None;
+    state.open_beam_data = None;
+    state.energies = None;
+    state.normalized = None;
+    state.load_error = false;
+}
+
+/// Sample NeXus/HDF5 file picked: reset derived state, probe the file,
+/// and build the tree view.
+pub(crate) fn on_hdf5_sample_picked(state: &mut AppState, file: std::path::PathBuf) {
+    state.hdf5_path = Some(file.clone());
+    state.invalidate_results();
+    state.sample_data = None;
+    state.open_beam_data = None;
+    state.hdf5_ob_path = None;
+    state.load_error = false;
+    state.nexus_probe_error = None;
+
+    // Probe the file immediately
+    match nereids_io::nexus::probe_nexus(&file) {
+        Ok(meta) => {
+            if let Some(shape) = meta.histogram_shape {
+                state.event_height = shape[1];
+                state.event_width = shape[2];
+            }
+            state.nexus_metadata = Some(meta);
+            state.status_message = "NeXus file probed".into();
+        }
+        Err(e) => {
+            state.nexus_metadata = None;
+            state.nexus_probe_error = Some(format!("Probe failed: {e}"));
+            state.status_message = format!("Probe failed: {e}");
+        }
+    }
+
+    // Build HDF5 tree structure for browser display
+    match nereids_io::nexus::list_hdf5_tree(&file, 3) {
+        Ok(tree) => state.hdf5_tree = Some(tree),
+        Err(_) => state.hdf5_tree = None,
+    }
+}
+
+/// Optional open-beam NeXus/HDF5 file picked: load (event or histogram
+/// per the mode captured at request time), validate against the
+/// current sample, and install.
+pub(crate) fn on_hdf5_ob_picked(
+    state: &mut AppState,
+    path: std::path::PathBuf,
+    mode: InputMode,
+    event_params: &nereids_io::nexus::EventBinningParams,
+) {
+    state.hdf5_ob_path = Some(path.clone());
+    // Event-vs-histogram dispatch and binning use ONLY the values
+    // captured when the dialog was requested (`mode`, `event_params`) —
+    // state edits made while the dialog is pending must not change how
+    // the picked file is loaded. The shape/TOF validation below reads
+    // CURRENT state on purpose: the OB must match whatever sample is
+    // loaded now.
+    let ob_result = if mode == InputMode::Hdf5Event {
+        nereids_io::nexus::load_nexus_events(&path, event_params)
+            .map(|d| (d.counts, d.tof_edges_us, d.n_rotation_angles))
+    } else {
+        // Issue #430: the loader refuses multi-angle files by
+        // default to prevent silent sum-over-angles.  The GUI
+        // makes the explicit opt-in to preserve existing
+        // single-volume analysis behaviour on OB input.
+        //
+        // Issue #462: surface the rotation-angle count to the
+        // user via the status banner, mirroring the sample-load
+        // path.  `data.n_rotation_angles` is carried through the
+        // tuple so the success arm can build the same `angle_note`
+        // suffix.
+        nereids_io::nexus::load_nexus_histogram_with_mode(
+            &path,
+            nereids_io::nexus::MultiAngleMode::Sum,
+        )
+        .map(|d| (d.counts, d.tof_edges_us, d.n_rotation_angles))
+    };
+    match ob_result {
+        Ok((ob_counts, ob_tof_edges, n_rotation_angles)) => {
+            // P1-7: Validate shape matches sample
+            if let Some(ref sample) = state.sample_data
+                && sample.shape() != ob_counts.shape()
+            {
+                state.status_message = format!(
+                    "OB shape {:?} != sample {:?}",
+                    ob_counts.shape(),
+                    sample.shape()
+                );
+                state.hdf5_ob_path = None;
+                state.open_beam_data = None;
+                return;
+            }
+            // Validate TOF grid matches sample — reject if edges differ.
+            // Positional bin pairing in the counts path is only correct
+            // when sample and OB share the exact same TOF grid.
+            if let Some(ref sv) = state.spectrum_values {
+                if ob_tof_edges.len() != sv.len() {
+                    state.status_message = format!(
+                        "OB rejected: {} TOF edges vs sample {} — grids must match",
+                        ob_tof_edges.len(),
+                        sv.len()
+                    );
+                    state.hdf5_ob_path = None;
+                    state.open_beam_data = None;
+                    return;
+                }
+                let max_edge_diff: f64 = ob_tof_edges
+                    .iter()
+                    .zip(sv.iter())
+                    .map(|(a, b)| (a - b).abs())
+                    .fold(0.0f64, f64::max);
+                let edge_scale = sv.last().copied().unwrap_or(1.0).max(1.0);
+                if max_edge_diff > 1e-6 * edge_scale {
+                    state.status_message = format!(
+                        "OB rejected: TOF edges differ (max delta = {:.3} µs) — \
+                         sample and OB must use the same TOF grid",
+                        max_edge_diff
+                    );
+                    state.hdf5_ob_path = None;
+                    state.open_beam_data = None;
+                    return;
+                }
+            }
+            state.open_beam_data = Some(Arc::new(ob_counts));
+            // OB swap invalidates normalization + fit results,
+            // but NOT the sample's TOF spectrum, energies,
+            // preview image, ROIs, or rebin state.  The broad
+            // `invalidate_results()` would clear `spectrum_values`,
+            // which gates the Continue button on Hdf5Histogram
+            // mode (`has_required_data`) — using the narrow
+            // variant keeps Continue enabled.
+            state.invalidate_fit_results();
+            // #462: mirror the sample-load rotation-angle note
+            // so OB and sample banners use identical wording
+            // when angles were collapsed.
+            let angle_note = if n_rotation_angles > 1 {
+                format!(
+                    " ({} rotation angles summed — multi-angle analysis not yet supported, \
+                     see #430)",
+                    n_rotation_angles
+                )
+            } else {
+                String::new()
+            };
+            state.status_message = format!("Open beam loaded{angle_note}");
+        }
+        Err(e) => {
+            state.status_message = format!("Open beam load failed: {e}");
+            state.hdf5_ob_path = None;
+            // P1-8: Clear data on failure
+            state.open_beam_data = None;
         }
     }
 }

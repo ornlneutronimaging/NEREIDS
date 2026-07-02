@@ -277,11 +277,10 @@ fn analysis_map_column(
         };
         result_widgets::tile_toolbelt(
             ui,
-            data,
             tile_idx,
             &label,
             &mut state.tile_display,
-            &mut state.status_message,
+            &mut state.file_dialogs,
         );
     }
 }
@@ -1069,10 +1068,11 @@ fn dock_export(ui: &mut egui::Ui, state: &mut AppState) {
             .map_or("(not set)".to_string(), |p| p.display().to_string());
         ui.label(egui::RichText::new(dir_label).monospace().small());
 
-        if ui.button("Browse\u{2026}").clicked()
-            && let Some(path) = rfd::FileDialog::new().pick_folder()
-        {
-            state.export_directory = Some(path);
+        if ui.button("Browse\u{2026}").clicked() {
+            state.file_dialogs.pick_folder(
+                crate::file_dialog::DialogIntent::ExportDirectory,
+                Default::default(),
+            );
         }
     });
 

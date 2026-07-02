@@ -67,11 +67,15 @@ pub fn configure_step(ui: &mut egui::Ui, state: &mut AppState) {
     });
 
     // --- Instrument Resolution card ---
+    // File picks route through the dispatcher, which mirrors this
+    // invalidation (see `file_dialog::on_resolution_file_picked`).
     let res = design::resolution_card(
         ui,
         &mut state.resolution_enabled,
         &mut state.resolution_mode,
         state.beamline.flight_path_m,
+        &mut state.file_dialogs,
+        crate::file_dialog::ResolutionTarget::Configure,
     );
     if res.changed {
         state.spatial_result = None;
@@ -663,24 +667,37 @@ fn render_failed_cache_hint(ui: &mut egui::Ui, state: &AppState) {
     }
 }
 
-/// Manual ENDF upload escape hatch (issue #523): pick a local `.endf`/`.zip`
-/// from the filesystem and install it into the cache for whichever
-/// already-added isotope it describes. The retriever's `peek_local_endf`
-/// reads, extracts, and parses the file exactly once to discover its (Z, A);
-/// we then look that (Z, A) up in the user's selection and write the cached
-/// body directly — no trial-install loop, no re-extraction.
+/// Open the local-ENDF picker; the pick is applied by
+/// [`install_local_endf`] via the dialog dispatcher. The target library
+/// is captured now: the dialog can resolve later, and switching the
+/// library ComboBox meanwhile must not redirect a pending install.
 fn install_local_endf_dialog(state: &mut AppState) {
+    state.file_dialogs.pick_file(
+        crate::file_dialog::DialogIntent::InstallLocalEndf {
+            library: state.endf_library,
+        },
+        crate::file_dialog::DialogOptions {
+            filters: vec![("ENDF", &["endf", "dat", "txt", "zip"])],
+            ..Default::default()
+        },
+    );
+}
+
+/// Manual ENDF upload escape hatch (issue #523): install a local
+/// `.endf`/`.zip` into the cache for whichever already-added isotope it
+/// describes. The retriever's `peek_local_endf` reads, extracts, and
+/// parses the file exactly once to discover its (Z, A); we then look
+/// that (Z, A) up in the user's selection and write the cached body
+/// directly — no trial-install loop, no re-extraction.
+pub(crate) fn install_local_endf(
+    state: &mut AppState,
+    path: &std::path::Path,
+    library: EndfLibrary,
+) {
     use nereids_core::types::Isotope;
     use nereids_endf::retrieval::EndfRetriever;
 
-    let Some(path) = rfd::FileDialog::new()
-        .add_filter("ENDF", &["endf", "dat", "txt", "zip"])
-        .pick_file()
-    else {
-        return;
-    };
-
-    let (file_isotope, endf_text) = match EndfRetriever::peek_local_endf(&path) {
+    let (file_isotope, endf_text) = match EndfRetriever::peek_local_endf(path) {
         Ok(v) => v,
         Err(e) => {
             state.status_message = format!("Could not read local ENDF: {e}");
@@ -709,7 +726,7 @@ fn install_local_endf_dialog(state: &mut AppState) {
         }
     };
     let retriever = EndfRetriever::new();
-    if let Err(e) = retriever.install_endf_text(&isotope, state.endf_library, &endf_text) {
+    if let Err(e) = retriever.install_endf_text(&isotope, library, &endf_text) {
         state.status_message = format!("Could not install local ENDF for {label}: {e}");
         return;
     }
