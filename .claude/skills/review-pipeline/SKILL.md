@@ -143,15 +143,20 @@ restricted to a *different crate or subsystem* than the one being fixed.
 `review-core` already marks same-crate P2s `disposition: fix-now`; honor that —
 do not defer same-crate P2s, or debt accrues faster than it is paid down.
 
-**MANDATORY GATE — present the consolidation and STOP.** Do NOT proceed to
-Step 3 without user approval. The user must tell you which findings to fix.
-End your turn after presenting the report.
+**Consolidation gate — present the report, then apply the fix-all default.**
+Per CLAUDE.md ("Finding disposition: fix ALL by default"), the standing
+disposition is to fix EVERY P0/P1/P2 finding; deferring to a GitHub issue is
+the rare exception requiring an explicit engineering reason. Present the full
+consolidation for transparency, then proceed to Step 3 fixing all findings —
+do not ask the user to pick a subset. STOP for user input only when a finding
+looks like a false positive the user should adjudicate, or when a fix would
+require a genuine scope decision (different subsystem, breaking contract).
 
 ---
 
 ## Step 3: Fix
 
-After the user approves the fix list, launch one fix subagent per worktree
+Launch one fix subagent per worktree
 **in parallel**, using `.claude/templates/fix-subagent-prompt.md` (it encodes
 the DRY pre-step and no-scope-dodging rules). Each fix agent must:
 
