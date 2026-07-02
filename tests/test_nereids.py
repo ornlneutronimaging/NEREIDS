@@ -524,6 +524,64 @@ class TestTabulatedKernelOrientation:
         )
 
 
+class TestTabulatedKernelWidthInterpolation:
+    """Regression for issue #632: kernel width between reference energies
+    must follow the physical power law, not the arithmetic blend chord.
+
+    Symmetric Gaussian kernels (mode 0, immune to the #631 orientation)
+    at 10 and 50 eV with sigma_t ~ E^-1/2 widths: a width-correct
+    interpolation at 20 eV gives sigma_t = 2/sqrt(2) = 1.4142 us. The
+    pre-fix element-wise blend measured 1.524 us (+7.8%); the issue's
+    acceptance bar is <3% at the midpoint.
+    """
+
+    TOF_FACTOR = 72.298254398292800  # us*sqrt(eV)/m (resolution.rs)
+    L = 25.0
+    SIGMA_10EV = 2.0
+
+    @classmethod
+    def _write_kernel(cls, path):
+        lines = ["synthetic Gaussian kernels, sigma_t ~ E^-1/2", "-----"]
+        for eref in (10.0, 50.0):
+            sigma = cls.SIGMA_10EV * (eref / 10.0) ** -0.5
+            d = np.linspace(-6.0 * sigma, 6.0 * sigma, 499)
+            a = np.exp(-0.5 * (d / sigma) ** 2)
+            lines.append(f"   {eref:.5e}   0.00000e+000")
+            lines += [f"{x:.15f} {y:.15e}" for x, y in zip(d, a)]
+            lines.append("")
+        path.write_text("\n".join(lines))
+
+    def _measured_sigma_t(self, tab, e0):
+        e = np.linspace(e0 * 0.7, e0 * 1.3, 30001)
+        spec = 1.0 - 0.8 * np.exp(-0.5 * ((e - e0) / (e0 * 1e-4)) ** 2)
+        b = np.asarray(nereids.apply_resolution(e, spec, tab))
+        # Non-vacuity: the kernel must visibly reshape the dip.
+        assert np.max(np.abs(b - spec)) > 0.01
+        a = 1.0 - b
+        mu = np.sum(e * a) / np.sum(a)
+        sd_e = np.sqrt(np.sum((e - mu) ** 2 * a) / np.sum(a))
+        tof = self.TOF_FACTOR * self.L / np.sqrt(e0)
+        return sd_e * tof / (2.0 * e0)
+
+    def test_width_follows_power_law_between_references(self, tmp_path):
+        kernel_path = tmp_path / "synthetic_two_ref.txt"
+        self._write_kernel(kernel_path)
+        tab = nereids.load_resolution(str(kernel_path), self.L)
+
+        for e0, expected in [
+            (10.0, self.SIGMA_10EV),
+            (50.0, self.SIGMA_10EV / np.sqrt(5.0)),
+            (20.0, self.SIGMA_10EV / np.sqrt(2.0)),
+        ]:
+            measured = self._measured_sigma_t(tab, e0)
+            surplus = measured / expected - 1.0
+            assert abs(surplus) < 0.03, (
+                f"kernel width at {e0} eV is {surplus * 100:+.1f}% off the "
+                f"power law (measured {measured:.4f} us, expected "
+                f"{expected:.4f} us; the pre-fix blend gave +7.8% at 20 eV)"
+            )
+
+
 # ===========================================================================
 # LM fitting
 # ===========================================================================
