@@ -555,16 +555,23 @@ fn execute_save_with_dialog(state: &mut AppState) {
         }
     }
 
-    state
-        .file_dialogs
-        .save_file(crate::file_dialog::DialogIntent::SaveProjectAs, opts);
+    state.file_dialogs.save_file(
+        crate::file_dialog::DialogIntent::SaveProjectAs {
+            // Captured now, not read back at resolution: the dialog can
+            // resolve much later (Linux native tier), and the user may
+            // have reopened the save modal and changed the mode
+            // meanwhile — that choice belongs to the NEXT save.
+            mode: state.save_data_mode,
+        },
+        opts,
+    );
 }
 
 /// Apply a picked "Save As" path: normalize the extension and save with
-/// the mode chosen in the save modal.
-pub(crate) fn on_save_project_picked(state: &mut AppState, path: PathBuf) {
+/// the mode the save modal carried at request time.
+pub(crate) fn on_save_project_picked(state: &mut AppState, path: PathBuf, mode: SaveDataMode) {
     let path = ensure_extension(path);
-    execute_save(state, &path, state.save_data_mode);
+    execute_save(state, &path, mode);
 }
 
 /// Execute the actual save to `path` with the given mode.

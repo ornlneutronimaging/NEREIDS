@@ -23,14 +23,15 @@
 //!   the log-bridge latch (see `logging.rs`) then surface.
 //! - **Linux, in-app tier** — pure-egui `egui-file-dialog`, used when
 //!   the startup probe / portal canary finds no working native chain,
-//!   when an rfd backend failure is latched at runtime, or when the
-//!   user clicks the escape hatch. Works in every environment
+//!   when a resolved native request combined with the latch shows the
+//!   final zenity leg failed (see `FileDialogs::apply_native_outcome`),
+//!   or when the user clicks the escape hatch. Works in every environment
 //!   (containers, root, no D-Bus, `ssh -X`) with zero system
 //!   dependencies — the environments of issue #526.
 
 use std::path::PathBuf;
 
-use crate::state::AppState;
+use crate::state::{AppState, SaveDataMode};
 
 /// Which UI feature requested the dialog — routes the picked path in
 /// [`dispatch_results`].
@@ -38,8 +39,12 @@ use crate::state::AppState;
 pub enum DialogIntent {
     /// Open a `.nrd.h5` project (toolbar, Ctrl/Cmd+O).
     OpenProject,
-    /// "Save As" target for the current project (save modal).
-    SaveProjectAs,
+    /// "Save As" target for the current project (save modal). Carries
+    /// the data mode chosen in the modal at request time: the dialog
+    /// can resolve frames (or, on the Linux native tier, seconds)
+    /// later, and reading `state.save_data_mode` at resolution would
+    /// let a reopened modal retroactively change a pending Save-As.
+    SaveProjectAs { mode: SaveDataMode },
     /// Export directory for spatial-map results (Studio dock).
     ExportDirectory,
     /// Save one result tile as a colormapped PNG (tile toolbelt).
@@ -126,6 +131,11 @@ struct NativeRequest {
     opts: DialogOptions,
     rx: std::sync::mpsc::Receiver<Option<PathBuf>>,
     started: std::time::Instant,
+    /// Show the waiting overlay immediately instead of after the grace
+    /// period — set when a second request arrives while this one is
+    /// still on screen, so the refusal to open another dialog is
+    /// visible rather than silent.
+    overlay_forced: bool,
 }
 
 /// Poll-based dialog service stored in [`AppState`].
@@ -205,11 +215,10 @@ impl FileDialogs {
     }
 
     fn open(&mut self, mode: Mode, intent: DialogIntent, opts: DialogOptions) {
-        // A new request supersedes any unconsumed earlier result.
-        self.pending = None;
-
         #[cfg(not(target_os = "linux"))]
         {
+            // A new request supersedes any unconsumed earlier result.
+            self.pending = None;
             if let Some(path) = run_rfd_blocking(mode, &opts) {
                 self.remember_dir(&path);
                 self.pending = Some((intent, path));
@@ -218,10 +227,21 @@ impl FileDialogs {
 
         #[cfg(target_os = "linux")]
         {
-            // Dropping a previous in-flight request also drops its
-            // receiver, so a late result from an orphaned worker is
-            // discarded instead of resolving the wrong intent.
-            self.linux.active_native = None;
+            // One native dialog at a time — regardless of intent. rfd
+            // gives us no way to close an on-screen portal/zenity
+            // dialog programmatically, so superseding the in-flight
+            // request would orphan a live dialog whose eventual pick is
+            // silently discarded (its receiver is gone). Refuse the new
+            // request and make the refusal visible by forcing the
+            // waiting overlay. The in-app tier needs no such guard:
+            // its dialog is modal (`as_modal(true)`), so re-clicks
+            // cannot reach the picker buttons while one is open.
+            if let Some(req) = self.linux.active_native.as_mut() {
+                req.overlay_forced = true;
+                return;
+            }
+            // A new request supersedes any unconsumed earlier result.
+            self.pending = None;
             self.linux.active_in_app = None;
             match self.linux.tier.unwrap_or(LinuxTier::Native) {
                 LinuxTier::Native => self.open_native_worker(mode, intent, opts),
@@ -233,11 +253,20 @@ impl FileDialogs {
     /// Per-frame driver, called once from `NereidsApp::update`: decides
     /// the Linux tier on first run, polls the canary and any in-flight
     /// native request, drives the retained in-app dialog, and renders
-    /// the escape-hatch overlay. No-op on macOS/Windows (their dialogs
-    /// resolve inside `open()`).
+    /// the escape-hatch overlay. On macOS/Windows (dialogs resolve
+    /// inside `open()`) it only surfaces a latched rfd error as a
+    /// warning.
     pub fn update(&mut self, ctx: &egui::Context) {
         #[cfg(not(target_os = "linux"))]
-        let _ = ctx;
+        {
+            let _ = ctx;
+            // Dialogs resolve synchronously inside `open()`, so any
+            // latched rfd error is already final here. There is no
+            // fallback tier off-Linux — the warning must not claim one.
+            if let Some(msg) = crate::logging::take_dialog_backend_failure() {
+                self.warning = Some(format!("Native file dialog failed: {msg}"));
+            }
+        }
 
         #[cfg(target_os = "linux")]
         {
@@ -254,32 +283,11 @@ impl FileDialogs {
         self.pending.take()
     }
 
-    /// Take the probe/canary warning, if any (consume-once) — shown by
-    /// the app in the native-dialog warning banner.
+    /// Take the pending dialog warning, if any (consume-once) — probe/
+    /// canary verdicts and native-backend failures alike, shown by the
+    /// app in the native-dialog warning banner.
     pub fn take_warning(&mut self) -> Option<String> {
         self.warning.take()
-    }
-
-    /// A native-dialog backend failure was latched by the log bridge:
-    /// downgrade to the in-app tier and, if a native request is still
-    /// in flight, reopen the same request in-app so the user's click
-    /// still lands in a working dialog. Returns `true` when the in-app
-    /// fallback was actually engaged (Linux); the other platforms have
-    /// no fallback tier, so their banner must not claim one.
-    pub fn note_backend_failure(&mut self) -> bool {
-        #[cfg(target_os = "linux")]
-        {
-            self.linux.tier = Some(LinuxTier::InApp);
-            self.linux.canary_may_upgrade = false;
-            if let Some(req) = self.linux.active_native.take() {
-                self.open_in_app(req.mode, req.intent, req.opts);
-            }
-            true
-        }
-        #[cfg(not(target_os = "linux"))]
-        {
-            false
-        }
     }
 
     fn remember_dir(&mut self, path: &std::path::Path) {
@@ -420,6 +428,7 @@ impl FileDialogs {
             opts,
             rx,
             started: std::time::Instant::now(),
+            overlay_forced: false,
         });
     }
 
@@ -427,61 +436,112 @@ impl FileDialogs {
     /// long to resolve, offer the built-in browser as an escape hatch
     /// (a hung portal never delivers a result, and rfd gives us no way
     /// to cancel it — the orphaned worker thread is the accepted cost).
+    /// A resolved request is combined with the log-bridge latch in
+    /// [`Self::apply_native_outcome`].
     fn poll_native(&mut self, ctx: &egui::Context) {
         use std::sync::mpsc::TryRecvError;
 
-        let mut escape = false;
-        if let Some(req) = &self.linux.active_native {
-            match req.rx.try_recv() {
-                Ok(Some(path)) => {
-                    let intent = req.intent.clone();
-                    self.linux.active_native = None;
-                    self.remember_dir(&path);
-                    self.pending = Some((intent, path));
-                }
-                Ok(None) => {
-                    // User cancel, or backend failure — the log-bridge
-                    // latch (app banner + note_backend_failure) is the
-                    // failure discriminator; nothing to do here.
-                    self.linux.active_native = None;
-                }
-                Err(TryRecvError::Disconnected) => {
-                    self.linux.active_native = None;
-                }
-                Err(TryRecvError::Empty) => {
-                    // Still open. After a short grace period, offer the
-                    // in-app fallback without killing the native dialog
-                    // (we cannot tell "hung portal" from "user is
-                    // browsing a big directory").
-                    let elapsed = req.started.elapsed();
-                    if elapsed >= std::time::Duration::from_secs(1) {
-                        egui::Window::new("native_dialog_pending")
-                            .title_bar(false)
-                            .resizable(false)
-                            .anchor(egui::Align2::CENTER_TOP, [0.0, 8.0])
-                            .show(ctx, |ui| {
-                                ui.horizontal(|ui| {
-                                    ui.spinner();
-                                    ui.label("Waiting for the system file dialog\u{2026}");
-                                    if ui.small_button("Use built-in browser").clicked() {
-                                        escape = true;
-                                    }
-                                });
+        let Some(req) = &self.linux.active_native else {
+            return;
+        };
+        let picked = match req.rx.try_recv() {
+            Ok(picked) => picked,
+            // Worker panicked without sending: no pick — classified
+            // against the latch exactly like a returned `None`.
+            Err(TryRecvError::Disconnected) => None,
+            Err(TryRecvError::Empty) => {
+                // Still open. After a short grace period (or right away
+                // when a refused second request forced it), offer the
+                // in-app fallback without killing the native dialog
+                // (we cannot tell "hung portal" from "user is
+                // browsing a big directory").
+                let mut escape = false;
+                let elapsed = req.started.elapsed();
+                if req.overlay_forced || elapsed >= std::time::Duration::from_secs(1) {
+                    egui::Window::new("native_dialog_pending")
+                        .title_bar(false)
+                        .resizable(false)
+                        .anchor(egui::Align2::CENTER_TOP, [0.0, 8.0])
+                        .show(ctx, |ui| {
+                            ui.horizontal(|ui| {
+                                ui.spinner();
+                                ui.label("Waiting for the system file dialog\u{2026}");
+                                if ui.small_button("Use built-in browser").clicked() {
+                                    escape = true;
+                                }
                             });
-                    } else {
-                        // Wake up in time to show the overlay.
-                        ctx.request_repaint_after(std::time::Duration::from_secs(1) - elapsed);
-                    }
+                        });
+                } else {
+                    // Wake up in time to show the overlay.
+                    ctx.request_repaint_after(std::time::Duration::from_secs(1) - elapsed);
                 }
+                if escape && let Some(req) = self.linux.active_native.take() {
+                    self.linux.tier = Some(LinuxTier::InApp);
+                    // The user judged the native chain unusable — a
+                    // later canary verdict must not upgrade back to it.
+                    self.linux.canary_may_upgrade = false;
+                    self.open_in_app(req.mode, req.intent, req.opts);
+                }
+                return;
             }
+        };
+        if let Some(req) = self.linux.active_native.take() {
+            let latched = crate::logging::take_dialog_backend_failure();
+            self.apply_native_outcome(req, picked, latched);
         }
+    }
 
-        if escape && let Some(req) = self.linux.active_native.take() {
-            self.linux.tier = Some(LinuxTier::InApp);
-            // The user judged the native chain unusable — a later
-            // canary verdict must not upgrade back to it.
-            self.linux.canary_may_upgrade = false;
-            self.open_in_app(req.mode, req.intent, req.opts);
+    /// Combine a resolved native request with the log-bridge latch to
+    /// decide what actually happened. rfd's Linux chain tries the
+    /// portal first and falls back to zenity, log-erroring on every
+    /// failed leg (rfd 0.17.2: "Can't connect to a portal: ...",
+    /// "Failed to connect to session bus: ..." from
+    /// src/backend/xdg_desktop_portal/portal/libdbus.rs, "OpenFile
+    /// failed: ..." from .../portal/mod.rs), so a latched error alone
+    /// does not mean the dialog failed — the zenity leg may have gone
+    /// on to serve the user. Only the final zenity leg's errors name
+    /// zenity ("Failed to pick file with zenity: ...", "Failed to save
+    /// file with zenity: ...", "Failed to open zenity dialog: ..." from
+    /// src/backend/xdg_desktop_portal.rs), which makes "mentions
+    /// zenity" the end-of-chain discriminator.
+    fn apply_native_outcome(
+        &mut self,
+        req: NativeRequest,
+        picked: Option<PathBuf>,
+        latched: Option<String>,
+    ) {
+        if let Some(path) = picked {
+            // A pick means the chain worked end-to-end; any latched
+            // error was a non-final leg falling through. Discard it.
+            self.remember_dir(&path);
+            self.pending = Some((req.intent, path));
+            return;
+        }
+        match latched {
+            Some(msg) if msg.contains("zenity") => {
+                // The final leg failed: no dialog ever served the user.
+                // Downgrade for good and reopen the same request in the
+                // built-in browser so the click still lands somewhere.
+                self.linux.tier = Some(LinuxTier::InApp);
+                self.linux.canary_may_upgrade = false;
+                self.warning = Some(format!(
+                    "Native file dialog failed: {msg} — switched to the built-in file browser."
+                ));
+                self.open_in_app(req.mode, req.intent, req.opts);
+            }
+            Some(msg) => {
+                // Portal leg failed but the zenity leg then ran and the
+                // user cancelled: the chain works, keep the native tier
+                // (mirror of `apply_canary_verdict`'s zenity-keeps-
+                // native rule). Record the portal trouble for
+                // diagnosis.
+                tracing::info!(
+                    error = %msg,
+                    "portal dialog leg failed; zenity fallback served the request"
+                );
+            }
+            // Plain user cancel: nothing to do.
+            None => {}
         }
     }
 
@@ -662,7 +722,9 @@ pub fn dispatch_results(state: &mut AppState) {
     };
     match intent {
         DialogIntent::OpenProject => crate::project::load_project_from_path(state, &path),
-        DialogIntent::SaveProjectAs => crate::project::on_save_project_picked(state, path),
+        DialogIntent::SaveProjectAs { mode } => {
+            crate::project::on_save_project_picked(state, path, mode);
+        }
         DialogIntent::ExportDirectory => state.export_directory = Some(path),
         DialogIntent::SaveTilePng { tile_idx, label } => {
             crate::guided::result_widgets::save_tile_png(state, tile_idx, &label, &path);
@@ -946,14 +1008,131 @@ mod tests {
         assert!(!dialogs.linux.canary_may_upgrade);
     }
 
+    /// Build an in-flight native request for outcome tests. The
+    /// receiver never gets a message — `apply_native_outcome` takes the
+    /// resolution as a parameter, mirroring how `poll_native` hands it
+    /// the drained channel + latch.
+    #[cfg(target_os = "linux")]
+    fn native_request(intent: DialogIntent) -> NativeRequest {
+        let (_tx, rx) = std::sync::mpsc::channel();
+        NativeRequest {
+            mode: Mode::PickFile,
+            intent,
+            opts: DialogOptions::default(),
+            rx,
+            started: std::time::Instant::now(),
+            overlay_forced: false,
+        }
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn native_pick_discards_portal_leg_latch() {
+        // Portal leg errored, zenity leg served a pick: the chain
+        // worked — deliver the pick, keep the native tier, no warning.
+        let mut dialogs = FileDialogs::default();
+        dialogs.linux.tier = Some(LinuxTier::Native);
+        dialogs.apply_native_outcome(
+            native_request(DialogIntent::ExportDirectory),
+            Some(PathBuf::from("/tmp/picked")),
+            Some("Failed to connect to session bus: org.freedesktop.DBus.Error.NoServer".into()),
+        );
+        assert_eq!(
+            dialogs.take_any(),
+            Some((DialogIntent::ExportDirectory, PathBuf::from("/tmp/picked")))
+        );
+        assert!(dialogs.linux.tier == Some(LinuxTier::Native));
+        assert!(dialogs.take_warning().is_none());
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn zenity_leg_failure_downgrades_and_reopens_in_app() {
+        // No pick and the latch names zenity: the whole chain failed.
+        // Downgrade, warn with the switch notice, and reopen the same
+        // request in the built-in browser.
+        let mut dialogs = FileDialogs::default();
+        dialogs.linux.tier = Some(LinuxTier::Native);
+        dialogs.linux.canary_may_upgrade = true;
+        dialogs.apply_native_outcome(
+            native_request(DialogIntent::OpenProject),
+            None,
+            Some("Failed to pick file with zenity: not found".into()),
+        );
+        assert!(dialogs.linux.tier == Some(LinuxTier::InApp));
+        assert!(!dialogs.linux.canary_may_upgrade);
+        let warning = dialogs.take_warning().expect("warning must be set");
+        assert!(warning.contains("zenity"), "got {warning:?}");
+        assert!(
+            warning.contains("switched to the built-in file browser"),
+            "got {warning:?}"
+        );
+        assert!(
+            matches!(
+                &dialogs.linux.active_in_app,
+                Some((DialogIntent::OpenProject, _))
+            ),
+            "the pending request must reopen in-app"
+        );
+        assert!(dialogs.take_any().is_none());
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn portal_only_latch_on_cancel_keeps_native_tier() {
+        // No pick but the latch is portal-leg-only: zenity ran and the
+        // user cancelled — a working chain. Keep the native tier
+        // (parity with apply_canary_verdict's zenity-keeps-native
+        // rule), no warning, nothing reopened.
+        let mut dialogs = FileDialogs::default();
+        dialogs.linux.tier = Some(LinuxTier::Native);
+        dialogs.apply_native_outcome(
+            native_request(DialogIntent::OpenProject),
+            None,
+            Some("OpenFile failed: org.freedesktop.DBus.Error.ServiceUnknown".into()),
+        );
+        assert!(dialogs.linux.tier == Some(LinuxTier::Native));
+        assert!(dialogs.take_warning().is_none());
+        assert!(dialogs.linux.active_in_app.is_none());
+        assert!(dialogs.take_any().is_none());
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn second_request_while_native_pending_does_not_supersede() {
+        // A second click while a native dialog is on screen must not
+        // drop the in-flight request (its dialog would be orphaned);
+        // it forces the waiting overlay instead, and an unconsumed
+        // earlier result survives the refused request.
+        let mut dialogs = FileDialogs::default();
+        dialogs.linux.tier = Some(LinuxTier::Native);
+        dialogs.linux.active_native = Some(native_request(DialogIntent::OpenProject));
+        dialogs.pending = Some((DialogIntent::ExportDirectory, PathBuf::from("/tmp/x")));
+        dialogs.pick_file(DialogIntent::TiffSample, DialogOptions::default());
+        let req = dialogs
+            .linux
+            .active_native
+            .as_ref()
+            .expect("request must stay in flight");
+        assert_eq!(req.intent, DialogIntent::OpenProject);
+        assert!(req.overlay_forced, "refusal must force the overlay");
+        assert_eq!(
+            dialogs.take_any(),
+            Some((DialogIntent::ExportDirectory, PathBuf::from("/tmp/x")))
+        );
+    }
+
     #[cfg(target_os = "linux")]
     #[test]
     fn latched_downgrade_is_never_overturned_by_canary() {
         let mut dialogs = FileDialogs::default();
-        assert!(
-            dialogs.note_backend_failure(),
-            "Linux latch engages the in-app fallback"
+        dialogs.linux.tier = Some(LinuxTier::Native);
+        dialogs.apply_native_outcome(
+            native_request(DialogIntent::OpenProject),
+            None,
+            Some("Failed to pick file with zenity: exit status 1".into()),
         );
+        assert!(dialogs.linux.tier == Some(LinuxTier::InApp));
         dialogs.apply_canary_verdict(CanaryVerdict::Working);
         assert!(dialogs.linux.tier == Some(LinuxTier::InApp));
     }

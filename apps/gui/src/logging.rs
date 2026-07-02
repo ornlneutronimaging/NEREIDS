@@ -39,14 +39,19 @@ const MAX_LOG_FILES: usize = 7;
 /// `process::exit`).
 static GUARD: Mutex<Option<WorkerGuard>> = Mutex::new(None);
 
-/// Most recent file-dialog backend failure, latched by the log bridge.
+/// Most recent rfd error record, latched by the log bridge.
 ///
-/// rfd reports user-cancel as a bare `None` with no diagnostic, but its
-/// backend failures (portal unreachable, zenity missing/failed) are
-/// `log`-crate error records — so an rfd error record is a precise
-/// "the native dialog backend is broken" discriminator, exactly the
-/// signal #526 lacked. Consumed by the dialog facade to fall back to
-/// the in-app browser and surface a visible warning.
+/// rfd reports user-cancel as a bare `None` with no diagnostic, but it
+/// emits `log`-crate error records for backend trouble — including
+/// NON-final legs: on Linux the portal leg log-errors ("Failed to
+/// connect to session bus: ...", "OpenFile failed: ...") and then
+/// falls back to zenity, which may still serve the user. A latched
+/// record therefore means "some leg failed", not "the dialog failed".
+/// The latch stays deliberately broad (any rfd error); interpretation
+/// lives in the dialog facade, which combines the latch with the
+/// request's outcome to tell a broken chain from a fallback that
+/// worked (see `FileDialogs::apply_native_outcome` in
+/// `file_dialog.rs`).
 static DIALOG_BACKEND_FAILURE: Mutex<Option<String>> = Mutex::new(None);
 
 /// Take the latched native-dialog backend failure, if any (consume-once).
@@ -67,8 +72,11 @@ impl log::Log for LogBridge {
         // Coarse gate mirroring the tracing filter's max level (set in
         // `init_inner`), so `log_enabled!`-guarded expensive formatting
         // in dependencies is skipped instead of forwarded and then
-        // dropped. Fine-grained per-target filtering still happens on
-        // the tracing side.
+        // dropped. This global bound is the ONLY level filtering
+        // bridged records get: they re-enter tracing under this
+        // module's target (the macros below), so per-target EnvFilter
+        // directives (e.g. `NEREIDS_LOG=rfd=debug`) never match them —
+        // the original target survives only as the `log_target` field.
         metadata.level() <= log::max_level()
     }
 
@@ -267,10 +275,13 @@ fn init_inner() {
 
     install_panic_hook();
 
-    // Forward `log`-crate records into tracing. Fine-grained filtering
-    // happens on the tracing side (EnvFilter); the log-crate global
-    // level mirrors the filter's coarsest bound so dependencies'
-    // `log_enabled!` guards short-circuit at the same threshold.
+    // Forward `log`-crate records into tracing. Bridged records adopt
+    // this module's tracing target, so the EnvFilter applies only its
+    // global level bound to them — per-original-target directives do
+    // not match, and the source target is carried as the `log_target`
+    // field. The log-crate global level mirrors that coarsest bound so
+    // dependencies' `log_enabled!` guards short-circuit at the same
+    // threshold.
     // `set_logger` only fails if a logger is already installed — then
     // that one stays in charge.
     if log::set_logger(&LOG_BRIDGE).is_ok() {
@@ -458,8 +469,12 @@ mod tests {
 
     /// Feed records to the bridge directly (no global logger needed,
     /// and `enabled()` is deliberately bypassed — `log()` itself never
-    /// re-checks the gate): only rfd *error* records reach the latch —
-    /// warns and other targets don't, and the latch is consume-once.
+    /// re-checks the gate): rfd *error* records reach the latch from
+    /// EVERY leg of the chain — warns and other crates' errors don't —
+    /// and the latch is consume-once. Targets and messages mirror rfd
+    /// 0.17.2's real emission sites (`module_path!` targets:
+    /// src/backend/xdg_desktop_portal/portal/libdbus.rs for the portal
+    /// leg, src/backend/xdg_desktop_portal.rs for the zenity leg).
     #[test]
     fn log_bridge_latches_only_rfd_errors() {
         let bridge = LogBridge;
@@ -467,6 +482,8 @@ mod tests {
         // Drain anything a concurrent test may have latched.
         let _ = take_dialog_backend_failure();
 
+        // The zenity-fallback notice is a warn, not an error; foreign
+        // crates' errors are not rfd's. Neither latches.
         bridge.log(
             &log::Record::builder()
                 .level(log::Level::Warn)
@@ -483,10 +500,29 @@ mod tests {
         );
         assert_eq!(take_dialog_backend_failure(), None);
 
+        // Portal-leg error (emitted before rfd tries zenity): latched.
         bridge.log(
             &log::Record::builder()
                 .level(log::Level::Error)
-                .target("rfd::backend::linux::zenity")
+                .target("rfd::backend::xdg_desktop_portal::portal::libdbus")
+                .args(format_args!(
+                    "Failed to connect to session bus: org.freedesktop.DBus.Error.NoServer"
+                ))
+                .build(),
+        );
+        let latched = take_dialog_backend_failure();
+        assert!(
+            latched
+                .as_deref()
+                .is_some_and(|m| m.contains("session bus")),
+            "expected portal-leg failure latched, got {latched:?}"
+        );
+
+        // Final zenity-leg error: latched, and consume-once.
+        bridge.log(
+            &log::Record::builder()
+                .level(log::Level::Error)
+                .target("rfd::backend::xdg_desktop_portal")
                 .args(format_args!("Failed to pick file with zenity: not found"))
                 .build(),
         );
@@ -495,7 +531,6 @@ mod tests {
             latched.as_deref().is_some_and(|m| m.contains("zenity")),
             "expected zenity failure latched, got {latched:?}"
         );
-        // Consume-once.
         assert_eq!(take_dialog_backend_failure(), None);
     }
 }
