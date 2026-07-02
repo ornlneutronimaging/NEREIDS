@@ -63,8 +63,13 @@ pub fn take_dialog_backend_failure() -> Option<String> {
 struct LogBridge;
 
 impl log::Log for LogBridge {
-    fn enabled(&self, _metadata: &log::Metadata<'_>) -> bool {
-        true
+    fn enabled(&self, metadata: &log::Metadata<'_>) -> bool {
+        // Coarse gate mirroring the tracing filter's max level (set in
+        // `init_inner`), so `log_enabled!`-guarded expensive formatting
+        // in dependencies is skipped instead of forwarded and then
+        // dropped. Fine-grained per-target filtering still happens on
+        // the tracing side.
+        metadata.level() <= log::max_level()
     }
 
     fn log(&self, record: &log::Record<'_>) {
@@ -100,6 +105,31 @@ impl log::Log for LogBridge {
 }
 
 static LOG_BRIDGE: LogBridge = LogBridge;
+
+/// Map the tracing filter's static max-level hint onto the `log`
+/// crate's global level, so the bridge's `enabled()` can gate
+/// `log_enabled!`-guarded work in dependencies at the same bound the
+/// EnvFilter would apply. `None` (no static bound, e.g. dynamic
+/// reloading) stays permissive.
+fn log_level_from_hint(hint: Option<tracing::level_filters::LevelFilter>) -> log::LevelFilter {
+    use tracing::level_filters::LevelFilter;
+    let Some(hint) = hint else {
+        return log::LevelFilter::Trace;
+    };
+    if hint == LevelFilter::OFF {
+        log::LevelFilter::Off
+    } else if hint == LevelFilter::ERROR {
+        log::LevelFilter::Error
+    } else if hint == LevelFilter::WARN {
+        log::LevelFilter::Warn
+    } else if hint == LevelFilter::INFO {
+        log::LevelFilter::Info
+    } else if hint == LevelFilter::DEBUG {
+        log::LevelFilter::Debug
+    } else {
+        log::LevelFilter::Trace
+    }
+}
 
 /// Returns the directory where rolling log files are written, creating
 /// the directory tree on demand. Falls back to `.cache/NEREIDS/logs`
@@ -237,12 +267,17 @@ fn init_inner() {
 
     install_panic_hook();
 
-    // Forward `log`-crate records into tracing. Level filtering happens
-    // on the tracing side (EnvFilter), so pass everything through here.
+    // Forward `log`-crate records into tracing. Fine-grained filtering
+    // happens on the tracing side (EnvFilter); the log-crate global
+    // level mirrors the filter's coarsest bound so dependencies'
+    // `log_enabled!` guards short-circuit at the same threshold.
     // `set_logger` only fails if a logger is already installed — then
     // that one stays in charge.
     if log::set_logger(&LOG_BRIDGE).is_ok() {
-        log::set_max_level(log::LevelFilter::Trace);
+        let hint = <EnvFilter as tracing_subscriber::layer::Filter<Registry>>::max_level_hint(
+            &env_filter(),
+        );
+        log::set_max_level(log_level_from_hint(hint));
     }
 
     // Surface the dir-creation failure (if any) now that the subscriber
@@ -394,9 +429,37 @@ mod tests {
         assert_eq!(s.as_bytes()[7], b'-');
     }
 
-    /// Feed records to the bridge directly (no global logger needed):
-    /// only rfd *error* records reach the latch — warns and other
-    /// targets don't, and the latch is consume-once.
+    #[test]
+    fn log_level_hint_mapping_covers_every_level() {
+        use tracing::level_filters::LevelFilter as Hint;
+        assert_eq!(log_level_from_hint(None), log::LevelFilter::Trace);
+        assert_eq!(log_level_from_hint(Some(Hint::OFF)), log::LevelFilter::Off);
+        assert_eq!(
+            log_level_from_hint(Some(Hint::ERROR)),
+            log::LevelFilter::Error
+        );
+        assert_eq!(
+            log_level_from_hint(Some(Hint::WARN)),
+            log::LevelFilter::Warn
+        );
+        assert_eq!(
+            log_level_from_hint(Some(Hint::INFO)),
+            log::LevelFilter::Info
+        );
+        assert_eq!(
+            log_level_from_hint(Some(Hint::DEBUG)),
+            log::LevelFilter::Debug
+        );
+        assert_eq!(
+            log_level_from_hint(Some(Hint::TRACE)),
+            log::LevelFilter::Trace
+        );
+    }
+
+    /// Feed records to the bridge directly (no global logger needed,
+    /// and `enabled()` is deliberately bypassed — `log()` itself never
+    /// re-checks the gate): only rfd *error* records reach the latch —
+    /// warns and other targets don't, and the latch is consume-once.
     #[test]
     fn log_bridge_latches_only_rfd_errors() {
         let bridge = LogBridge;

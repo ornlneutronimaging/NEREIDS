@@ -157,7 +157,16 @@ struct LinuxTiers {
     /// Retained in-app dialog in flight.
     active_in_app: Option<(DialogIntent, egui_file_dialog::FileDialog)>,
     /// Portal-health canary result channel (worker thread).
-    canary_rx: Option<std::sync::mpsc::Receiver<Result<(), String>>>,
+    canary_rx: Option<std::sync::mpsc::Receiver<CanaryVerdict>>,
+    /// Probe-failure message held back until the canary rules: if the
+    /// canary proves the portal answers, the probe was a false negative
+    /// (non-FHS install paths) and the warning is discarded unshown.
+    pending_probe_warning: Option<String>,
+    /// The in-app tier came from the (best-effort) probe, so a
+    /// `Working` canary verdict may upgrade it to native. Cleared by
+    /// the runtime latch and the escape hatch — those downgrades are
+    /// evidence of an actually-broken chain and are never overturned.
+    canary_may_upgrade: bool,
 }
 
 #[cfg(target_os = "linux")]
@@ -167,6 +176,19 @@ enum LinuxTier {
     Native,
     /// Pure-egui in-app browser.
     InApp,
+}
+
+/// What the portal canary learned about the FileChooser backend.
+#[cfg(target_os = "linux")]
+enum CanaryVerdict {
+    /// The FileChooser interface answered: a portal backend exists.
+    Working,
+    /// The bus call ran but the interface did not answer: no backend
+    /// implements FileChooser.
+    Broken(String),
+    /// `busctl` itself could not run (non-systemd distro): no evidence
+    /// either way.
+    Inconclusive,
 }
 
 impl FileDialogs {
@@ -241,14 +263,22 @@ impl FileDialogs {
     /// A native-dialog backend failure was latched by the log bridge:
     /// downgrade to the in-app tier and, if a native request is still
     /// in flight, reopen the same request in-app so the user's click
-    /// still lands in a working dialog.
-    pub fn note_backend_failure(&mut self) {
+    /// still lands in a working dialog. Returns `true` when the in-app
+    /// fallback was actually engaged (Linux); the other platforms have
+    /// no fallback tier, so their banner must not claim one.
+    pub fn note_backend_failure(&mut self) -> bool {
         #[cfg(target_os = "linux")]
         {
             self.linux.tier = Some(LinuxTier::InApp);
+            self.linux.canary_may_upgrade = false;
             if let Some(req) = self.linux.active_native.take() {
                 self.open_in_app(req.mode, req.intent, req.opts);
             }
+            true
+        }
+        #[cfg(not(target_os = "linux"))]
+        {
+            false
         }
     }
 
@@ -271,8 +301,12 @@ impl FileDialogs {
 #[cfg(target_os = "linux")]
 impl FileDialogs {
     /// First-frame tier decision from cheap env/filesystem checks (no
-    /// D-Bus traffic, cannot block), plus an async portal canary when
-    /// the native chain looks viable.
+    /// D-Bus traffic, cannot block). The async portal canary always
+    /// runs afterwards: on a viable-looking chain it can catch a
+    /// backend-less portal, and on a failed probe it can rescue a
+    /// false negative (the probe's path list is best-effort — see
+    /// [`probe_native_prerequisites`]), so the probe's warning is
+    /// stashed until the canary rules.
     fn decide_tier_once(&mut self) {
         if self.linux.tier.is_some() {
             return;
@@ -280,49 +314,92 @@ impl FileDialogs {
         match probe_native_prerequisites() {
             Ok(()) => {
                 self.linux.tier = Some(LinuxTier::Native);
-                self.linux.canary_rx = Some(spawn_portal_canary());
             }
             Err(msg) => {
                 self.linux.tier = Some(LinuxTier::InApp);
-                self.warning = Some(msg);
+                self.linux.pending_probe_warning = Some(msg);
+                self.linux.canary_may_upgrade = true;
             }
         }
+        self.linux.canary_rx = Some(spawn_portal_canary());
     }
 
-    /// Portal canary result: reading the FileChooser interface version
-    /// succeeds only when a real portal backend implements it, so a
-    /// failure means the exact portal-accepts-then-hangs environment —
-    /// downgrade before any dialog can get stuck.
+    /// Drain the portal-canary channel and apply its verdict. The
+    /// canary detects a MISSING FileChooser backend (interface not
+    /// exposed); an installed-but-hung backend still answers the
+    /// property read — that case is covered by the dialog worker
+    /// thread + escape hatch, not here.
     fn poll_canary(&mut self) {
         let Some(rx) = &self.linux.canary_rx else {
             return;
         };
         match rx.try_recv() {
-            Ok(Ok(())) => {
+            Ok(verdict) => {
                 self.linux.canary_rx = None;
-            }
-            Ok(Err(msg)) => {
-                self.linux.canary_rx = None;
-                // Zenity alone still makes the native chain viable —
-                // rfd falls back to it without touching the portal.
-                if which_on_path("zenity") {
-                    tracing::info!(
-                        reason = %msg,
-                        "portal canary failed; keeping native dialogs via zenity fallback"
-                    );
-                } else {
-                    self.linux.tier = Some(LinuxTier::InApp);
-                    self.warning = Some(format!(
-                        "Native file dialogs disabled: {msg}. Using the built-in \
-                         file browser. Install zenity or run inside a desktop \
-                         session for native dialogs."
-                    ));
-                }
+                self.apply_canary_verdict(verdict);
             }
             Err(std::sync::mpsc::TryRecvError::Empty) => {}
             Err(std::sync::mpsc::TryRecvError::Disconnected) => {
+                // Canary worker died without reporting: no evidence
+                // either way.
                 self.linux.canary_rx = None;
+                self.apply_canary_verdict(CanaryVerdict::Inconclusive);
             }
+        }
+    }
+
+    /// Apply the canary verdict to the current tier.
+    ///
+    /// - Native tier: `Broken` downgrades (unless zenity keeps rfd's
+    ///   portal-free fallback viable) and reopens any in-flight native
+    ///   request in-app; `Working`/`Inconclusive` change nothing.
+    /// - In-app tier reached via a failed probe (`canary_may_upgrade`):
+    ///   `Working` proves the portal answers despite the probe missing
+    ///   it, so upgrade to native and discard the stashed probe
+    ///   warning; `Broken`/`Inconclusive` confirm the probe, so
+    ///   surface the stashed warning now.
+    /// - A latch or escape-hatch downgrade (`canary_may_upgrade`
+    ///   cleared) is never overturned.
+    fn apply_canary_verdict(&mut self, verdict: CanaryVerdict) {
+        match self.linux.tier {
+            Some(LinuxTier::Native) => {
+                if let CanaryVerdict::Broken(msg) = verdict {
+                    // Zenity alone still makes the native chain viable —
+                    // rfd falls back to it without touching the portal.
+                    if which_on_path("zenity") {
+                        tracing::info!(
+                            reason = %msg,
+                            "portal canary failed; keeping native dialogs via zenity fallback"
+                        );
+                    } else {
+                        self.linux.tier = Some(LinuxTier::InApp);
+                        self.warning = Some(format!(
+                            "Native file dialogs disabled: {msg}. Using the built-in \
+                             file browser. Install zenity or run inside a desktop \
+                             session for native dialogs."
+                        ));
+                        // A native request may already be waiting on the
+                        // dead portal — reopen it in-app so the user's
+                        // click still lands in a working dialog.
+                        if let Some(req) = self.linux.active_native.take() {
+                            self.open_in_app(req.mode, req.intent, req.opts);
+                        }
+                    }
+                }
+            }
+            Some(LinuxTier::InApp) if self.linux.canary_may_upgrade => {
+                self.linux.canary_may_upgrade = false;
+                match verdict {
+                    CanaryVerdict::Working => {
+                        self.linux.tier = Some(LinuxTier::Native);
+                        self.linux.pending_probe_warning = None;
+                    }
+                    CanaryVerdict::Broken(_) | CanaryVerdict::Inconclusive => {
+                        self.warning = self.linux.pending_probe_warning.take();
+                    }
+                }
+            }
+            _ => {}
         }
     }
 
@@ -401,6 +478,9 @@ impl FileDialogs {
 
         if escape && let Some(req) = self.linux.active_native.take() {
             self.linux.tier = Some(LinuxTier::InApp);
+            // The user judged the native chain unusable — a later
+            // canary verdict must not upgrade back to it.
+            self.linux.canary_may_upgrade = false;
             self.open_in_app(req.mode, req.intent, req.opts);
         }
     }
@@ -472,6 +552,11 @@ impl FileDialogs {
 /// no D-Bus traffic, cannot block. Either a session bus with an
 /// installed portal (rfd's primary path) or zenity on PATH (rfd's
 /// fallback path) makes native dialogs viable.
+///
+/// The portal path list is best-effort FHS locations — non-FHS distros
+/// (NixOS, Guix) install the portal elsewhere and read as a false
+/// negative here. The canary is the authoritative check and can rescue
+/// such a false negative (see [`FileDialogs::apply_canary_verdict`]).
 #[cfg(target_os = "linux")]
 fn probe_native_prerequisites() -> Result<(), String> {
     let has_zenity = which_on_path("zenity");
@@ -530,16 +615,18 @@ fn which_on_path(bin: &str) -> bool {
 /// Async portal-health canary: read the FileChooser portal interface
 /// version over the session bus via `busctl` (ships with systemd, so
 /// present on every RHEL/Alma/Fedora/Debian/Ubuntu target). The
-/// interface is only exposed when a real backend (e.g.
-/// xdg-desktop-portal-gtk) implements it, so this detects the exact
-/// environment where rfd's portal call would hang: xdg-desktop-portal
-/// accepts OpenFile but no backend ever sends a Response. `--timeout`
-/// bounds the D-Bus call; the subprocess isolates us from any hang.
+/// interface is only exposed when a backend (e.g.
+/// xdg-desktop-portal-gtk) implements it, so a failed read means the
+/// no-backend case — rfd's portal call would never produce a dialog.
+/// An installed-but-broken/hung backend still answers the property
+/// read; that case is covered by the dialog worker thread + escape
+/// hatch, not by this canary. `--timeout` bounds the D-Bus call; the
+/// subprocess isolates us from any hang.
 #[cfg(target_os = "linux")]
-fn spawn_portal_canary() -> std::sync::mpsc::Receiver<Result<(), String>> {
+fn spawn_portal_canary() -> std::sync::mpsc::Receiver<CanaryVerdict> {
     let (tx, rx) = std::sync::mpsc::channel();
     std::thread::spawn(move || {
-        let result = match std::process::Command::new("busctl")
+        let verdict = match std::process::Command::new("busctl")
             .args([
                 "--user",
                 "--timeout=2",
@@ -551,16 +638,16 @@ fn spawn_portal_canary() -> std::sync::mpsc::Receiver<Result<(), String>> {
             ])
             .output()
         {
-            Ok(out) if out.status.success() => Ok(()),
-            Ok(out) => Err(format!(
+            Ok(out) if out.status.success() => CanaryVerdict::Working,
+            Ok(out) => CanaryVerdict::Broken(format!(
                 "portal FileChooser backend not responding ({})",
                 String::from_utf8_lossy(&out.stderr).trim()
             )),
-            // busctl missing (non-systemd distro): inconclusive — keep
-            // the probe verdict rather than downgrading.
-            Err(_) => Ok(()),
+            // busctl missing (non-systemd distro): no evidence either
+            // way — keep the probe verdict.
+            Err(_) => CanaryVerdict::Inconclusive,
         };
-        let _ = tx.send(result);
+        let _ = tx.send(verdict);
     });
     rx
 }
@@ -711,6 +798,164 @@ mod tests {
             }
             other => panic!("expected Tabulated, got {other:?}"),
         }
+    }
+
+    /// Minimal fitted result for SaveTilePng dispatch tests: one 2x2
+    /// density map per label, plus an optional temperature map.
+    fn spatial_result_with(
+        labels: &[&str],
+        with_temperature: bool,
+    ) -> nereids_pipeline::spatial::SpatialResult {
+        let map = || ndarray::Array2::from_shape_fn((2, 2), |(y, x)| (y * 2 + x) as f64);
+        nereids_pipeline::spatial::SpatialResult {
+            density_maps: labels.iter().map(|_| map()).collect(),
+            uncertainty_maps: labels.iter().map(|_| map()).collect(),
+            chi_squared_map: map(),
+            deviance_per_dof_map: None,
+            converged_map: ndarray::Array2::from_elem((2, 2), true),
+            temperature_map: with_temperature.then(map),
+            temperature_uncertainty_map: None,
+            isotope_labels: labels.iter().map(|s| s.to_string()).collect(),
+            anorm_map: None,
+            background_maps: None,
+            back_d_map: None,
+            back_f_map: None,
+            t0_us_map: None,
+            l_scale_map: None,
+            n_converged: 4,
+            n_total: 4,
+            n_failed: 0,
+        }
+    }
+
+    fn dispatch_save_tile_png(state: &mut AppState, tile_idx: usize, label: &str, path: PathBuf) {
+        state.file_dialogs.inject(
+            DialogIntent::SaveTilePng {
+                tile_idx,
+                label: label.to_string(),
+            },
+            path,
+        );
+        dispatch_results(state);
+    }
+
+    #[test]
+    fn dispatch_save_tile_png_without_result_errors() {
+        let mut state = AppState::default();
+        dispatch_save_tile_png(
+            &mut state,
+            0,
+            "Fe56",
+            PathBuf::from("/tmp/never-written.png"),
+        );
+        assert_eq!(state.status_message, "PNG save error: no results available");
+    }
+
+    #[test]
+    fn dispatch_save_tile_png_refuses_stale_label() {
+        // The dialog can resolve frames after it was opened; if the
+        // results were replaced meanwhile, the carried label no longer
+        // names the tile at that index and nothing must be written.
+        let mut state = AppState {
+            spatial_result: Some(spatial_result_with(&["Fe56"], false)),
+            ..Default::default()
+        };
+        let dir = tempfile::tempdir().expect("tempdir");
+        let path = dir.path().join("stale.png");
+        dispatch_save_tile_png(&mut state, 0, "Gd157", path.clone());
+        assert!(
+            state.status_message.starts_with("PNG not saved:"),
+            "expected refusal, got {:?}",
+            state.status_message
+        );
+        assert!(!path.exists(), "stale-label save must not write a file");
+    }
+
+    #[test]
+    fn dispatch_save_tile_png_saves_matching_density_tile() {
+        let mut state = AppState {
+            spatial_result: Some(spatial_result_with(&["Fe56"], false)),
+            ..Default::default()
+        };
+        let dir = tempfile::tempdir().expect("tempdir");
+        let path = dir.path().join("Fe56.png");
+        dispatch_save_tile_png(&mut state, 0, "Fe56", path.clone());
+        assert!(
+            state.status_message.starts_with("Saved PNG:"),
+            "expected success, got {:?}",
+            state.status_message
+        );
+        assert!(path.exists());
+    }
+
+    #[test]
+    fn dispatch_save_tile_png_maps_tiles_like_studio() {
+        // Index mapping mirror of the Studio analysis column:
+        // 0..n_density = isotopes, n_density = temperature (if present),
+        // anything past that does not exist — even with a temperature
+        // map available.
+        let mut state = AppState {
+            spatial_result: Some(spatial_result_with(&["Fe56"], true)),
+            ..Default::default()
+        };
+        let dir = tempfile::tempdir().expect("tempdir");
+
+        let temp_path = dir.path().join("temperature.png");
+        dispatch_save_tile_png(&mut state, 1, "temperature", temp_path.clone());
+        assert!(
+            state.status_message.starts_with("Saved PNG:"),
+            "expected temperature tile at n_density to save, got {:?}",
+            state.status_message
+        );
+        assert!(temp_path.exists());
+
+        let ghost_path = dir.path().join("ghost.png");
+        dispatch_save_tile_png(&mut state, 2, "temperature", ghost_path.clone());
+        assert_eq!(
+            state.status_message,
+            "PNG save error: tile 2 no longer exists"
+        );
+        assert!(!ghost_path.exists());
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn canary_rescues_probe_false_negative() {
+        // Probe-failed state (e.g. non-FHS portal paths) + a Working
+        // canary: upgrade to native, discard the stashed warning.
+        let mut dialogs = FileDialogs::default();
+        dialogs.linux.tier = Some(LinuxTier::InApp);
+        dialogs.linux.canary_may_upgrade = true;
+        dialogs.linux.pending_probe_warning = Some("probe failed".into());
+        dialogs.apply_canary_verdict(CanaryVerdict::Working);
+        assert!(dialogs.linux.tier == Some(LinuxTier::Native));
+        assert!(dialogs.warning.is_none(), "rescued probe must not warn");
+        assert!(dialogs.linux.pending_probe_warning.is_none());
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn inconclusive_canary_surfaces_stashed_probe_warning() {
+        let mut dialogs = FileDialogs::default();
+        dialogs.linux.tier = Some(LinuxTier::InApp);
+        dialogs.linux.canary_may_upgrade = true;
+        dialogs.linux.pending_probe_warning = Some("probe failed".into());
+        dialogs.apply_canary_verdict(CanaryVerdict::Inconclusive);
+        assert!(dialogs.linux.tier == Some(LinuxTier::InApp));
+        assert_eq!(dialogs.warning.as_deref(), Some("probe failed"));
+        assert!(!dialogs.linux.canary_may_upgrade);
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn latched_downgrade_is_never_overturned_by_canary() {
+        let mut dialogs = FileDialogs::default();
+        assert!(
+            dialogs.note_backend_failure(),
+            "Linux latch engages the in-app fallback"
+        );
+        dialogs.apply_canary_verdict(CanaryVerdict::Working);
+        assert!(dialogs.linux.tier == Some(LinuxTier::InApp));
     }
 
     #[cfg(target_os = "linux")]

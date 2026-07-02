@@ -175,13 +175,16 @@ pub fn tile_toolbelt(
 
 /// Save the tile's map (density map, or the temperature map for the
 /// index one past the densities) as a colormapped PNG. Dispatch handler
-/// for [`crate::file_dialog::DialogIntent::SaveTilePng`]; re-derives the
-/// map from `spatial_result` exactly like the Studio analysis column so
-/// a pick that resolves on a later frame still targets the right tile.
+/// for [`crate::file_dialog::DialogIntent::SaveTilePng`]; the dialog can
+/// resolve frames after it was opened, so the map is re-derived from the
+/// CURRENT `spatial_result` with the same tile mapping the Studio
+/// analysis column uses, and the carried `label` must still name the
+/// tile at `tile_idx` — otherwise the results changed under the open
+/// dialog and saving would write the wrong map.
 pub(crate) fn save_tile_png(
     state: &mut AppState,
     tile_idx: usize,
-    _label: &str,
+    label: &str,
     path: &std::path::Path,
 ) {
     let msg = {
@@ -189,16 +192,34 @@ pub(crate) fn save_tile_png(
             state.status_message = "PNG save error: no results available".into();
             return;
         };
-        let n_density = result.density_maps.len();
-        let data = if tile_idx < n_density {
-            result.density_maps.get(tile_idx)
+        // Mirror of the Studio analysis column's tile mapping:
+        // 0..n_density = isotopes, n_density = temperature (if present),
+        // anything past that does not exist.
+        let n_density = result.density_maps.len().min(result.isotope_labels.len());
+        let (data, current_label) = if tile_idx < n_density {
+            (
+                result.density_maps.get(tile_idx),
+                result.isotope_labels.get(tile_idx).map(String::as_str),
+            )
+        } else if tile_idx == n_density {
+            (
+                result.temperature_map.as_ref(),
+                result.temperature_map.is_some().then_some("temperature"),
+            )
         } else {
-            result.temperature_map.as_ref()
+            (None, None)
         };
         let Some(data) = data else {
             state.status_message = format!("PNG save error: tile {tile_idx} no longer exists");
             return;
         };
+        if current_label != Some(label) {
+            state.status_message = format!(
+                "PNG not saved: results changed since the dialog was opened \
+                 ('{label}' is no longer tile {tile_idx})"
+            );
+            return;
+        }
         let colormap = state
             .tile_display
             .get(tile_idx)
