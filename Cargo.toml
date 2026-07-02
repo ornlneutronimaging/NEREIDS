@@ -52,6 +52,9 @@ rand = "0.9"
 rand_distr = "0.5"
 microlp = "0.4"
 tracing = "0.1"
+# log-crate facade: bridged into tracing by apps/gui/src/logging.rs so
+# diagnostics from log-based deps (rfd, opener) reach the log files.
+log = "0.4"
 tracing-appender = "0.2"
 tracing-subscriber = { version = "0.3", default-features = false, features = ["fmt", "env-filter", "registry", "ansi"] }
 opener = { version = "0.7", features = ["reveal"] }

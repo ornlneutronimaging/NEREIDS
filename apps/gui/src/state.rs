@@ -832,6 +832,10 @@ pub struct AppState {
     /// Poll-based file-dialog service; picks are routed by
     /// `crate::file_dialog::dispatch_results` each frame.
     pub file_dialogs: crate::file_dialog::FileDialogs,
+    /// Dismissible banner shown when native file dialogs are unavailable
+    /// or failed (portal/zenity chain) — #526's silent failure made
+    /// visible. Set from the startup probe and the log-bridge latch.
+    pub native_dialog_warning: Option<String>,
 
     /// Prevents auto-load retry after a loading failure; cleared when file paths change.
     pub load_error: bool,
@@ -1531,6 +1535,7 @@ impl Default for AppState {
             is_fetching_endf: false,
             egui_ctx: None,
             file_dialogs: Default::default(),
+            native_dialog_warning: None,
 
             hdf5_path: None,
             hdf5_ob_path: None,

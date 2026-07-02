@@ -148,6 +148,24 @@ impl eframe::App for NereidsApp {
         // Top toolbar
         widgets::toolbar::toolbar(ctx, &mut self.state);
 
+        // Native-dialog failure banner: the log bridge latches rfd
+        // backend errors (which never fire on user-cancel), so a dead
+        // file-picker environment is surfaced instead of silent (#526).
+        if let Some(msg) = crate::logging::take_dialog_backend_failure() {
+            self.state.native_dialog_warning = Some(format!("Native file dialog failed: {msg}"));
+        }
+        if let Some(msg) = self.state.native_dialog_warning.clone() {
+            egui::TopBottomPanel::top("native_dialog_warning").show(ctx, |ui| {
+                ui.horizontal_wrapped(|ui| {
+                    ui.label(egui::RichText::new("\u{26A0}").color(ui.visuals().warn_fg_color));
+                    ui.label(msg);
+                    if ui.small_button("Dismiss").clicked() {
+                        self.state.native_dialog_warning = None;
+                    }
+                });
+            });
+        }
+
         // Bottom status bar
         widgets::statusbar::status_bar(ctx, &self.state, self.memory.rss_bytes);
 

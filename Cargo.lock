@@ -2947,6 +2947,7 @@ dependencies = [
  "egui_extras",
  "egui_plot",
  "image",
+ "log",
  "ndarray",
  "nereids-core",
  "nereids-endf",

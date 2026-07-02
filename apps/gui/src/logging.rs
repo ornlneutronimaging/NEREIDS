@@ -39,6 +39,68 @@ const MAX_LOG_FILES: usize = 7;
 /// `process::exit`).
 static GUARD: Mutex<Option<WorkerGuard>> = Mutex::new(None);
 
+/// Most recent file-dialog backend failure, latched by the log bridge.
+///
+/// rfd reports user-cancel as a bare `None` with no diagnostic, but its
+/// backend failures (portal unreachable, zenity missing/failed) are
+/// `log`-crate error records — so an rfd error record is a precise
+/// "the native dialog backend is broken" discriminator, exactly the
+/// signal #526 lacked. Consumed by the dialog facade to fall back to
+/// the in-app browser and surface a visible warning.
+static DIALOG_BACKEND_FAILURE: Mutex<Option<String>> = Mutex::new(None);
+
+/// Take the latched native-dialog backend failure, if any (consume-once).
+pub fn take_dialog_backend_failure() -> Option<String> {
+    DIALOG_BACKEND_FAILURE
+        .lock()
+        .ok()
+        .and_then(|mut slot| slot.take())
+}
+
+/// Bridge `log`-crate records (rfd, opener, other C-adjacent deps emit
+/// these; without a bridge they are silently discarded) into `tracing`,
+/// and latch rfd error records for the dialog facade.
+struct LogBridge;
+
+impl log::Log for LogBridge {
+    fn enabled(&self, _metadata: &log::Metadata<'_>) -> bool {
+        true
+    }
+
+    fn log(&self, record: &log::Record<'_>) {
+        // The original target is carried as a field because tracing
+        // macro targets must be compile-time constants.
+        match record.level() {
+            log::Level::Error => {
+                tracing::error!(log_target = record.target(), "{}", record.args());
+            }
+            log::Level::Warn => {
+                tracing::warn!(log_target = record.target(), "{}", record.args());
+            }
+            log::Level::Info => {
+                tracing::info!(log_target = record.target(), "{}", record.args());
+            }
+            log::Level::Debug => {
+                tracing::debug!(log_target = record.target(), "{}", record.args());
+            }
+            log::Level::Trace => {
+                tracing::trace!(log_target = record.target(), "{}", record.args());
+            }
+        }
+
+        if record.level() == log::Level::Error
+            && record.target().starts_with("rfd")
+            && let Ok(mut slot) = DIALOG_BACKEND_FAILURE.lock()
+        {
+            *slot = Some(record.args().to_string());
+        }
+    }
+
+    fn flush(&self) {}
+}
+
+static LOG_BRIDGE: LogBridge = LogBridge;
+
 /// Returns the directory where rolling log files are written, creating
 /// the directory tree on demand. Falls back to `.cache/NEREIDS/logs`
 /// (relative to cwd) if `dirs::data_dir()` is unavailable.
@@ -175,6 +237,14 @@ fn init_inner() {
 
     install_panic_hook();
 
+    // Forward `log`-crate records into tracing. Level filtering happens
+    // on the tracing side (EnvFilter), so pass everything through here.
+    // `set_logger` only fails if a logger is already installed — then
+    // that one stays in charge.
+    if log::set_logger(&LOG_BRIDGE).is_ok() {
+        log::set_max_level(log::LevelFilter::Trace);
+    }
+
     // Surface the dir-creation failure (if any) now that the subscriber
     // is installed. Recorded as a warn so it stands out without being
     // alarming on filesystems where this is genuinely transient.
@@ -242,6 +312,7 @@ fn install_panic_hook() {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use log::Log;
     use tempfile::tempdir;
 
     #[test]
@@ -321,5 +392,47 @@ mod tests {
         assert_eq!(s.len(), 10, "got {s:?}");
         assert_eq!(s.as_bytes()[4], b'-');
         assert_eq!(s.as_bytes()[7], b'-');
+    }
+
+    /// Feed records to the bridge directly (no global logger needed):
+    /// only rfd *error* records reach the latch — warns and other
+    /// targets don't, and the latch is consume-once.
+    #[test]
+    fn log_bridge_latches_only_rfd_errors() {
+        let bridge = LogBridge;
+
+        // Drain anything a concurrent test may have latched.
+        let _ = take_dialog_backend_failure();
+
+        bridge.log(
+            &log::Record::builder()
+                .level(log::Level::Warn)
+                .target("rfd::backend::xdg_desktop_portal")
+                .args(format_args!("Using zenity fallback"))
+                .build(),
+        );
+        bridge.log(
+            &log::Record::builder()
+                .level(log::Level::Error)
+                .target("some_other_crate")
+                .args(format_args!("unrelated error"))
+                .build(),
+        );
+        assert_eq!(take_dialog_backend_failure(), None);
+
+        bridge.log(
+            &log::Record::builder()
+                .level(log::Level::Error)
+                .target("rfd::backend::linux::zenity")
+                .args(format_args!("Failed to pick file with zenity: not found"))
+                .build(),
+        );
+        let latched = take_dialog_backend_failure();
+        assert!(
+            latched.as_deref().is_some_and(|m| m.contains("zenity")),
+            "expected zenity failure latched, got {latched:?}"
+        );
+        // Consume-once.
+        assert_eq!(take_dialog_backend_failure(), None);
     }
 }
