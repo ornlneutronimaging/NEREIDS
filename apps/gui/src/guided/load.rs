@@ -381,8 +381,21 @@ fn hdf5_ob_picker(ui: &mut egui::Ui, state: &mut AppState) {
             .unwrap_or_else(|| "Click to select open beam...".to_string());
         let resp = design::drop_zone(ui, loaded, &display, "Open beam HDF5 (.h5, .hdf5, .nxs)");
         if resp.clicked() {
+            // Capture the interpretation inputs (mode + binning) at
+            // click time — see the `DialogIntent::Hdf5OpenBeam` doc
+            // comment. Params are captured unconditionally: cheap, and
+            // correct regardless of which mode is active at resolution.
             state.file_dialogs.pick_file(
-                DialogIntent::Hdf5OpenBeam,
+                DialogIntent::Hdf5OpenBeam {
+                    mode: state.input_mode,
+                    event_params: nereids_io::nexus::EventBinningParams {
+                        n_bins: state.event_n_bins,
+                        tof_min_us: state.event_tof_min_us,
+                        tof_max_us: state.event_tof_max_us,
+                        height: state.event_height,
+                        width: state.event_width,
+                    },
+                },
                 DialogOptions {
                     filters: vec![("HDF5", &["h5", "hdf5", "nxs", "nx5"])],
                     ..Default::default()
@@ -814,20 +827,23 @@ pub(crate) fn on_hdf5_sample_picked(state: &mut AppState, file: std::path::PathB
 }
 
 /// Optional open-beam NeXus/HDF5 file picked: load (event or histogram
-/// per input mode), validate against the sample, and install.
-pub(crate) fn on_hdf5_ob_picked(state: &mut AppState, path: std::path::PathBuf) {
+/// per the mode captured at request time), validate against the
+/// current sample, and install.
+pub(crate) fn on_hdf5_ob_picked(
+    state: &mut AppState,
+    path: std::path::PathBuf,
+    mode: InputMode,
+    event_params: &nereids_io::nexus::EventBinningParams,
+) {
     state.hdf5_ob_path = Some(path.clone());
-    // Dispatch event vs histogram loading based on input mode
-    let ob_result = if state.input_mode == InputMode::Hdf5Event {
-        // Use same binning params as sample
-        let params = nereids_io::nexus::EventBinningParams {
-            n_bins: state.event_n_bins,
-            tof_min_us: state.event_tof_min_us,
-            tof_max_us: state.event_tof_max_us,
-            height: state.event_height,
-            width: state.event_width,
-        };
-        nereids_io::nexus::load_nexus_events(&path, &params)
+    // Event-vs-histogram dispatch and binning use ONLY the values
+    // captured when the dialog was requested (`mode`, `event_params`) —
+    // state edits made while the dialog is pending must not change how
+    // the picked file is loaded. The shape/TOF validation below reads
+    // CURRENT state on purpose: the OB must match whatever sample is
+    // loaded now.
+    let ob_result = if mode == InputMode::Hdf5Event {
+        nereids_io::nexus::load_nexus_events(&path, event_params)
             .map(|d| (d.counts, d.tof_edges_us, d.n_rotation_angles))
     } else {
         // Issue #430: the loader refuses multi-angle files by

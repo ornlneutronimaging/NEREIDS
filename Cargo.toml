@@ -59,7 +59,18 @@ egui_plot = "0.34"
 # The portal backend has no link-time C deps (dlopens libdbus, zenity
 # CLI fallback) and the GUI adds a pure-egui in-app fallback tier.
 # Do NOT re-enable "gtk3". Per-target features live in apps/gui/Cargo.toml.
-rfd = { version = "0.17", default-features = false }
+# EXACT-VERSION PIN: the GUI's dialog-failure classification is coupled
+# to rfd 0.17.2's log message wording and module paths — the zenity
+# end-of-chain discriminator in `FileDialogs::apply_native_outcome`
+# (apps/gui/src/file_dialog.rs) and the error latch
+# (apps/gui/src/logging.rs) match strings emitted from rfd's
+# src/backend/xdg_desktop_portal.rs and
+# src/backend/xdg_desktop_portal/portal/{mod.rs,libdbus.rs}. A
+# semver-compatible bump that rewords those messages would silently
+# disarm the classification while the tests (which mirror the strings
+# by hand) keep passing. Any bump must re-verify those emission sites
+# and update both classifiers AND their tests.
+rfd = { version = "=0.17.2", default-features = false }
 # Pure-egui in-app file browser (Linux fallback dialog tier). LOCKSTEP
 # with egui minors: 0.12 <-> egui 0.33, 0.13 <-> 0.34, 0.14 <-> 0.35 —
 # any egui/eframe bump MUST bump this together.

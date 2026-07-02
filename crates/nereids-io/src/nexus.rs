@@ -476,7 +476,7 @@ pub fn load_nexus_histogram_with_mode(
 }
 
 /// Parameters for histogramming neutron event data into a 3D grid.
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, PartialEq)]
 pub struct EventBinningParams {
     /// Number of TOF bins.
     pub n_bins: usize,

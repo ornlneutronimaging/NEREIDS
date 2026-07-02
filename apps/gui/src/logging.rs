@@ -119,13 +119,27 @@ static LOG_BRIDGE: LogBridge = LogBridge;
 /// `log_enabled!`-guarded work in dependencies at the same bound the
 /// EnvFilter would apply. `None` (no static bound, e.g. dynamic
 /// reloading) stays permissive.
+///
+/// The mapping floors at `Error` — an OFF hint maps to
+/// `log::LevelFilter::Error`, never `Off`. The dialog-failure latch
+/// ([`DIALOG_BACKEND_FAILURE`]) is load-bearing for classifying native
+/// dialog failures: the `log` macros short-circuit against the global
+/// max level before invoking the logger, so `Off` would stop rfd's
+/// error records from ever reaching the bridge, and a full
+/// portal+zenity chain failure would classify as a plain user cancel
+/// (silent dead dialog buttons) whenever the user silences logging
+/// (e.g. `NEREIDS_LOG=off`). Error records must always reach the
+/// bridge; the tracing side still drops them from the log files under
+/// an `off` filter.
 fn log_level_from_hint(hint: Option<tracing::level_filters::LevelFilter>) -> log::LevelFilter {
     use tracing::level_filters::LevelFilter;
     let Some(hint) = hint else {
         return log::LevelFilter::Trace;
     };
     if hint == LevelFilter::OFF {
-        log::LevelFilter::Off
+        // Floor, not Off — see the doc comment: the latch must still
+        // see rfd's error records.
+        log::LevelFilter::Error
     } else if hint == LevelFilter::ERROR {
         log::LevelFilter::Error
     } else if hint == LevelFilter::WARN {
@@ -444,7 +458,13 @@ mod tests {
     fn log_level_hint_mapping_covers_every_level() {
         use tracing::level_filters::LevelFilter as Hint;
         assert_eq!(log_level_from_hint(None), log::LevelFilter::Trace);
-        assert_eq!(log_level_from_hint(Some(Hint::OFF)), log::LevelFilter::Off);
+        // OFF floors at Error instead of mapping to Off: the dialog-
+        // failure latch depends on rfd error records reaching the
+        // bridge even when the user silences log output.
+        assert_eq!(
+            log_level_from_hint(Some(Hint::OFF)),
+            log::LevelFilter::Error
+        );
         assert_eq!(
             log_level_from_hint(Some(Hint::ERROR)),
             log::LevelFilter::Error

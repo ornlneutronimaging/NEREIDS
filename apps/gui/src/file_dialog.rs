@@ -31,11 +31,11 @@
 
 use std::path::PathBuf;
 
-use crate::state::{AppState, SaveDataMode};
+use crate::state::{AppState, InputMode, SaveDataMode};
 
 /// Which UI feature requested the dialog — routes the picked path in
 /// [`dispatch_results`].
-#[derive(Clone, Debug, PartialEq, Eq)]
+#[derive(Clone, Debug, PartialEq)]
 pub enum DialogIntent {
     /// Open a `.nrd.h5` project (toolbar, Ctrl/Cmd+O).
     OpenProject,
@@ -61,8 +61,19 @@ pub enum DialogIntent {
     SpectrumFile,
     /// Sample NeXus/HDF5 file (Load step, histogram + event tabs).
     Hdf5Sample,
-    /// Optional open-beam NeXus/HDF5 file (Load step).
-    Hdf5OpenBeam,
+    /// Optional open-beam NeXus/HDF5 file (Load step). Carries the
+    /// input mode and event-binning parameters captured at request
+    /// time: the dialog can resolve frames (or, on the Linux native
+    /// tier, seconds) later, and reading `state.input_mode` / the
+    /// `event_*` fields at resolution would let edits made while the
+    /// dialog is pending retroactively change how the picked file is
+    /// loaded (a same-shape, differently-binned OB would install
+    /// silently). Validation against the sample stays on current
+    /// state — the OB must match whatever is loaded when it lands.
+    Hdf5OpenBeam {
+        mode: InputMode,
+        event_params: nereids_io::nexus::EventBinningParams,
+    },
     /// Tabulated instrument-resolution file for one of the three
     /// resolution cards.
     ResolutionFile(ResolutionTarget),
@@ -329,7 +340,7 @@ impl FileDialogs {
                 self.linux.canary_may_upgrade = true;
             }
         }
-        self.linux.canary_rx = Some(spawn_portal_canary());
+        self.linux.canary_rx = Some(spawn_portal_canary(self.linux.ctx.clone()));
     }
 
     /// Drain the portal-canary channel and apply its verdict. The
@@ -503,7 +514,8 @@ impl FileDialogs {
     /// zenity ("Failed to pick file with zenity: ...", "Failed to save
     /// file with zenity: ...", "Failed to open zenity dialog: ..." from
     /// src/backend/xdg_desktop_portal.rs), which makes "mentions
-    /// zenity" the end-of-chain discriminator.
+    /// zenity" the end-of-chain discriminator. Wording pinned via
+    /// rfd "=0.17.2" — see the workspace Cargo.toml.
     fn apply_native_outcome(
         &mut self,
         req: NativeRequest,
@@ -556,14 +568,25 @@ impl FileDialogs {
         }
         match mode {
             Mode::SaveFile => {
-                // Save dialogs use an extension dropdown instead of filters.
-                for (name, exts) in &opts.filters {
-                    if let Some(ext) = exts.first() {
-                        dlg = dlg.add_save_extension(name, ext);
+                // Save dialogs use an extension dropdown instead of
+                // filters — but only when no name was pre-filled:
+                // egui-file-dialog 0.12.0 applies the default save
+                // extension to the pre-filled name via
+                // `PathBuf::set_extension`, which replaces only the
+                // final dot-component ("x.nrd" + "nrd.h5" ->
+                // "x.nrd.nrd.h5"). A supplied default name already
+                // carries its extension; for typed-in names,
+                // `ensure_extension` at dispatch remains the safety
+                // net.
+                if opts.file_name.is_none() {
+                    for (name, exts) in &opts.filters {
+                        if let Some(ext) = exts.first() {
+                            dlg = dlg.add_save_extension(name, ext);
+                        }
                     }
-                }
-                if let Some((name, _)) = opts.filters.first() {
-                    dlg = dlg.default_save_extension(name);
+                    if let Some((name, _)) = opts.filters.first() {
+                        dlg = dlg.default_save_extension(name);
+                    }
                 }
             }
             _ => {
@@ -681,9 +704,12 @@ fn which_on_path(bin: &str) -> bool {
 /// An installed-but-broken/hung backend still answers the property
 /// read; that case is covered by the dialog worker thread + escape
 /// hatch, not by this canary. `--timeout` bounds the D-Bus call; the
-/// subprocess isolates us from any hang.
+/// subprocess isolates us from any hang. After sending the verdict the
+/// worker requests a repaint (like `open_native_worker`'s), so
+/// `poll_canary` runs promptly instead of waiting for the next
+/// user-driven frame.
 #[cfg(target_os = "linux")]
-fn spawn_portal_canary() -> std::sync::mpsc::Receiver<CanaryVerdict> {
+fn spawn_portal_canary(ctx: Option<egui::Context>) -> std::sync::mpsc::Receiver<CanaryVerdict> {
     let (tx, rx) = std::sync::mpsc::channel();
     std::thread::spawn(move || {
         let verdict = match std::process::Command::new("busctl")
@@ -708,6 +734,9 @@ fn spawn_portal_canary() -> std::sync::mpsc::Receiver<CanaryVerdict> {
             Err(_) => CanaryVerdict::Inconclusive,
         };
         let _ = tx.send(verdict);
+        if let Some(ctx) = ctx {
+            ctx.request_repaint();
+        }
     });
     rx
 }
@@ -736,7 +765,9 @@ pub fn dispatch_results(state: &mut AppState) {
         DialogIntent::TiffOpenBeam => crate::guided::load::on_tiff_open_beam_picked(state, path),
         DialogIntent::SpectrumFile => crate::guided::load::on_spectrum_picked(state, path),
         DialogIntent::Hdf5Sample => crate::guided::load::on_hdf5_sample_picked(state, path),
-        DialogIntent::Hdf5OpenBeam => crate::guided::load::on_hdf5_ob_picked(state, path),
+        DialogIntent::Hdf5OpenBeam { mode, event_params } => {
+            crate::guided::load::on_hdf5_ob_picked(state, path, mode, &event_params);
+        }
         DialogIntent::ResolutionFile(target) => on_resolution_file_picked(state, target, path),
     }
 }
