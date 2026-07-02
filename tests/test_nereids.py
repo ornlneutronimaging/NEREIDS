@@ -466,6 +466,64 @@ class TestResolutionBroadening:
             nereids.resolution_broaden(e, xs, -1.0, 0.5, 0.001)
 
 
+class TestTabulatedKernelOrientation:
+    """Regression for issue #631: tabulated kernels must be applied as a
+    convolution (theory gathered at t - dt), not time-mirrored.
+
+    Kernel convention: mode at TOF offset 0, delayed-emission tail at
+    POSITIVE offsets. A delayed neutron measured at TOF t really flew
+    t - dt (it is faster than nominal), so a broadened symmetric dip
+    must acquire its tail toward later TOF = LOWER apparent energy:
+    centroid shift and skew both strictly negative. The pre-fix code
+    produced +0.297 eV / +1.53 on this exact setup.
+
+    Also the first coverage of the load_resolution / apply_resolution
+    bindings.
+    """
+
+    @staticmethod
+    def _write_kernel(path):
+        dt = np.linspace(-1.0, 15.0, 499)  # us
+        amp = np.where(dt >= 0, np.exp(-dt / 3.0), 0.0)
+        amp[np.argmin(np.abs(dt))] = 1.0  # mode at offset 0
+        lines = [
+            "synthetic asymmetric kernel, tail at positive TOF offsets",
+            "-----",
+        ]
+        for eref in (10.0, 100.0):
+            lines.append(f"   {eref:.5e}   0.00000e+000")
+            lines += [f"{d:.15f} {a:.15e}" for d, a in zip(dt, amp)]
+            lines.append("")
+        path.write_text("\n".join(lines))
+
+    def test_delayed_tail_shifts_dip_to_lower_energy(self, tmp_path):
+        kernel_path = tmp_path / "synthetic_kernel.txt"
+        self._write_kernel(kernel_path)
+        tab = nereids.load_resolution(str(kernel_path), 25.0)
+
+        e0 = 20.0
+        e = np.linspace(e0 - 3, e0 + 3, 24001)
+        spec = 1.0 - 0.6 * np.exp(-0.5 * ((e - e0) / 0.02) ** 2)
+        b = np.asarray(nereids.apply_resolution(e, spec, tab))
+
+        # Non-vacuity: the kernel must visibly reshape the dip.
+        assert np.max(np.abs(b - spec)) > 0.01 * np.max(np.abs(spec))
+
+        a = 1.0 - b
+        mu = np.sum(e * a) / np.sum(a)
+        sd = np.sqrt(np.sum((e - mu) ** 2 * a) / np.sum(a))
+        skew = np.sum(((e - mu) / sd) ** 3 * a) / np.sum(a)
+
+        assert mu - e0 < 0, (
+            f"centroid must shift to LOWER energy (delayed arrival): "
+            f"{mu - e0:+.4f} eV — positive means the kernel was applied "
+            f"time-mirrored"
+        )
+        assert skew < 0, (
+            f"broadened dip must be skewed toward LOWER energy: {skew:+.3f}"
+        )
+
+
 # ===========================================================================
 # LM fitting
 # ===========================================================================
