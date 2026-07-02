@@ -60,6 +60,10 @@ jobs:
             yum install -y cmake3 || yum install -y cmake
             ln -sf /usr/bin/cmake3 /usr/bin/cmake || true
 
+      - name: Enforce wheel policy (ORNL manylinux_2_28 ceiling)
+        if: runner.os == 'Linux'
+        run: ./scripts/check_wheel_policy.sh dist/*.whl
+
       - name: Upload wheel
         uses: actions/upload-artifact@v4
         with:
@@ -95,14 +99,19 @@ jobs:
         include:
           - os: ubuntu-latest
             target: x86_64-unknown-linux-gnu
-            # rfd's gtk3 backend (gtk-sys 0.18, added in #539) hard-requires
-            # gtk+-3.0 >= 3.24.  manylinux_2_28 (AlmaLinux 8) ships GTK 3.22 —
-            # too old — which broke the v0.2.0 build-gui job.  manylinux_2_34
-            # (AlmaLinux 9) ships GTK 3.24 AND is in maturin-action's container
-            # image map.  (manylinux_2_31 is NOT in that map, so the action
-            # silently falls back to a host build where before-script runs
-            # non-root and apt-get fails — do not use it here.)
-            manylinux: "2_34"
+            # manylinux_2_28 (AlmaLinux 8, glibc 2.28) is the ceiling for
+            # ORNL's RHEL 8 analysis fleet — scripts/check_wheel_policy.sh
+            # is the single source of truth; do not raise this without an
+            # ORNL fleet decision.  Feasible because the GUI no longer
+            # links GTK on Linux: rfd's retired gtk3 backend pinned
+            # gtk-sys's v3_24 feature (gtk+-3.0 >= 3.24 at build time),
+            # which broke the v0.2.0 build on this image and pushed
+            # 0.2.1 to manylinux_2_34 — uninstallable on glibc 2.28 and
+            # carrying a vendored 64-library GTK stack.  The portal
+            # backend + in-app fallback need no build-time system libs.
+            # (manylinux_2_31 is NOT in maturin-action's container map —
+            # it silently falls back to a host build; never use it.)
+            manylinux: "2_28"
           - os: macos-latest
             target: aarch64-apple-darwin
 
@@ -126,11 +135,16 @@ jobs:
           target: ${{ matrix.target }}
           manylinux: ${{ matrix.manylinux || 'auto' }}
           args: --release --out dist --find-interpreter
-          # manylinux_2_34 is AlmaLinux 9 (dnf/yum), running as root in the
-          # container.  gtk3-devel provides gtk+-3.0.pc (GTK 3.24) for gtk-sys;
-          # cmake (3.26, appstream) is needed by C build deps in the tree.
+          # AlmaLinux 8 container, running as root.  cmake is needed only
+          # by hdf5-metno-src's static HDF5 build (cmake3 on EL8); the
+          # dialog stack needs no build-time system libraries at all.
           before-script-linux: |
-            yum install -y gtk3-devel cmake
+            yum install -y cmake3 || yum install -y cmake
+            ln -sf /usr/bin/cmake3 /usr/bin/cmake || true
+
+      - name: Enforce wheel policy (ORNL manylinux_2_28 ceiling)
+        if: runner.os == 'Linux'
+        run: ./scripts/check_wheel_policy.sh apps/gui/dist/*.whl
 
       # maturin working-directory puts output in apps/gui/dist
       - name: Upload GUI wheel

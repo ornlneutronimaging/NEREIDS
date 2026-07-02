@@ -53,9 +53,6 @@ jobs:
 
       - uses: Swatinem/rust-cache@e18b497796c12c097a38f9edb9d0641fb99eee32 # v2
 
-      - name: Install GTK 3 development headers (rfd backend)
-        run: sudo apt-get update -qq && sudo apt-get install -y libgtk-3-dev
-
       - name: Install pixi
         uses: prefix-dev/setup-pixi@a0af7a228712d6121d37aba47adf55c1332c9c2e # v0.9.4
         with:

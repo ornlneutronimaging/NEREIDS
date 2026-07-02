@@ -1,0 +1,58 @@
+# Wheel-policy gate: build the Linux GUI wheel in the SAME manylinux_2_28
+# container the release uses, then enforce scripts/check_wheel_policy.sh
+# (the ORNL RHEL 8 / glibc 2.28 ceiling) — at PR time, not at tag time.
+#
+# Exists because build-gui/publish jobs only run on tags: the 0.2.0
+# release was the first time anyone discovered the GUI no longer built
+# on the 2_28 image (rfd gtk3 backend), which yanked the release and
+# pushed 0.2.1 to manylinux_2_34 — uninstallable on the ORNL fleet.
+# This gate makes that class of breakage a PR failure instead.
+name: Wheel policy
+
+on:
+  pull_request:
+    paths:
+      - 'apps/gui/**'
+      - 'crates/**'
+      - 'Cargo.toml'
+      - 'Cargo.lock'
+      - 'pyproject.toml'
+      - '.github/workflows/publish.yml'
+      - '.github/workflows/wheel-policy.yml'
+      - 'scripts/check_wheel_policy.sh'
+
+permissions:
+  contents: read
+
+jobs:
+  gui-linux-wheel:
+    name: GUI wheel builds on manylinux_2_28
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      # Same action SHA, container selection, and before-script as
+      # publish.yml's build-gui job — the gate must reproduce the
+      # release environment exactly. --find-interpreter is omitted:
+      # bin bindings produce a single py3-none wheel.
+      - name: Build GUI wheel (manylinux_2_28 container)
+        uses: PyO3/maturin-action@e83996d129638aa358a18fbd1dfb82f0b0fb5d3b # v1
+        with:
+          working-directory: apps/gui
+          target: x86_64-unknown-linux-gnu
+          manylinux: "2_28"
+          args: --release --out dist
+          sccache: true
+          before-script-linux: |
+            yum install -y cmake3 || yum install -y cmake
+            ln -sf /usr/bin/cmake3 /usr/bin/cmake || true
+
+      - name: Enforce wheel policy
+        run: ./scripts/check_wheel_policy.sh apps/gui/dist/*.whl
+
+      - name: Upload wheel for inspection
+        uses: actions/upload-artifact@v4
+        with:
+          name: gui-wheel-manylinux-2-28-pr
+          path: apps/gui/dist/*.whl
+          retention-days: 7
