@@ -404,6 +404,21 @@ pub struct UnifiedFitConfig {
     /// Number of density parameters (groups or isotopes).
     /// `None` = `resonance_data.len()` (backward compat).
     n_density_params: Option<usize>,
+
+    /// Per-density-parameter free/fixed mask (issue #633).
+    ///
+    /// `None` = every density is free (default; preserves the historic
+    /// behaviour bit-for-bit). `Some(mask)` with `mask[i] == false`
+    /// freezes density parameter `i` at its initial value — the standard
+    /// resonance-thermometry workflow, where the areal density is known
+    /// from a calibration foil and only temperature (and/or the energy
+    /// scale / baseline) is fitted. Length equals `n_density_params()`.
+    ///
+    /// A frozen density still occupies its slot in the parameter vector
+    /// (built as [`FitParameter::fixed`]), so result-extraction index
+    /// math is unchanged; the solver simply never gives it a Jacobian
+    /// column and holds it at the initial value.
+    density_free: Option<Vec<bool>>,
 }
 
 impl UnifiedFitConfig {
@@ -466,6 +481,7 @@ impl UnifiedFitConfig {
             density_indices: None,
             density_ratios: None,
             n_density_params: None,
+            density_free: None,
             tzero_jacobian_method: None,
             fit_energy_range: None,
         })
@@ -830,6 +846,65 @@ impl UnifiedFitConfig {
     /// Number of density parameters (one per group or per isotope).
     pub fn n_density_params(&self) -> usize {
         self.n_density_params.unwrap_or(self.resonance_data.len())
+    }
+
+    /// Freeze (or unfreeze) **all** density parameters at their initial
+    /// values (issue #633). The standard resonance-thermometry recipe:
+    /// the areal density is known from a calibration foil, so only
+    /// temperature (and/or the energy scale / baseline) is fitted.
+    ///
+    /// `with_fix_densities(true)` sets an all-fixed mask;
+    /// `with_fix_densities(false)` clears any mask back to all-free.
+    /// Applies to every fitter and to `spatial_map_typed`.
+    #[must_use]
+    pub fn with_fix_densities(mut self, fix: bool) -> Self {
+        self.density_free = if fix {
+            Some(vec![false; self.n_density_params()])
+        } else {
+            None
+        };
+        self
+    }
+
+    /// Per-density free/fixed mask (SAMMY-style selective freezing):
+    /// `free[i] == false` freezes density parameter `i` at its initial
+    /// value. Length must equal [`Self::n_density_params`].
+    ///
+    /// # Errors
+    /// [`FitConfigError::DensityCountMismatch`] if `free.len()` differs
+    /// from the density-parameter count.
+    pub fn with_density_free(mut self, free: Vec<bool>) -> Result<Self, FitConfigError> {
+        let n = self.n_density_params();
+        if free.len() != n {
+            return Err(FitConfigError::DensityCountMismatch {
+                densities: free.len(),
+                isotopes: n,
+            });
+        }
+        // All-free is represented as `None` so the historic path stays
+        // byte-identical (no behavioural change when nothing is frozen).
+        self.density_free = if free.iter().all(|&f| f) {
+            None
+        } else {
+            Some(free)
+        };
+        Ok(self)
+    }
+
+    /// Whether density parameter `i` is frozen. `false` (free) unless an
+    /// explicit mask marks it fixed.
+    fn density_is_fixed(&self, i: usize) -> bool {
+        self.density_free
+            .as_ref()
+            .is_some_and(|mask| !mask.get(i).copied().unwrap_or(true))
+    }
+
+    /// Count of density parameters that are free (not frozen). Equals
+    /// [`Self::n_density_params`] when no mask is set.
+    fn n_free_density_params(&self) -> usize {
+        (0..self.n_density_params())
+            .filter(|&i| !self.density_is_fixed(i))
+            .count()
     }
 
     /// Resolve `SolverConfig::Auto` into a concrete solver for the given input.
@@ -1623,14 +1698,20 @@ fn build_density_params(config: &UnifiedFitConfig) -> Vec<FitParameter> {
         .iter()
         .enumerate()
         .map(|(i, &d)| {
-            FitParameter::non_negative(
-                config
-                    .isotope_names
-                    .get(i)
-                    .cloned()
-                    .unwrap_or_else(|| format!("isotope_{i}")),
-                d,
-            )
+            let name = config
+                .isotope_names
+                .get(i)
+                .cloned()
+                .unwrap_or_else(|| format!("isotope_{i}"));
+            // Frozen densities (issue #633) still occupy their slot as a
+            // `fixed` parameter — held at the initial value, no Jacobian
+            // column — so downstream index-based result extraction is
+            // unaffected.
+            if config.density_is_fixed(i) {
+                FitParameter::fixed(name, d)
+            } else {
+                FitParameter::non_negative(name, d)
+            }
         })
         .collect()
 }
@@ -2078,7 +2159,10 @@ pub(crate) fn validate_precomputed_cross_sections(
 /// `CountsBackgroundConfig` are *not* counted: the joint-Poisson
 /// dispatch rejects them up-front and the LM path never wires them.
 pub(crate) fn count_free_params(config: &UnifiedFitConfig) -> usize {
-    let mut n_free = config.n_density_params();
+    // Frozen densities (issue #633) hold a fixed parameter slot but get
+    // no Jacobian column, so they must not count toward the free-DoF
+    // total the underdetermined-system guard checks against.
+    let mut n_free = config.n_free_density_params();
     if config.fit_temperature {
         n_free += 1;
     }
@@ -5478,6 +5562,146 @@ mod tests {
             )
             .is_none(),
             "an out-of-bounds calibration fit must be rejected (cold-start fallback)"
+        );
+    }
+
+    // ── Issue #633: per-parameter density freeze ──
+
+    /// `count_free_params` must drop frozen densities: a fixed density
+    /// holds a parameter slot but gets no Jacobian column, so the
+    /// underdetermined-system guard must not count it.
+    #[test]
+    fn test_count_free_params_drops_fixed_densities() {
+        let data = u238_single_resonance();
+        let energies: Vec<f64> = (0..51).map(|i| 1.0 + (i as f64) * 0.1).collect();
+        let base = UnifiedFitConfig::new(
+            energies,
+            vec![data.clone(), data],
+            vec!["a".into(), "b".into()],
+            300.0,
+            None,
+            vec![0.001, 0.001],
+        )
+        .unwrap()
+        .with_fit_temperature(true);
+
+        // 2 densities + temperature = 3 free.
+        assert_eq!(count_free_params(&base), 3);
+        // Freeze all densities → only temperature is free.
+        assert_eq!(count_free_params(&base.clone().with_fix_densities(true)), 1);
+        // Freeze one of two densities → 1 density + temperature = 2 free.
+        let one_fixed = base.with_density_free(vec![false, true]).unwrap();
+        assert_eq!(count_free_params(&one_fixed), 2);
+    }
+
+    /// `with_density_free` validates the mask length and normalises an
+    /// all-free mask back to the historic `None` (no behavioural change).
+    #[test]
+    fn test_with_density_free_validates_and_normalises() {
+        let data = u238_single_resonance();
+        let energies: Vec<f64> = (0..51).map(|i| 1.0 + (i as f64) * 0.1).collect();
+        let cfg = UnifiedFitConfig::new(
+            energies,
+            vec![data],
+            vec!["a".into()],
+            300.0,
+            None,
+            vec![0.001],
+        )
+        .unwrap();
+        // Wrong length is rejected.
+        assert!(matches!(
+            cfg.clone().with_density_free(vec![true, false]),
+            Err(FitConfigError::DensityCountMismatch { .. })
+        ));
+        // All-free mask leaves every density free (same as no mask).
+        let all_free = cfg.with_density_free(vec![true]).unwrap();
+        assert_eq!(all_free.n_free_density_params(), 1);
+        assert!(!all_free.density_is_fixed(0));
+    }
+
+    /// Closed-loop (issue #633 acceptance): synthetic spectrum at a known
+    /// (n, T); freeze n at truth and fit temperature only. Temperature is
+    /// recovered and the frozen density is held EXACTLY at its initial
+    /// value (no Jacobian column).
+    #[test]
+    fn test_fix_densities_recovers_temperature_holds_density() {
+        let data = u238_single_resonance();
+        let true_density = 0.0005;
+        let true_temp = 350.0;
+        let energies: Vec<f64> = (0..201).map(|i| 1.0 + (i as f64) * 0.05).collect();
+        let (t, sigma) = synthetic_transmission_at_temp(&data, true_density, true_temp, &energies);
+
+        let config = UnifiedFitConfig::new(
+            energies,
+            vec![data],
+            vec!["U-238".into()],
+            300.0, // temperature initial guess (off by 50 K)
+            None,
+            vec![true_density], // density initial = truth, and frozen below
+        )
+        .unwrap()
+        .with_solver(SolverConfig::LevenbergMarquardt(Default::default()))
+        .with_fit_temperature(true)
+        .with_fix_densities(true);
+
+        let input = InputData::Transmission {
+            transmission: t,
+            uncertainty: sigma,
+        };
+        let result = fit_spectrum_typed(&input, &config).unwrap();
+        assert!(result.converged, "T-only fit should converge");
+
+        // Frozen density is held bit-exactly at its initial value.
+        assert_eq!(
+            result.densities[0], true_density,
+            "frozen density must not move"
+        );
+        // Temperature (the sole free parameter) is recovered.
+        let fitted_temp = result
+            .temperature_k
+            .expect("temperature_k should be Some when fit_temperature=true");
+        assert!(
+            (fitted_temp - true_temp).abs() < 1.0,
+            "temperature: fitted={fitted_temp}, true={true_temp}"
+        );
+    }
+
+    /// Closed-loop (issue #633 acceptance): freezing n at 0.9× truth must
+    /// produce a converged, finite (biased) temperature — a documented
+    /// bias, never silent NaN/nonsense.
+    #[test]
+    fn test_fix_densities_biased_density_gives_finite_documented_bias() {
+        let data = u238_single_resonance();
+        let true_density = 0.0005;
+        let true_temp = 350.0;
+        let energies: Vec<f64> = (0..201).map(|i| 1.0 + (i as f64) * 0.05).collect();
+        let (t, sigma) = synthetic_transmission_at_temp(&data, true_density, true_temp, &energies);
+
+        let config = UnifiedFitConfig::new(
+            energies,
+            vec![data],
+            vec!["U-238".into()],
+            300.0,
+            None,
+            vec![0.9 * true_density], // frozen 10% low
+        )
+        .unwrap()
+        .with_solver(SolverConfig::LevenbergMarquardt(Default::default()))
+        .with_fit_temperature(true)
+        .with_fix_densities(true);
+
+        let input = InputData::Transmission {
+            transmission: t,
+            uncertainty: sigma,
+        };
+        let result = fit_spectrum_typed(&input, &config).unwrap();
+        let fitted_temp = result.temperature_k.expect("temperature_k should be Some");
+        // Frozen density unchanged; temperature finite (biased, not NaN).
+        assert_eq!(result.densities[0], 0.9 * true_density);
+        assert!(
+            fitted_temp.is_finite() && fitted_temp > 1.0,
+            "biased-density fit must yield a finite temperature, got {fitted_temp}"
         );
     }
 }

@@ -7,6 +7,23 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
 
 ## [Unreleased]
 
+### Added
+
+- **Per-parameter density freeze in every fitter** (#633): area
+  densities can now be held fixed while other parameters (temperature,
+  energy scale, background) are fit. `UnifiedFitConfig` gains
+  `with_fix_densities(bool)` (freeze all densities) and
+  `with_density_free(Vec<bool>)` (per-isotope mask; `false` freezes
+  isotope *i* at its initial value, length must equal the isotope
+  count). The Python fitters `fit_spectrum_typed`,
+  `fit_counts_spectrum_typed`, and `spatial_map_typed` expose the same
+  control via the new `fix_densities: bool = False` and
+  `density_free: list[bool] | None = None` keyword arguments (mutually
+  exclusive — supplying both is an error). Frozen densities no longer
+  consume a free parameter, so reported degrees of freedom and reduced
+  χ² reflect only the parameters actually varied. This enables
+  temperature-only thermometry fits against a known sample density.
+
 ## [0.2.2] - 2026-07-03
 
 ### Fixed

@@ -2118,6 +2118,93 @@ class TestFitEnergyRangeBindingParameter:
         )
 
 
+class TestFixDensities:
+    """Issue #633: freeze known densities (calibration-foil thermometry)."""
+
+    def test_fix_densities_holds_density_and_recovers_temperature(self, u238_data):
+        """Synthetic spectrum at a known (n, T); freeze n at truth and fit
+        temperature only. The frozen density is held EXACTLY at its initial
+        value and the temperature is recovered."""
+        energies = np.linspace(1.0, 30.0, 400)
+        true_density = 8.0e-4
+        true_temp = 350.0
+        t = np.asarray(
+            nereids.forward_model(
+                energies, [(u238_data, true_density)], temperature_k=true_temp
+            )
+        )
+        sigma = np.full_like(t, 0.005)
+
+        r = nereids.fit_spectrum_typed(
+            transmission=t,
+            uncertainty=sigma,
+            energies=energies,
+            isotopes=[(u238_data, true_density)],
+            solver="lm",
+            temperature_k=300.0,  # seeded 50 K off
+            fit_temperature=True,
+            fix_densities=True,
+            max_iter=200,
+        )
+        assert bool(r.converged) is True
+        # Frozen density held bit-exactly at its initial value.
+        assert r.densities[0] == true_density
+        # Temperature (the sole free parameter) recovered.
+        assert r.temperature_k is not None
+        assert abs(r.temperature_k - true_temp) < 2.0, (
+            f"temperature not recovered: got {r.temperature_k}, want {true_temp}"
+        )
+
+    def test_density_free_mask_freezes_selected_density(self, u238_data):
+        """A per-density `density_free` mask freezes only the marked
+        densities; the free one is still fitted."""
+        energies = np.linspace(1.0, 30.0, 400)
+        t = np.asarray(nereids.forward_model(energies, [(u238_data, 8.0e-4)]))
+        sigma = np.full_like(t, 0.005)
+        r = nereids.fit_spectrum_typed(
+            transmission=t,
+            uncertainty=sigma,
+            energies=energies,
+            isotopes=[(u238_data, 5.0e-4)],  # seeded off; frozen here
+            solver="lm",
+            temperature_k=293.6,
+            density_free=[False],  # freeze the single density
+            max_iter=100,
+        )
+        assert bool(r.converged) is True
+        # Frozen at the seed, not driven toward the 8e-4 truth.
+        assert r.densities[0] == 5.0e-4
+
+    def test_fix_densities_and_density_free_are_mutually_exclusive(self, u238_data):
+        """Supplying both `fix_densities` and `density_free` is rejected."""
+        energies = np.linspace(1.0, 30.0, 100)
+        t = np.full_like(energies, 0.95)
+        sigma = np.full_like(energies, 0.01)
+        with pytest.raises(ValueError, match="not both"):
+            nereids.fit_spectrum_typed(
+                transmission=t,
+                uncertainty=sigma,
+                energies=energies,
+                isotopes=[(u238_data, 0.001)],
+                fix_densities=True,
+                density_free=[True],
+            )
+
+    def test_density_free_wrong_length_rejected(self, u238_data):
+        """A `density_free` mask of the wrong length is rejected."""
+        energies = np.linspace(1.0, 30.0, 100)
+        t = np.full_like(energies, 0.95)
+        sigma = np.full_like(energies, 0.01)
+        with pytest.raises(ValueError):
+            nereids.fit_spectrum_typed(
+                transmission=t,
+                uncertainty=sigma,
+                energies=energies,
+                isotopes=[(u238_data, 0.001)],
+                density_free=[True, False],  # 2 masks for 1 density
+            )
+
+
 # ===========================================================================
 # fit_energy_scale recovery (#531 — single-spectrum LM, SAMMY TZERO)
 # ===========================================================================

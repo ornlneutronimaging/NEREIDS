@@ -3568,6 +3568,8 @@ fn spatial_result_to_py(
     temperature_k = 293.6,
     fit_temperature = false,
     initial_densities = None,
+    fix_densities = false,
+    density_free = None,
     dead_pixels = None,
     max_iter = 200,
     solver = "auto",
@@ -3603,6 +3605,8 @@ fn py_spatial_map_typed<'py>(
     temperature_k: f64,
     fit_temperature: bool,
     initial_densities: Option<Vec<f64>>,
+    fix_densities: bool,
+    density_free: Option<Vec<bool>>,
     dead_pixels: Option<PyReadonlyArray2<'py, bool>>,
     max_iter: usize,
     solver: &str,
@@ -3869,6 +3873,10 @@ fn py_spatial_map_typed<'py>(
         .with_fit_energy_range(fit_energy_range)
         .map_err(|e| pyo3::exceptions::PyValueError::new_err(e.to_string()))?;
 
+    // Issue #633: freeze known densities across every pixel — per-pixel
+    // T-only (or T + energy-scale) fits with a calibration-foil density.
+    config = apply_density_freeze(config, fix_densities, density_free)?;
+
     // GIL held during computation.  InputData3D borrows PyInputData arrays
     // which are not Send, so we cannot use py.allow_threads().  The existing
     // py_spatial_map has the same limitation.  Rayon still parallelizes the
@@ -3961,6 +3969,8 @@ fn py_spatial_map_typed<'py>(
     delta_l_m = None,
     groups = None,
     initial_densities = None,
+    fix_densities = false,
+    density_free = None,
     enable_polish = None,
     tzero_jacobian = None,
     fit_energy_range = None,
@@ -3996,6 +4006,8 @@ fn py_fit_counts_spectrum_typed<'py>(
     delta_l_m: Option<f64>,
     groups: Option<Vec<PyIsotopeGroup>>,
     initial_densities: Option<Vec<f64>>,
+    fix_densities: bool,
+    density_free: Option<Vec<bool>>,
     enable_polish: Option<bool>,
     tzero_jacobian: Option<&str>,
     fit_energy_range: Option<(f64, f64)>,
@@ -4197,6 +4209,9 @@ fn py_fit_counts_spectrum_typed<'py>(
     config = config
         .with_fit_energy_range(fit_energy_range)
         .map_err(|e| pyo3::exceptions::PyValueError::new_err(e.to_string()))?;
+
+    // Issue #633: freeze known densities (calibration-foil thermometry).
+    config = apply_density_freeze(config, fix_densities, density_free)?;
 
     let result = py.detach(move || fit_spectrum_typed(&input, &config).map_err(|e| e.to_string()));
     let result = result.map_err(|e| pyo3::exceptions::PyRuntimeError::new_err(e))?;
@@ -4479,6 +4494,31 @@ fn py_compute_model_jacobian<'py>(
     })
 }
 
+/// Apply the issue-#633 density freeze to a config: an explicit
+/// per-density `density_free` mask takes precedence; otherwise
+/// `fix_densities=true` freezes all densities. `density_free` and
+/// `fix_densities` are mutually exclusive — supplying both is an error
+/// (the mask is unambiguous, the bool would be redundant or conflicting).
+fn apply_density_freeze(
+    config: nereids_pipeline::pipeline::UnifiedFitConfig,
+    fix_densities: bool,
+    density_free: Option<Vec<bool>>,
+) -> PyResult<nereids_pipeline::pipeline::UnifiedFitConfig> {
+    match density_free {
+        Some(free) => {
+            if fix_densities {
+                return Err(pyo3::exceptions::PyValueError::new_err(
+                    "Provide either 'fix_densities' or 'density_free', not both.",
+                ));
+            }
+            config
+                .with_density_free(free)
+                .map_err(|e| pyo3::exceptions::PyValueError::new_err(e.to_string()))
+        }
+        None => Ok(config.with_fix_densities(fix_densities)),
+    }
+}
+
 /// Fit a single pre-normalized transmission spectrum.
 ///
 /// This function accepts **transmission** data only (T = sample/open-beam).
@@ -4524,6 +4564,8 @@ fn py_compute_model_jacobian<'py>(
     delta_l_m = None,
     groups = None,
     initial_densities = None,
+    fix_densities = false,
+    density_free = None,
     tzero_jacobian = None,
     fit_energy_range = None,
 ))]
@@ -4552,6 +4594,8 @@ fn py_fit_spectrum_typed<'py>(
     delta_l_m: Option<f64>,
     groups: Option<Vec<PyIsotopeGroup>>,
     initial_densities: Option<Vec<f64>>,
+    fix_densities: bool,
+    density_free: Option<Vec<bool>>,
     tzero_jacobian: Option<&str>,
     fit_energy_range: Option<(f64, f64)>,
 ) -> PyResult<PyFitResult> {
@@ -4698,6 +4742,9 @@ fn py_fit_spectrum_typed<'py>(
     config = config
         .with_fit_energy_range(fit_energy_range)
         .map_err(|e| pyo3::exceptions::PyValueError::new_err(e.to_string()))?;
+
+    // Issue #633: freeze known densities (calibration-foil thermometry).
+    config = apply_density_freeze(config, fix_densities, density_free)?;
 
     // Build 1D InputData
     let input = InputData::Transmission {
