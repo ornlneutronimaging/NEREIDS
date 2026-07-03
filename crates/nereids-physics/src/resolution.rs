@@ -1071,8 +1071,18 @@ impl TabulatedResolution {
                 let (off_hi, w_hi) = &self.kernels[idx];
                 let (_, s_lo) = trapezoidal_moments(off_lo, w_lo);
                 let (_, s_hi) = trapezoidal_moments(off_hi, w_hi);
-                if !(s_lo.is_finite() && s_lo > 0.0 && s_hi.is_finite() && s_hi > 0.0) {
-                    // Degenerate blocks take `interpolated_kernel`'s
+                let e_lo = self.ref_energies[idx - 1];
+                let e_hi = self.ref_energies[idx];
+                let frac = (e_ev.ln() - e_lo.ln()) / (e_hi.ln() - e_lo.ln());
+                if !(s_lo.is_finite()
+                    && s_lo > 0.0
+                    && s_hi.is_finite()
+                    && s_hi > 0.0
+                    && frac.is_finite())
+                {
+                    // Degenerate blocks — and a non-finite fraction
+                    // (defense-in-depth; constructors enforce positive
+                    // reference energies) — take `interpolated_kernel`'s
                     // nearest-clone fallback; bounding BOTH blocks
                     // bounds either clone.
                     visit(idx - 1, &mut max_dt_pos, &mut max_dt_neg);
@@ -1088,9 +1098,6 @@ impl TabulatedResolution {
                     // interpolated shape is positive on that fringe,
                     // and a merged point from the other block can land
                     // there with positive blended weight.
-                    let e_lo = self.ref_energies[idx - 1];
-                    let e_hi = self.ref_energies[idx];
-                    let frac = (e_ev.ln() - e_lo.ln()) / (e_hi.ln() - e_lo.ln());
                     let s_t = s_lo * (s_hi / s_lo).powf(frac);
                     let closure_extents = |offs: &[f64], ws: &[f64]| -> (f64, f64) {
                         let n_k = offs.len();
@@ -1751,13 +1758,19 @@ impl TabulatedResolution {
             ));
         }
 
-        // Validate finite, strictly ascending reference energies.  The
-        // finiteness check must come first: NaN compares false against
-        // everything, so a NaN energy would slip through the ascending
-        // check below and then poison the bracketing binary search.
-        if let Some(bad) = ref_energies.iter().find(|e| !e.is_finite()) {
+        // Validate finite, POSITIVE, strictly ascending reference
+        // energies.  The finiteness check must come first: NaN compares
+        // false against everything, so a NaN energy would slip through
+        // the ascending check below and then poison the bracketing
+        // binary search.  Positivity is load-bearing twice over: the
+        // TOF map t = TOF_FACTOR·L/√E needs E > 0, and the
+        // between-reference width interpolation takes ln(E_ref) — a
+        // non-positive reference would turn every blended weight into
+        // NaN, which bypasses the broadener's norm guard and silently
+        // disables broadening (NaN comparisons are false).
+        if let Some(bad) = ref_energies.iter().find(|e| !(e.is_finite() && **e > 0.0)) {
             return Err(ResolutionParseError::InvalidFormat(format!(
-                "Reference energies must be finite, got {bad}"
+                "Reference energies must be finite and positive, got {bad}"
             )));
         }
         for i in 1..ref_energies.len() {
@@ -1849,10 +1862,14 @@ impl TabulatedResolution {
         }
         // Finiteness first: NaN compares false against everything, so a
         // NaN energy would slip through the ascending check below and
-        // then poison the bracketing binary search.
-        if let Some(bad) = ref_energies.iter().find(|e| !e.is_finite()) {
+        // then poison the bracketing binary search.  Positivity is
+        // load-bearing twice over: the TOF map needs E > 0, and the
+        // between-reference width interpolation takes ln(E_ref) — a
+        // non-positive reference would turn every blended weight into
+        // NaN and silently disable broadening.
+        if let Some(bad) = ref_energies.iter().find(|e| !(e.is_finite() && **e > 0.0)) {
             return Err(ResolutionParseError::InvalidFormat(format!(
-                "Reference energies must be finite, got {bad}"
+                "Reference energies must be finite and positive, got {bad}"
             )));
         }
         for i in 1..ref_energies.len() {
@@ -2331,10 +2348,14 @@ impl TabulatedResolution {
     /// ## INTENTIONAL DEPARTURE from SAMMY
     ///
     /// SAMMY's user-defined resolution blends both the amplitude and
-    /// the time-point arrays element-wise, **linear in E**
-    /// (sammy/src/udr/mudr3.f90 lines 92–112: `UdR_E(J) =
-    /// a·UdR(J,I−1) + b·UdR(J,I)` and likewise `UdT_E(J)`), i.e. the
-    /// arithmetic width chord. Because the physical width law
+    /// the time-point arrays element-wise, **linear in E**: in the
+    /// active `Gen_Udr_Par` (sammy/src/udr/mudr3.f90, subroutine at
+    /// line 164; blend block at lines 241–255: `UdR_E(J,Nud) =
+    /// UdR(J,I−1,Nud)·a + UdR(J,I,Nud)·b` and likewise `UdT_E`), i.e.
+    /// the arithmetic width chord. (The file's first routine
+    /// `Gen_Udr_Par_x` holds the same blend at lines 92–112 but is
+    /// marked "never called" at line 10 — cite the live twin.)
+    /// Because the physical width law
     /// `σ_t ∝ ~E^{−1/2}` is convex, that chord systematically
     /// over-widens every between-reference energy: +7.8 % at the
     /// midpoint of synthetic 10/50 eV Gaussian blocks, +4.1…+7.2 %
@@ -2342,8 +2363,9 @@ impl TabulatedResolution {
     /// resolution-width systematic that biases fitted temperatures
     /// low. The geometric-width shape blend above removes it (and the
     /// nearest-reference width sawtooth that unequal point counts used
-    /// to produce). SAMMY additionally re-centers the blended kernel
-    /// on its trapezoidal centroid `Ct` (mudr3.f90 lines 114–140);
+    /// to produce). SAMMY additionally re-aligns the blended kernel so
+    /// its trapezoidal centroid `Ct` sits at T = 0 ("Realign so that
+    /// centroid is at T=0", mudr3.f90 lines 266–292);
     /// NEREIDS keeps kernels mode-anchored instead (deliberately
     /// unchanged here — the anchoring question is tracked separately).
     ///
@@ -2366,6 +2388,21 @@ impl TabulatedResolution {
             "ref_energies must be strictly ascending (invariant broken)"
         );
         let n_ref = self.ref_energies.len();
+
+        // NaN target energies never reach here through the validated
+        // public paths (a NaN in a multi-point grid fails the sorted
+        // check), but every comparison below is false for NaN, and the
+        // width-scaled merge would then emit NaN offsets — violating
+        // the strictly-ascending, all-finite invariants the broadener
+        // assumes. Clamp to the lowest reference so the output kernel
+        // is well-formed unconditionally (the old element-wise blend
+        // degraded to its nearest-reference fallback here by accident
+        // of its monotonicity guard; this keeps that graceful
+        // behaviour explicit). +∞ needs no guard: the high clamp
+        // below already catches it.
+        if energy.is_nan() {
+            return self.kernels[0].clone();
+        }
 
         // Clamp to nearest reference if outside range
         if energy <= self.ref_energies[0] || n_ref == 1 {
@@ -2410,7 +2447,12 @@ impl TabulatedResolution {
 
         let (_, s_lo) = trapezoidal_moments(off_lo, w_lo);
         let (_, s_hi) = trapezoidal_moments(off_hi, w_hi);
-        if !(s_lo.is_finite() && s_lo > 0.0 && s_hi.is_finite() && s_hi > 0.0) {
+        // Degenerate blocks (σ ≤ 0) cannot be width-scaled, and a
+        // non-finite fraction (constructors enforce positive reference
+        // energies, so defense-in-depth only) would poison every
+        // blended weight with NaN — both take the nearest-clone
+        // fallback so the output is well-formed unconditionally.
+        if !(s_lo.is_finite() && s_lo > 0.0 && s_hi.is_finite() && s_hi > 0.0 && frac.is_finite()) {
             return nearest();
         }
 
@@ -3203,12 +3245,61 @@ NaN 0.0
         );
     }
 
+    /// Non-positive reference energies must be rejected by BOTH
+    /// constructors: the TOF map needs E > 0, and the width
+    /// interpolation takes ln(E_ref) — a zero/negative reference would
+    /// turn every blended weight into NaN, which bypasses the
+    /// broadener's norm guard and silently disables broadening (a
+    /// stray `0.0 0.0` line after a blank line in a VENUS/FTS file
+    /// parses as an energy-block header).
+    #[test]
+    fn constructors_reject_non_positive_reference_energies() {
+        let zero_energy = "\
+Resolution file
+---------------
+0.0 0.0
+-1.0 0.1
+0.0 1.0
+1.0 0.5
+
+10.0 0.0
+-1.0 0.1
+0.0 1.0
+1.0 0.5
+";
+        let err = TabulatedResolution::from_text(zero_energy, 25.0);
+        let Err(ResolutionParseError::InvalidFormat(msg)) = err else {
+            panic!("zero reference energy must be rejected, got {err:?}");
+        };
+        assert!(
+            msg.contains("positive"),
+            "error must name the positivity requirement: {msg}"
+        );
+
+        let err = TabulatedResolution::from_kernels(
+            vec![-10.0, 10.0],
+            vec![
+                (vec![-1.0, 0.0, 1.0], vec![0.1, 1.0, 0.1]),
+                (vec![-1.0, 0.0, 1.0], vec![0.1, 1.0, 0.1]),
+            ],
+            25.0,
+        );
+        let Err(ResolutionParseError::InvalidFormat(msg)) = err else {
+            panic!("negative reference energy must be rejected, got {err:?}");
+        };
+        assert!(
+            msg.contains("positive"),
+            "error must name the positivity requirement: {msg}"
+        );
+    }
+
     #[test]
     fn interpolated_kernel_blend_stays_ascending_and_mode_anchored() {
-        // Two equal-length, mode-anchored kernels at bracketing energies (the
-        // element-wise blend path, common for IC). The blend must be strictly
-        // ascending (the sorted invariant the broadener relies on) and keep the
-        // mode at offset 0.
+        // Two equal-length, mode-anchored kernels at bracketing
+        // energies going through the width-normalized shape blend (the
+        // path every between-reference energy takes). The blend must be
+        // strictly ascending (the sorted invariant the broadener relies
+        // on) and keep the mode at offset 0.
         let off_lo = vec![-1.0, -0.4, 0.0, 0.6, 1.5, 3.0];
         let off_hi = vec![-0.5, -0.2, 0.0, 0.3, 0.8, 1.6]; // narrower, same length
         let wts = vec![0.1, 0.5, 1.0, 0.6, 0.3, 0.1]; // mode at index 2 (offset 0)
@@ -3240,6 +3331,15 @@ NaN 0.0
     /// grids coincide point-for-point in z, so the merge degenerates to
     /// the template shape at the target width). An interior reference
     /// energy must return that block bitwise (exact-hit arm).
+    ///
+    /// SCOPE NOTE: this measures the blend with the implementation's
+    /// own `trapezoidal_moments` and target formula, so it pins the
+    /// merge machinery against its coded target (plus the chord
+    /// separation below), not the physical width law independently —
+    /// that independent, end-to-end anchor lives in
+    /// `tests/kernel_width_interpolation.rs` and the pytest port,
+    /// which measure the APPLIED broadening of parsed kernels against
+    /// the analytic power law.
     #[test]
     fn interpolated_kernel_width_follows_power_law_for_self_similar_blocks() {
         let template_off = [-1.0, -0.4, 0.0, 0.8, 2.0, 4.0];
@@ -3324,6 +3424,24 @@ NaN 0.0
         for (a, b) in ws.iter().zip(&w) {
             assert_eq!(a.to_bits(), b.to_bits(), "identity weights must be bitwise");
         }
+    }
+
+    /// A NaN target energy (unreachable through validated public paths,
+    /// but defended anyway) must yield a well-formed reference clone —
+    /// never NaN offsets that break the broadener's invariants.
+    #[test]
+    fn interpolated_kernel_nan_energy_clamps_to_lowest_reference() {
+        let off = vec![-1.0, 0.0, 2.0];
+        let w = vec![0.3, 1.0, 0.2];
+        let tab = TabulatedResolution::from_kernels(
+            vec![10.0, 1000.0],
+            vec![(off.clone(), w.clone()), (off.clone(), w.clone())],
+            25.0,
+        )
+        .unwrap();
+        let (offs, ws) = test_support::interpolated_kernel(&tab, f64::NAN);
+        assert_eq!(offs, off);
+        assert_eq!(ws, w);
     }
 
     /// Degenerate blocks (single-point → σ = 0) cannot be width-scaled;
@@ -4990,6 +5108,55 @@ NaN 0.0
         assert!(
             upside_differs,
             "the delayed tail must reach the dip from a target below it"
+        );
+    }
+
+    /// Same containment property, exercised through the
+    /// BETWEEN-REFERENCES support arm: two width-scaled reference
+    /// blocks bracket the grid, so every target energy uses the
+    /// width-interpolated kernel and the closure-extent support bound.
+    /// The oracle is `broaden` itself — fully independent of both the
+    /// support formula and the interpolation implementation.
+    #[test]
+    fn test_tabulated_kernel_support_contains_broadener_footprint_between_refs() {
+        let r = TabulatedResolution {
+            ref_energies: vec![10.0, 1000.0],
+            kernels: vec![
+                (vec![-2.0, 0.0, 12.0], vec![0.2, 1.0, 0.7]),
+                (vec![-0.5, 0.0, 3.0], vec![0.2, 1.0, 0.7]),
+            ],
+            flight_path_m: 25.0,
+        };
+        let de = 0.05;
+        let energies: Vec<f64> = (0..2001).map(|j| 50.0 + de * j as f64).collect();
+        let f = 1000; // dip mid-grid, at ~100 eV — between the refs
+        let e_f = energies[f];
+        let mut spectrum = vec![1.0; energies.len()];
+        spectrum[f] = 0.0;
+        let out = r.broaden(&energies, &spectrum).unwrap();
+
+        let margin = 2.0 * de;
+        let (mut excluded, mut included_differs) = (0usize, false);
+        for (&e, &o) in energies.iter().zip(out.iter()) {
+            let s = r.kernel_support_ev(e);
+            if e + s + margin < e_f || e - s - margin > e_f {
+                assert!(
+                    (o - 1.0).abs() < 1e-12,
+                    "between-refs target {e} eV (support {s}) must be \
+                     untouched by a dip at {e_f} eV outside its window; got {o}"
+                );
+                excluded += 1;
+            } else if (o - 1.0).abs() > 1e-3 {
+                included_differs = true;
+            }
+        }
+        assert!(
+            excluded > 0,
+            "grid must exercise the exclusion region between references"
+        );
+        assert!(
+            included_differs,
+            "the dip must measurably alter at least one in-window target"
         );
     }
 }
