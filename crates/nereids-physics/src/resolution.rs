@@ -858,7 +858,10 @@ pub struct TabulatedResolution {
 /// The `dt` weights match the quadrature `broaden_presorted` integrates
 /// with (single point → 1.0; edges → one-sided span; interior → half
 /// the neighbour span), so these are the moments the broadener
-/// effectively applies. The centroid pass is byte-identical to the
+/// effectively applies: zero-weight entries contribute nothing
+/// (`tw = 0`, matching the broadener's `w <= 0` skip) and negative
+/// weights are rejected at construction, so the integration domains
+/// coincide exactly. The centroid pass is byte-identical to the
 /// accumulation `width_corrected` performed inline before this helper
 /// was factored out. Returns `(centroid, sigma)`; `sigma` is `0.0` for
 /// a single-point or zero-mass block — callers treat a non-positive or
@@ -917,6 +920,14 @@ impl TabulatedResolution {
     /// the kernel widens/narrows without moving its centroid — width and position
     /// stay orthogonal (`t0`/`L` handle absolute position). Weights are unchanged;
     /// the apply-time trapezoidal renormalization preserves unit area.
+    ///
+    /// Exactness note: the orthogonality is exact **at reference
+    /// energies**. Between references, `interpolated_kernel`'s
+    /// width-normalized blend re-scales each block about the mode
+    /// (offset 0), so the applied centroid picks up a second-order
+    /// dependence on the width exponent `p` (measured ~1 % of σ for
+    /// |p| ≤ 0.1 on widely spaced references) — absorbed by the
+    /// jointly fitted `t0` in calibration.
     ///
     /// The pivot is the **trapezoidal-weighted** centroid `Σ o·w·dt / Σ w·dt`,
     /// using the *same* `dt` quadrature weights as the broadening integral (see
@@ -1813,6 +1824,17 @@ impl TabulatedResolution {
                     ref_energies[i],
                 )));
             }
+            // Negative weights have no physical meaning (a resolution
+            // kernel is an emission-time density); the broadener skips
+            // w <= 0 entries, and the width machinery's trapezoidal
+            // moments must integrate over the same domain — reject at
+            // the door rather than let the two disagree.
+            if weights.iter().any(|&v| v < 0.0) {
+                return Err(ResolutionParseError::InvalidFormat(format!(
+                    "Kernel {i} (E = {} eV) contains negative weights",
+                    ref_energies[i],
+                )));
+            }
             if !offsets.windows(2).all(|w| w[0] < w[1]) {
                 return Err(ResolutionParseError::InvalidFormat(format!(
                     "Kernel {i} (E = {} eV) TOF offsets must be strictly ascending",
@@ -1906,6 +1928,14 @@ impl TabulatedResolution {
             if offsets.iter().chain(weights.iter()).any(|v| !v.is_finite()) {
                 return Err(ResolutionParseError::InvalidFormat(format!(
                     "Kernel {i} contains non-finite offset/weight values"
+                )));
+            }
+            // Negative weights have no physical meaning; the broadener
+            // skips w <= 0 entries and the trapezoidal width moments
+            // must integrate over the same domain (see `from_text`).
+            if weights.iter().any(|&v| v < 0.0) {
+                return Err(ResolutionParseError::InvalidFormat(format!(
+                    "Kernel {i} contains negative weights"
                 )));
             }
             // Offsets must be strictly ascending: `broaden_presorted`/`plan` walk a
@@ -2179,13 +2209,15 @@ impl TabulatedResolution {
         let e_min = energies[0];
         let e_max = energies[n - 1];
 
-        // Preallocate the entry Vecs to ~n × kernel_len so the inner
-        // pushes avoid repeated reallocations.  Real VENUS grids push
-        // ~n × 499 entries total; over-allocating by up to 2× (if some
-        // kernel points are skipped) is cheap vs. repeated grow-and-
-        // memcpy during plan build.
+        // Preallocate the entry Vecs to ~n × 2·kernel_len: the
+        // width-normalized shape blend merges the two bracketing
+        // blocks, so between-reference targets emit up to
+        // n_lo + n_hi points (~2× a single block; real VENUS grids
+        // push ~n × 998 entries). Over-allocating for at-reference
+        // targets is cheap vs. repeated grow-and-memcpy during the
+        // plan build.
         let estimated_kernel_len = self.kernels.first().map_or(0, |(off, _)| off.len());
-        let estimated_entries = n.saturating_mul(estimated_kernel_len);
+        let estimated_entries = n.saturating_mul(estimated_kernel_len.saturating_mul(2));
 
         let mut starts: Vec<u32> = Vec::with_capacity(n + 1);
         let mut lo_idx: Vec<u32> = Vec::with_capacity(estimated_entries);
@@ -3290,6 +3322,42 @@ Resolution file
         assert!(
             msg.contains("positive"),
             "error must name the positivity requirement: {msg}"
+        );
+    }
+
+    /// Negative kernel weights (no physical meaning; the broadener
+    /// skips them while the width moments would otherwise fold them
+    /// in) must be rejected by BOTH constructors.
+    #[test]
+    fn constructors_reject_negative_weights() {
+        let neg_weight = "\
+Resolution file
+---------------
+5.0 0.0
+-1.0 0.1
+0.0 1.0
+1.0 -0.2
+";
+        let err = TabulatedResolution::from_text(neg_weight, 25.0);
+        let Err(ResolutionParseError::InvalidFormat(msg)) = err else {
+            panic!("negative weight must be rejected, got {err:?}");
+        };
+        assert!(
+            msg.contains("negative weights"),
+            "error must name the negative-weight problem: {msg}"
+        );
+
+        let err = TabulatedResolution::from_kernels(
+            vec![10.0],
+            vec![(vec![-1.0, 0.0, 1.0], vec![-1.0, 0.2, -1.0])],
+            25.0,
+        );
+        let Err(ResolutionParseError::InvalidFormat(msg)) = err else {
+            panic!("negative weights must be rejected, got {err:?}");
+        };
+        assert!(
+            msg.contains("negative weights"),
+            "error must name the negative-weight problem: {msg}"
         );
     }
 
