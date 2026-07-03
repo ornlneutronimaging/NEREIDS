@@ -1,6 +1,6 @@
 [project]
 name = "nereids"
-version = "0.2.1"
+version = "0.2.2"
 description = "Neutron Resonance Resolved Imaging Data Analysis System — Python bindings"
 requires-python = ">= 3.10"
 license = "MIT"
@@ -37,7 +37,7 @@ Issues = "https://github.com/ornlneutronimaging/NEREIDS/issues"
 
 [project.optional-dependencies]
 mcp = ["fastmcp>=3.0"]
-gui = ["nereids-gui==0.2.1"]
+gui = ["nereids-gui==0.2.2"]
 
 [project.scripts]
 nereids-mcp = "nereids.mcp:main"
