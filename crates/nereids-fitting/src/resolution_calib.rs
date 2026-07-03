@@ -1175,9 +1175,15 @@ mod tests {
         let mkbase = || ResolutionFamily::UdrCorr {
             base: Arc::new(base.clone()),
         };
-        // Tight prior (σ=0.2 µs ≪ 1.5 µs displacement): can't reach t0, pays penalty.
+        // Tight prior: σ must be small enough that the quadratic prior
+        // curvature rivals the data-χ² curvature in t0, or the optimum
+        // sits at the displacement and the pull is invisible. The
+        // width-correct kernel interpolation sharpened the data term
+        // (narrower between-reference kernels carry more positional
+        // information than the over-wide chord blend used to), so the
+        // binding regime needs a tighter σ than it once did.
         let tight =
-            calibrate_resolution(mkbase(), &energies, &data, &unc, &sample, &mk(0.2)).unwrap();
+            calibrate_resolution(mkbase(), &energies, &data, &unc, &sample, &mk(0.005)).unwrap();
         // Loose prior (σ=100 µs): recovers the displacement, ~no penalty.
         let loose =
             calibrate_resolution(mkbase(), &energies, &data, &unc, &sample, &mk(100.0)).unwrap();
