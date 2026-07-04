@@ -9,6 +9,23 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
 
 ### Added
 
+- **`fit_energy_scale` + `fit_temperature` jointly, in every fitter**
+  (#634): the flag combination resonance thermometry needs — calibrate
+  the SAMMY energy scale (t₀, L_scale) *and* fit temperature in one
+  fit — is now supported across the LM, transmission-KL, and counts
+  joint-Poisson paths and `spatial_map_typed` (the four guards that
+  rejected it are gone). `EnergyScaleTransmissionModel` carries a fitted
+  temperature column (central finite difference, validated against the
+  analytic ∂σ/∂T column to <1e-4 relative; an independent (JᵀWJ)⁻¹
+  reconstruction reproduces the reported temperature σ to <0.1 %).
+- **`corrected_energies()` accessor** (#634): `SpectrumFitResult` (Rust)
+  and `FitResult` (Python) expose the exact energy-scale transform the
+  fit used — `corrected_energies(nominal_energies, flight_path_m)` maps
+  a nominal grid through the fitted `(t0_us, l_scale)` with the SAMMY
+  `−t0` sign convention (`dat/mdat0.f90:189`), returning `None` when the
+  energy scale was not fitted. Hand-deriving this transform (with a
+  `+t0` slip) previously caused a silent +400 K temperature bias.
+
 - **Per-parameter density freeze in every fitter** (#633): areal
   densities can now be held fixed while other parameters (temperature,
   energy scale, background) are fit. `UnifiedFitConfig` gains
@@ -26,6 +43,20 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
   uncertainties reflect only the parameters actually varied (a frozen
   density's reported 1-σ is `NaN`). This enables temperature-only
   thermometry fits against a known sample density.
+
+### Changed
+
+- **`calibrate_energy` is orders of magnitude faster** (#634): the
+  three-phase (L, t₀) grid + per-candidate golden-section density search
+  (~35 000 forward evaluations; >10 min on production windows) is
+  replaced by a multi-start descent built on the `fit_energy_scale` LM
+  path (peak-match-seeded alignment with the density frozen, exact 1-D
+  golden-section density at each alignment, joint LM polish, argmin-χ²
+  across log-spaced density starts). The public signature,
+  `CalibrationResult` fields, density band `[1e-5, 1e-2]`,
+  boundary-saturation and no-finite-χ² error contracts, and the
+  `dof = n_valid − 3` reduced-χ² convention are unchanged; all existing
+  calibration tests pass unmodified.
 
 ## [0.2.2] - 2026-07-03
 
