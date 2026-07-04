@@ -2204,6 +2204,86 @@ class TestFixDensities:
             f"got {r.temperature_k_unc}"
         )
 
+    def test_fix_densities_counts_path_holds_density_and_reports_uncertainty(
+        self, u238_data
+    ):
+        """The counts KL fitter (``fit_counts_spectrum_typed``) must also hold
+        a frozen density, report NaN for its 1-σ (no covariance column), and
+        report a finite temperature σ. Exercises the counts uncertainty loop
+        directly — the transmission tests never touch it (the CHANGELOG's
+        "every fitter" claim)."""
+        energies = np.linspace(1.0, 30.0, 300)
+        true_density = 8.0e-4
+        true_temp = 350.0
+        flux = 5000.0
+        t_1d = np.asarray(
+            nereids.forward_model(
+                energies, [(u238_data, true_density)], temperature_k=true_temp
+            )
+        )
+        rng = np.random.default_rng(20260703)
+        open_beam = np.maximum(
+            rng.poisson(np.full_like(t_1d, flux)).astype(float), 1.0
+        )
+        sample = rng.poisson(flux * t_1d).astype(float)
+        r = nereids.fit_counts_spectrum_typed(
+            sample_counts=sample,
+            open_beam_counts=open_beam,
+            energies=energies,
+            isotopes=[(u238_data, true_density)],
+            solver="kl",
+            c=1.0,
+            temperature_k=300.0,
+            fit_temperature=True,
+            fix_densities=True,
+            max_iter=200,
+        )
+        assert bool(r.converged) is True
+        assert r.densities[0] == true_density, "frozen density must not move"
+        # R1 counts-loop regression: frozen density → NaN σ, not a
+        # neighbouring free parameter's error bar.
+        assert np.isnan(float(r.uncertainties[0])), (
+            f"frozen density must report NaN σ, got {r.uncertainties[0]}"
+        )
+        assert r.temperature_k_unc is not None
+        assert np.isfinite(r.temperature_k_unc) and r.temperature_k_unc > 0.0, (
+            "counts frozen-density temperature σ must be finite positive, "
+            f"got {r.temperature_k_unc}"
+        )
+
+    def test_fix_densities_spatial_map_holds_density(self, u238_data):
+        """``spatial_map_typed`` must freeze densities per pixel: the frozen
+        density map stays bit-exactly at the (offset) seed instead of fitting
+        toward the data. Exercises the per-pixel frozen path end to end."""
+        energies = np.linspace(1.0, 30.0, 200)
+        true_density = 2.0e-3
+        ny, nx = 2, 2
+        # Cube at 350 K; the fit seeds temperature at 300 K and fits it while
+        # the density is frozen at an offset seed (≠ truth).
+        t_1d = np.asarray(
+            nereids.forward_model(
+                energies, [(u238_data, true_density)], temperature_k=350.0
+            )
+        )
+        trans = np.tile(t_1d[:, None, None], (1, ny, nx))
+        unc = np.full_like(trans, 0.005)
+        data = nereids.from_transmission(trans, unc)
+        seed = 1.0e-3  # deliberately far from the 2e-3 truth
+        result = nereids.spatial_map_typed(
+            data,
+            energies,
+            [u238_data],
+            initial_densities=[seed],
+            temperature_k=300.0,
+            fit_temperature=True,  # keep ≥1 free param so pixels converge
+            fix_densities=True,
+            max_iter=60,
+        )
+        dmap = np.asarray(result.density_maps[0])
+        assert dmap.shape == (ny, nx)
+        # Every pixel frozen at the seed, NOT driven toward true_density.
+        np.testing.assert_array_equal(dmap, seed)
+
     def test_density_free_mask_freezes_selected_density(self, u238_data):
         """A per-density `density_free` mask freezes only the marked
         densities; the free one is still fitted."""

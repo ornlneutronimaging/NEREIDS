@@ -716,11 +716,22 @@ impl UnifiedFitConfig {
     ///
     /// Replaces the existing per-isotope configuration with the expanded
     /// group mapping (flattened resonance_data + density_indices + density_ratios).
+    ///
+    /// # Errors
+    /// [`FitConfigError::DensityFreezeBeforeGroups`] if a density-freeze mask
+    /// (issue #633) was already set — grouping redefines the density
+    /// parameters, so the pre-group mask no longer applies. Configure the
+    /// freeze *after* grouping. (Erroring rather than silently clearing the
+    /// mask keeps a mis-ordered builder chain from producing an unexpectedly
+    /// unfrozen fit.)
     pub fn with_groups(
         mut self,
         groups: &[(&nereids_core::types::IsotopeGroup, &[ResonanceData])],
         initial_densities: Vec<f64>,
     ) -> Result<Self, FitConfigError> {
+        if self.density_free.is_some() {
+            return Err(FitConfigError::DensityFreezeBeforeGroups);
+        }
         if groups.is_empty() {
             return Err(FitConfigError::EmptyResonanceData);
         }
@@ -765,13 +776,10 @@ impl UnifiedFitConfig {
         self.n_density_params = Some(groups.len());
         self.density_indices = Some(all_indices);
         self.density_ratios = Some(all_ratios);
-        // A density-freeze mask set before grouping (issue #633) indexes the
-        // pre-group density layout — its length and per-index meaning no
-        // longer apply once groups redefine the density parameters. Clear it
-        // back to all-free (rather than silently keeping a stale, wrongly
-        // sized mask that would leave new group densities unfrozen). Apply
-        // `with_fix_densities` / `with_density_free` AFTER `with_groups`.
-        self.density_free = None;
+        // Note: a pre-existing density-freeze mask (issue #633) is rejected up
+        // front (see the guard at the top of this method), so by here
+        // `density_free` is always `None`. Freezing is configured after
+        // grouping, against the new group density layout.
         // Clear stale caches — the isotope set changed.
         self.precomputed_cross_sections = None;
         self.precomputed_work_cross_sections = None;
@@ -868,7 +876,8 @@ impl UnifiedFitConfig {
     /// Applies to every fitter and to `spatial_map_typed`.
     ///
     /// Call this **after** [`Self::with_groups`] — grouping redefines the
-    /// density parameters and clears any previously-set freeze mask.
+    /// density parameters, so [`Self::with_groups`] rejects a freeze mask set
+    /// before it ([`FitConfigError::DensityFreezeBeforeGroups`]).
     #[must_use]
     pub fn with_fix_densities(mut self, fix: bool) -> Self {
         self.density_free = if fix {
@@ -886,7 +895,8 @@ impl UnifiedFitConfig {
     /// fits.
     ///
     /// Call this **after** [`Self::with_groups`] — grouping redefines the
-    /// density parameters and clears any previously-set freeze mask.
+    /// density parameters, so [`Self::with_groups`] rejects a freeze mask set
+    /// before it ([`FitConfigError::DensityFreezeBeforeGroups`]).
     ///
     /// # Errors
     /// [`FitConfigError::DensityCountMismatch`] if `free.len()` differs
@@ -2992,6 +3002,11 @@ pub enum FitConfigError {
     NegativeTemperature(f64),
     /// `fit_energy_range` bounds were non-finite or reversed/empty.
     InvalidFitEnergyRange(&'static str),
+    /// A density-freeze mask (`with_fix_densities` / `with_density_free`,
+    /// issue #633) was set before [`UnifiedFitConfig::with_groups`].
+    /// Grouping redefines the density parameters, so the pre-group mask no
+    /// longer applies; configure the freeze *after* grouping.
+    DensityFreezeBeforeGroups,
 }
 
 impl fmt::Display for FitConfigError {
@@ -3037,6 +3052,11 @@ impl fmt::Display for FitConfigError {
             Self::InvalidFitEnergyRange(msg) => {
                 write!(f, "invalid fit_energy_range: {msg}")
             }
+            Self::DensityFreezeBeforeGroups => write!(
+                f,
+                "density freeze (with_fix_densities / with_density_free) must be configured \
+                 after with_groups: grouping redefines the density parameters"
+            ),
         }
     }
 }
@@ -5665,13 +5685,13 @@ mod tests {
         assert!(!all_free.density_is_fixed(0));
     }
 
-    /// `with_groups` must clear a freeze mask set before grouping — the mask
-    /// indexes the pre-group density layout and would otherwise silently
-    /// freeze the new group densities (or, with a length-matching regroup,
-    /// carry the wrong per-index meaning). Regression for the review's
-    /// stale-mask finding.
+    /// `with_groups` must REJECT a freeze mask set before grouping — the mask
+    /// indexes the pre-group density layout, and silently clearing it would
+    /// leave the new group densities unexpectedly free (a silently-wrong fit).
+    /// Regression for the review's stale-mask finding: the mis-ordered chain
+    /// errors instead of silently changing behavior in either direction.
     #[test]
-    fn test_with_groups_clears_prior_density_freeze() {
+    fn test_with_groups_rejects_prior_density_freeze() {
         use nereids_core::types::{Isotope, IsotopeGroup};
         let data = u238_single_resonance();
         let energies: Vec<f64> = (0..51).map(|i| 1.0 + (i as f64) * 0.1).collect();
@@ -5691,16 +5711,41 @@ mod tests {
         .with_fix_densities(true);
         assert!(cfg.density_is_fixed(0), "mask set before grouping");
 
-        // Regroup 1→1: length still matches, so a length check alone would
-        // not catch a stale mask — the clear must happen unconditionally.
-        let regrouped = cfg.with_groups(&[(&group, &[data])], vec![0.001]).unwrap();
-        assert_eq!(regrouped.n_density_params(), 1);
-        assert_eq!(
-            regrouped.n_free_density_params(),
-            1,
-            "grouping must clear the pre-group freeze mask (density left free)"
+        // Grouping after a freeze is rejected (freeze must follow with_groups).
+        assert!(matches!(
+            cfg.with_groups(&[(&group, &[data])], vec![0.001]),
+            Err(FitConfigError::DensityFreezeBeforeGroups)
+        ));
+    }
+
+    /// The intended order — group first, THEN freeze — succeeds and freezes
+    /// the group density parameter.
+    #[test]
+    fn test_freeze_after_groups_succeeds() {
+        use nereids_core::types::{Isotope, IsotopeGroup};
+        let data = u238_single_resonance();
+        let energies: Vec<f64> = (0..51).map(|i| 1.0 + (i as f64) * 0.1).collect();
+        let iso = Isotope::new(92, 238).unwrap();
+        let group = IsotopeGroup::custom("U-238".into(), vec![(iso, 1.0)]).unwrap();
+
+        let cfg = UnifiedFitConfig::new(
+            energies,
+            vec![data.clone()],
+            vec!["placeholder".into()],
+            300.0,
+            None,
+            vec![0.001],
+        )
+        .unwrap()
+        .with_groups(&[(&group, &[data])], vec![0.001])
+        .unwrap()
+        .with_fix_densities(true);
+        assert_eq!(cfg.n_density_params(), 1);
+        assert!(
+            cfg.density_is_fixed(0),
+            "group density frozen when freeze follows grouping"
         );
-        assert!(!regrouped.density_is_fixed(0));
+        assert_eq!(cfg.n_free_density_params(), 0);
     }
 
     /// Closed-loop (issue #633 acceptance): synthetic spectrum at a known
