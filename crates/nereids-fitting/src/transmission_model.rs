@@ -1667,7 +1667,25 @@ pub struct EnergyScaleTransmissionModel {
     /// thickness is `params[density_indices[i]] * density_ratios[i]`.
     density_ratios: Arc<Vec<f64>>,
     /// Sample temperature (K) for Doppler broadening at the corrected energies.
+    /// Used as the fixed temperature when `temperature_index` is `None`, and as
+    /// the fallback / initial value otherwise.
     temperature_k: f64,
+    /// If `Some(idx)`, `params[idx]` is the sample temperature (K) fitted as a
+    /// free parameter jointly with the energy scale (issue #634); σ is rebuilt
+    /// at that T on each evaluate. `None` ⇒ the fixed `temperature_k` is used.
+    /// Mirrors `PrecomputedTransmissionModel::temperature_index`.
+    ///
+    /// The temperature Jacobian column is computed by central finite
+    /// difference (like this model's t0 column), not by the analytic ∂σ/∂T
+    /// that the fixed-grid `PrecomputedTransmissionModel` uses. The forward σ
+    /// stays exact — FD only sets the descent direction / covariance, and it
+    /// is validated against the analytic column to `<1e-4` relative. Porting
+    /// analytic ∂σ/∂T here is a deliberate FUTURE optimization: it is
+    /// evaluated on the *corrected* grid (which moves with t0/L_scale), so it
+    /// would need a new physics helper plus a third `(t0,L_scale,T)`-keyed
+    /// derivative cache — not worth it until profiling shows the FD probes
+    /// dominate.
+    temperature_index: Option<usize>,
     /// Nominal energy grid (eV, ascending).
     nominal_energies: Vec<f64>,
     /// Flight path length in meters (used for TOF↔energy conversion).
@@ -1718,10 +1736,12 @@ pub struct EnergyScaleTransmissionModel {
     jacobian_method: EnergyScaleJacobianMethod,
 }
 
-/// Capacity-1 working-grid σ cache entry, keyed on `(t0_bits, l_scale_bits)`.
-/// Named alias to keep the field type within clippy's `type_complexity` budget
-/// (issue #608).
-type CachedWorkXs = Option<((u64, u64), Rc<transmission::WorkingGridXs>)>;
+/// Capacity-1 working-grid σ cache entry, keyed on
+/// `(t0_bits, l_scale_bits, temperature_bits)` — the temperature bits (issue
+/// #634) keep a T-only perturbation (same t0/L_scale) from incorrectly hitting
+/// a σ built at the base temperature. Named alias to keep the field type within
+/// clippy's `type_complexity` budget (issue #608).
+type CachedWorkXs = Option<((u64, u64, u64), Rc<transmission::WorkingGridXs>)>;
 
 /// One `(t0_bits, l_scale_bits)` → `ResolutionPlan` entry.  Named
 /// struct to keep the cache field type within clippy's
@@ -1895,6 +1915,9 @@ impl EnergyScaleTransmissionModel {
             density_indices,
             density_ratios,
             temperature_k,
+            // Default: temperature fixed. `with_temperature_index` opts into
+            // joint temperature fitting (issue #634).
+            temperature_index: None,
             nominal_energies,
             flight_path_m,
             tof_factor,
@@ -1913,6 +1936,25 @@ impl EnergyScaleTransmissionModel {
     pub fn with_jacobian_method(mut self, method: EnergyScaleJacobianMethod) -> Self {
         self.jacobian_method = method;
         self
+    }
+
+    /// Fit the sample temperature jointly with the energy scale (issue #634).
+    /// `Some(idx)` makes `params[idx]` the free temperature (K); `None` keeps
+    /// temperature fixed at the constructor's `temperature_k`.
+    #[must_use]
+    pub fn with_temperature_index(mut self, temperature_index: Option<usize>) -> Self {
+        self.temperature_index = temperature_index;
+        self
+    }
+
+    /// Sample temperature (K) for the current parameter vector: the fitted
+    /// `params[temperature_index]` when temperature is free, else the fixed
+    /// `temperature_k`. Mirrors `PrecomputedTransmissionModel`.
+    fn temperature_for(&self, params: &[f64]) -> f64 {
+        match self.temperature_index {
+            Some(idx) => params[idx],
+            None => self.temperature_k,
+        }
     }
 
     /// Build or reuse the broadening plan for the current `(t0, L_scale)`
@@ -2025,7 +2067,11 @@ impl EnergyScaleTransmissionModel {
     /// the only way to reproduce SAMMY's σ(E_corr) under the energy-scale shift
     /// (boundary + fine-structure fidelity).  For tabulated / no resolution the
     /// working grid is `e_corr` itself with an identity layout.
-    fn working_xs(&self, e_corr: &[f64]) -> Result<transmission::WorkingGridXs, FittingError> {
+    fn working_xs(
+        &self,
+        e_corr: &[f64],
+        temperature_k: f64,
+    ) -> Result<transmission::WorkingGridXs, FittingError> {
         // Issue #608: a degenerate calibration can drive corrected energies to
         // 0 (l_scale → 0) or non-finite (l_scale → ∞).  `reich_moore` asserts
         // positive finite energy (an always-on `assert!`), so without this guard
@@ -2050,7 +2096,7 @@ impl EnergyScaleTransmissionModel {
         transmission::broadened_cross_sections_on_working_grid(
             e_corr,
             &self.resonance_data,
-            self.temperature_k,
+            temperature_k,
             self.instrument.as_deref(),
             None,
         )
@@ -2067,9 +2113,11 @@ impl EnergyScaleTransmissionModel {
         params: &[f64],
         e_corr: &[f64],
     ) -> Result<Rc<transmission::WorkingGridXs>, FittingError> {
+        let temperature_k = self.temperature_for(params);
         let key = (
             params[self.t0_index].to_bits(),
             params[self.l_scale_index].to_bits(),
+            temperature_k.to_bits(),
         );
         let hit = self
             .cached_work_xs
@@ -2079,7 +2127,7 @@ impl EnergyScaleTransmissionModel {
         if let Some(xs) = hit {
             return Ok(xs);
         }
-        let xs = Rc::new(self.working_xs(e_corr)?);
+        let xs = Rc::new(self.working_xs(e_corr, temperature_k)?);
         *self.cached_work_xs.borrow_mut() = Some((key, Rc::clone(&xs)));
         Ok(xs)
     }
@@ -2306,7 +2354,13 @@ impl FitModel for EnergyScaleTransmissionModel {
         let density_plan = self.cached_resolution_plan(t0, l_scale, work_e);
 
         for (col, &fp_idx) in free_param_indices.iter().enumerate() {
-            if fp_idx == self.t0_index || fp_idx == self.l_scale_index {
+            // Temperature (issue #634), when free, is differentiated by the
+            // per-coordinate central FD arm below — it is neither t0 nor
+            // L_scale, so the PartialGal block never fires for it. Perturbing
+            // T changes σ (via `working_xs` at the T-widened cache key) but not
+            // the corrected grid, so its ±h probes share `e_corr`.
+            let is_temperature = Some(fp_idx) == self.temperature_index;
+            if fp_idx == self.t0_index || fp_idx == self.l_scale_index || is_temperature {
                 // partial-GAL: when both t0 and L_scale are free, the t0
                 // column comes from a single pre-computed FD pair (above),
                 // and the L_scale column is the per-bin rank-1 derivation
@@ -2382,7 +2436,20 @@ impl FitModel for EnergyScaleTransmissionModel {
                 // use the cache for the many-uses-per-probe callers
                 // (KL solver's deviance + gradient + Fisher at the
                 // current probe).  Issue #483 A1.
-                let h = if fp_idx == self.t0_index { 1e-4 } else { 1e-7 };
+                // FD step per coordinate: t0 in μs → absolute 1e-4; L_scale
+                // dimensionless → absolute 1e-7; temperature in K → a RELATIVE
+                // step (1e-4·T, i.e. ~0.03 K at 300 K, matching L_scale's
+                // relative scale) since T is O(300 K) and an absolute 1e-7 K
+                // would be pure round-off. Central differences make the
+                // truncation error O((h/T)²) ~ 1e-9, far below the analytic
+                // column it is validated against (see the FD-vs-analytic test).
+                let h = if fp_idx == self.t0_index {
+                    1e-4
+                } else if is_temperature {
+                    1e-4 * params[fp_idx].max(1.0)
+                } else {
+                    1e-7
+                };
                 let mut p_plus = params.to_vec();
                 let mut p_minus = params.to_vec();
                 p_plus[fp_idx] += h;
@@ -4806,6 +4873,94 @@ mod tests {
             err_old > 1e-4 && err_old > 1e4 * err_fixed.max(1e-15),
             "old coarse-grid path should differ from forward_model far more than \
              the fixed path (old={err_old:.3e}, fixed={err_fixed:.3e})"
+        );
+    }
+
+    /// Issue #634: the energy-scale model's FINITE-DIFFERENCE temperature
+    /// column must match the ANALYTIC ∂σ/∂T column that the fixed-grid
+    /// `TransmissionFitModel` produces on the SAME corrected grid, to <1e-4
+    /// relative. This validates the FD choice (correct index, sign, magnitude)
+    /// against the exact analytic derivative the non-energy-scale path uses.
+    /// The non-zero assertions guard against a silently mis-wired T index
+    /// (which would yield a zero column a loose recovery test could miss).
+    #[test]
+    fn energy_scale_temperature_jacobian_matches_analytic() {
+        let data = u238_single_resonance();
+        let energies: Vec<f64> = (0..401).map(|i| 4.0 + (i as f64) * 0.015).collect();
+        let temperature = 320.0;
+        let density = 0.0006;
+        // Non-trivial energy scale so the corrected grid differs from nominal.
+        let t0 = 0.7_f64;
+        let l_scale = 1.004_f64;
+        let flight_path = 25.0;
+
+        // Param layout mirrors the pipeline: [density, temperature, t0, l_scale]
+        // (temperature appended before the energy-scale params).
+        let (d_idx, t_idx, t0_idx, ls_idx) = (0usize, 1usize, 2usize, 3usize);
+        let params = [density, temperature, t0, l_scale];
+
+        // Energy-scale model with temperature fitting (FD T column). No
+        // resolution keeps the corrected-grid physics identical to the oracle.
+        let es = EnergyScaleTransmissionModel::new(
+            Arc::new(vec![data.clone()]),
+            Arc::new(vec![d_idx]),
+            Arc::new(vec![1.0]),
+            temperature,
+            energies.clone(),
+            flight_path,
+            t0_idx,
+            ls_idx,
+            None,
+        )
+        .with_temperature_index(Some(t_idx));
+
+        let free = [d_idx, t_idx, t0_idx, ls_idx];
+        let y = es.evaluate(&params).unwrap();
+        let jac = es
+            .analytical_jacobian(&params, &free, &y)
+            .expect("energy-scale jacobian available");
+        let t_col_fd: Vec<f64> = (0..energies.len()).map(|i| jac.get(i, 1)).collect();
+
+        // Analytic oracle: TransmissionFitModel on the SAME corrected grid.
+        let e_corr = es.corrected_energies(t0, l_scale);
+        let oracle = TransmissionFitModel::new(
+            e_corr,
+            vec![data],
+            temperature,
+            None,
+            (vec![d_idx], vec![1.0]),
+            Some(t_idx),
+            None,
+        )
+        .unwrap();
+        // Oracle params: [density, temperature] (no t0/l_scale); T at index 1.
+        let oracle_params = [density, temperature];
+        let y_o = oracle.evaluate(&oracle_params).unwrap();
+        let jac_o = oracle
+            .analytical_jacobian(&oracle_params, &[d_idx, t_idx], &y_o)
+            .expect("oracle analytic jacobian available");
+        let t_col_an: Vec<f64> = (0..energies.len()).map(|i| jac_o.get(i, 1)).collect();
+
+        let mut scale = 0.0f64;
+        let mut max_err = 0.0f64;
+        for i in 0..energies.len() {
+            scale = scale.max(t_col_an[i].abs());
+            max_err = max_err.max((t_col_fd[i] - t_col_an[i]).abs());
+        }
+        assert!(
+            scale > 1e-6,
+            "analytic T column must be non-trivially non-zero (scale {scale:.3e})"
+        );
+        let fd_scale = t_col_fd.iter().fold(0.0f64, |a, &v| a.max(v.abs()));
+        assert!(
+            fd_scale > 1e-6,
+            "FD T column must be non-zero — a mis-wired T index gives a silent zero"
+        );
+        let rel = max_err / scale;
+        assert!(
+            rel < 1e-4,
+            "energy-scale FD ∂T/∂temperature must match the analytic column to \
+             <1e-4 relative, got {rel:.3e}"
         );
     }
 

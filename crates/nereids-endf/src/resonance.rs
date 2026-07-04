@@ -1104,6 +1104,36 @@ pub mod test_support {
         )
     }
 
+    /// U-238 with three well-separated s-wave resonances (6.674, 20.87,
+    /// 36.68 eV), Reich-Moore.  Multiple dips at different energies break the
+    /// (t0, L_scale) degeneracy that a single resonance leaves — a single dip
+    /// cannot separate a TOF offset from a flight-path scale.  Used by the
+    /// energy-scale calibration and joint temperature-recovery tests (#634),
+    /// mirroring the Python `TestFitEnergyScaleRecovery` fixture.
+    pub fn u238_three_resonances() -> ResonanceData {
+        wrap(
+            92,
+            238,
+            236.006,
+            make_range(
+                1e-6,
+                1e5,
+                ResonanceFormalism::ReichMoore,
+                0.0,
+                9.4285,
+                1,
+                0,
+                236.006,
+                0.0,
+                vec![
+                    res(6.674, 0.5, 1.493e-3, 23.0e-3),
+                    res(20.87, 0.5, 10.3e-3, 26.0e-3),
+                    res(36.68, 0.5, 34.4e-3, 27.0e-3),
+                ],
+            ),
+        )
+    }
+
     /// Fully-parameterized U-238 ZA single-resonance, Reich-Moore.  For the
     /// RM-harness tests that vary (E_r, Γn, Γγ, J, L, AWR, I, AP) per case.
     pub fn single_resonance(p: SingleResonanceParams) -> ResonanceData {

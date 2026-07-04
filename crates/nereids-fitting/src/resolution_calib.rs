@@ -86,11 +86,16 @@ const POSITION_L_SCALE_MAX: f64 = 1.02;
 /// opposite to the `+t0` form used by the retired position nuisance. Errors if any
 /// corrected TOF `tof − t0 ≤ 0` (a `t0` past the shortest flight time).
 ///
-/// `pub(crate)` so the equivalence to the runtime
-/// [`EnergyScaleTransmissionModel::corrected_energies`] is *pinned by a test*
-/// (`corrected_energy_grid_matches_energy_scale_model`) rather than only asserted
-/// in prose — a future edit to either convention then fails fast.
-pub(crate) fn corrected_energy_grid(
+/// SAMMY reference for the `−t0` sign convention: `dat/mdat0.f90:189`
+/// (`etzero = ee*(Elzero/(1−Tzero·√ee/Tttzzz))²`) — the measured TOF has TZERO
+/// subtracted before the energy conversion, so a positive `t0` raises the
+/// corrected energy. This is the canonical NEREIDS implementation of the
+/// formula; the runtime
+/// `EnergyScaleTransmissionModel::corrected_energies` is pinned bit-for-bit
+/// to it by `corrected_energy_grid_matches_energy_scale_model`, and
+/// `SpectrumFitResult::corrected_energies` (issue #634) reuses it so callers
+/// never re-derive the transform (a `+t0` slip caused a silent +400 K bias).
+pub fn corrected_energy_grid(
     energies: &[f64],
     t0_us: f64,
     l_scale: f64,

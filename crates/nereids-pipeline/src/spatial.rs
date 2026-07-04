@@ -712,22 +712,11 @@ pub fn spatial_map_typed(
         ));
     }
 
-    // Issue #458: `fit_energy_scale` + `fit_temperature`
-    // is not a supported combination — `EnergyScaleTransmissionModel`
-    // and the temperature-fitting path are mutually exclusive in every
-    // solver dispatch arm of `fit_spectrum_typed`.  Without
-    // this spatial-layer guard, every per-pixel call would error and
-    // `spatial_map_typed` would report `n_failed == n_total` with an
-    // all-NaN map — a silently-failed map is worse than a clear error.
-    if config.fit_energy_scale() && config.fit_temperature() {
-        return Err(PipelineError::InvalidParameter(
-            "spatial_map_typed: fit_energy_scale=true and fit_temperature=true cannot \
-             both be set — EnergyScaleTransmissionModel does not support temperature \
-             fitting. Choose one: either calibrate TZERO with a fixed temperature, or \
-             fit temperature on the nominal energy grid."
-                .into(),
-        ));
-    }
+    // Issue #634: `fit_energy_scale` + `fit_temperature` is now supported —
+    // `EnergyScaleTransmissionModel` wires a fitted temperature column, so
+    // per-pixel `fit_spectrum_typed` handles the combination and no spatial
+    // guard is needed. (The #458 B3 guard above — LM + fit_energy_scale on
+    // counts — is a separate, still-active numerical-stability restriction.)
 
     // `fit_spectrum_typed` rejects `CountsWithNuisance + LM` per-pixel
     // (see `validate_input_solver` in `pipeline.rs` — "CountsWithNuisance
@@ -3831,14 +3820,12 @@ mod tests {
         assert!(result.t0_us_map.is_some());
     }
 
-    /// `fit_energy_scale + fit_temperature` must be rejected at
-    /// spatial entry (follow-up to #458).  The
-    /// single-spectrum fitter errors on this combination, but without
-    /// a spatial-layer guard every pixel would error and
-    /// `spatial_map_typed` would silently return `n_failed == n_total`
-    /// with an all-NaN map instead of a clear error.
+    /// Issue #634: `fit_energy_scale + fit_temperature` is now SUPPORTED at
+    /// spatial entry (the per-pixel fitter wires a temperature column into the
+    /// energy-scale model). `spatial_map_typed` must run without the old guard
+    /// error and allocate both the temperature and t0/L_scale maps.
     #[test]
-    fn test_spatial_map_typed_rejects_energy_scale_with_temperature() {
+    fn test_spatial_map_typed_allows_energy_scale_with_temperature() {
         let rd = u238_single_resonance();
         let energies: Vec<f64> = (0..51).map(|i| 1.0 + (i as f64) * 0.2).collect();
         let (t_3d, u_3d) = synthetic_4x4_transmission(&rd, 0.001, &energies);
@@ -3859,13 +3846,18 @@ mod tests {
         .with_fit_temperature(true)
         .with_energy_scale(0.0, 1.0, 25.0);
 
-        let err = spatial_map_typed(&data, &config, None, None, None)
-            .expect_err("fit_energy_scale + fit_temperature must be rejected");
-        let msg = err.to_string();
+        let result = spatial_map_typed(&data, &config, None, None, None)
+            .expect("fit_energy_scale + fit_temperature is now supported (#634)");
+        // Both flag families allocate their maps.
         assert!(
-            msg.contains("fit_energy_scale") && msg.contains("fit_temperature"),
-            "error message should name both culprits, got: {msg}"
+            result.temperature_map.is_some(),
+            "temperature map allocated when fit_temperature=true"
         );
+        assert!(
+            result.t0_us_map.is_some() && result.l_scale_map.is_some(),
+            "energy-scale maps allocated when fit_energy_scale=true"
+        );
+        assert_eq!(result.n_total, 16, "4×4 map");
     }
 
     /// `(Transmission + LM + fit_energy_scale=true)` is allowed —

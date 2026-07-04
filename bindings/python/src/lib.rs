@@ -530,6 +530,39 @@ impl PyFitResult {
         self.l_scale
     }
 
+    /// Map a nominal energy grid through the fitted ``(t0_us, l_scale)`` energy
+    /// scale to the corrected (calibrated) energies the fit evaluated the
+    /// physics on (issue #634). Reuses the exact SAMMY-convention transform
+    /// (``dat/mdat0.f90:189``, −t0 sign) the fitter used, so the corrected
+    /// axis is never re-derived by hand (a +t0 slip caused a silent +400 K
+    /// temperature bias in the field).
+    ///
+    /// Returns ``None`` when energy-scale fitting was not enabled (``t0_us`` or
+    /// ``l_scale`` is ``None``). Raises ``ValueError`` on a degenerate
+    /// calibration (a ``t0`` past the shortest flight time on this grid).
+    #[pyo3(signature = (nominal_energies, flight_path_m))]
+    fn corrected_energies<'py>(
+        &self,
+        py: Python<'py>,
+        nominal_energies: PyReadonlyArray1<'py, f64>,
+        flight_path_m: f64,
+    ) -> PyResult<Option<Bound<'py, PyArray1<f64>>>> {
+        match (self.t0_us, self.l_scale) {
+            (Some(t0), Some(l_scale)) => {
+                let e = nominal_energies.as_slice()?;
+                let corr = nereids_fitting::resolution_calib::corrected_energy_grid(
+                    e,
+                    t0,
+                    l_scale,
+                    flight_path_m,
+                )
+                .map_err(|err| pyo3::exceptions::PyValueError::new_err(err.to_string()))?;
+                Ok(Some(PyArray1::from_vec(py, corr)))
+            }
+            _ => Ok(None),
+        }
+    }
+
     /// Conditional binomial deviance divided by (n − k) from the counts-KL
     /// dispatch (joint-Poisson profile-deviance fitter).
     ///

@@ -1216,17 +1216,7 @@ fn fit_transmission_lm(
     // Build parameter vector
     let mut param_vec = build_density_params(config);
 
-    // Guard: energy-scale + temperature fitting is not yet supported.
-    // The EnergyScaleTransmissionModel does not wire the temperature parameter.
-    if config.fit_energy_scale && config.fit_temperature {
-        return Err(PipelineError::InvalidParameter(
-            "fit_energy_scale and fit_temperature cannot both be true: \
-             EnergyScaleTransmissionModel does not support temperature fitting yet"
-                .into(),
-        ));
-    }
-
-    let _temperature_index = append_temperature_param(&mut param_vec, config);
+    let temperature_index = append_temperature_param(&mut param_vec, config);
     let energy_scale_indices = append_energy_scale_params(&mut param_vec, config);
 
     // Issue #608: seed (t0, L_scale) via resonance peak-matching so the
@@ -1250,9 +1240,9 @@ fn fit_transmission_lm(
 
     // Build model — use EnergyScaleTransmissionModel when energy-scale is enabled
     let model: Box<dyn FitModel> = if let Some((t0_idx, ls_idx)) = energy_scale_indices {
-        build_energy_scale_transmission_model(config, t0_idx, ls_idx)?
+        build_energy_scale_transmission_model(config, t0_idx, ls_idx, temperature_index)?
     } else {
-        build_transmission_model(config, n_density_params, _temperature_index)?
+        build_transmission_model(config, n_density_params, temperature_index)?
     };
 
     // Build the per-bin active mask (SAMMY EMIN/EMAX-equivalent fit-energy
@@ -1379,13 +1369,6 @@ fn fit_transmission_poisson(
     let n_density_params = config.n_density_params();
     let mut param_vec = build_density_params(config);
 
-    if config.fit_temperature && config.fit_energy_scale {
-        return Err(PipelineError::InvalidParameter(
-            "fit_energy_scale and fit_temperature cannot both be true: \
-             EnergyScaleTransmissionModel does not support temperature fitting yet"
-                .into(),
-        ));
-    }
     let temperature_index = append_temperature_param(&mut param_vec, config);
     let energy_scale_indices = append_energy_scale_params(&mut param_vec, config);
 
@@ -1406,7 +1389,7 @@ fn fit_transmission_poisson(
 
     // Build inner model (energy-scale or precomputed)
     let model: Box<dyn FitModel> = if let Some((t0_idx, ls_idx)) = energy_scale_indices {
-        build_energy_scale_transmission_model(config, t0_idx, ls_idx)?
+        build_energy_scale_transmission_model(config, t0_idx, ls_idx, temperature_index)?
     } else {
         build_transmission_model(config, n_density_params, temperature_index)?
     };
@@ -1536,13 +1519,6 @@ fn fit_counts_joint_poisson(
     let n_density_params = config.n_density_params();
     let mut param_vec = build_density_params(config);
 
-    if config.fit_temperature && config.fit_energy_scale {
-        return Err(PipelineError::InvalidParameter(
-            "fit_energy_scale and fit_temperature cannot both be true: \
-             EnergyScaleTransmissionModel does not support temperature fitting yet"
-                .into(),
-        ));
-    }
     let temperature_index = append_temperature_param(&mut param_vec, config);
     let energy_scale_indices = append_energy_scale_params(&mut param_vec, config);
 
@@ -1579,7 +1555,7 @@ fn fit_counts_joint_poisson(
 
     // ── Build pure transmission model ──
     let t_model: Box<dyn FitModel> = if let Some((t0_idx, ls_idx)) = energy_scale_indices {
-        build_energy_scale_transmission_model(config, t0_idx, ls_idx)?
+        build_energy_scale_transmission_model(config, t0_idx, ls_idx, temperature_index)?
     } else {
         build_transmission_model(config, n_density_params, temperature_index)?
     };
@@ -2374,6 +2350,7 @@ fn build_energy_scale_transmission_model(
     config: &UnifiedFitConfig,
     t0_idx: usize,
     ls_idx: usize,
+    temperature_index: Option<usize>,
 ) -> Result<Box<dyn FitModel>, PipelineError> {
     let instrument = config
         .resolution
@@ -2403,7 +2380,11 @@ fn build_energy_scale_transmission_model(
         t0_idx,
         ls_idx,
         instrument,
-    );
+    )
+    // Issue #634: when temperature is also fit, wire its parameter index in
+    // so the model rebuilds σ at the free temperature and emits a T Jacobian
+    // column. `None` keeps temperature fixed (unchanged behavior).
+    .with_temperature_index(temperature_index);
     if let Some(method) = config.tzero_jacobian_method {
         es_model = es_model.with_jacobian_method(method);
     }
@@ -3145,14 +3126,96 @@ pub struct SpectrumFitResult {
     pub deviance_per_dof: Option<f64>,
 }
 
+impl SpectrumFitResult {
+    /// Map a nominal energy grid through the fitted SAMMY energy scale
+    /// `(t0_us, l_scale)` to the corrected (calibrated) energies the fit
+    /// actually evaluated the physics on (issue #634).
+    ///
+    /// This exposes the exact transform the fitter used so downstream code
+    /// never has to re-derive it — replicating it by hand with a `+t0` sign
+    /// (instead of the correct `−t0`) caused a silent +400 K temperature bias
+    /// in the field. It reuses the canonical
+    /// [`corrected_energy_grid`](nereids_fitting::resolution_calib::corrected_energy_grid)
+    /// (SAMMY `dat/mdat0.f90:189`, −t0 convention).
+    ///
+    /// Returns `None` when energy-scale fitting was not enabled (`t0_us` or
+    /// `l_scale` is `None`) — the corrected grid would equal the input, but
+    /// `None` distinguishes "not fitted" from "fitted to the identity".
+    /// Returns `Some(Err(_))` for a degenerate calibration (a `t0` past the
+    /// shortest flight time on the given grid).
+    pub fn corrected_energies(
+        &self,
+        nominal_energies: &[f64],
+        flight_path_m: f64,
+    ) -> Option<Result<Vec<f64>, PipelineError>> {
+        match (self.t0_us, self.l_scale) {
+            (Some(t0), Some(l_scale)) => Some(
+                nereids_fitting::resolution_calib::corrected_energy_grid(
+                    nominal_energies,
+                    t0,
+                    l_scale,
+                    flight_path_m,
+                )
+                .map_err(|e| PipelineError::InvalidParameter(e.to_string())),
+            ),
+            _ => None,
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
     use nereids_endf::resonance::test_support::{
         hf178_mlbw_two_resonances, synthetic_single_resonance, u238_single_resonance,
+        u238_three_resonances,
     };
     use nereids_fitting::lm::FitModel;
+    use nereids_fitting::transmission_model::{
+        EnergyScaleJacobianMethod, EnergyScaleTransmissionModel,
+    };
     use nereids_physics::transmission as phys_transmission;
+
+    /// Gauss–Jordan inverse of a small dense matrix (test-only; the crate's
+    /// `invert_matrix` is `pub(crate)` in nereids-fitting and unreachable here).
+    /// Returns `None` on a singular pivot.
+    fn invert_dense(a: &[Vec<f64>]) -> Option<Vec<Vec<f64>>> {
+        let n = a.len();
+        let mut m: Vec<Vec<f64>> = a.to_vec();
+        let mut inv: Vec<Vec<f64>> = (0..n)
+            .map(|i| (0..n).map(|j| if i == j { 1.0 } else { 0.0 }).collect())
+            .collect();
+        for col in 0..n {
+            // Partial pivot.
+            let mut piv = col;
+            for r in (col + 1)..n {
+                if m[r][col].abs() > m[piv][col].abs() {
+                    piv = r;
+                }
+            }
+            if m[piv][col].abs() < 1e-300 {
+                return None;
+            }
+            m.swap(col, piv);
+            inv.swap(col, piv);
+            let d = m[col][col];
+            for j in 0..n {
+                m[col][j] /= d;
+                inv[col][j] /= d;
+            }
+            for r in 0..n {
+                if r == col {
+                    continue;
+                }
+                let f = m[r][col];
+                for j in 0..n {
+                    m[r][j] -= f * m[col][j];
+                    inv[r][j] -= f * inv[col][j];
+                }
+            }
+        }
+        Some(inv)
+    }
 
     /// Issue #608: the dip detector finds the resonance signatures (local
     /// transmission minima) the energy-scale peak-match seed needs.
@@ -3946,6 +4009,25 @@ mod tests {
     }
 
     /// Helper: build synthetic transmission at a given temperature.
+    /// Deterministic ~N(0,1) samples via an LCG + Box–Muller. Test-only, so a
+    /// fixed seed gives reproducible noise (no `rand` dev-dependency).
+    fn seeded_gaussian(n: usize, seed: u64) -> Vec<f64> {
+        let mut state = seed | 1;
+        let mut unif = || {
+            state = state
+                .wrapping_mul(6364136223846793005)
+                .wrapping_add(1442695040888963407);
+            (((state >> 11) as f64) / ((1u64 << 53) as f64)).clamp(1e-12, 1.0 - 1e-12)
+        };
+        (0..n)
+            .map(|_| {
+                let u1 = unif();
+                let u2 = unif();
+                (-2.0 * u1.ln()).sqrt() * (std::f64::consts::TAU * u2).cos()
+            })
+            .collect()
+    }
+
     fn synthetic_transmission_at_temp(
         data: &ResonanceData,
         true_density: f64,
@@ -4416,36 +4498,283 @@ mod tests {
 
     // ── Energy-scale fitting tests ──
 
-    /// fit_energy_scale + fit_temperature must be rejected.
+    /// Issue #634: fit_energy_scale + fit_temperature JOINTLY recovers the
+    /// injected (t0, L_scale, T) in a single LM fit. Closed loop: synthesize
+    /// on the TRUE corrected grid at the true T, report on the nominal grid,
+    /// then fit from a cold energy-scale seed (0, 1) with T seeded 40 K off —
+    /// so a no-op fit cannot pass (non-vacuity).
     #[test]
-    fn test_energy_scale_rejects_temperature() {
-        let data = u238_single_resonance();
-        let energies: Vec<f64> = (0..101).map(|i| 1.0 + (i as f64) * 0.1).collect();
-        let (t_obs, sigma) = synthetic_transmission(&data, 0.002, &energies);
+    fn test_energy_scale_with_temperature_recovers_all_three() {
+        // Three well-separated resonances break the (t0, L_scale) degeneracy
+        // that a single dip leaves.
+        let data = u238_three_resonances();
+        let flight_path = 25.0_f64;
+        let true_density = 0.002;
+        let true_temp = 340.0;
+        let true_t0 = 0.6_f64; // µs
+        let true_l_scale = 1.004_f64;
+        // Fine grid spanning all three resonances (6.674, 20.87, 36.68 eV).
+        let nominal: Vec<f64> = (0..801).map(|i| 4.0 + (i as f64) * 0.05).collect();
+
+        // TRUE corrected energies: each nominal bin's true physical energy.
+        let e_true = nereids_fitting::resolution_calib::corrected_energy_grid(
+            &nominal,
+            true_t0,
+            true_l_scale,
+            flight_path,
+        )
+        .unwrap();
+        // Clean transmission at the true energies + true T, indexed by bin.
+        let (t_obs, sigma) =
+            synthetic_transmission_at_temp(&data, true_density, true_temp, &e_true);
 
         let config = UnifiedFitConfig::new(
-            energies,
+            nominal,
             vec![data],
             vec!["U-238".into()],
-            293.6,
+            true_temp - 40.0, // temperature seeded 40 K low
             None,
-            vec![0.001],
+            vec![true_density],
         )
         .unwrap()
         .with_solver(SolverConfig::LevenbergMarquardt(Default::default()))
         .with_fit_temperature(true)
-        .with_energy_scale(0.0, 1.0, 25.0);
+        .with_energy_scale(0.0, 1.0, flight_path); // cold energy-scale seed
 
         let input = InputData::Transmission {
             transmission: t_obs,
             uncertainty: sigma,
         };
-        let err = fit_spectrum_typed(&input, &config);
-        assert!(err.is_err(), "energy_scale + temperature should fail");
-        let msg = err.unwrap_err().to_string();
+        let result = fit_spectrum_typed(&input, &config).expect("joint fit runs");
+        assert!(result.converged, "joint (t0,L_scale,T) fit should converge");
+
+        let t0 = result.t0_us.expect("t0_us populated");
+        let ls = result.l_scale.expect("l_scale populated");
+        let temp = result.temperature_k.expect("temperature_k populated");
         assert!(
-            msg.contains("fit_energy_scale") && msg.contains("fit_temperature"),
-            "error should mention both flags: {msg}"
+            (t0 - true_t0).abs() < 0.05,
+            "t0: fitted={t0}, true={true_t0}"
+        );
+        assert!(
+            (ls - true_l_scale).abs() / true_l_scale < 1e-3,
+            "l_scale: fitted={ls}, true={true_l_scale}"
+        );
+        assert!(
+            (temp - true_temp).abs() < 3.0,
+            "temperature: fitted={temp}, true={true_temp}"
+        );
+    }
+
+    /// Issue #634 (acceptance c, revised): two guarantees on the joint fit's
+    /// temperature uncertainty.
+    ///
+    /// (c1) Physical invariant, no arbitrary threshold: on identical data the
+    /// joint (T + t0 + L_scale) fit's σ_T is strictly LARGER than a
+    /// no-energy-scale (T-only) fit's σ_T — the extra energy-scale parameters
+    /// are not orthogonal to temperature. (The magnitude of the excess is
+    /// dataset-dependent coupling, so pinning a % against a different model
+    /// protects nothing; hence a strict inequality, not a bound.)
+    ///
+    /// (c2) Covariance plumbing, same model: at the joint solution, an
+    /// INDEPENDENT reconstruction of the covariance — finite-difference the
+    /// SAME model's predictions with the model's own steps, form (JᵀWJ)⁻¹ by
+    /// hand, read the temperature diagonal, scale by reduced χ² — reproduces
+    /// the solver-reported σ_T to <0.1%. This is the assertion that catches
+    /// the #641-class bug where σ_T is read from the wrong free-parameter slot.
+    /// Full-FD Jacobian so the reconstruction's steps match the solver's.
+    #[test]
+    fn test_energy_scale_temperature_sigma_covariance_plumbing() {
+        let data = u238_three_resonances();
+        let flight_path = 25.0_f64;
+        let true_density = 0.002;
+        let true_temp = 340.0;
+        let true_t0 = 0.6_f64;
+        let true_l_scale = 1.004_f64;
+        let nominal: Vec<f64> = (0..801).map(|i| 4.0 + (i as f64) * 0.05).collect();
+        let e_true = nereids_fitting::resolution_calib::corrected_energy_grid(
+            &nominal,
+            true_t0,
+            true_l_scale,
+            flight_path,
+        )
+        .unwrap();
+        let (t_clean, sigma) =
+            synthetic_transmission_at_temp(&data, true_density, true_temp, &e_true);
+        // Matched Gaussian noise so both fits reach reduced_chi²≈1 and σ_T
+        // reflects the Jacobian covariance (not a ~0 residual).
+        let noise = seeded_gaussian(t_clean.len(), 0x6340_0000_0000_0634);
+        let t_obs: Vec<f64> = t_clean
+            .iter()
+            .zip(sigma.iter())
+            .zip(noise.iter())
+            .map(|((&t, &s), &g)| t + s * g)
+            .collect();
+
+        // Joint fit — full-FD Jacobian so the independent reconstruction below
+        // uses matching per-coordinate central differences (PartialGal would
+        // derive the L_scale column by a rank-1 identity we do not replicate).
+        let joint_cfg = UnifiedFitConfig::new(
+            nominal.clone(),
+            vec![data.clone()],
+            vec!["U-238".into()],
+            true_temp - 40.0,
+            None,
+            vec![true_density],
+        )
+        .unwrap()
+        .with_solver(SolverConfig::LevenbergMarquardt(Default::default()))
+        .with_fit_temperature(true)
+        .with_energy_scale(0.0, 1.0, flight_path)
+        .with_tzero_jacobian_method(Some(EnergyScaleJacobianMethod::FiniteDifference));
+        let joint = fit_spectrum_typed(
+            &InputData::Transmission {
+                transmission: t_obs.clone(),
+                uncertainty: sigma.clone(),
+            },
+            &joint_cfg,
+        )
+        .unwrap();
+        let sigma_t_joint = joint.temperature_k_unc.expect("joint σ_T");
+
+        // Reference: temperature-only fit on the TRUE corrected grid (analytic
+        // ∂σ/∂T path, no energy scale) — same data, same noise.
+        let ref_cfg = UnifiedFitConfig::new(
+            e_true,
+            vec![data.clone()],
+            vec!["U-238".into()],
+            true_temp - 40.0,
+            None,
+            vec![true_density],
+        )
+        .unwrap()
+        .with_solver(SolverConfig::LevenbergMarquardt(Default::default()))
+        .with_fit_temperature(true);
+        let reference = fit_spectrum_typed(
+            &InputData::Transmission {
+                transmission: t_obs,
+                uncertainty: sigma.clone(),
+            },
+            &ref_cfg,
+        )
+        .unwrap();
+        let sigma_t_ref = reference.temperature_k_unc.expect("reference σ_T");
+
+        // (c1) strict physical invariant.
+        assert!(sigma_t_joint.is_finite() && sigma_t_joint > 0.0);
+        assert!(sigma_t_ref.is_finite() && sigma_t_ref > 0.0);
+        assert!(
+            sigma_t_joint > sigma_t_ref,
+            "joint σ_T ({sigma_t_joint:.5}) must strictly exceed no-energy-scale \
+             σ_T ({sigma_t_ref:.5}): the extra t0/L_scale params are not \
+             orthogonal to temperature"
+        );
+
+        // (c2) independent covariance reconstruction at the joint solution.
+        // Param layout: [density(0), temperature(1), t0(2), l_scale(3)].
+        let p = [
+            joint.densities[0],
+            joint.temperature_k.unwrap(),
+            joint.t0_us.unwrap(),
+            joint.l_scale.unwrap(),
+        ];
+        let model = EnergyScaleTransmissionModel::new(
+            Arc::new(vec![data]),
+            Arc::new(vec![0]),
+            Arc::new(vec![1.0]),
+            true_temp - 40.0,
+            nominal.clone(),
+            flight_path,
+            2,
+            3,
+            None,
+        )
+        .with_temperature_index(Some(1))
+        .with_jacobian_method(EnergyScaleJacobianMethod::FiniteDifference);
+
+        // Central FD of the model predictions, per-coordinate steps matching
+        // the model (t0 abs 1e-4, temperature rel 1e-4, L_scale abs 1e-7;
+        // density is analytic in the model — FD it here with a tiny relative
+        // step, its off-diagonal contribution to cov_TT is negligible).
+        let steps = [1e-4 * p[0].max(1e-6), 1e-4 * p[1].max(1.0), 1e-4, 1e-7];
+        let n_e = nominal.len();
+        let mut jac = vec![[0.0f64; 4]; n_e];
+        for (j, &h) in steps.iter().enumerate() {
+            let mut pp = p;
+            let mut pm = p;
+            pp[j] += h;
+            pm[j] -= h;
+            let yp = model.evaluate(&pp).unwrap();
+            let ym = model.evaluate(&pm).unwrap();
+            for i in 0..n_e {
+                jac[i][j] = (yp[i] - ym[i]) / (2.0 * h);
+            }
+        }
+        // A = JᵀWJ, W = diag(1/σ²).
+        let mut a = vec![vec![0.0f64; 4]; 4];
+        for i in 0..n_e {
+            let w = 1.0 / (sigma[i] * sigma[i]);
+            for r in 0..4 {
+                for c in 0..4 {
+                    a[r][c] += jac[i][r] * w * jac[i][c];
+                }
+            }
+        }
+        let cov = invert_dense(&a).expect("covariance invertible");
+        // #108.1: covariance is scaled by reduced χ².
+        let sigma_t_recon = (cov[1][1] * joint.reduced_chi_squared).sqrt();
+        let rel = (sigma_t_recon - sigma_t_joint).abs() / sigma_t_joint;
+        assert!(
+            rel < 1e-3,
+            "independent covariance reconstruction σ_T={sigma_t_recon:.5} must match \
+             the solver-reported σ_T={sigma_t_joint:.5} to <0.1%, got {rel:.3e} \
+             (a mismatch means the solver read T's σ from the wrong covariance slot)"
+        );
+    }
+
+    /// Issue #634: `SpectrumFitResult::corrected_energies` reuses the canonical
+    /// transform and returns `None` when the energy scale was not fitted.
+    #[test]
+    fn test_spectrum_result_corrected_energies() {
+        let nominal: Vec<f64> = (0..50).map(|i| 5.0 + i as f64 * 0.3).collect();
+        let flight_path = 25.0;
+        let (t0, ls) = (0.4_f64, 1.003_f64);
+        let expected =
+            nereids_fitting::resolution_calib::corrected_energy_grid(&nominal, t0, ls, flight_path)
+                .unwrap();
+
+        let mk = |t0: Option<f64>, ls: Option<f64>| SpectrumFitResult {
+            densities: vec![0.001],
+            uncertainties: None,
+            reduced_chi_squared: 1.0,
+            converged: true,
+            iterations: 1,
+            temperature_k: None,
+            temperature_k_unc: None,
+            anorm: 1.0,
+            background: [0.0; 3],
+            back_d: None,
+            back_f: None,
+            t0_us: t0,
+            l_scale: ls,
+            deviance_per_dof: None,
+        };
+
+        // Fitted energy scale → Some(corrected grid) == the canonical transform.
+        let got = mk(Some(t0), Some(ls))
+            .corrected_energies(&nominal, flight_path)
+            .expect("Some when energy scale fitted")
+            .unwrap();
+        assert_eq!(got, expected);
+        // Not fitted → None (distinguishes "unfit" from "fitted to identity").
+        assert!(
+            mk(None, None)
+                .corrected_energies(&nominal, flight_path)
+                .is_none()
+        );
+        assert!(
+            mk(Some(t0), None)
+                .corrected_energies(&nominal, flight_path)
+                .is_none()
         );
     }
 
