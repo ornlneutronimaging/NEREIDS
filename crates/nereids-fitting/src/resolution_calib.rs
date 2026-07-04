@@ -101,6 +101,32 @@ pub fn corrected_energy_grid(
     l_scale: f64,
     flight_path_m: f64,
 ) -> Result<Vec<f64>, FittingError> {
+    // Validate scale inputs up front (issue #634 review): the transform is
+    // EVEN in `l_scale` (`(kl·l_scale/denom)²`), so a negative `l_scale`
+    // would silently return the identical plausible grid as its positive
+    // counterpart, a NaN `l_scale` would pass the denominator-only guard and
+    // return `Ok(vec![NaN])` ("NaN bypasses guards"), and
+    // `flight_path_m = 0` with a negative fitted `t0` would return an
+    // all-zeros grid as `Ok`.  Matches the sibling fit entry points'
+    // `validate_energy_scale_params` rejection (issue #458) — this is the
+    // canonical public transform, so it must not hand back plausible
+    // garbage for invalid inputs.
+    if !t0_us.is_finite() {
+        return Err(FittingError::EvaluationFailed(format!(
+            "corrected_energy_grid: t0_us must be finite, got {t0_us}"
+        )));
+    }
+    if !l_scale.is_finite() || l_scale <= 0.0 {
+        return Err(FittingError::EvaluationFailed(format!(
+            "corrected_energy_grid: l_scale must be finite and positive, got {l_scale}"
+        )));
+    }
+    if !flight_path_m.is_finite() || flight_path_m <= 0.0 {
+        return Err(FittingError::EvaluationFailed(format!(
+            "corrected_energy_grid: flight_path_m must be finite and positive, \
+             got {flight_path_m}"
+        )));
+    }
     if t0_us == 0.0 && l_scale == 1.0 {
         return Ok(energies.to_vec());
     }

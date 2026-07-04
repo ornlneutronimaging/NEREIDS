@@ -171,8 +171,10 @@ pub struct CalibrationResult {
 ///
 /// # Search strategy
 ///
-/// Issue #634: the former three-phase `(L, t₀)` grid scan (~900 forward
-/// evaluations, >10 min on production windows) is replaced by the
+/// Issue #634: the former three-phase `(L, t₀)` grid scan — ~900 (L, t₀)
+/// candidates × a ~25-evaluation golden-section density search each,
+/// i.e. ~35 000 forward evaluations, >10 min on production windows — is
+/// replaced by the
 /// **`fit_energy_scale` Levenberg–Marquardt path** — the same
 /// peak-match-seeded machinery `fit_spectrum_typed` uses — which solves
 /// the identical 3-parameter `(t₀, L_scale, n_total)` problem in seconds.
@@ -576,7 +578,14 @@ pub fn calibrate_energy(
         let n_c = fit.densities.first().copied().unwrap_or(f64::NAN) / total_abundance;
 
         // Score this start with the ORIGINAL valid-bins objective at its
-        // solution; keep the argmin.  (NaN chi² never wins: `<` is false.)
+        // solution; keep the argmin.  The latch is gated on finiteness: a
+        // bare `None => true` first-start arm would let a NaN chi² latch
+        // (bypassing the `<` comparison), and every later start would then
+        // compare `chi2 < NaN` (always false) — a valid later calibration
+        // could never displace a NaN first start and the function would
+        // return the no-finite-chi² error for a calibratable spectrum.
+        // Mirrors the old grid's `best_chi2 = INFINITY` + `<` behaviour,
+        // where non-finite candidates could never latch (issue #634 review).
         let Ok(e_c) = corrected_energy_grid(energies_nominal, t0_c, ls_c, assumed_flight_path_m)
         else {
             continue;
@@ -592,10 +601,11 @@ pub fn calibrate_energy(
             &valid,
             resolution,
         );
-        let better = match &winner {
-            None => true,
-            Some((_, _, _, best, _)) => chi2_c < *best,
-        };
+        let better = chi2_c.is_finite()
+            && match &winner {
+                None => true,
+                Some((_, _, _, best, _)) => chi2_c < *best,
+            };
         if better {
             winner = Some((t0_c, ls_c, n_c, chi2_c, fit.converged));
         }

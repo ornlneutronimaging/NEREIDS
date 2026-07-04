@@ -2807,6 +2807,13 @@ class TestFitEnergyScaleRecovery:
         )
         assert r_plain.corrected_energies(energies, L_NOM) is None
 
+        # Invalid flight path is rejected, not squared into a plausible
+        # (all-zero / garbage) grid (#634 review).
+        with pytest.raises(ValueError):
+            r_es.corrected_energies(energies, 0.0)
+        with pytest.raises(ValueError):
+            r_es.corrected_energies(energies, -25.0)
+
 
 # ===========================================================================
 # Issue #558 — energy-grid validation at the PyO3 boundary

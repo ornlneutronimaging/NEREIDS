@@ -4514,6 +4514,16 @@ mod tests {
     /// on the TRUE corrected grid at the true T, report on the nominal grid,
     /// then fit from a cold energy-scale seed (0, 1) with T seeded 40 K off —
     /// so a no-op fit cannot pass (non-vacuity).
+    ///
+    /// Oracle-dependency note: the truth grid is built with the SAME
+    /// `corrected_energy_grid` transform the fitter is pinned to, so a
+    /// sign/convention error in that shared transform would cancel here.
+    /// The convention itself is covered independently: the Python
+    /// `TestFitEnergyScaleRecovery` derives measured energies through a
+    /// hand-written inverse TOF map, and the `−t0` form is verified against
+    /// SAMMY `dat/mdat0.f90:189`. This test targets the JOINT-recovery
+    /// property (temperature wiring, FD column, index mapping), which the
+    /// shared transform cannot mask.
     #[test]
     fn test_energy_scale_with_temperature_recovers_all_three() {
         // Three well-separated resonances break the (t0, L_scale) degeneracy
@@ -4573,6 +4583,150 @@ mod tests {
         assert!(
             (temp - true_temp).abs() < 3.0,
             "temperature: fitted={temp}, true={true_temp}"
+        );
+    }
+
+    /// Issue #634: the joint combination must also work on the
+    /// transmission-PoissonKL path — its guard was lifted too, and the KL
+    /// solver consumes the model Jacobian through a different route
+    /// (deviance gradient plus Fisher) than the LM normal equations,
+    /// exactly the seam where wrong-slot σ bugs have hidden before (#641).
+    /// Same closed loop as the LM test; also pins a finite positive
+    /// temperature σ.
+    #[test]
+    fn test_energy_scale_with_temperature_recovers_all_three_kl() {
+        let data = u238_three_resonances();
+        let flight_path = 25.0_f64;
+        let true_density = 0.002;
+        let true_temp = 340.0;
+        let true_t0 = 0.6_f64;
+        let true_l_scale = 1.004_f64;
+        let nominal: Vec<f64> = (0..801).map(|i| 4.0 + (i as f64) * 0.05).collect();
+        let e_true = nereids_fitting::resolution_calib::corrected_energy_grid(
+            &nominal,
+            true_t0,
+            true_l_scale,
+            flight_path,
+        )
+        .unwrap();
+        let (t_obs, sigma) =
+            synthetic_transmission_at_temp(&data, true_density, true_temp, &e_true);
+
+        let config = UnifiedFitConfig::new(
+            nominal,
+            vec![data],
+            vec!["U-238".into()],
+            true_temp - 40.0,
+            None,
+            vec![true_density],
+        )
+        .unwrap()
+        .with_solver(SolverConfig::PoissonKL(PoissonConfig::default()))
+        .with_fit_temperature(true)
+        .with_energy_scale(0.0, 1.0, flight_path);
+
+        let result = fit_spectrum_typed(
+            &InputData::Transmission {
+                transmission: t_obs,
+                uncertainty: sigma,
+            },
+            &config,
+        )
+        .expect("KL joint fit runs");
+        assert!(result.converged, "KL joint fit should converge");
+        let t0 = result.t0_us.expect("t0_us populated");
+        let ls = result.l_scale.expect("l_scale populated");
+        let temp = result.temperature_k.expect("temperature_k populated");
+        assert!(
+            (t0 - true_t0).abs() < 0.1,
+            "KL t0: fitted={t0}, true={true_t0}"
+        );
+        assert!(
+            (ls - true_l_scale).abs() / true_l_scale < 2e-3,
+            "KL l_scale: fitted={ls}, true={true_l_scale}"
+        );
+        assert!(
+            (temp - true_temp).abs() < 5.0,
+            "KL temperature: fitted={temp}, true={true_temp}"
+        );
+        let t_unc = result
+            .temperature_k_unc
+            .expect("KL joint fit must report a temperature σ");
+        assert!(
+            t_unc.is_finite() && t_unc > 0.0,
+            "KL joint temperature σ must be finite positive, got {t_unc}"
+        );
+    }
+
+    /// Issue #634: the joint combination on the COUNTS joint-Poisson path —
+    /// the third lifted guard. Deterministic counts (no sampling noise) at
+    /// the true corrected grid; the joint fit must recover (t0, L_scale, T)
+    /// and report a finite temperature σ through the joint-Poisson
+    /// uncertainty extraction.
+    #[test]
+    fn test_energy_scale_with_temperature_recovers_all_three_counts() {
+        let data = u238_three_resonances();
+        let flight_path = 25.0_f64;
+        let true_density = 0.002;
+        let true_temp = 340.0;
+        let true_t0 = 0.6_f64;
+        let true_l_scale = 1.004_f64;
+        let flux = 1.0e4_f64;
+        let nominal: Vec<f64> = (0..801).map(|i| 4.0 + (i as f64) * 0.05).collect();
+        let e_true = nereids_fitting::resolution_calib::corrected_energy_grid(
+            &nominal,
+            true_t0,
+            true_l_scale,
+            flight_path,
+        )
+        .unwrap();
+        let (t_true, _) = synthetic_transmission_at_temp(&data, true_density, true_temp, &e_true);
+        let open_beam = vec![flux; t_true.len()];
+        let sample_counts: Vec<f64> = t_true.iter().map(|&t| flux * t).collect();
+
+        let config = UnifiedFitConfig::new(
+            nominal,
+            vec![data],
+            vec!["U-238".into()],
+            true_temp - 40.0,
+            None,
+            vec![true_density],
+        )
+        .unwrap()
+        .with_solver(SolverConfig::PoissonKL(PoissonConfig::default()))
+        .with_fit_temperature(true)
+        .with_energy_scale(0.0, 1.0, flight_path);
+
+        let result = fit_spectrum_typed(
+            &InputData::Counts {
+                sample_counts,
+                open_beam_counts: open_beam,
+            },
+            &config,
+        )
+        .expect("counts joint-Poisson joint fit runs");
+        assert!(result.converged, "counts joint fit should converge");
+        let t0 = result.t0_us.expect("t0_us populated");
+        let ls = result.l_scale.expect("l_scale populated");
+        let temp = result.temperature_k.expect("temperature_k populated");
+        assert!(
+            (t0 - true_t0).abs() < 0.1,
+            "counts t0: fitted={t0}, true={true_t0}"
+        );
+        assert!(
+            (ls - true_l_scale).abs() / true_l_scale < 2e-3,
+            "counts l_scale: fitted={ls}, true={true_l_scale}"
+        );
+        assert!(
+            (temp - true_temp).abs() < 5.0,
+            "counts temperature: fitted={temp}, true={true_temp}"
+        );
+        let t_unc = result
+            .temperature_k_unc
+            .expect("counts joint fit must report a temperature σ");
+        assert!(
+            t_unc.is_finite() && t_unc > 0.0,
+            "counts joint temperature σ must be finite positive, got {t_unc}"
         );
     }
 
@@ -4786,6 +4940,27 @@ mod tests {
             mk(Some(t0), None)
                 .corrected_energies(&nominal, flight_path)
                 .is_none()
+        );
+
+        // Invalid scale inputs are REJECTED, not squared into plausible
+        // grids (#634 review): the transform is even in l_scale (a negative
+        // l_scale would silently return the same grid as its positive
+        // counterpart), flight_path_m = 0 with t0 < 0 would return all
+        // zeros, and a NaN l_scale would return Ok(NaN).
+        let fitted = mk(Some(t0), Some(ls));
+        assert!(fitted.corrected_energies(&nominal, 0.0).unwrap().is_err());
+        assert!(fitted.corrected_energies(&nominal, -25.0).unwrap().is_err());
+        assert!(
+            mk(Some(t0), Some(-1.0))
+                .corrected_energies(&nominal, flight_path)
+                .unwrap()
+                .is_err()
+        );
+        assert!(
+            mk(Some(t0), Some(f64::NAN))
+                .corrected_energies(&nominal, flight_path)
+                .unwrap()
+                .is_err()
         );
     }
 
