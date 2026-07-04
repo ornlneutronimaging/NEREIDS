@@ -234,6 +234,20 @@ fn validate_spatial_fit_preflight(
         )));
     }
 
+    // Gate: a fully-constrained fit (issue #633) — every density frozen and
+    // no other free parameter — would leave each pixel a converged no-op via
+    // the all-fixed solver fast path, i.e. an all-frozen "success" map.
+    // Reject the whole map up front with a clear message (mirrors the
+    // `fit_spectrum_typed` guard).
+    if count_free_params(config) == 0 {
+        return Err(PipelineError::InvalidParameter(
+            "no free parameters to fit: all densities are frozen and no other \
+             parameter is free — free at least one density (with_density_free) \
+             or enable fit_temperature / energy-scale / background"
+                .into(),
+        ));
+    }
+
     // Resolve `SolverConfig::Auto` against the input variant — counts
     // → PoissonKL, transmission → LM.  `effective_solver` lives on
     // `UnifiedFitConfig` but takes the 1D `InputData`; inline the
