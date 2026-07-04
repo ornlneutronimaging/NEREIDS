@@ -2943,3 +2943,68 @@ class TestCalibrateResolution:
                     flight_path_m=-1.0,
                     **kw,
                 )
+
+    def test_ic_params_decoded_and_bounds_reported(self):
+        # The bounded "ic" family (#642) exposes decoded physical parameters
+        # (single source of truth: the calibrated resolution, not the
+        # ln/box-encoded theta) plus the degeneracy report.
+        iso, e, t, unc = self._calibrant()
+        cal = nereids.calibrate_resolution(
+            e, t, unc, "ic", isotopes=[(iso, 5.0e-4)], temperature_k=300.0
+        )
+        p = cal.params()
+        for key in ("a0", "a1", "beta", "r", "psr_fwhm_us"):
+            assert key in p, f"missing decoded param {key}"
+        assert p["a0"] > 0.0
+        assert p["a1"] > 0.0  # alpha(E) positive by construction
+        assert p["beta"] > 0.0
+        assert 0.0 <= p["r"] <= 1.0
+        assert p["psr_fwhm_us"] >= 0.0
+        assert cal.n_free_params == 4
+        assert len(cal.theta) == 4
+        assert isinstance(cal.bounds_hit, list)
+        assert all(isinstance(s, str) for s in cal.bounds_hit)
+        assert "n_free_params=4" in repr(cal)
+
+    def test_fit_psr_appends_fifth_parameter(self):
+        iso, e, t, unc = self._calibrant()
+        cal = nereids.calibrate_resolution(
+            e,
+            t,
+            unc,
+            "ic",
+            isotopes=[(iso, 5.0e-4)],
+            temperature_k=300.0,
+            fit_psr=True,
+        )
+        assert cal.n_free_params == 5
+        assert len(cal.theta) == 5
+        # The fitted PSR FWHM respects its box (0.05-1 us).
+        assert 0.05 <= cal.params()["psr_fwhm_us"] <= 1.0
+
+    def test_fit_psr_requires_ic_family(self):
+        iso, e, t, unc = self._calibrant()
+        with pytest.raises(ValueError, match="fit_psr"):
+            nereids.calibrate_resolution(
+                e,
+                t,
+                unc,
+                "gaussian",
+                isotopes=[(iso, 5.0e-4)],
+                temperature_k=300.0,
+                fit_psr=True,
+            )
+
+    def test_invalid_psr_fwhm_rejected(self):
+        iso, e, t, unc = self._calibrant()
+        for bad in (-1.0, float("nan")):
+            with pytest.raises(ValueError, match="psr_fwhm_ns"):
+                nereids.calibrate_resolution(
+                    e,
+                    t,
+                    unc,
+                    "ic",
+                    isotopes=[(iso, 5.0e-4)],
+                    temperature_k=300.0,
+                    psr_fwhm_ns=bad,
+                )

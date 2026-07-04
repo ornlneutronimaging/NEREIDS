@@ -346,8 +346,28 @@ class ResolutionCalibration:
         to fit."""
         ...
 
+    @property
+    def n_free_params(self) -> int:
+        """Number of outer-loop free parameters: resolution theta plus any
+        fitted position coordinates (4-5 for family="ic", 2 for the other
+        families)."""
+        ...
+
+    @property
+    def bounds_hit(self) -> list[str]:
+        """Coordinates pinned at a box bound at the solution, as
+        "name:lower" / "name:upper" strings (empty list = interior solution).
+        E.g. "r:lower" flags the beta-R ridge: the calibrant shows no storage
+        tail, so the reported beta carries no information."""
+        ...
+
     def params(self) -> dict[str, float]:
-        """Decoded, human-readable fitted parameters."""
+        """Decoded, human-readable fitted parameters.
+
+        For family="ic" the keys are a0/a1 (alpha(E) = a0*sqrt(E) + a1,
+        positive by construction), beta, r and psr_fwhm_us — decoded from the
+        calibrated resolution itself (the raw theta is ln/box-encoded
+        optimizer space)."""
         ...
 
     def as_tabulated(self) -> TabulatedResolution | None:
@@ -616,6 +636,8 @@ def calibrate_resolution(
     restarts: int = 1,
     ic_n_energies: int = 64,
     ic_n_tau: int = 500,
+    psr_fwhm_ns: float = 350.0,
+    fit_psr: bool = False,
     fit_t0: bool = False,
     fit_l_scale: bool = False,
     t0_center_us: float = 0.0,
@@ -630,6 +652,15 @@ def calibrate_resolution(
     and ``temperature_k`` fixed. ``base_udr`` is required for ``"udr_corr"``.
     Pin the returned resolution into a sample fit via ``.as_tabulated()`` (or
     ``.gaussian_params()`` for the Gaussian family).
+
+    The ``"ic"`` family fits the full bounded moderator shape:
+    ``alpha(E) = a0*sqrt(E) + a1`` (positive by construction), free bounded
+    ``beta`` and storage fraction ``r``, folded with the SNS PSR channel
+    triangle of FWHM ``psr_fwhm_ns`` (default 350 ns, the VENUS FTS header
+    value; 0 disables; applies to "ic" only — tabulated/UDR kernels already
+    carry the fold). ``fit_psr=True`` ("ic" only) also fits the PSR FWHM as a
+    5th parameter (box-bounded 0.05-1 us). Degenerate directions are reported
+    via ``bounds_hit``.
 
     By default position is PINNED (``fit_t0=fit_l_scale=False``): a pure
     shape/width fit on the already energy-calibrated grid. Set ``fit_t0`` /
