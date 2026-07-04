@@ -9,7 +9,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
 
 ### Added
 
-- **Per-parameter density freeze in every fitter** (#633): area
+- **Per-parameter density freeze in every fitter** (#633): areal
   densities can now be held fixed while other parameters (temperature,
   energy scale, background) are fit. `UnifiedFitConfig` gains
   `with_fix_densities(bool)` (freeze all densities) and
