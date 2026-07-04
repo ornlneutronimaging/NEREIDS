@@ -2154,6 +2154,20 @@ class TestFixDensities:
         assert abs(r.temperature_k - true_temp) < 2.0, (
             f"temperature not recovered: got {r.temperature_k}, want {true_temp}"
         )
+        # #633 P0 regression: with the density frozen, temperature is the sole
+        # free parameter. Its 1-σ must be finite and positive (mapped from the
+        # correct free slot); the frozen density reports NaN (no covariance
+        # column). Before the free-index mapping fix the binding returned a NaN
+        # temperature σ and a misassigned density σ, since uncertainties were
+        # indexed by the full parameter layout.
+        assert r.temperature_k_unc is not None
+        assert np.isfinite(r.temperature_k_unc) and r.temperature_k_unc > 0.0, (
+            "frozen-density thermometry must report a finite positive "
+            f"temperature σ, got {r.temperature_k_unc}"
+        )
+        assert np.isnan(float(r.uncertainties[0])), (
+            f"frozen density must report NaN σ, got {r.uncertainties[0]}"
+        )
 
     def test_density_free_mask_freezes_selected_density(self, u238_data):
         """A per-density `density_free` mask freezes only the marked
