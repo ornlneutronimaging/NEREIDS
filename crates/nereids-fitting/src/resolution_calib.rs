@@ -125,6 +125,20 @@ const NS_TO_US: f64 = 1e-3;
 /// A coordinate within this fraction of its box range of a bound is reported
 /// in [`CalibrationResult::bounds_hit`] as pinned.
 const BOUND_HIT_REL_TOL: f64 = 1e-3;
+/// Cap on per-restart Nelder–Mead simplex re-inflations (fresh simplex
+/// restarted at the incumbent while it keeps improving by more than `fatol`).
+/// Guards against premature simplex collapse — see the re-inflation comment
+/// in [`calibrate_resolution`] — while guaranteeing termination.
+const MAX_SIMPLEX_REINFLATIONS: usize = 5;
+/// Initial-step fraction for the RE-INFLATED simplex (vs the default 0.05 of
+/// the first descent). A collapsed simplex rebuilt at the same 5 % scale
+/// deterministically re-collapses to the same trap (observed on the IC
+/// family's curved α↔β↔R valley); a 25 % edge straddles the valley and lets
+/// the restarted simplex see the descent direction.
+const REINFLATE_STEP_FRAC: f64 = 0.25;
+/// Absolute re-inflation step for near-zero coordinates (`|x| < 1e-8`),
+/// matching the box scale of the bounded coordinates (R ∈ [0, 1]).
+const REINFLATE_STEP_ABS: f64 = 0.1;
 /// Guard-rail bound (µs) on the optional fitted TOF zero `t0`. `t0` and `L_scale`
 /// are the SAMMY *energy-scale* parameters; resolution calibration pins them by
 /// default and fits them only as an explicit, prior-constrained opt-in (see
@@ -862,7 +876,7 @@ pub fn calibrate_resolution(
             .zip(&bounds)
             .map(|(&v, &(lo, hi))| (v + 0.1 * r as f64 * (hi - lo)).clamp(lo, hi))
             .collect();
-        let obj = |theta: &[f64]| -> Result<f64, FittingError> {
+        let mut obj = |theta: &[f64]| -> Result<f64, FittingError> {
             // theta = [resolution params (n_res)..., t0?, L_scale?]. The resolution
             // kernel uses only the first n_res; (t0, L_scale) set the energy scale.
             let res = build_resolution(&family, theta, e_min, e_max, config)?;
@@ -885,7 +899,37 @@ pub fn calibrate_resolution(
             };
             Ok(ssr + position_prior_penalty(t0, l_scale, config))
         };
-        let res = nelder_mead_minimize(obj, &start, Some(&bounds), &nm)?;
+        let mut res = nelder_mead_minimize(&mut obj, &start, Some(&bounds), &nm)?;
+        // Simplex RE-INFLATION: Nelder–Mead's known failure mode is premature
+        // simplex collapse — the spread criteria are met (`self_converged`)
+        // at a point that is NOT the basin minimum. Observed on the
+        // 4-parameter IC family: a 300 K synthetic calibrant stalled at
+        // Δχ² ≈ +130 above the noise floor in the curved α↔β↔R valley, and
+        // the ~1.5 % kernel-width error re-expressed as a ~23 K temperature
+        // bias in the downstream pinned fit. Standard cure: restart a FRESH,
+        // *larger* simplex at the incumbent (same 5 % edge re-collapses to
+        // the same trap deterministically) and keep the improvement, until
+        // it stops helping (bounded by MAX_SIMPLEX_REINFLATIONS). A
+        // re-inflation from a true minimum re-contracts quickly, so the
+        // extra cost there is small.
+        let reinflate_nm = NelderMeadConfig {
+            initial_step_frac: REINFLATE_STEP_FRAC,
+            initial_step_abs: REINFLATE_STEP_ABS,
+            ..nm.clone()
+        };
+        for _ in 0..MAX_SIMPLEX_REINFLATIONS {
+            let again = nelder_mead_minimize(&mut obj, &res.x, Some(&bounds), &reinflate_nm)?;
+            let improved = again.fun + nm.fatol < res.fun;
+            res.iterations += again.iterations;
+            res.n_evals += again.n_evals;
+            if improved {
+                res.x = again.x;
+                res.fun = again.fun;
+                res.self_converged = again.self_converged;
+            } else {
+                break;
+            }
+        }
         if best.as_ref().is_none_or(|b| res.fun < b.fun) {
             best = Some(res);
         }
