@@ -7,6 +7,33 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
 
 ## [Unreleased]
 
+### Added
+
+- **Hot/railed pixel detection** (#643): `detect_hot_pixels` — robust
+  one-sided log-space median + k·MAD screen on per-pixel total counts
+  (k = 6 default, with a Poisson floor on the robust scale so quantized
+  low-count images never turn the screen into a low-count filter), in
+  Rust (`nereids_io::normalization`) and Python.
+- **Chunked dead-pixel detection** (#643):
+  `detect_dead_pixels_chunked` — per-acquisition-chunk detection that
+  flags pixels dead in *any* chunk, catching intermittent deadness
+  invisible to the summed-stack test, in Rust and Python.
+- **Unified bad-pixel entry point** (#643): `detect_bad_pixels` —
+  validating detector computing dead ∪ hot over the sample and
+  (optionally) the open-beam stack, in Rust and Python.
+- `nereids-core` gains a `stats` module (`median`,
+  `median_abs_deviation`, `MAD_TO_SIGMA`).
+
+### Changed
+
+- **GUI normalization now masks dead(sample) ∪ dead(OB) ∪ hot(sample)
+  ∪ hot(OB)** instead of dead(sample) only (#643) — masked-pixel counts
+  may differ on re-normalization of existing data.
+- Pixel-mask documentation now states the semantics explicitly (#643):
+  masks are a pipeline-integrity screen only, never a
+  data-quality/coverage filter — low-count pixels are alive and are
+  kept.
+
 ## [0.2.2] - 2026-07-03
 
 ### Fixed
