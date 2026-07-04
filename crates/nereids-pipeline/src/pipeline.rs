@@ -1942,6 +1942,17 @@ fn seed_energy_scale_in_params(
     }
 }
 
+/// Optimizer box bound on the TZERO offset: `t_0 ∈ [−T0, +T0]` µs.
+/// `calibrate_energy` (calibration.rs) composes multiple fits when an
+/// offset exceeds one box (issue #634); each individual fit is bounded here.
+const ENERGY_SCALE_T0_BOUND_US: f64 = 10.0;
+/// Optimizer box bounds on the flight-path scale `L_scale` (dimensionless,
+/// ±1 %).  `calibrate_energy` re-anchors across cycles to cover its wider
+/// documented band (issue #634); each individual fit is bounded here.
+const ENERGY_SCALE_L_SCALE_LO: f64 = 0.99;
+/// Upper `L_scale` bound; see [`ENERGY_SCALE_L_SCALE_LO`].
+const ENERGY_SCALE_L_SCALE_HI: f64 = 1.01;
+
 /// Append SAMMY TZERO energy-scale parameters (t_0 and L_scale) when
 /// `config.fit_energy_scale` is `true`.  Returns `(t0_idx, l_scale_idx)`.
 ///
@@ -1958,16 +1969,16 @@ fn append_energy_scale_params(
     param_vec.push(FitParameter {
         name: "t0_us".into(),
         value: config.t0_init_us,
-        lower: -10.0,
-        upper: 10.0,
+        lower: -ENERGY_SCALE_T0_BOUND_US,
+        upper: ENERGY_SCALE_T0_BOUND_US,
         fixed: false,
     });
     let ls_idx = param_vec.len();
     param_vec.push(FitParameter {
         name: "l_scale".into(),
         value: config.l_scale_init,
-        lower: 0.99,
-        upper: 1.01,
+        lower: ENERGY_SCALE_L_SCALE_LO,
+        upper: ENERGY_SCALE_L_SCALE_HI,
         fixed: false,
     });
     Some((t0_idx, ls_idx))
