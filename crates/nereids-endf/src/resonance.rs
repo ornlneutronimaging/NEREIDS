@@ -1202,6 +1202,41 @@ pub mod test_support {
         )
     }
 
+    /// Multi-resonance sibling of [`synthetic_isotope`]: N s-wave resonances
+    /// `(energy_eV, Γn_eV, Γγ_eV)` in **one** L-group of a **single** range —
+    /// i.e. ONE potential-scattering term.  Deliberately NOT built by stacking
+    /// N `synthetic_isotope` single-resonance isotopes in a sample: each such
+    /// isotope carries its own AP hard-sphere background, so a stack N-folds
+    /// the potential-scattering baseline.  Same structural defaults as
+    /// [`synthetic_isotope`] (RM, AP=6, I=0, L=0, J=0.5, `awr ≈ a − 0.009`).
+    pub fn synthetic_isotope_multi(
+        z: u32,
+        a: u32,
+        resonances: &[(f64, f64, f64)],
+    ) -> ResonanceData {
+        let awr = a as f64 - 0.009;
+        wrap(
+            z,
+            a,
+            awr,
+            make_range(
+                1e-5,
+                1e4,
+                ResonanceFormalism::ReichMoore,
+                0.0,
+                6.0,
+                1,
+                0,
+                awr,
+                0.0,
+                resonances
+                    .iter()
+                    .map(|&(e, gn, gg)| res(e, 0.5, gn, gg))
+                    .collect(),
+            ),
+        )
+    }
+
     /// Hf-178 MLBW: two s-waves at 7.8 and 16.9 eV in the same J=1/2 group.
     /// Range `0 .. 100` eV, AP=9.48, NAPS=0.  MLBW positivity and
     /// total-vs-components regression tests in `slbw.rs`.
@@ -1349,5 +1384,33 @@ mod test_support_tests {
         let d = synthetic_isotope(74, 184, 10.0, 1e-3, 1e-2);
         assert_eq!(d.za, 74184);
         assert_eq!(d.ranges[0].l_groups[0].resonances[0].energy, 10.0);
+    }
+
+    #[test]
+    fn synthetic_isotope_multi_puts_all_resonances_in_one_group() {
+        // One range, one L-group, one potential-scattering term — NOT N
+        // stacked single-resonance isotopes (which would N-fold the AP
+        // background).
+        let d = synthetic_isotope_multi(
+            73,
+            181,
+            &[
+                (10.36, 0.003, 0.058),
+                (24.0, 0.009, 0.060),
+                (39.1, 0.040, 0.060),
+            ],
+        );
+        assert_eq!(d.za, 73181);
+        assert_eq!(d.ranges.len(), 1);
+        assert_eq!(d.ranges[0].l_groups.len(), 1);
+        let rs = &d.ranges[0].l_groups[0].resonances;
+        assert_eq!(rs.len(), 3);
+        assert_eq!(rs[0].energy, 10.36);
+        assert_eq!(rs[2].gn, 0.040);
+        // Structural defaults match synthetic_isotope (same awr law, RM, J=0.5).
+        let single = synthetic_isotope(73, 181, 10.36, 0.003, 0.058);
+        assert_eq!(d.awr, single.awr);
+        assert_eq!(d.ranges[0].formalism, single.ranges[0].formalism);
+        assert_eq!(rs[0].j, single.ranges[0].l_groups[0].resonances[0].j);
     }
 }
