@@ -976,6 +976,20 @@ pub fn fit_spectrum_typed(
         )));
     }
 
+    // Reject a fully-constrained fit up front (issue #633): freezing every
+    // density with no other free parameter leaves nothing to vary, and the
+    // solver cores' all-fixed fast path would otherwise report
+    // `converged = true` from a no-op evaluate-once — a misleading success at
+    // a public entry point. Surface it as a clear config error instead.
+    if count_free_params(config) == 0 {
+        return Err(PipelineError::InvalidParameter(
+            "no free parameters to fit: all densities are frozen and no other \
+             parameter is free — free at least one density (with_density_free) \
+             or enable fit_temperature / energy-scale / background"
+                .to_string(),
+        ));
+    }
+
     // Validate input length matches energy grid
     if input.n_energies() != n_e {
         return Err(PipelineError::ShapeMismatch(format!(
@@ -5746,6 +5760,37 @@ mod tests {
             "group density frozen when freeze follows grouping"
         );
         assert_eq!(cfg.n_free_density_params(), 0);
+    }
+
+    /// #633 (review R4): a fully-constrained fit — every density frozen and
+    /// no other free parameter — must be rejected up front, not silently
+    /// reported as a converged no-op by the solver's all-fixed fast path.
+    #[test]
+    fn test_all_frozen_no_free_param_rejected() {
+        let data = u238_single_resonance();
+        let true_density = 0.0005;
+        let energies: Vec<f64> = (0..201).map(|i| 1.0 + (i as f64) * 0.05).collect();
+        let (t, sigma) = synthetic_transmission_at_temp(&data, true_density, 300.0, &energies);
+        let config = UnifiedFitConfig::new(
+            energies,
+            vec![data],
+            vec!["U-238".into()],
+            300.0,
+            None,
+            vec![true_density],
+        )
+        .unwrap()
+        // Freeze the only parameter; fit_temperature stays false → 0 free.
+        .with_fix_densities(true);
+        assert_eq!(count_free_params(&config), 0);
+        let input = InputData::Transmission {
+            transmission: t,
+            uncertainty: sigma,
+        };
+        assert!(matches!(
+            fit_spectrum_typed(&input, &config),
+            Err(PipelineError::InvalidParameter(_))
+        ));
     }
 
     /// Closed-loop (issue #633 acceptance): synthetic spectrum at a known

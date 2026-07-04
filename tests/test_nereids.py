@@ -2119,7 +2119,18 @@ class TestFitEnergyRangeBindingParameter:
 
 
 class TestFixDensities:
-    """Issue #633: freeze known densities (calibration-foil thermometry)."""
+    """Issue #633: freeze known densities (calibration-foil thermometry).
+
+    These verify the freeze *plumbing* — which parameters vary, how frozen
+    slots map through the free-only covariance/uncertainty vector, and the
+    reported degrees of freedom. Spectra are generated with
+    ``nereids.forward_model`` and fitted through the same stack (loop
+    closure): appropriate here because the physics oracle (Doppler /
+    temperature sensitivity, Beer–Lambert) is validated independently against
+    SAMMY in the ``nereids-physics`` crate — these tests deliberately do not
+    re-validate it. Non-vacuity is guaranteed by seeding every fit away from
+    truth (temperature 50 K off, densities offset), so a no-op fit fails.
+    """
 
     def test_fix_densities_holds_density_and_recovers_temperature(self, u238_data):
         """Synthetic spectrum at a known (n, T); freeze n at truth and fit
@@ -2285,24 +2296,68 @@ class TestFixDensities:
         np.testing.assert_array_equal(dmap, seed)
 
     def test_density_free_mask_freezes_selected_density(self, u238_data):
-        """A per-density `density_free` mask freezes only the marked
-        densities; the free one is still fitted."""
-        energies = np.linspace(1.0, 30.0, 400)
-        t = np.asarray(nereids.forward_model(energies, [(u238_data, 8.0e-4)]))
-        sigma = np.full_like(t, 0.005)
+        """A per-density ``density_free`` mask freezes only the marked density
+        parameter while the unmarked one is still fitted. Two spectrally
+        distinct isotopes: index 0 frozen at its seed (held bit-exactly, NaN
+        σ), index 1 free and recovered (finite σ). This also exercises the
+        leading-frozen uncertainty mapping — the free density's σ must come
+        from free slot 0, not full index 1 (the R1 index-compression fix)."""
+        # A second, well-separated resonance (≈21 eV) so the two densities are
+        # distinguishable and the free one can be recovered.
+        iso_b = _make_single_resonance(
+            z=90, a=232, awr=230.045, scattering_radius=9.0,
+            energy=21.0, j=0.5, gn=0.002, gg=0.02,
+        )
+        energies = np.linspace(1.0, 30.0, 500)
+        d_a_true, d_b_true = 8.0e-4, 1.2e-3
+        t = np.asarray(
+            nereids.forward_model(
+                energies, [(u238_data, d_a_true), (iso_b, d_b_true)]
+            )
+        )
+        sigma = np.full_like(t, 0.003)
         r = nereids.fit_spectrum_typed(
             transmission=t,
             uncertainty=sigma,
             energies=energies,
-            isotopes=[(u238_data, 5.0e-4)],  # seeded off; frozen here
+            # index 0 frozen at truth; index 1 seeded off and left free.
+            isotopes=[(u238_data, d_a_true), (iso_b, 5.0e-4)],
             solver="lm",
             temperature_k=293.6,
-            density_free=[False],  # freeze the single density
-            max_iter=100,
+            density_free=[False, True],
+            max_iter=200,
         )
         assert bool(r.converged) is True
-        # Frozen at the seed, not driven toward the 8e-4 truth.
-        assert r.densities[0] == 5.0e-4
+        # Masked-false density held bit-exactly; free density recovered.
+        assert r.densities[0] == d_a_true, "masked-false density must not move"
+        assert abs(r.densities[1] - d_b_true) / d_b_true < 0.05, (
+            f"free density should recover: got {r.densities[1]}, want {d_b_true}"
+        )
+        # Frozen density → NaN σ; free density → finite positive σ.
+        assert np.isnan(float(r.uncertainties[0])), (
+            f"frozen density σ must be NaN, got {r.uncertainties[0]}"
+        )
+        assert np.isfinite(float(r.uncertainties[1])) and r.uncertainties[1] > 0.0, (
+            f"free density σ must be finite positive, got {r.uncertainties[1]}"
+        )
+
+    def test_all_frozen_no_free_param_rejected(self, u238_data):
+        """Freezing the only density with no other free parameter is rejected
+        up front — the all-fixed solver fast path would otherwise report
+        ``converged=true`` from a fit that varied nothing (review R4)."""
+        energies = np.linspace(1.0, 30.0, 200)
+        t = np.asarray(nereids.forward_model(energies, [(u238_data, 8.0e-4)]))
+        sigma = np.full_like(t, 0.005)
+        with pytest.raises(RuntimeError, match="no free parameters"):
+            nereids.fit_spectrum_typed(
+                transmission=t,
+                uncertainty=sigma,
+                energies=energies,
+                isotopes=[(u238_data, 8.0e-4)],
+                solver="lm",
+                temperature_k=293.6,
+                fix_densities=True,  # freeze the only param, nothing else free
+            )
 
     def test_fix_densities_and_density_free_are_mutually_exclusive(self, u238_data):
         """Supplying both `fix_densities` and `density_free` is rejected."""
