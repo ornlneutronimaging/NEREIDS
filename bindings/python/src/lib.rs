@@ -2601,7 +2601,15 @@ fn precompute_cross_sections<'py>(
 ///
 /// A pixel is marked as "dead" when all its counts across the spectral/TOF
 /// axis are exactly zero.  The returned mask can be passed directly to
-/// ``spatial_map(dead_pixels=...)``.
+/// ``spatial_map_typed(dead_pixels=...)``.
+///
+/// Pixel masks are a **pipeline-integrity screen only** — they exclude
+/// pixels whose data stream is broken (dead, hot/railed), never low-count
+/// or poorly covered pixels.  Low-count pixels are alive and must be kept.
+/// Prefer ``detect_bad_pixels()`` (validating, unions sample and open-beam,
+/// optional hot screen); see also ``detect_hot_pixels()`` and
+/// ``detect_dead_pixels_chunked()`` for intermittent deadness across
+/// acquisition chunks.
 ///
 /// Args:
 ///     data: 3D numpy array with shape ``(n_frames, height, width)``.
@@ -2617,6 +2625,116 @@ fn detect_dead_pixels<'py>(
 ) -> PyResult<Bound<'py, PyArray2<bool>>> {
     let arr = data.as_array().to_owned();
     let mask = py.detach(move || norm::detect_dead_pixels(&arr));
+    Ok(PyArray2::from_owned_array(py, mask))
+}
+
+/// Detect hot (railed / runaway) pixels.
+///
+/// Robust one-sided screen on per-pixel total counts: a pixel is flagged
+/// when ``ln(total) > median + k_mad * sigma``, where median and MAD are
+/// computed over the live (``total > 0``) pixels only and ``sigma`` is the
+/// MAD-based robust scale floored by the Poisson counting noise of the
+/// median total.  Upper tail only — stuck-low pixels are indistinguishable
+/// from low-count-alive pixels and are kept (masks are pipeline-integrity
+/// only, never a low-count screen).
+///
+/// Args:
+///     data: 3D numpy array with shape ``(n_frames, height, width)``.
+///     k_mad: Robust-sigma multiplier for the upper-tail cut (default 6.0:
+///         one-sided Gaussian tail ~1e-9, essentially never flags a
+///         statistically plausible pixel).
+///
+/// Returns:
+///     2D boolean numpy array with shape ``(height, width)``.
+///     ``True`` marks a hot pixel.
+///
+/// Raises:
+///     ValueError: If ``data`` contains non-finite or negative values, or
+///         ``k_mad`` is not finite and positive.
+#[pyfunction]
+#[pyo3(signature = (data, k_mad = norm::HOT_PIXEL_K_MAD))]
+fn detect_hot_pixels<'py>(
+    py: Python<'py>,
+    data: PyReadonlyArray3<f64>,
+    k_mad: f64,
+) -> PyResult<Bound<'py, PyArray2<bool>>> {
+    let arr = data.as_array().to_owned();
+    let mask = py.detach(move || norm::detect_hot_pixels(&arr, k_mad));
+    let mask = mask.map_err(|e| pyo3::exceptions::PyValueError::new_err(format!("{}", e)))?;
+    Ok(PyArray2::from_owned_array(py, mask))
+}
+
+/// Detect dead pixels across acquisition chunks (dead in ANY chunk).
+///
+/// Catches intermittent deadness that ``detect_dead_pixels()`` on the
+/// summed stack cannot see: a pixel dead for one acquisition chunk but
+/// alive in another has nonzero summed counts, yet its dead-chunk data
+/// corrupts the combined spectrum.  Chunk the acquisition so each live
+/// pixel has an expected >= 20 total counts per chunk (misflag probability
+/// per live pixel is ``m * exp(-lambda)`` over ``m`` chunks).
+///
+/// Chunks may have different numbers of frames (ragged event
+/// re-histogramming is fine); spatial dimensions must agree.
+///
+/// Args:
+///     chunks: List of 3D numpy arrays, one per acquisition chunk, each
+///         with shape ``(n_frames_i, height, width)``.
+///
+/// Returns:
+///     2D boolean numpy array with shape ``(height, width)``.
+///     ``True`` marks a pixel that is all-zero in at least one chunk.
+///
+/// Raises:
+///     ValueError: If ``chunks`` is empty, any chunk contains non-finite
+///         or negative values, or the spatial dimensions differ.
+#[pyfunction]
+fn detect_dead_pixels_chunked<'py>(
+    py: Python<'py>,
+    chunks: Vec<PyReadonlyArray3<f64>>,
+) -> PyResult<Bound<'py, PyArray2<bool>>> {
+    // Copy to owned arrays before releasing the GIL.
+    let owned: Vec<_> = chunks.iter().map(|c| c.as_array().to_owned()).collect();
+    let mask = py.detach(move || norm::detect_dead_pixels_chunked(&owned));
+    let mask = mask.map_err(|e| pyo3::exceptions::PyValueError::new_err(format!("{}", e)))?;
+    Ok(PyArray2::from_owned_array(py, mask))
+}
+
+/// Detect all pipeline-corrupting pixels: dead + hot over sample and
+/// (optionally) open beam.
+///
+/// This is the validating entry point.  Deadness/hotness is
+/// per-acquisition — a pixel dead only in the open-beam run still corrupts
+/// every transmission ratio computed from it — so the masks of both stacks
+/// are unioned: ``dead(sample) | hot(sample) [| dead(ob) | hot(ob)]``.
+/// The stacks' frame counts may differ; spatial dimensions must agree.
+///
+/// Args:
+///     sample: 3D numpy array with shape ``(n_frames, height, width)``.
+///     open_beam: Optional 3D numpy array with shape
+///         ``(n_frames2, height, width)``.
+///     hot_k_mad: Robust-sigma multiplier for the hot-pixel screen
+///         (default 6.0), or ``None`` to disable it (dead-only detection).
+///
+/// Returns:
+///     2D boolean numpy array with shape ``(height, width)``.
+///     ``True`` marks a pixel to exclude.
+///
+/// Raises:
+///     ValueError: If either stack contains non-finite or negative values,
+///         the spatial dimensions differ, or ``hot_k_mad`` is not finite
+///         and positive.
+#[pyfunction]
+#[pyo3(signature = (sample, open_beam = None, hot_k_mad = Some(norm::HOT_PIXEL_K_MAD)))]
+fn detect_bad_pixels<'py>(
+    py: Python<'py>,
+    sample: PyReadonlyArray3<f64>,
+    open_beam: Option<PyReadonlyArray3<f64>>,
+    hot_k_mad: Option<f64>,
+) -> PyResult<Bound<'py, PyArray2<bool>>> {
+    let s = sample.as_array().to_owned();
+    let ob = open_beam.map(|o| o.as_array().to_owned());
+    let mask = py.detach(move || norm::detect_bad_pixels(&s, ob.as_ref(), hot_k_mad));
+    let mask = mask.map_err(|e| pyo3::exceptions::PyValueError::new_err(format!("{}", e)))?;
     Ok(PyArray2::from_owned_array(py, mask))
 }
 
@@ -3058,6 +3176,9 @@ fn nereids(m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_function(wrap_pyfunction!(py_trace_detectability_survey, m)?)?;
     m.add_function(wrap_pyfunction!(precompute_cross_sections, m)?)?;
     m.add_function(wrap_pyfunction!(detect_dead_pixels, m)?)?;
+    m.add_function(wrap_pyfunction!(detect_hot_pixels, m)?)?;
+    m.add_function(wrap_pyfunction!(detect_dead_pixels_chunked, m)?)?;
+    m.add_function(wrap_pyfunction!(detect_bad_pixels, m)?)?;
     m.add_function(wrap_pyfunction!(py_calibrate_energy, m)?)?;
     m.add_class::<PyCalibrationResult>()?;
     // Phase 5: Typed API

@@ -889,6 +889,13 @@ def detect_dead_pixels(
 ) -> NDArray[np.bool_]:
     """Detect dead pixels (all-zero across the spectral axis).
 
+    Pixel masks are a pipeline-integrity screen only — they exclude pixels
+    whose data stream is broken (dead, hot/railed), never low-count or
+    poorly covered pixels.  Low-count pixels are alive and must be kept.
+    Prefer ``detect_bad_pixels()`` (validating, unions sample and open-beam,
+    optional hot screen); see also ``detect_hot_pixels()`` and
+    ``detect_dead_pixels_chunked()``.
+
     Parameters
     ----------
     data :
@@ -900,6 +907,114 @@ def detect_dead_pixels(
     NDArray[np.bool_]
         2D boolean mask with shape ``(height, width)``, where ``True`` marks
         a dead pixel (all-zero across the spectral axis).
+    """
+    ...
+
+def detect_hot_pixels(
+    data: NDArray[np.float64],
+    k_mad: float = 6.0,
+) -> NDArray[np.bool_]:
+    """Detect hot (railed / runaway) pixels.
+
+    Robust one-sided screen on per-pixel total counts: a pixel is flagged
+    when ``ln(total) > median + k_mad * sigma``, with median and MAD taken
+    over the live (``total > 0``) pixels only and ``sigma`` floored by the
+    Poisson counting noise of the median total.  Upper tail only —
+    stuck-low pixels are indistinguishable from low-count-alive pixels and
+    are kept (masks are pipeline-integrity only, never a low-count screen).
+
+    Parameters
+    ----------
+    data :
+        3D NumPy array with shape ``(n_frames, height, width)``.
+    k_mad :
+        Robust-sigma multiplier for the upper-tail cut. The default 6.0
+        corresponds to a one-sided Gaussian tail of ~1e-9 — it essentially
+        never flags a statistically plausible pixel.
+
+    Returns
+    -------
+    NDArray[np.bool_]
+        2D boolean mask with shape ``(height, width)``, where ``True`` marks
+        a hot pixel.
+
+    Raises
+    ------
+    ValueError
+        If ``data`` contains non-finite or negative values, or ``k_mad`` is
+        not finite and positive.
+    """
+    ...
+
+def detect_dead_pixels_chunked(
+    chunks: list[NDArray[np.float64]],
+) -> NDArray[np.bool_]:
+    """Detect dead pixels across acquisition chunks (dead in ANY chunk).
+
+    Catches intermittent deadness invisible to ``detect_dead_pixels()`` on
+    the summed stack: a pixel dead for one acquisition chunk but alive in
+    another has nonzero summed counts, yet its dead-chunk data corrupts the
+    combined spectrum.  Chunk the acquisition so each live pixel has an
+    expected >= 20 total counts per chunk (misflag probability per live
+    pixel is ``m * exp(-lambda)`` over ``m`` chunks).
+
+    Parameters
+    ----------
+    chunks :
+        List of 3D NumPy arrays, one per acquisition chunk, each with shape
+        ``(n_frames_i, height, width)``.  Frame counts may differ between
+        chunks (ragged event re-histogramming is fine); spatial dimensions
+        must agree.
+
+    Returns
+    -------
+    NDArray[np.bool_]
+        2D boolean mask with shape ``(height, width)``, where ``True`` marks
+        a pixel that is all-zero in at least one chunk.
+
+    Raises
+    ------
+    ValueError
+        If ``chunks`` is empty, any chunk contains non-finite or negative
+        values, or the spatial dimensions differ between chunks.
+    """
+    ...
+
+def detect_bad_pixels(
+    sample: NDArray[np.float64],
+    open_beam: NDArray[np.float64] | None = None,
+    hot_k_mad: float | None = 6.0,
+) -> NDArray[np.bool_]:
+    """Detect all pipeline-corrupting pixels: dead + hot, sample and OB.
+
+    The validating entry point.  Deadness/hotness is per-acquisition — a
+    pixel dead only in the open-beam run still corrupts every transmission
+    ratio computed from it — so the masks of both stacks are unioned:
+    ``dead(sample) | hot(sample) [| dead(open_beam) | hot(open_beam)]``.
+    Frame counts may differ between the stacks; spatial dimensions must
+    agree.  The result can be passed to ``spatial_map_typed(dead_pixels=...)``.
+
+    Parameters
+    ----------
+    sample :
+        3D NumPy array with shape ``(n_frames, height, width)``.
+    open_beam :
+        Optional 3D NumPy array with shape ``(n_frames2, height, width)``.
+    hot_k_mad :
+        Robust-sigma multiplier for the hot-pixel screen (default 6.0), or
+        ``None`` to disable it (dead-only detection).
+
+    Returns
+    -------
+    NDArray[np.bool_]
+        2D boolean mask with shape ``(height, width)``, where ``True`` marks
+        a pixel to exclude from fitting.
+
+    Raises
+    ------
+    ValueError
+        If either stack contains non-finite or negative values, the spatial
+        dimensions differ, or ``hot_k_mad`` is not finite and positive.
     """
     ...
 

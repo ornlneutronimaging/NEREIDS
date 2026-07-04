@@ -1344,6 +1344,131 @@ class TestNormalization:
 
 
 # ===========================================================================
+# Pixel masks (pipeline-integrity screens, #643)
+# ===========================================================================
+
+
+class TestPixelMasks:
+    """Tests for detect_dead_pixels, detect_hot_pixels,
+    detect_dead_pixels_chunked, and detect_bad_pixels (#643)."""
+
+    def test_detect_dead_pixels_backcompat(self):
+        """The original all-zero-stack detector is unchanged."""
+        data = np.full((3, 2, 2), 5.0)
+        data[:, 0, 0] = 0.0
+        mask = np.asarray(nereids.detect_dead_pixels(data))
+        assert mask.dtype == np.bool_
+        assert mask.shape == (2, 2)
+        assert mask[0, 0]
+        assert not mask[1, 1]
+
+    def test_detect_bad_pixels_union(self):
+        """dead(sample) | hot(sample) | dead(ob) | hot(ob); low-count kept."""
+        sample = np.full((3, 3, 3), 100.0)
+        sample[:, 0, 0] = 0.0  # dead in sample only
+        sample[:, 1, 2] = 0.0
+        sample[0, 1, 2] = 1.0  # low-count-ALIVE: 1 total count
+        ob = np.full((3, 3, 3), 200.0)
+        ob[:, 0, 1] = 0.0  # dead in OB only
+        ob[:, 2, 2] = 65535.0  # hot (railed) in OB only
+
+        mask = np.asarray(nereids.detect_bad_pixels(sample, ob))
+        assert mask.dtype == np.bool_
+        assert mask.shape == (3, 3)
+        assert mask[0, 0], "dead-in-sample-only must be flagged"
+        assert mask[0, 1], "dead-in-OB-only must be flagged"
+        assert mask[2, 2], "hot-in-OB-only must be flagged"
+        assert not mask[1, 2], "low-count-alive pixel must be kept"
+        assert mask.sum() == 3
+
+    def test_detect_bad_pixels_hot_k_mad_none_disables_hot(self):
+        sample = np.full((3, 3, 3), 100.0)
+        sample[:, 1, 1] = 65535.0  # railed
+        dead_only = np.asarray(nereids.detect_bad_pixels(sample, hot_k_mad=None))
+        assert not dead_only.any()
+        with_hot = np.asarray(nereids.detect_bad_pixels(sample))
+        assert with_hot[1, 1]
+
+    def test_detect_hot_pixels_flags_railed_keeps_low_count(self):
+        data = np.full((3, 3, 3), 100.0)
+        data[:, 2, 0] = 65535.0  # railed
+        data[:, 0, 2] = 0.0
+        data[1, 0, 2] = 1.0  # low-count-alive
+        mask = np.asarray(nereids.detect_hot_pixels(data))
+        assert mask[2, 0], "railed pixel must be flagged"
+        assert not mask[0, 2], "low-count-alive pixel must be kept"
+        assert mask.sum() == 1
+
+    def test_detect_dead_pixels_chunked_catches_intermittent(self):
+        chunk0 = np.full((3, 2, 2), 5.0)
+        chunk0[:, 0, 1] = 0.0  # dead throughout chunk 0 only
+        chunk1 = np.full((3, 2, 2), 5.0)
+        mask = np.asarray(nereids.detect_dead_pixels_chunked([chunk0, chunk1]))
+        assert mask[0, 1]
+        assert mask.sum() == 1
+        # The gap being closed: the summed stack cannot see it.
+        summed_mask = np.asarray(nereids.detect_dead_pixels(chunk0 + chunk1))
+        assert not summed_mask[0, 1]
+
+    def test_shape_mismatch_raises(self):
+        sample = np.ones((3, 2, 2))
+        ob = np.ones((3, 2, 3))
+        with pytest.raises(ValueError, match="[Ss]hape"):
+            nereids.detect_bad_pixels(sample, ob)
+        with pytest.raises(ValueError, match="[Ss]hape"):
+            nereids.detect_dead_pixels_chunked([sample, ob])
+
+    def test_nan_raises(self):
+        data = np.ones((2, 2, 2))
+        data[0, 0, 0] = np.nan
+        with pytest.raises(ValueError):
+            nereids.detect_bad_pixels(data)
+        with pytest.raises(ValueError):
+            nereids.detect_hot_pixels(data)
+        with pytest.raises(ValueError):
+            nereids.detect_dead_pixels_chunked([data])
+
+    def test_bad_k_raises(self):
+        data = np.ones((2, 2, 2))
+        for bad_k in (0.0, -1.0, float("nan"), float("inf")):
+            with pytest.raises(ValueError, match="k_mad"):
+                nereids.detect_hot_pixels(data, k_mad=bad_k)
+            with pytest.raises(ValueError, match="k_mad"):
+                nereids.detect_bad_pixels(data, hot_k_mad=bad_k)
+
+    def test_empty_chunks_raises(self):
+        with pytest.raises(ValueError):
+            nereids.detect_dead_pixels_chunked([])
+
+    def test_mask_round_trips_into_spatial_map(self, u238_data):
+        """A detect_bad_pixels mask feeds spatial_map_typed(dead_pixels=...):
+        the masked pixel is hard-excluded (NaN in the density map)."""
+        energies = np.linspace(1.0, 10.0, 20)
+        n_e = len(energies)
+        h, w = 3, 3
+        sample = np.full((n_e, h, w), 100.0)
+        sample[:, 1, 1] = 0.0  # dead pixel
+        mask = np.asarray(nereids.detect_bad_pixels(sample))
+        assert mask.dtype == np.bool_
+        assert mask[1, 1] and mask.sum() == 1
+
+        t = np.full((n_e, h, w), 0.5)
+        u = np.full((n_e, h, w), 0.01)
+        data = nereids.from_transmission(t, u)
+        result = nereids.spatial_map_typed(
+            data, energies, [u238_data],
+            solver="lm",
+            dead_pixels=mask,
+            max_iter=5,
+        )
+        density = np.asarray(result.density_maps[0])
+        assert density.shape == (h, w)
+        assert np.isnan(density[1, 1]), (
+            "masked pixel must be hard-excluded (NaN in the density map)"
+        )
+
+
+# ===========================================================================
 # TIFF I/O
 # ===========================================================================
 
