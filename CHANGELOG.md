@@ -7,6 +7,46 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
 
 ## [Unreleased]
 
+### Changed
+
+- **Physics-complete bounded Ikeda–Carpenter calibration family** (#642):
+  `family="ic"` now fits the full moderator shape — the prompt law
+  `α(E) = e^{c0}·√E + e^{c1}` is positive at every energy by construction
+  (exp-encoded; a real calibration once returned `a1 = −0.396`, driving
+  α(E) < 0 at low energy), the storage rate `β` and mixing fraction
+  `R ∈ [0, 1]` are free within physics bounds (previously β was pinned at
+  0.1 and R ≡ exp(−E_meV/25) ≈ 0, i.e. no storage freedom at all), and the
+  kernel is folded with the SNS PSR channel triangle (`psr_fwhm_ns`,
+  default 350 ns — the fold the VENUS FTS header records for the tabulated
+  kernel; `0` disables; optional `fit_psr` adds the FWHM as a 5th
+  parameter). The missing shape freedom previously re-expressed as a ~90 K
+  temperature degeneracy on real data. The IC τ-grid is now anchored to the
+  prompt core so low-β storage tails cannot undersample the pulse rise
+  (bit-identical for all previous callers). **Action required: earlier
+  `family="ic"` calibrations (2-parameter, no PSR fold) are superseded —
+  re-calibrate.** The raw `theta` for `"ic"` is now 4–5 ln/box-encoded
+  values; read decoded physical parameters from `params()` (Python) or the
+  returned `resolution` (Rust) instead of interpreting `theta` directly.
+
+### Added
+
+- **Calibration degeneracy reporting** (#642): `calibrate_resolution`
+  results now carry `n_free_params` and `bounds_hit` (parameters pinned at
+  a box bound, e.g. `"r:lower"` on the β↔R ridge when the calibrant shows
+  no storage tail), in Rust and Python.
+- **Calibration simplex re-inflation** (#642): each `calibrate_resolution`
+  restart now re-launches a fresh, larger Nelder–Mead simplex at the
+  incumbent until it stops improving, escaping premature simplex collapse
+  in the curved α↔β↔R valley of the 4-parameter IC family (a collapsed
+  simplex once stalled a 300 K calibration Δχ² ≈ +130 above the noise
+  floor, biasing the downstream pinned temperature fit by ~23 K). Applies
+  to all families; results can only improve or stay put.
+- **Closed-loop IC acceptance tests** (#642): synthetic Ta-181
+  calibrate→pin→refit-temperature loops at 300 K and 1073 K
+  (`crates/nereids-fitting/tests/ic_closed_loop.rs`) assert χ²/dof ≈ 1,
+  interior recovery of the truth kernel, and temperature recovery within
+  3σ with σ_T far below the old ~90 K degeneracy scale.
+
 ## [0.2.2] - 2026-07-03
 
 ### Fixed
