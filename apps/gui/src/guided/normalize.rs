@@ -137,7 +137,7 @@ fn normalization_controls_card(ui: &mut egui::Ui, state: &mut AppState) {
                     ui.label("Transmission computed.");
                     if let Some(ref dead) = state.dead_pixels {
                         let n_dead = dead.iter().filter(|&&d| d).count();
-                        ui.label(format!("Dead pixels: {}", n_dead));
+                        ui.label(format!("Masked pixels (dead/hot): {}", n_dead));
                     }
                 } else if state.sample_data.is_some() && state.open_beam_data.is_some() {
                     ui.label("Click Normalize to compute transmission.");
@@ -459,7 +459,23 @@ pub(crate) fn normalize_data(state: &mut AppState) {
 
     match nereids_io::normalization::normalize(sample, open_beam, &params, None) {
         Ok(norm) => {
-            state.dead_pixels = Some(nereids_io::normalization::detect_dead_pixels(sample));
+            // Pipeline-integrity mask: dead ∪ hot over BOTH stacks — a pixel
+            // dead or railed only in the open-beam run still corrupts every
+            // transmission ratio computed from it (#643).
+            state.dead_pixels = match nereids_io::normalization::detect_bad_pixels(
+                sample,
+                Some(open_beam.as_ref()),
+                Some(nereids_io::normalization::HOT_PIXEL_K_MAD),
+            ) {
+                Ok(mask) => Some(mask),
+                // Unreachable in practice: normalize() above already validated
+                // both stacks finite/non-negative and shape-equal; keep the
+                // mask absent rather than stale if that invariant ever breaks.
+                Err(e) => {
+                    state.status_message = format!("Pixel-mask detection: {}", e);
+                    None
+                }
+            };
 
             let n_tof = sample.shape()[0];
             match compute_energies(state, n_tof) {
