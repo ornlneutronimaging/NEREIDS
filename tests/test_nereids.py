@@ -2169,6 +2169,41 @@ class TestFixDensities:
             f"frozen density must report NaN σ, got {r.uncertainties[0]}"
         )
 
+    def test_fix_densities_kl_reports_temperature_uncertainty(self, u238_data):
+        """The KL transmission solver (``solver="kl"``) must also report a
+        finite temperature 1-σ with a density frozen — the parallel path the
+        LM tests don't exercise. Pre-fix a leftover full-index overwrite
+        clobbered ``temperature_k_unc`` to None on this path (review R2 P0)."""
+        energies = np.linspace(1.0, 30.0, 400)
+        true_density = 8.0e-4
+        true_temp = 350.0
+        t = np.asarray(
+            nereids.forward_model(
+                energies, [(u238_data, true_density)], temperature_k=true_temp
+            )
+        )
+        sigma = np.full_like(t, 0.005)
+        r = nereids.fit_spectrum_typed(
+            transmission=t,
+            uncertainty=sigma,
+            energies=energies,
+            isotopes=[(u238_data, true_density)],
+            solver="kl",
+            temperature_k=300.0,
+            fit_temperature=True,
+            fix_densities=True,
+            max_iter=200,
+        )
+        assert bool(r.converged) is True
+        assert r.densities[0] == true_density
+        assert r.temperature_k is not None
+        # The regression: temperature_k_unc was None pre-fix on the KL path.
+        assert r.temperature_k_unc is not None
+        assert np.isfinite(r.temperature_k_unc) and r.temperature_k_unc > 0.0, (
+            "KL frozen-density temperature σ must be finite positive, "
+            f"got {r.temperature_k_unc}"
+        )
+
     def test_density_free_mask_freezes_selected_density(self, u238_data):
         """A per-density `density_free` mask freezes only the marked
         densities; the free one is still fitted."""

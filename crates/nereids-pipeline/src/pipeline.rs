@@ -1420,18 +1420,13 @@ fn fit_transmission_poisson(
     let free_indices = params.free_indices();
     let mut sr = extract_result(config, &result, n_density_params, &free_indices, bg_indices)?;
 
-    // Populate temperature
-    if let Some(idx) = temperature_index {
-        sr.temperature_k = Some(result.params[idx]);
-        sr.temperature_k_unc = temperature_index.and_then(|i| {
-            result
-                .uncertainties
-                .as_ref()
-                .and_then(|u| u.get(i).copied())
-        });
-    }
-
-    // Populate energy-scale results
+    // Temperature (value and 1-σ) is fully populated by `extract_result`,
+    // which maps the solver's FREE-only uncertainty vector through
+    // `free_indices` (issue #633). Do NOT re-derive it here: a prior
+    // full-layout `result.uncertainties.get(temperature_index)` overwrite
+    // clobbered the corrected σ with the wrong free slot (out of bounds →
+    // None in the all-frozen thermometry case). Mirror `fit_transmission_lm`
+    // and only overwrite the energy-scale outputs below.
     if let Some((t0_idx, ls_idx)) = energy_scale_indices {
         sr.t0_us = Some(result.params[t0_idx]);
         sr.l_scale = Some(result.params[ls_idx]);
@@ -5774,6 +5769,59 @@ mod tests {
             dens_unc[0].is_nan(),
             "frozen density must report NaN σ (no covariance column), got {}",
             dens_unc[0]
+        );
+    }
+
+    /// #633 P0 (review round 2): the KL transmission path
+    /// (`SolverConfig::PoissonKL`) must also report the frozen-density
+    /// temperature σ from the correct free slot. A leftover post-extract
+    /// block indexed the FREE-only uncertainty vector by the FULL temperature
+    /// index, so with a density frozen it read out of bounds → `None`,
+    /// silently dropping the temperature 1-σ that `extract_result` had
+    /// computed correctly. LM was covered; this pins the parallel KL path.
+    #[test]
+    fn test_fix_densities_kl_reports_temperature_uncertainty() {
+        let data = u238_single_resonance();
+        let true_density = 0.0005;
+        let true_temp = 350.0;
+        let energies: Vec<f64> = (0..201).map(|i| 1.0 + (i as f64) * 0.05).collect();
+        let (t, sigma) = synthetic_transmission_at_temp(&data, true_density, true_temp, &energies);
+
+        let config = UnifiedFitConfig::new(
+            energies,
+            vec![data],
+            vec!["U-238".into()],
+            300.0,
+            None,
+            vec![true_density],
+        )
+        .unwrap()
+        .with_solver(SolverConfig::PoissonKL(PoissonConfig::default()))
+        .with_fit_temperature(true)
+        .with_fix_densities(true);
+
+        let input = InputData::Transmission {
+            transmission: t,
+            uncertainty: sigma,
+        };
+        let result = fit_spectrum_typed(&input, &config).unwrap();
+        assert!(result.converged, "KL T-only fit should converge");
+        assert_eq!(
+            result.densities[0], true_density,
+            "frozen density must not move"
+        );
+        let fitted_temp = result.temperature_k.expect("temperature_k should be Some");
+        assert!(
+            (fitted_temp - true_temp).abs() < 5.0,
+            "KL temperature: fitted={fitted_temp}, true={true_temp}"
+        );
+        // The regression: this was None pre-fix whenever a density was frozen.
+        let t_unc = result
+            .temperature_k_unc
+            .expect("KL frozen-density fit must report a temperature σ, not None");
+        assert!(
+            t_unc.is_finite() && t_unc > 0.0,
+            "KL frozen-density temperature σ must be finite positive, got {t_unc}"
         );
     }
 
