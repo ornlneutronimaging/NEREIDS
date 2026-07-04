@@ -113,9 +113,21 @@
 //!
 //! The full instrument function folds the moderator with a proton-burst
 //! (Gaussian σ) and a chopper/channel (triangle, FWHM) term. Both are optional
-//! here (`None` ⇒ omitted). Note: a tabulated file whose header says the
-//! channel triangle is already "folded" in must NOT be double-counted against
-//! an IC model that also applies the channel.
+//! here (`None` ⇒ omitted).
+//!
+//! **Provenance of the triangle (`channel_fwhm_us`).** SAMMY broadens for the
+//! accelerator burst either as a Gaussian of FWHM `DELTAG` (SAMMY Manual R8
+//! Sec. III.C.1.a, eq. III C1 a.12) or as a square pulse of width `BURST`
+//! (Sec. III.C.2.a). At SNS the proton pulse delivered to the target is shaped
+//! by the accumulator ring (Proton Storage Ring, PSR) into an approximately
+//! triangular ~700 ns base — FWHM ≈ 350 ns — which is what the VENUS tabulated
+//! FTS kernel header records as "folded triang FWHM 350 ns PSR". NEREIDS folds
+//! that PSR triangle via `channel_fwhm_us` (symmetric triangle, half-base =
+//! FWHM, [`triangle_kernel`]). Note: a tabulated file whose header says the
+//! triangle is already "folded" in must NOT be double-counted against an IC
+//! model that also applies it (the `nereids-fitting` calibrator therefore
+//! applies its `psr_fwhm_ns` fold to the IC family only, never to
+//! tabulated/UDR kernels).
 
 use crate::resolution::{ResolutionParseError, TabulatedResolution};
 
@@ -137,6 +149,16 @@ pub const DEFAULT_N_ENERGIES: usize = 64;
 
 /// Default number of τ-samples spanning the prompt core of each kernel.
 pub const DEFAULT_N_TAU: usize = 600;
+
+/// Hard cap on the τ-sample count of one synthesized kernel. The τ-step is
+/// anchored to the PROMPT core (`fast_reach / (n_tau − 1)`), so a long storage
+/// tail (β ≪ α with R > 0) is covered by growing the sample COUNT rather than
+/// by widening the step — otherwise a β as low as the calibration bound
+/// 0.02 µs⁻¹ (slow reach 16/β = 800 µs) would set a ~1.6 µs step that
+/// undersamples the prompt core and degenerates a 0.35 µs channel triangle to
+/// a delta. This cap bounds that growth (CPU/memory); only past it does the
+/// step widen to `tau_max / (MAX_TAU_SAMPLES − 1)`.
+const MAX_TAU_SAMPLES: usize = 8192;
 
 /// Taylor expansion of `h(u)/u³` where `h(u) = 1 − e^{−u}(1 + u + ½u²)`, for
 /// `|u|` small (the `α ≈ β` limit), where direct evaluation cancels
@@ -472,7 +494,12 @@ fn synth_kernel(
     let fast_reach = 18.0 / alpha;
     let slow_reach = if r > 1e-9 { 16.0 / beta } else { 0.0 };
     let tau_max = fast_reach.max(slow_reach);
-    let dtau = tau_max / (n_tau as f64 - 1.0);
+    // τ-step anchored to the PROMPT core, not to τ_max: `n_tau` samples span the
+    // fast Gamma(3) rise, and a longer storage tail (β ≪ α, R > 0) extends the
+    // SAMPLE COUNT (`j_hi ∝ tau_max/dtau`) instead of the step, capped at
+    // MAX_TAU_SAMPLES. Bit-identical to the old `tau_max/(n_tau−1)` step
+    // whenever slow_reach ≤ fast_reach (the R≈0 eV-regime case).
+    let dtau = (fast_reach / (n_tau as f64 - 1.0)).max(tau_max / (MAX_TAU_SAMPLES as f64 - 1.0));
 
     // Extend the grid to slightly negative τ so a symmetric burst/channel can
     // spread the leading edge correctly (the moderator pulse itself is 0 there).
@@ -929,6 +956,79 @@ mod tests {
         for (a, b) in direct.iter().zip(&planned) {
             assert!((a - b).abs() < 1e-12, "plan vs direct mismatch: {a} vs {b}");
         }
+    }
+
+    #[test]
+    fn tau_step_anchors_to_prompt_core_not_storage_tail() {
+        // Regression for the τ-grid fix: with a slow storage tail active
+        // (β ≪ α, R > 0) the τ-step must stay anchored to the prompt core —
+        // the old `tau_max/(n_tau−1)` step let the tail dilate dtau and
+        // degenerate the 0.35 µs channel triangle toward a delta.
+        let n_tau = 600;
+        let alpha = 2.0; // fast_reach = 18/α = 9 µs
+        let prompt_step = (18.0 / alpha) / (n_tau as f64 - 1.0);
+
+        // (a) Moderate tail (β = 0.25 ⇒ slow_reach = 64 µs): the cap does not
+        // bite, so the step equals the prompt-core step exactly and the grid
+        // still spans the full tail.
+        let p = IkedaCarpenterParams {
+            channel_fwhm_us: Some(0.35),
+            ..IkedaCarpenterParams::constant(alpha, 0.25, 0.5)
+        };
+        let (offs, wts) = synth_kernel(&p, n_tau, 10.0);
+        let dtau = offs[1] - offs[0];
+        assert!(
+            (dtau - prompt_step).abs() < 1e-12,
+            "uncapped step {dtau} != prompt-core step {prompt_step}"
+        );
+        assert!(
+            dtau <= prompt_step + 1e-12,
+            "prompt-core spacing {dtau} > fast_reach/(n_tau−1) = {prompt_step}"
+        );
+        // ≥ 3 nonzero triangle samples per side at this step.
+        let tri = triangle_kernel(dtau, 0.35);
+        let nonzero_per_side = tri.iter().take(tri.len() / 2).filter(|&&v| v > 0.0).count();
+        assert!(
+            nonzero_per_side >= 3,
+            "triangle degenerated: {nonzero_per_side} nonzero samples per side"
+        );
+        // The tail is still reached: the last positive-offset sample must sit
+        // near the mode-relative slow reach (tau_max − tau_peak ≈ 63 µs) or be
+        // trimmed as negligible — assert the pulse there is below trim level.
+        let span = offs.last().unwrap() - offs.first().unwrap();
+        let peak = wts.iter().cloned().fold(f64::MIN, f64::max);
+        assert!((peak - 1.0).abs() < 1e-12, "weights not peak-normalized");
+        assert!(span > 3.0 / alpha, "kernel span {span} lost the pulse body");
+
+        // (b) Extreme admitted tail (β = 0.02 ⇒ slow_reach = 800 µs): the
+        // MAX_TAU_SAMPLES cap bites; the step widens to tau_max/(cap−1) but
+        // must still resolve the 0.35 µs triangle with ≥ 3 samples per side
+        // (the old tail-anchored step was 800/599 ≈ 1.34 µs — a delta).
+        let p_ext = IkedaCarpenterParams {
+            channel_fwhm_us: Some(0.35),
+            ..IkedaCarpenterParams::constant(alpha, 0.02, 0.5)
+        };
+        let (offs_ext, _) = synth_kernel(&p_ext, n_tau, 10.0);
+        let dtau_ext = offs_ext[1] - offs_ext[0];
+        let capped_step = 800.0 / (MAX_TAU_SAMPLES as f64 - 1.0);
+        assert!(
+            (dtau_ext - capped_step).abs() < 1e-9,
+            "capped step {dtau_ext} != tau_max/(MAX_TAU_SAMPLES−1) = {capped_step}"
+        );
+        assert!(
+            dtau_ext <= 0.35 / 3.0,
+            "capped step {dtau_ext} cannot resolve the 0.35 µs triangle"
+        );
+        let tri_ext = triangle_kernel(dtau_ext, 0.35);
+        let nonzero_ext = tri_ext
+            .iter()
+            .take(tri_ext.len() / 2)
+            .filter(|&&v| v > 0.0)
+            .count();
+        assert!(
+            nonzero_ext >= 3,
+            "triangle degenerated under cap: {nonzero_ext} nonzero samples per side"
+        );
     }
 
     #[test]
