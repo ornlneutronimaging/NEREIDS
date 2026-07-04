@@ -18,3 +18,6 @@ nereids-physics = { workspace = true, features = ["test-support"] }
 # Exposes `nereids_endf::resonance::test_support` — synthetic
 # `ResonanceData` builders shared with sibling crates' tests.
 nereids-endf = { workspace = true, features = ["test-support"] }
+# Seeded synthetic noise for the IC closed-loop acceptance test (#642).
+rand = { workspace = true }
+rand_distr = { workspace = true }
