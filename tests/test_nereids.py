@@ -3362,3 +3362,143 @@ class TestCalibrateResolution:
                     flight_path_m=-1.0,
                     **kw,
                 )
+
+    def test_ic_params_decoded_and_bounds_reported(self):
+        # The bounded "ic" family (#642) exposes decoded physical parameters
+        # (single source of truth: the calibrated resolution, not the
+        # ln/box-encoded theta) plus the degeneracy report.
+        iso, e, t, unc = self._calibrant()
+        cal = nereids.calibrate_resolution(
+            e, t, unc, "ic", isotopes=[(iso, 5.0e-4)], temperature_k=300.0
+        )
+        p = cal.params()
+        for key in ("a0", "a1", "beta", "r", "psr_fwhm_us"):
+            assert key in p, f"missing decoded param {key}"
+        assert p["a0"] > 0.0
+        assert p["a1"] > 0.0  # alpha(E) positive by construction
+        assert p["beta"] > 0.0
+        assert 0.0 <= p["r"] <= 1.0
+        assert p["psr_fwhm_us"] >= 0.0
+        assert cal.n_free_params == 4
+        assert len(cal.theta) == 4
+        assert isinstance(cal.bounds_hit, list)
+        assert all(isinstance(s, str) for s in cal.bounds_hit)
+        assert "n_free_params=4" in repr(cal)
+
+    def test_fit_psr_appends_fifth_parameter(self):
+        iso, e, t, unc = self._calibrant()
+        cal = nereids.calibrate_resolution(
+            e,
+            t,
+            unc,
+            "ic",
+            isotopes=[(iso, 5.0e-4)],
+            temperature_k=300.0,
+            fit_psr=True,
+        )
+        assert cal.n_free_params == 5
+        assert len(cal.theta) == 5
+        # The fitted PSR FWHM respects its box (0.05-1 us).
+        assert 0.05 <= cal.params()["psr_fwhm_us"] <= 1.0
+
+    def test_fit_psr_requires_ic_family(self):
+        iso, e, t, unc = self._calibrant()
+        with pytest.raises(ValueError, match="fit_psr"):
+            nereids.calibrate_resolution(
+                e,
+                t,
+                unc,
+                "gaussian",
+                isotopes=[(iso, 5.0e-4)],
+                temperature_k=300.0,
+                fit_psr=True,
+            )
+
+    def test_invalid_psr_fwhm_rejected(self):
+        iso, e, t, unc = self._calibrant()
+        for bad in (-1.0, float("nan")):
+            with pytest.raises(ValueError, match="psr_fwhm_ns"):
+                nereids.calibrate_resolution(
+                    e,
+                    t,
+                    unc,
+                    "ic",
+                    isotopes=[(iso, 5.0e-4)],
+                    temperature_k=300.0,
+                    psr_fwhm_ns=bad,
+                )
+
+    def test_absurd_pinned_psr_width_rejected(self):
+        # Review #645 round 2, F1: psr_fwhm_ns is NANOSECONDS (FTS convention
+        # 350 ns); kernel-synthesis cost is quadratic in the fold width, so a
+        # us-as-ns unit slip (350 meaning us -> 350_000 ns) previously passed
+        # the finite/sign check and became a multi-hour silent hang behind a
+        # fictitious 350 us fold. Nonzero widths above the 10_000 ns (10 us)
+        # ceiling must raise up front; the message names the ns unit and the
+        # 350-ns convention. (Boundary acceptance at exactly 10_000 ns is
+        # pinned Rust-side: rejects_absurd_pinned_psr_width.)
+        iso, e, t, unc = self._calibrant()
+        with pytest.raises(ValueError, match="NANOSECONDS.*350 ns"):
+            nereids.calibrate_resolution(
+                e,
+                t,
+                unc,
+                "ic",
+                isotopes=[(iso, 5.0e-4)],
+                temperature_k=300.0,
+                psr_fwhm_ns=350_000.0,
+            )
+
+    def test_infeasible_start_psr_width_rejected(self):
+        # Review #645 round 3, F1: a pinned PSR width in (0, ~58.6 ns) passes
+        # the finite/sign/ceiling checks but cannot be SYNTHESIZED at the
+        # optimizer's default beta/R start (beta = 0.1 spans a 160 us storage
+        # tail, capping the tau-step at ~19.5 ns > fwhm/3). Previously every
+        # initial simplex vertex was infinite and the calibration burned
+        # max_iter before a generic "no finite-objective" error blaming the
+        # forward model. The Rust pre-flight must reject the start up front,
+        # and the informative message (naming psr_fwhm_ns and the tau-cap
+        # cause) must propagate through the binding as a ValueError.
+        iso, e, t, unc = self._calibrant()
+        with pytest.raises(
+            ValueError, match="starting parameter vector.*psr_fwhm_ns"
+        ):
+            nereids.calibrate_resolution(
+                e,
+                t,
+                unc,
+                "ic",
+                isotopes=[(iso, 5.0e-4)],
+                temperature_k=300.0,
+                psr_fwhm_ns=55.0,
+            )
+
+    def test_fit_psr_with_zero_width_rejected(self):
+        # psr_fwhm_ns=0 is documented as "no PSR fold"; fit_psr=True would
+        # silently clamp the 0 start into the [0.05, 1] us fit box. The
+        # contradiction must raise, not fit a phantom fold.
+        iso, e, t, unc = self._calibrant()
+        with pytest.raises(ValueError, match="fit_psr"):
+            nereids.calibrate_resolution(
+                e,
+                t,
+                unc,
+                "ic",
+                isotopes=[(iso, 5.0e-4)],
+                temperature_k=300.0,
+                psr_fwhm_ns=0.0,
+                fit_psr=True,
+            )
+
+    def test_psr_parameters_trail_the_signature(self):
+        # Review #645 F7: psr_fwhm_ns / fit_psr were added AFTER the original
+        # signature froze, so they must sit at the END — inserting them
+        # mid-signature would silently shift every pre-existing call passing
+        # >= 14 positional arguments.
+        sig = nereids.calibrate_resolution.__text_signature__
+        assert sig is not None
+        assert (
+            sig.index("l_scale_prior")
+            < sig.index("psr_fwhm_ns")
+            < sig.index("fit_psr")
+        ), f"psr_fwhm_ns/fit_psr must trail the signature: {sig}"
