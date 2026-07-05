@@ -49,6 +49,13 @@ const PSR_TRUE_US: f64 = 0.35;
 const DENSITY_TRUE: f64 = 2.0e-4;
 /// Absolute transmission noise σ (0.3 % of the unit open-beam level).
 const NOISE_SIGMA: f64 = 0.003;
+/// Absolute ceiling (K) on the recovered-temperature bias |T_fit − T_true|
+/// (#645 round 3, F3). The σ_T < 30 K gate plus the 3σ statistical window
+/// jointly admit a worst-case bias of ~90 K — numerically the very
+/// degeneracy scale of the old 2-parameter family this test exists to guard.
+/// Observed biases are 0.5 K (300 K) / 1.2 K (1073 K); 30 K is far above
+/// noise wander yet a third of the degeneracy scale.
+const T_BIAS_MAX_K: f64 = 30.0;
 
 /// Full calibrate → pin → refit-T loop at one truth temperature.
 fn closed_loop(t_true_k: f64) {
@@ -246,6 +253,13 @@ fn closed_loop(t_true_k: f64) {
         (t_fit - t_true_k).abs() <= 3.0 * sigma_t,
         "T recovered {t_fit} K vs truth {t_true_k} K exceeds 3σ = {} K",
         3.0 * sigma_t
+    );
+    // Absolute bias bound alongside the statistical one: the two assertions
+    // above alone admit |bias| up to 3·30 = 90 K — see T_BIAS_MAX_K.
+    assert!(
+        (t_fit - t_true_k).abs() <= T_BIAS_MAX_K,
+        "T recovered {t_fit} K vs truth {t_true_k} K exceeds the absolute \
+         {T_BIAS_MAX_K} K bias ceiling (old-family degeneracy scale ~90 K)"
     );
     eprintln!(
         "closed_loop(T={t_true_k} K): χ²/dof={:.3}, a0={a0:.3}, a1={a1:.4}, β={:.3}, R={:.3}, \
