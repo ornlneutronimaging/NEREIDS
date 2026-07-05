@@ -86,8 +86,15 @@ const IC_A1_X0: f64 = 0.05;
 /// Lower box bound on the storage (slow) rate `β` (µs⁻¹). Covers the
 /// canonical Ikeda–Carpenter ambient-moderator value β ≈ 0.031 µs⁻¹
 /// (NIM A239 (1985) 536; also Mantid `IkedaCarpenterPV`'s β default) with
-/// margin below it. The τ-grid is prompt-anchored (nereids-physics
-/// `MAX_TAU_SAMPLES`), so the 16/β ≈ 800 µs tail at this bound stays sampled.
+/// margin below it. The τ-grid is prompt-anchored and capped (nereids-physics
+/// `MAX_TAU_SAMPLES`), so the 16/β ≈ 800 µs tail at this bound stays sampled
+/// at a ≈ 0.098 µs capped step — fine enough for the default 0.35 µs (and
+/// any ≥ ~0.3 µs) PSR triangle and for prompt rates up to α ≈ 26 µs⁻¹. A
+/// fitted PSR near its 0.05 µs floor combined with β near this bound is
+/// unresolvable within the cap; such θ are treated as infeasible points
+/// (∞ objective) during the search, never as a calibration abort — see
+/// `ic_box_worst_corner_synthesizes_within_tau_cap` /
+/// `ic_unresolvable_theta_is_infeasible_point_not_abort`.
 const IC_BETA_MIN: f64 = 0.02;
 /// Upper box bound on `β`: at 5 µs⁻¹ the storage tail is as fast as the
 /// prompt core itself (α range), beyond which β↔α are indistinguishable.
@@ -285,6 +292,10 @@ impl ResolutionFamily {
                     (IC_R_MIN, IC_R_MAX),
                 ];
                 if *fit_psr {
+                    // cfg.psr_fwhm_ns > 0 is guaranteed here (fit_psr with a
+                    // zero width is rejected up front — "0 disables" cannot
+                    // silently become a fitted 0.05 µs); the clamp only pulls
+                    // positive out-of-box starting widths onto the box.
                     x0.push((cfg.psr_fwhm_ns * NS_TO_US).clamp(PSR_FWHM_US_MIN, PSR_FWHM_US_MAX));
                     bounds.push((PSR_FWHM_US_MIN, PSR_FWHM_US_MAX));
                 }
@@ -663,7 +674,8 @@ fn solve_small(a: &[f64], b: &[f64], k: usize) -> Option<Vec<f64>> {
 /// bounded `β = e^{θ2}` and scalar storage fraction `R = θ3 ∈ [0, 1]`, folded
 /// with the SNS PSR channel triangle
 /// ([`CalibrationConfig::psr_fwhm_ns`], default 350 ns; `0` disables;
-/// optionally fitted via `IkedaCarpenter { fit_psr: true }`).
+/// optionally fitted via `IkedaCarpenter { fit_psr: true }` — a zero width
+/// combined with `fit_psr` contradicts "0 disables" and is rejected).
 ///
 /// Returns the fitted shape parameters, the reduced **data** χ²/dof, the fitted (or
 /// pinned) `(t0, L_scale)`, the prior penalty, the calibrated
@@ -769,6 +781,40 @@ pub fn calibrate_resolution(
             "psr_fwhm_ns must be finite and >= 0 (0 disables the PSR fold), got {}",
             config.psr_fwhm_ns
         )));
+    }
+    // fit_psr fits the PSR FWHM from the psr_fwhm_ns starting value, but 0 is
+    // documented as "no fold": a zero start would be silently clamped into the
+    // [PSR_FWHM_US_MIN, PSR_FWHM_US_MAX] fit box, contradicting the "0
+    // disables" contract. Reject the contradiction loudly.
+    if matches!(family, ResolutionFamily::IkedaCarpenter { fit_psr: true })
+        && config.psr_fwhm_ns == 0.0
+    {
+        return Err(FittingError::InvalidConfig(
+            "fit_psr requires a positive psr_fwhm_ns starting value (psr_fwhm_ns = 0 disables \
+             the PSR fold; use fit_psr = false to calibrate without one)"
+                .into(),
+        ));
+    }
+    // IC synthesis-grid resolution: validate up front for the IC family (inert
+    // for the others) so an out-of-range value gives this precise error instead
+    // of every IkedaCarpenter::new evaluation failing into the generic late
+    // "no finite-objective resolution" error. Thresholds mirror both
+    // IkedaCarpenter::new (n_energies >= 2, n_tau >= 8) and the Python
+    // binding's sibling validation, so the two public entry points reject the
+    // same inputs.
+    if matches!(family, ResolutionFamily::IkedaCarpenter { .. }) {
+        if config.ic_n_energies < 2 {
+            return Err(FittingError::InvalidConfig(format!(
+                "ic_n_energies must be >= 2 for the IC family, got {}",
+                config.ic_n_energies
+            )));
+        }
+        if config.ic_n_tau < 8 {
+            return Err(FittingError::InvalidConfig(format!(
+                "ic_n_tau must be >= 8 for the IC family, got {}",
+                config.ic_n_tau
+            )));
+        }
     }
     // Validate the energy-scale (t0, L_scale) prior/center configuration up front.
     if !config.position_t0_center_us.is_finite()
@@ -879,7 +925,16 @@ pub fn calibrate_resolution(
         let mut obj = |theta: &[f64]| -> Result<f64, FittingError> {
             // theta = [resolution params (n_res)..., t0?, L_scale?]. The resolution
             // kernel uses only the first n_res; (t0, L_scale) set the energy scale.
-            let res = build_resolution(&family, theta, e_min, e_max, config)?;
+            // An UNRESOLVABLE θ — nereids-physics rejects a kernel whose τ-grid
+            // cannot resolve the requested fold / prompt core within the
+            // MAX_TAU_SAMPLES cap (e.g. a fitted PSR at its 0.05 µs floor
+            // against β at its own floor) — is an infeasible POINT of the
+            // search, not a broken calibration: step away (mirrors the
+            // corrected-TOF ≤ 0 guard below). Config-level failures cannot
+            // reach here: they are rejected up front by calibrate_resolution.
+            let Ok(res) = build_resolution(&family, theta, e_min, e_max, config) else {
+                return Ok(f64::INFINITY);
+            };
             let inst = InstrumentParams { resolution: res };
             let (t0, l_scale) = unpack_position(theta);
             // Infeasible energy scale (corrected TOF ≤ 0) → step away.
@@ -1920,6 +1975,75 @@ mod tests {
     }
 
     #[test]
+    fn ic_recovers_known_psr_when_fit() {
+        // Loop-closure / optimizer test for fit_psr (#645 F2, same caveat as
+        // ic_recovers_known_alpha: truth and fit share the IC synthesis, so
+        // this checks the 5-parameter optimizer, not the pulse physics).
+        // Truth PSR FWHM = 0.6 µs — interior to the [0.05, 1] µs box and far
+        // from the 0.35 µs default start — with the rest of the truth kernel
+        // identical to ic_recovers_known_alpha. Two resonances (15 + 45 eV)
+        // give the E-leverage that separates the E-independent triangle
+        // width from the α(E) = a0·√E + a1 prompt law (a single resonance
+        // probes the kernel at essentially one energy).
+        // Full-density run (420 pts, 64×500 grid, restarts 2) recovers
+        // psr = 0.5984 µs at χ²/dof ≈ 1e-6; this slimmed grid keeps the same
+        // loop-closure semantics at a debug-friendly runtime.
+        let iso_lo = synthetic_isotope(72, 178, 15.0, 0.05, 0.06);
+        let iso_hi = synthetic_isotope(72, 179, 45.0, 0.05, 0.06);
+        let sample = SampleParams::new(300.0, vec![(iso_lo, 2.0e-3), (iso_hi, 2.0e-3)]).unwrap();
+        let energies: Vec<f64> = (0..280).map(|i| 8.0 + i as f64 * 0.15).collect();
+        let cfg = CalibrationConfig {
+            restarts: 1,
+            ic_n_energies: 32,
+            ic_n_tau: 320,
+            ..Default::default()
+        };
+        let psr_true = 0.6;
+        let ic_truth = IkedaCarpenter::new(
+            IkedaCarpenterParams {
+                alpha: EnergyLaw::SqrtE { a0: 0.35, a1: 0.05 },
+                beta: 0.1,
+                r: EnergyLaw::Const(0.1),
+                burst_sigma_us: None,
+                channel_fwhm_us: Some(psr_true),
+            },
+            cfg.flight_path_m,
+            &SynthesisGrid {
+                e_min_ev: (energies[0] * 0.5).max(1e-3),
+                e_max_ev: energies.last().unwrap() * 2.0,
+                n_energies: cfg.ic_n_energies,
+                n_tau: cfg.ic_n_tau,
+            },
+        )
+        .unwrap();
+        let truth = ResolutionFunction::IkedaCarpenter(Arc::new(ic_truth));
+        let data = forward_model(
+            &energies,
+            &sample,
+            Some(&InstrumentParams { resolution: truth }),
+        )
+        .unwrap();
+        let unc = vec![0.004; energies.len()];
+        let r = calibrate_resolution(
+            ResolutionFamily::IkedaCarpenter { fit_psr: true },
+            &energies,
+            &data,
+            &unc,
+            &sample,
+            &cfg,
+        )
+        .unwrap();
+        let (a0, _a1, _beta, _rr, psr) = decoded_ic(&r);
+        assert_eq!(r.n_free_params, 5);
+        assert!(
+            (psr - psr_true).abs() < 0.1,
+            "recovered PSR FWHM {psr} µs, expected {psr_true} µs"
+        );
+        assert!((a0 - 0.35).abs() < 0.05, "recovered a0={a0}, expected 0.35");
+        assert!(r.chi2_dof < 1.0, "matched χ²/dof={} too high", r.chi2_dof);
+    }
+
+    #[test]
     fn psr_disabled_at_zero_width() {
         // psr_fwhm_ns = 0.0 disables the triangle fold entirely: an UNFOLDED
         // truth is reproduced and the calibrated kernel carries no channel.
@@ -2067,5 +2191,168 @@ mod tests {
                 "psr_fwhm_ns={bad} should be rejected"
             );
         }
+    }
+
+    #[test]
+    fn rejects_fit_psr_with_zero_psr_width() {
+        // psr_fwhm_ns = 0 means "no PSR fold"; fit_psr = true would silently
+        // clamp that 0 start into the [0.05, 1] µs fit box, contradicting the
+        // documented "0 disables". The contradiction is a config error.
+        let iso = synthetic_isotope(72, 178, 20.0, 0.05, 0.06);
+        let sample = SampleParams::new(300.0, vec![(iso, 2.0e-3)]).unwrap();
+        let e: Vec<f64> = (0..60).map(|i| 15.0 + i as f64 * 0.2).collect();
+        let d = vec![0.9; 60];
+        let u = vec![0.01; 60];
+        let cfg = CalibrationConfig {
+            psr_fwhm_ns: 0.0,
+            ..Default::default()
+        };
+        let err = calibrate_resolution(
+            ResolutionFamily::IkedaCarpenter { fit_psr: true },
+            &e,
+            &d,
+            &u,
+            &sample,
+            &cfg,
+        )
+        .expect_err("fit_psr with psr_fwhm_ns = 0 must be rejected");
+        assert!(
+            matches!(&err, FittingError::InvalidConfig(msg) if msg.contains("fit_psr")),
+            "expected an InvalidConfig naming fit_psr, got {err:?}"
+        );
+        // The same zero width WITHOUT fit_psr stays valid ("0 disables").
+        // Tiny grid/iteration budget: this arm only asserts the config
+        // passes validation, not fit quality.
+        let cheap = CalibrationConfig {
+            psr_fwhm_ns: 0.0,
+            ic_n_energies: 8,
+            ic_n_tau: 32,
+            max_iter: 10,
+            ..Default::default()
+        };
+        assert!(
+            calibrate_resolution(
+                ResolutionFamily::IkedaCarpenter { fit_psr: false },
+                &e,
+                &d,
+                &u,
+                &sample,
+                &cheap,
+            )
+            .is_ok(),
+            "psr_fwhm_ns = 0 with fit_psr = false must remain a valid config"
+        );
+    }
+
+    #[test]
+    fn rejects_undersized_ic_synthesis_grid() {
+        // ic_n_energies < 2 / ic_n_tau < 8 previously surfaced only as the
+        // late, generic "no finite-objective resolution" error (every
+        // IkedaCarpenter::new evaluation failed). They must be precise
+        // up-front InvalidConfig errors for the IC family — sibling parity
+        // with the Python binding's validation.
+        let iso = synthetic_isotope(72, 178, 20.0, 0.05, 0.06);
+        let sample = SampleParams::new(300.0, vec![(iso, 2.0e-3)]).unwrap();
+        let e: Vec<f64> = (0..60).map(|i| 15.0 + i as f64 * 0.2).collect();
+        let d = vec![0.9; 60];
+        let u = vec![0.01; 60];
+        for (ne, nt, what) in [(1, 500, "ic_n_energies"), (64, 7, "ic_n_tau")] {
+            // The loose iteration/tolerance budget only cheapens the Gaussian
+            // is_ok arm below (validation-only assertion, not fit quality);
+            // the InvalidConfig arm rejects before any optimization runs.
+            let cfg = CalibrationConfig {
+                ic_n_energies: ne,
+                ic_n_tau: nt,
+                max_iter: 5,
+                xatol: 1.0,
+                fatol: 1.0,
+                ..Default::default()
+            };
+            let err = calibrate_resolution(
+                ResolutionFamily::IkedaCarpenter { fit_psr: false },
+                &e,
+                &d,
+                &u,
+                &sample,
+                &cfg,
+            )
+            .expect_err("undersized IC synthesis grid must be rejected");
+            assert!(
+                matches!(&err, FittingError::InvalidConfig(msg) if msg.contains(what)),
+                "expected an InvalidConfig naming {what}, got {err:?}"
+            );
+            // The same values are inert for a non-IC family (mirrors the
+            // Python binding: the knobs only size the IC synthesis grid).
+            assert!(
+                calibrate_resolution(ResolutionFamily::Gaussian, &e, &d, &u, &sample, &cfg).is_ok(),
+                "ic grid knobs must stay inert for the Gaussian family"
+            );
+        }
+    }
+
+    #[test]
+    fn ic_box_worst_corner_synthesizes_within_tau_cap() {
+        // #645 F1: the calibrator's box must not abort a calibration on an
+        // unresolvable τ-grid. Worst corner of the box in the τ-cap sense:
+        // β at its floor (slow reach 16/β = 800 µs — the longest admitted
+        // storage tail, so the capped step is at its widest ≈ 0.098 µs),
+        // R = 1 (storage fully active), a1 at its ceiling and a0 at the
+        // documented physical ceiling (α ≈ 1–3 µs⁻¹ in the eV regime ⇒
+        // a0 ≈ 0.2–0.5, see IC_A0_MIN), at the calibrator's default
+        // n_tau = 500 on a representative eV-regime synthesis window. The
+        // capped step resolves both the PSR triangle box (0.35 µs default
+        // pin up to the 1 µs fitted ceiling: ≥ 3 samples per side) and any
+        // prompt core with α ≤ 18/(7 · 0.098) ≈ 26 µs⁻¹ — far above eV-regime
+        // moderator physics. (The remaining unresolvable pockets — a fitted
+        // PSR near its 0.05 µs floor together with β near its floor, or
+        // a0 driven ~50× past the physical ceiling — are handled as
+        // infeasible points, see the companion test below.)
+        let cfg = CalibrationConfig::default();
+        for fwhm_us in [DEFAULT_PSR_FWHM_NS * NS_TO_US, PSR_FWHM_US_MAX] {
+            let corner = IkedaCarpenterParams {
+                alpha: EnergyLaw::SqrtE {
+                    a0: 0.5,
+                    a1: IC_A1_MAX,
+                },
+                beta: IC_BETA_MIN,
+                r: EnergyLaw::Const(IC_R_MAX),
+                burst_sigma_us: None,
+                channel_fwhm_us: Some(fwhm_us),
+            };
+            let grid = SynthesisGrid {
+                e_min_ev: 6.0,
+                e_max_ev: 112.0,
+                n_energies: cfg.ic_n_energies,
+                n_tau: cfg.ic_n_tau,
+            };
+            assert!(
+                IkedaCarpenter::new(corner, cfg.flight_path_m, &grid).is_ok(),
+                "calibration-box worst corner must synthesize (fwhm = {fwhm_us} µs)"
+            );
+        }
+    }
+
+    #[test]
+    fn ic_unresolvable_theta_is_infeasible_point_not_abort() {
+        // A θ inside the box can still be unresolvable: a fitted PSR at its
+        // 0.05 µs floor against β at its own floor needs a τ-step ≤ FWHM/3 ≈
+        // 0.017 µs across an 800 µs storage tail — past the 8192-sample cap.
+        // build_resolution must Err for such θ; the calibration objective
+        // maps that to an ∞ objective (an infeasible point the simplex steps
+        // away from — same handling as an infeasible energy scale), so a
+        // wandering optimizer can never abort the whole calibration on it.
+        let cfg = CalibrationConfig::default();
+        let theta = [
+            IC_A0_X0.ln(),
+            IC_A1_X0.ln(),
+            IC_BETA_MIN.ln(),
+            0.5,
+            PSR_FWHM_US_MIN,
+        ];
+        let fam = ResolutionFamily::IkedaCarpenter { fit_psr: true };
+        assert!(
+            build_resolution(&fam, &theta, 6.0, 112.0, &cfg).is_err(),
+            "β at its floor + PSR at its floor must be unresolvable"
+        );
     }
 }
