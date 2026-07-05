@@ -355,9 +355,22 @@ pub const HOT_PIXEL_K_MAD: f64 = 6.0;
 ///   ≤2–3×; even directly across a sharp sample edge only one ring of
 ///   neighbors is mixed, and the neighbor *median* stays on the pixel's
 ///   own side of the edge.
-/// - A fully-railed row/column segment still leaves each railed pixel with
+/// - A fully-railed 1-px row/column still leaves each railed pixel with
 ///   ≥5 normal neighbors of 8, so the neighbor median stays normal and the
-///   segment IS caught.
+///   line IS caught in a single pass.  Railed CLUSTERS ≥2 px wide are
+///   caught by the stage-2 fixpoint erosion — see the
+///   "Fixpoint erosion of railed clusters" section of
+///   [`detect_hot_pixels`].
+///
+/// **Width-1 limitation (accepted trade-off)**: a 1-px-wide bright *scene*
+/// line at ≥`HOT_LOCAL_FACTOR`× local contrast is spatially
+/// indistinguishable from a railed line and IS masked.  Contiguous bright
+/// regions ≥2 px wide are safe (their boundary pixels keep a same-side
+/// neighbor median, so the erosion never seeds — see [`detect_hot_pixels`],
+/// "Why bright scene regions never erode").  Real scene features on VENUS
+/// are PSF-blurred over ≥2 px, so ≥10× single-pixel scene contrast is
+/// physically rare; masking it is the accepted price for catching railed
+/// rows/columns.
 pub const HOT_LOCAL_FACTOR: f64 = 10.0;
 
 /// Reject a stack with an empty TOF axis (`shape[0] == 0`).
@@ -482,12 +495,73 @@ pub fn detect_dead_pixels_chunked(chunks: &[Array3<f64>]) -> Result<Array2<bool>
 ///    Railed/always-max pixels are subsumed by the upper tail: no fixed
 ///    saturation value exists after efficiency correction, so a
 ///    saturation-constant test would be wrong anyway.
-/// 6. Stage 2 (local confirmation): a candidate is flagged iff its total
-///    also exceeds [`HOT_LOCAL_FACTOR`] × the median total of its available
-///    live (`total > 0`) 8-neighbors.  Edge pixels use whatever neighbors
-///    exist.  If a candidate has *no* live neighbor at all (isolated live
-///    pixel in a dead field), the global verdict stands — there is nothing
-///    local to refute it.
+/// 6. Stage 2 (local confirmation), iterated to a **fixpoint**: a candidate
+///    is flagged iff its total also exceeds [`HOT_LOCAL_FACTOR`] × the
+///    median of its 8-neighborhood reference sample, where each neighbor
+///    contributes its total if live (`total > 0`) and not yet flagged,
+///    contributes `0.0` if already flagged (a known defect cannot vouch
+///    for its neighbors — see below), and is omitted if dead (a dead pixel
+///    carries no scene information).  Edge pixels use whatever neighbors
+///    exist.  A candidate whose reference sample is empty (every neighbor
+///    dead — isolated live pixel in a dead field) keeps the global verdict;
+///    a candidate whose neighbors are mostly flagged defects likewise stays
+///    flagged (its reference median is 0).  After each full pass over the
+///    fixed stage-1 candidate list, newly confirmed flags are applied and
+///    the pass repeats until a pass adds no new flag.
+///
+/// # Fixpoint erosion of railed clusters
+///
+/// A single stage-2 pass misses the INTERIOR of a railed cluster ≥2 px
+/// wide: an interior pixel's 8-neighbors are railed too, so its neighbor
+/// median is railed and the ratio test refutes the flag.  Iterating to a
+/// fixpoint erodes such clusters from the boundary inward — once the
+/// cluster's outermost pixels are flagged they stop vouching (each
+/// contributes `0.0` instead of its railed total), the reference median of
+/// the next ring drops back to the background level, and the next pass
+/// flags that ring.  Contributing `0.0` (rather than omitting the flagged
+/// neighbor) is load-bearing: with omission, a 3-background + 3-railed
+/// reference sample has an even-count [`nereids_core::stats::median`]
+/// midpoint mid-gap (≈ railed/2), the ratio test reads ~2× and the erosion
+/// stalls; with the zero contribution the median stays on the background
+/// side and erosion completes.  Erosion fully consumes clusters up to 3 px
+/// wide in their narrower dimension (point defects, 1-px lines, 2–3-px-wide
+/// blobs/segments — the physical shapes of railed detector defects).  A
+/// hard-edged railed rectangle ≥4 px wide keeps its interior (only its
+/// convex corners flag): it is pixel-for-pixel indistinguishable from a
+/// hard-edged bright scene region, which must survive (below).
+///
+/// **Termination bound**: flags are only ever added, and every pass except
+/// the last adds at least one, so at most `height·width` passes can do
+/// work; the loop is additionally capped at `height·width` passes to make
+/// the bound structural rather than reasoned.  In practice the pass count
+/// is on the order of the defect-cluster radius (one pass for point
+/// defects and 1-px lines).
+///
+/// # Why bright scene regions never erode
+///
+/// Erosion must *seed* at a bright-region boundary pixel.  A boundary
+/// pixel of a contiguous bright scene region ≥2 px wide keeps ≥4 of its
+/// 8 neighbors on its own (bright) side for any straight or diagonal
+/// edge, so its reference median stays bright and its ratio is the scene
+/// gradient (≤2–3× across real edges) — far below the ≥10×
+/// [`HOT_LOCAL_FACTOR`].  Stage 1's global cut additionally gates which
+/// pixels can seed at all.  With no seed, the fixpoint is reached with
+/// zero flags in the region and it survives intact
+/// (`test_detect_hot_pixels_large_psf_bright_region_not_eroded`).  Two
+/// documented, test-pinned exceptions — both physically rare on VENUS,
+/// where the detector PSF blurs real scene features over ≥2 px so ≥10×
+/// single-pixel contrast steps do not occur in scene:
+///
+/// - a **width-1 bright line** at ≥10× local contrast is spatially
+///   indistinguishable from a railed line and IS masked — the accepted
+///   trade-off for catching railed rows/columns
+///   (`test_detect_hot_pixels_1px_bright_line_flagged_by_design`);
+/// - the single pixel at a **sharp convex (90°) corner** of a hard-edged
+///   ≥10× region sees only 3 same-side neighbors, its reference median
+///   falls on the dark side, and it is flagged (this predates the
+///   fixpoint); erosion does NOT propagate past it — the adjacent edge
+///   pixels keep ≥4 bright unflagged neighbors
+///   (`test_detect_hot_pixels_hard_edged_bright_rectangle_corners_only`).
 ///
 /// The two stages encode complementary definitions of "hot": stage 1 says
 /// *statistically implausible for this image*, stage 2 says *spatially
@@ -500,8 +574,8 @@ pub fn detect_dead_pixels_chunked(chunks: &[Array3<f64>]) -> Result<Array2<bool>
 /// REGION is scene, not a defect — masking it would reject statistically
 /// plausible pixels, the exact failure the module rules ban.  A true point
 /// defect beats its neighbor median by ≥100× and is caught by both stages
-/// even *inside* a bright region and even as part of a short railed
-/// row/column segment (see [`HOT_LOCAL_FACTOR`]).
+/// even *inside* a bright region and even as part of a railed row/column
+/// or a small railed cluster (see [`HOT_LOCAL_FACTOR`]).
 ///
 /// # Raw counts required
 ///
@@ -561,34 +635,87 @@ pub fn detect_hot_pixels(data: &Array3<f64>, k_mad: f64) -> Result<Array2<bool>,
     let sigma = f64::max(nereids_core::stats::MAD_TO_SIGMA * mad, (-med / 2.0).exp());
     let threshold = med + k_mad * sigma;
 
-    // Stage 2 (local confirmation): only a spatially ISOLATED excess is a
-    // detector point defect — a contiguous bright region is scene.  This is
-    // what keeps the global cut honest on bimodal images (see rustdoc).
+    // Stage 1 (global robust cut), upper tail only: the candidate list is
+    // fixed for the whole stage-2 fixpoint iteration below.
     let (height, width) = totals.dim();
-    let mut neighbor_totals: Vec<f64> = Vec::with_capacity(8);
+    let mut candidates: Vec<(usize, usize)> = Vec::new();
     for y in 0..height {
         for x in 0..width {
             let total = totals[[y, x]];
-            // Stage 1 (global robust cut), upper tail only.
-            if !(total > 0.0 && total.ln() > threshold) {
+            if total > 0.0 && total.ln() > threshold {
+                candidates.push((y, x));
+            }
+        }
+    }
+
+    // Stage 2 (local confirmation): only a spatially ISOLATED excess is a
+    // detector point defect — a contiguous bright region is scene.  This is
+    // what keeps the global cut honest on bimodal images (see rustdoc).
+    //
+    // Iterated to a FIXPOINT to erode railed clusters from their boundary
+    // inward (see rustdoc, "Fixpoint erosion of railed clusters"): each
+    // pass evaluates the not-yet-flagged candidates against the PREVIOUS
+    // pass's mask (batch update — order-independent within a pass), and
+    // the loop ends when a pass adds no new flag.
+    //
+    // Termination bound: flags are only ever added and every pass except
+    // the last adds at least one, so ≤ height·width passes can do work;
+    // the explicit cap makes that bound structural.  Pass 1 sees an
+    // all-false mask and is exactly the pre-fixpoint single pass.
+    let max_passes = height * width;
+    let mut neighbor_totals: Vec<f64> = Vec::with_capacity(8);
+    for _pass in 0..max_passes {
+        let mut newly_flagged: Vec<(usize, usize)> = Vec::new();
+        for &(y, x) in &candidates {
+            if mask[[y, x]] {
                 continue;
             }
-            // Live (total > 0) 8-neighbors; edge pixels use what exists.
+            let total = totals[[y, x]];
+            // 8-neighborhood reference sample; edge pixels use what exists.
             neighbor_totals.clear();
             for ny in y.saturating_sub(1)..=(y + 1).min(height - 1) {
                 for nx in x.saturating_sub(1)..=(x + 1).min(width - 1) {
-                    let t = totals[[ny, nx]];
-                    if (ny, nx) != (y, x) && t > 0.0 {
-                        neighbor_totals.push(t);
+                    if (ny, nx) == (y, x) {
+                        continue;
+                    }
+                    if mask[[ny, nx]] {
+                        // Already-flagged neighbor: a known defect cannot
+                        // vouch for the candidate.  It contributes the
+                        // lowest possible scene value (zero total) so the
+                        // reference median is not dragged up by the defect
+                        // itself — load-bearing for cluster erosion (see
+                        // rustdoc: an omitted neighbor leaves an even-count
+                        // sample whose midpoint median stalls the erosion).
+                        neighbor_totals.push(0.0);
+                    } else {
+                        // Live (total > 0) unflagged neighbors contribute
+                        // their totals; dead neighbors carry no scene
+                        // information and are omitted.
+                        let t = totals[[ny, nx]];
+                        if t > 0.0 {
+                            neighbor_totals.push(t);
+                        }
                     }
                 }
             }
-            mask[[y, x]] = match nereids_core::stats::median(&neighbor_totals) {
+            let flagged = match nereids_core::stats::median(&neighbor_totals) {
                 Some(local_med) => total > HOT_LOCAL_FACTOR * local_med,
-                // No live neighbor at all (isolated live pixel in a dead
-                // field): nothing local can refute the global verdict.
+                // Empty sample: every neighbor is dead (isolated live pixel
+                // in a dead field) — nothing local can refute the global
+                // verdict.  (A mostly-flagged neighborhood is NOT empty:
+                // the zeros give a reference median of 0 and the candidate
+                // stays flagged, the consistent generalization.)
                 None => true,
             };
+            if flagged {
+                newly_flagged.push((y, x));
+            }
+        }
+        if newly_flagged.is_empty() {
+            break;
+        }
+        for &(y, x) in &newly_flagged {
+            mask[[y, x]] = true;
         }
     }
     Ok(mask)
@@ -1257,6 +1384,219 @@ mod tests {
             mask.iter().filter(|&&m| m).count(),
             3,
             "only the railed segment may be flagged"
+        );
+    }
+
+    #[test]
+    fn test_detect_hot_pixels_2x2_railed_cluster_fully_caught() {
+        // Fixpoint acceptance (#646 review R2, F1): a 2×2 railed cluster
+        // has no interior — every pixel keeps 5 background neighbors of 8,
+        // so the whole cluster is caught in the first pass.  Regression
+        // guard for the smallest ≥2-px-wide cluster.
+        let mut data = Array3::from_elem((4, 7, 7), 100.0);
+        for t in 0..4 {
+            for y in 2..4 {
+                for x in 2..4 {
+                    data[[t, y, x]] = 65535.0;
+                }
+            }
+        }
+
+        let mask = detect_hot_pixels(&data, HOT_PIXEL_K_MAD).unwrap();
+        for y in 2..4 {
+            for x in 2..4 {
+                assert!(mask[[y, x]], "2x2 cluster pixel ({y}, {x}) must be flagged");
+            }
+        }
+        assert_eq!(
+            mask.iter().filter(|&&m| m).count(),
+            4,
+            "only the railed cluster may be flagged"
+        );
+    }
+
+    #[test]
+    fn test_detect_hot_pixels_3x3_railed_blob_fully_caught() {
+        // Fixpoint acceptance (#646 review R2, F1) — THE erosion proof.
+        // A 3×3 railed blob: pass 1 flags only the 4 corners (5 background
+        // neighbors each); the edge centers (3 bg + 5 railed) and the
+        // interior (8 railed) are refuted by a single pass — the
+        // pre-fixpoint code missed them.  With flagged neighbors
+        // contributing zero totals, pass 2 flags the edge centers
+        // (sample [0, 0, bg, bg, bg, R, R, R] → median bg) and pass 3 the
+        // interior (all-flagged neighborhood → median 0).
+        let mut data = Array3::from_elem((4, 9, 9), 100.0);
+        for t in 0..4 {
+            for y in 3..6 {
+                for x in 3..6 {
+                    data[[t, y, x]] = 65535.0;
+                }
+            }
+        }
+
+        let mask = detect_hot_pixels(&data, HOT_PIXEL_K_MAD).unwrap();
+        for y in 3..6 {
+            for x in 3..6 {
+                assert!(
+                    mask[[y, x]],
+                    "3x3 blob pixel ({y}, {x}) must be flagged (interior included)"
+                );
+            }
+        }
+        assert_eq!(
+            mask.iter().filter(|&&m| m).count(),
+            9,
+            "only the railed blob may be flagged"
+        );
+    }
+
+    #[test]
+    fn test_detect_hot_pixels_2px_wide_railed_column_fully_caught() {
+        // Fixpoint acceptance (#646 review R2, F1): the interior of a
+        // 2-px-wide railed column (3 bg + 5 railed neighbors per interior
+        // pixel) was invisible to the single pass — only the 4 end pixels
+        // (5 bg neighbors each) flagged.  The fixpoint erodes the column
+        // pairwise from both ends.
+        let mut data = Array3::from_elem((4, 9, 9), 100.0);
+        for t in 0..4 {
+            for y in 2..7 {
+                for x in 3..5 {
+                    data[[t, y, x]] = 65535.0;
+                }
+            }
+        }
+
+        let mask = detect_hot_pixels(&data, HOT_PIXEL_K_MAD).unwrap();
+        for y in 2..7 {
+            for x in 3..5 {
+                assert!(
+                    mask[[y, x]],
+                    "2-px-wide column pixel ({y}, {x}) must be flagged"
+                );
+            }
+        }
+        assert_eq!(
+            mask.iter().filter(|&&m| m).count(),
+            10,
+            "only the railed column may be flagged"
+        );
+    }
+
+    #[test]
+    fn test_detect_hot_pixels_full_railed_column_caught() {
+        // Regression (#646 review R2, F1 test 3): a full-height 1-px railed
+        // column — every pixel keeps ≥4 background neighbors, so the whole
+        // line is caught in pass 1, exactly as before the fixpoint.
+        let mut data = Array3::from_elem((4, 7, 7), 100.0);
+        for t in 0..4 {
+            for y in 0..7 {
+                data[[t, y, 3]] = 65535.0;
+            }
+        }
+
+        let mask = detect_hot_pixels(&data, HOT_PIXEL_K_MAD).unwrap();
+        for y in 0..7 {
+            assert!(mask[[y, 3]], "railed column pixel ({y}, 3) must be flagged");
+        }
+        assert_eq!(
+            mask.iter().filter(|&&m| m).count(),
+            7,
+            "only the railed column may be flagged"
+        );
+    }
+
+    #[test]
+    fn test_detect_hot_pixels_large_psf_bright_region_not_eroded() {
+        // Fixpoint safety (#646 review R2, F1 test 5): a LARGE bright scene
+        // region — 20×20 core at 100× background — with the ≥2-px PSF edge
+        // blur that real VENUS scene features have (adjacent-pixel ratios
+        // ≤5× through a 2-px transition ring: 100 → 400 → 2000 → 10000).
+        // Every bright-layer pixel passes the stage-1 global cut (dark
+        // majority: med = ln 100, mad = 0, Poisson-floor sigma = 0.1 →
+        // threshold ≈ 5.21 < ln 400 ≈ 5.99), yet no pixel reaches 10× its
+        // neighbor median, so the erosion never seeds and the fixpoint is
+        // reached with ZERO flags — the region survives intact.
+        let mut data = Array3::from_elem((1, 50, 50), 100.0);
+        for y in 13..37 {
+            for x in 13..37 {
+                data[[0, y, x]] = 400.0; // outer transition ring
+            }
+        }
+        for y in 14..36 {
+            for x in 14..36 {
+                data[[0, y, x]] = 2000.0; // inner transition ring
+            }
+        }
+        for y in 15..35 {
+            for x in 15..35 {
+                data[[0, y, x]] = 10000.0; // 20×20 core at 100× background
+            }
+        }
+
+        let mask = detect_hot_pixels(&data, HOT_PIXEL_K_MAD).unwrap();
+        assert!(
+            mask.iter().all(|&m| !m),
+            "a PSF-blurred bright scene region must not be eroded at all"
+        );
+    }
+
+    #[test]
+    fn test_detect_hot_pixels_hard_edged_bright_rectangle_corners_only() {
+        // Pins the documented convex-corner caveat AND the fixpoint
+        // no-propagation property (#646 review R2).  A hard-edged (0-px
+        // transition) 20×20 region at 100× background: each sharp convex
+        // corner pixel sees only 3 same-side neighbors (median falls on
+        // the dark side) and flags — pre-existing single-pass behavior,
+        // physically rare in scene (PSF blurs real edges over ≥2 px).
+        // Crucially, the erosion must NOT propagate past the corners: the
+        // corner-adjacent edge pixels keep ≥4 bright unflagged neighbors,
+        // so the fixpoint stops at exactly the 4 corner pixels.
+        let mut data = Array3::from_elem((1, 50, 50), 100.0);
+        for y in 15..35 {
+            for x in 15..35 {
+                data[[0, y, x]] = 10000.0;
+            }
+        }
+
+        let mask = detect_hot_pixels(&data, HOT_PIXEL_K_MAD).unwrap();
+        for &(y, x) in &[(15, 15), (15, 34), (34, 15), (34, 34)] {
+            assert!(
+                mask[[y, x]],
+                "sharp convex corner ({y}, {x}) flags (documented caveat)"
+            );
+        }
+        assert_eq!(
+            mask.iter().filter(|&&m| m).count(),
+            4,
+            "erosion must not propagate past the convex corners"
+        );
+    }
+
+    #[test]
+    fn test_detect_hot_pixels_1px_bright_line_flagged_by_design() {
+        // Width-1 limitation pin (#646 review R2, F3 — user-decided:
+        // document + pin, no connected-component machinery).  A 1-px-wide
+        // bright SCENE line at ≥10× local contrast is spatially
+        // indistinguishable from a railed line and IS masked — the
+        // accepted trade-off for catching railed rows/columns.  Real VENUS
+        // scene features are PSF-blurred over ≥2 px, so this contrast is
+        // physically rare in scene (see HOT_LOCAL_FACTOR rustdoc).
+        let mut data = Array3::from_elem((1, 9, 9), 100.0);
+        for y in 0..9 {
+            data[[0, y, 4]] = 5000.0; // 50× the local background
+        }
+
+        let mask = detect_hot_pixels(&data, HOT_PIXEL_K_MAD).unwrap();
+        for y in 0..9 {
+            assert!(
+                mask[[y, 4]],
+                "1-px bright line pixel ({y}, 4) is flagged BY DESIGN"
+            );
+        }
+        assert_eq!(
+            mask.iter().filter(|&&m| m).count(),
+            9,
+            "only the width-1 line may be flagged"
         );
     }
 

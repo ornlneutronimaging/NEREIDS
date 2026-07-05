@@ -920,16 +920,35 @@ def detect_hot_pixels(
     pixel is a candidate when ``ln(total) > median + k_mad * sigma``, with
     median and MAD taken over the live (``total > 0``) pixels only and
     ``sigma`` floored by the Poisson counting noise of the median total.
-    Stage 2 (local): a candidate is flagged only if its total also exceeds
-    10x the median total of its live 8-neighbors (edge pixels use whatever
-    neighbors exist; a candidate with no live neighbor keeps the global
-    verdict).  The local confirmation keeps bimodal scenes honest: with a
-    dark majority (a sample covering >50% of the field of view, or an
-    aperture-limited open beam), the global statistics describe only the
-    dark population and the entire bright region would otherwise be masked
-    — a contiguous bright region is scene, not a defect.  Upper tail only —
-    stuck-low pixels are indistinguishable from low-count-alive pixels and
-    are kept (masks are pipeline-integrity only, never a low-count screen).
+    Stage 2 (local), iterated to a fixpoint: a candidate is flagged only if
+    its total also exceeds 10x the median of its 8-neighborhood reference
+    sample — live unflagged neighbors contribute their totals,
+    already-flagged neighbors contribute 0 (a known defect cannot vouch for
+    its neighbors), dead neighbors are omitted; edge pixels use whatever
+    neighbors exist, and a candidate with no live neighbor keeps the global
+    verdict.  Passes repeat until no new flag is added (bounded by
+    ``height * width`` passes; in practice ~the defect-cluster radius),
+    eroding railed CLUSTERS from the boundary inward — a single pass would
+    miss the interior of clusters >= 2 px wide, whose neighbors are railed
+    too.  Clusters up to 3 px wide are fully consumed.  The local
+    confirmation keeps bimodal scenes honest: with a dark majority (a
+    sample covering >50% of the field of view, or an aperture-limited open
+    beam), the global statistics describe only the dark population and the
+    entire bright region would otherwise be masked — a contiguous bright
+    region is scene, not a defect.  Upper tail only — stuck-low pixels are
+    indistinguishable from low-count-alive pixels and are kept (masks are
+    pipeline-integrity only, never a low-count screen).
+
+    Bright SCENE regions never erode: a boundary pixel of a contiguous
+    bright region >= 2 px wide keeps >= 4 same-side neighbors for any
+    straight or diagonal edge, so its reference median stays bright and
+    scene gradients (<= 2-3x across real edges) never reach the 10x factor
+    — the erosion has no seed.  Documented width-1 limitation (accepted
+    trade-off): a 1-px-wide bright scene line at >= 10x local contrast is
+    spatially indistinguishable from a railed line and IS masked; real
+    scene features on VENUS are PSF-blurred over >= 2 px, so >= 10x
+    single-pixel scene contrast is physically rare, and contiguous bright
+    regions of width >= 2 are safe from the local stage.
 
     ``data`` must be RAW detected counts (unscaled): the Poisson floor
     assumes ``Var[N] = N``.  Scaled inputs silently distort the floor —

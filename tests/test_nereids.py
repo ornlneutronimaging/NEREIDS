@@ -1461,6 +1461,39 @@ class TestPixelMasks:
         assert mask[5, 8]
         assert mask.sum() == 1
 
+    def test_railed_blob_fully_caught_fixpoint(self):
+        """#646 review R2 (F1): the stage-2 fixpoint erodes a 3x3 railed
+        blob from the boundary inward — a single local pass flags only the
+        4 corners (5 background neighbors each) and misses the edge centers
+        and the interior, whose neighbors are railed too."""
+        data = np.full((4, 9, 9), 100.0)
+        data[:, 3:6, 3:6] = 65535.0
+        mask = np.asarray(nereids.detect_hot_pixels(data))
+        assert mask[3:6, 3:6].all(), "3x3 blob must be fully caught"
+        assert mask.sum() == 9, "only the blob may be flagged"
+
+    def test_large_psf_bright_region_not_eroded(self):
+        """#646 review R2 (F1 safety): a large bright scene region (20x20
+        core at 100x background) with the >= 2-px PSF edge blur real VENUS
+        features have (adjacent ratios <= 5x) passes the global cut but
+        never seeds the erosion — zero flags."""
+        data = np.full((1, 50, 50), 100.0)
+        data[:, 13:37, 13:37] = 400.0
+        data[:, 14:36, 14:36] = 2000.0
+        data[:, 15:35, 15:35] = 10000.0
+        assert not np.asarray(nereids.detect_hot_pixels(data)).any()
+
+    def test_1px_bright_line_flagged_by_design(self):
+        """#646 review R2 (F3, pinned): a 1-px-wide bright scene line at
+        >= 10x local contrast is spatially indistinguishable from a railed
+        line and IS masked — the documented, accepted trade-off (real VENUS
+        scene features are PSF-blurred over >= 2 px)."""
+        data = np.full((1, 9, 9), 100.0)
+        data[:, :, 4] = 5000.0
+        mask = np.asarray(nereids.detect_hot_pixels(data))
+        assert mask[:, 4].all(), "width-1 line is flagged by design"
+        assert mask.sum() == 9
+
     def test_empty_tof_axis_raises(self):
         """shape[0] == 0: the all-zero dead test would pass vacuously and
         mask the whole detector — the validating entry points reject it."""
