@@ -138,6 +138,14 @@ pub struct ProjectSnapshot {
     pub energies: Option<Vec<f64>>,
     /// D-20: Dead-pixel mask (true = dead). Same spatial dimensions as the
     /// transmission data (height × width). `None` when no mask is available.
+    ///
+    /// Since #646 the GUI stores the **declared** mask component only here
+    /// (file-declared or project-declared — `AppState::file_dead_pixels`);
+    /// session detections are recomputed on every normalization and never
+    /// persisted.  The dataset path (`/intermediate/dead_pixels`), dtype,
+    /// and shape are unchanged, so no format marker is needed.  Files
+    /// written before #646 carried the effective mask (declared ∪ detected
+    /// at save time); the GUI promotes those to declared once on load.
     pub dead_pixels: Option<Array2<bool>>,
 
     // -- results (always embedded) --

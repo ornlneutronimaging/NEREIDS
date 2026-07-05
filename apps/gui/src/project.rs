@@ -343,7 +343,17 @@ pub fn snapshot_from_state(state: &AppState) -> ProjectSnapshot {
         normalized,
         normalized_uncertainty,
         energies: state.energies.clone(),
-        dead_pixels: state.dead_pixels.clone(),
+        // Persist the DECLARED mask component only (#646 review R3, F3):
+        // detections are session-scoped and recomputed on every
+        // normalization.  Persisting the effective mask (declared ∪
+        // detected) would let the restore-side declared-promotion bake
+        // each session's detections into the next session's declared
+        // component — monotonic mask growth across save/load cycles.
+        // Old project files stored the effective mask at this same
+        // dataset path (`/intermediate/dead_pixels` — unchanged dtype and
+        // shape, no format marker needed) and get a documented one-time
+        // promotion on load; new saves end the accumulation.
+        dead_pixels: state.file_dead_pixels.clone(),
         density_maps,
         uncertainty_maps,
         chi_squared_map,
@@ -1040,14 +1050,19 @@ fn state_from_snapshot(snap: ProjectSnapshot, state: &mut AppState, path: &Path)
     }
     state.energies = snap.energies;
 
-    // 15b. Restore dead-pixel mask (D-20).  The persisted mask is treated
-    // as DECLARED (#646): loading a project declares its saved mask, which
-    // then persists across re-normalizations exactly like an HDF5
-    // file-declared mask, while re-detections are recomputed from scratch
-    // (AppState::set_detected_dead_pixels) instead of unioning into it —
-    // detections never accumulate across the save/load boundary.  If the
-    // linked HDF5 is reloaded, the load site overwrites the declared mask
-    // with the file's own.
+    // 15b. Restore dead-pixel mask (D-20) as DECLARED (#646).  NEW project
+    // files persist exactly the declared component (snapshot_from_state
+    // writes state.file_dead_pixels), so this restore is the identity.
+    // OLD files stored the effective mask (declared ∪ detected at save
+    // time) at the same dataset path; promoting it to declared here is a
+    // documented one-time promotion — the only lossless reading of a file
+    // that never recorded the declared/detected split.  Either way,
+    // detections stay session-scoped: every normalization recomputes the
+    // effective mask from scratch as declared ∪ freshly-detected
+    // (AppState::set_detected_dead_pixels), so save→load→save cycles no
+    // longer grow the persisted mask (#646 review R3, F3).  If the linked
+    // HDF5 is reloaded, the load site overwrites the declared mask with
+    // the file's own.
     state.dead_pixels = snap.dead_pixels;
     state.file_dead_pixels = state.dead_pixels.clone();
 
@@ -1261,4 +1276,58 @@ fn ymd_to_days(y: u64, m: u64, d: u64) -> u64 {
     let doe = yoe * 365 + yoe / 4 - yoe / 100 + doy;
     let base = era * 146097 + doe;
     base.saturating_sub(719468)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use ndarray::Array2;
+
+    /// #646 review R3, F3: project SAVE persists the DECLARED mask
+    /// component only, so a save→load→save cycle with an active session
+    /// detection must not grow the persisted mask.  Before the fix the
+    /// snapshot carried the EFFECTIVE mask (declared ∪ detected) and the
+    /// restore-side declared-promotion baked each session's detections
+    /// into the next session's declared component — monotonic growth.
+    #[test]
+    fn test_snapshot_persists_declared_mask_only_no_growth_across_cycles() {
+        let mut declared = Array2::from_elem((3, 3), false);
+        declared[[0, 0]] = true;
+        let mut detected = Array2::from_elem((3, 3), false);
+        detected[[1, 1]] = true;
+
+        let mut state = AppState {
+            file_dead_pixels: Some(declared.clone()),
+            ..AppState::default()
+        };
+        state.set_detected_dead_pixels(Some(detected.clone()));
+        // Effective mask in the session is declared ∪ detected...
+        assert_eq!(
+            state
+                .dead_pixels
+                .as_ref()
+                .unwrap()
+                .iter()
+                .filter(|&&m| m)
+                .count(),
+            2
+        );
+
+        // ...but the snapshot persists the declared component only.
+        let snap = snapshot_from_state(&state);
+        assert_eq!(snap.dead_pixels.as_ref().unwrap(), &declared);
+
+        // Load into a fresh session: the persisted mask restores as the
+        // declared component (and the effective mask starts as exactly it).
+        let mut restored = AppState::default();
+        state_from_snapshot(snap, &mut restored, Path::new("/nonexistent/p.nrd.h5"));
+        assert_eq!(restored.file_dead_pixels.as_ref().unwrap(), &declared);
+        assert_eq!(restored.dead_pixels.as_ref().unwrap(), &declared);
+
+        // The next normalization re-detects; the next save STILL persists
+        // only the declared component — no growth across cycles.
+        restored.set_detected_dead_pixels(Some(detected));
+        let snap2 = snapshot_from_state(&restored);
+        assert_eq!(snap2.dead_pixels.as_ref().unwrap(), &declared);
+    }
 }
