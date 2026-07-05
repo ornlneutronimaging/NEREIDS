@@ -86,16 +86,76 @@ const POSITION_L_SCALE_MAX: f64 = 1.02;
 /// opposite to the `+t0` form used by the retired position nuisance. Errors if any
 /// corrected TOF `tof − t0 ≤ 0` (a `t0` past the shortest flight time).
 ///
-/// `pub(crate)` so the equivalence to the runtime
-/// [`EnergyScaleTransmissionModel::corrected_energies`] is *pinned by a test*
-/// (`corrected_energy_grid_matches_energy_scale_model`) rather than only asserted
-/// in prose — a future edit to either convention then fails fast.
-pub(crate) fn corrected_energy_grid(
+/// SAMMY reference for the `−t0` sign convention: `dat/mdat0.f90:189`
+/// (`etzero = ee*(Elzero/(1−Tzero·√ee/Tttzzz))²`) — the measured TOF has TZERO
+/// subtracted before the energy conversion, so a positive `t0` raises the
+/// corrected energy. This is the canonical NEREIDS implementation of the
+/// formula; the runtime
+/// `EnergyScaleTransmissionModel::corrected_energies` is pinned bit-for-bit
+/// to it by `corrected_energy_grid_matches_energy_scale_model`, and
+/// `SpectrumFitResult::corrected_energies` (issue #634) reuses it so callers
+/// never re-derive the transform (a `+t0` slip caused a silent +400 K bias).
+pub fn corrected_energy_grid(
     energies: &[f64],
     t0_us: f64,
     l_scale: f64,
     flight_path_m: f64,
 ) -> Result<Vec<f64>, FittingError> {
+    // Validate scale inputs up front (issue #634 review): the transform is
+    // EVEN in `l_scale` (`(kl·l_scale/denom)²`), so a negative `l_scale`
+    // would silently return the identical plausible grid as its positive
+    // counterpart, a NaN `l_scale` would pass the denominator-only guard and
+    // return `Ok(vec![NaN])` ("NaN bypasses guards"), and
+    // `flight_path_m = 0` with a negative fitted `t0` would return an
+    // all-zeros grid as `Ok`.  Matches the sibling fit entry points'
+    // `validate_energy_scale_params` rejection (issue #458) — this is the
+    // canonical public transform, so it must not hand back plausible
+    // garbage for invalid inputs.
+    if !t0_us.is_finite() {
+        return Err(FittingError::EvaluationFailed(format!(
+            "corrected_energy_grid: t0_us must be finite, got {t0_us}"
+        )));
+    }
+    if !l_scale.is_finite() || l_scale <= 0.0 {
+        return Err(FittingError::EvaluationFailed(format!(
+            "corrected_energy_grid: l_scale must be finite and positive, got {l_scale}"
+        )));
+    }
+    if !flight_path_m.is_finite() || flight_path_m <= 0.0 {
+        return Err(FittingError::EvaluationFailed(format!(
+            "corrected_energy_grid: flight_path_m must be finite and positive, \
+             got {flight_path_m}"
+        )));
+    }
+    // Per-bin grid validation runs BEFORE the identity shortcut so the
+    // Ok/Err contract is uniform: previously (t0=0, l_scale=1) returned a
+    // NaN/non-positive grid verbatim while any other transform rejected the
+    // same grid via the denominator guard (#634 review).  Empty grids are
+    // rejected for the same uniformity (the Python binding already errors
+    // on them; a per-bin loop is vacuous on an empty slice).
+    if energies.is_empty() {
+        return Err(FittingError::EvaluationFailed(
+            "corrected_energy_grid: energies must not be empty".into(),
+        ));
+    }
+    for (i, &e) in energies.iter().enumerate() {
+        if !e.is_finite() || e <= 0.0 {
+            return Err(FittingError::EvaluationFailed(format!(
+                "corrected_energy_grid: energies[{i}] must be finite and positive, got {e}"
+            )));
+        }
+        // Strict ascending order, matching the Python binding's standard
+        // energy-grid validation (issue #634 review): a non-monotone input
+        // would otherwise map to a plausible but non-monotone corrected axis.
+        if i > 0 && e <= energies[i - 1] {
+            return Err(FittingError::EvaluationFailed(format!(
+                "corrected_energy_grid: energies must be strictly ascending; \
+                 energies[{i}] = {e} <= energies[{}] = {}",
+                i - 1,
+                energies[i - 1],
+            )));
+        }
+    }
     if t0_us == 0.0 && l_scale == 1.0 {
         return Ok(energies.to_vec());
     }

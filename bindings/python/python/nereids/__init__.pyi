@@ -159,6 +159,21 @@ class FitResult:
         """Fitted flight-path scale factor (SAMMY TZERO L0), or None."""
         ...
 
+    def corrected_energies(
+        self, nominal_energies: NDArray[np.float64]
+    ) -> NDArray[np.float64] | None:
+        """Map a nominal energy grid through the fitted ``(t0_us, l_scale)``
+        energy scale to the corrected (calibrated) energies the fit used
+        (issue #634), using the exact SAMMY −t0 convention and the SAME
+        flight path the fit was configured with (stored on the result).
+
+        Returns ``None`` when energy-scale fitting was not enabled; raises
+        ``ValueError`` on an invalid nominal grid (non-finite, non-positive,
+        or non-ascending) or a degenerate calibration (t0 past the shortest
+        flight time).
+        """
+        ...
+
     @property
     def deviance_per_dof(self) -> float | None:
         """Conditional binomial deviance / (n - k) from the counts-KL
@@ -1170,6 +1185,8 @@ def spatial_map_typed(
     temperature_k: float = 293.6,
     fit_temperature: bool = False,
     initial_densities: list[float] | None = None,
+    fix_densities: bool = False,
+    density_free: list[bool] | None = None,
     dead_pixels: NDArray[np.bool_] | None = None,
     max_iter: int = 200,
     solver: str = "auto",
@@ -1214,6 +1231,13 @@ def spatial_map_typed(
     Args:
         data: InputData from `from_counts()`, `from_counts_with_nuisance()`,
             or `from_transmission()`.
+        fix_densities: Freeze all densities at their initial values across
+            every pixel (per-pixel temperature-only fits with a known
+            calibration-foil density — the fastest thermometry path).
+        density_free: Per-density free/fixed mask applied to every pixel
+            (``free[i] == False`` freezes density ``i``); length must equal
+            the number of density parameters. Mutually exclusive with
+            ``fix_densities``.
         fit_back_d, fit_back_f: When ``background=True``, fit the
             optional SAMMY exponential background tail
             ``BackD * exp(-BackF / √E)``.  SAMMY pairs the two — fitting
@@ -1276,6 +1300,8 @@ def fit_spectrum_typed(
     delta_l_m: float | None = None,
     groups: list[IsotopeGroup] | None = None,
     initial_densities: list[float] | None = None,
+    fix_densities: bool = False,
+    density_free: list[bool] | None = None,
     tzero_jacobian: str | None = None,
     fit_energy_range: tuple[float, float] | None = None,
 ) -> FitResult:
@@ -1300,6 +1326,13 @@ def fit_spectrum_typed(
         resolution: Optional resolution function.
         groups: List of IsotopeGroup objects (mutually exclusive with isotopes).
         initial_densities: Initial density guesses when using groups.
+        fix_densities: Freeze all densities at their initial values and fit
+            only the remaining free parameters (temperature / energy scale).
+            The standard resonance-thermometry workflow when the areal density
+            is known from a calibration foil.
+        density_free: Per-density free/fixed mask (``free[i] == False`` freezes
+            density ``i``); length must equal the number of density parameters.
+            Mutually exclusive with ``fix_densities``.
     """
     ...
 
@@ -1335,6 +1368,8 @@ def fit_counts_spectrum_typed(
     delta_l_m: float | None = None,
     groups: list[IsotopeGroup] | None = None,
     initial_densities: list[float] | None = None,
+    fix_densities: bool = False,
+    density_free: list[bool] | None = None,
     enable_polish: bool | None = None,
     tzero_jacobian: str | None = None,
     fit_energy_range: tuple[float, float] | None = None,
@@ -1389,6 +1424,13 @@ def fit_counts_spectrum_typed(
         resolution: Optional resolution function.
         groups: List of IsotopeGroup objects (mutually exclusive with isotopes).
         initial_densities: Initial density guesses when using groups.
+        fix_densities: Freeze all densities at their initial values and fit
+            only the remaining free parameters (temperature / energy scale).
+            The standard resonance-thermometry workflow when the areal density
+            is known from a calibration foil.
+        density_free: Per-density free/fixed mask (``free[i] == False`` freezes
+            density ``i``); length must equal the number of density parameters.
+            Mutually exclusive with ``fix_densities``.
         enable_polish: Override the Nelder-Mead polish flag for the
             counts-KL solver.  ``None`` (default) falls through to the
             library default — currently ``False`` (#486) because the
