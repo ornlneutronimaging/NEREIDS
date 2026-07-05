@@ -666,9 +666,12 @@ def calibrate_resolution(
     10_000 ns (10 us) raise ``ValueError`` as a us-as-ns unit slip (kernel
     synthesis cost is quadratic in the fold width, so e.g. 350 meaning us
     would hang for hours). ``fit_psr=True`` ("ic" only) also fits the PSR FWHM as a
-    5th parameter (box-bounded 0.05-1 us), started at ``psr_fwhm_ns`` — which
-    must then be > 0 (a zero start contradicts "0 disables" and raises
-    ``ValueError``). ``psr_fwhm_ns`` / ``fit_psr`` sit at the END of the
+    5th parameter (box-bounded 0.05-1 us), started at ``psr_fwhm_ns`` clamped
+    into that box: an out-of-box start (legal as a pin up to 10 us) starts at
+    the nearer box edge with a stderr warning, and a fit that stays there
+    reports ``psr_fwhm_us:lower`` / ``:upper`` in ``bounds_hit``.
+    ``psr_fwhm_ns`` must then be > 0 (a zero start contradicts "0 disables"
+    and raises ``ValueError``). ``psr_fwhm_ns`` / ``fit_psr`` sit at the END of the
     signature so pre-existing positional calls keep their meaning. Degenerate
     directions are reported via ``bounds_hit``.
 

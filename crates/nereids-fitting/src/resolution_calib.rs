@@ -128,7 +128,7 @@ const PSR_FWHM_US_MIN: f64 = 0.05;
 /// pulse base — anything larger is the moderator's job (α, β), not the burst.
 const PSR_FWHM_US_MAX: f64 = 1.0;
 /// Sanity ceiling (µs) on the configured PSR triangle FWHM: one decade above
-/// the [`PSR_FWHM_US_MAX`] fit bound. [`CalibrationConfig::psr_fwhm_ns`] is in
+/// the `PSR_FWHM_US_MAX` fit bound. [`CalibrationConfig::psr_fwhm_ns`] is in
 /// NANOSECONDS (the VENUS FTS header convention: "folded triang FWHM 350 ns
 /// PSR"), and kernel-synthesis cost grows QUADRATICALLY with a wide fold's
 /// width. The mechanism is NOT τ-step refinement — that applies only to
@@ -248,9 +248,13 @@ pub enum ResolutionFamily {
     /// ([`CalibrationConfig::psr_fwhm_ns`], default [`DEFAULT_PSR_FWHM_NS`]).
     IkedaCarpenter {
         /// Also fit the PSR triangle FWHM: appends `θ4` (µs, box-bounded
-        /// 0.05–1.0 µs, started at the config value). Off by default — the
-        /// 350 ns SNS PSR width is machine metrology, not a per-experiment
-        /// unknown.
+        /// 0.05–1.0 µs, started at [`CalibrationConfig::psr_fwhm_ns`]
+        /// clamped into that box). A positive starting width outside the box
+        /// — legal as a pin up to [`PSR_FWHM_PIN_CEILING_US`] — starts at
+        /// the nearer box edge with a stderr warning; a fit that stays there
+        /// reports `psr_fwhm_us:lower` / `:upper` in
+        /// [`CalibrationResult::bounds_hit`]. Off by default — the 350 ns
+        /// SNS PSR width is machine metrology, not a per-experiment unknown.
         fit_psr: bool,
     },
 }
@@ -316,9 +320,26 @@ impl ResolutionFamily {
                 if *fit_psr {
                     // cfg.psr_fwhm_ns > 0 is guaranteed here (fit_psr with a
                     // zero width is rejected up front — "0 disables" cannot
-                    // silently become a fitted 0.05 µs); the clamp only pulls
-                    // positive out-of-box starting widths onto the box.
-                    x0.push((cfg.psr_fwhm_ns * NS_TO_US).clamp(PSR_FWHM_US_MIN, PSR_FWHM_US_MAX));
+                    // silently become a fitted 0.05 µs). A positive start
+                    // outside the fit box — legal as a PIN up to
+                    // PSR_FWHM_PIN_CEILING_US — is CLAMPED to the nearer box
+                    // edge, not rejected (#645 round 4, F3), and the clamp is
+                    // announced on stderr: a clamped start that never leaves
+                    // its edge additionally surfaces as "psr_fwhm_us:lower" /
+                    // ":upper" in `CalibrationResult::bounds_hit`.
+                    let start_us = cfg.psr_fwhm_ns * NS_TO_US;
+                    let clamped_us = start_us.clamp(PSR_FWHM_US_MIN, PSR_FWHM_US_MAX);
+                    if clamped_us != start_us {
+                        eprintln!(
+                            "warning: fit_psr starting width psr_fwhm_ns = {} ns lies \
+                             outside the PSR fit box [{PSR_FWHM_US_MIN}, {PSR_FWHM_US_MAX}] µs; \
+                             starting the fit at the nearer box edge ({clamped_us} µs). A fit \
+                             that stays there reports \"psr_fwhm_us:lower\" / \":upper\" in \
+                             bounds_hit.",
+                            cfg.psr_fwhm_ns
+                        );
+                    }
+                    x0.push(clamped_us);
                     bounds.push((PSR_FWHM_US_MIN, PSR_FWHM_US_MAX));
                 }
                 (x0, bounds)
@@ -352,7 +373,11 @@ pub struct CalibrationConfig {
     /// structurally never re-folded here — applying it twice would
     /// double-count the burst. When the family is
     /// `IkedaCarpenter { fit_psr: true }` this value is the fit's starting
-    /// point instead of a pin. Nonzero widths above
+    /// point instead of a pin, clamped into the 0.05–1 µs fit box: a width
+    /// in (1, 10] µs is a legal pin but an out-of-box start — the fit then
+    /// starts at the box top (announced by a stderr warning), and if it
+    /// stays there it reports `psr_fwhm_us:upper` in
+    /// [`CalibrationResult::bounds_hit`]. Nonzero widths above
     /// [`PSR_FWHM_PIN_CEILING_US`] (10 µs = 10 000 ns) are rejected as a
     /// ns↔µs unit slip — see that constant for the quadratic-cost rationale.
     pub psr_fwhm_ns: f64,
@@ -1065,18 +1090,21 @@ pub fn calibrate_resolution(
     }
     let best = best.expect("at least one restart runs");
     if !best.fun.is_finite() {
-        // Every ∞ source of the objective, not only the forward model (#645
-        // round 3, F1): a hard forward-model failure aborts with its own
-        // error above, so reaching here means every vector tried hit an
-        // infeasible-point class — kernel synthesis rejected (τ-grid cap vs
-        // fold/prompt geometry), an invalid energy scale (corrected TOF ≤ 0),
-        // or a singular anorm/baseline system. The start itself synthesized
-        // (pre-flighted above), so the infeasibility arose during the search.
+        // Every ∞ source of the objective (#645 round 3 F1, round 4 F1):
+        // `nelder_mead_minimize` maps every objective `Err` — forward-model
+        // failures included — to an infeasible +∞ point rather than aborting
+        // (see the `eval` closure in `nelder_mead.rs`), so no failure class
+        // raises its own error during the search. Reaching here means every
+        // vector tried hit one of them — kernel synthesis rejected (τ-grid
+        // cap vs fold/prompt geometry), an invalid energy scale (corrected
+        // TOF ≤ 0), a singular anorm/baseline system, or a forward-model
+        // (transmission) failure. The start itself synthesized (pre-flighted
+        // above), so the infeasibility arose during the search.
         return Err(FittingError::EvaluationFailed(
             "calibration found no finite-objective resolution: every parameter vector \
              tried was infeasible — kernel synthesis rejected it (τ-grid cap vs \
              fold/prompt geometry), the energy scale was invalid (corrected TOF ≤ 0), \
-             or the anorm/baseline system was singular"
+             the anorm/baseline system was singular, or the forward model failed"
                 .into(),
         ));
     }
@@ -1185,6 +1213,34 @@ mod tests {
         let data: Vec<f64> = model.iter().map(|m| 1.0 * m).collect();
         let unc = vec![0.01; 4];
         assert!(inner_chi2(&data, &unc, &model, false, 0) < 1e-18);
+    }
+
+    /// #645 round 4, F3: a `fit_psr` starting width outside the 0.05–1 µs fit
+    /// box (legal as a PIN up to [`PSR_FWHM_PIN_CEILING_US`]) is clamped to
+    /// the nearer box edge — documented behavior, not an error.
+    #[test]
+    fn fit_psr_out_of_box_start_clamps_to_box_edge() {
+        let family = ResolutionFamily::IkedaCarpenter { fit_psr: true };
+        // 5 000 ns = 5 µs: a valid pin width, above the 1 µs fit-box top.
+        let above = CalibrationConfig {
+            psr_fwhm_ns: 5_000.0,
+            ..CalibrationConfig::default()
+        };
+        let (x0, bounds) = family.x0_bounds(&above);
+        assert_eq!(x0.len(), 5);
+        assert_eq!(x0[4], PSR_FWHM_US_MAX);
+        assert_eq!(bounds[4], (PSR_FWHM_US_MIN, PSR_FWHM_US_MAX));
+        // 10 ns: below the 50 ns identifiability floor — clamped UP.
+        let below = CalibrationConfig {
+            psr_fwhm_ns: 10.0,
+            ..CalibrationConfig::default()
+        };
+        let (x0, _) = family.x0_bounds(&below);
+        assert_eq!(x0[4], PSR_FWHM_US_MIN);
+        // The in-box default (350 ns) passes through unclamped.
+        let inside = CalibrationConfig::default();
+        let (x0, _) = family.x0_bounds(&inside);
+        assert_eq!(x0[4], DEFAULT_PSR_FWHM_NS * NS_TO_US);
     }
 
     #[test]

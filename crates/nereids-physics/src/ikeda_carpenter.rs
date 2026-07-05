@@ -123,7 +123,7 @@
 //! triangular ~700 ns base — FWHM ≈ 350 ns — which is what the VENUS tabulated
 //! FTS kernel header records as "folded triang FWHM 350 ns PSR". NEREIDS folds
 //! that PSR triangle via `channel_fwhm_us` (symmetric triangle, half-base =
-//! FWHM, [`triangle_kernel`]). Note: a tabulated file whose header says the
+//! FWHM, `triangle_kernel`). Note: a tabulated file whose header says the
 //! triangle is already "folded" in must NOT be double-counted against an IC
 //! model that also applies it (the `nereids-fitting` calibrator therefore
 //! applies its `psr_fwhm_ns` fold to the IC family only, never to
@@ -407,7 +407,7 @@ impl IkedaCarpenter {
     /// `e_min ≤ 0`, `e_max ≤ e_min`), a non-positive `β`, a parameter/grid
     /// combination whose τ-grid cannot resolve the prompt core and requested
     /// folds within the `MAX_TAU_SAMPLES` cap at some reference energy (see
-    /// [`tau_geometry`] — remedy: larger `β`, `R = 0`, or a wider/disabled
+    /// `tau_geometry` — remedy: larger `β`, `R = 0`, or a wider/disabled
     /// fold), or if the synthesized kernels fail
     /// [`TabulatedResolution::from_kernels`] validation.
     pub fn new(
@@ -547,7 +547,7 @@ impl IkedaCarpenter {
     ///
     /// # Errors
     /// Returns [`ResolutionParseError::InvalidFormat`] when the τ-grid cannot
-    /// resolve the prompt core and requested folds within [`MAX_TAU_SAMPLES`]
+    /// resolve the prompt core and requested folds within `MAX_TAU_SAMPLES`
     /// at this energy. Construction validates every *reference* energy, but a
     /// probe energy outside `[e_min, e_max]` — for the √E law, above `e_max`,
     /// where the larger α(E) imposes a finer prompt resolution floor against

@@ -1324,8 +1324,12 @@ impl PyResolutionCalibration {
 ///         above 10_000 ns (10 µs) are rejected as a µs-as-ns unit slip
 ///         (synthesis cost is quadratic in the fold width).
 ///     fit_psr: also FIT the PSR FWHM (``"ic"`` only; appends a 5th
-///         parameter, box-bounded 0.05–1 µs, started at ``psr_fwhm_ns`` —
-///         which must then be > 0: a zero start contradicts "0 disables").
+///         parameter, box-bounded 0.05–1 µs, started at ``psr_fwhm_ns``
+///         clamped into that box — an out-of-box start, legal as a pin up
+///         to 10 µs, starts at the nearer box edge with a stderr warning,
+///         and a fit that stays there reports ``psr_fwhm_us:lower`` /
+///         ``:upper`` in ``bounds_hit``; ``psr_fwhm_ns`` must then be > 0:
+///         a zero start contradicts "0 disables").
 ///
 /// Returns:
 ///     ResolutionCalibration with the fitted params, data χ²/dof, the fitted (or
