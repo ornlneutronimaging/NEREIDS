@@ -1144,6 +1144,13 @@ fn selected_pixel_fit_result_for_overlay(
         back_f: result.back_f_map.as_ref().map(|map| map[[y, x]]),
         t0_us: result.t0_us_map.as_ref().map(|map| map[[y, x]]),
         l_scale: result.l_scale_map.as_ref().map(|map| map[[y, x]]),
+        // The spatial fit was configured with the beamline flight path (see
+        // `build_fit_config`'s `with_energy_scale` call), so the overlay
+        // result carries the same value when the energy scale was fitted.
+        energy_scale_flight_path_m: result
+            .t0_us_map
+            .as_ref()
+            .map(|_| state.beamline.flight_path_m),
         deviance_per_dof: result.deviance_per_dof_map.as_ref().map(|map| map[[y, x]]),
     })
 }

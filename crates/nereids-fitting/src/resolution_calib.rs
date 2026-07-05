@@ -127,6 +127,17 @@ pub fn corrected_energy_grid(
              got {flight_path_m}"
         )));
     }
+    // Per-bin grid validation runs BEFORE the identity shortcut so the
+    // Ok/Err contract is uniform: previously (t0=0, l_scale=1) returned a
+    // NaN/non-positive grid verbatim while any other transform rejected the
+    // same grid via the denominator guard (#634 review).
+    for (i, &e) in energies.iter().enumerate() {
+        if !e.is_finite() || e <= 0.0 {
+            return Err(FittingError::EvaluationFailed(format!(
+                "corrected_energy_grid: energies[{i}] must be finite and positive, got {e}"
+            )));
+        }
+    }
     if t0_us == 0.0 && l_scale == 1.0 {
         return Ok(energies.to_vec());
     }

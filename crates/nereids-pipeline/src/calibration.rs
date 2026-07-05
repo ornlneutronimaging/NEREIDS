@@ -19,6 +19,7 @@ use nereids_core::types::IsotopeGroup;
 use nereids_endf::resonance::ResonanceData;
 use nereids_fitting::lm::LmConfig;
 use nereids_fitting::resolution_calib::corrected_energy_grid;
+use nereids_physics::resolution::TOF_FACTOR;
 use nereids_physics::transmission::{self, InstrumentParams, SampleParams};
 
 use crate::error::PipelineError;
@@ -148,6 +149,143 @@ where
     }
 }
 
+/// Plateau-robust dip-position anchor (issue #634 review P0).
+///
+/// The dip POSITIONS carry the complete (t₀, L_scale) information: with the
+/// resonance energies known, matching each measured dip to its resonance and
+/// solving the 2-parameter affine TOF map `u_dip = t₀ + L_scale · u_res` by
+/// least squares recovers the energy scale directly — no grid search.  This
+/// is the same idea as the fitters' peak-match seed, with one critical
+/// difference: dip positions are the depth-weighted centres of contiguous
+/// below-threshold RUNS, so saturated flat-bottomed dips (transmission ≈ 0
+/// over several bins — the SoftwareX foil regime), which fail the strict
+/// local-minimum test of `detect_transmission_dips`, are located robustly.
+///
+/// Used as one CANDIDATE for the stage-2 anchor (scored by the same exact
+/// golden-section density as the lattice candidates); the coarse lattice
+/// remains the fallback when fewer than two dips are detectable.  Restricted
+/// to the plausible window (|t₀| ≤ 10 µs, L_scale ∈ [0.98, 1.02]) — wider
+/// offsets are out of this function's documented band.
+fn dip_match_anchor(
+    energies_nominal: &[f64],
+    transmission: &[f64],
+    valid: &[bool],
+    isotopes: &[ResonanceData],
+    abundances: &[f64],
+    assumed_flight_path_m: f64,
+) -> Option<(f64, f64)> {
+    let n = energies_nominal.len();
+    // Baseline = 90th percentile of valid transmission; depth threshold at
+    // 25 % of the maximum depth (matches the fitters' seed conventions).
+    let mut vals: Vec<f64> = transmission
+        .iter()
+        .zip(valid.iter())
+        .filter(|&(_, &v)| v)
+        .map(|(&t, _)| t)
+        .collect();
+    if vals.len() < 5 {
+        return None;
+    }
+    vals.sort_by(f64::total_cmp);
+    let baseline = vals[(vals.len() * 9) / 10];
+    let max_depth = baseline - vals[0];
+    if !(max_depth.is_finite() && max_depth > 1e-6) {
+        return None;
+    }
+    let threshold = baseline - 0.25 * max_depth;
+
+    // Depth-weighted centre of each contiguous below-threshold run.
+    let mut dips: Vec<f64> = Vec::new();
+    let mut i = 0;
+    while i < n {
+        if valid[i] && transmission[i] < threshold {
+            let mut wsum = 0.0_f64;
+            let mut ewsum = 0.0_f64;
+            while i < n && valid[i] && transmission[i] < threshold {
+                let w = (baseline - transmission[i]).max(0.0);
+                wsum += w;
+                ewsum += w * energies_nominal[i];
+                i += 1;
+            }
+            if wsum > 0.0 {
+                dips.push(ewsum / wsum);
+            }
+        } else {
+            i += 1;
+        }
+    }
+    if dips.len() < 2 {
+        return None;
+    }
+
+    // Resonance energies of contributing isotopes inside the window.
+    let e_lo = energies_nominal[0];
+    let e_hi = energies_nominal[n - 1];
+    let mut res_e: Vec<f64> = Vec::new();
+    for (rd, &abd) in isotopes.iter().zip(abundances.iter()) {
+        if abd <= 0.0 {
+            continue;
+        }
+        for range in &rd.ranges {
+            for lg in &range.l_groups {
+                for r in &lg.resonances {
+                    if r.energy > e_lo && r.energy < e_hi {
+                        res_e.push(r.energy);
+                    }
+                }
+            }
+        }
+    }
+    res_e.sort_by(f64::total_cmp);
+    res_e.dedup_by(|a, b| (*a - *b).abs() < 1e-9);
+    if res_e.len() < 2 {
+        return None;
+    }
+
+    // Match each resonance to its nearest dip within half the minimum
+    // resonance spacing (floored at twice the grid resolution).
+    let min_spacing = res_e
+        .windows(2)
+        .map(|w| w[1] - w[0])
+        .fold(f64::INFINITY, f64::min);
+    let grid_res = (e_hi - e_lo) / (n as f64 - 1.0);
+    let tol = (0.5 * min_spacing).max(2.0 * grid_res);
+    let kl = TOF_FACTOR * assumed_flight_path_m;
+    let mut pairs: Vec<(f64, f64)> = Vec::new(); // (u_dip, u_res) in µs
+    for &er in &res_e {
+        let mut best: Option<f64> = None;
+        for &d in &dips {
+            let dist = (d - er).abs();
+            if dist < tol && best.is_none_or(|b: f64| dist < (b - er).abs()) {
+                best = Some(d);
+            }
+        }
+        if let Some(d) = best {
+            pairs.push((kl / d.sqrt(), kl / er.sqrt()));
+        }
+    }
+    if pairs.len() < 2 {
+        return None;
+    }
+
+    // Least squares for u_dip = t0 + ls · u_res.
+    let m = pairs.len() as f64;
+    let su: f64 = pairs.iter().map(|p| p.0).sum();
+    let sv: f64 = pairs.iter().map(|p| p.1).sum();
+    let svv: f64 = pairs.iter().map(|p| p.1 * p.1).sum();
+    let suv: f64 = pairs.iter().map(|p| p.0 * p.1).sum();
+    let sxx = svv - sv * sv / m;
+    if !(sxx.is_finite() && sxx > 0.0) {
+        return None;
+    }
+    let ls = (suv - su * sv / m) / sxx;
+    let t0 = (su - ls * sv) / m;
+    if !(t0.is_finite() && ls.is_finite()) || t0.abs() > 10.0 || !(0.98..=1.02).contains(&ls) {
+        return None;
+    }
+    Some((t0, ls))
+}
+
 /// Result of energy calibration.
 #[derive(Debug, Clone)]
 pub struct CalibrationResult {
@@ -174,24 +312,39 @@ pub struct CalibrationResult {
 /// Issue #634: the former three-phase `(L, t₀)` grid scan — ~900 (L, t₀)
 /// candidates × a ~25-evaluation golden-section density search each,
 /// i.e. ~35 000 forward evaluations, >10 min on production windows — is
-/// replaced by the
-/// **`fit_energy_scale` Levenberg–Marquardt path** — the same
-/// peak-match-seeded machinery `fit_spectrum_typed` uses — which solves
-/// the identical 3-parameter `(t₀, L_scale, n_total)` problem in seconds.
+/// replaced by a staged global-then-local search built on the
+/// **`fit_energy_scale` Levenberg–Marquardt path**:
 ///
-/// The density `n_total` (total areal density, atoms/barn) is seeded by a
-/// **golden-section search in `log10(n)` space** over the documented
-/// user-supported interval `[1e-5, 1e-2]` atoms/barn, evaluated once at
-/// the identity energy scale; the LM then refines all three parameters
-/// jointly (density fitted as a single grouped parameter with the
-/// normalised abundances as fixed ratios).  Searching the seed in log
-/// space gives uniform relative resolution across the three-decade band
-/// (~1e-5 trace samples to ~1e-2 for 1 mm metal foils).
+/// 1. a coarse joint `(t₀, L_scale)` scan (7 × 7 candidates, each with an
+///    exact golden-section density in `log10(n)` over the documented
+///    `[1e-5, 1e-2]` atoms/barn band — the per-candidate density is what
+///    keeps the anchor JOINT, like the old grid);
+/// 2. a direct **dip-match anchor**: measured dip positions (plateau-robust
+///    depth-weighted run centres, so saturated flat-bottom dips locate
+///    correctly) matched to the known resonance energies and solved as an
+///    affine TOF map by least squares — the discriminating anchor along
+///    the `(t₀, L_scale)` degeneracy valley;
+/// 3. a fine joint pit-scan (11 × 11 at 0.25 µs / 0.05 % steps, narrow-band
+///    golden density) around EACH anchor — the compact descendant of the
+///    old Phase-2/3 grids, needed because the chi² landscape's sub-bin
+///    aliasing pits are ~±0.3 µs wide;
+/// 4. a multi-start descent from both fine anchors (per anchor: its own
+///    density plus log-spaced starts; per start: a direct joint LM AND an
+///    exact-density ↔ alignment-only-LM alternation), with every candidate
+///    scored by the original valid-bins chi² and the argmin returned.
+///
+/// Net cost is ~4× fewer forward evaluations than the old grid on
+/// production windows, and the LM refinement removes the old grid's
+/// resolution floor (0.001 % L, 0.05 µs t₀) — the optimum is continuous.
+/// The internal LM fits disable the fitters' peak-match seed
+/// (`with_energy_scale_seed(false)`): stages 1–3 already provide a
+/// stronger anchor, and the seed's strict-local-minimum dip detector
+/// mislocates saturated flat-bottom dips.
 ///
 /// Each LM fit constrains `L_scale` to ±1 % (`ENERGY_SCALE_L_SCALE_*`);
 /// when a fit rails on that box (a larger true offset), the search
 /// re-anchors on the corrected grid and composes the affine TOF maps, so
-/// the documented ±1.5 % flight-path band remains covered (≤ 3 rounds).
+/// the documented ±1.5 % flight-path band remains covered.
 ///
 /// The golden-section seed runs on a slightly wider band (~5e-6 to
 /// ~2e-2), and if the **fitted** density optimum saturates that band —
@@ -381,8 +534,23 @@ pub fn calibrate_energy(
         .map_err(|e| PipelineError::InvalidParameter(format!("calibrate_energy: {e}")))?
         .with_groups(&group_pairs, vec![d_init])
         .map_err(|e| PipelineError::InvalidParameter(format!("calibrate_energy: {e}")))?
-        .with_solver(SolverConfig::LevenbergMarquardt(LmConfig::default()))
-        .with_energy_scale(0.0, 1.0, assumed_flight_path_m);
+        .with_solver(SolverConfig::LevenbergMarquardt(LmConfig {
+            // Small first steps (issue #634): at saturated sharp dips the
+            // true (t0, L_scale) pit is sub-0.3 µs narrow while the
+            // along-valley Jacobian is near-singular — the default
+            // lambda_init = 1e-3 lets the first LM step overshoot the
+            // basin (observed: a start 0.12 µs from truth walking to a
+            // 7 µs-wrong valley pit).  A large initial damping keeps the
+            // early steps gradient-like and short; the LM anneals lambda
+            // back down once inside the basin.
+            lambda_init: 1.0e2,
+            ..LmConfig::default()
+        }))
+        .with_energy_scale(0.0, 1.0, assumed_flight_path_m)
+        // The anchor stages already seed (t0, L_scale); the fitters' internal
+        // peak-match seed mislocates saturated flat-bottom dips and would
+        // overwrite the anchor with an in-bounds wrong seed (issue #634).
+        .with_energy_scale_seed(false);
         if freeze_density {
             config = config.with_fix_densities(true);
         }
@@ -430,194 +598,297 @@ pub fn calibrate_energy(
         10f64.powf(0.5 * (CALIBRATION_LOG10_N_LO + CALIBRATION_LOG10_N_HI))
     };
 
-    // ── Stage 2: coarse global alignment anchor ─────────────────────────
+    // ── Stage 2: coarse global JOINT alignment anchor ────────────────────
     // A compact descendant of the old Phase-1 scan: 7 L_scale (±1.5 % in
     // 0.5 % steps) × 7 t₀ (−5…+10 µs in 2.5 µs steps) candidates, each
-    // scored by chi² at the COMMON density `n_seed` (49 forward
-    // evaluations — no per-candidate density optimisation, which was the
-    // expensive part of the old grid).  This keeps the global-basin
-    // robustness for wide offsets that a purely local method would lose
-    // when the peak-match seed cannot fire (e.g. trace densities in noise).
+    // scored with its OWN exact golden-section density — the per-candidate
+    // density optimisation is what makes the anchor JOINT, exactly like the
+    // old grid.  Scoring all candidates at one common density is NOT
+    // sufficient (issue #634 review, empirically demonstrated): on
+    // saturated (5e-3) or trace (2e-5) landscapes with production-scale
+    // offsets (0.3–1.2 % L, the module header's own VENUS example
+    // magnitude), the identity-seeded common density corrupts the candidate
+    // ranking, every descent start then inherits a wrong-basin anchor, and
+    // the calibration returns Ok with a density up to 139× off — at trace
+    // density with chi²_r ≈ 1e-4, i.e. no user-visible failure signal.
+    // ~49 golden sections ≈ 1 200 forward evaluations, still ~30× cheaper
+    // than the old three-phase grid's ~35 000.
     let mut t0_tot = 0.0_f64;
     let mut ls_tot = 1.0_f64;
+    let mut anchor_n = n_seed;
     let mut anchor_chi2 = seed_chi2;
     for i_l in -3..=3_i32 {
         let ls = 1.0 + f64::from(i_l) * 0.005;
         for i_t in 0..=6_i32 {
             let t0 = -5.0 + 2.5 * f64::from(i_t);
             if i_l == 0 && i_t == 2 {
-                continue; // the identity candidate is `seed_chi2` above
+                continue; // the identity candidate is (n_seed, seed_chi2) above
             }
             let Ok(e_c) = corrected_energy_grid(energies_nominal, t0, ls, assumed_flight_path_m)
             else {
                 continue; // degenerate candidate (t0 past the shortest TOF)
             };
-            let c = compute_chi2(
-                &e_c,
-                transmission,
-                uncertainty,
-                isotopes,
-                abundances,
-                n_seed,
-                temperature_k,
-                &valid,
-                resolution,
-            );
-            if c < anchor_chi2 {
-                anchor_chi2 = c;
+            let (n_c, chi2_c) = golden_at(&e_c);
+            if chi2_c < anchor_chi2 {
+                anchor_chi2 = chi2_c;
                 t0_tot = t0;
                 ls_tot = ls;
+                anchor_n = n_c;
             }
         }
     }
-    let grid = if t0_tot == 0.0 && ls_tot == 1.0 {
-        energies_nominal.to_vec()
-    } else {
-        corrected_energy_grid(energies_nominal, t0_tot, ls_tot, assumed_flight_path_m).map_err(
-            |e| {
-                PipelineError::InvalidParameter(format!(
-                    "calibrate_energy: degenerate anchor grid: {e}"
-                ))
-            },
-        )?
+
+    // ── Stage 2b: fine joint pit-scan around each anchor ────────────────
+    // The coarse 2.5 µs / 0.5 % cell — and the dip-match solve at saturated
+    // dips (its centroid is the bin-quantized saturation interval, biased up
+    // to ~0.5 µs) — are both coarser than the (t0, L_scale) landscape's
+    // sub-bin aliasing pits (~±0.3 µs wide, ~2 µs apart on the 0.2 eV test
+    // grid), so a descent seeded from either can converge into a
+    // NEIGHBOURING pit (observed: chi² 3.3 at 1.85 µs from the chi² ≈ 0 true
+    // pit, with the LM reporting converged).  This fine scan — 11 × 11
+    // candidates at 0.25 µs / 0.05 % steps spanning one coarse cell, each
+    // with its own golden-section density on a ±0.5-decade band around the
+    // coarse anchor density — is the compact descendant of the old
+    // Phase-2/3 refinement grids and deterministically lands inside the
+    // true pit, from which the descent below converges.  It runs around
+    // BOTH anchors (lattice winner and dip-match).
+    let fine_scan = |t0_a: f64, ls_a: f64, n_a: f64| -> (f64, f64, f64, f64) {
+        let fine_lo = (n_a.log10() - 0.5).max(CALIBRATION_LOG10_N_LO);
+        let fine_hi = (n_a.log10() + 0.5).min(CALIBRATION_LOG10_N_HI);
+        let mut best = (t0_a, ls_a, n_a, f64::INFINITY);
+        for i_l in -5..=5_i32 {
+            let ls = ls_a + f64::from(i_l) * 0.0005;
+            for i_t in -5..=5_i32 {
+                let t0 = t0_a + f64::from(i_t) * 0.25;
+                let Ok(e_c) =
+                    corrected_energy_grid(energies_nominal, t0, ls, assumed_flight_path_m)
+                else {
+                    continue;
+                };
+                let (n_c, chi2_c) =
+                    golden_section_n_total(fine_lo, fine_hi, CALIBRATION_LOG10_N_TOL, |log_n| {
+                        compute_chi2(
+                            &e_c,
+                            transmission,
+                            uncertainty,
+                            isotopes,
+                            abundances,
+                            10f64.powf(log_n),
+                            temperature_k,
+                            &valid,
+                            resolution,
+                        )
+                    });
+                if chi2_c < best.3 {
+                    best = (t0, ls, n_c, chi2_c);
+                }
+            }
+        }
+        best
     };
 
-    // ── Stages 3+4: multi-start descent — the sparse-grid degeneracy ────
-    // On coarse energy grids (dip width < bin spacing) the chi² landscape
-    // has aliasing local minima: with each dip sampled by ~1 point, a
-    // wrong density can trade off against a sub-bin (t₀, L_scale) shift
-    // almost perfectly.  A single local descent seeded from a
-    // misalignment-biased density can converge there (observed: n 14× low
-    // at chi² 0.17 on the 0.2 eV test fixture, while the true basin sits
-    // at chi² ≈ 0).  The old grid escaped this by JOINTLY sweeping
-    // (L, t₀) × exact density; the local-method equivalent is a small
-    // multi-start over log-spaced density seeds with argmin-chi²
-    // selection — the true basin always wins the comparison.
-    //
-    // Each start runs the same two stages from the stage-2 anchor:
-    //
-    //   Stage 3 — coordinate descent: the density is optimised EXACTLY
-    //   (1-D golden section) at the current alignment, and the alignment
-    //   is refined with the density FROZEN (#633), so the two cannot
-    //   trade off inside one ill-conditioned joint step.  Alignment-only
-    //   LM is the safe direction: at fixed density, dip POSITION mismatch
-    //   is the only signal, exactly what (t₀, L_scale) control.  Each
-    //   cycle re-anchors the grid at the composed transform (affine TOF
-    //   maps compose as t₀ ← t₀ + ls·t₀ₖ, ls ← ls·lsₖ), so a fit railed
-    //   on its ±1 % L_scale box extends its reach next cycle — covering
-    //   this function's documented ±1.5 % band.
-    //
-    //   Stage 4 — joint (t₀, L_scale, n) LM refinement: from inside the
-    //   basin the LM only accepts chi²-improving steps, so it cannot
-    //   degrade the alternation's solution; it captures the residual
-    //   density↔alignment coupling the alternation alone cannot.
-    let anchor = (t0_tot, ls_tot);
-    let anchor_grid = grid;
-    let mut seeds = vec![n_seed];
-    for exp in [-4.5_f64, -3.5, -2.5] {
-        let s = 10f64.powf(exp);
-        // Skip seeds within 2× of an existing one — same basin.
-        if seeds.iter().all(|&e| (s / e).log10().abs() > 0.301) {
-            seeds.push(s);
+    // Anchor set for the descent: the fine-scanned lattice winner PLUS the
+    // fine-scanned dip-match solve (see `dip_match_anchor`).  The dip-match
+    // anchor is deliberately NOT ranked against the lattice winner by a
+    // single chi² comparison: at sub-bin misalignment of sharp saturated
+    // dips, chi²(n) is multimodal — the steep dip edges make a nearly-right
+    // deep model score WORSE than a shallow one — so a chi² ranking can
+    // discard the one anchor whose fine neighbourhood contains the true pit
+    // (observed: dip-match landed 0.12 µs from truth yet scored chi² 1 809
+    // vs the lattice winner's 124).  Running the full multi-start descent
+    // from BOTH fine anchors and letting the final argmin-chi² decide is
+    // robust to that ranking failure.
+    let lattice_fine = fine_scan(t0_tot, ls_tot, anchor_n);
+    let mut anchor_list: Vec<(f64, f64, f64)> =
+        vec![(lattice_fine.0, lattice_fine.1, lattice_fine.2)];
+    if let Some((t0_d, ls_d)) = dip_match_anchor(
+        energies_nominal,
+        transmission,
+        &valid,
+        isotopes,
+        abundances,
+        assumed_flight_path_m,
+    ) {
+        // Density context for the dip anchor's narrow golden band: the
+        // lattice anchor's density is the best available estimate.
+        let dip_fine = fine_scan(t0_d, ls_d, anchor_n);
+        // Skip a duplicate anchor (both scans converged on the same pit).
+        if (dip_fine.0 - lattice_fine.0).abs() > 0.05 || (dip_fine.1 - lattice_fine.1).abs() > 1e-4
+        {
+            anchor_list.push((dip_fine.0, dip_fine.1, dip_fine.2));
         }
     }
+
     // (t0_tot, ls_tot, n_total, chi2 over valid bins, LM converged flag)
     let mut winner: Option<(f64, f64, f64, f64, bool)> = None;
-    for &start_n in &seeds {
-        let mut t0_tot = anchor.0;
-        let mut ls_tot = anchor.1;
-        let mut grid = anchor_grid.clone();
-        let mut n_cur = start_n;
+    // Last LM error across all starts: per-seed failures are skippable, but
+    // when EVERY start fails (a config-class error — bad resolution kernel,
+    // config rejection — fails all seeds identically) the no-winner
+    // diagnostic must carry the actual root cause instead of misattributing
+    // it to non-finite residuals (issue #634 review).
+    let mut last_lm_err: Option<PipelineError> = None;
+    for &(a_t0, a_ls, a_n) in &anchor_list {
+        let anchor_grid = if a_t0 == 0.0 && a_ls == 1.0 {
+            energies_nominal.to_vec()
+        } else {
+            match corrected_energy_grid(energies_nominal, a_t0, a_ls, assumed_flight_path_m) {
+                Ok(g) => g,
+                // Degenerate anchor — the other anchor still runs; if every
+                // anchor is degenerate the no-winner guard below reports it.
+                Err(_) => continue,
+            }
+        };
+        // Density seeds: this anchor's own fine-scan density (the joint
+        // optimum of its pit) plus log-spaced starts across the band (the
+        // aliasing/multimodality guard).
+        let mut seeds = vec![a_n];
+        for exp in [-4.5_f64, -3.5, -2.5] {
+            let sd = 10f64.powf(exp);
+            // Skip seeds within 2× of an existing one — same basin.
+            if seeds.iter().all(|&e| (sd / e).log10().abs() > 0.301) {
+                seeds.push(sd);
+            }
+        }
+        for &start_n in &seeds {
+            // Two descent variants per (anchor, seed); both feed the same
+            // final argmin:
+            //
+            //  (a) DIRECT joint LM from the anchor — robust at saturated
+            //      dips, where the alternation below fails: a frozen
+            //      slightly-wrong density has its alignment optimum in a
+            //      COMPENSATING pit, so the alternation walks away from a
+            //      good anchor before its joint stage ever runs (observed:
+            //      an anchor 0.12 µs from truth descending to a chi² 3.3
+            //      pit while the direct joint fit rolls into the chi² ≈ 0
+            //      true pit).
+            //
+            //  (b) alternation (exact density ↔ alignment-only LM, then
+            //      joint LM) — robust when the density seed is decades off,
+            //      where a direct joint fit would trade density against a
+            //      sub-bin shift (the aliasing degeneracy).
+            let mut candidates: Vec<(f64, f64, SpectrumFitResult)> = Vec::new();
 
-        // Stage 3: exact density ↔ alignment-only LM.
-        let mut failed = false;
-        for cycle in 0..3 {
-            // First cycle keeps the start density (the whole point of the
-            // multi-start); later cycles re-optimise it at the improved
-            // alignment.
-            if cycle > 0 {
-                let (n_new, chi2_n) = golden_at(&grid);
-                if chi2_n.is_finite() {
-                    n_cur = n_new;
+            // (a) direct joint fit from the anchor.
+            match run_lm(&anchor_grid, start_n * total_abundance, false) {
+                Ok(fit) => {
+                    let t0_c = a_t0 + a_ls * fit.t0_us.unwrap_or(0.0);
+                    let ls_c = a_ls * fit.l_scale.unwrap_or(1.0);
+                    candidates.push((t0_c, ls_c, fit));
                 }
+                Err(e) => last_lm_err = Some(e),
             }
-            let Ok(align) = run_lm(&grid, n_cur * total_abundance, true) else {
-                failed = true;
-                break;
-            };
-            let t0_k = align.t0_us.unwrap_or(0.0);
-            let ls_k = align.l_scale.unwrap_or(1.0);
-            t0_tot += ls_tot * t0_k;
-            ls_tot *= ls_k;
-            // Alignment converged (no further shift found) → stop.
-            if t0_k.abs() < 1e-6 && (ls_k - 1.0).abs() < 1e-9 {
-                break;
-            }
-            match corrected_energy_grid(energies_nominal, t0_tot, ls_tot, assumed_flight_path_m) {
-                Ok(g) => grid = g,
-                Err(_) => {
-                    failed = true;
+
+            // (b) alternation.
+            let mut t0_tot = a_t0;
+            let mut ls_tot = a_ls;
+            let mut grid = anchor_grid.clone();
+            let mut n_cur = start_n;
+            let mut failed = false;
+            for cycle in 0..3 {
+                // First cycle keeps the start density (the whole point of the
+                // multi-start); later cycles re-optimise it at the improved
+                // alignment.
+                if cycle > 0 {
+                    let (n_new, chi2_n) = golden_at(&grid);
+                    if chi2_n.is_finite() {
+                        n_cur = n_new;
+                    }
+                }
+                let align = match run_lm(&grid, n_cur * total_abundance, true) {
+                    Ok(a) => a,
+                    Err(e) => {
+                        last_lm_err = Some(e);
+                        failed = true;
+                        break;
+                    }
+                };
+                let t0_k = align.t0_us.unwrap_or(0.0);
+                let ls_k = align.l_scale.unwrap_or(1.0);
+                t0_tot += ls_tot * t0_k;
+                ls_tot *= ls_k;
+                // Alignment converged (no further shift found) → stop.
+                if t0_k.abs() < 1e-6 && (ls_k - 1.0).abs() < 1e-9 {
                     break;
                 }
+                match corrected_energy_grid(energies_nominal, t0_tot, ls_tot, assumed_flight_path_m)
+                {
+                    Ok(g) => grid = g,
+                    Err(_) => {
+                        failed = true;
+                        break;
+                    }
+                }
             }
-        }
-        if failed {
-            continue;
-        }
+            if !failed {
+                // Joint refinement of the alternation result.
+                let (n_stage, chi2_stage) = golden_at(&grid);
+                if chi2_stage.is_finite() {
+                    n_cur = n_stage;
+                }
+                match run_lm(&grid, n_cur * total_abundance, false) {
+                    Ok(fit) => {
+                        let t0_c = t0_tot + ls_tot * fit.t0_us.unwrap_or(0.0);
+                        let ls_c = ls_tot * fit.l_scale.unwrap_or(1.0);
+                        candidates.push((t0_c, ls_c, fit));
+                    }
+                    Err(e) => last_lm_err = Some(e),
+                }
+            }
 
-        // Stage 4: joint refinement with the density free.
-        let (n_stage, chi2_stage) = golden_at(&grid);
-        if chi2_stage.is_finite() {
-            n_cur = n_stage;
-        }
-        let Ok(fit) = run_lm(&grid, n_cur * total_abundance, false) else {
-            continue;
-        };
-        let t0_c = t0_tot + ls_tot * fit.t0_us.unwrap_or(0.0);
-        let ls_c = ls_tot * fit.l_scale.unwrap_or(1.0);
-        let n_c = fit.densities.first().copied().unwrap_or(f64::NAN) / total_abundance;
-
-        // Score this start with the ORIGINAL valid-bins objective at its
-        // solution; keep the argmin.  The latch is gated on finiteness: a
-        // bare `None => true` first-start arm would let a NaN chi² latch
-        // (bypassing the `<` comparison), and every later start would then
-        // compare `chi2 < NaN` (always false) — a valid later calibration
-        // could never displace a NaN first start and the function would
-        // return the no-finite-chi² error for a calibratable spectrum.
-        // Mirrors the old grid's `best_chi2 = INFINITY` + `<` behaviour,
-        // where non-finite candidates could never latch (issue #634 review).
-        let Ok(e_c) = corrected_energy_grid(energies_nominal, t0_c, ls_c, assumed_flight_path_m)
-        else {
-            continue;
-        };
-        let chi2_c = compute_chi2(
-            &e_c,
-            transmission,
-            uncertainty,
-            isotopes,
-            abundances,
-            n_c,
-            temperature_k,
-            &valid,
-            resolution,
-        );
-        let better = chi2_c.is_finite()
-            && match &winner {
-                None => true,
-                Some((_, _, _, best, _)) => chi2_c < *best,
-            };
-        if better {
-            winner = Some((t0_c, ls_c, n_c, chi2_c, fit.converged));
+            // Score every candidate with the ORIGINAL valid-bins objective at
+            // its solution; keep the argmin.  The latch is gated on
+            // finiteness: a bare `None => true` first-candidate arm would let
+            // a NaN chi² latch (bypassing the `<` comparison), and every
+            // later candidate would then compare `chi2 < NaN` (always false)
+            // — a valid later calibration could never displace a NaN first
+            // one and the function would return the no-finite-chi² error for
+            // a calibratable spectrum.  Mirrors the old grid's
+            // `best_chi2 = INFINITY` + `<` behaviour, where non-finite
+            // candidates could never latch (issue #634 review).
+            for (t0_c, ls_c, fit) in candidates {
+                let n_c = fit.densities.first().copied().unwrap_or(f64::NAN) / total_abundance;
+                let Ok(e_c) =
+                    corrected_energy_grid(energies_nominal, t0_c, ls_c, assumed_flight_path_m)
+                else {
+                    continue;
+                };
+                let chi2_c = compute_chi2(
+                    &e_c,
+                    transmission,
+                    uncertainty,
+                    isotopes,
+                    abundances,
+                    n_c,
+                    temperature_k,
+                    &valid,
+                    resolution,
+                );
+                let better = chi2_c.is_finite()
+                    && match &winner {
+                        None => true,
+                        Some((_, _, _, best, _)) => chi2_c < *best,
+                    };
+                if better {
+                    winner = Some((t0_c, ls_c, n_c, chi2_c, fit.converged));
+                }
+            }
         }
     }
     let Some((t0_tot, ls_tot, best_n, _, lm_converged)) = winner else {
-        return Err(PipelineError::InvalidParameter(
+        // Preserve the root cause: a config-class LM error fails every seed
+        // identically, and its message is the actionable diagnostic — the
+        // generic non-finite-residuals guess applies only when no LM error
+        // occurred.
+        let detail = match last_lm_err {
+            Some(e) => format!("last LM error: {e}"),
+            None => "likely cause is forward-model failure or non-finite \
+                     residuals (e.g. wildly out-of-scale transmission)"
+                .to_string(),
+        };
+        return Err(PipelineError::InvalidParameter(format!(
             "calibrate_energy: calibration produced no finite chi² from any \
-             density start (best_chi2 = inf) — likely cause is forward-model \
-             failure or non-finite residuals (e.g. wildly out-of-scale \
-             transmission)"
-                .into(),
-        ));
+             density start (best_chi2 = inf) — {detail}"
+        )));
     };
 
     // Boundary-saturation guard: if the fitted n_total lies within
@@ -1219,19 +1490,19 @@ mod tests {
     // the old reachable max) plus the explicit boundary-failure
     // diagnostic at densities outside the band.
 
-    /// Synthetic round-trip helper parameterised on `true_n`.  Builds
-    /// data with two well-separated Hf-style resonances at the given
-    /// true density, runs `calibrate_energy`, and on success returns
-    /// `(result, e_true, assumed_l)` so individual tests can assert on
-    /// density recovery and chi² finiteness (most callers) or on
-    /// corrected-energy accuracy against `e_true` (the
-    /// `test_calibrate_round_trip_synthetic` smoke test).
-    fn calibrate_round_trip_at_density(
+    /// Fully-parameterised synthetic round-trip helper.  Builds data with
+    /// two well-separated Hf-style resonances at the given true density and
+    /// injected `(true_l = assumed_l · true_l_factor, true_t0_us)` offsets,
+    /// runs `calibrate_energy`, and on success returns
+    /// `(result, e_true, assumed_l)` so tests can assert on parameter
+    /// recovery and corrected-energy accuracy against `e_true`.
+    fn calibrate_round_trip(
+        true_l_factor: f64,
+        true_t0_us: f64,
         true_n: f64,
     ) -> Result<(CalibrationResult, Vec<f64>, f64), PipelineError> {
-        let true_l = 25.0125;
         let assumed_l = 25.0;
-        let true_t0_us = 0.5;
+        let true_l = assumed_l * true_l_factor;
         let temperature_k = 293.6;
 
         let iso_a = synthetic_single_resonance(72, 178, 176.4, 7.8);
@@ -1271,6 +1542,89 @@ mod tests {
             None,
         )?;
         Ok((result, e_true, assumed_l))
+    }
+
+    /// Synthetic round-trip helper parameterised on `true_n` at the small
+    /// legacy offsets (`+0.05 % L`, `+0.5 µs`) — the easy regime.  The
+    /// wide-offset production regime is covered separately by
+    /// `assert_wide_offset_recovery` (issue #634 review P0).
+    fn calibrate_round_trip_at_density(
+        true_n: f64,
+    ) -> Result<(CalibrationResult, Vec<f64>, f64), PipelineError> {
+        calibrate_round_trip(25.0125 / 25.0, 0.5, true_n)
+    }
+
+    /// Issue #634 review P0 regression: production-scale offsets — the
+    /// module header's own VENUS correction magnitude (0.3 % L) and
+    /// beyond-one-±1 %-L_scale-box offsets (1.2 % L, 6 µs, which also pin
+    /// the affine re-anchoring composition `t0 ← t0 + ls·t0_k, ls ← ls·ls_k`)
+    /// — must recover `(L, t0, n)` and the corrected energy grid.  The
+    /// single-common-density anchor variant returned Ok in the WRONG basin
+    /// here (density up to 139× off; at trace density with chi²_r ≈ 1e-4,
+    /// no visible failure signal); the per-candidate golden-section density
+    /// in the stage-2 anchor is what defeats it.
+    fn assert_wide_offset_recovery(
+        true_l_factor: f64,
+        true_t0_us: f64,
+        true_n: f64,
+        n_rel_tol: f64,
+    ) {
+        let (result, e_true, assumed_l) = calibrate_round_trip(true_l_factor, true_t0_us, true_n)
+            .expect("wide-offset calibration must succeed");
+        let true_l = assumed_l * true_l_factor;
+        assert!(
+            (result.flight_path_m - true_l).abs() / true_l < 2e-3,
+            "L: got {}, expected {true_l}",
+            result.flight_path_m,
+        );
+        assert!(
+            (result.t0_us - true_t0_us).abs() < 0.5,
+            "t0: got {}, expected {true_t0_us}",
+            result.t0_us,
+        );
+        assert!(
+            (result.total_density - true_n).abs() / true_n < n_rel_tol,
+            "n: got {}, expected {true_n}",
+            result.total_density,
+        );
+        // The deliverable: the corrected energy grid tracks the truth.
+        let mut rel: Vec<f64> = result
+            .energies_corrected
+            .iter()
+            .zip(e_true.iter())
+            .map(|(&c, &t)| (c - t).abs() / t)
+            .collect();
+        rel.sort_by(f64::total_cmp);
+        let med = rel[rel.len() / 2];
+        assert!(
+            med < 5e-3,
+            "median corrected-energy rel err {med:.3e} exceeds 5e-3"
+        );
+    }
+
+    #[test]
+    fn test_calibrate_wide_offset_venus_scale_at_paper_density() {
+        // 0.3 % L + 1 µs at the SoftwareX U-238 foil density.
+        assert_wide_offset_recovery(1.003, 1.0, 5e-3, 0.15);
+    }
+
+    #[test]
+    fn test_calibrate_wide_offset_venus_scale_at_trace_density() {
+        // Same offsets at trace density — the silent-failure regime
+        // (wrong answer previously carried chi²_r ≈ 1e-4).
+        assert_wide_offset_recovery(1.003, 1.0, 2e-5, 0.3);
+    }
+
+    #[test]
+    fn test_calibrate_wide_offset_beyond_one_box_at_paper_density() {
+        // 1.2 % L exceeds the per-fit ±1 % L_scale box → exercises the
+        // re-anchoring composition; 6 µs t0 is mid coarse-grid.
+        assert_wide_offset_recovery(1.012, 6.0, 5e-3, 0.15);
+    }
+
+    #[test]
+    fn test_calibrate_wide_offset_beyond_one_box_at_midband_density() {
+        assert_wide_offset_recovery(1.012, 6.0, 1.5e-4, 0.15);
     }
 
     /// Near-lower-edge density: `true_n = 2e-5` sits just inside the

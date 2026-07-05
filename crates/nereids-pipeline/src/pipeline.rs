@@ -372,6 +372,14 @@ pub struct UnifiedFitConfig {
     /// back to `PartialGal` (the default since issue #489).
     /// `Some(_)` bypasses both the env var and the default.
     tzero_jacobian_method: Option<nereids_fitting::transmission_model::EnergyScaleJacobianMethod>,
+    /// Whether the resonance peak-match seed runs before an energy-scale fit
+    /// (default `true`).  `calibrate_energy` disables it (issue #634): its
+    /// global anchor stages already seed `(t0, L_scale)`, and the peak-match
+    /// dip detector mislocates saturated flat-bottom dips (a strict
+    /// local-minimum test on a ≈0 plateau), producing an in-bounds but wrong
+    /// least-squares seed that OVERWRITES the caller's anchor — observed
+    /// driving a fit from 0.12 µs off truth to a 7 µs-wrong pit.
+    energy_scale_seed_enabled: bool,
 
     // ── Fit energy range restriction (SAMMY EMIN/EMAX equivalent) ──
     /// User-specified fit-energy-range restriction.  When `Some((min,
@@ -486,6 +494,7 @@ impl UnifiedFitConfig {
             n_density_params: None,
             density_free: None,
             tzero_jacobian_method: None,
+            energy_scale_seed_enabled: true,
             fit_energy_range: None,
         })
     }
@@ -501,6 +510,18 @@ impl UnifiedFitConfig {
         method: Option<nereids_fitting::transmission_model::EnergyScaleJacobianMethod>,
     ) -> Self {
         self.tzero_jacobian_method = method;
+        self
+    }
+
+    /// Enable/disable the resonance peak-match `(t0, L_scale)` seed that
+    /// normally runs before an energy-scale fit (default `true`).  Callers
+    /// that supply their own, stronger alignment anchor — `calibrate_energy`
+    /// (issue #634) — disable it: the seed's dip detector mislocates
+    /// saturated flat-bottom dips and its in-bounds least-squares result
+    /// would overwrite the anchor.
+    #[must_use]
+    pub fn with_energy_scale_seed(mut self, enabled: bool) -> Self {
+        self.energy_scale_seed_enabled = enabled;
         self
     }
 
@@ -1329,6 +1350,7 @@ fn fit_transmission_lm(
     if let Some((t0_idx, ls_idx)) = energy_scale_indices {
         sr.t0_us = Some(result.params[t0_idx]);
         sr.l_scale = Some(result.params[ls_idx]);
+        sr.energy_scale_flight_path_m = Some(config.flight_path_m);
     }
 
     Ok(sr)
@@ -1437,6 +1459,7 @@ fn fit_transmission_poisson(
     if let Some((t0_idx, ls_idx)) = energy_scale_indices {
         sr.t0_us = Some(result.params[t0_idx]);
         sr.l_scale = Some(result.params[ls_idx]);
+        sr.energy_scale_flight_path_m = Some(config.flight_path_m);
     }
 
     Ok(sr)
@@ -1699,6 +1722,7 @@ fn fit_counts_joint_poisson(
         back_f: None,
         t0_us: energy_scale_indices.map(|(t0_idx, _)| result.params[t0_idx]),
         l_scale: energy_scale_indices.map(|(_, ls_idx)| result.params[ls_idx]),
+        energy_scale_flight_path_m: energy_scale_indices.map(|_| config.flight_path_m),
         deviance_per_dof: Some(result.deviance_per_dof),
     })
 }
@@ -1924,6 +1948,11 @@ fn seed_energy_scale_in_params(
     measured_transmission: &[f64],
     config: &UnifiedFitConfig,
 ) {
+    // Issue #634: callers with their own alignment anchor (calibrate_energy)
+    // disable the seed — see `with_energy_scale_seed`.
+    if !config.energy_scale_seed_enabled {
+        return;
+    }
     let Some((t0_idx, ls_idx)) = energy_scale_indices else {
         return;
     };
@@ -2665,6 +2694,7 @@ fn extract_result(
         back_f,
         t0_us: None,
         l_scale: None,
+        energy_scale_flight_path_m: None,
         deviance_per_dof: None,
     })
 }
@@ -3126,6 +3156,13 @@ pub struct SpectrumFitResult {
     /// Fitted flight-path scale factor (SAMMY TZERO L₀, dimensionless).
     /// `None` when energy-scale fitting is not enabled.
     pub l_scale: Option<f64>,
+    /// The nominal flight path (m) the energy-scale fit was configured
+    /// with — stored so [`Self::corrected_energies`] reproduces the
+    /// transform with the SAME flight path the fit used, closing the
+    /// caller-resupplied-mismatch channel (issue #634 review: a wrong but
+    /// positive flight path silently changes the t₀ term).  `None` when
+    /// energy-scale fitting is not enabled.
+    pub energy_scale_flight_path_m: Option<f64>,
     /// Conditional binomial deviance divided by `(n − k)`
     /// (primary GOF for the counts-KL dispatch, i.e.
     /// `SolverConfig::PoissonKL` on `InputData::Counts` or
@@ -3140,27 +3177,32 @@ pub struct SpectrumFitResult {
 impl SpectrumFitResult {
     /// Map a nominal energy grid through the fitted SAMMY energy scale
     /// `(t0_us, l_scale)` to the corrected (calibrated) energies the fit
-    /// actually evaluated the physics on (issue #634).
+    /// evaluated the physics on (issue #634).
     ///
-    /// This exposes the exact transform the fitter used so downstream code
-    /// never has to re-derive it — replicating it by hand with a `+t0` sign
+    /// This exposes the transform the fitter used so downstream code never
+    /// has to re-derive it — replicating it by hand with a `+t0` sign
     /// (instead of the correct `−t0`) caused a silent +400 K temperature bias
     /// in the field. It reuses the canonical
     /// [`corrected_energy_grid`](nereids_fitting::resolution_calib::corrected_energy_grid)
-    /// (SAMMY `dat/mdat0.f90:189`, −t0 convention).
+    /// (SAMMY `dat/mdat0.f90:189`, −t0 convention) with the SAME flight path
+    /// the fit was configured with (stored on the result), so a mismatched
+    /// caller-supplied flight path cannot silently skew the t₀ term.
     ///
-    /// Returns `None` when energy-scale fitting was not enabled (`t0_us` or
-    /// `l_scale` is `None`) — the corrected grid would equal the input, but
-    /// `None` distinguishes "not fitted" from "fitted to the identity".
-    /// Returns `Some(Err(_))` for a degenerate calibration (a `t0` past the
-    /// shortest flight time on the given grid).
+    /// One divergence from the fit's internal evaluation: at a DEGENERATE
+    /// `t0` at/past the grid's shortest flight time, the model clamps `t0`
+    /// just below the limit and keeps evaluating, while this accessor
+    /// returns `Some(Err(_))` — a degenerate calibration should be
+    /// re-examined, not silently reproduced.
+    ///
+    /// Returns `None` when energy-scale fitting was not enabled — the
+    /// corrected grid would equal the input, but `None` distinguishes
+    /// "not fitted" from "fitted to the identity".
     pub fn corrected_energies(
         &self,
         nominal_energies: &[f64],
-        flight_path_m: f64,
     ) -> Option<Result<Vec<f64>, PipelineError>> {
-        match (self.t0_us, self.l_scale) {
-            (Some(t0), Some(l_scale)) => Some(
+        match (self.t0_us, self.l_scale, self.energy_scale_flight_path_m) {
+            (Some(t0), Some(l_scale), Some(flight_path_m)) => Some(
                 nereids_fitting::resolution_calib::corrected_energy_grid(
                     nominal_energies,
                     t0,
@@ -4907,7 +4949,7 @@ mod tests {
             nereids_fitting::resolution_calib::corrected_energy_grid(&nominal, t0, ls, flight_path)
                 .unwrap();
 
-        let mk = |t0: Option<f64>, ls: Option<f64>| SpectrumFitResult {
+        let mk = |t0: Option<f64>, ls: Option<f64>, fp: Option<f64>| SpectrumFitResult {
             densities: vec![0.001],
             uncertainties: None,
             reduced_chi_squared: 1.0,
@@ -4921,44 +4963,66 @@ mod tests {
             back_f: None,
             t0_us: t0,
             l_scale: ls,
+            energy_scale_flight_path_m: fp,
             deviance_per_dof: None,
         };
 
-        // Fitted energy scale → Some(corrected grid) == the canonical transform.
-        let got = mk(Some(t0), Some(ls))
-            .corrected_energies(&nominal, flight_path)
+        // Fitted energy scale → Some(corrected grid) == the canonical
+        // transform at the STORED flight path.
+        let got = mk(Some(t0), Some(ls), Some(flight_path))
+            .corrected_energies(&nominal)
             .expect("Some when energy scale fitted")
             .unwrap();
         assert_eq!(got, expected);
         // Not fitted → None (distinguishes "unfit" from "fitted to identity").
+        assert!(mk(None, None, None).corrected_energies(&nominal).is_none());
         assert!(
-            mk(None, None)
-                .corrected_energies(&nominal, flight_path)
-                .is_none()
-        );
-        assert!(
-            mk(Some(t0), None)
-                .corrected_energies(&nominal, flight_path)
+            mk(Some(t0), None, None)
+                .corrected_energies(&nominal)
                 .is_none()
         );
 
-        // Invalid scale inputs are REJECTED, not squared into plausible
+        // Invalid scale values are REJECTED, not squared into plausible
         // grids (#634 review): the transform is even in l_scale (a negative
         // l_scale would silently return the same grid as its positive
         // counterpart), flight_path_m = 0 with t0 < 0 would return all
         // zeros, and a NaN l_scale would return Ok(NaN).
-        let fitted = mk(Some(t0), Some(ls));
-        assert!(fitted.corrected_energies(&nominal, 0.0).unwrap().is_err());
-        assert!(fitted.corrected_energies(&nominal, -25.0).unwrap().is_err());
         assert!(
-            mk(Some(t0), Some(-1.0))
-                .corrected_energies(&nominal, flight_path)
+            mk(Some(t0), Some(ls), Some(0.0))
+                .corrected_energies(&nominal)
                 .unwrap()
                 .is_err()
         );
         assert!(
-            mk(Some(t0), Some(f64::NAN))
-                .corrected_energies(&nominal, flight_path)
+            mk(Some(t0), Some(ls), Some(-25.0))
+                .corrected_energies(&nominal)
+                .unwrap()
+                .is_err()
+        );
+        assert!(
+            mk(Some(t0), Some(-1.0), Some(flight_path))
+                .corrected_energies(&nominal)
+                .unwrap()
+                .is_err()
+        );
+        assert!(
+            mk(Some(t0), Some(f64::NAN), Some(flight_path))
+                .corrected_energies(&nominal)
+                .unwrap()
+                .is_err()
+        );
+        // A garbage NOMINAL grid is rejected too — including at the exact
+        // identity (t0=0, ls=1), which previously passed the grid through
+        // verbatim (#634 review: inconsistent Ok/Err contract).
+        assert!(
+            mk(Some(0.0), Some(1.0), Some(flight_path))
+                .corrected_energies(&[1.0, f64::NAN, 3.0])
+                .unwrap()
+                .is_err()
+        );
+        assert!(
+            mk(Some(t0), Some(ls), Some(flight_path))
+                .corrected_energies(&[0.0, 1.0])
                 .unwrap()
                 .is_err()
         );

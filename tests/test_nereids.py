@@ -2790,7 +2790,7 @@ class TestFitEnergyScaleRecovery:
             energy_scale_flight_path_m=L_NOM,
             max_iter=100,
         )
-        corr = r_es.corrected_energies(energies, L_NOM)
+        corr = r_es.corrected_energies(energies)
         assert corr is not None
         corr = np.asarray(corr)
         assert corr.shape == energies.shape
@@ -2805,14 +2805,17 @@ class TestFitEnergyScaleRecovery:
             solver="lm",
             max_iter=50,
         )
-        assert r_plain.corrected_energies(energies, L_NOM) is None
+        assert r_plain.corrected_energies(energies) is None
 
-        # Invalid flight path is rejected, not squared into a plausible
-        # (all-zero / garbage) grid (#634 review).
+        # Invalid nominal grids are rejected with the binding's standard
+        # energy-grid validation (#634 review) — NaN, non-positive, and
+        # non-ascending grids raise instead of passing through.
         with pytest.raises(ValueError):
-            r_es.corrected_energies(energies, 0.0)
+            r_es.corrected_energies(np.array([np.nan, 2.0, 3.0]))
         with pytest.raises(ValueError):
-            r_es.corrected_energies(energies, -25.0)
+            r_es.corrected_energies(np.array([0.0, 1.0, 2.0]))
+        with pytest.raises(ValueError):
+            r_es.corrected_energies(np.array([3.0, 1.0, 2.0]))
 
 
 # ===========================================================================

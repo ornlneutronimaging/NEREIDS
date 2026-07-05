@@ -1120,6 +1120,7 @@ fn state_from_snapshot(snap: ProjectSnapshot, state: &mut AppState, path: &Path)
             back_f: None,
             t0_us: None,
             l_scale: None,
+            energy_scale_flight_path_m: None,
             deviance_per_dof: None,
         };
         // Rebuild FitFeedback from the restored result

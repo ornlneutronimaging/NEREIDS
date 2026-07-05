@@ -160,14 +160,16 @@ class FitResult:
         ...
 
     def corrected_energies(
-        self, nominal_energies: NDArray[np.float64], flight_path_m: float
+        self, nominal_energies: NDArray[np.float64]
     ) -> NDArray[np.float64] | None:
         """Map a nominal energy grid through the fitted ``(t0_us, l_scale)``
         energy scale to the corrected (calibrated) energies the fit used
-        (issue #634), using the exact SAMMY −t0 convention.
+        (issue #634), using the exact SAMMY −t0 convention and the SAME
+        flight path the fit was configured with (stored on the result).
 
         Returns ``None`` when energy-scale fitting was not enabled; raises
-        ``ValueError`` on a degenerate calibration (t0 past the shortest
+        ``ValueError`` on an invalid nominal grid (non-finite, non-positive,
+        or non-ascending) or a degenerate calibration (t0 past the shortest
         flight time).
         """
         ...

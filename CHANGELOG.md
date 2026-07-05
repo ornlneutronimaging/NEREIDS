@@ -46,14 +46,20 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
 
 ### Changed
 
-- **`calibrate_energy` is orders of magnitude faster** (#634): the
-  three-phase (L, t₀) grid + per-candidate golden-section density search
-  (~35 000 forward evaluations; >10 min on production windows) is
-  replaced by a multi-start descent built on the `fit_energy_scale` LM
-  path (peak-match-seeded alignment with the density frozen, exact 1-D
-  golden-section density at each alignment, joint LM polish, argmin-χ²
-  across log-spaced density starts). The public signature,
-  `CalibrationResult` fields, density band `[1e-5, 1e-2]`,
+- **`calibrate_energy` rebuilt on the `fit_energy_scale` LM path**
+  (#634): the three-phase (L, t₀) grid + per-candidate golden-section
+  density search (~35 000 forward evaluations; >10 min on production
+  windows) is replaced by a staged search — coarse joint (t₀, L_scale)
+  scan with exact per-candidate density, a plateau-robust dip-match
+  anchor (handles saturated flat-bottom dips), fine joint pit-scans
+  around each anchor, then a multi-start LM descent scored by the
+  original valid-bins χ² (argmin). ~4× fewer forward evaluations on
+  production windows, and the LM refinement removes the old grid's
+  resolution floor (the optimum is continuous rather than quantized to
+  0.001 % L / 0.05 µs t₀). New wide-offset round-trip regression tests
+  pin recovery at production-scale offsets (0.3–1.2 % L, 1–6 µs t₀)
+  across trace, mid-band, and saturated-foil densities. The public
+  signature, `CalibrationResult` fields, density band `[1e-5, 1e-2]`,
   boundary-saturation and no-finite-χ² error contracts, and the
   `dof = n_valid − 3` reduced-χ² convention are unchanged; all existing
   calibration tests pass unmodified.
