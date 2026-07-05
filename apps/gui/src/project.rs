@@ -159,6 +159,9 @@ pub fn snapshot_from_state(state: &AppState) -> ProjectSnapshot {
         result_isotope_labels,
         anorm_map,
         background_maps,
+        baseline_global,
+        baseline_e_ref_ev,
+        baseline_maps,
     ) = if let Some(ref sr) = state.spatial_result {
         (
             Some(sr.density_maps.clone()),
@@ -173,10 +176,16 @@ pub fn snapshot_from_state(state: &AppState) -> ProjectSnapshot {
             Some(sr.isotope_labels.clone()),
             sr.anorm_map.clone(),
             sr.background_maps.clone(),
+            // #635: the overlay rebuilds B(E) from these on reload —
+            // dropping them would silently change the displayed model.
+            sr.baseline_global,
+            sr.baseline_e_ref_ev,
+            sr.baseline_maps.clone(),
         )
     } else {
         (
-            None, None, None, None, None, None, None, None, None, None, None, None,
+            None, None, None, None, None, None, None, None, None, None, None, None, None, None,
+            None,
         )
     };
 
@@ -193,6 +202,8 @@ pub fn snapshot_from_state(state: &AppState) -> ProjectSnapshot {
         single_fit_labels,
         single_fit_anorm,
         single_fit_background,
+        single_fit_baseline,
+        single_fit_baseline_e_ref_ev,
     ) = if let Some(ref pfr) = state.pixel_fit_result {
         // Prefer labels from FitFeedback (captured at fit time) to avoid
         // desync if isotope_entries are modified after the fit.
@@ -221,10 +232,12 @@ pub fn snapshot_from_state(state: &AppState) -> ProjectSnapshot {
             Some(labels),
             Some(pfr.anorm),
             Some(pfr.background),
+            pfr.baseline,
+            pfr.baseline_e_ref_ev,
         )
     } else {
         (
-            None, None, None, None, None, None, None, None, None, None, None,
+            None, None, None, None, None, None, None, None, None, None, None, None, None,
         )
     };
 
@@ -356,6 +369,9 @@ pub fn snapshot_from_state(state: &AppState) -> ProjectSnapshot {
         result_isotope_labels,
         anorm_map,
         background_maps,
+        baseline_global,
+        baseline_e_ref_ev,
+        baseline_maps,
         single_fit_densities,
         single_fit_uncertainties,
         single_fit_chi_squared,
@@ -367,6 +383,8 @@ pub fn snapshot_from_state(state: &AppState) -> ProjectSnapshot {
         single_fit_labels,
         single_fit_anorm,
         single_fit_background,
+        single_fit_baseline,
+        single_fit_baseline_e_ref_ev,
         endf_cache,
         provenance,
     }
@@ -1093,11 +1111,12 @@ fn state_from_snapshot(snap: ProjectSnapshot, state: &mut AppState, path: &Path)
             // Snapshots don't persist the energy-scale flight path yet; the
             // overlay accessor treats `None` as "energy scale not fitted".
             energy_scale_flight_path_m: None,
-            // Baseline outputs (#635) are not persisted in project files —
-            // None/empty on restore; re-running the fit regenerates them.
-            baseline_global: None,
-            baseline_e_ref_ev: None,
-            baseline_maps: None,
+            // #635: baseline outputs are persisted so the overlay rebuilds
+            // B(E) exactly as fitted.  Warnings are config-time diagnostics
+            // and regenerate on refit — not persisted.
+            baseline_global: snap.baseline_global,
+            baseline_e_ref_ev: snap.baseline_e_ref_ev,
+            baseline_maps: snap.baseline_maps.clone(),
             warnings: Vec::new(),
             n_converged: snap.n_converged.unwrap_or(0),
             n_total: snap.n_total.unwrap_or(0),
@@ -1131,10 +1150,10 @@ fn state_from_snapshot(snap: ProjectSnapshot, state: &mut AppState, path: &Path)
             l_scale: None,
             energy_scale_flight_path_m: None,
             deviance_per_dof: None,
-            // Baseline persistence lands with the Step-5 GUI wiring; a
-            // pre-#635 snapshot has no baseline either way.
-            baseline: None,
-            baseline_e_ref_ev: None,
+            // #635: restore the fitted baseline so the overlay applies the
+            // same B(E) the fit used.  Pre-#635 project files read as None.
+            baseline: snap.single_fit_baseline,
+            baseline_e_ref_ev: snap.single_fit_baseline_e_ref_ev,
             warnings: Vec::new(),
         };
         // Rebuild FitFeedback from the restored result

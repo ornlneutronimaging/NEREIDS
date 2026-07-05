@@ -280,6 +280,35 @@ fn validate_spatial_fit_preflight(
         ));
     }
 
+    // Gate (issue #635): in GLOBAL baseline mode, stage 2 freezes the
+    // baseline coefficients before the per-pixel fits — so the free-param
+    // count that matters per-pixel EXCLUDES the baseline flags.  Without
+    // this check, a config whose only free parameters are the baseline
+    // coefficients passes the guard above, stage 1 fits the global
+    // baseline, and then EVERY pixel hits fit_spectrum_typed's
+    // "no free parameters" rejection — which the rayon loop records as a
+    // per-pixel failure, returning Ok(SpatialResult) with all-NaN maps and
+    // n_failed == n_total.  That masks a whole-config error as per-pixel
+    // failures (the exact class the validate-up-front rule forbids).
+    if let Some(bl) = config.multiplicative_baseline()
+        && bl.spatial_global
+    {
+        let n_baseline_free =
+            usize::from(bl.fit_b0) + usize::from(bl.fit_b1) + usize::from(bl.fit_b2);
+        if count_free_params(config) == n_baseline_free {
+            return Err(PipelineError::InvalidParameter(
+                "global multiplicative baseline (spatial_global = true) is the \
+                 only free parameter block: after stage 1 freezes the fitted \
+                 baseline, the per-pixel fits would have nothing left to fit. \
+                 Free at least one per-pixel parameter (density / temperature / \
+                 energy scale / background), fit the aggregated spectrum with a \
+                 single-spectrum fitter instead, or set spatial_global = false \
+                 to fit per-pixel baselines."
+                    .into(),
+            ));
+        }
+    }
+
     // Resolve `SolverConfig::Auto` against the input variant — counts
     // → PoissonKL, transmission → LM.  `effective_solver` lives on
     // `UnifiedFitConfig` but takes the 1D `InputData`; inline the
@@ -5035,6 +5064,58 @@ mod tests {
             }
         }
         assert!(r.n_converged > 0, "at least some pixels converge");
+    }
+
+    /// Review R1 P0: a config whose ONLY free parameters are the global
+    /// baseline coefficients must be rejected up front.  Pre-fix, preflight
+    /// counted the (still-free) baseline flags, stage 1 fitted the global
+    /// baseline, and then the stage-2 freeze left every per-pixel fit with
+    /// zero free parameters — each pixel's "no free parameters" error was
+    /// swallowed as a per-pixel failure and the call returned
+    /// Ok(SpatialResult) with all-NaN maps and n_failed == n_total.
+    #[test]
+    fn spatial_global_baseline_as_only_free_block_rejected_up_front() {
+        let energies: Vec<f64> = (0..201).map(|i| 1.0 + (i as f64) * 0.05).collect();
+        let (sample, ob) = baseline_thermometry_cube(&energies, 0.002, 600.0, 400.0);
+        // Densities frozen, NO temperature / energy-scale / background —
+        // the baseline is the only free block, and global mode will freeze
+        // it before the per-pixel stage.
+        let config = UnifiedFitConfig::new(
+            energies,
+            vec![u238_single_resonance()],
+            vec!["U-238".into()],
+            600.0,
+            None,
+            vec![0.002],
+        )
+        .unwrap()
+        .with_solver(SolverConfig::PoissonKL(PoissonConfig::default()))
+        .with_fix_densities(true)
+        .with_multiplicative_baseline(crate::pipeline::MultiplicativeBaselineConfig::default());
+        let input = InputData3D::Counts {
+            sample_counts: sample.view(),
+            open_beam_counts: ob.view(),
+        };
+        let err = spatial_map_typed(&input, &config, None, None, None).expect_err(
+            "global-baseline-only config must be a whole-map rejection, not \
+             an Ok(all-NaN) result",
+        );
+        let msg = err.to_string();
+        assert!(
+            msg.contains("only free parameter block"),
+            "error must explain the stage-2 freeze consequence, got: {msg}"
+        );
+
+        // Per-pixel mode with the SAME parameter set stays legal: the
+        // baseline coefficients remain free in every pixel fit.
+        let per_pixel =
+            config.with_multiplicative_baseline(crate::pipeline::MultiplicativeBaselineConfig {
+                spatial_global: false,
+                ..Default::default()
+            });
+        let r = spatial_map_typed(&input, &per_pixel, None, None, None)
+            .expect("per-pixel baseline-only fits are well-posed");
+        assert!(r.n_converged > 0, "per-pixel baseline-only fits converge");
     }
 
     #[test]

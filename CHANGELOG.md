@@ -17,7 +17,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
   transmission-KL, and counts joint-Poisson paths, `spatial_map_typed`,
   the Python fitters (`baseline=True`, `fit_b0/b1/b2`, `b*_init`,
   `b*_bounds`, `fit_anorm`, spatial `baseline_global`), and the GUI
-  (advanced-solver checkbox + overlay). Real transmission ratios sit a
+  (advanced-solver checkbox + overlay; baseline outputs persist in
+  project files so a reloaded fit renders the same model). Real transmission ratios sit a
   few % off unity with smooth energy dependence (filters, holders,
   scattering); the default bounds ((0.9, 1.1) / ±0.05) keep the
   baseline too stiff to absorb resonance dips. A free SAMMY `Anorm`
