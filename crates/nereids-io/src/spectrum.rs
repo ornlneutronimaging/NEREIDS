@@ -8,10 +8,87 @@
 //! - Two-column (CSV/TSV): first column used, rest ignored
 //! - Comment lines starting with `#` are skipped
 //! - First non-comment line skipped if it cannot be parsed as a number (header)
+//!
+//! ## VENUS `*_Spectra.txt` sidecars
+//!
+//! Autoreduced VENUS TIFF folders ship a `<run>_Spectra.txt` sidecar whose
+//! first column is each frame's *start time in seconds* (N rows for N
+//! frames; the second column is counts).  [`read_tof_sidecar`] converts it
+//! to the N+1 ascending TOF bin edges **in microseconds** that
+//! [`crate::tof::tof_edges_to_energy_centers`] expects.
 
 use std::path::Path;
 
 use crate::error::IoError;
+
+/// Microseconds per second — sidecar start times are recorded in seconds,
+/// while every NEREIDS TOF axis is in microseconds.
+pub const MICROSECONDS_PER_SECOND: f64 = 1e6;
+
+/// Read a VENUS `*_Spectra.txt` TOF sidecar into bin edges (µs).
+///
+/// See [`parse_tof_sidecar_text`] for format semantics and validation.
+///
+/// # Arguments
+/// * `path`     — Path to the sidecar file.
+/// * `n_frames` — When `Some(n)`, the resulting edge count is validated
+///   against the TIFF stack's frame count (`n + 1` edges for `n` frames).
+pub fn read_tof_sidecar(path: &Path, n_frames: Option<usize>) -> Result<Vec<f64>, IoError> {
+    let content = std::fs::read_to_string(path)
+        .map_err(|e| IoError::FileNotFound(path.to_string_lossy().into_owned(), e))?;
+    parse_tof_sidecar_text(&content, n_frames)
+}
+
+/// Parse VENUS `*_Spectra.txt` sidecar text into TOF bin edges (µs).
+///
+/// Format: CSV `shutter_time,counts` where column 0 is the frame **start
+/// time in seconds** — one row per TOF frame.  Comment lines (`#`), blank
+/// lines, and a single header row are tolerated (the
+/// [`parse_spectrum_text`] rules).
+///
+/// Processing:
+/// 1. start times must be finite, the first must be `>= 0`, and the
+///    sequence must be strictly increasing;
+/// 2. values are converted to microseconds ([`MICROSECONDS_PER_SECOND`]);
+/// 3. the closing edge of the last frame is synthesized by extrapolating
+///    the *last* frame width (`last + (last − prev)`), yielding N+1
+///    ascending edges for N rows.
+///
+/// Bin **uniformity is deliberately not enforced**: VENUS MCP shutter
+/// segments change the frame width mid-run, so a sidecar with several
+/// distinct widths is valid.  The last-segment-width extrapolation is
+/// exact whenever the final two frames belong to the same shutter segment
+/// (always the case in practice — segments are many frames long).
+///
+/// The returned edges plug directly into
+/// [`crate::tof::tof_edges_to_energy_centers`].
+///
+/// # Errors
+/// [`IoError::InvalidParameter`] on fewer than 2 rows, non-finite or
+/// unparseable values, a negative first start time, a non-increasing
+/// sequence, or (when `n_frames` is `Some`) an edge/frame count mismatch.
+pub fn parse_tof_sidecar_text(text: &str, n_frames: Option<usize>) -> Result<Vec<f64>, IoError> {
+    let starts_s = parse_spectrum_text(text)?;
+    if starts_s[0] < 0.0 {
+        return Err(IoError::InvalidParameter(format!(
+            "TOF sidecar start times must be >= 0 s, but the first is {}",
+            starts_s[0],
+        )));
+    }
+    validate_monotonic(&starts_s)?;
+
+    let mut edges: Vec<f64> = Vec::with_capacity(starts_s.len() + 1);
+    edges.extend(starts_s.iter().map(|s| s * MICROSECONDS_PER_SECOND));
+    // parse_spectrum_text guarantees >= 2 values, so [n-2] is in bounds.
+    let last = edges[edges.len() - 1];
+    let last_width = last - edges[edges.len() - 2];
+    edges.push(last + last_width);
+
+    if let Some(frames) = n_frames {
+        validate_spectrum_frame_count(edges.len(), frames, SpectrumValueKind::BinEdges)?;
+    }
+    Ok(edges)
+}
 
 /// Whether spectrum values represent TOF or energy.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -273,5 +350,107 @@ TOF_us, intensity
     fn test_parse_spectrum_file_not_found() {
         let result = parse_spectrum_file(Path::new("/nonexistent/spectrum.csv"));
         assert!(result.is_err());
+    }
+
+    /// T23: 3 rows of start times in seconds become 4 ascending µs edges.
+    /// Values chosen binary-exact so seconds → µs conversion is exact.
+    #[test]
+    fn test_sidecar_three_rows_exact_edges() {
+        let text = "0.5,100\n1.0,200\n1.5,300\n";
+        let edges = parse_tof_sidecar_text(text, None).unwrap();
+        assert_eq!(
+            edges,
+            vec![500_000.0, 1_000_000.0, 1_500_000.0, 2_000_000.0]
+        );
+        assert_eq!(edges.len(), 3 + 1);
+    }
+
+    /// T24: a header row is tolerated (one non-numeric first line).
+    #[test]
+    fn test_sidecar_header_row_tolerated() {
+        let text = "shutter_time,counts\n0.5,100\n1.0,200\n1.5,300\n";
+        let edges = parse_tof_sidecar_text(text, None).unwrap();
+        assert_eq!(edges.len(), 4);
+        assert_eq!(edges[0], 500_000.0);
+    }
+
+    /// T25: n_frames validation — matching count passes, mismatch errors.
+    #[test]
+    fn test_sidecar_frame_count_validation() {
+        let text = "0.5,100\n1.0,200\n1.5,300\n";
+        assert!(parse_tof_sidecar_text(text, Some(3)).is_ok());
+        let err = parse_tof_sidecar_text(text, Some(4)).unwrap_err();
+        assert!(
+            matches!(err, IoError::InvalidParameter(_)),
+            "Expected InvalidParameter, got: {:?}",
+            err,
+        );
+    }
+
+    /// T26: non-monotonic start times are rejected.
+    #[test]
+    fn test_sidecar_non_monotonic_rejected() {
+        let text = "0.5,100\n1.5,200\n1.0,300\n";
+        assert!(parse_tof_sidecar_text(text, None).is_err());
+    }
+
+    /// T27: a NaN row is rejected.
+    #[test]
+    fn test_sidecar_nan_rejected() {
+        let text = "0.5,100\nNaN,200\n1.5,300\n";
+        assert!(parse_tof_sidecar_text(text, None).is_err());
+    }
+
+    /// T28: a single row cannot define a bin width — rejected.
+    #[test]
+    fn test_sidecar_single_row_rejected() {
+        let text = "0.5,100\n";
+        assert!(parse_tof_sidecar_text(text, None).is_err());
+    }
+
+    /// T29: a negative first start time is rejected.
+    #[test]
+    fn test_sidecar_negative_first_start_rejected() {
+        let text = "-0.5,100\n0.5,200\n1.0,300\n";
+        let err = parse_tof_sidecar_text(text, None).unwrap_err();
+        assert!(
+            format!("{}", err).contains(">= 0"),
+            "Expected >= 0 message, got: {}",
+            err,
+        );
+    }
+
+    /// T30: non-uniform shutter segments (64 µs then 128 µs frames) are
+    /// accepted, and the synthesized final edge extrapolates the *last*
+    /// segment's width.
+    #[test]
+    fn test_sidecar_shutter_segments_last_width_extrapolation() {
+        // Starts (s): 0, 64 µs, 192 µs — widths 64 µs then 128 µs.
+        let text = "0.0,10\n0.000064,20\n0.000192,30\n";
+        let edges = parse_tof_sidecar_text(text, None).unwrap();
+        assert_eq!(edges.len(), 4);
+        // The synthesized edge uses exactly the last frame width
+        // (edges[2] - edges[1]), not the first segment's 64 µs.
+        assert_eq!(edges[3], edges[2] + (edges[2] - edges[1]));
+        let expected = [0.0, 64.0, 192.0, 320.0];
+        for (edge, want) in edges.iter().zip(expected.iter()) {
+            assert!(
+                (edge - want).abs() < 1e-9,
+                "edge {} != expected {}",
+                edge,
+                want,
+            );
+        }
+    }
+
+    /// T31: a missing sidecar file surfaces as FileNotFound.
+    #[test]
+    fn test_sidecar_missing_file() {
+        let err = read_tof_sidecar(Path::new("/nonexistent/run_Spectra.txt"), None).unwrap_err();
+        assert!(
+            matches!(err, IoError::FileNotFound(..)),
+            "Expected FileNotFound, got: {:?}",
+            err,
+        );
     }
 }
