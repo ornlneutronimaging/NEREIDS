@@ -150,14 +150,55 @@ pub const DEFAULT_N_ENERGIES: usize = 64;
 /// Default number of τ-samples spanning the prompt core of each kernel.
 pub const DEFAULT_N_TAU: usize = 600;
 
-/// Hard cap on the τ-sample count of one synthesized kernel. The τ-step is
-/// anchored to the PROMPT core (`fast_reach / (n_tau − 1)`), so a long storage
-/// tail (β ≪ α with R > 0) is covered by growing the sample COUNT rather than
-/// by widening the step — otherwise a β as low as the calibration bound
-/// 0.02 µs⁻¹ (slow reach 16/β = 800 µs) would set a ~1.6 µs step that
-/// undersamples the prompt core and degenerates a 0.35 µs channel triangle to
-/// a delta. This cap bounds that growth (CPU/memory); only past it does the
-/// step widen to `tau_max / (MAX_TAU_SAMPLES − 1)`.
+/// Minimum accepted `n_tau` (τ-samples across the prompt core). Doubles as
+/// the module's prompt-core **resolution floor**: when [`MAX_TAU_SAMPLES`]
+/// widens the τ-step (see [`tau_geometry`]), the step may never exceed
+/// `fast_reach / (MIN_N_TAU − 1)` — the coarsest prompt sampling
+/// [`IkedaCarpenter::new`] has ever accepted as valid via its `n_tau ≥ 8`
+/// check.
+const MIN_N_TAU: usize = 8;
+
+/// Minimum nonzero samples per side of a sampled channel triangle
+/// (`dtau ≤ FWHM / 3`, half-base = FWHM). Below this the discrete triangle
+/// degenerates toward an exact delta `[0, 1, 0]` and a requested fold would
+/// silently vanish from the kernel — [`tau_geometry`] rejects that instead.
+const TRI_MIN_SAMPLES_PER_SIDE: f64 = 3.0;
+
+/// Reach of the sampled/folded Gaussian burst in standard deviations (±4σ:
+/// e^{−8} ≈ 3.4e-4 of peak at the edge, well below any consuming tolerance
+/// once convolved). Also fixes the burst resolution floor `dtau ≤ σ`
+/// (≥ `GAUSS_REACH_SIGMAS` samples per side).
+const GAUSS_REACH_SIGMAS: f64 = 4.0;
+
+/// Prompt-tail reach in e-folds: the τ-grid spans `FAST_REACH_E_FOLDS / α`
+/// so the prompt Gamma(3) tail `τ²e^{−ατ}` is < ~1e-8 of peak at the edge.
+const FAST_REACH_E_FOLDS: f64 = 18.0;
+
+/// Slow/storage-tail reach in e-folds (`SLOW_REACH_E_FOLDS / β` when storage
+/// is active). Sits AT the trim horizon: `e^{−16} ≈ 1.1e-7 ≈` [`TRIM_REL`]
+/// (`ln(1/TRIM_REL) ≈ 16.1`), so the reach cannot be truncated shorter
+/// without discarding tail weight the [`TRIM_REL`] trim would keep — no
+/// hidden approximation lives in this constant.
+const SLOW_REACH_E_FOLDS: f64 = 16.0;
+
+/// Storage fractions below this are treated as "no storage tail" when sizing
+/// the τ-grid (the slow term's weight is far below [`TRIM_REL`]).
+const R_NEGLIGIBLE: f64 = 1e-9;
+
+/// Cap on the τ-sample count spanning the PULSE BODY (`[0, τ_max]`) of one
+/// synthesized kernel. The τ-step is anchored to the prompt core and refined
+/// to resolve active folds (see [`tau_geometry`]), so a long storage tail
+/// (β ≪ α with R > 0) grows the sample COUNT rather than the step; this cap
+/// bounds that growth (CPU/memory) by widening the step to
+/// `tau_max / (MAX_TAU_SAMPLES − 1)` — but never past the resolution floor
+/// (prompt core: `fast_reach / (MIN_N_TAU − 1)`; triangle: FWHM /
+/// [`TRI_MIN_SAMPLES_PER_SIDE`]; burst: σ). A parameter/grid combination
+/// whose floor cannot be met within the cap is REJECTED loudly by
+/// [`IkedaCarpenter::new`] instead of silently under-sampled. The actual
+/// guarantee is on the pulse body only: the symmetric burst/channel fold
+/// margin (± `4σ + FWHM` at the resolved step) adds its samples ON TOP of
+/// the cap, so the final grid can exceed `MAX_TAU_SAMPLES` by the margin
+/// sample count.
 const MAX_TAU_SAMPLES: usize = 8192;
 
 /// Taylor expansion of `h(u)/u³` where `h(u) = 1 − e^{−u}(1 + u + ½u²)`, for
@@ -300,7 +341,15 @@ pub struct SynthesisGrid {
     pub e_max_ev: f64,
     /// Number of log-spaced reference energies (≥ 2).
     pub n_energies: usize,
-    /// Number of τ-samples spanning the prompt core of each kernel (≥ 8).
+    /// Number of τ-samples spanning the prompt core of each kernel
+    /// (≥ [`MIN_N_TAU`](crate::ikeda_carpenter) = 8). A long storage tail
+    /// (β ≪ α with R > 0) grows the per-kernel sample count beyond `n_tau`;
+    /// that count is capped at 8192 (`MAX_TAU_SAMPLES`), past which the
+    /// τ-step widens — never below the resolution floor (prompt core at the
+    /// `n_tau = 8` density, folds at ≥ 3 triangle samples per side / ≥ 1
+    /// sample per burst σ): a combination that cannot be resolved within the
+    /// cap is rejected by [`IkedaCarpenter::new`]. Active burst/channel folds
+    /// add their ±(4σ + FWHM) margin samples on top of the cap.
     pub n_tau: usize,
 }
 
@@ -339,8 +388,12 @@ impl IkedaCarpenter {
     /// # Errors
     /// Returns [`ResolutionParseError::InvalidFormat`] for a non-positive
     /// flight path, a degenerate grid (`n_energies < 2`, `n_tau < 8`,
-    /// `e_min ≤ 0`, `e_max ≤ e_min`), a non-positive `β`, or if the synthesized
-    /// kernels fail [`TabulatedResolution::from_kernels`] validation.
+    /// `e_min ≤ 0`, `e_max ≤ e_min`), a non-positive `β`, a parameter/grid
+    /// combination whose τ-grid cannot resolve the prompt core and requested
+    /// folds within the `MAX_TAU_SAMPLES` cap at some reference energy (see
+    /// [`tau_geometry`] — remedy: larger `β`, `R = 0`, or a wider/disabled
+    /// fold), or if the synthesized kernels fail
+    /// [`TabulatedResolution::from_kernels`] validation.
     pub fn new(
         params: IkedaCarpenterParams,
         flight_path_m: f64,
@@ -357,9 +410,9 @@ impl IkedaCarpenter {
                 grid.n_energies
             )));
         }
-        if grid.n_tau < 8 {
+        if grid.n_tau < MIN_N_TAU {
             return Err(ResolutionParseError::InvalidFormat(format!(
-                "n_tau must be >= 8, got {}",
+                "n_tau must be >= {MIN_N_TAU}, got {}",
                 grid.n_tau
             )));
         }
@@ -425,10 +478,14 @@ impl IkedaCarpenter {
             }
         }
 
+        // Synthesis is fallible: a kernel whose τ-grid cannot resolve the
+        // requested physics within MAX_TAU_SAMPLES (long slow tail vs a fine
+        // fold / fast prompt core) errs loudly here instead of silently
+        // degrading — see `tau_geometry`.
         let kernels: Vec<(Vec<f64>, Vec<f64>)> = ref_energies
             .iter()
             .map(|&e| synth_kernel(&params, grid.n_tau, e))
-            .collect();
+            .collect::<Result<_, _>>()?;
 
         let tabulated =
             TabulatedResolution::from_kernels(ref_energies.clone(), kernels, flight_path_m)?;
@@ -471,42 +528,129 @@ impl IkedaCarpenter {
     /// Returns ascending TOF-offsets (µs, mode at 0) and peak-normalized
     /// weights (max = 1), matching the [`TabulatedResolution`] storage
     /// convention.
-    #[must_use]
-    pub fn kernel_at(&self, energy_ev: f64) -> (Vec<f64>, Vec<f64>) {
+    ///
+    /// # Errors
+    /// Returns [`ResolutionParseError::InvalidFormat`] when the τ-grid cannot
+    /// resolve the prompt core and requested folds within [`MAX_TAU_SAMPLES`]
+    /// at this energy. Construction validates every *reference* energy, but a
+    /// probe energy outside `[e_min, e_max]` (a smaller α(E), hence a finer
+    /// prompt floor against the same storage-tail span) can still leave the
+    /// resolvable region.
+    pub fn kernel_at(&self, energy_ev: f64) -> Result<(Vec<f64>, Vec<f64>), ResolutionParseError> {
         synth_kernel(&self.params, self.n_tau, energy_ev)
     }
+}
+
+/// τ-grid geometry for one kernel: `(dtau, tau_max, margin)`, or a
+/// descriptive error when no exact sampled representation fits the cap.
+///
+/// The step is anchored to the PROMPT core — `n_tau` samples across the fast
+/// Gamma(3) pulse (`fast_reach / (n_tau − 1)`) — and REFINED to resolve any
+/// requested instrument fold (triangle: ≥ [`TRI_MIN_SAMPLES_PER_SIDE`]
+/// samples per side, i.e. `dtau ≤ FWHM/3`; Gaussian burst: `dtau ≤ σ`, i.e.
+/// ≥ [`GAUSS_REACH_SIGMAS`] samples per ±4σ side). A longer storage tail
+/// (β ≪ α, R > 0) extends the SAMPLE COUNT (`j_hi ∝ tau_max/dtau`) instead
+/// of the step; [`MAX_TAU_SAMPLES`] bounds that count by widening the step —
+/// but never past the resolution FLOOR (`fast_reach / (MIN_N_TAU − 1)` for
+/// the prompt core, the fold minima above for folds). A combination whose
+/// floor cannot be met within the cap has no faithful sampled representation
+/// here, so it is rejected loudly: a capped step above the fold width would
+/// degenerate the sampled triangle to an exact delta `[0,1,0]` (the fold
+/// silently vanishes), and a capped step above the prompt scale steps OVER
+/// the prompt pulse entirely (probe: α = 250, β = 0.02, R = 0.1 loses the
+/// prompt's 0.9 weight share).
+///
+/// Bit-identical to the pre-#642-review `max(fast_reach/(n_tau−1),
+/// tau_max/(MAX_TAU_SAMPLES−1))` step whenever no fold is finer than the
+/// prompt design step and the capped step stays at or below the floor.
+fn tau_geometry(
+    params: &IkedaCarpenterParams,
+    n_tau: usize,
+    alpha: f64,
+    beta: f64,
+    r: f64,
+) -> Result<(f64, f64, f64), String> {
+    // τ_max: reach far enough that the prompt tail (e^{−ατ}) and, when
+    // storage is active, the slow tail (e^{−βτ}) are below the trim level.
+    let fast_reach = FAST_REACH_E_FOLDS / alpha;
+    let slow_reach = if r > R_NEGLIGIBLE {
+        SLOW_REACH_E_FOLDS / beta
+    } else {
+        0.0
+    };
+    let tau_max = fast_reach.max(slow_reach);
+
+    // Requested step and resolution floor. `floor ≥ dtau_req` always: the
+    // prompt terms satisfy MIN_N_TAU ≤ n_tau (validated by `new`) and the
+    // fold terms are common to both.
+    let mut dtau_req = fast_reach / (n_tau as f64 - 1.0);
+    let mut floor = fast_reach / (MIN_N_TAU as f64 - 1.0);
+    let mut fold_desc = String::new();
+    if let Some(fwhm) = params.channel_fwhm_us
+        && fwhm > 0.0
+    {
+        let tri_floor = fwhm / TRI_MIN_SAMPLES_PER_SIDE;
+        dtau_req = dtau_req.min(tri_floor);
+        floor = floor.min(tri_floor);
+        fold_desc.push_str(&format!(", channel triangle FWHM = {fwhm} µs"));
+    }
+    if let Some(sigma) = params.burst_sigma_us
+        && sigma > 0.0
+    {
+        dtau_req = dtau_req.min(sigma);
+        floor = floor.min(sigma);
+        fold_desc.push_str(&format!(", burst σ = {sigma} µs"));
+    }
+
+    let capped_step = tau_max / (MAX_TAU_SAMPLES as f64 - 1.0);
+    if capped_step > floor {
+        return Err(format!(
+            "the {MAX_TAU_SAMPLES}-sample τ-grid cap cannot resolve the requested physics: \
+             the pulse spans τ_max = {tau_max:.3} µs (α = {alpha:.4} µs⁻¹, β = {beta:.4} µs⁻¹, \
+             R = {r:.3}{fold_desc}), forcing a τ-step of {capped_step:.4} µs — above the \
+             finest-feature resolution floor of {floor:.4} µs. Increase β (shorter storage \
+             tail), set R = 0 (drop the storage term), or widen/disable the burst/channel fold"
+        ));
+    }
+    Ok((dtau_req.max(capped_step), tau_max, margin_of(params)))
+}
+
+/// Symmetric τ-grid margin for the burst/channel folds: ±(4σ + FWHM), the
+/// folds' full reach. These samples come ON TOP of [`MAX_TAU_SAMPLES`] (the
+/// cap governs the pulse body only).
+fn margin_of(params: &IkedaCarpenterParams) -> f64 {
+    params
+        .burst_sigma_us
+        .map_or(0.0, |s| GAUSS_REACH_SIGMAS * s)
+        + params.channel_fwhm_us.unwrap_or(0.0)
 }
 
 /// Synthesize one `(offsets, weights)` kernel for `energy_ev` from the IC
 /// parameters: sample `I(τ)`, fold in burst + channel, anchor the mode at
 /// offset 0, trim negligible tails, peak-normalize.
+///
+/// # Errors
+/// [`ResolutionParseError::InvalidFormat`] when [`tau_geometry`] cannot
+/// resolve the prompt core and requested folds within [`MAX_TAU_SAMPLES`].
 fn synth_kernel(
     params: &IkedaCarpenterParams,
     n_tau: usize,
     energy_ev: f64,
-) -> (Vec<f64>, Vec<f64>) {
+) -> Result<(Vec<f64>, Vec<f64>), ResolutionParseError> {
     let alpha = params.alpha.eval(energy_ev).max(MIN_RATE);
     let beta = params.beta.max(MIN_RATE);
     let r = params.r.eval(energy_ev).clamp(0.0, 1.0);
 
-    // τ_max: reach far enough that the prompt Gamma(3) tail (e^{−ατ}) and, when
-    // storage is present, the slow tail (e^{−βτ}) are < ~1e-8 of peak.
-    let fast_reach = 18.0 / alpha;
-    let slow_reach = if r > 1e-9 { 16.0 / beta } else { 0.0 };
-    let tau_max = fast_reach.max(slow_reach);
-    // τ-step anchored to the PROMPT core, not to τ_max: `n_tau` samples span the
-    // fast Gamma(3) rise, and a longer storage tail (β ≪ α, R > 0) extends the
-    // SAMPLE COUNT (`j_hi ∝ tau_max/dtau`) instead of the step, capped at
-    // MAX_TAU_SAMPLES. Bit-identical to the old `tau_max/(n_tau−1)` step
-    // whenever slow_reach ≤ fast_reach (the R≈0 eV-regime case).
-    let dtau = (fast_reach / (n_tau as f64 - 1.0)).max(tau_max / (MAX_TAU_SAMPLES as f64 - 1.0));
+    let (dtau, tau_max, margin) = tau_geometry(params, n_tau, alpha, beta, r).map_err(|msg| {
+        ResolutionParseError::InvalidFormat(format!(
+            "Ikeda–Carpenter kernel at E = {energy_ev} eV: {msg}"
+        ))
+    })?;
 
     // Extend the grid to slightly negative τ so a symmetric burst/channel can
     // spread the leading edge correctly (the moderator pulse itself is 0 there).
     // Widths are validated finite and >= 0 by `IkedaCarpenter::new`, so they are
     // used directly (no `.abs()` masking of a sign error).
-    let margin =
-        params.burst_sigma_us.map_or(0.0, |s| 4.0 * s) + params.channel_fwhm_us.unwrap_or(0.0);
     let j_lo: isize = -((margin / dtau).ceil() as isize);
     let j_hi: isize = ((tau_max + margin) / dtau).ceil() as isize;
 
@@ -543,7 +687,7 @@ fn synth_kernel(
 
     let offsets: Vec<f64> = (lo..=hi).map(|j| taus[j] - tau_peak).collect();
     let w: Vec<f64> = (lo..=hi).map(|j| weights[j] / peak_val).collect();
-    (offsets, w)
+    Ok((offsets, w))
 }
 
 /// Index of the maximum element (first on ties). Slice is non-empty by
@@ -561,9 +705,9 @@ fn argmax(xs: &[f64]) -> usize {
 }
 
 /// Symmetric, unit-sum Gaussian kernel sampled on a `dtau`-spaced grid out to
-/// ±4σ.
+/// ±[`GAUSS_REACH_SIGMAS`]·σ.
 fn gaussian_kernel(dtau: f64, sigma: f64) -> Vec<f64> {
-    let half = ((4.0 * sigma / dtau).ceil() as isize).max(1);
+    let half = ((GAUSS_REACH_SIGMAS * sigma / dtau).ceil() as isize).max(1);
     let mut k: Vec<f64> = (-half..=half)
         .map(|j| {
             let t = j as f64 * dtau / sigma;
@@ -724,7 +868,7 @@ mod tests {
             burst_sigma_us: None,
             channel_fwhm_us: None,
         };
-        let (offs, wts) = synth_kernel(&p, 600, 1.0);
+        let (offs, wts) = synth_kernel(&p, 600, 1.0).unwrap();
         assert!(offs.iter().chain(wts.iter()).all(|v| v.is_finite()));
     }
 
@@ -754,7 +898,7 @@ mod tests {
     #[test]
     fn kernel_mode_anchored_at_zero() {
         let p = IkedaCarpenterParams::constant(1.0, 0.1, 0.3);
-        let (offsets, weights) = synth_kernel(&p, 600, 10.0);
+        let (offsets, weights) = synth_kernel(&p, 600, 10.0).unwrap();
         let peak = argmax(&weights);
         // The peak offset is the closest to zero of all offsets.
         let peak_abs = offsets[peak].abs();
@@ -768,7 +912,7 @@ mod tests {
     fn kernel_tail_points_to_positive_offset() {
         // Asymmetry: longer/heavier tail toward +offset (later TOF, lower E).
         let p = IkedaCarpenterParams::constant(1.0, 0.1, 0.2);
-        let (offsets, weights) = synth_kernel(&p, 600, 10.0);
+        let (offsets, weights) = synth_kernel(&p, 600, 10.0).unwrap();
         let max_pos = offsets.iter().cloned().fold(f64::MIN, f64::max);
         let min_neg = offsets.iter().cloned().fold(f64::MAX, f64::min);
         assert!(
@@ -802,7 +946,7 @@ mod tests {
             channel_fwhm_us: None,
         };
         let support = |e: f64| {
-            let (o, _) = synth_kernel(&p, 600, e);
+            let (o, _) = synth_kernel(&p, 600, e).unwrap();
             o.iter().cloned().fold(f64::MIN, f64::max) - o.iter().cloned().fold(f64::MAX, f64::min)
         };
         assert!(support(100.0) < support(5.0));
@@ -975,7 +1119,7 @@ mod tests {
             channel_fwhm_us: Some(0.35),
             ..IkedaCarpenterParams::constant(alpha, 0.25, 0.5)
         };
-        let (offs, wts) = synth_kernel(&p, n_tau, 10.0);
+        let (offs, wts) = synth_kernel(&p, n_tau, 10.0).unwrap();
         let dtau = offs[1] - offs[0];
         assert!(
             (dtau - prompt_step).abs() < 1e-12,
@@ -992,13 +1136,21 @@ mod tests {
             nonzero_per_side >= 3,
             "triangle degenerated: {nonzero_per_side} nonzero samples per side"
         );
-        // The tail is still reached: the last positive-offset sample must sit
-        // near the mode-relative slow reach (tau_max − tau_peak ≈ 63 µs) or be
-        // trimmed as negligible — assert the pulse there is below trim level.
+        // The tail is still reached: for β = 0.25 the slow tail crosses the
+        // TRIM_REL = 1e-7 trim level near τ ≈ 63 µs (e^{−βτ}·slow-amplitude ÷
+        // peak = 1e-7 at τ ≈ 62.6 µs), so the trimmed kernel must still span
+        // well past 40 µs — a step anchored to τ_max instead of the prompt
+        // core would pass a narrow-span check, but a grid that stops short of
+        // the storage tail would not survive this one.
         let span = offs.last().unwrap() - offs.first().unwrap();
         let peak = wts.iter().cloned().fold(f64::MIN, f64::max);
         assert!((peak - 1.0).abs() < 1e-12, "weights not peak-normalized");
         assert!(span > 3.0 / alpha, "kernel span {span} lost the pulse body");
+        assert!(
+            span > 40.0,
+            "kernel span {span} µs stops short of the β = 0.25 storage tail \
+             (trim horizon ≈ 63 µs)"
+        );
 
         // (b) Extreme admitted tail (β = 0.02 ⇒ slow_reach = 800 µs): the
         // MAX_TAU_SAMPLES cap bites; the step widens to tau_max/(cap−1) but
@@ -1008,7 +1160,7 @@ mod tests {
             channel_fwhm_us: Some(0.35),
             ..IkedaCarpenterParams::constant(alpha, 0.02, 0.5)
         };
-        let (offs_ext, _) = synth_kernel(&p_ext, n_tau, 10.0);
+        let (offs_ext, _) = synth_kernel(&p_ext, n_tau, 10.0).unwrap();
         let dtau_ext = offs_ext[1] - offs_ext[0];
         let capped_step = 800.0 / (MAX_TAU_SAMPLES as f64 - 1.0);
         assert!(
@@ -1035,7 +1187,7 @@ mod tests {
     fn burst_and_channel_broaden_further() {
         // Folding in burst + channel widens the kernel TOF support.
         let base = IkedaCarpenterParams::constant(1.0, 0.1, 0.0);
-        let (o0, _) = synth_kernel(&base, 600, 10.0);
+        let (o0, _) = synth_kernel(&base, 600, 10.0).unwrap();
         let support0 = o0.iter().cloned().fold(f64::MIN, f64::max)
             - o0.iter().cloned().fold(f64::MAX, f64::min);
         let folded = IkedaCarpenterParams {
@@ -1043,9 +1195,124 @@ mod tests {
             channel_fwhm_us: Some(0.35),
             ..IkedaCarpenterParams::constant(1.0, 0.1, 0.0)
         };
-        let (o1, _) = synth_kernel(&folded, 600, 10.0);
+        let (o1, _) = synth_kernel(&folded, 600, 10.0).unwrap();
         let support1 = o1.iter().cloned().fold(f64::MIN, f64::max)
             - o1.iter().cloned().fold(f64::MAX, f64::min);
         assert!(support1 > support0, "folded {support1} !> bare {support0}");
+    }
+
+    /// Sum-weighted variance of a sampled `(offsets, weights)` kernel on a
+    /// uniform τ-grid. Normalization-independent (divides by Σw).
+    fn kernel_variance(offsets: &[f64], weights: &[f64]) -> f64 {
+        let w_sum: f64 = weights.iter().sum();
+        let mean: f64 = offsets.iter().zip(weights).map(|(o, w)| o * w).sum::<f64>() / w_sum;
+        offsets
+            .iter()
+            .zip(weights)
+            .map(|(o, w)| (o - mean).powi(2) * w)
+            .sum::<f64>()
+            / w_sum
+    }
+
+    #[test]
+    fn unresolvable_tau_grid_is_rejected_loudly() {
+        // Review #645 F1, probe 1: β = 0.005 ⇒ slow reach 16/β = 3200 µs ⇒
+        // capped step 3200/8191 ≈ 0.39 µs > the 0.35 µs triangle FWHM — the
+        // sampled triangle would be the exact delta [0, 1, 0] and the
+        // requested fold would silently vanish from the kernel. Must be a
+        // loud construction error, not silent physics degradation.
+        let p1 = IkedaCarpenterParams {
+            channel_fwhm_us: Some(0.35),
+            ..IkedaCarpenterParams::constant(2.0, 0.005, 0.5)
+        };
+        let err = IkedaCarpenter::new(p1.clone(), 25.0, &SynthesisGrid::new(1.0, 100.0))
+            .expect_err("a delta-degenerate fold must be rejected");
+        let msg = format!("{err:?}");
+        assert!(
+            msg.contains("cannot resolve") && msg.contains("Increase"),
+            "error must diagnose the cap and name remedies: {msg}"
+        );
+        // The per-energy synthesis (kernel_at path) refuses identically.
+        assert!(synth_kernel(&p1, 600, 10.0).is_err());
+
+        // Probe 2: α = 250 ⇒ the whole prompt pulse spans 18/α ≈ 0.07 µs,
+        // less than ONE capped step (800/8191 ≈ 0.098 µs): sampling would
+        // step over the prompt term entirely (0.9 of the pulse weight at
+        // R = 0.1). Must also be rejected.
+        let p2 = IkedaCarpenterParams::constant(250.0, 0.02, 0.1);
+        assert!(
+            IkedaCarpenter::new(p2, 25.0, &SynthesisGrid::new(1.0, 100.0)).is_err(),
+            "a capped step wider than the prompt core must be rejected"
+        );
+    }
+
+    #[test]
+    fn requested_fold_is_never_a_silent_no_op() {
+        // Adjacent to probe 1 but resolvable (β = 0.05 ⇒ capped step
+        // 320/8191 ≈ 0.039 µs ≤ FWHM/3): when synthesis is Ok and a fold is
+        // requested, the folded kernel must genuinely differ from the
+        // unfolded one — by approximately the analytic fold variance
+        // FWHM²/6 — never by ~0 (the silent delta no-op this guards against).
+        let base = IkedaCarpenterParams::constant(2.0, 0.05, 0.5);
+        let folded = IkedaCarpenterParams {
+            channel_fwhm_us: Some(0.35),
+            ..base.clone()
+        };
+        let (o0, w0) = synth_kernel(&base, 600, 10.0).unwrap();
+        let (o1, w1) = synth_kernel(&folded, 600, 10.0).unwrap();
+        let dv = kernel_variance(&o1, &w1) - kernel_variance(&o0, &w0);
+        let expected = 0.35f64.powi(2) / 6.0;
+        assert!(
+            dv > 0.5 * expected,
+            "fold variance increment {dv} µs² vs analytic {expected} µs²: \
+             the requested fold (nearly) vanished"
+        );
+    }
+
+    #[test]
+    fn fold_variance_matches_analytic_oracle() {
+        // Independent analytic oracle for the fold convention (#645 F8): a
+        // convolution adds second central moments, so the sampled kernel's
+        // variance must grow by EXACTLY the fold kernel's analytic variance —
+        // FWHM²/6 for the symmetric channel triangle (half-base = FWHM),
+        // σ² for the Gaussian burst. Unlike the closed-loop calibration
+        // tests, the expectation here comes from analysis, not from the
+        // shared synthesis code. Pure-prompt pulse (R = 0) keeps trim /
+        // edge-truncation error far below the increments.
+        let base = IkedaCarpenterParams::constant(2.0, 0.1, 0.0);
+        let (o0, w0) = synth_kernel(&base, 600, 10.0).unwrap();
+        let v0 = kernel_variance(&o0, &w0);
+        // Sanity: the bare Gamma(3, α) variance is 3/α².
+        let v_gamma = 3.0 / (2.0f64 * 2.0);
+        assert!(
+            (v0 - v_gamma).abs() < 0.01 * v_gamma,
+            "bare pulse variance {v0}, Gamma(3) analytic {v_gamma}"
+        );
+
+        let fwhm = 0.35;
+        let tri = IkedaCarpenterParams {
+            channel_fwhm_us: Some(fwhm),
+            ..base.clone()
+        };
+        let (o1, w1) = synth_kernel(&tri, 600, 10.0).unwrap();
+        let dv_tri = kernel_variance(&o1, &w1) - v0;
+        let want_tri = fwhm * fwhm / 6.0;
+        assert!(
+            ((dv_tri - want_tri) / want_tri).abs() < 0.02,
+            "triangle fold added {dv_tri} µs², analytic FWHM²/6 = {want_tri} µs²"
+        );
+
+        let sigma = 0.3;
+        let gau = IkedaCarpenterParams {
+            burst_sigma_us: Some(sigma),
+            ..base.clone()
+        };
+        let (o2, w2) = synth_kernel(&gau, 600, 10.0).unwrap();
+        let dv_gau = kernel_variance(&o2, &w2) - v0;
+        let want_gau = sigma * sigma;
+        assert!(
+            ((dv_gau - want_gau) / want_gau).abs() < 0.02,
+            "Gaussian burst added {dv_gau} µs², analytic σ² = {want_gau} µs²"
+        );
     }
 }

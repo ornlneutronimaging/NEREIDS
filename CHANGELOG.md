@@ -21,8 +21,18 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
   kernel; `0` disables; optional `fit_psr` adds the FWHM as a 5th
   parameter). The missing shape freedom previously re-expressed as a ~90 K
   temperature degeneracy on real data. The IC τ-grid is now anchored to the
-  prompt core so low-β storage tails cannot undersample the pulse rise
-  (bit-identical for all previous callers). **Action required: earlier
+  prompt core and refined to resolve any requested burst/channel fold, so
+  low-β storage tails can neither undersample the pulse rise nor silently
+  degenerate the fold to a delta; a parameter combination whose τ-grid
+  cannot be resolved within the 8192-sample cap is now rejected with a
+  descriptive error (`IkedaCarpenter::new` / `kernel_at`) instead of
+  silently under-sampled — the calibrator treats such points as infeasible
+  during its search. Synthesized kernels are bit-identical to earlier
+  releases only when the storage tail does not extend past the prompt reach
+  (`slow_reach ≤ fast_reach`, the R ≈ 0 eV-regime case), no fold is finer
+  than the prompt design step, and `n_tau` ≤ 8192; direct-API kernels with
+  constant R > 0 and long storage tails (or folds finer than the design
+  step) change — finer, more accurate sampling. **Action required: earlier
   `family="ic"` calibrations (2-parameter, no PSR fold) are superseded —
   re-calibrate.** The raw `theta` for `"ic"` is now 4–5 ln/box-encoded
   values; read decoded physical parameters from `params()` (Python) or the
