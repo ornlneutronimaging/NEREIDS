@@ -711,7 +711,7 @@ pub struct AppState {
     pub dead_pixels: Option<Array2<bool>>,
     /// Declared-mask provenance (#646): the pixel mask carried by an input
     /// artifact — the HDF5 file's dead-pixel dataset (set where the sample
-    /// is loaded: `guided::load::load_hdf5_data`, `guided::bin`) or a saved
+    /// is loaded: `guided::load::load_hdf5_histogram`, `guided::bin`) or a saved
     /// project's `/intermediate/dead_pixels` (set on project restore).
     /// Lives exactly as long as the loaded sample: cleared by
     /// [`AppState::invalidate_results`] and the file-pick handlers.  This
@@ -1359,10 +1359,17 @@ impl AppState {
     /// `detected == None` means detection failed or was skipped: the
     /// effective mask falls back to the declared component alone; a
     /// previous detection is never kept (it may be stale for the current
-    /// open beam).  A declared mask whose dimensions differ from the
-    /// detected mask cannot apply to the data being normalized (e.g. a
-    /// project's saved mask from a different detector or ROI-cropped
-    /// geometry than the data now loaded) and is ignored.
+    /// open beam).  The dimension-mismatch arm is **defensive**: every
+    /// load site installs the declared mask from the same artifact the
+    /// data comes from, so in the current wiring the two components
+    /// always agree in shape.  It is reachable in principle through
+    /// state drift this method cannot rule out — e.g. a hand-edited or
+    /// corrupt project file whose declared mask was saved from a
+    /// different detector or ROI-cropped geometry than its own detected
+    /// mask / embedded data.  A declared mask that cannot apply to the
+    /// data is dropped for this recomputation (detected-only mask), and
+    /// the drop is logged to the provenance trail (#646 R4, F5) —
+    /// masking decisions stay observable, never silent.
     pub fn set_detected_dead_pixels(&mut self, detected: Option<Array2<bool>>) {
         // Keep the raw detected component (#646 R4, P1-1): project SAVE
         // persists it as /intermediate/detected_dead_pixels so a restore
@@ -1375,8 +1382,21 @@ impl AppState {
                     .for_each(|m, &d| *m = *m || d);
                 Some(declared)
             }
-            // Declared mask of a different detector size: detected only.
-            (Some(_), Some(det)) => Some(det),
+            // Defensive arm (see rustdoc): a declared mask of a different
+            // geometry cannot apply — detected only, drop surfaced.
+            (Some(declared), Some(det)) => {
+                self.log_provenance(
+                    ProvenanceEventKind::ConfigChanged,
+                    format!(
+                        "Declared pixel mask {:?} does not match the data \
+                         geometry {:?}; declared mask ignored for this \
+                         recomputation — detected-only mask applied",
+                        declared.dim(),
+                        det.dim()
+                    ),
+                );
+                Some(det)
+            }
             (Some(declared), None) => Some(declared),
             (None, det) => det,
         };
@@ -1774,19 +1794,35 @@ mod tests {
         assert!(state.dead_pixels.is_none());
     }
 
-    /// A declared mask of a different detector size cannot apply to the
-    /// data being normalized (e.g. a project's saved mask from a
-    /// different detector or ROI-cropped geometry) — detected mask only.
+    /// The DEFENSIVE dimension-mismatch arm (unreachable in the current
+    /// wiring — load sites install the declared mask from the same
+    /// artifact the data comes from; reachable in principle via a
+    /// hand-edited/corrupt project whose declared mask was saved from a
+    /// different detector or ROI-cropped geometry): the inapplicable
+    /// declared mask is dropped for the recomputation (detected-only
+    /// mask) and the drop is SURFACED in the provenance log, never
+    /// silent (#646 R4, F5).
     #[test]
-    fn test_set_detected_dead_pixels_dim_mismatch_uses_detected() {
+    fn test_set_detected_dead_pixels_dim_mismatch_uses_detected_and_logs() {
         let mut state = AppState {
             file_dead_pixels: Some(Array2::from_elem((4, 4), true)),
             ..AppState::default()
         };
+        let provenance_len_before = state.provenance_log.len();
 
         let mut det = Array2::from_elem((2, 2), false);
         det[[0, 0]] = true;
         state.set_detected_dead_pixels(Some(det.clone()));
         assert_eq!(state.dead_pixels.as_ref().unwrap(), &det);
+        // The drop is observable: one provenance entry naming both
+        // geometries.
+        assert_eq!(state.provenance_log.len(), provenance_len_before + 1);
+        let msg = &state.provenance_log.last().unwrap().message;
+        assert!(msg.contains("(4, 4)") && msg.contains("(2, 2)"), "{msg}");
+
+        // The matching-geometry path stays silent — no drop, no entry.
+        state.file_dead_pixels = Some(Array2::from_elem((2, 2), false));
+        state.set_detected_dead_pixels(Some(det));
+        assert_eq!(state.provenance_log.len(), provenance_len_before + 1);
     }
 }

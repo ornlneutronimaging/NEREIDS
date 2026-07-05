@@ -603,7 +603,8 @@ pub fn detect_dead_pixels_chunked(chunks: &[Array3<f64>]) -> Result<Array2<bool>
 /// gain division) inflates the floor and can suppress real flags, while
 /// up-scaling (event weights > 1) deflates it below true counting noise.
 /// Run the detectors on unscaled counts and normalize afterwards; the GUI
-/// does exactly this (both of its normalization paths pass the raw
+/// does exactly this (all three of its raw-counts paths — TIFF pair,
+/// HDF5 with open beam, HDF5 without open beam — pass the raw
 /// sample/open-beam stacks, before any normalization).
 ///
 /// # Arguments
@@ -754,9 +755,10 @@ pub fn detect_hot_pixels(data: &Array3<f64>, k_mad: f64) -> Result<Array2<bool>,
 ///
 /// Both stacks must be **raw detected counts** (unscaled) — see the "Raw
 /// counts required" section of [`detect_hot_pixels`]: scaling distorts the
-/// Poisson floor of the hot screen.  The GUI satisfies this: both of its
-/// normalization paths call this function on the raw sample/open-beam
-/// stacks, before any normalization.
+/// Poisson floor of the hot screen.  The GUI satisfies this: all three of
+/// its raw-counts paths (TIFF pair, HDF5 with open beam, HDF5 without
+/// open beam) call this function on the raw sample/open-beam stacks,
+/// before any normalization.
 ///
 /// # Arguments
 /// * `sample` — Raw sample counts, shape (n_tof, height, width).
