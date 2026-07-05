@@ -1734,67 +1734,111 @@ fn read_results(file: &hdf5::File, snap: &mut ProjectSnapshot) -> Result<(), IoE
         }
     }
 
-    // D-11/D-21: Background maps
+    // D-11/D-21: Background maps.  FAIL CLOSED on a partial or malformed
+    // group (review R3): save_project writes all three datasets atomically,
+    // so a group that exists with a missing or mis-shaped member is a
+    // truncated / corrupted file — silently loading it as "no background"
+    // would display a different scientific model than the one fitted.
     if let Ok(bg_grp) = results.group("background") {
         let mut maps: [Option<Array2<f64>>; 3] = [None, None, None];
         for (i, &label) in ["back_a", "back_b", "back_c"].iter().enumerate() {
-            if let Ok(ds) = bg_grp.dataset(label) {
-                let shape = ds.shape();
-                if shape.len() == 2 {
-                    let data: Vec<f64> = ds
-                        .read_raw()
-                        .map_err(|e| hdf5_err(&format!("/results/background/{label}"), e))?;
-                    maps[i] = Some(Array2::from_shape_vec((shape[0], shape[1]), data).map_err(
-                        |e| hdf5_err(&format!("/results/background/{label} reshape"), e),
-                    )?);
-                }
+            let ds = bg_grp.dataset(label).map_err(|e| {
+                hdf5_err(
+                    &format!(
+                        "/results/background exists but /results/background/{label} is missing \
+                         (truncated or corrupted project file)"
+                    ),
+                    e,
+                )
+            })?;
+            let shape = ds.shape();
+            if shape.len() != 2 {
+                return Err(IoError::Hdf5Error(format!(
+                    "/results/background/{label}: expected a 2-D map, got {} dimension(s) \
+                     (corrupted project file)",
+                    shape.len()
+                )));
             }
+            let data: Vec<f64> = ds
+                .read_raw()
+                .map_err(|e| hdf5_err(&format!("/results/background/{label}"), e))?;
+            maps[i] = Some(
+                Array2::from_shape_vec((shape[0], shape[1]), data)
+                    .map_err(|e| hdf5_err(&format!("/results/background/{label} reshape"), e))?,
+            );
         }
-        // Only set if all three are present.
-        if maps.iter().all(|m| m.is_some()) {
-            snap.background_maps = Some([
-                maps[0].take().unwrap(),
-                maps[1].take().unwrap(),
-                maps[2].take().unwrap(),
-            ]);
-        }
+        snap.background_maps = Some([
+            maps[0].take().unwrap(),
+            maps[1].take().unwrap(),
+            maps[2].take().unwrap(),
+        ]);
     }
 
-    // Issue #635: multiplicative-baseline outputs.
+    // Issue #635: multiplicative-baseline outputs.  FAIL CLOSED on
+    // present-but-malformed data (review R3): the GUI overlay rebuilds
+    // B(E) from these fields, so silently dropping a truncated baseline
+    // would render a different scientific model than the one fitted —
+    // the exact silent-model-change class the persistence fix closed.
+    // ABSENCE stays legal (pre-#635 files, baseline-off fits).
     if let Ok(ds) = results.dataset("baseline_global") {
         let data: Vec<f64> = ds
             .read_raw()
             .map_err(|e| hdf5_err("/results/baseline_global", e))?;
-        if data.len() == 3 {
-            snap.baseline_global = Some([data[0], data[1], data[2]]);
+        if data.len() != 3 {
+            return Err(IoError::Hdf5Error(format!(
+                "/results/baseline_global: expected 3 coefficients, got {} \
+                 (corrupted project file)",
+                data.len()
+            )));
         }
+        snap.baseline_global = Some([data[0], data[1], data[2]]);
     }
-    snap.baseline_e_ref_ev = read_f64_attr(&results, "baseline_e_ref_ev").ok();
     if let Ok(bl_grp) = results.group("baseline") {
         let mut maps: [Option<Array2<f64>>; 3] = [None, None, None];
         for (i, &label) in ["b0", "b1", "b2"].iter().enumerate() {
-            if let Ok(ds) = bl_grp.dataset(label) {
-                let shape = ds.shape();
-                if shape.len() == 2 {
-                    let data: Vec<f64> = ds
-                        .read_raw()
-                        .map_err(|e| hdf5_err(&format!("/results/baseline/{label}"), e))?;
-                    maps[i] = Some(
-                        Array2::from_shape_vec((shape[0], shape[1]), data).map_err(|e| {
-                            hdf5_err(&format!("/results/baseline/{label} reshape"), e)
-                        })?,
-                    );
-                }
+            let ds = bl_grp.dataset(label).map_err(|e| {
+                hdf5_err(
+                    &format!(
+                        "/results/baseline exists but /results/baseline/{label} is missing \
+                         (truncated or corrupted project file)"
+                    ),
+                    e,
+                )
+            })?;
+            let shape = ds.shape();
+            if shape.len() != 2 {
+                return Err(IoError::Hdf5Error(format!(
+                    "/results/baseline/{label}: expected a 2-D map, got {} dimension(s) \
+                     (corrupted project file)",
+                    shape.len()
+                )));
             }
+            let data: Vec<f64> = ds
+                .read_raw()
+                .map_err(|e| hdf5_err(&format!("/results/baseline/{label}"), e))?;
+            maps[i] = Some(
+                Array2::from_shape_vec((shape[0], shape[1]), data)
+                    .map_err(|e| hdf5_err(&format!("/results/baseline/{label} reshape"), e))?,
+            );
         }
-        // Only set if all three are present (mirrors background_maps).
-        if maps.iter().all(|m| m.is_some()) {
-            snap.baseline_maps = Some([
-                maps[0].take().unwrap(),
-                maps[1].take().unwrap(),
-                maps[2].take().unwrap(),
-            ]);
-        }
+        snap.baseline_maps = Some([
+            maps[0].take().unwrap(),
+            maps[1].take().unwrap(),
+            maps[2].take().unwrap(),
+        ]);
+    }
+    snap.baseline_e_ref_ev = read_f64_attr(&results, "baseline_e_ref_ev").ok();
+    // Coefficients without the reference energy are unreconstructable —
+    // B(E) needs the exact E_ref the fit used.
+    if (snap.baseline_global.is_some() || snap.baseline_maps.is_some())
+        && snap.baseline_e_ref_ev.is_none()
+    {
+        return Err(IoError::Hdf5Error(
+            "baseline coefficients are present but the baseline_e_ref_ev \
+             attribute is missing — B(E) cannot be reconstructed (corrupted \
+             project file)"
+                .into(),
+        ));
     }
 
     // Scalar attrs
@@ -1849,11 +1893,24 @@ fn read_results(file: &hdf5::File, snap: &mut ProjectSnapshot) -> Result<(), IoE
             let data: Vec<f64> = ds
                 .read_raw()
                 .map_err(|e| hdf5_err("/results/single_fit/baseline", e))?;
-            if data.len() == 3 {
-                snap.single_fit_baseline = Some([data[0], data[1], data[2]]);
+            if data.len() != 3 {
+                return Err(IoError::Hdf5Error(format!(
+                    "/results/single_fit/baseline: expected 3 coefficients, got {} \
+                     (corrupted project file)",
+                    data.len()
+                )));
             }
+            snap.single_fit_baseline = Some([data[0], data[1], data[2]]);
         }
         snap.single_fit_baseline_e_ref_ev = read_f64_attr(&sf, "baseline_e_ref_ev").ok();
+        if snap.single_fit_baseline.is_some() && snap.single_fit_baseline_e_ref_ev.is_none() {
+            return Err(IoError::Hdf5Error(
+                "/results/single_fit/baseline is present but its baseline_e_ref_ev \
+                 attribute is missing — B(E) cannot be reconstructed (corrupted \
+                 project file)"
+                    .into(),
+            ));
+        }
     }
 
     Ok(())
@@ -2794,6 +2851,91 @@ mod tests {
         assert!(loaded2.baseline_maps.is_none());
         assert!(loaded2.single_fit_baseline.is_none());
         assert!(loaded2.single_fit_baseline_e_ref_ev.is_none());
+    }
+
+    /// Review R3: present-but-malformed baseline data must FAIL CLOSED —
+    /// a truncated project file silently loading as "no baseline" would
+    /// display a different scientific model than the one fitted.  The
+    /// corrupted fixtures here are built by hand with the hdf5 API (NOT by
+    /// save_project) so this cannot be circular with the writer.
+    #[test]
+    fn test_malformed_baseline_fails_closed() {
+        let dir = tempfile::tempdir().unwrap();
+
+        // (a) /results/baseline group with only b0 (b1/b2 missing).
+        let path = dir.path().join("partial_maps.nrd.h5");
+        save_project(&path, &minimal_snapshot()).unwrap();
+        {
+            let f = hdf5::File::open_rw(&path).unwrap();
+            let results = f.group("results").unwrap();
+            let bl = results.create_group("baseline").unwrap();
+            bl.new_dataset::<f64>()
+                .shape([2, 2])
+                .create("b0")
+                .and_then(|ds| ds.write_raw(&[1.0f64; 4]))
+                .unwrap();
+        }
+        let err = load_project(&path).expect_err("partial baseline group must fail closed");
+        assert!(
+            err.to_string().contains("truncated or corrupted"),
+            "got: {err}"
+        );
+
+        // (b) baseline_global with the wrong length.
+        let path = dir.path().join("bad_len.nrd.h5");
+        save_project(&path, &minimal_snapshot()).unwrap();
+        {
+            let f = hdf5::File::open_rw(&path).unwrap();
+            let results = f.group("results").unwrap();
+            results
+                .new_dataset::<f64>()
+                .shape([2])
+                .create("baseline_global")
+                .and_then(|ds| ds.write_raw(&[1.0f64, 0.0]))
+                .unwrap();
+        }
+        let err = load_project(&path).expect_err("2-element baseline_global must fail closed");
+        assert!(
+            err.to_string().contains("expected 3 coefficients"),
+            "got: {err}"
+        );
+
+        // (c) coefficients present but the reference energy attribute
+        // missing: B(E) is unreconstructable.
+        let path = dir.path().join("no_eref.nrd.h5");
+        save_project(&path, &minimal_snapshot()).unwrap();
+        {
+            let f = hdf5::File::open_rw(&path).unwrap();
+            let results = f.group("results").unwrap();
+            results
+                .new_dataset::<f64>()
+                .shape([3])
+                .create("baseline_global")
+                .and_then(|ds| ds.write_raw(&[1.02f64, -0.03, 0.01]))
+                .unwrap();
+        }
+        let err = load_project(&path).expect_err("baseline without E_ref must fail closed");
+        assert!(err.to_string().contains("baseline_e_ref_ev"), "got: {err}");
+
+        // (d) same-shape sibling: a partial /results/background group
+        // (present but missing back_b/back_c) fails closed too.
+        let path = dir.path().join("partial_bg.nrd.h5");
+        save_project(&path, &minimal_snapshot()).unwrap();
+        {
+            let f = hdf5::File::open_rw(&path).unwrap();
+            let results = f.group("results").unwrap();
+            let bg = results.create_group("background").unwrap();
+            bg.new_dataset::<f64>()
+                .shape([2, 2])
+                .create("back_a")
+                .and_then(|ds| ds.write_raw(&[0.0f64; 4]))
+                .unwrap();
+        }
+        let err = load_project(&path).expect_err("partial background group must fail closed");
+        assert!(
+            err.to_string().contains("truncated or corrupted"),
+            "got: {err}"
+        );
     }
 
     #[test]

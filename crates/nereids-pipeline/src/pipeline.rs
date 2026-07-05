@@ -126,9 +126,12 @@ struct BackgroundIndices {
 /// multiplicative form fitted jointly with temperature at fixed density is
 /// the production recipe (χ²/ν ≈ 2–8 across the 20-run campaign).
 ///
-/// `b0` is exactly degenerate with `Anorm`, so configurations that free both
-/// are rejected (`validate_multiplicative_baseline`); the additive ABC(+DF)
-/// background remains combinable when `fit_anorm = false`.
+/// `b0` is exactly degenerate with `Anorm`, so a free `Anorm` alongside ANY
+/// configured baseline — even a fully frozen one — is rejected
+/// (`validate_multiplicative_baseline`).  A frozen-`b0` + free-`Anorm`
+/// combination would be well-posed, but supporting it buys nothing (`Anorm`
+/// would just play `b0`'s role at a rescaled value); the sanctioned
+/// combination is the additive ABC(+DF) background with `fit_anorm = false`.
 ///
 /// What prevents the A3-style runaway is SMOOTHNESS, not amplitude: a
 /// single global quadratic in ln E cannot produce a narrow local feature at
@@ -2864,6 +2867,22 @@ fn build_transmission_model(
                     .clone()
                     .unwrap_or_else(|| vec![1.0; config.resonance_data.len()]),
             );
+            // Guard the collapse against length mismatch BEFORE zipping —
+            // Iterator::zip silently truncates to the shortest input, which
+            // would under-sum σ_eff.  The sibling `collapse_by_groups`
+            // closure below applies the same three-way equality check
+            // (review R3: one-path-hardened / parallel-path-missed).
+            if density_indices.len() != working.sigma.len()
+                || density_ratios.len() != working.sigma.len()
+            {
+                return Err(PipelineError::InvalidParameter(format!(
+                    "density mapping length mismatch: {} density_indices / {} \
+                     density_ratios for {} per-isotope cross-section rows",
+                    density_indices.len(),
+                    density_ratios.len(),
+                    working.sigma.len(),
+                )));
+            }
             let n_e = working.sigma[0].len();
             let mut eff = vec![vec![0.0f64; n_e]; n_params];
             for ((&idx, &ratio), member_xs) in density_indices
@@ -7753,7 +7772,7 @@ mod tests {
         let model_res = build_transmission_model(&config_res, 1, None).unwrap();
         let t_model_res = model_res.evaluate(&[density]).unwrap();
         let inst = InstrumentParams { resolution: res };
-        let sample_res = SampleParams::new(293.6, vec![(data, density)]).unwrap();
+        let sample_res = SampleParams::new(293.6, vec![(data.clone(), density)]).unwrap();
         let t_fwd_res =
             phys_transmission::forward_model(&energies, &sample_res, Some(&inst)).unwrap();
         assert_eq!(t_model_res.len(), t_fwd_res.len());
@@ -7762,6 +7781,56 @@ mod tests {
                 a.to_bits(),
                 b.to_bits(),
                 "Gaussian-resolution arm, bin {i}: {a:e} != {b:e}"
+            );
+        }
+
+        // Arm 3 (review R3): tabulated resolution — build_aux_grid returns
+        // None for ResolutionFunction::Tabulated, so this exercises the
+        // identity-layout arm WITH an instrument attached (the working
+        // grid IS the data grid; resolution applies on it after
+        // Beer-Lambert).  A plausible production input now that tabulated
+        // VENUS kernels landed (#631), and the arm the two pins above do
+        // not cover.
+        let tab_text = "header\n---\n\
+             5.0 0.0\n\
+             -0.01 0.0\n\
+             -0.005 0.5\n\
+             0.0 1.0\n\
+             0.005 0.5\n\
+             0.01 0.0\n\
+             \n\
+             200.0 0.0\n\
+             -0.02 0.0\n\
+             -0.01 0.5\n\
+             0.0 1.0\n\
+             0.01 0.5\n\
+             0.02 0.0\n";
+        let tab = nereids_physics::resolution::TabulatedResolution::from_text(tab_text, 25.0)
+            .expect("synthetic tabulated kernel parses");
+        let res_tab = nereids_physics::resolution::ResolutionFunction::Tabulated(Arc::new(tab));
+        let config_tab = UnifiedFitConfig::new(
+            energies.clone(),
+            vec![data.clone()],
+            vec!["U-238".into()],
+            293.6,
+            Some(res_tab.clone()),
+            vec![density],
+        )
+        .unwrap();
+        let model_tab = build_transmission_model(&config_tab, 1, None).unwrap();
+        let t_model_tab = model_tab.evaluate(&[density]).unwrap();
+        let inst_tab = InstrumentParams {
+            resolution: res_tab,
+        };
+        let sample_tab = SampleParams::new(293.6, vec![(data, density)]).unwrap();
+        let t_fwd_tab =
+            phys_transmission::forward_model(&energies, &sample_tab, Some(&inst_tab)).unwrap();
+        assert_eq!(t_model_tab.len(), t_fwd_tab.len());
+        for (i, (a, b)) in t_model_tab.iter().zip(t_fwd_tab.iter()).enumerate() {
+            assert_eq!(
+                a.to_bits(),
+                b.to_bits(),
+                "tabulated-resolution arm, bin {i}: {a:e} != {b:e}"
             );
         }
     }

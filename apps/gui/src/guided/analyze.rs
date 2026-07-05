@@ -809,6 +809,17 @@ fn convergence_summary(ui: &mut egui::Ui, state: &AppState) {
         ))
         .size(11.0),
     );
+    // Structured pipeline warnings (#635) — the degenerate-trio diagnostic
+    // was built for exactly this spatial workflow (the field failure was a
+    // silent spatial run); render them amber alongside the result, same
+    // style as the pixel/ROI fit-feedback panel.
+    for w in &result.warnings {
+        ui.label(
+            egui::RichText::new(format!("\u{26A0} {w}"))
+                .color(egui::Color32::from_rgb(220, 160, 40))
+                .size(11.0),
+        );
+    }
 }
 
 // ---- Image Panel (Column 2) ----

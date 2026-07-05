@@ -46,23 +46,6 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
   density), which on real VENUS data converged to T = 4471 K at
   χ²/ν = 932 with no diagnostic.
 
-### Fixed
-
-- **Analytic Jacobian for no-temperature fits without precomputed σ**
-  (#635): `build_transmission_model` now precomputes working-grid σ for
-  this case, so the model exposes its analytical Jacobian instead of
-  silently degrading the LM path to finite differences and the counts
-  joint-Poisson stage to an identity-Fisher gradient descent (which
-  crawled through correlated-parameter valleys and, on the real-VENUS
-  regression fixture, stopped 1.7 % short of the true deviance optimum).
-  The model output is unchanged (bit-exact parity with the previous
-  forward-model path); only the optimizer quality improved.
-- **Joint-Poisson deviance is clamped at its mathematical floor**
-  (#635): per-bin xlogy round-off could report a total deviance of
-  ~−1e-13 on machine-exact fits, violating the D ≥ 0 contract; D == 0
-  (a perfect fit) is now reported as converged instead of inflating the
-  damping to its ceiling and returning non-converged.
-
 - **`fit_energy_scale` + `fit_temperature` jointly, in every fitter**
   (#634): the flag combination resonance thermometry needs — calibrate
   the SAMMY energy scale (t₀, L_scale) *and* fit temperature in one
@@ -101,6 +84,15 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
 
 ### Changed
 
+- **Config-class Python errors now raise `ValueError` uniformly** (#635
+  review): `fit_spectrum_typed`, `fit_counts_spectrum_typed`, and
+  `compute_model_jacobian` previously stringified every `PipelineError`
+  to `RuntimeError`; invalid-input errors
+  (`PipelineError::InvalidParameter` — e.g. an init outside its bounds,
+  `no free parameters`, a bad `fit_energy_range`) now raise `ValueError`,
+  matching `spatial_map_typed`. Scripts catching `RuntimeError` for
+  config-class errors must catch `ValueError` instead.
+
 - **`calibrate_energy` rebuilt on the `fit_energy_scale` LM path**
   (#634): the three-phase (L, t₀) grid + per-candidate golden-section
   density search (~35 000 forward evaluations; >10 min on production
@@ -118,6 +110,27 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
   boundary-saturation and no-finite-χ² error contracts, and the
   `dof = n_valid − 3` reduced-χ² convention are unchanged; all existing
   calibration tests pass unmodified.
+
+### Fixed
+
+- **Analytic Jacobian for no-temperature fits without precomputed σ**
+  (#635): `build_transmission_model` now precomputes working-grid σ for
+  this case, so the model exposes its analytical Jacobian instead of
+  silently degrading the LM path to finite differences and the counts
+  joint-Poisson stage to an identity-Fisher gradient descent (which
+  crawled through correlated-parameter valleys and, on the real-VENUS
+  regression fixture, stopped 1.7 % short of the true deviance optimum).
+  The model output is unchanged (bit-exact parity with the previous
+  forward-model path, pinned by a committed test); only the optimizer
+  quality improved.
+- **Joint-Poisson deviance is clamped at its mathematical floor**
+  (#635): per-bin xlogy round-off could report a total deviance of
+  ~−1e-13 on machine-exact fits, violating the D ≥ 0 contract; D == 0
+  (a perfect fit) is now reported as converged instead of inflating the
+  damping to its ceiling and returning non-converged. The clamp is
+  scoped to the accumulation round-off envelope — a deviance negative
+  beyond it surfaces as an error instead of a silent perfect fit.
+
 
 ## [0.2.2] - 2026-07-03
 

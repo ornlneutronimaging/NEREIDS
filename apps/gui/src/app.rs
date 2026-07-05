@@ -229,12 +229,28 @@ fn poll_pending_tasks(state: &mut AppState) {
                 tracing::info!(
                     converged = result.n_converged,
                     total = result.n_total,
+                    warnings = result.warnings.len(),
                     "spatial map completed"
                 );
-                state.status_message = format!(
-                    "Spatial map: {}/{} converged",
-                    result.n_converged, result.n_total
-                );
+                // Surface pipeline warnings (#635, e.g. the degenerate
+                // normalization trio) in the status bar — the motivating
+                // silent failure (T -> 4471 K, chi2/nu 932) was a SPATIAL
+                // run, and the engine's stderr print never reaches desktop
+                // GUI users.  The full text renders with the spatial result
+                // (convergence summary panel).
+                state.status_message = if result.warnings.is_empty() {
+                    format!(
+                        "Spatial map: {}/{} converged",
+                        result.n_converged, result.n_total
+                    )
+                } else {
+                    format!(
+                        "Spatial map: {}/{} converged — \u{26A0} {} configuration warning(s), see Analyze panel",
+                        result.n_converged,
+                        result.n_total,
+                        result.warnings.len()
+                    )
+                };
                 state.log_provenance(
                     ProvenanceEventKind::AnalysisRun,
                     format!(

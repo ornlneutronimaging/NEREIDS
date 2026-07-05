@@ -2694,12 +2694,21 @@ impl<M: FitModel> ForwardModel for NormalizedTransmissionModel<M> {
 ///
 /// The caller must guarantee a non-empty grid of positive energies (the
 /// pipeline validates this); on an empty grid this returns NaN, which the
-/// config validation rejects downstream.
+/// config validation rejects downstream.  The actual extrema are folded
+/// over the slice rather than read from `first()`/`last()`, so the
+/// documented `√(E_min·E_max)` holds regardless of grid ordering (the
+/// pipeline convention is ascending, but `UnifiedFitConfig::new` does not
+/// enforce it and the two forms agree bit-exactly on any monotonic grid).
 pub fn baseline_reference_energy(energies: &[f64]) -> f64 {
-    match (energies.first(), energies.last()) {
-        (Some(&lo), Some(&hi)) => (lo * hi).sqrt(),
-        _ => f64::NAN,
+    if energies.is_empty() {
+        return f64::NAN;
     }
+    let (lo, hi) = energies
+        .iter()
+        .fold((f64::INFINITY, f64::NEG_INFINITY), |(lo, hi), &e| {
+            (lo.min(e), hi.max(e))
+        });
+    (lo * hi).sqrt()
 }
 
 /// Bounded multiplicative polynomial baseline (issue #635):
@@ -2732,9 +2741,13 @@ pub fn baseline_reference_energy(energies: &[f64]) -> f64 {
 /// jointly with temperature at fixed density produced χ²/ν ≈ 2–8 across the
 /// 20-run campaign.
 ///
-/// Because `b0` is exactly degenerate with `Anorm`, the pipeline rejects
-/// configurations that free both (see
-/// `nereids-pipeline::validate_multiplicative_baseline`).
+/// Because `b0` is exactly degenerate with `Anorm`, the pipeline rejects a
+/// free `Anorm` alongside ANY configured baseline — including a fully
+/// frozen one (see `nereids-pipeline::validate_multiplicative_baseline`).
+/// A frozen-`b0` + free-`Anorm` combination would be well-posed, but
+/// supporting it buys nothing (`Anorm` would just play `b0`'s role at a
+/// rescaled value) and splits the normalization story across two knobs;
+/// the sanctioned combination is `Anorm` held fixed.
 pub struct MultiplicativeBaselineModel<M: FitModel> {
     /// The inner model (bare transmission, or the additive-background
     /// wrapper when both are configured).
@@ -2937,6 +2950,13 @@ impl<M: FitModel> ForwardModel for MultiplicativeBaselineModel<M> {
     }
 
     fn n_params(&self) -> usize {
+        // Assumes the baseline coefficients occupy the HIGHEST parameter
+        // indices (the pipeline appends them last: density → temperature →
+        // energy-scale → background → baseline).  A caller that interleaves
+        // baseline indices below other parameters would under-report the
+        // vector length here — matching the sibling wrappers, which make
+        // the same layout assumption (e.g. EnergyScaleTransmissionModel
+        // over t0/l_scale).
         self.b0_index.max(self.b1_index).max(self.b2_index) + 1
     }
 }
