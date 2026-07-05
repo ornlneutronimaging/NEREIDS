@@ -703,7 +703,23 @@ pub struct AppState {
     pub sample_data: Option<Arc<Array3<f64>>>,
     pub open_beam_data: Option<Arc<Array3<f64>>>,
     pub normalized: Option<Arc<NormalizedData>>,
+    /// Effective pixel mask applied by the analysis:
+    /// `file_dead_pixels ∪ latest detection`.  Recomputed FROM SCRATCH on
+    /// every normalization via [`AppState::set_detected_dead_pixels`] —
+    /// never unioned with its own previous value, so detections can not
+    /// accumulate across open-beam swaps / re-normalizations (#646).
     pub dead_pixels: Option<Array2<bool>>,
+    /// Declared-mask provenance (#646): the pixel mask carried by an input
+    /// artifact — the HDF5 file's dead-pixel dataset (set where the sample
+    /// is loaded: `guided::load::load_hdf5_data`, `guided::bin`) or a saved
+    /// project's `/intermediate/dead_pixels` (set on project restore).
+    /// Lives exactly as long as the loaded sample: cleared by
+    /// [`AppState::invalidate_results`] and the file-pick handlers.  This
+    /// is the only mask component that persists across re-normalizations;
+    /// detected masks are always recomputed
+    /// ([`AppState::set_detected_dead_pixels`] is the single site that
+    /// combines the two).
+    pub file_dead_pixels: Option<Array2<bool>>,
 
     // -- Spectrum file --
     pub spectrum_path: Option<PathBuf>,
@@ -1317,6 +1333,37 @@ impl AppState {
         self.export_status = None;
     }
 
+    /// Recompute the effective pixel mask FROM SCRATCH (#646):
+    /// `dead_pixels = file/persisted-declared ∪ freshly detected`.
+    ///
+    /// The single site where normalization installs a detected mask — the
+    /// uniform semantics across all paths: detected masks are always
+    /// recomputed, only the declared component (`file_dead_pixels`)
+    /// persists.  Never unions with the previous `dead_pixels`, which may
+    /// hold a detection from an earlier run (e.g. before an open-beam
+    /// swap) — unioning would accumulate stale flags monotonically.
+    ///
+    /// `detected == None` means detection failed or was skipped: the
+    /// effective mask falls back to the declared component alone; a
+    /// previous detection is never kept (it may be stale for the current
+    /// open beam).  A declared mask whose dimensions differ from the
+    /// detected mask cannot apply to the data being normalized (e.g. a
+    /// mask persisted before a rebin) and is ignored.
+    pub fn set_detected_dead_pixels(&mut self, detected: Option<Array2<bool>>) {
+        self.dead_pixels = match (self.file_dead_pixels.clone(), detected) {
+            (Some(mut declared), Some(det)) if declared.dim() == det.dim() => {
+                ndarray::Zip::from(&mut declared)
+                    .and(&det)
+                    .for_each(|m, &d| *m = *m || d);
+                Some(declared)
+            }
+            // Declared mask of a different detector size: detected only.
+            (Some(_), Some(det)) => Some(det),
+            (Some(declared), None) => Some(declared),
+            (None, det) => det,
+        };
+    }
+
     /// Clear pixel selection, ROI, results, normalization, and cancel pending tasks.
     /// Called when the underlying data changes.
     pub fn invalidate_results(&mut self) {
@@ -1333,6 +1380,10 @@ impl AppState {
         self.energies = None;
         self.normalized = None;
         self.dead_pixels = None;
+        // The declared mask belongs to the invalidated data; every caller
+        // of invalidate_results either replaces the sample or triggers a
+        // reload, and the load sites reinstall the file-declared mask.
+        self.file_dead_pixels = None;
         self.spectrum_values = None;
         self.tile_display.clear();
         self.studio_selected_tile = 0;
@@ -1469,6 +1520,7 @@ impl Default for AppState {
             open_beam_data: None,
             normalized: None,
             dead_pixels: None,
+            file_dead_pixels: None,
             load_error: false,
             rebin_factor: 1,
             rebin_applied: false,
@@ -1628,5 +1680,92 @@ impl Default for AppState {
 
             cached_session: None,
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// The #646 accumulation pin: re-detection REPLACES the previous
+    /// detection instead of unioning with it — only the file-declared
+    /// component persists across runs (e.g. open-beam swaps).
+    #[test]
+    fn test_set_detected_dead_pixels_no_accumulation_across_runs() {
+        let mut declared = Array2::from_elem((3, 3), false);
+        declared[[0, 0]] = true;
+        let mut state = AppState {
+            file_dead_pixels: Some(declared),
+            ..AppState::default()
+        };
+
+        // First normalization detects (1, 1).
+        let mut det1 = Array2::from_elem((3, 3), false);
+        det1[[1, 1]] = true;
+        state.set_detected_dead_pixels(Some(det1));
+        let mask = state.dead_pixels.as_ref().unwrap();
+        assert!(mask[[0, 0]] && mask[[1, 1]]);
+        assert_eq!(mask.iter().filter(|&&m| m).count(), 2);
+
+        // OB swap: the fresh detection flags (2, 2) instead.  (1, 1) is
+        // stale and must be GONE; (0, 0) is file-declared and persists.
+        let mut det2 = Array2::from_elem((3, 3), false);
+        det2[[2, 2]] = true;
+        state.set_detected_dead_pixels(Some(det2));
+        let mask = state.dead_pixels.as_ref().unwrap();
+        assert!(mask[[0, 0]], "file-declared flag must persist");
+        assert!(!mask[[1, 1]], "stale detection must not accumulate");
+        assert!(mask[[2, 2]], "fresh detection must be present");
+        assert_eq!(mask.iter().filter(|&&m| m).count(), 2);
+    }
+
+    /// Detection failure falls back to the declared component alone —
+    /// a previous detection is never kept.
+    #[test]
+    fn test_set_detected_dead_pixels_failure_keeps_declared_only() {
+        let mut declared = Array2::from_elem((2, 2), false);
+        declared[[0, 1]] = true;
+        let mut state = AppState {
+            file_dead_pixels: Some(declared.clone()),
+            ..AppState::default()
+        };
+
+        let mut det = Array2::from_elem((2, 2), false);
+        det[[1, 0]] = true;
+        state.set_detected_dead_pixels(Some(det));
+        assert_eq!(
+            state
+                .dead_pixels
+                .as_ref()
+                .unwrap()
+                .iter()
+                .filter(|&&m| m)
+                .count(),
+            2
+        );
+
+        state.set_detected_dead_pixels(None);
+        assert_eq!(state.dead_pixels.as_ref().unwrap(), &declared);
+
+        // No declared mask either: the effective mask is absent, not stale.
+        state.file_dead_pixels = None;
+        state.set_detected_dead_pixels(None);
+        assert!(state.dead_pixels.is_none());
+    }
+
+    /// A declared mask of a different detector size cannot apply to the
+    /// data being normalized (e.g. persisted before a rebin) — detected
+    /// mask only.
+    #[test]
+    fn test_set_detected_dead_pixels_dim_mismatch_uses_detected() {
+        let mut state = AppState {
+            file_dead_pixels: Some(Array2::from_elem((4, 4), true)),
+            ..AppState::default()
+        };
+
+        let mut det = Array2::from_elem((2, 2), false);
+        det[[0, 0]] = true;
+        state.set_detected_dead_pixels(Some(det.clone()));
+        assert_eq!(state.dead_pixels.as_ref().unwrap(), &det);
     }
 }

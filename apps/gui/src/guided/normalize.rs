@@ -443,12 +443,14 @@ pub(crate) fn normalize_data(state: &mut AppState) {
     state.pixel_fit_result = None;
     state.spatial_result = None;
 
+    // Clone Arcs (O(1)) so no field borrow is held across the
+    // set_detected_dead_pixels(&mut self) call below.
     let sample = match state.sample_data {
-        Some(ref d) => d,
+        Some(ref d) => Arc::clone(d),
         None => return,
     };
     let open_beam = match state.open_beam_data {
-        Some(ref d) => d,
+        Some(ref d) => Arc::clone(d),
         None => return,
     };
 
@@ -457,25 +459,30 @@ pub(crate) fn normalize_data(state: &mut AppState) {
         proton_charge_ob: state.proton_charge_ob,
     };
 
-    match nereids_io::normalization::normalize(sample, open_beam, &params, None) {
+    match nereids_io::normalization::normalize(&sample, &open_beam, &params, None) {
         Ok(norm) => {
             // Pipeline-integrity mask: dead ∪ hot over BOTH stacks — a pixel
             // dead or railed only in the open-beam run still corrupts every
-            // transmission ratio computed from it (#643).
+            // transmission ratio computed from it (#643).  The effective
+            // mask is recomputed from scratch (declared ∪ detected) via the
+            // single AppState helper — see set_detected_dead_pixels (#646).
+            // TIFF stacks carry no declared mask, so this is normally the
+            // detected mask alone.
             let mask_err = match nereids_io::normalization::detect_bad_pixels(
-                sample,
+                &sample,
                 Some(open_beam.as_ref()),
                 Some(nereids_io::normalization::HOT_PIXEL_K_MAD),
             ) {
                 Ok(mask) => {
-                    state.dead_pixels = Some(mask);
+                    state.set_detected_dead_pixels(Some(mask));
                     None
                 }
                 // Unreachable in practice: normalize() above already validated
-                // both stacks finite/non-negative and shape-equal; keep the
-                // mask absent rather than stale if that invariant ever breaks.
+                // both stacks finite/non-negative and shape-equal; fall back
+                // to the declared component rather than keep a stale
+                // detection if that invariant ever breaks.
                 Err(e) => {
-                    state.dead_pixels = None;
+                    state.set_detected_dead_pixels(None);
                     Some(e)
                 }
             };
@@ -528,9 +535,11 @@ pub(crate) fn prepare_transmission(state: &mut AppState) {
         None => return,
     };
 
-    // Only clear dead pixels for TransmissionTiff — HDF5 modes load them from the file.
+    // Only clear dead pixels for TransmissionTiff (TIFFs carry no declared
+    // mask) — HDF5 modes keep the file-declared mask installed at load time.
     if state.input_mode == InputMode::TransmissionTiff {
         state.dead_pixels = None;
+        state.file_dead_pixels = None;
     }
 
     let n_tof = sample.shape()[0];
@@ -637,33 +646,31 @@ pub(crate) fn normalize_hdf5_with_ob(state: &mut AppState) {
         });
 
     // Pipeline-integrity mask: dead ∪ hot over BOTH stacks, same as the
-    // TIFF-pair path (#643).  HDF5 files may also carry their own mask
-    // (loaded into state.dead_pixels at load time) — union with it rather
-    // than overwrite: file-declared defects and detected defects both hold.
+    // TIFF-pair path (#643).  HDF5 files may also carry their own declared
+    // mask (kept in state.file_dead_pixels since load time); the effective
+    // mask is recomputed FROM SCRATCH as declared ∪ freshly-detected via
+    // the single AppState helper — never unioned into the previous
+    // dead_pixels, which after an open-beam swap still holds the previous
+    // run's detection and would accumulate stale flags monotonically
+    // (#646).  See set_detected_dead_pixels for the full semantics.
     let mask_err = match nereids_io::normalization::detect_bad_pixels(
         &sample_arc,
         Some(ob_arc.as_ref()),
         Some(nereids_io::normalization::HOT_PIXEL_K_MAD),
     ) {
         Ok(detected) => {
-            state.dead_pixels = Some(match state.dead_pixels.take() {
-                Some(mut loaded) if loaded.dim() == detected.dim() => {
-                    ndarray::Zip::from(&mut loaded)
-                        .and(&detected)
-                        .for_each(|m, &d| *m = *m || d);
-                    loaded
-                }
-                // No file mask, or one of a different detector size (it
-                // cannot apply to this data): use the detected mask alone.
-                _ => detected,
-            });
+            state.set_detected_dead_pixels(Some(detected));
             None
         }
         // Unlike the TIFF path, these stacks are not pre-validated by
         // normalize(): negative/non-finite HDF5 values are clamped by the
-        // transmission loop above but rejected by detect_bad_pixels.  Keep
-        // any file-loaded mask and surface the failure in the final status.
-        Err(e) => Some(e),
+        // transmission loop above but rejected by detect_bad_pixels.  Fall
+        // back to the file-declared mask alone (never a stale detection)
+        // and surface the failure in the final status.
+        Err(e) => {
+            state.set_detected_dead_pixels(None);
+            Some(e)
+        }
     };
 
     match compute_energies(state, n_tof) {

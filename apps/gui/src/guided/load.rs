@@ -614,9 +614,14 @@ fn load_hdf5_histogram(state: &mut AppState) {
                 }
             }
 
-            if let Some(dead) = data.dead_pixels {
-                state.dead_pixels = Some(dead);
-            }
+            // Declared-mask provenance (#646): the file-declared mask gets
+            // its own field (assigned unconditionally — a file without a
+            // mask must not inherit a previous file's), and the effective
+            // mask starts as exactly that.  Every normalization recomputes
+            // dead_pixels = declared ∪ detected from scratch
+            // (AppState::set_detected_dead_pixels).
+            state.file_dead_pixels = data.dead_pixels.clone();
+            state.dead_pixels = data.dead_pixels;
 
             let shape = data.counts.shape();
             state.log_provenance(
@@ -762,6 +767,7 @@ pub(crate) fn on_tiff_sample_picked(state: &mut AppState, path: std::path::PathB
     state.sample_data = None;
     state.normalized = None;
     state.dead_pixels = None;
+    state.file_dead_pixels = None;
     state.energies = None;
     state.pixel_fit_result = None;
     state.spatial_result = None;
@@ -774,6 +780,7 @@ pub(crate) fn on_tiff_open_beam_picked(state: &mut AppState, path: std::path::Pa
     state.open_beam_data = None;
     state.normalized = None;
     state.dead_pixels = None;
+    state.file_dead_pixels = None;
     state.energies = None;
     state.pixel_fit_result = None;
     state.spatial_result = None;

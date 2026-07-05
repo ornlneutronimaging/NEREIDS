@@ -738,6 +738,7 @@ fn state_from_snapshot(snap: ProjectSnapshot, state: &mut AppState, path: &Path)
     state.open_beam_data = None;
     state.spectrum_values = None;
     state.dead_pixels = None;
+    state.file_dead_pixels = None;
     state.fm_spectrum = None;
     state.fm_per_isotope_spectra.clear();
     state.detect_results.clear();
@@ -1039,8 +1040,16 @@ fn state_from_snapshot(snap: ProjectSnapshot, state: &mut AppState, path: &Path)
     }
     state.energies = snap.energies;
 
-    // 15b. Restore dead-pixel mask (D-20).
+    // 15b. Restore dead-pixel mask (D-20).  The persisted mask is treated
+    // as DECLARED (#646): loading a project declares its saved mask, which
+    // then persists across re-normalizations exactly like an HDF5
+    // file-declared mask, while re-detections are recomputed from scratch
+    // (AppState::set_detected_dead_pixels) instead of unioning into it —
+    // detections never accumulate across the save/load boundary.  If the
+    // linked HDF5 is reloaded, the load site overwrites the declared mask
+    // with the file's own.
     state.dead_pixels = snap.dead_pixels;
+    state.file_dead_pixels = state.dead_pixels.clone();
 
     // 16. Restore results
     if let Some(density_maps) = snap.density_maps {
