@@ -1090,6 +1090,9 @@ fn state_from_snapshot(snap: ProjectSnapshot, state: &mut AppState, path: &Path)
             // restore.  Re-running spatial_map_typed regenerates them.
             t0_us_map: None,
             l_scale_map: None,
+            // Snapshots don't persist the energy-scale flight path yet; the
+            // overlay accessor treats `None` as "energy scale not fitted".
+            energy_scale_flight_path_m: None,
             n_converged: snap.n_converged.unwrap_or(0),
             n_total: snap.n_total.unwrap_or(0),
             n_failed: snap.n_failed.unwrap_or(0),
@@ -1120,6 +1123,7 @@ fn state_from_snapshot(snap: ProjectSnapshot, state: &mut AppState, path: &Path)
             back_f: None,
             t0_us: None,
             l_scale: None,
+            energy_scale_flight_path_m: None,
             deviance_per_dof: None,
         };
         // Rebuild FitFeedback from the restored result

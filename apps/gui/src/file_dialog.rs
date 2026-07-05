@@ -945,6 +945,7 @@ mod tests {
             back_f_map: None,
             t0_us_map: None,
             l_scale_map: None,
+            energy_scale_flight_path_m: None,
             n_converged: 4,
             n_total: 4,
             n_failed: 0,

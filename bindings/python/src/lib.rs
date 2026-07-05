@@ -431,6 +431,10 @@ struct PyFitResult {
     /// Fitted flight-path scale factor (SAMMY TZERO L₀, dimensionless).
     /// None when energy-scale fitting is not enabled.
     l_scale: Option<f64>,
+    /// Nominal flight path (m) the energy-scale fit was configured with;
+    /// consumed by `corrected_energies` so the transform is reproduced with
+    /// the SAME flight path the fit used (issue #634).
+    energy_scale_flight_path_m: Option<f64>,
     /// Conditional binomial deviance / (n − k).  `Some(...)` only for the
     /// counts-KL dispatch (`solver="kl"` on counts input).
     deviance_per_dof: Option<f64>,
@@ -528,6 +532,43 @@ impl PyFitResult {
     #[getter]
     fn l_scale(&self) -> Option<f64> {
         self.l_scale
+    }
+
+    /// Map a nominal energy grid through the fitted ``(t0_us, l_scale)`` energy
+    /// scale to the corrected (calibrated) energies the fit evaluated the
+    /// physics on (issue #634). Reuses the exact SAMMY-convention transform
+    /// (``dat/mdat0.f90:189``, −t0 sign) with the SAME flight path the fit
+    /// was configured with (stored on the result), so the corrected axis is
+    /// never re-derived by hand (a +t0 slip caused a silent +400 K
+    /// temperature bias in the field) and a mismatched caller-supplied
+    /// flight path cannot silently skew the t₀ term.
+    ///
+    /// Returns ``None`` when energy-scale fitting was not enabled. Raises
+    /// ``ValueError`` on an invalid nominal grid (non-finite / non-positive /
+    /// non-ascending — the binding's standard energy-grid validation) or a
+    /// degenerate calibration (a ``t0`` past the shortest flight time).
+    #[pyo3(signature = (nominal_energies))]
+    fn corrected_energies<'py>(
+        &self,
+        py: Python<'py>,
+        nominal_energies: PyReadonlyArray1<'py, f64>,
+    ) -> PyResult<Option<Bound<'py, PyArray1<f64>>>> {
+        match (self.t0_us, self.l_scale, self.energy_scale_flight_path_m) {
+            (Some(t0), Some(l_scale), Some(flight_path_m)) => {
+                let e = nominal_energies.as_slice()?;
+                require_non_empty_energy_grid(e)?;
+                validate_energy_grid(e)?;
+                let corr = nereids_fitting::resolution_calib::corrected_energy_grid(
+                    e,
+                    t0,
+                    l_scale,
+                    flight_path_m,
+                )
+                .map_err(|err| pyo3::exceptions::PyValueError::new_err(err.to_string()))?;
+                Ok(Some(PyArray1::from_vec(py, corr)))
+            }
+            _ => Ok(None),
+        }
     }
 
     /// Conditional binomial deviance divided by (n − k) from the counts-KL
@@ -3676,6 +3717,8 @@ fn spatial_result_to_py(
     temperature_k = 293.6,
     fit_temperature = false,
     initial_densities = None,
+    fix_densities = false,
+    density_free = None,
     dead_pixels = None,
     max_iter = 200,
     solver = "auto",
@@ -3711,6 +3754,8 @@ fn py_spatial_map_typed<'py>(
     temperature_k: f64,
     fit_temperature: bool,
     initial_densities: Option<Vec<f64>>,
+    fix_densities: bool,
+    density_free: Option<Vec<bool>>,
     dead_pixels: Option<PyReadonlyArray2<'py, bool>>,
     max_iter: usize,
     solver: &str,
@@ -3977,6 +4022,10 @@ fn py_spatial_map_typed<'py>(
         .with_fit_energy_range(fit_energy_range)
         .map_err(|e| pyo3::exceptions::PyValueError::new_err(e.to_string()))?;
 
+    // Issue #633: freeze known densities across every pixel — per-pixel
+    // T-only (or T + energy-scale) fits with a calibration-foil density.
+    config = apply_density_freeze(config, fix_densities, density_free)?;
+
     // GIL held during computation.  InputData3D borrows PyInputData arrays
     // which are not Send, so we cannot use py.allow_threads().  The existing
     // py_spatial_map has the same limitation.  Rayon still parallelizes the
@@ -4069,6 +4118,8 @@ fn py_spatial_map_typed<'py>(
     delta_l_m = None,
     groups = None,
     initial_densities = None,
+    fix_densities = false,
+    density_free = None,
     enable_polish = None,
     tzero_jacobian = None,
     fit_energy_range = None,
@@ -4104,6 +4155,8 @@ fn py_fit_counts_spectrum_typed<'py>(
     delta_l_m: Option<f64>,
     groups: Option<Vec<PyIsotopeGroup>>,
     initial_densities: Option<Vec<f64>>,
+    fix_densities: bool,
+    density_free: Option<Vec<bool>>,
     enable_polish: Option<bool>,
     tzero_jacobian: Option<&str>,
     fit_energy_range: Option<(f64, f64)>,
@@ -4306,6 +4359,9 @@ fn py_fit_counts_spectrum_typed<'py>(
         .with_fit_energy_range(fit_energy_range)
         .map_err(|e| pyo3::exceptions::PyValueError::new_err(e.to_string()))?;
 
+    // Issue #633: freeze known densities (calibration-foil thermometry).
+    config = apply_density_freeze(config, fix_densities, density_free)?;
+
     let result = py.detach(move || fit_spectrum_typed(&input, &config).map_err(|e| e.to_string()));
     let result = result.map_err(|e| pyo3::exceptions::PyRuntimeError::new_err(e))?;
 
@@ -4339,6 +4395,7 @@ fn py_fit_counts_spectrum_typed<'py>(
         },
         t0_us: result.t0_us,
         l_scale: result.l_scale,
+        energy_scale_flight_path_m: result.energy_scale_flight_path_m,
         deviance_per_dof: result.deviance_per_dof,
     })
 }
@@ -4587,6 +4644,31 @@ fn py_compute_model_jacobian<'py>(
     })
 }
 
+/// Apply the issue-#633 density freeze to a config: an explicit
+/// per-density `density_free` mask takes precedence; otherwise
+/// `fix_densities=true` freezes all densities. `density_free` and
+/// `fix_densities` are mutually exclusive — supplying both is an error
+/// (the mask is unambiguous, the bool would be redundant or conflicting).
+fn apply_density_freeze(
+    config: nereids_pipeline::pipeline::UnifiedFitConfig,
+    fix_densities: bool,
+    density_free: Option<Vec<bool>>,
+) -> PyResult<nereids_pipeline::pipeline::UnifiedFitConfig> {
+    match density_free {
+        Some(free) => {
+            if fix_densities {
+                return Err(pyo3::exceptions::PyValueError::new_err(
+                    "Provide either 'fix_densities' or 'density_free', not both.",
+                ));
+            }
+            config
+                .with_density_free(free)
+                .map_err(|e| pyo3::exceptions::PyValueError::new_err(e.to_string()))
+        }
+        None => Ok(config.with_fix_densities(fix_densities)),
+    }
+}
+
 /// Fit a single pre-normalized transmission spectrum.
 ///
 /// This function accepts **transmission** data only (T = sample/open-beam).
@@ -4632,6 +4714,8 @@ fn py_compute_model_jacobian<'py>(
     delta_l_m = None,
     groups = None,
     initial_densities = None,
+    fix_densities = false,
+    density_free = None,
     tzero_jacobian = None,
     fit_energy_range = None,
 ))]
@@ -4660,6 +4744,8 @@ fn py_fit_spectrum_typed<'py>(
     delta_l_m: Option<f64>,
     groups: Option<Vec<PyIsotopeGroup>>,
     initial_densities: Option<Vec<f64>>,
+    fix_densities: bool,
+    density_free: Option<Vec<bool>>,
     tzero_jacobian: Option<&str>,
     fit_energy_range: Option<(f64, f64)>,
 ) -> PyResult<PyFitResult> {
@@ -4807,6 +4893,9 @@ fn py_fit_spectrum_typed<'py>(
         .with_fit_energy_range(fit_energy_range)
         .map_err(|e| pyo3::exceptions::PyValueError::new_err(e.to_string()))?;
 
+    // Issue #633: freeze known densities (calibration-foil thermometry).
+    config = apply_density_freeze(config, fix_densities, density_free)?;
+
     // Build 1D InputData
     let input = InputData::Transmission {
         transmission: t_slice.to_vec(),
@@ -4848,6 +4937,7 @@ fn py_fit_spectrum_typed<'py>(
         },
         t0_us: result.t0_us,
         l_scale: result.l_scale,
+        energy_scale_flight_path_m: result.energy_scale_flight_path_m,
         deviance_per_dof: result.deviance_per_dof,
     })
 }

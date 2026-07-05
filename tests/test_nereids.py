@@ -2118,6 +2118,277 @@ class TestFitEnergyRangeBindingParameter:
         )
 
 
+class TestFixDensities:
+    """Issue #633: freeze known densities (calibration-foil thermometry).
+
+    These verify the freeze *plumbing* — which parameters vary, how frozen
+    slots map through the free-only covariance/uncertainty vector, and the
+    reported degrees of freedom. Spectra are generated with
+    ``nereids.forward_model`` and fitted through the same stack (loop
+    closure): appropriate here because the physics oracle (Doppler /
+    temperature sensitivity, Beer–Lambert) is validated independently against
+    SAMMY in the ``nereids-physics`` crate — these tests deliberately do not
+    re-validate it. Non-vacuity is guaranteed by seeding every fit away from
+    truth (temperature 50 K off, densities offset), so a no-op fit fails.
+    """
+
+    def test_fix_densities_holds_density_and_recovers_temperature(self, u238_data):
+        """Synthetic spectrum at a known (n, T); freeze n at truth and fit
+        temperature only. The frozen density is held EXACTLY at its initial
+        value and the temperature is recovered."""
+        energies = np.linspace(1.0, 30.0, 400)
+        true_density = 8.0e-4
+        true_temp = 350.0
+        t = np.asarray(
+            nereids.forward_model(
+                energies, [(u238_data, true_density)], temperature_k=true_temp
+            )
+        )
+        sigma = np.full_like(t, 0.005)
+
+        r = nereids.fit_spectrum_typed(
+            transmission=t,
+            uncertainty=sigma,
+            energies=energies,
+            isotopes=[(u238_data, true_density)],
+            solver="lm",
+            temperature_k=300.0,  # seeded 50 K off
+            fit_temperature=True,
+            fix_densities=True,
+            max_iter=200,
+        )
+        assert bool(r.converged) is True
+        # Frozen density held bit-exactly at its initial value.
+        assert r.densities[0] == true_density
+        # Temperature (the sole free parameter) recovered.
+        assert r.temperature_k is not None
+        assert abs(r.temperature_k - true_temp) < 2.0, (
+            f"temperature not recovered: got {r.temperature_k}, want {true_temp}"
+        )
+        # #633 P0 regression: with the density frozen, temperature is the sole
+        # free parameter. Its 1-σ must be finite and positive (mapped from the
+        # correct free slot); the frozen density reports NaN (no covariance
+        # column). Before the free-index mapping fix the binding returned a NaN
+        # temperature σ and a misassigned density σ, since uncertainties were
+        # indexed by the full parameter layout.
+        assert r.temperature_k_unc is not None
+        assert np.isfinite(r.temperature_k_unc) and r.temperature_k_unc > 0.0, (
+            "frozen-density thermometry must report a finite positive "
+            f"temperature σ, got {r.temperature_k_unc}"
+        )
+        assert np.isnan(float(r.uncertainties[0])), (
+            f"frozen density must report NaN σ, got {r.uncertainties[0]}"
+        )
+
+    def test_fix_densities_kl_reports_temperature_uncertainty(self, u238_data):
+        """The KL transmission solver (``solver="kl"``) must also report a
+        finite temperature 1-σ with a density frozen — the parallel path the
+        LM tests don't exercise. Pre-fix a leftover full-index overwrite
+        clobbered ``temperature_k_unc`` to None on this path (review R2 P0)."""
+        energies = np.linspace(1.0, 30.0, 400)
+        true_density = 8.0e-4
+        true_temp = 350.0
+        t = np.asarray(
+            nereids.forward_model(
+                energies, [(u238_data, true_density)], temperature_k=true_temp
+            )
+        )
+        sigma = np.full_like(t, 0.005)
+        r = nereids.fit_spectrum_typed(
+            transmission=t,
+            uncertainty=sigma,
+            energies=energies,
+            isotopes=[(u238_data, true_density)],
+            solver="kl",
+            temperature_k=300.0,
+            fit_temperature=True,
+            fix_densities=True,
+            max_iter=200,
+        )
+        assert bool(r.converged) is True
+        assert r.densities[0] == true_density
+        assert r.temperature_k is not None
+        # The regression: temperature_k_unc was None pre-fix on the KL path.
+        assert r.temperature_k_unc is not None
+        assert np.isfinite(r.temperature_k_unc) and r.temperature_k_unc > 0.0, (
+            "KL frozen-density temperature σ must be finite positive, "
+            f"got {r.temperature_k_unc}"
+        )
+
+    def test_fix_densities_counts_path_holds_density_and_reports_uncertainty(
+        self, u238_data
+    ):
+        """The counts KL fitter (``fit_counts_spectrum_typed``) must also hold
+        a frozen density, report NaN for its 1-σ (no covariance column), and
+        report a finite temperature σ. Exercises the counts uncertainty loop
+        directly — the transmission tests never touch it (the CHANGELOG's
+        "every fitter" claim)."""
+        energies = np.linspace(1.0, 30.0, 300)
+        true_density = 8.0e-4
+        true_temp = 350.0
+        flux = 5000.0
+        t_1d = np.asarray(
+            nereids.forward_model(
+                energies, [(u238_data, true_density)], temperature_k=true_temp
+            )
+        )
+        rng = np.random.default_rng(20260703)
+        open_beam = np.maximum(
+            rng.poisson(np.full_like(t_1d, flux)).astype(float), 1.0
+        )
+        sample = rng.poisson(flux * t_1d).astype(float)
+        r = nereids.fit_counts_spectrum_typed(
+            sample_counts=sample,
+            open_beam_counts=open_beam,
+            energies=energies,
+            isotopes=[(u238_data, true_density)],
+            solver="kl",
+            c=1.0,
+            temperature_k=300.0,
+            fit_temperature=True,
+            fix_densities=True,
+            max_iter=200,
+        )
+        assert bool(r.converged) is True
+        assert r.densities[0] == true_density, "frozen density must not move"
+        # R1 counts-loop regression: frozen density → NaN σ, not a
+        # neighbouring free parameter's error bar.
+        assert np.isnan(float(r.uncertainties[0])), (
+            f"frozen density must report NaN σ, got {r.uncertainties[0]}"
+        )
+        assert r.temperature_k_unc is not None
+        assert np.isfinite(r.temperature_k_unc) and r.temperature_k_unc > 0.0, (
+            "counts frozen-density temperature σ must be finite positive, "
+            f"got {r.temperature_k_unc}"
+        )
+
+    def test_fix_densities_spatial_map_holds_density(self, u238_data):
+        """``spatial_map_typed`` must freeze densities per pixel: the frozen
+        density map stays bit-exactly at the (offset) seed instead of fitting
+        toward the data. Exercises the per-pixel frozen path end to end."""
+        energies = np.linspace(1.0, 30.0, 200)
+        true_density = 2.0e-3
+        ny, nx = 2, 2
+        # Cube at 350 K; the fit seeds temperature at 300 K and fits it while
+        # the density is frozen at an offset seed (≠ truth).
+        t_1d = np.asarray(
+            nereids.forward_model(
+                energies, [(u238_data, true_density)], temperature_k=350.0
+            )
+        )
+        trans = np.tile(t_1d[:, None, None], (1, ny, nx))
+        unc = np.full_like(trans, 0.005)
+        data = nereids.from_transmission(trans, unc)
+        seed = 1.0e-3  # deliberately far from the 2e-3 truth
+        result = nereids.spatial_map_typed(
+            data,
+            energies,
+            [u238_data],
+            initial_densities=[seed],
+            temperature_k=300.0,
+            fit_temperature=True,  # keep ≥1 free param so pixels converge
+            fix_densities=True,
+            max_iter=60,
+        )
+        dmap = np.asarray(result.density_maps[0])
+        assert dmap.shape == (ny, nx)
+        # Every pixel frozen at the seed, NOT driven toward true_density.
+        np.testing.assert_array_equal(dmap, seed)
+
+    def test_density_free_mask_freezes_selected_density(self, u238_data):
+        """A per-density ``density_free`` mask freezes only the marked density
+        parameter while the unmarked one is still fitted. Two spectrally
+        distinct isotopes: index 0 frozen at its seed (held bit-exactly, NaN
+        σ), index 1 free and recovered (finite σ). This also exercises the
+        leading-frozen uncertainty mapping — the free density's σ must come
+        from free slot 0, not full index 1 (the R1 index-compression fix)."""
+        # A second, well-separated resonance (≈21 eV) so the two densities are
+        # distinguishable and the free one can be recovered.
+        iso_b = _make_single_resonance(
+            z=90, a=232, awr=230.045, scattering_radius=9.0,
+            energy=21.0, j=0.5, gn=0.002, gg=0.02,
+        )
+        energies = np.linspace(1.0, 30.0, 500)
+        d_a_true, d_b_true = 8.0e-4, 1.2e-3
+        t = np.asarray(
+            nereids.forward_model(
+                energies, [(u238_data, d_a_true), (iso_b, d_b_true)]
+            )
+        )
+        sigma = np.full_like(t, 0.003)
+        r = nereids.fit_spectrum_typed(
+            transmission=t,
+            uncertainty=sigma,
+            energies=energies,
+            # index 0 frozen at truth; index 1 seeded off and left free.
+            isotopes=[(u238_data, d_a_true), (iso_b, 5.0e-4)],
+            solver="lm",
+            temperature_k=293.6,
+            density_free=[False, True],
+            max_iter=200,
+        )
+        assert bool(r.converged) is True
+        # Masked-false density held bit-exactly; free density recovered.
+        assert r.densities[0] == d_a_true, "masked-false density must not move"
+        assert abs(r.densities[1] - d_b_true) / d_b_true < 0.05, (
+            f"free density should recover: got {r.densities[1]}, want {d_b_true}"
+        )
+        # Frozen density → NaN σ; free density → finite positive σ.
+        assert np.isnan(float(r.uncertainties[0])), (
+            f"frozen density σ must be NaN, got {r.uncertainties[0]}"
+        )
+        assert np.isfinite(float(r.uncertainties[1])) and r.uncertainties[1] > 0.0, (
+            f"free density σ must be finite positive, got {r.uncertainties[1]}"
+        )
+
+    def test_all_frozen_no_free_param_rejected(self, u238_data):
+        """Freezing the only density with no other free parameter is rejected
+        up front — the all-fixed solver fast path would otherwise report
+        ``converged=true`` from a fit that varied nothing (review R4)."""
+        energies = np.linspace(1.0, 30.0, 200)
+        t = np.asarray(nereids.forward_model(energies, [(u238_data, 8.0e-4)]))
+        sigma = np.full_like(t, 0.005)
+        with pytest.raises(RuntimeError, match="no free parameters"):
+            nereids.fit_spectrum_typed(
+                transmission=t,
+                uncertainty=sigma,
+                energies=energies,
+                isotopes=[(u238_data, 8.0e-4)],
+                solver="lm",
+                temperature_k=293.6,
+                fix_densities=True,  # freeze the only param, nothing else free
+            )
+
+    def test_fix_densities_and_density_free_are_mutually_exclusive(self, u238_data):
+        """Supplying both `fix_densities` and `density_free` is rejected."""
+        energies = np.linspace(1.0, 30.0, 100)
+        t = np.full_like(energies, 0.95)
+        sigma = np.full_like(energies, 0.01)
+        with pytest.raises(ValueError, match="not both"):
+            nereids.fit_spectrum_typed(
+                transmission=t,
+                uncertainty=sigma,
+                energies=energies,
+                isotopes=[(u238_data, 0.001)],
+                fix_densities=True,
+                density_free=[True],
+            )
+
+    def test_density_free_wrong_length_rejected(self, u238_data):
+        """A `density_free` mask of the wrong length is rejected."""
+        energies = np.linspace(1.0, 30.0, 100)
+        t = np.full_like(energies, 0.95)
+        sigma = np.full_like(energies, 0.01)
+        with pytest.raises(ValueError):
+            nereids.fit_spectrum_typed(
+                transmission=t,
+                uncertainty=sigma,
+                energies=energies,
+                isotopes=[(u238_data, 0.001)],
+                density_free=[True, False],  # 2 masks for 1 density
+            )
+
+
 # ===========================================================================
 # fit_energy_scale recovery (#531 — single-spectrum LM, SAMMY TZERO)
 # ===========================================================================
@@ -2418,6 +2689,154 @@ class TestFitEnergyScaleRecovery:
             f"L_scale rel err {l_scale_rel_err:.3e} exceeds 1 %: "
             f"got {float(r.l_scale):.6f}, truth {L_SCALE_TRUE}"
         )
+
+    def test_recovers_t0_l_scale_and_temperature_jointly(self):
+        """Issue #634: fit_energy_scale + fit_temperature recover the injected
+        (t0, L_scale, T) in ONE fit through the Python binding — the flag
+        combination the binding used to reject. Gate on the observables
+        (L_scale + temperature), seeding T 60 K off so a no-op cannot pass."""
+        L_NOM = 25.0
+        T0_TRUE = 0.5
+        L_SCALE_TRUE = 1.005
+        TRUE_DENSITY = 3.0e-4
+        TRUE_TEMP = 450.0
+
+        u238 = nereids.create_resonance_data(
+            z=92,
+            a=238,
+            awr=236.006,
+            scattering_radius=9.48,
+            resonances=[
+                (6.67, 0.5, 0.0015, 0.023),
+                (20.87, 0.5, 0.0103, 0.026),
+                (36.68, 0.5, 0.0344, 0.027),
+            ],
+            target_spin=0.0,
+        )
+        tof_lo = _TOF_FACTOR * L_NOM / np.sqrt(45.0)
+        tof_hi = _TOF_FACTOR * L_NOM / np.sqrt(4.0)
+        tof_grid = np.linspace(tof_lo, tof_hi, 800)
+        e_true = np.sort((_TOF_FACTOR * L_NOM / tof_grid) ** 2)
+        # Clean transmission at the TRUE energies AND the true temperature.
+        t_clean = np.asarray(
+            nereids.forward_model(
+                e_true, [(u238, TRUE_DENSITY)], temperature_k=TRUE_TEMP
+            )
+        )
+        e_meas = _measured_energies_for_known_tzero(
+            e_true,
+            t0_true_us=T0_TRUE,
+            l_scale_true=L_SCALE_TRUE,
+            l_nom_m=L_NOM,
+        )
+        rng = np.random.default_rng(20260704)
+        sigma_noise = 0.004
+        t_obs = t_clean + rng.normal(0.0, sigma_noise, size=t_clean.shape)
+        sigma = np.full_like(t_obs, sigma_noise)
+
+        r = nereids.fit_spectrum_typed(
+            transmission=t_obs,
+            uncertainty=sigma,
+            energies=e_meas,
+            isotopes=[(u238, TRUE_DENSITY)],
+            solver="lm",
+            temperature_k=TRUE_TEMP - 60.0,  # seeded 60 K off
+            fit_temperature=True,
+            fit_energy_scale=True,
+            t0_init_us=0.0,
+            l_scale_init=1.0,
+            energy_scale_flight_path_m=L_NOM,
+            max_iter=300,
+        )
+        assert bool(r.converged) is True
+        assert r.t0_us is not None and np.isfinite(r.t0_us)
+        assert r.l_scale is not None and np.isfinite(r.l_scale)
+        assert r.temperature_k is not None
+        # L_scale + temperature are the well-constrained observables (t0/L
+        # share a shallow valley; see the class docstring).
+        assert abs(float(r.l_scale) - L_SCALE_TRUE) / L_SCALE_TRUE < 1e-2
+        assert abs(float(r.temperature_k) - TRUE_TEMP) < 15.0, (
+            f"temperature not recovered jointly: got {r.temperature_k}, "
+            f"want {TRUE_TEMP}"
+        )
+        # Non-identity accessor oracle (#634 review): at a genuinely shifted
+        # calibration, corrected_energies(e_meas) must land on the TRUE
+        # energy axis the data was synthesized on (to within the recovered
+        # parameters' accuracy) — a no-op accessor returns e_meas instead,
+        # which differs from e_true by ~0.5-1 % here.
+        corr = np.asarray(r.corrected_energies(e_meas))
+        med_rel = np.median(np.abs(corr - e_true) / e_true)
+        noop_rel = np.median(np.abs(e_meas - e_true) / e_true)
+        assert med_rel < 0.2 * noop_rel, (
+            f"corrected axis (med rel err {med_rel:.2e}) should be far closer "
+            f"to truth than the uncorrected axis ({noop_rel:.2e})"
+        )
+
+    def test_corrected_energies_accessor(self):
+        """Issue #634: FitResult.corrected_energies maps a nominal grid through
+        the fitted energy scale (finite ndarray), and returns None when the
+        energy scale was not fitted."""
+        L_NOM = 25.0
+        u238 = nereids.create_resonance_data(
+            z=92,
+            a=238,
+            awr=236.006,
+            scattering_radius=9.48,
+            resonances=[(6.67, 0.5, 0.0015, 0.023), (20.87, 0.5, 0.0103, 0.026)],
+            target_spin=0.0,
+        )
+        energies = np.linspace(4.0, 30.0, 400)
+        t_clean = np.asarray(nereids.forward_model(energies, [(u238, 3.0e-4)]))
+        sigma = np.full_like(t_clean, 0.005)
+
+        # Energy-scale fit → corrected_energies is a finite ndarray, ascending.
+        r_es = nereids.fit_spectrum_typed(
+            transmission=t_clean,
+            uncertainty=sigma,
+            energies=energies,
+            isotopes=[(u238, 3.0e-4)],
+            solver="lm",
+            fit_energy_scale=True,
+            t0_init_us=0.0,
+            l_scale_init=1.0,
+            energy_scale_flight_path_m=L_NOM,
+            max_iter=100,
+        )
+        corr = r_es.corrected_energies(energies)
+        assert corr is not None
+        corr = np.asarray(corr)
+        assert corr.shape == energies.shape
+        assert np.all(np.isfinite(corr)) and np.all(np.diff(corr) > 0)
+        # Non-circular numeric oracle (#634 review): hand-compute the SAMMY
+        # −t0 transform in numpy from the FITTED (t0, l_scale) and the fit's
+        # flight path — a no-op accessor, a sign flip, a t0/l_scale swap, or
+        # a wrong flight-path source all break this equality, none of which
+        # the shape/finite asserts above can see.
+        kl = _TOF_FACTOR * L_NOM
+        tof = kl / np.sqrt(energies)
+        expected = (kl * float(r_es.l_scale) / (tof - float(r_es.t0_us))) ** 2
+        np.testing.assert_allclose(corr, expected, rtol=1e-12)
+
+        # No energy-scale fit → None (distinguishes "unfit" from "identity").
+        r_plain = nereids.fit_spectrum_typed(
+            transmission=t_clean,
+            uncertainty=sigma,
+            energies=energies,
+            isotopes=[(u238, 3.0e-4)],
+            solver="lm",
+            max_iter=50,
+        )
+        assert r_plain.corrected_energies(energies) is None
+
+        # Invalid nominal grids are rejected with the binding's standard
+        # energy-grid validation (#634 review) — NaN, non-positive, and
+        # non-ascending grids raise instead of passing through.
+        with pytest.raises(ValueError):
+            r_es.corrected_energies(np.array([np.nan, 2.0, 3.0]))
+        with pytest.raises(ValueError):
+            r_es.corrected_energies(np.array([0.0, 1.0, 2.0]))
+        with pytest.raises(ValueError):
+            r_es.corrected_energies(np.array([3.0, 1.0, 2.0]))
 
 
 # ===========================================================================

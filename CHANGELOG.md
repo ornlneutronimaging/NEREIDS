@@ -7,6 +7,61 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
 
 ## [Unreleased]
 
+### Added
+
+- **`fit_energy_scale` + `fit_temperature` jointly, in every fitter**
+  (#634): the flag combination resonance thermometry needs — calibrate
+  the SAMMY energy scale (t₀, L_scale) *and* fit temperature in one
+  fit — is now supported across the LM, transmission-KL, and counts
+  joint-Poisson paths and `spatial_map_typed` (the four guards that
+  rejected it are gone). `EnergyScaleTransmissionModel` carries a fitted
+  temperature column (central finite difference, validated against the
+  analytic ∂σ/∂T column to <1e-4 relative; an independent (JᵀWJ)⁻¹
+  reconstruction reproduces the reported temperature σ to <0.1 %).
+- **`corrected_energies()` accessor** (#634): `SpectrumFitResult` (Rust)
+  and `FitResult` (Python) expose the exact energy-scale transform the
+  fit used — `corrected_energies(nominal_energies)` maps a nominal grid
+  through the fitted `(t0_us, l_scale)`, using the flight path stored on
+  the result at fit time, with the SAMMY
+  `−t0` sign convention (`dat/mdat0.f90:189`), returning `None` when the
+  energy scale was not fitted. Hand-deriving this transform (with a
+  `+t0` slip) previously caused a silent +400 K temperature bias.
+
+- **Per-parameter density freeze in every fitter** (#633): areal
+  densities can now be held fixed while other parameters (temperature,
+  energy scale, background) are fit. `UnifiedFitConfig` gains
+  `with_fix_densities(bool)` (freeze all densities) and
+  `with_density_free(Vec<bool>)` (per-density-parameter mask; `false`
+  freezes density parameter *i* at its initial value, length must equal
+  the density-parameter count — one entry per isotope for ungrouped
+  fits, one per group for grouped fits). The Python fitters
+  `fit_spectrum_typed`, `fit_counts_spectrum_typed`, and
+  `spatial_map_typed` expose the same control via the new
+  `fix_densities: bool = False` and `density_free: list[bool] | None =
+  None` keyword arguments (mutually exclusive — supplying both is an
+  error). Frozen densities no longer consume a free parameter, so
+  reported degrees of freedom, reduced χ², and per-parameter
+  uncertainties reflect only the parameters actually varied (a frozen
+  density's reported 1-σ is `NaN`). This enables temperature-only
+  thermometry fits against a known sample density.
+
+- **Calibration degeneracy reporting** (#642): `calibrate_resolution`
+  results now carry `n_free_params` and `bounds_hit` (parameters pinned at
+  a box bound, e.g. `"r:lower"` on the β↔R ridge when the calibrant shows
+  no storage tail), in Rust and Python.
+- **Calibration simplex re-inflation** (#642): each `calibrate_resolution`
+  restart now re-launches a fresh, larger Nelder–Mead simplex at the
+  incumbent until it stops improving, escaping premature simplex collapse
+  in the curved α↔β↔R valley of the 4-parameter IC family (a collapsed
+  simplex once stalled a 300 K calibration Δχ² ≈ +130 above the noise
+  floor, biasing the downstream pinned temperature fit by ~23 K). Applies
+  to all families; results can only improve or stay put.
+- **Closed-loop IC acceptance tests** (#642): synthetic Ta-181
+  calibrate→pin→refit-temperature loops at 300 K and 1073 K
+  (`crates/nereids-fitting/tests/ic_closed_loop.rs`) assert χ²/dof ≈ 1,
+  interior recovery of the truth kernel, and temperature recovery within
+  3σ with σ_T far below the old ~90 K degeneracy scale.
+
 ### Changed
 
 - **Physics-complete bounded Ikeda–Carpenter calibration family** (#642):
@@ -38,24 +93,23 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
   values; read decoded physical parameters from `params()` (Python) or the
   returned `resolution` (Rust) instead of interpreting `theta` directly.
 
-### Added
-
-- **Calibration degeneracy reporting** (#642): `calibrate_resolution`
-  results now carry `n_free_params` and `bounds_hit` (parameters pinned at
-  a box bound, e.g. `"r:lower"` on the β↔R ridge when the calibrant shows
-  no storage tail), in Rust and Python.
-- **Calibration simplex re-inflation** (#642): each `calibrate_resolution`
-  restart now re-launches a fresh, larger Nelder–Mead simplex at the
-  incumbent until it stops improving, escaping premature simplex collapse
-  in the curved α↔β↔R valley of the 4-parameter IC family (a collapsed
-  simplex once stalled a 300 K calibration Δχ² ≈ +130 above the noise
-  floor, biasing the downstream pinned temperature fit by ~23 K). Applies
-  to all families; results can only improve or stay put.
-- **Closed-loop IC acceptance tests** (#642): synthetic Ta-181
-  calibrate→pin→refit-temperature loops at 300 K and 1073 K
-  (`crates/nereids-fitting/tests/ic_closed_loop.rs`) assert χ²/dof ≈ 1,
-  interior recovery of the truth kernel, and temperature recovery within
-  3σ with σ_T far below the old ~90 K degeneracy scale.
+- **`calibrate_energy` rebuilt on the `fit_energy_scale` LM path**
+  (#634): the three-phase (L, t₀) grid + per-candidate golden-section
+  density search (~35 000 forward evaluations; >10 min on production
+  windows) is replaced by a staged search — coarse joint (t₀, L_scale)
+  scan with exact per-candidate density, a plateau-robust dip-match
+  anchor (handles saturated flat-bottom dips), fine joint pit-scans
+  around each anchor, then a multi-start LM descent scored by the
+  original valid-bins χ² (argmin). ~4× fewer forward evaluations on
+  production windows, and the LM refinement removes the old grid's
+  resolution floor (the optimum is continuous rather than quantized to
+  0.001 % L / 0.05 µs t₀). New wide-offset round-trip regression tests
+  pin recovery at production-scale offsets (0.3–1.2 % L, 1–6 µs t₀)
+  across trace, mid-band, and saturated-foil densities. The public
+  signature, `CalibrationResult` fields, density band `[1e-5, 1e-2]`,
+  boundary-saturation and no-finite-χ² error contracts, and the
+  `dof = n_valid − 3` reduced-χ² convention are unchanged; all existing
+  calibration tests pass unmodified.
 
 ## [0.2.2] - 2026-07-03
 
