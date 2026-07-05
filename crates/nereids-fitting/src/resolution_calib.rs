@@ -144,6 +144,17 @@ pub fn corrected_energy_grid(
                 "corrected_energy_grid: energies[{i}] must be finite and positive, got {e}"
             )));
         }
+        // Strict ascending order, matching the Python binding's standard
+        // energy-grid validation (issue #634 review): a non-monotone input
+        // would otherwise map to a plausible but non-monotone corrected axis.
+        if i > 0 && e <= energies[i - 1] {
+            return Err(FittingError::EvaluationFailed(format!(
+                "corrected_energy_grid: energies must be strictly ascending; \
+                 energies[{i}] = {e} <= energies[{}] = {}",
+                i - 1,
+                energies[i - 1],
+            )));
+        }
     }
     if t0_us == 0.0 && l_scale == 1.0 {
         return Ok(energies.to_vec());

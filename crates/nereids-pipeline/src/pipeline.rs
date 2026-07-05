@@ -2428,7 +2428,8 @@ fn build_energy_scale_transmission_model(
     // Issue #634: when temperature is also fit, wire its parameter index in
     // so the model rebuilds σ at the free temperature and emits a T Jacobian
     // column. `None` keeps temperature fixed (unchanged behavior).
-    .with_temperature_index(temperature_index);
+    .with_temperature_index(temperature_index)
+    .map_err(|e| PipelineError::InvalidParameter(format!("energy-scale model: {e}")))?;
     if let Some(method) = config.tzero_jacobian_method {
         es_model = es_model.with_jacobian_method(method);
     }
@@ -4906,6 +4907,7 @@ mod tests {
             None,
         )
         .with_temperature_index(Some(1))
+        .expect("distinct temperature index")
         .with_jacobian_method(EnergyScaleJacobianMethod::FiniteDifference);
 
         // Central FD of the model predictions, per-coordinate steps matching
@@ -5043,6 +5045,14 @@ mod tests {
         assert!(
             mk(Some(t0), Some(ls), Some(flight_path))
                 .corrected_energies(&[0.0, 1.0])
+                .unwrap()
+                .is_err()
+        );
+        // Non-ascending grids are rejected on the Rust surface too, matching
+        // the Python binding's standard validation (#634 review R4).
+        assert!(
+            mk(Some(t0), Some(ls), Some(flight_path))
+                .corrected_energies(&[5.0, 4.0, 6.0])
                 .unwrap()
                 .is_err()
         );

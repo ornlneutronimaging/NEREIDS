@@ -438,6 +438,16 @@ pub fn calibrate_energy(
             "assumed_flight_path_m must be finite and positive, got {assumed_flight_path_m}",
         )));
     }
+    // Reject an invalid temperature at the entry (issue #634 review): the
+    // sibling `UnifiedFitConfig::new` validates it, and without this guard a
+    // NaN/negative temperature is only caught deep inside the repeated
+    // search/LM stages (or silently converted to an all-INFINITY chi²).
+    if !temperature_k.is_finite() || temperature_k < 0.0 {
+        return Err(PipelineError::InvalidParameter(format!(
+            "calibrate_energy: temperature_k must be finite and non-negative, \
+             got {temperature_k}",
+        )));
+    }
     for (i, &e) in energies_nominal.iter().enumerate() {
         if !e.is_finite() || e <= 0.0 {
             return Err(PipelineError::InvalidParameter(format!(
@@ -516,9 +526,10 @@ pub fn calibrate_energy(
 
     // ── Local helpers ────────────────────────────────────────────────────
     // `run_lm`: one LM energy-scale fit on `grid`, cold-seeded at
-    // `(t0, L_scale) = (0, 1)` (the peak-match seed inside the fitter
-    // improves on that when it can), with the grouped density either free
-    // or frozen (#633) at `d_init`.
+    // `(t0, L_scale) = (0, 1)` — the fitters' internal peak-match seed is
+    // deliberately DISABLED for these fits (see the
+    // `with_energy_scale_seed(false)` call and its rationale below) — with
+    // the grouped density either free or frozen (#633) at `d_init`.
     let run_lm = |grid: &[f64],
                   d_init: f64,
                   freeze_density: bool|
@@ -616,7 +627,16 @@ pub fn calibrate_energy(
     let mut t0_tot = 0.0_f64;
     let mut ls_tot = 1.0_f64;
     let mut anchor_n = n_seed;
-    let mut anchor_chi2 = seed_chi2;
+    // NaN-safe latch init (issue #634 review): a NaN identity chi² would
+    // make every `chi2_c < anchor_chi2` comparison false and silently
+    // discard the whole joint scan — the same NaN-latch pattern the winner
+    // latch below is hardened against.  The old grid was immune
+    // (`best_chi2 = INFINITY` with no privileged identity candidate).
+    let mut anchor_chi2 = if seed_chi2.is_finite() {
+        seed_chi2
+    } else {
+        f64::INFINITY
+    };
     for i_l in -3..=3_i32 {
         let ls = 1.0 + f64::from(i_l) * 0.005;
         for i_t in 0..=6_i32 {

@@ -1941,16 +1941,41 @@ impl EnergyScaleTransmissionModel {
     /// Fit the sample temperature jointly with the energy scale (issue #634).
     /// `Some(idx)` makes `params[idx]` the free temperature (K); `None` keeps
     /// temperature fixed at the constructor's `temperature_k`.
-    #[must_use]
-    pub fn with_temperature_index(mut self, temperature_index: Option<usize>) -> Self {
+    ///
+    /// # Errors
+    /// `FittingError::InvalidConfig` if `Some(idx)` collides with `t0_index`,
+    /// `l_scale_index`, or any density index — a mis-wired index would
+    /// otherwise Doppler-broaden at a nonsense "temperature" (e.g. the t0
+    /// value) with no error.  Mirrors `TransmissionFitModel::new`'s
+    /// density-overlap rejection (issue #634 review, sibling-parity class).
+    pub fn with_temperature_index(
+        mut self,
+        temperature_index: Option<usize>,
+    ) -> Result<Self, FittingError> {
+        if let Some(idx) = temperature_index
+            && (idx == self.t0_index
+                || idx == self.l_scale_index
+                || self.density_indices.contains(&idx))
+        {
+            return Err(FittingError::InvalidConfig(format!(
+                "temperature_index {idx} must not overlap t0_index \
+                 ({}), l_scale_index ({}), or the density indices",
+                self.t0_index, self.l_scale_index,
+            )));
+        }
         self.temperature_index = temperature_index;
-        self
+        Ok(self)
     }
 
     /// Sample temperature (K) for the current parameter vector: the fitted
     /// `params[temperature_index]` when temperature is free, else the fixed
     /// `temperature_k`. Mirrors `PrecomputedTransmissionModel`.
     fn temperature_for(&self, params: &[f64]) -> f64 {
+        debug_assert!(
+            self.temperature_index.is_none_or(|i| i < params.len()),
+            "temperature_index out of bounds for params (len={})",
+            params.len()
+        );
         match self.temperature_index {
             Some(idx) => params[idx],
             None => self.temperature_k,
@@ -4926,7 +4951,8 @@ mod tests {
             ls_idx,
             None,
         )
-        .with_temperature_index(Some(t_idx));
+        .with_temperature_index(Some(t_idx))
+        .expect("distinct temperature index");
 
         let free = [d_idx, t_idx, t0_idx, ls_idx];
         let y = es.evaluate(&params).unwrap();
