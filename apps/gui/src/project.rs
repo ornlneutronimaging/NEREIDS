@@ -1125,6 +1125,11 @@ fn state_from_snapshot(snap: ProjectSnapshot, state: &mut AppState, path: &Path)
             l_scale: None,
             energy_scale_flight_path_m: None,
             deviance_per_dof: None,
+            // Baseline persistence lands with the Step-5 GUI wiring; a
+            // pre-#635 snapshot has no baseline either way.
+            baseline: None,
+            baseline_e_ref_ev: None,
+            warnings: Vec::new(),
         };
         // Rebuild FitFeedback from the restored result
         if let Some(ref labels) = snap.single_fit_labels {

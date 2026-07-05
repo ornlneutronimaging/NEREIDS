@@ -1144,6 +1144,10 @@ fn selected_pixel_fit_result_for_overlay(
         // reopen the mismatch channel the stored field exists to close).
         energy_scale_flight_path_m: result.energy_scale_flight_path_m,
         deviance_per_dof: result.deviance_per_dof_map.as_ref().map(|map| map[[y, x]]),
+        // Wired to SpatialResult's baseline fields in the #635 GUI step.
+        baseline: None,
+        baseline_e_ref_ev: None,
+        warnings: Vec::new(),
     })
 }
 

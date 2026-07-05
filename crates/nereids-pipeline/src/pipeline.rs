@@ -17,8 +17,8 @@ use nereids_fitting::lm::{self, FitModel, LmConfig, LmResult};
 use nereids_fitting::parameters::{FitParameter, ParameterSet};
 use nereids_fitting::poisson::{self, PoissonConfig};
 use nereids_fitting::transmission_model::{
-    EnergyScaleTransmissionModel, NormalizedTransmissionModel, PrecomputedTransmissionModel,
-    TransmissionFitModel,
+    EnergyScaleTransmissionModel, MultiplicativeBaselineModel, NormalizedTransmissionModel,
+    PrecomputedTransmissionModel, TransmissionFitModel, baseline_reference_energy,
 };
 use nereids_physics::resolution::ResolutionFunction;
 use nereids_physics::transmission::InstrumentParams;
@@ -112,6 +112,80 @@ struct BackgroundIndices {
     back_c: usize,
     back_d: Option<usize>,
     back_f: Option<usize>,
+}
+
+/// Bounded multiplicative polynomial baseline (issue #635):
+/// `y(E) = (b0 + b1·z + b2·z²) · T_model(E)` with `z = ln(E/E_ref)` and
+/// `E_ref = √(E_min·E_max)` of the fit grid.
+///
+/// A NEREIDS extension (see `MultiplicativeBaselineModel` for the SAMMY
+/// departure record): real VENUS sample/open-beam ratios sit a few % from
+/// unity with smooth energy dependence, and freeing the SAMMY `Anorm`
+/// together with temperature and density is degenerate on such data
+/// (IPTS-37432 finding A3: T → 4471 K with no warning).  The bounded
+/// multiplicative form fitted jointly with temperature at fixed density is
+/// the production recipe (χ²/ν ≈ 2–8 across the 20-run campaign).
+///
+/// `b0` is exactly degenerate with `Anorm`, so configurations that free both
+/// are rejected (`validate_multiplicative_baseline`); the additive ABC(+DF)
+/// background remains combinable when `fit_anorm = false`.
+///
+/// Bounds are configurable with tight defaults — tight enough that the
+/// baseline cannot absorb resonance dips (which need O(1) local excursions),
+/// which is what prevents the A3-style runaway.
+#[derive(Debug, Clone)]
+pub struct MultiplicativeBaselineConfig {
+    /// Initial mid-grid baseline value `b0` (default 1.0).
+    pub b0_init: f64,
+    /// Initial slope per ln-E unit `b1` (default 0.0).
+    pub b1_init: f64,
+    /// Initial curvature per ln-E² unit `b2` (default 0.0).
+    pub b2_init: f64,
+    /// Whether `b0` is free (default true).  All-false = frozen baseline
+    /// (the #633 fixed-parameter pattern; used by the spatial global mode).
+    pub fit_b0: bool,
+    /// Whether `b1` is free (default true).
+    pub fit_b1: bool,
+    /// Whether `b2` is free (default true).
+    pub fit_b2: bool,
+    /// `spatial_map_typed` only: fit ONE baseline on the aggregated mean
+    /// spectrum, then freeze it for every pixel (default true — per-pixel
+    /// baselines on <500 counts/bin biased fitted temperatures by up to
+    /// +150 K on IPTS-37432; the global mode removed 80 % of that).
+    /// Ignored by the single-spectrum fitters.
+    pub spatial_global: bool,
+    /// Optimizer box for `b0` (default `(0.9, 1.1)` — "a few % off unity").
+    pub b0_bounds: (f64, f64),
+    /// Optimizer box for `b1` (default `(-0.05, 0.05)`).
+    pub b1_bounds: (f64, f64),
+    /// Optimizer box for `b2` (default `(-0.05, 0.05)`).
+    pub b2_bounds: (f64, f64),
+}
+
+impl Default for MultiplicativeBaselineConfig {
+    fn default() -> Self {
+        Self {
+            b0_init: 1.0,
+            b1_init: 0.0,
+            b2_init: 0.0,
+            fit_b0: true,
+            fit_b1: true,
+            fit_b2: true,
+            spatial_global: true,
+            b0_bounds: (0.9, 1.1),
+            b1_bounds: (-0.05, 0.05),
+            b2_bounds: (-0.05, 0.05),
+        }
+    }
+}
+
+/// Indices of the multiplicative-baseline parameters in the full parameter
+/// vector (issue #635).
+#[derive(Debug, Clone, Copy)]
+struct BaselineIndices {
+    b0: usize,
+    b1: usize,
+    b2: usize,
 }
 
 // ── New typed pipeline API (Phase 0) ─────────────────────────────────────
@@ -297,6 +371,8 @@ pub struct UnifiedFitConfig {
     // ── Background models (engine-specific) ──
     /// SAMMY-style background for the transmission engine.
     transmission_background: Option<BackgroundConfig>,
+    /// Optional bounded multiplicative baseline (issue #635); `None` = off.
+    multiplicative_baseline: Option<MultiplicativeBaselineConfig>,
     /// Counts-domain background for the counts engine.
     counts_background: Option<CountsBackgroundConfig>,
 
@@ -477,6 +553,7 @@ impl UnifiedFitConfig {
             compute_covariance: true,
             solver: SolverConfig::Auto,
             transmission_background: None,
+            multiplicative_baseline: None,
             counts_background: None,
             counts_enable_polish: None,
             precomputed_cross_sections: None,
@@ -599,6 +676,18 @@ impl UnifiedFitConfig {
     #[must_use]
     pub fn with_transmission_background(mut self, bg: BackgroundConfig) -> Self {
         self.transmission_background = Some(bg);
+        self
+    }
+
+    /// Enable the bounded multiplicative polynomial baseline (issue #635):
+    /// `y(E) = (b0 + b1·z + b2·z²) · T_model(E)`, `z = ln(E/E_ref)`.
+    /// See [`MultiplicativeBaselineConfig`].  Validated at fit dispatch by
+    /// `validate_multiplicative_baseline` (inits within bounds, `B(E) > 0`
+    /// at the initial point, and no free `Anorm` alongside — `b0` and
+    /// `Anorm` are degenerate normalizations).
+    #[must_use]
+    pub fn with_multiplicative_baseline(mut self, bl: MultiplicativeBaselineConfig) -> Self {
+        self.multiplicative_baseline = Some(bl);
         self
     }
 
@@ -860,6 +949,10 @@ impl UnifiedFitConfig {
     }
     pub fn transmission_background(&self) -> Option<&BackgroundConfig> {
         self.transmission_background.as_ref()
+    }
+    /// The configured multiplicative baseline (issue #635), if any.
+    pub fn multiplicative_baseline(&self) -> Option<&MultiplicativeBaselineConfig> {
+        self.multiplicative_baseline.as_ref()
     }
     pub fn counts_background(&self) -> Option<&CountsBackgroundConfig> {
         self.counts_background.as_ref()
@@ -1259,6 +1352,14 @@ fn fit_transmission_lm(
         .as_ref()
         .map(|bg| append_background_params(&mut param_vec, bg));
 
+    // Multiplicative-baseline parameters (issue #635) — appended LAST
+    // (density → temperature → energy-scale → background → baseline).
+    validate_multiplicative_baseline(config)?;
+    let bl_indices = config
+        .multiplicative_baseline
+        .as_ref()
+        .map(|bl| append_multiplicative_baseline_params(&mut param_vec, bl));
+
     let mut params = ParameterSet::new(param_vec);
     let mut lm_cfg = lm_config.clone();
     lm_cfg.compute_covariance = config.compute_covariance;
@@ -1305,11 +1406,16 @@ fn fit_transmission_lm(
         }
     }
 
-    // Dispatch with optional background wrapping
-    let result = if let Some(bi) = bg_indices {
-        let wrapped = if let (Some(di), Some(fi)) = (bi.back_d, bi.back_f) {
-            NormalizedTransmissionModel::new_with_exponential(
-                &*model,
+    // Dispatch with optional background / baseline wrapping.  Wrappers
+    // Box-stack linearly (the `Box<M>` FitModel blanket impl in lm.rs):
+    // inner physics → NormalizedTransmissionModel (additive SAMMY
+    // background, if configured) → MultiplicativeBaselineModel (issue
+    // #635, OUTERMOST, if configured).
+    let mut stacked: Box<dyn FitModel> = model;
+    if let Some(bi) = bg_indices {
+        stacked = if let (Some(di), Some(fi)) = (bi.back_d, bi.back_f) {
+            Box::new(NormalizedTransmissionModel::new_with_exponential(
+                stacked,
                 config.energies(),
                 bi.anorm,
                 bi.back_a,
@@ -1317,38 +1423,46 @@ fn fit_transmission_lm(
                 bi.back_c,
                 di,
                 fi,
-            )
+            ))
         } else {
-            NormalizedTransmissionModel::new(
-                &*model,
+            Box::new(NormalizedTransmissionModel::new(
+                stacked,
                 config.energies(),
                 bi.anorm,
                 bi.back_a,
                 bi.back_b,
                 bi.back_c,
-            )
+            ))
         };
-        lm::levenberg_marquardt_with_mask(
-            &wrapped,
-            measured_t,
-            sigma,
-            &mut params,
-            &lm_cfg,
-            active_mask.as_deref(),
-        )?
-    } else {
-        lm::levenberg_marquardt_with_mask(
-            &*model,
-            measured_t,
-            sigma,
-            &mut params,
-            &lm_cfg,
-            active_mask.as_deref(),
-        )?
-    };
+    }
+    if let Some(bli) = bl_indices {
+        stacked = Box::new(MultiplicativeBaselineModel::new(
+            stacked,
+            config.energies(),
+            baseline_reference_energy(config.energies()),
+            bli.b0,
+            bli.b1,
+            bli.b2,
+        ));
+    }
+    let result = lm::levenberg_marquardt_with_mask(
+        &*stacked,
+        measured_t,
+        sigma,
+        &mut params,
+        &lm_cfg,
+        active_mask.as_deref(),
+    )?;
 
     let free_indices = params.free_indices();
-    let mut sr = extract_result(config, &result, n_density_params, &free_indices, bg_indices)?;
+    let mut sr = extract_result(
+        config,
+        &result,
+        n_density_params,
+        &free_indices,
+        bg_indices,
+        bl_indices,
+    )?;
 
     // Populate energy-scale results if fitted.
     if let Some((t0_idx, ls_idx)) = energy_scale_indices {
@@ -1411,6 +1525,14 @@ fn fit_transmission_poisson(
         .as_ref()
         .map(|bg| append_background_params(&mut param_vec, bg));
 
+    // Multiplicative-baseline parameters (issue #635) — appended LAST,
+    // same layout as the LM path.
+    validate_multiplicative_baseline(config)?;
+    let bl_indices = config
+        .multiplicative_baseline
+        .as_ref()
+        .map(|bl| append_multiplicative_baseline_params(&mut param_vec, bl));
+
     let mut params = ParameterSet::new(param_vec);
 
     // Build inner model (energy-scale or precomputed)
@@ -1420,11 +1542,14 @@ fn fit_transmission_poisson(
         build_transmission_model(config, n_density_params, temperature_index)?
     };
 
-    // Wrap with NormalizedTransmissionModel for background (same as LM)
-    let result = if let Some(bi) = bg_indices {
-        let wrapped = if let (Some(di), Some(fi)) = (bi.back_d, bi.back_f) {
-            NormalizedTransmissionModel::new_with_exponential(
-                &*model,
+    // Wrap with NormalizedTransmissionModel for background (same as LM),
+    // then MultiplicativeBaselineModel OUTERMOST (issue #635) — the same
+    // Box-stacking as the LM path.
+    let mut stacked: Box<dyn FitModel> = model;
+    if let Some(bi) = bg_indices {
+        stacked = if let (Some(di), Some(fi)) = (bi.back_d, bi.back_f) {
+            Box::new(NormalizedTransmissionModel::new_with_exponential(
+                stacked,
                 config.energies(),
                 bi.anorm,
                 bi.back_a,
@@ -1432,26 +1557,40 @@ fn fit_transmission_poisson(
                 bi.back_c,
                 di,
                 fi,
-            )
+            ))
         } else {
-            NormalizedTransmissionModel::new(
-                &*model,
+            Box::new(NormalizedTransmissionModel::new(
+                stacked,
                 config.energies(),
                 bi.anorm,
                 bi.back_a,
                 bi.back_b,
                 bi.back_c,
-            )
+            ))
         };
-        let pr = poisson::poisson_fit(&wrapped, measured_t, &mut params, poisson_cfg)?;
-        poisson_to_lm_result(&wrapped, measured_t, sigma, &pr, &params)
-    } else {
-        let pr = poisson::poisson_fit(&*model, measured_t, &mut params, poisson_cfg)?;
-        poisson_to_lm_result(&*model, measured_t, sigma, &pr, &params)
-    }?;
+    }
+    if let Some(bli) = bl_indices {
+        stacked = Box::new(MultiplicativeBaselineModel::new(
+            stacked,
+            config.energies(),
+            baseline_reference_energy(config.energies()),
+            bli.b0,
+            bli.b1,
+            bli.b2,
+        ));
+    }
+    let pr = poisson::poisson_fit(&*stacked, measured_t, &mut params, poisson_cfg)?;
+    let result = poisson_to_lm_result(&*stacked, measured_t, sigma, &pr, &params)?;
 
     let free_indices = params.free_indices();
-    let mut sr = extract_result(config, &result, n_density_params, &free_indices, bg_indices)?;
+    let mut sr = extract_result(
+        config,
+        &result,
+        n_density_params,
+        &free_indices,
+        bg_indices,
+        bl_indices,
+    )?;
 
     // Temperature (value and 1-σ) is fully populated by `extract_result`,
     // which maps the solver's FREE-only uncertainty vector through
@@ -1578,6 +1717,16 @@ fn fit_counts_joint_poisson(
         .as_ref()
         .map(|bg| append_background_params(&mut param_vec, bg));
 
+    // ── Multiplicative-baseline parameters (issue #635), appended LAST ──
+    // B(E) multiplies the model TRANSMISSION, so it flows through the
+    // profile λ̂ = Σc(O+S)/Σ(1+cT) exactly like any other T-shape change —
+    // no JP-specific wiring needed.
+    validate_multiplicative_baseline(config)?;
+    let bl_indices = config
+        .multiplicative_baseline
+        .as_ref()
+        .map(|bl| append_multiplicative_baseline_params(&mut param_vec, bl));
+
     let mut params = ParameterSet::new(param_vec);
 
     // ── Build pure transmission model ──
@@ -1627,42 +1776,41 @@ fn fit_counts_joint_poisson(
         }
     }
 
-    let result;
+    // Box-stack the wrappers (same as the LM / KL-transmission paths):
+    // inner physics → NormalizedTransmissionModel (if bg) →
+    // MultiplicativeBaselineModel (issue #635, OUTERMOST, if configured).
+    let mut stacked: Box<dyn FitModel> = t_model;
     if let Some(bi) = bg_indices {
-        let wrapped = NormalizedTransmissionModel::new(
-            &*t_model,
+        stacked = Box::new(NormalizedTransmissionModel::new(
+            stacked,
             config.energies(),
             bi.anorm,
             bi.back_a,
             bi.back_b,
             bi.back_c,
-        );
-        let objective = JointPoissonObjective {
-            model: &wrapped,
-            o: flux,
-            s: sample_counts,
-            c,
-            active_mask: active_mask_slice,
-        };
-        let mut cfg = jp_cfg.clone();
-        cfg.compute_covariance = config.compute_covariance;
-        result = joint_poisson::joint_poisson_fit(&objective, &mut params, &cfg).map_err(|e| {
-            PipelineError::InvalidParameter(format!("joint-Poisson fit failed: {e}"))
-        })?;
-    } else {
-        let objective = JointPoissonObjective {
-            model: &*t_model,
-            o: flux,
-            s: sample_counts,
-            c,
-            active_mask: active_mask_slice,
-        };
-        let mut cfg = jp_cfg.clone();
-        cfg.compute_covariance = config.compute_covariance;
-        result = joint_poisson::joint_poisson_fit(&objective, &mut params, &cfg).map_err(|e| {
-            PipelineError::InvalidParameter(format!("joint-Poisson fit failed: {e}"))
-        })?;
+        ));
     }
+    if let Some(bli) = bl_indices {
+        stacked = Box::new(MultiplicativeBaselineModel::new(
+            stacked,
+            config.energies(),
+            baseline_reference_energy(config.energies()),
+            bli.b0,
+            bli.b1,
+            bli.b2,
+        ));
+    }
+    let objective = JointPoissonObjective {
+        model: &*stacked,
+        o: flux,
+        s: sample_counts,
+        c,
+        active_mask: active_mask_slice,
+    };
+    let mut cfg = jp_cfg.clone();
+    cfg.compute_covariance = config.compute_covariance;
+    let result = joint_poisson::joint_poisson_fit(&objective, &mut params, &cfg)
+        .map_err(|e| PipelineError::InvalidParameter(format!("joint-Poisson fit failed: {e}")))?;
 
     // ── Extract fitted quantities ──
     let densities: Vec<f64> = (0..n_density_params).map(|i| result.params[i]).collect();
@@ -1705,6 +1853,20 @@ fn fit_counts_joint_poisson(
         (1.0, [0.0, 0.0, 0.0])
     };
 
+    // Multiplicative-baseline readout (issue #635) — mirrors extract_result.
+    let (baseline_out, baseline_e_ref_out) = if let Some(bli) = bl_indices {
+        (
+            Some([
+                result.params[bli.b0],
+                result.params[bli.b1],
+                result.params[bli.b2],
+            ]),
+            Some(baseline_reference_energy(config.energies())),
+        )
+    } else {
+        (None, None)
+    };
+
     Ok(SpectrumFitResult {
         densities,
         uncertainties,
@@ -1728,6 +1890,11 @@ fn fit_counts_joint_poisson(
         l_scale: energy_scale_indices.map(|(_, ls_idx)| result.params[ls_idx]),
         energy_scale_flight_path_m: energy_scale_indices.map(|_| config.flight_path_m),
         deviance_per_dof: Some(result.deviance_per_dof),
+        baseline: baseline_out,
+        baseline_e_ref_ev: baseline_e_ref_out,
+        warnings: degenerate_normalization_warning(config)
+            .into_iter()
+            .collect(),
     })
 }
 
@@ -2047,6 +2214,107 @@ pub(crate) fn validate_transmission_background(bg: &BackgroundConfig) -> Result<
     Ok(())
 }
 
+/// Validate a [`MultiplicativeBaselineConfig`] against the fit grid
+/// (issue #635).  Rejects:
+/// - non-finite inits or bounds, reversed bounds, inits outside bounds
+///   (silent clamping would move the caller's value — reject instead);
+/// - an initial baseline `B_init(E) <= 0` anywhere on the grid (the model's
+///   runtime positivity guard treats mid-iteration violations as rejected
+///   trial steps, but the INITIAL point must be valid);
+/// - a free SAMMY `Anorm` alongside (`b0` and `Anorm` are degenerate
+///   normalizations — never free two of them; hold `Anorm` fixed via
+///   `fit_anorm = false` to combine the additive ABC background with the
+///   baseline).
+///
+/// All-`false` fit flags are allowed: that is the frozen-baseline form the
+/// spatial global mode uses (the same fixed-parameter substrate as
+/// `with_fix_densities`).
+pub(crate) fn validate_multiplicative_baseline(
+    config: &UnifiedFitConfig,
+) -> Result<(), PipelineError> {
+    let Some(bl) = config.multiplicative_baseline() else {
+        return Ok(());
+    };
+    for (name, init, (lo, hi)) in [
+        ("b0", bl.b0_init, bl.b0_bounds),
+        ("b1", bl.b1_init, bl.b1_bounds),
+        ("b2", bl.b2_init, bl.b2_bounds),
+    ] {
+        if !init.is_finite() {
+            return Err(PipelineError::InvalidParameter(format!(
+                "multiplicative baseline: {name}_init must be finite, got {init}"
+            )));
+        }
+        if !lo.is_finite() || !hi.is_finite() || lo >= hi {
+            return Err(PipelineError::InvalidParameter(format!(
+                "multiplicative baseline: {name}_bounds must be finite with \
+                 lower < upper, got ({lo}, {hi})"
+            )));
+        }
+        if init < lo || init > hi {
+            return Err(PipelineError::InvalidParameter(format!(
+                "multiplicative baseline: {name}_init = {init} lies outside \
+                 {name}_bounds ({lo}, {hi})"
+            )));
+        }
+    }
+    // Initial-point positivity over the actual grid.
+    let e_ref = baseline_reference_energy(config.energies());
+    if !e_ref.is_finite() || e_ref <= 0.0 {
+        return Err(PipelineError::InvalidParameter(format!(
+            "multiplicative baseline: reference energy sqrt(E_min*E_max) is \
+             invalid ({e_ref}) — check the energy grid"
+        )));
+    }
+    for &e in config.energies() {
+        let z = (e / e_ref).ln();
+        let b = bl.b0_init + bl.b1_init * z + bl.b2_init * z * z;
+        let positive = b.is_finite() && b > 0.0;
+        if !positive {
+            return Err(PipelineError::InvalidParameter(format!(
+                "multiplicative baseline: initial B(E) = {b} is not strictly \
+                 positive at E = {e} eV — adjust the b0/b1/b2 inits"
+            )));
+        }
+    }
+    if config
+        .transmission_background()
+        .is_some_and(|bg| bg.fit_anorm)
+    {
+        return Err(PipelineError::InvalidParameter(
+            "multiplicative baseline and a FREE SAMMY Anorm cannot be fitted \
+             together: b0 and Anorm are degenerate normalizations. Set \
+             BackgroundConfig::fit_anorm = false to combine the additive ABC \
+             background with the baseline."
+                .into(),
+        ));
+    }
+    Ok(())
+}
+
+/// A free SAMMY `Anorm` together with a free temperature and at least one
+/// free density is a degenerate normalization trio on real data (observed on
+/// VENUS transmission: T ran to 4471 K with n +76 % and chi2/nu 932, with no
+/// warning).  Returns a warning string rather than an error: the combination
+/// is SAMMY-legal and can converge on synthetic data.
+pub(crate) fn degenerate_normalization_warning(config: &UnifiedFitConfig) -> Option<String> {
+    let anorm_free = config
+        .transmission_background()
+        .is_some_and(|bg| bg.fit_anorm);
+    if anorm_free && config.fit_temperature && config.n_free_density_params() >= 1 {
+        Some(
+            "fit configuration frees Anorm, temperature, AND at least one \
+             density together — a degenerate normalization trio on real data \
+             (observed: T ran to 4471 K with chi2/nu 932 and no warning). \
+             Consider with_multiplicative_baseline (bounded normalization) \
+             and/or with_fix_densities (known areal density)."
+                .to_string(),
+        )
+    } else {
+        None
+    }
+}
+
 /// Validate a caller-supplied precomputed cross-section stack against the
 /// config's grid and isotope/group mapping, BEFORE it reaches the forward-model
 /// builders or the per-pixel rayon loop.
@@ -2209,6 +2477,8 @@ pub(crate) fn validate_precomputed_cross_sections(
 ///   up-front, but this helper counts them as free when set so the
 ///   fail-fast diagnostic ordering (`underdetermined > BackD/BackF
 ///   reject`) does not flip across paths.
+/// * For a multiplicative_baseline (issue #635), the count of `true`
+///   flags on `(fit_b0, fit_b1, fit_b2)`.
 ///
 /// Used both by [`validate_spatial_fit_preflight`] (whole-map
 /// rejection) and by the per-pixel LM / JP dispatchers
@@ -2235,6 +2505,11 @@ pub(crate) fn count_free_params(config: &UnifiedFitConfig) -> usize {
         n_free += usize::from(bg.fit_back_c);
         n_free += usize::from(bg.fit_back_d);
         n_free += usize::from(bg.fit_back_f);
+    }
+    if let Some(bl) = config.multiplicative_baseline.as_ref() {
+        n_free += usize::from(bl.fit_b0);
+        n_free += usize::from(bl.fit_b1);
+        n_free += usize::from(bl.fit_b2);
     }
     n_free
 }
@@ -2367,6 +2642,61 @@ fn append_background_params(
     }
 }
 
+/// Append the three multiplicative-baseline coefficients (issue #635) to the
+/// parameter vector, mirroring [`append_background_params`].
+///
+/// Bounds come from the caller-visible [`MultiplicativeBaselineConfig`]
+/// (validated finite / lo < hi / init-in-bounds by
+/// [`validate_multiplicative_baseline`] before any fitter reaches this
+/// helper).  A `fit_*` flag of `false` freezes the coefficient at its init
+/// via [`FitParameter::fixed`] — the same substrate as frozen densities, so
+/// `count_free_params` and the LM free-index mapping handle it without
+/// special cases.  All three slots are ALWAYS pushed (fixed or free): the
+/// wrapper model indexes them unconditionally.
+fn append_multiplicative_baseline_params(
+    param_vec: &mut Vec<FitParameter>,
+    bl: &MultiplicativeBaselineConfig,
+) -> BaselineIndices {
+    let b0 = param_vec.len();
+    param_vec.push(if bl.fit_b0 {
+        FitParameter {
+            name: "baseline_b0".into(),
+            value: bl.b0_init,
+            lower: bl.b0_bounds.0,
+            upper: bl.b0_bounds.1,
+            fixed: false,
+        }
+    } else {
+        FitParameter::fixed("baseline_b0", bl.b0_init)
+    });
+    let b1 = param_vec.len();
+    param_vec.push(if bl.fit_b1 {
+        FitParameter {
+            name: "baseline_b1".into(),
+            value: bl.b1_init,
+            lower: bl.b1_bounds.0,
+            upper: bl.b1_bounds.1,
+            fixed: false,
+        }
+    } else {
+        FitParameter::fixed("baseline_b1", bl.b1_init)
+    });
+    let b2 = param_vec.len();
+    param_vec.push(if bl.fit_b2 {
+        FitParameter {
+            name: "baseline_b2".into(),
+            value: bl.b2_init,
+            lower: bl.b2_bounds.0,
+            upper: bl.b2_bounds.1,
+            fixed: false,
+        }
+    } else {
+        FitParameter::fixed("baseline_b2", bl.b2_init)
+    });
+
+    BaselineIndices { b0, b1, b2 }
+}
+
 /// Build an [`EnergyScaleTransmissionModel`] for the energy-scale fit branch
 /// of `fit_transmission_lm` / `fit_transmission_poisson` /
 /// `fit_counts_joint_poisson`.
@@ -2443,8 +2773,89 @@ fn build_transmission_model(
     temperature_index: Option<usize>,
 ) -> Result<Box<dyn FitModel>, PipelineError> {
     let n_params = config.n_density_params();
+
+    // No-temperature fit without caller-precomputed σ: compute the
+    // working-grid σ HERE (same primitive `evaluate_jacobian_and_fisher`
+    // uses) so this path also returns a `PrecomputedTransmissionModel`.
+    //
+    // Before issue #635 this case fell through to `TransmissionFitModel`,
+    // whose constructor only builds `base_xs` when a temperature index is
+    // present — so `analytical_jacobian` returned `None` and every
+    // downstream consumer silently degraded to finite differences.  For
+    // the LM path that is a hidden slowdown; for the joint-Poisson
+    // stage-1 the degradation is to an IDENTITY-Fisher fallback (plain
+    // projected gradient descent), which crawls once the parameter vector
+    // couples several correlated columns (density + b0/b1/b2 of the
+    // multiplicative baseline needed >3000 iterations to cross a valley
+    // damped-Fisher clears in tens).  σ is computed once per fit — the
+    // same work `TransmissionFitModel` would have done lazily on its
+    // first `evaluate()`.
+    let computed_xs_storage;
+    let effective_precomputed: Option<&Arc<Vec<Vec<f64>>>> = if config.fit_temperature {
+        None
+    } else if let Some(xs) = &config.precomputed_cross_sections {
+        Some(xs)
+    } else {
+        let instrument = config
+            .resolution
+            .clone()
+            .map(|r| Arc::new(InstrumentParams { resolution: r }));
+        let working = nereids_physics::transmission::broadened_cross_sections_on_working_grid(
+            config.energies(),
+            &config.resonance_data,
+            config.temperature_k,
+            instrument.as_deref(),
+            None,
+        )
+        .map_err(PipelineError::Transmission)?;
+        if working.layout.is_identity() {
+            // Tabulated / no resolution: the working grid IS the data grid.
+            computed_xs_storage = Arc::new(working.sigma);
+            Some(&computed_xs_storage)
+        } else {
+            // Gaussian aux grid (#608): resolution must be applied on the
+            // working grid and the data points extracted last.  Collapse
+            // per-isotope σ into per-parameter σ_eff (identity mapping when
+            // no groups are configured), then build the model directly with
+            // the working σ + layout.
+            let (density_indices, density_ratios) = (
+                config
+                    .density_indices
+                    .clone()
+                    .unwrap_or_else(|| (0..n_params).collect()),
+                config
+                    .density_ratios
+                    .clone()
+                    .unwrap_or_else(|| vec![1.0; config.resonance_data.len()]),
+            );
+            let n_e = working.sigma[0].len();
+            let mut eff = vec![vec![0.0f64; n_e]; n_params];
+            for ((&idx, &ratio), member_xs) in density_indices
+                .iter()
+                .zip(density_ratios.iter())
+                .zip(working.sigma.iter())
+            {
+                for (j, &sigma) in member_xs.iter().enumerate() {
+                    eff[idx][j] += ratio * sigma;
+                }
+            }
+            return Ok(Box::new(PrecomputedTransmissionModel {
+                cross_sections: Arc::new(eff),
+                density_indices: Arc::new((0..n_params).collect()),
+                energies: instrument
+                    .as_ref()
+                    .map(|_| Arc::new(config.energies.clone())),
+                instrument,
+                resolution_plan: None,
+                sparse_cubature_plan: None,
+                sparse_scalar_plan: None,
+                work_layout: Some(Arc::new(working.layout)),
+            }));
+        }
+    };
+
     if !config.fit_temperature
-        && let Some(xs) = &config.precomputed_cross_sections
+        && let Some(xs) = effective_precomputed
     {
         // When groups are active, compute σ_eff per group from member XS.
         // For ungrouped isotopes, this is a no-op (identity mapping, ratio=1.0).
@@ -2617,8 +3028,25 @@ fn extract_result(
     n_density_params: usize,
     free_indices: &[usize],
     bg_indices: Option<BackgroundIndices>,
+    bl_indices: Option<BaselineIndices>,
 ) -> Result<SpectrumFitResult, PipelineError> {
     let densities: Vec<f64> = (0..n_density_params).map(|i| result.params[i]).collect();
+
+    // Multiplicative baseline readout (issue #635): report the coefficients
+    // the model actually used (fixed or free) plus the E_ref the ln-basis
+    // was centered on, so consumers reconstruct B(E) exactly.
+    let (baseline, baseline_e_ref_ev) = if let Some(bli) = bl_indices {
+        (
+            Some([
+                result.params[bli.b0],
+                result.params[bli.b1],
+                result.params[bli.b2],
+            ]),
+            Some(baseline_reference_energy(config.energies())),
+        )
+    } else {
+        (None, None)
+    };
 
     let (anorm, background, back_d, back_f): (f64, [f64; 3], Option<f64>, Option<f64>) =
         if let Some(bi) = bg_indices {
@@ -2701,6 +3129,11 @@ fn extract_result(
         l_scale: None,
         energy_scale_flight_path_m: None,
         deviance_per_dof: None,
+        baseline,
+        baseline_e_ref_ev,
+        warnings: degenerate_normalization_warning(config)
+            .into_iter()
+            .collect(),
     })
 }
 
@@ -2762,6 +3195,23 @@ pub fn evaluate_jacobian_and_fisher(
     // guard the same way as `fit_spectrum_typed` / `spatial_map_typed` so all
     // three surface the same typed `ShapeMismatch` at the boundary.
     validate_precomputed_cross_sections(config)?;
+
+    // The multiplicative baseline (issue #635) is NOT wired into this
+    // research helper: its parameter layout below is frozen for Epic #394
+    // research-script compatibility (kl_b0/kl_b1 stand in for the
+    // transmission background; the production anorm/ABC block is likewise
+    // absent).  Silently ignoring a configured baseline would report a
+    // Jacobian/Fisher for a DIFFERENT model than the caller asked for —
+    // reject explicitly instead.
+    if config.multiplicative_baseline.is_some() {
+        return Err(PipelineError::InvalidParameter(
+            "evaluate_jacobian_and_fisher does not support a multiplicative \
+             baseline: its parameter layout is frozen for research-script \
+             compatibility (kl_b0/kl_b1 background stand-ins). Remove \
+             with_multiplicative_baseline from the config for this helper."
+                .into(),
+        ));
+    }
 
     let n_density_params = config.n_density_params();
 
@@ -3177,6 +3627,34 @@ pub struct SpectrumFitResult {
     /// `None` for the LM path and for transmission + PoissonKL (those
     /// populate `reduced_chi_squared` with Pearson χ² / (n−k) instead).
     pub deviance_per_dof: Option<f64>,
+    /// Fitted multiplicative-baseline coefficients `[b0, b1, b2]` (issue
+    /// #635) for
+    ///
+    /// ```text
+    /// B(E) = b0 + b1·ln(E/E_ref) + b2·ln²(E/E_ref)
+    /// ```
+    ///
+    /// applied OUTERMOST: `y(E) = B(E)·[Anorm·T + additive background]`.
+    /// `None` when no multiplicative baseline was configured (values that
+    /// were configured but frozen via `fit_b0/b1/b2 = false` still report
+    /// `Some` — they are part of the model that produced the fit).
+    pub baseline: Option<[f64; 3]>,
+    /// Reference energy `E_ref` (eV) the baseline's `ln(E/E_ref)` basis was
+    /// centered on — the geometric midpoint `√(E_min·E_max)` of the fit
+    /// grid, stored so consumers reconstruct `B(E)` with the EXACT
+    /// reference the fit used (the same resupply-mismatch channel
+    /// [`Self::energy_scale_flight_path_m`] closes for the energy scale).
+    /// `None` when no multiplicative baseline was configured.
+    pub baseline_e_ref_ev: Option<f64>,
+    /// Structured fit-configuration warnings (issue #635).  Non-fatal
+    /// conditions the caller should surface to the user — currently the
+    /// degenerate normalization trio (free `Anorm` + free temperature +
+    /// ≥1 free density), which on real VENUS data converged to T = 4471 K
+    /// with χ²/ν = 932 and no diagnostic.  Empty when nothing is flagged.
+    /// A `Vec<String>` rather than tracing: nereids-pipeline has no
+    /// tracing dependency, and structured warnings survive across the
+    /// PyO3 / GUI boundaries.
+    pub warnings: Vec<String>,
 }
 
 impl SpectrumFitResult {
@@ -3813,7 +4291,7 @@ mod tests {
         };
 
         // Single free density → its full-layout index 0 is also free-index 0.
-        let extracted = extract_result(&config, &result, 1, &[0], None).unwrap();
+        let extracted = extract_result(&config, &result, 1, &[0], None, None).unwrap();
         assert!(!extracted.converged);
         assert!(
             extracted.uncertainties.is_none(),
@@ -4528,7 +5006,18 @@ mod tests {
     fn test_lm_uncertainty_not_regressed() {
         let data = u238_single_resonance();
         let energies: Vec<f64> = (0..201).map(|i| 1.0 + (i as f64) * 0.05).collect();
-        let (t, sigma) = synthetic_transmission(&data, 0.001, &energies);
+        let (t_clean, sigma) = synthetic_transmission(&data, 0.001, &energies);
+        // Deterministic pseudo-noise at ~0.2 % relative (σ is 1 % relative):
+        // the covariance is scaled by χ²/ν (#108.1), so EXACTLY noise-free
+        // data drives χ² → 0 once the analytic-Jacobian fit converges
+        // machine-exactly, collapsing the scaled covariance to zero — a
+        // degenerate oracle, not a solver regression.  Real data always has
+        // χ² > 0; emulate that with a seed-free perturbation.
+        let t: Vec<f64> = t_clean
+            .iter()
+            .enumerate()
+            .map(|(i, &v)| v * (1.0 + 0.002 * (7.3 * i as f64).sin()))
+            .collect();
 
         let config = UnifiedFitConfig::new(
             energies,
@@ -4987,6 +5476,9 @@ mod tests {
             l_scale: ls,
             energy_scale_flight_path_m: fp,
             deviance_per_dof: None,
+            baseline: None,
+            baseline_e_ref_ev: None,
+            warnings: Vec::new(),
         };
 
         // Fitted energy scale → Some(corrected grid) == the canonical
@@ -6560,7 +7052,7 @@ mod tests {
             uncertainties: Some(vec![0.02, 4.0]),
         };
 
-        let extracted = extract_result(&config, &result, 2, &[1, 2], None).unwrap();
+        let extracted = extract_result(&config, &result, 2, &[1, 2], None, None).unwrap();
         let unc = extracted
             .uncertainties
             .expect("converged fit surfaces density uncertainties");
@@ -6613,5 +7105,515 @@ mod tests {
             fitted_temp.is_finite() && fitted_temp > 1.0,
             "biased-density fit must yield a finite temperature, got {fitted_temp}"
         );
+    }
+
+    // ── Issue #635: bounded multiplicative baseline ─────────────────────────
+
+    /// Truth baseline used by the closed loops: a few % off unity, curved,
+    /// strictly positive over the test grids, inside the DEFAULT bounds.
+    const BL_TRUE: [f64; 3] = [1.02, -0.03, 0.01];
+
+    fn baseline_at(e: f64, e_ref: f64, b: &[f64; 3]) -> f64 {
+        let z = (e / e_ref).ln();
+        b[0] + b[1] * z + b[2] * z * z
+    }
+
+    /// Multiply a clean transmission by the truth baseline, with a
+    /// non-vacuity pre-check: the injected baseline must actually move the
+    /// data, otherwise the closed-loop oracle is trivially satisfiable.
+    fn apply_truth_baseline(t: &[f64], energies: &[f64]) -> Vec<f64> {
+        let e_ref = baseline_reference_energy(energies);
+        let out: Vec<f64> = t
+            .iter()
+            .zip(energies.iter())
+            .map(|(&ti, &e)| ti * baseline_at(e, e_ref, &BL_TRUE))
+            .collect();
+        let max_rel = t
+            .iter()
+            .zip(out.iter())
+            .map(|(&a, &b)| ((b - a) / a.max(1e-12)).abs())
+            .fold(0.0_f64, f64::max);
+        assert!(
+            max_rel > 0.01,
+            "non-vacuity pre-check: injected baseline moved the data by only \
+             {max_rel:.2e} (max relative) — the closed loop would not \
+             distinguish baseline-on from baseline-off"
+        );
+        out
+    }
+
+    #[test]
+    fn baseline_lm_closed_loop_recovers_temperature_and_coefficients() {
+        let data = u238_single_resonance();
+        let true_density = 0.002;
+        let true_temp = 600.0;
+        let energies: Vec<f64> = (0..201).map(|i| 1.0 + (i as f64) * 0.05).collect();
+        let (t_pure, _) = synthetic_transmission_at_temp(&data, true_density, true_temp, &energies);
+        let measured = apply_truth_baseline(&t_pure, &energies);
+        let sigma: Vec<f64> = measured.iter().map(|&v| 0.01 * v.max(0.01)).collect();
+        let e_ref = baseline_reference_energy(&energies);
+
+        // Density frozen at truth (the production thermometry pattern the
+        // baseline was designed for); temperature seeded 100 K low; baseline
+        // seeded at the identity (1, 0, 0) — all seeds away from truth.
+        let config = UnifiedFitConfig::new(
+            energies,
+            vec![data],
+            vec!["U-238".into()],
+            500.0,
+            None,
+            vec![true_density],
+        )
+        .unwrap()
+        .with_solver(SolverConfig::LevenbergMarquardt(LmConfig::default()))
+        .with_fit_temperature(true)
+        .with_fix_densities(true)
+        .with_multiplicative_baseline(MultiplicativeBaselineConfig::default());
+
+        let input = InputData::Transmission {
+            transmission: measured,
+            uncertainty: sigma,
+        };
+        let result = fit_spectrum_typed(&input, &config).unwrap();
+        assert!(result.converged, "baseline LM closed loop should converge");
+
+        let fitted_temp = result.temperature_k.expect("temperature fitted");
+        assert!(
+            (fitted_temp - true_temp).abs() < 10.0,
+            "temperature: fitted={fitted_temp}, true={true_temp}"
+        );
+
+        let b = result.baseline.expect("baseline fitted");
+        for (i, (&fitted, &truth)) in b.iter().zip(BL_TRUE.iter()).enumerate() {
+            assert!(
+                (fitted - truth).abs() < 1e-2,
+                "b{i}: fitted={fitted}, true={truth}"
+            );
+        }
+        let bl_cfg = MultiplicativeBaselineConfig::default();
+        for (i, (&fitted, bounds)) in b
+            .iter()
+            .zip([bl_cfg.b0_bounds, bl_cfg.b1_bounds, bl_cfg.b2_bounds].iter())
+            .enumerate()
+        {
+            assert!(
+                fitted >= bounds.0 && fitted <= bounds.1,
+                "b{i} = {fitted} escaped its bounds {bounds:?}"
+            );
+        }
+        let reported_e_ref = result.baseline_e_ref_ev.expect("e_ref reported");
+        assert!(
+            (reported_e_ref - e_ref).abs() < 1e-12,
+            "reported E_ref {reported_e_ref} != geometric midpoint {e_ref}"
+        );
+        assert!(
+            result.warnings.is_empty(),
+            "no degenerate trio here — warnings should be empty, got {:?}",
+            result.warnings
+        );
+    }
+
+    #[test]
+    fn baseline_kl_transmission_closed_loop() {
+        let data = u238_single_resonance();
+        let true_density = 0.002;
+        let energies: Vec<f64> = (0..201).map(|i| 1.0 + (i as f64) * 0.05).collect();
+        let (t_pure, _) = synthetic_transmission(&data, true_density, &energies);
+        let measured = apply_truth_baseline(&t_pure, &energies);
+        let sigma: Vec<f64> = measured.iter().map(|&v| 0.01 * v.max(0.01)).collect();
+
+        let config = UnifiedFitConfig::new(
+            energies,
+            vec![data],
+            vec!["U-238".into()],
+            0.0,
+            None,
+            vec![0.001],
+        )
+        .unwrap()
+        .with_solver(SolverConfig::PoissonKL(PoissonConfig {
+            max_iter: 500,
+            ..PoissonConfig::default()
+        }))
+        .with_multiplicative_baseline(MultiplicativeBaselineConfig::default());
+
+        let input = InputData::Transmission {
+            transmission: measured,
+            uncertainty: sigma,
+        };
+        let result = fit_spectrum_typed(&input, &config).unwrap();
+        assert!(result.converged, "baseline KL closed loop should converge");
+        let fitted = result.densities[0];
+        assert!(
+            (fitted - true_density).abs() / true_density < 0.02,
+            "density: fitted={fitted}, true={true_density}"
+        );
+        let b = result.baseline.expect("baseline fitted");
+        for (i, (&fit_b, &truth)) in b.iter().zip(BL_TRUE.iter()).enumerate() {
+            assert!(
+                (fit_b - truth).abs() < 1e-2,
+                "b{i}: fitted={fit_b}, true={truth}"
+            );
+        }
+    }
+
+    #[test]
+    fn baseline_counts_jp_closed_loop() {
+        let data = u238_single_resonance();
+        let true_density = 0.002;
+        let energies: Vec<f64> = (0..201).map(|i| 1.0 + (i as f64) * 0.05).collect();
+        let (t_pure, _) = synthetic_transmission(&data, true_density, &energies);
+        let t_baselined = apply_truth_baseline(&t_pure, &energies);
+        let i0 = 10_000.0;
+        let open_beam: Vec<f64> = vec![i0; t_baselined.len()];
+        let sample: Vec<f64> = t_baselined
+            .iter()
+            .map(|&v| (v * i0).round().max(0.0))
+            .collect();
+
+        let config = UnifiedFitConfig::new(
+            energies,
+            vec![data],
+            vec!["U-238".into()],
+            0.0,
+            None,
+            vec![0.001],
+        )
+        .unwrap()
+        .with_solver(SolverConfig::PoissonKL(PoissonConfig::default()))
+        .with_multiplicative_baseline(MultiplicativeBaselineConfig::default());
+
+        let input = InputData::Counts {
+            sample_counts: sample,
+            open_beam_counts: open_beam,
+        };
+        let result = fit_spectrum_typed(&input, &config).unwrap();
+        assert!(result.converged, "baseline JP closed loop should converge");
+        assert!(
+            result.deviance_per_dof.is_some(),
+            "counts-KL path reports deviance"
+        );
+        let fitted = result.densities[0];
+        assert!(
+            (fitted - true_density).abs() / true_density < 0.02,
+            "density: fitted={fitted}, true={true_density}"
+        );
+        let b = result.baseline.expect("baseline fitted");
+        for (i, (&fit_b, &truth)) in b.iter().zip(BL_TRUE.iter()).enumerate() {
+            assert!(
+                (fit_b - truth).abs() < 1e-2,
+                "b{i}: fitted={fit_b}, true={truth}"
+            );
+        }
+    }
+
+    /// b0 and Anorm are degenerate normalizations — a free Anorm alongside
+    /// the baseline must be rejected on EVERY solver path (the #641 lesson:
+    /// audit all parallel dispatches, not just the one under edit).
+    #[test]
+    fn baseline_rejects_free_anorm_on_all_paths() {
+        let data = u238_single_resonance();
+        let energies: Vec<f64> = (0..51).map(|i| 1.0 + (i as f64) * 0.2).collect();
+        let (t, sigma) = synthetic_transmission(&data, 0.002, &energies);
+
+        let base_config = UnifiedFitConfig::new(
+            energies.clone(),
+            vec![data],
+            vec!["U-238".into()],
+            0.0,
+            None,
+            vec![0.001],
+        )
+        .unwrap()
+        // BackgroundConfig::default() has fit_anorm = true — the rejected combo.
+        .with_transmission_background(BackgroundConfig::default())
+        .with_multiplicative_baseline(MultiplicativeBaselineConfig::default());
+
+        let transmission_input = InputData::Transmission {
+            transmission: t.clone(),
+            uncertainty: sigma,
+        };
+        let counts_input = InputData::Counts {
+            sample_counts: t.iter().map(|&v| (v * 1000.0).round()).collect(),
+            open_beam_counts: vec![1000.0; energies.len()],
+        };
+
+        for (label, input, solver) in [
+            (
+                "LM transmission",
+                &transmission_input,
+                SolverConfig::LevenbergMarquardt(LmConfig::default()),
+            ),
+            (
+                "KL transmission",
+                &transmission_input,
+                SolverConfig::PoissonKL(PoissonConfig::default()),
+            ),
+            (
+                "joint-Poisson counts",
+                &counts_input,
+                SolverConfig::PoissonKL(PoissonConfig::default()),
+            ),
+        ] {
+            let config = base_config.clone().with_solver(solver);
+            let err = fit_spectrum_typed(input, &config)
+                .expect_err(&format!("{label}: free Anorm + baseline must be rejected"));
+            let msg = err.to_string();
+            assert!(
+                msg.contains("Anorm") && msg.contains("fit_anorm = false"),
+                "{label}: rejection must name the degeneracy and the fix, got: {msg}"
+            );
+        }
+    }
+
+    /// The additive ABC background WITH Anorm HELD FIXED is the sanctioned
+    /// combination alongside the baseline — it must fit, and report both
+    /// parameter blocks.
+    #[test]
+    fn baseline_with_fixed_anorm_abc_accepted() {
+        let data = u238_single_resonance();
+        let true_density = 0.002;
+        let energies: Vec<f64> = (0..201).map(|i| 1.0 + (i as f64) * 0.05).collect();
+        let (t_pure, _) = synthetic_transmission(&data, true_density, &energies);
+        let measured = apply_truth_baseline(&t_pure, &energies);
+        let sigma: Vec<f64> = measured.iter().map(|&v| 0.01 * v.max(0.01)).collect();
+
+        let config = UnifiedFitConfig::new(
+            energies,
+            vec![data],
+            vec!["U-238".into()],
+            0.0,
+            None,
+            vec![0.001],
+        )
+        .unwrap()
+        .with_solver(SolverConfig::LevenbergMarquardt(LmConfig::default()))
+        .with_transmission_background(BackgroundConfig {
+            fit_anorm: false,
+            ..BackgroundConfig::default()
+        })
+        .with_multiplicative_baseline(MultiplicativeBaselineConfig::default());
+
+        let input = InputData::Transmission {
+            transmission: measured,
+            uncertainty: sigma,
+        };
+        let result = fit_spectrum_typed(&input, &config).unwrap();
+        assert!(result.converged, "fixed-Anorm + ABC + baseline should fit");
+        assert!(
+            (result.anorm - 1.0).abs() < f64::EPSILON,
+            "Anorm was frozen at 1.0, got {}",
+            result.anorm
+        );
+        assert!(result.baseline.is_some(), "baseline block reported");
+        // The truth signal is purely multiplicative, so the additive ABC
+        // terms should stay small and the baseline should carry the shape.
+        let b = result.baseline.unwrap();
+        assert!(
+            (b[0] - BL_TRUE[0]).abs() < 0.02,
+            "b0: fitted={}, true={}",
+            b[0],
+            BL_TRUE[0]
+        );
+    }
+
+    #[test]
+    fn baseline_validation_rejects_bad_configs() {
+        let data = u238_single_resonance();
+        let energies: Vec<f64> = (0..51).map(|i| 1.0 + (i as f64) * 0.2).collect();
+        let (t, sigma) = synthetic_transmission(&data, 0.002, &energies);
+        let input = InputData::Transmission {
+            transmission: t,
+            uncertainty: sigma,
+        };
+        let mk_config = |bl: MultiplicativeBaselineConfig| {
+            UnifiedFitConfig::new(
+                energies.clone(),
+                vec![data.clone()],
+                vec!["U-238".into()],
+                0.0,
+                None,
+                vec![0.001],
+            )
+            .unwrap()
+            .with_solver(SolverConfig::LevenbergMarquardt(LmConfig::default()))
+            .with_multiplicative_baseline(bl)
+        };
+
+        // Non-finite init.
+        let err = fit_spectrum_typed(
+            &input,
+            &mk_config(MultiplicativeBaselineConfig {
+                b0_init: f64::NAN,
+                ..MultiplicativeBaselineConfig::default()
+            }),
+        )
+        .expect_err("NaN b0_init must be rejected");
+        assert!(err.to_string().contains("b0_init must be finite"));
+
+        // Reversed bounds.
+        let err = fit_spectrum_typed(
+            &input,
+            &mk_config(MultiplicativeBaselineConfig {
+                b1_bounds: (0.05, -0.05),
+                ..MultiplicativeBaselineConfig::default()
+            }),
+        )
+        .expect_err("reversed b1_bounds must be rejected");
+        assert!(err.to_string().contains("b1_bounds"));
+
+        // Init outside bounds (no silent clamping).
+        let err = fit_spectrum_typed(
+            &input,
+            &mk_config(MultiplicativeBaselineConfig {
+                b0_init: 1.5,
+                ..MultiplicativeBaselineConfig::default()
+            }),
+        )
+        .expect_err("out-of-bounds b0_init must be rejected");
+        assert!(err.to_string().contains("outside"));
+
+        // Initial B(E) <= 0 somewhere on the grid: legal coefficients under
+        // WIDENED bounds, but the slope drives B negative at the low edge
+        // (grid 1..11 eV, e_ref ~ 3.3 eV, z_min ~ -1.2: 0.3 + 0.4*(-1.2) < 0
+        // ... need |b1*z| > b0; use b1 = 0.4, b0 = 0.3 on a wider grid).
+        let wide_energies: Vec<f64> = (0..51).map(|i| 1.0 * 1.1f64.powi(i)).collect();
+        let (wt, ws) = synthetic_transmission(&data, 0.002, &wide_energies);
+        let wide_input = InputData::Transmission {
+            transmission: wt,
+            uncertainty: ws,
+        };
+        let wide_config = UnifiedFitConfig::new(
+            wide_energies,
+            vec![data.clone()],
+            vec!["U-238".into()],
+            0.0,
+            None,
+            vec![0.001],
+        )
+        .unwrap()
+        .with_solver(SolverConfig::LevenbergMarquardt(LmConfig::default()))
+        .with_multiplicative_baseline(MultiplicativeBaselineConfig {
+            b0_init: 0.3,
+            b1_init: 0.4,
+            b0_bounds: (0.1, 1.1),
+            b1_bounds: (-1.0, 1.0),
+            ..MultiplicativeBaselineConfig::default()
+        });
+        let err = fit_spectrum_typed(&wide_input, &wide_config)
+            .expect_err("non-positive initial B(E) must be rejected");
+        assert!(err.to_string().contains("not strictly"), "got: {err}");
+    }
+
+    #[test]
+    fn degenerate_trio_produces_warning() {
+        let data = u238_single_resonance();
+        let energies: Vec<f64> = (0..51).map(|i| 1.0 + (i as f64) * 0.2).collect();
+
+        let trio = UnifiedFitConfig::new(
+            energies.clone(),
+            vec![data.clone()],
+            vec!["U-238".into()],
+            300.0,
+            None,
+            vec![0.001],
+        )
+        .unwrap()
+        .with_fit_temperature(true)
+        .with_transmission_background(BackgroundConfig::default());
+        let w = degenerate_normalization_warning(&trio)
+            .expect("free Anorm + free T + free density must warn");
+        assert!(w.contains("degenerate"), "warning names the failure: {w}");
+
+        // Removing ANY leg of the trio silences the warning.
+        let frozen_density = trio.clone().with_fix_densities(true);
+        assert!(degenerate_normalization_warning(&frozen_density).is_none());
+        let no_temp = trio.clone().with_fit_temperature(false);
+        assert!(degenerate_normalization_warning(&no_temp).is_none());
+        let fixed_anorm = trio.clone().with_transmission_background(BackgroundConfig {
+            fit_anorm: false,
+            ..BackgroundConfig::default()
+        });
+        assert!(degenerate_normalization_warning(&fixed_anorm).is_none());
+
+        // End-to-end: the warning must surface on the fit RESULT (the whole
+        // point — the field failure was silent).
+        let (t, sigma) = synthetic_transmission(&data, 0.002, &energies);
+        let input = InputData::Transmission {
+            transmission: t,
+            uncertainty: sigma,
+        };
+        let config = trio.with_solver(SolverConfig::LevenbergMarquardt(LmConfig {
+            max_iter: 5,
+            ..LmConfig::default()
+        }));
+        let result = fit_spectrum_typed(&input, &config).unwrap();
+        assert!(
+            result.warnings.iter().any(|w| w.contains("degenerate")),
+            "fit result must carry the degenerate-trio warning, got {:?}",
+            result.warnings
+        );
+    }
+
+    #[test]
+    fn count_free_params_includes_baseline_flags() {
+        let data = u238_single_resonance();
+        let energies: Vec<f64> = (0..11).map(|i| 1.0 + (i as f64) * 0.1).collect();
+        let base = UnifiedFitConfig::new(
+            energies,
+            vec![data],
+            vec!["U-238".into()],
+            0.0,
+            None,
+            vec![0.001],
+        )
+        .unwrap();
+        let n0 = count_free_params(&base);
+
+        let all_free = base
+            .clone()
+            .with_multiplicative_baseline(MultiplicativeBaselineConfig::default());
+        assert_eq!(count_free_params(&all_free), n0 + 3);
+
+        let one_frozen = base
+            .clone()
+            .with_multiplicative_baseline(MultiplicativeBaselineConfig {
+                fit_b1: false,
+                ..MultiplicativeBaselineConfig::default()
+            });
+        assert_eq!(count_free_params(&one_frozen), n0 + 2);
+
+        let frozen = base
+            .clone()
+            .with_multiplicative_baseline(MultiplicativeBaselineConfig {
+                fit_b0: false,
+                fit_b1: false,
+                fit_b2: false,
+                ..MultiplicativeBaselineConfig::default()
+            });
+        assert_eq!(count_free_params(&frozen), n0);
+    }
+
+    #[test]
+    fn evaluate_jacobian_and_fisher_rejects_baseline() {
+        let data = u238_single_resonance();
+        let energies: Vec<f64> = (0..11).map(|i| 1.0 + (i as f64) * 0.1).collect();
+        let n = energies.len();
+        let config = UnifiedFitConfig::new(
+            energies,
+            vec![data],
+            vec!["U-238".into()],
+            0.0,
+            None,
+            vec![0.001],
+        )
+        .unwrap()
+        .with_multiplicative_baseline(MultiplicativeBaselineConfig::default());
+        // `.err().expect(...)` — ModelJacobianResult is not Debug, so
+        // `expect_err` is unavailable.
+        let err = evaluate_jacobian_and_fisher(&config, &vec![1000.0; n], &vec![0.0; n])
+            .err()
+            .expect("research Fisher helper must reject a baseline config");
+        assert!(err.to_string().contains("multiplicative"), "got: {err}");
     }
 }
