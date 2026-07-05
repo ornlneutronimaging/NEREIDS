@@ -7,5 +7,6 @@
 pub mod constants;
 pub mod elements;
 pub mod error;
+pub mod stats;
 pub mod types;
 pub mod validation;

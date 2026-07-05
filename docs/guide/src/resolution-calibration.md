@@ -97,22 +97,42 @@ cal = nereids.calibrate_resolution(
     base_udr=udr,                       # required for family="udr_corr"
     restarts=2,
 )
-print(cal)                # ResolutionCalibration(family=udr_corr, chi2/dof=..., converged=...)
+print(cal)                # ResolutionCalibration(family=udr_corr, chi2/dof=..., converged=..., n_free_params=2, bounds_hit=[])
 print(cal.params())       # decoded fitted parameters
 calibrated = cal.as_tabulated()         # pin this into the sample fit
 ```
 
 The families calibrate different knobs:
 
-| family       | fits                                  | meaning                                   |
-|--------------|---------------------------------------|-------------------------------------------|
-| `gaussian`   | `Δt, ΔL`                              | analytical Gaussian width                 |
-| `udr_corr`   | `s(E)=s0·(E/E_ref)^p` on a base UDR   | trust the MC *shape*, calibrate its width |
-| `ic`         | `α(E)=a0√E+a1` (β fixed)               | free analytic shape                       |
+| family       | fits                                        | meaning                                   |
+|--------------|---------------------------------------------|-------------------------------------------|
+| `gaussian`   | `Δt, ΔL`                                    | analytical Gaussian width                 |
+| `udr_corr`   | `s(E)=s0·(E/E_ref)^p` on a base UDR         | trust the MC *shape*, calibrate its width |
+| `ic`         | `α(E)=e^c0·√E+e^c1`, `β`, `R` (⊗ PSR triangle) | full bounded analytic moderator shape     |
+
+The `ic` family fits the **complete bounded Ikeda–Carpenter shape**: the
+prompt law `α(E) = e^{c0}·√E + e^{c1}` is *positive at every energy by
+construction* (the coefficients are exp-encoded — a calibration can no longer
+return an `a1 < 0` that flips α negative below the fit window), and the
+storage rate `β` and mixing fraction `R ∈ [0, 1]` are free within physics
+bounds. The kernel is convolved with the SNS PSR (accumulator-ring) channel
+triangle — FWHM `psr_fwhm_ns` (default 350 ns, the value the VENUS FTS file
+header records as already folded into the *tabulated* kernel; `0` disables).
+Pass `fit_psr=True` to also fit the triangle FWHM as a 5th parameter.
+The PSR fold applies to `ic` only: tabulated/UDR kernels already carry it in
+the file and are never re-folded.
+
+Every result echoes `n_free_params` and `bounds_hit` — a list of
+`"name:lower"` / `"name:upper"` strings for parameters pinned at a box bound.
+A pinned bound flags a degenerate direction: e.g. an eV-regime calibrant with
+no storage tail drives `R → 0` (`"r:lower"`), and on that β↔R ridge the
+reported `β` carries no information.
 
 Use `.as_tabulated()` for `udr_corr` / `ic` (a `TabulatedResolution` to pass as
 `resolution=`); use `.gaussian_params()` → `(delta_t_us, delta_l_m)` for the
-Gaussian family.
+Gaussian family. For `ic`, `cal.params()` returns the decoded
+`{a0, a1, beta, r, psr_fwhm_us}` (the raw `theta` is ln/box-encoded optimizer
+space).
 
 ### Pin and fit the sample
 

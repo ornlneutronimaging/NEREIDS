@@ -320,7 +320,11 @@ class IkedaCarpenter:
         ...
 
     def kernel_at(self, energy_ev: float) -> tuple[list[float], list[float]]:
-        """``(tof_offsets_us, weights)`` at one energy; mode at offset 0."""
+        """``(tof_offsets_us, weights)`` at one energy; mode at offset 0.
+
+        Raises ``ValueError`` when the tau-grid cannot resolve the prompt
+        core and requested folds within the sample cap at this energy.
+        """
         ...
 
     @property
@@ -384,8 +388,28 @@ class ResolutionCalibration:
         to fit."""
         ...
 
+    @property
+    def n_free_params(self) -> int:
+        """Number of outer-loop free parameters: resolution theta plus any
+        fitted position coordinates (4-5 for family="ic", 2 for the other
+        families)."""
+        ...
+
+    @property
+    def bounds_hit(self) -> list[str]:
+        """Coordinates pinned at a box bound at the solution, as
+        "name:lower" / "name:upper" strings (empty list = interior solution).
+        E.g. "r:lower" flags the beta-R ridge: the calibrant shows no storage
+        tail, so the reported beta carries no information."""
+        ...
+
     def params(self) -> dict[str, float]:
-        """Decoded, human-readable fitted parameters."""
+        """Decoded, human-readable fitted parameters.
+
+        For family="ic" the keys are a0/a1 (alpha(E) = a0*sqrt(E) + a1,
+        positive by construction), beta, r and psr_fwhm_us — decoded from the
+        calibrated resolution itself (the raw theta is ln/box-encoded
+        optimizer space)."""
         ...
 
     def as_tabulated(self) -> TabulatedResolution | None:
@@ -688,6 +712,8 @@ def calibrate_resolution(
     l_scale_center: float = 1.0,
     t0_prior_us: float | None = None,
     l_scale_prior: float | None = None,
+    psr_fwhm_ns: float = 350.0,
+    fit_psr: bool = False,
 ) -> ResolutionCalibration:
     """Calibrate instrument-resolution parameters against a known-(rho,T) calibrant.
 
@@ -696,6 +722,24 @@ def calibrate_resolution(
     and ``temperature_k`` fixed. ``base_udr`` is required for ``"udr_corr"``.
     Pin the returned resolution into a sample fit via ``.as_tabulated()`` (or
     ``.gaussian_params()`` for the Gaussian family).
+
+    The ``"ic"`` family fits the full bounded moderator shape:
+    ``alpha(E) = a0*sqrt(E) + a1`` (positive by construction), free bounded
+    ``beta`` and storage fraction ``r``, folded with the SNS PSR channel
+    triangle of FWHM ``psr_fwhm_ns`` (default 350 ns, the VENUS FTS header
+    value; 0 disables; applies to "ic" only — tabulated/UDR kernels already
+    carry the fold). ``psr_fwhm_ns`` is NANOSECONDS: nonzero values above
+    10_000 ns (10 us) raise ``ValueError`` as a us-as-ns unit slip (kernel
+    synthesis cost is quadratic in the fold width, so e.g. 350 meaning us
+    would hang for hours). ``fit_psr=True`` ("ic" only) also fits the PSR FWHM as a
+    5th parameter (box-bounded 0.05-1 us), started at ``psr_fwhm_ns`` clamped
+    into that box: an out-of-box start (legal as a pin up to 10 us) starts at
+    the nearer box edge with a stderr warning, and a fit that stays there
+    reports ``psr_fwhm_us:lower`` / ``:upper`` in ``bounds_hit``.
+    ``psr_fwhm_ns`` must then be > 0 (a zero start contradicts "0 disables"
+    and raises ``ValueError``). ``psr_fwhm_ns`` / ``fit_psr`` sit at the END of the
+    signature so pre-existing positional calls keep their meaning. Degenerate
+    directions are reported via ``bounds_hit``.
 
     By default position is PINNED (``fit_t0=fit_l_scale=False``): a pure
     shape/width fit on the already energy-calibrated grid. Set ``fit_t0`` /
@@ -955,6 +999,13 @@ def detect_dead_pixels(
 ) -> NDArray[np.bool_]:
     """Detect dead pixels (all-zero across the spectral axis).
 
+    Pixel masks are a pipeline-integrity screen only — they exclude pixels
+    whose data stream is broken (dead, hot/railed), never low-count or
+    poorly covered pixels.  Low-count pixels are alive and must be kept.
+    Prefer ``detect_bad_pixels()`` (validating, unions sample and open-beam,
+    optional hot screen); see also ``detect_hot_pixels()`` and
+    ``detect_dead_pixels_chunked()``.
+
     Parameters
     ----------
     data :
@@ -966,6 +1017,166 @@ def detect_dead_pixels(
     NDArray[np.bool_]
         2D boolean mask with shape ``(height, width)``, where ``True`` marks
         a dead pixel (all-zero across the spectral axis).
+    """
+    ...
+
+def detect_hot_pixels(
+    data: NDArray[np.float64],
+    k_mad: float = 6.0,
+) -> NDArray[np.bool_]:
+    """Detect hot (railed / runaway) pixels — two-stage screen.
+
+    Stage 1 (global): robust one-sided cut on per-pixel total counts — a
+    pixel is a candidate when ``ln(total) > median + k_mad * sigma``, with
+    median and MAD taken over the live (``total > 0``) pixels only and
+    ``sigma`` floored by the Poisson counting noise of the median total.
+    Stage 2 (local), iterated to a fixpoint: a candidate is flagged only if
+    its total also exceeds 10x the median of its 8-neighborhood reference
+    sample — live unflagged neighbors contribute their totals,
+    already-flagged neighbors contribute 0 (a known defect cannot vouch for
+    its neighbors), dead neighbors are omitted; edge pixels use whatever
+    neighbors exist, and a candidate with no live neighbor keeps the global
+    verdict.  Passes repeat until no new flag is added (bounded by
+    ``height * width`` passes; in practice ~the defect-cluster radius),
+    eroding railed CLUSTERS from the boundary inward — a single pass would
+    miss the interior of clusters >= 2 px wide, whose neighbors are railed
+    too.  Clusters up to 3 px wide are fully consumed PROVIDED they expose
+    at least one end cap or convex corner to normal-scene neighbors
+    (erosion must seed somewhere): an EDGE-TO-EDGE railed band >= 2 px
+    wide, spanning the full detector width or height with both ends
+    off-detector, has no seed and is NOT caught — deliberately, because a
+    slit-aperture open beam produces a genuine full-width bright scene
+    band pixel-for-pixel indistinguishable from it, and a full-span screen
+    would mask that scene (the bimodal failure).  Declare such full-span
+    detector pathologies in a file mask.  A full-span width-1 railed line
+    IS caught (each pixel keeps >= 4 normal neighbors).  The local
+    confirmation keeps bimodal scenes honest: with a dark majority (a
+    sample covering >50% of the field of view, or an aperture-limited open
+    beam), the global statistics describe only the dark population and the
+    entire bright region would otherwise be masked — a contiguous bright
+    region is scene, not a defect.  Upper tail only — stuck-low pixels are
+    indistinguishable from low-count-alive pixels and are kept (masks are
+    pipeline-integrity only, never a low-count screen).
+
+    Bright SCENE regions never erode: a boundary pixel of a contiguous
+    bright region >= 2 px wide keeps >= 4 same-side neighbors for any
+    straight or diagonal edge, so its reference median stays bright and
+    scene gradients (<= 2-3x across real edges) never reach the 10x factor
+    — the erosion has no seed.  Documented width-1 limitation (accepted
+    trade-off): a 1-px-wide bright scene line at >= 10x local contrast is
+    spatially indistinguishable from a railed line and IS masked; real
+    scene features on VENUS are PSF-blurred over >= 2 px, so >= 10x
+    single-pixel scene contrast is physically rare, and contiguous bright
+    regions of width >= 2 are safe from the local stage.
+
+    ``data`` must be RAW detected counts (unscaled): the Poisson floor
+    assumes ``Var[N] = N``.  Scaled inputs silently distort the floor —
+    down-scaling (proton-charge-normalized rates << 1, gain division)
+    inflates it and can suppress real flags; up-scaling (event weights > 1)
+    deflates it below true counting noise.  Detect on raw counts and
+    normalize afterwards.
+
+    Parameters
+    ----------
+    data :
+        3D NumPy array of raw counts with shape ``(n_frames, height, width)``.
+    k_mad :
+        Robust-sigma multiplier for the stage-1 upper-tail cut. The default
+        6.0 corresponds to a one-sided Gaussian tail of ~1e-9 — on a
+        unimodal image it essentially never flags a statistically plausible
+        pixel.
+
+    Returns
+    -------
+    NDArray[np.bool_]
+        2D boolean mask with shape ``(height, width)``, where ``True`` marks
+        a hot pixel.
+
+    Raises
+    ------
+    ValueError
+        If ``data`` contains non-finite or negative values or has zero
+        frames (``shape[0] == 0``), or ``k_mad`` is not finite and positive.
+    """
+    ...
+
+def detect_dead_pixels_chunked(
+    chunks: list[NDArray[np.float64]],
+) -> NDArray[np.bool_]:
+    """Detect dead pixels across acquisition chunks (dead in ANY chunk).
+
+    Catches intermittent deadness invisible to ``detect_dead_pixels()`` on
+    the summed stack: a pixel dead for one acquisition chunk but alive in
+    another has nonzero summed counts, yet its dead-chunk data corrupts the
+    combined spectrum.  Chunk the acquisition so each live pixel has an
+    expected >= 20 total counts per chunk (misflag probability per live
+    pixel is ``m * exp(-lambda)`` over ``m`` chunks).
+
+    Parameters
+    ----------
+    chunks :
+        List of 3D NumPy arrays, one per acquisition chunk, each with shape
+        ``(n_frames_i, height, width)``.  Frame counts may differ between
+        chunks (ragged event re-histogramming is fine); spatial dimensions
+        must agree.
+
+    Returns
+    -------
+    NDArray[np.bool_]
+        2D boolean mask with shape ``(height, width)``, where ``True`` marks
+        a pixel that is all-zero in at least one chunk.
+
+    Raises
+    ------
+    ValueError
+        If ``chunks`` is empty, any chunk has zero frames
+        (``shape[0] == 0`` — its all-zero test would vacuously mark every
+        pixel dead), any chunk contains non-finite or negative values, or
+        the spatial dimensions differ between chunks.
+    """
+    ...
+
+def detect_bad_pixels(
+    sample: NDArray[np.float64],
+    open_beam: NDArray[np.float64] | None = None,
+    hot_k_mad: float | None = 6.0,
+) -> NDArray[np.bool_]:
+    """Detect all pipeline-corrupting pixels: dead + hot, sample and OB.
+
+    The validating entry point.  Deadness/hotness is per-acquisition — a
+    pixel dead only in the open-beam run still corrupts every transmission
+    ratio computed from it — so the masks of both stacks are unioned:
+    ``dead(sample) | hot(sample) [| dead(open_beam) | hot(open_beam)]``.
+    Frame counts may differ between the stacks; spatial dimensions must
+    agree.  The result can be passed to ``spatial_map_typed(dead_pixels=...)``.
+
+    Both stacks must be RAW detected counts (unscaled) — see
+    ``detect_hot_pixels()``: scaling distorts the Poisson floor of the hot
+    screen.  Detect on raw counts, before any normalization.
+
+    Parameters
+    ----------
+    sample :
+        3D NumPy array of raw counts with shape ``(n_frames, height, width)``.
+    open_beam :
+        Optional 3D NumPy array of raw counts with shape
+        ``(n_frames2, height, width)``.
+    hot_k_mad :
+        Robust-sigma multiplier for the hot-pixel screen (default 6.0), or
+        ``None`` to disable it (dead-only detection).
+
+    Returns
+    -------
+    NDArray[np.bool_]
+        2D boolean mask with shape ``(height, width)``, where ``True`` marks
+        a pixel to exclude from fitting.
+
+    Raises
+    ------
+    ValueError
+        If either stack contains non-finite or negative values or has zero
+        frames (``shape[0] == 0``), the spatial dimensions differ, or
+        ``hot_k_mad`` is not finite and positive.
     """
     ...
 

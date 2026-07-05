@@ -1344,6 +1344,259 @@ class TestNormalization:
 
 
 # ===========================================================================
+# Pixel masks (pipeline-integrity screens, #643)
+# ===========================================================================
+
+
+class TestPixelMasks:
+    """Tests for detect_dead_pixels, detect_hot_pixels,
+    detect_dead_pixels_chunked, and detect_bad_pixels (#643)."""
+
+    def test_detect_dead_pixels_backcompat(self):
+        """The original all-zero-stack detector is unchanged."""
+        data = np.full((3, 2, 2), 5.0)
+        data[:, 0, 0] = 0.0
+        mask = np.asarray(nereids.detect_dead_pixels(data))
+        assert mask.dtype == np.bool_
+        assert mask.shape == (2, 2)
+        assert mask[0, 0]
+        assert not mask[1, 1]
+
+    def test_detect_bad_pixels_union(self):
+        """dead(sample) | hot(sample) | dead(ob) | hot(ob); low-count kept."""
+        sample = np.full((3, 3, 3), 100.0)
+        sample[:, 0, 0] = 0.0  # dead in sample only
+        sample[:, 1, 2] = 0.0
+        sample[0, 1, 2] = 1.0  # low-count-ALIVE: 1 total count
+        ob = np.full((3, 3, 3), 200.0)
+        ob[:, 0, 1] = 0.0  # dead in OB only
+        ob[:, 2, 2] = 65535.0  # hot (railed) in OB only
+
+        mask = np.asarray(nereids.detect_bad_pixels(sample, ob))
+        assert mask.dtype == np.bool_
+        assert mask.shape == (3, 3)
+        assert mask[0, 0], "dead-in-sample-only must be flagged"
+        assert mask[0, 1], "dead-in-OB-only must be flagged"
+        assert mask[2, 2], "hot-in-OB-only must be flagged"
+        assert not mask[1, 2], "low-count-alive pixel must be kept"
+        assert mask.sum() == 3
+
+    def test_detect_bad_pixels_hot_k_mad_none_disables_hot(self):
+        sample = np.full((3, 3, 3), 100.0)
+        sample[:, 1, 1] = 65535.0  # railed
+        dead_only = np.asarray(nereids.detect_bad_pixels(sample, hot_k_mad=None))
+        assert not dead_only.any()
+        with_hot = np.asarray(nereids.detect_bad_pixels(sample))
+        assert with_hot[1, 1]
+
+    def test_detect_hot_pixels_flags_railed_keeps_low_count(self):
+        data = np.full((3, 3, 3), 100.0)
+        data[:, 2, 0] = 65535.0  # railed
+        data[:, 0, 2] = 0.0
+        data[1, 0, 2] = 1.0  # low-count-alive
+        mask = np.asarray(nereids.detect_hot_pixels(data))
+        assert mask[2, 0], "railed pixel must be flagged"
+        assert not mask[0, 2], "low-count-alive pixel must be kept"
+        assert mask.sum() == 1
+
+    def test_detect_hot_pixels_mad_scale_decides_stage1_threshold(self):
+        """Mirror of the Rust deciding-branch test (#646 review R4, P1-2):
+        the robust-MAD branch of the stage-1 scale
+        sigma = max(MAD_TO_SIGMA*mad, exp(-med/2)) decides the outcome.
+
+        8x8 single-bin grid; two all-dead 3x3 moats (rows/cols 1-3 and
+        4-6) isolate a probe at (2,2) and a control at (5,5) so their
+        stage-2 reference sample is empty and the flag outcome is decided
+        purely by the stage-1 threshold.  Background: 24 px at A = 8000,
+        22 px at B = 12500 (A*B = 1e8, B/A = 1.25**2).  Worked stage-1
+        arithmetic over the 48 live pixels (ranks pin the statistics):
+
+          med = (ln A + ln B)/2 = ln 1e4         = 9.2103404
+          mad = ln 1.25                          = 0.2231436
+          MAD term = 1.4826022 * 0.2231436       = 0.3308331
+          floor = exp(-med/2) = 1e-2             = 0.01  (MAD wins)
+          threshold = med + 6*sigma              = 11.1953391
+
+        Probe ln 40000 = 10.5966347 < threshold -> kept; under a
+        floor-only mutation the threshold collapses to 9.2703404 and the
+        probe would be flagged.  Control ln 200000 = 12.2060726 >
+        threshold -> flagged.
+        """
+        data = np.zeros((1, 8, 8))
+        data[0, 2, 2] = 40000.0  # probe
+        data[0, 5, 5] = 200000.0  # control
+        filled = 0
+        for y in range(8):
+            for x in range(8):
+                in_moat1 = 1 <= y <= 3 and 1 <= x <= 3
+                in_moat2 = 4 <= y <= 6 and 4 <= x <= 6
+                if in_moat1 or in_moat2:
+                    continue  # dead moat cells stay 0.0
+                data[0, y, x] = 8000.0 if filled < 24 else 12500.0
+                filled += 1
+        assert filled == 46
+
+        mask = np.asarray(nereids.detect_hot_pixels(data))
+        assert not mask[2, 2], "probe below the MAD-driven threshold must be kept"
+        assert mask[5, 5], "control above the MAD-driven threshold must be flagged"
+        assert mask.sum() == 1
+
+    def test_detect_dead_pixels_chunked_catches_intermittent(self):
+        chunk0 = np.full((3, 2, 2), 5.0)
+        chunk0[:, 0, 1] = 0.0  # dead throughout chunk 0 only
+        chunk1 = np.full((3, 2, 2), 5.0)
+        mask = np.asarray(nereids.detect_dead_pixels_chunked([chunk0, chunk1]))
+        assert mask[0, 1]
+        assert mask.sum() == 1
+        # The gap being closed: the summed stack cannot see it.
+        summed_mask = np.asarray(nereids.detect_dead_pixels(chunk0 + chunk1))
+        assert not summed_mask[0, 1]
+
+    def test_shape_mismatch_raises(self):
+        sample = np.ones((3, 2, 2))
+        ob = np.ones((3, 2, 3))
+        with pytest.raises(ValueError, match="[Ss]hape"):
+            nereids.detect_bad_pixels(sample, ob)
+        with pytest.raises(ValueError, match="[Ss]hape"):
+            nereids.detect_dead_pixels_chunked([sample, ob])
+
+    def test_nan_raises(self):
+        data = np.ones((2, 2, 2))
+        data[0, 0, 0] = np.nan
+        with pytest.raises(ValueError):
+            nereids.detect_bad_pixels(data)
+        with pytest.raises(ValueError):
+            nereids.detect_hot_pixels(data)
+        with pytest.raises(ValueError):
+            nereids.detect_dead_pixels_chunked([data])
+
+    def test_bad_k_raises(self):
+        data = np.ones((2, 2, 2))
+        for bad_k in (0.0, -1.0, float("nan"), float("inf")):
+            with pytest.raises(ValueError, match="k_mad"):
+                nereids.detect_hot_pixels(data, k_mad=bad_k)
+            with pytest.raises(ValueError, match="k_mad"):
+                nereids.detect_bad_pixels(data, hot_k_mad=bad_k)
+
+    def test_empty_chunks_raises(self):
+        with pytest.raises(ValueError):
+            nereids.detect_dead_pixels_chunked([])
+
+    def test_bimodal_bright_region_not_flagged(self):
+        """PR #646 P0 regression guard: dark-majority bimodal scene (60%
+        of the FOV at ~50 counts, contiguous 40% bright region at ~5000).
+        Every bright pixel passes the global median+MAD cut (the dark
+        population holds the median), but the local-neighborhood
+        confirmation must veto them all — bright scene is not a defect."""
+        data = np.full((1, 10, 10), 50.0)
+        data[:, :, 6:] = 5000.0
+        assert not np.asarray(nereids.detect_hot_pixels(data)).any()
+        assert not np.asarray(nereids.detect_bad_pixels(data)).any()
+
+    def test_bimodal_railed_inside_bright_region_caught(self):
+        """A genuinely railed pixel INSIDE the bright region of a bimodal
+        scene (~200x its bright neighbors) is still caught."""
+        data = np.full((1, 10, 10), 50.0)
+        data[:, :, 6:] = 5000.0
+        data[0, 5, 8] = 1.0e6
+        mask = np.asarray(nereids.detect_hot_pixels(data))
+        assert mask[5, 8]
+        assert mask.sum() == 1
+
+    def test_railed_blob_fully_caught_fixpoint(self):
+        """#646 review R2 (F1): the stage-2 fixpoint erodes a 3x3 railed
+        blob from the boundary inward — a single local pass flags only the
+        4 corners (5 background neighbors each) and misses the edge centers
+        and the interior, whose neighbors are railed too."""
+        data = np.full((4, 9, 9), 100.0)
+        data[:, 3:6, 3:6] = 65535.0
+        mask = np.asarray(nereids.detect_hot_pixels(data))
+        assert mask[3:6, 3:6].all(), "3x3 blob must be fully caught"
+        assert mask.sum() == 9, "only the blob may be flagged"
+
+    def test_large_psf_bright_region_not_eroded(self):
+        """#646 review R2 (F1 safety): a large bright scene region (20x20
+        core at 100x background) with the >= 2-px PSF edge blur real VENUS
+        features have (adjacent ratios <= 5x) passes the global cut but
+        never seeds the erosion — zero flags."""
+        data = np.full((1, 50, 50), 100.0)
+        data[:, 13:37, 13:37] = 400.0
+        data[:, 14:36, 14:36] = 2000.0
+        data[:, 15:35, 15:35] = 10000.0
+        assert not np.asarray(nereids.detect_hot_pixels(data)).any()
+
+    def test_edge_to_edge_2px_band_not_flagged_by_design(self):
+        """#646 review R3 (F1, pinned limitation): an EDGE-TO-EDGE railed
+        band >= 2 px wide (both ends off-detector) exposes no end cap or
+        convex corner, so the fixpoint erosion has no seed and the band is
+        NOT caught — deliberately: a slit-aperture open beam produces a
+        genuine full-width bright scene band indistinguishable from it,
+        and a full-span screen would mask that scene (bimodal failure).
+        Declare such full-span pathologies in a file mask.  The same band
+        with one end cap inside the detector IS fully consumed."""
+        edge_to_edge = np.full((4, 9, 9), 100.0)
+        edge_to_edge[:, 3:5, :] = 65535.0
+        assert not np.asarray(nereids.detect_hot_pixels(edge_to_edge)).any()
+
+        one_end_inside = np.full((4, 9, 9), 100.0)
+        one_end_inside[:, 3:5, :7] = 65535.0
+        mask = np.asarray(nereids.detect_hot_pixels(one_end_inside))
+        assert mask[3:5, :7].all(), "band with an end cap must be caught"
+        assert mask.sum() == 14, "only the railed band may be flagged"
+
+    def test_1px_bright_line_flagged_by_design(self):
+        """#646 review R2 (F3, pinned): a 1-px-wide bright scene line at
+        >= 10x local contrast is spatially indistinguishable from a railed
+        line and IS masked — the documented, accepted trade-off (real VENUS
+        scene features are PSF-blurred over >= 2 px)."""
+        data = np.full((1, 9, 9), 100.0)
+        data[:, :, 4] = 5000.0
+        mask = np.asarray(nereids.detect_hot_pixels(data))
+        assert mask[:, 4].all(), "width-1 line is flagged by design"
+        assert mask.sum() == 9
+
+    def test_empty_tof_axis_raises(self):
+        """shape[0] == 0: the all-zero dead test would pass vacuously and
+        mask the whole detector — the validating entry points reject it."""
+        empty = np.empty((0, 2, 2))
+        with pytest.raises(ValueError):
+            nereids.detect_bad_pixels(empty)
+        with pytest.raises(ValueError):
+            nereids.detect_bad_pixels(np.ones((3, 2, 2)), empty)
+        with pytest.raises(ValueError):
+            nereids.detect_hot_pixels(empty)
+        with pytest.raises(ValueError):
+            nereids.detect_dead_pixels_chunked([empty])
+
+    def test_mask_round_trips_into_spatial_map(self, u238_data):
+        """A detect_bad_pixels mask feeds spatial_map_typed(dead_pixels=...):
+        the masked pixel is hard-excluded (NaN in the density map)."""
+        energies = np.linspace(1.0, 10.0, 20)
+        n_e = len(energies)
+        h, w = 3, 3
+        sample = np.full((n_e, h, w), 100.0)
+        sample[:, 1, 1] = 0.0  # dead pixel
+        mask = np.asarray(nereids.detect_bad_pixels(sample))
+        assert mask.dtype == np.bool_
+        assert mask[1, 1] and mask.sum() == 1
+
+        t = np.full((n_e, h, w), 0.5)
+        u = np.full((n_e, h, w), 0.01)
+        data = nereids.from_transmission(t, u)
+        result = nereids.spatial_map_typed(
+            data, energies, [u238_data],
+            solver="lm",
+            dead_pixels=mask,
+            max_iter=5,
+        )
+        density = np.asarray(result.density_maps[0])
+        assert density.shape == (h, w)
+        assert np.isnan(density[1, 1]), (
+            "masked pixel must be hard-excluded (NaN in the density map)"
+        )
+
+
+# ===========================================================================
 # TIFF I/O
 # ===========================================================================
 
@@ -3391,6 +3644,147 @@ class TestCalibrateResolution:
                     flight_path_m=-1.0,
                     **kw,
                 )
+
+    def test_ic_params_decoded_and_bounds_reported(self):
+        # The bounded "ic" family (#642) exposes decoded physical parameters
+        # (single source of truth: the calibrated resolution, not the
+        # ln/box-encoded theta) plus the degeneracy report.
+        iso, e, t, unc = self._calibrant()
+        cal = nereids.calibrate_resolution(
+            e, t, unc, "ic", isotopes=[(iso, 5.0e-4)], temperature_k=300.0
+        )
+        p = cal.params()
+        for key in ("a0", "a1", "beta", "r", "psr_fwhm_us"):
+            assert key in p, f"missing decoded param {key}"
+        assert p["a0"] > 0.0
+        assert p["a1"] > 0.0  # alpha(E) positive by construction
+        assert p["beta"] > 0.0
+        assert 0.0 <= p["r"] <= 1.0
+        assert p["psr_fwhm_us"] >= 0.0
+        assert cal.n_free_params == 4
+        assert len(cal.theta) == 4
+        assert isinstance(cal.bounds_hit, list)
+        assert all(isinstance(s, str) for s in cal.bounds_hit)
+        assert "n_free_params=4" in repr(cal)
+
+    def test_fit_psr_appends_fifth_parameter(self):
+        iso, e, t, unc = self._calibrant()
+        cal = nereids.calibrate_resolution(
+            e,
+            t,
+            unc,
+            "ic",
+            isotopes=[(iso, 5.0e-4)],
+            temperature_k=300.0,
+            fit_psr=True,
+        )
+        assert cal.n_free_params == 5
+        assert len(cal.theta) == 5
+        # The fitted PSR FWHM respects its box (0.05-1 us).
+        assert 0.05 <= cal.params()["psr_fwhm_us"] <= 1.0
+
+    def test_fit_psr_requires_ic_family(self):
+        iso, e, t, unc = self._calibrant()
+        with pytest.raises(ValueError, match="fit_psr"):
+            nereids.calibrate_resolution(
+                e,
+                t,
+                unc,
+                "gaussian",
+                isotopes=[(iso, 5.0e-4)],
+                temperature_k=300.0,
+                fit_psr=True,
+            )
+
+    def test_invalid_psr_fwhm_rejected(self):
+        iso, e, t, unc = self._calibrant()
+        for bad in (-1.0, float("nan")):
+            with pytest.raises(ValueError, match="psr_fwhm_ns"):
+                nereids.calibrate_resolution(
+                    e,
+                    t,
+                    unc,
+                    "ic",
+                    isotopes=[(iso, 5.0e-4)],
+                    temperature_k=300.0,
+                    psr_fwhm_ns=bad,
+                )
+
+    def test_absurd_pinned_psr_width_rejected(self):
+        # Review #645 round 2, F1: psr_fwhm_ns is NANOSECONDS (FTS convention
+        # 350 ns); kernel-synthesis cost is quadratic in the fold width, so a
+        # us-as-ns unit slip (350 meaning us -> 350_000 ns) previously passed
+        # the finite/sign check and became a multi-hour silent hang behind a
+        # fictitious 350 us fold. Nonzero widths above the 10_000 ns (10 us)
+        # ceiling must raise up front; the message names the ns unit and the
+        # 350-ns convention. (Boundary acceptance at exactly 10_000 ns is
+        # pinned Rust-side: rejects_absurd_pinned_psr_width.)
+        iso, e, t, unc = self._calibrant()
+        with pytest.raises(ValueError, match="NANOSECONDS.*350 ns"):
+            nereids.calibrate_resolution(
+                e,
+                t,
+                unc,
+                "ic",
+                isotopes=[(iso, 5.0e-4)],
+                temperature_k=300.0,
+                psr_fwhm_ns=350_000.0,
+            )
+
+    def test_infeasible_start_psr_width_rejected(self):
+        # Review #645 round 3, F1: a pinned PSR width in (0, ~58.6 ns) passes
+        # the finite/sign/ceiling checks but cannot be SYNTHESIZED at the
+        # optimizer's default beta/R start (beta = 0.1 spans a 160 us storage
+        # tail, capping the tau-step at ~19.5 ns > fwhm/3). Previously every
+        # initial simplex vertex was infinite and the calibration burned
+        # max_iter before a generic "no finite-objective" error blaming the
+        # forward model. The Rust pre-flight must reject the start up front,
+        # and the informative message (naming psr_fwhm_ns and the tau-cap
+        # cause) must propagate through the binding as a ValueError.
+        iso, e, t, unc = self._calibrant()
+        with pytest.raises(
+            ValueError, match="starting parameter vector.*psr_fwhm_ns"
+        ):
+            nereids.calibrate_resolution(
+                e,
+                t,
+                unc,
+                "ic",
+                isotopes=[(iso, 5.0e-4)],
+                temperature_k=300.0,
+                psr_fwhm_ns=55.0,
+            )
+
+    def test_fit_psr_with_zero_width_rejected(self):
+        # psr_fwhm_ns=0 is documented as "no PSR fold"; fit_psr=True would
+        # silently clamp the 0 start into the [0.05, 1] us fit box. The
+        # contradiction must raise, not fit a phantom fold.
+        iso, e, t, unc = self._calibrant()
+        with pytest.raises(ValueError, match="fit_psr"):
+            nereids.calibrate_resolution(
+                e,
+                t,
+                unc,
+                "ic",
+                isotopes=[(iso, 5.0e-4)],
+                temperature_k=300.0,
+                psr_fwhm_ns=0.0,
+                fit_psr=True,
+            )
+
+    def test_psr_parameters_trail_the_signature(self):
+        # Review #645 F7: psr_fwhm_ns / fit_psr were added AFTER the original
+        # signature froze, so they must sit at the END — inserting them
+        # mid-signature would silently shift every pre-existing call passing
+        # >= 14 positional arguments.
+        sig = nereids.calibrate_resolution.__text_signature__
+        assert sig is not None
+        assert (
+            sig.index("l_scale_prior")
+            < sig.index("psr_fwhm_ns")
+            < sig.index("fit_psr")
+        ), f"psr_fwhm_ns/fit_psr must trail the signature: {sig}"
+
 
 
 # ===========================================================================

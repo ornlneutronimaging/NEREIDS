@@ -357,7 +357,25 @@ pub fn snapshot_from_state(state: &AppState) -> ProjectSnapshot {
         normalized,
         normalized_uncertainty,
         energies: state.energies.clone(),
-        dead_pixels: state.dead_pixels.clone(),
+        // Persist the two mask components SEPARATELY (#646 review R3 F3 +
+        // R4 P1-1).  `/intermediate/dead_pixels` carries the DECLARED
+        // component only: persisting the effective mask (declared ∪
+        // detected) there would let the restore-side declared-promotion
+        // bake each session's detections into the next session's declared
+        // component — monotonic mask growth across save/load cycles.  Old
+        // project files stored the effective mask at this same dataset
+        // path (unchanged dtype and shape, no format marker needed) and
+        // get a documented one-time promotion on load; new saves end the
+        // accumulation.
+        dead_pixels: state.file_dead_pixels.clone(),
+        // The DETECTED component gets its own versioned, session-scoped
+        // dataset (`/intermediate/detected_dead_pixels`): a restore
+        // without raw stacks cannot re-run detection, and dropping the
+        // component there would silently refit without the dead/hot
+        // exclusions active at save time.  Restore rebuilds the effective
+        // mask as declared ∪ detected — both components round-trip
+        // unchanged, so cycles still cannot grow either one.
+        detected_dead_pixels: state.detected_dead_pixels.clone(),
         density_maps,
         uncertainty_maps,
         chi_squared_map,
@@ -757,6 +775,8 @@ fn state_from_snapshot(snap: ProjectSnapshot, state: &mut AppState, path: &Path)
     state.open_beam_data = None;
     state.spectrum_values = None;
     state.dead_pixels = None;
+    state.file_dead_pixels = None;
+    state.detected_dead_pixels = None;
     state.fm_spectrum = None;
     state.fm_per_isotope_spectra.clear();
     state.detect_results.clear();
@@ -1062,8 +1082,144 @@ fn state_from_snapshot(snap: ProjectSnapshot, state: &mut AppState, path: &Path)
     }
     state.energies = snap.energies;
 
-    // 15b. Restore dead-pixel mask (D-20).
-    state.dead_pixels = snap.dead_pixels;
+    // 15b. Restore the dead-pixel mask components (D-20, #646).  NEW
+    // project files persist the DECLARED component at
+    // `/intermediate/dead_pixels` (snapshot_from_state writes
+    // state.file_dead_pixels) and the DETECTED component at
+    // `/intermediate/detected_dead_pixels` (#646 R4, P1-1); the effective
+    // mask is rebuilt here as declared ∪ persisted-detected via the same
+    // single-site helper every normalization uses — a restored project
+    // may carry embedded normalized data WITHOUT raw stacks, where
+    // detection never re-runs, and a declared-only restore would silently
+    // refit without the exclusions active at save time.  OLD files stored
+    // the effective mask at the declared dataset path and lack the
+    // detected dataset; promoting the effective mask to declared is a
+    // documented one-time promotion — the only lossless reading of a file
+    // that never recorded the split.  Either way, the next normalization
+    // recomputes the effective mask from scratch as declared ∪
+    // freshly-detected (AppState::set_detected_dead_pixels), so
+    // save→load→save cycles cannot grow either component (#646 review R3
+    // F3, R4 P1-1).  If the linked HDF5 is reloaded, the load site
+    // overwrites the declared mask with the file's own.
+    //
+    // Geometry validation (#646 F3): both components now come from a
+    // FILE, so a hand-corrupted project can carry a mask whose geometry
+    // does not match the data it will be applied to.  The refit consumes
+    // the effective mask against the restored normalized transmission
+    // (guided::analyze returns early without state.normalized) — without
+    // ROIs the pipeline rejects a wrong-geometry mask cleanly, but with
+    // restored ROIs the analyze-side ROI∪mask merge (ndarray::Zip)
+    // panics on the shape mismatch.  So when the snapshot carries
+    // normalized data (restored at step 15 above), validate each
+    // component against its spatial dims and DROP any that cannot apply,
+    // surfaced via the same deferred-notice mechanism as the drift
+    // warning below — never silently.  When the snapshot carries no
+    // normalized data, geometry is unknown here, but no refit can run
+    // either: the only route to a mask consumer is a fresh normalization,
+    // which recomputes the detected component at the data's own geometry
+    // and drops an inapplicable declared mask via the setter's returned
+    // notice.
+    let mut mask_notices: Vec<String> = Vec::new();
+    let expected_dims = state.normalized.as_ref().map(|n| {
+        let s = n.transmission.shape();
+        (s[1], s[2])
+    });
+    let mut declared = snap.dead_pixels;
+    let mut detected = snap.detected_dead_pixels;
+    if let Some(dims) = expected_dims {
+        if let Some(ref m) = declared
+            && m.dim() != dims
+        {
+            mask_notices.push(format!(
+                "restored declared pixel mask {:?} does not match the \
+                 restored transmission geometry {:?}; declared mask \
+                 dropped",
+                m.dim(),
+                dims
+            ));
+            declared = None;
+        }
+        if let Some(ref m) = detected
+            && m.dim() != dims
+        {
+            mask_notices.push(format!(
+                "restored detected pixel mask {:?} does not match the \
+                 restored transmission geometry {:?}; detected mask \
+                 dropped",
+                m.dim(),
+                dims
+            ));
+            detected = None;
+        }
+    }
+    state.file_dead_pixels = declared;
+    // The setter RETURNS a declared-mask-drop notice instead of logging
+    // it (#646 F1): step 17 below replaces the provenance log wholesale
+    // with the snapshot's, which would erase an entry appended here.
+    // Deferred — with the geometry notices above — to steps 20/22,
+    // exactly like the drift warning (15c).
+    if let Some(notice) = state.set_detected_dead_pixels(detected) {
+        mask_notices.push(notice);
+    }
+
+    // 15c. Detection-drift check (#646 R4, P1-1): when the raw stacks WERE
+    // restored (embedded save), re-run the same detection normalization
+    // would run and WARN if it no longer reproduces the persisted detected
+    // component — hidden state drift becomes observable instead of being
+    // silently replaced (or silently trusted).  The persisted component
+    // stays active either way; re-normalizing adopts the fresh detection
+    // explicitly.  Mode gating mirrors the three normalization call sites:
+    // TransmissionTiff never detects; the TIFF pair detects over
+    // sample ∪ OB (skip when the OB stack was not restored — recomputing
+    // on the sample alone would warn spuriously); the HDF5 modes detect
+    // over whatever is present.
+    let detected_drift: Option<String> = match (&state.detected_dead_pixels, &state.sample_data) {
+        (Some(persisted), Some(sample)) => {
+            let ob = state.open_beam_data.as_deref();
+            let stacks = match state.input_mode {
+                InputMode::TransmissionTiff => None,
+                InputMode::TiffPair => ob.map(|o| (sample.as_ref(), Some(o))),
+                InputMode::Hdf5Histogram | InputMode::Hdf5Event => Some((sample.as_ref(), ob)),
+            };
+            stacks.and_then(|(s, o)| {
+                match nereids_io::normalization::detect_bad_pixels(
+                    s,
+                    o,
+                    Some(nereids_io::normalization::HOT_PIXEL_K_MAD),
+                ) {
+                    Ok(fresh) if fresh.dim() == persisted.dim() => {
+                        let n_diff = fresh
+                            .iter()
+                            .zip(persisted.iter())
+                            .filter(|(f, p)| f != p)
+                            .count();
+                        (n_diff > 0).then(|| {
+                            format!(
+                                "recomputed dead/hot detection on the restored raw stacks \
+                                 differs from the saved detected mask at {n_diff} pixel(s); \
+                                 saved mask kept active — re-run normalization to adopt \
+                                 the fresh detection"
+                            )
+                        })
+                    }
+                    Ok(fresh) => Some(format!(
+                        "recomputed dead/hot detection is {:?} but the saved detected \
+                         mask is {:?}; saved mask kept active",
+                        fresh.dim(),
+                        persisted.dim()
+                    )),
+                    Err(e) => Some(format!(
+                        "dead/hot detection drift check failed ({e}); saved detected \
+                         mask kept active"
+                    )),
+                }
+            })
+        }
+        _ => None,
+    };
+    // (Logged to provenance at step 22 — step 17 below REPLACES the
+    // provenance log with the snapshot's, which would drop an entry
+    // appended here.)
 
     // 16. Restore results
     if let Some(density_maps) = snap.density_maps {
@@ -1234,10 +1390,18 @@ fn state_from_snapshot(snap: ProjectSnapshot, state: &mut AppState, path: &Path)
         state.guided_step = state.pipeline[0].step;
     }
 
-    // 20. Status message
+    // 20. Status message — compose the mask-drop notices (15b) and the
+    // drift warning (15c) in rather than leaving them provenance-only; a
+    // plain "Project loaded" would bury them.
     let mut status = format!("Project loaded from {}", path.display());
     if !missing.is_empty() {
         status.push_str(&format!(" (missing files: {})", missing.join(", ")));
+    }
+    for msg in &mask_notices {
+        status.push_str(&format!(" — WARNING: {msg}"));
+    }
+    if let Some(ref msg) = detected_drift {
+        status.push_str(&format!(" — WARNING: {msg}"));
     }
     state.status_message = status;
 
@@ -1245,11 +1409,24 @@ fn state_from_snapshot(snap: ProjectSnapshot, state: &mut AppState, path: &Path)
     state.cached_session = None;
     state.clear_dirty();
 
-    // 22. Log provenance
+    // 22. Log provenance (mask-drop and drift entries after step 17's
+    // wholesale replacement of the provenance log — see 15b/15c)
     state.log_provenance(
         ProvenanceEventKind::ProjectLoaded,
         format!("Loaded from {}", path.display()),
     );
+    for msg in &mask_notices {
+        state.log_provenance(
+            ProvenanceEventKind::ConfigChanged,
+            format!("Pixel-mask restore: {msg}"),
+        );
+    }
+    if let Some(ref msg) = detected_drift {
+        state.log_provenance(
+            ProvenanceEventKind::ProjectLoaded,
+            format!("Detected-mask drift: {msg}"),
+        );
+    }
 }
 
 /// Parse a timestamp string ("YYYY-MM-DD HH:MM:SS UTC" or ISO 8601) into SystemTime.
@@ -1295,4 +1472,418 @@ fn ymd_to_days(y: u64, m: u64, d: u64) -> u64 {
     let doe = yoe * 365 + yoe / 4 - yoe / 100 + doy;
     let base = era * 146097 + doe;
     base.saturating_sub(719468)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use ndarray::{Array2, Array3};
+    use nereids_io::project::{load_project, save_project, save_project_with_data};
+
+    /// The mask the refit consumes: `guided::analyze` merges
+    /// `state.dead_pixels` with the ROI mask, and with no ROIs (the case
+    /// in these tests) uses `state.dead_pixels` as-is.
+    fn refit_active_mask(state: &AppState) -> Option<Array2<bool>> {
+        assert!(state.rois.is_empty());
+        state.dead_pixels.clone()
+    }
+
+    /// #646 review R3 F3 + R4 P1-1: project SAVE persists the mask as two
+    /// SEPARATE components (declared at `/intermediate/dead_pixels`,
+    /// detected at `/intermediate/detected_dead_pixels`), so a
+    /// save→load→save cycle must not grow EITHER component.  Before the
+    /// R3 fix the snapshot carried the EFFECTIVE mask (declared ∪
+    /// detected) at the declared path and the restore-side
+    /// declared-promotion baked each session's detections into the next
+    /// session's declared component — monotonic growth.
+    #[test]
+    fn test_snapshot_persists_split_mask_components_no_growth_across_cycles() {
+        let mut declared = Array2::from_elem((3, 3), false);
+        declared[[0, 0]] = true;
+        let mut detected = Array2::from_elem((3, 3), false);
+        detected[[1, 1]] = true;
+
+        let mut state = AppState {
+            file_dead_pixels: Some(declared.clone()),
+            ..AppState::default()
+        };
+        assert!(
+            state
+                .set_detected_dead_pixels(Some(detected.clone()))
+                .is_none()
+        );
+        // Effective mask in the session is declared ∪ detected...
+        assert_eq!(
+            state
+                .dead_pixels
+                .as_ref()
+                .unwrap()
+                .iter()
+                .filter(|&&m| m)
+                .count(),
+            2
+        );
+
+        // ...and the snapshot persists the two components separately —
+        // the declared dataset never absorbs the detection.
+        let snap = snapshot_from_state(&state);
+        assert_eq!(snap.dead_pixels.as_ref().unwrap(), &declared);
+        assert_eq!(snap.detected_dead_pixels.as_ref().unwrap(), &detected);
+
+        // Load into a fresh session: each component restores to its own
+        // field and the effective mask is rebuilt as declared ∪ detected.
+        let mut restored = AppState::default();
+        state_from_snapshot(snap, &mut restored, Path::new("/nonexistent/p.nrd.h5"));
+        assert_eq!(restored.file_dead_pixels.as_ref().unwrap(), &declared);
+        assert_eq!(restored.detected_dead_pixels.as_ref().unwrap(), &detected);
+        assert_eq!(
+            restored
+                .dead_pixels
+                .as_ref()
+                .unwrap()
+                .iter()
+                .filter(|&&m| m)
+                .count(),
+            2
+        );
+
+        // The next normalization re-detects; the next save STILL persists
+        // the same two components — no growth of either across cycles.
+        assert!(
+            restored
+                .set_detected_dead_pixels(Some(detected.clone()))
+                .is_none()
+        );
+        let snap2 = snapshot_from_state(&restored);
+        assert_eq!(snap2.dead_pixels.as_ref().unwrap(), &declared);
+        assert_eq!(snap2.detected_dead_pixels.as_ref().unwrap(), &detected);
+    }
+
+    /// #646 R4 P1-1 acceptance (b): save→restore→refit WITHOUT raw stacks
+    /// — the exact scenario the detected-component persistence exists
+    /// for.  Normalization (and thus detection) cannot re-run, so the
+    /// refit's active mask must still equal the at-save mask, through the
+    /// real HDF5 writer/reader.
+    #[test]
+    fn test_save_restore_refit_active_mask_without_raw_stacks() {
+        let mut declared = Array2::from_elem((3, 3), false);
+        declared[[0, 0]] = true;
+        let mut detected = Array2::from_elem((3, 3), false);
+        detected[[1, 1]] = true;
+
+        let mut state = AppState {
+            input_mode: InputMode::Hdf5Histogram,
+            file_dead_pixels: Some(declared.clone()),
+            ..AppState::default()
+        };
+        assert!(
+            state
+                .set_detected_dead_pixels(Some(detected.clone()))
+                .is_none()
+        );
+        let at_save_mask = refit_active_mask(&state).unwrap();
+
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("no_raw.nrd.h5");
+        save_project(&path, &snapshot_from_state(&state)).unwrap();
+
+        let mut restored = AppState::default();
+        state_from_snapshot(load_project(&path).unwrap(), &mut restored, &path);
+
+        // Scenario precondition: no raw stacks after restore.
+        assert!(restored.sample_data.is_none());
+        // The refit's active mask equals the at-save mask (before P1-1 the
+        // detected component was lost and this was declared-only).
+        assert_eq!(refit_active_mask(&restored).unwrap(), at_save_mask);
+        // No drift check without raw stacks: nothing to recompute from.
+        assert!(!restored.status_message.contains("WARNING"));
+        assert!(
+            !restored
+                .provenance_log
+                .iter()
+                .any(|e| e.message.contains("drift"))
+        );
+    }
+
+    /// #646 R4 P1-1 acceptance (a): save→restore→refit WITH raw stacks
+    /// embedded.  The persisted detected component still restores the
+    /// at-save active mask, and — since the recomputed detection agrees
+    /// with the persisted one — no drift warning is raised.
+    #[test]
+    fn test_save_restore_refit_active_mask_with_raw_stacks() {
+        // Raw stack with a genuinely detectable hot pixel: uniform 100
+        // counts, one railed pixel (see
+        // test_detect_hot_pixels_uniform_image_poisson_floor_path).
+        let mut sample = Array3::from_elem((1, 3, 3), 100.0);
+        sample[[0, 1, 1]] = 65535.0;
+        let detected = nereids_io::normalization::detect_bad_pixels(
+            &sample,
+            None,
+            Some(nereids_io::normalization::HOT_PIXEL_K_MAD),
+        )
+        .unwrap();
+        assert!(detected[[1, 1]], "fixture must detect the railed pixel");
+
+        let mut declared = Array2::from_elem((3, 3), false);
+        declared[[0, 0]] = true;
+
+        let mut state = AppState {
+            input_mode: InputMode::Hdf5Histogram,
+            sample_data: Some(Arc::new(sample.clone())),
+            file_dead_pixels: Some(declared),
+            ..AppState::default()
+        };
+        assert!(state.set_detected_dead_pixels(Some(detected)).is_none());
+        let at_save_mask = refit_active_mask(&state).unwrap();
+
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("with_raw.nrd.h5");
+        let embedded = EmbeddedData {
+            sample: Some(&sample),
+            open_beam: None,
+            spectrum: None,
+        };
+        save_project_with_data(&path, &snapshot_from_state(&state), Some(&embedded)).unwrap();
+
+        let mut restored = AppState::default();
+        state_from_snapshot(load_project(&path).unwrap(), &mut restored, &path);
+
+        // Scenario precondition: raw stacks present after restore.
+        assert!(restored.sample_data.is_some());
+        assert_eq!(refit_active_mask(&restored).unwrap(), at_save_mask);
+        // Recomputed detection reproduces the persisted component → no
+        // drift warning.
+        assert!(!restored.status_message.contains("WARNING"));
+        assert!(
+            !restored
+                .provenance_log
+                .iter()
+                .any(|e| e.message.contains("drift"))
+        );
+    }
+
+    /// #646 R4 P1-1: when raw stacks are present on restore and the
+    /// recomputed detection DISAGREES with the persisted detected
+    /// component, the persisted mask stays active (never silently
+    /// replaced) and the drift is surfaced in both the status message and
+    /// the provenance log.
+    #[test]
+    fn test_restore_with_raw_stacks_warns_on_detection_drift_keeps_saved_mask() {
+        let mut sample = Array3::from_elem((1, 3, 3), 100.0);
+        sample[[0, 1, 1]] = 65535.0; // recompute will flag (1, 1)
+
+        // Persisted detected component from a "different" detection run:
+        // flags (0, 2) instead — drift at 2 pixels ((1,1) and (0,2)).
+        let mut stale_detected = Array2::from_elem((3, 3), false);
+        stale_detected[[0, 2]] = true;
+
+        let mut state = AppState {
+            input_mode: InputMode::Hdf5Histogram,
+            sample_data: Some(Arc::new(sample.clone())),
+            ..AppState::default()
+        };
+        assert!(
+            state
+                .set_detected_dead_pixels(Some(stale_detected.clone()))
+                .is_none()
+        );
+        let at_save_mask = refit_active_mask(&state).unwrap();
+
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("drift.nrd.h5");
+        let embedded = EmbeddedData {
+            sample: Some(&sample),
+            open_beam: None,
+            spectrum: None,
+        };
+        save_project_with_data(&path, &snapshot_from_state(&state), Some(&embedded)).unwrap();
+
+        let mut restored = AppState::default();
+        state_from_snapshot(load_project(&path).unwrap(), &mut restored, &path);
+
+        // The saved mask is kept active — drift never silently replaces it.
+        assert_eq!(refit_active_mask(&restored).unwrap(), at_save_mask);
+        assert_eq!(
+            restored.detected_dead_pixels.as_ref().unwrap(),
+            &stale_detected
+        );
+        // ...and the drift is observable in status + provenance.
+        assert!(
+            restored.status_message.contains("WARNING"),
+            "status must surface the drift: {}",
+            restored.status_message
+        );
+        assert!(restored.status_message.contains("2 pixel(s)"));
+        assert!(
+            restored
+                .provenance_log
+                .iter()
+                .any(|e| e.message.contains("Detected-mask drift")),
+            "provenance must record the drift"
+        );
+    }
+
+    /// #646 F1 acceptance: a mismatched declared/detected pair on restore
+    /// must stay observable THROUGH step 17's wholesale replacement of
+    /// the session provenance log with the snapshot's — the erasure the
+    /// direct-call setter test (state.rs) cannot see.  End-to-end through
+    /// the real HDF5 writer/reader: no normalized data in the snapshot,
+    /// so restore-side geometry validation cannot apply and the corrupt
+    /// pair reaches `set_detected_dead_pixels`, whose drop notice is
+    /// deferred past step 17 into the final provenance log AND the
+    /// status message.
+    #[test]
+    fn test_restore_mismatched_mask_pair_drop_notice_survives_provenance_replacement() {
+        let mut snap = snapshot_from_state(&AppState::default());
+        // Hand-corrupted pair: declared (4, 4) vs detected (2, 2).
+        snap.dead_pixels = Some(Array2::from_elem((4, 4), true));
+        let mut detected = Array2::from_elem((2, 2), false);
+        detected[[0, 0]] = true;
+        snap.detected_dead_pixels = Some(detected.clone());
+        // The snapshot carries its own provenance history — step 17
+        // replaces the session log with exactly this, which used to
+        // erase the drop entry the setter appended at step 15b.
+        snap.provenance = vec![(
+            "2026-07-04 00:00:00 UTC".into(),
+            "ProjectSaved".into(),
+            "saved in an earlier session".into(),
+        )];
+
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("mismatched_pair.nrd.h5");
+        save_project(&path, &snap).unwrap();
+
+        let mut restored = AppState::default();
+        state_from_snapshot(load_project(&path).unwrap(), &mut restored, &path);
+
+        // Effective mask: the inapplicable declared mask is dropped —
+        // the refit runs with the detected component only.
+        assert_eq!(refit_active_mask(&restored).unwrap(), detected);
+        // The drop survives step 17: the FINAL provenance log carries it
+        // (naming both geometries)...
+        assert!(
+            restored
+                .provenance_log
+                .iter()
+                .any(|e| e.message.contains("(4, 4)") && e.message.contains("(2, 2)")),
+            "final provenance log must carry the declared-mask drop"
+        );
+        // ...alongside the snapshot's own restored history (i.e. the
+        // replacement DID happen and the notice still made it through)...
+        assert!(
+            restored
+                .provenance_log
+                .iter()
+                .any(|e| e.message.contains("saved in an earlier session")),
+            "snapshot provenance must have replaced the session log"
+        );
+        // ...and the status message surfaces it too.
+        assert!(
+            restored.status_message.contains("WARNING")
+                && restored.status_message.contains("(4, 4)")
+                && restored.status_message.contains("(2, 2)"),
+            "status must surface the drop: {}",
+            restored.status_message
+        );
+    }
+
+    /// #646 F3: a hand-corrupted persisted DETECTED component of the
+    /// wrong geometry must not become the effective mask — with restored
+    /// ROIs the analyze-side ROI∪mask merge (`ndarray::Zip`,
+    /// guided/analyze.rs) panics on the shape mismatch.  With normalized
+    /// data restored the geometry is known at step 15b, so the component
+    /// is dropped and the drop surfaced in status + provenance.
+    #[test]
+    fn test_restore_drops_wrong_geometry_detected_component_with_notice() {
+        let mut declared = Array2::from_elem((3, 3), false);
+        declared[[0, 0]] = true;
+
+        let mut snap = snapshot_from_state(&AppState::default());
+        snap.normalized = Some(Array3::from_elem((1, 3, 3), 0.5));
+        snap.dead_pixels = Some(declared.clone());
+        // Corrupt: detected component from a different geometry.
+        snap.detected_dead_pixels = Some(Array2::from_elem((2, 2), true));
+
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("wrong_geom_detected.nrd.h5");
+        save_project(&path, &snap).unwrap();
+
+        let mut restored = AppState::default();
+        state_from_snapshot(load_project(&path).unwrap(), &mut restored, &path);
+
+        // The wrong-geometry detected component is dropped; the declared
+        // component (which matches the data) is kept and becomes the
+        // effective mask.
+        assert!(restored.detected_dead_pixels.is_none());
+        assert_eq!(restored.file_dead_pixels.as_ref().unwrap(), &declared);
+        assert_eq!(refit_active_mask(&restored).unwrap(), declared);
+        // Mask-geometry invariant that makes the analyze ROI-merge panic
+        // unreachable: the effective mask matches the restored
+        // transmission's spatial dims.
+        let t = &restored.normalized.as_ref().unwrap().transmission;
+        let dims = (t.shape()[1], t.shape()[2]);
+        assert_eq!(restored.dead_pixels.as_ref().unwrap().dim(), dims);
+        // Drive the same ROI∪mask merge analyze performs (Zip panics on
+        // shape mismatch) — must not panic now that geometry is enforced.
+        let mut roi_mask = Array2::from_elem(dims, true);
+        if let Some(ref dp) = restored.dead_pixels {
+            ndarray::Zip::from(&mut roi_mask)
+                .and(dp)
+                .for_each(|m, &d| *m = *m || d);
+        }
+        // Drop surfaced in status + final provenance, never silent.
+        assert!(
+            restored.status_message.contains("WARNING")
+                && restored.status_message.contains("detected mask"),
+            "status must surface the drop: {}",
+            restored.status_message
+        );
+        assert!(
+            restored
+                .provenance_log
+                .iter()
+                .any(|e| e.message.contains("detected mask") && e.message.contains("dropped")),
+            "provenance must record the drop"
+        );
+    }
+
+    /// #646 F3: BOTH persisted components wrong against the restored
+    /// data geometry — both are dropped (effective mask absent, not
+    /// wrong), each drop gets its own notice, and the setter's own
+    /// mismatch arm never double-fires (it receives an already-validated
+    /// pair).
+    #[test]
+    fn test_restore_drops_both_wrong_geometry_mask_components() {
+        let mut snap = snapshot_from_state(&AppState::default());
+        snap.normalized = Some(Array3::from_elem((1, 3, 3), 0.5));
+        snap.dead_pixels = Some(Array2::from_elem((4, 4), true));
+        snap.detected_dead_pixels = Some(Array2::from_elem((2, 2), true));
+
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("both_wrong_geom.nrd.h5");
+        save_project(&path, &snap).unwrap();
+
+        let mut restored = AppState::default();
+        state_from_snapshot(load_project(&path).unwrap(), &mut restored, &path);
+
+        assert!(restored.file_dead_pixels.is_none());
+        assert!(restored.detected_dead_pixels.is_none());
+        assert!(restored.dead_pixels.is_none());
+        // One notice per dropped component, both in status and provenance.
+        assert!(
+            restored.status_message.contains("declared mask")
+                && restored.status_message.contains("detected mask"),
+            "status must surface both drops: {}",
+            restored.status_message
+        );
+        assert_eq!(
+            restored
+                .provenance_log
+                .iter()
+                .filter(|e| e.message.contains("Pixel-mask restore:"))
+                .count(),
+            2,
+            "one provenance entry per dropped component"
+        );
+    }
 }

@@ -151,9 +151,14 @@ fn histogram_events(state: &mut AppState) {
                 }
             }
 
-            if let Some(dead) = data.dead_pixels {
-                state.dead_pixels = Some(dead);
-            }
+            // Declared-mask provenance (#646) — same contract as the
+            // histogram load site (guided::load::load_hdf5_histogram): the
+            // file-declared mask is assigned unconditionally to its own
+            // field, and normalization recomputes the effective mask via
+            // AppState::set_detected_dead_pixels.
+            state.file_dead_pixels = data.dead_pixels.clone();
+            state.dead_pixels = data.dead_pixels;
+            state.detected_dead_pixels = None;
 
             state.log_provenance(
                 ProvenanceEventKind::DataLoaded,

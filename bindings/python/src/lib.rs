@@ -50,8 +50,8 @@ use nereids_endf::resonance::{
 };
 use nereids_endf::retrieval::{EndfLibrary, EndfRetriever, mat_number};
 use nereids_fitting::resolution_calib::{
-    CalibrationConfig, ResolutionFamily, UDR_S0_MAX, UDR_S0_MIN,
-    calibrate_resolution as rust_calibrate_resolution,
+    CalibrationConfig, DEFAULT_PSR_FWHM_NS, NS_TO_US, PSR_FWHM_PIN_CEILING_US, ResolutionFamily,
+    UDR_S0_MAX, UDR_S0_MIN, calibrate_resolution as rust_calibrate_resolution,
 };
 use nereids_io::normalization::{self as norm, NormalizationParams};
 use nereids_io::tof::BeamlineParams;
@@ -836,8 +836,15 @@ impl PyIkedaCarpenter {
 
     /// `(tof_offsets_us, weights)` kernel at a single energy (eV); offsets
     /// ascending with the mode at 0, weights peak-normalized.
-    fn kernel_at(&self, energy_ev: f64) -> (Vec<f64>, Vec<f64>) {
-        self.inner.kernel_at(energy_ev)
+    ///
+    /// Raises ``ValueError`` when the τ-grid cannot resolve the prompt core
+    /// and requested folds within the sample cap at this energy (construction
+    /// validates the reference energies; a probe energy outside their range
+    /// can still be unresolvable).
+    fn kernel_at(&self, energy_ev: f64) -> PyResult<(Vec<f64>, Vec<f64>)> {
+        self.inner
+            .kernel_at(energy_ev)
+            .map_err(|e| pyo3::exceptions::PyValueError::new_err(e.to_string()))
     }
 
     /// Flight path length in meters.
@@ -1317,6 +1324,11 @@ impl PyResolutionCalibration {
     }
 
     /// Decoded, human-readable fitted parameters.
+    ///
+    /// For ``family="ic"`` (#642) the keys are ``a0``/``a1`` (α(E) = a0·√E +
+    /// a1, positive by construction), ``beta``, ``r`` and ``psr_fwhm_us`` —
+    /// decoded from the calibrated resolution itself (the raw ``theta`` is
+    /// ln/box-encoded optimizer space).
     fn params<'py>(&self, py: Python<'py>) -> PyResult<Bound<'py, pyo3::types::PyDict>> {
         let d = pyo3::types::PyDict::new(py);
         match self.inner.family.as_str() {
@@ -1332,12 +1344,40 @@ impl PyResolutionCalibration {
                 d.set_item("delta_l_m", self.inner.theta[1].abs())?;
             }
             _ => {
-                // IC fits (a0, a1); β is held fixed (unidentifiable in the eV regime).
-                d.set_item("a0", self.inner.theta[0].abs())?;
-                d.set_item("a1", self.inner.theta[1])?;
+                // IC: decode off the calibrated resolution — the single source
+                // of truth (never re-derive from the encoded theta by hand).
+                // The a0/a1 keys keep their pre-#642 meaning for back-compat.
+                if let ResolutionFunction::IkedaCarpenter(ic) = &self.inner.resolution {
+                    let p = ic.params();
+                    if let EnergyLaw::SqrtE { a0, a1 } = &p.alpha {
+                        d.set_item("a0", *a0)?;
+                        d.set_item("a1", *a1)?;
+                    }
+                    d.set_item("beta", p.beta)?;
+                    if let EnergyLaw::Const(r) = &p.r {
+                        d.set_item("r", *r)?;
+                    }
+                    d.set_item("psr_fwhm_us", p.channel_fwhm_us.unwrap_or(0.0))?;
+                }
             }
         }
         Ok(d)
+    }
+
+    /// Number of outer-loop free parameters: resolution θ plus any fitted
+    /// position coordinates (4–5 for ``"ic"``, 2 for the other families).
+    #[getter]
+    fn n_free_params(&self) -> usize {
+        self.inner.n_free_params
+    }
+
+    /// Coordinates pinned at a box bound at the solution, as
+    /// ``"name:lower"`` / ``"name:upper"`` strings (empty = interior
+    /// solution). E.g. ``"r:lower"`` flags the β↔R ridge: the calibrant shows
+    /// no storage tail, so the reported β carries no information.
+    #[getter]
+    fn bounds_hit(&self) -> Vec<String> {
+        self.inner.bounds_hit.clone()
     }
 
     /// The calibrated resolution as a [`TabulatedResolution`] — pass to
@@ -1363,8 +1403,12 @@ impl PyResolutionCalibration {
 
     fn __repr__(&self) -> String {
         format!(
-            "ResolutionCalibration(family={}, chi2/dof={:.4}, converged={})",
-            self.inner.family, self.inner.chi2_dof, self.inner.converged
+            "ResolutionCalibration(family={}, chi2/dof={:.4}, converged={}, n_free_params={}, bounds_hit={:?})",
+            self.inner.family,
+            self.inner.chi2_dof,
+            self.inner.converged,
+            self.inner.n_free_params,
+            self.inner.bounds_hit
         )
     }
 }
@@ -1377,7 +1421,10 @@ impl PyResolutionCalibration {
 ///
 /// Args:
 ///     energies, data, uncertainty: calibrant transmission spectrum.
-///     family: ``"gaussian"`` | ``"udr_corr"`` | ``"ic"``.
+///     family: ``"gaussian"`` | ``"udr_corr"`` | ``"ic"``. The ``"ic"`` family
+///         (#642) fits the full bounded moderator shape — ``α(E) = a0·√E + a1``
+///         positive by construction, free bounded ``beta`` and storage
+///         fraction ``r`` — folded with the SNS PSR channel triangle.
 ///     isotopes / groups: known calibrant composition + density (exactly one).
 ///     temperature_k: known calibrant temperature.
 ///     base_udr: base UDR kernel (required for ``family="udr_corr"``).
@@ -1393,18 +1440,36 @@ impl PyResolutionCalibration {
 ///         set from the instrument's flight-path / timing metrology.
 ///     t0_center_us, l_scale_center: prior means / pinned values (default 0.0, 1.0).
 ///     t0_prior_us, l_scale_prior: Gaussian prior σ (``None`` = flat/bounded only).
+///     psr_fwhm_ns: SNS PSR channel-triangle FWHM in ns, folded into the
+///         ``"ic"`` family's kernel only (default 350 — the VENUS FTS header
+///         value; ``0`` disables). Tabulated/UDR kernels already carry the
+///         fold in the file and are never re-folded. NANOSECONDS: values
+///         above 10_000 ns (10 µs) are rejected as a µs-as-ns unit slip
+///         (synthesis cost is quadratic in the fold width).
+///     fit_psr: also FIT the PSR FWHM (``"ic"`` only; appends a 5th
+///         parameter, box-bounded 0.05–1 µs, started at ``psr_fwhm_ns``
+///         clamped into that box — an out-of-box start, legal as a pin up
+///         to 10 µs, starts at the nearer box edge with a stderr warning,
+///         and a fit that stays there reports ``psr_fwhm_us:lower`` /
+///         ``:upper`` in ``bounds_hit``; ``psr_fwhm_ns`` must then be > 0:
+///         a zero start contradicts "0 disables").
 ///
 /// Returns:
 ///     ResolutionCalibration with the fitted params, data χ²/dof, the fitted (or
 ///     pinned) ``position_t0_us`` / ``position_l_scale`` / ``prior_penalty``, and
 ///     the calibrated resolution (``.as_tabulated()`` / ``.gaussian_params()``).
+// `psr_fwhm_ns` / `fit_psr` sit at the END of the signature (after every
+// parameter that predates them): inserting them mid-signature would silently
+// shift the meaning of existing ≥ 14-positional-argument calls (review #645
+// F7). Keep any future additions at the end for the same reason.
 #[pyfunction]
 #[pyo3(signature = (
     energies, data, uncertainty, family, isotopes=None, groups=None,
     temperature_k=293.6, base_udr=None, flight_path_m=25.0, fit_background=false,
     restarts=1, ic_n_energies=64, ic_n_tau=500,
     fit_t0=false, fit_l_scale=false, t0_center_us=0.0, l_scale_center=1.0,
-    t0_prior_us=None, l_scale_prior=None
+    t0_prior_us=None, l_scale_prior=None,
+    psr_fwhm_ns=DEFAULT_PSR_FWHM_NS, fit_psr=false
 ))]
 #[allow(clippy::too_many_arguments)]
 fn calibrate_resolution(
@@ -1428,6 +1493,8 @@ fn calibrate_resolution(
     l_scale_center: f64,
     t0_prior_us: Option<f64>,
     l_scale_prior: Option<f64>,
+    psr_fwhm_ns: f64,
+    fit_psr: bool,
 ) -> PyResult<PyResolutionCalibration> {
     if isotopes.is_some() == groups.is_some() {
         return Err(pyo3::exceptions::PyValueError::new_err(
@@ -1490,7 +1557,7 @@ fn calibrate_resolution(
 
     let fam = match family {
         "gaussian" => ResolutionFamily::Gaussian,
-        "ic" => ResolutionFamily::IkedaCarpenter,
+        "ic" => ResolutionFamily::IkedaCarpenter { fit_psr },
         "udr_corr" => {
             let base = base_udr.ok_or_else(|| {
                 pyo3::exceptions::PyValueError::new_err(
@@ -1506,11 +1573,18 @@ fn calibrate_resolution(
         }
     };
 
+    // fit_psr appends the PSR-FWHM fit coordinate, which only the IC family
+    // carries — reject the flag on other families instead of silently ignoring it.
+    if fit_psr && !matches!(fam, ResolutionFamily::IkedaCarpenter { .. }) {
+        return Err(pyo3::exceptions::PyValueError::new_err(format!(
+            "fit_psr=True requires family='ic', got family='{family}'"
+        )));
+    }
     // For family='ic' these size the kernel-synthesis grid; validate up front so an
     // out-of-range value gives a precise error instead of the generic "no finite-χ²
     // resolution" (every IkedaCarpenter::new eval would otherwise fail). They are
     // inert for the gaussian/udr_corr families.
-    if matches!(fam, ResolutionFamily::IkedaCarpenter) {
+    if matches!(fam, ResolutionFamily::IkedaCarpenter { .. }) {
         if ic_n_energies < 2 {
             return Err(pyo3::exceptions::PyValueError::new_err(format!(
                 "ic_n_energies must be >= 2 for family='ic', got {ic_n_energies}"
@@ -1521,6 +1595,39 @@ fn calibrate_resolution(
                 "ic_n_tau must be >= 8 for family='ic', got {ic_n_tau}"
             )));
         }
+        // PSR triangle FWHM: finite and >= 0 ns (0 disables the fold). Also
+        // enforced by the Rust calibrator; rejected here with the precise
+        // Python-facing message.
+        if !psr_fwhm_ns.is_finite() || psr_fwhm_ns < 0.0 {
+            return Err(pyo3::exceptions::PyValueError::new_err(format!(
+                "psr_fwhm_ns must be finite and >= 0 (0 disables the PSR fold), got {psr_fwhm_ns}"
+            )));
+        }
+        // Sanity ceiling (mirrors the Rust calibrator; see
+        // PSR_FWHM_PIN_CEILING_US): psr_fwhm_ns is NANOSECONDS and kernel-
+        // synthesis cost is quadratic in the fold width, so a µs-as-ns unit
+        // slip (350 meaning µs) would hang the calibration for hours behind
+        // a fictitious fold. Reject with the precise Python-facing message.
+        if psr_fwhm_ns * NS_TO_US > PSR_FWHM_PIN_CEILING_US {
+            return Err(pyo3::exceptions::PyValueError::new_err(format!(
+                "psr_fwhm_ns={psr_fwhm_ns} ns (= {} us) exceeds the {PSR_FWHM_PIN_CEILING_US} \
+                 us sanity ceiling: psr_fwhm_ns is in NANOSECONDS (the SNS/VENUS FTS \
+                 convention is 350 ns) and kernel-synthesis cost grows quadratically with \
+                 the fold width, so a us-as-ns unit slip would hang the calibration. Pass \
+                 the width in ns, or 0 to disable the PSR fold",
+                psr_fwhm_ns * NS_TO_US
+            )));
+        }
+        // fit_psr fits the PSR FWHM from the psr_fwhm_ns starting value, but 0
+        // means "no fold" — a zero start would be silently clamped into the
+        // [0.05, 1] us fit box, contradicting the documented "0 disables".
+        // Also enforced by the Rust calibrator.
+        if fit_psr && psr_fwhm_ns == 0.0 {
+            return Err(pyo3::exceptions::PyValueError::new_err(
+                "fit_psr=True requires a positive psr_fwhm_ns starting value (psr_fwhm_ns=0 \
+                 disables the PSR fold; use fit_psr=False to calibrate without one)",
+            ));
+        }
     }
 
     let cfg = CalibrationConfig {
@@ -1529,6 +1636,7 @@ fn calibrate_resolution(
         restarts,
         ic_n_energies,
         ic_n_tau,
+        psr_fwhm_ns,
         fit_t0,
         fit_l_scale,
         position_t0_center_us: t0_center_us,
@@ -2724,7 +2832,15 @@ fn precompute_cross_sections<'py>(
 ///
 /// A pixel is marked as "dead" when all its counts across the spectral/TOF
 /// axis are exactly zero.  The returned mask can be passed directly to
-/// ``spatial_map(dead_pixels=...)``.
+/// ``spatial_map_typed(dead_pixels=...)``.
+///
+/// Pixel masks are a **pipeline-integrity screen only** — they exclude
+/// pixels whose data stream is broken (dead, hot/railed), never low-count
+/// or poorly covered pixels.  Low-count pixels are alive and must be kept.
+/// Prefer ``detect_bad_pixels()`` (validating, unions sample and open-beam,
+/// optional hot screen); see also ``detect_hot_pixels()`` and
+/// ``detect_dead_pixels_chunked()`` for intermittent deadness across
+/// acquisition chunks.
 ///
 /// Args:
 ///     data: 3D numpy array with shape ``(n_frames, height, width)``.
@@ -2740,6 +2856,167 @@ fn detect_dead_pixels<'py>(
 ) -> PyResult<Bound<'py, PyArray2<bool>>> {
     let arr = data.as_array().to_owned();
     let mask = py.detach(move || norm::detect_dead_pixels(&arr));
+    Ok(PyArray2::from_owned_array(py, mask))
+}
+
+/// Detect hot (railed / runaway) pixels — two-stage screen.
+///
+/// Stage 1 (global): robust one-sided cut on per-pixel total counts — a
+/// pixel is a candidate when ``ln(total) > median + k_mad * sigma``, where
+/// median and MAD are computed over the live (``total > 0``) pixels only
+/// and ``sigma`` is the MAD-based robust scale floored by the Poisson
+/// counting noise of the median total.  Stage 2 (local), iterated to a
+/// fixpoint: a candidate is flagged only if its total also exceeds 10x the
+/// median of its 8-neighborhood reference sample — live unflagged
+/// neighbors contribute their totals, already-flagged neighbors contribute
+/// 0 (a known defect cannot vouch for its neighbors), dead neighbors are
+/// omitted; edge pixels use whatever neighbors exist, and a candidate with
+/// no live neighbor keeps the global verdict.  Passes repeat until no new
+/// flag is added (bounded by ``height * width`` passes; in practice ~the
+/// defect-cluster radius), eroding railed CLUSTERS from the boundary
+/// inward — a single pass would miss the interior of clusters >= 2 px
+/// wide, whose neighbors are railed too.  Clusters up to 3 px wide are
+/// fully consumed PROVIDED they expose at least one end cap or convex
+/// corner to normal-scene neighbors (erosion must seed somewhere): an
+/// EDGE-TO-EDGE railed band >= 2 px wide, spanning the full detector
+/// width or height with both ends off-detector, has no seed and is NOT
+/// caught — deliberately, because a slit-aperture open beam produces a
+/// genuine full-width bright scene band pixel-for-pixel
+/// indistinguishable from it, and a full-span screen would mask that
+/// scene (the bimodal failure).  Declare such full-span detector
+/// pathologies in a file mask.  A full-span width-1 railed line IS
+/// caught (each pixel keeps >= 4 normal neighbors).  The local
+/// confirmation keeps bimodal scenes honest:
+/// with a dark majority holding the median, the global statistics describe
+/// only the dark population and the entire bright region would otherwise
+/// be masked — a contiguous bright region is scene, not a defect.  Upper
+/// tail only — stuck-low pixels are indistinguishable from low-count-alive
+/// pixels and are kept (masks are pipeline-integrity only, never a
+/// low-count screen).
+///
+/// Bright SCENE regions never erode: a boundary pixel of a contiguous
+/// bright region >= 2 px wide keeps >= 4 same-side neighbors for any
+/// straight or diagonal edge, so its reference median stays bright and
+/// scene gradients (<= 2-3x across real edges) never reach the 10x factor
+/// — the erosion has no seed.  Documented width-1 limitation (accepted
+/// trade-off): a 1-px-wide bright scene line at >= 10x local contrast is
+/// spatially indistinguishable from a railed line and IS masked; real
+/// scene features on VENUS are PSF-blurred over >= 2 px, so >= 10x
+/// single-pixel scene contrast is physically rare, and contiguous bright
+/// regions of width >= 2 are safe from the local stage.
+///
+/// ``data`` must be RAW detected counts (unscaled): the Poisson floor
+/// assumes ``Var[N] = N``, so scaled inputs silently distort it —
+/// down-scaling (proton-charge-normalized rates << 1, gain division)
+/// inflates the floor and can suppress real flags; up-scaling (event
+/// weights > 1) deflates it.  Detect on raw counts, normalize afterwards.
+///
+/// Args:
+///     data: 3D numpy array of raw counts with shape
+///         ``(n_frames, height, width)``.
+///     k_mad: Robust-sigma multiplier for the stage-1 upper-tail cut
+///         (default 6.0: one-sided Gaussian tail ~1e-9, on a unimodal
+///         image essentially never flags a statistically plausible pixel).
+///
+/// Returns:
+///     2D boolean numpy array with shape ``(height, width)``.
+///     ``True`` marks a hot pixel.
+///
+/// Raises:
+///     ValueError: If ``data`` contains non-finite or negative values or
+///         has zero frames (``shape[0] == 0``), or ``k_mad`` is not finite
+///         and positive.
+#[pyfunction]
+#[pyo3(signature = (data, k_mad = norm::HOT_PIXEL_K_MAD))]
+fn detect_hot_pixels<'py>(
+    py: Python<'py>,
+    data: PyReadonlyArray3<f64>,
+    k_mad: f64,
+) -> PyResult<Bound<'py, PyArray2<bool>>> {
+    let arr = data.as_array().to_owned();
+    let mask = py.detach(move || norm::detect_hot_pixels(&arr, k_mad));
+    let mask = mask.map_err(|e| pyo3::exceptions::PyValueError::new_err(format!("{}", e)))?;
+    Ok(PyArray2::from_owned_array(py, mask))
+}
+
+/// Detect dead pixels across acquisition chunks (dead in ANY chunk).
+///
+/// Catches intermittent deadness that ``detect_dead_pixels()`` on the
+/// summed stack cannot see: a pixel dead for one acquisition chunk but
+/// alive in another has nonzero summed counts, yet its dead-chunk data
+/// corrupts the combined spectrum.  Chunk the acquisition so each live
+/// pixel has an expected >= 20 total counts per chunk (misflag probability
+/// per live pixel is ``m * exp(-lambda)`` over ``m`` chunks).
+///
+/// Chunks may have different numbers of frames (ragged event
+/// re-histogramming is fine); spatial dimensions must agree.
+///
+/// Args:
+///     chunks: List of 3D numpy arrays, one per acquisition chunk, each
+///         with shape ``(n_frames_i, height, width)``.
+///
+/// Returns:
+///     2D boolean numpy array with shape ``(height, width)``.
+///     ``True`` marks a pixel that is all-zero in at least one chunk.
+///
+/// Raises:
+///     ValueError: If ``chunks`` is empty, any chunk has zero frames
+///         (``shape[0] == 0`` — its all-zero test would vacuously mark
+///         every pixel dead), any chunk contains non-finite or negative
+///         values, or the spatial dimensions differ.
+#[pyfunction]
+fn detect_dead_pixels_chunked<'py>(
+    py: Python<'py>,
+    chunks: Vec<PyReadonlyArray3<f64>>,
+) -> PyResult<Bound<'py, PyArray2<bool>>> {
+    // Copy to owned arrays before releasing the GIL.
+    let owned: Vec<_> = chunks.iter().map(|c| c.as_array().to_owned()).collect();
+    let mask = py.detach(move || norm::detect_dead_pixels_chunked(&owned));
+    let mask = mask.map_err(|e| pyo3::exceptions::PyValueError::new_err(format!("{}", e)))?;
+    Ok(PyArray2::from_owned_array(py, mask))
+}
+
+/// Detect all pipeline-corrupting pixels: dead + hot over sample and
+/// (optionally) open beam.
+///
+/// This is the validating entry point.  Deadness/hotness is
+/// per-acquisition — a pixel dead only in the open-beam run still corrupts
+/// every transmission ratio computed from it — so the masks of both stacks
+/// are unioned: ``dead(sample) | hot(sample) [| dead(ob) | hot(ob)]``.
+/// The stacks' frame counts may differ; spatial dimensions must agree.
+///
+/// Both stacks must be RAW detected counts (unscaled) — see
+/// ``detect_hot_pixels()``: scaling distorts the Poisson floor of the hot
+/// screen.  Detect on raw counts, before any normalization.
+///
+/// Args:
+///     sample: 3D numpy array of raw counts with shape
+///         ``(n_frames, height, width)``.
+///     open_beam: Optional 3D numpy array of raw counts with shape
+///         ``(n_frames2, height, width)``.
+///     hot_k_mad: Robust-sigma multiplier for the hot-pixel screen
+///         (default 6.0), or ``None`` to disable it (dead-only detection).
+///
+/// Returns:
+///     2D boolean numpy array with shape ``(height, width)``.
+///     ``True`` marks a pixel to exclude.
+///
+/// Raises:
+///     ValueError: If either stack contains non-finite or negative values
+///         or has zero frames (``shape[0] == 0``), the spatial dimensions
+///         differ, or ``hot_k_mad`` is not finite and positive.
+#[pyfunction]
+#[pyo3(signature = (sample, open_beam = None, hot_k_mad = Some(norm::HOT_PIXEL_K_MAD)))]
+fn detect_bad_pixels<'py>(
+    py: Python<'py>,
+    sample: PyReadonlyArray3<f64>,
+    open_beam: Option<PyReadonlyArray3<f64>>,
+    hot_k_mad: Option<f64>,
+) -> PyResult<Bound<'py, PyArray2<bool>>> {
+    let s = sample.as_array().to_owned();
+    let ob = open_beam.map(|o| o.as_array().to_owned());
+    let mask = py.detach(move || norm::detect_bad_pixels(&s, ob.as_ref(), hot_k_mad));
+    let mask = mask.map_err(|e| pyo3::exceptions::PyValueError::new_err(format!("{}", e)))?;
     Ok(PyArray2::from_owned_array(py, mask))
 }
 
@@ -3181,6 +3458,9 @@ fn nereids(m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_function(wrap_pyfunction!(py_trace_detectability_survey, m)?)?;
     m.add_function(wrap_pyfunction!(precompute_cross_sections, m)?)?;
     m.add_function(wrap_pyfunction!(detect_dead_pixels, m)?)?;
+    m.add_function(wrap_pyfunction!(detect_hot_pixels, m)?)?;
+    m.add_function(wrap_pyfunction!(detect_dead_pixels_chunked, m)?)?;
+    m.add_function(wrap_pyfunction!(detect_bad_pixels, m)?)?;
     m.add_function(wrap_pyfunction!(py_calibrate_energy, m)?)?;
     m.add_class::<PyCalibrationResult>()?;
     // Phase 5: Typed API
