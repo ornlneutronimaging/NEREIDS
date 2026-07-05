@@ -107,6 +107,13 @@ pub struct SpatialResult {
     /// `Some` when `config.fit_energy_scale` is true; `None` otherwise.
     /// NaN at pixels where `converged_map` is `false`.
     pub l_scale_map: Option<Array2<f64>>,
+    /// Nominal flight path (m) the energy-scale fit was configured with —
+    /// recorded AT FIT TIME so downstream consumers (e.g. the GUI overlay's
+    /// per-pixel `SpectrumFitResult::corrected_energies`) reproduce the
+    /// transform with the fit's own flight path even if the live beamline
+    /// setting is edited afterwards (issue #634 review).  `Some` when
+    /// `config.fit_energy_scale` is true; `None` otherwise.
+    pub energy_scale_flight_path_m: Option<f64>,
     /// Number of pixels that converged.
     pub n_converged: usize,
     /// Total number of pixels fitted.
@@ -925,6 +932,7 @@ pub fn spatial_map_typed(
             } else {
                 None
             },
+            energy_scale_flight_path_m: config.fit_energy_scale().then(|| config.flight_path_m()),
             n_converged: 0,
             n_total: 0,
             n_failed: 0,
@@ -1737,6 +1745,7 @@ pub fn spatial_map_typed(
         back_f_map,
         t0_us_map,
         l_scale_map,
+        energy_scale_flight_path_m: config.fit_energy_scale().then(|| config.flight_path_m()),
         n_converged,
         n_total: pixel_coords.len(),
         n_failed: failed_count.load(Ordering::Relaxed),

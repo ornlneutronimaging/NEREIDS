@@ -2072,6 +2072,20 @@ impl EnergyScaleTransmissionModel {
         e_corr: &[f64],
         temperature_k: f64,
     ) -> Result<transmission::WorkingGridXs, FittingError> {
+        // Issue #634 review: validate the (possibly fitted) temperature at
+        // the point of consumption, mirroring
+        // `PrecomputedTransmissionModel::evaluate`.  Without this, a NaN or
+        // negative `params[temperature_index]` flows into
+        // `broadened_cross_sections_on_working_grid`, whose
+        // `temperature_k > 0.0` branch silently SKIPS Doppler broadening and
+        // returns plausible unbroadened σ as `Ok` ("NaN bypasses guards").
+        // The production fitter bounds T ∈ [1, 5000] K, so this guard fires
+        // only for direct model API misuse — but the model is public.
+        if !temperature_k.is_finite() || temperature_k < 0.0 {
+            return Err(FittingError::EvaluationFailed(format!(
+                "temperature must be finite and non-negative, got {temperature_k}"
+            )));
+        }
         // Issue #608: a degenerate calibration can drive corrected energies to
         // 0 (l_scale → 0) or non-finite (l_scale → ∞).  `reich_moore` asserts
         // positive finite energy (an always-on `assert!`), so without this guard

@@ -247,24 +247,17 @@ fn fit_controls(ui: &mut egui::Ui, state: &mut AppState, available_height_hint: 
 
         let draw_advanced_solver = |ui: &mut egui::Ui, state: &mut AppState| {
             ui.indent("advanced_solver", |ui| {
-                // Fit temperature and Fit energy scale are mutually exclusive
-                // (pipeline returns a hard error if both are true — see
-                // `pipeline.rs` ~L977).  Grey out each when the other is on so
-                // the constraint is visible in the UI rather than only at fit
-                // time.
-                ui.add_enabled(
-                    !state.fit_energy_scale,
-                    egui::Checkbox::new(
-                        &mut state.fit_temperature,
-                        "Fit temperature (slow for Spatial Map)",
-                    ),
+                // Fit temperature and Fit energy scale can be combined since
+                // issue #634 (the energy-scale model carries a fitted
+                // temperature column) — the joint (t\u{2080}, L_scale, T) fit
+                // is the standard resonance-thermometry workflow.
+                ui.checkbox(
+                    &mut state.fit_temperature,
+                    "Fit temperature (slow for Spatial Map)",
                 );
-                ui.add_enabled(
-                    !state.fit_temperature,
-                    egui::Checkbox::new(
-                        &mut state.fit_energy_scale,
-                        "Fit energy scale (TZERO t\u{2080} + L_scale, SAMMY equivalent)",
-                    ),
+                ui.checkbox(
+                    &mut state.fit_energy_scale,
+                    "Fit energy scale (TZERO t\u{2080} + L_scale, SAMMY equivalent)",
                 )
                 .on_hover_text(
                     "Adds the residual time-zero offset t\u{2080} (\u{03BC}s) \
@@ -274,8 +267,9 @@ fn fit_controls(ui: &mut egui::Ui, state: &mut AppState, available_height_hint: 
                  has already been subtracted when building the energy \
                  grid, and L_scale multiplies the configured Flight \
                  Path.  Optimiser bound: t\u{2080} \u{2208} \u{00B1}10 \
-                 \u{03BC}s, L_scale \u{2208} [0.99, 1.01].  Mutually \
-                 exclusive with Fit temperature.",
+                 \u{03BC}s, L_scale \u{2208} [0.99, 1.01].  Can be \
+                 combined with Fit temperature (issue #634) for joint \
+                 energy-scale + temperature thermometry.",
                 );
                 // SAMMY EMIN/EMAX-equivalent fit-energy-range restriction (#514).
                 // The checkbox toggles the `Option<(f64, f64)>` state field;
@@ -1144,13 +1138,11 @@ fn selected_pixel_fit_result_for_overlay(
         back_f: result.back_f_map.as_ref().map(|map| map[[y, x]]),
         t0_us: result.t0_us_map.as_ref().map(|map| map[[y, x]]),
         l_scale: result.l_scale_map.as_ref().map(|map| map[[y, x]]),
-        // The spatial fit was configured with the beamline flight path (see
-        // `build_fit_config`'s `with_energy_scale` call), so the overlay
-        // result carries the same value when the energy scale was fitted.
-        energy_scale_flight_path_m: result
-            .t0_us_map
-            .as_ref()
-            .map(|_| state.beamline.flight_path_m),
+        // Use the flight path RECORDED AT FIT TIME on the spatial result —
+        // not the live beamline setting, which the user may have edited
+        // since the fit (issue #634 review: a stale-state flight path would
+        // reopen the mismatch channel the stored field exists to close).
+        energy_scale_flight_path_m: result.energy_scale_flight_path_m,
         deviance_per_dof: result.deviance_per_dof_map.as_ref().map(|map| map[[y, x]]),
     })
 }
@@ -2230,9 +2222,8 @@ fn build_fit_config(state: &AppState) -> Result<(UnifiedFitConfig, Range<usize>)
     }
 
     // Energy-scale calibration: TZERO t₀ (μs) + flight-path L_scale
-    // (dimensionless) as free parameters.  Pipeline rejects the
-    // combination with fit_temperature; the UI grey-out should
-    // prevent that path.
+    // (dimensionless) as free parameters.  Composes with
+    // fit_temperature since issue #634 (joint thermometry fit).
     //
     // **Why `t0_init_us = 0.0`** (not `state.beamline.delay_us`):
     // `tof_edges_to_energy` (`nereids-io::tof`) already subtracts

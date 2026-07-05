@@ -20,8 +20,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
   reconstruction reproduces the reported temperature σ to <0.1 %).
 - **`corrected_energies()` accessor** (#634): `SpectrumFitResult` (Rust)
   and `FitResult` (Python) expose the exact energy-scale transform the
-  fit used — `corrected_energies(nominal_energies, flight_path_m)` maps
-  a nominal grid through the fitted `(t0_us, l_scale)` with the SAMMY
+  fit used — `corrected_energies(nominal_energies)` maps a nominal grid
+  through the fitted `(t0_us, l_scale)`, using the flight path stored on
+  the result at fit time, with the SAMMY
   `−t0` sign convention (`dat/mdat0.f90:189`), returning `None` when the
   energy scale was not fitted. Hand-deriving this transform (with a
   `+t0` slip) previously caused a silent +400 K temperature bias.

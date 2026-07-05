@@ -1108,8 +1108,9 @@ pub mod test_support {
     /// 36.68 eV), Reich-Moore.  Multiple dips at different energies break the
     /// (t0, L_scale) degeneracy that a single resonance leaves — a single dip
     /// cannot separate a TOF offset from a flight-path scale.  Used by the
-    /// energy-scale calibration and joint temperature-recovery tests (#634),
-    /// mirroring the Python `TestFitEnergyScaleRecovery` fixture.
+    /// energy-scale calibration and joint temperature-recovery tests (#634);
+    /// analogous to (not numerically identical with) the Python
+    /// `TestFitEnergyScaleRecovery` fixture.
     pub fn u238_three_resonances() -> ResonanceData {
         wrap(
             92,

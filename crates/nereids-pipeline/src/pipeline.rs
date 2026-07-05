@@ -873,6 +873,10 @@ impl UnifiedFitConfig {
     pub fn fit_energy_scale(&self) -> bool {
         self.fit_energy_scale
     }
+    /// Nominal flight path (m) configured via [`Self::with_energy_scale`].
+    pub fn flight_path_m(&self) -> f64 {
+        self.flight_path_m
+    }
     /// User-specified fit-energy-range restriction (SAMMY EMIN/EMAX
     /// equivalent), or `None` for full-grid fitting.
     /// See [`Self::with_fit_energy_range`].
@@ -4866,7 +4870,13 @@ mod tests {
         .unwrap();
         let sigma_t_ref = reference.temperature_k_unc.expect("reference σ_T");
 
-        // (c1) strict physical invariant.
+        // (c1) strict inequality.  NOTE: this compares σ_T across two
+        // DIFFERENT models (4-param energy-scale on the nominal grid vs
+        // 2-param fixed-grid on the true corrected grid), so the nested-
+        // model Fisher argument does not make it a theorem — it is an
+        // empirical property of THIS fixture (verified robust here). If a
+        // future fixture change flips it, convert to the same-model form
+        // (t0/L_scale frozen vs free), where the inequality is guaranteed.
         assert!(sigma_t_joint.is_finite() && sigma_t_joint > 0.0);
         assert!(sigma_t_ref.is_finite() && sigma_t_ref > 0.0);
         assert!(
@@ -4945,9 +4955,19 @@ mod tests {
         let nominal: Vec<f64> = (0..50).map(|i| 5.0 + i as f64 * 0.3).collect();
         let flight_path = 25.0;
         let (t0, ls) = (0.4_f64, 1.003_f64);
-        let expected =
-            nereids_fitting::resolution_calib::corrected_energy_grid(&nominal, t0, ls, flight_path)
-                .unwrap();
+        // Hand-computed oracle — deliberately NOT `corrected_energy_grid`
+        // (the very helper the accessor delegates to), so a sign flip,
+        // argument swap, or wrong flight-path source in the accessor wiring
+        // cannot cancel (issue #634 review: circular-oracle gap).  Formula
+        // per SAMMY dat/mdat0.f90:189: E' = (kl·ls / (kl/√E − t0))².
+        let kl = nereids_physics::resolution::TOF_FACTOR * flight_path;
+        let expected: Vec<f64> = nominal
+            .iter()
+            .map(|&e| {
+                let tof = kl / e.sqrt();
+                (kl * ls / (tof - t0)).powi(2)
+            })
+            .collect();
 
         let mk = |t0: Option<f64>, ls: Option<f64>, fp: Option<f64>| SpectrumFitResult {
             densities: vec![0.001],

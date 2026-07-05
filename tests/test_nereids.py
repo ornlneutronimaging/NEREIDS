@@ -2759,6 +2759,18 @@ class TestFitEnergyScaleRecovery:
             f"temperature not recovered jointly: got {r.temperature_k}, "
             f"want {TRUE_TEMP}"
         )
+        # Non-identity accessor oracle (#634 review): at a genuinely shifted
+        # calibration, corrected_energies(e_meas) must land on the TRUE
+        # energy axis the data was synthesized on (to within the recovered
+        # parameters' accuracy) — a no-op accessor returns e_meas instead,
+        # which differs from e_true by ~0.5-1 % here.
+        corr = np.asarray(r.corrected_energies(e_meas))
+        med_rel = np.median(np.abs(corr - e_true) / e_true)
+        noop_rel = np.median(np.abs(e_meas - e_true) / e_true)
+        assert med_rel < 0.2 * noop_rel, (
+            f"corrected axis (med rel err {med_rel:.2e}) should be far closer "
+            f"to truth than the uncorrected axis ({noop_rel:.2e})"
+        )
 
     def test_corrected_energies_accessor(self):
         """Issue #634: FitResult.corrected_energies maps a nominal grid through
@@ -2795,6 +2807,15 @@ class TestFitEnergyScaleRecovery:
         corr = np.asarray(corr)
         assert corr.shape == energies.shape
         assert np.all(np.isfinite(corr)) and np.all(np.diff(corr) > 0)
+        # Non-circular numeric oracle (#634 review): hand-compute the SAMMY
+        # −t0 transform in numpy from the FITTED (t0, l_scale) and the fit's
+        # flight path — a no-op accessor, a sign flip, a t0/l_scale swap, or
+        # a wrong flight-path source all break this equality, none of which
+        # the shape/finite asserts above can see.
+        kl = _TOF_FACTOR * L_NOM
+        tof = kl / np.sqrt(energies)
+        expected = (kl * float(r_es.l_scale) / (tof - float(r_es.t0_us))) ** 2
+        np.testing.assert_allclose(corr, expected, rtol=1e-12)
 
         # No energy-scale fit → None (distinguishes "unfit" from "identity").
         r_plain = nereids.fit_spectrum_typed(
