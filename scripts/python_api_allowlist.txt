@@ -57,12 +57,6 @@ TraceDetectabilityReport
 IsotopeGroup
 
 # ---------------------------------------------------------------------------
-# Dead-pixel detection helper; partially covered by the spatial-mapping
-# "dead_pixels=" kwarg, but the detector itself has no section yet.
-# ---------------------------------------------------------------------------
-detect_dead_pixels
-
-# ---------------------------------------------------------------------------
 # Research-only Jacobian/Fisher evaluator (research follow-up work); no
 # narrative section yet — pdoc reference covers the signature.
 # ---------------------------------------------------------------------------

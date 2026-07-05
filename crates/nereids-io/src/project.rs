@@ -17,6 +17,20 @@ use crate::error::IoError;
 /// Current schema version written to `/meta/version`.
 pub const PROJECT_SCHEMA_VERSION: &str = "1.0";
 
+/// Format version written to the `format_version` attribute of the
+/// `/intermediate/detected_dead_pixels` dataset (#646 review R4, P1-1).
+///
+/// The dataset carries the session-scoped *detected* dead/hot mask
+/// component (the declared component lives at
+/// `/intermediate/dead_pixels`, unversioned for backward compatibility).
+/// Readers accept exactly this version; a dataset with a missing or
+/// unrecognized `format_version` is ignored, as is a dataset whose
+/// rank is not 2 (the same shape gate the declared-mask reader
+/// applies) — the restore then falls back to the declared-only
+/// behavior that predates the dataset, which is also the fallback for
+/// old files lacking the dataset entirely.
+pub const DETECTED_DEAD_PIXELS_FORMAT_VERSION: u32 = 1;
+
 /// Serialization-friendly snapshot of the full session state.
 ///
 /// All GUI-specific enums are stored as plain strings so this struct
@@ -138,7 +152,32 @@ pub struct ProjectSnapshot {
     pub energies: Option<Vec<f64>>,
     /// D-20: Dead-pixel mask (true = dead). Same spatial dimensions as the
     /// transmission data (height × width). `None` when no mask is available.
+    ///
+    /// Since #646 the GUI stores the **declared** mask component only here
+    /// (file-declared or project-declared — `AppState::file_dead_pixels`);
+    /// the detected component travels separately in
+    /// [`ProjectSnapshot::detected_dead_pixels`].  The dataset path
+    /// (`/intermediate/dead_pixels`), dtype, and shape are unchanged, so no
+    /// format marker is needed.  Files written before #646 carried the
+    /// effective mask (declared ∪ detected at save time); the GUI promotes
+    /// those to declared once on load.
     pub dead_pixels: Option<Array2<bool>>,
+    /// Detected dead/hot mask component active at save time (#646 review
+    /// R4, P1-1).  Same spatial dimensions as the transmission data;
+    /// `None` when no detection had run (or for files predating the
+    /// dataset — restore then falls back to the declared component alone).
+    ///
+    /// Persisted as its own session-scoped dataset
+    /// (`/intermediate/detected_dead_pixels`, u8, with a `format_version`
+    /// attribute — see [`DETECTED_DEAD_PIXELS_FORMAT_VERSION`]) because a
+    /// restored project may carry embedded normalized data WITHOUT the raw
+    /// stacks: normalization (and thus detection) never re-runs there, so a
+    /// declared-only restore would silently refit without the dead/hot
+    /// exclusions that were active at save time.  On restore the GUI
+    /// rebuilds the effective mask as declared ∪ persisted-detected, and —
+    /// when raw stacks ARE present — recomputes detection purely to *warn*
+    /// on drift, never to silently replace the persisted component.
+    pub detected_dead_pixels: Option<Array2<bool>>,
 
     // -- results (always embedded) --
     pub density_maps: Option<Vec<Array2<f64>>>,
@@ -259,6 +298,7 @@ impl Default for ProjectSnapshot {
             normalized_uncertainty: None,
             energies: None,
             dead_pixels: None,
+            detected_dead_pixels: None,
             density_maps: None,
             uncertainty_maps: None,
             chi_squared_map: None,
@@ -402,6 +442,22 @@ fn write_u64_attr(loc: &hdf5::Group, name: &str, value: u64) -> Result<(), IoErr
         .create(name)
         .and_then(|a| a.write_scalar(&value))
         .map_err(|e| hdf5_err(name, e))
+}
+
+/// Dataset-attribute variant of [`write_u32_attr`] (the group-typed
+/// helpers above predate any dataset carrying attributes).
+fn write_u32_attr_ds(ds: &hdf5::Dataset, name: &str, value: u32) -> Result<(), IoError> {
+    ds.new_attr::<u32>()
+        .shape(())
+        .create(name)
+        .and_then(|a| a.write_scalar(&value))
+        .map_err(|e| hdf5_err(name, e))
+}
+
+/// Dataset-attribute read: `Some(value)` if present and convertible,
+/// `None` otherwise (mirrors the `read_*_attr_opt` group helpers).
+fn read_u32_attr_ds_opt(ds: &hdf5::Dataset, name: &str) -> Option<u32> {
+    ds.attr(name).ok()?.read_scalar::<u32>().ok()
 }
 
 fn write_meta(file: &hdf5::File, snap: &ProjectSnapshot) -> Result<(), IoError> {
@@ -785,6 +841,24 @@ fn write_intermediate(file: &hdf5::File, snap: &ProjectSnapshot) -> Result<(), I
                 .create("dead_pixels")
                 .and_then(|ds| ds.write_raw(&data))
                 .map_err(|e| hdf5_err("/intermediate/dead_pixels", e))?;
+        }
+    }
+
+    // #646 R4 P1-1: Persist the DETECTED mask component as its own
+    // session-scoped, versioned dataset (u8, 0 = live, 1 = excluded) —
+    // see the field rustdoc on `ProjectSnapshot::detected_dead_pixels`.
+    if let Some(ref det) = snap.detected_dead_pixels {
+        let shape = [det.shape()[0], det.shape()[1]];
+        if !shape.contains(&0) {
+            let data: Vec<u8> = det.iter().map(|&b| u8::from(b)).collect();
+            let ds = inter
+                .new_dataset::<u8>()
+                .shape(shape)
+                .create("detected_dead_pixels")
+                .map_err(|e| hdf5_err("/intermediate/detected_dead_pixels", e))?;
+            ds.write_raw(&data)
+                .map_err(|e| hdf5_err("/intermediate/detected_dead_pixels", e))?;
+            write_u32_attr_ds(&ds, "format_version", DETECTED_DEAD_PIXELS_FORMAT_VERSION)?;
         }
     }
 
@@ -1491,6 +1565,27 @@ fn read_intermediate(file: &hdf5::File, snap: &mut ProjectSnapshot) -> Result<()
         }
     }
 
+    // #646 R4 P1-1: Load the detected mask component (u8 → bool).  The
+    // dataset is versioned; a missing or unrecognized `format_version`
+    // leaves the field `None`, as does a dataset whose rank is not 2 —
+    // the same shape gate as the declared-mask reader above
+    // (declared-only restore — the documented fallback for files
+    // predating the dataset, see DETECTED_DEAD_PIXELS_FORMAT_VERSION).
+    if let Ok(det_ds) = inter.dataset("detected_dead_pixels") {
+        let version = read_u32_attr_ds_opt(&det_ds, "format_version");
+        let shape = det_ds.shape();
+        if version == Some(DETECTED_DEAD_PIXELS_FORMAT_VERSION) && shape.len() == 2 {
+            let data: Vec<u8> = det_ds
+                .read_raw()
+                .map_err(|e| hdf5_err("/intermediate/detected_dead_pixels", e))?;
+            let bools: Vec<bool> = data.iter().map(|&v| v != 0).collect();
+            snap.detected_dead_pixels = Some(
+                Array2::from_shape_vec((shape[0], shape[1]), bools)
+                    .map_err(|e| hdf5_err("/intermediate/detected_dead_pixels reshape", e))?,
+            );
+        }
+    }
+
     Ok(())
 }
 
@@ -1880,6 +1975,7 @@ mod tests {
             normalized_uncertainty: None,
             energies: None,
             dead_pixels: None,
+            detected_dead_pixels: None,
             density_maps: None,
             uncertainty_maps: None,
             chi_squared_map: None,
@@ -2292,6 +2388,71 @@ mod tests {
         let en = loaded.energies.unwrap();
         assert_eq!(en.len(), 5);
         assert!((en[2] - 3.0).abs() < 1e-10);
+    }
+
+    /// #646 R4 P1-1: the declared and detected mask components round-trip
+    /// as independent datasets — neither leaks into the other.
+    #[test]
+    fn test_roundtrip_detected_dead_pixels_independent_of_declared() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("rt_detected.nrd.h5");
+        let mut snap = minimal_snapshot();
+        let mut declared = Array2::from_elem((3, 4), false);
+        declared[[0, 0]] = true;
+        let mut detected = Array2::from_elem((3, 4), false);
+        detected[[2, 3]] = true;
+        snap.dead_pixels = Some(declared.clone());
+        snap.detected_dead_pixels = Some(detected.clone());
+        save_project(&path, &snap).unwrap();
+        let loaded = load_project(&path).unwrap();
+
+        assert_eq!(loaded.dead_pixels.unwrap(), declared);
+        assert_eq!(loaded.detected_dead_pixels.unwrap(), detected);
+    }
+
+    /// #646 R4 P1-1 backward compat: a file written without the detected
+    /// dataset (any pre-R4 file, or a session with no detection) loads
+    /// with `detected_dead_pixels = None` — the declared-only fallback.
+    #[test]
+    fn test_load_without_detected_dataset_is_declared_only() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("no_detected.nrd.h5");
+        let mut snap = minimal_snapshot();
+        let mut declared = Array2::from_elem((2, 2), false);
+        declared[[1, 1]] = true;
+        snap.dead_pixels = Some(declared.clone());
+        save_project(&path, &snap).unwrap();
+        let loaded = load_project(&path).unwrap();
+
+        assert_eq!(loaded.dead_pixels.unwrap(), declared);
+        assert!(loaded.detected_dead_pixels.is_none());
+    }
+
+    /// #646 R4 P1-1 forward compat: a detected dataset whose
+    /// `format_version` is unrecognized is ignored (declared-only
+    /// restore), never misread under the current format's semantics.
+    #[test]
+    fn test_detected_dead_pixels_future_format_version_ignored() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("future_detected.nrd.h5");
+        let mut snap = minimal_snapshot();
+        let mut detected = Array2::from_elem((2, 2), false);
+        detected[[0, 1]] = true;
+        snap.detected_dead_pixels = Some(detected);
+        save_project(&path, &snap).unwrap();
+
+        // Bump the dataset's format_version past the supported one.
+        {
+            let file = hdf5::File::open_rw(&path).unwrap();
+            let ds = file.dataset("intermediate/detected_dead_pixels").unwrap();
+            ds.attr("format_version")
+                .unwrap()
+                .write_scalar(&(DETECTED_DEAD_PIXELS_FORMAT_VERSION + 1))
+                .unwrap();
+        }
+
+        let loaded = load_project(&path).unwrap();
+        assert!(loaded.detected_dead_pixels.is_none());
     }
 
     #[test]

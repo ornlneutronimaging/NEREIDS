@@ -62,6 +62,39 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
   interior recovery of the truth kernel, and temperature recovery within
   3σ with σ_T far below the old ~90 K degeneracy scale.
 
+- **Hot/railed pixel detection** (#643): `detect_hot_pixels` — two-stage
+  screen on per-pixel total counts: a robust one-sided log-space
+  median + k·MAD cut (k = 6 default, with a Poisson floor on the robust
+  scale so quantized low-count images never turn the screen into a
+  low-count filter) confirmed by a 10× local-8-neighbor-median isolation
+  test iterated to a fixpoint (already-flagged neighbors stop vouching),
+  which erodes railed clusters up to 3 px wide from the boundary inward
+  — a single local pass would miss the interior of clusters ≥2 px wide —
+  provided the cluster exposes at least one end cap or convex corner to
+  normal-scene neighbors (erosion must seed somewhere).  An edge-to-edge
+  railed band ≥2 px wide (both ends off-detector) has no seed and is not
+  caught — deliberate: a slit-aperture open beam produces a genuine
+  full-width bright scene band indistinguishable from it, and a
+  full-span row/column screen would mask that scene (the bimodal
+  failure); declare such full-span detector pathologies in a file mask.
+  A full-span width-1 railed line is caught.
+  Bimodal scenes (dark-majority sample + bright open-beam region) never
+  get their bright region masked — a contiguous bright region ≥2 px
+  wide is scene, not a defect, and the erosion never seeds in it; a
+  1-px-wide bright line at ≥10× local contrast is indistinguishable
+  from a railed line and is masked by design (documented trade-off;
+  real VENUS features are PSF-blurred over ≥2 px).  Requires raw
+  (unscaled) counts.  In Rust (`nereids_io::normalization`) and Python.
+- **Chunked dead-pixel detection** (#643):
+  `detect_dead_pixels_chunked` — per-acquisition-chunk detection that
+  flags pixels dead in *any* chunk, catching intermittent deadness
+  invisible to the summed-stack test, in Rust and Python.
+- **Unified bad-pixel entry point** (#643): `detect_bad_pixels` —
+  validating detector computing dead ∪ hot over the sample and
+  (optionally) the open-beam stack, in Rust and Python.
+- `nereids-core` gains a `stats` module (`median`,
+  `median_abs_deviation`, `MAD_TO_SIGMA`).
+
 ### Changed
 
 - **Physics-complete bounded Ikeda–Carpenter calibration family** (#642):
@@ -92,6 +125,63 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
   re-calibrate.** The raw `theta` for `"ic"` is now 4–5 ln/box-encoded
   values; read decoded physical parameters from `params()` (Python) or the
   returned `resolution` (Rust) instead of interpreting `theta` directly.
+
+- **GUI normalization now masks dead ∪ hot on every raw-counts path**
+  (#643): the TIFF-pair and HDF5-with-open-beam paths mask
+  dead(sample) ∪ hot(sample) ∪ dead(OB) ∪ hot(OB) instead of
+  dead(sample) only, and the HDF5-without-open-beam path (histogram or
+  event data prepared with uniform weighting) now runs the same
+  detection on the sample stack alone — masked-pixel counts may differ
+  on re-normalization of existing data.  TransmissionTiff runs no
+  detection: its data is a pre-normalized transmission ratio, not raw
+  counts, so the hot screen's Poisson floor does not apply and an
+  all-zero "dead" test would conflate opaque scene with a dead
+  detector.  Mask provenance is explicit (#646): the file-declared mask
+  (HDF5 dead-pixel dataset or a saved project's mask) is kept
+  separately, and every normalization recomputes the effective mask
+  from scratch as declared ∪ freshly-detected — detections never
+  accumulate across open-beam swaps or re-normalizations.
+- **Project files persist the pixel mask as two separate components**
+  (#646): `/intermediate/dead_pixels` (path, dtype, and shape
+  unchanged) now stores the declared mask rather than the effective
+  (declared ∪ detected) mask, so save→load→save cycles no longer bake
+  each session's detections into the next session's declared component;
+  the detected component is persisted alongside it as a new
+  session-scoped, versioned dataset
+  (`/intermediate/detected_dead_pixels`, u8, `format_version` = 1).
+  On restore the effective mask is rebuilt as declared ∪
+  persisted-detected — a restored project carrying embedded normalized
+  data without the raw stacks (where detection cannot re-run) refits
+  with exactly the dead/hot exclusions active at save time instead of
+  silently losing them.  When the raw stacks ARE present on restore,
+  detection is recomputed purely as a drift check: a mismatch with the
+  persisted detected mask is surfaced in the status bar and the
+  provenance log (the saved mask stays active; re-running normalization
+  adopts the fresh detection explicitly).  Neither component can grow
+  across save/load cycles.
+  Restore also validates both persisted components against the restored
+  transmission geometry (when the project carries normalized data) and
+  drops any component that cannot apply — a hand-corrupted mask can no
+  longer become the effective mask (or crash a refit with restored
+  ROIs).  Every mask drop on restore is surfaced in the status bar and
+  the provenance log, and survives the restore replacing the session
+  provenance with the project's own history.
+  Backward/forward compatibility: files written by earlier versions
+  stored the effective mask at the declared path and lack the detected
+  dataset — loading one promotes the stored mask to declared once (the
+  only lossless reading of a file that never recorded the split; such
+  masks keep any detections they had already absorbed, but stop growing
+  from now on) and restores with no detected component (declared-only),
+  as does any file whose detected dataset carries an unrecognized
+  `format_version` or a rank other than 2.
+- Dead/hot detectors' validating entry points (`detect_bad_pixels`,
+  `detect_hot_pixels`, `detect_dead_pixels_chunked`) now reject stacks
+  and chunks with an empty TOF axis (`shape[0] == 0`), whose vacuous
+  all-zero test would otherwise mask the whole detector (#643).
+- Pixel-mask documentation now states the semantics explicitly (#643):
+  masks are a pipeline-integrity screen only, never a
+  data-quality/coverage filter — low-count pixels are alive and are
+  kept.
 
 - **`calibrate_energy` rebuilt on the `fit_energy_scale` LM path**
   (#634): the three-phase (L, t₀) grid + per-candidate golden-section

@@ -2750,7 +2750,15 @@ fn precompute_cross_sections<'py>(
 ///
 /// A pixel is marked as "dead" when all its counts across the spectral/TOF
 /// axis are exactly zero.  The returned mask can be passed directly to
-/// ``spatial_map(dead_pixels=...)``.
+/// ``spatial_map_typed(dead_pixels=...)``.
+///
+/// Pixel masks are a **pipeline-integrity screen only** — they exclude
+/// pixels whose data stream is broken (dead, hot/railed), never low-count
+/// or poorly covered pixels.  Low-count pixels are alive and must be kept.
+/// Prefer ``detect_bad_pixels()`` (validating, unions sample and open-beam,
+/// optional hot screen); see also ``detect_hot_pixels()`` and
+/// ``detect_dead_pixels_chunked()`` for intermittent deadness across
+/// acquisition chunks.
 ///
 /// Args:
 ///     data: 3D numpy array with shape ``(n_frames, height, width)``.
@@ -2766,6 +2774,167 @@ fn detect_dead_pixels<'py>(
 ) -> PyResult<Bound<'py, PyArray2<bool>>> {
     let arr = data.as_array().to_owned();
     let mask = py.detach(move || norm::detect_dead_pixels(&arr));
+    Ok(PyArray2::from_owned_array(py, mask))
+}
+
+/// Detect hot (railed / runaway) pixels — two-stage screen.
+///
+/// Stage 1 (global): robust one-sided cut on per-pixel total counts — a
+/// pixel is a candidate when ``ln(total) > median + k_mad * sigma``, where
+/// median and MAD are computed over the live (``total > 0``) pixels only
+/// and ``sigma`` is the MAD-based robust scale floored by the Poisson
+/// counting noise of the median total.  Stage 2 (local), iterated to a
+/// fixpoint: a candidate is flagged only if its total also exceeds 10x the
+/// median of its 8-neighborhood reference sample — live unflagged
+/// neighbors contribute their totals, already-flagged neighbors contribute
+/// 0 (a known defect cannot vouch for its neighbors), dead neighbors are
+/// omitted; edge pixels use whatever neighbors exist, and a candidate with
+/// no live neighbor keeps the global verdict.  Passes repeat until no new
+/// flag is added (bounded by ``height * width`` passes; in practice ~the
+/// defect-cluster radius), eroding railed CLUSTERS from the boundary
+/// inward — a single pass would miss the interior of clusters >= 2 px
+/// wide, whose neighbors are railed too.  Clusters up to 3 px wide are
+/// fully consumed PROVIDED they expose at least one end cap or convex
+/// corner to normal-scene neighbors (erosion must seed somewhere): an
+/// EDGE-TO-EDGE railed band >= 2 px wide, spanning the full detector
+/// width or height with both ends off-detector, has no seed and is NOT
+/// caught — deliberately, because a slit-aperture open beam produces a
+/// genuine full-width bright scene band pixel-for-pixel
+/// indistinguishable from it, and a full-span screen would mask that
+/// scene (the bimodal failure).  Declare such full-span detector
+/// pathologies in a file mask.  A full-span width-1 railed line IS
+/// caught (each pixel keeps >= 4 normal neighbors).  The local
+/// confirmation keeps bimodal scenes honest:
+/// with a dark majority holding the median, the global statistics describe
+/// only the dark population and the entire bright region would otherwise
+/// be masked — a contiguous bright region is scene, not a defect.  Upper
+/// tail only — stuck-low pixels are indistinguishable from low-count-alive
+/// pixels and are kept (masks are pipeline-integrity only, never a
+/// low-count screen).
+///
+/// Bright SCENE regions never erode: a boundary pixel of a contiguous
+/// bright region >= 2 px wide keeps >= 4 same-side neighbors for any
+/// straight or diagonal edge, so its reference median stays bright and
+/// scene gradients (<= 2-3x across real edges) never reach the 10x factor
+/// — the erosion has no seed.  Documented width-1 limitation (accepted
+/// trade-off): a 1-px-wide bright scene line at >= 10x local contrast is
+/// spatially indistinguishable from a railed line and IS masked; real
+/// scene features on VENUS are PSF-blurred over >= 2 px, so >= 10x
+/// single-pixel scene contrast is physically rare, and contiguous bright
+/// regions of width >= 2 are safe from the local stage.
+///
+/// ``data`` must be RAW detected counts (unscaled): the Poisson floor
+/// assumes ``Var[N] = N``, so scaled inputs silently distort it —
+/// down-scaling (proton-charge-normalized rates << 1, gain division)
+/// inflates the floor and can suppress real flags; up-scaling (event
+/// weights > 1) deflates it.  Detect on raw counts, normalize afterwards.
+///
+/// Args:
+///     data: 3D numpy array of raw counts with shape
+///         ``(n_frames, height, width)``.
+///     k_mad: Robust-sigma multiplier for the stage-1 upper-tail cut
+///         (default 6.0: one-sided Gaussian tail ~1e-9, on a unimodal
+///         image essentially never flags a statistically plausible pixel).
+///
+/// Returns:
+///     2D boolean numpy array with shape ``(height, width)``.
+///     ``True`` marks a hot pixel.
+///
+/// Raises:
+///     ValueError: If ``data`` contains non-finite or negative values or
+///         has zero frames (``shape[0] == 0``), or ``k_mad`` is not finite
+///         and positive.
+#[pyfunction]
+#[pyo3(signature = (data, k_mad = norm::HOT_PIXEL_K_MAD))]
+fn detect_hot_pixels<'py>(
+    py: Python<'py>,
+    data: PyReadonlyArray3<f64>,
+    k_mad: f64,
+) -> PyResult<Bound<'py, PyArray2<bool>>> {
+    let arr = data.as_array().to_owned();
+    let mask = py.detach(move || norm::detect_hot_pixels(&arr, k_mad));
+    let mask = mask.map_err(|e| pyo3::exceptions::PyValueError::new_err(format!("{}", e)))?;
+    Ok(PyArray2::from_owned_array(py, mask))
+}
+
+/// Detect dead pixels across acquisition chunks (dead in ANY chunk).
+///
+/// Catches intermittent deadness that ``detect_dead_pixels()`` on the
+/// summed stack cannot see: a pixel dead for one acquisition chunk but
+/// alive in another has nonzero summed counts, yet its dead-chunk data
+/// corrupts the combined spectrum.  Chunk the acquisition so each live
+/// pixel has an expected >= 20 total counts per chunk (misflag probability
+/// per live pixel is ``m * exp(-lambda)`` over ``m`` chunks).
+///
+/// Chunks may have different numbers of frames (ragged event
+/// re-histogramming is fine); spatial dimensions must agree.
+///
+/// Args:
+///     chunks: List of 3D numpy arrays, one per acquisition chunk, each
+///         with shape ``(n_frames_i, height, width)``.
+///
+/// Returns:
+///     2D boolean numpy array with shape ``(height, width)``.
+///     ``True`` marks a pixel that is all-zero in at least one chunk.
+///
+/// Raises:
+///     ValueError: If ``chunks`` is empty, any chunk has zero frames
+///         (``shape[0] == 0`` — its all-zero test would vacuously mark
+///         every pixel dead), any chunk contains non-finite or negative
+///         values, or the spatial dimensions differ.
+#[pyfunction]
+fn detect_dead_pixels_chunked<'py>(
+    py: Python<'py>,
+    chunks: Vec<PyReadonlyArray3<f64>>,
+) -> PyResult<Bound<'py, PyArray2<bool>>> {
+    // Copy to owned arrays before releasing the GIL.
+    let owned: Vec<_> = chunks.iter().map(|c| c.as_array().to_owned()).collect();
+    let mask = py.detach(move || norm::detect_dead_pixels_chunked(&owned));
+    let mask = mask.map_err(|e| pyo3::exceptions::PyValueError::new_err(format!("{}", e)))?;
+    Ok(PyArray2::from_owned_array(py, mask))
+}
+
+/// Detect all pipeline-corrupting pixels: dead + hot over sample and
+/// (optionally) open beam.
+///
+/// This is the validating entry point.  Deadness/hotness is
+/// per-acquisition — a pixel dead only in the open-beam run still corrupts
+/// every transmission ratio computed from it — so the masks of both stacks
+/// are unioned: ``dead(sample) | hot(sample) [| dead(ob) | hot(ob)]``.
+/// The stacks' frame counts may differ; spatial dimensions must agree.
+///
+/// Both stacks must be RAW detected counts (unscaled) — see
+/// ``detect_hot_pixels()``: scaling distorts the Poisson floor of the hot
+/// screen.  Detect on raw counts, before any normalization.
+///
+/// Args:
+///     sample: 3D numpy array of raw counts with shape
+///         ``(n_frames, height, width)``.
+///     open_beam: Optional 3D numpy array of raw counts with shape
+///         ``(n_frames2, height, width)``.
+///     hot_k_mad: Robust-sigma multiplier for the hot-pixel screen
+///         (default 6.0), or ``None`` to disable it (dead-only detection).
+///
+/// Returns:
+///     2D boolean numpy array with shape ``(height, width)``.
+///     ``True`` marks a pixel to exclude.
+///
+/// Raises:
+///     ValueError: If either stack contains non-finite or negative values
+///         or has zero frames (``shape[0] == 0``), the spatial dimensions
+///         differ, or ``hot_k_mad`` is not finite and positive.
+#[pyfunction]
+#[pyo3(signature = (sample, open_beam = None, hot_k_mad = Some(norm::HOT_PIXEL_K_MAD)))]
+fn detect_bad_pixels<'py>(
+    py: Python<'py>,
+    sample: PyReadonlyArray3<f64>,
+    open_beam: Option<PyReadonlyArray3<f64>>,
+    hot_k_mad: Option<f64>,
+) -> PyResult<Bound<'py, PyArray2<bool>>> {
+    let s = sample.as_array().to_owned();
+    let ob = open_beam.map(|o| o.as_array().to_owned());
+    let mask = py.detach(move || norm::detect_bad_pixels(&s, ob.as_ref(), hot_k_mad));
+    let mask = mask.map_err(|e| pyo3::exceptions::PyValueError::new_err(format!("{}", e)))?;
     Ok(PyArray2::from_owned_array(py, mask))
 }
 
@@ -3207,6 +3376,9 @@ fn nereids(m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_function(wrap_pyfunction!(py_trace_detectability_survey, m)?)?;
     m.add_function(wrap_pyfunction!(precompute_cross_sections, m)?)?;
     m.add_function(wrap_pyfunction!(detect_dead_pixels, m)?)?;
+    m.add_function(wrap_pyfunction!(detect_hot_pixels, m)?)?;
+    m.add_function(wrap_pyfunction!(detect_dead_pixels_chunked, m)?)?;
+    m.add_function(wrap_pyfunction!(detect_bad_pixels, m)?)?;
     m.add_function(wrap_pyfunction!(py_calibrate_energy, m)?)?;
     m.add_class::<PyCalibrationResult>()?;
     // Phase 5: Typed API
