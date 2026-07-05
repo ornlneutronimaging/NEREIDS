@@ -94,7 +94,8 @@ const IC_A1_X0: f64 = 0.05;
 /// unresolvable within the cap; such θ are treated as infeasible points
 /// (∞ objective) during the search, never as a calibration abort — see
 /// `ic_box_worst_corner_synthesizes_within_tau_cap` /
-/// `ic_unresolvable_theta_is_infeasible_point_not_abort`.
+/// `ic_unresolvable_theta_errs_in_build_resolution` /
+/// `ic_infeasible_pocket_inside_box_completes_calibration`.
 const IC_BETA_MIN: f64 = 0.02;
 /// Upper box bound on `β`: at 5 µs⁻¹ the storage tail is as fast as the
 /// prompt core itself (α range), beyond which β↔α are indistinguishable.
@@ -129,10 +130,15 @@ const PSR_FWHM_US_MAX: f64 = 1.0;
 /// Sanity ceiling (µs) on the configured PSR triangle FWHM: one decade above
 /// the [`PSR_FWHM_US_MAX`] fit bound. [`CalibrationConfig::psr_fwhm_ns`] is in
 /// NANOSECONDS (the VENUS FTS header convention: "folded triang FWHM 350 ns
-/// PSR"), and kernel-synthesis cost grows QUADRATICALLY with the fold width
-/// (the fold both refines the τ-step and widens the ± fold-reach margin):
-/// measured ~12 ms at 0.35 µs but ~1.3 s at 50 µs and ~28 s at 350 µs per
-/// single kernel-table synthesis at the default grid. A µs-as-ns unit slip
+/// PSR"), and kernel-synthesis cost grows QUADRATICALLY with a wide fold's
+/// width. The mechanism is NOT τ-step refinement — that applies only to
+/// folds FINER than the prompt design step, and a 50–350 µs fold's FWHM/3
+/// resolution floor is far coarser, leaving the step unchanged — it is the
+/// convolution itself: the ±FWHM fold-reach margin adds O(FWHM/step)
+/// τ-samples, each folded in `convolve_same` against a sampled triangle
+/// itself O(FWHM/step) long. Measured ~12 ms at 0.35 µs but ~1.3 s at 50 µs
+/// and ~28 s at 350 µs per single kernel-table synthesis at the default
+/// grid. A µs-as-ns unit slip
 /// (passing `350` meaning µs → interpreted as a 350 µs pin) would therefore
 /// turn a calibration into a multi-hour silent hang behind a physically
 /// fictitious fold. Any genuine width sits inside the fitted box; one decade
@@ -922,6 +928,39 @@ pub fn calibrate_resolution(
         );
         bounds.push((POSITION_L_SCALE_MIN, POSITION_L_SCALE_MAX));
     }
+    // PRE-FLIGHT the start (#645 round 3, F1): synthesize the resolution once
+    // at x0 before any optimization. A start whose kernel cannot be
+    // synthesized — e.g. any PSR triangle under ~58.6 ns: the default β/R
+    // start (β = 0.1, R = 0.1) spans a 16/β = 160 µs storage tail, capping
+    // the τ-step at 160/8191 ≈ 19.53 ns, above such a triangle's FWHM/3
+    // resolution floor (note the PSR fit-box floor 0.05 µs = 50 ns is ITSELF
+    // in this class, so a `>= PSR_FWHM_US_MIN` value check could not cover
+    // it) — passes every value-level config check above yet makes EVERY
+    // initial-simplex vertex infeasible (∞ objective): the Nelder–Mead
+    // objective range is then ∞ − ∞ = NaN, so it can never self-converge,
+    // burns max_iter, and used to die late with the generic "no
+    // finite-objective" error blaming the forward model. Reject the START
+    // precisely instead, surfacing the τ-geometry/synthesis diagnosis. A θ
+    // that becomes infeasible only DURING the search remains an ∞ point the
+    // simplex steps away from (see the objective below) — this pre-flight
+    // rejects only an infeasible start.
+    if let Err(synth_err) = build_resolution(&family, &x0, e_min, e_max, config) {
+        let psr_note = if matches!(family, ResolutionFamily::IkedaCarpenter { .. }) {
+            format!(
+                " The starting PSR width comes from psr_fwhm_ns = {} ns — widen the \
+                 triangle (the SNS/VENUS FTS convention is 350 ns), or pass 0 to \
+                 disable the fold when not fitting it.",
+                config.psr_fwhm_ns
+            )
+        } else {
+            String::new()
+        };
+        return Err(FittingError::InvalidConfig(format!(
+            "resolution kernel synthesis is infeasible at the starting parameter \
+             vector, so every optimizer restart would begin from an all-infeasible \
+             simplex: {synth_err}.{psr_note}"
+        )));
+    }
     let nm = NelderMeadConfig {
         xatol: config.xatol,
         fatol: config.fatol,
@@ -1026,9 +1065,18 @@ pub fn calibrate_resolution(
     }
     let best = best.expect("at least one restart runs");
     if !best.fun.is_finite() {
+        // Every ∞ source of the objective, not only the forward model (#645
+        // round 3, F1): a hard forward-model failure aborts with its own
+        // error above, so reaching here means every vector tried hit an
+        // infeasible-point class — kernel synthesis rejected (τ-grid cap vs
+        // fold/prompt geometry), an invalid energy scale (corrected TOF ≤ 0),
+        // or a singular anorm/baseline system. The start itself synthesized
+        // (pre-flighted above), so the infeasibility arose during the search.
         return Err(FittingError::EvaluationFailed(
-            "calibration found no finite-objective resolution (the forward model failed for \
-             every parameter vector tried)"
+            "calibration found no finite-objective resolution: every parameter vector \
+             tried was infeasible — kernel synthesis rejected it (τ-grid cap vs \
+             fold/prompt geometry), the energy scale was invalid (corrected TOF ≤ 0), \
+             or the anorm/baseline system was singular"
                 .into(),
         ));
     }
@@ -2293,6 +2341,56 @@ mod tests {
     }
 
     #[test]
+    fn rejects_infeasible_psr_start_width() {
+        // Review #645 round 3, F1: a nonzero PSR width in (0, ~58.6 ns)
+        // passes every value-level check (finite / sign / ceiling) yet cannot
+        // be SYNTHESIZED at the optimizer start: the default β/R start
+        // (β = 0.1, R = 0.1 > R_NEGLIGIBLE) spans a 16/β = 160 µs storage
+        // tail, capping the τ-step at 160/8191 ≈ 19.53 ns, and tau_geometry
+        // rejects any triangle whose FWHM/3 floor is below that (fwhm <
+        // ~58.6 ns). Every initial-simplex vertex was then ∞ (objective range
+        // ∞ − ∞ = NaN — no self-convergence), so the calibration burned
+        // max_iter and died with the generic "no finite-objective" error
+        // blaming the forward model. The pre-flight must reject the START
+        // precisely, surfacing the τ-geometry diagnosis and naming
+        // psr_fwhm_ns. The fit_psr arm starts AT the fit-box floor
+        // PSR_FWHM_US_MIN = 0.05 µs (50 ns), which is itself infeasible at
+        // the default start — proof that a `>= PSR_FWHM_US_MIN` value check
+        // would not be sufficient.
+        let iso = synthetic_isotope(72, 178, 20.0, 0.05, 0.06);
+        let sample = SampleParams::new(300.0, vec![(iso, 2.0e-3)]).unwrap();
+        let e: Vec<f64> = (0..60).map(|i| 15.0 + i as f64 * 0.2).collect();
+        let d = vec![0.9; 60];
+        let u = vec![0.01; 60];
+        for (fit_psr, psr_ns) in [(false, 55.0), (true, 50.0)] {
+            let cfg = CalibrationConfig {
+                psr_fwhm_ns: psr_ns,
+                ..Default::default()
+            };
+            let err = calibrate_resolution(
+                ResolutionFamily::IkedaCarpenter { fit_psr },
+                &e,
+                &d,
+                &u,
+                &sample,
+                &cfg,
+            )
+            .expect_err("a sub-59-ns PSR start must be rejected up front");
+            assert!(
+                matches!(
+                    &err,
+                    FittingError::InvalidConfig(msg)
+                        if msg.contains("starting parameter vector")
+                            && msg.contains("psr_fwhm_ns")
+                            && msg.contains("cannot resolve")
+                ),
+                "pre-flight error must name the start, psr_fwhm_ns and the τ-cap cause \
+                 (fit_psr = {fit_psr}, psr_ns = {psr_ns}), got {err:?}"
+            );
+        }
+    }
+
+    #[test]
     fn rejects_fit_psr_with_zero_psr_width() {
         // psr_fwhm_ns = 0 means "no PSR fold"; fit_psr = true would silently
         // clamp that 0 start into the [0.05, 1] µs fit box, contradicting the
@@ -2432,14 +2530,15 @@ mod tests {
     }
 
     #[test]
-    fn ic_unresolvable_theta_is_infeasible_point_not_abort() {
+    fn ic_unresolvable_theta_errs_in_build_resolution() {
         // A θ inside the box can still be unresolvable: a fitted PSR at its
         // 0.05 µs floor against β at its own floor needs a τ-step ≤ FWHM/3 ≈
         // 0.017 µs across an 800 µs storage tail — past the 8192-sample cap.
-        // build_resolution must Err for such θ; the calibration objective
-        // maps that to an ∞ objective (an infeasible point the simplex steps
-        // away from — same handling as an infeasible energy scale), so a
-        // wandering optimizer can never abort the whole calibration on it.
+        // This test asserts the build_resolution half only: such θ must Err.
+        // The calibration-level half — the objective maps that Err to an ∞
+        // point the simplex steps away from, never aborting the calibration —
+        // is asserted by ic_infeasible_pocket_inside_box_completes_calibration
+        // below (#645 round 3, F4).
         let cfg = CalibrationConfig::default();
         let theta = [
             IC_A0_X0.ln(),
@@ -2452,6 +2551,55 @@ mod tests {
         assert!(
             build_resolution(&fam, &theta, 6.0, 112.0, &cfg).is_err(),
             "β at its floor + PSR at its floor must be unresolvable"
+        );
+    }
+
+    #[test]
+    fn ic_infeasible_pocket_inside_box_completes_calibration() {
+        // Review #645 round 3, F4 — the calibration-level half of the claim
+        // above: with fit_psr the box CONTAINS the unresolvable pocket (PSR
+        // near its 0.05 µs floor against β near its own floor), and the
+        // simplex demonstrably brushes it — the 60 ns start sits just above
+        // the ~58.6 ns feasibility edge at the default β/R start (the
+        // pre-flight passes: 60/3 = 20 ns floor > 19.53 ns capped step), so
+        // the FIRST simplex already carries an ∞ vertex: the β-decreased
+        // vertex (ln β step is negative, β 0.1 → ~0.089) widens the storage
+        // reach to ~180 µs and the capped step to ~21.9 ns, past the 20 ns
+        // floor. The optimizer must treat such vertices as infeasible points
+        // and finish: Ok, finite χ², decoded resolution inside the box. Tiny
+        // grid/iteration budget — this asserts non-abortion, not fit quality.
+        let iso = synthetic_isotope(72, 178, 20.0, 0.05, 0.06);
+        let sample = SampleParams::new(300.0, vec![(iso, 2.0e-3)]).unwrap();
+        let e: Vec<f64> = (0..60).map(|i| 15.0 + i as f64 * 0.2).collect();
+        let d = vec![0.9; 60];
+        let u = vec![0.01; 60];
+        let cfg = CalibrationConfig {
+            psr_fwhm_ns: 60.0,
+            ic_n_energies: 8,
+            ic_n_tau: 32,
+            max_iter: 60,
+            ..Default::default()
+        };
+        let r = calibrate_resolution(
+            ResolutionFamily::IkedaCarpenter { fit_psr: true },
+            &e,
+            &d,
+            &u,
+            &sample,
+            &cfg,
+        )
+        .expect("an infeasible pocket inside the box must not abort the calibration");
+        assert!(
+            r.chi2_dof.is_finite(),
+            "calibration through the infeasible pocket must return a finite χ²/dof, got {}",
+            r.chi2_dof
+        );
+        let (_a0, _a1, beta, _r, psr_us) = decoded_ic(&r);
+        assert!(
+            (PSR_FWHM_US_MIN..=PSR_FWHM_US_MAX).contains(&psr_us)
+                && (IC_BETA_MIN..=IC_BETA_MAX).contains(&beta),
+            "decoded solution must be feasible and inside the box: β = {beta}, \
+             psr = {psr_us} µs"
         );
     }
 }

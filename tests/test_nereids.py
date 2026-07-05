@@ -3030,6 +3030,30 @@ class TestCalibrateResolution:
                 psr_fwhm_ns=350_000.0,
             )
 
+    def test_infeasible_start_psr_width_rejected(self):
+        # Review #645 round 3, F1: a pinned PSR width in (0, ~58.6 ns) passes
+        # the finite/sign/ceiling checks but cannot be SYNTHESIZED at the
+        # optimizer's default beta/R start (beta = 0.1 spans a 160 us storage
+        # tail, capping the tau-step at ~19.5 ns > fwhm/3). Previously every
+        # initial simplex vertex was infinite and the calibration burned
+        # max_iter before a generic "no finite-objective" error blaming the
+        # forward model. The Rust pre-flight must reject the start up front,
+        # and the informative message (naming psr_fwhm_ns and the tau-cap
+        # cause) must propagate through the binding as a ValueError.
+        iso, e, t, unc = self._calibrant()
+        with pytest.raises(
+            ValueError, match="starting parameter vector.*psr_fwhm_ns"
+        ):
+            nereids.calibrate_resolution(
+                e,
+                t,
+                unc,
+                "ic",
+                isotopes=[(iso, 5.0e-4)],
+                temperature_k=300.0,
+                psr_fwhm_ns=55.0,
+            )
+
     def test_fit_psr_with_zero_width_rejected(self):
         # psr_fwhm_ns=0 is documented as "no PSR fold"; fit_psr=True would
         # silently clamp the 0 start into the [0.05, 1] us fit box. The
