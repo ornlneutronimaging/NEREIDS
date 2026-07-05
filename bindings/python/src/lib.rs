@@ -431,6 +431,10 @@ struct PyFitResult {
     /// Fitted flight-path scale factor (SAMMY TZERO L₀, dimensionless).
     /// None when energy-scale fitting is not enabled.
     l_scale: Option<f64>,
+    /// Nominal flight path (m) the energy-scale fit was configured with;
+    /// consumed by `corrected_energies` so the transform is reproduced with
+    /// the SAME flight path the fit used (issue #634).
+    energy_scale_flight_path_m: Option<f64>,
     /// Conditional binomial deviance / (n − k).  `Some(...)` only for the
     /// counts-KL dispatch (`solver="kl"` on counts input).
     deviance_per_dof: Option<f64>,
@@ -528,6 +532,43 @@ impl PyFitResult {
     #[getter]
     fn l_scale(&self) -> Option<f64> {
         self.l_scale
+    }
+
+    /// Map a nominal energy grid through the fitted ``(t0_us, l_scale)`` energy
+    /// scale to the corrected (calibrated) energies the fit evaluated the
+    /// physics on (issue #634). Reuses the exact SAMMY-convention transform
+    /// (``dat/mdat0.f90:189``, −t0 sign) with the SAME flight path the fit
+    /// was configured with (stored on the result), so the corrected axis is
+    /// never re-derived by hand (a +t0 slip caused a silent +400 K
+    /// temperature bias in the field) and a mismatched caller-supplied
+    /// flight path cannot silently skew the t₀ term.
+    ///
+    /// Returns ``None`` when energy-scale fitting was not enabled. Raises
+    /// ``ValueError`` on an invalid nominal grid (non-finite / non-positive /
+    /// non-ascending — the binding's standard energy-grid validation) or a
+    /// degenerate calibration (a ``t0`` past the shortest flight time).
+    #[pyo3(signature = (nominal_energies))]
+    fn corrected_energies<'py>(
+        &self,
+        py: Python<'py>,
+        nominal_energies: PyReadonlyArray1<'py, f64>,
+    ) -> PyResult<Option<Bound<'py, PyArray1<f64>>>> {
+        match (self.t0_us, self.l_scale, self.energy_scale_flight_path_m) {
+            (Some(t0), Some(l_scale), Some(flight_path_m)) => {
+                let e = nominal_energies.as_slice()?;
+                require_non_empty_energy_grid(e)?;
+                validate_energy_grid(e)?;
+                let corr = nereids_fitting::resolution_calib::corrected_energy_grid(
+                    e,
+                    t0,
+                    l_scale,
+                    flight_path_m,
+                )
+                .map_err(|err| pyo3::exceptions::PyValueError::new_err(err.to_string()))?;
+                Ok(Some(PyArray1::from_vec(py, corr)))
+            }
+            _ => Ok(None),
+        }
     }
 
     /// Conditional binomial deviance divided by (n − k) from the counts-KL
@@ -4246,6 +4287,7 @@ fn py_fit_counts_spectrum_typed<'py>(
         },
         t0_us: result.t0_us,
         l_scale: result.l_scale,
+        energy_scale_flight_path_m: result.energy_scale_flight_path_m,
         deviance_per_dof: result.deviance_per_dof,
     })
 }
@@ -4787,6 +4829,7 @@ fn py_fit_spectrum_typed<'py>(
         },
         t0_us: result.t0_us,
         l_scale: result.l_scale,
+        energy_scale_flight_path_m: result.energy_scale_flight_path_m,
         deviance_per_dof: result.deviance_per_dof,
     })
 }

@@ -107,6 +107,13 @@ pub struct SpatialResult {
     /// `Some` when `config.fit_energy_scale` is true; `None` otherwise.
     /// NaN at pixels where `converged_map` is `false`.
     pub l_scale_map: Option<Array2<f64>>,
+    /// Nominal flight path (m) the energy-scale fit was configured with —
+    /// recorded AT FIT TIME so downstream consumers (e.g. the GUI overlay's
+    /// per-pixel `SpectrumFitResult::corrected_energies`) reproduce the
+    /// transform with the fit's own flight path even if the live beamline
+    /// setting is edited afterwards (issue #634 review).  `Some` when
+    /// `config.fit_energy_scale` is true; `None` otherwise.
+    pub energy_scale_flight_path_m: Option<f64>,
     /// Number of pixels that converged.
     pub n_converged: usize,
     /// Total number of pixels fitted.
@@ -582,11 +589,12 @@ fn validate_spatial_data_values(
 /// * Known-degenerate configurations are rejected with a diagnostic
 ///   rather than letting every pixel fail into an all-NaN map:
 ///   counts + LM + `fit_energy_scale` (numerically ill-conditioned
-///   per-pixel — issue #458 B3), `fit_energy_scale` together with
-///   `fit_temperature` (mutually exclusive model paths), and
-///   `CountsWithNuisance` with an LM solver (requires a counts-domain
-///   solver).  `transmission_background` settings are validated here
-///   for the same reason.
+///   per-pixel — issue #458 B3) and `CountsWithNuisance` with an LM
+///   solver (requires a counts-domain solver).
+///   `transmission_background` settings are validated here for the
+///   same reason.  (`fit_energy_scale` together with `fit_temperature`
+///   is SUPPORTED since issue #634 — the energy-scale model carries a
+///   fitted temperature column.)
 ///
 /// Per-pixel fit *failures* after validation are not errors: the pixel
 /// is recorded as NaN in the maps, `converged_map` is `false` there,
@@ -712,22 +720,11 @@ pub fn spatial_map_typed(
         ));
     }
 
-    // Issue #458: `fit_energy_scale` + `fit_temperature`
-    // is not a supported combination — `EnergyScaleTransmissionModel`
-    // and the temperature-fitting path are mutually exclusive in every
-    // solver dispatch arm of `fit_spectrum_typed`.  Without
-    // this spatial-layer guard, every per-pixel call would error and
-    // `spatial_map_typed` would report `n_failed == n_total` with an
-    // all-NaN map — a silently-failed map is worse than a clear error.
-    if config.fit_energy_scale() && config.fit_temperature() {
-        return Err(PipelineError::InvalidParameter(
-            "spatial_map_typed: fit_energy_scale=true and fit_temperature=true cannot \
-             both be set — EnergyScaleTransmissionModel does not support temperature \
-             fitting. Choose one: either calibrate TZERO with a fixed temperature, or \
-             fit temperature on the nominal energy grid."
-                .into(),
-        ));
-    }
+    // Issue #634: `fit_energy_scale` + `fit_temperature` is now supported —
+    // `EnergyScaleTransmissionModel` wires a fitted temperature column, so
+    // per-pixel `fit_spectrum_typed` handles the combination and no spatial
+    // guard is needed. (The #458 B3 guard above — LM + fit_energy_scale on
+    // counts — is a separate, still-active numerical-stability restriction.)
 
     // `fit_spectrum_typed` rejects `CountsWithNuisance + LM` per-pixel
     // (see `validate_input_solver` in `pipeline.rs` — "CountsWithNuisance
@@ -811,8 +808,8 @@ pub fn spatial_map_typed(
     //
     // Ordering note: the preflight runs *after* the dispatch /
     // solver-compatibility guards above (CountsWithNuisance + LM,
-    // fit_energy_scale + fit_temperature, transmission_background
-    // BackD/BackF interlocks, …).  The fit-range, temperature and
+    // transmission_background BackD/BackF interlocks, …).  The
+    // fit-range, temperature and
     // alpha gates inside the preflight only meaningfully apply once
     // the input → solver dispatch is known to be valid; otherwise
     // a downstream "LM transmission active-bin" message would
@@ -935,6 +932,7 @@ pub fn spatial_map_typed(
             } else {
                 None
             },
+            energy_scale_flight_path_m: config.fit_energy_scale().then(|| config.flight_path_m()),
             n_converged: 0,
             n_total: 0,
             n_failed: 0,
@@ -1747,6 +1745,7 @@ pub fn spatial_map_typed(
         back_f_map,
         t0_us_map,
         l_scale_map,
+        energy_scale_flight_path_m: config.fit_energy_scale().then(|| config.flight_path_m()),
         n_converged,
         n_total: pixel_coords.len(),
         n_failed: failed_count.load(Ordering::Relaxed),
@@ -3831,14 +3830,16 @@ mod tests {
         assert!(result.t0_us_map.is_some());
     }
 
-    /// `fit_energy_scale + fit_temperature` must be rejected at
-    /// spatial entry (follow-up to #458).  The
-    /// single-spectrum fitter errors on this combination, but without
-    /// a spatial-layer guard every pixel would error and
-    /// `spatial_map_typed` would silently return `n_failed == n_total`
-    /// with an all-NaN map instead of a clear error.
+    /// Issue #634: `fit_energy_scale + fit_temperature` is now SUPPORTED at
+    /// spatial entry (the per-pixel fitter wires a temperature column into the
+    /// energy-scale model). `spatial_map_typed` must run without the old guard
+    /// error, actually CONVERGE per pixel, and write finite values into both
+    /// the temperature and t0/L_scale maps.  Some-ness alone is vacuous — the
+    /// maps are pre-allocated as `Some(NaN-filled)` from the config flags, so
+    /// an all-pixels-failed run (the exact hazard the replaced guard's doc
+    /// comment warned about) would still pass a Some-only assertion.
     #[test]
-    fn test_spatial_map_typed_rejects_energy_scale_with_temperature() {
+    fn test_spatial_map_typed_allows_energy_scale_with_temperature() {
         let rd = u238_single_resonance();
         let energies: Vec<f64> = (0..51).map(|i| 1.0 + (i as f64) * 0.2).collect();
         let (t_3d, u_3d) = synthetic_4x4_transmission(&rd, 0.001, &energies);
@@ -3859,13 +3860,38 @@ mod tests {
         .with_fit_temperature(true)
         .with_energy_scale(0.0, 1.0, 25.0);
 
-        let err = spatial_map_typed(&data, &config, None, None, None)
-            .expect_err("fit_energy_scale + fit_temperature must be rejected");
-        let msg = err.to_string();
+        let result = spatial_map_typed(&data, &config, None, None, None)
+            .expect("fit_energy_scale + fit_temperature is now supported (#634)");
+        assert_eq!(result.n_total, 16, "4×4 map");
+        // Real acceptance: the joint per-pixel fits must actually converge
+        // (neighbouring-spatial-test convention), not merely be dispatched.
         assert!(
-            msg.contains("fit_energy_scale") && msg.contains("fit_temperature"),
-            "error message should name both culprits, got: {msg}"
+            result.n_converged >= 14,
+            "joint fit should converge on (nearly) all pixels, got {}/16",
+            result.n_converged
         );
+        // Converged pixels write FINITE values into all three maps — this is
+        // what distinguishes success from the pre-allocated NaN fill.
+        let finite_count = |m: &Option<ndarray::Array2<f64>>| {
+            m.as_ref()
+                .expect("map allocated when its flag is set")
+                .iter()
+                .filter(|v| v.is_finite())
+                .count()
+        };
+        for (name, map) in [
+            ("temperature_map", &result.temperature_map),
+            ("t0_us_map", &result.t0_us_map),
+            ("l_scale_map", &result.l_scale_map),
+        ] {
+            let n_finite = finite_count(map);
+            assert!(
+                n_finite >= result.n_converged,
+                "{name}: {n_finite} finite entries < {} converged pixels — \
+                 converged pixels must write finite values",
+                result.n_converged
+            );
+        }
     }
 
     /// `(Transmission + LM + fit_energy_scale=true)` is allowed —

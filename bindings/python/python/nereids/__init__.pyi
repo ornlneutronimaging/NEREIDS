@@ -159,6 +159,21 @@ class FitResult:
         """Fitted flight-path scale factor (SAMMY TZERO L0), or None."""
         ...
 
+    def corrected_energies(
+        self, nominal_energies: NDArray[np.float64]
+    ) -> NDArray[np.float64] | None:
+        """Map a nominal energy grid through the fitted ``(t0_us, l_scale)``
+        energy scale to the corrected (calibrated) energies the fit used
+        (issue #634), using the exact SAMMY −t0 convention and the SAME
+        flight path the fit was configured with (stored on the result).
+
+        Returns ``None`` when energy-scale fitting was not enabled; raises
+        ``ValueError`` on an invalid nominal grid (non-finite, non-positive,
+        or non-ascending) or a degenerate calibration (t0 past the shortest
+        flight time).
+        """
+        ...
+
     @property
     def deviance_per_dof(self) -> float | None:
         """Conditional binomial deviance / (n - k) from the counts-KL

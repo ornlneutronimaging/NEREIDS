@@ -74,7 +74,7 @@ pub struct SessionCache {
     #[serde(default)]
     pub kl_enable_polish_override: Option<bool>,
     /// Fit energy-scale calibration (TZERO `t₀` + flight-path `L_scale`)
-    /// as free parameters.  Mutually exclusive with `fit_temperature`.
+    /// as free parameters.  Composes with `fit_temperature` (issue #634).
     #[serde(default)]
     pub fit_energy_scale: bool,
     /// Fit energy range restriction (SAMMY EMIN/EMAX equivalent).
@@ -734,9 +734,9 @@ pub struct AppState {
     pub solver_method: SolverMethod,
     pub fit_temperature: bool,
     /// Fit residual energy-scale calibration (TZERO `t₀` μs + flight-path
-    /// `L_scale`) as free parameters per SAMMY equivalent.  Mutually
-    /// exclusive with `fit_temperature` — pipeline returns a hard error
-    /// if both are set (`pipeline.rs` ~L977).
+    /// `L_scale`) as free parameters per SAMMY equivalent.  Composes with
+    /// `fit_temperature` since issue #634 — the energy-scale model carries
+    /// a fitted temperature column (joint thermometry).
     ///
     /// Initial values: `t₀ = 0.0` and `L_scale = 1.0` (identity seeds).
     /// The configured Delay has already been subtracted when the energy

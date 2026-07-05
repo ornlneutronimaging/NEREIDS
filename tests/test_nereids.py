@@ -2690,6 +2690,154 @@ class TestFitEnergyScaleRecovery:
             f"got {float(r.l_scale):.6f}, truth {L_SCALE_TRUE}"
         )
 
+    def test_recovers_t0_l_scale_and_temperature_jointly(self):
+        """Issue #634: fit_energy_scale + fit_temperature recover the injected
+        (t0, L_scale, T) in ONE fit through the Python binding — the flag
+        combination the binding used to reject. Gate on the observables
+        (L_scale + temperature), seeding T 60 K off so a no-op cannot pass."""
+        L_NOM = 25.0
+        T0_TRUE = 0.5
+        L_SCALE_TRUE = 1.005
+        TRUE_DENSITY = 3.0e-4
+        TRUE_TEMP = 450.0
+
+        u238 = nereids.create_resonance_data(
+            z=92,
+            a=238,
+            awr=236.006,
+            scattering_radius=9.48,
+            resonances=[
+                (6.67, 0.5, 0.0015, 0.023),
+                (20.87, 0.5, 0.0103, 0.026),
+                (36.68, 0.5, 0.0344, 0.027),
+            ],
+            target_spin=0.0,
+        )
+        tof_lo = _TOF_FACTOR * L_NOM / np.sqrt(45.0)
+        tof_hi = _TOF_FACTOR * L_NOM / np.sqrt(4.0)
+        tof_grid = np.linspace(tof_lo, tof_hi, 800)
+        e_true = np.sort((_TOF_FACTOR * L_NOM / tof_grid) ** 2)
+        # Clean transmission at the TRUE energies AND the true temperature.
+        t_clean = np.asarray(
+            nereids.forward_model(
+                e_true, [(u238, TRUE_DENSITY)], temperature_k=TRUE_TEMP
+            )
+        )
+        e_meas = _measured_energies_for_known_tzero(
+            e_true,
+            t0_true_us=T0_TRUE,
+            l_scale_true=L_SCALE_TRUE,
+            l_nom_m=L_NOM,
+        )
+        rng = np.random.default_rng(20260704)
+        sigma_noise = 0.004
+        t_obs = t_clean + rng.normal(0.0, sigma_noise, size=t_clean.shape)
+        sigma = np.full_like(t_obs, sigma_noise)
+
+        r = nereids.fit_spectrum_typed(
+            transmission=t_obs,
+            uncertainty=sigma,
+            energies=e_meas,
+            isotopes=[(u238, TRUE_DENSITY)],
+            solver="lm",
+            temperature_k=TRUE_TEMP - 60.0,  # seeded 60 K off
+            fit_temperature=True,
+            fit_energy_scale=True,
+            t0_init_us=0.0,
+            l_scale_init=1.0,
+            energy_scale_flight_path_m=L_NOM,
+            max_iter=300,
+        )
+        assert bool(r.converged) is True
+        assert r.t0_us is not None and np.isfinite(r.t0_us)
+        assert r.l_scale is not None and np.isfinite(r.l_scale)
+        assert r.temperature_k is not None
+        # L_scale + temperature are the well-constrained observables (t0/L
+        # share a shallow valley; see the class docstring).
+        assert abs(float(r.l_scale) - L_SCALE_TRUE) / L_SCALE_TRUE < 1e-2
+        assert abs(float(r.temperature_k) - TRUE_TEMP) < 15.0, (
+            f"temperature not recovered jointly: got {r.temperature_k}, "
+            f"want {TRUE_TEMP}"
+        )
+        # Non-identity accessor oracle (#634 review): at a genuinely shifted
+        # calibration, corrected_energies(e_meas) must land on the TRUE
+        # energy axis the data was synthesized on (to within the recovered
+        # parameters' accuracy) — a no-op accessor returns e_meas instead,
+        # which differs from e_true by ~0.5-1 % here.
+        corr = np.asarray(r.corrected_energies(e_meas))
+        med_rel = np.median(np.abs(corr - e_true) / e_true)
+        noop_rel = np.median(np.abs(e_meas - e_true) / e_true)
+        assert med_rel < 0.2 * noop_rel, (
+            f"corrected axis (med rel err {med_rel:.2e}) should be far closer "
+            f"to truth than the uncorrected axis ({noop_rel:.2e})"
+        )
+
+    def test_corrected_energies_accessor(self):
+        """Issue #634: FitResult.corrected_energies maps a nominal grid through
+        the fitted energy scale (finite ndarray), and returns None when the
+        energy scale was not fitted."""
+        L_NOM = 25.0
+        u238 = nereids.create_resonance_data(
+            z=92,
+            a=238,
+            awr=236.006,
+            scattering_radius=9.48,
+            resonances=[(6.67, 0.5, 0.0015, 0.023), (20.87, 0.5, 0.0103, 0.026)],
+            target_spin=0.0,
+        )
+        energies = np.linspace(4.0, 30.0, 400)
+        t_clean = np.asarray(nereids.forward_model(energies, [(u238, 3.0e-4)]))
+        sigma = np.full_like(t_clean, 0.005)
+
+        # Energy-scale fit → corrected_energies is a finite ndarray, ascending.
+        r_es = nereids.fit_spectrum_typed(
+            transmission=t_clean,
+            uncertainty=sigma,
+            energies=energies,
+            isotopes=[(u238, 3.0e-4)],
+            solver="lm",
+            fit_energy_scale=True,
+            t0_init_us=0.0,
+            l_scale_init=1.0,
+            energy_scale_flight_path_m=L_NOM,
+            max_iter=100,
+        )
+        corr = r_es.corrected_energies(energies)
+        assert corr is not None
+        corr = np.asarray(corr)
+        assert corr.shape == energies.shape
+        assert np.all(np.isfinite(corr)) and np.all(np.diff(corr) > 0)
+        # Non-circular numeric oracle (#634 review): hand-compute the SAMMY
+        # −t0 transform in numpy from the FITTED (t0, l_scale) and the fit's
+        # flight path — a no-op accessor, a sign flip, a t0/l_scale swap, or
+        # a wrong flight-path source all break this equality, none of which
+        # the shape/finite asserts above can see.
+        kl = _TOF_FACTOR * L_NOM
+        tof = kl / np.sqrt(energies)
+        expected = (kl * float(r_es.l_scale) / (tof - float(r_es.t0_us))) ** 2
+        np.testing.assert_allclose(corr, expected, rtol=1e-12)
+
+        # No energy-scale fit → None (distinguishes "unfit" from "identity").
+        r_plain = nereids.fit_spectrum_typed(
+            transmission=t_clean,
+            uncertainty=sigma,
+            energies=energies,
+            isotopes=[(u238, 3.0e-4)],
+            solver="lm",
+            max_iter=50,
+        )
+        assert r_plain.corrected_energies(energies) is None
+
+        # Invalid nominal grids are rejected with the binding's standard
+        # energy-grid validation (#634 review) — NaN, non-positive, and
+        # non-ascending grids raise instead of passing through.
+        with pytest.raises(ValueError):
+            r_es.corrected_energies(np.array([np.nan, 2.0, 3.0]))
+        with pytest.raises(ValueError):
+            r_es.corrected_energies(np.array([0.0, 1.0, 2.0]))
+        with pytest.raises(ValueError):
+            r_es.corrected_energies(np.array([3.0, 1.0, 2.0]))
+
 
 # ===========================================================================
 # Issue #558 — energy-grid validation at the PyO3 boundary
