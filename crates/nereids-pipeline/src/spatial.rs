@@ -340,7 +340,8 @@ fn validate_spatial_fit_preflight(
     // the joint-Poisson path (`pipeline.rs::fit_counts_joint_poisson`)
     // both fire identically across the map.  We compute `required`
     // from the config's free-parameter count (densities + temperature
-    // + energy-scale + transmission_background flags), clamped to a
+    // + energy-scale + transmission_background flags +
+    // multiplicative-baseline flags, #635), clamped to a
     // floor of 2 — that combined `max(2, n_free)` covers both the
     // numerical-stability minimum and the underdetermined-system
     // rejection.  Without the `n_free` factor, a config with
@@ -1116,9 +1117,16 @@ pub fn spatial_map_typed(
                 None
             },
             energy_scale_flight_path_m: config.fit_energy_scale().then(|| config.flight_path_m()),
-            // No live pixels → stage 1 never ran; report the baseline as
-            // absent rather than echoing unfitted inits.
-            baseline_global: None,
+            // No live pixels → stage 1 never ran, so a FITTED global
+            // baseline is absent.  A fully FROZEN global baseline involves
+            // no fitting, though — the caller's inits ARE the baseline —
+            // so mirror the main path and echo them (review R4: the same
+            // config must not report Some(inits) on a live map but None on
+            // an all-dead one).
+            baseline_global: config
+                .multiplicative_baseline()
+                .filter(|bl| bl.spatial_global && !bl.fit_b0 && !bl.fit_b1 && !bl.fit_b2)
+                .map(|bl| [bl.b0_init, bl.b1_init, bl.b2_init]),
             baseline_e_ref_ev,
             baseline_maps: if has_baseline_maps {
                 Some([

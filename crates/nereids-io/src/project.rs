@@ -196,6 +196,13 @@ pub struct ProjectSnapshot {
     pub lm_background_enabled: Option<bool>,
     /// Whether KL background fitting (b0 + b1/sqrt(E)) is enabled.
     pub kl_background_enabled: Option<bool>,
+    /// Whether the bounded multiplicative baseline (#635) is enabled.
+    /// This flag SELECTS the fit model (attaches the baseline and holds
+    /// Anorm fixed), so it must round-trip like every sibling solver
+    /// flag — without it a reloaded project displays baseline results
+    /// while a refit silently runs a different model.  `None` for
+    /// pre-#635 files; restore-side defaults to false.
+    pub baseline_enabled: Option<bool>,
     /// Counts-KL proton-charge ratio `c = Q_s / Q_ob`.
     /// `None` for project files predating the field; restore-side
     /// defaults to 1.0.
@@ -306,6 +313,7 @@ impl Default for ProjectSnapshot {
             uncertainty_is_estimated: None,
             lm_background_enabled: None,
             kl_background_enabled: None,
+            baseline_enabled: None,
             kl_c_ratio: None,
             kl_enable_polish_override: None,
             endf_cache: vec![],
@@ -611,6 +619,9 @@ fn write_config(file: &hdf5::File, snap: &ProjectSnapshot) -> Result<(), IoError
     }
     if let Some(lm_bg) = snap.lm_background_enabled {
         write_bool_attr(&solver, "lm_background_enabled", lm_bg)?;
+    }
+    if let Some(bl) = snap.baseline_enabled {
+        write_bool_attr(&solver, "baseline_enabled", bl)?;
     }
     if let Some(kl_bg) = snap.kl_background_enabled {
         write_bool_attr(&solver, "kl_background_enabled", kl_bg)?;
@@ -1341,6 +1352,7 @@ fn read_config(file: &hdf5::File, snap: &mut ProjectSnapshot) -> Result<(), IoEr
     };
     snap.uncertainty_is_estimated = read_bool_attr(&solver, "uncertainty_is_estimated").ok();
     snap.lm_background_enabled = read_bool_attr(&solver, "lm_background_enabled").ok();
+    snap.baseline_enabled = read_bool_attr(&solver, "baseline_enabled").ok();
     snap.kl_background_enabled = read_bool_attr(&solver, "kl_background_enabled").ok();
     snap.kl_c_ratio = read_f64_attr(&solver, "kl_c_ratio").ok();
     snap.kl_enable_polish_override =
@@ -2078,6 +2090,7 @@ mod tests {
             uncertainty_is_estimated: Some(false),
             lm_background_enabled: None,
             kl_background_enabled: None,
+            baseline_enabled: None,
             kl_c_ratio: None,
             kl_enable_polish_override: None,
             endf_cache: vec![],
@@ -2829,9 +2842,14 @@ mod tests {
         snap.single_fit_densities = Some(vec![0.002]);
         snap.single_fit_baseline = Some([1.019, -0.029, 0.011]);
         snap.single_fit_baseline_e_ref_ev = Some(3.3166247903554);
+        // The flag that PRODUCED these results must round-trip too (R4):
+        // arrays without the configuration mean a reloaded project refits
+        // a silently different model.
+        snap.baseline_enabled = Some(true);
         save_project(&path, &snap).unwrap();
 
         let loaded = load_project(&path).unwrap();
+        assert_eq!(loaded.baseline_enabled, Some(true));
         assert_eq!(loaded.baseline_global, Some([1.02, -0.03, 0.01]));
         assert!((loaded.baseline_e_ref_ev.unwrap() - 3.3166247903554).abs() < 1e-12);
         let maps = loaded.baseline_maps.as_ref().expect("baseline maps");
@@ -2851,6 +2869,10 @@ mod tests {
         assert!(loaded2.baseline_maps.is_none());
         assert!(loaded2.single_fit_baseline.is_none());
         assert!(loaded2.single_fit_baseline_e_ref_ev.is_none());
+        assert!(
+            loaded2.baseline_enabled.is_none(),
+            "pre-#635 files read as None"
+        );
     }
 
     /// Review R3: present-but-malformed baseline data must FAIL CLOSED —

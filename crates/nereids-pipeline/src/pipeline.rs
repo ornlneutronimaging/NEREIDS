@@ -1832,8 +1832,15 @@ fn fit_counts_joint_poisson(
     };
     let mut cfg = jp_cfg.clone();
     cfg.compute_covariance = config.compute_covariance;
+    // Solver / numeric failures map to PipelineError::Fitting — NOT
+    // InvalidParameter (review R4): the binding taxonomy sends
+    // InvalidParameter to Python ValueError (bad user input), and a
+    // joint-Poisson failure at this point (config already validated
+    // up-front) is a solver-class error that must stay RuntimeError,
+    // matching the LM / KL-transmission paths' `?`-conversion of
+    // FittingError.
     let result = joint_poisson::joint_poisson_fit(&objective, &mut params, &cfg)
-        .map_err(|e| PipelineError::InvalidParameter(format!("joint-Poisson fit failed: {e}")))?;
+        .map_err(PipelineError::Fitting)?;
 
     // ── Extract fitted quantities ──
     let densities: Vec<f64> = (0..n_density_params).map(|i| result.params[i]).collect();
