@@ -9,10 +9,14 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
 
 ### Added
 
-- **Hot/railed pixel detection** (#643): `detect_hot_pixels` — robust
-  one-sided log-space median + k·MAD screen on per-pixel total counts
-  (k = 6 default, with a Poisson floor on the robust scale so quantized
-  low-count images never turn the screen into a low-count filter), in
+- **Hot/railed pixel detection** (#643): `detect_hot_pixels` — two-stage
+  screen on per-pixel total counts: a robust one-sided log-space
+  median + k·MAD cut (k = 6 default, with a Poisson floor on the robust
+  scale so quantized low-count images never turn the screen into a
+  low-count filter) confirmed by a 10× local-8-neighbor-median isolation
+  test, so bimodal scenes (dark-majority sample + bright open-beam
+  region) never get their bright region masked — a contiguous bright
+  region is scene, not a defect.  Requires raw (unscaled) counts.  In
   Rust (`nereids_io::normalization`) and Python.
 - **Chunked dead-pixel detection** (#643):
   `detect_dead_pixels_chunked` — per-acquisition-chunk detection that
@@ -27,8 +31,14 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
 ### Changed
 
 - **GUI normalization now masks dead(sample) ∪ dead(OB) ∪ hot(sample)
-  ∪ hot(OB)** instead of dead(sample) only (#643) — masked-pixel counts
-  may differ on re-normalization of existing data.
+  ∪ hot(OB)** instead of dead(sample) only (#643), on both the TIFF-pair
+  and the HDF5-with-open-beam paths (the HDF5 path unions the detected
+  mask with any mask carried by the file) — masked-pixel counts may
+  differ on re-normalization of existing data.
+- Dead/hot detectors' validating entry points (`detect_bad_pixels`,
+  `detect_hot_pixels`, `detect_dead_pixels_chunked`) now reject stacks
+  and chunks with an empty TOF axis (`shape[0] == 0`), whose vacuous
+  all-zero test would otherwise mask the whole detector (#643).
 - Pixel-mask documentation now states the semantics explicitly (#643):
   masks are a pipeline-integrity screen only, never a
   data-quality/coverage filter — low-count pixels are alive and are
