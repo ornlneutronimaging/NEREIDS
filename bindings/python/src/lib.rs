@@ -758,8 +758,15 @@ impl PyIkedaCarpenter {
 
     /// `(tof_offsets_us, weights)` kernel at a single energy (eV); offsets
     /// ascending with the mode at 0, weights peak-normalized.
-    fn kernel_at(&self, energy_ev: f64) -> (Vec<f64>, Vec<f64>) {
-        self.inner.kernel_at(energy_ev)
+    ///
+    /// Raises ``ValueError`` when the τ-grid cannot resolve the prompt core
+    /// and requested folds within the sample cap at this energy (construction
+    /// validates the reference energies; a probe energy outside their range
+    /// can still be unresolvable).
+    fn kernel_at(&self, energy_ev: f64) -> PyResult<(Vec<f64>, Vec<f64>)> {
+        self.inner
+            .kernel_at(energy_ev)
+            .map_err(|e| pyo3::exceptions::PyValueError::new_err(e.to_string()))
     }
 
     /// Flight path length in meters.
@@ -1300,12 +1307,6 @@ impl PyResolutionCalibration {
 ///     base_udr: base UDR kernel (required for ``family="udr_corr"``).
 ///     fit_background: also fit anorm + linear baseline (default anorm only).
 ///     restarts: optimizer restarts (keep the best).
-///     psr_fwhm_ns: SNS PSR channel-triangle FWHM in ns, folded into the
-///         ``"ic"`` family's kernel only (default 350 — the VENUS FTS header
-///         value; ``0`` disables). Tabulated/UDR kernels already carry the
-///         fold in the file and are never re-folded.
-///     fit_psr: also FIT the PSR FWHM (``"ic"`` only; appends a 5th
-///         parameter, box-bounded 0.05–1 µs, started at ``psr_fwhm_ns``).
 ///     fit_t0, fit_l_scale: also fit the SHARED SAMMY energy-scale ``(t0,
 ///         L_scale)``. Default ``False`` — position is PINNED at its center (a pure
 ///         shape/width calibration on the already energy-calibrated grid). Opt in
@@ -1316,19 +1317,30 @@ impl PyResolutionCalibration {
 ///         set from the instrument's flight-path / timing metrology.
 ///     t0_center_us, l_scale_center: prior means / pinned values (default 0.0, 1.0).
 ///     t0_prior_us, l_scale_prior: Gaussian prior σ (``None`` = flat/bounded only).
+///     psr_fwhm_ns: SNS PSR channel-triangle FWHM in ns, folded into the
+///         ``"ic"`` family's kernel only (default 350 — the VENUS FTS header
+///         value; ``0`` disables). Tabulated/UDR kernels already carry the
+///         fold in the file and are never re-folded.
+///     fit_psr: also FIT the PSR FWHM (``"ic"`` only; appends a 5th
+///         parameter, box-bounded 0.05–1 µs, started at ``psr_fwhm_ns`` —
+///         which must then be > 0: a zero start contradicts "0 disables").
 ///
 /// Returns:
 ///     ResolutionCalibration with the fitted params, data χ²/dof, the fitted (or
 ///     pinned) ``position_t0_us`` / ``position_l_scale`` / ``prior_penalty``, and
 ///     the calibrated resolution (``.as_tabulated()`` / ``.gaussian_params()``).
+// `psr_fwhm_ns` / `fit_psr` sit at the END of the signature (after every
+// parameter that predates them): inserting them mid-signature would silently
+// shift the meaning of existing ≥ 14-positional-argument calls (review #645
+// F7). Keep any future additions at the end for the same reason.
 #[pyfunction]
 #[pyo3(signature = (
     energies, data, uncertainty, family, isotopes=None, groups=None,
     temperature_k=293.6, base_udr=None, flight_path_m=25.0, fit_background=false,
     restarts=1, ic_n_energies=64, ic_n_tau=500,
-    psr_fwhm_ns=DEFAULT_PSR_FWHM_NS, fit_psr=false,
     fit_t0=false, fit_l_scale=false, t0_center_us=0.0, l_scale_center=1.0,
-    t0_prior_us=None, l_scale_prior=None
+    t0_prior_us=None, l_scale_prior=None,
+    psr_fwhm_ns=DEFAULT_PSR_FWHM_NS, fit_psr=false
 ))]
 #[allow(clippy::too_many_arguments)]
 fn calibrate_resolution(
@@ -1346,14 +1358,14 @@ fn calibrate_resolution(
     restarts: usize,
     ic_n_energies: usize,
     ic_n_tau: usize,
-    psr_fwhm_ns: f64,
-    fit_psr: bool,
     fit_t0: bool,
     fit_l_scale: bool,
     t0_center_us: f64,
     l_scale_center: f64,
     t0_prior_us: Option<f64>,
     l_scale_prior: Option<f64>,
+    psr_fwhm_ns: f64,
+    fit_psr: bool,
 ) -> PyResult<PyResolutionCalibration> {
     if isotopes.is_some() == groups.is_some() {
         return Err(pyo3::exceptions::PyValueError::new_err(
@@ -1461,6 +1473,16 @@ fn calibrate_resolution(
             return Err(pyo3::exceptions::PyValueError::new_err(format!(
                 "psr_fwhm_ns must be finite and >= 0 (0 disables the PSR fold), got {psr_fwhm_ns}"
             )));
+        }
+        // fit_psr fits the PSR FWHM from the psr_fwhm_ns starting value, but 0
+        // means "no fold" — a zero start would be silently clamped into the
+        // [0.05, 1] us fit box, contradicting the documented "0 disables".
+        // Also enforced by the Rust calibrator.
+        if fit_psr && psr_fwhm_ns == 0.0 {
+            return Err(pyo3::exceptions::PyValueError::new_err(
+                "fit_psr=True requires a positive psr_fwhm_ns starting value (psr_fwhm_ns=0 \
+                 disables the PSR fold; use fit_psr=False to calibrate without one)",
+            ));
         }
     }
 

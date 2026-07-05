@@ -3008,3 +3008,33 @@ class TestCalibrateResolution:
                     temperature_k=300.0,
                     psr_fwhm_ns=bad,
                 )
+
+    def test_fit_psr_with_zero_width_rejected(self):
+        # psr_fwhm_ns=0 is documented as "no PSR fold"; fit_psr=True would
+        # silently clamp the 0 start into the [0.05, 1] us fit box. The
+        # contradiction must raise, not fit a phantom fold.
+        iso, e, t, unc = self._calibrant()
+        with pytest.raises(ValueError, match="fit_psr"):
+            nereids.calibrate_resolution(
+                e,
+                t,
+                unc,
+                "ic",
+                isotopes=[(iso, 5.0e-4)],
+                temperature_k=300.0,
+                psr_fwhm_ns=0.0,
+                fit_psr=True,
+            )
+
+    def test_psr_parameters_trail_the_signature(self):
+        # Review #645 F7: psr_fwhm_ns / fit_psr were added AFTER the original
+        # signature froze, so they must sit at the END — inserting them
+        # mid-signature would silently shift every pre-existing call passing
+        # >= 14 positional arguments.
+        sig = nereids.calibrate_resolution.__text_signature__
+        assert sig is not None
+        assert (
+            sig.index("l_scale_prior")
+            < sig.index("psr_fwhm_ns")
+            < sig.index("fit_psr")
+        ), f"psr_fwhm_ns/fit_psr must trail the signature: {sig}"

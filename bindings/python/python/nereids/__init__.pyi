@@ -282,7 +282,11 @@ class IkedaCarpenter:
         ...
 
     def kernel_at(self, energy_ev: float) -> tuple[list[float], list[float]]:
-        """``(tof_offsets_us, weights)`` at one energy; mode at offset 0."""
+        """``(tof_offsets_us, weights)`` at one energy; mode at offset 0.
+
+        Raises ``ValueError`` when the tau-grid cannot resolve the prompt
+        core and requested folds within the sample cap at this energy.
+        """
         ...
 
     @property
@@ -636,14 +640,14 @@ def calibrate_resolution(
     restarts: int = 1,
     ic_n_energies: int = 64,
     ic_n_tau: int = 500,
-    psr_fwhm_ns: float = 350.0,
-    fit_psr: bool = False,
     fit_t0: bool = False,
     fit_l_scale: bool = False,
     t0_center_us: float = 0.0,
     l_scale_center: float = 1.0,
     t0_prior_us: float | None = None,
     l_scale_prior: float | None = None,
+    psr_fwhm_ns: float = 350.0,
+    fit_psr: bool = False,
 ) -> ResolutionCalibration:
     """Calibrate instrument-resolution parameters against a known-(rho,T) calibrant.
 
@@ -659,8 +663,11 @@ def calibrate_resolution(
     triangle of FWHM ``psr_fwhm_ns`` (default 350 ns, the VENUS FTS header
     value; 0 disables; applies to "ic" only — tabulated/UDR kernels already
     carry the fold). ``fit_psr=True`` ("ic" only) also fits the PSR FWHM as a
-    5th parameter (box-bounded 0.05-1 us). Degenerate directions are reported
-    via ``bounds_hit``.
+    5th parameter (box-bounded 0.05-1 us), started at ``psr_fwhm_ns`` — which
+    must then be > 0 (a zero start contradicts "0 disables" and raises
+    ``ValueError``). ``psr_fwhm_ns`` / ``fit_psr`` sit at the END of the
+    signature so pre-existing positional calls keep their meaning. Degenerate
+    directions are reported via ``bounds_hit``.
 
     By default position is PINNED (``fit_t0=fit_l_scale=False``): a pure
     shape/width fit on the already energy-calibrated grid. Set ``fit_t0`` /

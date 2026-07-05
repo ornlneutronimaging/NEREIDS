@@ -97,7 +97,7 @@ cal = nereids.calibrate_resolution(
     base_udr=udr,                       # required for family="udr_corr"
     restarts=2,
 )
-print(cal)                # ResolutionCalibration(family=udr_corr, chi2/dof=..., converged=...)
+print(cal)                # ResolutionCalibration(family=udr_corr, chi2/dof=..., converged=..., n_free_params=2, bounds_hit=[])
 print(cal.params())       # decoded fitted parameters
 calibrated = cal.as_tabulated()         # pin this into the sample fit
 ```
