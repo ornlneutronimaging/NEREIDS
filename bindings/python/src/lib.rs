@@ -50,8 +50,8 @@ use nereids_endf::resonance::{
 };
 use nereids_endf::retrieval::{EndfLibrary, EndfRetriever, mat_number};
 use nereids_fitting::resolution_calib::{
-    CalibrationConfig, ResolutionFamily, UDR_S0_MAX, UDR_S0_MIN,
-    calibrate_resolution as rust_calibrate_resolution,
+    CalibrationConfig, DEFAULT_PSR_FWHM_NS, NS_TO_US, PSR_FWHM_PIN_CEILING_US, ResolutionFamily,
+    UDR_S0_MAX, UDR_S0_MIN, calibrate_resolution as rust_calibrate_resolution,
 };
 use nereids_io::normalization::{self as norm, NormalizationParams};
 use nereids_io::tof::BeamlineParams;
@@ -799,8 +799,15 @@ impl PyIkedaCarpenter {
 
     /// `(tof_offsets_us, weights)` kernel at a single energy (eV); offsets
     /// ascending with the mode at 0, weights peak-normalized.
-    fn kernel_at(&self, energy_ev: f64) -> (Vec<f64>, Vec<f64>) {
-        self.inner.kernel_at(energy_ev)
+    ///
+    /// Raises ``ValueError`` when the τ-grid cannot resolve the prompt core
+    /// and requested folds within the sample cap at this energy (construction
+    /// validates the reference energies; a probe energy outside their range
+    /// can still be unresolvable).
+    fn kernel_at(&self, energy_ev: f64) -> PyResult<(Vec<f64>, Vec<f64>)> {
+        self.inner
+            .kernel_at(energy_ev)
+            .map_err(|e| pyo3::exceptions::PyValueError::new_err(e.to_string()))
     }
 
     /// Flight path length in meters.
@@ -1235,6 +1242,11 @@ impl PyResolutionCalibration {
     }
 
     /// Decoded, human-readable fitted parameters.
+    ///
+    /// For ``family="ic"`` (#642) the keys are ``a0``/``a1`` (α(E) = a0·√E +
+    /// a1, positive by construction), ``beta``, ``r`` and ``psr_fwhm_us`` —
+    /// decoded from the calibrated resolution itself (the raw ``theta`` is
+    /// ln/box-encoded optimizer space).
     fn params<'py>(&self, py: Python<'py>) -> PyResult<Bound<'py, pyo3::types::PyDict>> {
         let d = pyo3::types::PyDict::new(py);
         match self.inner.family.as_str() {
@@ -1250,12 +1262,40 @@ impl PyResolutionCalibration {
                 d.set_item("delta_l_m", self.inner.theta[1].abs())?;
             }
             _ => {
-                // IC fits (a0, a1); β is held fixed (unidentifiable in the eV regime).
-                d.set_item("a0", self.inner.theta[0].abs())?;
-                d.set_item("a1", self.inner.theta[1])?;
+                // IC: decode off the calibrated resolution — the single source
+                // of truth (never re-derive from the encoded theta by hand).
+                // The a0/a1 keys keep their pre-#642 meaning for back-compat.
+                if let ResolutionFunction::IkedaCarpenter(ic) = &self.inner.resolution {
+                    let p = ic.params();
+                    if let EnergyLaw::SqrtE { a0, a1 } = &p.alpha {
+                        d.set_item("a0", *a0)?;
+                        d.set_item("a1", *a1)?;
+                    }
+                    d.set_item("beta", p.beta)?;
+                    if let EnergyLaw::Const(r) = &p.r {
+                        d.set_item("r", *r)?;
+                    }
+                    d.set_item("psr_fwhm_us", p.channel_fwhm_us.unwrap_or(0.0))?;
+                }
             }
         }
         Ok(d)
+    }
+
+    /// Number of outer-loop free parameters: resolution θ plus any fitted
+    /// position coordinates (4–5 for ``"ic"``, 2 for the other families).
+    #[getter]
+    fn n_free_params(&self) -> usize {
+        self.inner.n_free_params
+    }
+
+    /// Coordinates pinned at a box bound at the solution, as
+    /// ``"name:lower"`` / ``"name:upper"`` strings (empty = interior
+    /// solution). E.g. ``"r:lower"`` flags the β↔R ridge: the calibrant shows
+    /// no storage tail, so the reported β carries no information.
+    #[getter]
+    fn bounds_hit(&self) -> Vec<String> {
+        self.inner.bounds_hit.clone()
     }
 
     /// The calibrated resolution as a [`TabulatedResolution`] — pass to
@@ -1281,8 +1321,12 @@ impl PyResolutionCalibration {
 
     fn __repr__(&self) -> String {
         format!(
-            "ResolutionCalibration(family={}, chi2/dof={:.4}, converged={})",
-            self.inner.family, self.inner.chi2_dof, self.inner.converged
+            "ResolutionCalibration(family={}, chi2/dof={:.4}, converged={}, n_free_params={}, bounds_hit={:?})",
+            self.inner.family,
+            self.inner.chi2_dof,
+            self.inner.converged,
+            self.inner.n_free_params,
+            self.inner.bounds_hit
         )
     }
 }
@@ -1295,7 +1339,10 @@ impl PyResolutionCalibration {
 ///
 /// Args:
 ///     energies, data, uncertainty: calibrant transmission spectrum.
-///     family: ``"gaussian"`` | ``"udr_corr"`` | ``"ic"``.
+///     family: ``"gaussian"`` | ``"udr_corr"`` | ``"ic"``. The ``"ic"`` family
+///         (#642) fits the full bounded moderator shape — ``α(E) = a0·√E + a1``
+///         positive by construction, free bounded ``beta`` and storage
+///         fraction ``r`` — folded with the SNS PSR channel triangle.
 ///     isotopes / groups: known calibrant composition + density (exactly one).
 ///     temperature_k: known calibrant temperature.
 ///     base_udr: base UDR kernel (required for ``family="udr_corr"``).
@@ -1311,18 +1358,36 @@ impl PyResolutionCalibration {
 ///         set from the instrument's flight-path / timing metrology.
 ///     t0_center_us, l_scale_center: prior means / pinned values (default 0.0, 1.0).
 ///     t0_prior_us, l_scale_prior: Gaussian prior σ (``None`` = flat/bounded only).
+///     psr_fwhm_ns: SNS PSR channel-triangle FWHM in ns, folded into the
+///         ``"ic"`` family's kernel only (default 350 — the VENUS FTS header
+///         value; ``0`` disables). Tabulated/UDR kernels already carry the
+///         fold in the file and are never re-folded. NANOSECONDS: values
+///         above 10_000 ns (10 µs) are rejected as a µs-as-ns unit slip
+///         (synthesis cost is quadratic in the fold width).
+///     fit_psr: also FIT the PSR FWHM (``"ic"`` only; appends a 5th
+///         parameter, box-bounded 0.05–1 µs, started at ``psr_fwhm_ns``
+///         clamped into that box — an out-of-box start, legal as a pin up
+///         to 10 µs, starts at the nearer box edge with a stderr warning,
+///         and a fit that stays there reports ``psr_fwhm_us:lower`` /
+///         ``:upper`` in ``bounds_hit``; ``psr_fwhm_ns`` must then be > 0:
+///         a zero start contradicts "0 disables").
 ///
 /// Returns:
 ///     ResolutionCalibration with the fitted params, data χ²/dof, the fitted (or
 ///     pinned) ``position_t0_us`` / ``position_l_scale`` / ``prior_penalty``, and
 ///     the calibrated resolution (``.as_tabulated()`` / ``.gaussian_params()``).
+// `psr_fwhm_ns` / `fit_psr` sit at the END of the signature (after every
+// parameter that predates them): inserting them mid-signature would silently
+// shift the meaning of existing ≥ 14-positional-argument calls (review #645
+// F7). Keep any future additions at the end for the same reason.
 #[pyfunction]
 #[pyo3(signature = (
     energies, data, uncertainty, family, isotopes=None, groups=None,
     temperature_k=293.6, base_udr=None, flight_path_m=25.0, fit_background=false,
     restarts=1, ic_n_energies=64, ic_n_tau=500,
     fit_t0=false, fit_l_scale=false, t0_center_us=0.0, l_scale_center=1.0,
-    t0_prior_us=None, l_scale_prior=None
+    t0_prior_us=None, l_scale_prior=None,
+    psr_fwhm_ns=DEFAULT_PSR_FWHM_NS, fit_psr=false
 ))]
 #[allow(clippy::too_many_arguments)]
 fn calibrate_resolution(
@@ -1346,6 +1411,8 @@ fn calibrate_resolution(
     l_scale_center: f64,
     t0_prior_us: Option<f64>,
     l_scale_prior: Option<f64>,
+    psr_fwhm_ns: f64,
+    fit_psr: bool,
 ) -> PyResult<PyResolutionCalibration> {
     if isotopes.is_some() == groups.is_some() {
         return Err(pyo3::exceptions::PyValueError::new_err(
@@ -1408,7 +1475,7 @@ fn calibrate_resolution(
 
     let fam = match family {
         "gaussian" => ResolutionFamily::Gaussian,
-        "ic" => ResolutionFamily::IkedaCarpenter,
+        "ic" => ResolutionFamily::IkedaCarpenter { fit_psr },
         "udr_corr" => {
             let base = base_udr.ok_or_else(|| {
                 pyo3::exceptions::PyValueError::new_err(
@@ -1424,11 +1491,18 @@ fn calibrate_resolution(
         }
     };
 
+    // fit_psr appends the PSR-FWHM fit coordinate, which only the IC family
+    // carries — reject the flag on other families instead of silently ignoring it.
+    if fit_psr && !matches!(fam, ResolutionFamily::IkedaCarpenter { .. }) {
+        return Err(pyo3::exceptions::PyValueError::new_err(format!(
+            "fit_psr=True requires family='ic', got family='{family}'"
+        )));
+    }
     // For family='ic' these size the kernel-synthesis grid; validate up front so an
     // out-of-range value gives a precise error instead of the generic "no finite-χ²
     // resolution" (every IkedaCarpenter::new eval would otherwise fail). They are
     // inert for the gaussian/udr_corr families.
-    if matches!(fam, ResolutionFamily::IkedaCarpenter) {
+    if matches!(fam, ResolutionFamily::IkedaCarpenter { .. }) {
         if ic_n_energies < 2 {
             return Err(pyo3::exceptions::PyValueError::new_err(format!(
                 "ic_n_energies must be >= 2 for family='ic', got {ic_n_energies}"
@@ -1439,6 +1513,39 @@ fn calibrate_resolution(
                 "ic_n_tau must be >= 8 for family='ic', got {ic_n_tau}"
             )));
         }
+        // PSR triangle FWHM: finite and >= 0 ns (0 disables the fold). Also
+        // enforced by the Rust calibrator; rejected here with the precise
+        // Python-facing message.
+        if !psr_fwhm_ns.is_finite() || psr_fwhm_ns < 0.0 {
+            return Err(pyo3::exceptions::PyValueError::new_err(format!(
+                "psr_fwhm_ns must be finite and >= 0 (0 disables the PSR fold), got {psr_fwhm_ns}"
+            )));
+        }
+        // Sanity ceiling (mirrors the Rust calibrator; see
+        // PSR_FWHM_PIN_CEILING_US): psr_fwhm_ns is NANOSECONDS and kernel-
+        // synthesis cost is quadratic in the fold width, so a µs-as-ns unit
+        // slip (350 meaning µs) would hang the calibration for hours behind
+        // a fictitious fold. Reject with the precise Python-facing message.
+        if psr_fwhm_ns * NS_TO_US > PSR_FWHM_PIN_CEILING_US {
+            return Err(pyo3::exceptions::PyValueError::new_err(format!(
+                "psr_fwhm_ns={psr_fwhm_ns} ns (= {} us) exceeds the {PSR_FWHM_PIN_CEILING_US} \
+                 us sanity ceiling: psr_fwhm_ns is in NANOSECONDS (the SNS/VENUS FTS \
+                 convention is 350 ns) and kernel-synthesis cost grows quadratically with \
+                 the fold width, so a us-as-ns unit slip would hang the calibration. Pass \
+                 the width in ns, or 0 to disable the PSR fold",
+                psr_fwhm_ns * NS_TO_US
+            )));
+        }
+        // fit_psr fits the PSR FWHM from the psr_fwhm_ns starting value, but 0
+        // means "no fold" — a zero start would be silently clamped into the
+        // [0.05, 1] us fit box, contradicting the documented "0 disables".
+        // Also enforced by the Rust calibrator.
+        if fit_psr && psr_fwhm_ns == 0.0 {
+            return Err(pyo3::exceptions::PyValueError::new_err(
+                "fit_psr=True requires a positive psr_fwhm_ns starting value (psr_fwhm_ns=0 \
+                 disables the PSR fold; use fit_psr=False to calibrate without one)",
+            ));
+        }
     }
 
     let cfg = CalibrationConfig {
@@ -1447,6 +1554,7 @@ fn calibrate_resolution(
         restarts,
         ic_n_energies,
         ic_n_tau,
+        psr_fwhm_ns,
         fit_t0,
         fit_l_scale,
         position_t0_center_us: t0_center_us,
