@@ -14,10 +14,16 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
   median + k·MAD cut (k = 6 default, with a Poisson floor on the robust
   scale so quantized low-count images never turn the screen into a
   low-count filter) confirmed by a 10× local-8-neighbor-median isolation
-  test, so bimodal scenes (dark-majority sample + bright open-beam
-  region) never get their bright region masked — a contiguous bright
-  region is scene, not a defect.  Requires raw (unscaled) counts.  In
-  Rust (`nereids_io::normalization`) and Python.
+  test iterated to a fixpoint (already-flagged neighbors stop vouching),
+  which erodes railed clusters up to 3 px wide from the boundary inward
+  — a single local pass would miss the interior of clusters ≥2 px wide.
+  Bimodal scenes (dark-majority sample + bright open-beam region) never
+  get their bright region masked — a contiguous bright region ≥2 px
+  wide is scene, not a defect, and the erosion never seeds in it; a
+  1-px-wide bright line at ≥10× local contrast is indistinguishable
+  from a railed line and is masked by design (documented trade-off;
+  real VENUS features are PSF-blurred over ≥2 px).  Requires raw
+  (unscaled) counts.  In Rust (`nereids_io::normalization`) and Python.
 - **Chunked dead-pixel detection** (#643):
   `detect_dead_pixels_chunked` — per-acquisition-chunk detection that
   flags pixels dead in *any* chunk, catching intermittent deadness
@@ -32,9 +38,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
 
 - **GUI normalization now masks dead(sample) ∪ dead(OB) ∪ hot(sample)
   ∪ hot(OB)** instead of dead(sample) only (#643), on both the TIFF-pair
-  and the HDF5-with-open-beam paths (the HDF5 path unions the detected
-  mask with any mask carried by the file) — masked-pixel counts may
-  differ on re-normalization of existing data.
+  and the HDF5-with-open-beam paths — masked-pixel counts may differ on
+  re-normalization of existing data.  Mask provenance is explicit
+  (#646): the file-declared mask (HDF5 dead-pixel dataset or a saved
+  project's mask) is kept separately, and every normalization recomputes
+  the effective mask from scratch as declared ∪ freshly-detected —
+  detections never accumulate across open-beam swaps or
+  re-normalizations.
 - Dead/hot detectors' validating entry points (`detect_bad_pixels`,
   `detect_hot_pixels`, `detect_dead_pixels_chunked`) now reject stacks
   and chunks with an empty TOF axis (`shape[0] == 0`), whose vacuous
