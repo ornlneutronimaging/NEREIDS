@@ -462,18 +462,21 @@ pub(crate) fn normalize_data(state: &mut AppState) {
             // Pipeline-integrity mask: dead ∪ hot over BOTH stacks — a pixel
             // dead or railed only in the open-beam run still corrupts every
             // transmission ratio computed from it (#643).
-            state.dead_pixels = match nereids_io::normalization::detect_bad_pixels(
+            let mask_err = match nereids_io::normalization::detect_bad_pixels(
                 sample,
                 Some(open_beam.as_ref()),
                 Some(nereids_io::normalization::HOT_PIXEL_K_MAD),
             ) {
-                Ok(mask) => Some(mask),
+                Ok(mask) => {
+                    state.dead_pixels = Some(mask);
+                    None
+                }
                 // Unreachable in practice: normalize() above already validated
                 // both stacks finite/non-negative and shape-equal; keep the
                 // mask absent rather than stale if that invariant ever breaks.
                 Err(e) => {
-                    state.status_message = format!("Pixel-mask detection: {}", e);
-                    None
+                    state.dead_pixels = None;
+                    Some(e)
                 }
             };
 
@@ -494,7 +497,16 @@ pub(crate) fn normalize_data(state: &mut AppState) {
                 ProvenanceEventKind::Normalized,
                 "Normalization complete (Method 2)",
             );
-            state.status_message = "Normalization complete".into();
+            // Compose the mask failure into the final status — a plain
+            // "Normalization complete" would silently swallow it.
+            state.status_message = match mask_err {
+                None => "Normalization complete".into(),
+                Some(e) => format!(
+                    "Normalization complete — pixel-mask detection failed \
+                     ({}), no pixel mask applied",
+                    e
+                ),
+            };
         }
         Err(e) => {
             state.status_message = format!("Normalization error: {}", e);
@@ -624,6 +636,36 @@ pub(crate) fn normalize_hdf5_with_ob(state: &mut AppState) {
             }
         });
 
+    // Pipeline-integrity mask: dead ∪ hot over BOTH stacks, same as the
+    // TIFF-pair path (#643).  HDF5 files may also carry their own mask
+    // (loaded into state.dead_pixels at load time) — union with it rather
+    // than overwrite: file-declared defects and detected defects both hold.
+    let mask_err = match nereids_io::normalization::detect_bad_pixels(
+        &sample_arc,
+        Some(ob_arc.as_ref()),
+        Some(nereids_io::normalization::HOT_PIXEL_K_MAD),
+    ) {
+        Ok(detected) => {
+            state.dead_pixels = Some(match state.dead_pixels.take() {
+                Some(mut loaded) if loaded.dim() == detected.dim() => {
+                    ndarray::Zip::from(&mut loaded)
+                        .and(&detected)
+                        .for_each(|m, &d| *m = *m || d);
+                    loaded
+                }
+                // No file mask, or one of a different detector size (it
+                // cannot apply to this data): use the detected mask alone.
+                _ => detected,
+            });
+            None
+        }
+        // Unlike the TIFF path, these stacks are not pre-validated by
+        // normalize(): negative/non-finite HDF5 values are clamped by the
+        // transmission loop above but rejected by detect_bad_pixels.  Keep
+        // any file-loaded mask and surface the failure in the final status.
+        Err(e) => Some(e),
+    };
+
     match compute_energies(state, n_tof) {
         Ok(energies) => state.energies = Some(energies),
         Err(e) => {
@@ -641,7 +683,16 @@ pub(crate) fn normalize_hdf5_with_ob(state: &mut AppState) {
         ProvenanceEventKind::Normalized,
         "HDF5 normalized with open beam (T = sample/OB)",
     );
-    state.status_message = "Normalized with open beam — counts-domain fitting available".into();
+    // Compose the mask failure into the final status so it is not
+    // silently overwritten (same rationale as normalize_data above).
+    state.status_message = match mask_err {
+        None => "Normalized with open beam — counts-domain fitting available".into(),
+        Some(e) => format!(
+            "Normalized with open beam — pixel-mask detection failed ({}), \
+             detected mask not applied",
+            e
+        ),
+    };
 }
 
 /// Compute energy bin centers from the spectrum file loaded in state.
