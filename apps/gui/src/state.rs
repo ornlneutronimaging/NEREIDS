@@ -1368,13 +1368,26 @@ impl AppState {
     /// different detector or ROI-cropped geometry than its own detected
     /// mask / embedded data.  A declared mask that cannot apply to the
     /// data is dropped for this recomputation (detected-only mask), and
-    /// the drop is logged to the provenance trail (#646 R4, F5) —
-    /// masking decisions stay observable, never silent.
-    pub fn set_detected_dead_pixels(&mut self, detected: Option<Array2<bool>>) {
+    /// the drop is RETURNED as a notice the caller must surface (#646
+    /// R4 F5; return-value design per review F1) — masking decisions
+    /// stay observable, never silent.
+    ///
+    /// The notice is returned rather than logged here because one
+    /// caller — project restore (`project::state_from_snapshot`, step
+    /// 15b) — runs BEFORE the snapshot's provenance history replaces
+    /// the session log wholesale (step 17), which would erase an entry
+    /// appended by this method; a `#[must_use]` return value cannot be
+    /// silently erased, and forces every caller to route the drop into
+    /// its own provenance/status surface (immediately at the
+    /// normalization sites, deferred past the log replacement on
+    /// restore).
+    #[must_use = "declared-mask-drop notice: surface it (provenance/status), never drop it (#646 F1)"]
+    pub fn set_detected_dead_pixels(&mut self, detected: Option<Array2<bool>>) -> Option<String> {
         // Keep the raw detected component (#646 R4, P1-1): project SAVE
         // persists it as /intermediate/detected_dead_pixels so a restore
         // without raw stacks can still rebuild the effective mask.
         self.detected_dead_pixels = detected.clone();
+        let mut notice = None;
         self.dead_pixels = match (self.file_dead_pixels.clone(), detected) {
             (Some(mut declared), Some(det)) if declared.dim() == det.dim() => {
                 ndarray::Zip::from(&mut declared)
@@ -1383,23 +1396,22 @@ impl AppState {
                 Some(declared)
             }
             // Defensive arm (see rustdoc): a declared mask of a different
-            // geometry cannot apply — detected only, drop surfaced.
+            // geometry cannot apply — detected only, drop surfaced via
+            // the returned notice.
             (Some(declared), Some(det)) => {
-                self.log_provenance(
-                    ProvenanceEventKind::ConfigChanged,
-                    format!(
-                        "Declared pixel mask {:?} does not match the data \
-                         geometry {:?}; declared mask ignored for this \
-                         recomputation — detected-only mask applied",
-                        declared.dim(),
-                        det.dim()
-                    ),
-                );
+                notice = Some(format!(
+                    "Declared pixel mask {:?} does not match the data \
+                     geometry {:?}; declared mask ignored for this \
+                     recomputation — detected-only mask applied",
+                    declared.dim(),
+                    det.dim()
+                ));
                 Some(det)
             }
             (Some(declared), None) => Some(declared),
             (None, det) => det,
         };
+        notice
     }
 
     /// Clear pixel selection, ROI, results, normalization, and cancel pending tasks.
@@ -1743,7 +1755,7 @@ mod tests {
         // First normalization detects (1, 1).
         let mut det1 = Array2::from_elem((3, 3), false);
         det1[[1, 1]] = true;
-        state.set_detected_dead_pixels(Some(det1));
+        assert!(state.set_detected_dead_pixels(Some(det1)).is_none());
         let mask = state.dead_pixels.as_ref().unwrap();
         assert!(mask[[0, 0]] && mask[[1, 1]]);
         assert_eq!(mask.iter().filter(|&&m| m).count(), 2);
@@ -1752,7 +1764,7 @@ mod tests {
         // stale and must be GONE; (0, 0) is file-declared and persists.
         let mut det2 = Array2::from_elem((3, 3), false);
         det2[[2, 2]] = true;
-        state.set_detected_dead_pixels(Some(det2));
+        assert!(state.set_detected_dead_pixels(Some(det2)).is_none());
         let mask = state.dead_pixels.as_ref().unwrap();
         assert!(mask[[0, 0]], "file-declared flag must persist");
         assert!(!mask[[1, 1]], "stale detection must not accumulate");
@@ -1773,7 +1785,7 @@ mod tests {
 
         let mut det = Array2::from_elem((2, 2), false);
         det[[1, 0]] = true;
-        state.set_detected_dead_pixels(Some(det));
+        assert!(state.set_detected_dead_pixels(Some(det)).is_none());
         assert_eq!(
             state
                 .dead_pixels
@@ -1785,25 +1797,29 @@ mod tests {
             2
         );
 
-        state.set_detected_dead_pixels(None);
+        assert!(state.set_detected_dead_pixels(None).is_none());
         assert_eq!(state.dead_pixels.as_ref().unwrap(), &declared);
 
         // No declared mask either: the effective mask is absent, not stale.
         state.file_dead_pixels = None;
-        state.set_detected_dead_pixels(None);
+        assert!(state.set_detected_dead_pixels(None).is_none());
         assert!(state.dead_pixels.is_none());
     }
 
-    /// The DEFENSIVE dimension-mismatch arm (unreachable in the current
-    /// wiring — load sites install the declared mask from the same
-    /// artifact the data comes from; reachable in principle via a
+    /// The DEFENSIVE dimension-mismatch arm (reachable via a
     /// hand-edited/corrupt project whose declared mask was saved from a
     /// different detector or ROI-cropped geometry): the inapplicable
     /// declared mask is dropped for the recomputation (detected-only
-    /// mask) and the drop is SURFACED in the provenance log, never
-    /// silent (#646 R4, F5).
+    /// mask) and the drop is RETURNED as a must-surface notice, never
+    /// silent (#646 R4 F5; return-value design F1).  The setter itself
+    /// no longer logs to provenance — project restore replaces the
+    /// provenance log wholesale AFTER calling it (step 17), which would
+    /// erase such an entry; see
+    /// `test_restore_mismatched_mask_pair_drop_notice_survives_provenance_replacement`
+    /// (project.rs) for the end-to-end restore-path property this
+    /// direct-call test cannot see.
     #[test]
-    fn test_set_detected_dead_pixels_dim_mismatch_uses_detected_and_logs() {
+    fn test_set_detected_dead_pixels_dim_mismatch_uses_detected_and_returns_notice() {
         let mut state = AppState {
             file_dead_pixels: Some(Array2::from_elem((4, 4), true)),
             ..AppState::default()
@@ -1812,17 +1828,19 @@ mod tests {
 
         let mut det = Array2::from_elem((2, 2), false);
         det[[0, 0]] = true;
-        state.set_detected_dead_pixels(Some(det.clone()));
+        let notice = state.set_detected_dead_pixels(Some(det.clone()));
         assert_eq!(state.dead_pixels.as_ref().unwrap(), &det);
-        // The drop is observable: one provenance entry naming both
-        // geometries.
-        assert_eq!(state.provenance_log.len(), provenance_len_before + 1);
-        let msg = &state.provenance_log.last().unwrap().message;
+        // The drop is observable: the returned notice names both
+        // geometries...
+        let msg = notice.expect("dim mismatch must return a drop notice");
         assert!(msg.contains("(4, 4)") && msg.contains("(2, 2)"), "{msg}");
+        // ...and surfacing is the CALLER's job — the setter appends
+        // nothing itself (a caller-side log would be erased by restore's
+        // provenance replacement; the return value cannot be).
+        assert_eq!(state.provenance_log.len(), provenance_len_before);
 
-        // The matching-geometry path stays silent — no drop, no entry.
+        // The matching-geometry path returns no notice — no drop.
         state.file_dead_pixels = Some(Array2::from_elem((2, 2), false));
-        state.set_detected_dead_pixels(Some(det));
-        assert_eq!(state.provenance_log.len(), provenance_len_before + 1);
+        assert!(state.set_detected_dead_pixels(Some(det)).is_none());
     }
 }

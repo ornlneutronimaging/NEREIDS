@@ -24,9 +24,11 @@ pub const PROJECT_SCHEMA_VERSION: &str = "1.0";
 /// component (the declared component lives at
 /// `/intermediate/dead_pixels`, unversioned for backward compatibility).
 /// Readers accept exactly this version; a dataset with a missing or
-/// unrecognized `format_version` is ignored — the restore then falls
-/// back to the declared-only behavior that predates the dataset, which
-/// is also the fallback for old files lacking the dataset entirely.
+/// unrecognized `format_version` is ignored, as is a dataset whose
+/// rank is not 2 (the same shape gate the declared-mask reader
+/// applies) — the restore then falls back to the declared-only
+/// behavior that predates the dataset, which is also the fallback for
+/// old files lacking the dataset entirely.
 pub const DETECTED_DEAD_PIXELS_FORMAT_VERSION: u32 = 1;
 
 /// Serialization-friendly snapshot of the full session state.
@@ -1565,9 +1567,10 @@ fn read_intermediate(file: &hdf5::File, snap: &mut ProjectSnapshot) -> Result<()
 
     // #646 R4 P1-1: Load the detected mask component (u8 → bool).  The
     // dataset is versioned; a missing or unrecognized `format_version`
-    // leaves the field `None` (declared-only restore — the documented
-    // fallback for files predating the dataset, see
-    // DETECTED_DEAD_PIXELS_FORMAT_VERSION).
+    // leaves the field `None`, as does a dataset whose rank is not 2 —
+    // the same shape gate as the declared-mask reader above
+    // (declared-only restore — the documented fallback for files
+    // predating the dataset, see DETECTED_DEAD_PIXELS_FORMAT_VERSION).
     if let Ok(det_ds) = inter.dataset("detected_dead_pixels") {
         let version = read_u32_attr_ds_opt(&det_ds, "format_version");
         let shape = det_ds.shape();

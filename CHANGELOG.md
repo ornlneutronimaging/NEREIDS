@@ -77,6 +77,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
   provenance log (the saved mask stays active; re-running normalization
   adopts the fresh detection explicitly).  Neither component can grow
   across save/load cycles.
+  Restore also validates both persisted components against the restored
+  transmission geometry (when the project carries normalized data) and
+  drops any component that cannot apply — a hand-corrupted mask can no
+  longer become the effective mask (or crash a refit with restored
+  ROIs).  Every mask drop on restore is surfaced in the status bar and
+  the provenance log, and survives the restore replacing the session
+  provenance with the project's own history.
   Backward/forward compatibility: files written by earlier versions
   stored the effective mask at the declared path and lack the detected
   dataset — loading one promotes the stored mask to declared once (the
@@ -84,7 +91,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
   masks keep any detections they had already absorbed, but stop growing
   from now on) and restores with no detected component (declared-only),
   as does any file whose detected dataset carries an unrecognized
-  `format_version`.
+  `format_version` or a rank other than 2.
 - Dead/hot detectors' validating entry points (`detect_bad_pixels`,
   `detect_hot_pixels`, `detect_dead_pixels_chunked`) now reject stacks
   and chunks with an empty TOF axis (`shape[0] == 0`), whose vacuous
