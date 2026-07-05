@@ -1134,6 +1134,18 @@ pub(crate) fn build_fit_line(p: &FitLineParams<'_>) -> Option<Line<'static>> {
                 0.0
             };
             let y_corrected = p.result.anorm * fitted_t[i] + bg_poly;
+            // Issue #635: the multiplicative baseline is OUTERMOST —
+            // y = B(E)·[Anorm·T + additive background] — reconstructed with
+            // the EXACT E_ref the fit used (stored on the result).  `None`
+            // (baseline not fit, or a reload that dropped it) leaves the
+            // overlay unchanged.
+            let y_corrected = match (p.result.baseline, p.result.baseline_e_ref_ev) {
+                (Some(b), Some(e_ref)) if e > 0.0 && e.is_finite() && e_ref > 0.0 => {
+                    let z = (e / e_ref).ln();
+                    (b[0] + b[1] * z + b[2] * z * z) * y_corrected
+                }
+                _ => y_corrected,
+            };
             let y = match p.y_multiplier {
                 Some(m) if i < m.len() => m[i] * y_corrected,
                 _ => y_corrected,

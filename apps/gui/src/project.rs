@@ -1162,6 +1162,10 @@ fn state_from_snapshot(snap: ProjectSnapshot, state: &mut AppState, path: &Path)
                 summary,
                 densities: fb_densities,
                 temperature_k: result.temperature_k,
+                // Warnings are config-time diagnostics; the restored result
+                // carries none (they are not persisted — re-fitting
+                // regenerates them).
+                warnings: result.warnings.clone(),
             });
         }
         state.selected_pixel = snap.single_fit_pixel;

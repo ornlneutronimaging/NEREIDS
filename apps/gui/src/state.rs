@@ -64,6 +64,9 @@ pub struct SessionCache {
     /// KL background enabled (b₀ + b₁/√E).
     #[serde(default)]
     pub kl_background_enabled: bool,
+    /// Bounded multiplicative baseline enabled (issue #635).
+    #[serde(default)]
+    pub baseline_enabled: bool,
     /// Counts-KL proton-charge ratio `c = Q_s / Q_ob`.
     /// Defaults to 1.0 (caller PC-normalized the flux upstream).
     #[serde(default = "default_kl_c_ratio")]
@@ -185,6 +188,7 @@ impl SessionCache {
             sidebar_collapsed: state.sidebar_collapsed,
             lm_background_enabled: state.lm_background_enabled,
             kl_background_enabled: state.kl_background_enabled,
+            baseline_enabled: state.baseline_enabled,
             kl_c_ratio: state.kl_c_ratio,
             kl_enable_polish_override: state.kl_enable_polish_override,
             fit_energy_scale: state.fit_energy_scale,
@@ -308,6 +312,7 @@ impl SessionCache {
         // Restore background normalization state
         state.lm_background_enabled = self.lm_background_enabled;
         state.kl_background_enabled = self.kl_background_enabled;
+        state.baseline_enabled = self.baseline_enabled;
         state.kl_c_ratio = self.kl_c_ratio;
         state.kl_enable_polish_override = self.kl_enable_polish_override;
         state.fit_energy_scale = self.fit_energy_scale;
@@ -425,6 +430,10 @@ pub struct FitFeedback {
     pub densities: Vec<(String, f64)>,
     /// Fitted temperature (K), when temperature fitting was enabled.
     pub temperature_k: Option<f64>,
+    /// Structured fit-configuration warnings from the pipeline (issue
+    /// #635 — e.g. the degenerate free-Anorm + free-T + free-density
+    /// trio).  Rendered as amber lines under the summary.
+    pub warnings: Vec<String>,
 }
 
 /// A single provenance event in the session audit trail.
@@ -778,6 +787,11 @@ pub struct AppState {
     /// polish on even at spatial scale (research use only);
     /// `Some(false)` forces off.
     pub kl_enable_polish_override: Option<bool>,
+    /// Bounded multiplicative baseline (issue #635):
+    /// B(E) = b0 + b1·ln(E/E_ref) + b2·ln²(E/E_ref), applied OUTERMOST.
+    /// When combined with a background, Anorm is held fixed (b0/Anorm are
+    /// degenerate normalizations) — `build_fit_config` wires that.
+    pub baseline_enabled: bool,
 
     // -- Pixel / ROI selection --
     pub selected_pixel: Option<(usize, usize)>,
@@ -1501,6 +1515,7 @@ impl Default for AppState {
             uncertainty_is_estimated: false,
             lm_background_enabled: false,
             kl_background_enabled: false,
+            baseline_enabled: false,
             kl_c_ratio: 1.0,
             kl_enable_polish_override: None,
 
