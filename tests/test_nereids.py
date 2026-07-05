@@ -3818,6 +3818,67 @@ class TestMultiplicativeBaseline:
     data carries a distinctly different truth, so a no-op fit fails.
     """
 
+    def test_baseline_composes_with_energy_scale_and_temperature(self):
+        """Merge guard (#635 x #634): baseline + fit_energy_scale + fit_temperature
+        jointly — the one combination neither PR's suite covered alone. The
+        baseline B is a function of the NOMINAL (measured) grid while the
+        physics is evaluated on the corrected grid, matching the wrapper's
+        construction; truth is injected accordingly and all three parameter
+        groups must be recovered from deliberately-off seeds.
+
+        THREE well-separated resonances: a single line cannot pin
+        (t0, L_scale, T) simultaneously — the offset-seeded fit then walks
+        to a distant (t0, T) basin (observed: t0 = −4.2 µs, T = 1220 K,
+        baseline still recovered) — so identifiability, not plumbing,
+        requires the multi-line scene, as in the #634 joint-recovery tests."""
+        data = nereids.create_resonance_data(
+            92, 238, 236.006, 9.4285,
+            [(6.674, 0.5, 1.493e-3, 2.3e-2),
+             (14.0, 0.5, 3.0e-3, 2.3e-2),
+             (24.5, 0.5, 5.0e-3, 2.3e-2)],
+            target_spin=0.0,
+        )
+        energies = np.linspace(1.0, 30.0, 400)
+        true_density, true_temp = 8.0e-4, 350.0
+        t0_true, ls_true, flight_path = 0.4, 1.003, 25.0
+        k = nereids.energy_to_tof(1.0, 1.0)
+        tof = k * flight_path / np.sqrt(energies)
+        e_corr = (k * flight_path * ls_true / (tof - t0_true)) ** 2
+        t_phys = np.asarray(
+            nereids.forward_model(
+                e_corr, [(data, true_density)], temperature_k=true_temp
+            )
+        )
+        curve, e_ref = _baseline_curve(energies)
+        t = t_phys * curve
+        sigma = np.full_like(t, 0.005)
+
+        r = nereids.fit_spectrum_typed(
+            transmission=t,
+            uncertainty=sigma,
+            energies=energies,
+            isotopes=[(data, true_density)],
+            solver="lm",
+            temperature_k=300.0,           # 50 K off
+            fit_temperature=True,
+            fit_energy_scale=True,         # seeds t0=0, l_scale=1
+            energy_scale_flight_path_m=flight_path,
+            fix_densities=True,
+            baseline=True,                 # seeds identity (1, 0, 0)
+            max_iter=300,
+        )
+        assert bool(r.converged) is True
+        assert r.temperature_k is not None
+        assert abs(r.temperature_k - true_temp) < 5.0
+        assert abs(r.t0_us - t0_true) < 0.05
+        assert abs(r.l_scale - ls_true) < 5e-4
+        assert r.baseline is not None
+        for i, (fitted, truth) in enumerate(zip(r.baseline, _BL_TRUE)):
+            assert abs(fitted - truth) < 1.5e-2, (
+                f"baseline[{i}] = {fitted} vs truth {truth}"
+            )
+        assert r.baseline_e_ref_ev == pytest.approx(e_ref, rel=1e-12)
+
     def test_baseline_lm_recovers_coefficients_and_temperature(self, u238_data):
         energies = np.linspace(1.0, 30.0, 400)
         true_density = 8.0e-4
