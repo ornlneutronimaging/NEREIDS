@@ -19,5 +19,9 @@ nereids-physics = { workspace = true, features = ["test-support"] }
 # `ResonanceData` builders shared with sibling crates' tests.
 nereids-endf = { workspace = true, features = ["test-support"] }
 # Seeded synthetic noise for the IC closed-loop acceptance test (#642).
+# rand_chacha pins the stream algorithm (ChaCha12): StdRng's stream is
+# documented unstable across rand versions and would silently change the
+# pinned noise realization on an upgrade.
 rand = { workspace = true }
+rand_chacha = { workspace = true }
 rand_distr = { workspace = true }

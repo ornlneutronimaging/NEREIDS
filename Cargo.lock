@@ -2850,6 +2850,7 @@ dependencies = [
  "nereids-endf",
  "nereids-physics",
  "rand 0.9.4",
+ "rand_chacha",
  "rand_distr",
 ]
 

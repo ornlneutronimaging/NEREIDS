@@ -32,7 +32,7 @@ use nereids_physics::ikeda_carpenter::{
 use nereids_physics::resolution::ResolutionFunction;
 use nereids_physics::transmission::{InstrumentParams, SampleParams, forward_model};
 use rand::SeedableRng;
-use rand::rngs::StdRng;
+use rand_chacha::ChaCha12Rng;
 use rand_distr::{Distribution, Normal};
 
 /// IC truth: all coordinates interior to the calibration boxes (a0 ∈
@@ -122,8 +122,12 @@ fn closed_loop(t_true_k: f64) {
         "calibrant dip minimum T = {t_min} outside the non-black target band"
     );
 
-    // Seeded absolute Gaussian noise.
-    let mut rng = StdRng::seed_from_u64(642);
+    // Seeded absolute Gaussian noise. ChaCha12Rng by NAME (review #645 round
+    // 2, F5): StdRng's stream is documented unstable across rand versions —
+    // a rand upgrade would silently swap the noise realization under this
+    // test's fixed tolerances. (rand 0.9's StdRng is currently ChaCha12, so
+    // this pin preserves the exact realization the tolerances were set on.)
+    let mut rng = ChaCha12Rng::seed_from_u64(642);
     let normal = Normal::new(0.0, NOISE_SIGMA).unwrap();
     let data: Vec<f64> = clean.iter().map(|&t| t + normal.sample(&mut rng)).collect();
     let unc = vec![NOISE_SIGMA; data.len()];
