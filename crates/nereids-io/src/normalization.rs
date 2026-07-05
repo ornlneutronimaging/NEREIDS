@@ -296,6 +296,12 @@ pub fn average_roi(
 ///   is deliberate: corrupt input must be rejected upstream, never silently
 ///   masked (house anti-masking rule — cf. the validation rationale comment
 ///   in [`normalize`]).  [`detect_bad_pixels`] rejects such input up front.
+/// - An empty TOF axis (`shape[0] == 0`) makes the all-zero test vacuously
+///   true for *every* pixel — the whole detector would be reported dead.
+///   This non-validating function keeps that behaviour for backward
+///   compatibility; the validating entry points ([`detect_bad_pixels`],
+///   [`detect_dead_pixels_chunked`], [`detect_hot_pixels`]) reject empty
+///   stacks up front.
 ///
 /// # Arguments
 /// * `data` — 3D array with shape (n_tof, height, width).
@@ -317,15 +323,59 @@ pub fn detect_dead_pixels(data: &Array3<f64>) -> ndarray::Array2<bool> {
     mask
 }
 
-/// Default MAD multiplier for [`detect_hot_pixels`].
+/// Default MAD multiplier for the global (stage-1) cut of
+/// [`detect_hot_pixels`].
 ///
 /// The one-sided Gaussian tail at 6 robust σ is P(Z > 6) ≈ 9.9e-10, i.e.
 /// ~2.6e-4 expected false flags on a full 512×512 frame (262 144 pixels) —
-/// the screen essentially never rejects a statistically plausible pixel,
-/// while a railed pixel sits tens of robust σ above any plausible median.
-/// Real spatial structure (beam profile, sample absorption) only *inflates*
-/// the MAD, making the cut more conservative, never less.
+/// on a *unimodal* image the screen essentially never rejects a
+/// statistically plausible pixel, while a railed pixel sits tens of robust
+/// σ above any plausible median.
+///
+/// On a **bimodal** image the global cut alone is not trustworthy: when the
+/// darker population holds the median (a sample covering >50 % of the FOV,
+/// or an aperture-limited open beam), the MAD reflects only the dark
+/// population's internal spread, and *every* bright-region pixel lands
+/// above `med + k·MAD`.  [`detect_hot_pixels`] therefore never flags on the
+/// global cut alone — the local-neighborhood confirmation
+/// ([`HOT_LOCAL_FACTOR`]) must also pass.
 pub const HOT_PIXEL_K_MAD: f64 = 6.0;
+
+/// Local-neighborhood confirmation factor (stage 2) of
+/// [`detect_hot_pixels`].
+///
+/// A pixel that passes the global cut is flagged only if its total also
+/// exceeds `HOT_LOCAL_FACTOR ×` the median total of its available live
+/// 8-neighbors.  The factor separates detector *point defects* from scene
+/// structure:
+///
+/// - A railed/runaway pixel is spatially isolated and typically ≥100× its
+///   neighbors, so it clears 10× with a wide margin.
+/// - Adjacent-pixel scene gradients (beam profile, sample absorption) are
+///   ≤2–3×; even directly across a sharp sample edge only one ring of
+///   neighbors is mixed, and the neighbor *median* stays on the pixel's
+///   own side of the edge.
+/// - A fully-railed row/column segment still leaves each railed pixel with
+///   ≥5 normal neighbors of 8, so the neighbor median stays normal and the
+///   segment IS caught.
+pub const HOT_LOCAL_FACTOR: f64 = 10.0;
+
+/// Reject a stack with an empty TOF axis (`shape[0] == 0`).
+///
+/// Every-bin predicates are vacuously true over zero bins: an empty stack
+/// would mark the whole detector dead (and gives the hot screen an all-zero
+/// totals image) with no error.  Called up front by the validating detector
+/// entry points; [`detect_dead_pixels`] deliberately stays non-validating
+/// (see its rustdoc).
+fn validate_n_tof(data: &Array3<f64>, field: &str) -> Result<(), IoError> {
+    if data.shape()[0] == 0 {
+        return Err(IoError::InvalidParameter(format!(
+            "{field} has an empty TOF axis (shape[0] == 0) — dead/hot detection \
+             over zero bins is vacuous and would mask every pixel"
+        )));
+    }
+    Ok(())
+}
 
 /// Detect dead pixels across acquisition chunks (dead-in-any-chunk).
 ///
@@ -364,9 +414,11 @@ pub const HOT_PIXEL_K_MAD: f64 = 6.0;
 /// chunk.
 ///
 /// # Errors
-/// Returns `IoError::InvalidParameter` if `chunks` is empty or any chunk
-/// contains a non-finite or negative value, and `IoError::ShapeMismatch` if
-/// the chunks' spatial dimensions differ.
+/// Returns `IoError::InvalidParameter` if `chunks` is empty, any chunk has
+/// an empty TOF axis (`shape[0] == 0` — its all-zero test would vacuously
+/// mark every pixel dead), or any chunk contains a non-finite or negative
+/// value, and `IoError::ShapeMismatch` if the chunks' spatial dimensions
+/// differ.
 pub fn detect_dead_pixels_chunked(chunks: &[Array3<f64>]) -> Result<Array2<bool>, IoError> {
     if chunks.is_empty() {
         return Err(IoError::InvalidParameter(
@@ -386,6 +438,7 @@ pub fn detect_dead_pixels_chunked(chunks: &[Array3<f64>]) -> Result<Array2<bool>
             )));
         }
         validate_counts(chunk, &format!("chunks[{i}]"))?;
+        validate_n_tof(chunk, &format!("chunks[{i}]"))?;
     }
 
     let mut mask = Array2::from_elem((height, width), false);
@@ -398,8 +451,10 @@ pub fn detect_dead_pixels_chunked(chunks: &[Array3<f64>]) -> Result<Array2<bool>
     Ok(mask)
 }
 
-/// Detect hot (railed / runaway) pixels via a robust one-sided log-space
-/// median + k·MAD screen on per-pixel total counts.
+/// Detect hot (railed / runaway) pixels via a two-stage criterion: a
+/// robust one-sided log-space median + k·MAD screen on per-pixel total
+/// counts (stage 1, global), confirmed by a local-neighborhood isolation
+/// test (stage 2).
 ///
 /// Pipeline-integrity screen only — see the module-level "Pixel masks —
 /// pipeline integrity only" section.  The algorithm:
@@ -420,16 +475,48 @@ pub fn detect_dead_pixels_chunked(chunks: &[Array3<f64>]) -> Result<Array2<bool>
 ///    an image where most totals are 1.0 and some are 2.0 has `mad = 0` and
 ///    floor `= 1`, so the threshold is `e^6 ≈ 403×` the median — the 2-count
 ///    pixels are NOT flagged, while a railed pixel still is.
-/// 5. Flag iff `totals > 0 && ln(total) > med + k_mad·sigma` — **upper tail
-///    only**.  A stuck-low pixel is indistinguishable from a low-count-alive
-///    pixel and is deliberately kept (masking it would be the banned
-///    low-count screen).  Railed/always-max pixels are subsumed by the upper
-///    tail: no fixed saturation value exists after efficiency correction, so
-///    a saturation-constant test would be wrong anyway.
+/// 5. Stage 1 (global): a pixel is a *candidate* iff `totals > 0 &&
+///    ln(total) > med + k_mad·sigma` — **upper tail only**.  A stuck-low
+///    pixel is indistinguishable from a low-count-alive pixel and is
+///    deliberately kept (masking it would be the banned low-count screen).
+///    Railed/always-max pixels are subsumed by the upper tail: no fixed
+///    saturation value exists after efficiency correction, so a
+///    saturation-constant test would be wrong anyway.
+/// 6. Stage 2 (local confirmation): a candidate is flagged iff its total
+///    also exceeds [`HOT_LOCAL_FACTOR`] × the median total of its available
+///    live (`total > 0`) 8-neighbors.  Edge pixels use whatever neighbors
+///    exist.  If a candidate has *no* live neighbor at all (isolated live
+///    pixel in a dead field), the global verdict stands — there is nothing
+///    local to refute it.
+///
+/// The two stages encode complementary definitions of "hot": stage 1 says
+/// *statistically implausible for this image*, stage 2 says *spatially
+/// isolated*, and a railed/hot pixel is a detector **point defect** — it
+/// must be both.  Stage 2 exists because the global cut alone fails
+/// catastrophically on **bimodal** images: with a dark majority holding the
+/// median (a sample covering >50 % of the FOV, or an aperture-limited open
+/// beam), the MAD reflects only the dark population's internal spread and
+/// the ENTIRE bright minority exceeds `med + k·MAD`.  A contiguous bright
+/// REGION is scene, not a defect — masking it would reject statistically
+/// plausible pixels, the exact failure the module rules ban.  A true point
+/// defect beats its neighbor median by ≥100× and is caught by both stages
+/// even *inside* a bright region and even as part of a short railed
+/// row/column segment (see [`HOT_LOCAL_FACTOR`]).
+///
+/// # Raw counts required
+///
+/// `data` must be **raw detected counts** (unscaled).  The Poisson floor in
+/// step 4 assumes `Var[N] = N`; any prior scaling silently breaks that
+/// identity — down-scaling (proton-charge-normalized rates ≪ 1, per-pixel
+/// gain division) inflates the floor and can suppress real flags, while
+/// up-scaling (event weights > 1) deflates it below true counting noise.
+/// Run the detectors on unscaled counts and normalize afterwards; the GUI
+/// does exactly this (both of its normalization paths pass the raw
+/// sample/open-beam stacks, before any normalization).
 ///
 /// # Arguments
-/// * `data` — 3D counts array with shape (n_tof, height, width).
-/// * `k_mad` — Robust-σ multiplier for the upper-tail cut; use
+/// * `data` — 3D raw-counts array with shape (n_tof, height, width).
+/// * `k_mad` — Robust-σ multiplier for the stage-1 upper-tail cut; use
 ///   [`HOT_PIXEL_K_MAD`] unless you have a reason not to.
 ///
 /// # Returns
@@ -437,9 +524,14 @@ pub fn detect_dead_pixels_chunked(chunks: &[Array3<f64>]) -> Result<Array2<bool>
 ///
 /// # Errors
 /// Returns `IoError::InvalidParameter` if `data` contains a non-finite or
-/// negative value, or if `k_mad` is not finite and positive.
+/// negative value or has an empty TOF axis (`shape[0] == 0`), or if `k_mad`
+/// is not finite and positive.
 pub fn detect_hot_pixels(data: &Array3<f64>, k_mad: f64) -> Result<Array2<bool>, IoError> {
     validate_counts(data, "data")?;
+    // An empty TOF axis would yield an all-zero totals image (empty live
+    // set → all-false mask) rather than corrupt output, but the validating
+    // entry points reject it uniformly (see validate_n_tof).
+    validate_n_tof(data, "data")?;
     // NaN bypasses `>`, so pair the order comparison with is_finite().
     if !(k_mad.is_finite() && k_mad > 0.0) {
         return Err(IoError::InvalidParameter(format!(
@@ -469,9 +561,36 @@ pub fn detect_hot_pixels(data: &Array3<f64>, k_mad: f64) -> Result<Array2<bool>,
     let sigma = f64::max(nereids_core::stats::MAD_TO_SIGMA * mad, (-med / 2.0).exp());
     let threshold = med + k_mad * sigma;
 
-    Zip::from(&mut mask)
-        .and(&totals)
-        .for_each(|m, &t| *m = t > 0.0 && t.ln() > threshold);
+    // Stage 2 (local confirmation): only a spatially ISOLATED excess is a
+    // detector point defect — a contiguous bright region is scene.  This is
+    // what keeps the global cut honest on bimodal images (see rustdoc).
+    let (height, width) = totals.dim();
+    let mut neighbor_totals: Vec<f64> = Vec::with_capacity(8);
+    for y in 0..height {
+        for x in 0..width {
+            let total = totals[[y, x]];
+            // Stage 1 (global robust cut), upper tail only.
+            if !(total > 0.0 && total.ln() > threshold) {
+                continue;
+            }
+            // Live (total > 0) 8-neighbors; edge pixels use what exists.
+            neighbor_totals.clear();
+            for ny in y.saturating_sub(1)..=(y + 1).min(height - 1) {
+                for nx in x.saturating_sub(1)..=(x + 1).min(width - 1) {
+                    let t = totals[[ny, nx]];
+                    if (ny, nx) != (y, x) && t > 0.0 {
+                        neighbor_totals.push(t);
+                    }
+                }
+            }
+            mask[[y, x]] = match nereids_core::stats::median(&neighbor_totals) {
+                Some(local_med) => total > HOT_LOCAL_FACTOR * local_med,
+                // No live neighbor at all (isolated live pixel in a dead
+                // field): nothing local can refute the global verdict.
+                None => true,
+            };
+        }
+    }
     Ok(mask)
 }
 
@@ -488,9 +607,16 @@ pub fn detect_hot_pixels(data: &Array3<f64>, k_mad: f64) -> Result<Array2<bool>,
 /// The stacks' TOF axis lengths may differ (deadness is spatial); only the
 /// spatial dimensions must agree.
 ///
+/// Both stacks must be **raw detected counts** (unscaled) — see the "Raw
+/// counts required" section of [`detect_hot_pixels`]: scaling distorts the
+/// Poisson floor of the hot screen.  The GUI satisfies this: both of its
+/// normalization paths call this function on the raw sample/open-beam
+/// stacks, before any normalization.
+///
 /// # Arguments
-/// * `sample` — Sample counts, shape (n_tof, height, width).
-/// * `open_beam` — Optional open-beam counts, shape (n_tof', height, width).
+/// * `sample` — Raw sample counts, shape (n_tof, height, width).
+/// * `open_beam` — Optional raw open-beam counts, shape
+///   (n_tof', height, width).
 /// * `hot_k_mad` — `Some(k)` to include the [`detect_hot_pixels`] screen
 ///   with multiplier `k` (use [`HOT_PIXEL_K_MAD`]); `None` for dead-only
 ///   detection.
@@ -499,9 +625,11 @@ pub fn detect_hot_pixels(data: &Array3<f64>, k_mad: f64) -> Result<Array2<bool>,
 /// 2D boolean mask, shape (height, width). `true` = exclude pixel.
 ///
 /// # Errors
-/// Returns `IoError::InvalidParameter` if either stack contains a non-finite
-/// or negative value or `hot_k_mad` is `Some` of a non-finite/non-positive
-/// value, and `IoError::ShapeMismatch` if the spatial dimensions differ.
+/// Returns `IoError::InvalidParameter` if either stack contains a
+/// non-finite or negative value or has an empty TOF axis (`shape[0] == 0`
+/// — the dead test over zero bins would vacuously mask every pixel) or
+/// `hot_k_mad` is `Some` of a non-finite/non-positive value, and
+/// `IoError::ShapeMismatch` if the spatial dimensions differ.
 pub fn detect_bad_pixels(
     sample: &Array3<f64>,
     open_beam: Option<&Array3<f64>>,
@@ -511,8 +639,10 @@ pub fn detect_bad_pixels(
     // The public detectors called below re-validate; that duplication is one
     // O(n) sweep and keeps each entry point independently safe.
     validate_counts(sample, "sample")?;
+    validate_n_tof(sample, "sample")?;
     if let Some(ob) = open_beam {
         validate_counts(ob, "open_beam")?;
+        validate_n_tof(ob, "open_beam")?;
         let (ss, os) = (sample.shape(), ob.shape());
         // n_tof may differ (deadness is spatial); spatial dims must agree.
         if ss[1] != os[1] || ss[2] != os[2] {
@@ -918,6 +1048,17 @@ mod tests {
     }
 
     #[test]
+    fn test_detect_dead_pixels_chunked_empty_tof_chunk_err() {
+        // A zero-frame chunk would vacuously mark the whole detector dead.
+        let chunk0 = Array3::from_elem((3, 2, 2), 1.0);
+        let chunk1 = Array3::<f64>::zeros((0, 2, 2));
+        let err = detect_dead_pixels_chunked(&[chunk0, chunk1]).unwrap_err();
+        assert!(matches!(err, IoError::InvalidParameter(_)));
+        assert!(err.to_string().contains("chunks[1]"));
+        assert!(err.to_string().contains("empty TOF axis"));
+    }
+
+    #[test]
     fn test_detect_dead_pixels_chunked_spatial_mismatch_err() {
         let chunk0 = Array3::from_elem((3, 2, 2), 1.0);
         let chunk1 = Array3::from_elem((3, 2, 3), 1.0);
@@ -1044,6 +1185,112 @@ mod tests {
     }
 
     #[test]
+    fn test_detect_hot_pixels_bimodal_bright_region_not_flagged() {
+        // THE PR-#646 P0 regression guard.  Dark-majority bimodal scene:
+        // 60 % of the FOV at 50 counts (sample), a contiguous 40 % bright
+        // region at 5000 counts (open beam past the sample edge).  The dark
+        // population holds the median (med = ln 50) and the MAD is 0 (both
+        // populations are internally uniform), so sigma falls to the Poisson
+        // floor 1/√50 ≈ 0.141 and the stage-1 threshold is
+        // ln 50 + 6·0.141 ≈ 4.76 — EVERY bright pixel (ln 5000 ≈ 8.52)
+        // passes the global cut.  The local confirmation must veto them
+        // all: each bright pixel's neighbor median is 5000, and
+        // 5000 > 10 × 5000 is false.  Bright scene is not a defect.
+        let mut data = Array3::from_elem((1, 10, 10), 50.0);
+        for y in 0..10 {
+            for x in 6..10 {
+                data[[0, y, x]] = 5000.0;
+            }
+        }
+
+        let mask = detect_hot_pixels(&data, HOT_PIXEL_K_MAD).unwrap();
+        assert!(
+            mask.iter().all(|&m| !m),
+            "no pixel of a bimodal scene may be flagged — the bright \
+             minority region is scene, not a defect"
+        );
+    }
+
+    #[test]
+    fn test_detect_hot_pixels_railed_inside_bright_region_caught() {
+        // Same bimodal scene, but with a genuinely railed pixel INSIDE the
+        // bright region: 1e6 ≈ 200× its bright neighbors.  It must still be
+        // caught (stage 2 compares against the LOCAL median of 5000, not
+        // the global dark median).
+        let mut data = Array3::from_elem((1, 10, 10), 50.0);
+        for y in 0..10 {
+            for x in 6..10 {
+                data[[0, y, x]] = 5000.0;
+            }
+        }
+        data[[0, 5, 8]] = 1.0e6;
+
+        let mask = detect_hot_pixels(&data, HOT_PIXEL_K_MAD).unwrap();
+        assert!(
+            mask[[5, 8]],
+            "railed pixel inside bright region must be flagged"
+        );
+        assert_eq!(
+            mask.iter().filter(|&&m| m).count(),
+            1,
+            "only the railed pixel may be flagged"
+        );
+    }
+
+    #[test]
+    fn test_detect_hot_pixels_railed_column_segment_caught() {
+        // Three adjacent railed pixels in a column: each has ≥5 normal
+        // neighbors of 8 (the middle one has 6), so the neighbor MEDIAN
+        // stays at the background level and the whole segment is caught.
+        let mut data = Array3::from_elem((4, 7, 7), 100.0);
+        for t in 0..4 {
+            for y in 2..5 {
+                data[[t, y, 3]] = 65535.0;
+            }
+        }
+
+        let mask = detect_hot_pixels(&data, HOT_PIXEL_K_MAD).unwrap();
+        for y in 2..5 {
+            assert!(mask[[y, 3]], "railed column pixel ({y}, 3) must be flagged");
+        }
+        assert_eq!(
+            mask.iter().filter(|&&m| m).count(),
+            3,
+            "only the railed segment may be flagged"
+        );
+    }
+
+    #[test]
+    fn test_detect_hot_pixels_isolated_live_pixel_keeps_global_verdict() {
+        // A stage-1 candidate whose 8-neighbors are ALL dead has no live
+        // neighbor median to refute the global verdict — it stays flagged.
+        // Scattered far pixels at 50 counts define the global statistics
+        // (med = ln 50, threshold ≈ 4.76); the isolated 1e6 pixel passes.
+        let mut data = Array3::<f64>::zeros((1, 5, 5));
+        for &(y, x) in &[(0, 0), (0, 2), (0, 4), (4, 0), (4, 2), (4, 4)] {
+            data[[0, y, x]] = 50.0;
+        }
+        data[[0, 2, 2]] = 1.0e6;
+
+        let mask = detect_hot_pixels(&data, HOT_PIXEL_K_MAD).unwrap();
+        assert!(
+            mask[[2, 2]],
+            "isolated live candidate in a dead field keeps the global verdict"
+        );
+        assert_eq!(mask.iter().filter(|&&m| m).count(), 1);
+    }
+
+    #[test]
+    fn test_detect_hot_pixels_empty_tof_err() {
+        // n_tof == 0: the totals image would be all-zero (vacuous sums) —
+        // validating entry points must reject rather than return all-false.
+        let data = Array3::<f64>::zeros((0, 2, 2));
+        let err = detect_hot_pixels(&data, HOT_PIXEL_K_MAD).unwrap_err();
+        assert!(matches!(err, IoError::InvalidParameter(_)));
+        assert!(err.to_string().contains("empty TOF axis"));
+    }
+
+    #[test]
     fn test_detect_hot_pixels_nan_err() {
         let mut data = Array3::from_elem((2, 2, 2), 1.0);
         data[[1, 1, 0]] = f64::NAN;
@@ -1135,6 +1382,21 @@ mod tests {
                 "hot_k_mad = {bad_k} must be rejected"
             );
         }
+    }
+
+    #[test]
+    fn test_detect_bad_pixels_empty_tof_err() {
+        // An empty stack's all-zero test passes vacuously — without this
+        // guard the whole detector would be masked dead with no error.
+        let empty = Array3::<f64>::zeros((0, 2, 2));
+        let err = detect_bad_pixels(&empty, None, None).unwrap_err();
+        assert!(matches!(err, IoError::InvalidParameter(_)));
+        assert!(err.to_string().contains("sample"));
+
+        let sample = Array3::from_elem((3, 2, 2), 1.0);
+        let err = detect_bad_pixels(&sample, Some(&empty), None).unwrap_err();
+        assert!(matches!(err, IoError::InvalidParameter(_)));
+        assert!(err.to_string().contains("open_beam"));
     }
 
     #[test]
