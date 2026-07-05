@@ -1440,6 +1440,40 @@ class TestPixelMasks:
         with pytest.raises(ValueError):
             nereids.detect_dead_pixels_chunked([])
 
+    def test_bimodal_bright_region_not_flagged(self):
+        """PR #646 P0 regression guard: dark-majority bimodal scene (60%
+        of the FOV at ~50 counts, contiguous 40% bright region at ~5000).
+        Every bright pixel passes the global median+MAD cut (the dark
+        population holds the median), but the local-neighborhood
+        confirmation must veto them all — bright scene is not a defect."""
+        data = np.full((1, 10, 10), 50.0)
+        data[:, :, 6:] = 5000.0
+        assert not np.asarray(nereids.detect_hot_pixels(data)).any()
+        assert not np.asarray(nereids.detect_bad_pixels(data)).any()
+
+    def test_bimodal_railed_inside_bright_region_caught(self):
+        """A genuinely railed pixel INSIDE the bright region of a bimodal
+        scene (~200x its bright neighbors) is still caught."""
+        data = np.full((1, 10, 10), 50.0)
+        data[:, :, 6:] = 5000.0
+        data[0, 5, 8] = 1.0e6
+        mask = np.asarray(nereids.detect_hot_pixels(data))
+        assert mask[5, 8]
+        assert mask.sum() == 1
+
+    def test_empty_tof_axis_raises(self):
+        """shape[0] == 0: the all-zero dead test would pass vacuously and
+        mask the whole detector — the validating entry points reject it."""
+        empty = np.empty((0, 2, 2))
+        with pytest.raises(ValueError):
+            nereids.detect_bad_pixels(empty)
+        with pytest.raises(ValueError):
+            nereids.detect_bad_pixels(np.ones((3, 2, 2)), empty)
+        with pytest.raises(ValueError):
+            nereids.detect_hot_pixels(empty)
+        with pytest.raises(ValueError):
+            nereids.detect_dead_pixels_chunked([empty])
+
     def test_mask_round_trips_into_spatial_map(self, u238_data):
         """A detect_bad_pixels mask feeds spatial_map_typed(dead_pixels=...):
         the masked pixel is hard-excluded (NaN in the density map)."""

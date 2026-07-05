@@ -2628,29 +2628,44 @@ fn detect_dead_pixels<'py>(
     Ok(PyArray2::from_owned_array(py, mask))
 }
 
-/// Detect hot (railed / runaway) pixels.
+/// Detect hot (railed / runaway) pixels — two-stage screen.
 ///
-/// Robust one-sided screen on per-pixel total counts: a pixel is flagged
-/// when ``ln(total) > median + k_mad * sigma``, where median and MAD are
-/// computed over the live (``total > 0``) pixels only and ``sigma`` is the
-/// MAD-based robust scale floored by the Poisson counting noise of the
-/// median total.  Upper tail only — stuck-low pixels are indistinguishable
-/// from low-count-alive pixels and are kept (masks are pipeline-integrity
-/// only, never a low-count screen).
+/// Stage 1 (global): robust one-sided cut on per-pixel total counts — a
+/// pixel is a candidate when ``ln(total) > median + k_mad * sigma``, where
+/// median and MAD are computed over the live (``total > 0``) pixels only
+/// and ``sigma`` is the MAD-based robust scale floored by the Poisson
+/// counting noise of the median total.  Stage 2 (local): a candidate is
+/// flagged only if its total also exceeds 10x the median total of its live
+/// 8-neighbors (edge pixels use whatever neighbors exist; a candidate with
+/// no live neighbor keeps the global verdict).  The local confirmation
+/// keeps bimodal scenes honest: with a dark majority holding the median,
+/// the global statistics describe only the dark population and the entire
+/// bright region would otherwise be masked — a contiguous bright region is
+/// scene, not a defect.  Upper tail only — stuck-low pixels are
+/// indistinguishable from low-count-alive pixels and are kept (masks are
+/// pipeline-integrity only, never a low-count screen).
+///
+/// ``data`` must be RAW detected counts (unscaled): the Poisson floor
+/// assumes ``Var[N] = N``, so scaled inputs silently distort it —
+/// down-scaling (proton-charge-normalized rates << 1, gain division)
+/// inflates the floor and can suppress real flags; up-scaling (event
+/// weights > 1) deflates it.  Detect on raw counts, normalize afterwards.
 ///
 /// Args:
-///     data: 3D numpy array with shape ``(n_frames, height, width)``.
-///     k_mad: Robust-sigma multiplier for the upper-tail cut (default 6.0:
-///         one-sided Gaussian tail ~1e-9, essentially never flags a
-///         statistically plausible pixel).
+///     data: 3D numpy array of raw counts with shape
+///         ``(n_frames, height, width)``.
+///     k_mad: Robust-sigma multiplier for the stage-1 upper-tail cut
+///         (default 6.0: one-sided Gaussian tail ~1e-9, on a unimodal
+///         image essentially never flags a statistically plausible pixel).
 ///
 /// Returns:
 ///     2D boolean numpy array with shape ``(height, width)``.
 ///     ``True`` marks a hot pixel.
 ///
 /// Raises:
-///     ValueError: If ``data`` contains non-finite or negative values, or
-///         ``k_mad`` is not finite and positive.
+///     ValueError: If ``data`` contains non-finite or negative values or
+///         has zero frames (``shape[0] == 0``), or ``k_mad`` is not finite
+///         and positive.
 #[pyfunction]
 #[pyo3(signature = (data, k_mad = norm::HOT_PIXEL_K_MAD))]
 fn detect_hot_pixels<'py>(
@@ -2685,8 +2700,10 @@ fn detect_hot_pixels<'py>(
 ///     ``True`` marks a pixel that is all-zero in at least one chunk.
 ///
 /// Raises:
-///     ValueError: If ``chunks`` is empty, any chunk contains non-finite
-///         or negative values, or the spatial dimensions differ.
+///     ValueError: If ``chunks`` is empty, any chunk has zero frames
+///         (``shape[0] == 0`` — its all-zero test would vacuously mark
+///         every pixel dead), any chunk contains non-finite or negative
+///         values, or the spatial dimensions differ.
 #[pyfunction]
 fn detect_dead_pixels_chunked<'py>(
     py: Python<'py>,
@@ -2708,9 +2725,14 @@ fn detect_dead_pixels_chunked<'py>(
 /// are unioned: ``dead(sample) | hot(sample) [| dead(ob) | hot(ob)]``.
 /// The stacks' frame counts may differ; spatial dimensions must agree.
 ///
+/// Both stacks must be RAW detected counts (unscaled) — see
+/// ``detect_hot_pixels()``: scaling distorts the Poisson floor of the hot
+/// screen.  Detect on raw counts, before any normalization.
+///
 /// Args:
-///     sample: 3D numpy array with shape ``(n_frames, height, width)``.
-///     open_beam: Optional 3D numpy array with shape
+///     sample: 3D numpy array of raw counts with shape
+///         ``(n_frames, height, width)``.
+///     open_beam: Optional 3D numpy array of raw counts with shape
 ///         ``(n_frames2, height, width)``.
 ///     hot_k_mad: Robust-sigma multiplier for the hot-pixel screen
 ///         (default 6.0), or ``None`` to disable it (dead-only detection).
@@ -2720,9 +2742,9 @@ fn detect_dead_pixels_chunked<'py>(
 ///     ``True`` marks a pixel to exclude.
 ///
 /// Raises:
-///     ValueError: If either stack contains non-finite or negative values,
-///         the spatial dimensions differ, or ``hot_k_mad`` is not finite
-///         and positive.
+///     ValueError: If either stack contains non-finite or negative values
+///         or has zero frames (``shape[0] == 0``), the spatial dimensions
+///         differ, or ``hot_k_mad`` is not finite and positive.
 #[pyfunction]
 #[pyo3(signature = (sample, open_beam = None, hot_k_mad = Some(norm::HOT_PIXEL_K_MAD)))]
 fn detect_bad_pixels<'py>(

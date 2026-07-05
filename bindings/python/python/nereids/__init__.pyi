@@ -914,23 +914,39 @@ def detect_hot_pixels(
     data: NDArray[np.float64],
     k_mad: float = 6.0,
 ) -> NDArray[np.bool_]:
-    """Detect hot (railed / runaway) pixels.
+    """Detect hot (railed / runaway) pixels — two-stage screen.
 
-    Robust one-sided screen on per-pixel total counts: a pixel is flagged
-    when ``ln(total) > median + k_mad * sigma``, with median and MAD taken
-    over the live (``total > 0``) pixels only and ``sigma`` floored by the
-    Poisson counting noise of the median total.  Upper tail only —
+    Stage 1 (global): robust one-sided cut on per-pixel total counts — a
+    pixel is a candidate when ``ln(total) > median + k_mad * sigma``, with
+    median and MAD taken over the live (``total > 0``) pixels only and
+    ``sigma`` floored by the Poisson counting noise of the median total.
+    Stage 2 (local): a candidate is flagged only if its total also exceeds
+    10x the median total of its live 8-neighbors (edge pixels use whatever
+    neighbors exist; a candidate with no live neighbor keeps the global
+    verdict).  The local confirmation keeps bimodal scenes honest: with a
+    dark majority (a sample covering >50% of the field of view, or an
+    aperture-limited open beam), the global statistics describe only the
+    dark population and the entire bright region would otherwise be masked
+    — a contiguous bright region is scene, not a defect.  Upper tail only —
     stuck-low pixels are indistinguishable from low-count-alive pixels and
     are kept (masks are pipeline-integrity only, never a low-count screen).
+
+    ``data`` must be RAW detected counts (unscaled): the Poisson floor
+    assumes ``Var[N] = N``.  Scaled inputs silently distort the floor —
+    down-scaling (proton-charge-normalized rates << 1, gain division)
+    inflates it and can suppress real flags; up-scaling (event weights > 1)
+    deflates it below true counting noise.  Detect on raw counts and
+    normalize afterwards.
 
     Parameters
     ----------
     data :
-        3D NumPy array with shape ``(n_frames, height, width)``.
+        3D NumPy array of raw counts with shape ``(n_frames, height, width)``.
     k_mad :
-        Robust-sigma multiplier for the upper-tail cut. The default 6.0
-        corresponds to a one-sided Gaussian tail of ~1e-9 — it essentially
-        never flags a statistically plausible pixel.
+        Robust-sigma multiplier for the stage-1 upper-tail cut. The default
+        6.0 corresponds to a one-sided Gaussian tail of ~1e-9 — on a
+        unimodal image it essentially never flags a statistically plausible
+        pixel.
 
     Returns
     -------
@@ -941,8 +957,8 @@ def detect_hot_pixels(
     Raises
     ------
     ValueError
-        If ``data`` contains non-finite or negative values, or ``k_mad`` is
-        not finite and positive.
+        If ``data`` contains non-finite or negative values or has zero
+        frames (``shape[0] == 0``), or ``k_mad`` is not finite and positive.
     """
     ...
 
@@ -975,8 +991,10 @@ def detect_dead_pixels_chunked(
     Raises
     ------
     ValueError
-        If ``chunks`` is empty, any chunk contains non-finite or negative
-        values, or the spatial dimensions differ between chunks.
+        If ``chunks`` is empty, any chunk has zero frames
+        (``shape[0] == 0`` — its all-zero test would vacuously mark every
+        pixel dead), any chunk contains non-finite or negative values, or
+        the spatial dimensions differ between chunks.
     """
     ...
 
@@ -994,12 +1012,17 @@ def detect_bad_pixels(
     Frame counts may differ between the stacks; spatial dimensions must
     agree.  The result can be passed to ``spatial_map_typed(dead_pixels=...)``.
 
+    Both stacks must be RAW detected counts (unscaled) — see
+    ``detect_hot_pixels()``: scaling distorts the Poisson floor of the hot
+    screen.  Detect on raw counts, before any normalization.
+
     Parameters
     ----------
     sample :
-        3D NumPy array with shape ``(n_frames, height, width)``.
+        3D NumPy array of raw counts with shape ``(n_frames, height, width)``.
     open_beam :
-        Optional 3D NumPy array with shape ``(n_frames2, height, width)``.
+        Optional 3D NumPy array of raw counts with shape
+        ``(n_frames2, height, width)``.
     hot_k_mad :
         Robust-sigma multiplier for the hot-pixel screen (default 6.0), or
         ``None`` to disable it (dead-only detection).
@@ -1013,8 +1036,9 @@ def detect_bad_pixels(
     Raises
     ------
     ValueError
-        If either stack contains non-finite or negative values, the spatial
-        dimensions differ, or ``hot_k_mad`` is not finite and positive.
+        If either stack contains non-finite or negative values or has zero
+        frames (``shape[0] == 0``), the spatial dimensions differ, or
+        ``hot_k_mad`` is not finite and positive.
     """
     ...
 
