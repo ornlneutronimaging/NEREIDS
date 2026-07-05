@@ -59,17 +59,32 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
   separately, and every normalization recomputes the effective mask
   from scratch as declared ∪ freshly-detected — detections never
   accumulate across open-beam swaps or re-normalizations.
-- **Project files persist the declared mask component only** (#646):
-  `/intermediate/dead_pixels` (path, dtype, and shape unchanged) now
-  stores the declared mask rather than the effective
+- **Project files persist the pixel mask as two separate components**
+  (#646): `/intermediate/dead_pixels` (path, dtype, and shape
+  unchanged) now stores the declared mask rather than the effective
   (declared ∪ detected) mask, so save→load→save cycles no longer bake
-  each session's detections into the next session's declared component
-  — detections are session-scoped and recomputed on normalization.
-  Project files written by earlier versions stored the effective mask;
-  loading one promotes it to declared once (the only lossless reading
-  of a file that never recorded the split) — masks saved by old
-  versions keep any detections they had already absorbed, but stop
-  growing from now on.
+  each session's detections into the next session's declared component;
+  the detected component is persisted alongside it as a new
+  session-scoped, versioned dataset
+  (`/intermediate/detected_dead_pixels`, u8, `format_version` = 1).
+  On restore the effective mask is rebuilt as declared ∪
+  persisted-detected — a restored project carrying embedded normalized
+  data without the raw stacks (where detection cannot re-run) refits
+  with exactly the dead/hot exclusions active at save time instead of
+  silently losing them.  When the raw stacks ARE present on restore,
+  detection is recomputed purely as a drift check: a mismatch with the
+  persisted detected mask is surfaced in the status bar and the
+  provenance log (the saved mask stays active; re-running normalization
+  adopts the fresh detection explicitly).  Neither component can grow
+  across save/load cycles.
+  Backward/forward compatibility: files written by earlier versions
+  stored the effective mask at the declared path and lack the detected
+  dataset — loading one promotes the stored mask to declared once (the
+  only lossless reading of a file that never recorded the split; such
+  masks keep any detections they had already absorbed, but stop growing
+  from now on) and restores with no detected component (declared-only),
+  as does any file whose detected dataset carries an unrecognized
+  `format_version`.
 - Dead/hot detectors' validating entry points (`detect_bad_pixels`,
   `detect_hot_pixels`, `detect_dead_pixels_chunked`) now reject stacks
   and chunks with an empty TOF axis (`shape[0] == 0`), whose vacuous

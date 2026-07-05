@@ -543,6 +543,9 @@ pub(crate) fn prepare_transmission(state: &mut AppState) {
     if state.input_mode == InputMode::TransmissionTiff {
         state.dead_pixels = None;
         state.file_dead_pixels = None;
+        // No detection ever runs for TransmissionTiff (see below), so the
+        // component would otherwise stay stale from a previous mode.
+        state.detected_dead_pixels = None;
     }
 
     // Pipeline-integrity mask (#643, #646 review R3 F2): the HDF5 modes

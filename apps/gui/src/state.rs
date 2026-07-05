@@ -720,6 +720,19 @@ pub struct AppState {
     /// ([`AppState::set_detected_dead_pixels`] is the single site that
     /// combines the two).
     pub file_dead_pixels: Option<Array2<bool>>,
+    /// Detected-mask component (#646 R4, P1-1): the dead ∪ hot mask from
+    /// the most recent detection run, exactly as
+    /// [`AppState::set_detected_dead_pixels`] received it.  Kept separate
+    /// from the effective mask so project SAVE can persist it as its own
+    /// session-scoped, versioned dataset
+    /// (`/intermediate/detected_dead_pixels`): a restored project may
+    /// carry embedded normalized data WITHOUT raw stacks — detection
+    /// never re-runs there, and without this component a refit would
+    /// silently lose the dead/hot exclusions active at save time.
+    /// Restore rebuilds the effective mask as declared ∪ this component.
+    /// Cleared wherever the mask pair is cleared/replaced (load sites,
+    /// [`AppState::invalidate_results`]).
+    pub detected_dead_pixels: Option<Array2<bool>>,
 
     // -- Spectrum file --
     pub spectrum_path: Option<PathBuf>,
@@ -1351,6 +1364,10 @@ impl AppState {
     /// project's saved mask from a different detector or ROI-cropped
     /// geometry than the data now loaded) and is ignored.
     pub fn set_detected_dead_pixels(&mut self, detected: Option<Array2<bool>>) {
+        // Keep the raw detected component (#646 R4, P1-1): project SAVE
+        // persists it as /intermediate/detected_dead_pixels so a restore
+        // without raw stacks can still rebuild the effective mask.
+        self.detected_dead_pixels = detected.clone();
         self.dead_pixels = match (self.file_dead_pixels.clone(), detected) {
             (Some(mut declared), Some(det)) if declared.dim() == det.dim() => {
                 ndarray::Zip::from(&mut declared)
@@ -1385,6 +1402,8 @@ impl AppState {
         // of invalidate_results either replaces the sample or triggers a
         // reload, and the load sites reinstall the file-declared mask.
         self.file_dead_pixels = None;
+        // The detected component belongs to the invalidated data too.
+        self.detected_dead_pixels = None;
         self.spectrum_values = None;
         self.tile_display.clear();
         self.studio_selected_tile = 0;
@@ -1522,6 +1541,7 @@ impl Default for AppState {
             normalized: None,
             dead_pixels: None,
             file_dead_pixels: None,
+            detected_dead_pixels: None,
             load_error: false,
             rebin_factor: 1,
             rebin_applied: false,

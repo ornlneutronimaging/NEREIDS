@@ -158,6 +158,7 @@ fn histogram_events(state: &mut AppState) {
             // AppState::set_detected_dead_pixels.
             state.file_dead_pixels = data.dead_pixels.clone();
             state.dead_pixels = data.dead_pixels;
+            state.detected_dead_pixels = None;
 
             state.log_provenance(
                 ProvenanceEventKind::DataLoaded,
