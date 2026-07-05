@@ -2374,7 +2374,10 @@ class TestFixDensities:
         energies = np.linspace(1.0, 30.0, 200)
         t = np.asarray(nereids.forward_model(energies, [(u238_data, 8.0e-4)]))
         sigma = np.full_like(t, 0.005)
-        with pytest.raises(RuntimeError, match="no free parameters"):
+        # ValueError (not RuntimeError) since review R2: config-class
+        # errors (PipelineError::InvalidParameter) map to ValueError on
+        # every fitter, matching the spatial API convention.
+        with pytest.raises(ValueError, match="no free parameters"):
             nereids.fit_spectrum_typed(
                 transmission=t,
                 uncertainty=sigma,
@@ -3620,7 +3623,11 @@ class TestMultiplicativeBaseline:
             b0_init=1.3,  # outside the default (0.9, 1.1) box
             max_iter=300,
         )
-        with pytest.raises(RuntimeError, match="outside"):
+        # ValueError since review R2: the out-of-bounds init is rejected by
+        # the core config validation (PipelineError::InvalidParameter),
+        # which now maps to ValueError on every fitter — the same exception
+        # type the spatial API raises for the identical bad input.
+        with pytest.raises(ValueError, match="outside"):
             nereids.fit_spectrum_typed(**common)
         r = nereids.fit_spectrum_typed(**common, b0_bounds=(0.5, 1.5))
         assert bool(r.converged) is True

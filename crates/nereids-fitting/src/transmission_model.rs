@@ -2749,6 +2749,18 @@ pub struct MultiplicativeBaselineModel<M: FitModel> {
     b1_index: usize,
     /// Index of `b2` (curvature per ln-E² unit) in the parameter vector.
     b2_index: usize,
+    /// Optional per-bin active mask (SAMMY EMIN/EMAX-equivalent
+    /// `fit_energy_range`, #514).  When `Some`, the positivity guard in
+    /// [`FitModel::evaluate`] is scoped to ACTIVE bins only: masked bins
+    /// contribute nothing to any mask-honouring cost function, so a
+    /// negative `B(E)` there must not reject the whole trial step — on a
+    /// wide TOF grid (|z| up to ~6–8) coefficients that are comfortably
+    /// in-bounds inside the fit window can drive `B` negative at far
+    /// out-of-window bins, and an unscoped guard would veto every such
+    /// trial (λ inflation → spurious non-convergence).  Masked bins still
+    /// emit the raw product `B·T_inner` (possibly negative), matching the
+    /// LM/joint-Poisson contract that masked-bin values are never read.
+    active_mask: Option<Vec<bool>>,
 }
 
 impl<M: FitModel> MultiplicativeBaselineModel<M> {
@@ -2772,7 +2784,17 @@ impl<M: FitModel> MultiplicativeBaselineModel<M> {
             b0_index,
             b1_index,
             b2_index,
+            active_mask: None,
         }
+    }
+
+    /// Scope the runtime positivity guard to the given active mask
+    /// (`None` = all bins active, the default).  See the `active_mask`
+    /// field doc for why masked bins must be exempt.
+    #[must_use]
+    pub fn with_active_mask(mut self, mask: Option<&[bool]>) -> Self {
+        self.active_mask = mask.map(<[bool]>::to_vec);
+        self
     }
 
     /// `B(E_i)` for the current parameters.
@@ -2796,8 +2818,24 @@ impl<M: FitModel> FitModel for MultiplicativeBaselineModel<M> {
             // negative — reject the trial step instead.  Mid-iteration `Err`
             // is a REJECTED trial in the LM (backtrack / raise λ); the config
             // validation guarantees the initial point satisfies B(E) > 0.
+            //
+            // SCOPED to active bins (#514 review R2): a bin masked out by
+            // fit_energy_range contributes nothing to any mask-honouring
+            // cost function, so a negative B there must not veto the trial
+            // step — an unscoped guard rejected in-window-valid coefficients
+            // because of out-of-window bins, inflating λ into spurious
+            // non-convergence.  Masked bins emit the raw (possibly negative)
+            // product, which the solvers never read.
+            // A mask shorter than the grid treats out-of-range bins as
+            // ACTIVE (guarded) — the conservative default for a misused
+            // public constructor; the pipeline always builds equal-length
+            // masks from the same grid.
+            let bin_active = self
+                .active_mask
+                .as_ref()
+                .is_none_or(|m| m.get(i).copied().unwrap_or(true));
             let positive = b.is_finite() && b > 0.0;
-            if !positive {
+            if bin_active && !positive {
                 return Err(FittingError::EvaluationFailed(format!(
                     "multiplicative baseline B(E) = {b} is non-positive at bin {i} \
                      (b0 + b1·z + b2·z² with z = {})",
@@ -4737,6 +4775,61 @@ mod tests {
         );
         // Sanity: identity still evaluates on the same grid.
         assert!(model.evaluate(&[0.3, 1.0, 0.0, 0.0]).is_ok());
+    }
+
+    /// Review R2: the positivity guard is scoped to ACTIVE bins.  The same
+    /// in-bounds coefficients that go negative only at masked-out grid-edge
+    /// bins must NOT reject the trial step when those bins are excluded by
+    /// the fit-energy-range mask — an unscoped guard vetoed in-window-valid
+    /// steps and inflated λ into spurious non-convergence.
+    #[test]
+    fn baseline_positivity_guard_scoped_to_active_mask() {
+        let xs = vec![vec![1.0; 5]];
+        let energies = [1e-3, 1e-1, 1.0, 1e1, 1e3];
+        let e_ref = baseline_reference_energy(&energies);
+        // Same coefficients as baseline_evaluate_rejects_nonpositive_b:
+        // B < 0 only at the outer bins (|z| ≈ 6.9).
+        let params = [0.3, 0.9, 0.0, -0.05];
+
+        // Unmasked control (non-vacuity): the guard fires.
+        let unmasked = MultiplicativeBaselineModel::new(
+            make_precomputed(xs.clone(), vec![0]),
+            &energies,
+            e_ref,
+            1,
+            2,
+            3,
+        );
+        assert!(unmasked.evaluate(&params).is_err());
+
+        // Mask out the offending edge bins: evaluation succeeds and the
+        // ACTIVE bins carry the expected positive product.
+        let mask = [false, true, true, true, false];
+        let masked = MultiplicativeBaselineModel::new(
+            make_precomputed(xs, vec![0]),
+            &energies,
+            e_ref,
+            1,
+            2,
+            3,
+        )
+        .with_active_mask(Some(&mask));
+        let out = masked
+            .evaluate(&params)
+            .expect("negative B at MASKED bins must not reject the step");
+        for (i, (&y, &active)) in out.iter().zip(mask.iter()).enumerate() {
+            if active {
+                let z = (energies[i] / e_ref).ln();
+                let b = 0.9 - 0.05 * z * z;
+                assert!(b > 0.0, "test setup: active bin {i} must have B > 0");
+                let t = (-0.3f64).exp();
+                assert!(
+                    (y - b * t).abs() < 1e-12,
+                    "active bin {i}: y = {y}, expected {}",
+                    b * t
+                );
+            }
+        }
     }
 
     /// End-to-end: fit recovers known Anorm + BackA from synthetic data.

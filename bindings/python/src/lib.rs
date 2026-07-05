@@ -3705,9 +3705,10 @@ fn spatial_result_to_py(
 ///     b0_init, b1_init, b2_init: Initial coefficients (default 1, 0, 0 —
 ///         the identity baseline).
 ///     b0_bounds, b1_bounds, b2_bounds: Optional (lower, upper) optimizer
-///         boxes; defaults (0.9, 1.1) / (−0.05, 0.05) / (−0.05, 0.05) keep
-///         the baseline "a few % off unity" so it cannot absorb resonance
-///         dips.
+///         boxes; defaults (0.9, 1.1) / (−0.05, 0.05) / (−0.05, 0.05).
+///         The boxes bound the coefficients (tilt/curvature per ln-E
+///         unit), not the evaluated B(E); dip protection comes from the
+///         quadratic's smoothness, and B(E) > 0 is enforced pointwise.
 ///     baseline_global: With ``baseline=True``: True (default) fits the
 ///         baseline ONCE on the aggregated mean spectrum and freezes it for
 ///         every pixel (stage-1 non-convergence is a hard error); False
@@ -4152,9 +4153,10 @@ fn py_spatial_map_typed<'py>(
 ///     b0_init, b1_init, b2_init: Initial coefficients (default 1, 0, 0 —
 ///         the identity baseline).
 ///     b0_bounds, b1_bounds, b2_bounds: Optional (lower, upper) optimizer
-///         boxes; defaults (0.9, 1.1) / (−0.05, 0.05) / (−0.05, 0.05) keep
-///         the baseline "a few % off unity" so it cannot absorb resonance
-///         dips.
+///         boxes; defaults (0.9, 1.1) / (−0.05, 0.05) / (−0.05, 0.05).
+///         The boxes bound the coefficients (tilt/curvature per ln-E
+///         unit), not the evaluated B(E); dip protection comes from the
+///         quadratic's smoothness, and B(E) > 0 is enforced pointwise.
 ///
 /// Returns:
 ///     FitResult with densities, uncertainties, chi2, etc.
@@ -4465,8 +4467,25 @@ fn py_fit_counts_spectrum_typed<'py>(
     // Issue #633: freeze known densities (calibration-foil thermometry).
     config = apply_density_freeze(config, fix_densities, density_free)?;
 
-    let result = py.detach(move || fit_spectrum_typed(&input, &config).map_err(|e| e.to_string()));
-    let result = result.map_err(|e| pyo3::exceptions::PyRuntimeError::new_err(e))?;
+    let result = py.detach(move || fit_spectrum_typed(&input, &config));
+    // Config-class errors (InvalidParameter) surface as ValueError —
+    // matching py_spatial_map_typed, which established the convention for
+    // PipelineError at this boundary (review R2: identical invalid input,
+    // e.g. a baseline init outside its bounds, previously raised ValueError
+    // from the spatial API but RuntimeError here because the error variant
+    // was stringified inside py.detach).  Other variants stay RuntimeError —
+    // they signal solver / numeric failures, not bad input.
+    let result = result.map_err(|e| {
+        let msg = e.to_string();
+        if matches!(
+            e,
+            nereids_pipeline::error::PipelineError::InvalidParameter(_)
+        ) {
+            pyo3::exceptions::PyValueError::new_err(msg)
+        } else {
+            pyo3::exceptions::PyRuntimeError::new_err(msg)
+        }
+    })?;
 
     Ok(PyFitResult {
         densities: result.densities,
@@ -4734,10 +4753,20 @@ fn py_compute_model_jacobian<'py>(
     let flux = ob_slice.to_vec();
     let background = det_bg_vec;
 
-    let result = py.detach(move || {
-        evaluate_jacobian_and_fisher(&config, &flux, &background).map_err(|e| e.to_string())
-    });
-    let result = result.map_err(|e| pyo3::exceptions::PyRuntimeError::new_err(e))?;
+    let result = py.detach(move || evaluate_jacobian_and_fisher(&config, &flux, &background));
+    // InvalidParameter → ValueError, other variants → RuntimeError — the
+    // same PipelineError convention as the three fitters (review R2).
+    let result = result.map_err(|e| {
+        let msg = e.to_string();
+        if matches!(
+            e,
+            nereids_pipeline::error::PipelineError::InvalidParameter(_)
+        ) {
+            pyo3::exceptions::PyValueError::new_err(msg)
+        } else {
+            pyo3::exceptions::PyRuntimeError::new_err(msg)
+        }
+    })?;
 
     Ok(PyModelJacobianResult {
         jacobian_data: result.jacobian.data,
@@ -4880,9 +4909,10 @@ fn apply_baseline(
 ///     b0_init, b1_init, b2_init: Initial coefficients (default 1, 0, 0 —
 ///         the identity baseline).
 ///     b0_bounds, b1_bounds, b2_bounds: Optional (lower, upper) optimizer
-///         boxes; defaults (0.9, 1.1) / (−0.05, 0.05) / (−0.05, 0.05) keep
-///         the baseline "a few % off unity" so it cannot absorb resonance
-///         dips.
+///         boxes; defaults (0.9, 1.1) / (−0.05, 0.05) / (−0.05, 0.05).
+///         The boxes bound the coefficients (tilt/curvature per ln-E
+///         unit), not the evaluated B(E); dip protection comes from the
+///         quadratic's smoothness, and B(E) > 0 is enforced pointwise.
 ///
 /// Returns:
 ///     FitResult with densities, uncertainties, chi2, etc.
@@ -5133,9 +5163,26 @@ fn py_fit_spectrum_typed<'py>(
     };
 
     // Release the GIL for the fit computation.
-    let result = py.detach(move || fit_spectrum_typed(&input, &config).map_err(|e| e.to_string()));
+    let result = py.detach(move || fit_spectrum_typed(&input, &config));
 
-    let result = result.map_err(|e| pyo3::exceptions::PyRuntimeError::new_err(e))?;
+    // Config-class errors (InvalidParameter) surface as ValueError —
+    // matching py_spatial_map_typed, which established the convention for
+    // PipelineError at this boundary (review R2: identical invalid input,
+    // e.g. a baseline init outside its bounds, previously raised ValueError
+    // from the spatial API but RuntimeError here because the error variant
+    // was stringified inside py.detach).  Other variants stay RuntimeError —
+    // they signal solver / numeric failures, not bad input.
+    let result = result.map_err(|e| {
+        let msg = e.to_string();
+        if matches!(
+            e,
+            nereids_pipeline::error::PipelineError::InvalidParameter(_)
+        ) {
+            pyo3::exceptions::PyValueError::new_err(msg)
+        } else {
+            pyo3::exceptions::PyRuntimeError::new_err(msg)
+        }
+    })?;
 
     Ok(PyFitResult {
         densities: result.densities,

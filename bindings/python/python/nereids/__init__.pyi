@@ -135,7 +135,7 @@ class FitResult:
         ...
 
     @property
-    def background(self) -> tuple[float, float, float]:
+    def background(self) -> list[float]:
         """Fitted background parameters (BackA, BackB, BackC)."""
         ...
 
@@ -189,8 +189,9 @@ class FitResult:
         ...
 
     @property
-    def baseline(self) -> tuple[float, float, float] | None:
-        """Fitted multiplicative-baseline coefficients ``(b0, b1, b2)`` for
+    def baseline(self) -> list[float] | None:
+        """Fitted multiplicative-baseline coefficients ``[b0, b1, b2]`` (a
+        3-element list) for
         ``B(E) = b0 + b1*ln(E/E_ref) + b2*ln^2(E/E_ref)`` applied outermost
         (issue #635).  ``None`` when ``baseline=False``."""
         ...
@@ -500,9 +501,9 @@ class SpatialResult:
         ...
 
     @property
-    def baseline_global(self) -> tuple[float, float, float] | None:
-        """Global multiplicative-baseline coefficients ``(b0, b1, b2)``
-        (issue #635): fitted once on the aggregated mean spectrum, then
+    def baseline_global(self) -> list[float] | None:
+        """Global multiplicative-baseline coefficients ``[b0, b1, b2]`` (a
+        3-element list; issue #635): fitted once on the aggregated mean spectrum, then
         frozen for every pixel.  ``None`` when ``baseline=False`` or in
         per-pixel mode (``baseline_global=False``)."""
         ...

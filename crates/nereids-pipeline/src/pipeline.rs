@@ -130,9 +130,18 @@ struct BackgroundIndices {
 /// are rejected (`validate_multiplicative_baseline`); the additive ABC(+DF)
 /// background remains combinable when `fit_anorm = false`.
 ///
-/// Bounds are configurable with tight defaults — tight enough that the
-/// baseline cannot absorb resonance dips (which need O(1) local excursions),
-/// which is what prevents the A3-style runaway.
+/// What prevents the A3-style runaway is SMOOTHNESS, not amplitude: a
+/// single global quadratic in ln E cannot produce a narrow local feature at
+/// a resonance whatever its coefficients, so the dips stay attributed to
+/// the physics model.  The (configurable) coefficient boxes bound the
+/// baseline's overall tilt/curvature PER ln-E UNIT, not the evaluated
+/// `B(E)` itself: the worst-case excursion from `b0` grows with the grid's
+/// log-width, `|B − b0| ≤ |b1|·|z|_max + |b2|·z²_max` (≈ ±0.23 beyond
+/// `b0`'s own ±0.1 box on a 1–30 eV grid at the default ±0.05 boxes; more
+/// on wider grids, where only the runtime `B(E) > 0` guard applies).
+/// "A few % off unity" describes the typical FITTED values on campaign
+/// data and the hard `b0` box at mid-grid — not a hard envelope on `B(E)`
+/// across the grid.
 #[derive(Debug, Clone)]
 pub struct MultiplicativeBaselineConfig {
     /// Initial mid-grid baseline value `b0` (default 1.0).
@@ -1436,14 +1445,18 @@ fn fit_transmission_lm(
         };
     }
     if let Some(bli) = bl_indices {
-        stacked = Box::new(MultiplicativeBaselineModel::new(
-            stacked,
-            config.energies(),
-            baseline_reference_energy(config.energies()),
-            bli.b0,
-            bli.b1,
-            bli.b2,
-        ));
+        stacked = Box::new(
+            MultiplicativeBaselineModel::new(
+                stacked,
+                config.energies(),
+                baseline_reference_energy(config.energies()),
+                bli.b0,
+                bli.b1,
+                bli.b2,
+            )
+            // Scope the runtime positivity guard to the fit window (#514).
+            .with_active_mask(active_mask.as_deref()),
+        );
     }
     let result = lm::levenberg_marquardt_with_mask(
         &*stacked,
@@ -1570,6 +1583,9 @@ fn fit_transmission_poisson(
         };
     }
     if let Some(bli) = bl_indices {
+        // No active mask here: this path hard-rejects fit_energy_range up
+        // front, so every bin participates and the full-grid positivity
+        // guard is the correct contract.
         stacked = Box::new(MultiplicativeBaselineModel::new(
             stacked,
             config.energies(),
@@ -1791,14 +1807,18 @@ fn fit_counts_joint_poisson(
         ));
     }
     if let Some(bli) = bl_indices {
-        stacked = Box::new(MultiplicativeBaselineModel::new(
-            stacked,
-            config.energies(),
-            baseline_reference_energy(config.energies()),
-            bli.b0,
-            bli.b1,
-            bli.b2,
-        ));
+        stacked = Box::new(
+            MultiplicativeBaselineModel::new(
+                stacked,
+                config.energies(),
+                baseline_reference_energy(config.energies()),
+                bli.b0,
+                bli.b1,
+                bli.b2,
+            )
+            // Scope the runtime positivity guard to the fit window (#514).
+            .with_active_mask(active_mask_slice),
+        );
     }
     let objective = JointPoissonObjective {
         model: &*stacked,
@@ -2258,7 +2278,15 @@ pub(crate) fn validate_multiplicative_baseline(
             )));
         }
     }
-    // Initial-point positivity over the actual grid.
+    // Initial-point positivity over the ACTIVE bins (#514 semantics,
+    // review R2): bins masked out by fit_energy_range contribute nothing
+    // to any mask-honouring cost function, so an init that is positive
+    // everywhere inside the fit window must not be rejected because of
+    // out-of-window bins on a wide TOF grid.  E_ref itself stays a
+    // full-grid property — it is a pure reparameterization of the
+    // quadratic (any E_ref > 0 spans the same function family), and
+    // keeping it mask-independent keeps reported coefficients comparable
+    // across window choices.
     let e_ref = baseline_reference_energy(config.energies());
     if !e_ref.is_finite() || e_ref <= 0.0 {
         return Err(PipelineError::InvalidParameter(format!(
@@ -2266,14 +2294,22 @@ pub(crate) fn validate_multiplicative_baseline(
              invalid ({e_ref}) — check the energy grid"
         )));
     }
-    for &e in config.energies() {
+    let active_mask = nereids_fitting::active_mask::build_active_mask(
+        config.energies(),
+        config.fit_energy_range(),
+    );
+    for (i, &e) in config.energies().iter().enumerate() {
+        if active_mask.as_ref().is_some_and(|m| !m[i]) {
+            continue;
+        }
         let z = (e / e_ref).ln();
         let b = bl.b0_init + bl.b1_init * z + bl.b2_init * z * z;
         let positive = b.is_finite() && b > 0.0;
         if !positive {
             return Err(PipelineError::InvalidParameter(format!(
                 "multiplicative baseline: initial B(E) = {b} is not strictly \
-                 positive at E = {e} eV — adjust the b0/b1/b2 inits"
+                 positive at E = {e} eV (inside the fit window) — adjust the \
+                 b0/b1/b2 inits"
             )));
         }
     }
@@ -7615,5 +7651,118 @@ mod tests {
             .err()
             .expect("research Fisher helper must reject a baseline config");
         assert!(err.to_string().contains("multiplicative"), "got: {err}");
+    }
+
+    /// Review R2: initial-point positivity validation is scoped to the fit
+    /// window.  Inits that dip negative only at bins EXCLUDED by
+    /// fit_energy_range are legal; the same inits without the window are
+    /// rejected (non-vacuity control).
+    #[test]
+    fn baseline_init_positivity_scoped_to_fit_window() {
+        let data = u238_single_resonance();
+        // Wide log grid: z spans ±6.9 around the geometric midpoint, so
+        // in-bounds coefficients (b0 = 0.9, b2 = -0.05) drive B_init < 0 at
+        // the outer decades while staying positive near mid-grid.
+        let energies: Vec<f64> = (0..61)
+            .map(|i| 1e-3 * 10f64.powf(i as f64 / 10.0))
+            .collect();
+        let bl = MultiplicativeBaselineConfig {
+            b0_init: 0.9,
+            b2_init: -0.05,
+            ..MultiplicativeBaselineConfig::default()
+        };
+        let base = UnifiedFitConfig::new(
+            energies,
+            vec![data],
+            vec!["U-238".into()],
+            0.0,
+            None,
+            vec![0.001],
+        )
+        .unwrap()
+        .with_multiplicative_baseline(bl);
+
+        // Full grid: rejected (B_init <= 0 at the edges).
+        let err = validate_multiplicative_baseline(&base)
+            .expect_err("negative B_init at unmasked edge bins must reject");
+        assert!(err.to_string().contains("not strictly positive"), "{err}");
+
+        // Narrow window where B_init > 0 everywhere active: accepted.
+        let windowed = base
+            .with_fit_energy_range(Some((0.5, 2.0)))
+            .expect("valid range");
+        validate_multiplicative_baseline(&windowed)
+            .expect("inits positive inside the fit window must be accepted");
+    }
+
+    /// Review R2: committed parity pin for the #635
+    /// `build_transmission_model` rewiring.  The no-temperature /
+    /// no-precomputed-σ path now returns `PrecomputedTransmissionModel`
+    /// (for its analytic Jacobian) instead of falling through to
+    /// `TransmissionFitModel` — this test pins the load-bearing property
+    /// that the MODEL OUTPUT is bit-identical to the canonical
+    /// `forward_model` on both resolution arms, so only the optimizer
+    /// quality changed.  If a future intentional physics change breaks
+    /// bit-equality, re-anchoring THIS test forces the rationale to be
+    /// written down (the VENUS anchors alone are machine-generated by the
+    /// code under test and cannot distinguish "optimizer moved" from
+    /// "model moved").
+    #[test]
+    fn build_transmission_model_no_temp_matches_forward_model_bit_exact() {
+        use nereids_physics::transmission::SampleParams;
+        let data = u238_single_resonance();
+        let energies: Vec<f64> = (0..201).map(|i| 1.0 + (i as f64) * 0.05).collect();
+        let density = 0.002;
+
+        // Arm 1: no resolution (identity working grid).
+        let config = UnifiedFitConfig::new(
+            energies.clone(),
+            vec![data.clone()],
+            vec!["U-238".into()],
+            293.6,
+            None,
+            vec![density],
+        )
+        .unwrap();
+        let model = build_transmission_model(&config, 1, None).unwrap();
+        let t_model = model.evaluate(&[density]).unwrap();
+        let sample = SampleParams::new(293.6, vec![(data.clone(), density)]).unwrap();
+        let t_fwd = phys_transmission::forward_model(&energies, &sample, None).unwrap();
+        assert_eq!(t_model.len(), t_fwd.len());
+        for (i, (a, b)) in t_model.iter().zip(t_fwd.iter()).enumerate() {
+            assert_eq!(
+                a.to_bits(),
+                b.to_bits(),
+                "no-resolution arm, bin {i}: {a:e} != {b:e}"
+            );
+        }
+
+        // Arm 2: Gaussian resolution (auxiliary extended working grid, #608).
+        let res = nereids_physics::resolution::ResolutionFunction::Gaussian(
+            nereids_physics::resolution::ResolutionParams::new(25.0, 0.5, 0.005, 0.0).unwrap(),
+        );
+        let config_res = UnifiedFitConfig::new(
+            energies.clone(),
+            vec![data.clone()],
+            vec!["U-238".into()],
+            293.6,
+            Some(res.clone()),
+            vec![density],
+        )
+        .unwrap();
+        let model_res = build_transmission_model(&config_res, 1, None).unwrap();
+        let t_model_res = model_res.evaluate(&[density]).unwrap();
+        let inst = InstrumentParams { resolution: res };
+        let sample_res = SampleParams::new(293.6, vec![(data, density)]).unwrap();
+        let t_fwd_res =
+            phys_transmission::forward_model(&energies, &sample_res, Some(&inst)).unwrap();
+        assert_eq!(t_model_res.len(), t_fwd_res.len());
+        for (i, (a, b)) in t_model_res.iter().zip(t_fwd_res.iter()).enumerate() {
+            assert_eq!(
+                a.to_bits(),
+                b.to_bits(),
+                "Gaussian-resolution arm, bin {i}: {a:e} != {b:e}"
+            );
+        }
     }
 }

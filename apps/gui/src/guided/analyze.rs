@@ -387,10 +387,10 @@ fn fit_controls(ui: &mut egui::Ui, state: &mut AppState, available_height_hint: 
                 .on_hover_text(
                     "Fits y = B(E)\u{00B7}[model] with B(E) = b\u{2080} + \
                      b\u{2081}\u{00B7}ln(E/E_ref) + b\u{2082}\u{00B7}ln\u{00B2}(E/E_ref), \
-                     bounded a few % around unity \u{2014} absorbs smooth open-beam \
-                     mismatch (filters, holders, scattering) without eating \
-                     resonance dips. When combined with a background, Anorm is \
-                     held fixed automatically (b\u{2080} and Anorm are degenerate \
+                     with box-bounded coefficients \u{2014} absorbs smooth open-beam \
+                     mismatch (filters, holders, scattering); too smooth to \
+                     absorb resonance dips. When combined with a background, Anorm \
+                     is held fixed automatically (b\u{2080} and Anorm are degenerate \
                      normalizations). For Spatial Map the baseline is fitted once \
                      on the aggregated spectrum and frozen per-pixel.",
                 );
