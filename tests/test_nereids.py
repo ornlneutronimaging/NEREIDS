@@ -1835,13 +1835,24 @@ class TestVenusMlbwRegression:
         # rel, χ²_r −2.4e-6 rel — the exact kernel fits the measured data
         # marginally BETTER — iteration count unchanged.
         #
+        # Baseline regenerated after #635's analytic-Jacobian availability
+        # fix: no-temperature fits without precomputed sigma previously fell
+        # through to a model with NO analytical_jacobian, so LM ran on FD
+        # columns. The model itself is UNCHANGED (bit-exact parity between
+        # the old forward_model path and the new working-grid precompute was
+        # verified before re-anchoring); only the optimizer's stopping point
+        # inside the same flat basin moved: chi2_r agrees with the old
+        # anchor to 1e-9 RELATIVE (219657.2440 vs .2437) while the density
+        # shifts -0.07 % and the iteration count halves (14 -> 7) because
+        # analytic steps satisfy the relative-chi2 tolerance sooner.
+        #
         # These pinned values are machine-generated regression anchors
         # (produced by the code under test); the correctness burden is
         # carried by the SAMMY-oracle suites (samtry, ex001) and the
         # analytic kernel pins in doppler.rs.
-        EXPECTED_DENSITY = 8.110140236608694e-05
-        EXPECTED_CHI2_R = 219657.24372935892
-        EXPECTED_ITERATIONS = 14
+        EXPECTED_DENSITY = 8.10458528518008e-05
+        EXPECTED_CHI2_R = 219657.2439575215
+        EXPECTED_ITERATIONS = 7
 
         FLOAT_TOL = pytest.approx
         assert float(result.densities[0]) == FLOAT_TOL(EXPECTED_DENSITY, rel=1e-6), (
@@ -1923,8 +1934,17 @@ class TestVenusMlbwRegression:
             delta_l_m=0.005,
         )
 
-        EXPECTED_DENSITY = 2.9110452985323965e-05
-        EXPECTED_DEVIANCE_PER_DOF = 31445.956656870774
+        # Anchors regenerated after #635's analytic-Jacobian availability
+        # fix. The old anchor was captured at an identity-Fisher
+        # gradient-descent STALL: without an analytic transmission Jacobian
+        # the joint-Poisson stage 1 silently degraded to projected gradient
+        # descent, which stopped 1.7 % away (in density) from the true
+        # optimum of the SAME objective. With the analytic Fisher the fit
+        # reaches a strictly BETTER minimum (deviance/dof 31445.853 <
+        # 31445.957) in 3 iterations. The model is unchanged (bit-exact
+        # parity verified); only the optimum actually attained improved.
+        EXPECTED_DENSITY = 2.9596692297867937e-05
+        EXPECTED_DEVIANCE_PER_DOF = 31445.852761391532
 
         assert bool(result.converged) is True, (
             f"counts-KL fit did not converge on the real VENUS fixture "
@@ -2315,6 +2335,12 @@ class TestFixDensities:
                 energies, [(u238_data, d_a_true), (iso_b, d_b_true)]
             )
         )
+        # Deterministic ~0.2 % pseudo-noise: the covariance is scaled by
+        # chi2/nu, so EXACTLY noise-free data drives chi2 -> 0 once the
+        # analytic-Jacobian fit (#635) converges machine-exactly, collapsing
+        # the free density's sigma to NaN — a degenerate oracle, not an
+        # index-mapping regression. Real data always has chi2 > 0.
+        t = t * (1.0 + 0.002 * np.sin(7.3 * np.arange(t.size)))
         sigma = np.full_like(t, 0.003)
         r = nereids.fit_spectrum_typed(
             transmission=t,
@@ -3362,3 +3388,320 @@ class TestCalibrateResolution:
                     flight_path_m=-1.0,
                     **kw,
                 )
+
+
+# ===========================================================================
+# Bounded multiplicative baseline (#635)
+# ===========================================================================
+
+
+# Truth baseline shared by the closed loops below: a few % off unity,
+# curved, strictly positive on the test grids, inside the DEFAULT bounds.
+_BL_TRUE = (1.02, -0.03, 0.01)
+
+
+def _baseline_curve(energies):
+    """B(E) = b0 + b1·ln(E/E_ref) + b2·ln²(E/E_ref) at the truth
+    coefficients, with E_ref the geometric midpoint of the grid — the same
+    convention the Rust fitter uses (``baseline_reference_energy``)."""
+    e = np.asarray(energies, dtype=float)
+    e_ref = float(np.sqrt(e[0] * e[-1]))
+    z = np.log(e / e_ref)
+    return _BL_TRUE[0] + _BL_TRUE[1] * z + _BL_TRUE[2] * z * z, e_ref
+
+
+class TestMultiplicativeBaseline:
+    """Issue #635: bounded multiplicative baseline B(E) applied OUTERMOST.
+
+    These verify the *plumbing* — kwargs, result fields, mode routing, and
+    boundary rejections. The deep closed loops (Jacobians, solver behavior,
+    stage-1 aggregation, non-vacuity controls) live in the Rust suites
+    (``nereids-fitting`` / ``nereids-pipeline``). Non-vacuity here comes
+    from seeding every fit at the identity baseline (1, 0, 0) while the
+    data carries a distinctly different truth, so a no-op fit fails.
+    """
+
+    def test_baseline_lm_recovers_coefficients_and_temperature(self, u238_data):
+        energies = np.linspace(1.0, 30.0, 400)
+        true_density = 8.0e-4
+        true_temp = 350.0
+        t_clean = np.asarray(
+            nereids.forward_model(
+                energies, [(u238_data, true_density)], temperature_k=true_temp
+            )
+        )
+        curve, e_ref = _baseline_curve(energies)
+        t = t_clean * curve
+        sigma = np.full_like(t, 0.005)
+
+        r = nereids.fit_spectrum_typed(
+            transmission=t,
+            uncertainty=sigma,
+            energies=energies,
+            isotopes=[(u238_data, true_density)],
+            solver="lm",
+            temperature_k=300.0,  # seeded 50 K off
+            fit_temperature=True,
+            fix_densities=True,
+            baseline=True,
+            max_iter=200,
+        )
+        assert bool(r.converged) is True
+        assert r.baseline is not None
+        for i, (fitted, truth) in enumerate(zip(r.baseline, _BL_TRUE)):
+            assert abs(fitted - truth) < 1e-2, (
+                f"baseline[{i}] = {fitted} vs truth {truth}"
+            )
+        assert r.baseline_e_ref_ev == pytest.approx(e_ref, rel=1e-12)
+        assert r.temperature_k is not None
+        assert abs(r.temperature_k - true_temp) < 5.0
+        assert r.warnings == []
+
+    def test_baseline_counts_kl_recovers_coefficients(self, u238_data):
+        energies = np.linspace(1.0, 30.0, 300)
+        true_density = 8.0e-4
+        flux = 5000.0
+        t_clean = np.asarray(
+            nereids.forward_model(energies, [(u238_data, true_density)])
+        )
+        curve, _ = _baseline_curve(energies)
+        rng = np.random.default_rng(20260705)
+        open_beam = np.maximum(
+            rng.poisson(np.full_like(t_clean, flux)).astype(float), 1.0
+        )
+        sample = rng.poisson(flux * t_clean * curve).astype(float)
+
+        r = nereids.fit_counts_spectrum_typed(
+            sample_counts=sample,
+            open_beam_counts=open_beam,
+            energies=energies,
+            isotopes=[(u238_data, true_density)],
+            solver="kl",
+            fix_densities=True,
+            baseline=True,
+            max_iter=500,
+        )
+        assert bool(r.converged) is True
+        assert r.deviance_per_dof is not None
+        assert r.baseline is not None
+        # Poisson noise at 5000 counts/bin: coefficients recover to a few
+        # times the shot-noise floor.
+        for i, (fitted, truth) in enumerate(zip(r.baseline, _BL_TRUE)):
+            assert abs(fitted - truth) < 2e-2, (
+                f"baseline[{i}] = {fitted} vs truth {truth}"
+            )
+
+    def test_baseline_none_when_disabled(self, u238_data):
+        energies = np.linspace(1.0, 30.0, 200)
+        t = np.asarray(nereids.forward_model(energies, [(u238_data, 8.0e-4)]))
+        r = nereids.fit_spectrum_typed(
+            transmission=t,
+            uncertainty=np.full_like(t, 0.005),
+            energies=energies,
+            isotopes=[(u238_data, 5.0e-4)],
+            solver="lm",
+        )
+        assert r.baseline is None
+        assert r.baseline_e_ref_ev is None
+        assert r.warnings == []
+
+    def test_baseline_with_default_background_rejected_on_all_fitters(
+        self, u238_data
+    ):
+        """``background=True`` frees Anorm by default, and b0/Anorm are
+        degenerate normalizations — every fitter rejects the combination at
+        the binding boundary with the fix in the message."""
+        energies = np.linspace(1.0, 30.0, 100)
+        t = np.full_like(energies, 0.95)
+        sigma = np.full_like(energies, 0.01)
+        with pytest.raises(ValueError, match="fit_anorm=False"):
+            nereids.fit_spectrum_typed(
+                transmission=t,
+                uncertainty=sigma,
+                energies=energies,
+                isotopes=[(u238_data, 0.001)],
+                background=True,
+                baseline=True,
+            )
+        with pytest.raises(ValueError, match="fit_anorm=False"):
+            nereids.fit_counts_spectrum_typed(
+                sample_counts=np.full_like(energies, 900.0),
+                open_beam_counts=np.full_like(energies, 1000.0),
+                energies=energies,
+                isotopes=[(u238_data, 0.001)],
+                background=True,
+                baseline=True,
+            )
+        trans = np.tile(t[:, None, None], (1, 2, 2))
+        unc = np.full_like(trans, 0.01)
+        with pytest.raises(ValueError, match="fit_anorm=False"):
+            nereids.spatial_map_typed(
+                nereids.from_transmission(trans, unc),
+                energies,
+                [u238_data],
+                initial_densities=[0.001],
+                background=True,
+                baseline=True,
+            )
+
+    def test_baseline_with_background_fit_anorm_false_accepted(self, u238_data):
+        """The sanctioned combination: additive ABC background with Anorm
+        HELD FIXED alongside the baseline."""
+        energies = np.linspace(1.0, 30.0, 400)
+        true_density = 8.0e-4
+        t_clean = np.asarray(
+            nereids.forward_model(energies, [(u238_data, true_density)])
+        )
+        curve, _ = _baseline_curve(energies)
+        t = t_clean * curve
+        r = nereids.fit_spectrum_typed(
+            transmission=t,
+            uncertainty=np.full_like(t, 0.005),
+            energies=energies,
+            isotopes=[(u238_data, true_density)],
+            solver="lm",
+            fix_densities=True,
+            background=True,
+            fit_anorm=False,
+            baseline=True,
+            max_iter=300,
+        )
+        assert bool(r.converged) is True
+        assert r.anorm == 1.0, "Anorm was frozen at its init"
+        assert r.baseline is not None
+        assert abs(r.baseline[0] - _BL_TRUE[0]) < 2e-2
+
+    def test_baseline_suboptions_require_baseline_true(self, u238_data):
+        energies = np.linspace(1.0, 30.0, 100)
+        t = np.full_like(energies, 0.95)
+        sigma = np.full_like(energies, 0.01)
+        with pytest.raises(ValueError, match="require baseline=True"):
+            nereids.fit_spectrum_typed(
+                transmission=t,
+                uncertainty=sigma,
+                energies=energies,
+                isotopes=[(u238_data, 0.001)],
+                fit_b1=False,  # baseline sub-option without baseline=True
+            )
+
+    def test_fit_anorm_false_requires_background(self, u238_data):
+        energies = np.linspace(1.0, 30.0, 100)
+        t = np.full_like(energies, 0.95)
+        sigma = np.full_like(energies, 0.01)
+        with pytest.raises(ValueError, match="requires background=True"):
+            nereids.fit_spectrum_typed(
+                transmission=t,
+                uncertainty=sigma,
+                energies=energies,
+                isotopes=[(u238_data, 0.001)],
+                fit_anorm=False,
+            )
+
+    def test_baseline_bounds_kwargs_widen_the_box(self, u238_data):
+        """An init outside the DEFAULT box is rejected by the core config
+        validation; supplying a wider explicit box makes the same init
+        legal — the bounds kwargs genuinely reach the optimizer."""
+        energies = np.linspace(1.0, 30.0, 300)
+        true_density = 8.0e-4
+        t_clean = np.asarray(
+            nereids.forward_model(energies, [(u238_data, true_density)])
+        )
+        curve, _ = _baseline_curve(energies)
+        t = t_clean * curve
+        sigma = np.full_like(t, 0.005)
+        common = dict(
+            transmission=t,
+            uncertainty=sigma,
+            energies=energies,
+            isotopes=[(u238_data, true_density)],
+            solver="lm",
+            fix_densities=True,
+            baseline=True,
+            b0_init=1.3,  # outside the default (0.9, 1.1) box
+            max_iter=300,
+        )
+        with pytest.raises(RuntimeError, match="outside"):
+            nereids.fit_spectrum_typed(**common)
+        r = nereids.fit_spectrum_typed(**common, b0_bounds=(0.5, 1.5))
+        assert bool(r.converged) is True
+        assert abs(r.baseline[0] - _BL_TRUE[0]) < 2e-2
+
+    def test_degenerate_trio_warning_roundtrip(self, u238_data):
+        """Free Anorm + free temperature + free density surfaces the
+        structured warning on FitResult.warnings (the silent field failure:
+        T ran to 4471 K with chi2/nu 932 and no diagnostic)."""
+        energies = np.linspace(1.0, 30.0, 200)
+        t = np.asarray(nereids.forward_model(energies, [(u238_data, 8.0e-4)]))
+        r = nereids.fit_spectrum_typed(
+            transmission=t,
+            uncertainty=np.full_like(t, 0.005),
+            energies=energies,
+            isotopes=[(u238_data, 5.0e-4)],
+            solver="lm",
+            fit_temperature=True,
+            background=True,  # fit_anorm defaults True
+            max_iter=5,
+        )
+        assert any("degenerate" in w for w in r.warnings), r.warnings
+
+    def test_baseline_spatial_global_roundtrip(self, u238_data):
+        energies = np.linspace(1.0, 30.0, 300)
+        true_density = 2.0e-3
+        t_1d = np.asarray(
+            nereids.forward_model(energies, [(u238_data, true_density)])
+        )
+        curve, e_ref = _baseline_curve(energies)
+        trans = np.tile((t_1d * curve)[:, None, None], (1, 2, 2))
+        unc = np.full_like(trans, 0.005)
+        result = nereids.spatial_map_typed(
+            nereids.from_transmission(trans, unc),
+            energies,
+            [u238_data],
+            initial_densities=[true_density],
+            fix_densities=True,
+            fit_temperature=True,  # keep >=1 free param per pixel
+            temperature_k=300.0,
+            baseline=True,
+            max_iter=200,
+        )
+        assert result.baseline_global is not None
+        for i, (fitted, truth) in enumerate(zip(result.baseline_global, _BL_TRUE)):
+            assert abs(fitted - truth) < 1e-2, (
+                f"baseline_global[{i}] = {fitted} vs truth {truth}"
+            )
+        assert result.baseline_e_ref_ev == pytest.approx(e_ref, rel=1e-12)
+        assert result.baseline_maps is None, "global mode has no per-pixel maps"
+        assert result.warnings == []
+        assert result.n_converged == 4
+
+    def test_baseline_spatial_per_pixel_maps(self, u238_data):
+        energies = np.linspace(1.0, 30.0, 300)
+        true_density = 2.0e-3
+        t_1d = np.asarray(
+            nereids.forward_model(energies, [(u238_data, true_density)])
+        )
+        curve, _ = _baseline_curve(energies)
+        trans = np.tile((t_1d * curve)[:, None, None], (1, 2, 2))
+        unc = np.full_like(trans, 0.005)
+        result = nereids.spatial_map_typed(
+            nereids.from_transmission(trans, unc),
+            energies,
+            [u238_data],
+            initial_densities=[true_density],
+            fix_densities=True,
+            fit_temperature=True,
+            temperature_k=300.0,
+            baseline=True,
+            baseline_global=False,
+            max_iter=200,
+        )
+        assert result.baseline_global is None, "per-pixel mode has no global triple"
+        maps = result.baseline_maps
+        assert maps is not None and len(maps) == 3
+        b0_map = np.asarray(maps[0])
+        assert b0_map.shape == (2, 2)
+        converged = np.asarray(result.converged_map)
+        assert converged.any(), "at least one pixel must converge"
+        assert np.all(
+            np.abs(b0_map[converged] - _BL_TRUE[0]) < 5e-2
+        ), f"per-pixel b0 off truth: {b0_map}"

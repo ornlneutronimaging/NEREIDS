@@ -438,6 +438,15 @@ struct PyFitResult {
     /// Conditional binomial deviance / (n − k).  `Some(...)` only for the
     /// counts-KL dispatch (`solver="kl"` on counts input).
     deviance_per_dof: Option<f64>,
+    /// Fitted multiplicative-baseline coefficients `[b0, b1, b2]` (issue
+    /// #635); `None` when ``baseline=False``.
+    baseline: Option<[f64; 3]>,
+    /// Reference energy E_ref (eV) of the baseline's centered ln(E/E_ref)
+    /// basis; `None` when ``baseline=False``.
+    baseline_e_ref_ev: Option<f64>,
+    /// Structured fit-configuration warnings (e.g. the degenerate
+    /// free-Anorm + free-temperature + free-density trio).
+    warnings: Vec<String>,
 }
 
 #[pymethods]
@@ -581,6 +590,34 @@ impl PyFitResult {
     #[getter]
     fn deviance_per_dof(&self) -> Option<f64> {
         self.deviance_per_dof
+    }
+
+    /// Fitted multiplicative-baseline coefficients ``[b0, b1, b2]`` for
+    /// ``B(E) = b0 + b1·ln(E/E_ref) + b2·ln²(E/E_ref)`` applied OUTERMOST
+    /// (issue #635).  ``None`` when ``baseline=False``.  Coefficients that
+    /// were configured but frozen (``fit_b0=False`` …) still report their
+    /// values — they are part of the model that produced the fit.
+    #[getter]
+    fn baseline(&self) -> Option<[f64; 3]> {
+        self.baseline
+    }
+
+    /// Reference energy E_ref (eV) the baseline's ``ln(E/E_ref)`` basis was
+    /// centered on — the geometric midpoint ``sqrt(E_min·E_max)`` of the fit
+    /// grid, stored so ``B(E)`` can be reconstructed with the EXACT
+    /// reference the fit used.  ``None`` when ``baseline=False``.
+    #[getter]
+    fn baseline_e_ref_ev(&self) -> Option<f64> {
+        self.baseline_e_ref_ev
+    }
+
+    /// Structured fit-configuration warnings.  Currently flags the
+    /// degenerate normalization trio (free ``Anorm`` + free temperature +
+    /// ≥1 free density), which on real VENUS data ran to T = 4471 K with
+    /// χ²/ν = 932 and no diagnostic.  Empty list when nothing is flagged.
+    #[getter]
+    fn warnings(&self) -> Vec<String> {
+        self.warnings.clone()
     }
 
     fn __repr__(&self) -> String {
@@ -863,6 +900,16 @@ struct PySpatialResult {
     t0_us_map: Option<Py<PyArray2<f64>>>,
     /// Per-pixel fitted TZERO L_scale map (None when fit_energy_scale=False).
     l_scale_map: Option<Py<PyArray2<f64>>>,
+    /// Global multiplicative-baseline coefficients (issue #635);
+    /// None when baseline=False or baseline_global=False.
+    baseline_global: Option<[f64; 3]>,
+    /// Baseline reference energy E_ref (eV); None when baseline=False.
+    baseline_e_ref_ev: Option<f64>,
+    /// Per-pixel baseline coefficient maps; None unless baseline=True with
+    /// baseline_global=False.
+    baseline_maps: Option<[Py<PyArray2<f64>>; 3]>,
+    /// Structured fit-configuration warnings.
+    warnings: Vec<String>,
 }
 
 #[pymethods]
@@ -999,6 +1046,41 @@ impl PySpatialResult {
     #[getter]
     fn l_scale_map<'py>(&self, py: Python<'py>) -> Option<Bound<'py, PyArray2<f64>>> {
         self.l_scale_map.as_ref().map(|m| m.bind(py).clone())
+    }
+
+    /// Global multiplicative-baseline coefficients ``[b0, b1, b2]``
+    /// (issue #635): the stage-1 fit on the aggregated mean spectrum that
+    /// every pixel then used frozen.  ``None`` when ``baseline=False`` or
+    /// in per-pixel mode (``baseline_global=False`` — see
+    /// :py:attr:`baseline_maps`).
+    #[getter]
+    fn baseline_global(&self) -> Option<[f64; 3]> {
+        self.baseline_global
+    }
+
+    /// Baseline reference energy E_ref (eV) of the centered ``ln(E/E_ref)``
+    /// basis — reconstruct ``B(E)`` with exactly this reference.
+    /// ``None`` when ``baseline=False``.
+    #[getter]
+    fn baseline_e_ref_ev(&self) -> Option<f64> {
+        self.baseline_e_ref_ev
+    }
+
+    /// Per-pixel baseline coefficient maps ``[b0, b1, b2]``.  ``None``
+    /// unless ``baseline=True`` with ``baseline_global=False``.
+    /// NaN at pixels that did not converge.
+    #[getter]
+    fn baseline_maps<'py>(&self, py: Python<'py>) -> Option<Vec<Bound<'py, PyArray2<f64>>>> {
+        self.baseline_maps
+            .as_ref()
+            .map(|maps| maps.iter().map(|m| m.bind(py).clone()).collect())
+    }
+
+    /// Structured fit-configuration warnings (also printed once to stderr
+    /// by the spatial engine).  Empty list when nothing is flagged.
+    #[getter]
+    fn warnings(&self) -> Vec<String> {
+        self.warnings.clone()
     }
 
     fn __repr__(&self) -> String {
@@ -3537,6 +3619,13 @@ fn spatial_result_to_py(
         .l_scale_map
         .as_ref()
         .map(|m| PyArray2::from_array(py, m).into());
+    let baseline_maps = result.baseline_maps.as_ref().map(|maps| {
+        [
+            PyArray2::from_array(py, &maps[0]).into(),
+            PyArray2::from_array(py, &maps[1]).into(),
+            PyArray2::from_array(py, &maps[2]).into(),
+        ]
+    });
 
     PySpatialResult {
         density_maps,
@@ -3557,6 +3646,10 @@ fn spatial_result_to_py(
         back_f_map,
         t0_us_map,
         l_scale_map,
+        baseline_global: result.baseline_global,
+        baseline_e_ref_ev: result.baseline_e_ref_ev,
+        baseline_maps,
+        warnings: result.warnings.clone(),
     }
 }
 
@@ -3600,6 +3693,25 @@ fn spatial_result_to_py(
 ///         energy-scale model. Must match the grid used to compute `energies`.
 ///     resolution: Optional resolution function.
 ///     groups: list of IsotopeGroup objects (mutually exclusive with isotopes).
+///     fit_anorm: Whether Anorm is free when ``background=True`` (default
+///         True).  Must be False to combine ``background=True`` with
+///         ``baseline=True`` (b0 and Anorm are degenerate normalizations).
+///     baseline: Enable the bounded multiplicative baseline
+///         ``B(E) = b0 + b1·ln(E/E_ref) + b2·ln²(E/E_ref)`` applied
+///         OUTERMOST (issue #635).  E_ref is the geometric midpoint of the
+///         energy grid and is reported as ``FitResult.baseline_e_ref_ev``.
+///     fit_b0, fit_b1, fit_b2: Per-coefficient fit flags (default True).
+///         All-False freezes the baseline at its inits.
+///     b0_init, b1_init, b2_init: Initial coefficients (default 1, 0, 0 —
+///         the identity baseline).
+///     b0_bounds, b1_bounds, b2_bounds: Optional (lower, upper) optimizer
+///         boxes; defaults (0.9, 1.1) / (−0.05, 0.05) / (−0.05, 0.05) keep
+///         the baseline "a few % off unity" so it cannot absorb resonance
+///         dips.
+///     baseline_global: With ``baseline=True``: True (default) fits the
+///         baseline ONCE on the aggregated mean spectrum and freezes it for
+///         every pixel (stage-1 non-convergence is a hard error); False
+///         fits a baseline per pixel and populates ``baseline_maps``.
 ///
 /// Returns:
 ///     SpatialResult with density_maps, chi_squared_map, converged_map, etc.
@@ -3636,6 +3748,18 @@ fn spatial_result_to_py(
     groups = None,
     tzero_jacobian = None,
     fit_energy_range = None,
+    fit_anorm = true,
+    baseline = false,
+    fit_b0 = true,
+    fit_b1 = true,
+    fit_b2 = true,
+    b0_init = 1.0,
+    b1_init = 0.0,
+    b2_init = 0.0,
+    b0_bounds = None,
+    b1_bounds = None,
+    b2_bounds = None,
+    baseline_global = true,
 ))]
 #[allow(clippy::too_many_arguments)]
 fn py_spatial_map_typed<'py>(
@@ -3673,6 +3797,18 @@ fn py_spatial_map_typed<'py>(
     groups: Option<Vec<PyIsotopeGroup>>,
     tzero_jacobian: Option<&str>,
     fit_energy_range: Option<(f64, f64)>,
+    fit_anorm: bool,
+    baseline: bool,
+    fit_b0: bool,
+    fit_b1: bool,
+    fit_b2: bool,
+    b0_init: f64,
+    b1_init: f64,
+    b2_init: f64,
+    b0_bounds: Option<(f64, f64)>,
+    b1_bounds: Option<(f64, f64)>,
+    b2_bounds: Option<(f64, f64)>,
+    baseline_global: bool,
 ) -> PyResult<PySpatialResult> {
     // Validate mutual exclusivity
     let has_isotopes = isotopes.is_some();
@@ -3820,6 +3956,7 @@ fn py_spatial_map_typed<'py>(
         // `back_d_map` / `back_f_map` would never be `Some`.  Mirrors
         // the single-spectrum `py_fit_spectrum_typed` wiring above.
         let bg = nereids_pipeline::pipeline::BackgroundConfig {
+            fit_anorm,
             fit_back_d,
             fit_back_f,
             back_d_init,
@@ -3837,7 +3974,32 @@ fn py_spatial_map_typed<'py>(
              exponential tail of the SAMMY background only exists when \
              the polynomial background model is attached.",
         ));
+    } else if !fit_anorm {
+        return Err(pyo3::exceptions::PyValueError::new_err(
+            "fit_anorm=False requires background=True: Anorm is a parameter \
+             of the SAMMY background model.",
+        ));
     }
+
+    // Bounded multiplicative baseline (issue #635).  `baseline_global`
+    // selects the two-stage global mode (fit once on the aggregated mean
+    // spectrum, freeze per-pixel) vs per-pixel baseline maps.
+    config = apply_baseline(
+        config,
+        baseline,
+        fit_b0,
+        fit_b1,
+        fit_b2,
+        b0_init,
+        b1_init,
+        b2_init,
+        b0_bounds,
+        b1_bounds,
+        b2_bounds,
+        baseline_global,
+        background,
+        fit_anorm,
+    )?;
     if fit_alpha_1 || fit_alpha_2 || alpha_1_init != 1.0 || alpha_2_init != 1.0 {
         if data.kind != "counts_with_nuisance" {
             return Err(pyo3::exceptions::PyValueError::new_err(
@@ -3978,6 +4140,22 @@ fn py_spatial_map_typed<'py>(
 ///         physically meaningful.  See ``JointPoissonFitConfig``
 ///         ``enable_polish`` field doc for details.
 ///
+///     fit_anorm: Whether Anorm is free when ``background=True`` (default
+///         True).  Must be False to combine ``background=True`` with
+///         ``baseline=True`` (b0 and Anorm are degenerate normalizations).
+///     baseline: Enable the bounded multiplicative baseline
+///         ``B(E) = b0 + b1·ln(E/E_ref) + b2·ln²(E/E_ref)`` applied
+///         OUTERMOST (issue #635).  E_ref is the geometric midpoint of the
+///         energy grid and is reported as ``FitResult.baseline_e_ref_ev``.
+///     fit_b0, fit_b1, fit_b2: Per-coefficient fit flags (default True).
+///         All-False freezes the baseline at its inits.
+///     b0_init, b1_init, b2_init: Initial coefficients (default 1, 0, 0 —
+///         the identity baseline).
+///     b0_bounds, b1_bounds, b2_bounds: Optional (lower, upper) optimizer
+///         boxes; defaults (0.9, 1.1) / (−0.05, 0.05) / (−0.05, 0.05) keep
+///         the baseline "a few % off unity" so it cannot absorb resonance
+///         dips.
+///
 /// Returns:
 ///     FitResult with densities, uncertainties, chi2, etc.
 ///
@@ -4015,6 +4193,17 @@ fn py_spatial_map_typed<'py>(
     enable_polish = None,
     tzero_jacobian = None,
     fit_energy_range = None,
+    fit_anorm = true,
+    baseline = false,
+    fit_b0 = true,
+    fit_b1 = true,
+    fit_b2 = true,
+    b0_init = 1.0,
+    b1_init = 0.0,
+    b2_init = 0.0,
+    b0_bounds = None,
+    b1_bounds = None,
+    b2_bounds = None,
 ))]
 fn py_fit_counts_spectrum_typed<'py>(
     py: Python<'py>,
@@ -4052,6 +4241,17 @@ fn py_fit_counts_spectrum_typed<'py>(
     enable_polish: Option<bool>,
     tzero_jacobian: Option<&str>,
     fit_energy_range: Option<(f64, f64)>,
+    fit_anorm: bool,
+    baseline: bool,
+    fit_b0: bool,
+    fit_b1: bool,
+    fit_b2: bool,
+    b0_init: f64,
+    b1_init: f64,
+    b2_init: f64,
+    b0_bounds: Option<(f64, f64)>,
+    b1_bounds: Option<(f64, f64)>,
+    b2_bounds: Option<(f64, f64)>,
 ) -> PyResult<PyFitResult> {
     use nereids_pipeline::pipeline::{
         CountsBackgroundConfig, InputData, UnifiedFitConfig, fit_spectrum_typed,
@@ -4184,12 +4384,23 @@ fn py_fit_counts_spectrum_typed<'py>(
     }
     if background {
         let mut bg = nereids_pipeline::pipeline::BackgroundConfig::default();
+        bg.fit_anorm = fit_anorm;
         bg.fit_back_d = fit_back_d;
         bg.fit_back_f = fit_back_f;
         bg.back_d_init = back_d_init;
         bg.back_f_init = back_f_init;
         config = config.with_transmission_background(bg);
+    } else if !fit_anorm {
+        return Err(pyo3::exceptions::PyValueError::new_err(
+            "fit_anorm=False requires background=True: Anorm is a parameter \
+             of the SAMMY background model.",
+        ));
     }
+    // Bounded multiplicative baseline (issue #635).
+    config = apply_baseline(
+        config, baseline, fit_b0, fit_b1, fit_b2, b0_init, b1_init, b2_init, b0_bounds, b1_bounds,
+        b2_bounds, true, background, fit_anorm,
+    )?;
     if fit_energy_scale {
         validate_energy_scale_params(t0_init_us, l_scale_init, energy_scale_flight_path_m)?;
         config = config.with_energy_scale(t0_init_us, l_scale_init, energy_scale_flight_path_m);
@@ -4289,6 +4500,9 @@ fn py_fit_counts_spectrum_typed<'py>(
         l_scale: result.l_scale,
         energy_scale_flight_path_m: result.energy_scale_flight_path_m,
         deviance_per_dof: result.deviance_per_dof,
+        baseline: result.baseline,
+        baseline_e_ref_ev: result.baseline_e_ref_ev,
+        warnings: result.warnings,
     })
 }
 
@@ -4561,6 +4775,79 @@ fn apply_density_freeze(
     }
 }
 
+/// Shared kwarg plumbing for the bounded multiplicative baseline (issue
+/// #635), mirroring `apply_density_freeze`.  Rejects silent-noop
+/// combinations (baseline sub-options without `baseline=True`) and the
+/// degenerate free-Anorm pairing at the binding boundary (ValueError with
+/// the fix) rather than letting the core rejection surface as a
+/// RuntimeError after config assembly.
+#[allow(clippy::too_many_arguments)]
+fn apply_baseline(
+    config: nereids_pipeline::pipeline::UnifiedFitConfig,
+    baseline: bool,
+    fit_b0: bool,
+    fit_b1: bool,
+    fit_b2: bool,
+    b0_init: f64,
+    b1_init: f64,
+    b2_init: f64,
+    b0_bounds: Option<(f64, f64)>,
+    b1_bounds: Option<(f64, f64)>,
+    b2_bounds: Option<(f64, f64)>,
+    baseline_global: bool,
+    background: bool,
+    fit_anorm: bool,
+) -> PyResult<nereids_pipeline::pipeline::UnifiedFitConfig> {
+    if !baseline {
+        let sub_options_at_default = fit_b0
+            && fit_b1
+            && fit_b2
+            && b0_init == 1.0
+            && b1_init == 0.0
+            && b2_init == 0.0
+            && b0_bounds.is_none()
+            && b1_bounds.is_none()
+            && b2_bounds.is_none()
+            && baseline_global;
+        if !sub_options_at_default {
+            return Err(pyo3::exceptions::PyValueError::new_err(
+                "baseline sub-options (fit_b0/fit_b1/fit_b2, b*_init, b*_bounds, \
+                 baseline_global) require baseline=True — without it they would \
+                 silently do nothing.",
+            ));
+        }
+        return Ok(config);
+    }
+    if background && fit_anorm {
+        return Err(pyo3::exceptions::PyValueError::new_err(
+            "baseline=True with background=True requires fit_anorm=False: the \
+             baseline's b0 and the SAMMY Anorm are degenerate normalizations \
+             (never free two of them). Pass fit_anorm=False to combine the \
+             additive ABC background with the multiplicative baseline.",
+        ));
+    }
+    let mut bl = nereids_pipeline::pipeline::MultiplicativeBaselineConfig {
+        b0_init,
+        b1_init,
+        b2_init,
+        fit_b0,
+        fit_b1,
+        fit_b2,
+        spatial_global: baseline_global,
+        ..Default::default()
+    };
+    if let Some(b) = b0_bounds {
+        bl.b0_bounds = b;
+    }
+    if let Some(b) = b1_bounds {
+        bl.b1_bounds = b;
+    }
+    if let Some(b) = b2_bounds {
+        bl.b2_bounds = b;
+    }
+    Ok(config.with_multiplicative_baseline(bl))
+}
+
 /// Fit a single pre-normalized transmission spectrum.
 ///
 /// This function accepts **transmission** data only (T = sample/open-beam).
@@ -4581,6 +4868,21 @@ fn apply_density_freeze(
 ///     resolution: Optional resolution function.
 ///     groups: list of IsotopeGroup objects (mutually exclusive with isotopes).
 ///     initial_densities: Initial density guesses when using groups (default 0.001 each).
+///     fit_anorm: Whether Anorm is free when ``background=True`` (default
+///         True).  Must be False to combine ``background=True`` with
+///         ``baseline=True`` (b0 and Anorm are degenerate normalizations).
+///     baseline: Enable the bounded multiplicative baseline
+///         ``B(E) = b0 + b1·ln(E/E_ref) + b2·ln²(E/E_ref)`` applied
+///         OUTERMOST (issue #635).  E_ref is the geometric midpoint of the
+///         energy grid and is reported as ``FitResult.baseline_e_ref_ev``.
+///     fit_b0, fit_b1, fit_b2: Per-coefficient fit flags (default True).
+///         All-False freezes the baseline at its inits.
+///     b0_init, b1_init, b2_init: Initial coefficients (default 1, 0, 0 —
+///         the identity baseline).
+///     b0_bounds, b1_bounds, b2_bounds: Optional (lower, upper) optimizer
+///         boxes; defaults (0.9, 1.1) / (−0.05, 0.05) / (−0.05, 0.05) keep
+///         the baseline "a few % off unity" so it cannot absorb resonance
+///         dips.
 ///
 /// Returns:
 ///     FitResult with densities, uncertainties, chi2, etc.
@@ -4610,6 +4912,17 @@ fn apply_density_freeze(
     density_free = None,
     tzero_jacobian = None,
     fit_energy_range = None,
+    fit_anorm = true,
+    baseline = false,
+    fit_b0 = true,
+    fit_b1 = true,
+    fit_b2 = true,
+    b0_init = 1.0,
+    b1_init = 0.0,
+    b2_init = 0.0,
+    b0_bounds = None,
+    b1_bounds = None,
+    b2_bounds = None,
 ))]
 fn py_fit_spectrum_typed<'py>(
     py: Python<'py>,
@@ -4640,6 +4953,17 @@ fn py_fit_spectrum_typed<'py>(
     density_free: Option<Vec<bool>>,
     tzero_jacobian: Option<&str>,
     fit_energy_range: Option<(f64, f64)>,
+    fit_anorm: bool,
+    baseline: bool,
+    fit_b0: bool,
+    fit_b1: bool,
+    fit_b2: bool,
+    b0_init: f64,
+    b1_init: f64,
+    b2_init: f64,
+    b0_bounds: Option<(f64, f64)>,
+    b1_bounds: Option<(f64, f64)>,
+    b2_bounds: Option<(f64, f64)>,
 ) -> PyResult<PyFitResult> {
     use nereids_pipeline::pipeline::{InputData, fit_spectrum_typed};
 
@@ -4757,12 +5081,26 @@ fn py_fit_spectrum_typed<'py>(
     // Background
     if background {
         let mut bg = nereids_pipeline::pipeline::BackgroundConfig::default();
+        bg.fit_anorm = fit_anorm;
         bg.fit_back_d = fit_back_d;
         bg.fit_back_f = fit_back_f;
         bg.back_d_init = back_d_init;
         bg.back_f_init = back_f_init;
         config = config.with_transmission_background(bg);
+    } else if !fit_anorm {
+        // Anorm only exists on the background model — reject the silent
+        // no-op rather than letting the kwarg vanish.
+        return Err(pyo3::exceptions::PyValueError::new_err(
+            "fit_anorm=False requires background=True: Anorm is a parameter \
+             of the SAMMY background model.",
+        ));
     }
+
+    // Bounded multiplicative baseline (issue #635).
+    config = apply_baseline(
+        config, baseline, fit_b0, fit_b1, fit_b2, b0_init, b1_init, b2_init, b0_bounds, b1_bounds,
+        b2_bounds, true, background, fit_anorm,
+    )?;
 
     // Energy-scale calibration (SAMMY TZERO equivalent)
     if fit_energy_scale {
@@ -4831,5 +5169,8 @@ fn py_fit_spectrum_typed<'py>(
         l_scale: result.l_scale,
         energy_scale_flight_path_m: result.energy_scale_flight_path_m,
         deviance_per_dof: result.deviance_per_dof,
+        baseline: result.baseline,
+        baseline_e_ref_ev: result.baseline_e_ref_ev,
+        warnings: result.warnings,
     })
 }
