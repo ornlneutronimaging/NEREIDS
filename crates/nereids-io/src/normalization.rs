@@ -1306,6 +1306,148 @@ mod tests {
         );
     }
 
+    /// Build the 8×8 single-TOF-bin two-moat fixture for the stage-1
+    /// robust-scale tests (#646 review R4, P1-2): two 3×3 all-dead moats
+    /// (rows 1–3 × cols 1–3 and rows 4–6 × cols 4–6) with a `probe` at
+    /// (2,2) and a `control` at (5,5) in their centers, and the remaining
+    /// 46 pixels filled row-major with `n_a` × `a` then (46 − n_a) × `b`.
+    ///
+    /// A dead moat makes a probe's stage-2 reference sample EMPTY (every
+    /// neighbor dead → omitted), which keeps the global verdict — so a
+    /// probe's flag outcome is decided purely by the stage-1 threshold
+    /// under test, never vetoed by the local confirmation.  Dead pixels
+    /// are excluded from the stage-1 statistics, so with `n_a = 24` the
+    /// live sample is 24×`a`, 22×`b`, probe, control (n = 48, both
+    /// probes above `b`): the two central order statistics are the 24th
+    /// (= ln a) and 25th (= ln b), pinning `med = (ln a + ln b)/2`
+    /// exactly; the deviation sample has 46 × |ln(b/a)|/2 below the two
+    /// probe deviations, pinning `mad = |ln(b/a)|/2` exactly.
+    fn stage1_two_moat_grid(a: f64, n_a: usize, b: f64, probe: f64, control: f64) -> Array3<f64> {
+        let mut data = Array3::<f64>::zeros((1, 8, 8));
+        data[[0, 2, 2]] = probe;
+        data[[0, 5, 5]] = control;
+        let mut filled = 0usize;
+        for y in 0..8 {
+            for x in 0..8 {
+                let in_moat1 = (1..=3).contains(&y) && (1..=3).contains(&x);
+                let in_moat2 = (4..=6).contains(&y) && (4..=6).contains(&x);
+                if in_moat1 || in_moat2 {
+                    // Moat cells stay 0.0 (dead); the probe/control
+                    // assignments above are inside the moats and survive.
+                    continue;
+                }
+                data[[0, y, x]] = if filled < n_a { a } else { b };
+                filled += 1;
+            }
+        }
+        assert_eq!(filled, 46, "8×8 minus two 3×3 moats is 46 background px");
+        data
+    }
+
+    /// #646 review R4, P1-2 (1/3): the robust-MAD branch of the stage-1
+    /// scale `sigma = max(MAD_TO_SIGMA·mad, exp(−med/2))` DECIDES an
+    /// outcome.  Every earlier test drove sigma through the Poisson
+    /// floor (uniform/quantized backgrounds → mad = 0), so a mutation of
+    /// the MAD branch survived the suite.
+    ///
+    /// Fixture (see [`stage1_two_moat_grid`]): 24 × A = 8000,
+    /// 22 × B = 12500, probe P = 40 000, control C = 200 000.
+    /// A·B = 10⁸ and B/A = 1.25², so ln A = 8.9871968 and
+    /// ln B = 9.4334839 sit symmetrically about ln 10⁴.  Worked stage-1
+    /// arithmetic over the 48 live pixels:
+    ///
+    ///   med = (ln A + ln B)/2 = ln 10⁴          = 9.2103404
+    ///   mad = ln 1.25                            = 0.2231436
+    ///   MAD term = 1.4826022 × 0.2231436         = 0.3308331
+    ///   floor    = exp(−med/2) = 10⁻²            = 0.01
+    ///   sigma = max(0.3308331, 0.01)             = 0.3308331   (MAD wins)
+    ///   threshold = med + 6·sigma                = 11.1953391
+    ///
+    /// Probe: ln P = 10.5966347 < 11.1953391 (margin 0.60) → NOT a
+    /// candidate → kept.  Under a floor-only mutation (sigma = 0.01) the
+    /// threshold collapses to 9.2703404 < ln P and the dead moat flags
+    /// the probe unconditionally — this assertion fails.
+    /// Control: ln C = 12.2060726 > 11.1953391 (margin 1.01) → flagged;
+    /// a mutation that INFLATES the MAD term (≥2× → threshold ≥ 13.18)
+    /// unflags it.  The MAD value itself separates the two probes.
+    #[test]
+    fn test_detect_hot_pixels_mad_scale_decides_stage1_threshold() {
+        let data = stage1_two_moat_grid(8000.0, 24, 12500.0, 40_000.0, 200_000.0);
+        let mask = detect_hot_pixels(&data, HOT_PIXEL_K_MAD).unwrap();
+        assert!(
+            !mask[[2, 2]],
+            "probe below the MAD-driven threshold must be kept"
+        );
+        assert!(
+            mask[[5, 5]],
+            "control above the MAD-driven threshold must be flagged"
+        );
+        assert_eq!(mask.iter().filter(|&&m| m).count(), 1);
+    }
+
+    /// #646 review R4, P1-2 (2/3) — crossover pin, MAD term just ABOVE
+    /// the Poisson floor: `max()` must pick the MAD branch.
+    ///
+    /// Fixture: 24 × A = 100/1.08, 22 × B = 108 (A·B = 10⁴ →
+    /// med = (ln A + ln B)/2 = ln 100 = 4.6051702, floor =
+    /// exp(−med/2) = 10⁻¹ = 0.1), probe P = 190, control C = 10 000.
+    ///
+    ///   mad = ln 1.08                            = 0.0769610
+    ///   MAD term = 1.4826022 × 0.0769610         = 0.1141026
+    ///     → 14 % ABOVE the 0.1 floor: MAD branch wins, barely.
+    ///   correct threshold = 4.6051702 + 6×0.1141026 = 5.2897858
+    ///   floor-mutant thr  = 4.6051702 + 6×0.1       = 5.2051702
+    ///
+    /// ln P = ln 190 = 5.2470241 sits BETWEEN the two thresholds
+    /// (margins 0.042 above the mutant's, 0.043 below the correct one):
+    /// correct code keeps the probe; a mutant that resolves the
+    /// crossover the wrong way (max→min, dropped MAD branch, deflated
+    /// MAD_TO_SIGMA) flags it via the dead moat.  Control:
+    /// ln C = 9.2103404 ≫ 5.2897858 → flagged (liveness control).
+    #[test]
+    fn test_detect_hot_pixels_mad_term_just_above_poisson_floor_wins() {
+        let data = stage1_two_moat_grid(100.0 / 1.08, 24, 108.0, 190.0, 10_000.0);
+        let mask = detect_hot_pixels(&data, HOT_PIXEL_K_MAD).unwrap();
+        assert!(
+            !mask[[2, 2]],
+            "probe between floor and MAD thresholds must be kept when the MAD branch wins"
+        );
+        assert!(mask[[5, 5]], "control must be flagged");
+        assert_eq!(mask.iter().filter(|&&m| m).count(), 1);
+    }
+
+    /// #646 review R4, P1-2 (3/3) — crossover pin, MAD term just BELOW
+    /// the Poisson floor: `max()` must pick the floor.
+    ///
+    /// Fixture: 24 × A = 100/1.06, 22 × B = 106 (med = ln 100 =
+    /// 4.6051702, floor = 0.1 as above), probe P = 175, control
+    /// C = 10 000.
+    ///
+    ///   mad = ln 1.06                            = 0.0582689
+    ///   MAD term = 1.4826022 × 0.0582689         = 0.0863896
+    ///     → 14 % BELOW the 0.1 floor: the floor wins, barely.
+    ///   correct threshold = 4.6051702 + 6×0.1        = 5.2051702
+    ///   MAD-mutant thr    = 4.6051702 + 6×0.0863896  = 5.1235079
+    ///
+    /// ln P = ln 175 = 5.1647860 sits BETWEEN the two thresholds
+    /// (margins 0.041 above the mutant's, 0.040 below the correct one):
+    /// correct code keeps the probe; a mutant that drops the floor
+    /// (sigma = MAD term unconditionally — here max→min picks the MAD
+    /// term) flags it via the dead moat.  Together with the ABOVE case
+    /// this pins both branches of the crossover and the `max()` itself
+    /// from both sides.
+    #[test]
+    fn test_detect_hot_pixels_poisson_floor_just_above_mad_term_wins() {
+        let data = stage1_two_moat_grid(100.0 / 1.06, 24, 106.0, 175.0, 10_000.0);
+        let mask = detect_hot_pixels(&data, HOT_PIXEL_K_MAD).unwrap();
+        assert!(
+            !mask[[2, 2]],
+            "probe between MAD and floor thresholds must be kept when the floor wins"
+        );
+        assert!(mask[[5, 5]], "control must be flagged");
+        assert_eq!(mask.iter().filter(|&&m| m).count(), 1);
+    }
+
     #[test]
     fn test_detect_hot_pixels_majority_dead_live_not_flagged() {
         // A large dead population must not drag the median down and get the

@@ -1399,6 +1399,48 @@ class TestPixelMasks:
         assert not mask[0, 2], "low-count-alive pixel must be kept"
         assert mask.sum() == 1
 
+    def test_detect_hot_pixels_mad_scale_decides_stage1_threshold(self):
+        """Mirror of the Rust deciding-branch test (#646 review R4, P1-2):
+        the robust-MAD branch of the stage-1 scale
+        sigma = max(MAD_TO_SIGMA*mad, exp(-med/2)) decides the outcome.
+
+        8x8 single-bin grid; two all-dead 3x3 moats (rows/cols 1-3 and
+        4-6) isolate a probe at (2,2) and a control at (5,5) so their
+        stage-2 reference sample is empty and the flag outcome is decided
+        purely by the stage-1 threshold.  Background: 24 px at A = 8000,
+        22 px at B = 12500 (A*B = 1e8, B/A = 1.25**2).  Worked stage-1
+        arithmetic over the 48 live pixels (ranks pin the statistics):
+
+          med = (ln A + ln B)/2 = ln 1e4         = 9.2103404
+          mad = ln 1.25                          = 0.2231436
+          MAD term = 1.4826022 * 0.2231436       = 0.3308331
+          floor = exp(-med/2) = 1e-2             = 0.01  (MAD wins)
+          threshold = med + 6*sigma              = 11.1953391
+
+        Probe ln 40000 = 10.5966347 < threshold -> kept; under a
+        floor-only mutation the threshold collapses to 9.2703404 and the
+        probe would be flagged.  Control ln 200000 = 12.2060726 >
+        threshold -> flagged.
+        """
+        data = np.zeros((1, 8, 8))
+        data[0, 2, 2] = 40000.0  # probe
+        data[0, 5, 5] = 200000.0  # control
+        filled = 0
+        for y in range(8):
+            for x in range(8):
+                in_moat1 = 1 <= y <= 3 and 1 <= x <= 3
+                in_moat2 = 4 <= y <= 6 and 4 <= x <= 6
+                if in_moat1 or in_moat2:
+                    continue  # dead moat cells stay 0.0
+                data[0, y, x] = 8000.0 if filled < 24 else 12500.0
+                filled += 1
+        assert filled == 46
+
+        mask = np.asarray(nereids.detect_hot_pixels(data))
+        assert not mask[2, 2], "probe below the MAD-driven threshold must be kept"
+        assert mask[5, 5], "control above the MAD-driven threshold must be flagged"
+        assert mask.sum() == 1
+
     def test_detect_dead_pixels_chunked_catches_intermittent(self):
         chunk0 = np.full((3, 2, 2), 5.0)
         chunk0[:, 0, 1] = 0.0  # dead throughout chunk 0 only
