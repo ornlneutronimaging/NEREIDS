@@ -2716,8 +2716,9 @@ pub fn baseline_reference_energy(energies: &[f64]) -> f64 {
 /// ## INTENTIONAL DEPARTURE from SAMMY
 ///
 /// SAMMY's modern data-reduction path applies a SCALAR normalization plus
-/// additive backgrounds only: `T_obs = Anorm·T + BackA + BackB/√E + BackC·√E
-/// + BackD·exp(−BackF/√E)` (`cro/mnrm1.f90`, subroutine `Norm`, applied to
+/// additive backgrounds only:
+/// `T_obs = Anorm·T + BackA + BackB/√E + BackC·√E + BackD·exp(−BackF/√E)`
+/// (`cro/mnrm1.f90`, subroutine `Norm`, applied to
 /// every data type via `the/ZeroKCrossCorrections_M.f90`).  SAMMY's nearest
 /// analogue to an energy-dependent multiplicative normalization is the
 /// DORMANT legacy power-law `Anorm = Anrm(1) + Anrm(2)·E^Anrm(3)`
@@ -2795,7 +2796,8 @@ impl<M: FitModel> FitModel for MultiplicativeBaselineModel<M> {
             // negative — reject the trial step instead.  Mid-iteration `Err`
             // is a REJECTED trial in the LM (backtrack / raise λ); the config
             // validation guarantees the initial point satisfies B(E) > 0.
-            if !(b > 0.0) {
+            let positive = b.is_finite() && b > 0.0;
+            if !positive {
                 return Err(FittingError::EvaluationFailed(format!(
                     "multiplicative baseline B(E) = {b} is non-positive at bin {i} \
                      (b0 + b1·z + b2·z² with z = {})",
