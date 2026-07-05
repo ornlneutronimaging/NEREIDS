@@ -32,6 +32,24 @@
 //! lexicographic stacking — summing across different prefixes would merge
 //! different runs.  Use the `pattern` argument to select one run.
 //!
+//! ## Pixel-value policy
+//!
+//! Raw detector counts are non-negative by construction, so a negative or
+//! non-finite pixel signals file corruption or a signed-type readout bug.
+//! By default every loader rejects such values with
+//! [`IoError::BadPixelValue`] ([`PixelValuePolicy::Reject`]).  Two escape
+//! hatches exist:
+//! - [`PixelValuePolicy::ClipToZero`] clamps negative values to `0.0`
+//!   (counted in [`TiffLoadInfo::n_clipped_pixels`]); non-finite values
+//!   still error, because clipping a NaN would invent data;
+//! - [`PixelValuePolicy::Allow`] accepts all values verbatim — required for
+//!   pre-normalized transmission stacks, where noise around zero can
+//!   legitimately produce small negative values.
+//!
+//! For *corrupt readout pixels* in raw counts (e.g. a railed pixel stuck at
+//! a signed sentinel), the right tool is a per-acquisition mask from
+//! `nereids_io::normalization::detect_bad_pixels`, not a load-time clamp.
+//!
 //! ## Data types
 //! - 16-bit unsigned integer (common for neutron detectors)
 //! - 32-bit float (normalized data)
@@ -45,6 +63,25 @@ use tiff::decoder::DecodingResult;
 
 use crate::error::IoError;
 
+/// Policy for negative or non-finite pixel values encountered during load.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum PixelValuePolicy {
+    /// Reject the load with [`IoError::BadPixelValue`] (default).  Raw
+    /// detector counts are non-negative by construction, so a negative or
+    /// non-finite pixel signals corruption that must be surfaced, not
+    /// silently imported.
+    #[default]
+    Reject,
+    /// Clamp negative values to `0.0`, counting them in
+    /// [`TiffLoadInfo::n_clipped_pixels`].  Non-finite values still error —
+    /// clipping a NaN would invent data.
+    ClipToZero,
+    /// Accept all values verbatim.  Needed for pre-normalized transmission
+    /// stacks, where noise around zero legitimately produces small negative
+    /// values.
+    Allow,
+}
+
 /// Options controlling how a TIFF folder (or file) is loaded.
 #[derive(Debug, Clone, Copy)]
 pub struct TiffFolderOptions {
@@ -52,11 +89,17 @@ pub struct TiffFolderOptions {
     /// (default `true`).  When `false`, a chunked folder is loaded as the
     /// legacy lexicographic concatenation of all files.
     pub sum_chunks: bool,
+    /// Policy for negative / non-finite pixel values (default
+    /// [`PixelValuePolicy::Reject`]).
+    pub pixel_policy: PixelValuePolicy,
 }
 
 impl Default for TiffFolderOptions {
     fn default() -> Self {
-        Self { sum_chunks: true }
+        Self {
+            sum_chunks: true,
+            pixel_policy: PixelValuePolicy::default(),
+        }
     }
 }
 
@@ -72,12 +115,64 @@ pub struct TiffLoadInfo {
     pub chunk_ids: Vec<u64>,
     /// Whether chunks were summed element-wise into a single stack.
     pub chunks_summed: bool,
+    /// Number of negative pixels clamped to zero.  Only ever nonzero under
+    /// [`PixelValuePolicy::ClipToZero`].
+    pub n_clipped_pixels: usize,
+}
+
+/// Apply the pixel-value policy to one decoded frame, in place.
+///
+/// Returns the number of pixels clamped to zero (only ever nonzero under
+/// [`PixelValuePolicy::ClipToZero`]).  `frame` is the frame's position in
+/// the stack being assembled, used only for error reporting.
+fn enforce_pixel_policy(
+    pixels: &mut [f64],
+    policy: PixelValuePolicy,
+    file: &Path,
+    frame: usize,
+) -> Result<usize, IoError> {
+    match policy {
+        PixelValuePolicy::Allow => Ok(0),
+        PixelValuePolicy::Reject => {
+            nereids_core::validation::first_non_finite_or_negative(pixels.iter().copied())
+                .map_err(|(index, value)| IoError::BadPixelValue {
+                    file: file.to_string_lossy().into_owned(),
+                    frame,
+                    index,
+                    value,
+                })?;
+            Ok(0)
+        }
+        PixelValuePolicy::ClipToZero => {
+            let mut clipped = 0usize;
+            for (index, v) in pixels.iter_mut().enumerate() {
+                // NaN bypasses `<`, so the finiteness check must come first
+                // and cannot be folded into the comparison below.
+                if !v.is_finite() {
+                    return Err(IoError::BadPixelValue {
+                        file: file.to_string_lossy().into_owned(),
+                        frame,
+                        index,
+                        value: *v,
+                    });
+                }
+                if *v < 0.0 {
+                    *v = 0.0;
+                    clipped += 1;
+                }
+            }
+            Ok(clipped)
+        }
+    }
 }
 
 /// Load a multi-frame TIFF into a 3D array (n_frames, height, width).
 ///
 /// Each TIFF frame becomes one slice along the first axis.
 /// Data is converted to `f64` regardless of the source pixel type.
+/// Negative or non-finite pixels are rejected (the default
+/// [`PixelValuePolicy::Reject`]); use [`load_tiff_stack_with_options`] to
+/// choose a different policy.
 ///
 /// # Arguments
 /// * `path` — Path to the multi-frame TIFF file.
@@ -85,6 +180,25 @@ pub struct TiffLoadInfo {
 /// # Returns
 /// 3D array with shape (n_frames, height, width) and f64 values.
 pub fn load_tiff_stack(path: &Path) -> Result<Array3<f64>, IoError> {
+    load_tiff_stack_with_options(path, PixelValuePolicy::default()).map(|(arr, _)| arr)
+}
+
+/// Load a multi-frame TIFF with an explicit pixel-value policy, returning
+/// provenance metadata.
+///
+/// Behaves like [`load_tiff_stack`], with the pixel-value policy applied to
+/// every frame as it is decoded (see the [module docs](self)).
+///
+/// # Arguments
+/// * `path`         — Path to the multi-frame TIFF file.
+/// * `pixel_policy` — Policy for negative / non-finite pixel values.
+///
+/// # Returns
+/// `(stack, info)` where `stack` has shape (n_frames, height, width).
+pub fn load_tiff_stack_with_options(
+    path: &Path,
+    pixel_policy: PixelValuePolicy,
+) -> Result<(Array3<f64>, TiffLoadInfo), IoError> {
     let file = std::fs::File::open(path)
         .map_err(|e| IoError::FileNotFound(path.to_string_lossy().into_owned(), e))?;
     let mut decoder = Decoder::new(file).map_err(|e| IoError::TiffDecode(format!("{}", e)))?;
@@ -92,6 +206,7 @@ pub fn load_tiff_stack(path: &Path) -> Result<Array3<f64>, IoError> {
     let mut frames: Vec<Vec<f64>> = Vec::new();
     let mut width = 0u32;
     let mut height = 0u32;
+    let mut n_clipped_pixels = 0usize;
 
     loop {
         let (w, h) = decoder
@@ -113,7 +228,8 @@ pub fn load_tiff_stack(path: &Path) -> Result<Array3<f64>, IoError> {
             .read_image()
             .map_err(|e| IoError::TiffDecode(format!("{}", e)))?;
 
-        let pixels = decode_to_f64(data)?;
+        let mut pixels = decode_to_f64(data)?;
+        n_clipped_pixels += enforce_pixel_policy(&mut pixels, pixel_policy, path, frames.len())?;
         let expected_len = (width as usize) * (height as usize);
         if pixels.len() != expected_len {
             return Err(IoError::TiffDecode(format!(
@@ -140,8 +256,18 @@ pub fn load_tiff_stack(path: &Path) -> Result<Array3<f64>, IoError> {
 
     // Flatten all frames into a single Vec and reshape to 3D
     let flat: Vec<f64> = frames.into_iter().flatten().collect();
-    Array3::from_shape_vec((n_frames, height as usize, width as usize), flat)
-        .map_err(|e| IoError::TiffDecode(format!("Shape error: {}", e)))
+    let arr = Array3::from_shape_vec((n_frames, height as usize, width as usize), flat)
+        .map_err(|e| IoError::TiffDecode(format!("Shape error: {}", e)))?;
+    Ok((
+        arr,
+        TiffLoadInfo {
+            n_files: 1,
+            n_chunks: 0,
+            chunk_ids: Vec::new(),
+            chunks_summed: false,
+            n_clipped_pixels,
+        },
+    ))
 }
 
 /// Load TIFF data from either a single multi-frame file or a directory.
@@ -198,16 +324,7 @@ pub fn load_tiff_auto_with_options(
     match std::fs::metadata(path) {
         Ok(meta) => {
             if meta.is_file() {
-                let arr = load_tiff_stack(path)?;
-                Ok((
-                    arr,
-                    TiffLoadInfo {
-                        n_files: 1,
-                        n_chunks: 0,
-                        chunk_ids: Vec::new(),
-                        chunks_summed: false,
-                    },
-                ))
+                load_tiff_stack_with_options(path, options.pixel_policy)
             } else if meta.is_dir() {
                 load_tiff_folder_with_options(path, None, options)
             } else {
@@ -351,11 +468,12 @@ pub fn load_tiff_folder_with_options(
     }
 
     let n_files = paths.len();
+    let mut n_clipped_pixels = 0usize;
 
     match detect_chunk_layout(dir, &paths)? {
         ChunkLayout::Legacy => {
             paths.sort();
-            let arr = load_frames_from_paths(&paths)?;
+            let arr = load_frames_from_paths(&paths, options.pixel_policy, &mut n_clipped_pixels)?;
             Ok((
                 arr,
                 TiffLoadInfo {
@@ -363,6 +481,7 @@ pub fn load_tiff_folder_with_options(
                     n_chunks: 0,
                     chunk_ids: Vec::new(),
                     chunks_summed: false,
+                    n_clipped_pixels,
                 },
             ))
         }
@@ -374,7 +493,7 @@ pub fn load_tiff_folder_with_options(
                 // strict improvement over lexicographic order for unpadded
                 // frame numbers); multiple chunks additionally sum
                 // element-wise across chunks.
-                let arr = load_chunked_sum(&chunks)?;
+                let arr = load_chunked_sum(&chunks, options.pixel_policy, &mut n_clipped_pixels)?;
                 Ok((
                     arr,
                     TiffLoadInfo {
@@ -382,13 +501,15 @@ pub fn load_tiff_folder_with_options(
                         n_chunks,
                         chunk_ids,
                         chunks_summed: n_chunks > 1,
+                        n_clipped_pixels,
                     },
                 ))
             } else {
                 // Chunk summing opted out: legacy lexicographic concatenation
                 // of every matching file (chunk structure is still reported).
                 paths.sort();
-                let arr = load_frames_from_paths(&paths)?;
+                let arr =
+                    load_frames_from_paths(&paths, options.pixel_policy, &mut n_clipped_pixels)?;
                 Ok((
                     arr,
                     TiffLoadInfo {
@@ -396,6 +517,7 @@ pub fn load_tiff_folder_with_options(
                         n_chunks,
                         chunk_ids,
                         chunks_summed: false,
+                        n_clipped_pixels,
                     },
                 ))
             }
@@ -526,16 +648,20 @@ fn detect_chunk_layout(dir: &Path, paths: &[PathBuf]) -> Result<ChunkLayout, IoE
 ///
 /// Peak memory is one full stack plus one frame — VENUS stacks run to
 /// several GB, so materialising every chunk simultaneously is not an option.
-fn load_chunked_sum(chunks: &BTreeMap<u64, Vec<(u64, PathBuf)>>) -> Result<Array3<f64>, IoError> {
+fn load_chunked_sum(
+    chunks: &BTreeMap<u64, Vec<(u64, PathBuf)>>,
+    pixel_policy: PixelValuePolicy,
+    n_clipped_pixels: &mut usize,
+) -> Result<Array3<f64>, IoError> {
     let mut iter = chunks.values();
     let first = iter.next().expect("detect_chunk_layout yields >= 1 chunk");
     let first_paths: Vec<PathBuf> = first.iter().map(|(_, path)| path.clone()).collect();
-    let mut acc = load_frames_from_paths(&first_paths)?;
+    let mut acc = load_frames_from_paths(&first_paths, pixel_policy, n_clipped_pixels)?;
     let (_, height, width) = acc.dim();
 
     for frames in iter {
         for (i, (_, path)) in frames.iter().enumerate() {
-            let (pixels, w, h) = read_single_frame(path, i)?;
+            let (pixels, w, h) = read_single_frame(path, i, pixel_policy, n_clipped_pixels)?;
             if w as usize != width || h as usize != height {
                 return Err(IoError::DimensionMismatch {
                     expected: (width as u32, height as u32),
@@ -558,7 +684,11 @@ fn load_chunked_sum(chunks: &BTreeMap<u64, Vec<(u64, PathBuf)>>) -> Result<Array
 /// Each file must contain exactly one frame.  Dimensions are checked for
 /// consistency across all files and pixel counts are validated against the
 /// reported image dimensions.
-fn load_frames_from_paths(paths: &[std::path::PathBuf]) -> Result<Array3<f64>, IoError> {
+fn load_frames_from_paths(
+    paths: &[std::path::PathBuf],
+    pixel_policy: PixelValuePolicy,
+    n_clipped_pixels: &mut usize,
+) -> Result<Array3<f64>, IoError> {
     debug_assert!(
         !paths.is_empty(),
         "load_frames_from_paths called with empty paths"
@@ -568,7 +698,7 @@ fn load_frames_from_paths(paths: &[std::path::PathBuf]) -> Result<Array3<f64>, I
     let mut height = 0u32;
 
     for (i, path) in paths.iter().enumerate() {
-        let (pixels, w, h) = read_single_frame(path, i)?;
+        let (pixels, w, h) = read_single_frame(path, i, pixel_policy, n_clipped_pixels)?;
 
         if i == 0 {
             width = w;
@@ -595,9 +725,15 @@ fn load_frames_from_paths(paths: &[std::path::PathBuf]) -> Result<Array3<f64>, I
 /// Rejects files containing more than one frame — each file in a directory is
 /// expected to contain exactly one frame; use [`load_tiff_stack`] for
 /// multi-frame TIFFs.  The pixel count is validated against the reported
-/// image dimensions.  `frame_label` is the frame's position in the stack
-/// being assembled, used only for error messages.
-fn read_single_frame(path: &Path, frame_label: usize) -> Result<(Vec<f64>, u32, u32), IoError> {
+/// image dimensions and the pixel-value policy is enforced (clipped pixels
+/// accumulate into `n_clipped_pixels`).  `frame_label` is the frame's
+/// position in the stack being assembled, used only for error messages.
+fn read_single_frame(
+    path: &Path,
+    frame_label: usize,
+    pixel_policy: PixelValuePolicy,
+    n_clipped_pixels: &mut usize,
+) -> Result<(Vec<f64>, u32, u32), IoError> {
     let file = std::fs::File::open(path)
         .map_err(|e| IoError::FileNotFound(path.to_string_lossy().into_owned(), e))?;
     let mut decoder = Decoder::new(file).map_err(|e| IoError::TiffDecode(format!("{}", e)))?;
@@ -620,7 +756,8 @@ fn read_single_frame(path: &Path, frame_label: usize) -> Result<(Vec<f64>, u32, 
         )));
     }
 
-    let pixels = decode_to_f64(data)?;
+    let mut pixels = decode_to_f64(data)?;
+    *n_clipped_pixels += enforce_pixel_policy(&mut pixels, pixel_policy, path, frame_label)?;
     let expected_len = (w as usize) * (h as usize);
     if pixels.len() != expected_len {
         return Err(IoError::TiffDecode(format!(
@@ -1038,6 +1175,215 @@ mod tests {
         }
     }
 
+    /// Create a signed-16-bit TIFF (native GrayI16 encoding) for pixel-value
+    /// policy tests — a railed/corrupt readout pixel shows up as a negative
+    /// signed sentinel such as -32554.
+    fn write_test_tiff_i16(path: &Path, frames: &[Vec<i16>], width: u32, height: u32) {
+        let file = std::fs::File::create(path).unwrap();
+        let mut encoder = TiffEncoder::new(file).unwrap();
+        for frame in frames {
+            encoder
+                .write_image::<tiff::encoder::colortype::GrayI16>(width, height, frame)
+                .unwrap();
+        }
+    }
+
+    /// Create a 32-bit float TIFF (native Gray32Float encoding) so NaN and
+    /// negative float pixels can be synthesized directly.
+    fn write_test_tiff_f32(path: &Path, frames: &[Vec<f32>], width: u32, height: u32) {
+        let file = std::fs::File::create(path).unwrap();
+        let mut encoder = TiffEncoder::new(file).unwrap();
+        for frame in frames {
+            encoder
+                .write_image::<tiff::encoder::colortype::Gray32Float>(width, height, frame)
+                .unwrap();
+        }
+    }
+
+    /// The corrupt-readout sentinel used across the pixel-policy tests.
+    const BAD_I16: i16 = -32554;
+
+    /// T15: a negative signed pixel is rejected by default with a message
+    /// naming the file, frame, index, value, and the detect_bad_pixels()
+    /// escape hatch.
+    #[test]
+    fn test_pixel_policy_reject_negative_i16() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("frame_0000.tif");
+        write_test_tiff_i16(&path, &[vec![10, BAD_I16, 30, 40]], 2, 2);
+
+        let err = load_tiff_folder_with_options(dir.path(), None, &TiffFolderOptions::default())
+            .unwrap_err();
+        assert!(
+            matches!(err, IoError::BadPixelValue { .. }),
+            "Expected BadPixelValue, got: {:?}",
+            err,
+        );
+        let msg = format!("{}", err);
+        assert!(msg.contains("frame_0000.tif"), "file missing: {msg}");
+        assert!(msg.contains("frame 0"), "frame missing: {msg}");
+        assert!(msg.contains("index 1"), "index missing: {msg}");
+        assert!(msg.contains("-32554"), "value missing: {msg}");
+        assert!(
+            msg.contains("detect_bad_pixels"),
+            "detect_bad_pixels hint missing: {msg}"
+        );
+    }
+
+    /// T16: ClipToZero clamps the negative pixel to 0.0 and counts it.
+    #[test]
+    fn test_pixel_policy_clip_to_zero() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("frame_0000.tif");
+        write_test_tiff_i16(&path, &[vec![10, BAD_I16, 30, 40]], 2, 2);
+
+        let options = TiffFolderOptions {
+            pixel_policy: PixelValuePolicy::ClipToZero,
+            ..Default::default()
+        };
+        let (arr, info) = load_tiff_folder_with_options(dir.path(), None, &options).unwrap();
+        assert_eq!(arr[[0, 0, 0]], 10.0);
+        assert_eq!(arr[[0, 0, 1]], 0.0);
+        assert_eq!(info.n_clipped_pixels, 1);
+    }
+
+    /// T17: Allow passes the negative value through verbatim.
+    #[test]
+    fn test_pixel_policy_allow_negative() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("frame_0000.tif");
+        write_test_tiff_i16(&path, &[vec![10, BAD_I16, 30, 40]], 2, 2);
+
+        let options = TiffFolderOptions {
+            pixel_policy: PixelValuePolicy::Allow,
+            ..Default::default()
+        };
+        let (arr, info) = load_tiff_folder_with_options(dir.path(), None, &options).unwrap();
+        assert_eq!(arr[[0, 0, 1]], f64::from(BAD_I16));
+        assert_eq!(info.n_clipped_pixels, 0);
+    }
+
+    /// T18: a NaN float pixel is rejected by default.
+    #[test]
+    fn test_pixel_policy_reject_nan_f32() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("frame_0000.tif");
+        write_test_tiff_f32(&path, &[vec![1.0, f32::NAN, 3.0, 4.0]], 2, 2);
+
+        let err = load_tiff_folder_with_options(dir.path(), None, &TiffFolderOptions::default())
+            .unwrap_err();
+        assert!(
+            matches!(err, IoError::BadPixelValue { .. }),
+            "Expected BadPixelValue, got: {:?}",
+            err,
+        );
+    }
+
+    /// T19: ClipToZero still errors on NaN — clipping NaN would invent data.
+    #[test]
+    fn test_pixel_policy_clip_still_rejects_nan() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("frame_0000.tif");
+        write_test_tiff_f32(&path, &[vec![1.0, f32::NAN, 3.0, 4.0]], 2, 2);
+
+        let options = TiffFolderOptions {
+            pixel_policy: PixelValuePolicy::ClipToZero,
+            ..Default::default()
+        };
+        let err = load_tiff_folder_with_options(dir.path(), None, &options).unwrap_err();
+        assert!(
+            matches!(err, IoError::BadPixelValue { .. }),
+            "Expected BadPixelValue, got: {:?}",
+            err,
+        );
+    }
+
+    /// T20: Allow passes NaN and negative floats through verbatim.
+    #[test]
+    fn test_pixel_policy_allow_nan_and_negative() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("frame_0000.tif");
+        write_test_tiff_f32(&path, &[vec![1.0, f32::NAN, -5.0, 4.0]], 2, 2);
+
+        let options = TiffFolderOptions {
+            pixel_policy: PixelValuePolicy::Allow,
+            ..Default::default()
+        };
+        let (arr, info) = load_tiff_folder_with_options(dir.path(), None, &options).unwrap();
+        assert!(arr[[0, 0, 1]].is_nan());
+        assert_eq!(arr[[0, 1, 0]], -5.0);
+        assert_eq!(info.n_clipped_pixels, 0);
+    }
+
+    /// T21: multi-frame load_tiff_stack rejects negatives by default;
+    /// load_tiff_stack_with_options can clip instead.
+    #[test]
+    fn test_pixel_policy_multi_frame_stack() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("multi.tiff");
+        let frame1: Vec<i16> = vec![1, 2, 3, 4];
+        let frame2: Vec<i16> = vec![5, BAD_I16, 7, 8];
+        write_test_tiff_i16(&path, &[frame1, frame2], 2, 2);
+
+        let err = load_tiff_stack(&path).unwrap_err();
+        assert!(
+            matches!(err, IoError::BadPixelValue { frame: 1, .. }),
+            "Expected BadPixelValue at frame 1, got: {:?}",
+            err,
+        );
+
+        let (arr, info) =
+            load_tiff_stack_with_options(&path, PixelValuePolicy::ClipToZero).unwrap();
+        assert_eq!(arr.shape(), &[2, 2, 2]);
+        assert_eq!(arr[[1, 0, 1]], 0.0);
+        assert_eq!(info.n_clipped_pixels, 1);
+    }
+
+    /// T22: clipped-pixel counts accumulate across summed chunks.
+    #[test]
+    fn test_pixel_policy_clip_counts_accumulate_across_chunks() {
+        let dir = tempfile::tempdir().unwrap();
+        // Chunk 1: one negative pixel in frame 0.
+        write_test_tiff_i16(
+            &dir.path().join("run_1_0000.tif"),
+            &[vec![10, -1, 30, 40]],
+            2,
+            2,
+        );
+        write_test_tiff_i16(
+            &dir.path().join("run_1_0001.tif"),
+            &[vec![11, 21, 31, 41]],
+            2,
+            2,
+        );
+        // Chunk 2: two negative pixels in frame 1.
+        write_test_tiff_i16(
+            &dir.path().join("run_2_0000.tif"),
+            &[vec![100, 200, 300, 400]],
+            2,
+            2,
+        );
+        write_test_tiff_i16(
+            &dir.path().join("run_2_0001.tif"),
+            &[vec![-2, 201, -3, 401]],
+            2,
+            2,
+        );
+
+        let options = TiffFolderOptions {
+            pixel_policy: PixelValuePolicy::ClipToZero,
+            ..Default::default()
+        };
+        let (arr, info) = load_tiff_folder_with_options(dir.path(), None, &options).unwrap();
+        assert_eq!(info.n_clipped_pixels, 3);
+        assert!(info.chunks_summed);
+        // Clipping applies per frame before summing: frame 0 pixel 1 is
+        // 0 + 200, frame 1 pixel 0 is 11 + 0.
+        assert_eq!(arr[[0, 0, 1]], 200.0);
+        assert_eq!(arr[[1, 0, 0]], 11.0);
+        assert_eq!(arr[[1, 1, 0]], 31.0);
+    }
+
     /// T1: two chunks with identical frame sequences sum element-wise.
     #[test]
     fn test_chunked_two_chunks_summed() {
@@ -1061,6 +1407,7 @@ mod tests {
                 n_chunks: 2,
                 chunk_ids: vec![764, 765],
                 chunks_summed: true,
+                n_clipped_pixels: 0,
             }
         );
     }
@@ -1072,7 +1419,10 @@ mod tests {
         write_chunk_files(dir.path(), "run", 764, 100, &[0, 1, 2, 3]);
         write_chunk_files(dir.path(), "run", 765, 200, &[0, 1, 2, 3]);
 
-        let options = TiffFolderOptions { sum_chunks: false };
+        let options = TiffFolderOptions {
+            sum_chunks: false,
+            ..Default::default()
+        };
         let (arr, info) = load_tiff_folder_with_options(dir.path(), None, &options).unwrap();
         assert_eq!(arr.shape(), &[8, 2, 2]);
         // Lexicographic: run_764_0000 .. run_764_0003, run_765_0000 ..
@@ -1097,7 +1447,8 @@ mod tests {
                 .map(|e| e.unwrap().path())
                 .collect();
             paths.sort();
-            load_frames_from_paths(&paths).unwrap()
+            let mut clipped = 0usize;
+            load_frames_from_paths(&paths, PixelValuePolicy::Reject, &mut clipped).unwrap()
         };
         assert_eq!(arr, legacy);
         assert_eq!(
@@ -1107,6 +1458,7 @@ mod tests {
                 n_chunks: 1,
                 chunk_ids: vec![764],
                 chunks_summed: false,
+                n_clipped_pixels: 0,
             }
         );
     }
