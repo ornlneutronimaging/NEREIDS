@@ -662,7 +662,10 @@ def calibrate_resolution(
     ``beta`` and storage fraction ``r``, folded with the SNS PSR channel
     triangle of FWHM ``psr_fwhm_ns`` (default 350 ns, the VENUS FTS header
     value; 0 disables; applies to "ic" only — tabulated/UDR kernels already
-    carry the fold). ``fit_psr=True`` ("ic" only) also fits the PSR FWHM as a
+    carry the fold). ``psr_fwhm_ns`` is NANOSECONDS: nonzero values above
+    10_000 ns (10 us) raise ``ValueError`` as a us-as-ns unit slip (kernel
+    synthesis cost is quadratic in the fold width, so e.g. 350 meaning us
+    would hang for hours). ``fit_psr=True`` ("ic" only) also fits the PSR FWHM as a
     5th parameter (box-bounded 0.05-1 us), started at ``psr_fwhm_ns`` — which
     must then be > 0 (a zero start contradicts "0 disables" and raises
     ``ValueError``). ``psr_fwhm_ns`` / ``fit_psr`` sit at the END of the

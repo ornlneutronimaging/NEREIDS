@@ -3009,6 +3009,27 @@ class TestCalibrateResolution:
                     psr_fwhm_ns=bad,
                 )
 
+    def test_absurd_pinned_psr_width_rejected(self):
+        # Review #645 round 2, F1: psr_fwhm_ns is NANOSECONDS (FTS convention
+        # 350 ns); kernel-synthesis cost is quadratic in the fold width, so a
+        # us-as-ns unit slip (350 meaning us -> 350_000 ns) previously passed
+        # the finite/sign check and became a multi-hour silent hang behind a
+        # fictitious 350 us fold. Nonzero widths above the 10_000 ns (10 us)
+        # ceiling must raise up front; the message names the ns unit and the
+        # 350-ns convention. (Boundary acceptance at exactly 10_000 ns is
+        # pinned Rust-side: rejects_absurd_pinned_psr_width.)
+        iso, e, t, unc = self._calibrant()
+        with pytest.raises(ValueError, match="NANOSECONDS.*350 ns"):
+            nereids.calibrate_resolution(
+                e,
+                t,
+                unc,
+                "ic",
+                isotopes=[(iso, 5.0e-4)],
+                temperature_k=300.0,
+                psr_fwhm_ns=350_000.0,
+            )
+
     def test_fit_psr_with_zero_width_rejected(self):
         # psr_fwhm_ns=0 is documented as "no PSR fold"; fit_psr=True would
         # silently clamp the 0 start into the [0.05, 1] us fit box. The

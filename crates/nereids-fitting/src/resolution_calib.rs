@@ -126,9 +126,25 @@ const PSR_FWHM_US_MIN: f64 = 0.05;
 /// Upper box bound (µs) on a fitted PSR FWHM: 1 µs is ~3× the physical SNS
 /// pulse base — anything larger is the moderator's job (α, β), not the burst.
 const PSR_FWHM_US_MAX: f64 = 1.0;
+/// Sanity ceiling (µs) on the configured PSR triangle FWHM: one decade above
+/// the [`PSR_FWHM_US_MAX`] fit bound. [`CalibrationConfig::psr_fwhm_ns`] is in
+/// NANOSECONDS (the VENUS FTS header convention: "folded triang FWHM 350 ns
+/// PSR"), and kernel-synthesis cost grows QUADRATICALLY with the fold width
+/// (the fold both refines the τ-step and widens the ± fold-reach margin):
+/// measured ~12 ms at 0.35 µs but ~1.3 s at 50 µs and ~28 s at 350 µs per
+/// single kernel-table synthesis at the default grid. A µs-as-ns unit slip
+/// (passing `350` meaning µs → interpreted as a 350 µs pin) would therefore
+/// turn a calibration into a multi-hour silent hang behind a physically
+/// fictitious fold. Any genuine width sits inside the fitted box; one decade
+/// of headroom keeps deliberate sensitivity studies possible while still
+/// catching the 1000× ns↔µs slip. `0.0` (fold disabled) is always accepted.
+/// `pub` for parity with the Python binding's mirrored validation.
+pub const PSR_FWHM_PIN_CEILING_US: f64 = 10.0 * PSR_FWHM_US_MAX;
 /// Nanoseconds → microseconds ([`CalibrationConfig::psr_fwhm_ns`] is in ns to
-/// match the FTS header convention; the kernel synthesis takes µs).
-const NS_TO_US: f64 = 1e-3;
+/// match the FTS header convention; the kernel synthesis takes µs). `pub` so
+/// the Python binding's mirrored [`PSR_FWHM_PIN_CEILING_US`] check converts
+/// with the identical factor.
+pub const NS_TO_US: f64 = 1e-3;
 /// A coordinate within this fraction of its box range of a bound is reported
 /// in [`CalibrationResult::bounds_hit`] as pinned.
 const BOUND_HIT_REL_TOL: f64 = 1e-3;
@@ -330,7 +346,9 @@ pub struct CalibrationConfig {
     /// structurally never re-folded here — applying it twice would
     /// double-count the burst. When the family is
     /// `IkedaCarpenter { fit_psr: true }` this value is the fit's starting
-    /// point instead of a pin.
+    /// point instead of a pin. Nonzero widths above
+    /// [`PSR_FWHM_PIN_CEILING_US`] (10 µs = 10 000 ns) are rejected as a
+    /// ns↔µs unit slip — see that constant for the quadratic-cost rationale.
     pub psr_fwhm_ns: f64,
     /// Fit the SAMMY TOF-zero `t0` (µs) as a SHARED energy-scale parameter.
     /// **Default `false`** — position is pinned at
@@ -780,6 +798,23 @@ pub fn calibrate_resolution(
         return Err(FittingError::InvalidConfig(format!(
             "psr_fwhm_ns must be finite and >= 0 (0 disables the PSR fold), got {}",
             config.psr_fwhm_ns
+        )));
+    }
+    // Sanity ceiling on the width itself (see PSR_FWHM_PIN_CEILING_US):
+    // psr_fwhm_ns is NANOSECONDS and synthesis cost is quadratic in the fold
+    // width, so a µs-as-ns unit slip pins a fictitious multi-hundred-µs fold
+    // that hangs the calibration for hours. Reject loudly, up front, for
+    // every family (inert outside IC, same rationale as the checks above).
+    if config.psr_fwhm_ns * NS_TO_US > PSR_FWHM_PIN_CEILING_US {
+        return Err(FittingError::InvalidConfig(format!(
+            "psr_fwhm_ns = {} ns (= {} µs) exceeds the {PSR_FWHM_PIN_CEILING_US} µs sanity \
+             ceiling (10x the {PSR_FWHM_US_MAX} µs fit bound). psr_fwhm_ns is in NANOSECONDS \
+             — the SNS/VENUS FTS convention is 350 ns — and kernel-synthesis cost grows \
+             quadratically with the fold width, so a µs-as-ns unit slip would hang the \
+             calibration behind a fictitious fold. Pass the width in ns, or 0 to disable \
+             the PSR fold",
+            config.psr_fwhm_ns,
+            config.psr_fwhm_ns * NS_TO_US
         )));
     }
     // fit_psr fits the PSR FWHM from the psr_fwhm_ns starting value, but 0 is
@@ -2189,6 +2224,70 @@ mod tests {
                     Err(FittingError::InvalidConfig(_))
                 ),
                 "psr_fwhm_ns={bad} should be rejected"
+            );
+        }
+    }
+
+    #[test]
+    fn rejects_absurd_pinned_psr_width() {
+        // Review #645 round 2, F1: psr_fwhm_ns is NANOSECONDS (FTS convention
+        // 350 ns) and synthesis cost is quadratic in the fold width — a
+        // µs-as-ns unit slip (350 meaning µs → 350_000 ns) previously passed
+        // the finite/sign check and pinned a fictitious 350 µs fold: a
+        // multi-hour silent hang. Widths above PSR_FWHM_PIN_CEILING_US
+        // (10 µs = 10_000 ns) must be a loud up-front config error.
+        let iso = synthetic_isotope(72, 178, 20.0, 0.05, 0.06);
+        let sample = SampleParams::new(300.0, vec![(iso, 2.0e-3)]).unwrap();
+        let e: Vec<f64> = (0..60).map(|i| 15.0 + i as f64 * 0.2).collect();
+        let d = vec![0.9; 60];
+        let u = vec![0.01; 60];
+        let cfg = CalibrationConfig {
+            psr_fwhm_ns: 350_000.0, // "350 µs" unit slip
+            ..Default::default()
+        };
+        let err = calibrate_resolution(
+            ResolutionFamily::IkedaCarpenter { fit_psr: false },
+            &e,
+            &d,
+            &u,
+            &sample,
+            &cfg,
+        )
+        .expect_err("a 350_000 ns (350 µs) pinned PSR width must be rejected");
+        assert!(
+            matches!(
+                &err,
+                FittingError::InvalidConfig(msg)
+                    if msg.contains("NANOSECONDS") && msg.contains("350 ns")
+            ),
+            "ceiling error must name the ns unit and the 350-ns convention, got {err:?}"
+        );
+
+        // Boundary + normal pins stay valid: exactly 10_000 ns sits ON the
+        // ceiling (rejection is strict `>`; 10_000·1e-3 rounds to exactly
+        // 10.0) and 350 ns is the FTS default. psr_fwhm_ns = 0 (disable) is
+        // pinned valid by rejects_fit_psr_with_zero_psr_width. Tiny
+        // grid/iteration budget: these arms assert config validity, not fit
+        // quality.
+        for ok_ns in [350.0, 10_000.0] {
+            let cheap = CalibrationConfig {
+                psr_fwhm_ns: ok_ns,
+                ic_n_energies: 8,
+                ic_n_tau: 32,
+                max_iter: 10,
+                ..Default::default()
+            };
+            assert!(
+                calibrate_resolution(
+                    ResolutionFamily::IkedaCarpenter { fit_psr: false },
+                    &e,
+                    &d,
+                    &u,
+                    &sample,
+                    &cheap,
+                )
+                .is_ok(),
+                "psr_fwhm_ns = {ok_ns} ns must remain a valid pinned width"
             );
         }
     }

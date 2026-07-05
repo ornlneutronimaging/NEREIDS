@@ -50,8 +50,8 @@ use nereids_endf::resonance::{
 };
 use nereids_endf::retrieval::{EndfLibrary, EndfRetriever, mat_number};
 use nereids_fitting::resolution_calib::{
-    CalibrationConfig, DEFAULT_PSR_FWHM_NS, ResolutionFamily, UDR_S0_MAX, UDR_S0_MIN,
-    calibrate_resolution as rust_calibrate_resolution,
+    CalibrationConfig, DEFAULT_PSR_FWHM_NS, NS_TO_US, PSR_FWHM_PIN_CEILING_US, ResolutionFamily,
+    UDR_S0_MAX, UDR_S0_MIN, calibrate_resolution as rust_calibrate_resolution,
 };
 use nereids_io::normalization::{self as norm, NormalizationParams};
 use nereids_io::tof::BeamlineParams;
@@ -1320,7 +1320,9 @@ impl PyResolutionCalibration {
 ///     psr_fwhm_ns: SNS PSR channel-triangle FWHM in ns, folded into the
 ///         ``"ic"`` family's kernel only (default 350 — the VENUS FTS header
 ///         value; ``0`` disables). Tabulated/UDR kernels already carry the
-///         fold in the file and are never re-folded.
+///         fold in the file and are never re-folded. NANOSECONDS: values
+///         above 10_000 ns (10 µs) are rejected as a µs-as-ns unit slip
+///         (synthesis cost is quadratic in the fold width).
 ///     fit_psr: also FIT the PSR FWHM (``"ic"`` only; appends a 5th
 ///         parameter, box-bounded 0.05–1 µs, started at ``psr_fwhm_ns`` —
 ///         which must then be > 0: a zero start contradicts "0 disables").
@@ -1472,6 +1474,21 @@ fn calibrate_resolution(
         if !psr_fwhm_ns.is_finite() || psr_fwhm_ns < 0.0 {
             return Err(pyo3::exceptions::PyValueError::new_err(format!(
                 "psr_fwhm_ns must be finite and >= 0 (0 disables the PSR fold), got {psr_fwhm_ns}"
+            )));
+        }
+        // Sanity ceiling (mirrors the Rust calibrator; see
+        // PSR_FWHM_PIN_CEILING_US): psr_fwhm_ns is NANOSECONDS and kernel-
+        // synthesis cost is quadratic in the fold width, so a µs-as-ns unit
+        // slip (350 meaning µs) would hang the calibration for hours behind
+        // a fictitious fold. Reject with the precise Python-facing message.
+        if psr_fwhm_ns * NS_TO_US > PSR_FWHM_PIN_CEILING_US {
+            return Err(pyo3::exceptions::PyValueError::new_err(format!(
+                "psr_fwhm_ns={psr_fwhm_ns} ns (= {} us) exceeds the {PSR_FWHM_PIN_CEILING_US} \
+                 us sanity ceiling: psr_fwhm_ns is in NANOSECONDS (the SNS/VENUS FTS \
+                 convention is 350 ns) and kernel-synthesis cost grows quadratically with \
+                 the fold width, so a us-as-ns unit slip would hang the calibration. Pass \
+                 the width in ns, or 0 to disable the PSR fold",
+                psr_fwhm_ns * NS_TO_US
             )));
         }
         // fit_psr fits the PSR FWHM from the psr_fwhm_ns starting value, but 0
