@@ -48,4 +48,11 @@ pub enum IoError {
     /// HDF5 format or access error.
     #[error("HDF5 error: {0}")]
     Hdf5Error(String),
+
+    /// Chunked TIFF folder is internally inconsistent (ragged chunks or
+    /// duplicate (chunk, frame) pairs).  Summing across inconsistent chunks
+    /// would silently corrupt counts, so this is a hard error — never a
+    /// partial sum, never a silent fallback to plain stacking.
+    #[error("Inconsistent DAQ chunks in directory {directory}: {details}")]
+    ChunkMismatch { directory: String, details: String },
 }
