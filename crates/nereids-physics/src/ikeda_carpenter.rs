@@ -158,10 +158,16 @@ pub const DEFAULT_N_TAU: usize = 600;
 /// check.
 const MIN_N_TAU: usize = 8;
 
-/// Minimum nonzero samples per side of a sampled channel triangle
-/// (`dtau ≤ FWHM / 3`, half-base = FWHM). Below this the discrete triangle
-/// degenerates toward an exact delta `[0, 1, 0]` and a requested fold would
-/// silently vanish from the kernel — [`tau_geometry`] rejects that instead.
+/// Minimum samples per side SPANNING a sampled channel triangle
+/// (`dtau ≤ FWHM / 3`, half-base = FWHM). At the exactly-admitted boundary
+/// `dtau = FWHM/3` the per-side samples sit at `{FWHM/3, 2FWHM/3, FWHM}` —
+/// triangle weights `{2/3, 1/3, 0}` — so each side carries ≥ 2 strictly
+/// interior (nonzero) samples while the endpoint lands ON the triangle
+/// zero; the sampled fold is distinctly non-delta (discrete variance
+/// 4·FWHM²/27 ≈ 89 % of the analytic FWHM²/6). Coarser steps degenerate
+/// the discrete triangle toward the exact delta `[0, 1, 0]`, silently
+/// erasing a requested fold — [`tau_geometry`] rejects that instead
+/// (strictly: `capped_step > FWHM/3`).
 const TRI_MIN_SAMPLES_PER_SIDE: f64 = 3.0;
 
 /// Reach of the sampled/folded Gaussian burst in standard deviations (±4σ:
@@ -182,7 +188,17 @@ const FAST_REACH_E_FOLDS: f64 = 18.0;
 const SLOW_REACH_E_FOLDS: f64 = 16.0;
 
 /// Storage fractions below this are treated as "no storage tail" when sizing
-/// the τ-grid (the slow term's weight is far below [`TRIM_REL`]).
+/// the τ-grid. DELIBERATELY two decades below [`TRIM_REL`], not derived from
+/// it: whether a slow tail actually survives the [`TRIM_REL`] trim depends on
+/// the α/β contrast (the trim threshold is relative to the prompt-dominated
+/// peak, and the slow term's peak weight scales with both R and β/α), so no
+/// single constant derived from [`TRIM_REL`] is exact for every admitted
+/// (α, β) — treating a larger R as absent would be a hidden approximation.
+/// The margin's only consequence is conservatism: for R ∈ (1e-9, ~1e-7) the
+/// τ-grid is sized — and the [`MAX_TAU_SAMPLES`] cap gate applied — for a
+/// slow tail whose weight the trim then discards anyway, spending samples
+/// (or rejecting a configuration) for physics that cannot appear in the
+/// kernel. It can never drop tail weight the trim would have kept.
 const R_NEGLIGIBLE: f64 = 1e-9;
 
 /// Cap on the τ-sample count spanning the PULSE BODY (`[0, τ_max]`) of one
@@ -533,9 +549,9 @@ impl IkedaCarpenter {
     /// Returns [`ResolutionParseError::InvalidFormat`] when the τ-grid cannot
     /// resolve the prompt core and requested folds within [`MAX_TAU_SAMPLES`]
     /// at this energy. Construction validates every *reference* energy, but a
-    /// probe energy outside `[e_min, e_max]` (a smaller α(E), hence a finer
-    /// prompt floor against the same storage-tail span) can still leave the
-    /// resolvable region.
+    /// probe energy outside `[e_min, e_max]` — for the √E law, above `e_max`,
+    /// where the larger α(E) imposes a finer prompt resolution floor against
+    /// the same storage-tail span — can still leave the resolvable region.
     pub fn kernel_at(&self, energy_ev: f64) -> Result<(Vec<f64>, Vec<f64>), ResolutionParseError> {
         synth_kernel(&self.params, self.n_tau, energy_ev)
     }
@@ -1266,6 +1282,74 @@ mod tests {
             dv > 0.5 * expected,
             "fold variance increment {dv} µs² vs analytic {expected} µs²: \
              the requested fold (nearly) vanished"
+        );
+    }
+
+    #[test]
+    fn boundary_step_fwhm_over_3_is_admitted_and_fold_survives() {
+        // Review #645 round 2, F3: pin the exactly-admitted boundary
+        // `dtau = FWHM/3` (rejection is STRICT: `capped_step > floor`). Per
+        // the TRI_MIN_SAMPLES_PER_SIDE doc, each triangle side then samples
+        // at {FWHM/3, 2FWHM/3, FWHM} — weights {2/3, 1/3, 0}: exactly 2
+        // strictly interior nonzero samples, endpoint ON the triangle zero —
+        // and the fold stays effective (non-delta, second moment ≈ 4FWHM²/27).
+        //
+        // Route to the boundary: n_tau = MIN_N_TAU = 8 with α = 1 gives a
+        // prompt design step 18/7 ≈ 2.57 µs, far coarser than FWHM/3 for a
+        // 1 µs triangle, so the fold refinement pins dtau to exactly
+        // `fwhm / TRI_MIN_SAMPLES_PER_SIDE`. R = 0 keeps the cap inert
+        // (capped step 18/8191 ≪ floor).
+        let fwhm = 1.0;
+        let p = IkedaCarpenterParams {
+            channel_fwhm_us: Some(fwhm),
+            ..IkedaCarpenterParams::constant(1.0, 0.1, 0.0)
+        };
+        let (offs, _) = synth_kernel(&p, MIN_N_TAU, 10.0)
+            .expect("the dtau = FWHM/3 boundary must be admitted, not rejected");
+        let dtau = offs[1] - offs[0];
+        let boundary = fwhm / TRI_MIN_SAMPLES_PER_SIDE;
+        assert!(
+            (dtau - boundary).abs() < 1e-12,
+            "step {dtau} µs is not the FWHM/3 boundary {boundary} µs"
+        );
+
+        // The sampled triangle at the boundary: ≥ 7 samples, exactly 2
+        // strictly interior nonzero per side, center far below the delta's 1.
+        let tri = triangle_kernel(dtau, fwhm);
+        assert!(tri.len() >= 7, "boundary triangle too short: {}", tri.len());
+        let per_side = tri
+            .iter()
+            .take(tri.len() / 2)
+            .filter(|&&v| v > 1e-9)
+            .count();
+        assert_eq!(
+            per_side, 2,
+            "boundary triangle must keep 2 strictly interior nonzero samples \
+             per side: {tri:?}"
+        );
+        let center = tri[tri.len() / 2];
+        assert!(
+            center < 0.5,
+            "center weight {center} — boundary triangle degenerated toward a delta"
+        );
+
+        // Fold effectiveness: the discrete triangle's variance is 4·FWHM²/27
+        // (samples {0, ±FWHM/3, ±2FWHM/3} with weights ∝ {1, 2/3, 1/3}),
+        // ≈ 89 % of the analytic FWHM²/6 — the fold physics survives the
+        // 2-interior-sample discretization.
+        let tri_offs: Vec<f64> = (0..tri.len())
+            .map(|i| (i as f64 - (tri.len() / 2) as f64) * dtau)
+            .collect();
+        let v = kernel_variance(&tri_offs, &tri);
+        let want = 4.0 * fwhm * fwhm / 27.0;
+        assert!(
+            ((v - want) / want).abs() < 0.02,
+            "boundary triangle variance {v} µs² vs discrete analytic {want} µs²"
+        );
+        assert!(
+            v > 0.5 * (fwhm * fwhm / 6.0),
+            "boundary fold variance {v} µs² collapsed below half the \
+             continuous FWHM²/6 — fold (nearly) vanished"
         );
     }
 
