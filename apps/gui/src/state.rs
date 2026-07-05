@@ -1348,7 +1348,8 @@ impl AppState {
     /// previous detection is never kept (it may be stale for the current
     /// open beam).  A declared mask whose dimensions differ from the
     /// detected mask cannot apply to the data being normalized (e.g. a
-    /// mask persisted before a rebin) and is ignored.
+    /// project's saved mask from a different detector or ROI-cropped
+    /// geometry than the data now loaded) and is ignored.
     pub fn set_detected_dead_pixels(&mut self, detected: Option<Array2<bool>>) {
         self.dead_pixels = match (self.file_dead_pixels.clone(), detected) {
             (Some(mut declared), Some(det)) if declared.dim() == det.dim() => {
@@ -1754,8 +1755,8 @@ mod tests {
     }
 
     /// A declared mask of a different detector size cannot apply to the
-    /// data being normalized (e.g. persisted before a rebin) — detected
-    /// mask only.
+    /// data being normalized (e.g. a project's saved mask from a
+    /// different detector or ROI-cropped geometry) — detected mask only.
     #[test]
     fn test_set_detected_dead_pixels_dim_mismatch_uses_detected() {
         let mut state = AppState {
