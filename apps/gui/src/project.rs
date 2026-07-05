@@ -1093,6 +1093,12 @@ fn state_from_snapshot(snap: ProjectSnapshot, state: &mut AppState, path: &Path)
             // Snapshots don't persist the energy-scale flight path yet; the
             // overlay accessor treats `None` as "energy scale not fitted".
             energy_scale_flight_path_m: None,
+            // Baseline outputs (#635) are not persisted in project files —
+            // None/empty on restore; re-running the fit regenerates them.
+            baseline_global: None,
+            baseline_e_ref_ev: None,
+            baseline_maps: None,
+            warnings: Vec::new(),
             n_converged: snap.n_converged.unwrap_or(0),
             n_total: snap.n_total.unwrap_or(0),
             n_failed: snap.n_failed.unwrap_or(0),

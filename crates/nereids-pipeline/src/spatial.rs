@@ -3,7 +3,7 @@
 //! Applies the single-spectrum fitting pipeline across all pixels in
 //! a hyperspectral neutron imaging dataset to produce 2D composition maps.
 
-use ndarray::{Array2, ArrayView3, s};
+use ndarray::{Array2, Array3, ArrayView3, s};
 use rayon::prelude::*;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
@@ -114,6 +114,30 @@ pub struct SpatialResult {
     /// setting is edited afterwards (issue #634 review).  `Some` when
     /// `config.fit_energy_scale` is true; `None` otherwise.
     pub energy_scale_flight_path_m: Option<f64>,
+    /// Global multiplicative-baseline coefficients `[b0, b1, b2]` (issue
+    /// #635).  `Some` when a baseline was configured with
+    /// `spatial_global = true`: stage 1 fits the baseline ONCE on the
+    /// aggregated mean spectrum, then freezes it for every pixel (per-pixel
+    /// baselines at low counts biased fitted temperatures by up to +150 K;
+    /// the global mode removed ~80 % of that).  `None` when no baseline was
+    /// configured or in per-pixel mode (see [`Self::baseline_maps`]).
+    pub baseline_global: Option<[f64; 3]>,
+    /// Reference energy `E_ref` (eV) of the baseline's centered
+    /// `ln(E/E_ref)` basis — the geometric midpoint `√(E_min·E_max)` of the
+    /// fit grid, stored so consumers reconstruct `B(E)` with the exact
+    /// reference the fit used.  `Some` whenever a baseline was configured
+    /// (global or per-pixel mode).
+    pub baseline_e_ref_ev: Option<f64>,
+    /// Per-pixel multiplicative-baseline coefficient maps `[b0, b1, b2]`.
+    /// `Some` when a baseline was configured with `spatial_global = false`
+    /// (each pixel fits its own baseline); `None` in global mode.
+    /// NaN at pixels where `converged_map` is `false`.
+    pub baseline_maps: Option<[Array2<f64>; 3]>,
+    /// Structured fit-configuration warnings (issue #635) — currently the
+    /// degenerate normalization trio (free `Anorm` + free temperature +
+    /// ≥1 free density).  Mirrors `SpectrumFitResult::warnings`; also
+    /// printed once to stderr since spatial runs are long.
+    pub warnings: Vec<String>,
     /// Number of pixels that converged.
     pub n_converged: usize,
     /// Total number of pixels fitted.
@@ -127,8 +151,9 @@ pub struct SpatialResult {
 // ── Phase 3: InputData3D + spatial_map_typed ─────────────────────────────
 
 use crate::pipeline::{
-    InputData, SolverConfig, UnifiedFitConfig, count_free_params, fit_spectrum_typed,
-    required_active_bins, validate_transmission_background,
+    InputData, MultiplicativeBaselineConfig, SolverConfig, UnifiedFitConfig, count_free_params,
+    degenerate_normalization_warning, fit_spectrum_typed, required_active_bins,
+    validate_multiplicative_baseline, validate_transmission_background,
 };
 
 /// 3D input data for spatial mapping.
@@ -325,6 +350,13 @@ fn validate_spatial_fit_preflight(
         }
     }
 
+    // Gate: multiplicative-baseline config errors (issue #635) fire
+    // identically for every pixel (inits/bounds/positivity are grid+config
+    // properties, and the free-Anorm degeneracy is a config property) —
+    // hoist them so the caller gets one clear error instead of an all-NaN
+    // map with n_failed == n_total.
+    validate_multiplicative_baseline(config)?;
+
     // ── Counts-KL (joint-Poisson) whole-config gates ────────────────
     // Every gate below mirrors a per-pixel rejection in
     // `pipeline.rs::fit_counts_joint_poisson`.  All fire identically
@@ -370,6 +402,118 @@ fn validate_spatial_fit_preflight(
     }
 
     Ok(())
+}
+
+/// Stage 1 of the two-stage global multiplicative baseline (issue #635):
+/// fit the FULL configured model (density / temperature / background /
+/// baseline) once on the **aggregated mean spectrum** over all live pixels,
+/// and return the fitted `[b0, b1, b2]` for stage 2 to freeze per-pixel.
+///
+/// Aggregation conventions (must mirror the per-pixel dispatch):
+/// - **Transmission**: per-bin mean transmission over live pixels, with the
+///   standard error of the mean `√(Σσ²)/n` as the aggregated 1-σ.
+/// - **Counts**: per-bin mean sample counts, paired against the SAME
+///   spatially-averaged open-beam flux the per-pixel KL dispatch uses
+///   (`averaged_flux`); routed as `CountsWithNuisance` + zero background
+///   for the KL solver exactly like the rayon closure.  Mean counts are
+///   non-integer, which the binomial deviance handles exactly.
+/// - **CountsWithNuisance**: per-bin means of all three caller cubes.
+///
+/// Non-convergence is a HARD error by design: silently falling back to
+/// per-pixel baselines would reintroduce the +150 K low-count temperature
+/// bias the global mode exists to remove.
+#[allow(clippy::too_many_arguments)]
+fn fit_global_baseline_stage1(
+    input: &InputData3D<'_>,
+    fast_config: &UnifiedFitConfig,
+    data_a: &Array3<f64>,
+    data_b: &Array3<f64>,
+    data_c: Option<&Array3<f64>>,
+    pixel_coords: &[(usize, usize)],
+    averaged_flux: Option<&[f64]>,
+) -> Result<[f64; 3], PipelineError> {
+    let n_e = data_a.shape()[2];
+    let n_live = pixel_coords.len() as f64;
+    let mean_over = |cube: &Array3<f64>| -> Vec<f64> {
+        let mut m = vec![0.0f64; n_e];
+        for &(y, x) in pixel_coords {
+            for (e, &v) in cube.slice(s![y, x, ..]).iter().enumerate() {
+                m[e] += v;
+            }
+        }
+        for v in &mut m {
+            *v /= n_live;
+        }
+        m
+    };
+
+    let aggregate = match input {
+        InputData3D::Transmission { .. } => {
+            let mean_t = mean_over(data_a);
+            // Standard error of the mean under independent per-pixel σ.
+            let mut se = vec![0.0f64; n_e];
+            for &(y, x) in pixel_coords {
+                for (e, &sig) in data_b.slice(s![y, x, ..]).iter().enumerate() {
+                    se[e] += sig * sig;
+                }
+            }
+            for v in &mut se {
+                *v = v.sqrt() / n_live;
+            }
+            InputData::Transmission {
+                transmission: mean_t,
+                uncertainty: se,
+            }
+        }
+        InputData3D::Counts { .. } => {
+            let mean_s = mean_over(data_a);
+            let flux = averaged_flux
+                .expect("averaged_flux is Some for InputData3D::Counts")
+                .to_vec();
+            // Mirror the per-pixel dispatch: KL → CountsWithNuisance with
+            // the averaged flux + zero background; LM → raw Counts.
+            let effective = fast_config.effective_solver(&InputData::Counts {
+                sample_counts: mean_s.clone(),
+                open_beam_counts: flux.clone(),
+            });
+            match effective {
+                SolverConfig::PoissonKL(_) => InputData::CountsWithNuisance {
+                    sample_counts: mean_s,
+                    flux,
+                    background: vec![0.0f64; n_e],
+                },
+                _ => InputData::Counts {
+                    sample_counts: mean_s,
+                    open_beam_counts: flux,
+                },
+            }
+        }
+        InputData3D::CountsWithNuisance { .. } => InputData::CountsWithNuisance {
+            sample_counts: mean_over(data_a),
+            flux: mean_over(data_b),
+            background: mean_over(data_c.expect("CountsWithNuisance carries a background cube")),
+        },
+    };
+
+    let agg = fit_spectrum_typed(&aggregate, fast_config).map_err(|e| {
+        PipelineError::InvalidParameter(format!(
+            "multiplicative-baseline stage 1 (global fit on the aggregated \
+             mean spectrum) failed: {e}"
+        ))
+    })?;
+    if !agg.converged {
+        return Err(PipelineError::InvalidParameter(
+            "multiplicative-baseline stage 1 did not converge on the \
+             aggregated mean spectrum; refusing to fall back to per-pixel \
+             baselines (at low counts they biased fitted temperatures by up \
+             to +150 K). Check the baseline bounds/inits, or set \
+             spatial_global = false to fit per-pixel baselines explicitly."
+                .into(),
+        ));
+    }
+    Ok(agg
+        .baseline
+        .expect("stage 1 ran with a configured baseline, so the result carries it"))
 }
 
 /// Validity domain for an up-front detector-cube value check.
@@ -863,6 +1007,16 @@ pub fn spatial_map_typed(
     let dispatches_to_counts_kl =
         input.is_counts() && !matches!(config.solver(), SolverConfig::LevenbergMarquardt(_));
 
+    // Issue #635: baseline output shape.  Global mode → scalar
+    // `baseline_global`; per-pixel mode → `baseline_maps`.
+    let baseline_global_mode = config
+        .multiplicative_baseline()
+        .is_some_and(|bl| bl.spatial_global);
+    let has_baseline_maps = config.multiplicative_baseline().is_some() && !baseline_global_mode;
+    let baseline_e_ref_ev = config
+        .multiplicative_baseline()
+        .map(|_| nereids_fitting::transmission_model::baseline_reference_energy(config.energies()));
+
     if cancel.is_some_and(|c| c.load(Ordering::Relaxed)) {
         return Err(PipelineError::Cancelled);
     }
@@ -933,6 +1087,22 @@ pub fn spatial_map_typed(
                 None
             },
             energy_scale_flight_path_m: config.fit_energy_scale().then(|| config.flight_path_m()),
+            // No live pixels → stage 1 never ran; report the baseline as
+            // absent rather than echoing unfitted inits.
+            baseline_global: None,
+            baseline_e_ref_ev,
+            baseline_maps: if has_baseline_maps {
+                Some([
+                    Array2::from_elem((height, width), f64::NAN),
+                    Array2::from_elem((height, width), f64::NAN),
+                    Array2::from_elem((height, width), f64::NAN),
+                ])
+            } else {
+                None
+            },
+            warnings: degenerate_normalization_warning(config)
+                .into_iter()
+                .collect(),
             n_converged: 0,
             n_total: 0,
             n_failed: 0,
@@ -1488,6 +1658,57 @@ pub fn spatial_map_typed(
         Vec::new()
     };
 
+    // ── Issue #635: two-stage global multiplicative baseline ──
+    //
+    // Surface the degenerate-normalization warning once, up front (spatial
+    // runs are long; a warning buried after the rayon loop is useless), and
+    // carry it on the result for GUI / Python consumers.
+    let warnings: Vec<String> = degenerate_normalization_warning(config)
+        .into_iter()
+        .inspect(|w| eprintln!("spatial_map_typed: warning: {w}"))
+        .collect();
+
+    // Stage 1 (global mode): fit the baseline ONCE on the aggregated mean
+    // spectrum, then FREEZE it into the per-pixel config (the same
+    // fixed-parameter substrate as frozen densities).  Non-convergence is a
+    // HARD error: silently falling back to per-pixel baselines would
+    // reintroduce the +150 K low-count temperature bias the global mode
+    // exists to remove.
+    let (fast_config, baseline_global) = match fast_config.multiplicative_baseline().cloned() {
+        Some(bl) if bl.spatial_global => {
+            let b_global = if bl.fit_b0 || bl.fit_b1 || bl.fit_b2 {
+                fit_global_baseline_stage1(
+                    input,
+                    &fast_config,
+                    &data_a,
+                    &data_b,
+                    data_c.as_ref(),
+                    &pixel_coords,
+                    averaged_flux.as_deref(),
+                )?
+            } else {
+                // Caller froze every coefficient — stage 1 has nothing to
+                // fit; the frozen inits ARE the global baseline.
+                [bl.b0_init, bl.b1_init, bl.b2_init]
+            };
+            let frozen = MultiplicativeBaselineConfig {
+                b0_init: b_global[0],
+                b1_init: b_global[1],
+                b2_init: b_global[2],
+                fit_b0: false,
+                fit_b1: false,
+                fit_b2: false,
+                ..bl
+            };
+            (
+                fast_config.with_multiplicative_baseline(frozen),
+                Some(b_global),
+            )
+        }
+        // Per-pixel mode (or no baseline): pass the config through.
+        _ => (fast_config, None),
+    };
+
     // Fit all pixels in parallel
     let failed_count = AtomicUsize::new(0);
     let results: Vec<((usize, usize), SpectrumFitResult)> = pixel_coords
@@ -1636,6 +1857,15 @@ pub fn spatial_map_typed(
     } else {
         None
     };
+    let mut baseline_maps: Option<[Array2<f64>; 3]> = if has_baseline_maps {
+        Some([
+            Array2::from_elem((height, width), f64::NAN),
+            Array2::from_elem((height, width), f64::NAN),
+            Array2::from_elem((height, width), f64::NAN),
+        ])
+    } else {
+        None
+    };
     let mut n_converged = 0;
     let mut temperature_map: Option<Array2<f64>> = if config.fit_temperature() {
         Some(Array2::from_elem((height, width), f64::NAN))
@@ -1728,6 +1958,13 @@ pub fn spatial_map_typed(
         if let (Some(map), Some(v)) = (&mut l_scale_map, result.l_scale) {
             map[[*y, *x]] = v;
         }
+        // Per-pixel baseline mode (issue #635): each converged pixel
+        // carries its own fitted coefficients.
+        if let (Some(maps), Some(b)) = (&mut baseline_maps, result.baseline) {
+            maps[0][[*y, *x]] = b[0];
+            maps[1][[*y, *x]] = b[1];
+            maps[2][[*y, *x]] = b[2];
+        }
     }
 
     Ok(SpatialResult {
@@ -1746,6 +1983,10 @@ pub fn spatial_map_typed(
         t0_us_map,
         l_scale_map,
         energy_scale_flight_path_m: config.fit_energy_scale().then(|| config.flight_path_m()),
+        baseline_global,
+        baseline_e_ref_ev,
+        baseline_maps,
+        warnings,
         n_converged,
         n_total: pixel_coords.len(),
         n_failed: failed_count.load(Ordering::Relaxed),
@@ -4587,6 +4828,320 @@ mod tests {
         assert!(
             err.to_string().contains("averaged open-beam flux"),
             "error must name the averaged-flux overflow, got: {err}"
+        );
+    }
+
+    // ── Issue #635: spatial multiplicative-baseline tests ────────────────
+
+    /// Truth baseline for the spatial closed loops (shared with the
+    /// pipeline-level tests): a few % off unity, curved, strictly positive
+    /// on the test grids, inside the DEFAULT bounds.
+    const SPATIAL_BL_TRUE: [f64; 3] = [1.02, -0.03, 0.01];
+
+    fn spatial_baseline_at(e: f64, e_ref: f64) -> f64 {
+        let z = (e / e_ref).ln();
+        SPATIAL_BL_TRUE[0] + SPATIAL_BL_TRUE[1] * z + SPATIAL_BL_TRUE[2] * z * z
+    }
+
+    /// Low-count 3x3 thermometry cube: counts follow
+    /// `lambda(e) = i0 * B(e) * T_600K(e)` with deterministic ~1-sigma
+    /// pseudo-Poisson noise (no rand dep; `round(lambda + sqrt(lambda)*g)`
+    /// with a sin-hash g).  This is the regime where PER-PIXEL baselines
+    /// biased fitted temperatures on real data and the global mode fixed it.
+    fn baseline_thermometry_cube(
+        energies: &[f64],
+        true_density: f64,
+        true_temp: f64,
+        i0: f64,
+    ) -> (Array3<f64>, Array3<f64>) {
+        let data = u238_single_resonance();
+        let xs = nereids_physics::transmission::broadened_cross_sections(
+            energies,
+            std::slice::from_ref(&data),
+            true_temp,
+            None,
+            None,
+        )
+        .unwrap();
+        let model = PrecomputedTransmissionModel {
+            cross_sections: Arc::new(xs),
+            density_indices: Arc::new(vec![0]),
+            energies: None,
+            instrument: None,
+            resolution_plan: None,
+            sparse_cubature_plan: None,
+            sparse_scalar_plan: None,
+            work_layout: None,
+        };
+        let t_1d = model.evaluate(&[true_density]).unwrap();
+        let e_ref = nereids_fitting::transmission_model::baseline_reference_energy(energies);
+        let n_e = energies.len();
+        let mut sample = Array3::zeros((n_e, 3, 3));
+        let mut ob = Array3::zeros((n_e, 3, 3));
+        for y in 0..3 {
+            for x in 0..3 {
+                for (i, (&t, &e)) in t_1d.iter().zip(energies.iter()).enumerate() {
+                    let lam = i0 * spatial_baseline_at(e, e_ref) * t;
+                    // Deterministic ~1-sigma pseudo-noise.
+                    let g = (1.7 * (i as f64) + 7.9 * (y as f64) + 13.3 * (x as f64)).sin();
+                    sample[[i, y, x]] = (lam + lam.sqrt() * g).round().max(0.0);
+                    ob[[i, y, x]] = i0;
+                }
+            }
+        }
+        (sample, ob)
+    }
+
+    #[test]
+    fn spatial_global_baseline_recovers_truth_and_beats_unmodeled_control() {
+        let true_density = 0.002;
+        let true_temp = 600.0;
+        let energies: Vec<f64> = (0..201).map(|i| 1.0 + (i as f64) * 0.05).collect();
+        let (sample, ob) = baseline_thermometry_cube(&energies, true_density, true_temp, 400.0);
+
+        // The production thermometry pattern: counts-KL, density frozen at
+        // the known areal density, temperature free (seeded 100 K low).
+        let base_config = UnifiedFitConfig::new(
+            energies.clone(),
+            vec![u238_single_resonance()],
+            vec!["U-238".into()],
+            500.0,
+            None,
+            vec![true_density],
+        )
+        .unwrap()
+        .with_solver(SolverConfig::PoissonKL(PoissonConfig::default()))
+        .with_fit_temperature(true)
+        .with_fix_densities(true);
+
+        let input = InputData3D::Counts {
+            sample_counts: sample.view(),
+            open_beam_counts: ob.view(),
+        };
+
+        // ── Global-baseline run ──
+        let with_bl = base_config
+            .clone()
+            .with_multiplicative_baseline(crate::pipeline::MultiplicativeBaselineConfig::default());
+        let r = spatial_map_typed(&input, &with_bl, None, None, None).unwrap();
+        assert_eq!(r.n_converged, 9, "all 9 pixels converge in global mode");
+        assert!(
+            r.warnings.is_empty(),
+            "no degenerate trio here: {:?}",
+            r.warnings
+        );
+        assert!(
+            r.baseline_maps.is_none(),
+            "global mode reports a scalar baseline, not maps"
+        );
+
+        // Stage-1 recovery of the injected baseline (probe run measured
+        // |error| <= 2e-4 per coefficient at this noise level; 0.01 leaves
+        // a 50x margin without admitting a shape-blind fit).
+        let bg = r.baseline_global.expect("global baseline populated");
+        for (i, (&fitted, &truth)) in bg.iter().zip(SPATIAL_BL_TRUE.iter()).enumerate() {
+            assert!(
+                (fitted - truth).abs() < 0.01,
+                "baseline_global[{i}] = {fitted} vs truth {truth}"
+            );
+        }
+        let e_ref_expected =
+            nereids_fitting::transmission_model::baseline_reference_energy(&energies);
+        let e_ref = r.baseline_e_ref_ev.expect("E_ref reported");
+        assert!(
+            (e_ref - e_ref_expected).abs() < 1e-12,
+            "E_ref {e_ref} != geometric midpoint {e_ref_expected}"
+        );
+
+        // Temperature recovery through the frozen per-pixel baseline
+        // (probe: median 603.9 at ~1-sigma pseudo-noise, i0 = 400).
+        let t_map = r.temperature_map.as_ref().unwrap();
+        let mut temps: Vec<f64> = t_map.iter().copied().filter(|v| v.is_finite()).collect();
+        temps.sort_by(|a, b| a.partial_cmp(b).unwrap());
+        let median_t = temps[temps.len() / 2];
+        assert!(
+            (median_t - true_temp).abs() < 15.0,
+            "median fitted T = {median_t} vs truth {true_temp}"
+        );
+
+        // ── Non-vacuity: the baseline is genuinely in the data ──
+        // A control fit WITHOUT the baseline on the SAME cube must show the
+        // model mismatch as a strictly worse per-pixel deviance (the 2 %
+        // multiplicative distortion contributes ~0.16 per bin at 400 counts,
+        // well above the D/dof ~ 1 noise floor).  Without this check the
+        // recovery assertions above could pass on data where the baseline
+        // injection silently no-opped.
+        let control = spatial_map_typed(&input, &base_config, None, None, None).unwrap();
+        let mean_dpd = |res: &SpatialResult| -> f64 {
+            let m = res.deviance_per_dof_map.as_ref().unwrap();
+            let v: Vec<f64> = m.iter().copied().filter(|v| v.is_finite()).collect();
+            v.iter().sum::<f64>() / v.len() as f64
+        };
+        let dpd_baseline = mean_dpd(&r);
+        let dpd_control = mean_dpd(&control);
+        assert!(
+            dpd_baseline < dpd_control,
+            "modeling the baseline must improve the fit: D/dof {dpd_baseline} \
+             (baseline) vs {dpd_control} (unmodeled control)"
+        );
+    }
+
+    #[test]
+    fn spatial_per_pixel_baseline_mode_populates_maps() {
+        let energies: Vec<f64> = (0..201).map(|i| 1.0 + (i as f64) * 0.05).collect();
+        let (sample, ob) = baseline_thermometry_cube(&energies, 0.002, 600.0, 400.0);
+        let config = UnifiedFitConfig::new(
+            energies,
+            vec![u238_single_resonance()],
+            vec!["U-238".into()],
+            500.0,
+            None,
+            vec![0.002],
+        )
+        .unwrap()
+        .with_solver(SolverConfig::PoissonKL(PoissonConfig::default()))
+        .with_fit_temperature(true)
+        .with_fix_densities(true)
+        .with_multiplicative_baseline(crate::pipeline::MultiplicativeBaselineConfig {
+            spatial_global: false,
+            ..Default::default()
+        });
+        let input = InputData3D::Counts {
+            sample_counts: sample.view(),
+            open_beam_counts: ob.view(),
+        };
+        let r = spatial_map_typed(&input, &config, None, None, None).unwrap();
+        assert!(
+            r.baseline_global.is_none(),
+            "per-pixel mode has no global baseline"
+        );
+        assert!(
+            r.baseline_e_ref_ev.is_some(),
+            "E_ref reported in both modes"
+        );
+        let maps = r.baseline_maps.as_ref().expect("per-pixel baseline maps");
+        for y in 0..3 {
+            for x in 0..3 {
+                if !r.converged_map[[y, x]] {
+                    continue;
+                }
+                let b0 = maps[0][[y, x]];
+                assert!(
+                    (b0 - SPATIAL_BL_TRUE[0]).abs() < 0.05,
+                    "per-pixel b0[{y},{x}] = {b0} vs truth {}",
+                    SPATIAL_BL_TRUE[0]
+                );
+                assert!(maps[1][[y, x]].is_finite() && maps[2][[y, x]].is_finite());
+            }
+        }
+        assert!(r.n_converged > 0, "at least some pixels converge");
+    }
+
+    #[test]
+    fn spatial_stage1_nonconvergence_is_hard_error() {
+        // LM with max_iter = 1 cannot converge from the identity baseline
+        // seed on baseline-distorted data — stage 1 must surface a HARD
+        // error rather than silently falling back to per-pixel baselines.
+        let data = u238_single_resonance();
+        let energies: Vec<f64> = (0..101).map(|i| 1.0 + (i as f64) * 0.1).collect();
+        let (t_3d, sigma_3d) = synthetic_grid_transmission(&data, 0.002, &energies, 2, 2);
+        let e_ref = nereids_fitting::transmission_model::baseline_reference_energy(&energies);
+        let mut t_bl = t_3d.clone();
+        for y in 0..2 {
+            for x in 0..2 {
+                for (i, &e) in energies.iter().enumerate() {
+                    t_bl[[i, y, x]] = t_3d[[i, y, x]] * spatial_baseline_at(e, e_ref);
+                }
+            }
+        }
+        let config = UnifiedFitConfig::new(
+            energies,
+            vec![data],
+            vec!["U-238".into()],
+            0.0,
+            None,
+            vec![0.001],
+        )
+        .unwrap()
+        .with_solver(SolverConfig::LevenbergMarquardt(LmConfig {
+            max_iter: 1,
+            ..LmConfig::default()
+        }))
+        .with_multiplicative_baseline(crate::pipeline::MultiplicativeBaselineConfig::default());
+        let input = InputData3D::Transmission {
+            transmission: t_bl.view(),
+            uncertainty: sigma_3d.view(),
+        };
+        let err = spatial_map_typed(&input, &config, None, None, None)
+            .expect_err("non-converged stage 1 must be a hard error");
+        assert!(
+            err.to_string().contains("stage 1 did not converge"),
+            "error must name stage 1, got: {err}"
+        );
+    }
+
+    #[test]
+    fn spatial_rejects_free_anorm_with_baseline_up_front() {
+        let data = u238_single_resonance();
+        let energies: Vec<f64> = (0..11).map(|i| 1.0 + (i as f64) * 0.1).collect();
+        let (t_3d, sigma_3d) = synthetic_grid_transmission(&data, 0.002, &energies, 2, 2);
+        let config = UnifiedFitConfig::new(
+            energies,
+            vec![data],
+            vec!["U-238".into()],
+            0.0,
+            None,
+            vec![0.001],
+        )
+        .unwrap()
+        .with_solver(SolverConfig::LevenbergMarquardt(LmConfig::default()))
+        // fit_anorm defaults to true — the rejected degenerate combination.
+        .with_transmission_background(crate::pipeline::BackgroundConfig::default())
+        .with_multiplicative_baseline(crate::pipeline::MultiplicativeBaselineConfig::default());
+        let input = InputData3D::Transmission {
+            transmission: t_3d.view(),
+            uncertainty: sigma_3d.view(),
+        };
+        let err = spatial_map_typed(&input, &config, None, None, None)
+            .expect_err("free Anorm + baseline must be hoisted to a whole-map rejection");
+        assert!(
+            err.to_string().contains("Anorm"),
+            "rejection must name the degeneracy, got: {err}"
+        );
+    }
+
+    #[test]
+    fn spatial_result_carries_degenerate_trio_warning() {
+        // Free Anorm + free temperature + free density (NO baseline — that
+        // combination is rejected outright) must surface the structured
+        // warning on the SpatialResult even when pixels fail to converge.
+        let data = u238_single_resonance();
+        let energies: Vec<f64> = (0..101).map(|i| 1.0 + (i as f64) * 0.1).collect();
+        let (t_3d, sigma_3d) = synthetic_grid_transmission(&data, 0.002, &energies, 2, 2);
+        let config = UnifiedFitConfig::new(
+            energies,
+            vec![data],
+            vec!["U-238".into()],
+            300.0,
+            None,
+            vec![0.001],
+        )
+        .unwrap()
+        .with_solver(SolverConfig::LevenbergMarquardt(LmConfig {
+            max_iter: 2,
+            ..LmConfig::default()
+        }))
+        .with_fit_temperature(true)
+        .with_transmission_background(crate::pipeline::BackgroundConfig::default());
+        let input = InputData3D::Transmission {
+            transmission: t_3d.view(),
+            uncertainty: sigma_3d.view(),
+        };
+        let r = spatial_map_typed(&input, &config, None, None, None).unwrap();
+        assert!(
+            r.warnings.iter().any(|w| w.contains("degenerate")),
+            "spatial result must carry the degenerate-trio warning, got {:?}",
+            r.warnings
         );
     }
 }
