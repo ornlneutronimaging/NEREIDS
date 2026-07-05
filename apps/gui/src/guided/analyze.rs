@@ -241,6 +241,7 @@ fn fit_controls(ui: &mut egui::Ui, state: &mut AppState, available_height_hint: 
         let prev_fit_energy_scale = state.fit_energy_scale;
         let prev_fit_energy_range = state.fit_energy_range;
         let prev_lm_background_enabled = state.lm_background_enabled;
+        let prev_baseline_enabled = state.baseline_enabled;
         let prev_compute_covariance = state.lm_config.compute_covariance;
         let prev_tol_param = state.lm_config.tol_param;
         let prev_lambda_init = state.lm_config.lambda_init;
@@ -380,6 +381,20 @@ fn fit_controls(ui: &mut egui::Ui, state: &mut AppState, available_height_hint: 
                     });
                 }
                 ui.checkbox(
+                    &mut state.baseline_enabled,
+                    "Multiplicative baseline B(E) (bounded, ln-E quadratic)",
+                )
+                .on_hover_text(
+                    "Fits y = B(E)\u{00B7}[model] with B(E) = b\u{2080} + \
+                     b\u{2081}\u{00B7}ln(E/E_ref) + b\u{2082}\u{00B7}ln\u{00B2}(E/E_ref), \
+                     with box-bounded coefficients \u{2014} absorbs smooth open-beam \
+                     mismatch (filters, holders, scattering); too smooth to \
+                     absorb resonance dips. When combined with a background, Anorm \
+                     is held fixed automatically (b\u{2080} and Anorm are degenerate \
+                     normalizations). For Spatial Map the baseline is fitted once \
+                     on the aggregated spectrum and frozen per-pixel.",
+                );
+                ui.checkbox(
                     &mut state.lm_config.compute_covariance,
                     "Compute covariance (single-pixel/ROI only)",
                 );
@@ -426,6 +441,7 @@ fn fit_controls(ui: &mut egui::Ui, state: &mut AppState, available_height_hint: 
             || state.fit_energy_scale != prev_fit_energy_scale
             || state.fit_energy_range != prev_fit_energy_range
             || state.lm_background_enabled != prev_lm_background_enabled
+            || state.baseline_enabled != prev_baseline_enabled
             || state.lm_config.compute_covariance != prev_compute_covariance
             || state.lm_config.tol_param.to_bits() != prev_tol_param.to_bits()
             || state.lm_config.lambda_init.to_bits() != prev_lambda_init.to_bits();
@@ -763,6 +779,15 @@ fn fit_feedback_panel(ui: &mut egui::Ui, state: &AppState) {
             if let Some(t) = fb.temperature_k {
                 ui.label(format!("T = {t:.1} K"));
             }
+            // Structured pipeline warnings (issue #635) — amber so they are
+            // visible on both the success (green) and failure (red) frames.
+            for w in &fb.warnings {
+                ui.label(
+                    egui::RichText::new(format!("\u{26A0} {w}"))
+                        .color(egui::Color32::from_rgb(220, 160, 40))
+                        .size(11.0),
+                );
+            }
         });
 }
 
@@ -784,6 +809,17 @@ fn convergence_summary(ui: &mut egui::Ui, state: &AppState) {
         ))
         .size(11.0),
     );
+    // Structured pipeline warnings (#635) — the degenerate-trio diagnostic
+    // was built for exactly this spatial workflow (the field failure was a
+    // silent spatial run); render them amber alongside the result, same
+    // style as the pixel/ROI fit-feedback panel.
+    for w in &result.warnings {
+        ui.label(
+            egui::RichText::new(format!("\u{26A0} {w}"))
+                .color(egui::Color32::from_rgb(220, 160, 40))
+                .size(11.0),
+        );
+    }
 }
 
 // ---- Image Panel (Column 2) ----
@@ -1144,6 +1180,15 @@ fn selected_pixel_fit_result_for_overlay(
         // reopen the mismatch channel the stored field exists to close).
         energy_scale_flight_path_m: result.energy_scale_flight_path_m,
         deviance_per_dof: result.deviance_per_dof_map.as_ref().map(|map| map[[y, x]]),
+        // Per-pixel maps take precedence (per-pixel mode); the global
+        // triple applies uniformly to every pixel in global mode.
+        baseline: result
+            .baseline_maps
+            .as_ref()
+            .map(|maps| [maps[0][[y, x]], maps[1][[y, x]], maps[2][[y, x]]])
+            .or(result.baseline_global),
+        baseline_e_ref_ev: result.baseline_e_ref_ev,
+        warnings: result.warnings.clone(),
     })
 }
 
@@ -2249,7 +2294,20 @@ fn build_fit_config(state: &AppState) -> Result<(UnifiedFitConfig, Range<usize>)
         SolverMethod::PoissonKL => state.kl_background_enabled,
     };
     if bg_enabled {
-        config = config.with_transmission_background(BackgroundConfig::default());
+        config = config.with_transmission_background(BackgroundConfig {
+            // #635: when the multiplicative baseline is also enabled, hold
+            // Anorm fixed — b0 and Anorm are degenerate normalizations and
+            // the pipeline hard-rejects freeing both.  The GUI wires the
+            // sanctioned combination automatically so the user can never
+            // submit the rejected config.
+            fit_anorm: !state.baseline_enabled,
+            ..BackgroundConfig::default()
+        });
+    }
+    if state.baseline_enabled {
+        config = config.with_multiplicative_baseline(
+            nereids_pipeline::pipeline::MultiplicativeBaselineConfig::default(),
+        );
     }
 
     // Counts-KL options: proton-charge ratio + polish override.  Both
@@ -2291,6 +2349,7 @@ fn fit_pixel(state: &mut AppState) {
                 summary: e.clone(),
                 densities: vec![],
                 temperature_k: None,
+                warnings: vec![],
             });
             state.status_message = e;
             return;
@@ -2306,6 +2365,7 @@ fn fit_pixel(state: &mut AppState) {
                 summary: msg.clone(),
                 densities: vec![],
                 temperature_k: None,
+                warnings: vec![],
             });
             state.status_message = msg;
             return;
@@ -2325,6 +2385,7 @@ fn fit_pixel(state: &mut AppState) {
             summary: msg.clone(),
             densities: vec![],
             temperature_k: None,
+            warnings: vec![],
         });
         state.status_message = msg;
         return;
@@ -2387,6 +2448,7 @@ fn fit_pixel(state: &mut AppState) {
                 summary: msg.clone(),
                 densities: vec![],
                 temperature_k: None,
+                warnings: vec![],
             });
             state.status_message = msg;
             return;
@@ -2419,6 +2481,7 @@ fn fit_pixel(state: &mut AppState) {
         summary: summary.clone(),
         densities,
         temperature_k: fitted_temp,
+        warnings: result.warnings.clone(),
     });
     state.status_message = summary;
     state.pixel_fit_result = Some(result);
@@ -2436,6 +2499,7 @@ fn fit_roi(state: &mut AppState) {
                 summary: e.clone(),
                 densities: vec![],
                 temperature_k: None,
+                warnings: vec![],
             });
             state.status_message = e;
             return;
@@ -2454,6 +2518,7 @@ fn fit_roi(state: &mut AppState) {
             summary: msg.clone(),
             densities: vec![],
             temperature_k: None,
+            warnings: vec![],
         });
         state.status_message = msg;
         return;
@@ -2494,6 +2559,7 @@ fn fit_roi(state: &mut AppState) {
             summary: msg.clone(),
             densities: vec![],
             temperature_k: None,
+            warnings: vec![],
         });
         state.status_message = msg;
         return;
@@ -2577,6 +2643,7 @@ fn fit_roi(state: &mut AppState) {
                 summary: msg.clone(),
                 densities: vec![],
                 temperature_k: None,
+                warnings: vec![],
             });
             state.status_message = msg;
             return;
@@ -2609,6 +2676,7 @@ fn fit_roi(state: &mut AppState) {
         summary: summary.clone(),
         densities,
         temperature_k: fitted_temp,
+        warnings: result.warnings.clone(),
     });
     state.status_message = summary;
     state.pixel_fit_result = Some(result);

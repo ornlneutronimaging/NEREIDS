@@ -209,14 +209,47 @@ impl<'a> JointPoissonObjective<'a> {
     pub fn deviance_from_transmission(&self, t: &[f64]) -> Result<f64, FittingError> {
         self.validate_inputs(t.len())?;
         let mut d = 0.0;
+        // Total active counts — sets the scale of legitimate xlogy round-off
+        // (each term cancels quantities of magnitude ~(O+S), so the summed
+        // error is O(ε · Σ(O+S))).
+        let mut weight_scale = 0.0;
         for (i, ((&t_i, &o_i), &s_i)) in t.iter().zip(self.o.iter()).zip(self.s.iter()).enumerate()
         {
             if !self.bin_active(i) {
                 continue;
             }
             d += binomial_deviance_term(s_i, o_i, t_i, self.c);
+            weight_scale += o_i + s_i;
         }
-        Ok(d)
+        // Each conditional-binomial term is nonnegative by Gibbs' inequality,
+        // so D ≥ 0 is a hard mathematical invariant — but the per-term xlogy
+        // cancellations carry O(ULP·count) round-off, and when the optimizer
+        // converges machine-exactly on noise-free (synthetic) data the sum
+        // can land at ~−1e-13.  Clamp WITHIN the round-off envelope only
+        // (review R2): an unbounded clamp would convert a genuine
+        // deviance-term defect producing a large negative / −∞ sum into a
+        // silent "perfect converged fit" (the D == 0 convergence shortcut in
+        // damped_fisher_stage).  Beyond the envelope, surface the defect as
+        // an Err — at the initial point that propagates to the caller, and
+        // mid-iteration it rejects trials until the fit reports
+        // non-converged, both honest failure signals.  NaN from a
+        // non-finite model row passes through first: NaN.max(0.0) = 0.0
+        // would be wrong (f64::max returns the OTHER operand for NaN).
+        if d.is_nan() {
+            return Ok(d);
+        }
+        // 64× margin over the observed magnitude class (−1.5e-13 at
+        // Σ(O+S) ≈ 4e6, i.e. ~ε·Σ ≈ 1e-9 worst-case).
+        let roundoff_envelope = 64.0 * f64::EPSILON * weight_scale.max(1.0);
+        if d < -roundoff_envelope {
+            return Err(FittingError::EvaluationFailed(format!(
+                "conditional-binomial deviance D = {d} is negative beyond the \
+                 accumulation round-off envelope ({roundoff_envelope:.3e}) — \
+                 this indicates a deviance-term defect, not round-off; \
+                 refusing to clamp it to a perfect fit"
+            )));
+        }
+        Ok(d.max(0.0))
     }
 
     /// Evaluate the deviance at parameter vector θ by calling the model.
@@ -1110,6 +1143,19 @@ fn damped_fisher_stage(
 
     while iter < config.max_iter {
         iter += 1;
+
+        // D is a sum of nonnegative conditional-binomial terms (clamped at
+        // 0 in `deviance_from_transmission`), so D == 0 is the exact global
+        // minimum — reachable on noise-free synthetic data once the model
+        // converges machine-exactly.  Declare convergence here: the Armijo
+        // test can never accept a step from D == 0 (it demands a strict
+        // decrease), so without this check the stage inflates λ past its
+        // ceiling and reports a PERFECT fit as non-converged.
+        if d_current == 0.0 {
+            converged = true;
+            break;
+        }
+
         let free_idx = params.free_indices();
         let n_free = free_idx.len();
         if n_free == 0 {

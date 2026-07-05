@@ -135,7 +135,7 @@ class FitResult:
         ...
 
     @property
-    def background(self) -> tuple[float, float, float]:
+    def background(self) -> list[float]:
         """Fitted background parameters (BackA, BackB, BackC)."""
         ...
 
@@ -186,6 +186,29 @@ class FitResult:
         transmission + PoissonKL (those populate
         ``reduced_chi_squared`` with Pearson chi-squared / (n - k)).
         """
+        ...
+
+    @property
+    def baseline(self) -> list[float] | None:
+        """Fitted multiplicative-baseline coefficients ``[b0, b1, b2]`` (a
+        3-element list) for
+        ``B(E) = b0 + b1*ln(E/E_ref) + b2*ln^2(E/E_ref)`` applied outermost
+        (issue #635).  ``None`` when ``baseline=False``."""
+        ...
+
+    @property
+    def baseline_e_ref_ev(self) -> float | None:
+        """Reference energy E_ref (eV) of the baseline's centered
+        ``ln(E/E_ref)`` basis — the geometric midpoint sqrt(E_min*E_max) of
+        the fit grid; reconstruct ``B(E)`` with exactly this reference.
+        ``None`` when ``baseline=False``."""
+        ...
+
+    @property
+    def warnings(self) -> list[str]:
+        """Structured fit-configuration warnings (e.g. the degenerate
+        free-Anorm + free-temperature + free-density trio).  Empty list
+        when nothing is flagged."""
         ...
 
 class CalibrationResult:
@@ -499,6 +522,34 @@ class SpatialResult:
     def l_scale_map(self) -> NDArray[np.float64] | None:
         """Per-pixel SAMMY TZERO flight-path scale factor map.
         ``None`` when the run did not use ``fit_energy_scale=True``."""
+        ...
+
+    @property
+    def baseline_global(self) -> list[float] | None:
+        """Global multiplicative-baseline coefficients ``[b0, b1, b2]`` (a
+        3-element list; issue #635): fitted once on the aggregated mean spectrum, then
+        frozen for every pixel.  ``None`` when ``baseline=False`` or in
+        per-pixel mode (``baseline_global=False``)."""
+        ...
+
+    @property
+    def baseline_e_ref_ev(self) -> float | None:
+        """Baseline reference energy E_ref (eV); ``None`` when
+        ``baseline=False``."""
+        ...
+
+    @property
+    def baseline_maps(self) -> list[NDArray[np.float64]] | None:
+        """Per-pixel baseline coefficient maps ``[b0, b1, b2]``.  ``None``
+        unless ``baseline=True`` with ``baseline_global=False``.  NaN at
+        pixels that did not converge."""
+        ...
+
+    @property
+    def warnings(self) -> list[str]:
+        """Structured fit-configuration warnings (also printed once to
+        stderr by the spatial engine).  Empty list when nothing is
+        flagged."""
         ...
 
 class IsotopeGroup:
@@ -1256,6 +1307,18 @@ def spatial_map_typed(
     groups: list[IsotopeGroup] | None = None,
     tzero_jacobian: str | None = None,
     fit_energy_range: tuple[float, float] | None = None,
+    fit_anorm: bool = True,
+    baseline: bool = False,
+    fit_b0: bool = True,
+    fit_b1: bool = True,
+    fit_b2: bool = True,
+    b0_init: float = 1.0,
+    b1_init: float = 0.0,
+    b2_init: float = 0.0,
+    b0_bounds: tuple[float, float] | None = None,
+    b1_bounds: tuple[float, float] | None = None,
+    b2_bounds: tuple[float, float] | None = None,
+    baseline_global: bool = True,
 ) -> SpatialResult:
     """Spatial mapping using the typed input data API.
 
@@ -1348,6 +1411,17 @@ def fit_spectrum_typed(
     density_free: list[bool] | None = None,
     tzero_jacobian: str | None = None,
     fit_energy_range: tuple[float, float] | None = None,
+    fit_anorm: bool = True,
+    baseline: bool = False,
+    fit_b0: bool = True,
+    fit_b1: bool = True,
+    fit_b2: bool = True,
+    b0_init: float = 1.0,
+    b1_init: float = 0.0,
+    b2_init: float = 0.0,
+    b0_bounds: tuple[float, float] | None = None,
+    b1_bounds: tuple[float, float] | None = None,
+    b2_bounds: tuple[float, float] | None = None,
 ) -> FitResult:
     """Fit a single pre-normalized transmission spectrum.
 
@@ -1417,6 +1491,17 @@ def fit_counts_spectrum_typed(
     enable_polish: bool | None = None,
     tzero_jacobian: str | None = None,
     fit_energy_range: tuple[float, float] | None = None,
+    fit_anorm: bool = True,
+    baseline: bool = False,
+    fit_b0: bool = True,
+    fit_b1: bool = True,
+    fit_b2: bool = True,
+    b0_init: float = 1.0,
+    b1_init: float = 0.0,
+    b2_init: float = 0.0,
+    b0_bounds: tuple[float, float] | None = None,
+    b1_bounds: tuple[float, float] | None = None,
+    b2_bounds: tuple[float, float] | None = None,
 ) -> FitResult:
     """Fit a single raw-count spectrum (sample + open-beam counts).
 

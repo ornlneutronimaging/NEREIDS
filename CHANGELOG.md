@@ -9,6 +9,43 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
 
 ### Added
 
+- **Bounded multiplicative baseline `B(E)` in every fitter** (#635): a
+  smooth, box-bounded normalization
+  `B(E) = b0 + b1·ln(E/E_ref) + b2·ln²(E/E_ref)` (E_ref = geometric
+  midpoint of the fit grid, reported on the result) applied OUTERMOST —
+  `y = B(E)·[Anorm·T + additive background]` — across the LM,
+  transmission-KL, and counts joint-Poisson paths, `spatial_map_typed`,
+  the Python fitters (`baseline=True`, `fit_b0/b1/b2`, `b*_init`,
+  `b*_bounds`, `fit_anorm`, spatial `baseline_global`), and the GUI
+  (advanced-solver checkbox + overlay; baseline outputs persist in
+  project files so a reloaded fit renders the same model). Real transmission ratios sit a
+  few % off unity with smooth energy dependence (filters, holders,
+  scattering). Resonance dips stay attributed to the physics model
+  because a single global ln-E quadratic is too SMOOTH to produce a
+  narrow local feature; the configurable coefficient boxes (default
+  (0.9, 1.1) / ±0.05 per ln-E unit) additionally bound the baseline's
+  tilt and curvature (the evaluated B(E) excursion grows with the
+  grid's log-width; only positivity is enforced pointwise). A free SAMMY `Anorm`
+  alongside the baseline is rejected (`b0`/`Anorm` are degenerate
+  normalizations); the additive ABC background combines with the
+  baseline when `Anorm` is held fixed. This is a documented NEREIDS
+  extension: modern SAMMY normalizes with a scalar `Anorm` + additive
+  backgrounds only (`cro/mnrm1.f90`); the nearest analogue is the
+  dormant legacy power-law `Anrm(1)+Anrm(2)·E^Anrm(3)`
+  (`acs/macs4.f90:440-450`).
+- **Two-stage global baseline for spatial maps** (#635):
+  `spatial_map_typed` fits the baseline ONCE on the aggregated mean
+  spectrum, then freezes it for every pixel (default; per-pixel
+  baselines at low counts biased fitted temperatures on real data).
+  Stage-1 non-convergence is a hard error, never a silent per-pixel
+  fallback. `SpatialResult` gains `baseline_global`,
+  `baseline_e_ref_ev`, `baseline_maps` (per-pixel mode), `warnings`.
+- **Structured fit warnings** (#635): `SpectrumFitResult::warnings` /
+  `FitResult.warnings` / GUI fit feedback now flag the degenerate
+  normalization trio (free `Anorm` + free temperature + ≥1 free
+  density), which on real VENUS data converged to T = 4471 K at
+  χ²/ν = 932 with no diagnostic.
+
 - **`fit_energy_scale` + `fit_temperature` jointly, in every fitter**
   (#634): the flag combination resonance thermometry needs — calibrate
   the SAMMY energy scale (t₀, L_scale) *and* fit temperature in one
@@ -96,6 +133,15 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
   `median_abs_deviation`, `MAD_TO_SIGMA`).
 
 ### Changed
+
+- **Config-class Python errors now raise `ValueError` uniformly** (#635
+  review): `fit_spectrum_typed`, `fit_counts_spectrum_typed`, and
+  `compute_model_jacobian` previously stringified every `PipelineError`
+  to `RuntimeError`; invalid-input errors
+  (`PipelineError::InvalidParameter` — e.g. an init outside its bounds,
+  `no free parameters`, a bad `fit_energy_range`) now raise `ValueError`,
+  matching `spatial_map_typed`. Scripts catching `RuntimeError` for
+  config-class errors must catch `ValueError` instead.
 
 - **Physics-complete bounded Ikeda–Carpenter calibration family** (#642):
   `family="ic"` now fits the full moderator shape — the prompt law
@@ -200,6 +246,27 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
   boundary-saturation and no-finite-χ² error contracts, and the
   `dof = n_valid − 3` reduced-χ² convention are unchanged; all existing
   calibration tests pass unmodified.
+
+### Fixed
+
+- **Analytic Jacobian for no-temperature fits without precomputed σ**
+  (#635): `build_transmission_model` now precomputes working-grid σ for
+  this case, so the model exposes its analytical Jacobian instead of
+  silently degrading the LM path to finite differences and the counts
+  joint-Poisson stage to an identity-Fisher gradient descent (which
+  crawled through correlated-parameter valleys and, on the real-VENUS
+  regression fixture, stopped 1.7 % short of the true deviance optimum).
+  The model output is unchanged (bit-exact parity with the previous
+  forward-model path, pinned by a committed test); only the optimizer
+  quality improved.
+- **Joint-Poisson deviance is clamped at its mathematical floor**
+  (#635): per-bin xlogy round-off could report a total deviance of
+  ~−1e-13 on machine-exact fits, violating the D ≥ 0 contract; D == 0
+  (a perfect fit) is now reported as converged instead of inflating the
+  damping to its ceiling and returning non-converged. The clamp is
+  scoped to the accumulation round-off envelope — a deviance negative
+  beyond it surfaces as an error instead of a silent perfect fit.
+
 
 ## [0.2.2] - 2026-07-03
 
