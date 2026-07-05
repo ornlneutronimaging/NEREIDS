@@ -242,8 +242,13 @@ fn dip_match_anchor(
         return None;
     }
 
-    // Match each resonance to its nearest dip within half the minimum
-    // resonance spacing (floored at twice the grid resolution).
+    // Match resonances to dips ONE-TO-ONE within half the minimum resonance
+    // spacing (floored at twice the grid resolution).  Greedy assignment on
+    // globally ascending distance: matching each resonance to its nearest
+    // dip independently would let one dip serve several resonances,
+    // duplicating `u_dip` rows in the affine least squares below — which
+    // biases the fit and, in the two-resonance case, degenerates it toward
+    // `sxx → 0` (Copilot review, PR #644).
     let min_spacing = res_e
         .windows(2)
         .map(|w| w[1] - w[0])
@@ -251,18 +256,26 @@ fn dip_match_anchor(
     let grid_res = (e_hi - e_lo) / (n as f64 - 1.0);
     let tol = (0.5 * min_spacing).max(2.0 * grid_res);
     let kl = TOF_FACTOR * assumed_flight_path_m;
-    let mut pairs: Vec<(f64, f64)> = Vec::new(); // (u_dip, u_res) in µs
-    for &er in &res_e {
-        let mut best: Option<f64> = None;
-        for &d in &dips {
+    let mut candidates: Vec<(f64, usize, usize)> = Vec::new(); // (dist, res idx, dip idx)
+    for (ri, &er) in res_e.iter().enumerate() {
+        for (di, &d) in dips.iter().enumerate() {
             let dist = (d - er).abs();
-            if dist < tol && best.is_none_or(|b: f64| dist < (b - er).abs()) {
-                best = Some(d);
+            if dist < tol {
+                candidates.push((dist, ri, di));
             }
         }
-        if let Some(d) = best {
-            pairs.push((kl / d.sqrt(), kl / er.sqrt()));
+    }
+    candidates.sort_by(|a, b| a.0.total_cmp(&b.0));
+    let mut res_used = vec![false; res_e.len()];
+    let mut dip_used = vec![false; dips.len()];
+    let mut pairs: Vec<(f64, f64)> = Vec::new(); // (u_dip, u_res) in µs
+    for &(_, ri, di) in &candidates {
+        if res_used[ri] || dip_used[di] {
+            continue;
         }
+        res_used[ri] = true;
+        dip_used[di] = true;
+        pairs.push((kl / dips[di].sqrt(), kl / res_e[ri].sqrt()));
     }
     if pairs.len() < 2 {
         return None;
