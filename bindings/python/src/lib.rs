@@ -2143,6 +2143,24 @@ fn py_apply_resolution<'py>(
     Ok(PyArray1::from_vec(py, result))
 }
 
+/// Parse a Python-facing pixel-value policy string.
+///
+/// Accepted values: ``"reject"`` (default — negative or non-finite pixels
+/// are an error), ``"clip"`` (clamp negatives to 0.0; NaN still errors),
+/// ``"allow"`` (verbatim pass-through for pre-normalized transmission).
+fn parse_pixel_policy(policy: &str) -> PyResult<nereids_io::tiff_stack::PixelValuePolicy> {
+    use nereids_io::tiff_stack::PixelValuePolicy;
+    match policy {
+        "reject" => Ok(PixelValuePolicy::Reject),
+        "clip" => Ok(PixelValuePolicy::ClipToZero),
+        "allow" => Ok(PixelValuePolicy::Allow),
+        other => Err(pyo3::exceptions::PyValueError::new_err(format!(
+            "invalid pixel_policy '{}': expected \"reject\", \"clip\", or \"allow\"",
+            other
+        ))),
+    }
+}
+
 /// Load a multi-frame TIFF file into a 3D numpy array.
 ///
 /// Each TIFF frame becomes one slice along the first axis.
@@ -2150,20 +2168,51 @@ fn py_apply_resolution<'py>(
 ///
 /// Args:
 ///     path: Path to the multi-frame TIFF file.
+///     pixel_policy: ``"reject"`` (default) errors on negative or
+///         non-finite pixels — raw counts are non-negative by
+///         construction, so a violation signals corruption (mask corrupt
+///         readout pixels per acquisition with ``detect_bad_pixels()``
+///         instead).  ``"clip"`` clamps negatives to 0.0 (NaN still
+///         errors).  ``"allow"`` passes all values through verbatim —
+///         use for pre-normalized transmission stacks.
 ///
 /// Returns:
 ///     3D numpy array with shape (n_frames, height, width).
+///
+/// Raises:
+///     ValueError: For bad pixel values under the active policy, or an
+///         invalid ``pixel_policy`` string.
+///     IOError: For TIFF decoding errors or other I/O failures.
 #[pyfunction]
-fn load_tiff_stack<'py>(py: Python<'py>, path: &str) -> PyResult<Bound<'py, PyArray3<f64>>> {
-    let arr = nereids_io::tiff_stack::load_tiff_stack(std::path::Path::new(path))
-        .map_err(|e| pyo3::exceptions::PyIOError::new_err(format!("{}", e)))?;
+#[pyo3(signature = (path, pixel_policy="reject"))]
+fn load_tiff_stack<'py>(
+    py: Python<'py>,
+    path: &str,
+    pixel_policy: &str,
+) -> PyResult<Bound<'py, PyArray3<f64>>> {
+    let policy = parse_pixel_policy(pixel_policy)?;
+    let (arr, _info) =
+        nereids_io::tiff_stack::load_tiff_stack_with_options(std::path::Path::new(path), policy)
+            .map_err(|e| match &e {
+                nereids_io::error::IoError::BadPixelValue { .. } => {
+                    pyo3::exceptions::PyValueError::new_err(format!("{}", e))
+                }
+                _ => pyo3::exceptions::PyIOError::new_err(format!("{}", e)),
+            })?;
     Ok(PyArray3::from_owned_array(py, arr))
 }
 
 /// Load a folder of single-frame TIFFs into a 3D numpy array.
 ///
-/// Files are sorted lexicographically by name, so they should be named with
-/// zero-padded indices (e.g., ``frame_0001.tif``, ``frame_0002.tif``, ...).
+/// Chunked VENUS folders (files named ``<prefix>_<chunk>_<frame>.tif``)
+/// are detected automatically: when every filename follows the convention
+/// with one common prefix, frames are ordered by numeric frame index and
+/// chunks covering identical frame ranges are summed element-wise
+/// (``sum_chunks=True``, the default).  Ragged chunks or duplicate
+/// (chunk, frame) pairs are an error — never a silent stack.  Folders not
+/// following the convention (or with several distinct prefixes) load in
+/// lexicographic filename order, so name legacy files with zero-padded
+/// indices (e.g., ``frame_0001.tif``, ``frame_0002.tif``, ...).
 ///
 /// Args:
 ///     folder: Path to the directory containing TIFF files.
@@ -2172,6 +2221,13 @@ fn load_tiff_stack<'py>(py: Python<'py>, path: &str) -> PyResult<Bound<'py, PyAr
 ///              (case-insensitive).  Only files with ``.tif`` or ``.tiff``
 ///              extensions are ever loaded; the pattern adds an additional
 ///              filename filter on top of that.
+///     sum_chunks: Sum DAQ chunks element-wise when a chunked folder is
+///                 detected (default ``True``).  ``False`` loads the legacy
+///                 lexicographic concatenation of all files.
+///     pixel_policy: ``"reject"`` (default) errors on negative or
+///         non-finite pixels; ``"clip"`` clamps negatives to 0.0 (NaN
+///         still errors); ``"allow"`` passes values through verbatim (for
+///         pre-normalized transmission stacks).
 ///
 /// Returns:
 ///     3D numpy array with shape (n_frames, height, width), dtype float64.
@@ -2179,34 +2235,96 @@ fn load_tiff_stack<'py>(py: Python<'py>, path: &str) -> PyResult<Bound<'py, PyAr
 /// Raises:
 ///     FileNotFoundError: If the folder does not exist or no files match.
 ///     NotADirectoryError: If the provided path is not a directory.
-///     ValueError: If matched frames have inconsistent dimensions.
+///     ValueError: If matched frames have inconsistent dimensions, the
+///         chunked layout is internally inconsistent, a pixel value
+///         violates the active policy, or ``pixel_policy`` is invalid.
 ///     IOError: For TIFF decoding errors or other I/O failures.
 #[pyfunction]
-#[pyo3(signature = (folder, pattern=None))]
+#[pyo3(signature = (folder, pattern=None, sum_chunks=true, pixel_policy="reject"))]
 fn load_tiff_folder<'py>(
     py: Python<'py>,
     folder: &str,
     pattern: Option<&str>,
+    sum_chunks: bool,
+    pixel_policy: &str,
 ) -> PyResult<Bound<'py, PyArray3<f64>>> {
-    let arr = nereids_io::tiff_stack::load_tiff_folder(std::path::Path::new(folder), pattern)
+    let options = nereids_io::tiff_stack::TiffFolderOptions {
+        sum_chunks,
+        pixel_policy: parse_pixel_policy(pixel_policy)?,
+    };
+    let (arr, _info) = nereids_io::tiff_stack::load_tiff_folder_with_options(
+        std::path::Path::new(folder),
+        pattern,
+        &options,
+    )
+    .map_err(|e| match &e {
+        nereids_io::error::IoError::NoMatchingFiles { .. } => {
+            pyo3::exceptions::PyFileNotFoundError::new_err(format!("{}", e))
+        }
+        nereids_io::error::IoError::NotADirectory(_) => {
+            pyo3::exceptions::PyNotADirectoryError::new_err(format!("{}", e))
+        }
+        nereids_io::error::IoError::FileNotFound(_, source)
+            if source.kind() == std::io::ErrorKind::NotFound =>
+        {
+            pyo3::exceptions::PyFileNotFoundError::new_err(format!("{}", e))
+        }
+        nereids_io::error::IoError::DimensionMismatch { .. } => {
+            pyo3::exceptions::PyValueError::new_err(format!("{}", e))
+        }
+        nereids_io::error::IoError::ChunkMismatch { .. } => {
+            pyo3::exceptions::PyValueError::new_err(format!("{}", e))
+        }
+        nereids_io::error::IoError::BadPixelValue { .. } => {
+            pyo3::exceptions::PyValueError::new_err(format!("{}", e))
+        }
+        _ => pyo3::exceptions::PyIOError::new_err(format!("{}", e)),
+    })?;
+    Ok(PyArray3::from_owned_array(py, arr))
+}
+
+/// Read a VENUS ``*_Spectra.txt`` TOF sidecar into bin edges (µs).
+///
+/// The sidecar's first CSV column is each frame's start time in SECONDS
+/// (one row per TOF frame; the second column is counts).  Values are
+/// converted to microseconds and the closing edge of the last frame is
+/// synthesized by extrapolating the last frame width, yielding N+1
+/// ascending edges for N rows — exactly what ``tof_to_energy_centers``
+/// expects.  Bin uniformity is not enforced (MCP shutter segments change
+/// the frame width mid-run).
+///
+/// Args:
+///     path: Path to the ``*_Spectra.txt`` sidecar file.
+///     n_frames: When given, validate the edge count against the TIFF
+///         stack's frame count (``n_frames + 1`` edges).
+///
+/// Returns:
+///     1D numpy array of N+1 ascending TOF bin edges in microseconds.
+///
+/// Raises:
+///     FileNotFoundError: If the sidecar file does not exist.
+///     ValueError: For malformed content (fewer than 2 rows, non-finite
+///         or non-increasing start times, a negative first start) or an
+///         edge/frame count mismatch.
+///     IOError: For other I/O failures.
+#[pyfunction]
+#[pyo3(signature = (path, n_frames=None))]
+fn read_tof_sidecar<'py>(
+    py: Python<'py>,
+    path: &str,
+    n_frames: Option<usize>,
+) -> PyResult<Bound<'py, PyArray1<f64>>> {
+    let edges = nereids_io::spectrum::read_tof_sidecar(std::path::Path::new(path), n_frames)
         .map_err(|e| match &e {
-            nereids_io::error::IoError::NoMatchingFiles { .. } => {
-                pyo3::exceptions::PyFileNotFoundError::new_err(format!("{}", e))
-            }
-            nereids_io::error::IoError::NotADirectory(_) => {
-                pyo3::exceptions::PyNotADirectoryError::new_err(format!("{}", e))
-            }
-            nereids_io::error::IoError::FileNotFound(_, source)
-                if source.kind() == std::io::ErrorKind::NotFound =>
-            {
-                pyo3::exceptions::PyFileNotFoundError::new_err(format!("{}", e))
-            }
-            nereids_io::error::IoError::DimensionMismatch { .. } => {
+            nereids_io::error::IoError::InvalidParameter(_) => {
                 pyo3::exceptions::PyValueError::new_err(format!("{}", e))
+            }
+            nereids_io::error::IoError::FileNotFound(..) => {
+                pyo3::exceptions::PyFileNotFoundError::new_err(format!("{}", e))
             }
             _ => pyo3::exceptions::PyIOError::new_err(format!("{}", e)),
         })?;
-    Ok(PyArray3::from_owned_array(py, arr))
+    Ok(PyArray1::from_vec(py, edges))
 }
 
 /// Normalize raw sample and open-beam data to transmission.
@@ -3360,6 +3478,7 @@ fn nereids(m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_function(wrap_pyfunction!(py_apply_resolution, m)?)?;
     m.add_function(wrap_pyfunction!(load_tiff_stack, m)?)?;
     m.add_function(wrap_pyfunction!(load_tiff_folder, m)?)?;
+    m.add_function(wrap_pyfunction!(read_tof_sidecar, m)?)?;
     m.add_class::<PyNexusMetadata>()?;
     m.add_class::<PyNexusData>()?;
     m.add_function(wrap_pyfunction!(probe_nexus, m)?)?;

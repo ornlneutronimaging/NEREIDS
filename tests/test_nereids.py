@@ -1648,6 +1648,158 @@ class TestTiffIO:
         with pytest.raises(OSError):
             nereids.load_tiff_stack("/nonexistent/path.tif")
 
+    @staticmethod
+    def _write_chunked_folder(tmpdir, n_frames=4, h=2, w=3):
+        """Write a 2-chunk VENUS-style folder (run_764_* / run_765_*).
+
+        Frame f of chunk c holds the constant value ``(c - 763) * 100 + f``
+        so per-element sums are easy to assert.  Returns the expected
+        summed stack.
+        """
+        import tifffile
+
+        expected = np.zeros((n_frames, h, w))
+        for c in (764, 765):
+            for f in range(n_frames):
+                value = (c - 763) * 100 + f
+                frame = np.full((h, w), value, dtype=np.uint16)
+                tifffile.imwrite(
+                    os.path.join(tmpdir, f"run_{c}_{f:04d}.tif"), frame
+                )
+                expected[f] += value
+        return expected
+
+    def test_load_tiff_folder_chunked_sums(self):
+        """T40: a 2-chunk folder sums element-wise by default; opting out
+        loads the 2x lexicographic concatenation."""
+        pytest.importorskip("tifffile")
+        n_frames, h, w = 4, 2, 3
+
+        with tempfile.TemporaryDirectory() as tmpdir:
+            expected = self._write_chunked_folder(tmpdir, n_frames, h, w)
+
+            summed = np.asarray(nereids.load_tiff_folder(tmpdir))
+            assert summed.shape == (n_frames, h, w)
+            np.testing.assert_allclose(summed, expected)
+
+            legacy = np.asarray(nereids.load_tiff_folder(tmpdir, sum_chunks=False))
+            assert legacy.shape == (2 * n_frames, h, w)
+            # Lexicographic order: all of chunk 764, then all of chunk 765.
+            assert legacy[0, 0, 0] == 100.0
+            assert legacy[n_frames, 0, 0] == 200.0
+
+    def test_pixel_policy_negative_int16(self):
+        """T41: a negative signed pixel rejects by default (naming
+        detect_bad_pixels), clips to 0 under "clip", passes under "allow"."""
+        tifffile = pytest.importorskip("tifffile")
+        frame = np.array([[10, -32554], [30, 40]], dtype=np.int16)
+
+        with tempfile.NamedTemporaryFile(suffix=".tif", delete=False) as f:
+            path = f.name
+        try:
+            tifffile.imwrite(path, frame)
+
+            with pytest.raises(ValueError, match="detect_bad_pixels"):
+                nereids.load_tiff_stack(path)
+
+            clipped = np.asarray(nereids.load_tiff_stack(path, pixel_policy="clip"))
+            assert clipped[0, 0, 1] == 0.0
+            assert clipped[0, 0, 0] == 10.0
+
+            allowed = np.asarray(nereids.load_tiff_stack(path, pixel_policy="allow"))
+            assert allowed[0, 0, 1] == -32554.0
+        finally:
+            os.unlink(path)
+
+    def test_pixel_policy_nan_float32(self):
+        """T42: a NaN float pixel rejects by default and passes under
+        "allow"."""
+        tifffile = pytest.importorskip("tifffile")
+        frame = np.array([[1.0, np.nan], [3.0, 4.0]], dtype=np.float32)
+
+        with tempfile.NamedTemporaryFile(suffix=".tif", delete=False) as f:
+            path = f.name
+        try:
+            tifffile.imwrite(path, frame)
+
+            with pytest.raises(ValueError):
+                nereids.load_tiff_stack(path)
+
+            allowed = np.asarray(nereids.load_tiff_stack(path, pixel_policy="allow"))
+            assert np.isnan(allowed[0, 0, 1])
+        finally:
+            os.unlink(path)
+
+    def test_venus_run_folder_three_calls(self):
+        """T43 (acceptance): a 2-chunk VENUS run folder with a
+        *_Spectra.txt sidecar loads to stack + energy axis in 3 calls."""
+        pytest.importorskip("tifffile")
+        n_frames, h, w = 4, 2, 3
+
+        with tempfile.TemporaryDirectory() as tmpdir:
+            expected = self._write_chunked_folder(tmpdir, n_frames, h, w)
+            # Frame start times in seconds (col 0) + counts (col 1),
+            # 100 µs frames starting at 1 ms.
+            sidecar = os.path.join(tmpdir, "run_Spectra.txt")
+            with open(sidecar, "w") as fh:
+                fh.write("shutter_time,counts\n")
+                for f in range(n_frames):
+                    fh.write(f"{0.001 + f * 0.0001},{100 + f}\n")
+
+            # Call 1: chunk-aware stack (the sidecar .txt is ignored by
+            # the TIFF extension filter).
+            counts = np.asarray(nereids.load_tiff_folder(tmpdir))
+            # Call 2: sidecar -> N+1 ascending µs edges, validated.
+            edges_us = np.asarray(
+                nereids.read_tof_sidecar(sidecar, n_frames=counts.shape[0])
+            )
+            # Call 3: energy centers.
+            energies = np.asarray(
+                nereids.tof_to_energy_centers(edges_us, 25.0)
+            )
+
+            assert counts.shape == (n_frames, h, w)
+            np.testing.assert_allclose(counts, expected)
+            assert edges_us.shape == (n_frames + 1,)
+            np.testing.assert_allclose(edges_us[0], 1000.0)
+            assert np.all(np.diff(edges_us) > 0)
+            assert energies.shape == (n_frames,)
+            assert np.all(np.diff(energies) > 0)
+
+    def test_read_tof_sidecar_errors(self):
+        """T44: frame-count mismatch raises ValueError; a missing sidecar
+        raises FileNotFoundError."""
+        with tempfile.TemporaryDirectory() as tmpdir:
+            sidecar = os.path.join(tmpdir, "run_Spectra.txt")
+            with open(sidecar, "w") as fh:
+                fh.write("0.001,10\n0.002,20\n0.003,30\n")
+
+            with pytest.raises(ValueError):
+                nereids.read_tof_sidecar(sidecar, n_frames=7)
+
+            with pytest.raises(FileNotFoundError):
+                nereids.read_tof_sidecar(
+                    os.path.join(tmpdir, "missing_Spectra.txt")
+                )
+
+    def test_invalid_pixel_policy_string(self):
+        """T45: an invalid pixel_policy lists the accepted options."""
+        tifffile = pytest.importorskip("tifffile")
+        frame = np.ones((2, 2), dtype=np.uint16)
+
+        with tempfile.NamedTemporaryFile(suffix=".tif", delete=False) as f:
+            path = f.name
+        try:
+            tifffile.imwrite(path, frame)
+            with pytest.raises(ValueError, match="reject"):
+                nereids.load_tiff_stack(path, pixel_policy="bogus")
+            with pytest.raises(ValueError, match="allow"):
+                nereids.load_tiff_folder(
+                    os.path.dirname(path), pixel_policy="bogus"
+                )
+        finally:
+            os.unlink(path)
+
 
 # ===========================================================================
 # Error handling / validation

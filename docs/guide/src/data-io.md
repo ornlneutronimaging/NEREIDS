@@ -24,19 +24,83 @@ Use `load_tiff_stack(...)` for a multi-frame TIFF:
 ```python
 import nereids
 
-transmission = nereids.load_tiff_stack("transmission_stack.tif")
+transmission = nereids.load_tiff_stack("transmission_stack.tif", pixel_policy="allow")
 # transmission.shape == (n_frames, height, width)
 ```
 
 Use `load_tiff_folder(...)` for a directory of single-frame TIFF files:
 
 ```python
-transmission = nereids.load_tiff_folder("frames", pattern="frame_*.tif")
+counts = nereids.load_tiff_folder("frames", pattern="frame_*.tif")
 ```
 
-Folder frames are sorted lexicographically by filename. Use zero-padded names
-such as `frame_0001.tif`, `frame_0002.tif`, and so on. The optional `pattern`
+Folders that do not follow the chunked VENUS naming convention below are
+sorted lexicographically by filename. Use zero-padded names such as
+`frame_0001.tif`, `frame_0002.tif`, and so on. The optional `pattern`
 matches filenames, not full paths, and supports `*` and `?`.
+
+Note: load-time coverage/thickness masking is deliberately not part of the
+loaders — per the #646 masking policy, coverage and sample thickness are
+model concerns handled downstream, not I/O concerns.
+
+### Chunked VENUS folders
+
+The VENUS DAQ sometimes splits one run into several chunks, each covering
+the full TOF frame range, with files named `<prefix>_<chunk>_<frame>.tif`
+(for example `run_764_00042.tif`). When every filename in the folder follows
+this convention with a single common prefix, `load_tiff_folder(...)` detects
+the layout automatically:
+
+- frames are ordered by numeric frame index (identical to lexicographic
+  order for zero-padded names, and correct where `_10` would sort before
+  `_2` lexicographically);
+- chunks covering identical frame ranges are summed element-wise into a
+  single `(n_frames, height, width)` stack — the physical stack is the sum,
+  not a concatenation. Pass `sum_chunks=False` for the legacy lexicographic
+  concatenation;
+- ragged chunks (differing frame counts or frame sets) or duplicate
+  (chunk, frame) pairs raise `ValueError` — never a silent stack or a
+  partial sum.
+
+Folders with two or more distinct prefixes fall back to legacy
+lexicographic loading (summing across prefixes would merge different runs);
+use `pattern` to select one run, e.g. `pattern="run_764_*"`.
+
+### Pixel-value policy
+
+Raw detector counts are non-negative by construction, so a negative or
+non-finite pixel signals file corruption or a signed-type readout bug. Both
+TIFF loaders take a `pixel_policy` keyword:
+
+- `"reject"` (default): raise `ValueError` naming the file, frame, flat
+  index, and value. For corrupt readout pixels, mask them per acquisition
+  with `detect_bad_pixels(...)` instead of relaxing the policy.
+- `"clip"`: clamp negative values to `0.0`; NaN still raises (clipping a
+  NaN would invent data).
+- `"allow"`: accept all values verbatim — required for pre-normalized
+  transmission stacks, where noise around zero legitimately produces small
+  negative values.
+
+### TOF sidecar (`*_Spectra.txt`)
+
+Autoreduced VENUS folders ship a `<run>_Spectra.txt` sidecar whose first
+CSV column is each frame's start time in seconds (one row per TOF frame).
+`read_tof_sidecar(...)` converts it to the N+1 ascending microsecond bin
+edges that `tof_to_energy_centers(...)` expects, synthesizing the closing
+edge from the last frame width. Bin uniformity is not required — MCP
+shutter segments change the frame width mid-run.
+
+A complete VENUS run folder loads to a stack plus energy axis in three
+calls:
+
+```python
+counts = nereids.load_tiff_folder("run_764")                # chunk-aware
+edges_us = nereids.read_tof_sidecar(
+    "run_764/run_764_Spectra.txt",
+    n_frames=counts.shape[0],                               # validated
+)
+energies = nereids.tof_to_energy_centers(edges_us, flight_path_m=25.0)
+```
 
 ## Normalization
 

@@ -341,8 +341,17 @@ match across chunks; the TOF axis may differ.
 ## TIFF and NeXus I/O
 
 ```python
-stack = nereids.load_tiff_stack("transmission_stack.tif")
-folder_stack = nereids.load_tiff_folder("frames", pattern="frame_*.tif")
+stack = nereids.load_tiff_stack("transmission_stack.tif", pixel_policy="allow")
+folder_stack = nereids.load_tiff_folder(
+    "frames",
+    pattern="frame_*.tif",
+    sum_chunks=True,        # sum chunked VENUS runs element-wise (default)
+    pixel_policy="reject",  # "reject" | "clip" | "allow" (default "reject")
+)
+edges_us = nereids.read_tof_sidecar(
+    "run_764/run_764_Spectra.txt",
+    n_frames=folder_stack.shape[0],
+)
 
 sample = nereids.load_nexus_histogram("sample.nxs")
 open_beam = nereids.load_nexus_histogram("open_beam.nxs")
@@ -352,7 +361,15 @@ energies = nereids.tof_to_energy_centers(
 )
 ```
 
-See [Data I/O and NeXus/TOF](./data-io.md) for ordering and pairing rules.
+`load_tiff_folder` detects chunked VENUS folders
+(`<prefix>_<chunk>_<frame>.tif`) and sums chunks element-wise by default;
+`read_tof_sidecar` converts a VENUS `*_Spectra.txt` sidecar (frame start
+times in seconds) into the N+1 ascending microsecond TOF bin edges that
+`tof_to_energy_centers` expects. Negative or non-finite pixels are rejected
+at load time unless `pixel_policy` says otherwise.
+
+See [Data I/O and NeXus/TOF](./data-io.md) for ordering and pairing rules,
+chunk semantics, and the pixel-value policy.
 
 ## Element and Utility APIs
 

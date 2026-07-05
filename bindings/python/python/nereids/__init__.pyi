@@ -793,15 +793,45 @@ def apply_resolution(
     """Apply tabulated resolution broadening to a spectrum."""
     ...
 
-def load_tiff_stack(path: str) -> NDArray[np.float64]:
-    """Load a multi-frame TIFF file into a 3D numpy array."""
+def load_tiff_stack(
+    path: str,
+    pixel_policy: str = "reject",
+) -> NDArray[np.float64]:
+    """Load a multi-frame TIFF file into a 3D numpy array.
+
+    ``pixel_policy``: ``"reject"`` (default) errors on negative or
+    non-finite pixels; ``"clip"`` clamps negatives to 0.0 (NaN still
+    errors); ``"allow"`` passes values through verbatim (pre-normalized
+    transmission stacks).
+    """
     ...
 
 def load_tiff_folder(
     folder: str,
     pattern: str | None = None,
+    sum_chunks: bool = True,
+    pixel_policy: str = "reject",
 ) -> NDArray[np.float64]:
-    """Load a folder of single-frame TIFFs into a 3D numpy array."""
+    """Load a folder of single-frame TIFFs into a 3D numpy array.
+
+    Chunked VENUS folders (``<prefix>_<chunk>_<frame>.tif``) are detected
+    automatically and summed element-wise across chunks by default
+    (``sum_chunks=True``); ragged chunks are an error.  ``pixel_policy``
+    is ``"reject"`` | ``"clip"`` | ``"allow"`` as in ``load_tiff_stack``.
+    """
+    ...
+
+def read_tof_sidecar(
+    path: str,
+    n_frames: int | None = None,
+) -> NDArray[np.float64]:
+    """Read a VENUS ``*_Spectra.txt`` sidecar into TOF bin edges (µs).
+
+    Column 0 holds each frame's start time in seconds; the result is the
+    N+1 ascending microsecond edges expected by ``tof_to_energy_centers``
+    (the closing edge extrapolates the last frame width).  When
+    ``n_frames`` is given, the edge count is validated against it.
+    """
     ...
 
 def probe_nexus(path: str) -> NexusMetadata:
