@@ -281,6 +281,63 @@ Keyword arguments:
 | `tzero_jacobian="..."` | Select the TZERO Jacobian implementation. |
 | `fit_energy_range=(emin, emax)` | Restrict the cost function to an energy window. |
 
+## Pixel Masks
+
+Pixel masks exist **only to exclude pipeline-corrupting pixels** (dead or
+hot/railed detector defects).  They are not a data-quality or coverage
+filter: low-count pixels are alive and must be kept (the KL-domain fitters
+handle them), and coverage/thickness inhomogeneity is a model concern, not a
+masking concern.  Downstream, a masked pixel is hard-excluded — never
+fitted, `NaN` in the result maps.  Masks are `(height, width)` boolean
+arrays, `True` = exclude, and feed directly into
+`spatial_map(dead_pixels=...)`.
+
+```python
+# Recommended entry point: dead ∪ hot over sample AND open beam.
+mask = nereids.detect_bad_pixels(sample, open_beam=open_beam)
+
+# Individual criteria:
+dead = nereids.detect_dead_pixels(sample)             # exactly zero in every TOF bin
+hot  = nereids.detect_hot_pixels(sample, k_mad=6.0)   # railed/hot point defects
+gone = nereids.detect_dead_pixels_chunked([chunk_a, chunk_b])  # intermittent deadness
+
+result = nereids.spatial_map(cube, energies, isotopes, dead_pixels=mask)
+```
+
+### `detect_bad_pixels(sample, open_beam=None, hot_k_mad=6.0)`
+
+Union mask `dead(sample) ∪ hot(sample) [∪ dead(ob) ∪ hot(ob)]` — deadness
+and hotness are per-acquisition, so a mask built from one stack alone misses
+failures in the other.  This is the validating entry point (rejects
+non-finite/negative counts and empty TOF axes with `ValueError`).
+`hot_k_mad=None` disables the hot screen (dead-only mask).
+
+### `detect_dead_pixels(data)`
+
+Legacy single-stack detector: flags pixels that are exactly `0.0` in every
+TOF bin.  Assumes counts already validated finite and non-negative; prefer
+`detect_bad_pixels` for new code.
+
+### `detect_hot_pixels(data, k_mad=6.0)`
+
+Two-stage hot/railed screen on **raw counts**: a global robust cut on log
+total counts (median + `k_mad` · max(1.4826 · MAD, Poisson floor)) nominates
+candidates, and a local 8-neighbor confirmation (≥ 10× the neighbors'
+median, iterated to a fixpoint) keeps contiguous bright *scene* regions —
+open-beam areas, slit apertures — unmasked while catching isolated point,
+line, and small-cluster defects.  Pass raw detected counts, not
+proton-charge-normalized rates or transmission ratios: scaling breaks the
+Poisson floor.
+
+### `detect_dead_pixels_chunked(chunks)`
+
+Intermittent deadness: a pixel dead for part of the acquisition is invisible
+in a summed stack (uniformly reduced counts, no zeros).  Given per-chunk
+stacks (e.g. per-run splits or event data re-histogrammed in time windows),
+flags pixels all-zero in **any** chunk.  Chunk so that live pixels expect
+λ ≥ 20 counts each (false-flag probability ≤ m·e^(−λ)).  Spatial dims must
+match across chunks; the TOF axis may differ.
+
 ## TIFF and NeXus I/O
 
 ```python
