@@ -1483,6 +1483,25 @@ class TestPixelMasks:
         data[:, 15:35, 15:35] = 10000.0
         assert not np.asarray(nereids.detect_hot_pixels(data)).any()
 
+    def test_edge_to_edge_2px_band_not_flagged_by_design(self):
+        """#646 review R3 (F1, pinned limitation): an EDGE-TO-EDGE railed
+        band >= 2 px wide (both ends off-detector) exposes no end cap or
+        convex corner, so the fixpoint erosion has no seed and the band is
+        NOT caught — deliberately: a slit-aperture open beam produces a
+        genuine full-width bright scene band indistinguishable from it,
+        and a full-span screen would mask that scene (bimodal failure).
+        Declare such full-span pathologies in a file mask.  The same band
+        with one end cap inside the detector IS fully consumed."""
+        edge_to_edge = np.full((4, 9, 9), 100.0)
+        edge_to_edge[:, 3:5, :] = 65535.0
+        assert not np.asarray(nereids.detect_hot_pixels(edge_to_edge)).any()
+
+        one_end_inside = np.full((4, 9, 9), 100.0)
+        one_end_inside[:, 3:5, :7] = 65535.0
+        mask = np.asarray(nereids.detect_hot_pixels(one_end_inside))
+        assert mask[3:5, :7].all(), "band with an end cap must be caught"
+        assert mask.sum() == 14, "only the railed band may be flagged"
+
     def test_1px_bright_line_flagged_by_design(self):
         """#646 review R2 (F3, pinned): a 1-px-wide bright scene line at
         >= 10x local contrast is spatially indistinguishable from a railed

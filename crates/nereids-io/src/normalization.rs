@@ -525,8 +525,26 @@ pub fn detect_dead_pixels_chunked(chunks: &[Array3<f64>]) -> Result<Array2<bool>
 /// stalls; with the zero contribution the median stays on the background
 /// side and erosion completes.  Erosion fully consumes clusters up to 3 px
 /// wide in their narrower dimension (point defects, 1-px lines, 2–3-px-wide
-/// blobs/segments — the physical shapes of railed detector defects).  A
-/// hard-edged railed rectangle ≥4 px wide keeps its interior (only its
+/// blobs/segments — the physical shapes of railed detector defects)
+/// PROVIDED the cluster exposes at least one end cap or convex corner to
+/// normal-scene neighbors — erosion must seed somewhere.  An EDGE-TO-EDGE
+/// railed band ≥2 px wide (both ends off-detector — spanning the full
+/// detector width or height) exposes neither: every interior band pixel
+/// keeps ≥5 railed of 8 neighbors, and even the on-detector-border band
+/// ends keep 3 railed of 5, so every neighbor median stays railed, no
+/// pixel ever seeds, and the band is NOT caught
+/// (`test_detect_hot_pixels_edge_to_edge_2px_band_not_flagged_by_design`).
+/// This is deliberate, not an oversight: a slit-aperture open beam
+/// produces a genuine full-width bright SCENE band that is
+/// pixel-for-pixel indistinguishable from such a defect, so a full-span
+/// row/column screen would mask it — re-introducing the exact bimodal
+/// failure stage 2 exists to prevent.  Full-span detector pathologies of
+/// width ≥2 belong in a declared/file mask.  (A full-span width-1 railed
+/// line IS caught — each of its pixels keeps ≥4 normal neighbors,
+/// `test_detect_hot_pixels_full_railed_column_caught`; and a ≥2-px band
+/// with even one end cap inside the detector is fully consumed from that
+/// cap, `test_detect_hot_pixels_2px_band_one_end_on_detector_fully_caught`.)
+/// A hard-edged railed rectangle ≥4 px wide keeps its interior (only its
 /// convex corners flag): it is pixel-for-pixel indistinguishable from a
 /// hard-edged bright scene region, which must survive (below).
 ///
@@ -1479,6 +1497,67 @@ mod tests {
             mask.iter().filter(|&&m| m).count(),
             10,
             "only the railed column may be flagged"
+        );
+    }
+
+    #[test]
+    fn test_detect_hot_pixels_edge_to_edge_2px_band_not_flagged_by_design() {
+        // Documented-limitation pin (#646 review R3, F1): an EDGE-TO-EDGE
+        // railed band ≥2 px wide (both ends off-detector) exposes no end
+        // cap or convex corner, so the erosion has no seed — interior
+        // band pixels keep 3 bg + 5 railed neighbors (median railed) and
+        // even the on-detector-border band ends keep 2 bg + 3 railed
+        // (median railed).  Nothing flags, deliberately: a slit-aperture
+        // open beam produces a genuine full-width bright SCENE band that
+        // is pixel-for-pixel indistinguishable from this defect, and a
+        // full-span row/column screen would mask it (the bimodal
+        // failure).  Such detector pathologies belong in a declared/file
+        // mask (see rustdoc, "Fixpoint erosion of railed clusters").
+        let mut data = Array3::from_elem((4, 9, 9), 100.0);
+        for t in 0..4 {
+            for y in 3..5 {
+                for x in 0..9 {
+                    data[[t, y, x]] = 65535.0;
+                }
+            }
+        }
+
+        let mask = detect_hot_pixels(&data, HOT_PIXEL_K_MAD).unwrap();
+        assert!(
+            mask.iter().all(|&m| !m),
+            "an edge-to-edge ≥2-px railed band must NOT be flagged \
+             (documented limitation — geometrically ambiguous with a \
+             slit-aperture bright scene band)"
+        );
+    }
+
+    #[test]
+    fn test_detect_hot_pixels_2px_band_one_end_on_detector_fully_caught() {
+        // Companion to the edge-to-edge pin (#646 review R3, F1): the
+        // same 2-row railed band, but with ONE end cap inside the
+        // detector.  The two cap pixels keep 5 bg + 3 railed neighbors
+        // (median bg) and seed in pass 1; the fixpoint then erodes the
+        // band column-pair by column-pair all the way to the opposite
+        // (detector-border) end.
+        let mut data = Array3::from_elem((4, 9, 9), 100.0);
+        for t in 0..4 {
+            for y in 3..5 {
+                for x in 0..7 {
+                    data[[t, y, x]] = 65535.0;
+                }
+            }
+        }
+
+        let mask = detect_hot_pixels(&data, HOT_PIXEL_K_MAD).unwrap();
+        for y in 3..5 {
+            for x in 0..7 {
+                assert!(mask[[y, x]], "band pixel ({y}, {x}) must be flagged");
+            }
+        }
+        assert_eq!(
+            mask.iter().filter(|&&m| m).count(),
+            14,
+            "only the railed band may be flagged"
         );
     }
 

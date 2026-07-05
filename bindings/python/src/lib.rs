@@ -2645,7 +2645,17 @@ fn detect_dead_pixels<'py>(
 /// defect-cluster radius), eroding railed CLUSTERS from the boundary
 /// inward — a single pass would miss the interior of clusters >= 2 px
 /// wide, whose neighbors are railed too.  Clusters up to 3 px wide are
-/// fully consumed.  The local confirmation keeps bimodal scenes honest:
+/// fully consumed PROVIDED they expose at least one end cap or convex
+/// corner to normal-scene neighbors (erosion must seed somewhere): an
+/// EDGE-TO-EDGE railed band >= 2 px wide, spanning the full detector
+/// width or height with both ends off-detector, has no seed and is NOT
+/// caught — deliberately, because a slit-aperture open beam produces a
+/// genuine full-width bright scene band pixel-for-pixel
+/// indistinguishable from it, and a full-span screen would mask that
+/// scene (the bimodal failure).  Declare such full-span detector
+/// pathologies in a file mask.  A full-span width-1 railed line IS
+/// caught (each pixel keeps >= 4 normal neighbors).  The local
+/// confirmation keeps bimodal scenes honest:
 /// with a dark majority holding the median, the global statistics describe
 /// only the dark population and the entire bright region would otherwise
 /// be masked — a contiguous bright region is scene, not a defect.  Upper
