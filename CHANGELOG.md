@@ -16,7 +16,15 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
   low-count filter) confirmed by a 10× local-8-neighbor-median isolation
   test iterated to a fixpoint (already-flagged neighbors stop vouching),
   which erodes railed clusters up to 3 px wide from the boundary inward
-  — a single local pass would miss the interior of clusters ≥2 px wide.
+  — a single local pass would miss the interior of clusters ≥2 px wide —
+  provided the cluster exposes at least one end cap or convex corner to
+  normal-scene neighbors (erosion must seed somewhere).  An edge-to-edge
+  railed band ≥2 px wide (both ends off-detector) has no seed and is not
+  caught — deliberate: a slit-aperture open beam produces a genuine
+  full-width bright scene band indistinguishable from it, and a
+  full-span row/column screen would mask that scene (the bimodal
+  failure); declare such full-span detector pathologies in a file mask.
+  A full-span width-1 railed line is caught.
   Bimodal scenes (dark-majority sample + bright open-beam region) never
   get their bright region masked — a contiguous bright region ≥2 px
   wide is scene, not a defect, and the erosion never seeds in it; a
@@ -36,15 +44,32 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
 
 ### Changed
 
-- **GUI normalization now masks dead(sample) ∪ dead(OB) ∪ hot(sample)
-  ∪ hot(OB)** instead of dead(sample) only (#643), on both the TIFF-pair
-  and the HDF5-with-open-beam paths — masked-pixel counts may differ on
-  re-normalization of existing data.  Mask provenance is explicit
-  (#646): the file-declared mask (HDF5 dead-pixel dataset or a saved
-  project's mask) is kept separately, and every normalization recomputes
-  the effective mask from scratch as declared ∪ freshly-detected —
-  detections never accumulate across open-beam swaps or
-  re-normalizations.
+- **GUI normalization now masks dead ∪ hot on every raw-counts path**
+  (#643): the TIFF-pair and HDF5-with-open-beam paths mask
+  dead(sample) ∪ hot(sample) ∪ dead(OB) ∪ hot(OB) instead of
+  dead(sample) only, and the HDF5-without-open-beam path (histogram or
+  event data prepared with uniform weighting) now runs the same
+  detection on the sample stack alone — masked-pixel counts may differ
+  on re-normalization of existing data.  TransmissionTiff runs no
+  detection: its data is a pre-normalized transmission ratio, not raw
+  counts, so the hot screen's Poisson floor does not apply and an
+  all-zero "dead" test would conflate opaque scene with a dead
+  detector.  Mask provenance is explicit (#646): the file-declared mask
+  (HDF5 dead-pixel dataset or a saved project's mask) is kept
+  separately, and every normalization recomputes the effective mask
+  from scratch as declared ∪ freshly-detected — detections never
+  accumulate across open-beam swaps or re-normalizations.
+- **Project files persist the declared mask component only** (#646):
+  `/intermediate/dead_pixels` (path, dtype, and shape unchanged) now
+  stores the declared mask rather than the effective
+  (declared ∪ detected) mask, so save→load→save cycles no longer bake
+  each session's detections into the next session's declared component
+  — detections are session-scoped and recomputed on normalization.
+  Project files written by earlier versions stored the effective mask;
+  loading one promotes it to declared once (the only lossless reading
+  of a file that never recorded the split) — masks saved by old
+  versions keep any detections they had already absorbed, but stop
+  growing from now on.
 - Dead/hot detectors' validating entry points (`detect_bad_pixels`,
   `detect_hot_pixels`, `detect_dead_pixels_chunked`) now reject stacks
   and chunks with an empty TOF axis (`shape[0] == 0`), whose vacuous
