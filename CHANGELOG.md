@@ -13,13 +13,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
   chunked VENUS naming convention (`<prefix>_<chunk>_<frame>.tif`) are
   detected automatically — frames order by numeric index and chunks
   covering identical frame ranges are summed element-wise by default
-  (`sum_chunks=False` / `TiffFolderOptions::sum_chunks` opts out; ragged
-  chunks or duplicate (chunk, frame) pairs are a hard `ChunkMismatch`
-  error, never a silent stack). New `load_tiff_folder_with_options` /
-  `load_tiff_auto_with_options` / `load_tiff_stack_with_options` return a
-  `TiffLoadInfo` provenance report (`n_files`, `n_chunks`, `chunk_ids`,
-  `chunks_summed`, `n_clipped_pixels`); the GUI logs "summed k DAQ
-  chunks" provenance. The Python loaders emit a `UserWarning` when
+  (`sum_chunks=False` / `TiffFolderOptions::sum_chunks` opts out; on the
+  default summing path ragged chunks or duplicate (chunk, frame) pairs are
+  a hard `ChunkMismatch` error, never a silent stack). New
+  `load_tiff_folder_with_options` / `load_tiff_auto_with_options` /
+  `load_tiff_stack_with_options` return a `TiffLoadInfo` provenance report
+  (`n_files`, `n_chunks`, `chunk_ids`, `chunks_summed`,
+  `n_clipped_pixels`); the GUI logs "summed k DAQ chunks" provenance. The Python loaders emit a `UserWarning` when
   chunks were summed (naming the chunk ids and the `sum_chunks=False`
   escape hatch) or when `pixel_policy="clip"` clamped pixels, and
   `load_tiff_folder(..., return_info=True)` returns the provenance dict
@@ -42,7 +42,23 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
   summed" when transmission mode loads a chunked folder with summing
   disabled, and `load_tiff_folder` on a nonexistent path now raises
   `FileNotFoundError` (`NotADirectoryError` is reserved for paths that
-  exist but are not directories), matching its documented contract.
+  exist but are not directories, preserving the real metadata-error kind
+  so a permission-denied parent stays `OSError`), matching its documented
+  contract.
+- **`sum_chunks=False` honors its opt-out contract on inconsistent chunks**
+  (#636): ragged chunks (differing frame counts/sets) or duplicate
+  (chunk, frame) pairs are a hard `ChunkMismatch` error only on the
+  default summing path — where summing them would corrupt counts. With
+  `sum_chunks=False` there is nothing to corrupt, so the same folder now
+  loads as the documented lexicographic concatenation of every file
+  (frame count = the sum of all files) instead of erroring — inspecting
+  raw frames of a ragged folder is exactly when `sum_chunks=False` is
+  reached for. The irregularity is surfaced through a new
+  `TiffLoadInfo::chunk_inconsistent` flag (the `return_info` dict gains a
+  `chunk_inconsistent` key, the Python loader emits a `UserWarning`, and
+  the GUI's transmission-mode provenance logs it), never silently
+  swallowed. The default summing path is unchanged — inconsistent chunks
+  that would be summed still fail loud.
 - **`read_tof_sidecar`** (#636): reads a VENUS `*_Spectra.txt` sidecar
   (frame start times in seconds) into the N+1 ascending microsecond TOF
   bin edges `tof_to_energy_centers` expects, extrapolating the closing

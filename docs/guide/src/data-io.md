@@ -62,8 +62,13 @@ the layout automatically:
   way — chunk-patterned names in numeric frame order, others
   lexicographically;
 - ragged chunks (differing frame counts or frame sets) or duplicate
-  (chunk, frame) pairs raise `ValueError` — never a silent stack or a
-  partial sum.
+  (chunk, frame) pairs raise `ValueError` on the default summing path —
+  never a silent stack or a partial sum. With `sum_chunks=False` there is
+  nothing to corrupt, so the same inconsistent folder loads as the
+  lexicographic concatenation of every file (frame count = the sum of all
+  files) and the irregularity is reported via `chunk_inconsistent` (and a
+  `UserWarning`) instead of raising — this is exactly the case you reach for
+  `sum_chunks=False` to inspect raw frames.
 
 Folders with two or more distinct prefixes fall back to legacy
 lexicographic loading (summing across prefixes would merge different runs);
@@ -87,7 +92,8 @@ a second return value:
 counts, info = nereids.load_tiff_folder("run_764", return_info=True)
 # info == {"n_files": ..., "n_chunks": ..., "chunk_ids": [...],
 #          "chunks_summed": ..., "n_clipped_pixels": ...,
-#          "n_unrecognized_files": ..., "unrecognized_examples": [...]}
+#          "n_unrecognized_files": ..., "unrecognized_examples": [...],
+#          "chunk_inconsistent": ...}
 ```
 
 **One acquisition per folder.** The chunk heuristic assumes the folder
