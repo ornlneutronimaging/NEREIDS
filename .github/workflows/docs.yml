@@ -34,7 +34,7 @@ jobs:
     #                              doc) + doc-python (pdoc on installed
     #                              wheel)
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
 
       # Fail fast on drift between the PyO3 type stubs and the curated
       # python-api.md page (issue #533).  The script is stdlib-only;

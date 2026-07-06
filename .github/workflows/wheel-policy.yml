@@ -32,7 +32,7 @@ jobs:
     name: GUI wheel builds on manylinux_2_28
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
 
       # Same action SHA, container selection, before-script, and args
       # as publish.yml's build-gui job — the gate must reproduce the
@@ -65,7 +65,7 @@ jobs:
     name: Bindings wheel builds on manylinux_2_28
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
 
       # Same action SHA, container selection, before-script, and args
       # as publish.yml's build-wheels Linux matrix entry — the gate
