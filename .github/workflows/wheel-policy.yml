@@ -32,7 +32,7 @@ jobs:
     name: GUI wheel builds on manylinux_2_28
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
 
       # Same action SHA, container selection, before-script, and args
       # as publish.yml's build-gui job — the gate must reproduce the
@@ -55,7 +55,7 @@ jobs:
         run: ./scripts/check_wheel_policy.sh apps/gui/dist/*.whl
 
       - name: Upload wheel for inspection
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
         with:
           name: gui-wheel-manylinux-2-28-pr
           path: apps/gui/dist/*.whl
@@ -65,7 +65,7 @@ jobs:
     name: Bindings wheel builds on manylinux_2_28
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
 
       # Same action SHA, container selection, before-script, and args
       # as publish.yml's build-wheels Linux matrix entry — the gate
@@ -86,7 +86,7 @@ jobs:
         run: ./scripts/check_wheel_policy.sh dist/*.whl
 
       - name: Upload wheel for inspection
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
         with:
           name: bindings-wheel-manylinux-2-28-pr
           path: dist/*.whl
