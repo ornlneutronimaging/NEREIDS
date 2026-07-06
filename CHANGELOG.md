@@ -9,6 +9,33 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
 
 ### Added
 
+- **Chunk-aware TIFF folder loading** (#636): folders following the
+  chunked VENUS naming convention (`<prefix>_<chunk>_<frame>.tif`) are
+  detected automatically — frames order by numeric index and chunks
+  covering identical frame ranges are summed element-wise by default
+  (`sum_chunks=False` / `TiffFolderOptions::sum_chunks` opts out; ragged
+  chunks or duplicate (chunk, frame) pairs are a hard `ChunkMismatch`
+  error, never a silent stack). New `load_tiff_folder_with_options` /
+  `load_tiff_auto_with_options` / `load_tiff_stack_with_options` return a
+  `TiffLoadInfo` provenance report (`n_files`, `n_chunks`, `chunk_ids`,
+  `chunks_summed`, `n_clipped_pixels`); the GUI logs "summed k DAQ
+  chunks" provenance. The issue's coverage-mask item was dropped per its
+  scope amendment: per the #646 masking policy, coverage/thickness is a
+  model concern, not an I/O concern.
+- **`read_tof_sidecar`** (#636): reads a VENUS `*_Spectra.txt` sidecar
+  (frame start times in seconds) into the N+1 ascending microsecond TOF
+  bin edges `tof_to_energy_centers` expects, extrapolating the closing
+  edge from the last frame width (shutter segments with different frame
+  widths are valid). The GUI auto-detects `*_Spectra.txt` spectrum picks
+  and never falls back to the verbatim-µs parser on sidecar failure. A
+  VENUS run folder now loads to stack + energy axis in 3 Python calls.
+- **`run_health`** (#636): DASlogs-based run-health summary
+  (`pause_fraction`, `beam_dip_fraction`, `median_power`, `duration_s`)
+  using last-value-held time-weighted integration (DASlogs PVs log
+  transitions; entry means are wrong). SNS PV-name defaults (`pause`,
+  `proton_charge`); other facilities pass their own. Absent PVs report
+  `None`; present-but-malformed PVs are hard errors.
+
 - **`fit_energy_scale` + `fit_temperature` jointly, in every fitter**
   (#634): the flag combination resonance thermometry needs — calibrate
   the SAMMY energy scale (t₀, L_scale) *and* fit temperature in one
@@ -94,6 +121,20 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
   (optionally) the open-beam stack, in Rust and Python.
 - `nereids-core` gains a `stats` module (`median`,
   `median_abs_deviation`, `MAD_TO_SIGMA`).
+
+### Fixed
+
+- **2-chunk VENUS folders no longer load as doubled stacks** (#636):
+  `load_tiff_folder` previously concatenated all files lexicographically,
+  so a run split into k DAQ chunks silently produced a k× stack; chunked
+  folders now sum element-wise (see Added).
+- **Negative / non-finite pixels no longer import silently** (#636): TIFF
+  loaders now reject them by default (`IoError::BadPixelValue` naming
+  file/frame/index/value and pointing at `detect_bad_pixels()`), with
+  `pixel_policy="clip"` (clamp negatives to zero, counted in
+  `TiffLoadInfo::n_clipped_pixels`; NaN still errors) and
+  `pixel_policy="allow"` (pre-normalized transmission, used by the MCP
+  server and the GUI transmission tab) as explicit escape hatches.
 
 ### Changed
 

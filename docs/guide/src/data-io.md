@@ -190,6 +190,41 @@ The event loader reads `/entry/neutrons/event_time_offset`, `/x`, and `/y`,
 bins events into a linear TOF grid, and returns the same `NexusData` shape
 contract as the histogram loader.
 
+## Run Health (DASlogs)
+
+A run can be paused mid-acquisition or suffer accelerator beam dips; both
+silently reduce the effective exposure of the summed stack.
+`run_health(...)` summarizes the slow-control logs under `/entry/DASlogs`:
+
+```python
+health = nereids.run_health("sample.nxs")
+print(health.pause_fraction)     # time-weighted fraction spent paused
+print(health.beam_dip_fraction)  # fraction with power < 0.5 * median
+print(health.median_power, health.duration_s)
+```
+
+DASlogs PVs log *transitions*, not regular samples — a run paused for 90%
+of its duration may contain just two pause entries, so entry means are
+wrong. All fractions use last-value-held time-weighted integration over
+the run window (`/entry/duration` when present, else the latest log
+timestamp, a lower bound).
+
+The PV-name defaults are the SNS ones (`pause`, `proton_charge`); other
+facilities pass their own names, and the dip threshold is adjustable:
+
+```python
+health = nereids.run_health(
+    "sample.nxs",
+    pause_pv="pause",
+    power_pv="proton_charge",
+    power_dip_fraction=0.5,
+)
+```
+
+Absent PVs (or a missing `DASlogs` group) yield `None` fields — absence is
+not an error. A PV that is present but malformed (length mismatch,
+non-finite entries, decreasing timestamps) raises `ValueError`.
+
 ## TOF Edges to Energy Centers
 
 NeXus loaders return counts in ascending TOF order. Neutron energy decreases

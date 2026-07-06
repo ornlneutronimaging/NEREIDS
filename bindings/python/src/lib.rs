@@ -3346,6 +3346,111 @@ fn probe_nexus(path: &str) -> PyResult<PyNexusMetadata> {
     Ok(PyNexusMetadata { inner: meta })
 }
 
+/// DASlogs-based run-health summary.
+#[pyclass(name = "RunHealth")]
+struct PyRunHealth {
+    inner: nereids_io::daslogs::RunHealth,
+}
+
+#[pymethods]
+impl PyRunHealth {
+    /// Time-weighted fraction of the run spent paused, if the pause PV
+    /// is present.
+    #[getter]
+    fn pause_fraction(&self) -> Option<f64> {
+        self.inner.pause_fraction
+    }
+
+    /// Time-weighted fraction of the run with power below
+    /// `power_dip_fraction × median(power)`, if the power PV is present.
+    #[getter]
+    fn beam_dip_fraction(&self) -> Option<f64> {
+        self.inner.beam_dip_fraction
+    }
+
+    /// Sample median of the power PV entries (not time-weighted), if
+    /// present.
+    #[getter]
+    fn median_power(&self) -> Option<f64> {
+        self.inner.median_power
+    }
+
+    /// Run duration in seconds (`/entry/duration`, or the latest log
+    /// timestamp as a lower bound), if determinable.
+    #[getter]
+    fn duration_s(&self) -> Option<f64> {
+        self.inner.duration_s
+    }
+
+    /// Number of pause-PV log entries read (0 when absent).
+    #[getter]
+    fn n_pause_entries(&self) -> usize {
+        self.inner.n_pause_entries
+    }
+
+    /// Number of power-PV log entries read (0 when absent).
+    #[getter]
+    fn n_power_entries(&self) -> usize {
+        self.inner.n_power_entries
+    }
+
+    fn __repr__(&self) -> String {
+        format!(
+            "RunHealth(pause_fraction={:?}, beam_dip_fraction={:?}, median_power={:?}, duration_s={:?})",
+            self.inner.pause_fraction,
+            self.inner.beam_dip_fraction,
+            self.inner.median_power,
+            self.inner.duration_s,
+        )
+    }
+}
+
+/// Compute a run-health summary from /entry/DASlogs of a NeXus file.
+///
+/// DASlogs PVs log transitions, not regular samples, so entry means are
+/// wrong; this uses last-value-held time-weighted integration over the
+/// run window (``/entry/duration`` when present, else the latest log
+/// timestamp — a lower bound).  Absent PVs (or a missing DASlogs group)
+/// yield ``None`` fields, not errors.
+///
+/// Args:
+///     path: Path to the NeXus/HDF5 file.
+///     pause_pv: DASlogs PV nonzero while the DAQ is paused
+///         (SNS default ``"pause"``).
+///     power_pv: DASlogs PV proxying beam power (SNS default
+///         ``"proton_charge"``).  Other facilities pass their own names.
+///     power_dip_fraction: Beam-dip threshold as a fraction of the
+///         median power (default 0.5 — between nominal source jitter
+///         and true beam-off dips).
+///
+/// Returns:
+///     RunHealth with pause_fraction, beam_dip_fraction, median_power,
+///     duration_s, n_pause_entries, n_power_entries.
+///
+/// Raises:
+///     ValueError: For a present-but-malformed PV (length mismatch,
+///         non-finite entries, decreasing timestamps), a non-positive
+///         run window, or an invalid power_dip_fraction.
+///     IOError: If the file is missing/unreadable or /entry is absent
+///         (HDF5 access failures).
+#[pyfunction]
+#[pyo3(signature = (path, pause_pv="pause", power_pv="proton_charge", power_dip_fraction=nereids_io::daslogs::DEFAULT_POWER_DIP_FRACTION))]
+fn run_health(
+    path: &str,
+    pause_pv: &str,
+    power_pv: &str,
+    power_dip_fraction: f64,
+) -> PyResult<PyRunHealth> {
+    let options = nereids_io::daslogs::RunHealthOptions {
+        pause_pv: pause_pv.to_string(),
+        power_pv: power_pv.to_string(),
+        power_dip_fraction,
+    };
+    let health = nereids_io::daslogs::run_health(std::path::Path::new(path), &options)
+        .map_err(map_io_error)?;
+    Ok(PyRunHealth { inner: health })
+}
+
 /// Load pre-histogrammed counts from a NeXus/HDF5 file.
 ///
 /// Reads `/entry/histogram/counts` (4D: rotation × y × x × tof) and
@@ -3481,7 +3586,9 @@ fn nereids(m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_function(wrap_pyfunction!(read_tof_sidecar, m)?)?;
     m.add_class::<PyNexusMetadata>()?;
     m.add_class::<PyNexusData>()?;
+    m.add_class::<PyRunHealth>()?;
     m.add_function(wrap_pyfunction!(probe_nexus, m)?)?;
+    m.add_function(wrap_pyfunction!(run_health, m)?)?;
     m.add_function(wrap_pyfunction!(load_nexus_histogram, m)?)?;
     m.add_function(wrap_pyfunction!(load_nexus_events, m)?)?;
     m.add_function(wrap_pyfunction!(normalize, m)?)?;

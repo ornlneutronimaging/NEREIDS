@@ -359,6 +359,7 @@ energies = nereids.tof_to_energy_centers(
     sample.tof_edges_us,
     sample.flight_path_m or 25.0,
 )
+health = nereids.run_health("sample.nxs")   # RunHealth: pause/beam-dip fractions
 ```
 
 `load_tiff_folder` detects chunked VENUS folders
@@ -366,10 +367,12 @@ energies = nereids.tof_to_energy_centers(
 `read_tof_sidecar` converts a VENUS `*_Spectra.txt` sidecar (frame start
 times in seconds) into the N+1 ascending microsecond TOF bin edges that
 `tof_to_energy_centers` expects. Negative or non-finite pixels are rejected
-at load time unless `pixel_policy` says otherwise.
+at load time unless `pixel_policy` says otherwise. `run_health` returns a
+`RunHealth` summary of the `/entry/DASlogs` pause and beam-power logs using
+last-value-held time-weighted integration (SNS PV-name defaults).
 
 See [Data I/O and NeXus/TOF](./data-io.md) for ordering and pairing rules,
-chunk semantics, and the pixel-value policy.
+chunk semantics, the pixel-value policy, and run health.
 
 ## Element and Utility APIs
 

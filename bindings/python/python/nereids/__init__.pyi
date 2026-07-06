@@ -25,6 +25,30 @@ class NexusMetadata:
     @property
     def tof_offset_ns(self) -> float | None: ...
 
+class RunHealth:
+    """DASlogs-based run-health summary (``None`` = PV absent)."""
+
+    @property
+    def pause_fraction(self) -> float | None:
+        """Time-weighted fraction of the run spent paused."""
+        ...
+    @property
+    def beam_dip_fraction(self) -> float | None:
+        """Time-weighted fraction with power below the dip threshold."""
+        ...
+    @property
+    def median_power(self) -> float | None:
+        """Sample median of the power PV entries (not time-weighted)."""
+        ...
+    @property
+    def duration_s(self) -> float | None:
+        """Run duration in seconds (file value, or last-timestamp lower bound)."""
+        ...
+    @property
+    def n_pause_entries(self) -> int: ...
+    @property
+    def n_power_entries(self) -> int: ...
+
 class NexusData:
     """Result of loading NeXus histogram or event data."""
 
@@ -836,6 +860,21 @@ def read_tof_sidecar(
 
 def probe_nexus(path: str) -> NexusMetadata:
     """Probe a NeXus/HDF5 file for available data without loading it."""
+    ...
+
+def run_health(
+    path: str,
+    pause_pv: str = "pause",
+    power_pv: str = "proton_charge",
+    power_dip_fraction: float = 0.5,
+) -> RunHealth:
+    """Compute a run-health summary from ``/entry/DASlogs``.
+
+    DASlogs PVs log transitions, so statistics use last-value-held
+    time-weighted integration over the run window, never entry means.
+    The PV-name defaults are the SNS ones; other facilities pass their
+    own.  Absent PVs yield ``None`` fields, not errors.
+    """
     ...
 
 def load_nexus_histogram(

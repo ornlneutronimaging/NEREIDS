@@ -2122,6 +2122,44 @@ class TestNexusIO:
         input_data = nereids.from_counts(sample, ob)
         assert input_data is not None  # successfully created InputData
 
+    def test_run_health_daslogs(self, tmp_path):
+        """T47: run_health reads DASlogs pause/power via last-value-held
+        time-weighted integration; absent PVs yield None."""
+        import h5py
+
+        path = str(tmp_path / "run.h5")
+        with h5py.File(path, "w") as f:
+            entry = f.create_group("entry")
+            entry.create_dataset("duration", data=100.0)
+            das = entry.create_group("DASlogs")
+            pause = das.create_group("pause")
+            pause.create_dataset("time", data=np.array([0.0, 10.0, 20.0]))
+            pause.create_dataset("value", data=np.array([0.0, 1.0, 0.0]))
+            power = das.create_group("proton_charge")
+            power.create_dataset(
+                "time", data=np.array([0.0, 10.0, 20.0, 30.0])
+            )
+            power.create_dataset(
+                "value", data=np.array([10.0, 1.0, 10.0, 10.0])
+            )
+
+        health = nereids.run_health(path)
+        assert isinstance(health, nereids.RunHealth)
+        # Paused (value 1) over [10, 20) of a 100 s run.
+        assert health.pause_fraction == pytest.approx(0.1)
+        # Power 1 < 0.5 * median(10) over [10, 20) of 100 s.
+        assert health.median_power == pytest.approx(10.0)
+        assert health.beam_dip_fraction == pytest.approx(0.1)
+        assert health.duration_s == pytest.approx(100.0)
+        assert health.n_pause_entries == 3
+        assert health.n_power_entries == 4
+
+        # Custom PV name that is absent -> None fields, not an error.
+        other = nereids.run_health(path, pause_pv="no_such_pv")
+        assert other.pause_fraction is None
+        assert other.n_pause_entries == 0
+        assert other.beam_dip_fraction is not None
+
 
 # ---------------------------------------------------------------------------
 # Real VENUS regression gate (issue #465)
