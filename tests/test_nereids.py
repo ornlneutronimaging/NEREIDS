@@ -6,6 +6,7 @@ so no network access or ENDF downloads are required.
 
 import os
 import tempfile
+import warnings
 
 import numpy as np
 import pytest
@@ -1648,6 +1649,369 @@ class TestTiffIO:
         with pytest.raises(OSError):
             nereids.load_tiff_stack("/nonexistent/path.tif")
 
+    @staticmethod
+    def _write_chunked_folder(tmpdir, n_frames=4, h=2, w=3):
+        """Write a 2-chunk VENUS-style folder (run_764_* / run_765_*).
+
+        Frame f of chunk c holds the constant value ``(c - 763) * 100 + f``
+        so per-element sums are easy to assert.  Returns the expected
+        summed stack.
+        """
+        import tifffile
+
+        expected = np.zeros((n_frames, h, w))
+        for c in (764, 765):
+            for f in range(n_frames):
+                value = (c - 763) * 100 + f
+                frame = np.full((h, w), value, dtype=np.uint16)
+                tifffile.imwrite(
+                    os.path.join(tmpdir, f"run_{c}_{f:04d}.tif"), frame
+                )
+                expected[f] += value
+        return expected
+
+    def test_load_tiff_folder_chunked_sums(self):
+        """T40: a 2-chunk folder sums element-wise by default; opting out
+        loads the 2x lexicographic concatenation."""
+        pytest.importorskip("tifffile")
+        n_frames, h, w = 4, 2, 3
+
+        with tempfile.TemporaryDirectory() as tmpdir:
+            expected = self._write_chunked_folder(tmpdir, n_frames, h, w)
+
+            summed = np.asarray(nereids.load_tiff_folder(tmpdir))
+            assert summed.shape == (n_frames, h, w)
+            np.testing.assert_allclose(summed, expected)
+
+            legacy = np.asarray(nereids.load_tiff_folder(tmpdir, sum_chunks=False))
+            assert legacy.shape == (2 * n_frames, h, w)
+            # Lexicographic order: all of chunk 764, then all of chunk 765.
+            assert legacy[0, 0, 0] == 100.0
+            assert legacy[n_frames, 0, 0] == 200.0
+
+    def test_pixel_policy_negative_int16(self):
+        """T41: a negative signed pixel rejects by default (naming
+        detect_bad_pixels), clips to 0 under "clip", passes under "allow"."""
+        tifffile = pytest.importorskip("tifffile")
+        frame = np.array([[10, -32554], [30, 40]], dtype=np.int16)
+
+        with tempfile.NamedTemporaryFile(suffix=".tif", delete=False) as f:
+            path = f.name
+        try:
+            tifffile.imwrite(path, frame)
+
+            with pytest.raises(ValueError, match="detect_bad_pixels"):
+                nereids.load_tiff_stack(path)
+
+            clipped = np.asarray(nereids.load_tiff_stack(path, pixel_policy="clip"))
+            assert clipped[0, 0, 1] == 0.0
+            assert clipped[0, 0, 0] == 10.0
+
+            allowed = np.asarray(nereids.load_tiff_stack(path, pixel_policy="allow"))
+            assert allowed[0, 0, 1] == -32554.0
+        finally:
+            os.unlink(path)
+
+    def test_pixel_policy_nan_float32(self):
+        """T42: a NaN float pixel rejects by default and passes under
+        "allow"."""
+        tifffile = pytest.importorskip("tifffile")
+        frame = np.array([[1.0, np.nan], [3.0, 4.0]], dtype=np.float32)
+
+        with tempfile.NamedTemporaryFile(suffix=".tif", delete=False) as f:
+            path = f.name
+        try:
+            tifffile.imwrite(path, frame)
+
+            with pytest.raises(ValueError):
+                nereids.load_tiff_stack(path)
+
+            allowed = np.asarray(nereids.load_tiff_stack(path, pixel_policy="allow"))
+            assert np.isnan(allowed[0, 0, 1])
+        finally:
+            os.unlink(path)
+
+    def test_venus_run_folder_three_calls(self):
+        """T43 (acceptance): a 2-chunk VENUS run folder with a
+        *_Spectra.txt sidecar loads to stack + energy axis in 3 calls."""
+        pytest.importorskip("tifffile")
+        n_frames, h, w = 4, 2, 3
+
+        with tempfile.TemporaryDirectory() as tmpdir:
+            expected = self._write_chunked_folder(tmpdir, n_frames, h, w)
+            # Evidence-shaped sidecar mirroring measured IPTS-37432 VENUS
+            # autoreduce output (synthetic counts): header
+            # "shutter_time,counts", first start time 1.12e-6 s (7 x the
+            # 160 ns bin -- NOT zero; autoreduce drops pre-trigger bins),
+            # uniform 1.6e-7 s steps.
+            sidecar = os.path.join(tmpdir, "run_Spectra.txt")
+            with open(sidecar, "w") as fh:
+                fh.write("shutter_time,counts\n")
+                for f in range(n_frames):
+                    fh.write(f"{1.12e-6 + f * 1.6e-7:.10e},{100 + f}\n")
+
+            # Call 1: chunk-aware stack (the sidecar .txt is ignored by
+            # the TIFF extension filter).
+            counts = np.asarray(nereids.load_tiff_folder(tmpdir))
+            # Call 2: sidecar -> N+1 ascending µs edges, validated.
+            edges_us = np.asarray(
+                nereids.read_tof_sidecar(sidecar, n_frames=counts.shape[0])
+            )
+            # Call 3: energy centers.
+            energies = np.asarray(
+                nereids.tof_to_energy_centers(edges_us, 25.0)
+            )
+
+            assert counts.shape == (n_frames, h, w)
+            np.testing.assert_allclose(counts, expected)
+            assert edges_us.shape == (n_frames + 1,)
+            # 1.12 us first edge, 0.16 us steps (seconds -> us conversion).
+            np.testing.assert_allclose(edges_us[0], 1.12, rtol=1e-12)
+            np.testing.assert_allclose(np.diff(edges_us), 0.16, rtol=1e-9)
+            assert np.all(np.diff(edges_us) > 0)
+            assert energies.shape == (n_frames,)
+            assert np.all(np.diff(energies) > 0)
+
+    def test_read_tof_sidecar_errors(self):
+        """T44: frame-count mismatch raises ValueError; a missing sidecar
+        raises FileNotFoundError."""
+        with tempfile.TemporaryDirectory() as tmpdir:
+            sidecar = os.path.join(tmpdir, "run_Spectra.txt")
+            with open(sidecar, "w") as fh:
+                fh.write("0.001,10\n0.002,20\n0.003,30\n")
+
+            with pytest.raises(ValueError):
+                nereids.read_tof_sidecar(sidecar, n_frames=7)
+
+            with pytest.raises(FileNotFoundError):
+                nereids.read_tof_sidecar(
+                    os.path.join(tmpdir, "missing_Spectra.txt")
+                )
+
+    def test_invalid_pixel_policy_string(self):
+        """T45: an invalid pixel_policy lists the accepted options."""
+        tifffile = pytest.importorskip("tifffile")
+        frame = np.ones((2, 2), dtype=np.uint16)
+
+        with tempfile.NamedTemporaryFile(suffix=".tif", delete=False) as f:
+            path = f.name
+        try:
+            tifffile.imwrite(path, frame)
+            with pytest.raises(ValueError, match="reject"):
+                nereids.load_tiff_stack(path, pixel_policy="bogus")
+            with pytest.raises(ValueError, match="allow"):
+                nereids.load_tiff_folder(
+                    os.path.dirname(path), pixel_policy="bogus"
+                )
+        finally:
+            os.unlink(path)
+
+    def test_chunk_sum_warns_and_return_info(self):
+        """T46: summing chunks emits a UserWarning naming the chunk count,
+        ids, and the sum_chunks=False escape hatch; return_info=True
+        returns (array, info) with the full provenance dict."""
+        pytest.importorskip("tifffile")
+        n_frames, h, w = 4, 2, 3
+
+        with tempfile.TemporaryDirectory() as tmpdir:
+            expected = self._write_chunked_folder(tmpdir, n_frames, h, w)
+
+            with pytest.warns(
+                UserWarning,
+                match=r"summed 2 DAQ chunks \(764, 765\).*sum_chunks=False",
+            ):
+                arr, info = nereids.load_tiff_folder(tmpdir, return_info=True)
+
+            np.testing.assert_allclose(np.asarray(arr), expected)
+            assert info == {
+                "n_files": 2 * n_frames,
+                "n_chunks": 2,
+                "chunk_ids": [764, 765],
+                "chunks_summed": True,
+                "n_clipped_pixels": 0,
+                "n_unrecognized_files": 0,
+                "unrecognized_examples": [],
+                "chunk_inconsistent": False,
+            }
+
+    def test_clip_warns(self):
+        """T47: pixel_policy="clip" emits a UserWarning counting the
+        clipped pixels."""
+        tifffile = pytest.importorskip("tifffile")
+        frame = np.array([[10, -5], [-3, 40]], dtype=np.int16)
+
+        with tempfile.NamedTemporaryFile(suffix=".tif", delete=False) as f:
+            path = f.name
+        try:
+            tifffile.imwrite(path, frame)
+            with pytest.warns(UserWarning, match=r"2 negative pixel\(s\) clipped"):
+                clipped = np.asarray(
+                    nereids.load_tiff_stack(path, pixel_policy="clip")
+                )
+            assert clipped[0, 0, 1] == 0.0
+            assert clipped[0, 1, 0] == 0.0
+        finally:
+            os.unlink(path)
+
+    def test_plain_folder_no_warning(self):
+        """T48: a plain (non-chunked) clean folder loads with no warning;
+        return_info reports the un-chunked layout."""
+        tifffile = pytest.importorskip("tifffile")
+        n_frames, h, w = 3, 2, 2
+
+        with tempfile.TemporaryDirectory() as tmpdir:
+            for i in range(n_frames):
+                tifffile.imwrite(
+                    os.path.join(tmpdir, f"frame_{i:04d}.tif"),
+                    np.ones((h, w), dtype=np.uint16),
+                )
+            with warnings.catch_warnings():
+                warnings.simplefilter("error")
+                arr, info = nereids.load_tiff_folder(tmpdir, return_info=True)
+            assert np.asarray(arr).shape == (n_frames, h, w)
+            assert info == {
+                "n_files": n_frames,
+                "n_chunks": 0,
+                "chunk_ids": [],
+                "chunks_summed": False,
+                "n_clipped_pixels": 0,
+                "n_unrecognized_files": 0,
+                "unrecognized_examples": [],
+                "chunk_inconsistent": False,
+            }
+
+    def test_warning_attributed_to_caller(self):
+        """T50: TIFF-load warnings are attributed to this file (the
+        Python call site).  pyo3 functions execute in the caller's frame,
+        so stacklevel=1 already points there; stacklevel=2 would blame
+        the caller's caller (pytest internals in this suite).  pytest.warns
+        checks only category/message, so assert the filename explicitly."""
+        pytest.importorskip("tifffile")
+        with tempfile.TemporaryDirectory() as tmpdir:
+            self._write_chunked_folder(tmpdir)
+            with warnings.catch_warnings(record=True) as w:
+                warnings.simplefilter("always")
+                nereids.load_tiff_folder(tmpdir)
+        assert len(w) == 1
+        assert issubclass(w[0].category, UserWarning)
+        assert w[0].filename == __file__
+
+    def test_missing_tiff_raises_filenotfound(self):
+        """T51: a nonexistent path raises FileNotFoundError from
+        load_tiff_stack (aligned with load_tiff_folder and
+        read_tof_sidecar).  Only a genuine NotFound maps there; other
+        open failures (e.g. permission denied) stay plain OSError."""
+        with tempfile.TemporaryDirectory() as tmpdir:
+            missing = os.path.join(tmpdir, "no_such.tif")
+            with pytest.raises(FileNotFoundError):
+                nereids.load_tiff_stack(missing)
+
+    def test_return_info_is_keyword_only(self):
+        """T52: return_info is keyword-only at runtime, matching the
+        .pyi overloads; passing it positionally raises TypeError."""
+        tifffile = pytest.importorskip("tifffile")
+        with tempfile.TemporaryDirectory() as tmpdir:
+            tifffile.imwrite(
+                os.path.join(tmpdir, "frame_0000.tif"),
+                np.ones((2, 2), dtype=np.uint16),
+            )
+            arr, info = nereids.load_tiff_folder(
+                tmpdir, None, True, "reject", return_info=True
+            )
+            assert np.asarray(arr).shape == (1, 2, 2)
+            assert info["n_files"] == 1
+            with pytest.raises(TypeError):
+                nereids.load_tiff_folder(tmpdir, None, True, "reject", True)
+
+    def test_mixed_folder_warns_and_counts_unrecognized(self):
+        """T53: a mixed folder (chunk-patterned files plus a stray TIFF)
+        falls back to legacy lexicographic loading with a UserWarning
+        counting and naming the non-conforming files; return_info reports
+        the same via n_unrecognized_files / unrecognized_examples."""
+        tifffile = pytest.importorskip("tifffile")
+        n_frames, h, w = 4, 2, 3
+
+        with tempfile.TemporaryDirectory() as tmpdir:
+            self._write_chunked_folder(tmpdir, n_frames, h, w)
+            tifffile.imwrite(
+                os.path.join(tmpdir, "overview.tif"),
+                np.full((h, w), 7, dtype=np.uint16),
+            )
+
+            with pytest.warns(
+                UserWarning,
+                match=(
+                    r"1 file\(s\) did not match the chunk naming pattern "
+                    r"\(e\.g\. overview\.tif\).*chunk detection disabled.*"
+                    r"lexicographic order.*pattern="
+                ),
+            ):
+                arr, info = nereids.load_tiff_folder(tmpdir, return_info=True)
+
+            # Legacy concatenation of all files — never a k-fold chunk sum.
+            assert np.asarray(arr).shape == (2 * n_frames + 1, h, w)
+            assert info["n_chunks"] == 0
+            assert info["chunks_summed"] is False
+            assert info["n_unrecognized_files"] == 1
+            assert info["unrecognized_examples"] == ["overview.tif"]
+
+    def test_ragged_chunks_opt_out_concatenates(self):
+        """T55: a ragged chunked folder (chunk 764 has 3 frames, chunk 765
+        has 2) is a ValueError on the default summing path — summing ragged
+        chunks would corrupt counts — but with sum_chunks=False it honors
+        the opt-out contract: it loads as the lexicographic concatenation of
+        all files (frame count = the sum of all files), emits a UserWarning
+        naming the inconsistency, and return_info sets
+        chunk_inconsistent=True instead of raising."""
+        tifffile = pytest.importorskip("tifffile")
+        h, w = 2, 3
+
+        with tempfile.TemporaryDirectory() as tmpdir:
+            for f in range(3):
+                tifffile.imwrite(
+                    os.path.join(tmpdir, f"run_764_{f:04d}.tif"),
+                    np.full((h, w), 100 + f, dtype=np.uint16),
+                )
+            for f in range(2):
+                tifffile.imwrite(
+                    os.path.join(tmpdir, f"run_765_{f:04d}.tif"),
+                    np.full((h, w), 200 + f, dtype=np.uint16),
+                )
+
+            # Default summing path: still a hard ValueError (regression guard).
+            with pytest.raises(ValueError):
+                nereids.load_tiff_folder(tmpdir)
+
+            # Opt-out: concatenation of all 5 files + inconsistency signal,
+            # never a ValueError.
+            with pytest.warns(
+                UserWarning,
+                match=r"DAQ chunks are internally inconsistent.*sum_chunks=False",
+            ):
+                arr, info = nereids.load_tiff_folder(
+                    tmpdir, sum_chunks=False, return_info=True
+                )
+
+            assert np.asarray(arr).shape == (5, h, w)
+            assert info["chunk_inconsistent"] is True
+            assert info["chunks_summed"] is False
+            assert info["n_chunks"] == 2
+            assert info["chunk_ids"] == [764, 765]
+
+    def test_missing_folder_vs_not_a_directory(self):
+        """T54: load_tiff_folder raises FileNotFoundError for a
+        nonexistent path (matching the docstring) and NotADirectoryError
+        only for a path that exists but is a file."""
+        tifffile = pytest.importorskip("tifffile")
+        with tempfile.TemporaryDirectory() as tmpdir:
+            with pytest.raises(FileNotFoundError):
+                nereids.load_tiff_folder(os.path.join(tmpdir, "no_such_dir"))
+
+            file_path = os.path.join(tmpdir, "frame_0000.tif")
+            tifffile.imwrite(file_path, np.ones((2, 2), dtype=np.uint16))
+            with pytest.raises(NotADirectoryError):
+                nereids.load_tiff_folder(file_path)
+
 
 # ===========================================================================
 # Error handling / validation
@@ -1969,6 +2333,44 @@ class TestNexusIO:
         ob = np.full_like(sample, 100.0)  # synthetic OB
         input_data = nereids.from_counts(sample, ob)
         assert input_data is not None  # successfully created InputData
+
+    def test_run_health_daslogs(self, tmp_path):
+        """T49: run_health reads DASlogs pause/power via last-value-held
+        time-weighted integration; absent PVs yield None."""
+        import h5py
+
+        path = str(tmp_path / "run.h5")
+        with h5py.File(path, "w") as f:
+            entry = f.create_group("entry")
+            entry.create_dataset("duration", data=100.0)
+            das = entry.create_group("DASlogs")
+            pause = das.create_group("pause")
+            pause.create_dataset("time", data=np.array([0.0, 10.0, 20.0]))
+            pause.create_dataset("value", data=np.array([0.0, 1.0, 0.0]))
+            power = das.create_group("proton_charge")
+            power.create_dataset(
+                "time", data=np.array([0.0, 10.0, 20.0, 30.0])
+            )
+            power.create_dataset(
+                "value", data=np.array([10.0, 1.0, 10.0, 10.0])
+            )
+
+        health = nereids.run_health(path)
+        assert isinstance(health, nereids.RunHealth)
+        # Paused (value 1) over [10, 20) of a 100 s run.
+        assert health.pause_fraction == pytest.approx(0.1)
+        # Power 1 < 0.5 * median(10) over [10, 20) of 100 s.
+        assert health.median_power == pytest.approx(10.0)
+        assert health.beam_dip_fraction == pytest.approx(0.1)
+        assert health.duration_s == pytest.approx(100.0)
+        assert health.n_pause_entries == 3
+        assert health.n_power_entries == 4
+
+        # Custom PV name that is absent -> None fields, not an error.
+        other = nereids.run_health(path, pause_pv="no_such_pv")
+        assert other.pause_fraction is None
+        assert other.n_pause_entries == 0
+        assert other.beam_dip_fraction is not None
 
 
 # ---------------------------------------------------------------------------

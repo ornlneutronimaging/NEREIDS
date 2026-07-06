@@ -3,6 +3,8 @@
 //! Data I/O for VENUS beamline neutron imaging data.
 //!
 //! ## Modules
+//! - `daslogs` — DASlogs run-health summary (pause/beam-dip fractions;
+//!   `hdf5` feature)
 //! - [`error`] — Error types for I/O operations
 //! - [`export`] — Export spatial mapping results to TIFF, HDF5, and Markdown
 //! - `nexus` — NeXus/HDF5 reading for rustpix-processed data (`hdf5` feature;
@@ -21,6 +23,8 @@
 //! - `pleiades/processing/normalization_ornl.py` for Method 2 normalization
 //! - `pleiades/processing/helper_ornl.py` for data loading
 
+#[cfg(feature = "hdf5")]
+pub mod daslogs;
 pub mod error;
 pub mod export;
 #[cfg(feature = "hdf5")]

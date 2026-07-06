@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+from typing import Any, Literal, overload
+
 import numpy as np
 from numpy.typing import NDArray
 
@@ -24,6 +26,37 @@ class NexusMetadata:
     def flight_path_m(self) -> float | None: ...
     @property
     def tof_offset_ns(self) -> float | None: ...
+
+class RunHealth:
+    """DASlogs-based run-health summary (``None`` = cannot compute:
+    PV absent or empty, or the dip threshold is undefined)."""
+
+    @property
+    def pause_fraction(self) -> float | None:
+        """Time-weighted fraction of the run spent paused."""
+        ...
+    @property
+    def beam_dip_fraction(self) -> float | None:
+        """Time-weighted fraction with power below the dip threshold.
+
+        ``None`` when the power PV is absent or empty, or when the dip
+        threshold is undefined because the sample median of the power
+        entries is non-positive (e.g. beam off for at least half the
+        entries) — check ``median_power``, which is co-reported.
+        """
+        ...
+    @property
+    def median_power(self) -> float | None:
+        """Sample median of the power PV entries (not time-weighted)."""
+        ...
+    @property
+    def duration_s(self) -> float | None:
+        """Run duration in seconds (file value, or last-timestamp lower bound)."""
+        ...
+    @property
+    def n_pause_entries(self) -> int: ...
+    @property
+    def n_power_entries(self) -> int: ...
 
 class NexusData:
     """Result of loading NeXus histogram or event data."""
@@ -844,19 +877,113 @@ def apply_resolution(
     """Apply tabulated resolution broadening to a spectrum."""
     ...
 
-def load_tiff_stack(path: str) -> NDArray[np.float64]:
-    """Load a multi-frame TIFF file into a 3D numpy array."""
+def load_tiff_stack(
+    path: str,
+    pixel_policy: str = "reject",
+) -> NDArray[np.float64]:
+    """Load a multi-frame TIFF file into a 3D numpy array.
+
+    ``pixel_policy``: ``"reject"`` (default) errors on negative or
+    non-finite pixels; ``"clip"`` clamps negatives to 0.0 (NaN still
+    errors); ``"allow"`` passes values through verbatim (pre-normalized
+    transmission stacks).
+
+    Raises ``FileNotFoundError`` when ``path`` does not exist,
+    ``ValueError`` for bad pixel values or an invalid policy, and
+    ``OSError`` for other I/O failures (e.g. permission denied).
+    """
     ...
 
+@overload
 def load_tiff_folder(
     folder: str,
     pattern: str | None = None,
+    sum_chunks: bool = True,
+    pixel_policy: str = "reject",
+    *,
+    return_info: Literal[False] = False,
 ) -> NDArray[np.float64]:
-    """Load a folder of single-frame TIFFs into a 3D numpy array."""
+    """Load a folder of single-frame TIFFs into a 3D numpy array.
+
+    Chunked VENUS folders (``<prefix>_<chunk>_<frame>.tif``) are detected
+    automatically and summed element-wise across chunks by default
+    (``sum_chunks=True``, with a ``UserWarning`` naming the chunks); ragged
+    or duplicated chunks are an error on the summing path, but with
+    ``sum_chunks=False`` they load as the lexicographic concatenation and
+    are flagged via ``chunk_inconsistent`` (with a ``UserWarning``) instead
+    of raising.  ``sum_chunks`` otherwise only affects folders with two
+    or more chunks — a *consistent* single-chunk (or non-chunk-patterned)
+    folder loads identically either way; an internally inconsistent one
+    (e.g. an accidental ``.tif``/``.tiff`` duplicate) still raises under
+    ``sum_chunks=True`` but concatenates under ``sum_chunks=False``.  A
+    *mixed* folder (chunk-patterned names
+    alongside non-conforming files) loads lexicographically with a
+    ``UserWarning`` counting the files that disabled chunk detection.  The
+    heuristic assumes one acquisition per folder; use ``pattern`` (or
+    ``sum_chunks=False``) when a folder may hold multiple same-prefix
+    runs.  ``pixel_policy`` is ``"reject"`` | ``"clip"`` | ``"allow"`` as
+    in ``load_tiff_stack``.  With ``return_info=True`` (keyword-only),
+    returns ``(array, info)`` where ``info`` has keys ``n_files``,
+    ``n_chunks``, ``chunk_ids``, ``chunks_summed``, ``n_clipped_pixels``,
+    ``n_unrecognized_files`` (files that broke chunk detection in a mixed
+    folder; 0 otherwise), ``unrecognized_examples`` (up to three of their
+    names), and ``chunk_inconsistent`` (``True`` when inconsistent chunks
+    were concatenated under ``sum_chunks=False`` instead of raising).
+    """
+    ...
+
+@overload
+def load_tiff_folder(
+    folder: str,
+    pattern: str | None = None,
+    sum_chunks: bool = True,
+    pixel_policy: str = "reject",
+    *,
+    return_info: Literal[True],
+) -> tuple[NDArray[np.float64], dict[str, Any]]: ...
+
+def read_tof_sidecar(
+    path: str,
+    n_frames: int | None = None,
+) -> NDArray[np.float64]:
+    """Read a VENUS ``*_Spectra.txt`` sidecar into TOF bin edges (µs).
+
+    Column 0 holds each frame's start time in seconds — the frame START
+    (left bin edge; verified on measured VENUS autoreduce output, where
+    every value is an exact integer multiple of the bin width).  The
+    result is the N+1 ascending microsecond edges expected by
+    ``tof_to_energy_centers`` (the closing edge extrapolates the last
+    frame width).  When ``n_frames`` is given, the edge count is
+    validated against it.  If the first edge is exactly 0, crop the
+    first frame from both stack and edges (``stack[1:]``, ``edges[1:]``)
+    before energy conversion.
+
+    Raises ``FileNotFoundError`` only when the file genuinely does not
+    exist; other open failures (e.g. permission denied) raise
+    ``OSError``, and malformed content raises ``ValueError``.
+    """
     ...
 
 def probe_nexus(path: str) -> NexusMetadata:
     """Probe a NeXus/HDF5 file for available data without loading it."""
+    ...
+
+def run_health(
+    path: str,
+    pause_pv: str = "pause",
+    power_pv: str = "proton_charge",
+    power_dip_fraction: float = 0.5,
+) -> RunHealth:
+    """Compute a run-health summary from ``/entry/DASlogs``.
+
+    DASlogs PVs log transitions, so statistics use last-value-held
+    time-weighted integration over the run window, never entry means.
+    The PV-name defaults are the SNS ones; other facilities pass their
+    own.  Absent PVs and present-but-empty PVs (zero entries logged)
+    yield ``None`` fields, not errors; ``beam_dip_fraction`` is also
+    ``None`` when the median power is non-positive (dip threshold
+    undefined — see ``RunHealth.beam_dip_fraction``).
+    """
     ...
 
 def load_nexus_histogram(

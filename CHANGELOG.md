@@ -70,6 +70,70 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
   density), which on real VENUS data converged to T = 4471 K at
   χ²/ν = 932 with no diagnostic.
 
+- **Chunk-aware TIFF folder loading** (#636): folders following the
+  chunked VENUS naming convention (`<prefix>_<chunk>_<frame>.tif`) are
+  detected automatically — frames order by numeric index and chunks
+  covering identical frame ranges are summed element-wise by default
+  (`sum_chunks=False` / `TiffFolderOptions::sum_chunks` opts out; on the
+  default summing path ragged chunks or duplicate (chunk, frame) pairs are
+  a hard `ChunkMismatch` error, never a silent stack). New
+  `load_tiff_folder_with_options` / `load_tiff_auto_with_options` /
+  `load_tiff_stack_with_options` return a `TiffLoadInfo` provenance report
+  (`n_files`, `n_chunks`, `chunk_ids`, `chunks_summed`,
+  `n_clipped_pixels`); the GUI logs "summed k DAQ chunks" provenance. The Python loaders emit a `UserWarning` when
+  chunks were summed (naming the chunk ids and the `sum_chunks=False`
+  escape hatch) or when `pixel_policy="clip"` clamped pixels, and
+  `load_tiff_folder(..., return_info=True)` returns the provenance dict
+  alongside the array. The GUI's pre-normalized transmission mode loads
+  chunked folders with `sum_chunks=False` — element-wise sums of
+  transmissions are counts semantics and physically meaningless. The
+  issue's coverage-mask item was dropped per its scope amendment: per
+  the #646 masking policy, coverage/thickness is a model concern, not
+  an I/O concern.
+- **Mixed-folder chunk-detection observability** (#636): a folder where
+  at least one file matches the chunked naming convention but others do
+  not (a stray overview TIFF, a misnamed frame) still falls back to
+  legacy lexicographic loading, but the fallback is now loud: the
+  non-conforming files are counted in
+  `TiffLoadInfo::n_unrecognized_files` (up to three named in
+  `unrecognized_examples`), the Python loaders emit a new `UserWarning`
+  class ("N file(s) did not match the chunk naming pattern..."), the
+  `return_info` dict gains both keys, and the GUI logs the count in its
+  load provenance. The GUI also logs "detected k DAQ chunks — NOT
+  summed" when transmission mode loads a chunked folder with summing
+  disabled, and `load_tiff_folder` on a nonexistent path now raises
+  `FileNotFoundError` (`NotADirectoryError` is reserved for paths that
+  exist but are not directories, preserving the real metadata-error kind
+  so a permission-denied parent stays `OSError`), matching its documented
+  contract.
+- **`sum_chunks=False` honors its opt-out contract on inconsistent chunks**
+  (#636): ragged chunks (differing frame counts/sets) or duplicate
+  (chunk, frame) pairs are a hard `ChunkMismatch` error only on the
+  default summing path — where summing them would corrupt counts. With
+  `sum_chunks=False` there is nothing to corrupt, so the same folder now
+  loads as the documented lexicographic concatenation of every file
+  (frame count = the sum of all files) instead of erroring — inspecting
+  raw frames of a ragged folder is exactly when `sum_chunks=False` is
+  reached for. The irregularity is surfaced through a new
+  `TiffLoadInfo::chunk_inconsistent` flag (the `return_info` dict gains a
+  `chunk_inconsistent` key, the Python loader emits a `UserWarning`, and
+  the GUI's transmission-mode provenance logs it), never silently
+  swallowed. The default summing path is unchanged — inconsistent chunks
+  that would be summed still fail loud.
+- **`read_tof_sidecar`** (#636): reads a VENUS `*_Spectra.txt` sidecar
+  (frame start times in seconds) into the N+1 ascending microsecond TOF
+  bin edges `tof_to_energy_centers` expects, extrapolating the closing
+  edge from the last frame width (shutter segments with different frame
+  widths are valid). The GUI auto-detects `*_Spectra.txt` spectrum picks
+  and never falls back to the verbatim-µs parser on sidecar failure. A
+  VENUS run folder now loads to stack + energy axis in 3 Python calls.
+- **`run_health`** (#636): DASlogs-based run-health summary
+  (`pause_fraction`, `beam_dip_fraction`, `median_power`, `duration_s`)
+  using last-value-held time-weighted integration (DASlogs PVs log
+  transitions; entry means are wrong). SNS PV-name defaults (`pause`,
+  `proton_charge`); other facilities pass their own. Absent PVs report
+  `None`; present-but-malformed PVs are hard errors.
+
 - **`fit_energy_scale` + `fit_temperature` jointly, in every fitter**
   (#634): the flag combination resonance thermometry needs — calibrate
   the SAMMY energy scale (t₀, L_scale) *and* fit temperature in one
@@ -155,6 +219,20 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
   (optionally) the open-beam stack, in Rust and Python.
 - `nereids-core` gains a `stats` module (`median`,
   `median_abs_deviation`, `MAD_TO_SIGMA`).
+
+### Fixed
+
+- **2-chunk VENUS folders no longer load as doubled stacks** (#636):
+  `load_tiff_folder` previously concatenated all files lexicographically,
+  so a run split into k DAQ chunks silently produced a k× stack; chunked
+  folders now sum element-wise (see Added).
+- **Negative / non-finite pixels no longer import silently** (#636): TIFF
+  loaders now reject them by default (`IoError::BadPixelValue` naming
+  file/frame/index/value and pointing at `detect_bad_pixels()`), with
+  `pixel_policy="clip"` (clamp negatives to zero, counted in
+  `TiffLoadInfo::n_clipped_pixels`; NaN still errors) and
+  `pixel_policy="allow"` (pre-normalized transmission, used by the MCP
+  server and the GUI transmission tab) as explicit escape hatches.
 
 ### Changed
 

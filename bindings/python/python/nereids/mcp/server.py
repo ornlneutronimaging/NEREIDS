@@ -828,13 +828,20 @@ def _process_density_map(
     elif kind in {"transmission_tiff", "tiff"}:
         if path is None:
             raise ValueError("transmission_tiff data requires data.path")
+        # Pre-normalized transmission: noise around zero legitimately
+        # produces small negative values, so bypass the raw-counts
+        # pixel-value guard ("allow" rather than the default "reject").
         transmission = _validate_array(
-            "transmission", nereids.load_tiff_stack(str(path)), ndim=3
+            "transmission",
+            nereids.load_tiff_stack(str(path), pixel_policy="allow"),
+            ndim=3,
         )
         uncertainty_path = _resolve_path(base, data_config.get("uncertainty_path"))
         if uncertainty_path is not None:
             uncertainty = _validate_array(
-                "uncertainty", nereids.load_tiff_stack(str(uncertainty_path)), ndim=3
+                "uncertainty",
+                nereids.load_tiff_stack(str(uncertainty_path), pixel_policy="allow"),
+                ndim=3,
             )
         else:
             uncertainty = np.full_like(

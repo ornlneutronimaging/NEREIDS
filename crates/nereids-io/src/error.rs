@@ -48,4 +48,26 @@ pub enum IoError {
     /// HDF5 format or access error.
     #[error("HDF5 error: {0}")]
     Hdf5Error(String),
+
+    /// Chunked TIFF folder is internally inconsistent (ragged chunks or
+    /// duplicate (chunk, frame) pairs).  Summing across inconsistent chunks
+    /// would silently corrupt counts, so this is a hard error — never a
+    /// partial sum, never a silent fallback to plain stacking.
+    #[error("Inconsistent DAQ chunks in directory {directory}: {details}")]
+    ChunkMismatch { directory: String, details: String },
+
+    /// A pixel value violates the raw-counts invariant (finite and >= 0).
+    #[error(
+        "Bad pixel value {value} at flat index {index} of frame {frame} in '{file}': \
+         raw counts must be finite and >= 0. For corrupt readout pixels, mask them \
+         per acquisition with detect_bad_pixels(); to clamp negative values to zero \
+         use the clip pixel policy (PixelValuePolicy::ClipToZero); for pre-normalized \
+         transmission data use the allow policy (PixelValuePolicy::Allow)."
+    )]
+    BadPixelValue {
+        file: String,
+        frame: usize,
+        index: usize,
+        value: f64,
+    },
 }

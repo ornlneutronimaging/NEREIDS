@@ -642,21 +642,97 @@ fn load_hdf5_histogram(state: &mut AppState) {
     }
 }
 
+/// Format the chunk-summing / chunk-concatenation / stray-file /
+/// inconsistent-chunk / pixel-clipping provenance suffix for a TIFF load, or
+/// an empty string when nothing noteworthy happened.
+fn tiff_load_suffix(info: &nereids_io::tiff_stack::TiffLoadInfo) -> String {
+    let mut suffix = String::new();
+    if info.n_chunks > 1 {
+        let ids = info
+            .chunk_ids
+            .iter()
+            .map(|id| id.to_string())
+            .collect::<Vec<String>>()
+            .join(", ");
+        if info.chunks_summed {
+            suffix.push_str(&format!(", summed {} DAQ chunks ({ids})", info.n_chunks));
+        } else {
+            // Transmission mode loads with sum_chunks=false; without this
+            // line a mis-picked raw chunked run folder loads as a k×
+            // concatenated stack with zero provenance — the only downstream
+            // symptom is a spectrum-count mismatch that never mentions
+            // chunks.
+            suffix.push_str(&format!(
+                ", detected {} DAQ chunks ({ids}) — NOT summed (transmission \
+                 mode); frames are concatenated",
+                info.n_chunks,
+            ));
+        }
+    }
+    if info.n_unrecognized_files > 0 {
+        suffix.push_str(&format!(
+            ", {} file(s) did not match the chunk naming pattern (e.g. {}) — \
+             chunk detection disabled, frames concatenated lexicographically",
+            info.n_unrecognized_files,
+            info.unrecognized_examples.join(", "),
+        ));
+    }
+    if info.chunk_inconsistent {
+        // The files ARE chunk-patterned but internally inconsistent (ragged
+        // frame counts/sets or a duplicate (chunk, frame) pair).  Under the
+        // default summing path this is a hard error; because transmission
+        // mode loads with sum_chunks=false, it instead loaded verbatim as a
+        // lexicographic concatenation — which the operator must see, since a
+        // ragged raw run folder that would otherwise fail is now a silent
+        // plain stack whose only symptom is a spectrum-count mismatch.
+        suffix.push_str(
+            " — WARNING: DAQ chunks are internally inconsistent (ragged frame \
+             counts/sets or duplicate frames); loaded as a plain lexicographic \
+             concatenation, not summed",
+        );
+    }
+    if info.n_clipped_pixels > 0 {
+        suffix.push_str(&format!(
+            ", {} negative pixels clipped to 0",
+            info.n_clipped_pixels
+        ));
+    }
+    suffix
+}
+
 /// Load all data: TIFF stacks + spectrum file with validation and auto-detect.
 fn load_all_data(state: &mut AppState) {
     state.invalidate_results();
 
+    // Pre-normalized transmission stacks legitimately contain small
+    // negative values (noise around zero), so they bypass the raw-counts
+    // pixel guard; raw counts keep the strict default.  Chunk summing is
+    // likewise counts semantics: element-wise summing k per-chunk
+    // *transmission* stacks yields values near k (e.g. ~2.0 for 2 chunks),
+    // which is physically meaningless — so TransmissionTiff mode also
+    // disables it, exactly mirroring the pixel-policy switch.
+    let options = if state.input_mode == InputMode::TransmissionTiff {
+        nereids_io::tiff_stack::TiffFolderOptions {
+            pixel_policy: nereids_io::tiff_stack::PixelValuePolicy::Allow,
+            sum_chunks: false,
+        }
+    } else {
+        // Raw counts: Reject bad pixels, sum DAQ chunks (the defaults).
+        nereids_io::tiff_stack::TiffFolderOptions::default()
+    };
+
     // Load sample TIFF (auto-detect file vs directory)
     if let Some(ref path) = state.sample_path {
-        match nereids_io::tiff_stack::load_tiff_auto(path) {
-            Ok(data) => {
+        match nereids_io::tiff_stack::load_tiff_auto_with_options(path, &options) {
+            Ok((data, info)) => {
                 state.preview_image = Some(data.sum_axis(Axis(0)));
                 let n_frames = data.shape()[0];
                 state.log_provenance(
                     ProvenanceEventKind::DataLoaded,
                     format!(
-                        "Loaded sample TIFF: {n_frames} frames from {}",
-                        path.display()
+                        "Loaded sample TIFF: {n_frames} frames from {}{}",
+                        path.display(),
+                        tiff_load_suffix(&info),
                     ),
                 );
                 state.sample_data = Some(Arc::new(data));
@@ -674,8 +750,20 @@ fn load_all_data(state: &mut AppState) {
     if state.input_mode == InputMode::TiffPair
         && let Some(ref path) = state.open_beam_path
     {
-        match nereids_io::tiff_stack::load_tiff_auto(path) {
-            Ok(data) => {
+        match nereids_io::tiff_stack::load_tiff_auto_with_options(path, &options) {
+            Ok((data, info)) => {
+                let suffix = tiff_load_suffix(&info);
+                if !suffix.is_empty() {
+                    state.log_provenance(
+                        ProvenanceEventKind::DataLoaded,
+                        format!(
+                            "Loaded open-beam TIFF: {} frames from {}{}",
+                            data.shape()[0],
+                            path.display(),
+                            suffix,
+                        ),
+                    );
+                }
                 state.open_beam_data = Some(Arc::new(data));
                 state.status_message = "Sample and open beam loaded".into();
             }
@@ -705,6 +793,48 @@ fn load_all_data(state: &mut AppState) {
 
     // Parse spectrum file with auto-detect bin type
     if let Some(ref path) = state.spectrum_path {
+        // VENUS sidecar auto-detect: *_Spectra.txt files hold frame START
+        // times in SECONDS, not verbatim-µs edges — feeding them to the
+        // plain parser would be a 10^6 unit error, so the sidecar reader
+        // handles them and a sidecar parse failure is surfaced, never
+        // silently retried with the verbatim parser.  Detection is by
+        // filename suffix only; an explicit format selector in the UI is a
+        // possible follow-up, so the provenance log records which parser
+        // was chosen and why.
+        let is_sidecar = path
+            .file_name()
+            .and_then(|n| n.to_str())
+            .is_some_and(|n| n.to_lowercase().ends_with("_spectra.txt"));
+        if is_sidecar {
+            // Cross-check the sidecar frame count against the sample stack only
+            // when it is already loaded; with no stack yet, pass `None` so a
+            // valid sidecar parses instead of failing the count check against a
+            // spurious n_frames = 0.
+            let n_frames = state.sample_data.as_ref().map(|d| d.shape()[0]);
+            match nereids_io::spectrum::read_tof_sidecar(path, n_frames) {
+                Ok(edges) => {
+                    state.spectrum_kind = nereids_io::spectrum::SpectrumValueKind::BinEdges;
+                    state.spectrum_unit = nereids_io::spectrum::SpectrumUnit::TofMicroseconds;
+                    state.log_provenance(
+                        ProvenanceEventKind::DataLoaded,
+                        format!(
+                            "Spectrum parser: TOF sidecar (filename ends in \
+                             _Spectra.txt): {} frame start times in seconds \
+                             converted to {} µs bin edges",
+                            edges.len() - 1,
+                            edges.len(),
+                        ),
+                    );
+                    state.spectrum_values = Some(Arc::new(edges));
+                    state.status_message = "All data loaded".into();
+                }
+                Err(e) => {
+                    state.status_message = format!("Failed to parse TOF sidecar: {}", e);
+                    state.load_error = true;
+                }
+            }
+            return;
+        }
         match nereids_io::spectrum::parse_spectrum_file(path) {
             Ok(values) => {
                 // Validate monotonicity
@@ -745,6 +875,16 @@ fn load_all_data(state: &mut AppState) {
                     return;
                 }
 
+                state.log_provenance(
+                    ProvenanceEventKind::DataLoaded,
+                    format!(
+                        "Spectrum parser: verbatim spectrum file (no \
+                         _Spectra.txt suffix): {} values used as-is (µs/eV), \
+                         detected as {:?}",
+                        values.len(),
+                        state.spectrum_kind,
+                    ),
+                );
                 state.spectrum_values = Some(Arc::new(values));
                 state.status_message = "All data loaded".into();
             }

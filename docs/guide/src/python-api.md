@@ -341,8 +341,24 @@ match across chunks; the TOF axis may differ.
 ## TIFF and NeXus I/O
 
 ```python
-stack = nereids.load_tiff_stack("transmission_stack.tif")
-folder_stack = nereids.load_tiff_folder("frames", pattern="frame_*.tif")
+stack = nereids.load_tiff_stack("transmission_stack.tif", pixel_policy="allow")
+folder_stack, info = nereids.load_tiff_folder(
+    "frames",
+    pattern="frame_*.tif",
+    sum_chunks=True,        # sum chunked VENUS runs element-wise (default)
+    pixel_policy="reject",  # "reject" | "clip" | "allow" (default "reject")
+    return_info=True,       # also return the load-provenance dict
+)
+info["n_chunks"]            # DAQ chunks detected (1 if not chunked)
+info["chunks_summed"]       # True when they were summed element-wise
+info["n_clipped_pixels"]    # pixels clamped under pixel_policy="clip"
+# full key set: n_files, n_chunks, chunk_ids, chunks_summed,
+# n_clipped_pixels, chunk_inconsistent, n_unrecognized_files,
+# unrecognized_examples
+edges_us = nereids.read_tof_sidecar(
+    "run_764/run_764_Spectra.txt",
+    n_frames=folder_stack.shape[0],
+)
 
 sample = nereids.load_nexus_histogram("sample.nxs")
 open_beam = nereids.load_nexus_histogram("open_beam.nxs")
@@ -350,9 +366,24 @@ energies = nereids.tof_to_energy_centers(
     sample.tof_edges_us,
     sample.flight_path_m or 25.0,
 )
+health = nereids.run_health("sample.nxs")   # RunHealth: pause/beam-dip fractions
 ```
 
-See [Data I/O and NeXus/TOF](./data-io.md) for ordering and pairing rules.
+`load_tiff_folder` detects chunked VENUS folders
+(`<prefix>_<chunk>_<frame>.tif`) and sums chunks element-wise by default,
+emitting a `UserWarning` naming the summed chunks (and one with the
+clipped-pixel count under `pixel_policy="clip"`); `return_info=True`
+returns the load provenance as a second value. `read_tof_sidecar`
+converts a VENUS `*_Spectra.txt` sidecar (frame **start** times in
+seconds — the left bin edges, verified on measured autoreduce output)
+into the N+1 ascending microsecond TOF bin edges that
+`tof_to_energy_centers` expects. Negative or non-finite pixels are rejected
+at load time unless `pixel_policy` says otherwise. `run_health` returns a
+`RunHealth` summary of the `/entry/DASlogs` pause and beam-power logs using
+last-value-held time-weighted integration (SNS PV-name defaults).
+
+See [Data I/O and NeXus/TOF](./data-io.md) for ordering and pairing rules,
+chunk semantics, the pixel-value policy, and run health.
 
 ## Beam-State Filtering (DASlogs and Event Banks)
 

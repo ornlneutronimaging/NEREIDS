@@ -24,19 +24,139 @@ Use `load_tiff_stack(...)` for a multi-frame TIFF:
 ```python
 import nereids
 
-transmission = nereids.load_tiff_stack("transmission_stack.tif")
+transmission = nereids.load_tiff_stack("transmission_stack.tif", pixel_policy="allow")
 # transmission.shape == (n_frames, height, width)
 ```
 
 Use `load_tiff_folder(...)` for a directory of single-frame TIFF files:
 
 ```python
-transmission = nereids.load_tiff_folder("frames", pattern="frame_*.tif")
+counts = nereids.load_tiff_folder("frames", pattern="frame_*.tif")
 ```
 
-Folder frames are sorted lexicographically by filename. Use zero-padded names
-such as `frame_0001.tif`, `frame_0002.tif`, and so on. The optional `pattern`
+Folders that do not follow the chunked VENUS naming convention below are
+sorted lexicographically by filename. Use zero-padded names such as
+`frame_0001.tif`, `frame_0002.tif`, and so on. The optional `pattern`
 matches filenames, not full paths, and supports `*` and `?`.
+
+Note: load-time coverage/thickness masking is deliberately not part of the
+loaders — per the #646 masking policy, coverage and sample thickness are
+model concerns handled downstream, not I/O concerns.
+
+### Chunked VENUS folders
+
+The VENUS DAQ sometimes splits one run into several chunks, each covering
+the full TOF frame range, with files named `<prefix>_<chunk>_<frame>.tif`
+(for example `run_764_00042.tif`). When every filename in the folder follows
+this convention with a single common prefix, `load_tiff_folder(...)` detects
+the layout automatically:
+
+- frames are ordered by numeric frame index (identical to lexicographic
+  order for zero-padded names, and correct where `_10` would sort before
+  `_2` lexicographically);
+- chunks covering identical frame ranges are summed element-wise into a
+  single `(n_frames, height, width)` stack — the physical stack is the sum,
+  not a concatenation. Pass `sum_chunks=False` for the legacy lexicographic
+  concatenation. The flag only affects folders with two or more chunks:
+  single-chunk (and non-chunk-patterned) folders load identically either
+  way — chunk-patterned names in numeric frame order, others
+  lexicographically;
+- ragged chunks (differing frame counts or frame sets) or duplicate
+  (chunk, frame) pairs raise `ValueError` on the default summing path —
+  never a silent stack or a partial sum. With `sum_chunks=False` there is
+  nothing to corrupt, so the same inconsistent folder loads as the
+  lexicographic concatenation of every file (frame count = the sum of all
+  files) and the irregularity is reported via `chunk_inconsistent` (and a
+  `UserWarning`) instead of raising — this is exactly the case you reach for
+  `sum_chunks=False` to inspect raw frames.
+
+Folders with two or more distinct prefixes fall back to legacy
+lexicographic loading (summing across prefixes would merge different runs);
+use `pattern` to select one run, e.g. `pattern="run_764_*"`.
+
+A *mixed* folder — at least one chunk-patterned name alongside files that
+do not match (a stray overview TIFF, a misnamed frame) — also falls back
+to lexicographic loading, and the Python loader emits a `UserWarning`
+counting the non-conforming files (naming up to three); check for stray
+TIFFs or use `pattern` to exclude them. The provenance dict reports the
+same via `n_unrecognized_files` / `unrecognized_examples`.
+
+Because summing changes the data semantics versus a per-file read, the
+Python loader emits a `UserWarning` naming the chunk count and ids (and
+the `sum_chunks=False` escape hatch) whenever chunks were summed, and a
+`UserWarning` with the clipped-pixel count when `pixel_policy="clip"`
+clamped anything. Pass `return_info=True` to get the full provenance as
+a second return value:
+
+```python
+counts, info = nereids.load_tiff_folder("run_764", return_info=True)
+# info == {"n_files": ..., "n_chunks": ..., "chunk_ids": [...],
+#          "chunks_summed": ..., "n_clipped_pixels": ...,
+#          "n_unrecognized_files": ..., "unrecognized_examples": [...],
+#          "chunk_inconsistent": ...}
+```
+
+**One acquisition per folder.** The chunk heuristic assumes the folder
+holds a single acquisition — the VENUS autoreduce layout, where each run
+gets its own directory (verified on IPTS-37432 output; the `<chunk>`
+field in real names is a run-ish id, e.g. `..._ob_0_116_00000.tif`). It
+cannot distinguish same-prefix sibling *runs* co-located in one folder
+from DAQ chunks — such siblings would be summed. When a folder may hold
+multiple runs, select one with `pattern` or pass `sum_chunks=False`.
+
+### Pixel-value policy
+
+Raw detector counts are non-negative by construction, so a negative or
+non-finite pixel signals file corruption or a signed-type readout bug. Both
+TIFF loaders take a `pixel_policy` keyword:
+
+- `"reject"` (default): raise `ValueError` naming the file, frame, flat
+  index, and value. For corrupt readout pixels, mask them per acquisition
+  with `detect_bad_pixels(...)` instead of relaxing the policy.
+- `"clip"`: clamp negative values to `0.0`; NaN still raises (clipping a
+  NaN would invent data).
+- `"allow"`: accept all values verbatim — required for pre-normalized
+  transmission stacks, where noise around zero legitimately produces small
+  negative values.
+
+### TOF sidecar (`*_Spectra.txt`)
+
+Autoreduced VENUS folders ship a `<run>_Spectra.txt` sidecar whose first
+CSV column is each frame's start time in seconds (one row per TOF frame).
+`read_tof_sidecar(...)` converts it to the N+1 ascending microsecond bin
+edges that `tof_to_energy_centers(...)` expects, synthesizing the closing
+edge from the last frame width. Bin uniformity is not required — MCP
+shutter segments change the frame width mid-run.
+
+The start-time = left-bin-edge semantics is established from measured
+VENUS autoreduce output (IPTS-37432, OB run 19385): the sidecar holds
+exactly one row per TIFF frame, starts at 1.12 µs — not zero; the
+autoreduce already drops the pre-trigger bins — in uniform 160 ns steps,
+and every time value is an exact integer multiple of the 160 ns bin
+width (1.12 µs = 7 × 0.16 µs). Bin *centers* would sit at
+half-multiples, so `shutter_time` is definitively the frame start (left
+bin edge). Note that PLEIADES's sidecar helper uses these values
+directly as frame TOFs, which differs from the true bin centers by half
+a bin width; NEREIDS uses edges plus geometric-mean centers. A constant
+offset of this kind is absorbed by the fitted t₀ in the energy-scale
+fit.
+
+A hand-made sidecar whose first start time is exactly 0 s still parses
+(0 is a valid TOF edge), but the t = 0 edge cannot be energy-converted —
+E is undefined at t = 0. Crop the first frame from **both** the stack
+and the edges (`stack[1:]`, `edges[1:]`) before conversion.
+
+A complete VENUS run folder loads to a stack plus energy axis in three
+calls:
+
+```python
+counts = nereids.load_tiff_folder("run_764")                # chunk-aware
+edges_us = nereids.read_tof_sidecar(
+    "run_764/run_764_Spectra.txt",
+    n_frames=counts.shape[0],                               # validated
+)
+energies = nereids.tof_to_energy_centers(edges_us, flight_path_m=25.0)
+```
 
 ## Normalization
 
@@ -125,6 +245,41 @@ events = nereids.load_nexus_events(
 The event loader reads `/entry/neutrons/event_time_offset`, `/x`, and `/y`,
 bins events into a linear TOF grid, and returns the same `NexusData` shape
 contract as the histogram loader.
+
+## Run Health (DASlogs)
+
+A run can be paused mid-acquisition or suffer accelerator beam dips; both
+silently reduce the effective exposure of the summed stack.
+`run_health(...)` summarizes the slow-control logs under `/entry/DASlogs`:
+
+```python
+health = nereids.run_health("sample.nxs")
+print(health.pause_fraction)     # time-weighted fraction spent paused
+print(health.beam_dip_fraction)  # fraction with power < 0.5 * median
+print(health.median_power, health.duration_s)
+```
+
+DASlogs PVs log *transitions*, not regular samples — a run paused for 90%
+of its duration may contain just two pause entries, so entry means are
+wrong. All fractions use last-value-held time-weighted integration over
+the run window (`/entry/duration` when present, else the latest log
+timestamp, a lower bound).
+
+The PV-name defaults are the SNS ones (`pause`, `proton_charge`); other
+facilities pass their own names, and the dip threshold is adjustable:
+
+```python
+health = nereids.run_health(
+    "sample.nxs",
+    pause_pv="pause",
+    power_pv="proton_charge",
+    power_dip_fraction=0.5,
+)
+```
+
+Absent PVs (or a missing `DASlogs` group) yield `None` fields — absence is
+not an error. A PV that is present but malformed (length mismatch,
+non-finite entries, decreasing timestamps) raises `ValueError`.
 
 ## TOF Edges to Energy Centers
 
