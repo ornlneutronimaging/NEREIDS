@@ -70,15 +70,25 @@ impl Default for RunHealthOptions {
 
 /// Run-health summary computed from DASlogs.
 ///
-/// Fields are `None` when the corresponding PV (or the whole `DASlogs`
-/// group) is absent from the file — absence is not an error, it simply
-/// means the facility did not log that quantity.
+/// Fields are `None` when the corresponding quantity *cannot be
+/// computed*: the PV (or the whole `DASlogs` group) is absent from the
+/// file, the PV is present but logged zero entries, or — for
+/// [`beam_dip_fraction`](Self::beam_dip_fraction) only — the dip
+/// threshold is undefined.  None of these is an error; they simply mean
+/// the facility did not log that quantity (or logged nothing usable).
 #[derive(Debug, Clone, PartialEq)]
 pub struct RunHealth {
     /// Time-weighted fraction of the run spent paused (pause PV nonzero).
     pub pause_fraction: Option<f64>,
     /// Time-weighted fraction of the run with power below
     /// `power_dip_fraction × median(power)`.
+    ///
+    /// `None` when the power PV is absent or empty, **or when the dip
+    /// threshold is undefined because the sample median of the power
+    /// entries is non-positive** (e.g. the beam was off for at least half
+    /// the log entries → median = 0, so the strict `< threshold` predicate
+    /// could never fire and would misreport the worst runs as dip-free) —
+    /// check [`median_power`](Self::median_power), which is co-reported.
     pub beam_dip_fraction: Option<f64>,
     /// Sample median of the power PV entries (median of the logged
     /// values, *not* time-weighted — documented deliberately: it is the
@@ -87,9 +97,9 @@ pub struct RunHealth {
     /// Run duration in seconds: `/entry/duration` when present, else the
     /// latest log timestamp across the PVs read (a lower bound).
     pub duration_s: Option<f64>,
-    /// Number of pause-PV log entries read (0 when absent).
+    /// Number of pause-PV log entries read (0 when absent or empty).
     pub n_pause_entries: usize,
-    /// Number of power-PV log entries read (0 when absent).
+    /// Number of power-PV log entries read (0 when absent or empty).
     pub n_power_entries: usize,
 }
 
@@ -101,16 +111,23 @@ pub struct RunHealth {
 /// # Errors
 /// * [`IoError::Hdf5Error`] when the file or `/entry` cannot be opened.
 /// * [`IoError::InvalidParameter`] when a PV is *present but malformed*
-///   (time/value length mismatch, non-finite entries, decreasing
-///   timestamps), `/entry/duration` is present but non-positive or
-///   non-finite, the integration window is non-positive, or
-///   `power_dip_fraction` is not a positive finite number.
+///   (time/value length mismatch, non-finite entries, negative power
+///   values, decreasing timestamps), `/entry/duration` is present but
+///   non-positive or non-finite, the integration window is non-positive,
+///   or `power_dip_fraction` is not a positive finite number.
 ///
 /// Absent PVs (or an absent `DASlogs` group) are *not* errors — the
-/// corresponding fields are `None`.  Absence vs malformed is decided by
-/// link existence (`member_names`), the `read_dead_pixel_mask` idiom:
-/// collapsing "not there" and "there but unreadable" into one path would
-/// mask real file corruption as absence.
+/// corresponding fields are `None`, as is a present PV with zero log
+/// entries ("no entries logged" carries no integrable information).
+/// Absence vs malformed is decided by link existence (`member_names`),
+/// the `read_dead_pixel_mask` idiom: collapsing "not there" and "there
+/// but unreadable" into one path would mask real file corruption as
+/// absence.
+///
+/// `beam_dip_fraction` is additionally `None` (with `median_power` still
+/// reported) when the sample median of the power entries is non-positive:
+/// the dip threshold `power_dip_fraction × median` is then undefined —
+/// see [`RunHealth::beam_dip_fraction`].
 pub fn run_health(path: &Path, options: &RunHealthOptions) -> Result<RunHealth, IoError> {
     if !options.power_dip_fraction.is_finite() || options.power_dip_fraction <= 0.0 {
         return Err(IoError::InvalidParameter(format!(
@@ -158,12 +175,15 @@ pub fn run_health(path: &Path, options: &RunHealthOptions) -> Result<RunHealth, 
         None
     };
 
+    // The pause PV is a state flag (any nonzero value means "paused", sign
+    // included), but beam power is physically non-negative — a negative
+    // entry is malformed data, not a dip, so it takes the hard-error path.
     let pause = match &daslogs {
-        Some(group) => read_pv_series(group, &options.pause_pv)?,
+        Some(group) => read_pv_series(group, &options.pause_pv, false)?,
         None => None,
     };
     let power = match &daslogs {
-        Some(group) => read_pv_series(group, &options.power_pv)?,
+        Some(group) => read_pv_series(group, &options.power_pv, true)?,
         None => None,
     };
 
@@ -217,9 +237,22 @@ pub fn run_health(path: &Path, options: &RunHealthOptions) -> Result<RunHealth, 
     let (median_power, beam_dip_fraction) = match &power {
         Some((time, value)) => {
             let median = sample_median(value);
-            let threshold = options.power_dip_fraction * median;
-            let dip = lvh_fraction(time, value, duration, |v| v < threshold);
-            (Some(median), Some(dip))
+            // The dip threshold `power_dip_fraction × median` is undefined
+            // when the median is non-positive (e.g. the beam was off for at
+            // least half the log entries → median = 0): the strict `<`
+            // predicate could never fire, misreporting exactly the worst
+            // runs as beam_dip_fraction = 0.0.  Report "cannot compute"
+            // (None) instead — the struct's established signal — with
+            // `median_power` co-reported so callers can see why.  Values
+            // are validated finite and non-negative on read, so the
+            // is_finite() arm is defense-in-depth only.
+            if !median.is_finite() || median <= 0.0 {
+                (Some(median), None)
+            } else {
+                let threshold = options.power_dip_fraction * median;
+                let dip = lvh_fraction(time, value, duration, |v| v < threshold);
+                (Some(median), Some(dip))
+            }
         }
         None => (None, None),
     };
@@ -261,11 +294,20 @@ type PvSeries = (Vec<f64>, Vec<f64>);
 /// Read `<group>/<pv>/{time,value}` as parallel 1D f64 series.
 ///
 /// Returns `Ok(None)` when the PV link is absent (valid file without that
-/// log).  Returns `Err` when the PV is present but malformed: unreadable
-/// group/datasets, empty or length-mismatched series, non-finite entries,
-/// or decreasing timestamps.  Duplicate (equal) timestamps are allowed —
-/// real SNS logs contain them; they contribute zero-width intervals.
-fn read_pv_series(daslogs: &hdf5::Group, pv: &str) -> Result<Option<PvSeries>, IoError> {
+/// log) **or** when the PV is present but both series are empty — "no
+/// entries logged" carries no integrable information, so it is treated
+/// like absence rather than corruption (a hard error here would discard
+/// the other PV's summary).  Returns `Err` when the PV is present but
+/// malformed: unreadable group/datasets, length-mismatched series,
+/// non-finite entries, negative values when `require_non_negative` is set
+/// (physically non-negative PVs such as beam power), or decreasing
+/// timestamps.  Duplicate (equal) timestamps are allowed — real SNS logs
+/// contain them; they contribute zero-width intervals.
+fn read_pv_series(
+    daslogs: &hdf5::Group,
+    pv: &str,
+    require_non_negative: bool,
+) -> Result<Option<PvSeries>, IoError> {
     let members = daslogs.member_names().map_err(|e| {
         IoError::InvalidParameter(format!("Failed to list /entry/DASlogs members: {e}"))
     })?;
@@ -291,10 +333,13 @@ fn read_pv_series(daslogs: &hdf5::Group, pv: &str) -> Result<Option<PvSeries>, I
     let time = read_series("time")?;
     let value = read_series("value")?;
 
-    if time.is_empty() {
-        return Err(IoError::InvalidParameter(format!(
-            "/entry/DASlogs/{pv} has no log entries"
-        )));
+    // Present-but-empty (zero entries in BOTH series) is "no entries
+    // logged", semantically closer to an absent PV than to corruption —
+    // map to Ok(None) so the other PV's summary survives.  An empty time
+    // with a non-empty value (or vice versa) still falls through to the
+    // length-mismatch error below: that IS corruption.
+    if time.is_empty() && value.is_empty() {
+        return Ok(None);
     }
     if time.len() != value.len() {
         return Err(IoError::InvalidParameter(format!(
@@ -314,6 +359,13 @@ fn read_pv_series(daslogs: &hdf5::Group, pv: &str) -> Result<Option<PvSeries>, I
         if !v.is_finite() {
             return Err(IoError::InvalidParameter(format!(
                 "/entry/DASlogs/{pv}/value[{i}] is non-finite ({v})"
+            )));
+        }
+        if require_non_negative && v < 0.0 {
+            return Err(IoError::InvalidParameter(format!(
+                "/entry/DASlogs/{pv}/value[{i}] is negative ({v}); \
+                 this PV is physically non-negative (e.g. beam power), so \
+                 a negative entry is malformed data"
             )));
         }
     }
@@ -590,6 +642,86 @@ mod tests {
 
         let err = run_health(&path, &RunHealthOptions::default()).unwrap_err();
         assert!(format!("{err}").contains("duration"));
+    }
+
+    /// T53: a mostly-zero power log (median 0 — beam off for at least
+    /// half the entries) makes the dip threshold undefined: the strict
+    /// `< 0` predicate could never fire, so beam_dip_fraction must be
+    /// None (not a false 0.0) with median_power still co-reported.
+    #[test]
+    fn test_zero_median_power_dip_is_none() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("run.h5");
+        // Beam off (0) for 3 of 4 entries → sample median 0.
+        write_run(
+            &path,
+            Some(40.0),
+            &[(
+                "proton_charge",
+                &[0.0, 10.0, 20.0, 30.0],
+                &[0.0, 0.0, 0.0, 10.0],
+            )],
+        );
+
+        let health = run_health(&path, &RunHealthOptions::default()).unwrap();
+        assert_eq!(health.median_power, Some(0.0));
+        assert_eq!(health.beam_dip_fraction, None);
+        assert_eq!(health.n_power_entries, 4);
+        assert_eq!(health.duration_s, Some(40.0));
+    }
+
+    /// T54: a negative power value is malformed (beam power is physically
+    /// non-negative) and hard-errors; a negative *pause* value is not an
+    /// error — the pause PV is a state flag where any nonzero value
+    /// (sign included) means "paused".
+    #[test]
+    fn test_negative_power_errors_negative_pause_allowed() {
+        let dir = tempfile::tempdir().unwrap();
+
+        let path = dir.path().join("neg_power.h5");
+        write_run(
+            &path,
+            Some(100.0),
+            &[("proton_charge", &[0.0, 10.0], &[10.0, -1.0])],
+        );
+        let err = run_health(&path, &RunHealthOptions::default()).unwrap_err();
+        assert!(
+            format!("{err}").contains("negative"),
+            "Expected negative-power error, got: {err}",
+        );
+
+        let path = dir.path().join("neg_pause.h5");
+        write_run(
+            &path,
+            Some(100.0),
+            &[("pause", &[0.0, 10.0, 20.0], &[0.0, -1.0, 0.0])],
+        );
+        let health = run_health(&path, &RunHealthOptions::default()).unwrap();
+        assert_eq!(health.pause_fraction, Some(0.1));
+    }
+
+    /// T55: a present-but-EMPTY PV (zero entries logged) is treated like
+    /// an absent PV — None fields, no error — and the other PV's summary
+    /// survives.
+    #[test]
+    fn test_empty_pv_is_none_other_pv_survives() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("run.h5");
+        write_run(
+            &path,
+            Some(100.0),
+            &[
+                ("pause", &[], &[]),
+                ("proton_charge", &[0.0, 50.0], &[10.0, 10.0]),
+            ],
+        );
+
+        let health = run_health(&path, &RunHealthOptions::default()).unwrap();
+        assert_eq!(health.pause_fraction, None);
+        assert_eq!(health.n_pause_entries, 0);
+        assert_eq!(health.median_power, Some(10.0));
+        assert_eq!(health.beam_dip_fraction, Some(0.0));
+        assert_eq!(health.n_power_entries, 2);
     }
 
     /// Invalid power_dip_fraction is rejected up-front.
