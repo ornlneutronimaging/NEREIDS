@@ -32,7 +32,13 @@ If not already on main, stash or warn before switching.
    - Check if its branch is merged into main (`git branch --merged main`)
    - If merged: `git worktree remove {path}` then `git branch -d {branch}`
    - If not merged: warn the user — do NOT force-delete
-3. Prune stale remote-tracking branches:
+3. **Prune stale worktree registrations**: `git worktree prune -v`, then
+   `git worktree list` to confirm. A `git worktree remove` that is
+   interrupted (e.g. slow NFS `target/` deletes) can leave the directory
+   gone but the admin registration behind (shows as `prunable`); the stale
+   entry makes VSCode/Git report "too many active changes". Always prune
+   after the removal loop.
+4. Prune stale remote-tracking branches:
    ```bash
    git fetch --prune origin
    git branch -vv | grep ': gone]' | awk '{print $1}'
