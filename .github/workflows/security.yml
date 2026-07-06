@@ -1,0 +1,31 @@
+name: Security audit
+
+# Scans the Cargo dependency tree against the RustSec advisory database.
+# Runs on dependency/lockfile changes, on every PR, and weekly so that newly
+# published advisories are caught even when the lockfile has not changed.
+on:
+  push:
+    branches: [main]
+  pull_request:
+  schedule:
+    - cron: "0 6 * * 1" # Mondays 06:00 UTC
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  cargo-audit:
+    name: cargo audit (RustSec)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@29eef336d9b2848a0b548edc03f92a220660cdb8 # stable
+      - uses: taiki-e/install-action@4684b8405694ae9dd42c9f39ba901a70ae83f4a3 # v2.82.9
+        with:
+          tool: cargo-audit
+      # Fails on unignored vulnerabilities. Accepted-risk advisories (with a
+      # reason + revisit condition) live in .cargo/audit.toml. Unmaintained/
+      # unsound/yanked crates are reported as warnings and do not fail the gate.
+      - name: cargo audit
+        run: cargo audit
