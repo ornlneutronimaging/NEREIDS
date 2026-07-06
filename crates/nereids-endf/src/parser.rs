@@ -1977,17 +1977,15 @@ mod tests {
             .parent()
             .unwrap()
             .join("tests/data/endf/Ta-181.endf");
-        let endf_text = match std::fs::read_to_string(&endf_path) {
-            Ok(t) => t,
-            Err(e) => {
-                eprintln!(
-                    "skipping test_parse_ta181_endf8_0_resonance_count: \
-                     fixture not available at {endf_path:?}: {e}. \
-                     Run from the full NEREIDS workspace to exercise this gate."
-                );
-                return;
-            }
-        };
+        // The fixture is committed to the repo, so a missing file is a
+        // packaging/path regression that MUST fail CI — not a skip that would
+        // silently disable this #638 resonance-count guard.
+        let endf_text = std::fs::read_to_string(&endf_path).unwrap_or_else(|e| {
+            panic!(
+                "vendored Ta-181 regression fixture must be present at \
+                 {endf_path:?} (committed test data): {e}"
+            )
+        });
         let data = parse_endf_file2(&endf_text).unwrap();
 
         assert_eq!(data.za, 73181, "Should be Ta-181");

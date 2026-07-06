@@ -1523,6 +1523,12 @@ mod tests {
     /// NOT this Poisson deviance, which on transmission fractions would be a
     /// pseudo-Poisson statistic rather than a valid reduced-χ².
     fn poisson_deviance(y_obs: &[f64], y_model: &[f64]) -> f64 {
+        // Poisson deviance is undefined for negative observations (the term
+        // `obs * ln(obs/m)` has no meaning); guard the impossible state.
+        debug_assert!(
+            y_obs.iter().all(|&o| o >= 0.0),
+            "poisson_deviance requires non-negative observations"
+        );
         y_obs
             .iter()
             .zip(y_model.iter())

@@ -276,8 +276,13 @@ class TestResonanceData:
         fixture = os.path.join(
             root, "tests/data/synthetic/lrf7_krm3_resonance_column_order.endf"
         )
-        if not os.path.exists(fixture):
-            pytest.skip(f"LRF=7 fixture missing at {fixture}")
+        # The fixture is committed to the repo, so a missing file is a
+        # packaging/path regression that MUST fail — not a skip that would
+        # silently disable this LRF=7 count guard.
+        assert os.path.exists(fixture), (
+            f"vendored LRF=7 regression fixture must be present at {fixture} "
+            "(committed test data)"
+        )
 
         data = nereids.load_endf_file(fixture)
         assert data.n_resonances > 0, (

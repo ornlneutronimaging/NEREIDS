@@ -5280,7 +5280,13 @@ mod tests {
             let perturbed: Vec<f64> = t
                 .iter()
                 .enumerate()
-                .map(|(i, &ti)| if i % 2 == 0 { ti * (1.0 + k) } else { ti * (1.0 - k) })
+                .map(|(i, &ti)| {
+                    if i % 2 == 0 {
+                        ti * (1.0 + k)
+                    } else {
+                        ti * (1.0 - k)
+                    }
+                })
                 .collect();
             (perturbed, sigma)
         };
