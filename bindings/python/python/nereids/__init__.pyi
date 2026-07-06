@@ -28,7 +28,8 @@ class NexusMetadata:
     def tof_offset_ns(self) -> float | None: ...
 
 class RunHealth:
-    """DASlogs-based run-health summary (``None`` = PV absent)."""
+    """DASlogs-based run-health summary (``None`` = cannot compute:
+    PV absent or empty, or the dip threshold is undefined)."""
 
     @property
     def pause_fraction(self) -> float | None:
@@ -36,7 +37,13 @@ class RunHealth:
         ...
     @property
     def beam_dip_fraction(self) -> float | None:
-        """Time-weighted fraction with power below the dip threshold."""
+        """Time-weighted fraction with power below the dip threshold.
+
+        ``None`` when the power PV is absent or empty, or when the dip
+        threshold is undefined because the sample median of the power
+        entries is non-positive (e.g. beam off for at least half the
+        entries) — check ``median_power``, which is co-reported.
+        """
         ...
     @property
     def median_power(self) -> float | None:
@@ -829,6 +836,10 @@ def load_tiff_stack(
     non-finite pixels; ``"clip"`` clamps negatives to 0.0 (NaN still
     errors); ``"allow"`` passes values through verbatim (pre-normalized
     transmission stacks).
+
+    Raises ``FileNotFoundError`` when ``path`` does not exist,
+    ``ValueError`` for bad pixel values or an invalid policy, and
+    ``OSError`` for other I/O failures (e.g. permission denied).
     """
     ...
 
@@ -838,6 +849,7 @@ def load_tiff_folder(
     pattern: str | None = None,
     sum_chunks: bool = True,
     pixel_policy: str = "reject",
+    *,
     return_info: Literal[False] = False,
 ) -> NDArray[np.float64]:
     """Load a folder of single-frame TIFFs into a 3D numpy array.
@@ -851,9 +863,9 @@ def load_tiff_folder(
     per folder; use ``pattern`` (or ``sum_chunks=False``) when a folder
     may hold multiple same-prefix runs.  ``pixel_policy`` is ``"reject"``
     | ``"clip"`` | ``"allow"`` as in ``load_tiff_stack``.  With
-    ``return_info=True``, returns ``(array, info)`` where ``info`` has
-    keys ``n_files``, ``n_chunks``, ``chunk_ids``, ``chunks_summed``,
-    and ``n_clipped_pixels``.
+    ``return_info=True`` (keyword-only), returns ``(array, info)`` where
+    ``info`` has keys ``n_files``, ``n_chunks``, ``chunk_ids``,
+    ``chunks_summed``, and ``n_clipped_pixels``.
     """
     ...
 
@@ -882,6 +894,10 @@ def read_tof_sidecar(
     validated against it.  If the first edge is exactly 0, crop the
     first frame from both stack and edges (``stack[1:]``, ``edges[1:]``)
     before energy conversion.
+
+    Raises ``FileNotFoundError`` only when the file genuinely does not
+    exist; other open failures (e.g. permission denied) raise
+    ``OSError``, and malformed content raises ``ValueError``.
     """
     ...
 
@@ -900,7 +916,10 @@ def run_health(
     DASlogs PVs log transitions, so statistics use last-value-held
     time-weighted integration over the run window, never entry means.
     The PV-name defaults are the SNS ones; other facilities pass their
-    own.  Absent PVs yield ``None`` fields, not errors.
+    own.  Absent PVs and present-but-empty PVs (zero entries logged)
+    yield ``None`` fields, not errors; ``beam_dip_fraction`` is also
+    ``None`` when the median power is non-positive (dip threshold
+    undefined — see ``RunHealth.beam_dip_fraction``).
     """
     ...
 

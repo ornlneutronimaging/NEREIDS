@@ -2161,6 +2161,24 @@ fn parse_pixel_policy(policy: &str) -> PyResult<nereids_io::tiff_stack::PixelVal
     }
 }
 
+/// True when `e` is an [`IoError::FileNotFound`] whose underlying OS error
+/// kind is genuinely `NotFound`.
+///
+/// `IoError::FileNotFound` wraps *any* `std::io::Error` raised while
+/// opening a path (permission denied, `InvalidInput`, ...), so mapping the
+/// variant unconditionally to Python ``FileNotFoundError`` would mislabel
+/// e.g. a permission-denied file as missing.  Callers use this guard and
+/// fall through to ``OSError`` for every other kind.
+///
+/// [`IoError::FileNotFound`]: nereids_io::error::IoError::FileNotFound
+fn is_genuine_not_found(e: &nereids_io::error::IoError) -> bool {
+    matches!(
+        e,
+        nereids_io::error::IoError::FileNotFound(_, source)
+            if source.kind() == std::io::ErrorKind::NotFound
+    )
+}
+
 /// Emit Python ``UserWarning``s for semantically significant TIFF-load
 /// events recorded in a [`nereids_io::tiff_stack::TiffLoadInfo`].
 ///
@@ -2172,14 +2190,19 @@ fn parse_pixel_policy(policy: &str) -> PyResult<nereids_io::tiff_stack::PixelVal
 /// can catch, filter, or escalate with the stdlib ``warnings`` module
 /// (mirroring the GUI's provenance-log entries for the same events).
 ///
-/// ``stacklevel=2`` attributes the warning to the Python call site rather
-/// than this extension module.
+/// ``stacklevel=1`` attributes the warning to the frame that invoked this
+/// pyo3 function — which *is* the Python call site: extension functions
+/// execute inside the caller's Python frame without pushing a frame of
+/// their own, so there is no "extension frame" to skip.
 fn emit_tiff_load_warnings(
     py: Python<'_>,
     info: &nereids_io::tiff_stack::TiffLoadInfo,
 ) -> PyResult<()> {
-    /// ``warnings.warn`` stacklevel: 1 = this extension frame, 2 = caller.
-    const WARN_STACKLEVEL: i32 = 2;
+    /// ``warnings.warn`` stacklevel.  pyo3 ``#[pyfunction]``s run in the
+    /// *caller's* Python frame (no extension frame exists), so level 1 is
+    /// already the Python call site; 2 would blame the caller's caller
+    /// (empirically: pytest internals when called from the test suite).
+    const WARN_STACKLEVEL: i32 = 1;
     let mut messages: Vec<String> = Vec::new();
     if info.chunks_summed {
         let ids: Vec<String> = info.chunk_ids.iter().map(|id| id.to_string()).collect();
@@ -2233,9 +2256,11 @@ fn emit_tiff_load_warnings(
 ///         negative pixels (the message reports the count).
 ///
 /// Raises:
+///     FileNotFoundError: If the file does not exist.
 ///     ValueError: For bad pixel values under the active policy, or an
 ///         invalid ``pixel_policy`` string.
-///     IOError: For TIFF decoding errors or other I/O failures.
+///     IOError: For TIFF decoding errors or other I/O failures
+///         (e.g. permission denied).
 #[pyfunction]
 #[pyo3(signature = (path, pixel_policy="reject"))]
 fn load_tiff_stack<'py>(
@@ -2249,6 +2274,9 @@ fn load_tiff_stack<'py>(
             .map_err(|e| match &e {
                 nereids_io::error::IoError::BadPixelValue { .. } => {
                     pyo3::exceptions::PyValueError::new_err(format!("{}", e))
+                }
+                err if is_genuine_not_found(err) => {
+                    pyo3::exceptions::PyFileNotFoundError::new_err(format!("{}", e))
                 }
                 _ => pyo3::exceptions::PyIOError::new_err(format!("{}", e)),
             })?;
@@ -2292,10 +2320,10 @@ fn load_tiff_stack<'py>(
 ///         non-finite pixels; ``"clip"`` clamps negatives to 0.0 (NaN
 ///         still errors); ``"allow"`` passes values through verbatim (for
 ///         pre-normalized transmission stacks).
-///     return_info: When ``True``, return ``(array, info)`` where ``info``
-///         is a dict with keys ``n_files``, ``n_chunks``, ``chunk_ids``,
-///         ``chunks_summed``, and ``n_clipped_pixels`` (default
-///         ``False`` — return just the array).
+///     return_info: Keyword-only.  When ``True``, return ``(array, info)``
+///         where ``info`` is a dict with keys ``n_files``, ``n_chunks``,
+///         ``chunk_ids``, ``chunks_summed``, and ``n_clipped_pixels``
+///         (default ``False`` — return just the array).
 ///
 /// Returns:
 ///     3D numpy array with shape (n_frames, height, width), dtype float64;
@@ -2315,7 +2343,7 @@ fn load_tiff_stack<'py>(
 ///         violates the active policy, or ``pixel_policy`` is invalid.
 ///     IOError: For TIFF decoding errors or other I/O failures.
 #[pyfunction]
-#[pyo3(signature = (folder, pattern=None, sum_chunks=true, pixel_policy="reject", return_info=false))]
+#[pyo3(signature = (folder, pattern=None, sum_chunks=true, pixel_policy="reject", *, return_info=false))]
 fn load_tiff_folder<'py>(
     py: Python<'py>,
     folder: &str,
@@ -2340,9 +2368,7 @@ fn load_tiff_folder<'py>(
         nereids_io::error::IoError::NotADirectory(_) => {
             pyo3::exceptions::PyNotADirectoryError::new_err(format!("{}", e))
         }
-        nereids_io::error::IoError::FileNotFound(_, source)
-            if source.kind() == std::io::ErrorKind::NotFound =>
-        {
+        err if is_genuine_not_found(err) => {
             pyo3::exceptions::PyFileNotFoundError::new_err(format!("{}", e))
         }
         nereids_io::error::IoError::DimensionMismatch { .. } => {
@@ -2403,11 +2429,13 @@ fn load_tiff_folder<'py>(
 ///     1D numpy array of N+1 ascending TOF bin edges in microseconds.
 ///
 /// Raises:
-///     FileNotFoundError: If the sidecar file does not exist.
+///     FileNotFoundError: If the sidecar file does not exist (genuinely
+///         missing — other open failures such as permission denied raise
+///         ``OSError`` instead).
 ///     ValueError: For malformed content (fewer than 2 rows, non-finite
 ///         or non-increasing start times, a negative first start) or an
 ///         edge/frame count mismatch.
-///     IOError: For other I/O failures.
+///     IOError: For other I/O failures (e.g. permission denied).
 #[pyfunction]
 #[pyo3(signature = (path, n_frames=None))]
 fn read_tof_sidecar<'py>(
@@ -2420,7 +2448,7 @@ fn read_tof_sidecar<'py>(
             nereids_io::error::IoError::InvalidParameter(_) => {
                 pyo3::exceptions::PyValueError::new_err(format!("{}", e))
             }
-            nereids_io::error::IoError::FileNotFound(..) => {
+            err if is_genuine_not_found(err) => {
                 pyo3::exceptions::PyFileNotFoundError::new_err(format!("{}", e))
             }
             _ => pyo3::exceptions::PyIOError::new_err(format!("{}", e)),
@@ -3463,7 +3491,11 @@ impl PyRunHealth {
     }
 
     /// Time-weighted fraction of the run with power below
-    /// `power_dip_fraction × median(power)`, if the power PV is present.
+    /// `power_dip_fraction × median(power)`.  ``None`` when the power PV
+    /// is absent or empty, or when the dip threshold is undefined because
+    /// the sample median of the power entries is non-positive (e.g. the
+    /// beam was off for at least half the entries) — check
+    /// ``median_power``, which is co-reported.
     #[getter]
     fn beam_dip_fraction(&self) -> Option<f64> {
         self.inner.beam_dip_fraction
@@ -3512,7 +3544,10 @@ impl PyRunHealth {
 /// wrong; this uses last-value-held time-weighted integration over the
 /// run window (``/entry/duration`` when present, else the latest log
 /// timestamp — a lower bound).  Absent PVs (or a missing DASlogs group)
-/// yield ``None`` fields, not errors.
+/// and present-but-empty PVs (zero entries logged) yield ``None`` fields,
+/// not errors.  ``beam_dip_fraction`` is additionally ``None`` when the
+/// sample median of the power entries is non-positive (dip threshold
+/// undefined); ``median_power`` is co-reported so callers can see why.
 ///
 /// Args:
 ///     path: Path to the NeXus/HDF5 file.
@@ -3530,8 +3565,9 @@ impl PyRunHealth {
 ///
 /// Raises:
 ///     ValueError: For a present-but-malformed PV (length mismatch,
-///         non-finite entries, decreasing timestamps), a non-positive
-///         run window, or an invalid power_dip_fraction.
+///         non-finite entries, negative power values, decreasing
+///         timestamps), a non-positive run window, or an invalid
+///         power_dip_fraction.
 ///     IOError: If the file is missing/unreadable or /entry is absent
 ///         (HDF5 access failures).
 #[pyfunction]

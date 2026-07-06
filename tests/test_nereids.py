@@ -1874,6 +1874,49 @@ class TestTiffIO:
                 "n_clipped_pixels": 0,
             }
 
+    def test_warning_attributed_to_caller(self):
+        """T50: TIFF-load warnings are attributed to this file (the
+        Python call site).  pyo3 functions execute in the caller's frame,
+        so stacklevel=1 already points there; stacklevel=2 would blame
+        the caller's caller (pytest internals in this suite).  pytest.warns
+        checks only category/message, so assert the filename explicitly."""
+        pytest.importorskip("tifffile")
+        with tempfile.TemporaryDirectory() as tmpdir:
+            self._write_chunked_folder(tmpdir)
+            with warnings.catch_warnings(record=True) as w:
+                warnings.simplefilter("always")
+                nereids.load_tiff_folder(tmpdir)
+        assert len(w) == 1
+        assert issubclass(w[0].category, UserWarning)
+        assert w[0].filename == __file__
+
+    def test_missing_tiff_raises_filenotfound(self):
+        """T51: a nonexistent path raises FileNotFoundError from
+        load_tiff_stack (aligned with load_tiff_folder and
+        read_tof_sidecar).  Only a genuine NotFound maps there; other
+        open failures (e.g. permission denied) stay plain OSError."""
+        with tempfile.TemporaryDirectory() as tmpdir:
+            missing = os.path.join(tmpdir, "no_such.tif")
+            with pytest.raises(FileNotFoundError):
+                nereids.load_tiff_stack(missing)
+
+    def test_return_info_is_keyword_only(self):
+        """T52: return_info is keyword-only at runtime, matching the
+        .pyi overloads; passing it positionally raises TypeError."""
+        tifffile = pytest.importorskip("tifffile")
+        with tempfile.TemporaryDirectory() as tmpdir:
+            tifffile.imwrite(
+                os.path.join(tmpdir, "frame_0000.tif"),
+                np.ones((2, 2), dtype=np.uint16),
+            )
+            arr, info = nereids.load_tiff_folder(
+                tmpdir, None, True, "reject", return_info=True
+            )
+            assert np.asarray(arr).shape == (1, 2, 2)
+            assert info["n_files"] == 1
+            with pytest.raises(TypeError):
+                nereids.load_tiff_folder(tmpdir, None, True, "reject", True)
+
 
 # ===========================================================================
 # Error handling / validation
@@ -2197,7 +2240,7 @@ class TestNexusIO:
         assert input_data is not None  # successfully created InputData
 
     def test_run_health_daslogs(self, tmp_path):
-        """T47: run_health reads DASlogs pause/power via last-value-held
+        """T49: run_health reads DASlogs pause/power via last-value-held
         time-weighted integration; absent PVs yield None."""
         import h5py
 
