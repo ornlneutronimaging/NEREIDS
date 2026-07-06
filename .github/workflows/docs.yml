@@ -41,7 +41,7 @@ jobs:
       # running it BEFORE the (slow) rust + mdbook + pixi setup avoids
       # paying ~1 min of environment-install cost when the drift gate
       # fails.
-      - uses: actions/setup-python@v5
+      - uses: actions/setup-python@v6
         with:
           python-version: "3.10"
       - name: Check curated Python API page is in sync with .pyi stubs
