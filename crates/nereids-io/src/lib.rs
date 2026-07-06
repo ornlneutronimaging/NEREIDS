@@ -10,6 +10,9 @@
 //! - [`normalization`] — Raw + open beam → transmission (Method 2), dead/hot pixel masks (pipeline-integrity), ROI
 //! - `project` — Project file save/load for `.nrd.h5` archives (`hdf5` feature)
 //! - [`rebin`] — Energy rebinning (coarsen the TOF/energy axis by an integer factor)
+//! - `runlog` — DASlogs transition logs → beam-state intervals for event
+//!   filtering (`hdf5` feature; not an intra-doc link so default-feature
+//!   doc builds stay warning-free)
 //! - [`spectrum`] — Spectrum file parser for TOF/energy bin edges or centers
 //! - [`tiff_stack`] — Multi-frame TIFF stack loading → 3D arrays (tof, y, x)
 //! - [`tof`] — TOF bin edges → energy conversion for imaging data
@@ -26,6 +29,8 @@ pub mod normalization;
 #[cfg(feature = "hdf5")]
 pub mod project;
 pub mod rebin;
+#[cfg(feature = "hdf5")]
+pub mod runlog;
 pub mod spectrum;
 pub mod tiff_stack;
 pub mod tof;

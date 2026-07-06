@@ -4167,3 +4167,206 @@ class TestMultiplicativeBaseline:
         assert np.all(
             np.abs(b0_map[converged] - _BL_TRUE[0]) < 5e-2
         ), f"per-pixel b0 off truth: {b0_map}"
+
+def _create_synthetic_nxevent_bank(
+    path, pulse_times_s, events_per_pulse_us, tof_units="microsecond",
+    etz_units="second",
+):
+    """Create a facility-schema NXevent_data bank (issue #637).
+
+    Mirrors the SNS layout: ``/entry/<bank>/{event_time_offset,
+    event_index, event_time_zero}`` where ``event_index`` is the
+    cumulative first-event index per pulse and ``event_time_zero`` is
+    seconds since run start.  Also writes a matching ``pause`` DASlogs
+    transition log and ``/entry/duration`` so the full
+    read_run_log -> intervals_where -> load_nexus_bank_spectrum chain
+    can be exercised on one file.
+    """
+    import h5py
+
+    with h5py.File(path, "w") as f:
+        entry = f.create_group("entry")
+        entry.create_dataset(
+            "duration", data=np.array([len(pulse_times_s)], dtype=np.float32)
+        )
+        bank = entry.create_group("monitor1")
+        index, tofs = [], []
+        for evs in events_per_pulse_us:
+            index.append(len(tofs))
+            tofs.extend(evs)
+        etz = bank.create_dataset(
+            "event_time_zero", data=np.asarray(pulse_times_s, dtype=np.float64)
+        )
+        # fixed-length ASCII attrs, exactly like SNS/ADARA facility files
+        if etz_units is not None:
+            etz.attrs["units"] = np.bytes_(etz_units)
+        etz.attrs["offset"] = np.bytes_("2026-06-22T19:01:07.183368667-04:00")
+        bank.create_dataset("event_index", data=np.asarray(index, dtype=np.uint64))
+        # f32 like real SNS files
+        eto = bank.create_dataset(
+            "event_time_offset", data=np.asarray(tofs, dtype=np.float32)
+        )
+        if tof_units is not None:
+            eto.attrs["units"] = np.bytes_(tof_units)
+        # pause transition log: paused (value 1) during the middle third
+        n = len(pulse_times_s)
+        logs = entry.create_group("DASlogs")
+        pause = logs.create_group("pause")
+        t = pause.create_dataset(
+            "time", data=np.array([0.0, n / 3.0, 2.0 * n / 3.0])
+        )
+        t.attrs["start"] = np.bytes_("2026-06-22T19:01:07.183368667-04:00")
+        # uint16, like the real SNS pause PV
+        pause.create_dataset("value", data=np.array([0, 1, 0], dtype=np.uint16))
+
+
+@pytest.mark.skipif(not HAS_H5PY, reason="h5py not installed")
+class TestRunLogAndBankSpectrum:
+    """Beam-state filtering: DASlogs intervals + NXevent_data banks (#637)."""
+
+    def test_read_run_log_and_step_semantics(self, tmp_path):
+        path = str(tmp_path / "bank.h5")
+        _create_synthetic_nxevent_bank(path, [0.0, 1.0, 2.0], [[100.0]] * 3)
+        log = nereids.read_run_log(path, "pause")
+        assert isinstance(log, nereids.RunLog)
+        assert log.times.shape == (3,)
+        assert log.n_dropped_corrupt == 0
+        assert "Some(" not in repr(log)
+        assert log.duration_s == pytest.approx(3.0)
+        assert log.offset_iso.startswith("2026-06-22")
+        # Step semantics: pause==0 on [0, 1) and [2, 3) (last value
+        # persists to duration) — the middle third is paused.
+        live = nereids.intervals_where(
+            log.times, log.values, log.duration_s, max_value=0.5
+        )
+        assert len(live) == 2
+        assert live[0] == (0.0, pytest.approx(1.0))
+        assert live[1][0] == pytest.approx(2.0)
+        assert live[1][1] >= 3.0  # final segment padded past f32 duration
+        with pytest.raises((IOError, ValueError)):
+            nereids.read_run_log(path, "no_such_pv")
+
+    def test_corrupt_reconnect_record_dropped(self, tmp_path):
+        # Mirror of VENUS run 19383 BL10:SE:ND1:CH1:PV — a reconnect
+        # appends (time=0.0, value=denormal garbage) mid-log.
+        import h5py
+
+        path = str(tmp_path / "reconnect.h5")
+        with h5py.File(path, "w") as f:
+            entry = f.create_group("entry")
+            entry.create_dataset("duration", data=np.array([2000.0], dtype=np.float32))
+            g = entry.create_group("DASlogs/ch1")
+            g.create_dataset(
+                "time", data=np.array([0.0, 2.0, 1194.96, 1226.96, 0.0, 1228.99])
+            )
+            g.create_dataset(
+                "value", data=np.array([6.9e-310, 27.7, 27.75, 27.79, 6.9e-310, 27.78])
+            )
+        log = nereids.read_run_log(path, "ch1")
+        assert log.n_dropped_corrupt == 2
+        assert log.times.shape == (4,)
+        assert not np.any(log.values < 1.0)
+        # Cleaned log feeds intervals_where without error.  The state on
+        # [0, 2) was recorded only by the garbage record, so the interval
+        # starts at the first clean entry; the end is the f32-ULP-padded
+        # run end.
+        iv = nereids.intervals_where(log.times, log.values, log.duration_s, min_value=27.0)
+        assert len(iv) == 1
+        assert iv[0][0] == pytest.approx(2.0)
+        assert iv[0][1] >= 2000.0
+
+    def test_intervals_where_entry_mean_trap(self):
+        # The motivating case: entry-mean of the log reads 3/7 = 0.43
+        # "paused" while the time-weighted pause fraction is ~0.90.
+        times = [0.0, 1000.0, 20000.0, 21500.0, 42589.0, 44100.0, 44338.0]
+        values = [0.0, 1.0, 0.0, 1.0, 0.0, 1.0, 0.0]
+        live = nereids.intervals_where(times, values, 44339.0, max_value=0.5)
+        live_s = sum(b - a for a, b in live)
+        assert np.mean(values) == pytest.approx(3.0 / 7.0)
+        assert live_s / 44339.0 < 0.11
+        with pytest.raises(ValueError):
+            nereids.intervals_where(times, values, 44339.0, min_value=2.0, max_value=1.0)
+
+    def test_intervals_intersect(self):
+        keep = nereids.intervals_intersect(
+            [(0.0, 10.0), (20.0, 30.0)], [(5.0, 25.0)]
+        )
+        assert keep == [(5.0, 10.0), (20.0, 25.0)]
+        assert nereids.intervals_intersect([(0.0, 5.0)], [(5.0, 9.0)]) == []
+        # Unsorted input is normalised, not silently corrupted.
+        assert nereids.intervals_intersect(
+            [(20.0, 30.0), (0.0, 10.0)], [(5.0, 25.0)]
+        ) == [(5.0, 10.0), (20.0, 25.0)]
+        with pytest.raises(ValueError):
+            nereids.intervals_intersect([(5.0, 5.0)], [(0.0, 1.0)])
+
+    def test_load_bank_spectrum_unfiltered_and_filtered(self, tmp_path):
+        path = str(tmp_path / "bank.h5")
+        # 6 pulses at t = 0..5 s; pulse p carries p events at TOF 500 µs.
+        _create_synthetic_nxevent_bank(
+            path, [float(t) for t in range(6)], [[500.0] * p for p in range(6)]
+        )
+        s = nereids.load_nexus_bank_spectrum(
+            path, "monitor1", n_bins=2, tof_min_us=0.0, tof_max_us=1000.0
+        )
+        assert isinstance(s, nereids.BankSpectrum)
+        assert s.pulses_total == 6 and s.pulses_kept == 6
+        assert s.events_total == 15 and s.events_kept == 15
+        assert list(s.counts) == [0, 15]
+        assert s.tof_edges_us.shape == (3,)
+        assert s.pulse_time_offset_iso.startswith("2026-06-22")
+        # Filter to the live intervals derived from the pause log:
+        # [0, 2) and [4, 6) keep pulses 0, 1, 4, 5 -> 0+1+4+5 = 10 events.
+        log = nereids.read_run_log(path, "pause")
+        live = nereids.intervals_where(
+            log.times, log.values, log.duration_s, max_value=0.5
+        )
+        sf = nereids.load_nexus_bank_spectrum(
+            path,
+            "monitor1",
+            n_bins=2,
+            tof_min_us=0.0,
+            tof_max_us=1000.0,
+            keep_intervals=live,
+        )
+        assert sf.pulses_kept == 4
+        assert sf.events_kept == 10
+        assert list(sf.counts) == [0, 10]
+
+    def test_empty_bank_grace(self, tmp_path):
+        # The VENUS reality: pulses recorded, zero events (frame-mode tpx1).
+        path = str(tmp_path / "empty.h5")
+        _create_synthetic_nxevent_bank(path, [0.0, 1.0, 2.0], [[], [], []])
+        s = nereids.load_nexus_bank_spectrum(
+            path, "monitor1", n_bins=4, tof_min_us=0.0, tof_max_us=1000.0,
+            keep_intervals=[(0.5, 2.5)],
+        )
+        assert s.pulses_total == 3 and s.pulses_kept == 2
+        assert s.events_total == 0 and s.events_kept == 0
+        assert list(s.counts) == [0, 0, 0, 0]
+
+    def test_missing_units_is_an_error_on_both_event_datasets(self, tmp_path):
+        # event_time_offset without units
+        path = str(tmp_path / "nounits.h5")
+        _create_synthetic_nxevent_bank(path, [0.0], [[250.0]], tof_units=None)
+        with pytest.raises(ValueError, match="units"):
+            nereids.load_nexus_bank_spectrum(
+                path, "monitor1", n_bins=2, tof_min_us=0.0, tof_max_us=1000.0
+            )
+        # event_time_zero without units (same #554 policy, separate check)
+        path2 = str(tmp_path / "nounits_etz.h5")
+        _create_synthetic_nxevent_bank(path2, [0.0], [[250.0]], etz_units=None)
+        with pytest.raises(ValueError, match="event_time_zero"):
+            nereids.load_nexus_bank_spectrum(
+                path2, "monitor1", n_bins=2, tof_min_us=0.0, tof_max_us=1000.0
+            )
+
+    def test_bad_keep_intervals_rejected(self, tmp_path):
+        path = str(tmp_path / "bank.h5")
+        _create_synthetic_nxevent_bank(path, [0.0], [[250.0]])
+        for bad in [(5.0, 5.0), (5.0, 1.0), (float("nan"), 1.0)]:
+            with pytest.raises(ValueError):
+                nereids.load_nexus_bank_spectrum(
+                    path, "monitor1", n_bins=2, tof_min_us=0.0,
+                    tof_max_us=1000.0, keep_intervals=[bad],
+                )

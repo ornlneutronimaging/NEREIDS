@@ -882,6 +882,47 @@ def load_nexus_histogram(
     """
     ...
 
+class RunLog:
+    """A slow-control PV from ``/entry/DASlogs/<pv>`` as a transition log.
+
+    ``values[i]`` takes effect at ``times[i]`` and persists until the next
+    entry (the last value persists to ``duration_s``).  Do NOT average
+    ``values`` directly — use :func:`intervals_where` (issue #637).
+    """
+
+    @property
+    def times(self) -> NDArray[np.float64]: ...
+    @property
+    def values(self) -> NDArray[np.float64]: ...
+    @property
+    def duration_s(self) -> float: ...
+    @property
+    def offset_iso(self) -> str | None: ...
+    @property
+    def n_dropped_corrupt(self) -> int: ...
+
+class BankSpectrum:
+    """1-D TOF spectrum from one NXevent_data bank plus retention stats."""
+
+    @property
+    def tof_edges_us(self) -> NDArray[np.float64]: ...
+    @property
+    def counts(self) -> NDArray[np.uint64]: ...
+    @property
+    def pulses_total(self) -> int: ...
+    @property
+    def pulses_kept(self) -> int: ...
+    @property
+    def events_total(self) -> int: ...
+    @property
+    def events_kept(self) -> int: ...
+    @property
+    def dropped_tof_range(self) -> int: ...
+    @property
+    def dropped_non_finite(self) -> int: ...
+    @property
+    def pulse_time_offset_iso(self) -> str | None: ...
+
 def load_nexus_events(
     path: str,
     n_bins: int,
@@ -894,6 +935,56 @@ def load_nexus_events(
 
     Reads ``/entry/neutrons/event_time_offset``, ``/x``, ``/y`` and bins
     events into a linear TOF grid.
+    """
+    ...
+
+def read_run_log(path: str, pv: str) -> RunLog:
+    """Read a DASlogs PV from a NeXus file as a transition log (issue #637).
+
+    SNS DASlogs record TRANSITIONS, not uniform samples: on a real VENUS
+    run the entry-mean of the ``pause`` log read 0.43 while the
+    time-weighted truth was 0.90.  Derive intervals with
+    :func:`intervals_where` instead of averaging ``values``.
+    """
+    ...
+
+def intervals_where(
+    times: NDArray[np.float64] | list[float],
+    values: NDArray[np.float64] | list[float],
+    duration_s: float,
+    min_value: float | None = None,
+    max_value: float | None = None,
+) -> list[tuple[float, float]]:
+    """Intervals where ``min_value <= value <= max_value`` under correct
+    step-function semantics (issue #637).  Time before the first log entry
+    never matches; NaN never matches; adjacent segments merge.
+    """
+    ...
+
+def intervals_intersect(
+    a: list[tuple[float, float]],
+    b: list[tuple[float, float]],
+) -> list[tuple[float, float]]:
+    """Intersect two interval lists, e.g. pause==0 AND power>1.5 MW.
+
+    Inputs may be unsorted/overlapping (normalised by sort+merge first);
+    every pair must be finite with t_end > t_start.
+    """
+    ...
+
+def load_nexus_bank_spectrum(
+    path: str,
+    bank: str,
+    n_bins: int,
+    tof_min_us: float,
+    tof_max_us: float,
+    keep_intervals: list[tuple[float, float]] | None = None,
+) -> BankSpectrum:
+    """Load one NXevent_data bank (e.g. ``"monitor1"``) as a 1-D TOF
+    spectrum, keeping only pulses inside ``keep_intervals`` (seconds on the
+    pulse clock = DASlogs clock at SNS).  Empty banks load gracefully to a
+    zero spectrum; ``units`` attrs are required on both event datasets
+    (issue #637).
     """
     ...
 

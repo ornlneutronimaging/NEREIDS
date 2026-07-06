@@ -3396,6 +3396,302 @@ fn load_nexus_events(
     Ok(nexus_data_to_py(py, data))
 }
 
+/// A slow-control PV read from `/entry/DASlogs/<pv>` as a transition log.
+#[pyclass(name = "RunLog")]
+struct PyRunLog {
+    times: Py<PyArray1<f64>>,
+    values: Py<PyArray1<f64>>,
+    duration_s: f64,
+    offset_iso: Option<String>,
+    n_dropped_corrupt: usize,
+}
+
+#[pymethods]
+impl PyRunLog {
+    /// Transition times in seconds relative to run start (ascending).
+    #[getter]
+    fn times<'py>(&self, py: Python<'py>) -> Bound<'py, PyArray1<f64>> {
+        self.times.bind(py).clone()
+    }
+
+    /// Value taking effect at the matching `times` entry.
+    #[getter]
+    fn values<'py>(&self, py: Python<'py>) -> Bound<'py, PyArray1<f64>> {
+        self.values.bind(py).clone()
+    }
+
+    /// Total run duration in seconds (`/entry/duration`).
+    #[getter]
+    fn duration_s(&self) -> f64 {
+        self.duration_s
+    }
+
+    /// ISO-8601 epoch of the time axis, when recorded.  Compare with
+    /// `BankSpectrum.pulse_time_offset_iso` to confirm both clocks share
+    /// a zero point.
+    #[getter]
+    fn offset_iso(&self) -> Option<String> {
+        self.offset_iso.clone()
+    }
+
+    /// Entries dropped as corrupt device-reconnect records (backward time
+    /// jump or subnormal value payload, both seen in real SNS files).
+    /// Non-zero is worth a mention in run-health screens.
+    #[getter]
+    fn n_dropped_corrupt(&self) -> usize {
+        self.n_dropped_corrupt
+    }
+
+    fn __repr__(&self, py: Python<'_>) -> String {
+        let offset = match &self.offset_iso {
+            Some(o) => format!("{o:?}"),
+            None => "None".to_string(),
+        };
+        format!(
+            "RunLog(n_entries={}, duration_s={}, offset={}, n_dropped_corrupt={})",
+            self.times.bind(py).len(),
+            self.duration_s,
+            offset,
+            self.n_dropped_corrupt,
+        )
+    }
+}
+
+/// Read a DASlogs PV from a NeXus file as a transition log (issue #637).
+///
+/// SNS/HFIR DASlogs are **transition logs**, not uniformly-sampled time
+/// series: `values[i]` takes effect at `times[i]` and persists until the
+/// next entry (the last value persists to the end of the run).  Averaging
+/// `values` directly is therefore wrong whenever entries are unevenly
+/// spaced — on a real VENUS run the entry-mean of the `pause` log read
+/// 0.43 while the time-weighted truth was 0.90.  Use `intervals_where`
+/// to derive time intervals with the correct step-function semantics.
+///
+/// Args:
+///     path: Path to the NeXus/HDF5 file.
+///     pv: PV name under `/entry/DASlogs/` (e.g. "pause",
+///         "BL10:Det:rtdl:BeamPowerAvg").
+///
+/// Returns:
+///     RunLog with times (s, relative to run start), values, duration_s,
+///     the ISO-8601 epoch of the time axis when recorded, and
+///     n_dropped_corrupt — the number of corrupt device-reconnect
+///     records (backward time jump or subnormal value payload) dropped.
+#[pyfunction]
+#[pyo3(signature = (path, pv))]
+fn read_run_log(py: Python<'_>, path: &str, pv: &str) -> PyResult<PyRunLog> {
+    let log =
+        nereids_io::runlog::read_run_log(std::path::Path::new(path), pv).map_err(map_io_error)?;
+    Ok(PyRunLog {
+        times: PyArray1::from_vec(py, log.times).unbind(),
+        values: PyArray1::from_vec(py, log.values).unbind(),
+        duration_s: log.duration_s,
+        offset_iso: log.offset_iso,
+        n_dropped_corrupt: log.n_dropped_corrupt,
+    })
+}
+
+/// Derive run-time intervals where a transition-log PV satisfies
+/// `min_value <= value <= max_value` (issue #637).
+///
+/// Uses the correct step-function semantics: `values[i]` holds on
+/// `[times[i], times[i+1])` and the last value holds to `duration_s`.
+/// Time before the first log entry is treated as NOT matching (the state
+/// is unrecorded — the conservative choice for a keep-filter), and NaN
+/// values never match.  Adjacent matching segments are merged.
+///
+/// Example — beam-state filtering for a paused run::
+///
+///     pause = read_run_log(path, "pause")
+///     live = intervals_where(pause.times, pause.values,
+///                            pause.duration_s, max_value=0.5)
+///     power = read_run_log(path, "BL10:Det:rtdl:BeamPowerAvg")
+///     stable = intervals_where(power.times, power.values,
+///                              power.duration_s, min_value=1.5)
+///     keep = intervals_intersect(live, stable)
+///
+/// Args:
+///     times: Transition times in seconds (ascending).
+///     values: PV values taking effect at each time.
+///     duration_s: Total run duration in seconds.
+///     min_value: Keep intervals where value >= min_value (optional).
+///     max_value: Keep intervals where value <= max_value (optional).
+///
+/// Returns:
+///     List of (t_start, t_end) tuples in seconds, sorted, non-overlapping.
+#[pyfunction]
+#[pyo3(signature = (times, values, duration_s, min_value=None, max_value=None))]
+fn intervals_where(
+    times: Vec<f64>,
+    values: Vec<f64>,
+    duration_s: f64,
+    min_value: Option<f64>,
+    max_value: Option<f64>,
+) -> PyResult<Vec<(f64, f64)>> {
+    nereids_io::runlog::intervals_where(&times, &values, duration_s, min_value, max_value)
+        .map_err(map_io_error)
+}
+
+/// Intersect two interval lists (issue #637).
+///
+/// Composes conditions across PVs, e.g. `pause == 0` AND
+/// `beam_power > 1.5 MW`.  Inputs are lists of (t_start, t_end) tuples;
+/// unsorted or overlapping lists are normalised first (every pair must be
+/// finite with t_end > t_start).  The output is sorted, non-overlapping,
+/// and drops empty intersections.
+#[pyfunction]
+#[pyo3(signature = (a, b))]
+fn intervals_intersect(a: Vec<(f64, f64)>, b: Vec<(f64, f64)>) -> PyResult<Vec<(f64, f64)>> {
+    nereids_io::runlog::intervals_intersect(&a, &b).map_err(map_io_error)
+}
+
+/// A 1-D TOF spectrum from one NXevent_data bank, with pulse/event
+/// retention statistics.
+#[pyclass(name = "BankSpectrum")]
+struct PyBankSpectrum {
+    tof_edges_us: Py<PyArray1<f64>>,
+    counts: Py<PyArray1<u64>>,
+    pulses_total: usize,
+    pulses_kept: usize,
+    events_total: usize,
+    events_kept: usize,
+    dropped_tof_range: usize,
+    dropped_non_finite: usize,
+    pulse_time_offset_iso: Option<String>,
+}
+
+#[pymethods]
+impl PyBankSpectrum {
+    /// TOF bin edges in microseconds (length = n_bins + 1).
+    #[getter]
+    fn tof_edges_us<'py>(&self, py: Python<'py>) -> Bound<'py, PyArray1<f64>> {
+        self.tof_edges_us.bind(py).clone()
+    }
+
+    /// Event counts per TOF bin (length = n_bins).
+    #[getter]
+    fn counts<'py>(&self, py: Python<'py>) -> Bound<'py, PyArray1<u64>> {
+        self.counts.bind(py).clone()
+    }
+
+    /// Total pulses recorded in the bank.
+    #[getter]
+    fn pulses_total(&self) -> usize {
+        self.pulses_total
+    }
+
+    /// Pulses inside keep_intervals (= pulses_total when unfiltered).
+    #[getter]
+    fn pulses_kept(&self) -> usize {
+        self.pulses_kept
+    }
+
+    /// Total events recorded in the bank.
+    #[getter]
+    fn events_total(&self) -> usize {
+        self.events_total
+    }
+
+    /// Events on kept pulses inside the TOF window.
+    #[getter]
+    fn events_kept(&self) -> usize {
+        self.events_kept
+    }
+
+    /// Events on kept pulses dropped for TOF outside the window.
+    #[getter]
+    fn dropped_tof_range(&self) -> usize {
+        self.dropped_tof_range
+    }
+
+    /// Events on kept pulses dropped for non-finite TOF.
+    #[getter]
+    fn dropped_non_finite(&self) -> usize {
+        self.dropped_non_finite
+    }
+
+    /// ISO-8601 epoch of the pulse clock, when recorded.  Compare with
+    /// `RunLog.offset_iso` to confirm both clocks share a zero point.
+    #[getter]
+    fn pulse_time_offset_iso(&self) -> Option<String> {
+        self.pulse_time_offset_iso.clone()
+    }
+
+    fn __repr__(&self, py: Python<'_>) -> String {
+        format!(
+            "BankSpectrum(n_bins={}, pulses={}/{}, events={}/{})",
+            self.counts.bind(py).len(),
+            self.pulses_kept,
+            self.pulses_total,
+            self.events_kept,
+            self.events_total,
+        )
+    }
+}
+
+/// Load one NXevent_data bank (e.g. a beam monitor) as a 1-D TOF spectrum,
+/// optionally keeping only pulses inside wall-clock intervals (issue #637).
+///
+/// Reads `/entry/<bank>/{event_time_offset, event_index, event_time_zero}`
+/// (the facility NeXus convention).  The `units` attributes on
+/// `event_time_offset` AND `event_time_zero` are required — NXevent_data
+/// specifies no defaults, and refusing to guess closes the #554
+/// silent-rescale class.
+/// A bank with zero events loads to an all-zero spectrum with correct
+/// pulse statistics — it never errors (on VENUS every imaging-detector
+/// bank is empty because tpx1 is frame-mode; only monitors carry events).
+///
+/// Args:
+///     path: Path to the NeXus/HDF5 file.
+///     bank: Bank group name under `/entry` (e.g. "monitor1",
+///         "bank100_events").
+///     n_bins: Number of TOF bins.
+///     tof_min_us: Minimum TOF in microseconds (inclusive).
+///     tof_max_us: Maximum TOF in microseconds (exclusive).
+///     keep_intervals: Optional list of (t_start, t_end) pairs in seconds
+///         on the pulse clock (at SNS: seconds since run start, the same
+///         clock as DASlogs times — pass the output of `intervals_where`
+///         / `intervals_intersect` directly).  A pulse is kept iff
+///         t_start <= event_time_zero < t_end for some interval.
+///
+/// Returns:
+///     BankSpectrum with tof_edges_us, counts, and pulse/event stats.
+#[pyfunction]
+#[pyo3(signature = (path, bank, n_bins, tof_min_us, tof_max_us, keep_intervals=None))]
+fn load_nexus_bank_spectrum(
+    py: Python<'_>,
+    path: &str,
+    bank: &str,
+    n_bins: usize,
+    tof_min_us: f64,
+    tof_max_us: f64,
+    keep_intervals: Option<Vec<(f64, f64)>>,
+) -> PyResult<PyBankSpectrum> {
+    let params = nereids_io::nexus::BankBinningParams {
+        n_bins,
+        tof_min_us,
+        tof_max_us,
+    };
+    let s = nereids_io::nexus::load_nexus_bank_spectrum(
+        std::path::Path::new(path),
+        bank,
+        &params,
+        keep_intervals.as_deref(),
+    )
+    .map_err(map_io_error)?;
+    Ok(PyBankSpectrum {
+        tof_edges_us: PyArray1::from_vec(py, s.tof_edges_us).unbind(),
+        counts: PyArray1::from_vec(py, s.counts).unbind(),
+        pulses_total: s.pulses_total,
+        pulses_kept: s.pulses_kept,
+        events_total: s.events_total,
+        events_kept: s.events_kept,
+        dropped_tof_range: s.dropped_tof_range,
+        dropped_non_finite: s.dropped_non_finite,
+        pulse_time_offset_iso: s.pulse_time_offset_iso,
+    })
+}
+
 /// Convert Rust NexusHistogramData to Python PyNexusData.
 fn nexus_data_to_py(py: Python<'_>, data: nereids_io::nexus::NexusHistogramData) -> PyNexusData {
     let (event_total, event_kept) = data
@@ -3447,6 +3743,12 @@ fn nereids(m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_function(wrap_pyfunction!(probe_nexus, m)?)?;
     m.add_function(wrap_pyfunction!(load_nexus_histogram, m)?)?;
     m.add_function(wrap_pyfunction!(load_nexus_events, m)?)?;
+    m.add_class::<PyRunLog>()?;
+    m.add_class::<PyBankSpectrum>()?;
+    m.add_function(wrap_pyfunction!(read_run_log, m)?)?;
+    m.add_function(wrap_pyfunction!(intervals_where, m)?)?;
+    m.add_function(wrap_pyfunction!(intervals_intersect, m)?)?;
+    m.add_function(wrap_pyfunction!(load_nexus_bank_spectrum, m)?)?;
     m.add_function(wrap_pyfunction!(normalize, m)?)?;
     m.add_function(wrap_pyfunction!(tof_to_energy_centers, m)?)?;
     m.add_function(wrap_pyfunction!(py_element_symbol, m)?)?;

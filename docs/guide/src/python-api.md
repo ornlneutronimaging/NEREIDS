@@ -354,6 +354,67 @@ energies = nereids.tof_to_energy_centers(
 
 See [Data I/O and NeXus/TOF](./data-io.md) for ordering and pairing rules.
 
+## Beam-State Filtering (DASlogs and Event Banks)
+
+Facility NeXus files record slow-control PVs under `/entry/DASlogs/<pv>` as
+**transition logs**: each value takes effect at its timestamp and persists
+until the next entry.  Averaging the value array directly is wrong whenever
+entries are unevenly spaced — on a real VENUS run the entry-mean of the
+`pause` log read 0.43 while the time-weighted pause fraction was 0.90.
+
+### `read_run_log(path, pv)`
+
+Returns a `RunLog` with `times` (seconds since run start), `values`,
+`duration_s`, `offset_iso` (ISO-8601 epoch of the clock), and
+`n_dropped_corrupt` — the number of corrupt device-reconnect records
+(backward time jumps or subnormal garbage payloads, both seen in real SNS
+files) dropped from the log.
+
+### `intervals_where(times, values, duration_s, min_value=None, max_value=None)`
+
+Derives `(t_start, t_end)` intervals where the PV satisfies the bounds,
+under correct step-function semantics: the last value persists to
+`duration_s` (padded one f32 ULP — SNS records duration in float32 while
+pulse times are float64, and the final pulse of about half of real runs is
+stamped just beyond it), time before the first entry never matches, `NaN`
+never matches, and adjacent segments merge.
+
+### `intervals_intersect(a, b)`
+
+Composes conditions across PVs (e.g. not-paused AND beam power above
+threshold).  Inputs are validated and normalised (sorted, merged).
+
+### `load_nexus_bank_spectrum(path, bank, n_bins, tof_min_us, tof_max_us, keep_intervals=None)`
+
+Loads one NXevent_data bank (e.g. `"monitor1"`) as a `BankSpectrum` — a 1-D
+TOF spectrum (`tof_edges_us`, `counts`) with retention statistics
+(`pulses_total`/`pulses_kept`, `events_total`/`events_kept`, drop counters,
+`pulse_time_offset_iso`).  With `keep_intervals`, only pulses whose
+`event_time_zero` falls inside the intervals (half-open, DASlogs clock)
+are histogrammed.  `units` attributes are required on both event datasets
+(never guess a scale); a bank with zero events loads gracefully to a zero
+spectrum — on VENUS every imaging-detector bank is empty because tpx1 is
+frame-mode, and only monitors carry events.
+
+```python
+pause = nereids.read_run_log("run.nxs.h5", "pause")
+live = nereids.intervals_where(
+    pause.times, pause.values, pause.duration_s, max_value=0.5
+)
+power = nereids.read_run_log("run.nxs.h5", "BL10:Det:rtdl:BeamPowerAvg")
+stable = nereids.intervals_where(
+    power.times, power.values, power.duration_s, min_value=1.5
+)
+keep = nereids.intervals_intersect(live, stable)
+
+mon = nereids.load_nexus_bank_spectrum(
+    "run.nxs.h5", "monitor1",
+    n_bins=500, tof_min_us=0.0, tof_max_us=16667.0,
+    keep_intervals=keep,
+)
+print(mon.pulses_kept, "/", mon.pulses_total, "pulses in stable beam")
+```
+
 ## Element and Utility APIs
 
 ```python
