@@ -26,6 +26,8 @@ pub mod normalization;
 #[cfg(feature = "hdf5")]
 pub mod project;
 pub mod rebin;
+#[cfg(feature = "hdf5")]
+pub mod runlog;
 pub mod spectrum;
 pub mod tiff_stack;
 pub mod tof;

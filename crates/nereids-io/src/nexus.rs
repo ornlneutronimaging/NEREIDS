@@ -123,7 +123,10 @@ fn tof_scale_to_us(units: Option<&str>) -> Result<f64, IoError> {
 /// becoming "attribute missing".  This was a latent bug:
 /// the previous implementation mapped *every* `attr()` failure to
 /// `Ok(None)`, including non-"not found" errors.
-fn read_string_attr(loc: &hdf5::Location, name: &str) -> Result<Option<String>, IoError> {
+pub(crate) fn read_string_attr(
+    loc: &hdf5::Location,
+    name: &str,
+) -> Result<Option<String>, IoError> {
     // Probe the attribute table first.  `attr_names()` is the only
     // discriminator the hdf5-metno 0.12 `Error` enum exposes for
     // "absent vs. other failure" — its `Error` is a flat
@@ -142,12 +145,60 @@ fn read_string_attr(loc: &hdf5::Location, name: &str) -> Result<Option<String>, 
             "Failed to open attribute {name:?} (listed but unreadable): {e}"
         ))
     })?;
-    let value: VarLenUnicode = attr.read_scalar().map_err(|e| {
-        IoError::InvalidParameter(format!(
-            "Failed to read string attribute {name:?}: {e} (expected a UTF-8 string)"
-        ))
+    // Producers disagree on string storage: rustpix writes variable-length
+    // UTF-8, while SNS/ADARA facility files write fixed-length ASCII
+    // (e.g. the 35-byte ISO timestamp on `event_time_zero@offset`).
+    // Dispatch on the stored type descriptor instead of assuming one
+    // (issue #637; previously only variable-length UTF-8 was readable).
+    use hdf5::types::{FixedAscii, FixedUnicode, TypeDescriptor, VarLenAscii};
+    let td = attr.dtype().and_then(|d| d.to_descriptor()).map_err(|e| {
+        IoError::InvalidParameter(format!("Failed to inspect type of attribute {name:?}: {e}"))
     })?;
-    Ok(Some(value.as_str().to_string()))
+    let read_err = |e: hdf5::Error| {
+        IoError::InvalidParameter(format!(
+            "Failed to read string attribute {name:?}: {e} (stored as {td:?})"
+        ))
+    };
+    let value = match td {
+        TypeDescriptor::VarLenUnicode => attr
+            .read_scalar::<VarLenUnicode>()
+            .map_err(read_err)?
+            .as_str()
+            .to_string(),
+        TypeDescriptor::VarLenAscii => attr
+            .read_scalar::<VarLenAscii>()
+            .map_err(read_err)?
+            .as_str()
+            .to_string(),
+        // Fixed-length strings: HDF5's string-to-string soft conversion
+        // repacks any length into this generous fixed buffer; trim the
+        // NUL/space padding it leaves behind.
+        TypeDescriptor::FixedAscii(n) | TypeDescriptor::FixedUnicode(n) if n <= 1024 => match td {
+            TypeDescriptor::FixedAscii(_) => attr
+                .read_scalar::<FixedAscii<1024>>()
+                .map_err(read_err)?
+                .as_str()
+                .to_string(),
+            _ => attr
+                .read_scalar::<FixedUnicode<1024>>()
+                .map_err(read_err)?
+                .as_str()
+                .to_string(),
+        },
+        TypeDescriptor::FixedAscii(n) | TypeDescriptor::FixedUnicode(n) => {
+            return Err(IoError::InvalidParameter(format!(
+                "String attribute {name:?} is {n} bytes, exceeding the supported \
+                 fixed-string read buffer (1024)"
+            )));
+        }
+        other => {
+            return Err(IoError::InvalidParameter(format!(
+                "Attribute {name:?} is not a string (stored as {other:?})"
+            )));
+        }
+    };
+    let value = value.trim_end_matches(['\0', ' ']).to_string();
+    Ok(Some(value))
 }
 
 /// Metadata probed from a NeXus/HDF5 file without loading full data.
@@ -2008,5 +2059,521 @@ mod tests {
             msg.contains("Unsupported NeXus TOF units") && msg.contains("clock-ticks"),
             "error should name the offending value, got: {msg}"
         );
+    }
+}
+
+// ---------------------------------------------------------------------------
+// NXevent_data bank spectra with wall-clock interval filtering (issue #637)
+// ---------------------------------------------------------------------------
+
+/// TOF binning parameters for a 1-D NXevent_data bank spectrum (issue #637).
+///
+/// NXevent_data banks (facility NeXus convention: `/entry/<bank>/` with
+/// `event_time_offset`, `event_index`, `event_time_zero`) have no per-event
+/// pixel coordinates in the general case (monitors never do), so the result
+/// is a 1-D TOF spectrum rather than a `(tof, y, x)` cube.
+#[derive(Debug, Clone, Copy)]
+pub struct BankBinningParams {
+    /// Number of TOF bins.
+    pub n_bins: usize,
+    /// Minimum TOF in microseconds (inclusive).
+    pub tof_min_us: f64,
+    /// Maximum TOF in microseconds (exclusive).
+    pub tof_max_us: f64,
+}
+
+/// Result of [`load_nexus_bank_spectrum`]: a 1-D TOF spectrum plus pulse and
+/// event retention statistics.
+///
+/// The drop counters (`dropped_tof_range`, `dropped_non_finite`) cover only
+/// events belonging to **kept** pulses; events on pulses excluded by
+/// `keep_intervals` are accounted for as `events_total - events_kept -
+/// dropped_tof_range - dropped_non_finite` and are not itemised.
+#[derive(Debug, Clone)]
+pub struct BankSpectrum {
+    /// TOF bin edges in microseconds (`n_bins + 1` values, linear grid).
+    pub tof_edges_us: Vec<f64>,
+    /// Histogrammed event counts per TOF bin (`n_bins` values).
+    pub counts: Vec<u64>,
+    /// Total number of pulses recorded in the bank.
+    pub pulses_total: usize,
+    /// Pulses whose `event_time_zero` fell inside `keep_intervals`
+    /// (equals `pulses_total` when no filter was given).
+    pub pulses_kept: usize,
+    /// Total number of events recorded in the bank.
+    pub events_total: usize,
+    /// Events on kept pulses that landed inside the TOF window.
+    pub events_kept: usize,
+    /// Events on kept pulses dropped for TOF outside `[tof_min_us, tof_max_us)`.
+    pub dropped_tof_range: usize,
+    /// Events on kept pulses dropped for non-finite TOF.
+    pub dropped_non_finite: usize,
+    /// ISO-8601 `offset` attribute of `event_time_zero`, when recorded —
+    /// the absolute wall-clock epoch that pulse times are relative to.
+    /// Compare with [`crate::runlog::RunLog::offset_iso`] to confirm that
+    /// interval and pulse clocks share a zero point (at SNS both are
+    /// seconds since run start and the attributes match exactly).
+    pub pulse_time_offset_iso: Option<String>,
+}
+
+/// Load one NXevent_data bank (e.g. a beam monitor) as a 1-D TOF spectrum,
+/// optionally keeping only pulses inside wall-clock `keep_intervals`
+/// (issue #637).
+///
+/// Reads `/entry/<bank>/{event_time_offset, event_index, event_time_zero}`:
+///
+/// - `event_time_offset` — TOF per event; its `units` attribute is
+///   **required** on this path (facility files always write it; refusing to
+///   guess closes the #554 silent-rescale class).  Recognised values are
+///   the module-level table (ns/us/ms/s), scaled to canonical µs.
+/// - `event_index` — cumulative first-event index per pulse (validated
+///   non-decreasing, last entry ≤ total events).  Events of pulse `p` are
+///   `event_index[p] .. event_index[p+1]` (last pulse runs to the end).
+/// - `event_time_zero` — pulse wall-clock times; its `units` attribute is
+///   also required (NXevent_data specifies no default; SNS writes
+///   `"second"`), accepted via the same table and rescaled to seconds.
+///
+/// `keep_intervals` are `(t_start, t_end)` pairs in seconds on the same
+/// clock as `event_time_zero` (at SNS: seconds since run start — the same
+/// clock as `/entry/DASlogs/<pv>/time`, so lists from
+/// [`crate::runlog::intervals_where`] /
+/// [`crate::runlog::intervals_intersect`] apply directly).  Pulse `p` is
+/// kept iff `t_start <= event_time_zero[p] < t_end` for some interval;
+/// the list may be unsorted/overlapping (it is normalised internally), but
+/// every pair must be finite with `t_end > t_start`.
+///
+/// **Empty-bank grace (issue #637)**: a bank with zero events (the normal
+/// state of every imaging-detector bank on VENUS, where tpx1 is frame-mode)
+/// loads to an all-zero spectrum with correct pulse statistics — it never
+/// errors.
+pub fn load_nexus_bank_spectrum(
+    path: &Path,
+    bank: &str,
+    params: &BankBinningParams,
+    keep_intervals: Option<&[(f64, f64)]>,
+) -> Result<BankSpectrum, IoError> {
+    if params.n_bins == 0 {
+        return Err(IoError::InvalidParameter("n_bins must be positive".into()));
+    }
+    if !params.tof_min_us.is_finite() || !params.tof_max_us.is_finite() {
+        return Err(IoError::InvalidParameter(
+            "TOF bounds must be finite".into(),
+        ));
+    }
+    if params.tof_max_us <= params.tof_min_us {
+        return Err(IoError::InvalidParameter(format!(
+            "tof_max_us ({}) must be greater than tof_min_us ({})",
+            params.tof_max_us, params.tof_min_us
+        )));
+    }
+    // Normalise the keep-list once: validate pairs, sort, merge overlaps.
+    let intervals: Option<Vec<(f64, f64)>> = match keep_intervals {
+        None => None,
+        Some(raw) => Some(crate::runlog::normalize_intervals(raw)?),
+    };
+
+    let file = hdf5::File::open(path).map_err(|e| {
+        IoError::FileNotFound(
+            path.display().to_string(),
+            std::io::Error::other(e.to_string()),
+        )
+    })?;
+    let group = file
+        .group(&format!("entry/{bank}"))
+        .map_err(|e| IoError::InvalidParameter(format!("Missing /entry/{bank} group: {e}")))?;
+
+    let etz_ds = group.dataset("event_time_zero").map_err(|e| {
+        IoError::InvalidParameter(format!("Missing /entry/{bank}/event_time_zero: {e}"))
+    })?;
+    // NXevent_data specifies only the unit CATEGORY (NX_TIME) with no
+    // default, so a missing attribute is an error, not a guess — the same
+    // policy #554 established for event_time_offset.  Every surveyed SNS
+    // file writes units="second" here.
+    let etz_to_s = match read_string_attr(&etz_ds, "units")? {
+        None => {
+            return Err(IoError::InvalidParameter(format!(
+                "/entry/{bank}/event_time_zero has no units attribute; refusing to \
+                 guess a time scale (issues #554/#637)"
+            )));
+        }
+        Some(u) => tof_scale_to_us(Some(&u))? * 1e-6,
+    };
+    let event_time_zero: Vec<f64> = etz_ds
+        .read_1d::<f64>()
+        .map_err(|e| IoError::Hdf5Error(format!("Failed to read {bank}/event_time_zero: {e}")))?
+        .to_vec()
+        .into_iter()
+        .map(|t| t * etz_to_s)
+        .collect();
+    let pulse_time_offset_iso = read_string_attr(&etz_ds, "offset")?;
+
+    let event_index: Vec<u64> = group
+        .dataset("event_index")
+        .map_err(|e| IoError::InvalidParameter(format!("Missing /entry/{bank}/event_index: {e}")))?
+        .read_1d::<u64>()
+        .map_err(|e| IoError::Hdf5Error(format!("Failed to read {bank}/event_index: {e}")))?
+        .to_vec();
+    if event_index.len() != event_time_zero.len() {
+        return Err(IoError::ShapeMismatch(format!(
+            "{bank}: event_index has {} entries but event_time_zero has {}",
+            event_index.len(),
+            event_time_zero.len()
+        )));
+    }
+    if event_index.windows(2).any(|w| w[1] < w[0]) {
+        return Err(IoError::InvalidParameter(format!(
+            "{bank}/event_index must be non-decreasing (cumulative first-event index per pulse)"
+        )));
+    }
+
+    let eto_ds = group.dataset("event_time_offset").map_err(|e| {
+        IoError::InvalidParameter(format!("Missing /entry/{bank}/event_time_offset: {e}"))
+    })?;
+    let tof_scale = match read_string_attr(&eto_ds, "units")? {
+        Some(u) => tof_scale_to_us(Some(&u))?,
+        None => {
+            return Err(IoError::InvalidParameter(format!(
+                "/entry/{bank}/event_time_offset has no units attribute; NXevent_data \
+                 producers declare TOF units explicitly and this loader refuses to \
+                 guess a scale factor (issues #554/#637)"
+            )));
+        }
+    };
+    let tof_raw: Vec<f64> = eto_ds
+        .read_1d::<f64>()
+        .map_err(|e| IoError::Hdf5Error(format!("Failed to read {bank}/event_time_offset: {e}")))?
+        .to_vec();
+    let events_total = tof_raw.len();
+    if let Some(&last) = event_index.last()
+        && last as usize > events_total
+    {
+        return Err(IoError::InvalidParameter(format!(
+            "{bank}/event_index last entry ({last}) exceeds total event count ({events_total})"
+        )));
+    }
+    // Retention accounting must be exact: every event belongs to a pulse
+    // slice or a drop counter.  A first index > 0 (events preceding the
+    // first pulse) or events without any pulse record would vanish
+    // silently — fail loud instead (issue #637).
+    match event_index.first() {
+        Some(&first) if first != 0 => {
+            return Err(IoError::InvalidParameter(format!(
+                "{bank}/event_index first entry ({first}) must be 0: {first} event(s) \
+                 precede the first pulse and would be silently dropped"
+            )));
+        }
+        None if events_total > 0 => {
+            return Err(IoError::InvalidParameter(format!(
+                "{bank} has {events_total} events but no pulses (empty event_index)"
+            )));
+        }
+        _ => {}
+    }
+
+    let pulses_total = event_time_zero.len();
+    let bin_w = (params.tof_max_us - params.tof_min_us) / params.n_bins as f64;
+    let keep_pulse = |t: f64| -> bool {
+        // Normalise -0.0 to +0.0: membership is defined numerically, but
+        // total_cmp (needed for NaN robustness) orders -0.0 below +0.0.
+        let t = if t == 0.0 { 0.0 } else { t };
+        match &intervals {
+            None => true,
+            Some(iv) => match iv.binary_search_by(|&(a, _)| a.total_cmp(&t)) {
+                Ok(i) => t < iv[i].1,
+                Err(0) => false,
+                Err(i) => t < iv[i - 1].1,
+            },
+        }
+    };
+
+    let mut counts = vec![0u64; params.n_bins];
+    let mut pulses_kept = 0usize;
+    let mut events_kept = 0usize;
+    let mut dropped_tof_range = 0usize;
+    let mut dropped_non_finite = 0usize;
+    for p in 0..pulses_total {
+        if !keep_pulse(event_time_zero[p]) {
+            continue;
+        }
+        pulses_kept += 1;
+        let e0 = event_index[p] as usize;
+        let e1 = if p + 1 < pulses_total {
+            event_index[p + 1] as usize
+        } else {
+            events_total
+        };
+        for &raw in &tof_raw[e0..e1] {
+            let tof = raw * tof_scale;
+            if !tof.is_finite() {
+                dropped_non_finite += 1;
+                continue;
+            }
+            if tof < params.tof_min_us || tof >= params.tof_max_us {
+                dropped_tof_range += 1;
+                continue;
+            }
+            // Guard the floating-point upper edge: tof < max is checked, but
+            // (tof - min) / bin_w can still round up to n_bins.
+            let bin = (((tof - params.tof_min_us) / bin_w) as usize).min(params.n_bins - 1);
+            counts[bin] += 1;
+            events_kept += 1;
+        }
+    }
+    let tof_edges_us = (0..=params.n_bins)
+        .map(|i| params.tof_min_us + i as f64 * bin_w)
+        .collect();
+    Ok(BankSpectrum {
+        tof_edges_us,
+        counts,
+        pulses_total,
+        pulses_kept,
+        events_total,
+        events_kept,
+        dropped_tof_range,
+        dropped_non_finite,
+        pulse_time_offset_iso,
+    })
+}
+
+#[cfg(test)]
+mod bank_tests {
+    use super::*;
+
+    /// Write a synthetic NXevent_data bank: per-pulse wall times (s) and
+    /// per-pulse event TOF lists (µs, stored in the given units).
+    fn create_test_bank(
+        path: &Path,
+        bank: &str,
+        pulse_times_s: &[f64],
+        events_per_pulse: &[Vec<f64>],
+        tof_units: Option<&str>,
+        tof_store_scale: f64,
+    ) {
+        assert_eq!(pulse_times_s.len(), events_per_pulse.len());
+        let file = hdf5::File::create(path).expect("create test file");
+        let entry = if let Ok(g) = file.group("entry") {
+            g
+        } else {
+            file.create_group("entry").expect("create entry")
+        };
+        let g = entry.create_group(bank).expect("create bank");
+        let mut index: Vec<u64> = Vec::new();
+        let mut tofs: Vec<f64> = Vec::new();
+        for evs in events_per_pulse {
+            index.push(tofs.len() as u64);
+            tofs.extend(evs.iter().map(|t| t * tof_store_scale));
+        }
+        let etz = g
+            .new_dataset_builder()
+            .with_data(pulse_times_s)
+            .create("event_time_zero")
+            .expect("etz");
+        etz.new_attr::<hdf5::types::VarLenUnicode>()
+            .create("units")
+            .expect("attr")
+            .write_scalar(&"second".parse::<hdf5::types::VarLenUnicode>().unwrap())
+            .expect("write");
+        etz.new_attr::<hdf5::types::VarLenUnicode>()
+            .create("offset")
+            .expect("attr")
+            .write_scalar(
+                &"2026-06-22T19:01:07.183368667-04:00"
+                    .parse::<hdf5::types::VarLenUnicode>()
+                    .unwrap(),
+            )
+            .expect("write");
+        g.new_dataset_builder()
+            .with_data(&index)
+            .create("event_index")
+            .expect("ei");
+        let eto = g
+            .new_dataset_builder()
+            .with_data(&tofs)
+            .create("event_time_offset")
+            .expect("eto");
+        if let Some(u) = tof_units {
+            eto.new_attr::<hdf5::types::VarLenUnicode>()
+                .create("units")
+                .expect("attr")
+                .write_scalar(&u.parse::<hdf5::types::VarLenUnicode>().unwrap())
+                .expect("write");
+        }
+    }
+
+    fn params(n_bins: usize, lo: f64, hi: f64) -> BankBinningParams {
+        BankBinningParams {
+            n_bins,
+            tof_min_us: lo,
+            tof_max_us: hi,
+        }
+    }
+
+    #[test]
+    fn unfiltered_spectrum_counts_all_events() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("bank.h5");
+        create_test_bank(
+            &path,
+            "monitor1",
+            &[0.0, 1.0, 2.0],
+            &[vec![100.0, 900.0], vec![500.0], vec![100.0, 500.0, 900.0]],
+            Some("microsecond"),
+            1.0,
+        );
+        let s = load_nexus_bank_spectrum(&path, "monitor1", &params(2, 0.0, 1000.0), None)
+            .expect("load");
+        assert_eq!(s.pulses_total, 3);
+        assert_eq!(s.pulses_kept, 3);
+        assert_eq!(s.events_total, 6);
+        assert_eq!(s.events_kept, 6);
+        assert_eq!(s.counts, vec![2, 4]); // [0,500): the two 100s; [500,1000): 500,500,900,900
+        assert_eq!(s.tof_edges_us, vec![0.0, 500.0, 1000.0]);
+        assert!(s.pulse_time_offset_iso.unwrap().starts_with("2026-06-22"));
+    }
+
+    #[test]
+    fn interval_filter_keeps_only_matching_pulses_with_boundary_semantics() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("bank.h5");
+        // Pulses at t = 0, 10, 20, 30 s with 1, 2, 4, 8 events.
+        create_test_bank(
+            &path,
+            "monitor1",
+            &[0.0, 10.0, 20.0, 30.0],
+            &[vec![50.0], vec![50.0; 2], vec![50.0; 4], vec![50.0; 8]],
+            Some("microsecond"),
+            1.0,
+        );
+        // Half-open [10, 30): keeps pulses at 10 and 20, not 0 and not 30.
+        let s = load_nexus_bank_spectrum(
+            &path,
+            "monitor1",
+            &params(1, 0.0, 100.0),
+            Some(&[(10.0, 30.0)]),
+        )
+        .expect("load");
+        assert_eq!(s.pulses_kept, 2);
+        assert_eq!(s.events_kept, 6);
+        assert_eq!(s.counts, vec![6]);
+        // Unsorted, overlapping intervals normalise to the same union.
+        let s2 = load_nexus_bank_spectrum(
+            &path,
+            "monitor1",
+            &params(1, 0.0, 100.0),
+            Some(&[(15.0, 30.0), (10.0, 20.0)]),
+        )
+        .expect("load");
+        assert_eq!(s2.events_kept, 6);
+        // Empty keep-list keeps nothing.
+        let s3 = load_nexus_bank_spectrum(&path, "monitor1", &params(1, 0.0, 100.0), Some(&[]))
+            .expect("load");
+        assert_eq!((s3.pulses_kept, s3.events_kept), (0, 0));
+        assert_eq!(s3.counts, vec![0]);
+    }
+
+    #[test]
+    fn empty_bank_loads_gracefully() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("bank.h5");
+        // The VENUS reality: pulses recorded, zero events (frame-mode tpx1).
+        create_test_bank(
+            &path,
+            "bank100_events",
+            &[0.0, 1.0, 2.0],
+            &[vec![], vec![], vec![]],
+            Some("microsecond"),
+            1.0,
+        );
+        let s = load_nexus_bank_spectrum(
+            &path,
+            "bank100_events",
+            &params(4, 0.0, 1000.0),
+            Some(&[(0.5, 2.5)]),
+        )
+        .expect("empty bank must load");
+        assert_eq!(s.pulses_total, 3);
+        assert_eq!(s.pulses_kept, 2);
+        assert_eq!(s.events_total, 0);
+        assert_eq!(s.counts, vec![0, 0, 0, 0]);
+    }
+
+    #[test]
+    fn tof_units_are_scaled_and_required() {
+        let dir = tempfile::tempdir().unwrap();
+        // Nanosecond storage scales to the same µs spectrum.
+        let p_ns = dir.path().join("ns.h5");
+        create_test_bank(&p_ns, "m", &[0.0], &[vec![250.0, 750.0]], Some("ns"), 1e3);
+        let s = load_nexus_bank_spectrum(&p_ns, "m", &params(2, 0.0, 1000.0), None).unwrap();
+        assert_eq!(s.counts, vec![1, 1]);
+        // Missing units attribute on this path is an error, not a guess.
+        let p_none = dir.path().join("none.h5");
+        create_test_bank(&p_none, "m", &[0.0], &[vec![250.0]], None, 1.0);
+        let err = load_nexus_bank_spectrum(&p_none, "m", &params(2, 0.0, 1000.0), None)
+            .expect_err("must refuse to guess units");
+        assert!(err.to_string().contains("units"), "{err}");
+    }
+
+    #[test]
+    fn fixed_length_ascii_attributes_read_correctly() {
+        // SNS/ADARA facility files store attributes as FIXED-length ASCII
+        // (rustpix uses variable-length UTF-8) — both must read (issue #637).
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("fixed.h5");
+        create_test_bank(&path, "m", &[0.0], &[vec![250.0, 750.0]], None, 1.0);
+        {
+            let file = hdf5::File::open_rw(&path).expect("reopen");
+            let eto = file.dataset("entry/m/event_time_offset").expect("eto");
+            let units = hdf5::types::FixedAscii::<16>::from_ascii(b"microsecond").unwrap();
+            eto.new_attr::<hdf5::types::FixedAscii<16>>()
+                .create("units")
+                .expect("attr")
+                .write_scalar(&units)
+                .expect("write");
+        }
+        let s = load_nexus_bank_spectrum(&path, "m", &params(2, 0.0, 1000.0), None)
+            .expect("fixed-ascii units must parse");
+        assert_eq!(s.counts, vec![1, 1]);
+    }
+
+    #[test]
+    fn orphan_head_events_fail_loud() {
+        // event_index[0] != 0 means events precede the first pulse; they
+        // belong to no pulse slice and would vanish from the accounting.
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("orphan.h5");
+        create_test_bank(&path, "m", &[0.0], &[vec![100.0, 200.0]], Some("us"), 1.0);
+        {
+            let file = hdf5::File::open_rw(&path).expect("reopen");
+            let ei = file.dataset("entry/m/event_index").expect("ei");
+            ei.write(&ndarray::arr1(&[1u64])).expect("overwrite");
+        }
+        let err = load_nexus_bank_spectrum(&path, "m", &params(1, 0.0, 1000.0), None)
+            .expect_err("orphan head events must error");
+        assert!(err.to_string().contains("precede the first pulse"), "{err}");
+    }
+
+    #[test]
+    fn malformed_inputs_error() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("bank.h5");
+        create_test_bank(
+            &path,
+            "m",
+            &[0.0, 1.0],
+            &[vec![1.0], vec![2.0]],
+            Some("us"),
+            1.0,
+        );
+        // Bad interval pairs.
+        for bad in [(5.0, 5.0), (5.0, 1.0), (f64::NAN, 1.0)] {
+            assert!(
+                load_nexus_bank_spectrum(&path, "m", &params(1, 0.0, 10.0), Some(&[bad])).is_err()
+            );
+        }
+        // Bad binning params.
+        assert!(load_nexus_bank_spectrum(&path, "m", &params(0, 0.0, 10.0), None).is_err());
+        assert!(load_nexus_bank_spectrum(&path, "m", &params(1, 10.0, 10.0), None).is_err());
+        // Missing bank.
+        assert!(load_nexus_bank_spectrum(&path, "nope", &params(1, 0.0, 10.0), None).is_err());
     }
 }

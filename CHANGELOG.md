@@ -9,6 +9,30 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
 
 ### Added
 
+- **Beam-state event filtering for NXevent_data banks** (#637):
+  `read_run_log(path, pv)` reads `/entry/DASlogs/<pv>` as a transition
+  log (SNS logs record transitions, not uniform samples — the entry-mean
+  of a real VENUS `pause` log read 0.43 while the time-weighted truth
+  was 0.90); `intervals_where` derives `(t_start, t_end)` intervals with
+  correct step-function semantics (last value persists to
+  `/entry/duration`, pre-log time and NaN never match);
+  `intervals_intersect` composes conditions across PVs.
+  `load_nexus_bank_spectrum(path, bank, ..., keep_intervals=None)` loads
+  one facility NXevent_data bank (e.g. `monitor1`) as a 1-D TOF spectrum
+  keeping only pulses whose `event_time_zero` falls in the intervals
+  (half-open, same run-start clock as DASlogs at SNS), with pulse/event
+  retention statistics and clock-epoch attributes for cross-checking.
+  `units` attributes are required on both `event_time_offset` and
+  `event_time_zero` (#554: NXevent_data declares no defaults — never
+  guess a scale); corrupt device-reconnect records in DASlogs (backward
+  time jumps and subnormal uninitialized-memory payloads, both seen on
+  real VENUS furnace channels) are dropped and counted in
+  `RunLog.n_dropped_corrupt`; empty banks — the normal state of every VENUS
+  imaging-detector bank, since tpx1 is frame-mode — load gracefully to a
+  zero spectrum.  The rustpix `/entry/neutrons` event path is NOT
+  filtered: that schema carries no per-event wall-clock time; filtering
+  there stays out of scope until a producer demonstrably writes one.
+
 - **Bounded multiplicative baseline `B(E)` in every fitter** (#635): a
   smooth, box-bounded normalization
   `B(E) = b0 + b1·ln(E/E_ref) + b2·ln²(E/E_ref)` (E_ref = geometric
