@@ -1,0 +1,15 @@
+# cargo-audit configuration — the reviewable record of accepted Rust advisories.
+# Every ignore needs a reason and a revisit condition. Vulnerabilities that are
+# fixable in our tree are bumped (see Dependabot / cargo update), not ignored.
+[advisories]
+ignore = [
+  # quick-xml 0.38 is a *build-time, deep-transitive* dependency of the Linux
+  # GUI stack: wayland-scanner (proc-macro) -> winit -> eframe -> nereids-gui.
+  # wayland-scanner uses quick-xml only to parse the *bundled, trusted* Wayland
+  # protocol XML at build time — it never parses untrusted input at runtime, so
+  # these XML-parsing DoS advisories are not reachable in NEREIDS. The fix
+  # (quick-xml >= 0.41) is not installable until the winit/wayland stack bumps
+  # its requirement; Dependabot will pull it once that lands. Revisit then.
+  "RUSTSEC-2026-0195", # quick-xml: unbounded namespace-declaration allocation (DoS)
+  "RUSTSEC-2026-0194", # quick-xml: quadratic run time on duplicate attribute names (DoS)
+]

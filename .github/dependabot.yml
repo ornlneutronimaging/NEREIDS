@@ -1,0 +1,27 @@
+# Dependabot version updates. (Vulnerability *alerts* are a separate repo
+# setting and are already enabled.) Grouped minor/patch bumps keep PR volume
+# manageable across the multi-crate Cargo workspace.
+# https://docs.github.com/code-security/dependabot/dependabot-version-updates
+version: 2
+updates:
+  # Rust crates — the cargo workspace (crates/*, bindings/python, apps/gui)
+  - package-ecosystem: "cargo"
+    directory: "/"
+    schedule:
+      interval: "weekly"
+    open-pull-requests-limit: 10
+    groups:
+      cargo-minor-patch:
+        update-types: ["minor", "patch"]
+
+  # Python bindings — PEP 621 dependencies in pyproject.toml
+  - package-ecosystem: "pip"
+    directory: "/"
+    schedule:
+      interval: "weekly"
+
+  # GitHub Actions referenced by the workflows
+  - package-ecosystem: "github-actions"
+    directory: "/"
+    schedule:
+      interval: "weekly"
