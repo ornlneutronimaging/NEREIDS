@@ -92,6 +92,6 @@ tracing-subscriber = { version = "0.3", default-features = false, features = ["f
 # NOTE: opener's default dbus-vendored feature statically links libdbus.
 # Never set default-features = false here — dynamic libdbus would break
 # the manylinux_2_28 container build and trigger wheel vendoring.
-opener = { version = "0.7", features = ["reveal"] }
+opener = { version = "0.8", features = ["reveal"] }
 time = { version = "0.3", default-features = false, features = ["formatting", "macros"] }
 tempfile = "3"
