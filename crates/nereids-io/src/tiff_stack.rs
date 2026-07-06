@@ -34,6 +34,17 @@
 //! lexicographic stacking — summing across different prefixes would merge
 //! different runs.  Use the `pattern` argument to select one run.
 //!
+//! *Mixed* folders — where at least one stem parses as
+//! `<prefix>_<chunk>_<frame>` but others do not (a stray overview TIFF, a
+//! misnamed frame) — also fall back to legacy lexicographic stacking, but
+//! the fallback is counted: [`TiffLoadInfo::n_unrecognized_files`] reports
+//! how many files disabled chunk detection and
+//! [`TiffLoadInfo::unrecognized_examples`] names up to
+//! [`MAX_UNRECOGNIZED_EXAMPLES`] of them, so consumers (the GUI provenance
+//! log, the Python `UserWarning`) can surface that a chunked-looking run
+//! folder was *not* chunk-loaded.  Remove the stray files or use `pattern`
+//! to exclude them.
+//!
 //! ### One acquisition per folder
 //!
 //! The chunk heuristic assumes the folder holds **one acquisition** — the
@@ -135,7 +146,26 @@ pub struct TiffLoadInfo {
     /// Number of negative pixels clamped to zero.  Only ever nonzero under
     /// [`PixelValuePolicy::ClipToZero`].
     pub n_clipped_pixels: usize,
+    /// Number of files that did **not** parse as `<prefix>_<chunk>_<frame>`
+    /// while at least one other file in the same folder did — a *mixed*
+    /// folder, where the non-conforming files disabled chunk detection and
+    /// forced the legacy lexicographic load.  `0` in every other path:
+    /// single-file loads, fully chunk-patterned folders, folders where no
+    /// file matches the convention (the normal `frame_0000.tif` world), and
+    /// multi-prefix folders (every stem parses; a different, documented
+    /// fallback).
+    pub n_unrecognized_files: usize,
+    /// Lexicographically-first filenames of the non-conforming files, capped
+    /// at [`MAX_UNRECOGNIZED_EXAMPLES`] entries so the provenance stays
+    /// message-sized.  Empty iff `n_unrecognized_files == 0`.
+    pub unrecognized_examples: Vec<String>,
 }
+
+/// Maximum number of offending filenames retained in
+/// [`TiffLoadInfo::unrecognized_examples`] when a mixed folder disables
+/// chunk detection (the count in [`TiffLoadInfo::n_unrecognized_files`] is
+/// never capped).
+pub const MAX_UNRECOGNIZED_EXAMPLES: usize = 3;
 
 /// Apply the pixel-value policy to one decoded frame, in place.
 ///
@@ -283,6 +313,8 @@ pub fn load_tiff_stack_with_options(
             chunk_ids: Vec::new(),
             chunks_summed: false,
             n_clipped_pixels,
+            n_unrecognized_files: 0,
+            unrecognized_examples: Vec::new(),
         },
     ))
 }
@@ -422,6 +454,8 @@ pub fn load_tiff_directory(dir: &Path) -> Result<Array3<f64>, IoError> {
 /// 3D array with shape (n_files, height, width) and f64 values.
 ///
 /// # Errors
+/// * [`IoError::FileNotFound`] if `dir` does not exist.
+/// * [`IoError::NotADirectory`] if `dir` exists but is not a directory.
 /// * [`IoError::NoMatchingFiles`] if no files match the pattern.
 /// * [`IoError::DimensionMismatch`] if frames have inconsistent dimensions.
 /// * [`IoError::ChunkMismatch`] if a chunked folder is internally inconsistent.
@@ -447,6 +481,8 @@ pub fn load_tiff_folder(dir: &Path, pattern: Option<&str>) -> Result<Array3<f64>
 /// `(stack, info)` where `stack` has shape (n_frames, height, width).
 ///
 /// # Errors
+/// * [`IoError::FileNotFound`] if `dir` does not exist.
+/// * [`IoError::NotADirectory`] if `dir` exists but is not a directory.
 /// * [`IoError::NoMatchingFiles`] if no files match the pattern.
 /// * [`IoError::DimensionMismatch`] if frames have inconsistent dimensions.
 /// * [`IoError::ChunkMismatch`] if a chunked folder is internally
@@ -456,6 +492,18 @@ pub fn load_tiff_folder_with_options(
     pattern: Option<&str>,
     options: &TiffFolderOptions,
 ) -> Result<(Array3<f64>, TiffLoadInfo), IoError> {
+    // Distinguish "does not exist" from "exists but is not a directory":
+    // the Python binding maps `FileNotFound` (with kind `NotFound`) to
+    // `FileNotFoundError` and `NotADirectory` to `NotADirectoryError`, and
+    // its docstring promises exactly that split.  Without this guard a
+    // nonexistent path fell through `!is_dir()` and mislabeled as
+    // NotADirectory.
+    if !dir.exists() {
+        return Err(IoError::FileNotFound(
+            dir.to_string_lossy().into_owned(),
+            std::io::Error::new(std::io::ErrorKind::NotFound, "no such directory"),
+        ));
+    }
     if !dir.is_dir() {
         return Err(IoError::NotADirectory(dir.to_string_lossy().into_owned()));
     }
@@ -509,7 +557,10 @@ pub fn load_tiff_folder_with_options(
     let mut n_clipped_pixels = 0usize;
 
     match detect_chunk_layout(dir, &paths)? {
-        ChunkLayout::Legacy => {
+        ChunkLayout::Legacy {
+            n_unrecognized_files,
+            unrecognized_examples,
+        } => {
             paths.sort();
             let arr = load_frames_from_paths(&paths, options.pixel_policy, &mut n_clipped_pixels)?;
             Ok((
@@ -520,6 +571,8 @@ pub fn load_tiff_folder_with_options(
                     chunk_ids: Vec::new(),
                     chunks_summed: false,
                     n_clipped_pixels,
+                    n_unrecognized_files,
+                    unrecognized_examples,
                 },
             ))
         }
@@ -540,6 +593,8 @@ pub fn load_tiff_folder_with_options(
                         chunk_ids,
                         chunks_summed: n_chunks > 1,
                         n_clipped_pixels,
+                        n_unrecognized_files: 0,
+                        unrecognized_examples: Vec::new(),
                     },
                 ))
             } else {
@@ -557,6 +612,8 @@ pub fn load_tiff_folder_with_options(
                         chunk_ids,
                         chunks_summed: false,
                         n_clipped_pixels,
+                        n_unrecognized_files: 0,
+                        unrecognized_examples: Vec::new(),
                     },
                 ))
             }
@@ -567,7 +624,14 @@ pub fn load_tiff_folder_with_options(
 /// Detected layout of a TIFF folder's (filtered) file list.
 enum ChunkLayout {
     /// Not a chunked folder — load in lexicographic filename order.
-    Legacy,
+    /// The fields are nonzero/non-empty only for *mixed* folders (some
+    /// stems parsed as `<prefix>_<chunk>_<frame>` but others did not),
+    /// where the non-conforming files disabled chunk detection; see
+    /// [`TiffLoadInfo::n_unrecognized_files`].
+    Legacy {
+        n_unrecognized_files: usize,
+        unrecognized_examples: Vec<String>,
+    },
     /// Chunked folder: chunk id → frames as `(frame index, path)`, with
     /// chunk ids ascending (BTreeMap) and frames sorted ascending by index.
     /// Every chunk is validated to cover the identical frame-index sequence.
@@ -600,8 +664,14 @@ fn parse_chunked_stem(stem: &str) -> Option<(&str, u64, u64)> {
 /// Classify a filtered file list as legacy or chunked.
 ///
 /// Legacy fallbacks (no error): any stem that does not parse as
-/// `<prefix>_<chunk>_<frame>`, or two or more distinct prefixes (summing
-/// across prefixes would merge different runs; use `pattern` to select one).
+/// `<prefix>_<chunk>_<frame>` (including non-UTF-8 stems), or two or more
+/// distinct prefixes (summing across prefixes would merge different runs;
+/// use `pattern` to select one).  *Mixed* folders — at least one stem
+/// parsed but others did not — still fall back (a hand-assembled folder is
+/// legitimate) but are counted in the returned
+/// [`ChunkLayout::Legacy`] fields so every consumer can surface that a
+/// stray file disabled chunk detection; all-non-conforming folders (the
+/// normal `frame_0000.tif` world) report a count of 0.
 ///
 /// Hard errors ([`IoError::ChunkMismatch`]): duplicate (chunk, frame) pairs
 /// (e.g. the same stem with both `.tif` and `.tiff` extensions, or `_764_`
@@ -610,19 +680,53 @@ fn parse_chunked_stem(stem: &str) -> Option<(&str, u64, u64)> {
 /// still the same run.
 fn detect_chunk_layout(dir: &Path, paths: &[PathBuf]) -> Result<ChunkLayout, IoError> {
     let mut parsed: Vec<(&str, u64, u64, &PathBuf)> = Vec::with_capacity(paths.len());
+    let mut unrecognized: Vec<String> = Vec::new();
     for path in paths {
-        let Some(stem) = path.file_stem().and_then(|s| s.to_str()) else {
-            return Ok(ChunkLayout::Legacy);
+        // Non-UTF-8 stems cannot follow the ASCII naming convention, so
+        // they count as non-conforming like any other unparseable stem
+        // (displayed lossily in the examples).
+        match path
+            .file_stem()
+            .and_then(|s| s.to_str())
+            .and_then(parse_chunked_stem)
+        {
+            Some((prefix, chunk, frame)) => parsed.push((prefix, chunk, frame, path)),
+            None => unrecognized.push(
+                path.file_name()
+                    .map(|n| n.to_string_lossy().into_owned())
+                    .unwrap_or_else(|| path.to_string_lossy().into_owned()),
+            ),
+        }
+    }
+
+    if parsed.is_empty() || !unrecognized.is_empty() {
+        // Mixed folders (some stems parsed, some did not) must be loud:
+        // without the count, ONE stray overview TIFF silently reinstates
+        // the doubled-stack load — n_chunks reports 0 and neither the
+        // Python warning nor the GUI provenance ever mentions chunks.
+        let (n_unrecognized_files, unrecognized_examples) = if parsed.is_empty() {
+            (0, Vec::new())
+        } else {
+            let n = unrecognized.len();
+            // Sort for deterministic examples (read_dir order is arbitrary).
+            unrecognized.sort();
+            unrecognized.truncate(MAX_UNRECOGNIZED_EXAMPLES);
+            (n, unrecognized)
         };
-        let Some((prefix, chunk, frame)) = parse_chunked_stem(stem) else {
-            return Ok(ChunkLayout::Legacy);
-        };
-        parsed.push((prefix, chunk, frame, path));
+        return Ok(ChunkLayout::Legacy {
+            n_unrecognized_files,
+            unrecognized_examples,
+        });
     }
 
     let first_prefix = parsed[0].0;
     if parsed.iter().any(|(prefix, ..)| *prefix != first_prefix) {
-        return Ok(ChunkLayout::Legacy);
+        // Every stem parsed but prefixes differ — a multi-run folder, the
+        // documented legacy fallback, not a stray-file situation: count 0.
+        return Ok(ChunkLayout::Legacy {
+            n_unrecognized_files: 0,
+            unrecognized_examples: Vec::new(),
+        });
     }
 
     let mut chunks: BTreeMap<u64, Vec<(u64, PathBuf)>> = BTreeMap::new();
@@ -1458,6 +1562,8 @@ mod tests {
                 chunk_ids: vec![764, 765],
                 chunks_summed: true,
                 n_clipped_pixels: 0,
+                n_unrecognized_files: 0,
+                unrecognized_examples: vec![],
             }
         );
     }
@@ -1509,6 +1615,8 @@ mod tests {
                 chunk_ids: vec![764],
                 chunks_summed: false,
                 n_clipped_pixels: 0,
+                n_unrecognized_files: 0,
+                unrecognized_examples: vec![],
             }
         );
     }
@@ -1528,6 +1636,9 @@ mod tests {
         assert_eq!(info.n_chunks, 0);
         assert!(info.chunk_ids.is_empty());
         assert!(!info.chunks_summed);
+        // All-non-conforming folders are the normal legacy world: no noise.
+        assert_eq!(info.n_unrecognized_files, 0);
+        assert!(info.unrecognized_examples.is_empty());
     }
 
     /// T5: ragged chunks (differing frame counts) are a hard error naming
@@ -1584,6 +1695,10 @@ mod tests {
         assert_eq!(arr.shape(), &[4, 2, 2]);
         assert_eq!(info.n_chunks, 0);
         assert!(!info.chunks_summed);
+        // Every stem parsed (prefixes merely differ) — not a stray-file
+        // situation, so no unrecognized-file noise.
+        assert_eq!(info.n_unrecognized_files, 0);
+        assert!(info.unrecognized_examples.is_empty());
     }
 
     /// T8: duplicate (chunk, frame) via `.tif` + `.tiff` of the same stem.
@@ -1626,6 +1741,83 @@ mod tests {
         assert_eq!(arr[[1, 0, 0]], 100.0);
         assert_eq!(info.n_chunks, 1);
         assert_eq!(info.chunk_ids, vec![1]);
+    }
+
+    /// T10: a mixed folder (chunk-patterned files plus one stray) falls
+    /// back to legacy lexicographic loading — but the fallback is counted:
+    /// the stray is reported in `n_unrecognized_files` and named in
+    /// `unrecognized_examples`, so a mis-picked raw chunked run folder can
+    /// never load as a k× concatenated stack with zero provenance.
+    #[test]
+    fn test_mixed_folder_legacy_fallback_counts_unrecognized() {
+        let dir = tempfile::tempdir().unwrap();
+        write_chunk_files(dir.path(), "run", 764, 100, &[0, 1]);
+        write_chunk_files(dir.path(), "run", 765, 200, &[0, 1]);
+        write_test_tiff(&dir.path().join("overview.tif"), &[vec![7, 7, 7, 7]], 2, 2);
+
+        let (arr, info) =
+            load_tiff_folder_with_options(dir.path(), None, &TiffFolderOptions::default()).unwrap();
+        // Legacy lexicographic concatenation of all 5 files, stray first
+        // ("overview.tif" < "run_..."), never a chunk sum.
+        assert_eq!(arr.shape(), &[5, 2, 2]);
+        assert_eq!(arr[[0, 0, 0]], 7.0);
+        assert_eq!(arr[[1, 0, 0]], 100.0);
+        assert_eq!(
+            info,
+            TiffLoadInfo {
+                n_files: 5,
+                n_chunks: 0,
+                chunk_ids: vec![],
+                chunks_summed: false,
+                n_clipped_pixels: 0,
+                n_unrecognized_files: 1,
+                unrecognized_examples: vec!["overview.tif".to_string()],
+            }
+        );
+    }
+
+    /// T11: `unrecognized_examples` is capped at
+    /// [`MAX_UNRECOGNIZED_EXAMPLES`] lexicographically-first names while
+    /// `n_unrecognized_files` keeps the full count.
+    #[test]
+    fn test_unrecognized_examples_capped() {
+        let dir = tempfile::tempdir().unwrap();
+        write_chunk_files(dir.path(), "run", 764, 100, &[0]);
+        for name in ["stray_d.tif", "stray_c.tif", "stray_b.tif", "stray_a.tif"] {
+            write_test_tiff(&dir.path().join(name), &[vec![1, 1, 1, 1]], 2, 2);
+        }
+
+        let (arr, info) =
+            load_tiff_folder_with_options(dir.path(), None, &TiffFolderOptions::default()).unwrap();
+        assert_eq!(arr.shape(), &[5, 2, 2]);
+        assert_eq!(info.n_unrecognized_files, 4);
+        assert_eq!(info.unrecognized_examples.len(), MAX_UNRECOGNIZED_EXAMPLES);
+        assert_eq!(
+            info.unrecognized_examples,
+            vec!["stray_a.tif", "stray_b.tif", "stray_c.tif"]
+        );
+    }
+
+    /// A nonexistent folder path is `FileNotFound` with OS kind `NotFound`
+    /// (Python: `FileNotFoundError`); `NotADirectory` is reserved for paths
+    /// that exist but are not directories (see
+    /// `test_load_tiff_folder_not_a_directory`).
+    #[test]
+    fn test_load_tiff_folder_missing_dir_file_not_found() {
+        let dir = tempfile::tempdir().unwrap();
+        let missing = dir.path().join("no_such_dir");
+
+        let err = load_tiff_folder_with_options(&missing, None, &TiffFolderOptions::default())
+            .unwrap_err();
+        assert!(
+            matches!(
+                &err,
+                IoError::FileNotFound(_, source)
+                    if source.kind() == std::io::ErrorKind::NotFound
+            ),
+            "Expected FileNotFound with kind NotFound, got: {:?}",
+            err,
+        );
     }
 
     /// T10: dimension mismatch across chunks is surfaced as DimensionMismatch.
