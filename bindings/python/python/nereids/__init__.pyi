@@ -965,7 +965,11 @@ def intervals_intersect(
     a: list[tuple[float, float]],
     b: list[tuple[float, float]],
 ) -> list[tuple[float, float]]:
-    """Intersect two sorted interval lists, e.g. pause==0 AND power>1.5 MW."""
+    """Intersect two interval lists, e.g. pause==0 AND power>1.5 MW.
+
+    Inputs may be unsorted/overlapping (normalised by sort+merge first);
+    every pair must be finite with t_end > t_start.
+    """
     ...
 
 def load_nexus_bank_spectrum(
