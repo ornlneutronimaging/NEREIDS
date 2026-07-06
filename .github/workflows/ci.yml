@@ -78,6 +78,11 @@ jobs:
       - run: cargo clippy --workspace --exclude nereids-python --all-targets -- -D warnings
 
   # ── Tests (cross-platform) ─────────────────────────────────────────
+  # ubuntu-latest is deliberately NOT in this matrix: the `coverage` job below
+  # already runs the full `cargo test --workspace` suite on ubuntu (under
+  # cargo-llvm-cov, which fails the job on any test failure), so listing ubuntu
+  # here would run the identical suite a second time. This matrix covers only
+  # the platforms the coverage job does not (macOS, Windows).
   test:
     name: Test (${{ matrix.os }})
     needs: check
@@ -87,7 +92,7 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        os: [ubuntu-latest, macos-latest, windows-latest]
+        os: [macos-latest, windows-latest]
     steps:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@29eef336d9b2848a0b548edc03f92a220660cdb8 # stable
