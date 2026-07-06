@@ -642,16 +642,39 @@ fn load_hdf5_histogram(state: &mut AppState) {
     }
 }
 
-/// Format the chunk-summing / pixel-clipping provenance suffix for a TIFF
-/// load, or an empty string when nothing noteworthy happened.
+/// Format the chunk-summing / chunk-concatenation / stray-file /
+/// pixel-clipping provenance suffix for a TIFF load, or an empty string
+/// when nothing noteworthy happened.
 fn tiff_load_suffix(info: &nereids_io::tiff_stack::TiffLoadInfo) -> String {
     let mut suffix = String::new();
-    if info.chunks_summed {
-        let ids: Vec<String> = info.chunk_ids.iter().map(|id| id.to_string()).collect();
+    if info.n_chunks > 1 {
+        let ids = info
+            .chunk_ids
+            .iter()
+            .map(|id| id.to_string())
+            .collect::<Vec<String>>()
+            .join(", ");
+        if info.chunks_summed {
+            suffix.push_str(&format!(", summed {} DAQ chunks ({ids})", info.n_chunks));
+        } else {
+            // Transmission mode loads with sum_chunks=false; without this
+            // line a mis-picked raw chunked run folder loads as a k×
+            // concatenated stack with zero provenance — the only downstream
+            // symptom is a spectrum-count mismatch that never mentions
+            // chunks.
+            suffix.push_str(&format!(
+                ", detected {} DAQ chunks ({ids}) — NOT summed (transmission \
+                 mode); frames are concatenated",
+                info.n_chunks,
+            ));
+        }
+    }
+    if info.n_unrecognized_files > 0 {
         suffix.push_str(&format!(
-            ", summed {} DAQ chunks ({})",
-            info.n_chunks,
-            ids.join(", ")
+            ", {} file(s) did not match the chunk naming pattern (e.g. {}) — \
+             chunk detection disabled, frames concatenated lexicographically",
+            info.n_unrecognized_files,
+            info.unrecognized_examples.join(", "),
         ));
     }
     if info.n_clipped_pixels > 0 {
