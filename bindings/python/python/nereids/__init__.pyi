@@ -859,13 +859,18 @@ def load_tiff_folder(
     (``sum_chunks=True``, with a ``UserWarning`` naming the chunks);
     ragged chunks are an error.  ``sum_chunks`` only affects folders with
     two or more chunks — single-chunk (and non-chunk-patterned) folders
-    load identically either way.  The heuristic assumes one acquisition
-    per folder; use ``pattern`` (or ``sum_chunks=False``) when a folder
-    may hold multiple same-prefix runs.  ``pixel_policy`` is ``"reject"``
-    | ``"clip"`` | ``"allow"`` as in ``load_tiff_stack``.  With
-    ``return_info=True`` (keyword-only), returns ``(array, info)`` where
-    ``info`` has keys ``n_files``, ``n_chunks``, ``chunk_ids``,
-    ``chunks_summed``, and ``n_clipped_pixels``.
+    load identically either way.  A *mixed* folder (chunk-patterned names
+    alongside non-conforming files) loads lexicographically with a
+    ``UserWarning`` counting the files that disabled chunk detection.  The
+    heuristic assumes one acquisition per folder; use ``pattern`` (or
+    ``sum_chunks=False``) when a folder may hold multiple same-prefix
+    runs.  ``pixel_policy`` is ``"reject"`` | ``"clip"`` | ``"allow"`` as
+    in ``load_tiff_stack``.  With ``return_info=True`` (keyword-only),
+    returns ``(array, info)`` where ``info`` has keys ``n_files``,
+    ``n_chunks``, ``chunk_ids``, ``chunks_summed``, ``n_clipped_pixels``,
+    ``n_unrecognized_files`` (files that broke chunk detection in a mixed
+    folder; 0 otherwise), and ``unrecognized_examples`` (up to three of
+    their names).
     """
     ...
 

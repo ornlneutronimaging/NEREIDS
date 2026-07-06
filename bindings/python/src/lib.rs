@@ -2184,11 +2184,14 @@ fn is_genuine_not_found(e: &nereids_io::error::IoError) -> bool {
 ///
 /// Python callers otherwise have zero observability of chunk summing (a
 /// semantic change versus the old concatenate behavior: the returned stack
-/// is the element-wise *sum* of k DAQ chunks) and of negative-pixel
-/// clipping under ``pixel_policy="clip"`` — both alter the data relative
-/// to a naive per-file read, so they are surfaced as warnings the caller
-/// can catch, filter, or escalate with the stdlib ``warnings`` module
-/// (mirroring the GUI's provenance-log entries for the same events).
+/// is the element-wise *sum* of k DAQ chunks), of a *mixed* folder whose
+/// non-conforming files disabled chunk detection (silently reinstating the
+/// legacy concatenated load — potentially a k× stack), and of
+/// negative-pixel clipping under ``pixel_policy="clip"`` — all alter the
+/// data relative to the caller's expectation, so they are surfaced as
+/// warnings the caller can catch, filter, or escalate with the stdlib
+/// ``warnings`` module (mirroring the GUI's provenance-log entries for the
+/// same events).
 ///
 /// ``stacklevel=1`` attributes the warning to the frame that invoked this
 /// pyo3 function — which *is* the Python call site: extension functions
@@ -2211,6 +2214,15 @@ fn emit_tiff_load_warnings(
              pass sum_chunks=False to load the raw per-file stack instead",
             info.n_chunks,
             ids.join(", "),
+        ));
+    }
+    if info.n_unrecognized_files > 0 {
+        messages.push(format!(
+            "{} file(s) did not match the chunk naming pattern (e.g. {}); \
+             chunk detection disabled, frames loaded in lexicographic order \
+             — check for stray TIFFs or pass pattern=... to exclude them",
+            info.n_unrecognized_files,
+            info.unrecognized_examples.join(", "),
         ));
     }
     if info.n_clipped_pixels > 0 {
@@ -2294,7 +2306,11 @@ fn load_tiff_stack<'py>(
 /// (chunk, frame) pairs are an error — never a silent stack.  Folders not
 /// following the convention (or with several distinct prefixes) load in
 /// lexicographic filename order, so name legacy files with zero-padded
-/// indices (e.g., ``frame_0001.tif``, ``frame_0002.tif``, ...).
+/// indices (e.g., ``frame_0001.tif``, ``frame_0002.tif``, ...).  A *mixed*
+/// folder — at least one chunk-patterned name alongside files that do not
+/// match (a stray overview TIFF, a misnamed frame) — also loads
+/// lexicographically, with a ``UserWarning`` counting the non-conforming
+/// files (naming up to three).
 ///
 /// The chunk heuristic assumes **one acquisition per folder** (the VENUS
 /// autoreduce layout: one run folder per directory).  It cannot
@@ -2322,8 +2338,11 @@ fn load_tiff_stack<'py>(
 ///         pre-normalized transmission stacks).
 ///     return_info: Keyword-only.  When ``True``, return ``(array, info)``
 ///         where ``info`` is a dict with keys ``n_files``, ``n_chunks``,
-///         ``chunk_ids``, ``chunks_summed``, and ``n_clipped_pixels``
-///         (default ``False`` — return just the array).
+///         ``chunk_ids``, ``chunks_summed``, ``n_clipped_pixels``,
+///         ``n_unrecognized_files`` (files that broke chunk detection in a
+///         mixed folder; 0 otherwise), and ``unrecognized_examples`` (up to
+///         three of their names) (default ``False`` — return just the
+///         array).
 ///
 /// Returns:
 ///     3D numpy array with shape (n_frames, height, width), dtype float64;
@@ -2332,12 +2351,16 @@ fn load_tiff_stack<'py>(
 /// Warns:
 ///     UserWarning: When chunks were summed element-wise (the message
 ///         names the chunk count and ids and the ``sum_chunks=False``
-///         escape hatch), and when ``pixel_policy="clip"`` clamped one or
-///         more negative pixels (the message reports the count).
+///         escape hatch), when a mixed folder disabled chunk detection
+///         (the message counts the non-conforming files and names up to
+///         three), and when ``pixel_policy="clip"`` clamped one or more
+///         negative pixels (the message reports the count).
 ///
 /// Raises:
-///     FileNotFoundError: If the folder does not exist or no files match.
-///     NotADirectoryError: If the provided path is not a directory.
+///     FileNotFoundError: If the folder does not exist, or no files match
+///         the pattern.
+///     NotADirectoryError: If the provided path exists but is not a
+///         directory.
 ///     ValueError: If matched frames have inconsistent dimensions, the
 ///         chunked layout is internally inconsistent, a pixel value
 ///         violates the active policy, or ``pixel_policy`` is invalid.
@@ -2391,6 +2414,8 @@ fn load_tiff_folder<'py>(
         d.set_item("chunk_ids", info.chunk_ids)?;
         d.set_item("chunks_summed", info.chunks_summed)?;
         d.set_item("n_clipped_pixels", info.n_clipped_pixels)?;
+        d.set_item("n_unrecognized_files", info.n_unrecognized_files)?;
+        d.set_item("unrecognized_examples", info.unrecognized_examples)?;
         Ok((arr, d).into_pyobject(py)?.into_any())
     } else {
         Ok(arr.into_any())

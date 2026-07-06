@@ -69,6 +69,13 @@ Folders with two or more distinct prefixes fall back to legacy
 lexicographic loading (summing across prefixes would merge different runs);
 use `pattern` to select one run, e.g. `pattern="run_764_*"`.
 
+A *mixed* folder — at least one chunk-patterned name alongside files that
+do not match (a stray overview TIFF, a misnamed frame) — also falls back
+to lexicographic loading, and the Python loader emits a `UserWarning`
+counting the non-conforming files (naming up to three); check for stray
+TIFFs or use `pattern` to exclude them. The provenance dict reports the
+same via `n_unrecognized_files` / `unrecognized_examples`.
+
 Because summing changes the data semantics versus a per-file read, the
 Python loader emits a `UserWarning` naming the chunk count and ids (and
 the `sum_chunks=False` escape hatch) whenever chunks were summed, and a
@@ -79,7 +86,8 @@ a second return value:
 ```python
 counts, info = nereids.load_tiff_folder("run_764", return_info=True)
 # info == {"n_files": ..., "n_chunks": ..., "chunk_ids": [...],
-#          "chunks_summed": ..., "n_clipped_pixels": ...}
+#          "chunks_summed": ..., "n_clipped_pixels": ...,
+#          "n_unrecognized_files": ..., "unrecognized_examples": [...]}
 ```
 
 **One acquisition per folder.** The chunk heuristic assumes the folder

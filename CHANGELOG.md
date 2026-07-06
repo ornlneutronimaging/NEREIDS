@@ -29,6 +29,20 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
   issue's coverage-mask item was dropped per its scope amendment: per
   the #646 masking policy, coverage/thickness is a model concern, not
   an I/O concern.
+- **Mixed-folder chunk-detection observability** (#636): a folder where
+  at least one file matches the chunked naming convention but others do
+  not (a stray overview TIFF, a misnamed frame) still falls back to
+  legacy lexicographic loading, but the fallback is now loud: the
+  non-conforming files are counted in
+  `TiffLoadInfo::n_unrecognized_files` (up to three named in
+  `unrecognized_examples`), the Python loaders emit a new `UserWarning`
+  class ("N file(s) did not match the chunk naming pattern..."), the
+  `return_info` dict gains both keys, and the GUI logs the count in its
+  load provenance. The GUI also logs "detected k DAQ chunks — NOT
+  summed" when transmission mode loads a chunked folder with summing
+  disabled, and `load_tiff_folder` on a nonexistent path now raises
+  `FileNotFoundError` (`NotADirectoryError` is reserved for paths that
+  exist but are not directories), matching its documented contract.
 - **`read_tof_sidecar`** (#636): reads a VENUS `*_Spectra.txt` sidecar
   (frame start times in seconds) into the N+1 ascending microsecond TOF
   bin edges `tof_to_energy_centers` expects, extrapolating the closing

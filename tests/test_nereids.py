@@ -1829,6 +1829,8 @@ class TestTiffIO:
                 "chunk_ids": [764, 765],
                 "chunks_summed": True,
                 "n_clipped_pixels": 0,
+                "n_unrecognized_files": 0,
+                "unrecognized_examples": [],
             }
 
     def test_clip_warns(self):
@@ -1872,6 +1874,8 @@ class TestTiffIO:
                 "chunk_ids": [],
                 "chunks_summed": False,
                 "n_clipped_pixels": 0,
+                "n_unrecognized_files": 0,
+                "unrecognized_examples": [],
             }
 
     def test_warning_attributed_to_caller(self):
@@ -1916,6 +1920,52 @@ class TestTiffIO:
             assert info["n_files"] == 1
             with pytest.raises(TypeError):
                 nereids.load_tiff_folder(tmpdir, None, True, "reject", True)
+
+    def test_mixed_folder_warns_and_counts_unrecognized(self):
+        """T53: a mixed folder (chunk-patterned files plus a stray TIFF)
+        falls back to legacy lexicographic loading with a UserWarning
+        counting and naming the non-conforming files; return_info reports
+        the same via n_unrecognized_files / unrecognized_examples."""
+        tifffile = pytest.importorskip("tifffile")
+        n_frames, h, w = 4, 2, 3
+
+        with tempfile.TemporaryDirectory() as tmpdir:
+            self._write_chunked_folder(tmpdir, n_frames, h, w)
+            tifffile.imwrite(
+                os.path.join(tmpdir, "overview.tif"),
+                np.full((h, w), 7, dtype=np.uint16),
+            )
+
+            with pytest.warns(
+                UserWarning,
+                match=(
+                    r"1 file\(s\) did not match the chunk naming pattern "
+                    r"\(e\.g\. overview\.tif\).*chunk detection disabled.*"
+                    r"lexicographic order.*pattern="
+                ),
+            ):
+                arr, info = nereids.load_tiff_folder(tmpdir, return_info=True)
+
+            # Legacy concatenation of all files — never a k-fold chunk sum.
+            assert np.asarray(arr).shape == (2 * n_frames + 1, h, w)
+            assert info["n_chunks"] == 0
+            assert info["chunks_summed"] is False
+            assert info["n_unrecognized_files"] == 1
+            assert info["unrecognized_examples"] == ["overview.tif"]
+
+    def test_missing_folder_vs_not_a_directory(self):
+        """T54: load_tiff_folder raises FileNotFoundError for a
+        nonexistent path (matching the docstring) and NotADirectoryError
+        only for a path that exists but is a file."""
+        tifffile = pytest.importorskip("tifffile")
+        with tempfile.TemporaryDirectory() as tmpdir:
+            with pytest.raises(FileNotFoundError):
+                nereids.load_tiff_folder(os.path.join(tmpdir, "no_such_dir"))
+
+            file_path = os.path.join(tmpdir, "frame_0000.tif")
+            tifffile.imwrite(file_path, np.ones((2, 2), dtype=np.uint16))
+            with pytest.raises(NotADirectoryError):
+                nereids.load_tiff_folder(file_path)
 
 
 # ===========================================================================
