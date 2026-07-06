@@ -669,15 +669,19 @@ fn load_all_data(state: &mut AppState) {
 
     // Pre-normalized transmission stacks legitimately contain small
     // negative values (noise around zero), so they bypass the raw-counts
-    // pixel guard; raw counts keep the strict default.
-    let pixel_policy = if state.input_mode == InputMode::TransmissionTiff {
-        nereids_io::tiff_stack::PixelValuePolicy::Allow
+    // pixel guard; raw counts keep the strict default.  Chunk summing is
+    // likewise counts semantics: element-wise summing k per-chunk
+    // *transmission* stacks yields values near k (e.g. ~2.0 for 2 chunks),
+    // which is physically meaningless — so TransmissionTiff mode also
+    // disables it, exactly mirroring the pixel-policy switch.
+    let options = if state.input_mode == InputMode::TransmissionTiff {
+        nereids_io::tiff_stack::TiffFolderOptions {
+            pixel_policy: nereids_io::tiff_stack::PixelValuePolicy::Allow,
+            sum_chunks: false,
+        }
     } else {
-        nereids_io::tiff_stack::PixelValuePolicy::Reject
-    };
-    let options = nereids_io::tiff_stack::TiffFolderOptions {
-        pixel_policy,
-        ..Default::default()
+        // Raw counts: Reject bad pixels, sum DAQ chunks (the defaults).
+        nereids_io::tiff_stack::TiffFolderOptions::default()
     };
 
     // Load sample TIFF (auto-detect file vs directory)
@@ -756,7 +760,10 @@ fn load_all_data(state: &mut AppState) {
         // times in SECONDS, not verbatim-µs edges — feeding them to the
         // plain parser would be a 10^6 unit error, so the sidecar reader
         // handles them and a sidecar parse failure is surfaced, never
-        // silently retried with the verbatim parser.
+        // silently retried with the verbatim parser.  Detection is by
+        // filename suffix only; an explicit format selector in the UI is a
+        // possible follow-up, so the provenance log records which parser
+        // was chosen and why.
         let is_sidecar = path
             .file_name()
             .and_then(|n| n.to_str())
@@ -767,6 +774,16 @@ fn load_all_data(state: &mut AppState) {
                 Ok(edges) => {
                     state.spectrum_kind = nereids_io::spectrum::SpectrumValueKind::BinEdges;
                     state.spectrum_unit = nereids_io::spectrum::SpectrumUnit::TofMicroseconds;
+                    state.log_provenance(
+                        ProvenanceEventKind::DataLoaded,
+                        format!(
+                            "Spectrum parser: TOF sidecar (filename ends in \
+                             _Spectra.txt): {} frame start times in seconds \
+                             converted to {} µs bin edges",
+                            edges.len() - 1,
+                            edges.len(),
+                        ),
+                    );
                     state.spectrum_values = Some(Arc::new(edges));
                     state.status_message = "All data loaded".into();
                 }
@@ -817,6 +834,16 @@ fn load_all_data(state: &mut AppState) {
                     return;
                 }
 
+                state.log_provenance(
+                    ProvenanceEventKind::DataLoaded,
+                    format!(
+                        "Spectrum parser: verbatim spectrum file (no \
+                         _Spectra.txt suffix): {} values used as-is (µs/eV), \
+                         detected as {:?}",
+                        values.len(),
+                        state.spectrum_kind,
+                    ),
+                );
                 state.spectrum_values = Some(Arc::new(values));
                 state.status_message = "All data loaded".into();
             }
