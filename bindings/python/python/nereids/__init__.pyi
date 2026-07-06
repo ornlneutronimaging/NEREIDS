@@ -172,7 +172,15 @@ class FitResult:
 
     @property
     def temperature_k_unc(self) -> float | None:
-        """1-sigma uncertainty on fitted temperature (None when fit_temperature=False)."""
+        """1-sigma uncertainty on fitted temperature (None when fit_temperature=False).
+
+        For the raw-covariance solver paths (Poisson-KL, joint-Poisson) this is a
+        covariance-only lower bound (sqrt of the temperature diagonal of the
+        inverse Fisher matrix); it omits baseline/model noise and on real data can
+        underestimate the observed per-superpixel scatter by ~3-4x. Pass
+        ``scale_by_chi2=True`` for a sqrt(chi2/dof)-inflated estimate (no-op on the
+        already-chi2-scaled LM transmission path).
+        """
         ...
 
     @property
@@ -526,7 +534,14 @@ class SpatialResult:
     @property
     def temperature_uncertainty_map(self) -> NDArray[np.float64] | None:
         """Per-pixel temperature uncertainty map (None when fit_temperature=False).
-        Entries are NaN where uncertainty was unavailable for that pixel."""
+        Entries are NaN where uncertainty was unavailable for that pixel.
+
+        For the raw-covariance solver paths (Poisson-KL, joint-Poisson) each sigma_T
+        is a covariance-only lower bound (sqrt of the temperature diagonal of the
+        inverse Fisher matrix); it omits baseline/model noise and on real data can
+        underestimate the observed per-superpixel scatter by ~3-4x. Pass
+        ``scale_by_chi2=True`` to ``spatial_map*`` for a sqrt(chi2/dof)-inflated
+        estimate (no-op on the already-chi2-scaled LM transmission path)."""
         ...
 
     @property

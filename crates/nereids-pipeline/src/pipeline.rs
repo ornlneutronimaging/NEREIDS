@@ -3634,6 +3634,16 @@ pub struct SpectrumFitResult {
     /// Fitted temperature in Kelvin (only when `fit_temperature` is true).
     pub temperature_k: Option<f64>,
     /// 1-sigma uncertainty on the fitted temperature (from covariance matrix).
+    ///
+    /// **Covariance-only lower bound** for the raw-covariance solver paths
+    /// (Poisson-KL, joint-Poisson): this is `sqrt` of the temperature diagonal
+    /// of the inverse curvature (Fisher) matrix at convergence. It reflects only
+    /// statistical curvature — baseline/model noise is not in the covariance —
+    /// so on real data it can **underestimate the observed per-superpixel scatter
+    /// by ~3–4×**. Set `UnifiedFitConfig::scale_by_chi2` to inflate it by
+    /// `sqrt(χ²/dof)` for a goodness-of-fit-scaled estimate. The LM transmission
+    /// path is already χ²-scaled (Numerical Recipes §15.6), so the flag is a
+    /// no-op there.
     pub temperature_k_unc: Option<f64>,
     /// Fitted normalization scale (SAMMY `Anorm`).  When background
     /// fitting is disabled, the pipeline emits `1.0` (`λ̂` absorbs

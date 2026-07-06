@@ -503,6 +503,13 @@ impl PyFitResult {
 
     /// 1-sigma uncertainty on fitted temperature in Kelvin (``None`` when
     /// ``fit_temperature=False``).
+    ///
+    /// For the raw-covariance solver paths (Poisson-KL, joint-Poisson) this is a
+    /// **covariance-only lower bound**: it is `sqrt` of the temperature diagonal
+    /// of the inverse Fisher matrix and omits baseline/model noise, so on real
+    /// data it can underestimate the observed per-superpixel scatter by ~3–4×.
+    /// Pass ``scale_by_chi2=True`` to the fit call for a `sqrt(χ²/dof)`-inflated
+    /// estimate (no-op on the already-χ²-scaled LM transmission path).
     #[getter]
     fn temperature_k_unc(&self) -> Option<f64> {
         self.temperature_k_unc
@@ -1002,6 +1009,13 @@ impl PySpatialResult {
 
     /// Per-pixel temperature uncertainty map (None when fit_temperature=False).
     /// Entries are NaN where uncertainty was unavailable for that pixel.
+    ///
+    /// For the raw-covariance solver paths (Poisson-KL, joint-Poisson) each σ_T
+    /// is a **covariance-only lower bound** (`sqrt` of the temperature diagonal
+    /// of the inverse Fisher matrix): it omits baseline/model noise and on real
+    /// data can underestimate the observed per-superpixel scatter by ~3–4×.
+    /// Pass ``scale_by_chi2=True`` to ``spatial_map*`` for a `sqrt(χ²/dof)`-
+    /// inflated estimate (no-op on the already-χ²-scaled LM transmission path).
     #[getter]
     fn temperature_uncertainty_map<'py>(
         &self,

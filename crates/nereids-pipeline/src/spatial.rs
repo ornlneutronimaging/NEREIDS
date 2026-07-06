@@ -59,6 +59,17 @@ pub struct SpatialResult {
     /// Per-pixel temperature uncertainty map (K, 1-sigma).
     /// `Some` when `config.fit_temperature()` is true.
     /// Entries are NaN where uncertainty was unavailable for that pixel.
+    ///
+    /// **Covariance-only lower bound.** For the raw-covariance solver paths
+    /// (Poisson-KL, joint-Poisson) each σ_T is the square root of the
+    /// temperature entry of the inverse curvature (Fisher) matrix at the
+    /// converged point. That is a *lower bound* on the true uncertainty: it
+    /// captures only the statistical curvature and omits baseline/model
+    /// mis-specification noise, so on real data it can **underestimate the
+    /// observed per-superpixel scatter by ~3–4×**. Enable
+    /// `UnifiedFitConfig::scale_by_chi2` to inflate σ_T by `sqrt(χ²/dof)` for a
+    /// goodness-of-fit-scaled estimate. The LM transmission path is already
+    /// χ²-scaled (Numerical Recipes §15.6), so the flag is a no-op there.
     pub temperature_uncertainty_map: Option<Array2<f64>>,
     /// Isotope labels captured at compute time, one per density map.
     /// Ensures display labels stay in sync with density data even if the
