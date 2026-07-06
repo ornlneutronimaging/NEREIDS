@@ -178,8 +178,11 @@ class FitResult:
         covariance-only lower bound (sqrt of the temperature diagonal of the
         inverse Fisher matrix); it omits baseline/model noise and on real data can
         underestimate the observed per-superpixel scatter by ~3-4x. Pass
-        ``scale_by_chi2=True`` for a sqrt(chi2/dof)-inflated estimate (no-op on the
-        already-chi2-scaled LM transmission path).
+        ``scale_by_chi2=True`` for a sqrt(chi2/dof)-inflated estimate: sigma is
+        scaled by sqrt of the goodness-of-fit this result reports (Gaussian
+        reduced-chi2 on the transmission paths, deviance-per-dof on the counts
+        joint-Poisson path). No-op on the already-chi2-scaled LM transmission
+        path.
         """
         ...
 
@@ -541,7 +544,10 @@ class SpatialResult:
         inverse Fisher matrix); it omits baseline/model noise and on real data can
         underestimate the observed per-superpixel scatter by ~3-4x. Pass
         ``scale_by_chi2=True`` to ``spatial_map*`` for a sqrt(chi2/dof)-inflated
-        estimate (no-op on the already-chi2-scaled LM transmission path)."""
+        estimate: sigma is scaled by sqrt of the goodness-of-fit each pixel's
+        result reports (Gaussian reduced-chi2 on the transmission paths,
+        deviance-per-dof on the counts joint-Poisson path). No-op on the
+        already-chi2-scaled LM transmission path."""
         ...
 
     @property
@@ -1620,10 +1626,13 @@ def spatial_map_typed(
             energy-scale model (default 25.0).
         scale_by_chi2: When ``True``, inflate the covariance-only
             uncertainties (incl. ``temperature_uncertainty_map``) by
-            ``sqrt(chi2/dof)`` at the converged point for the Poisson-KL /
-            joint-Poisson paths, turning the inverse-Fisher lower bound into a
-            goodness-of-fit-scaled estimate. No-op on the already-chi2-scaled
-            LM transmission path. Default ``False`` (issue #638).
+            ``sqrt(chi2/dof)`` at the converged point, turning the inverse-Fisher
+            lower bound into a goodness-of-fit-scaled estimate. Sigma is scaled
+            by sqrt of the goodness-of-fit each pixel's result reports (Gaussian
+            reduced-chi2 on the transmission paths incl. Poisson-KL,
+            deviance-per-dof on the counts joint-Poisson path). No-op on the
+            already-chi2-scaled LM transmission path. Default ``False``
+            (issue #638).
 
     Always returns SpatialResult.  For counts-KL runs,
     ``SpatialResult.deviance_per_dof_map`` is populated as the primary GOF.
@@ -1706,9 +1715,11 @@ def fit_spectrum_typed(
             density ``i``); length must equal the number of density parameters.
             Mutually exclusive with ``fix_densities``.
         scale_by_chi2: Inflate covariance-only uncertainties by
-            ``sqrt(chi2/dof)`` (issue #638). No-op on this function's default LM
-            transmission path (already chi2-scaled); only takes effect with an
-            explicit ``solver='kl'``. Default ``False``.
+            ``sqrt(chi2/dof)`` (issue #638), scaling sigma by sqrt of the
+            Gaussian ``reduced_chi_squared`` this result reports. No-op on this
+            function's default LM transmission path (already chi2-scaled); with
+            an explicit ``solver='kl'`` it opts the raw inverse-Fisher sigma into
+            the same Gaussian reduced-chi2 scaling. Default ``False``.
     """
     ...
 
@@ -1831,7 +1842,9 @@ def fit_counts_spectrum_typed(
         scale_by_chi2: When ``True``, inflate the covariance-only
             uncertainties (incl. ``temperature_k_unc``) by ``sqrt(chi2/dof)``
             at the converged point, turning the inverse-Fisher lower bound into
-            a goodness-of-fit-scaled estimate. Default ``False`` (issue #638).
+            a goodness-of-fit-scaled estimate. Scales sigma by sqrt of the
+            counts joint-Poisson ``deviance_per_dof`` this result reports.
+            Default ``False`` (issue #638).
     """
     ...
 

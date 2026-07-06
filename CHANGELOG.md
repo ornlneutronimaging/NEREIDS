@@ -223,10 +223,15 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
   (Rust `UnifiedFitConfig::with_scale_by_chi2`; Python `scale_by_chi2=`
   kwarg on `spatial_map_typed` / `fit_spectrum_typed` /
   `fit_counts_spectrum_typed`, default `False`) inflates the
-  covariance-only uncertainties by `sqrt(χ²/dof)` at the converged point
-  on the Poisson-KL and joint-Poisson paths, turning the inverse-Fisher
-  lower bound into a goodness-of-fit-scaled estimate. No-op on the
-  already-χ²-scaled LM transmission path (Numerical Recipes §15.6).
+  covariance-only uncertainties by `sqrt` of the goodness-of-fit the
+  same result reports, turning the inverse-Fisher lower bound into a
+  goodness-of-fit-scaled estimate. Self-consistent on every path: the
+  transmission paths (LM and Poisson-KL) scale by the Gaussian
+  `reduced_chi_squared`, and the counts joint-Poisson path scales by its
+  `deviance_per_dof`. No-op on the already-χ²-scaled LM transmission path
+  (Numerical Recipes §15.6). The transmission Poisson-KL path never scales
+  by a Poisson deviance on transmission fractions (that would be a
+  pseudo-Poisson statistic, not a valid reduced-χ²).
 - **Ta-181 VIII.0 resonance-count regression guard** (#638): a vendored
   public-domain 73-Ta-181 ENDF/B-VIII.0 evaluation (MAT 7328) plus a
   pinning test confirm the parser faithfully reads every NER range —

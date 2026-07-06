@@ -67,8 +67,10 @@ pub struct SpatialResult {
     /// captures only the statistical curvature and omits baseline/model
     /// mis-specification noise, so on real data it can **underestimate the
     /// observed per-superpixel scatter by ~3–4×**. Enable
-    /// `UnifiedFitConfig::scale_by_chi2` to inflate σ_T by `sqrt(χ²/dof)` for a
-    /// goodness-of-fit-scaled estimate. The LM transmission path is already
+    /// `UnifiedFitConfig::scale_by_chi2` to inflate σ_T by `sqrt` of the
+    /// goodness-of-fit this result reports (Gaussian `reduced_chi_squared` on the
+    /// transmission paths, `deviance_per_dof` on the counts joint-Poisson path)
+    /// for a goodness-of-fit-scaled estimate. The LM transmission path is already
     /// χ²-scaled (Numerical Recipes §15.6), so the flag is a no-op there.
     pub temperature_uncertainty_map: Option<Array2<f64>>,
     /// Isotope labels captured at compute time, one per density map.

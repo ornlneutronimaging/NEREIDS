@@ -508,8 +508,10 @@ impl PyFitResult {
     /// **covariance-only lower bound**: it is `sqrt` of the temperature diagonal
     /// of the inverse Fisher matrix and omits baseline/model noise, so on real
     /// data it can underestimate the observed per-superpixel scatter by ~3–4×.
-    /// Pass ``scale_by_chi2=True`` to the fit call for a `sqrt(χ²/dof)`-inflated
-    /// estimate (no-op on the already-χ²-scaled LM transmission path).
+    /// Pass ``scale_by_chi2=True`` for a `sqrt(χ²/dof)`-inflated estimate: σ is
+    /// scaled by `sqrt` of the goodness-of-fit this result reports (Gaussian
+    /// reduced-χ² on the transmission paths, deviance-per-dof on the counts
+    /// joint-Poisson path). No-op on the already-χ²-scaled LM transmission path.
     #[getter]
     fn temperature_k_unc(&self) -> Option<f64> {
         self.temperature_k_unc
@@ -1015,7 +1017,10 @@ impl PySpatialResult {
     /// of the inverse Fisher matrix): it omits baseline/model noise and on real
     /// data can underestimate the observed per-superpixel scatter by ~3–4×.
     /// Pass ``scale_by_chi2=True`` to ``spatial_map*`` for a `sqrt(χ²/dof)`-
-    /// inflated estimate (no-op on the already-χ²-scaled LM transmission path).
+    /// inflated estimate: σ is scaled by `sqrt` of the goodness-of-fit each
+    /// pixel's result reports (Gaussian reduced-χ² on the transmission paths,
+    /// deviance-per-dof on the counts joint-Poisson path). No-op on the
+    /// already-χ²-scaled LM transmission path.
     #[getter]
     fn temperature_uncertainty_map<'py>(
         &self,
@@ -4734,9 +4739,11 @@ fn spatial_result_to_py(
 ///         fits a baseline per pixel and populates ``baseline_maps``.
 ///     scale_by_chi2: When True, inflate the covariance-only uncertainties
 ///         (incl. ``temperature_uncertainty_map``) by ``sqrt(chi2/dof)`` at
-///         convergence for the Poisson-KL / joint-Poisson paths — the
-///         inverse-Fisher lower bound becomes a goodness-of-fit-scaled
-///         estimate. No-op on the already-chi2-scaled LM transmission path.
+///         convergence — the inverse-Fisher lower bound becomes a
+///         goodness-of-fit-scaled estimate, scaled by the goodness-of-fit each
+///         pixel's result reports (Gaussian reduced-chi2 on the transmission
+///         paths incl. Poisson-KL, deviance-per-dof on the counts joint-Poisson
+///         path). No-op on the already-chi2-scaled LM transmission path.
 ///         Default False (issue #638).
 ///
 /// Returns:
@@ -6139,10 +6146,12 @@ fn py_fit_spectrum_typed<'py>(
     let solver_config = parse_solver_config(solver, false, max_iter)?;
     config = config.with_solver(solver_config);
 
-    // Issue #638: χ²-scaled uncertainties. This function's default solver
-    // resolves to the LM transmission path, which is already χ²-scaled, so the
-    // flag is a no-op there; it only takes effect if a Poisson-KL solver is
-    // explicitly selected for transmission input.
+    // Issue #638: χ²-scaled uncertainties. This function takes TRANSMISSION
+    // input. Its default solver resolves to the LM transmission path, which is
+    // already χ²-scaled, so the flag is a no-op there; with ``solver='kl'`` it
+    // routes to the transmission Poisson-KL path, where the flag opts the raw
+    // inverse-Fisher σ into the SAME Gaussian reduced-χ² scaling the LM path
+    // uses (see `pipeline::poisson_to_lm_result`).
     config = config.with_scale_by_chi2(scale_by_chi2);
 
     // Temperature fitting

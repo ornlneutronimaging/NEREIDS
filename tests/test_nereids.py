@@ -3039,6 +3039,67 @@ class TestFixDensities:
             "default (flag absent) must equal scale_by_chi2=False"
         )
 
+    def test_scale_by_chi2_transmission_kl_scales_by_reduced_chi2(self, u238_data):
+        """Issue #638 (review R1): on the transmission Poisson-KL path
+        (``fit_spectrum_typed(solver="kl")``), ``scale_by_chi2=True`` scales σ by
+        ``sqrt(reduced_chi_squared)`` — the SAME Gaussian goodness-of-fit the
+        result reports, the identical prescription the LM path applies — NOT a
+        Poisson deviance on transmission fractions. The direction guard is the
+        regression check: a deliberately poor fit (reduced-χ² > 1) must GROW σ;
+        the original bug scaled by the transmission Poisson deviance, which gave
+        ``D ≪ dof`` on a poor pseudo-Poisson fit and SHRANK σ (~30×)."""
+        energies = np.linspace(1.0, 30.0, 300)
+        true_density = 8.0e-4
+        t_clean = np.asarray(
+            nereids.forward_model(energies, [(u238_data, true_density)])
+        )
+        sigma = 0.01 * np.maximum(t_clean, 0.01)
+
+        # ±k (relative) high-frequency zig-zag the smooth density model cannot
+        # absorb. Multiplicative so transmission stays strictly positive; since
+        # σ = 0.01·max(t, 0.01), the reported Gaussian reduced-χ² ≈ (100·k)².
+        def zigzag(k):
+            sign = np.where(np.arange(t_clean.size) % 2 == 0, 1.0, -1.0)
+            return t_clean * (1.0 + k * sign)
+
+        def check(t):
+            def run(scale):
+                return nereids.fit_spectrum_typed(
+                    transmission=t,
+                    uncertainty=sigma,
+                    energies=energies,
+                    isotopes=[(u238_data, 5.0e-4)],
+                    solver="kl",
+                    max_iter=200,
+                    scale_by_chi2=scale,
+                )
+
+            unscaled = run(False)
+            scaled = run(True)
+            assert bool(unscaled.converged) and bool(scaled.converged)
+            rcs = float(scaled.reduced_chi_squared)
+            # The flag only rescales the post-convergence covariance, so the fit
+            # (and its reported GOF) is identical between the two runs.
+            assert float(unscaled.reduced_chi_squared) == pytest.approx(rcs, rel=1e-9)
+            assert np.isfinite(rcs) and rcs > 0.0
+            factor = float(np.sqrt(rcs))
+            s_un = float(unscaled.uncertainties[0])
+            s_sc = float(scaled.uncertainties[0])
+            assert s_sc == pytest.approx(s_un * factor, rel=1e-6), (
+                f"σ_scaled {s_sc} must equal σ_unscaled {s_un} × sqrt(rcs {rcs})"
+            )
+            return rcs, s_sc / s_un
+
+        # Poor fit (±3% → reduced-χ² ≈ 9 > 1): σ GROWS (bug inverted this).
+        rcs_poor, ratio_poor = check(zigzag(0.03))
+        assert rcs_poor > 1.0, f"zig-zag fit should give reduced-χ² > 1, got {rcs_poor}"
+        assert ratio_poor > 1.0, f"poor fit must grow σ, ratio = {ratio_poor}"
+
+        # Good fit (±0.3% → reduced-χ² ≈ 0.09 < 1): σ shrinks.
+        rcs_good, ratio_good = check(zigzag(0.003))
+        assert rcs_good < 1.0, f"clean-ish fit should give reduced-χ² < 1, got {rcs_good}"
+        assert ratio_good < 1.0, f"good fit must shrink σ, ratio = {ratio_good}"
+
     def test_fix_densities_spatial_map_holds_density(self, u238_data):
         """``spatial_map_typed`` must freeze densities per pixel: the frozen
         density map stays bit-exactly at the (offset) seed instead of fitting

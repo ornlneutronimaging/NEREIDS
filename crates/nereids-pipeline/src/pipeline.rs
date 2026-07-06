@@ -643,11 +643,23 @@ impl UnifiedFitConfig {
 
     /// Enable χ²-scaled uncertainties (issue #638).
     ///
-    /// When `true`, the raw-covariance solver paths (Poisson-KL, joint-Poisson)
-    /// inflate their reported σ by `sqrt(χ²/dof)` at the converged point, turning
-    /// the inverse-Fisher lower bound into a goodness-of-fit-scaled estimate. The
-    /// LM transmission path is already χ²-scaled (Numerical Recipes §15.6), so the
-    /// flag is a no-op there. Off by default, so existing results are unchanged.
+    /// When `true`, inflate the reported covariance-only σ by `sqrt` of the
+    /// goodness-of-fit-per-dof that the **same result reports**, turning the
+    /// inverse-Fisher lower bound into a goodness-of-fit-scaled estimate.
+    /// Self-consistent on every path:
+    ///
+    /// - **Transmission (LM and Poisson-KL)**: `σ → σ·√(χ²/ν)` using the
+    ///   Gaussian `reduced_chi_squared`. The LM path applies this
+    ///   unconditionally (Numerical Recipes §15.6), so the flag is a **no-op**
+    ///   there; the Poisson-KL path applies it on opt-in (the raw inverse-Fisher
+    ///   bound is the default).
+    /// - **Counts (joint-Poisson)**: `σ → σ·√(D/ν)` using the
+    ///   conditional-binomial `deviance_per_dof` (a genuine count-statistics
+    ///   GOF), on opt-in.
+    ///
+    /// It never scales by a Poisson deviance on transmission fractions (which
+    /// would be a pseudo-Poisson statistic, not a valid reduced-χ²). Off by
+    /// default, so existing results are unchanged.
     #[must_use]
     pub fn with_scale_by_chi2(mut self, v: bool) -> Self {
         self.scale_by_chi2 = v;
@@ -1546,7 +1558,6 @@ fn fit_transmission_poisson(
 
     let mut poisson_cfg = poisson_cfg.clone();
     poisson_cfg.compute_covariance = config.compute_covariance;
-    poisson_cfg.scale_by_chi2 = config.scale_by_chi2;
     let poisson_cfg = &poisson_cfg;
 
     let n_density_params = config.n_density_params();
@@ -1626,7 +1637,14 @@ fn fit_transmission_poisson(
         ));
     }
     let pr = poisson::poisson_fit(&*stacked, measured_t, &mut params, poisson_cfg)?;
-    let result = poisson_to_lm_result(&*stacked, measured_t, sigma, &pr, &params)?;
+    let result = poisson_to_lm_result(
+        &*stacked,
+        measured_t,
+        sigma,
+        &pr,
+        &params,
+        config.scale_by_chi2,
+    )?;
 
     let free_indices = params.free_indices();
     let mut sr = extract_result(
@@ -3069,6 +3087,7 @@ fn poisson_to_lm_result(
     sigma: &[f64],
     pr: &poisson::PoissonResult,
     params: &ParameterSet,
+    scale_by_chi2: bool,
 ) -> Result<LmResult, PipelineError> {
     let n_free = params.n_free();
     let dof = measured_t.len().saturating_sub(n_free).max(1);
@@ -3082,14 +3101,48 @@ fn poisson_to_lm_result(
             (residual * residual) / (s * s).max(1e-30)
         })
         .sum();
+    let reduced_chi_squared = chi_sq / dof as f64;
+
+    // Issue #638: `scale_by_chi2` makes the transmission Poisson-KL path's
+    // covariance-only σ self-consistent with the goodness-of-fit THIS result
+    // reports — exactly as the LM transmission path does unconditionally
+    // (`lm.rs` #108.1, Numerical Recipes §15.6): `Cov → (χ²/ν)·Cov`, so
+    // `σ → σ·√(χ²/ν)`. It scales by the SAME Gaussian reduced-χ² (`chi_sq/dof`)
+    // surfaced in `reduced_chi_squared` below — NOT a Poisson deviance on the
+    // transmission fractions. The Poisson deviance assumes count statistics
+    // (Var ≈ mean); on transmission (~0..1) it is a pseudo-Poisson statistic,
+    // not a valid reduced-χ², and a good fit gives `D ≪ dof`, which would
+    // SHRINK σ far below the Cramér-Rao bound (the opposite of the flag's
+    // intent). Opt-in: the raw inverse-Fisher bound is the default; scaling
+    // needs a finite, positive reduced-χ² (`dof = 0` / non-finite leaves the
+    // raw bound), mirroring the LM path's `dof > 0` guard.
+    let (covariance, uncertainties) =
+        if scale_by_chi2 && reduced_chi_squared.is_finite() && reduced_chi_squared > 0.0 {
+            let sigma_factor = reduced_chi_squared.sqrt();
+            let covariance = pr.covariance.as_ref().map(|cov| {
+                let mut scaled = cov.clone();
+                for v in scaled.data.iter_mut() {
+                    *v *= reduced_chi_squared;
+                }
+                scaled
+            });
+            let uncertainties = pr
+                .uncertainties
+                .as_ref()
+                .map(|unc| unc.iter().map(|s| s * sigma_factor).collect());
+            (covariance, uncertainties)
+        } else {
+            (pr.covariance.clone(), pr.uncertainties.clone())
+        };
+
     Ok(LmResult {
         chi_squared: chi_sq,
-        reduced_chi_squared: chi_sq / dof as f64,
+        reduced_chi_squared,
         iterations: pr.iterations,
         converged: pr.converged,
         params: pr.params.clone(),
-        covariance: pr.covariance.clone(),
-        uncertainties: pr.uncertainties.clone(),
+        covariance,
+        uncertainties,
     })
 }
 
@@ -3668,10 +3721,11 @@ pub struct SpectrumFitResult {
     /// of the inverse curvature (Fisher) matrix at convergence. It reflects only
     /// statistical curvature — baseline/model noise is not in the covariance —
     /// so on real data it can **underestimate the observed per-superpixel scatter
-    /// by ~3–4×**. Set `UnifiedFitConfig::scale_by_chi2` to inflate it by
-    /// `sqrt(χ²/dof)` for a goodness-of-fit-scaled estimate. The LM transmission
-    /// path is already χ²-scaled (Numerical Recipes §15.6), so the flag is a
-    /// no-op there.
+    /// by ~3–4×**. Set `UnifiedFitConfig::scale_by_chi2` to inflate it by `sqrt`
+    /// of the goodness-of-fit this result reports (Gaussian `reduced_chi_squared`
+    /// on the transmission paths, `deviance_per_dof` on the counts joint-Poisson
+    /// path) for a goodness-of-fit-scaled estimate. The LM transmission path is
+    /// already χ²-scaled (Numerical Recipes §15.6), so the flag is a no-op there.
     pub temperature_k_unc: Option<f64>,
     /// Fitted normalization scale (SAMMY `Anorm`).  When background
     /// fitting is disabled, the pipeline emits `1.0` (`λ̂` absorbs
@@ -5148,6 +5202,111 @@ mod tests {
         assert_eq!(
             default_run.temperature_k_unc, unscaled.temperature_k_unc,
             "default (flag absent) must equal scale_by_chi2=false"
+        );
+    }
+
+    /// Issue #638 (review R1): on the transmission Poisson-KL path,
+    /// `scale_by_chi2` scales σ by the SAME Gaussian `reduced_chi_squared` the
+    /// result reports — the identical prescription the LM path applies
+    /// unconditionally (`lm.rs` #108.1, Numerical Recipes §15.6) — NOT a Poisson
+    /// deviance on transmission fractions.
+    ///
+    /// Two regimes, both asserting `σ_scaled == σ_unscaled·√(reduced_chi_squared)`
+    /// (self-consistency with the reported GOF):
+    ///  - a good fit (`reduced_chi_squared < 1`) SHRINKS σ, and
+    ///  - a deliberately poor fit (`reduced_chi_squared > 1`, forced by a
+    ///    high-frequency zig-zag the smooth density model cannot absorb) GROWS σ.
+    ///
+    /// The direction guard is the key regression check: the original bug scaled
+    /// by the Poisson deviance of transmission fractions, which gives `D ≪ dof`
+    /// on a poor pseudo-Poisson fit and SHRANK σ (~30×), the opposite of intent.
+    #[test]
+    fn test_scale_by_chi2_transmission_kl_scales_by_reported_reduced_chi2() {
+        let data = u238_single_resonance();
+        let true_density = 0.002;
+        let energies: Vec<f64> = (0..201).map(|i| 1.0 + (i as f64) * 0.05).collect();
+
+        let make_config = |scale: bool| {
+            UnifiedFitConfig::new(
+                energies.clone(),
+                vec![data.clone()],
+                vec!["U-238".into()],
+                0.0,
+                None,
+                vec![0.001],
+            )
+            .unwrap()
+            .with_solver(SolverConfig::PoissonKL(PoissonConfig::default()))
+            .with_scale_by_chi2(scale)
+        };
+
+        // Fit `t` (with uncertainty `sigma`) twice — flag off/on — assert
+        // `σ_scaled == σ_unscaled·√(reduced_chi_squared)` and that the flag does
+        // not change the reported GOF. Returns (reduced_chi², σ_scaled/σ_unscaled).
+        let check = |t: Vec<f64>, sigma: Vec<f64>| -> (f64, f64) {
+            let input = InputData::Transmission {
+                transmission: t,
+                uncertainty: sigma,
+            };
+            let unscaled = fit_spectrum_typed(&input, &make_config(false)).unwrap();
+            let scaled = fit_spectrum_typed(&input, &make_config(true)).unwrap();
+            assert!(unscaled.converged && scaled.converged);
+            let rcs = scaled.reduced_chi_squared;
+            assert!(
+                (rcs - unscaled.reduced_chi_squared).abs() < 1e-9,
+                "scale flag must not change the reported reduced_chi_squared"
+            );
+            assert!(rcs.is_finite() && rcs > 0.0, "reduced_chi_squared = {rcs}");
+            let factor = rcs.sqrt();
+            let s_un = unscaled.uncertainties.as_ref().expect("σ unscaled")[0];
+            let s_sc = scaled.uncertainties.as_ref().expect("σ scaled")[0];
+            let rel = (s_sc - s_un * factor).abs() / (s_un * factor);
+            assert!(
+                rel < 1e-6,
+                "σ_scaled {s_sc} must equal σ_unscaled {s_un} × √(reduced_chi² {rcs})"
+            );
+            (rcs, s_sc / s_un)
+        };
+
+        // ±k (relative) zig-zag: a zero-mean high-frequency perturbation the
+        // smooth density model cannot absorb. Multiplicative (`t·(1±k)`) so the
+        // transmission stays strictly positive even at a deep resonance dip (an
+        // additive ±k·σ perturbation drives `t` negative there, violating the
+        // Poisson `obs ≥ 0` contract). Since `σ = 0.01·max(t, 0.01)`, the bulk
+        // bins give `(residual/σ)² ≈ (100·k)²`, so the reported Gaussian
+        // reduced-χ² ≈ (100·k)².
+        let zigzag = |k: f64| -> (Vec<f64>, Vec<f64>) {
+            let (t, sigma) = synthetic_transmission(&data, true_density, &energies);
+            let perturbed: Vec<f64> = t
+                .iter()
+                .enumerate()
+                .map(|(i, &ti)| if i % 2 == 0 { ti * (1.0 + k) } else { ti * (1.0 - k) })
+                .collect();
+            (perturbed, sigma)
+        };
+
+        // Good fit (±0.3% → reduced-χ² ≈ 0.09 < 1): σ shrinks.
+        let (t_good, s_good) = zigzag(0.003);
+        let (rcs_good, ratio_good) = check(t_good, s_good);
+        assert!(
+            rcs_good < 1.0,
+            "clean-ish fit should give reduced-χ² < 1, got {rcs_good}"
+        );
+        assert!(
+            ratio_good < 1.0,
+            "good fit must shrink σ, ratio = {ratio_good}"
+        );
+
+        // Poor fit (±3% → reduced-χ² ≈ 9 > 1): σ grows (bug inverted this).
+        let (t_poor, s_poor) = zigzag(0.03);
+        let (rcs_poor, ratio_poor) = check(t_poor, s_poor);
+        assert!(
+            rcs_poor > 1.0,
+            "zig-zag fit should give reduced-χ² > 1, got {rcs_poor}"
+        );
+        assert!(
+            ratio_poor > 1.0,
+            "poor fit must GROW σ, ratio = {ratio_poor}"
         );
     }
 

@@ -54,18 +54,6 @@ pub struct PoissonConfig {
     /// after convergence.  Set to `false` for per-pixel spatial mapping
     /// when only densities are needed, avoiding extra model evaluations.
     pub compute_covariance: bool,
-    /// Inflate the covariance-only uncertainties by the goodness-of-fit factor
-    /// at the converged point: `Cov → (D/dof)·Cov`, i.e. `σ → σ·√(D/dof)`, where
-    /// `D` is the Poisson deviance (see [`poisson_deviance`]) and
-    /// `dof = n_data − n_free`.
-    ///
-    /// Off by default, so the reported σ stays the raw Cramér-Rao (inverse-Fisher)
-    /// lower bound, which omits baseline/model mis-specification noise and can
-    /// underestimate the true per-superpixel scatter by ~3–4× on real data.
-    /// Scaling is only applied when `D/dof` is finite and positive (`dof = 0`
-    /// leaves the covariance unscaled). See issue #638; the LM transmission path
-    /// is already χ²-scaled (Numerical Recipes §15.6) and does not use this flag.
-    pub scale_by_chi2: bool,
 }
 
 impl Default for PoissonConfig {
@@ -80,7 +68,6 @@ impl Default for PoissonConfig {
             gauss_newton_lambda: 1e-3,
             lbfgs_history: 8,
             compute_covariance: true,
-            scale_by_chi2: false,
         }
     }
 }
@@ -125,30 +112,6 @@ fn poisson_nll(y_obs: &[f64], y_model: &[f64]) -> f64 {
         .iter()
         .zip(y_model.iter())
         .map(|(&obs, &mdl)| poisson_nll_term(obs, mdl))
-        .sum()
-}
-
-/// Poisson deviance `D = 2·Σ [y_obs·ln(y_obs/y_model) − (y_obs − y_model)]`.
-///
-/// Goodness-of-fit statistic for the Poisson likelihood at the converged
-/// parameters. Used only for the optional χ²-scaling of the covariance
-/// (issue #638) — it is never part of the objective being minimized. Each term
-/// is non-negative. The `y_obs = 0` term reduces to `2·y_model`. `y_model` is
-/// floored at `POISSON_EPSILON` before the logarithm, matching
-/// [`poisson_nll_term`], so a degenerate zero prediction cannot yield a
-/// non-finite deviance.
-fn poisson_deviance(y_obs: &[f64], y_model: &[f64]) -> f64 {
-    y_obs
-        .iter()
-        .zip(y_model.iter())
-        .map(|(&obs, &mdl)| {
-            let m = mdl.max(POISSON_EPSILON);
-            if obs > 0.0 {
-                2.0 * (obs * (obs / m).ln() - (obs - m))
-            } else {
-                2.0 * m
-            }
-        })
         .sum()
 }
 
@@ -1135,31 +1098,18 @@ pub fn poisson_fit(
         };
 
         if let Some(fisher) = fisher_opt {
-            if let Some(mut cov) = crate::lm::invert_matrix(&fisher) {
-                // Optional goodness-of-fit inflation (issue #638): σ → σ·√(D/dof),
-                // i.e. Cov → (D/dof)·Cov, with D the Poisson deviance at the
-                // converged parameters. Off by default; only applied when D/dof
-                // is finite and positive (dof = 0 leaves the raw bound).
-                let var_scale = if config.scale_by_chi2 {
-                    let dof = y_obs.len().saturating_sub(params.n_free());
-                    if dof > 0 {
-                        let dpd = poisson_deviance(y_obs, &y_model) / dof as f64;
-                        if dpd.is_finite() && dpd > 0.0 {
-                            dpd
-                        } else {
-                            1.0
-                        }
-                    } else {
-                        1.0
-                    }
-                } else {
-                    1.0
-                };
-                if var_scale != 1.0 {
-                    for v in cov.data.iter_mut() {
-                        *v *= var_scale;
-                    }
-                }
+            if let Some(cov) = crate::lm::invert_matrix(&fisher) {
+                // Raw Cramér-Rao (inverse-Fisher) covariance-only bound. This
+                // fitter deliberately does NOT apply the optional χ²-scaling
+                // (`scale_by_chi2`, issue #638): the objective here is the
+                // Poisson NLL on transmission fractions (~0..1), so a Poisson
+                // deviance would be a pseudo-Poisson statistic, not a valid
+                // reduced-χ². The pipeline extraction layer
+                // (`pipeline::poisson_to_lm_result`) scales this σ by the
+                // Gaussian reduced-χ² the result reports — the same GOF the LM
+                // transmission path uses — when the caller opts in, keeping the
+                // formalism-agnostic scaling out of this count-statistics
+                // fitter.
                 let n_free = cov.nrows;
                 let unc: Vec<f64> = (0..n_free)
                     .map(|i| {
@@ -1555,6 +1505,68 @@ mod tests {
     use super::*;
     use crate::lm::FitModel;
     use crate::parameters::FitParameter;
+
+    /// Poisson deviance `D = 2·Σ [y_obs·ln(y_obs/y_model) − (y_obs − y_model)]`.
+    ///
+    /// Goodness-of-fit statistic for the Poisson likelihood. Each term is
+    /// non-negative; the `y_obs = 0` term reduces to `2·y_model`. `y_model` is
+    /// HARD-floored at `POISSON_EPSILON` before the logarithm — a simpler
+    /// scheme than [`poisson_nll_term`]'s smooth quadratic sub-`POISSON_EPSILON`
+    /// extrapolation, used here solely to keep the deviance finite for a
+    /// degenerate zero prediction (the two schemes agree only for
+    /// `y_model ≥ POISSON_EPSILON`).
+    ///
+    /// Reference formula kept under `#[cfg(test)]` as an independently
+    /// hand-checked oracle (issue #638). The production σ-scaling on the
+    /// transmission Poisson-KL path scales by the Gaussian reduced-χ² the
+    /// result reports (see `nereids_pipeline::pipeline::poisson_to_lm_result`),
+    /// NOT this Poisson deviance, which on transmission fractions would be a
+    /// pseudo-Poisson statistic rather than a valid reduced-χ².
+    fn poisson_deviance(y_obs: &[f64], y_model: &[f64]) -> f64 {
+        y_obs
+            .iter()
+            .zip(y_model.iter())
+            .map(|(&obs, &mdl)| {
+                let m = mdl.max(POISSON_EPSILON);
+                if obs > 0.0 {
+                    2.0 * (obs * (obs / m).ln() - (obs - m))
+                } else {
+                    2.0 * m
+                }
+            })
+            .sum()
+    }
+
+    /// F3 oracle: `poisson_deviance` against a per-bin HAND-COMPUTED value.
+    ///
+    /// Bins exercise every branch:
+    ///  - `obs=4, mdl=2` (main branch): `2·(4·ln(4/2) − (4−2)) = 8·ln2 − 4`.
+    ///  - `obs=1, mdl=1` (main branch, exact match): `2·(1·ln1 − 0) = 0`.
+    ///  - `obs=0, mdl=5` (`obs=0` branch): `2·5 = 10`.
+    ///  - `obs=3, mdl=0` (flooring path, `obs>0`, `mdl<ε`): `mdl` is clamped to
+    ///    `POISSON_EPSILON`, so the term is `2·(3·ln(3/ε) − (3−ε))`. Verifies
+    ///    the hard floor is applied (an unclamped `mdl=0` would give `ln(3/0)=∞`
+    ///    and a non-finite deviance).
+    #[test]
+    fn test_poisson_deviance_hand_computed() {
+        let y_obs = [4.0, 1.0, 0.0, 3.0];
+        let y_model = [2.0, 1.0, 5.0, 0.0];
+
+        let eps = POISSON_EPSILON;
+        let term_main = 8.0 * 2.0_f64.ln() - 4.0; // obs=4, mdl=2
+        let term_match = 0.0; // obs=1, mdl=1
+        let term_zero_obs = 10.0; // obs=0, mdl=5 → 2·5
+        let term_floored = 2.0 * (3.0 * (3.0 / eps).ln() - (3.0 - eps)); // obs=3, mdl=0
+        let expected = term_main + term_match + term_zero_obs + term_floored;
+
+        let got = poisson_deviance(&y_obs, &y_model);
+        assert!(
+            (got - expected).abs() < 1e-9,
+            "poisson_deviance = {got}, hand-computed = {expected}"
+        );
+        // Each term is non-negative and the floored bin stayed finite.
+        assert!(got.is_finite() && got > 0.0, "deviance = {got}");
+    }
 
     /// Simple model: y = a * exp(-b * x)
     /// This mimics transmission: counts = flux * exp(-density * sigma)
