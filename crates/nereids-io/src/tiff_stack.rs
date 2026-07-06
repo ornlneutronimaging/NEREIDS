@@ -23,7 +23,9 @@
 //!   summed element-wise by default (each chunk covers the same TOF bins, so
 //!   the physical stack is the sum, not a concatenation).  Opt out with
 //!   [`TiffFolderOptions::sum_chunks`]` = false` to get the legacy
-//!   lexicographic concatenation;
+//!   lexicographic concatenation (the flag only affects folders with two or
+//!   more chunks — single-chunk folders always load in numeric frame
+//!   order);
 //! - ragged chunks (differing frame counts or frame sets) or duplicate
 //!   (chunk, frame) pairs → hard [`IoError::ChunkMismatch`] error, never a
 //!   silent stack or partial sum.
@@ -31,6 +33,17 @@
 //! Folders with two or more distinct prefixes fall back to legacy
 //! lexicographic stacking — summing across different prefixes would merge
 //! different runs.  Use the `pattern` argument to select one run.
+//!
+//! ### One acquisition per folder
+//!
+//! The chunk heuristic assumes the folder holds **one acquisition** — the
+//! VENUS autoreduce layout, where each run gets its own directory (verified
+//! on IPTS-37432 output; note the `<chunk>` field in real names is a
+//! run-ish id, e.g. `..._ob_0_116_00000.tif`).  The heuristic cannot
+//! distinguish same-prefix sibling *runs* co-located in one folder from DAQ
+//! chunks of a single run: such siblings would be summed.  When a folder
+//! may hold multiple runs, select one with `pattern` or pass
+//! [`TiffFolderOptions::sum_chunks`]` = false`.
 //!
 //! ## Pixel-value policy
 //!
@@ -86,8 +99,12 @@ pub enum PixelValuePolicy {
 #[derive(Debug, Clone, Copy)]
 pub struct TiffFolderOptions {
     /// Sum DAQ chunks element-wise when a chunked folder is detected
-    /// (default `true`).  When `false`, a chunked folder is loaded as the
-    /// legacy lexicographic concatenation of all files.
+    /// (default `true`).  When `false`, a *multi-chunk* folder is loaded
+    /// as the legacy lexicographic concatenation of all files.  The flag
+    /// only affects folders with two or more chunks: single-chunk (and
+    /// non-chunk-patterned) folders load identically either way —
+    /// chunk-patterned names in numeric frame order, others
+    /// lexicographically.
     pub sum_chunks: bool,
     /// Policy for negative / non-finite pixel values (default
     /// [`PixelValuePolicy::Reject`]).
@@ -505,8 +522,9 @@ pub fn load_tiff_folder_with_options(
                     },
                 ))
             } else {
-                // Chunk summing opted out: legacy lexicographic concatenation
-                // of every matching file (chunk structure is still reported).
+                // Chunk summing opted out (only reachable with >= 2 chunks):
+                // legacy lexicographic concatenation of every matching file
+                // (chunk structure is still reported in the info).
                 paths.sort();
                 let arr =
                     load_frames_from_paths(&paths, options.pixel_policy, &mut n_clipped_pixels)?;

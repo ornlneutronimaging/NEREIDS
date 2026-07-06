@@ -15,7 +15,10 @@
 //! first column is each frame's *start time in seconds* (N rows for N
 //! frames; the second column is counts).  [`read_tof_sidecar`] converts it
 //! to the N+1 ascending TOF bin edges **in microseconds** that
-//! [`crate::tof::tof_edges_to_energy_centers`] expects.
+//! [`crate::tof::tof_edges_to_energy_centers`] expects.  The start-time =
+//! left-bin-edge semantics is established from measured autoreduce output
+//! (see [`parse_tof_sidecar_text`] for the evidence and for how NEREIDS
+//! differs from PLEIADES here).
 
 use std::path::Path;
 
@@ -59,6 +62,30 @@ pub fn read_tof_sidecar(path: &Path, n_frames: Option<usize>) -> Result<Vec<f64>
 /// distinct widths is valid.  The last-segment-width extrapolation is
 /// exact whenever the final two frames belong to the same shutter segment
 /// (always the case in practice — segments are many frames long).
+///
+/// ## `shutter_time` is the frame START (left bin edge) — evidence
+///
+/// Verified on measured IPTS-37432 VENUS autoreduce output (OB run 19385,
+/// chunk id 116): the sidecar holds 4053 rows (exactly one per TIFF
+/// frame), starting at 1.12 µs — *not* zero; the autoreduce already drops
+/// the pre-trigger bins — in uniform 160 ns steps, and **every time value
+/// is an exact integer multiple of the 160 ns bin width**
+/// (1.12 µs = 7 × 0.16 µs).  Bin *centers* would sit at half-multiples,
+/// so `shutter_time` is definitively the frame start / left bin edge.
+/// PLEIADES's sidecar helper instead uses the values directly as frame
+/// TOFs, which differs from the true bin centers by half a bin width;
+/// NEREIDS uses edges here plus geometric-mean centers
+/// ([`crate::tof::tof_edges_to_energy_centers`]).  A constant offset of
+/// this kind is absorbed by the fitted t₀ in the energy-scale fit.
+///
+/// ## First edge exactly 0
+///
+/// A sidecar whose first start time is exactly 0 s parses successfully
+/// (0 is a valid TOF edge), but that edge cannot be energy-converted —
+/// E is undefined at t = 0.  Crop the first frame from **both** the
+/// stack and the edges (`stack[1:]`, `edges[1:]`) before conversion.
+/// Real autoreduce sidecars start after the pre-trigger bins, so this
+/// only arises for hand-made files.
 ///
 /// The returned edges plug directly into
 /// [`crate::tof::tof_edges_to_energy_centers`].
@@ -352,8 +379,34 @@ TOF_us, intensity
         assert!(result.is_err());
     }
 
-    /// T23: 3 rows of start times in seconds become 4 ascending µs edges.
-    /// Values chosen binary-exact so seconds → µs conversion is exact.
+    /// T23 (primary fixture): evidence-shaped VENUS sidecar mirroring the
+    /// structure of measured IPTS-37432 autoreduce output (OB run 19385):
+    /// header `shutter_time,counts`, first start time 1.12e-6 s — NOT
+    /// zero; the autoreduce drops the pre-trigger bins — and uniform
+    /// 1.6e-7 s (160 ns) steps, every value an exact integer multiple of
+    /// the bin width (1.12 µs = 7 × 0.16 µs).  Counts are synthetic.
+    /// 3 rows become 4 ascending µs edges.
+    #[test]
+    fn test_sidecar_evidence_shaped_edges() {
+        let text = "shutter_time,counts\n1.12e-6,100\n1.28e-6,200\n1.44e-6,300\n";
+        let edges = parse_tof_sidecar_text(text, None).unwrap();
+        assert_eq!(edges.len(), 3 + 1);
+        // Seconds → µs uses exactly this multiplication, so the first
+        // edge is bit-identical by construction.
+        assert_eq!(edges[0], 1.12e-6 * MICROSECONDS_PER_SECOND);
+        let expected = [1.12, 1.28, 1.44, 1.60];
+        for (edge, want) in edges.iter().zip(expected.iter()) {
+            assert!(
+                (edge - want).abs() < 1e-9,
+                "edge {} != expected {}",
+                edge,
+                want,
+            );
+        }
+    }
+
+    /// T23b: binary-exact start times convert to bit-exact µs edges
+    /// (pins the conversion constant and the synthesized closing edge).
     #[test]
     fn test_sidecar_three_rows_exact_edges() {
         let text = "0.5,100\n1.0,200\n1.5,300\n";
@@ -423,6 +476,14 @@ TOF_us, intensity
     /// T30: non-uniform shutter segments (64 µs then 128 µs frames) are
     /// accepted, and the synthesized final edge extrapolates the *last*
     /// segment's width.
+    ///
+    /// This fixture also pins that a first start time of exactly 0 s
+    /// *parses successfully* — 0 is a valid TOF edge.  Callers must crop
+    /// the first frame from both the stack and the edges (`stack[1:]`,
+    /// `edges[1:]`) before energy conversion, since E is undefined at
+    /// t = 0 (see [`parse_tof_sidecar_text`]).  Real autoreduce sidecars
+    /// start after the pre-trigger bins (T23), so 0-start files are
+    /// hand-made.
     #[test]
     fn test_sidecar_shutter_segments_last_width_extrapolation() {
         // Starts (s): 0, 64 µs, 192 µs — widths 64 µs then 128 µs.

@@ -57,7 +57,10 @@ the layout automatically:
 - chunks covering identical frame ranges are summed element-wise into a
   single `(n_frames, height, width)` stack — the physical stack is the sum,
   not a concatenation. Pass `sum_chunks=False` for the legacy lexicographic
-  concatenation;
+  concatenation. The flag only affects folders with two or more chunks:
+  single-chunk (and non-chunk-patterned) folders load identically either
+  way — chunk-patterned names in numeric frame order, others
+  lexicographically;
 - ragged chunks (differing frame counts or frame sets) or duplicate
   (chunk, frame) pairs raise `ValueError` — never a silent stack or a
   partial sum.
@@ -65,6 +68,27 @@ the layout automatically:
 Folders with two or more distinct prefixes fall back to legacy
 lexicographic loading (summing across prefixes would merge different runs);
 use `pattern` to select one run, e.g. `pattern="run_764_*"`.
+
+Because summing changes the data semantics versus a per-file read, the
+Python loader emits a `UserWarning` naming the chunk count and ids (and
+the `sum_chunks=False` escape hatch) whenever chunks were summed, and a
+`UserWarning` with the clipped-pixel count when `pixel_policy="clip"`
+clamped anything. Pass `return_info=True` to get the full provenance as
+a second return value:
+
+```python
+counts, info = nereids.load_tiff_folder("run_764", return_info=True)
+# info == {"n_files": ..., "n_chunks": ..., "chunk_ids": [...],
+#          "chunks_summed": ..., "n_clipped_pixels": ...}
+```
+
+**One acquisition per folder.** The chunk heuristic assumes the folder
+holds a single acquisition — the VENUS autoreduce layout, where each run
+gets its own directory (verified on IPTS-37432 output; the `<chunk>`
+field in real names is a run-ish id, e.g. `..._ob_0_116_00000.tif`). It
+cannot distinguish same-prefix sibling *runs* co-located in one folder
+from DAQ chunks — such siblings would be summed. When a folder may hold
+multiple runs, select one with `pattern` or pass `sum_chunks=False`.
 
 ### Pixel-value policy
 
@@ -89,6 +113,24 @@ CSV column is each frame's start time in seconds (one row per TOF frame).
 edges that `tof_to_energy_centers(...)` expects, synthesizing the closing
 edge from the last frame width. Bin uniformity is not required — MCP
 shutter segments change the frame width mid-run.
+
+The start-time = left-bin-edge semantics is established from measured
+VENUS autoreduce output (IPTS-37432, OB run 19385): the sidecar holds
+exactly one row per TIFF frame, starts at 1.12 µs — not zero; the
+autoreduce already drops the pre-trigger bins — in uniform 160 ns steps,
+and every time value is an exact integer multiple of the 160 ns bin
+width (1.12 µs = 7 × 0.16 µs). Bin *centers* would sit at
+half-multiples, so `shutter_time` is definitively the frame start (left
+bin edge). Note that PLEIADES's sidecar helper uses these values
+directly as frame TOFs, which differs from the true bin centers by half
+a bin width; NEREIDS uses edges plus geometric-mean centers. A constant
+offset of this kind is absorbed by the fitted t₀ in the energy-scale
+fit.
+
+A hand-made sidecar whose first start time is exactly 0 s still parses
+(0 is a valid TOF edge), but the t = 0 edge cannot be energy-converted —
+E is undefined at t = 0. Crop the first frame from **both** the stack
+and the edges (`stack[1:]`, `edges[1:]`) before conversion.
 
 A complete VENUS run folder loads to a stack plus energy axis in three
 calls:
