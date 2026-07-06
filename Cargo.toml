@@ -81,7 +81,7 @@ rand = "0.9"
 # UNSTABLE across rand versions, so acceptance tests that pin a noise
 # realization must name a concrete algorithm (ChaCha12) instead.
 rand_chacha = "0.9"
-rand_distr = "0.5"
+rand_distr = "0.6"
 microlp = "0.4"
 tracing = "0.1"
 # log-crate facade: bridged into tracing by apps/gui/src/logging.rs so
