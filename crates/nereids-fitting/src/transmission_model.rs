@@ -2684,6 +2684,283 @@ impl<M: FitModel> ForwardModel for NormalizedTransmissionModel<M> {
     }
 }
 
+// ── Multiplicative baseline wrapper (issue #635) ──────────────────────────
+
+/// Reference energy for the multiplicative-baseline log basis: the geometric
+/// midpoint `√(E_min · E_max)` of the grid.  Centering the basis at the
+/// geometric midpoint makes the design columns `1, z, z²` near-orthogonal on
+/// a log-uniform grid and makes `b0` the mid-grid baseline value — so its
+/// bound is directly the "a few % off unity" statement from the VENUS data.
+///
+/// The caller must guarantee a non-empty grid of positive energies (the
+/// pipeline validates this); on an empty grid this returns NaN, which the
+/// config validation rejects downstream.  The actual extrema are folded
+/// over the slice rather than read from `first()`/`last()`, so the
+/// documented `√(E_min·E_max)` holds regardless of grid ordering (the
+/// pipeline convention is ascending, but `UnifiedFitConfig::new` does not
+/// enforce it and the two forms agree bit-exactly on any monotonic grid).
+pub fn baseline_reference_energy(energies: &[f64]) -> f64 {
+    if energies.is_empty() {
+        return f64::NAN;
+    }
+    let (lo, hi) = energies
+        .iter()
+        .fold((f64::INFINITY, f64::NEG_INFINITY), |(lo, hi), &e| {
+            (lo.min(e), hi.max(e))
+        });
+    (lo * hi).sqrt()
+}
+
+/// Bounded multiplicative polynomial baseline (issue #635):
+///
+/// ```text
+/// y(E) = B(E) · T_inner(E),   B(E) = b0 + b1·z + b2·z²,   z = ln(E / E_ref)
+/// ```
+///
+/// where `E_ref = √(E_min·E_max)` (see [`baseline_reference_energy`]) and
+/// `T_inner` is any inner [`FitModel`] — typically the bare transmission
+/// model, or [`NormalizedTransmissionModel`] when the SAMMY additive
+/// background is also configured (the baseline is the OUTERMOST factor).
+///
+/// ## INTENTIONAL DEPARTURE from SAMMY
+///
+/// SAMMY's modern data-reduction path applies a SCALAR normalization plus
+/// additive backgrounds only:
+/// `T_obs = Anorm·T + BackA + BackB/√E + BackC·√E + BackD·exp(−BackF/√E)`
+/// (`cro/mnrm1.f90`, subroutine `Norm`, applied to
+/// every data type via `the/ZeroKCrossCorrections_M.f90`).  SAMMY's nearest
+/// analogue to an energy-dependent multiplicative normalization is the
+/// DORMANT legacy power-law `Anorm = Anrm(1) + Anrm(2)·E^Anrm(3)`
+/// (`acs/macs4.f90:440–450`, `Find_Www_Yyy`), which is not reachable from the
+/// modern reconstruction path.  This low-order ln-E polynomial baseline is a
+/// NEREIDS extension motivated by the IPTS-37432 campaign (findings A3/A5):
+/// real VENUS sample/open-beam ratios sit a few % from unity with smooth
+/// energy dependence, and freeing the SAMMY `Anorm` together with temperature
+/// and density is degenerate on such data (observed: T → 4471 K, n +76 %,
+/// χ²/ν 932, with no warning).  The bounded multiplicative form fitted
+/// jointly with temperature at fixed density produced χ²/ν ≈ 2–8 across the
+/// 20-run campaign.
+///
+/// Because `b0` is exactly degenerate with `Anorm`, the pipeline rejects a
+/// free `Anorm` alongside ANY configured baseline — including a fully
+/// frozen one (see `nereids-pipeline::validate_multiplicative_baseline`).
+/// A frozen-`b0` + free-`Anorm` combination would be well-posed, but
+/// supporting it buys nothing (`Anorm` would just play `b0`'s role at a
+/// rescaled value) and splits the normalization story across two knobs;
+/// the sanctioned combination is `Anorm` held fixed.
+pub struct MultiplicativeBaselineModel<M: FitModel> {
+    /// The inner model (bare transmission, or the additive-background
+    /// wrapper when both are configured).
+    inner: M,
+    /// Precomputed `z_i = ln(E_i / E_ref)`.
+    ln_ratio: Vec<f64>,
+    /// Precomputed `z_i²`.
+    ln_ratio_sq: Vec<f64>,
+    /// Index of `b0` (mid-grid baseline value) in the parameter vector.
+    b0_index: usize,
+    /// Index of `b1` (slope per ln-E unit) in the parameter vector.
+    b1_index: usize,
+    /// Index of `b2` (curvature per ln-E² unit) in the parameter vector.
+    b2_index: usize,
+    /// Optional per-bin active mask (SAMMY EMIN/EMAX-equivalent
+    /// `fit_energy_range`, #514).  When `Some`, the positivity guard in
+    /// [`FitModel::evaluate`] is scoped to ACTIVE bins only: masked bins
+    /// contribute nothing to any mask-honouring cost function, so a
+    /// negative `B(E)` there must not reject the whole trial step — on a
+    /// wide TOF grid (|z| up to ~6–8) coefficients that are comfortably
+    /// in-bounds inside the fit window can drive `B` negative at far
+    /// out-of-window bins, and an unscoped guard would veto every such
+    /// trial (λ inflation → spurious non-convergence).  Masked bins still
+    /// emit the raw product `B·T_inner` (possibly negative), matching the
+    /// LM/joint-Poisson contract that masked-bin values are never read.
+    active_mask: Option<Vec<bool>>,
+}
+
+impl<M: FitModel> MultiplicativeBaselineModel<M> {
+    /// Create the wrapper.  `e_ref` is normally
+    /// [`baseline_reference_energy`]`(energies)`; it is passed explicitly so
+    /// result consumers can reconstruct `B(E)` with the exact same reference.
+    pub fn new(
+        inner: M,
+        energies: &[f64],
+        e_ref: f64,
+        b0_index: usize,
+        b1_index: usize,
+        b2_index: usize,
+    ) -> Self {
+        let ln_ratio: Vec<f64> = energies.iter().map(|&e| (e / e_ref).ln()).collect();
+        let ln_ratio_sq: Vec<f64> = ln_ratio.iter().map(|&z| z * z).collect();
+        Self {
+            inner,
+            ln_ratio,
+            ln_ratio_sq,
+            b0_index,
+            b1_index,
+            b2_index,
+            active_mask: None,
+        }
+    }
+
+    /// Scope the runtime positivity guard to the given active mask
+    /// (`None` = all bins active, the default).  See the `active_mask`
+    /// field doc for why masked bins must be exempt.
+    #[must_use]
+    pub fn with_active_mask(mut self, mask: Option<&[bool]>) -> Self {
+        self.active_mask = mask.map(<[bool]>::to_vec);
+        self
+    }
+
+    /// `B(E_i)` for the current parameters.
+    fn baseline_at(&self, params: &[f64], i: usize) -> f64 {
+        params[self.b0_index]
+            + params[self.b1_index] * self.ln_ratio[i]
+            + params[self.b2_index] * self.ln_ratio_sq[i]
+    }
+}
+
+impl<M: FitModel> FitModel for MultiplicativeBaselineModel<M> {
+    fn evaluate(&self, params: &[f64]) -> Result<Vec<f64>, FittingError> {
+        let t_inner = self.inner.evaluate(params)?;
+        let mut out = Vec::with_capacity(t_inner.len());
+        for (i, &t) in t_inner.iter().enumerate() {
+            let b = self.baseline_at(params, i);
+            // Positivity guard: a non-positive baseline is unphysical (the
+            // measured ratio would change sign) and would silently flip the
+            // model.  The default bounds keep B > 0 on typical windows, but a
+            // very wide TOF grid (z ≈ ±8) can drive in-bounds coefficients
+            // negative — reject the trial step instead.  Mid-iteration `Err`
+            // is a REJECTED trial in the LM (backtrack / raise λ); the config
+            // validation guarantees the initial point satisfies B(E) > 0.
+            //
+            // SCOPED to active bins (#514 review R2): a bin masked out by
+            // fit_energy_range contributes nothing to any mask-honouring
+            // cost function, so a negative B there must not veto the trial
+            // step — an unscoped guard rejected in-window-valid coefficients
+            // because of out-of-window bins, inflating λ into spurious
+            // non-convergence.  Masked bins emit the raw (possibly negative)
+            // product, which the solvers never read.
+            // A mask shorter than the grid treats out-of-range bins as
+            // ACTIVE (guarded) — the conservative default for a misused
+            // public constructor; the pipeline always builds equal-length
+            // masks from the same grid.
+            let bin_active = self
+                .active_mask
+                .as_ref()
+                .is_none_or(|m| m.get(i).copied().unwrap_or(true));
+            let positive = b.is_finite() && b > 0.0;
+            if bin_active && !positive {
+                return Err(FittingError::EvaluationFailed(format!(
+                    "multiplicative baseline B(E) = {b} is non-positive at bin {i} \
+                     (b0 + b1·z + b2·z² with z = {})",
+                    self.ln_ratio[i],
+                )));
+            }
+            out.push(b * t);
+        }
+        Ok(out)
+    }
+
+    fn analytical_jacobian(
+        &self,
+        params: &[f64],
+        free_param_indices: &[usize],
+        y_current: &[f64],
+    ) -> Option<FlatMatrix> {
+        let n_e = y_current.len();
+        let n_free = free_param_indices.len();
+
+        // Recompute T_inner once — both the baseline columns (∂/∂b_k =
+        // z^k · T_inner) and the inner-column scaling (× B) need it.
+        let t_inner = self.inner.evaluate(params).ok()?;
+
+        let baseline_set = [self.b0_index, self.b1_index, self.b2_index];
+        let inner_free_indices: Vec<usize> = free_param_indices
+            .iter()
+            .copied()
+            .filter(|idx| !baseline_set.contains(idx))
+            .collect();
+
+        // Inner Jacobian ONCE, against the inner model's own output.
+        let inner_jac = if !inner_free_indices.is_empty() {
+            self.inner
+                .analytical_jacobian(params, &inner_free_indices, &t_inner)
+        } else {
+            None
+        };
+
+        let mut inner_col_map = std::collections::HashMap::new();
+        for (col, &idx) in inner_free_indices.iter().enumerate() {
+            inner_col_map.insert(idx, col);
+        }
+
+        let mut jacobian = FlatMatrix::zeros(n_e, n_free);
+        for (col, &fp_idx) in free_param_indices.iter().enumerate() {
+            if fp_idx == self.b0_index {
+                // ∂y/∂b0 = T_inner
+                for (i, &ti) in t_inner.iter().enumerate() {
+                    *jacobian.get_mut(i, col) = ti;
+                }
+            } else if fp_idx == self.b1_index {
+                // ∂y/∂b1 = z · T_inner
+                for (i, &ti) in t_inner.iter().enumerate() {
+                    *jacobian.get_mut(i, col) = self.ln_ratio[i] * ti;
+                }
+            } else if fp_idx == self.b2_index {
+                // ∂y/∂b2 = z² · T_inner
+                for (i, &ti) in t_inner.iter().enumerate() {
+                    *jacobian.get_mut(i, col) = self.ln_ratio_sq[i] * ti;
+                }
+            } else if let Some(&inner_col) = inner_col_map.get(&fp_idx) {
+                // Inner parameter: ∂y/∂p = B(E) · ∂T_inner/∂p
+                if let Some(ref jac) = inner_jac {
+                    for i in 0..n_e {
+                        let b = self.baseline_at(params, i);
+                        *jacobian.get_mut(i, col) = b * jac.get(i, inner_col);
+                    }
+                } else {
+                    // Inner has no analytic Jacobian — FD for everything.
+                    return None;
+                }
+            } else {
+                // Unknown parameter — should not happen; fall back to FD.
+                return None;
+            }
+        }
+        Some(jacobian)
+    }
+}
+
+impl<M: FitModel> ForwardModel for MultiplicativeBaselineModel<M> {
+    fn predict(&self, params: &[f64]) -> Result<Vec<f64>, FittingError> {
+        self.evaluate(params)
+    }
+
+    fn jacobian(
+        &self,
+        params: &[f64],
+        free_param_indices: &[usize],
+        y_current: &[f64],
+    ) -> Option<Vec<Vec<f64>>> {
+        let fm = self.analytical_jacobian(params, free_param_indices, y_current)?;
+        Some(flat_matrix_to_vecs(&fm, free_param_indices.len()))
+    }
+
+    fn n_data(&self) -> usize {
+        self.ln_ratio.len()
+    }
+
+    fn n_params(&self) -> usize {
+        // Assumes the baseline coefficients occupy the HIGHEST parameter
+        // indices (the pipeline appends them last: density → temperature →
+        // energy-scale → background → baseline).  A caller that interleaves
+        // baseline indices below other parameters would under-report the
+        // vector length here — matching the sibling wrappers, which make
+        // the same layout assumption (e.g. EnergyScaleTransmissionModel
+        // over t0/l_scale).
+        self.b0_index.max(self.b1_index).max(self.b2_index) + 1
+    }
+}
+
 impl ForwardModel for EnergyScaleTransmissionModel {
     fn predict(&self, params: &[f64]) -> Result<Vec<f64>, FittingError> {
         self.evaluate(params)
@@ -4303,6 +4580,273 @@ mod tests {
                 assert!(
                     err / scale < 1e-4,
                     "Jacobian mismatch (row {i}, col {col}): FD={fd:.8}, analytical={ana:.8}"
+                );
+            }
+        }
+    }
+
+    /// Issue #635: `baseline_reference_energy` is the geometric grid midpoint.
+    #[test]
+    fn baseline_reference_energy_geometric_mid() {
+        let e = [1.0, 5.0, 100.0];
+        assert!((baseline_reference_energy(&e) - 10.0).abs() < 1e-12);
+        assert!(baseline_reference_energy(&[]).is_nan());
+    }
+
+    /// Issue #635: identity coefficients (1, 0, 0) reproduce the inner model
+    /// bit-for-bit — the wrapper must be a no-op at the default init.
+    #[test]
+    fn baseline_identity_matches_inner() {
+        let xs = vec![vec![1.0, 2.0, 3.0]];
+        let inner_ref = make_precomputed(xs.clone(), vec![0]);
+        let inner_wrap = make_precomputed(xs, vec![0]);
+
+        let energies = [4.0, 9.0, 16.0];
+        let e_ref = baseline_reference_energy(&energies);
+        let model = MultiplicativeBaselineModel::new(inner_wrap, &energies, e_ref, 1, 2, 3);
+
+        // params: [density, b0, b1, b2]
+        let params = [0.3, 1.0, 0.0, 0.0];
+        let y = model.evaluate(&params).unwrap();
+        let t_inner = inner_ref.evaluate(&params).unwrap();
+        assert_eq!(y, t_inner, "identity baseline must be bit-exact");
+    }
+
+    /// Issue #635: hand-computed `B(E)·T` with an explicit reference energy —
+    /// pins the centered ln-E basis and the coefficient order.
+    #[test]
+    fn baseline_formula_correct() {
+        let xs = vec![vec![1.0, 2.0, 3.0]];
+        let inner_ref = make_precomputed(xs.clone(), vec![0]);
+        let inner_wrap = make_precomputed(xs, vec![0]);
+
+        let energies = [4.0, 9.0, 16.0];
+        let e_ref = 8.0; // explicit, NOT the geometric mid — pins the argument
+        let model = MultiplicativeBaselineModel::new(inner_wrap, &energies, e_ref, 1, 2, 3);
+
+        let (b0, b1, b2) = (1.02, -0.03, 0.01);
+        let density = 0.3;
+        let params = [density, b0, b1, b2];
+        let y = model.evaluate(&params).unwrap();
+        let t_inner = inner_ref.evaluate(&params).unwrap();
+
+        for (i, (&yi, &ti)) in y.iter().zip(t_inner.iter()).enumerate() {
+            let z = (energies[i] / e_ref).ln();
+            let expected = (b0 + b1 * z + b2 * z * z) * ti;
+            assert!(
+                (yi - expected).abs() < 1e-12,
+                "E[{i}]: got {yi}, expected {expected}"
+            );
+        }
+    }
+
+    /// Issue #635: analytical Jacobian matches central finite differences with
+    /// every parameter free (density + b0 + b1 + b2).
+    #[test]
+    fn baseline_analytical_jacobian_matches_fd() {
+        let xs = vec![vec![1.0, 2.0, 3.0], vec![0.5, 0.5, 0.5]];
+        let inner = make_precomputed(xs, vec![0, 1]);
+
+        let energies = [4.0, 9.0, 16.0];
+        let e_ref = baseline_reference_energy(&energies);
+        // params: [density0, density1, b0, b1, b2]
+        let model = MultiplicativeBaselineModel::new(inner, &energies, e_ref, 2, 3, 4);
+
+        let params = [0.2, 0.4, 1.02, -0.03, 0.01];
+        let y = model.evaluate(&params).unwrap();
+        let free: Vec<usize> = (0..5).collect();
+
+        let jac = model
+            .analytical_jacobian(&params, &free, &y)
+            .expect("analytical_jacobian should return Some");
+        assert_eq!(jac.nrows, 3);
+        assert_eq!(jac.ncols, 5);
+
+        let h = 1e-7;
+        for (col, &p_idx) in free.iter().enumerate() {
+            let mut p_plus = params;
+            let mut p_minus = params;
+            p_plus[p_idx] += h;
+            p_minus[p_idx] -= h;
+            let y_plus = model.evaluate(&p_plus).unwrap();
+            let y_minus = model.evaluate(&p_minus).unwrap();
+            for i in 0..3 {
+                let fd = (y_plus[i] - y_minus[i]) / (2.0 * h);
+                let ana = jac.get(i, col);
+                let err = (fd - ana).abs();
+                let scale = fd.abs().max(ana.abs()).max(1e-10);
+                assert!(
+                    err / scale < 1e-4,
+                    "Jacobian mismatch (row {i}, col {col}): FD={fd:.8}, analytical={ana:.8}"
+                );
+            }
+        }
+    }
+
+    /// Issue #635: partial free sets (only density + b1) produce the correct
+    /// column subset.
+    #[test]
+    fn baseline_jacobian_partial_free() {
+        let xs = vec![vec![1.0, 2.0, 3.0]];
+        let inner = make_precomputed(xs, vec![0]);
+
+        let energies = [4.0, 9.0, 16.0];
+        let e_ref = baseline_reference_energy(&energies);
+        let model = MultiplicativeBaselineModel::new(inner, &energies, e_ref, 1, 2, 3);
+
+        // params: [density, b0, b1, b2]; only density and b1 free.
+        let params = [0.3, 1.02, -0.03, 0.01];
+        let y = model.evaluate(&params).unwrap();
+        let free = vec![0usize, 2usize];
+
+        let jac = model
+            .analytical_jacobian(&params, &free, &y)
+            .expect("should return Some for partial free");
+        assert_eq!(jac.nrows, 3);
+        assert_eq!(jac.ncols, 2);
+
+        let h = 1e-7;
+        for (col, &p_idx) in free.iter().enumerate() {
+            let mut p_plus = params;
+            let mut p_minus = params;
+            p_plus[p_idx] += h;
+            p_minus[p_idx] -= h;
+            let y_plus = model.evaluate(&p_plus).unwrap();
+            let y_minus = model.evaluate(&p_minus).unwrap();
+            for i in 0..3 {
+                let fd = (y_plus[i] - y_minus[i]) / (2.0 * h);
+                let ana = jac.get(i, col);
+                let err = (fd - ana).abs();
+                let scale = fd.abs().max(ana.abs()).max(1e-10);
+                assert!(
+                    err / scale < 1e-4,
+                    "Jacobian mismatch (row {i}, col {col}): FD={fd:.8}, analytical={ana:.8}"
+                );
+            }
+        }
+    }
+
+    /// Issue #635: the STACKED composition the pipeline builds — baseline
+    /// wrapping the additive-background wrapper — chains both Jacobians
+    /// correctly (verified against central FD over all 8 parameters).
+    #[test]
+    fn baseline_stacked_on_normalized_jacobian_matches_fd() {
+        let xs = vec![vec![1.0, 2.0, 3.0]];
+        let inner = make_precomputed(xs, vec![0]);
+
+        let energies = [4.0, 9.0, 16.0];
+        let e_ref = baseline_reference_energy(&energies);
+        // params: [density, Anorm, BackA, BackB, BackC, b0, b1, b2]
+        let bg = NormalizedTransmissionModel::new(inner, &energies, 1, 2, 3, 4);
+        let model = MultiplicativeBaselineModel::new(bg, &energies, e_ref, 5, 6, 7);
+
+        let params = [0.3, 0.98, 0.01, 0.02, 0.005, 1.02, -0.03, 0.01];
+        let y = model.evaluate(&params).unwrap();
+        let free: Vec<usize> = (0..8).collect();
+
+        let jac = model
+            .analytical_jacobian(&params, &free, &y)
+            .expect("stacked analytical_jacobian should return Some");
+        assert_eq!(jac.nrows, 3);
+        assert_eq!(jac.ncols, 8);
+
+        let h = 1e-7;
+        for (col, &p_idx) in free.iter().enumerate() {
+            let mut p_plus = params;
+            let mut p_minus = params;
+            p_plus[p_idx] += h;
+            p_minus[p_idx] -= h;
+            let y_plus = model.evaluate(&p_plus).unwrap();
+            let y_minus = model.evaluate(&p_minus).unwrap();
+            for i in 0..3 {
+                let fd = (y_plus[i] - y_minus[i]) / (2.0 * h);
+                let ana = jac.get(i, col);
+                let err = (fd - ana).abs();
+                let scale = fd.abs().max(ana.abs()).max(1e-10);
+                assert!(
+                    err / scale < 1e-4,
+                    "stacked Jacobian mismatch (row {i}, col {col}): \
+                     FD={fd:.8}, analytical={ana:.8}"
+                );
+            }
+        }
+    }
+
+    /// Issue #635: a non-positive B(E) at any bin rejects the evaluation —
+    /// the positivity guard fires on wide grids where in-bounds coefficients
+    /// can drive the polynomial negative.
+    #[test]
+    fn baseline_evaluate_rejects_nonpositive_b() {
+        let xs = vec![vec![1.0; 5]];
+        let inner = make_precomputed(xs, vec![0]);
+
+        // Very wide grid: z spans ±~6.9 around the geometric mid.
+        let energies = [1e-3, 1e-1, 1.0, 1e1, 1e3];
+        let e_ref = baseline_reference_energy(&energies);
+        let model = MultiplicativeBaselineModel::new(inner, &energies, e_ref, 1, 2, 3);
+
+        // In-bounds-magnitude coefficients that go negative at the grid edge:
+        // B(z=-6.9) = 0.9 - 0.05·(-6.9) ... use b2 to force it negative.
+        let params = [0.3, 0.9, 0.0, -0.05];
+        let err = model.evaluate(&params);
+        assert!(
+            err.is_err(),
+            "B(E) <= 0 at the grid edge must be rejected, got {err:?}"
+        );
+        // Sanity: identity still evaluates on the same grid.
+        assert!(model.evaluate(&[0.3, 1.0, 0.0, 0.0]).is_ok());
+    }
+
+    /// Review R2: the positivity guard is scoped to ACTIVE bins.  The same
+    /// in-bounds coefficients that go negative only at masked-out grid-edge
+    /// bins must NOT reject the trial step when those bins are excluded by
+    /// the fit-energy-range mask — an unscoped guard vetoed in-window-valid
+    /// steps and inflated λ into spurious non-convergence.
+    #[test]
+    fn baseline_positivity_guard_scoped_to_active_mask() {
+        let xs = vec![vec![1.0; 5]];
+        let energies = [1e-3, 1e-1, 1.0, 1e1, 1e3];
+        let e_ref = baseline_reference_energy(&energies);
+        // Same coefficients as baseline_evaluate_rejects_nonpositive_b:
+        // B < 0 only at the outer bins (|z| ≈ 6.9).
+        let params = [0.3, 0.9, 0.0, -0.05];
+
+        // Unmasked control (non-vacuity): the guard fires.
+        let unmasked = MultiplicativeBaselineModel::new(
+            make_precomputed(xs.clone(), vec![0]),
+            &energies,
+            e_ref,
+            1,
+            2,
+            3,
+        );
+        assert!(unmasked.evaluate(&params).is_err());
+
+        // Mask out the offending edge bins: evaluation succeeds and the
+        // ACTIVE bins carry the expected positive product.
+        let mask = [false, true, true, true, false];
+        let masked = MultiplicativeBaselineModel::new(
+            make_precomputed(xs, vec![0]),
+            &energies,
+            e_ref,
+            1,
+            2,
+            3,
+        )
+        .with_active_mask(Some(&mask));
+        let out = masked
+            .evaluate(&params)
+            .expect("negative B at MASKED bins must not reject the step");
+        for (i, (&y, &active)) in out.iter().zip(mask.iter()).enumerate() {
+            if active {
+                let z = (energies[i] / e_ref).ln();
+                let b = 0.9 - 0.05 * z * z;
+                assert!(b > 0.0, "test setup: active bin {i} must have B > 0");
+                let t = (-0.3f64).exp();
+                assert!(
+                    (y - b * t).abs() < 1e-12,
+                    "active bin {i}: y = {y}, expected {}",
+                    b * t
                 );
             }
         }

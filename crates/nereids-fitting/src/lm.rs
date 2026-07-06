@@ -183,6 +183,25 @@ impl<M: FitModel + ?Sized> FitModel for &M {
     }
 }
 
+/// Blanket implementation for boxed models, forwarding to the underlying
+/// implementation.  Lets the pipeline stack optional wrapper models linearly
+/// (`model = Box::new(Wrapper::new(model, …))`) instead of enumerating every
+/// wrapper combination in nested match arms (issue #635).
+impl<M: FitModel + ?Sized> FitModel for Box<M> {
+    fn evaluate(&self, params: &[f64]) -> Result<Vec<f64>, FittingError> {
+        (**self).evaluate(params)
+    }
+
+    fn analytical_jacobian(
+        &self,
+        params: &[f64],
+        free_param_indices: &[usize],
+        y_current: &[f64],
+    ) -> Option<FlatMatrix> {
+        (**self).analytical_jacobian(params, free_param_indices, y_current)
+    }
+}
+
 /// Compute weighted chi-squared: Σ [(y_obs - y_model)² / σ²].
 ///
 /// When `active_mask` is `Some(m)`, bins where `m[i]` is `false` are

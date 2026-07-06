@@ -195,6 +195,17 @@ pub struct ProjectSnapshot {
     /// Per-pixel background [A, B, C] maps (background fitting).
     /// Stored as 3 separate Array2 maps (one per coefficient).
     pub background_maps: Option<[Array2<f64>; 3]>,
+    /// Global multiplicative-baseline coefficients [b0, b1, b2] from the
+    /// spatial two-stage fit (issue #635).  `None` when no baseline was
+    /// fitted or in per-pixel mode.
+    pub baseline_global: Option<[f64; 3]>,
+    /// Baseline reference energy E_ref (eV) of the centered ln(E/E_ref)
+    /// basis — persisted so the overlay reconstructs B(E) with the exact
+    /// reference the fit used.  `None` when no baseline was fitted.
+    pub baseline_e_ref_ev: Option<f64>,
+    /// Per-pixel baseline coefficient maps [b0, b1, b2] (issue #635,
+    /// per-pixel mode).  Stored like `background_maps`.
+    pub baseline_maps: Option<[Array2<f64>; 3]>,
 
     // -- results/single_fit (single-pixel fit, optional) --
     pub single_fit_densities: Option<Vec<f64>>,
@@ -210,6 +221,11 @@ pub struct ProjectSnapshot {
     pub single_fit_anorm: Option<f64>,
     /// Fitted background [BackA, BackB, BackC] from single-pixel fit.
     pub single_fit_background: Option<[f64; 3]>,
+    /// Fitted multiplicative-baseline [b0, b1, b2] from single-pixel fit
+    /// (issue #635).  `None` when the baseline was not enabled.
+    pub single_fit_baseline: Option<[f64; 3]>,
+    /// Baseline reference energy E_ref (eV) for the single-pixel fit.
+    pub single_fit_baseline_e_ref_ev: Option<f64>,
 
     // -- flags --
     /// True when per-bin uncertainty was estimated (not measured).
@@ -219,6 +235,13 @@ pub struct ProjectSnapshot {
     pub lm_background_enabled: Option<bool>,
     /// Whether KL background fitting (b0 + b1/sqrt(E)) is enabled.
     pub kl_background_enabled: Option<bool>,
+    /// Whether the bounded multiplicative baseline (#635) is enabled.
+    /// This flag SELECTS the fit model (attaches the baseline and holds
+    /// Anorm fixed), so it must round-trip like every sibling solver
+    /// flag — without it a reloaded project displays baseline results
+    /// while a refit silently runs a different model.  `None` for
+    /// pre-#635 files; restore-side defaults to false.
+    pub baseline_enabled: Option<bool>,
     /// Counts-KL proton-charge ratio `c = Q_s / Q_ob`.
     /// `None` for project files predating the field; restore-side
     /// defaults to 1.0.
@@ -311,6 +334,9 @@ impl Default for ProjectSnapshot {
             result_isotope_labels: None,
             anorm_map: None,
             background_maps: None,
+            baseline_global: None,
+            baseline_e_ref_ev: None,
+            baseline_maps: None,
             single_fit_densities: None,
             single_fit_uncertainties: None,
             single_fit_chi_squared: None,
@@ -322,9 +348,12 @@ impl Default for ProjectSnapshot {
             single_fit_labels: None,
             single_fit_anorm: None,
             single_fit_background: None,
+            single_fit_baseline: None,
+            single_fit_baseline_e_ref_ev: None,
             uncertainty_is_estimated: None,
             lm_background_enabled: None,
             kl_background_enabled: None,
+            baseline_enabled: None,
             kl_c_ratio: None,
             kl_enable_polish_override: None,
             endf_cache: vec![],
@@ -646,6 +675,9 @@ fn write_config(file: &hdf5::File, snap: &ProjectSnapshot) -> Result<(), IoError
     }
     if let Some(lm_bg) = snap.lm_background_enabled {
         write_bool_attr(&solver, "lm_background_enabled", lm_bg)?;
+    }
+    if let Some(bl) = snap.baseline_enabled {
+        write_bool_attr(&solver, "baseline_enabled", bl)?;
     }
     if let Some(kl_bg) = snap.kl_background_enabled {
         write_bool_attr(&solver, "kl_background_enabled", kl_bg)?;
@@ -998,6 +1030,39 @@ fn write_results(file: &hdf5::File, snap: &ProjectSnapshot) -> Result<(), IoErro
         }
     }
 
+    // Issue #635: multiplicative-baseline outputs.  The overlay rebuilds
+    // B(E) from these on project load — dropping them would silently render
+    // a different scientific model than the one that was fitted.
+    if let Some(bl) = snap.baseline_global {
+        results
+            .new_dataset::<f64>()
+            .shape([3])
+            .create("baseline_global")
+            .and_then(|ds| ds.write_raw(&bl))
+            .map_err(|e| hdf5_err("/results/baseline_global", e))?;
+    }
+    if let Some(e_ref) = snap.baseline_e_ref_ev {
+        write_f64_attr(&results, "baseline_e_ref_ev", e_ref)?;
+    }
+    if let Some(ref bl_maps) = snap.baseline_maps {
+        let bl_grp = results
+            .create_group("baseline")
+            .map_err(|e| hdf5_err("create /results/baseline", e))?;
+        for (i, &label) in ["b0", "b1", "b2"].iter().enumerate() {
+            let m = &bl_maps[i];
+            let shape = [m.shape()[0], m.shape()[1]];
+            let data: Vec<f64> = m.iter().copied().collect();
+            bl_grp
+                .new_dataset::<f64>()
+                .shape(shape)
+                .chunk(shape)
+                .deflate(4)
+                .create(label)
+                .and_then(|ds| ds.write_raw(&data))
+                .map_err(|e| hdf5_err(&format!("/results/baseline/{label}"), e))?;
+        }
+    }
+
     if let Some(nc) = snap.n_converged {
         write_u64_attr(&results, "n_converged", nc as u64)?;
     }
@@ -1082,6 +1147,16 @@ fn write_results(file: &hdf5::File, snap: &ProjectSnapshot) -> Result<(), IoErro
                 .create("background")
                 .and_then(|ds| ds.write_raw(&bg))
                 .map_err(|e| hdf5_err("/results/single_fit/background", e))?;
+        }
+        if let Some(bl) = snap.single_fit_baseline {
+            sf.new_dataset::<f64>()
+                .shape([3])
+                .create("baseline")
+                .and_then(|ds| ds.write_raw(&bl))
+                .map_err(|e| hdf5_err("/results/single_fit/baseline", e))?;
+        }
+        if let Some(e_ref) = snap.single_fit_baseline_e_ref_ev {
+            write_f64_attr(&sf, "baseline_e_ref_ev", e_ref)?;
         }
     }
 
@@ -1351,6 +1426,7 @@ fn read_config(file: &hdf5::File, snap: &mut ProjectSnapshot) -> Result<(), IoEr
     };
     snap.uncertainty_is_estimated = read_bool_attr(&solver, "uncertainty_is_estimated").ok();
     snap.lm_background_enabled = read_bool_attr(&solver, "lm_background_enabled").ok();
+    snap.baseline_enabled = read_bool_attr(&solver, "baseline_enabled").ok();
     snap.kl_background_enabled = read_bool_attr(&solver, "kl_background_enabled").ok();
     snap.kl_c_ratio = read_f64_attr(&solver, "kl_c_ratio").ok();
     snap.kl_enable_polish_override =
@@ -1765,30 +1841,111 @@ fn read_results(file: &hdf5::File, snap: &mut ProjectSnapshot) -> Result<(), IoE
         }
     }
 
-    // D-11/D-21: Background maps
+    // D-11/D-21: Background maps.  FAIL CLOSED on a partial or malformed
+    // group (review R3): save_project writes all three datasets atomically,
+    // so a group that exists with a missing or mis-shaped member is a
+    // truncated / corrupted file — silently loading it as "no background"
+    // would display a different scientific model than the one fitted.
     if let Ok(bg_grp) = results.group("background") {
         let mut maps: [Option<Array2<f64>>; 3] = [None, None, None];
         for (i, &label) in ["back_a", "back_b", "back_c"].iter().enumerate() {
-            if let Ok(ds) = bg_grp.dataset(label) {
-                let shape = ds.shape();
-                if shape.len() == 2 {
-                    let data: Vec<f64> = ds
-                        .read_raw()
-                        .map_err(|e| hdf5_err(&format!("/results/background/{label}"), e))?;
-                    maps[i] = Some(Array2::from_shape_vec((shape[0], shape[1]), data).map_err(
-                        |e| hdf5_err(&format!("/results/background/{label} reshape"), e),
-                    )?);
-                }
+            let ds = bg_grp.dataset(label).map_err(|e| {
+                hdf5_err(
+                    &format!(
+                        "/results/background exists but /results/background/{label} is missing \
+                         (truncated or corrupted project file)"
+                    ),
+                    e,
+                )
+            })?;
+            let shape = ds.shape();
+            if shape.len() != 2 {
+                return Err(IoError::Hdf5Error(format!(
+                    "/results/background/{label}: expected a 2-D map, got {} dimension(s) \
+                     (corrupted project file)",
+                    shape.len()
+                )));
             }
+            let data: Vec<f64> = ds
+                .read_raw()
+                .map_err(|e| hdf5_err(&format!("/results/background/{label}"), e))?;
+            maps[i] = Some(
+                Array2::from_shape_vec((shape[0], shape[1]), data)
+                    .map_err(|e| hdf5_err(&format!("/results/background/{label} reshape"), e))?,
+            );
         }
-        // Only set if all three are present.
-        if maps.iter().all(|m| m.is_some()) {
-            snap.background_maps = Some([
-                maps[0].take().unwrap(),
-                maps[1].take().unwrap(),
-                maps[2].take().unwrap(),
-            ]);
+        snap.background_maps = Some([
+            maps[0].take().unwrap(),
+            maps[1].take().unwrap(),
+            maps[2].take().unwrap(),
+        ]);
+    }
+
+    // Issue #635: multiplicative-baseline outputs.  FAIL CLOSED on
+    // present-but-malformed data (review R3): the GUI overlay rebuilds
+    // B(E) from these fields, so silently dropping a truncated baseline
+    // would render a different scientific model than the one fitted —
+    // the exact silent-model-change class the persistence fix closed.
+    // ABSENCE stays legal (pre-#635 files, baseline-off fits).
+    if let Ok(ds) = results.dataset("baseline_global") {
+        let data: Vec<f64> = ds
+            .read_raw()
+            .map_err(|e| hdf5_err("/results/baseline_global", e))?;
+        if data.len() != 3 {
+            return Err(IoError::Hdf5Error(format!(
+                "/results/baseline_global: expected 3 coefficients, got {} \
+                 (corrupted project file)",
+                data.len()
+            )));
         }
+        snap.baseline_global = Some([data[0], data[1], data[2]]);
+    }
+    if let Ok(bl_grp) = results.group("baseline") {
+        let mut maps: [Option<Array2<f64>>; 3] = [None, None, None];
+        for (i, &label) in ["b0", "b1", "b2"].iter().enumerate() {
+            let ds = bl_grp.dataset(label).map_err(|e| {
+                hdf5_err(
+                    &format!(
+                        "/results/baseline exists but /results/baseline/{label} is missing \
+                         (truncated or corrupted project file)"
+                    ),
+                    e,
+                )
+            })?;
+            let shape = ds.shape();
+            if shape.len() != 2 {
+                return Err(IoError::Hdf5Error(format!(
+                    "/results/baseline/{label}: expected a 2-D map, got {} dimension(s) \
+                     (corrupted project file)",
+                    shape.len()
+                )));
+            }
+            let data: Vec<f64> = ds
+                .read_raw()
+                .map_err(|e| hdf5_err(&format!("/results/baseline/{label}"), e))?;
+            maps[i] = Some(
+                Array2::from_shape_vec((shape[0], shape[1]), data)
+                    .map_err(|e| hdf5_err(&format!("/results/baseline/{label} reshape"), e))?,
+            );
+        }
+        snap.baseline_maps = Some([
+            maps[0].take().unwrap(),
+            maps[1].take().unwrap(),
+            maps[2].take().unwrap(),
+        ]);
+    }
+    snap.baseline_e_ref_ev = read_f64_attr(&results, "baseline_e_ref_ev").ok();
+    // Coefficients without the reference energy are unreconstructable —
+    // B(E) needs the exact E_ref the fit used.
+    if (snap.baseline_global.is_some() || snap.baseline_maps.is_some())
+        && snap.baseline_e_ref_ev.is_none()
+    {
+        return Err(IoError::Hdf5Error(
+            "baseline coefficients are present but the baseline_e_ref_ev \
+             attribute is missing — B(E) cannot be reconstructed (corrupted \
+             project file)"
+                .into(),
+        ));
     }
 
     // Scalar attrs
@@ -1838,6 +1995,28 @@ fn read_results(file: &hdf5::File, snap: &mut ProjectSnapshot) -> Result<(), IoE
             if data.len() == 3 {
                 snap.single_fit_background = Some([data[0], data[1], data[2]]);
             }
+        }
+        if let Ok(ds) = sf.dataset("baseline") {
+            let data: Vec<f64> = ds
+                .read_raw()
+                .map_err(|e| hdf5_err("/results/single_fit/baseline", e))?;
+            if data.len() != 3 {
+                return Err(IoError::Hdf5Error(format!(
+                    "/results/single_fit/baseline: expected 3 coefficients, got {} \
+                     (corrupted project file)",
+                    data.len()
+                )));
+            }
+            snap.single_fit_baseline = Some([data[0], data[1], data[2]]);
+        }
+        snap.single_fit_baseline_e_ref_ev = read_f64_attr(&sf, "baseline_e_ref_ev").ok();
+        if snap.single_fit_baseline.is_some() && snap.single_fit_baseline_e_ref_ev.is_none() {
+            return Err(IoError::Hdf5Error(
+                "/results/single_fit/baseline is present but its baseline_e_ref_ev \
+                 attribute is missing — B(E) cannot be reconstructed (corrupted \
+                 project file)"
+                    .into(),
+            ));
         }
     }
 
@@ -1988,6 +2167,9 @@ mod tests {
             result_isotope_labels: None,
             anorm_map: None,
             background_maps: None,
+            baseline_global: None,
+            baseline_e_ref_ev: None,
+            baseline_maps: None,
             single_fit_densities: None,
             single_fit_uncertainties: None,
             single_fit_chi_squared: None,
@@ -1999,9 +2181,12 @@ mod tests {
             single_fit_labels: None,
             single_fit_anorm: None,
             single_fit_background: None,
+            single_fit_baseline: None,
+            single_fit_baseline_e_ref_ev: None,
             uncertainty_is_estimated: Some(false),
             lm_background_enabled: None,
             kl_background_enabled: None,
+            baseline_enabled: None,
             kl_c_ratio: None,
             kl_enable_polish_override: None,
             endf_cache: vec![],
@@ -2798,6 +2983,142 @@ mod tests {
         assert_eq!(loaded.single_fit_pixel, Some((10, 20)));
         let expected_labels: Vec<String> = vec!["U-238".into(), "Fe-56".into()];
         assert_eq!(loaded.single_fit_labels, Some(expected_labels));
+    }
+
+    /// Issue #635 (review R1 P1): baseline outputs must survive
+    /// save/load — the GUI overlay rebuilds B(E) from them, so dropping
+    /// them silently renders a different scientific model on reload.
+    #[test]
+    fn test_roundtrip_baseline_fields() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("baseline.nrd.h5");
+        let mut snap = minimal_snapshot();
+        snap.baseline_global = Some([1.02, -0.03, 0.01]);
+        snap.baseline_e_ref_ev = Some(3.3166247903554);
+        snap.baseline_maps = Some([
+            Array2::from_elem((2, 2), 1.02),
+            Array2::from_elem((2, 2), -0.03),
+            Array2::from_elem((2, 2), 0.01),
+        ]);
+        snap.single_fit_densities = Some(vec![0.002]);
+        snap.single_fit_baseline = Some([1.019, -0.029, 0.011]);
+        snap.single_fit_baseline_e_ref_ev = Some(3.3166247903554);
+        // The flag that PRODUCED these results must round-trip too (R4):
+        // arrays without the configuration mean a reloaded project refits
+        // a silently different model.
+        snap.baseline_enabled = Some(true);
+        save_project(&path, &snap).unwrap();
+
+        let loaded = load_project(&path).unwrap();
+        assert_eq!(loaded.baseline_enabled, Some(true));
+        assert_eq!(loaded.baseline_global, Some([1.02, -0.03, 0.01]));
+        assert!((loaded.baseline_e_ref_ev.unwrap() - 3.3166247903554).abs() < 1e-12);
+        let maps = loaded.baseline_maps.as_ref().expect("baseline maps");
+        assert_eq!(maps[0][[0, 0]], 1.02);
+        assert_eq!(maps[1][[1, 1]], -0.03);
+        assert_eq!(maps[2][[0, 1]], 0.01);
+        assert_eq!(loaded.single_fit_baseline, Some([1.019, -0.029, 0.011]));
+        assert!((loaded.single_fit_baseline_e_ref_ev.unwrap() - 3.3166247903554).abs() < 1e-12);
+
+        // Absence round-trips as None (pre-#635 files and baseline-off fits).
+        let path2 = dir.path().join("no_baseline.nrd.h5");
+        let snap2 = minimal_snapshot();
+        save_project(&path2, &snap2).unwrap();
+        let loaded2 = load_project(&path2).unwrap();
+        assert!(loaded2.baseline_global.is_none());
+        assert!(loaded2.baseline_e_ref_ev.is_none());
+        assert!(loaded2.baseline_maps.is_none());
+        assert!(loaded2.single_fit_baseline.is_none());
+        assert!(loaded2.single_fit_baseline_e_ref_ev.is_none());
+        assert!(
+            loaded2.baseline_enabled.is_none(),
+            "pre-#635 files read as None"
+        );
+    }
+
+    /// Review R3: present-but-malformed baseline data must FAIL CLOSED —
+    /// a truncated project file silently loading as "no baseline" would
+    /// display a different scientific model than the one fitted.  The
+    /// corrupted fixtures here are built by hand with the hdf5 API (NOT by
+    /// save_project) so this cannot be circular with the writer.
+    #[test]
+    fn test_malformed_baseline_fails_closed() {
+        let dir = tempfile::tempdir().unwrap();
+
+        // (a) /results/baseline group with only b0 (b1/b2 missing).
+        let path = dir.path().join("partial_maps.nrd.h5");
+        save_project(&path, &minimal_snapshot()).unwrap();
+        {
+            let f = hdf5::File::open_rw(&path).unwrap();
+            let results = f.group("results").unwrap();
+            let bl = results.create_group("baseline").unwrap();
+            bl.new_dataset::<f64>()
+                .shape([2, 2])
+                .create("b0")
+                .and_then(|ds| ds.write_raw(&[1.0f64; 4]))
+                .unwrap();
+        }
+        let err = load_project(&path).expect_err("partial baseline group must fail closed");
+        assert!(
+            err.to_string().contains("truncated or corrupted"),
+            "got: {err}"
+        );
+
+        // (b) baseline_global with the wrong length.
+        let path = dir.path().join("bad_len.nrd.h5");
+        save_project(&path, &minimal_snapshot()).unwrap();
+        {
+            let f = hdf5::File::open_rw(&path).unwrap();
+            let results = f.group("results").unwrap();
+            results
+                .new_dataset::<f64>()
+                .shape([2])
+                .create("baseline_global")
+                .and_then(|ds| ds.write_raw(&[1.0f64, 0.0]))
+                .unwrap();
+        }
+        let err = load_project(&path).expect_err("2-element baseline_global must fail closed");
+        assert!(
+            err.to_string().contains("expected 3 coefficients"),
+            "got: {err}"
+        );
+
+        // (c) coefficients present but the reference energy attribute
+        // missing: B(E) is unreconstructable.
+        let path = dir.path().join("no_eref.nrd.h5");
+        save_project(&path, &minimal_snapshot()).unwrap();
+        {
+            let f = hdf5::File::open_rw(&path).unwrap();
+            let results = f.group("results").unwrap();
+            results
+                .new_dataset::<f64>()
+                .shape([3])
+                .create("baseline_global")
+                .and_then(|ds| ds.write_raw(&[1.02f64, -0.03, 0.01]))
+                .unwrap();
+        }
+        let err = load_project(&path).expect_err("baseline without E_ref must fail closed");
+        assert!(err.to_string().contains("baseline_e_ref_ev"), "got: {err}");
+
+        // (d) same-shape sibling: a partial /results/background group
+        // (present but missing back_b/back_c) fails closed too.
+        let path = dir.path().join("partial_bg.nrd.h5");
+        save_project(&path, &minimal_snapshot()).unwrap();
+        {
+            let f = hdf5::File::open_rw(&path).unwrap();
+            let results = f.group("results").unwrap();
+            let bg = results.create_group("background").unwrap();
+            bg.new_dataset::<f64>()
+                .shape([2, 2])
+                .create("back_a")
+                .and_then(|ds| ds.write_raw(&[0.0f64; 4]))
+                .unwrap();
+        }
+        let err = load_project(&path).expect_err("partial background group must fail closed");
+        assert!(
+            err.to_string().contains("truncated or corrupted"),
+            "got: {err}"
+        );
     }
 
     #[test]
