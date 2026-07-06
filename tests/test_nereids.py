@@ -1831,6 +1831,7 @@ class TestTiffIO:
                 "n_clipped_pixels": 0,
                 "n_unrecognized_files": 0,
                 "unrecognized_examples": [],
+                "chunk_inconsistent": False,
             }
 
     def test_clip_warns(self):
@@ -1876,6 +1877,7 @@ class TestTiffIO:
                 "n_clipped_pixels": 0,
                 "n_unrecognized_files": 0,
                 "unrecognized_examples": [],
+                "chunk_inconsistent": False,
             }
 
     def test_warning_attributed_to_caller(self):
@@ -1952,6 +1954,49 @@ class TestTiffIO:
             assert info["chunks_summed"] is False
             assert info["n_unrecognized_files"] == 1
             assert info["unrecognized_examples"] == ["overview.tif"]
+
+    def test_ragged_chunks_opt_out_concatenates(self):
+        """T55: a ragged chunked folder (chunk 764 has 3 frames, chunk 765
+        has 2) is a ValueError on the default summing path — summing ragged
+        chunks would corrupt counts — but with sum_chunks=False it honors
+        the opt-out contract: it loads as the lexicographic concatenation of
+        all files (frame count = the sum of all files), emits a UserWarning
+        naming the inconsistency, and return_info sets
+        chunk_inconsistent=True instead of raising."""
+        tifffile = pytest.importorskip("tifffile")
+        h, w = 2, 3
+
+        with tempfile.TemporaryDirectory() as tmpdir:
+            for f in range(3):
+                tifffile.imwrite(
+                    os.path.join(tmpdir, f"run_764_{f:04d}.tif"),
+                    np.full((h, w), 100 + f, dtype=np.uint16),
+                )
+            for f in range(2):
+                tifffile.imwrite(
+                    os.path.join(tmpdir, f"run_765_{f:04d}.tif"),
+                    np.full((h, w), 200 + f, dtype=np.uint16),
+                )
+
+            # Default summing path: still a hard ValueError (regression guard).
+            with pytest.raises(ValueError):
+                nereids.load_tiff_folder(tmpdir)
+
+            # Opt-out: concatenation of all 5 files + inconsistency signal,
+            # never a ValueError.
+            with pytest.warns(
+                UserWarning,
+                match=r"DAQ chunks are internally inconsistent.*sum_chunks=False",
+            ):
+                arr, info = nereids.load_tiff_folder(
+                    tmpdir, sum_chunks=False, return_info=True
+                )
+
+            assert np.asarray(arr).shape == (5, h, w)
+            assert info["chunk_inconsistent"] is True
+            assert info["chunks_summed"] is False
+            assert info["n_chunks"] == 2
+            assert info["chunk_ids"] == [764, 765]
 
     def test_missing_folder_vs_not_a_directory(self):
         """T54: load_tiff_folder raises FileNotFoundError for a

@@ -856,10 +856,13 @@ def load_tiff_folder(
 
     Chunked VENUS folders (``<prefix>_<chunk>_<frame>.tif``) are detected
     automatically and summed element-wise across chunks by default
-    (``sum_chunks=True``, with a ``UserWarning`` naming the chunks);
-    ragged chunks are an error.  ``sum_chunks`` only affects folders with
-    two or more chunks — single-chunk (and non-chunk-patterned) folders
-    load identically either way.  A *mixed* folder (chunk-patterned names
+    (``sum_chunks=True``, with a ``UserWarning`` naming the chunks); ragged
+    or duplicated chunks are an error on the summing path, but with
+    ``sum_chunks=False`` they load as the lexicographic concatenation and
+    are flagged via ``chunk_inconsistent`` (with a ``UserWarning``) instead
+    of raising.  ``sum_chunks`` only affects folders with two or more
+    chunks — single-chunk (and non-chunk-patterned) folders load
+    identically either way.  A *mixed* folder (chunk-patterned names
     alongside non-conforming files) loads lexicographically with a
     ``UserWarning`` counting the files that disabled chunk detection.  The
     heuristic assumes one acquisition per folder; use ``pattern`` (or
@@ -869,8 +872,9 @@ def load_tiff_folder(
     returns ``(array, info)`` where ``info`` has keys ``n_files``,
     ``n_chunks``, ``chunk_ids``, ``chunks_summed``, ``n_clipped_pixels``,
     ``n_unrecognized_files`` (files that broke chunk detection in a mixed
-    folder; 0 otherwise), and ``unrecognized_examples`` (up to three of
-    their names).
+    folder; 0 otherwise), ``unrecognized_examples`` (up to three of their
+    names), and ``chunk_inconsistent`` (``True`` when inconsistent chunks
+    were concatenated under ``sum_chunks=False`` instead of raising).
     """
     ...
 

@@ -2225,6 +2225,21 @@ fn emit_tiff_load_warnings(
             info.unrecognized_examples.join(", "),
         ));
     }
+    if info.chunk_inconsistent {
+        // Chunk-patterned files that are internally inconsistent (ragged
+        // frame counts/sets or a duplicate (chunk, frame) pair).  With
+        // sum_chunks=True this is a ValueError; the caller passed
+        // sum_chunks=False, so the files were concatenated lexicographically
+        // verbatim instead of raising — surface that so a ragged folder that
+        // would otherwise error is not silently accepted.
+        messages.push(
+            "DAQ chunks are internally inconsistent (ragged frame counts/sets \
+             or duplicate (chunk, frame) pairs); loaded as the lexicographic \
+             concatenation of all files because sum_chunks=False — pass \
+             sum_chunks=True to make this a hard error instead"
+                .to_string(),
+        );
+    }
     if info.n_clipped_pixels > 0 {
         messages.push(format!(
             "{} negative pixel(s) clipped to 0.0 under pixel_policy=\"clip\"",
@@ -2303,7 +2318,10 @@ fn load_tiff_stack<'py>(
 /// with one common prefix, frames are ordered by numeric frame index and
 /// chunks covering identical frame ranges are summed element-wise
 /// (``sum_chunks=True``, the default).  Ragged chunks or duplicate
-/// (chunk, frame) pairs are an error — never a silent stack.  Folders not
+/// (chunk, frame) pairs are an error under the default summing path — never
+/// a silent stack; with ``sum_chunks=False`` they are instead loaded as the
+/// lexicographic concatenation (there is nothing to corrupt when not
+/// summing) and flagged via ``chunk_inconsistent`` (see below).  Folders not
 /// following the convention (or with several distinct prefixes) load in
 /// lexicographic filename order, so name legacy files with zero-padded
 /// indices (e.g., ``frame_0001.tif``, ``frame_0002.tif``, ...).  A *mixed*
@@ -2331,7 +2349,12 @@ fn load_tiff_stack<'py>(
 ///                 affects folders with **two or more** chunks:
 ///                 single-chunk (and non-chunk-patterned) folders load
 ///                 identically either way — chunk-patterned names in
-///                 numeric frame order, others lexicographically.
+///                 numeric frame order, others lexicographically.  It also
+///                 decides how *inconsistent* chunks are handled: ragged or
+///                 duplicated chunks raise ``ValueError`` with
+///                 ``sum_chunks=True`` but, with ``sum_chunks=False``, load
+///                 as the lexicographic concatenation and set
+///                 ``chunk_inconsistent`` (a ``UserWarning`` is emitted).
 ///     pixel_policy: ``"reject"`` (default) errors on negative or
 ///         non-finite pixels; ``"clip"`` clamps negatives to 0.0 (NaN
 ///         still errors); ``"allow"`` passes values through verbatim (for
@@ -2340,9 +2363,10 @@ fn load_tiff_stack<'py>(
 ///         where ``info`` is a dict with keys ``n_files``, ``n_chunks``,
 ///         ``chunk_ids``, ``chunks_summed``, ``n_clipped_pixels``,
 ///         ``n_unrecognized_files`` (files that broke chunk detection in a
-///         mixed folder; 0 otherwise), and ``unrecognized_examples`` (up to
-///         three of their names) (default ``False`` — return just the
-///         array).
+///         mixed folder; 0 otherwise), ``unrecognized_examples`` (up to
+///         three of their names), and ``chunk_inconsistent`` (``True`` when
+///         inconsistent chunks were concatenated under ``sum_chunks=False``
+///         instead of raising) (default ``False`` — return just the array).
 ///
 /// Returns:
 ///     3D numpy array with shape (n_frames, height, width), dtype float64;
@@ -2353,8 +2377,10 @@ fn load_tiff_stack<'py>(
 ///         names the chunk count and ids and the ``sum_chunks=False``
 ///         escape hatch), when a mixed folder disabled chunk detection
 ///         (the message counts the non-conforming files and names up to
-///         three), and when ``pixel_policy="clip"`` clamped one or more
-///         negative pixels (the message reports the count).
+///         three), when inconsistent chunks were concatenated under
+///         ``sum_chunks=False`` instead of raising, and when
+///         ``pixel_policy="clip"`` clamped one or more negative pixels (the
+///         message reports the count).
 ///
 /// Raises:
 ///     FileNotFoundError: If the folder does not exist, or no files match
@@ -2362,7 +2388,9 @@ fn load_tiff_stack<'py>(
 ///     NotADirectoryError: If the provided path exists but is not a
 ///         directory.
 ///     ValueError: If matched frames have inconsistent dimensions, the
-///         chunked layout is internally inconsistent, a pixel value
+///         chunked layout is internally inconsistent *and*
+///         ``sum_chunks=True`` (with ``sum_chunks=False`` an inconsistent
+///         layout is concatenated and flagged, not raised), a pixel value
 ///         violates the active policy, or ``pixel_policy`` is invalid.
 ///     IOError: For TIFF decoding errors or other I/O failures.
 #[pyfunction]
@@ -2416,6 +2444,7 @@ fn load_tiff_folder<'py>(
         d.set_item("n_clipped_pixels", info.n_clipped_pixels)?;
         d.set_item("n_unrecognized_files", info.n_unrecognized_files)?;
         d.set_item("unrecognized_examples", info.unrecognized_examples)?;
+        d.set_item("chunk_inconsistent", info.chunk_inconsistent)?;
         Ok((arr, d).into_pyobject(py)?.into_any())
     } else {
         Ok(arr.into_any())
