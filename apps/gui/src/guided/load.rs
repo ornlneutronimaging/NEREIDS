@@ -806,8 +806,12 @@ fn load_all_data(state: &mut AppState) {
             .and_then(|n| n.to_str())
             .is_some_and(|n| n.to_lowercase().ends_with("_spectra.txt"));
         if is_sidecar {
-            let n_frames = state.sample_data.as_ref().map_or(0, |d| d.shape()[0]);
-            match nereids_io::spectrum::read_tof_sidecar(path, Some(n_frames)) {
+            // Cross-check the sidecar frame count against the sample stack only
+            // when it is already loaded; with no stack yet, pass `None` so a
+            // valid sidecar parses instead of failing the count check against a
+            // spurious n_frames = 0.
+            let n_frames = state.sample_data.as_ref().map(|d| d.shape()[0]);
+            match nereids_io::spectrum::read_tof_sidecar(path, n_frames) {
                 Ok(edges) => {
                     state.spectrum_kind = nereids_io::spectrum::SpectrumValueKind::BinEdges;
                     state.spectrum_unit = nereids_io::spectrum::SpectrumUnit::TofMicroseconds;

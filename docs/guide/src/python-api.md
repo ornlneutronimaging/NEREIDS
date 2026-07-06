@@ -349,8 +349,12 @@ folder_stack, info = nereids.load_tiff_folder(
     pixel_policy="reject",  # "reject" | "clip" | "allow" (default "reject")
     return_info=True,       # also return the load-provenance dict
 )
-info["chunks_summed"]       # n_files / n_chunks / chunk_ids /
-                            # chunks_summed / n_clipped_pixels
+info["n_chunks"]            # DAQ chunks detected (1 if not chunked)
+info["chunks_summed"]       # True when they were summed element-wise
+info["n_clipped_pixels"]    # pixels clamped under pixel_policy="clip"
+# full key set: n_files, n_chunks, chunk_ids, chunks_summed,
+# n_clipped_pixels, chunk_inconsistent, n_unrecognized_files,
+# unrecognized_examples
 edges_us = nereids.read_tof_sidecar(
     "run_764/run_764_Spectra.txt",
     n_frames=folder_stack.shape[0],
