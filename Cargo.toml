@@ -47,7 +47,7 @@ numpy = "0.29"
 # Disabling defaults would hard-link libwayland and re-trigger wheel
 # vendoring (see scripts/check_wheel_policy.sh).
 eframe = { version = "0.33", features = ["persistence"] }
-egui = "0.33"
+egui = "0.34"
 egui_extras = { version = "0.33", features = ["image", "svg"] }
 egui_plot = "0.34"
 # Native file dialogs. default-features = false retires the gtk3 backend
