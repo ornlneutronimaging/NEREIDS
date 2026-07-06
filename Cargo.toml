@@ -80,7 +80,7 @@ rand = "0.9"
 # Stable-stream RNG for seeded test noise: StdRng's stream is documented
 # UNSTABLE across rand versions, so acceptance tests that pin a noise
 # realization must name a concrete algorithm (ChaCha12) instead.
-rand_chacha = "0.9"
+rand_chacha = "0.10"
 rand_distr = "0.5"
 microlp = "0.4"
 tracing = "0.1"
