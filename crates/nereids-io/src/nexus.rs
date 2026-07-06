@@ -113,8 +113,11 @@ fn tof_scale_to_us(units: Option<&str>) -> Result<f64, IoError> {
 
 /// Read a string-valued attribute from an HDF5 `Location` (Group or
 /// Dataset both deref to `Location`), returning `None` if the
-/// attribute is absent and `Err` only if the attribute exists but
-/// cannot be decoded as a UTF-8 string.
+/// attribute is absent.  Both storage conventions decode: variable-length
+/// (rustpix) and fixed-length (SNS/ADARA) strings, ASCII or UTF-8, with
+/// trailing NUL/space padding trimmed.  `Err` when the attribute exists
+/// but is not a string, is a fixed string longer than the 1024-byte read
+/// buffer, or cannot be read/decoded.
 ///
 /// Absence is detected via [`Location::attr_names`] (rather than
 /// catching any error from [`Location::attr`]) so that genuine HDF5
@@ -2205,6 +2208,17 @@ pub fn load_nexus_bank_spectrum(
         .into_iter()
         .map(|t| t * etz_to_s)
         .collect();
+    // Retention accounting must be exact (same policy as the
+    // event_index guards below): a pulse with a non-finite wall-clock
+    // time can never match a keep-interval, so its events would vanish
+    // from the counts without being tallied — fail loud instead.
+    if let Some(i) = event_time_zero.iter().position(|t| !t.is_finite()) {
+        return Err(IoError::InvalidParameter(format!(
+            "{bank}/event_time_zero[{i}] is not finite ({}); corrupt pulse \
+             times would silently exclude events from the accounting",
+            event_time_zero[i]
+        )));
+    }
     let pulse_time_offset_iso = read_string_attr(&etz_ds, "offset")?;
 
     let event_index: Vec<u64> = group
@@ -2533,6 +2547,25 @@ mod bank_tests {
         let s = load_nexus_bank_spectrum(&path, "m", &params(2, 0.0, 1000.0), None)
             .expect("fixed-ascii units must parse");
         assert_eq!(s.counts, vec![1, 1]);
+    }
+
+    #[test]
+    fn non_finite_pulse_time_fails_loud() {
+        // A NaN event_time_zero can never match a keep-interval, so its
+        // events would silently vanish from the retention accounting.
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("nanpulse.h5");
+        create_test_bank(
+            &path,
+            "m",
+            &[0.0, f64::NAN],
+            &[vec![100.0], vec![200.0]],
+            Some("us"),
+            1.0,
+        );
+        let err = load_nexus_bank_spectrum(&path, "m", &params(1, 0.0, 1000.0), None)
+            .expect_err("non-finite pulse time must error");
+        assert!(err.to_string().contains("not finite"), "{err}");
     }
 
     #[test]

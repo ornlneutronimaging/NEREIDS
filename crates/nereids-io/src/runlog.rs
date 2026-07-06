@@ -187,12 +187,16 @@ pub fn intervals_where(
             values.len()
         )));
     }
-    if times.windows(2).any(|w| {
-        matches!(
-            w[0].partial_cmp(&w[1]),
-            None | Some(std::cmp::Ordering::Greater)
-        )
-    }) {
+    // Explicit finiteness check so a single-entry log gets the same
+    // validation as longer ones (a windows(2)-only check would let a lone
+    // NaN time through, to be silently clamped by max(0.0) below).
+    if let Some(i) = times.iter().position(|t| !t.is_finite()) {
+        return Err(IoError::InvalidParameter(format!(
+            "times[{i}] is not finite ({})",
+            times[i]
+        )));
+    }
+    if times.windows(2).any(|w| w[1] < w[0]) {
         return Err(IoError::InvalidParameter(
             "times must be ascending (transition log)".to_string(),
         ));
@@ -339,6 +343,8 @@ mod tests {
         assert!(intervals_where(&[0.0], &[1.0], 10.0, Some(2.0), Some(1.0)).is_err());
         assert!(intervals_where(&[0.0], &[1.0], f64::NAN, None, None).is_err());
         assert!(intervals_where(&[10.0, 5.0], &[1.0, 1.0], 20.0, None, None).is_err());
+        // Single-entry logs get the same finiteness validation.
+        assert!(intervals_where(&[f64::NAN], &[1.0], 10.0, None, None).is_err());
     }
 
     fn create_test_daslogs(path: &std::path::Path, pv: &str, times: &[f64], values: &[f64]) {

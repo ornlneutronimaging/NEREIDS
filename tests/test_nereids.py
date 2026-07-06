@@ -4169,7 +4169,8 @@ class TestMultiplicativeBaseline:
         ), f"per-pixel b0 off truth: {b0_map}"
 
 def _create_synthetic_nxevent_bank(
-    path, pulse_times_s, events_per_pulse_us, tof_units="microsecond"
+    path, pulse_times_s, events_per_pulse_us, tof_units="microsecond",
+    etz_units="second",
 ):
     """Create a facility-schema NXevent_data bank (issue #637).
 
@@ -4197,7 +4198,8 @@ def _create_synthetic_nxevent_bank(
             "event_time_zero", data=np.asarray(pulse_times_s, dtype=np.float64)
         )
         # fixed-length ASCII attrs, exactly like SNS/ADARA facility files
-        etz.attrs["units"] = np.bytes_("second")
+        if etz_units is not None:
+            etz.attrs["units"] = np.bytes_(etz_units)
         etz.attrs["offset"] = np.bytes_("2026-06-22T19:01:07.183368667-04:00")
         bank.create_dataset("event_index", data=np.asarray(index, dtype=np.uint64))
         # f32 like real SNS files
@@ -4343,12 +4345,20 @@ class TestRunLogAndBankSpectrum:
         assert s.events_total == 0 and s.events_kept == 0
         assert list(s.counts) == [0, 0, 0, 0]
 
-    def test_missing_tof_units_is_an_error(self, tmp_path):
+    def test_missing_units_is_an_error_on_both_event_datasets(self, tmp_path):
+        # event_time_offset without units
         path = str(tmp_path / "nounits.h5")
         _create_synthetic_nxevent_bank(path, [0.0], [[250.0]], tof_units=None)
         with pytest.raises(ValueError, match="units"):
             nereids.load_nexus_bank_spectrum(
                 path, "monitor1", n_bins=2, tof_min_us=0.0, tof_max_us=1000.0
+            )
+        # event_time_zero without units (same #554 policy, separate check)
+        path2 = str(tmp_path / "nounits_etz.h5")
+        _create_synthetic_nxevent_bank(path2, [0.0], [[250.0]], etz_units=None)
+        with pytest.raises(ValueError, match="event_time_zero"):
+            nereids.load_nexus_bank_spectrum(
+                path2, "monitor1", n_bins=2, tof_min_us=0.0, tof_max_us=1000.0
             )
 
     def test_bad_keep_intervals_rejected(self, tmp_path):
