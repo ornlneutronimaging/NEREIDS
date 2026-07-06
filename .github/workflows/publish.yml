@@ -208,14 +208,14 @@ jobs:
       url: https://pypi.org/p/nereids
     steps:
       - name: Download wheels
-        uses: actions/download-artifact@v4
+        uses: actions/download-artifact@v8
         with:
           path: dist
           pattern: wheel-*
           merge-multiple: true
 
       - name: Download sdist
-        uses: actions/download-artifact@v4
+        uses: actions/download-artifact@v8
         with:
           name: sdist
           path: dist-sdist
@@ -243,7 +243,7 @@ jobs:
       url: https://pypi.org/p/nereids-gui
     steps:
       - name: Download GUI wheels
-        uses: actions/download-artifact@v4
+        uses: actions/download-artifact@v8
         with:
           path: dist
           pattern: gui-wheel-*
@@ -305,27 +305,27 @@ jobs:
       - uses: actions/checkout@v4
 
       - name: Download all wheel artifacts
-        uses: actions/download-artifact@v4
+        uses: actions/download-artifact@v8
         with:
           path: dist/wheels
           pattern: wheel-*
           merge-multiple: true
 
       - name: Download sdist
-        uses: actions/download-artifact@v4
+        uses: actions/download-artifact@v8
         with:
           name: sdist
           path: dist/wheels
 
       - name: Download GUI wheels
-        uses: actions/download-artifact@v4
+        uses: actions/download-artifact@v8
         with:
           path: dist/gui
           pattern: gui-wheel-*
           merge-multiple: true
 
       - name: Download macOS app DMG
-        uses: actions/download-artifact@v4
+        uses: actions/download-artifact@v8
         with:
           path: dist/dmg
           pattern: gui-macos-app
