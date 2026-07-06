@@ -860,9 +860,12 @@ def load_tiff_folder(
     or duplicated chunks are an error on the summing path, but with
     ``sum_chunks=False`` they load as the lexicographic concatenation and
     are flagged via ``chunk_inconsistent`` (with a ``UserWarning``) instead
-    of raising.  ``sum_chunks`` only affects folders with two or more
-    chunks — single-chunk (and non-chunk-patterned) folders load
-    identically either way.  A *mixed* folder (chunk-patterned names
+    of raising.  ``sum_chunks`` otherwise only affects folders with two
+    or more chunks — a *consistent* single-chunk (or non-chunk-patterned)
+    folder loads identically either way; an internally inconsistent one
+    (e.g. an accidental ``.tif``/``.tiff`` duplicate) still raises under
+    ``sum_chunks=True`` but concatenates under ``sum_chunks=False``.  A
+    *mixed* folder (chunk-patterned names
     alongside non-conforming files) loads lexicographically with a
     ``UserWarning`` counting the files that disabled chunk detection.  The
     heuristic assumes one acquisition per folder; use ``pattern`` (or

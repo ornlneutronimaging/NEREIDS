@@ -2346,10 +2346,11 @@ fn load_tiff_stack<'py>(
 ///     sum_chunks: Sum DAQ chunks element-wise when a chunked folder is
 ///                 detected (default ``True``).  ``False`` loads the legacy
 ///                 lexicographic concatenation of all files.  The flag only
-///                 affects folders with **two or more** chunks:
-///                 single-chunk (and non-chunk-patterned) folders load
-///                 identically either way — chunk-patterned names in
-///                 numeric frame order, others lexicographically.  It also
+///                 affects folders with **two or more** chunks: a
+///                 *consistent* single-chunk (or non-chunk-patterned)
+///                 folder loads identically either way — chunk-patterned
+///                 names in numeric frame order, others lexicographically.
+///                 It also
 ///                 decides how *inconsistent* chunks are handled: ragged or
 ///                 duplicated chunks raise ``ValueError`` with
 ///                 ``sum_chunks=True`` but, with ``sum_chunks=False``, load
