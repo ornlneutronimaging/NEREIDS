@@ -2961,6 +2961,84 @@ class TestFixDensities:
             f"got {r.temperature_k_unc}"
         )
 
+    def test_scale_by_chi2_inflates_counts_uncertainty(self, u238_data):
+        """Issue #638: ``scale_by_chi2=True`` inflates the covariance-only
+        uncertainties by exactly ``sqrt(deviance_per_dof)`` on the counts-KL
+        (joint-Poisson) path, and ``scale_by_chi2=False`` reproduces the default
+        (no regression)."""
+        energies = np.linspace(1.0, 30.0, 300)
+        true_density = 8.0e-4
+        true_temp = 350.0
+        flux = 5000.0
+        t_1d = np.asarray(
+            nereids.forward_model(
+                energies, [(u238_data, true_density)], temperature_k=true_temp
+            )
+        )
+        rng = np.random.default_rng(20260706)
+        open_beam = np.maximum(
+            rng.poisson(np.full_like(t_1d, flux)).astype(float), 1.0
+        )
+        sample = rng.poisson(flux * t_1d).astype(float)
+
+        def run(scale):
+            return nereids.fit_counts_spectrum_typed(
+                sample_counts=sample,
+                open_beam_counts=open_beam,
+                energies=energies,
+                isotopes=[(u238_data, true_density)],
+                solver="kl",
+                c=1.0,
+                temperature_k=300.0,
+                fit_temperature=True,
+                max_iter=200,
+                scale_by_chi2=scale,
+            )
+
+        unscaled = run(False)
+        scaled = run(True)
+        assert bool(unscaled.converged) and bool(scaled.converged)
+
+        # The flag only rescales the post-convergence covariance, so the fit
+        # itself (parameters, deviance) is identical between the two runs.
+        dpd = unscaled.deviance_per_dof
+        assert dpd is not None and np.isfinite(dpd) and dpd > 0.0, (
+            f"counts-KL must report a valid deviance_per_dof, got {dpd}"
+        )
+        factor = float(np.sqrt(dpd))
+        # reduced_chi_squared mirrors deviance_per_dof on this path.
+        assert float(unscaled.reduced_chi_squared) == pytest.approx(dpd, rel=1e-9)
+
+        # Temperature σ scales by exactly sqrt(deviance_per_dof).
+        t_un = float(unscaled.temperature_k_unc)
+        t_sc = float(scaled.temperature_k_unc)
+        assert t_sc == pytest.approx(t_un * factor, rel=1e-6), (
+            f"σ_T: scaled {t_sc} must equal unscaled {t_un} × {factor}"
+        )
+
+        # Free-density σ scales by the same factor.
+        d_un = float(unscaled.uncertainties[0])
+        d_sc = float(scaled.uncertainties[0])
+        assert np.isfinite(d_un) and d_un > 0.0
+        assert d_sc == pytest.approx(d_un * factor, rel=1e-6)
+
+        # No regression: scale_by_chi2=False (the default) reproduces a plain
+        # flag-absent fit bit-for-bit.
+        default = nereids.fit_counts_spectrum_typed(
+            sample_counts=sample,
+            open_beam_counts=open_beam,
+            energies=energies,
+            isotopes=[(u238_data, true_density)],
+            solver="kl",
+            c=1.0,
+            temperature_k=300.0,
+            fit_temperature=True,
+            max_iter=200,
+        )
+        assert float(default.temperature_k_unc) == t_un, (
+            "default (flag absent) must equal scale_by_chi2=False"
+        )
+
     def test_fix_densities_spatial_map_holds_density(self, u238_data):
         """``spatial_map_typed`` must freeze densities per pixel: the frozen
         density map stays bit-exactly at the (offset) seed instead of fitting

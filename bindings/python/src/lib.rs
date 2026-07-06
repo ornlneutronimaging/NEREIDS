@@ -4732,6 +4732,12 @@ fn spatial_result_to_py(
 ///         baseline ONCE on the aggregated mean spectrum and freezes it for
 ///         every pixel (stage-1 non-convergence is a hard error); False
 ///         fits a baseline per pixel and populates ``baseline_maps``.
+///     scale_by_chi2: When True, inflate the covariance-only uncertainties
+///         (incl. ``temperature_uncertainty_map``) by ``sqrt(chi2/dof)`` at
+///         convergence for the Poisson-KL / joint-Poisson paths — the
+///         inverse-Fisher lower bound becomes a goodness-of-fit-scaled
+///         estimate. No-op on the already-chi2-scaled LM transmission path.
+///         Default False (issue #638).
 ///
 /// Returns:
 ///     SpatialResult with density_maps, chi_squared_map, converged_map, etc.
@@ -4780,6 +4786,7 @@ fn spatial_result_to_py(
     b1_bounds = None,
     b2_bounds = None,
     baseline_global = true,
+    scale_by_chi2 = false,
 ))]
 #[allow(clippy::too_many_arguments)]
 fn py_spatial_map_typed<'py>(
@@ -4829,6 +4836,7 @@ fn py_spatial_map_typed<'py>(
     b1_bounds: Option<(f64, f64)>,
     b2_bounds: Option<(f64, f64)>,
     baseline_global: bool,
+    scale_by_chi2: bool,
 ) -> PyResult<PySpatialResult> {
     // Validate mutual exclusivity
     let has_isotopes = isotopes.is_some();
@@ -4960,6 +4968,9 @@ fn py_spatial_map_typed<'py>(
     // (`is_counts_input` computed earlier for V1 validation.)
     let solver_config = parse_solver_config(solver, is_counts_input, max_iter)?;
     config = config.with_solver(solver_config);
+
+    // Issue #638: χ²-scaled uncertainties (no-op on the LM transmission path).
+    config = config.with_scale_by_chi2(scale_by_chi2);
 
     // Temperature fitting
     if fit_temperature {
@@ -5225,6 +5236,7 @@ fn py_spatial_map_typed<'py>(
     b0_bounds = None,
     b1_bounds = None,
     b2_bounds = None,
+    scale_by_chi2 = false,
 ))]
 fn py_fit_counts_spectrum_typed<'py>(
     py: Python<'py>,
@@ -5273,6 +5285,7 @@ fn py_fit_counts_spectrum_typed<'py>(
     b0_bounds: Option<(f64, f64)>,
     b1_bounds: Option<(f64, f64)>,
     b2_bounds: Option<(f64, f64)>,
+    scale_by_chi2: bool,
 ) -> PyResult<PyFitResult> {
     use nereids_pipeline::pipeline::{
         CountsBackgroundConfig, InputData, UnifiedFitConfig, fit_spectrum_typed,
@@ -5400,6 +5413,8 @@ fn py_fit_counts_spectrum_typed<'py>(
     };
 
     config = config.with_solver(parse_solver_config(solver, true, max_iter)?);
+    // Issue #638: χ²-scaled uncertainties (no-op on the LM transmission path).
+    config = config.with_scale_by_chi2(scale_by_chi2);
     if fit_temperature {
         config = config.with_fit_temperature(true);
     }
@@ -5972,6 +5987,7 @@ fn apply_baseline(
     b0_bounds = None,
     b1_bounds = None,
     b2_bounds = None,
+    scale_by_chi2 = false,
 ))]
 fn py_fit_spectrum_typed<'py>(
     py: Python<'py>,
@@ -6013,6 +6029,7 @@ fn py_fit_spectrum_typed<'py>(
     b0_bounds: Option<(f64, f64)>,
     b1_bounds: Option<(f64, f64)>,
     b2_bounds: Option<(f64, f64)>,
+    scale_by_chi2: bool,
 ) -> PyResult<PyFitResult> {
     use nereids_pipeline::pipeline::{InputData, fit_spectrum_typed};
 
@@ -6121,6 +6138,12 @@ fn py_fit_spectrum_typed<'py>(
     // so "auto" always resolves to LM (the signature default is "lm" to match).
     let solver_config = parse_solver_config(solver, false, max_iter)?;
     config = config.with_solver(solver_config);
+
+    // Issue #638: χ²-scaled uncertainties. This function's default solver
+    // resolves to the LM transmission path, which is already χ²-scaled, so the
+    // flag is a no-op there; it only takes effect if a Poisson-KL solver is
+    // explicitly selected for transmission input.
+    config = config.with_scale_by_chi2(scale_by_chi2);
 
     // Temperature fitting
     if fit_temperature {

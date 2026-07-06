@@ -376,6 +376,12 @@ pub struct UnifiedFitConfig {
     initial_densities: Vec<f64>,
     fit_temperature: bool,
     compute_covariance: bool,
+    /// Inflate covariance-only uncertainties by `sqrt(χ²/dof)` at convergence
+    /// (issue #638). Applies only to the raw-covariance solver paths (Poisson-KL,
+    /// joint-Poisson); the LM transmission path is already χ²-scaled, so the flag
+    /// is a no-op there. Off by default — reported σ stays the inverse-Fisher
+    /// lower bound.
+    scale_by_chi2: bool,
 
     // ── Solver ──
     solver: SolverConfig,
@@ -563,6 +569,7 @@ impl UnifiedFitConfig {
             initial_densities,
             fit_temperature: false,
             compute_covariance: true,
+            scale_by_chi2: false,
             solver: SolverConfig::Auto,
             transmission_background: None,
             multiplicative_baseline: None,
@@ -631,6 +638,19 @@ impl UnifiedFitConfig {
     #[must_use]
     pub fn with_compute_covariance(mut self, v: bool) -> Self {
         self.compute_covariance = v;
+        self
+    }
+
+    /// Enable χ²-scaled uncertainties (issue #638).
+    ///
+    /// When `true`, the raw-covariance solver paths (Poisson-KL, joint-Poisson)
+    /// inflate their reported σ by `sqrt(χ²/dof)` at the converged point, turning
+    /// the inverse-Fisher lower bound into a goodness-of-fit-scaled estimate. The
+    /// LM transmission path is already χ²-scaled (Numerical Recipes §15.6), so the
+    /// flag is a no-op there. Off by default, so existing results are unchanged.
+    #[must_use]
+    pub fn with_scale_by_chi2(mut self, v: bool) -> Self {
+        self.scale_by_chi2 = v;
         self
     }
 
@@ -978,6 +998,11 @@ impl UnifiedFitConfig {
     pub fn fit_energy_scale(&self) -> bool {
         self.fit_energy_scale
     }
+    /// Whether χ²-scaled uncertainties are enabled
+    /// (see [`Self::with_scale_by_chi2`]).
+    pub fn scale_by_chi2(&self) -> bool {
+        self.scale_by_chi2
+    }
     /// Nominal flight path (m) configured via [`Self::with_energy_scale`].
     pub fn flight_path_m(&self) -> f64 {
         self.flight_path_m
@@ -1289,6 +1314,7 @@ fn poisson_to_joint_poisson_config(
 ) -> JointPoissonFitConfig {
     let mut jp_cfg = JointPoissonFitConfig {
         max_iter: poisson_cfg.max_iter,
+        scale_by_chi2: config.scale_by_chi2,
         ..Default::default()
     };
     if let Some(override_val) = config.counts_enable_polish() {
@@ -1520,6 +1546,7 @@ fn fit_transmission_poisson(
 
     let mut poisson_cfg = poisson_cfg.clone();
     poisson_cfg.compute_covariance = config.compute_covariance;
+    poisson_cfg.scale_by_chi2 = config.scale_by_chi2;
     let poisson_cfg = &poisson_cfg;
 
     let n_density_params = config.n_density_params();
@@ -1832,6 +1859,7 @@ fn fit_counts_joint_poisson(
     };
     let mut cfg = jp_cfg.clone();
     cfg.compute_covariance = config.compute_covariance;
+    cfg.scale_by_chi2 = config.scale_by_chi2;
     // Solver / numeric failures map to PipelineError::Fitting — NOT
     // InvalidParameter (review R4): the binding taxonomy sends
     // InvalidParameter to Python ValueError (bad user input), and a
@@ -5035,6 +5063,91 @@ mod tests {
         assert!(
             t_unc.is_finite() && t_unc > 0.0,
             "temperature unc = {t_unc}"
+        );
+    }
+
+    /// Issue #638: `scale_by_chi2` inflates the joint-Poisson uncertainties by
+    /// exactly `sqrt(deviance_per_dof)`, and `false` reproduces today's values.
+    #[test]
+    fn test_scale_by_chi2_inflates_joint_poisson_uncertainty() {
+        let data = u238_single_resonance();
+        let energies: Vec<f64> = (0..201).map(|i| 4.0 + (i as f64) * 0.05).collect();
+        let (sample, open_beam) = synthetic_counts(&data, 0.001, &energies, 1000.0);
+        let input = InputData::Counts {
+            sample_counts: sample,
+            open_beam_counts: open_beam,
+        };
+
+        let make_config = |scale: bool| {
+            UnifiedFitConfig::new(
+                energies.clone(),
+                vec![data.clone()],
+                vec!["U-238".into()],
+                350.0,
+                None,
+                vec![0.0005],
+            )
+            .unwrap()
+            .with_solver(SolverConfig::PoissonKL(PoissonConfig::default()))
+            .with_fit_temperature(true)
+            .with_scale_by_chi2(scale)
+        };
+
+        let unscaled = fit_spectrum_typed(&input, &make_config(false)).unwrap();
+        let scaled = fit_spectrum_typed(&input, &make_config(true)).unwrap();
+        assert!(unscaled.converged && scaled.converged);
+
+        // The flag only rescales the post-convergence covariance, so the fit
+        // itself (parameters, deviance) is identical between the two runs.
+        let dpd = unscaled
+            .deviance_per_dof
+            .expect("joint-Poisson must report deviance_per_dof");
+        assert!(dpd.is_finite() && dpd > 0.0, "deviance_per_dof = {dpd}");
+        let factor = dpd.sqrt();
+        // The flag must move σ appreciably (guards against a silently-inert
+        // flag). χ²-scaling is two-way: on real underfit data D/dof > 1 inflates
+        // σ; on this near-noiseless synthetic fit D/dof < 1 shrinks it (standard
+        // Numerical Recipes §15.6 behaviour). Direction-agnostic check:
+        assert!(
+            (factor - 1.0).abs() > 0.01,
+            "expected D/dof to move σ by >1%, got factor {factor}"
+        );
+
+        // Temperature σ scales by exactly sqrt(D/dof).
+        let t_unscaled = unscaled.temperature_k_unc.expect("σ_T unscaled");
+        let t_scaled = scaled.temperature_k_unc.expect("σ_T scaled");
+        let rel_t = (t_scaled - t_unscaled * factor).abs() / (t_unscaled * factor);
+        assert!(
+            rel_t < 1e-6,
+            "σ_T: scaled {t_scaled} must equal unscaled {t_unscaled} × {factor}"
+        );
+
+        // Density σ scales by the same factor.
+        let d_unscaled = unscaled.uncertainties.as_ref().expect("density σ unscaled")[0];
+        let d_scaled = scaled.uncertainties.as_ref().expect("density σ scaled")[0];
+        let rel_d = (d_scaled - d_unscaled * factor).abs() / (d_unscaled * factor);
+        assert!(
+            rel_d < 1e-6,
+            "density σ: scaled {d_scaled} must equal unscaled {d_unscaled} × {factor}"
+        );
+
+        // No-regression: scale_by_chi2=false is the default, so the unscaled
+        // run must match a plain (flag-absent) fit bit-for-bit.
+        let default_cfg = UnifiedFitConfig::new(
+            energies.clone(),
+            vec![data.clone()],
+            vec!["U-238".into()],
+            350.0,
+            None,
+            vec![0.0005],
+        )
+        .unwrap()
+        .with_solver(SolverConfig::PoissonKL(PoissonConfig::default()))
+        .with_fit_temperature(true);
+        let default_run = fit_spectrum_typed(&input, &default_cfg).unwrap();
+        assert_eq!(
+            default_run.temperature_k_unc, unscaled.temperature_k_unc,
+            "default (flag absent) must equal scale_by_chi2=false"
         );
     }
 

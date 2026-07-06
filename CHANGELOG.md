@@ -219,9 +219,29 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
   (optionally) the open-beam stack, in Rust and Python.
 - `nereids-core` gains a `stats` module (`median`,
   `median_abs_deviation`, `MAD_TO_SIGMA`).
+- **Opt-in χ²-scaled temperature uncertainty** (#638): `scale_by_chi2`
+  (Rust `UnifiedFitConfig::with_scale_by_chi2`; Python `scale_by_chi2=`
+  kwarg on `spatial_map_typed` / `fit_spectrum_typed` /
+  `fit_counts_spectrum_typed`, default `False`) inflates the
+  covariance-only uncertainties by `sqrt(χ²/dof)` at the converged point
+  on the Poisson-KL and joint-Poisson paths, turning the inverse-Fisher
+  lower bound into a goodness-of-fit-scaled estimate. No-op on the
+  already-χ²-scaled LM transmission path (Numerical Recipes §15.6).
+- **Ta-181 VIII.0 resonance-count regression guard** (#638): a vendored
+  public-domain 73-Ta-181 ENDF/B-VIII.0 evaluation (MAT 7328) plus a
+  pinning test confirm the parser faithfully reads every NER range —
+  `total_resonance_count() == 76` reflects VIII.0's genuinely-sparse
+  resolved region (MLBW RRR to 330 eV + an unresolved URR), not a
+  dropped range (VIII.1 extended the RRR to 2554 eV / 565 resonances).
 
 ### Fixed
 
+- **Python `n_resonances` under-counted LRF=7 evaluations as 0** (#638):
+  the `ResonanceData.n_resonances` getter (and `__repr__`) summed only
+  `l_groups`, so R-matrix-limited (LRF=7) evaluations — whose resonances
+  live in `rml.spin_groups` — reported zero; both now delegate to the
+  formalism-aware Rust `total_resonance_count()`. A `total_resonance_count`
+  getter is exposed as an explicit alias.
 - **2-chunk VENUS folders no longer load as doubled stacks** (#636):
   `load_tiff_folder` previously concatenated all files lexicographically,
   so a run split into k DAQ chunks silently produced a k× stack; chunked
@@ -233,6 +253,16 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
   `TiffLoadInfo::n_clipped_pixels`; NaN still errors) and
   `pixel_policy="allow"` (pre-normalized transmission, used by the MCP
   server and the GUI transmission tab) as explicit escape hatches.
+
+### Documentation
+
+- **Temperature uncertainty documented as a covariance-only lower bound**
+  (#638): `temperature_uncertainty_map` / `temperature_k_unc` (rustdoc,
+  the PyO3 getters, the `.pyi` stubs, and the `docs/guide` SpatialResult
+  table) now state that on the Poisson-KL / joint-Poisson paths they are
+  inverse-Fisher lower bounds that omit baseline/model noise and can
+  underestimate the observed per-superpixel scatter by ~3–4× on real
+  data; `scale_by_chi2=True` gives the χ²-inflated estimate.
 
 ### Changed
 

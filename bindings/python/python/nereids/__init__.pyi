@@ -1565,6 +1565,7 @@ def spatial_map_typed(
     b1_bounds: tuple[float, float] | None = None,
     b2_bounds: tuple[float, float] | None = None,
     baseline_global: bool = True,
+    scale_by_chi2: bool = False,
 ) -> SpatialResult:
     """Spatial mapping using the typed input data API.
 
@@ -1617,6 +1618,12 @@ def spatial_map_typed(
         l_scale_init: Initial flight-path scale factor (default 1.0).
         energy_scale_flight_path_m: Nominal flight path (m) for the
             energy-scale model (default 25.0).
+        scale_by_chi2: When ``True``, inflate the covariance-only
+            uncertainties (incl. ``temperature_uncertainty_map``) by
+            ``sqrt(chi2/dof)`` at the converged point for the Poisson-KL /
+            joint-Poisson paths, turning the inverse-Fisher lower bound into a
+            goodness-of-fit-scaled estimate. No-op on the already-chi2-scaled
+            LM transmission path. Default ``False`` (issue #638).
 
     Always returns SpatialResult.  For counts-KL runs,
     ``SpatialResult.deviance_per_dof_map`` is populated as the primary GOF.
@@ -1668,6 +1675,7 @@ def fit_spectrum_typed(
     b0_bounds: tuple[float, float] | None = None,
     b1_bounds: tuple[float, float] | None = None,
     b2_bounds: tuple[float, float] | None = None,
+    scale_by_chi2: bool = False,
 ) -> FitResult:
     """Fit a single pre-normalized transmission spectrum.
 
@@ -1697,6 +1705,10 @@ def fit_spectrum_typed(
         density_free: Per-density free/fixed mask (``free[i] == False`` freezes
             density ``i``); length must equal the number of density parameters.
             Mutually exclusive with ``fix_densities``.
+        scale_by_chi2: Inflate covariance-only uncertainties by
+            ``sqrt(chi2/dof)`` (issue #638). No-op on this function's default LM
+            transmission path (already chi2-scaled); only takes effect with an
+            explicit ``solver='kl'``. Default ``False``.
     """
     ...
 
@@ -1748,6 +1760,7 @@ def fit_counts_spectrum_typed(
     b0_bounds: tuple[float, float] | None = None,
     b1_bounds: tuple[float, float] | None = None,
     b2_bounds: tuple[float, float] | None = None,
+    scale_by_chi2: bool = False,
 ) -> FitResult:
     """Fit a single raw-count spectrum (sample + open-beam counts).
 
@@ -1815,6 +1828,10 @@ def fit_counts_spectrum_typed(
             movement.  Pass ``True`` to opt in for synthetic / clean
             (``D ≈ 1``) regimes where the absolute tolerance is
             physically meaningful; ``False`` to force off explicitly.
+        scale_by_chi2: When ``True``, inflate the covariance-only
+            uncertainties (incl. ``temperature_k_unc``) by ``sqrt(chi2/dof)``
+            at the converged point, turning the inverse-Fisher lower bound into
+            a goodness-of-fit-scaled estimate. Default ``False`` (issue #638).
     """
     ...
 

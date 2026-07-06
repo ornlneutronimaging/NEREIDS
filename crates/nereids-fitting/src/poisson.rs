@@ -54,6 +54,18 @@ pub struct PoissonConfig {
     /// after convergence.  Set to `false` for per-pixel spatial mapping
     /// when only densities are needed, avoiding extra model evaluations.
     pub compute_covariance: bool,
+    /// Inflate the covariance-only uncertainties by the goodness-of-fit factor
+    /// at the converged point: `Cov → (D/dof)·Cov`, i.e. `σ → σ·√(D/dof)`, where
+    /// `D` is the Poisson deviance (see [`poisson_deviance`]) and
+    /// `dof = n_data − n_free`.
+    ///
+    /// Off by default, so the reported σ stays the raw Cramér-Rao (inverse-Fisher)
+    /// lower bound, which omits baseline/model mis-specification noise and can
+    /// underestimate the true per-superpixel scatter by ~3–4× on real data.
+    /// Scaling is only applied when `D/dof` is finite and positive (`dof = 0`
+    /// leaves the covariance unscaled). See issue #638; the LM transmission path
+    /// is already χ²-scaled (Numerical Recipes §15.6) and does not use this flag.
+    pub scale_by_chi2: bool,
 }
 
 impl Default for PoissonConfig {
@@ -68,6 +80,7 @@ impl Default for PoissonConfig {
             gauss_newton_lambda: 1e-3,
             lbfgs_history: 8,
             compute_covariance: true,
+            scale_by_chi2: false,
         }
     }
 }
@@ -112,6 +125,30 @@ fn poisson_nll(y_obs: &[f64], y_model: &[f64]) -> f64 {
         .iter()
         .zip(y_model.iter())
         .map(|(&obs, &mdl)| poisson_nll_term(obs, mdl))
+        .sum()
+}
+
+/// Poisson deviance `D = 2·Σ [y_obs·ln(y_obs/y_model) − (y_obs − y_model)]`.
+///
+/// Goodness-of-fit statistic for the Poisson likelihood at the converged
+/// parameters. Used only for the optional χ²-scaling of the covariance
+/// (issue #638) — it is never part of the objective being minimized. Each term
+/// is non-negative. The `y_obs = 0` term reduces to `2·y_model`. `y_model` is
+/// floored at `POISSON_EPSILON` before the logarithm, matching
+/// [`poisson_nll_term`], so a degenerate zero prediction cannot yield a
+/// non-finite deviance.
+fn poisson_deviance(y_obs: &[f64], y_model: &[f64]) -> f64 {
+    y_obs
+        .iter()
+        .zip(y_model.iter())
+        .map(|(&obs, &mdl)| {
+            let m = mdl.max(POISSON_EPSILON);
+            if obs > 0.0 {
+                2.0 * (obs * (obs / m).ln() - (obs - m))
+            } else {
+                2.0 * m
+            }
+        })
         .sum()
 }
 
@@ -1098,7 +1135,31 @@ pub fn poisson_fit(
         };
 
         if let Some(fisher) = fisher_opt {
-            if let Some(cov) = crate::lm::invert_matrix(&fisher) {
+            if let Some(mut cov) = crate::lm::invert_matrix(&fisher) {
+                // Optional goodness-of-fit inflation (issue #638): σ → σ·√(D/dof),
+                // i.e. Cov → (D/dof)·Cov, with D the Poisson deviance at the
+                // converged parameters. Off by default; only applied when D/dof
+                // is finite and positive (dof = 0 leaves the raw bound).
+                let var_scale = if config.scale_by_chi2 {
+                    let dof = y_obs.len().saturating_sub(params.n_free());
+                    if dof > 0 {
+                        let dpd = poisson_deviance(y_obs, &y_model) / dof as f64;
+                        if dpd.is_finite() && dpd > 0.0 {
+                            dpd
+                        } else {
+                            1.0
+                        }
+                    } else {
+                        1.0
+                    }
+                } else {
+                    1.0
+                };
+                if var_scale != 1.0 {
+                    for v in cov.data.iter_mut() {
+                        *v *= var_scale;
+                    }
+                }
                 let n_free = cov.nrows;
                 let unc: Vec<f64> = (0..n_free)
                     .map(|i| {
