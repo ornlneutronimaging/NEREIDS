@@ -27,8 +27,14 @@
 //!   more chunks — single-chunk folders always load in numeric frame
 //!   order);
 //! - ragged chunks (differing frame counts or frame sets) or duplicate
-//!   (chunk, frame) pairs → hard [`IoError::ChunkMismatch`] error, never a
-//!   silent stack or partial sum.
+//!   (chunk, frame) pairs → dispatched on the summing flag.  On the default
+//!   summing path ([`TiffFolderOptions::sum_chunks`]` = true`) they are a
+//!   hard [`IoError::ChunkMismatch`] error, never a silent stack or partial
+//!   sum (summing ragged chunks would corrupt counts).  With summing opted
+//!   out ([`sum_chunks`](TiffFolderOptions::sum_chunks)` = false`) there is
+//!   nothing to corrupt, so the documented legacy lexicographic
+//!   concatenation loads even for inconsistent chunks, with the irregularity
+//!   surfaced through [`TiffLoadInfo::chunk_inconsistent`].
 //!
 //! Folders with two or more distinct prefixes fall back to legacy
 //! lexicographic stacking — summing across different prefixes would merge
@@ -116,6 +122,17 @@ pub struct TiffFolderOptions {
     /// non-chunk-patterned) folders load identically either way —
     /// chunk-patterned names in numeric frame order, others
     /// lexicographically.
+    ///
+    /// The flag also decides how *inconsistent* chunks (ragged frame
+    /// counts/sets or duplicate (chunk, frame) pairs) are handled.  With
+    /// summing on (the default), inconsistency is a hard
+    /// [`IoError::ChunkMismatch`] error — summing ragged chunks would
+    /// silently corrupt counts.  With summing off, the legacy lexicographic
+    /// concatenation loads even for inconsistent chunks (there is nothing to
+    /// corrupt), and the irregularity is reported via
+    /// [`TiffLoadInfo::chunk_inconsistent`] rather than raised — inspecting
+    /// raw frames of a ragged folder is exactly when `sum_chunks = false` is
+    /// reached for.
     pub sum_chunks: bool,
     /// Policy for negative / non-finite pixel values (default
     /// [`PixelValuePolicy::Reject`]).
@@ -159,6 +176,17 @@ pub struct TiffLoadInfo {
     /// at [`MAX_UNRECOGNIZED_EXAMPLES`] entries so the provenance stays
     /// message-sized.  Empty iff `n_unrecognized_files == 0`.
     pub unrecognized_examples: Vec<String>,
+    /// Whether the folder's chunk-patterned files were internally
+    /// inconsistent (ragged frame counts/sets or a duplicate (chunk, frame)
+    /// pair) yet were still loaded, as the legacy lexicographic
+    /// concatenation, because the caller opted out of summing
+    /// ([`TiffFolderOptions::sum_chunks`]` = false`).  This is a distinct
+    /// signal from [`n_unrecognized_files`](Self::n_unrecognized_files): the
+    /// files *do* follow `<prefix>_<chunk>_<frame>`, they just do not agree
+    /// on a common frame set.  Always `false` on the summing path — there the
+    /// same inconsistency is a hard [`IoError::ChunkMismatch`] error, because
+    /// summing ragged chunks would silently corrupt counts.
+    pub chunk_inconsistent: bool,
 }
 
 /// Maximum number of offending filenames retained in
@@ -315,6 +343,7 @@ pub fn load_tiff_stack_with_options(
             n_clipped_pixels,
             n_unrecognized_files: 0,
             unrecognized_examples: Vec::new(),
+            chunk_inconsistent: false,
         },
     ))
 }
@@ -458,7 +487,10 @@ pub fn load_tiff_directory(dir: &Path) -> Result<Array3<f64>, IoError> {
 /// * [`IoError::NotADirectory`] if `dir` exists but is not a directory.
 /// * [`IoError::NoMatchingFiles`] if no files match the pattern.
 /// * [`IoError::DimensionMismatch`] if frames have inconsistent dimensions.
-/// * [`IoError::ChunkMismatch`] if a chunked folder is internally inconsistent.
+/// * [`IoError::ChunkMismatch`] if a chunked folder is internally
+///   inconsistent *and* chunk summing is enabled (the default); with
+///   `sum_chunks = false` the inconsistency is reported via
+///   [`TiffLoadInfo::chunk_inconsistent`] instead of raised.
 pub fn load_tiff_folder(dir: &Path, pattern: Option<&str>) -> Result<Array3<f64>, IoError> {
     load_tiff_folder_with_options(dir, pattern, &TiffFolderOptions::default()).map(|(arr, _)| arr)
 }
@@ -486,26 +518,31 @@ pub fn load_tiff_folder(dir: &Path, pattern: Option<&str>) -> Result<Array3<f64>
 /// * [`IoError::NoMatchingFiles`] if no files match the pattern.
 /// * [`IoError::DimensionMismatch`] if frames have inconsistent dimensions.
 /// * [`IoError::ChunkMismatch`] if a chunked folder is internally
-///   inconsistent (ragged chunks or duplicate (chunk, frame) pairs).
+///   inconsistent (ragged chunks or duplicate (chunk, frame) pairs) *and*
+///   `options.sum_chunks` is `true`.  With `sum_chunks = false` the same
+///   inconsistency is not raised: the files load as the legacy lexicographic
+///   concatenation and [`TiffLoadInfo::chunk_inconsistent`] is set.
 pub fn load_tiff_folder_with_options(
     dir: &Path,
     pattern: Option<&str>,
     options: &TiffFolderOptions,
 ) -> Result<(Array3<f64>, TiffLoadInfo), IoError> {
     // Distinguish "does not exist" from "exists but is not a directory":
-    // the Python binding maps `FileNotFound` (with kind `NotFound`) to
-    // `FileNotFoundError` and `NotADirectory` to `NotADirectoryError`, and
-    // its docstring promises exactly that split.  Without this guard a
-    // nonexistent path fell through `!is_dir()` and mislabeled as
-    // NotADirectory.
-    if !dir.exists() {
-        return Err(IoError::FileNotFound(
-            dir.to_string_lossy().into_owned(),
-            std::io::Error::new(std::io::ErrorKind::NotFound, "no such directory"),
-        ));
-    }
-    if !dir.is_dir() {
-        return Err(IoError::NotADirectory(dir.to_string_lossy().into_owned()));
+    // the Python binding maps `FileNotFound` *whose source kind is
+    // `NotFound`* to `FileNotFoundError` and `NotADirectory` to
+    // `NotADirectoryError`, and its docstring promises exactly that split.
+    //
+    // A single `metadata` probe (mirroring `load_tiff_auto_with_options`) is
+    // the honest test: `Path::exists()`/`is_dir()` collapse *every* metadata
+    // failure to `false`, so a permission-denied parent (EACCES) would be
+    // mislabeled `FileNotFound(NotFound)` → Python `FileNotFoundError` — the
+    // exact confusion `is_genuine_not_found` exists to prevent.  Wrapping the
+    // real `io::Error` preserves its true kind, so only a genuine `NotFound`
+    // reaches `FileNotFoundError` while EACCES falls through to `OSError`.
+    match std::fs::metadata(dir) {
+        Ok(meta) if meta.is_dir() => {}
+        Ok(_) => return Err(IoError::NotADirectory(dir.to_string_lossy().into_owned())),
+        Err(e) => return Err(IoError::FileNotFound(dir.to_string_lossy().into_owned(), e)),
     }
 
     // Collect directory entries, propagating per-entry read errors instead of
@@ -556,7 +593,7 @@ pub fn load_tiff_folder_with_options(
     let n_files = paths.len();
     let mut n_clipped_pixels = 0usize;
 
-    match detect_chunk_layout(dir, &paths)? {
+    match detect_chunk_layout(dir, &paths, options.sum_chunks)? {
         ChunkLayout::Legacy {
             n_unrecognized_files,
             unrecognized_examples,
@@ -573,6 +610,33 @@ pub fn load_tiff_folder_with_options(
                     n_clipped_pixels,
                     n_unrecognized_files,
                     unrecognized_examples,
+                    chunk_inconsistent: false,
+                },
+            ))
+        }
+        ChunkLayout::InconsistentChunks { chunk_ids } => {
+            // Only reachable with `sum_chunks == false` (detect_chunk_layout
+            // yields this variant *instead of* a hard `ChunkMismatch` exactly
+            // when summing was opted out).  There is nothing to corrupt when
+            // we are not summing, so honor the documented `sum_chunks=false`
+            // contract: load every matching file as the legacy lexicographic
+            // concatenation (frame count = sum of all files) and surface the
+            // irregularity through `chunk_inconsistent` — the chunk ids are
+            // still reported so consumers can name what was inconsistent.
+            let n_chunks = chunk_ids.len();
+            paths.sort();
+            let arr = load_frames_from_paths(&paths, options.pixel_policy, &mut n_clipped_pixels)?;
+            Ok((
+                arr,
+                TiffLoadInfo {
+                    n_files,
+                    n_chunks,
+                    chunk_ids,
+                    chunks_summed: false,
+                    n_clipped_pixels,
+                    n_unrecognized_files: 0,
+                    unrecognized_examples: Vec::new(),
+                    chunk_inconsistent: true,
                 },
             ))
         }
@@ -595,6 +659,7 @@ pub fn load_tiff_folder_with_options(
                         n_clipped_pixels,
                         n_unrecognized_files: 0,
                         unrecognized_examples: Vec::new(),
+                        chunk_inconsistent: false,
                     },
                 ))
             } else {
@@ -614,6 +679,7 @@ pub fn load_tiff_folder_with_options(
                         n_clipped_pixels,
                         n_unrecognized_files: 0,
                         unrecognized_examples: Vec::new(),
+                        chunk_inconsistent: false,
                     },
                 ))
             }
@@ -632,6 +698,15 @@ enum ChunkLayout {
         n_unrecognized_files: usize,
         unrecognized_examples: Vec<String>,
     },
+    /// Chunk-conforming filenames that are internally inconsistent — ragged
+    /// frame counts/sets or a duplicate (chunk, frame) pair.  Produced *only*
+    /// when `sum_chunks` is `false`: with summing requested the identical
+    /// inconsistency is a hard [`IoError::ChunkMismatch`] (summing ragged
+    /// chunks would silently corrupt counts).  The caller loads these files
+    /// as the legacy lexicographic concatenation and records the irregularity
+    /// in [`TiffLoadInfo::chunk_inconsistent`]; the detected chunk ids are
+    /// carried so the provenance can still name them.
+    InconsistentChunks { chunk_ids: Vec<u64> },
     /// Chunked folder: chunk id → frames as `(frame index, path)`, with
     /// chunk ids ascending (BTreeMap) and frames sorted ascending by index.
     /// Every chunk is validated to cover the identical frame-index sequence.
@@ -673,12 +748,27 @@ fn parse_chunked_stem(stem: &str) -> Option<(&str, u64, u64)> {
 /// stray file disabled chunk detection; all-non-conforming folders (the
 /// normal `frame_0000.tif` world) report a count of 0.
 ///
-/// Hard errors ([`IoError::ChunkMismatch`]): duplicate (chunk, frame) pairs
-/// (e.g. the same stem with both `.tif` and `.tiff` extensions, or `_764_`
-/// alongside `_0764_`), and ragged chunks (differing frame counts or frame
-/// sets).  Chunk ids need *not* be consecutive — a dropped middle chunk is
-/// still the same run.
-fn detect_chunk_layout(dir: &Path, paths: &[PathBuf]) -> Result<ChunkLayout, IoError> {
+/// Internally *inconsistent* chunks — duplicate (chunk, frame) pairs (e.g.
+/// the same stem with both `.tif` and `.tiff` extensions, or `_764_`
+/// alongside `_0764_`) or ragged chunks (differing frame counts or frame
+/// sets) — are dispatched on `sum_chunks`:
+/// - `sum_chunks == true` (the default summing path): a hard
+///   [`IoError::ChunkMismatch`] error, because summing ragged chunks would
+///   silently corrupt counts in the missing frames.  This guard is airtight
+///   — the only path that ever *sums* rejects inconsistency before a single
+///   frame is added.
+/// - `sum_chunks == false` (the opt-out): [`ChunkLayout::InconsistentChunks`]
+///   instead of an error.  Nothing is summed, so nothing can be corrupted;
+///   the caller loads the documented legacy lexicographic concatenation and
+///   flags [`TiffLoadInfo::chunk_inconsistent`].
+///
+/// Chunk ids need *not* be consecutive — a dropped middle chunk is still the
+/// same run.
+fn detect_chunk_layout(
+    dir: &Path,
+    paths: &[PathBuf],
+    sum_chunks: bool,
+) -> Result<ChunkLayout, IoError> {
     let mut parsed: Vec<(&str, u64, u64, &PathBuf)> = Vec::with_capacity(paths.len());
     let mut unrecognized: Vec<String> = Vec::new();
     for path in paths {
@@ -734,56 +824,77 @@ fn detect_chunk_layout(dir: &Path, paths: &[PathBuf]) -> Result<ChunkLayout, IoE
         chunks.entry(chunk).or_default().push((frame, path.clone()));
     }
 
+    // One source of truth for "what makes chunks inconsistent"; the caller
+    // decides whether that inconsistency is fatal (summing) or a soft
+    // fall-back (opt-out).  Keeping the check in one place stops the two
+    // paths from ever drifting apart.
+    match validate_chunk_consistency(&mut chunks) {
+        Ok(()) => Ok(ChunkLayout::Chunked(chunks)),
+        Err(details) if sum_chunks => Err(IoError::ChunkMismatch {
+            directory: dir.to_string_lossy().into_owned(),
+            details,
+        }),
+        Err(_) => Ok(ChunkLayout::InconsistentChunks {
+            chunk_ids: chunks.keys().copied().collect(),
+        }),
+    }
+}
+
+/// Validate a parsed chunk map for internal consistency, sorting each
+/// chunk's frames by numeric index in place (needed both here and by
+/// [`load_chunked_sum`]).
+///
+/// Returns `Ok(())` when every chunk covers the identical frame-index
+/// sequence with no duplicate (chunk, frame) pair, or `Err(details)`
+/// describing the first inconsistency found (a duplicate frame within a
+/// chunk, differing per-chunk frame counts, or differing frame sets).  The
+/// caller maps `details` onto either a hard [`IoError::ChunkMismatch`] (the
+/// summing path — summing ragged chunks would silently corrupt counts) or a
+/// [`ChunkLayout::InconsistentChunks`] soft fall-back (`sum_chunks = false`,
+/// nothing to corrupt).
+fn validate_chunk_consistency(
+    chunks: &mut BTreeMap<u64, Vec<(u64, PathBuf)>>,
+) -> Result<(), String> {
     // Sort each chunk's frames by numeric index and reject duplicates.
-    for (chunk_id, frames) in &mut chunks {
+    for (chunk_id, frames) in chunks.iter_mut() {
         frames.sort_by_key(|(frame, _)| *frame);
         if let Some(pair) = frames.windows(2).find(|pair| pair[0].0 == pair[1].0) {
-            return Err(IoError::ChunkMismatch {
-                directory: dir.to_string_lossy().into_owned(),
-                details: format!(
-                    "duplicate frame {} in chunk {}: '{}' and '{}'",
-                    pair[0].0,
-                    chunk_id,
-                    pair[0].1.display(),
-                    pair[1].1.display(),
-                ),
-            });
+            return Err(format!(
+                "duplicate frame {} in chunk {}: '{}' and '{}'",
+                pair[0].0,
+                chunk_id,
+                pair[0].1.display(),
+                pair[1].1.display(),
+            ));
         }
     }
 
-    // Every chunk must cover the identical frame-index sequence; summing
-    // ragged chunks would silently corrupt counts in the missing frames.
+    // Every chunk must cover the identical frame-index sequence.
     let mut iter = chunks.iter();
-    let (first_id, first_frames) = iter.next().expect("paths is non-empty");
+    let (first_id, first_frames) = iter.next().expect("chunks is non-empty");
     for (chunk_id, frames) in iter {
         if frames.len() != first_frames.len() {
-            return Err(IoError::ChunkMismatch {
-                directory: dir.to_string_lossy().into_owned(),
-                details: format!(
-                    "chunk {} has {} frames but chunk {} has {} frames",
-                    first_id,
-                    first_frames.len(),
-                    chunk_id,
-                    frames.len(),
-                ),
-            });
+            return Err(format!(
+                "chunk {} has {} frames but chunk {} has {} frames",
+                first_id,
+                first_frames.len(),
+                chunk_id,
+                frames.len(),
+            ));
         }
         if let Some((a, b)) = first_frames
             .iter()
             .zip(frames.iter())
             .find(|(a, b)| a.0 != b.0)
         {
-            return Err(IoError::ChunkMismatch {
-                directory: dir.to_string_lossy().into_owned(),
-                details: format!(
-                    "chunks {} and {} cover different frame indices: first difference {} vs {}",
-                    first_id, chunk_id, a.0, b.0,
-                ),
-            });
+            return Err(format!(
+                "chunks {} and {} cover different frame indices: first difference {} vs {}",
+                first_id, chunk_id, a.0, b.0,
+            ));
         }
     }
 
-    Ok(ChunkLayout::Chunked(chunks))
+    Ok(())
 }
 
 /// Load a validated chunked layout: first chunk becomes the stack, remaining
@@ -1564,6 +1675,7 @@ mod tests {
                 n_clipped_pixels: 0,
                 n_unrecognized_files: 0,
                 unrecognized_examples: vec![],
+                chunk_inconsistent: false,
             }
         );
     }
@@ -1617,6 +1729,7 @@ mod tests {
                 n_clipped_pixels: 0,
                 n_unrecognized_files: 0,
                 unrecognized_examples: vec![],
+                chunk_inconsistent: false,
             }
         );
     }
@@ -1720,6 +1833,78 @@ mod tests {
         assert!(msg.contains("duplicate frame 1"), "got: {msg}");
     }
 
+    /// T25: with `sum_chunks = false`, ragged chunks are NOT a hard error —
+    /// they load as the legacy lexicographic concatenation (frame count = the
+    /// sum of every file) and the irregularity is surfaced through
+    /// `chunk_inconsistent`, not raised.  Inspecting raw frames of a ragged
+    /// folder is exactly what the opt-out is for.  (Contrast T5, where the
+    /// same folder under the default summing path is a `ChunkMismatch`.)
+    #[test]
+    fn test_chunked_ragged_opt_out_loads_concatenation() {
+        let dir = tempfile::tempdir().unwrap();
+        write_chunk_files(dir.path(), "run", 764, 100, &[0, 1, 2]);
+        write_chunk_files(dir.path(), "run", 765, 200, &[0, 1]);
+
+        let options = TiffFolderOptions {
+            sum_chunks: false,
+            ..Default::default()
+        };
+        let (arr, info) = load_tiff_folder_with_options(dir.path(), None, &options).unwrap();
+        // Legacy concatenation of all 5 files (3 from chunk 764, 2 from 765),
+        // never a partial sum.
+        assert_eq!(arr.shape(), &[5, 2, 2]);
+        // Lexicographic: run_764_0000..0002, then run_765_0000..0001.
+        assert_eq!(arr[[0, 0, 0]], 100.0);
+        assert_eq!(arr[[3, 0, 0]], 200.0);
+        assert_eq!(
+            info,
+            TiffLoadInfo {
+                n_files: 5,
+                n_chunks: 2,
+                chunk_ids: vec![764, 765],
+                chunks_summed: false,
+                n_clipped_pixels: 0,
+                n_unrecognized_files: 0,
+                unrecognized_examples: vec![],
+                chunk_inconsistent: true,
+            }
+        );
+    }
+
+    /// T26: with `sum_chunks = false`, a duplicate (chunk, frame) pair is
+    /// likewise NOT a hard error — the files load as the legacy lexicographic
+    /// concatenation and `chunk_inconsistent` is set.  (Contrast T8, where
+    /// the same folder under the default summing path is a `ChunkMismatch`.)
+    #[test]
+    fn test_chunked_duplicate_opt_out_loads_concatenation() {
+        let dir = tempfile::tempdir().unwrap();
+        write_chunk_files(dir.path(), "run", 764, 100, &[0, 1]);
+        let dup = dir.path().join("run_764_0001.tiff");
+        write_test_tiff(&dup, &[vec![9, 9, 9, 9]], 2, 2);
+
+        let options = TiffFolderOptions {
+            sum_chunks: false,
+            ..Default::default()
+        };
+        let (arr, info) = load_tiff_folder_with_options(dir.path(), None, &options).unwrap();
+        // A single chunk (764) with a duplicated frame 1 — three files load
+        // verbatim in lexicographic order (`.tif` before `.tiff`).
+        assert_eq!(arr.shape(), &[3, 2, 2]);
+        assert_eq!(
+            info,
+            TiffLoadInfo {
+                n_files: 3,
+                n_chunks: 1,
+                chunk_ids: vec![764],
+                chunks_summed: false,
+                n_clipped_pixels: 0,
+                n_unrecognized_files: 0,
+                unrecognized_examples: vec![],
+                chunk_inconsistent: true,
+            }
+        );
+    }
+
     /// T9: unpadded frame numbers order numerically (`_2` before `_10`),
     /// unlike lexicographic order where `run_1_10` sorts before `run_1_2`.
     #[test]
@@ -1772,6 +1957,7 @@ mod tests {
                 n_clipped_pixels: 0,
                 n_unrecognized_files: 1,
                 unrecognized_examples: vec!["overview.tif".to_string()],
+                chunk_inconsistent: false,
             }
         );
     }
@@ -1798,10 +1984,14 @@ mod tests {
         );
     }
 
-    /// A nonexistent folder path is `FileNotFound` with OS kind `NotFound`
-    /// (Python: `FileNotFoundError`); `NotADirectory` is reserved for paths
-    /// that exist but are not directories (see
-    /// `test_load_tiff_folder_not_a_directory`).
+    /// A nonexistent folder path is `FileNotFound` carrying the *real* OS
+    /// error kind `NotFound` (Python: `FileNotFoundError`); `NotADirectory`
+    /// is reserved for paths that exist but are not directories (see
+    /// `test_load_tiff_folder_not_a_directory`).  The kind is now the genuine
+    /// `std::fs::metadata` error, not a synthesized sentinel, so a
+    /// permission-denied parent (EACCES — not portably reproducible in a unit
+    /// test) surfaces as its true `PermissionDenied` kind and falls through
+    /// to `OSError` rather than being mislabeled `FileNotFoundError`.
     #[test]
     fn test_load_tiff_folder_missing_dir_file_not_found() {
         let dir = tempfile::tempdir().unwrap();
@@ -1820,7 +2010,7 @@ mod tests {
         );
     }
 
-    /// T10: dimension mismatch across chunks is surfaced as DimensionMismatch.
+    /// T23: dimension mismatch across chunks is surfaced as DimensionMismatch.
     #[test]
     fn test_chunked_cross_chunk_dimension_mismatch() {
         let dir = tempfile::tempdir().unwrap();
@@ -1840,7 +2030,7 @@ mod tests {
         );
     }
 
-    /// T11: three chunks sum element-wise.
+    /// T24: three chunks sum element-wise.
     #[test]
     fn test_chunked_three_chunks() {
         let dir = tempfile::tempdir().unwrap();
