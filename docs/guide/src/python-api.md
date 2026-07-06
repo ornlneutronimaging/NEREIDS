@@ -342,12 +342,15 @@ match across chunks; the TOF axis may differ.
 
 ```python
 stack = nereids.load_tiff_stack("transmission_stack.tif", pixel_policy="allow")
-folder_stack = nereids.load_tiff_folder(
+folder_stack, info = nereids.load_tiff_folder(
     "frames",
     pattern="frame_*.tif",
     sum_chunks=True,        # sum chunked VENUS runs element-wise (default)
     pixel_policy="reject",  # "reject" | "clip" | "allow" (default "reject")
+    return_info=True,       # also return the load-provenance dict
 )
+info["chunks_summed"]       # n_files / n_chunks / chunk_ids /
+                            # chunks_summed / n_clipped_pixels
 edges_us = nereids.read_tof_sidecar(
     "run_764/run_764_Spectra.txt",
     n_frames=folder_stack.shape[0],
@@ -363,9 +366,13 @@ health = nereids.run_health("sample.nxs")   # RunHealth: pause/beam-dip fraction
 ```
 
 `load_tiff_folder` detects chunked VENUS folders
-(`<prefix>_<chunk>_<frame>.tif`) and sums chunks element-wise by default;
-`read_tof_sidecar` converts a VENUS `*_Spectra.txt` sidecar (frame start
-times in seconds) into the N+1 ascending microsecond TOF bin edges that
+(`<prefix>_<chunk>_<frame>.tif`) and sums chunks element-wise by default,
+emitting a `UserWarning` naming the summed chunks (and one with the
+clipped-pixel count under `pixel_policy="clip"`); `return_info=True`
+returns the load provenance as a second value. `read_tof_sidecar`
+converts a VENUS `*_Spectra.txt` sidecar (frame **start** times in
+seconds — the left bin edges, verified on measured autoreduce output)
+into the N+1 ascending microsecond TOF bin edges that
 `tof_to_energy_centers` expects. Negative or non-finite pixels are rejected
 at load time unless `pixel_policy` says otherwise. `run_health` returns a
 `RunHealth` summary of the `/entry/DASlogs` pause and beam-power logs using

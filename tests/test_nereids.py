@@ -6,6 +6,7 @@ so no network access or ENDF downloads are required.
 
 import os
 import tempfile
+import warnings
 
 import numpy as np
 import pytest
@@ -1738,13 +1739,16 @@ class TestTiffIO:
 
         with tempfile.TemporaryDirectory() as tmpdir:
             expected = self._write_chunked_folder(tmpdir, n_frames, h, w)
-            # Frame start times in seconds (col 0) + counts (col 1),
-            # 100 µs frames starting at 1 ms.
+            # Evidence-shaped sidecar mirroring measured IPTS-37432 VENUS
+            # autoreduce output (synthetic counts): header
+            # "shutter_time,counts", first start time 1.12e-6 s (7 x the
+            # 160 ns bin -- NOT zero; autoreduce drops pre-trigger bins),
+            # uniform 1.6e-7 s steps.
             sidecar = os.path.join(tmpdir, "run_Spectra.txt")
             with open(sidecar, "w") as fh:
                 fh.write("shutter_time,counts\n")
                 for f in range(n_frames):
-                    fh.write(f"{0.001 + f * 0.0001},{100 + f}\n")
+                    fh.write(f"{1.12e-6 + f * 1.6e-7:.10e},{100 + f}\n")
 
             # Call 1: chunk-aware stack (the sidecar .txt is ignored by
             # the TIFF extension filter).
@@ -1761,7 +1765,9 @@ class TestTiffIO:
             assert counts.shape == (n_frames, h, w)
             np.testing.assert_allclose(counts, expected)
             assert edges_us.shape == (n_frames + 1,)
-            np.testing.assert_allclose(edges_us[0], 1000.0)
+            # 1.12 us first edge, 0.16 us steps (seconds -> us conversion).
+            np.testing.assert_allclose(edges_us[0], 1.12, rtol=1e-12)
+            np.testing.assert_allclose(np.diff(edges_us), 0.16, rtol=1e-9)
             assert np.all(np.diff(edges_us) > 0)
             assert energies.shape == (n_frames,)
             assert np.all(np.diff(energies) > 0)
@@ -1799,6 +1805,74 @@ class TestTiffIO:
                 )
         finally:
             os.unlink(path)
+
+    def test_chunk_sum_warns_and_return_info(self):
+        """T46: summing chunks emits a UserWarning naming the chunk count,
+        ids, and the sum_chunks=False escape hatch; return_info=True
+        returns (array, info) with the full provenance dict."""
+        pytest.importorskip("tifffile")
+        n_frames, h, w = 4, 2, 3
+
+        with tempfile.TemporaryDirectory() as tmpdir:
+            expected = self._write_chunked_folder(tmpdir, n_frames, h, w)
+
+            with pytest.warns(
+                UserWarning,
+                match=r"summed 2 DAQ chunks \(764, 765\).*sum_chunks=False",
+            ):
+                arr, info = nereids.load_tiff_folder(tmpdir, return_info=True)
+
+            np.testing.assert_allclose(np.asarray(arr), expected)
+            assert info == {
+                "n_files": 2 * n_frames,
+                "n_chunks": 2,
+                "chunk_ids": [764, 765],
+                "chunks_summed": True,
+                "n_clipped_pixels": 0,
+            }
+
+    def test_clip_warns(self):
+        """T47: pixel_policy="clip" emits a UserWarning counting the
+        clipped pixels."""
+        tifffile = pytest.importorskip("tifffile")
+        frame = np.array([[10, -5], [-3, 40]], dtype=np.int16)
+
+        with tempfile.NamedTemporaryFile(suffix=".tif", delete=False) as f:
+            path = f.name
+        try:
+            tifffile.imwrite(path, frame)
+            with pytest.warns(UserWarning, match=r"2 negative pixel\(s\) clipped"):
+                clipped = np.asarray(
+                    nereids.load_tiff_stack(path, pixel_policy="clip")
+                )
+            assert clipped[0, 0, 1] == 0.0
+            assert clipped[0, 1, 0] == 0.0
+        finally:
+            os.unlink(path)
+
+    def test_plain_folder_no_warning(self):
+        """T48: a plain (non-chunked) clean folder loads with no warning;
+        return_info reports the un-chunked layout."""
+        tifffile = pytest.importorskip("tifffile")
+        n_frames, h, w = 3, 2, 2
+
+        with tempfile.TemporaryDirectory() as tmpdir:
+            for i in range(n_frames):
+                tifffile.imwrite(
+                    os.path.join(tmpdir, f"frame_{i:04d}.tif"),
+                    np.ones((h, w), dtype=np.uint16),
+                )
+            with warnings.catch_warnings():
+                warnings.simplefilter("error")
+                arr, info = nereids.load_tiff_folder(tmpdir, return_info=True)
+            assert np.asarray(arr).shape == (n_frames, h, w)
+            assert info == {
+                "n_files": n_frames,
+                "n_chunks": 0,
+                "chunk_ids": [],
+                "chunks_summed": False,
+                "n_clipped_pixels": 0,
+            }
 
 
 # ===========================================================================

@@ -2161,6 +2161,55 @@ fn parse_pixel_policy(policy: &str) -> PyResult<nereids_io::tiff_stack::PixelVal
     }
 }
 
+/// Emit Python ``UserWarning``s for semantically significant TIFF-load
+/// events recorded in a [`nereids_io::tiff_stack::TiffLoadInfo`].
+///
+/// Python callers otherwise have zero observability of chunk summing (a
+/// semantic change versus the old concatenate behavior: the returned stack
+/// is the element-wise *sum* of k DAQ chunks) and of negative-pixel
+/// clipping under ``pixel_policy="clip"`` — both alter the data relative
+/// to a naive per-file read, so they are surfaced as warnings the caller
+/// can catch, filter, or escalate with the stdlib ``warnings`` module
+/// (mirroring the GUI's provenance-log entries for the same events).
+///
+/// ``stacklevel=2`` attributes the warning to the Python call site rather
+/// than this extension module.
+fn emit_tiff_load_warnings(
+    py: Python<'_>,
+    info: &nereids_io::tiff_stack::TiffLoadInfo,
+) -> PyResult<()> {
+    /// ``warnings.warn`` stacklevel: 1 = this extension frame, 2 = caller.
+    const WARN_STACKLEVEL: i32 = 2;
+    let mut messages: Vec<String> = Vec::new();
+    if info.chunks_summed {
+        let ids: Vec<String> = info.chunk_ids.iter().map(|id| id.to_string()).collect();
+        messages.push(format!(
+            "summed {} DAQ chunks ({}) element-wise into one stack; \
+             pass sum_chunks=False to load the raw per-file stack instead",
+            info.n_chunks,
+            ids.join(", "),
+        ));
+    }
+    if info.n_clipped_pixels > 0 {
+        messages.push(format!(
+            "{} negative pixel(s) clipped to 0.0 under pixel_policy=\"clip\"",
+            info.n_clipped_pixels,
+        ));
+    }
+    let category = py.get_type::<pyo3::exceptions::PyUserWarning>();
+    for msg in messages {
+        // The messages above are built from numeric fields and contain no
+        // NUL bytes, but map the error instead of unwrapping on principle.
+        let c_msg = std::ffi::CString::new(msg).map_err(|e| {
+            pyo3::exceptions::PyValueError::new_err(format!(
+                "internal TIFF-load warning message contained a NUL byte: {e}"
+            ))
+        })?;
+        PyErr::warn(py, category.as_any(), &c_msg, WARN_STACKLEVEL)?;
+    }
+    Ok(())
+}
+
 /// Load a multi-frame TIFF file into a 3D numpy array.
 ///
 /// Each TIFF frame becomes one slice along the first axis.
@@ -2179,6 +2228,10 @@ fn parse_pixel_policy(policy: &str) -> PyResult<nereids_io::tiff_stack::PixelVal
 /// Returns:
 ///     3D numpy array with shape (n_frames, height, width).
 ///
+/// Warns:
+///     UserWarning: When ``pixel_policy="clip"`` clamped one or more
+///         negative pixels (the message reports the count).
+///
 /// Raises:
 ///     ValueError: For bad pixel values under the active policy, or an
 ///         invalid ``pixel_policy`` string.
@@ -2191,7 +2244,7 @@ fn load_tiff_stack<'py>(
     pixel_policy: &str,
 ) -> PyResult<Bound<'py, PyArray3<f64>>> {
     let policy = parse_pixel_policy(pixel_policy)?;
-    let (arr, _info) =
+    let (arr, info) =
         nereids_io::tiff_stack::load_tiff_stack_with_options(std::path::Path::new(path), policy)
             .map_err(|e| match &e {
                 nereids_io::error::IoError::BadPixelValue { .. } => {
@@ -2199,6 +2252,7 @@ fn load_tiff_stack<'py>(
                 }
                 _ => pyo3::exceptions::PyIOError::new_err(format!("{}", e)),
             })?;
+    emit_tiff_load_warnings(py, &info)?;
     Ok(PyArray3::from_owned_array(py, arr))
 }
 
@@ -2214,6 +2268,12 @@ fn load_tiff_stack<'py>(
 /// lexicographic filename order, so name legacy files with zero-padded
 /// indices (e.g., ``frame_0001.tif``, ``frame_0002.tif``, ...).
 ///
+/// The chunk heuristic assumes **one acquisition per folder** (the VENUS
+/// autoreduce layout: one run folder per directory).  It cannot
+/// distinguish same-prefix sibling *runs* co-located in one folder from
+/// DAQ chunks — they would be summed.  Use ``pattern`` to select one run,
+/// or ``sum_chunks=False``, when a folder may hold multiple runs.
+///
 /// Args:
 ///     folder: Path to the directory containing TIFF files.
 ///     pattern: Optional glob pattern matched against each filename (not the
@@ -2223,14 +2283,29 @@ fn load_tiff_stack<'py>(
 ///              filename filter on top of that.
 ///     sum_chunks: Sum DAQ chunks element-wise when a chunked folder is
 ///                 detected (default ``True``).  ``False`` loads the legacy
-///                 lexicographic concatenation of all files.
+///                 lexicographic concatenation of all files.  The flag only
+///                 affects folders with **two or more** chunks:
+///                 single-chunk (and non-chunk-patterned) folders load
+///                 identically either way — chunk-patterned names in
+///                 numeric frame order, others lexicographically.
 ///     pixel_policy: ``"reject"`` (default) errors on negative or
 ///         non-finite pixels; ``"clip"`` clamps negatives to 0.0 (NaN
 ///         still errors); ``"allow"`` passes values through verbatim (for
 ///         pre-normalized transmission stacks).
+///     return_info: When ``True``, return ``(array, info)`` where ``info``
+///         is a dict with keys ``n_files``, ``n_chunks``, ``chunk_ids``,
+///         ``chunks_summed``, and ``n_clipped_pixels`` (default
+///         ``False`` — return just the array).
 ///
 /// Returns:
-///     3D numpy array with shape (n_frames, height, width), dtype float64.
+///     3D numpy array with shape (n_frames, height, width), dtype float64;
+///     or an ``(array, info)`` tuple when ``return_info=True``.
+///
+/// Warns:
+///     UserWarning: When chunks were summed element-wise (the message
+///         names the chunk count and ids and the ``sum_chunks=False``
+///         escape hatch), and when ``pixel_policy="clip"`` clamped one or
+///         more negative pixels (the message reports the count).
 ///
 /// Raises:
 ///     FileNotFoundError: If the folder does not exist or no files match.
@@ -2240,19 +2315,20 @@ fn load_tiff_stack<'py>(
 ///         violates the active policy, or ``pixel_policy`` is invalid.
 ///     IOError: For TIFF decoding errors or other I/O failures.
 #[pyfunction]
-#[pyo3(signature = (folder, pattern=None, sum_chunks=true, pixel_policy="reject"))]
+#[pyo3(signature = (folder, pattern=None, sum_chunks=true, pixel_policy="reject", return_info=false))]
 fn load_tiff_folder<'py>(
     py: Python<'py>,
     folder: &str,
     pattern: Option<&str>,
     sum_chunks: bool,
     pixel_policy: &str,
-) -> PyResult<Bound<'py, PyArray3<f64>>> {
+    return_info: bool,
+) -> PyResult<Bound<'py, PyAny>> {
     let options = nereids_io::tiff_stack::TiffFolderOptions {
         sum_chunks,
         pixel_policy: parse_pixel_policy(pixel_policy)?,
     };
-    let (arr, _info) = nereids_io::tiff_stack::load_tiff_folder_with_options(
+    let (arr, info) = nereids_io::tiff_stack::load_tiff_folder_with_options(
         std::path::Path::new(folder),
         pattern,
         &options,
@@ -2280,7 +2356,19 @@ fn load_tiff_folder<'py>(
         }
         _ => pyo3::exceptions::PyIOError::new_err(format!("{}", e)),
     })?;
-    Ok(PyArray3::from_owned_array(py, arr))
+    emit_tiff_load_warnings(py, &info)?;
+    let arr = PyArray3::from_owned_array(py, arr);
+    if return_info {
+        let d = pyo3::types::PyDict::new(py);
+        d.set_item("n_files", info.n_files)?;
+        d.set_item("n_chunks", info.n_chunks)?;
+        d.set_item("chunk_ids", info.chunk_ids)?;
+        d.set_item("chunks_summed", info.chunks_summed)?;
+        d.set_item("n_clipped_pixels", info.n_clipped_pixels)?;
+        Ok((arr, d).into_pyobject(py)?.into_any())
+    } else {
+        Ok(arr.into_any())
+    }
 }
 
 /// Read a VENUS ``*_Spectra.txt`` TOF sidecar into bin edges (µs).
@@ -2292,6 +2380,19 @@ fn load_tiff_folder<'py>(
 /// ascending edges for N rows — exactly what ``tof_to_energy_centers``
 /// expects.  Bin uniformity is not enforced (MCP shutter segments change
 /// the frame width mid-run).
+///
+/// The start-time = left-bin-edge semantics is verified on measured
+/// VENUS autoreduce output: every ``shutter_time`` value is an exact
+/// integer multiple of the bin width, which only edges (not centers)
+/// satisfy.  Note PLEIADES uses these values directly as frame TOFs,
+/// which differs by half a bin width; see the NEREIDS data-io guide.
+///
+/// A sidecar whose first start time is exactly 0 s parses fine, but the
+/// t = 0 edge cannot be energy-converted (E is undefined at t = 0) —
+/// crop the first frame from BOTH the stack and the edges
+/// (``stack[1:]``, ``edges[1:]``) before conversion.  Real autoreduce
+/// sidecars start after the pre-trigger bins (e.g. at 1.12 µs), so this
+/// only arises for hand-made files.
 ///
 /// Args:
 ///     path: Path to the ``*_Spectra.txt`` sidecar file.

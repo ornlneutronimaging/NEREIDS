@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+from typing import Any, Literal, overload
+
 import numpy as np
 from numpy.typing import NDArray
 
@@ -830,20 +832,40 @@ def load_tiff_stack(
     """
     ...
 
+@overload
 def load_tiff_folder(
     folder: str,
     pattern: str | None = None,
     sum_chunks: bool = True,
     pixel_policy: str = "reject",
+    return_info: Literal[False] = False,
 ) -> NDArray[np.float64]:
     """Load a folder of single-frame TIFFs into a 3D numpy array.
 
     Chunked VENUS folders (``<prefix>_<chunk>_<frame>.tif``) are detected
     automatically and summed element-wise across chunks by default
-    (``sum_chunks=True``); ragged chunks are an error.  ``pixel_policy``
-    is ``"reject"`` | ``"clip"`` | ``"allow"`` as in ``load_tiff_stack``.
+    (``sum_chunks=True``, with a ``UserWarning`` naming the chunks);
+    ragged chunks are an error.  ``sum_chunks`` only affects folders with
+    two or more chunks — single-chunk (and non-chunk-patterned) folders
+    load identically either way.  The heuristic assumes one acquisition
+    per folder; use ``pattern`` (or ``sum_chunks=False``) when a folder
+    may hold multiple same-prefix runs.  ``pixel_policy`` is ``"reject"``
+    | ``"clip"`` | ``"allow"`` as in ``load_tiff_stack``.  With
+    ``return_info=True``, returns ``(array, info)`` where ``info`` has
+    keys ``n_files``, ``n_chunks``, ``chunk_ids``, ``chunks_summed``,
+    and ``n_clipped_pixels``.
     """
     ...
+
+@overload
+def load_tiff_folder(
+    folder: str,
+    pattern: str | None = None,
+    sum_chunks: bool = True,
+    pixel_policy: str = "reject",
+    *,
+    return_info: Literal[True],
+) -> tuple[NDArray[np.float64], dict[str, Any]]: ...
 
 def read_tof_sidecar(
     path: str,
@@ -851,10 +873,15 @@ def read_tof_sidecar(
 ) -> NDArray[np.float64]:
     """Read a VENUS ``*_Spectra.txt`` sidecar into TOF bin edges (µs).
 
-    Column 0 holds each frame's start time in seconds; the result is the
-    N+1 ascending microsecond edges expected by ``tof_to_energy_centers``
-    (the closing edge extrapolates the last frame width).  When
-    ``n_frames`` is given, the edge count is validated against it.
+    Column 0 holds each frame's start time in seconds — the frame START
+    (left bin edge; verified on measured VENUS autoreduce output, where
+    every value is an exact integer multiple of the bin width).  The
+    result is the N+1 ascending microsecond edges expected by
+    ``tof_to_energy_centers`` (the closing edge extrapolates the last
+    frame width).  When ``n_frames`` is given, the edge count is
+    validated against it.  If the first edge is exactly 0, crop the
+    first frame from both stack and edges (``stack[1:]``, ``edges[1:]``)
+    before energy conversion.
     """
     ...
 

@@ -19,9 +19,16 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
   `load_tiff_auto_with_options` / `load_tiff_stack_with_options` return a
   `TiffLoadInfo` provenance report (`n_files`, `n_chunks`, `chunk_ids`,
   `chunks_summed`, `n_clipped_pixels`); the GUI logs "summed k DAQ
-  chunks" provenance. The issue's coverage-mask item was dropped per its
-  scope amendment: per the #646 masking policy, coverage/thickness is a
-  model concern, not an I/O concern.
+  chunks" provenance. The Python loaders emit a `UserWarning` when
+  chunks were summed (naming the chunk ids and the `sum_chunks=False`
+  escape hatch) or when `pixel_policy="clip"` clamped pixels, and
+  `load_tiff_folder(..., return_info=True)` returns the provenance dict
+  alongside the array. The GUI's pre-normalized transmission mode loads
+  chunked folders with `sum_chunks=False` — element-wise sums of
+  transmissions are counts semantics and physically meaningless. The
+  issue's coverage-mask item was dropped per its scope amendment: per
+  the #646 masking policy, coverage/thickness is a model concern, not
+  an I/O concern.
 - **`read_tof_sidecar`** (#636): reads a VENUS `*_Spectra.txt` sidecar
   (frame start times in seconds) into the N+1 ascending microsecond TOF
   bin edges `tof_to_energy_centers` expects, extrapolating the closing
