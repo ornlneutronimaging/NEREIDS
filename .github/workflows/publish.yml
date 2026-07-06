@@ -65,7 +65,7 @@ jobs:
         run: ./scripts/check_wheel_policy.sh dist/*.whl
 
       - name: Upload wheel
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@v7
         with:
           name: wheel-${{ matrix.target }}
           path: dist/*.whl
@@ -84,7 +84,7 @@ jobs:
           args: --out dist -m bindings/python/Cargo.toml
 
       - name: Upload sdist
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@v7
         with:
           name: sdist
           path: dist/*.tar.gz
@@ -148,7 +148,7 @@ jobs:
 
       # maturin working-directory puts output in apps/gui/dist
       - name: Upload GUI wheel
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@v7
         with:
           name: gui-wheel-${{ matrix.target }}
           path: apps/gui/dist/*.whl
@@ -191,7 +191,7 @@ jobs:
             nereids-${VERSION}-macos-arm64.dmg
 
       - name: Upload DMG
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@v7
         with:
           name: gui-macos-app
           path: "*.dmg"
