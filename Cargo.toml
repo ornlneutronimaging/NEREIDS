@@ -74,7 +74,7 @@ rfd = { version = "=0.17.2", default-features = false }
 # Pure-egui in-app file browser (Linux fallback dialog tier). LOCKSTEP
 # with egui minors: 0.12 <-> egui 0.33, 0.13 <-> 0.34, 0.14 <-> 0.35 —
 # any egui/eframe bump MUST bump this together.
-egui-file-dialog = "0.12"
+egui-file-dialog = "0.13"
 hdf5 = { package = "hdf5-metno", version = "0.12", features = ["static", "zlib"] }
 rand = "0.9"
 # Stable-stream RNG for seeded test noise: StdRng's stream is documented
