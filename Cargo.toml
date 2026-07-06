@@ -49,7 +49,7 @@ numpy = "0.29"
 eframe = { version = "0.33", features = ["persistence"] }
 egui = "0.33"
 egui_extras = { version = "0.33", features = ["image", "svg"] }
-egui_plot = "0.34"
+egui_plot = "0.35"
 # Native file dialogs. default-features = false retires the gtk3 backend
 # permanently: rfd's gtk3 feature pins gtk-sys's v3_24 feature
 # (gtk+-3.0 >= 3.24 at BUILD time), which forced the Linux wheel from
