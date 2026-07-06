@@ -70,7 +70,7 @@
 use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
 
-use ndarray::{Array3, s};
+use ndarray::{Array3, ArrayView2, s};
 use tiff::decoder::Decoder;
 use tiff::decoder::DecodingResult;
 
@@ -293,6 +293,13 @@ pub fn load_tiff_stack_with_options(
 /// - File → [`load_tiff_stack`] (multi-frame TIFF)
 /// - Directory → [`load_tiff_directory`] (one file per frame)
 ///
+/// Directories are **not** loaded purely lexicographically: chunked VENUS
+/// folders (`<prefix>_<chunk>_<frame>.tif`) are detected automatically,
+/// ordered by numeric frame index, and chunks are summed element-wise
+/// (the [`TiffFolderOptions`] defaults — see the [module docs](self)).
+/// No provenance is returned; use [`load_tiff_auto_with_options`] to get
+/// a [`TiffLoadInfo`] and to control chunk summing.
+///
 /// # Arguments
 /// * `path` — Path to either a multi-frame TIFF file or a directory of TIFFs.
 ///
@@ -363,14 +370,21 @@ pub fn load_tiff_auto_with_options(
 
 /// Load a directory of single-frame TIFFs as a 3D stack.
 ///
-/// Files are sorted by name (lexicographic), so they should be named with
-/// zero-padded indices (e.g., `frame_0001.tiff`, `frame_0002.tiff`, ...).
+/// Delegates to [`load_tiff_folder`] with default options: chunked VENUS
+/// folders (`<prefix>_<chunk>_<frame>.tif`) are detected automatically,
+/// ordered by numeric frame index, and chunks covering identical frame
+/// ranges are **summed element-wise**.  Only folders *not* following the
+/// chunk convention load in lexicographic filename order — name legacy
+/// files with zero-padded indices (e.g., `frame_0001.tiff`,
+/// `frame_0002.tiff`, ...).  No provenance is returned; use
+/// [`load_tiff_folder_with_options`] to get a [`TiffLoadInfo`] and to
+/// control chunk summing.
 ///
 /// # Arguments
 /// * `dir` — Path to the directory containing TIFF files.
 ///
 /// # Returns
-/// 3D array with shape (n_files, height, width) and f64 values.
+/// 3D array with shape (n_frames, height, width) and f64 values.
 pub fn load_tiff_directory(dir: &Path) -> Result<Array3<f64>, IoError> {
     load_tiff_folder(dir, None).map_err(|e| match e {
         // Preserve the original error message for backward compatibility.
@@ -383,8 +397,15 @@ pub fn load_tiff_directory(dir: &Path) -> Result<Array3<f64>, IoError> {
 
 /// Load a directory of TIFFs matching a glob pattern as a 3D stack.
 ///
-/// Files are sorted lexicographically by name, so they should be named with
-/// zero-padded indices (e.g., `frame_0001.tif`, `frame_0002.tif`, ...).
+/// Applies the default [`TiffFolderOptions`]: chunked VENUS folders
+/// (`<prefix>_<chunk>_<frame>.tif`) are detected automatically, ordered by
+/// numeric frame index, and chunks covering identical frame ranges are
+/// **summed element-wise**.  Only folders *not* following the chunk
+/// convention load in lexicographic filename order — name legacy files
+/// with zero-padded indices (e.g., `frame_0001.tif`, `frame_0002.tif`,
+/// ...).  No provenance is returned; use
+/// [`load_tiff_folder_with_options`] to get a [`TiffLoadInfo`] and to
+/// control chunk summing.
 ///
 /// Only files with `.tif` or `.tiff` extensions (case-insensitive) are considered.
 /// When `pattern` is `None`, all such files are loaded.  When `Some`, the pattern
@@ -664,8 +685,11 @@ fn detect_chunk_layout(dir: &Path, paths: &[PathBuf]) -> Result<ChunkLayout, IoE
 /// Load a validated chunked layout: first chunk becomes the stack, remaining
 /// chunks are decoded frame-by-frame and added element-wise.
 ///
-/// Peak memory is one full stack plus one frame — VENUS stacks run to
-/// several GB, so materialising every chunk simultaneously is not an option.
+/// Peak memory is one full stack plus one frame's decode buffers: the first
+/// chunk is decoded straight into its preallocated stack (see
+/// [`load_frames_from_paths`]) and every later chunk is added one frame at
+/// a time.  VENUS stacks run to several GB, so materialising every chunk
+/// (or a transient second copy of one chunk's stack) is not an option.
 fn load_chunked_sum(
     chunks: &BTreeMap<u64, Vec<(u64, PathBuf)>>,
     pixel_policy: PixelValuePolicy,
@@ -701,7 +725,10 @@ fn load_chunked_sum(
 ///
 /// Each file must contain exactly one frame.  Dimensions are checked for
 /// consistency across all files and pixel counts are validated against the
-/// reported image dimensions.
+/// reported image dimensions.  The stack is preallocated once the first
+/// frame reveals the dimensions and every frame is copied straight into
+/// its slice, so peak memory is the full stack plus one frame's decode
+/// buffers — never a transient second copy of the stack.
 fn load_frames_from_paths(
     paths: &[std::path::PathBuf],
     pixel_policy: PixelValuePolicy,
@@ -711,9 +738,12 @@ fn load_frames_from_paths(
         !paths.is_empty(),
         "load_frames_from_paths called with empty paths"
     );
-    let mut frames: Vec<Vec<f64>> = Vec::new();
     let mut width = 0u32;
     let mut height = 0u32;
+    // Placeholder until the first frame reveals the dimensions (returned
+    // as-is only in the release-mode empty-input case the debug_assert
+    // above rules out in tests).
+    let mut arr = Array3::<f64>::zeros((0, 0, 0));
 
     for (i, path) in paths.iter().enumerate() {
         let (pixels, w, h) = read_single_frame(path, i, pixel_policy, n_clipped_pixels)?;
@@ -721,6 +751,7 @@ fn load_frames_from_paths(
         if i == 0 {
             width = w;
             height = h;
+            arr = Array3::zeros((paths.len(), h as usize, w as usize));
         } else if w != width || h != height {
             return Err(IoError::DimensionMismatch {
                 expected: (width, height),
@@ -729,13 +760,14 @@ fn load_frames_from_paths(
             });
         }
 
-        frames.push(pixels);
+        // read_single_frame validated pixels.len() == w × h, so this shape
+        // check cannot fail in practice; map it anyway rather than unwrap.
+        let view = ArrayView2::from_shape((h as usize, w as usize), &pixels)
+            .map_err(|e| IoError::TiffDecode(format!("Shape error: {}", e)))?;
+        arr.slice_mut(s![i, .., ..]).assign(&view);
     }
 
-    let n_frames = frames.len();
-    let flat: Vec<f64> = frames.into_iter().flatten().collect();
-    Array3::from_shape_vec((n_frames, height as usize, width as usize), flat)
-        .map_err(|e| IoError::TiffDecode(format!("Shape error: {}", e)))
+    Ok(arr)
 }
 
 /// Decode one single-frame TIFF file to `(pixels, width, height)`.
