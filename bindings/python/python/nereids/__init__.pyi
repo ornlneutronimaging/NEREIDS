@@ -106,7 +106,20 @@ class ResonanceData:
 
     @property
     def n_resonances(self) -> int:
-        """Total number of resonances across all L-groups and ranges."""
+        """Total number of resonances across all ranges and formalisms.
+
+        Formalism-aware: counts LRF=1/2/3 L-group resonances *and* LRF=7
+        R-matrix-limited spin-group resonances (which previously reported 0).
+        """
+        ...
+
+    @property
+    def total_resonance_count(self) -> int:
+        """Total resonance count across all ranges and formalisms.
+
+        Explicit alias for :attr:`n_resonances`; both delegate to the
+        formalism-aware Rust ``ResonanceData::total_resonance_count()``.
+        """
         ...
 
     @property

@@ -79,13 +79,8 @@ struct PyResonanceData {
 impl PyResonanceData {
     /// String representation.
     fn __repr__(&self) -> String {
-        let n_res: usize = self
-            .inner
-            .ranges
-            .iter()
-            .flat_map(|r| &r.l_groups)
-            .map(|lg| lg.resonances.len())
-            .sum();
+        // Formalism-aware count (covers LRF=7 R-matrix-limited spin groups too).
+        let n_res: usize = self.inner.total_resonance_count();
         format!(
             "ResonanceData(Z={}, A={}, AWR={:.3}, n_resonances={})",
             self.inner.isotope.z(),
@@ -113,15 +108,25 @@ impl PyResonanceData {
         self.inner.awr
     }
 
-    /// Number of resonances.
+    /// Number of resonances (across all ranges and all formalisms).
+    ///
+    /// Delegates to the formalism-aware
+    /// [`ResonanceData::total_resonance_count`], so LRF=7 R-matrix-limited
+    /// evaluations (whose resonances live in `rml.spin_groups`, not
+    /// `l_groups`) are counted correctly instead of reporting 0.
     #[getter]
     fn n_resonances(&self) -> usize {
-        self.inner
-            .ranges
-            .iter()
-            .flat_map(|r| &r.l_groups)
-            .map(|lg| lg.resonances.len())
-            .sum()
+        self.inner.total_resonance_count()
+    }
+
+    /// Total resonance count across all ranges and formalisms.
+    ///
+    /// Explicit alias for [`Self::n_resonances`]; both delegate to the
+    /// formalism-aware Rust `ResonanceData::total_resonance_count()` (covers
+    /// LRF=1/2/3 L-groups and LRF=7 R-matrix-limited spin groups).
+    #[getter]
+    fn total_resonance_count(&self) -> usize {
+        self.inner.total_resonance_count()
     }
 
     /// Target spin (I) of the first resonance range.

@@ -2117,6 +2117,39 @@ mod tests {
         );
     }
 
+    /// LRF=7 resonances must be counted by `total_resonance_count()`.
+    ///
+    /// R-matrix-limited (LRF=7) resonances live in `rml.spin_groups`, not in
+    /// `l_groups`. A naive `l_groups`-only sum (as the Python `n_resonances`
+    /// getter used to do) reports 0 for such evaluations; the formalism-aware
+    /// accessor must report the true count. This pins the Rust side of the
+    /// issue-#638 binding fix so the Python delegation stays correct.
+    #[test]
+    fn test_lrf7_total_resonance_count_nonzero() {
+        const ENDF: &str =
+            include_str!("../../../tests/data/synthetic/lrf7_krm3_resonance_column_order.endf");
+        let data = parse_endf_file2(ENDF).expect("fixture must parse without error");
+
+        // The naive l_groups-only sum that the old Python getter used.
+        let l_groups_only: usize = data
+            .ranges
+            .iter()
+            .flat_map(|r| &r.l_groups)
+            .map(|lg| lg.resonances.len())
+            .sum();
+        assert_eq!(
+            l_groups_only, 0,
+            "LRF=7 fixture has no l_groups resonances (they live in rml.spin_groups)"
+        );
+
+        // The formalism-aware accessor the binding now delegates to.
+        assert_eq!(
+            data.total_resonance_count(),
+            2,
+            "total_resonance_count() must count LRF=7 rml.spin_groups resonances"
+        );
+    }
+
     /// KRM=2 spin group with an explicit photon capture channel (IPP=2, MA=0).
     ///
     /// Before issue #45 the parser rejected MA<0.5 channels with UnsupportedFormat.

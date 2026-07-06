@@ -263,6 +263,30 @@ class TestResonanceData:
                 formalism="bogus",
             )
 
+    def test_lrf7_n_resonances_counts_rml_spin_groups(self):
+        """LRF=7 R-matrix-limited resonances must be counted (issue #638).
+
+        Their resonances live in ``rml.spin_groups``, not ``l_groups``. The
+        ``n_resonances`` getter previously summed only ``l_groups`` and so
+        reported 0 for R-matrix-limited evaluations. It now delegates to the
+        formalism-aware Rust ``total_resonance_count()``. This synthetic
+        LRF=7/KRM=3 fixture has exactly 2 resonances and zero L-groups.
+        """
+        root = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+        fixture = os.path.join(
+            root, "tests/data/synthetic/lrf7_krm3_resonance_column_order.endf"
+        )
+        if not os.path.exists(fixture):
+            pytest.skip(f"LRF=7 fixture missing at {fixture}")
+
+        data = nereids.load_endf_file(fixture)
+        assert data.n_resonances > 0, (
+            "LRF=7 evaluation must not report 0 resonances"
+        )
+        assert data.n_resonances == 2, "fixture has 2 R-matrix-limited resonances"
+        # Explicit alias must agree with n_resonances.
+        assert data.total_resonance_count == data.n_resonances
+
 
 # ===========================================================================
 # Cross-sections
