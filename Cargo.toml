@@ -76,12 +76,12 @@ rfd = { version = "=0.17.2", default-features = false }
 # any egui/eframe bump MUST bump this together.
 egui-file-dialog = "0.12"
 hdf5 = { package = "hdf5-metno", version = "0.12", features = ["static", "zlib"] }
-rand = "0.9"
+rand = "0.10"
 # Stable-stream RNG for seeded test noise: StdRng's stream is documented
 # UNSTABLE across rand versions, so acceptance tests that pin a noise
 # realization must name a concrete algorithm (ChaCha12) instead.
-rand_chacha = "0.9"
-rand_distr = "0.5"
+rand_chacha = "0.10"
+rand_distr = "0.6"
 microlp = "0.4"
 tracing = "0.1"
 # log-crate facade: bridged into tracing by apps/gui/src/logging.rs so
