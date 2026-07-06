@@ -643,8 +643,8 @@ fn load_hdf5_histogram(state: &mut AppState) {
 }
 
 /// Format the chunk-summing / chunk-concatenation / stray-file /
-/// pixel-clipping provenance suffix for a TIFF load, or an empty string
-/// when nothing noteworthy happened.
+/// inconsistent-chunk / pixel-clipping provenance suffix for a TIFF load, or
+/// an empty string when nothing noteworthy happened.
 fn tiff_load_suffix(info: &nereids_io::tiff_stack::TiffLoadInfo) -> String {
     let mut suffix = String::new();
     if info.n_chunks > 1 {
@@ -676,6 +676,20 @@ fn tiff_load_suffix(info: &nereids_io::tiff_stack::TiffLoadInfo) -> String {
             info.n_unrecognized_files,
             info.unrecognized_examples.join(", "),
         ));
+    }
+    if info.chunk_inconsistent {
+        // The files ARE chunk-patterned but internally inconsistent (ragged
+        // frame counts/sets or a duplicate (chunk, frame) pair).  Under the
+        // default summing path this is a hard error; because transmission
+        // mode loads with sum_chunks=false, it instead loaded verbatim as a
+        // lexicographic concatenation — which the operator must see, since a
+        // ragged raw run folder that would otherwise fail is now a silent
+        // plain stack whose only symptom is a spectrum-count mismatch.
+        suffix.push_str(
+            " — WARNING: DAQ chunks are internally inconsistent (ragged frame \
+             counts/sets or duplicate frames); loaded as a plain lexicographic \
+             concatenation, not summed",
+        );
     }
     if info.n_clipped_pixels > 0 {
         suffix.push_str(&format!(
