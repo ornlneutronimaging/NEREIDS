@@ -132,8 +132,10 @@ fn closed_loop(t_true_k: f64) {
     // Seeded absolute Gaussian noise. ChaCha12Rng by NAME (review #645 round
     // 2, F5): StdRng's stream is documented unstable across rand versions —
     // a rand upgrade would silently swap the noise realization under this
-    // test's fixed tolerances. (rand 0.9's StdRng is currently ChaCha12, so
-    // this pin preserves the exact realization the tolerances were set on.)
+    // test's fixed tolerances. Naming ChaCha12Rng explicitly pins the exact
+    // stream regardless of what StdRng aliases in any rand version (the
+    // rand 0.9→0.10 bump left this realization unchanged — both closed-loop
+    // cases still pass with no re-baseline).
     let mut rng = ChaCha12Rng::seed_from_u64(642);
     let normal = Normal::new(0.0, NOISE_SIGMA).unwrap();
     let data: Vec<f64> = clean.iter().map(|&t| t + normal.sample(&mut rng)).collect();
