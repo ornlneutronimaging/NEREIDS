@@ -42,14 +42,24 @@ tiff = "0.11"
 image = "0.25"
 pyo3 = { version = "0.29", features = ["extension-module"] }
 numpy = "0.29"
-# NOTE: keep eframe default features ON — winit's default wayland-dlopen /
-# x11 features make the display stack dlopen'ed rather than linked.
-# Disabling defaults would hard-link libwayland and re-trigger wheel
-# vendoring (see scripts/check_wheel_policy.sh).
-eframe = { version = "0.33", features = ["persistence"] }
-egui = "0.33"
-egui_extras = { version = "0.33", features = ["image", "svg"] }
-egui_plot = "0.34"
+# eframe 0.34 made `wgpu` the default renderer and moved `glow` to opt-in.
+# We render with glow (Renderer::Glow in main.rs) and DROP wgpu entirely
+# (default-features = false + explicit features): under glow, wgpu is dead
+# weight, its wgpu-hal Direct3D12 backend fails to build on Windows (a
+# windows-core 0.61/0.62 trait conflict), and it bloats the manylinux wheel.
+# This mirrors what eframe 0.33 shipped (glow, no wgpu).
+# CAVEAT (wheel): eframe pulls egui-winit/winit with default-features = false,
+# so the ONLY source of winit's wayland-dlopen is eframe's own default
+# `winit/default` entry — which default-features = false drops. eframe's
+# `wayland`/`x11` features map to winit/wayland|x11 (hard-link), NOT the dlopen
+# variant. libwayland must stay dlopen'ed (not linked) or the wheel re-vendors
+# it (see scripts/check_wheel_policy.sh), so wayland-dlopen is restored by a
+# direct Linux-only `winit` dep in apps/gui/Cargo.toml. Do NOT drop that winit
+# dep, and do NOT re-enable wgpu.
+eframe = { version = "0.34", default-features = false, features = ["accesskit", "default_fonts", "glow", "persistence", "wayland", "x11"] }
+egui = "0.34"
+egui_extras = { version = "0.34", features = ["image", "svg"] }
+egui_plot = "0.35"
 # Native file dialogs. default-features = false retires the gtk3 backend
 # permanently: rfd's gtk3 feature pins gtk-sys's v3_24 feature
 # (gtk+-3.0 >= 3.24 at BUILD time), which forced the Linux wheel from
@@ -74,14 +84,14 @@ rfd = { version = "=0.17.2", default-features = false }
 # Pure-egui in-app file browser (Linux fallback dialog tier). LOCKSTEP
 # with egui minors: 0.12 <-> egui 0.33, 0.13 <-> 0.34, 0.14 <-> 0.35 —
 # any egui/eframe bump MUST bump this together.
-egui-file-dialog = "0.12"
+egui-file-dialog = "0.13"
 hdf5 = { package = "hdf5-metno", version = "0.12", features = ["static", "zlib"] }
-rand = "0.9"
+rand = "0.10"
 # Stable-stream RNG for seeded test noise: StdRng's stream is documented
 # UNSTABLE across rand versions, so acceptance tests that pin a noise
 # realization must name a concrete algorithm (ChaCha12) instead.
-rand_chacha = "0.9"
-rand_distr = "0.5"
+rand_chacha = "0.10"
+rand_distr = "0.6"
 microlp = "0.4"
 tracing = "0.1"
 # log-crate facade: bridged into tracing by apps/gui/src/logging.rs so

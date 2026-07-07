@@ -4,17 +4,17 @@ use crate::state::{AppState, UiMode};
 use crate::theme::{ThemeColors, semantic};
 
 /// Render the bottom status bar.
-pub fn status_bar(ctx: &egui::Context, state: &AppState, rss_bytes: u64) {
-    let colors = ThemeColors::from_ctx(ctx);
-    egui::TopBottomPanel::bottom("status_bar")
-        .exact_height(28.0)
+pub fn status_bar(ui: &mut egui::Ui, state: &AppState, rss_bytes: u64) {
+    let colors = ThemeColors::from_ctx(ui.ctx());
+    egui::Panel::bottom("status_bar")
+        .exact_size(28.0)
         .frame(
             egui::Frame::NONE
                 .fill(colors.bg2)
                 .inner_margin(egui::Margin::symmetric(12, 4))
                 .stroke(egui::Stroke::new(1.0, colors.border)),
         )
-        .show(ctx, |ui| {
+        .show_inside(ui, |ui| {
             ui.horizontal(|ui| {
                 // Status dot
                 let dot_color = if state.is_fitting || state.is_fetching_endf || state.is_saving {

@@ -7,17 +7,18 @@ use crate::theme::ThemeColors;
 use crate::widgets::design;
 
 /// Render the top toolbar.
-pub fn toolbar(ctx: &egui::Context, state: &mut AppState) {
-    let colors = ThemeColors::from_ctx(ctx);
-    egui::TopBottomPanel::top("toolbar")
-        .exact_height(48.0)
+pub fn toolbar(ui: &mut egui::Ui, state: &mut AppState) {
+    let ctx = ui.ctx().clone();
+    let colors = ThemeColors::from_ctx(&ctx);
+    egui::Panel::top("toolbar")
+        .exact_size(48.0)
         .frame(
             egui::Frame::NONE
                 .fill(colors.bg2)
                 .inner_margin(egui::Margin::symmetric(12, 6))
                 .stroke(egui::Stroke::new(1.0, colors.border)),
         )
-        .show(ctx, |ui| {
+        .show_inside(ui, |ui| {
             ui.horizontal_centered(|ui| {
                 ui.spacing_mut().item_spacing.x = 10.0;
 
@@ -39,7 +40,7 @@ pub fn toolbar(ctx: &egui::Context, state: &mut AppState) {
                 ui.selectable_value(&mut state.ui_mode, UiMode::Studio, "Studio");
 
                 // Help menu (log folder + log path) — issue #524
-                help_menu(ctx, ui);
+                help_menu(&ctx, ui);
 
                 // Trailing controls right-aligned
                 ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {

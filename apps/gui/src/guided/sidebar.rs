@@ -5,8 +5,8 @@ use crate::theme::{ThemeColors, semantic};
 use egui::{Align, Color32, CornerRadius, Layout, Margin, RichText, Sense, Stroke};
 
 /// Render the guided mode sidebar with step navigation.
-pub fn guided_sidebar(ctx: &egui::Context, state: &mut AppState) {
-    let colors = ThemeColors::from_ctx(ctx);
+pub fn guided_sidebar(ui: &mut egui::Ui, state: &mut AppState) {
+    let colors = ThemeColors::from_ctx(ui.ctx());
     let force_compact = state.guided_step == GuidedStep::Analyze;
     let panel_width = if state.sidebar_collapsed || force_compact {
         56.0
@@ -18,9 +18,9 @@ pub fn guided_sidebar(ctx: &egui::Context, state: &mut AppState) {
     } else {
         Margin::symmetric(12, 16)
     };
-    egui::SidePanel::left("guided_sidebar")
-        .default_width(panel_width)
-        .exact_width(panel_width)
+    egui::Panel::left("guided_sidebar")
+        .default_size(panel_width)
+        .exact_size(panel_width)
         .resizable(false)
         .frame(
             egui::Frame::NONE
@@ -28,7 +28,7 @@ pub fn guided_sidebar(ctx: &egui::Context, state: &mut AppState) {
                 .inner_margin(margin)
                 .stroke(Stroke::new(1.0, colors.border)),
         )
-        .show(ctx, |ui| {
+        .show_inside(ui, |ui| {
             if state.sidebar_collapsed || force_compact {
                 collapsed_sidebar(ui, state, &colors, force_compact);
             } else {

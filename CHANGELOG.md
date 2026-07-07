@@ -271,6 +271,26 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
 
 ### Changed
 
+- **rand 0.9→0.10 and egui 0.33→0.34 ecosystem upgrades** (#670, #671):
+  coordinated bumps that supersede six Dependabot PRs (#660, #665, #661,
+  #663, #664, #668) which each break the build in isolation.
+  - `rand`/`rand_chacha` → 0.10, `rand_distr` → 0.6. Only `rand_core` 0.10
+    is actually compiled (`cargo tree` shows a single built `rand_core`);
+    the lockfile still lists older `rand_core` from optional/transitive deps
+    (phf build-dep, quinn) that are not in the default build graph. No API
+    changes at our one call site (the `ic_closed_loop` seeded-noise test):
+    the seeded ChaCha12 stream is algorithm-stable, so closed-loop
+    temperature recovery passes with no re-baseline or tolerance change.
+  - `eframe`/`egui`/`egui_extras` → 0.34, `egui_plot` → 0.35,
+    `egui-file-dialog` → 0.13. eframe 0.34 makes **wgpu** the default
+    renderer; NEREIDS pins **glow** (`Renderer::Glow`) with eframe default
+    features kept ON, preserving the `winit/default` wayland-dlopen display
+    stack proven on the ORNL ThinLinc / manylinux_2_28 fleet. The egui 0.34
+    render-model migration (`App::update`→`App::ui`, panels via
+    `egui::Panel::{left,top,bottom}` + `show_inside`, `Context::style`→
+    `global_style`) is internal to `apps/gui` — no user-facing behavior
+    change.
+
 - **Config-class Python errors now raise `ValueError` uniformly** (#635
   review): `fit_spectrum_typed`, `fit_counts_spectrum_typed`, and
   `compute_model_jacobian` previously stringified every `PipelineError`

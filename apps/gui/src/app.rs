@@ -89,14 +89,19 @@ impl eframe::App for NereidsApp {
         self.save_session_cache(storage);
     }
 
-    fn update(&mut self, ctx: &egui::Context, frame: &mut eframe::Frame) {
+    fn ui(&mut self, ui: &mut egui::Ui, frame: &mut eframe::Frame) {
         #[cfg(not(target_os = "macos"))]
         let _ = frame;
 
+        // egui 0.34: `App::ui` provides the whole-window `Ui`. Keep an owned
+        // Context handle for the non-panel logic (input, repaint, shortcuts)
+        // and the Window/modal calls below; panels use `show_inside(ui)`.
+        let ctx = ui.ctx().clone();
+
         // Apply theme (skip if unchanged to avoid 80+ color assignments per frame)
-        let resolved = theme::resolve_dark_mode(ctx, self.state.theme_preference);
+        let resolved = theme::resolve_dark_mode(&ctx, self.state.theme_preference);
         if self.state.last_applied_dark_mode != Some(resolved) {
-            theme::apply_theme(ctx, self.state.theme_preference);
+            theme::apply_theme(&ctx, self.state.theme_preference);
             self.state.last_applied_dark_mode = Some(resolved);
         }
 
@@ -151,7 +156,7 @@ impl eframe::App for NereidsApp {
         }
 
         // Top toolbar
-        widgets::toolbar::toolbar(ctx, &mut self.state);
+        widgets::toolbar::toolbar(ui, &mut self.state);
 
         // Dialog problems surfaced by the facade: probe/canary
         // verdicts and native-backend failures (the facade classifies
@@ -165,7 +170,7 @@ impl eframe::App for NereidsApp {
             // no per-frame clone of a message that may stay visible for
             // many frames.
             let mut dismissed = false;
-            egui::TopBottomPanel::top("native_dialog_warning").show(ctx, |ui| {
+            egui::Panel::top("native_dialog_warning").show_inside(ui, |ui| {
                 ui.horizontal_wrapped(|ui| {
                     ui.label(egui::RichText::new("\u{26A0}").color(ui.visuals().warn_fg_color));
                     ui.label(msg.as_str());
@@ -180,14 +185,14 @@ impl eframe::App for NereidsApp {
         }
 
         // Bottom status bar
-        widgets::statusbar::status_bar(ctx, &self.state, self.memory.rss_bytes);
+        widgets::statusbar::status_bar(ui, &self.state, self.memory.rss_bytes);
 
         // Main content area
         match self.state.ui_mode {
             UiMode::Guided => {
-                guided::sidebar::guided_sidebar(ctx, &mut self.state);
-                guided::sidebar::history_window(ctx, &mut self.state);
-                egui::CentralPanel::default().show(ctx, |ui| {
+                guided::sidebar::guided_sidebar(ui, &mut self.state);
+                guided::sidebar::history_window(&ctx, &mut self.state);
+                egui::CentralPanel::default().show_inside(ui, |ui| {
                     // Analyze needs the real viewport height so its image
                     // column can fill vertically (ScrollArea makes
                     // available_height() return infinity). All other steps
@@ -202,20 +207,20 @@ impl eframe::App for NereidsApp {
                 });
             }
             UiMode::Studio => {
-                studio::studio_content(ctx, &mut self.state);
+                studio::studio_content(ui, &mut self.state);
             }
         }
 
         // Save-mode chooser modal
-        crate::project::save_modal(ctx, &mut self.state);
+        crate::project::save_modal(&ctx, &mut self.state);
 
         // Periodic table modal overlay
-        crate::widgets::periodic_table::periodic_table_modal(ctx, &mut self.state);
+        crate::widgets::periodic_table::periodic_table_modal(&ctx, &mut self.state);
 
         // File dialogs: drive any retained dialog, then route completed
         // picks. Runs after all panels so results are applied exactly
         // once per frame regardless of which panel opened the dialog.
-        self.state.file_dialogs.update(ctx);
+        self.state.file_dialogs.update(&ctx);
         crate::file_dialog::dispatch_results(&mut self.state);
     }
 }

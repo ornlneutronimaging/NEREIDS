@@ -16,7 +16,7 @@ use crate::widgets::image_view::show_colormapped_image;
 use egui_plot::{Line, Plot, PlotPoints};
 
 /// Render the Studio mode content.
-pub fn studio_content(ctx: &egui::Context, state: &mut AppState) {
+pub fn studio_content(ui: &mut egui::Ui, state: &mut AppState) {
     let has_results = state.spatial_result.is_some();
 
     // Ensure tile_display is populated when results exist
@@ -30,23 +30,23 @@ pub fn studio_content(ctx: &egui::Context, state: &mut AppState) {
 
     // 1. Bottom dock (before side panel and central panel — egui ordering)
     if state.studio_show_dock {
-        bottom_dock(ctx, state);
+        bottom_dock(ui, state);
     }
 
     // 2. Parameter sidebar (left, Analysis tab only)
     if state.studio_doc_tab == StudioDocTab::Analysis {
-        parameter_sidebar(ctx, state);
+        parameter_sidebar(ui, state);
     }
 
     // 3. Central panel: doc tab bar + routed content
-    let colors = ThemeColors::from_ctx(ctx);
+    let colors = ThemeColors::from_ctx(ui.ctx());
     egui::CentralPanel::default()
         .frame(
             egui::Frame::NONE
                 .fill(colors.bg)
                 .inner_margin(egui::Margin::same(12)),
         )
-        .show(ctx, |ui| {
+        .show_inside(ui, |ui| {
             doc_tab_bar(ui, state);
             ui.add_space(4.0);
 
@@ -603,20 +603,20 @@ fn studio_detectability(ui: &mut egui::Ui, state: &mut AppState) {
 // Bottom dock (resizable panel with 4 tabs)
 // ---------------------------------------------------------------------------
 
-fn bottom_dock(ctx: &egui::Context, state: &mut AppState) {
-    let colors = ThemeColors::from_ctx(ctx);
-    egui::TopBottomPanel::bottom("studio_dock")
+fn bottom_dock(ui: &mut egui::Ui, state: &mut AppState) {
+    let colors = ThemeColors::from_ctx(ui.ctx());
+    egui::Panel::bottom("studio_dock")
         .resizable(true)
-        .default_height(200.0)
-        .min_height(140.0)
-        .max_height(400.0)
+        .default_size(200.0)
+        .min_size(140.0)
+        .max_size(400.0)
         .frame(
             egui::Frame::NONE
                 .fill(colors.bg)
                 .inner_margin(egui::Margin::symmetric(12, 8))
                 .stroke(egui::Stroke::new(1.0, colors.border)),
         )
-        .show(ctx, |ui| {
+        .show_inside(ui, |ui| {
             let labels = &["Isotopes", "Residuals", "Provenance", "Export"];
             design::underline_tabs(ui, labels, &mut state.studio_dock_tab);
             ui.add_space(4.0);
@@ -1102,20 +1102,20 @@ fn dock_export(ui: &mut egui::Ui, state: &mut AppState) {
 
 /// Left parameter sidebar — editable beamline, solver, isotope, and ROI
 /// controls with dirty tracking + re-run button.
-fn parameter_sidebar(ctx: &egui::Context, state: &mut AppState) {
-    let colors = ThemeColors::from_ctx(ctx);
-    egui::SidePanel::left("studio_params")
+fn parameter_sidebar(ui: &mut egui::Ui, state: &mut AppState) {
+    let colors = ThemeColors::from_ctx(ui.ctx());
+    egui::Panel::left("studio_params")
         .resizable(true)
-        .default_width(240.0)
-        .min_width(200.0)
-        .max_width(360.0)
+        .default_size(240.0)
+        .min_size(200.0)
+        .max_size(360.0)
         .frame(
             egui::Frame::NONE
                 .fill(colors.bg)
                 .inner_margin(egui::Margin::symmetric(10, 8))
                 .stroke(egui::Stroke::new(1.0, colors.border)),
         )
-        .show(ctx, |ui| {
+        .show_inside(ui, |ui| {
             egui::ScrollArea::vertical().show(ui, |ui| {
                 rerun_card(ui, state);
                 ui.add_space(6.0);

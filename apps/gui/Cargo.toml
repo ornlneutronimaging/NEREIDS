@@ -45,6 +45,12 @@ rfd = { workspace = true }
 [target.'cfg(target_os = "linux")'.dependencies]
 rfd = { workspace = true, features = ["xdg-portal", "wayland"] }
 egui-file-dialog = { workspace = true }
+# Restore winit's wayland-dlopen. eframe (Cargo.toml) drops wgpu via
+# default-features = false, which also drops eframe's `winit/default` — the
+# sole source of dlopen. Without this, winit hard-links libwayland-client and
+# the manylinux_2_28 wheel re-vendors it (scripts/check_wheel_policy.sh). Pin
+# tracks eframe 0.34.3's winit (0.30.x); features unify across the graph.
+winit = { version = "0.30", default-features = false, features = ["wayland-dlopen"] }
 
 [dev-dependencies]
 tempfile = { workspace = true }

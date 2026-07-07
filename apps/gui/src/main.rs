@@ -27,6 +27,10 @@ fn main() -> eframe::Result {
         viewport: egui::ViewportBuilder::default()
             .with_inner_size([1280.0, 800.0])
             .with_title("NEREIDS — Neutron Resonance Resolved Imaging"),
+        // eframe 0.34 changed the default renderer to wgpu; pin glow — the
+        // OpenGL backend proven on the ORNL ThinLinc / manylinux_2_28 fleet
+        // (see the eframe dep note in the workspace Cargo.toml).
+        renderer: eframe::Renderer::Glow,
         ..Default::default()
     };
 
