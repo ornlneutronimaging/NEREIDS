@@ -263,6 +263,35 @@ class TestResonanceData:
                 formalism="bogus",
             )
 
+    def test_lrf7_n_resonances_counts_rml_spin_groups(self):
+        """LRF=7 R-matrix-limited resonances must be counted (issue #638).
+
+        Their resonances live in ``rml.spin_groups``, not ``l_groups``. The
+        ``n_resonances`` getter previously summed only ``l_groups`` and so
+        reported 0 for R-matrix-limited evaluations. It now delegates to the
+        formalism-aware Rust ``total_resonance_count()``. This synthetic
+        LRF=7/KRM=3 fixture has exactly 2 resonances and zero L-groups.
+        """
+        root = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+        fixture = os.path.join(
+            root, "tests/data/synthetic/lrf7_krm3_resonance_column_order.endf"
+        )
+        # The fixture is committed to the repo, so a missing file is a
+        # packaging/path regression that MUST fail — not a skip that would
+        # silently disable this LRF=7 count guard.
+        assert os.path.exists(fixture), (
+            f"vendored LRF=7 regression fixture must be present at {fixture} "
+            "(committed test data)"
+        )
+
+        data = nereids.load_endf_file(fixture)
+        assert data.n_resonances > 0, (
+            "LRF=7 evaluation must not report 0 resonances"
+        )
+        assert data.n_resonances == 2, "fixture has 2 R-matrix-limited resonances"
+        # Explicit alias must agree with n_resonances.
+        assert data.total_resonance_count == data.n_resonances
+
 
 # ===========================================================================
 # Cross-sections
@@ -2936,6 +2965,145 @@ class TestFixDensities:
             "counts frozen-density temperature σ must be finite positive, "
             f"got {r.temperature_k_unc}"
         )
+
+    def test_scale_by_chi2_inflates_counts_uncertainty(self, u238_data):
+        """Issue #638: ``scale_by_chi2=True`` inflates the covariance-only
+        uncertainties by exactly ``sqrt(deviance_per_dof)`` on the counts-KL
+        (joint-Poisson) path, and ``scale_by_chi2=False`` reproduces the default
+        (no regression)."""
+        energies = np.linspace(1.0, 30.0, 300)
+        true_density = 8.0e-4
+        true_temp = 350.0
+        flux = 5000.0
+        t_1d = np.asarray(
+            nereids.forward_model(
+                energies, [(u238_data, true_density)], temperature_k=true_temp
+            )
+        )
+        rng = np.random.default_rng(20260706)
+        open_beam = np.maximum(
+            rng.poisson(np.full_like(t_1d, flux)).astype(float), 1.0
+        )
+        sample = rng.poisson(flux * t_1d).astype(float)
+
+        def run(scale):
+            return nereids.fit_counts_spectrum_typed(
+                sample_counts=sample,
+                open_beam_counts=open_beam,
+                energies=energies,
+                isotopes=[(u238_data, true_density)],
+                solver="kl",
+                c=1.0,
+                temperature_k=300.0,
+                fit_temperature=True,
+                max_iter=200,
+                scale_by_chi2=scale,
+            )
+
+        unscaled = run(False)
+        scaled = run(True)
+        assert bool(unscaled.converged) and bool(scaled.converged)
+
+        # The flag only rescales the post-convergence covariance, so the fit
+        # itself (parameters, deviance) is identical between the two runs.
+        dpd = unscaled.deviance_per_dof
+        assert dpd is not None and np.isfinite(dpd) and dpd > 0.0, (
+            f"counts-KL must report a valid deviance_per_dof, got {dpd}"
+        )
+        factor = float(np.sqrt(dpd))
+        # reduced_chi_squared mirrors deviance_per_dof on this path.
+        assert float(unscaled.reduced_chi_squared) == pytest.approx(dpd, rel=1e-9)
+
+        # Temperature σ scales by exactly sqrt(deviance_per_dof).
+        t_un = float(unscaled.temperature_k_unc)
+        t_sc = float(scaled.temperature_k_unc)
+        assert t_sc == pytest.approx(t_un * factor, rel=1e-6), (
+            f"σ_T: scaled {t_sc} must equal unscaled {t_un} × {factor}"
+        )
+
+        # Free-density σ scales by the same factor.
+        d_un = float(unscaled.uncertainties[0])
+        d_sc = float(scaled.uncertainties[0])
+        assert np.isfinite(d_un) and d_un > 0.0
+        assert d_sc == pytest.approx(d_un * factor, rel=1e-6)
+
+        # No regression: scale_by_chi2=False (the default) reproduces a plain
+        # flag-absent fit bit-for-bit.
+        default = nereids.fit_counts_spectrum_typed(
+            sample_counts=sample,
+            open_beam_counts=open_beam,
+            energies=energies,
+            isotopes=[(u238_data, true_density)],
+            solver="kl",
+            c=1.0,
+            temperature_k=300.0,
+            fit_temperature=True,
+            max_iter=200,
+        )
+        assert float(default.temperature_k_unc) == t_un, (
+            "default (flag absent) must equal scale_by_chi2=False"
+        )
+
+    def test_scale_by_chi2_transmission_kl_scales_by_reduced_chi2(self, u238_data):
+        """Issue #638 (review R1): on the transmission Poisson-KL path
+        (``fit_spectrum_typed(solver="kl")``), ``scale_by_chi2=True`` scales σ by
+        ``sqrt(reduced_chi_squared)`` — the SAME Gaussian goodness-of-fit the
+        result reports, the identical prescription the LM path applies — NOT a
+        Poisson deviance on transmission fractions. The direction guard is the
+        regression check: a deliberately poor fit (reduced-χ² > 1) must GROW σ;
+        the original bug scaled by the transmission Poisson deviance, which gave
+        ``D ≪ dof`` on a poor pseudo-Poisson fit and SHRANK σ (~30×)."""
+        energies = np.linspace(1.0, 30.0, 300)
+        true_density = 8.0e-4
+        t_clean = np.asarray(
+            nereids.forward_model(energies, [(u238_data, true_density)])
+        )
+        sigma = 0.01 * np.maximum(t_clean, 0.01)
+
+        # ±k (relative) high-frequency zig-zag the smooth density model cannot
+        # absorb. Multiplicative so transmission stays strictly positive; since
+        # σ = 0.01·max(t, 0.01), the reported Gaussian reduced-χ² ≈ (100·k)².
+        def zigzag(k):
+            sign = np.where(np.arange(t_clean.size) % 2 == 0, 1.0, -1.0)
+            return t_clean * (1.0 + k * sign)
+
+        def check(t):
+            def run(scale):
+                return nereids.fit_spectrum_typed(
+                    transmission=t,
+                    uncertainty=sigma,
+                    energies=energies,
+                    isotopes=[(u238_data, 5.0e-4)],
+                    solver="kl",
+                    max_iter=200,
+                    scale_by_chi2=scale,
+                )
+
+            unscaled = run(False)
+            scaled = run(True)
+            assert bool(unscaled.converged) and bool(scaled.converged)
+            rcs = float(scaled.reduced_chi_squared)
+            # The flag only rescales the post-convergence covariance, so the fit
+            # (and its reported GOF) is identical between the two runs.
+            assert float(unscaled.reduced_chi_squared) == pytest.approx(rcs, rel=1e-9)
+            assert np.isfinite(rcs) and rcs > 0.0
+            factor = float(np.sqrt(rcs))
+            s_un = float(unscaled.uncertainties[0])
+            s_sc = float(scaled.uncertainties[0])
+            assert s_sc == pytest.approx(s_un * factor, rel=1e-6), (
+                f"σ_scaled {s_sc} must equal σ_unscaled {s_un} × sqrt(rcs {rcs})"
+            )
+            return rcs, s_sc / s_un
+
+        # Poor fit (±3% → reduced-χ² ≈ 9 > 1): σ GROWS (bug inverted this).
+        rcs_poor, ratio_poor = check(zigzag(0.03))
+        assert rcs_poor > 1.0, f"zig-zag fit should give reduced-χ² > 1, got {rcs_poor}"
+        assert ratio_poor > 1.0, f"poor fit must grow σ, ratio = {ratio_poor}"
+
+        # Good fit (±0.3% → reduced-χ² ≈ 0.09 < 1): σ shrinks.
+        rcs_good, ratio_good = check(zigzag(0.003))
+        assert rcs_good < 1.0, f"clean-ish fit should give reduced-χ² < 1, got {rcs_good}"
+        assert ratio_good < 1.0, f"good fit must shrink σ, ratio = {ratio_good}"
 
     def test_fix_densities_spatial_map_holds_density(self, u238_data):
         """``spatial_map_typed`` must freeze densities per pixel: the frozen

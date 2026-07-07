@@ -632,6 +632,15 @@ impl ResonanceData {
     /// Total number of resonances across all ranges and groups.
     ///
     /// For LRF=7 ranges, counts resonances across all spin groups.
+    ///
+    /// A low count for a given evaluation reflects that evaluation's
+    /// resolved-resonance-region (RRR) extent, **not** a dropped energy range.
+    /// The parser reads every NER range and errors on unconsumed MF2/MT151 data,
+    /// so ranges are never silently discarded. For example, Ta-181 in
+    /// ENDF/B-VIII.0 returns 76 (RRR only to 330 eV, plus an unresolved URR that
+    /// contributes 0 discrete resonances), whereas ENDF/B-VIII.1 extended the RRR
+    /// to 2554 eV and returns 565. See `test_parse_ta181_endf8_0_resonance_count`
+    /// in `parser.rs`, which pins the VIII.0 count as a regression guard.
     pub fn total_resonance_count(&self) -> usize {
         self.ranges.iter().map(|r| r.resonance_count()).sum()
     }

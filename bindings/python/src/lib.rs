@@ -79,13 +79,8 @@ struct PyResonanceData {
 impl PyResonanceData {
     /// String representation.
     fn __repr__(&self) -> String {
-        let n_res: usize = self
-            .inner
-            .ranges
-            .iter()
-            .flat_map(|r| &r.l_groups)
-            .map(|lg| lg.resonances.len())
-            .sum();
+        // Formalism-aware count (covers LRF=7 R-matrix-limited spin groups too).
+        let n_res: usize = self.inner.total_resonance_count();
         format!(
             "ResonanceData(Z={}, A={}, AWR={:.3}, n_resonances={})",
             self.inner.isotope.z(),
@@ -113,15 +108,25 @@ impl PyResonanceData {
         self.inner.awr
     }
 
-    /// Number of resonances.
+    /// Number of resonances (across all ranges and all formalisms).
+    ///
+    /// Delegates to the formalism-aware
+    /// [`ResonanceData::total_resonance_count`], so LRF=7 R-matrix-limited
+    /// evaluations (whose resonances live in `rml.spin_groups`, not
+    /// `l_groups`) are counted correctly instead of reporting 0.
     #[getter]
     fn n_resonances(&self) -> usize {
-        self.inner
-            .ranges
-            .iter()
-            .flat_map(|r| &r.l_groups)
-            .map(|lg| lg.resonances.len())
-            .sum()
+        self.inner.total_resonance_count()
+    }
+
+    /// Total resonance count across all ranges and formalisms.
+    ///
+    /// Explicit alias for [`Self::n_resonances`]; both delegate to the
+    /// formalism-aware Rust `ResonanceData::total_resonance_count()` (covers
+    /// LRF=1/2/3 L-groups and LRF=7 R-matrix-limited spin groups).
+    #[getter]
+    fn total_resonance_count(&self) -> usize {
+        self.inner.total_resonance_count()
     }
 
     /// Target spin (I) of the first resonance range.
@@ -498,6 +503,15 @@ impl PyFitResult {
 
     /// 1-sigma uncertainty on fitted temperature in Kelvin (``None`` when
     /// ``fit_temperature=False``).
+    ///
+    /// For the raw-covariance solver paths (Poisson-KL, joint-Poisson) this is a
+    /// **covariance-only lower bound**: it is `sqrt` of the temperature diagonal
+    /// of the inverse Fisher matrix and omits baseline/model noise, so on real
+    /// data it can underestimate the observed per-superpixel scatter by ~3–4×.
+    /// Pass ``scale_by_chi2=True`` for a `sqrt(χ²/dof)`-inflated estimate: σ is
+    /// scaled by `sqrt` of the goodness-of-fit this result reports (Gaussian
+    /// reduced-χ² on the transmission paths, deviance-per-dof on the counts
+    /// joint-Poisson path). No-op on the already-χ²-scaled LM transmission path.
     #[getter]
     fn temperature_k_unc(&self) -> Option<f64> {
         self.temperature_k_unc
@@ -997,6 +1011,16 @@ impl PySpatialResult {
 
     /// Per-pixel temperature uncertainty map (None when fit_temperature=False).
     /// Entries are NaN where uncertainty was unavailable for that pixel.
+    ///
+    /// For the raw-covariance solver paths (Poisson-KL, joint-Poisson) each σ_T
+    /// is a **covariance-only lower bound** (`sqrt` of the temperature diagonal
+    /// of the inverse Fisher matrix): it omits baseline/model noise and on real
+    /// data can underestimate the observed per-superpixel scatter by ~3–4×.
+    /// Pass ``scale_by_chi2=True`` to ``spatial_map*`` for a `sqrt(χ²/dof)`-
+    /// inflated estimate: σ is scaled by `sqrt` of the goodness-of-fit each
+    /// pixel's result reports (Gaussian reduced-χ² on the transmission paths,
+    /// deviance-per-dof on the counts joint-Poisson path). No-op on the
+    /// already-χ²-scaled LM transmission path.
     #[getter]
     fn temperature_uncertainty_map<'py>(
         &self,
@@ -4713,6 +4737,14 @@ fn spatial_result_to_py(
 ///         baseline ONCE on the aggregated mean spectrum and freezes it for
 ///         every pixel (stage-1 non-convergence is a hard error); False
 ///         fits a baseline per pixel and populates ``baseline_maps``.
+///     scale_by_chi2: When True, inflate the covariance-only uncertainties
+///         (incl. ``temperature_uncertainty_map``) by ``sqrt(chi2/dof)`` at
+///         convergence — the inverse-Fisher lower bound becomes a
+///         goodness-of-fit-scaled estimate, scaled by the goodness-of-fit each
+///         pixel's result reports (Gaussian reduced-chi2 on the transmission
+///         paths incl. Poisson-KL, deviance-per-dof on the counts joint-Poisson
+///         path). No-op on the already-chi2-scaled LM transmission path.
+///         Default False (issue #638).
 ///
 /// Returns:
 ///     SpatialResult with density_maps, chi_squared_map, converged_map, etc.
@@ -4761,6 +4793,7 @@ fn spatial_result_to_py(
     b1_bounds = None,
     b2_bounds = None,
     baseline_global = true,
+    scale_by_chi2 = false,
 ))]
 #[allow(clippy::too_many_arguments)]
 fn py_spatial_map_typed<'py>(
@@ -4810,6 +4843,7 @@ fn py_spatial_map_typed<'py>(
     b1_bounds: Option<(f64, f64)>,
     b2_bounds: Option<(f64, f64)>,
     baseline_global: bool,
+    scale_by_chi2: bool,
 ) -> PyResult<PySpatialResult> {
     // Validate mutual exclusivity
     let has_isotopes = isotopes.is_some();
@@ -4941,6 +4975,9 @@ fn py_spatial_map_typed<'py>(
     // (`is_counts_input` computed earlier for V1 validation.)
     let solver_config = parse_solver_config(solver, is_counts_input, max_iter)?;
     config = config.with_solver(solver_config);
+
+    // Issue #638: χ²-scaled uncertainties (no-op on the LM transmission path).
+    config = config.with_scale_by_chi2(scale_by_chi2);
 
     // Temperature fitting
     if fit_temperature {
@@ -5206,6 +5243,7 @@ fn py_spatial_map_typed<'py>(
     b0_bounds = None,
     b1_bounds = None,
     b2_bounds = None,
+    scale_by_chi2 = false,
 ))]
 fn py_fit_counts_spectrum_typed<'py>(
     py: Python<'py>,
@@ -5254,6 +5292,7 @@ fn py_fit_counts_spectrum_typed<'py>(
     b0_bounds: Option<(f64, f64)>,
     b1_bounds: Option<(f64, f64)>,
     b2_bounds: Option<(f64, f64)>,
+    scale_by_chi2: bool,
 ) -> PyResult<PyFitResult> {
     use nereids_pipeline::pipeline::{
         CountsBackgroundConfig, InputData, UnifiedFitConfig, fit_spectrum_typed,
@@ -5381,6 +5420,8 @@ fn py_fit_counts_spectrum_typed<'py>(
     };
 
     config = config.with_solver(parse_solver_config(solver, true, max_iter)?);
+    // Issue #638: χ²-scaled uncertainties (no-op on the LM transmission path).
+    config = config.with_scale_by_chi2(scale_by_chi2);
     if fit_temperature {
         config = config.with_fit_temperature(true);
     }
@@ -5953,6 +5994,7 @@ fn apply_baseline(
     b0_bounds = None,
     b1_bounds = None,
     b2_bounds = None,
+    scale_by_chi2 = false,
 ))]
 fn py_fit_spectrum_typed<'py>(
     py: Python<'py>,
@@ -5994,6 +6036,7 @@ fn py_fit_spectrum_typed<'py>(
     b0_bounds: Option<(f64, f64)>,
     b1_bounds: Option<(f64, f64)>,
     b2_bounds: Option<(f64, f64)>,
+    scale_by_chi2: bool,
 ) -> PyResult<PyFitResult> {
     use nereids_pipeline::pipeline::{InputData, fit_spectrum_typed};
 
@@ -6102,6 +6145,14 @@ fn py_fit_spectrum_typed<'py>(
     // so "auto" always resolves to LM (the signature default is "lm" to match).
     let solver_config = parse_solver_config(solver, false, max_iter)?;
     config = config.with_solver(solver_config);
+
+    // Issue #638: χ²-scaled uncertainties. This function takes TRANSMISSION
+    // input. Its default solver resolves to the LM transmission path, which is
+    // already χ²-scaled, so the flag is a no-op there; with ``solver='kl'`` it
+    // routes to the transmission Poisson-KL path, where the flag opts the raw
+    // inverse-Fisher σ into the SAME Gaussian reduced-χ² scaling the LM path
+    // uses (see `pipeline::poisson_to_lm_result`).
+    config = config.with_scale_by_chi2(scale_by_chi2);
 
     // Temperature fitting
     if fit_temperature {
