@@ -348,6 +348,34 @@ fn read_pv_series(
             value.len(),
         )));
     }
+
+    // Drop corrupt device-reconnect records (issue #652, B12).  Real SNS
+    // files — furnace channels BL10:SE:ND1:* on runs 19383/19386/19392 —
+    // contain reconnect entries with the exact signature `time == 0.0` AND
+    // a subnormal uninitialized-memory value (~6.9e-310).  A subnormal is
+    // `is_finite() == true`, so without this guard the leading such record
+    // would silently enter the power median and the time-weighted
+    // integration.  These are also the records that produce the backward
+    // `time = 0.0` jump mid-log, so dropping them ALSO removes the spurious
+    // non-ascending step — `run_health` then works on the very furnace PV
+    // a user asked about, instead of failing the ascending-time check
+    // below.  Both parts of the signature are required so a legitimate
+    // (if physically implausible) subnormal reading at a NORMAL timestamp
+    // is not silently discarded; and a genuine non-subnormal backward jump
+    // is still NOT dropped — it trips the ascending-time hard error, so
+    // real scrambled logs stay loud.  Matches `read_run_log`'s policy on
+    // the leading-record case.
+    let (time, value): (Vec<f64>, Vec<f64>) = time
+        .iter()
+        .zip(&value)
+        .filter(|&(&t, &v)| !(t == 0.0 && v != 0.0 && v.abs() < f64::MIN_POSITIVE))
+        .map(|(&t, &v)| (t, v))
+        .unzip();
+    // Every entry was a corrupt reconnect record → treat as "no usable log"
+    // (same as an absent/empty PV) so the other PV's summary survives.
+    if time.is_empty() {
+        return Ok(None);
+    }
     for (i, &t) in time.iter().enumerate() {
         if !t.is_finite() {
             return Err(IoError::InvalidParameter(format!(
@@ -576,6 +604,36 @@ mod tests {
             format!("{err}").contains("ascending"),
             "Expected ascending-time error, got: {err}",
         );
+    }
+
+    /// Issue #652 (B12): corrupt device-reconnect records — `time = 0.0`
+    /// with a subnormal (~6.9e-310) value — are dropped, so `run_health`
+    /// works on furnace-style PVs instead of ingesting the subnormal into
+    /// its median or failing the ascending-time check.  Mirrors the real
+    /// VENUS run-19383 furnace channel, both leading and mid-log records.
+    #[test]
+    fn test_subnormal_reconnect_records_dropped() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("run.h5");
+        let sub = 6.9e-310_f64;
+        assert!(sub.is_finite() && sub != 0.0 && sub.abs() < f64::MIN_POSITIVE);
+        // Leading reconnect record (t=0, subnormal) + a mid-log one (the
+        // spurious backward jump to 0.0); real power values 20 MW elsewhere.
+        write_run(
+            &path,
+            Some(100.0),
+            &[(
+                "proton_charge",
+                &[0.0, 10.0, 30.0, 0.0, 60.0],
+                &[sub, 20.0, 20.0, sub, 20.0],
+            )],
+        );
+        let health = run_health(&path, &RunHealthOptions::default()).unwrap();
+        // Two records dropped → three clean entries, all 20 MW, ascending.
+        assert_eq!(health.n_power_entries, 3);
+        assert_eq!(health.median_power, Some(20.0));
+        // Median is 20 (not dragged toward 0 by the subnormal), so no dip.
+        assert_eq!(health.beam_dip_fraction, Some(0.0));
     }
 
     /// T38: without /entry/duration the window falls back to the latest

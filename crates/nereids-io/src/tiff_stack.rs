@@ -648,7 +648,8 @@ pub fn load_tiff_folder_with_options(
                 // strict improvement over lexicographic order for unpadded
                 // frame numbers); multiple chunks additionally sum
                 // element-wise across chunks.
-                let arr = load_chunked_sum(&chunks, options.pixel_policy, &mut n_clipped_pixels)?;
+                let arr =
+                    load_chunked_sum(dir, &chunks, options.pixel_policy, &mut n_clipped_pixels)?;
                 Ok((
                     arr,
                     TiffLoadInfo {
@@ -906,17 +907,43 @@ fn validate_chunk_consistency(
 /// a time.  VENUS stacks run to several GB, so materialising every chunk
 /// (or a transient second copy of one chunk's stack) is not an option.
 fn load_chunked_sum(
+    dir: &Path,
     chunks: &BTreeMap<u64, Vec<(u64, PathBuf)>>,
     pixel_policy: PixelValuePolicy,
     n_clipped_pixels: &mut usize,
 ) -> Result<Array3<f64>, IoError> {
-    let mut iter = chunks.values();
-    let first = iter.next().expect("detect_chunk_layout yields >= 1 chunk");
+    let mut iter = chunks.iter();
+    let (&first_id, first) = iter.next().expect("detect_chunk_layout yields >= 1 chunk");
     let first_paths: Vec<PathBuf> = first.iter().map(|(_, path)| path.clone()).collect();
     let mut acc = load_frames_from_paths(&first_paths, pixel_policy, n_clipped_pixels)?;
     let (_, height, width) = acc.dim();
 
-    for frames in iter {
+    // Duplicate-chunk guard (issue #653).  On real VENUS data every observed
+    // multi-chunk folder is a *duplicate write* of one
+    // exposure, not sequential DAQ segments — summing them (the default)
+    // silently doubles every count.  We fingerprint each chunk with an
+    // FNV-1a hash over the raw f64 bits (O(1) extra memory — the stacks run
+    // to several GB, so a second copy for an equality check is not an
+    // option) and refuse to sum a chunk that is identical to ANY earlier
+    // chunk (not just the first — otherwise a duplicate pair that excludes
+    // the first chunk, e.g. [A, B, B], would still be double-summed).
+    const FNV_OFFSET: u64 = 0xcbf2_9ce4_8422_2325;
+    const FNV_PRIME: u64 = 0x0000_0100_0000_01b3;
+    let fnv_step = |h: u64, bits: u64| (h ^ bits).wrapping_mul(FNV_PRIME);
+
+    // Single-chunk folders (the dominant real case) never enter the loop, so
+    // skip the full hash pass over the multi-GB first chunk entirely.
+    let multi_chunk = chunks.len() > 1;
+    let mut seen_hashes: Vec<(u64, u64)> = Vec::new(); // (chunk_id, hash)
+    if multi_chunk {
+        let first_hash = acc
+            .iter()
+            .fold(FNV_OFFSET, |h, &v| fnv_step(h, v.to_bits()));
+        seen_hashes.push((first_id, first_hash));
+    }
+
+    for (&chunk_id, frames) in iter {
+        let mut chunk_hash = FNV_OFFSET;
         for (i, (_, path)) in frames.iter().enumerate() {
             let (pixels, w, h) = read_single_frame(path, i, pixel_policy, n_clipped_pixels)?;
             if w as usize != width || h as usize != height {
@@ -926,11 +953,30 @@ fn load_chunked_sum(
                     frame: i,
                 });
             }
+            // Fold in the SAME element order as `acc.iter()` (row-major
+            // frame,y,x) so identical content yields identical hashes.
+            for &p in &pixels {
+                chunk_hash = fnv_step(chunk_hash, p.to_bits());
+            }
             let mut slice = acc.slice_mut(s![i, .., ..]);
             for (dst, src) in slice.iter_mut().zip(pixels.iter()) {
                 *dst += src;
             }
         }
+        if let Some(&(dup_of, _)) = seen_hashes.iter().find(|&&(_, h)| h == chunk_hash) {
+            return Err(IoError::ChunkMismatch {
+                directory: dir.to_string_lossy().into_owned(),
+                details: format!(
+                    "DAQ chunk {chunk_id} has an identical content fingerprint to chunk \
+                     {dup_of} (FNV-1a hash over all pixel bits) — almost certainly a \
+                     duplicate write of the same exposure, not a distinct DAQ segment. \
+                     Summing them (default sum_chunks=true) would double every count \
+                     (and inflate proton-charge normalisation by the chunk multiplicity). \
+                     Pass sum_chunks=false to load all frames without summing (issue #653)."
+                ),
+            });
+        }
+        seen_hashes.push((chunk_id, chunk_hash));
     }
 
     Ok(acc)
@@ -1678,6 +1724,69 @@ mod tests {
                 chunk_inconsistent: false,
             }
         );
+    }
+
+    /// Issue #653: two chunks with byte-identical content are a duplicate DAQ
+    /// write, not sequential segments — the default summing path must refuse
+    /// them (silently doubling every count is the exact real-VENUS failure),
+    /// while `sum_chunks=false` still loads every frame for inspection.
+    #[test]
+    fn test_chunked_duplicate_write_rejected_on_sum_path() {
+        let dir = tempfile::tempdir().unwrap();
+        // Same base ⇒ chunk 765 is byte-identical to chunk 764.
+        write_chunk_files(dir.path(), "run", 764, 100, &[0, 1, 2, 3]);
+        write_chunk_files(dir.path(), "run", 765, 100, &[0, 1, 2, 3]);
+
+        let err = load_tiff_folder_with_options(dir.path(), None, &TiffFolderOptions::default())
+            .expect_err("summing byte-identical duplicate chunks must be a hard error");
+        match err {
+            IoError::ChunkMismatch { details, .. } => {
+                assert!(
+                    details.contains("identical") && details.contains("765"),
+                    "unexpected message: {details}"
+                );
+                assert!(
+                    details.contains("sum_chunks=false"),
+                    "must name the escape hatch"
+                );
+            }
+            other => panic!("expected ChunkMismatch, got {other:?}"),
+        }
+
+        // The escape hatch loads all 8 frames (concatenation), no summing.
+        let options = TiffFolderOptions {
+            sum_chunks: false,
+            ..TiffFolderOptions::default()
+        };
+        let (arr, info) = load_tiff_folder_with_options(dir.path(), None, &options).unwrap();
+        assert_eq!(arr.shape(), &[8, 2, 2]);
+        assert!(!info.chunks_summed);
+        // Distinct chunks (the T1 case) must still sum — the guard is
+        // content-based, not a blanket multi-chunk refusal.
+        let dir2 = tempfile::tempdir().unwrap();
+        write_chunk_files(dir2.path(), "run", 764, 100, &[0, 1, 2, 3]);
+        write_chunk_files(dir2.path(), "run", 765, 200, &[0, 1, 2, 3]);
+        let (_, info2) =
+            load_tiff_folder_with_options(dir2.path(), None, &TiffFolderOptions::default())
+                .unwrap();
+        assert!(info2.chunks_summed);
+
+        // A duplicate pair that does NOT include the first chunk ([A, B, B])
+        // must also be caught — the guard compares against ALL earlier
+        // chunks, not just the first.
+        let dir3 = tempfile::tempdir().unwrap();
+        write_chunk_files(dir3.path(), "run", 764, 100, &[0, 1, 2, 3]); // A
+        write_chunk_files(dir3.path(), "run", 765, 200, &[0, 1, 2, 3]); // B
+        write_chunk_files(dir3.path(), "run", 766, 200, &[0, 1, 2, 3]); // B' == B
+        let err3 = load_tiff_folder_with_options(dir3.path(), None, &TiffFolderOptions::default())
+            .expect_err("[A, B, B] must be rejected — 766 duplicates 765");
+        match err3 {
+            IoError::ChunkMismatch { details, .. } => assert!(
+                details.contains("766") && details.contains("765"),
+                "must name 766 as identical to 765, got: {details}"
+            ),
+            other => panic!("expected ChunkMismatch, got {other:?}"),
+        }
     }
 
     /// T2: sum_chunks=false loads the legacy lexicographic concatenation.

@@ -1058,7 +1058,7 @@ pub fn spatial_map_typed(
     let has_baseline_maps = config.multiplicative_baseline().is_some() && !baseline_global_mode;
     let baseline_e_ref_ev = config
         .multiplicative_baseline()
-        .map(|_| nereids_fitting::transmission_model::baseline_reference_energy(config.energies()));
+        .map(|_| config.baseline_reference_energy());
 
     if cancel.is_some_and(|c| c.load(Ordering::Relaxed)) {
         return Err(PipelineError::Cancelled);

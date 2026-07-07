@@ -18,7 +18,7 @@ use nereids_fitting::parameters::{FitParameter, ParameterSet};
 use nereids_fitting::poisson::{self, PoissonConfig};
 use nereids_fitting::transmission_model::{
     EnergyScaleTransmissionModel, MultiplicativeBaselineModel, NormalizedTransmissionModel,
-    PrecomputedTransmissionModel, TransmissionFitModel, baseline_reference_energy,
+    PrecomputedTransmissionModel, TransmissionFitModel,
 };
 use nereids_physics::resolution::ResolutionFunction;
 use nereids_physics::transmission::InstrumentParams;
@@ -1025,6 +1025,23 @@ impl UnifiedFitConfig {
     pub fn fit_energy_range(&self) -> Option<(f64, f64)> {
         self.fit_energy_range
     }
+    /// Baseline log-basis reference energy over the ACTIVE fit window
+    /// (issue #648).  Every baseline construction site must use this rather
+    /// than `baseline_reference_energy(self.energies())`: with a
+    /// `fit_energy_range` set, the full-grid midpoint sits thousands of eV
+    /// away from the window and the baseline silently absorbs temperature
+    /// broadening.  Folds the `fit_energy_range` mask in one place so no
+    /// call site can reintroduce the full-grid bug.
+    pub fn baseline_reference_energy(&self) -> f64 {
+        let mask = nereids_fitting::active_mask::build_active_mask(
+            self.energies(),
+            self.fit_energy_range(),
+        );
+        nereids_fitting::transmission_model::baseline_reference_energy_active(
+            self.energies(),
+            mask.as_deref(),
+        )
+    }
     pub fn precomputed_cross_sections(&self) -> Option<&Arc<Vec<Vec<f64>>>> {
         self.precomputed_cross_sections.as_ref()
     }
@@ -1490,7 +1507,10 @@ fn fit_transmission_lm(
             MultiplicativeBaselineModel::new(
                 stacked,
                 config.energies(),
-                baseline_reference_energy(config.energies()),
+                nereids_fitting::transmission_model::baseline_reference_energy_active(
+                    config.energies(),
+                    active_mask.as_deref(),
+                ),
                 bli.b0,
                 bli.b1,
                 bli.b2,
@@ -1630,7 +1650,7 @@ fn fit_transmission_poisson(
         stacked = Box::new(MultiplicativeBaselineModel::new(
             stacked,
             config.energies(),
-            baseline_reference_energy(config.energies()),
+            config.baseline_reference_energy(),
             bli.b0,
             bli.b1,
             bli.b2,
@@ -1859,7 +1879,10 @@ fn fit_counts_joint_poisson(
             MultiplicativeBaselineModel::new(
                 stacked,
                 config.energies(),
-                baseline_reference_energy(config.energies()),
+                nereids_fitting::transmission_model::baseline_reference_energy_active(
+                    config.energies(),
+                    active_mask_slice,
+                ),
                 bli.b0,
                 bli.b1,
                 bli.b2,
@@ -1937,7 +1960,12 @@ fn fit_counts_joint_poisson(
                 result.params[bli.b1],
                 result.params[bli.b2],
             ]),
-            Some(baseline_reference_energy(config.energies())),
+            Some(
+                nereids_fitting::transmission_model::baseline_reference_energy_active(
+                    config.energies(),
+                    active_mask_slice,
+                ),
+            ),
         )
     } else {
         (None, None)
@@ -2338,12 +2366,15 @@ pub(crate) fn validate_multiplicative_baseline(
     // review R2): bins masked out by fit_energy_range contribute nothing
     // to any mask-honouring cost function, so an init that is positive
     // everywhere inside the fit window must not be rejected because of
-    // out-of-window bins on a wide TOF grid.  E_ref itself stays a
-    // full-grid property — it is a pure reparameterization of the
-    // quadratic (any E_ref > 0 spans the same function family), and
-    // keeping it mask-independent keeps reported coefficients comparable
-    // across window choices.
-    let e_ref = baseline_reference_energy(config.energies());
+    // out-of-window bins on a wide TOF grid.  E_ref is the ACTIVE-window
+    // reference used by the fitter (#648): with fit_energy_range set it is
+    // the geometric midpoint of the active bins, not the full grid, so
+    // this validation evaluates the baseline basis exactly as the fit
+    // does.  (Only positivity matters here — any E_ref > 0 spans the same
+    // quadratic family — but using the fitter's value keeps validation and
+    // fit consistent.  Reported b0/b1/b2 are therefore defined relative to
+    // the active-window E_ref and are not comparable across window choices.)
+    let e_ref = config.baseline_reference_energy();
     if !e_ref.is_finite() || e_ref <= 0.0 {
         return Err(PipelineError::InvalidParameter(format!(
             "multiplicative baseline: reference energy sqrt(E_min*E_max) is \
@@ -3186,7 +3217,7 @@ fn extract_result(
                 result.params[bli.b1],
                 result.params[bli.b2],
             ]),
-            Some(baseline_reference_energy(config.energies())),
+            Some(config.baseline_reference_energy()),
         )
     } else {
         (None, None)
@@ -3935,6 +3966,42 @@ mod tests {
             (de[1] - energies[80]).abs() <= 1.0,
             "second dip at {} eV",
             de[1]
+        );
+    }
+
+    /// Issue #648: `UnifiedFitConfig::baseline_reference_energy()` must fold
+    /// the `fit_energy_range` mask, so a full grid that runs into the keV/MeV
+    /// tail yields the ACTIVE-window midpoint, not the full-grid midpoint that
+    /// silently let the baseline absorb Doppler broadening (T runaway,
+    /// warnings=[]).  Mirrors the real VENUS Ta grid.
+    #[test]
+    fn baseline_reference_energy_honours_fit_energy_range() {
+        let data = hf178_mlbw_two_resonances();
+        // 8–45 eV resonance region plus a keV-scale tail bin, like the VENUS grid.
+        let mut energies: Vec<f64> = (0..400).map(|i| 8.0 + (i as f64) * 0.0925).collect();
+        energies.push(3211.0 * 3211.0 / 8.0); // pushes full-grid midpoint far away
+        let config = UnifiedFitConfig::new(
+            energies.clone(),
+            vec![data],
+            vec!["Hf-178".into()],
+            293.6,
+            None,
+            vec![0.1],
+        )
+        .unwrap();
+        let full = nereids_fitting::transmission_model::baseline_reference_energy(&energies);
+        // No range → full grid (unchanged behaviour).
+        assert!((config.baseline_reference_energy() - full).abs() < 1e-6);
+        // With fit_energy_range 8–45 eV → active-window midpoint ≈ 19 eV.
+        let windowed = config.with_fit_energy_range(Some((8.0, 45.0))).unwrap();
+        let e_ref = windowed.baseline_reference_energy();
+        assert!(
+            e_ref > 8.0 && e_ref < 45.0,
+            "windowed E_ref = {e_ref} eV must lie inside the 8–45 eV fit window"
+        );
+        assert!(
+            (e_ref - full).abs() > 100.0,
+            "windowed E_ref must differ from the buggy full-grid value {full}"
         );
     }
 
@@ -7534,7 +7601,7 @@ mod tests {
     /// non-vacuity pre-check: the injected baseline must actually move the
     /// data, otherwise the closed-loop oracle is trivially satisfiable.
     fn apply_truth_baseline(t: &[f64], energies: &[f64]) -> Vec<f64> {
-        let e_ref = baseline_reference_energy(energies);
+        let e_ref = nereids_fitting::transmission_model::baseline_reference_energy(energies);
         let out: Vec<f64> = t
             .iter()
             .zip(energies.iter())
@@ -7563,7 +7630,7 @@ mod tests {
         let (t_pure, _) = synthetic_transmission_at_temp(&data, true_density, true_temp, &energies);
         let measured = apply_truth_baseline(&t_pure, &energies);
         let sigma: Vec<f64> = measured.iter().map(|&v| 0.01 * v.max(0.01)).collect();
-        let e_ref = baseline_reference_energy(&energies);
+        let e_ref = nereids_fitting::transmission_model::baseline_reference_energy(&energies);
 
         // Density frozen at truth (the production thermometry pattern the
         // baseline was designed for); temperature seeded 100 K low; baseline

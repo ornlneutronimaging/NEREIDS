@@ -2711,6 +2711,48 @@ pub fn baseline_reference_energy(energies: &[f64]) -> f64 {
     (lo * hi).sqrt()
 }
 
+/// Reference energy for the baseline log basis, computed over the **active
+/// fit window only** (issue #648).
+///
+/// The full grid extends far beyond the resonances of interest (a VENUS Ta
+/// grid spans 4.5 eV–2.3 MeV while the fit window is 8–45 eV).  Centering
+/// the `ln(E/E_ref)` basis at the full-grid midpoint (≈3211 eV) instead of
+/// the active-window midpoint (≈19 eV) pushes every active bin to a large
+/// negative `z`, so the `1, z, z²` columns stop being near-orthogonal and
+/// the baseline silently absorbs Doppler broadening — the fitted
+/// temperature runs away with `warnings = []`.  Restricting the midpoint to
+/// the bins that actually enter the cost (the active mask) restores it.
+///
+/// `active` is the per-bin mask from
+/// [`crate::active_mask::build_active_mask`]; `None` (no `fit_energy_range`)
+/// is identical to [`baseline_reference_energy`] over the whole grid.  A
+/// mask selecting no bins falls back to the full grid rather than returning
+/// NaN (the pipeline's active-bin-count gate rejects an empty window
+/// upstream, so this branch is defensive only).
+pub fn baseline_reference_energy_active(energies: &[f64], active: Option<&[bool]>) -> f64 {
+    match active {
+        None => baseline_reference_energy(energies),
+        Some(mask) => {
+            debug_assert_eq!(mask.len(), energies.len());
+            let (lo, hi, any) = energies.iter().zip(mask).fold(
+                (f64::INFINITY, f64::NEG_INFINITY, false),
+                |(lo, hi, any), (&e, &a)| {
+                    if a {
+                        (lo.min(e), hi.max(e), true)
+                    } else {
+                        (lo, hi, any)
+                    }
+                },
+            );
+            if any {
+                (lo * hi).sqrt()
+            } else {
+                baseline_reference_energy(energies)
+            }
+        }
+    }
+}
+
 /// Bounded multiplicative polynomial baseline (issue #635):
 ///
 /// ```text
@@ -4591,6 +4633,39 @@ mod tests {
         let e = [1.0, 5.0, 100.0];
         assert!((baseline_reference_energy(&e) - 10.0).abs() < 1e-12);
         assert!(baseline_reference_energy(&[]).is_nan());
+    }
+
+    /// Issue #648: with an active mask, the reference energy is the midpoint
+    /// of the ACTIVE window, not the full grid.  Mirrors the real VENUS case
+    /// where the full grid spans to the MeV range but the fit window is
+    /// 8–45 eV: the full-grid midpoint (≈3211 eV) silently lets the baseline
+    /// absorb Doppler broadening; the active midpoint (≈19 eV) does not.
+    #[test]
+    fn baseline_reference_energy_active_uses_window_not_full_grid() {
+        // Grid: three low-eV resonance bins + one MeV-scale tail bin.
+        let energies = [8.0, 20.0, 45.0, 2_278_807.0];
+        // fit_energy_range 8–45 eV → last bin inactive.
+        let mask = [true, true, true, false];
+        let e_ref = baseline_reference_energy_active(&energies, Some(&mask));
+        assert!(
+            (e_ref - (8.0_f64 * 45.0).sqrt()).abs() < 1e-9,
+            "active E_ref = {e_ref}, expected {}",
+            (8.0_f64 * 45.0).sqrt()
+        );
+        // Full-grid value is the buggy ≈3211 eV — the fix must differ from it.
+        let full = baseline_reference_energy(&energies);
+        assert!(full > 1000.0 && (full - e_ref).abs() > 1000.0);
+        // None mask == full grid (no fit_energy_range).
+        assert_eq!(
+            baseline_reference_energy_active(&energies, None),
+            baseline_reference_energy(&energies)
+        );
+        // Degenerate all-false mask falls back to full grid, never NaN.
+        let none_active = [false, false, false, false];
+        assert_eq!(
+            baseline_reference_energy_active(&energies, Some(&none_active)),
+            baseline_reference_energy(&energies)
+        );
     }
 
     /// Issue #635: identity coefficients (1, 0, 0) reproduce the inner model
