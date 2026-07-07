@@ -759,6 +759,18 @@ pub struct JointPoissonFitConfig {
     pub polish: NelderMeadConfig,
     /// Compute and return the Fisher covariance and parameter uncertainties.
     pub compute_covariance: bool,
+    /// Inflate the covariance-only uncertainties by the goodness-of-fit factor
+    /// at the converged point: `Cov → (D/dof)·Cov`, i.e. `σ → σ·√(D/dof)`, where
+    /// `D` is the final Poisson deviance and `dof = n_active − n_free`.
+    ///
+    /// Off by default, so the reported σ stays the raw Cramér-Rao (inverse-Fisher)
+    /// lower bound, which omits baseline/model mis-specification noise and can
+    /// underestimate the true per-superpixel scatter by ~3–4× on real data. When
+    /// enabled, scaling is only applied when `D/dof` is finite and positive
+    /// (exactly-determined fits with `dof = 0` report `D/dof = NaN` and are left
+    /// unscaled). See issue #638; the LM transmission path is already χ²-scaled
+    /// (Numerical Recipes §15.6) and does not use this flag.
+    pub scale_by_chi2: bool,
 }
 
 impl Default for JointPoissonFitConfig {
@@ -798,6 +810,7 @@ impl Default for JointPoissonFitConfig {
                 initial_step_abs: 1e-4,
             },
             compute_covariance: true,
+            scale_by_chi2: false,
         }
     }
 }
@@ -1070,6 +1083,16 @@ pub fn joint_poisson_fit(
     // `H_D` and using it directly would under-report variance by 2× and
     // standard errors by √2 × — a real ½-scaling bug.  We rescale
     // the inverse here: `I^{-1} = 2 · H_D^{-1}`.
+    // Optional goodness-of-fit inflation (issue #638): σ → σ·√(D/dof), i.e.
+    // Cov → (D/dof)·Cov. Folded into the Cramér-Rao ×2 rescale below. Only
+    // applied when `D/dof` is finite and positive; `dof = 0` fits report
+    // `deviance_per_dof = NaN` and are left at the raw covariance-only bound.
+    let var_scale =
+        if config.scale_by_chi2 && deviance_per_dof.is_finite() && deviance_per_dof > 0.0 {
+            deviance_per_dof
+        } else {
+            1.0
+        };
     let (covariance, uncertainties) = if config.compute_covariance {
         let free_idx = params.free_indices();
         let info_opt = match objective.fisher_information(&final_values, &free_idx)? {
@@ -1080,9 +1103,11 @@ pub fn joint_poisson_fit(
             Some(info) => match invert_matrix(&info) {
                 Some(mut cov) => {
                     // Rescale: invert_matrix returned (2I)^{-1}; multiply
-                    // every entry by 2 to obtain I^{-1}.
+                    // every entry by 2 to obtain I^{-1}, and by `var_scale`
+                    // (= D/dof when scale_by_chi2, else 1.0) for the optional
+                    // χ²-inflation. `u` picks up √(var_scale) automatically.
                     for v in cov.data.iter_mut() {
-                        *v *= 2.0;
+                        *v *= 2.0 * var_scale;
                     }
                     let u: Vec<f64> = (0..cov.nrows)
                         .map(|i| {

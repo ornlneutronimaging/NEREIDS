@@ -106,7 +106,20 @@ class ResonanceData:
 
     @property
     def n_resonances(self) -> int:
-        """Total number of resonances across all L-groups and ranges."""
+        """Total number of resonances across all ranges and formalisms.
+
+        Formalism-aware: counts LRF=1/2/3 L-group resonances *and* LRF=7
+        R-matrix-limited spin-group resonances (which previously reported 0).
+        """
+        ...
+
+    @property
+    def total_resonance_count(self) -> int:
+        """Total resonance count across all ranges and formalisms.
+
+        Explicit alias for :attr:`n_resonances`; both delegate to the
+        formalism-aware Rust ``ResonanceData::total_resonance_count()``.
+        """
         ...
 
     @property
@@ -159,7 +172,18 @@ class FitResult:
 
     @property
     def temperature_k_unc(self) -> float | None:
-        """1-sigma uncertainty on fitted temperature (None when fit_temperature=False)."""
+        """1-sigma uncertainty on fitted temperature (None when fit_temperature=False).
+
+        For the raw-covariance solver paths (Poisson-KL, joint-Poisson) this is a
+        covariance-only lower bound (sqrt of the temperature diagonal of the
+        inverse Fisher matrix); it omits baseline/model noise and on real data can
+        underestimate the observed per-superpixel scatter by ~3-4x. Pass
+        ``scale_by_chi2=True`` for a sqrt(chi2/dof)-inflated estimate: sigma is
+        scaled by sqrt of the goodness-of-fit this result reports (Gaussian
+        reduced-chi2 on the transmission paths, deviance-per-dof on the counts
+        joint-Poisson path). No-op on the already-chi2-scaled LM transmission
+        path.
+        """
         ...
 
     @property
@@ -513,7 +537,17 @@ class SpatialResult:
     @property
     def temperature_uncertainty_map(self) -> NDArray[np.float64] | None:
         """Per-pixel temperature uncertainty map (None when fit_temperature=False).
-        Entries are NaN where uncertainty was unavailable for that pixel."""
+        Entries are NaN where uncertainty was unavailable for that pixel.
+
+        For the raw-covariance solver paths (Poisson-KL, joint-Poisson) each sigma_T
+        is a covariance-only lower bound (sqrt of the temperature diagonal of the
+        inverse Fisher matrix); it omits baseline/model noise and on real data can
+        underestimate the observed per-superpixel scatter by ~3-4x. Pass
+        ``scale_by_chi2=True`` to ``spatial_map*`` for a sqrt(chi2/dof)-inflated
+        estimate: sigma is scaled by sqrt of the goodness-of-fit each pixel's
+        result reports (Gaussian reduced-chi2 on the transmission paths,
+        deviance-per-dof on the counts joint-Poisson path). No-op on the
+        already-chi2-scaled LM transmission path."""
         ...
 
     @property
@@ -1537,6 +1571,7 @@ def spatial_map_typed(
     b1_bounds: tuple[float, float] | None = None,
     b2_bounds: tuple[float, float] | None = None,
     baseline_global: bool = True,
+    scale_by_chi2: bool = False,
 ) -> SpatialResult:
     """Spatial mapping using the typed input data API.
 
@@ -1589,6 +1624,15 @@ def spatial_map_typed(
         l_scale_init: Initial flight-path scale factor (default 1.0).
         energy_scale_flight_path_m: Nominal flight path (m) for the
             energy-scale model (default 25.0).
+        scale_by_chi2: When ``True``, inflate the covariance-only
+            uncertainties (incl. ``temperature_uncertainty_map``) by
+            ``sqrt(chi2/dof)`` at the converged point, turning the inverse-Fisher
+            lower bound into a goodness-of-fit-scaled estimate. Sigma is scaled
+            by sqrt of the goodness-of-fit each pixel's result reports (Gaussian
+            reduced-chi2 on the transmission paths incl. Poisson-KL,
+            deviance-per-dof on the counts joint-Poisson path). No-op on the
+            already-chi2-scaled LM transmission path. Default ``False``
+            (issue #638).
 
     Always returns SpatialResult.  For counts-KL runs,
     ``SpatialResult.deviance_per_dof_map`` is populated as the primary GOF.
@@ -1640,6 +1684,7 @@ def fit_spectrum_typed(
     b0_bounds: tuple[float, float] | None = None,
     b1_bounds: tuple[float, float] | None = None,
     b2_bounds: tuple[float, float] | None = None,
+    scale_by_chi2: bool = False,
 ) -> FitResult:
     """Fit a single pre-normalized transmission spectrum.
 
@@ -1669,6 +1714,12 @@ def fit_spectrum_typed(
         density_free: Per-density free/fixed mask (``free[i] == False`` freezes
             density ``i``); length must equal the number of density parameters.
             Mutually exclusive with ``fix_densities``.
+        scale_by_chi2: Inflate covariance-only uncertainties by
+            ``sqrt(chi2/dof)`` (issue #638), scaling sigma by sqrt of the
+            Gaussian ``reduced_chi_squared`` this result reports. No-op on this
+            function's default LM transmission path (already chi2-scaled); with
+            an explicit ``solver='kl'`` it opts the raw inverse-Fisher sigma into
+            the same Gaussian reduced-chi2 scaling. Default ``False``.
     """
     ...
 
@@ -1720,6 +1771,7 @@ def fit_counts_spectrum_typed(
     b0_bounds: tuple[float, float] | None = None,
     b1_bounds: tuple[float, float] | None = None,
     b2_bounds: tuple[float, float] | None = None,
+    scale_by_chi2: bool = False,
 ) -> FitResult:
     """Fit a single raw-count spectrum (sample + open-beam counts).
 
@@ -1787,6 +1839,12 @@ def fit_counts_spectrum_typed(
             movement.  Pass ``True`` to opt in for synthetic / clean
             (``D ≈ 1``) regimes where the absolute tolerance is
             physically meaningful; ``False`` to force off explicitly.
+        scale_by_chi2: When ``True``, inflate the covariance-only
+            uncertainties (incl. ``temperature_k_unc``) by ``sqrt(chi2/dof)``
+            at the converged point, turning the inverse-Fisher lower bound into
+            a goodness-of-fit-scaled estimate. Scales sigma by sqrt of the
+            counts joint-Poisson ``deviance_per_dof`` this result reports.
+            Default ``False`` (issue #638).
     """
     ...
 

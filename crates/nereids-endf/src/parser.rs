@@ -1952,6 +1952,96 @@ mod tests {
         );
     }
 
+    /// Pin the Ta-181 ENDF/B-VIII.0 resonance count at 76 (genuinely-sparse RRR).
+    ///
+    /// Ta-181 (MAT 7328) in ENDF/B-VIII.0 has NER=2 ranges:
+    ///   range 0: LRU=1 resolved, LRF=2 (MLBW), one L-group, 76 discrete
+    ///            resonances, resolved region only to 330 eV;
+    ///   range 1: LRU=2 unresolved (URR), 0 discrete resonances.
+    /// So `total_resonance_count()` == 76 is **faithful**, not a dropped range —
+    /// the parser reads every NER range and errors on unconsumed MF2/MT151 data.
+    /// ENDF/B-VIII.1 later extended the resolved region (RRR to 2554 eV, 565
+    /// resonances); a low VIII.0 count reflects that evaluation's resolved-region
+    /// extent, not a parser bug. This test is a regression guard for that fact.
+    ///
+    /// Vendored under public-domain ENDF/B redistribution (73-Ta-181 LLNL EVAL,
+    /// same evaluation NNDC/IAEA distribute) at the workspace-root
+    /// `tests/data/endf/Ta-181.endf` (Hf-177 precedent). Inside the full NEREIDS
+    /// workspace — where CI runs — the fixture is always present and the gate
+    /// asserts fully; a standalone crate build (no workspace fixtures) skips.
+    #[test]
+    fn test_parse_ta181_endf8_0_resonance_count() {
+        let endf_path = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+            .parent()
+            .unwrap()
+            .parent()
+            .unwrap()
+            .join("tests/data/endf/Ta-181.endf");
+        // The fixture is committed to the repo, so a missing file is a
+        // packaging/path regression that MUST fail CI — not a skip that would
+        // silently disable this #638 resonance-count guard.
+        let endf_text = std::fs::read_to_string(&endf_path).unwrap_or_else(|e| {
+            panic!(
+                "vendored Ta-181 regression fixture must be present at \
+                 {endf_path:?} (committed test data): {e}"
+            )
+        });
+        let data = parse_endf_file2(&endf_text).unwrap();
+
+        assert_eq!(data.za, 73181, "Should be Ta-181");
+        assert!(
+            (data.awr - 179.3936).abs() < 0.01,
+            "AWR should be ~179.3936, got {}",
+            data.awr
+        );
+
+        // Faithful count: VIII.0's RRR is genuinely sparse (76), not a drop.
+        assert_eq!(
+            data.total_resonance_count(),
+            76,
+            "Ta-181 VIII.0 has 76 discrete resonances (sparse RRR to 330 eV)"
+        );
+        assert_eq!(
+            data.ranges.len(),
+            2,
+            "Ta-181 VIII.0 has NER=2 ranges (resolved MLBW + unresolved URR)"
+        );
+
+        // Range 0: resolved MLBW (LRF=2), all 76 resonances live here.
+        let resolved = &data.ranges[0];
+        assert!(resolved.resolved, "Range 0 must be resolved (LRU=1)");
+        assert_eq!(
+            resolved.formalism,
+            ResonanceFormalism::MLBW,
+            "Ta-181 VIII.0 resolved range uses MLBW (LRF=2)"
+        );
+        assert!(resolved.rml.is_none(), "MLBW range has no LRF=7 RML data");
+        assert!(resolved.urr.is_none(), "Resolved range has no URR data");
+        assert_eq!(
+            resolved.resonance_count(),
+            76,
+            "All 76 resonances belong to the resolved MLBW range"
+        );
+
+        // Range 1: unresolved (LRU=2, URR), zero discrete resonances.
+        let unresolved = &data.ranges[1];
+        assert!(!unresolved.resolved, "Range 1 must be unresolved (LRU=2)");
+        assert_eq!(
+            unresolved.formalism,
+            ResonanceFormalism::Unresolved,
+            "Ta-181 VIII.0 second range is the URR (LRU=2)"
+        );
+        assert!(
+            unresolved.urr.is_some(),
+            "URR range must carry unresolved data"
+        );
+        assert_eq!(
+            unresolved.resonance_count(),
+            0,
+            "URR range carries no discrete resonances"
+        );
+    }
+
     /// Verify KRM=3 resonance column order (offline fixture — no network needed).
     ///
     /// For KRM=3 the per-resonance ENDF layout is [ER, Γγ, Γ_1, ..., Γ_NCH, padding].
@@ -2022,6 +2112,39 @@ mod tests {
             (res1.widths[0] - 0.002).abs() < 1e-10,
             "res1 widths[0] must be 0.002 eV, got {}",
             res1.widths[0]
+        );
+    }
+
+    /// LRF=7 resonances must be counted by `total_resonance_count()`.
+    ///
+    /// R-matrix-limited (LRF=7) resonances live in `rml.spin_groups`, not in
+    /// `l_groups`. A naive `l_groups`-only sum (as the Python `n_resonances`
+    /// getter used to do) reports 0 for such evaluations; the formalism-aware
+    /// accessor must report the true count. This pins the Rust side of the
+    /// issue-#638 binding fix so the Python delegation stays correct.
+    #[test]
+    fn test_lrf7_total_resonance_count_nonzero() {
+        const ENDF: &str =
+            include_str!("../../../tests/data/synthetic/lrf7_krm3_resonance_column_order.endf");
+        let data = parse_endf_file2(ENDF).expect("fixture must parse without error");
+
+        // The naive l_groups-only sum that the old Python getter used.
+        let l_groups_only: usize = data
+            .ranges
+            .iter()
+            .flat_map(|r| &r.l_groups)
+            .map(|lg| lg.resonances.len())
+            .sum();
+        assert_eq!(
+            l_groups_only, 0,
+            "LRF=7 fixture has no l_groups resonances (they live in rml.spin_groups)"
+        );
+
+        // The formalism-aware accessor the binding now delegates to.
+        assert_eq!(
+            data.total_resonance_count(),
+            2,
+            "total_resonance_count() must count LRF=7 rml.spin_groups resonances"
         );
     }
 
