@@ -78,7 +78,7 @@ impl ThemeColors {
     }
 
     pub fn from_ctx(ctx: &egui::Context) -> Self {
-        Self::from_dark_mode(ctx.style().visuals.dark_mode)
+        Self::from_dark_mode(ctx.global_style().visuals.dark_mode)
     }
 }
 
@@ -94,7 +94,7 @@ pub fn resolve_dark_mode(ctx: &egui::Context, preference: ThemePreference) -> bo
         ThemePreference::Light => false,
         ThemePreference::Auto => match ctx.system_theme() {
             Some(theme) => theme == egui::Theme::Dark,
-            None => ctx.style().visuals.dark_mode,
+            None => ctx.global_style().visuals.dark_mode,
         },
     }
 }
@@ -141,7 +141,7 @@ pub fn apply_theme(ctx: &egui::Context, preference: ThemePreference) {
 
 /// Configure font sizes (called once at startup).
 pub fn configure_fonts(ctx: &egui::Context) {
-    let mut style = (*ctx.style()).clone();
+    let mut style = (*ctx.global_style()).clone();
     style.text_styles.insert(
         egui::TextStyle::Body,
         egui::FontId::new(13.0, egui::FontFamily::Proportional),
@@ -160,5 +160,5 @@ pub fn configure_fonts(ctx: &egui::Context) {
     );
     style.spacing.item_spacing = egui::vec2(8.0, 6.0);
     style.spacing.button_padding = egui::vec2(10.0, 5.0);
-    ctx.set_style(style);
+    ctx.set_global_style(style);
 }

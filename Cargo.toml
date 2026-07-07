@@ -42,14 +42,20 @@ tiff = "0.11"
 image = "0.25"
 pyo3 = { version = "0.29", features = ["extension-module"] }
 numpy = "0.29"
-# NOTE: keep eframe default features ON — winit's default wayland-dlopen /
-# x11 features make the display stack dlopen'ed rather than linked.
-# Disabling defaults would hard-link libwayland and re-trigger wheel
-# vendoring (see scripts/check_wheel_policy.sh).
-eframe = { version = "0.33", features = ["persistence"] }
-egui = "0.33"
-egui_extras = { version = "0.33", features = ["image", "svg"] }
-egui_plot = "0.34"
+# NOTE: keep eframe default features ON — the `winit/default` default entry
+# pulls winit's wayland-dlopen, so the display stack is dlopen'ed rather than
+# linked. Disabling defaults (even while re-adding eframe's own `wayland`/`x11`
+# features, which only map to egui-winit/wayland|x11 — NOT winit/wayland-dlopen)
+# would hard-link libwayland and re-trigger wheel vendoring
+# (see scripts/check_wheel_policy.sh).
+# eframe 0.34 made `wgpu` the default renderer; we keep defaults ON to preserve
+# the dlopen stack and add `glow`, selecting Renderer::Glow at runtime in
+# main.rs — the backend proven on the ORNL ThinLinc / manylinux_2_28 fleet.
+# `wgpu` is compiled but never used at runtime.
+eframe = { version = "0.34", features = ["persistence", "glow"] }
+egui = "0.34"
+egui_extras = { version = "0.34", features = ["image", "svg"] }
+egui_plot = "0.35"
 # Native file dialogs. default-features = false retires the gtk3 backend
 # permanently: rfd's gtk3 feature pins gtk-sys's v3_24 feature
 # (gtk+-3.0 >= 3.24 at BUILD time), which forced the Linux wheel from
@@ -74,7 +80,7 @@ rfd = { version = "=0.17.2", default-features = false }
 # Pure-egui in-app file browser (Linux fallback dialog tier). LOCKSTEP
 # with egui minors: 0.12 <-> egui 0.33, 0.13 <-> 0.34, 0.14 <-> 0.35 —
 # any egui/eframe bump MUST bump this together.
-egui-file-dialog = "0.12"
+egui-file-dialog = "0.13"
 hdf5 = { package = "hdf5-metno", version = "0.12", features = ["static", "zlib"] }
 rand = "0.10"
 # Stable-stream RNG for seeded test noise: StdRng's stream is documented
