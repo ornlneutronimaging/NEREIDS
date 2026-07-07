@@ -1507,7 +1507,10 @@ fn fit_transmission_lm(
             MultiplicativeBaselineModel::new(
                 stacked,
                 config.energies(),
-                config.baseline_reference_energy(),
+                nereids_fitting::transmission_model::baseline_reference_energy_active(
+                    config.energies(),
+                    active_mask.as_deref(),
+                ),
                 bli.b0,
                 bli.b1,
                 bli.b2,
@@ -1876,7 +1879,10 @@ fn fit_counts_joint_poisson(
             MultiplicativeBaselineModel::new(
                 stacked,
                 config.energies(),
-                config.baseline_reference_energy(),
+                nereids_fitting::transmission_model::baseline_reference_energy_active(
+                    config.energies(),
+                    active_mask_slice,
+                ),
                 bli.b0,
                 bli.b1,
                 bli.b2,
@@ -1954,7 +1960,12 @@ fn fit_counts_joint_poisson(
                 result.params[bli.b1],
                 result.params[bli.b2],
             ]),
-            Some(config.baseline_reference_energy()),
+            Some(
+                nereids_fitting::transmission_model::baseline_reference_energy_active(
+                    config.energies(),
+                    active_mask_slice,
+                ),
+            ),
         )
     } else {
         (None, None)

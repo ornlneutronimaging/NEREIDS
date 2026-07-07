@@ -351,22 +351,24 @@ fn read_pv_series(
 
     // Drop corrupt device-reconnect records (issue #652, B12).  Real SNS
     // files — furnace channels BL10:SE:ND1:* on runs 19383/19386/19392 —
-    // contain reconnect entries with `time = 0.0` and a subnormal
-    // uninitialized-memory value (~6.9e-310).  A subnormal is
+    // contain reconnect entries with the exact signature `time == 0.0` AND
+    // a subnormal uninitialized-memory value (~6.9e-310).  A subnormal is
     // `is_finite() == true`, so without this guard the leading such record
     // would silently enter the power median and the time-weighted
-    // integration.  These records are also the ones that produce the
-    // backward `time = 0.0` jump mid-log, so dropping them by their
-    // subnormal-value signature ALSO removes the spurious non-ascending
-    // step — `run_health` then works on the very furnace PV a user asked
-    // about, instead of failing the ascending-time check below.  This
-    // matches `read_run_log`'s corrupt-record policy.  A genuine
-    // (non-subnormal) backward jump is NOT dropped: it still trips the
-    // ascending-time hard error, so real scrambled logs stay loud.
+    // integration.  These are also the records that produce the backward
+    // `time = 0.0` jump mid-log, so dropping them ALSO removes the spurious
+    // non-ascending step — `run_health` then works on the very furnace PV
+    // a user asked about, instead of failing the ascending-time check
+    // below.  Both parts of the signature are required so a legitimate
+    // (if physically implausible) subnormal reading at a NORMAL timestamp
+    // is not silently discarded; and a genuine non-subnormal backward jump
+    // is still NOT dropped — it trips the ascending-time hard error, so
+    // real scrambled logs stay loud.  Matches `read_run_log`'s policy on
+    // the leading-record case.
     let (time, value): (Vec<f64>, Vec<f64>) = time
         .iter()
         .zip(&value)
-        .filter(|&(_, &v)| !(v != 0.0 && v.abs() < f64::MIN_POSITIVE))
+        .filter(|&(&t, &v)| !(t == 0.0 && v != 0.0 && v.abs() < f64::MIN_POSITIVE))
         .map(|(&t, &v)| (t, v))
         .unzip();
     // Every entry was a corrupt reconnect record → treat as "no usable log"

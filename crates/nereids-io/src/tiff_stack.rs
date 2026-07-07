@@ -919,7 +919,7 @@ fn load_chunked_sum(
     let (_, height, width) = acc.dim();
 
     // Duplicate-chunk guard (issue #653).  On real VENUS data every observed
-    // multi-chunk folder is a byte-identical *duplicate write* of one
+    // multi-chunk folder is a *duplicate write* of one
     // exposure, not sequential DAQ segments — summing them (the default)
     // silently doubles every count.  We fingerprint each chunk with an
     // FNV-1a hash over the raw f64 bits (O(1) extra memory — the stacks run
@@ -967,7 +967,8 @@ fn load_chunked_sum(
             return Err(IoError::ChunkMismatch {
                 directory: dir.to_string_lossy().into_owned(),
                 details: format!(
-                    "DAQ chunk {chunk_id} is byte-identical to chunk {dup_of} — a \
+                    "DAQ chunk {chunk_id} has an identical content fingerprint to chunk \
+                     {dup_of} (FNV-1a hash over all pixel bits) — almost certainly a \
                      duplicate write of the same exposure, not a distinct DAQ segment. \
                      Summing them (default sum_chunks=true) would double every count \
                      (and inflate proton-charge normalisation by the chunk multiplicity). \
