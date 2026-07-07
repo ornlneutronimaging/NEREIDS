@@ -3114,8 +3114,9 @@ fn poisson_to_lm_result(
     // not a valid reduced-χ², and a good fit gives `D ≪ dof`, which would
     // SHRINK σ far below the Cramér-Rao bound (the opposite of the flag's
     // intent). Opt-in: the raw inverse-Fisher bound is the default; scaling
-    // needs a finite, positive reduced-χ² (`dof = 0` / non-finite leaves the
-    // raw bound), mirroring the LM path's `dof > 0` guard.
+    // needs a finite, positive reduced-χ². A perfect transmission fit
+    // (`chi_sq == 0`, so `reduced_chi_squared == 0` since `dof` is floored to 1
+    // above) or a non-finite model output leaves the raw bound untouched.
     let (covariance, uncertainties) =
         if scale_by_chi2 && reduced_chi_squared.is_finite() && reduced_chi_squared > 0.0 {
             let sigma_factor = reduced_chi_squared.sqrt();
@@ -5202,6 +5203,67 @@ mod tests {
         assert_eq!(
             default_run.temperature_k_unc, unscaled.temperature_k_unc,
             "default (flag absent) must equal scale_by_chi2=false"
+        );
+    }
+
+    /// Issue #638 (review R2): counts joint-Poisson `scale_by_chi2` DIRECTION
+    /// guard. The self-consistency test above uses a near-noiseless synthetic
+    /// (`deviance_per_dof < 1`, so σ shrinks); this exercises the paper's actual
+    /// regime — a deliberately UNDER-fit spectrum (`D/dof > 1`) must GROW σ.
+    /// A behavioural check (σ_scaled > σ_unscaled), not a re-derivation of the
+    /// reported statistic, so a future refactor that inverted the counts-path
+    /// factor would fail here.
+    #[test]
+    fn test_scale_by_chi2_joint_poisson_underfit_grows_sigma() {
+        let data = u238_single_resonance();
+        let energies: Vec<f64> = (0..201).map(|i| 4.0 + (i as f64) * 0.05).collect();
+        let (sample, open_beam) = synthetic_counts(&data, 0.001, &energies, 1000.0);
+        // ±30% zig-zag on the sample counts: a zero-mean high-frequency
+        // perturbation the smooth density+temperature model cannot absorb,
+        // driving the Poisson deviance per dof well above 1. Rounded and
+        // floored ≥ 0 to stay a valid count spectrum.
+        let sample: Vec<f64> = sample
+            .iter()
+            .enumerate()
+            .map(|(i, &c)| {
+                let k = if i % 2 == 0 { 1.30 } else { 0.70 };
+                (c * k).round().max(0.0)
+            })
+            .collect();
+        let input = InputData::Counts {
+            sample_counts: sample,
+            open_beam_counts: open_beam,
+        };
+        let make_config = |scale: bool| {
+            UnifiedFitConfig::new(
+                energies.clone(),
+                vec![data.clone()],
+                vec!["U-238".into()],
+                350.0,
+                None,
+                vec![0.0005],
+            )
+            .unwrap()
+            .with_solver(SolverConfig::PoissonKL(PoissonConfig::default()))
+            .with_fit_temperature(true)
+            .with_scale_by_chi2(scale)
+        };
+        let unscaled = fit_spectrum_typed(&input, &make_config(false)).unwrap();
+        let scaled = fit_spectrum_typed(&input, &make_config(true)).unwrap();
+        assert!(unscaled.converged && scaled.converged);
+        let dpd = unscaled
+            .deviance_per_dof
+            .expect("joint-Poisson must report deviance_per_dof");
+        assert!(
+            dpd > 1.0,
+            "zig-zag counts must under-fit (D/dof > 1), got {dpd}"
+        );
+        let t_unscaled = unscaled.temperature_k_unc.expect("σ_T unscaled");
+        let t_scaled = scaled.temperature_k_unc.expect("σ_T scaled");
+        assert!(
+            t_scaled > t_unscaled,
+            "under-fit (D/dof {dpd} > 1) must GROW σ_T: scaled {t_scaled} \
+             vs unscaled {t_unscaled}"
         );
     }
 
