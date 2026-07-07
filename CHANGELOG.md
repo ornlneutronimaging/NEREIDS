@@ -7,6 +7,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
 
 ## [Unreleased]
 
+## [0.3.0] - 2026-07-07
+
 ### Added
 
 - **Beam-state event filtering for NXevent_data banks** (#637):
@@ -258,6 +260,42 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
   `TiffLoadInfo::n_clipped_pixels`; NaN still errors) and
   `pixel_policy="allow"` (pre-normalized transmission, used by the MCP
   server and the GUI transmission tab) as explicit escape hatches.
+- **Three real-VENUS defects from post-merge validation** (#676): fixes
+  surfaced validating the merged build against IPTS-37432 data. (#648,
+  fitting) the multiplicative-baseline `E_ref` was placed over the full
+  cross-section grid instead of the active `fit_energy_range`, so on a VENUS
+  Ta grid (4.5 eV–2.3 MeV) with an 8–45 eV fit window `E_ref` landed at
+  ~3211 eV instead of ~19 eV — collapsing the `1, z, z²` basis's
+  orthogonality and letting the baseline silently absorb Doppler broadening;
+  `UnifiedFitConfig::baseline_reference_energy()` now folds the fit-range
+  mask (all 7 construction sites updated; new
+  `baseline_reference_energy_active`), a software fix with no
+  temperature-correctness claim. (#653, io) duplicate DAQ chunks — every
+  real VENUS multi-chunk folder is a byte-identical duplicate write of one
+  exposure — no longer silently double-count: `load_chunked_sum` fingerprints
+  each chunk (FNV-1a over the f64 bits) and refuses one identical to any
+  earlier chunk (naming the `sum_chunks=false` escape), while distinct chunks
+  still sum. (#652, io) `run_health` / `read_pv_series` now drop the corrupt
+  B12 furnace-reconnect DASlogs records (`time=0.0` with a subnormal value —
+  subnormals are `is_finite()`, so one otherwise entered the power median or
+  tripped the ascending-time guard); genuine backward time jumps still error.
+- **Analytic Jacobian for no-temperature fits without precomputed σ**
+  (#635): `build_transmission_model` now precomputes working-grid σ for
+  this case, so the model exposes its analytical Jacobian instead of
+  silently degrading the LM path to finite differences and the counts
+  joint-Poisson stage to an identity-Fisher gradient descent (which
+  crawled through correlated-parameter valleys and, on the real-VENUS
+  regression fixture, stopped 1.7 % short of the true deviance optimum).
+  The model output is unchanged (bit-exact parity with the previous
+  forward-model path, pinned by a committed test); only the optimizer
+  quality improved.
+- **Joint-Poisson deviance is clamped at its mathematical floor**
+  (#635): per-bin xlogy round-off could report a total deviance of
+  ~−1e-13 on machine-exact fits, violating the D ≥ 0 contract; D == 0
+  (a perfect fit) is now reported as converged instead of inflating the
+  damping to its ceiling and returning non-converged. The clamp is
+  scoped to the accumulation round-off envelope — a deviance negative
+  beyond it surfaces as an error instead of a silent perfect fit.
 
 ### Documentation
 
@@ -403,26 +441,6 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
   boundary-saturation and no-finite-χ² error contracts, and the
   `dof = n_valid − 3` reduced-χ² convention are unchanged; all existing
   calibration tests pass unmodified.
-
-### Fixed
-
-- **Analytic Jacobian for no-temperature fits without precomputed σ**
-  (#635): `build_transmission_model` now precomputes working-grid σ for
-  this case, so the model exposes its analytical Jacobian instead of
-  silently degrading the LM path to finite differences and the counts
-  joint-Poisson stage to an identity-Fisher gradient descent (which
-  crawled through correlated-parameter valleys and, on the real-VENUS
-  regression fixture, stopped 1.7 % short of the true deviance optimum).
-  The model output is unchanged (bit-exact parity with the previous
-  forward-model path, pinned by a committed test); only the optimizer
-  quality improved.
-- **Joint-Poisson deviance is clamped at its mathematical floor**
-  (#635): per-bin xlogy round-off could report a total deviance of
-  ~−1e-13 on machine-exact fits, violating the D ≥ 0 contract; D == 0
-  (a perfect fit) is now reported as converged instead of inflating the
-  damping to its ceiling and returning non-converged. The clamp is
-  scoped to the accumulation round-off envelope — a deviance negative
-  beyond it surfaces as an error instead of a silent perfect fit.
 
 
 ## [0.2.2] - 2026-07-03
@@ -794,7 +812,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
 - Documentation site: mdBook user guide + rustdoc API reference on GitHub Pages
 - SAMMY validation suite: 43 test cases validated against SAMMY reference code
 
-[Unreleased]: https://github.com/ornlneutronimaging/NEREIDS/compare/v0.2.2...HEAD
+[Unreleased]: https://github.com/ornlneutronimaging/NEREIDS/compare/v0.3.0...HEAD
+[0.3.0]: https://github.com/ornlneutronimaging/NEREIDS/compare/v0.2.2...v0.3.0
 [0.2.2]: https://github.com/ornlneutronimaging/NEREIDS/compare/v0.2.1...v0.2.2
 [0.2.1]: https://github.com/ornlneutronimaging/NEREIDS/compare/v0.2.0...v0.2.1
 [0.2.0]: https://github.com/ornlneutronimaging/NEREIDS/compare/v0.1.8...v0.2.0

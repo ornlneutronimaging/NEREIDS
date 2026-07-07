@@ -3,8 +3,8 @@ title: "NEREIDS: Neutron Resonance Resolved Imaging Data Analysis System"
 message: "If you use this software, please cite it as below."
 type: software
 license: MIT
-version: 0.2.2
-date-released: 2026-07-03
+version: 0.3.0
+date-released: 2026-07-07
 doi: 10.5281/zenodo.18973054
 url: https://ornlneutronimaging.github.io/NEREIDS/
 repository-code: https://github.com/ornlneutronimaging/NEREIDS
