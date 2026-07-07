@@ -42,17 +42,21 @@ tiff = "0.11"
 image = "0.25"
 pyo3 = { version = "0.29", features = ["extension-module"] }
 numpy = "0.29"
-# NOTE: keep eframe default features ON — the `winit/default` default entry
-# pulls winit's wayland-dlopen, so the display stack is dlopen'ed rather than
-# linked. Disabling defaults (even while re-adding eframe's own `wayland`/`x11`
-# features, which only map to egui-winit/wayland|x11 — NOT winit/wayland-dlopen)
-# would hard-link libwayland and re-trigger wheel vendoring
-# (see scripts/check_wheel_policy.sh).
-# eframe 0.34 made `wgpu` the default renderer; we keep defaults ON to preserve
-# the dlopen stack and add `glow`, selecting Renderer::Glow at runtime in
-# main.rs — the backend proven on the ORNL ThinLinc / manylinux_2_28 fleet.
-# `wgpu` is compiled but never used at runtime.
-eframe = { version = "0.34", features = ["persistence", "glow"] }
+# eframe 0.34 made `wgpu` the default renderer and moved `glow` to opt-in.
+# We render with glow (Renderer::Glow in main.rs) and DROP wgpu entirely
+# (default-features = false + explicit features): under glow, wgpu is dead
+# weight, its wgpu-hal Direct3D12 backend fails to build on Windows (a
+# windows-core 0.61/0.62 trait conflict), and it bloats the manylinux wheel.
+# This mirrors what eframe 0.33 shipped (glow, no wgpu).
+# CAVEAT (wheel): eframe pulls egui-winit/winit with default-features = false,
+# so the ONLY source of winit's wayland-dlopen is eframe's own default
+# `winit/default` entry — which default-features = false drops. eframe's
+# `wayland`/`x11` features map to winit/wayland|x11 (hard-link), NOT the dlopen
+# variant. libwayland must stay dlopen'ed (not linked) or the wheel re-vendors
+# it (see scripts/check_wheel_policy.sh), so wayland-dlopen is restored by a
+# direct Linux-only `winit` dep in apps/gui/Cargo.toml. Do NOT drop that winit
+# dep, and do NOT re-enable wgpu.
+eframe = { version = "0.34", default-features = false, features = ["accesskit", "default_fonts", "glow", "persistence", "wayland", "x11"] }
 egui = "0.34"
 egui_extras = { version = "0.34", features = ["image", "svg"] }
 egui_plot = "0.35"
