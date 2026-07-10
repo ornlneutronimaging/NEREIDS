@@ -34,6 +34,10 @@ Thumbs.db
 # Local development worklog (NOT tracked)
 /worklog/
 
+# Local agent task state and private investigation artifacts (NOT tracked)
+/.harness/
+/investigation/
+
 # Python
 __pycache__/
 *.pyc
