@@ -1453,18 +1453,22 @@ impl<'a> FitModel for TransmissionKLBackgroundModel<'a> {
 
         // Fill inner model columns (density, temperature).
         // Inner Jacobian is the same as bare model — background doesn't
-        // affect ∂T_inner/∂nₖ. Without an analytical inner Jacobian the
-        // `?` returns None: fall back to FD for the entire model.
-        let ij = inner_jac.as_ref()?;
-        let mut inner_col = 0;
-        for (col, &fp) in free_param_indices.iter().enumerate() {
-            if fp == self.b0_index || fp == self.b1_index {
-                continue;
+        // affect ∂T_inner/∂nₖ.
+        if let Some(ij) = inner_jac.as_ref() {
+            let mut inner_col = 0;
+            for (col, &fp) in free_param_indices.iter().enumerate() {
+                if fp == self.b0_index || fp == self.b1_index {
+                    continue;
+                }
+                for row in 0..n_e {
+                    *jacobian.get_mut(row, col) = ij.get(row, inner_col);
+                }
+                inner_col += 1;
             }
-            for row in 0..n_e {
-                *jacobian.get_mut(row, col) = ij.get(row, inner_col);
-            }
-            inner_col += 1;
+        } else if !inner_free.is_empty() {
+            // Inner params are free but the inner model has no analytical
+            // Jacobian — fall back to FD for the entire model.
+            return None;
         }
 
         // Background columns.
@@ -2399,6 +2403,162 @@ mod tests {
             "b1 fit={}, true={}",
             result.params[3],
             true_params[3],
+        );
+    }
+
+    /// Inner params FREE + inner model WITHOUT `analytical_jacobian` →
+    /// the wrapper must return `None` (FD fallback for the entire model)
+    /// and the fit must still converge on the FD path.
+    #[test]
+    fn test_transmission_kl_background_fd_fallback_when_inner_lacks_jacobian() {
+        // ExponentialModel has no analytical_jacobian (trait default None).
+        // Counts-scale data (flux 1000, backgrounds 20/10) keeps the
+        // Poisson NLL well-conditioned for parameter recovery.
+        let x: Vec<f64> = (0..40).map(|i| 1.0 + 0.25 * i as f64).collect();
+        let inner = ExponentialModel {
+            x: x.clone(),
+            flux: vec![1000.0; x.len()],
+        };
+        let inv_sqrt_energies: Vec<f64> = x.iter().map(|&e| 1.0 / e.sqrt()).collect();
+        let wrapped = TransmissionKLBackgroundModel {
+            inner: &inner,
+            inv_sqrt_energies,
+            b0_index: 1,
+            b1_index: 2,
+            n_params: 3,
+        };
+
+        let true_params = vec![0.4, 20.0, 10.0];
+        let y_obs = wrapped.evaluate(&true_params).unwrap();
+
+        // Inner param 0 free (alone and together with b0/b1): no analytic
+        // inner Jacobian → wrapper falls back to FD.
+        assert!(
+            wrapped
+                .analytical_jacobian(&true_params, &[0, 1, 2], &y_obs)
+                .is_none(),
+            "inner param free without inner analytical_jacobian must give None"
+        );
+        assert!(
+            wrapped
+                .analytical_jacobian(&true_params, &[0], &y_obs)
+                .is_none(),
+            "inner-only free set without inner analytical_jacobian must give None"
+        );
+
+        let mut params = ParameterSet::new(vec![
+            FitParameter::non_negative("density", 0.8),
+            FitParameter {
+                name: "kl_b0".into(),
+                value: 5.0,
+                lower: 0.0,
+                upper: 500.0,
+                fixed: false,
+            },
+            FitParameter {
+                name: "kl_b1".into(),
+                value: 5.0,
+                lower: 0.0,
+                upper: 500.0,
+                fixed: false,
+            },
+        ]);
+        let config = PoissonConfig {
+            max_iter: 300,
+            ..PoissonConfig::default()
+        };
+        let result = poisson_fit(&wrapped, &y_obs, &mut params, &config).unwrap();
+        assert!(
+            result.converged,
+            "FD-fallback fit did not converge: {result:?}"
+        );
+        assert!(
+            (result.params[0] - true_params[0]).abs() / true_params[0] < 0.05,
+            "density fit={}, true={}",
+            result.params[0],
+            true_params[0],
+        );
+    }
+
+    /// Inner params FIXED (only b0/b1 free) → the wrapper stays on the
+    /// analytic path: `analytical_jacobian` returns `Some` with the exact
+    /// background columns ∂T/∂b₀ = 1 and ∂T/∂b₁ = 1/√E, and the
+    /// background-only fit converges.
+    #[test]
+    fn test_transmission_kl_background_background_only_analytic_jacobian() {
+        // Counts-scale data — see the FD-fallback test above.
+        let x: Vec<f64> = (0..40).map(|i| 1.0 + 0.25 * i as f64).collect();
+        let inner = ExponentialModel {
+            x: x.clone(),
+            flux: vec![1000.0; x.len()],
+        };
+        let inv_sqrt_energies: Vec<f64> = x.iter().map(|&e| 1.0 / e.sqrt()).collect();
+        let wrapped = TransmissionKLBackgroundModel {
+            inner: &inner,
+            inv_sqrt_energies: inv_sqrt_energies.clone(),
+            b0_index: 1,
+            b1_index: 2,
+            n_params: 3,
+        };
+
+        let true_params = vec![0.4, 20.0, 10.0];
+        let y_obs = wrapped.evaluate(&true_params).unwrap();
+
+        let jac = wrapped
+            .analytical_jacobian(&true_params, &[1, 2], &y_obs)
+            .expect("background-only free set must stay on the analytic path");
+        for (row, &inv_sqrt_e) in inv_sqrt_energies.iter().enumerate() {
+            assert!(
+                (jac.get(row, 0) - 1.0).abs() < 1e-15,
+                "∂T/∂b₀ at row {row} = {}, expected 1.0",
+                jac.get(row, 0),
+            );
+            assert!(
+                (jac.get(row, 1) - inv_sqrt_e).abs() < 1e-15,
+                "∂T/∂b₁ at row {row} = {}, expected {inv_sqrt_e}",
+                jac.get(row, 1),
+            );
+        }
+
+        // Background-only fit (density fixed at truth) converges on the
+        // analytic path.
+        let mut params = ParameterSet::new(vec![
+            FitParameter::fixed("density", true_params[0]),
+            FitParameter {
+                name: "kl_b0".into(),
+                value: 5.0,
+                lower: 0.0,
+                upper: 500.0,
+                fixed: false,
+            },
+            FitParameter {
+                name: "kl_b1".into(),
+                value: 5.0,
+                lower: 0.0,
+                upper: 500.0,
+                fixed: false,
+            },
+        ]);
+        let config = PoissonConfig {
+            max_iter: 300,
+            ..PoissonConfig::default()
+        };
+        let result = poisson_fit(&wrapped, &y_obs, &mut params, &config).unwrap();
+        assert!(
+            result.converged,
+            "background-only analytic fit did not converge: {result:?}"
+        );
+        assert!(
+            (result.params[1] - true_params[1]).abs() < 0.1,
+            "b0 fit={}, true={}",
+            result.params[1],
+            true_params[1],
+        );
+        assert!(
+            (result.params[2] - true_params[2]).abs() < 0.1,
+            "b1 fit={}, true={}",
+            result.params[2],
+            true_params[2],
         );
     }
 }
