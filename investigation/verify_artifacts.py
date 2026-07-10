@@ -44,12 +44,20 @@ def main() -> None:
         compile(path.read_text(), str(path), "exec")
 
     contract = (ROOT / ".harness/TASK.md").read_text()
-    checked_requirements = re.findall(r"^- \[x\] R\d+", contract, flags=re.MULTILINE)
-    unchecked_requirements = re.findall(r"^- \[ \] R\d+", contract, flags=re.MULTILINE)
-    if len(checked_requirements) != 12 or unchecked_requirements:
+    requirement_states = re.findall(
+        r"^- \[([x ])\] R(\d+)\b", contract, flags=re.MULTILINE
+    )
+    if not requirement_states:
+        raise AssertionError("contract state: no R-numbered requirements found")
+    requirement_numbers = [int(number) for _, number in requirement_states]
+    expected_numbers = list(range(1, max(requirement_numbers) + 1))
+    unchecked_requirements = [
+        f"R{number}" for state, number in requirement_states if state != "x"
+    ]
+    if requirement_numbers != expected_numbers or unchecked_requirements:
         raise AssertionError(
-            f"contract state: checked={len(checked_requirements)}, "
-            f"unchecked={len(unchecked_requirements)}"
+            f"contract state: requirements={requirement_numbers}, "
+            f"expected={expected_numbers}, unchecked={unchecked_requirements}"
         )
 
     inventory = (INVESTIGATION / "archive-inventory.md").read_text()
@@ -73,7 +81,7 @@ def main() -> None:
     link_count = verify_links()
     print(f"required_artifacts={len(REQUIRED)}")
     print(f"python_files_compiled={len(python_files)}")
-    print(f"contract_checked_requirements={len(checked_requirements)}")
+    print(f"contract_checked_requirements={len(requirement_states)}")
     print(f"archive_inventory_rows={inventory_rows}")
     print(f"relative_links_checked={link_count}")
     print("verification=PASS")

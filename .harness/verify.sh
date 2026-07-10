@@ -57,6 +57,7 @@ printf 'root=%s\n' "$ROOT"
 # Fast, dependency-light failures first.
 run cargo fmt --all -- --check
 run pixi run python scripts/check_python_api_drift.py
+run pixi run python investigation/verify_artifacts.py
 run pixi run python investigation/verify_phase0.py
 run pixi run python investigation/verify_github_program.py
 
