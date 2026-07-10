@@ -15,11 +15,11 @@ the live source of status is [NEREIDS Development Project #8](https://github.com
 - Bootstrap base: `b01e077` (`docs: audit Phase 0 fitting paths`)
 - Project node ID: `PVT_kwDOAPDgcs4BOcuc`
 
-The local completion harness passed once during bootstrap:
+The final clean bootstrap checkout passed the local completion harness:
 
 ```text
-212 passed, 1 skipped, 3 warnings in 277.16s
-PASS: NEREIDS completion gate (8m18s)
+212 passed, 1 skipped, 3 warnings in 277.00s
+PASS: NEREIDS completion gate (7m27s)
 ```
 
 The full transcript was observed in this session. The harness remains the

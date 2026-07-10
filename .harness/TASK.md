@@ -127,13 +127,15 @@ serialized-name tombstones remain beyond v0.5 pending a later versioned audit.
   `61 M + 17 X + 50 CL = 128 identifiers; each has exactly one primary owner`.
 - R21: Project #8 contains the six program fields and saved views 4–9; GraphQL
   returned all field options, filters, layouts, and 22 populated program items.
-- R22: `.harness/verify.sh` reported `PASS: NEREIDS completion gate (8m18s)`;
+- R22: `.harness/verify.sh` reported `212 passed, 1 skipped` and
+  `PASS: NEREIDS completion gate (7m27s)` after the artifact verifier confirmed
+  25 checked requirements, 22 Python files, and 93 relative links;
   `.harness/review` is committed; #688 and every G0–G9 body contain issue-ready,
   PR-merge, phase GO/NO-GO, and post-merge rules.
 - R23: G0 leaf issues #699–#705 hold the missing anchors; commit `e9bbdcc`
   records the local tracking/gate bootstrap while G0 remains Pending.
 - R24: #625 is a G3 child/blocker, #628/#459 are G8 children/blockers, #529 is
   a G7 child/blocker, and #423/#427/#448/#458/#502 remain closed historical evidence.
-- R25: `pixi run python investigation/verify_github_program.py` reports seven
+- R25: `pixi run python investigation/verify_github_program.py` reports nine
   bootstrap paths and no production source; `git diff --name-only
   b01e077..HEAD` lists only `.gitignore`, `.harness`, and `investigation` paths.
