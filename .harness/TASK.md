@@ -23,6 +23,16 @@
 >
 > I agree that the code base is a bit messy and there are lots of half baked work done by Opus, and this is the time we should clear the mess and fix the problem
 
+### Program execution authorization
+
+> based on the output of phase 0, this will be a serious efforts, I would like to know
+> - how do we properly track this work on Github? Project board or an epics issue specifically?
+> - what is the plan for deprecation? for useless path or incomplete path, I think it might be okay to remove them directly. However, what if the code is partialy used? should we rewire the code to use the more robust one?
+>
+> If I were to give you the permission to go forward, what is the execution order and how do I monitor the process? How does the gating of the development works here?
+
+> sounds good, proceed
+
 ## Investigation rules
 
 - The deliverable is a validated mechanism or a complete elimination ledger, not disappearance of a residual feature. No data may be masked, excluded, smoothed, reweighted, or windowed merely because doing so improves the fit.
@@ -49,6 +59,14 @@
 - [x] R15 — “provide suggestions on what to deprecate, what to keep and improve” — check: `test -s investigation/phase-0-disposition.md`; every matrix cell has exactly one evidence-backed recommendation (`keep`, `keep+improve`, `deprecate`, `remove`, or `complete before exposure`), compatibility and migration impact, and falsifiable acceptance criteria. Recommendations must not treat a better fit alone as evidence of correctness.
 - [x] R16 — “there are lots of half baked work done by Opus” — check: `test -s investigation/phase-0-cleanup-ledger.md`; every duplicated, stale, misleading, partially wired, research-only, or publicly exposed-but-rejected implementation found in scope is recorded with source evidence, reachability, test coverage, and an assigned disposition; authorship is not used as evidence of defect.
 - [x] R17 program floor — “this is the time we should clear the mess and fix the problem” — check: Phase 0 produces a dependency-ordered cleanup/repair sequence in `investigation/phase-0-disposition.md`; subsequent implementation may begin only after R13–R16 establish whether each path should be repaired, completed, deprecated, or removed, and every implementation change must reproduce the pre-change behavior/defect and pass its path-specific acceptance test.
+- [ ] R18 — “how do we properly track this work on Github? Project board or an epics issue specifically?” — check: one program epic and native G0–G9 phase sub-issues exist in `ornlneutronimaging/NEREIDS`, are attached to the existing NEREIDS Development Project #8 rather than a duplicate board, and their URLs/IDs are preserved in `investigation/github-program-tracking.md`.
+- [ ] R19 — “what is the plan for deprecation? for useless path or incomplete path, I think it might be okay to remove them directly. However, what if the code is partialy used? should we rewire the code to use the more robust one?” — check: the epic and relevant phase issues encode the Phase 0 remove/fail-closed, complete-before-exposure, deprecate/migrate, and default-only-rewire policy; explicit solver requests are never silently reinterpreted, and release/usage-audit gates are stated.
+- [ ] R20 — “If I were to give you the permission to go forward, what is the execution order” — check: G0–G9 phase issues reproduce the dependency order in `investigation/phase-0-disposition.md`, GitHub parent/dependency relationships prevent downstream gate closure, and every M01–M61, X01–X17, and CL-01–CL-50 identifier maps to exactly one primary owner recorded in `investigation/github-program-tracking.md`.
+- [ ] R21 — “how do I monitor the process?” — check: Project #8 has program-specific Phase, Workstream, Scientific gate, Disposition, and Risk fields plus documented Board/Table/Roadmap/Gate/Deprecation views; each phase issue has an evidence-backed GO/NO-GO checklist and linked child/PR roll-up.
+- [ ] R22 — “How does the gating of the development works here?” — check: executable `.harness/verify.sh` is built from the repository's real formatting, lint, Rust, Python, API-drift, and Phase 0 route checks, exits 0 on the current checkout, and `.harness/review` is committed for the approved fresh-context review gate; issue-ready, PR-merge, phase-science, and post-merge gates are recorded in the epic/phase bodies.
+- [ ] R23 — “sounds good, proceed” — check: the approved tracking/bootstrap package is executed rather than only described: GitHub objects are created, G0 is populated with the missing reproduction-anchor work, local tracking/gate artifacts are committed, and no production refactor starts while G0's scientific gate is pending.
+- [ ] R24 existing-work reconciliation — check: existing relevant issues (#625, #628, #529, #459 and referenced prior/closed work) are linked or assigned to the appropriate phase instead of silently duplicated; any reopen decision cites a current narrow reproduction.
+- [ ] R25 bootstrap boundary — check: the bootstrap/G0 commit changes only `.harness`, `.github`/tracking documentation, and investigation support artifacts; `git diff --name-only b01e077..HEAD` contains no production Rust/Python/GUI/MCP source path.
 
 ## Coverage mapping
 
@@ -62,6 +80,7 @@
 - Its second bullet maps to R14.
 - Its third bullet maps to R15.
 - The final sentence's “half baked work” clause maps to R16; its “clear the mess and fix the problem” directive maps to R17 as the program floor. R17 deliberately gates cleanup behind the audit so removal cannot manufacture a passing result.
+- The program-execution questions map to R18–R22; the final authorization maps to R23. R24 preserves the approved no-duplicate tracking model, and R25 enforces the approved G0-before-production boundary.
 
 ## Evidence
 
@@ -90,3 +109,6 @@
   `investigation/phase-0-disposition.md`,
   `investigation/phase-0-cleanup-ledger.md`, and exact commands/results under
   `investigation/evidence/phase-0/test-results.md`.
+- R18–R25: pending program-bootstrap evidence in
+  `investigation/github-program-tracking.md`, GitHub Project #8 and its epic/
+  phase hierarchy, `.harness/verify.sh`, and the bootstrap commit diff.
