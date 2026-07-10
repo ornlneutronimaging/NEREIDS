@@ -502,7 +502,7 @@ impl FileDialogs {
                     egui::Window::new("native_dialog_pending")
                         .title_bar(false)
                         .resizable(false)
-                        .anchor(egui::Align2::CENTER_TOP, [0.0, 8.0])
+                        .anchor(egui::Align2::CENTER_TOP, [0.0_f32, 8.0_f32])
                         .show(ctx, |ui| {
                             ui.horizontal(|ui| {
                                 ui.spinner();

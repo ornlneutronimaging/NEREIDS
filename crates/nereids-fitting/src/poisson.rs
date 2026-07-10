@@ -1453,21 +1453,18 @@ impl<'a> FitModel for TransmissionKLBackgroundModel<'a> {
 
         // Fill inner model columns (density, temperature).
         // Inner Jacobian is the same as bare model — background doesn't
-        // affect ∂T_inner/∂nₖ.
-        if let Some(ref ij) = inner_jac {
-            let mut inner_col = 0;
-            for (col, &fp) in free_param_indices.iter().enumerate() {
-                if fp == self.b0_index || fp == self.b1_index {
-                    continue;
-                }
-                for row in 0..n_e {
-                    *jacobian.get_mut(row, col) = ij.get(row, inner_col);
-                }
-                inner_col += 1;
+        // affect ∂T_inner/∂nₖ. Without an analytical inner Jacobian the
+        // `?` returns None: fall back to FD for the entire model.
+        let ij = inner_jac.as_ref()?;
+        let mut inner_col = 0;
+        for (col, &fp) in free_param_indices.iter().enumerate() {
+            if fp == self.b0_index || fp == self.b1_index {
+                continue;
             }
-        } else {
-            // No analytical inner Jacobian — fall back to FD for entire model.
-            return None;
+            for row in 0..n_e {
+                *jacobian.get_mut(row, col) = ij.get(row, inner_col);
+            }
+            inner_col += 1;
         }
 
         // Background columns.

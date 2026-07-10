@@ -115,7 +115,7 @@ pub fn landing_step(ui: &mut egui::Ui, state: &mut AppState) {
                     .fill(tc.bg2)
                     .corner_radius(CornerRadius::same(8))
                     .inner_margin(Margin::symmetric(16, 10))
-                    .stroke(Stroke::new(1.0, tc.border))
+                    .stroke(Stroke::new(1.0_f32, tc.border))
                     .show(ui, |ui| {
                         ui.horizontal(|ui| {
                             ui.vertical(|ui| {
@@ -167,7 +167,7 @@ fn landing_card(
         .fill(tc.bg2)
         .corner_radius(CornerRadius::same(12))
         .inner_margin(Margin::same(20))
-        .stroke(Stroke::new(1.0, tc.border))
+        .stroke(Stroke::new(1.0_f32, tc.border))
         .shadow(Shadow {
             offset: [0, 1],
             blur: 3,

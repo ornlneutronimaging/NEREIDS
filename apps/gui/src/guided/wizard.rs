@@ -46,7 +46,7 @@ fn breadcrumb_bar(ui: &mut egui::Ui, state: &mut AppState) {
                 .stroke(if is_active || is_past {
                     Stroke::NONE
                 } else {
-                    Stroke::new(1.0, tc.border)
+                    Stroke::new(1.0_f32, tc.border)
                 })
                 .show(ui, |ui| {
                     ui.label(RichText::new(*label).size(11.0).strong().color(text_color));
@@ -250,7 +250,7 @@ fn wizard_confirm(ui: &mut egui::Ui, state: &mut AppState) {
             .fill(tc.bg2)
             .corner_radius(CornerRadius::same(8))
             .inner_margin(Margin::same(16))
-            .stroke(Stroke::new(1.0, tc.accent))
+            .stroke(Stroke::new(1.0_f32, tc.accent))
             .show(ui, |ui| {
                 ui.set_min_width(full_w - 38.0);
                 ui.label(
@@ -331,9 +331,9 @@ fn wizard_option_card(
     let tc = ThemeColors::from_ctx(ui.ctx());
     let fill = if selected { tc.bg3 } else { tc.bg2 };
     let border = if selected {
-        Stroke::new(2.0, tc.accent)
+        Stroke::new(2.0_f32, tc.accent)
     } else {
-        Stroke::new(1.0, tc.border)
+        Stroke::new(1.0_f32, tc.border)
     };
 
     let full_w = ui.available_width();

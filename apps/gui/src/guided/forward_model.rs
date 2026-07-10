@@ -400,7 +400,7 @@ pub(crate) fn fm_spectrum_panel(ui: &mut egui::Ui, state: &mut AppState) {
                     .filter(|&i| x_values[i].is_finite())
                     .map(|i| [x_values[i], combined[i]])
                     .collect();
-                plot_ui.line(Line::new("Combined T(E)", points).width(2.0));
+                plot_ui.line(Line::new("Combined T(E)", points).width(2.0_f32));
             }
 
             // Per-isotope contribution lines (dashed, colored by isotope hash)

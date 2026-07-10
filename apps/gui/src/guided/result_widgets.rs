@@ -267,7 +267,7 @@ pub fn draw_colorbar(ui: &mut egui::Ui, data: &ndarray::Array2<f64>, colormap: C
     painter.rect_stroke(
         bar_rect,
         0.0,
-        egui::Stroke::new(1.0, egui::Color32::GRAY),
+        egui::Stroke::new(1.0_f32, egui::Color32::GRAY),
         egui::StrokeKind::Outside,
     );
 

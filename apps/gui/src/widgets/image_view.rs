@@ -588,7 +588,7 @@ fn draw_roi_draft_overlay(
         roi_rect,
         0.0,
         egui::Stroke::new(
-            1.5,
+            1.5_f32,
             egui::Color32::from_rgba_unmultiplied(255, 255, 255, 180),
         ),
         egui::StrokeKind::Outside,
@@ -681,7 +681,7 @@ fn draw_roi_overlay(
     painter.rect_stroke(
         roi_rect,
         0.0,
-        egui::Stroke::new(1.5, egui::Color32::from_rgb(0, 120, 255)),
+        egui::Stroke::new(1.5_f32, egui::Color32::from_rgb(0, 120, 255)),
         egui::StrokeKind::Outside,
     );
 }
@@ -719,7 +719,7 @@ fn draw_roi_selected_overlay(
     painter.rect_stroke(
         roi_rect,
         0.0,
-        egui::Stroke::new(2.0, egui::Color32::from_rgb(0, 200, 80)),
+        egui::Stroke::new(2.0_f32, egui::Color32::from_rgb(0, 200, 80)),
         egui::StrokeKind::Outside,
     );
 }
@@ -742,7 +742,7 @@ fn draw_pixel_marker(
         rect.top() + frac_y * rect.height(),
     );
     let r = 4.0;
-    let stroke = egui::Stroke::new(1.5, egui::Color32::from_rgb(255, 165, 0));
+    let stroke = egui::Stroke::new(1.5_f32, egui::Color32::from_rgb(255, 165, 0));
     painter.circle_stroke(center, r, stroke);
     painter.line_segment(
         [

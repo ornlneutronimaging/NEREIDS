@@ -16,7 +16,7 @@ pub fn toolbar(ui: &mut egui::Ui, state: &mut AppState) {
             egui::Frame::NONE
                 .fill(colors.bg2)
                 .inner_margin(egui::Margin::symmetric(12, 6))
-                .stroke(egui::Stroke::new(1.0, colors.border)),
+                .stroke(egui::Stroke::new(1.0_f32, colors.border)),
         )
         .show_inside(ui, |ui| {
             ui.horizontal_centered(|ui| {
