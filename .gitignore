@@ -58,3 +58,10 @@ tmp/
 
 # do not track manuscript folders
 .manuscripts/
+
+# Agent harness runtime state (not tracked)
+.harness/DONE
+.harness/BLOCKED
+.harness/RUN_LOG.md
+.harness/PLAN.orig
+.harness/NOTES.md
