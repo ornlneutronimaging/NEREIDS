@@ -14,6 +14,15 @@
 > third, the IC instrument resolution was implemented in rush, despite mulitple round of bug fixing, I am not entire sure we get it right. And it does seems like even with current IC model, there are still strange issues we cannot resolve when deal with the real data. I need you to look into the physics to figrue out what kind of fixing or improvement we need to introduce into IC model in order to make it work for real data.
 > last, the IC model involved steps are very slow, which is expected during the rushed development process as we are running out of time, but now I do believe we should consider speed optimizatoin, which I think should be possible given that the IC model is a nanalytical form whereas UDR is talbuated data taht are hard to optmized for speed.
 
+### Phase 0 amendment
+
+> I think we need a phase 0 where:
+> - each of the existing path is audited, evaluated and tested (with synthetic data and real data if possible)
+> - form the matrix you described
+> - provide suggestions on what to deprecate, what to keep and improve
+>
+> I agree that the code base is a bit messy and there are lots of half baked work done by Opus, and this is the time we should clear the mess and fix the problem
+
 ## Investigation rules
 
 - The deliverable is a validated mechanism or a complete elimination ledger, not disappearance of a residual feature. No data may be masked, excluded, smoothed, reweighted, or windowed merely because doing so improves the fit.
@@ -35,6 +44,11 @@
 - [x] R10 discrimination — every test actually run records the exact command, exit status, output path, observation, and what it rules in or out — check: ledger rows and preserved outputs under `investigation/evidence/`.
 - [x] R11 outcome, exactly one arm — EITHER one or more causes are validated because their mechanisms predict/reproduce the observed features without excluding affected data; OR the problem remains unresolved and the elimination ledger is complete with the most informative next test — check: `investigation/report.md` labels the achieved arm and cites the ledger evidence.
 - [x] R12 disclosure — the report lists every data exclusion with independent justification and a with/without comparison, or states “no exclusions” — check: `rg -n "Data exclusions|no exclusions" investigation/report.md`.
+- [ ] R13 — “each of the existing path is audited, evaluated and tested (with synthetic data and real data if possible)” — check: `test -s investigation/phase-0-path-audit.md`; every public single-spectrum, spatial, and resolution-calibration dispatch reachable through the Rust and Python APIs has a row identifying its data domain, requested solver, actual objective, resolution operator, background/nuisance stack, support status, and exact synthetic and available-real-data test command/result. Any path not executable is labeled blocked or unsupported with the precise reason; no passing result may be inferred from a sibling path.
+- [ ] R14 — “form the matrix you described” — check: `test -s investigation/phase-0-support-matrix.md`; the matrix covers data domain × solver dispatch × background/nuisance model × resolution family, distinguishes native, fallback, research-only, rejected, and calibration-only routes, and links every cell to file/line evidence and its R13 test result.
+- [ ] R15 — “provide suggestions on what to deprecate, what to keep and improve” — check: `test -s investigation/phase-0-disposition.md`; every matrix cell has exactly one evidence-backed recommendation (`keep`, `keep+improve`, `deprecate`, `remove`, or `complete before exposure`), compatibility and migration impact, and falsifiable acceptance criteria. Recommendations must not treat a better fit alone as evidence of correctness.
+- [ ] R16 — “there are lots of half baked work done by Opus” — check: `test -s investigation/phase-0-cleanup-ledger.md`; every duplicated, stale, misleading, partially wired, research-only, or publicly exposed-but-rejected implementation found in scope is recorded with source evidence, reachability, test coverage, and an assigned disposition; authorship is not used as evidence of defect.
+- [ ] R17 program floor — “this is the time we should clear the mess and fix the problem” — check: Phase 0 produces a dependency-ordered cleanup/repair sequence in `investigation/phase-0-disposition.md`; subsequent implementation may begin only after R13–R16 establish whether each path should be repaired, completed, deprecated, or removed, and every implementation change must reproduce the pre-change behavior/defect and pass its path-specific acceptance test.
 
 ## Coverage mapping
 
@@ -44,6 +58,10 @@
 - The three “third” source sentences map to R7 and the validated-mechanism requirement R11.
 - The “last” source sentence maps to R8.
 - R9–R12 are mandatory investigation-integrity requirements added by the investigation template; they do not reduce any source requirement.
+- The Phase 0 amendment's introductory sentence and first bullet map to R13.
+- Its second bullet maps to R14.
+- Its third bullet maps to R15.
+- The final sentence's “half baked work” clause maps to R16; its “clear the mess and fix the problem” directive maps to R17 as the program floor. R17 deliberately gates cleanup behind the audit so removal cannot manufacture a passing result.
 
 ## Evidence
 
@@ -67,3 +85,5 @@
   `investigation/evidence/identifiability.md`; no new exclusions, both inherited
   4–120 and 8–45 reproduction scopes disclosed with controls and the precise
   full-domain synthesis blocker.
+- R13–R17: pending Phase 0 evidence; canonical artifacts are named on each
+  requirement line and must link their exact commands and preserved outputs.
