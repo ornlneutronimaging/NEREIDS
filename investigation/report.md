@@ -499,15 +499,22 @@ transfer test.
 
 ## Implementation and validation sequence
 
+The user-requested [Phase 0 path audit](phase-0-plan.md) now precedes every
+model change below. Its [support matrix](phase-0-support-matrix.md) and
+[dispositions](phase-0-disposition.md) separate surviving scientific routes,
+compatibility approximations, incomplete public contracts, and deprecated
+paths; Gate A must not be applied as one universal change across them.
+
 | Gate | Deliverable | Pass condition |
 |---|---|---|
+| 0 | Existing domain × solver × background × resolution × surface audit | Every F1–F6/S1–S6/C1–C3 route has code evidence, path-specific synthetic/available-real evaluation, and one migration-aware disposition; invalid routes are reproduced before cleanup |
 | A | True-energy count response, tau/R continuity, L-scale, all-family auxiliary grid, validation/range tests | Analytic/probe tolerances above; current relevant suites remain green |
 | B | Reduced IC coordinates, counts calibration, `n_evals`/Jacobian/profiles | Simulated coverage; finite profiles; no hidden bound/ridge |
 | C | Component provenance and multi-standard dataset | Raw/checksummed inputs; non-black lines; two thicknesses; Ta held out |
 | D | IC-law/component comparison | Frozen held-out Poisson likelihood and predeclared residual improvement |
 | E | Sparse/adaptive/gradient performance | Numerical parity plus benchmark targets |
 
-Do not compare physical model families until Gate A passes. Do not interpret a
+Do not begin Gate A changes until Gate 0 passes. Do not compare physical model families until Gate A passes. Do not interpret a
 parameter physically until Gate B passes. Do not publish a transferable VENUS
 response until Gate D passes.
 
