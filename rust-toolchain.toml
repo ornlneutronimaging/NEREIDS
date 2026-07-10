@@ -1,0 +1,18 @@
+# Pinned Rust toolchain — single source of truth for CI and rustup users.
+#
+# Why pinned: CI used to float `stable`, so every new stable release
+# (with its new clippy/rustc lints under `-D warnings`) instantly turned
+# ALL open PRs red for reasons unrelated to their diffs (2026-07-10:
+# Rust 1.97.0 reddened 11 Dependabot PRs at once). Pinning makes
+# toolchain bumps deliberate, reviewed changes.
+#
+# Bump ritual: update `channel` here, update the matching
+# `toolchain: "X.Y.Z"` inputs in .github/workflows/*.yml (they only
+# pre-install the right version — rustup proxies enforce THIS file for
+# every cargo invocation regardless), fix any new lints, one PR.
+#
+# Note: maturin-action's manylinux containers (publish.yml,
+# wheel-policy.yml) also honor this file and will download the pinned
+# toolchain inside the container — intended, for reproducible wheels.
+[toolchain]
+channel = "1.97.0"
