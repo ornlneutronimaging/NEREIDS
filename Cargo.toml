@@ -56,7 +56,7 @@ numpy = "0.29"
 # it (see scripts/check_wheel_policy.sh), so wayland-dlopen is restored by a
 # direct Linux-only `winit` dep in apps/gui/Cargo.toml. Do NOT drop that winit
 # dep, and do NOT re-enable wgpu.
-eframe = { version = "0.34", default-features = false, features = ["accesskit", "default_fonts", "glow", "persistence", "wayland", "x11"] }
+eframe = { version = "0.35", default-features = false, features = ["accesskit", "default_fonts", "glow", "persistence", "wayland", "x11"] }
 egui = "0.34"
 egui_extras = { version = "0.34", features = ["image", "svg"] }
 egui_plot = "0.35"
