@@ -22,7 +22,7 @@ Open a GitHub issue with the `enhancement` label. Include:
 
 ### Prerequisites
 
-- [Rust](https://www.rust-lang.org/tools/install) (stable toolchain)
+- [Rust](https://www.rust-lang.org/tools/install) (rustup; the exact version is pinned by rust-toolchain.toml)
 - [pixi](https://pixi.sh/) (Python environment manager)
 - cmake (for HDF5 builds)
 

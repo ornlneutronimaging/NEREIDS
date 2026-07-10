@@ -6,13 +6,24 @@
 # Rust 1.97.0 reddened 11 Dependabot PRs at once). Pinning makes
 # toolchain bumps deliberate, reviewed changes.
 #
+# Why 1.96.1 and not 1.97.0: rust-lang/rust#159035 — a P-critical
+# x86-64 miscompile in 1.97.0 (optimized safe code segfaults; an LLVM
+# regression from stable to stable; 1.96.1 is not affected). Release
+# wheels for the ORNL x86-64 RHEL fleet are built under this pin, so
+# 1.97.0 is unacceptable until fixed. Bump this pin to the first
+# stable release containing the fix (the revert of
+# rust-lang/rust#155850, merged upstream via rust-lang/rust#159047).
+#
 # Bump ritual: update `channel` here, update the matching
 # `toolchain: "X.Y.Z"` inputs in .github/workflows/*.yml (they only
-# pre-install the right version — rustup proxies enforce THIS file for
-# every cargo invocation regardless), fix any new lints, one PR.
+# pre-install the right version — for ordinary invocations in this
+# repo, without a higher-precedence rustup override such as
+# `cargo +toolchain`, `RUSTUP_TOOLCHAIN`, or a nearer directory
+# override, the rustup proxies enforce THIS file), fix any new lints,
+# one PR.
 #
 # Note: maturin-action's manylinux containers (publish.yml,
 # wheel-policy.yml) also honor this file and will download the pinned
 # toolchain inside the container — intended, for reproducible wheels.
 [toolchain]
-channel = "1.97.0"
+channel = "1.96.1"
