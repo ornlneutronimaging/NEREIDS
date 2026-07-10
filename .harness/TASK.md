@@ -33,6 +33,13 @@
 
 > sounds good, proceed
 
+### Accepted execution-model details
+
+The plan accepted by “sounds good, proceed” fixes the deprecation cadence:
+warnings and replacements ship in v0.4; production implementation deletion is
+not eligible before v0.5 and still requires the usage audit and migration gates;
+serialized-name tombstones remain beyond v0.5 pending a later versioned audit.
+
 ## Investigation rules
 
 - The deliverable is a validated mechanism or a complete elimination ledger, not disappearance of a residual feature. No data may be masked, excluded, smoothed, reweighted, or windowed merely because doing so improves the fit.
@@ -60,8 +67,8 @@
 - [x] R16 — “there are lots of half baked work done by Opus” — check: `test -s investigation/phase-0-cleanup-ledger.md`; every duplicated, stale, misleading, partially wired, research-only, or publicly exposed-but-rejected implementation found in scope is recorded with source evidence, reachability, test coverage, and an assigned disposition; authorship is not used as evidence of defect.
 - [x] R17 program floor — “this is the time we should clear the mess and fix the problem” — check: Phase 0 produces a dependency-ordered cleanup/repair sequence in `investigation/phase-0-disposition.md`; subsequent implementation may begin only after R13–R16 establish whether each path should be repaired, completed, deprecated, or removed, and every implementation change must reproduce the pre-change behavior/defect and pass its path-specific acceptance test.
 - [x] R18 — “how do we properly track this work on Github? Project board or an epics issue specifically?” — check: one program epic and native G0–G9 phase sub-issues exist in `ornlneutronimaging/NEREIDS`, are attached to the existing NEREIDS Development Project #8 rather than a duplicate board, and their URLs/IDs are preserved in `investigation/github-program-tracking.md`.
-- [x] R19 — “what is the plan for deprecation? for useless path or incomplete path, I think it might be okay to remove them directly. However, what if the code is partialy used? should we rewire the code to use the more robust one?” — check: the epic and relevant phase issues encode the Phase 0 remove/fail-closed, complete-before-exposure, deprecate/migrate, and default-only-rewire policy; explicit solver requests are never silently reinterpreted, and release/usage-audit gates are stated.
-- [x] R20 — “If I were to give you the permission to go forward, what is the execution order” — check: G0–G9 phase issues reproduce the dependency order in `investigation/phase-0-disposition.md`, GitHub parent/dependency relationships prevent downstream gate closure, and every M01–M61, X01–X17, and CL-01–CL-50 identifier maps to exactly one primary owner recorded in `investigation/github-program-tracking.md`.
+- [x] R19 — “what is the plan for deprecation? for useless path or incomplete path, I think it might be okay to remove them directly. However, what if the code is partialy used? should we rewire the code to use the more robust one?” — check: the epic and relevant phase issues encode the Phase 0 remove/fail-closed, complete-before-exposure, deprecate/migrate, and default-only-rewire policy; explicit solver requests are never silently reinterpreted; warnings/replacements ship in v0.4, implementation deletion is ineligible before v0.5 plus the usage audit, and tombstones remain beyond v0.5.
+- [x] R20 — “If I were to give you the permission to go forward, what is the execution order” — check: G0–G9 phase issues reproduce the dependency order in `investigation/phase-0-disposition.md`, G0 leaves block G0, phases block the epic, G3 follows G1/G2, and every M01–M61, X01–X17, and CL-01–CL-50 identifier maps to exactly one primary owner recorded in `investigation/github-program-tracking.md`.
 - [x] R21 — “how do I monitor the process?” — check: Project #8 has program-specific Phase, Workstream, Scientific gate, Disposition, and Risk fields plus documented Board/Table/Roadmap/Gate/Deprecation views; each phase issue has an evidence-backed GO/NO-GO checklist and linked child/PR roll-up.
 - [x] R22 — “How does the gating of the development works here?” — check: executable `.harness/verify.sh` is built from the repository's real formatting, lint, Rust, Python, API-drift, and Phase 0 route checks, exits 0 on the current checkout, and `.harness/review` is committed for the approved fresh-context review gate; issue-ready, PR-merge, phase-science, and post-merge gates are recorded in the epic/phase bodies.
 - [x] R23 — “sounds good, proceed” — check: the approved tracking/bootstrap package is executed rather than only described: GitHub objects are created, G0 is populated with the missing reproduction-anchor work, local tracking/gate artifacts are committed, and no production refactor starts while G0's scientific gate is pending.
@@ -112,7 +119,9 @@
 - R18: GitHub epic #688, native phase sub-issues #689–#698, and Project #8;
   URLs/node IDs are indexed in `investigation/github-program-tracking.md`.
 - R19: #688's “Deprecation, removal, and rewiring policy”, G1/G2/G9 phase
-  bodies, and the same policy in `investigation/github-program-tracking.md`.
+  bodies, and `investigation/github-program-tracking.md` all fix v0.4 warnings/
+  replacements, v0.5 earliest implementation deletion after usage audit, and
+  longer-lived tombstones.
 - R20: native `parent` and `blockedBy` relationships verified through GraphQL;
   `pixi run python investigation/verify_github_program.py` reports exactly
   `61 M + 17 X + 50 CL = 128 identifiers; each has exactly one primary owner`.
@@ -124,7 +133,7 @@
 - R23: G0 leaf issues #699–#705 hold the missing anchors; commit `e9bbdcc`
   records the local tracking/gate bootstrap while G0 remains Pending.
 - R24: #625 is a G3 child/blocker, #628/#459 are G8 children/blockers, #529 is
-  a G7 child/blocker, and #423/#427/#448/#502 remain closed historical evidence.
+  a G7 child/blocker, and #423/#427/#448/#458/#502 remain closed historical evidence.
 - R25: `pixi run python investigation/verify_github_program.py` reports seven
   bootstrap paths and no production source; `git diff --name-only
   b01e077..HEAD` lists only `.gitignore`, `.harness`, and `investigation` paths.

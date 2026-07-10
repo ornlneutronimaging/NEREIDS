@@ -137,8 +137,13 @@ required_phrases = (
     "Phase science",
     "Post-merge",
     "Explicit solver/objective/version requests are never",
-    "tagged minor release",
+    "v0.4",
+    "v0.5",
+    "beyond v0.5",
     "usage audit",
+    "#423, #427, #448, #458, #502",
+    "#699–#705",
+    "#625, #689–#691",
 )
 for phrase in required_phrases:
     if phrase not in tracking:

@@ -29,11 +29,11 @@ replayable evidence; the generated runtime log is intentionally ignored.
 
 | Phase | Issue | Native blocked-by relationships | Workstream | Gate |
 |---|---|---|---|---|
-| Program | [#688](https://github.com/ornlneutronimaging/NEREIDS/issues/688) | — | Program governance | Pending |
-| G0 | [#689](https://github.com/ornlneutronimaging/NEREIDS/issues/689) | — | Evidence harness | Pending |
+| Program | [#688](https://github.com/ornlneutronimaging/NEREIDS/issues/688) | #689–#698 | Program governance | Pending |
+| G0 | [#689](https://github.com/ornlneutronimaging/NEREIDS/issues/689) | #699–#705 | Evidence harness | Pending |
 | G1 | [#690](https://github.com/ornlneutronimaging/NEREIDS/issues/690) | #689 | Safety and contracts | Pending |
 | G2 | [#691](https://github.com/ornlneutronimaging/NEREIDS/issues/691) | #689, #690 | Objective semantics | Pending |
-| G3 | [#692](https://github.com/ornlneutronimaging/NEREIDS/issues/692) | #689, #625 | IC physics and numerics | Pending |
+| G3 | [#692](https://github.com/ornlneutronimaging/NEREIDS/issues/692) | #625, #689–#691 | IC physics and numerics | Pending |
 | G4 | [#693](https://github.com/ornlneutronimaging/NEREIDS/issues/693) | #691, #692 | Count response and background | Pending |
 | G5 | [#694](https://github.com/ornlneutronimaging/NEREIDS/issues/694) | #692, #693 | Calibration and identifiability | Pending |
 | G6 | [#695](https://github.com/ornlneutronimaging/NEREIDS/issues/695) | #690–#694 | Surface integration | Pending |
@@ -41,8 +41,9 @@ replayable evidence; the generated runtime log is intentionally ignored.
 | G8 | [#697](https://github.com/ornlneutronimaging/NEREIDS/issues/697) | #459, #628, #692–#696 | Performance | Pending |
 | G9 | [#698](https://github.com/ornlneutronimaging/NEREIDS/issues/698) | #691, #693, #695–#697 | Migration and removal | Pending |
 
-All G0–G9 issues are native sub-issues of #688. Native dependencies are closure
-constraints, not merely prose references.
+All G0–G9 issues are native sub-issues and blockers of #688. G0 is blocked by
+all seven anchor leaves; G3 is explicitly ordered after G1/G2. Native
+dependencies are closure constraints, not merely prose references.
 
 ## G0 anchor backlog
 
@@ -68,7 +69,7 @@ not complete.
 | [#628](https://github.com/ornlneutronimaging/NEREIDS/issues/628) | G8 | Native child of #697 and blocker for parity-first IC plan caching. |
 | [#459](https://github.com/ornlneutronimaging/NEREIDS/issues/459) | G8 | Native child of #697; retained as the measured spatial performance backlog. |
 | [#529](https://github.com/ornlneutronimaging/NEREIDS/issues/529) | G7 | Native child/blocker of #696; G4 supplies candidate operators but does not duplicate the real-data study. |
-| #423, #427, #448, #502 | Historical only | Closed work is not reopened without a fresh, narrow current-branch mechanism reproduction. |
+| #423, #427, #448, #458, #502 | Historical only | Closed work is not reopened without a fresh, narrow current-branch mechanism reproduction. |
 
 ## Project fields
 
@@ -78,7 +79,7 @@ All program items carry `Program = IC calibration remediation`.
 |---|---|---|
 | Program | `PVTSSF_lADOAPDgcs4BOcuczhXnBIQ` | IC calibration remediation |
 | Phase | `PVTSSF_lADOAPDgcs4BOcuczhXnBIU` | Program, G0–G9 |
-| Workstream | `PVTSSF_lADOAPDgcs4BOcuczhXnBIY` | governance, evidence, safety, semantics, IC, counts/background, calibration, surfaces, validation, performance, migration/removal |
+| Workstream | `PVTSSF_lADOAPDgcs4BOcuczhXnBIY` | Program governance, Evidence harness, Safety and contracts, Objective semantics, IC physics and numerics, Count response and background, Calibration and identifiability, Surface integration, Real-data validation, Performance, Migration and removal |
 | Scientific gate | `PVTSSF_lADOAPDgcs4BOcuczhXnBIc` | Pending, Blocked, NO-GO, GO |
 | Disposition | `PVTSSF_lADOAPDgcs4BOcuczhXnBIg` | mixed, keep, keep+improve, deprecate, remove, complete-before-exposure |
 | Risk | `PVTSSF_lADOAPDgcs4BOcuczhXnBIk` | Critical, High, Medium, Low |
@@ -139,14 +140,16 @@ exactly one primary owner`.
 3. Hide or reject incomplete routes until their versioned mechanism passes its
    fixed Q gates; “complete before exposure” is not a deprecation shortcut.
 4. Deprecate executable public F2/F4/S2/S4 routes with deterministic warnings,
-   migration tests, resolved-route provenance, at least one tagged minor release,
-   and a documented repository/downstream usage audit before deletion.
+   replacements, migration tests, and resolved-route provenance in v0.4.
+   Production implementation deletion is ineligible before v0.5 and still
+   requires a documented repository/downstream usage audit.
 5. Typed `Auto`/default routing may select the robust route when the input domain
    uniquely determines it. Explicit solver/objective/version requests are never
    silently reinterpreted; they execute their still-supported exact behavior,
    warn, or fail with a migration error.
-6. Archived serialized names retain deterministic tombstones long enough for
-   old projects/manifests to fail actionably rather than change statistics.
+6. Archived serialized names retain deterministic tombstones beyond v0.5.
+   Tombstone removal requires its own later versioned usage audit so old
+   projects/manifests fail actionably rather than change statistics.
 
 ## Development gates
 
