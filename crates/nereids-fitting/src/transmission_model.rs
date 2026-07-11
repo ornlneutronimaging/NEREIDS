@@ -1244,6 +1244,13 @@ impl FitModel for TransmissionFitModel {
         let t_for_deriv: &[f64] = t_unresolved.as_deref().unwrap_or(y_current);
 
         // ── Density columns: ∂T/∂N_g or ∂T_obs/∂N_g ──
+        // Role indices are assumed DISTINCT (first-match layout: the
+        // temperature column is skipped here and filled separately, so a
+        // parameter serving both roles would get only one contribution).
+        // The pipeline always constructs distinct indices; aliasing is
+        // not supported in this resolution-coupled fill — see
+        // NormalizedTransmissionModel's "Index invariant" for the
+        // accumulate-hardened pattern used by the simple wrappers.
         for (col, &fp_idx) in free_param_indices.iter().enumerate() {
             if temp_col == Some(col) {
                 continue;
@@ -1361,6 +1368,15 @@ impl FitModel for TransmissionFitModel {
 /// SAMMY fits up to 6 background terms; we implement all 6:
 ///   Anorm, constant BackA, 1/√E term BackB, √E term BackC,
 ///   exponential amplitude BackD, exponential decay BackF.
+///
+/// ## Index invariant
+///
+/// The role indices (`anorm_index`, `back_*_index`) must NOT designate
+/// a parameter the inner model reads: the analytic Jacobian filters the
+/// role indices out of the inner free set, so such a collision cannot
+/// be detected and the column would silently omit Anorm × ∂T_inner/∂p.
+/// Aliasing AMONG the role indices themselves IS supported — the
+/// Jacobian columns accumulate.
 pub struct NormalizedTransmissionModel<M: FitModel> {
     /// The inner (pure Beer-Lambert) transmission model.
     inner: M,
@@ -1567,33 +1583,53 @@ impl<M: FitModel> FitModel for NormalizedTransmissionModel<M> {
             inner_col_map.insert(idx, col);
         }
 
+        // Independent role checks with accumulation (+=) rather than a
+        // first-match if/else-if chain: nothing forbids two role indices
+        // from aliasing, and evaluate() reads an aliased parameter for
+        // every role it occupies, so its derivative is the SUM of the
+        // matching columns. Distinct indices touch each column once on a
+        // zeroed matrix — identical to assignment. A role index colliding
+        // with an INNER-model parameter remains undetectable here (role
+        // indices are filtered out of inner_free_indices) — see the
+        // struct docs.
         for (col, &fp_idx) in free_param_indices.iter().enumerate() {
+            let mut matched = false;
             if fp_idx == self.anorm_index {
                 // ∂T_out/∂Anorm = T_inner(E)
                 for (i, &ti) in t_inner.iter().enumerate() {
-                    *jacobian.get_mut(i, col) = ti;
+                    *jacobian.get_mut(i, col) += ti;
                 }
-            } else if fp_idx == self.back_a_index {
+                matched = true;
+            }
+            if fp_idx == self.back_a_index {
                 // ∂T_out/∂BackA = 1
                 for i in 0..n_e {
-                    *jacobian.get_mut(i, col) = 1.0;
+                    *jacobian.get_mut(i, col) += 1.0;
                 }
-            } else if fp_idx == self.back_b_index {
+                matched = true;
+            }
+            if fp_idx == self.back_b_index {
                 // ∂T_out/∂BackB = 1/√E
                 for (i, &inv_se) in self.inv_sqrt_energies.iter().enumerate() {
-                    *jacobian.get_mut(i, col) = inv_se;
+                    *jacobian.get_mut(i, col) += inv_se;
                 }
-            } else if fp_idx == self.back_c_index {
+                matched = true;
+            }
+            if fp_idx == self.back_c_index {
                 // ∂T_out/∂BackC = √E
                 for (i, &se) in self.sqrt_energies.iter().enumerate() {
-                    *jacobian.get_mut(i, col) = se;
+                    *jacobian.get_mut(i, col) += se;
                 }
-            } else if self.back_d_index == Some(fp_idx) {
+                matched = true;
+            }
+            if self.back_d_index == Some(fp_idx) {
                 // ∂T_out/∂BackD = exp(−BackF / √E)
                 for (i, &et) in exp_terms.iter().enumerate() {
-                    *jacobian.get_mut(i, col) = et;
+                    *jacobian.get_mut(i, col) += et;
                 }
-            } else if self.back_f_index == Some(fp_idx) {
+                matched = true;
+            }
+            if self.back_f_index == Some(fp_idx) {
                 // ∂T_out/∂BackF = −BackD × exp(−BackF / √E) / √E
                 let back_d = params[self.back_d_index.unwrap()];
                 for (i, (&et, &inv_se)) in exp_terms
@@ -1601,20 +1637,24 @@ impl<M: FitModel> FitModel for NormalizedTransmissionModel<M> {
                     .zip(self.inv_sqrt_energies.iter())
                     .enumerate()
                 {
-                    *jacobian.get_mut(i, col) = -back_d * et * inv_se;
+                    *jacobian.get_mut(i, col) += -back_d * et * inv_se;
                 }
-            } else if let Some(&inner_col) = inner_col_map.get(&fp_idx) {
+                matched = true;
+            }
+            if let Some(&inner_col) = inner_col_map.get(&fp_idx) {
                 // Inner model parameter: ∂T_out/∂p = Anorm × ∂T_inner/∂p
                 if let Some(ref jac) = inner_jac {
                     for i in 0..n_e {
-                        *jacobian.get_mut(i, col) = anorm * jac.get(i, inner_col);
+                        *jacobian.get_mut(i, col) += anorm * jac.get(i, inner_col);
                     }
+                    matched = true;
                 } else {
                     // Inner model did not provide analytical Jacobian —
                     // fall back to finite-difference for the whole thing.
                     return None;
                 }
-            } else {
+            }
+            if !matched {
                 // Unknown parameter — should not happen, but fall back to FD.
                 return None;
             }
@@ -2392,6 +2432,11 @@ impl FitModel for EnergyScaleTransmissionModel {
         // byte-identically to `apply_resolution`.
         let density_plan = self.cached_resolution_plan(t0, l_scale, work_e);
 
+        // Role indices (t0/L_scale/temperature/densities) are assumed
+        // DISTINCT — first-match layout; aliasing is not supported in
+        // this FD-arm fill. See NormalizedTransmissionModel's "Index
+        // invariant" for the accumulate-hardened pattern used by the
+        // simple wrappers.
         for (col, &fp_idx) in free_param_indices.iter().enumerate() {
             // Temperature (issue #634), when free, is differentiated by the
             // per-coordinate central FD arm below — it is neither t0 nor
@@ -2790,6 +2835,15 @@ pub fn baseline_reference_energy_active(energies: &[f64], active: Option<&[bool]
 /// supporting it buys nothing (`Anorm` would just play `b0`'s role at a
 /// rescaled value) and splits the normalization story across two knobs;
 /// the sanctioned combination is `Anorm` held fixed.
+///
+/// ## Index invariant
+///
+/// The baseline indices (`b0_index`, `b1_index`, `b2_index`) must NOT
+/// designate a parameter the inner model reads: the analytic Jacobian
+/// filters the baseline indices out of the inner free set, so such a
+/// collision cannot be detected and the column would silently omit
+/// B(E) × ∂T_inner/∂p. Aliasing AMONG the baseline indices themselves
+/// IS supported — the Jacobian columns accumulate.
 pub struct MultiplicativeBaselineModel<M: FitModel> {
     /// The inner model (bare transmission, or the additive-background
     /// wrapper when both are configured).
@@ -2936,34 +2990,52 @@ impl<M: FitModel> FitModel for MultiplicativeBaselineModel<M> {
         }
 
         let mut jacobian = FlatMatrix::zeros(n_e, n_free);
+        // Independent role checks with accumulation (+=) rather than a
+        // first-match if/else-if chain: nothing forbids the baseline
+        // indices from aliasing, and baseline_at() reads an aliased
+        // parameter for every role it occupies, so its derivative is the
+        // SUM of the matching columns. Distinct indices touch each column
+        // once on a zeroed matrix — identical to assignment. A baseline
+        // index colliding with an INNER-model parameter remains
+        // undetectable here (baseline indices are filtered out of
+        // inner_free_indices) — see the struct docs.
         for (col, &fp_idx) in free_param_indices.iter().enumerate() {
+            let mut matched = false;
             if fp_idx == self.b0_index {
                 // ∂y/∂b0 = T_inner
                 for (i, &ti) in t_inner.iter().enumerate() {
-                    *jacobian.get_mut(i, col) = ti;
+                    *jacobian.get_mut(i, col) += ti;
                 }
-            } else if fp_idx == self.b1_index {
+                matched = true;
+            }
+            if fp_idx == self.b1_index {
                 // ∂y/∂b1 = z · T_inner
                 for (i, &ti) in t_inner.iter().enumerate() {
-                    *jacobian.get_mut(i, col) = self.ln_ratio[i] * ti;
+                    *jacobian.get_mut(i, col) += self.ln_ratio[i] * ti;
                 }
-            } else if fp_idx == self.b2_index {
+                matched = true;
+            }
+            if fp_idx == self.b2_index {
                 // ∂y/∂b2 = z² · T_inner
                 for (i, &ti) in t_inner.iter().enumerate() {
-                    *jacobian.get_mut(i, col) = self.ln_ratio_sq[i] * ti;
+                    *jacobian.get_mut(i, col) += self.ln_ratio_sq[i] * ti;
                 }
-            } else if let Some(&inner_col) = inner_col_map.get(&fp_idx) {
+                matched = true;
+            }
+            if let Some(&inner_col) = inner_col_map.get(&fp_idx) {
                 // Inner parameter: ∂y/∂p = B(E) · ∂T_inner/∂p
                 if let Some(ref jac) = inner_jac {
                     for i in 0..n_e {
                         let b = self.baseline_at(params, i);
-                        *jacobian.get_mut(i, col) = b * jac.get(i, inner_col);
+                        *jacobian.get_mut(i, col) += b * jac.get(i, inner_col);
                     }
+                    matched = true;
                 } else {
                     // Inner has no analytic Jacobian — FD for everything.
                     return None;
                 }
-            } else {
+            }
+            if !matched {
                 // Unknown parameter — should not happen; fall back to FD.
                 return None;
             }
@@ -4575,6 +4647,103 @@ mod tests {
                     "Jacobian mismatch (row {i}, col {col}): FD={fd:.8}, analytical={ana:.8}, \
                      rel_err={:.6}",
                     err / scale,
+                );
+            }
+        }
+    }
+
+    /// Aliased role indices (BackA == BackB sharing one parameter): the
+    /// analytic Jacobian must ACCUMULATE both roles' contributions
+    /// (1 + 1/√E), matching central finite differences — not keep only
+    /// the first match.
+    #[test]
+    fn normalized_jacobian_aliased_role_indices_match_fd() {
+        let xs = vec![vec![1.0, 2.0, 3.0]];
+        let inner = make_precomputed(xs, vec![0]);
+
+        let energies = [4.0, 9.0, 16.0];
+        // params: [density, Anorm, BackAB (shared), BackC] — BackA and
+        // BackB deliberately alias index 2.
+        let model = NormalizedTransmissionModel::new(inner, &energies, 1, 2, 2, 3);
+
+        let params = [0.3, 0.95, 0.02, 0.005];
+        let y = model.evaluate(&params).unwrap();
+        let free: Vec<usize> = (0..4).collect();
+
+        let jac = model
+            .analytical_jacobian(&params, &free, &y)
+            .expect("analytical_jacobian should return Some");
+
+        let h = 1e-7;
+        for (col, &p_idx) in free.iter().enumerate() {
+            let mut p_plus = params;
+            let mut p_minus = params;
+            p_plus[p_idx] += h;
+            p_minus[p_idx] -= h;
+            let y_plus = model.evaluate(&p_plus).unwrap();
+            let y_minus = model.evaluate(&p_minus).unwrap();
+            for i in 0..3 {
+                let fd = (y_plus[i] - y_minus[i]) / (2.0 * h);
+                let ana = jac.get(i, col);
+                let err = (fd - ana).abs();
+                let scale = fd.abs().max(ana.abs()).max(1e-10);
+                assert!(
+                    err / scale < 1e-4,
+                    "aliased Jacobian mismatch (row {i}, col {col}): FD={fd:.8}, \
+                     analytical={ana:.8}",
+                );
+            }
+        }
+        // Pin the aliased column exactly: ∂/∂BackAB = 1 + 1/√E.
+        for (i, &e) in energies.iter().enumerate() {
+            let expected = 1.0 + 1.0 / e.sqrt();
+            assert!(
+                (jac.get(i, 2) - expected).abs() < 1e-12,
+                "aliased column row {i}: {} vs expected {expected}",
+                jac.get(i, 2),
+            );
+        }
+    }
+
+    /// Aliased baseline indices (b0 == b1 sharing one parameter) in the
+    /// multiplicative wrapper: same accumulate-not-overwrite requirement,
+    /// derivative (1 + z)·T_inner against the FD oracle.
+    #[test]
+    fn multiplicative_baseline_aliased_indices_match_fd() {
+        let xs = vec![vec![1.0, 2.0, 3.0]];
+        let inner = make_precomputed(xs, vec![0]);
+
+        let energies = [4.0, 9.0, 16.0];
+        let e_ref = baseline_reference_energy(&energies);
+        // params: [density, b01 (shared), b2] — b0 and b1 deliberately
+        // alias index 1.
+        let model = MultiplicativeBaselineModel::new(inner, &energies, e_ref, 1, 1, 2);
+
+        let params = [0.3, 1.02, 0.01];
+        let y = model.evaluate(&params).unwrap();
+        let free: Vec<usize> = (0..3).collect();
+
+        let jac = model
+            .analytical_jacobian(&params, &free, &y)
+            .expect("analytical_jacobian should return Some");
+
+        let h = 1e-7;
+        for (col, &p_idx) in free.iter().enumerate() {
+            let mut p_plus = params;
+            let mut p_minus = params;
+            p_plus[p_idx] += h;
+            p_minus[p_idx] -= h;
+            let y_plus = model.evaluate(&p_plus).unwrap();
+            let y_minus = model.evaluate(&p_minus).unwrap();
+            for i in 0..3 {
+                let fd = (y_plus[i] - y_minus[i]) / (2.0 * h);
+                let ana = jac.get(i, col);
+                let err = (fd - ana).abs();
+                let scale = fd.abs().max(ana.abs()).max(1e-10);
+                assert!(
+                    err / scale < 1e-4,
+                    "aliased baseline Jacobian mismatch (row {i}, col {col}): FD={fd:.8}, \
+                     analytical={ana:.8}",
                 );
             }
         }
