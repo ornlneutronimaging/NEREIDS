@@ -1342,14 +1342,20 @@ impl<'a> FitModel for CountsBackgroundScaleModel<'a> {
             return None;
         }
 
+        // Accumulate (+=) rather than assign: the struct does not forbid
+        // alpha1_index == alpha2_index, and evaluate() reads the aliased
+        // parameter for both roles, so its derivative is the SUM of both
+        // column contributions (f·t + b). With distinct indices each
+        // column is touched once and += on the zeroed matrix is identical
+        // to assignment.
         if let Some(col) = alpha1_col {
             for (row, (&f, &t)) in self.flux.iter().zip(t_inner.iter()).enumerate() {
-                *jacobian.get_mut(row, col) = f * t;
+                *jacobian.get_mut(row, col) += f * t;
             }
         }
         if let Some(col) = alpha2_col {
             for (row, &bg) in self.background.iter().enumerate() {
-                *jacobian.get_mut(row, col) = bg;
+                *jacobian.get_mut(row, col) += bg;
             }
         }
 
@@ -1471,15 +1477,20 @@ impl<'a> FitModel for TransmissionKLBackgroundModel<'a> {
             return None;
         }
 
-        // Background columns.
+        // Background columns. Accumulate (+=) rather than assign: the
+        // struct does not forbid b0_index == b1_index, and evaluate()
+        // reads the aliased parameter for both roles, so its derivative
+        // is the SUM of both column contributions (1 + 1/√E). With
+        // distinct indices each column is touched once and += on the
+        // zeroed matrix is identical to assignment.
         if let Some(col) = b0_col {
             for row in 0..n_e {
-                *jacobian.get_mut(row, col) = 1.0; // ∂T_out/∂b₀ = 1
+                *jacobian.get_mut(row, col) += 1.0; // ∂T_out/∂b₀ = 1
             }
         }
         if let Some(col) = b1_col {
             for row in 0..n_e {
-                *jacobian.get_mut(row, col) = self.inv_sqrt_energies[row]; // ∂T_out/∂b₁ = 1/√E
+                *jacobian.get_mut(row, col) += self.inv_sqrt_energies[row]; // ∂T_out/∂b₁ = 1/√E
             }
         }
 
@@ -2560,5 +2571,111 @@ mod tests {
             result.params[2],
             true_params[2],
         );
+    }
+
+    /// Central finite-difference column for one parameter, computed
+    /// straight from `evaluate` — an oracle independent of the model's
+    /// analytic Jacobian path.
+    fn fd_column(model: &dyn FitModel, params: &[f64], param_index: usize, h: f64) -> Vec<f64> {
+        let mut plus = params.to_vec();
+        plus[param_index] += h;
+        let mut minus = params.to_vec();
+        minus[param_index] -= h;
+        let y_plus = model.evaluate(&plus).unwrap();
+        let y_minus = model.evaluate(&minus).unwrap();
+        y_plus
+            .iter()
+            .zip(y_minus.iter())
+            .map(|(&p, &m)| (p - m) / (2.0 * h))
+            .collect()
+    }
+
+    /// Aliased background indices (b0_index == b1_index): the analytic
+    /// Jacobian must ACCUMULATE both roles' contributions (1 + 1/√E),
+    /// matching finite differences — not overwrite one with the other.
+    #[test]
+    fn test_transmission_kl_background_aliased_indices_jacobian_matches_fd() {
+        let x: Vec<f64> = (0..10).map(|i| 1.0 + 0.5 * i as f64).collect();
+        let inner = ExponentialModel {
+            x: x.clone(),
+            flux: vec![1000.0; x.len()],
+        };
+        let inv_sqrt_energies: Vec<f64> = x.iter().map(|&e| 1.0 / e.sqrt()).collect();
+        let wrapped = TransmissionKLBackgroundModel {
+            inner: &inner,
+            inv_sqrt_energies: inv_sqrt_energies.clone(),
+            b0_index: 1,
+            b1_index: 1, // deliberately aliased with b0
+            n_params: 2,
+        };
+
+        let params = vec![0.4, 15.0];
+        let y = wrapped.evaluate(&params).unwrap();
+        // Inner param fixed, only the aliased background param free →
+        // analytic path.
+        let jac = wrapped
+            .analytical_jacobian(&params, &[1], &y)
+            .expect("background-only free set must stay on the analytic path");
+
+        let fd = fd_column(&wrapped, &params, 1, 1e-6);
+        for (row, (&fd_val, &inv_sqrt_e)) in fd.iter().zip(inv_sqrt_energies.iter()).enumerate() {
+            let expected = 1.0 + inv_sqrt_e;
+            assert!(
+                (jac.get(row, 0) - expected).abs() < 1e-12,
+                "aliased ∂/∂b at row {row}: analytic {}, expected {expected}",
+                jac.get(row, 0),
+            );
+            assert!(
+                (jac.get(row, 0) - fd_val).abs() < 1e-5,
+                "aliased ∂/∂b at row {row}: analytic {}, FD {fd_val}",
+                jac.get(row, 0),
+            );
+        }
+    }
+
+    /// Aliased scale indices (alpha1_index == alpha2_index) in the
+    /// sibling counts model: same accumulate-not-overwrite requirement,
+    /// derivative f·T + B against the finite-difference oracle.
+    #[test]
+    fn test_counts_background_scale_aliased_indices_jacobian_matches_fd() {
+        let x: Vec<f64> = (0..10).map(|i| 1.0 + 0.5 * i as f64).collect();
+        let inner = ExponentialModel {
+            x: x.clone(),
+            flux: vec![1.0; x.len()], // inner transmission in [0,1]
+        };
+        let flux: Vec<f64> = vec![1000.0; x.len()];
+        let background: Vec<f64> = x.iter().map(|&e| 5.0 + e).collect();
+        let wrapped = CountsBackgroundScaleModel {
+            transmission_model: &inner,
+            flux: &flux,
+            background: &background,
+            alpha1_index: 1,
+            alpha2_index: 1, // deliberately aliased with alpha1
+            n_params: 2,
+        };
+
+        let params = vec![0.4, 1.2];
+        let y = wrapped.evaluate(&params).unwrap();
+        let t_inner = inner.evaluate(&params).unwrap();
+        // Inner param fixed, only the aliased scale param free →
+        // analytic path.
+        let jac = wrapped
+            .analytical_jacobian(&params, &[1], &y)
+            .expect("scale-only free set must stay on the analytic path");
+
+        let fd = fd_column(&wrapped, &params, 1, 1e-6);
+        for (row, &fd_val) in fd.iter().enumerate() {
+            let expected = flux[row] * t_inner[row] + background[row];
+            assert!(
+                (jac.get(row, 0) - expected).abs() < 1e-9,
+                "aliased ∂/∂α at row {row}: analytic {}, expected {expected}",
+                jac.get(row, 0),
+            );
+            assert!(
+                (jac.get(row, 0) - fd_val).abs() < 1e-3,
+                "aliased ∂/∂α at row {row}: analytic {}, FD {fd_val}",
+                jac.get(row, 0),
+            );
+        }
     }
 }
