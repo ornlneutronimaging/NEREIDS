@@ -576,7 +576,7 @@ pub(crate) fn detect_results_panel(ui: &mut egui::Ui, state: &AppState) {
                             .map(|i| [report.energies[i], report.delta_t_spectrum[i]])
                             .collect();
                         let color = design::isotope_dot_color(name);
-                        plot_ui.line(Line::new(name.as_str(), points).color(color).width(1.5));
+                        plot_ui.line(Line::new(name.as_str(), points).color(color).width(1.5_f32));
                     }
                 });
         });

@@ -27,6 +27,12 @@ targeted `Edit` patches. Do not suppress clippy warnings with `#[allow(...)]`.
 - **GPG-signed commits**: always use `git commit -S`. The GPG agent is working.
 - **Atomic commits**: commit early and often. Huge monolithic commits make it
   hard to catch off-rail behaviour.
+- **PR descriptions are concise and professional**: a short summary of what
+  changed and why, the validation performed, and any risk or follow-up —
+  a few sentences or bullets total. Do NOT inventory individual edits (the
+  diff shows those), narrate review rounds, or paste investigation memos.
+  Long-form audit/investigation material goes in a PR **comment** or the
+  commit messages, never the description.
 - **No temp file litter**: clean up all one-off scripts immediately.
 - **Do not touch `.claude/worktrees/`**: this directory is managed by
   Claude Code for isolated worktree sessions. Never delete, modify, or
@@ -158,12 +164,13 @@ when working single-threaded on one feature branch.
 **Anything else does not belong in `docs/`.** In particular:
 
 - **Audit memos** (impact analysis of a bug fix, which research scripts
-  were affected, etc.) — belong in the PR body. When the PR merges,
-  the memo is preserved in the commit + PR history where it is actually
-  searchable. Do not create `docs/audit/` or similar.
+  were affected, etc.) — belong in a PR **comment**, never the PR
+  description (see Commit Style). When the PR merges, the memo is
+  preserved in the PR history where it is actually searchable. Do not
+  create `docs/audit/` or similar.
 - **Investigation / ablation / debugging notes** (step-by-step inquiry
   into a performance question, correctness hypothesis, etc.) — belong in
-  `.research/` (gitignored; session-private) or in the PR body if the
+  `.research/` (gitignored; session-private) or in a PR comment if the
   investigation directly motivates a concrete code change.
 - **Design specs / requirements drafts** — belong inline with the code
   they specify (rustdoc on the struct / module they describe) or in
@@ -173,7 +180,7 @@ when working single-threaded on one feature branch.
 If I feel compelled to commit a memo under `docs/`, I stop and check:
 (a) is this user-facing reference that someone reading the project
 cold will want to read?  If yes, it fits one of the subtrees above.
-If no, it belongs in `.research/` or the PR body.  **When in doubt,
+If no, it belongs in `.research/` or a PR comment.  **When in doubt,
 ask the user before creating the file** — do not invent a new
 `docs/<whatever>/` directory to make the artifact commit-able.
 

@@ -48,7 +48,7 @@ pub fn card(ui: &mut Ui, add_contents: impl FnOnce(&mut Ui)) {
     let shadow_alpha = if ui.style().visuals.dark_mode { 76 } else { 20 };
     egui::Frame::NONE
         .fill(tc.bg2)
-        .stroke(Stroke::new(1.0, tc.border))
+        .stroke(Stroke::new(1.0_f32, tc.border))
         .corner_radius(CornerRadius::same(10))
         .inner_margin(Margin::same(16))
         .shadow(Shadow {
@@ -125,7 +125,7 @@ pub fn underline_tabs(ui: &mut Ui, labels: &[&str], selected: &mut usize) -> boo
             egui::pos2(row_rect.left(), baseline),
             egui::pos2(row_rect.right(), baseline),
         ],
-        Stroke::new(1.0, tc.border),
+        Stroke::new(1.0_f32, tc.border),
     );
 
     // 2px accent underline on active tab
@@ -135,7 +135,7 @@ pub fn underline_tabs(ui: &mut Ui, labels: &[&str], selected: &mut usize) -> boo
                 egui::pos2(rect.left(), baseline),
                 egui::pos2(rect.right(), baseline),
             ],
-            Stroke::new(2.0, tc.accent),
+            Stroke::new(2.0_f32, tc.accent),
         );
     }
 
@@ -201,7 +201,7 @@ pub fn btn_icon(ui: &mut Ui, label: &str, active: bool) -> Response {
     let (fill, text_color, stroke) = if active {
         (tc.accent, Color32::WHITE, Stroke::NONE)
     } else {
-        (tc.bg2, tc.fg2, Stroke::new(1.0, tc.border))
+        (tc.bg2, tc.fg2, Stroke::new(1.0_f32, tc.border))
     };
     ui.add(
         egui::Button::new(RichText::new(label).size(11.0).strong().color(text_color))
@@ -231,7 +231,7 @@ pub fn drop_zone(ui: &mut Ui, loaded: bool, label: &str, hint: &str) -> Response
     let (border_color, border_width, fill) = if loaded {
         (
             semantic::GREEN,
-            2.0,
+            2.0_f32,
             Color32::from_rgba_unmultiplied(
                 semantic::GREEN.r(),
                 semantic::GREEN.g(),
@@ -240,7 +240,7 @@ pub fn drop_zone(ui: &mut Ui, loaded: bool, label: &str, hint: &str) -> Response
             ),
         )
     } else {
-        (tc.fg3, 1.5, Color32::TRANSPARENT)
+        (tc.fg3, 1.5_f32, Color32::TRANSPARENT)
     };
 
     // Background + border
@@ -358,7 +358,7 @@ pub fn isotope_chip(
     let fill = if enabled { tc.bg3 } else { tc.bg2 };
     egui::Frame::NONE
         .fill(fill)
-        .stroke(Stroke::new(1.0, tc.border))
+        .stroke(Stroke::new(1.0_f32, tc.border))
         .corner_radius(CornerRadius::same(12))
         .inner_margin(Margin::symmetric(8, 4))
         .show(ui, |ui| {
@@ -430,7 +430,7 @@ pub fn group_chip(
     let fill = if enabled { tc.bg3 } else { tc.bg2 };
     egui::Frame::NONE
         .fill(fill)
-        .stroke(Stroke::new(1.0, tc.border))
+        .stroke(Stroke::new(1.0_f32, tc.border))
         .corner_radius(CornerRadius::same(12))
         .inner_margin(Margin::symmetric(8, 4))
         .show(ui, |ui| {
@@ -993,7 +993,7 @@ pub(crate) fn draw_resonance_dips(
                         plot_ui.vline(
                             VLine::new("", res.energy)
                                 .color(RESONANCE_DIP_COLOR)
-                                .width(0.5),
+                                .width(0.5_f32),
                         );
                     }
                 }
@@ -1155,7 +1155,7 @@ pub(crate) fn build_fit_line(p: &FitLineParams<'_>) -> Option<Line<'static>> {
         .collect();
     Some(
         Line::new("Fit", fit_points)
-            .width(1.25)
+            .width(1.25_f32)
             .color(egui::Color32::from_rgba_unmultiplied(0, 122, 255, 170)),
     )
 }

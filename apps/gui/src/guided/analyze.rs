@@ -764,7 +764,7 @@ fn fit_feedback_panel(ui: &mut egui::Ui, state: &AppState) {
     };
     egui::Frame::default()
         .fill(bg_color)
-        .stroke(egui::Stroke::new(1.5, border_color))
+        .stroke(egui::Stroke::new(1.5_f32, border_color))
         .corner_radius(4.0)
         .inner_margin(6.0)
         .show(ui, |ui| {
@@ -999,7 +999,7 @@ fn image_color_bar(
     painter.rect_stroke(
         response.rect,
         0.0,
-        egui::Stroke::new(1.0, ui.visuals().widgets.noninteractive.bg_stroke.color),
+        egui::Stroke::new(1.0_f32, ui.visuals().widgets.noninteractive.bg_stroke.color),
         egui::StrokeKind::Inside,
     );
     ui.horizontal(|ui| {
@@ -1446,7 +1446,7 @@ fn spectrum_panel(ui: &mut egui::Ui, state: &mut AppState) {
             .collect()
     };
     let measured_points = Points::new("Measured", measured_points)
-        .radius(1.4)
+        .radius(1.4_f32)
         .color(crate::theme::semantic::RED);
 
     // OB reference line (counts mode only): the c·OB curve the KL
@@ -1721,7 +1721,7 @@ fn draw_aligned_tick_row(
     painter.rect_stroke(
         track_rect,
         2.0,
-        egui::Stroke::new(1.0, ui.visuals().widgets.noninteractive.bg_stroke.color),
+        egui::Stroke::new(1.0_f32, ui.visuals().widgets.noninteractive.bg_stroke.color),
         egui::StrokeKind::Inside,
     );
 
@@ -1761,7 +1761,7 @@ fn draw_aligned_tick_row(
                         egui::pos2(x_pos, track_rect.top()),
                         egui::pos2(x_pos, track_rect.bottom()),
                     ],
-                    egui::Stroke::new(1.0, row.color),
+                    egui::Stroke::new(1.0_f32, row.color),
                 );
             }
         }
@@ -1869,7 +1869,7 @@ fn draw_dragged_resonance_ruler(
     ));
     painter.line_segment(
         [egui::pos2(x, frame.top()), egui::pos2(x, frame.bottom())],
-        egui::Stroke::new(2.0, ruler.color),
+        egui::Stroke::new(2.0_f32, ruler.color),
     );
     painter.text(
         egui::pos2(x + 6.0, pointer_y),

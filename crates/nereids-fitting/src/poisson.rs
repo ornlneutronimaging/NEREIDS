@@ -1260,6 +1260,17 @@ impl<'a> crate::forward_model::ForwardModel for CountsModel<'a> {
 ///   Y(E) = α₁ · [Φ(E) · T(θ)] + α₂ · B(E)
 ///
 /// where `α₁` and `α₂` are parameter-vector entries.
+///
+/// ## Index invariant
+///
+/// `alpha1_index` / `alpha2_index` must NOT designate a parameter index
+/// the transmission model reads. The wrapper cannot detect such a
+/// collision through `dyn FitModel`, and the analytic Jacobian excludes
+/// the scale indices from the inner free set — a collided parameter
+/// would get only the scale contribution, silently omitting ∂T/∂p.
+/// (Sharing ONE parameter between the two scale roles,
+/// `alpha1_index == alpha2_index`, IS supported: the columns
+/// accumulate.)
 pub struct CountsBackgroundScaleModel<'a> {
     /// Underlying transmission model.
     pub transmission_model: &'a dyn FitModel,
@@ -1268,8 +1279,10 @@ pub struct CountsBackgroundScaleModel<'a> {
     /// Detector background spectrum.
     pub background: &'a [f64],
     /// Index of α₁ in the parameter vector.
+    /// Must not be a parameter the transmission model reads (see struct docs).
     pub alpha1_index: usize,
     /// Index of α₂ in the parameter vector.
+    /// Must not be a parameter the transmission model reads (see struct docs).
     pub alpha2_index: usize,
     /// Total parameter count in the wrapped model.
     pub n_params: usize,
@@ -1342,14 +1355,20 @@ impl<'a> FitModel for CountsBackgroundScaleModel<'a> {
             return None;
         }
 
+        // Accumulate (+=) rather than assign: the struct does not forbid
+        // alpha1_index == alpha2_index, and evaluate() reads the aliased
+        // parameter for both roles, so its derivative is the SUM of both
+        // column contributions (f·t + b). With distinct indices each
+        // column is touched once and += on the zeroed matrix is identical
+        // to assignment.
         if let Some(col) = alpha1_col {
             for (row, (&f, &t)) in self.flux.iter().zip(t_inner.iter()).enumerate() {
-                *jacobian.get_mut(row, col) = f * t;
+                *jacobian.get_mut(row, col) += f * t;
             }
         }
         if let Some(col) = alpha2_col {
             for (row, &bg) in self.background.iter().enumerate() {
-                *jacobian.get_mut(row, col) = bg;
+                *jacobian.get_mut(row, col) += bg;
             }
         }
 
@@ -1394,14 +1413,27 @@ impl<'a> crate::forward_model::ForwardModel for CountsBackgroundScaleModel<'a> {
 /// - ∂T_out/∂nₖ = ∂T_inner/∂nₖ = -σₖ(E)·T_inner(E)  (same as bare model)
 /// - ∂T_out/∂b₀ = 1
 /// - ∂T_out/∂b₁ = 1/√E
+///
+/// ## Index invariant
+///
+/// `b0_index` / `b1_index` must NOT designate a parameter index the
+/// inner model reads. The wrapper cannot detect such a collision
+/// through `dyn FitModel`, and the analytic Jacobian excludes the
+/// background indices from the inner free set — a collided parameter
+/// would get only the background contribution, silently omitting
+/// ∂T_inner/∂p. (Sharing ONE parameter between the two background
+/// roles, `b0_index == b1_index`, IS supported: the columns
+/// accumulate.)
 pub struct TransmissionKLBackgroundModel<'a> {
     /// Underlying transmission model (density parameters only).
     pub inner: &'a dyn FitModel,
     /// Precomputed 1/√E for each energy bin.
     pub inv_sqrt_energies: Vec<f64>,
     /// Index of b₀ (constant background) in the parameter vector.
+    /// Must not be a parameter the inner model reads (see struct docs).
     pub b0_index: usize,
     /// Index of b₁ (1/√E background) in the parameter vector.
+    /// Must not be a parameter the inner model reads (see struct docs).
     pub b1_index: usize,
     /// Total parameter count in the wrapped model.
     pub n_params: usize,
@@ -1454,7 +1486,7 @@ impl<'a> FitModel for TransmissionKLBackgroundModel<'a> {
         // Fill inner model columns (density, temperature).
         // Inner Jacobian is the same as bare model — background doesn't
         // affect ∂T_inner/∂nₖ.
-        if let Some(ref ij) = inner_jac {
+        if let Some(ij) = inner_jac.as_ref() {
             let mut inner_col = 0;
             for (col, &fp) in free_param_indices.iter().enumerate() {
                 if fp == self.b0_index || fp == self.b1_index {
@@ -1465,20 +1497,26 @@ impl<'a> FitModel for TransmissionKLBackgroundModel<'a> {
                 }
                 inner_col += 1;
             }
-        } else {
-            // No analytical inner Jacobian — fall back to FD for entire model.
+        } else if !inner_free.is_empty() {
+            // Inner params are free but the inner model has no analytical
+            // Jacobian — fall back to FD for the entire model.
             return None;
         }
 
-        // Background columns.
+        // Background columns. Accumulate (+=) rather than assign: the
+        // struct does not forbid b0_index == b1_index, and evaluate()
+        // reads the aliased parameter for both roles, so its derivative
+        // is the SUM of both column contributions (1 + 1/√E). With
+        // distinct indices each column is touched once and += on the
+        // zeroed matrix is identical to assignment.
         if let Some(col) = b0_col {
             for row in 0..n_e {
-                *jacobian.get_mut(row, col) = 1.0; // ∂T_out/∂b₀ = 1
+                *jacobian.get_mut(row, col) += 1.0; // ∂T_out/∂b₀ = 1
             }
         }
         if let Some(col) = b1_col {
             for row in 0..n_e {
-                *jacobian.get_mut(row, col) = self.inv_sqrt_energies[row]; // ∂T_out/∂b₁ = 1/√E
+                *jacobian.get_mut(row, col) += self.inv_sqrt_energies[row]; // ∂T_out/∂b₁ = 1/√E
             }
         }
 
@@ -2403,5 +2441,267 @@ mod tests {
             result.params[3],
             true_params[3],
         );
+    }
+
+    /// Inner params FREE + inner model WITHOUT `analytical_jacobian` →
+    /// the wrapper must return `None` (FD fallback for the entire model)
+    /// and the fit must still converge on the FD path.
+    #[test]
+    fn test_transmission_kl_background_fd_fallback_when_inner_lacks_jacobian() {
+        // ExponentialModel has no analytical_jacobian (trait default None).
+        // Counts-scale data (flux 1000, backgrounds 20/10) keeps the
+        // Poisson NLL well-conditioned for parameter recovery.
+        let x: Vec<f64> = (0..40).map(|i| 1.0 + 0.25 * i as f64).collect();
+        let inner = ExponentialModel {
+            x: x.clone(),
+            flux: vec![1000.0; x.len()],
+        };
+        let inv_sqrt_energies: Vec<f64> = x.iter().map(|&e| 1.0 / e.sqrt()).collect();
+        let wrapped = TransmissionKLBackgroundModel {
+            inner: &inner,
+            inv_sqrt_energies,
+            b0_index: 1,
+            b1_index: 2,
+            n_params: 3,
+        };
+
+        let true_params = vec![0.4, 20.0, 10.0];
+        let y_obs = wrapped.evaluate(&true_params).unwrap();
+
+        // Inner param 0 free (alone and together with b0/b1): no analytic
+        // inner Jacobian → wrapper falls back to FD.
+        assert!(
+            wrapped
+                .analytical_jacobian(&true_params, &[0, 1, 2], &y_obs)
+                .is_none(),
+            "inner param free without inner analytical_jacobian must give None"
+        );
+        assert!(
+            wrapped
+                .analytical_jacobian(&true_params, &[0], &y_obs)
+                .is_none(),
+            "inner-only free set without inner analytical_jacobian must give None"
+        );
+
+        let mut params = ParameterSet::new(vec![
+            FitParameter::non_negative("density", 0.8),
+            FitParameter {
+                name: "kl_b0".into(),
+                value: 5.0,
+                lower: 0.0,
+                upper: 500.0,
+                fixed: false,
+            },
+            FitParameter {
+                name: "kl_b1".into(),
+                value: 5.0,
+                lower: 0.0,
+                upper: 500.0,
+                fixed: false,
+            },
+        ]);
+        let config = PoissonConfig {
+            max_iter: 300,
+            ..PoissonConfig::default()
+        };
+        let result = poisson_fit(&wrapped, &y_obs, &mut params, &config).unwrap();
+        assert!(
+            result.converged,
+            "FD-fallback fit did not converge: {result:?}"
+        );
+        assert!(
+            (result.params[0] - true_params[0]).abs() / true_params[0] < 0.05,
+            "density fit={}, true={}",
+            result.params[0],
+            true_params[0],
+        );
+    }
+
+    /// Inner params FIXED (only b0/b1 free) → the wrapper stays on the
+    /// analytic path: `analytical_jacobian` returns `Some` with the exact
+    /// background columns ∂T/∂b₀ = 1 and ∂T/∂b₁ = 1/√E, and the
+    /// background-only fit converges.
+    #[test]
+    fn test_transmission_kl_background_background_only_analytic_jacobian() {
+        // Counts-scale data — see the FD-fallback test above.
+        let x: Vec<f64> = (0..40).map(|i| 1.0 + 0.25 * i as f64).collect();
+        let inner = ExponentialModel {
+            x: x.clone(),
+            flux: vec![1000.0; x.len()],
+        };
+        let inv_sqrt_energies: Vec<f64> = x.iter().map(|&e| 1.0 / e.sqrt()).collect();
+        let wrapped = TransmissionKLBackgroundModel {
+            inner: &inner,
+            inv_sqrt_energies: inv_sqrt_energies.clone(),
+            b0_index: 1,
+            b1_index: 2,
+            n_params: 3,
+        };
+
+        let true_params = vec![0.4, 20.0, 10.0];
+        let y_obs = wrapped.evaluate(&true_params).unwrap();
+
+        let jac = wrapped
+            .analytical_jacobian(&true_params, &[1, 2], &y_obs)
+            .expect("background-only free set must stay on the analytic path");
+        for (row, &inv_sqrt_e) in inv_sqrt_energies.iter().enumerate() {
+            assert!(
+                (jac.get(row, 0) - 1.0).abs() < 1e-15,
+                "∂T/∂b₀ at row {row} = {}, expected 1.0",
+                jac.get(row, 0),
+            );
+            assert!(
+                (jac.get(row, 1) - inv_sqrt_e).abs() < 1e-15,
+                "∂T/∂b₁ at row {row} = {}, expected {inv_sqrt_e}",
+                jac.get(row, 1),
+            );
+        }
+
+        // Background-only fit (density fixed at truth) converges on the
+        // analytic path.
+        let mut params = ParameterSet::new(vec![
+            FitParameter::fixed("density", true_params[0]),
+            FitParameter {
+                name: "kl_b0".into(),
+                value: 5.0,
+                lower: 0.0,
+                upper: 500.0,
+                fixed: false,
+            },
+            FitParameter {
+                name: "kl_b1".into(),
+                value: 5.0,
+                lower: 0.0,
+                upper: 500.0,
+                fixed: false,
+            },
+        ]);
+        let config = PoissonConfig {
+            max_iter: 300,
+            ..PoissonConfig::default()
+        };
+        let result = poisson_fit(&wrapped, &y_obs, &mut params, &config).unwrap();
+        assert!(
+            result.converged,
+            "background-only analytic fit did not converge: {result:?}"
+        );
+        assert!(
+            (result.params[1] - true_params[1]).abs() < 0.1,
+            "b0 fit={}, true={}",
+            result.params[1],
+            true_params[1],
+        );
+        assert!(
+            (result.params[2] - true_params[2]).abs() < 0.1,
+            "b1 fit={}, true={}",
+            result.params[2],
+            true_params[2],
+        );
+    }
+
+    /// Central finite-difference column for one parameter, computed
+    /// straight from `evaluate` — an oracle independent of the model's
+    /// analytic Jacobian path.
+    fn fd_column(model: &dyn FitModel, params: &[f64], param_index: usize, h: f64) -> Vec<f64> {
+        let mut plus = params.to_vec();
+        plus[param_index] += h;
+        let mut minus = params.to_vec();
+        minus[param_index] -= h;
+        let y_plus = model.evaluate(&plus).unwrap();
+        let y_minus = model.evaluate(&minus).unwrap();
+        y_plus
+            .iter()
+            .zip(y_minus.iter())
+            .map(|(&p, &m)| (p - m) / (2.0 * h))
+            .collect()
+    }
+
+    /// Aliased background indices (b0_index == b1_index): the analytic
+    /// Jacobian must ACCUMULATE both roles' contributions (1 + 1/√E),
+    /// matching finite differences — not overwrite one with the other.
+    #[test]
+    fn test_transmission_kl_background_aliased_indices_jacobian_matches_fd() {
+        let x: Vec<f64> = (0..10).map(|i| 1.0 + 0.5 * i as f64).collect();
+        let inner = ExponentialModel {
+            x: x.clone(),
+            flux: vec![1000.0; x.len()],
+        };
+        let inv_sqrt_energies: Vec<f64> = x.iter().map(|&e| 1.0 / e.sqrt()).collect();
+        let wrapped = TransmissionKLBackgroundModel {
+            inner: &inner,
+            inv_sqrt_energies: inv_sqrt_energies.clone(),
+            b0_index: 1,
+            b1_index: 1, // deliberately aliased with b0
+            n_params: 2,
+        };
+
+        let params = vec![0.4, 15.0];
+        let y = wrapped.evaluate(&params).unwrap();
+        // Inner param fixed, only the aliased background param free →
+        // analytic path.
+        let jac = wrapped
+            .analytical_jacobian(&params, &[1], &y)
+            .expect("background-only free set must stay on the analytic path");
+
+        let fd = fd_column(&wrapped, &params, 1, 1e-6);
+        for (row, (&fd_val, &inv_sqrt_e)) in fd.iter().zip(inv_sqrt_energies.iter()).enumerate() {
+            let expected = 1.0 + inv_sqrt_e;
+            assert!(
+                (jac.get(row, 0) - expected).abs() < 1e-12,
+                "aliased ∂/∂b at row {row}: analytic {}, expected {expected}",
+                jac.get(row, 0),
+            );
+            assert!(
+                (jac.get(row, 0) - fd_val).abs() < 1e-5,
+                "aliased ∂/∂b at row {row}: analytic {}, FD {fd_val}",
+                jac.get(row, 0),
+            );
+        }
+    }
+
+    /// Aliased scale indices (alpha1_index == alpha2_index) in the
+    /// sibling counts model: same accumulate-not-overwrite requirement,
+    /// derivative f·T + B against the finite-difference oracle.
+    #[test]
+    fn test_counts_background_scale_aliased_indices_jacobian_matches_fd() {
+        let x: Vec<f64> = (0..10).map(|i| 1.0 + 0.5 * i as f64).collect();
+        let inner = ExponentialModel {
+            x: x.clone(),
+            flux: vec![1.0; x.len()], // inner transmission in [0,1]
+        };
+        let flux: Vec<f64> = vec![1000.0; x.len()];
+        let background: Vec<f64> = x.iter().map(|&e| 5.0 + e).collect();
+        let wrapped = CountsBackgroundScaleModel {
+            transmission_model: &inner,
+            flux: &flux,
+            background: &background,
+            alpha1_index: 1,
+            alpha2_index: 1, // deliberately aliased with alpha1
+            n_params: 2,
+        };
+
+        let params = vec![0.4, 1.2];
+        let y = wrapped.evaluate(&params).unwrap();
+        let t_inner = inner.evaluate(&params).unwrap();
+        // Inner param fixed, only the aliased scale param free →
+        // analytic path.
+        let jac = wrapped
+            .analytical_jacobian(&params, &[1], &y)
+            .expect("scale-only free set must stay on the analytic path");
+
+        let fd = fd_column(&wrapped, &params, 1, 1e-6);
+        for (row, &fd_val) in fd.iter().enumerate() {
+            let expected = flux[row] * t_inner[row] + background[row];
+            assert!(
+                (jac.get(row, 0) - expected).abs() < 1e-9,
+                "aliased ∂/∂α at row {row}: analytic {}, expected {expected}",
+                jac.get(row, 0),
+            );
+            assert!(
+                (jac.get(row, 0) - fd_val).abs() < 1e-3,
+                "aliased ∂/∂α at row {row}: analytic {}, FD {fd_val}",
+                jac.get(row, 0),
+            );
+        }
     }
 }

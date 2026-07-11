@@ -23,6 +23,10 @@ on:
       - '.github/workflows/publish.yml'
       - '.github/workflows/wheel-policy.yml'
       - 'scripts/check_wheel_policy.sh'
+      # maturin-action resolves the in-container compiler from the repo
+      # root rust-toolchain.toml, so a pin-only bump changes the release
+      # wheel compiler and MUST schedule this gate.
+      - 'rust-toolchain.toml'
 
 permissions:
   contents: read

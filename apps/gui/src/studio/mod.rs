@@ -614,7 +614,7 @@ fn bottom_dock(ui: &mut egui::Ui, state: &mut AppState) {
             egui::Frame::NONE
                 .fill(colors.bg)
                 .inner_margin(egui::Margin::symmetric(12, 8))
-                .stroke(egui::Stroke::new(1.0, colors.border)),
+                .stroke(egui::Stroke::new(1.0_f32, colors.border)),
         )
         .show_inside(ui, |ui| {
             let labels = &["Isotopes", "Residuals", "Provenance", "Export"];
@@ -1113,7 +1113,7 @@ fn parameter_sidebar(ui: &mut egui::Ui, state: &mut AppState) {
             egui::Frame::NONE
                 .fill(colors.bg)
                 .inner_margin(egui::Margin::symmetric(10, 8))
-                .stroke(egui::Stroke::new(1.0, colors.border)),
+                .stroke(egui::Stroke::new(1.0_f32, colors.border)),
         )
         .show_inside(ui, |ui| {
             egui::ScrollArea::vertical().show(ui, |ui| {

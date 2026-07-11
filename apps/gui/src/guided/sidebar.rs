@@ -26,7 +26,7 @@ pub fn guided_sidebar(ui: &mut egui::Ui, state: &mut AppState) {
             egui::Frame::NONE
                 .fill(colors.bg)
                 .inner_margin(margin)
-                .stroke(Stroke::new(1.0, colors.border)),
+                .stroke(Stroke::new(1.0_f32, colors.border)),
         )
         .show_inside(ui, |ui| {
             if state.sidebar_collapsed || force_compact {
@@ -268,7 +268,7 @@ fn collapsed_step_badge(
                     );
                 } else {
                     ui.painter()
-                        .circle_stroke(center, 10.0, Stroke::new(1.0, colors.border));
+                        .circle_stroke(center, 10.0, Stroke::new(1.0_f32, colors.border));
                     ui.painter().text(
                         center,
                         egui::Align2::CENTER_CENTER,
@@ -466,7 +466,7 @@ fn pipeline_step_row(
                 } else {
                     // Pending: outlined icon, not a filled status dot.
                     ui.painter()
-                        .circle_stroke(center, 10.0, Stroke::new(1.0, colors.border));
+                        .circle_stroke(center, 10.0, Stroke::new(1.0_f32, colors.border));
                     ui.painter().text(
                         center,
                         egui::Align2::CENTER_CENTER,
