@@ -58,3 +58,6 @@ tmp/
 
 # do not track manuscript folders
 .manuscripts/
+
+# Session-local agent-harness state (task contracts, verify gates)
+.harness/
