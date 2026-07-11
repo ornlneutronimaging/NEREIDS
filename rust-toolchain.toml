@@ -7,12 +7,14 @@
 # toolchain bumps deliberate, reviewed changes.
 #
 # Why 1.96.1 and not 1.97.0: rust-lang/rust#159035 — a P-critical
-# x86-64 miscompile in 1.97.0 (optimized safe code segfaults; an LLVM
-# regression from stable to stable; 1.96.1 is not affected). Release
-# wheels for the ORNL x86-64 RHEL fleet are built under this pin, so
-# 1.97.0 is unacceptable until fixed. Bump this pin to the first
-# stable release containing the fix (the revert of
-# rust-lang/rust#155850, merged upstream via rust-lang/rust#159047).
+# x86-64 miscompile (optimized safe code segfaults). The underlying
+# LLVM codegen issue predates 1.97 (LLVM 20 era, ~1.87+), but 1.97.0's
+# enum-tag change (rust-lang/rust#155850) makes the trigger condition
+# far more common; the issue's reproducer passes on 1.96.1. Release
+# wheels for the ORNL x86-64 RHEL fleet are built under this pin:
+# 1.96.1 matches what main already shipped with and avoids the widened
+# 1.97 trigger. Bump to the first stable containing the #155850 revert
+# (rust-lang/rust#159047) and/or the upstream LLVM fix.
 #
 # Bump ritual: update `channel` here, update the matching
 # `toolchain: "X.Y.Z"` inputs in .github/workflows/*.yml (they only
