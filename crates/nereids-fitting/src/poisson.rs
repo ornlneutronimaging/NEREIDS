@@ -1260,6 +1260,17 @@ impl<'a> crate::forward_model::ForwardModel for CountsModel<'a> {
 ///   Y(E) = α₁ · [Φ(E) · T(θ)] + α₂ · B(E)
 ///
 /// where `α₁` and `α₂` are parameter-vector entries.
+///
+/// ## Index invariant
+///
+/// `alpha1_index` / `alpha2_index` must NOT designate a parameter index
+/// the transmission model reads. The wrapper cannot detect such a
+/// collision through `dyn FitModel`, and the analytic Jacobian excludes
+/// the scale indices from the inner free set — a collided parameter
+/// would get only the scale contribution, silently omitting ∂T/∂p.
+/// (Sharing ONE parameter between the two scale roles,
+/// `alpha1_index == alpha2_index`, IS supported: the columns
+/// accumulate.)
 pub struct CountsBackgroundScaleModel<'a> {
     /// Underlying transmission model.
     pub transmission_model: &'a dyn FitModel,
@@ -1268,8 +1279,10 @@ pub struct CountsBackgroundScaleModel<'a> {
     /// Detector background spectrum.
     pub background: &'a [f64],
     /// Index of α₁ in the parameter vector.
+    /// Must not be a parameter the transmission model reads (see struct docs).
     pub alpha1_index: usize,
     /// Index of α₂ in the parameter vector.
+    /// Must not be a parameter the transmission model reads (see struct docs).
     pub alpha2_index: usize,
     /// Total parameter count in the wrapped model.
     pub n_params: usize,
@@ -1400,14 +1413,27 @@ impl<'a> crate::forward_model::ForwardModel for CountsBackgroundScaleModel<'a> {
 /// - ∂T_out/∂nₖ = ∂T_inner/∂nₖ = -σₖ(E)·T_inner(E)  (same as bare model)
 /// - ∂T_out/∂b₀ = 1
 /// - ∂T_out/∂b₁ = 1/√E
+///
+/// ## Index invariant
+///
+/// `b0_index` / `b1_index` must NOT designate a parameter index the
+/// inner model reads. The wrapper cannot detect such a collision
+/// through `dyn FitModel`, and the analytic Jacobian excludes the
+/// background indices from the inner free set — a collided parameter
+/// would get only the background contribution, silently omitting
+/// ∂T_inner/∂p. (Sharing ONE parameter between the two background
+/// roles, `b0_index == b1_index`, IS supported: the columns
+/// accumulate.)
 pub struct TransmissionKLBackgroundModel<'a> {
     /// Underlying transmission model (density parameters only).
     pub inner: &'a dyn FitModel,
     /// Precomputed 1/√E for each energy bin.
     pub inv_sqrt_energies: Vec<f64>,
     /// Index of b₀ (constant background) in the parameter vector.
+    /// Must not be a parameter the inner model reads (see struct docs).
     pub b0_index: usize,
     /// Index of b₁ (1/√E background) in the parameter vector.
+    /// Must not be a parameter the inner model reads (see struct docs).
     pub b1_index: usize,
     /// Total parameter count in the wrapped model.
     pub n_params: usize,
