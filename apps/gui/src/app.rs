@@ -275,18 +275,18 @@ fn poll_pending_tasks(state: &mut AppState) {
             }
             Ok(Err(err_msg)) => {
                 tracing::error!(error = %err_msg, "spatial map failed");
+                state.clear_spatial_fit_output();
                 state.status_message = format!("Spatial map error: {err_msg}");
                 state.is_fitting = false;
                 state.fitting_progress = None;
-                state.residuals_cache = None;
                 state.pending_spatial = None;
             }
             Err(std::sync::mpsc::TryRecvError::Disconnected) => {
                 tracing::error!("spatial map task disconnected without result");
+                state.clear_spatial_fit_output();
                 state.status_message = "Spatial map task failed".into();
                 state.is_fitting = false;
                 state.fitting_progress = None;
-                state.residuals_cache = None;
                 state.pending_spatial = None;
             }
             Err(std::sync::mpsc::TryRecvError::Empty) => {} // Still running
@@ -634,5 +634,67 @@ fn poll_pending_tasks(state: &mut AppState) {
             }
             Err(std::sync::mpsc::TryRecvError::Empty) => {} // Still saving
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use ndarray::Array2;
+    use nereids_pipeline::spatial::SpatialResult;
+    use std::sync::mpsc;
+
+    fn stale_spatial_result() -> SpatialResult {
+        let map = || Array2::from_elem((1, 1), 9.9);
+        SpatialResult {
+            density_maps: vec![map()],
+            uncertainty_maps: vec![map()],
+            chi_squared_map: map(),
+            deviance_per_dof_map: None,
+            converged_map: Array2::from_elem((1, 1), true),
+            temperature_map: None,
+            temperature_uncertainty_map: None,
+            isotope_labels: vec!["U-238".into()],
+            anorm_map: None,
+            background_maps: None,
+            back_d_map: None,
+            back_f_map: None,
+            t0_us_map: None,
+            l_scale_map: None,
+            energy_scale_flight_path_m: None,
+            baseline_global: None,
+            baseline_e_ref_ev: None,
+            baseline_maps: None,
+            warnings: Vec::new(),
+            n_converged: 1,
+            n_total: 1,
+            n_failed: 0,
+        }
+    }
+
+    #[test]
+    fn spatial_worker_error_clears_stale_map_and_export_state() {
+        let mut state = AppState {
+            spatial_result: Some(stale_spatial_result()),
+            export_status: Some("old export".into()),
+            is_fitting: true,
+            ..Default::default()
+        };
+        let (tx, rx) = mpsc::channel();
+        tx.send(Err("counts-resolution route rejected".into()))
+            .expect("test receiver is live");
+        state.pending_spatial = Some(rx);
+
+        poll_pending_tasks(&mut state);
+
+        assert!(state.spatial_result.is_none());
+        assert!(state.export_status.is_none());
+        assert!(state.pending_spatial.is_none());
+        assert!(!state.is_fitting);
+        assert!(
+            state
+                .status_message
+                .contains("counts-resolution route rejected")
+        );
     }
 }

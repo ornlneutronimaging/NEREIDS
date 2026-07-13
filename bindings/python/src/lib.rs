@@ -65,6 +65,10 @@ use nereids_physics::resolution::{
 use nereids_physics::transmission::{self, InstrumentParams, SampleParams};
 use nereids_pipeline::detectability;
 
+// PyO3 needs a literal here to expose the real default through
+// `inspect.signature`; keep that public literal locked to the core default.
+const _: () = assert!(DEFAULT_PSR_FWHM_NS == 350.0);
+
 /// Python wrapper for ENDF resonance data.
 ///
 /// Uses `Arc` internally so that `.clone()` in `py.detach()` closures is O(1)
@@ -1493,7 +1497,7 @@ impl PyResolutionCalibration {
     restarts=1, ic_n_energies=64, ic_n_tau=500,
     fit_t0=false, fit_l_scale=false, t0_center_us=0.0, l_scale_center=1.0,
     t0_prior_us=None, l_scale_prior=None,
-    psr_fwhm_ns=DEFAULT_PSR_FWHM_NS, fit_psr=false
+    psr_fwhm_ns=350.0, fit_psr=false
 ))]
 #[allow(clippy::too_many_arguments)]
 fn calibrate_resolution(

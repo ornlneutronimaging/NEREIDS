@@ -1134,6 +1134,34 @@ impl UnifiedFitConfig {
     }
 }
 
+/// Reject count-domain requests that attach instrument resolution until the
+/// pipeline can migrate the incident flux and sample arm separately.
+///
+/// The current counts fit wraps a transmission model and therefore evaluates
+/// a broadened transmission `R[T]`.  A detector observes separate broadened
+/// arms, so the physical normalized response is `R[Phi*T] / R[Phi]`.  These
+/// expressions agree only for special flat-flux cases.  Returning a fit from
+/// the former model would be numerically plausible but scientifically wrong.
+///
+/// Kept as one shared boundary check so single-spectrum fitting, spatial
+/// fitting, and the public Fisher helper cannot drift to different behavior.
+pub(crate) fn validate_counts_resolution_route(
+    is_counts: bool,
+    config: &UnifiedFitConfig,
+) -> Result<(), PipelineError> {
+    if is_counts && config.resolution().is_some() {
+        return Err(PipelineError::InvalidParameter(
+            "counts input with instrument resolution is unsupported: the current \
+             counts path broadens transmission as R[T], but the physical detector \
+             model requires separate open/sample response arms R[Phi] and \
+             R[Phi*T]. Supply pre-normalized transmission, or disable instrument \
+             resolution until an exact counts response is implemented."
+                .into(),
+        ));
+    }
+    Ok(())
+}
+
 /// Fit a single spectrum using the typed input data API.
 ///
 /// Dispatches to the correct fitting engine based on the `InputData` variant
@@ -1230,6 +1258,11 @@ pub fn fit_spectrum_typed(
             }
         }
     }
+
+    // The count-domain objective currently sees only an already-broadened
+    // transmission model.  Fail before any cross-section/model construction
+    // rather than returning a good-looking fit for the wrong response.
+    validate_counts_resolution_route(input.is_counts(), config)?;
 
     // Reject a malformed caller-supplied precomputed cross-section stack here,
     // before it reaches the forward-model builders (which would otherwise panic
@@ -3361,6 +3394,11 @@ pub fn evaluate_jacobian_and_fisher(
     flux: &[f64],
     background: &[f64],
 ) -> Result<ModelJacobianResult, PipelineError> {
+    // This helper builds a counts-space Jacobian/Fisher from the same
+    // transmission-first chain as production fitting.  It is no more physical
+    // under instrument resolution than the optimizer route, so reject it too.
+    validate_counts_resolution_route(true, config)?;
+
     // Reject a malformed caller-supplied precomputed cross-section stack here,
     // before it reaches `build_transmission_model`.  Without this, an empty
     // stack is caught only deep in `PrecomputedTransmissionModel` (as an
@@ -6250,6 +6288,100 @@ mod tests {
         assert!(r.reduced_chi_squared.is_finite());
     }
 
+    /// Gate 1: the current counts likelihood profiles an already-broadened
+    /// transmission model. With instrument resolution this computes R[T], not
+    /// the physical separate-arm response R[Phi*T] / R[Phi]. Until the public
+    /// counts input carries the required true-energy incident flux and both
+    /// detector-response arms, every counts + resolution request must fail
+    /// before model construction instead of returning a plausible wrong fit.
+    #[test]
+    fn counts_resolution_requires_exact_count_response() {
+        use nereids_physics::resolution::{
+            ResolutionFunction, ResolutionParams, TabulatedResolution,
+        };
+
+        let data = u238_single_resonance();
+        let energies: Vec<f64> = (0..101).map(|i| 1.0 + (i as f64) * 0.1).collect();
+        let (sample_counts, open_beam_counts) = synthetic_counts(&data, 0.0005, &energies, 1000.0);
+        let tab_text = "header\n---\n\
+             5.0 0.0\n\
+             -0.01 0.0\n\
+             0.0 1.0\n\
+             0.01 0.0\n\
+             \n\
+             20.0 0.0\n\
+             -0.02 0.0\n\
+             0.0 1.0\n\
+             0.02 0.0\n";
+        let resolutions = [
+            (
+                "gaussian",
+                ResolutionFunction::Gaussian(ResolutionParams::new(25.0, 0.5, 0.005, 0.0).unwrap()),
+            ),
+            (
+                "tabulated",
+                ResolutionFunction::Tabulated(Arc::new(
+                    TabulatedResolution::from_text(tab_text, 25.0).unwrap(),
+                )),
+            ),
+        ];
+        let solvers = [
+            ("auto", SolverConfig::Auto),
+            ("kl", SolverConfig::PoissonKL(PoissonConfig::default())),
+            ("lm", SolverConfig::LevenbergMarquardt(LmConfig::default())),
+        ];
+
+        for (resolution_name, resolution) in resolutions {
+            for (solver_name, solver) in &solvers {
+                let config = UnifiedFitConfig::new(
+                    energies.clone(),
+                    vec![data.clone()],
+                    vec!["U-238".into()],
+                    293.6,
+                    Some(resolution.clone()),
+                    vec![0.001],
+                )
+                .unwrap()
+                .with_solver(solver.clone());
+                let inputs = [
+                    (
+                        "counts",
+                        InputData::Counts {
+                            sample_counts: sample_counts.clone(),
+                            open_beam_counts: open_beam_counts.clone(),
+                        },
+                    ),
+                    (
+                        "counts-with-nuisance",
+                        InputData::CountsWithNuisance {
+                            sample_counts: sample_counts.clone(),
+                            flux: open_beam_counts.clone(),
+                            background: vec![0.0; energies.len()],
+                        },
+                    ),
+                ];
+
+                for (input_name, input) in inputs {
+                    let err = match fit_spectrum_typed(&input, &config) {
+                        Ok(_) => panic!(
+                            "{input_name} + {solver_name} + {resolution_name} resolution \
+                             returned a scientifically invalid fit"
+                        ),
+                        Err(err) => err,
+                    };
+                    let msg = err.to_string();
+                    assert!(
+                        msg.contains("counts")
+                            && msg.contains("instrument resolution")
+                            && msg.contains("separate open/sample response arms"),
+                        "{input_name} + {solver_name} + {resolution_name}: expected \
+                         physical counts-response rejection, got: {msg}"
+                    );
+                }
+            }
+        }
+    }
+
     // ──────────────────────────────────────────────────────────────────
     // transmission_background through the joint-Poisson path.
     // ──────────────────────────────────────────────────────────────────
@@ -6843,15 +6975,12 @@ mod tests {
     // ── Issue #608: Rust coverage for paths previously exercised only
     //    via Python / the spatial-identity path (codecov/patch gap) ───────────
 
-    /// `evaluate_jacobian_and_fisher` (the research Fisher / `compute_model_jacobian`
-    /// entry point) was exercised only through the Python bindings, which the
-    /// Rust-only coverage run excludes — so its body, and the #608
-    /// compute-working-grid-σ branch, were uncovered.  Drive it with a
-    /// Gaussian-resolution config carrying NO precomputed σ: that exercises the
-    /// aux-grid σ build + the model construction + the analytical Jacobian /
-    /// Fisher assembly.
+    /// The research Fisher helper is a counts-space model.  It must reject
+    /// instrument resolution for the same separate-arm reason as the production
+    /// optimizer, rather than exposing a wrong-but-finite Jacobian/Fisher for
+    /// `R[T]`.
     #[test]
-    fn evaluate_jacobian_and_fisher_gaussian_aux_grid() {
+    fn evaluate_jacobian_and_fisher_rejects_resolution() {
         use nereids_physics::resolution::{ResolutionFunction, ResolutionParams};
         let data = u238_single_resonance();
         let energies: Vec<f64> = (0..101).map(|i| 1.0 + (i as f64) * 0.1).collect();
@@ -6869,16 +6998,16 @@ mod tests {
         .unwrap();
         let flux = vec![5000.0; n_e];
         let background = vec![10.0; n_e];
-        let result = evaluate_jacobian_and_fisher(&config, &flux, &background).unwrap();
-        assert_eq!(result.model_prediction.len(), n_e);
-        assert!(result.model_prediction.iter().all(|v| v.is_finite()));
-        assert_eq!(result.param_names.len(), 1, "one free density parameter");
-        // Density Fisher information must be finite + positive (well-posed
-        // measurement); the Jacobian endpoints must be finite.
-        let f00 = result.fisher.get(0, 0);
-        assert!(f00.is_finite() && f00 > 0.0, "Fisher[0,0] = {f00}");
-        assert!(result.jacobian.get(0, 0).is_finite());
-        assert!(result.jacobian.get(n_e - 1, 0).is_finite());
+        let err = match evaluate_jacobian_and_fisher(&config, &flux, &background) {
+            Ok(_) => panic!("counts-space Fisher helper accepted instrument resolution"),
+            Err(err) => err,
+        };
+        let msg = err.to_string();
+        assert!(
+            msg.contains("instrument resolution")
+                && msg.contains("separate open/sample response arms"),
+            "expected physical counts-response rejection, got: {msg}"
+        );
     }
 
     /// Non-spatial energy-scale fit through `fit_spectrum_typed` (LM

@@ -1063,6 +1063,20 @@ pub(crate) struct FitLineParams<'a> {
     pub y_multiplier: Option<&'a [f64]>,
 }
 
+/// Counts and instrument resolution cannot share the transmission-only fit
+/// overlay until the detector response has separate open/sample arms.
+pub(crate) fn counts_resolution_overlay_unsupported(
+    shows_counts: bool,
+    has_instrument_resolution: bool,
+) -> bool {
+    shows_counts && has_instrument_resolution
+}
+
+pub(crate) const COUNTS_RESOLUTION_OVERLAY_MESSAGE: &str = "Count fit overlay hidden: instrument resolution needs separate open/sample response arms \
+     R[Phi] and R[Phi*T]. Multiplying c*OB by R[T] is not a physical count model. Supply \
+     pre-normalized transmission, or disable instrument resolution until an exact count \
+     response is implemented.";
+
 /// Build a fit overlay line from a `SpectrumFitResult`.
 ///
 /// Returns `None` if the fit didn't converge, no resonance data is provided,
@@ -1072,6 +1086,9 @@ pub(crate) struct FitLineParams<'a> {
 /// (individual isotopes + group members). `density_indices` and `density_ratios`
 /// map each resonance data entry to a density parameter index and its abundance ratio.
 pub(crate) fn build_fit_line(p: &FitLineParams<'_>) -> Option<Line<'static>> {
+    if counts_resolution_overlay_unsupported(p.y_multiplier.is_some(), p.instrument.is_some()) {
+        return None;
+    }
     if !p.result.converged {
         return None;
     }
@@ -1202,4 +1219,17 @@ pub(crate) fn collect_all_resonance_data_with_mapping(
         }
     }
     (all_rd, indices, ratios)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::counts_resolution_overlay_unsupported;
+
+    #[test]
+    fn count_overlay_is_suppressed_only_with_active_resolution() {
+        assert!(counts_resolution_overlay_unsupported(true, true));
+        assert!(!counts_resolution_overlay_unsupported(true, false));
+        assert!(!counts_resolution_overlay_unsupported(false, true));
+        assert!(!counts_resolution_overlay_unsupported(false, false));
+    }
 }

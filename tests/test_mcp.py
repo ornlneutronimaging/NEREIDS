@@ -693,6 +693,67 @@ class TestManifestWorkflowTools:
         assert result["success"] is False
         assert "single_spectrum workflow requires data.path" in result["validation"]["errors"]
 
+    def test_validate_and_dry_run_reject_counts_with_active_resolution(self, tmp_path):
+        np.savez(
+            tmp_path / "counts.npz",
+            energies_ev=np.linspace(1.0, 30.0, 20),
+            sample_counts=np.full(20, 900.0),
+            open_beam_counts=np.full(20, 1000.0),
+        )
+        _write_json_frontmatter_manifest(
+            tmp_path,
+            {
+                "mode": "single_spectrum",
+                "data": {"kind": "counts_npz", "path": "counts.npz"},
+                "isotopes": [_synthetic_u238_entry()],
+                "fit": {"solver": "poisson_kl", "max_iter": 5},
+                "resolution": {
+                    "kind": "gaussian",
+                    "flight_path_m": 25.0,
+                    "delta_t_us": 1.0,
+                    "delta_l_m": 0.01,
+                },
+            },
+        )
+
+        validation = validate_resonance_dataset(str(tmp_path))
+        dry_run = process_resonance_dataset(str(tmp_path), dry_run=True)
+
+        assert validation["valid"] is False
+        assert dry_run["success"] is False
+        assert dry_run["validation"]["errors"] == validation["errors"]
+        message = "\n".join(validation["errors"])
+        assert "counts input with instrument resolution is unsupported" in message
+        assert "separate open/sample response arms R[Phi] and R[Phi*T]" in message
+
+    def test_validation_allows_transmission_with_active_resolution(self, tmp_path):
+        np.savez(
+            tmp_path / "spectrum.npz",
+            energies_ev=np.linspace(1.0, 30.0, 20),
+            transmission=np.ones(20),
+            uncertainty=np.full(20, 0.01),
+        )
+        _write_json_frontmatter_manifest(
+            tmp_path,
+            {
+                "mode": "single_spectrum",
+                "data": {"kind": "transmission_npz", "path": "spectrum.npz"},
+                "isotopes": [_synthetic_u238_entry()],
+                "fit": {"solver": "lm", "max_iter": 5},
+                "resolution": {
+                    "kind": "gaussian",
+                    "flight_path_m": 25.0,
+                    "delta_t_us": 1.0,
+                    "delta_l_m": 0.01,
+                },
+            },
+        )
+
+        validation = validate_resonance_dataset(str(tmp_path))
+
+        assert validation["valid"] is True
+        assert not any("counts input" in error for error in validation["errors"])
+
     def test_fit_summary_is_strict_json_safe(self):
         result = SimpleNamespace(
             densities=np.asarray([np.nan]),

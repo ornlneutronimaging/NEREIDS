@@ -4347,6 +4347,8 @@ class TestCalibrateResolution:
         # signature froze, so they must sit at the END — inserting them
         # mid-signature would silently shift every pre-existing call passing
         # >= 14 positional arguments.
+        import inspect
+
         sig = nereids.calibrate_resolution.__text_signature__
         assert sig is not None
         assert (
@@ -4354,6 +4356,14 @@ class TestCalibrateResolution:
             < sig.index("psr_fwhm_ns")
             < sig.index("fit_psr")
         ), f"psr_fwhm_ns/fit_psr must trail the signature: {sig}"
+        # Named Rust constants are rendered as ``...`` by PyO3 even though the
+        # call path uses the right value.  Keep the introspected public default
+        # equal to the stub and to the fitting-core default instead of exposing
+        # an unusable Ellipsis value to help(), IDEs, and manifest checks.
+        default = inspect.signature(nereids.calibrate_resolution).parameters[
+            "psr_fwhm_ns"
+        ].default
+        assert default == 350.0
 
 
 
