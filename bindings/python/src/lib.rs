@@ -869,6 +869,14 @@ impl PyIkedaCarpenter {
             .map_err(|e| pyo3::exceptions::PyValueError::new_err(e.to_string()))
     }
 
+    /// `(moderator_delay_us, density)` for the physical source pulse at one
+    /// true energy. Unlike `kernel_at`, this keeps the pulse's time origin.
+    fn source_pulse_at(&self, true_energy_ev: f64) -> PyResult<(Vec<f64>, Vec<f64>)> {
+        self.inner
+            .source_pulse_at(true_energy_ev)
+            .map_err(|e| pyo3::exceptions::PyValueError::new_err(e.to_string()))
+    }
+
     /// Probability that a neutron at one true energy is recorded in each
     /// adjacent detector-time bin. The result is not renormalized when the
     /// supplied time window omits part of the pulse.

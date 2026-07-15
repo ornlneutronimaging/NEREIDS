@@ -385,6 +385,13 @@ class IkedaCarpenter:
         """
         ...
 
+    def source_pulse_at(self, true_energy_ev: float) -> tuple[list[float], list[float]]:
+        """Physical ``(moderator_delay_us, density)`` at one true energy.
+
+        Unlike :meth:`kernel_at`, this keeps the pulse's time origin.
+        """
+        ...
+
     def detector_bin_probabilities(
         self,
         true_energy_ev: float,

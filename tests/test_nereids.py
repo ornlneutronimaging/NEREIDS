@@ -4074,6 +4074,22 @@ class TestCalibrateEnergySmoke:
 
 
 class TestIkedaCarpenterCausalResponse:
+    def test_source_pulse_keeps_physical_delay_origin(self):
+        ic = nereids.IkedaCarpenter(
+            flight_path_m=25.0,
+            e_min_ev=1.0,
+            e_max_ev=10.0,
+            alpha=nereids.EnergyLaw.const(2.0),
+            beta=0.5,
+            r=nereids.EnergyLaw.const(0.3),
+        )
+
+        delay_us, density = map(np.asarray, ic.source_pulse_at(4.0))
+
+        assert delay_us[0] == 0.0
+        assert delay_us[np.argmax(density)] > 0.0
+        assert np.all(np.diff(delay_us) > 0.0)
+
     def test_detector_bin_probabilities_preserve_probability_and_clock(self):
         flight_path_m = 25.0
         energy_ev = 4.0
