@@ -1305,6 +1305,41 @@ pub enum ResolutionFunction {
     IkedaCarpenter(Arc<crate::ikeda_carpenter::IkedaCarpenter>),
 }
 
+impl ResolutionFunction {
+    /// Probability that one neutron of known true energy is recorded in each
+    /// supplied detector-time bin.
+    ///
+    /// The tabulated and Ikeda–Carpenter variants are evaluated directly in
+    /// detector time. In particular, the analytical IC variant does not pass
+    /// through its legacy synthesized [`TabulatedResolution`] broadening
+    /// table. The older Gaussian energy-broadening model has no physical
+    /// detector-time probability law and is therefore rejected rather than
+    /// silently treated as one.
+    pub fn detector_bin_probabilities(
+        &self,
+        true_energy_ev: f64,
+        detector_time_edges_us: &[f64],
+        timing_offset_us: f64,
+    ) -> Result<Vec<f64>, ResolutionParseError> {
+        match self {
+            Self::Tabulated(tabulated) => tabulated.detector_bin_probabilities(
+                true_energy_ev,
+                detector_time_edges_us,
+                timing_offset_us,
+            ),
+            Self::IkedaCarpenter(ic) => ic.detector_bin_probabilities(
+                true_energy_ev,
+                detector_time_edges_us,
+                timing_offset_us,
+            ),
+            Self::Gaussian(_) => Err(ResolutionParseError::InvalidFormat(
+                "Gaussian energy broadening cannot produce detector-time bin probabilities; use a validated tabulated or Ikeda–Carpenter time response"
+                    .to_string(),
+            )),
+        }
+    }
+}
+
 /// Pre-built resolution-broadening plan for a specific target energy grid.
 ///
 /// Encodes every quantity that depends only on the target grid, the

@@ -55,6 +55,7 @@ use nereids_fitting::resolution_calib::{
 };
 use nereids_io::normalization::{self as norm, NormalizationParams};
 use nereids_io::tof::BeamlineParams;
+use nereids_physics::counts_response;
 use nereids_physics::doppler::{self, DopplerParams};
 use nereids_physics::ikeda_carpenter::{
     EnergyLaw, IkedaCarpenter, IkedaCarpenterParams, SynthesisGrid,
@@ -2296,6 +2297,63 @@ fn py_apply_resolution<'py>(
     Ok(PyArray1::from_vec(py, result))
 }
 
+/// Predict separate open-beam and sample counts on actual detector-time bins.
+///
+/// ``incident_fluence_weights[j]`` is the incident flux density at true energy
+/// ``j`` multiplied by the caller's energy-integration weight. The response is
+/// applied to the open and attenuated sample arms separately; this function
+/// never broadens a transmission ratio.
+#[pyfunction]
+#[pyo3(name = "two_arm_count_response", signature = (
+    true_energies_ev,
+    incident_fluence_weights,
+    transmission,
+    detector_time_edges_us,
+    resolution,
+    timing_offset_us = 0.0,
+))]
+fn py_two_arm_count_response<'py>(
+    py: Python<'py>,
+    true_energies_ev: PyReadonlyArray1<f64>,
+    incident_fluence_weights: PyReadonlyArray1<f64>,
+    transmission: PyReadonlyArray1<f64>,
+    detector_time_edges_us: PyReadonlyArray1<f64>,
+    resolution: &Bound<'_, PyAny>,
+    timing_offset_us: f64,
+) -> PyResult<(Bound<'py, PyArray1<f64>>, Bound<'py, PyArray1<f64>>)> {
+    let response = if let Ok(tabulated) = resolution.extract::<PyRef<'_, PyTabulatedResolution>>() {
+        ResolutionFunction::Tabulated(Arc::clone(&tabulated.inner))
+    } else if let Ok(ic) = resolution.extract::<PyRef<'_, PyIkedaCarpenter>>() {
+        ResolutionFunction::IkedaCarpenter(Arc::clone(&ic.inner))
+    } else {
+        return Err(pyo3::exceptions::PyTypeError::new_err(
+            "resolution must be a TabulatedResolution or IkedaCarpenter",
+        ));
+    };
+
+    let energies = true_energies_ev.as_slice()?.to_vec();
+    let fluence = incident_fluence_weights.as_slice()?.to_vec();
+    let transmission = transmission.as_slice()?.to_vec();
+    let detector_edges = detector_time_edges_us.as_slice()?.to_vec();
+    let result = py.detach(move || {
+        counts_response::two_arm_count_response(
+            &energies,
+            &fluence,
+            &transmission,
+            &detector_edges,
+            timing_offset_us,
+            &response,
+        )
+    });
+    let result = result.map_err(|error| {
+        pyo3::exceptions::PyValueError::new_err(format!("two-arm count response: {error}"))
+    })?;
+    Ok((
+        PyArray1::from_vec(py, result.open_beam),
+        PyArray1::from_vec(py, result.sample),
+    ))
+}
+
 /// Parse a Python-facing pixel-value policy string.
 ///
 /// Accepted values: ``"reject"`` (default — negative or non-finite pixels
@@ -4222,6 +4280,7 @@ fn nereids(m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_function(wrap_pyfunction!(resolution_broaden, m)?)?;
     m.add_function(wrap_pyfunction!(load_resolution, m)?)?;
     m.add_function(wrap_pyfunction!(py_apply_resolution, m)?)?;
+    m.add_function(wrap_pyfunction!(py_two_arm_count_response, m)?)?;
     m.add_function(wrap_pyfunction!(load_tiff_stack, m)?)?;
     m.add_function(wrap_pyfunction!(load_tiff_folder, m)?)?;
     m.add_function(wrap_pyfunction!(read_tof_sidecar, m)?)?;

@@ -946,6 +946,24 @@ def apply_resolution(
     """Apply tabulated resolution broadening to a spectrum."""
     ...
 
+def two_arm_count_response(
+    true_energies_ev: NDArray[np.float64],
+    incident_fluence_weights: NDArray[np.float64],
+    transmission: NDArray[np.float64],
+    detector_time_edges_us: NDArray[np.float64],
+    resolution: TabulatedResolution | IkedaCarpenter,
+    timing_offset_us: float = 0.0,
+) -> tuple[NDArray[np.float64], NDArray[np.float64]]:
+    """Predict open-beam and sample counts on detector-time bins.
+
+    ``incident_fluence_weights[j]`` is the incident flux density at true
+    energy ``j`` multiplied by the caller's energy-integration weight. The
+    validated response is applied to the open and attenuated sample arms
+    separately. Probability outside the supplied acquisition window is not
+    renormalized into that window.
+    """
+    ...
+
 def load_tiff_stack(
     path: str,
     pixel_policy: str = "reject",

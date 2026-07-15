@@ -31,6 +31,7 @@
 pub mod auxiliary_grid;
 pub mod channel;
 pub mod coulomb;
+pub mod counts_response;
 pub mod doppler;
 pub mod ikeda_carpenter;
 pub mod penetrability;
