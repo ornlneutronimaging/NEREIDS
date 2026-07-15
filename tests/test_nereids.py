@@ -554,6 +554,54 @@ class TestTabulatedKernelOrientation:
         )
 
 
+class TestTabulatedDetectorBins:
+    """The public tabulated-response API integrates the loaded UDR directly
+    into measured detector-time bins."""
+
+    TOF_FACTOR = 72.298254398292800
+    L = 25.0
+
+    @staticmethod
+    def _write_kernel(path):
+        path.write_text(
+            "\n".join(
+                [
+                    "synthetic asymmetric triangular response",
+                    "-----",
+                    "   2.50000e+001   0.00000e+000",
+                    "-1.0 0.0",
+                    "0.0 1.0",
+                    "2.0 0.0",
+                    "",
+                ]
+            )
+        )
+
+    def test_exact_bin_probabilities_without_window_renormalization(self, tmp_path):
+        kernel_path = tmp_path / "synthetic_exact_bins.txt"
+        self._write_kernel(kernel_path)
+        response = nereids.load_resolution(str(kernel_path), self.L)
+        arrival = self.TOF_FACTOR * self.L / np.sqrt(25.0)
+
+        probabilities = np.asarray(
+            response.detector_bin_probabilities(
+                25.0,
+                [arrival - 2.0, arrival - 1.0, arrival, arrival + 1.0],
+                0.0,
+            )
+        )
+
+        np.testing.assert_allclose(probabilities, [0.0, 1.0 / 3.0, 1.0 / 2.0])
+        assert probabilities.sum() == pytest.approx(5.0 / 6.0)
+
+    def test_invalid_flight_path_is_rejected_when_loading(self, tmp_path):
+        kernel_path = tmp_path / "synthetic_invalid_path.txt"
+        self._write_kernel(kernel_path)
+
+        with pytest.raises(ValueError, match="flight_path"):
+            nereids.load_resolution(str(kernel_path), float("nan"))
+
+
 class TestTabulatedKernelWidthInterpolation:
     """Regression for issue #632: kernel width between reference energies
     must follow the physical power law, not the arithmetic blend chord.

@@ -129,7 +129,9 @@
 //! applies its `psr_fwhm_ns` fold to the IC family only, never to
 //! tabulated/UDR kernels).
 
-use crate::resolution::{ResolutionParseError, TOF_FACTOR, TabulatedResolution};
+use crate::resolution::{
+    ResolutionParseError, TOF_FACTOR, TabulatedResolution, piecewise_linear_bin_probabilities,
+};
 
 /// de Broglie wavelength factor: λ (Å) = `LAMBDA_ANGSTROM_FACTOR` / √(E in eV).
 ///
@@ -711,7 +713,7 @@ impl IkedaCarpenter {
         }
 
         let (times, weights) = self.source_pulse_at(true_energy_ev)?;
-        sampled_bin_probabilities(&times, &weights, &relative_edges).ok_or_else(|| {
+        piecewise_linear_bin_probabilities(&times, &weights, &relative_edges).ok_or_else(|| {
             ResolutionParseError::InvalidFormat(format!(
                 "Ikeda–Carpenter pulse at E = {true_energy_ev} eV has zero sampled area"
             ))
@@ -905,48 +907,6 @@ fn synth_source_pulse(
     let offsets: Vec<f64> = (lo..=hi).map(|j| taus[j]).collect();
     let w: Vec<f64> = (lo..=hi).map(|j| weights[j] / peak_val).collect();
     Ok((offsets, w))
-}
-
-/// Integrate a sampled piecewise-linear density into the requested edges.
-fn sampled_bin_probabilities(times: &[f64], weights: &[f64], edges: &[f64]) -> Option<Vec<f64>> {
-    if times.len() < 2 || times.len() != weights.len() {
-        return None;
-    }
-
-    let mut cumulative = Vec::with_capacity(times.len());
-    cumulative.push(0.0);
-    for i in 0..times.len() - 1 {
-        let width = times[i + 1] - times[i];
-        let area = 0.5 * (weights[i] + weights[i + 1]) * width;
-        cumulative.push(cumulative[i] + area.max(0.0));
-    }
-    let total = *cumulative.last()?;
-    if !total.is_finite() || total <= 0.0 {
-        return None;
-    }
-
-    let cdf = |x: f64| -> f64 {
-        if x <= times[0] {
-            return 0.0;
-        }
-        if x >= times[times.len() - 1] {
-            return 1.0;
-        }
-        let hi = times.partition_point(|&time| time <= x);
-        let lo = hi - 1;
-        let width = times[hi] - times[lo];
-        let dx = x - times[lo];
-        let slope = (weights[hi] - weights[lo]) / width;
-        let partial = weights[lo] * dx + 0.5 * slope * dx * dx;
-        ((cumulative[lo] + partial) / total).clamp(0.0, 1.0)
-    };
-
-    Some(
-        edges
-            .windows(2)
-            .map(|edge| (cdf(edge[1]) - cdf(edge[0])).max(0.0))
-            .collect(),
-    )
 }
 
 /// Index of the maximum element (first on ties). Slice is non-empty by

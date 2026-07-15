@@ -319,6 +319,20 @@ class TabulatedResolution:
         """Number of points per kernel."""
         ...
 
+    def detector_bin_probabilities(
+        self,
+        true_energy_ev: float,
+        detector_time_edges_us: list[float],
+        timing_offset_us: float,
+    ) -> list[float]:
+        """Probability in each adjacent detector-time bin.
+
+        The loaded tabulated response is evaluated at ``true_energy_ev``.
+        Probability outside the supplied time window is not renormalized into
+        the window.
+        """
+        ...
+
 class EnergyLaw:
     """Energy-dependence law for an Ikeda-Carpenter parameter.
 

@@ -895,6 +895,75 @@ fn trapezoidal_moments(offsets: &[f64], weights: &[f64]) -> (f64, f64) {
     (centroid, sigma)
 }
 
+/// Integrate a sampled probability distribution into adjacent requested
+/// edges. A one-point kernel is treated as a delta mass at that point; longer
+/// kernels are piecewise-linear densities.
+///
+/// The density is normalized over its complete supplied support.  The result
+/// is deliberately not renormalized to `edges`: a requested detector window
+/// that covers only part of the pulse therefore sums to less than one.
+pub(crate) fn piecewise_linear_bin_probabilities(
+    times: &[f64],
+    weights: &[f64],
+    edges: &[f64],
+) -> Option<Vec<f64>> {
+    if times.is_empty() || times.len() != weights.len() {
+        return None;
+    }
+
+    if times.len() == 1 {
+        if !times[0].is_finite() || !weights[0].is_finite() || weights[0] <= 0.0 {
+            return None;
+        }
+        let mut probabilities = vec![0.0; edges.len().saturating_sub(1)];
+        for (index, edge) in edges.windows(2).enumerate() {
+            let in_bin = edge[0] <= times[0]
+                && (times[0] < edge[1]
+                    || (index + 1 == probabilities.len() && times[0] == edge[1]));
+            if in_bin {
+                probabilities[index] = 1.0;
+                break;
+            }
+        }
+        return Some(probabilities);
+    }
+
+    let mut cumulative = Vec::with_capacity(times.len());
+    cumulative.push(0.0);
+    for i in 0..times.len() - 1 {
+        let width = times[i + 1] - times[i];
+        let area = 0.5 * (weights[i] + weights[i + 1]) * width;
+        cumulative.push(cumulative[i] + area.max(0.0));
+    }
+    let total = *cumulative.last()?;
+    if !total.is_finite() || total <= 0.0 {
+        return None;
+    }
+
+    let cdf = |x: f64| -> f64 {
+        if x <= times[0] {
+            return 0.0;
+        }
+        if x >= times[times.len() - 1] {
+            return 1.0;
+        }
+        let hi = times.partition_point(|&time| time <= x);
+        let lo = hi - 1;
+        let width = times[hi] - times[lo];
+        let dx = x - times[lo];
+        let slope = (weights[hi] - weights[lo]) / width;
+        let partial = weights[lo] * dx + 0.5 * slope * dx * dx;
+        ((cumulative[lo] + partial) / total).clamp(0.0, 1.0)
+    };
+
+    Some(
+        edges
+            .windows(2)
+            .map(|edge| (cdf(edge[1]) - cdf(edge[0])).max(0.0))
+            .collect(),
+    )
+}
+
 impl TabulatedResolution {
     /// Reference energies (eV), sorted ascending.
     pub fn ref_energies(&self) -> &[f64] {
@@ -910,6 +979,67 @@ impl TabulatedResolution {
     /// Flight path length in meters (needed for TOF↔energy conversion).
     pub fn flight_path_m(&self) -> f64 {
         self.flight_path_m
+    }
+
+    /// Probability that a neutron of known true energy is recorded in each
+    /// supplied detector-time bin.
+    ///
+    /// The tabulated pulse is selected and interpolated at `true_energy_ev`.
+    /// Its offsets are relative to the reference pulse mode, so the nominal
+    /// arrival is `timing_offset_us + TOF_FACTOR * flight_path_m / sqrt(E)`.
+    /// `timing_offset_us` is the effective clock/energy-axis offset calibrated
+    /// for the measurement; this method does not invent an absolute moderator
+    /// emission time that is absent from a mode-centred UDR file.
+    ///
+    /// The returned vector has one entry per adjacent edge pair and is not
+    /// renormalized to the supplied window.  Probability outside the measured
+    /// window remains outside it.
+    ///
+    /// # Errors
+    /// Returns [`ResolutionParseError::InvalidFormat`] unless the true energy
+    /// is positive and finite, the timing offset is finite, and at least two
+    /// finite bin edges are supplied in strictly increasing order.  It also
+    /// fails if the interpolated tabulated pulse has zero area.
+    pub fn detector_bin_probabilities(
+        &self,
+        true_energy_ev: f64,
+        detector_time_edges_us: &[f64],
+        timing_offset_us: f64,
+    ) -> Result<Vec<f64>, ResolutionParseError> {
+        if !true_energy_ev.is_finite() || true_energy_ev <= 0.0 {
+            return Err(ResolutionParseError::InvalidFormat(format!(
+                "true energy must be positive and finite, got {true_energy_ev}"
+            )));
+        }
+        if !timing_offset_us.is_finite() {
+            return Err(ResolutionParseError::InvalidFormat(format!(
+                "timing_offset_us must be finite, got {timing_offset_us}"
+            )));
+        }
+        if detector_time_edges_us.len() < 2
+            || detector_time_edges_us.iter().any(|edge| !edge.is_finite())
+            || detector_time_edges_us
+                .windows(2)
+                .any(|edge| edge[0] >= edge[1])
+        {
+            return Err(ResolutionParseError::InvalidFormat(
+                "detector time edges must contain at least two finite, strictly increasing values"
+                    .to_string(),
+            ));
+        }
+
+        let nominal_arrival =
+            timing_offset_us + TOF_FACTOR * self.flight_path_m / true_energy_ev.sqrt();
+        let relative_edges: Vec<f64> = detector_time_edges_us
+            .iter()
+            .map(|edge| edge - nominal_arrival)
+            .collect();
+        let (times, weights) = self.interpolated_kernel(true_energy_ev);
+        piecewise_linear_bin_probabilities(&times, &weights, &relative_edges).ok_or_else(|| {
+            ResolutionParseError::InvalidFormat(format!(
+                "tabulated resolution at E = {true_energy_ev} eV has zero sampled area"
+            ))
+        })
     }
 
     /// Width-corrected copy of this tabulated kernel.
@@ -1698,6 +1828,11 @@ impl TabulatedResolution {
     /// * `text` — File contents as a string.
     /// * `flight_path_m` — Flight path length in meters.
     pub fn from_text(text: &str, flight_path_m: f64) -> Result<Self, ResolutionParseError> {
+        if !flight_path_m.is_finite() || flight_path_m <= 0.0 {
+            return Err(ResolutionParseError::InvalidFormat(format!(
+                "Flight path must be positive and finite, got {flight_path_m}"
+            )));
+        }
         let mut lines = text.lines();
 
         // Skip header and separator
@@ -1861,15 +1996,21 @@ impl TabulatedResolution {
     /// offsets/weights.
     ///
     /// # Errors
-    /// Returns [`ResolutionParseError::InvalidFormat`] if the reference
-    /// energies are empty / not strictly ascending, if the energy and kernel
-    /// counts differ, if any kernel is empty, if a kernel's offset and weight
-    /// vectors differ in length, or if any offset/weight is non-finite.
+    /// Returns [`ResolutionParseError::InvalidFormat`] if the flight path is
+    /// not positive and finite, if the reference energies are empty / not
+    /// strictly ascending, if the energy and kernel counts differ, if any
+    /// kernel is empty, if a kernel's offset and weight vectors differ in
+    /// length, or if any offset/weight is non-finite.
     pub fn from_kernels(
         ref_energies: Vec<f64>,
         kernels: Vec<(Vec<f64>, Vec<f64>)>,
         flight_path_m: f64,
     ) -> Result<Self, ResolutionParseError> {
+        if !flight_path_m.is_finite() || flight_path_m <= 0.0 {
+            return Err(ResolutionParseError::InvalidFormat(format!(
+                "Flight path must be positive and finite, got {flight_path_m}"
+            )));
+        }
         if ref_energies.is_empty() {
             return Err(ResolutionParseError::InvalidFormat(
                 "No reference energies provided".into(),
