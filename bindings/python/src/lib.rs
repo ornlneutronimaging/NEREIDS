@@ -869,6 +869,20 @@ impl PyIkedaCarpenter {
             .map_err(|e| pyo3::exceptions::PyValueError::new_err(e.to_string()))
     }
 
+    /// Probability that a neutron at one true energy is recorded in each
+    /// adjacent detector-time bin. The result is not renormalized when the
+    /// supplied time window omits part of the pulse.
+    fn detector_bin_probabilities(
+        &self,
+        true_energy_ev: f64,
+        detector_time_edges_us: Vec<f64>,
+        timing_offset_us: f64,
+    ) -> PyResult<Vec<f64>> {
+        self.inner
+            .detector_bin_probabilities(true_energy_ev, &detector_time_edges_us, timing_offset_us)
+            .map_err(|e| pyo3::exceptions::PyValueError::new_err(e.to_string()))
+    }
+
     /// Flight path length in meters.
     #[getter]
     fn flight_path_m(&self) -> f64 {

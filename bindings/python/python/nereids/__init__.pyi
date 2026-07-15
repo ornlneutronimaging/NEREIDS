@@ -385,6 +385,19 @@ class IkedaCarpenter:
         """
         ...
 
+    def detector_bin_probabilities(
+        self,
+        true_energy_ev: float,
+        detector_time_edges_us: list[float],
+        timing_offset_us: float,
+    ) -> list[float]:
+        """Probability in each detector-time bin for one true energy.
+
+        The probabilities are not renormalized when the supplied time window
+        omits part of the pulse.
+        """
+        ...
+
     @property
     def flight_path_m(self) -> float:
         """Flight path length in meters."""
