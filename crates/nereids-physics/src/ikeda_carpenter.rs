@@ -388,8 +388,8 @@ impl EnergyLaw {
 pub struct IkedaCarpenterParams {
     /// Fast (slowing-down) rate `α(E)`, 1/µs. Must evaluate to > 0.
     pub alpha: EnergyLaw,
-    /// Slow (storage) rate `β`, 1/µs. Energy-independent, must be > 0.
-    pub beta: f64,
+    /// Slow (storage) rate `β(E)`, 1/µs. Must evaluate to > 0.
+    pub beta: EnergyLaw,
     /// Storage mixing fraction `R(E)`, 0 ≤ R ≤ 1.
     pub r: EnergyLaw,
     /// Optional proton-burst Gaussian standard deviation (µs).
@@ -405,7 +405,7 @@ impl IkedaCarpenterParams {
     pub fn constant(alpha: f64, beta: f64, r: f64) -> Self {
         Self {
             alpha: EnergyLaw::Const(alpha),
-            beta,
+            beta: EnergyLaw::Const(beta),
             r: EnergyLaw::Const(r),
             burst_sigma_us: None,
             channel_fwhm_us: None,
@@ -471,7 +471,7 @@ impl IkedaCarpenter {
     /// # Errors
     /// Returns [`ResolutionParseError::InvalidFormat`] for a non-positive
     /// flight path, a degenerate grid (`n_energies < 2`, `n_tau < 8`,
-    /// `e_min ≤ 0`, `e_max ≤ e_min`), a non-positive `β`, a parameter/grid
+    /// `e_min ≤ 0`, `e_max ≤ e_min`), a non-positive `β(E)`, a parameter/grid
     /// combination whose τ-grid cannot resolve the prompt core and requested
     /// folds within the `MAX_TAU_SAMPLES` cap at some reference energy (see
     /// `tau_geometry` — remedy: larger `β`, `R = 0`, or a wider/disabled
@@ -509,13 +509,6 @@ impl IkedaCarpenter {
                 grid.e_min_ev, grid.e_max_ev
             )));
         }
-        if !params.beta.is_finite() || params.beta <= 0.0 {
-            return Err(ResolutionParseError::InvalidFormat(format!(
-                "beta must be a positive finite number, got {}",
-                params.beta
-            )));
-        }
-
         let ln_lo = grid.e_min_ev.ln();
         let ln_hi = grid.e_max_ev.ln();
         let denom = (grid.n_energies - 1) as f64;
@@ -533,6 +526,18 @@ impl IkedaCarpenter {
             return Err(ResolutionParseError::InvalidFormat(format!(
                 "Ikeda–Carpenter α(E) must be > 0, but α({bad}) = {} is not",
                 params.alpha.eval(bad)
+            )));
+        }
+        // β is a rate, so every synthesized reference energy must give a
+        // positive finite value. Reject invalid laws instead of clamping them
+        // into a different pulse.
+        if let Some(&bad) = ref_energies.iter().find(|&&e| {
+            let beta = params.beta.eval(e);
+            !beta.is_finite() || beta <= 0.0
+        }) {
+            return Err(ResolutionParseError::InvalidFormat(format!(
+                "Ikeda–Carpenter β(E) must be > 0, but β({bad}) = {} is not",
+                params.beta.eval(bad)
             )));
         }
         // Reject storage-fraction laws that fall outside [0, 1] (synthesis clamps
@@ -613,13 +618,14 @@ impl IkedaCarpenter {
     /// convention.
     ///
     /// # Errors
-    /// Returns [`ResolutionParseError::InvalidFormat`] when the τ-grid cannot
-    /// resolve the prompt core and requested folds within `MAX_TAU_SAMPLES`
-    /// at this energy. Construction validates every *reference* energy, but a
-    /// probe energy outside `[e_min, e_max]` — for the √E law, above `e_max`,
-    /// where the larger α(E) imposes a finer prompt resolution floor against
-    /// the same storage-tail span — can still leave the resolvable region.
+    /// Returns [`ResolutionParseError::InvalidFormat`] when the requested
+    /// energy or an energy-dependent rate/fraction is non-physical, or when
+    /// the τ-grid cannot resolve the prompt core and requested folds within
+    /// `MAX_TAU_SAMPLES` at this energy. Construction validates every
+    /// *reference* energy, but a probe outside `[e_min, e_max]` can still leave
+    /// the physical or resolvable region.
     pub fn kernel_at(&self, energy_ev: f64) -> Result<(Vec<f64>, Vec<f64>), ResolutionParseError> {
+        self.validate_probe_energy(energy_ev)?;
         synth_kernel(&self.params, self.n_tau, energy_ev)
     }
 
@@ -694,13 +700,12 @@ impl IkedaCarpenter {
             && self.params.channel_fwhm_us.unwrap_or(0.0) == 0.0
         {
             let alpha = self.params.alpha.eval(true_energy_ev);
+            let beta = self.params.beta.eval(true_energy_ev);
             let r = self.params.r.eval(true_energy_ev);
             return Ok(relative_edges
                 .windows(2)
                 .map(|edge| {
-                    (ic_cdf(alpha, self.params.beta, r, edge[1])
-                        - ic_cdf(alpha, self.params.beta, r, edge[0]))
-                    .max(0.0)
+                    (ic_cdf(alpha, beta, r, edge[1]) - ic_cdf(alpha, beta, r, edge[0])).max(0.0)
                 })
                 .collect());
         }
@@ -720,10 +725,16 @@ impl IkedaCarpenter {
             )));
         }
         let alpha = self.params.alpha.eval(energy_ev);
+        let beta = self.params.beta.eval(energy_ev);
         let r = self.params.r.eval(energy_ev);
         if !alpha.is_finite() || alpha <= 0.0 {
             return Err(ResolutionParseError::InvalidFormat(format!(
                 "Ikeda–Carpenter alpha({energy_ev}) must be positive and finite, got {alpha}"
+            )));
+        }
+        if !beta.is_finite() || beta <= 0.0 {
+            return Err(ResolutionParseError::InvalidFormat(format!(
+                "Ikeda–Carpenter beta({energy_ev}) must be positive and finite, got {beta}"
             )));
         }
         if !r.is_finite() || !(0.0..=1.0).contains(&r) {
@@ -846,7 +857,7 @@ fn synth_source_pulse(
     energy_ev: f64,
 ) -> Result<(Vec<f64>, Vec<f64>), ResolutionParseError> {
     let alpha = params.alpha.eval(energy_ev).max(MIN_RATE);
-    let beta = params.beta.max(MIN_RATE);
+    let beta = params.beta.eval(energy_ev).max(MIN_RATE);
     let r = params.r.eval(energy_ev).clamp(0.0, 1.0);
 
     let (dtau, tau_max, margin) = tau_geometry(params, n_tau, alpha, beta, r).map_err(|msg| {
@@ -1111,7 +1122,7 @@ mod tests {
         // The synthesized kernel must contain no non-finite entries.
         let p = IkedaCarpenterParams {
             alpha: EnergyLaw::Const(0.05),
-            beta: 4.0,
+            beta: EnergyLaw::Const(4.0),
             r: EnergyLaw::Const(0.5),
             burst_sigma_us: None,
             channel_fwhm_us: None,
@@ -1188,7 +1199,7 @@ mod tests {
         // α(E) ∝ √E ⇒ prompt width 1/α shrinks with E ⇒ smaller TOF support.
         let p = IkedaCarpenterParams {
             alpha: EnergyLaw::SqrtE { a0: 0.3, a1: 0.0 },
-            beta: 0.1,
+            beta: EnergyLaw::Const(0.1),
             r: EnergyLaw::Const(0.0),
             burst_sigma_us: None,
             channel_fwhm_us: None,

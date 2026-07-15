@@ -70,7 +70,7 @@ fn energy_law_is_evaluated_at_true_energy() {
     let flight_path_m = 25.0;
     let params = IkedaCarpenterParams {
         alpha: EnergyLaw::SqrtE { a0: 1.0, a1: 0.0 },
-        beta: 0.1,
+        beta: EnergyLaw::Const(0.1),
         r: EnergyLaw::Const(0.0),
         burst_sigma_us: None,
         channel_fwhm_us: None,
@@ -91,6 +91,63 @@ fn energy_law_is_evaluated_at_true_energy() {
             "E={true_energy_ev} eV used the wrong pulse: {got:.16e} != {want:.16e}"
         );
     }
+}
+
+#[test]
+fn moderator_rates_that_follow_neutron_speed_preserve_scaled_pulse_time() {
+    let flight_path_m = 25.0;
+    let params = IkedaCarpenterParams {
+        alpha: EnergyLaw::SqrtE { a0: 2.0, a1: 0.0 },
+        beta: EnergyLaw::SqrtE { a0: 0.5, a1: 0.0 },
+        r: EnergyLaw::Const(0.3),
+        burst_sigma_us: None,
+        channel_fwhm_us: None,
+    };
+    let model = IkedaCarpenter::new(params, flight_path_m, &SynthesisGrid::new(1.0, 4.0))
+        .expect("valid speed-scaled IC model");
+
+    let probability_to_scaled_delay = |energy_ev: f64, delay_us: f64| {
+        let arrival = TOF_FACTOR * flight_path_m / energy_ev.sqrt();
+        model
+            .detector_bin_probabilities(energy_ev, &[arrival, arrival + delay_us], 0.0)
+            .expect("valid detector bin")[0]
+    };
+
+    let at_one_ev = probability_to_scaled_delay(1.0, 2.0);
+    let at_four_ev = probability_to_scaled_delay(4.0, 1.0);
+    assert!(
+        (at_one_ev - at_four_ev).abs() < 2e-12,
+        "speed-scaled moderator pulse changed shape: {at_one_ev:.16e} != {at_four_ev:.16e}"
+    );
+}
+
+#[test]
+fn probe_outside_synthesis_range_rejects_nonphysical_beta_law() {
+    let model = IkedaCarpenter::new(
+        IkedaCarpenterParams {
+            alpha: EnergyLaw::Const(1.0),
+            beta: EnergyLaw::SqrtE { a0: -1.0, a1: 2.0 },
+            r: EnergyLaw::Const(0.3),
+            burst_sigma_us: None,
+            channel_fwhm_us: None,
+        },
+        25.0,
+        &SynthesisGrid::new(1.0, 2.0),
+    )
+    .expect("beta law is physical inside the synthesis range");
+
+    let legacy_error = model
+        .kernel_at(9.0)
+        .expect_err("legacy kernel probe must reject a negative beta law")
+        .to_string();
+    assert!(
+        legacy_error.contains("beta(9)"),
+        "legacy kernel probe hid the invalid beta law behind: {legacy_error}"
+    );
+    assert!(
+        model.source_pulse_at(9.0).is_err(),
+        "physical source probe must reject a negative beta law"
+    );
 }
 
 #[test]

@@ -371,6 +371,7 @@ class IkedaCarpenter:
         n_tau: int = 600,
         burst_sigma_us: float | None = None,
         channel_fwhm_us: float | None = None,
+        beta_law: EnergyLaw | None = None,
     ) -> None: ...
     def as_tabulated(self) -> TabulatedResolution:
         """The synthesized tabulated kernel (usable as a resolution file)."""

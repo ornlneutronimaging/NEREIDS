@@ -775,9 +775,11 @@ impl PyEnergyLaw {
 /// the *same* broadening path as a Monte-Carlo file, so the IC-vs-tabulated
 /// comparison differs only in kernel source.
 ///
-/// Parameters: `alpha`/`r` are [`EnergyLaw`]s (fixed-or-fit general case),
-/// `beta` (1/µs) is the storage rate; optional `burst_sigma_us` (Gaussian) and
-/// `channel_fwhm_us` (triangle) fold in the proton-burst and chopper terms.
+/// Parameters: `alpha`/`r` are [`EnergyLaw`]s (fixed-or-fit general case).
+/// `beta` keeps the original constant-rate API; the optional trailing
+/// `beta_law` overrides it with an energy-dependent rate. Optional
+/// `burst_sigma_us` (Gaussian) and `channel_fwhm_us` (triangle) fold in the
+/// proton-burst and chopper terms.
 #[pyclass(name = "IkedaCarpenter", skip_from_py_object)]
 #[derive(Clone)]
 struct PyIkedaCarpenter {
@@ -798,6 +800,7 @@ impl PyIkedaCarpenter {
         n_tau = 600,
         burst_sigma_us = None,
         channel_fwhm_us = None,
+        beta_law = None,
     ))]
     #[allow(clippy::too_many_arguments)]
     fn new(
@@ -811,6 +814,7 @@ impl PyIkedaCarpenter {
         n_tau: usize,
         burst_sigma_us: Option<f64>,
         channel_fwhm_us: Option<f64>,
+        beta_law: Option<PyEnergyLaw>,
     ) -> PyResult<Self> {
         for (name, v) in [
             ("burst_sigma_us", burst_sigma_us),
@@ -826,7 +830,7 @@ impl PyIkedaCarpenter {
         }
         let params = IkedaCarpenterParams {
             alpha: alpha.inner,
-            beta,
+            beta: beta_law.map_or(EnergyLaw::Const(beta), |law| law.inner),
             r: r.inner,
             burst_sigma_us,
             channel_fwhm_us,
@@ -1381,7 +1385,9 @@ impl PyResolutionCalibration {
                         d.set_item("a0", *a0)?;
                         d.set_item("a1", *a1)?;
                     }
-                    d.set_item("beta", p.beta)?;
+                    if let EnergyLaw::Const(beta) = p.beta {
+                        d.set_item("beta", beta)?;
+                    }
                     if let EnergyLaw::Const(r) = &p.r {
                         d.set_item("r", *r)?;
                     }
