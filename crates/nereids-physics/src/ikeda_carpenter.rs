@@ -129,7 +129,7 @@
 //! applies its `psr_fwhm_ns` fold to the IC family only, never to
 //! tabulated/UDR kernels).
 
-use crate::resolution::{ResolutionParseError, TabulatedResolution};
+use crate::resolution::{ResolutionParseError, TOF_FACTOR, TabulatedResolution};
 
 /// de Broglie wavelength factor: λ (Å) = `LAMBDA_ANGSTROM_FACTOR` / √(E in eV).
 ///
@@ -263,6 +263,73 @@ pub fn ic_pulse(alpha: f64, beta: f64, r: f64, tau: f64) -> f64 {
         coeff * bracket / (u * u * u)
     };
     (1.0 - r) * fast + r * slow
+}
+
+/// Cumulative probability of the Ikeda–Carpenter moderator pulse.
+///
+/// Returns `P(U <= tau)` for moderator delay `U`. `tau` is in µs and rates
+/// are in 1/µs. The prompt term is the Gamma(3, α) cumulative distribution;
+/// the storage term is the cumulative distribution of Gamma(3, α) plus an
+/// independent exponential delay with rate β.
+///
+/// The expression is evaluated without subtracting nearly equal exponentials
+/// when `α ≈ β`. This is the bin-integral companion to [`ic_pulse`].
+#[must_use]
+pub fn ic_cdf(alpha: f64, beta: f64, r: f64, tau: f64) -> f64 {
+    if tau.is_nan() || tau <= 0.0 {
+        return 0.0;
+    }
+    if tau == f64::INFINITY {
+        return 1.0;
+    }
+    if !tau.is_finite() {
+        return 0.0;
+    }
+
+    let alpha = alpha.max(MIN_RATE);
+    let beta = beta.max(MIN_RATE);
+    let at = alpha * tau;
+    let fast = gamma3_cdf(at);
+    if r <= 0.0 {
+        return fast;
+    }
+
+    // The storage CDF is the prompt CDF minus the positive survival
+    // correction below. Written this way, the α=β limit is Gamma(4, α).
+    let u = (alpha - beta) * tau;
+    let correction = if u.abs() < 0.05 {
+        at.powi(3) * (-beta * tau).exp() * h_over_cube_taylor(u)
+    } else {
+        // Bounded form: neither exponential can overflow even when β >> α.
+        let bracket = (-beta * tau).exp() - (-alpha * tau).exp() * (1.0 + u + 0.5 * u * u);
+        at.powi(3) * bracket / u.powi(3)
+    };
+    (fast - r * correction).clamp(0.0, 1.0)
+}
+
+/// Gamma(3, rate=1) cumulative distribution at dimensionless time `x`.
+fn gamma3_cdf(x: f64) -> f64 {
+    if x <= 0.0 {
+        return 0.0;
+    }
+    if x < 0.5 {
+        // Integral of x² exp(-x) / 2 as an alternating series. The direct
+        // `1 - exp(-x)(1+x+x²/2)` loses most digits for small x.
+        let mut n = 0_u32;
+        let mut term = x.powi(3) / 6.0;
+        let mut sum = term;
+        loop {
+            let n_f = f64::from(n);
+            term *= -x * (n_f + 3.0) / ((n_f + 1.0) * (n_f + 4.0));
+            let next = sum + term;
+            n += 1;
+            if next == sum || n >= 128 {
+                return next.clamp(0.0, 1.0);
+            }
+            sum = next;
+        }
+    }
+    (1.0 - (-x).exp() * (1.0 + x + 0.5 * x * x)).clamp(0.0, 1.0)
 }
 
 /// Energy-dependence law for an Ikeda–Carpenter parameter.
@@ -555,6 +622,117 @@ impl IkedaCarpenter {
     pub fn kernel_at(&self, energy_ev: f64) -> Result<(Vec<f64>, Vec<f64>), ResolutionParseError> {
         synth_kernel(&self.params, self.n_tau, energy_ev)
     }
+
+    /// Evaluate the physical source pulse at one true neutron energy.
+    ///
+    /// Returns sampled moderator-delay coordinates in µs and peak-normalized
+    /// densities. Unlike [`Self::kernel_at`], this method does not move the
+    /// pulse mode to zero. With no symmetric proton/channel fold, the delay is
+    /// causal and starts at zero. A symmetric fold may extend the sampled
+    /// support below zero relative to its stated time origin.
+    ///
+    /// # Errors
+    /// Returns [`ResolutionParseError::InvalidFormat`] if `energy_ev` is not a
+    /// positive finite true energy, if an energy law is unphysical at that
+    /// energy, or if the requested pulse cannot be resolved by the configured
+    /// sampling limits.
+    pub fn source_pulse_at(
+        &self,
+        energy_ev: f64,
+    ) -> Result<(Vec<f64>, Vec<f64>), ResolutionParseError> {
+        self.validate_probe_energy(energy_ev)?;
+        synth_source_pulse(&self.params, self.n_tau, energy_ev)
+    }
+
+    /// Probability that a neutron of known true energy is recorded in each
+    /// supplied detector-time bin.
+    ///
+    /// `detector_time_edges_us` are the actual measured bin edges. The nominal
+    /// arrival time is
+    /// `timing_offset_us + TOF_FACTOR * flight_path_m / sqrt(true_energy_ev)`.
+    /// `timing_offset_us` represents the shared clock/detector offset; it does
+    /// not absorb or remove the moderator pulse's physical mode.
+    ///
+    /// The returned vector has one entry per adjacent edge pair and is not
+    /// renormalized to the supplied window: bins that do not cover the full
+    /// pulse correctly sum to less than one.
+    ///
+    /// # Errors
+    /// Returns [`ResolutionParseError::InvalidFormat`] unless the true energy
+    /// is physical, the timing offset is finite, and at least two finite bin
+    /// edges are supplied in strictly increasing order.
+    pub fn detector_bin_probabilities(
+        &self,
+        true_energy_ev: f64,
+        detector_time_edges_us: &[f64],
+        timing_offset_us: f64,
+    ) -> Result<Vec<f64>, ResolutionParseError> {
+        self.validate_probe_energy(true_energy_ev)?;
+        if !timing_offset_us.is_finite() {
+            return Err(ResolutionParseError::InvalidFormat(format!(
+                "timing_offset_us must be finite, got {timing_offset_us}"
+            )));
+        }
+        if detector_time_edges_us.len() < 2
+            || detector_time_edges_us.iter().any(|x| !x.is_finite())
+            || detector_time_edges_us.windows(2).any(|w| w[0] >= w[1])
+        {
+            return Err(ResolutionParseError::InvalidFormat(
+                "detector time edges must contain at least two finite, strictly increasing values"
+                    .to_string(),
+            ));
+        }
+
+        let nominal_arrival =
+            timing_offset_us + TOF_FACTOR * self.flight_path_m / true_energy_ev.sqrt();
+        let relative_edges: Vec<f64> = detector_time_edges_us
+            .iter()
+            .map(|edge| edge - nominal_arrival)
+            .collect();
+
+        if self.params.burst_sigma_us.unwrap_or(0.0) == 0.0
+            && self.params.channel_fwhm_us.unwrap_or(0.0) == 0.0
+        {
+            let alpha = self.params.alpha.eval(true_energy_ev);
+            let r = self.params.r.eval(true_energy_ev);
+            return Ok(relative_edges
+                .windows(2)
+                .map(|edge| {
+                    (ic_cdf(alpha, self.params.beta, r, edge[1])
+                        - ic_cdf(alpha, self.params.beta, r, edge[0]))
+                    .max(0.0)
+                })
+                .collect());
+        }
+
+        let (times, weights) = self.source_pulse_at(true_energy_ev)?;
+        sampled_bin_probabilities(&times, &weights, &relative_edges).ok_or_else(|| {
+            ResolutionParseError::InvalidFormat(format!(
+                "Ikeda–Carpenter pulse at E = {true_energy_ev} eV has zero sampled area"
+            ))
+        })
+    }
+
+    fn validate_probe_energy(&self, energy_ev: f64) -> Result<(), ResolutionParseError> {
+        if !energy_ev.is_finite() || energy_ev <= 0.0 {
+            return Err(ResolutionParseError::InvalidFormat(format!(
+                "true energy must be positive and finite, got {energy_ev}"
+            )));
+        }
+        let alpha = self.params.alpha.eval(energy_ev);
+        let r = self.params.r.eval(energy_ev);
+        if !alpha.is_finite() || alpha <= 0.0 {
+            return Err(ResolutionParseError::InvalidFormat(format!(
+                "Ikeda–Carpenter alpha({energy_ev}) must be positive and finite, got {alpha}"
+            )));
+        }
+        if !r.is_finite() || !(0.0..=1.0).contains(&r) {
+            return Err(ResolutionParseError::InvalidFormat(format!(
+                "Ikeda–Carpenter R({energy_ev}) must be in [0, 1], got {r}"
+            )));
+        }
+        Ok(())
+    }
 }
 
 /// τ-grid geometry for one kernel: `(dtau, tau_max, margin)`, or a
@@ -653,6 +831,20 @@ fn synth_kernel(
     n_tau: usize,
     energy_ev: f64,
 ) -> Result<(Vec<f64>, Vec<f64>), ResolutionParseError> {
+    let (mut offsets, weights) = synth_source_pulse(params, n_tau, energy_ev)?;
+    let peak_time = offsets[argmax(&weights)];
+    for offset in &mut offsets {
+        *offset -= peak_time;
+    }
+    Ok((offsets, weights))
+}
+
+/// Synthesize one physical-time source pulse without moving its mode.
+fn synth_source_pulse(
+    params: &IkedaCarpenterParams,
+    n_tau: usize,
+    energy_ev: f64,
+) -> Result<(Vec<f64>, Vec<f64>), ResolutionParseError> {
     let alpha = params.alpha.eval(energy_ev).max(MIN_RATE);
     let beta = params.beta.max(MIN_RATE);
     let r = params.r.eval(energy_ev).clamp(0.0, 1.0);
@@ -684,10 +876,8 @@ fn synth_kernel(
         weights = convolve_same(&weights, &triangle_kernel(dtau, fwhm));
     }
 
-    // Anchor the mode at offset 0.
     let peak_idx = argmax(&weights);
     let peak_val = weights[peak_idx].max(f64::MIN_POSITIVE);
-    let tau_peak = taus[peak_idx];
 
     // Trim tails below TRIM_REL of peak, keeping one guard sample each side so
     // the convolution's neighbor-difference trapezoid widths stay defined.
@@ -701,9 +891,51 @@ fn synth_kernel(
         .rposition(|&w| w > thresh)
         .map_or(weights.len() - 1, |i| (i + 1).min(weights.len() - 1));
 
-    let offsets: Vec<f64> = (lo..=hi).map(|j| taus[j] - tau_peak).collect();
+    let offsets: Vec<f64> = (lo..=hi).map(|j| taus[j]).collect();
     let w: Vec<f64> = (lo..=hi).map(|j| weights[j] / peak_val).collect();
     Ok((offsets, w))
+}
+
+/// Integrate a sampled piecewise-linear density into the requested edges.
+fn sampled_bin_probabilities(times: &[f64], weights: &[f64], edges: &[f64]) -> Option<Vec<f64>> {
+    if times.len() < 2 || times.len() != weights.len() {
+        return None;
+    }
+
+    let mut cumulative = Vec::with_capacity(times.len());
+    cumulative.push(0.0);
+    for i in 0..times.len() - 1 {
+        let width = times[i + 1] - times[i];
+        let area = 0.5 * (weights[i] + weights[i + 1]) * width;
+        cumulative.push(cumulative[i] + area.max(0.0));
+    }
+    let total = *cumulative.last()?;
+    if !total.is_finite() || total <= 0.0 {
+        return None;
+    }
+
+    let cdf = |x: f64| -> f64 {
+        if x <= times[0] {
+            return 0.0;
+        }
+        if x >= times[times.len() - 1] {
+            return 1.0;
+        }
+        let hi = times.partition_point(|&time| time <= x);
+        let lo = hi - 1;
+        let width = times[hi] - times[lo];
+        let dx = x - times[lo];
+        let slope = (weights[hi] - weights[lo]) / width;
+        let partial = weights[lo] * dx + 0.5 * slope * dx * dx;
+        ((cumulative[lo] + partial) / total).clamp(0.0, 1.0)
+    };
+
+    Some(
+        edges
+            .windows(2)
+            .map(|edge| (cdf(edge[1]) - cdf(edge[0])).max(0.0))
+            .collect(),
+    )
 }
 
 /// Index of the maximum element (first on ties). Slice is non-empty by
