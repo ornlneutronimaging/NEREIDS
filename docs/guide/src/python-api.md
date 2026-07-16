@@ -138,6 +138,85 @@ input energy grid. Pass either `isotopes=[(ResonanceData, density), ...]` or
 enabled by the `flight_path_m`, `delta_t_us`, and `delta_l_m` parameters.
 Tabulated resolution can be supplied with `resolution=load_resolution(...)`.
 
+### Exact Two-Arm Count Response
+
+```python
+open_signal, sample_signal = nereids.two_arm_count_response(
+    true_energies_ev,
+    incident_fluence_weights,
+    transmission,
+    detector_time_edges_us,
+    resolution,
+)
+```
+
+`two_arm_count_response(...)` applies the instrument response separately to
+the incident spectrum and to the attenuated sample spectrum. It returns the
+numerator and denominator needed to form the physical ratio
+`response(flux * transmission) / response(flux)` without broadening a
+transmission ratio directly. The fluence array must already include the
+energy-integration weights. The result uses detector-time bins; probability
+falling outside the supplied acquisition window is not silently moved back
+into it. Both arrays are predictions for the same reference exposure. Scale
+them to the measured proton charge, live time, or other documented exposure of
+each complete acquisition before comparing them with observed counts.
+
+### Independently Measured Count Backgrounds
+
+```python
+background_fit = nereids.fit_two_arm_background_templates(
+    observed_open_counts,
+    observed_sample_counts,
+    open_signal,
+    sample_signal,
+    open_exposure_scale,
+    sample_exposure_scale,
+    ["blocked_beam"],
+    open_background_templates,
+    sample_background_templates,
+    initial_amplitudes,
+)
+```
+
+Each row of the two template matrices is a fixed detector-bin shape from an
+independent measurement such as blocked-beam or detector-only data. NEREIDS
+fits only a non-negative amplitude and returns all three pieces for each arm:
+the fixed neutron signal, the fitted background, and their exact total. This
+count background is added after the neutron response and is not the SAMMY
+transmission background. The code does not generate a flexible residual curve
+or establish template provenance; callers must retain the independent source
+record. `open_exposure_scale` and `sample_exposure_scale` are required: they
+convert the common reference neutron signal to the proton charge, live time, or
+other documented exposure of each complete acquisition. A missing exposure
+correction can otherwise be falsely absorbed by an additive background.
+
+Background placement is part of the model, not a scripting choice:
+
+| Background source | Required input to this API |
+|-------------------|----------------------------|
+| Detector dark counts, gamma counts, or a blocked-beam reference measured in detector-time bins | Add after the neutron response as a detector-bin template. |
+| Sample scattering calculated as a function of true neutron energy | Pass through the instrument response first; only its resulting detector-bin template is fitted here. |
+| Sample scattering measured directly in detector-time bins under independently documented conditions | Add after the neutron response as a detector-bin template. |
+| SAMMY-style transmission baseline/background | Use the separate transmission model; it is not accepted as a count template by this API. |
+
+The older fitting routes remain separate:
+
+| Fitting route | Current background behavior |
+|---------------|-----------------------------|
+| Transmission with LM or KL | `background=True` fits the SAMMY-style transmission model. |
+| Counts with KL | `background=True` also fits a SAMMY-style change to transmission inside the count likelihood; this is not a detector-count background. |
+| Counts with a nonzero `detector_background` argument | The production fit currently rejects this input because its detector-background scale is not wired into the joint count likelihood. It is not silently substituted with the SAMMY model. |
+| Exact two-arm response shown above | `fit_two_arm_background_templates(...)` fits independently supplied detector-bin templates while holding the neutron signal fixed. Joint fitting with nuclear or calibration parameters is deliberately deferred until the parameter-separation checks are complete. |
+
+`TwoArmBackgroundFitResult` reports `names`, `amplitudes`, optional local
+`amplitude_uncertainties`, `amplitudes_identifiable`, the
+signal/background/total arrays for both arms, `poisson_deviance`,
+`deviance_per_dof`, `converged`, and `iterations`. If
+`amplitudes_identifiable` is false, two or more supplied shapes cannot be
+separated: the summed background and total prediction remain usable, but the
+individual named amounts are arbitrary and their uncertainties are returned as
+`NaN`.
+
 ## Single-Spectrum Fitting
 
 ### Transmission Data
@@ -199,15 +278,19 @@ data to the counts-KL dispatch. Use `c=Q_s / Q_ob` when sample and open-beam
 counts have different proton charge or dwell-time normalization. The primary
 GOF for this path is `FitResult.deviance_per_dof`.
 
-Counts fitting accepts the same temperature, background, group, resolution,
-energy-scale, and `fit_energy_range` options as transmission fitting. Counts
-specific options are:
+Counts fitting accepts temperature, isotope groups, energy-scale calibration,
+and `fit_energy_range`. It does not currently accept every transmission option:
+the production counts route rejects a nonzero `detector_background`, fitted
+counts nuisance factors, and an instrument-resolution argument instead of
+silently routing them through a different model. The exact two-arm APIs above
+provide the validated response and detector-bin background operations while
+their joint calibration is being checked. Counts-specific options are:
 
 | Option | Meaning |
 |--------|---------|
-| `detector_background=...` | Optional 1D detector background spectrum; required when `fit_alpha_2=True`. |
-| `fit_alpha_1=False`, `fit_alpha_2=False` | Fit counts-domain nuisance/background terms. |
-| `alpha_1_init=1.0`, `alpha_2_init=1.0` | Initial nuisance/background values. |
+| `detector_background=...` | Reserved compatibility input. The production fit rejects nonzero values; use `fit_two_arm_background_templates(...)` for independently supplied detector-bin shapes. |
+| `fit_alpha_1=False`, `fit_alpha_2=False` | Research-only flags. The production fit rejects enabling them. |
+| `alpha_1_init=1.0`, `alpha_2_init=1.0` | Research-only initial values; they do not enable nuisance fitting in the production route. |
 | `c=1.0` | Proton-charge ratio `Q_s / Q_ob`. |
 | `enable_polish=True/False/None` | Override counts-KL polish behavior; `None` uses the dispatcher default. |
 

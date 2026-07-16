@@ -1,6 +1,8 @@
 use std::sync::Arc;
 
-use nereids_physics::counts_response::{CountsResponseError, two_arm_count_response};
+use nereids_physics::counts_response::{
+    CountsResponseError, TwoArmCounts, add_count_backgrounds, two_arm_count_response,
+};
 use nereids_physics::ikeda_carpenter::{
     EnergyLaw, IkedaCarpenter, IkedaCarpenterParams, SynthesisGrid,
 };
@@ -141,5 +143,45 @@ fn unsupported_or_unphysical_inputs_fail_clearly() {
             &triangle_response(),
         ),
         Err(CountsResponseError::InvalidTransmission { .. })
+    ));
+}
+
+#[test]
+fn count_background_is_added_after_response_and_returned_separately() {
+    let prediction = add_count_backgrounds(
+        TwoArmCounts {
+            open_beam: vec![50.0, 150.0, 100.0],
+            sample: vec![10.0, 90.0, 80.0],
+        },
+        &[2.0, 3.0, 4.0],
+        &[5.0, 7.0, 11.0],
+    )
+    .expect("valid detector-bin backgrounds");
+
+    assert_eq!(prediction.open_beam.neutron_signal, [50.0, 150.0, 100.0]);
+    assert_eq!(prediction.open_beam.background, [2.0, 3.0, 4.0]);
+    assert_eq!(prediction.open_beam.total, [52.0, 153.0, 104.0]);
+    assert_eq!(prediction.sample.neutron_signal, [10.0, 90.0, 80.0]);
+    assert_eq!(prediction.sample.background, [5.0, 7.0, 11.0]);
+    assert_eq!(prediction.sample.total, [15.0, 97.0, 91.0]);
+}
+
+#[test]
+fn count_background_rejects_shape_mismatch_and_negative_counts() {
+    let signal = TwoArmCounts {
+        open_beam: vec![10.0, 20.0],
+        sample: vec![5.0, 8.0],
+    };
+    assert!(matches!(
+        add_count_backgrounds(signal.clone(), &[1.0], &[2.0, 3.0]),
+        Err(CountsResponseError::DetectorBinCountMismatch { .. })
+    ));
+    assert!(matches!(
+        add_count_backgrounds(signal, &[1.0, 2.0], &[0.0, -1.0]),
+        Err(CountsResponseError::InvalidExpectedCount {
+            field: "sample_background_counts",
+            index: 1,
+            ..
+        })
     ));
 }

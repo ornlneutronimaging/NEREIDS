@@ -964,6 +964,78 @@ def two_arm_count_response(
     """
     ...
 
+class TwoArmBackgroundFitResult:
+    """Fixed-signal fit of independently supplied count-background templates."""
+
+    @property
+    def names(self) -> list[str]: ...
+
+    @property
+    def amplitudes(self) -> NDArray[np.float64]: ...
+
+    @property
+    def amplitude_uncertainties(self) -> NDArray[np.float64]: ...
+
+    @property
+    def amplitudes_identifiable(self) -> bool:
+        """Whether every named component amount is separately determined."""
+        ...
+
+    @property
+    def open_neutron_signal(self) -> NDArray[np.float64]: ...
+
+    @property
+    def open_background(self) -> NDArray[np.float64]: ...
+
+    @property
+    def open_total(self) -> NDArray[np.float64]: ...
+
+    @property
+    def sample_neutron_signal(self) -> NDArray[np.float64]: ...
+
+    @property
+    def sample_background(self) -> NDArray[np.float64]: ...
+
+    @property
+    def sample_total(self) -> NDArray[np.float64]: ...
+
+    @property
+    def poisson_deviance(self) -> float: ...
+
+    @property
+    def deviance_per_dof(self) -> float: ...
+
+    @property
+    def converged(self) -> bool: ...
+
+    @property
+    def iterations(self) -> int: ...
+
+def fit_two_arm_background_templates(
+    observed_open_counts: NDArray[np.float64],
+    observed_sample_counts: NDArray[np.float64],
+    open_neutron_signal: NDArray[np.float64],
+    sample_neutron_signal: NDArray[np.float64],
+    open_exposure_scale: float,
+    sample_exposure_scale: float,
+    template_names: list[str],
+    open_background_templates: NDArray[np.float64],
+    sample_background_templates: NDArray[np.float64],
+    initial_amplitudes: NDArray[np.float64],
+    max_iter: int = 200,
+) -> TwoArmBackgroundFitResult:
+    """Fit non-negative amplitudes of independent detector-bin templates.
+
+    Each row of the two template matrices is one named component. Templates
+    are expected counts per unit amplitude in the measured detector bins and
+    are added after the neutron response. The required exposure scales convert
+    the common reference signal into expected counts for each acquisition.
+    This model is separate from SAMMY's transmission-level background. When
+    ``amplitudes_identifiable`` is false, only the summed background and total
+    prediction are determined; individual component amounts are arbitrary.
+    """
+    ...
+
 def load_tiff_stack(
     path: str,
     pixel_policy: str = "reject",
@@ -1859,8 +1931,12 @@ def fit_counts_spectrum_typed(
             or ``'lm'``.
         background: Enable the SAMMY-style transmission-background
             wrapper inside the counts-KL fit (A_n + B_A + B_B/√E + B_C√E).
-        detector_background: Optional detector/counts background reference
-            (for LM-converted path only; counts-KL rejects non-zero values).
+        detector_background: Reserved detector/counts background reference.
+            Production per-spectrum fitting currently rejects every non-zero
+            value: counts-KL has not wired its scale into the joint likelihood,
+            and the LM-converted path does not accept nuisance spectra. Use
+            ``fit_two_arm_background_templates`` to fit independently supplied
+            detector-bin templates against a fixed exact two-arm signal.
         fit_alpha_1: Research-only; rejected by the counts-KL dispatch
             because the profile λ̂ absorbs the global flux scale.
         fit_alpha_2: Research-only; rejected by the counts-KL dispatch

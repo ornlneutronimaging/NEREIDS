@@ -669,6 +669,144 @@ class TestTwoArmCountResponse:
         np.testing.assert_allclose(sample, 40.0 * probabilities, atol=2e-12)
 
 
+class TestTwoArmCountBackground:
+    """Count backgrounds stay separate and their full prediction is returned."""
+
+    @staticmethod
+    def _signals():
+        return (
+            np.array([1000.0, 900.0, 800.0, 700.0, 600.0]),
+            np.array([600.0, 540.0, 480.0, 420.0, 360.0]),
+        )
+
+    def test_recovers_independent_template_and_returns_components(self):
+        open_signal, sample_signal = self._signals()
+        open_template = np.array([[0.2, 0.5, 1.0, 2.0, 4.0]])
+        sample_template = np.array([[4.0, 2.0, 1.0, 0.5, 0.2]])
+        true_amplitude = 25.0
+        observed_open = open_signal + true_amplitude * open_template[0]
+        observed_sample = sample_signal + true_amplitude * sample_template[0]
+
+        result = nereids.fit_two_arm_background_templates(
+            observed_open,
+            observed_sample,
+            open_signal,
+            sample_signal,
+            1.0,
+            1.0,
+            ["blocked_beam_reference"],
+            open_template,
+            sample_template,
+            np.array([1.0]),
+        )
+
+        assert result.converged
+        assert result.amplitudes_identifiable
+        np.testing.assert_allclose(result.amplitudes, [true_amplitude], atol=1e-6)
+        np.testing.assert_allclose(result.open_neutron_signal, open_signal)
+        np.testing.assert_allclose(result.sample_neutron_signal, sample_signal)
+        np.testing.assert_allclose(
+            result.open_background, true_amplitude * open_template[0], atol=1e-6
+        )
+        np.testing.assert_allclose(result.open_total, observed_open, atol=1e-6)
+        np.testing.assert_allclose(result.sample_total, observed_sample, atol=1e-6)
+        assert result.poisson_deviance < 1e-10
+
+    def test_wrong_flat_template_leaves_bad_count_fit(self):
+        open_signal, sample_signal = self._signals()
+        true_open = np.array([0.2, 0.5, 1.0, 2.0, 4.0])
+        true_sample = np.array([4.0, 2.0, 1.0, 0.5, 0.2])
+        observed_open = open_signal + 100.0 * true_open
+        observed_sample = sample_signal + 100.0 * true_sample
+
+        result = nereids.fit_two_arm_background_templates(
+            observed_open,
+            observed_sample,
+            open_signal,
+            sample_signal,
+            1.0,
+            1.0,
+            ["wrong_flat_reference"],
+            np.ones((1, 5)),
+            np.ones((1, 5)),
+            np.array([1.0]),
+        )
+
+        assert result.converged
+        assert result.deviance_per_dof > 5.0
+
+    def test_template_units_do_not_change_physical_fit(self):
+        open_signal = np.array([100.0, 200.0, 300.0])
+        sample_signal = np.array([80.0, 160.0, 240.0])
+        template = np.full((1, 3), 1e-8)
+        true_amplitude = 1e9
+        observed_open = open_signal + true_amplitude * template[0]
+        observed_sample = sample_signal + true_amplitude * template[0]
+
+        result = nereids.fit_two_arm_background_templates(
+            observed_open,
+            observed_sample,
+            open_signal,
+            sample_signal,
+            1.0,
+            1.0,
+            ["same_reference_in_tiny_units"],
+            template,
+            template,
+            np.array([0.0]),
+        )
+
+        assert result.converged
+        np.testing.assert_allclose(result.amplitudes, [true_amplitude], rtol=1e-6)
+        np.testing.assert_allclose(result.open_total, observed_open, atol=1e-8)
+        np.testing.assert_allclose(result.sample_total, observed_sample, atol=1e-8)
+        assert 0.0 <= result.deviance_per_dof < 1e-10
+
+    def test_exposure_scale_is_not_fitted_as_false_background(self):
+        open_signal = np.array([100.0, 100.0])
+        sample_signal = np.array([50.0, 50.0])
+
+        result = nereids.fit_two_arm_background_templates(
+            np.array([100.0, 100.0]),
+            np.array([100.0, 100.0]),
+            open_signal,
+            sample_signal,
+            1.0,
+            2.0,
+            ["sample_only"],
+            np.zeros((1, 2)),
+            np.ones((1, 2)),
+            np.array([10.0]),
+        )
+
+        assert result.converged
+        np.testing.assert_allclose(result.amplitudes, [0.0], atol=1e-10)
+        np.testing.assert_allclose(result.sample_neutron_signal, [100.0, 100.0])
+        assert result.poisson_deviance == 0.0
+
+    def test_dependent_component_amounts_are_marked_unidentifiable(self):
+        signal = np.full(3, 100.0)
+
+        result = nereids.fit_two_arm_background_templates(
+            np.full(3, 120.0),
+            np.full(3, 120.0),
+            signal,
+            signal,
+            1.0,
+            1.0,
+            ["dark", "gamma"],
+            np.array([[1.0] * 3, [2.0] * 3]),
+            np.array([[1.0] * 3, [2.0] * 3]),
+            np.array([0.0, 5.0]),
+        )
+
+        assert result.converged
+        assert not result.amplitudes_identifiable
+        assert np.isnan(result.amplitude_uncertainties).all()
+        np.testing.assert_allclose(result.open_background, [20.0] * 3)
+        assert result.poisson_deviance == 0.0
+
+
 class TestTabulatedKernelWidthInterpolation:
     """Regression for issue #632: kernel width between reference energies
     must follow the physical power law, not the arithmetic blend chord.
