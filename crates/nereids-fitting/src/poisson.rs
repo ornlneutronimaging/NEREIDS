@@ -1,5 +1,4 @@
-//! Poisson-likelihood optimizer for low-count neutron data (transmission
-//! path).
+//! Low-level single-arm Poisson-likelihood optimizer for nonnegative data.
 //!
 //! Minimizes the single-arm Poisson negative log-likelihood
 //!
@@ -10,16 +9,12 @@
 //! using a projected damped Gauss-Newton / Fisher optimizer with
 //! backtracking line search and finite-difference fallback.
 //!
-//! **Scope note.**  In the current pipeline this solver is only reached
-//! for the **transmission + PoissonKL** path (via
-//! `crate::transmission_model::TransmissionKLBackgroundModel`).  The
-//! **counts** path uses the joint-Poisson conditional-binomial-deviance
-//! solver in [`crate::joint_poisson`], which replaced the older
-//! fixed-flux counts NLL that lived here.  The helpers [`CountsModel`]
-//! and [`CountsBackgroundScaleModel`] exposed from this module are
-//! retained for the [`crate::lm`]-side `evaluate_jacobian_and_fisher`
-//! Fisher-information helper and for spatial-regularization research
-//! drivers; they are not part of the production fit path.
+//! **Scope note.** The production pipeline does not apply this single-arm
+//! objective to normalized transmission. Raw open/sample counts use the
+//! joint-Poisson conditional-binomial-deviance solver in
+//! [`crate::joint_poisson`]. This module remains available to the standalone
+//! count-background fitter and research diagnostics; it is not a public
+//! transmission fitting route.
 //!
 //! ## TRINIDI Reference
 //! - `trinidi/reconstruct.py` — Poisson NLL and APGM optimizer

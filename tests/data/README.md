@@ -69,7 +69,9 @@ a maintainer task.
 
 Aggregated (full-frame-summed) VENUS Hf 120 min spectrum used by the
 real-data regression gates in `tests/test_nereids.py`
-(`TestVenusMlbwRegression` — one LM/MLBW gate and one counts-KL gate).
+(`TestVenusMlbwRegression` — one LM/MLBW numerical gate and one gate proving
+that resolved counts fail closed when the source weights and detector-time
+edges required by the exact two-arm optimizer are omitted).
 Contents: `energies_ev` (7–200 eV window, ascending), `sample_counts`
 and `open_beam_counts` (full-frame pixel sums over the cube), and
 `pc_ratio` (the proton-charge ratio `c = Q_s / Q_ob`, ≈ 5.98). Same

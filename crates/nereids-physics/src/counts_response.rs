@@ -33,6 +33,141 @@ pub struct TwoArmCounts {
     pub sample: Vec<f64>,
 }
 
+/// Exact detector-bin probabilities for a fixed instrument response.
+///
+/// Rows correspond to `true_energies_ev`; columns correspond to consecutive
+/// intervals in `detector_time_edges_us`. Building the matrix evaluates the
+/// analytical IC/tabulated bin integrals once. Reusing it during optimization
+/// changes only the true-energy sample transmission, not the detector physics.
+#[derive(Debug, Clone, PartialEq)]
+pub struct DetectorBinResponseMatrix {
+    probabilities: Vec<f64>,
+    n_true_energies: usize,
+    n_detector_bins: usize,
+}
+
+impl DetectorBinResponseMatrix {
+    /// Build an exact fixed-response matrix.
+    pub fn new(
+        true_energies_ev: &[f64],
+        detector_time_edges_us: &[f64],
+        timing_offset_us: f64,
+        response: &ResolutionFunction,
+    ) -> Result<Self, CountsResponseError> {
+        if true_energies_ev.is_empty() {
+            return Err(CountsResponseError::EmptyTrueEnergyGrid);
+        }
+        for (index, &energy) in true_energies_ev.iter().enumerate() {
+            if !energy.is_finite() || energy <= 0.0 {
+                return Err(CountsResponseError::InvalidTrueEnergy {
+                    index,
+                    value: energy,
+                });
+            }
+        }
+
+        let n_detector_bins = detector_time_edges_us.len().saturating_sub(1);
+        let mut probabilities = Vec::with_capacity(
+            true_energies_ev
+                .len()
+                .checked_mul(n_detector_bins)
+                .ok_or_else(|| {
+                    CountsResponseError::Resolution(ResolutionParseError::InvalidFormat(
+                        "detector response matrix dimensions overflow usize".into(),
+                    ))
+                })?,
+        );
+        for &energy in true_energies_ev {
+            let row = response.detector_bin_probabilities(
+                energy,
+                detector_time_edges_us,
+                timing_offset_us,
+            )?;
+            debug_assert_eq!(row.len(), n_detector_bins);
+            probabilities.extend(row);
+        }
+
+        Ok(Self {
+            probabilities,
+            n_true_energies: true_energies_ev.len(),
+            n_detector_bins,
+        })
+    }
+
+    /// Number of true-energy quadrature points.
+    pub fn n_true_energies(&self) -> usize {
+        self.n_true_energies
+    }
+
+    /// Number of measured detector-time bins.
+    pub fn n_detector_bins(&self) -> usize {
+        self.n_detector_bins
+    }
+
+    /// Probability that true-energy row `true_index` lands in detector bin
+    /// `detector_bin`.
+    pub fn probability(&self, true_index: usize, detector_bin: usize) -> f64 {
+        self.probabilities[true_index * self.n_detector_bins + detector_bin]
+    }
+
+    /// Apply the fixed response separately to open and sample arms.
+    pub fn apply(
+        &self,
+        incident_fluence_weights: &[f64],
+        transmission: &[f64],
+    ) -> Result<TwoArmCounts, CountsResponseError> {
+        if incident_fluence_weights.len() != self.n_true_energies
+            || transmission.len() != self.n_true_energies
+        {
+            return Err(CountsResponseError::LengthMismatch {
+                energies: self.n_true_energies,
+                incident_fluence: incident_fluence_weights.len(),
+                transmission: transmission.len(),
+            });
+        }
+        for (index, &fluence) in incident_fluence_weights.iter().enumerate() {
+            if !fluence.is_finite() || fluence < 0.0 {
+                return Err(CountsResponseError::InvalidIncidentFluence {
+                    index,
+                    value: fluence,
+                });
+            }
+        }
+        for (index, &value) in transmission.iter().enumerate() {
+            if !value.is_finite() || !(0.0..=1.0).contains(&value) {
+                return Err(CountsResponseError::InvalidTransmission { index, value });
+            }
+        }
+
+        let mut open_beam = vec![0.0; self.n_detector_bins];
+        let mut sample = vec![0.0; self.n_detector_bins];
+        let mut open_compensation = vec![0.0; self.n_detector_bins];
+        let mut sample_compensation = vec![0.0; self.n_detector_bins];
+        for true_index in 0..self.n_true_energies {
+            let fluence = incident_fluence_weights[true_index];
+            let sample_weight = fluence * transmission[true_index];
+            for detector_bin in 0..self.n_detector_bins {
+                let probability = self.probability(true_index, detector_bin);
+                compensated_add(
+                    &mut open_beam[detector_bin],
+                    &mut open_compensation[detector_bin],
+                    fluence * probability,
+                );
+                compensated_add(
+                    &mut sample[detector_bin],
+                    &mut sample_compensation[detector_bin],
+                    sample_weight * probability,
+                );
+            }
+        }
+        for detector_bin in 0..self.n_detector_bins {
+            open_beam[detector_bin] += open_compensation[detector_bin];
+            sample[detector_bin] += sample_compensation[detector_bin];
+        }
+        Ok(TwoArmCounts { open_beam, sample })
+    }
+}
+
 /// Signal, additive background, and total expected counts for one measured arm.
 ///
 /// Background is expressed directly in the detector bins of that measurement.
@@ -273,9 +408,6 @@ pub fn two_arm_count_response(
     timing_offset_us: f64,
     response: &ResolutionFunction,
 ) -> Result<TwoArmCounts, CountsResponseError> {
-    if true_energies_ev.is_empty() {
-        return Err(CountsResponseError::EmptyTrueEnergyGrid);
-    }
     if incident_fluence_weights.len() != true_energies_ev.len()
         || transmission.len() != true_energies_ev.len()
     {
@@ -285,70 +417,13 @@ pub fn two_arm_count_response(
             transmission: transmission.len(),
         });
     }
-    for (index, &energy) in true_energies_ev.iter().enumerate() {
-        if !energy.is_finite() || energy <= 0.0 {
-            return Err(CountsResponseError::InvalidTrueEnergy {
-                index,
-                value: energy,
-            });
-        }
-    }
-    for (index, &fluence) in incident_fluence_weights.iter().enumerate() {
-        if !fluence.is_finite() || fluence < 0.0 {
-            return Err(CountsResponseError::InvalidIncidentFluence {
-                index,
-                value: fluence,
-            });
-        }
-    }
-    for (index, &value) in transmission.iter().enumerate() {
-        if !value.is_finite() || !(0.0..=1.0).contains(&value) {
-            return Err(CountsResponseError::InvalidTransmission { index, value });
-        }
-    }
-
-    // Calling the response once even when every fluence weight is zero is
-    // important: malformed detector edges and unsupported Gaussian responses
-    // must still fail clearly instead of appearing to succeed with all zeros.
-    let n_bins = detector_time_edges_us.len().saturating_sub(1);
-    let mut open_beam = vec![0.0; n_bins];
-    let mut sample = vec![0.0; n_bins];
-    let mut open_compensation = vec![0.0; n_bins];
-    let mut sample_compensation = vec![0.0; n_bins];
-
-    for ((&energy, &fluence), &sample_transmission) in true_energies_ev
-        .iter()
-        .zip(incident_fluence_weights)
-        .zip(transmission)
-    {
-        let probabilities = response.detector_bin_probabilities(
-            energy,
-            detector_time_edges_us,
-            timing_offset_us,
-        )?;
-        debug_assert_eq!(probabilities.len(), n_bins);
-
-        // Neumaier-compensated accumulation keeps a weak high-energy tail from
-        // being lost when the same bin also contains a much larger prompt term.
-        for (bin, probability) in probabilities.into_iter().enumerate() {
-            compensated_add(
-                &mut open_beam[bin],
-                &mut open_compensation[bin],
-                fluence * probability,
-            );
-            compensated_add(
-                &mut sample[bin],
-                &mut sample_compensation[bin],
-                fluence * sample_transmission * probability,
-            );
-        }
-    }
-    for bin in 0..n_bins {
-        open_beam[bin] += open_compensation[bin];
-        sample[bin] += sample_compensation[bin];
-    }
-
-    Ok(TwoArmCounts { open_beam, sample })
+    DetectorBinResponseMatrix::new(
+        true_energies_ev,
+        detector_time_edges_us,
+        timing_offset_us,
+        response,
+    )?
+    .apply(incident_fluence_weights, transmission)
 }
 
 #[inline]

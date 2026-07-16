@@ -1306,6 +1306,15 @@ pub enum ResolutionFunction {
 }
 
 impl ResolutionFunction {
+    /// Flight path used to map true neutron energy to detector time.
+    pub fn flight_path_m(&self) -> f64 {
+        match self {
+            Self::Gaussian(params) => params.flight_path_m(),
+            Self::Tabulated(tabulated) => tabulated.flight_path_m(),
+            Self::IkedaCarpenter(ic) => ic.flight_path_m(),
+        }
+    }
+
     /// Probability that one neutron of known true energy is recorded in each
     /// supplied detector-time bin.
     ///

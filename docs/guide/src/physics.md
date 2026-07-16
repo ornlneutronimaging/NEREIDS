@@ -75,12 +75,9 @@ Standard nonlinear least-squares minimization for Gaussian-distributed data.
 
 Maximum-likelihood fitting for low-count data where Gaussian statistics break down.
 
-- Module: [`joint_poisson`](api/nereids_fitting/joint_poisson/) -- counts-domain
-  joint-Poisson fit (conditional binomial deviance); the production path for
-  counts data
-- Module: [`poisson`](api/nereids_fitting/poisson/) -- transmission-domain
-  Poisson likelihood (projected damped Gauss-Newton); used for the
-  transmission + PoissonKL combination
+- Module: [`joint_poisson`](api/nereids_fitting/joint_poisson/) -- count-domain
+  joint-Poisson fit (conditional binomial deviance) using the separate open and
+  sample count arms; the production path for counts data
 - Reference: TRINIDI approach (`trinidi/reconstruct.py`)
 
 ## ENDF Nuclear Data

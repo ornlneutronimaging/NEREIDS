@@ -15,7 +15,7 @@
 //! then pass to `spatial_map_typed()` for per-pixel fitting:
 //!
 //! - **Counts** → Poisson KL (statistically optimal for raw detector counts)
-//! - **Transmission** → LM (default) or KL (opt-in via `solver="kl"`)
+//! - **Transmission** → LM only; a count likelihood is not valid for ratios
 //!
 //! ## Usage
 //! ```python
@@ -509,7 +509,7 @@ impl PyFitResult {
     /// 1-sigma uncertainty on fitted temperature in Kelvin (``None`` when
     /// ``fit_temperature=False``).
     ///
-    /// For the raw-covariance solver paths (Poisson-KL, joint-Poisson) this is a
+    /// For the raw-count joint-Poisson path this is a
     /// **covariance-only lower bound**: it is `sqrt` of the temperature diagonal
     /// of the inverse Fisher matrix and omits baseline/model noise, so on real
     /// data it can underestimate the observed per-superpixel scatter by ~3–4×.
@@ -604,7 +604,7 @@ impl PyFitResult {
     ///
     /// Primary goodness-of-fit statistic for ``solver="kl"`` on counts
     /// data — replaces the fixed-flux Pearson χ² that scaled with ``c``.
-    /// Returns ``None`` for LM fits and for transmission + PoissonKL;
+    /// Returns ``None`` for LM transmission fits;
     /// those populate ``reduced_chi_squared`` with Pearson χ² / (n − k).
     #[getter]
     fn deviance_per_dof(&self) -> Option<f64> {
@@ -1010,7 +1010,7 @@ impl PySpatialResult {
     /// Primary goodness-of-fit for ``solver="kl"`` on counts data
     /// (replaces the fixed-flux Pearson that scaled
     /// with ``c``).  Returns ``None`` for LM fits and transmission +
-    /// PoissonKL; those populate ``chi_squared_map`` with Pearson χ² /
+    /// LM transmission fits; those populate ``chi_squared_map`` with Pearson χ² /
     /// (n − k) instead.
     #[getter]
     fn deviance_per_dof_map<'py>(&self, py: Python<'py>) -> Option<Bound<'py, PyArray2<f64>>> {
@@ -1058,7 +1058,7 @@ impl PySpatialResult {
     /// Per-pixel temperature uncertainty map (None when fit_temperature=False).
     /// Entries are NaN where uncertainty was unavailable for that pixel.
     ///
-    /// For the raw-covariance solver paths (Poisson-KL, joint-Poisson) each σ_T
+    /// For the raw-count joint-Poisson path each σ_T
     /// is a **covariance-only lower bound** (`sqrt` of the temperature diagonal
     /// of the inverse Fisher matrix): it omits baseline/model noise and on real
     /// data can underestimate the observed per-superpixel scatter by ~3–4×.
@@ -2095,6 +2095,19 @@ fn build_resolution(
     }
 }
 
+/// Extract a detector-time response that has exact bin probabilities.
+fn extract_detector_time_resolution(resolution: &Bound<'_, PyAny>) -> PyResult<ResolutionFunction> {
+    if let Ok(tabulated) = resolution.extract::<PyRef<'_, PyTabulatedResolution>>() {
+        Ok(ResolutionFunction::Tabulated(Arc::clone(&tabulated.inner)))
+    } else if let Ok(ic) = resolution.extract::<PyRef<'_, PyIkedaCarpenter>>() {
+        Ok(ResolutionFunction::IkedaCarpenter(Arc::clone(&ic.inner)))
+    } else {
+        Err(pyo3::exceptions::PyTypeError::new_err(
+            "resolution must be a TabulatedResolution or IkedaCarpenter",
+        ))
+    }
+}
+
 /// Apply Free Gas Model (FGM) Doppler broadening to a cross-section array.
 ///
 /// Convolves the input cross-sections with a Gaussian kernel whose width
@@ -2321,15 +2334,7 @@ fn py_two_arm_count_response<'py>(
     resolution: &Bound<'_, PyAny>,
     timing_offset_us: f64,
 ) -> PyResult<(Bound<'py, PyArray1<f64>>, Bound<'py, PyArray1<f64>>)> {
-    let response = if let Ok(tabulated) = resolution.extract::<PyRef<'_, PyTabulatedResolution>>() {
-        ResolutionFunction::Tabulated(Arc::clone(&tabulated.inner))
-    } else if let Ok(ic) = resolution.extract::<PyRef<'_, PyIkedaCarpenter>>() {
-        ResolutionFunction::IkedaCarpenter(Arc::clone(&ic.inner))
-    } else {
-        return Err(pyo3::exceptions::PyTypeError::new_err(
-            "resolution must be a TabulatedResolution or IkedaCarpenter",
-        ));
-    };
+    let response = extract_detector_time_resolution(resolution)?;
 
     let energies = true_energies_ev.as_slice()?.to_vec();
     let fluence = incident_fluence_weights.as_slice()?.to_vec();
@@ -4635,10 +4640,12 @@ fn py_from_counts<'py>(
     })
 }
 
-/// Create InputData from raw detector counts plus explicit nuisance spectra.
+/// Legacy raw-count nuisance wrapper retained for compatibility.
 ///
-/// Use this when the detector/counts background spectrum has been estimated
-/// outside NEREIDS and should be supplied explicitly.
+/// Production fitting rejects a nonzero background because this legacy array
+/// is not connected to the physical two-arm likelihood. New code should use
+/// `from_counts` and fit independently measured detector-bin shapes with
+/// `fit_two_arm_background_templates`.
 #[pyfunction]
 #[pyo3(name = "from_counts_with_nuisance")]
 fn py_from_counts_with_nuisance<'py>(
@@ -4678,8 +4685,9 @@ fn py_from_counts_with_nuisance<'py>(
 
 /// Create InputData from normalized transmission and uncertainty.
 ///
-/// The fitting engine will use LM by default. Pass solver="kl" to use
-/// Poisson KL instead (for low-count transmission data).
+/// The fitting engine uses LM. A Poisson/KL count likelihood is rejected for
+/// normalized transmission because the separate count arms are no longer
+/// available.
 ///
 /// **Note:** Both arrays must have dtype `np.float64`. Call `.astype(np.float64)`
 /// if your arrays are a different type.
@@ -4744,6 +4752,11 @@ fn parse_solver_config(
                 )
             }
         }
+        "lm" if is_counts => Err(pyo3::exceptions::PyValueError::new_err(
+            "raw sample/open-beam counts cannot use solver='lm': dividing the \
+             count arms into transmission loses count statistics; use \
+             solver='auto' or solver='kl'",
+        )),
         "lm" => Ok(
             nereids_pipeline::pipeline::SolverConfig::LevenbergMarquardt(
                 nereids_fitting::lm::LmConfig {
@@ -4758,6 +4771,13 @@ fn parse_solver_config(
         // implementation IS the KL solver.  No runtime deprecation
         // warning is emitted; the aliases simply accept the older name
         // strings so existing user scripts keep working.
+        "kl" | "poisson" | "joint_poisson" if !is_counts => {
+            Err(pyo3::exceptions::PyValueError::new_err(
+                "normalized transmission cannot use a Poisson/KL count \
+                 likelihood because the separate open/sample count arms are \
+                 unavailable; use solver='auto' or solver='lm'",
+            ))
+        }
         "kl" | "poisson" | "joint_poisson" => {
             Ok(nereids_pipeline::pipeline::SolverConfig::PoissonKL(
                 nereids_fitting::poisson::PoissonConfig {
@@ -5012,7 +5032,7 @@ fn spatial_result_to_py(
 ///
 /// Dispatches per-pixel fitting based on the InputData type:
 ///   - from_counts → Poisson KL on raw counts (statistically optimal)
-///   - from_transmission → LM by default, KL opt-in via solver="kl"
+///   - from_transmission → LM; Poisson/KL is rejected for ratios
 ///
 /// Either `isotopes` or `groups` must be provided, but not both.
 /// When `groups` is provided, each group maps to one fitted density parameter.
@@ -5488,7 +5508,8 @@ fn py_spatial_map_typed<'py>(
 ///     temperature_k: Sample temperature in Kelvin (default 293.6).
 ///     fit_temperature: Whether to fit temperature (default False).
 ///     max_iter: Maximum iterations (default 200).
-///     solver: "auto" (default), "kl", "poisson", "joint_poisson", or "lm".
+///     solver: "auto" (default), "kl", "poisson", or "joint_poisson".
+///         "lm" is rejected for raw counts.
 ///     background: Enable the SAMMY-style transmission background inside the
 ///         counts likelihood. This is not detector-count background.
 ///     detector_background: Reserved detector/counts background reference.
@@ -5501,7 +5522,13 @@ fn py_spatial_map_typed<'py>(
 ///         production counts fitting.
 ///     alpha_1_init: Initial value for `alpha_1` (default 1.0).
 ///     alpha_2_init: Initial value for `alpha_2` (default 1.0).
-///     resolution: Optional resolution function.
+///     resolution: Exact detector-time response. Resolved raw-count fitting
+///         accepts a TabulatedResolution or IkedaCarpenter.
+///     incident_fluence_weights: Incident fluence integrated over each point
+///         of the true-energy quadrature. Required with detector_time_edges_us.
+///     detector_time_edges_us: Actual measured detector-time bin edges. Its
+///         length must be one greater than the sample/open count arrays.
+///     timing_offset_us: Fixed detector-clock offset applied by the response.
 ///     groups: list of IsotopeGroup objects (mutually exclusive with isotopes).
 ///     initial_densities: Initial density guesses when using groups (default 0.001 each).
 ///     enable_polish: Override the Nelder-Mead polish phase on the
@@ -5559,6 +5586,9 @@ fn py_spatial_map_typed<'py>(
     alpha_2_init = 1.0,
     c = 1.0,
     resolution = None,
+    incident_fluence_weights = None,
+    detector_time_edges_us = None,
+    timing_offset_us = 0.0,
     flight_path_m = None,
     delta_t_us = None,
     delta_l_m = None,
@@ -5607,7 +5637,10 @@ fn py_fit_counts_spectrum_typed<'py>(
     alpha_1_init: f64,
     alpha_2_init: f64,
     c: f64,
-    resolution: Option<PyTabulatedResolution>,
+    resolution: Option<&Bound<'py, PyAny>>,
+    incident_fluence_weights: Option<PyReadonlyArray1<'py, f64>>,
+    detector_time_edges_us: Option<PyReadonlyArray1<'py, f64>>,
+    timing_offset_us: f64,
     flight_path_m: Option<f64>,
     delta_t_us: Option<f64>,
     delta_l_m: Option<f64>,
@@ -5632,7 +5665,8 @@ fn py_fit_counts_spectrum_typed<'py>(
     scale_by_chi2: bool,
 ) -> PyResult<PyFitResult> {
     use nereids_pipeline::pipeline::{
-        CountsBackgroundConfig, InputData, UnifiedFitConfig, fit_spectrum_typed,
+        CountsBackgroundConfig, ExactCountResponseConfig, InputData, UnifiedFitConfig,
+        fit_spectrum_typed,
     };
 
     let has_isotopes = isotopes.is_some();
@@ -5658,11 +5692,51 @@ fn py_fit_counts_spectrum_typed<'py>(
             ob_slice.len(),
         )));
     }
-    if sample_slice.len() != e_slice.len() {
+    let exact_source = incident_fluence_weights
+        .map(|values| values.as_slice().map(<[f64]>::to_vec))
+        .transpose()?;
+    let exact_edges = detector_time_edges_us
+        .map(|values| values.as_slice().map(<[f64]>::to_vec))
+        .transpose()?;
+    let exact_requested = exact_source.is_some() || exact_edges.is_some();
+    if exact_source.is_some() != exact_edges.is_some() {
+        return Err(pyo3::exceptions::PyValueError::new_err(
+            "incident_fluence_weights and detector_time_edges_us must be supplied together",
+        ));
+    }
+    if !exact_requested && timing_offset_us != 0.0 {
+        return Err(pyo3::exceptions::PyValueError::new_err(
+            "timing_offset_us requires incident_fluence_weights and detector_time_edges_us",
+        ));
+    }
+    if !exact_requested && sample_slice.len() != e_slice.len() {
         return Err(pyo3::exceptions::PyValueError::new_err(format!(
             "sample_counts length ({}) must match energies length ({})",
             sample_slice.len(),
             e_slice.len(),
+        )));
+    }
+    if let Some(source) = exact_source.as_ref()
+        && source.len() != e_slice.len()
+    {
+        return Err(pyo3::exceptions::PyValueError::new_err(format!(
+            "incident_fluence_weights length ({}) must match the true-energy grid length ({})",
+            source.len(),
+            e_slice.len(),
+        )));
+    }
+    if let Some(edges) = exact_edges.as_ref()
+        && edges.len() != sample_slice.len() + 1
+    {
+        return Err(pyo3::exceptions::PyValueError::new_err(format!(
+            "detector_time_edges_us length ({}) must be one greater than the measured count-bin length ({})",
+            edges.len(),
+            sample_slice.len(),
+        )));
+    }
+    if exact_requested && !timing_offset_us.is_finite() {
+        return Err(pyo3::exceptions::PyValueError::new_err(format!(
+            "timing_offset_us must be finite, got {timing_offset_us}",
         )));
     }
     require_non_empty_energy_grid(e_slice)?;
@@ -5714,7 +5788,17 @@ fn py_fit_counts_spectrum_typed<'py>(
     }
 
     let energies_vec = e_slice.to_vec();
-    let res_fn = build_resolution(flight_path_m, delta_t_us, delta_l_m, resolution, None)?;
+    let has_gaussian = flight_path_m.is_some() || delta_t_us.is_some() || delta_l_m.is_some();
+    if has_gaussian && resolution.is_some() {
+        return Err(pyo3::exceptions::PyValueError::new_err(
+            "Cannot specify both Gaussian resolution parameters and resolution",
+        ));
+    }
+    let res_fn = if let Some(response) = resolution {
+        Some(extract_detector_time_resolution(response)?)
+    } else {
+        build_resolution(flight_path_m, delta_t_us, delta_l_m, None, None)?
+    };
 
     let mut config = if let Some(isotopes) = isotopes {
         let iso_names: Vec<String> = isotopes
@@ -5757,6 +5841,20 @@ fn py_fit_counts_spectrum_typed<'py>(
     };
 
     config = config.with_solver(parse_solver_config(solver, true, max_iter)?);
+    if let (Some(incident_fluence_weights), Some(detector_time_edges_us)) =
+        (exact_source, exact_edges)
+    {
+        if config.resolution().is_none() {
+            return Err(pyo3::exceptions::PyValueError::new_err(
+                "exact resolved counts require resolution=TabulatedResolution or IkedaCarpenter",
+            ));
+        }
+        config = config.with_exact_count_response(ExactCountResponseConfig {
+            incident_fluence_weights,
+            detector_time_edges_us,
+            timing_offset_us,
+        });
+    }
     // Issue #638: χ²-scaled uncertainties (no-op on the LM transmission path).
     config = config.with_scale_by_chi2(scale_by_chi2);
     if fit_temperature {
@@ -6270,7 +6368,8 @@ fn apply_baseline(
 ///     temperature_k: Sample temperature in Kelvin (default 293.6).
 ///     fit_temperature: Whether to fit temperature (default False).
 ///     max_iter: Maximum iterations (default 200).
-///     solver: "lm" (default), "kl", or "auto".
+///     solver: "lm" (default) or "auto". Count-likelihood names are rejected
+///         for normalized transmission.
 ///     background: Enable SAMMY transmission background.
 ///     resolution: Optional resolution function.
 ///     groups: list of IsotopeGroup objects (mutually exclusive with isotopes).
@@ -6483,12 +6582,9 @@ fn py_fit_spectrum_typed<'py>(
     let solver_config = parse_solver_config(solver, false, max_iter)?;
     config = config.with_solver(solver_config);
 
-    // Issue #638: χ²-scaled uncertainties. This function takes TRANSMISSION
-    // input. Its default solver resolves to the LM transmission path, which is
-    // already χ²-scaled, so the flag is a no-op there; with ``solver='kl'`` it
-    // routes to the transmission Poisson-KL path, where the flag opts the raw
-    // inverse-Fisher σ into the SAME Gaussian reduced-χ² scaling the LM path
-    // uses (see `pipeline::poisson_to_lm_result`).
+    // Issue #638: this function takes transmission input and therefore always
+    // uses LM. LM already scales its covariance by reduced chi-squared, so this
+    // compatibility flag is a no-op here.
     config = config.with_scale_by_chi2(scale_by_chi2);
 
     // Temperature fitting

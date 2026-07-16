@@ -35,11 +35,11 @@ _MANIFEST_NAMES = (
 )
 
 _COUNTS_RESOLUTION_UNSUPPORTED = (
-    "counts input with instrument resolution is unsupported: the current counts "
-    "path broadens transmission as R[T], but the physical detector model requires "
-    "separate open/sample response arms R[Phi] and R[Phi*T]. Supply pre-normalized "
-    "transmission, or disable instrument resolution until an exact counts response "
-    "is implemented."
+    "counts input with instrument resolution is not available through the MCP "
+    "manifest: an exact count fit requires incident fluence weights and measured "
+    "detector-time bin edges, which this manifest schema does not carry. Use the "
+    "direct Python fit_counts_spectrum_typed exact-count arguments, supply "
+    "pre-normalized transmission, or disable instrument resolution."
 )
 _SAFE_KEY = re.compile(r"[^A-Za-z0-9_]+")
 
@@ -669,8 +669,6 @@ def _process_single_spectrum(
         entries, base, default_library=str(config.get("library", "endf8.1"))
     )
     resolution = _resolution_kwargs(base, config)
-    solver = str(fit_config.get("solver", "lm")).lower()
-
     if kind in {"counts_npz", "counts"}:
         sample_key = data_config.get("sample_key", "sample_counts")
         open_beam_key = data_config.get("open_beam_key", "open_beam_counts")
@@ -690,40 +688,33 @@ def _process_single_spectrum(
         if sample.ndim != 1 or open_beam.ndim != 1:
             raise ValueError("single_spectrum counts arrays must be 1D or 3D")
         c = float(data_config.get("pc_ratio", arrays.get("pc_ratio", 1.0)))
-        fit_domain = str(
-            fit_config.get(
-                "fit_domain",
-                "transmission" if solver == "lm" else "counts",
+        fit_domain = str(fit_config.get("fit_domain", "counts")).lower()
+        if fit_domain != "counts":
+            raise ValueError(
+                "raw count input cannot be fit in the transmission domain: "
+                "the conversion discards open-beam count uncertainty; use "
+                "fit_domain='counts' with solver='auto' or solver='kl'"
             )
-        ).lower()
-        if fit_domain == "counts":
-            kwargs = _single_fit_kwargs(fit_config, resolution, counts=True)
-            kwargs["c"] = float(fit_config.get("c", c))
-            result = nereids.fit_counts_spectrum_typed(
-                sample_counts=sample,
-                open_beam_counts=open_beam,
-                energies=energies,
-                isotopes=isotopes,
-                **kwargs,
-            )
-            transmission = sample / np.maximum(kwargs["c"] * open_beam, 1.0)
-            uncertainty = transmission * np.sqrt(
-                1.0 / np.maximum(sample, 1.0) + 1.0 / np.maximum(open_beam, 1.0)
-            )
-        else:
-            transmission = sample / np.maximum(c * open_beam, 1.0)
-            uncertainty = transmission * np.sqrt(
-                1.0 / np.maximum(sample, 1.0) + 1.0 / np.maximum(open_beam, 1.0)
-            )
-            kwargs = _single_fit_kwargs(fit_config, resolution, counts=False)
-            result = nereids.fit_spectrum_typed(
-                transmission=transmission,
-                uncertainty=uncertainty,
-                energies=energies,
-                isotopes=isotopes,
-                **kwargs,
-            )
+        kwargs = _single_fit_kwargs(fit_config, resolution, counts=True)
+        kwargs["c"] = float(fit_config.get("c", c))
+        result = nereids.fit_counts_spectrum_typed(
+            sample_counts=sample,
+            open_beam_counts=open_beam,
+            energies=energies,
+            isotopes=isotopes,
+            **kwargs,
+        )
+        transmission = sample / np.maximum(kwargs["c"] * open_beam, 1.0)
+        uncertainty = transmission * np.sqrt(
+            1.0 / np.maximum(sample, 1.0) + 1.0 / np.maximum(open_beam, 1.0)
+        )
     elif kind in {"transmission_npz", "transmission", "spectrum"}:
+        fit_domain = str(fit_config.get("fit_domain", "transmission")).lower()
+        if fit_domain != "transmission":
+            raise ValueError(
+                "normalized transmission input must use fit_domain='transmission' "
+                "with solver='auto' or solver='lm'"
+            )
         trans_key = data_config.get("transmission_key", "transmission")
         unc_key = data_config.get("uncertainty_key", "uncertainty")
         _require_npz_keys(
@@ -950,6 +941,22 @@ def _process_density_map(
     initial_densities = [density for _, density in isotopes]
     isotope_data = [data for data, _ in isotopes]
     kwargs = _spatial_fit_kwargs(fit_config, _resolution_kwargs(base, config))
+    requested_solver = str(fit_config.get("solver", "auto")).lower()
+    if input_kind == "counts" and requested_solver == "lm":
+        raise ValueError(
+            "raw count maps cannot use solver='lm': use solver='auto' or "
+            "solver='kl' so the separate sample/open-beam arms are preserved"
+        )
+    if input_kind == "transmission" and requested_solver in {
+        "kl",
+        "poisson",
+        "poisson_kl",
+        "joint_poisson",
+    }:
+        raise ValueError(
+            "normalized transmission maps cannot use a Poisson/KL count "
+            "likelihood; use solver='auto' or solver='lm'"
+        )
     if c is not None and "c" not in kwargs:
         kwargs["c"] = c
     result = nereids.spatial_map_typed(
@@ -1155,10 +1162,9 @@ def _validate_workflow(manifest: dict[str, Any]) -> dict[str, Any]:
     elif resolution is None and mode in {"density_map", "spatial_map"}:
         warnings.append("no resolution configured; OK for synthetic/demo data")
 
-    # Raw count inputs need two separately broadened response arms:
-    # R[Phi] for the open beam and R[Phi*T] for the sample.  The current
-    # fitting API only has R[T], so approving this manifest would make a
-    # dry run disagree with the production pipeline's fail-closed gate.
+    # Raw count inputs need two separately evaluated response arms. The direct
+    # Python fitter supports this when source weights and detector-time edges
+    # are supplied, but the MCP manifest schema does not carry those inputs.
     counts_input = effective_kind in {
         "counts_npz",
         "counts",

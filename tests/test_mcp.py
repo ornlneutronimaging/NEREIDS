@@ -370,6 +370,88 @@ class TestManifestWorkflowTools:
         assert (tmp_path / "output" / "nereids_spectrum_fit.npz").exists()
         assert (tmp_path / "output" / "nereids_mcp_result.json").exists()
 
+    def test_count_spectrum_stays_in_count_domain_by_default(
+        self, tmp_path, monkeypatch
+    ):
+        energies = np.linspace(1.0, 30.0, 20)
+        sample = np.full(20, 900.0)
+        open_beam = np.full(20, 1000.0)
+        np.savez(
+            tmp_path / "counts.npz",
+            energies_ev=energies,
+            sample_counts=sample,
+            open_beam_counts=open_beam,
+        )
+        captured = {}
+
+        def fake_fit_counts_spectrum_typed(**kwargs):
+            captured.update(kwargs)
+            return SimpleNamespace(
+                densities=np.asarray([0.001]),
+                uncertainties=np.asarray([0.0001]),
+                reduced_chi_squared=1.0,
+                deviance_per_dof=1.0,
+                converged=True,
+                iterations=1,
+                temperature_k=None,
+                anorm=1.0,
+                background=[0.0, 0.0, 0.0],
+            )
+
+        def forbidden_transmission_fit(**kwargs):
+            raise AssertionError("raw counts were silently converted to transmission")
+
+        monkeypatch.setattr(
+            nereids, "fit_counts_spectrum_typed", fake_fit_counts_spectrum_typed
+        )
+        monkeypatch.setattr(
+            nereids, "fit_spectrum_typed", forbidden_transmission_fit
+        )
+        _write_json_frontmatter_manifest(
+            tmp_path,
+            {
+                "mode": "single_spectrum",
+                "data": {"kind": "counts_npz", "path": "counts.npz"},
+                "isotopes": [_synthetic_u238_entry()],
+                "fit": {"max_iter": 5},
+                "resolution": {"kind": "none"},
+            },
+        )
+
+        result = process_resonance_dataset(str(tmp_path))
+
+        assert result["success"] is True
+        np.testing.assert_array_equal(captured["sample_counts"], sample)
+        np.testing.assert_array_equal(captured["open_beam_counts"], open_beam)
+        assert "solver" not in captured  # binding default resolves counts to KL
+
+    def test_count_spectrum_rejects_transmission_fit_domain(self, tmp_path):
+        np.savez(
+            tmp_path / "counts.npz",
+            energies_ev=np.linspace(1.0, 30.0, 20),
+            sample_counts=np.full(20, 900.0),
+            open_beam_counts=np.full(20, 1000.0),
+        )
+        _write_json_frontmatter_manifest(
+            tmp_path,
+            {
+                "mode": "single_spectrum",
+                "data": {"kind": "counts_npz", "path": "counts.npz"},
+                "isotopes": [_synthetic_u238_entry()],
+                "fit": {
+                    "solver": "lm",
+                    "fit_domain": "transmission",
+                    "max_iter": 5,
+                },
+                "resolution": {"kind": "none"},
+            },
+        )
+
+        result = process_resonance_dataset(str(tmp_path))
+
+        assert result["success"] is False
+        assert "raw count input cannot be fit in the transmission domain" in result["error"]
+
     def test_process_density_map_manifest(self, tmp_path):
         energies = np.linspace(1.0, 30.0, 120)
         true_density = 0.002
@@ -463,7 +545,7 @@ class TestManifestWorkflowTools:
                     "open_beam_path": open_beam_path.name,
                 },
                 "isotopes": [_synthetic_u238_entry(initial_density=0.001)],
-                "fit": {"solver": "lm", "max_iter": 5},
+                "fit": {"solver": "auto", "max_iter": 5},
                 "resolution": {"kind": "none"},
                 "output": {"directory": "output"},
             },
@@ -723,8 +805,8 @@ class TestManifestWorkflowTools:
         assert dry_run["success"] is False
         assert dry_run["validation"]["errors"] == validation["errors"]
         message = "\n".join(validation["errors"])
-        assert "counts input with instrument resolution is unsupported" in message
-        assert "separate open/sample response arms R[Phi] and R[Phi*T]" in message
+        assert "not available through the MCP manifest" in message
+        assert "incident fluence weights and measured detector-time bin edges" in message
 
     def test_validation_allows_transmission_with_active_resolution(self, tmp_path):
         np.savez(

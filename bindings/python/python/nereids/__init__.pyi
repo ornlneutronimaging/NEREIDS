@@ -239,9 +239,8 @@ class FitResult:
         Primary goodness-of-fit for ``solver='kl'`` (or the
         ``'poisson'`` / ``'joint_poisson'`` aliases) on counts data —
         replaces the fixed-flux Pearson chi-squared
-        that scaled with ``c``.  ``None`` for LM fits and for
-        transmission + PoissonKL (those populate
-        ``reduced_chi_squared`` with Pearson chi-squared / (n - k)).
+        that scaled with ``c``. ``None`` for LM transmission fits, which
+        populate ``reduced_chi_squared`` with Pearson chi-squared / (n - k).
         """
         ...
 
@@ -1614,16 +1613,13 @@ def from_counts_with_nuisance(
     flux: NDArray[np.float64],
     background: NDArray[np.float64],
 ) -> InputData:
-    """Create InputData from raw detector counts plus explicit nuisance spectra.
+    """Legacy input wrapper retained for compatibility.
 
-    Use this when the detector/counts background spectrum has been
-    estimated outside NEREIDS and should be supplied explicitly
-    alongside the open-beam flux.  Routes through the counts-KL
-    (joint-Poisson) dispatch when passed to ``spatial_map_typed``
-    with ``solver="auto"`` / ``"kl"``.  (Per-spectrum counts fitting
-    uses ``fit_counts_spectrum_typed``, which takes the raw 1D
-    ``sample_counts`` / ``open_beam_counts`` / ``detector_background``
-    arrays directly rather than an ``InputData`` wrapper.)
+    The production joint-Poisson fitter rejects a nonzero ``background``
+    because that spectrum is not connected to the physical two-arm likelihood.
+    New code should use ``from_counts`` for spatial fitting and
+    ``fit_two_arm_background_templates`` for independently measured
+    detector-bin background shapes.
 
     Args:
         sample_counts: 3D float64 array (n_energies, height, width).
@@ -1643,8 +1639,8 @@ def from_transmission(
 ) -> InputData:
     """Create InputData from normalized transmission and uncertainty.
 
-    The fitting engine uses LM by default. Pass solver="kl" to
-    spatial_map_typed() for low-count transmission data.
+    The fitting engine uses LM. Poisson/KL is rejected because normalized
+    transmission no longer contains the separate open/sample count arms.
     """
     ...
 
@@ -1704,18 +1700,19 @@ def spatial_map_typed(
     When ``groups`` is provided, each group maps to one fitted density parameter.
 
     Dispatches per-pixel fitting based on InputData type:
-      - from_counts / from_counts_with_nuisance + solver="kl" / "auto"
+      - from_counts + solver="kl" / "auto"
         -> counts-KL (joint-Poisson deviance) — the counts-path solver,
         validated against synthetic counts benchmarks and locked by a
         real-VENUS counts regression test on the committed aggregated-Hf
         fixture.
-      - from_transmission + solver="lm" (default for transmission) -> LM.
-      - from_transmission + solver="kl" -> Poisson NLL on transmission values
-        (legacy niche).
+      - from_transmission + solver="lm" or "auto" -> LM.
+      - from_transmission + a Poisson/KL solver -> rejected, because a ratio is
+        not Poisson count data.
 
     Args:
-        data: InputData from `from_counts()`, `from_counts_with_nuisance()`,
-            or `from_transmission()`.
+        data: InputData from `from_counts()` or `from_transmission()`.
+            `from_counts_with_nuisance()` is compatibility-only and rejects a
+            nonzero background in production fitting.
         fix_densities: Freeze all densities at their initial values across
             every pixel (per-pixel temperature-only fits with a known
             calibration-foil density — the fastest thermometry path).
@@ -1735,8 +1732,8 @@ def spatial_map_typed(
             and BackD becomes a constant duplicate of BackA at
             BackF ≈ 0).
         c: Proton-charge ratio ``Q_s / Q_ob`` for the counts-KL dispatch.
-            Default 1.0 (assumes caller PC-normalized
-            the flux already).  Ignored for LM / transmission-KL paths.
+            Default 1.0 (assumes caller PC-normalized the flux already).
+            Ignored for transmission LM.
         enable_polish: Override the Nelder-Mead polish flag.  ``None``
             (default) = the dispatcher auto-disables polish when
             ``n_pixels > 1`` (polish costs ~1000 s per pixel
@@ -1754,8 +1751,8 @@ def spatial_map_typed(
             ``sqrt(chi2/dof)`` at the converged point, turning the inverse-Fisher
             lower bound into a goodness-of-fit-scaled estimate. Sigma is scaled
             by sqrt of the goodness-of-fit each pixel's result reports (Gaussian
-            reduced-chi2 on the transmission paths incl. Poisson-KL,
-            deviance-per-dof on the counts joint-Poisson path). No-op on the
+            reduced-chi2 on the transmission LM path, deviance-per-dof on the
+            counts joint-Poisson path). No-op on the
             already-chi2-scaled LM transmission path. Default ``False``
             (issue #638).
 
@@ -1827,7 +1824,8 @@ def fit_spectrum_typed(
         temperature_k: Sample temperature in Kelvin (default 293.6).
         fit_temperature: Whether to fit temperature (default False).
         max_iter: Maximum iterations (default 200).
-        solver: 'lm' (default), 'kl', or 'auto'.
+        solver: ``'lm'`` (default) or ``'auto'``. Count-likelihood names are
+            rejected for normalized transmission.
         background: Enable SAMMY transmission background.
         resolution: Optional resolution function.
         groups: List of IsotopeGroup objects (mutually exclusive with isotopes).
@@ -1839,12 +1837,9 @@ def fit_spectrum_typed(
         density_free: Per-density free/fixed mask (``free[i] == False`` freezes
             density ``i``); length must equal the number of density parameters.
             Mutually exclusive with ``fix_densities``.
-        scale_by_chi2: Inflate covariance-only uncertainties by
-            ``sqrt(chi2/dof)`` (issue #638), scaling sigma by sqrt of the
-            Gaussian ``reduced_chi_squared`` this result reports. No-op on this
-            function's default LM transmission path (already chi2-scaled); with
-            an explicit ``solver='kl'`` it opts the raw inverse-Fisher sigma into
-            the same Gaussian reduced-chi2 scaling. Default ``False``.
+        scale_by_chi2: Compatibility flag. LM already scales its covariance by
+            Gaussian ``reduced_chi_squared``, so this is a no-op for normalized
+            transmission. Default ``False``.
     """
     ...
 
@@ -1874,7 +1869,10 @@ def fit_counts_spectrum_typed(
     alpha_1_init: float = 1.0,
     alpha_2_init: float = 1.0,
     c: float = 1.0,
-    resolution: TabulatedResolution | None = None,
+    resolution: TabulatedResolution | IkedaCarpenter | None = None,
+    incident_fluence_weights: NDArray[np.float64] | None = None,
+    detector_time_edges_us: NDArray[np.float64] | None = None,
+    timing_offset_us: float = 0.0,
     flight_path_m: float | None = None,
     delta_t_us: float | None = None,
     delta_l_m: float | None = None,
@@ -1909,9 +1907,8 @@ def fit_counts_spectrum_typed(
       ``FitResult.deviance_per_dof`` as the primary GOF.
       ``'joint_poisson'`` is kept as a compatibility alias; prefer ``'kl'``
       for new code.
-    - ``'lm'`` converts counts to transmission internally and runs
-      Levenberg-Marquardt on the resulting ratio (information-lossy
-      fallback).
+    - ``'lm'`` is rejected because converting the two count arms into a ratio
+      loses open-beam uncertainty and the original count statistics.
 
     For pre-normalized transmission data, use ``fit_spectrum_typed(...)``.
 
@@ -1927,8 +1924,8 @@ def fit_counts_spectrum_typed(
         fit_temperature: Whether to fit temperature (default False).
         max_iter: Maximum iterations (default 200).
         solver: ``'auto'`` (default), ``'kl'`` / ``'poisson'`` /
-            ``'joint_poisson'`` (all equivalent — counts-KL dispatch),
-            or ``'lm'``.
+            ``'joint_poisson'`` (all equivalent — counts-KL dispatch).
+            ``'lm'`` is rejected for raw counts.
         background: Enable the SAMMY-style transmission-background
             wrapper inside the counts-KL fit (A_n + B_A + B_B/√E + B_C√E).
         detector_background: Reserved detector/counts background reference.
@@ -1949,7 +1946,15 @@ def fit_counts_spectrum_typed(
             For raw VENUS-style counts, set this to the actual ratio
             (typically ~5–6).  Used by the counts-KL dispatch; ignored
             by the LM path.
-        resolution: Optional resolution function.
+        resolution: Exact detector-time response. Resolved raw-count fitting
+            accepts ``TabulatedResolution`` or ``IkedaCarpenter``.
+        incident_fluence_weights: Incident fluence integrated over each
+            true-energy quadrature point. Required with ``resolution`` for
+            resolved raw counts.
+        detector_time_edges_us: Measured detector-time bin edges. Its length
+            must be ``len(sample_counts) + 1``. Required with
+            ``incident_fluence_weights``.
+        timing_offset_us: Fixed detector-clock offset applied by the response.
         groups: List of IsotopeGroup objects (mutually exclusive with isotopes).
         initial_densities: Initial density guesses when using groups.
         fix_densities: Freeze all densities at their initial values and fit

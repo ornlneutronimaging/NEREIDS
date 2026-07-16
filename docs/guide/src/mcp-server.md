@@ -104,6 +104,11 @@ delimiters. Pure JSON manifests must contain the frontmatter object directly.
 The workflow configuration may be placed under `analysis`, `workflow`, or
 `processing`; otherwise the root object is treated as the workflow.
 
+The fitting domain follows the stored data. Normalized transmission uses LM.
+Separate sample/open-beam counts use the Poisson/KL count engine. The workflow
+does not silently divide counts into transmission, and it rejects a
+Poisson/KL request for normalized transmission.
+
 Minimal single-spectrum manifest:
 
 ```markdown
@@ -208,15 +213,10 @@ Example NeXus density-map manifest:
       {"isotope": "U-238", "initial_density": 0.001}
     ],
     "fit": {
-      "solver": "lm",
+      "solver": "auto",
       "max_iter": 100
     },
-    "resolution": {
-      "kind": "gaussian",
-      "flight_path_m": 25.0,
-      "delta_t_us": 0.5,
-      "delta_l_m": 0.005
-    }
+    "resolution": {"kind": "none"}
   }
 }
 ---

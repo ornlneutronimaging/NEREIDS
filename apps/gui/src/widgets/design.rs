@@ -1073,9 +1073,10 @@ pub(crate) fn counts_resolution_overlay_unsupported(
 }
 
 pub(crate) const COUNTS_RESOLUTION_OVERLAY_MESSAGE: &str = "Count fit overlay hidden: instrument resolution needs separate open/sample response arms \
-     R[Phi] and R[Phi*T]. Multiplying c*OB by R[T] is not a physical count model. Supply \
-     pre-normalized transmission, or disable instrument resolution until an exact count \
-     response is implemented.";
+     R[Phi] and R[Phi*T]. Multiplying c*OB by R[T] is not a physical count model. This GUI \
+     does not yet collect the source weights and detector-time edges required by the exact \
+     count fitter; use the direct Python API, pre-normalized transmission, or disable \
+     instrument resolution.";
 
 /// Build a fit overlay line from a `SpectrumFitResult`.
 ///

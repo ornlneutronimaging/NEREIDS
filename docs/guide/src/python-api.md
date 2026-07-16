@@ -82,7 +82,7 @@ Returned by `spatial_map_typed(...)`.
 | `converged_map` | `NDArray[bool_]` | Per-pixel convergence flags. |
 | `n_converged`, `n_failed`, `n_total` | `int` | Pixel fit counts. |
 | `temperature_map` | `NDArray[float64] or None` | Fitted temperature map when enabled. |
-| `temperature_uncertainty_map` | `NDArray[float64] or None` | Per-pixel 1σ temperature uncertainty (K) when `fit_temperature=True`. **Covariance-only lower bound** on the Poisson-KL / joint-Poisson paths: it captures only statistical curvature (inverse Fisher matrix), omits baseline/model noise, and on real data can underestimate the observed per-superpixel scatter by ~3–4×. Pass `scale_by_chi2=True` for a goodness-of-fit-scaled estimate: σ is multiplied by `sqrt` of the reduced χ² each pixel's result reports (Gaussian `reduced_chi_squared` on the transmission paths, `deviance_per_dof` on the counts joint-Poisson path). This inflates σ for an under-fit pixel (χ²/dof > 1) and, less commonly, shrinks it for an over-fit one (χ²/dof < 1). The flag is a no-op on the already-χ²-scaled LM transmission path. |
+| `temperature_uncertainty_map` | `NDArray[float64] or None` | Per-pixel 1σ temperature uncertainty (K) when `fit_temperature=True`. On the raw-count joint-Poisson path this is a **covariance-only lower bound**: it captures only statistical curvature (inverse Fisher matrix) and omits baseline/model noise. Pass `scale_by_chi2=True` to multiply it by the square root of `deviance_per_dof`. The flag is a no-op on the LM transmission path, which already scales covariance by reduced chi-squared. |
 | `anorm_map`, `background_maps` | `NDArray[float64] / list[...] or None` | SAMMY `Anorm` and the polynomial background `[BackA, BackB, BackC]` per pixel when `background=True`. |
 | `back_d_map`, `back_f_map` | `NDArray[float64] or None` | SAMMY exponential background `BackD` / `BackF` per pixel when `background=True` and `fit_back_d=True` / `fit_back_f=True`. Counts-KL spatial runs always return `None` for both (the joint-Poisson dispatch never fits the exponential tail). |
 | `t0_us_map`, `l_scale_map` | `NDArray[float64] or None` | Energy-scale maps when enabled. |
@@ -199,14 +199,16 @@ Background placement is part of the model, not a scripting choice:
 | Sample scattering measured directly in detector-time bins under independently documented conditions | Add after the neutron response as a detector-bin template. |
 | SAMMY-style transmission baseline/background | Use the separate transmission model; it is not accepted as a count template by this API. |
 
-The older fitting routes remain separate:
+The supported fit matrix is explicit:
 
-| Fitting route | Current background behavior |
-|---------------|-----------------------------|
-| Transmission with LM or KL | `background=True` fits the SAMMY-style transmission model. |
-| Counts with KL | `background=True` also fits a SAMMY-style change to transmission inside the count likelihood; this is not a detector-count background. |
-| Counts with a nonzero `detector_background` argument | The production fit currently rejects this input because its detector-background scale is not wired into the joint count likelihood. It is not silently substituted with the SAMMY model. |
-| Exact two-arm response shown above | `fit_two_arm_background_templates(...)` fits independently supplied detector-bin templates while holding the neutron signal fixed. Joint fitting with nuclear or calibration parameters is deliberately deferred until the parameter-separation checks are complete. |
+| Data | Engine | Decision and background behavior |
+|------|--------|----------------------------------|
+| Pre-normalized transmission | LM least squares | Supported. `background=True` fits the SAMMY apparent-transmission curve. Resolution on this route is a ratio-level approximation because the separate count arms are unavailable. |
+| Pre-normalized transmission | Poisson/KL | Rejected: a fractional ratio is not a Poisson count and its supplied uncertainty would be ignored. |
+| Separate open/sample counts | Poisson/KL | Supported. With a detector response, the exact source weights and detector-time edges are required. `background=True` applies the SAMMY curve to measured apparent transmission after the two-arm detector calculation. |
+| Separate open/sample counts | LM least squares | Rejected: silently dividing the arms loses the open-beam count uncertainty. |
+| Count data with detector/gamma templates | Fixed-signal count-template fit | Supported by `fit_two_arm_background_templates(...)`. The template fit is deliberately separate from nuclear/calibration fitting; a nonzero `detector_background` on the main fitter is rejected rather than misinterpreted. |
+| Spatial count cube with detector response | Any | Not yet supported: the spatial API does not carry the exact source/time inputs and does not yet cache one fixed detector matrix for all pixels. |
 
 `TwoArmBackgroundFitResult` reports `names`, `amplitudes`, optional local
 `amplitude_uncertainties`, `amplitudes_identifiable`, the
@@ -246,7 +248,7 @@ Keyword arguments:
 | `temperature_k=293.6` | Sample temperature in kelvin. |
 | `fit_temperature=False` | Fit sample temperature in addition to densities. |
 | `max_iter=200` | Maximum optimizer iterations. |
-| `solver="lm"` | `"lm"`, `"kl"`, `"auto"`, `"poisson"`, or `"joint_poisson"`. `"poisson"` and `"joint_poisson"` are aliases used by the counts dispatch and accepted here for symmetry. |
+| `solver="lm"` | `"lm"` or `"auto"` for normalized transmission. Poisson/KL names are rejected because transmission ratios are not Poisson counts. |
 | `background=False` | Enable SAMMY-style transmission background parameters. |
 | `fit_back_d=False`, `fit_back_f=False` | Fit optional exponential background terms. |
 | `back_d_init=0.01`, `back_f_init=1.0` | Initial exponential background values. |
@@ -279,12 +281,18 @@ counts have different proton charge or dwell-time normalization. The primary
 GOF for this path is `FitResult.deviance_per_dof`.
 
 Counts fitting accepts temperature, isotope groups, energy-scale calibration,
-and `fit_energy_range`. It does not currently accept every transmission option:
-the production counts route rejects a nonzero `detector_background`, fitted
-counts nuisance factors, and an instrument-resolution argument instead of
-silently routing them through a different model. The exact two-arm APIs above
-provide the validated response and detector-bin background operations while
-their joint calibration is being checked. Counts-specific options are:
+and `fit_energy_range` when no detector response is active. Resolved counts use
+the exact two-arm model by supplying `resolution`, `incident_fluence_weights`,
+and `detector_time_edges_us` together. `energies` is then the true-energy
+quadrature and may have a different length from the measured count arrays. The
+fit evaluates `response(flux * transmission) / response(flux)`; it never uses
+the post-hoc shortcut `response(transmission)`. Energy-scale fitting and an
+energy fit window are rejected on this two-axis route until the detector clock
+is fitted consistently.
+
+The production counts route still rejects a nonzero `detector_background` and
+fitted count nuisance factors. Use the independently measured template API
+above for those backgrounds. Counts-specific options are:
 
 | Option | Meaning |
 |--------|---------|
@@ -292,6 +300,10 @@ their joint calibration is being checked. Counts-specific options are:
 | `fit_alpha_1=False`, `fit_alpha_2=False` | Research-only flags. The production fit rejects enabling them. |
 | `alpha_1_init=1.0`, `alpha_2_init=1.0` | Research-only initial values; they do not enable nuisance fitting in the production route. |
 | `c=1.0` | Proton-charge ratio `Q_s / Q_ob`. |
+| `resolution=...` | Exact detector-time response (`TabulatedResolution` or `IkedaCarpenter`); requires the two arrays below. |
+| `incident_fluence_weights=...` | Incident fluence integrated over the true-energy quadrature. |
+| `detector_time_edges_us=...` | Measured detector-time edges; length is `len(sample_counts) + 1`. |
+| `timing_offset_us=0.0` | Fixed detector-clock offset used by the response. |
 | `enable_polish=True/False/None` | Override counts-KL polish behavior; `None` uses the dispatcher default. |
 
 ## Spatial Mapping
@@ -309,11 +321,10 @@ result = nereids.spatial_map_typed(
 )
 ```
 
-For `from_transmission(...)` inputs the default `solver="lm"` and `solver="auto"`
-both route to LM (this is the dispatcher contract in `__init__.pyi`:
-"`from_transmission + solver="lm"` (default for transmission) → LM"). The
-explicit `solver="kl"` opt-in for `from_transmission` runs the legacy
-Poisson-NLL-on-transmission path. `density_maps[0]` is the fitted U-238 map.
+For `from_transmission(...)` inputs, `solver="lm"` and `solver="auto"` both
+route to LM. Poisson/KL solver names are rejected because the normalized ratio
+no longer contains the separate open and sample count arms.
+`density_maps[0]` is the fitted U-238 map.
 
 ### Raw Count Cubes
 

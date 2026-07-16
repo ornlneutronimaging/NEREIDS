@@ -9,7 +9,7 @@
 use std::sync::Arc;
 
 use crate::guided::{detectability, forward_model, result_widgets};
-use crate::state::{AppState, Colormap, EndfStatus, SpectrumAxis, StudioDocTab};
+use crate::state::{AppState, Colormap, EndfStatus, InputMode, SpectrumAxis, StudioDocTab};
 use crate::theme::ThemeColors;
 use crate::widgets::design;
 use crate::widgets::image_view::show_colormapped_image;
@@ -1242,6 +1242,9 @@ fn solver_card(ui: &mut egui::Ui, state: &mut AppState) {
     use crate::state::{GuidedStep, SolverMethod};
 
     design::card_with_header(ui, "Solver", None, |ui| {
+        let counts_available = state.sample_data.is_some()
+            && state.open_beam_data.is_some()
+            && !matches!(state.input_mode, InputMode::TransmissionTiff);
         ui.horizontal(|ui| {
             ui.label("Method:");
             let prev = state.solver_method;
@@ -1257,16 +1260,21 @@ fn solver_card(ui: &mut egui::Ui, state: &mut AppState) {
                         SolverMethod::LevenbergMarquardt,
                         "Levenberg-Marquardt",
                     );
-                    ui.selectable_value(
-                        &mut state.solver_method,
-                        SolverMethod::PoissonKL,
-                        "Poisson KL",
-                    );
+                    ui.add_enabled_ui(counts_available, |ui| {
+                        ui.selectable_value(
+                            &mut state.solver_method,
+                            SolverMethod::PoissonKL,
+                            "Poisson KL (raw counts)",
+                        );
+                    });
                 });
             if state.solver_method != prev {
                 state.mark_dirty(GuidedStep::Analyze);
             }
         });
+        if !counts_available {
+            ui.weak("Poisson KL needs separate sample and open-beam counts");
+        }
 
         ui.horizontal(|ui| {
             ui.label("Max iter:");

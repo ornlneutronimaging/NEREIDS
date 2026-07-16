@@ -5,6 +5,7 @@
 //! ## Modules
 //! - [`active_mask`] — Active-bin masking for fit-energy-range restriction
 //! - [`error`] — Error types for the fitting crate
+//! - [`exact_count_model`] — Exact two-arm detector-bin model for count fitting
 //! - [`forward_model`] — Solver-agnostic forward model trait
 //! - [`joint_poisson`] — Joint-Poisson profile binomial deviance (counts path)
 //! - [`lm`] — Levenberg-Marquardt least-squares optimizer
@@ -22,6 +23,7 @@
 pub mod active_mask;
 pub mod count_background;
 pub mod error;
+pub mod exact_count_model;
 pub mod forward_model;
 pub mod joint_poisson;
 pub mod lm;
