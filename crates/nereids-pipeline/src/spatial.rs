@@ -1558,23 +1558,27 @@ pub fn spatial_map_typed(
         })
     });
 
-    // Precompute unbroadened (base) cross-sections for temperature fitting.
-    // This avoids 74× overhead from redundant Reich-Moore evaluation per
-    // KL iteration (112ms Reich-Moore vs 1.5ms Doppler rebroadening).
+    // A temperature fit retains the resonance source for supported SLBW/MLBW
+    // data. Cache the zero-temperature rows once only as the all-isotope
+    // fallback for unsupported formalisms; the fit model never selects these
+    // rows for an isotope covered by the continuous source evaluator.
+    let fallback_base_xs = if config.fit_temperature() && !config.has_precomputed_base_xs() {
+        Some(Arc::new(unbroadened_cross_sections(
+            config.energies(),
+            config.resonance_data(),
+            cancel,
+        )?))
+    } else {
+        None
+    };
     let fast_config = if config.fit_temperature() {
-        // Bare `?`: the `From<TransmissionError>` impl maps
-        // `TransmissionError::Cancelled` to `PipelineError::Cancelled`,
-        // keeping the documented uniform-Cancelled contract when the user
-        // cancels during this (expensive) Reich-Moore precompute.  A
-        // `.map_err(PipelineError::Transmission)` here would bypass that
-        // conversion and surface cancellation as an error.
-        let base_xs: Vec<Vec<f64>> =
-            unbroadened_cross_sections(config.energies(), config.resonance_data(), cancel)?;
         let mut cfg = config
             .clone()
             .with_precomputed_cross_sections(xs)
-            .with_precomputed_base_xs(Arc::new(base_xs))
             .with_compute_covariance(true);
+        if let Some(fallback_base_xs) = fallback_base_xs {
+            cfg = cfg.with_precomputed_fallback_base_xs(fallback_base_xs);
+        }
         if let Some(plan) = resolution_plan.clone() {
             cfg = cfg.with_precomputed_resolution_plan(plan);
         }

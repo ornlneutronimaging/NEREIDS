@@ -19,6 +19,7 @@ use crate::reich_moore::CrossSectionPlan;
 const SUPPORT_X: f64 = 8.0;
 const RELATIVE_TOLERANCE: f64 = 1.0e-8;
 const ABSOLUTE_TOLERANCE_BARN: f64 = 1.0e-8;
+const ABSOLUTE_DERIVATIVE_TOLERANCE_BARN_PER_K: f64 = 1.0e-10;
 const MAX_DEPTH: usize = 20;
 const MAX_ACTIVE_PANELS: usize = 4_096;
 const SQRT_PI: f64 = 1.772_453_850_905_516;
@@ -93,6 +94,10 @@ pub enum ContinuousDopplerError {
         energy_ev: f64,
         value: f64,
     },
+    InvalidDerivative {
+        energy_ev: f64,
+        value: f64,
+    },
     PanelLimit {
         energy_ev: f64,
         limit: usize,
@@ -128,6 +133,10 @@ impl fmt::Display for ContinuousDopplerError {
                 formatter,
                 "continuous Doppler integral at {energy_ev} eV is invalid: {value}"
             ),
+            Self::InvalidDerivative { energy_ev, value } => write!(
+                formatter,
+                "continuous Doppler temperature derivative at {energy_ev} eV is invalid: {value}"
+            ),
             Self::PanelLimit { energy_ev, limit } => write!(
                 formatter,
                 "continuous Doppler integral at {energy_ev} eV exceeded {limit} active panels"
@@ -156,13 +165,16 @@ struct Panel {
     right: f64,
     depth: usize,
     value: f64,
-    error: f64,
+    derivative: f64,
+    value_error: f64,
+    derivative_error: f64,
+    priority: f64,
     sequence: usize,
 }
 
 impl PartialEq for Panel {
     fn eq(&self, other: &Self) -> bool {
-        self.error.to_bits() == other.error.to_bits() && self.sequence == other.sequence
+        self.priority.to_bits() == other.priority.to_bits() && self.sequence == other.sequence
     }
 }
 
@@ -176,10 +188,26 @@ impl PartialOrd for Panel {
 
 impl Ord for Panel {
     fn cmp(&self, other: &Self) -> Ordering {
-        self.error
-            .total_cmp(&other.error)
+        self.priority
+            .total_cmp(&other.priority)
             .then_with(|| self.sequence.cmp(&other.sequence))
     }
+}
+
+#[derive(Debug, Clone, Copy)]
+struct Integral {
+    value: f64,
+    derivative: f64,
+}
+
+type BroadenedWithDerivative = (Vec<f64>, Vec<f64>);
+
+struct TargetContext<'plan, 'data> {
+    plan: &'plan CrossSectionPlan<'data>,
+    target_energy: f64,
+    thermal_u: f64,
+    temperature_k: f64,
+    require_derivative: bool,
 }
 
 fn supported_range(
@@ -243,10 +271,11 @@ fn rule(
     plan: &CrossSectionPlan<'_>,
     target_energy: f64,
     thermal_u: f64,
+    temperature_k: f64,
     left: f64,
     right: f64,
     nodes: &[(f64, f64)],
-) -> f64 {
+) -> Integral {
     let middle = 0.5 * (left + right);
     let radius = 0.5 * (right - left);
     let target_speed = target_energy.sqrt();
@@ -258,36 +287,65 @@ fn rule(
         })
         .collect();
     let cross_sections = plan.evaluate(&source_energies);
-    radius
-        * nodes
-            .iter()
-            .zip(source_energies.iter().zip(cross_sections))
-            .map(|((node, weight), (source_energy, cross_section))| {
-                let coordinate = middle + radius * node;
+    let (value, derivative) = nodes
+        .iter()
+        .zip(source_energies.iter().zip(cross_sections))
+        .map(|((node, weight), (source_energy, cross_section))| {
+            let coordinate = middle + radius * node;
+            let contribution =
                 weight * (-coordinate * coordinate).exp() * source_energy * cross_section.total
-                    / (SQRT_PI * target_energy)
-            })
-            .sum::<f64>()
+                    / (SQRT_PI * target_energy);
+            (
+                contribution,
+                contribution * (coordinate * coordinate - 0.5) / temperature_k,
+            )
+        })
+        .fold((0.0, 0.0), |(value, derivative), contribution| {
+            (value + contribution.0, derivative + contribution.1)
+        });
+    Integral {
+        value: radius * value,
+        derivative: radius * derivative,
+    }
 }
 
-fn evaluate_panel(
-    plan: &CrossSectionPlan<'_>,
-    target_energy: f64,
-    thermal_u: f64,
-    left: f64,
-    right: f64,
-    depth: usize,
-    sequence: usize,
-) -> Panel {
-    let coarse = rule(plan, target_energy, thermal_u, left, right, &GL16);
-    let fine = rule(plan, target_energy, thermal_u, left, right, &GL32);
-    Panel {
-        left,
-        right,
-        depth,
-        value: fine,
-        error: (fine - coarse).abs(),
-        sequence,
+impl TargetContext<'_, '_> {
+    fn evaluate_panel(&self, left: f64, right: f64, depth: usize, sequence: usize) -> Panel {
+        let coarse = rule(
+            self.plan,
+            self.target_energy,
+            self.thermal_u,
+            self.temperature_k,
+            left,
+            right,
+            &GL16,
+        );
+        let fine = rule(
+            self.plan,
+            self.target_energy,
+            self.thermal_u,
+            self.temperature_k,
+            left,
+            right,
+            &GL32,
+        );
+        let value_error = (fine.value - coarse.value).abs();
+        let derivative_error = (fine.derivative - coarse.derivative).abs();
+        Panel {
+            left,
+            right,
+            depth,
+            value: fine.value,
+            derivative: fine.derivative,
+            value_error,
+            derivative_error,
+            priority: if self.require_derivative {
+                value_error.max(self.temperature_k * derivative_error)
+            } else {
+                value_error
+            },
+            sequence,
+        }
     }
 }
 
@@ -296,29 +354,38 @@ fn broaden_target(
     range: &ResonanceRange,
     target_energy: f64,
     thermal_u: f64,
-) -> Result<f64, ContinuousDopplerError> {
+    temperature_k: f64,
+    require_derivative: bool,
+) -> Result<Integral, ContinuousDopplerError> {
+    let context = TargetContext {
+        plan,
+        target_energy,
+        thermal_u,
+        temperature_k,
+        require_derivative,
+    };
     let points = breakpoints(range, target_energy, thermal_u);
     let mut heap = BinaryHeap::with_capacity(points.len());
     let mut value = 0.0;
-    let mut error = 0.0;
+    let mut derivative = 0.0;
+    let mut value_error = 0.0;
+    let mut derivative_error = 0.0;
     let mut sequence = 0usize;
     for pair in points.windows(2) {
-        let panel = evaluate_panel(
-            plan,
-            target_energy,
-            thermal_u,
-            pair[0],
-            pair[1],
-            0,
-            sequence,
-        );
+        let panel = context.evaluate_panel(pair[0], pair[1], 0, sequence);
         sequence += 1;
         value += panel.value;
-        error += panel.error;
+        derivative += panel.derivative;
+        value_error += panel.value_error;
+        derivative_error += panel.derivative_error;
         heap.push(panel);
     }
 
-    while error > ABSOLUTE_TOLERANCE_BARN + RELATIVE_TOLERANCE * value.abs() {
+    while value_error > ABSOLUTE_TOLERANCE_BARN + RELATIVE_TOLERANCE * value.abs()
+        || (require_derivative
+            && derivative_error
+                > ABSOLUTE_DERIVATIVE_TOLERANCE_BARN_PER_K + RELATIVE_TOLERANCE * derivative.abs())
+    {
         if heap.len() >= MAX_ACTIVE_PANELS {
             return Err(ContinuousDopplerError::PanelLimit {
                 energy_ev: target_energy,
@@ -341,28 +408,19 @@ fn broaden_target(
             });
         }
         let children = [
-            evaluate_panel(
-                plan,
-                target_energy,
-                thermal_u,
-                panel.left,
-                middle,
-                panel.depth + 1,
-                sequence,
-            ),
-            evaluate_panel(
-                plan,
-                target_energy,
-                thermal_u,
-                middle,
-                panel.right,
-                panel.depth + 1,
-                sequence + 1,
-            ),
+            context.evaluate_panel(panel.left, middle, panel.depth + 1, sequence),
+            context.evaluate_panel(middle, panel.right, panel.depth + 1, sequence + 1),
         ];
         sequence += 2;
         value += children[0].value + children[1].value - panel.value;
-        error = (error + children[0].error + children[1].error - panel.error).max(0.0);
+        derivative += children[0].derivative + children[1].derivative - panel.derivative;
+        value_error = (value_error + children[0].value_error + children[1].value_error
+            - panel.value_error)
+            .max(0.0);
+        derivative_error =
+            (derivative_error + children[0].derivative_error + children[1].derivative_error
+                - panel.derivative_error)
+                .max(0.0);
         heap.extend(children);
     }
 
@@ -372,20 +430,16 @@ fn broaden_target(
             value,
         });
     }
-    Ok(value)
+    if require_derivative && !derivative.is_finite() {
+        return Err(ContinuousDopplerError::InvalidDerivative {
+            energy_ev: target_energy,
+            value: derivative,
+        });
+    }
+    Ok(Integral { value, derivative })
 }
 
-/// Try the continuous source-aware free-gas transform.
-///
-/// `Ok(None)` means that at least one requested thermal support window is not
-/// wholly inside a resolved SLBW/MLBW range.  Callers must then use their
-/// explicitly named legacy route; unsupported data are never partially mixed
-/// with the continuous result.
-pub(crate) fn try_broaden(
-    energies: &[f64],
-    data: &ResonanceData,
-    params: &DopplerParams,
-) -> Result<Option<Vec<f64>>, ContinuousDopplerError> {
+fn validate_energies(energies: &[f64]) -> Result<(), ContinuousDopplerError> {
     for (index, &energy) in energies.iter().enumerate() {
         if !energy.is_finite() || energy <= 0.0 {
             return Err(ContinuousDopplerError::InvalidEnergy {
@@ -401,28 +455,33 @@ pub(crate) fn try_broaden(
             });
         }
     }
+    Ok(())
+}
+
+fn try_broaden_integrals(
+    energies: &[f64],
+    data: &ResonanceData,
+    params: &DopplerParams,
+    require_derivative: bool,
+) -> Result<Option<Vec<Integral>>, ContinuousDopplerError> {
+    validate_energies(energies)?;
     if energies.is_empty() {
         return Ok(Some(Vec::new()));
     }
 
     let plan = CrossSectionPlan::new(data);
-    if params.temperature_k() <= 0.0 {
+    if params.temperature_k() <= 0.0 || params.u() == 0.0 {
         return Ok(Some(
             plan.evaluate(energies)
                 .into_iter()
-                .map(|cross_section| cross_section.total)
+                .map(|cross_section| Integral {
+                    value: cross_section.total,
+                    derivative: 0.0,
+                })
                 .collect(),
         ));
     }
     let thermal_u = params.u();
-    if thermal_u == 0.0 {
-        return Ok(Some(
-            plan.evaluate(energies)
-                .into_iter()
-                .map(|cross_section| cross_section.total)
-                .collect(),
-        ));
-    }
     let ranges: Option<Vec<&ResonanceRange>> = energies
         .iter()
         .map(|&energy| supported_range(data, energy, thermal_u))
@@ -434,9 +493,60 @@ pub(crate) fn try_broaden(
     energies
         .iter()
         .zip(ranges)
-        .map(|(&energy, range)| broaden_target(&plan, range, energy, thermal_u))
+        .map(|(&energy, range)| {
+            broaden_target(
+                &plan,
+                range,
+                energy,
+                thermal_u,
+                params.temperature_k(),
+                require_derivative,
+            )
+        })
         .collect::<Result<Vec<_>, _>>()
         .map(Some)
+}
+
+/// Try the continuous source-aware free-gas transform.
+///
+/// `Ok(None)` means that at least one requested thermal support window is not
+/// wholly inside a resolved SLBW/MLBW range.  Callers must then use their
+/// explicitly named legacy route; unsupported data are never partially mixed
+/// with the continuous result.
+pub(crate) fn try_broaden(
+    energies: &[f64],
+    data: &ResonanceData,
+    params: &DopplerParams,
+) -> Result<Option<Vec<f64>>, ContinuousDopplerError> {
+    try_broaden_integrals(energies, data, params, false).map(|result| {
+        result.map(|integrals| {
+            integrals
+                .into_iter()
+                .map(|integral| integral.value)
+                .collect()
+        })
+    })
+}
+
+/// Try the continuous free-gas transform and its exact temperature derivative.
+///
+/// At fixed source speed, differentiating the Maxwellian kernel contributes
+/// `(x^2 - 1/2) / T` inside the same integral, where
+/// `x = (sqrt(E_source) - sqrt(E_target)) / u`.  Value and derivative are
+/// integrated together and must both pass error estimates before returning.
+pub(crate) fn try_broaden_with_derivative(
+    energies: &[f64],
+    data: &ResonanceData,
+    params: &DopplerParams,
+) -> Result<Option<BroadenedWithDerivative>, ContinuousDopplerError> {
+    try_broaden_integrals(energies, data, params, true).map(|result| {
+        result.map(|integrals| {
+            integrals
+                .into_iter()
+                .map(|integral| (integral.value, integral.derivative))
+                .unzip()
+        })
+    })
 }
 
 #[cfg(test)]
@@ -511,5 +621,37 @@ mod tests {
             .collect();
 
         assert_eq!(actual, expected);
+    }
+
+    #[test]
+    fn analytical_temperature_derivative_matches_five_point_difference() {
+        let data = u238_with_formalism(ResonanceFormalism::MLBW);
+        let energy = [6.674];
+        let temperature = 300.0;
+        let step = 0.5;
+        let params = DopplerParams::new(temperature, data.awr).unwrap();
+        let (_, derivative) = try_broaden_with_derivative(&energy, &data, &params)
+            .unwrap()
+            .expect("supported MLBW source");
+        let value_at = |offset: f64| {
+            let shifted = DopplerParams::new(temperature + offset, data.awr).unwrap();
+            try_broaden(&energy, &data, &shifted)
+                .unwrap()
+                .expect("supported MLBW source")[0]
+        };
+        let five_point = (value_at(-2.0 * step) - 8.0 * value_at(-step) + 8.0 * value_at(step)
+            - value_at(2.0 * step))
+            / (12.0 * step);
+        let difference = (derivative[0] - five_point).abs();
+        let allowance = 1.0e-8 + 1.0e-6 * five_point.abs();
+
+        assert!(
+            difference <= allowance,
+            "analytical={} five_point={} difference={} allowance={}",
+            derivative[0],
+            five_point,
+            difference,
+            allowance,
+        );
     }
 }

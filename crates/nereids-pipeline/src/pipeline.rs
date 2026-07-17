@@ -444,7 +444,16 @@ pub struct UnifiedFitConfig {
     /// working-grid copy consumed only by `build_transmission_model`'s
     /// precomputed branch.
     precomputed_work_cross_sections: Option<PrecomputedWorkXs>,
+    /// Explicit sampled zero-temperature source for the legacy table route.
+    /// Do not populate this from `resonance_data`: doing so loses unresolved
+    /// narrow structure between the caller's energy points before Doppler
+    /// broadening. The standard temperature-fit path leaves this `None` and
+    /// retains the resonance source.
     precomputed_base_xs: Option<Arc<Vec<Vec<f64>>>>,
+    /// Shared zero-temperature cache used only when the continuous source
+    /// evaluator cannot cover an isotope. Injected by the spatial route so
+    /// unsupported formalisms are not reevaluated once per pixel and trial.
+    precomputed_fallback_base_xs: Option<Arc<Vec<Vec<f64>>>>,
     /// Resolution broadening plan built once for `(energies, resolution)`.
     ///
     /// Populated by [`spatial_map_typed`] when the data grid is shared
@@ -601,6 +610,7 @@ impl UnifiedFitConfig {
             precomputed_cross_sections: None,
             precomputed_work_cross_sections: None,
             precomputed_base_xs: None,
+            precomputed_fallback_base_xs: None,
             precomputed_resolution_plan: None,
             precomputed_sparse_cubature_plan: None,
             precomputed_sparse_scalar_plan: None,
@@ -822,6 +832,10 @@ impl UnifiedFitConfig {
         self
     }
 
+    /// Select the explicit sampled-source temperature route.
+    ///
+    /// This is for a genuinely tabulated source. A resolved ENDF evaluation
+    /// should remain in `resonance_data` so the source-aware integral is used.
     #[must_use]
     pub fn with_precomputed_base_xs(mut self, xs: Arc<Vec<Vec<f64>>>) -> Self {
         self.precomputed_base_xs = Some(xs);
@@ -830,6 +844,16 @@ impl UnifiedFitConfig {
         // the same reason as `with_precomputed_cross_sections`.
         self.precomputed_sparse_cubature_plan = None;
         self.precomputed_sparse_scalar_plan = None;
+        self
+    }
+
+    pub(crate) fn has_precomputed_base_xs(&self) -> bool {
+        self.precomputed_base_xs.is_some()
+    }
+
+    /// Attach the spatial route's shared sampled-fallback cache.
+    pub(crate) fn with_precomputed_fallback_base_xs(mut self, xs: Arc<Vec<Vec<f64>>>) -> Self {
+        self.precomputed_fallback_base_xs = Some(xs);
         self
     }
 
@@ -965,6 +989,7 @@ impl UnifiedFitConfig {
         self.precomputed_cross_sections = None;
         self.precomputed_work_cross_sections = None;
         self.precomputed_base_xs = None;
+        self.precomputed_fallback_base_xs = None;
         // Clear the cubature plan too: atoms are σ-coordinates in
         // ℝ^k and `k` / σ-stack change when groups are reconfigured,
         // so a stale plan would silently produce wrong forward /
@@ -2924,8 +2949,8 @@ fn build_transmission_model(
     // uses) so this path also returns a `PrecomputedTransmissionModel`.
     //
     // Before issue #635 this case fell through to `TransmissionFitModel`,
-    // whose constructor only builds `base_xs` when a temperature index is
-    // present — so `analytical_jacobian` returned `None` and every
+    // whose constructor only enters its cached cross-section path when a
+    // temperature index is present — so `analytical_jacobian` returned `None` and every
     // downstream consumer silently degraded to finite differences.  For
     // the LM path that is a hidden slowdown; for the joint-Poisson
     // stage-1 the degradation is to an IDENTITY-Fisher fallback (plain
@@ -3094,6 +3119,7 @@ fn build_transmission_model(
         .map(|r| Arc::new(InstrumentParams { resolution: r }));
 
     let base_xs = config.precomputed_base_xs.clone();
+    let fallback_base_xs = config.precomputed_fallback_base_xs.clone();
     let density_ratios = config
         .density_ratios
         .clone()
@@ -3117,7 +3143,18 @@ fn build_transmission_model(
     } else {
         None
     };
-    Ok(Box::new(
+    let model = if let Some(fallback_base_xs) = fallback_base_xs {
+        TransmissionFitModel::new_with_cached_fallback(
+            config.energies.clone(),
+            config.resonance_data.clone(),
+            config.temperature_k,
+            instrument.clone(),
+            (density_indices, density_ratios),
+            temperature_index,
+            base_xs.clone(),
+            Some(fallback_base_xs),
+        )?
+    } else {
         TransmissionFitModel::new(
             config.energies.clone(),
             config.resonance_data.clone(),
@@ -3127,9 +3164,12 @@ fn build_transmission_model(
             temperature_index,
             base_xs,
         )?
-        .with_resolution_plan(resolution_plan)
-        .with_sparse_cubature_plan(sparse_cubature_plan)
-        .with_sparse_scalar_plan(sparse_scalar_plan),
+    };
+    Ok(Box::new(
+        model
+            .with_resolution_plan(resolution_plan)
+            .with_sparse_cubature_plan(sparse_cubature_plan)
+            .with_sparse_scalar_plan(sparse_scalar_plan),
     ))
 }
 
@@ -3445,17 +3485,17 @@ pub fn evaluate_jacobian_and_fisher(
     // ── Precompute cross-sections so that analytical Jacobian is available ──
     // For the density-only case (no temperature fitting), the model uses
     // PrecomputedTransmissionModel which requires precomputed XS.
-    // For the temperature case, TransmissionFitModel computes base_xs in
-    // its constructor.  Either way, precomputing here ensures the analytical
-    // Jacobian path is always available.
+    // For the temperature case, TransmissionFitModel retains the resonance
+    // source and caches the source-aware broadened result. Either way, the
+    // analytical Jacobian path is available.
     // Issue #608: the non-temperature path uses `PrecomputedTransmissionModel`,
     // which must apply resolution on the WORKING grid (auxiliary extended grid
     // under Gaussian resolution) and extract the data points last — the same
     // #608 path as production fitting + spatial mapping, not the old coarse
     // data-grid path.  Derive σ from `resonance_data` (the source of truth) on
     // the working grid here whenever it is not already set up:
-    //   * `fit_temperature` → skip: `TransmissionFitModel` builds its own
-    //     working-grid base σ internally.
+    //   * `fit_temperature` → skip: `TransmissionFitModel` evaluates the
+    //     retained resonance source on the working grid.
     //   * working-grid σ already attached (a caller did the #608 setup) → skip.
     //   * otherwise (caller passed no σ, OR only a data-grid σ) → (re)build the
     //     data-grid σ = `extract(work σ)` AND the working-grid σ + layout from
@@ -7117,7 +7157,7 @@ mod tests {
     /// Cover the OTHER branches of the #608 `evaluate_jacobian_and_fisher` σ
     /// restructure: the identity-layout path (no resolution ⇒ working grid ==
     /// data grid) and the early-return when `fit_temperature` is set (the
-    /// `TransmissionFitModel` builds its own working-grid base σ).
+    /// `TransmissionFitModel` retains its resonance source).
     #[test]
     fn evaluate_jacobian_and_fisher_identity_and_temperature_paths() {
         let data = u238_single_resonance();
@@ -7143,7 +7183,7 @@ mod tests {
             "identity-path Fisher[0,0]={f00}"
         );
         // (b) fit_temperature ⇒ the σ-branch early-returns `config`;
-        //     TransmissionFitModel builds its own working-grid base σ.
+        //     TransmissionFitModel retains its resonance source.
         let cfg_t = UnifiedFitConfig::new(
             energies,
             vec![data],

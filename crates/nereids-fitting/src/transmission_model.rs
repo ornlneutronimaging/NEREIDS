@@ -772,12 +772,21 @@ pub struct TransmissionFitModel {
     /// and included as a free parameter in the fit. The Doppler broadening
     /// kernel is recomputed at each `evaluate()` call.
     temperature_index: Option<usize>,
-    /// Cached unbroadened (Reich-Moore) cross-sections, computed once in
-    /// `new()` when `temperature_index` is `Some`. Eliminates redundant
-    /// O(N_energy × N_resonances) computation on every `evaluate()` call.
-    /// Wrapped in `Arc` so `spatial_map` can share a single allocation across
-    /// all per-pixel `TransmissionFitModel` instances without deep cloning.
+    /// Optional caller-supplied sampled zero-temperature cross sections.
+    ///
+    /// This preserves the explicit legacy API for callers whose source is a
+    /// table. When absent, temperature fitting retains `resonance_data` and
+    /// uses the source-equation free-gas integral; it never manufactures this
+    /// table internally from a resolved resonance source.
     base_xs: Option<Arc<Vec<Vec<f64>>>>,
+    /// Cached zero-temperature resonance-equation values used only when the
+    /// continuous source evaluator cannot cover a complete isotope.
+    ///
+    /// This is not an alternate public source. Supported SLBW/MLBW isotopes
+    /// continue to use the source equation; unsupported formalisms use their
+    /// matching cached row so repeated temperature trials do not reevaluate
+    /// the full resonance calculation.
+    fallback_base_xs: Option<Arc<Vec<Vec<f64>>>>,
     /// Cached broadened cross-sections from the last `evaluate()` call, on the
     /// **working grid** (auxiliary extended grid when Gaussian resolution is
     /// active, else the data grid).  Used by `analytical_jacobian()` to provide
@@ -826,9 +835,9 @@ pub struct TransmissionFitModel {
 impl TransmissionFitModel {
     /// Create a validated `TransmissionFitModel`.
     ///
-    /// When `external_base_xs` is `Some`, uses those precomputed unbroadened
-    /// cross-sections instead of computing them (expensive Reich-Moore).
-    /// `spatial_map` precomputes once for all pixels and passes them here.
+    /// When `external_base_xs` is `Some`, uses that explicit sampled source.
+    /// Otherwise a temperature fit retains the resonance source and evaluates
+    /// the error-controlled source-equation free-gas integral.
     ///
     /// # Errors
     /// Returns `FittingError::InvalidConfig` if `temperature_index` overlaps
@@ -841,6 +850,52 @@ impl TransmissionFitModel {
         density_mapping: (Vec<usize>, Vec<f64>),
         temperature_index: Option<usize>,
         external_base_xs: Option<Arc<Vec<Vec<f64>>>>,
+    ) -> Result<Self, FittingError> {
+        let needs_fallback = temperature_index.is_some() && external_base_xs.is_none();
+        let mut model = Self::new_with_cached_fallback(
+            energies,
+            resonance_data,
+            temperature_k,
+            instrument,
+            density_mapping,
+            temperature_index,
+            external_base_xs,
+            None,
+        )?;
+        if needs_fallback {
+            model.fallback_base_xs = Some(Arc::new(
+                transmission::unbroadened_cross_sections(
+                    &model.energies,
+                    &model.resonance_data,
+                    None,
+                )
+                .map_err(|error| {
+                    FittingError::InvalidConfig(format!(
+                        "failed to cache sampled Doppler fallback: {error}"
+                    ))
+                })?,
+            ));
+        }
+        Ok(model)
+    }
+
+    /// Construct a temperature model with a shared sampled-fallback cache.
+    ///
+    /// This exists for the spatial pipeline, which computes the immutable
+    /// fallback once and shares it across pixel models. `external_base_xs`
+    /// remains the caller-selected table source; `fallback_base_xs` is used
+    /// only for an unsupported resonance formalism.
+    #[doc(hidden)]
+    #[allow(clippy::too_many_arguments)]
+    pub fn new_with_cached_fallback(
+        energies: Vec<f64>,
+        resonance_data: Vec<ResonanceData>,
+        temperature_k: f64,
+        instrument: Option<Arc<InstrumentParams>>,
+        density_mapping: (Vec<usize>, Vec<f64>),
+        temperature_index: Option<usize>,
+        external_base_xs: Option<Arc<Vec<Vec<f64>>>>,
+        fallback_base_xs: Option<Arc<Vec<Vec<f64>>>>,
     ) -> Result<Self, FittingError> {
         let (density_indices, density_ratios) = density_mapping;
         if density_indices.len() != resonance_data.len() {
@@ -864,11 +919,17 @@ impl TransmissionFitModel {
                 "temperature_index must not overlap with density_indices".into(),
             ));
         }
-        // Validate external base XS shape before accepting.
-        if let Some(ref xs) = external_base_xs {
+        // Validate every cached source shape before accepting it.
+        for (name, cached) in [
+            ("external_base_xs", external_base_xs.as_ref()),
+            ("fallback_base_xs", fallback_base_xs.as_ref()),
+        ] {
+            let Some(xs) = cached else {
+                continue;
+            };
             if xs.len() != resonance_data.len() {
                 return Err(FittingError::InvalidConfig(format!(
-                    "external_base_xs has {} isotopes but resonance_data has {}",
+                    "{name} has {} isotopes but resonance_data has {}",
                     xs.len(),
                     resonance_data.len(),
                 )));
@@ -876,25 +937,14 @@ impl TransmissionFitModel {
             for (i, row) in xs.iter().enumerate() {
                 if row.len() != energies.len() {
                     return Err(FittingError::InvalidConfig(format!(
-                        "external_base_xs[{i}] has {} energies but expected {}",
+                        "{name}[{i}] has {} energies but expected {}",
                         row.len(),
                         energies.len(),
                     )));
                 }
             }
         }
-        let base_xs = match external_base_xs {
-            Some(xs) => Some(xs),
-            None if temperature_index.is_some() => Some(Arc::new(
-                transmission::unbroadened_cross_sections(&energies, &resonance_data, None)
-                    .map_err(|e| {
-                        FittingError::InvalidConfig(format!(
-                            "failed to compute unbroadened cross-sections: {e}"
-                        ))
-                    })?,
-            )),
-            None => None,
-        };
+        let base_xs = external_base_xs;
         Ok(Self {
             energies,
             resonance_data,
@@ -904,6 +954,7 @@ impl TransmissionFitModel {
             density_ratios,
             temperature_index,
             base_xs,
+            fallback_base_xs,
             cached_broadened_xs: RefCell::new(None),
             cached_dxs_dt: RefCell::new(None),
             cached_work_layout: RefCell::new(None),
@@ -1009,8 +1060,9 @@ impl FitModel for TransmissionFitModel {
             None => self.temperature_k,
         };
 
-        if let Some(ref base_xs) = self.base_xs {
-            // Fast path: reuse cached unbroadened XS, only redo Doppler + Beer-Lambert.
+        if self.temperature_index.is_some() || self.base_xs.is_some() {
+            // Temperature-fit path: retain the resonance source unless the
+            // caller explicitly supplied a sampled zero-temperature table.
             // Validate temperature (same rules as SampleParams::new in the slow path)
             // so the optimizer can't silently evaluate an unphysical model.
             if !temperature_k.is_finite() || temperature_k < 0.0 {
@@ -1044,13 +1096,31 @@ impl FitModel for TransmissionFitModel {
                     Rc::clone(self.cached_work_layout.borrow().as_ref().unwrap()),
                 )
             } else {
-                let working = transmission::broadened_cross_sections_from_base_on_working_grid(
-                    &self.energies,
-                    base_xs,
-                    &self.resonance_data,
-                    temperature_k,
-                    self.instrument.as_deref(),
-                )
+                let working = if let Some(table_xs) = self.base_xs.as_deref() {
+                    transmission::broadened_cross_sections_from_table_on_working_grid(
+                        &self.energies,
+                        table_xs,
+                        &self.resonance_data,
+                        temperature_k,
+                        self.instrument.as_deref(),
+                    )
+                } else if let Some(fallback_base_xs) = self.fallback_base_xs.as_deref() {
+                    transmission::broadened_cross_sections_on_working_grid_with_cached_fallback(
+                        &self.energies,
+                        fallback_base_xs,
+                        &self.resonance_data,
+                        temperature_k,
+                        self.instrument.as_deref(),
+                    )
+                } else {
+                    transmission::broadened_cross_sections_on_working_grid(
+                        &self.energies,
+                        &self.resonance_data,
+                        temperature_k,
+                        self.instrument.as_deref(),
+                        None,
+                    )
+                }
                 .map_err(|e| FittingError::EvaluationFailed(e.to_string()))?;
                 let xs = Rc::new(working.sigma);
                 let layout = Rc::new(working.layout);
@@ -1120,20 +1190,15 @@ impl FitModel for TransmissionFitModel {
 
     /// Analytical Jacobian for the transmission model with temperature fitting.
     ///
-    /// When `base_xs` is available (temperature fitting path):
+    /// When the temperature path has populated its cross-section cache:
     /// - **Density columns**: `∂T/∂nᵢ = -σᵢ(E)·T(E)` using cached broadened XS
     ///   from the most recent `evaluate()` call.  Same formula as
     ///   `PrecomputedTransmissionModel`, zero extra broadening calls.
     /// - **Temperature column**: analytical chain rule via on-demand `∂σ/∂T`.
     ///   `∂T/∂T_temp = -T(E) · Σᵢ nᵢ·rᵢ·∂σᵢ/∂T`.  The derivative is
-    ///   computed once per temperature via
-    ///   `broadened_cross_sections_with_analytical_derivative_from_base()`
-    ///   and cached until temperature changes.  Costs one broadening call
-    ///   per Jacobian (same as the old FD approach, but exact).
-    ///
-    /// Returns `None` for the no-base_xs path (full forward model), which
-    /// falls back to finite-difference in the LM solver.
-    /// Analytical Jacobian for density and temperature fitting.
+    ///   computed once per temperature from either the retained resonance
+    ///   source or an explicitly supplied sampled source, then cached until
+    ///   temperature changes.
     ///
     /// Without resolution:
     ///   ∂T/∂N_g = -(Σ_{i∈g} rᵢ σᵢ) · T
@@ -1143,8 +1208,8 @@ impl FitModel for TransmissionFitModel {
     ///   ∂T_obs/∂N_g = R\[-(Σ_{i∈g} rᵢ σᵢ) · T\]
     ///   ∂T_obs/∂Temp = R\[-T · Σᵢ nᵢ rᵢ ∂σᵢ/∂T\]
     ///
-    /// Returns `None` only when `base_xs` is not available (full forward
-    /// model path falls back to FD) or when the temperature cache is stale.
+    /// Returns `None` only for a fixed-temperature full-forward path without a
+    /// populated cache, or when the temperature cache is stale.
     fn analytical_jacobian(
         &self,
         params: &[f64],
@@ -1193,9 +1258,12 @@ impl FitModel for TransmissionFitModel {
         // see the docstring at the corresponding
         // site in `TransmissionFitModel::evaluate()` above.
 
-        // Only provide analytical Jacobian when base_xs is available
-        // (temperature-fitting fast path with cached broadened XS).
-        let _base_xs_guard = self.base_xs.as_ref()?;
+        // Density derivatives require a populated broadened-XS cache. The
+        // temperature-fit path can populate it from either the retained
+        // resonance source or an explicitly supplied sampled table.
+        if self.temperature_index.is_none() && self.base_xs.is_none() {
+            return None;
+        }
         let cached_xs = self.cached_broadened_xs.borrow();
         let broadened_xs = cached_xs.as_ref()?;
         // Working-grid layout matching the cached σ (issue #608).  Inner
@@ -1297,17 +1365,32 @@ impl FitModel for TransmissionFitModel {
             {
                 let needs_compute = self.cached_dxs_dt.borrow().as_ref().is_none();
                 if needs_compute {
-                    let base_xs = self.base_xs.as_ref()?;
                     let temperature_k = self.cached_temperature.get();
-                    let working =
-                        transmission::broadened_cross_sections_with_analytical_derivative_from_base_on_working_grid(
+                    let working = if let Some(table_xs) = self.base_xs.as_deref() {
+                        transmission::broadened_cross_sections_with_analytical_derivative_from_table_on_working_grid(
                             &self.energies,
-                            base_xs,
+                            table_xs,
                             &self.resonance_data,
                             temperature_k,
                             self.instrument.as_deref(),
                         )
-                        .ok()?;
+                    } else if let Some(fallback_base_xs) = self.fallback_base_xs.as_deref() {
+                        transmission::broadened_cross_sections_with_analytical_derivative_on_working_grid_with_cached_fallback(
+                            &self.energies,
+                            fallback_base_xs,
+                            &self.resonance_data,
+                            temperature_k,
+                            self.instrument.as_deref(),
+                        )
+                    } else {
+                        transmission::broadened_cross_sections_with_analytical_derivative_on_working_grid(
+                            &self.energies,
+                            &self.resonance_data,
+                            temperature_k,
+                            self.instrument.as_deref(),
+                        )
+                    }
+                    .ok()?;
                     *self.cached_dxs_dt.borrow_mut() = Some(Rc::new(working.dsigma_dt));
                 }
             }
@@ -3115,7 +3198,7 @@ mod tests {
     use crate::lm::{self, FitModel, LmConfig};
     use crate::parameters::{FitParameter, ParameterSet};
     use nereids_core::types::Isotope;
-    use nereids_endf::resonance::test_support::u238_single_resonance;
+    use nereids_endf::resonance::test_support::{u238_single_resonance, u238_with_formalism};
     use nereids_endf::resonance::{LGroup, Resonance, ResonanceFormalism, ResonanceRange};
 
     /// ∞-norm of the residual between two equal-length spectra.
@@ -3421,6 +3504,93 @@ mod tests {
                 b
             );
         }
+    }
+
+    #[test]
+    fn temperature_fit_retains_resonance_source_unless_table_is_explicit() {
+        let data = u238_with_formalism(ResonanceFormalism::MLBW);
+        let energies = vec![6.0, 6.674, 7.5];
+        let density = 0.01;
+        let temperature = 300.0;
+        let source_model = TransmissionFitModel::new(
+            energies.clone(),
+            vec![data.clone()],
+            temperature,
+            None,
+            (vec![0], vec![1.0]),
+            Some(1),
+            None,
+        )
+        .unwrap();
+        let base = Arc::new(
+            transmission::unbroadened_cross_sections(&energies, std::slice::from_ref(&data), None)
+                .unwrap(),
+        );
+        let explicit_table_model = TransmissionFitModel::new(
+            energies.clone(),
+            vec![data.clone()],
+            temperature,
+            None,
+            (vec![0], vec![1.0]),
+            Some(1),
+            Some(base),
+        )
+        .unwrap();
+        let sample = SampleParams::new(temperature, vec![(data, density)]).unwrap();
+        let expected = transmission::forward_model(&energies, &sample, None).unwrap();
+        let source = source_model.evaluate(&[density, temperature]).unwrap();
+        let sampled = explicit_table_model
+            .evaluate(&[density, temperature])
+            .unwrap();
+
+        assert_eq!(source, expected);
+        let sampled_error = max_abs_diff(&sampled, &expected);
+        assert!(
+            sampled_error > 1.0e-6,
+            "the explicit sparse table control must reproduce the lost-source defect; error={sampled_error}"
+        );
+    }
+
+    #[test]
+    fn explicit_table_remains_the_only_source_on_gaussian_auxiliary_grid() {
+        let data = u238_single_resonance();
+        let energies: Vec<f64> = (0..101).map(|index| 4.0 + index as f64 * 0.05).collect();
+        let zero_table = Arc::new(vec![vec![0.0; energies.len()]]);
+        let instrument = Arc::new(InstrumentParams {
+            resolution: ResolutionFunction::Gaussian(
+                nereids_physics::resolution::ResolutionParams::new(25.0, 0.5, 0.005, 0.0).unwrap(),
+            ),
+        });
+        let model = TransmissionFitModel::new(
+            energies,
+            vec![data],
+            300.0,
+            Some(instrument),
+            (vec![0], vec![1.0]),
+            Some(1),
+            Some(zero_table),
+        )
+        .unwrap();
+
+        let predicted = model.evaluate(&[0.01, 300.0]).unwrap();
+        let maximum_deviation = predicted
+            .iter()
+            .map(|value| (value - 1.0).abs())
+            .fold(0.0_f64, f64::max);
+        assert!(
+            maximum_deviation < 1.0e-12,
+            "an explicit zero table must stay zero at auxiliary points; max transmission deviation={maximum_deviation}"
+        );
+        let jacobian = model
+            .analytical_jacobian(&[0.01, 300.0], &[1], &predicted)
+            .expect("explicit-table temperature derivative");
+        let maximum_derivative = (0..predicted.len())
+            .map(|row| jacobian.get(row, 0).abs())
+            .fold(0.0_f64, f64::max);
+        assert!(
+            maximum_derivative < 1.0e-12,
+            "an explicit zero table must have zero temperature derivative; max={maximum_derivative}"
+        );
     }
 
     /// Recover temperature from Doppler-broadened synthetic data.

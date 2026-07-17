@@ -201,6 +201,26 @@ fn build_extended_xs_from_base(
     xs_ext
 }
 
+/// Extend an explicitly supplied table without consulting resonance data.
+///
+/// This is deliberately separate from [`build_extended_xs_from_base`].  That
+/// helper is a cache of the same resonance equation and may therefore evaluate
+/// that equation at auxiliary points.  A genuine table is a different source:
+/// every auxiliary value must be interpolated or extrapolated from the table
+/// itself so a Gaussian working grid cannot silently mix two sources.
+fn build_extended_xs_from_table(
+    source_energies: &[f64],
+    source_cross_sections: &[f64],
+    work_energies: &[f64],
+) -> Vec<f64> {
+    work_energies
+        .iter()
+        .map(|&energy| {
+            doppler::interpolate_cross_section(source_energies, source_cross_sections, energy)
+        })
+        .collect()
+}
+
 /// Validate `base_xs` shape against `resonance_data` and `energies`.
 ///
 /// Shared by the base-XS broadening family so the same `InputMismatch`
@@ -392,6 +412,36 @@ fn source_aware_doppler(
 
     let sampled = unbroadened();
     doppler::doppler_broaden(energies, &sampled, &params).map_err(Into::into)
+}
+
+/// Source-aware Doppler broadening and exact temperature derivative.
+///
+/// Resolved SLBW/MLBW data use the resonance equation inside both integrals.
+/// Unsupported formalisms use the named sampled-table route for both value and
+/// derivative, so a single isotope never mixes representations.
+fn source_aware_doppler_with_derivative(
+    energies: &[f64],
+    data: &ResonanceData,
+    temperature_k: f64,
+) -> Result<(Vec<f64>, Vec<f64>), TransmissionError> {
+    let unbroadened = || {
+        reich_moore::cross_sections_on_grid(data, energies)
+            .into_iter()
+            .map(|cross_section| cross_section.total)
+            .collect::<Vec<_>>()
+    };
+    if temperature_k <= 0.0 {
+        return Ok((unbroadened(), vec![0.0; energies.len()]));
+    }
+
+    let params = DopplerParams::new(temperature_k, data.awr)?;
+    if let Some(result) = continuous_doppler::try_broaden_with_derivative(energies, data, &params)?
+    {
+        return Ok(result);
+    }
+
+    let sampled = unbroadened();
+    doppler::doppler_broaden_with_derivative(energies, &sampled, &params).map_err(Into::into)
 }
 
 /// Broadened cross-sections and their temperature derivative.
@@ -1201,6 +1251,264 @@ pub fn broadened_cross_sections_with_analytical_derivative_from_base_on_working_
     })
 }
 
+/// Doppler-broaden a genuine sampled source on the resolution working grid.
+///
+/// Unlike the `_from_base` cache API, auxiliary Gaussian-grid values are
+/// obtained only from the supplied table.  Resonance equations are not read,
+/// so the route cannot silently combine two different nuclear sources.
+pub fn broadened_cross_sections_from_table_on_working_grid(
+    energies: &[f64],
+    table_xs: &[Vec<f64>],
+    resonance_data: &[ResonanceData],
+    temperature_k: f64,
+    instrument: Option<&InstrumentParams>,
+) -> Result<WorkingGridXs, TransmissionError> {
+    validate_base_xs(energies, table_xs, resonance_data)?;
+    if instrument.is_some() && !energies.windows(2).all(|window| window[0] <= window[1]) {
+        return Err(ResolutionError::UnsortedEnergies.into());
+    }
+
+    let references: Vec<&ResonanceData> = resonance_data.iter().collect();
+    let extended_grid = build_aux_grid(energies, instrument, &references);
+    let (work_energies, layout) = working_grid_layout(energies, extended_grid.as_ref());
+    let sigma: Result<Vec<Vec<f64>>, TransmissionError> = table_xs
+        .par_iter()
+        .zip(resonance_data.par_iter())
+        .map(|(source, data)| {
+            let work_source = if extended_grid.is_some() {
+                build_extended_xs_from_table(energies, source, work_energies)
+            } else {
+                source.clone()
+            };
+            if temperature_k > 0.0 {
+                let params = DopplerParams::new(temperature_k, data.awr)?;
+                doppler::doppler_broaden(work_energies, &work_source, &params).map_err(Into::into)
+            } else {
+                Ok(work_source)
+            }
+        })
+        .collect();
+
+    Ok(WorkingGridXs {
+        sigma: sigma?,
+        layout,
+    })
+}
+
+/// Sampled-source counterpart of
+/// [`broadened_cross_sections_from_table_on_working_grid`] with the analytical
+/// temperature derivative.
+pub fn broadened_cross_sections_with_analytical_derivative_from_table_on_working_grid(
+    energies: &[f64],
+    table_xs: &[Vec<f64>],
+    resonance_data: &[ResonanceData],
+    temperature_k: f64,
+    instrument: Option<&InstrumentParams>,
+) -> Result<WorkingGridXsWithDerivative, TransmissionError> {
+    validate_base_xs(energies, table_xs, resonance_data)?;
+    if instrument.is_some() && !energies.windows(2).all(|window| window[0] <= window[1]) {
+        return Err(ResolutionError::UnsortedEnergies.into());
+    }
+
+    let references: Vec<&ResonanceData> = resonance_data.iter().collect();
+    let extended_grid = build_aux_grid(energies, instrument, &references);
+    let (work_energies, layout) = working_grid_layout(energies, extended_grid.as_ref());
+    type IsotopeXsDxs = Result<(Vec<f64>, Vec<f64>), TransmissionError>;
+    let results: Vec<IsotopeXsDxs> = table_xs
+        .par_iter()
+        .zip(resonance_data.par_iter())
+        .map(|(source, data)| {
+            let work_source = if extended_grid.is_some() {
+                build_extended_xs_from_table(energies, source, work_energies)
+            } else {
+                source.clone()
+            };
+            if temperature_k > 0.0 {
+                let params = DopplerParams::new(temperature_k, data.awr)?;
+                doppler::doppler_broaden_with_derivative(work_energies, &work_source, &params)
+                    .map_err(Into::into)
+            } else {
+                Ok((work_source, vec![0.0; work_energies.len()]))
+            }
+        })
+        .collect();
+
+    let mut sigma = Vec::with_capacity(results.len());
+    let mut dsigma_dt = Vec::with_capacity(results.len());
+    for result in results {
+        let (values, derivatives) = result?;
+        sigma.push(values);
+        dsigma_dt.push(derivatives);
+    }
+    Ok(WorkingGridXsWithDerivative {
+        sigma,
+        dsigma_dt,
+        layout,
+    })
+}
+
+/// Compute source-aware Doppler-broadened cross sections and their exact
+/// temperature derivatives on the resolution working grid.
+///
+/// Unlike the `_from_base` API, this function retains the immutable resonance
+/// source. Resolved SLBW/MLBW evaluations therefore integrate the resonance
+/// equation directly inside the free-gas kernel instead of interpolating a
+/// caller-grid table. Resolution is not applied here; callers apply it after
+/// Beer-Lambert attenuation.
+pub fn broadened_cross_sections_with_analytical_derivative_on_working_grid(
+    energies: &[f64],
+    resonance_data: &[ResonanceData],
+    temperature_k: f64,
+    instrument: Option<&InstrumentParams>,
+) -> Result<WorkingGridXsWithDerivative, TransmissionError> {
+    if instrument.is_some() && !energies.windows(2).all(|window| window[0] <= window[1]) {
+        return Err(ResolutionError::UnsortedEnergies.into());
+    }
+
+    let references: Vec<&ResonanceData> = resonance_data.iter().collect();
+    let extended_grid = build_aux_grid(energies, instrument, &references);
+    let (work_energies, layout) = working_grid_layout(energies, extended_grid.as_ref());
+    type IsotopeXsDxs = Result<(Vec<f64>, Vec<f64>), TransmissionError>;
+    let results: Vec<IsotopeXsDxs> = resonance_data
+        .par_iter()
+        .map(|data| source_aware_doppler_with_derivative(work_energies, data, temperature_k))
+        .collect();
+
+    let mut sigma = Vec::with_capacity(results.len());
+    let mut dsigma_dt = Vec::with_capacity(results.len());
+    for result in results {
+        let (values, derivatives) = result?;
+        sigma.push(values);
+        dsigma_dt.push(derivatives);
+    }
+    Ok(WorkingGridXsWithDerivative {
+        sigma,
+        dsigma_dt,
+        layout,
+    })
+}
+
+/// Source-aware Doppler broadening with a cached sampled fallback.
+///
+/// Resolved SLBW/MLBW sources still use the continuous resonance-equation
+/// integral.  Only an isotope that the continuous evaluator cannot cover uses
+/// its matching cached zero-temperature row.  The choice is all-or-nothing per
+/// isotope, and the cache avoids reevaluating unsupported resonance sources at
+/// every trial temperature.
+pub fn broadened_cross_sections_on_working_grid_with_cached_fallback(
+    energies: &[f64],
+    fallback_base_xs: &[Vec<f64>],
+    resonance_data: &[ResonanceData],
+    temperature_k: f64,
+    instrument: Option<&InstrumentParams>,
+) -> Result<WorkingGridXs, TransmissionError> {
+    validate_base_xs(energies, fallback_base_xs, resonance_data)?;
+    if instrument.is_some() && !energies.windows(2).all(|window| window[0] <= window[1]) {
+        return Err(ResolutionError::UnsortedEnergies.into());
+    }
+
+    let references: Vec<&ResonanceData> = resonance_data.iter().collect();
+    let extended_grid = build_aux_grid(energies, instrument, &references);
+    let is_data_point = data_point_mask(extended_grid.as_ref());
+    let (work_energies, layout) = working_grid_layout(energies, extended_grid.as_ref());
+    let sigma: Result<Vec<Vec<f64>>, TransmissionError> = fallback_base_xs
+        .par_iter()
+        .zip(resonance_data.par_iter())
+        .map(|(cached_source, data)| {
+            let params = DopplerParams::new(temperature_k, data.awr)?;
+            if let Some(values) = continuous_doppler::try_broaden(work_energies, data, &params)? {
+                return Ok(values);
+            }
+
+            let work_source = if let Some((ref work_grid, ref data_indices)) = extended_grid {
+                build_extended_xs_from_base(
+                    work_grid,
+                    data_indices,
+                    is_data_point.as_ref().expect("extended-grid mask"),
+                    cached_source,
+                    data,
+                )
+            } else {
+                cached_source.clone()
+            };
+            if temperature_k > 0.0 {
+                doppler::doppler_broaden(work_energies, &work_source, &params).map_err(Into::into)
+            } else {
+                Ok(work_source)
+            }
+        })
+        .collect();
+
+    Ok(WorkingGridXs {
+        sigma: sigma?,
+        layout,
+    })
+}
+
+/// Derivative counterpart of
+/// [`broadened_cross_sections_on_working_grid_with_cached_fallback`].
+pub fn broadened_cross_sections_with_analytical_derivative_on_working_grid_with_cached_fallback(
+    energies: &[f64],
+    fallback_base_xs: &[Vec<f64>],
+    resonance_data: &[ResonanceData],
+    temperature_k: f64,
+    instrument: Option<&InstrumentParams>,
+) -> Result<WorkingGridXsWithDerivative, TransmissionError> {
+    validate_base_xs(energies, fallback_base_xs, resonance_data)?;
+    if instrument.is_some() && !energies.windows(2).all(|window| window[0] <= window[1]) {
+        return Err(ResolutionError::UnsortedEnergies.into());
+    }
+
+    let references: Vec<&ResonanceData> = resonance_data.iter().collect();
+    let extended_grid = build_aux_grid(energies, instrument, &references);
+    let is_data_point = data_point_mask(extended_grid.as_ref());
+    let (work_energies, layout) = working_grid_layout(energies, extended_grid.as_ref());
+    type IsotopeXsDxs = Result<(Vec<f64>, Vec<f64>), TransmissionError>;
+    let results: Vec<IsotopeXsDxs> = fallback_base_xs
+        .par_iter()
+        .zip(resonance_data.par_iter())
+        .map(|(cached_source, data)| {
+            let params = DopplerParams::new(temperature_k, data.awr)?;
+            if let Some(result) =
+                continuous_doppler::try_broaden_with_derivative(work_energies, data, &params)?
+            {
+                return Ok(result);
+            }
+
+            let work_source = if let Some((ref work_grid, ref data_indices)) = extended_grid {
+                build_extended_xs_from_base(
+                    work_grid,
+                    data_indices,
+                    is_data_point.as_ref().expect("extended-grid mask"),
+                    cached_source,
+                    data,
+                )
+            } else {
+                cached_source.clone()
+            };
+            if temperature_k > 0.0 {
+                doppler::doppler_broaden_with_derivative(work_energies, &work_source, &params)
+                    .map_err(Into::into)
+            } else {
+                Ok((work_source, vec![0.0; work_energies.len()]))
+            }
+        })
+        .collect();
+
+    let mut sigma = Vec::with_capacity(results.len());
+    let mut dsigma_dt = Vec::with_capacity(results.len());
+    for result in results {
+        let (values, derivatives) = result?;
+        sigma.push(values);
+        dsigma_dt.push(derivatives);
+    }
+    Ok(WorkingGridXsWithDerivative {
+        sigma,
+        dsigma_dt,
+        layout,
+    })
+}
+
 /// Compute a transmission spectrum from precomputed unbroadened cross-sections.
 ///
 /// Applies Doppler broadening and Beer-Lambert using cached base XS, then
@@ -1334,7 +1642,7 @@ pub fn forward_model_from_base_xs(
 mod tests {
     use super::*;
     use nereids_core::types::Isotope;
-    use nereids_endf::resonance::test_support::u238_single_resonance;
+    use nereids_endf::resonance::test_support::{u238_single_resonance, u238_with_formalism};
     use nereids_endf::resonance::{LGroup, Resonance, ResonanceFormalism, ResonanceRange};
 
     /// Issue #608 R2: the spatial pipeline builds the working-grid σ
@@ -1382,6 +1690,85 @@ mod tests {
                 "working-grid energies must be bit-identical"
             );
         }
+    }
+
+    #[test]
+    fn cached_fallback_is_used_only_for_unsupported_formalism() {
+        let energies: Vec<f64> = (0..201).map(|index| 5.5 + index as f64 * 0.01).collect();
+        let temperature = 300.0;
+
+        let unsupported = u238_with_formalism(ResonanceFormalism::ReichMoore);
+        let unsupported_base =
+            unbroadened_cross_sections(&energies, std::slice::from_ref(&unsupported), None)
+                .unwrap();
+        let cached = broadened_cross_sections_on_working_grid_with_cached_fallback(
+            &energies,
+            &unsupported_base,
+            std::slice::from_ref(&unsupported),
+            temperature,
+            None,
+        )
+        .unwrap();
+        let legacy = broadened_cross_sections_from_base_on_working_grid(
+            &energies,
+            &unsupported_base,
+            std::slice::from_ref(&unsupported),
+            temperature,
+            None,
+        )
+        .unwrap();
+        assert_eq!(cached.sigma, legacy.sigma);
+        let cached_derivative =
+            broadened_cross_sections_with_analytical_derivative_on_working_grid_with_cached_fallback(
+                &energies,
+                &unsupported_base,
+                std::slice::from_ref(&unsupported),
+                temperature,
+                None,
+            )
+            .unwrap();
+        let legacy_derivative =
+            broadened_cross_sections_with_analytical_derivative_from_base_on_working_grid(
+                &energies,
+                &unsupported_base,
+                std::slice::from_ref(&unsupported),
+                temperature,
+                None,
+            )
+            .unwrap();
+        assert_eq!(cached_derivative.sigma, legacy_derivative.sigma);
+        assert_eq!(cached_derivative.dsigma_dt, legacy_derivative.dsigma_dt);
+
+        let zero_fallback = vec![vec![0.0; energies.len()]];
+        let zero_result = broadened_cross_sections_on_working_grid_with_cached_fallback(
+            &energies,
+            &zero_fallback,
+            std::slice::from_ref(&unsupported),
+            temperature,
+            None,
+        )
+        .unwrap();
+        assert!(zero_result.sigma[0].iter().all(|&value| value == 0.0));
+
+        let supported = u238_with_formalism(ResonanceFormalism::MLBW);
+        let deliberately_wrong_fallback = vec![vec![0.0; energies.len()]];
+        let cached = broadened_cross_sections_on_working_grid_with_cached_fallback(
+            &energies,
+            &deliberately_wrong_fallback,
+            std::slice::from_ref(&supported),
+            temperature,
+            None,
+        )
+        .unwrap();
+        let source = broadened_cross_sections_on_working_grid(
+            &energies,
+            std::slice::from_ref(&supported),
+            temperature,
+            None,
+            None,
+        )
+        .unwrap();
+        assert_eq!(cached.sigma, source.sigma);
     }
 
     #[test]

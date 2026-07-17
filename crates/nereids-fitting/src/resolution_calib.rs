@@ -38,7 +38,7 @@ use nereids_physics::ikeda_carpenter::{
     EnergyLaw, IkedaCarpenter, IkedaCarpenterParams, SynthesisGrid,
 };
 use nereids_physics::resolution::{
-    ResolutionFunction, ResolutionParams, TOF_FACTOR, TabulatedResolution,
+    ResolutionFunction, ResolutionParams, TOF_FACTOR, TabulatedResolution, apply_resolution,
 };
 use nereids_physics::transmission::{InstrumentParams, SampleParams, forward_model};
 
@@ -1071,6 +1071,30 @@ pub fn calibrate_resolution(
         (t0, l_scale)
     };
 
+    // For tabulated UDR and IC kernels, the working grid is the data grid.
+    // When the energy scale is pinned, the Doppler-broadened Beer-Lambert
+    // transmission is therefore identical at every optimizer evaluation;
+    // only the resolution kernel changes.  Compute that fixed nuclear result
+    // once and reuse it.  Gaussian resolution is deliberately excluded because
+    // its auxiliary working grid depends on the trial width.  A fitted t0 or
+    // L_scale is also excluded because it changes the nuclear evaluation grid.
+    let fixed_unresolved = if !config.fit_t0
+        && !config.fit_l_scale
+        && !matches!(&family, ResolutionFamily::Gaussian)
+    {
+        let grid = corrected_energy_grid(
+            energies,
+            config.position_t0_center_us,
+            config.position_l_scale_center,
+            config.flight_path_m,
+        )?;
+        let transmission = forward_model(&grid, sample, None)
+            .map_err(|e| FittingError::EvaluationFailed(format!("forward: {e:?}")))?;
+        Some((grid, transmission))
+    } else {
+        None
+    };
+
     let mut best: Option<NelderMeadResult> = None;
     for r in 0..config.restarts.max(1) {
         // Additive perturbation (a fraction of each parameter's bound range) so
@@ -1096,13 +1120,18 @@ pub fn calibrate_resolution(
             };
             let inst = InstrumentParams { resolution: res };
             let (t0, l_scale) = unpack_position(theta);
-            // Infeasible energy scale (corrected TOF ≤ 0) → step away.
-            let Ok(grid) = corrected_energy_grid(energies, t0, l_scale, config.flight_path_m)
-            else {
-                return Ok(f64::INFINITY);
+            let model = if let Some((grid, unresolved)) = &fixed_unresolved {
+                apply_resolution(grid, unresolved, &inst.resolution)
+                    .map_err(|e| FittingError::EvaluationFailed(format!("resolution: {e:?}")))?
+            } else {
+                // Infeasible energy scale (corrected TOF ≤ 0) → step away.
+                let Ok(grid) = corrected_energy_grid(energies, t0, l_scale, config.flight_path_m)
+                else {
+                    return Ok(f64::INFINITY);
+                };
+                forward_model(&grid, sample, Some(&inst))
+                    .map_err(|e| FittingError::EvaluationFailed(format!("forward: {e:?}")))?
             };
-            let model = forward_model(&grid, sample, Some(&inst))
-                .map_err(|e| FittingError::EvaluationFailed(format!("forward: {e:?}")))?;
             if !model.iter().all(|v| v.is_finite()) {
                 return Err(FittingError::EvaluationFailed("non-finite model".into()));
             }
@@ -1182,8 +1211,13 @@ pub fn calibrate_resolution(
         config.flight_path_m,
     )?;
     let inst = InstrumentParams { resolution };
-    let model = forward_model(&grid, sample, Some(&inst))
-        .map_err(|e| FittingError::EvaluationFailed(format!("forward: {e:?}")))?;
+    let model = if let Some((fixed_grid, unresolved)) = &fixed_unresolved {
+        apply_resolution(fixed_grid, unresolved, &inst.resolution)
+            .map_err(|e| FittingError::EvaluationFailed(format!("resolution: {e:?}")))?
+    } else {
+        forward_model(&grid, sample, Some(&inst))
+            .map_err(|e| FittingError::EvaluationFailed(format!("forward: {e:?}")))?
+    };
     let (ssr, k) = inner_ssr(data, unc, &model, config.fit_background).ok_or_else(|| {
         FittingError::EvaluationFailed("singular anorm/baseline at the solution".into())
     })?;

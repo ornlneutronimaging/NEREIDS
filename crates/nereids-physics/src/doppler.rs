@@ -799,7 +799,11 @@ pub fn doppler_broaden_with_derivative(
 /// consolidation could unify both behind a shared trait or closure-based
 /// extrapolation strategy; for now they remain separate to avoid coupling
 /// the two broadening modules.
-fn interpolate_cross_section(energies: &[f64], cross_sections: &[f64], energy: f64) -> f64 {
+pub(crate) fn interpolate_cross_section(
+    energies: &[f64],
+    cross_sections: &[f64],
+    energy: f64,
+) -> f64 {
     if energies.is_empty() {
         return 0.0;
     }
