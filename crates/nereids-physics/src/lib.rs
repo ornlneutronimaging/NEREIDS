@@ -30,6 +30,7 @@
 
 pub mod auxiliary_grid;
 pub mod channel;
+pub mod continuous_doppler;
 pub mod coulomb;
 pub mod counts_response;
 pub mod doppler;

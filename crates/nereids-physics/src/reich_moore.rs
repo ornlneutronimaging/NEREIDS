@@ -430,65 +430,74 @@ pub fn cross_sections_at_energy(data: &ResonanceData, energy_ev: f64) -> CrossSe
 /// the same release-mode silent-zero footgun that the SLBW / RML / URR
 /// leaf asserts guard against per-point.
 pub fn cross_sections_on_grid(data: &ResonanceData, energies: &[f64]) -> Vec<CrossSections> {
-    if energies.is_empty() {
-        return Vec::new();
+    CrossSectionPlan::new(data).evaluate(energies)
+}
+
+/// Reusable evaluation plan for one immutable resonance source.
+///
+/// Continuous Doppler integration evaluates the same ENDF equation on many
+/// adaptively selected energy batches.  Building the formalism-specific
+/// resonance caches for every quadrature panel would change only runtime, not
+/// physics, so this crate-private plan builds them once and reuses them.
+pub(crate) struct CrossSectionPlan<'a> {
+    awr: f64,
+    precomputed: Vec<PrecomputedRangeData<'a>>,
+}
+
+impl<'a> CrossSectionPlan<'a> {
+    pub(crate) fn new(data: &'a ResonanceData) -> Self {
+        let awr = data.awr;
+        let precomputed = data
+            .ranges
+            .iter()
+            .enumerate()
+            .map(|(range_idx, range)| precompute_range_data(range, range_idx, data, awr))
+            .collect();
+        Self { awr, precomputed }
     }
 
-    // Symmetric public-API guard.  See `cross_sections_at_energy` above.
-    // O(n) — negligible next to the per-range precompute and per-point
-    // resonance evaluation that follow.
-    for &energy_ev in energies {
-        assert!(
-            energy_ev.is_finite() && energy_ev > 0.0,
-            "expected positive finite energy_ev, got {energy_ev}"
-        );
-    }
+    pub(crate) fn evaluate(&self, energies: &[f64]) -> Vec<CrossSections> {
+        for &energy_ev in energies {
+            assert!(
+                energy_ev.is_finite() && energy_ev > 0.0,
+                "expected positive finite energy_ev, got {energy_ev}"
+            );
+        }
 
-    let awr = data.awr;
+        energies
+            .iter()
+            .map(|&energy_ev| {
+                let mut total = 0.0;
+                let mut elastic = 0.0;
+                let mut capture = 0.0;
+                let mut fission = 0.0;
 
-    // Phase 1: precompute per-range data (J-groups, reduced widths, etc.).
-    // This runs once for the entire grid, not per energy point.
-    let precomputed: Vec<PrecomputedRangeData> = data
-        .ranges
-        .iter()
-        .enumerate()
-        .map(|(range_idx, range)| precompute_range_data(range, range_idx, data, awr))
-        .collect();
+                for range in &self.precomputed {
+                    let in_range = if range.half_open_upper {
+                        energy_ev >= range.energy_low && energy_ev < range.energy_high
+                    } else {
+                        energy_ev >= range.energy_low && energy_ev <= range.energy_high
+                    };
+                    if !in_range {
+                        continue;
+                    }
 
-    // Phase 2: evaluate each energy point using precomputed data.
-    energies
-        .iter()
-        .map(|&energy_ev| {
-            let mut total = 0.0;
-            let mut elastic = 0.0;
-            let mut capture = 0.0;
-            let mut fission = 0.0;
-
-            for pc in &precomputed {
-                let in_range = if pc.half_open_upper {
-                    energy_ev >= pc.energy_low && energy_ev < pc.energy_high
-                } else {
-                    energy_ev >= pc.energy_low && energy_ev <= pc.energy_high
-                };
-                if !in_range {
-                    continue;
+                    let (t, e, c, f) = evaluate_precomputed_range(range, energy_ev, self.awr);
+                    total += t;
+                    elastic += e;
+                    capture += c;
+                    fission += f;
                 }
 
-                let (t, e, c, f) = evaluate_precomputed_range(pc, energy_ev, awr);
-                total += t;
-                elastic += e;
-                capture += c;
-                fission += f;
-            }
-
-            CrossSections {
-                total,
-                elastic,
-                capture,
-                fission,
-            }
-        })
-        .collect()
+                CrossSections {
+                    total,
+                    elastic,
+                    capture,
+                    fission,
+                }
+            })
+            .collect()
+    }
 }
 
 // ─── Precomputed range data for batch grid evaluation ────────────────────────

@@ -30,6 +30,7 @@ use rayon::prelude::*;
 
 use nereids_endf::resonance::ResonanceData;
 
+use crate::continuous_doppler::{self, ContinuousDopplerError};
 use crate::doppler::{self, DopplerParams, DopplerParamsError};
 use crate::reich_moore;
 use crate::resolution::{self, ResolutionError, ResolutionFunction};
@@ -302,6 +303,8 @@ pub enum TransmissionError {
     Doppler(DopplerParamsError),
     /// Doppler broadening input validation failed (e.g. length mismatch).
     DopplerBroadening(crate::doppler::DopplerError),
+    /// Error-controlled source-equation Doppler integration failed.
+    ContinuousDoppler(ContinuousDopplerError),
     /// Computation was cancelled via the cancel token.
     Cancelled,
     /// Input array mismatch (e.g. cross-sections vs thicknesses length).
@@ -314,6 +317,9 @@ impl fmt::Display for TransmissionError {
             Self::Resolution(e) => write!(f, "resolution broadening error: {}", e),
             Self::Doppler(e) => write!(f, "Doppler parameter error: {}", e),
             Self::DopplerBroadening(e) => write!(f, "Doppler broadening error: {}", e),
+            Self::ContinuousDoppler(e) => {
+                write!(f, "continuous Doppler broadening error: {e}")
+            }
             Self::Cancelled => write!(f, "computation cancelled"),
             Self::InputMismatch(msg) => write!(f, "input mismatch: {}", msg),
         }
@@ -326,6 +332,7 @@ impl std::error::Error for TransmissionError {
             Self::Resolution(e) => Some(e),
             Self::Doppler(e) => Some(e),
             Self::DopplerBroadening(e) => Some(e),
+            Self::ContinuousDoppler(e) => Some(e),
             Self::Cancelled => None,
             Self::InputMismatch(_) => None,
         }
@@ -348,6 +355,43 @@ impl From<crate::doppler::DopplerError> for TransmissionError {
     fn from(e: crate::doppler::DopplerError) -> Self {
         Self::DopplerBroadening(e)
     }
+}
+
+impl From<ContinuousDopplerError> for TransmissionError {
+    fn from(e: ContinuousDopplerError) -> Self {
+        Self::ContinuousDoppler(e)
+    }
+}
+
+/// Doppler-broaden an immutable resonance source without first sampling it
+/// onto the output grid.
+///
+/// Resolved SLBW/MLBW sources use the error-controlled free-gas integral of
+/// the resonance equation.  Other ENDF formalisms take the explicitly named
+/// legacy sampled-table route until a source-aware evaluator exists for that
+/// formalism.  The two routes are never mixed within one isotope result.
+fn source_aware_doppler(
+    energies: &[f64],
+    data: &ResonanceData,
+    temperature_k: f64,
+) -> Result<Vec<f64>, TransmissionError> {
+    let unbroadened = || {
+        reich_moore::cross_sections_on_grid(data, energies)
+            .into_iter()
+            .map(|cross_section| cross_section.total)
+            .collect::<Vec<_>>()
+    };
+    if temperature_k <= 0.0 {
+        return Ok(unbroadened());
+    }
+
+    let params = DopplerParams::new(temperature_k, data.awr)?;
+    if let Some(cross_sections) = continuous_doppler::try_broaden(energies, data, &params)? {
+        return Ok(cross_sections);
+    }
+
+    let sampled = unbroadened();
+    doppler::doppler_broaden(energies, &sampled, &params).map_err(Into::into)
 }
 
 /// Broadened cross-sections and their temperature derivative.
@@ -663,16 +707,8 @@ pub fn forward_model(
         .par_iter()
         .filter(|(_, thickness)| *thickness > 0.0)
         .map(|(res_data, thickness)| {
-            let unbroadened: Vec<f64> = work_energies
-                .iter()
-                .map(|&e| reich_moore::cross_sections_at_energy(res_data, e).total)
-                .collect();
-            let after_doppler = if sample.temperature_k() > 0.0 {
-                let params = DopplerParams::new(sample.temperature_k(), res_data.awr)?;
-                doppler::doppler_broaden(work_energies, &unbroadened, &params)?
-            } else {
-                unbroadened
-            };
+            let after_doppler =
+                source_aware_doppler(work_energies, res_data, sample.temperature_k())?;
             Ok((after_doppler, *thickness))
         })
         .collect();
@@ -801,16 +837,7 @@ pub fn broadened_cross_sections_on_working_grid(
                 return Err(TransmissionError::Cancelled);
             }
 
-            let unbroadened: Vec<f64> = work_energies
-                .iter()
-                .map(|&e| reich_moore::cross_sections_at_energy(rd, e).total)
-                .collect();
-            if temperature_k > 0.0 {
-                let params = DopplerParams::new(temperature_k, rd.awr)?;
-                doppler::doppler_broaden(work_energies, &unbroadened, &params).map_err(Into::into)
-            } else {
-                Ok(unbroadened)
-            }
+            source_aware_doppler(work_energies, rd, temperature_k)
         })
         .collect();
 
@@ -890,19 +917,8 @@ pub fn broadened_cross_sections_for_transmission(
                 // Extended grid available: evaluate the full pipeline on the
                 // extended grid and extract at data positions.
 
-                // 1. Unbroadened cross sections on extended grid.
-                let unbroadened: Vec<f64> = ext_energies
-                    .iter()
-                    .map(|&e| reich_moore::cross_sections_at_energy(rd, e).total)
-                    .collect();
-
-                // 2. Doppler broadening.
-                let after_doppler = if temperature_k > 0.0 {
-                    let params = DopplerParams::new(temperature_k, rd.awr)?;
-                    doppler::doppler_broaden(ext_energies, &unbroadened, &params)?
-                } else {
-                    unbroadened
-                };
+                // 1–2. Evaluate and Doppler-broaden the immutable source.
+                let after_doppler = source_aware_doppler(ext_energies, rd, temperature_k)?;
 
                 // 3. Convert to transmission: T = exp(-nd × σ_D).
                 let transmission: Vec<f64> = after_doppler
@@ -928,17 +944,7 @@ pub fn broadened_cross_sections_for_transmission(
             } else {
                 // No extended grid (e.g. tabulated resolution with no aux grid):
                 // Doppler on data grid, Beer-Lambert, resolution on data grid.
-                let unbroadened: Vec<f64> = energies
-                    .iter()
-                    .map(|&e| reich_moore::cross_sections_at_energy(rd, e).total)
-                    .collect();
-
-                let after_doppler = if temperature_k > 0.0 {
-                    let params = DopplerParams::new(temperature_k, rd.awr)?;
-                    doppler::doppler_broaden(energies, &unbroadened, &params)?
-                } else {
-                    unbroadened
-                };
+                let after_doppler = source_aware_doppler(energies, rd, temperature_k)?;
 
                 let transmission: Vec<f64> = after_doppler
                     .iter()
