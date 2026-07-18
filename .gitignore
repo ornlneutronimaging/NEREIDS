@@ -35,8 +35,8 @@ Thumbs.db
 /worklog/
 
 # Local agent task state and private investigation artifacts (NOT tracked)
-/.harness/
-/investigation/
+/.harness
+/investigation
 
 # Python
 __pycache__/
@@ -63,5 +63,5 @@ tmp/
 # do not track manuscript folders
 .manuscripts/
 
-# Session-local agent-harness state (task contracts, verify gates)
-.harness/
+# Session-local agent-harness state (task contracts, verify gates) is covered
+# by the root-level rule above, including when a worktree uses a symlink.
