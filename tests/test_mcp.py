@@ -484,6 +484,43 @@ class TestManifestWorkflowTools:
         assert "raw count input cannot use solver='lm'" in result["error"]
         assert fitter_called is False
 
+    def test_transmission_spectrum_rejects_joint_poisson_before_fit(
+        self, tmp_path, monkeypatch
+    ):
+        np.savez(
+            tmp_path / "spectrum.npz",
+            energies_ev=np.linspace(1.0, 30.0, 20),
+            transmission=np.ones(20),
+            uncertainty=np.full(20, 0.01),
+        )
+        fitter_called = False
+
+        def forbidden_transmission_fit(**_kwargs):
+            nonlocal fitter_called
+            fitter_called = True
+            raise AssertionError("invalid transmission + joint Poisson route reached the fitter")
+
+        monkeypatch.setattr(nereids, "fit_spectrum_typed", forbidden_transmission_fit)
+        _write_json_frontmatter_manifest(
+            tmp_path,
+            {
+                "mode": "single_spectrum",
+                "data": {"kind": "transmission_npz", "path": "spectrum.npz"},
+                "isotopes": [_synthetic_u238_entry()],
+                "fit": {"solver": "joint_poisson", "max_iter": 5},
+                "resolution": {"kind": "none"},
+            },
+        )
+
+        result = process_resonance_dataset(str(tmp_path))
+
+        assert result["success"] is False
+        assert (
+            "normalized transmission input cannot use a Poisson/KL count likelihood"
+            in result["error"]
+        )
+        assert fitter_called is False
+
     def test_process_density_map_manifest(self, tmp_path):
         energies = np.linspace(1.0, 30.0, 120)
         true_density = 0.002

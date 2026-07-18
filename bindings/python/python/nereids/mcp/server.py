@@ -723,7 +723,7 @@ def _process_single_spectrum(
                 "with solver='auto' or solver='lm'"
             )
         requested_solver = str(fit_config.get("solver", "auto")).lower()
-        if requested_solver in {"kl", "poisson", "poisson_kl"}:
+        if requested_solver in {"kl", "poisson", "poisson_kl", "joint_poisson"}:
             raise ValueError(
                 "normalized transmission input cannot use a Poisson/KL count "
                 "likelihood; use solver='auto' or solver='lm'"
