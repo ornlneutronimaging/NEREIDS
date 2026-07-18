@@ -560,6 +560,7 @@ pub(crate) fn try_broaden_with_derivative(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use nereids_endf::parser::parse_endf_file2;
     use nereids_endf::resonance::test_support::u238_with_formalism;
 
     #[test]
@@ -660,6 +661,67 @@ mod tests {
             five_point,
             difference,
             allowance,
+        );
+    }
+
+    /// Independent full-kernel check for the Hf-177 regression used by the
+    /// public Python test. The oracle uses a fixed 400,001-point trapezoidal
+    /// integral in thermal-speed coordinates, not this module's adaptive
+    /// Gauss-Legendre panels, breakpoints, or error estimator.
+    #[test]
+    fn hf177_matches_uniform_speed_trapezoid_oracle() {
+        let path = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+            .parent()
+            .unwrap()
+            .parent()
+            .unwrap()
+            .join("tests/data/endf/Hf-177.endf");
+        let text = std::fs::read_to_string(&path)
+            .unwrap_or_else(|error| panic!("required Hf-177 fixture missing at {path:?}: {error}"));
+        let data = parse_endf_file2(&text).expect("tracked Hf-177 fixture must parse");
+
+        let target_energy = 8.876_917_538_350_767_f64;
+        let temperature_k = 300.0_f64;
+        let n_points = 400_001_usize;
+        let left_x = -8.0_f64;
+        let right_x = 8.0_f64;
+        let dx = (right_x - left_x) / (n_points - 1) as f64;
+        let thermal_speed = (8.617_333_262e-5 * temperature_k / data.awr).sqrt();
+        let target_speed = target_energy.sqrt();
+        let source_energies: Vec<f64> = (0..n_points)
+            .map(|index| {
+                let x = left_x + index as f64 * dx;
+                (target_speed + thermal_speed * x).powi(2)
+            })
+            .collect();
+        let source_cross_sections = CrossSectionPlan::new(&data).evaluate(&source_energies);
+        let normalization = std::f64::consts::PI.sqrt() * target_energy;
+        let mut trapezoid_sum = 0.0;
+        for (index, (&source_energy, cross_section)) in source_energies
+            .iter()
+            .zip(source_cross_sections.iter())
+            .enumerate()
+        {
+            let x = left_x + index as f64 * dx;
+            let endpoint_weight = if index == 0 || index + 1 == n_points {
+                0.5
+            } else {
+                1.0
+            };
+            trapezoid_sum += endpoint_weight * (-x * x).exp() * source_energy * cross_section.total
+                / normalization;
+        }
+        let oracle = trapezoid_sum * dx;
+
+        let params = DopplerParams::new(temperature_k, data.awr).unwrap();
+        let actual = try_broaden(&[target_energy], &data, &params)
+            .unwrap()
+            .expect("Hf-177 MLBW source is supported")[0];
+        let relative_difference = (actual - oracle).abs() / oracle.abs();
+
+        assert!(
+            relative_difference <= 1.0e-10,
+            "adaptive={actual:.16e} trapezoid={oracle:.16e} relative_difference={relative_difference:.3e}",
         );
     }
 }
