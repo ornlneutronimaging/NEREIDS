@@ -2828,12 +2828,23 @@ class TestVenusMlbwRegression:
         # shifts -0.07 % and the iteration count halves (14 -> 7) because
         # analytic steps satisfy the relative-chi2 tolerance sooner.
         #
+        # Baseline regenerated after the source-aware free-gas integration
+        # replaced interpolation of a sampled zero-temperature table for
+        # resolved SLBW/MLBW data.  The evaluated Hf-177 resonance parameters
+        # are unchanged; the thermal integral now evaluates that resonance
+        # equation at its own quadrature points, so its result no longer
+        # depends on whether the caller's output grid happened to resolve the
+        # narrow source line.  The independent full-kernel and derivative
+        # tests in ``continuous_doppler.rs`` carry the correctness check.  On
+        # this frozen workload, density moves +0.134 %, reduced chi-squared
+        # improves by 3.58e-6 relative, and the iteration count stays at 7.
+        #
         # These pinned values are machine-generated regression anchors
         # (produced by the code under test); the correctness burden is
         # carried by the SAMMY-oracle suites (samtry, ex001) and the
-        # analytic kernel pins in doppler.rs.
-        EXPECTED_DENSITY = 8.10458528518008e-05
-        EXPECTED_CHI2_R = 219657.2439575215
+        # analytic kernel pins in doppler.rs and continuous_doppler.rs.
+        EXPECTED_DENSITY = 8.115412297872233e-05
+        EXPECTED_CHI2_R = 219656.45748585448
         EXPECTED_ITERATIONS = 7
 
         FLOAT_TOL = pytest.approx
