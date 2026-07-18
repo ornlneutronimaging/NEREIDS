@@ -12,6 +12,7 @@ use std::collections::BinaryHeap;
 use std::fmt;
 
 use nereids_endf::resonance::{ResonanceData, ResonanceFormalism, ResonanceRange};
+use rayon::prelude::*;
 
 use crate::doppler::DopplerParams;
 use crate::reich_moore::CrossSectionPlan;
@@ -490,9 +491,16 @@ fn try_broaden_integrals(
         return Ok(None);
     };
 
+    // Each target energy is a mathematically independent free-gas integral.
+    // Parallelize those independent integrals directly. The surrounding
+    // transmission code also parallelizes across isotopes, but the common
+    // thermometry case contains one isotope; isotope-only parallelism left
+    // almost the entire calculation serial. `IndexedParallelIterator::collect`
+    // preserves the input energy order, and no tolerance or quadrature rule is
+    // changed here.
     energies
-        .iter()
-        .zip(ranges)
+        .par_iter()
+        .zip(ranges.into_par_iter())
         .map(|(&energy, range)| {
             broaden_target(
                 &plan,
