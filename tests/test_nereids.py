@@ -1439,7 +1439,9 @@ class TestSpatialMapBadValues:
         sample = np.full((n_e, 2, 2), 100.0)
         flux = np.full((n_e, 2, 2), 200.0)
         background = np.zeros((n_e, 2, 2))
-        background[6, 1, 0] = 1.0
+        # This is deliberately below the old 1e-12 tolerance. Unsupported
+        # background is a model choice, so every exact nonzero must fail.
+        background[6, 1, 0] = 5.0e-13
         data = nereids.from_counts_with_nuisance(sample, flux, background)
 
         with pytest.raises(ValueError, match="non-zero detector_background"):

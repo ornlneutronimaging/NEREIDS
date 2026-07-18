@@ -1686,7 +1686,7 @@ fn fit_counts_joint_poisson(
                 .into(),
         ));
     }
-    if detector_background.iter().any(|&v| v.abs() > 1e-12) {
+    if detector_background.iter().any(|&v| v != 0.0) {
         return Err(PipelineError::InvalidParameter(
             "joint-Poisson solver with non-zero detector_background is not yet supported \
              (B_det wiring is deferred)."
@@ -6509,34 +6509,35 @@ mod tests {
         let (t, _) = synthetic_transmission(&data, 0.0005, &energies);
         let flux: Vec<f64> = vec![500.0; energies.len()];
         let s: Vec<f64> = t.iter().map(|&ti| 500.0 * ti).collect();
-        let background: Vec<f64> = vec![5.0; energies.len()];
+        for nonzero_background in [5.0, 5.0e-13] {
+            let background: Vec<f64> = vec![nonzero_background; energies.len()];
+            let config = UnifiedFitConfig::new(
+                energies.clone(),
+                vec![data.clone()],
+                vec!["U-238".into()],
+                0.0,
+                None,
+                vec![0.001],
+            )
+            .unwrap()
+            .with_solver(SolverConfig::PoissonKL(PoissonConfig::default()))
+            .with_counts_background(CountsBackgroundConfig {
+                c: 1.0,
+                ..Default::default()
+            });
 
-        let config = UnifiedFitConfig::new(
-            energies,
-            vec![data],
-            vec!["U-238".into()],
-            0.0,
-            None,
-            vec![0.001],
-        )
-        .unwrap()
-        .with_solver(SolverConfig::PoissonKL(PoissonConfig::default()))
-        .with_counts_background(CountsBackgroundConfig {
-            c: 1.0,
-            ..Default::default()
-        });
-
-        let input = InputData::CountsWithNuisance {
-            sample_counts: s,
-            flux,
-            background,
-        };
-        let err = fit_spectrum_typed(&input, &config).unwrap_err();
-        let msg = err.to_string();
-        assert!(
-            msg.contains("B_det"),
-            "expected deferred-B_det rejection message, got: {msg}"
-        );
+            let input = InputData::CountsWithNuisance {
+                sample_counts: s.clone(),
+                flux: flux.clone(),
+                background,
+            };
+            let err = fit_spectrum_typed(&input, &config).unwrap_err();
+            let msg = err.to_string();
+            assert!(
+                msg.contains("B_det"),
+                "expected deferred-B_det rejection for {nonzero_background}, got: {msg}"
+            );
+        }
     }
 
     /// Joint-Poisson rejects BackD/BackF exponential tail (support is deferred).

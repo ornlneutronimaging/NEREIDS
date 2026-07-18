@@ -680,7 +680,7 @@ fn check_cube(
 ///   quantities, where a bad value anywhere is an upstream bug (matching the
 ///   all-bins `validate_counts`).
 /// - **background** (CountsWithNuisance) is checked **finite, all bins**,
-///   closing the `NaN.abs() > 1e-12 == false` finiteness leak in the
+///   closing the `NaN != 0.0` comparison leak in the
 ///   per-pixel detector-background gate.
 fn validate_spatial_data_values(
     input: &InputData3D<'_>,
@@ -753,7 +753,7 @@ fn validate_spatial_data_values(
                 None,
             )?;
             if live_pixels.iter().any(|&(y, x)| {
-                (0..background.shape()[0]).any(|energy| background[[energy, y, x]].abs() > 1.0e-12)
+                (0..background.shape()[0]).any(|energy| background[[energy, y, x]] != 0.0)
             }) {
                 return Err(PipelineError::InvalidParameter(
                     "joint-Poisson solver with non-zero detector_background is not yet \
@@ -4751,7 +4751,7 @@ mod tests {
     #[test]
     fn test_spatial_counts_with_nuisance_rejects_nonfinite_background() {
         // Background is validated finite before the nonzero-background gate;
-        // this closes the `NaN.abs() > 1e-12 == false` comparison leak.
+        // this closes the `NaN != 0.0` comparison leak.
         let energies: Vec<f64> = (0..51).map(|i| 1.0 + (i as f64) * 0.2).collect();
         for bad in [f64::NAN, f64::INFINITY] {
             let data = u238_single_resonance();
@@ -4784,25 +4784,27 @@ mod tests {
         let energies: Vec<f64> = (0..51).map(|i| 1.0 + (i as f64) * 0.2).collect();
         let (sample, _ob) = synthetic_4x4_counts(&data, 0.0005, &energies, 1000.0);
         let flux = Array3::from_elem((energies.len(), 4, 4), 1000.0);
-        let mut background = Array3::from_elem((energies.len(), 4, 4), 0.0);
-        background[[2, 3, 3]] = 1.0;
-        let config = kl_counts_config(energies.clone(), data);
-        let input = InputData3D::CountsWithNuisance {
-            sample_counts: sample.view(),
-            flux: flux.view(),
-            background: background.view(),
-        };
+        for nonzero_background in [1.0, 5.0e-13] {
+            let mut background = Array3::from_elem((energies.len(), 4, 4), 0.0);
+            background[[2, 3, 3]] = nonzero_background;
+            let config = kl_counts_config(energies.clone(), data.clone());
+            let input = InputData3D::CountsWithNuisance {
+                sample_counts: sample.view(),
+                flux: flux.view(),
+                background: background.view(),
+            };
 
-        let err = spatial_map_typed(&input, &config, None, None, None)
-            .expect_err("unsupported detector background must fail before pixel fitting");
-        assert!(
-            matches!(err, PipelineError::InvalidParameter(_)),
-            "got {err:?}"
-        );
-        assert!(
-            err.to_string().contains("non-zero detector_background"),
-            "error must name the unsupported detector background, got: {err}"
-        );
+            let err = spatial_map_typed(&input, &config, None, None, None)
+                .expect_err("unsupported detector background must fail before pixel fitting");
+            assert!(
+                matches!(err, PipelineError::InvalidParameter(_)),
+                "got {err:?}"
+            );
+            assert!(
+                err.to_string().contains("non-zero detector_background"),
+                "error must name the unsupported detector background, got: {err}"
+            );
+        }
     }
 
     #[test]
