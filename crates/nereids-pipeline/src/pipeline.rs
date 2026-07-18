@@ -1647,6 +1647,22 @@ fn fit_transmission_lm(
         sr.energy_scale_flight_path_m = Some(config.flight_path_m);
     }
 
+    let model_prediction = stacked.evaluate(&result.params)?;
+    let prediction_energies_ev = config.energies().to_vec();
+    let (signal_prediction, background_prediction) = split_prediction_components(
+        config,
+        &result.params,
+        &prediction_energies_ev,
+        &model_prediction,
+        bg_indices,
+        bl_indices,
+        true,
+    )?;
+    sr.prediction_energies_ev = prediction_energies_ev;
+    sr.signal_prediction = signal_prediction;
+    sr.background_prediction = background_prediction;
+    sr.model_prediction = model_prediction;
+
     Ok(sr)
 }
 
@@ -1840,6 +1856,8 @@ fn fit_counts_joint_poisson(
     // bins, so on the exact route it is applied only after the separate-arm
     // detector ratio has been formed.
     let mut stacked: Box<dyn FitModel> = t_model;
+    let prediction_energies_ev: Vec<f64>;
+    let baseline_wraps_background: bool;
     if let Some(exact) = config.exact_count_response() {
         if let Some(bli) = bl_indices {
             stacked = Box::new(MultiplicativeBaselineModel::new(
@@ -1857,6 +1875,26 @@ fn fit_counts_joint_poisson(
         let response = config.resolution().expect(
             "validate_counts_resolution_route requires resolution with exact_count_response",
         );
+        let detector_energies: Result<Vec<f64>, PipelineError> = exact
+            .detector_time_edges_us
+            .windows(2)
+            .enumerate()
+            .map(|(bin, edges)| {
+                let corrected_tof_us = 0.5 * (edges[0] + edges[1]) - exact.timing_offset_us;
+                let energy = tof_to_energy(corrected_tof_us, response.flight_path_m());
+                if energy.is_finite() && energy > 0.0 {
+                    Ok(energy)
+                } else {
+                    Err(PipelineError::InvalidParameter(format!(
+                        "detector-time bin {bin} has non-positive time after the fixed \
+                         timing offset; the fitted prediction energy is undefined"
+                    )))
+                }
+            })
+            .collect();
+        let detector_energies = detector_energies?;
+        prediction_energies_ev = detector_energies.clone();
+        baseline_wraps_background = false;
         let matrix = DetectorBinResponseMatrix::new(
             config.energies(),
             &exact.detector_time_edges_us,
@@ -1888,27 +1926,9 @@ fn fit_counts_joint_poisson(
         stacked = Box::new(exact_model);
 
         if let Some(bi) = bg_indices {
-            let detector_energies: Result<Vec<f64>, PipelineError> = exact
-                .detector_time_edges_us
-                .windows(2)
-                .enumerate()
-                .map(|(bin, edges)| {
-                    let corrected_tof_us = 0.5 * (edges[0] + edges[1]) - exact.timing_offset_us;
-                    let energy = tof_to_energy(corrected_tof_us, response.flight_path_m());
-                    if energy.is_finite() && energy > 0.0 {
-                        Ok(energy)
-                    } else {
-                        Err(PipelineError::InvalidParameter(format!(
-                            "detector-time bin {bin} has non-positive time after the fixed \
-                             timing offset; SAMMY apparent-transmission background cannot \
-                             be evaluated on that bin"
-                        )))
-                    }
-                })
-                .collect();
             stacked = Box::new(NormalizedTransmissionModel::new(
                 stacked,
-                &detector_energies?,
+                &detector_energies,
                 bi.anorm,
                 bi.back_a,
                 bi.back_b,
@@ -1916,6 +1936,8 @@ fn fit_counts_joint_poisson(
             ));
         }
     } else {
+        prediction_energies_ev = config.energies().to_vec();
+        baseline_wraps_background = true;
         if let Some(bi) = bg_indices {
             stacked = Box::new(NormalizedTransmissionModel::new(
                 stacked,
@@ -1962,6 +1984,16 @@ fn fit_counts_joint_poisson(
     // FittingError.
     let result = joint_poisson::joint_poisson_fit(&objective, &mut params, &cfg)
         .map_err(PipelineError::Fitting)?;
+    let model_prediction = stacked.evaluate(&result.params)?;
+    let (signal_prediction, background_prediction) = split_prediction_components(
+        config,
+        &result.params,
+        &prediction_energies_ev,
+        &model_prediction,
+        bg_indices,
+        bl_indices,
+        baseline_wraps_background,
+    )?;
 
     // ── Extract fitted quantities ──
     let densities: Vec<f64> = (0..n_density_params).map(|i| result.params[i]).collect();
@@ -2051,6 +2083,10 @@ fn fit_counts_joint_poisson(
         warnings: degenerate_normalization_warning(config)
             .into_iter()
             .collect(),
+        prediction_energies_ev,
+        signal_prediction,
+        background_prediction,
+        model_prediction,
     })
 }
 
@@ -3196,6 +3232,69 @@ fn free_uncertainty(free_indices: &[usize], unc_all: &[f64], full_index: usize) 
         .and_then(|pos| unc_all.get(pos).copied())
 }
 
+/// Split a complete fitted curve into the signal and additive-background
+/// contributions returned by [`SpectrumFitResult`].
+///
+/// The model itself remains the source of truth for the complete curve. This
+/// helper evaluates only the explicit SAMMY additive term and subtracts it
+/// from that complete curve. On ordinary transmission routes the optional
+/// multiplicative baseline wraps both signal and background, so it is applied
+/// to the background contribution here. On the exact two-arm count route the
+/// baseline belongs to the true-energy sample arm and is inside the detector
+/// response, while the SAMMY background is added afterwards in detector-bin
+/// space; `baseline_wraps_background` is therefore false for that route.
+fn split_prediction_components(
+    config: &UnifiedFitConfig,
+    params: &[f64],
+    prediction_energies_ev: &[f64],
+    model_prediction: &[f64],
+    bg_indices: Option<BackgroundIndices>,
+    bl_indices: Option<BaselineIndices>,
+    baseline_wraps_background: bool,
+) -> Result<(Vec<f64>, Vec<f64>), PipelineError> {
+    if prediction_energies_ev.len() != model_prediction.len() {
+        return Err(PipelineError::ShapeMismatch(format!(
+            "prediction energy length {} != fitted model length {}",
+            prediction_energies_ev.len(),
+            model_prediction.len(),
+        )));
+    }
+
+    let mut background = vec![0.0; model_prediction.len()];
+    if let Some(bi) = bg_indices {
+        for (index, &energy) in prediction_energies_ev.iter().enumerate() {
+            if !energy.is_finite() || energy <= 0.0 {
+                return Err(PipelineError::InvalidParameter(format!(
+                    "prediction_energies_ev[{index}] must be finite and positive, got {energy}",
+                )));
+            }
+            let sqrt_energy = energy.sqrt();
+            let mut value = params[bi.back_a]
+                + params[bi.back_b] / sqrt_energy
+                + params[bi.back_c] * sqrt_energy;
+            if let (Some(back_d), Some(back_f)) = (bi.back_d, bi.back_f) {
+                value += params[back_d] * (-params[back_f] / sqrt_energy).exp();
+            }
+            background[index] = value;
+        }
+    }
+
+    if baseline_wraps_background && let Some(bli) = bl_indices {
+        let e_ref = config.baseline_reference_energy();
+        for (value, &energy) in background.iter_mut().zip(prediction_energies_ev) {
+            let z = (energy / e_ref).ln();
+            *value *= params[bli.b0] + params[bli.b1] * z + params[bli.b2] * z * z;
+        }
+    }
+
+    let signal = model_prediction
+        .iter()
+        .zip(&background)
+        .map(|(&model, &background)| model - background)
+        .collect();
+    Ok((signal, background))
+}
+
 /// Extract SpectrumFitResult from solver output.
 fn extract_result(
     config: &UnifiedFitConfig,
@@ -3309,6 +3408,10 @@ fn extract_result(
         warnings: degenerate_normalization_warning(config)
             .into_iter()
             .collect(),
+        prediction_energies_ev: Vec::new(),
+        signal_prediction: Vec::new(),
+        background_prediction: Vec::new(),
+        model_prediction: Vec::new(),
     })
 }
 
@@ -3853,6 +3956,28 @@ pub struct SpectrumFitResult {
     /// tracing dependency, and structured warnings survive across the
     /// PyO3 / GUI boundaries.
     pub warnings: Vec<String>,
+    /// Energy coordinate for the returned fitted prediction.
+    ///
+    /// For ordinary transmission fits this is the caller's measured-energy
+    /// grid. For the exact two-arm count path it is derived from the measured
+    /// detector-time bin centres using the fixed response flight path and
+    /// timing offset. It therefore always has the same length and ordering as
+    /// [`Self::model_prediction`].
+    pub prediction_energies_ev: Vec<f64>,
+    /// Complete fitted signal contribution before the additive SAMMY
+    /// background, after all response, normalization, and multiplicative
+    /// baseline terms that belong to the signal have been applied.
+    pub signal_prediction: Vec<f64>,
+    /// Additive SAMMY background contribution in the returned prediction.
+    ///
+    /// This is an all-zero array when no additive transmission background was
+    /// configured. If a multiplicative baseline is outside the background on
+    /// the selected route, that baseline is already included here, so
+    /// `signal_prediction + background_prediction == model_prediction`
+    /// without caller-side reconstruction.
+    pub background_prediction: Vec<f64>,
+    /// Complete fitted curve in measured-bin order.
+    pub model_prediction: Vec<f64>,
 }
 
 impl SpectrumFitResult {
@@ -5860,6 +5985,10 @@ mod tests {
             baseline: None,
             baseline_e_ref_ev: None,
             warnings: Vec::new(),
+            prediction_energies_ev: Vec::new(),
+            signal_prediction: Vec::new(),
+            background_prediction: Vec::new(),
+            model_prediction: Vec::new(),
         };
 
         // Fitted energy scale → Some(corrected grid) == the canonical

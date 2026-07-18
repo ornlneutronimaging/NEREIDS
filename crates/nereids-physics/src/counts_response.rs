@@ -191,6 +191,79 @@ impl DetectorBinResponseMatrix {
         }
     }
 
+    /// Combine consecutive true-energy rows with quadrature weights.
+    ///
+    /// The returned matrix has one row per true-energy cell. Every positive
+    /// weighted probability is retained; no numerical cutoff is applied.
+    pub fn collapse_true_energy_groups(
+        &self,
+        quadrature_weights: &[f64],
+        group_size: usize,
+    ) -> Result<Self, CountsResponseError> {
+        if group_size == 0 || !self.n_true_energies.is_multiple_of(group_size) {
+            return Err(CountsResponseError::InvalidResponseGroupSize {
+                true_energies: self.n_true_energies,
+                group_size,
+            });
+        }
+        if quadrature_weights.len() != self.n_true_energies {
+            return Err(CountsResponseError::QuadratureWeightLengthMismatch {
+                true_energies: self.n_true_energies,
+                weights: quadrature_weights.len(),
+            });
+        }
+        for (index, &weight) in quadrature_weights.iter().enumerate() {
+            if !weight.is_finite() || weight < 0.0 {
+                return Err(CountsResponseError::InvalidQuadratureWeight {
+                    index,
+                    value: weight,
+                });
+            }
+        }
+
+        let n_groups = self.n_true_energies / group_size;
+        let mut row_offsets = Vec::with_capacity(n_groups + 1);
+        let mut detector_bins = Vec::new();
+        let mut probabilities = Vec::new();
+        let mut accumulated = vec![0.0; self.n_detector_bins];
+        let mut touched = Vec::new();
+        row_offsets.push(0);
+        for group in 0..n_groups {
+            touched.clear();
+            for offset in 0..group_size {
+                let true_index = group * group_size + offset;
+                let weight = quadrature_weights[true_index];
+                if weight == 0.0 {
+                    continue;
+                }
+                for (detector_bin, probability) in self.row_entries(true_index) {
+                    if accumulated[detector_bin] == 0.0 {
+                        touched.push(detector_bin);
+                    }
+                    accumulated[detector_bin] += weight * probability;
+                }
+            }
+            touched.sort_unstable();
+            touched.dedup();
+            for &detector_bin in &touched {
+                let probability = accumulated[detector_bin];
+                if probability > 0.0 {
+                    detector_bins.push(detector_bin as u32);
+                    probabilities.push(probability);
+                }
+                accumulated[detector_bin] = 0.0;
+            }
+            row_offsets.push(probabilities.len());
+        }
+        Ok(Self {
+            row_offsets,
+            detector_bins,
+            probabilities,
+            n_true_energies: n_groups,
+            n_detector_bins: self.n_detector_bins,
+        })
+    }
+
     /// Apply the fixed response separately to open and sample arms.
     pub fn apply(
         &self,
@@ -290,6 +363,18 @@ pub enum CountsResponseError {
     InvalidIncidentFluence { index: usize, value: f64 },
     /// A physical sample transmission was outside `[0, 1]` or non-finite.
     InvalidTransmission { index: usize, value: f64 },
+    /// Consecutive response rows could not be divided into equal cells.
+    InvalidResponseGroupSize {
+        true_energies: usize,
+        group_size: usize,
+    },
+    /// Quadrature weights must match the true-energy response rows.
+    QuadratureWeightLengthMismatch {
+        true_energies: usize,
+        weights: usize,
+    },
+    /// A quadrature weight was negative or non-finite.
+    InvalidQuadratureWeight { index: usize, value: f64 },
     /// A signal or background expected count was negative or non-finite.
     InvalidExpectedCount {
         field: &'static str,
@@ -330,6 +415,24 @@ impl fmt::Display for CountsResponseError {
             Self::InvalidTransmission { index, value } => write!(
                 f,
                 "transmission[{index}] must be finite and in [0, 1], got {value}"
+            ),
+            Self::InvalidResponseGroupSize {
+                true_energies,
+                group_size,
+            } => write!(
+                f,
+                "group_size must be positive and evenly divide {true_energies} true-energy rows, got {group_size}"
+            ),
+            Self::QuadratureWeightLengthMismatch {
+                true_energies,
+                weights,
+            } => write!(
+                f,
+                "quadrature weight length ({weights}) must match true-energy rows ({true_energies})"
+            ),
+            Self::InvalidQuadratureWeight { index, value } => write!(
+                f,
+                "quadrature_weights[{index}] must be finite and nonnegative, got {value}"
             ),
             Self::InvalidExpectedCount {
                 field,

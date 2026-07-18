@@ -56,6 +56,10 @@ Returned by `fit_spectrum_typed(...)` and `fit_counts_spectrum_typed(...)`.
 | `iterations` | `int` | Iteration count. |
 | `temperature_k` | `float or None` | Fitted temperature when `fit_temperature=True`. |
 | `t0_us`, `l_scale` | `float or None` | Fitted energy-scale parameters when `fit_energy_scale=True`. |
+| `prediction_energies_ev` | `NDArray[float64]` | Energy coordinate for the returned fitted curve, in measured-bin order. |
+| `signal_prediction` | `NDArray[float64]` | Fitted signal after response and normalization, excluding the explicit additive background. |
+| `background_prediction` | `NDArray[float64]` | Explicit additive SAMMY background contribution. |
+| `model_prediction` | `NDArray[float64]` | Complete fitted curve; exactly `signal_prediction + background_prediction`. |
 
 ### `InputData`
 
@@ -160,6 +164,94 @@ falling outside the supplied acquisition window is not silently moved back
 into it. Both arrays are predictions for the same reference exposure. Scale
 them to the measured proton charge, live time, or other documented exposure of
 each complete acquisition before comparing them with observed counts.
+
+For repeated work, build `DetectorResponseMatrix(...)` once. Its `project(...)`
+and `apply(...)` methods reuse the compact native response, while
+`transpose_project(...)` supplies the reverse operation needed by source
+inference. `collapse_true_energy_groups(...)` pre-sums fixed quadrature points
+inside each source cell. It changes neither the quadrature nor any response
+probability; it avoids repeating the same sum during every source-optimizer
+step.
+
+## Aggregate 1D Room Calibration and Frozen Hot Fit
+
+Use `calibrate_aggregated_1d(...)` for the room run and pass its result directly
+to `fit_frozen_aggregated_1d(...)` for the hot run. The room function accepts no
+hot data, so the instrument cannot be adjusted to improve the hot result.
+
+```python
+calibration = nereids.calibrate_aggregated_1d(
+    detector_time_edges_us=detector_edges,
+    open_counts=open_counts,
+    room_counts=room_counts,
+    sample_over_open_exposure=room_charge / open_charge,
+    isotopes=[ta181],
+    room_temperature_k=room_temperature,
+    reference_flight_path_m=reference_path,
+    reference_timing_offset_us=reference_t0,
+    initial_physical_parameters=(t0_start, path_start, width_start, density_start),
+    fit_energy_range_ev=(energy_min, energy_max),
+    ic_profile=instrument_ic_profile,
+    physical_lower_bounds=(t0_min, path_min, width_min, density_min),
+    physical_upper_bounds=(t0_max, path_max, width_max, density_max),
+    debye_temperature_k=217.0,
+)
+
+hot = nereids.fit_frozen_aggregated_1d(
+    calibration,
+    hot_counts=hot_counts,
+    sample_over_open_exposure=hot_charge / open_charge,
+    initial_temperature_k=1000.0,
+    initial_density_atoms_per_barn=density_start,
+)
+```
+
+The supported calculation is:
+
+1. Integrate the analytical IC response over the actual detector-time edges
+   with a fixed 15-point rule inside every true-energy cell.
+2. Infer one nonnegative incident-source amount per cell from the open beam
+   only.
+3. Fit room timing offset, effective path, IC width scale, and material amount.
+   At each physical trial, fit the four SAMMY apparent-transmission background
+   coefficients inside that trial.
+4. Freeze the room response, source, energy interval, nuclear evaluation,
+   material model, and open-beam uncertainty.
+5. Fit only hot temperature, material amount, and the same four background
+   coefficients.
+
+`Aggregated1DFitResult` returns measured transmission, uncertainty, signal,
+background, complete model, residual, every fitted parameter, bound hits, and
+summary residual values. It returns both `poisson_uncertainty` /
+`poisson_residual` (independent count statistics) and `uncertainty` / `residual`
+(including any independently measured detector variance factors supplied by
+the caller). A notebook must not rebuild the background or fitted curve. The
+measured arrays and evaluated nuclear values are never modified. Variance
+factors must come from detector data independent of the spectrum fit; they must
+not be adjusted to improve a residual.
+
+The IC profile, fit-energy range, and physical bounds are required arguments.
+There are no hidden VENUS geometry or fit-window defaults in the generic API.
+The VENUS example uses a 4--120 eV true-energy response interval so neutrons
+outside the fit window can still migrate into measured bins, while its 8--45
+eV calibration interval is the pre-existing tantalum analysis region fixed
+before the IC comparison. Its JSON and figure report all supplied 4--120 eV
+bins as diagnostics as well as the bins that determine the fit.
+
+The public VENUS example is
+`examples/workflows/venus_aggregated_1d.py`. It uses scatter points for the
+measured spectra and lines for the fitted curves. The fixed
+`VENUS_UDR_MATCHED_IC_PROFILE` is an analytical approximation to the archived
+VENUS UDR shape; it is not a new nuclear evaluation and is not claimed to be
+more faithful than the high-fidelity UDR itself. The example's TPX1 variance
+factors were measured from the raw pixels for those exact acquisitions and are
+reported alongside the independent-Poisson residuals.
+
+Current boundary: this workflow is for one aggregated spectrum. Exact-response
+spatial fitting remains unsupported until one frozen detector response can be
+reused safely across pixels. The aggregate calibration is also not an
+interactive operation; source inference and repeated response construction are
+still the main runtime costs.
 
 ### Independently Measured Count Backgrounds
 

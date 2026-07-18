@@ -1198,6 +1198,10 @@ fn selected_pixel_fit_result_for_overlay(
             .or(result.baseline_global),
         baseline_e_ref_ev: result.baseline_e_ref_ev,
         warnings: result.warnings.clone(),
+        prediction_energies_ev: Vec::new(),
+        signal_prediction: Vec::new(),
+        background_prediction: Vec::new(),
+        model_prediction: Vec::new(),
     })
 }
 
@@ -2922,6 +2926,10 @@ mod tests {
             baseline: None,
             baseline_e_ref_ev: None,
             warnings: Vec::new(),
+            prediction_energies_ev: Vec::new(),
+            signal_prediction: Vec::new(),
+            background_prediction: Vec::new(),
+            model_prediction: Vec::new(),
         }
     }
 

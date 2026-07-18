@@ -63,6 +63,50 @@ fn compact_response_keeps_every_nonzero_and_reconstructs_interior_zeros() {
 }
 
 #[test]
+fn quadrature_rows_collapse_to_the_same_open_beam_operator() {
+    let response = triangle_response();
+    let arrival_0 = TOF_FACTOR * 25.0 / 25.0_f64.sqrt();
+    let energy_1 = (TOF_FACTOR * 25.0 / (arrival_0 + 1.0)).powi(2);
+    let full = DetectorBinResponseMatrix::new(
+        &[25.0, energy_1, 25.0, energy_1],
+        &[arrival_0 - 1.0, arrival_0, arrival_0 + 1.0, arrival_0 + 2.0],
+        0.0,
+        &response,
+    )
+    .expect("valid quadrature response");
+    let weights = [0.25, 0.75, 0.6, 0.4];
+    let collapsed = full
+        .collapse_true_energy_groups(&weights, 2)
+        .expect("valid two-point cells");
+    let source = [120.0, 80.0];
+    let expanded_source = [
+        source[0] * weights[0],
+        source[0] * weights[1],
+        source[1] * weights[2],
+        source[1] * weights[3],
+    ];
+    let full_open = full
+        .apply(&expanded_source, &[1.0; 4])
+        .expect("full response")
+        .open_beam;
+    let collapsed_open = collapsed
+        .apply(&source, &[1.0; 2])
+        .expect("collapsed response")
+        .open_beam;
+    for (full_value, collapsed_value) in full_open.iter().zip(&collapsed_open) {
+        assert!((full_value - collapsed_value).abs() < 2.0e-14);
+    }
+    assert!(matches!(
+        full.collapse_true_energy_groups(&weights, 3),
+        Err(CountsResponseError::InvalidResponseGroupSize { .. })
+    ));
+    assert!(matches!(
+        full.collapse_true_energy_groups(&[0.5; 3], 2),
+        Err(CountsResponseError::QuadratureWeightLengthMismatch { .. })
+    ));
+}
+
+#[test]
 fn two_arm_response_integrates_fluence_and_transmission_before_detector_binning() {
     let response = triangle_response();
     let arrival_0 = TOF_FACTOR * 25.0 / 25.0_f64.sqrt();

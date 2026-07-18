@@ -1316,6 +1316,12 @@ fn state_from_snapshot(snap: ProjectSnapshot, state: &mut AppState, path: &Path)
             baseline: snap.single_fit_baseline,
             baseline_e_ref_ev: snap.single_fit_baseline_e_ref_ev,
             warnings: Vec::new(),
+            // Older project snapshots did not persist fitted curve arrays.
+            // The overlay can still rebuild the curve from the fitted values.
+            prediction_energies_ev: Vec::new(),
+            signal_prediction: Vec::new(),
+            background_prediction: Vec::new(),
+            model_prediction: Vec::new(),
         };
         // Rebuild FitFeedback from the restored result
         if let Some(ref labels) = snap.single_fit_labels {

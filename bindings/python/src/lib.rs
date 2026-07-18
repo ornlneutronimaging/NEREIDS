@@ -457,6 +457,17 @@ struct PyFitResult {
     /// Structured fit-configuration warnings (e.g. the degenerate
     /// free-Anorm + free-temperature + free-density trio).
     warnings: Vec<String>,
+    /// Energy coordinate for the complete fitted prediction, in measured-bin
+    /// order.
+    prediction_energies_ev: Vec<f64>,
+    /// Signal contribution after response and normalization, excluding the
+    /// explicit additive SAMMY background.
+    signal_prediction: Vec<f64>,
+    /// Explicit additive SAMMY background contribution.
+    background_prediction: Vec<f64>,
+    /// Complete fitted curve.  This is always signal_prediction plus
+    /// background_prediction.
+    model_prediction: Vec<f64>,
 }
 
 #[pymethods]
@@ -526,6 +537,30 @@ impl PyFitResult {
     #[getter]
     fn anorm(&self) -> f64 {
         self.anorm
+    }
+
+    /// Energy coordinate for the fitted prediction, in measured-bin order.
+    #[getter]
+    fn prediction_energies_ev<'py>(&self, py: Python<'py>) -> Bound<'py, PyArray1<f64>> {
+        PyArray1::from_vec(py, self.prediction_energies_ev.clone())
+    }
+
+    /// Fitted signal contribution excluding the explicit additive background.
+    #[getter]
+    fn signal_prediction<'py>(&self, py: Python<'py>) -> Bound<'py, PyArray1<f64>> {
+        PyArray1::from_vec(py, self.signal_prediction.clone())
+    }
+
+    /// Explicit additive background contribution to the fitted curve.
+    #[getter]
+    fn background_prediction<'py>(&self, py: Python<'py>) -> Bound<'py, PyArray1<f64>> {
+        PyArray1::from_vec(py, self.background_prediction.clone())
+    }
+
+    /// Complete fitted curve in measured-bin order.
+    #[getter]
+    fn model_prediction<'py>(&self, py: Python<'py>) -> Bound<'py, PyArray1<f64>> {
+        PyArray1::from_vec(py, self.model_prediction.clone())
     }
 
     /// Fitted background parameter triplet.
@@ -2357,6 +2392,174 @@ fn py_two_arm_count_response<'py>(
         PyArray1::from_vec(py, result.open_beam),
         PyArray1::from_vec(py, result.sample),
     ))
+}
+
+/// Reusable compact detector response for repeated aggregate-spectrum work.
+///
+/// Rows in the underlying native matrix are true-energy points and output
+/// bins are consecutive intervals in ``detector_time_edges_us``.  The matrix
+/// stores every strictly positive probability without a numerical cutoff.
+#[pyclass(name = "DetectorResponseMatrix")]
+struct PyDetectorResponseMatrix {
+    inner: counts_response::DetectorBinResponseMatrix,
+}
+
+#[pymethods]
+impl PyDetectorResponseMatrix {
+    #[new]
+    #[pyo3(signature = (
+        true_energies_ev,
+        detector_time_edges_us,
+        resolution,
+        timing_offset_us = 0.0,
+    ))]
+    fn new(
+        py: Python<'_>,
+        true_energies_ev: PyReadonlyArray1<f64>,
+        detector_time_edges_us: PyReadonlyArray1<f64>,
+        resolution: &Bound<'_, PyAny>,
+        timing_offset_us: f64,
+    ) -> PyResult<Self> {
+        let response = extract_detector_time_resolution(resolution)?;
+        let energies = true_energies_ev.as_slice()?.to_vec();
+        let detector_edges = detector_time_edges_us.as_slice()?.to_vec();
+        let inner = py.detach(move || {
+            counts_response::DetectorBinResponseMatrix::new(
+                &energies,
+                &detector_edges,
+                timing_offset_us,
+                &response,
+            )
+        });
+        let inner = inner.map_err(|error| {
+            pyo3::exceptions::PyValueError::new_err(format!("detector response matrix: {error}"))
+        })?;
+        Ok(Self { inner })
+    }
+
+    #[getter]
+    fn n_true_energies(&self) -> usize {
+        self.inner.n_true_energies()
+    }
+
+    #[getter]
+    fn n_detector_bins(&self) -> usize {
+        self.inner.n_detector_bins()
+    }
+
+    #[getter]
+    fn nonzero_probabilities(&self) -> usize {
+        self.inner.nnz()
+    }
+
+    #[getter]
+    fn storage_bytes(&self) -> usize {
+        self.inner.storage_bytes()
+    }
+
+    /// Apply the response to one nonnegative true-energy weight vector.
+    fn project<'py>(
+        &self,
+        py: Python<'py>,
+        true_energy_weights: PyReadonlyArray1<f64>,
+    ) -> PyResult<Bound<'py, PyArray1<f64>>> {
+        let weights = true_energy_weights.as_slice()?;
+        let transmission = vec![1.0; self.inner.n_true_energies()];
+        let result = self.inner.apply(weights, &transmission).map_err(|error| {
+            pyo3::exceptions::PyValueError::new_err(format!(
+                "detector response projection: {error}"
+            ))
+        })?;
+        Ok(PyArray1::from_vec(py, result.open_beam))
+    }
+
+    /// Apply the transpose response to detector-bin values.
+    ///
+    /// This operation accepts signed finite values because it is also the
+    /// gradient operation used by nonnegative source inference.
+    fn transpose_project<'py>(
+        &self,
+        py: Python<'py>,
+        detector_bin_values: PyReadonlyArray1<f64>,
+    ) -> PyResult<Bound<'py, PyArray1<f64>>> {
+        let values = detector_bin_values.as_slice()?;
+        if values.len() != self.inner.n_detector_bins() {
+            return Err(pyo3::exceptions::PyValueError::new_err(format!(
+                "detector_bin_values length ({}) must match n_detector_bins ({})",
+                values.len(),
+                self.inner.n_detector_bins(),
+            )));
+        }
+        if let Some((index, value)) = values
+            .iter()
+            .copied()
+            .enumerate()
+            .find(|(_, value)| !value.is_finite())
+        {
+            return Err(pyo3::exceptions::PyValueError::new_err(format!(
+                "detector_bin_values[{index}] must be finite, got {value}"
+            )));
+        }
+        let mut projected = vec![0.0; self.inner.n_true_energies()];
+        for (true_index, output) in projected.iter_mut().enumerate() {
+            *output = self
+                .inner
+                .row_entries(true_index)
+                .map(|(detector_bin, probability)| probability * values[detector_bin])
+                .sum();
+        }
+        Ok(PyArray1::from_vec(py, projected))
+    }
+
+    /// Apply the response to open and attenuated sample weights separately.
+    fn apply<'py>(
+        &self,
+        py: Python<'py>,
+        incident_fluence_weights: PyReadonlyArray1<f64>,
+        transmission: PyReadonlyArray1<f64>,
+    ) -> PyResult<(Bound<'py, PyArray1<f64>>, Bound<'py, PyArray1<f64>>)> {
+        let result = self
+            .inner
+            .apply(
+                incident_fluence_weights.as_slice()?,
+                transmission.as_slice()?,
+            )
+            .map_err(|error| {
+                pyo3::exceptions::PyValueError::new_err(format!(
+                    "detector response application: {error}"
+                ))
+            })?;
+        Ok((
+            PyArray1::from_vec(py, result.open_beam),
+            PyArray1::from_vec(py, result.sample),
+        ))
+    }
+
+    /// Combine consecutive true-energy rows into exact quadrature cells.
+    fn collapse_true_energy_groups(
+        &self,
+        quadrature_weights: PyReadonlyArray1<f64>,
+        group_size: usize,
+    ) -> PyResult<Self> {
+        let inner = self
+            .inner
+            .collapse_true_energy_groups(quadrature_weights.as_slice()?, group_size)
+            .map_err(|error| {
+                pyo3::exceptions::PyValueError::new_err(format!(
+                    "collapse detector response groups: {error}"
+                ))
+            })?;
+        Ok(Self { inner })
+    }
+
+    fn __repr__(&self) -> String {
+        format!(
+            "DetectorResponseMatrix(n_true_energies={}, n_detector_bins={}, nnz={})",
+            self.inner.n_true_energies(),
+            self.inner.n_detector_bins(),
+            self.inner.nnz(),
+        )
+    }
 }
 
 /// Python result for a fixed-signal, measured-template count-background fit.
@@ -4492,6 +4695,7 @@ fn nereids(m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_class::<PyTabulatedResolution>()?;
     m.add_class::<PyEnergyLaw>()?;
     m.add_class::<PyIkedaCarpenter>()?;
+    m.add_class::<PyDetectorResponseMatrix>()?;
     m.add_class::<PyTwoArmBackgroundFitResult>()?;
     m.add_class::<PyResolutionCalibration>()?;
     m.add_class::<PySpatialResult>()?;
@@ -5998,6 +6202,10 @@ fn py_fit_counts_spectrum_typed<'py>(
         baseline: result.baseline,
         baseline_e_ref_ev: result.baseline_e_ref_ev,
         warnings: result.warnings,
+        prediction_energies_ev: result.prediction_energies_ev,
+        signal_prediction: result.signal_prediction,
+        background_prediction: result.background_prediction,
+        model_prediction: result.model_prediction,
     })
 }
 
@@ -6703,5 +6911,9 @@ fn py_fit_spectrum_typed<'py>(
         baseline: result.baseline,
         baseline_e_ref_ev: result.baseline_e_ref_ev,
         warnings: result.warnings,
+        prediction_energies_ev: result.prediction_energies_ev,
+        signal_prediction: result.signal_prediction,
+        background_prediction: result.background_prediction,
+        model_prediction: result.model_prediction,
     })
 }

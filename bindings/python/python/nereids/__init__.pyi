@@ -7,6 +7,19 @@ from typing import Any, Literal, overload
 import numpy as np
 from numpy.typing import NDArray
 
+from .aggregated_1d import (
+    Aggregated1DCalibration as Aggregated1DCalibration,
+    Aggregated1DFitResult as Aggregated1DFitResult,
+    IcShapeProfile as IcShapeProfile,
+    SourceInferenceResult as SourceInferenceResult,
+    VENUS_UDR_MATCHED_IC_PROFILE as VENUS_UDR_MATCHED_IC_PROFILE,
+    calibrate_aggregated_1d as calibrate_aggregated_1d,
+    fit_frozen_aggregated_1d as fit_frozen_aggregated_1d,
+    profiled_two_arm_residual as profiled_two_arm_residual,
+    select_energy_ordered_detector_bins as select_energy_ordered_detector_bins,
+    solid_debye_effective_temperature as solid_debye_effective_temperature,
+)
+
 # ---------------------------------------------------------------------------
 # Classes
 # ---------------------------------------------------------------------------
@@ -189,6 +202,26 @@ class FitResult:
     @property
     def anorm(self) -> float:
         """Fitted normalization factor (1.0 if background not enabled)."""
+        ...
+
+    @property
+    def prediction_energies_ev(self) -> NDArray[np.float64]:
+        """Energy coordinate for the complete fitted prediction."""
+        ...
+
+    @property
+    def signal_prediction(self) -> NDArray[np.float64]:
+        """Fitted signal contribution excluding the explicit additive background."""
+        ...
+
+    @property
+    def background_prediction(self) -> NDArray[np.float64]:
+        """Explicit additive background contribution to the fitted curve."""
+        ...
+
+    @property
+    def model_prediction(self) -> NDArray[np.float64]:
+        """Complete fitted curve in measured-bin order."""
         ...
 
     @property
@@ -962,6 +995,54 @@ def two_arm_count_response(
     renormalized into that window.
     """
     ...
+
+class DetectorResponseMatrix:
+    """Reusable compact detector-time response matrix.
+
+    The matrix is built once for fixed true energies, detector-time edges,
+    timing offset, and an analytical IC or loaded tabulated response. Outputs
+    are in increasing detector-time bin order.
+    """
+
+    def __init__(
+        self,
+        true_energies_ev: NDArray[np.float64],
+        detector_time_edges_us: NDArray[np.float64],
+        resolution: TabulatedResolution | IkedaCarpenter,
+        timing_offset_us: float = 0.0,
+    ) -> None: ...
+
+    @property
+    def n_true_energies(self) -> int: ...
+
+    @property
+    def n_detector_bins(self) -> int: ...
+
+    @property
+    def nonzero_probabilities(self) -> int: ...
+
+    @property
+    def storage_bytes(self) -> int: ...
+
+    def project(
+        self, true_energy_weights: NDArray[np.float64]
+    ) -> NDArray[np.float64]: ...
+
+    def transpose_project(
+        self, detector_bin_values: NDArray[np.float64]
+    ) -> NDArray[np.float64]: ...
+
+    def apply(
+        self,
+        incident_fluence_weights: NDArray[np.float64],
+        transmission: NDArray[np.float64],
+    ) -> tuple[NDArray[np.float64], NDArray[np.float64]]: ...
+
+    def collapse_true_energy_groups(
+        self,
+        quadrature_weights: NDArray[np.float64],
+        group_size: int,
+    ) -> DetectorResponseMatrix: ...
 
 class TwoArmBackgroundFitResult:
     """Fixed-signal fit of independently supplied count-background templates."""

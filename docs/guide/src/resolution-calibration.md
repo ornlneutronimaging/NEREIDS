@@ -13,6 +13,15 @@ This page covers (1) the three resolution models NEREIDS provides and (2) the
 **calibrate → pin → fit** procedure that determines the resolution from a known
 standard.
 
+For separate open/sample counts from an aggregate detector ROI, use the
+supported `calibrate_aggregated_1d(...)` then
+`fit_frozen_aggregated_1d(...)` workflow described in the
+[Python API reference](python-api.md#aggregate-1d-room-calibration-and-frozen-hot-fit).
+It applies the response to the two count arms separately and returns the full
+signal/background/model curve. The older `calibrate_resolution(...)` API below
+fits a normalized transmission spectrum and remains the supported route when
+the separate count arms are unavailable.
+
 ## The three resolution models
 
 All three are passed to [`forward_model`](./python-api.md) and the fitters the

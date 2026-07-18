@@ -712,6 +712,58 @@ class TestTwoArmCountResponse:
         assert result.converged
         assert float(result.densities[0]) == pytest.approx(true_density, abs=2.0e-6)
         assert float(result.deviance_per_dof) < 1.0e-8
+        assert result.prediction_energies_ev.shape == sample.shape
+        assert result.signal_prediction.shape == sample.shape
+        assert result.background_prediction.shape == sample.shape
+        assert result.model_prediction.shape == sample.shape
+        np.testing.assert_allclose(result.background_prediction, 0.0, atol=0.0)
+        np.testing.assert_allclose(
+            result.signal_prediction + result.background_prediction,
+            result.model_prediction,
+            rtol=0.0,
+            atol=2.0e-15,
+        )
+
+    def test_reusable_matrix_matches_function_and_has_correct_transpose(self):
+        energies = np.array([5.0, 6.0, 7.0])
+        source = np.array([100.0, 200.0, 300.0])
+        transmission = np.array([0.9, 0.7, 0.5])
+        detector_edges = np.linspace(650.0, 850.0, 17)
+        ic = nereids.IkedaCarpenter(
+            flight_path_m=self.L,
+            e_min_ev=4.0,
+            e_max_ev=8.0,
+            alpha=nereids.EnergyLaw.const(1.2),
+            beta=0.2,
+            r=nereids.EnergyLaw.const(0.25),
+        )
+        expected_open, expected_sample = nereids.two_arm_count_response(
+            energies, source, transmission, detector_edges, ic
+        )
+        matrix = nereids.DetectorResponseMatrix(energies, detector_edges, ic)
+        observed_open, observed_sample = matrix.apply(source, transmission)
+
+        np.testing.assert_array_equal(observed_open, expected_open)
+        np.testing.assert_array_equal(observed_sample, expected_sample)
+        np.testing.assert_array_equal(matrix.project(source), expected_open)
+        detector_values = np.linspace(-2.0, 3.0, detector_edges.size - 1)
+        left = float(np.dot(matrix.project(source), detector_values))
+        right = float(np.dot(source, matrix.transpose_project(detector_values)))
+        assert left == pytest.approx(right, abs=2.0e-12)
+        assert matrix.n_true_energies == energies.size
+        assert matrix.n_detector_bins == detector_edges.size - 1
+        assert matrix.nonzero_probabilities > 0
+        assert matrix.storage_bytes > 0
+
+        doubled = nereids.DetectorResponseMatrix(
+            np.repeat(energies, 2), detector_edges, ic
+        )
+        collapsed = doubled.collapse_true_energy_groups(
+            np.tile([0.25, 0.75], energies.size), 2
+        )
+        np.testing.assert_allclose(
+            collapsed.project(source), matrix.project(source), rtol=0.0, atol=2.0e-13
+        )
 
 
 class TestTwoArmCountBackground:
@@ -4051,6 +4103,14 @@ class TestStubConformance:
             if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef)):
                 if not node.name.startswith("_"):
                     stub_names.add(node.name)
+            elif isinstance(node, (ast.Import, ast.ImportFrom)):
+                for alias in node.names:
+                    exported_name = alias.asname or alias.name.split(".")[0]
+                    if not exported_name.startswith("_"):
+                        stub_names.add(exported_name)
+            elif isinstance(node, ast.AnnAssign) and isinstance(node.target, ast.Name):
+                if not node.target.id.startswith("_"):
+                    stub_names.add(node.target.id)
 
         # Dunders + the ``__version__`` style attributes don't belong
         # in the stub; pyo3's auto-injected ``annotations`` import isn't
@@ -4771,6 +4831,14 @@ class TestMultiplicativeBaseline:
         assert r.baseline is None
         assert r.baseline_e_ref_ev is None
         assert r.warnings == []
+        np.testing.assert_array_equal(r.prediction_energies_ev, energies)
+        np.testing.assert_allclose(r.background_prediction, 0.0, atol=0.0)
+        np.testing.assert_allclose(
+            r.signal_prediction + r.background_prediction,
+            r.model_prediction,
+            rtol=0.0,
+            atol=2.0e-15,
+        )
 
     def test_baseline_with_default_background_rejected_on_all_fitters(
         self, u238_data
@@ -4837,6 +4905,26 @@ class TestMultiplicativeBaseline:
         assert r.anorm == 1.0, "Anorm was frozen at its init"
         assert r.baseline is not None
         assert abs(r.baseline[0] - _BL_TRUE[0]) < 2e-2
+        e_ref = float(r.baseline_e_ref_ev)
+        log_energy = np.log(energies / e_ref)
+        fitted_baseline = (
+            r.baseline[0]
+            + r.baseline[1] * log_energy
+            + r.baseline[2] * log_energy * log_energy
+        )
+        back_a, back_b, back_c = r.background
+        expected_background = fitted_baseline * (
+            back_a + back_b / np.sqrt(energies) + back_c * np.sqrt(energies)
+        )
+        np.testing.assert_allclose(
+            r.background_prediction, expected_background, rtol=2.0e-13, atol=2.0e-14
+        )
+        np.testing.assert_allclose(
+            r.signal_prediction + r.background_prediction,
+            r.model_prediction,
+            rtol=0.0,
+            atol=2.0e-15,
+        )
 
     def test_baseline_suboptions_require_baseline_true(self, u238_data):
         energies = np.linspace(1.0, 30.0, 100)
