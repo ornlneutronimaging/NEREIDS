@@ -452,6 +452,38 @@ class TestManifestWorkflowTools:
         assert result["success"] is False
         assert "raw count input cannot be fit in the transmission domain" in result["error"]
 
+    def test_count_spectrum_rejects_lm_in_count_domain(self, tmp_path, monkeypatch):
+        np.savez(
+            tmp_path / "counts.npz",
+            energies_ev=np.linspace(1.0, 30.0, 20),
+            sample_counts=np.full(20, 900.0),
+            open_beam_counts=np.full(20, 1000.0),
+        )
+        fitter_called = False
+
+        def forbidden_count_fit(**_kwargs):
+            nonlocal fitter_called
+            fitter_called = True
+            raise AssertionError("invalid counts + LM route reached the fitter")
+
+        monkeypatch.setattr(nereids, "fit_counts_spectrum_typed", forbidden_count_fit)
+        _write_json_frontmatter_manifest(
+            tmp_path,
+            {
+                "mode": "single_spectrum",
+                "data": {"kind": "counts_npz", "path": "counts.npz"},
+                "isotopes": [_synthetic_u238_entry()],
+                "fit": {"solver": "lm", "max_iter": 5},
+                "resolution": {"kind": "none"},
+            },
+        )
+
+        result = process_resonance_dataset(str(tmp_path))
+
+        assert result["success"] is False
+        assert "raw count input cannot use solver='lm'" in result["error"]
+        assert fitter_called is False
+
     def test_process_density_map_manifest(self, tmp_path):
         energies = np.linspace(1.0, 30.0, 120)
         true_density = 0.002

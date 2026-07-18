@@ -695,6 +695,13 @@ def _process_single_spectrum(
                 "the conversion discards open-beam count uncertainty; use "
                 "fit_domain='counts' with solver='auto' or solver='kl'"
             )
+        requested_solver = str(fit_config.get("solver", "auto")).lower()
+        if requested_solver == "lm":
+            raise ValueError(
+                "raw count input cannot use solver='lm': the least-squares "
+                "transmission engine would discard open-beam count uncertainty; "
+                "use solver='auto' or solver='kl'"
+            )
         kwargs = _single_fit_kwargs(fit_config, resolution, counts=True)
         kwargs["c"] = float(fit_config.get("c", c))
         result = nereids.fit_counts_spectrum_typed(
@@ -714,6 +721,12 @@ def _process_single_spectrum(
             raise ValueError(
                 "normalized transmission input must use fit_domain='transmission' "
                 "with solver='auto' or solver='lm'"
+            )
+        requested_solver = str(fit_config.get("solver", "auto")).lower()
+        if requested_solver in {"kl", "poisson", "poisson_kl"}:
+            raise ValueError(
+                "normalized transmission input cannot use a Poisson/KL count "
+                "likelihood; use solver='auto' or solver='lm'"
             )
         trans_key = data_config.get("transmission_key", "transmission")
         unc_key = data_config.get("uncertainty_key", "uncertainty")
