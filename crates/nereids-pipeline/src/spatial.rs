@@ -254,10 +254,10 @@ fn apply_spatial_polish_default(config: UnifiedFitConfig, n_pixels: usize) -> Un
 /// raised inside `fit_spectrum_typed` / `fit_transmission_poisson` /
 /// `fit_counts_joint_poisson` whose decision depends only on
 /// `(input variant, config)` — i.e. fires identically for every pixel.
-/// Per-pixel error variants (numerical fit failure, per-pixel detector
-/// background contamination on `CountsWithNuisance`) intentionally stay
-/// inside the closure where they correctly produce a NaN-only single
-/// pixel rather than a whole-map error.
+/// Per-pixel numerical fit failures intentionally stay inside the closure
+/// where they correctly produce a NaN-only single pixel rather than a
+/// whole-map error. Unsupported detector background is validated separately
+/// on every live pixel before the closure starts.
 ///
 /// The error messages here are kept byte-identical to the originating
 /// per-pixel sites so the user-facing diagnostic does not bifurcate
@@ -420,10 +420,9 @@ fn validate_spatial_fit_preflight(
     // Every gate below mirrors a per-pixel rejection in
     // `pipeline.rs::fit_counts_joint_poisson`.  All fire identically
     // across the map because they depend only on shared config flags
-    // (alpha fitting, B_A/B/C interlock, `c` value); per-pixel
-    // detector-background contamination is *not* hoisted because
-    // `CountsWithNuisance` carries per-pixel `background` slices and
-    // contamination is a legitimately per-pixel signal.
+    // (alpha fitting, B_A/B/C interlock, `c` value). Unsupported nonzero
+    // detector background is rejected across all live pixels by
+    // `validate_spatial_data_values` before any fit starts.
     if is_counts && is_kl {
         if let Some(bg) = config.counts_background() {
             if bg.fit_alpha_1 || bg.fit_alpha_2 {
@@ -753,6 +752,15 @@ fn validate_spatial_data_values(
                 live_pixels,
                 None,
             )?;
+            if live_pixels.iter().any(|&(y, x)| {
+                (0..background.shape()[0]).any(|energy| background[[energy, y, x]].abs() > 1.0e-12)
+            }) {
+                return Err(PipelineError::InvalidParameter(
+                    "joint-Poisson solver with non-zero detector_background is not yet \
+                     supported (B_det wiring is deferred)."
+                        .into(),
+                ));
+            }
         }
     }
     Ok(())
@@ -4742,9 +4750,8 @@ mod tests {
 
     #[test]
     fn test_spatial_counts_with_nuisance_rejects_nonfinite_background() {
-        // Background is validated finite (sign deferred to the per-pixel
-        // detector-background gate); this closes the `NaN.abs() > 1e-12 ==
-        // false` finiteness leak in that gate at the boundary.
+        // Background is validated finite before the nonzero-background gate;
+        // this closes the `NaN.abs() > 1e-12 == false` comparison leak.
         let energies: Vec<f64> = (0..51).map(|i| 1.0 + (i as f64) * 0.2).collect();
         for bad in [f64::NAN, f64::INFINITY] {
             let data = u238_single_resonance();
@@ -4769,6 +4776,33 @@ mod tests {
                 "error must name the background cube, got: {err}"
             );
         }
+    }
+
+    #[test]
+    fn test_spatial_counts_with_nuisance_rejects_nonzero_live_background() {
+        let data = u238_single_resonance();
+        let energies: Vec<f64> = (0..51).map(|i| 1.0 + (i as f64) * 0.2).collect();
+        let (sample, _ob) = synthetic_4x4_counts(&data, 0.0005, &energies, 1000.0);
+        let flux = Array3::from_elem((energies.len(), 4, 4), 1000.0);
+        let mut background = Array3::from_elem((energies.len(), 4, 4), 0.0);
+        background[[2, 3, 3]] = 1.0;
+        let config = kl_counts_config(energies.clone(), data);
+        let input = InputData3D::CountsWithNuisance {
+            sample_counts: sample.view(),
+            flux: flux.view(),
+            background: background.view(),
+        };
+
+        let err = spatial_map_typed(&input, &config, None, None, None)
+            .expect_err("unsupported detector background must fail before pixel fitting");
+        assert!(
+            matches!(err, PipelineError::InvalidParameter(_)),
+            "got {err:?}"
+        );
+        assert!(
+            err.to_string().contains("non-zero detector_background"),
+            "error must name the unsupported detector background, got: {err}"
+        );
     }
 
     #[test]

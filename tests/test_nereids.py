@@ -1433,6 +1433,18 @@ class TestSpatialMapBadValues:
         with pytest.raises(ValueError, match="flux"):
             nereids.spatial_map_typed(data, energies, [u238_data], max_iter=10)
 
+    def test_rejects_nonzero_detector_background_before_spatial_fit(self, u238_data):
+        energies = self._energies()
+        n_e = len(energies)
+        sample = np.full((n_e, 2, 2), 100.0)
+        flux = np.full((n_e, 2, 2), 200.0)
+        background = np.zeros((n_e, 2, 2))
+        background[6, 1, 0] = 1.0
+        data = nereids.from_counts_with_nuisance(sample, flux, background)
+
+        with pytest.raises(ValueError, match="non-zero detector_background"):
+            nereids.spatial_map_typed(data, energies, [u238_data], max_iter=10)
+
     def test_accepts_negative_transmission(self, u238_data):
         # SAMMY does not reject negative transmission (noise / over-
         # subtraction); only finiteness is required, so this must NOT raise.
