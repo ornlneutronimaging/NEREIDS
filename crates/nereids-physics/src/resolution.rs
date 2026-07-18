@@ -895,23 +895,26 @@ fn trapezoidal_moments(offsets: &[f64], weights: &[f64]) -> (f64, f64) {
     (centroid, sigma)
 }
 
-/// Integrate a sampled probability distribution into adjacent requested
-/// edges. A one-point kernel is treated as a delta mass at that point; longer
-/// kernels are piecewise-linear densities.
+/// Integrate a sampled distribution into adjacent requested edges.
 ///
-/// The density is normalized over its complete supplied support.  The result
-/// is deliberately not renormalized to `edges`: a requested detector window
-/// that covers only part of the pulse therefore sums to less than one.
-pub(crate) fn piecewise_linear_bin_probabilities(
+/// With `normalize_support`, a one-point kernel is treated as a unit delta and
+/// a longer kernel is normalized over its supplied support. Without it, the
+/// supplied values retain their physical density scale and a one-point density
+/// is rejected because it has no defined integration width.
+fn piecewise_linear_bin_integrals(
     times: &[f64],
     weights: &[f64],
     edges: &[f64],
+    normalize_support: bool,
 ) -> Option<Vec<f64>> {
     if times.is_empty() || times.len() != weights.len() {
         return None;
     }
 
     if times.len() == 1 {
+        if !normalize_support {
+            return None;
+        }
         if !times[0].is_finite() || !weights[0].is_finite() || weights[0] <= 0.0 {
             return None;
         }
@@ -939,13 +942,14 @@ pub(crate) fn piecewise_linear_bin_probabilities(
     if !total.is_finite() || total <= 0.0 {
         return None;
     }
+    let scale = if normalize_support { total } else { 1.0 };
 
     let cdf = |x: f64| -> f64 {
         if x <= times[0] {
             return 0.0;
         }
         if x >= times[times.len() - 1] {
-            return 1.0;
+            return total / scale;
         }
         let hi = times.partition_point(|&time| time <= x);
         let lo = hi - 1;
@@ -953,7 +957,7 @@ pub(crate) fn piecewise_linear_bin_probabilities(
         let dx = x - times[lo];
         let slope = (weights[hi] - weights[lo]) / width;
         let partial = weights[lo] * dx + 0.5 * slope * dx * dx;
-        ((cumulative[lo] + partial) / total).clamp(0.0, 1.0)
+        ((cumulative[lo] + partial) / scale).clamp(0.0, total / scale)
     };
 
     Some(
@@ -962,6 +966,35 @@ pub(crate) fn piecewise_linear_bin_probabilities(
             .map(|edge| (cdf(edge[1]) - cdf(edge[0])).max(0.0))
             .collect(),
     )
+}
+
+/// Integrate a sampled probability distribution into adjacent requested
+/// edges. A one-point kernel is treated as a delta mass at that point; longer
+/// kernels are piecewise-linear densities.
+///
+/// The density is normalized over its complete supplied support. The result
+/// is deliberately not renormalized to `edges`: a requested detector window
+/// that covers only part of the supplied pulse therefore sums to less than
+/// one.
+pub(crate) fn piecewise_linear_bin_probabilities(
+    times: &[f64],
+    weights: &[f64],
+    edges: &[f64],
+) -> Option<Vec<f64>> {
+    piecewise_linear_bin_integrals(times, weights, edges, true)
+}
+
+/// Integrate a sampled density without changing its physical mass scale.
+///
+/// This is used by analytical responses whose source density is already in
+/// probability per unit time. Probability omitted by finite numerical support
+/// therefore remains omitted instead of being redistributed into that support.
+pub(crate) fn piecewise_linear_bin_masses(
+    times: &[f64],
+    densities: &[f64],
+    edges: &[f64],
+) -> Option<Vec<f64>> {
+    piecewise_linear_bin_integrals(times, densities, edges, false)
 }
 
 impl TabulatedResolution {

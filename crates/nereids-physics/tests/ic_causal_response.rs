@@ -216,7 +216,7 @@ fn equal_rate_storage_limit_matches_gamma4_closed_form() {
 }
 
 #[test]
-fn symmetric_sns_pulse_fold_keeps_source_clock_and_conserves_probability() {
+fn symmetric_sns_pulse_fold_keeps_source_clock_and_preserves_missing_tail_mass() {
     let alpha = 2.0_f64;
     let flight_path_m = 25.0_f64;
     let true_energy_ev = 25.0_f64;
@@ -259,9 +259,111 @@ fn symmetric_sns_pulse_fold_keeps_source_clock_and_conserves_probability() {
         .detector_bin_probabilities(true_energy_ev, &detector_edges, 0.0)
         .expect("valid folded detector bins");
     let total: f64 = probabilities.iter().sum();
+
+    // Independent oracle for X + C, where X is the prompt-only Gamma(3,
+    // alpha) moderator delay and C is the symmetric triangular channel-time
+    // density. Integrating the analytical moderator CDF over C predicts the
+    // probability inside these finite detector edges without using the
+    // implementation's sampled convolution or bin integration.
+    let gamma3_cdf = |delay: f64| {
+        let x = alpha * delay;
+        if x <= 0.0 {
+            0.0
+        } else {
+            1.0 - (-x).exp() * (1.0 + x + x * x / 2.0)
+        }
+    };
+    let half_base = 0.35_f64;
+    let lower = delays[0];
+    let upper = delays[delays.len() - 1];
+    let integrand = |channel_delay: f64| {
+        let channel_density = (1.0 - channel_delay.abs() / half_base) / half_base;
+        channel_density * (gamma3_cdf(upper - channel_delay) - gamma3_cdf(lower - channel_delay))
+    };
+    let intervals = 20_000_usize;
+    let step = 2.0 * half_base / intervals as f64;
+    let mut oracle = integrand(-half_base) + integrand(half_base);
+    for index in 1..intervals {
+        let delay = -half_base + index as f64 * step;
+        oracle += if index % 2 == 0 { 2.0 } else { 4.0 } * integrand(delay);
+    }
+    oracle *= step / 3.0;
     assert!(
-        (total - 1.0).abs() < 2e-12,
-        "full sampled pulse has probability {total}, expected 1"
+        (total - oracle).abs() < 2.0e-7,
+        "sampled folded pulse has probability {total}, independent analytical integral gives {oracle}"
+    );
+    assert!(
+        oracle < 1.0,
+        "finite detector edges must omit a physical tail"
     );
     assert!(probabilities.iter().all(|p| p.is_finite() && *p >= 0.0));
+}
+
+#[test]
+fn gaussian_fold_preserves_finite_window_tail_mass() {
+    let alpha = 100.0_f64;
+    let sigma = 1.0_f64;
+    let flight_path_m = 25.0_f64;
+    let true_energy_ev = 25.0_f64;
+    let params = IkedaCarpenterParams {
+        burst_sigma_us: Some(sigma),
+        ..IkedaCarpenterParams::constant(alpha, 1.0, 0.0)
+    };
+    let model = IkedaCarpenter::new(
+        params,
+        flight_path_m,
+        &SynthesisGrid {
+            e_min_ev: 24.0,
+            e_max_ev: 26.0,
+            n_energies: 2,
+            n_tau: 8,
+        },
+    )
+    .expect("valid Gaussian-folded IC model");
+    let (delays, _) = model
+        .source_pulse_at(true_energy_ev)
+        .expect("valid folded source pulse");
+    let lower = delays[0];
+    let upper = delays[delays.len() - 1];
+    let nominal_arrival = TOF_FACTOR * flight_path_m / true_energy_ev.sqrt();
+    let got: f64 = model
+        .detector_bin_probabilities(
+            true_energy_ev,
+            &[nominal_arrival + lower, nominal_arrival + upper],
+            0.0,
+        )
+        .expect("valid folded detector window")
+        .iter()
+        .sum();
+
+    // Independent oracle: integrate the exact Gamma(3) moderator CDF over a
+    // standard normal variable. This does not use the sampled convolution or
+    // detector-bin integrator under test.
+    let normal_density = |delay: f64| {
+        (-0.5 * (delay / sigma).powi(2)).exp() / (sigma * std::f64::consts::TAU.sqrt())
+    };
+    let moderator_cdf = |delay: f64| gamma3_cdf(alpha * delay);
+    let integrand = |gaussian_delay: f64| {
+        normal_density(gaussian_delay)
+            * (moderator_cdf(upper - gaussian_delay) - moderator_cdf(lower - gaussian_delay))
+    };
+    let integration_limit = 10.0 * sigma;
+    let intervals = 200_000_usize;
+    let step = 2.0 * integration_limit / intervals as f64;
+    let mut oracle = integrand(-integration_limit) + integrand(integration_limit);
+    for index in 1..intervals {
+        let delay = -integration_limit + index as f64 * step;
+        oracle += if index % 2 == 0 { 2.0 } else { 4.0 } * integrand(delay);
+    }
+    oracle *= step / 3.0;
+
+    assert!(
+        1.0 - oracle > 4.0e-5,
+        "oracle window must expose enough missing tail to reject silent renormalization"
+    );
+    assert!(
+        (got - oracle).abs() < 2.0e-5,
+        "sampled Gaussian-folded probability {got} disagrees with independent integral {oracle}"
+    );
+    assert!(got < 1.0, "finite window was silently renormalized to one");
 }

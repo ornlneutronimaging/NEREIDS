@@ -130,7 +130,7 @@
 //! tabulated/UDR kernels).
 
 use crate::resolution::{
-    ResolutionParseError, TOF_FACTOR, TabulatedResolution, piecewise_linear_bin_probabilities,
+    ResolutionParseError, TOF_FACTOR, TabulatedResolution, piecewise_linear_bin_masses,
 };
 
 /// de Broglie wavelength factor: λ (Å) = `LAMBDA_ANGSTROM_FACTOR` / √(E in eV).
@@ -665,6 +665,12 @@ impl IkedaCarpenter {
     /// renormalized to the supplied window: bins that do not cover the full
     /// pulse correctly sum to less than one.
     ///
+    /// With no burst or channel fold, probabilities come directly from the
+    /// analytical IC CDF. With either optional fold, the continuous pulse is
+    /// represented on the configured synthesis grid and integrated as a
+    /// piecewise-linear density. The finite numerical support is not silently
+    /// renormalized; omitted physical tail probability remains omitted.
+    ///
     /// # Errors
     /// Returns [`ResolutionParseError::InvalidFormat`] unless the true energy
     /// is physical, the timing offset is finite, and at least two finite bin
@@ -712,8 +718,9 @@ impl IkedaCarpenter {
                 .collect());
         }
 
-        let (times, weights) = self.source_pulse_at(true_energy_ev)?;
-        piecewise_linear_bin_probabilities(&times, &weights, &relative_edges).ok_or_else(|| {
+        let (times, densities) =
+            synth_source_pulse_density(&self.params, self.n_tau, true_energy_ev)?;
+        piecewise_linear_bin_masses(&times, &densities, &relative_edges).ok_or_else(|| {
             ResolutionParseError::InvalidFormat(format!(
                 "Ikeda–Carpenter pulse at E = {true_energy_ev} eV has zero sampled area"
             ))
@@ -853,7 +860,7 @@ fn synth_kernel(
 }
 
 /// Synthesize one physical-time source pulse without moving its mode.
-fn synth_source_pulse(
+fn synth_source_pulse_density(
     params: &IkedaCarpenterParams,
     n_tau: usize,
     energy_ev: f64,
@@ -878,10 +885,34 @@ fn synth_source_pulse(
     let taus: Vec<f64> = (j_lo..=j_hi).map(|j| j as f64 * dtau).collect();
     let mut weights: Vec<f64> = taus.iter().map(|&t| ic_pulse(alpha, beta, r, t)).collect();
 
+    // Correct only the sampled quadrature error of the analytical moderator
+    // density. The target is its exact CDF at the finite grid endpoint, not
+    // one, so physical moderator probability beyond the grid is not moved
+    // back into the sampled support. This matters for the coarsest admitted
+    // n_tau values, where peak-normalization used to hide a large area error.
+    let sampled_area = dtau
+        * (0.5 * weights[0]
+            + weights[1..weights.len() - 1].iter().sum::<f64>()
+            + 0.5 * weights[weights.len() - 1]);
+    let moderator_mass = ic_cdf(alpha, beta, r, *taus.last().expect("non-empty tau grid"));
+    if !sampled_area.is_finite() || sampled_area <= 0.0 {
+        return Err(ResolutionParseError::InvalidFormat(format!(
+            "Ikeda–Carpenter pulse at E = {energy_ev} eV has zero sampled area"
+        )));
+    }
+    let area_correction = moderator_mass / sampled_area;
+    for weight in &mut weights {
+        *weight *= area_correction;
+    }
+
     if let Some(sigma) = params.burst_sigma_us
         && sigma > 0.0
     {
-        weights = convolve_same(&weights, &gaussian_kernel(dtau, sigma));
+        let (kernel, retained_mass) = gaussian_kernel(dtau, sigma);
+        weights = convolve_same(&weights, &kernel);
+        for weight in &mut weights {
+            *weight *= retained_mass;
+        }
     }
     if let Some(fwhm) = params.channel_fwhm_us
         && fwhm > 0.0
@@ -905,8 +936,24 @@ fn synth_source_pulse(
         .map_or(weights.len() - 1, |i| (i + 1).min(weights.len() - 1));
 
     let offsets: Vec<f64> = (lo..=hi).map(|j| taus[j]).collect();
-    let w: Vec<f64> = (lo..=hi).map(|j| weights[j] / peak_val).collect();
-    Ok((offsets, w))
+    let densities: Vec<f64> = (lo..=hi).map(|j| weights[j]).collect();
+    Ok((offsets, densities))
+}
+
+/// Synthesize the public peak-normalized source-pulse representation.
+fn synth_source_pulse(
+    params: &IkedaCarpenterParams,
+    n_tau: usize,
+    energy_ev: f64,
+) -> Result<(Vec<f64>, Vec<f64>), ResolutionParseError> {
+    let (offsets, densities) = synth_source_pulse_density(params, n_tau, energy_ev)?;
+    let peak = densities
+        .iter()
+        .copied()
+        .fold(0.0_f64, f64::max)
+        .max(f64::MIN_POSITIVE);
+    let weights = densities.into_iter().map(|value| value / peak).collect();
+    Ok((offsets, weights))
 }
 
 /// Index of the maximum element (first on ties). Slice is non-empty by
@@ -925,7 +972,7 @@ fn argmax(xs: &[f64]) -> usize {
 
 /// Symmetric, unit-sum Gaussian kernel sampled on a `dtau`-spaced grid out to
 /// ±[`GAUSS_REACH_SIGMAS`]·σ.
-fn gaussian_kernel(dtau: f64, sigma: f64) -> Vec<f64> {
+fn gaussian_kernel(dtau: f64, sigma: f64) -> (Vec<f64>, f64) {
     let half = ((GAUSS_REACH_SIGMAS * sigma / dtau).ceil() as isize).max(1);
     let mut k: Vec<f64> = (-half..=half)
         .map(|j| {
@@ -933,8 +980,10 @@ fn gaussian_kernel(dtau: f64, sigma: f64) -> Vec<f64> {
             (-0.5 * t * t).exp()
         })
         .collect();
+    let raw_sum: f64 = k.iter().sum();
+    let retained_mass = (raw_sum * dtau / (sigma * std::f64::consts::TAU.sqrt())).clamp(0.0, 1.0);
     normalize_sum(&mut k);
-    k
+    (k, retained_mass)
 }
 
 /// Symmetric, unit-sum triangle kernel of FWHM `fwhm` (half-base = FWHM;
