@@ -2095,7 +2095,7 @@ fn build_resolution(
     }
 }
 
-/// Extract a detector-time response that has exact bin probabilities.
+/// Extract a response that can integrate over caller-supplied detector bins.
 fn extract_detector_time_resolution(resolution: &Bound<'_, PyAny>) -> PyResult<ResolutionFunction> {
     if let Ok(tabulated) = resolution.extract::<PyRef<'_, PyTabulatedResolution>>() {
         Ok(ResolutionFunction::Tabulated(Arc::clone(&tabulated.inner)))

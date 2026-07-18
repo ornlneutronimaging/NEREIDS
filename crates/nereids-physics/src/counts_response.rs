@@ -22,7 +22,11 @@
 
 use std::fmt;
 
+use rayon::prelude::*;
+
 use crate::resolution::{ResolutionFunction, ResolutionParseError};
+
+type CompactResponseRow = (Vec<u32>, Vec<f64>);
 
 /// Expected detector-bin counts for the open-beam and sample measurements.
 #[derive(Debug, Clone, PartialEq)]
@@ -33,21 +37,27 @@ pub struct TwoArmCounts {
     pub sample: Vec<f64>,
 }
 
-/// Exact detector-bin probabilities for a fixed instrument response.
+/// Detector-bin probabilities for a fixed instrument response.
 ///
 /// Rows correspond to `true_energies_ev`; columns correspond to consecutive
 /// intervals in `detector_time_edges_us`. Building the matrix evaluates the
 /// analytical IC/tabulated bin integrals once. Reusing it during optimization
 /// changes only the true-energy sample transmission, not the detector physics.
+///
+/// Only entries whose evaluated probability is strictly greater than zero are
+/// stored. This is lossless: there is no numerical cutoff, and every nonzero
+/// value returned by the response model is retained.
 #[derive(Debug, Clone, PartialEq)]
 pub struct DetectorBinResponseMatrix {
+    row_offsets: Vec<usize>,
+    detector_bins: Vec<u32>,
     probabilities: Vec<f64>,
     n_true_energies: usize,
     n_detector_bins: usize,
 }
 
 impl DetectorBinResponseMatrix {
-    /// Build an exact fixed-response matrix.
+    /// Build a fixed detector-bin response matrix.
     pub fn new(
         true_energies_ev: &[f64],
         detector_time_edges_us: &[f64],
@@ -67,27 +77,65 @@ impl DetectorBinResponseMatrix {
         }
 
         let n_detector_bins = detector_time_edges_us.len().saturating_sub(1);
-        let mut probabilities = Vec::with_capacity(
-            true_energies_ev
-                .len()
-                .checked_mul(n_detector_bins)
-                .ok_or_else(|| {
-                    CountsResponseError::Resolution(ResolutionParseError::InvalidFormat(
-                        "detector response matrix dimensions overflow usize".into(),
-                    ))
-                })?,
-        );
-        for &energy in true_energies_ev {
-            let row = response.detector_bin_probabilities(
-                energy,
-                detector_time_edges_us,
-                timing_offset_us,
-            )?;
-            debug_assert_eq!(row.len(), n_detector_bins);
-            probabilities.extend(row);
+        if n_detector_bins > u32::MAX as usize {
+            return Err(CountsResponseError::Resolution(
+                ResolutionParseError::InvalidFormat(format!(
+                    "detector response has {n_detector_bins} bins, exceeding the u32 storage limit"
+                )),
+            ));
+        }
+        // Each true-energy response is independent. Rayon preserves the input
+        // order of this indexed parallel collect, so rows and all subsequent
+        // accumulation orders remain deterministic.
+        let row_results: Vec<Result<CompactResponseRow, ResolutionParseError>> = true_energies_ev
+            .par_iter()
+            .map(|&energy| {
+                let row = response.detector_bin_probabilities(
+                    energy,
+                    detector_time_edges_us,
+                    timing_offset_us,
+                )?;
+                debug_assert_eq!(row.len(), n_detector_bins);
+                let mut bins = Vec::new();
+                let mut values = Vec::new();
+                for (detector_bin, probability) in row.into_iter().enumerate() {
+                    if !probability.is_finite() || probability < 0.0 {
+                        return Err(ResolutionParseError::InvalidFormat(format!(
+                            "detector response probability at E = {energy} eV, bin {detector_bin} must be finite and >= 0, got {probability}"
+                        )));
+                    }
+                    if probability > 0.0 {
+                        bins.push(detector_bin as u32);
+                        values.push(probability);
+                    }
+                }
+                Ok::<_, ResolutionParseError>((bins, values))
+            })
+            .collect();
+        // Resolve errors after the ordered collect so the first failing input
+        // row is reported deterministically regardless of thread scheduling.
+        let rows: Vec<CompactResponseRow> = row_results.into_iter().collect::<Result<_, _>>()?;
+        let nonzero_count = rows.iter().try_fold(0_usize, |total, (_, values)| {
+            total.checked_add(values.len()).ok_or_else(|| {
+                CountsResponseError::Resolution(ResolutionParseError::InvalidFormat(
+                    "detector response nonzero count overflows usize".into(),
+                ))
+            })
+        })?;
+
+        let mut row_offsets = Vec::with_capacity(true_energies_ev.len() + 1);
+        let mut detector_bins = Vec::with_capacity(nonzero_count);
+        let mut probabilities = Vec::with_capacity(nonzero_count);
+        row_offsets.push(0);
+        for (mut bins, mut values) in rows {
+            detector_bins.append(&mut bins);
+            probabilities.append(&mut values);
+            row_offsets.push(probabilities.len());
         }
 
         Ok(Self {
+            row_offsets,
+            detector_bins,
             probabilities,
             n_true_energies: true_energies_ev.len(),
             n_detector_bins,
@@ -104,10 +152,43 @@ impl DetectorBinResponseMatrix {
         self.n_detector_bins
     }
 
+    /// Number of stored nonzero probabilities.
+    pub fn nnz(&self) -> usize {
+        self.probabilities.len()
+    }
+
+    /// Heap bytes used by the compact probability storage.
+    ///
+    /// This excludes the small fixed-size `Self` value and allocator overhead.
+    pub fn storage_bytes(&self) -> usize {
+        self.row_offsets.capacity() * std::mem::size_of::<usize>()
+            + self.detector_bins.capacity() * std::mem::size_of::<u32>()
+            + self.probabilities.capacity() * std::mem::size_of::<f64>()
+    }
+
+    /// Stored `(detector_bin, probability)` pairs for one true-energy row.
+    pub fn row_entries(&self, true_index: usize) -> impl Iterator<Item = (usize, f64)> + '_ {
+        let start = self.row_offsets[true_index];
+        let end = self.row_offsets[true_index + 1];
+        self.detector_bins[start..end]
+            .iter()
+            .map(|&bin| bin as usize)
+            .zip(self.probabilities[start..end].iter().copied())
+    }
+
     /// Probability that true-energy row `true_index` lands in detector bin
     /// `detector_bin`.
     pub fn probability(&self, true_index: usize, detector_bin: usize) -> f64 {
-        self.probabilities[true_index * self.n_detector_bins + detector_bin]
+        assert!(
+            detector_bin < self.n_detector_bins,
+            "detector bin out of range"
+        );
+        let start = self.row_offsets[true_index];
+        let end = self.row_offsets[true_index + 1];
+        match self.detector_bins[start..end].binary_search(&(detector_bin as u32)) {
+            Ok(offset) => self.probabilities[start + offset],
+            Err(_) => 0.0,
+        }
     }
 
     /// Apply the fixed response separately to open and sample arms.
@@ -146,8 +227,7 @@ impl DetectorBinResponseMatrix {
         for true_index in 0..self.n_true_energies {
             let fluence = incident_fluence_weights[true_index];
             let sample_weight = fluence * transmission[true_index];
-            for detector_bin in 0..self.n_detector_bins {
-                let probability = self.probability(true_index, detector_bin);
+            for (detector_bin, probability) in self.row_entries(true_index) {
                 compensated_add(
                     &mut open_beam[detector_bin],
                     &mut open_compensation[detector_bin],

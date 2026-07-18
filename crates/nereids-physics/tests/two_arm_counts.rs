@@ -1,7 +1,8 @@
 use std::sync::Arc;
 
 use nereids_physics::counts_response::{
-    CountsResponseError, TwoArmCounts, add_count_backgrounds, two_arm_count_response,
+    CountsResponseError, DetectorBinResponseMatrix, TwoArmCounts, add_count_backgrounds,
+    two_arm_count_response,
 };
 use nereids_physics::ikeda_carpenter::{
     EnergyLaw, IkedaCarpenter, IkedaCarpenterParams, SynthesisGrid,
@@ -19,6 +20,46 @@ fn triangle_response() -> ResolutionFunction {
         )
         .expect("valid triangle response"),
     ))
+}
+
+#[test]
+fn compact_response_keeps_every_nonzero_and_reconstructs_interior_zeros() {
+    let response = triangle_response();
+    let arrival_0 = TOF_FACTOR * 25.0 / 25.0_f64.sqrt();
+    let arrival_1 = arrival_0 + 1.0;
+    let energy_1 = (TOF_FACTOR * 25.0 / arrival_1).powi(2);
+    let matrix = DetectorBinResponseMatrix::new(
+        &[25.0, energy_1],
+        &[arrival_0 - 1.0, arrival_0, arrival_0 + 1.0, arrival_0 + 2.0],
+        0.0,
+        &response,
+    )
+    .expect("valid compact response");
+
+    assert_eq!(matrix.nnz(), 4);
+    assert_eq!(
+        matrix.storage_bytes(),
+        3 * std::mem::size_of::<usize>()
+            + 4 * std::mem::size_of::<u32>()
+            + 4 * std::mem::size_of::<f64>()
+    );
+    assert_eq!(
+        matrix.row_entries(0).collect::<Vec<_>>(),
+        [(0, 0.5), (1, 0.5)]
+    );
+    assert_eq!(
+        matrix.row_entries(1).collect::<Vec<_>>(),
+        [(1, 0.5), (2, 0.5)]
+    );
+    assert_eq!(matrix.probability(0, 2), 0.0);
+    assert_eq!(matrix.probability(1, 0), 0.0);
+    assert_eq!(matrix.probability(0, 0), 0.5);
+
+    let got = matrix
+        .apply(&[100.0, 200.0], &[0.2, 0.8])
+        .expect("valid compact response application");
+    assert_eq!(got.open_beam, [50.0, 150.0, 100.0]);
+    assert_eq!(got.sample, [10.0, 90.0, 80.0]);
 }
 
 #[test]

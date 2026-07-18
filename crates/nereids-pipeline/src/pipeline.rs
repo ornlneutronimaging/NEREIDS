@@ -771,7 +771,12 @@ impl UnifiedFitConfig {
         self
     }
 
-    /// Enable the exact separate-arm detector response for raw counts.
+    /// Enable the separate-arm detector-bin response for raw counts.
+    ///
+    /// The historical `exact_count_response` name means that open and sample
+    /// arms are integrated over the caller's actual detector-time edges before
+    /// forming a ratio. It does not change the numerical accuracy contract of
+    /// the selected response model.
     #[must_use]
     pub fn with_exact_count_response(mut self, response: ExactCountResponseConfig) -> Self {
         self.exact_count_response = Some(response);
@@ -1864,7 +1869,7 @@ fn fit_counts_joint_poisson(
             ))
         })?;
         let exact_model =
-            ExactTwoArmRatioModel::new(stacked, &matrix, &exact.incident_fluence_weights)
+            ExactTwoArmRatioModel::new(stacked, matrix, &exact.incident_fluence_weights)
                 .map_err(PipelineError::Fitting)?;
         for (bin, ((&observed_open, &observed_sample), &predicted_open)) in flux
             .iter()

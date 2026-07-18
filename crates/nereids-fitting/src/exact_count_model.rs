@@ -19,7 +19,8 @@ use crate::lm::{FitModel, FlatMatrix};
 /// the invalid post-hoc shortcut `R[T]`.
 pub struct ExactTwoArmRatioModel {
     inner: Box<dyn FitModel>,
-    weighted_response: Vec<f64>,
+    response: DetectorBinResponseMatrix,
+    scaled_fluence_weights: Vec<f64>,
     open_expectation: Vec<f64>,
     n_true_energies: usize,
     n_detector_bins: usize,
@@ -29,7 +30,7 @@ impl ExactTwoArmRatioModel {
     /// Build the reusable fixed-response model.
     pub fn new(
         inner: Box<dyn FitModel>,
-        response: &DetectorBinResponseMatrix,
+        response: DetectorBinResponseMatrix,
         incident_fluence_weights: &[f64],
     ) -> Result<Self, FittingError> {
         if incident_fluence_weights.len() != response.n_true_energies() {
@@ -58,14 +59,15 @@ impl ExactTwoArmRatioModel {
 
         let n_true_energies = response.n_true_energies();
         let n_detector_bins = response.n_detector_bins();
-        let mut weighted_response = vec![0.0; n_true_energies * n_detector_bins];
+        let scaled_fluence_weights: Vec<f64> = incident_fluence_weights
+            .iter()
+            .map(|fluence| fluence / fluence_scale)
+            .collect();
         let mut open_expectation = vec![0.0; n_detector_bins];
         let mut open_compensation = vec![0.0; n_detector_bins];
-        for (true_index, &fluence) in incident_fluence_weights.iter().enumerate() {
-            let fluence = fluence / fluence_scale;
-            for detector_bin in 0..n_detector_bins {
-                let value = fluence * response.probability(true_index, detector_bin);
-                weighted_response[true_index * n_detector_bins + detector_bin] = value;
+        for (true_index, &fluence) in scaled_fluence_weights.iter().enumerate() {
+            for (detector_bin, probability) in response.row_entries(true_index) {
+                let value = fluence * probability;
                 compensated_add(
                     &mut open_expectation[detector_bin],
                     &mut open_compensation[detector_bin],
@@ -79,7 +81,8 @@ impl ExactTwoArmRatioModel {
 
         Ok(Self {
             inner,
-            weighted_response,
+            response,
+            scaled_fluence_weights,
             open_expectation,
             n_true_energies,
             n_detector_bins,
@@ -107,12 +110,12 @@ impl ExactTwoArmRatioModel {
                     "true-energy model output[{true_index}] is not finite: {value}"
                 )));
             }
-            for detector_bin in 0..self.n_detector_bins {
+            let fluence = self.scaled_fluence_weights[true_index];
+            for (detector_bin, probability) in self.response.row_entries(true_index) {
                 compensated_add(
                     &mut sample[detector_bin],
                     &mut compensation[detector_bin],
-                    value
-                        * self.weighted_response[true_index * self.n_detector_bins + detector_bin],
+                    value * fluence * probability,
                 );
             }
         }
@@ -159,13 +162,13 @@ impl FitModel for ExactTwoArmRatioModel {
 
         let mut output = FlatMatrix::zeros(self.n_detector_bins, free_param_indices.len());
         for true_index in 0..self.n_true_energies {
-            for detector_bin in 0..self.n_detector_bins {
+            let fluence = self.scaled_fluence_weights[true_index];
+            for (detector_bin, probability) in self.response.row_entries(true_index) {
                 let open = self.open_expectation[detector_bin];
                 if open <= PIVOT_FLOOR {
                     continue;
                 }
-                let weight =
-                    self.weighted_response[true_index * self.n_detector_bins + detector_bin] / open;
+                let weight = fluence * probability / open;
                 for column in 0..free_param_indices.len() {
                     *output.get_mut(detector_bin, column) +=
                         weight * inner_jacobian.get(true_index, column);
@@ -243,7 +246,7 @@ mod tests {
         )
         .expect("valid exact response");
         let model =
-            ExactTwoArmRatioModel::new(Box::new(LinearTrueEnergyModel), &response, &[100.0, 200.0])
+            ExactTwoArmRatioModel::new(Box::new(LinearTrueEnergyModel), response, &[100.0, 200.0])
                 .expect("valid exact ratio model");
 
         let values = model.evaluate(&[0.2]).expect("model evaluation");
