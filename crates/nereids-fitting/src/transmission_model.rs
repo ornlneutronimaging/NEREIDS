@@ -3317,7 +3317,6 @@ mod tests {
                         gfb: 0.0,
                     }],
                 }],
-                rml: None,
                 ap_table: None,
                 r_external: vec![],
             }],

@@ -166,8 +166,12 @@ pub enum ResonanceFormalism {
     MLBW,
     /// Reich-Moore (LRF=3). Primary formalism for light and actinide isotopes.
     ReichMoore,
-    /// R-Matrix Limited (LRF=7). General multi-channel formalism; used for
-    /// many medium-heavy isotopes (W, Ta, Zr, etc.) in ENDF/B-VIII.0.
+    /// R-Matrix Limited (LRF=7). General multi-channel formalism (W, Ta, Zr,
+    /// etc. in ENDF/B-VIII.0). Parsed for cursor alignment but not evaluated:
+    /// the RML physics was removed because its closed-channel boundary
+    /// condition was never implemented and it was never validated against
+    /// SAMMY. Ranges tagged `RMatrixLimited` are non-evaluable and resolve to
+    /// Skip.
     RMatrixLimited,
     /// Unresolved Resonance Region (LRU=2). Parsed for cursor alignment but not
     /// evaluated: NEREIDS does not compute URR average cross sections. The
@@ -230,10 +234,9 @@ pub struct ResonanceRange {
     /// Reference: ENDF-6 Formats Manual §2.2.1; SAMMY `mlb/mmlb1.f90`
     #[serde(default)]
     pub ap_table: Option<Tab1>,
-    /// Spin groups for LRF=1/2/3 (L-grouped). Empty for LRF=7 and LRU=2.
+    /// Spin groups for LRF=1/2/3 (L-grouped). Empty for LRF=7 and LRU=2 (both
+    /// parsed-and-skipped, non-evaluable).
     pub l_groups: Vec<LGroup>,
-    /// R-Matrix Limited data for LRF=7. `None` for LRF=1/2/3 and LRU=2.
-    pub rml: Option<Box<RmlData>>,
     /// R-external (background R-matrix) entries per spin group.
     ///
     /// Diagonal, real-valued corrections to the R-matrix that approximate
@@ -369,174 +372,6 @@ impl RExternalEntry {
     }
 }
 
-// ─── LRF=7 (R-Matrix Limited) Data Structures ────────────────────────────────
-//
-// LRF=7 organizes resonances by spin group (J,π) rather than L-value.
-// Each spin group has multiple explicit reaction channels. Resonances carry
-// reduced width amplitudes γ per channel, not formal widths Γ.
-//
-// Reference: ENDF-6 Formats Manual §2.2.1.6; SAMMY manual Ch. 3
-// SAMMY source: rml/mrml01.f (reader), rml/mrml11.f (cross-section calc)
-
-/// Particle pair definition for LRF=7 R-Matrix Limited.
-///
-/// Identifies the two particles in a reaction channel (e.g., neutron + W-184,
-/// or gamma + W-185). Used to determine which channels are entrance (neutron)
-/// channels and which are exit (fission, capture) channels.
-///
-/// Reference: ENDF-6 Formats Manual §2.2.1.6, Table 2.2
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct ParticlePair {
-    /// Mass of particle a (neutron = 1.0, in neutron mass units).
-    pub ma: f64,
-    /// Mass of particle b (target nucleus, in neutron mass units).
-    pub mb: f64,
-    /// Charge number Z of particle a, as stored in the ENDF LRF=7 particle-pair list.
-    /// ENDF LRF=7 stores the charge directly: neutron/photon = 0, proton = 1, alpha = 2.
-    /// Reference: SAMMY rml/mrml03.f — `Docoul = Kzb * Kza` (product of charges).
-    pub za: f64,
-    /// Charge number Z of particle b (target or recoil), as stored in ENDF LRF=7.
-    pub zb: f64,
-    /// Spin of particle a (1/2 for neutron).
-    pub ia: f64,
-    /// Spin of particle b (target spin I).
-    pub ib: f64,
-    /// Q-value for this reaction (eV). 0 for elastic.
-    pub q: f64,
-    /// Penetrability flag (ENDF `PNT`, SAMMY `Lpent`).
-    ///
-    /// `PNT=1`: calculate penetrability P_c and shift S_c analytically
-    /// (Blatt-Weisskopf / Coulomb). Used for open particle channels.
-    /// `PNT=0`: no penetrability — the channel contributes only the
-    /// `Ymat(2,Ii) -= 1` term (SAMMY `rml/mrml07.f:118-122`), encoded here as
-    /// `P_c=1, S_c=B_c`. Always the case for the photon/eliminated channel.
-    /// `PNT∉{0,1}` is rejected at parse time (SAMMY `Check_Quantum`,
-    /// `rml/mrml03.f:22`).
-    pub pnt: i32,
-    /// Shift factor flag.
-    ///
-    /// `SHF=1`: calculate shift factor S_c analytically (Blatt-Weisskopf).
-    /// `SHF=0`: do not calculate; treat S_c = B_c so (S_c − B_c) = 0 in level matrix.
-    pub shf: i32,
-    /// ENDF MT number identifying the reaction (2=elastic, 18=fission, 102=capture).
-    pub mt: u32,
-    /// Parity of particle a.
-    pub pa: f64,
-    /// Parity of particle b.
-    pub pb: f64,
-}
-
-/// A single reaction channel within an LRF=7 spin group.
-///
-/// Specifies which particle pair, what orbital angular momentum, and the
-/// radii used to compute penetrabilities and hard-sphere phase shifts.
-///
-/// Reference: ENDF-6 Formats Manual §2.2.1.6, Table 2.3
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct RmlChannel {
-    /// Index into the parent `RmlData::particle_pairs` vector.
-    pub particle_pair_idx: usize,
-    /// Orbital angular momentum quantum number L.
-    pub l: u32,
-    /// Channel spin S = |I ± 1/2|.
-    pub channel_spin: f64,
-    /// Boundary condition B (usually 0.0; shifts the shift factor reference).
-    pub boundary: f64,
-    /// Effective channel radius APE (fm), used to compute the hard-sphere phase φ_l.
-    ///
-    /// Per SAMMY `rml/mrml07.f:129,134` (`Rhof = Zkfe·Ex`, `Zkfe = Z·Rdeff`) the
-    /// EFFECTIVE radius feeds the phase shift (Sinsix), not the penetrability.
-    /// Independently corroborated by PLEIADES `models.py:385` ("Radius for
-    /// potential scattering").
-    pub effective_radius: f64,
-    /// True channel radius APT (fm), used to compute penetrability P_l and shift S_l.
-    ///
-    /// Per SAMMY `rml/mrml07.f:128,136` (`Rho = Zkte·Ex`, `Zkte = Z·Rdtru`) and
-    /// `rml/mrml03.f:244` (Betset width conversion), the TRUE radius feeds the
-    /// penetrability and shift (Pgh). Corroborated by PLEIADES `models.py:386`
-    /// ("Radius for penetrabilities and shifts").
-    pub true_radius: f64,
-}
-
-/// A single resonance in LRF=7 format.
-///
-/// For KRM=2 (standard R-matrix), `widths` contains reduced width amplitudes
-/// γ_c (eV^{1/2}) and `gamma_gamma = 0.0`.
-///
-/// For KRM=3 (Reich-Moore approximation), `widths` contains formal partial widths
-/// Γ_c (eV) and `gamma_gamma` is the capture width Γ_γ (eV) used to form complex
-/// pole energies: Ẽ_n = E_n - i·Γ_γn/2. The reduced amplitudes are derived as
-/// γ_nc = √(Γ_nc / (2·P_c(E_n))).
-///
-/// Reference: ENDF-6 Formats Manual §2.2.1.6; SAMMY manual §3.1
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct RmlResonance {
-    /// Resonance energy (eV).
-    pub energy: f64,
-    /// Width amplitudes per channel (eV^{1/2} for KRM=2; eV for KRM=3).
-    ///
-    /// Sign convention: sign(γ) encodes interference between resonances.
-    /// `widths.len()` equals the number of channels in the parent `SpinGroup`.
-    pub widths: Vec<f64>,
-    /// Capture (gamma) width Γ_γ (eV) for KRM=3 Reich-Moore approximation.
-    ///
-    /// Used to make the R-matrix denominator complex: E_n → E_n - i·Γ_γ/2.
-    /// Zero for KRM=2 (standard R-matrix, no complex energy shift).
-    pub gamma_gamma: f64,
-}
-
-/// A spin group (J, π) in LRF=7 R-Matrix Limited format.
-///
-/// Groups all resonances with the same total angular momentum J and parity π.
-/// Each spin group has its own set of reaction channels.
-///
-/// Reference: ENDF-6 Formats Manual §2.2.1.6; SAMMY rml/mrml01.f
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct SpinGroup {
-    /// Total angular momentum J.
-    pub j: f64,
-    /// Parity: +1.0 (even) or -1.0 (odd).
-    pub parity: f64,
-    /// Reaction channels for this spin group.
-    pub channels: Vec<RmlChannel>,
-    /// Resonances in this spin group.
-    pub resonances: Vec<RmlResonance>,
-    /// True when the ENDF file contained KBK > 0 or KPS > 0 background correction
-    /// records for this spin group.  The records are consumed by the parser but
-    /// the background terms are **not applied** to the cross-section calculation
-    /// (matching SAMMY behaviour: mrml10.f is a matrix utility, not a background
-    /// reader; KPS is explicitly ignored in mrml07.f).  Cross-sections computed
-    /// for spin groups with background corrections are therefore approximate.
-    #[serde(default)]
-    pub has_background_correction: bool,
-}
-
-/// Complete R-Matrix Limited data for one energy range (LRF=7).
-///
-/// Stored in `ResonanceRange::rml` when the formalism is `RMatrixLimited`.
-///
-/// Reference: ENDF-6 Formats Manual §2.2.1.6; SAMMY rml/mrml01.f
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct RmlData {
-    /// Target spin I.
-    pub target_spin: f64,
-    /// Atomic weight ratio (mass of target / neutron mass).
-    pub awr: f64,
-    /// Global scattering radius AP (fm); used as fallback when per-channel APE = 0.
-    pub scattering_radius: f64,
-    /// R-matrix type flag from ENDF CONT header.
-    ///
-    /// KRM=2: Standard multi-channel R-matrix (widths are reduced amplitudes γ).
-    /// KRM=3: Reich-Moore approximation (widths are formal partial widths Γ;
-    ///        capture enters via complex pole energies Ẽ_n = E_n - i·Γ_γ/2).
-    /// Reference: ENDF-6 Formats Manual §2.2.1.6; SAMMY rml/mrml01.f
-    pub krm: u32,
-    /// Particle pair definitions (NPP entries).
-    pub particle_pairs: Vec<ParticlePair>,
-    /// Spin groups (NJS entries), one per (J, π) combination.
-    pub spin_groups: Vec<SpinGroup>,
-}
-
 impl ResonanceData {
     /// Total number of resonances across all ranges and groups.
     ///
@@ -574,13 +409,13 @@ impl ResonanceRange {
         }
     }
 
-    /// Total resonance count for this range (works for both LRF=1/2/3 and LRF=7).
+    /// Total discrete-resonance count for this range.
+    ///
+    /// Counts the L-grouped resonances of an evaluable LRF=1/2/3 range. LRF=7
+    /// (and LRU=2) ranges are parsed-and-skipped with empty `l_groups`, so they
+    /// contribute 0 — NEREIDS does not evaluate them.
     pub fn resonance_count(&self) -> usize {
-        if let Some(rml) = &self.rml {
-            rml.spin_groups.iter().map(|sg| sg.resonances.len()).sum()
-        } else {
-            self.l_groups.iter().map(|lg| lg.resonances.len()).sum()
-        }
+        self.l_groups.iter().map(|lg| lg.resonances.len()).sum()
     }
 }
 
@@ -724,7 +559,6 @@ mod tests {
             naps: 1,
             ap_table: None,
             l_groups: vec![],
-            rml: None,
             r_external: vec![],
         };
         assert_eq!(range.scattering_radius_at(1.0), 9.4285);
@@ -746,7 +580,6 @@ mod tests {
             naps: 1,
             ap_table: Some(table),
             l_groups: vec![],
-            rml: None,
             r_external: vec![],
         };
         // At 1 eV: 8.0 fm
@@ -938,7 +771,6 @@ pub mod test_support {
                 lrx: 0,
                 resonances,
             }],
-            rml: None,
             ap_table: None,
             r_external: vec![],
         }

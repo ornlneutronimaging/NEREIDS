@@ -165,7 +165,6 @@ pub fn parse_endf_file2(endf_text: &str) -> Result<ResonanceData, EndfParseError
                     naps: naps_urr,
                     ap_table: None,
                     l_groups: Vec::new(),
-                    rml: None,
                     r_external: vec![],
                 });
                 continue;
@@ -273,7 +272,7 @@ pub fn parse_endf_file2(endf_text: &str) -> Result<ResonanceData, EndfParseError
                     parse_bw_range(&mut ctx, formalism)?
                 }
                 ResonanceFormalism::ReichMoore => parse_reich_moore_range(&mut ctx)?,
-                ResonanceFormalism::RMatrixLimited => parse_rmatrix_limited_range(&mut ctx, awr)?,
+                ResonanceFormalism::RMatrixLimited => skip_rmatrix_limited_range(&mut ctx)?,
                 ResonanceFormalism::Unresolved => {
                     // Unreachable: Unresolved is only assigned in the LRU=2 branch above.
                     unreachable!("Unresolved formalism should not appear in LRU=1 dispatch");
@@ -413,7 +412,6 @@ fn parse_bw_range(
         naps: ctx.naps,
         ap_table: ctx.ap_table.take(),
         l_groups,
-        rml: None,
         r_external: vec![],
     })
 }
@@ -504,53 +502,37 @@ fn parse_reich_moore_range(
         naps: ctx.naps,
         ap_table: ctx.ap_table.take(),
         l_groups,
-        rml: None,
         r_external: vec![],
     })
 }
 
-/// Parse an R-Matrix Limited (LRF=7) resolved resonance range.
+/// Consume (skip) an R-Matrix Limited (LRF=7) resolved resonance range,
+/// advancing the line cursor past the particle-pair, channel, and resonance
+/// LIST records so any following range/material stays aligned.
 ///
-/// ## ENDF-6 Record Layout (File 2, MT=151, after range CONT + optional TAB1)
+/// NEREIDS does not evaluate LRF=7 cross sections — the RML physics was removed
+/// (its closed-channel boundary condition was never implemented and it was
+/// never validated against SAMMY) — so the parameters are discarded and the
+/// range is tagged `ResonanceFormalism::RMatrixLimited` (non-evaluable → Skip).
 ///
-/// ```text
-/// CONT:  [SPI, AP, IFG, KRM, NJS, KRL]
-///        SPI = target spin, AP = global scattering radius (fm),
-///        NJS = number of spin groups (J,π)
-///
-/// LIST:  [0, 0, NPP, 0, 12*NPP, NPP]   ← particle pair definitions
-///        12 values per pair: [MA, MB, ZA, ZB, IA, IB, Q, PNT, SHF, MT, PA, PB]
-///
-/// For each spin group j = 1..NJS:
-///   LIST: [AJ, PJ, KBK, KPS, 6*(NCH+1), NCH+1]   ← header + channels
-///         First 6 values: header row [0, 0, 0, 0, 0, NCH]
-///         NCH × 6 values: [IPP, L, SCH, BND, APE, APT] per channel
-///
-///   LIST: [0, 0, 0, NRS, 6*NX, NX]                  ← resonance parameters
-///         Per ENDF-6 §2.2.1.6 and SAMMY mrml01.f:413-415, NRS is in L2
-///         (resonance count for this spin group) and NX is in N2 (number of
-///         packed 6-float ENDF rows = NRS · ceil(stride/6) where stride is
-///         NCH+1 for KRM=2 and NCH+2 for KRM=3); N1 = 6*NX.
-///         KRM=2: stride ≥ NCH+1; per resonance: [ER, γ_1, ..., γ_NCH, <padding>]
-///         KRM=3: stride ≥ NCH+2; per resonance: [ER, Γγ, Γ_1, ..., Γ_NCH, <padding>]
-/// ```
+/// Record advancement and every structural/quantum-flag guard are preserved
+/// verbatim (IFG/KRM/KRL; the PNT/SHF/mass particle-pair guards; KBK/KPS; the
+/// NCH, IPP-range, NRS/NX/NPL and KRM-dependent stride guards): they reject
+/// malformed or unsupported records that would otherwise misalign the stream.
+/// Only the RmlData/ParticlePair/RmlChannel/RmlResonance/SpinGroup construction
+/// is gone.
 ///
 /// Reference: ENDF-6 Formats Manual §2.2.1.6; SAMMY rml/mrml01.f
-fn parse_rmatrix_limited_range(
+fn skip_rmatrix_limited_range(
     ctx: &mut RangeParseContext<'_>,
-    awr: f64,
 ) -> Result<ResonanceRange, EndfParseError> {
     // CONT: [SPI, AP, IFG, KRM, NJS, KRL]
     // ENDF AP is in 10⁻¹² cm; convert to fm (×10).
     let cont = parse_cont(ctx.lines, ctx.pos)?;
     let target_spin = cont.c1;
     let scattering_radius = cont.c2 * ENDF_RADIUS_TO_FM;
-    // IFG (L1): radius unit flag.
-    //   IFG=0: AP, APE, APT are in 10⁻¹² cm — universal in ENDF/B-VIII.0.
-    //   IFG=1: radii are in units of ℏ/k (energy-dependent) — not supported here.
-    // SAMMY's WriteRrEndf.cpp always writes IFG=0 and its reader never checks it,
-    // confirming IFG=1 is not used in practice.
-    // Reference: ENDF-6 §2.2.1.6; SAMMY ndf/WriteRrEndf.cpp line 363.
+    // IFG (L1): radius unit flag. IFG=0 (10⁻¹² cm) is universal in ENDF/B-VIII.0;
+    // IFG=1 (energy-dependent ℏ/k units) is not supported. SAMMY always writes 0.
     let ifg = cont.l1;
     if ifg != 0 {
         return Err(EndfParseError::UnsupportedFormat(format!(
@@ -558,20 +540,15 @@ fn parse_rmatrix_limited_range(
         )));
     }
     let krm = cont.l2 as u32; // R-matrix type: 2=standard, 3=Reich-Moore approx
-    // P2: Validate KRM at parse time so the physics code never sees an unknown type.
     // KRM=0/1/4 are defined in the ENDF spec but not supported here.
-    // Reference: ENDF-6 §2.2.1.6; SAMMY rml/mrml01.f KRM field.
     if krm != 2 && krm != 3 {
         return Err(EndfParseError::UnsupportedFormat(format!(
             "LRF=7 KRM={krm} is not supported (only KRM=2 and KRM=3)"
         )));
     }
     let njs = checked_count(cont.n1, "NJS")?; // number of spin groups
-    // KRL (N2): kinematics flag.
-    //   KRL=0: non-relativistic kinematics — universal in ENDF/B-VIII.0.
-    //   KRL=1: relativistic kinematics — not supported here.
-    // SAMMY's WriteRrEndf.cpp always writes KRL=0.
-    // Reference: ENDF-6 §2.2.1.6; SAMMY ndf/WriteRrEndf.cpp line 366.
+    // KRL (N2): kinematics flag. KRL=0 (non-relativistic) is universal;
+    // KRL=1 (relativistic) is not supported. SAMMY always writes 0.
     let krl = cont.n2;
     if krl != 0 {
         return Err(EndfParseError::UnsupportedFormat(format!(
@@ -579,19 +556,16 @@ fn parse_rmatrix_limited_range(
         )));
     }
 
-    // LIST: [0, 0, NPP, 0, 12*NPP, NPP]  — particle pair definitions
-    // NPP is authoritative in L1; N2 is nominally equal but can encode a
-    // different count in some files (e.g. N2 = 2*NPP).  Always derive from L1.
-    // Reference: ENDF-6 Formats Manual §2.2.1.6 Table 2.1.
+    // LIST: [0, 0, NPP, 0, 12*NPP, NPP]  — particle pair definitions.
+    // NPP is authoritative in L1. Reference: ENDF-6 §2.2.1.6 Table 2.1.
     let pp_cont = parse_cont(ctx.lines, ctx.pos)?;
     let npp = checked_count(pp_cont.l1, "NPP")?;
     let pp_values = parse_list_values(ctx.lines, ctx.pos, npp * 12)?;
 
-    // Validate-and-narrow an ENDF integer-coded particle-pair flag.  ENDF integer
-    // fields are whole numbers, so a fractional or non-finite f64 indicates a
-    // malformed record and must not be silently truncated/saturated: PNT=1.7
-    // would narrow to 1 and PNT=NaN to 0, both bypassing the {0,1} range check
-    // below.  Applied to PNT and SHF — the two flags the physics branches on.
+    // Validate-and-narrow an ENDF integer-coded particle-pair flag (PNT/SHF).
+    // A fractional or non-finite f64 is a malformed record and must not be
+    // silently truncated/saturated (PNT=1.7→1, PNT=NaN→0 would bypass the {0,1}
+    // check below).
     fn pp_int_flag(value: f64, field: &str, idx: usize) -> Result<i32, EndfParseError> {
         if !value.is_finite() || value.fract() != 0.0 {
             return Err(EndfParseError::UnsupportedFormat(format!(
@@ -601,98 +575,64 @@ fn parse_rmatrix_limited_range(
         Ok(value as i32)
     }
 
-    let mut particle_pairs = Vec::with_capacity(npp);
+    // Particle-pair validation. Values are discarded (the pair defs are not
+    // stored), but every quantum-flag guard is applied so malformed records are
+    // rejected exactly as before.
     for i in 0..npp {
         let b = i * 12;
-        particle_pairs.push(ParticlePair {
-            ma: pp_values[b],
-            mb: pp_values[b + 1],
-            za: pp_values[b + 2],
-            zb: pp_values[b + 3],
-            ia: pp_values[b + 4],
-            ib: pp_values[b + 5],
-            q: pp_values[b + 6],
-            pnt: pp_int_flag(pp_values[b + 7], "PNT", i)?,
-            shf: pp_int_flag(pp_values[b + 8], "SHF", i)?,
-            mt: pp_values[b + 9] as u32,
-            pa: pp_values[b + 10],
-            pb: pp_values[b + 11],
-        });
-    }
-
-    for (i, pp) in particle_pairs.iter().enumerate() {
-        // PNT (Lpent) must be 0 or 1.  SAMMY's Check_Quantum (rml/mrml03.f:22)
-        // rejects Lpent ∉ {0,1} via Wrongi; PNT=2 ("ASSIGN") is defined in the
-        // ENDF-6 spec but neither SAMMY nor NEREIDS implements it.  Validate up
-        // front so the physics code never sees an unknown penetrability flag.
-        if pp.pnt != 0 && pp.pnt != 1 {
+        let ma = pp_values[b];
+        let mb = pp_values[b + 1];
+        let za = pp_values[b + 2];
+        let zb = pp_values[b + 3];
+        let pnt = pp_int_flag(pp_values[b + 7], "PNT", i)?;
+        let shf = pp_int_flag(pp_values[b + 8], "SHF", i)?;
+        // PNT (Lpent) must be 0 or 1 (SAMMY rml/mrml03.f:22 Check_Quantum rejects
+        // Lpent ∉ {0,1}; PNT=2 "ASSIGN" is unimplemented).
+        if pnt != 0 && pnt != 1 {
             return Err(EndfParseError::UnsupportedFormat(format!(
-                "LRF=7 particle pair {i}: PNT={} is not supported (only PNT=0 \
-                 and PNT=1; SAMMY rejects Lpent outside {{0,1}})",
-                pp.pnt
+                "LRF=7 particle pair {i}: PNT={pnt} is not supported (only PNT=0 \
+                 and PNT=1; SAMMY rejects Lpent outside {{0,1}})"
             )));
         }
-        // A massless pair (photon/eliminated channel, MA=0) must carry PNT=0:
-        // SAMMY always assigns Lpent=0 to the photon channel, and the physics
-        // evaluator's penetrability branch (which divides by a reduced mass)
-        // is only entered for PNT=1.  Reject the inconsistent combination so a
-        // massless PNT=1 pair can never reach a divide-by-zero reduced mass.
-        if pp.ma < 0.5 && pp.pnt != 0 {
+        // A massless pair (photon/eliminated channel, MA=0) must carry PNT=0.
+        if ma < 0.5 && pnt != 0 {
             return Err(EndfParseError::UnsupportedFormat(format!(
-                "LRF=7 particle pair {i}: massless pair (MA={}) with PNT={} is \
-                 invalid; a photon/eliminated channel must have PNT=0",
-                pp.ma, pp.pnt
+                "LRF=7 particle pair {i}: massless pair (MA={ma}) with PNT={pnt} is \
+                 invalid; a photon/eliminated channel must have PNT=0"
             )));
         }
-        // A PNT=1 pair drives the penetrability path, which forms the reduced
-        // mass μ = MA·MB/(MA+MB) (rmatrix_limited.rs).  Validate the reduced mass
-        // itself — computed exactly as the physics does — is finite and strictly
-        // positive, so the physics never sees a non-finite μ.  Checking MA/MB > 0
-        // alone is insufficient: pathological huge (but finite) masses can still
-        // overflow MA·MB to ∞.  This also covers the MA+MB = 0 / sign cases.
-        if pp.pnt == 1 {
-            let reduced_mass = pp.ma * pp.mb / (pp.ma + pp.mb);
-            if !(pp.ma.is_finite()
-                && pp.mb.is_finite()
-                && pp.ma > 0.0
-                && pp.mb > 0.0
+        // PNT=1 requires finite positive masses yielding a finite reduced mass
+        // μ = MA·MB/(MA+MB) (computed exactly as the physics did); catches
+        // overflow of MA·MB to ∞ and the MA+MB=0 / sign cases.
+        if pnt == 1 {
+            let reduced_mass = ma * mb / (ma + mb);
+            if !(ma.is_finite()
+                && mb.is_finite()
+                && ma > 0.0
+                && mb > 0.0
                 && reduced_mass.is_finite()
                 && reduced_mass > 0.0)
             {
                 return Err(EndfParseError::UnsupportedFormat(format!(
                     "LRF=7 particle pair {i}: PNT=1 requires finite positive masses \
-                     yielding a finite reduced mass (MA={}, MB={})",
-                    pp.ma, pp.mb
+                     yielding a finite reduced mass (MA={ma}, MB={mb})"
                 )));
             }
         }
         // Coulomb + SHF=1: closed-channel Coulomb shift at imaginary argument is
-        // unimplemented.  Reject at parse time rather than silently producing wrong
-        // dispersive terms near threshold.
-        // Reference: SAMMY rml/mrml07.f — Pghcou is only called for open channels.
-        if pp.za.abs() > 0.5 && pp.zb.abs() > 0.5 && pp.shf == 1 {
+        // unimplemented (SAMMY rml/mrml07.f Pghcou only for open channels).
+        if za.abs() > 0.5 && zb.abs() > 0.5 && shf == 1 {
             return Err(EndfParseError::UnsupportedFormat(format!(
-                "LRF=7 particle pair {i}: Coulomb channel (za={}, zb={}) with \
+                "LRF=7 particle pair {i}: Coulomb channel (za={za}, zb={zb}) with \
                  SHF=1 is not supported; closed-channel Coulomb shift at \
-                 imaginary rho is not yet implemented",
-                pp.za, pp.zb
+                 imaginary rho is not yet implemented"
             )));
         }
     }
 
-    // All particle-pair types are now fully supported (with the SHF=1 restriction above):
-    // - PNT 0/1: branched on pp.pnt in rmatrix_limited.rs (SAMMY Lpent); PNT∉{0,1} rejected above.
-    // - SHF 0/1: respected by the shf field in rmatrix_limited.rs.
-    // - Coulomb channels (pp.za > 0 && pp.zb > 0): routed through
-    //   nereids_physics::coulomb (Steed's CF1+CF2, SAMMY coulomb/mrml08.f90).
-    let mut spin_groups = Vec::with_capacity(njs);
-
     for _ in 0..njs {
         // LIST: [AJ, PJ, KBK, KPS, 6*(NCH+1), NCH+1]
-        // First 6*(NCH+1) values: header row [0,0,0,0,0,NCH] then NCH×6 channel defs.
         let sg_cont = parse_cont(ctx.lines, ctx.pos)?;
-        let aj = sg_cont.c1;
-        let pj = sg_cont.c2; // explicit parity field; may be 0.0 when parity is in sign(AJ)
         let kbk = sg_cont.l1; // background R-matrix flag
         let kps = sg_cont.l2; // phase shift flag
 
@@ -748,28 +688,12 @@ fn parse_rmatrix_limited_range(
             )));
         }
 
-        // AJ encodes both the spin and, in some evaluations, the parity.
-        // ENDF/B-VIII.0 evaluations such as W-184 use negative AJ for odd-parity
-        // spin groups (e.g., AJ=-0.5, AJ=-1.5) and set PJ=0.
-        // Statistical weight formula (2J+1)/... requires J > 0; negative J yields
-        // zero or negative weights and drives non-physical cross-sections.
-        // Fix: J = |AJ|; parity from sign(AJ) when PJ is absent (PJ=0).
-        // Reference: ENDF-6 §2.2.1.6; SAMMY rml/mrml01.f Scan_File_2.
-        let j = aj.abs();
-        let parity = if pj != 0.0 {
-            pj.signum()
-        } else if aj < 0.0 {
-            -1.0
-        } else {
-            1.0
-        };
         let npl = checked_count(sg_cont.n1, "NPL")?; // 6*(NCH+1)
         let nch_plus_one = checked_count(sg_cont.n2, "NCH+1")?; // NCH+1
 
         // NCH+1 <= 1 would imply zero physical channels (NCH = 0), which is
         // meaningless for a resonance range — every spin group must have at
-        // least one channel.
-        // Reference: ENDF-6 §2.2.1.6; SAMMY rml/mrml01.f.
+        // least one channel. Reference: ENDF-6 §2.2.1.6; SAMMY rml/mrml01.f.
         if nch_plus_one <= 1 {
             return Err(EndfParseError::UnsupportedFormat(format!(
                 "RML spin-group LIST: NCH+1 must be >= 2, got NCH+1={nch_plus_one}"
@@ -779,10 +703,8 @@ fn parse_rmatrix_limited_range(
 
         let sg_values = parse_list_values(ctx.lines, ctx.pos, npl)?;
 
-        // C3: Validate that the LIST record carries at least 6*(NCH+1) values.
-        // NCH is derived from N2 in the LIST header (N2 = NCH+1); the first data row
-        // is a dummy/header row of zeros that ENDF evaluators may fill arbitrarily.
-        // SAMMY (mrml01.f Scan_File_2/ENDF123) reads NCH from N2 and ignores row[5].
+        // The LIST must carry at least 6*(NCH+1) values (a dummy header row of
+        // zeros followed by NCH channel definitions).
         // Reference: ENDF-6 §2.2.1.6 Table 2.3; SAMMY rml/mrml01.f lines 104-107.
         let expected_npl = 6 * (nch + 1);
         if npl < expected_npl {
@@ -791,71 +713,28 @@ fn parse_rmatrix_limited_range(
             )));
         }
 
-        // First 6 values are the dummy header row (zeros); subsequent NCH×6 values
-        // are channel definitions [IPP, L, SCH, BND, APE, APT] per channel.
-        let npp = particle_pairs.len();
-        let mut channels = Vec::with_capacity(nch);
+        // Validate each channel's IPP (1-based particle-pair index) is in range;
+        // the channel definitions [IPP, L, SCH, BND, APE, APT] are otherwise
+        // discarded (LRF=7 is not evaluated). The first 6 values are the dummy
+        // header row. Reference: ENDF-6 §2.2.1.6; SAMMY rml/mrml01.f (Ippx test).
         for c in 0..nch {
             let b = 6 + c * 6; // skip the 6-value header row
-            // C2: IPP is 1-based in ENDF; validate range before converting.
             let ipp_raw = sg_values[b] as usize;
             if ipp_raw == 0 || ipp_raw > npp {
                 return Err(EndfParseError::UnsupportedFormat(format!(
                     "LRF=7 spin-group channel IPP={ipp_raw} is out of range 1..={npp}"
                 )));
             }
-            // Photon channels (MA < 0.5, PNT=0) are stored as regular channels.
-            // The physics code sets P_c=1, S_c=B_c, φ_c=0 for PNT=0 channels
-            // (rmatrix_limited.rs; SAMMY rml/mrml07.f:118-122 Ymat(2)-=1) and
-            // classifies them as capture channels via pp.mt == 102.  Their reduced width amplitudes
-            // appear at the corresponding column position in the resonance rows,
-            // exactly like any other channel.  Reference: ENDF-6 §2.2.1.6; SAMMY
-            // rml/mrml01.f (Ippx test, mrml07.f P=1 convention for massless).
-            channels.push(RmlChannel {
-                particle_pair_idx: ipp_raw - 1, // convert 1-based ENDF index to 0-based
-                l: sg_values[b + 1] as u32,     // L
-                channel_spin: sg_values[b + 2], // SCH
-                boundary: sg_values[b + 3],     // BND
-                effective_radius: sg_values[b + 4] * ENDF_RADIUS_TO_FM, // APE
-                true_radius: sg_values[b + 5] * ENDF_RADIUS_TO_FM, // APT
-            });
-        }
-
-        // Apply global scattering radius for channels where APE/APT == 0
-        for ch in &mut channels {
-            if ch.effective_radius == 0.0 {
-                ch.effective_radius = scattering_radius;
-            }
-            if ch.true_radius == 0.0 {
-                ch.true_radius = scattering_radius;
-            }
         }
 
         // LIST: [0, 0, 0, NRS, 6*NX, NX]  — resonance parameters.
         //
-        // ENDF-6 §2.2.1.6 fixes the resonance LIST control fields as
-        // [C1=0, C2=0, L1=0, L2=NRS, N1=6*NX, N2=NX]:
-        //   NRS lives in L2 (the resonance count for this spin group).
-        //   NX  lives in N2 (number of packed 6-float ENDF data rows =
-        //       NRS · ceil(stride/6) where stride is NCH+1 for KRM=2 and
-        //       NCH+2 for KRM=3), and N1 must equal 6*NX.
-        //
-        // For spin groups where each resonance fits in one packed row
-        // (NCH+1 ≤ 6 for KRM=2, NCH+2 ≤ 6 for KRM=3) NX == NRS and the
-        // distinction is invisible; for larger NCH (e.g. F-19 spin groups
-        // with NCH≥5) NX > NRS and reading NRS from N2 over-counts the
-        // resonances and trips the stride guard below with a misleading
-        // "stride too small" error.
-        //
-        // SAMMY reads NRS via `FORMAT (33X, I11)` which skips C1+C2+L1
-        // (3 × 11 chars) and reads L2 (mrml01.f:413-415, also :116-119
-        // for the scan pass). OpenScale reads `list.getL2()` and writes
-        // `list.setL2(nres) / setN2(nx)` (File2.cpp:415, :686-697).
-        //
-        // For KRM=3 (e.g. W-184 ENDF/B-VIII.0), evaluators pad each resonance row
-        // to a fixed 6 values per ENDF line, so NPL/NRS = 6 even when NCH=1.
-        // Using hardcoded nch+1 drifts the offset and misreads zeros as energies.
-        // Fix: derive stride directly from NPL/NRS; read only NCH widths per row.
+        // ENDF-6 §2.2.1.6 fixes the control fields as [0, 0, 0, L2=NRS, N1=6*NX,
+        // N2=NX]: NRS (resonance count) is in L2; NX (packed 6-float row count =
+        // NRS·ceil(stride/6), stride NCH+1 for KRM=2 / NCH+2 for KRM=3) is in N2;
+        // N1 = 6*NX. For wide spin groups (e.g. F-19, NCH≥5) NX > NRS, so NRS
+        // MUST be read from L2 and NX from N2 — mixing them mis-sizes the block.
+        // SAMMY mrml01.f:413-415; OpenScale File2.cpp:415,686-697.
         let res_cont = parse_cont(ctx.lines, ctx.pos)?;
         let nrs = checked_count(res_cont.l2, "NRS")?;
         let nx = checked_count(res_cont.n2, "NX")?;
@@ -867,19 +746,9 @@ fn parse_rmatrix_limited_range(
                 6 * nx
             )));
         }
-        // Per ENDF-6 §2.2.1.6, NX is the per-spin-group packed-row count:
-        //     NX = NRS · ceil(per_resonance_floats / 6)
-        // where the per-resonance float count is layout-dependent:
-        //     KRM=2: per_resonance = NCH+1  (ER + NCH reduced widths γ_c)
-        //     KRM=3: per_resonance = NCH+2  (ER + Γγ + NCH partial widths Γ_c)
-        // SAMMY rml/mrml01.f ENDF123 confirms the KRM=3 layout reads Gamgam
-        // at position 1 and (Gamma,I=1,Ichan) at positions 2..NCH+1.
-        // Because the per-resonance row count is constant within a spin
-        // group, NX is always an integer multiple of NRS. A non-zero NRS
-        // with NX not divisible by NRS would yield a fractional stride
-        // (`6 * NX / NRS` non-integer) and mis-align resonance reads.
-        // Reject up-front rather than rely on the downstream
-        // `res_npl % nrs != 0` check, which is a weaker invariant.
+        // The per-resonance row count is constant within a spin group, so NX is
+        // always an integer multiple of NRS; a non-multiple would yield a
+        // fractional stride and mis-align resonance reads.
         if nrs > 0 && nx % nrs != 0 {
             return Err(EndfParseError::UnsupportedFormat(format!(
                 "LRF=7 resonance LIST: N2/NX ({nx}) is not a multiple of L2/NRS ({nrs}); \
@@ -887,42 +756,22 @@ fn parse_rmatrix_limited_range(
                  NCH+1 for KRM=2 and NCH+2 for KRM=3"
             )));
         }
-        // Canonical empty spin group per ENDF-6 §2.2.1.6 and OpenScale's
-        // writer at File2.cpp:683-697:
-        //   list.setL2(spin->getNres());        // L2 = NRS
-        //   ...
-        //   // nx must be at least 1, even if nres=0
-        //   if (spin->getNres() == 0)
-        //       nx = 1;
-        //   list.setN1(6 * nx);                  // N1 = 6
-        //   list.setN2(nx);                      // N2 = 1
-        // The LIST body for the empty spin group is a single 6-float zero
-        // filler row. Reject any NRS=0 record that does not carry NX=1
-        // (NX=0 is malformed by OpenScale; NX>1 would imply phantom rows
-        // with no resonance count to anchor them).
+        // Canonical empty spin group (ENDF-6 §2.2.1.6 + OpenScale File2.cpp:
+        // 683-697): NRS=0 carries a single zero-filler row, so NX must be 1.
         if nrs == 0 && nx != 1 {
             return Err(EndfParseError::UnsupportedFormat(format!(
                 "LRF=7 resonance LIST: NRS=0 requires NX=1 (single zero-filler row \
                  per ENDF-6 §2.2.1.6 + OpenScale File2.cpp:683-697); got NX={nx}"
             )));
         }
-        let res_values = parse_list_values(ctx.lines, ctx.pos, res_npl)?;
-
-        // C4: Validate stride before use — NPL must divide evenly by NRS, and each row
-        // must be at least min_stride values wide.
-        //
-        // KRM=2: per-resonance layout is [ER, Γ_1, ..., Γ_NCH, <padding>]
-        //        → min_stride = NCH+1 (energy + NCH reduced width amplitudes)
-        // KRM=3: per-resonance layout is [ER, Γγ, Γ_1, ..., Γ_NCH, <padding>]
-        //        → min_stride = NCH+2 (energy + Gamgam + NCH partial widths)
-        //
-        // Reference: ENDF-6 §2.2.1.6; SAMMY rml/mrml01.f ENDF123 subroutine —
-        //   reads Gamgam at position 1 (immediately after ER), then
-        //   (Gamma,I=1,Ichan) at positions 2..NCH+1.
-        let min_stride = if krm == 3 { nch + 2 } else { nch + 1 };
-        let stride = if nrs == 0 {
-            min_stride // no resonances; stride unused
-        } else {
+        // Consume the resonance block, then validate the KRM-dependent stride so
+        // a malformed row layout is rejected rather than silently accepted.
+        // KRM=2 per-resonance row = [ER, γ_1..γ_NCH, pad] → stride ≥ NCH+1;
+        // KRM=3 = [ER, Γγ, Γ_1..Γ_NCH, pad] → stride ≥ NCH+2.
+        // Reference: ENDF-6 §2.2.1.6; SAMMY rml/mrml01.f ENDF123.
+        parse_list_values(ctx.lines, ctx.pos, res_npl)?;
+        if nrs > 0 {
+            let min_stride = if krm == 3 { nch + 2 } else { nch + 1 };
             if res_npl % nrs != 0 {
                 return Err(EndfParseError::UnsupportedFormat(format!(
                     "LRF=7 resonance block NPL={res_npl} is not divisible by NRS={nrs}"
@@ -936,81 +785,8 @@ fn parse_rmatrix_limited_range(
                     if krm == 3 { "NCH+2" } else { "NCH+1" }
                 )));
             }
-            s
-        };
-        let mut resonances = Vec::with_capacity(nrs);
-        for r in 0..nrs {
-            let b = r * stride;
-            // Parse resonance row according to KRM column order.
-            //
-            // KRM=2: [ER, γ_1, ..., γ_NCH, <padding>]
-            //   widths (reduced amplitudes γ) start at b+1.
-            //   No capture width column; gamma_gamma = 0.
-            //
-            // KRM=3: [ER, Γγ, Γ_1, ..., Γ_NCH, <padding>]
-            //   Gamgam (radiation width, eV) is at b+1.
-            //   Partial widths Γ_c start at b+2.
-            //   Gamgam forms complex pole energies: Ẽ_n = E_n - i·Γγ/2.
-            //
-            // Reference: ENDF-6 §2.2.1.6; SAMMY rml/mrml01.f ENDF123 subroutine.
-            //
-            // Bounds safety: stride ≥ min_stride (verified above), b = r·stride,
-            // and r < nrs, so b + stride ≤ res_npl = res_values.len().
-            // For KRM=3: b+2+nch ≤ b+min_stride ≤ b+stride; guaranteed in bounds.
-            // For KRM=2: b+1+nch ≤ b+min_stride ≤ b+stride; guaranteed in bounds.
-            // Explicit error checks below make the safety locally verifiable and
-            // guard against future changes that might weaken the stride invariant.
-            let (widths, gamma_gamma) = if krm == 3 {
-                let need = b + 2 + nch;
-                if need > res_values.len() {
-                    return Err(EndfParseError::UnsupportedFormat(format!(
-                        "LRF=7 KRM=3 resonance row {r}: need {need} values, \
-                         have {} (stride={stride}, NCH={nch})",
-                        res_values.len()
-                    )));
-                }
-                let gamma_gamma = res_values[b + 1]; // Gamgam at position 1
-                let widths = res_values[b + 2..b + 2 + nch].to_vec(); // Γ_c at positions 2..NCH+1
-                (widths, gamma_gamma)
-            } else {
-                // KRM=2: widths immediately follow ER; no capture-width column.
-                let need = b + 1 + nch;
-                if need > res_values.len() {
-                    return Err(EndfParseError::UnsupportedFormat(format!(
-                        "LRF=7 KRM=2 resonance row {r}: need {need} values, \
-                         have {} (stride={stride}, NCH={nch})",
-                        res_values.len()
-                    )));
-                }
-                (res_values[b + 1..b + 1 + nch].to_vec(), 0.0)
-            };
-            resonances.push(RmlResonance {
-                energy: res_values[b],
-                widths,
-                gamma_gamma,
-            });
         }
-
-        spin_groups.push(SpinGroup {
-            j,
-            parity,
-            channels,
-            resonances,
-            // Nonzero KBK/KPS are rejected at the top of this loop iteration
-            // (immediately after the spin-group CONT is read), so any spin
-            // group that reaches this point has no background correction.
-            has_background_correction: false,
-        });
     }
-
-    let rml = RmlData {
-        target_spin,
-        awr,
-        scattering_radius,
-        krm,
-        particle_pairs,
-        spin_groups,
-    };
 
     Ok(ResonanceRange {
         energy_low: ctx.energy_low,
@@ -1022,7 +798,6 @@ fn parse_rmatrix_limited_range(
         naps: ctx.naps,
         ap_table: ctx.ap_table.take(),
         l_groups: Vec::new(),
-        rml: Some(Box::new(rml)),
         r_external: vec![],
     })
 }
@@ -1755,7 +1530,6 @@ mod tests {
             ResonanceFormalism::MLBW,
             "Ta-181 VIII.0 resolved range uses MLBW (LRF=2)"
         );
-        assert!(resolved.rml.is_none(), "MLBW range has no LRF=7 RML data");
         assert_eq!(
             resolved.resonance_count(),
             76,
@@ -1777,169 +1551,68 @@ mod tests {
         );
     }
 
-    /// Verify KRM=3 resonance column order (offline fixture — no network needed).
-    ///
-    /// For KRM=3 the per-resonance ENDF layout is [ER, Γγ, Γ_1, ..., Γ_NCH, padding].
-    /// The regression checks that `gamma_gamma` comes from position b+1 (Γγ) and
-    /// `widths[0]` from position b+2 (Γ_1), NOT the other way round.
-    ///
-    /// Constructed values:
-    ///   res0: ER=10 eV, Γγ=0.025 eV, Γ_1=0.001 eV
-    ///   res1: ER=20 eV, Γγ=0.030 eV, Γ_1=0.002 eV
-    ///
-    /// The fixture is a minimal but fully valid ENDF MF=2/MT=151 block:
-    ///   1 isotope, 1 energy range, LRF=7, KRM=3, 1 particle pair, 1 spin group,
-    ///   2 resonances, NCH=1 (single elastic neutron channel).
+    /// A valid KRM=3 LRF=7 range is parsed-and-skipped: it loads as a bare
+    /// RMatrixLimited range (NEREIDS does not evaluate LRF=7). The fixture is a
+    /// minimal but fully valid ENDF MF=2/MT=151 block (1 isotope, 1 range,
+    /// LRF=7, KRM=3, 1 particle pair, 1 spin group, 2 resonances, NCH=1); its
+    /// end-to-end parse exercises the KRM=3 stride (NCH+2) in the skip's
+    /// resonance-block consumption.
     #[test]
-    fn test_krm3_resonance_column_order() {
-        // Each ENDF line is exactly 80 chars:
-        //   positions  0-65: six 11-char data fields
-        //   positions 66-69: MAT (4 chars)
-        //   positions 70-71: MF (2 chars)
-        //   positions 72-74: MT (3 chars)
-        //   positions 75-79: NS (5 chars)
-        //
-        // Floats use Fortran notation, e.g. "1.000000+1" = 1e1 = 10.0.
-        // Integer fields written as right-justified 11-char strings.
+    fn test_lrf7_krm3_skipped() {
         const ENDF: &str =
             include_str!("../../../tests/data/synthetic/lrf7_krm3_resonance_column_order.endf");
 
         let data = parse_endf_file2(ENDF).expect("fixture must parse without error");
-        let rml = data.ranges[0]
-            .rml
-            .as_ref()
-            .expect("LRF=7 range must have RmlData");
-        let sg = &rml.spin_groups[0];
-
-        assert_eq!(sg.resonances.len(), 2, "spin group must have 2 resonances");
-
-        let res0 = &sg.resonances[0];
-        assert!(
-            (res0.energy - 10.0).abs() < 1e-10,
-            "res0 energy must be 10.0 eV, got {}",
-            res0.energy
-        );
-        // The critical assertions: Γγ must come from column b+1, Γ_1 from column b+2.
-        // With the old (buggy) code these two values were swapped.
-        assert!(
-            (res0.gamma_gamma - 0.025).abs() < 1e-10,
-            "res0 gamma_gamma must be 0.025 eV (Gamgam at b+1), got {}",
-            res0.gamma_gamma
-        );
-        assert_eq!(res0.widths.len(), 1, "NCH=1 so widths must have 1 element");
-        assert!(
-            (res0.widths[0] - 0.001).abs() < 1e-10,
-            "res0 widths[0] must be 0.001 eV (Γ_1 at b+2), got {}",
-            res0.widths[0]
-        );
-
-        let res1 = &sg.resonances[1];
-        assert!(
-            (res1.energy - 20.0).abs() < 1e-10,
-            "res1 energy must be 20.0 eV"
-        );
-        assert!(
-            (res1.gamma_gamma - 0.030).abs() < 1e-10,
-            "res1 gamma_gamma must be 0.030 eV, got {}",
-            res1.gamma_gamma
-        );
-        assert!(
-            (res1.widths[0] - 0.002).abs() < 1e-10,
-            "res1 widths[0] must be 0.002 eV, got {}",
-            res1.widths[0]
+        assert_eq!(data.ranges.len(), 1, "one LRF=7 range");
+        let range = &data.ranges[0];
+        assert_eq!(range.formalism, ResonanceFormalism::RMatrixLimited);
+        assert!(range.resolved, "LRF=7 is a resolved (LRU=1) range");
+        assert_eq!(
+            range.resonance_count(),
+            0,
+            "LRF=7 is skipped, not evaluated: no discrete resonances counted"
         );
     }
 
-    /// LRF=7 resonances must be counted by `total_resonance_count()`.
+    /// LRF=7 resonances are NOT counted by `total_resonance_count()`.
     ///
-    /// R-matrix-limited (LRF=7) resonances live in `rml.spin_groups`, not in
-    /// `l_groups`. A naive `l_groups`-only sum (as the Python `n_resonances`
-    /// getter used to do) reports 0 for such evaluations; the formalism-aware
-    /// accessor must report the true count. This pins the Rust side of the
-    /// issue-#638 binding fix so the Python delegation stays correct.
+    /// R-matrix-limited (LRF=7) ranges are parsed-and-skipped: NEREIDS does not
+    /// evaluate them, so they carry no `l_groups` and contribute 0 to the
+    /// discrete-resonance count. The PyO3 `n_resonances` getter delegates to
+    /// this accessor, so it too reports 0 for a pure-LRF=7 evaluation.
     #[test]
-    fn test_lrf7_total_resonance_count_nonzero() {
+    fn test_lrf7_skipped_not_counted() {
         const ENDF: &str =
             include_str!("../../../tests/data/synthetic/lrf7_krm3_resonance_column_order.endf");
         let data = parse_endf_file2(ENDF).expect("fixture must parse without error");
-
-        // The naive l_groups-only sum that the old Python getter used.
-        let l_groups_only: usize = data
-            .ranges
-            .iter()
-            .flat_map(|r| &r.l_groups)
-            .map(|lg| lg.resonances.len())
-            .sum();
-        assert_eq!(
-            l_groups_only, 0,
-            "LRF=7 fixture has no l_groups resonances (they live in rml.spin_groups)"
-        );
-
-        // The formalism-aware accessor the binding now delegates to.
         assert_eq!(
             data.total_resonance_count(),
-            2,
-            "total_resonance_count() must count LRF=7 rml.spin_groups resonances"
+            0,
+            "LRF=7 ranges are skipped (not evaluated), so no resonances are counted"
         );
     }
 
-    /// KRM=2 spin group with an explicit photon capture channel (IPP=2, MA=0).
-    ///
-    /// Before issue #45 the parser rejected MA<0.5 channels with UnsupportedFormat.
-    /// This test verifies that photon channels are now parsed and stored correctly:
-    ///   - channels[1] points to the photon particle pair (MT=102)
-    ///   - res.widths has two entries: [γ_elastic, γ_photon]
+    /// A KRM=2 LRF=7 range with an explicit photon capture channel (IPP=2,
+    /// MA=0, MT=102) is parsed-and-skipped. The massless PNT=0 photon pair
+    /// passes the particle-pair guards and the two-channel spin group passes the
+    /// IPP-range and stride guards, so the fixture loads as a bare
+    /// RMatrixLimited range.
     #[test]
-    fn test_krm2_explicit_photon_channel() {
-        // Minimal synthetic LRF=7, KRM=2, NJS=1 ENDF snippet.
-        // Two particle pairs: pair 1 = n+W184 (MT=2), pair 2 = γ+W185 (MT=102, MA=0).
-        // One spin group with 2 channels (elastic + photon); one resonance.
-        //
-        // Each ENDF line is 80 chars: 6×11-char fields + MAT(4)+MF(2)+MT(3)+NS(5).
+    fn test_lrf7_krm2_photon_channel_skipped() {
+        // Two particle pairs: pair 1 = n+W184 (MT=2), pair 2 = γ+W185 (MT=102, MA=0);
+        // one spin group with 2 channels (elastic + photon); one resonance.
         const ENDF: &str =
             include_str!("../../../tests/data/synthetic/lrf7_krm2_explicit_photon_channel.endf");
 
         let data = parse_endf_file2(ENDF).expect("KRM=2 photon channel must parse without error");
-        let rml = data.ranges[0]
-            .rml
-            .as_ref()
-            .expect("LRF=7 range must have RmlData");
-
-        assert_eq!(rml.krm, 2, "KRM must be 2");
-        assert_eq!(rml.particle_pairs.len(), 2, "must have 2 particle pairs");
-        assert!(
-            rml.particle_pairs[1].ma < 0.5,
-            "pair 2 must be massless (photon)"
-        );
+        assert_eq!(data.ranges.len(), 1, "one LRF=7 range");
+        let range = &data.ranges[0];
+        assert_eq!(range.formalism, ResonanceFormalism::RMatrixLimited);
+        assert!(range.resolved, "LRF=7 is a resolved (LRU=1) range");
         assert_eq!(
-            rml.particle_pairs[1].mt, 102,
-            "pair 2 must be MT=102 capture"
-        );
-
-        let sg = &rml.spin_groups[0];
-        assert_eq!(sg.channels.len(), 2, "spin group must have 2 channels");
-        assert_eq!(
-            sg.channels[0].particle_pair_idx, 0,
-            "channel 0 must point to pair 0 (elastic)"
-        );
-        assert_eq!(
-            sg.channels[1].particle_pair_idx, 1,
-            "channel 1 must point to pair 1 (photon)"
-        );
-
-        assert_eq!(sg.resonances.len(), 1, "must have 1 resonance");
-        let res = &sg.resonances[0];
-        assert!((res.energy - 10.0).abs() < 1e-10, "energy must be 10 eV");
-        assert_eq!(res.widths.len(), 2, "widths must have 2 entries (NCH=2)");
-        assert!(
-            (res.widths[0] - 0.001).abs() < 1e-10,
-            "widths[0] (elastic) must be 0.001, got {}",
-            res.widths[0]
-        );
-        assert!(
-            (res.widths[1] - 0.004).abs() < 1e-10,
-            "widths[1] (photon) must be 0.004, got {}",
-            res.widths[1]
+            range.resonance_count(),
+            0,
+            "LRF=7 is skipped, not evaluated"
         );
     }
 
@@ -2454,10 +2127,9 @@ mod tests {
     /// Under the (pre-fix) buggy reader that took NRS from N2, this fixture
     /// would set NRS=4, recompute stride = NPL/NRS = 6, and trip the
     /// min_stride guard (6 < NCH+2 = 7) with a misleading
-    /// "stride too small" UnsupportedFormat error. With the fix it reads
-    /// NRS=2 (from L2) and stride = NPL/NRS = 12 = 2·6, parses exactly
-    /// two resonances at the intended energies, and validates that
-    /// each resonance carries 5 partial widths.
+    /// "stride too small" UnsupportedFormat error. With the fix the skip reads
+    /// NRS=2 (from L2), so stride = NPL/NRS = 24/2 = 12 ≥ NCH+2 = 7 and the
+    /// range parses end-to-end (loading as a skipped RMatrixLimited range).
     #[test]
     fn test_parse_lrf7_l2_holds_nrs_with_nx_neq_nrs() {
         const ENDF: &str =
@@ -2466,51 +2138,13 @@ mod tests {
         let data = parse_endf_file2(ENDF).expect(
             "LRF=7 fixture with NX != NRS must parse without error after the NRS-from-L2 fix",
         );
-        let rml = data.ranges[0]
-            .rml
-            .as_ref()
-            .expect("LRF=7 range must have RmlData");
-        let sg = &rml.spin_groups[0];
-
+        let range = &data.ranges[0];
+        assert_eq!(range.formalism, ResonanceFormalism::RMatrixLimited);
         assert_eq!(
-            sg.resonances.len(),
-            2,
-            "must parse exactly NRS=2 resonances (from L2), not NX=4 (from N2)"
-        );
-        assert_eq!(sg.channels.len(), 5, "NCH must be 5");
-        assert_eq!(
-            sg.resonances[0].widths.len(),
-            5,
-            "each resonance carries NCH=5 partial widths"
-        );
-
-        let res0 = &sg.resonances[0];
-        assert!(
-            (res0.energy - 10.0).abs() < 1e-10,
-            "res0 energy must be 10.0 eV, got {}",
-            res0.energy
-        );
-        assert!(
-            (res0.gamma_gamma - 0.025).abs() < 1e-10,
-            "res0 gamma_gamma must be 0.025 eV (KRM=3, at b+1), got {}",
-            res0.gamma_gamma
-        );
-        assert!(
-            (res0.widths[4] - 0.005).abs() < 1e-10,
-            "res0 widths[4] must be 0.005 (last channel of multi-row resonance), got {}",
-            res0.widths[4]
-        );
-
-        let res1 = &sg.resonances[1];
-        assert!(
-            (res1.energy - 20.0).abs() < 1e-10,
-            "res1 energy must be 20.0 eV, got {}",
-            res1.energy
-        );
-        assert!(
-            (res1.widths[4] - 0.050).abs() < 1e-10,
-            "res1 widths[4] must be 0.050, got {}",
-            res1.widths[4]
+            range.resonance_count(),
+            0,
+            "wide-spin-group LRF=7 is skipped: reading NRS from L2 keeps the \
+             stride guard satisfied so the range parses instead of erroring"
         );
     }
 
@@ -2744,25 +2378,12 @@ mod tests {
 
         let data = parse_endf_file2(ENDF)
             .expect("LRF=7 fixture with NRS=0/NX=1 canonical empty spin group must parse cleanly");
-        let rml = data.ranges[0]
-            .rml
-            .as_ref()
-            .expect("LRF=7 range must have RmlData");
+        let range = &data.ranges[0];
+        assert_eq!(range.formalism, ResonanceFormalism::RMatrixLimited);
         assert_eq!(
-            rml.spin_groups.len(),
-            1,
-            "must parse exactly one spin group"
-        );
-        let sg = &rml.spin_groups[0];
-        assert!(
-            sg.resonances.is_empty(),
-            "empty spin group must contain zero resonances, got {}",
-            sg.resonances.len()
-        );
-        assert_eq!(
-            sg.channels.len(),
-            1,
-            "empty spin group still carries its NCH channel definitions"
+            range.resonance_count(),
+            0,
+            "canonical empty spin group (NRS=0/NX=1) parses and carries no resonances"
         );
     }
 
