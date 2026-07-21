@@ -501,10 +501,6 @@ def _single_fit_kwargs(
     if counts:
         keys.update(
             {
-                "fit_alpha_1",
-                "fit_alpha_2",
-                "alpha_1_init",
-                "alpha_2_init",
                 "enable_polish",
             }
         )
@@ -532,10 +528,6 @@ def _spatial_fit_kwargs(
         "fit_back_f",
         "back_d_init",
         "back_f_init",
-        "fit_alpha_1",
-        "fit_alpha_2",
-        "alpha_1_init",
-        "alpha_2_init",
         "c",
         "enable_polish",
         "fit_energy_scale",

@@ -4701,12 +4701,6 @@ fn spatial_result_to_py(
 ///         For transmission data this uses the transmission-domain background model.
 ///         For counts data this enables the same transmission background inside the
 ///         count-domain KL/LM pipelines.
-///     fit_alpha_1: Fit counts nuisance flux scale `alpha_1` when using
-///         `from_counts_with_nuisance()`.
-///     fit_alpha_2: Fit detector-background scale `alpha_2` when using
-///         `from_counts_with_nuisance()`.
-///     alpha_1_init: Initial value for `alpha_1` (default 1.0).
-///     alpha_2_init: Initial value for `alpha_2` (default 1.0).
 ///     fit_energy_scale: Fit per-pixel SAMMY TZERO calibration (t0, L_scale).
 ///         Required for real VENUS counts data to match SAMMY chi2 performance.
 ///     t0_init_us: Initial TOF offset in microseconds (default 0.0).
@@ -4762,10 +4756,6 @@ fn spatial_result_to_py(
     fit_back_f = false,
     back_d_init = 0.01,
     back_f_init = 1.0,
-    fit_alpha_1 = false,
-    fit_alpha_2 = false,
-    alpha_1_init = 1.0,
-    alpha_2_init = 1.0,
     c = 1.0,
     enable_polish = None,
     fit_energy_scale = false,
@@ -4812,10 +4802,6 @@ fn py_spatial_map_typed<'py>(
     fit_back_f: bool,
     back_d_init: f64,
     back_f_init: f64,
-    fit_alpha_1: bool,
-    fit_alpha_2: bool,
-    alpha_1_init: f64,
-    alpha_2_init: f64,
     c: f64,
     enable_polish: Option<bool>,
     fit_energy_scale: bool,
@@ -5036,23 +5022,9 @@ fn py_spatial_map_typed<'py>(
         background,
         fit_anorm,
     )?;
-    if fit_alpha_1 || fit_alpha_2 || alpha_1_init != 1.0 || alpha_2_init != 1.0 {
-        if data.kind != "counts_with_nuisance" {
-            return Err(pyo3::exceptions::PyValueError::new_err(
-                "counts background scaling requires from_counts_with_nuisance() input",
-            ));
-        }
-        config =
-            config.with_counts_background(nereids_pipeline::pipeline::CountsBackgroundConfig {
-                alpha_1_init,
-                alpha_2_init,
-                fit_alpha_1,
-                fit_alpha_2,
-                c,
-            });
-    } else if c != 1.0 && (data.kind == "counts" || data.kind == "counts_with_nuisance") {
-        // Caller provided `c` without alpha fitting — attach a minimal
-        // CountsBackgroundConfig carrying just the proton-charge ratio.
+    if c != 1.0 && (data.kind == "counts" || data.kind == "counts_with_nuisance") {
+        // Caller provided `c` (the proton-charge ratio) — attach a minimal
+        // CountsBackgroundConfig carrying just it for the counts-KL dispatch.
         config =
             config.with_counts_background(nereids_pipeline::pipeline::CountsBackgroundConfig {
                 c,
@@ -5158,10 +5130,6 @@ fn py_spatial_map_typed<'py>(
 ///     solver: "lm" (default), "kl", or "auto".
 ///     background: Enable transmission-lift background inside the counts fit.
 ///     detector_background: Optional detector/counts background reference.
-///     fit_alpha_1: Fit flux-scale nuisance parameter `alpha_1`.
-///     fit_alpha_2: Fit detector-background scale nuisance parameter `alpha_2`.
-///     alpha_1_init: Initial value for `alpha_1` (default 1.0).
-///     alpha_2_init: Initial value for `alpha_2` (default 1.0).
 ///     resolution: Optional resolution function.
 ///     groups: list of IsotopeGroup objects (mutually exclusive with isotopes).
 ///     initial_densities: Initial density guesses when using groups (default 0.001 each).
@@ -5214,10 +5182,6 @@ fn py_spatial_map_typed<'py>(
     l_scale_init = 1.0,
     energy_scale_flight_path_m = 25.0,
     detector_background = None,
-    fit_alpha_1 = false,
-    fit_alpha_2 = false,
-    alpha_1_init = 1.0,
-    alpha_2_init = 1.0,
     c = 1.0,
     resolution = None,
     flight_path_m = None,
@@ -5263,10 +5227,6 @@ fn py_fit_counts_spectrum_typed<'py>(
     l_scale_init: f64,
     energy_scale_flight_path_m: f64,
     detector_background: Option<PyReadonlyArray1<'py, f64>>,
-    fit_alpha_1: bool,
-    fit_alpha_2: bool,
-    alpha_1_init: f64,
-    alpha_2_init: f64,
     c: f64,
     resolution: Option<PyTabulatedResolution>,
     flight_path_m: Option<f64>,
@@ -5368,12 +5328,6 @@ fn py_fit_counts_spectrum_typed<'py>(
     } else {
         None
     };
-    if fit_alpha_2 && detector_background_vec.is_none() {
-        return Err(pyo3::exceptions::PyValueError::new_err(
-            "fit_alpha_2 requires detector_background to be provided",
-        ));
-    }
-
     let energies_vec = e_slice.to_vec();
     let res_fn = build_resolution(flight_path_m, delta_t_us, delta_l_m, resolution, None)?;
 
@@ -5453,21 +5407,10 @@ fn py_fit_counts_spectrum_typed<'py>(
     // Attach CountsBackgroundConfig whenever any of its fields deviates from
     // the default — including c, which is the explicit proton-charge ratio
     // consumed by the counts-KL (joint-Poisson) dispatch.
-    if fit_alpha_1
-        || fit_alpha_2
-        || alpha_1_init != 1.0
-        || alpha_2_init != 1.0
-        || c != 1.0
-        || solver == "kl"
-        || solver == "poisson"
-        || solver == "joint_poisson"
-    {
+    if c != 1.0 || solver == "kl" || solver == "poisson" || solver == "joint_poisson" {
         config = config.with_counts_background(CountsBackgroundConfig {
-            alpha_1_init,
-            alpha_2_init,
-            fit_alpha_1,
-            fit_alpha_2,
             c,
+            ..CountsBackgroundConfig::default()
         });
     }
 
