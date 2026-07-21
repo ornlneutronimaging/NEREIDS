@@ -342,15 +342,15 @@ pub struct CrossSections {
 ///
 /// # Panics
 /// Panics if `energy_ev` is non-finite or non-positive.  The leaf SLBW /
-/// RML / URR routines already enforce this precondition in release builds;
-/// hoisting the same assert to the top-level pub fn keeps the public
-/// contract symmetric so direct Rust callers cannot bypass validation
-/// by hitting a range that gates entry on a finite-only check (e.g. a
-/// pure-RM range with no SLBW/URR/RML leaf would otherwise silently
+/// The SLBW leaf routine already enforces this precondition in release
+/// builds; hoisting the same assert to the top-level pub fn keeps the
+/// public contract symmetric so direct Rust callers cannot bypass
+/// validation by hitting a range that gates entry on a finite-only check
+/// (e.g. a pure-RM range with no SLBW leaf would otherwise silently
 /// return zeros when handed NaN).
 pub fn cross_sections_at_energy(data: &ResonanceData, energy_ev: f64) -> CrossSections {
-    // Symmetric public-API guard.  Matches `slbw_cross_sections_for_range`,
-    // `cross_sections_for_rml_range`, and `urr_cross_sections`.  One branch
+    // Symmetric public-API guard.  Matches `slbw_cross_sections_for_range`.
+    // One branch
     // at the entry of this O(ranges × resonances) function is negligible.
     assert!(
         energy_ev.is_finite() && energy_ev > 0.0,
@@ -1789,7 +1789,6 @@ mod tests {
                 }],
                 rml: None,
                 ap_table: None,
-                urr: None,
                 r_external: vec![],
             }],
         };
@@ -1966,7 +1965,6 @@ mod tests {
                     }],
                 }],
                 rml: None,
-                urr: None,
                 ap_table: None,
                 r_external: vec![],
             }],
@@ -2001,7 +1999,6 @@ mod tests {
                     }],
                 }],
                 rml: None,
-                urr: None,
                 ap_table: None,
                 r_external: vec![],
             }],
