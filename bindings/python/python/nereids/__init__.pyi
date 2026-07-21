@@ -1542,10 +1542,6 @@ def spatial_map_typed(
     fit_back_f: bool = False,
     back_d_init: float = 0.01,
     back_f_init: float = 1.0,
-    fit_alpha_1: bool = False,
-    fit_alpha_2: bool = False,
-    alpha_1_init: float = 1.0,
-    alpha_2_init: float = 1.0,
     c: float = 1.0,
     enable_polish: bool | None = None,
     fit_energy_scale: bool = False,
@@ -1744,10 +1740,6 @@ def fit_counts_spectrum_typed(
     l_scale_init: float = 1.0,
     energy_scale_flight_path_m: float = 25.0,
     detector_background: NDArray[np.float64] | None = None,
-    fit_alpha_1: bool = False,
-    fit_alpha_2: bool = False,
-    alpha_1_init: float = 1.0,
-    alpha_2_init: float = 1.0,
     c: float = 1.0,
     resolution: TabulatedResolution | None = None,
     flight_path_m: float | None = None,
@@ -1808,13 +1800,6 @@ def fit_counts_spectrum_typed(
             wrapper inside the counts-KL fit (A_n + B_A + B_B/√E + B_C√E).
         detector_background: Optional detector/counts background reference
             (for LM-converted path only; counts-KL rejects non-zero values).
-        fit_alpha_1: Research-only; rejected by the counts-KL dispatch
-            because the profile λ̂ absorbs the global flux scale.
-        fit_alpha_2: Research-only; rejected by the counts-KL dispatch
-            (non-zero detector background not currently wired).
-        alpha_1_init: Initial value for alpha_1 (default 1.0); only
-            consumed by the research Fisher helper.
-        alpha_2_init: Initial value for alpha_2 (default 1.0); same.
         c: Proton-charge ratio ``Q_s / Q_ob``.  Default
             1.0 assumes the caller has already PC-normalized the flux.
             For raw VENUS-style counts, set this to the actual ratio
