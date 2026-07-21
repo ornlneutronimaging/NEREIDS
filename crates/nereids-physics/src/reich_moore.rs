@@ -17,8 +17,6 @@
 //! | 1        | SLBW                       | `slbw::slbw_evaluate_with_cached_jgroups`         |
 //! | 2        | MLBW                       | `slbw::mlbw_evaluate_with_cached_jgroups`         |
 //! | 3        | Reich-Moore                | `reich_moore_spin_group_precomputed` (+ 2ch/3ch)  |
-//! | 7        | R-Matrix Limited           | `rmatrix_limited::cross_sections_for_rml_range`   |
-//! | URR      | Hauser-Feshbach average    | `urr::urr_cross_sections` |
 //!
 //! ## Reich-Moore Approximation
 //! In the full R-matrix, all channels (neutron, capture, fission) appear
@@ -45,7 +43,6 @@ use nereids_endf::resonance::{ResonanceData, ResonanceFormalism, ResonanceRange,
 
 use crate::channel;
 use crate::penetrability;
-use crate::rmatrix_limited;
 use crate::slbw;
 
 // ─── Per-resonance precomputed invariants ─────────────────────────────────────
@@ -585,8 +582,6 @@ enum PrecomputedRangeKind<'a> {
         range: &'a ResonanceRange,
         l_groups: Vec<PrecomputedSlbwLGroupData>,
     },
-    /// R-Matrix Limited (LRF=7): no precompute, evaluate per-energy.
-    RMatrixLimited(&'a nereids_endf::resonance::RmlData),
     /// Not evaluable (skip).
     Skip,
 }
@@ -617,11 +612,6 @@ fn precompute_range_data<'a>(
 
     if !range.resolved {
         return make(PrecomputedRangeKind::Skip);
-    }
-
-    // RML ranges.
-    if let Some(rml) = &range.rml {
-        return make(PrecomputedRangeKind::RMatrixLimited(rml));
     }
 
     // SLBW and MLBW share the precomputed-J-group layout but evaluate
@@ -787,10 +777,6 @@ fn evaluate_precomputed_range(
 ) -> (f64, f64, f64, f64) {
     match &pc.kind {
         PrecomputedRangeKind::Skip => (0.0, 0.0, 0.0, 0.0),
-
-        PrecomputedRangeKind::RMatrixLimited(rml) => {
-            rmatrix_limited::cross_sections_for_rml_range(rml, energy_ev)
-        }
 
         PrecomputedRangeKind::Slbw { range, l_groups } => {
             let pi_over_k2 = channel::pi_over_k_squared_barns(energy_ev, awr);
@@ -1058,10 +1044,7 @@ fn range_is_evaluable(range: &ResonanceRange) -> bool {
     }
     matches!(
         range.formalism,
-        ResonanceFormalism::SLBW
-            | ResonanceFormalism::MLBW
-            | ResonanceFormalism::ReichMoore
-            | ResonanceFormalism::RMatrixLimited
+        ResonanceFormalism::SLBW | ResonanceFormalism::MLBW | ResonanceFormalism::ReichMoore
     )
 }
 
