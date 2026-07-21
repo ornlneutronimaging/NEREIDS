@@ -47,7 +47,6 @@ use crate::channel;
 use crate::penetrability;
 use crate::rmatrix_limited;
 use crate::slbw;
-use crate::urr;
 
 // ─── Per-resonance precomputed invariants ─────────────────────────────────────
 //
@@ -588,11 +587,6 @@ enum PrecomputedRangeKind<'a> {
     },
     /// R-Matrix Limited (LRF=7): no precompute, evaluate per-energy.
     RMatrixLimited(&'a nereids_endf::resonance::RmlData),
-    /// URR: no precompute, evaluate per-energy.
-    Urr {
-        urr_data: &'a nereids_endf::resonance::UrrData,
-        range: &'a ResonanceRange,
-    },
     /// Not evaluable (skip).
     Skip,
 }
@@ -620,11 +614,6 @@ fn precompute_range_data<'a>(
         half_open_upper: next_starts_here,
         kind,
     };
-
-    // URR ranges.
-    if let Some(urr_data) = &range.urr {
-        return make(PrecomputedRangeKind::Urr { urr_data, range });
-    }
 
     if !range.resolved {
         return make(PrecomputedRangeKind::Skip);
@@ -801,11 +790,6 @@ fn evaluate_precomputed_range(
 
         PrecomputedRangeKind::RMatrixLimited(rml) => {
             rmatrix_limited::cross_sections_for_rml_range(rml, energy_ev)
-        }
-
-        PrecomputedRangeKind::Urr { urr_data, range } => {
-            let ap_fm = range.scattering_radius_at(energy_ev);
-            urr::urr_cross_sections(urr_data, energy_ev, ap_fm)
         }
 
         PrecomputedRangeKind::Slbw { range, l_groups } => {
@@ -1069,9 +1053,6 @@ fn evaluate_precomputed_range(
 /// formalism becomes evaluable there, add it to the `matches!` pattern
 /// here so the energy-boundary logic (`next_starts_here`) stays correct.
 fn range_is_evaluable(range: &ResonanceRange) -> bool {
-    if range.urr.is_some() {
-        return true;
-    }
     if !range.resolved {
         return false;
     }

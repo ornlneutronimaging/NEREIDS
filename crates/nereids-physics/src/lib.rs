@@ -15,9 +15,6 @@
 //! - [`slbw`] — Breit-Wigner formalisms, single- and multi-level (LRF=1/2)
 //! - [`surrogate`] — Forward-model surrogates for multi-isotope accelerated fits
 //! - [`transmission`] — Beer-Lambert transmission forward model
-//! - [`urr`] — Unresolved Resonance Region (LRU=2) energy-averaged
-//!   Hauser-Feshbach cross-sections (width-fluctuation correction not yet
-//!   implemented)
 //!
 //! ## SAMMY Reference
 //! - Cross-sections: `rml/` (Reich-Moore), `mlb/` (SLBW/MLBW), manual Sec. II
@@ -40,4 +37,3 @@ pub mod rmatrix_limited;
 pub mod slbw;
 pub mod surrogate;
 pub mod transmission;
-pub mod urr;
