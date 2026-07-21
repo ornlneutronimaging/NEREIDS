@@ -117,26 +117,14 @@ fn extract_resonance_widths(resonance_data: &[&ResonanceData]) -> Vec<(f64, f64)
             if !range.resolved {
                 continue;
             }
-            // LRF=1/2/3: resonances grouped by L
+            // LRF=1/2/3: resonances grouped by L. LRF=7 (and LRU=2) ranges are
+            // parsed-and-skipped with empty l_groups and are not evaluated, so
+            // they contribute no resonance dips here.
             for lg in &range.l_groups {
                 for res in &lg.resonances {
                     let gd = res.gn.abs() + res.gg.abs() + res.gfa.abs() + res.gfb.abs();
                     if gd > 0.0 {
                         pairs.push((res.energy, gd));
-                    }
-                }
-            }
-            // LRF=7: resonances in spin groups
-            if let Some(ref rml) = range.rml {
-                for sg in &rml.spin_groups {
-                    for res in &sg.resonances {
-                        let mut gd = res.gamma_gamma.abs();
-                        for &w in &res.widths {
-                            gd += w * w; // γ² approximates Γ
-                        }
-                        if gd > 0.0 {
-                            pairs.push((res.energy, gd));
-                        }
                     }
                 }
             }
@@ -1552,7 +1540,6 @@ mod tests {
                         gfb: 0.0,
                     }],
                 }],
-                rml: None,
                 ap_table: None,
                 r_external: vec![],
             }],

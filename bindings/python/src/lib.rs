@@ -108,12 +108,12 @@ impl PyResonanceData {
         self.inner.awr
     }
 
-    /// Number of resonances (across all ranges and all formalisms).
+    /// Number of discrete resonances (across all evaluable ranges).
     ///
-    /// Delegates to the formalism-aware
-    /// [`ResonanceData::total_resonance_count`], so LRF=7 R-matrix-limited
-    /// evaluations (whose resonances live in `rml.spin_groups`, not
-    /// `l_groups`) are counted correctly instead of reporting 0.
+    /// Delegates to [`ResonanceData::total_resonance_count`], which counts the
+    /// L-grouped resonances of evaluable LRF=1/2/3 ranges. LRF=7 (and LRU=2)
+    /// ranges are parsed-and-skipped — NEREIDS does not evaluate them — so they
+    /// contribute 0.
     #[getter]
     fn n_resonances(&self) -> usize {
         self.inner.total_resonance_count()
@@ -1947,7 +1947,6 @@ fn create_resonance_data(
                 scattering_radius,
                 naps: 1,
                 l_groups: groups,
-                rml: None,
                 ap_table: None,
                 r_external: vec![],
             }],

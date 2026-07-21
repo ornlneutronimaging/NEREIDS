@@ -263,14 +263,16 @@ class TestResonanceData:
                 formalism="bogus",
             )
 
-    def test_lrf7_n_resonances_counts_rml_spin_groups(self):
-        """LRF=7 R-matrix-limited resonances must be counted (issue #638).
+    def test_lrf7_n_resonances_zero_when_skipped(self):
+        """LRF=7 R-matrix-limited ranges are parsed-and-skipped, not evaluated.
 
-        Their resonances live in ``rml.spin_groups``, not ``l_groups``. The
-        ``n_resonances`` getter previously summed only ``l_groups`` and so
-        reported 0 for R-matrix-limited evaluations. It now delegates to the
-        formalism-aware Rust ``total_resonance_count()``. This synthetic
-        LRF=7/KRM=3 fixture has exactly 2 resonances and zero L-groups.
+        NEREIDS removed the LRF=7 cross-section physics (its closed-channel
+        boundary condition was never implemented and it was never validated
+        against SAMMY), so an LRF=7 range now loads as a non-evaluable
+        placeholder with no discrete resonances. ``n_resonances`` therefore
+        reports 0 for a pure-LRF=7 evaluation — it is not evaluated, so there
+        is nothing to count. The file still loads (parse-and-skip keeps mixed
+        evaluations accessible).
         """
         root = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
         fixture = os.path.join(
@@ -278,17 +280,16 @@ class TestResonanceData:
         )
         # The fixture is committed to the repo, so a missing file is a
         # packaging/path regression that MUST fail — not a skip that would
-        # silently disable this LRF=7 count guard.
+        # silently disable this LRF=7 skip guard.
         assert os.path.exists(fixture), (
             f"vendored LRF=7 regression fixture must be present at {fixture} "
             "(committed test data)"
         )
 
         data = nereids.load_endf_file(fixture)
-        assert data.n_resonances > 0, (
-            "LRF=7 evaluation must not report 0 resonances"
+        assert data.n_resonances == 0, (
+            "LRF=7 ranges are skipped (not evaluated), so no resonances are counted"
         )
-        assert data.n_resonances == 2, "fixture has 2 R-matrix-limited resonances"
         # Explicit alias must agree with n_resonances.
         assert data.total_resonance_count == data.n_resonances
 

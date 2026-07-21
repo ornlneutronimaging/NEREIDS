@@ -20,7 +20,7 @@ use nereids_core::constants::{self, NEAR_ZERO_FLOOR};
 /// η = Z_a · Z_b · α · √(m_n·c² · μ̃ / (2·E_c))
 ///
 /// where:
-/// - Z_a, Z_b are the charge numbers stored in `ParticlePair.za`/`.zb`
+/// - Z_a, Z_b are the two channel charge numbers (ENDF LRF=7 particle-pair charges)
 ///   (ENDF LRF=7 stores the charge Z directly: neutron/photon = 0,
 ///   proton = 1, alpha = 2; see SAMMY rml/mrml03.f Zeta formula)
 /// - α = fine-structure constant ≈ 1/137.036
@@ -33,7 +33,7 @@ use nereids_core::constants::{self, NEAR_ZERO_FLOOR};
 /// where `Kza`/`Kzb` are the charges read directly from the ENDF file.
 ///
 /// # Arguments
-/// * `za`, `zb` — Charge numbers Z of the two particles (from `ParticlePair.za`/`.zb`).
+/// * `za`, `zb` — Charge numbers Z of the two particles.
 ///   Neutron and photon: 0; proton: 1; alpha: 2; oxygen-16: 8.
 /// * `ma`, `mb` — Particle masses in neutron mass units.
 /// * `e_cm_ev` — CM kinetic energy in eV (must be > 0).
