@@ -169,97 +169,12 @@ pub enum ResonanceFormalism {
     /// R-Matrix Limited (LRF=7). General multi-channel formalism; used for
     /// many medium-heavy isotopes (W, Ta, Zr, etc.) in ENDF/B-VIII.0.
     RMatrixLimited,
-    /// Unresolved Resonance Region (LRU=2). Average cross-sections via
-    /// Hauser-Feshbach formalism. Cross-sections computed in `urr::urr_cross_sections`.
+    /// Unresolved Resonance Region (LRU=2). Parsed for cursor alignment but not
+    /// evaluated: NEREIDS does not compute URR average cross sections. The
+    /// Hauser-Feshbach path was removed because it lacked the ENDF
+    /// width-fluctuation correction (a systematically wrong average). Ranges
+    /// tagged `Unresolved` are non-evaluable and resolve to Skip.
     Unresolved,
-}
-
-// ─── LRU=2 (Unresolved Resonance Region) Data Structures ─────────────────────
-//
-// The URR uses average level-spacing and width parameters rather than discrete
-// resonances. Cross-sections are computed via the Hauser-Feshbach formula.
-//
-// LRF=1: single energy-independent width set per (L, J); Γ_n derived from
-//        reduced neutron width GNO via Γ_n = 2·P_L·GNO.
-// LRF=2: tabulated energy-dependent widths with an interpolation law per
-//        J-group; supported INT codes enforced by the parser at load time.
-//
-// Reference: ENDF-6 Formats Manual §2.2.2
-
-/// Average widths for one (L, J) combination in the Unresolved Resonance Region.
-///
-/// For LRF=1: `energies` is empty; each width vector has exactly one element.
-/// For LRF=2: all vectors have length NE; `int_code` selects the interpolation
-/// law (INT=1..=5 per ENDF-6 §0.5; validated by the parser, dispatched in
-/// `nereids_physics::urr`).
-///
-/// Reference: ENDF-6 Formats Manual §2.2.2
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct UrrJGroup {
-    /// Total angular momentum J.
-    pub j: f64,
-    /// Neutron χ² degrees of freedom (AMUN).
-    pub amun: f64,
-    /// Fission χ² degrees of freedom (AMUF); 0 for LRF=1 non-fissile.
-    pub amuf: f64,
-    /// Tabulation energies (eV). Empty for LRF=1.
-    pub energies: Vec<f64>,
-    /// Average level spacing D (eV). Single-element for LRF=1.
-    pub d: Vec<f64>,
-    /// Competitive width GX (eV). Single-element 0 for LRF=1.
-    pub gx: Vec<f64>,
-    /// Average neutron width (eV). For LRF=1 this is GNO (reduced width);
-    /// for LRF=2 this is the actual average Γ_n from the table.
-    pub gn: Vec<f64>,
-    /// Average gamma (capture) width GG (eV). Single-element for LRF=1.
-    pub gg: Vec<f64>,
-    /// Average fission width GF (eV). Single-element for LRF=1.
-    pub gf: Vec<f64>,
-    /// Interpolation law for the energy table (LRF=2 only).
-    /// INT=1..=5 per ENDF-6 §0.5 (1: histogram; 2: y linear in E;
-    /// 3: y linear in ln E; 4: ln y linear in E; 5: ln y linear in ln E).
-    /// Ignored for LRF=1 (no table).
-    #[serde(default = "default_int_code")]
-    pub int_code: u32,
-}
-
-fn default_int_code() -> u32 {
-    2
-}
-
-/// Average URR parameters for one L-value.
-///
-/// Reference: ENDF-6 Formats Manual §2.2.2
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct UrrLGroup {
-    /// Orbital angular momentum quantum number.
-    pub l: u32,
-    /// Atomic weight ratio for this L-group.
-    pub awri: f64,
-    /// J-groups within this L-value.
-    pub j_groups: Vec<UrrJGroup>,
-}
-
-/// Complete Unresolved Resonance Region data for one energy range (LRU=2).
-///
-/// Stored in `ResonanceRange::urr` when the range is an URR range.
-///
-/// Reference: ENDF-6 Formats Manual §2.2.2
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct UrrData {
-    /// LRF flag: 1 = single-level BWR (energy-independent widths),
-    ///           2 = multi-level BWR (energy-dependent width tables).
-    pub lrf: u32,
-    /// Target spin I.
-    pub spi: f64,
-    /// Scattering radius AP in fm (converted from ENDF 10⁻¹² cm at parse time).
-    pub ap: f64,
-    /// Lower URR energy bound (eV).
-    pub e_low: f64,
-    /// Upper URR energy bound (eV).
-    pub e_high: f64,
-    /// L-groups (one per orbital angular momentum value).
-    pub l_groups: Vec<UrrLGroup>,
 }
 
 /// Top-level container for all resonance data parsed from an ENDF file.
@@ -319,12 +234,6 @@ pub struct ResonanceRange {
     pub l_groups: Vec<LGroup>,
     /// R-Matrix Limited data for LRF=7. `None` for LRF=1/2/3 and LRU=2.
     pub rml: Option<Box<RmlData>>,
-    /// Unresolved Resonance Region data (LRU=2). `None` for all LRU=1 ranges.
-    ///
-    /// When `Some`, cross-sections are computed via the Hauser-Feshbach
-    /// formula in `nereids_physics::urr::urr_cross_sections`.
-    #[serde(default)]
-    pub urr: Option<Box<UrrData>>,
     /// R-external (background R-matrix) entries per spin group.
     ///
     /// Diagonal, real-valued corrections to the R-matrix that approximate
@@ -816,7 +725,6 @@ mod tests {
             ap_table: None,
             l_groups: vec![],
             rml: None,
-            urr: None,
             r_external: vec![],
         };
         assert_eq!(range.scattering_radius_at(1.0), 9.4285);
@@ -839,7 +747,6 @@ mod tests {
             ap_table: Some(table),
             l_groups: vec![],
             rml: None,
-            urr: None,
             r_external: vec![],
         };
         // At 1 eV: 8.0 fm
@@ -1032,7 +939,6 @@ pub mod test_support {
                 resonances,
             }],
             rml: None,
-            urr: None,
             ap_table: None,
             r_external: vec![],
         }

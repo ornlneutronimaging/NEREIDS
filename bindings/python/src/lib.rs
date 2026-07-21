@@ -1948,7 +1948,6 @@ fn create_resonance_data(
                 naps: 1,
                 l_groups: groups,
                 rml: None,
-                urr: None,
                 ap_table: None,
                 r_external: vec![],
             }],

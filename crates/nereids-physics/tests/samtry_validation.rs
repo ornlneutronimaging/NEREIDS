@@ -47,7 +47,7 @@
 //! SAMMY source: `../SAMMY/SAMMY/sammy/samtry/`
 
 use nereids_endf::parser::parse_endf_file2;
-use nereids_endf::resonance::ResonanceData;
+use nereids_endf::resonance::{ResonanceData, ResonanceFormalism};
 use nereids_endf::sammy::{
     SammyInpConfig, SammyObservationType, SammyParFile, SammyPltRecord, parse_sammy_inp,
     parse_sammy_par, parse_sammy_plt, sammy_to_nereids_resolution, sammy_to_resonance_data,
@@ -2690,7 +2690,7 @@ fn test_tr129c_na23_endf_total_xs() {
 }
 
 #[test]
-fn test_tr129e_pu240_lfw1_lrf1_urr_parsed() {
+fn test_tr129e_pu240_lfw1_lrf1_urr_skipped() {
     // Pu-240 ENDF file (tape128_9440_2) is a real-world LFW=1/LRF=1
     // (ENDF-6 §2.2.2.1 "Case B") URR tape: the isotope CONT carries LFW=1
     // and NER=2 — range 1 is a resolved MLBW (LRU=1, LRF=2) region and
@@ -2713,48 +2713,19 @@ fn test_tr129e_pu240_lfw1_lrf1_urr_parsed() {
 
     // NER=2: one resolved range + one URR range.
     assert_eq!(rd.ranges.len(), 2, "Pu-240 has NER=2 (resolved + URR)");
+
+    // The URR (LRU=2, LFW=1/LRF=1 Case B) range is parsed-and-skipped: it must
+    // appear as a non-resolved Unresolved range. That the whole tape parses
+    // end-to-end — rather than tripping the multiple-materials guard on stray,
+    // mis-consumed lines — is the regression guard for the Case-B skip's cursor
+    // advancement (before the per-J control-line read was added this file
+    // mis-parsed, per the fixture note above).
     let urr_range = rd
         .ranges
         .iter()
-        .find(|r| r.urr.is_some())
-        .expect("the URR (LRU=2) range must carry parsed UrrData");
-    let urr = urr_range.urr.as_ref().unwrap();
-    assert_eq!(urr.lrf, 1, "URR formalism is LRF=1 (Case B)");
-    // CONT (line 539): SPI=0, AP=0.888, NE=14, NLS=3.
-    assert_eq!(urr.l_groups.len(), 3, "NLS=3 L-groups");
-
-    // First L-group (L=0, line 543): one J-group.
-    let lg0 = &urr.l_groups[0];
-    assert_eq!(lg0.l, 0, "first L-group is L=0");
-    assert_eq!(lg0.j_groups.len(), 1, "L=0 has NJS=1");
-
-    // First J-group body (lines 545-548) + per-J control (line 544).
-    let jg = &lg0.j_groups[0];
-    assert!((jg.j - 0.5).abs() < 1e-6, "AJ = {}", jg.j);
-    assert!((jg.amun - 1.0).abs() < 1e-6, "AMUN = {}", jg.amun);
-    // MUF (fission DOF) from the per-J control L2 field.
-    assert!((jg.amuf - 1.0).abs() < 1e-6, "AMUF (MUF) = {}", jg.amuf);
-    assert!((jg.d[0] - 13.10).abs() < 1e-6, "D = {}", jg.d[0]);
-    assert!((jg.gn[0] - 1.572e-3).abs() < 1e-9, "GNO = {}", jg.gn[0]);
-    assert!((jg.gg[0] - 3.100e-2).abs() < 1e-9, "GG = {}", jg.gg[0]);
-
-    // Shared energy grid (lines 540-542): NE=14 points, 5700..40000 eV.
-    assert_eq!(jg.energies.len(), 14, "NE=14 shared energy points");
-    assert!((jg.energies[0] - 5700.0).abs() < 1e-3);
-    assert!((jg.energies[13] - 40000.0).abs() < 1e-3);
-
-    // Energy-dependent fission widths: NE=14 values, first and last checked.
-    assert_eq!(jg.gf.len(), 14, "NE=14 fission widths");
-    assert!((jg.gf[0] - 1.256e-3).abs() < 1e-9, "GF[0] = {}", jg.gf[0]);
-    assert!(
-        (jg.gf[13] - 1.403e-3).abs() < 1e-9,
-        "GF[13] = {}",
-        jg.gf[13]
-    );
-
-    // Sanity on the other L-groups' NJS (lines 549, 560: NJS=2 each).
-    assert_eq!(urr.l_groups[1].j_groups.len(), 2, "L=1 has NJS=2");
-    assert_eq!(urr.l_groups[2].j_groups.len(), 2, "L=2 has NJS=2");
+        .find(|r| r.formalism == ResonanceFormalism::Unresolved)
+        .expect("the URR (LRU=2) range must be present");
+    assert!(!urr_range.resolved, "URR range must not be resolved");
 }
 
 #[test]

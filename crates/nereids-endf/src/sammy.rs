@@ -1334,7 +1334,6 @@ pub fn sammy_to_resonance_data(
         ap_table: None,
         l_groups,
         rml: None,
-        urr: None,
         r_external: vec![],
     };
 
@@ -1583,7 +1582,6 @@ pub fn sammy_to_resonance_data_multi(
             ap_table: None,
             l_groups,
             rml: None,
-            urr: None,
             r_external: r_external_entries,
         };
 
