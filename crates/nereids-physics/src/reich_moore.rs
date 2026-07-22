@@ -310,9 +310,9 @@ pub struct CrossSections {
 /// Compute cross-sections at a single energy.
 ///
 /// Dispatches each resonance range to the appropriate formalism-specific
-/// calculator (SLBW, MLBW, Reich-Moore, R-Matrix Limited, URR) based on the
-/// formalism stored in that range.  See the module-level table for the full
-/// dispatch map.
+/// calculator (SLBW, MLBW, Reich-Moore) based on the formalism stored in
+/// that range; non-evaluable ranges (LRF=7, LRU=2) resolve to `Skip` and
+/// contribute zero.  See the module-level table for the full dispatch map.
 ///
 /// Adjacent ranges that share a boundary energy use half-open intervals
 /// `[e_low, e_high)` so the boundary point is counted exactly once
@@ -1026,26 +1026,15 @@ fn evaluate_precomputed_range(
 
 /// Can this range actually produce non-zero cross-sections?
 ///
-/// Returns `true` for formalisms whose physics evaluation is implemented:
-/// - SLBW (LRF=1) and MLBW (LRF=2) resolved ranges
-/// - Reich-Moore (LRF=3) resolved ranges
-/// - R-Matrix Limited (LRF=7) resolved ranges
-/// - URR ranges with parsed data (`urr.is_some()`)
-///
-/// Returns `false` for URR placeholders created when unsupported INT
-/// codes force a skip, or other unrecognized formalisms.
+/// Delegates to [`ResonanceRange::is_evaluable`]: evaluable = resolved
+/// LRF=1/2/3 (SLBW, MLBW, Reich-Moore). LRF=7 and LRU=2 ranges are
+/// parse-and-skip placeholders and are never evaluated.
 ///
 /// **Keep in sync with `precompute_range_data`.**  Whenever a new
-/// formalism becomes evaluable there, add it to the `matches!` pattern
-/// here so the energy-boundary logic (`next_starts_here`) stays correct.
+/// formalism becomes evaluable there, extend `ResonanceRange::is_evaluable`
+/// so the energy-boundary logic (`next_starts_here`) stays correct.
 fn range_is_evaluable(range: &ResonanceRange) -> bool {
-    if !range.resolved {
-        return false;
-    }
-    matches!(
-        range.formalism,
-        ResonanceFormalism::SLBW | ResonanceFormalism::MLBW | ResonanceFormalism::ReichMoore
-    )
+    range.is_evaluable()
 }
 
 /// Cross-sections for a single spin group (J, π) in the Reich-Moore formalism,

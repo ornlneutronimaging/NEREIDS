@@ -802,7 +802,25 @@ pub(crate) fn endf_fetch_worker(
         };
         let result = match retriever.get_endf_file(&item.isotope, item.library, mat) {
             Ok((_path, endf_text)) => match nereids_endf::parser::parse_endf_file2(&endf_text) {
-                Ok(data) => Ok(data),
+                Ok(data) => {
+                    if data.has_unevaluated_ranges() {
+                        // Mixed evaluation: the file loads, but the skipped
+                        // spans contribute zero cross-section. Pure
+                        // non-evaluable files never reach here — the parser
+                        // rejects them with a hard error.
+                        let spans: Vec<String> = data
+                            .unevaluated_ranges()
+                            .iter()
+                            .map(|r| r.skip_description())
+                            .collect();
+                        tracing::warn!(
+                            isotope = %item.symbol,
+                            skipped = %spans.join("; "),
+                            "ENDF ranges parsed but not evaluated (zero cross-section over these spans)"
+                        );
+                    }
+                    Ok(data)
+                }
                 Err(e) => Err(format!("Parse error for {}: {e}", item.symbol)),
             },
             Err(e) => {
