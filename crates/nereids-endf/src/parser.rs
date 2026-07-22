@@ -366,8 +366,7 @@ pub fn parse_endf_file2(endf_text: &str) -> Result<ResonanceData, EndfParseError
         let detail = if data.ranges.is_empty() {
             "the file carries no resonance-parameter ranges at all".to_string()
         } else {
-            let skipped: Vec<String> =
-                data.ranges.iter().map(|r| r.skip_description()).collect();
+            let skipped: Vec<String> = data.ranges.iter().map(|r| r.skip_description()).collect();
             format!(
                 "every range in this file is a parse-and-skip placeholder: {}",
                 skipped.join("; ")
@@ -584,9 +583,10 @@ fn parse_reich_moore_range(
 /// LIST records so any following range/material stays aligned.
 ///
 /// NEREIDS does not evaluate LRF=7 cross sections — the RML physics was removed
-/// (its closed-channel boundary condition was never implemented and it was
-/// never validated against SAMMY) — so the parameters are discarded and the
-/// range is tagged `ResonanceFormalism::RMatrixLimited` (non-evaluable → Skip).
+/// (its closed-channel treatment was incomplete: the Coulomb/SHF=1 closed-channel
+/// shift was unimplemented, and the evaluator was never validated against SAMMY)
+/// — so the parameters are discarded and the range is tagged
+/// `ResonanceFormalism::RMatrixLimited` (non-evaluable → Skip).
 ///
 /// Record advancement and every structural/quantum-flag guard are preserved
 /// verbatim (IFG/KRM/KRL; the PNT/SHF/mass particle-pair guards; KBK/KPS; the
@@ -2154,7 +2154,10 @@ mod tests {
 
         let data = parse_endf_file2(ENDF).expect("mixed LRU=0 + resolved file must load");
         assert_eq!(data.ranges.len(), 2, "LRU=0 range + resolved range");
-        assert!(data.has_evaluable_range(), "resolved range keeps it evaluable");
+        assert!(
+            data.has_evaluable_range(),
+            "resolved range keeps it evaluable"
+        );
         assert!(data.has_unevaluated_ranges(), "LRU=0 range is unevaluated");
 
         let lru0 = data

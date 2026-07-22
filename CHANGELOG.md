@@ -11,9 +11,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
 
 - **Removed URR (LRU=2) and R-Matrix Limited (LRF=7) cross-section
   evaluation.** The URR Hauser-Feshbach path lacked the ENDF
-  width-fluctuation correction (a systematically wrong average) and the
-  RML path never implemented the closed-channel boundary condition nor
-  was validated against SAMMY. Both range types are now parsed-and-skipped:
+  width-fluctuation correction (a systematically wrong average), and the
+  RML path's closed-channel treatment was incomplete (the Coulomb/SHF=1
+  closed-channel shift was unimplemented) and never validated against SAMMY.
+  Both range types are now parsed-and-skipped:
   the parser consumes their records for cursor alignment (all structural
   guards preserved) and tags them non-evaluable, so they contribute zero
   cross-section. A file whose every range is non-evaluable (e.g. a pure

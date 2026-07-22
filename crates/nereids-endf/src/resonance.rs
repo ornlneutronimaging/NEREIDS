@@ -168,10 +168,10 @@ pub enum ResonanceFormalism {
     ReichMoore,
     /// R-Matrix Limited (LRF=7). General multi-channel formalism (W, Ta, Zr,
     /// etc. in ENDF/B-VIII.0). Parsed for cursor alignment but not evaluated:
-    /// the RML physics was removed because its closed-channel boundary
-    /// condition was never implemented and it was never validated against
-    /// SAMMY. Ranges tagged `RMatrixLimited` are non-evaluable and resolve to
-    /// Skip.
+    /// the RML physics was removed because its closed-channel treatment was
+    /// incomplete (the Coulomb/SHF=1 closed-channel shift was unimplemented)
+    /// and the evaluator was never validated against SAMMY. Ranges tagged
+    /// `RMatrixLimited` are non-evaluable and resolve to Skip.
     RMatrixLimited,
     /// Unresolved Resonance Region (LRU=2). Parsed for cursor alignment but not
     /// evaluated: NEREIDS does not compute URR average cross sections. The

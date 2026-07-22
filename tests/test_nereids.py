@@ -267,8 +267,9 @@ class TestResonanceData:
         """A pure-LRF=7 evaluation is rejected at load, not silently zeroed.
 
         NEREIDS removed the LRF=7 cross-section physics (its closed-channel
-        boundary condition was never implemented and it was never validated
-        against SAMMY), so LRF=7 ranges are parse-and-skip placeholders. A
+        treatment was incomplete — the Coulomb/SHF=1 closed-channel shift was
+        unimplemented — and it was never validated against SAMMY), so LRF=7
+        ranges are parse-and-skip placeholders. A
         file whose ONLY range is LRF=7 would produce zero cross-sections
         everywhere (transmission = 1) — the parser now rejects it loudly
         instead of loading it with ``n_resonances == 0``.

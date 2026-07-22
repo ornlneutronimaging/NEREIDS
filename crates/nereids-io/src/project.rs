@@ -2667,30 +2667,60 @@ mod tests {
 
     #[test]
     fn test_roundtrip_endf_cache() {
+        use nereids_endf::resonance::{LGroup, Resonance, ResonanceFormalism, ResonanceRange};
+
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("rt_endf.nrd.h5");
         let mut snap = minimal_snapshot();
+        // An evaluable cache entry (resolved SLBW range with one resonance)
+        // must survive save/load. The loader drops entries with no evaluable
+        // range — that path is covered by
+        // `test_load_drops_legacy_non_evaluable_endf_cache`.
         let rd = ResonanceData {
-            isotope: nereids_core::types::Isotope::new(74, 182).unwrap(),
-            za: 74182,
-            awr: 180.948,
-            ranges: vec![],
+            isotope: nereids_core::types::Isotope::new(92, 238).unwrap(),
+            za: 92238,
+            awr: 236.006,
+            ranges: vec![ResonanceRange {
+                energy_low: 1e-5,
+                energy_high: 1e4,
+                resolved: true,
+                formalism: ResonanceFormalism::SLBW,
+                target_spin: 0.0,
+                scattering_radius: 9.4285,
+                naps: 1,
+                ap_table: None,
+                l_groups: vec![LGroup {
+                    l: 0,
+                    awr: 236.006,
+                    apl: 0.0,
+                    qx: 0.0,
+                    lrx: 0,
+                    resonances: vec![Resonance {
+                        energy: 6.674,
+                        j: 0.5,
+                        gn: 1.493e-3,
+                        gg: 23.0e-3,
+                        gfa: 0.0,
+                        gfb: 0.0,
+                    }],
+                }],
+                r_external: vec![],
+            }],
         };
-        snap.endf_cache = vec![("W-182".into(), rd)];
+        snap.endf_cache = vec![("U-238".into(), rd)];
         save_project(&path, &snap).unwrap();
         let loaded = load_project(&path).unwrap();
 
         assert_eq!(loaded.endf_cache.len(), 1);
-        assert_eq!(loaded.endf_cache[0].0, "W-182");
-        assert_eq!(loaded.endf_cache[0].1.za, 74182);
-        assert!((loaded.endf_cache[0].1.awr - 180.948).abs() < 1e-6);
+        assert_eq!(loaded.endf_cache[0].0, "U-238");
+        assert_eq!(loaded.endf_cache[0].1.za, 92238);
+        assert!((loaded.endf_cache[0].1.awr - 236.006).abs() < 1e-6);
+        assert!(loaded.endf_cache[0].1.has_evaluable_range());
     }
 
     #[test]
     fn test_load_drops_legacy_non_evaluable_endf_cache() {
-        use nereids_endf::resonance::{
-            LGroup, Resonance, ResonanceFormalism, ResonanceRange,
-        };
+        use nereids_endf::resonance::{LGroup, Resonance, ResonanceFormalism, ResonanceRange};
 
         // A legacy project (saved before the RML/URR removal) persisted an
         // LRF=7 isotope whose ResonanceData JSON carried `rml`/`urr` payloads
@@ -2772,10 +2802,7 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("legacy.nrd.h5");
         let mut snap = minimal_snapshot();
-        snap.endf_cache = vec![
-            ("Zr-90".into(), restored),
-            ("U-238".into(), evaluable),
-        ];
+        snap.endf_cache = vec![("Zr-90".into(), restored), ("U-238".into(), evaluable)];
         save_project(&path, &snap).unwrap();
 
         let loaded = load_project(&path).unwrap();

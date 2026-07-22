@@ -341,17 +341,16 @@ pub struct CrossSections {
 /// Cross-sections in barns.
 ///
 /// # Panics
-/// Panics if `energy_ev` is non-finite or non-positive.  The leaf SLBW /
-/// The SLBW leaf routine already enforces this precondition in release
-/// builds; hoisting the same assert to the top-level pub fn keeps the
-/// public contract symmetric so direct Rust callers cannot bypass
-/// validation by hitting a range that gates entry on a finite-only check
-/// (e.g. a pure-RM range with no SLBW leaf would otherwise silently
-/// return zeros when handed NaN).
+/// Panics if `energy_ev` is non-finite or non-positive.  The SLBW leaf
+/// routine already enforces this precondition in release builds; hoisting
+/// the same assert to the top-level pub fn keeps the public contract
+/// symmetric so direct Rust callers cannot bypass validation by hitting a
+/// range that gates entry on a finite-only check (e.g. a pure-RM range with
+/// no SLBW leaf would otherwise silently return zeros when handed NaN).
 pub fn cross_sections_at_energy(data: &ResonanceData, energy_ev: f64) -> CrossSections {
     // Symmetric public-API guard.  Matches `slbw_cross_sections_for_range`.
-    // One branch
-    // at the entry of this O(ranges × resonances) function is negligible.
+    // One branch at the entry of this O(ranges × resonances) function is
+    // negligible.
     assert!(
         energy_ev.is_finite() && energy_ev > 0.0,
         "expected positive finite energy_ev, got {energy_ev}"
@@ -423,7 +422,7 @@ pub fn cross_sections_at_energy(data: &ResonanceData, energy_ev: f64) -> CrossSe
 /// single bad energy fails fast with a clear message instead of being
 /// hidden inside the inner loop, matches the symmetric contract on
 /// `cross_sections_at_energy`, and protects direct Rust callers from
-/// the same release-mode silent-zero footgun that the SLBW / RML / URR
+/// the same release-mode silent-zero footgun that the SLBW / Reich-Moore
 /// leaf asserts guard against per-point.
 pub fn cross_sections_on_grid(data: &ResonanceData, energies: &[f64]) -> Vec<CrossSections> {
     if energies.is_empty() {
@@ -1847,9 +1846,18 @@ mod tests {
         for &e in &e_skip {
             let pt = cross_sections_at_energy(&data, e);
             assert_eq!(pt.total, 0.0, "per-point total must be exactly 0 at E={e}");
-            assert_eq!(pt.elastic, 0.0, "per-point elastic must be exactly 0 at E={e}");
-            assert_eq!(pt.capture, 0.0, "per-point capture must be exactly 0 at E={e}");
-            assert_eq!(pt.fission, 0.0, "per-point fission must be exactly 0 at E={e}");
+            assert_eq!(
+                pt.elastic, 0.0,
+                "per-point elastic must be exactly 0 at E={e}"
+            );
+            assert_eq!(
+                pt.capture, 0.0,
+                "per-point capture must be exactly 0 at E={e}"
+            );
+            assert_eq!(
+                pt.fission, 0.0,
+                "per-point fission must be exactly 0 at E={e}"
+            );
         }
         for (i, xs) in cross_sections_on_grid(&data, &e_skip).iter().enumerate() {
             let e = e_skip[i];
@@ -1864,10 +1872,22 @@ mod tests {
         let grid = cross_sections_on_grid(&data, &shared);
         for (i, &e) in shared.iter().enumerate() {
             let pt = cross_sections_at_energy(&data, e);
-            assert_eq!(pt.total, grid[i].total, "scalar/grid total disagree at E={e}");
-            assert_eq!(pt.elastic, grid[i].elastic, "scalar/grid elastic disagree at E={e}");
-            assert_eq!(pt.capture, grid[i].capture, "scalar/grid capture disagree at E={e}");
-            assert_eq!(pt.fission, grid[i].fission, "scalar/grid fission disagree at E={e}");
+            assert_eq!(
+                pt.total, grid[i].total,
+                "scalar/grid total disagree at E={e}"
+            );
+            assert_eq!(
+                pt.elastic, grid[i].elastic,
+                "scalar/grid elastic disagree at E={e}"
+            );
+            assert_eq!(
+                pt.capture, grid[i].capture,
+                "scalar/grid capture disagree at E={e}"
+            );
+            assert_eq!(
+                pt.fission, grid[i].fission,
+                "scalar/grid fission disagree at E={e}"
+            );
         }
 
         // (4) Boundary: the placeholder is non-evaluable, so the resolved range
@@ -1878,7 +1898,10 @@ mod tests {
         let mut resolved_only = data.clone();
         resolved_only.ranges.truncate(1);
         let edge_resolved = cross_sections_at_energy(&resolved_only, e_edge);
-        assert_eq!(edge.total, edge_resolved.total, "skipped range corrupts the boundary total");
+        assert_eq!(
+            edge.total, edge_resolved.total,
+            "skipped range corrupts the boundary total"
+        );
         assert_eq!(edge.elastic, edge_resolved.elastic);
         assert_eq!(edge.capture, edge_resolved.capture);
         assert_eq!(edge.fission, edge_resolved.fission);

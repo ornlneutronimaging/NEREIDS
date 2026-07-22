@@ -205,11 +205,14 @@ specific options are:
 
 | Option | Meaning |
 |--------|---------|
-| `detector_background=...` | Optional 1D detector background spectrum; required when `fit_alpha_2=True`. |
-| `fit_alpha_1=False`, `fit_alpha_2=False` | Fit counts-domain nuisance/background terms. |
-| `alpha_1_init=1.0`, `alpha_2_init=1.0` | Initial nuisance/background values. |
+| `detector_background=...` | Optional 1D detector background spectrum. |
 | `c=1.0` | Proton-charge ratio `Q_s / Q_ob`. |
 | `enable_polish=True/False/None` | Override counts-KL polish behavior; `None` uses the dispatcher default. |
+
+The counts-domain `alpha_1`/`alpha_2` nuisance parameters are not fit by
+`fit_counts_spectrum_typed` or `spatial_map_typed`. Only
+`compute_model_jacobian` retains the `alpha` parameters, as a research/UQ
+surface.
 
 ## Spatial Mapping
 
@@ -269,8 +272,6 @@ Keyword arguments:
 | `background=False` | Enable SAMMY-style background for LM/transmission paths. |
 | `fit_back_d=False`, `fit_back_f=False` | Fit the SAMMY exponential background tail (`BackD * exp(-BackF / √E)`).  Requires `background=True`.  Per-pixel `back_d_map` / `back_f_map` are populated on the returned `SpatialResult` (issue #538). |
 | `back_d_init=0.01`, `back_f_init=1.0` | Initial values for the exponential tail. |
-| `fit_alpha_1=False`, `fit_alpha_2=False` | Fit counts-domain nuisance/background terms. |
-| `alpha_1_init=1.0`, `alpha_2_init=1.0` | Initial nuisance/background values. |
 | `c=1.0` | Proton-charge ratio for counts-KL spatial fitting. |
 | `enable_polish=True/False/None` | Override counts-KL polish behavior; `None` auto-disables polish for multi-pixel maps. |
 | `fit_energy_scale=False` | Fit per-pixel `t0_us` and `l_scale` maps. |
