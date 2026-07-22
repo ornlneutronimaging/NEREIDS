@@ -22,6 +22,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
   (e.g. Ta-181, U-238) still load, with a Python `UserWarning` from
   `load_endf`/`load_endf_file` listing the skipped spans, a
   `ResonanceData.has_unevaluated_ranges` getter, and a GUI log warning.
+- **LRU=0 scattering-radius-only evaluations are rejected at load.** ENDF-6
+  §2.1 LRU=0 ranges (e.g. H-1) give a scattering radius but no resonance
+  parameters, so they contribute zero cross-section; NEREIDS previously loaded
+  them as zero-resonance data. They are now parsed-and-skipped placeholders,
+  and a file whose only range is LRU=0 is rejected with an `UnsupportedFormat`
+  error that names the LRU=0 span. Mixed files that also carry a resolved
+  LRF=1/2/3 range still load and use it.
 - **Removed the dead `alpha_1`/`alpha_2` counts-fit parameters** from the
   Python API (`fit_alpha_1`, `fit_alpha_2`, `alpha_1_init`,
   `alpha_2_init` kwargs). The MCP server now rejects manifests that still
