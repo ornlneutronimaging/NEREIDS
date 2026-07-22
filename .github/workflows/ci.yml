@@ -151,6 +151,11 @@ jobs:
           run-install: true
       - name: Build and test Python bindings
         run: pixi run test-python
+      # MCP tests need fastmcp, which conflicts with conda's importlib-metadata
+      # in the default env, so they run in the isolated `mcp` environment.
+      # Without this, tests/test_mcp.py silently import-skips (fastmcp absent).
+      - name: Build and test MCP server (isolated fastmcp env)
+        run: pixi run -e mcp test-mcp
 
   # ── Code coverage ──────────────────────────────────────────────────
   coverage:
