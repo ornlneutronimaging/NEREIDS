@@ -106,19 +106,33 @@ class ResonanceData:
 
     @property
     def n_resonances(self) -> int:
-        """Total number of resonances across all ranges and formalisms.
+        """Total number of discrete resonances across all evaluable ranges.
 
-        Formalism-aware: counts LRF=1/2/3 L-group resonances *and* LRF=7
-        R-matrix-limited spin-group resonances (which previously reported 0).
+        Counts LRF=1/2/3 L-group resonances only. LRF=7 (R-Matrix Limited)
+        and LRU=2 (URR) ranges are parsed-and-skipped — not evaluated — so
+        they contribute 0. A file with NO evaluable range at all fails to
+        load with a ValueError instead of reporting 0 here.
         """
         ...
 
     @property
     def total_resonance_count(self) -> int:
-        """Total resonance count across all ranges and formalisms.
+        """Total resonance count across all ranges.
 
-        Explicit alias for :attr:`n_resonances`; both delegate to the
-        formalism-aware Rust ``ResonanceData::total_resonance_count()``.
+        Explicit alias for :attr:`n_resonances`; both delegate to the Rust
+        ``ResonanceData::total_resonance_count()`` (skipped LRF=7 / LRU=2
+        ranges contribute 0).
+        """
+        ...
+
+    @property
+    def has_unevaluated_ranges(self) -> bool:
+        """Whether the evaluation carries parsed-but-not-evaluated ranges.
+
+        True when any range is a parse-and-skip placeholder (LRF=7 R-Matrix
+        Limited or LRU=2 URR). Those spans contribute zero cross-section; a
+        ``UserWarning`` listing them is emitted at load time by
+        :func:`load_endf` / :func:`load_endf_file`.
         """
         ...
 

@@ -263,16 +263,15 @@ class TestResonanceData:
                 formalism="bogus",
             )
 
-    def test_lrf7_n_resonances_zero_when_skipped(self):
-        """LRF=7 R-matrix-limited ranges are parsed-and-skipped, not evaluated.
+    def test_pure_lrf7_file_rejected_no_evaluable_ranges(self):
+        """A pure-LRF=7 evaluation is rejected at load, not silently zeroed.
 
         NEREIDS removed the LRF=7 cross-section physics (its closed-channel
         boundary condition was never implemented and it was never validated
-        against SAMMY), so an LRF=7 range now loads as a non-evaluable
-        placeholder with no discrete resonances. ``n_resonances`` therefore
-        reports 0 for a pure-LRF=7 evaluation — it is not evaluated, so there
-        is nothing to count. The file still loads (parse-and-skip keeps mixed
-        evaluations accessible).
+        against SAMMY), so LRF=7 ranges are parse-and-skip placeholders. A
+        file whose ONLY range is LRF=7 would produce zero cross-sections
+        everywhere (transmission = 1) — the parser now rejects it loudly
+        instead of loading it with ``n_resonances == 0``.
         """
         root = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
         fixture = os.path.join(
@@ -280,16 +279,40 @@ class TestResonanceData:
         )
         # The fixture is committed to the repo, so a missing file is a
         # packaging/path regression that MUST fail — not a skip that would
-        # silently disable this LRF=7 skip guard.
+        # silently disable this no-evaluable-content guard.
         assert os.path.exists(fixture), (
             f"vendored LRF=7 regression fixture must be present at {fixture} "
             "(committed test data)"
         )
 
-        data = nereids.load_endf_file(fixture)
-        assert data.n_resonances == 0, (
-            "LRF=7 ranges are skipped (not evaluated), so no resonances are counted"
+        with pytest.raises(ValueError, match="No evaluable resonance ranges"):
+            nereids.load_endf_file(fixture)
+
+    def test_mixed_evaluation_loads_with_unevaluated_range_warning(self):
+        """A mixed evaluation (resolved + URR) loads, warns, and is flagged.
+
+        U-238 (ENDF/B-VIII.0, SAMMY ex027) carries a resolved Reich-Moore
+        range plus an unresolved (LRU=2) range. The resolved range keeps the
+        file loadable; the skipped URR range must surface as a ``UserWarning``
+        at load time and as ``has_unevaluated_ranges == True``, because its
+        span contributes zero cross-section.
+        """
+        root = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+        fixture = os.path.join(
+            root, "crates/nereids-endf/tests/data/u238_ex027.endf"
         )
+        assert os.path.exists(fixture), (
+            f"vendored U-238 fixture must be present at {fixture} "
+            "(committed test data)"
+        )
+
+        with pytest.warns(UserWarning, match="parsed but NOT evaluated"):
+            data = nereids.load_endf_file(fixture)
+        assert data.has_unevaluated_ranges, (
+            "the skipped URR range must be flagged as unevaluated"
+        )
+        # The resolved Reich-Moore range is fully usable.
+        assert data.n_resonances > 500
         # Explicit alias must agree with n_resonances.
         assert data.total_resonance_count == data.n_resonances
 

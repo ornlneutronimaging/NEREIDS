@@ -105,8 +105,9 @@ fn build_aux_grid(
 /// Extract (energy_eV, gd_eV) pairs from resonance data for fine-structure
 /// grid densification.
 ///
-/// For LRF=1/2/3 (BW and Reich-Moore): `gd = |Γn| + |Γγ| + |Γf1| + |Γf2|`
-/// For LRF=7 (R-Matrix Limited): `gd = |Γγ| + Σ|γ_i|²` (approximate)
+/// For LRF=1/2/3 (BW and Reich-Moore): `gd = |Γn| + |Γγ| + |Γf1| + |Γf2|`,
+/// walked from each resolved range's `l_groups`. Non-evaluable ranges
+/// (LRF=7, LRU=2) carry empty `l_groups` and contribute no pairs.
 ///
 /// SAMMY Ref: dat/mdat4.f90 Fspken — uses total width to define the region
 /// [E_res − gd, E_res + gd] for fine-structure point insertion.

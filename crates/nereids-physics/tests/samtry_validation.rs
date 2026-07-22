@@ -2726,6 +2726,11 @@ fn test_tr129e_pu240_lfw1_lrf1_urr_skipped() {
         .find(|r| r.formalism == ResonanceFormalism::Unresolved)
         .expect("the URR (LRU=2) range must be present");
     assert!(!urr_range.resolved, "URR range must not be resolved");
+
+    // Mixed evaluation: the resolved MLBW range keeps the file loadable, and
+    // the skipped URR range must be flagged as unevaluated.
+    assert!(rd.has_unevaluated_ranges());
+    assert_eq!(rd.unevaluated_ranges().len(), 1);
 }
 
 #[test]

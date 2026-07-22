@@ -704,27 +704,22 @@ mod tests {
         );
     }
 
-    // Minimal valid ENDF MF=2/MT=151 fixture for W-184 — same shape as the
-    // krm3 fixture in parser.rs tests, kept inline so retrieval tests stay
-    // self-contained.
+    // Minimal valid ENDF MF=2/MT=151 fixture tagged W-184 (ZA=74184), kept
+    // inline so retrieval tests stay self-contained. These tests exercise
+    // install/zip/peek mechanics only, so the body is a synthetic evaluable
+    // MLBW (LRF=2) range — the real W-184 evaluation is LRF=7-only, which
+    // the parser now rejects as carrying no evaluable ranges, and a fixture
+    // that cannot parse would fail isotope extraction here.
+    // Layout: HEAD, isotope CONT (NER=1), range CONT (LRU=1/LRF=2),
+    // SPI/AP CONT (NLS=1), L CONT (L=0, NRS=1), one resonance LIST row
+    // [ER, AJ, GT, GN, GG, GF].
     const W184_FIXTURE: &str = concat!(
         " 7.418400+4 1.820000+2          0          0          1          07437 2151    1\n",
         " 7.418400+4 1.000000+0          0          0          1          07437 2151    2\n",
-        " 1.000000-5 1.000000+3          1          7          0          07437 2151    3\n",
-        " 0.000000+0 7.000000-1          0          3          1          07437 2151    4\n",
-        " 0.000000+0 0.000000+0          1          0         12          17437 2151    5\n",
-        " 1.000000+0 1.820000+2 0.000000+0 0.000000+0 5.000000-1 0.000000+07437 2151    6\n",
-        " 0.000000+0 1.000000+0 0.000000+0 2.000000+0 1.000000+0 1.000000+07437 2151    7\n",
-        " 5.000000-1 0.000000+0          0          0         12          27437 2151    8\n",
-        " 0.000000+0 0.000000+0 0.000000+0 0.000000+0 0.000000+0 0.000000+07437 2151    9\n",
-        " 1.000000+0 0.000000+0 5.000000-1 0.000000+0 7.000000-1 7.000000-17437 2151   10\n",
-        // Resonance LIST CONT: NRS=2 (L2), NPL=12 (N1=6*NX), NX=2 (N2);
-        // ENDF-6 §2.2.1.6 requires NX = NRS·ceil((NCH+1)/6), so NRS must
-        // equal NX whenever each resonance fits in a single packed row
-        // (NCH+1 ≤ 6 for KRM=2, NCH+2 ≤ 6 for KRM=3).
-        " 0.000000+0 0.000000+0          0          2         12          27437 2151   11\n",
-        " 1.000000+1 2.500000-2 1.000000-3 0.000000+0 0.000000+0 0.000000+07437 2151   12\n",
-        " 2.000000+1 3.000000-2 2.000000-3 0.000000+0 0.000000+0 0.000000+07437 2151   13\n",
+        " 1.000000-5 1.000000+3          1          2          0          07437 2151    3\n",
+        " 0.000000+0 7.000000-1          0          0          1          07437 2151    4\n",
+        " 1.820000+2 0.000000+0          0          0          6          17437 2151    5\n",
+        " 1.000000+1 5.000000-1 2.600000-2 1.000000-3 2.500000-2 0.000000+07437 2151    6\n",
     );
 
     fn write_zip_with_endf(zip_path: &Path, inner_name: &str, body: &str) -> std::io::Result<()> {

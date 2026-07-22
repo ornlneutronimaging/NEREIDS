@@ -79,7 +79,8 @@ struct PyResonanceData {
 impl PyResonanceData {
     /// String representation.
     fn __repr__(&self) -> String {
-        // Formalism-aware count (covers LRF=7 R-matrix-limited spin groups too).
+        // Discrete-resonance count over evaluable LRF=1/2/3 ranges; skipped
+        // LRF=7 / LRU=2 placeholder ranges contribute 0.
         let n_res: usize = self.inner.total_resonance_count();
         format!(
             "ResonanceData(Z={}, A={}, AWR={:.3}, n_resonances={})",
@@ -119,14 +120,26 @@ impl PyResonanceData {
         self.inner.total_resonance_count()
     }
 
-    /// Total resonance count across all ranges and formalisms.
+    /// Total resonance count across all ranges.
     ///
-    /// Explicit alias for [`Self::n_resonances`]; both delegate to the
-    /// formalism-aware Rust `ResonanceData::total_resonance_count()` (covers
-    /// LRF=1/2/3 L-groups and LRF=7 R-matrix-limited spin groups).
+    /// Explicit alias for [`Self::n_resonances`]; both delegate to the Rust
+    /// `ResonanceData::total_resonance_count()`, which counts LRF=1/2/3
+    /// L-group resonances only (skipped LRF=7 / LRU=2 ranges contribute 0).
     #[getter]
     fn total_resonance_count(&self) -> usize {
         self.inner.total_resonance_count()
+    }
+
+    /// Whether the evaluation carries parsed-but-not-evaluated ranges.
+    ///
+    /// `True` when any range is a parse-and-skip placeholder (LRF=7
+    /// R-Matrix Limited or LRU=2 URR). Those spans contribute zero
+    /// cross-section — a `UserWarning` listing them is emitted at load time
+    /// by `load_endf` / `load_endf_file`. Files with NO evaluable range at
+    /// all fail to load instead (ValueError).
+    #[getter]
+    fn has_unevaluated_ranges(&self) -> bool {
+        self.inner.has_unevaluated_ranges()
     }
 
     /// Target spin (I) of the first resonance range.
@@ -209,6 +222,44 @@ fn load_and_parse_endf(
     let data =
         parse_endf_file2(&contents).map_err(|e| (true, format!("ENDF parse error: {}", e)))?;
     Ok(data)
+}
+
+/// Emit a Python ``UserWarning`` when parsed ENDF data contains
+/// parse-and-skip placeholder ranges (LRF=7 R-Matrix Limited or LRU=2 URR).
+///
+/// Those spans contribute exactly zero cross-section, so any physics computed
+/// over them reflects only the evaluation's other ranges. The parser already
+/// hard-errors when NO range is evaluable; this warning covers the mixed case
+/// (e.g. Ta-181, U-238), where the file loads but part of its declared energy
+/// coverage is silently inert without this signal. Callers can catch, filter,
+/// or escalate it with the stdlib ``warnings`` module.
+///
+/// ``stacklevel=1`` attributes the warning to the frame that invoked the
+/// pyo3 function — extension functions execute inside the caller's Python
+/// frame, so level 1 is already the Python call site (same rationale as
+/// `emit_tiff_load_warnings`).
+fn warn_unevaluated_ranges(py: Python<'_>, data: &ResonanceData, origin: &str) -> PyResult<()> {
+    const WARN_STACKLEVEL: i32 = 1;
+    let skipped = data.unevaluated_ranges();
+    if skipped.is_empty() {
+        return Ok(());
+    }
+    let spans: Vec<String> = skipped.iter().map(|r| r.skip_description()).collect();
+    let msg = format!(
+        "{origin}: {} of {} resonance range(s) are parsed but NOT evaluated: {}. \
+         These spans contribute zero cross-section (transmission = 1); NEREIDS \
+         evaluates resolved LRF=1/2/3 ranges only.",
+        skipped.len(),
+        data.ranges.len(),
+        spans.join("; ")
+    );
+    let c_msg = std::ffi::CString::new(msg).map_err(|e| {
+        pyo3::exceptions::PyValueError::new_err(format!(
+            "internal ENDF-load warning message contained a NUL byte: {e}"
+        ))
+    })?;
+    let category = py.get_type::<pyo3::exceptions::PyUserWarning>();
+    PyErr::warn(py, category.as_any(), &c_msg, WARN_STACKLEVEL)
 }
 
 /// Python wrapper for isotope groups.
@@ -325,6 +376,17 @@ impl PyIsotopeGroup {
                 })
             })
             .collect::<PyResult<Vec<_>>>()?;
+        // Warn about skipped ranges BEFORE mutating self: a caller that
+        // escalates warnings to exceptions (warnings.simplefilter("error"))
+        // must not observe a partially-updated group.
+        for (i, data) in staged.iter().enumerate() {
+            let member = &self.inner.members()[i];
+            warn_unevaluated_ranges(
+                py,
+                data,
+                &format!("ENDF Z={} A={}", member.0.z(), member.0.a()),
+            )?;
+        }
         // All succeeded — swap in atomically.
         for (i, data) in staged.into_iter().enumerate() {
             self.resonance_data[i] = Some(data);
@@ -1804,6 +1866,8 @@ fn load_endf(
         )));
     }
 
+    warn_unevaluated_ranges(py, &data, &format!("ENDF Z={z} A={a}"))?;
+
     Ok(PyResonanceData {
         inner: Arc::new(data),
     })
@@ -1838,6 +1902,8 @@ fn load_endf_file(py: Python<'_>, path: &str) -> PyResult<PyResonanceData> {
             pyo3::exceptions::PyIOError::new_err(msg)
         }
     })?;
+
+    warn_unevaluated_ranges(py, &data, path)?;
 
     Ok(PyResonanceData {
         inner: Arc::new(data),

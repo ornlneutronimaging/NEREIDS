@@ -375,7 +375,9 @@ impl RExternalEntry {
 impl ResonanceData {
     /// Total number of resonances across all ranges and groups.
     ///
-    /// For LRF=7 ranges, counts resonances across all spin groups.
+    /// Counts the L-grouped resonances of evaluable LRF=1/2/3 ranges. LRF=7
+    /// (and LRU=2) ranges are parsed-and-skipped with empty `l_groups`, so
+    /// they contribute 0 — NEREIDS does not evaluate them.
     ///
     /// A low count for a given evaluation reflects that evaluation's
     /// resolved-resonance-region (RRR) extent, **not** a dropped energy range.
@@ -387,6 +389,25 @@ impl ResonanceData {
     /// in `parser.rs`, which pins the VIII.0 count as a regression guard.
     pub fn total_resonance_count(&self) -> usize {
         self.ranges.iter().map(|r| r.resonance_count()).sum()
+    }
+
+    /// Ranges that are parsed but NOT evaluated (non-evaluable placeholders).
+    ///
+    /// These are the LRF=7 (R-Matrix Limited) and LRU=2 (unresolved) ranges
+    /// that the parser consumes for cursor alignment only: they carry no
+    /// resonance parameters and contribute exactly zero to every
+    /// cross-section, so any physics computed over their energy span reflects
+    /// only the *other* ranges of the evaluation. Callers that surface data
+    /// to users should warn when this list is non-empty.
+    pub fn unevaluated_ranges(&self) -> Vec<&ResonanceRange> {
+        self.ranges.iter().filter(|r| !r.is_evaluable()).collect()
+    }
+
+    /// Whether any range is a non-evaluable parse-and-skip placeholder.
+    ///
+    /// See [`Self::unevaluated_ranges`].
+    pub fn has_unevaluated_ranges(&self) -> bool {
+        self.ranges.iter().any(|r| !r.is_evaluable())
     }
 }
 
@@ -416,6 +437,44 @@ impl ResonanceRange {
     /// contribute 0 — NEREIDS does not evaluate them.
     pub fn resonance_count(&self) -> usize {
         self.l_groups.iter().map(|lg| lg.resonances.len()).sum()
+    }
+
+    /// Can this range actually produce non-zero cross-sections?
+    ///
+    /// Evaluable means a resolved (LRU=1) range using one of the implemented
+    /// formalisms: SLBW (LRF=1), MLBW (LRF=2), or Reich-Moore (LRF=3).
+    /// LRF=7 (R-Matrix Limited) and LRU=2 (unresolved) ranges are
+    /// parse-and-skip placeholders — consumed for cursor alignment, never
+    /// evaluated — so they return `false` and contribute zero cross-section
+    /// over their energy span.
+    pub fn is_evaluable(&self) -> bool {
+        self.resolved
+            && matches!(
+                self.formalism,
+                ResonanceFormalism::SLBW
+                    | ResonanceFormalism::MLBW
+                    | ResonanceFormalism::ReichMoore
+            )
+    }
+
+    /// One-line diagnostic for a parse-and-skip placeholder range, e.g.
+    /// `"LRF=7 (R-Matrix Limited) over [1.000000e-5, 1.000000e3] eV"`.
+    ///
+    /// Shared by the parser's no-evaluable-content error, the Python-binding
+    /// `UserWarning`, and the GUI load log so all three surfaces describe a
+    /// skipped range identically. Only meaningful for ranges where
+    /// [`Self::is_evaluable`] is `false`; an evaluable range is labeled
+    /// `"non-evaluable"` defensively (callers never pass one).
+    pub fn skip_description(&self) -> String {
+        let kind = match self.formalism {
+            ResonanceFormalism::RMatrixLimited => "LRF=7 (R-Matrix Limited)",
+            ResonanceFormalism::Unresolved => "LRU=2 (URR)",
+            _ => "non-evaluable",
+        };
+        format!(
+            "{kind} over [{:.6e}, {:.6e}] eV",
+            self.energy_low, self.energy_high
+        )
     }
 }
 
@@ -735,12 +794,12 @@ pub mod test_support {
     //
     // The public fixtures below all build a single `ResonanceRange` with one
     // `LGroup` whose body varies only in well-defined ways.  The two private
-    // helpers below absorb the structural skeleton (resolved/rml/urr/ap_table/
+    // helpers below absorb the structural skeleton (resolved/ap_table/
     // r_external/qx/lrx/gfa/gfb) so each public helper carries only the
     // physically-meaningful parameters.
 
     /// One resolved `ResonanceRange` with a single L-group.  All "structural
-    /// invariants" (resolved, `rml`/`urr`/`ap_table`/`r_external`,
+    /// invariants" (resolved, `ap_table`/`r_external`,
     /// `qx`/`lrx`) get the minimal-fixture defaults.
     #[allow(clippy::too_many_arguments)]
     fn make_range(

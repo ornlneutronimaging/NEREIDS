@@ -135,10 +135,19 @@ pub fn parse_endf_file2(endf_text: &str) -> Result<ResonanceData, EndfParseError
                 // cursor. Reference: ENDF-6 §2.2.2.
                 let nro_urr = range_cont.n1; // energy-dependent scattering radius flag
                 let naps_urr = range_cont.n2; // scattering radius calculation flag
-                if nro_urr != 0 {
-                    // A TAB1 AP(E) record precedes the URR body; consume it.
-                    let _ = parse_tab1(&lines, &mut pos)?;
-                }
+                // A TAB1 AP(E) record precedes the URR body when NRO != 0.
+                // Store it (converted to fm) on the placeholder, mirroring the
+                // LRF=7 skip: the placeholder preserves everything the header
+                // carries even though the range is never evaluated.
+                let ap_table_urr = if nro_urr != 0 {
+                    let mut tab = parse_tab1(&lines, &mut pos)?;
+                    for pt in &mut tab.points {
+                        pt.1 *= ENDF_RADIUS_TO_FM;
+                    }
+                    Some(tab)
+                } else {
+                    None
+                };
 
                 // LRF is 1 or 2 for the URR (ENDF-6 §2.2.2). Anything else is an
                 // unsupported sub-format: skip its body without emitting a range.
@@ -149,21 +158,21 @@ pub fn parse_endf_file2(endf_text: &str) -> Result<ResonanceData, EndfParseError
 
                 // LFW=1/LRF=1 uses the "Case B" shared-energy-grid layout
                 // (ENDF-6 §2.2.2.1); LFW=1/LRF=2 is byte-identical to LFW=0/LRF=2.
-                if lfw != 0 && lrf == 1 {
-                    skip_urr_lfw1_lrf1(&lines, &mut pos)?;
+                let (spi_urr, ap_urr_fm) = if lfw != 0 && lrf == 1 {
+                    skip_urr_lfw1_lrf1(&lines, &mut pos)?
                 } else {
-                    skip_urr_range(&lines, &mut pos, lrf)?;
-                }
+                    skip_urr_range(&lines, &mut pos, lrf)?
+                };
 
                 all_ranges.push(ResonanceRange {
                     energy_low,
                     energy_high,
                     resolved: false,
                     formalism: ResonanceFormalism::Unresolved,
-                    target_spin: 0.0,
-                    scattering_radius: 0.0,
+                    target_spin: spi_urr,
+                    scattering_radius: ap_urr_fm,
                     naps: naps_urr,
-                    ap_table: None,
+                    ap_table: ap_table_urr,
                     l_groups: Vec::new(),
                     r_external: vec![],
                 });
@@ -300,6 +309,30 @@ pub fn parse_endf_file2(endf_text: &str) -> Result<ResonanceData, EndfParseError
              supported; split the file into single-material ENDF files."
                 .to_string(),
         ));
+    }
+
+    // Fail loudly when the evaluation carries NO evaluable content. A file
+    // whose every range is a parse-and-skip placeholder (LRF=7 or LRU=2)
+    // would otherwise "load" with zero resonances, return zero cross-sections
+    // everywhere, and produce transmission ≡ 1 with no signal to the caller.
+    // Files with at least one evaluable range still load: parse-and-skip
+    // exists for real mixed tapes (e.g. Ta-181, U-238, Pu-240) whose resolved
+    // ranges remain fully usable.
+    if !all_ranges.iter().any(|r| r.is_evaluable()) {
+        let detail = if all_ranges.is_empty() {
+            "the file carries no resonance-parameter ranges at all".to_string()
+        } else {
+            let skipped: Vec<String> = all_ranges.iter().map(|r| r.skip_description()).collect();
+            format!(
+                "every range in this file is a parse-and-skip placeholder: {}",
+                skipped.join("; ")
+            )
+        };
+        return Err(EndfParseError::UnsupportedFormat(format!(
+            "No evaluable resonance ranges: NEREIDS evaluates resolved LRF=1/2/3 \
+             (SLBW/MLBW/Reich-Moore) only, and {detail}. Cross-sections would be \
+             identically zero (transmission = 1) over the full energy grid."
+        )));
     }
 
     Ok(ResonanceData {
@@ -1043,16 +1076,21 @@ fn parse_endf_int(line: &str, field_index: usize) -> Result<i32, EndfParseError>
 /// per-(L,J) LIST record. NEREIDS does not evaluate URR cross sections, so the
 /// parameter values are discarded; only the record structure is read, which is
 /// what keeps the line stream aligned for any following range or SEND record.
+/// Returns the header's `(SPI, AP)` — AP converted to fm — so the caller can
+/// preserve them on the placeholder range.
 ///
 /// The per-J control line (carrying `N1 = NE+6`) MUST be consumed before its
 /// body — omitting it misaligns the stream by one record per J-group. The
 /// `N1 = NE+6` guard is preserved to catch malformed records.
 ///
-/// Reference: ENDF-6 §2.2.2.1 Case B; SCALE/openScale `File2.cpp`
-/// (`lfw==1 && lrf==1` branch); SAMMY `File2Unres.f90`.
-fn skip_urr_lfw1_lrf1(lines: &[&str], pos: &mut usize) -> Result<(), EndfParseError> {
+/// Reference: ENDF-6 §2.2.2.1 Case B; OpenScale `File2.cpp`
+/// (`lfw==1 && lrf==1` branch) and AMPX `File2Unres.f90` — both OpenScale/AMPX
+/// readers vendored under SAMMY's external tree, not SAMMY proper.
+fn skip_urr_lfw1_lrf1(lines: &[&str], pos: &mut usize) -> Result<(f64, f64), EndfParseError> {
     // CONT: SPI, AP, LSSF, 0, NE, NLS
     let header = parse_cont(lines, pos)?;
+    let spi = header.c1;
+    let ap_fm = header.c2 * ENDF_RADIUS_TO_FM;
     let ne = checked_count(header.n1, "NE")?;
     let nls = checked_count(header.n2, "NLS")?;
 
@@ -1063,6 +1101,17 @@ fn skip_urr_lfw1_lrf1(lines: &[&str], pos: &mut usize) -> Result<(), EndfParseEr
         // CONT: AWRI, 0, L, 0, NJS, 0
         let l_cont = parse_cont(lines, pos)?;
         let njs = checked_count(l_cont.n1, "NJS")?;
+
+        // Zero NJS means no J-groups for this L-value, which is malformed
+        // (ENDF §2.2.2.1 requires at least one J-group per L-group) and would
+        // under-consume the body, surfacing as a confusing downstream error.
+        // Mirrors the NJS=0 guards in `skip_urr_range`.
+        if njs == 0 {
+            return Err(EndfParseError::UnsupportedFormat(format!(
+                "URR LFW=1/LRF=1 L={}: NJS=0 (at least one J-group required)",
+                l_cont.l1
+            )));
+        }
 
         for _ in 0..njs {
             // Per-J LIST control: 0.0, 0.0, L, MUF, NE+6, 0.  Consuming this
@@ -1081,14 +1130,15 @@ fn skip_urr_lfw1_lrf1(lines: &[&str], pos: &mut usize) -> Result<(), EndfParseEr
         }
     }
 
-    Ok(())
+    Ok((spi, ap_fm))
 }
 
 /// Consume (skip) a URR (LRU=2) range body of the given LRF, advancing the line
 /// cursor past every L- and (L,J)-record. NEREIDS does not evaluate URR cross
 /// sections, so the parameter values are discarded; only the record structure
 /// is read, which keeps the line stream aligned for any following range or SEND
-/// record.
+/// record. Returns the header's `(SPI, AP)` — AP converted to fm — so the
+/// caller can preserve them on the placeholder range.
 ///
 /// Handles LFW=0/LRF=1 (energy-independent widths) and LRF=2 (tabulated
 /// widths); LFW=1/LRF=2 is byte-identical to LFW=0/LRF=2 and routes here too.
@@ -1099,9 +1149,11 @@ fn skip_urr_lfw1_lrf1(lines: &[&str], pos: &mut usize) -> Result<(), EndfParseEr
 /// otherwise over-/under-consume lines and misalign the cursor.
 ///
 /// Reference: ENDF-6 Formats Manual §2.2.2
-fn skip_urr_range(lines: &[&str], pos: &mut usize, lrf: i32) -> Result<(), EndfParseError> {
+fn skip_urr_range(lines: &[&str], pos: &mut usize, lrf: i32) -> Result<(f64, f64), EndfParseError> {
     // CONT: SPI, AP, 0, 0, NLS, 0
     let spi_cont = parse_cont(lines, pos)?;
+    let spi = spi_cont.c1;
+    let ap_fm = spi_cont.c2 * ENDF_RADIUS_TO_FM;
     let nls = checked_count(spi_cont.n1, "NLS")?;
 
     if lrf == 1 {
@@ -1178,7 +1230,7 @@ fn skip_urr_range(lines: &[&str], pos: &mut usize, lrf: i32) -> Result<(), EndfP
         }
     }
 
-    Ok(())
+    Ok((spi, ap_fm))
 }
 
 /// Parse a TAB1 record into a `Tab1` interpolation table.
@@ -1549,71 +1601,91 @@ mod tests {
             0,
             "URR range carries no discrete resonances"
         );
-    }
 
-    /// A valid KRM=3 LRF=7 range is parsed-and-skipped: it loads as a bare
-    /// RMatrixLimited range (NEREIDS does not evaluate LRF=7). The fixture is a
-    /// minimal but fully valid ENDF MF=2/MT=151 block (1 isotope, 1 range,
-    /// LRF=7, KRM=3, 1 particle pair, 1 spin group, 2 resonances, NCH=1); its
-    /// end-to-end parse exercises the KRM=3 stride (NCH+2) in the skip's
-    /// resonance-block consumption.
-    #[test]
-    fn test_lrf7_krm3_skipped() {
-        const ENDF: &str =
-            include_str!("../../../tests/data/synthetic/lrf7_krm3_resonance_column_order.endf");
-
-        let data = parse_endf_file2(ENDF).expect("fixture must parse without error");
-        assert_eq!(data.ranges.len(), 1, "one LRF=7 range");
-        let range = &data.ranges[0];
-        assert_eq!(range.formalism, ResonanceFormalism::RMatrixLimited);
-        assert!(range.resolved, "LRF=7 is a resolved (LRU=1) range");
+        // Mixed evaluation: the resolved MLBW range keeps the file loadable,
+        // and the skipped URR range must be flagged as unevaluated so callers
+        // can warn that its span contributes zero cross-section.
+        assert!(
+            data.has_unevaluated_ranges(),
+            "Ta-181's URR range must be flagged as unevaluated"
+        );
         assert_eq!(
-            range.resonance_count(),
-            0,
-            "LRF=7 is skipped, not evaluated: no discrete resonances counted"
+            data.unevaluated_ranges().len(),
+            1,
+            "exactly the URR range is unevaluated"
         );
     }
 
-    /// LRF=7 resonances are NOT counted by `total_resonance_count()`.
+    /// Assert that a fixture whose every range is a parse-and-skip placeholder
+    /// is rejected with the no-evaluable-ranges error.
     ///
-    /// R-matrix-limited (LRF=7) ranges are parsed-and-skipped: NEREIDS does not
-    /// evaluate them, so they carry no `l_groups` and contribute 0 to the
-    /// discrete-resonance count. The PyO3 `n_resonances` getter delegates to
-    /// this accessor, so it too reports 0 for a pure-LRF=7 evaluation.
+    /// This still pins cursor advancement: a misaligned skip surfaces as a
+    /// *different* error (multi-material guard, unexpected EOF, or a
+    /// structural-guard message), not this one — so reaching this specific
+    /// message proves the skip consumed exactly the range body.
+    #[track_caller]
+    fn assert_rejected_no_evaluable_ranges(endf: &str) {
+        let err = parse_endf_file2(endf).unwrap_err();
+        match err {
+            EndfParseError::UnsupportedFormat(ref msg) => {
+                assert!(
+                    msg.contains("No evaluable resonance ranges"),
+                    "expected no-evaluable-ranges rejection, got: {msg}"
+                );
+            }
+            other => panic!("expected UnsupportedFormat, got: {other:?}"),
+        }
+    }
+
+    /// A valid KRM=3 LRF=7 range is parsed-and-skipped, and because it is the
+    /// file's ONLY range the parse is rejected with the no-evaluable-ranges
+    /// error (a pure-LRF=7 evaluation would yield zero cross-sections
+    /// everywhere). The fixture is a minimal but fully valid ENDF MF=2/MT=151
+    /// block (1 isotope, 1 range, LRF=7, KRM=3, 1 particle pair, 1 spin group,
+    /// 2 resonances, NCH=1); reaching the no-evaluable-ranges error (rather
+    /// than a misalignment error) exercises the KRM=3 stride (NCH+2) in the
+    /// skip's resonance-block consumption.
     #[test]
-    fn test_lrf7_skipped_not_counted() {
+    fn test_lrf7_krm3_rejected_no_evaluable_ranges() {
         const ENDF: &str =
             include_str!("../../../tests/data/synthetic/lrf7_krm3_resonance_column_order.endf");
-        let data = parse_endf_file2(ENDF).expect("fixture must parse without error");
-        assert_eq!(
-            data.total_resonance_count(),
-            0,
-            "LRF=7 ranges are skipped (not evaluated), so no resonances are counted"
+        assert_rejected_no_evaluable_ranges(ENDF);
+    }
+
+    /// The no-evaluable-ranges rejection must NAME each skipped range's
+    /// formalism and energy span so the user can see exactly what was in the
+    /// file and why it cannot be evaluated.
+    #[test]
+    fn test_lrf7_rejection_names_formalism_and_span() {
+        const ENDF: &str =
+            include_str!("../../../tests/data/synthetic/lrf7_krm3_resonance_column_order.endf");
+        let err = parse_endf_file2(ENDF).unwrap_err();
+        let msg = err.to_string();
+        assert!(
+            msg.contains("LRF=7 (R-Matrix Limited)"),
+            "rejection must name the skipped formalism, got: {msg}"
+        );
+        assert!(
+            msg.contains("eV"),
+            "rejection must state the skipped energy span, got: {msg}"
+        );
+        assert!(
+            msg.contains("LRF=1/2/3"),
+            "rejection must state what NEREIDS evaluates, got: {msg}"
         );
     }
 
     /// A KRM=2 LRF=7 range with an explicit photon capture channel (IPP=2,
-    /// MA=0, MT=102) is parsed-and-skipped. The massless PNT=0 photon pair
-    /// passes the particle-pair guards and the two-channel spin group passes the
-    /// IPP-range and stride guards, so the fixture loads as a bare
-    /// RMatrixLimited range.
+    /// MA=0, MT=102) passes every particle-pair, IPP-range, and stride guard
+    /// during the skip — then the file is rejected because the LRF=7 range is
+    /// its only range (no evaluable content).
     #[test]
-    fn test_lrf7_krm2_photon_channel_skipped() {
+    fn test_lrf7_krm2_photon_channel_rejected_no_evaluable_ranges() {
         // Two particle pairs: pair 1 = n+W184 (MT=2), pair 2 = γ+W185 (MT=102, MA=0);
         // one spin group with 2 channels (elastic + photon); one resonance.
         const ENDF: &str =
             include_str!("../../../tests/data/synthetic/lrf7_krm2_explicit_photon_channel.endf");
-
-        let data = parse_endf_file2(ENDF).expect("KRM=2 photon channel must parse without error");
-        assert_eq!(data.ranges.len(), 1, "one LRF=7 range");
-        let range = &data.ranges[0];
-        assert_eq!(range.formalism, ResonanceFormalism::RMatrixLimited);
-        assert!(range.resolved, "LRF=7 is a resolved (LRU=1) range");
-        assert_eq!(
-            range.resonance_count(),
-            0,
-            "LRF=7 is skipped, not evaluated"
-        );
+        assert_rejected_no_evaluable_ranges(ENDF);
     }
 
     /// Parse a minimal hand-crafted ENDF snippet with NRO=1 (energy-dependent
@@ -1749,6 +1821,11 @@ mod tests {
             .find(|r| r.formalism == ResonanceFormalism::Unresolved)
             .expect("URR range must exist");
         assert!(!urr_range.resolved, "URR range must not be resolved");
+
+        // Mixed evaluation: the resolved range keeps the file loadable, and
+        // the skipped URR range must be flagged as unevaluated.
+        assert!(data.has_unevaluated_ranges());
+        assert_eq!(data.unevaluated_ranges().len(), 1);
     }
 
     /// Hand-crafted LRF=1 URR roundtrip test.
@@ -1787,31 +1864,29 @@ mod tests {
         // The LRF=1 URR body is parsed-and-skipped; the range is present as
         // Unresolved (asserted above). ranges.len()==2 confirms the skip
         // consumed exactly the URR body and left the line stream aligned.
+
+        // Mixed evaluation: the resolved range keeps the file loadable, and
+        // the skipped URR range must be flagged as unevaluated.
+        assert!(data.has_unevaluated_ranges());
+        assert_eq!(data.unevaluated_ranges().len(), 1);
     }
 
-    /// An LRF=2 URR range with INT=3 (log-x/lin-y) is skipped without error.
-    ///
-    /// INT=3 is a valid ENDF interpolation code (§0.5: INT∈1..=5). The URR
-    /// skip's per-J INT guard must accept the full 1..=5 set — a stricter
-    /// guard would spuriously reject valid evaluations. (URR cross sections
-    /// are not evaluated; the range is consumed and tagged Unresolved.)
+    /// An LRF=2 URR range with INT=3 (log-x/lin-y) passes the per-J INT guard
+    /// (§0.5: INT∈1..=5 — a stricter guard would spuriously reject valid
+    /// evaluations), then the file is rejected because the URR range is its
+    /// only range (no evaluable content).
     #[test]
-    fn test_parse_lrf2_urr_int3_skipped() {
+    fn test_parse_lrf2_urr_int3_rejected_no_evaluable_ranges() {
         // Minimal ENDF MF=2/MT=151 with one LRU=2/LRF=2 range:
         // NLS=1 (L=0), NJS=1, NE=2 energy points, INT=3 (log-x/lin-y).
         // LIST layout: row 0 = [0, 0, 0, AMUN, 0, AMUF]; rows 1..=NE = (E,
         // D, GX, GN, GG, GF). Total = 6*(NE+1) = 18 floats = 3 lines.
+        // Reaching the no-evaluable-ranges error (not an INT rejection or a
+        // misalignment error) proves the INT=3 guard accepted the record and
+        // the skip consumed exactly the URR body.
         const ENDF: &str =
             include_str!("../../../tests/data/synthetic/lrf2_urr_int3_roundtrip.endf");
-
-        let data = parse_endf_file2(ENDF).expect("LRF=2 URR with INT=3 must parse");
-        assert_eq!(data.ranges.len(), 1, "must have one URR range");
-        // INT=3 is a valid interpolation code (ENDF §0.5: INT∈1..=5), so the
-        // skip's per-J INT guard accepts it and consumes the LIST body. The
-        // range is present as a non-resolved Unresolved range.
-        let range = &data.ranges[0];
-        assert_eq!(range.formalism, ResonanceFormalism::Unresolved);
-        assert!(!range.resolved, "URR range must not be resolved");
+        assert_rejected_no_evaluable_ranges(ENDF);
     }
 
     /// LRF=2 URR with INT=0 is rejected as a hard error.
@@ -1978,31 +2053,17 @@ mod tests {
     ///
     /// The fixture has NE=2, NLS=1, NJS=1, MUF=1.
     #[test]
-    fn test_lfw1_lrf1_urr_skipped_cursor_aligned() {
+    fn test_lfw1_lrf1_urr_rejected_no_evaluable_ranges() {
         const ENDF: &str =
             include_str!("../../../tests/data/synthetic/lfw1_urr_gracefully_skipped.endf");
 
-        let data = parse_endf_file2(ENDF).expect("LFW=1 URR parse should succeed");
         // The Case-B URR body is parsed-and-skipped; consuming the per-J
-        // control line (N1=NE+6) keeps the stream aligned, so the file parses
-        // end-to-end and the URR range appears as a non-resolved Unresolved
-        // range. (Omitting the control read would misalign the stream and trip
-        // the multi-material guard — see the fixture note above.)
-        let urr_count = data
-            .ranges
-            .iter()
-            .filter(|r| r.formalism == ResonanceFormalism::Unresolved)
-            .count();
-        assert_eq!(
-            urr_count, 1,
-            "LFW=1/LRF=1 URR range must be present (skipped)"
-        );
-        let urr_range = data
-            .ranges
-            .iter()
-            .find(|r| r.formalism == ResonanceFormalism::Unresolved)
-            .expect("URR range must exist");
-        assert!(!urr_range.resolved, "URR range must not be resolved");
+        // control line (N1=NE+6) keeps the stream aligned. The fixture's only
+        // range is the URR, so the aligned parse then hits the
+        // no-evaluable-ranges rejection — a misaligned skip would instead trip
+        // the multi-material guard or EOF (see the fixture note above), so
+        // reaching this specific error pins the cursor advancement.
+        assert_rejected_no_evaluable_ranges(ENDF);
     }
 
     /// A per-J LIST control whose `N1 != NE+6` is a malformed Case-B record.
@@ -2135,17 +2196,12 @@ mod tests {
         const ENDF: &str =
             include_str!("../../../tests/data/synthetic/lrf7_l2_holds_nrs_with_nx_neq_nrs.endf");
 
-        let data = parse_endf_file2(ENDF).expect(
-            "LRF=7 fixture with NX != NRS must parse without error after the NRS-from-L2 fix",
-        );
-        let range = &data.ranges[0];
-        assert_eq!(range.formalism, ResonanceFormalism::RMatrixLimited);
-        assert_eq!(
-            range.resonance_count(),
-            0,
-            "wide-spin-group LRF=7 is skipped: reading NRS from L2 keeps the \
-             stride guard satisfied so the range parses instead of erroring"
-        );
+        // Reading NRS from L2 keeps the stride guard satisfied, so the skip
+        // consumes the wide-spin-group range cleanly and the parse reaches the
+        // no-evaluable-ranges rejection (the LRF=7 range is the file's only
+        // range) instead of the misleading "stride too small" error the
+        // NRS-from-N2 misread would produce.
+        assert_rejected_no_evaluable_ranges(ENDF);
     }
 
     /// LRF=7 spin group with nonzero KBK (R-external background) is rejected.
@@ -2372,19 +2428,16 @@ mod tests {
     /// `if nrs == 0 && nx != 1 { reject }` accepts it while still rejecting
     /// malformed shapes such as NRS=0/NX=2.
     #[test]
-    fn test_parse_lrf7_accepts_nrs_zero_nx_one_canonical_empty() {
+    fn test_parse_lrf7_nrs_zero_nx_one_canonical_empty_passes_guard() {
         const ENDF: &str =
             include_str!("../../../tests/data/synthetic/lrf7_nrs_zero_nx_one_canonical_empty.endf");
 
-        let data = parse_endf_file2(ENDF)
-            .expect("LRF=7 fixture with NRS=0/NX=1 canonical empty spin group must parse cleanly");
-        let range = &data.ranges[0];
-        assert_eq!(range.formalism, ResonanceFormalism::RMatrixLimited);
-        assert_eq!(
-            range.resonance_count(),
-            0,
-            "canonical empty spin group (NRS=0/NX=1) parses and carries no resonances"
-        );
+        // The canonical empty spin group (NRS=0/NX=1) passes the relaxed
+        // guard, so the skip consumes the range cleanly and the parse reaches
+        // the no-evaluable-ranges rejection (the LRF=7 range is the file's
+        // only range) rather than the NRS=0/NX guard error a stricter check
+        // would raise.
+        assert_rejected_no_evaluable_ranges(ENDF);
     }
 
     /// LRF=7 spin group with NRS=0 but NX≠1 is rejected as malformed.
