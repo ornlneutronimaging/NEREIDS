@@ -477,11 +477,30 @@ def _fit_energy_range(value: Any) -> tuple[float, float] | None:
     return (float(value[0]), float(value[1]))
 
 
+# Fit keys removed together with the dead alpha_1/alpha_2 counts-fit
+# parameters. The fit config is whitelist-filtered, so without this check a
+# legacy manifest naming them would silently run with defaults instead.
+_REMOVED_FIT_KEYS = frozenset(
+    {"fit_alpha_1", "fit_alpha_2", "alpha_1_init", "alpha_2_init"}
+)
+
+
+def _reject_removed_fit_keys(fit_config: dict[str, Any]) -> None:
+    """Raise on fit-config keys that were removed from the API entirely."""
+    removed = sorted(_REMOVED_FIT_KEYS & fit_config.keys())
+    if removed:
+        raise ValueError(
+            f"fit config uses removed key(s) {removed}: the alpha_1/alpha_2 "
+            "counts-fit parameters were removed and are no longer supported"
+        )
+
+
 def _single_fit_kwargs(
     fit_config: dict[str, Any],
     resolution: dict[str, Any],
     counts: bool,
 ) -> dict[str, Any]:
+    _reject_removed_fit_keys(fit_config)
     keys = {
         "temperature_k",
         "fit_temperature",
@@ -515,6 +534,7 @@ def _spatial_fit_kwargs(
     fit_config: dict[str, Any],
     resolution: dict[str, Any],
 ) -> dict[str, Any]:
+    _reject_removed_fit_keys(fit_config)
     keys = {
         "temperature_k",
         "fit_temperature",
