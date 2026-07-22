@@ -400,8 +400,9 @@ impl ResonanceData {
 
     /// Ranges that are parsed but NOT evaluated (non-evaluable placeholders).
     ///
-    /// These are the LRF=7 (R-Matrix Limited) and LRU=2 (unresolved) ranges
-    /// that the parser consumes for cursor alignment only: they carry no
+    /// These are the LRF=7 (R-Matrix Limited), LRU=2 (unresolved), and LRU=0
+    /// (scattering-radius-only) ranges that the parser consumes for cursor
+    /// alignment only: they carry no
     /// resonance parameters and contribute exactly zero to every
     /// cross-section, so any physics computed over their energy span reflects
     /// only the *other* ranges of the evaluation. Callers that surface data
@@ -462,10 +463,10 @@ impl ResonanceRange {
     ///
     /// Evaluable means a resolved (LRU=1) range using one of the implemented
     /// formalisms: SLBW (LRF=1), MLBW (LRF=2), or Reich-Moore (LRF=3).
-    /// LRF=7 (R-Matrix Limited) and LRU=2 (unresolved) ranges are
-    /// parse-and-skip placeholders — consumed for cursor alignment, never
-    /// evaluated — so they return `false` and contribute zero cross-section
-    /// over their energy span.
+    /// LRF=7 (R-Matrix Limited), LRU=2 (unresolved), and LRU=0
+    /// (scattering-radius-only) ranges are parse-and-skip placeholders —
+    /// consumed for cursor alignment, never evaluated — so they return `false`
+    /// and contribute zero cross-section over their energy span.
     pub fn is_evaluable(&self) -> bool {
         self.resolved
             && matches!(

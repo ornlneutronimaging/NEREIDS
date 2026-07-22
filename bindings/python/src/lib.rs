@@ -133,7 +133,8 @@ impl PyResonanceData {
     /// Whether the evaluation carries parsed-but-not-evaluated ranges.
     ///
     /// `True` when any range is a parse-and-skip placeholder (LRF=7
-    /// R-Matrix Limited or LRU=2 URR). Those spans contribute zero
+    /// R-Matrix Limited, LRU=2 URR, or LRU=0 scattering-radius-only). Those
+    /// spans contribute zero
     /// cross-section — a `UserWarning` listing them is emitted at load time
     /// by `load_endf` / `load_endf_file`. Files with NO evaluable range at
     /// all fail to load instead (ValueError).
