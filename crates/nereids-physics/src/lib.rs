@@ -6,7 +6,6 @@
 //! ## Modules
 //! - [`auxiliary_grid`] — Auxiliary energy-grid construction for resolution broadening
 //! - [`channel`] — Wave number, ρ parameter, statistical weight calculations
-//! - [`coulomb`] — Coulomb wave functions (Steed's CF1+CF2) for charged-particle channels
 //! - [`doppler`] — Free Gas Model Doppler broadening
 //! - [`penetrability`] — Hard-sphere penetrability, shift, and phase shift functions
 //! - [`reich_moore`] — Reich-Moore R-matrix cross-section formalism
@@ -18,7 +17,6 @@
 //! ## SAMMY Reference
 //! - Cross-sections: `rml/` (Reich-Moore), `mlb/` (SLBW/MLBW), manual Sec. II
 //! - Penetrability: `rml/mrml07.f` (Pgh, Sinsix, Pf)
-//! - Coulomb: `coulomb/mrml08.f90` (Coulfg, Steed's CF1+CF2)
 //! - Doppler: `fgm/` module (Dopfgm), manual Sec. III.B.1
 //! - Resolution: `convolution/` module, manual Sec. III.C
 //! - Transmission: `cro/`, `xxx/` modules, manual Sec. II; transmission
@@ -26,7 +24,6 @@
 
 pub mod auxiliary_grid;
 pub mod channel;
-pub mod coulomb;
 pub mod doppler;
 pub mod ikeda_carpenter;
 pub mod penetrability;
