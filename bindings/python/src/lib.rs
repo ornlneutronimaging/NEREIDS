@@ -242,7 +242,8 @@ fn load_and_parse_endf(
 }
 
 /// Emit a Python ``UserWarning`` when parsed ENDF data contains
-/// parse-and-skip placeholder ranges (LRF=7 R-Matrix Limited or LRU=2 URR).
+/// parse-and-skip placeholder ranges (LRF=7 R-Matrix Limited, LRU=2 URR, or
+/// LRU=0 scattering-radius-only).
 ///
 /// Those spans contribute exactly zero cross-section, so any physics computed
 /// over them reflects only the evaluation's other ranges. The parser already
