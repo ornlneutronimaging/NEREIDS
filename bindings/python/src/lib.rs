@@ -142,6 +142,22 @@ impl PyResonanceData {
         self.inner.has_unevaluated_ranges()
     }
 
+    /// One-line descriptions of the parse-and-skip placeholder ranges.
+    ///
+    /// One string per non-evaluable range (LRF=7 R-Matrix Limited, LRU=2 URR,
+    /// or LRU=0 scattering-radius-only), formatted by the shared Rust
+    /// `ResonanceRange::skip_description` — the same text used in the load-time
+    /// `UserWarning` and the parser's rejection message. Empty when
+    /// [`Self::has_unevaluated_ranges`] is `False`.
+    #[getter]
+    fn skipped_ranges(&self) -> Vec<String> {
+        self.inner
+            .unevaluated_ranges()
+            .iter()
+            .map(|r| r.skip_description())
+            .collect()
+    }
+
     /// Target spin (I) of the first resonance range.
     #[getter]
     fn target_spin(&self) -> f64 {
