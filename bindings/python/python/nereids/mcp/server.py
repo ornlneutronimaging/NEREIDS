@@ -1222,7 +1222,9 @@ def load_endf(
 
     Returns:
         Summary dict with keys: isotope, z, a, n_resonances, scattering_radius,
-        target_spin, l_values.
+        target_spin, l_values, has_unevaluated_ranges. When
+        has_unevaluated_ranges is True (mixed evaluations, e.g. U-238), a
+        skipped_ranges list of the parsed-but-not-evaluated spans is included.
     """
     parsed = nereids.parse_isotope_str(isotope)
     if parsed is None:
@@ -1231,7 +1233,7 @@ def load_endf(
     data = nereids.load_endf(z, a, library=library)
     key = _isotope_key(z, a)
     _registry[key] = data
-    return {
+    result = {
         "isotope": key,
         "z": data.z,
         "a": data.a,
@@ -1239,7 +1241,11 @@ def load_endf(
         "scattering_radius": data.scattering_radius,
         "target_spin": data.target_spin,
         "l_values": data.l_values,
+        "has_unevaluated_ranges": data.has_unevaluated_ranges,
     }
+    if data.has_unevaluated_ranges:
+        result["skipped_ranges"] = data.skipped_ranges
+    return result
 
 
 @mcp.tool()
@@ -1251,12 +1257,14 @@ def get_resonance_parameters(isotope: str) -> dict:
 
     Returns:
         Dict with keys: isotope, z, a, awr, target_spin, scattering_radius,
-        n_resonances, l_values.
+        n_resonances, l_values, has_unevaluated_ranges. When
+        has_unevaluated_ranges is True, a skipped_ranges list of the
+        parsed-but-not-evaluated spans is included.
     """
     data = _registry.get(isotope)
     if data is None:
         raise ValueError(f"Isotope {isotope!r} not loaded. Call load_endf first.")
-    return {
+    result = {
         "isotope": isotope,
         "z": data.z,
         "a": data.a,
@@ -1265,7 +1273,11 @@ def get_resonance_parameters(isotope: str) -> dict:
         "scattering_radius": data.scattering_radius,
         "n_resonances": data.n_resonances,
         "l_values": data.l_values,
+        "has_unevaluated_ranges": data.has_unevaluated_ranges,
     }
+    if data.has_unevaluated_ranges:
+        result["skipped_ranges"] = data.skipped_ranges
+    return result
 
 
 @mcp.tool()

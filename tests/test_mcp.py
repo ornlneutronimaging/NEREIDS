@@ -98,8 +98,30 @@ class TestLoadEndf:
     def test_return_structure(self):
         result = load_endf(isotope="Fe-56")
         for key in ("isotope", "z", "a", "n_resonances", "scattering_radius",
-                     "target_spin", "l_values"):
+                     "target_spin", "l_values", "has_unevaluated_ranges"):
             assert key in result, f"Missing key: {key}"
+
+    def test_pure_lrf7_isotope_rejected(self):
+        """W-182 (pure LRF=7 + URR) has no evaluable range and must be rejected.
+
+        The branch removed LRF=7/URR evaluation; a file whose every range is a
+        parse-and-skip placeholder fails to load with a ValueError rather than
+        loading as a silent zero-cross-section isotope.
+        """
+        with pytest.raises(ValueError, match="No evaluable resonance ranges"):
+            load_endf(isotope="W-182")
+
+    def test_mixed_evaluation_reports_skipped_ranges(self):
+        """A mixed evaluation (U-238: resolved RM + URR) flags its skipped span.
+
+        The URR range is parsed-and-skipped, so load_endf must set
+        has_unevaluated_ranges and list the skipped URR span in skipped_ranges.
+        """
+        result = load_endf(isotope="U-238")
+        assert result["has_unevaluated_ranges"] is True
+        assert isinstance(result["skipped_ranges"], list)
+        assert result["skipped_ranges"], "skipped_ranges must be non-empty"
+        assert any("LRU=2" in span for span in result["skipped_ranges"])
 
 
 # ---------------------------------------------------------------------------
@@ -118,6 +140,12 @@ class TestGetResonanceParameters:
     def test_not_loaded(self):
         with pytest.raises(ValueError, match="not loaded"):
             get_resonance_parameters(isotope="U-238")
+
+    def test_reports_unevaluated_ranges(self):
+        load_endf(isotope="U-238")
+        result = get_resonance_parameters(isotope="U-238")
+        assert result["has_unevaluated_ranges"] is True
+        assert any("LRU=2" in span for span in result["skipped_ranges"])
 
 
 # ---------------------------------------------------------------------------
@@ -213,13 +241,15 @@ class TestForwardModel:
 
 
 class TestDetectIsotopes:
+    # Ta-181 is a mixed evaluation (resolved Reich-Moore + URR) that loads;
+    # W-182 (pure LRF=7 + URR) is now rejected at load, so it cannot be a trace.
     def test_basic(self):
         load_endf(isotope="Fe-56")
-        load_endf(isotope="W-182")
+        load_endf(isotope="Ta-181")
         result = detect_isotopes(
             matrix_isotope="Fe-56",
             matrix_density=0.01,
-            trace_isotopes=["W-182"],
+            trace_isotopes=["Ta-181"],
             trace_ppm=1000.0,
             energy_min=1.0, energy_max=100.0, n_points=200,
             i0=1e6,
@@ -237,7 +267,7 @@ class TestDetectIsotopes:
             detect_isotopes(
                 matrix_isotope="Fe-56",
                 matrix_density=0.01,
-                trace_isotopes=["W-182"],
+                trace_isotopes=["Ta-181"],
             )
 
     def test_trace_not_loaded(self):
@@ -246,7 +276,7 @@ class TestDetectIsotopes:
             detect_isotopes(
                 matrix_isotope="Fe-56",
                 matrix_density=0.01,
-                trace_isotopes=["W-182"],
+                trace_isotopes=["Ta-181"],
             )
 
 

@@ -130,9 +130,19 @@ class ResonanceData:
         """Whether the evaluation carries parsed-but-not-evaluated ranges.
 
         True when any range is a parse-and-skip placeholder (LRF=7 R-Matrix
-        Limited or LRU=2 URR). Those spans contribute zero cross-section; a
-        ``UserWarning`` listing them is emitted at load time by
-        :func:`load_endf` / :func:`load_endf_file`.
+        Limited, LRU=2 URR, or LRU=0 scattering-radius-only). Those spans
+        contribute zero cross-section; a ``UserWarning`` listing them is
+        emitted at load time by :func:`load_endf` / :func:`load_endf_file`.
+        """
+        ...
+
+    @property
+    def skipped_ranges(self) -> list[str]:
+        """One-line descriptions of the parse-and-skip placeholder ranges.
+
+        One string per non-evaluable range (LRF=7, LRU=2, or LRU=0), using the
+        same text as the load-time ``UserWarning`` and the parser's rejection
+        message. Empty when :attr:`has_unevaluated_ranges` is ``False``.
         """
         ...
 
