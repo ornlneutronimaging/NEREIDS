@@ -1795,6 +1795,95 @@ mod tests {
         );
     }
 
+    /// A parsed-but-skipped range contributes EXACTLY zero cross-section over
+    /// its span, through both evaluation entry points.
+    ///
+    /// This pins the branch's central safety property: a non-evaluable
+    /// placeholder range (LRU=2 URR / LRF=7 RML / LRU=0) reached by real mixed
+    /// tapes must add nothing to the four components, so the load-time
+    /// warnings ("these spans contribute zero cross-section") are honoured at
+    /// evaluation time — not just at parse time. The data has one evaluable
+    /// resolved range [1e-5, 1e4] eV (a real U-238 6.674 eV resonance) and one
+    /// disjoint placeholder range [1e4, 1e5] eV.
+    ///
+    /// Non-circular: the same shared primitive (`evaluate_precomputed_range`)
+    /// backs both APIs, so a vacuous "everything is zero" implementation would
+    /// pass a zeros-only check. The nonzero assertion inside the evaluable span
+    /// rules that out; the boundary assertion pins that the skipped range does
+    /// not corrupt the resolved range's inclusive upper edge.
+    #[test]
+    fn test_skipped_range_contributes_exact_zero() {
+        // Evaluable resolved RM range [1e-5, 1e4] with one resonance.
+        let mut data = u238_with_formalism(ResonanceFormalism::ReichMoore);
+        // Append a disjoint non-evaluable placeholder over [1e4, 1e5] (URR-like:
+        // empty l_groups, resolved=false), mirroring a real mixed tape.
+        data.ranges.push(ResonanceRange {
+            energy_low: 1e4,
+            energy_high: 1e5,
+            resolved: false,
+            formalism: ResonanceFormalism::Unresolved,
+            target_spin: 0.0,
+            scattering_radius: 9.4285,
+            naps: 1,
+            ap_table: None,
+            l_groups: vec![],
+            r_external: vec![],
+        });
+
+        assert!(data.has_unevaluated_ranges());
+        assert_eq!(data.unevaluated_ranges().len(), 1);
+
+        // (1) Non-vacuity: the evaluable span must produce a real signal, so
+        // "zero inside the skipped span" is not trivially true everywhere.
+        let e_eval = 6.674; // strictly inside [1e-5, 1e4]
+        let xs_eval = cross_sections_at_energy(&data, e_eval);
+        assert!(
+            xs_eval.total > 0.0 && xs_eval.capture > 0.0,
+            "evaluable span must be nonzero, got {xs_eval:?}"
+        );
+
+        // (2) Exact zero strictly inside the placeholder span, via BOTH APIs.
+        let e_skip = [2.0e4, 5.0e4, 9.0e4]; // strictly inside [1e4, 1e5]
+        for &e in &e_skip {
+            let pt = cross_sections_at_energy(&data, e);
+            assert_eq!(pt.total, 0.0, "per-point total must be exactly 0 at E={e}");
+            assert_eq!(pt.elastic, 0.0, "per-point elastic must be exactly 0 at E={e}");
+            assert_eq!(pt.capture, 0.0, "per-point capture must be exactly 0 at E={e}");
+            assert_eq!(pt.fission, 0.0, "per-point fission must be exactly 0 at E={e}");
+        }
+        for (i, xs) in cross_sections_on_grid(&data, &e_skip).iter().enumerate() {
+            let e = e_skip[i];
+            assert_eq!(xs.total, 0.0, "grid total must be exactly 0 at E={e}");
+            assert_eq!(xs.elastic, 0.0, "grid elastic must be exactly 0 at E={e}");
+            assert_eq!(xs.capture, 0.0, "grid capture must be exactly 0 at E={e}");
+            assert_eq!(xs.fission, 0.0, "grid fission must be exactly 0 at E={e}");
+        }
+
+        // (3) Scalar/grid agreement at shared points (evaluable and skipped).
+        let shared = [6.674, 2.0e4, 5.0e4];
+        let grid = cross_sections_on_grid(&data, &shared);
+        for (i, &e) in shared.iter().enumerate() {
+            let pt = cross_sections_at_energy(&data, e);
+            assert_eq!(pt.total, grid[i].total, "scalar/grid total disagree at E={e}");
+            assert_eq!(pt.elastic, grid[i].elastic, "scalar/grid elastic disagree at E={e}");
+            assert_eq!(pt.capture, grid[i].capture, "scalar/grid capture disagree at E={e}");
+            assert_eq!(pt.fission, grid[i].fission, "scalar/grid fission disagree at E={e}");
+        }
+
+        // (4) Boundary: the placeholder is non-evaluable, so the resolved range
+        // owns its inclusive upper edge 1e4. At exactly 1e4 the placeholder adds
+        // zero — the value must equal the resolved-range-only value there.
+        let e_edge = 1e4;
+        let edge = cross_sections_at_energy(&data, e_edge);
+        let mut resolved_only = data.clone();
+        resolved_only.ranges.truncate(1);
+        let edge_resolved = cross_sections_at_energy(&resolved_only, e_edge);
+        assert_eq!(edge.total, edge_resolved.total, "skipped range corrupts the boundary total");
+        assert_eq!(edge.elastic, edge_resolved.elastic);
+        assert_eq!(edge.capture, edge_resolved.capture);
+        assert_eq!(edge.fission, edge_resolved.fission);
+    }
+
     /// `cross_sections_on_grid` (batch, precompute hoisted) must produce
     /// identical results to `cross_sections_at_energy` (per-point) for
     /// Reich-Moore data.

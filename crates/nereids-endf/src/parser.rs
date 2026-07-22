@@ -149,11 +149,16 @@ pub fn parse_endf_file2(endf_text: &str) -> Result<ResonanceData, EndfParseError
                     None
                 };
 
-                // LRF is 1 or 2 for the URR (ENDF-6 §2.2.2). Anything else is an
-                // unsupported sub-format: skip its body without emitting a range.
+                // LRF must be 1 or 2 for the URR (ENDF-6 §2.2.2). Any other
+                // value is a malformed URR record; reject it as an unsupported
+                // format — consistent with the sibling malformed-record guards
+                // (INT range, N1 relations) — rather than heuristically
+                // consuming a guessed body and silently dropping the span.
                 if lrf != 1 && lrf != 2 {
-                    skip_urr_body(&lines, &mut pos)?;
-                    continue;
+                    return Err(EndfParseError::UnsupportedFormat(format!(
+                        "LRU=2 (URR) with LRF={lrf}: ENDF-6 §2.2.2 restricts \
+                         the unresolved region to LRF=1 or LRF=2"
+                    )));
                 }
 
                 // LFW=1/LRF=1 uses the "Case B" shared-energy-grid layout
@@ -181,20 +186,33 @@ pub fn parse_endf_file2(endf_text: &str) -> Result<ResonanceData, EndfParseError
 
             if lru == 0 {
                 // LRU=0: scattering-radius-only range (no resonance parameters).
-                // ENDF-6 §2.2: after the range CONT (and optional TAB1 if NRO!=0),
-                // a single CONT record follows: [SPI, AP, 0, 0, NLS=0, 0].
-                // We consume the NRO TAB1 if present, then the CONT, and skip.
+                // ENDF-6 §2.1: after the range CONT (and optional TAB1 if
+                // NRO!=0), a single CONT record follows: [SPI, AP, 0, 0,
+                // NLS=0, 0]. We consume the NRO TAB1 if present, then the CONT,
+                // and store a non-evaluable placeholder (rather than dropping
+                // the range) so the LRU=0 span is named by skip_description and
+                // the no-evaluable-content error — a file whose only range is
+                // LRU=0 is still rejected (NEREIDS cannot evaluate a
+                // resonance-parameter-free stanza, and loading it would yield
+                // silent zero cross-sections), but with an accurate message.
                 let nro_lru0 = range_cont.n1;
-                if nro_lru0 != 0 {
-                    // TAB1 AP(E) already follows; consume it.
-                    let _tab = parse_tab1(&lines, &mut pos)?;
-                }
+                let naps_lru0 = range_cont.n2;
+                let ap_table_lru0 = if nro_lru0 != 0 {
+                    // TAB1 AP(E) precedes the SPI/AP CONT; consume and store it.
+                    let mut tab = parse_tab1(&lines, &mut pos)?;
+                    for pt in &mut tab.points {
+                        pt.1 *= ENDF_RADIUS_TO_FM;
+                    }
+                    Some(tab)
+                } else {
+                    None
+                };
                 // CONT: SPI, AP, 0, 0, NLS=0, 0
                 // Validate NLS=0 (#123): a non-zero NLS in an LRU=0 range is
                 // malformed and would cause the parser to look for L-groups that
                 // don't exist, misaligning the cursor for subsequent ranges.
                 let spi_cont = parse_cont(&lines, &mut pos)?;
-                // ENDF-6 §2.2: the SPI/AP CONT is [SPI, AP, 0, 0, NLS=0, 0].
+                // ENDF-6 §2.1: the SPI/AP CONT is [SPI, AP, 0, 0, NLS=0, 0].
                 // Validate that L1 and L2 are both zero — non-zero values
                 // indicate a malformed or mis-identified record.
                 if spi_cont.l1 != 0 {
@@ -222,6 +240,18 @@ pub fn parse_endf_file2(endf_text: &str) -> Result<ResonanceData, EndfParseError
                         spi_cont.n2
                     )));
                 }
+                all_ranges.push(ResonanceRange {
+                    energy_low,
+                    energy_high,
+                    resolved: false,
+                    formalism: ResonanceFormalism::ScatteringRadiusOnly,
+                    target_spin: spi_cont.c1,
+                    scattering_radius: spi_cont.c2 * ENDF_RADIUS_TO_FM,
+                    naps: naps_lru0,
+                    ap_table: ap_table_lru0,
+                    l_groups: Vec::new(),
+                    r_external: vec![],
+                });
                 continue;
             }
 
@@ -285,6 +315,13 @@ pub fn parse_endf_file2(endf_text: &str) -> Result<ResonanceData, EndfParseError
                 ResonanceFormalism::Unresolved => {
                     // Unreachable: Unresolved is only assigned in the LRU=2 branch above.
                     unreachable!("Unresolved formalism should not appear in LRU=1 dispatch");
+                }
+                ResonanceFormalism::ScatteringRadiusOnly => {
+                    // Unreachable: ScatteringRadiusOnly is only assigned in the
+                    // LRU=0 branch above.
+                    unreachable!(
+                        "ScatteringRadiusOnly formalism should not appear in LRU=1 dispatch"
+                    );
                 }
             };
             all_ranges.push(range);
@@ -863,46 +900,6 @@ fn checked_count(value: i32, label: &str) -> Result<usize, EndfParseError> {
         )));
     }
     Ok(value as usize)
-}
-
-/// Skip an unsupported URR body **with LFW=0** layout.
-///
-/// Called when LRU=2 has an LRF value other than 1 or 2 so that the records
-/// for this range are consumed and subsequent ranges can still be parsed.
-///
-/// Structure consumed (ENDF-6 §2.2.2, LFW=0):
-/// ```text
-/// CONT: SPI, AP, 0, 0, NLS, 0
-/// For each L (NLS times):
-///   CONT: AWRI, 0, L, 0, N1, N2
-///   if N2 > 0  -> LRF=1 style: one LIST record of N1 values
-///   if N2 == 0 -> LRF=2 style: N1 J-sub-blocks, each = CONT + LIST(N1_j values)
-/// ```
-fn skip_urr_body(lines: &[&str], pos: &mut usize) -> Result<(), EndfParseError> {
-    // CONT: SPI, AP, 0, 0, NLS, 0
-    let header = parse_cont(lines, pos)?;
-    let nls = checked_count(header.n1, "NLS")?;
-
-    for _ in 0..nls {
-        // L CONT: AWRI, 0, L, 0, N1, N2
-        let l_cont = parse_cont(lines, pos)?;
-        let n1 = checked_count(l_cont.n1, "N1")?;
-        let n2 = checked_count(l_cont.n2, "N2")?;
-
-        if n2 > 0 {
-            // LRF=1 style: N2=NJS, N1=6*NJS — single LIST record.
-            parse_list_values(lines, pos, n1)?;
-        } else {
-            // LRF=2 style: N1=NJS, N2=0 — N1 J-sub-blocks, each with their
-            // own CONT (carrying 6*(NE+1) in N1) followed by a LIST record.
-            for _ in 0..n1 {
-                let j_cont = parse_cont(lines, pos)?;
-                let jn1 = checked_count(j_cont.n1, "N1")?;
-                parse_list_values(lines, pos, jn1)?;
-            }
-        }
-    }
-    Ok(())
 }
 
 // ---------------------------------------------------------------------------
@@ -2084,6 +2081,25 @@ mod tests {
         );
     }
 
+    /// An LRU=2 (URR) range with LRF ∉ {1, 2} is a malformed record and is
+    /// rejected with an error naming the offending LRF.
+    ///
+    /// ENDF-6 §2.2.2 restricts the unresolved region to LRF=1 or LRF=2. The
+    /// parser previously heuristically consumed such a body and dropped the
+    /// span silently; it now hard-errors like the sibling malformed-record
+    /// guards.
+    #[test]
+    fn test_urr_lrf3_rejected() {
+        const ENDF: &str = include_str!("../../../tests/data/synthetic/urr_lrf3_rejected.endf");
+
+        let err = parse_endf_file2(ENDF).unwrap_err();
+        let msg = err.to_string();
+        assert!(
+            msg.contains("LRF=3") && msg.contains("URR"),
+            "expected URR LRF=3 rejection naming the LRF, got: {msg}"
+        );
+    }
+
     /// LRU=0 range with non-zero L1 in SPI/AP CONT is rejected.
     ///
     /// ENDF-6 §2.2: the SPI/AP CONT record for LRU=0 must be
@@ -2098,6 +2114,60 @@ mod tests {
         assert!(
             err.to_string().contains("L1=5"),
             "expected LRU=0 L1 validation error, got: {err}"
+        );
+    }
+
+    /// A well-formed LRU=0-only evaluation (scattering radius, no resonance
+    /// parameters) is rejected — NEREIDS cannot evaluate it and loading it
+    /// would yield silent zero cross-sections — but the message NAMES the
+    /// LRU=0 span rather than misreporting an empty file.
+    ///
+    /// ENDF-6 §2.1: LRU=0 gives a scattering radius but no resonances. The
+    /// fixture is byte-identical to `lru0_nonzero_nls_rejected` except the
+    /// SPI/AP CONT carries NLS=0 (well-formed), so parsing reaches the
+    /// no-evaluable-content guard rather than the NLS validation guard.
+    #[test]
+    fn test_lru0_only_rejected_names_lru0_span() {
+        const ENDF: &str =
+            include_str!("../../../tests/data/synthetic/lru0_only_rejected_no_evaluable.endf");
+
+        let err = parse_endf_file2(ENDF).unwrap_err();
+        let msg = err.to_string();
+        assert!(
+            msg.contains("No evaluable resonance ranges"),
+            "expected no-evaluable-ranges rejection, got: {msg}"
+        );
+        assert!(
+            msg.contains("LRU=0 (scattering-radius-only, no resonance parameters)"),
+            "rejection must name the LRU=0 span, got: {msg}"
+        );
+    }
+
+    /// A mixed evaluation carrying an LRU=0 range plus a resolved range still
+    /// loads: the resolved range keeps the file evaluable, and the LRU=0 span
+    /// is surfaced as a non-evaluable parse-and-skip placeholder (same handling
+    /// as LRF=7 / LRU=2).
+    #[test]
+    fn test_lru0_plus_resolved_mixed_loads_and_flags_lru0() {
+        const ENDF: &str =
+            include_str!("../../../tests/data/synthetic/lru0_plus_resolved_mixed.endf");
+
+        let data = parse_endf_file2(ENDF).expect("mixed LRU=0 + resolved file must load");
+        assert_eq!(data.ranges.len(), 2, "LRU=0 range + resolved range");
+        assert!(data.has_evaluable_range(), "resolved range keeps it evaluable");
+        assert!(data.has_unevaluated_ranges(), "LRU=0 range is unevaluated");
+
+        let lru0 = data
+            .ranges
+            .iter()
+            .find(|r| r.formalism == ResonanceFormalism::ScatteringRadiusOnly)
+            .expect("the LRU=0 range must be present");
+        assert!(!lru0.resolved, "LRU=0 range must not be resolved");
+        assert!(
+            lru0.skip_description()
+                .contains("LRU=0 (scattering-radius-only, no resonance parameters)"),
+            "LRU=0 skip_description must name the span, got: {}",
+            lru0.skip_description()
         );
     }
 

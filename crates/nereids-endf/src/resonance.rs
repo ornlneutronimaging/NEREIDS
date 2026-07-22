@@ -179,6 +179,13 @@ pub enum ResonanceFormalism {
     /// width-fluctuation correction (a systematically wrong average). Ranges
     /// tagged `Unresolved` are non-evaluable and resolve to Skip.
     Unresolved,
+    /// Scattering-radius-only range (LRU=0). ENDF-6 §2.1: the standard stanza
+    /// for materials given a scattering radius but no resonance parameters. It
+    /// carries no resonances, so there is nothing to evaluate — the range is a
+    /// non-evaluable placeholder that resolves to Skip. Captured (rather than
+    /// dropped) so a file whose only range is LRU=0 is rejected with an error
+    /// that names the LRU=0 span instead of misreporting an empty file.
+    ScatteringRadiusOnly,
 }
 
 /// Top-level container for all resonance data parsed from an ENDF file.
@@ -481,6 +488,9 @@ impl ResonanceRange {
         let kind = match self.formalism {
             ResonanceFormalism::RMatrixLimited => "LRF=7 (R-Matrix Limited)",
             ResonanceFormalism::Unresolved => "LRU=2 (URR)",
+            ResonanceFormalism::ScatteringRadiusOnly => {
+                "LRU=0 (scattering-radius-only, no resonance parameters)"
+            }
             _ => "non-evaluable",
         };
         format!(
