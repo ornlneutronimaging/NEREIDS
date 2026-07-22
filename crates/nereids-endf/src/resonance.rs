@@ -409,6 +409,18 @@ impl ResonanceData {
     pub fn has_unevaluated_ranges(&self) -> bool {
         self.ranges.iter().any(|r| !r.is_evaluable())
     }
+
+    /// Whether at least one range can actually produce non-zero cross-sections.
+    ///
+    /// `false` means every range is a parse-and-skip placeholder (or there are
+    /// no ranges at all): the evaluation would return zero cross-section over
+    /// its full grid (transmission ≡ 1). This is the load-time acceptance
+    /// predicate — the parser rejects such an evaluation, and the project
+    /// loader drops it from the ENDF cache so a stale removed-physics payload
+    /// cannot silently restore as a zero-cross-section isotope.
+    pub fn has_evaluable_range(&self) -> bool {
+        self.ranges.iter().any(|r| r.is_evaluable())
+    }
 }
 
 impl ResonanceRange {

@@ -311,18 +311,26 @@ pub fn parse_endf_file2(endf_text: &str) -> Result<ResonanceData, EndfParseError
         ));
     }
 
+    let data = ResonanceData {
+        isotope,
+        za,
+        awr,
+        ranges: all_ranges,
+    };
+
     // Fail loudly when the evaluation carries NO evaluable content. A file
-    // whose every range is a parse-and-skip placeholder (LRF=7 or LRU=2)
-    // would otherwise "load" with zero resonances, return zero cross-sections
-    // everywhere, and produce transmission ≡ 1 with no signal to the caller.
-    // Files with at least one evaluable range still load: parse-and-skip
-    // exists for real mixed tapes (e.g. Ta-181, U-238, Pu-240) whose resolved
-    // ranges remain fully usable.
-    if !all_ranges.iter().any(|r| r.is_evaluable()) {
-        let detail = if all_ranges.is_empty() {
+    // whose every range is a parse-and-skip placeholder (LRF=7, LRU=2, or an
+    // LRU=0 scattering-radius-only stanza) would otherwise "load" with zero
+    // resonances, return zero cross-sections everywhere, and produce
+    // transmission ≡ 1 with no signal to the caller. Files with at least one
+    // evaluable range still load: parse-and-skip exists for real mixed tapes
+    // (e.g. Ta-181, U-238, Pu-240) whose resolved ranges remain fully usable.
+    if !data.has_evaluable_range() {
+        let detail = if data.ranges.is_empty() {
             "the file carries no resonance-parameter ranges at all".to_string()
         } else {
-            let skipped: Vec<String> = all_ranges.iter().map(|r| r.skip_description()).collect();
+            let skipped: Vec<String> =
+                data.ranges.iter().map(|r| r.skip_description()).collect();
             format!(
                 "every range in this file is a parse-and-skip placeholder: {}",
                 skipped.join("; ")
@@ -335,12 +343,7 @@ pub fn parse_endf_file2(endf_text: &str) -> Result<ResonanceData, EndfParseError
         )));
     }
 
-    Ok(ResonanceData {
-        isotope,
-        za,
-        awr,
-        ranges: all_ranges,
-    })
+    Ok(data)
 }
 
 /// Shared context for ENDF range parsers.

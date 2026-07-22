@@ -405,6 +405,8 @@ pub fn snapshot_from_state(state: &AppState) -> ProjectSnapshot {
         single_fit_baseline,
         single_fit_baseline_e_ref_ev,
         endf_cache,
+        // Read-only diagnostic populated by `load_project`; never written back.
+        endf_cache_dropped: vec![],
         provenance,
     }
 }
@@ -746,6 +748,30 @@ pub fn load_project_from_path(state: &mut AppState, path: &Path) {
     }
 }
 
+/// Log a warning when parsed ENDF data carries parse-and-skip placeholder
+/// ranges (LRF=7 R-Matrix Limited or LRU=2 URR).
+///
+/// Those spans contribute exactly zero cross-section, so any physics computed
+/// over them reflects only the evaluation's other ranges. Shared by the ENDF
+/// fetch worker and the project-restore path so both surfaces describe skipped
+/// ranges identically, reusing `ResonanceRange::skip_description`. No-op when
+/// the evaluation has no unevaluated ranges.
+pub(crate) fn warn_unevaluated_ranges(symbol: &str, data: &ResonanceData) {
+    if !data.has_unevaluated_ranges() {
+        return;
+    }
+    let spans: Vec<String> = data
+        .unevaluated_ranges()
+        .iter()
+        .map(|r| r.skip_description())
+        .collect();
+    tracing::warn!(
+        isotope = %symbol,
+        skipped = %spans.join("; "),
+        "ENDF ranges parsed but not evaluated (zero cross-section over these spans)"
+    );
+}
+
 /// Apply a [`ProjectSnapshot`] to [`AppState`], restoring the full session.
 fn state_from_snapshot(snap: ProjectSnapshot, state: &mut AppState, path: &Path) {
     // 0. Cancel any in-flight background tasks (ENDF fetches, fitting, etc.)
@@ -866,8 +892,24 @@ fn state_from_snapshot(snap: ProjectSnapshot, state: &mut AppState, path: &Path)
         _ => nereids_endf::retrieval::EndfLibrary::EndfB8_0,
     };
 
-    // 7. ENDF cache priority — build lookup from snapshot
+    // 7. ENDF cache priority — build lookup from snapshot.
+    // Entries dropped by the loader (removed-physics payloads with no evaluable
+    // range) are absent from `endf_cache`, so the isotopes below fall through
+    // to `EndfStatus::Pending` and are re-fetched on demand — the fetch worker
+    // then surfaces the parser's hard error. Warn so the drop is visible.
+    for symbol in &snap.endf_cache_dropped {
+        tracing::warn!(
+            isotope = %symbol,
+            "cached ENDF evaluation dropped on project load (no evaluable \
+             resonance range — stale removed-physics data); re-fetch required"
+        );
+    }
     let endf_cache: HashMap<String, ResonanceData> = snap.endf_cache.into_iter().collect();
+    // Mixed evaluations that survived the load still carry parsed-but-skipped
+    // spans (zero cross-section). Emit the same warning the fetch worker emits.
+    for (symbol, rd) in &endf_cache {
+        warn_unevaluated_ranges(symbol, rd);
+    }
 
     // 8. Restore isotope entries with ENDF cache
     // Use the minimum length across all parallel arrays to avoid panics on corrupted files.
