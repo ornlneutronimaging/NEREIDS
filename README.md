@@ -18,10 +18,9 @@ output spatially resolved isotopic composition maps.
 
 ## Features
 
-- **R-matrix cross-sections** -- Reich-Moore, Breit-Wigner (single- and
-  multi-level), R-Matrix Limited (LRF=7), Coulomb channels
-- **Unresolved Resonance Region** -- energy-averaged Hauser-Feshbach
-  cross-sections (width-fluctuation correction planned, not yet implemented)
+- **R-matrix cross-sections** -- resolved Breit-Wigner (single- and
+  multi-level, LRF=1/2) and Reich-Moore (LRF=3); R-Matrix Limited (LRF=7)
+  and unresolved (LRU=2) ranges are parsed-and-skipped, not evaluated
 - **Doppler broadening** -- Free Gas Model (crystal-lattice model planned, not yet implemented)
 - **Resolution broadening** -- Gaussian (channel width + flight path) and
   tabulated instrument functions

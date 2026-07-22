@@ -14,13 +14,12 @@ equations and citations.
 |-----------|----------|--------|-----------------|
 | Reich-Moore | LRF=3 | [`reich_moore`](api/nereids_physics/reich_moore/) | Manual Sec. II, `rml/` |
 | Breit-Wigner (single- and multi-level) | LRF=1,2 | [`slbw`](api/nereids_physics/slbw/) | Manual Sec. II, `mlb/` |
-| R-Matrix Limited | LRF=7 | [`rmatrix_limited`](api/nereids_physics/rmatrix_limited/) | Manual Sec. II |
-| Unresolved Resonance Region | LRU=2 | [`urr`](api/nereids_physics/urr/) | Manual Sec. VIII.A, `acs/` (FITACS) |
 
-The `urr` module computes energy-averaged Hauser-Feshbach cross-sections from
-the average resonance parameters. The width-fluctuation correction is not yet
-implemented: the `AMUN`/`AMUF` degrees of freedom are parsed from ENDF File 2
-but not yet used in the cross-section computation.
+**Not evaluated:** R-Matrix Limited (LRF=7) and Unresolved Resonance Region
+(LRU=2) ranges are parsed-and-skipped — consumed for file alignment but
+contributing zero cross-section. A file containing only such ranges is
+rejected at load time; mixed evaluations load with a warning naming the
+skipped spans.
 
 The [`penetrability`](api/nereids_physics/penetrability/) and
 [`channel`](api/nereids_physics/channel/) modules provide the underlying
