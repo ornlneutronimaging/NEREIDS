@@ -39,7 +39,6 @@ it against analytical formulas and SAMMY reference values.
 | 2 | [SLBW Validation](foundations/02_slbw_validation.ipynb) | Compare Single-Level Breit-Wigner and Reich-Moore formalisms |
 | 3 | [Doppler Broadening](foundations/03_doppler_broadening.ipynb) | Validate Free Gas Model Doppler broadening across temperatures |
 | 4 | [Resolution Broadening](foundations/04_resolution_broadening.ipynb) | Validate instrument resolution broadening against SAMMY |
-| 5 | [URR Cross-Sections](foundations/05_urr_cross_sections.ipynb) | Unresolved Resonance Region via Hauser-Feshbach |
 | 6 | [Transmission Model](foundations/06_transmission_model.ipynb) | Full forward model: cross-sections through broadening to transmission |
 
 ## Tier 2: Building Blocks

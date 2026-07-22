@@ -7,6 +7,27 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
 
 ## [Unreleased]
 
+### Changed (breaking)
+
+- **Removed URR (LRU=2) and R-Matrix Limited (LRF=7) cross-section
+  evaluation.** The URR Hauser-Feshbach path lacked the ENDF
+  width-fluctuation correction (a systematically wrong average) and the
+  RML path never implemented the closed-channel boundary condition nor
+  was validated against SAMMY. Both range types are now parsed-and-skipped:
+  the parser consumes their records for cursor alignment (all structural
+  guards preserved) and tags them non-evaluable, so they contribute zero
+  cross-section. A file whose every range is non-evaluable (e.g. a pure
+  LRF=7 evaluation such as W-184) is rejected at load with an
+  `UnsupportedFormat` error naming each skipped range; mixed evaluations
+  (e.g. Ta-181, U-238) still load, with a Python `UserWarning` from
+  `load_endf`/`load_endf_file` listing the skipped spans, a
+  `ResonanceData.has_unevaluated_ranges` getter, and a GUI log warning.
+- **Removed the dead `alpha_1`/`alpha_2` counts-fit parameters** from the
+  Python API (`fit_alpha_1`, `fit_alpha_2`, `alpha_1_init`,
+  `alpha_2_init` kwargs). The MCP server now rejects manifests that still
+  pass any of these keys with an explicit error instead of silently
+  running with defaults.
+
 ## [0.3.0] - 2026-07-07
 
 ### Added
