@@ -241,7 +241,7 @@ class TestForwardModel:
 
 
 class TestDetectIsotopes:
-    # Ta-181 is a mixed evaluation (resolved Reich-Moore + URR) that loads;
+    # Ta-181 is a mixed evaluation (resolved MLBW LRF=2 + URR) that loads;
     # W-182 (pure LRF=7 + URR) is now rejected at load, so it cannot be a trace.
     def test_basic(self):
         load_endf(isotope="Fe-56")

@@ -2282,7 +2282,7 @@ mod tests {
 
     // ─── Top-level pub-fn energy-validation guards ─────────────────────────
     //
-    // Mirrors the SLBW / RML / URR test patterns: NaN, ±Inf, 0, and -1 must
+    // Mirrors the SLBW / Reich-Moore test patterns: NaN, ±Inf, 0, and -1 must
     // each panic with the canonical "expected positive finite energy_ev"
     // message.  These tests gate the symmetric defense-in-depth contract on
     // both Reich-Moore top-level pub fns so a future refactor cannot
