@@ -19,6 +19,8 @@ from nereids.mcp.server import (
     _fit_result_summary,
     _json_safe,
     _registry,
+    _single_fit_kwargs,
+    _spatial_fit_kwargs,
     compute_cross_sections,
     compute_transmission,
     detect_isotopes,
@@ -282,6 +284,38 @@ class TestInputValidation:
     def test_list_isotopes_invalid_z(self):
         with pytest.raises(ValueError, match="z must be"):
             list_isotopes(0)
+
+
+class TestRemovedFitKeys:
+    """The removed alpha_1/alpha_2 fit keys must raise, not silently no-op.
+
+    The fit config is whitelist-filtered, so without the explicit rejection a
+    legacy manifest passing these keys would run with defaults and report
+    success while ignoring the request.
+    """
+
+    REMOVED = ["fit_alpha_1", "fit_alpha_2", "alpha_1_init", "alpha_2_init"]
+
+    @pytest.mark.parametrize("key", REMOVED)
+    def test_single_fit_kwargs_rejects_removed_key(self, key):
+        with pytest.raises(ValueError, match="no longer supported"):
+            _single_fit_kwargs({key: 1.0}, {}, counts=True)
+
+    @pytest.mark.parametrize("key", REMOVED)
+    def test_spatial_fit_kwargs_rejects_removed_key(self, key):
+        with pytest.raises(ValueError, match="no longer supported"):
+            _spatial_fit_kwargs({key: 1.0}, {})
+
+    def test_error_names_every_offending_key(self):
+        config = {"fit_alpha_1": True, "alpha_2_init": 0.5, "max_iter": 10}
+        with pytest.raises(ValueError, match="alpha_2_init.*fit_alpha_1|fit_alpha_1.*alpha_2_init"):
+            _single_fit_kwargs(config, {}, counts=False)
+
+    def test_clean_config_still_accepted(self):
+        kwargs = _single_fit_kwargs({"max_iter": 10}, {}, counts=False)
+        assert kwargs == {"max_iter": 10}
+        kwargs = _spatial_fit_kwargs({"max_iter": 10}, {})
+        assert kwargs == {"max_iter": 10}
 
 
 # ---------------------------------------------------------------------------
