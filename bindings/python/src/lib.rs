@@ -1229,7 +1229,7 @@ fn cross_sections<'py>(
     // Validate the full grid up front so invalid input surfaces as ValueError
     // rather than a release-mode `PanicException` from the per-point
     // `assert!(energy_ev.is_finite() && energy_ev > 0.0)` guards added to
-    // the SLBW / RML / URR leaf paths.  Sibling PyO3 entries
+    // the SLBW / Reich-Moore leaf paths.  Sibling PyO3 entries
     // (`doppler_broaden`, `resolution_broaden`, `forward_model`, etc.)
     // already validate via this same helper; this entry was the lone gap.
     let e_slice = energies.as_slice()?;
@@ -1318,9 +1318,9 @@ fn forward_model<'py>(
     // Validate the energy grid up front so invalid input surfaces as
     // ValueError rather than a release-mode `PanicException` from the
     // per-point `assert!(energy_ev.is_finite() && energy_ev > 0.0)` guards
-    // added to the SLBW / RML / URR / Reich-Moore leaf paths.  Empty
-    // grids are accepted (the downstream `transmission::forward_model`
-    // returns an empty vector for an empty grid).
+    // added to the SLBW / Reich-Moore leaf paths.  Empty grids are accepted
+    // (the downstream `transmission::forward_model` returns an empty vector
+    // for an empty grid).
     let e_slice = energies.as_slice()?;
     validate_energy_grid(e_slice)?;
     let e_owned = e_slice.to_vec();
@@ -3515,7 +3515,7 @@ fn py_calibrate_energy(
     // Validate the nominal energy grid up front so malformed energies
     // surface as ValueError rather than a release-mode `PanicException`
     // from the per-point `assert!(energy_ev.is_finite() && energy_ev > 0.0)`
-    // guards inside `transmission::forward_model` → SLBW / RML / URR
+    // guards inside `transmission::forward_model` → SLBW / Reich-Moore
     // leaves.  Calibration requires at least one data point to fit
     // (L, t₀, n_total), so an empty grid is also rejected.
     require_non_empty_energy_grid(&e_owned)?;
@@ -4980,7 +4980,7 @@ fn py_spatial_map_typed<'py>(
     // ValueError rather than a release-mode `PanicException` from the
     // per-point `assert!(energy_ev.is_finite() && energy_ev > 0.0)`
     // guards inside the rayon-parallelised pipeline precompute → SLBW /
-    // RML / URR leaves.  Empty grids are accepted and yield an empty
+    // Reich-Moore leaves.  Empty grids are accepted and yield an empty
     // result; per-pixel failures still degrade gracefully via
     // `filter_map(Err(_) => None)`.
     validate_energy_grid(e_slice)?;
