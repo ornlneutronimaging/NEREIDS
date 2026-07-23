@@ -1,0 +1,207 @@
+<title>NEREIDS — The Forward Model</title>
+<style>
+  :root {
+    --ground: #f4f6f9; --surface: #ffffff; --surface-2: #eef2f6; --ink: #16212c; --ink-muted: #55636f; --ink-faint: #8b98a3; --hairline: #d9e0e7;
+    /* parameter-group hues */
+    --nuc: #6b6f8c; --inst: #2f6aa8; --samp: #17836a; --nui: #b0781c;
+    --warn: #bf4a3a; --accent: #2f6aa8;
+    --plot: #0e1a26; --plot-line: #7fd4d4; --plot-edge: #2a3d4e; --plot-faint: #6f8598;
+    --mono: ui-monospace, "SF Mono", "JetBrains Mono", Menlo, Consolas, monospace;
+    --sans: ui-sans-serif, -apple-system, "Segoe UI", Roboto, Helvetica, Arial, sans-serif;
+  }
+  @media (prefers-color-scheme: dark) {
+    :root { --ground: #0b1116; --surface: #131c24; --surface-2: #182430; --ink: #dde5ec; --ink-muted: #94a3af; --ink-faint: #63717d; --hairline: #223039;
+      --nuc: #a3a7c6; --inst: #6ea8dd; --samp: #45c4a4; --nui: #dcab55; --warn: #e07a68; --accent: #6ea8dd;
+      --plot: #081019; --plot-line: #45c8c8; --plot-edge: #22323f; --plot-faint: #6f889c; }
+  }
+  :root[data-theme="light"]{ --ground:#f4f6f9;--surface:#fff;--surface-2:#eef2f6;--ink:#16212c;--ink-muted:#55636f;--ink-faint:#8b98a3;--hairline:#d9e0e7;--nuc:#6b6f8c;--inst:#2f6aa8;--samp:#17836a;--nui:#b0781c;--warn:#bf4a3a;--accent:#2f6aa8;--plot:#0e1a26;--plot-line:#7fd4d4;--plot-edge:#2a3d4e;--plot-faint:#6f8598;}
+  :root[data-theme="dark"]{ --ground:#0b1116;--surface:#131c24;--surface-2:#182430;--ink:#dde5ec;--ink-muted:#94a3af;--ink-faint:#63717d;--hairline:#223039;--nuc:#a3a7c6;--inst:#6ea8dd;--samp:#45c4a4;--nui:#dcab55;--warn:#e07a68;--accent:#6ea8dd;--plot:#081019;--plot-line:#45c8c8;--plot-edge:#22323f;--plot-faint:#6f889c;}
+  * { box-sizing: border-box; }
+  body { margin: 0; background: var(--ground); color: var(--ink); font-family: var(--sans); line-height: 1.58; -webkit-font-smoothing: antialiased; }
+  .wrap { max-width: 58rem; margin: 0 auto; padding: clamp(1.3rem,4vw,3rem) clamp(1.1rem,4vw,2.4rem) 4rem; }
+  .eyebrow { font-family: var(--mono); font-size: .7rem; letter-spacing: .18em; text-transform: uppercase; color: var(--accent); margin: 0 0 .5rem; }
+  h1 { font-size: clamp(1.6rem,3.2vw,2.15rem); line-height: 1.1; margin: 0 0 .6rem; letter-spacing: -.015em; font-weight: 700; text-wrap: balance; }
+  .lede { color: var(--ink-muted); max-width: 62ch; margin: 0 0 1.6rem; font-size: 1rem; }
+  .lede b { color: var(--ink); font-weight: 600; }
+  h2 { font-size: .8rem; font-family: var(--mono); letter-spacing: .12em; text-transform: uppercase; color: var(--ink-faint); margin: 2.4rem 0 1rem; font-weight: 600; }
+
+  /* transformation chain */
+  .chain { display: flex; flex-direction: column; gap: 0; }
+  .step { border: 1px solid var(--hairline); border-radius: 11px; background: var(--surface); padding: .8rem 1rem; }
+  .step-top { display: flex; align-items: baseline; gap: .6rem; flex-wrap: wrap; }
+  .step-no { font-family: var(--mono); font-size: .72rem; font-weight: 700; color: var(--accent); }
+  .step-name { font-weight: 700; font-size: .98rem; letter-spacing: -.01em; }
+  .step-eq { margin-left: auto; font-family: var(--mono); font-size: .78rem; color: var(--ink); background: var(--surface-2); border-radius: 6px; padding: .12rem .5rem; }
+  .step-body { font-size: .85rem; color: var(--ink-muted); margin: .45rem 0 0; }
+  .step-body b { color: var(--ink); font-weight: 600; }
+  .pills { display: flex; flex-wrap: wrap; gap: .35rem; margin-top: .55rem; }
+  .pill { font-family: var(--mono); font-size: .64rem; border-radius: 5px; padding: .12rem .45rem; border: 1px solid var(--pc); color: var(--pc); background: color-mix(in srgb, var(--pc) 10%, transparent); }
+  .pill.nuc { --pc: var(--nuc); } .pill.inst { --pc: var(--inst); } .pill.samp { --pc: var(--samp); } .pill.nui { --pc: var(--nui); }
+  .pill.warn { --pc: var(--warn); font-weight: 700; }
+  .arrow { align-self: center; width: 2px; height: 1.15rem; background: var(--hairline); }
+
+  /* parameter groups */
+  .groups { display: grid; grid-template-columns: repeat(auto-fit, minmax(13rem, 1fr)); gap: .8rem; }
+  .grp { border: 1px solid var(--hairline); border-top: 3px solid var(--gc); border-radius: 10px; background: var(--surface); padding: .75rem .85rem; }
+  .grp.nuc { --gc: var(--nuc); } .grp.inst { --gc: var(--inst); } .grp.samp { --gc: var(--samp); } .grp.nui { --gc: var(--nui); }
+  .grp h3 { margin: 0; font-size: .9rem; font-weight: 700; display: flex; align-items: baseline; gap: .5rem; }
+  .grp .disp { font-family: var(--mono); font-size: .58rem; letter-spacing: .06em; text-transform: uppercase; color: var(--gc); border: 1px solid var(--gc); border-radius: 4px; padding: .05rem .32rem; }
+  .grp ul { margin: .5rem 0 0; padding-left: 1.05rem; }
+  .grp li { font-family: var(--mono); font-size: .72rem; color: var(--ink); margin: .18rem 0; }
+  .grp .role { margin: .5rem 0 0; font-size: .74rem; color: var(--ink-muted); }
+
+  /* regime physics */
+  .regime { border: 1px solid var(--hairline); border-left: 3px solid var(--warn); border-radius: 10px; background: var(--surface); padding: .9rem 1.05rem; margin-bottom: .8rem; }
+  .regime.calm { border-left-color: var(--samp); }
+  .regime h3 { margin: 0 0 .35rem; font-size: .95rem; font-weight: 700; }
+  .regime p { margin: .3rem 0 0; font-size: .86rem; color: var(--ink-muted); }
+  .regime p b { color: var(--ink); font-weight: 600; }
+  .lineshape { display: grid; grid-template-columns: 1fr; gap: .8rem; align-items: center; margin-top: .8rem; }
+  @media (min-width: 40rem) { .lineshape { grid-template-columns: minmax(0,26rem) 1fr; } }
+  .plot { background: var(--plot); border: 1px solid var(--plot-edge); border-radius: 9px; width: 100%; height: auto; }
+  .plot .ax { stroke: var(--plot-edge); stroke-width: 1; }
+  .plot .base { stroke: var(--plot-faint); stroke-width: 1; stroke-dasharray: 3 4; opacity: .55; }
+  .plot .curve { fill: none; stroke: var(--plot-line); stroke-width: 2.2; stroke-linejoin: round; }
+  .plot text { font-family: var(--mono); }
+  .plot .tf { fill: var(--plot-faint); }
+  .plot .ts { fill: var(--samp); }
+  .plot .tb { fill: var(--warn); }
+  .capnote { font-family: var(--mono); font-size: .68rem; color: var(--ink-muted); line-height: 1.5; }
+  .capnote b { color: var(--ink); }
+  .capnote .w { color: var(--samp); } .capnote .b { color: var(--warn); }
+
+  .deg { display: grid; grid-template-columns: 1fr; gap: .5rem; margin-top: .3rem; }
+  @media (min-width: 34rem){ .deg { grid-template-columns: 1fr 1fr; } }
+  .degp { font-family: var(--mono); font-size: .72rem; color: var(--ink-muted); border: 1px dashed var(--hairline); border-radius: 7px; padding: .5rem .6rem; }
+  .degp b { color: var(--ink); }
+
+  /* instances */
+  .inst-tbl { width: 100%; border-collapse: collapse; font-size: .8rem; }
+  .inst-tbl th, .inst-tbl td { text-align: left; padding: .5rem .55rem; border-bottom: 1px solid var(--hairline); vertical-align: top; }
+  .inst-tbl th { font-family: var(--mono); font-size: .62rem; letter-spacing: .06em; text-transform: uppercase; color: var(--ink-faint); font-weight: 600; }
+  .inst-tbl td.name { font-weight: 700; }
+  .fx { color: var(--ink-faint); } .fr { color: var(--samp); font-weight: 600; }
+  .scroller { overflow-x: auto; }
+
+  footer { margin-top: 2.6rem; padding-top: 1rem; border-top: 1px solid var(--hairline); font-family: var(--mono); font-size: .72rem; color: var(--ink-faint); line-height: 1.6; }
+</style>
+
+<div class="wrap">
+  <p class="eyebrow">NEREIDS · VENUS neutron-resonance imaging · forward model</p>
+  <h1>The forward model — nuclear data → the measurement</h1>
+  <p class="lede">One deterministic chain. <b>Every fit runs this same model</b> — calibration and all three experiments are just different choices of which parameters are <b>fixed</b> vs <b>solved</b>. Get the model complete first; the fitting instances then fall out as partitions of its parameters. Colors mark which group a parameter belongs to.</p>
+
+  <h2>Transformation chain</h2>
+  <div class="chain">
+    <div class="step">
+      <div class="step-top"><span class="step-no">1</span><span class="step-name">Microscopic cross-section σ₀(E)</span><span class="step-eq">R-matrix / Reich–Moore</span></div>
+      <p class="step-body"><b>Total</b> cross-section per isotope (transmission removes neutrons by absorption <i>and</i> scattering). Resonances + <b>potential scattering</b> + <b>resonance–potential interference</b> → the dip is <b>asymmetric</b>, not a clean Lorentzian.</p>
+      <div class="pills"><span class="pill nuc">resonance set {E_r, Γ_n, Γ_γ, Γ_f, J}</span><span class="pill nuc">channel radius R′</span><span class="pill nuc">abundances</span></div>
+    </div>
+    <div class="arrow"></div>
+    <div class="step">
+      <div class="step-top"><span class="step-no">2</span><span class="step-name">Doppler broadening → σ(E; T)</span><span class="step-eq">Δ_D ∝ √(T·E / A)</span></div>
+      <p class="step-body">Thermal motion (free-gas; lattice at low T). <b>Conserves resonance area</b> — widens and lowers, removes nothing. This is why <b>width↔T</b> and <b>depth↔n·d</b> can be separated.</p>
+      <div class="pills"><span class="pill samp">temperature T</span><span class="pill nuc">atomic mass A</span></div>
+    </div>
+    <div class="arrow"></div>
+    <div class="step">
+      <div class="step-top"><span class="step-no">3</span><span class="step-name">Attenuation → transmission</span><span class="step-eq">T(E) = exp(−Σᵢ (n·d)ᵢ σᵢ)</span></div>
+      <p class="step-body">Beer–Lambert, areal density in atoms/barn. Single-attenuation only — thick/dense samples need <b>self-shielding + multiple-scattering</b> corrections (needs sample geometry).</p>
+      <div class="pills"><span class="pill samp">areal density (n·d)ᵢ</span><span class="pill samp">sample geometry</span><span class="pill warn">⚑ black-resonance saturation</span></div>
+    </div>
+    <div class="arrow"></div>
+    <div class="step">
+      <div class="step-top"><span class="step-no">4</span><span class="step-name">Energy ↔ time-of-flight</span><span class="step-eq">E = ½mₙ(L/(t−t₀))²</span></div>
+      <p class="step-body">The measurement lives in TOF; the physics in energy. <b>L varies per pixel</b> off-axis, so the energy axis is per-pixel.</p>
+      <div class="pills"><span class="pill inst">flight path L (+ per-pixel L(y,x))</span><span class="pill inst">time offset t₀</span></div>
+    </div>
+    <div class="arrow"></div>
+    <div class="step">
+      <div class="step-top"><span class="step-no">5</span><span class="step-name">Instrument resolution</span><span class="step-eq">obs(t) = ∫ R(t−t′;θ) · true(t′) dt′</span></div>
+      <p class="step-body">Convolution in time: moderator emission pulse (Ikeda–Carpenter) + flight-path/geometry spread + detector timing; energy-dependent. <b>Degenerate with Doppler</b> — the reason calibration exists.</p>
+      <div class="pills"><span class="pill inst">resolution shape θ_res</span></div>
+    </div>
+    <div class="arrow"></div>
+    <div class="step">
+      <div class="step-top"><span class="step-no">6</span><span class="step-name">Observation model</span><span class="step-eq">counts: S=Φ·T·ε+B · O=Φ·ε+B</span></div>
+      <p class="step-body">Transmission domain: ratio (S/Q_s)/(O/Q_ob). Counts domain: Poisson, with the structured <b>incident flux Φ(E)</b> (Maxwellian + 1/E) carried or profiled out, plus efficiency and background.</p>
+      <div class="pills"><span class="pill nui">normalization a (Q ratio, ε)</span><span class="pill nui">background B(E)</span><span class="pill nui">incident flux Φ(E)</span></div>
+    </div>
+  </div>
+
+  <h2>Parameters, by what they belong to</h2>
+  <div class="groups">
+    <div class="grp nuc">
+      <h3>Nuclear <span class="disp">fixed ref</span></h3>
+      <ul><li>resonance set {E_r, Γ_n, Γ_γ, Γ_f, J}</li><li>channel radius R′</li><li>abundances, atomic mass A</li></ul>
+      <p class="role">Reference data — held fixed, but itself uncertain (a systematic floor).</p>
+    </div>
+    <div class="grp inst">
+      <h3>Instrument <span class="disp">calibrate → pin</span></h3>
+      <ul><li>flight path L (+ per-pixel)</li><li>time offset t₀</li><li>resolution shape θ_res</li></ul>
+      <p class="role">Stable across the beamline. Determined once by calibration, then pinned.</p>
+    </div>
+    <div class="grp samp">
+      <h3>Sample <span class="disp">the science</span></h3>
+      <ul><li>areal density (n·d)ᵢ per isotope</li><li>temperature T</li><li>(3D: local density via inversion)</li></ul>
+      <p class="role">What each experiment solves for.</p>
+    </div>
+    <div class="grp nui">
+      <h3>Nuisance <span class="disp">per measurement</span></h3>
+      <ul><li>normalization a</li><li>background B(E)</li><li>incident flux Φ(E)</li></ul>
+      <p class="role">Not physics of interest, but they trade off against density — must be constrained.</p>
+    </div>
+  </div>
+
+  <h2>Regime physics — what constrains the fit</h2>
+
+  <div class="regime">
+    <h3>⚑ Black resonances &amp; saturation</h3>
+    <p>Where <b>(n·d)·σ ≫ 1</b>, transmission bottoms out at <b>T = 0</b>. The saturated core carries <b>no information</b> — the Fisher information for n·d and T collapses there; all the fit sensitivity lives on the <b>wings</b>.</p>
+    <div class="lineshape">
+      <svg class="plot" viewBox="0 0 420 210" role="img" aria-label="Transmission vs energy: an unsaturated resonance dip and a saturated (black) resonance dip">
+        <line class="ax" x1="40" y1="25" x2="40" y2="178"/>
+        <line class="ax" x1="40" y1="178" x2="404" y2="178"/>
+        <line class="base" x1="40" y1="35" x2="404" y2="35"/>
+        <text class="tf" x="34" y="38" text-anchor="end" font-size="10">T=1</text>
+        <text class="tf" x="34" y="181" text-anchor="end" font-size="10">T=0</text>
+        <text class="tf" x="402" y="196" text-anchor="end" font-size="10">energy →</text>
+        <path class="curve" d="M40,35 L100,35 C122,35 130,120 148,120 C166,120 174,35 196,35 L250,35 C272,35 276,178 296,178 L320,178 C342,178 346,35 368,35 L404,35"/>
+        <text class="ts" x="148" y="140" text-anchor="middle" font-size="10">unsaturated</text>
+        <text class="tb" x="308" y="166" text-anchor="middle" font-size="10">black (T=0)</text>
+        <text class="tf" x="205" y="52" text-anchor="middle" font-size="9">wings ↕ carry info</text>
+      </svg>
+      <p class="capnote">
+        <span class="w">Unsaturated dip</span> — depth encodes <b>n·d</b>, width encodes <b>T</b>; the fit reads the <b>wings</b>.<br><br>
+        <span class="b">Black dip</span> — core is flat zero, blind to more material or more heat. But at T=0 the <b>true signal is exactly zero</b>, so any measured counts there are <b>pure background</b> — a black resonance is a built-in probe of <b>B(E)</b> and the resolution wings. Dual-use, not just a dead zone.
+      </p>
+    </div>
+    <p><b>Design consequence:</b> too much material → every strong resonance goes black → only weak resonances stay quantitative. Isotope + energy-window selection is part of the physics, and there is a hard dynamic-range cutoff.</p>
+  </div>
+
+  <div class="regime calm">
+    <h3>Degeneracies — why fits must be partitioned</h3>
+    <div class="deg">
+      <div class="degp"><b>resolution ⊗ temperature</b> — both broaden; unfittable together → calibration pins resolution first.</div>
+      <div class="degp"><b>energy scale (L,t₀) ⊗ resonance position</b> — a wrong axis mimics shifted resonances → pinned by the known calibrant.</div>
+      <div class="degp"><b>n·d ⊗ normalization ⊗ background</b> — dip depth vs overall scale vs baseline all trade off.</div>
+      <div class="degp"><b>n ⊗ d</b> — transmission sees only the product (areal); volumetric needs geometry / tomography.</div>
+    </div>
+  </div>
+
+  <h2>The fitting instances are partitions of this model</h2>
+  <div class="scroller">
+    <table class="inst-tbl">
+      <thead><tr><th>Instance</th><th>Nuclear</th><th>Instrument</th><th>Sample</th><th>Nuisance</th></tr></thead>
+      <tbody>
+        <tr><td class="name">Calibration</td><td class="fx">fixed (known calibrant)</td><td class="fr">SOLVE L, t₀, θ_res</td><td class="fx">fixed (known ρ, T)</td><td class="fr">solve</td></tr>
+        <tr><td class="name">Density</td><td class="fx">fixed</td><td class="fx">pinned</td><td class="fr">SOLVE n·d</td><td class="fr">solve</td></tr>
+        <tr><td class="name">Temperature</td><td class="fx">fixed</td><td class="fx">pinned</td><td class="fr">SOLVE T</td><td class="fr">solve</td></tr>
+        <tr><td class="name">In-situ</td><td class="fx">fixed</td><td class="fx">pinned</td><td class="fr">SOLVE n·d + T</td><td class="fr">solve</td></tr>
+      </tbody>
+    </table>
+  </div>
+
+  <footer>Physics first. This is the shared forward model every fit invokes; calibration and the experiments are fixed/free partitions of it. Open questions still to settle as physics: free-gas vs lattice Doppler; whether self-shielding/multiple-scattering is in scope for VENUS samples; resolution model family (Ikeda–Carpenter vs tabulated). Code is validated against this later — never the reverse.</footer>
+</div>
