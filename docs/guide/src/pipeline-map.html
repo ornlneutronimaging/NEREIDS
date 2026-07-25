@@ -110,6 +110,26 @@
   .tblnote math { font-size: .95rem; }
 
   /* skeleton tabs */
+  /* calibration section */
+  .idtbl { width: 100%; border-collapse: collapse; font-size: .78rem; }
+  .idtbl th, .idtbl td { text-align: left; padding: .5rem .55rem; border-bottom: 1px solid var(--hairline); vertical-align: top; }
+  .idtbl th { font-family: var(--mono); font-size: .6rem; letter-spacing: .06em; text-transform: uppercase; color: var(--ink-faint); font-weight: 600; }
+  .idtbl td.p { font-family: var(--mono); font-weight: 700; color: var(--inst); white-space: nowrap; }
+  .idtbl td.feat { color: var(--ink); }
+  .idtbl td.req { color: var(--ink-muted); font-size: .74rem; }
+  .num { font-family: var(--mono); font-size: .72rem; color: var(--ok); }
+  .steps { display: flex; flex-direction: column; gap: .5rem; counter-reset: st; }
+  .st-row { border: 1px solid var(--hairline); border-left: 3px solid var(--pipe-c); border-radius: 9px; background: var(--surface); padding: .6rem .8rem; }
+  .st-row h4 { margin: 0; font-size: .88rem; font-weight: 700; display: flex; align-items: baseline; gap: .5rem; }
+  .st-row h4::before { counter-increment: st; content: "C" counter(st); font-family: var(--mono); font-size: .66rem; color: var(--pipe-c); border: 1px solid var(--pipe-c); border-radius: 4px; padding: .04rem .3rem; }
+  .st-row p { margin: .35rem 0 0; font-size: .8rem; color: var(--ink-muted); line-height: 1.45; }
+  .st-row .idn { display: block; margin-top: .3rem; font-family: var(--mono); font-size: .66rem; color: var(--inst); }
+  .openlist { margin: .3rem 0 0; padding-left: 1.1rem; }
+  .openlist li { font-size: .8rem; color: var(--ink-muted); margin: .25rem 0; line-height: 1.45; }
+  .openlist li b { color: var(--ink); }
+  .vstatus { font-family: var(--mono); font-size: .68rem; color: var(--ink-muted); border: 1px solid var(--hairline); border-left: 3px solid var(--ok); border-radius: 8px; padding: .55rem .75rem; margin: 0 0 1rem; line-height: 1.5; }
+  .vstatus b { color: var(--ink); }
+
   .skel-note { font-size: .9rem; color: var(--ink-muted); border: 1px solid var(--hairline); border-left: 3px solid var(--sc, var(--accent)); border-radius: 10px; background: var(--surface); padding: .8rem 1rem; margin-bottom: 1.2rem; }
   .skel-note b { color: var(--ink); }
   .cards { display: grid; grid-template-columns: repeat(auto-fit, minmax(15rem, 1fr)); gap: .7rem; }
@@ -179,8 +199,8 @@
       <div class="arrow"></div>
       <div class="step">
         <div class="step-top"><span class="step-no">4</span><span class="step-name">Energy ↔ time-of-flight</span><span class="step-eq"><math><mi>E</mi><mo>=</mo><mfrac><mn>1</mn><mn>2</mn></mfrac><msub><mi>m</mi><mi>n</mi></msub><msup><mrow><mo>(</mo><mfrac><mi>L</mi><mrow><mi>t</mi><mo>−</mo><msub><mi>t</mi><mn>0</mn></msub></mrow></mfrac><mo>)</mo></mrow><mn>2</mn></msup></math></span></div>
-        <p class="step-body">Measurement in TOF, physics in energy. <b>L varies per pixel</b> off-axis (per-pixel energy axis). The energy-dependent emission delay lives in <b>exactly one</b> of {t₀, the resolution-kernel mean} — never both.</p>
-        <div class="pills"><span class="pill inst">flight path L (+ per-pixel L(y,x))</span><span class="pill inst">time offset t₀</span></div>
+        <p class="step-body">Measurement in TOF, physics in energy. <span class="fix">Corrected:</span> off-axis <b>geometric</b> per-pixel L is <b>negligible at VENUS</b> (ΔE/E ≈ 6×10⁻⁷ at r = 2 cm, L₀ = 25 m) — <b>one parameter removed</b>; but a per-pixel/per-chip <b>t₀</b> (timing) can reach ΔE/E ≈ 10⁻³ and may be needed. The energy-dependent emission delay lives in <b>exactly one</b> of {t₀, the resolution-kernel mean} — never both.</p>
+        <div class="pills"><span class="pill inst">flight path L (effective, not surveyed)</span><span class="pill inst">time offset t₀ (+ possible per-pixel)</span></div>
       </div>
       <div class="arrow"></div>
       <div class="step">
@@ -220,7 +240,7 @@
           <text class="tb" x="292" y="164" text-anchor="middle" font-size="10">thick · large n·d</text>
           <text class="tf" x="220" y="52" text-anchor="middle" font-size="9">same T → FWHM grows with n·d</text>
         </svg>
-        <p class="capnote">Both dips at the <b>same temperature</b>. Raising areal density widens then saturates the dip — so <b>FWHM ⇏ temperature</b>; n·d and T fit jointly. "FWHM gives T without density" holds only optically-thin (<b>τ₀ ≲ 0.3</b>) with Γ and resolution known.<br><br>A saturated core is <b>not pure background</b> — it carries resolution-leakage + in-scatter + gammas + frame overlap. A model-assisted constraint, not a free zero.</p>
+        <p class="capnote">Both dips at the <b>same temperature</b>. Raising areal density widens then saturates the dip — so <b>FWHM ⇏ temperature</b>; n·d and T fit jointly. "FWHM gives T without density" holds only optically-thin (<b>τ₀ ≲ 0.3</b>) with Γ and resolution known. Note the distinction: that threshold applies to <i>width-only inversion</i>; under <b>full forward-model fitting</b> opacity is deterministic and modelable, so τ₀ ~ 1 is usable (see the calibration section).<br><br>A saturated core is <b>not pure background</b> — it carries resolution-leakage + in-scatter + gammas + frame overlap. A model-assisted constraint, not a free zero.</p>
       </div>
     </div>
     <div class="regime calm">
@@ -247,6 +267,98 @@
       </table>
     </div>
     <p class="tblnote">Instrument carried as a correlated calibration prior or fit jointly — <b>not hard-pinned</b>. Hard-pinning reports <math><msub><mi>C</mi><mtext>cond</mtext></msub></math>; the honest covariance is <math><msub><mi>C</mi><mtext>marg</mtext></msub><mo>=</mo><msub><mi>C</mi><mtext>cond</mtext></msub><mo>+</mo><mi>J</mi><msub><mi>Σ</mi><mtext>cal</mtext></msub><msup><mi>J</mi><mi>T</mi></msup><mo>⪰</mo><msub><mi>C</mi><mtext>cond</mtext></msub></math>. In a toy MC the pinned 1σ bar covered only <b>20.4%</b> vs the nominal 68.3% (≈4× too small; ~27× near the T–resolution degeneracy). Joint fitting is honest <b>and</b> tighter — sharp resonances re-measure resolution and energy scale.</p>
+
+    <h2>Calibration instance — how the instrument is determined</h2>
+    <p class="vstatus"><b>Verification status:</b> reviewed by a second LLM family (Codex) and independently re-derived numerically here; <b>every number below reproduced by both to the quoted digits</b>. Three of the initially-proposed claims were <b>corrected</b> by that review (marked ⚠ corrected). Four further review lenses stalled and did not run — noted for honesty; the numeric claims stand on the two independent reproductions.</p>
+
+    <p class="step-body" style="margin-bottom:1rem">Calibration is the instance where <b>nuclear data and sample state are known and the instrument is solved</b>. Its value comes from <i>which data feature identifies which parameter</i> — and from the degeneracies that fix the order of operations.</p>
+
+    <p class="subhead">Identifiability map</p>
+    <div class="scroller">
+      <table class="idtbl">
+        <thead><tr><th>Parameter</th><th>Identified from</th><th>Requirement / limit</th></tr></thead>
+        <tbody>
+          <tr>
+            <td class="p">L, t₀</td>
+            <td class="feat">Resonance <b>positions</b>. <math><msub><mi>t</mi><mi>r</mi></msub><mo>=</mo><msub><mi>t</mi><mn>0</mn></msub><mo>+</mo><mi>L</mi><msqrt><mrow><msub><mi>m</mi><mi>n</mi></msub><mo>/</mo><mn>2</mn><msub><mi>E</mi><mi>r</mi></msub></mrow></msqrt></math> — linear in <math><msup><mi>E</mi><mrow><mo>−</mo><mn>1</mn><mo>/</mo><mn>2</mn></mrow></msup></math>, so intercept = t₀, slope ∝ L.</td>
+            <td class="req">≥2 well-separated resonances is the <i>algebraic</i> minimum; in practice an overdetermined set. Wide span reduces but <b>never removes</b> the L–t₀ anticorrelation: <span class="num">ρ = −0.81</span> (2 endpoints, 5–200 eV) → <span class="num">−0.88</span> (20 lines); narrow 10–40 eV → <span class="num">−0.97</span>; 8–12 eV → <span class="num">−0.998</span>.</td>
+          </tr>
+          <tr>
+            <td class="p">θ_res</td>
+            <td class="feat">Excess <b>broadening and asymmetry</b> beyond the known natural Γ ⊗ known Doppler.</td>
+            <td class="req">⚠ corrected: sensitivity is <b>resonance-specific</b>, strongest where the instrumental width ≳ Doppler+natural — at VENUS that is the <b>high-energy end</b>; low-energy Ta lines are weak resolution probes. Known parameters give an intrinsic-shape <b>prior, not an exact shape</b> — nuclear/sample uncertainty must be modelled, never absorbed into θ_res.</td>
+          </tr>
+          <tr>
+            <td class="p">nuisances</td>
+            <td class="feat">Open-beam, resonance-free continuum, blocked-beam, charge scaling — <b>plus</b> distinct spectral templates.</td>
+            <td class="req">⚠ corrected (claim refuted): known n·d does <b>not</b> by itself make normalization+background identifiable. It supplies depth information only. <b>Unexplained depth residuals must stay visible as model inadequacy</b>, not be absorbed into background.</td>
+          </tr>
+        </tbody>
+      </table>
+    </div>
+
+    <p class="subhead">Degeneracy structure of the timing model (exact)</p>
+    <div class="regime" style="margin-top:.2rem">
+      <p>Writing the arrival time as <math><mi>t</mi><mo>(</mo><mi>E</mi><mo>)</mo><mo>=</mo><msub><mi>t</mi><mn>0</mn></msub><mo>+</mo><mi>L</mi><mo>/</mo><mi>v</mi><mo>(</mo><mi>E</mi><mo>)</mo><mo>+</mo><mi>lag</mi><mo>(</mo><mi>E</mi><mo>)</mo></math>, the fit spans only <math><mrow><mo>{</mo><mn>1</mn><mo>,</mo><msup><mi>E</mi><mrow><mo>−</mo><mn>1</mn><mo>/</mo><mn>2</mn></mrow></msup><mo>}</mo></mrow></math>. Therefore:</p>
+      <div class="deg">
+        <div class="degp"><b>constant lag ≡ t₀</b> — exactly degenerate (residual <span class="num">3×10⁻¹⁶ µs</span>). ⚠ corrected: <b>a wide energy span does NOT cure this one</b>, contrary to the original claim.</div>
+        <div class="degp"><b>lag ∝ E<sup>−1/2</sup> ≡ L</b> — exactly degenerate (residual <span class="num">4×10⁻¹⁷ µs</span>). So an emission delay of this form is indistinguishable from a longer flight path.</div>
+        <div class="degp"><b>other energy dependences</b> — separable only if the residual after projection exceeds centroid precision (a 1 µs @10 eV lag ∝ E<sup>−1</sup> leaves <span class="num">0.14 µs</span>).</div>
+        <div class="degp"><b>a fixed-time lag is not a fixed extra path</b> — the implied path varies by ~6.3× across 5–200 eV, so the two cannot be conflated.</div>
+      </div>
+      <p style="margin-top:.6rem"><b>Consequences.</b> L, t₀ and the kernel location must be fitted <b>jointly under an explicitly stated anchoring convention</b> — not in sequence. The fitted <b>L is an <i>effective</i> flight path</b> that absorbs the emission depth: it is <b>not</b> the surveyed distance, so a discrepancy against the survey is <b>expected and physical</b>, not a validation failure. Because a constant delay is exactly absorbed by t₀, <b>there is no internal check on t₀</b> — which trigger defines it must be stated externally.</p>
+    </div>
+
+    <p class="subhead">Calibrant &amp; resonance selection <span style="text-transform:none;letter-spacing:0">(⚠ corrected — the original τ₀ ≲ 0.3 rule was too strict)</span></p>
+    <div class="regime calm" style="margin-top:.2rem">
+      <p><b>Span the band</b> (lever arm for L vs t₀, and the kernel's energy dependence) · <b>use a range of optical depths</b>, favouring weak-to-moderate <b>τ₀ up to ~1</b> for the resolution core · <b>keep saturated lines</b> for wing/background diagnostics · <b>isolated</b> lines only (no blends) · fit <b>modelled dip shapes, never raw centroids</b> (an asymmetric kernel plus opacity bias the centroid, which biases <i>both</i> L and t₀).</p>
+      <p style="margin-top:.5rem">Why the change: at τ₀ = 0.3 the dip is only <span class="num">26% deep</span> — too weak to build a resolution determination on — while opacity broadening at τ₀ = 1 is only <span class="num">+28%</span> and is <b>deterministic under the forward model</b>, i.e. modelable rather than corrupting. Apparent/natural HWHM ratio: <span class="num">1.08 / 1.28 / 1.91 / 3.66</span> at τ₀ = 0.3 / 1 / 3 / 10. Also <b>do not</b> impose a capture-dominance cut — it discards the most resolution-sensitive lines; model the interference instead.</p>
+      <p style="margin-top:.5rem"><b>Reality check (new).</b> A real Ta foil is <i>already saturated</i> at its strong low-energy lines: at the 4.28 eV resonance, <span class="num">25 µm → τ₀ ≈ 2.2</span> (dip 89% deep) and <span class="num">100 µm → τ₀ ≈ 8.7</span>. So "use only optically-thin resonances" is <b>not satisfiable</b> there — opacity must be modelled, not avoided.</p>
+    </div>
+
+    <p class="subhead">Is calibration per-pixel? <span style="text-transform:none;letter-spacing:0">(geometry no, timing maybe)</span></p>
+    <div class="regime" style="margin-top:.2rem">
+      <p><b>Geometric per-pixel flight path is unnecessary at VENUS.</b> <math><mi>Δ</mi><mi>L</mi><mo>/</mo><mi>L</mi><mo>≈</mo><msup><mi>r</mi><mn>2</mn></msup><mo>/</mo><mn>2</mn><msubsup><mi>L</mi><mn>0</mn><mn>2</mn></msubsup></math>: at L₀ = 25 m, r = 2 cm gives <span class="num">ΔE/E ≈ 6×10⁻⁷</span>; even a 20 cm-square detector's corner gives <span class="num">3×10⁻⁵</span> — two to three orders below any realistic resolution. <b>This removes a parameter from the model.</b></p>
+      <p style="margin-top:.5rem">⚠ but the corollary is <b>not</b> that the field collapses to one calibration: a per-pixel/per-chip <b>t₀</b> (time-walk, clock distribution, cluster-timing estimator) reaches <span class="num">ΔE/E ≈ 1.4×10⁻³</span> at 10 eV and <span class="num">6.3×10⁻³</span> at 200 eV for a 400 ns offset — at or above resolution. So a genuine 1D-ROI-vs-2D calibration disagreement would indicate <b>timing, statistics, or sub-pixel heterogeneity — not geometry</b>.</p>
+    </div>
+
+    <p class="subhead">What calibration must emit</p>
+    <div class="regime calm" style="margin-top:.2rem">
+      <p>Not point values. The output object is the <b>joint posterior</b>: parameter vector + <b>full covariance</b> (or samples/likelihood if non-Gaussian), <b>plus</b> the resolution model form and its <b>anchoring convention</b>, the <b>validity energy range</b>, the <b>calibrant assumptions it is conditional on</b>, and any <b>correlations with nuclear data</b>.</p>
+      <p style="margin-top:.5rem">Why the full covariance is mandatory: discarding the off-diagonal is wrong in <b>both directions</b>. At ρ = −0.861, the variance of one linear combination is overstated <span class="num">7.2×</span> while the orthogonal one is understated <span class="num">~1.9×</span>; at ρ = −0.98 the overstatement reaches <span class="num">50×</span>. Which error you make depends on which combination the downstream observable happens to be sensitive to — so marginal error bars cannot be salvaged.</p>
+    </div>
+
+    <p class="subhead">The calibration process (physics-derived order)</p>
+    <div class="steps">
+      <div class="st-row"><h4>Select resonances</h4><p>Span the band; a range of optical depths; isolated lines.</p><span class="idn">↳ sets the L–t₀ lever arm and where θ_res is constrained</span></div>
+      <div class="st-row"><h4>Predict the known cross-section</h4><p>σ(E; T_eff) from evaluated parameters at the calibrant's known temperature and areal density.</p><span class="idn">↳ no free parameters — but conditional on nuclear data + calibrant assay, whose uncertainty must be carried</span></div>
+      <div class="st-row"><h4>Joint fit of instrument + nuisances</h4><p>{L, t₀, θ_res} and the nuisances against <b>modelled dip shapes</b>, under an explicit kernel anchoring convention.</p><span class="idn">↳ positions and widths are NOT separable steps (see the degeneracy structure) — one joint fit</span></div>
+      <div class="st-row"><h4>Emit the joint posterior</h4><p>Mean + full covariance + model form + anchor + validity range + conditionality.</p><span class="idn">↳ consumed downstream as a correlated prior or in a joint fit — never hard-pinned</span></div>
+      <div class="st-row"><h4>Self-consistency check</h4><p>Residual structure across resonances, and 1D-ROI vs per-pixel agreement.</p><span class="idn">↳ per-resonance residuals are model-inadequacy evidence and must remain visible, not be absorbed</span></div>
+    </div>
+
+    <p class="subhead">Confirmed gaps &amp; residual couplings <span style="text-transform:none;letter-spacing:0">(physics still to settle — not code)</span></p>
+    <ul class="openlist">
+      <li><b>Bound-atom lattice dynamics vs free-gas T_eff</b> — trades directly against instrumental width, worst below ~20–40 eV where Doppler dominates.</li>
+      <li><b>Multiple scattering / accepted in-scatter</b> — fills dips and creates <i>apparent</i> resolution wings; not a scalar background.</li>
+      <li><b>Detector dead time, MCP gain depletion, pileup, gamma-flash recovery</b> — distorts exactly the short-TOF high-energy lines that carry the resolution information.</li>
+      <li><b>Frame overlap / wraparound</b> — 5–200 eV arrives at 0.13–0.81 ms; slower neutrons from the previous 16.7 ms frame can alias in.</li>
+      <li><b>Background needs distinct spectral templates</b> (constant-in-TOF, ~1/E, prompt tail), not a single (B_s, B_o) pair — this is what refutes the nuisance claim above.</li>
+      <li><b>t₀'s definition</b> — accelerator trigger vs proton-on-target vs moderator reference vs detector trigger vs chopper phase; these drift independently and a constant offset is exactly degenerate with t₀.</li>
+      <li><b>ENDF resonance-parameter covariance</b> — treating nuclear data as exact converts nuclear-data error into a <i>spurious instrument correction</i>.</li>
+      <li><b>Dip-location bias</b> under an asymmetric, non-stationary kernel — minimum ≠ centroid ≠ fitted energy once opacity and asymmetry act.</li>
+      <li><b>Convolution order</b> — Doppler <i>inside</i> σ before exponentiation; instrument kernel <i>after</i>, on Φ·ε·T, with the open beam propagated separately.</li>
+      <li><b>Calibrant assay</b> — Ta-182 activation, Ta-180m, oxide layers, impurities, thickness map: "known n·d" is itself uncertain.</li>
+    </ul>
+
+    <p class="subhead">Open calls for the instrument team</p>
+    <ul class="openlist">
+      <li>The <b>actual VENUS resolution width vs energy</b> — it decides where in the band θ_res is actually constrained.</li>
+      <li>The <b>calibration foil thickness</b> — it decides the τ₀ regime and whether any line is usable optically-thin.</li>
+      <li>Is the calibrant <b>temperature measured</b> or assumed room temperature?</li>
+      <li><b>Per-pixel / per-chip timing calibration</b> — does it exist, and what is its magnitude?</li>
+      <li>Which <b>trigger defines t₀</b>, and how stable is it run-to-run?</li>
+    </ul>
   </section>
 
   <!-- ===================== PIPELINES ===================== -->
