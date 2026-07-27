@@ -129,6 +129,15 @@
   .openlist li b { color: var(--ink); }
   .vstatus { font-family: var(--mono); font-size: .68rem; color: var(--ink-muted); border: 1px solid var(--hairline); border-left: 3px solid var(--ok); border-radius: 8px; padding: .55rem .75rem; margin: 0 0 1rem; line-height: 1.5; }
   .vstatus b { color: var(--ink); }
+  /* evidence-status badges */
+  .ev { font-family: var(--mono); font-size: .52rem; letter-spacing: .05em; text-transform: uppercase; border-radius: 3px; padding: .04rem .3rem; white-space: nowrap; }
+  .ev.ver { color: var(--ok); border: 1px solid var(--ok); }
+  .ev.hyp { color: var(--partial, var(--nui)); border: 1px solid var(--nui); }
+  .ev.unv { color: var(--warn); border: 1px solid var(--warn); }
+  .rank { font-family: var(--mono); font-weight: 700; color: var(--data-c); }
+  .foilname { font-weight: 700; }
+  .srcline { font-family: var(--mono); font-size: .64rem; color: var(--ink-faint); margin: .6rem 0 0; line-height: 1.5; }
+  .srcline a { color: var(--accent); }
 
   .skel-note { font-size: .9rem; color: var(--ink-muted); border: 1px solid var(--hairline); border-left: 3px solid var(--sc, var(--accent)); border-radius: 10px; background: var(--surface); padding: .8rem 1rem; margin-bottom: 1.2rem; }
   .skel-note b { color: var(--ink); }
@@ -385,13 +394,74 @@
   <section class="panel" data-panel="data" role="tabpanel" hidden>
     <div class="skel-note" style="--sc:var(--data-c)"><b>Skeleton — categories established, to finalize against the pipelines.</b> What each pipeline consumes.</div>
     <div class="cards">
-      <div class="card" style="--cc:var(--data-c)"><h4>Calibrant <span class="todo">to detail</span></h4><p>Ta-181 foil (Z=73), room T, uniform thickness, its own sample + OB — the known-(ρ,T) reference. Prefer ENDF/B-VIII.1.</p></div>
+      <div class="card" style="--cc:var(--data-c)"><h4>Calibrant <span class="todo">foil choice ↓</span></h4><p>A known-(ρ,T) reference foil at room T with its own sample + OB. Candidates evaluated below; prefer a full-RRR library (ENDF/B-VIII.1) over VIII.0.</p></div>
       <div class="card" style="--cc:var(--data-c)"><h4>Sample <span class="todo">to detail</span></h4><p>Sample + OB (+ container). Thickness uniform for calibration, variant for spatial (from fitting, not an ingested map).</p></div>
       <div class="card" style="--cc:var(--data-c)"><h4>Domain <span class="todo">to detail</span></h4><p>Transmission (conventional) vs counts (VENUS target, KL-exact). Full foil vs ROI-aggregated.</p></div>
       <div class="card" style="--cc:var(--data-c)"><h4>Acquisition &amp; normalization <span class="todo">to detail</span></h4><p>Proton charge (Q_s, Q_o), incident flux Φ(E), distinct backgrounds B_s ≠ B_o.</p></div>
       <div class="card" style="--cc:var(--data-c)"><h4>ENDF nuclear data <span class="todo">to detail</span></h4><p>Resolved resonance parameters + library/version; the full R-matrix set (see Physics).</p></div>
       <div class="card" style="--cc:var(--data-c)"><h4>Measurement targets <span class="todo">to detail</span></h4><p>Known isotope+T → density · known ρ → temperature · neither → in-situ.</p></div>
     </div>
+
+    <h2>Calibrant foil selection — Ta / W / Au / Ag</h2>
+    <p class="step-body" style="margin-bottom:.8rem">A calibrant serves <b>two distinct jobs</b>, and they favour different foils — which is why "cleanest resonance" and "most preferred" need not be the same material.</p>
+    <div class="deg" style="margin-bottom:1rem">
+      <div class="degp"><b>Job A · energy scale (L, t₀)</b> — wants many accurately-known, well-separated resonance <b>positions</b> spanning the widest <math><msup><mi>E</mi><mrow><mo>−</mo><mn>1</mn><mo>/</mo><mn>2</mn></mrow></msup></math> range. Multi-isotope is harmless: a position is a position.</div>
+      <div class="degp"><b>Job B · resolution function θ_res(E)</b> — wants the <b>instrumental</b> width not swamped by intrinsic Doppler+natural width, <b>sampled across the band</b>, at unsaturated optical depth, on isolated lines. Favours heavy nuclei (<math><msub><mi>Δ</mi><mi>D</mi></msub><mo>∝</mo><mn>1</mn><mo>/</mo><msqrt><mi>A</mi></msqrt></math>).</div>
+    </div>
+
+    <div class="scroller">
+      <table class="idtbl">
+        <thead><tr><th>#</th><th>Foil</th><th>Best for</th><th>Weakest for</th><th>Practical</th></tr></thead>
+        <tbody>
+          <tr>
+            <td class="rank">1</td><td class="p">W</td>
+            <td class="feat"><b>Resolution function.</b> Best kernel coverage — largest <math><msup><mi>E</mi><mrow><mo>−</mo><mn>1</mn><mo>/</mo><mn>2</mn></mrow></msup></math> sampling gap only <span class="num">0.132</span>. Strong low-band lines at <b>4.1 &amp; 7.7 eV</b> <span class="ev ver">verified</span>.</td>
+            <td class="req">Multi-isotope (W-182/183/184/186) → more nuclear-data bookkeeping; harmless for Job A.</td>
+            <td class="req">Refractory, robust, cheap, often already in-beam. Activation <b>W-187 ≈ 24 h</b> — decays away in days <span class="ev unv">t½ unverified</span>.</td>
+          </tr>
+          <tr>
+            <td class="rank">2</td><td class="p">Ta</td>
+            <td class="feat"><b>Verified flight-path standard</b> <span class="ev ver">verified</span>. Effectively mononuclidic (Ta-181 = 99.988%); dense ladder gives many lines across the band.</td>
+            <td class="req">I = 7/2 → many spin groups → ladder <b>crowds/blends above ~50–100 eV</b>.</td>
+            <td class="req">Refractory. Activation <b>Ta-182 ≈ 114 d</b> — a real handling nuisance vs W <span class="ev unv">t½ unverified</span>.</td>
+          </tr>
+          <tr>
+            <td class="rank">3</td><td class="p">Au</td>
+            <td class="feat"><b>Energy-scale anchor.</b> Best lever arm (<span class="num">ρ = −0.79</span>). Mononuclidic (100%), inert, international standard → best-known parameters. 4.906 eV line strongly capture-dominated (<b>Γ = 137.5 meV, Γn = 15.0 meV</b> ⇒ Γ_γ ≈ 122 meV) — hence its exceptional cleanliness <span class="ev ver">verified</span>.</td>
+            <td class="req"><b>Kernel coverage</b> — worst sampling gap <span class="num">0.305</span> (~2× the others), driven by a large 4.9 → ~46.7 eV hole <span class="ev unv">gap unverified</span>. Soft, expensive.</td>
+            <td class="req">Chemically inert (never oxidises); Au-198 ≈ 2.7 d, decays fast.</td>
+          </tr>
+          <tr>
+            <td class="rank">4</td><td class="p">Ag</td>
+            <td class="feat">A known-temperature <b>thermometry</b> reference (Ag-109 5.19 eV) — a different job entirely.</td>
+            <td class="req"><b>The only quantitative physics penalty:</b> lightest ⇒ Doppler width <span class="num">~35% larger</span>, so the instrumental share of the observed width falls to <span class="num">27%</span> vs ~40% for the heavies. Two comparable isotopes (51.8 / 48.2%) interleave ladders.</td>
+            <td class="req">Tarnishes. <b>Long-lived activation</b> (Ag-110m ≈ 250 d, Ag-108m ≈ 438 y) <span class="ev unv">t½ unverified</span>.</td>
+          </tr>
+        </tbody>
+      </table>
+    </div>
+
+    <div class="regime calm" style="margin-top:1rem">
+      <h3>Recommendation — two foils, each in two thicknesses</h3>
+      <p><b>W (or Ta) as the primary multi-line calibrant</b> for θ_res(E) coverage, <b>plus Au as an independent energy-scale anchor</b> and cross-check. They optimise different jobs, and Au's coverage gap stops mattering once it is not carrying the kernel.</p>
+      <p style="margin-top:.5rem"><b>Two thicknesses of the same foil</b> <span class="ev ver">verified</span> — "a linear combination of measurements with two thicknesses… yields better energy resolution than either foil alone… no penalty in counting statistics." This resolves the saturation problem directly: a <b>thin (~10 µm)</b> foil keeps τ₀ ≲ 1 for resolution work while a <b>thicker</b> one supplies deliberately black lines for background/wing diagnosis. All four candidates saturate (τ₀ &gt; 1) by roughly 25–50 µm at their strong low-energy lines, so a single intermediate thickness cannot serve both.</p>
+      <p style="margin-top:.5rem"><b>Fit modelled dip shapes, never raw centroids</b> <span class="ev ver">verified</span> — practice is a linear <math><mi>t</mi></math> vs <math><msup><mi>E</mi><mrow><mo>−</mo><mn>1</mn><mo>/</mo><mn>2</mn></mrow></msup></math> fit for a first L, then refinement by χ² against evaluated data.</p>
+    </div>
+
+    <div class="regime" style="margin-top:.2rem">
+      <h3>Why is W often preferred? — <span style="color:var(--nui)">hypothesis, not confirmed</span></h3>
+      <p>No source was found stating the reason. The <b>proposed</b> explanation rests on solid nuclear physics: the even-even isotopes <b>W-182/184/186 have spin I = 0</b>, so each contributes only a <b>single s-wave spin group (J = ½)</b> and therefore a <b>sparse, widely-spaced ladder</b>. Several sparse ladders superimposed give band coverage with <b>isolated, non-blended</b> lines — whereas one dense ladder (Ta, I = 7/2) crowds. Combined with refractory robustness and short-lived activation, that would explain the preference. <span class="ev hyp">hypothesis</span></p>
+      <p style="margin-top:.5rem">Suggestive but not decisive: a dedicated study exists on <i>Neutron Doppler broadening studies of tantalum and tungsten metal</i> — <b>Ta and W are the canonical pair</b> for this class of work.</p>
+      <p style="margin-top:.5rem"><b>To settle it:</b> ask whether the stated reason is (a) line isolation, (b) refractory robustness, (c) short activation (W-187 24 h vs Ta-182 114 d), or (d) already present in the beamline.</p>
+    </div>
+
+    <p class="subhead">Open items on the foil choice</p>
+    <ul class="openlist">
+      <li><b>Does Au-197 really have a 4.9 → ~46.7 eV gap?</b> The Au ranking depends on it more than on anything else. The GELINA study of ¹⁹⁷Au+n below 200 eV is the authoritative source.</li>
+      <li><b>Activation half-lives</b> — quoted from general knowledge, not verified in session; they carry real operational weight (Ta-182 114 d vs W-187 24 h).</li>
+      <li><b>The actual reason for W's preference</b> — see above; the instrument team can likely resolve this immediately.</li>
+    </ul>
+    <p class="srcline">Sources — <a href="https://arxiv.org/pdf/1909.11120">NRTA feasibility study</a> (flight-path calibration by linear fit; Ta as standard) · <a href="https://arxiv.org/pdf/2012.03937">Compact D-T NRTA</a> (W 4.1/7.7 eV lines) · <a href="https://inis.iaea.org/records/h3s1p-v9y40">Au-197 4.90 eV parameters</a> · <a href="https://publications.jrc.ec.europa.eu/repository/handle/JRC56557">Resonance parameters for ¹⁹⁷Au+n below 200 eV (GELINA)</a> · <a href="https://www.sciencedirect.com/science/article/abs/pii/S0168583X02004809">Doppler broadening studies of Ta and W metal</a> · <a href="https://www.sciencedirect.com/science/article/abs/pii/0167508782902769">Black-and-white filter method for background</a> · <a href="https://www.sciencedirect.com/science/article/abs/pii/0167508783904246">Two-thickness resolution method</a></p>
   </section>
 
   <!-- ===================== API ===================== -->
