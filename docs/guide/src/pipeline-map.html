@@ -397,7 +397,9 @@
     <div class="regime">
       <h3>Temperature instance — known n·d → T_eff</h3>
       <p><b>Identified from:</b> the full line <b>shape</b> (never the raw FWHM — established earlier), specifically the Doppler contribution in excess of the pinned instrument kernel.</p>
-      <p style="margin-top:.5rem"><b>⚑ Where the temperature information lives — and it is the opposite end of the band from the resolution information.</b> The relative Doppler width <math><msub><mi>Δ</mi><mi>D</mi></msub><mo>/</mo><mi>E</mi><mo>∝</mo><msup><mi>E</mi><mrow><mo>−</mo><mn>1</mn><mo>/</mo><mn>2</mn></mrow></msup></math> <b>falls</b> with energy, while the relative instrument width <math><mn>2</mn><mi>δt</mi><mo>/</mo><mi>t</mi><mo>∝</mo><msqrt><mi>E</mi></msqrt></math> <b>grows</b>. They cross at <span class="num">≈ 22 eV</span> (δt = 1 µs) or <span class="num">≈ 7 eV</span> (δt = 3 µs). <b>Below the crossover Doppler dominates → temperature fits; above it the instrument dominates → resolution calibration.</b> This independently reproduces the earlier finding that instrumental width only dominates toward the top of 5–200 eV, and it means the two jobs should deliberately use <i>different resonances</i>.</p>
+      <p style="margin-top:.5rem"><b>⚑ Where the temperature information lives.</b> The relative Doppler width <math><msub><mi>Δ</mi><mi>D</mi></msub><mo>/</mo><mi>E</mi><mo>∝</mo><msup><mi>E</mi><mrow><mo>−</mo><mn>1</mn><mo>/</mo><mn>2</mn></mrow></msup></math> <b>falls</b> with energy, while a moderator-dominated instrument gives a roughly <b>constant</b> relative resolution (see the resolution section). So the Doppler-to-instrument ratio <b>improves monotonically toward low energy</b> — temperature fits should use the <b>lowest usable resonances</b>.</p>
+      <p style="margin-top:.5rem" class="capnote"><b>⚠ Correction to an earlier version of this section.</b> I first compared Doppler against a <i>fixed</i> timing uncertainty, which makes relative resolution grow as √E and produced a "crossover at 22 eV / 7 eV". That model is <b>unphysical</b> — the dominant term is the moderator emission time, which scales as 1/√E and therefore gives constant ΔE/E. <b>The crossover figures are withdrawn.</b> With realistic moderator-dominated resolution (ΔE/E ≈ 1.05×10⁻²) the <b>instrument width equals or exceeds the Doppler width across essentially the whole band</b>, crossing only near the very bottom (<span class="num">≈ 5.2 eV</span>): the ratio is <span class="num">1.02</span> at 5 eV, <span class="num">0.72</span> at 10 eV, <span class="num">0.23</span> at 100 eV. The directional conclusion (favour low-E lines) survives; the numbers did not.</p>
+      <p style="margin-top:.5rem"><b>Consequence — and it is a serious one.</b> Temperature is extracted from a <b>sub-dominant</b> broadening contribution everywhere in the band. That is exactly why the resolution must be pinned from a calibrant <i>and</i> propagated with its covariance: a small θ_res error becomes a large T error. It also independently explains the earlier finding that VENUS suppresses Doppler sensitivity by roughly 4×.</p>
       <p style="margin-top:.5rem"><b>May n·d be pinned?</b> Only if τ₀ is known <i>and</i> small. Since T ∝ Δ_D², a fractional width error maps to ~2× the temperature error: an unmodelled τ₀ drift from 0.3 → 1 inflates the apparent temperature by <span class="num">+37% ≈ +112 K at 300 K</span>; 1 → 3 gives <span class="num">+99% ≈ +297 K</span>. Opacity masquerades as heat.</p>
       <p class="prior" style="margin-top:.5rem">degeneracies: T ⊗ θ_res (the reason calibration runs first) · T ⊗ n·d (curve of growth) · T ⊗ energy scale (a stretched axis mimics broadening)</p>
     </div>
@@ -478,6 +480,51 @@
         <div class="degp"><b>per-resonance residuals</b> — must be reported per line. A model wrong in one resonance but averaged away globally is the failure mode this catches.</div>
       </div>
       <p style="margin-top:.6rem"><b>Model adequacy must stay visible.</b> Nuisance flexibility has to be restricted enough that unexplained structure <i>cannot</i> be absorbed into normalization or background. If the background can reproduce any residual, the fit can never report that the physics is wrong — which is the single most dangerous property an analysis can have.</p>
+    </div>
+
+    <!-- ============ 1.8 RESOLUTION FUNCTION PHYSICS ============ -->
+    <h2>The resolution function — what it physically is</h2>
+    <p class="vstatus"><b>Why this section exists:</b> it was <b>missing</b> from the first pass of this layer — resolution appeared only as a chain step and as a calibration fit target, i.e. as a black box inside a whitebox. That was a scope gap, and closing it immediately produced a correction to the temperature section above. Derived and numerically verified here.</p>
+
+    <div class="regime">
+      <h3>⚑ The moderator emission delay <i>is</i> an extra flight path</h3>
+      <p>A neutron detected at energy E was born fast and had to <b>slow down</b> inside the moderator before leaking out. The slowing-down time to reach E scales as <math><msub><mi>τ</mi><mtext>mod</mtext></msub><mo>=</mo><mi>C</mi><mo>/</mo><msqrt><mi>E</mi></msqrt></math>. Convert that delay to an equivalent path: <math><mi>Δ</mi><mi>L</mi><mo>=</mo><mi>v</mi><mo>·</mo><msub><mi>τ</mi><mtext>mod</mtext></msub><mo>=</mo><msqrt><mrow><mn>2</mn><mi>E</mi><mo>/</mo><mi>m</mi></mrow></msqrt><mo>·</mo><mi>C</mi><mo>/</mo><msqrt><mi>E</mi></msqrt><mo>=</mo><mi>C</mi><msqrt><mrow><mn>2</mn><mo>/</mo><mi>m</mi></mrow></msqrt></math> — <b>energy-independent</b>.</p>
+      <p style="margin-top:.5rem">So a 1/√E emission delay is <b>exactly</b> a constant flight-path offset. This is the physical origin of the exact L-degeneracy found in the calibration section, and it is <b>large</b>: a 3 µs delay at 10 eV corresponds to <span class="num">13.1 cm</span> of apparent extra path — <span class="num">0.53%</span> of a 25 m flight path (1 µs → 4.4 cm; 10 µs → 43.7 cm). Since a <b>0.3% L error is already catastrophic</b> for the fit, the moderator delay is not a refinement — it is the dominant reason the fitted L must differ from the surveyed distance, and why it is meaningless to "check" one against the other.</p>
+    </div>
+
+    <div class="regime calm">
+      <h3>Components, and how each scales</h3>
+      <p>Independent timing contributions <b>convolve</b> (widths add in quadrature only where each is Gaussian — the moderator term is not, so quadrature is a width approximation only). With <math><mi>Δ</mi><mi>E</mi><mo>/</mo><mi>E</mi><mo>=</mo><mn>2</mn><mi>Δ</mi><mi>t</mi><mo>/</mo><mi>t</mi></math> and <math><mi>t</mi><mo>∝</mo><msup><mi>E</mi><mrow><mo>−</mo><mn>1</mn><mo>/</mo><mn>2</mn></mrow></msup></math>:</p>
+      <div class="scroller">
+        <table class="idtbl">
+          <thead><tr><th>Component</th><th>Δt scaling</th><th>ΔE/E scaling</th><th>Note</th></tr></thead>
+          <tbody>
+            <tr><td class="p">Moderator emission</td><td class="feat">∝ 1/√E</td><td class="feat"><b>constant</b></td><td class="req"><b>Dominant across 5–200 eV.</b> Asymmetric (slowing-down rise + storage decay) — this is what Ikeda–Carpenter models.</td></tr>
+            <tr><td class="p">Fixed timing (binning, electronics)</td><td class="feat">constant</td><td class="feat">∝ √E</td><td class="req">Grows with energy; overtakes the moderator only well above the band for plausible values.</td></tr>
+            <tr><td class="p">Geometric ΔL (moderator depth, divergence)</td><td class="feat">— (path, not time)</td><td class="feat">constant</td><td class="req">A flat floor, 2ΔL/L. Off-axis pixel geometry is negligible (≈6×10⁻⁷).</td></tr>
+            <tr><td class="p">Detector conversion depth / time-walk</td><td class="feat">constant, small</td><td class="feat">∝ √E, small</td><td class="req">Per-pixel; the cluster-timing estimator matters more than the depth.</td></tr>
+            <tr><td class="p">Sample thickness</td><td class="feat"><b>none</b></td><td class="feat"><b>none</b></td><td class="req">For <i>unscattered</i> neutrons the total source-to-detector path is unchanged, so a thick sample does <b>not</b> broaden TOF. It enters only via scattering.</td></tr>
+          </tbody>
+        </table>
+      </div>
+      <p style="margin-top:.6rem"><b>Net shape of the resolution curve:</b> moderator-dominated ⟹ <b>ΔE/E is approximately constant</b> across 5–200 eV (≈1.05×10⁻² for a 3 µs @10 eV moderator), with a slow √E rise appearing only at higher energy. <b>This is the fact that corrected the temperature section:</b> relative resolution does <i>not</i> grow across the band, so the earlier Doppler-vs-instrument "crossover" was an artefact.</p>
+    </div>
+
+    <div class="regime">
+      <h3>Constraints any admissible kernel must satisfy — and why a Gaussian fails</h3>
+      <div class="deg">
+        <div class="degp"><b>Non-negative:</b> K ≥ 0 (it is a probability density over arrival times).</div>
+        <div class="degp"><b>Normalised:</b> ∫K dt = 1 — the kernel redistributes neutrons in time, it must not create or destroy them.</div>
+        <div class="degp"><b>Causal:</b> K = 0 before emission. Nothing arrives before it left.</div>
+        <div class="degp"><b>Position-anchored:</b> one convention (mode or mean at zero) must be fixed, or the kernel's location fights t₀ and L.</div>
+      </div>
+      <p style="margin-top:.6rem">A <b>Gaussian violates causality</b>: it has support at negative times. The leaked fraction is Φ(−μ/σ) — <span class="num">15.9%</span> at μ = σ, <span class="num">2.3%</span> at 2σ, <span class="num">0.14%</span> at 3σ. So a Gaussian is only defensible where the mean delay exceeds ~3–4σ. The moderator term is <b>both wide and skewed</b>, which is precisely the regime where a symmetric Gaussian is least valid. <b>Ikeda–Carpenter is causal by construction</b> (its t²e^(−αt) slowing-down term vanishes at t = 0), which is the physics reason to prefer it over a Gaussian — not merely a better fit.</p>
+      <p style="margin-top:.5rem"><b>Ikeda–Carpenter parameters, physically:</b> α = slowing-down decay rate (energy-dependent, faster neutrons escape sooner); β = storage/thermal decay rate; R = the fraction emitted through the storage channel. A tabulated (UDR) kernel is the alternative — it captures real geometry, filters and collimation that no analytic form knows about, but it is only as good as its sampling and does not extrapolate. Physics fixes the <i>family</i> (positive, normalised, causal, moderator-skewed); the choice within it is a modelling decision.</p>
+    </div>
+
+    <div class="regime calm">
+      <h3>Why asymmetry biases the energy scale — "fit shapes, not centroids" is physics</h3>
+      <p>The moderator tail runs to <b>late</b> times, i.e. toward <b>lower apparent energy</b>, so a skewed kernel displaces an observed dip's centroid from the true resonance energy. A mean-vs-mode offset <i>d</i> shifts apparent energy by −2d/t: for d = 2 µs that is <span class="num">−0.50%</span> at 5 eV, <span class="num">−0.99%</span> at 20 eV, <span class="num">−3.13%</span> at 200 eV — <b>and the size varies with energy</b>, so it does not cancel in the L–t₀ straight-line fit; it tilts it, biasing both parameters. Fitting the <b>modelled skewed line shape</b> removes this by construction. That is why the earlier "fit modelled dip shapes, never raw centroids" rule is a physics requirement rather than a numerical preference.</p>
     </div>
   </section>
 
