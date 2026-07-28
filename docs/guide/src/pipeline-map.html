@@ -109,6 +109,49 @@
   .tblnote b { color: var(--ink); }
   .tblnote math { font-size: .95rem; }
 
+  /* pipelines node-edge graph */
+  .pg-scroll { overflow-x: auto; border: 1px solid var(--plot-edge); border-radius: 14px; background: var(--plot); margin-bottom: 1.4rem; }
+  .pgraph { position: relative; display: grid; grid-template-columns: repeat(5, minmax(8.5rem, 1fr)); column-gap: clamp(1.6rem, 4vw, 3rem); align-items: center; min-width: 58rem; padding: 1.5rem 1.3rem; }
+  .pgraph::before { content: ""; position: absolute; inset: 0; background-image: radial-gradient(circle at 1px 1px, var(--plot-edge) 1px, transparent 0); background-size: 26px 26px; opacity: .4; pointer-events: none; }
+  .pedges { position: absolute; left: 0; top: 0; pointer-events: none; overflow: visible; z-index: 0; }
+  .pedge { fill: none; stroke-linecap: round; }
+  .pedge.data { stroke: var(--data-c); stroke-width: 2; }
+  .pedge.flow { stroke: var(--phys-c); stroke-width: 2.2; }
+  .pedge.feedback { stroke: var(--api-c); stroke-width: 1.8; stroke-dasharray: 3 5; }
+  .pelabel { font-family: var(--mono); font-size: 9px; fill: var(--api-c); }
+  .pcol { position: relative; z-index: 1; display: flex; flex-direction: column; gap: .55rem; justify-content: center; }
+  .pcol .colcap { font-family: var(--mono); font-size: .56rem; letter-spacing: .12em; text-transform: uppercase; color: var(--plot-faint); text-align: center; margin-bottom: .05rem; }
+  .pnode { border-radius: 9px; border: 1px solid color-mix(in srgb, var(--nc) 42%, var(--plot-edge)); border-left: 3px solid var(--nc); background: color-mix(in srgb, var(--nc) 13%, var(--plot)); padding: .5rem .6rem; }
+  .pnode.data { --nc: var(--data-c); } .pnode.proc { --nc: var(--phys-c); } .pnode.cal { --nc: var(--api-c); } .pnode.res { --nc: var(--ok); }
+  .pnode .nm { font-family: var(--sans); font-weight: 700; font-size: .78rem; color: #b3c6d6; }
+  .pnode .sub { display: block; font-family: var(--mono); font-size: .56rem; color: var(--plot-faint); margin-top: .2rem; line-height: 1.35; }
+  .pxcut { border: 1px dashed var(--api-c); border-radius: 7px; background: color-mix(in srgb, var(--api-c) 10%, transparent); padding: .35rem .5rem; font-family: var(--mono); font-size: .55rem; color: var(--plot-faint); line-height: 1.35; }
+  .pxcut b { color: var(--api-c); }
+  .pglegend { display: flex; flex-wrap: wrap; gap: 1rem; margin: .8rem 0 0; font-family: var(--mono); font-size: .66rem; color: var(--ink-muted); }
+  .pglegend span { display: inline-flex; align-items: center; gap: .4rem; }
+  .pglegend .ln { width: 1.6rem; border-top: 2.2px solid var(--phys-c); }
+  .pglegend .ln.d { border-color: var(--data-c); }
+  .pglegend .ln.f { border-color: var(--api-c); border-top-style: dashed; }
+
+  /* pipeline stage sequences */
+  .plsteps { display: flex; flex-direction: column; gap: .45rem; counter-reset: pls; margin-top: .5rem; }
+  .pls { border: 1px solid var(--hairline); border-left: 3px solid var(--plc, var(--pipe-c)); border-radius: 9px; background: var(--surface); padding: .55rem .75rem; }
+  .pls h4 { margin: 0; font-size: .84rem; font-weight: 700; display: flex; align-items: baseline; gap: .5rem; flex-wrap: wrap; }
+  .pls h4::before { counter-increment: pls; content: counter(pls); font-family: var(--mono); font-size: .62rem; color: var(--plc, var(--pipe-c)); border: 1px solid var(--plc, var(--pipe-c)); border-radius: 4px; padding: .03rem .34rem; }
+  .pls p { margin: .3rem 0 0; font-size: .78rem; color: var(--ink-muted); line-height: 1.45; }
+  .pls p b { color: var(--ink); }
+  .pls .why { display: block; margin-top: .25rem; font-family: var(--mono); font-size: .62rem; color: var(--pipe-c); }
+  .pls .dec { display: inline-block; margin-top: .3rem; font-family: var(--mono); font-size: .6rem; color: var(--api-c); border: 1px dashed var(--api-c); border-radius: 5px; padding: .08rem .4rem; }
+  .plhead { display: flex; align-items: baseline; gap: .6rem; flex-wrap: wrap; margin: 1.6rem 0 .2rem; }
+  .plhead h3 { margin: 0; font-size: 1rem; font-weight: 700; }
+  .plhead .pltag { font-family: var(--mono); font-size: .58rem; letter-spacing: .06em; text-transform: uppercase; border: 1px solid var(--pipe-c); color: var(--pipe-c); border-radius: 4px; padding: .05rem .35rem; }
+  .dimsplit { display: grid; grid-template-columns: 1fr; gap: .6rem; margin-top: .5rem; }
+  @media (min-width: 42rem) { .dimsplit { grid-template-columns: 1fr 1fr; } }
+  .dimbox { border: 1px dashed var(--hairline); border-radius: 8px; padding: .55rem .7rem; }
+  .dimbox h5 { margin: 0 0 .3rem; font-family: var(--mono); font-size: .64rem; letter-spacing: .08em; text-transform: uppercase; color: var(--pipe-c); }
+  .dimbox p { margin: .25rem 0 0; font-size: .76rem; color: var(--ink-muted); line-height: 1.45; }
+  .dimbox p b { color: var(--ink); }
+
   /* skeleton tabs */
   /* calibration section */
   .idtbl { width: 100%; border-collapse: collapse; font-size: .78rem; }
@@ -162,7 +205,7 @@
   <div class="tabs" role="tablist" aria-label="Views">
     <button type="button" class="tab t-over" role="tab" data-tab="overview" aria-selected="true"><span class="dotc"></span> Overview</button>
     <button type="button" class="tab t-phys" role="tab" data-tab="physics" aria-selected="false"><span class="dotc"></span> Physics <span class="st">✓</span></button>
-    <button type="button" class="tab t-pipe" role="tab" data-tab="pipelines" aria-selected="false"><span class="dotc"></span> Pipelines <span class="st">skeleton</span></button>
+    <button type="button" class="tab t-pipe" role="tab" data-tab="pipelines" aria-selected="false"><span class="dotc"></span> Pipelines <span class="st">✓</span></button>
     <button type="button" class="tab t-data" role="tab" data-tab="data" aria-selected="false"><span class="dotc"></span> Data <span class="st">skeleton</span></button>
     <button type="button" class="tab t-api" role="tab" data-tab="api" aria-selected="false"><span class="dotc"></span> API <span class="st">pending</span></button>
   </div>
@@ -174,7 +217,7 @@
       <span class="harr">→</span>
       <button class="area phys" data-goto="physics"><span class="an">Physics <span class="status">verified</span></span><span class="as">the one shared forward model + statistics every fit runs</span></button>
       <span class="harr">→</span>
-      <button class="area pipe" data-goto="pipelines"><span class="an">Pipelines <span class="status">skeleton</span></span><span class="as">the concrete instances (calibration + experiments) built on it</span></button>
+      <button class="area pipe" data-goto="pipelines"><span class="an">Pipelines <span class="status">done</span></span><span class="as">the concrete instances (calibration + experiments) built on it</span></button>
       <span class="harr">→</span>
       <button class="area api" data-goto="api"><span class="an">API <span class="status">pending</span></span><span class="as">the contract that exposes them — specified last</span></button>
     </div>
@@ -530,21 +573,118 @@
 
   <!-- ===================== PIPELINES ===================== -->
   <section class="panel" data-panel="pipelines" role="tabpanel" hidden>
-    <div class="skel-note" style="--sc:var(--pipe-c)"><b>Skeleton — to finalize step by step.</b> Each pipeline is a concrete ordered sequence built on the <b>one shared forward model</b> (Physics tab). Same engine, many instances — that is the anti-rot property. Details, edges, and the transmission-vs-counts choice per stage come next.</div>
+    <p class="lede">The concrete processes. <b>One shared spine</b> — reduce → model+likelihood → fit → results — instantiated four ways. Every stage below cites the Physics-tab result it derives from; <b>no physics is re-derived here</b>. That single-spine property is the anti-rot design: a new capability is a new <i>instance configuration</i>, never a new parallel path.</p>
 
-    <p class="subhead">Shared stages (every pipeline)</p>
-    <div class="cards">
-      <div class="card" style="--cc:var(--data-c)"><h4>Reduction <span class="todo">to detail</span></h4><p>Raw counts → observable on a calibrated energy axis, one convention shared by calibrant &amp; sample.</p></div>
-      <div class="card" style="--cc:var(--phys-c)"><h4>Forward model + likelihood <span class="todo">→ Physics</span></h4><p>The shared engine; transmission-χ² vs counts-KL chosen by the screening rule.</p></div>
-      <div class="card" style="--cc:var(--ok)"><h4>Results / QC / uncertainty <span class="todo">to detail</span></h4><p>Value + σ + goodness-of-fit + trust maps; transmission↔counts &amp; 1D↔2D consistency; calibration-covariance floor.</p></div>
+    <div class="pg-scroll">
+      <div class="pgraph" id="pgraph">
+        <svg class="pedges" id="pedges" aria-hidden="true">
+          <defs>
+            <marker id="parr" viewBox="0 0 10 10" refX="8.5" refY="5" markerWidth="6.5" markerHeight="6.5" orient="auto-start-reverse">
+              <path d="M0 0 L10 5 L0 10 z" fill="context-stroke"></path>
+            </marker>
+          </defs>
+        </svg>
+        <div class="pcol">
+          <div class="colcap">data</div>
+          <div class="pnode data" id="pn-cal-data"><span class="nm">Calibrant</span><span class="sub">W/Ta + Au anchor · two thicknesses · own OB</span></div>
+          <div class="pnode data" id="pn-sam-data"><span class="nm">Sample</span><span class="sub">sample + OB (+ container) · Q per run</span></div>
+          <div class="pnode data" id="pn-endf"><span class="nm">ENDF</span><span class="sub">resonance params + covariance · library/version</span></div>
+        </div>
+        <div class="pcol">
+          <div class="colcap">reduce</div>
+          <div class="pnode proc" id="pn-reduce"><span class="nm">Reduction</span><span class="sub">one convention, calibrant &amp; sample · broken-pixel mask only · arms split here</span></div>
+        </div>
+        <div class="pcol">
+          <div class="colcap">model</div>
+          <div class="pnode proc" id="pn-model"><span class="nm">Forward model + likelihood</span><span class="sub">σ(E;T_eff) → Beer-Lambert → K(t|E) on counts · χ² | Poisson/KL</span></div>
+          <div class="pxcut" id="pn-gate"><b>◇ identifiability screen</b> — τ₀ regime + parameter resolvability, gates entry to any fit loop</div>
+        </div>
+        <div class="pcol">
+          <div class="colcap">fit</div>
+          <div class="pnode cal" id="pn-cal"><span class="nm">Calibration</span><span class="sub">solve L, t₀, θ_res → joint posterior</span></div>
+          <div class="pnode proc" id="pn-den"><span class="nm">Density</span><span class="sub">n·d (+T joint unless thin)</span></div>
+          <div class="pnode proc" id="pn-tem"><span class="nm">Temperature</span><span class="sub">T (+n·d joint) · low-E lines</span></div>
+          <div class="pnode proc" id="pn-ins"><span class="nm">In-situ</span><span class="sub">global fit over series</span></div>
+          <div class="pxcut" id="pn-spax"><b>▚ spatial estimator</b> — ROI ⟨exp(−τ)⟩ | per-pixel | regularized (2D/3D of every instance)</div>
+        </div>
+        <div class="pcol">
+          <div class="colcap">results</div>
+          <div class="pnode res" id="pn-res"><span class="nm">Results / QC</span><span class="sub">value + σ + GOF + trust + residual cube · predicted-value consistency tests</span></div>
+        </div>
+      </div>
+    </div>
+    <div class="pglegend">
+      <span><span class="ln d"></span> data</span>
+      <span><span class="ln"></span> process flow</span>
+      <span><span class="ln f"></span> instrument posterior (calibration → model)</span>
     </div>
 
-    <p class="subhead">Instances (fixed/free partitions of the model)</p>
-    <div class="cards">
-      <div class="card" style="--cc:var(--api-c)"><h4>Calibration <span class="todo">to detail</span></h4><p>Known calibrant → solves the instrument (L, t₀, θ_res). Prerequisite; carried forward as a prior, not hard-pinned.</p></div>
-      <div class="card" style="--cc:var(--pipe-c)"><h4>Density <span class="todo">to detail</span></h4><p>Known isotope + T → n·d (jointly with T unless τ₀≲0.3).</p><div class="dims"><span class="dim">1D</span><span class="dim">2D</span><span class="dim">3D later</span></div></div>
-      <div class="card" style="--cc:var(--pipe-c)"><h4>Temperature <span class="todo">to detail</span></h4><p>Known density → T (jointly with n·d), via Doppler width.</p><div class="dims"><span class="dim">1D</span><span class="dim">2D</span><span class="dim">3D later</span></div></div>
-      <div class="card" style="--cc:var(--pipe-c)"><h4>In-situ <span class="todo">to detail</span></h4><p>→ n·d + T jointly, tracking composition vs temperature.</p><div class="dims"><span class="dim">1D</span><span class="dim">2D</span><span class="dim">3D later</span></div></div>
+    <h2>Shared stage · Reduction <span style="text-transform:none;letter-spacing:0">(one convention — used verbatim by all four instances)</span></h2>
+    <div class="plsteps" style="--plc:var(--data-c)">
+      <div class="pls"><h4>Broken-pixel mask</h4><p>Union of sample ∪ OB masks; <b>hard-exclude broken pixels only</b> — never a low-count or quality screen (low-count pixels are alive and the counts likelihood handles them).</p><span class="why">↳ Physics: masking by counts would bias the Poisson statistics it feeds</span></div>
+      <div class="pls"><h4>TOF binning</h4><p>Bin edges recorded per run; per-bin width Δt carried (it multiplies every predicted count in the counts arm).</p></div>
+      <div class="pls"><h4>Energy axis</h4><p><math><mi>E</mi><mo>=</mo><mfrac><mn>1</mn><mn>2</mn></mfrac><msub><mi>m</mi><mi>n</mi></msub><msup><mrow><mo>(</mo><mi>L</mi><mo>/</mo><mo>(</mo><mi>t</mi><mo>−</mo><msub><mi>t</mi><mn>0</mn></msub><mo>)</mo><mo>)</mo></mrow><mn>2</mn></msup></math> using the <b>calibration posterior</b> (L is the effective flight path). <b>Identical convention for calibrant and sample</b> — a divergence here invalidates the calibration transfer. No per-pixel geometric L (negligible, ≈6×10⁻⁷); per-pixel t₀ only if timing calibration shows it is needed.</p><span class="why">↳ Physics: calibration §, resolution § (emission delay ≡ path offset)</span></div>
+      <div class="pls"><h4>Arm split — the domain decision lives here</h4><p><b>Counts arm (default):</b> keep (S, O, Q_s, Q_o) separate — no ratio is ever formed; flux and background stay inside the model. <b>Transmission arm (convention):</b> form T=(S/Q_s)/(O/Q_o) with σ_T <b>only if admissible</b>: &gt;~100 open counts/bin <i>and</i> the resolution-order screening rule passes.</p><span class="dec">decision: counts unless both admissibility tests pass — recorded per dataset</span></div>
+      <div class="pls"><h4>Output + provenance</h4><p>Reduced observable + per-bin uncertainties + the full provenance record (bin edges, masks, Q values, axis parameters with their covariance, library/version).</p></div>
+    </div>
+
+    <h2>Shared stage · Forward model + likelihood <span style="text-transform:none;letter-spacing:0">(one invocation — the Physics tab is its specification)</span></h2>
+    <div class="plsteps" style="--plc:var(--phys-c)">
+      <div class="pls"><h4>Assemble σ(E; T_eff)</h4><p>Coherent Reich-Moore per isotope from ENDF (full parameter set incl. signs, radii, distant levels), Doppler-broadened at the effective temperature.</p></div>
+      <div class="pls"><h4>Attenuate + instrument</h4><p>Beer-Lambert with per-instance n·d structure; resolution kernel <math><mi>K</mi><mo>(</mo><mi>t</mi><mo>∣</mo><mi>E</mi><mo>)</mo></math> applied to expected <b>counts</b> (Φ·ε·T), position-anchored.</p></div>
+      <div class="pls"><h4>Objective</h4><p>Counts arm: Poisson/KL deviance, D/(n−k)→1 as the built-in GOF. Transmission arm: Gaussian χ² with model-based (Pearson) weights — <b>never Neyman</b> (data-based variance biases amplitudes low).</p></div>
+      <div class="pls"><h4>◇ Identifiability screen</h4><p>Before any fit loop: τ₀ regime per resonance (thin / moderate / saturated), parameter resolvability for the requested fixed/free partition, and the instrument prior conditioning. <b>Fails loudly</b> — a non-identifiable request is rejected, not silently regularized.</p><span class="dec">gate: runs once per configuration, not per pixel</span></div>
+    </div>
+
+    <h2>Pipeline · Calibration <span style="text-transform:none;letter-spacing:0">(prerequisite — produces the instrument posterior)</span></h2>
+    <div class="plsteps" style="--plc:var(--api-c)">
+      <div class="pls"><h4>Select resonances</h4><p>Span the band; range of optical depths (thin foil for the kernel core, thick for black-line wings/background); isolated lines only.</p></div>
+      <div class="pls"><h4>Reduce calibrant + OB</h4><p>Shared reduction convention with <i>nominal</i> axis parameters (the fit refines them).</p></div>
+      <div class="pls"><h4>Predict known σ(E; T_eff)</h4><p>Calibrant n·d and T known; ENDF parameters with covariance carried, not treated as exact.</p></div>
+      <div class="pls"><h4>Joint fit {L, t₀, θ_res} + nuisances</h4><p>Against <b>modelled dip shapes</b> (never centroids — kernel asymmetry tilts the L–t₀ line), under an explicit kernel anchor. Positions and widths in <b>one</b> fit — the degeneracy structure forbids a sequential split.</p></div>
+      <div class="pls"><h4>Emit the joint posterior</h4><p>(θ̂, Σ_cal) with off-diagonals + kernel form + anchor convention + validity range + conditionality on the calibrant assay.</p></div>
+      <div class="pls"><h4>Self-consistency</h4><p>Per-resonance residuals (must stay visible); 1D-ROI vs per-pixel agreement (geometry predicts identity; disagreement ⇒ timing/statistics/heterogeneity).</p></div>
+    </div>
+
+    <h2>Pipeline · Density <span style="text-transform:none;letter-spacing:0">(isotope + T known → n·d)</span></h2>
+    <div class="plsteps">
+      <div class="pls"><h4>Configure</h4><p>Free: (n·d)ᵢ + nuisances. T: <b>pinned only if the screen confirms the thin regime</b> (area conservation makes n·d T-independent there); otherwise joint with a tight prior. Instrument: correlated prior from the calibration posterior.</p><span class="dec">τ₀ ≈ 2.2 is the optimal sample thickness for density precision</span></div>
+      <div class="pls"><h4>Fit through the shared model</h4><p>Counts arm by default; the equivalent width / integrated strength carries the information, so saturated lines still contribute lower bounds.</p></div>
+      <div class="pls"><h4>Results / QC</h4><p>n·d map + σ (with the calibration floor separated from statistics) + GOF + per-resonance residuals.</p></div>
+    </div>
+    <div class="dimsplit">
+      <div class="dimbox"><h5>1D · ROI</h5><p>Sum counts over the ROI (Poisson sums are Poisson) — but the ROI forward model is <b>⟨exp(−τ)⟩</b>, not exp(−⟨τ⟩); with the uniform model expect the <b>−Var(τ)/2 underestimate</b> in heterogeneous ROIs.</p></div>
+      <div class="dimbox"><h5>2D · per-pixel</h5><p>Screen once, then the per-pixel loop; spatial estimator per the axis (independent today; regularization only where physically justified, with effective-dof accounting). Sub-pixel heterogeneity enters as ⟨exp(−τ)⟩ within the pixel.</p></div>
+    </div>
+
+    <h2>Pipeline · Temperature <span style="text-transform:none;letter-spacing:0">(n·d known → T_eff)</span></h2>
+    <div class="plsteps">
+      <div class="pls"><h4>Configure</h4><p>Free: T_eff + nuisances; n·d joint with a tight prior <b>unless</b> τ₀ is known small (opacity mimics heat: τ₀ drift 0.3→1 reads as +112 K). Instrument prior mandatory — T is a <b>sub-dominant</b> broadening everywhere in band, so θ_res covariance dominates the T error budget.</p><span class="dec">prefer the lowest usable resonances — Doppler/instrument ratio improves toward low E</span></div>
+      <div class="pls"><h4>Fit through the shared model</h4><p>Full line-shape fit (never width-only); report T_eff with the Debye/lattice relation to thermodynamic T stated.</p></div>
+      <div class="pls"><h4>Results / QC</h4><p>T map + σ split (statistical vs calibration floor) + GOF; flag pixels where the posterior leans on the prior (information-poor).</p></div>
+    </div>
+    <div class="dimsplit">
+      <div class="dimbox"><h5>1D · ROI</h5><p>Reported T is the ROI-average effective temperature; gradients inside the ROI bias it (path/area averaging, stated on output).</p></div>
+      <div class="dimbox"><h5>2D · per-pixel</h5><p>Per-pixel T_eff is still a <b>beam-path average</b>; only tomography resolves along-beam gradients (deferred).</p></div>
+    </div>
+
+    <h2>Pipeline · In-situ <span style="text-transform:none;letter-spacing:0">(series → n·d + T per frame)</span></h2>
+    <div class="plsteps">
+      <div class="pls"><h4>Declare the sharing structure</h4><p><b>Part of the experiment definition, not an implementation choice:</b> which parameters are global across the series (n·d absent composition change) vs per-frame (T). If composition genuinely evolves, per-isotope n·d becomes per-frame — declared, with the identifiability screen re-run.</p></div>
+      <div class="pls"><h4>Thermal-expansion term</h4><p>Areal density scales as <math><msup><mrow><mo>(</mo><mn>1</mn><mo>+</mo><mi>α</mi><mi>Δ</mi><mi>T</mi><mo>)</mo></mrow><mrow><mo>−</mo><mn>2</mn></mrow></msup></math> — in the model as a deterministic link, not a free parameter; omitting it masquerades as mass loss (−1.25%/1000 K for Ta).</p></div>
+      <div class="pls"><h4>Global fit over the series</h4><p>One joint fit across frames (shared n·d + per-frame T beats frame-by-frame identifiability); separation powered by the energy dependence across ≥2 resonances of differing strength.</p></div>
+      <div class="pls"><h4>Results / QC</h4><p>n·d(frame), T(frame) trajectories with correlated uncertainty bands; per-frame GOF; explicit test of the sharing assumption (residual trend across frames = evidence of undeclared evolution).</p></div>
+    </div>
+    <div class="dimsplit">
+      <div class="dimbox"><h5>1D · ROI</h5><p>The default in-situ mode: time series of ROI fits under the global model.</p></div>
+      <div class="dimbox"><h5>2D · per-pixel</h5><p>Per-pixel series fits; sharing structure applies per pixel. Heaviest compute — the screen decides whether the per-pixel information supports it or binning is required.</p></div>
+    </div>
+
+    <h2>Shared stage · Results / QC <span style="text-transform:none;letter-spacing:0">(every instance terminates here)</span></h2>
+    <div class="plsteps" style="--plc:var(--ok)">
+      <div class="pls"><h4>Product family</h4><p>Value map · 1σ map (statistical and correlated-systematic parts <b>separated</b> — the calibration floor does not average down) · GOF/deviance map · trust mask · residual cube.</p></div>
+      <div class="pls"><h4>Consistency tests, each with a predicted value</h4><p>1D↔2D: predicted offset −Var(τ)/2, <b>not zero</b>. Transmission↔counts: within ratio-bias (≈1/λ_o) + resolution-order bias. Deviance: D/(n−k)→1. Per-resonance residuals reported per line.</p></div>
+      <div class="pls"><h4>Model-adequacy guard</h4><p>Nuisance flexibility restricted so unexplained structure <b>cannot</b> be absorbed; residual structure is surfaced as a finding, never smoothed away.</p></div>
     </div>
   </section>
 
@@ -640,14 +780,72 @@
   (function () {
     var tabs = Array.prototype.slice.call(document.querySelectorAll(".tab"));
     var panels = Array.prototype.slice.call(document.querySelectorAll(".panel"));
+
+    var graph = document.getElementById("pgraph");
+    var svg = document.getElementById("pedges");
+    var EDGES = [
+      { from: "pn-cal-data", to: "pn-reduce", type: "data" },
+      { from: "pn-sam-data", to: "pn-reduce", type: "data" },
+      { from: "pn-endf", to: "pn-model", type: "data" },
+      { from: "pn-reduce", to: "pn-model", type: "flow" },
+      { from: "pn-model", to: "pn-cal", type: "flow" },
+      { from: "pn-model", to: "pn-den", type: "flow" },
+      { from: "pn-model", to: "pn-tem", type: "flow" },
+      { from: "pn-model", to: "pn-ins", type: "flow" },
+      { from: "pn-den", to: "pn-res", type: "flow" },
+      { from: "pn-tem", to: "pn-res", type: "flow" },
+      { from: "pn-ins", to: "pn-res", type: "flow" },
+      { from: "pn-cal", to: "pn-model", type: "feedback" }
+    ];
+    function pt(el, side) {
+      var r = el.getBoundingClientRect(), g = graph.getBoundingClientRect();
+      var y = r.top + r.height / 2 - g.top + graph.scrollTop;
+      var x = (side === "right" ? r.right : side === "left" ? r.left : (r.left + r.right) / 2) - g.left + graph.scrollLeft;
+      if (side === "top") y = r.top - g.top + graph.scrollTop;
+      return { x: x, y: y };
+    }
+    function draw() {
+      if (!graph || graph.offsetWidth === 0) return;
+      var w = graph.scrollWidth, h = graph.scrollHeight;
+      svg.setAttribute("width", w); svg.setAttribute("height", h);
+      svg.setAttribute("viewBox", "0 0 " + w + " " + h);
+      Array.prototype.slice.call(svg.querySelectorAll(".drawn")).forEach(function (n) { n.remove(); });
+      EDGES.forEach(function (e) {
+        var a = document.getElementById(e.from), b = document.getElementById(e.to);
+        if (!a || !b) return;
+        var d, path = document.createElementNS("http://www.w3.org/2000/svg", "path");
+        if (e.type === "feedback") {
+          var p0 = pt(a, "top"), p1 = pt(b, "top");
+          var ytop = Math.min(p0.y, p1.y) - 26;
+          d = "M" + p0.x + " " + p0.y + " C" + p0.x + " " + ytop + " " + p1.x + " " + ytop + " " + p1.x + " " + p1.y;
+          var t = document.createElementNS("http://www.w3.org/2000/svg", "text");
+          t.setAttribute("x", (p0.x + p1.x) / 2); t.setAttribute("y", ytop - 4);
+          t.setAttribute("text-anchor", "middle"); t.setAttribute("class", "pelabel drawn");
+          t.textContent = "instrument posterior (θ̂, Σ_cal)";
+          svg.appendChild(t);
+        } else {
+          var s = pt(a, "right"), q = pt(b, "left");
+          var dx = Math.max(24, (q.x - s.x) * 0.5);
+          d = "M" + s.x + " " + s.y + " C" + (s.x + dx) + " " + s.y + " " + (q.x - dx) + " " + q.y + " " + q.x + " " + q.y;
+        }
+        path.setAttribute("d", d);
+        path.setAttribute("class", "pedge " + e.type + " drawn");
+        path.setAttribute("marker-end", "url(#parr)");
+        svg.appendChild(path);
+      });
+    }
+
     function activate(name) {
       tabs.forEach(function (t) { t.setAttribute("aria-selected", String(t.getAttribute("data-tab") === name)); });
       panels.forEach(function (p) { p.hidden = (p.getAttribute("data-panel") !== name); });
       window.scrollTo({ top: 0, behavior: "smooth" });
+      if (name === "pipelines") requestAnimationFrame(draw);
     }
     tabs.forEach(function (t) { t.addEventListener("click", function () { activate(t.getAttribute("data-tab")); }); });
     document.querySelectorAll("[data-goto]").forEach(function (b) {
       b.addEventListener("click", function () { activate(b.getAttribute("data-goto")); });
     });
+    var rz;
+    window.addEventListener("resize", function () { clearTimeout(rz); rz = setTimeout(draw, 120); });
   })();
 </script>
