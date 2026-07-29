@@ -93,20 +93,11 @@
   .eqline { margin: .5rem 0 .2rem; padding: .35rem .6rem; background: var(--surface-2); border-radius: 7px; overflow-x: auto; }
   .eqline math { font-size: 1.02rem; }
   .fix { color: var(--warn); font-weight: 600; }
-  .pills { display: flex; flex-wrap: wrap; gap: .35rem; margin-top: .55rem; }
-  .pill { font-family: var(--mono); font-size: .62rem; border-radius: 5px; padding: .12rem .45rem; border: 1px solid var(--pc); color: var(--pc); background: color-mix(in srgb, var(--pc) 10%, transparent); }
-  .pill.nuc{--pc:var(--nuc);} .pill.inst{--pc:var(--inst);} .pill.samp{--pc:var(--samp);} .pill.nui{--pc:var(--nui);} .pill.warn{--pc:var(--warn);font-weight:700;}
+  .parline { font-family: var(--mono); font-size: var(--fs-label); color: var(--ink-faint); margin: .5rem 0 0; max-width: 76ch; }
+  .parflag { color: var(--warn); }
   .scope { font-family: var(--mono); font-size: var(--fs-label); color: var(--ink-faint); background: var(--surface-2); border-radius: 6px; padding: .3rem .55rem; margin-top: .5rem; display: inline-block; }
   .arrow { align-self: center; width: 2px; height: 1.15rem; background: var(--hairline); }
 
-  .groups { display: grid; grid-template-columns: repeat(auto-fit, minmax(13rem, 1fr)); gap: .8rem; }
-  .grp { border: 1px solid var(--hairline); border-top: 3px solid var(--gc); border-radius: 10px; background: var(--surface); padding: .75rem .85rem; }
-  .grp.nuc{--gc:var(--nuc);} .grp.inst{--gc:var(--inst);} .grp.samp{--gc:var(--samp);} .grp.nui{--gc:var(--nui);}
-  .grp h3 { margin: 0; font-size: .9rem; font-weight: 700; display: flex; align-items: baseline; gap: .5rem; flex-wrap: wrap; }
-  .grp .disp { font-family: var(--mono); font-size: var(--fs-chip); letter-spacing: .06em; text-transform: uppercase; color: var(--gc); border: 1px solid var(--gc); border-radius: 4px; padding: .05rem .32rem; }
-  .grp ul { margin: .5rem 0 0; padding-left: 1.05rem; }
-  .grp li { font-family: var(--mono); font-size: .7rem; color: var(--ink); margin: .18rem 0; line-height: 1.4; }
-  .grp .role { margin: .5rem 0 0; font-size: var(--fs-caption); color: var(--ink-muted); }
 
   .regime { border: 1px solid var(--hairline); border-left: 3px solid var(--warn); border-radius: 10px; background: var(--surface); padding: .9rem 1.05rem; margin-bottom: .8rem; }
   .regime.calm { border-left-color: var(--samp); }
@@ -125,10 +116,6 @@
   .plot .tf { fill: var(--plot-faint); } .plot .ts { fill: var(--plot-line); } .plot .tb { fill: var(--plot-line2); }
   .capnote { font-size: var(--fs-caption); color: var(--ink-muted); line-height: 1.5; max-width: 72ch; }
   .capnote b { color: var(--ink); }
-  .deg { display: grid; grid-template-columns: 1fr; gap: .5rem; margin-top: .3rem; }
-  @media (min-width: 34rem){ .deg { grid-template-columns: 1fr 1fr; } }
-  .degp { font-size: var(--fs-caption); color: var(--ink-muted); border: 1px dashed var(--hairline); border-radius: 7px; padding: .5rem .6rem; line-height: 1.45; }
-  .degp b { color: var(--ink); }
   .inst-tbl { width: 100%; border-collapse: collapse; font-size: .78rem; }
   .inst-tbl th, .inst-tbl td { text-align: left; padding: .5rem .55rem; border-bottom: 1px solid var(--hairline); vertical-align: top; }
   .inst-tbl th { font-family: var(--mono); font-size: .6rem; letter-spacing: .06em; text-transform: uppercase; color: var(--ink-faint); font-weight: 600; }
@@ -142,62 +129,53 @@
   .nomen div { font-size: var(--fs-caption); color: var(--ink-muted); padding: .12rem 0; }
   .nomen b { font-family: var(--mono); color: var(--ink); font-weight: 600; margin-right: .3rem; }
 
-  /* pipelines node-edge graph */
-  .pgwrap { border: 1px solid var(--plot-edge); border-radius: 14px; background: var(--plot); margin-bottom: .5rem; overflow-x: auto; }
-  .pgraph { position: relative; display: grid; grid-template-columns: repeat(6, minmax(6.6rem, 1fr)); column-gap: clamp(.7rem, 1.6vw, 1.3rem); align-items: center; min-width: 44rem; padding: 2.7rem .9rem 2.4rem; }
-  .pgraph::before { content: ""; position: absolute; inset: 0; background-image: radial-gradient(circle at 1px 1px, var(--plot-edge) 1px, transparent 0); background-size: 26px 26px; opacity: .4; pointer-events: none; }
-  .pedges { position: absolute; left: 0; top: 0; pointer-events: none; overflow: visible; z-index: 0; }
-  .pedge { fill: none; stroke-linecap: round; stroke-linejoin: round; }
-  .pedge.data { stroke: var(--data-c); stroke-width: 2; }
-  .pedge.flow { stroke: var(--phys-c); stroke-width: 2.2; }
-  .pedge.feedback { stroke: var(--api-c); stroke-width: 1.8; stroke-dasharray: 3 5; }
-  .pjunction { fill: var(--phys-c); }
-  .pelabel { font-family: var(--mono); font-size: 10px; }
-  .pelabel.fb { fill: var(--api-c); }
-  .pelabel.dt { fill: var(--data-c); }
-  .plabelbg { fill: var(--plot); stroke: var(--plot-edge); stroke-width: 1; rx: 4; }
-  .pcol { position: relative; z-index: 1; display: flex; flex-direction: column; gap: .55rem; justify-content: center; }
-  .pcol .colcap { font-family: var(--mono); font-size: .62rem; letter-spacing: .1em; text-transform: uppercase; color: var(--plot-faint); text-align: center; margin-bottom: .1rem; display: flex; align-items: center; justify-content: center; gap: .35rem; }
-  .pnlink { text-decoration: none; display: block; }
-  .pnode { border-radius: 9px; border: 1px solid color-mix(in srgb, var(--nc) 42%, var(--plot-edge)); border-left: 3px solid var(--nc); background: color-mix(in srgb, var(--nc) 13%, var(--plot)); padding: .5rem .6rem; transition: border-color .15s; }
-  .pnlink:hover .pnode, .pnlink:focus-visible .pnode { border-color: var(--nc); }
-  .pnode.data { --nc: var(--data-c); border-left-style: double; border-left-width: 5px; }
-  .pnode.proc { --nc: var(--phys-c); }
-  .pnode.cal { --nc: var(--api-c); }
-  .pnode.res { --nc: var(--ok); border-radius: 999px; text-align: center; }
-  .pnode .nm { font-family: var(--sans); font-weight: 700; font-size: .8rem; color: #c6d6e4; }
-  .pnode .sub { display: block; font-family: var(--mono); font-size: .66rem; color: var(--plot-faint); margin-top: .18rem; line-height: 1.35; }
-  .pxcut { border: 1px dashed var(--api-c); border-radius: 7px; background: color-mix(in srgb, var(--api-c) 10%, transparent); padding: .35rem .5rem; font-family: var(--mono); font-size: .62rem; color: var(--plot-faint); line-height: 1.4; }
-  .pxcut b { color: var(--api-c); }
-  .sn { font-family: var(--mono); font-size: .66rem; font-weight: 700; color: var(--pipe-c); border: 1px solid var(--pipe-c); border-radius: 4px; padding: .02rem .34rem; }
-  .colcap .sn { color: var(--plot-faint); border-color: var(--plot-faint); }
-  .pgcap { font-size: var(--fs-caption); color: var(--ink-muted); margin: .5rem 0 .9rem; max-width: 72ch; }
-  .pglegend { display: flex; flex-wrap: wrap; gap: .9rem; margin: 0 0 .3rem; font-family: var(--mono); font-size: var(--fs-label); color: var(--ink-muted); align-items: center; }
-  .pglegend span { display: inline-flex; align-items: center; gap: .35rem; }
-  .pglegend svg { display: block; }
+  /* the pipeline scene — one continuous interactive figure */
+  .scene { position: relative; border: 1px solid var(--plot-edge); border-radius: 14px; background: var(--plot); margin: 0 0 1.2rem; }
+  .scene svg { display: block; width: 100%; height: auto; }
+  .scene text { font-family: var(--mono); }
+  .scn-cap { fill: var(--plot-faint); font-size: 12px; }
+  .scn-cap2 { fill: var(--plot-faint); font-size: 11px; }
+  .scn-lab { fill: #c6d6e4; font-size: 13px; font-weight: 700; font-family: var(--sans); }
+  .scn-anchor { fill: var(--plot); stroke: var(--pipe-c); }
+  .scn-anchor-t { fill: #b9aef7; font-size: 12px; font-weight: 700; }
+  .scn-axis { stroke: var(--plot-edge); stroke-width: 1.2; }
+  .scn-ob { fill: none; stroke: var(--plot-faint); stroke-width: 1.7; opacity: .85; }
+  .scn-data { fill: var(--plot-line); }
+  .scn-model { fill: none; stroke: var(--plot-line2); stroke-width: 2.4; }
+  .scn-res { fill: var(--plot-line2); opacity: .8; }
+  .scn-link { fill: none; stroke: var(--plot-faint); stroke-width: 1.3; stroke-dasharray: 4 4; opacity: .8; }
+  .scn-feed { fill: none; stroke: var(--api-c); stroke-width: 1.6; stroke-dasharray: 3 5; }
+  .scn-feed-t { fill: var(--api-c); font-size: 11px; }
+  .scn-lock { fill: var(--plot-faint); font-size: 11.5px; }
+  .scn-cell { stroke: var(--plot); stroke-width: 1; cursor: pointer; }
+  .scn-cell.sel { stroke: var(--plot-line2); stroke-width: 2; }
+  .scn-ell { fill: none; stroke: var(--plot-line2); stroke-width: 1.6; opacity: .9; }
+  .ctl { position: absolute; display: flex; flex-direction: column; gap: .25rem; font-family: var(--mono); font-size: .68rem; color: var(--plot-faint); }
+  .ctl label { display: flex; align-items: center; gap: .5rem; }
+  .ctl input[type=range] { flex: 1; accent-color: var(--plot-line2); min-width: 0; }
+  .ctl .v { min-width: 4.2em; color: #c6d6e4; text-align: right; }
+  .ctl .fitrow { display: flex; align-items: center; gap: .5rem; margin-top: .15rem; }
+  .ctl button { white-space: nowrap; font-family: var(--mono); font-size: .68rem; color: var(--plot-line2); background: transparent; border: 1px solid var(--plot-line2); border-radius: 6px; padding: .22rem .6rem; cursor: pointer; }
+  .ctl button:hover { background: color-mix(in srgb, var(--plot-line2) 16%, transparent); }
+  .ctl .chi { color: #c6d6e4; margin-left: auto; white-space: nowrap; }
+  .ctl .unote { font-size: .6rem; color: var(--plot-faint); }
+  @media (max-width: 40rem) { .ctl { position: static; padding: .6rem .9rem .8rem; } }
 
-  /* pipeline stage sections + cards */
-  h2.sh { display: flex; align-items: center; gap: .55rem; }
-  h2.sh .h2role { text-transform: none; letter-spacing: 0; color: var(--ink-faint); font-weight: 400; }
-  .plsteps { display: flex; flex-direction: column; gap: .45rem; counter-reset: pls; margin-top: .5rem; }
-  .pls { border: 1px solid var(--hairline); border-left: 3px solid var(--plc, var(--pipe-c)); border-radius: 9px; background: var(--surface); padding: .6rem .8rem; }
-  .pls h4 { margin: 0; font-size: .84rem; font-weight: 700; display: flex; align-items: baseline; gap: .5rem; flex-wrap: wrap; }
-  .pls h4::before { counter-increment: pls; content: var(--sn-prefix, "") counter(pls); font-family: var(--mono); font-size: .62rem; color: var(--plc, var(--pipe-c)); border: 1px solid var(--plc, var(--pipe-c)); border-radius: 4px; padding: .03rem .34rem; }
-  .pls .rule { margin: .35rem 0 0; font-size: var(--fs-body); color: var(--ink); font-weight: 500; max-width: 70ch; }
-  .pls .det { margin: .3rem 0 0; font-size: var(--fs-detail); color: var(--ink-muted); line-height: 1.5; max-width: 70ch; }
-  .pls .det b { color: var(--ink); font-weight: 600; }
-  .pls .why { display: block; margin-top: .3rem; font-family: var(--mono); font-size: var(--fs-label); color: var(--pipe-c); }
-  .pls .dec { display: inline-block; margin-top: .35rem; font-family: var(--mono); font-size: var(--fs-label); color: var(--api-c); border: 1px dashed var(--api-c); border-radius: 5px; padding: .08rem .4rem; }
-  .plhead { display: flex; align-items: baseline; gap: .6rem; flex-wrap: wrap; margin: 1.6rem 0 .2rem; }
-  .plhead h3 { margin: 0; font-size: 1rem; font-weight: 700; }
-  .plhead .pltag { font-family: var(--mono); font-size: var(--fs-chip); letter-spacing: .06em; text-transform: uppercase; border: 1px solid var(--pipe-c); color: var(--pipe-c); border-radius: 4px; padding: .05rem .35rem; }
-  .plhead .plrole { font-size: var(--fs-caption); color: var(--ink-faint); }
-  .dimsplit { display: grid; grid-template-columns: 1fr; gap: .6rem; margin-top: .5rem; }
-  @media (min-width: 42rem) { .dimsplit { grid-template-columns: 1fr 1fr; } }
-  .dimbox { border: 1px dashed var(--hairline); border-radius: 8px; padding: .55rem .7rem; }
-  .dimbox h5 { margin: 0 0 .3rem; font-family: var(--mono); font-size: var(--fs-label); letter-spacing: .08em; text-transform: uppercase; color: var(--pipe-c); }
-  .dimbox p { margin: .25rem 0 0; font-size: var(--fs-caption); color: var(--ink-muted); line-height: 1.5; }
-  .dimbox p b { color: var(--ink); }
+  /* the narrative */
+  .story { max-width: 72ch; }
+  .story p { font-size: .92rem; line-height: 1.66; color: var(--ink-muted); margin: 0 0 .85rem; }
+  .story p b { color: var(--ink); font-weight: 600; }
+  .story .mk { display: inline-flex; align-items: center; justify-content: center; width: 1.25rem; height: 1.25rem; border-radius: 50%; border: 1.5px solid var(--pipe-c); color: var(--pipe-c); font-family: var(--mono); font-size: .7rem; font-weight: 700; margin-right: .45rem; vertical-align: -.15rem; }
+  .story .storycal { border-top: 1px solid var(--hairline); padding-top: .85rem; }
+
+  /* the dev-layer engineering contract */
+  details.contract { border: 1px solid var(--hairline); border-left: 3px solid var(--pipe-c); border-radius: 9px; background: var(--surface); margin-bottom: .5rem; }
+  details.contract summary { cursor: pointer; padding: .55rem .8rem; font-size: .84rem; font-weight: 700; color: var(--ink); list-style: none; }
+  details.contract summary::-webkit-details-marker { display: none; }
+  details.contract summary::before { content: "▸ "; color: var(--pipe-c); }
+  details.contract[open] summary::before { content: "▾ "; }
+  details.contract p { margin: 0; padding: 0 .9rem .7rem; font-size: var(--fs-detail); color: var(--ink-muted); line-height: 1.55; max-width: 76ch; }
+  details.contract p b { color: var(--ink); font-weight: 600; }
 
   /* calibration section */
   .idtbl { width: 100%; border-collapse: collapse; font-size: .78rem; }
@@ -207,12 +185,10 @@
   .idtbl td.feat { color: var(--ink); }
   .idtbl td.req { color: var(--ink-muted); font-size: .74rem; }
   .num { font-family: var(--mono); font-size: .72rem; color: var(--ok); }
-  .steps { display: flex; flex-direction: column; gap: .5rem; counter-reset: st; }
-  .st-row { border: 1px solid var(--hairline); border-left: 3px solid var(--pipe-c); border-radius: 9px; background: var(--surface); padding: .6rem .8rem; }
-  .st-row h4 { margin: 0; font-size: .88rem; font-weight: 700; display: flex; align-items: baseline; gap: .5rem; }
-  .st-row h4::before { counter-increment: st; content: "C" counter(st); font-family: var(--mono); font-size: .66rem; color: var(--pipe-c); border: 1px solid var(--pipe-c); border-radius: 4px; padding: .04rem .3rem; }
-  .st-row p { margin: .35rem 0 0; font-size: .8rem; color: var(--ink-muted); line-height: 1.45; max-width: 70ch; }
-  .st-row .idn { display: block; margin-top: .3rem; font-family: var(--mono); font-size: .66rem; color: var(--inst); }
+  .procsteps { margin: .3rem 0 0; padding-left: 1.3rem; max-width: 72ch; }
+  .procsteps li { font-size: var(--fs-body); color: var(--ink-muted); margin: .45rem 0; line-height: 1.55; }
+  .procsteps li b { color: var(--ink); }
+  .procsteps li::marker { font-family: var(--mono); color: var(--pipe-c); font-weight: 700; }
   .openlist { margin: .3rem 0 0; padding-left: 1.1rem; max-width: 74ch; }
   .openlist li { font-size: .8rem; color: var(--ink-muted); margin: .25rem 0; line-height: 1.45; }
   .openlist li b { color: var(--ink); }
@@ -222,11 +198,6 @@
 
   .skel-note { font-size: .9rem; color: var(--ink-muted); border: 1px solid var(--hairline); border-left: 3px solid var(--sc, var(--accent)); border-radius: 10px; background: var(--surface); padding: .8rem 1rem; margin-bottom: 1.2rem; }
   .skel-note b { color: var(--ink); }
-  .cards { display: grid; grid-template-columns: repeat(auto-fit, minmax(15rem, 1fr)); gap: .7rem; }
-  .card { border: 1px solid var(--hairline); border-left: 3px solid var(--cc, var(--ink-faint)); border-radius: 10px; background: var(--surface); padding: .7rem .85rem; }
-  .card h4 { margin: 0; font-size: .9rem; font-weight: 700; display: flex; align-items: baseline; gap: .5rem; flex-wrap: wrap; }
-  .card .todo { font-family: var(--mono); font-size: var(--fs-chip); letter-spacing: .05em; text-transform: uppercase; color: var(--ink-faint); border: 1px solid var(--hairline); border-radius: 3px; padding: .04rem .3rem; }
-  .card p { margin: .4rem 0 0; font-size: .78rem; color: var(--ink-muted); line-height: 1.45; }
   .subhead { font-family: var(--mono); font-size: var(--fs-label); letter-spacing: .1em; text-transform: uppercase; color: var(--ink-faint); margin: 1.4rem 0 .6rem; }
 
   /* review record */
@@ -311,47 +282,52 @@
         <p class="step-body">Total σ per isotope, built coherently from the collision matrix — <span class="fix">not a sum of independent terms</span> (that is single-level SLBW):</p>
         <div class="eqline"><math display="block"><msub><mi>σ</mi><mtext>tot</mtext></msub><mo>=</mo><mfrac><mrow><mn>2</mn><mi>π</mi></mrow><msup><mi>k</mi><mn>2</mn></msup></mfrac><munder><mo>∑</mo><mi>J</mi></munder><msub><mi>g</mi><mi>J</mi></msub><munder><mo>∑</mo><mi>c</mi></munder><mo>(</mo><mn>1</mn><mo>−</mo><mi>Re</mi><mspace width="0.1em"/><msub><mi>U</mi><mrow><mi>cc</mi></mrow></msub><mo>)</mo></math></div>
         <p class="step-body">Coherence is within each isotope's channels; isotope contributions sum in the exponent. The reconstruction uses each evaluation's <b>declared</b> resolved-resonance formalism (ENDF File 2: RM / RML / MLBW as given) plus File-3 background where present, honouring region-boundary rules. <a class="ev rev" href="#rr2-9">corrected·r1</a> Interference asymmetry scales with Γn/Γtot; scattering resonances can rise above the baseline. Removal is by total σ, but forward scatter into the detector makes the effective removal &lt; σ_tot — prefer capture-dominated resonances for quantitative n·d.</p>
-        <div class="pills"><span class="pill nuc">E_r, Γn, Γγ, J, π, ℓ</span><span class="pill nuc">channel spin · g_J · radii (AP, a_c, NAPS)</span><span class="pill nuc">reduced-width signs · boundary B · distant-level R^ext</span><span class="pill nuc">abundances · bare mass A</span></div>
+        <p class="parline">parameters: E_r, Γn, Γγ, J, π, ℓ · channel spin · g_J · radii (AP, a_c, NAPS) · reduced-width signs · boundary B · distant-level R^ext · abundances · bare mass A</p>
         <p class="scope">VENUS band ≤ 200 eV ⇒ resolved region only: no URR, no inelastic threshold (Ta-181's is 6.24 keV).</p>
       </div>
       <div class="arrow"></div>
       <div class="step">
         <div class="step-top"><span class="step-no">2</span><span class="step-name">Doppler broadening</span><span class="step-eq"><math><msub><mi>Δ</mi><mi>D</mi></msub><mo>≈</mo><msqrt><mrow><mn>4</mn><msub><mi>k</mi><mi>B</mi></msub><msub><mi>T</mi><mtext>eff</mtext></msub><mi>E</mi><mo>/</mo><mi>A</mi></msqrt></math></span></div>
         <p class="step-body">Broadens σ; <b>temperature enters the whole pipeline only here</b>. The exact free-gas kernel conserves the reaction rate (1/v exact); the σ-area only to O((Δ_D/E)²), and the √ form is its high-energy approximation. For lattice-bound solids the temperature is an effective kinetic T_eff (phonon DOS / Debye) — a scalar correction (~+1.6% width Ta, ~+4% W at 300 K). Isotropic: texture does not affect the resonance width for cubic metals (distinct from the Bragg-edge effect).</p>
-        <div class="pills"><span class="pill samp">temperature T → T_eff</span><span class="pill nuc">Debye θ_D (scalar)</span><span class="pill nuc">per-isotope mass A</span></div>
+        <p class="parline">parameters: temperature T → T_eff · Debye θ_D (scalar) · per-isotope mass A</p>
       </div>
       <div class="arrow"></div>
       <div class="step">
         <div class="step-top"><span class="step-no">3</span><span class="step-name">Attenuation → transmission</span><span class="step-eq"><math><mi>T</mi><mo>(</mo><mi>E</mi><mo>)</mo><mo>=</mo><mi>exp</mi><mo>(</mo><mo>−</mo><munder><mo>∑</mo><mi>i</mi></munder><msub><mrow><mo>(</mo><mi>n</mi><mi>d</mi><mo>)</mo></mrow><mi>i</mi></msub><msub><mi>σ</mi><mi>i</mi></msub><mo>)</mo></math></span></div>
         <p class="step-body">Beer–Lambert, areal density in atoms/barn. <b>Exact for the uncollided beam at any optical depth</b> — strong attenuation <i>is</i> the self-shielding. Real corrections: (i) detector acceptance / in-scatter (likely negligible for MCP-TPX, to confirm); (ii) sub-pixel heterogeneity — the pixel value is ⟨exp(−τ)⟩ ≠ exp(−⟨τ⟩), so thickness variation biases n·d.</p>
-        <div class="pills"><span class="pill samp">areal density (n·d)ᵢ</span><span class="pill samp">per-pixel ⟨exp(−τ)⟩</span><span class="pill warn">⚑ saturation / curve of growth</span></div>
+        <p class="parline">parameters: areal density (n·d)ᵢ · per-pixel ⟨exp(−τ)⟩ &nbsp;&nbsp;<span class="parflag">⚑ saturation / curve of growth — see below</span></p>
       </div>
       <div class="arrow"></div>
       <div class="step">
         <div class="step-top"><span class="step-no">4</span><span class="step-name">Energy ↔ time-of-flight</span><span class="step-eq"><math><mi>E</mi><mo>=</mo><mfrac><mn>1</mn><mn>2</mn></mfrac><msub><mi>m</mi><mi>n</mi></msub><msup><mrow><mo>(</mo><mfrac><mi>L</mi><mrow><mi>t</mi><mo>−</mo><msub><mi>t</mi><mn>0</mn></msub></mrow></mfrac><mo>)</mo></mrow><mn>2</mn></msup></math></span></div>
         <p class="step-body">Measurement in TOF, physics in energy. Off-axis geometric per-pixel L is negligible at VENUS (ΔE/E ≈ 6×10⁻⁷ at r = 2 cm, L₀ = 25 m) — <b>one parameter removed</b>; but a per-pixel/per-chip t₀ (timing) can reach ΔE/E ≈ 10⁻³ and may be needed. The energy-dependent emission delay lives in <b>exactly one</b> of {t₀, the resolution-kernel mean} — never both.</p>
-        <div class="pills"><span class="pill inst">flight path L (effective, not surveyed)</span><span class="pill inst">time offset t₀ (+ possible per-pixel)</span></div>
+        <p class="parline">parameters: flight path L (effective, not surveyed) · time offset t₀ (+ possible per-pixel)</p>
       </div>
       <div class="arrow"></div>
       <div class="step">
         <div class="step-top"><span class="step-no">5</span><span class="step-name">Instrument resolution</span><span class="step-eq"><math><mi>K</mi><mo>(</mo><mi>t</mi><mo>∣</mo><mi>E</mi><mo>)</mo></math></span></div>
         <p class="step-body">A non-stationary conditional kernel K(t|E), <b>not a shift-invariant convolution</b> — the Ikeda–Carpenter moderator parameters vary with energy — and it must be position-anchored. Broadens the resonance, degenerate with Doppler (why calibration exists). It acts on expected <b>counts</b> (Φ·ε·T): convolving transmission alone is exact only for smooth flux — screened per experiment by a forward-simulated bias bound (see statistics).</p>
-        <div class="pills"><span class="pill inst">resolution shape θ_res (Ikeda–Carpenter)</span></div>
+        <p class="parline">parameters: resolution shape θ_res (Ikeda–Carpenter)</p>
       </div>
       <div class="arrow"></div>
       <div class="step">
         <div class="step-top"><span class="step-no">6</span><span class="step-name">Observation model</span><span class="step-eq"><math><mi>S</mi><mo>=</mo><mi>Φε</mi><mi>T</mi><mo>+</mo><msub><mi>B</mi><mi>s</mi></msub><mo>,</mo><mspace width="0.4em"/><mi>O</mi><mo>=</mo><mi>Φε</mi><mo>+</mo><msub><mi>B</mi><mi>o</mi></msub></math></span></div>
         <p class="step-body">Transmission domain: ratio (S/Q_s)/(O/Q_o). Counts domain (VENUS target): Poisson, flux Φ(E) inside the model. Sample and open-beam backgrounds differ (B_s ≠ B_o — the sample adds scatter and gammas); exposures differ (Q_s ≠ Q_o), and Q are noisy monitor observations with their own likelihood terms, not exact divisors. <a class="ev rev" href="#rr2-5">corrected·r1</a> Dead time and pile-up must be corrected before the Poisson likelihood is valid at all.</p>
-        <div class="pills"><span class="pill nui">normalization (Q_s, Q_o)</span><span class="pill nui">background B_s ≠ B_o</span><span class="pill nui">incident flux Φ(E)</span></div>
+        <p class="parline">parameters: normalization (Q_s, Q_o) · background B_s ≠ B_o · incident flux Φ(E)</p>
       </div>
     </div>
 
     <h2>Parameters, by what they belong to</h2>
-    <div class="groups">
-      <div class="grp nuc"><h3>Nuclear <span class="disp">fixed ref + covariance</span></h3><ul><li>E_r, Γn, Γγ, J, π, ℓ, channel spin, g_J</li><li>radii (NAPS) · reduced-width signs · boundary B · distant-level R^ext</li><li>abundances · bare mass A · Debye θ_D</li></ul><p class="role">Reference — its covariance must propagate into fitted n·d, T (not treated as certain).</p></div>
-      <div class="grp inst"><h3>Instrument <span class="disp">calibrate → propagate</span></h3><ul><li>flight path L (+ per-pixel)</li><li>time offset t₀</li><li>resolution shape θ_res</li></ul><p class="role">Carried as a correlated prior / joint fit — <b>not hard-pinned</b> (see table note).</p></div>
-      <div class="grp samp"><h3>Sample <span class="disp">the science — jointly</span></h3><ul><li>areal density (n·d)ᵢ per isotope</li><li>effective temperature T_eff</li><li>(3D: local density via inversion)</li></ul><p class="role"><b>n·d and T are jointly encoded</b> — fit together, not read off depth/width.</p></div>
-      <div class="grp nui"><h3>Nuisance <span class="disp">per measurement</span></h3><ul><li>normalization Q_s, Q_o</li><li>background B_s, B_o (distinct)</li><li>incident flux Φ(E)</li></ul><p class="role">Trade off against density — must be constrained.</p></div>
+    <div class="scroller">
+      <table class="idtbl">
+        <thead><tr><th>Family</th><th>Parameters</th><th>Treatment</th><th>Why</th></tr></thead>
+        <tbody>
+          <tr><td class="p">Nuclear</td><td class="feat">E_r, Γn, Γγ, J, π, ℓ, channel spin, g_J · radii (NAPS) · reduced-width signs · boundary B · distant-level R^ext · abundances · bare mass A · Debye θ_D</td><td class="req">fixed reference + covariance</td><td class="req">its covariance must propagate into fitted n·d, T — never treated as certain</td></tr>
+          <tr><td class="p">Instrument</td><td class="feat">flight path L (+ per-pixel t₀ if warranted) · time offset t₀ · resolution shape θ_res</td><td class="req">calibrated once, then a correlated prior / joint fit — <b>never hard-pinned</b></td><td class="req">hard-pinning understates every downstream uncertainty (see the covariance note below)</td></tr>
+          <tr><td class="p">Sample</td><td class="feat">areal density (n·d)ᵢ per isotope · effective temperature T_eff · (3D: local density via inversion)</td><td class="req">the science — solved jointly</td><td class="req">n·d and T are jointly encoded by the curve of growth; fit together, not read off depth or width</td></tr>
+          <tr><td class="p">Nuisance</td><td class="feat">normalization Q_s, Q_o · backgrounds B_s ≠ B_o · incident flux Φ(E)</td><td class="req">solved per measurement, constrained</td><td class="req">they trade off directly against density</td></tr>
+        </tbody>
+      </table>
     </div>
 
     <h2>Regime physics</h2>
@@ -375,12 +351,17 @@
     </div>
     <div class="regime calm">
       <h3>Degeneracies — why fits are coupled</h3>
-      <div class="deg">
-        <div class="degp"><b>n·d ⊗ T</b> — jointly encoded (curve of growth); fit together. "Pin one" is governed by the marginalization criterion below.</div>
-        <div class="degp"><b>resolution ⊗ T</b> — both broaden; calibration determines resolution, carried as a prior.</div>
-        <div class="degp"><b>energy scale (L, t₀) ⊗ resonance position</b> — anchored by the known calibrant.</div>
-        <div class="degp"><b>n·d ⊗ normalization ⊗ background</b> — depth vs scale vs baseline trade off.</div>
-        <div class="degp"><b>n ⊗ d</b> — transmission sees only the product (areal); volumetric needs geometry.</div>
+      <div class="scroller">
+        <table class="idtbl">
+          <thead><tr><th>Coupled pair</th><th>Mechanism</th><th>Broken by</th></tr></thead>
+          <tbody>
+            <tr><td class="p">n·d ⊗ T</td><td class="feat">jointly encoded by the curve of growth</td><td class="req">joint fitting; pinning only under the marginalization criterion below</td></tr>
+            <tr><td class="p">θ_res ⊗ T</td><td class="feat">both broaden the line</td><td class="req">calibration determines resolution; carried as a correlated prior</td></tr>
+            <tr><td class="p">(L, t₀) ⊗ E_r</td><td class="feat">energy scale vs resonance position</td><td class="req">anchored by the known calibrant</td></tr>
+            <tr><td class="p">n·d ⊗ Q ⊗ B</td><td class="feat">depth vs scale vs baseline</td><td class="req">background templates + monitor observations + restricted nuisance freedom</td></tr>
+            <tr><td class="p">n ⊗ d</td><td class="feat">transmission sees only the areal product</td><td class="req">volumetric density needs geometry (3D)</td></tr>
+          </tbody>
+        </table>
       </div>
     </div>
 
@@ -432,12 +413,17 @@
     <p class="subhead">Degeneracy structure of the timing model (exact)</p>
     <div class="regime" style="margin-top:.2rem">
       <p>Writing the arrival time as <math><mi>t</mi><mo>(</mo><mi>E</mi><mo>)</mo><mo>=</mo><msub><mi>t</mi><mn>0</mn></msub><mo>+</mo><mi>L</mi><mo>/</mo><mi>v</mi><mo>(</mo><mi>E</mi><mo>)</mo><mo>+</mo><mi>lag</mi><mo>(</mo><mi>E</mi><mo>)</mo></math>, the fit spans only <math><mrow><mo>{</mo><mn>1</mn><mo>,</mo><msup><mi>E</mi><mrow><mo>−</mo><mn>1</mn><mo>/</mo><mn>2</mn></mrow></msup><mo>}</mo></mrow></math>. Therefore:</p>
-      <div class="deg">
-        <div class="degp"><b>constant lag ≡ t₀</b> — exactly degenerate (residual <span class="num">3×10⁻¹⁶ µs</span>); a wide energy span does <b>not</b> cure this one.</div>
-        <div class="degp"><b>lag ∝ E<sup>−1/2</sup> ≡ L</b> — exactly degenerate (residual <span class="num">4×10⁻¹⁷ µs</span>). An emission delay of this form is indistinguishable from a longer flight path.</div>
-        <div class="degp"><b>other energy dependences</b> — separable only if the residual after projection exceeds centroid precision (a 1 µs @10 eV lag ∝ E<sup>−1</sup> leaves <span class="num">0.14 µs</span>).</div>
-        <div class="degp"><b>a fixed-time lag is not a fixed extra path</b> — the implied path varies ~6.3× across 5–200 eV, so the two cannot be conflated.</div>
+      <div class="scroller">
+        <table class="idtbl">
+          <thead><tr><th>Lag form</th><th>Degenerate with</th><th>Residual after projection</th></tr></thead>
+          <tbody>
+            <tr><td class="p">constant</td><td class="feat">t₀ — exactly; a wide energy span does <b>not</b> cure it</td><td class="req"><span class="num">3×10⁻¹⁶ µs</span></td></tr>
+            <tr><td class="p">∝ E<sup>−1/2</sup></td><td class="feat">L — exactly; an emission delay of this form <i>is</i> a longer flight path</td><td class="req"><span class="num">4×10⁻¹⁷ µs</span></td></tr>
+            <tr><td class="p">other (e.g. ∝ E<sup>−1</sup>)</td><td class="feat">nothing — separable in principle</td><td class="req">only what survives projection: 1 µs @10 eV leaves <span class="num">0.14 µs</span>, which must exceed centroid precision</td></tr>
+          </tbody>
+        </table>
       </div>
+      <p style="margin-top:.5rem">A fixed-time lag is <b>not</b> a fixed extra path — the implied path varies ~6.3× across 5–200 eV, so the two cannot be conflated.</p>
       <p style="margin-top:.6rem"><b>Consequences.</b> L, t₀ and the kernel location must be fitted <b>jointly under an explicitly stated anchoring convention</b> — not in sequence. The fitted L is an <i>effective</i> flight path that absorbs the emission depth: it is not the surveyed distance, so a discrepancy against the survey is expected and physical, not a validation failure. Because a constant delay is exactly absorbed by t₀, there is no internal check on t₀ — which trigger defines it must be stated externally.</p>
     </div>
 
@@ -461,13 +447,13 @@
     </div>
 
     <p class="subhead">The calibration process (physics-derived order)</p>
-    <div class="steps">
-      <div class="st-row"><h4>Select resonances</h4><p>Span the band; a range of optical depths; isolated lines.</p><span class="idn">↳ sets the L–t₀ lever arm and where θ_res is constrained</span></div>
-      <div class="st-row"><h4>Predict the known cross-section</h4><p>σ(E; T_eff) from evaluated parameters at the calibrant's known temperature and areal density.</p><span class="idn">↳ no free parameters — but conditional on nuclear data + calibrant assay, whose uncertainty must be carried</span></div>
-      <div class="st-row"><h4>Joint fit of instrument + nuisances</h4><p>{L, t₀, θ_res} and the nuisances against <b>modelled dip shapes</b>, under an explicit kernel anchoring convention.</p><span class="idn">↳ positions and widths are NOT separable steps (see the degeneracy structure) — one joint fit</span></div>
-      <div class="st-row"><h4>Emit the joint posterior</h4><p>Mean + full covariance + model form + anchor + validity range + conditionality.</p><span class="idn">↳ consumed downstream as a correlated prior or in a joint fit — never hard-pinned</span></div>
-      <div class="st-row"><h4>Self-consistency check</h4><p>Residual structure across resonances, and 1D-ROI vs per-pixel agreement.</p><span class="idn">↳ per-resonance residuals are model-inadequacy evidence and must remain visible, not be absorbed</span></div>
-    </div>
+    <ol class="procsteps">
+      <li><b>Select resonances</b> — span the band, a range of optical depths, isolated lines. This sets the L–t₀ lever arm and decides where θ_res is constrained.</li>
+      <li><b>Predict the known cross-section</b> — σ(E; T_eff) from evaluated parameters at the calibrant's known temperature and areal density. No free parameters, but conditional on nuclear data and the calibrant assay, whose uncertainty must be carried.</li>
+      <li><b>Jointly fit instrument + nuisances</b> — {L, t₀, θ_res} and the nuisances against <b>modelled dip shapes</b>, under an explicit kernel anchoring convention. Positions and widths are not separable steps (see the degeneracy structure): one joint fit.</li>
+      <li><b>Emit the joint posterior</b> — mean + full covariance + model form + anchor + validity range + conditionality; consumed downstream as a correlated prior or in a joint fit, never hard-pinned.</li>
+      <li><b>Check self-consistency</b> — residual structure across resonances, and 1D-ROI vs per-pixel agreement. Per-resonance residuals are model-inadequacy evidence and must remain visible, not be absorbed.</li>
+    </ol>
 
     <p class="subhead">Confirmed gaps &amp; residual couplings (physics still to settle — not code)</p>
     <ul class="openlist">
@@ -502,11 +488,7 @@
 
     <div class="regime calm">
       <h3>The unifying result: optical depth τ₀ governs <i>both</i> separations</h3>
-      <p>In the <b>optically thin</b> limit the two observables decouple cleanly:</p>
-      <div class="deg">
-        <div class="degp"><b>AREA carries n·d, free of T.</b> Doppler conserves the cross-section area, so the equivalent width measures n·d independently of temperature: <span class="num">d ln W / d ln T = 0.008</span> at τ₀ ≈ 0.1.</div>
-        <div class="degp"><b>WIDTH carries T, free of n·d.</b> The Doppler width ∝ √T sets the shape while the depth scale is set by n·d (the FWHM result above, valid at τ₀ ≲ 0.3).</div>
-      </div>
+      <p>In the <b>optically thin</b> limit the two observables decouple cleanly: the <b>area</b> of a dip carries n·d free of temperature, because Doppler conserves the cross-section area (<span class="num">d ln W / d ln T = 0.008</span> at τ₀ ≈ 0.1) — while the <b>width</b> carries T free of n·d, because the Doppler width ∝ √T sets the shape and n·d only scales the depth (the FWHM result above, valid at τ₀ ≲ 0.3).</p>
       <p><b>Saturation destroys both separations — continuously.</b> Corrections begin at O(τ₀); there is no sharp threshold. For a representative fixed-Γ line (Voigt, Γ = 60 meV, Ta-181-like at 10 eV), temperature leaks into the area as <span class="num">d ln W/d ln T = 0.023 → 0.063 → 0.110</span> at τ₀ ≈ 0.3 → 1 → 3, while opacity broadening inflates the width by <span class="num">+18.6%</span> from τ₀ 0.3 → 1 (Lorentzian shape; a Gaussian gives +12.1%). These numbers are <b>line-specific, not functions of τ₀ alone</b>: a pure conserved-area Gaussian scale family reaches 0.021 → 0.061 → 0.168 → 0.327 over the same range, and the fixed-Γ Voigt is non-monotonic — falling back to 0.092 by τ₀ ≈ 10 as deep saturation moves the equivalent width onto the T-independent Lorentzian wings. τ₀ remains the master design variable; thresholds quoted on it are illustrations for a stated line shape, never universal constants. <a class="ev rev" href="#rr1-1">corrected·r1</a></p>
       <div class="aside"><span class="lbl">method note</span>My first numerical test normalised the line profile to unit <i>peak</i>, which silently holds τ₀ fixed instead of n·d and manufactured a spurious T-dependence in the thin limit. The correct test holds n·d fixed with an area-normalised cross-section. Recorded because it is exactly the kind of mistake a plot would have "confirmed".</div>
     </div>
@@ -533,11 +515,7 @@
 
     <div class="regime">
       <h3>In-situ instance — neither known → n·d + T, tracked</h3>
-      <p><b>What makes separation possible at all.</b> Not the shape of a single line. Two independent levers:</p>
-      <div class="deg">
-        <div class="degp"><b>(1) Energy dependence across resonances.</b> Temperature acts <i>coherently</i> on every line via Δ_D ∝ √E; optical depth acts through each line's own σ_peak. Typically separable with ≥2 resonances of differing strength spanning energy — a rule of thumb, neither necessary nor sufficient; the identifiability screen, not the line count, is the gate. <a class="ev rev" href="#rr1-6">corrected·r1</a></div>
-        <div class="degp"><b>(2) Global fit across the thermal series.</b> The reference n·d₀ is shared across frames (absent composition change) while T varies per frame — a shared-parameter global fit, a large identifiability gain over frame-by-frame fitting.</div>
-      </div>
+      <p><b>What makes separation possible at all</b> is not the shape of a single line but two independent levers. First, the <b>energy dependence across resonances</b>: temperature acts <i>coherently</i> on every line via Δ_D ∝ √E, while optical depth acts through each line's own σ_peak — typically separable with ≥2 resonances of differing strength spanning energy, though that count is a rule of thumb, neither necessary nor sufficient; the identifiability screen, not the line count, is the gate. <a class="ev rev" href="#rr1-6">corrected·r1</a> Second, the <b>global fit across the thermal series</b>: the reference n·d₀ is shared across frames (absent composition change) while T varies per frame — a shared-parameter fit with a large identifiability gain over frame-by-frame fitting.</p>
       <p><b>⚑ Thermal expansion is a first-class term, not a correction.</b> Per-frame areal density follows n·dⱼ = n·d₀·exp(−2∫α(T)dT); with constant α over 1000 K that is <span class="num">−1.25% (Ta)</span>, <span class="num">−0.89% (W)</span>, <span class="num">−2.78% (Au)</span>. Left out of the model it masquerades as mass loss or composition change — precisely the quantity an in-situ experiment claims to measure. The free-isotropic law breaks under fixtures (anisotropic strain), phase changes, or near melting (Au: 1337 K) — then an integrated strain model with uncertainty replaces it. <a class="ev rev" href="#rr2-21">corrected·r1</a></p>
       <p><b>Composition evolution constrains what may be shared:</b> if composition genuinely changes (phase change, diffusion), per-isotope n·d cannot be shared across the series. The model must declare which parameters are global and which are per-frame — that declaration is part of the experiment definition, not an implementation choice.</p>
     </div>
@@ -563,10 +541,8 @@
     </div>
     <div class="regime" style="margin-top:.8rem">
       <h3>Two statistical traps that silently bias results</h3>
-      <div class="deg">
-        <div class="degp"><b>Neyman χ² bias.</b> Taking the per-bin variance <i>from the data</i> (σ² = N_observed) generally biases fitted amplitudes low — deep bins get over-weighted. The sign is not universal once backgrounds and nonlinear shape parameters enter: the Poisson likelihood is the defensible default; Pearson χ² (variance from the model) is the minimum.</div>
-        <div class="degp"><b>Per-pixel UQ underestimates.</b> The <span class="num">~3–4×</span> understatement of per-superpixel scatter is an empirical VENUS observation, not a general statistical fact — under regular high-count conditions the inverse-Hessian covariance is asymptotically correct, so a shortfall this size points at model mismatch, ignored calibration covariance, or spatial correlation <span class="ev unv">cause unattributed</span>. Reserve MCMC for ROIs / a global co-fit; report a χ²-scaled covariance elsewhere with the scaling disclosed. <a class="ev rev" href="#rr1-8">corrected·r1</a></div>
-      </div>
+      <p><b>Neyman χ² bias.</b> Taking the per-bin variance <i>from the data</i> (σ² = N_observed) generally biases fitted amplitudes low — deep bins get over-weighted. The sign is not universal once backgrounds and nonlinear shape parameters enter: the Poisson likelihood is the defensible default; Pearson χ² (variance from the model) is the minimum.</p>
+      <p><b>Per-pixel UQ underestimates.</b> The <span class="num">~3–4×</span> understatement of per-superpixel scatter is an empirical VENUS observation, not a general statistical fact — under regular high-count conditions the inverse-Hessian covariance is asymptotically correct, so a shortfall this size points at model mismatch, ignored calibration covariance, or spatial correlation <span class="ev unv">cause unattributed</span>. Reserve MCMC for ROIs / a global co-fit; report a χ²-scaled covariance elsewhere with the scaling disclosed. <a class="ev rev" href="#rr1-8">corrected·r1</a></p>
       <p><b>The joint-fit contract.</b> The instrument enters as a correlated prior (or is fitted jointly), never hard-pinned; the reported covariance is C_marg = C_cond + JΣ_calJ<sup>T</sup>. Nuclear-data covariance propagates the same way — otherwise evaluation error is silently reclassified as a physical result.</p>
     </div>
 
@@ -584,10 +560,7 @@
     <div class="regime">
       <h3>⚑ Why 3D is a different problem — and when it factorises</h3>
       <p>Each measurement is a line integral: τ(E, ray) = Σᵢ ∫ nᵢ(x) σᵢ(E; T(x)) dl.</p>
-      <div class="deg">
-        <div class="degp"><b>Uniform T → it FACTORISES.</b> σ leaves the integral, so τ(E, ray) is linear in the line integral of n. Correct order: reconstruct the <i>linear</i> quantity τ tomographically, then fit per voxel.</div>
-        <div class="degp"><b>Spatially varying T → it does NOT factorise.</b> σ depends on position, so reconstruction and spectral fitting must be solved jointly. In-situ 3D (thermal gradients) is fundamentally harder than density-only 3D.</div>
-      </div>
+      <p>With <b>uniform temperature it factorises</b>: σ leaves the integral, τ(E, ray) is linear in the line integral of n, and the correct order is to reconstruct the <i>linear</i> quantity τ tomographically, then fit per voxel. With <b>spatially varying temperature it does not</b>: σ depends on position, reconstruction and spectral fitting must be solved jointly — in-situ 3D (thermal gradients) is fundamentally harder than density-only 3D.</p>
       <p><b>Reconstruction operates on line integrals — under two conditions.</b> (i) The linearity of τ = −ln T holds for the <i>model-domain</i> transmission: once expected counts are convolved in TOF, −ln(counts ratio) per energy bin is not a linear Radon sinogram — deconvolve, or fit a count-domain forward model. (ii) Back-projecting per-ray fitted values is legitimate <i>iff</i> the fitted quantity is a line integral of a common scalar density (uniform or known T); it is invalid when the ray fit mixes temperature, composition, resolution or opacity into something non-additive along the ray. <a class="ev rev" href="#rr1-10">corrected·r1</a></p>
     </div>
 
@@ -600,11 +573,16 @@
     </div>
     <div class="regime calm">
       <h3>Consistency tests — each with a predicted value, not a hope</h3>
-      <div class="deg">
-        <div class="degp"><b>1D ↔ 2D</b> — predicted offset ⟨e^(−τ)⟩ from the fitted 2D field (−Var(τ)/2 to leading order), <b>not zero</b>. Agreement at zero would itself indicate a homogeneous ROI or a masked bug.</div>
-        <div class="degp"><b>transmission ↔ counts</b> — should agree within the ratio-bias (≈1/λ_o) and the resolution-order bias; a larger disagreement localises to flux or background modelling.</div>
-        <div class="degp"><b>deviance</b> — against its calibrated (bootstrap / posterior-predictive) reference; a systematic departure is model inadequacy, not noise.</div>
-        <div class="degp"><b>per-resonance residuals</b> — reported per line. A model wrong in one resonance but averaged away globally is the failure mode this catches.</div>
+      <div class="scroller">
+        <table class="idtbl">
+          <thead><tr><th>Test</th><th>Predicted value</th><th>A departure means</th></tr></thead>
+          <tbody>
+            <tr><td class="p">1D ↔ 2D</td><td class="feat">offset = ⟨e^(−τ)⟩ from the fitted 2D field (−Var(τ)/2 to leading order) — <b>not zero</b></td><td class="req">agreement <i>at zero</i> itself indicates a homogeneous ROI or a masked bug</td></tr>
+            <tr><td class="p">transmission ↔ counts</td><td class="feat">agreement within ratio-bias (≈1/λ_o) + resolution-order bias</td><td class="req">a larger disagreement localises to flux or background modelling</td></tr>
+            <tr><td class="p">deviance</td><td class="feat">its calibrated (bootstrap / posterior-predictive) reference</td><td class="req">systematic departure = model inadequacy, not noise</td></tr>
+            <tr><td class="p">per-resonance residuals</td><td class="feat">flat, line by line</td><td class="req">a model wrong in one resonance but averaged away globally is the failure mode this catches</td></tr>
+          </tbody>
+        </table>
       </div>
       <p><b>Model adequacy must stay visible.</b> Nuisance flexibility has to be restricted enough that unexplained structure <i>cannot</i> be absorbed into normalization or background. If the background can reproduce any residual, the fit can never report that the physics is wrong — the single most dangerous property an analysis can have.</p>
     </div>
@@ -639,12 +617,7 @@
 
     <div class="regime">
       <h3>Constraints any admissible kernel must satisfy — and why a Gaussian fails</h3>
-      <div class="deg">
-        <div class="degp"><b>Non-negative:</b> K ≥ 0 (a probability density over arrival times).</div>
-        <div class="degp"><b>Normalised:</b> ∫K dt = 1 — the kernel redistributes neutrons in time; it must not create or destroy them.</div>
-        <div class="degp"><b>Causal:</b> K = 0 before emission. Nothing arrives before it left.</div>
-        <div class="degp"><b>Position-anchored:</b> one convention (mode or mean at zero) must be fixed, or the kernel's location fights t₀ and L.</div>
-      </div>
+      <p>An admissible kernel is <b>non-negative</b> (a probability density over arrival times), <b>normalised</b> (∫K dt = 1 — it redistributes neutrons in time, never creates or destroys them), <b>causal</b> (K = 0 before emission: nothing arrives before it left), and <b>position-anchored</b> (one convention, mode or mean at zero, must be fixed, or the kernel's location fights t₀ and L).</p>
       <p>A <b>Gaussian violates causality</b>: it has support at negative times. The leaked fraction is Φ(−μ/σ) — <span class="num">15.9%</span> at μ = σ, <span class="num">2.3%</span> at 2σ, <span class="num">0.14%</span> at 3σ. A Gaussian is only defensible where the mean delay exceeds ~3–4σ. The moderator term is both wide and skewed — precisely the regime where a symmetric Gaussian is least valid. <b>Ikeda–Carpenter is causal by construction</b> (its t²e^(−αt) slowing-down term vanishes at t = 0) — the physics reason to prefer it over a Gaussian, not merely a better fit.</p>
       <p><b>Ikeda–Carpenter parameters, physically:</b> α = slowing-down decay rate (energy-dependent, faster neutrons escape sooner); β = storage/thermal decay rate; R = the fraction emitted through the storage channel. A tabulated (UDR) kernel is the alternative — it captures real geometry, filters and collimation no analytic form knows, but it is only as good as its sampling and does not extrapolate. Physics fixes the <i>family</i> (positive, normalised, causal, moderator-skewed); the choice within it is a modelling decision.</p>
     </div>
@@ -658,227 +631,98 @@
 
   <!-- ===================== PIPELINES ===================== -->
   <section class="panel" data-panel="pipelines" role="tabpanel" hidden>
-    <p class="lede"><b>One shared spine, five stages</b> — qualify → reduce → model → fit → results — instantiated four ways at stage 4. Every stage cites the Physics-tab result it derives from; no physics is re-derived here. A new capability is a new <i>instance configuration</i>, never a new parallel path: that is the anti-rot design.</p>
-    <p class="tabstatus">This layer absorbed the round-1 architecture review (28 findings): a fail-closed qualification stage, native TOF preserved through the fit, compatibility-gated calibration transfer, layered identifiability screening. Each change is marked <span class="ev rev">corrected·r1</span> where it lives — history in the <a href="#" data-goto="record">review record</a>.</p>
+    <p class="lede"><b>This is what NEREIDS does.</b> The scene below is not an illustration — it is the pipeline itself, running in this page on the same Ta-181 physics the Physics tab specifies. Drag the two science parameters and watch the predicted spectrum respond; press <i>fit</i> and watch the pipeline solve a pixel; fit the whole field and the result map appears. Reading time to the first idea: zero.</p>
+    <p class="tabstatus">The interactive model here is the document's own forward model (resonances → Doppler → Beer-Lambert → flux), reduced to two free parameters for demonstration; the engineering contract for each stage is in the developer layer below. Design and content history: <a href="#" data-goto="record">review record</a>.</p>
 
-    <div class="pgwrap">
-      <div class="pgraph" id="pgraph">
-        <svg class="pedges" id="pedges" aria-hidden="true">
-          <defs>
-            <marker id="parr" viewBox="0 0 10 10" refX="8.5" refY="5" markerWidth="6.5" markerHeight="6.5" orient="auto-start-reverse">
-              <path d="M0 0 L10 5 L0 10 z" fill="context-stroke"></path>
-            </marker>
-          </defs>
-        </svg>
-        <div class="pcol">
-          <div class="colcap">sources</div>
-          <a class="pnlink" href="#s0-data" data-goto-anchor="pipelines"><div class="pnode data" id="pn-cal-data"><span class="nm">Calibrant</span><span class="sub">W/Ta + Au anchor · own OB</span></div></a>
-          <a class="pnlink" href="#s0-data" data-goto-anchor="pipelines"><div class="pnode data" id="pn-sam-data"><span class="nm">Sample</span><span class="sub">sample + OB · Q per run</span></div></a>
-          <a class="pnlink" href="#s0-data" data-goto-anchor="pipelines"><div class="pnode data" id="pn-endf"><span class="nm">ENDF</span><span class="sub">joins at stage 3</span></div></a>
-        </div>
-        <div class="pcol">
-          <div class="colcap"><span class="sn">1</span> qualify</div>
-          <a class="pnlink" href="#s1" data-goto-anchor="pipelines"><div class="pnode proc" id="pn-qual"><span class="nm">Qualification</span><span class="sub">fail-closed run vetting</span></div></a>
-        </div>
-        <div class="pcol">
-          <div class="colcap"><span class="sn">2</span> reduce</div>
-          <a class="pnlink" href="#s2" data-goto-anchor="pipelines"><div class="pnode proc" id="pn-reduce"><span class="nm">Reduction</span><span class="sub">native TOF · one convention</span></div></a>
-        </div>
-        <div class="pcol">
-          <div class="colcap"><span class="sn">3</span> model</div>
-          <a class="pnlink" href="#s3" data-goto-anchor="pipelines"><div class="pnode proc" id="pn-model"><span class="nm">Forward model</span><span class="sub">σ → Beer-Lambert → K(t|E)</span></div></a>
-          <div class="pxcut" id="pn-gate"><b>◇ identifiability screen</b> — gates every fit</div>
-        </div>
-        <div class="pcol">
-          <div class="colcap"><span class="sn">4</span> fit</div>
-          <a class="pnlink" href="#s4a" data-goto-anchor="pipelines"><div class="pnode cal" id="pn-cal"><span class="nm">Calibration</span><span class="sub">solve L, t₀, θ_res</span></div></a>
-          <a class="pnlink" href="#s4b" data-goto-anchor="pipelines"><div class="pnode proc" id="pn-den"><span class="nm">Density</span><span class="sub">n·d</span></div></a>
-          <a class="pnlink" href="#s4c" data-goto-anchor="pipelines"><div class="pnode proc" id="pn-tem"><span class="nm">Temperature</span><span class="sub">T_eff · low-E lines</span></div></a>
-          <a class="pnlink" href="#s4d" data-goto-anchor="pipelines"><div class="pnode proc" id="pn-ins"><span class="nm">In-situ</span><span class="sub">global fit over series</span></div></a>
-          <div class="pxcut" id="pn-spax"><b>▚ spatial estimator</b> — 1D/2D of every instance</div>
-        </div>
-        <div class="pcol">
-          <div class="colcap"><span class="sn">5</span> results</div>
-          <a class="pnlink" href="#s5" data-goto-anchor="pipelines"><div class="pnode res" id="pn-res"><span class="nm">Results / QC</span><span class="sub">value + σ + trust</span></div></a>
-        </div>
+    <div class="scene" id="scene">
+      <svg id="scn" viewBox="0 0 920 1160" role="img" aria-label="The NEREIDS pipeline operating: a neutron pulse disperses along the flight path, is attenuated by the sample, accumulates into a time-of-flight spectrum with resonance dips; a forward model with five parameters is fitted to that spectrum, yielding a joint posterior; the fit repeats per pixel to produce the areal-density map with uncertainties.">
+        <defs>
+          <marker id="sarr" viewBox="0 0 10 10" refX="8.5" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse"><path d="M0 0 L10 5 L0 10 z" fill="context-stroke"></path></marker>
+          <linearGradient id="beamfade" x1="0" y1="0" x2="1" y2="0">
+            <stop offset="0" stop-color="var(--plot-line)" stop-opacity=".9"/><stop offset="1" stop-color="var(--plot-line)" stop-opacity=".25"/>
+          </linearGradient>
+        </defs>
+        <!-- ================= region A: the measurement ================= -->
+        <g id="rgA"></g>
+        <!-- ================= region B: spectrum + model ================= -->
+        <g id="rgB"></g>
+        <!-- ================= region C: parameters + fit ================= -->
+        <g id="rgC"></g>
+        <!-- ================= region D: the map ================= -->
+        <g id="rgD"></g>
+      </svg>
+      <div class="ctl" id="ctl-dials" style="left:2.5%; top:53.2%; width:37%">
+        <label>n·d <input type="range" id="in-nd" min="0.2" max="3" step="0.01" value="0.45"><span class="v" id="v-nd">0.70</span></label>
+        <label>T <input type="range" id="in-T" min="200" max="1200" step="5" value="1100"><span class="v" id="v-T">900 K</span></label>
+        <div class="fitrow"><button type="button" id="btn-fit">fit this pixel</button><button type="button" id="btn-map">fit every pixel</button><span class="chi" id="v-chi"></span></div>
+        <span class="unote">demo units: n·d as peak optical depth at the 4.3 eV line · real deliverable: atoms/barn</span>
       </div>
     </div>
-    <div class="pglegend" id="pglegend">
-      <span><svg width="26" height="8"><line x1="0" y1="4" x2="20" y2="4" class="pedge data"></line><path d="M20 1 L26 4 L20 7 z" fill="var(--data-c)"></path></svg> data</span>
-      <span><svg width="26" height="8"><line x1="0" y1="4" x2="20" y2="4" class="pedge flow"></line><path d="M20 1 L26 4 L20 7 z" fill="var(--phys-c)"></path></svg> process flow</span>
-      <span><svg width="26" height="8"><line x1="0" y1="4" x2="20" y2="4" class="pedge feedback"></line><path d="M20 1 L26 4 L20 7 z" fill="var(--api-c)"></path></svg> instrument posterior</span>
-      <span><svg width="14" height="12"><rect x="1" y="1" width="12" height="10" rx="3" fill="none" stroke="var(--api-c)" stroke-dasharray="2 2"></rect></svg> cross-cut gate</span>
-    </div>
-    <p class="pgcap">Calibrant and sample data enter qualification; qualified runs are reduced once, in one convention; the forward model consumes reduced data plus ENDF; the four fit instances are the <i>same</i> model invocation configured four ways; every instance terminates in results/QC. Calibration feeds its instrument posterior back to the model for the other three. Each node links to its stage below.</p>
 
-    <h2 class="sh" id="s1"><span class="sn">1</span> Qualification <span class="h2role">— shared · fail-closed · runs before any reduction</span> <a class="ev rev" href="#rr2-2">corrected·r1</a></h2>
-    <div class="plsteps" style="--plc:var(--data-c); --sn-prefix:'1.'">
-      <div class="pls"><h4>Run &amp; beam qualification</h4>
-        <p class="rule">A corrupt or truncated run fails here — before it can meet a valid open beam.</p>
-        <p class="det">Checks: pulse IDs, live time, proton charge / beam monitors, chopper state, trigger and timing epochs, run completeness, sample motion, frame overlap, metadata consistency.</p></div>
-      <div class="pls"><h4>Detector response &amp; rate validity</h4>
-        <p class="rule">Dead time, pile-up, gain depletion and nonlinearity are corrected with propagated uncertainty and bounded by a hard rate-validity limit.</p>
-        <p class="det">Sample and open rates differ, so these effects never cancel in a ratio — and uncorrected losses invalidate the Poisson likelihood itself. <a class="ev rev" href="#rr2-4">corrected·r1</a></p></div>
-      <div class="pls"><h4>Background measurements</h4>
-        <p class="rule">Dedicated background data are first-class inputs, not nuisance guesses.</p>
-        <p class="det">Blocked-beam runs and black-resonance (notch) filters constrain the additive components per spectral template: constant-in-TOF · ~1/E · prompt tail. <a class="ev rev" href="#rr2-3">corrected·r1</a></p>
-        <span class="why">↳ Physics: background-template gap in the calibration section; filter-method source in the Data tab</span></div>
-      <div class="pls"><h4>Detector-health mask</h4>
-        <p class="rule">Unhealthy pixels come from independent diagnostics — never from the science counts being fitted, and never a low-count screen.</p>
-        <p class="det">Hot/noisy, timing-shifted, cross-talk, saturated. Low-count pixels are alive; the counts likelihood handles them. <a class="ev rev" href="#rr2-19">corrected·r1</a></p></div>
+    <div class="story">
+      <p><span class="mk">1</span> Every VENUS pulse releases one burst of neutrons. Over 25 m of flight, <b>time sorts them by energy</b> — fast neutrons land early, slow ones late — so the detector's time axis <i>is</i> an energy axis (drawn above: the pulse spreading as it flies). On the way, the sample absorbs neutrons at its nuclei's resonance energies. Every surviving neutron is one count in (pixel, time). Runs are vetted before anything downstream may consume them; nothing else touches the raw events.</p>
+      <p><span class="mk">2</span> Counting many pulses turns the event stream into <b>one spectrum per pixel</b> — the curve in the scene, with dark notches where the sample's resonances swallowed the beam. The notches are the information: their <b>depth and area</b> encode how much material (areal density n·d), their <b>shape</b> encodes its temperature (Doppler broadening), against the open-beam reference measured without the sample (the pale curve). The spectrum stays on its native time axis; energy is computed from time inside every fit, never baked into the data.</p>
+      <p><span class="mk">3</span> NEREIDS never manipulates that spectrum into an answer. Instead it <b>predicts</b> it: resonance physics → Doppler broadening at temperature T → attenuation by n·d → the flight-path relation → the instrument's timing blur → expected counts, bin by bin. That prediction is the smooth curve laid over the data, and it is fully determined by five parameters — the two science dials (drag them: the curve responds the way real physics responds) and three instrument parameters shown locked: <b>flight path L, time offset t₀, resolution shape θ_res</b>.</p>
+      <p><span class="mk">4</span> Fitting means <b>turning the dials until prediction matches measurement</b> — press <i>fit</i> and watch χ² fall (χ² is the likelihood's core; combined with the instrument prior it yields the posterior). What comes out is not two numbers but the <b>joint posterior</b> (the ellipse): n·d and T are partly interchangeable in a single spectrum, and the tilt of the ellipse is that honest coupling, carried — never hidden — into every downstream use. The locked dials carry their own uncertainty in exactly the same way: they were fitted once, by the <b>calibration</b> run.</p>
+      <p><span class="mk">5</span> The same fit runs in every pixel — press <i>fit every pixel</i> — and the field of posteriors becomes the deliverable: the <b>areal-density map, its uncertainty map, and the residuals</b> that prove (or indict) the physics in each pixel. Click any pixel to load its spectrum above: the whole pipeline is that one loop, repeated.</p>
+      <p class="storycal"><b>Where do the locked dials come from?</b> Calibration is <b>the same engine with the locks exchanged</b>: a reference foil whose n·d and T are already known is measured, so the fit solves for L, t₀ and θ_res instead. The posterior it emits is what locks them here — the dashed arrow in the scene. Every analysis is this one model; only the lock pattern changes:</p>
     </div>
 
-    <h2 class="sh" id="s2"><span class="sn">2</span> Reduction <span class="h2role">— shared · one convention, used verbatim by all four instances</span></h2>
-    <div class="plsteps" style="--plc:var(--data-c); --sn-prefix:'2.'">
-      <div class="pls"><h4>Apply the health mask</h4>
-        <p class="rule">Hard-exclude the sample ∪ OB unhealthy-pixel union — nothing else.</p>
-        <span class="why">↳ Physics: masking by counts would bias the Poisson statistics it feeds</span></div>
-      <div class="pls"><h4>Native-TOF binning — immutable</h4>
-        <p class="rule">Bin edges are recorded per run and never re-binned downstream.</p>
-        <p class="det">Per-bin width Δt carried (it multiplies every predicted count). Live time and monitor counts attach as observations with uncertainties — Q_s, Q_o are never exact divisors.</p></div>
-      <div class="pls"><h4>No energy transformation</h4>
-        <p class="rule">Reduction never rebins to energy: E(t; L, t₀) is evaluated inside every likelihood evaluation, at the current calibration parameters. <a class="ev rev" href="#rr2-1">corrected·r1</a></p>
-        <p class="det">That is what lets L and t₀ float with their covariance — an axis baked at reduction would silently pin them and re-interpolate counts. A derived energy axis is a display/export product of stage 5 only. Identical convention for calibrant and sample. No per-pixel geometric L (≈6×10⁻⁷ centre, 3×10⁻⁵ corner — orders below any stated budget); per-pixel t₀ only from independent timing calibration.</p>
-        <span class="why">↳ Physics: calibration section (L, t₀ float in the fit) · resolution section (emission delay ≡ path offset)</span></div>
-      <div class="pls"><h4>Arm split — the domain decision lives here</h4>
-        <p class="rule">Counts is the canonical arm; transmission is a community-convention diagnostic, formed only if every admissibility test passes. <a class="ev rev" href="#rr2-6">corrected·r1</a></p>
-        <p class="det">Counts arm: keep (S, O, Q_s, Q_o) separate — no ratio is ever formed; flux, background and monitors stay inside the model. Transmission arm: T = (S/Q_s)/(O/Q_o) with σ_T, admissible only past the open-count bias, black-core, shared-OB-covariance and background conditions <i>and</i> the forward-simulated resolution-order bound (Physics § statistics).</p>
-        <span class="dec">decision recorded per dataset — transmission is never the canonical fit domain</span></div>
-      <div class="pls"><h4>Output + provenance</h4>
-        <p class="rule">Reduced native-TOF observable + per-bin uncertainties + the full provenance record.</p>
-        <p class="det">Provenance: bin edges, masks, monitor observations, calibration-posterior identity, nuclear library/version, component versions, configuration hashes, seeds. <a class="ev rev" href="#rr2-26">corrected·r1</a></p></div>
+    <div class="scroller">
+      <table class="idtbl">
+        <thead><tr><th>Run as</th><th>You bring</th><th>The fit solves</th><th>Held / prior</th><th>You receive</th></tr></thead>
+        <tbody>
+          <tr><td class="p">Calibration</td><td class="feat">a known reference foil (n·d, T known)</td><td class="fr">L, t₀, θ_res</td><td class="req">nuclear data (+ covariance)</td><td class="feat">the instrument posterior every other run consumes</td></tr>
+          <tr><td class="p">Density</td><td class="feat">known isotope + temperature</td><td class="fr">n·d per pixel</td><td class="req">instrument (calibration prior) · T (prior)</td><td class="feat">n·d map + uncertainty + residuals</td></tr>
+          <tr><td class="p">Temperature</td><td class="feat">known areal density</td><td class="fr">T_eff per pixel</td><td class="req">instrument · n·d (prior)</td><td class="feat">temperature map + uncertainty + residuals</td></tr>
+          <tr><td class="p">In-situ</td><td class="feat">a time series, neither known</td><td class="fr">shared n·d₀ + per-frame T</td><td class="req">instrument · expansion link n·d(T)</td><td class="feat">n·d and T trajectories with joint uncertainty</td></tr>
+        </tbody>
+      </table>
     </div>
+    <p class="capnote" style="margin-top:.5rem">Spatially, each mode runs on a summed region of interest or per pixel (as in the scene); 3-D tomography is a different inverse problem and is deferred — see the Physics tab.</p>
 
-    <h2 class="sh" id="s3"><span class="sn">3</span> Forward model + likelihood <span class="h2role">— shared · one invocation; the Physics tab is its specification</span></h2>
-    <div class="plsteps" style="--plc:var(--phys-c); --sn-prefix:'3.'">
-      <div class="pls"><h4>Assemble σ(E; T_eff)</h4>
-        <p class="rule">Per isotope, the evaluation's declared resolved-resonance formalism — RM / RML / MLBW as ENDF File 2 states, never an assumed Reich-Moore. <a class="ev rev" href="#rr2-9">corrected·r1</a></p>
-        <p class="det">Full parameter set (signs, radii, distant levels), File-3 background where present, boundary rules honoured; isotope contributions sum in the exponent. Doppler-broadened at T_eff with the lattice-model family declared.</p></div>
-      <div class="pls"><h4>Nuclear-covariance policy</h4>
-        <p class="rule">"Covariance carried" has a failure policy: availability checked, non-PSD repaired and disclosed, missing covariance → a declared default or rejection — never silent zero. <a class="ev rev" href="#rr2-10">corrected·r1</a></p>
-        <p class="det">One shared nuclear-data uncertainty across all pixels, frames, calibration and sample fits. Model discrepancy is its own term, never mislabelled as nuclear covariance.</p></div>
-      <div class="pls"><h4>Attenuate + instrument</h4>
-        <p class="rule">Beer-Lambert per instance; K(t|E) acts on expected counts (Φ·ε·T), position-anchored; E(t; L, t₀) is evaluated here, on native-TOF bins.</p>
-        <p class="det">Completeness policy: container/environment attenuation, scatter-in, multiple scattering, PSF mixing, self-shielding — each modelled, bounded with a stated magnitude, or measured. "Visible as model inadequacy" is not a policy for a predictable physical term. <a class="ev rev" href="#rr2-8">corrected·r1</a></p></div>
-      <div class="pls"><h4>Objective</h4>
-        <p class="rule">Counts arm: Poisson/KL deviance with a calibrated GOF reference. Transmission arm: Pearson-weighted Gaussian χ² — never Neyman.</p>
-        <p class="det">D/(n−k) → 1 only asymptotically (per-bin E[D] ≈ 1.15 at λ=1): calibrate by parametric bootstrap / posterior predictive. Neyman weighting (variance from data) generally biases amplitudes low. <a class="ev rev" href="#rr2-23">corrected·r1</a></p></div>
-      <div class="pls"><h4>◇ Identifiability screen — layered</h4>
-        <p class="rule">Four layers: design time · per configuration · per pixel class on the actual data · post-fit. Fails loudly. <a class="ev rev" href="#rr2-14">corrected·r1</a></p>
-        <p class="det">(1) expected information at design; (2) structural resolvability of the requested fixed/free partition, τ₀ regime per resonance, prior conditioning; (3) local τ₀, masked bins, background on the usable data — a global screen would accept pixels with no local information; (4) posterior geometry and prior-dominance flags. Non-identifiability is never converted into a hard pin: the parameter keeps its external prior and prior dominance is reported; pinning only under the marginalization criterion. <a class="ev rev" href="#rr2-15">corrected·r1</a></p>
-        <span class="dec">structural per configuration · data-driven per pixel class · post-fit diagnostics</span></div>
-    </div>
-
-    <h2 class="sh" id="s4"><span class="sn">4</span> Fit instances <span class="h2role">— four configurations of the one shared model</span></h2>
-
-    <div class="plhead" id="s4a"><h3>Calibration</h3><span class="pltag">4a</span><span class="plrole">prerequisite — produces the instrument posterior</span></div>
-    <div class="plsteps" style="--plc:var(--api-c); --sn-prefix:'a.'">
-      <div class="pls"><h4>Select resonances</h4><p class="rule">Span the band; a range of optical depths; isolated lines only.</p><p class="det">Thin foil for the kernel core, thick for black-line wings and background diagnostics.</p></div>
-      <div class="pls"><h4>Reduce calibrant + OB</h4><p class="rule">Shared reduction convention with nominal axis parameters — the fit refines them.</p></div>
-      <div class="pls"><h4>Predict known σ(E; T_eff)</h4><p class="rule">Calibrant n·d and T are known; ENDF parameters carried with covariance, not treated as exact.</p></div>
-      <div class="pls"><h4>Joint fit {L, t₀, θ_res} + nuisances</h4>
-        <p class="rule">One joint fit against modelled dip shapes under an explicit kernel anchor — never centroids, never a sequential position/width split.</p>
-        <p class="det">Kernel asymmetry and opacity bias centroids; the degeneracy structure forbids sequencing.</p></div>
-      <div class="pls"><h4>Emit the joint posterior</h4>
-        <p class="rule">(θ̂, Σ_cal) with off-diagonals — or samples / a validated parametric form where non-Gaussian. <a class="ev rev" href="#rr2-11">corrected·r1</a></p>
-        <p class="det">Plus kernel form, anchor convention, validity range, and the conditioning set: calibrant assay &amp; temperature, nuclear library/version, detector state, beam configuration.</p></div>
-      <div class="pls"><h4>Compatibility gate for transfer</h4>
-        <p class="rule">Validity is enforced, not metadata: a sample run consumes this posterior only if its configuration matches. <a class="ev rev" href="#rr2-12">corrected·r1</a></p>
-        <p class="det">Match on moderator condition, detector thresholds/HV, rate regime, chopper state, geometry, maintenance epoch (via configuration hashes); drift bounded by bracketing/interleaved reference runs and control-chart tests. On mismatch: reject, or attach an explicit expanded drift model — never silent reuse.</p></div>
-      <div class="pls"><h4>Self-consistency + holdout</h4>
-        <p class="rule">Per-resonance residuals stay visible, and held-out resonances (or thicknesses / repeat runs) are predicted, not fitted. <a class="ev rev" href="#rr2-13">corrected·r1</a></p>
-        <p class="det">1D-ROI vs per-pixel agreement (geometry predicts identity; disagreement ⇒ timing, statistics or heterogeneity). In-sample residuals alone cannot distinguish a predictive kernel from one compensating ENDF or assay errors.</p></div>
-    </div>
-
-    <div class="plhead" id="s4b"><h3>Density</h3><span class="pltag">4b</span><span class="plrole">isotope + T known → n·d</span></div>
-    <div class="plsteps" style="--sn-prefix:'b.'">
-      <div class="pls"><h4>Configure</h4>
-        <p class="rule">Free: (n·d)ᵢ + nuisances. T: prior by default, pinned only under the marginalization criterion. Instrument: correlated prior via the compatibility gate. <a class="ev rev" href="#rr2-15">corrected·r1</a></p>
-        <p class="det">The criterion: marginalizing T's external uncertainty must shift the n·d posterior by less than a stated fraction of the error budget — the thin regime is why that passes at small τ₀.</p>
-        <span class="dec">τ₀ ≈ 2.2 is the optimal sample thickness for density precision (idealized-design result)</span></div>
-      <div class="pls"><h4>Fit through the shared model</h4>
-        <p class="rule">Counts arm by default; the equivalent width / integrated strength carries the information.</p>
-        <p class="det">Saturated lines still contribute lower bounds.</p></div>
-      <div class="pls"><h4>Results / QC</h4>
-        <p class="rule">n·d map + σ (calibration floor separated from statistics) + GOF + per-resonance residuals.</p></div>
-    </div>
-    <div class="dimsplit">
-      <div class="dimbox"><h5>1D · ROI</h5><p>Sum counts over the ROI (Poisson sums are Poisson) — but the ROI forward model is <b>⟨exp(−τ)⟩</b>, not exp(−⟨τ⟩); with a uniform model expect the −Var(τ)/2-order underestimate in heterogeneous ROIs.</p></div>
-      <div class="dimbox"><h5>2D · per-pixel</h5><p>Screen per pixel class, then the loop; spatial estimator per the axis (regularization only where physically justified, with effective-dof accounting). Sub-pixel heterogeneity enters as ⟨exp(−τ)⟩ within the pixel.</p></div>
-    </div>
-
-    <div class="plhead" id="s4c"><h3>Temperature</h3><span class="pltag">4c</span><span class="plrole">n·d known → T_eff</span></div>
-    <div class="plsteps" style="--sn-prefix:'c.'">
-      <div class="pls"><h4>Configure</h4>
-        <p class="rule">Free: T_eff + nuisances; n·d prior, pinned only under the marginalization criterion. Instrument prior mandatory. <a class="ev rev" href="#rr2-15">corrected·r1</a></p>
-        <p class="det">T is a sub-dominant-to-comparable broadening across the band, so θ_res covariance dominates the T error budget. Opacity mimics heat: a τ₀ drift 0.3 → 1 reads as +122 K (exact).</p>
-        <span class="dec">rank resonance sets by expected information on T_eff after marginalization — this lands on the lowest usable lines</span></div>
-      <div class="pls"><h4>Fit through the shared model</h4>
-        <p class="rule">Full line-shape fit, never width-only; the lattice-model family (free-gas / Debye / phonon DOS) is declared and its model uncertainty propagated into thermodynamic T. <a class="ev rev" href="#rr2-17">corrected·r1</a></p>
-        <p class="det">Different families give different line shapes — the choice is itself a T error source.</p></div>
-      <div class="pls"><h4>Results / QC</h4>
-        <p class="rule">T map + σ split (statistical vs calibration floor) + GOF; flag pixels where the posterior leans on the prior.</p></div>
-    </div>
-    <div class="dimsplit">
-      <div class="dimbox"><h5>1D · ROI</h5><p>Reported T is the ROI-average effective temperature; gradients inside the ROI bias it (path/area averaging, stated on output).</p></div>
-      <div class="dimbox"><h5>2D · per-pixel</h5><p>Per-pixel T_eff is still a <b>beam-path average</b>; only tomography resolves along-beam gradients (deferred).</p></div>
-    </div>
-
-    <div class="plhead" id="s4d"><h3>In-situ</h3><span class="pltag">4d</span><span class="plrole">series → n·d + T per frame</span></div>
-    <div class="plsteps" style="--sn-prefix:'d.'">
-      <div class="pls"><h4>Declare the sharing structure</h4>
-        <p class="rule">Part of the experiment definition, not an implementation choice: global = the reference n·d₀ (absent composition change); per-frame = T, plus the time-dependent instrument and beam terms. <a class="ev rev" href="#rr2-22">corrected·r1</a></p>
-        <p class="det">If composition genuinely evolves, per-isotope n·d becomes per-frame — declared, with the identifiability screen re-run. Per-frame beam intensity/monitors, background, detector state and timing drift enter as per-frame terms or validated constants: a global fit does not protect against drift it does not model, and residual-trend tests cannot recover uncertainty lost to a false sharing structure.</p></div>
-      <div class="pls"><h4>Thermal-expansion link</h4>
-        <p class="rule">Per-frame areal density follows n·dⱼ = n·d₀ · exp(−2∫α(T)dT) — a deterministic link, not a free parameter. <a class="ev rev" href="#rr2-21">corrected·r1</a></p>
-        <p class="det">Omitting it masquerades as mass loss (−1.25%/1000 K for Ta, constant-α illustration). Valid for free isotropic expansion; fixtures, anisotropy or phase changes replace it with an integrated strain model carrying uncertainty.</p></div>
-      <div class="pls"><h4>Global fit over the series</h4>
-        <p class="rule">One joint fit across frames — shared n·d₀ + per-frame T beats frame-by-frame identifiability.</p>
-        <p class="det">Separation is powered by the energy dependence across resonances of differing strength (typically ≥2 — the screen, not the count, is the gate).</p></div>
-      <div class="pls"><h4>Results / QC</h4>
-        <p class="rule">n·d(frame), T(frame) trajectories with correlated uncertainty bands; per-frame GOF; explicit sharing-assumption test.</p>
-        <p class="det">A residual trend across frames is evidence of undeclared evolution.</p></div>
-    </div>
-    <div class="dimsplit">
-      <div class="dimbox"><h5>1D · ROI</h5><p>The default in-situ mode: time series of ROI fits under the global model.</p></div>
-      <div class="dimbox"><h5>2D · per-pixel</h5><p>Per-pixel series fits; sharing structure applies per pixel. Heaviest compute — the screen decides whether per-pixel information supports it or binning is required.</p></div>
-    </div>
-
-    <h2 class="sh" id="s5"><span class="sn">5</span> Results / QC <span class="h2role">— shared · every instance terminates here</span></h2>
-    <div class="plsteps" style="--plc:var(--ok); --sn-prefix:'5.'">
-      <div class="pls"><h4>Product family</h4>
-        <p class="rule">Value map · uncertainty map · GOF/deviance map (calibrated reference) · trust mask · residual cube.</p>
-        <p class="det">The total marginal covariance is authoritative; the statistical / correlated-systematic split is a documented decomposition convention (the calibration floor does not average down), with credible intervals where posteriors are bounded or skewed. Residual cubes use signed-deviance / randomized-quantile residuals, not raw only. <a class="ev rev" href="#rr2-24">corrected·r1</a></p></div>
-      <div class="pls"><h4>Derived display products</h4>
-        <p class="rule">The energy axis at the posterior calibration, and the transmission spectrum — display, export and cross-checks only; never the fit domain. <a class="ev rev" href="#rr2-1">corrected·r1</a></p></div>
-      <div class="pls"><h4>Consistency tests, each with a predicted value</h4>
-        <p class="rule">1D↔2D: offset = ⟨e^(−τ)⟩ from the 2D field, not zero · transmission↔counts: within ratio-bias + resolution-order bias · deviance vs calibrated reference · per-resonance residuals per line.</p></div>
-      <div class="pls"><h4>Model-adequacy guard</h4>
-        <p class="rule">Nuisance flexibility restricted so unexplained structure cannot be absorbed; residual structure is surfaced as a finding, never smoothed away.</p></div>
-      <div class="pls"><h4>Degraded &amp; fail-closed states</h4>
-        <p class="rule">Every failure class has a predefined outcome — fail-closed (no result) or a declared degraded mode (result flagged with the specific deficiency) — decided in advance, per class. <a class="ev rev" href="#rr2-25">corrected·r1</a></p>
-        <p class="det">Classes: missing open beam / background / monitor data, partial frames, dead-time-limit violation, calibration incompatibility, missing or non-PSD nuclear covariance, kernel extrapolation beyond validity, non-identifiable request, non-convergence.</p></div>
+    <div class="dev-only">
+      <h2>The engineering contract, stage by stage</h2>
+      <p class="step-body" style="margin-bottom:.6rem">The demonstration above is the pipeline's meaning; the contract below is its law — every normative rule the round-1 review settled, with <span class="ev rev">corrected·r1</span> links into the record. Collapsed because it is reference, not reading.</p>
+      <details class="contract" id="c1"><summary>1 · Qualification — fail-closed, before any reduction <a class="ev rev" href="#rr2-2">corrected·r1</a></summary>
+        <p>A corrupt or truncated run fails before it can meet a valid open beam: pulse IDs, live time, proton charge and beam monitors, chopper state, trigger and timing epochs, run completeness, sample motion, frame overlap, metadata consistency are all checked here. Dead time, pile-up, gain depletion and nonlinearity are characterized, corrected with propagated uncertainty, and bounded by a hard rate-validity limit — sample and open rates differ, so these effects never cancel in a ratio, and uncorrected losses invalidate the Poisson likelihood itself. <a class="ev rev" href="#rr2-4">corrected·r1</a> Dedicated background measurements (blocked-beam runs, black-resonance notch filters) are first-class inputs constraining the additive components per spectral template (constant-in-TOF, ~1/E, prompt tail). <a class="ev rev" href="#rr2-3">corrected·r1</a> The detector-health mask comes from independent diagnostics — hot, noisy, timing-shifted, cross-talk and saturated pixels — never from the science counts being fitted, and never a low-count screen. <a class="ev rev" href="#rr2-19">corrected·r1</a></p>
+      </details>
+      <details class="contract" id="c2"><summary>2 · Reduction — one convention, native TOF preserved <a class="ev rev" href="#rr2-1">corrected·r1</a></summary>
+        <p>Reduction hard-excludes only the sample ∪ open-beam unhealthy-pixel union (masking by counts would bias the Poisson statistics it feeds). Native-TOF bin edges are recorded per run and never re-binned downstream; per-bin width Δt is carried; live time and monitor counts attach as observations with uncertainties — Q_s, Q_o are never exact divisors. <a class="ev rev" href="#rr2-5">corrected·r1</a> Reduction never rebins to energy: E(t; L, t₀) is evaluated inside every likelihood evaluation at the current calibration parameters — that is what lets L and t₀ float with their covariance; a baked axis would silently pin them and re-interpolate counts. A derived energy axis is a display product of stage 5 only. No per-pixel geometric L (≈6×10⁻⁷ centre, 3×10⁻⁵ corner — orders below any stated budget); per-pixel t₀ only from independent timing calibration. The domain decision lives here: <b>counts is the canonical arm</b>; transmission T=(S/Q_s)/(O/Q_o) is a community-convention diagnostic formed only if every admissibility test passes (open-count bias, black cores, shared-open-beam covariance, background and monitor uncertainty, and the forward-simulated resolution-order bound) — never the canonical fit domain. <a class="ev rev" href="#rr2-6">corrected·r1</a> The output carries full provenance: bin edges, masks, monitor observations, calibration-posterior identity, nuclear library/version, component versions, configuration hashes, seeds. <a class="ev rev" href="#rr2-26">corrected·r1</a></p>
+      </details>
+      <details class="contract" id="c3"><summary>3 · Forward model + likelihood — one invocation <a class="ev rev" href="#rr2-9">corrected·r1</a></summary>
+        <p>σ(E; T_eff) is assembled per isotope with the evaluation's declared resolved-resonance formalism (ENDF File 2: RM / RML / MLBW as given — never an assumed Reich-Moore), the full parameter set, File-3 background where present, boundary rules honoured; isotope contributions sum in the exponent; Doppler broadening at T_eff with the lattice-model family declared. Nuclear covariance is carried under an explicit failure policy: availability checked, non-PSD repaired and disclosed, missing covariance → declared default or rejection, one shared uncertainty across all fits, model discrepancy its own term. <a class="ev rev" href="#rr2-10">corrected·r1</a> The kernel K(t|E) acts on expected counts (Φ·ε·T), position-anchored; every non-Beer-Lambert contribution (container attenuation, scatter-in, multiple scattering, PSF mixing, self-shielding) is modelled, bounded with a stated magnitude, or measured. <a class="ev rev" href="#rr2-8">corrected·r1</a> Objectives: Poisson/KL deviance with a calibrated GOF reference (D/(n−k)→1 only asymptotically; per-bin E[D] ≈ 1.15 at λ=1) <a class="ev rev" href="#rr2-23">corrected·r1</a>; the transmission arm uses Pearson-weighted Gaussian χ², never Neyman. The identifiability screen is layered — design time, per configuration, per pixel class on the actual data, post-fit — fails loudly, and never converts non-identifiability into a hard pin: pinning is admissible only under the marginalization criterion. <a class="ev rev" href="#rr2-14">corrected·r1</a> <a class="ev rev" href="#rr2-15">corrected·r1</a></p>
+      </details>
+      <details class="contract" id="c4"><summary>4 · Fit instances — four lock patterns, one engine <a class="ev rev" href="#rr2-12">corrected·r1</a></summary>
+        <p><b>Calibration</b> selects isolated resonances spanning the band at a range of optical depths, reduces with nominal axis parameters, predicts the known σ(E; T_eff) with ENDF covariance carried, and jointly fits {L, t₀, θ_res} + nuisances against modelled dip shapes under an explicit kernel anchor — never centroids, never a sequential position/width split. It emits (θ̂, Σ_cal) with off-diagonals — or samples where non-Gaussian — plus kernel form, anchor, validity range and its full conditioning set. <a class="ev rev" href="#rr2-11">corrected·r1</a> Transfer is enforced by a compatibility gate (configuration hashes: moderator condition, thresholds/HV, rate regime, chopper, geometry, epoch; drift bounded by bracketing references and control charts; on mismatch reject or attach an expanded drift model), and validated by holdout — held-out resonances, thicknesses or repeat runs are predicted, not fitted. <a class="ev rev" href="#rr2-13">corrected·r1</a>
+        <b>Density</b> frees (n·d)ᵢ + nuisances with T under a prior (pinned only by the marginalization criterion; τ₀ ≈ 2.2 is the idealized thickness optimum). <b>Temperature</b> frees T_eff with n·d under a prior; resonance sets are ranked by expected information after marginalization <a class="ev rev" href="#rr2-16">corrected·r1</a>; the lattice-model family is declared and its uncertainty propagated <a class="ev rev" href="#rr2-17">corrected·r1</a>. <b>In-situ</b> declares its sharing structure as part of the experiment definition — global reference n·d₀ under the integrated expansion link n·dⱼ = n·d₀·exp(−2∫α(T)dT) <a class="ev rev" href="#rr2-21">corrected·r1</a>, per-frame T, and the time-dependent instrument and beam terms (a global fit does not protect against drift it does not model) <a class="ev rev" href="#rr2-22">corrected·r1</a> — then fits the series jointly.</p>
+      </details>
+      <details class="contract" id="c5"><summary>5 · Results / QC — every instance terminates here <a class="ev rev" href="#rr2-25">corrected·r1</a></summary>
+        <p>The product family: value map, uncertainty map (total marginal covariance authoritative; the statistical/systematic split is a documented decomposition convention; credible intervals where posteriors are bounded or skewed <a class="ev rev" href="#rr2-24">corrected·r1</a>), calibrated GOF/deviance map, trust mask, and residual cube in signed-deviance / randomized-quantile form. Derived display products — the energy axis at the posterior calibration and the transmission spectrum — are produced here for display and cross-checks only, never the fit domain. Consistency tests each carry a predicted value: 1D↔2D offset = ⟨e^(−τ)⟩ from the 2D field (not zero); transmission↔counts within ratio-bias + resolution-order bias; deviance against its calibrated reference; per-resonance residuals per line. Nuisance flexibility is restricted so unexplained structure cannot be absorbed. Every failure class has a predefined outcome — fail-closed or a declared degraded mode: missing open beam / background / monitor data, partial frames, dead-time violation, calibration incompatibility, missing or non-PSD covariance, kernel extrapolation, non-identifiability, non-convergence.</p>
+      </details>
     </div>
   </section>
 
   <!-- ===================== DATA ===================== -->
   <section class="panel" data-panel="data" role="tabpanel" hidden>
     <div class="skel-note" style="--sc:var(--data-c)" id="s0-data"><b>Skeleton — categories established, to finalize against the pipelines.</b> What each pipeline consumes.</div>
-    <div class="cards">
-      <div class="card" style="--cc:var(--data-c)"><h4>Calibrant <span class="todo">foil choice ↓</span></h4><p>A known-(ρ,T) reference foil at room T with its own sample + OB. Candidates evaluated below; prefer a full-RRR library (ENDF/B-VIII.1) over VIII.0.</p></div>
-      <div class="card" style="--cc:var(--data-c)"><h4>Sample <span class="todo">to detail</span></h4><p>Sample + OB (+ container). Thickness uniform for calibration, variant for spatial (from fitting, not an ingested map).</p></div>
-      <div class="card" style="--cc:var(--data-c)"><h4>Domain <span class="todo">to detail</span></h4><p>Transmission (conventional) vs counts (VENUS target, KL-exact). Full foil vs ROI-aggregated.</p></div>
-      <div class="card" style="--cc:var(--data-c)"><h4>Acquisition &amp; normalization <span class="todo">to detail</span></h4><p>Proton charge (Q_s, Q_o), incident flux Φ(E), distinct backgrounds B_s ≠ B_o, blocked-beam and notch-filter background runs.</p></div>
-      <div class="card" style="--cc:var(--data-c)"><h4>ENDF nuclear data <span class="todo">to detail</span></h4><p>Resolved resonance parameters + library/version; the full R-matrix set (see Physics).</p></div>
-      <div class="card" style="--cc:var(--data-c)"><h4>Measurement targets <span class="todo">to detail</span></h4><p>Known isotope+T → density · known ρ → temperature · neither → in-situ.</p></div>
+    <div class="scroller">
+      <table class="idtbl">
+        <thead><tr><th>Input</th><th>What it is</th><th>Status</th></tr></thead>
+        <tbody>
+          <tr><td class="p">Calibrant</td><td class="feat">A known-(ρ,T) reference foil at room T with its own sample + OB. Candidates evaluated below; prefer a full-RRR library (ENDF/B-VIII.1) over VIII.0.</td><td class="req">foil choice below</td></tr>
+          <tr><td class="p">Sample</td><td class="feat">Sample + OB (+ container). Thickness uniform for calibration, variant for spatial (from fitting, not an ingested map).</td><td class="req">to detail</td></tr>
+          <tr><td class="p">Domain</td><td class="feat">Transmission (conventional) vs counts (VENUS target, KL-exact). Full foil vs ROI-aggregated.</td><td class="req">to detail</td></tr>
+          <tr><td class="p">Acquisition &amp; normalization</td><td class="feat">Proton charge (Q_s, Q_o), incident flux Φ(E), distinct backgrounds B_s ≠ B_o, blocked-beam and notch-filter background runs.</td><td class="req">to detail</td></tr>
+          <tr><td class="p">ENDF nuclear data</td><td class="feat">Resolved resonance parameters + library/version; the full R-matrix set (see Physics).</td><td class="req">to detail</td></tr>
+          <tr><td class="p">Measurement targets</td><td class="feat">Known isotope + T → density · known ρ → temperature · neither → in-situ.</td><td class="req">to detail</td></tr>
+        </tbody>
+      </table>
     </div>
 
     <h2>Calibrant foil selection — Ta / W / Au / Ag</h2>
     <p class="step-body" style="margin-bottom:.8rem">A calibrant serves <b>two distinct jobs</b>, and they favour different foils — which is why "cleanest resonance" and "most preferred" need not be the same material.</p>
-    <div class="deg" style="margin-bottom:1rem">
-      <div class="degp"><b>Job A · energy scale (L, t₀)</b> — wants many accurately-known, well-separated resonance <b>positions</b> spanning the widest E<sup>−1/2</sup> range. Multi-isotope is harmless: a position is a position.</div>
-      <div class="degp"><b>Job B · resolution function θ_res(E)</b> — wants the <b>instrumental</b> width not swamped by intrinsic Doppler+natural width, sampled across the band, at unsaturated optical depth, on isolated lines. Favours heavy nuclei (Δ_D ∝ 1/√A).</div>
-    </div>
+    <p style="margin-bottom:1rem"><b>Job A — the energy scale (L, t₀)</b> — wants many accurately-known, well-separated resonance <b>positions</b> spanning the widest E<sup>−1/2</sup> range; multi-isotope is harmless, since a position is a position. <b>Job B — the resolution function θ_res(E)</b> — wants the <b>instrumental</b> width not swamped by intrinsic Doppler + natural width, sampled across the band, at unsaturated optical depth, on isolated lines; that favours heavy nuclei (Δ_D ∝ 1/√A).</p>
 
     <div class="scroller">
       <table class="idtbl">
@@ -938,11 +782,16 @@
   <!-- ===================== API ===================== -->
   <section class="panel" data-panel="api" role="tabpanel" hidden>
     <div class="skel-note" style="--sc:var(--api-c)"><b>Deliberately empty — categories only.</b> The API is specified <b>last</b>, derived from the Physics and Pipelines — never reverse-engineered from the current (flawed) code being refactored. These headings mark what to look into, not decisions. This tab is the anti-rot contract: once filled, no new function without updating it.</div>
-    <div class="cards">
-      <div class="card"><h4>Entry points <span class="todo">TBD</span></h4><p>The public surface — reduction, calibration, the fit instances. To be enumerated from the pipelines.</p></div>
-      <div class="card"><h4>Data types / structures <span class="todo">TBD</span></h4><p>The types crossing the boundary (counts cubes, reduced spectra, instrument model, result maps). From the Data tab.</p></div>
-      <div class="card"><h4>Configuration / fit contract <span class="todo">TBD</span></h4><p>What is fixed vs free vs prior per instance; the joint-fit and covariance-propagation contract.</p></div>
-      <div class="card"><h4>Acceptance criteria <span class="todo">TBD</span></h4><p>How we know the code matches the physics — toy problems, SAMMY as the resolved-σ oracle, known-sample recovery.</p></div>
+    <div class="scroller">
+      <table class="idtbl">
+        <thead><tr><th>Category</th><th>What will be specified</th><th>Derived from</th></tr></thead>
+        <tbody>
+          <tr><td class="p">Entry points</td><td class="feat">The public surface — reduction, calibration, the fit instances.</td><td class="req">enumerated from the Pipelines tab</td></tr>
+          <tr><td class="p">Data types / structures</td><td class="feat">The types crossing the boundary: counts cubes, reduced spectra, instrument model, result maps.</td><td class="req">the Data tab</td></tr>
+          <tr><td class="p">Configuration / fit contract</td><td class="feat">What is fixed vs free vs prior per instance; the joint-fit and covariance-propagation contract.</td><td class="req">Physics + Pipelines</td></tr>
+          <tr><td class="p">Acceptance criteria</td><td class="feat">How we know the code matches the physics — toy problems, SAMMY as the resolved-σ oracle, known-sample recovery.</td><td class="req">Physics</td></tr>
+        </tbody>
+      </table>
     </div>
   </section>
 
@@ -1084,113 +933,15 @@
   (function () {
     var tabs = Array.prototype.slice.call(document.querySelectorAll(".tab"));
     var panels = Array.prototype.slice.call(document.querySelectorAll(".panel"));
-
-    var graph = document.getElementById("pgraph");
-    var svg = document.getElementById("pedges");
-    var NS = "http://www.w3.org/2000/svg";
-
-    function pt(el, side) {
-      var r = el.getBoundingClientRect(), g = graph.getBoundingClientRect();
-      var y = r.top + r.height / 2 - g.top;
-      var x = (side === "right" ? r.right : side === "left" ? r.left : (r.left + r.right) / 2) - g.left;
-      if (side === "top") y = r.top - g.top;
-      if (side === "bottom") y = r.bottom - g.top;
-      return { x: x, y: y };
-    }
-    function P(d, cls, arrow) {
-      var p = document.createElementNS(NS, "path");
-      p.setAttribute("d", d);
-      p.setAttribute("class", "pedge " + cls + " drawn");
-      if (arrow) p.setAttribute("marker-end", "url(#parr)");
-      svg.appendChild(p);
-      return p;
-    }
-    function casedLabel(x, y, text, cls) {
-      var t = document.createElementNS(NS, "text");
-      t.setAttribute("x", x); t.setAttribute("y", y);
-      t.setAttribute("text-anchor", "middle");
-      t.setAttribute("class", "pelabel " + cls + " drawn");
-      t.textContent = text;
-      svg.appendChild(t);
-      var bb = t.getBBox();
-      var r = document.createElementNS(NS, "rect");
-      r.setAttribute("x", bb.x - 5); r.setAttribute("y", bb.y - 2);
-      r.setAttribute("width", bb.width + 10); r.setAttribute("height", bb.height + 4);
-      r.setAttribute("rx", 4);
-      r.setAttribute("class", "plabelbg drawn");
-      svg.insertBefore(r, t);
-    }
-    function draw() {
-      if (!graph || graph.offsetWidth === 0) return;
-      var w = graph.scrollWidth, h = graph.scrollHeight;
-      svg.setAttribute("width", w); svg.setAttribute("height", h);
-      svg.setAttribute("viewBox", "0 0 " + w + " " + h);
-      Array.prototype.slice.call(svg.querySelectorAll(".drawn")).forEach(function (n) { n.remove(); });
-      var id = function (s) { return document.getElementById(s); };
-      var cal = id("pn-cal-data"), sam = id("pn-sam-data"), endf = id("pn-endf");
-      var qual = id("pn-qual"), red = id("pn-reduce"), mod = id("pn-model");
-      var fits = [id("pn-cal"), id("pn-den"), id("pn-tem"), id("pn-ins")];
-      var res = id("pn-res");
-      if (!cal || !res) return;
-
-      // sources -> qualification (elbows into the left edge)
-      [cal, sam].forEach(function (n) {
-        var a = pt(n, "right"), b = pt(qual, "left");
-        var mx = (a.x + b.x) / 2;
-        P("M" + a.x + " " + a.y + " H" + mx + " V" + b.y + " H" + b.x, "data", true);
-      });
-      // ENDF -> model via the bottom band
-      var e = pt(endf, "right"), m = pt(mod, "bottom");
-      var bandY = h - 22;
-      P("M" + e.x + " " + e.y + " H" + (e.x + 14) + " V" + bandY + " H" + m.x + " V" + (m.y + 4), "data", true);
-      casedLabel((e.x + 14 + m.x) / 2, bandY + 3.5, "resonance params + covariance", "dt");
-      // spine: qual -> reduce -> model
-      var q = pt(qual, "right"), rL = pt(red, "left");
-      P("M" + q.x + " " + q.y + " H" + rL.x, "flow", true);
-      var rR = pt(red, "right"), mL = pt(mod, "left");
-      P("M" + rR.x + " " + rR.y + " H" + mL.x, "flow", true);
-      // model -> trunk -> comb into the four fit instances
-      var mR = pt(mod, "right");
-      var fitL = fits.map(function (n) { return pt(n, "left"); });
-      var jx = (mR.x + fitL[0].x) / 2;
-      P("M" + mR.x + " " + mR.y + " H" + jx, "flow", false);
-      var ys = fitL.map(function (p) { return p.y; });
-      P("M" + jx + " " + Math.min.apply(null, ys) + " V" + Math.max.apply(null, ys), "flow", false);
-      fitL.forEach(function (p) { P("M" + jx + " " + p.y + " H" + p.x, "flow", true); });
-      var dot = document.createElementNS(NS, "circle");
-      dot.setAttribute("cx", jx); dot.setAttribute("cy", mR.y); dot.setAttribute("r", 3);
-      dot.setAttribute("class", "pjunction drawn");
-      svg.appendChild(dot);
-      // fits -> mirrored comb -> results
-      var fitR = fits.map(function (n) { return pt(n, "right"); });
-      var resL = pt(res, "left");
-      var jx2 = (fitR[0].x + resL.x) / 2;
-      var ys2 = fitR.map(function (p) { return p.y; });
-      fitR.forEach(function (p) { P("M" + p.x + " " + p.y + " H" + jx2, "flow", false); });
-      P("M" + jx2 + " " + Math.min.apply(null, ys2) + " V" + Math.max.apply(null, ys2), "flow", false);
-      P("M" + jx2 + " " + resL.y + " H" + resL.x, "flow", true);
-      // feedback: calibration -> model along the reserved top band
-      var cT = pt(fits[0], "top"), mT = pt(mod, "top");
-      var bandTop = 16;
-      P("M" + cT.x + " " + cT.y + " V" + bandTop + " H" + mT.x + " V" + (mT.y - 4), "feedback", true);
-      casedLabel((cT.x + mT.x) / 2, bandTop + 3.5, "instrument posterior (θ̂, Σ_cal)", "fb");
-    }
-
     function activate(name) {
       tabs.forEach(function (t) { t.setAttribute("aria-selected", String(t.getAttribute("data-tab") === name)); });
       panels.forEach(function (p) { p.hidden = (p.getAttribute("data-panel") !== name); });
       window.scrollTo({ top: 0 });
-      if (name === "pipelines") requestAnimationFrame(draw);
     }
     tabs.forEach(function (t) { t.addEventListener("click", function () { activate(t.getAttribute("data-tab")); }); });
     document.querySelectorAll("[data-goto]").forEach(function (b) {
       b.addEventListener("click", function (ev) { ev.preventDefault(); activate(b.getAttribute("data-goto")); });
     });
-    // cross-tab anchors: chips -> review record entries; graph nodes -> stage sections
-    function panelOf(el) {
-      var p = el.closest ? el.closest(".panel") : null;
-      return p ? p.getAttribute("data-panel") : null;
-    }
     document.querySelectorAll('a[href^="#"]').forEach(function (a) {
       a.addEventListener("click", function (ev) {
         var tid = a.getAttribute("href").slice(1);
@@ -1198,16 +949,15 @@
         var target = document.getElementById(tid);
         if (!target) return;
         ev.preventDefault();
-        var pname = panelOf(target);
-        if (pname) activate(pname);
+        var pn = target.closest(".panel");
+        if (pn) activate(pn.getAttribute("data-panel"));
         if (history.replaceState) history.replaceState(null, "", "#" + tid);
-        // re-trigger :target styling
         location.hash = tid;
         requestAnimationFrame(function () { target.scrollIntoView({ block: "start" }); });
       });
     });
-    // user / developer view toggle — user view (default) delivers current knowledge
-    // only; developer view reveals the provenance layer (chips, record tab, asides)
+
+    // user / developer view toggle
     var root = document.documentElement;
     var vbtns = Array.prototype.slice.call(document.querySelectorAll(".viewtoggle button"));
     function setView(v) {
@@ -1222,11 +972,362 @@
     var savedView = "user";
     try { savedView = localStorage.getItem("nereids-whitebox-view") || "user"; } catch (e) {}
     setView(savedView);
-
     window.addEventListener("beforeprint", function () {
       document.querySelectorAll("details").forEach(function (d) { d.open = true; });
     });
-    var rz;
-    window.addEventListener("resize", function () { clearTimeout(rz); rz = setTimeout(draw, 120); });
+
+    /* ============================================================
+       The pipeline scene: the document's own forward model, live.
+       sigma(E;T) -> tau = nd*sigma -> counts = flux*exp(-tau),
+       fitted by Gauss-Newton in (nd, T) per pixel.
+       ============================================================ */
+    var svg = document.getElementById("scn");
+    if (!svg) return;
+    var NS = "http://www.w3.org/2000/svg";
+    var REDUCED = matchMedia("(prefers-reduced-motion: reduce)").matches;
+
+    // ---------- physics ----------
+    var RES = [[4.28, 1.0, 0.057], [10.36, 0.55, 0.20], [13.95, 0.18, 0.11],
+               [20.3, 0.10, 0.12], [23.9, 0.35, 0.13], [35.9, 0.28, 0.21], [39.1, 0.14, 0.19]];
+    var kB = 8.617333262e-5, N = 240;
+    var E = [], T_ = [], FLX = [];
+    for (var i = 0; i < N; i++) {
+      E.push(2.5 * Math.pow(60 / 2.5, i / (N - 1)));
+      T_.push(1 / Math.sqrt(E[i]));
+      FLX.push(Math.pow(E[i], -0.92) * (1 - Math.exp(-Math.pow(E[i] / 1.1, 2))));
+    }
+    var fmax = Math.max.apply(null, FLX);
+    for (i = 0; i < N; i++) FLX[i] /= fmax;
+    var tmin = Math.min.apply(null, T_), tmax = Math.max.apply(null, T_);
+    function sigmaAt(T) {
+      var s = new Array(N);
+      for (var i = 0; i < N; i++) s[i] = 0.02 / Math.sqrt(E[i]);
+      RES.forEach(function (r) {
+        var dD = Math.sqrt(4 * kB * T * r[0] / 181.0);
+        var w = 0.55 * Math.sqrt(dD * dD + r[2] * r[2]);
+        for (var i = 0; i < N; i++) {
+          var z = (E[i] - r[0]) / w;
+          s[i] += r[1] * Math.exp(-0.5 * z * z) * 3.2;
+        }
+      });
+      var pk = 0;
+      for (i = 0; i < N; i++) if (s[i] > pk) pk = s[i];
+      for (i = 0; i < N; i++) s[i] /= pk;          // peak sigma = 1 => nd is tau0 at 4.28 eV
+      return s;
+    }
+    function model(nd, T) {
+      var s = sigmaAt(T), m = new Array(N);
+      for (var i = 0; i < N; i++) m[i] = FLX[i] * Math.exp(-nd * s[i]);
+      return m;
+    }
+    function mulberry(seed) {
+      return function () {
+        seed |= 0; seed = (seed + 0x6D2B79F5) | 0;
+        var t = Math.imul(seed ^ (seed >>> 15), 1 | seed);
+        t = (t + Math.imul(t ^ (t >>> 7), 61 | t)) ^ t;
+        return ((t ^ (t >>> 14)) >>> 0) / 4294967296;
+      };
+    }
+    function gauss(rng) {
+      return Math.sqrt(-2 * Math.log(1 - rng())) * Math.cos(2 * Math.PI * rng());
+    }
+
+    // ---------- the sample field (truth) ----------
+    var MC = 13, MR = 9, NDT = [], INSIDE = [];
+    for (var j = 0; j < MR; j++) for (i = 0; i < MC; i++) {
+      var dx = (i - 6) / 5.0, dy = (j - 4) / 3.6, r2 = dx * dx + dy * dy;
+      INSIDE.push(r2 <= 1.02);
+      NDT.push(0.5 + 1.6 * Math.exp(-((dx + 0.25) * (dx + 0.25) * 1.3 + (dy - 0.15) * (dy - 0.15) * 1.6)));
+    }
+    var T_TRUE = 520;
+    function pixelData(px) {
+      var rng = mulberry((px + 1) * 2654435761);
+      var m = model(NDT[px], T_TRUE), d = new Array(N), sd = new Array(N);
+      for (var i = 0; i < N; i++) {
+        d[i] = Math.max(m[i] * (1 + 0.035 * gauss(rng)), 0.0005);
+        sd[i] = Math.max(0.035 * d[i], 0.004);
+      }
+      return { d: d, sd: sd };
+    }
+
+    // ---------- geometry ----------
+    var AX = { x0: 74, x1: 878, yb: 500, yt: 210 };     // spectrum axes
+    var RS = { y0: 524, y1: 560 };                       // residual strip
+    var PX = { x0: 646, x1: 876, y0: 610, y1: 764 };     // posterior panel
+    var MAP = { x: 92, y: 862, c: 24 };                  // nd map
+    var SMAP = { x: 486, y: 886, c: 13 };                // sigma map
+    function xOf(i) { return AX.x0 + (T_[i] - tmin) / (tmax - tmin) * (AX.x1 - AX.x0); }
+    function yOf(v) { return AX.yb - v * (AX.yb - AX.yt) / 1.06; }
+    function el(tag, attrs, parent, text) {
+      var n = document.createElementNS(NS, tag);
+      for (var k in attrs) n.setAttribute(k, attrs[k]);
+      (parent || svg).appendChild(n);
+      if (text != null) n.textContent = text;
+      return n;
+    }
+    function pathOf(vals) {
+      var d = "";
+      for (var i = N - 1; i >= 0; i--) d += (d ? " L" : "M") + xOf(i).toFixed(1) + " " + yOf(vals[i]).toFixed(1);
+      return d;
+    }
+
+    // ---------- region A: the measurement ----------
+    var A = document.getElementById("rgA");
+    el("rect", { x: 28, y: 56, width: 62, height: 64, rx: 8, fill: "color-mix(in srgb, var(--data-c) 16%, var(--plot))", stroke: "var(--data-c)" }, A);
+    el("text", { x: 59, y: 138, "text-anchor": "middle", "class": "scn-cap" }, A, "moderator");
+    el("path", { d: "M92 116 q4 -30 8 -34 q4 16 10 22 q8 8 18 9", fill: "none", stroke: "var(--plot-line2)", "stroke-width": 1.6 }, A);
+    el("text", { x: 140, y: 134, "class": "scn-cap2" }, A, "emission tail → the timing blur K(t|E)");
+    el("line", { x1: 100, y1: 88, x2: 640, y2: 88, stroke: "url(#beamfade)", "stroke-width": 2.4 }, A);
+    el("text", { x: 300, y: 76, "class": "scn-cap" }, A, "25 m flight — time sorts neutrons by energy");
+    // pulse snapshots: dispersing dot groups (leading = fast/teal, trailing = slow/amber)
+    [[150, 9], [330, 30], [530, 58]].forEach(function (g, gi) {
+      var rng = mulberry(11 + gi);
+      for (var k = 0; k < 11; k++) {
+        var u = k / 10;                                       // 0 = leading/fast
+        var col = u < 0.5 ? "var(--plot-line)" : "var(--plot-line2)";
+        el("circle", { cx: g[0] + (u - 0.5) * 2 * g[1] + 2 * gauss(rng),
+                       cy: 88 + 6 * gauss(rng) * (0.4 + 0.6 * gi / 2),
+                       r: 2.1, fill: col, opacity: 0.9 - 0.18 * (gi === 0 ? 0 : u) }, A);
+      }
+    });
+    el("text", { x: 150, y: 64, "text-anchor": "middle", "class": "scn-cap2" }, A, "one pulse");
+    el("text", { x: 530, y: 116, "text-anchor": "middle", "class": "scn-cap2" }, A, "fast arrive first · slow last");
+    el("rect", { x: 652, y: 50, width: 13, height: 76, rx: 3, fill: "color-mix(in srgb, var(--samp) 22%, var(--plot))", stroke: "var(--samp)" }, A);
+    el("text", { x: 622, y: 46, "text-anchor": "middle", "class": "scn-cap" }, A, "sample (n·d, T)");
+    el("line", { x1: 665, y1: 88, x2: 700, y2: 88, stroke: "var(--plot-line)", "stroke-width": 1.2, opacity: 0.5 }, A);
+    for (var drow = 0; drow < 8; drow++)
+      el("rect", { x: 704, y: 50 + drow * 10, width: 15, height: 8.4, rx: 2, fill: "color-mix(in srgb, var(--phys-c) 22%, var(--plot))", stroke: "var(--phys-c)", "stroke-width": 1 }, A);
+    el("text", { x: 742, y: 78, "class": "scn-cap" }, A, "detector —");
+    el("text", { x: 742, y: 93, "class": "scn-cap" }, A, "one count per");
+    el("text", { x: 742, y: 108, "class": "scn-cap" }, A, "neutron: (pixel, t)");
+    el("path", { d: "M712 132 C 712 182, 340 170, 172 246", "class": "scn-link", "marker-end": "url(#sarr)" }, A);
+    el("text", { x: 470, y: 182, "class": "scn-cap2" }, A, "thousands of pulses accumulate ↓");
+    function anchor(g, x, y, n, label) {
+      el("circle", { cx: x, cy: y, r: 10, "class": "scn-anchor", "stroke-width": 1.5 }, g);
+      el("text", { x: x, y: y + 4, "text-anchor": "middle", "class": "scn-anchor-t" }, g, n);
+      if (label) el("text", { x: x + 16, y: y + 4, "class": "scn-cap" }, g, label);
+    }
+    anchor(A, 44, 30, "1", "the measurement — qualified before use");
+
+    // ---------- region B: spectrum + model ----------
+    var B = document.getElementById("rgB");
+    el("line", { x1: AX.x0, y1: AX.yt - 8, x2: AX.x0, y2: AX.yb, "class": "scn-axis" }, B);
+    el("line", { x1: AX.x0, y1: AX.yb, x2: AX.x1 + 6, y2: AX.yb, "class": "scn-axis" }, B);
+    el("text", { x: 30, y: AX.yt + 16, "class": "scn-cap" }, B, "counts");
+    el("text", { x: 32, y: AX.yt + 30, "class": "scn-cap2" }, B, "(arb.)");
+    el("text", { x: AX.x0 + 210, y: AX.yt + 20, "class": "scn-cap2" }, B, "↑ energy (eV) — the same axis as time, read in the other currency");
+    el("text", { x: AX.x1 - 130, y: AX.yb + 16, "class": "scn-cap" }, B, "time of flight →");
+    anchor(B, 44, 182, "2", "one spectrum per pixel");
+    // energy markers at the resonance dips (energy runs opposite to time)
+    [[4.28, "4.3 eV"], [10.36, "10.4"], [23.9, "24"], [35.9, "36 eV"]].forEach(function (r) {
+      var ii = 0, best = 1e9;
+      for (var i = 0; i < N; i++) { var d = Math.abs(E[i] - r[0]); if (d < best) { best = d; ii = i; } }
+      el("line", { x1: xOf(ii), y1: AX.yt - 6, x2: xOf(ii), y2: AX.yt + 2, "class": "scn-axis" }, B);
+      el("text", { x: xOf(ii), y: AX.yt - 12, "text-anchor": "middle", "class": "scn-cap2" }, B, r[1]);
+    });
+        var obPath = el("path", { "class": "scn-ob" }, B);
+    var obLab = el("text", { "class": "scn-cap2", opacity: 0.9 }, B, "open beam (no sample) ↘");
+    var dataG = el("g", {}, B);
+    var modelPath = el("path", { "class": "scn-model" }, B);
+    // dip callout at the 4.28 eV line
+    var i428 = N - 1;
+    el("text", { x: AX.x1 - 174, y: AX.yb - 132, "class": "scn-cap" }, B, "deeper = more material (n·d)");
+    el("text", { x: AX.x1 - 174, y: AX.yb - 116, "class": "scn-cap" }, B, "wider = hotter (Doppler, T)");
+    // residual strip
+    el("line", { x1: AX.x0, y1: (RS.y0 + RS.y1) / 2, x2: AX.x1, y2: (RS.y0 + RS.y1) / 2, "class": "scn-axis", "stroke-dasharray": "3 4" }, B);
+    el("text", { x: AX.x0 + 10, y: RS.y1 + 16, "class": "scn-cap2" }, B, "residuals — data − prediction · red = off by more than 2σ · flat teal noise = the physics accounts for every count");
+    var resG = el("g", {}, B);
+    anchor(B, 44, RS.y0 - 12, "3", "");
+    el("text", { x: 62, y: RS.y0 - 8, "class": "scn-cap" }, B, "the forward model predicts the spectrum — orange curve");
+
+    // ---------- region C: parameters + fit ----------
+    var C = document.getElementById("rgC");
+    anchor(C, 44, 606, "4", "fit = turn the dials until prediction matches data");
+    // locked instrument parameters
+    var locks = [["L — flight path", "25.0013 m"], ["t₀ — time offset", ""], ["θ_res — timing-blur shape", ""]];
+    locks.forEach(function (L, k) {
+      var y = 646 + k * 26;
+      el("rect", { x: 424, y: y - 13, width: 10, height: 9, rx: 2, fill: "none", stroke: "var(--api-c)", "stroke-width": 1.3 }, C);
+      el("path", { d: "M426 " + (y - 13) + " v-4 a3 3 0 0 1 6 0 v4", fill: "none", stroke: "var(--api-c)", "stroke-width": 1.3 }, C);
+      el("text", { x: 442, y: y - 4, "class": "scn-lock" }, C, L[0] + (L[1] ? "  =  " + L[1] : ""));
+    });
+    el("text", { x: 424, y: 736, "class": "scn-feed-t" }, C, "held from the calibration posterior —");
+    el("text", { x: 424, y: 750, "class": "scn-feed-t" }, C, "with covariance, never as exact numbers");
+    var feed = el("path", { d: "M646 706 C 616 700, 592 692, 566 684", "class": "scn-feed", "marker-end": "url(#sarr)" }, C);
+    // posterior panel
+    el("rect", { x: PX.x0, y: PX.y0 - 22, width: PX.x1 - PX.x0, height: PX.y1 - PX.y0 + 22, rx: 8, fill: "none", stroke: "var(--plot-edge)" }, C);
+    el("text", { x: PX.x0 + 8, y: PX.y0 - 6, "class": "scn-cap" }, C, "the answer: a joint posterior");
+    el("text", { x: PX.x1 - 8, y: PX.y1 - 8, "text-anchor": "end", "class": "scn-cap2" }, C, "n·d →");
+    el("text", { x: PX.x0 + 8, y: PX.y0 + 16, "class": "scn-cap2" }, C, "T ↑");
+    var ellG = el("g", {}, C);
+    var postT1 = el("text", { x: PX.x0 + 8, y: PX.y1 + 16, "class": "scn-cap" }, C, "→ press fit to solve this pixel");
+    var postT2 = el("text", { x: PX.x0 + 8, y: PX.y1 + 32, "class": "scn-cap2" }, C, "tilt = the n·d–T trade-off");
+
+    // ---------- region D: the map ----------
+    var D = document.getElementById("rgD");
+    anchor(D, 44, 828, "5", "the same fit, in every pixel");
+    el("text", { x: MAP.x, y: MAP.y - 14, "class": "scn-lab" }, D, "areal density n·d");
+    el("text", { x: MAP.x + 150, y: MAP.y - 14, "class": "scn-cap2" }, D, "— click a pixel: its spectrum loads above (13×9 demo grid; VENUS is 512×512)");
+    el("text", { x: SMAP.x, y: SMAP.y - 14, "class": "scn-lab" }, D, "uncertainty σ(n·d)");
+    el("text", { x: SMAP.x + 200, y: SMAP.y - 14, "class": "scn-cap2" }, D, "+ residual cube · trust mask");
+    el("text", { x: SMAP.x, y: SMAP.y + MR * SMAP.c + 26, "class": "scn-cap2" }, D, "value · uncertainty · proof, per pixel — the deliverable");
+    var cells = [], sells = [];
+    for (j = 0; j < MR; j++) for (i = 0; i < MC; i++) {
+      var px = j * MC + i;
+      var c = el("rect", { x: MAP.x + i * MAP.c, y: MAP.y + j * MAP.c, width: MAP.c, height: MAP.c,
+                           "class": "scn-cell", fill: INSIDE[px] ? "color-mix(in srgb, var(--plot-line) 8%, var(--plot))" : "var(--plot)" }, D);
+      if (INSIDE[px]) c.setAttribute("data-px", px);
+      cells.push(c);
+      sells.push(el("rect", { x: SMAP.x + i * SMAP.c, y: SMAP.y + j * SMAP.c, width: SMAP.c, height: SMAP.c,
+                              fill: INSIDE[px] ? "color-mix(in srgb, var(--plot-line2) 6%, var(--plot))" : "var(--plot)", stroke: "var(--plot)" }, D));
+    }
+    el("text", { x: MAP.x + 140, y: MAP.y + MR * MAP.c + 52, "class": "scn-cap2" }, D, "· empty until you fit — the map is made of fits, not images");
+    (function colorbars() {
+      for (var s = 0; s < 12; s++) {
+        el("rect", { x: MAP.x + s * 10, y: MAP.y + MR * MAP.c + 30, width: 10, height: 8,
+                     fill: ndColor(0.2 + (s / 11) * 2.0) }, D);
+        el("rect", { x: SMAP.x + s * 8, y: SMAP.y + MR * SMAP.c + 34, width: 8, height: 7,
+                     fill: "color-mix(in srgb, var(--plot-line2) " + Math.round(6 + (s / 11) * 70) + "%, var(--plot))" }, D);
+      }
+      el("text", { x: MAP.x, y: MAP.y + MR * MAP.c + 52, "class": "scn-cap2" }, D, "0.2");
+      el("text", { x: MAP.x + 120, y: MAP.y + MR * MAP.c + 52, "text-anchor": "end", "class": "scn-cap2" }, D, "2.2  n·d");
+      el("text", { x: SMAP.x, y: SMAP.y + MR * SMAP.c + 55, "class": "scn-cap2" }, D, "low");
+      el("text", { x: SMAP.x + 96, y: SMAP.y + MR * SMAP.c + 55, "text-anchor": "end", "class": "scn-cap2" }, D, "high  σ/n·d");
+    })();
+    var linkPath = el("path", { "class": "scn-link", d: "" }, D);
+
+    // ---------- live state ----------
+    var ndIn = document.getElementById("in-nd"), TIn = document.getElementById("in-T");
+    var ndV = document.getElementById("v-nd"), TV = document.getElementById("v-T"), chiV = document.getElementById("v-chi");
+    var CUR = { px: 4 * MC + 5, data: null, fitted: {} };
+    CUR.data = pixelData(CUR.px);
+    function chi2(nd, T) {
+      var m = model(nd, T), s = 0;
+      for (var i = 0; i < N; i++) { var r = (CUR.data.d[i] - m[i]) / CUR.data.sd[i]; s += r * r; }
+      return s / N;
+    }
+    function redraw() {
+      var nd = +ndIn.value, T = +TIn.value;
+      ndV.textContent = nd.toFixed(2);
+      TV.textContent = Math.round(T) + " K";
+      var m = model(nd, T);
+      modelPath.setAttribute("d", pathOf(m));
+      chiV.textContent = "χ²/n = " + chi2(nd, T).toFixed(2);
+      while (resG.firstChild) resG.removeChild(resG.firstChild);
+      var mid = (RS.y0 + RS.y1) / 2;
+      for (var i = 0; i < N; i += 3) {
+        var r = (CUR.data.d[i] - m[i]) / CUR.data.sd[i];
+        var big = Math.abs(r) > 2;
+        el("circle", { cx: xOf(i), cy: mid - Math.max(-3.6, Math.min(3.6, r)) * 4.6, r: big ? 1.8 : 1.4,
+                       fill: big ? "var(--warn)" : "", "class": big ? "" : "scn-res" }, resG);
+      }
+    }
+    function drawData() {
+      obPath.setAttribute("d", pathOf(FLX));
+      var iLab = Math.floor(N * 0.55);
+      obLab.setAttribute("x", xOf(iLab) - 190);
+      obLab.setAttribute("y", yOf(FLX[iLab]) - 14);
+      while (dataG.firstChild) dataG.removeChild(dataG.firstChild);
+      for (var i = 0; i < N; i += 3)
+        el("circle", { cx: xOf(i), cy: yOf(CUR.data.d[i]), r: 2.2, "class": "scn-data" }, dataG);
+      cells.forEach(function (c) { c.classList.remove("sel"); });
+      cells[CUR.px].classList.add("sel");
+      var ci = CUR.px % MC, cj = (CUR.px / MC) | 0;
+      var cx = MAP.x + ci * MAP.c + MAP.c / 2, cy = MAP.y + cj * MAP.c;
+      linkPath.setAttribute("d", "M" + cx + " " + cy + " C " + cx + " " + (cy - 90) + ", 66 " + (cy - 130) + ", 66 " + (AX.yb + 46) + " L 70 " + (AX.yb + 14));
+    }
+    // Gauss-Newton in (nd, T)
+    function gnStep(nd, T) {
+      var m = model(nd, T), h1 = 0.01, h2 = 4;
+      var m1 = model(nd + h1, T), m2 = model(nd, T + h2);
+      var a = 0, b = 0, c = 0, g1 = 0, g2 = 0;
+      for (var i = 0; i < N; i++) {
+        var w = 1 / (CUR.data.sd[i] * CUR.data.sd[i]);
+        var j1 = (m1[i] - m[i]) / h1, j2 = (m2[i] - m[i]) / h2, r = CUR.data.d[i] - m[i];
+        a += w * j1 * j1; b += w * j1 * j2; c += w * j2 * j2; g1 += w * j1 * r; g2 += w * j2 * r;
+      }
+      var det = a * c - b * b;
+      if (Math.abs(det) < 1e-12) return null;
+      return { dnd: (c * g1 - b * g2) / det, dT: (a * g2 - b * g1) / det, cov: [c / det, -b / det, a / det] };
+    }
+    function fitPixel(quiet, done) {
+      var steps = 0;
+      function it() {
+        var s = gnStep(+ndIn.value, +TIn.value);
+        if (!s) return;
+        ndIn.value = Math.max(0.05, Math.min(4, +ndIn.value + 0.85 * s.dnd));
+        TIn.value = Math.max(150, Math.min(1500, +TIn.value + 0.85 * s.dT));
+        redraw();
+        if (++steps < 14 && (Math.abs(s.dnd) > 2e-4 || Math.abs(s.dT) > 0.3)) {
+          if (quiet || REDUCED) it(); else setTimeout(it, 90);
+        } else { drawPosterior(s.cov); if (done) done(); }
+      }
+      it();
+    }
+    function drawPosterior(cov) {
+      while (ellG.firstChild) ellG.removeChild(ellG.firstChild);
+      var snd = Math.sqrt(cov[0]), sT = Math.sqrt(cov[2]), rho = cov[1] / (snd * sT);
+      var tr = (cov[0] / (snd * snd) + cov[2] / (sT * sT)) / 2, dt2 = Math.sqrt(Math.max(0, tr * tr - (1 - rho * rho)));
+      var l1 = Math.sqrt(tr + dt2), l2 = Math.sqrt(Math.max(0.05, tr - dt2));
+      var ang = 45 * (rho < 0 ? 1 : -1);
+      var cx = (PX.x0 + PX.x1) / 2, cy = (PX.y0 + PX.y1) / 2 - 8, k = 52;
+      [2, 1].forEach(function (ns) {
+        el("ellipse", { cx: cx, cy: cy, rx: ns * k * l1 / (l1 + l2), ry: ns * k * l2 / (l1 + l2),
+                        transform: "rotate(" + ang + " " + cx + " " + cy + ")", "class": "scn-ell", opacity: ns === 2 ? 0.45 : 0.95 }, ellG);
+      });
+      el("circle", { cx: cx, cy: cy, r: 2.4, fill: "var(--plot-line2)" }, ellG);
+      postT1.textContent = "n·d " + (+ndIn.value).toFixed(2) + "±" + snd.toFixed(2) +
+                           " · T " + Math.round(+TIn.value) + "±" + Math.round(sT) + " K · ρ " + rho.toFixed(2);
+    }
+    function ndColor(v) {
+      var f = Math.max(0, Math.min(1, v / 2.2));
+      return "color-mix(in srgb, var(--plot-line) " + Math.round(8 + f * 84) + "%, var(--plot))";
+    }
+    function fitAllPixels() {
+      var order = [];
+      for (var px = 0; px < MC * MR; px++) if (INSIDE[px]) order.push(px);
+      var at = 0;
+      function batch() {
+        var stop = Math.min(at + (REDUCED ? order.length : 6), order.length);
+        for (; at < stop; at++) {
+          var px = order[at], dat = pixelData(px);
+          var save = CUR.data; CUR.data = dat;
+          var nd = 0.8, T = 600;
+          for (var s = 0; s < 8; s++) {
+            var st = (function (n2, T2) {
+              var keepN = ndIn.value, keepT = TIn.value;
+              ndIn.value = n2; TIn.value = T2;
+              var r = gnStep(n2, T2);
+              ndIn.value = keepN; TIn.value = keepT;
+              return r;
+            })(nd, T);
+            if (!st) break;
+            nd = Math.max(0.05, Math.min(4, nd + 0.85 * st.dnd));
+            T = Math.max(150, Math.min(1500, T + 0.85 * st.dT));
+            var covLast = st.cov;
+          }
+          CUR.data = save;
+          cells[px].setAttribute("fill", ndColor(nd));
+          var sig = covLast ? Math.sqrt(covLast[0]) : 0.03;
+          var sf = Math.max(0, Math.min(1, (sig / Math.max(nd, 0.2)) * 16));
+          sells[px].setAttribute("fill", "color-mix(in srgb, var(--plot-line2) " + Math.round(6 + sf * 70) + "%, var(--plot))");
+        }
+        if (at < order.length) requestAnimationFrame(batch);
+      }
+      batch();
+    }
+    ndIn.addEventListener("input", redraw);
+    TIn.addEventListener("input", redraw);
+    document.getElementById("btn-fit").addEventListener("click", function () { fitPixel(false); });
+    document.getElementById("btn-map").addEventListener("click", fitAllPixels);
+    cells.forEach(function (c) {
+      c.addEventListener("click", function () {
+        var px = c.getAttribute("data-px");
+        if (px == null) return;
+        CUR.px = +px; CUR.data = pixelData(CUR.px);
+        drawData(); redraw();
+      });
+    });
+    drawData(); redraw();
   })();
 </script>
