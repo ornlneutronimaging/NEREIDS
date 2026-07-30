@@ -5,7 +5,7 @@
     --nuc: #6b6f8c; --inst: #2f6aa8; --samp: #17836a; --nui: #b0781c;
     --warn: #bf4a3a; --accent: #2f6aa8; --ok: #17836a; --rev: #5b6ba8;
     --data-c: #128a8a; --phys-c: #2f6aa8; --pipe-c: #6f5fd0; --api-c: #b0781c;
-    --plot: #0e1a26; --plot-line: #7fd4d4; --plot-line2: #e0a24a; --plot-edge: #2a3d4e; --plot-faint: #7f95a8;
+    --plot: #fdfdfe; --plot-line: #0e7c7c; --plot-line2: #b26f10; --plot-edge: #d9e0e7; --plot-faint: #76838f;
     --mono: ui-monospace, "SF Mono", "JetBrains Mono", Menlo, Consolas, monospace;
     --sans: ui-sans-serif, -apple-system, "Segoe UI", Roboto, Helvetica, Arial, sans-serif;
     /* type scale — five tokens; nothing meant to be read sits below --fs-label */
@@ -17,7 +17,7 @@
       --data-c: #34c3c3; --phys-c: #6ea8dd; --pipe-c: #9a8ff2; --api-c: #dcab55;
       --plot: #081019; --plot-line: #45c8c8; --plot-line2: #e0a24a; --plot-edge: #22323f; --plot-faint: #7f95a8; }
   }
-  :root[data-theme="light"]{ --ground:#f4f6f9;--surface:#fff;--surface-2:#eef2f6;--ink:#16212c;--ink-muted:#55636f;--ink-faint:#8b98a3;--hairline:#d9e0e7;--nuc:#6b6f8c;--inst:#2f6aa8;--samp:#17836a;--nui:#b0781c;--warn:#bf4a3a;--accent:#2f6aa8;--ok:#17836a;--rev:#5b6ba8;--data-c:#128a8a;--phys-c:#2f6aa8;--pipe-c:#6f5fd0;--api-c:#b0781c;--plot:#0e1a26;--plot-line:#7fd4d4;--plot-line2:#e0a24a;--plot-edge:#2a3d4e;--plot-faint:#7f95a8;}
+  :root[data-theme="light"]{ --ground:#f4f6f9;--surface:#fff;--surface-2:#eef2f6;--ink:#16212c;--ink-muted:#55636f;--ink-faint:#8b98a3;--hairline:#d9e0e7;--nuc:#6b6f8c;--inst:#2f6aa8;--samp:#17836a;--nui:#b0781c;--warn:#bf4a3a;--accent:#2f6aa8;--ok:#17836a;--rev:#5b6ba8;--data-c:#128a8a;--phys-c:#2f6aa8;--pipe-c:#6f5fd0;--api-c:#b0781c;--plot:#fdfdfe;--plot-line:#0e7c7c;--plot-line2:#b26f10;--plot-edge:#d9e0e7;--plot-faint:#76838f;}
   :root[data-theme="dark"]{ --ground:#0b1116;--surface:#131c24;--surface-2:#182430;--ink:#dde5ec;--ink-muted:#94a3af;--ink-faint:#63717d;--hairline:#223039;--nuc:#a3a7c6;--inst:#6ea8dd;--samp:#45c4a4;--nui:#dcab55;--warn:#e07a68;--accent:#6ea8dd;--ok:#45c4a4;--rev:#93a1e0;--data-c:#34c3c3;--phys-c:#6ea8dd;--pipe-c:#9a8ff2;--api-c:#dcab55;--plot:#081019;--plot-line:#45c8c8;--plot-line2:#e0a24a;--plot-edge:#22323f;--plot-faint:#7f95a8;}
   * { box-sizing: border-box; }
   body { margin: 0; background: var(--ground); color: var(--ink); font-family: var(--sans); line-height: 1.58; -webkit-font-smoothing: antialiased; }
@@ -129,16 +129,20 @@
   .nomen div { font-size: var(--fs-caption); color: var(--ink-muted); padding: .12rem 0; }
   .nomen b { font-family: var(--mono); color: var(--ink); font-weight: 600; margin-right: .3rem; }
 
-  /* the pipeline scene — one continuous interactive figure */
+  /* the pipeline scene — one continuous interactive figure (theme-adaptive) */
   .scene { position: relative; border: 1px solid var(--plot-edge); border-radius: 14px; background: var(--plot); margin: 0 0 1.2rem; }
   .scene svg { display: block; width: 100%; height: auto; }
   .scene text { font-family: var(--mono); }
   .scn-cap { fill: var(--plot-faint); font-size: 12px; }
   .scn-cap2 { fill: var(--plot-faint); font-size: 11px; }
-  .scn-lab { fill: #c6d6e4; font-size: 13px; font-weight: 700; font-family: var(--sans); }
+  .scn-lab { fill: var(--ink); font-size: 13px; font-weight: 700; font-family: var(--sans); }
   .scn-anchor { fill: var(--plot); stroke: var(--pipe-c); }
-  .scn-anchor-t { fill: #b9aef7; font-size: 12px; font-weight: 700; }
-  .scn-axis { stroke: var(--plot-edge); stroke-width: 1.2; }
+  .scn-anchor-t { fill: var(--pipe-c); font-size: 12px; font-weight: 700; }
+  .scn-anchor-n { fill: var(--pipe-c); stroke: var(--pipe-c); }
+  .scn-anchor-tn { fill: var(--plot); font-size: 12px; font-weight: 700; }
+  .scn-spine { stroke: var(--plot-edge); stroke-width: 1.5; }
+  .scn-sep { stroke: var(--plot-edge); stroke-width: 1; opacity: .6; }
+  .scn-axis { stroke: color-mix(in srgb, var(--plot-faint) 55%, var(--plot)); stroke-width: 1.2; }
   .scn-ob { fill: none; stroke: var(--plot-faint); stroke-width: 1.7; opacity: .85; }
   .scn-data { fill: var(--plot-line); }
   .scn-model { fill: none; stroke: var(--plot-line2); stroke-width: 2.4; }
@@ -146,36 +150,63 @@
   .scn-link { fill: none; stroke: var(--plot-faint); stroke-width: 1.3; stroke-dasharray: 4 4; opacity: .8; }
   .scn-feed { fill: none; stroke: var(--api-c); stroke-width: 1.6; stroke-dasharray: 3 5; }
   .scn-feed-t { fill: var(--api-c); font-size: 11px; }
-  .scn-lock { fill: var(--plot-faint); font-size: 11.5px; }
   .scn-cell { stroke: var(--plot); stroke-width: 1; cursor: pointer; }
-  .scn-cell.sel { stroke: var(--plot-line2); stroke-width: 2; }
   .scn-ell { fill: none; stroke: var(--plot-line2); stroke-width: 1.6; opacity: .9; }
-  .ctl { position: absolute; display: flex; flex-direction: column; gap: .25rem; font-family: var(--mono); font-size: .68rem; color: var(--plot-faint); }
-  .ctl label { display: flex; align-items: center; gap: .5rem; }
+  .ctl { position: absolute; display: flex; flex-direction: column; gap: .28rem; font-family: var(--mono); font-size: .68rem; color: var(--plot-faint); }
+  .ctl label { display: flex; align-items: center; gap: .5rem; color: var(--ink-muted); }
+  .ctl label .pn { min-width: 3.4em; }
   .ctl input[type=range] { flex: 1; accent-color: var(--plot-line2); min-width: 0; }
-  .ctl .v { min-width: 4.2em; color: #c6d6e4; text-align: right; }
-  .ctl .fitrow { display: flex; align-items: center; gap: .5rem; margin-top: .15rem; }
+  .ctl .v { min-width: 4.6em; color: var(--ink); text-align: right; }
+  .ctl .prow { display: flex; align-items: center; gap: .5rem; }
+  .ctl .prow .pn { min-width: 3.4em; }
+  .ctl .pband { position: relative; flex: 1; height: 9px; border-radius: 3px; background: color-mix(in srgb, var(--plot-faint) 22%, transparent); }
+  .ctl .pband i { position: absolute; left: 50%; top: 0; bottom: 0; width: 12%; transform: translateX(-50%); background: var(--api-c); border-radius: 3px; }
+  .ctl .phead { color: var(--api-c); margin-top: .2rem; }
+  .ctl .fitrow { display: flex; align-items: center; gap: .5rem; margin-top: .2rem; flex-wrap: wrap; }
   .ctl button { white-space: nowrap; font-family: var(--mono); font-size: .68rem; color: var(--plot-line2); background: transparent; border: 1px solid var(--plot-line2); border-radius: 6px; padding: .22rem .6rem; cursor: pointer; }
   .ctl button:hover { background: color-mix(in srgb, var(--plot-line2) 16%, transparent); }
-  .ctl .chi { color: #c6d6e4; margin-left: auto; white-space: nowrap; }
-  .ctl .unote { font-size: .6rem; color: var(--plot-faint); }
-  @media (max-width: 40rem) { .ctl { position: static; padding: .6rem .9rem .8rem; } }
+  .ctl .chi { color: var(--ink); margin-left: auto; white-space: nowrap; }
+  @media (max-width: 40rem) {
+    .ctl { position: static; padding: .6rem .9rem .8rem; }
+    .ctl::before { content: "④ the joint fit — the controls"; font-family: var(--sans); font-size: .8rem; font-weight: 700; color: var(--ink); }
+  }
 
-  /* the narrative */
-  .modeslead, .modesnote { font-size: .92rem; line-height: 1.62; color: var(--ink-muted); max-width: 74ch; margin: 0 0 .9rem; }
-  .modeslead b, .modesnote b { color: var(--ink); font-weight: 600; }
+  /* mode switcher + recipe strip (replaces the forced-read modes prose/table) */
+  .pipeintro { font-size: .9rem; color: var(--ink-muted); max-width: 74ch; margin: 0 0 .8rem; }
+  .pipeintro b { color: var(--ink); font-weight: 600; }
+  .modebar { display: flex; flex-wrap: wrap; gap: .4rem; margin: 0 0 .55rem; }
+  .modebar .mode { text-align: left; font-family: var(--mono); font-size: .82rem; font-weight: 600; padding: .45rem .8rem; border: 1px solid var(--hairline); border-radius: 10px; background: var(--surface); color: var(--ink-muted); cursor: pointer; }
+  .modebar .mode .msub { display: block; font-family: var(--sans); font-size: .66rem; font-weight: 400; color: var(--ink-faint); margin-top: .12rem; }
+  .modebar .mode[aria-pressed="true"] { border-color: var(--pipe-c); box-shadow: inset 0 0 0 1px var(--pipe-c); color: var(--ink); }
+  .modebar .mode[aria-pressed="true"] .msub { color: var(--ink-muted); }
+  .modebar .mode:focus-visible { outline: 2px solid var(--pipe-c); outline-offset: 2px; }
+  .recipe { display: flex; flex-wrap: wrap; align-items: center; gap: .35rem .5rem; font-size: .74rem; color: var(--ink-muted); margin: 0 0 .9rem; max-width: none; }
+  .recipe .rslot { border: 1px solid var(--hairline); background: var(--surface); border-radius: 7px; padding: .26rem .55rem; }
+  .recipe .rslot b { color: var(--ink); font-weight: 600; }
+  .recipe .rslot.solve { border-color: var(--samp); }
+  .recipe .rslot.prior { border-style: dashed; }
+  .recipe .rarr { color: var(--ink-faint); }
+  .recipe .rpair { display: inline-flex; align-items: center; gap: .5rem; }
+
+  /* hover tooltips for HTML elements (default-hidden explanations) */
+  [data-tip] { position: relative; cursor: help; }
+  [data-tip]::after { content: attr(data-tip); position: absolute; left: 0; top: calc(100% + .45rem); z-index: 6; width: max-content; max-width: 36ch; background: var(--surface); color: var(--ink); border: 1px solid var(--pipe-c); border-radius: 8px; padding: .5rem .7rem; font-family: var(--sans); font-size: .78rem; font-weight: 400; line-height: 1.5; letter-spacing: 0; text-transform: none; white-space: normal; box-shadow: 0 4px 18px color-mix(in srgb, var(--ink) 18%, transparent); opacity: 0; visibility: hidden; transition: opacity .12s; pointer-events: none; }
+  [data-tip]:hover::after, [data-tip]:focus-visible::after { opacity: 1; visibility: visible; }
+  [data-tip].tip-r::after { left: auto; right: 0; }
+  .ihint { display: inline-flex; align-items: center; justify-content: center; width: 1.05rem; height: 1.05rem; border-radius: 50%; border: 1px solid var(--pipe-c); color: var(--pipe-c); font-size: .68rem; font-family: var(--mono); vertical-align: .05rem; }
   details.walk { margin: .2rem 0 1rem; border: 1px solid var(--hairline); border-radius: 10px; background: var(--surface); }
   details.walk summary { cursor: pointer; padding: .6rem .9rem; font-size: .88rem; font-weight: 600; color: var(--ink); list-style: none; }
   details.walk summary::-webkit-details-marker { display: none; }
   details.walk summary::before { content: "▸ "; color: var(--pipe-c); }
   details.walk[open] summary::before { content: "▾ "; }
   details.walk .story { padding: 0 1rem .5rem; }
-  .scntip { position: absolute; max-width: 36ch; background: var(--plot); border: 1px solid var(--pipe-c); color: #cdd9e5; font-family: var(--sans); font-size: .78rem; line-height: 1.5; padding: .5rem .75rem; border-radius: 8px; z-index: 3; box-shadow: 0 4px 18px rgba(0,0,0,.4); pointer-events: none; }
+  .scntip { position: absolute; max-width: 36ch; background: var(--surface); border: 1px solid var(--pipe-c); color: var(--ink); font-family: var(--sans); font-size: .78rem; line-height: 1.5; padding: .5rem .75rem; border-radius: 8px; z-index: 3; box-shadow: 0 4px 18px color-mix(in srgb, var(--ink) 22%, transparent); pointer-events: none; }
   .scn-anchor-hit { cursor: pointer; }
   .story { max-width: 72ch; }
   .story p { font-size: .92rem; line-height: 1.66; color: var(--ink-muted); margin: 0 0 .85rem; }
   .story p b { color: var(--ink); font-weight: 600; }
-  .story .mk { display: inline-flex; align-items: center; justify-content: center; width: 1.25rem; height: 1.25rem; border-radius: 50%; border: 1.5px solid var(--pipe-c); color: var(--pipe-c); font-family: var(--mono); font-size: .7rem; font-weight: 700; margin-right: .45rem; vertical-align: -.15rem; }
+  .story p { padding-left: 1.7rem; }
+  .story .mk { display: inline-flex; align-items: center; justify-content: center; width: 1.25rem; height: 1.25rem; border-radius: 50%; border: 1.5px solid var(--pipe-c); color: var(--pipe-c); font-family: var(--mono); font-size: .7rem; font-weight: 700; margin-left: -1.7rem; margin-right: .45rem; vertical-align: -.15rem; }
   .story .storycal { border-top: 1px solid var(--hairline); padding-top: .85rem; }
 
   /* the dev-layer engineering contract */
@@ -190,7 +221,7 @@
   /* calibration section */
   .idtbl { width: 100%; border-collapse: collapse; font-size: .78rem; }
   .idtbl th, .idtbl td { text-align: left; padding: .5rem .55rem; border-bottom: 1px solid var(--hairline); vertical-align: top; }
-  .idtbl th { font-family: var(--mono); font-size: .6rem; letter-spacing: .06em; text-transform: uppercase; color: var(--ink-faint); font-weight: 600; }
+  .idtbl th { font-family: var(--mono); font-size: .6rem; letter-spacing: .06em; text-transform: uppercase; color: var(--ink-faint); font-weight: 600; vertical-align: bottom; }
   .idtbl td.p { font-family: var(--mono); font-weight: 700; color: var(--inst); white-space: nowrap; }
   .idtbl td.feat { color: var(--ink); }
   .idtbl td.req { color: var(--ink-muted); font-size: .74rem; }
@@ -237,7 +268,7 @@
 <div class="wrap">
   <p class="eyebrow">NEREIDS · VENUS neutron-resonance imaging</p>
   <h1>Analysis whitebox — a living design map</h1>
-  <p class="lede">Built <b>physics-first</b>: one shared forward model, four experiment pipelines derived from it, and an API contract specified last. The code is validated against this document — never the reverse.</p>
+  <p class="lede">Built <b>physics-first</b>: one shared forward model, four experiment pipelines derived from it, an API contract specified last <span class="ihint" tabindex="0" data-tip="The code is validated against this document — never the reverse. This map is the anti-rot gate: no new function without updating it.">i</span></p>
   <p class="keyrow"><span>claim badges:</span> <span class="ev ver">verified</span> <span class="ev hyp">hypothesis</span> <span class="ev unv">unverified</span> <span class="dev-only"><span class="ev rev">corrected·r1</span> — links to the review record</span>
     <span class="viewtoggle" role="group" aria-label="View"><button type="button" data-view-opt="user" aria-pressed="true">user</button><button type="button" data-view-opt="dev" aria-pressed="false">developer</button></span></p>
 
@@ -261,13 +292,13 @@
       <span class="harr">→</span>
       <button class="area api" data-goto="api"><span class="an">API <span class="status">pending</span></span><span class="as">the contract that exposes them — specified last</span></button>
     </div>
-    <p class="principle"><b>How to read this:</b> there is <b>one forward model</b> (Physics). Each pipeline is that model run as an instance — calibration solves for the instrument; the experiments solve for density and/or temperature. Data is what the model consumes; the API is the contract the code must implement. Fill-order is physics-first: finish Physics → finalize Pipelines → refine Data → specify the API last, from the physics and pipelines — never reverse-engineered from the current (flawed) code being refactored.</p>
+    <p class="principle"><b>How to read this:</b> there is <b>one forward model</b> (Physics). Each pipeline runs it as an instance — calibration solves the instrument; the experiments solve density and temperature. Data is what the model consumes; the API is the contract the code must implement <span class="ihint" tabindex="0" data-tip="Fill order is physics-first: finish Physics → finalize Pipelines → refine Data → specify the API last, from the physics and pipelines — never reverse-engineered from the current (flawed) code being refactored.">i</span></p>
     <p class="tabstatus">Every claim on these tabs carries a status badge, and the whole document has passed one round of cross-family adversarial review (two independent reviews, 40 findings, all adjudicated against re-derived numerics). What each correction changed is in the <a href="#" data-goto="record">review record</a>.</p>
   </section>
 
   <!-- ===================== PHYSICS ===================== -->
   <section class="panel" data-panel="physics" role="tabpanel" hidden>
-    <p class="lede">One deterministic chain — the shared engine every fit runs. Calibration and the three experiments differ only in which parameters are known vs solved, and those parameters are coupled, so the honest picture is joint estimation with calibration carried as a constraint.</p>
+    <p class="lede">One deterministic chain — the shared engine every fit runs <span class="ihint" tabindex="0" data-tip="Calibration and the three experiments differ only in which parameters are known vs solved; those parameters are coupled, so the honest picture is joint estimation with calibration carried as a constraint.">i</span></p>
     <p class="tabstatus">Verified by derivation, in-session numerics and literature (dossier in <span style="font-family:var(--mono)">.research/pipeline-map/</span>); reviewed by a second LLM family; corrections folded and recorded in the <a href="#" data-goto="record">review record</a>.</p>
 
     <div class="nomen" aria-label="Symbols used on this tab">
@@ -641,25 +672,24 @@
 
   <!-- ===================== PIPELINES ===================== -->
   <section class="panel" data-panel="pipelines" role="tabpanel" hidden>
-    <p class="lede"><b>This is what NEREIDS does.</b> The scene below is not an illustration — it is the pipeline itself, running in this page on the same Ta-181 physics the Physics tab specifies. Drag the two science parameters and watch the predicted spectrum respond; press <i>fit</i> and watch the pipeline solve a pixel; fit the whole field and the result map appears. Reading time to the first idea: zero.</p>
-    <p class="tabstatus">The interactive model here is the document's own forward model (resonances → Doppler → Beer-Lambert → flux), reduced to two free parameters for demonstration; the engineering contract for each stage is in the developer layer below. Design and content history: <a href="#" data-goto="record">review record</a>.</p>
+    <p class="pipeintro"><b>One fitting engine, four modes.</b> Every parameter is fitted jointly — a mode is a prior pattern <span class="ihint" tabindex="0" data-tip="A tight prior is not a pin: the parameter's own uncertainty still flows into the answer — it just cannot absorb freedom the data should assign elsewhere. When a parameter may be treated as effectively fixed is governed per case by the marginalization criterion on the Physics tab.">i</span>. Pick a mode; the scene below runs it live, on the same Ta-181 physics the Physics tab specifies.</p>
+    <p class="tabstatus">The interactive model is the document's own forward model (resonances → Doppler → Beer-Lambert → E(t; L, t₀) inside the likelihood → constant-relative-width blur as the demo reduction of K(t|E)), fitted by 5-parameter Gauss-Newton with the mode's prior pattern; the engineering contract for each stage is in the developer layer below. Design and content history: <a href="#" data-goto="record">review record</a>.</p>
 
-    <p class="modeslead"><b>One fitting engine, four modes</b> — this table is the whole tab in one view. Every parameter is always fitted <b>jointly</b>; what distinguishes a mode is which parameters run free and which carry a tight prior. A tight prior is not a pin: the parameter’s own uncertainty still flows into the answer — it just cannot absorb freedom the data should assign elsewhere.</p>
-    <div class="scroller">
-      <table class="idtbl">
-        <thead><tr><th>Run as</th><th>You bring</th><th>The fit solves</th><th>Tight prior (uncertainty counted)</th><th>You receive</th></tr></thead>
-        <tbody>
-          <tr><td class="p">Calibration</td><td class="feat">a reference foil whose n·d and T are tightly known</td><td class="fr">L, t₀, θ_res</td><td class="req">the foil’s n·d, T · nuclear data (+ covariance)</td><td class="feat">the instrument posterior every other run consumes</td></tr>
-          <tr><td class="p">Density</td><td class="feat">known isotope + temperature</td><td class="fr">n·d per pixel</td><td class="req">L, t₀, θ_res (calibration posterior) · T</td><td class="feat">n·d map + uncertainty + residuals</td></tr>
-          <tr><td class="p">Temperature</td><td class="feat">known areal density</td><td class="fr">T_eff per pixel</td><td class="req">L, t₀, θ_res · n·d</td><td class="feat">temperature map + uncertainty + residuals</td></tr>
-          <tr><td class="p">In-situ</td><td class="feat">a time series, neither known</td><td class="fr">shared n·d₀ + per-frame T</td><td class="req">L, t₀, θ_res · the expansion link n·d(T)</td><td class="feat">n·d and T trajectories with joint uncertainty</td></tr>
-        </tbody>
-      </table>
+    <div class="modebar" role="group" aria-label="Run mode">
+      <button type="button" class="mode" data-mode="calibration" aria-pressed="false" data-tip="You bring a reference foil whose n·d and T are tightly known. With the sample known, the fit solves the instrument instead — flight path L, time offset t₀, blur shape θ_res — and emits them as a joint posterior with covariance. Every other mode consumes that posterior as its tight priors.">Calibration<span class="msub">runs first — solves L · t<sub>0</sub> · θ_res</span></button>
+      <button type="button" class="mode" data-mode="density" aria-pressed="true" data-tip="You bring a known isotope and temperature. The fit solves n·d per pixel; T and the instrument carry tight priors. You receive the density map with uncertainty and residuals.">Density<span class="msub">solves n·d per pixel</span></button>
+      <button type="button" class="mode" data-mode="temperature" aria-pressed="false" data-tip="You bring a known areal density. The fit solves T_eff per pixel; n·d and the instrument carry tight priors. You receive the temperature map with uncertainty and residuals.">Temperature<span class="msub">solves T_eff per pixel</span></button>
+      <button type="button" class="mode" data-mode="insitu" aria-pressed="false" data-tip="A time series where neither is known. The fit solves a shared reference n·d₀ and per-frame T under the expansion link n·d(T); the instrument carries tight priors. You receive n·d and T trajectories with joint uncertainty. (The demo fits one frame jointly in n·d and T.)">In-situ<span class="msub">solves n·d + T</span></button>
     </div>
-    <p class="modesnote">Where the instrument numbers come from: run the engine first in <b>calibration mode</b> on the reference foil — with n·d and T tightly known, the fit solves the instrument instead: L, t₀, θ_res, emitted as a <b>joint posterior with its covariance</b>. Every other mode consumes that posterior as its tight prior (the dashed arrow in the scene below). How tight a prior may be — and when a parameter may be treated as effectively fixed — is governed per case by the marginalization criterion on the Physics tab.</p>
+    <p class="recipe">
+      <span class="rslot">you bring <b id="r-bring"></b></span>
+      <span class="rpair"><span class="rarr">→</span><span class="rslot solve">the fit solves <b id="r-solve"></b></span></span>
+      <span class="rpair"><span class="rarr">→</span><span class="rslot">you receive <b id="r-get"></b></span></span>
+      <span class="rslot prior tip-r" tabindex="0" data-tip="Tight priors are still fitted — their uncertainty is counted in the answer; they just cannot absorb freedom the data should assign elsewhere. Never hard-pinned.">tight priors <b id="r-prior"></b></span>
+    </p>
 
     <div class="scene" id="scene">
-      <svg id="scn" viewBox="0 0 920 1160" role="img" aria-label="The NEREIDS pipeline operating: a neutron pulse disperses along the flight path, is attenuated by the sample, accumulates into a time-of-flight spectrum with resonance dips; a forward model with five parameters is fitted to that spectrum, yielding a joint posterior; the fit repeats per pixel to produce the areal-density map with uncertainties.">
+      <svg id="scn" viewBox="0 0 920 1160" role="img" aria-label="The NEREIDS pipeline operating in the selected mode: a neutron pulse disperses along the flight path, is attenuated by the sample or reference foil, accumulates into a time-of-flight spectrum with resonance dips; a forward model with five parameters is fitted jointly to that spectrum under the mode's prior pattern, yielding a joint posterior; experiment modes repeat the fit per pixel to produce value and uncertainty maps, while calibration emits the instrument posterior consumed by every other mode.">
         <defs>
           <marker id="sarr" viewBox="0 0 10 10" refX="8.5" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse"><path d="M0 0 L10 5 L0 10 z" fill="context-stroke"></path></marker>
           <linearGradient id="beamfade" x1="0" y1="0" x2="1" y2="0">
@@ -676,11 +706,11 @@
         <g id="rgD"></g>
       </svg>
       <div class="scntip" id="scntip" role="tooltip" hidden></div>
-      <div class="ctl" id="ctl-dials" style="left:2.5%; top:53.2%; width:37%">
-        <label>n·d <input type="range" id="in-nd" min="0.2" max="3" step="0.01" value="0.45"><span class="v" id="v-nd">0.70</span></label>
-        <label>T <input type="range" id="in-T" min="200" max="1200" step="5" value="1100"><span class="v" id="v-T">900 K</span></label>
-        <div class="fitrow"><button type="button" id="btn-fit">fit this pixel</button><button type="button" id="btn-map">fit every pixel</button><span class="chi" id="v-chi"></span></div>
-        <span class="unote">demo units: n·d as peak optical depth at the 4.3 eV line · real deliverable: atoms/barn</span>
+      <div class="ctl" id="ctl-board" style="left:7.5%; top:53.4%; width:36.5%">
+        <div id="freerows"></div>
+        <div class="phead" id="priorhead" tabindex="0" data-tip="These parameters are also in the joint fit, held by tight priors from the calibration posterior (with its L–t₀ correlation). Their uncertainty is counted in the answer — never hard-pinned.">tight priors ← calibration posterior</div>
+        <div id="priorrows"></div>
+        <div class="fitrow"><button type="button" id="btn-fit">fit this pixel</button><button type="button" id="btn-map">fit every pixel</button><span class="chi" id="v-chi"></span><span class="ihint" tabindex="0" data-tip="Demo reductions: n·d in units of peak optical depth at the 4.3 eV line (real deliverable: atoms/barn); K(t|E) rendered as a constant-relative-width blur; 13×9 pixel grid (VENUS is 512×512); one frame for in-situ.">i</span></div>
       </div>
     </div>
 
@@ -689,13 +719,29 @@
       <div class="story">
       <p><span class="mk">1</span> Every pulse releases one burst of neutrons. Over the 25 m flight, time sorts them by energy — fast ones land early, slow ones late — so arrival time doubles as an energy axis. On the way through the sample, its nuclei absorb neutrons at their resonance energies. Each surviving neutron is one count at (pixel, time). Before any run is used it is checked; incomplete or faulty runs stop here.</p>
       <p><span class="mk">2</span> Adding up thousands of pulses gives each pixel a spectrum: a smooth curve with dark notches at the resonance energies. The notches are the signal — how much beam they remove says how much material is in the way (areal density n·d), and their shape says how hot it is (thermal motion broadens them). The pale curve is the reference beam measured with no sample.</p>
-      <p><span class="mk">3</span> The analysis never works backward from the data. It predicts the full spectrum from physics — resonances, thermal broadening at temperature T, attenuation by n·d, the flight-time relation, the instrument’s timing blur — and compares prediction with measurement, count by count. The strip under the spectrum shows what is left over; flat noise means the physics accounts for everything.</p>
-      <p><span class="mk">4</span> Fitting adjusts parameters until the prediction matches. <b>All five parameters are fitted together — nothing is pinned.</b> The two science parameters run free; the three instrument parameters (flight path L, time offset t₀, timing-blur shape θ_res) enter with <b>tight priors taken from the calibration measurement</b>, so their uncertainty is counted in the result without adding freedom the data cannot support. The answer is the joint posterior — the ellipse — and its tilt is the honest statement that density and temperature partly mimic each other in a single spectrum.</p>
-      <p><span class="mk">5</span> The same fit runs in every pixel, and that field of fits is the deliverable: the density map, its uncertainty map, and per-pixel residuals. Click any pixel to load its spectrum — the whole pipeline is that one loop, repeated.</p>
+      <p><span class="mk">3</span> The analysis never works backward from the data. It predicts the full spectrum from physics — resonances, thermal broadening at temperature T, attenuation by n·d, the flight-time relation E(t; L, t₀), the instrument’s timing blur — and compares prediction with measurement, count by count. The strip under the spectrum shows what is left over; flat noise means the physics accounts for everything.</p>
+      <p><span class="mk">4</span> Fitting adjusts <b>all five parameters together — nothing is pinned</b>, and the mode decides only the prior pattern. In the experiment modes the science parameters run free while the instrument three (flight path L, time offset t₀, timing-blur shape θ_res) carry <b>tight priors taken from the calibration posterior</b> — their uncertainty is counted in the result without adding freedom the data cannot support. In <b>calibration mode the pattern flips</b>: the reference foil’s n·d and T are the tightly-known ones, and the fit solves the instrument — try it; the fitted L lands ≈8 cm above the surveyed 25 m, which is the moderator emission depth, expected and physical. The answer is always the joint posterior — the ellipse — whose tilt states honestly how much the two headline parameters mimic each other.</p>
+      <p><span class="mk">5</span> The same fit runs in every pixel, and that field of fits is the deliverable: value map, uncertainty map, per-pixel residuals. Click any pixel to load its spectrum — the whole pipeline is that one loop, repeated. Spatially a mode runs per pixel (as here) or on a summed region of interest; 3-D tomography is a different inverse problem and is deferred — see the Physics tab. Calibration instead ends in one product: the instrument posterior every other mode consumes.</p>
       </div>
     </details>
 
-    <p class="capnote" style="margin-top:.5rem">Spatially, each mode runs on a summed region of interest or per pixel (as in the scene); 3-D tomography is a different inverse problem and is deferred — see the Physics tab.</p>
+    <details class="walk">
+      <summary>The four modes, side by side — the reference table</summary>
+      <div class="story">
+      <div class="scroller">
+      <table class="idtbl">
+        <thead><tr><th>Run as</th><th>You bring</th><th>The fit solves</th><th>Tight prior (uncertainty counted)</th><th>You receive</th></tr></thead>
+        <tbody>
+          <tr><td class="p">Calibration</td><td class="feat">a reference foil whose n·d and T are tightly known</td><td class="fr">L, t₀, θ_res</td><td class="req">the foil’s n·d, T · nuclear data (+ covariance)</td><td class="feat">the instrument posterior every other run consumes</td></tr>
+          <tr><td class="p">Density</td><td class="feat">known isotope + temperature</td><td class="fr">n·d per pixel</td><td class="req">L, t₀, θ_res (calibration posterior) · T</td><td class="feat">n·d map + uncertainty + residuals</td></tr>
+          <tr><td class="p">Temperature</td><td class="feat">known areal density</td><td class="fr">T_eff per pixel</td><td class="req">L, t₀, θ_res · n·d</td><td class="feat">temperature map + uncertainty + residuals</td></tr>
+          <tr><td class="p">In-situ</td><td class="feat">a time series, neither known</td><td class="fr">shared n·d₀ + per-frame T</td><td class="req">L, t₀, θ_res · the expansion link n·d(T)</td><td class="feat">n·d and T trajectories with joint uncertainty</td></tr>
+        </tbody>
+      </table>
+      </div>
+      <p>Every other mode consumes the calibration posterior as its tight prior. How tight a prior may be — and when a parameter may be treated as effectively fixed — is governed per case by the marginalization criterion on the Physics tab.</p>
+      </div>
+    </details>
 
     <div class="dev-only">
       <h2>The engineering contract, stage by stage</h2>
@@ -942,7 +988,7 @@
     </div>
   </section>
 
-  <footer><b>Physics first — code is validated against this, never the reverse</b> (hard rule; the code is the flawed thing being refactored). Physics and Pipelines are complete<span class="dev-only"> and adversarially reviewed (round 1 folded — see the Review record tab)</span>; Data holds the calibrant decision; the API contract is specified last, never reverse-engineered from the code.<span class="dev-only"> Verification dossiers: <span style="font-family:var(--mono)">.research/pipeline-map/</span>.</span></footer>
+  <footer><b>Physics first — code is validated against this, never the reverse.</b><span class="dev-only"> Hard rule; the code is the flawed thing being refactored. Physics and Pipelines are complete and adversarially reviewed (round 1 folded — see the Review record tab); Data holds the calibrant decision; the API contract is specified last, never reverse-engineered from the code. Verification dossiers: <span style="font-family:var(--mono)">.research/pipeline-map/</span>.</span></footer>
 </div>
 
 <script>
@@ -994,8 +1040,11 @@
 
     /* ============================================================
        The pipeline scene: the document's own forward model, live.
-       sigma(E;T) -> tau = nd*sigma -> counts = flux*exp(-tau),
-       fitted by Gauss-Newton in (nd, T) per pixel.
+       Five parameters p = {nd, T, L, t0, th}; EVERY mode fits all
+       five jointly — a mode is nothing but a prior pattern.
+       Native TOF is preserved: E(t; L, t0) is evaluated inside the
+       likelihood; the blur K(t|E) is a constant-relative-width
+       kernel acting on expected counts (the demo reduction).
        ============================================================ */
     var svg = document.getElementById("scn");
     if (!svg) return;
@@ -1005,35 +1054,64 @@
     // ---------- physics ----------
     var RES = [[4.28, 1.0, 0.057], [10.36, 0.55, 0.20], [13.95, 0.18, 0.11],
                [20.3, 0.10, 0.12], [23.9, 0.35, 0.13], [35.9, 0.28, 0.21], [39.1, 0.14, 0.19]];
-    var kB = 8.617333262e-5, N = 240;
-    var E = [], T_ = [], FLX = [];
+    var kB = 8.617333262e-5, N = 240, A181 = 181.0;
+    var USM = 72.3;                                     // µs per metre per √eV: t = USM·L/√E
+    var E0 = [], tN = [];
     for (var i = 0; i < N; i++) {
-      E.push(2.5 * Math.pow(60 / 2.5, i / (N - 1)));
-      T_.push(1 / Math.sqrt(E[i]));
-      FLX.push(Math.pow(E[i], -0.92) * (1 - Math.exp(-Math.pow(E[i] / 1.1, 2))));
+      E0.push(2.5 * Math.pow(60 / 2.5, i / (N - 1)));
+      tN.push(USM * 25 / Math.sqrt(E0[i]));             // native TOF bin centres (µs), fixed by the DAQ
     }
-    var fmax = Math.max.apply(null, FLX);
-    for (i = 0; i < N; i++) FLX[i] /= fmax;
-    var tmin = Math.min.apply(null, T_), tmax = Math.max.apply(null, T_);
-    function sigmaAt(T) {
-      var s = new Array(N);
-      for (var i = 0; i < N; i++) s[i] = 0.02 / Math.sqrt(E[i]);
-      RES.forEach(function (r) {
-        var dD = Math.sqrt(4 * kB * T * r[0] / 181.0);
+    var DLOGT = Math.log(E0[N - 1] / E0[0]) / (N - 1) / 2;
+    var tnMin = tN[N - 1], tnMax = tN[0];
+    function fluxAt(Ee) { return Math.pow(Ee, -0.92) * (1 - Math.exp(-Math.pow(Ee / 1.1, 2))); }
+    var fmax = 0;
+    for (i = 0; i < N; i++) { var fv = fluxAt(E0[i]); if (fv > fmax) fmax = fv; }
+    function sigmaU(Ee, T) {
+      var s = 0.02 / Math.sqrt(Ee);
+      for (var k = 0; k < RES.length; k++) {
+        var r = RES[k];
+        var dD = Math.sqrt(4 * kB * T * r[0] / A181);
         var w = 0.55 * Math.sqrt(dD * dD + r[2] * r[2]);
-        for (var i = 0; i < N; i++) {
-          var z = (E[i] - r[0]) / w;
-          s[i] += r[1] * Math.exp(-0.5 * z * z) * 3.2;
-        }
-      });
-      var pk = 0;
-      for (i = 0; i < N; i++) if (s[i] > pk) pk = s[i];
-      for (i = 0; i < N; i++) s[i] /= pk;          // peak sigma = 1 => nd is tau0 at 4.28 eV
+        var z = (Ee - r[0]) / w;
+        if (z * z < 60) s += r[1] * Math.exp(-0.5 * z * z) * 3.2;
+      }
       return s;
     }
-    function model(nd, T) {
-      var s = sigmaAt(T), m = new Array(N);
-      for (var i = 0; i < N; i++) m[i] = FLX[i] * Math.exp(-nd * s[i]);
+    var pkCache = {};
+    function sigPeak(T) {                               // peak sigma = 1 => nd is tau0 at 4.28 eV
+      var key = Math.round(T);
+      if (pkCache[key]) return pkCache[key];
+      var pk = 0;
+      for (var i = 0; i < N; i++) { var v = sigmaU(E0[i], key); if (v > pk) pk = v; }
+      pkCache[key] = pk;
+      return pk;
+    }
+    // truth: the instrument the data was really taken with (hidden from the fit);
+    // effective L = surveyed 25 m + the moderator emission depth
+    var INSTR = { L: 25.083, t0: 1.8, th: 0.0105 };
+    function model(p) {
+      var m = new Array(N), pk = sigPeak(p.T), c = USM * p.L;
+      for (var i = 0; i < N; i++) {
+        var dt = Math.max(tN[i] - p.t0, 30);
+        var Ee = (c / dt) * (c / dt);
+        m[i] = fluxAt(Ee) / fmax * Math.exp(-p.nd * sigmaU(Ee, p.T) / pk);
+      }
+      var sIdx = (p.th / 2) / DLOGT;                    // constant ΔE/E ⇒ constant σ in log t ⇒ per-index
+      if (sIdx > 0.05) {
+        var R = Math.min(8, Math.ceil(3 * sIdx)), w = [], k;
+        for (k = -R; k <= R; k++) w.push(Math.exp(-0.5 * k * k / (sIdx * sIdx)));
+        var m2 = new Array(N);
+        for (i = 0; i < N; i++) {
+          var acc = 0, ws = 0;
+          for (k = -R; k <= R; k++) {
+            var ii = i + k;
+            if (ii < 0 || ii >= N) continue;
+            acc += w[k + R] * m[ii]; ws += w[k + R];
+          }
+          m2[i] = acc / ws;
+        }
+        m = m2;
+      }
       return m;
     }
     function mulberry(seed) {
@@ -1048,31 +1126,95 @@
       return Math.sqrt(-2 * Math.log(1 - rng())) * Math.cos(2 * Math.PI * rng());
     }
 
-    // ---------- the sample field (truth) ----------
-    var MC = 13, MR = 9, NDT = [], INSIDE = [];
+    // ---------- the sample and the reference foil (truth) ----------
+    var MC = 13, MR = 9, NDT = [], TF = [], INSIDE = [];
     for (var j = 0; j < MR; j++) for (i = 0; i < MC; i++) {
       var dx = (i - 6) / 5.0, dy = (j - 4) / 3.6, r2 = dx * dx + dy * dy;
       INSIDE.push(r2 <= 1.02);
       NDT.push(0.5 + 1.6 * Math.exp(-((dx + 0.25) * (dx + 0.25) * 1.3 + (dy - 0.15) * (dy - 0.15) * 1.6)));
+      TF.push(390 + 290 * Math.exp(-((dx - 0.3) * (dx - 0.3) * 1.4 + (dy + 0.2) * (dy + 0.2) * 1.7)));
     }
-    var T_TRUE = 520;
-    function pixelData(px) {
-      var rng = mulberry((px + 1) * 2654435761);
-      var m = model(NDT[px], T_TRUE), d = new Array(N), sd = new Array(N);
+    var FOIL = { nd: 2.0, T: 295 };
+    function genData(truth, seed) {
+      var m = model(truth), rng = mulberry(seed), d = new Array(N), sd = new Array(N);
       for (var i = 0; i < N; i++) {
         d[i] = Math.max(m[i] * (1 + 0.035 * gauss(rng)), 0.0005);
         sd[i] = Math.max(0.035 * d[i], 0.004);
       }
       return { d: d, sd: sd };
     }
+    function pixelData(px) {
+      return genData({ nd: NDT[px], T: TF[px], L: INSTR.L, t0: INSTR.t0, th: INSTR.th }, (px + 1) * 2654435761);
+    }
+    function foilData() {
+      return genData({ nd: FOIL.nd, T: FOIL.T, L: INSTR.L, t0: INSTR.t0, th: INSTR.th }, 77777);
+    }
+
+    // ---------- modes: one engine, four prior patterns ----------
+    // CALPOST is exactly what calibration mode on this page emits (deterministic
+    // foil seed) — the priors below ARE that posterior, so the story closes.
+    var CALPOST = { L: 25.073, t0: 1.98, th: 0.0106, sL: 0.009, st0: 0.21, rho: -0.90, sth: 0.0003 };
+    var KEYS = ["nd", "T", "L", "t0", "th"];
+    var STEPH = { nd: 0.01, T: 4, L: 0.003, t0: 0.4, th: 0.0004 };
+    var LIM = { nd: [0.05, 4], T: [150, 1500], L: [24.5, 25.6], t0: [-30, 30], th: [0.0005, 0.03] };
+    var CONV = { nd: 3e-4, T: 0.4, L: 6e-5, t0: 0.03, th: 5e-6 };
+    var SLD = {
+      nd: { min: 0.2, max: 3, step: 0.01, lab: "n·d", init: 0.45, fmt: function (v) { return (+v).toFixed(2); } },
+      T:  { min: 200, max: 1200, step: 5, lab: "T", init: 1000, fmt: function (v) { return Math.round(v) + " K"; } },
+      L:  { min: 24.75, max: 25.35, step: 0.001, lab: "L", init: 24.9, fmt: function (v) { return (+v).toFixed(3) + " m"; } },
+      t0: { min: -15, max: 15, step: 0.1, lab: "t₀", init: -5, fmt: function (v) { return (+v).toFixed(1) + " µs"; } },
+      th: { min: 0.001, max: 0.025, step: 0.0001, lab: "θ_res", init: 0.004, fmt: function (v) { return (100 * v).toFixed(2) + " %"; } }
+    };
+    var MODES = {
+      calibration: { free: ["L", "t0", "th"], pair: ["L", "t0"],
+        bring: "reference foil (n·d, T known)", solve: "L · t<sub>0</sub> · θ_res", get: "the instrument posterior",
+        prior: "n·d, T (foil) · nuclear data",
+        sample: "reference foil — n·d, T known", fitBtn: "fit the foil", map: false },
+      density: { free: ["nd"], pair: ["nd", "T"],
+        bring: "known isotope + temperature", solve: "n·d per pixel", get: "n·d map + σ + residuals",
+        prior: "L, t<sub>0</sub>, θ_res ← calibration · T",
+        sample: "sample (n·d, T)", fitBtn: "fit this pixel", map: true },
+      temperature: { free: ["T"], pair: ["nd", "T"],
+        bring: "known areal density", solve: "T_eff per pixel", get: "T map + σ + residuals",
+        prior: "L, t<sub>0</sub>, θ_res ← calibration · n·d",
+        sample: "sample (n·d, T)", fitBtn: "fit this pixel", map: true },
+      insitu: { free: ["nd", "T"], pair: ["nd", "T"],
+        bring: "a time series, neither known", solve: "n·d + T (this frame)", get: "n·d & T trajectories + joint σ",
+        prior: "L, t<sub>0</sub>, θ_res ← calibration",
+        sample: "sample (n·d, T)", fitBtn: "fit this pixel", map: true }
+    };
+    var MODE = "density";
+    function priorFor(mode, px) {
+      var p0, sig, rho = 0;
+      if (mode === "calibration") {
+        p0 = { nd: FOIL.nd, T: FOIL.T, L: 25.0, t0: 0, th: 0.0105 };
+        sig = { nd: 0.02, T: 5, L: 0.5, t0: 25, th: 0.01 };
+      } else {
+        p0 = { nd: 1, T: 500, L: CALPOST.L, t0: CALPOST.t0, th: CALPOST.th };
+        sig = { nd: 1e3, T: 1e4, L: CALPOST.sL, t0: CALPOST.st0, th: CALPOST.sth };
+        rho = CALPOST.rho;
+        if (mode === "density") { p0.T = TF[px]; sig.T = 15; }
+        if (mode === "temperature") { p0.nd = NDT[px]; sig.nd = 0.02 * NDT[px]; }
+      }
+      var P = [];
+      for (var a = 0; a < 5; a++) P.push([0, 0, 0, 0, 0]);
+      KEYS.forEach(function (k, a) { P[a][a] = 1 / (sig[k] * sig[k]); });
+      if (rho) {                                        // correlated (L, t0) block of the calibration posterior
+        var sL = sig.L, st = sig.t0, det = sL * sL * st * st * (1 - rho * rho);
+        P[2][2] = st * st / det; P[3][3] = sL * sL / det;
+        P[2][3] = P[3][2] = -rho * sL * st / det;
+      }
+      return { p0: p0, P: P };
+    }
 
     // ---------- geometry ----------
     var AX = { x0: 74, x1: 878, yb: 500, yt: 210 };     // spectrum axes
     var RS = { y0: 524, y1: 560 };                       // residual strip
     var PX = { x0: 646, x1: 876, y0: 610, y1: 764 };     // posterior panel
-    var MAP = { x: 92, y: 862, c: 24 };                  // nd map
-    var SMAP = { x: 486, y: 886, c: 13 };                // sigma map
-    function xOf(i) { return AX.x0 + (T_[i] - tmin) / (tmax - tmin) * (AX.x1 - AX.x0); }
+    var MAP = { x: 92, y: 862, c: 24 };                  // left map
+    var SMAP = { x: 486, y: 886, c: 13 };                // right map
+    function xOfT(t) { return AX.x0 + (t - tnMin) / (tnMax - tnMin) * (AX.x1 - AX.x0); }
+    function xOf(i) { return xOfT(tN[i]); }
     function yOf(v) { return AX.yb - v * (AX.yb - AX.yt) / 1.06; }
     function el(tag, attrs, parent, text) {
       var n = document.createElementNS(NS, tag);
@@ -1089,12 +1231,16 @@
 
     // ---------- region A: the measurement ----------
     var A = document.getElementById("rgA");
+    // navigation spine + region separators (drawn first, inside the first group => painted beneath)
+    el("line", { x1: 44, y1: 42, x2: 44, y2: 826, "class": "scn-spine" }, A);
+    el("line", { x1: 24, y1: 148, x2: 896, y2: 148, "class": "scn-sep" }, A);
+    el("line", { x1: 24, y1: 588, x2: 896, y2: 588, "class": "scn-sep" }, A);
+    el("line", { x1: 24, y1: 806, x2: 896, y2: 806, "class": "scn-sep" }, A);
+    el("text", { x: 894, y: 16, "text-anchor": "end", "class": "scn-cap2" }, A, "hover / tap ①–⑤ and ⓘ for explanations");
     el("rect", { x: 28, y: 56, width: 62, height: 64, rx: 8, fill: "color-mix(in srgb, var(--data-c) 16%, var(--plot))", stroke: "var(--data-c)" }, A);
     el("text", { x: 59, y: 138, "text-anchor": "middle", "class": "scn-cap" }, A, "moderator");
     el("path", { d: "M92 116 q4 -30 8 -34 q4 16 10 22 q8 8 18 9", fill: "none", stroke: "var(--plot-line2)", "stroke-width": 1.6 }, A);
-    el("text", { x: 140, y: 134, "class": "scn-cap2" }, A, "emission tail → the timing blur K(t|E)");
     el("line", { x1: 100, y1: 88, x2: 640, y2: 88, stroke: "url(#beamfade)", "stroke-width": 2.4 }, A);
-    el("text", { x: 300, y: 76, "class": "scn-cap" }, A, "25 m flight — time sorts neutrons by energy");
     // pulse snapshots: dispersing dot groups (leading = fast/teal, trailing = slow/amber)
     [[150, 9], [330, 30], [530, 58]].forEach(function (g, gi) {
       var rng = mulberry(11 + gi);
@@ -1107,26 +1253,28 @@
       }
     });
     el("text", { x: 150, y: 64, "text-anchor": "middle", "class": "scn-cap2" }, A, "one pulse");
-    el("text", { x: 530, y: 116, "text-anchor": "middle", "class": "scn-cap2" }, A, "fast arrive first · slow last");
+    var sampLab = el("text", { x: 622, y: 46, "text-anchor": "middle", "class": "scn-cap" }, A, "sample (n·d, T)");
     el("rect", { x: 652, y: 50, width: 13, height: 76, rx: 3, fill: "color-mix(in srgb, var(--samp) 22%, var(--plot))", stroke: "var(--samp)" }, A);
-    el("text", { x: 622, y: 46, "text-anchor": "middle", "class": "scn-cap" }, A, "sample (n·d, T)");
     el("line", { x1: 665, y1: 88, x2: 700, y2: 88, stroke: "var(--plot-line)", "stroke-width": 1.2, opacity: 0.5 }, A);
     for (var drow = 0; drow < 8; drow++)
       el("rect", { x: 704, y: 50 + drow * 10, width: 15, height: 8.4, rx: 2, fill: "color-mix(in srgb, var(--phys-c) 22%, var(--plot))", stroke: "var(--phys-c)", "stroke-width": 1 }, A);
-    el("text", { x: 742, y: 78, "class": "scn-cap" }, A, "detector —");
-    el("text", { x: 742, y: 93, "class": "scn-cap" }, A, "one count per");
-    el("text", { x: 742, y: 108, "class": "scn-cap" }, A, "neutron: (pixel, t)");
-    el("path", { d: "M712 132 C 712 168, 360 140, 150 250", "class": "scn-link", "marker-end": "url(#sarr)" }, A);
-    el("text", { x: 500, y: 206, "class": "scn-cap2" }, A, "thousands of pulses accumulate ↓");
+    el("text", { x: 742, y: 78, "class": "scn-cap" }, A, "detector");
+    el("text", { x: 742, y: 93, "class": "scn-cap2" }, A, "one count per");
+    el("text", { x: 742, y: 107, "class": "scn-cap2" }, A, "neutron: (pixel, t)");
+    el("path", { d: "M712 132 C 600 168, 340 230, 150 250", "class": "scn-link", "marker-end": "url(#sarr)" }, A);
     var TIPS = {
       "1": "Neutrons are counted one at a time as (pixel, arrival-time) events. Runs are checked for problems before anything downstream may use them.",
       "2": "Summing thousands of pulses gives every pixel its own spectrum. The dark notches are the sample's nuclear resonances — their size carries density, their shape carries temperature.",
       "3": "The software predicts the whole spectrum from physics and compares with the measurement, count by count — it never works backward from the data.",
-      "4": "All five parameters are fitted together — nothing is pinned. n·d and T run free; L, t₀ and θ_res carry tight priors measured by calibration, so their uncertainty is counted without leaking freedom.",
-      "5": "The same fit repeats in every pixel: a map of values, a map of uncertainties, and residuals that show where the physics does or does not fit."
+      "4": "All five parameters are fitted together — nothing is pinned. The mode's free parameters run free; the rest carry tight priors (in the experiment modes: the instrument three, from the calibration posterior), so their uncertainty is counted without leaking freedom.",
+      "5": "The same fit repeats in every pixel: a map of values, a map of uncertainties, and residuals that show where the physics does or does not fit. In calibration mode there is no map — the product is one instrument posterior.",
+      beam: "Over the 25 m flight, time sorts neutrons by energy: fast arrive first, slow last — so arrival time doubles as an energy axis. The dots are one pulse, dispersing in flight.",
+      mod: "The moderator releases each pulse with a slight emission tail — the timing blur K(t|E) that θ_res describes and calibration measures. It also adds an effective ≈8 cm to the flight path.",
+      axis: "One axis, two currencies: time of flight increases to the right, energy decreases — E = ½·m_n·(L/(t−t₀))², evaluated inside the fit. The marked energies are Ta-181 resonances.",
+      resid: "Residuals = (data − prediction)/σ. Red points are off by more than 2σ; flat teal noise means the physics accounts for every count.",
+      post: "The answer is not one number but a probability cloud — the ellipse marks the 68% region. A tilted ellipse means the two parameters partly mimic each other; ρ says how strongly (−1 to 1). Tight-prior parameters keep their small stated uncertainty inside this answer."
     };
     var tipEl = document.getElementById("scntip");
-    var sceneEl = document.getElementById("scene");
     function showTip(n, x, y) {
       tipEl.textContent = TIPS[n] || "";
       tipEl.hidden = false;
@@ -1136,241 +1284,410 @@
       tipEl.style.top = (fy * 100 + 1.6) + "%";
     }
     function hideTip() { tipEl.hidden = true; }
-    function anchor(g, x, y, n, label) {
-      el("circle", { cx: x, cy: y, r: 10, "class": "scn-anchor", "stroke-width": 1.5 }, g);
-      el("text", { x: x, y: y + 4, "text-anchor": "middle", "class": "scn-anchor-t" }, g, n);
-      if (label) el("text", { x: x + 16, y: y + 4, "class": "scn-cap" }, g, label);
-      var hit = el("circle", { cx: x, cy: y, r: 17, fill: "transparent", "class": "scn-anchor-hit", tabindex: 0,
-                               role: "img", "aria-label": TIPS[n] || ("stage " + n) }, g);
-      hit.addEventListener("mouseenter", function () { showTip(n, x, y); });
+    function anchor(g, x, y, key, label, r) {
+      r = r || 10;
+      var small = r < 9;
+      el("circle", { cx: x, cy: y, r: r, "class": small ? "scn-anchor" : "scn-anchor-n", "stroke-width": small ? 1.2 : 1.5 }, g);
+      el("text", { x: x, y: y + (small ? 3.5 : 4), "text-anchor": "middle", "class": small ? "scn-anchor-t" : "scn-anchor-tn",
+                   "font-size": small ? 10 : 12 }, g, key.length === 1 ? key : "i");
+      if (label) el("text", { x: x + r + 6, y: y + 4, "class": "scn-cap" }, g, label);
+      var hit = el("circle", { cx: x, cy: y, r: r + 6, fill: "transparent", "class": "scn-anchor-hit", tabindex: 0,
+                               role: "img", "aria-label": TIPS[key] || key }, g);
+      hit.addEventListener("mouseenter", function () { showTip(key, x, y); });
       hit.addEventListener("mouseleave", hideTip);
-      hit.addEventListener("focus", function () { showTip(n, x, y); });
+      hit.addEventListener("focus", function () { showTip(key, x, y); });
       hit.addEventListener("blur", hideTip);
-      hit.addEventListener("click", function () { tipEl.hidden ? showTip(n, x, y) : hideTip(); });
+      hit.addEventListener("click", function () { tipEl.hidden ? showTip(key, x, y) : hideTip(); });
     }
+    function infoDot(g, x, y, key) { anchor(g, x, y, key, "", 7.5); }
     anchor(A, 44, 30, "1", "the measurement — qualified before use");
+    infoDot(A, 396, 66, "beam");
+    infoDot(A, 142, 112, "mod");
 
     // ---------- region B: spectrum + model ----------
     var B = document.getElementById("rgB");
     el("line", { x1: AX.x0, y1: AX.yt - 8, x2: AX.x0, y2: AX.yb, "class": "scn-axis" }, B);
     el("line", { x1: AX.x0, y1: AX.yb, x2: AX.x1 + 6, y2: AX.yb, "class": "scn-axis" }, B);
-    el("text", { x: 30, y: AX.yt + 16, "class": "scn-cap" }, B, "counts");
-    el("text", { x: 32, y: AX.yt + 30, "class": "scn-cap2" }, B, "(arb.)");
-    el("text", { x: AX.x0 + 210, y: AX.yt + 20, "class": "scn-cap2" }, B, "↑ energy (eV) — the same axis as time, read in the other currency");
+    el("text", { x: AX.x0 + 8, y: AX.yt + 16, "class": "scn-cap" }, B, "counts (arb.)");
     el("text", { x: AX.x1 - 130, y: AX.yb + 16, "class": "scn-cap" }, B, "time of flight →");
     anchor(B, 44, 162, "2", "one spectrum per pixel");
-    // energy markers at the resonance dips (energy runs opposite to time)
+    // energy markers at the true resonance arrival times (energy runs opposite to time)
     [[4.28, "4.3 eV"], [10.36, "10.4"], [23.9, "24"], [35.9, "36 eV"]].forEach(function (r) {
-      var ii = 0, best = 1e9;
-      for (var i = 0; i < N; i++) { var d = Math.abs(E[i] - r[0]); if (d < best) { best = d; ii = i; } }
-      el("line", { x1: xOf(ii), y1: AX.yt - 7, x2: xOf(ii), y2: AX.yt + 2, "class": "scn-axis" }, B);
-      el("text", { x: xOf(ii), y: AX.yt - 16, "text-anchor": "middle", "class": "scn-cap2" }, B, r[1]);
+      var xt = xOfT(USM * INSTR.L / Math.sqrt(r[0]) + INSTR.t0);
+      el("line", { x1: xt, y1: AX.yt - 7, x2: xt, y2: AX.yt + 2, "class": "scn-axis" }, B);
+      el("text", { x: xt, y: AX.yt - 16, "text-anchor": "middle", "class": "scn-cap2" }, B, r[1]);
     });
-        var obPath = el("path", { "class": "scn-ob" }, B);
+    infoDot(B, AX.x0 + 24, AX.yt - 20, "axis");
+    var obPath = el("path", { "class": "scn-ob" }, B);
     var obLab = el("text", { "class": "scn-cap2", opacity: 0.9 }, B, "open beam (no sample) ↘");
     var dataG = el("g", {}, B);
     var modelPath = el("path", { "class": "scn-model" }, B);
     // dip callout at the 4.28 eV line
-    var i428 = N - 1;
     el("text", { x: AX.x1 - 174, y: AX.yb - 132, "class": "scn-cap" }, B, "deeper = more material (n·d)");
     el("text", { x: AX.x1 - 174, y: AX.yb - 116, "class": "scn-cap" }, B, "wider = hotter (Doppler, T)");
     // residual strip
     el("line", { x1: AX.x0, y1: (RS.y0 + RS.y1) / 2, x2: AX.x1, y2: (RS.y0 + RS.y1) / 2, "class": "scn-axis", "stroke-dasharray": "3 4" }, B);
-    el("text", { x: AX.x0 + 10, y: RS.y1 + 16, "class": "scn-cap2" }, B, "residuals — data − prediction · red = off by more than 2σ · flat teal noise = the physics accounts for every count");
+    el("text", { x: AX.x0 + 10, y: RS.y1 + 16, "class": "scn-cap2" }, B, "residuals — data − prediction");
+    infoDot(B, AX.x0 + 226, RS.y1 + 12, "resid");
     var resG = el("g", {}, B);
-    anchor(B, 44, RS.y0 - 12, "3", "");
-    el("text", { x: 62, y: RS.y0 - 8, "class": "scn-cap" }, B, "the forward model predicts the spectrum — orange curve");
+    anchor(B, 44, RS.y0 - 12, "3", "the model predicts — orange curve");
 
-    // ---------- region C: parameters + fit ----------
+    // ---------- region C: the joint fit ----------
     var C = document.getElementById("rgC");
-    anchor(C, 44, 606, "4", "fit = adjust all five parameters together until prediction matches data");
-    // instrument parameters: also in the joint fit, with tight priors from calibration
-    el("text", { x: 424, y: 626, "class": "scn-cap" }, C, "also fitted — tight priors:");
-    var pri = [["L = 25.0013 m"], ["t₀ — time offset"], ["θ_res — timing blur"]];
-    pri.forEach(function (P, k) {
-      var y = 646 + k * 26;
-      el("line", { x1: 424, y1: y - 8, x2: 470, y2: y - 8, stroke: "var(--plot-edge)", "stroke-width": 2 }, C);
-      el("rect", { x: 442, y: y - 13, width: 11, height: 10, rx: 2, fill: "color-mix(in srgb, var(--api-c) 45%, var(--plot))", stroke: "var(--api-c)" }, C);
-      el("text", { x: 480, y: y - 4, "class": "scn-lock" }, C, P[0]);
-    });
-    el("text", { x: 424, y: 736, "class": "scn-feed-t" }, C, "priors from the calibration");
-    el("text", { x: 424, y: 750, "class": "scn-feed-t" }, C, "posterior — jointly fitted,");
-    el("text", { x: 424, y: 764, "class": "scn-feed-t" }, C, "never hard-pinned");
-    var feed = el("path", { d: "M646 700 C 630 692, 612 668, 596 640", "class": "scn-feed", "marker-end": "url(#sarr)" }, C);
+    anchor(C, 44, 606, "4", "the joint fit — all five parameters");
     // posterior panel
     el("rect", { x: PX.x0, y: PX.y0 - 22, width: PX.x1 - PX.x0, height: PX.y1 - PX.y0 + 22, rx: 8, fill: "none", stroke: "var(--plot-edge)" }, C);
     el("text", { x: PX.x0 + 8, y: PX.y0 - 6, "class": "scn-cap" }, C, "the answer: a joint posterior");
-    el("text", { x: PX.x1 - 8, y: PX.y1 - 8, "text-anchor": "end", "class": "scn-cap2" }, C, "n·d →");
-    el("text", { x: PX.x0 + 8, y: PX.y0 + 16, "class": "scn-cap2" }, C, "T ↑");
+    var axXLab = el("text", { x: PX.x1 - 12, y: PX.y1 - 12, "text-anchor": "end", "class": "scn-cap2" }, C, "n·d →");
+    var axYLab = el("text", { x: PX.x0 + 8, y: PX.y0 + 16, "class": "scn-cap2" }, C, "T ↑");
     var ellG = el("g", {}, C);
-    var postT1 = el("text", { x: PX.x0 + 8, y: PX.y1 + 16, "class": "scn-cap" }, C, "→ press fit to solve this pixel");
-    var postT2 = el("text", { x: PX.x0 + 8, y: PX.y1 + 32, "class": "scn-cap2" }, C, "tilt = the n·d–T trade-off");
+    infoDot(C, 862, 630, "post");
+    var res1 = el("text", { x: PX.x0 + 8, y: PX.y1 + 16, "class": "scn-cap" }, C, "→ press fit to solve this pixel");
+    var res2 = el("text", { x: PX.x0 + 8, y: PX.y1 + 31, "class": "scn-cap2" }, C, "");
 
-    // ---------- region D: the map ----------
+    // ---------- region D: the deliverable (maps / the instrument posterior) ----------
     var D = document.getElementById("rgD");
-    anchor(D, 44, 828, "5", "the same fit, in every pixel");
-    el("text", { x: MAP.x, y: MAP.y - 14, "class": "scn-lab" }, D, "areal density n·d");
-    el("text", { x: MAP.x + 150, y: MAP.y - 14, "class": "scn-cap2" }, D, "— click a pixel: its spectrum loads above (13×9 demo grid; VENUS is 512×512)");
-    el("text", { x: SMAP.x, y: SMAP.y - 14, "class": "scn-lab" }, D, "uncertainty σ(n·d)");
-    el("text", { x: SMAP.x + 200, y: SMAP.y - 14, "class": "scn-cap2" }, D, "+ residual cube · trust mask");
-    el("text", { x: SMAP.x, y: SMAP.y + MR * SMAP.c + 26, "class": "scn-cap2" }, D, "value · uncertainty · proof, per pixel — the deliverable");
+    anchor(D, 44, 828, "5", "");
+    var anch5Lab = el("text", { x: 60, y: 832, "class": "scn-cap" }, D, "the deliverable — the same fit, every pixel");
+    var gMaps = el("g", {}, D);
+    var mapT1 = el("text", { x: MAP.x, y: MAP.y - 14, "class": "scn-lab" }, gMaps, "areal density n·d");
+    var mapH1 = el("text", { x: MAP.x + 160, y: MAP.y - 14, "class": "scn-cap2" }, gMaps, "— click a pixel: its spectrum loads above");
+    var mapT2 = el("text", { x: SMAP.x, y: SMAP.y - 14, "class": "scn-lab" }, gMaps, "uncertainty σ(n·d)");
+    function clamp01(v) { return Math.max(0, Math.min(1, v)); }
+    function ndColor(v) { return "color-mix(in srgb, var(--plot-line) " + Math.round(8 + clamp01(v / 2.2) * 84) + "%, var(--plot))"; }
+    function tColor(v) { return "color-mix(in srgb, var(--plot-line2) " + Math.round(8 + clamp01((v - 380) / 320) * 84) + "%, var(--plot))"; }
+    function sColor(f) { return "color-mix(in srgb, var(--plot-faint) " + Math.round(6 + clamp01(f) * 74) + "%, var(--plot))"; }
     var cells = [], sells = [];
     for (j = 0; j < MR; j++) for (i = 0; i < MC; i++) {
       var px = j * MC + i;
       var c = el("rect", { x: MAP.x + i * MAP.c, y: MAP.y + j * MAP.c, width: MAP.c, height: MAP.c,
-                           "class": "scn-cell", fill: INSIDE[px] ? "color-mix(in srgb, var(--plot-line) 8%, var(--plot))" : "var(--plot)" }, D);
+                           "class": "scn-cell", fill: INSIDE[px] ? "color-mix(in srgb, var(--plot-faint) 8%, var(--plot))" : "var(--plot)" }, gMaps);
       if (INSIDE[px]) c.setAttribute("data-px", px);
       cells.push(c);
       sells.push(el("rect", { x: SMAP.x + i * SMAP.c, y: SMAP.y + j * SMAP.c, width: SMAP.c, height: SMAP.c,
-                              fill: INSIDE[px] ? "color-mix(in srgb, var(--plot-line2) 6%, var(--plot))" : "var(--plot)", stroke: "var(--plot)" }, D));
+                              fill: INSIDE[px] ? "color-mix(in srgb, var(--plot-faint) 6%, var(--plot))" : "var(--plot)", stroke: "var(--plot)" }, gMaps));
     }
-    el("text", { x: MAP.x + 140, y: MAP.y + MR * MAP.c + 52, "class": "scn-cap2" }, D, "· empty until you fit — the map is made of fits, not images");
-    (function colorbars() {
+    var emptyLab = el("text", { x: MAP.x + 140, y: MAP.y + MR * MAP.c + 52, "class": "scn-cap2" }, gMaps, "· empty until you fit");
+    var gLeg = el("g", {}, gMaps);
+    function drawLegend() {
+      while (gLeg.firstChild) gLeg.removeChild(gLeg.firstChild);
+      var yl = MAP.y + MR * MAP.c + 30, yr = SMAP.y + MR * SMAP.c + 34;
       for (var s = 0; s < 12; s++) {
-        el("rect", { x: MAP.x + s * 10, y: MAP.y + MR * MAP.c + 30, width: 10, height: 8,
-                     fill: ndColor(0.2 + (s / 11) * 2.0) }, D);
-        el("rect", { x: SMAP.x + s * 8, y: SMAP.y + MR * SMAP.c + 34, width: 8, height: 7,
-                     fill: "color-mix(in srgb, var(--plot-line2) " + Math.round(6 + (s / 11) * 70) + "%, var(--plot))" }, D);
+        var u = s / 11;
+        el("rect", { x: MAP.x + s * 10, y: yl, width: 10, height: 8,
+                     fill: MODE === "temperature" ? tColor(380 + u * 320) : ndColor(0.2 + u * 2.0) }, gLeg);
+        el("rect", { x: SMAP.x + s * 8, y: yr, width: 8, height: 7,
+                     fill: MODE === "insitu" ? tColor(380 + u * 320) : sColor(u) }, gLeg);
       }
-      el("text", { x: MAP.x, y: MAP.y + MR * MAP.c + 52, "class": "scn-cap2" }, D, "0.2");
-      el("text", { x: MAP.x + 120, y: MAP.y + MR * MAP.c + 52, "text-anchor": "end", "class": "scn-cap2" }, D, "2.2  n·d");
-      el("text", { x: SMAP.x, y: SMAP.y + MR * SMAP.c + 55, "class": "scn-cap2" }, D, "low");
-      el("text", { x: SMAP.x + 96, y: SMAP.y + MR * SMAP.c + 55, "text-anchor": "end", "class": "scn-cap2" }, D, "high  σ/n·d");
-    })();
-    var linkPath = el("path", { "class": "scn-link", "marker-end": "url(#sarr)", d: "" }, D);
+      var la = MODE === "temperature" ? ["380", "700  K"] : ["0.2", "2.2  n·d"];
+      el("text", { x: MAP.x, y: yl + 22, "class": "scn-cap2" }, gLeg, la[0]);
+      el("text", { x: MAP.x + 120, y: yl + 22, "text-anchor": "end", "class": "scn-cap2" }, gLeg, la[1]);
+      var ra = MODE === "insitu" ? ["380", "700  K"] : ["low", "high  σ"];
+      el("text", { x: SMAP.x, y: yr + 21, "class": "scn-cap2" }, gLeg, ra[0]);
+      el("text", { x: SMAP.x + 96, y: yr + 21, "text-anchor": "end", "class": "scn-cap2" }, gLeg, ra[1]);
+    }
+    var selRect = el("rect", { fill: "none", stroke: "var(--plot-line2)", "stroke-width": 2, "pointer-events": "none", display: "none" }, gMaps);
+    // calibration product: one posterior, consumed by every other mode
+    var gProd = el("g", { display: "none" }, D);
+    el("rect", { x: 92, y: 880, width: 380, height: 112, rx: 10, fill: "none", stroke: "var(--api-c)" }, gProd);
+    el("text", { x: 108, y: 908, "class": "scn-lab" }, gProd, "the product: the instrument posterior");
+    el("text", { x: 108, y: 930, "class": "scn-cap" }, gProd, "L, t₀, θ_res — mean + full covariance");
+    el("text", { x: 108, y: 948, "class": "scn-cap2" }, gProd, "ρ(L,t₀) ≈ −0.90 · kernel form + validity range");
+    el("path", { d: "M472 936 C 512 936, 532 936, 560 936", "class": "scn-feed", "marker-end": "url(#sarr)" }, gProd);
+    el("text", { x: 584, y: 910, "class": "scn-feed-t" }, gProd, "consumed as tight priors by");
+    ["density", "temperature", "in-situ"].forEach(function (nm, k) {
+      el("rect", { x: 584, y: 920 + k * 27, width: 116, height: 20, rx: 6, fill: "none", stroke: "var(--plot-faint)" }, gProd);
+      el("text", { x: 642, y: 934 + k * 27, "text-anchor": "middle", "class": "scn-cap2" }, gProd, nm);
+    });
 
     // ---------- live state ----------
-    var ndIn = document.getElementById("in-nd"), TIn = document.getElementById("in-T");
-    var ndV = document.getElementById("v-nd"), TV = document.getElementById("v-T"), chiV = document.getElementById("v-chi");
-    var CUR = { px: 4 * MC + 5, data: null, fitted: {} };
-    CUR.data = pixelData(CUR.px);
-    function chi2(nd, T) {
-      var m = model(nd, T), s = 0;
-      for (var i = 0; i < N; i++) { var r = (CUR.data.d[i] - m[i]) / CUR.data.sd[i]; s += r * r; }
-      return s / N;
+    var CUR = { px: 4 * MC + 5, data: null };
+    var PS = {};                                        // current 5-parameter state
+    var PRIOR = null;                                   // {p0, P} for the current mode + pixel
+    var sliders = {};
+    var fitting = false;
+    var freeRows = document.getElementById("freerows"), priorRows = document.getElementById("priorrows");
+    var priorHead = document.getElementById("priorhead");
+    var btnFit = document.getElementById("btn-fit"), btnMap = document.getElementById("btn-map");
+    var chiV = document.getElementById("v-chi");
+    var modeBtns = Array.prototype.slice.call(document.querySelectorAll(".modebar .mode"));
+
+    function buildBoard() {
+      freeRows.innerHTML = ""; priorRows.innerHTML = ""; sliders = {};
+      var md = MODES[MODE];
+      md.free.forEach(function (k) {
+        var lab = document.createElement("label");
+        var pn = document.createElement("span"); pn.className = "pn"; pn.textContent = SLD[k].lab;
+        var inp = document.createElement("input"); inp.type = "range";
+        inp.min = SLD[k].min; inp.max = SLD[k].max; inp.step = SLD[k].step; inp.value = PS[k];
+        var v = document.createElement("span"); v.className = "v"; v.textContent = SLD[k].fmt(PS[k]);
+        lab.appendChild(pn); lab.appendChild(inp); lab.appendChild(v);
+        freeRows.appendChild(lab);
+        inp.addEventListener("input", function () { PS[k] = +inp.value; v.textContent = SLD[k].fmt(PS[k]); redraw(); });
+        sliders[k] = { input: inp, span: v };
+      });
+      KEYS.filter(function (k) { return md.free.indexOf(k) < 0; }).forEach(function (k) {
+        var row = document.createElement("div"); row.className = "prow";
+        var pn = document.createElement("span"); pn.className = "pn"; pn.textContent = SLD[k].lab;
+        var band = document.createElement("span"); band.className = "pband"; band.appendChild(document.createElement("i"));
+        var v = document.createElement("span"); v.className = "v"; v.textContent = SLD[k].fmt(PRIOR.p0[k]);
+        row.appendChild(pn); row.appendChild(band); row.appendChild(v);
+        priorRows.appendChild(row);
+      });
+      priorHead.textContent = MODE === "calibration" ? "tight priors — the foil assay" : "tight priors ← calibration posterior";
+      priorHead.setAttribute("data-tip", MODE === "calibration"
+        ? "The foil's n·d and T are tightly known (assay + measurement), so the data's freedom goes to the instrument parameters. Still jointly fitted — never hard-pinned."
+        : "Also in the joint fit, held by tight priors from the calibration posterior (with its L–t₀ correlation). Their uncertainty is counted in the answer — never hard-pinned.");
+      btnFit.textContent = md.fitBtn;
+      btnMap.style.display = md.map ? "" : "none";
     }
+    function syncSliders() {
+      MODES[MODE].free.forEach(function (k) {
+        if (sliders[k]) { sliders[k].input.value = PS[k]; sliders[k].span.textContent = SLD[k].fmt(PS[k]); }
+      });
+    }
+    function clearPosterior() {
+      while (ellG.firstChild) ellG.removeChild(ellG.firstChild);
+      res1.textContent = MODE === "calibration" ? "→ press fit to solve the instrument" : "→ press fit to solve this pixel";
+      res2.textContent = "";
+    }
+
     function redraw() {
-      var nd = +ndIn.value, T = +TIn.value;
-      ndV.textContent = nd.toFixed(2);
-      TV.textContent = Math.round(T) + " K";
-      var m = model(nd, T);
+      var m = model(PS), s = 0;
       modelPath.setAttribute("d", pathOf(m));
-      chiV.textContent = "χ²/n = " + chi2(nd, T).toFixed(2);
       while (resG.firstChild) resG.removeChild(resG.firstChild);
       var mid = (RS.y0 + RS.y1) / 2;
-      for (var i = 0; i < N; i += 3) {
+      for (var i = 0; i < N; i++) {
         var r = (CUR.data.d[i] - m[i]) / CUR.data.sd[i];
-        var big = Math.abs(r) > 2;
-        el("circle", { cx: xOf(i), cy: mid - Math.max(-3.6, Math.min(3.6, r)) * 4.6, r: big ? 1.8 : 1.4,
-                       fill: big ? "var(--warn)" : "", "class": big ? "" : "scn-res" }, resG);
+        s += r * r;
+        if (i % 3 === 0) {
+          var big = Math.abs(r) > 2;
+          el("circle", { cx: xOf(i), cy: mid - Math.max(-3.4, Math.min(3.4, r)) * 4.6, r: big ? 1.8 : 1.4,
+                         fill: big ? "var(--warn)" : "", "class": big ? "" : "scn-res" }, resG);
+        }
       }
+      var cn = s / N;
+      chiV.textContent = "χ²/n = " + cn.toFixed(2) + (cn > 2 ? " — mismatch: press fit" : "");
     }
     function drawData() {
-      obPath.setAttribute("d", pathOf(FLX));
+      var F = new Array(N);
+      for (var i = 0; i < N; i++) F[i] = fluxAt(E0[i]) / fmax;
+      obPath.setAttribute("d", pathOf(F));
       var iLab = Math.floor(N * 0.55);
       obLab.setAttribute("x", xOf(iLab) - 190);
-      obLab.setAttribute("y", yOf(FLX[iLab]) - 14);
+      obLab.setAttribute("y", yOf(F[iLab]) - 14);
       while (dataG.firstChild) dataG.removeChild(dataG.firstChild);
-      for (var i = 0; i < N; i += 3)
+      for (i = 0; i < N; i += 3)
         el("circle", { cx: xOf(i), cy: yOf(CUR.data.d[i]), r: 2.2, "class": "scn-data" }, dataG);
-      cells.forEach(function (c) { c.classList.remove("sel"); });
-      cells[CUR.px].classList.add("sel");
-      var ci = CUR.px % MC, cj = (CUR.px / MC) | 0;
-      var cx = MAP.x + ci * MAP.c + MAP.c / 2, cy = MAP.y + cj * MAP.c;
-      linkPath.setAttribute("d", "M" + cx + " " + cy + " L " + cx + " " + (cy - 22));
+      if (MODES[MODE].map) {
+        var ci = CUR.px % MC, cj = (CUR.px / MC) | 0;
+        selRect.setAttribute("x", MAP.x + ci * MAP.c); selRect.setAttribute("y", MAP.y + cj * MAP.c);
+        selRect.setAttribute("width", MAP.c); selRect.setAttribute("height", MAP.c);
+        selRect.setAttribute("display", "inline");
+      } else selRect.setAttribute("display", "none");
     }
-    // Gauss-Newton in (nd, T)
-    function gnStep(nd, T) {
-      var m = model(nd, T), h1 = 0.01, h2 = 4;
-      var m1 = model(nd + h1, T), m2 = model(nd, T + h2);
-      var a = 0, b = 0, c = 0, g1 = 0, g2 = 0;
-      for (var i = 0; i < N; i++) {
-        var w = 1 / (CUR.data.sd[i] * CUR.data.sd[i]);
-        var j1 = (m1[i] - m[i]) / h1, j2 = (m2[i] - m[i]) / h2, r = CUR.data.d[i] - m[i];
-        a += w * j1 * j1; b += w * j1 * j2; c += w * j2 * j2; g1 += w * j1 * r; g2 += w * j2 * r;
+
+    // ---------- the one engine: Gauss-Newton over all five parameters + the mode's priors ----------
+    function inv5(M) {
+      var n = 5, a = [], I = [], r, c, k;
+      for (r = 0; r < n; r++) {
+        a.push(M[r].slice());
+        I.push([0, 0, 0, 0, 0]); I[r][r] = 1;
       }
-      var det = a * c - b * b;
-      if (Math.abs(det) < 1e-12) return null;
-      return { dnd: (c * g1 - b * g2) / det, dT: (a * g2 - b * g1) / det, cov: [c / det, -b / det, a / det] };
+      for (c = 0; c < n; c++) {
+        var piv = c;
+        for (r = c + 1; r < n; r++) if (Math.abs(a[r][c]) > Math.abs(a[piv][c])) piv = r;
+        if (Math.abs(a[piv][c]) < 1e-14) return null;
+        var t = a[c]; a[c] = a[piv]; a[piv] = t; t = I[c]; I[c] = I[piv]; I[piv] = t;
+        var d = a[c][c];
+        for (k = 0; k < n; k++) { a[c][k] /= d; I[c][k] /= d; }
+        for (r = 0; r < n; r++) if (r !== c && a[r][c] !== 0) {
+          var f = a[r][c];
+          for (k = 0; k < n; k++) { a[r][k] -= f * a[c][k]; I[r][k] -= f * I[c][k]; }
+        }
+      }
+      return I;
     }
-    function fitPixel(quiet, done) {
+    function gnStep(p, data, prior) {
+      var m = model(p), J = [], a, b, i;
+      for (a = 0; a < 5; a++) {
+        var k = KEYS[a];
+        var q = { nd: p.nd, T: p.T, L: p.L, t0: p.t0, th: p.th };
+        q[k] += STEPH[k];
+        var mq = model(q), col = new Array(N);
+        for (i = 0; i < N; i++) col[i] = (mq[i] - m[i]) / STEPH[k];
+        J.push(col);
+      }
+      var A5 = [], g = [0, 0, 0, 0, 0];
+      for (a = 0; a < 5; a++) A5.push([0, 0, 0, 0, 0]);
+      for (i = 0; i < N; i++) {
+        var w = 1 / (data.sd[i] * data.sd[i]), r = data.d[i] - m[i];
+        for (a = 0; a < 5; a++) {
+          g[a] += w * J[a][i] * r;
+          for (b = a; b < 5; b++) A5[a][b] += w * J[a][i] * J[b][i];
+        }
+      }
+      for (a = 0; a < 5; a++) for (b = 0; b < a; b++) A5[a][b] = A5[b][a];
+      for (a = 0; a < 5; a++) {
+        var gp = 0;
+        for (b = 0; b < 5; b++) {
+          A5[a][b] += prior.P[a][b];
+          gp += prior.P[a][b] * (prior.p0[KEYS[b]] - p[KEYS[b]]);
+        }
+        g[a] += gp;
+      }
+      var inv = inv5(A5);
+      if (!inv) return null;
+      var dp = [0, 0, 0, 0, 0];
+      for (a = 0; a < 5; a++) for (b = 0; b < 5; b++) dp[a] += inv[a][b] * g[b];
+      return { dp: dp, cov: inv };
+    }
+    function applyStep(p, dp, damp) {
+      var q = {};
+      KEYS.forEach(function (k, a) {
+        q[k] = Math.max(LIM[k][0], Math.min(LIM[k][1], p[k] + damp * dp[a]));
+      });
+      return q;
+    }
+    function fitPixel() {
+      if (fitting) return;
+      fitting = true;
       var steps = 0;
       function it() {
-        var s = gnStep(+ndIn.value, +TIn.value);
-        if (!s) return;
-        ndIn.value = Math.max(0.05, Math.min(4, +ndIn.value + 0.85 * s.dnd));
-        TIn.value = Math.max(150, Math.min(1500, +TIn.value + 0.85 * s.dT));
-        redraw();
-        if (++steps < 14 && (Math.abs(s.dnd) > 2e-4 || Math.abs(s.dT) > 0.3)) {
-          if (quiet || REDUCED) it(); else setTimeout(it, 90);
-        } else { drawPosterior(s.cov); if (done) done(); }
+        var s = gnStep(PS, CUR.data, PRIOR);
+        if (!s) { fitting = false; return; }
+        PS = applyStep(PS, s.dp, 0.8);
+        syncSliders(); redraw();
+        var moving = s.dp.some(function (d, a) { return Math.abs(d) > CONV[KEYS[a]]; });
+        if (++steps < 18 && moving) { REDUCED ? it() : setTimeout(it, 80); }
+        else { drawPosterior(s.cov); fitting = false; }
       }
       it();
     }
     function drawPosterior(cov) {
       while (ellG.firstChild) ellG.removeChild(ellG.firstChild);
-      var snd = Math.sqrt(cov[0]), sT = Math.sqrt(cov[2]), rho = cov[1] / (snd * sT);
-      var tr = (cov[0] / (snd * snd) + cov[2] / (sT * sT)) / 2, dt2 = Math.sqrt(Math.max(0, tr * tr - (1 - rho * rho)));
-      var l1 = Math.sqrt(tr + dt2), l2 = Math.sqrt(Math.max(0.05, tr - dt2));
-      var ang = 45 * (rho < 0 ? 1 : -1);
-      var cx = (PX.x0 + PX.x1) / 2, cy = (PX.y0 + PX.y1) / 2 - 8, k = 52;
+      var md = MODES[MODE];
+      var ia = KEYS.indexOf(md.pair[0]), ib = KEYS.indexOf(md.pair[1]);
+      var sa = Math.sqrt(cov[ia][ia]), sb = Math.sqrt(cov[ib][ib]);
+      var rho = Math.max(-0.995, Math.min(0.995, cov[ia][ib] / (sa * sb)));
+      var l1 = Math.sqrt(1 + Math.abs(rho)), l2 = Math.sqrt(1 - Math.abs(rho));
+      var ang = rho < 0 ? 45 : -45;
+      var cx = (PX.x0 + PX.x1) / 2, cy = (PX.y0 + PX.y1) / 2 - 8, kk = 52;
       [2, 1].forEach(function (ns) {
-        el("ellipse", { cx: cx, cy: cy, rx: ns * k * l1 / (l1 + l2), ry: ns * k * l2 / (l1 + l2),
+        el("ellipse", { cx: cx, cy: cy, rx: ns * kk * l1 / (l1 + l2), ry: ns * kk * l2 / (l1 + l2),
                         transform: "rotate(" + ang + " " + cx + " " + cy + ")", "class": "scn-ell", opacity: ns === 2 ? 0.45 : 0.95 }, ellG);
       });
       el("circle", { cx: cx, cy: cy, r: 2.4, fill: "var(--plot-line2)" }, ellG);
-      postT1.textContent = "n·d " + (+ndIn.value).toFixed(2) + "±" + snd.toFixed(2) +
-                           " · T " + Math.round(+TIn.value) + "±" + Math.round(sT) + " K · ρ " + rho.toFixed(2);
+      function pm(k) {
+        var s = Math.sqrt(cov[KEYS.indexOf(k)][KEYS.indexOf(k)]);
+        if (k === "L") return "L " + PS.L.toFixed(3) + "±" + s.toFixed(3) + " m";
+        if (k === "t0") return "t₀ " + PS.t0.toFixed(1) + "±" + s.toFixed(1) + " µs";
+        if (k === "th") return "θ_res " + (100 * PS.th).toFixed(2) + "±" + (100 * s).toFixed(2) + " %";
+        if (k === "T") return "T " + Math.round(PS.T) + "±" + Math.round(s) + " K";
+        return "n·d " + PS.nd.toFixed(2) + "±" + s.toFixed(2);
+      }
+      if (MODE === "calibration") {
+        res1.textContent = pm("L") + " · " + pm("t0");
+        res2.textContent = pm("th") + " · ρ(L,t₀) " + rho.toFixed(2);
+      } else if (MODE === "insitu") {
+        res1.textContent = pm("nd") + " · " + pm("T");
+        res2.textContent = "ρ(n·d, T) " + rho.toFixed(2);
+      } else {
+        var f0 = MODES[MODE].free[0];
+        var other = md.pair[0] === f0 ? md.pair[1] : md.pair[0];
+        res1.textContent = pm(f0);
+        res2.textContent = pm(other) + " (held by prior)";
+      }
     }
-    function ndColor(v) {
-      var f = Math.max(0, Math.min(1, v / 2.2));
-      return "color-mix(in srgb, var(--plot-line) " + Math.round(8 + f * 84) + "%, var(--plot))";
+    function paintPixel(px, p, cov) {
+      var snd = cov ? Math.sqrt(cov[0][0]) : 0.05, sT = cov ? Math.sqrt(cov[1][1]) : 30;
+      if (MODE === "density") {
+        cells[px].setAttribute("fill", ndColor(p.nd));
+        sells[px].setAttribute("fill", sColor((snd / Math.max(p.nd, 0.2)) * 16));
+      } else if (MODE === "temperature") {
+        cells[px].setAttribute("fill", tColor(p.T));
+        sells[px].setAttribute("fill", sColor(sT / 45));
+      } else {
+        cells[px].setAttribute("fill", ndColor(p.nd));
+        sells[px].setAttribute("fill", tColor(p.T));
+      }
     }
     function fitAllPixels() {
+      var md = MODES[MODE];
+      if (!md.map || fitting) return;
       var order = [];
       for (var px = 0; px < MC * MR; px++) if (INSIDE[px]) order.push(px);
       var at = 0;
       function batch() {
-        var stop = Math.min(at + (REDUCED ? order.length : 6), order.length);
+        var stop = Math.min(at + (REDUCED ? order.length : 5), order.length);
         for (; at < stop; at++) {
-          var px = order[at], dat = pixelData(px);
-          var save = CUR.data; CUR.data = dat;
-          var nd = 0.8, T = 600;
-          for (var s = 0; s < 8; s++) {
-            var st = (function (n2, T2) {
-              var keepN = ndIn.value, keepT = TIn.value;
-              ndIn.value = n2; TIn.value = T2;
-              var r = gnStep(n2, T2);
-              ndIn.value = keepN; TIn.value = keepT;
-              return r;
-            })(nd, T);
+          var px2 = order[at];
+          var dat = pixelData(px2);
+          var pr = priorFor(MODE, px2);
+          var p = { nd: pr.p0.nd, T: pr.p0.T, L: pr.p0.L, t0: pr.p0.t0, th: pr.p0.th };
+          md.free.forEach(function (k) { p[k] = k === "nd" ? 0.8 : 600; });
+          var cov = null;
+          for (var s = 0; s < 9; s++) {
+            var st = gnStep(p, dat, pr);
             if (!st) break;
-            nd = Math.max(0.05, Math.min(4, nd + 0.85 * st.dnd));
-            T = Math.max(150, Math.min(1500, T + 0.85 * st.dT));
-            var covLast = st.cov;
+            p = applyStep(p, st.dp, 0.8);
+            cov = st.cov;
           }
-          CUR.data = save;
-          cells[px].setAttribute("fill", ndColor(nd));
-          var sig = covLast ? Math.sqrt(covLast[0]) : 0.03;
-          var sf = Math.max(0, Math.min(1, (sig / Math.max(nd, 0.2)) * 16));
-          sells[px].setAttribute("fill", "color-mix(in srgb, var(--plot-line2) " + Math.round(6 + sf * 70) + "%, var(--plot))");
+          paintPixel(px2, p, cov);
         }
         if (at < order.length) requestAnimationFrame(batch);
       }
       batch();
     }
-    ndIn.addEventListener("input", redraw);
-    TIn.addEventListener("input", redraw);
-    document.getElementById("btn-fit").addEventListener("click", function () { fitPixel(false); });
-    document.getElementById("btn-map").addEventListener("click", fitAllPixels);
+
+    // ---------- mode switching ----------
+    function setMode(mode) {
+      MODE = mode;
+      var md = MODES[mode];
+      modeBtns.forEach(function (b) { b.setAttribute("aria-pressed", String(b.getAttribute("data-mode") === mode)); });
+      document.getElementById("r-bring").innerHTML = md.bring;
+      document.getElementById("r-solve").innerHTML = md.solve;
+      document.getElementById("r-get").innerHTML = md.get;
+      document.getElementById("r-prior").innerHTML = md.prior;
+      sampLab.textContent = md.sample;
+      PRIOR = priorFor(mode, CUR.px);
+      PS = { nd: PRIOR.p0.nd, T: PRIOR.p0.T, L: PRIOR.p0.L, t0: PRIOR.p0.t0, th: PRIOR.p0.th };
+      md.free.forEach(function (k) { PS[k] = SLD[k].init; });
+      CUR.data = mode === "calibration" ? foilData() : pixelData(CUR.px);
+      buildBoard();
+      axXLab.textContent = SLD[md.pair[0]].lab + " →";
+      axYLab.textContent = SLD[md.pair[1]].lab + " ↑";
+      clearPosterior();
+      gMaps.setAttribute("display", md.map ? "inline" : "none");
+      gProd.setAttribute("display", mode === "calibration" ? "inline" : "none");
+      anch5Lab.textContent = mode === "calibration" ? "the deliverable — one instrument posterior" : "the deliverable — the same fit, every pixel";
+      if (md.map) {
+        if (mode === "density") { mapT1.textContent = "areal density n·d"; mapT2.textContent = "uncertainty σ(n·d)"; }
+        if (mode === "temperature") { mapT1.textContent = "temperature T_eff"; mapT2.textContent = "uncertainty σ(T)"; }
+        if (mode === "insitu") { mapT1.textContent = "areal density n·d"; mapT2.textContent = "temperature T_eff"; }
+        cells.forEach(function (c, q) { c.setAttribute("fill", INSIDE[q] ? "color-mix(in srgb, var(--plot-faint) 8%, var(--plot))" : "var(--plot)"); });
+        sells.forEach(function (c, q) { c.setAttribute("fill", INSIDE[q] ? "color-mix(in srgb, var(--plot-faint) 6%, var(--plot))" : "var(--plot)"); });
+        drawLegend();
+      }
+      drawData(); redraw();
+    }
+
+    btnFit.addEventListener("click", fitPixel);
+    btnMap.addEventListener("click", fitAllPixels);
     cells.forEach(function (c) {
       c.addEventListener("click", function () {
         var px = c.getAttribute("data-px");
-        if (px == null) return;
-        CUR.px = +px; CUR.data = pixelData(CUR.px);
-        drawData(); redraw();
+        if (px == null || !MODES[MODE].map || fitting) return;
+        CUR.px = +px;
+        PRIOR = priorFor(MODE, CUR.px);
+        KEYS.forEach(function (k) { if (MODES[MODE].free.indexOf(k) < 0) PS[k] = PRIOR.p0[k]; });
+        CUR.data = pixelData(CUR.px);
+        buildBoard(); clearPosterior(); drawData(); redraw();
       });
     });
-    drawData(); redraw();
+    modeBtns.forEach(function (b) {
+      b.addEventListener("click", function () { if (!fitting) setMode(b.getAttribute("data-mode")); });
+    });
+    setMode("density");
   })();
 </script>
