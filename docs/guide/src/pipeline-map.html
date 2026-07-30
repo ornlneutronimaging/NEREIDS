@@ -79,8 +79,35 @@
   .principle { border: 1px solid var(--hairline); border-left: 3px solid var(--accent); border-radius: 10px; background: var(--surface); padding: .8rem 1rem; font-size: .88rem; color: var(--ink-muted); }
   .principle b { color: var(--ink); font-weight: 600; }
 
-  /* physics chain */
-  .chain { display: flex; flex-direction: column; gap: 0; }
+  /* physics chain — selectable stages */
+  .chainbar { display: flex; flex-wrap: wrap; align-items: stretch; gap: .3rem; margin: 0 0 .7rem; }
+  .chainbar .cstep { text-align: left; font-family: var(--sans); border: 1px solid var(--hairline); border-radius: 10px; background: var(--surface); color: var(--ink-muted); cursor: pointer; padding: .4rem .55rem; flex: 1 1 7rem; min-width: 0; }
+  .chainbar .cstep .cn { font-family: var(--mono); font-size: .7rem; font-weight: 700; color: var(--phys-c); margin-right: .35rem; }
+  .chainbar .cstep .cnm { font-size: .73rem; font-weight: 600; color: var(--ink); display: block; }
+  .chainbar .cstep .ceq { display: block; margin-top: .25rem; overflow: hidden; }
+  .chainbar .cstep .ceq math { font-size: .74rem; }
+  .chainbar .cstep[aria-pressed="true"] { border-color: var(--phys-c); box-shadow: inset 0 0 0 1px var(--phys-c); }
+  .chainbar .cstep:focus-visible { outline: 2px solid var(--phys-c); outline-offset: 2px; }
+  .stagepanel[hidden] { display: none; }
+  /* the line lab — one resonance, live */
+  .lab { position: relative; border: 1px solid var(--plot-edge); border-radius: 14px; background: var(--plot); margin: 0 0 .8rem; }
+  .lab svg { display: block; width: 100%; height: auto; }
+  .lab text { font-family: var(--mono); }
+  .lab-cap { fill: var(--plot-faint); font-size: 11px; }
+  .lab-axis { stroke: color-mix(in srgb, var(--plot-faint) 55%, var(--plot)); stroke-width: 1.2; }
+  .lab-curve { fill: none; stroke: var(--plot-line); stroke-width: 2.2; }
+  .lab-ghost { fill: none; stroke: var(--plot-line2); stroke-width: 2; stroke-dasharray: 5 4; }
+  .lab-ctl { position: absolute; right: 2.2%; top: 9%; width: 33%; display: flex; flex-direction: column; gap: .3rem; font-family: var(--mono); font-size: .68rem; color: var(--ink-muted); }
+  .lab-ctl label { display: flex; align-items: center; gap: .5rem; }
+  .lab-ctl .pn { min-width: 3.2em; }
+  .lab-ctl input[type=range] { flex: 1; accent-color: var(--plot-line2); min-width: 0; }
+  .lab-ctl .v { min-width: 4.2em; color: var(--ink); text-align: right; }
+  .lab-ctl .presets { display: flex; flex-wrap: wrap; gap: .35rem; margin-top: .3rem; }
+  .lab-ctl button { font-family: var(--mono); font-size: .66rem; color: var(--plot-line2); background: transparent; border: 1px solid var(--plot-line2); border-radius: 6px; padding: .2rem .5rem; cursor: pointer; }
+  .lab-ctl button:hover { background: color-mix(in srgb, var(--plot-line2) 16%, transparent); }
+  .lab-read { font-family: var(--mono); font-size: .7rem; color: var(--ink); margin-top: .25rem; }
+  .lab-note { font-size: .66rem; font-family: var(--sans); color: var(--ink-muted); margin-top: .15rem; line-height: 1.45; }
+  @media (max-width: 40rem) { .lab-ctl { position: static; padding: .6rem .9rem .8rem; } }
   .step { border: 1px solid var(--hairline); border-radius: 11px; background: var(--surface); padding: .8rem 1rem; }
   .step-top { display: flex; align-items: center; gap: .6rem; flex-wrap: wrap; }
   .step-no { font-family: var(--mono); font-size: .72rem; font-weight: 700; color: var(--accent); }
@@ -151,6 +178,7 @@
   .scn-feed { fill: none; stroke: var(--api-c); stroke-width: 1.6; stroke-dasharray: 3 5; }
   .scn-feed-t { fill: var(--api-c); font-size: 11px; }
   .scn-cell { stroke: var(--plot); stroke-width: 1; cursor: pointer; }
+  a.livelink { color: var(--rev); }
   .scn-ell { fill: none; stroke: var(--plot-line2); stroke-width: 1.6; opacity: .9; }
   .ctl { position: absolute; display: flex; flex-direction: column; gap: .28rem; font-family: var(--mono); font-size: .68rem; color: var(--plot-faint); }
   .ctl label { display: flex; align-items: center; gap: .5rem; color: var(--ink-muted); }
@@ -198,6 +226,8 @@
   details.walk summary { cursor: pointer; padding: .6rem .9rem; font-size: .88rem; font-weight: 600; color: var(--ink); list-style: none; }
   details.walk summary::-webkit-details-marker { display: none; }
   details.walk summary::before { content: "▸ "; color: var(--pipe-c); }
+  details.walk.key { border-left: 3px solid var(--phys-c); }
+  details.walk.key summary { font-weight: 700; }
   details.walk[open] summary::before { content: "▾ "; }
   details.walk .story { padding: 0 1rem .5rem; }
   .scntip { position: absolute; max-width: 36ch; background: var(--surface); border: 1px solid var(--pipe-c); color: var(--ink); font-family: var(--sans); font-size: .78rem; line-height: 1.5; padding: .5rem .75rem; border-radius: 8px; z-index: 3; box-shadow: 0 4px 18px color-mix(in srgb, var(--ink) 22%, transparent); pointer-events: none; }
@@ -259,6 +289,7 @@
   @media print {
     .tabs { display: none; }
     .panel[hidden] { display: block; }
+    .stagepanel[hidden] { display: block; }
     details { display: block; }
     details > *:not(summary) { display: block; }
   }
@@ -317,40 +348,54 @@
     </div>
 
     <h2>Transformation chain</h2>
-    <div class="chain">
+    <div class="chainbar" role="group" aria-label="Transformation chain — select a stage">
+      <button type="button" class="cstep" data-stage="1" aria-pressed="true"><span class="cnm"><span class="cn">1</span>Microscopic cross-section</span><span class="ceq"><math><msub><mi>σ</mi><mn>0</mn></msub><mo>(</mo><mi>E</mi><mo>)</mo></math></span></button>
+      <button type="button" class="cstep" data-stage="2" aria-pressed="false"><span class="cnm"><span class="cn">2</span>Doppler broadening</span><span class="ceq"><math><msub><mi>Δ</mi><mi>D</mi></msub><mo>≈</mo><msqrt><mrow><mn>4</mn><msub><mi>k</mi><mi>B</mi></msub><msub><mi>T</mi><mtext>eff</mtext></msub><mi>E</mi><mo>/</mo><mi>A</mi></msqrt></math></span></button>
+      <button type="button" class="cstep" data-stage="3" aria-pressed="false"><span class="cnm"><span class="cn">3</span>Attenuation → transmission</span><span class="ceq"><math><mi>T</mi><mo>=</mo><msup><mi>e</mi><mrow><mo>−</mo><mo>∑</mo><mi>n</mi><mi>d</mi><mi>σ</mi></mrow></msup></math></span></button>
+      <button type="button" class="cstep" data-stage="4" aria-pressed="false"><span class="cnm"><span class="cn">4</span>Energy ↔ time-of-flight</span><span class="ceq"><math><mi>E</mi><mo>=</mo><mfrac><mn>1</mn><mn>2</mn></mfrac><msub><mi>m</mi><mi>n</mi></msub><msup><mrow><mo>(</mo><mfrac><mi>L</mi><mrow><mi>t</mi><mo>−</mo><msub><mi>t</mi><mn>0</mn></msub></mrow></mfrac><mo>)</mo></mrow><mn>2</mn></msup></math></span></button>
+      <button type="button" class="cstep" data-stage="5" aria-pressed="false"><span class="cnm"><span class="cn">5</span>Instrument resolution</span><span class="ceq"><math><mi>K</mi><mo>(</mo><mi>t</mi><mo>∣</mo><mi>E</mi><mo>)</mo></math></span></button>
+      <button type="button" class="cstep" data-stage="6" aria-pressed="false"><span class="cnm"><span class="cn">6</span>Observation model</span><span class="ceq"><math><mi>S</mi><mo>=</mo><mi>Φε</mi><mi>T</mi><mo>+</mo><msub><mi>B</mi><mi>s</mi></msub><mo>,</mo><mspace width="0.4em"/><mi>O</mi><mo>=</mo><mi>Φε</mi><mo>+</mo><msub><mi>B</mi><mi>o</mi></msub></math></span></button>
+    </div>
+    <div class="lab" style="margin-bottom:.7rem"><svg id="chainstrip" viewBox="0 0 900 168" role="img" aria-label="The forward model assembled stage by stage: selecting a chain stage draws the Ta-181 curve with all stages up to it applied"></svg></div>
+    <div class="stagepanel" data-stage="1">
       <div class="step">
         <div class="step-top"><span class="step-no">1</span><span class="step-name">Microscopic cross-section</span><span class="step-eq"><math><msub><mi>σ</mi><mn>0</mn></msub><mo>(</mo><mi>E</mi><mo>)</mo></math></span></div>
-        <p class="step-body">Total σ per isotope, built coherently from the collision matrix — <span class="fix">not a sum of independent terms</span> (that is single-level SLBW):</p>
+        <p class="step-body">Total σ per isotope, built coherently from the collision matrix — <span class="fix">not a sum of independent terms</span> (that is single-level SLBW) — the sums below run over spin groups J and channels c; resonances interfere inside U<sub>cc</sub>:</p>
         <div class="eqline"><math display="block"><msub><mi>σ</mi><mtext>tot</mtext></msub><mo>=</mo><mfrac><mrow><mn>2</mn><mi>π</mi></mrow><msup><mi>k</mi><mn>2</mn></msup></mfrac><munder><mo>∑</mo><mi>J</mi></munder><msub><mi>g</mi><mi>J</mi></msub><munder><mo>∑</mo><mi>c</mi></munder><mo>(</mo><mn>1</mn><mo>−</mo><mi>Re</mi><mspace width="0.1em"/><msub><mi>U</mi><mrow><mi>cc</mi></mrow></msub><mo>)</mo></math></div>
         <p class="step-body">Coherence is within each isotope's channels; isotope contributions sum in the exponent. The reconstruction uses each evaluation's <b>declared</b> resolved-resonance formalism (ENDF File 2: RM / RML / MLBW as given) plus File-3 background where present, honouring region-boundary rules. <a class="ev rev" href="#rr2-9">corrected·r1</a> Interference asymmetry scales with Γn/Γtot; scattering resonances can rise above the baseline. Removal is by total σ, but forward scatter into the detector makes the effective removal &lt; σ_tot — prefer capture-dominated resonances for quantitative n·d.</p>
         <p class="parline">parameters: E_r, Γn, Γγ, J, π, ℓ · channel spin · g_J · radii (AP, a_c, NAPS) · reduced-width signs · boundary B · distant-level R^ext · abundances · bare mass A</p>
         <p class="scope">VENUS band ≤ 200 eV ⇒ resolved region only: no URR, no inelastic threshold (Ta-181's is 6.24 keV).</p>
       </div>
-      <div class="arrow"></div>
+    </div>
+    <div class="stagepanel" data-stage="2" hidden>
       <div class="step">
         <div class="step-top"><span class="step-no">2</span><span class="step-name">Doppler broadening</span><span class="step-eq"><math><msub><mi>Δ</mi><mi>D</mi></msub><mo>≈</mo><msqrt><mrow><mn>4</mn><msub><mi>k</mi><mi>B</mi></msub><msub><mi>T</mi><mtext>eff</mtext></msub><mi>E</mi><mo>/</mo><mi>A</mi></msqrt></math></span></div>
         <p class="step-body">Broadens σ; <b>temperature enters the whole pipeline only here</b>. The exact free-gas kernel conserves the reaction rate (1/v exact); the σ-area only to O((Δ_D/E)²), and the √ form is its high-energy approximation. For lattice-bound solids the temperature is an effective kinetic T_eff (phonon DOS / Debye) — a scalar correction (~+1.6% width Ta, ~+4% W at 300 K). Isotropic: texture does not affect the resonance width for cubic metals (distinct from the Bragg-edge effect).</p>
         <p class="parline">parameters: temperature T → T_eff · Debye θ_D (scalar) · per-isotope mass A</p>
       </div>
-      <div class="arrow"></div>
+    </div>
+    <div class="stagepanel" data-stage="3" hidden>
       <div class="step">
         <div class="step-top"><span class="step-no">3</span><span class="step-name">Attenuation → transmission</span><span class="step-eq"><math><mi>T</mi><mo>(</mo><mi>E</mi><mo>)</mo><mo>=</mo><mi>exp</mi><mo>(</mo><mo>−</mo><munder><mo>∑</mo><mi>i</mi></munder><msub><mrow><mo>(</mo><mi>n</mi><mi>d</mi><mo>)</mo></mrow><mi>i</mi></msub><msub><mi>σ</mi><mi>i</mi></msub><mo>)</mo></math></span></div>
         <p class="step-body">Beer–Lambert, areal density in atoms/barn. <b>Exact for the uncollided beam at any optical depth</b> — strong attenuation <i>is</i> the self-shielding. Real corrections: (i) detector acceptance / in-scatter (likely negligible for MCP-TPX, to confirm); (ii) sub-pixel heterogeneity — the pixel value is ⟨exp(−τ)⟩ ≠ exp(−⟨τ⟩), so thickness variation biases n·d.</p>
         <p class="parline">parameters: areal density (n·d)ᵢ · per-pixel ⟨exp(−τ)⟩ &nbsp;&nbsp;<span class="parflag">⚑ saturation / curve of growth — see below</span></p>
       </div>
-      <div class="arrow"></div>
+    </div>
+    <div class="stagepanel" data-stage="4" hidden>
       <div class="step">
         <div class="step-top"><span class="step-no">4</span><span class="step-name">Energy ↔ time-of-flight</span><span class="step-eq"><math><mi>E</mi><mo>=</mo><mfrac><mn>1</mn><mn>2</mn></mfrac><msub><mi>m</mi><mi>n</mi></msub><msup><mrow><mo>(</mo><mfrac><mi>L</mi><mrow><mi>t</mi><mo>−</mo><msub><mi>t</mi><mn>0</mn></msub></mrow></mfrac><mo>)</mo></mrow><mn>2</mn></msup></math></span></div>
         <p class="step-body">Measurement in TOF, physics in energy. Off-axis geometric per-pixel L is negligible at VENUS (ΔE/E ≈ 6×10⁻⁷ at r = 2 cm, L₀ = 25 m) — <b>one parameter removed</b>; but a per-pixel/per-chip t₀ (timing) can reach ΔE/E ≈ 10⁻³ and may be needed. The energy-dependent emission delay lives in <b>exactly one</b> of {t₀, the resolution-kernel mean} — never both.</p>
         <p class="parline">parameters: flight path L (effective, not surveyed) · time offset t₀ (+ possible per-pixel)</p>
       </div>
-      <div class="arrow"></div>
+    </div>
+    <div class="stagepanel" data-stage="5" hidden>
       <div class="step">
         <div class="step-top"><span class="step-no">5</span><span class="step-name">Instrument resolution</span><span class="step-eq"><math><mi>K</mi><mo>(</mo><mi>t</mi><mo>∣</mo><mi>E</mi><mo>)</mo></math></span></div>
         <p class="step-body">A non-stationary conditional kernel K(t|E), <b>not a shift-invariant convolution</b> — the Ikeda–Carpenter moderator parameters vary with energy — and it must be position-anchored. Broadens the resonance, degenerate with Doppler (why calibration exists). It acts on expected <b>counts</b> (Φ·ε·T): convolving transmission alone is exact only for smooth flux — screened per experiment by a forward-simulated bias bound (see statistics).</p>
         <p class="parline">parameters: resolution shape θ_res (Ikeda–Carpenter)</p>
       </div>
-      <div class="arrow"></div>
+    </div>
+    <div class="stagepanel" data-stage="6" hidden>
       <div class="step">
         <div class="step-top"><span class="step-no">6</span><span class="step-name">Observation model</span><span class="step-eq"><math><mi>S</mi><mo>=</mo><mi>Φε</mi><mi>T</mi><mo>+</mo><msub><mi>B</mi><mi>s</mi></msub><mo>,</mo><mspace width="0.4em"/><mi>O</mi><mo>=</mo><mi>Φε</mi><mo>+</mo><msub><mi>B</mi><mi>o</mi></msub></math></span></div>
         <p class="step-body">Transmission domain: ratio (S/Q_s)/(O/Q_o). Counts domain (VENUS target): Poisson, flux Φ(E) inside the model. Sample and open-beam backgrounds differ (B_s ≠ B_o — the sample adds scatter and gammas); exposures differ (Q_s ≠ Q_o), and Q are noisy monitor observations with their own likelihood terms, not exact divisors. <a class="ev rev" href="#rr2-5">corrected·r1</a> Dead time and pile-up must be corrected before the Poisson likelihood is valid at all.</p>
@@ -371,9 +416,28 @@
       </table>
     </div>
 
-    <h2>Regime physics</h2>
-    <div class="regime">
-      <h3>⚑ Saturation &amp; the curve of growth</h3>
+    <h2>The line, live — Doppler · saturation · resolution</h2>
+    <div class="lab" id="lab">
+      <svg id="labsvg" viewBox="0 0 900 300" role="img" aria-label="One Ta-181 resonance line, live: the transmission dip responding to temperature, areal density and instrument blur; presets demonstrate that heating and thickening widen the dip identically, and that a hot sharp instrument and a cold blurred one produce nearly the same line"></svg>
+      <div class="lab-ctl">
+        <label><span class="pn">T</span><input type="range" id="lb-T" min="150" max="1200" step="5" value="300"><span class="v" id="lbv-T">300 K</span></label>
+        <label><span class="pn">n·d</span><input type="range" id="lb-nd" min="0.1" max="4" step="0.01" value="0.5"><span class="v" id="lbv-nd">0.50</span></label>
+        <label><span class="pn">θ_res</span><input type="range" id="lb-th" min="0.002" max="0.03" step="0.0002" value="0.0105"><span class="v" id="lbv-th">1.05 %</span></label>
+        <div class="presets">
+          <button type="button" id="lb-heat">heat it</button>
+          <button type="button" id="lb-thick">thicken it</button>
+          <button type="button" id="lb-look">the look-alike</button>
+          <button type="button" id="lb-reset">reset</button>
+        </div>
+        <div class="lab-read" id="lb-read"></div>
+        <div class="lab-read" id="lb-naive" style="color:var(--warn)"></div>
+        <div class="lab-note" id="lb-note">the same 4.28 eV Ta-181 line the scene fits — θ_res is the blur width as ΔE/E · drag, or press a preset</div>
+      </div>
+    </div>
+    <details class="walk">
+      <summary>Saturation &amp; the curve of growth — width grows with n·d at fixed T; width is not a thermometer</summary>
+      <div class="story">
+      <div class="regime" style="border:0; padding:.2rem 0 0; margin-bottom:.2rem">
       <p>As (n·d)·σ grows the dip deepens toward T≈0 (never exactly zero) and — at fixed temperature — <b>widens</b>. So the width does not encode temperature alone.</p>
       <div class="lineshape">
         <svg class="plot" viewBox="0 0 420 210" role="img" aria-label="Two transmission dips at the same temperature showing FWHM grows with areal density">
@@ -390,14 +454,16 @@
         <p class="capnote">Both dips at the <b>same temperature</b>. Raising areal density widens then saturates the dip — so FWHM ⇏ temperature; n·d and T fit jointly. "FWHM gives T without density" holds only optically thin (τ₀ ≲ 0.3) with Γ and resolution known. That threshold applies to <i>width-only inversion</i>; under full forward-model fitting opacity is deterministic and modelable, so τ₀ ~ 1 is usable (see calibration). A saturated core is <b>not pure background</b> — it carries resolution leakage, in-scatter, gammas and frame overlap: a model-assisted constraint, not a free zero.</p>
       </div>
     </div>
+      </div>
+    </details>
     <div class="regime calm">
       <h3>Degeneracies — why fits are coupled</h3>
       <div class="scroller">
         <table class="idtbl">
           <thead><tr><th>Coupled pair</th><th>Mechanism</th><th>Broken by</th></tr></thead>
           <tbody>
-            <tr><td class="p">n·d ⊗ T</td><td class="feat">jointly encoded by the curve of growth</td><td class="req">joint fitting; pinning only under the marginalization criterion below</td></tr>
-            <tr><td class="p">θ_res ⊗ T</td><td class="feat">both broaden the line</td><td class="req">calibration determines resolution; carried as a correlated prior</td></tr>
+            <tr><td class="p">n·d ⊗ T</td><td class="feat">jointly encoded by the curve of growth</td><td class="req">joint fitting; pinning only under the marginalization criterion below · <a href="#lab" class="livelink" data-preset="lb-thick">see it live ↑</a></td></tr>
+            <tr><td class="p">θ_res ⊗ T</td><td class="feat">both broaden the line</td><td class="req">calibration determines resolution; carried as a correlated prior · <a href="#lab" class="livelink" data-preset="lb-look">see it live ↑</a></td></tr>
             <tr><td class="p">(L, t₀) ⊗ E_r</td><td class="feat">energy scale vs resonance position</td><td class="req">anchored by the known calibrant</td></tr>
             <tr><td class="p">n·d ⊗ Q ⊗ B</td><td class="feat">depth vs scale vs baseline</td><td class="req">background templates + monitor observations + restricted nuisance freedom</td></tr>
             <tr><td class="p">n ⊗ d</td><td class="feat">transmission sees only the areal product</td><td class="req">volumetric density needs geometry (3D)</td></tr>
@@ -412,15 +478,15 @@
         <thead><tr><th>Instance</th><th>Nuclear</th><th>Instrument</th><th>Sample</th><th>Nuisance</th></tr></thead>
         <tbody>
           <tr><td class="name">Calibration</td><td class="fxd">fixed (known calibrant)</td><td class="fr">SOLVE L, t₀, θ_res</td><td class="fxd">fixed (known ρ, T)</td><td class="fr">solve</td></tr>
-          <tr><td class="name">Density</td><td class="fxd">fixed</td><td class="pri">prior / joint</td><td class="fr">SOLVE n·d <span class="fxd">(+T joint or prior)</span></td><td class="fr">solve</td></tr>
-          <tr><td class="name">Temperature</td><td class="fxd">fixed</td><td class="pri">prior / joint</td><td class="fr">SOLVE T <span class="fxd">(+n·d joint)</span></td><td class="fr">solve</td></tr>
-          <tr><td class="name">In-situ</td><td class="fxd">fixed</td><td class="pri">prior / joint</td><td class="fr">SOLVE n·d + T (joint)</td><td class="fr">solve</td></tr>
+          <tr><td class="name">Density</td><td class="fxd">fixed</td><td class="pri">tight prior ← calibration</td><td class="fr">SOLVE n·d <span class="fxd">(+T joint or prior)</span></td><td class="fr">solve</td></tr>
+          <tr><td class="name">Temperature</td><td class="fxd">fixed</td><td class="pri">tight prior ← calibration</td><td class="fr">SOLVE T <span class="fxd">(+n·d joint)</span></td><td class="fr">solve</td></tr>
+          <tr><td class="name">In-situ</td><td class="fxd">fixed</td><td class="pri">tight prior ← calibration</td><td class="fr">SOLVE n·d + T (joint)</td><td class="fr">solve</td></tr>
         </tbody>
       </table>
     </div>
     <p class="tblnote">Instrument carried as a correlated calibration prior or fit jointly — <b>not hard-pinned</b>. Hard-pinning reports C_cond; the honest covariance is</p>
     <div class="eqline"><math display="block"><msub><mi>C</mi><mtext>marg</mtext></msub><mo>=</mo><msub><mi>C</mi><mtext>cond</mtext></msub><mo>+</mo><mi>J</mi><msub><mi>Σ</mi><mtext>cal</mtext></msub><msup><mi>J</mi><mi>T</mi></msup><mo>⪰</mo><msub><mi>C</mi><mtext>cond</mtext></msub></math></div>
-    <p class="tblnote">In a toy MC the pinned 1σ bar covered only <span class="num">20.4%</span> vs the nominal 68.3% (≈4× too small; ~27× near the T–resolution degeneracy). Joint fitting is honest <b>and</b> tighter — sharp resonances re-measure resolution and energy scale.</p>
+    <p class="tblnote">In a toy MC, hard-pinning shrank the reported 1σ bar until it covered only <span class="num">20.4%</span> of truth draws instead of the nominal 68.3% (≈4× too small; ~27× near the T–resolution degeneracy) — pinning is the failure. Joint fitting is honest <b>and</b> tighter — sharp resonances re-measure resolution and energy scale.</p>
 
     <h2>Calibration instance — how the instrument is determined</h2>
     <p class="tabstatus">Reviewed by a second LLM family and independently re-derived numerically; every number reproduced by both to the quoted digits. Three initially-proposed claims were corrected in that review — details in the <a href="#" data-goto="record">review record</a>.</p>
@@ -451,7 +517,8 @@
       </table>
     </div>
 
-    <p class="subhead">Degeneracy structure of the timing model (exact)</p>
+    <details class="walk key"><summary>Timing degeneracy (exact) — a constant lag is exactly t₀; an E<sup>−1/2</sup> lag is exactly L</summary>
+
     <div class="regime" style="margin-top:.2rem">
       <p>Writing the arrival time as <math><mi>t</mi><mo>(</mo><mi>E</mi><mo>)</mo><mo>=</mo><msub><mi>t</mi><mn>0</mn></msub><mo>+</mo><mi>L</mi><mo>/</mo><mi>v</mi><mo>(</mo><mi>E</mi><mo>)</mo><mo>+</mo><mi>lag</mi><mo>(</mo><mi>E</mi><mo>)</mo></math>, the fit spans only <math><mrow><mo>{</mo><mn>1</mn><mo>,</mo><msup><mi>E</mi><mrow><mo>−</mo><mn>1</mn><mo>/</mo><mn>2</mn></mrow></msup><mo>}</mo></mrow></math>. Therefore:</p>
       <div class="scroller">
@@ -467,25 +534,32 @@
       <p style="margin-top:.5rem">A fixed-time lag is <b>not</b> a fixed extra path — the implied path varies ~6.3× across 5–200 eV, so the two cannot be conflated.</p>
       <p style="margin-top:.6rem"><b>Consequences.</b> L, t₀ and the kernel location must be fitted <b>jointly under an explicitly stated anchoring convention</b> — not in sequence. The fitted L is an <i>effective</i> flight path that absorbs the emission depth: it is not the surveyed distance, so a discrepancy against the survey is expected and physical, not a validation failure. Because a constant delay is exactly absorbed by t₀, there is no internal check on t₀ — which trigger defines it must be stated externally.</p>
     </div>
+    </details>
 
-    <p class="subhead">Calibrant &amp; resonance selection</p>
+    <details class="walk"><summary>Calibrant &amp; resonance selection — span the band · τ₀ up to ~1 · fit shapes, never centroids</summary>
+
     <div class="regime calm" style="margin-top:.2rem">
       <p><b>Span the band</b> (lever arm for L vs t₀, and the kernel's energy dependence) · use a range of optical depths, favouring weak-to-moderate <b>τ₀ up to ~1</b> for the resolution core · keep saturated lines for wing/background diagnostics · isolated lines only (no blends) · fit <b>modelled dip shapes, never raw centroids</b> (an asymmetric kernel plus opacity bias the centroid, which biases both L and t₀). <a class="ev rev" href="#rr0-1">corrected·r1</a></p>
       <p>Why τ₀ ≲ 0.3 was too strict: at τ₀ = 0.3 the dip is only <span class="num">26% deep</span> — too weak to build a resolution determination on — while opacity broadening at τ₀ = 1 is only <span class="num">+28%</span> and is deterministic under the forward model, i.e. modelable rather than corrupting. Apparent/natural HWHM ratio: <span class="num">1.08 / 1.28 / 1.91 / 3.66</span> at τ₀ = 0.3 / 1 / 3 / 10. Do not impose a capture-dominance cut — it discards the most resolution-sensitive lines; model the interference instead.</p>
       <p><b>Reality check.</b> A real Ta foil is already saturated at its strong low-energy lines: at the 4.28 eV resonance, <span class="num">25 µm → τ₀ ≈ 2.2</span> (dip 89% deep) and <span class="num">100 µm → τ₀ ≈ 8.7</span>. "Use only optically-thin resonances" is not satisfiable there — opacity must be modelled, not avoided.</p>
     </div>
+    </details>
 
-    <p class="subhead">Is calibration per-pixel? (geometry no, timing maybe)</p>
+    <details class="walk"><summary>Per-pixel calibration? — geometry no (ΔE/E ≈ 6×10⁻⁷); timing maybe (up to ~10⁻³)</summary>
+
     <div class="regime" style="margin-top:.2rem">
       <p><b>Geometric per-pixel flight path is unnecessary at VENUS.</b> ΔL/L ≈ r²/2L₀²: at L₀ = 25 m, r = 2 cm gives <span class="num">ΔE/E ≈ 6×10⁻⁷</span>; even a 20 cm-square detector's corner gives <span class="num">3×10⁻⁵</span> — orders below any stated bias budget. This removes a parameter from the model.</p>
       <p>The corollary is <b>not</b> that the field collapses to one calibration: a per-pixel/per-chip t₀ (time-walk, clock distribution, cluster-timing estimator) reaches <span class="num">ΔE/E ≈ 1.4×10⁻³</span> at 10 eV and <span class="num">6.3×10⁻³</span> at 200 eV for a 400 ns offset — at or above resolution. A genuine 1D-ROI-vs-2D calibration disagreement would indicate timing, statistics, or sub-pixel heterogeneity — not geometry.</p>
     </div>
+    </details>
 
-    <p class="subhead">What calibration must emit</p>
+    <details class="walk"><summary>What calibration must emit — the joint posterior with full covariance, never point values</summary>
+
     <div class="regime calm" style="margin-top:.2rem">
       <p>Not point values. The output object is the <b>joint posterior</b>: parameter vector + full covariance (or samples / a validated parametric form where non-Gaussian), plus the resolution model form and its anchoring convention, the validity energy range, the calibrant assumptions it is conditional on, and any correlations with nuclear data.</p>
       <p>Why the full covariance is mandatory: discarding the off-diagonal is wrong in <b>both directions</b>. At ρ = −0.861, the variance of one linear combination is overstated <span class="num">7.2×</span> while the orthogonal one is understated <span class="num">~1.9×</span>; at ρ = −0.98 the overstatement reaches <span class="num">50×</span>. Which error you make depends on which combination the downstream observable is sensitive to — marginal error bars cannot be salvaged.</p>
     </div>
+    </details>
 
     <p class="subhead">The calibration process (physics-derived order)</p>
     <ol class="procsteps">
@@ -496,6 +570,7 @@
       <li><b>Check self-consistency</b> — residual structure across resonances, and 1D-ROI vs per-pixel agreement. Per-resonance residuals are model-inadequacy evidence and must remain visible, not be absorbed.</li>
     </ol>
 
+    <div class="dev-only">
     <p class="subhead">Confirmed gaps &amp; residual couplings (physics still to settle — not code)</p>
     <ul class="openlist">
       <li><b>Bound-atom lattice dynamics vs free-gas T_eff</b> — trades directly against instrumental width, worst below ~20–40 eV where Doppler dominates.</li>
@@ -523,18 +598,22 @@
       <li><b>Per-pixel / per-chip timing calibration</b> — does it exist, and what is its magnitude?</li>
       <li>Which <b>trigger defines t₀</b>, and how stable is it run-to-run?</li>
     </ul>
+    </div>
 
     <!-- ============ EXPERIMENT INSTANCES ============ -->
     <h2>The experiment instances — density · temperature · in-situ</h2>
 
-    <div class="regime calm">
+    <details class="walk key"><summary>Optical depth τ₀ governs both separations — thin decouples area↔n·d and width↔T; saturation destroys both, continuously</summary>
+<div class="regime calm">
       <h3>The unifying result: optical depth τ₀ governs <i>both</i> separations</h3>
       <p>In the <b>optically thin</b> limit the two observables decouple cleanly: the <b>area</b> of a dip carries n·d free of temperature, because Doppler conserves the cross-section area (<span class="num">d ln W / d ln T = 0.008</span> at τ₀ ≈ 0.1) — while the <b>width</b> carries T free of n·d, because the Doppler width ∝ √T sets the shape and n·d only scales the depth (the FWHM result above, valid at τ₀ ≲ 0.3).</p>
       <p><b>Saturation destroys both separations — continuously.</b> Corrections begin at O(τ₀); there is no sharp threshold. For a representative fixed-Γ line (Voigt, Γ = 60 meV, Ta-181-like at 10 eV), temperature leaks into the area as <span class="num">d ln W/d ln T = 0.023 → 0.063 → 0.110</span> at τ₀ ≈ 0.3 → 1 → 3, while opacity broadening inflates the width by <span class="num">+18.6%</span> from τ₀ 0.3 → 1 (Lorentzian shape; a Gaussian gives +12.1%). These numbers are <b>line-specific, not functions of τ₀ alone</b>: a pure conserved-area Gaussian scale family reaches 0.021 → 0.061 → 0.168 → 0.327 over the same range, and the fixed-Γ Voigt is non-monotonic — falling back to 0.092 by τ₀ ≈ 10 as deep saturation moves the equivalent width onto the T-independent Lorentzian wings. τ₀ remains the master design variable; thresholds quoted on it are illustrations for a stated line shape, never universal constants. <a class="ev rev" href="#rr1-1">corrected·r1</a></p>
       <div class="aside"><span class="lbl">method note</span>My first numerical test normalised the line profile to unit <i>peak</i>, which silently holds τ₀ fixed instead of n·d and manufactured a spurious T-dependence in the thin limit. The correct test holds n·d fixed with an area-normalised cross-section. Recorded because it is exactly the kind of mistake a plot would have "confirmed".</div>
     </div>
+    </details>
 
-    <div class="regime">
+    <details class="walk"><summary>Density — n·d from the equivalent width · optimal τ₀ ≈ 2.2 · T held only by the marginalization criterion</summary>
+<div class="regime">
       <h3>Density instance — known isotope + T → n·d</h3>
       <p><b>Identified from:</b> the equivalent width / integrated dip strength — not the depth alone, since depth trades directly against normalization and background.</p>
       <p><b>Optimal sample thickness.</b> With Poisson counting, Var(τ) = (e^τ+1)/N, so minimising the relative error on τ gives e^τ(τ−2) = 2 ⟹ <b>τ₀ ≈ 2.22</b>. Penalty for being off: <span class="num">3.6×</span> worse at τ₀ = 0.3, <span class="num">4.7×</span> at τ₀ = 8. This is an asymptotic, equal-exposure, known-normalization result — backgrounds, monitors and unequal allocation shift it, and at τ₀ = 8 ten expected sample counts already need N ≈ 3×10⁴ open counts/bin. <a class="ev rev" href="#rr1-3">corrected·r1</a></p>
@@ -542,8 +621,10 @@
       <p><b>May T be pinned?</b> Not by a τ₀ branch alone. Pinning is admissible only when <b>marginalizing over T's external uncertainty shifts the n·d posterior by less than a stated fraction of the total error budget</b>; a T prior is always preferred over a hard pin. The thin regime is <i>why</i> the test passes at small τ₀ (area conservation makes the sensitivity vanish) — the test, not the regime label, is the gate. <a class="ev rev" href="#rr2-15">corrected·r1</a></p>
       <p class="capnote" style="margin-top:.5rem">degeneracies: n·d ⊗ normalization ⊗ background · n·d ⊗ T (curve of growth) · per-isotope n·d ⊗ each other wherever lines overlap</p>
     </div>
+    </details>
 
-    <div class="regime">
+    <details class="walk"><summary>Temperature — T from the full line shape · the information lives at low E · opacity masquerades as heat</summary>
+<div class="regime">
       <h3>Temperature instance — known n·d → T_eff</h3>
       <p><b>Identified from:</b> the full line <b>shape</b> (never the raw FWHM), specifically the Doppler contribution in excess of the pinned instrument kernel.</p>
       <p><b>Where the temperature information lives.</b> The relative Doppler width Δ_D/E ∝ E<sup>−1/2</sup> falls with energy, while a moderator-dominated instrument gives roughly constant relative resolution (see the resolution section) — so the Doppler-to-instrument <i>width ratio</i> improves toward low energy. The width ratio is a proxy, not the decision metric: the canonical selection ranks candidate resonance sets by <b>expected information on T_eff after marginalizing</b> density, kernel, background and nuclear-data uncertainty; under moderator-dominated resolution that ranking lands on the lowest usable lines, which is why the rule of thumb survives. <a class="ev rev" href="#rr2-16">corrected·r1</a></p>
@@ -553,13 +634,16 @@
       <div class="aside"><span class="lbl">corrected model</span>An earlier draft compared Doppler against a <i>fixed</i> timing uncertainty, producing a "crossover at 22 eV / 7 eV". Unphysical: the dominant moderator term scales as 1/√E, giving constant ΔE/E — the crossover figures are withdrawn; the directional conclusion (favour low-E lines) survives. <a class="ev rev" href="#rr0-2">corrected·r1</a></div>
       <p class="capnote" style="margin-top:.5rem">degeneracies: T ⊗ θ_res (the reason calibration runs first) · T ⊗ n·d (curve of growth) · T ⊗ energy scale (a stretched axis mimics broadening)</p>
     </div>
+    </details>
 
-    <div class="regime">
+    <details class="walk"><summary>In-situ — shared n·d₀ under the expansion link + per-frame T · the sharing declaration is part of the experiment definition</summary>
+<div class="regime">
       <h3>In-situ instance — neither known → n·d + T, tracked</h3>
       <p><b>What makes separation possible at all</b> is not the shape of a single line but two independent levers. First, the <b>energy dependence across resonances</b>: temperature acts <i>coherently</i> on every line via Δ_D ∝ √E, while optical depth acts through each line's own σ_peak — typically separable with ≥2 resonances of differing strength spanning energy, though that count is a rule of thumb, neither necessary nor sufficient; the identifiability screen, not the line count, is the gate. <a class="ev rev" href="#rr1-6">corrected·r1</a> Second, the <b>global fit across the thermal series</b>: the reference n·d₀ is shared across frames (absent composition change) while T varies per frame — a shared-parameter fit with a large identifiability gain over frame-by-frame fitting.</p>
       <p><b>⚑ Thermal expansion is a first-class term, not a correction.</b> Per-frame areal density follows n·dⱼ = n·d₀·exp(−2∫α(T)dT); with constant α over 1000 K that is <span class="num">−1.25% (Ta)</span>, <span class="num">−0.89% (W)</span>, <span class="num">−2.78% (Au)</span>. Left out of the model it masquerades as mass loss or composition change — precisely the quantity an in-situ experiment claims to measure. The free-isotropic law breaks under fixtures (anisotropic strain), phase changes, or near melting (Au: 1337 K) — then an integrated strain model with uncertainty replaces it. <a class="ev rev" href="#rr2-21">corrected·r1</a></p>
       <p><b>Composition evolution constrains what may be shared:</b> if composition genuinely changes (phase change, diffusion), per-isotope n·d cannot be shared across the series. The model must declare which parameters are global and which are per-frame — that declaration is part of the experiment definition, not an implementation choice.</p>
     </div>
+    </details>
 
     <!-- ============ STATISTICS & INFERENCE ============ -->
     <h2>Statistics &amp; inference — which likelihood, and what it costs</h2>
@@ -570,7 +654,7 @@
           <tr>
             <td class="p">Transmission</td>
             <td class="feat">Gaussian χ² on T(E), σ_T propagated from counting statistics. Flux and background divided out during reduction.</td>
-            <td class="req">The ratio of two Poisson counts has conditional relative bias ≈ 1/λ_o — exactly <span class="num">1.02%</span> at 100 open counts/bin, &lt;1% only from ≥103 — so "&gt;~100 counts/bin" is a rule of thumb, not a guarantee (<span class="num">10 counts → 10%</span>, <span class="num">1000 → 0.1%</span>). Additionally inadmissible when resonance cores go black (S ≈ 0 exactly where the information lives), when the shared open beam correlates all pixels, or when background/monitor uncertainty is non-negligible. Plus the resolution-order rule, checked as a forward-simulated bias bound. <a class="ev rev" href="#rr1-7">corrected·r1</a></td>
+            <td class="req">Ratio bias ≈ 1/λ_o: <span class="num">1.02%</span> at 100 open counts/bin, &lt;1% only from ≥103 — a rule of thumb, not a guarantee <span class="ihint" tabindex="0" data-tip="10 counts → 10% bias; 1000 → 0.1%. Additionally inadmissible when resonance cores go black (S ≈ 0 exactly where the information lives), when the shared open beam correlates all pixels, or when background/monitor uncertainty is non-negligible — plus the resolution-order rule, checked as a forward-simulated bias bound.">i</span> <a class="ev rev" href="#rr1-7">corrected·r1</a></td>
           </tr>
           <tr>
             <td class="p">Counts</td>
@@ -580,38 +664,51 @@
         </tbody>
       </table>
     </div>
-    <div class="regime" style="margin-top:.8rem">
+    <details class="walk"><summary>Two silent traps — Neyman χ² biases low; per-pixel UQ understates ~3–4× (a VENUS observation, cause unattributed)</summary>
+<div class="regime" style="margin-top:.8rem">
       <h3>Two statistical traps that silently bias results</h3>
       <p><b>Neyman χ² bias.</b> Taking the per-bin variance <i>from the data</i> (σ² = N_observed) generally biases fitted amplitudes low — deep bins get over-weighted. The sign is not universal once backgrounds and nonlinear shape parameters enter: the Poisson likelihood is the defensible default; Pearson χ² (variance from the model) is the minimum.</p>
       <p><b>Per-pixel UQ underestimates.</b> The <span class="num">~3–4×</span> understatement of per-superpixel scatter is an empirical VENUS observation, not a general statistical fact — under regular high-count conditions the inverse-Hessian covariance is asymptotically correct, so a shortfall this size points at model mismatch, ignored calibration covariance, or spatial correlation <span class="ev unv">cause unattributed</span>. Reserve MCMC for ROIs / a global co-fit; report a χ²-scaled covariance elsewhere with the scaling disclosed. <a class="ev rev" href="#rr1-8">corrected·r1</a></p>
       <p><b>The joint-fit contract.</b> The instrument enters as a correlated prior (or is fitted jointly), never hard-pinned; the reported covariance is C_marg = C_cond + JΣ_calJ<sup>T</sup>. Nuclear-data covariance propagates the same way — otherwise evaluation error is silently reclassified as a physical result.</p>
     </div>
+    </details>
 
     <!-- ============ SPATIAL DIMENSION ============ -->
     <h2>The spatial dimension — 1D ROI · 2D per-pixel · 3D</h2>
-    <div class="regime">
+    <details class="walk key"><summary>1D-ROI underestimates n·d by ≈ −Var(τ)/2 — predictable and signed; the 1D↔2D offset is a QC number, not a hope</summary>
+<div class="regime">
       <h3>⚑ 1D-ROI and 2D-per-pixel disagree by a <i>predictable, signed</i> amount</h3>
       <p>Because exp is convex, Jensen's inequality gives ⟨exp(−τ)⟩ ≥ exp(−⟨τ⟩). Fitting an aggregated ROI with a <i>uniform</i> model therefore returns τ_fit ≈ ⟨τ⟩ − Var(τ)/2 — so <b>1D-ROI systematically underestimates areal density</b> whenever the ROI is heterogeneous. Verified numerically (prediction vs Monte-Carlo agree): at ⟨τ⟩ = 2, a thickness spread of 10% → <span class="num">−1.0%</span>, 20% → <span class="num">−4.1%</span>, 30% → <span class="num">−9.0%</span> in n·d. −Var(τ)/2 is the leading cumulant only, and the exact offset is distribution-dependent: at 30% spread it ranges <span class="num">−8.5%</span> (two-point) to <span class="num">−8.7%</span> (uniform) to <span class="num">−9.0%</span> (Gaussian). <a class="ev rev" href="#rr1-9">corrected·r1</a></p>
       <p><b>Consequence for the never-tested 1D↔2D check:</b> the offset has a predicted value — exactly ⟨e^(−τ)⟩ computed from the fitted 2D field (all cumulants, with illumination weighting), read as −Var(τ)/2 to leading order. That converts a vague consistency hope into a quantitative test. Counts may legitimately be summed over an ROI (Poisson sums are Poisson), but the ROI forward model must then be ⟨exp(−τ)⟩, not exp(−⟨τ⟩).</p>
     </div>
-    <div class="regime calm">
+    </details>
+
+    <details class="walk"><summary>Regularization must be physically justified — edge-preserving where real boundaries exist; never cosmetic smoothing</summary>
+<div class="regime calm">
       <h3>The estimator axis, and when regularization is <i>physically</i> justified</h3>
       <p>independent per-pixel → adaptive binning → spatial regularization → joint spatial-spectral inversion. Regularization is justified when: (a) the underlying field really is smooth or piecewise-smooth on the pixel/PSF scale — use edge-preserving (TV-like) priors where the sample has genuine boundaries, <i>not</i> Gaussian smoothing; and (b) the detector PSF already correlates neighbouring pixels, so independent per-pixel fitting is statistically inefficient, not merely unsmoothed. It is not justified as cosmetic noise suppression: regularization trades variance for bias, so the reported uncertainty must account for the effective degrees of freedom it consumes.</p>
     </div>
-    <div class="regime">
+    </details>
+
+    <details class="walk"><summary>3D factorises only at uniform T — otherwise reconstruction and spectral fitting are one joint inverse problem</summary>
+<div class="regime">
       <h3>⚑ Why 3D is a different problem — and when it factorises</h3>
       <p>Each measurement is a line integral: τ(E, ray) = Σᵢ ∫ nᵢ(x) σᵢ(E; T(x)) dl.</p>
       <p>With <b>uniform temperature it factorises</b>: σ leaves the integral, τ(E, ray) is linear in the line integral of n, and the correct order is to reconstruct the <i>linear</i> quantity τ tomographically, then fit per voxel. With <b>spatially varying temperature it does not</b>: σ depends on position, reconstruction and spectral fitting must be solved jointly — in-situ 3D (thermal gradients) is fundamentally harder than density-only 3D.</p>
       <p><b>Reconstruction operates on line integrals — under two conditions.</b> (i) The linearity of τ = −ln T holds for the <i>model-domain</i> transmission: once expected counts are convolved in TOF, −ln(counts ratio) per energy bin is not a linear Radon sinogram — deconvolve, or fit a count-domain forward model. (ii) Back-projecting per-ray fitted values is legitimate <i>iff</i> the fitted quantity is a line integral of a common scalar density (uniform or known T); it is invalid when the ray fit mixes temperature, composition, resolution or opacity into something non-additive along the ray. <a class="ev rev" href="#rr1-10">corrected·r1</a></p>
     </div>
+    </details>
 
     <!-- ============ RESULTS / QC ============ -->
     <h2>Results, QC &amp; uncertainty — where every instance converges</h2>
     <p class="step-body" style="margin-bottom:.7rem">Every experiment terminates in the same product family, so this is shared scaffolding, not per-experiment reporting: value map · 1σ uncertainty map · goodness-of-fit map · convergence/trust mask · residual cube.</p>
-    <div class="regime">
+    <details class="walk key"><summary>A correlated systematic does not average down — the calibration term is a hard floor (ρ = 1 by construction)</summary>
+<div class="regime">
       <h3>⚑ A correlated systematic does not average down</h3>
       <p>The calibration-covariance contribution is spatially correlated — it biases the whole field coherently — so the variance of an N-pixel mean is σ²_stat/N + σ²_sys, and binning cannot beat the second term. With 5% per-pixel statistics and a 1% correlated floor: N = 100 → <span class="num">1.12%</span>, N = 10⁴ → <span class="num">1.001%</span>, N = 10⁵ → <span class="num">1.000%</span>. Reporting a spatial average with a 1/√N error bar is wrong by construction. This hard floor is exact for the calibration term, which is common-mode by construction (one shared parameter vector, ρ = 1); systematics with finite spatial correlation soften to σ²_sys(1+(N−1)ρ)/N and partially average down. <a class="ev rev" href="#rr1-11">corrected·r1</a></p>
     </div>
+    </details>
+
     <div class="regime calm">
       <h3>Consistency tests — each with a predicted value, not a hope</h3>
       <div class="scroller">
@@ -632,11 +729,13 @@
     <h2>The resolution function — what it physically is</h2>
     <p class="tabstatus">This section was missing from the first pass — resolution appeared only as a chain step and a calibration target, a black box inside a whitebox. Closing that gap produced the corrected temperature model above.</p>
 
-    <div class="regime">
+    <details class="walk key"><summary>The moderator emission delay is exactly extra flight path — why fitted L ≠ surveyed L (≈13 cm at 3 µs)</summary>
+<div class="regime">
       <h3>⚑ The moderator emission delay <i>is</i> an extra flight path</h3>
       <p>A neutron detected at energy E was born fast and had to slow down inside the moderator before leaking out. The slowing-down time to reach E scales as τ_mod = C/√E. Converting to an equivalent path: ΔL = v·τ_mod = √(2E/m)·C/√E = C√(2/m) — <b>energy-independent</b>.</p>
       <p>A 1/√E emission delay is therefore <b>exactly</b> a constant flight-path offset. This is the physical origin of the exact L-degeneracy in the calibration section, and it is large: a 3 µs delay at 10 eV corresponds to <span class="num">13.1 cm</span> of apparent extra path — <span class="num">0.53%</span> of a 25 m flight path (1 µs → 4.4 cm; 10 µs → 43.7 cm). Since a 0.3% L error is already catastrophic for the fit, the moderator delay is the dominant reason the fitted L must differ from the surveyed distance — and why it is meaningless to "check" one against the other.</p>
     </div>
+    </details>
 
     <div class="regime calm">
       <h3>Components, and how each scales</h3>
@@ -656,19 +755,24 @@
       <p><b>Net shape of the resolution curve:</b> moderator-dominated ⟹ ΔE/E approximately constant across 5–200 eV (≈1.05×10⁻² for a 3 µs @10 eV moderator), with a slow √E rise only at higher energy. This is the fact that corrected the temperature model: relative resolution does not grow across the band.</p>
     </div>
 
-    <div class="regime">
+    <details class="walk"><summary>Admissible kernels are non-negative, normalised, causal, anchored — a Gaussian fails causality; Ikeda–Carpenter is causal by construction</summary>
+<div class="regime">
       <h3>Constraints any admissible kernel must satisfy — and why a Gaussian fails</h3>
       <p>An admissible kernel is <b>non-negative</b> (a probability density over arrival times), <b>normalised</b> (∫K dt = 1 — it redistributes neutrons in time, never creates or destroys them), <b>causal</b> (K = 0 before emission: nothing arrives before it left), and <b>position-anchored</b> (one convention, mode or mean at zero, must be fixed, or the kernel's location fights t₀ and L).</p>
       <p>A <b>Gaussian violates causality</b>: it has support at negative times. The leaked fraction is Φ(−μ/σ) — <span class="num">15.9%</span> at μ = σ, <span class="num">2.3%</span> at 2σ, <span class="num">0.14%</span> at 3σ. A Gaussian is only defensible where the mean delay exceeds ~3–4σ. The moderator term is both wide and skewed — precisely the regime where a symmetric Gaussian is least valid. <b>Ikeda–Carpenter is causal by construction</b> (its t²e^(−αt) slowing-down term vanishes at t = 0) — the physics reason to prefer it over a Gaussian, not merely a better fit.</p>
       <p><b>Ikeda–Carpenter parameters, physically:</b> α = slowing-down decay rate (energy-dependent, faster neutrons escape sooner); β = storage/thermal decay rate; R = the fraction emitted through the storage channel. A tabulated (UDR) kernel is the alternative — it captures real geometry, filters and collimation no analytic form knows, but it is only as good as its sampling and does not extrapolate. Physics fixes the <i>family</i> (positive, normalised, causal, moderator-skewed); the choice within it is a modelling decision.</p>
     </div>
+    </details>
 
-    <div class="regime calm">
+    <details class="walk"><summary>Fit shapes, never centroids — only centroid drift outside span{1, E<sup>−1/2</sup>} tilts the fit</summary>
+<div class="regime calm">
       <h3>Why asymmetry biases the energy scale — "fit shapes, not centroids" is physics</h3>
       <p>The moderator tail runs to late times, displacing every observed dip centroid; left uncorrected, a mean-vs-mode offset <i>d</i> shifts apparent energy by −2d/t: for d = 2 µs that is <span class="num">−0.50%</span> at 5 eV, <span class="num">−3.13%</span> at 200 eV. Inside the calibration fit, however, these shifts do not tilt anything by themselves: a <b>constant</b> offset is absorbed exactly into t₀ (verified: refit residual 10⁻¹³ µs, L untouched) and an E<sup>−1/2</sup> component exactly into L — <b>only the part of the kernel's centroid drift outside span{1, E<sup>−1/2</sup>} survives projection and genuinely distorts the fit</b>. <a class="ev rev" href="#rr1-12">corrected·r1</a></p>
       <p>Why "fit modelled dip shapes, never raw centroids" still stands: (i) the Ikeda–Carpenter asymmetry drifts with energy in exactly such a non-absorbable way; (ii) opacity displaces each line's centroid by a depth-dependent amount — not a timing function at all, so it corrupts a centroid fit line-by-line; (iii) silently absorbed offsets redefine L and t₀ away from the declared kernel anchor, breaking the calibration transfer to sample fits with different line sets. Shape fitting models all three by construction. A centroid scheme is self-consistent only if the kernel <i>mean</i> is the declared anchor, used identically everywhere — fragile, and still opacity-biased.</p>
     </div>
-  </section>
+    </details>
+
+      </section>
 
   <!-- ===================== PIPELINES ===================== -->
   <section class="panel" data-panel="pipelines" role="tabpanel" hidden>
@@ -710,7 +814,7 @@
         <div id="freerows"></div>
         <div class="phead" id="priorhead" tabindex="0" data-tip="These parameters are also in the joint fit, held by tight priors from the calibration posterior (with its L–t₀ correlation). Their uncertainty is counted in the answer — never hard-pinned.">tight priors ← calibration posterior</div>
         <div id="priorrows"></div>
-        <div class="fitrow"><button type="button" id="btn-fit">fit this pixel</button><button type="button" id="btn-map">fit every pixel</button><span class="chi" id="v-chi"></span><span class="ihint" tabindex="0" data-tip="Demo reductions: n·d in units of peak optical depth at the 4.3 eV line (real deliverable: atoms/barn); K(t|E) rendered as a constant-relative-width blur; 13×9 pixel grid (VENUS is 512×512); one frame for in-situ.">i</span></div>
+        <div class="fitrow"><button type="button" id="btn-fit">fit this pixel</button><button type="button" id="btn-map">fit every pixel</button><span class="chi" id="v-chi"></span><span class="ihint" tabindex="0" data-tip="Demo reductions: n·d in units of peak optical depth at the 4.3 eV line (real deliverable: atoms/barn); K(t|E) rendered as a constant-relative-width blur (θ_res = ΔE/E); 13×9 pixel grid (VENUS is 512×512); one frame for in-situ.">i</span></div>
       </div>
     </div>
 
@@ -769,6 +873,7 @@
   <section class="panel" data-panel="data" role="tabpanel" hidden>
     <p class="pipeintro"><b>What exists between the instrument and a result</b> — eleven data classes: who makes each, who consumes it <span class="ihint" tabindex="0" data-tip="Derived from the pipeline contract (stages 1 Qualification · 2 Reduction · 3 Model/likelihood · 4 Fit instances · 5 Results/QC): every input a stage names has a home here and no class is orphaned — swept twice: a mechanical noun map, then an adversarial cross-read whose gaps are all folded. The calibrant decision below completes this tab.">i</span></p>
     <p class="tabstatus">Taxonomy finalized against the round-1-reviewed pipeline contract; completeness swept twice — a mechanical noun map, then a round-2 adversarial cross-read (15 findings: homeless items + two contract contradictions, all folded — <a href="#rr3-1">review record</a>). Calibrant evaluation below was Phase-1 work, adversarially reviewed.</p>
+    <p class="capnote" style="margin:0 0 .4rem">stages: 1 qualification · 2 reduction · 3 model/likelihood · 4 fits (4a calibration) · 5 results/QC</p>
     <div class="scroller">
       <table class="idtbl">
         <thead><tr><th>Class</th><th>What it is</th><th>Produced by</th><th>Consumed by</th></tr></thead>
@@ -801,11 +906,14 @@
         </tbody>
       </table>
     </div>
-    <p class="tblnote"><b>The rule:</b> a result must be reproducible bit-for-bit from its provenance block alone, and a calibration transfer must be rejectable on configuration mismatch without human judgement.</p>
+    <p class="tblnote"><b>The rule:</b> a result must be reproducible bit-for-bit from its provenance block alone, and a calibration transfer must be rejectable on configuration mismatch without human judgement. The block is one shared object: reduction attaches it to every reduced spectrum; results inherit and extend it.</p>
 
     <h2>Calibrant foil selection — Ta / W / Au / Ag</h2>
+    <p class="pipeintro">Ranked against the calibrant's <b>two jobs</b> — <b>A:</b> the energy scale (L, t<sub>0</sub>) · <b>B:</b> the resolution function θ_res(E) <span class="ihint" tabindex="0" data-tip="Job A, the energy scale, wants many accurately-known, well-separated resonance positions spanning the widest E^(−1/2) range — multi-isotope is harmless. Job B, the resolution function, wants the instrumental width not swamped by Doppler + natural width, sampled across the band at unsaturated depth on isolated lines — which favours heavy nuclei (Doppler width ∝ 1/√A). The jobs favour different foils, so the cleanest resonance and the most preferred foil need not be the same material.">i</span></p>
+    <div class="dev-only">
     <p class="step-body" style="margin-bottom:.8rem">A calibrant serves <b>two distinct jobs</b>, and they favour different foils — which is why "cleanest resonance" and "most preferred" need not be the same material.</p>
     <p style="margin-bottom:1rem"><b>Job A — the energy scale (L, t<sub>0</sub>)</b> — wants many accurately-known, well-separated resonance <b>positions</b> spanning the widest E<sup>−1/2</sup> range; multi-isotope is harmless, since a position is a position. <b>Job B — the resolution function θ_res(E)</b> — wants the <b>instrumental</b> width not swamped by intrinsic Doppler + natural width, sampled across the band, at unsaturated optical depth, on isolated lines; that favours heavy nuclei (<span style="white-space:nowrap">Δ_D ∝ 1/√A</span>).</p>
+    </div>
 
     <div class="scroller">
       <table class="idtbl">
@@ -841,24 +949,26 @@
 
     <div class="regime calm" style="margin-top:1rem">
       <h3>Recommendation — two foils, each in two thicknesses</h3>
-      <p><b>W (or Ta) as the primary multi-line calibrant</b> for θ_res(E) coverage, <b>plus Au as an independent energy-scale anchor</b> and cross-check. They optimise different jobs, and Au's coverage gap stops mattering once it is not carrying the kernel.</p>
-      <p><b>Two thicknesses of the same foil</b> <span class="ev ver">verified</span> — "a linear combination of measurements with two thicknesses… yields better energy resolution than either foil alone… no penalty in counting statistics." This resolves the saturation problem directly: a thin (~10 µm) foil keeps τ₀ ≲ 1 for resolution work while a thicker one supplies deliberately black lines for background/wing diagnosis. All four candidates saturate (τ₀ &gt; 1) by roughly 25–50 µm at their strong low-energy lines, so a single intermediate thickness cannot serve both.</p>
-      <p><b>Fit modelled dip shapes, never raw centroids</b> <span class="ev ver">verified</span> — practice is a linear t vs E<sup>−1/2</sup> fit for a first L, then refinement by χ² against evaluated data.</p>
+      <p><b>W (or Ta) primary</b> for θ_res(E) coverage · <b>Au as the independent energy-scale&#160;anchor</b>&#160;<span class="ihint" tabindex="0" data-tip="They optimise different jobs (B and A), and Au's kernel-coverage gap stops mattering once it is not carrying the resolution function.">i</span> · <b>thin + thick of&#160;each</b>&#160;<span class="ev ver">verified</span>&#160;<span class="ihint" tabindex="0" data-tip="A linear combination of two thicknesses yields better energy resolution than either foil alone, at no counting-statistics penalty — the thin (~10 µm) foil keeps τ₀ ≲ 1 for resolution work; the thick one supplies deliberately black lines for background/wing diagnosis. All four candidates saturate by ~25–50 µm at their strong low-energy lines, so one intermediate thickness cannot serve both.">i</span> · <b>fit modelled dip shapes, never raw&#160;centroids</b>&#160;<span class="ev ver">verified</span>&#160;<span class="ihint" tabindex="0" data-tip="Practice: a linear t vs E^(−1/2) fit for a first L, then refinement by χ² against evaluated data.">i</span></p>
     </div>
 
     <div class="regime" style="margin-top:.2rem">
       <h3>Why W is preferred — physics-grounded rationale (adopted)</h3>
       <p>The rationale rests on solid nuclear physics: the even-even isotopes <b>W-182/184/186 have spin I = 0</b>, so each contributes only a single s-wave spin group (J = ½) and therefore a sparse, widely-spaced ladder. Several sparse ladders superimposed give band coverage with isolated, non-blended lines — whereas one dense ladder (Ta, I = 7/2) crowds and blends. Combined with refractory robustness and short-lived activation, this explains the preference. <span class="ev ver">physics-grounded</span> <span class="ev unv">not literature-attributed</span></p>
+      <div class="dev-only">
       <p>Adopted as the working justification by project decision. What this is and is not: the underlying nuclear physics is certain (even-even nuclei always have I = 0 ground state, hence a single s-wave spin group), but no published source was found that states this as the reason practitioners choose W. It is a derived explanation, not a cited one.</p>
       <p>Corroborating but not decisive: a dedicated study exists on <i>Neutron Doppler broadening studies of tantalum and tungsten metal</i> — Ta and W are the canonical pair for this class of work.</p>
+      </div>
     </div>
 
+    <div class="dev-only">
     <p class="subhead">Open items on the foil choice</p>
     <ul class="openlist">
       <li><b>Does Au-197 really have a 4.9 → ~46.7 eV gap?</b> The Au ranking depends on it more than on anything else. The GELINA study of ¹⁹⁷Au+n below 200 eV is the authoritative source.</li>
       <li><b>Activation half-lives</b> — quoted from general knowledge, not verified in session; they carry real operational weight (Ta-182 114 d vs W-187 24 h).</li>
       <li><s>The actual reason for W's preference</s> — <b>closed by project decision:</b> the physics-grounded rationale above is adopted; no literature attribution is being sought.</li>
     </ul>
+    </div>
     <p class="srcline">Sources — <a href="https://arxiv.org/pdf/1909.11120">NRTA feasibility study</a> (flight-path calibration by linear fit; Ta as standard) · <a href="https://arxiv.org/pdf/2012.03937">Compact D-T NRTA</a> (W 4.1/7.7 eV lines) · <a href="https://inis.iaea.org/records/h3s1p-v9y40">Au-197 4.90 eV parameters</a> · <a href="https://publications.jrc.ec.europa.eu/repository/handle/JRC56557">Resonance parameters for ¹⁹⁷Au+n below 200 eV (GELINA)</a> · <a href="https://www.sciencedirect.com/science/article/abs/pii/S0168583X02004809">Doppler broadening studies of Ta and W metal</a> · <a href="https://www.sciencedirect.com/science/article/abs/pii/0167508782902769">Black-and-white filter method for background</a> · <a href="https://www.sciencedirect.com/science/article/abs/pii/0167508783904246">Two-thickness resolution method</a></p>
   </section>
 
@@ -1064,6 +1174,24 @@
     setView(savedView);
     window.addEventListener("beforeprint", function () {
       document.querySelectorAll("details").forEach(function (d) { d.open = true; });
+    });
+
+    // physics transformation chain: one stage panel at a time + the strip that assembles the model
+    var cbs = Array.prototype.slice.call(document.querySelectorAll(".chainbar .cstep"));
+    cbs.forEach(function (b) {
+      b.addEventListener("click", function () {
+        cbs.forEach(function (x) { x.setAttribute("aria-pressed", String(x === b)); });
+        document.querySelectorAll(".stagepanel").forEach(function (pn) {
+          pn.hidden = pn.getAttribute("data-stage") !== b.getAttribute("data-stage");
+        });
+        if (window.__drawStrip) window.__drawStrip(+b.getAttribute("data-stage"));
+      });
+    });
+    document.querySelectorAll(".livelink").forEach(function (a) {
+      a.addEventListener("click", function () {
+        var btn = document.getElementById(a.getAttribute("data-preset"));
+        if (btn) setTimeout(function () { btn.click(); }, 60);
+      });
     });
 
     /* ============================================================
@@ -1717,5 +1845,171 @@
       b.addEventListener("click", function () { if (!fitting) setMode(b.getAttribute("data-mode")); });
     });
     setMode("density");
+
+    /* ---------- the chain strip: the forward model, assembled stage by stage ---------- */
+    (function () {
+      var svgS = document.getElementById("chainstrip");
+      if (!svgS) return;
+      var SD = { nd: 1.6, T: 600 };
+      var SAX = { x0: 60, x1: 860, yb: 138, yt: 40 };
+      function elS(t, a, txt) {
+        var n = document.createElementNS(NS, t);
+        for (var k in a) n.setAttribute(k, a[k]);
+        svgS.appendChild(n);
+        if (txt != null) n.textContent = txt;
+        return n;
+      }
+      elS("line", { x1: SAX.x0, y1: SAX.yt - 6, x2: SAX.x0, y2: SAX.yb, "class": "lab-axis" });
+      elS("line", { x1: SAX.x0, y1: SAX.yb, x2: SAX.x1 + 8, y2: SAX.yb, "class": "lab-axis" });
+      var capS = elS("text", { x: SAX.x0, y: 20, "class": "lab-cap" }, "");
+      var axS = elS("text", { x: SAX.x1, y: SAX.yb + 18, "text-anchor": "end", "class": "lab-cap" }, "");
+      var curS = elS("path", { "class": "lab-curve" });
+      var stageCache = {};
+      function seriesFor(k) {
+        if (stageCache[k]) return stageCache[k];
+        var i, out = new Array(N), pk = sigPeak(SD.T), pk0 = sigPeak(160);
+        if (k === 1) for (i = 0; i < N; i++) out[i] = sigmaU(E0[i], 160) / pk0;
+        else if (k === 2) for (i = 0; i < N; i++) out[i] = sigmaU(E0[i], SD.T) / pk;
+        else if (k === 3) for (i = 0; i < N; i++) out[i] = Math.exp(-SD.nd * sigmaU(E0[i], SD.T) / pk);
+        else {
+          var m = model({ nd: SD.nd, T: SD.T, L: INSTR.L, t0: INSTR.t0, th: k >= 5 ? INSTR.th : 0.0001 });
+          if (k === 6) { out = m; }
+          else for (i = 0; i < N; i++) out[i] = m[i] / (fluxAt(E0[i]) / fmax);
+        }
+        var mx = Math.max.apply(null, out);
+        for (i = 0; i < N; i++) out[i] /= mx;
+        stageCache[k] = out;
+        return out;
+      }
+      var CAPS = {
+        1: ["bare σ(E) — sharp resonance lines (T → 0)", "energy →"],
+        2: ["Doppler-broadened σ(E; T) — temperature enters here, and only here", "energy →"],
+        3: ["transmission exp(−n·d·σ) — depth carries n·d; deep lines saturate", "energy →"],
+        4: ["the same curve, measured in time of flight — E(t; L, t₀) inside the fit", "time of flight → (energy runs the other way)"],
+        5: ["+ the instrument blur K(t|E) — dips soften and widen", "time of flight →"],
+        6: ["× flux Φ(E), + backgrounds → expected counts, the thing the fit compares", "time of flight →"],
+      };
+      window.__drawStrip = function (k) {
+        var s = seriesFor(k), d = "", i;
+        var flip = k >= 4;                              // TOF axis: long times right
+        for (i = 0; i < N; i++) {
+          var u = flip ? (tN[i] - tN[N - 1]) / (tN[0] - tN[N - 1]) : (i / (N - 1));
+          var x = SAX.x0 + u * (SAX.x1 - SAX.x0);
+          d += (d ? " L" : "M") + x.toFixed(1) + " " + (SAX.yb - s[i] * (SAX.yb - SAX.yt)).toFixed(1);
+        }
+        curS.setAttribute("d", d);
+        capS.textContent = k + " · " + CAPS[k][0];
+        axS.textContent = CAPS[k][1];
+      };
+      window.__drawStrip(1);
+    })();
+
+    /* ---------- the line lab: one resonance, live (Physics tab) ---------- */
+    (function () {
+      var svgL = document.getElementById("labsvg");
+      if (!svgL) return;
+      var ERl = 4.28, GAM = 0.057, NL = 400, EA = 3.4, EB = 5.2;
+      var GL = []; for (var i = 0; i < NL; i++) GL.push(EA + i * (EB - EA) / (NL - 1));
+      function lineSigma(E, T) {
+        var dD = Math.sqrt(4 * kB * T * ERl / A181);
+        var w = 0.55 * Math.sqrt(dD * dD + GAM * GAM);
+        var z = (E - ERl) / w;
+        return Math.exp(-0.5 * z * z);
+      }
+      function curveL(nd, T, th) {
+        var s = th * ERl / 2.355, dE = GL[1] - GL[0], R = Math.max(1, Math.ceil(3 * s / dE)), out = new Array(NL);
+        for (var i = 0; i < NL; i++) {
+          var acc = 0, ws = 0;
+          for (var k = -R; k <= R; k++) {
+            var j = i + k;
+            if (j < 0 || j >= NL) continue;
+            var g = Math.exp(-0.5 * Math.pow((GL[j] - GL[i]) / s, 2));
+            acc += g * Math.exp(-nd * lineSigma(GL[j], T)); ws += g;
+          }
+          out[i] = acc / ws;
+        }
+        return out;
+      }
+      function fwhmL(t) {
+        var dmin = Math.min.apply(null, t), half = (1 + dmin) / 2, lo = null, hi = null;
+        for (var i = 1; i < NL; i++) {
+          if (t[i - 1] > half && t[i] <= half) lo = GL[i];
+          if (t[i - 1] <= half && t[i] > half) hi = GL[i];
+        }
+        return lo != null && hi != null ? hi - lo : NaN;
+      }
+      var LAX = { x0: 64, x1: 580, yb: 250, yt: 34 };
+      function elL(t, a, txt) {
+        var n = document.createElementNS(NS, t);
+        for (var k in a) n.setAttribute(k, a[k]);
+        svgL.appendChild(n);
+        if (txt != null) n.textContent = txt;
+        return n;
+      }
+      elL("line", { x1: LAX.x0, y1: LAX.yt - 6, x2: LAX.x0, y2: LAX.yb, "class": "lab-axis" });
+      elL("line", { x1: LAX.x0, y1: LAX.yb, x2: LAX.x1 + 8, y2: LAX.yb, "class": "lab-axis" });
+      elL("line", { x1: LAX.x0, y1: LAX.yt, x2: LAX.x1 + 8, y2: LAX.yt, "class": "lab-axis", "stroke-dasharray": "3 4", opacity: .6 });
+      elL("text", { x: LAX.x0 - 8, y: LAX.yt + 4, "text-anchor": "end", "class": "lab-cap" }, "1");
+      elL("text", { x: LAX.x0 - 8, y: LAX.yb + 4, "text-anchor": "end", "class": "lab-cap" }, "0");
+      elL("text", { x: LAX.x0 + 8, y: LAX.yt + 18, "class": "lab-cap" }, "transmission");
+      elL("text", { x: LAX.x1, y: LAX.yb + 18, "text-anchor": "end", "class": "lab-cap" }, "energy (eV) — the 4.28 eV Ta-181 line");
+      var ghost = elL("path", { "class": "lab-ghost", display: "none" });
+      var mainC = elL("path", { "class": "lab-curve" });
+      var wbar = elL("line", { stroke: "var(--pipe-c)", "stroke-width": 2, display: "none" });
+      var wlab = elL("text", { "class": "lab-cap", fill: "var(--pipe-c)" });
+      function xOfL(E) { return LAX.x0 + (E - EA) / (EB - EA) * (LAX.x1 - LAX.x0); }
+      function yOfL(v) { return LAX.yb - v * (LAX.yb - LAX.yt); }
+      function pathL(t) {
+        var d = "";
+        for (var i = 0; i < NL; i++) d += (i ? " L" : "M") + xOfL(GL[i]).toFixed(1) + " " + yOfL(t[i]).toFixed(1);
+        return d;
+      }
+      var Ti = document.getElementById("lb-T"), ndi = document.getElementById("lb-nd"), thi = document.getElementById("lb-th");
+      var Tv = document.getElementById("lbv-T"), ndv = document.getElementById("lbv-nd"), thv = document.getElementById("lbv-th");
+      var readL = document.getElementById("lb-read"), noteL = document.getElementById("lb-note");
+      var naiveL = document.getElementById("lb-naive");
+      var ghostOn = false;
+      function naiveT(wMeas, th) {
+        // what a width-only thermometer reports: the thin-limit (nd = 0.3) T whose line has this FWHM
+        var lo = 150, hi = 4000;
+        if (isNaN(wMeas)) return NaN;
+        if (fwhmL(curveL(0.3, hi, th)) < wMeas) return Infinity;
+        for (var it = 0; it < 32; it++) {
+          var mid = 0.5 * (lo + hi);
+          if (fwhmL(curveL(0.3, mid, th)) < wMeas) lo = mid; else hi = mid;
+        }
+        return 0.5 * (lo + hi);
+      }
+      function drawL() {
+        var T = +Ti.value, nd = +ndi.value, th = +thi.value;
+        Tv.textContent = Math.round(T) + " K"; ndv.textContent = nd.toFixed(2); thv.textContent = (100 * th).toFixed(2) + " %";
+        var t = curveL(nd, T, th);
+        mainC.setAttribute("d", pathL(t));
+        var w = fwhmL(t), dmin = Math.min.apply(null, t), half = (1 + dmin) / 2;
+        readL.textContent = "FWHM " + (isNaN(w) ? "—" : (1000 * w).toFixed(0) + " meV") + " · dip depth " + (100 * (1 - dmin)).toFixed(0) + " %";
+        var Ta = naiveT(w, th);
+        if (!isNaN(Ta) && isFinite(Ta) && Ta > 1.15 * T) {
+          naiveL.textContent = "a width-only thermometer reads ≈ " + Math.round(Ta) + " K — opacity masquerading as heat";
+        } else naiveL.textContent = "";
+        if (!isNaN(w)) {
+          var yh = yOfL(half);
+          wbar.setAttribute("x1", xOfL(ERl - w / 2)); wbar.setAttribute("x2", xOfL(ERl + w / 2));
+          wbar.setAttribute("y1", yh); wbar.setAttribute("y2", yh); wbar.setAttribute("display", "inline");
+          wlab.setAttribute("x", xOfL(ERl + w / 2) + 8); wlab.setAttribute("y", yh + 4); wlab.textContent = "FWHM";
+        } else { wbar.setAttribute("display", "none"); wlab.textContent = ""; }
+        if (ghostOn) { ghost.setAttribute("display", "inline"); ghost.setAttribute("d", pathL(curveL(0.8, 300, 0.0164))); }
+        else ghost.setAttribute("display", "none");
+      }
+      function setL(T, nd, th) { Ti.value = T; ndi.value = nd; thi.value = th; }
+      [Ti, ndi, thi].forEach(function (x) { x.addEventListener("input", function () { ghostOn = false; noteL.textContent = ""; drawL(); }); });
+      document.getElementById("lb-heat").addEventListener("click", function () { ghostOn = false; setL(900, 0.5, 0.0105);
+        noteL.textContent = "T 300 → 900 K at fixed n·d — the dip widens +32 %. Doppler broadening (stage 2)."; drawL(); });
+      document.getElementById("lb-thick").addEventListener("click", function () { ghostOn = false; setL(300, 3, 0.0105);
+        noteL.textContent = "n·d 0.3 → 3 at the SAME 300 K — the width grows the same +32 %. Width is not a thermometer; n·d and T fit jointly."; drawL(); });
+      document.getElementById("lb-look").addEventListener("click", function () { ghostOn = true; setL(900, 0.8, 0.0105);
+        noteL.textContent = "Solid: 900 K, θ 1.05 %. Dashed: 300 K, θ 1.64 % — nearly the same line. Resolution comes from calibration, never the sample fit."; drawL(); });
+      document.getElementById("lb-reset").addEventListener("click", function () { ghostOn = false; setL(300, 0.5, 0.0105); noteL.textContent = ""; drawL(); });
+      drawL();
+    })();
   })();
 </script>
