@@ -162,6 +162,16 @@
   @media (max-width: 40rem) { .ctl { position: static; padding: .6rem .9rem .8rem; } }
 
   /* the narrative */
+  .modeslead, .modesnote { font-size: .92rem; line-height: 1.62; color: var(--ink-muted); max-width: 74ch; margin: 0 0 .9rem; }
+  .modeslead b, .modesnote b { color: var(--ink); font-weight: 600; }
+  details.walk { margin: .2rem 0 1rem; border: 1px solid var(--hairline); border-radius: 10px; background: var(--surface); }
+  details.walk summary { cursor: pointer; padding: .6rem .9rem; font-size: .88rem; font-weight: 600; color: var(--ink); list-style: none; }
+  details.walk summary::-webkit-details-marker { display: none; }
+  details.walk summary::before { content: "▸ "; color: var(--pipe-c); }
+  details.walk[open] summary::before { content: "▾ "; }
+  details.walk .story { padding: 0 1rem .5rem; }
+  .scntip { position: absolute; max-width: 36ch; background: var(--plot); border: 1px solid var(--pipe-c); color: #cdd9e5; font-family: var(--sans); font-size: .78rem; line-height: 1.5; padding: .5rem .75rem; border-radius: 8px; z-index: 3; box-shadow: 0 4px 18px rgba(0,0,0,.4); pointer-events: none; }
+  .scn-anchor-hit { cursor: pointer; }
   .story { max-width: 72ch; }
   .story p { font-size: .92rem; line-height: 1.66; color: var(--ink-muted); margin: 0 0 .85rem; }
   .story p b { color: var(--ink); font-weight: 600; }
@@ -634,6 +644,20 @@
     <p class="lede"><b>This is what NEREIDS does.</b> The scene below is not an illustration — it is the pipeline itself, running in this page on the same Ta-181 physics the Physics tab specifies. Drag the two science parameters and watch the predicted spectrum respond; press <i>fit</i> and watch the pipeline solve a pixel; fit the whole field and the result map appears. Reading time to the first idea: zero.</p>
     <p class="tabstatus">The interactive model here is the document's own forward model (resonances → Doppler → Beer-Lambert → flux), reduced to two free parameters for demonstration; the engineering contract for each stage is in the developer layer below. Design and content history: <a href="#" data-goto="record">review record</a>.</p>
 
+    <p class="modeslead"><b>One fitting engine, four modes</b> — this table is the whole tab in one view. Every parameter is always fitted <b>jointly</b>; what distinguishes a mode is which parameters run free and which carry a tight prior. A tight prior is not a pin: the parameter’s own uncertainty still flows into the answer — it just cannot absorb freedom the data should assign elsewhere.</p>
+    <div class="scroller">
+      <table class="idtbl">
+        <thead><tr><th>Run as</th><th>You bring</th><th>The fit solves</th><th>Tight prior (uncertainty counted)</th><th>You receive</th></tr></thead>
+        <tbody>
+          <tr><td class="p">Calibration</td><td class="feat">a reference foil whose n·d and T are tightly known</td><td class="fr">L, t₀, θ_res</td><td class="req">the foil’s n·d, T · nuclear data (+ covariance)</td><td class="feat">the instrument posterior every other run consumes</td></tr>
+          <tr><td class="p">Density</td><td class="feat">known isotope + temperature</td><td class="fr">n·d per pixel</td><td class="req">L, t₀, θ_res (calibration posterior) · T</td><td class="feat">n·d map + uncertainty + residuals</td></tr>
+          <tr><td class="p">Temperature</td><td class="feat">known areal density</td><td class="fr">T_eff per pixel</td><td class="req">L, t₀, θ_res · n·d</td><td class="feat">temperature map + uncertainty + residuals</td></tr>
+          <tr><td class="p">In-situ</td><td class="feat">a time series, neither known</td><td class="fr">shared n·d₀ + per-frame T</td><td class="req">L, t₀, θ_res · the expansion link n·d(T)</td><td class="feat">n·d and T trajectories with joint uncertainty</td></tr>
+        </tbody>
+      </table>
+    </div>
+    <p class="modesnote">Where the instrument numbers come from: run the engine first in <b>calibration mode</b> on the reference foil — with n·d and T tightly known, the fit solves the instrument instead: L, t₀, θ_res, emitted as a <b>joint posterior with its covariance</b>. Every other mode consumes that posterior as its tight prior (the dashed arrow in the scene below). How tight a prior may be — and when a parameter may be treated as effectively fixed — is governed per case by the marginalization criterion on the Physics tab.</p>
+
     <div class="scene" id="scene">
       <svg id="scn" viewBox="0 0 920 1160" role="img" aria-label="The NEREIDS pipeline operating: a neutron pulse disperses along the flight path, is attenuated by the sample, accumulates into a time-of-flight spectrum with resonance dips; a forward model with five parameters is fitted to that spectrum, yielding a joint posterior; the fit repeats per pixel to produce the areal-density map with uncertainties.">
         <defs>
@@ -651,6 +675,7 @@
         <!-- ================= region D: the map ================= -->
         <g id="rgD"></g>
       </svg>
+      <div class="scntip" id="scntip" role="tooltip" hidden></div>
       <div class="ctl" id="ctl-dials" style="left:2.5%; top:53.2%; width:37%">
         <label>n·d <input type="range" id="in-nd" min="0.2" max="3" step="0.01" value="0.45"><span class="v" id="v-nd">0.70</span></label>
         <label>T <input type="range" id="in-T" min="200" max="1200" step="5" value="1100"><span class="v" id="v-T">900 K</span></label>
@@ -659,26 +684,17 @@
       </div>
     </div>
 
-    <div class="story">
-      <p><span class="mk">1</span> Every VENUS pulse releases one burst of neutrons. Over 25 m of flight, <b>time sorts them by energy</b> — fast neutrons land early, slow ones late — so the detector's time axis <i>is</i> an energy axis (drawn above: the pulse spreading as it flies). On the way, the sample absorbs neutrons at its nuclei's resonance energies. Every surviving neutron is one count in (pixel, time). Runs are vetted before anything downstream may consume them; nothing else touches the raw events.</p>
-      <p><span class="mk">2</span> Counting many pulses turns the event stream into <b>one spectrum per pixel</b> — the curve in the scene, with dark notches where the sample's resonances swallowed the beam. The notches are the information: their <b>depth and area</b> encode how much material (areal density n·d), their <b>shape</b> encodes its temperature (Doppler broadening), against the open-beam reference measured without the sample (the pale curve). The spectrum stays on its native time axis; energy is computed from time inside every fit, never baked into the data.</p>
-      <p><span class="mk">3</span> NEREIDS never manipulates that spectrum into an answer. Instead it <b>predicts</b> it: resonance physics → Doppler broadening at temperature T → attenuation by n·d → the flight-path relation → the instrument's timing blur → expected counts, bin by bin. That prediction is the smooth curve laid over the data, and it is fully determined by five parameters — the two science dials (drag them: the curve responds the way real physics responds) and three instrument parameters shown locked: <b>flight path L, time offset t₀, resolution shape θ_res</b>.</p>
-      <p><span class="mk">4</span> Fitting means <b>turning the dials until prediction matches measurement</b> — press <i>fit</i> and watch χ² fall (χ² is the likelihood's core; combined with the instrument prior it yields the posterior). What comes out is not two numbers but the <b>joint posterior</b> (the ellipse): n·d and T are partly interchangeable in a single spectrum, and the tilt of the ellipse is that honest coupling, carried — never hidden — into every downstream use. The locked dials carry their own uncertainty in exactly the same way: they were fitted once, by the <b>calibration</b> run.</p>
-      <p><span class="mk">5</span> The same fit runs in every pixel — press <i>fit every pixel</i> — and the field of posteriors becomes the deliverable: the <b>areal-density map, its uncertainty map, and the residuals</b> that prove (or indict) the physics in each pixel. Click any pixel to load its spectrum above: the whole pipeline is that one loop, repeated.</p>
-      <p class="storycal"><b>Where do the locked dials come from?</b> Calibration is <b>the same engine with the locks exchanged</b>: a reference foil whose n·d and T are already known is measured, so the fit solves for L, t₀ and θ_res instead. The posterior it emits is what locks them here — the dashed arrow in the scene. Every analysis is this one model; only the lock pattern changes:</p>
-    </div>
+    <details class="walk">
+      <summary>The full walkthrough — the five numbered stops, in plain words</summary>
+      <div class="story">
+      <p><span class="mk">1</span> Every pulse releases one burst of neutrons. Over the 25 m flight, time sorts them by energy — fast ones land early, slow ones late — so arrival time doubles as an energy axis. On the way through the sample, its nuclei absorb neutrons at their resonance energies. Each surviving neutron is one count at (pixel, time). Before any run is used it is checked; incomplete or faulty runs stop here.</p>
+      <p><span class="mk">2</span> Adding up thousands of pulses gives each pixel a spectrum: a smooth curve with dark notches at the resonance energies. The notches are the signal — how much beam they remove says how much material is in the way (areal density n·d), and their shape says how hot it is (thermal motion broadens them). The pale curve is the reference beam measured with no sample.</p>
+      <p><span class="mk">3</span> The analysis never works backward from the data. It predicts the full spectrum from physics — resonances, thermal broadening at temperature T, attenuation by n·d, the flight-time relation, the instrument’s timing blur — and compares prediction with measurement, count by count. The strip under the spectrum shows what is left over; flat noise means the physics accounts for everything.</p>
+      <p><span class="mk">4</span> Fitting adjusts parameters until the prediction matches. <b>All five parameters are fitted together — nothing is pinned.</b> The two science parameters run free; the three instrument parameters (flight path L, time offset t₀, timing-blur shape θ_res) enter with <b>tight priors taken from the calibration measurement</b>, so their uncertainty is counted in the result without adding freedom the data cannot support. The answer is the joint posterior — the ellipse — and its tilt is the honest statement that density and temperature partly mimic each other in a single spectrum.</p>
+      <p><span class="mk">5</span> The same fit runs in every pixel, and that field of fits is the deliverable: the density map, its uncertainty map, and per-pixel residuals. Click any pixel to load its spectrum — the whole pipeline is that one loop, repeated.</p>
+      </div>
+    </details>
 
-    <div class="scroller">
-      <table class="idtbl">
-        <thead><tr><th>Run as</th><th>You bring</th><th>The fit solves</th><th>Held / prior</th><th>You receive</th></tr></thead>
-        <tbody>
-          <tr><td class="p">Calibration</td><td class="feat">a known reference foil (n·d, T known)</td><td class="fr">L, t₀, θ_res</td><td class="req">nuclear data (+ covariance)</td><td class="feat">the instrument posterior every other run consumes</td></tr>
-          <tr><td class="p">Density</td><td class="feat">known isotope + temperature</td><td class="fr">n·d per pixel</td><td class="req">instrument (calibration prior) · T (prior)</td><td class="feat">n·d map + uncertainty + residuals</td></tr>
-          <tr><td class="p">Temperature</td><td class="feat">known areal density</td><td class="fr">T_eff per pixel</td><td class="req">instrument · n·d (prior)</td><td class="feat">temperature map + uncertainty + residuals</td></tr>
-          <tr><td class="p">In-situ</td><td class="feat">a time series, neither known</td><td class="fr">shared n·d₀ + per-frame T</td><td class="req">instrument · expansion link n·d(T)</td><td class="feat">n·d and T trajectories with joint uncertainty</td></tr>
-        </tbody>
-      </table>
-    </div>
     <p class="capnote" style="margin-top:.5rem">Spatially, each mode runs on a summed region of interest or per pixel (as in the scene); 3-D tomography is a different inverse problem and is deferred — see the Physics tab.</p>
 
     <div class="dev-only">
@@ -693,7 +709,7 @@
       <details class="contract" id="c3"><summary>3 · Forward model + likelihood — one invocation <a class="ev rev" href="#rr2-9">corrected·r1</a></summary>
         <p>σ(E; T_eff) is assembled per isotope with the evaluation's declared resolved-resonance formalism (ENDF File 2: RM / RML / MLBW as given — never an assumed Reich-Moore), the full parameter set, File-3 background where present, boundary rules honoured; isotope contributions sum in the exponent; Doppler broadening at T_eff with the lattice-model family declared. Nuclear covariance is carried under an explicit failure policy: availability checked, non-PSD repaired and disclosed, missing covariance → declared default or rejection, one shared uncertainty across all fits, model discrepancy its own term. <a class="ev rev" href="#rr2-10">corrected·r1</a> The kernel K(t|E) acts on expected counts (Φ·ε·T), position-anchored; every non-Beer-Lambert contribution (container attenuation, scatter-in, multiple scattering, PSF mixing, self-shielding) is modelled, bounded with a stated magnitude, or measured. <a class="ev rev" href="#rr2-8">corrected·r1</a> Objectives: Poisson/KL deviance with a calibrated GOF reference (D/(n−k)→1 only asymptotically; per-bin E[D] ≈ 1.15 at λ=1) <a class="ev rev" href="#rr2-23">corrected·r1</a>; the transmission arm uses Pearson-weighted Gaussian χ², never Neyman. The identifiability screen is layered — design time, per configuration, per pixel class on the actual data, post-fit — fails loudly, and never converts non-identifiability into a hard pin: pinning is admissible only under the marginalization criterion. <a class="ev rev" href="#rr2-14">corrected·r1</a> <a class="ev rev" href="#rr2-15">corrected·r1</a></p>
       </details>
-      <details class="contract" id="c4"><summary>4 · Fit instances — four lock patterns, one engine <a class="ev rev" href="#rr2-12">corrected·r1</a></summary>
+      <details class="contract" id="c4"><summary>4 · Fit instances — four prior patterns, one engine <a class="ev rev" href="#rr2-12">corrected·r1</a></summary>
         <p><b>Calibration</b> selects isolated resonances spanning the band at a range of optical depths, reduces with nominal axis parameters, predicts the known σ(E; T_eff) with ENDF covariance carried, and jointly fits {L, t₀, θ_res} + nuisances against modelled dip shapes under an explicit kernel anchor — never centroids, never a sequential position/width split. It emits (θ̂, Σ_cal) with off-diagonals — or samples where non-Gaussian — plus kernel form, anchor, validity range and its full conditioning set. <a class="ev rev" href="#rr2-11">corrected·r1</a> Transfer is enforced by a compatibility gate (configuration hashes: moderator condition, thresholds/HV, rate regime, chopper, geometry, epoch; drift bounded by bracketing references and control charts; on mismatch reject or attach an expanded drift model), and validated by holdout — held-out resonances, thicknesses or repeat runs are predicted, not fitted. <a class="ev rev" href="#rr2-13">corrected·r1</a>
         <b>Density</b> frees (n·d)ᵢ + nuisances with T under a prior (pinned only by the marginalization criterion; τ₀ ≈ 2.2 is the idealized thickness optimum). <b>Temperature</b> frees T_eff with n·d under a prior; resonance sets are ranked by expected information after marginalization <a class="ev rev" href="#rr2-16">corrected·r1</a>; the lattice-model family is declared and its uncertainty propagated <a class="ev rev" href="#rr2-17">corrected·r1</a>. <b>In-situ</b> declares its sharing structure as part of the experiment definition — global reference n·d₀ under the integrated expansion link n·dⱼ = n·d₀·exp(−2∫α(T)dT) <a class="ev rev" href="#rr2-21">corrected·r1</a>, per-frame T, and the time-dependent instrument and beam terms (a global fit does not protect against drift it does not model) <a class="ev rev" href="#rr2-22">corrected·r1</a> — then fits the series jointly.</p>
       </details>
@@ -1100,12 +1116,37 @@
     el("text", { x: 742, y: 78, "class": "scn-cap" }, A, "detector —");
     el("text", { x: 742, y: 93, "class": "scn-cap" }, A, "one count per");
     el("text", { x: 742, y: 108, "class": "scn-cap" }, A, "neutron: (pixel, t)");
-    el("path", { d: "M712 132 C 712 182, 340 170, 172 246", "class": "scn-link", "marker-end": "url(#sarr)" }, A);
-    el("text", { x: 470, y: 182, "class": "scn-cap2" }, A, "thousands of pulses accumulate ↓");
+    el("path", { d: "M712 132 C 712 168, 360 140, 150 250", "class": "scn-link", "marker-end": "url(#sarr)" }, A);
+    el("text", { x: 500, y: 206, "class": "scn-cap2" }, A, "thousands of pulses accumulate ↓");
+    var TIPS = {
+      "1": "Neutrons are counted one at a time as (pixel, arrival-time) events. Runs are checked for problems before anything downstream may use them.",
+      "2": "Summing thousands of pulses gives every pixel its own spectrum. The dark notches are the sample's nuclear resonances — their size carries density, their shape carries temperature.",
+      "3": "The software predicts the whole spectrum from physics and compares with the measurement, count by count — it never works backward from the data.",
+      "4": "All five parameters are fitted together — nothing is pinned. n·d and T run free; L, t₀ and θ_res carry tight priors measured by calibration, so their uncertainty is counted without leaking freedom.",
+      "5": "The same fit repeats in every pixel: a map of values, a map of uncertainties, and residuals that show where the physics does or does not fit."
+    };
+    var tipEl = document.getElementById("scntip");
+    var sceneEl = document.getElementById("scene");
+    function showTip(n, x, y) {
+      tipEl.textContent = TIPS[n] || "";
+      tipEl.hidden = false;
+      var fx = x / 920, fy = y / 1160;
+      if (fx > 0.55) { tipEl.style.left = "auto"; tipEl.style.right = ((1 - fx) * 100) + "%"; }
+      else { tipEl.style.right = "auto"; tipEl.style.left = (fx * 100 + 2) + "%"; }
+      tipEl.style.top = (fy * 100 + 1.6) + "%";
+    }
+    function hideTip() { tipEl.hidden = true; }
     function anchor(g, x, y, n, label) {
       el("circle", { cx: x, cy: y, r: 10, "class": "scn-anchor", "stroke-width": 1.5 }, g);
       el("text", { x: x, y: y + 4, "text-anchor": "middle", "class": "scn-anchor-t" }, g, n);
       if (label) el("text", { x: x + 16, y: y + 4, "class": "scn-cap" }, g, label);
+      var hit = el("circle", { cx: x, cy: y, r: 17, fill: "transparent", "class": "scn-anchor-hit", tabindex: 0,
+                               role: "img", "aria-label": TIPS[n] || ("stage " + n) }, g);
+      hit.addEventListener("mouseenter", function () { showTip(n, x, y); });
+      hit.addEventListener("mouseleave", hideTip);
+      hit.addEventListener("focus", function () { showTip(n, x, y); });
+      hit.addEventListener("blur", hideTip);
+      hit.addEventListener("click", function () { tipEl.hidden ? showTip(n, x, y) : hideTip(); });
     }
     anchor(A, 44, 30, "1", "the measurement — qualified before use");
 
@@ -1117,13 +1158,13 @@
     el("text", { x: 32, y: AX.yt + 30, "class": "scn-cap2" }, B, "(arb.)");
     el("text", { x: AX.x0 + 210, y: AX.yt + 20, "class": "scn-cap2" }, B, "↑ energy (eV) — the same axis as time, read in the other currency");
     el("text", { x: AX.x1 - 130, y: AX.yb + 16, "class": "scn-cap" }, B, "time of flight →");
-    anchor(B, 44, 182, "2", "one spectrum per pixel");
+    anchor(B, 44, 162, "2", "one spectrum per pixel");
     // energy markers at the resonance dips (energy runs opposite to time)
     [[4.28, "4.3 eV"], [10.36, "10.4"], [23.9, "24"], [35.9, "36 eV"]].forEach(function (r) {
       var ii = 0, best = 1e9;
       for (var i = 0; i < N; i++) { var d = Math.abs(E[i] - r[0]); if (d < best) { best = d; ii = i; } }
-      el("line", { x1: xOf(ii), y1: AX.yt - 6, x2: xOf(ii), y2: AX.yt + 2, "class": "scn-axis" }, B);
-      el("text", { x: xOf(ii), y: AX.yt - 12, "text-anchor": "middle", "class": "scn-cap2" }, B, r[1]);
+      el("line", { x1: xOf(ii), y1: AX.yt - 7, x2: xOf(ii), y2: AX.yt + 2, "class": "scn-axis" }, B);
+      el("text", { x: xOf(ii), y: AX.yt - 16, "text-anchor": "middle", "class": "scn-cap2" }, B, r[1]);
     });
         var obPath = el("path", { "class": "scn-ob" }, B);
     var obLab = el("text", { "class": "scn-cap2", opacity: 0.9 }, B, "open beam (no sample) ↘");
@@ -1142,18 +1183,20 @@
 
     // ---------- region C: parameters + fit ----------
     var C = document.getElementById("rgC");
-    anchor(C, 44, 606, "4", "fit = turn the dials until prediction matches data");
-    // locked instrument parameters
-    var locks = [["L — flight path", "25.0013 m"], ["t₀ — time offset", ""], ["θ_res — timing-blur shape", ""]];
-    locks.forEach(function (L, k) {
+    anchor(C, 44, 606, "4", "fit = adjust all five parameters together until prediction matches data");
+    // instrument parameters: also in the joint fit, with tight priors from calibration
+    el("text", { x: 424, y: 626, "class": "scn-cap" }, C, "also fitted — tight priors:");
+    var pri = [["L = 25.0013 m"], ["t₀ — time offset"], ["θ_res — timing blur"]];
+    pri.forEach(function (P, k) {
       var y = 646 + k * 26;
-      el("rect", { x: 424, y: y - 13, width: 10, height: 9, rx: 2, fill: "none", stroke: "var(--api-c)", "stroke-width": 1.3 }, C);
-      el("path", { d: "M426 " + (y - 13) + " v-4 a3 3 0 0 1 6 0 v4", fill: "none", stroke: "var(--api-c)", "stroke-width": 1.3 }, C);
-      el("text", { x: 442, y: y - 4, "class": "scn-lock" }, C, L[0] + (L[1] ? "  =  " + L[1] : ""));
+      el("line", { x1: 424, y1: y - 8, x2: 470, y2: y - 8, stroke: "var(--plot-edge)", "stroke-width": 2 }, C);
+      el("rect", { x: 442, y: y - 13, width: 11, height: 10, rx: 2, fill: "color-mix(in srgb, var(--api-c) 45%, var(--plot))", stroke: "var(--api-c)" }, C);
+      el("text", { x: 480, y: y - 4, "class": "scn-lock" }, C, P[0]);
     });
-    el("text", { x: 424, y: 736, "class": "scn-feed-t" }, C, "held from the calibration posterior —");
-    el("text", { x: 424, y: 750, "class": "scn-feed-t" }, C, "with covariance, never as exact numbers");
-    var feed = el("path", { d: "M646 706 C 616 700, 592 692, 566 684", "class": "scn-feed", "marker-end": "url(#sarr)" }, C);
+    el("text", { x: 424, y: 736, "class": "scn-feed-t" }, C, "priors from the calibration");
+    el("text", { x: 424, y: 750, "class": "scn-feed-t" }, C, "posterior — jointly fitted,");
+    el("text", { x: 424, y: 764, "class": "scn-feed-t" }, C, "never hard-pinned");
+    var feed = el("path", { d: "M646 700 C 630 692, 612 668, 596 640", "class": "scn-feed", "marker-end": "url(#sarr)" }, C);
     // posterior panel
     el("rect", { x: PX.x0, y: PX.y0 - 22, width: PX.x1 - PX.x0, height: PX.y1 - PX.y0 + 22, rx: 8, fill: "none", stroke: "var(--plot-edge)" }, C);
     el("text", { x: PX.x0 + 8, y: PX.y0 - 6, "class": "scn-cap" }, C, "the answer: a joint posterior");
@@ -1194,7 +1237,7 @@
       el("text", { x: SMAP.x, y: SMAP.y + MR * SMAP.c + 55, "class": "scn-cap2" }, D, "low");
       el("text", { x: SMAP.x + 96, y: SMAP.y + MR * SMAP.c + 55, "text-anchor": "end", "class": "scn-cap2" }, D, "high  σ/n·d");
     })();
-    var linkPath = el("path", { "class": "scn-link", d: "" }, D);
+    var linkPath = el("path", { "class": "scn-link", "marker-end": "url(#sarr)", d: "" }, D);
 
     // ---------- live state ----------
     var ndIn = document.getElementById("in-nd"), TIn = document.getElementById("in-T");
@@ -1234,7 +1277,7 @@
       cells[CUR.px].classList.add("sel");
       var ci = CUR.px % MC, cj = (CUR.px / MC) | 0;
       var cx = MAP.x + ci * MAP.c + MAP.c / 2, cy = MAP.y + cj * MAP.c;
-      linkPath.setAttribute("d", "M" + cx + " " + cy + " C " + cx + " " + (cy - 90) + ", 66 " + (cy - 130) + ", 66 " + (AX.yb + 46) + " L 70 " + (AX.yb + 14));
+      linkPath.setAttribute("d", "M" + cx + " " + cy + " L " + cx + " " + (cy - 22));
     }
     // Gauss-Newton in (nd, T)
     function gnStep(nd, T) {
