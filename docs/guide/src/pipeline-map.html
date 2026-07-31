@@ -85,6 +85,7 @@
   .chainbar .cstep .cn { font-family: var(--mono); font-size: .7rem; font-weight: 700; color: var(--phys-c); margin-right: .35rem; }
   .chainbar .cstep .cnm { font-size: .73rem; font-weight: 600; color: var(--ink); display: block; }
   .chainbar .cstep .ceq { display: block; margin-top: .25rem; overflow: hidden; }
+  .apibar .cstep { flex: 1 1 5rem; }
   .chainbar .cstep .ceq math { font-size: .74rem; }
   .chainbar .cstep[aria-pressed="true"] { border-color: var(--phys-c); box-shadow: inset 0 0 0 1px var(--phys-c); }
   .chainbar .cstep:focus-visible { outline: 2px solid var(--phys-c); outline-offset: 2px; }
@@ -974,45 +975,117 @@
 
   <!-- ===================== API ===================== -->
   <section class="panel" data-panel="api" role="tabpanel" hidden>
-    <p class="pipeintro"><b>The contract the code must implement</b> — derived from Physics, Pipelines and Data; never from the code being refactored <span class="ihint" tabindex="0" data-tip="Hard rule: this tab was written without opening the repository. Everything here traces to a pipeline stage, a data class, or a physics rule on the other tabs. Divergence from the existing code is expected — it is evidence about the code, never a reason to bend the contract. Once agreed, the anti-rot clause at the bottom governs.">i</span></p>
-    <p class="tabstatus">Phase 4 draft — derived doc-only (no code read), self-gated and adversarially reviewed (completeness / representability / derivation attackers; all findings folded), awaiting the Phase-4 sign-off. The scope, granularity and acceptance-regime rows are Phase-4 project decisions (d1–d3, user-adopted), and the type invariants are Phase-4 normative additions — everything else on this tab derives from the other three tabs.</p>
+    <p class="pipeintro"><b>The contract the refactor implements.</b> Eight entry points and nothing else — click one below to see what crosses it <span class="ihint" tabindex="0" data-tip="Derived from the Physics, Pipelines and Data tabs without opening the repository; divergence from the existing code is expected and is evidence about the code. Adversarially attacked three ways (can it express everything the stages need? can a hostile developer re-pin or re-bake within it? does every clause trace?) — 36 findings folded. Once signed off, the closing rule governs: no new public function without updating this contract.">i</span></p>
+    <p class="tabstatus">Phase 4 draft — derived doc-only (no code read), self-gated and adversarially reviewed (completeness / representability / derivation attackers; all findings folded — record entries R3·A/B/C), awaiting the Phase-4 sign-off. The scope, granularity and acceptance-regime rows are Phase-4 project decisions (d1–d3, user-adopted); the type invariants are Phase-4 normative additions — everything else derives from the other three tabs.</p>
 
-    <h2>Scope &amp; conventions</h2>
-    <div class="scroller">
-      <table class="idtbl">
-        <thead><tr><th>Convention</th><th>Rule</th></tr></thead>
-        <tbody>
-          <tr><td class="p">Scope</td><td class="feat">The contract governs the core analysis crates. The Python bindings are a declared <b>thin mirror</b> — no independent surface, no behaviour of their own; the GUI is a consumer outside the contract.</td></tr>
-          <tr><td class="p">Granularity</td><td class="feat">Entry points + boundary types + invariants. <b>Never function signatures</b> — signatures are implementation, and contracting them invites matching the code instead of the physics.</td></tr>
-          <tr><td class="p">Identity</td><td class="feat">Every contracted object carries a content-addressed identity minted by its producer; references between objects are by identity, never by copy. The configuration hash is the compatibility-gate key.</td></tr>
-          <tr><td class="p">Optionality</td><td class="feat">A field is required unless marked <b>conditional(test)</b>, where the test is a contracted admissibility check (e.g. the diagnostic transmission arm exists iff every admissibility test passed). Variants are closed sums declared here — e.g. posterior representation: gaussian(mean, full&nbsp;Σ) | samples | validated parametric form.</td></tr>
-          <tr><td class="p">Uncertainty</td><td class="feat">One encoding: a posterior object (mean + full covariance, or a declared variant). A scalar ±σ is only ever a 1-D posterior; credible intervals are derived views, never the stored object.</td></tr>
-          <tr><td class="p">Units</td><td class="feat">Every physical field declares its unit in the type: eV, µs, m, K, atoms/barn; counts are dimensionless with live time attached; resolution parameters carry the kernel-form identity they parameterize.</td></tr>
-        </tbody>
-      </table>
+    <div class="lab" style="margin-bottom:.7rem">
+      <svg viewBox="0 0 920 240" role="img" aria-label="The API surface: a main line Ingest to Qualify to Reduce to Fit to Assemble results; the identifiability screen gates the experiment definition above the line; the compatibility gate and Calibrate sit below, Calibrate feeding Fit its priors by identity and the gate feeding Fit its verdict">
+        <defs><marker id="aarr" viewBox="0 0 10 10" refX="8.5" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse"><path d="M0 0 L10 5 L0 10 z" fill="context-stroke"></path></marker></defs>
+        <text x="30" y="232" class="lab-cap">the public surface — everything else is a pure accessor or does not exist</text>
+        <g font-family="var(--mono)" font-size="12">
+          <rect x="30" y="86" width="92" height="34" rx="9" fill="none" stroke="var(--plot-faint)"/><text x="76" y="107" text-anchor="middle" fill="var(--ink)">Ingest</text>
+          <rect x="152" y="86" width="98" height="34" rx="9" fill="none" stroke="var(--plot-faint)"/><text x="201" y="107" text-anchor="middle" fill="var(--ink)">Qualify</text>
+          <rect x="280" y="86" width="96" height="34" rx="9" fill="none" stroke="var(--plot-faint)"/><text x="328" y="107" text-anchor="middle" fill="var(--ink)">Reduce</text>
+          <rect x="596" y="86" width="76" height="34" rx="9" fill="none" stroke="var(--plot-line)" stroke-width="1.8"/><text x="634" y="107" text-anchor="middle" fill="var(--ink)" font-weight="700">Fit</text>
+          <rect x="702" y="86" width="188" height="34" rx="9" fill="none" stroke="var(--plot-faint)"/><text x="796" y="107" text-anchor="middle" fill="var(--ink)">Assemble results</text>
+          <rect x="380" y="18" width="196" height="30" rx="9" fill="none" stroke="var(--pipe-c)"/><text x="478" y="37" text-anchor="middle" fill="var(--ink)" font-size="11">Identifiability screen (G3)</text>
+          <rect x="300" y="182" width="110" height="30" rx="9" fill="none" stroke="var(--plot-line2)"/><text x="355" y="201" text-anchor="middle" fill="var(--ink)" font-size="11">Calibrate</text>
+          <rect x="470" y="182" width="176" height="30" rx="9" fill="none" stroke="var(--api-c)"/><text x="558" y="201" text-anchor="middle" fill="var(--ink)" font-size="11">Compatibility gate (G4)</text>
+        </g>
+        <g stroke="var(--plot-faint)" fill="none" stroke-width="1.4">
+          <path d="M122 103 L146 103" marker-end="url(#aarr)"/>
+          <path d="M250 103 L274 103" marker-end="url(#aarr)"/>
+          <path d="M376 103 L590 103" marker-end="url(#aarr)"/>
+          <path d="M672 103 L696 103" marker-end="url(#aarr)"/>
+          <path d="M352 86 C 370 60, 380 48, 396 42" marker-end="url(#aarr)"/>
+          <path d="M560 42 C 590 52, 612 66, 626 80" marker-end="url(#aarr)"/>
+        </g>
+        <path d="M410 197 C 470 190, 560 150, 612 124" fill="none" stroke="var(--plot-line2)" stroke-width="1.6" stroke-dasharray="3 5" marker-end="url(#aarr)"/>
+        <path d="M596 182 C 616 168, 640 150, 654 128" fill="none" stroke="var(--api-c)" stroke-width="1.4" stroke-dasharray="3 5" marker-end="url(#aarr)"/>
+        <text x="404" y="140" class="lab-cap" fill="var(--plot-line2)">priors —</text>
+        <text x="404" y="154" class="lab-cap" fill="var(--plot-line2)">by minted identity</text>
+        <text x="664" y="158" class="lab-cap" fill="var(--api-c)">verdict</text>
+        <text x="586" y="30" class="lab-cap" fill="var(--pipe-c)">admitted definition</text>
+      </svg>
     </div>
 
-    <h2>Entry points — the closed set</h2>
-    <p class="capnote" style="margin:0 0 .4rem">stages: 1 qualification · 2 reduction · 3 model/likelihood · 4 fits (4a calibration) · 5 results/QC — one ingestion boundary, one entry point per stage transition, two gates</p>
-    <div class="scroller">
-      <table class="idtbl">
-        <thead><tr><th>Entry point</th><th>Consumes</th><th>Produces</th><th>Stage</th></tr></thead>
-        <tbody>
-          <tr><td class="p">Ingest</td><td class="feat">raw external artifacts: DAQ streams · diagnostic runs · evaluation files (raw bytes) · assay reports · candidate experiment definitions</td><td class="feat">the externally-produced classes with minted identities — RawRun, RunState, DetectorHealth, NuclearData, CalibrantAssay, candidate ExperimentDefinition</td><td class="req">0 (boundary)</td></tr>
-          <tr><td class="p">Qualify</td><td class="feat">raw runs (any role) · run &amp; beam state · detector health</td><td class="feat">qualified runs (fail-closed)</td><td class="req">1</td></tr>
-          <tr><td class="p">Reduce</td><td class="feat">qualified runs · detector health (mask union) · instrument posterior + nuclear data (read-only: provenance identities and the forward-simulated resolution-order bound — never an axis) · experiment definition, admitted at the design/configuration layers (conditional: sample-role reductions — it executes the domain decision; calibrant runs reduce under their calibration-mode definition; background runs under the standing convention)</td><td class="feat">reduced spectra — native TOF, provenance attached; conditional diagnostic transmission arm · background constraints (template amplitudes, from reduced background runs)</td><td class="req">2</td></tr>
-          <tr><td class="p">Identifiability screen</td><td class="feat">candidate experiment definition · nuclear data · instrument posterior · run &amp; beam state (the per-configuration layer) · reduced spectra (for the per-pixel-class layer)</td><td class="feat">screen verdicts (design-time · per-configuration · per pixel class on the actual data) · the expected-information ranking of candidate resonance sets (recorded into the definition) <b>and every marginalization-criterion evaluation</b> — a degenerate prior without a linked criterion-evaluation identity is rejected by the fit engine; an experiment definition is only valid once admitted</td><td class="req">3 (gate)</td></tr>
-          <tr><td class="p">Compatibility gate</td><td class="feat">instrument posterior · run &amp; beam state (the configuration hash)</td><td class="feat">accept | reject | attach expanded drift model — mechanically, no human judgement</td><td class="req">4 (gate)</td></tr>
-          <tr><td class="p">Calibrate</td><td class="feat">reduced calibrant spectra · the admitted calibration-mode definition (resonance selection · kernel family + anchor choice · holdout partition) · nuclear data (+ covariance) · calibrant assay · background constraints · run &amp; beam state (the surveyed L / nominal t₀ seed) · calibration history (prior posteriors + bracketing reference runs, for the drift record)</td><td class="feat">the instrument posterior (kernel form + anchor + validity + conditioning + holdout verdicts + drift record) · the calibration fit&#8217;s posterior layer — calibration terminates in stage 5 like every instance (residual cube, GOF, self-consistency)</td><td class="req">4a — the one fit engine under the calibration prior pattern</td></tr>
-          <tr><td class="p">Fit</td><td class="feat">reduced spectra (sample and open-beam, predicted separately) · admitted experiment definition · instrument posterior <b>paired with its gate verdict — accept, or expanded-drift with the attached drift model entering the fit&#8217;s parameter set; reject never fits</b> (tight correlated priors) · nuclear data · background constraints</td><td class="feat">the posterior layer of the Results class (per-pixel / per-ROI joint posteriors under the mode&#8217;s prior pattern — or one coupled field posterior under a declared regularized/joint spatial estimator — Data: results, produced by 4–5) · the conditional diagnostic-arm fit (Pearson-weighted Gaussian χ², never Neyman) feeding the transmission↔counts consistency test</td><td class="req">4</td></tr>
-          <tr><td class="p">Assemble results</td><td class="feat">the posterior layer from Fit or Calibrate · reduced spectra · experiment definition · background constraints (adequacy) · instrument posterior (the display axis) · nuclear data (posterior-predictive simulation; per-line residual grouping) · prior Results (cross-experiment consistency checks)</td><td class="feat">results objects — value/σ/GOF/trust maps, residual cube, consistency tests with predicted values, post-fit identifiability outcomes (the screen&#8217;s fourth layer), failure verdicts, display products (display-only)</td><td class="req">5</td></tr>
-        </tbody>
-      </table>
+    <p class="capnote" style="margin:0 0 .4rem">stages: 0 ingestion boundary · 1 qualification · 2 reduction · 3 model/likelihood (its gate: G3, the identifiability screen) · 4 fits, 4a calibration (their gate: G4, the compatibility gate) · 5 results/QC</p>
+    <div class="chainbar apibar" role="group" aria-label="Entry points — select one">
+      <button type="button" class="cstep" data-ep="ingest" aria-pressed="false"><span class="cnm"><span class="cn">0</span>Ingest</span></button>
+      <button type="button" class="cstep" data-ep="qualify" aria-pressed="false"><span class="cnm"><span class="cn">1</span>Qualify</span></button>
+      <button type="button" class="cstep" data-ep="reduce" aria-pressed="false"><span class="cnm"><span class="cn">2</span>Reduce</span></button>
+      <button type="button" class="cstep" data-ep="screen" aria-pressed="false"><span class="cnm"><span class="cn">G3</span>Screen</span></button>
+      <button type="button" class="cstep" data-ep="gate" aria-pressed="false"><span class="cnm"><span class="cn">G4</span>Gate</span></button>
+      <button type="button" class="cstep" data-ep="calibrate" aria-pressed="false"><span class="cnm"><span class="cn">4a</span>Calibrate</span></button>
+      <button type="button" class="cstep" data-ep="fit" aria-pressed="true"><span class="cnm"><span class="cn">4</span>Fit</span></button>
+      <button type="button" class="cstep" data-ep="assemble" aria-pressed="false"><span class="cnm"><span class="cn">5</span>Assemble</span></button>
     </div>
+
+    <div class="eppanel step" data-ep="ingest" hidden>
+      <p class="step-body"><b>The only place external artifacts become contracted objects.</b></p>
+      <p class="step-body"><b>Consumes</b> — DAQ streams · diagnostic runs · evaluation files (raw bytes) · assay reports · candidate experiment definitions.</p>
+      <p class="step-body"><b>Produces</b> — the externally-produced classes with minted identities: RawRun · RunState · DetectorHealth · NuclearData · CalibrantAssay · candidate ExperimentDefinition.</p>
+    </div>
+    <div class="eppanel step" data-ep="qualify" hidden>
+      <p class="step-body"><b>Fail-closed: an unqualified run cannot reach reduction.</b></p>
+      <p class="step-body"><b>Consumes</b> — raw runs (any role) · run &amp; beam state · detector health.</p>
+      <p class="step-body"><b>Produces</b> — qualified runs, with corrections applied and their uncertainty propagated.</p>
+    </div>
+    <div class="eppanel step" data-ep="reduce" hidden>
+      <p class="step-body"><b>Never an energy axis — reduction is axis-free by type.</b></p>
+      <p class="step-body"><b>Consumes</b> — qualified runs · detector health (the mask union) · instrument posterior + nuclear data <i>read-only</i> (provenance identities and the forward-simulated resolution-order bound — never an axis) · the experiment definition, admitted at the design/configuration layers <span class="ihint" tabindex="0" data-tip="Conditional: sample-role reductions only — it executes the domain decision. Calibrant runs reduce under their calibration-mode definition; background runs under the standing convention.">i</span>.</p>
+      <p class="step-body"><b>Produces</b> — reduced spectra (native TOF, provenance attached; the conditional diagnostic transmission arm) · background constraints (template amplitudes, from reduced background runs).</p>
+    </div>
+    <div class="eppanel step" data-ep="screen" hidden>
+      <p class="step-body"><b>Only the screen admits an experiment definition — and every pin needs its approval.</b></p>
+      <p class="step-body"><b>Consumes</b> — candidate experiment definition · nuclear data · instrument posterior · run &amp; beam state (the per-configuration layer) · reduced spectra (the per-pixel-class layer).</p>
+      <p class="step-body"><b>Produces</b> — layer-tagged screen verdicts (design-time · per-configuration · per pixel class on the actual data) · the expected-information ranking of candidate resonance sets (recorded into the definition) · every marginalization-criterion evaluation — a degenerate prior without a linked criterion-evaluation identity is rejected by the fit engine.</p>
+    </div>
+    <div class="eppanel step" data-ep="gate" hidden>
+      <p class="step-body"><b>Mechanical — no human judgement; kernel extrapolation is a reject.</b></p>
+      <p class="step-body"><b>Consumes</b> — instrument posterior · run &amp; beam state (the configuration hash).</p>
+      <p class="step-body"><b>Produces</b> — accept | reject | expanded-drift(model), bound to the (posterior identity, configuration hash, fitted energy band) triple it judged — a band outside the posterior&#8217;s validity range is a reject.</p>
+    </div>
+    <div class="eppanel step" data-ep="calibrate" hidden>
+      <p class="step-body"><b>The one fit engine under the calibration prior pattern — and it terminates in stage 5 like every instance.</b></p>
+      <p class="step-body"><b>Consumes</b> — reduced calibrant spectra · the admitted calibration-mode definition (resonance selection · kernel family + anchor choice · holdout partition) · nuclear data (+ covariance) · calibrant assay · background constraints · run &amp; beam state (the surveyed L / nominal t₀ seed) · calibration history (prior posteriors + bracketing reference runs, for the drift record).</p>
+      <p class="step-body"><b>Produces</b> — the instrument posterior (kernel form + anchor + validity + conditioning + holdout verdicts + drift record) · the calibration fit&#8217;s posterior layer into Assemble (residual cube, GOF, self-consistency).</p>
+    </div>
+    <div class="eppanel step" data-ep="fit" hidden>
+      <p class="step-body"><b>Priors enter by minted-posterior identity — never as caller-supplied numbers</b> <span class="ihint" tabindex="0" data-tip="Minted = created by its contracted producer with a content-addressed identity. Only Calibrate mints instrument posteriors, so a prior can only reference a real calibration result — a hand-typed Σ, however tight, is not a prior. This is what makes silent hard-pinning impossible.">i</span></p>
+      <p class="step-body"><b>Consumes</b> — reduced spectra (sample and open-beam, predicted separately) · the admitted experiment definition (all layers, matching the fitted data&#8217;s configuration) · the instrument posterior paired with its gate verdict <span class="ihint" tabindex="0" data-tip="Accept, or expanded-drift with the attached drift model entering the fit's parameter set; reject never fits. An unpaired posterior is not accepted.">i</span> · nuclear data · background constraints.</p>
+      <p class="step-body"><b>Produces</b> — the posterior layer of the Results class (per-pixel / per-ROI joint posteriors under the mode&#8217;s prior pattern, or one coupled field posterior under a declared regularized/joint spatial estimator) · the conditional diagnostic-arm fit (Pearson-weighted Gaussian χ², never Neyman) feeding the transmission↔counts consistency test.</p>
+    </div>
+    <div class="eppanel step" data-ep="assemble" hidden>
+      <p class="step-body"><b>Where every instance terminates; display products are display-only.</b></p>
+      <p class="step-body"><b>Consumes</b> — the posterior layer from Fit or Calibrate · reduced spectra · experiment definition · background constraints (adequacy) · instrument posterior (the display axis) · nuclear data (posterior-predictive simulation; per-line residual grouping) · prior Results (cross-experiment consistency checks).</p>
+      <p class="step-body"><b>Produces</b> — results objects: value/σ/GOF/trust maps · residual cube · consistency tests with predicted values · post-fit identifiability outcomes (the screen&#8217;s fourth layer) · failure verdicts · display products (display-only).</p>
+    </div>
+
     <p class="tblnote"><b>Closed means closed:</b> a proposed public function that is not one of these eight, and not a pure accessor on a contracted type, requires updating this contract first — that is the anti-rot gate in operation. A <b>pure accessor</b> is deterministic from the object alone, takes no parameters beyond the object, and cannot produce a fit-domain input — in particular, no accessor takes (L, t₀) or returns an energy axis; derived energy/transmission views exist only on Results, flagged display-only. Accessors remain public surface for the CI enforcement rule — the exemption is only from the entry-point closure. <b>Failure outcomes are typed:</b> every entry point returns its declared fail-closed or degraded-mode variants from the stage-5 failure taxonomy; a failure class without a declared variant cannot be handled without a contract change.</p>
 
-    <h2>Boundary types</h2>
-    <p class="capnote" style="margin:0 0 .4rem">one type per Data-tab class + the shared provenance block — the Data tab holds the field inventories; this table holds the invariants the code must enforce</p>
+    <h2>The fit contract</h2>
+    <details class="walk key" open><summary>A parameter is <b>free</b> or carries a <b>prior(mean, Σ-block)</b> — the type has no "fixed" constructor</summary>
+      <div class="story"><p>Hard-pinning is unrepresentable by construction: "effectively fixed" exists only as a criterion-approved degenerate prior, and the marginalization-criterion evaluation that approved it is recorded in provenance. This is the C_marg = C_cond + JΣ<sub>cal</sub>J<sup>T</sup> rule (Physics tab) enforced by the type system rather than by discipline — the failure the 20.4%-coverage toy MC demonstrates cannot be expressed in the type system at all.</p></div>
+    </details>
+    <div class="scroller">
+      <table class="idtbl">
+        <thead><tr><th>Mode</th><th>Free</th><th>Prior (tight, correlated)</th><th>Emits</th></tr></thead>
+        <tbody>
+          <tr><td class="p">Calibration</td><td class="fr">L, t<sub>0</sub>, θ_res</td><td class="req">foil n·d, T (assay) · nuclear data</td><td class="feat">the instrument posterior</td></tr>
+          <tr><td class="p">Density</td><td class="fr">(n·d)ᵢ per pixel</td><td class="req">instrument (calibration posterior) · T (known state)</td><td class="feat">n·d posteriors</td></tr>
+          <tr><td class="p">Temperature</td><td class="fr">T_eff per pixel</td><td class="req">instrument · n·d (known state)</td><td class="feat">T posteriors</td></tr>
+          <tr><td class="p">In-situ</td><td class="fr">shared n·d<sub>0</sub> + per-frame T</td><td class="req">instrument · the expansion link n·d(T)</td><td class="feat">joint trajectories</td></tr>
+        </tbody>
+      </table>
+    </div>
+    <p class="tblnote">Covariance <b>in</b>: the instrument posterior with its off-diagonals, nuclear covariance under the failure policy. Covariance <b>out</b>: C_marg always — <b>C_cond alone is not constructible from the public surface</b>. Likelihood: counts canonical (Poisson/KL, flux inside the model); <b>the Results posterior is always the counts-likelihood product</b>.</p>
+    <details class="walk"><summary>Further fit rules — spatial estimators · ROI model · lattice family · nuisances</summary>
+      <div class="story"><p>Spatial estimators honour the declared ladder — a regularized or jointly inverted fit emits one coupled field posterior whose uncertainty accounts for the effective degrees of freedom the estimator consumed. ROI fits: summed counts are Poisson, and the ROI forward model is ⟨exp(−τ)⟩, never exp(−⟨τ⟩). The lattice-model family is declared per experiment and its discrete-model uncertainty enters C_marg as a declared model-family term. Diagnostic-arm fits appear only inside consistency-test outcomes; the transmission arm exists only behind its admissibility verdicts. Nuisances are solved per measurement with restricted freedom so model inadequacy stays visible.</p></div>
+    </details>
+
+    <h2>Boundary types — the invariants the code must make unbreakable</h2>
+    <p class="capnote" style="margin:0 0 .4rem">one type per Data-tab class + the verdict types + the shared provenance block — the Data tab holds the field inventories; this reference table holds the invariants</p>
     <div class="scroller">
       <table class="idtbl">
         <thead><tr><th>Type</th><th>Mirrors</th><th>Invariants the type must make unbreakable</th></tr></thead>
@@ -1027,30 +1100,31 @@
           <tr><td class="p">CalibrantAssay</td><td class="req">calibrant assay</td><td class="feat">temperature is measured-or-assumed with the flag in the type, not in prose.</td></tr>
           <tr><td class="p">InstrumentPosterior</td><td class="req">instrument posterior</td><td class="feat">minted only by Calibrate (producer-restricted, like QualifiedRun); inseparable from kernel form + anchor convention + validity range + conditioning set; off-diagonals never dropped — there is no marginal-only accessor. The fit engine takes priors <b>by minted-posterior identity, never as caller-supplied numbers</b> — a hand-built Σ (however tight) is not a prior.</td></tr>
           <tr><td class="p">ExperimentDefinition</td><td class="req">experiment definition</td><td class="feat">only the identifiability screen constructs an <i>admitted</i> definition, and admission is <b>layer-tagged</b> — Reduce requires the design/configuration layers, Fit requires every data-independent layer plus the per-pixel-class layer on the data being fitted; the fit engine accepts nothing else, checks the admitting configuration and instrument-posterior identities match the data, and the definition declares the marginalization-criterion threshold (the stated fraction of the error budget).</td></tr>
-          <tr><td class="p">Results</td><td class="req">results</td><td class="feat">stores the total marginal covariance; decompositions and display products (energy axis, transmission) are derived views flagged display-only — not inputs to anything. The statistical/systematic display split returns scalar summaries only — the C_cond-equivalent block is never exposed as a covariance object. Distinct from that split, the <b>spatially common-mode covariance share</b> (calibration + shared nuclear terms) is a labelled part of the total covariance&#8217;s declared structure — required for any correct N-pixel aggregate (the correlated floor does not average down). Residual cube in signed-deviance / randomized-quantile form.</td></tr>
           <tr><td class="p">ScreenVerdicts</td><td class="req">the identifiability screen&#8217;s products</td><td class="feat">layer-tagged verdicts + marginalization-criterion evaluations; each evaluation binds (parameter, prior, the declared threshold, the computed shift, verdict) to the definition and configuration identities it judged — the threshold is declared in the ExperimentDefinition, never chosen at fit time.</td></tr>
           <tr><td class="p">GateVerdict</td><td class="req">the compatibility gate&#8217;s product</td><td class="feat">exists only as accept | reject | expanded-drift(model), bound to the (posterior identity, configuration hash, fitted energy band) triple it judged — a band outside the posterior&#8217;s validity range is a reject (kernel extrapolation is detected here); the fit engine&#8217;s posterior argument is the pair (posterior, non-reject verdict) — an unpaired posterior is not accepted.</td></tr>
+          <tr><td class="p">Results</td><td class="req">results</td><td class="feat">stores the total marginal covariance; decompositions and display products (energy axis, transmission) are derived views flagged display-only — not inputs to anything. The statistical/systematic display split returns scalar summaries only — the C_cond-equivalent block is never exposed as a covariance object. Distinct from that split, the <b>spatially common-mode covariance share</b> (calibration + shared nuclear terms) is a labelled part of the total covariance&#8217;s declared structure — required for any correct N-pixel aggregate (the correlated floor does not average down). Residual cube in signed-deviance / randomized-quantile form.</td></tr>
           <tr><td class="p">ProvenanceBlock</td><td class="req">provenance (five groups)</td><td class="feat">one shared type; attached to every reduced spectrum, inherited and extended by every result; sufficient alone for bit-for-bit reproduction.</td></tr>
         </tbody>
       </table>
     </div>
 
-    <h2>The fit contract</h2>
-    <details class="walk key" open><summary>A parameter is <b>free</b> or carries a <b>prior(mean, Σ-block)</b> — the type has no "fixed" constructor</summary>
-      <div class="story"><p>Hard-pinning is unrepresentable by construction: "effectively fixed" exists only as a criterion-approved degenerate prior, and the marginalization-criterion evaluation that approved it is recorded in provenance. This is the C_marg = C_cond + JΣ<sub>cal</sub>J<sup>T</sup> rule (Physics tab) enforced by the type system rather than by discipline — the failure the 20.4%-coverage toy MC demonstrates cannot be written down.</p></div>
-    </details>
-    <div class="scroller">
+    <details class="walk"><summary>The six conventions — scope · granularity · identity · optionality · uncertainty · units</summary>
+      <div class="story">
+      <div class="scroller">
       <table class="idtbl">
-        <thead><tr><th>Mode</th><th>Free</th><th>Prior (tight, correlated)</th><th>Emits</th></tr></thead>
+        <thead><tr><th>Convention</th><th>Rule</th></tr></thead>
         <tbody>
-          <tr><td class="p">Calibration</td><td class="fr">L, t₀, θ_res</td><td class="req">foil n·d, T (assay) · nuclear data</td><td class="feat">the instrument posterior</td></tr>
-          <tr><td class="p">Density</td><td class="fr">(n·d)ᵢ per pixel</td><td class="req">instrument (calibration posterior) · T (known state)</td><td class="feat">n·d posteriors</td></tr>
-          <tr><td class="p">Temperature</td><td class="fr">T_eff per pixel</td><td class="req">instrument · n·d (known state)</td><td class="feat">T posteriors</td></tr>
-          <tr><td class="p">In-situ</td><td class="fr">shared n·d₀ + per-frame T</td><td class="req">instrument · the expansion link n·d(T)</td><td class="feat">joint trajectories</td></tr>
+          <tr><td class="p">Scope</td><td class="feat">The contract governs the core analysis crates. The Python bindings are a declared <b>thin mirror</b> — no independent surface, no behaviour of their own; the GUI is a consumer outside the contract.</td></tr>
+          <tr><td class="p">Granularity</td><td class="feat">Entry points + boundary types + invariants. <b>Never function signatures</b> — signatures are implementation, and contracting them invites matching the code instead of the physics.</td></tr>
+          <tr><td class="p">Identity</td><td class="feat">Every contracted object carries a content-addressed identity minted by its producer; references between objects are by identity, never by copy. The configuration hash is the compatibility-gate key.</td></tr>
+          <tr><td class="p">Optionality</td><td class="feat">A field is required unless marked <b>conditional(test)</b>, where the test is a contracted admissibility check (e.g. the diagnostic transmission arm exists iff every admissibility test passed). Variants are closed sums declared here — e.g. posterior representation: gaussian(mean, full&nbsp;Σ) | samples | validated parametric form.</td></tr>
+          <tr><td class="p">Uncertainty</td><td class="feat">One encoding: a posterior object (mean + full covariance, or a declared variant). A scalar ±σ is only ever a 1-D posterior; credible intervals are derived views, never the stored object.</td></tr>
+          <tr><td class="p">Units</td><td class="feat">Every physical field declares its unit in the type: eV, µs, m, K, atoms/barn; counts are dimensionless with live time attached; resolution parameters carry the kernel-form identity they parameterize.</td></tr>
         </tbody>
       </table>
-    </div>
-    <p class="tblnote">Covariance <b>in</b>: the instrument posterior with its off-diagonals, nuclear covariance under the failure policy. Covariance <b>out</b>: C_marg always — <b>C_cond alone is not constructible from the public surface</b>. Spatial estimators honour the declared ladder — a regularized or jointly inverted fit emits one coupled field posterior whose uncertainty accounts for the effective degrees of freedom the estimator consumed. ROI fits: summed counts are Poisson, and the ROI forward model is ⟨exp(−τ)⟩, never exp(−⟨τ⟩). The lattice-model family is declared per experiment and its discrete-model uncertainty enters C_marg as a declared model-family term. Likelihood: counts canonical (Poisson/KL, flux inside the model; sample and open beam predicted separately); <b>the Results posterior is always the counts-likelihood product</b> — diagnostic-arm fits appear only inside consistency-test outcomes; the transmission arm exists only behind its admissibility verdicts; nuisances solved per measurement with restricted freedom so model inadequacy stays visible.</p>
+      </div>
+      </div>
+    </details>
 
     <h2>Acceptance — how we know the code matches the physics</h2>
     <div class="scroller">
@@ -1060,8 +1134,8 @@
           <tr><td class="p">Resolved σ(E)</td><td class="feat">SAMMY as the resolved-resonance oracle, per declared formalism (RM / RML / MLBW) — an oracle for resolved σ(E) only, never a match-target for the pipeline</td><td class="req">per-module relative-error budget, stated in the test; <b>ratchet clause:</b> a tightness once achieved is never loosened</td></tr>
           <tr><td class="p">Known-sample recovery</td><td class="feat">synthetic data from the contracted forward model at known truth, all four modes</td><td class="req">posterior calibration: nominal 68.3% coverage within stated tolerance — the anti-20.4% criterion, per mode</td></tr>
           <tr><td class="p">Doc-number regressions</td><td class="feat">the document&#8217;s own verified numbers as fixed targets: ρ(L,t₀) structure, the Jensen −Var(τ)/2 offset, the deviance reference E[D] at low counts, the marginalization-criterion behaviour</td><td class="req">reproduced within quoted digits; a change to any target is a contract change</td></tr>
-          <tr><td class="p">Non-vacuity guards</td><td class="feat">every kernel / Jacobian test paired with a nonzero with-vs-without difference pre-check (a test that cannot see the feature is vacuous); ENDF fixtures pinned to the raw evaluation-file bytes, never parser output (a fixture built to match the parser is circular)</td><td class="req">a test that passes with the feature disabled fails the suite</td></tr>
           <tr><td class="p">Forward-model laws</td><td class="feat">constructive property tests independent of any oracle: Doppler kernel conserves the reaction rate (1/v exact) · convolution order (Doppler inside σ; the kernel on expected counts) · kernel admissibility (non-negative, normalised, causal, anchored), checked at kernel registration</td><td class="req">a violated law fails the suite regardless of any oracle agreement</td></tr>
+          <tr><td class="p">Non-vacuity guards</td><td class="feat">every kernel / Jacobian test paired with a nonzero with-vs-without difference pre-check (a test that cannot see the feature is vacuous); ENDF fixtures pinned to the raw evaluation-file bytes, never parser output (a fixture built to match the parser is circular)</td><td class="req">a test that passes with the feature disabled fails the suite</td></tr>
           <tr><td class="p">Enforcement</td><td class="feat">the acceptance suite runs in CI</td><td class="req">a contract change without a corresponding test change fails; a public-surface addition without a contract change fails; <b>a test change that widens any budget or tolerance without a contract change fails</b> — every acceptance budget and tolerance is contract material (the ratchet clause generalizes to all rows)</td></tr>
         </tbody>
       </table>
@@ -1281,6 +1355,19 @@
         if (window.__drawStrip) window.__drawStrip(+b.getAttribute("data-stage"));
       });
     });
+    // API entry-point selector: one panel at a time
+    var abs_ = Array.prototype.slice.call(document.querySelectorAll(".apibar .cstep"));
+    abs_.forEach(function (b) {
+      b.addEventListener("click", function () {
+        abs_.forEach(function (x) { x.setAttribute("aria-pressed", String(x === b)); });
+        document.querySelectorAll(".eppanel").forEach(function (pn) {
+          pn.hidden = pn.getAttribute("data-ep") !== b.getAttribute("data-ep");
+        });
+      });
+    });
+    var fitPanel = document.querySelector('.eppanel[data-ep="fit"]');
+    if (fitPanel) fitPanel.hidden = false;
+
     document.querySelectorAll(".livelink").forEach(function (a) {
       a.addEventListener("click", function () {
         var btn = document.getElementById(a.getAttribute("data-preset"));
