@@ -148,12 +148,18 @@ class ResonanceData:
 
     @property
     def target_spin(self) -> float:
-        """Target nuclear spin (I) of the first resonance range."""
+        """Target nuclear spin (I) of the first evaluable resonance range.
+
+        Parse-and-skip placeholder ranges (LRU=0 / LRF=7 / URR) are skipped.
+        """
         ...
 
     @property
     def scattering_radius(self) -> float:
-        """Effective scattering radius in fm."""
+        """Effective scattering radius in fm, from the first evaluable range.
+
+        Parse-and-skip placeholder ranges (LRU=0 / LRF=7 / URR) are skipped.
+        """
         ...
 
     @property

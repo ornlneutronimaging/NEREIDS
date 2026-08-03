@@ -159,26 +159,36 @@ impl PyResonanceData {
             .collect()
     }
 
-    /// Target spin (I) of the first resonance range.
+    /// Target spin (I) of the first evaluable resonance range.
+    ///
+    /// Parse-and-skip placeholders (LRU=0 / LRF=7 / URR) may precede the
+    /// evaluable ranges on mixed tapes; their SPI describes a span the
+    /// cross-section code never evaluates, so the getter skips them (falling
+    /// back to the first range only if nothing is evaluable).
     #[getter]
     fn target_spin(&self) -> f64 {
         self.inner
             .ranges
-            .first()
+            .iter()
+            .find(|r| r.is_evaluable())
+            .or_else(|| self.inner.ranges.first())
             .map(|r| r.target_spin)
             .unwrap_or(0.0)
     }
 
-    /// Effective scattering radius (fm).
+    /// Effective scattering radius (fm) of the first evaluable range.
     ///
-    /// Returns the global AP from the first range. If AP=0 (common in
+    /// Returns the global AP from the first evaluable range (skipping
+    /// parse-and-skip placeholders, as for `target_spin`). If AP=0 (common in
     /// ENDF Reich-Moore data that uses energy-dependent radii), falls back
     /// to the first L-group's channel radius APL.
     #[getter]
     fn scattering_radius(&self) -> f64 {
         self.inner
             .ranges
-            .first()
+            .iter()
+            .find(|r| r.is_evaluable())
+            .or_else(|| self.inner.ranges.first())
             .map(|r| {
                 if r.scattering_radius != 0.0 {
                     r.scattering_radius

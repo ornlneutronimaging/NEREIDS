@@ -416,6 +416,18 @@ fn parse_bw_range(
     let scattering_radius = cont.c2 * ENDF_RADIUS_TO_FM;
     let nls = checked_count(cont.n1, "NLS")?; // number of L-values
 
+    // Zero NLS means a resolved range with no L-groups: out of spec
+    // (ENDF-6 §2.2.1.1 requires NLS >= 1; NLS=0 belongs to LRU=0
+    // scattering-radius-only stanzas) and silently inert if accepted —
+    // the range would count as evaluable yet contribute zero cross-section
+    // everywhere. Mirrors the NJS=0 guards in the URR skip paths.
+    if nls == 0 {
+        return Err(EndfParseError::UnsupportedFormat(format!(
+            "{formalism:?} range: NLS=0 (ENDF-6 §2.2.1.1 requires at least one \
+             L-group in a resolved range; NLS=0 is reserved for LRU=0)"
+        )));
+    }
+
     let mut l_groups = Vec::with_capacity(nls);
 
     for _ in 0..nls {
@@ -508,6 +520,19 @@ fn parse_reich_moore_range(
     let target_spin = cont.c1;
     let scattering_radius = cont.c2 * ENDF_RADIUS_TO_FM;
     let nls = checked_count(cont.n1, "NLS")?; // number of L-values
+
+    // Zero NLS means a resolved range with no L-groups: out of spec
+    // (ENDF-6 §2.2.1.1 requires NLS >= 1; NLS=0 belongs to LRU=0
+    // scattering-radius-only stanzas) and silently inert if accepted —
+    // the range would count as evaluable yet contribute zero cross-section
+    // everywhere. Mirrors the NJS=0 guards in the URR skip paths.
+    if nls == 0 {
+        return Err(EndfParseError::UnsupportedFormat(
+            "Reich-Moore range: NLS=0 (ENDF-6 §2.2.1.1 requires at least one \
+             L-group in a resolved range; NLS=0 is reserved for LRU=0)"
+                .to_string(),
+        ));
+    }
 
     let mut l_groups = Vec::with_capacity(nls);
 
@@ -604,12 +629,14 @@ fn skip_rmatrix_limited_range(
     let cont = parse_cont(ctx.lines, ctx.pos)?;
     let target_spin = cont.c1;
     let scattering_radius = cont.c2 * ENDF_RADIUS_TO_FM;
-    // IFG (L1): radius unit flag. IFG=0 (10⁻¹² cm) is universal in ENDF/B-VIII.0;
-    // IFG=1 (energy-dependent ℏ/k units) is not supported. SAMMY always writes 0.
+    // IFG (L1): GAM representation flag (ENDF-6 §2.2.1.6). IFG=0 means channel
+    // widths GAM are given in eV; IFG=1 means reduced-width amplitudes (√eV).
+    // Only IFG=0 is supported; SAMMY's ENDF reader makes the same distinction.
     let ifg = cont.l1;
     if ifg != 0 {
         return Err(EndfParseError::UnsupportedFormat(format!(
-            "LRF=7 IFG={ifg} (energy-dependent radii) is not supported (only IFG=0)"
+            "LRF=7 IFG={ifg} (reduced-width amplitudes) is not supported (only \
+             IFG=0, channel widths in eV)"
         )));
     }
     let krm = cont.l2 as u32; // R-matrix type: 2=standard, 3=Reich-Moore approx
@@ -2036,6 +2063,35 @@ mod tests {
         );
     }
 
+    /// A resolved (LRU=1) MLBW range with NLS=0 is rejected.
+    ///
+    /// ENDF-6 §2.2.1.1 requires NLS >= 1 in a resolved range (NLS=0 is
+    /// reserved for LRU=0 scattering-radius-only stanzas). Without the guard
+    /// this file loads as "evaluable" with zero resonances — zero
+    /// cross-section everywhere and no warning.
+    #[test]
+    fn test_mlbw_nls0_rejected() {
+        const ENDF: &str = include_str!("../../../tests/data/synthetic/mlbw_nls0_rejected.endf");
+
+        let err = parse_endf_file2(ENDF).unwrap_err();
+        assert!(
+            err.to_string().contains("NLS=0"),
+            "expected resolved NLS=0 rejection, got: {err}"
+        );
+    }
+
+    /// A resolved (LRU=1) Reich-Moore range with NLS=0 is rejected.
+    #[test]
+    fn test_rm_nls0_rejected() {
+        const ENDF: &str = include_str!("../../../tests/data/synthetic/lrf3_rm_nls0_rejected.endf");
+
+        let err = parse_endf_file2(ENDF).unwrap_err();
+        assert!(
+            err.to_string().contains("NLS=0"),
+            "expected resolved NLS=0 rejection, got: {err}"
+        );
+    }
+
     /// LFW=1/LRF=1 (energy-dependent fission widths) URR is skipped with the
     /// line stream left aligned.
     ///
@@ -2172,6 +2228,20 @@ mod tests {
             "LRU=0 skip_description must name the span, got: {}",
             lru0.skip_description()
         );
+
+        // The fixture gives the placeholder DIFFERENT SPI/AP (1.5 / 5.0 fm)
+        // than the resolved range (2.5 / 9.6931 fm), so consumers that must
+        // prefer the evaluable range are distinguishable from ones reading
+        // the placeholder.
+        assert_eq!(lru0.target_spin, 1.5);
+        assert_eq!(lru0.scattering_radius, 5.0);
+        let resolved = data
+            .ranges
+            .iter()
+            .find(|r| r.is_evaluable())
+            .expect("the resolved range must be evaluable");
+        assert_eq!(resolved.target_spin, 2.5);
+        assert!((resolved.scattering_radius - 9.6931).abs() < 1e-9);
     }
 
     /// N1 != 6*NRS in a BW range CONT is rejected.

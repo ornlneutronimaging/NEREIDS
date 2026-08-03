@@ -317,6 +317,28 @@ class TestResonanceData:
         # Explicit alias must agree with n_resonances.
         assert data.total_resonance_count == data.n_resonances
 
+    def test_mixed_lru0_getters_prefer_evaluable_range(self):
+        """``target_spin`` / ``scattering_radius`` read the first EVALUABLE range.
+
+        The mixed fixture's leading LRU=0 placeholder deliberately carries
+        different SPI/AP (1.5 / 5.0 fm) than the resolved range (2.5 /
+        9.6931 fm), so this test can see which range the getters read: a
+        placeholder's SPI/AP describes a span the cross-section code never
+        evaluates, and the getters must skip it.
+        """
+        root = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+        fixture = os.path.join(
+            root, "tests/data/synthetic/lru0_plus_resolved_mixed.endf"
+        )
+        assert os.path.exists(fixture), (
+            f"vendored mixed LRU=0 fixture must be present at {fixture} "
+            "(committed test data)"
+        )
+        with pytest.warns(UserWarning, match="parsed but NOT evaluated"):
+            data = nereids.load_endf_file(fixture)
+        assert data.target_spin == 2.5
+        assert data.scattering_radius == pytest.approx(9.6931)
+
 
 # ===========================================================================
 # Cross-sections
