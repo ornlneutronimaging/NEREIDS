@@ -92,7 +92,7 @@ rand = "0.10"
 # realization must name a concrete algorithm (ChaCha12) instead.
 rand_chacha = "0.10"
 rand_distr = "0.6"
-microlp = "0.5"
+microlp = "0.6"
 tracing = "0.1"
 # log-crate facade: bridged into tracing by apps/gui/src/logging.rs so
 # diagnostics from log-based deps (rfd, opener) reach the log files.
