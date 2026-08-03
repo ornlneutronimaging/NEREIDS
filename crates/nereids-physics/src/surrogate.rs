@@ -49,7 +49,7 @@
 
 use std::fmt;
 
-use microlp::{ComparisonOp, OptimizationDirection, Problem};
+use microlp::{ComparisonOp, OptimizationDirection, Problem, SolveOutcome};
 
 use crate::resolution::ResolutionMatrix;
 
@@ -502,8 +502,14 @@ impl SparseEmpiricalCubaturePlan {
             // `ResolutionMatrix` row (`Σ w_exact = 1` implies at
             // least one entry exceeds `1 / support_len > 1e-12`).
             let sparse_weights: Vec<f64> = match problem.solve() {
-                Ok(solution) => vars.iter().map(|&v| solution.var_value(v)).collect(),
-                Err(_) => w_exact.clone(),
+                Ok(SolveOutcome::Solution(solution)) => {
+                    vars.iter().map(|&v| solution.var_value(v)).collect()
+                }
+                // `Interrupted` carries no validated assignment (a time or
+                // node limit fired — none is configured here, but the variant
+                // must be handled); treat it like any solver failure and keep
+                // the exact row measure.
+                Ok(SolveOutcome::Interrupted(_)) | Err(_) => w_exact.clone(),
             };
 
             // Drop numerically-zero atoms and renormalize so the row
