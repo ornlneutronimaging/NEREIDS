@@ -36,6 +36,20 @@ from nereids.mcp.server import (
 from _fixtures import _synthetic_u238_data, _synthetic_u238_entry
 
 
+def _load_endf_or_skip(**kwargs):
+    """Call the load_endf tool, skipping (not failing) on network errors.
+
+    Several tests fetch live evaluations from the IAEA service on a cold
+    cache; an infrastructure outage must surface as an explicit skip in CI,
+    not a PR-gate failure. Parse-level errors (ValueError) still propagate --
+    they are what the tests assert on.
+    """
+    try:
+        return load_endf(**kwargs)
+    except OSError as exc:  # download/cache I/O failure, not a parse verdict
+        pytest.skip(f"IAEA ENDF service unreachable: {exc}")
+
+
 @pytest.fixture(autouse=True)
 def clear_registry():
     """Clear the isotope registry before each test."""
@@ -80,7 +94,7 @@ class TestListIsotopes:
 
 class TestLoadEndf:
     def test_load_fe56(self):
-        result = load_endf(isotope="Fe-56")
+        result = _load_endf_or_skip(isotope="Fe-56")
         assert result["z"] == 26
         assert result["a"] == 56
         assert result["n_resonances"] > 0
@@ -92,11 +106,11 @@ class TestLoadEndf:
 
     def test_load_stores_in_registry(self):
         assert "U-238" not in _registry
-        load_endf(isotope="U-238")
+        _load_endf_or_skip(isotope="U-238")
         assert "U-238" in _registry
 
     def test_return_structure(self):
-        result = load_endf(isotope="Fe-56")
+        result = _load_endf_or_skip(isotope="Fe-56")
         for key in ("isotope", "z", "a", "n_resonances", "scattering_radius",
                      "target_spin", "l_values", "has_unevaluated_ranges"):
             assert key in result, f"Missing key: {key}"
@@ -114,7 +128,7 @@ class TestLoadEndf:
         the other live-download tests in this suite.
         """
         with pytest.raises(ValueError, match="No evaluable resonance ranges"):
-            load_endf(isotope="W-182", library="endf8.1")
+            _load_endf_or_skip(isotope="W-182", library="endf8.1")
 
     def test_mixed_evaluation_reports_skipped_ranges(self):
         """A mixed evaluation (U-238: resolved RM + URR) flags its skipped span.
@@ -122,7 +136,7 @@ class TestLoadEndf:
         The URR range is parsed-and-skipped, so load_endf must set
         has_unevaluated_ranges and list the skipped URR span in skipped_ranges.
         """
-        result = load_endf(isotope="U-238")
+        result = _load_endf_or_skip(isotope="U-238")
         assert result["has_unevaluated_ranges"] is True
         assert isinstance(result["skipped_ranges"], list)
         assert result["skipped_ranges"], "skipped_ranges must be non-empty"
@@ -136,7 +150,7 @@ class TestLoadEndf:
 
 class TestGetResonanceParameters:
     def test_loaded_isotope(self):
-        load_endf(isotope="Fe-56")
+        _load_endf_or_skip(isotope="Fe-56")
         result = get_resonance_parameters(isotope="Fe-56")
         assert result["z"] == 26
         assert result["a"] == 56
@@ -147,7 +161,7 @@ class TestGetResonanceParameters:
             get_resonance_parameters(isotope="U-238")
 
     def test_reports_unevaluated_ranges(self):
-        load_endf(isotope="U-238")
+        _load_endf_or_skip(isotope="U-238")
         result = get_resonance_parameters(isotope="U-238")
         assert result["has_unevaluated_ranges"] is True
         assert any("LRU=2" in span for span in result["skipped_ranges"])
@@ -160,7 +174,7 @@ class TestGetResonanceParameters:
 
 class TestComputeCrossSections:
     def test_basic(self):
-        load_endf(isotope="Fe-56")
+        _load_endf_or_skip(isotope="Fe-56")
         result = compute_cross_sections(
             isotope="Fe-56", energy_min=1.0, energy_max=100.0, n_points=100,
         )
@@ -183,7 +197,7 @@ class TestComputeCrossSections:
 
 class TestComputeTransmission:
     def test_basic(self):
-        load_endf(isotope="Fe-56")
+        _load_endf_or_skip(isotope="Fe-56")
         result = compute_transmission(
             isotope="Fe-56", thickness=0.01,
             energy_min=1.0, energy_max=100.0, n_points=50,
@@ -193,7 +207,7 @@ class TestComputeTransmission:
         assert all(0 <= v <= 1 for v in result["transmission"])
 
     def test_zero_thickness(self):
-        load_endf(isotope="Fe-56")
+        _load_endf_or_skip(isotope="Fe-56")
         result = compute_transmission(
             isotope="Fe-56", thickness=0.0,
             energy_min=1.0, energy_max=100.0, n_points=50,
@@ -213,7 +227,7 @@ class TestComputeTransmission:
 
 class TestForwardModel:
     def test_single_isotope(self):
-        load_endf(isotope="Fe-56")
+        _load_endf_or_skip(isotope="Fe-56")
         result = forward_model(
             isotopes=[{"isotope": "Fe-56", "thickness": 0.01}],
             energy_min=1.0, energy_max=100.0, n_points=50,
@@ -222,8 +236,8 @@ class TestForwardModel:
         assert all(0 <= v <= 1 for v in result["transmission"])
 
     def test_multi_isotope(self):
-        load_endf(isotope="Fe-56")
-        load_endf(isotope="U-238")
+        _load_endf_or_skip(isotope="Fe-56")
+        _load_endf_or_skip(isotope="U-238")
         result = forward_model(
             isotopes=[
                 {"isotope": "Fe-56", "thickness": 0.01},
@@ -249,8 +263,8 @@ class TestDetectIsotopes:
     # Ta-181 is a mixed evaluation (resolved MLBW LRF=2 + URR) that loads;
     # W-182 (pure LRF=7 + URR) is now rejected at load, so it cannot be a trace.
     def test_basic(self):
-        load_endf(isotope="Fe-56")
-        load_endf(isotope="Ta-181")
+        _load_endf_or_skip(isotope="Fe-56")
+        _load_endf_or_skip(isotope="Ta-181")
         result = detect_isotopes(
             matrix_isotope="Fe-56",
             matrix_density=0.01,
@@ -276,7 +290,7 @@ class TestDetectIsotopes:
             )
 
     def test_trace_not_loaded(self):
-        load_endf(isotope="Fe-56")
+        _load_endf_or_skip(isotope="Fe-56")
         with pytest.raises(ValueError, match="not loaded"):
             detect_isotopes(
                 matrix_isotope="Fe-56",

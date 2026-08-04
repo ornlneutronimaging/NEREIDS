@@ -609,7 +609,13 @@ fn precompute_range_data<'a>(
         kind,
     };
 
-    if !range.resolved {
+    // Literal sync with `ResonanceRange::is_evaluable` (see
+    // `range_is_evaluable` below): every non-evaluable shape — parse-and-skip
+    // placeholders AND accepted-but-inert resolved ranges whose L-groups are
+    // all empty — takes the Skip arm. The inert-resolved shape is unreachable
+    // from the parser and the Python constructor (both guard it) but can
+    // arrive via legacy serialized caches or direct Rust construction.
+    if !range.is_evaluable() {
         return make(PrecomputedRangeKind::Skip);
     }
 
@@ -1029,9 +1035,11 @@ fn evaluate_precomputed_range(
 /// LRF=1/2/3 (SLBW, MLBW, Reich-Moore). LRF=7 and LRU=2 ranges are
 /// parse-and-skip placeholders and are never evaluated.
 ///
-/// **Keep in sync with `precompute_range_data`.**  Whenever a new
-/// formalism becomes evaluable there, extend `ResonanceRange::is_evaluable`
-/// so the energy-boundary logic (`next_starts_here`) stays correct.
+/// **In literal sync with `precompute_range_data`**: both key on
+/// [`ResonanceRange::is_evaluable`] (`precompute_range_data` returns its Skip
+/// arm for every non-evaluable range), so the energy-boundary logic
+/// (`next_starts_here`) and the evaluator dispatch cannot disagree. Whenever
+/// a new formalism becomes evaluable, extend `ResonanceRange::is_evaluable`.
 fn range_is_evaluable(range: &ResonanceRange) -> bool {
     range.is_evaluable()
 }

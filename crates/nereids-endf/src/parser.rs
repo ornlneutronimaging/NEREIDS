@@ -486,16 +486,13 @@ fn parse_bw_range(
         });
     }
 
-    // A resolved range whose L-groups are all empty (every NRS=0) is the
-    // NLS=0 case in disguise: it would count as evaluable yet contribute
-    // zero cross-section everywhere, including potential scattering.
-    // Reject it loudly, like the NLS=0 guard above.
-    if l_groups.iter().all(|lg| lg.resonances.is_empty()) {
-        return Err(EndfParseError::UnsupportedFormat(format!(
-            "{formalism:?} range carries no resonances (every L-group has \
-             NRS=0): cross-sections would be identically zero over its span"
-        )));
-    }
+    // A resolved range whose L-groups are all empty (every NRS=0) contributes
+    // exactly zero cross-section, including potential scattering. Reference
+    // readers (SAMMY mrml01.f Nresg==0 path; OpenScale) accept the shape, so
+    // it is NOT a hard error: `is_evaluable()` classifies it non-evaluable,
+    // making it a warn-and-skip placeholder like LRF=7/LRU=2/LRU=0 — a mixed
+    // file keeps its populated ranges, and a file where this is the only
+    // range still fails the no-evaluable-content guard, naming the span.
 
     Ok(ResonanceRange {
         energy_low: ctx.energy_low,
@@ -600,17 +597,13 @@ fn parse_reich_moore_range(
         });
     }
 
-    // A resolved range whose L-groups are all empty (every NRS=0) is the
-    // NLS=0 case in disguise: it would count as evaluable yet contribute
-    // zero cross-section everywhere, including potential scattering.
-    // Reject it loudly, like the NLS=0 guard above.
-    if l_groups.iter().all(|lg| lg.resonances.is_empty()) {
-        return Err(EndfParseError::UnsupportedFormat(
-            "Reich-Moore range carries no resonances (every L-group has \
-             NRS=0): cross-sections would be identically zero over its span"
-                .to_string(),
-        ));
-    }
+    // A resolved range whose L-groups are all empty (every NRS=0) contributes
+    // exactly zero cross-section, including potential scattering. Reference
+    // readers (SAMMY mrml01.f Nresg==0 path; OpenScale) accept the shape, so
+    // it is NOT a hard error: `is_evaluable()` classifies it non-evaluable,
+    // making it a warn-and-skip placeholder like LRF=7/LRU=2/LRU=0 — a mixed
+    // file keeps its populated ranges, and a file where this is the only
+    // range still fails the no-evaluable-content guard, naming the span.
 
     Ok(ResonanceRange {
         energy_low: ctx.energy_low,
@@ -636,10 +629,14 @@ fn parse_reich_moore_range(
 /// — so the parameters are discarded and the range is tagged
 /// `ResonanceFormalism::RMatrixLimited` (non-evaluable → Skip).
 ///
-/// Record advancement and every structural/quantum-flag guard are preserved
-/// verbatim (IFG/KRM/KRL; the PNT/SHF/mass particle-pair guards; KBK/KPS; the
-/// NCH, IPP-range, NRS/NX/NPL and KRM-dependent stride guards): they reject
-/// malformed or unsupported records that would otherwise misalign the stream.
+/// Record advancement and every guard of the removed evaluator are preserved
+/// verbatim, for two distinct reasons. Structural guards (KRM — it sets the
+/// NCH+1 vs NCH+2 row stride — and the NCH, IPP-range, NRS/NX/NPL checks)
+/// reject records that would otherwise misalign the stream. The quantum-flag
+/// guards (IFG/KRL, the PNT/SHF/mass particle-pair guards, KBK/KPS) do NOT
+/// affect the byte layout; they are retained as deliberate strictness parity
+/// with the removed evaluator — a file carrying flags the evaluator never
+/// supported is rejected rather than silently consumed.
 /// Only the RmlData/ParticlePair/RmlChannel/RmlResonance/SpinGroup construction
 /// is gone.
 ///
@@ -826,9 +823,12 @@ fn skip_rmatrix_limited_range(
 
         let sg_values = parse_list_values(ctx.lines, ctx.pos, npl)?;
 
-        // The LIST must carry at least 6*(NCH+1) values (a dummy header row of
-        // zeros followed by NCH channel definitions).
-        // Reference: ENDF-6 §2.2.1.6 Table 2.3; SAMMY rml/mrml01.f lines 104-107.
+        // The LIST must carry at least 6*(NCH+1) values: the first row is the
+        // eliminated capture (gamma) channel — SAMMY reads all NCH+1 rows as
+        // channels, the first being the eliminated one — followed by the NCH
+        // particle channels.
+        // Reference: ENDF-6 §2.2.1.6 Table 2.3; SAMMY rml/mrml01.f lines
+        // 104-107, 381; ndf/WriteRrEndf.cpp:1033.
         let expected_npl = 6 * (nch + 1);
         if npl < expected_npl {
             return Err(EndfParseError::UnsupportedFormat(format!(
@@ -836,12 +836,14 @@ fn skip_rmatrix_limited_range(
             )));
         }
 
-        // Validate each channel's IPP (1-based particle-pair index) is in range;
-        // the channel definitions [IPP, L, SCH, BND, APE, APT] are otherwise
-        // discarded (LRF=7 is not evaluated). The first 6 values are the dummy
-        // header row. Reference: ENDF-6 §2.2.1.6; SAMMY rml/mrml01.f (Ippx test).
+        // Validate each particle channel's IPP (1-based particle-pair index)
+        // is in range; the channel definitions [IPP, L, SCH, BND, APE, APT]
+        // are otherwise discarded (LRF=7 is not evaluated). The first 6-value
+        // row is the eliminated capture channel, which carries no particle
+        // pair and is exempt from the IPP check.
+        // Reference: ENDF-6 §2.2.1.6; SAMMY rml/mrml01.f (Ippx test).
         for c in 0..nch {
-            let b = 6 + c * 6; // skip the 6-value header row
+            let b = 6 + c * 6; // skip the eliminated-capture-channel row
             let ipp_raw = sg_values[b] as usize;
             if ipp_raw == 0 || ipp_raw > npp {
                 return Err(EndfParseError::UnsupportedFormat(format!(
@@ -2103,18 +2105,53 @@ mod tests {
         );
     }
 
-    /// A resolved range with NLS=1 but NRS=0 in every L-group is rejected —
-    /// the NLS=0 case in disguise (zero resonances, zero cross-section
-    /// everywhere, including potential scattering).
+    /// A file whose ONLY range is resolved with NLS=1 but NRS=0 in every
+    /// L-group is rejected by the no-evaluable-content guard, naming the
+    /// inert span. (The range itself is accepted as a warn-and-skip
+    /// placeholder — SAMMY/OpenScale accept NRS=0 L-groups — so the
+    /// rejection comes from the file-level guard, not a per-range error.)
     #[test]
     fn test_mlbw_nrs0_everywhere_rejected() {
         const ENDF: &str =
             include_str!("../../../tests/data/synthetic/mlbw_nrs0_everywhere_rejected.endf");
 
         let err = parse_endf_file2(ENDF).unwrap_err();
+        let msg = err.to_string();
         assert!(
-            err.to_string().contains("carries no resonances"),
-            "expected all-empty-L-group rejection, got: {err}"
+            msg.contains("No evaluable resonance ranges"),
+            "expected no-evaluable-content rejection, got: {msg}"
+        );
+        assert!(
+            msg.contains("resolved range with no resonances"),
+            "rejection must name the inert resolved span, got: {msg}"
+        );
+    }
+
+    /// A mixed file [populated resolved range][all-empty resolved range]
+    /// loads: the populated range stays evaluable, the inert range becomes a
+    /// warn-and-skip placeholder — symmetric with LRF=7/LRU=2/LRU=0 handling,
+    /// so the good range is not lost.
+    #[test]
+    fn test_mlbw_nrs0_plus_resolved_mixed_loads_and_flags() {
+        const ENDF: &str =
+            include_str!("../../../tests/data/synthetic/mlbw_nrs0_plus_resolved_mixed.endf");
+
+        let data = parse_endf_file2(ENDF).expect("mixed populated + inert file must load");
+        assert_eq!(data.ranges.len(), 2);
+        assert!(data.has_evaluable_range());
+        assert!(data.has_unevaluated_ranges());
+        assert_eq!(data.total_resonance_count(), 1);
+        let inert = data
+            .ranges
+            .iter()
+            .find(|r| !r.is_evaluable())
+            .expect("the inert range must be present");
+        assert!(
+            inert
+                .skip_description()
+                .contains("LRF=2 (MLBW) resolved range with no resonances"),
+            "skip_description must name the inert shape, got: {}",
+            inert.skip_description()
         );
     }
 

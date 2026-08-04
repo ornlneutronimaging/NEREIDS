@@ -156,7 +156,8 @@ jobs:
       # Without this, tests/test_mcp.py silently import-skips (fastmcp absent).
       # Like the test-python step above, some MCP tests fetch live evaluations
       # from the IAEA service on a cold cache (deliberate: they assert against
-      # real pinned-library tapes, e.g. W-182 rejection).
+      # real pinned-library tapes, e.g. W-182 rejection). A service outage
+      # surfaces as explicit skips (_load_endf_or_skip), not a gate failure.
       - name: Build and test MCP server (isolated fastmcp env)
         run: pixi run -e mcp test-mcp
 

@@ -489,8 +489,9 @@ impl ResonanceRange {
     /// Shared by the parser's no-evaluable-content error, the Python-binding
     /// `UserWarning`, and the GUI load log so all three surfaces describe a
     /// skipped range identically. Only meaningful for ranges where
-    /// [`Self::is_evaluable`] is `false`; an evaluable range is labeled
-    /// `"non-evaluable"` defensively (callers never pass one).
+    /// [`Self::is_evaluable`] is `false`: the resolved-formalism arms label
+    /// the accepted-but-inert no-resonance shape (callers never pass an
+    /// evaluable range).
     pub fn skip_description(&self) -> String {
         let kind = match self.formalism {
             ResonanceFormalism::RMatrixLimited => "LRF=7 (R-Matrix Limited)",
@@ -498,7 +499,13 @@ impl ResonanceRange {
             ResonanceFormalism::ScatteringRadiusOnly => {
                 "LRU=0 (scattering-radius-only, no resonance parameters)"
             }
-            _ => "non-evaluable",
+            // A resolved LRF=1/2/3 range reaches here only when it carries no
+            // resonances (every L-group empty) — accepted, warn-and-skip.
+            ResonanceFormalism::SLBW => "LRF=1 (SLBW) resolved range with no resonances",
+            ResonanceFormalism::MLBW => "LRF=2 (MLBW) resolved range with no resonances",
+            ResonanceFormalism::ReichMoore => {
+                "LRF=3 (Reich-Moore) resolved range with no resonances"
+            }
         };
         format!(
             "{kind} over [{:.6e}, {:.6e}] eV",

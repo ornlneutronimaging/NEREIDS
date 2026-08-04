@@ -897,12 +897,21 @@ fn state_from_snapshot(snap: ProjectSnapshot, state: &mut AppState, path: &Path)
     // range) are absent from `endf_cache`, so the isotopes below fall through
     // to `EndfStatus::Pending` and are re-fetched on demand — the fetch worker
     // then surfaces the parser's hard error. Warn so the drop is visible.
+    // Collected into the load status line + provenance log below (a
+    // tracing::warn alone lands only in the log file, where a user re-running
+    // a saved fit would miss that the isotope set changed).
+    let mut endf_drop_notices: Vec<String> = Vec::new();
     for symbol in &snap.endf_cache_dropped {
         tracing::warn!(
             isotope = %symbol,
             "cached ENDF evaluation dropped on project load (no evaluable \
              resonance range — stale removed-physics data); re-fetch required"
         );
+        endf_drop_notices.push(format!(
+            "cached ENDF data for {symbol} was dropped (no evaluable resonance \
+             range — stale removed-physics data); the isotope is Pending and \
+             excluded from fits until re-fetched"
+        ));
     }
     let endf_cache: HashMap<String, ResonanceData> = snap.endf_cache.into_iter().collect();
     // Mixed evaluations that survived the load still carry parsed-but-skipped
@@ -1442,6 +1451,9 @@ fn state_from_snapshot(snap: ProjectSnapshot, state: &mut AppState, path: &Path)
     for msg in &mask_notices {
         status.push_str(&format!(" — WARNING: {msg}"));
     }
+    for msg in &endf_drop_notices {
+        status.push_str(&format!(" — WARNING: {msg}"));
+    }
     if let Some(ref msg) = detected_drift {
         status.push_str(&format!(" — WARNING: {msg}"));
     }
@@ -1461,6 +1473,12 @@ fn state_from_snapshot(snap: ProjectSnapshot, state: &mut AppState, path: &Path)
         state.log_provenance(
             ProvenanceEventKind::ConfigChanged,
             format!("Pixel-mask restore: {msg}"),
+        );
+    }
+    for msg in &endf_drop_notices {
+        state.log_provenance(
+            ProvenanceEventKind::ConfigChanged,
+            format!("ENDF restore: {msg}"),
         );
     }
     if let Some(ref msg) = detected_drift {
