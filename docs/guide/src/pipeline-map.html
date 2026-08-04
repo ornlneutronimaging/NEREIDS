@@ -425,7 +425,7 @@
   /* ---------- show everything: keeps Ctrl-F and linear reading intact ---------- */
   :root[data-expand] .stagepanel[hidden], :root[data-expand] .eppanel[hidden],
   :root[data-expand] .trace[hidden], :root[data-expand] .objpanel[hidden],
-  :root[data-expand] .secpanel[hidden] { display: block !important; }
+  :root[data-expand] .secpanel[hidden], :root[data-expand] .classpanel[hidden] { display: block !important; }
   :root[data-expand] .foldgrid > details[open] { grid-column: auto; }
 
   /* ---------- the class map: classes sit in the lane that produces them ---------- */
@@ -1057,7 +1057,7 @@
   <!-- ===================== PIPELINES ===================== -->
   <section class="panel" data-panel="pipelines" role="tabpanel" hidden>
     <p class="pipeintro"><b>One fitting engine, four modes.</b> Every parameter is fitted jointly — a mode is a prior pattern <span class="ihint" tabindex="0" data-tip="A tight prior is not a pin: the parameter's own uncertainty still flows into the answer — it just cannot absorb freedom the data should assign elsewhere. When a parameter may be treated as effectively fixed is governed per case by the marginalization criterion on the Physics tab.">i</span>. Pick a mode; the scene below runs it live, on the same Ta-181 physics the Physics tab specifies.</p>
-    <p class="tabstatus">The interactive model is the document's own forward model (resonances → Doppler → Beer-Lambert → E(t; L, t₀) inside the likelihood → constant-relative-width blur as the demo reduction of K(t|E)), fitted by 5-parameter Gauss-Newton with the mode's prior pattern; the engineering contract for each stage is in the developer layer below. Design and content history: <a href="#" data-goto="record">review record</a>.</p>
+    <p class="tabstatus">The interactive model follows the document's forward-model structure (resonances → Doppler → Beer-Lambert → E(t; L, t₀) inside the likelihood → constant-relative-width blur as the demo reduction of K(t|E)) with demo-reduced line shapes — seven fixed Ta-181 lines as independent, area-conserving Gaussian profiles; the real σ(E) is built coherently from the collision matrix with interference and Lorentzian wings (stage 1), which no on-page demo number represents — fitted by 5-parameter Gauss-Newton with the mode's prior pattern; the engineering contract for each stage is in the developer layer below. Design and content history: <a href="#" data-goto="record">review record</a>.</p>
 
     <section class="sec" id="s-pipe-run" data-sec-title="The pipeline, running">
     <div class="modebar" role="group" aria-label="Run mode">
@@ -1095,7 +1095,7 @@
         <div id="freerows"></div>
         <div class="phead" id="priorhead" tabindex="0" data-tip="These parameters are also in the joint fit, held by tight priors from the calibration posterior (with its L–t₀ correlation). Their uncertainty is counted in the answer — never hard-pinned.">tight priors ← calibration posterior</div>
         <div id="priorrows"></div>
-        <div class="fitrow"><button type="button" id="btn-fit">fit this pixel</button><button type="button" id="btn-map">fit every pixel</button><span class="chi" id="v-chi"></span><span class="ihint" tabindex="0" data-tip="Demo reductions: n·d in units of peak optical depth at the 4.3 eV line at the 295 K reference (real deliverable: atoms/barn); K(t|E) rendered as a constant-relative-width blur (θ_res = ΔE/E); 13×9 pixel grid (VENUS is 512×512); one frame for in-situ.">i</span></div>
+        <div class="fitrow"><button type="button" id="btn-fit">fit this pixel</button><button type="button" id="btn-map">fit every pixel</button><span class="chi" id="v-chi"></span><span class="ihint" tabindex="0" data-tip="Demo reductions: seven fixed Ta-181 lines as independent area-conserving Gaussian profiles (no interference or Lorentzian wings — the real σ is collision-matrix-coherent, stage 1); n·d in units of peak optical depth at the 4.3 eV line at the 295 K reference (real deliverable: atoms/barn); K(t|E) rendered as a constant-relative-width blur (θ_res = ΔE/E); multiplicative 3.5% Gaussian noise with model-variance (Pearson) weights standing in for the Poisson counts likelihood; 13×9 pixel grid (VENUS is 512×512); one frame for in-situ.">i</span></div>
       </div>
     </div>
 
@@ -1521,7 +1521,7 @@
     <section class="sec" id="s-api-the-letter-of-the-contract" data-sec-title="The contract, clause by clause — the enforcement layer">
     <h2>The contract, clause by clause — the enforcement layer</h2>
     <p class="pipeintro" style="font-size:.84rem">Everything below is the hardened contract text the adversarial review produced (36 findings folded) — reference, not reading. Eight entry points and nothing else; click one to see what crosses it <span class="ihint" tabindex="0" data-tip="Derived from the Physics, Pipelines and Data tabs without opening the repository; divergence from the existing code is expected and is evidence about the code. Adversarially attacked three ways (can it express everything the stages need? can a hostile developer re-pin or re-bake within it? does every clause trace?) — 36 findings folded. Once signed off, the closing rule governs: no new public function without updating this contract.">i</span></p>
-    <p class="tabstatus">Phase 4 draft — derived doc-only (no code read), self-gated and adversarially reviewed (completeness / representability / derivation attackers; all findings folded — record entries R3·A/B/C), awaiting the Phase-4 sign-off. The scope, granularity and acceptance-regime rows are Phase-4 project decisions (d1–d3, user-adopted); the type invariants are Phase-4 normative additions — everything else derives from the other three tabs.</p>
+    <p class="tabstatus">Phase 4 contract — derived doc-only (no code read), self-gated and adversarially reviewed (completeness / representability / derivation attackers; all findings folded — record entries R3·A/B/C), signed off 2026-08-03; the closing rule below governs, with CI enforcement landing in the Phase-5 acceptance wave. The scope, granularity and acceptance-regime rows are Phase-4 project decisions (d1–d3, user-adopted); the type invariants are Phase-4 normative additions — everything else derives from the other three tabs.</p>
 
 
     <p class="capnote" style="margin:0 0 .4rem">stages: 0 ingestion boundary · 1 qualification · 2 reduction · 3 model/likelihood (its gate: G3, the identifiability screen) · 4 fits, 4a calibration (their gate: G4, the compatibility gate) · 5 results/QC</p>
@@ -1706,7 +1706,7 @@
         </div>
         <div class="card" style="--cc:var(--api-c)">
           <p class="ch"><span class="cname">Doc-number regressions</span></p>
-          <p class="cline"><span class="clab">oracle / target</span>the document&#8217;s own verified numbers as fixed targets: ρ(L,t₀) structure, the Jensen −Var(τ)/2 offset, the deviance reference E[D] at low counts, the marginalization-criterion behaviour</p>
+          <p class="cline"><span class="clab">oracle / target</span>the document&#8217;s own verified numbers as fixed targets (from its analytic derivations and Phase-1 numerics — never the on-page demo): ρ(L,t₀) structure, the Jensen −Var(τ)/2 offset, the deviance reference E[D] at low counts, the marginalization-criterion behaviour</p>
           <p class="cline" style="margin-top:.35rem"><span class="clab">budget &amp; rule</span>reproduced within quoted digits; a change to any target is a contract change</p>
         </div>
         <div class="card" style="--cc:var(--api-c)">
@@ -1902,6 +1902,9 @@
       <details class="rec walk" id="rr5-4"><summary><span class="rid">R5·4</span> Interactive demos made area-conserving — the on-screen physics now obeys the stage-2 law</summary>
 <div class="story">        <p>Both live demos broadened with fixed-unit-peak Gaussians: the line lab&#8217;s profile kept peak 1 while its width grew with T (σ-area +36% from 300 → 900 K), and the pipeline scene divided σ by its T-dependent peak — so the &#8220;n·d&#8221; control actually pinned peak optical depth, keeping dip depth T-invariant where the document&#8217;s own stage-2 law conserves the σ-area and trades depth for width. This is the same unit-peak normalization mistake the temperature-instance method note records for an earlier prose draft, reproduced in the demo JavaScript; the in-page fits could not expose it because data generation and fitting share the model. Fixed by anchoring both demos at the 295 K calibrant reference: profiles scale as w_ref/w(T) (area conserved; verified numerically to machine precision), n·d reads τ₀ at 295 K, the heat preset now shows the depth-for-width trade (+32% width, −20% depth), and the look-alike ghost was retuned (300 K, n·d 0.88, θ 2.48% matches the 900 K line to |ΔT| &lt; 0.004). The calibration demo and its published CALPOST numbers are unchanged: the foil is at 295 K, where old and new normalizations coincide. Found in the Phase-5 branch review (cross-family verified, both verifiers reproducing the +36% area defect to nine digits).</p>
         <p class="where">Physics line lab + Pipelines interactive scene · demo JavaScript only</p></div></details>
+      <details class="rec walk" id="rr5-5"><summary><span class="rid">R5·5</span> Demo reductions disclosed in full; demo weights made model-variance (Pearson)</summary>
+<div class="story">        <p>The pipeline-scene status line called the demo &#8220;the document&#8217;s own forward model&#8221;, flagging only the blur as a reduction — while the demo&#8217;s σ(E) is seven fixed Ta-181 lines summed as independent Gaussian profiles, the very shape the stage-1 law warns against (no collision-matrix interference, no Lorentzian wings), and its noise model was multiplicative Gaussian with weights derived from the noisy observation — the Neyman trap the statistics section names. Neither reduction appeared in the disclosed list, and the in-page fits could not expose them (data generation and fitting share the model). Corrected three ways: the status line and the demo-reductions tooltip now disclose the line-shape and noise/weight reductions explicitly; the fit weights derive from the model value (Pearson), not the noisy draw; and the doc-number acceptance row states its targets come from the document&#8217;s analytic derivations and Phase-1 numerics, never the on-page demo. Found in the Phase-5 branch review (cross-family verified).</p>
+        <p class="where">Pipelines scene status + tooltip + demo JavaScript · API acceptance row</p></div></details>
     </div>
   </section>
 
@@ -2214,7 +2217,7 @@
     });
 
     // physics transformation chain: one stage panel at a time + the strip that assembles the model
-    var cbs = Array.prototype.slice.call(document.querySelectorAll(".chainbar .cstep"));
+    var cbs = Array.prototype.slice.call(document.querySelectorAll(".chainbar .cstep[data-stage]"));
     cbs.forEach(function (b) {
       b.addEventListener("click", function () {
         cbs.forEach(function (x) { x.setAttribute("aria-pressed", String(x === b)); });
@@ -2370,7 +2373,10 @@
       var m = model(truth), rng = mulberry(seed), d = new Array(N), sd = new Array(N);
       for (var i = 0; i < N; i++) {
         d[i] = Math.max(m[i] * (1 + 0.035 * gauss(rng)), 0.0005);
-        sd[i] = Math.max(0.035 * d[i], 0.004);
+        // Model-variance (Pearson) weights: sd from the true model value, not
+        // the noisy draw — data-derived weights are the Neyman trap the
+        // statistics section warns against.
+        sd[i] = Math.max(0.035 * m[i], 0.004);
       }
       return { d: d, sd: sd };
     }
@@ -2384,7 +2390,7 @@
     // ---------- modes: one engine, four prior patterns ----------
     // CALPOST is exactly what calibration mode on this page emits (deterministic
     // foil seed) — the priors below ARE that posterior, so the story closes.
-    var CALPOST = { L: 25.073, t0: 1.98, th: 0.0106, sL: 0.009, st0: 0.21, rho: -0.90, sth: 0.0003 };
+    var CALPOST = { L: 25.073, t0: 2.01, th: 0.0106, sL: 0.009, st0: 0.20, rho: -0.90, sth: 0.0003 };
     var KEYS = ["nd", "T", "L", "t0", "th"];
     var STEPH = { nd: 0.01, T: 4, L: 0.003, t0: 0.4, th: 0.0004 };
     var LIM = { nd: [0.05, 4], T: [150, 1500], L: [24.5, 25.6], t0: [-30, 30], th: [0.0005, 0.03] };
