@@ -154,6 +154,9 @@ jobs:
       # MCP tests need fastmcp, which conflicts with conda's importlib-metadata
       # in the default env, so they run in the isolated `mcp` environment.
       # Without this, tests/test_mcp.py silently import-skips (fastmcp absent).
+      # Like the test-python step above, some MCP tests fetch live evaluations
+      # from the IAEA service on a cold cache (deliberate: they assert against
+      # real pinned-library tapes, e.g. W-182 rejection).
       - name: Build and test MCP server (isolated fastmcp env)
         run: pixi run -e mcp test-mcp
 

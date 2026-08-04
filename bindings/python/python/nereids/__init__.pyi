@@ -871,11 +871,23 @@ def load_endf(
     library: str = "endf8.1",
     mat: int | None = None,
 ) -> ResonanceData:
-    """Load ENDF resonance data for an isotope from the IAEA database."""
+    """Load ENDF resonance data for an isotope from the IAEA database.
+
+    Raises ``ValueError`` when the evaluation has no evaluable resolved
+    (LRF=1/2/3) range — loading it would yield zero cross-section
+    everywhere. Mixed evaluations load with a ``UserWarning`` naming the
+    parsed-but-not-evaluated spans.
+    """
     ...
 
 def load_endf_file(path: str) -> ResonanceData:
-    """Load ENDF resonance data from a local file."""
+    """Load ENDF resonance data from a local file.
+
+    Raises ``ValueError`` when the file has no evaluable resolved
+    (LRF=1/2/3) range — loading it would yield zero cross-section
+    everywhere. Mixed evaluations load with a ``UserWarning`` naming the
+    parsed-but-not-evaluated spans.
+    """
     ...
 
 def create_resonance_data(

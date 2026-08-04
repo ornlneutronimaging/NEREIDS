@@ -486,6 +486,17 @@ fn parse_bw_range(
         });
     }
 
+    // A resolved range whose L-groups are all empty (every NRS=0) is the
+    // NLS=0 case in disguise: it would count as evaluable yet contribute
+    // zero cross-section everywhere, including potential scattering.
+    // Reject it loudly, like the NLS=0 guard above.
+    if l_groups.iter().all(|lg| lg.resonances.is_empty()) {
+        return Err(EndfParseError::UnsupportedFormat(format!(
+            "{formalism:?} range carries no resonances (every L-group has \
+             NRS=0): cross-sections would be identically zero over its span"
+        )));
+    }
+
     Ok(ResonanceRange {
         energy_low: ctx.energy_low,
         energy_high: ctx.energy_high,
@@ -587,6 +598,18 @@ fn parse_reich_moore_range(
             lrx: 0,  // Not used in Reich-Moore
             resonances,
         });
+    }
+
+    // A resolved range whose L-groups are all empty (every NRS=0) is the
+    // NLS=0 case in disguise: it would count as evaluable yet contribute
+    // zero cross-section everywhere, including potential scattering.
+    // Reject it loudly, like the NLS=0 guard above.
+    if l_groups.iter().all(|lg| lg.resonances.is_empty()) {
+        return Err(EndfParseError::UnsupportedFormat(
+            "Reich-Moore range carries no resonances (every L-group has \
+             NRS=0): cross-sections would be identically zero over its span"
+                .to_string(),
+        ));
     }
 
     Ok(ResonanceRange {
@@ -2077,6 +2100,21 @@ mod tests {
         assert!(
             err.to_string().contains("NLS=0"),
             "expected resolved NLS=0 rejection, got: {err}"
+        );
+    }
+
+    /// A resolved range with NLS=1 but NRS=0 in every L-group is rejected —
+    /// the NLS=0 case in disguise (zero resonances, zero cross-section
+    /// everywhere, including potential scattering).
+    #[test]
+    fn test_mlbw_nrs0_everywhere_rejected() {
+        const ENDF: &str =
+            include_str!("../../../tests/data/synthetic/mlbw_nrs0_everywhere_rejected.endf");
+
+        let err = parse_endf_file2(ENDF).unwrap_err();
+        assert!(
+            err.to_string().contains("carries no resonances"),
+            "expected all-empty-L-group rejection, got: {err}"
         );
     }
 

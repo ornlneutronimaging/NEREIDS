@@ -222,6 +222,32 @@ class TestResonanceData:
         )
         assert data.n_resonances == 3
 
+    def test_create_resonance_data_rejects_empty_resonances(self):
+        """An empty resonance list raises instead of building inert data.
+
+        A resolved range with no resonances evaluates to zero cross-section
+        everywhere (transmission = 1) — the same silently-inert shape the
+        ENDF load path rejects with its no-evaluable-ranges error.
+        """
+        with pytest.raises(ValueError, match="no resonances"):
+            nereids.create_resonance_data(
+                z=92,
+                a=238,
+                awr=236.006,
+                scattering_radius=9.48,
+                resonances=[],
+            )
+        # The explicit-l_groups arm is guarded the same way.
+        with pytest.raises(ValueError, match="no resonances"):
+            nereids.create_resonance_data(
+                z=92,
+                a=238,
+                awr=236.006,
+                scattering_radius=9.48,
+                resonances=[],
+                l_groups=[(0, [])],
+            )
+
     def test_l_groups(self):
         """Create with explicit L-groups."""
         data = nereids.create_resonance_data(

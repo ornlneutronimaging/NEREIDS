@@ -401,10 +401,11 @@ impl ResonanceData {
     /// Ranges that are parsed but NOT evaluated (non-evaluable placeholders).
     ///
     /// These are the LRF=7 (R-Matrix Limited), LRU=2 (unresolved), and LRU=0
-    /// (scattering-radius-only) ranges that the parser consumes for cursor
-    /// alignment only: they carry no
-    /// resonance parameters and contribute exactly zero to every
-    /// cross-section, so any physics computed over their energy span reflects
+    /// (scattering-radius-only) ranges: the parser consumes their records for
+    /// cursor alignment and discards any resonance parameters they carry in
+    /// the file (LRF=7 and LRU=2 tapes do carry them; LRU=0 has none), so the
+    /// stored placeholder holds none and contributes exactly zero to every
+    /// cross-section. Any physics computed over their energy span reflects
     /// only the *other* ranges of the evaluation. Callers that surface data
     /// to users should warn when this list is non-empty.
     pub fn unevaluated_ranges(&self) -> Vec<&ResonanceRange> {
@@ -462,9 +463,13 @@ impl ResonanceRange {
     /// Can this range actually produce non-zero cross-sections?
     ///
     /// Evaluable means a resolved (LRU=1) range using one of the implemented
-    /// formalisms: SLBW (LRF=1), MLBW (LRF=2), or Reich-Moore (LRF=3).
-    /// LRF=7 (R-Matrix Limited), LRU=2 (unresolved), and LRU=0
-    /// (scattering-radius-only) ranges are parse-and-skip placeholders —
+    /// formalisms — SLBW (LRF=1), MLBW (LRF=2), or Reich-Moore (LRF=3) — with
+    /// at least one resonance-bearing L-group. A resolved range whose L-groups
+    /// are all empty evaluates to exactly zero everywhere (including potential
+    /// scattering: J-groups derive from the resonance list, so an empty list
+    /// yields no J-groups), which is the silently-inert outcome this predicate
+    /// exists to catch. LRF=7 (R-Matrix Limited), LRU=2 (unresolved), and
+    /// LRU=0 (scattering-radius-only) ranges are parse-and-skip placeholders —
     /// consumed for cursor alignment, never evaluated — so they return `false`
     /// and contribute zero cross-section over their energy span.
     pub fn is_evaluable(&self) -> bool {
@@ -475,6 +480,7 @@ impl ResonanceRange {
                     | ResonanceFormalism::MLBW
                     | ResonanceFormalism::ReichMoore
             )
+            && self.l_groups.iter().any(|lg| !lg.resonances.is_empty())
     }
 
     /// One-line diagnostic for a parse-and-skip placeholder range, e.g.
@@ -645,6 +651,46 @@ mod tests {
         };
         assert_eq!(range.scattering_radius_at(1.0), 9.4285);
         assert_eq!(range.scattering_radius_at(1000.0), 9.4285);
+    }
+
+    /// `is_evaluable` is content-sensitive: a resolved LRF=1/2/3 range whose
+    /// L-groups are all empty is inert (zero cross-section everywhere,
+    /// potential scattering included, because J-groups derive from the
+    /// resonance list) and must not count as evaluable.
+    #[test]
+    fn test_is_evaluable_requires_resonances() {
+        let mut range = ResonanceRange {
+            energy_low: 1e-5,
+            energy_high: 1e4,
+            resolved: true,
+            formalism: crate::resonance::ResonanceFormalism::MLBW,
+            target_spin: 0.0,
+            scattering_radius: 9.4,
+            naps: 1,
+            ap_table: None,
+            l_groups: vec![LGroup {
+                l: 0,
+                awr: 236.0,
+                apl: 0.0,
+                qx: 0.0,
+                lrx: 0,
+                resonances: vec![],
+            }],
+            r_external: vec![],
+        };
+        assert!(!range.is_evaluable(), "all-empty L-groups must be inert");
+        range.l_groups[0].resonances.push(Resonance {
+            energy: 6.674,
+            j: 0.5,
+            gn: 1.5e-3,
+            gg: 2.3e-2,
+            gfa: 0.0,
+            gfb: 0.0,
+        });
+        assert!(
+            range.is_evaluable(),
+            "a resonance-bearing L-group is evaluable"
+        );
     }
 
     /// scattering_radius_at interpolates from ap_table when NRO=1.

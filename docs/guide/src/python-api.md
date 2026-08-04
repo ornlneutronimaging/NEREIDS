@@ -38,9 +38,11 @@ Important properties:
 | `a` | `int` | Mass number. |
 | `awr` | `float` | Atomic weight ratio. |
 | `n_resonances` | `int` | Resonance count across parsed ranges. |
-| `target_spin` | `float` | Target spin from the first range. |
-| `scattering_radius` | `float` | Effective scattering radius in fm. |
+| `target_spin` | `float` | Target spin from the first evaluable range (parse-and-skip placeholders are skipped). |
+| `scattering_radius` | `float` | Effective scattering radius in fm, from the first evaluable range. |
 | `l_values` | `list[int]` | Orbital angular momentum values present in the data. |
+| `has_unevaluated_ranges` | `bool` | True when the file carries parsed-but-not-evaluated spans (LRF=7 / URR / LRU=0); those spans contribute zero cross-section. |
+| `skipped_ranges` | `list[str]` | One description per parsed-but-not-evaluated span. |
 
 ### `FitResult`
 
@@ -112,6 +114,12 @@ names include `endf8.0`, `endf8.1`, `jeff3.3`, `jendl5`, `tendl2023`, and
 `cendl3.2`. First use can require network access; cached files are reused
 afterwards. `load_endf_file(...)` parses a local ENDF file and does not
 download data.
+
+Both loaders evaluate resolved LRF=1/2/3 ranges only. A file with **no**
+evaluable range (for example a pure LRF=7 evaluation such as W-182) raises
+`ValueError` — loading it would yield zero cross-section everywhere. A mixed
+evaluation loads, emits a `UserWarning` naming the skipped spans, and flags
+them via `has_unevaluated_ranges` / `skipped_ranges`.
 
 ## Forward Modeling
 

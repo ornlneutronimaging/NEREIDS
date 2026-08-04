@@ -2025,6 +2025,17 @@ fn create_resonance_data(
         }
     };
 
+    // A resolved range with no resonances at all evaluates to exactly zero
+    // cross-section everywhere (transmission = 1) — the same silently-inert
+    // shape the ENDF load path rejects. Reject it here too.
+    if groups.iter().all(|g| g.resonances.is_empty()) {
+        return Err(pyo3::exceptions::PyValueError::new_err(
+            "create_resonance_data: no resonances given (empty resonance list \
+             in every L-group); cross-sections would be identically zero \
+             everywhere (transmission = 1)",
+        ));
+    }
+
     Ok(PyResonanceData {
         inner: Arc::new(ResonanceData {
             isotope: Isotope::new(z, a).map_err(|e| {

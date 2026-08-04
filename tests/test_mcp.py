@@ -104,12 +104,17 @@ class TestLoadEndf:
     def test_pure_lrf7_isotope_rejected(self):
         """W-182 (pure LRF=7 + URR) has no evaluable range and must be rejected.
 
-        The branch removed LRF=7/URR evaluation; a file whose every range is a
+        LRF=7/URR evaluation was removed; a file whose every range is a
         parse-and-skip placeholder fails to load with a ValueError rather than
         loading as a silent zero-cross-section isotope.
+
+        The library is pinned so this asserts against a fixed evaluation
+        (W-182 is pure LRF=7 + URR in ENDF/B-VIII.1) rather than whatever the
+        tool's default library becomes; requires network on a cold cache, like
+        the other live-download tests in this suite.
         """
         with pytest.raises(ValueError, match="No evaluable resonance ranges"):
-            load_endf(isotope="W-182")
+            load_endf(isotope="W-182", library="endf8.1")
 
     def test_mixed_evaluation_reports_skipped_ranges(self):
         """A mixed evaluation (U-238: resolved RM + URR) flags its skipped span.
