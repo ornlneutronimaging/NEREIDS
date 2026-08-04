@@ -948,7 +948,7 @@
 <div class="regime">
       <h3>⚑ 1D-ROI and 2D-per-pixel disagree by a <i>predictable, signed</i> amount</h3>
       <p>Because exp is convex, Jensen's inequality gives ⟨exp(−τ)⟩ ≥ exp(−⟨τ⟩). Fitting an aggregated ROI with a <i>uniform</i> model therefore returns τ_fit ≈ ⟨τ⟩ − Var(τ)/2 — so <b>1D-ROI systematically underestimates areal density</b> whenever the ROI is heterogeneous. Verified numerically (prediction vs Monte-Carlo agree): at ⟨τ⟩ = 2, a thickness spread of 10% → <span class="num">−1.0%</span>, 20% → <span class="num">−4.1%</span>, 30% → <span class="num">−9.0%</span> in n·d. −Var(τ)/2 is the leading cumulant only, and the exact offset is distribution-dependent: at 30% spread it ranges <span class="num">−8.5%</span> (two-point) to <span class="num">−8.7%</span> (uniform) to <span class="num">−9.0%</span> (Gaussian). <a class="ev rev" href="#rr1-9">corrected·r1</a></p>
-      <p><b>Consequence for the never-tested 1D↔2D check:</b> the offset has a predicted value — exactly ⟨e^(−τ)⟩ computed from the fitted 2D field (all cumulants, with illumination weighting), read as −Var(τ)/2 to leading order. That converts a vague consistency hope into a quantitative test. Counts may legitimately be summed over an ROI (Poisson sums are Poisson), but the ROI forward model must then be ⟨exp(−τ)⟩, not exp(−⟨τ⟩).</p>
+      <p><b>Consequence for the never-tested 1D↔2D check:</b> the offset has a predicted value — exactly −ln⟨e^(−τ)⟩ − ⟨τ⟩ computed from the fitted 2D field (all cumulants, with illumination weighting), −Var(τ)/2 to leading order. <a class="ev rev" href="#rr5-3">erratum·p5</a> That converts a vague consistency hope into a quantitative test. Counts may legitimately be summed over an ROI (Poisson sums are Poisson), but the ROI forward model must then be ⟨exp(−τ)⟩, not exp(−⟨τ⟩).</p>
     </div>
     </details>
 
@@ -975,10 +975,10 @@
     <h2>Results, QC &amp; uncertainty — where every instance converges</h2>
     <p class="claim">Every instance ends in the same product family. A correlated systematic does not average down, however many pixels you bin.</p>
     <p class="step-body" style="margin-bottom:.7rem">Every experiment terminates in the same product family, so this is shared scaffolding, not per-experiment reporting: value map · 1σ uncertainty map · goodness-of-fit map · convergence/trust mask · residual cube.</p>
-    <details class="walk key"><summary>A correlated systematic does not average down — the calibration term is a hard floor (ρ = 1 by construction)</summary>
+    <details class="walk key"><summary>A correlated systematic does not average down — the calibration term sets a floor binning cannot remove</summary>
 <div class="regime">
       <h3>⚑ A correlated systematic does not average down</h3>
-      <p>The calibration-covariance contribution is spatially correlated — it biases the whole field coherently — so the variance of an N-pixel mean is σ²_stat/N + σ²_sys, and binning cannot beat the second term. With 5% per-pixel statistics and a 1% correlated floor: N = 100 → <span class="num">1.12%</span>, N = 10⁴ → <span class="num">1.001%</span>, N = 10⁵ → <span class="num">1.000%</span>. Reporting a spatial average with a 1/√N error bar is wrong by construction. This hard floor is exact for the calibration term, which is common-mode by construction (one shared parameter vector, ρ = 1); systematics with finite spatial correlation soften to σ²_sys(1+(N−1)ρ)/N and partially average down. <a class="ev rev" href="#rr1-11">corrected·r1</a></p>
+      <p>The calibration-covariance contribution is spatially correlated — every pixel shares the one calibration draw — so the variance of an N-pixel mean plateaus instead of falling as 1/N: σ²_stat/N + a floor ḡᵀΣ_cal ḡ, where ḡ is the illumination-weighted mean of the per-pixel calibration sensitivities J<sub>i</sub>. Binning cannot beat the second term. In the fully common-mode limit — all pixels sharing one sensitivity direction — the floor equals the per-pixel systematic: with 5% per-pixel statistics and a 1% correlated floor, N = 100 → <span class="num">1.12%</span>, N = 10⁴ → <span class="num">1.001%</span>, N = 10⁵ → <span class="num">1.000%</span>. Reporting a spatial average with a 1/√N error bar is wrong by construction. Sharing the parameter vector does <b>not</b>, however, force pairwise ρ = 1: ρ<sub>ij</sub> = J<sub>i</sub>Σ_cal J<sub>j</sub>ᵀ / √((J<sub>i</sub>Σ_cal J<sub>i</sub>ᵀ)(J<sub>j</sub>Σ_cal J<sub>j</sub>ᵀ)), which reaches one only when the sensitivity directions are proportional — pixels dominated by different resonances sit well below (ρ ≈ 0.58 for 1 eV- vs 100 eV-dominated pixels under a {L, t₀} posterior) — so ROI and map aggregates must use the full J<sub>i</sub>Σ_cal J<sub>j</sub>ᵀ block, never a ρ = 1 shortcut. Systematics with finite spatial correlation soften to σ²_sys(1+(N−1)ρ)/N and partially average down. <a class="ev rev" href="#rr1-11">corrected·r1</a> <a class="ev rev" href="#rr5-2">erratum·p5</a></p>
     </div>
     </details>
 
@@ -988,7 +988,7 @@
         <table class="idtbl">
           <thead><tr><th>Test</th><th>Predicted value</th><th>A departure means</th></tr></thead>
           <tbody>
-            <tr><td class="p">1D ↔ 2D</td><td class="feat">offset = ⟨e^(−τ)⟩ from the fitted 2D field (−Var(τ)/2 to leading order) — <b>not zero</b></td><td class="req">agreement <i>at zero</i> itself indicates a homogeneous ROI or a masked bug</td></tr>
+            <tr><td class="p">1D ↔ 2D</td><td class="feat">offset = −ln⟨e^(−τ)⟩ − ⟨τ⟩ from the fitted 2D field (−Var(τ)/2 to leading order) — <b>not zero</b></td><td class="req">agreement <i>at zero</i> itself indicates a homogeneous ROI or a masked bug</td></tr>
             <tr><td class="p">transmission ↔ counts</td><td class="feat">agreement within ratio-bias (≈1/λ_o) + resolution-order bias</td><td class="req">a larger disagreement localises to flux or background modelling</td></tr>
             <tr><td class="p">deviance</td><td class="feat">its calibrated (bootstrap / posterior-predictive) reference</td><td class="req">systematic departure = model inadequacy, not noise</td></tr>
             <tr><td class="p">per-resonance residuals</td><td class="feat">flat, line by line</td><td class="req">a model wrong in one resonance but averaged away globally is the failure mode this catches</td></tr>
@@ -1095,7 +1095,7 @@
         <div id="freerows"></div>
         <div class="phead" id="priorhead" tabindex="0" data-tip="These parameters are also in the joint fit, held by tight priors from the calibration posterior (with its L–t₀ correlation). Their uncertainty is counted in the answer — never hard-pinned.">tight priors ← calibration posterior</div>
         <div id="priorrows"></div>
-        <div class="fitrow"><button type="button" id="btn-fit">fit this pixel</button><button type="button" id="btn-map">fit every pixel</button><span class="chi" id="v-chi"></span><span class="ihint" tabindex="0" data-tip="Demo reductions: n·d in units of peak optical depth at the 4.3 eV line (real deliverable: atoms/barn); K(t|E) rendered as a constant-relative-width blur (θ_res = ΔE/E); 13×9 pixel grid (VENUS is 512×512); one frame for in-situ.">i</span></div>
+        <div class="fitrow"><button type="button" id="btn-fit">fit this pixel</button><button type="button" id="btn-map">fit every pixel</button><span class="chi" id="v-chi"></span><span class="ihint" tabindex="0" data-tip="Demo reductions: n·d in units of peak optical depth at the 4.3 eV line at the 295 K reference (real deliverable: atoms/barn); K(t|E) rendered as a constant-relative-width blur (θ_res = ΔE/E); 13×9 pixel grid (VENUS is 512×512); one frame for in-situ.">i</span></div>
       </div>
     </div>
 
@@ -1893,6 +1893,15 @@
       <details class="rec walk" id="rr5-1"><summary><span class="rid">R5·1</span> RML (LRF=7) reclassified: declared-unsupported, fail-closed — not a supported formalism</summary>
 <div class="story">        <p>The Phase-4 text listed the supported resolved formalisms as &#8220;RM / RML / MLBW&#8221;. At Phase-5 reconciliation the project removed the R-Matrix-Limited (LRF=7) computation path (with the unresolved-region path) as dead-and-incomplete code; the scope envelope&#8217;s calibrant and sample isotopes (Ta / W / Au / Ag, 5&#8211;200&#8202;eV) all declare LRF&#8202;1/2/3. The law that survives unchanged is the one that mattered: the evaluation&#8217;s declared formalism is honoured <i>as given</i>, never silently substituted — an evaluation declaring LRF=7 is now rejected fail-closed with a loud diagnostic instead of being computed. The formalism list in the stage-3 law and the acceptance card was corrected to &#8220;RM / MLBW / SLBW&#8221; (SLBW, LRF=1, was always supported and belonged on the list). Adjudicated with the user at the Phase-5 plan approval.</p>
         <p class="where">API acceptance card + Pipelines stage-3 law · formalism support list</p></div></details>
+      <details class="rec walk" id="rr5-2"><summary><span class="rid">R5·2</span> &#8220;ρ = 1 by construction&#8221; corrected — a shared calibration vector does not force unit pixel correlation</summary>
+<div class="story">        <p>The results section (and the R1·11 fold) asserted the calibration systematic is common-mode with pairwise ρ = 1 &#8220;by construction&#8221; because pixels share one parameter vector, making σ²_stat/N + σ²_sys an exact floor. For a multi-dimensional θ that inference is invalid: shared δθ ~ N(0, Σ_cal) gives ρ<sub>ij</sub> = J<sub>i</sub>Σ_cal J<sub>j</sub>ᵀ normalized, which equals one only under proportional sensitivities (Cauchy&#8211;Schwarz); a numeric check with a {L, t₀} posterior gives ρ ≈ 0.58 between 1 eV- and 100 eV-dominated pixels. What survives: the systematic never averages down — the mean&#8217;s variance plateaus at ḡᵀΣ_cal ḡ. What changed: &#8220;exact&#8221; and &#8220;ρ = 1&#8221; are gone; aggregates use the full J<sub>i</sub>Σ_cal J<sub>j</sub>ᵀ block. Found in the Phase-5 branch review (cross-family verified); the R1·11 entry above is left as history.</p>
+        <p class="where">Physics · results &amp; uncertainty (aggregation floor)</p></div></details>
+      <details class="rec walk" id="rr5-3"><summary><span class="rid">R5·3</span> 1D↔2D predicted offset restated in commensurate units</summary>
+<div class="story">        <p>Two sites (the consequence paragraph and the QC table) wrote the predicted 1D↔2D offset as &#8220;⟨e^(−τ)⟩ &#8230; (−Var(τ)/2 to leading order)&#8221; — equating a transmission in (0,1) with an optical-depth offset. The fitted 1D-ROI optical depth is −ln⟨e^(−τ)⟩, so the predicted offset is −ln⟨e^(−τ)⟩ − ⟨τ⟩ ≈ −Var(τ)/2; the adjacent Jensen derivation and its worked numbers were already in the correct convention and are unchanged. Found in the Phase-5 branch review (cross-family verified); the R1·9 entry above is left as history.</p>
+        <p class="where">Physics · spatial dimension + results QC table</p></div></details>
+      <details class="rec walk" id="rr5-4"><summary><span class="rid">R5·4</span> Interactive demos made area-conserving — the on-screen physics now obeys the stage-2 law</summary>
+<div class="story">        <p>Both live demos broadened with fixed-unit-peak Gaussians: the line lab&#8217;s profile kept peak 1 while its width grew with T (σ-area +36% from 300 → 900 K), and the pipeline scene divided σ by its T-dependent peak — so the &#8220;n·d&#8221; control actually pinned peak optical depth, keeping dip depth T-invariant where the document&#8217;s own stage-2 law conserves the σ-area and trades depth for width. This is the same unit-peak normalization mistake the temperature-instance method note records for an earlier prose draft, reproduced in the demo JavaScript; the in-page fits could not expose it because data generation and fitting share the model. Fixed by anchoring both demos at the 295 K calibrant reference: profiles scale as w_ref/w(T) (area conserved; verified numerically to machine precision), n·d reads τ₀ at 295 K, the heat preset now shows the depth-for-width trade (+32% width, −20% depth), and the look-alike ghost was retuned (300 K, n·d 0.88, θ 2.48% matches the 900 K line to |ΔT| &lt; 0.004). The calibration demo and its published CALPOST numbers are unchanged: the foil is at 295 K, where old and new normalizations coincide. Found in the Phase-5 branch review (cross-family verified, both verifiers reproducing the +36% area defect to nine digits).</p>
+        <p class="where">Physics line lab + Pipelines interactive scene · demo JavaScript only</p></div></details>
     </div>
   </section>
 
@@ -2265,6 +2274,10 @@
     var RES = [[4.28, 1.0, 0.057], [10.36, 0.55, 0.20], [13.95, 0.18, 0.11],
                [20.3, 0.10, 0.12], [23.9, 0.35, 0.13], [35.9, 0.28, 0.21], [39.1, 0.14, 0.19]];
     var kB = 8.617333262e-5, N = 240, A181 = 181.0;
+    var WREFS = RES.map(function (r) {                  // per-line reference width at 295 K
+      var dDr = Math.sqrt(4 * kB * 295 * r[0] / A181);
+      return 0.55 * Math.sqrt(dDr * dDr + r[2] * r[2]);
+    });
     var USM = 72.3;                                     // µs per metre per √eV: t = USM·L/√E
     var E0 = [], tN = [];
     for (var i = 0; i < N; i++) {
@@ -2283,12 +2296,15 @@
         var dD = Math.sqrt(4 * kB * T * r[0] / A181);
         var w = 0.55 * Math.sqrt(dD * dD + r[2] * r[2]);
         var z = (Ee - r[0]) / w;
-        if (z * z < 60) s += r[1] * Math.exp(-0.5 * z * z) * 3.2;
+        // Area-conserving Doppler: amplitude scales as wRef/w(T) (wRef at the
+        // 295 K calibrant reference), so each line's sigma-area is T-invariant
+        // — the stage-2 law. A fixed unit peak would grow the area with T.
+        if (z * z < 60) s += r[1] * (WREFS[k] / w) * Math.exp(-0.5 * z * z) * 3.2;
       }
       return s;
     }
     var pkCache = {};
-    function sigPeak(T) {                               // peak sigma = 1 => nd is tau0 at 4.28 eV
+    function sigPeak(T) {                               // peak sigma at temperature T
       var key = Math.round(T);
       if (pkCache[key]) return pkCache[key];
       var pk = 0;
@@ -2296,11 +2312,16 @@
       pkCache[key] = pk;
       return pk;
     }
+    // Fixed normalization at the 295 K calibrant reference (FOIL.T): nd reads
+    // tau0 at 4.28 eV and 295 K. Dividing by sigPeak(T) instead would pin the
+    // PEAK optical depth across temperatures — violating Doppler area
+    // conservation and hiding the depth-vs-width trade the physics tab states.
+    var SIGPK0 = sigPeak(295);
     // truth: the instrument the data was really taken with (hidden from the fit);
     // effective L = surveyed 25 m + the moderator emission depth
     var INSTR = { L: 25.083, t0: 1.8, th: 0.0105 };
     function model(p) {
-      var m = new Array(N), pk = sigPeak(p.T), c = USM * p.L;
+      var m = new Array(N), pk = SIGPK0, c = USM * p.L;
       for (var i = 0; i < N; i++) {
         var dt = Math.max(tN[i] - p.t0, 30);
         var Ee = (c / dt) * (c / dt);
@@ -2929,7 +2950,7 @@
       var stageCache = {};
       function seriesFor(k) {
         if (stageCache[k]) return stageCache[k];
-        var i, out = new Array(N), pk = sigPeak(SD.T), pk0 = sigPeak(160);
+        var i, out = new Array(N), pk = SIGPK0, pk0 = sigPeak(160);
         if (k === 1) for (i = 0; i < N; i++) out[i] = sigmaU(E0[i], 160) / pk0;
         else if (k === 2) for (i = 0; i < N; i++) out[i] = sigmaU(E0[i], SD.T) / pk;
         else if (k === 3) for (i = 0; i < N; i++) out[i] = Math.exp(-SD.nd * sigmaU(E0[i], SD.T) / pk);
@@ -2974,11 +2995,18 @@
       if (!svgL) return;
       var ERl = 4.28, GAM = 0.057, NL = 400, EA = 3.4, EB = 5.2;
       var GL = []; for (var i = 0; i < NL; i++) GL.push(EA + i * (EB - EA) / (NL - 1));
+      // Area-conserving Doppler: amplitude scales as wRef/w(T) so the
+      // sigma-profile area is T-invariant (the stage-2 law this lab teaches);
+      // peak = 1 at the 295 K calibrant reference, so the n·d slider reads
+      // tau0 at 295 K. A fixed unit peak would pin tau0 instead of n·d and
+      // manufacture a spurious T-dependence (the mistake the method note in
+      // the temperature instance records).
+      var WREFL = 0.55 * Math.sqrt(4 * kB * 295 * ERl / A181 + GAM * GAM);
       function lineSigma(E, T) {
         var dD = Math.sqrt(4 * kB * T * ERl / A181);
         var w = 0.55 * Math.sqrt(dD * dD + GAM * GAM);
         var z = (E - ERl) / w;
-        return Math.exp(-0.5 * z * z);
+        return (WREFL / w) * Math.exp(-0.5 * z * z);
       }
       function curveL(nd, T, th) {
         var s = th * ERl / 2.355, dE = GL[1] - GL[0], R = Math.max(1, Math.ceil(3 * s / dE)), out = new Array(NL);
@@ -3061,17 +3089,17 @@
           wbar.setAttribute("y1", yh); wbar.setAttribute("y2", yh); wbar.setAttribute("display", "inline");
           wlab.setAttribute("x", xOfL(ERl + w / 2) + 8); wlab.setAttribute("y", yh + 4); wlab.textContent = "FWHM";
         } else { wbar.setAttribute("display", "none"); wlab.textContent = ""; }
-        if (ghostOn) { ghost.setAttribute("display", "inline"); ghost.setAttribute("d", pathL(curveL(0.8, 300, 0.0164))); }
+        if (ghostOn) { ghost.setAttribute("display", "inline"); ghost.setAttribute("d", pathL(curveL(0.88, 300, 0.0248))); }
         else ghost.setAttribute("display", "none");
       }
       function setL(T, nd, th) { Ti.value = T; ndi.value = nd; thi.value = th; }
       [Ti, ndi, thi].forEach(function (x) { x.addEventListener("input", function () { ghostOn = false; noteL.textContent = ""; drawL(); }); });
       document.getElementById("lb-heat").addEventListener("click", function () { ghostOn = false; setL(900, 0.5, 0.0105);
-        noteL.textContent = "T 300 → 900 K at fixed n·d — the dip widens +32 %. Doppler broadening (stage 2)."; drawL(); });
+        noteL.textContent = "T 300 → 900 K at fixed n·d — the dip widens +32 % and shallows −20 %: Doppler conserves the line’s area (stage 2), trading depth for width."; drawL(); });
       document.getElementById("lb-thick").addEventListener("click", function () { ghostOn = false; setL(300, 3, 0.0105);
-        noteL.textContent = "n·d 0.3 → 3 at the SAME 300 K — the width grows the same +32 %. Width is not a thermometer; n·d and T fit jointly."; drawL(); });
+        noteL.textContent = "n·d 0.3 → 3 at the SAME 300 K — the width grows the same +32 % (and the dip deepens). Width is not a thermometer; n·d and T fit jointly."; drawL(); });
       document.getElementById("lb-look").addEventListener("click", function () { ghostOn = true; setL(900, 0.8, 0.0105);
-        noteL.textContent = "Solid: 900 K, θ 1.05 %. Dashed: 300 K, θ 1.64 % — nearly the same line. Resolution comes from calibration, never the sample fit."; drawL(); });
+        noteL.textContent = "Solid: 900 K, n·d 0.8, θ 1.05 %. Dashed: 300 K, n·d 0.88, θ 2.48 % — nearly the same line. Resolution comes from calibration, never the sample fit."; drawL(); });
       document.getElementById("lb-reset").addEventListener("click", function () { ghostOn = false; setL(300, 0.5, 0.0105); noteL.textContent = ""; drawL(); });
       drawL();
     })();
