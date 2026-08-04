@@ -465,13 +465,18 @@ impl ResonanceRange {
     /// Evaluable means a resolved (LRU=1) range using one of the implemented
     /// formalisms — SLBW (LRF=1), MLBW (LRF=2), or Reich-Moore (LRF=3) — with
     /// at least one resonance-bearing L-group. A resolved range whose L-groups
-    /// are all empty evaluates to exactly zero everywhere (including potential
-    /// scattering: J-groups derive from the resonance list, so an empty list
-    /// yields no J-groups), which is the silently-inert outcome this predicate
-    /// exists to catch. LRF=7 (R-Matrix Limited), LRU=2 (unresolved), and
-    /// LRU=0 (scattering-radius-only) ranges are parse-and-skip placeholders —
-    /// consumed for cursor alignment, never evaluated — so they return `false`
-    /// and contribute zero cross-section over their energy span.
+    /// are all empty evaluates to exactly zero in NEREIDS — an implementation
+    /// property, not a physics statement: NEREIDS derives its J-groups (and
+    /// with them the hard-sphere potential-scattering term) from the resonance
+    /// list, whereas SAMMY builds channels from the quantum numbers before
+    /// reading resonances and retains hard-sphere scattering for a
+    /// resonance-free group. Resonance-free channels are a declared NEREIDS
+    /// limitation; classifying the all-empty range non-evaluable keeps that
+    /// zero from being reported as physics. LRF=7 (R-Matrix Limited), LRU=2
+    /// (unresolved), and LRU=0 (scattering-radius-only) ranges are
+    /// parse-and-skip placeholders — consumed for cursor alignment, never
+    /// evaluated — so they return `false` and contribute zero cross-section
+    /// over their energy span.
     pub fn is_evaluable(&self) -> bool {
         self.resolved
             && matches!(

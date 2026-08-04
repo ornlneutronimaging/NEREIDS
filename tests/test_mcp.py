@@ -46,8 +46,14 @@ def _load_endf_or_skip(**kwargs):
     """
     try:
         return load_endf(**kwargs)
-    except OSError as exc:  # download/cache I/O failure, not a parse verdict
+    except OSError as exc:  # cache-file I/O failure, not a parse verdict
         pytest.skip(f"IAEA ENDF service unreachable: {exc}")
+    except RuntimeError as exc:
+        # The PyO3 binding maps retrieval (download) failures to RuntimeError;
+        # only network-shaped messages skip -- other RuntimeErrors propagate.
+        if "Network error" in str(exc) or "Failed to fetch" in str(exc):
+            pytest.skip(f"IAEA ENDF service unreachable: {exc}")
+        raise
 
 
 @pytest.fixture(autouse=True)
@@ -307,7 +313,7 @@ class TestDetectIsotopes:
 class TestInputValidation:
     def test_compute_cross_sections_invalid_energy(self):
         """Energy validation catches bad inputs."""
-        load_endf("Fe-56")
+        _load_endf_or_skip(isotope="Fe-56")
         with pytest.raises(ValueError, match="energy_min"):
             compute_cross_sections("Fe-56", energy_min=-1.0)
         with pytest.raises(ValueError, match="n_points"):
@@ -316,17 +322,17 @@ class TestInputValidation:
             compute_cross_sections("Fe-56", energy_min=100.0, energy_max=1.0)
 
     def test_compute_transmission_invalid_thickness(self):
-        load_endf("Fe-56")
+        _load_endf_or_skip(isotope="Fe-56")
         with pytest.raises(ValueError, match="thickness"):
             compute_transmission("Fe-56", thickness=-1.0)
 
     def test_forward_model_missing_key(self):
-        load_endf("Fe-56")
+        _load_endf_or_skip(isotope="Fe-56")
         with pytest.raises(ValueError, match="thickness"):
             forward_model([{"isotope": "Fe-56"}])  # missing thickness
 
     def test_detect_isotopes_empty_traces(self):
-        load_endf("Fe-56")
+        _load_endf_or_skip(isotope="Fe-56")
         with pytest.raises(ValueError, match="empty"):
             detect_isotopes("Fe-56", 0.01, [])
 

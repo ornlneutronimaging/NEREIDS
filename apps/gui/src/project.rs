@@ -897,17 +897,18 @@ fn state_from_snapshot(snap: ProjectSnapshot, state: &mut AppState, path: &Path)
     // range) are absent from `endf_cache`, so the isotopes below fall through
     // to `EndfStatus::Pending` and are re-fetched on demand — the fetch worker
     // then surfaces the parser's hard error. Warn so the drop is visible.
-    // Collected into the load status line + provenance log below (a
+    // ENDF restore notices (dropped stale entries + parsed-but-skipped
+    // spans), collected into the load status line + provenance log below (a
     // tracing::warn alone lands only in the log file, where a user re-running
     // a saved fit would miss that the isotope set changed).
-    let mut endf_drop_notices: Vec<String> = Vec::new();
+    let mut endf_notices: Vec<String> = Vec::new();
     for symbol in &snap.endf_cache_dropped {
         tracing::warn!(
             isotope = %symbol,
             "cached ENDF evaluation dropped on project load (no evaluable \
              resonance range — stale removed-physics data); re-fetch required"
         );
-        endf_drop_notices.push(format!(
+        endf_notices.push(format!(
             "cached ENDF data for {symbol} was dropped (no evaluable resonance \
              range — stale removed-physics data); the isotope is Pending and \
              excluded from fits until re-fetched"
@@ -915,9 +916,25 @@ fn state_from_snapshot(snap: ProjectSnapshot, state: &mut AppState, path: &Path)
     }
     let endf_cache: HashMap<String, ResonanceData> = snap.endf_cache.into_iter().collect();
     // Mixed evaluations that survived the load still carry parsed-but-skipped
-    // spans (zero cross-section). Emit the same warning the fetch worker emits.
+    // spans (zero cross-section). Emit the same warning the fetch worker
+    // emits, and surface a one-line notice in the load status/provenance —
+    // the same visibility the drop notices above get, for the same reason.
     for (symbol, rd) in &endf_cache {
         warn_unevaluated_ranges(symbol, rd);
+        let skipped = rd.unevaluated_ranges();
+        if !skipped.is_empty() {
+            endf_notices.push(format!(
+                "{symbol}: {} of {} resonance range(s) are parsed but NOT \
+                 evaluated ({}); those spans contribute zero cross-section",
+                skipped.len(),
+                rd.ranges.len(),
+                skipped
+                    .iter()
+                    .map(|r| r.skip_description())
+                    .collect::<Vec<_>>()
+                    .join("; ")
+            ));
+        }
     }
 
     // 8. Restore isotope entries with ENDF cache
@@ -1451,7 +1468,7 @@ fn state_from_snapshot(snap: ProjectSnapshot, state: &mut AppState, path: &Path)
     for msg in &mask_notices {
         status.push_str(&format!(" — WARNING: {msg}"));
     }
-    for msg in &endf_drop_notices {
+    for msg in &endf_notices {
         status.push_str(&format!(" — WARNING: {msg}"));
     }
     if let Some(ref msg) = detected_drift {
@@ -1475,7 +1492,7 @@ fn state_from_snapshot(snap: ProjectSnapshot, state: &mut AppState, path: &Path)
             format!("Pixel-mask restore: {msg}"),
         );
     }
-    for msg in &endf_drop_notices {
+    for msg in &endf_notices {
         state.log_provenance(
             ProvenanceEventKind::ConfigChanged,
             format!("ENDF restore: {msg}"),

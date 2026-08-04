@@ -486,13 +486,16 @@ fn parse_bw_range(
         });
     }
 
-    // A resolved range whose L-groups are all empty (every NRS=0) contributes
-    // exactly zero cross-section, including potential scattering. Reference
-    // readers (SAMMY mrml01.f Nresg==0 path; OpenScale) accept the shape, so
-    // it is NOT a hard error: `is_evaluable()` classifies it non-evaluable,
-    // making it a warn-and-skip placeholder like LRF=7/LRU=2/LRU=0 — a mixed
-    // file keeps its populated ranges, and a file where this is the only
-    // range still fails the no-evaluable-content guard, naming the span.
+    // A resolved range whose L-groups are all empty (every NRS=0) is accepted
+    // by reference readers (SAMMY, OpenScale), so it is NOT a hard error here.
+    // NEREIDS cannot evaluate it: its J-groups (and the hard-sphere
+    // potential-scattering term) derive from the resonance list, while SAMMY
+    // builds channels from quantum numbers and would retain hard-sphere
+    // scattering for the shape — a declared limitation. `is_evaluable()`
+    // therefore classifies it non-evaluable: a warn-and-skip placeholder like
+    // LRF=7/LRU=2/LRU=0, so a mixed file keeps its populated ranges, and a
+    // file where this is the only range fails the no-evaluable-content guard
+    // (fail-closed beats silently reporting zero as physics).
 
     Ok(ResonanceRange {
         energy_low: ctx.energy_low,
@@ -597,13 +600,16 @@ fn parse_reich_moore_range(
         });
     }
 
-    // A resolved range whose L-groups are all empty (every NRS=0) contributes
-    // exactly zero cross-section, including potential scattering. Reference
-    // readers (SAMMY mrml01.f Nresg==0 path; OpenScale) accept the shape, so
-    // it is NOT a hard error: `is_evaluable()` classifies it non-evaluable,
-    // making it a warn-and-skip placeholder like LRF=7/LRU=2/LRU=0 — a mixed
-    // file keeps its populated ranges, and a file where this is the only
-    // range still fails the no-evaluable-content guard, naming the span.
+    // A resolved range whose L-groups are all empty (every NRS=0) is accepted
+    // by reference readers (SAMMY, OpenScale), so it is NOT a hard error here.
+    // NEREIDS cannot evaluate it: its J-groups (and the hard-sphere
+    // potential-scattering term) derive from the resonance list, while SAMMY
+    // builds channels from quantum numbers and would retain hard-sphere
+    // scattering for the shape — a declared limitation. `is_evaluable()`
+    // therefore classifies it non-evaluable: a warn-and-skip placeholder like
+    // LRF=7/LRU=2/LRU=0, so a mixed file keeps its populated ranges, and a
+    // file where this is the only range fails the no-evaluable-content guard
+    // (fail-closed beats silently reporting zero as physics).
 
     Ok(ResonanceRange {
         energy_low: ctx.energy_low,
@@ -633,7 +639,7 @@ fn parse_reich_moore_range(
 /// verbatim, for two distinct reasons. Structural guards (KRM — it sets the
 /// NCH+1 vs NCH+2 row stride — and the NCH, IPP-range, NRS/NX/NPL checks)
 /// reject records that would otherwise misalign the stream. The quantum-flag
-/// guards (IFG/KRL, the PNT/SHF/mass particle-pair guards, KBK/KPS) do NOT
+/// guards (IFG/KRL, the PNT/mass particle-pair guards, KBK/KPS) do NOT
 /// affect the byte layout; they are retained as deliberate strictness parity
 /// with the removed evaluator — a file carrying flags the evaluator never
 /// supported is rejected rather than silently consumed.
@@ -702,10 +708,10 @@ fn skip_rmatrix_limited_range(
         let b = i * 12;
         let ma = pp_values[b];
         let mb = pp_values[b + 1];
-        let za = pp_values[b + 2];
-        let zb = pp_values[b + 3];
         let pnt = pp_int_flag(pp_values[b + 7], "PNT", i)?;
-        let shf = pp_int_flag(pp_values[b + 8], "SHF", i)?;
+        // SHF is validated-and-narrowed (must be 0 or 1) but otherwise unused
+        // in the skip path — see the Coulomb note below.
+        pp_int_flag(pp_values[b + 8], "SHF", i)?;
         // PNT (Lpent) must be 0 or 1 (SAMMY rml/mrml03.f:22 Check_Quantum rejects
         // Lpent ∉ {0,1}; PNT=2 "ASSIGN" is unimplemented).
         if pnt != 0 && pnt != 1 {
@@ -739,15 +745,14 @@ fn skip_rmatrix_limited_range(
                 )));
             }
         }
-        // Coulomb + SHF=1: closed-channel Coulomb shift at imaginary argument is
-        // unimplemented (SAMMY rml/mrml07.f Pghcou only for open channels).
-        if za.abs() > 0.5 && zb.abs() > 0.5 && shf == 1 {
-            return Err(EndfParseError::UnsupportedFormat(format!(
-                "LRF=7 particle pair {i}: Coulomb channel (za={za}, zb={zb}) with \
-                 SHF=1 is not supported; closed-channel Coulomb shift at \
-                 imaginary rho is not yet implemented"
-            )));
-        }
+        // Coulomb + SHF=1 is valid ENDF and SAMMY accepts it (mrml03.f rejects
+        // only SHF outside {0,1}; mrml07.f passes Ishift into the open-channel
+        // Coulomb calculation). The removed evaluator could not compute the
+        // closed-channel Coulomb shift and rejected the combination; with the
+        // parameters now discarded there is nothing to protect, and rejecting
+        // would fail a whole mixed file over a range that is skipped anyway.
+        // SHF is still validated-and-narrowed above (pp_int_flag), so a
+        // malformed flag remains a hard error.
     }
 
     for _ in 0..njs {
@@ -1828,8 +1833,10 @@ mod tests {
     ///
     /// ENDF-6 §2.2.2.2: for LFW=1/LRF=2 the per-(L,J) LIST layout is
     /// **identical to LFW=0/LRF=2** (the fission widths are already
-    /// per-energy-point in the LIST tail), so the parser dispatches to
-    /// the shared `parse_urr_range` path and produces full URR data.
+    /// per-energy-point in the LIST tail), so the parser dispatches to the
+    /// shared `skip_urr_range` path: the URR body is parsed-and-skipped
+    /// (structural guards applied, values discarded) and the range is
+    /// stored as a non-evaluable placeholder.
     ///
     /// We previously gated this assertion on a `../SAMMY/...t149a.endf`
     /// sibling checkout; on CI (and on any clean clone) the file was
