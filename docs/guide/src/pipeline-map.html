@@ -610,7 +610,7 @@
     <div class="stagepanel" data-stage="2" hidden>
       <div class="step">
         <div class="step-top"><span class="step-no">2</span><span class="step-name">Doppler broadening</span><span class="step-eq"><math><msub><mi>Δ</mi><mi>D</mi></msub><mo>≈</mo><msqrt><mrow><mn>4</mn><msub><mi>k</mi><mi>B</mi></msub><msub><mi>T</mi><mtext>eff</mtext></msub><mi>E</mi><mo>/</mo><mi>A</mi></mrow></msqrt></math></span></div>
-        <p class="step-body">Broadens σ; <b>temperature enters the whole pipeline only here</b>. The exact free-gas kernel conserves the reaction rate (1/v exact); the σ-area only to O((Δ_D/E)²), and the √ form is its high-energy approximation. For lattice-bound solids the temperature is an effective kinetic T_eff (phonon DOS / Debye) — a scalar correction (~+1.6% width Ta, ~+4% W at 300 K). Isotropic: texture does not affect the resonance width for cubic metals (distinct from the Bragg-edge effect).</p>
+        <p class="step-body">Broadens σ; <b>temperature enters the line shape only here</b> (in the in-situ instance it also enters the areal density through thermal expansion, n·d(T) — a Beer-Lambert pathway, not a line-shape one). The exact free-gas kernel conserves the reaction rate (1/v exact); the σ-area only to O((Δ_D/E)²), and the √ form is its high-energy approximation. For lattice-bound solids the temperature is an effective kinetic T_eff (phonon DOS / Debye) — a scalar correction (~+1.6% width Ta, ~+4% W at 300 K). Isotropic: texture does not affect the resonance width for cubic metals (distinct from the Bragg-edge effect).</p>
         <p class="parline">parameters: temperature T → T_eff · Debye θ_D (scalar) · per-isotope mass A</p>
       </div>
     </div>
@@ -2528,7 +2528,7 @@
       mod: "The moderator releases each pulse with a slight emission tail — the timing blur K(t|E) that θ_res describes and calibration measures. It also adds an effective ≈8 cm to the flight path.",
       axis: "One axis, two currencies: time of flight increases to the right, energy decreases — E = ½·m_n·(L/(t−t₀))², evaluated inside the fit. The marked energies are Ta-181 resonances.",
       resid: "Residuals = (data − prediction)/σ. Red points are off by more than 2σ; flat teal noise means the physics accounts for every count.",
-      post: "The answer is not one number but a probability cloud — the ellipse marks the 68% region. A tilted ellipse means the two parameters partly mimic each other; ρ says how strongly (−1 to 1). Tight-prior parameters keep their small stated uncertainty inside this answer."
+      post: "The answer is not one number but a probability cloud — the ellipses sketch the joint posterior\u2019s 1σ and 2σ contours (a bivariate 1σ contour holds ~39% of the probability; the per-parameter ±1σ intervals shown beside it are its one-dimensional shadows at 68.3% each). A tilted ellipse means the two parameters partly mimic each other; ρ says how strongly (−1 to 1). Tight-prior parameters keep their small stated uncertainty inside this answer."
     };
     var tipEl = document.getElementById("scntip");
     function showTip(n, x, y) {
@@ -2987,7 +2987,7 @@
       var YLAB = { 1: "σ / σ_peak", 2: "σ / σ_peak", 3: "transmission", 4: "transmission", 5: "counts (rel.)", 6: "counts (rel.)" };
       var CAPS = {
         1: ["bare σ(E) — sharp resonance lines (T → 0)", "energy →"],
-        2: ["Doppler-broadened σ(E; T) — temperature enters here, and only here", "energy →"],
+        2: ["Doppler-broadened σ(E; T) — temperature enters the line shape here, and only here", "energy →"],
         3: ["transmission exp(−n·d·σ) — depth carries n·d; deep lines saturate", "energy →"],
         4: ["the same curve, measured in time of flight — E(t; L, t₀) inside the fit", "time of flight → (energy runs the other way)"],
         5: ["+ the instrument blur K(t|E) — dips soften and widen", "time of flight →"],
