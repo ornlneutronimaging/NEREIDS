@@ -1,6 +1,7 @@
 # Summary
 
 - [Introduction](./introduction.md)
+- [Pipeline Map (interactive)](./interactive-pipeline-map.md)
 - [Installation](./installation.md)
 - [Quickstart: Rust](./quickstart-rust.md)
 - [Quickstart: Python](./quickstart-python.md)
