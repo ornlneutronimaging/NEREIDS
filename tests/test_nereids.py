@@ -338,8 +338,11 @@ class TestResonanceData:
         assert data.has_unevaluated_ranges, (
             "the skipped URR range must be flagged as unevaluated"
         )
-        # The resolved Reich-Moore range is fully usable.
-        assert data.n_resonances > 500
+        # The resolved Reich-Moore range is fully usable. The vendored tape
+        # is byte-pinned, so the count is exact: a lower bound would still
+        # pass if the parser silently dropped most of the resolved range.
+        # Update this number only when the fixture is deliberately replaced.
+        assert data.n_resonances == 1653
         # Explicit alias must agree with n_resonances.
         assert data.total_resonance_count == data.n_resonances
 
