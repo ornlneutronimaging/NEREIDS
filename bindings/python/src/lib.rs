@@ -79,7 +79,8 @@ struct PyResonanceData {
 impl PyResonanceData {
     /// String representation.
     fn __repr__(&self) -> String {
-        // Formalism-aware count (covers LRF=7 R-matrix-limited spin groups too).
+        // Discrete-resonance count over evaluable LRF=1/2/3 ranges; skipped
+        // LRF=7 / LRU=2 placeholder ranges contribute 0.
         let n_res: usize = self.inner.total_resonance_count();
         format!(
             "ResonanceData(Z={}, A={}, AWR={:.3}, n_resonances={})",
@@ -108,47 +109,86 @@ impl PyResonanceData {
         self.inner.awr
     }
 
-    /// Number of resonances (across all ranges and all formalisms).
+    /// Number of discrete resonances (across all evaluable ranges).
     ///
-    /// Delegates to the formalism-aware
-    /// [`ResonanceData::total_resonance_count`], so LRF=7 R-matrix-limited
-    /// evaluations (whose resonances live in `rml.spin_groups`, not
-    /// `l_groups`) are counted correctly instead of reporting 0.
+    /// Delegates to [`ResonanceData::total_resonance_count`], which counts the
+    /// L-grouped resonances of evaluable LRF=1/2/3 ranges. LRF=7 (and LRU=2)
+    /// ranges are parsed-and-skipped — NEREIDS does not evaluate them — so they
+    /// contribute 0.
     #[getter]
     fn n_resonances(&self) -> usize {
         self.inner.total_resonance_count()
     }
 
-    /// Total resonance count across all ranges and formalisms.
+    /// Total resonance count across all ranges.
     ///
-    /// Explicit alias for [`Self::n_resonances`]; both delegate to the
-    /// formalism-aware Rust `ResonanceData::total_resonance_count()` (covers
-    /// LRF=1/2/3 L-groups and LRF=7 R-matrix-limited spin groups).
+    /// Explicit alias for [`Self::n_resonances`]; both delegate to the Rust
+    /// `ResonanceData::total_resonance_count()`, which counts LRF=1/2/3
+    /// L-group resonances only (skipped LRF=7 / LRU=2 ranges contribute 0).
     #[getter]
     fn total_resonance_count(&self) -> usize {
         self.inner.total_resonance_count()
     }
 
-    /// Target spin (I) of the first resonance range.
+    /// Whether the evaluation carries parsed-but-not-evaluated ranges.
+    ///
+    /// `True` when any range is a parse-and-skip placeholder (LRF=7
+    /// R-Matrix Limited, LRU=2 URR, or LRU=0 scattering-radius-only). Those
+    /// spans contribute zero
+    /// cross-section — a `UserWarning` listing them is emitted at load time
+    /// by `load_endf` / `load_endf_file`. Files with NO evaluable range at
+    /// all fail to load instead (ValueError).
+    #[getter]
+    fn has_unevaluated_ranges(&self) -> bool {
+        self.inner.has_unevaluated_ranges()
+    }
+
+    /// One-line descriptions of the parse-and-skip placeholder ranges.
+    ///
+    /// One string per non-evaluable range (LRF=7 R-Matrix Limited, LRU=2 URR,
+    /// or LRU=0 scattering-radius-only), formatted by the shared Rust
+    /// `ResonanceRange::skip_description` — the same text used in the load-time
+    /// `UserWarning` and the parser's rejection message. Empty when
+    /// [`Self::has_unevaluated_ranges`] is `False`.
+    #[getter]
+    fn skipped_ranges(&self) -> Vec<String> {
+        self.inner
+            .unevaluated_ranges()
+            .iter()
+            .map(|r| r.skip_description())
+            .collect()
+    }
+
+    /// Target spin (I) of the first evaluable resonance range.
+    ///
+    /// Parse-and-skip placeholders (LRU=0 / LRF=7 / URR) may precede the
+    /// evaluable ranges on mixed tapes; their SPI describes a span the
+    /// cross-section code never evaluates, so the getter skips them (falling
+    /// back to the first range only if nothing is evaluable).
     #[getter]
     fn target_spin(&self) -> f64 {
         self.inner
             .ranges
-            .first()
+            .iter()
+            .find(|r| r.is_evaluable())
+            .or_else(|| self.inner.ranges.first())
             .map(|r| r.target_spin)
             .unwrap_or(0.0)
     }
 
-    /// Effective scattering radius (fm).
+    /// Effective scattering radius (fm) of the first evaluable range.
     ///
-    /// Returns the global AP from the first range. If AP=0 (common in
+    /// Returns the global AP from the first evaluable range (skipping
+    /// parse-and-skip placeholders, as for `target_spin`). If AP=0 (common in
     /// ENDF Reich-Moore data that uses energy-dependent radii), falls back
     /// to the first L-group's channel radius APL.
     #[getter]
     fn scattering_radius(&self) -> f64 {
         self.inner
             .ranges
-            .first()
+            .iter()
+            .find(|r| r.is_evaluable())
+            .or_else(|| self.inner.ranges.first())
             .map(|r| {
                 if r.scattering_radius != 0.0 {
                     r.scattering_radius
@@ -209,6 +249,45 @@ fn load_and_parse_endf(
     let data =
         parse_endf_file2(&contents).map_err(|e| (true, format!("ENDF parse error: {}", e)))?;
     Ok(data)
+}
+
+/// Emit a Python ``UserWarning`` when parsed ENDF data contains
+/// parse-and-skip placeholder ranges (LRF=7 R-Matrix Limited, LRU=2 URR, or
+/// LRU=0 scattering-radius-only).
+///
+/// Those spans contribute exactly zero cross-section, so any physics computed
+/// over them reflects only the evaluation's other ranges. The parser already
+/// hard-errors when NO range is evaluable; this warning covers the mixed case
+/// (e.g. Ta-181, U-238), where the file loads but part of its declared energy
+/// coverage is silently inert without this signal. Callers can catch, filter,
+/// or escalate it with the stdlib ``warnings`` module.
+///
+/// ``stacklevel=1`` attributes the warning to the frame that invoked the
+/// pyo3 function — extension functions execute inside the caller's Python
+/// frame, so level 1 is already the Python call site (same rationale as
+/// `emit_tiff_load_warnings`).
+fn warn_unevaluated_ranges(py: Python<'_>, data: &ResonanceData, origin: &str) -> PyResult<()> {
+    const WARN_STACKLEVEL: i32 = 1;
+    let skipped = data.unevaluated_ranges();
+    if skipped.is_empty() {
+        return Ok(());
+    }
+    let spans: Vec<String> = skipped.iter().map(|r| r.skip_description()).collect();
+    let msg = format!(
+        "{origin}: {} of {} resonance range(s) are parsed but NOT evaluated: {}. \
+         These spans contribute zero cross-section (transmission = 1); NEREIDS \
+         evaluates resolved LRF=1/2/3 ranges only.",
+        skipped.len(),
+        data.ranges.len(),
+        spans.join("; ")
+    );
+    let c_msg = std::ffi::CString::new(msg).map_err(|e| {
+        pyo3::exceptions::PyValueError::new_err(format!(
+            "internal ENDF-load warning message contained a NUL byte: {e}"
+        ))
+    })?;
+    let category = py.get_type::<pyo3::exceptions::PyUserWarning>();
+    PyErr::warn(py, category.as_any(), &c_msg, WARN_STACKLEVEL)
 }
 
 /// Python wrapper for isotope groups.
@@ -325,6 +404,17 @@ impl PyIsotopeGroup {
                 })
             })
             .collect::<PyResult<Vec<_>>>()?;
+        // Warn about skipped ranges BEFORE mutating self: a caller that
+        // escalates warnings to exceptions (warnings.simplefilter("error"))
+        // must not observe a partially-updated group.
+        for (i, data) in staged.iter().enumerate() {
+            let member = &self.inner.members()[i];
+            warn_unevaluated_ranges(
+                py,
+                data,
+                &format!("ENDF Z={} A={}", member.0.z(), member.0.a()),
+            )?;
+        }
         // All succeeded — swap in atomically.
         for (i, data) in staged.into_iter().enumerate() {
             self.resonance_data[i] = Some(data);
@@ -1151,7 +1241,7 @@ fn cross_sections<'py>(
     // Validate the full grid up front so invalid input surfaces as ValueError
     // rather than a release-mode `PanicException` from the per-point
     // `assert!(energy_ev.is_finite() && energy_ev > 0.0)` guards added to
-    // the SLBW / RML / URR leaf paths.  Sibling PyO3 entries
+    // the SLBW / Reich-Moore leaf paths.  Sibling PyO3 entries
     // (`doppler_broaden`, `resolution_broaden`, `forward_model`, etc.)
     // already validate via this same helper; this entry was the lone gap.
     let e_slice = energies.as_slice()?;
@@ -1240,9 +1330,9 @@ fn forward_model<'py>(
     // Validate the energy grid up front so invalid input surfaces as
     // ValueError rather than a release-mode `PanicException` from the
     // per-point `assert!(energy_ev.is_finite() && energy_ev > 0.0)` guards
-    // added to the SLBW / RML / URR / Reich-Moore leaf paths.  Empty
-    // grids are accepted (the downstream `transmission::forward_model`
-    // returns an empty vector for an empty grid).
+    // added to the SLBW / Reich-Moore leaf paths.  Empty grids are accepted
+    // (the downstream `transmission::forward_model` returns an empty vector
+    // for an empty grid).
     let e_slice = energies.as_slice()?;
     validate_energy_grid(e_slice)?;
     let e_owned = e_slice.to_vec();
@@ -1804,6 +1894,8 @@ fn load_endf(
         )));
     }
 
+    warn_unevaluated_ranges(py, &data, &format!("ENDF Z={z} A={a}"))?;
+
     Ok(PyResonanceData {
         inner: Arc::new(data),
     })
@@ -1838,6 +1930,8 @@ fn load_endf_file(py: Python<'_>, path: &str) -> PyResult<PyResonanceData> {
             pyo3::exceptions::PyIOError::new_err(msg)
         }
     })?;
+
+    warn_unevaluated_ranges(py, &data, path)?;
 
     Ok(PyResonanceData {
         inner: Arc::new(data),
@@ -1931,6 +2025,17 @@ fn create_resonance_data(
         }
     };
 
+    // A resolved range with no resonances at all evaluates to exactly zero
+    // cross-section everywhere (transmission = 1) — the same silently-inert
+    // shape the ENDF load path rejects. Reject it here too.
+    if groups.iter().all(|g| g.resonances.is_empty()) {
+        return Err(pyo3::exceptions::PyValueError::new_err(
+            "create_resonance_data: no resonances given (empty resonance list \
+             in every L-group); cross-sections would be identically zero \
+             everywhere (transmission = 1)",
+        ));
+    }
+
     Ok(PyResonanceData {
         inner: Arc::new(ResonanceData {
             isotope: Isotope::new(z, a).map_err(|e| {
@@ -1947,8 +2052,6 @@ fn create_resonance_data(
                 scattering_radius,
                 naps: 1,
                 l_groups: groups,
-                rml: None,
-                urr: None,
                 ap_table: None,
                 r_external: vec![],
             }],
@@ -3435,7 +3538,7 @@ fn py_calibrate_energy(
     // Validate the nominal energy grid up front so malformed energies
     // surface as ValueError rather than a release-mode `PanicException`
     // from the per-point `assert!(energy_ev.is_finite() && energy_ev > 0.0)`
-    // guards inside `transmission::forward_model` → SLBW / RML / URR
+    // guards inside `transmission::forward_model` → SLBW / Reich-Moore
     // leaves.  Calibration requires at least one data point to fit
     // (L, t₀, n_total), so an empty grid is also rejected.
     require_non_empty_energy_grid(&e_owned)?;
@@ -4703,12 +4806,6 @@ fn spatial_result_to_py(
 ///         For transmission data this uses the transmission-domain background model.
 ///         For counts data this enables the same transmission background inside the
 ///         count-domain KL/LM pipelines.
-///     fit_alpha_1: Fit counts nuisance flux scale `alpha_1` when using
-///         `from_counts_with_nuisance()`.
-///     fit_alpha_2: Fit detector-background scale `alpha_2` when using
-///         `from_counts_with_nuisance()`.
-///     alpha_1_init: Initial value for `alpha_1` (default 1.0).
-///     alpha_2_init: Initial value for `alpha_2` (default 1.0).
 ///     fit_energy_scale: Fit per-pixel SAMMY TZERO calibration (t0, L_scale).
 ///         Required for real VENUS counts data to match SAMMY chi2 performance.
 ///     t0_init_us: Initial TOF offset in microseconds (default 0.0).
@@ -4764,10 +4861,6 @@ fn spatial_result_to_py(
     fit_back_f = false,
     back_d_init = 0.01,
     back_f_init = 1.0,
-    fit_alpha_1 = false,
-    fit_alpha_2 = false,
-    alpha_1_init = 1.0,
-    alpha_2_init = 1.0,
     c = 1.0,
     enable_polish = None,
     fit_energy_scale = false,
@@ -4814,10 +4907,6 @@ fn py_spatial_map_typed<'py>(
     fit_back_f: bool,
     back_d_init: f64,
     back_f_init: f64,
-    fit_alpha_1: bool,
-    fit_alpha_2: bool,
-    alpha_1_init: f64,
-    alpha_2_init: f64,
     c: f64,
     enable_polish: Option<bool>,
     fit_energy_scale: bool,
@@ -4914,7 +5003,7 @@ fn py_spatial_map_typed<'py>(
     // ValueError rather than a release-mode `PanicException` from the
     // per-point `assert!(energy_ev.is_finite() && energy_ev > 0.0)`
     // guards inside the rayon-parallelised pipeline precompute → SLBW /
-    // RML / URR leaves.  Empty grids are accepted and yield an empty
+    // Reich-Moore leaves.  Empty grids are accepted and yield an empty
     // result; per-pixel failures still degrade gracefully via
     // `filter_map(Err(_) => None)`.
     validate_energy_grid(e_slice)?;
@@ -5038,23 +5127,9 @@ fn py_spatial_map_typed<'py>(
         background,
         fit_anorm,
     )?;
-    if fit_alpha_1 || fit_alpha_2 || alpha_1_init != 1.0 || alpha_2_init != 1.0 {
-        if data.kind != "counts_with_nuisance" {
-            return Err(pyo3::exceptions::PyValueError::new_err(
-                "counts background scaling requires from_counts_with_nuisance() input",
-            ));
-        }
-        config =
-            config.with_counts_background(nereids_pipeline::pipeline::CountsBackgroundConfig {
-                alpha_1_init,
-                alpha_2_init,
-                fit_alpha_1,
-                fit_alpha_2,
-                c,
-            });
-    } else if c != 1.0 && (data.kind == "counts" || data.kind == "counts_with_nuisance") {
-        // Caller provided `c` without alpha fitting — attach a minimal
-        // CountsBackgroundConfig carrying just the proton-charge ratio.
+    if c != 1.0 && (data.kind == "counts" || data.kind == "counts_with_nuisance") {
+        // Caller provided `c` (the proton-charge ratio) — attach a minimal
+        // CountsBackgroundConfig carrying just it for the counts-KL dispatch.
         config =
             config.with_counts_background(nereids_pipeline::pipeline::CountsBackgroundConfig {
                 c,
@@ -5160,10 +5235,6 @@ fn py_spatial_map_typed<'py>(
 ///     solver: "lm" (default), "kl", or "auto".
 ///     background: Enable transmission-lift background inside the counts fit.
 ///     detector_background: Optional detector/counts background reference.
-///     fit_alpha_1: Fit flux-scale nuisance parameter `alpha_1`.
-///     fit_alpha_2: Fit detector-background scale nuisance parameter `alpha_2`.
-///     alpha_1_init: Initial value for `alpha_1` (default 1.0).
-///     alpha_2_init: Initial value for `alpha_2` (default 1.0).
 ///     resolution: Optional resolution function.
 ///     groups: list of IsotopeGroup objects (mutually exclusive with isotopes).
 ///     initial_densities: Initial density guesses when using groups (default 0.001 each).
@@ -5216,10 +5287,6 @@ fn py_spatial_map_typed<'py>(
     l_scale_init = 1.0,
     energy_scale_flight_path_m = 25.0,
     detector_background = None,
-    fit_alpha_1 = false,
-    fit_alpha_2 = false,
-    alpha_1_init = 1.0,
-    alpha_2_init = 1.0,
     c = 1.0,
     resolution = None,
     flight_path_m = None,
@@ -5265,10 +5332,6 @@ fn py_fit_counts_spectrum_typed<'py>(
     l_scale_init: f64,
     energy_scale_flight_path_m: f64,
     detector_background: Option<PyReadonlyArray1<'py, f64>>,
-    fit_alpha_1: bool,
-    fit_alpha_2: bool,
-    alpha_1_init: f64,
-    alpha_2_init: f64,
     c: f64,
     resolution: Option<PyTabulatedResolution>,
     flight_path_m: Option<f64>,
@@ -5370,12 +5433,6 @@ fn py_fit_counts_spectrum_typed<'py>(
     } else {
         None
     };
-    if fit_alpha_2 && detector_background_vec.is_none() {
-        return Err(pyo3::exceptions::PyValueError::new_err(
-            "fit_alpha_2 requires detector_background to be provided",
-        ));
-    }
-
     let energies_vec = e_slice.to_vec();
     let res_fn = build_resolution(flight_path_m, delta_t_us, delta_l_m, resolution, None)?;
 
@@ -5455,21 +5512,10 @@ fn py_fit_counts_spectrum_typed<'py>(
     // Attach CountsBackgroundConfig whenever any of its fields deviates from
     // the default — including c, which is the explicit proton-charge ratio
     // consumed by the counts-KL (joint-Poisson) dispatch.
-    if fit_alpha_1
-        || fit_alpha_2
-        || alpha_1_init != 1.0
-        || alpha_2_init != 1.0
-        || c != 1.0
-        || solver == "kl"
-        || solver == "poisson"
-        || solver == "joint_poisson"
-    {
+    if c != 1.0 || solver == "kl" || solver == "poisson" || solver == "joint_poisson" {
         config = config.with_counts_background(CountsBackgroundConfig {
-            alpha_1_init,
-            alpha_2_init,
-            fit_alpha_1,
-            fit_alpha_2,
             c,
+            ..CountsBackgroundConfig::default()
         });
     }
 

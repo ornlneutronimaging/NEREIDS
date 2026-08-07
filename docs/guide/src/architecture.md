@@ -33,7 +33,7 @@ application, and Python bindings.
 | [`endf-mat`](api/endf_mat/) | Zero-dependency lookup tables: element symbols, MAT numbers, natural abundances, ZA encoding |
 | [`nereids-core`](api/nereids_core/) | Core types (`Isotope`, `Resonance`), physical constants, element data, error types |
 | [`nereids-endf`](api/nereids_endf/) | ENDF file retrieval from IAEA, local caching, File 2 resonance parameter parsing |
-| [`nereids-physics`](api/nereids_physics/) | Cross-section calculation (Reich-Moore, SLBW, RML, URR), Doppler/resolution broadening, Beer-Lambert transmission |
+| [`nereids-physics`](api/nereids_physics/) | Cross-section calculation (Reich-Moore, SLBW, MLBW), Doppler/resolution broadening, Beer-Lambert transmission |
 | [`nereids-io`](api/nereids_io/) | TIFF stack and NeXus/HDF5 loading, TOF-to-energy conversion, normalization, export |
 | [`nereids-fitting`](api/nereids_fitting/) | Levenberg-Marquardt and Poisson KL divergence optimizers, transmission fit model |
 | [`nereids-pipeline`](api/nereids_pipeline/) | Single-spectrum fitting, per-pixel spatial mapping (rayon), trace detectability |

@@ -8,7 +8,7 @@ Python type stubs, Python tests, Rust tests, mdBook guide, and Rustdoc.
 
 | Notebook group | Current status | Smoke-tested in CI | External requirements |
 |----------------|----------------|--------------------|-----------------------|
-| `foundations/` | Current examples for cross-sections, broadening, URR, and transmission physics. | No. Covered indirectly by Rust/Python physics tests. | ENDF downloads on first run for notebooks that call `load_endf(...)`. |
+| `foundations/` | Current examples for cross-sections, broadening, and transmission physics. | No. Covered indirectly by Rust/Python physics tests. | ENDF downloads on first run for notebooks that call `load_endf(...)`. |
 | `building_blocks/` | Current examples for ENDF loading, fitting, grouped isotopes, custom resolution, and TIFF I/O. | No. Core APIs are covered by `tests/test_nereids.py`. | ENDF downloads on first run; TIFF notebook may require local generated files. |
 | `workflows/` | Current end-to-end synthetic workflows. | No. | ENDF downloads on first run. |
 | `applications/` | Reference-data workflow. | No. | Requires external PLEIADES/Git LFS data, not bundled in normal PyPI installs. |

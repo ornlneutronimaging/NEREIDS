@@ -256,6 +256,18 @@ pub struct ProjectSnapshot {
     /// (symbol, resonance_data) pairs for offline loading.
     pub endf_cache: Vec<(String, ResonanceData)>,
 
+    /// Symbols whose cached ENDF data was dropped on load because it carried
+    /// no evaluable resonance range.
+    ///
+    /// Populated only by [`load_project`]; never written back. Legacy project
+    /// files (saved before the RML/URR removal) serialized `rml`/`urr`
+    /// payloads that the current [`ResonanceData`] struct no longer declares;
+    /// serde silently ignores those unknown fields, leaving a placeholder
+    /// range with no evaluable content. Restoring such an entry would mark the
+    /// isotope loaded yet contribute zero cross-section to every fit, so the
+    /// loader drops it here and records the symbol for the caller to re-fetch.
+    pub endf_cache_dropped: Vec<String>,
+
     // -- provenance --
     /// (timestamp, kind, message) triples.
     pub provenance: Vec<(String, String, String)>,
@@ -357,6 +369,7 @@ impl Default for ProjectSnapshot {
             kl_c_ratio: None,
             kl_enable_polish_override: None,
             endf_cache: vec![],
+            endf_cache_dropped: vec![],
             provenance: vec![],
         }
     }
@@ -2044,7 +2057,18 @@ fn read_endf_cache_into(file: &hdf5::File, snap: &mut ProjectSnapshot) -> Result
             .map_err(|e| hdf5_err(&format!("/endf_cache/{name}/resonance_data"), e))?;
         let rd: ResonanceData = serde_json::from_str(json.as_str())
             .map_err(|e| hdf5_err(&format!("deserialize /endf_cache/{name}"), e))?;
-        snap.endf_cache.push((name.clone(), rd));
+        // Drop cached data that carries no evaluable range. Legacy project
+        // files (saved before the RML/URR removal) serialized removed-physics
+        // payloads that now deserialize into placeholder ranges with no
+        // evaluable content; restoring them would mark the isotope loaded yet
+        // yield zero cross-section on every fit. Record the symbol so the
+        // caller re-fetches (the fetch path then surfaces the parser's hard
+        // error). Mixed evaluations (≥1 evaluable range) are kept as-is.
+        if rd.has_evaluable_range() {
+            snap.endf_cache.push((name.clone(), rd));
+        } else {
+            snap.endf_cache_dropped.push(name.clone());
+        }
     }
 
     Ok(())
@@ -2190,6 +2214,7 @@ mod tests {
             kl_c_ratio: None,
             kl_enable_polish_override: None,
             endf_cache: vec![],
+            endf_cache_dropped: vec![],
             provenance: vec![],
         }
     }
@@ -2642,23 +2667,152 @@ mod tests {
 
     #[test]
     fn test_roundtrip_endf_cache() {
+        use nereids_endf::resonance::{LGroup, Resonance, ResonanceFormalism, ResonanceRange};
+
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("rt_endf.nrd.h5");
         let mut snap = minimal_snapshot();
+        // An evaluable cache entry (resolved SLBW range with one resonance)
+        // must survive save/load. The loader drops entries with no evaluable
+        // range — that path is covered by
+        // `test_load_drops_legacy_non_evaluable_endf_cache`.
         let rd = ResonanceData {
-            isotope: nereids_core::types::Isotope::new(74, 182).unwrap(),
-            za: 74182,
-            awr: 180.948,
-            ranges: vec![],
+            isotope: nereids_core::types::Isotope::new(92, 238).unwrap(),
+            za: 92238,
+            awr: 236.006,
+            ranges: vec![ResonanceRange {
+                energy_low: 1e-5,
+                energy_high: 1e4,
+                resolved: true,
+                formalism: ResonanceFormalism::SLBW,
+                target_spin: 0.0,
+                scattering_radius: 9.4285,
+                naps: 1,
+                ap_table: None,
+                l_groups: vec![LGroup {
+                    l: 0,
+                    awr: 236.006,
+                    apl: 0.0,
+                    qx: 0.0,
+                    lrx: 0,
+                    resonances: vec![Resonance {
+                        energy: 6.674,
+                        j: 0.5,
+                        gn: 1.493e-3,
+                        gg: 23.0e-3,
+                        gfa: 0.0,
+                        gfb: 0.0,
+                    }],
+                }],
+                r_external: vec![],
+            }],
         };
-        snap.endf_cache = vec![("W-182".into(), rd)];
+        snap.endf_cache = vec![("U-238".into(), rd)];
         save_project(&path, &snap).unwrap();
         let loaded = load_project(&path).unwrap();
 
         assert_eq!(loaded.endf_cache.len(), 1);
-        assert_eq!(loaded.endf_cache[0].0, "W-182");
-        assert_eq!(loaded.endf_cache[0].1.za, 74182);
-        assert!((loaded.endf_cache[0].1.awr - 180.948).abs() < 1e-6);
+        assert_eq!(loaded.endf_cache[0].0, "U-238");
+        assert_eq!(loaded.endf_cache[0].1.za, 92238);
+        assert!((loaded.endf_cache[0].1.awr - 236.006).abs() < 1e-6);
+        assert!(loaded.endf_cache[0].1.has_evaluable_range());
+    }
+
+    #[test]
+    fn test_load_drops_legacy_non_evaluable_endf_cache() {
+        use nereids_endf::resonance::{LGroup, Resonance, ResonanceFormalism, ResonanceRange};
+
+        // A legacy project (saved before the RML/URR removal) persisted an
+        // LRF=7 isotope whose ResonanceData JSON carried `rml`/`urr` payloads
+        // the current struct no longer declares. serde silently ignores those
+        // unknown fields, so the entry deserializes as a placeholder range
+        // with empty l_groups — non-evaluable. Prove that (a) serde tolerates
+        // the legacy keys and (b) the loader drops the entry rather than
+        // restoring it as a zero-cross-section "loaded" isotope, while a
+        // sibling evaluable isotope in the same file is kept.
+        let non_evaluable = ResonanceData {
+            isotope: nereids_core::types::Isotope::new(40, 90).unwrap(),
+            za: 40090,
+            awr: 89.132,
+            ranges: vec![ResonanceRange {
+                energy_low: 1e-5,
+                energy_high: 1e4,
+                resolved: true,
+                formalism: ResonanceFormalism::RMatrixLimited,
+                target_spin: 0.0,
+                scattering_radius: 7.0,
+                naps: 0,
+                ap_table: None,
+                l_groups: vec![],
+                r_external: vec![],
+            }],
+        };
+
+        // Splice the legacy `rml`/`urr` keys serde now ignores back into the
+        // serialized payload, then round-trip through serde to confirm the
+        // unknown fields do not break deserialization and the entry stays
+        // non-evaluable.
+        let mut value = serde_json::to_value(&non_evaluable).unwrap();
+        value["ranges"][0]["rml"] = serde_json::json!({
+            "spin_groups": [],
+            "particle_pairs": []
+        });
+        value["ranges"][0]["urr"] = serde_json::json!({ "l_groups": [] });
+        let legacy_json = serde_json::to_string(&value).unwrap();
+        let restored: ResonanceData = serde_json::from_str(&legacy_json).unwrap();
+        assert!(
+            !restored.has_evaluable_range(),
+            "legacy LRF=7 payload must have no evaluable range"
+        );
+        assert!(restored.has_unevaluated_ranges());
+
+        // An evaluable sibling isotope (resolved SLBW with one resonance).
+        let evaluable = ResonanceData {
+            isotope: nereids_core::types::Isotope::new(92, 238).unwrap(),
+            za: 92238,
+            awr: 236.006,
+            ranges: vec![ResonanceRange {
+                energy_low: 1e-5,
+                energy_high: 1e4,
+                resolved: true,
+                formalism: ResonanceFormalism::SLBW,
+                target_spin: 0.0,
+                scattering_radius: 9.4285,
+                naps: 1,
+                ap_table: None,
+                l_groups: vec![LGroup {
+                    l: 0,
+                    awr: 236.006,
+                    apl: 0.0,
+                    qx: 0.0,
+                    lrx: 0,
+                    resonances: vec![Resonance {
+                        energy: 6.674,
+                        j: 0.5,
+                        gn: 1.493e-3,
+                        gg: 23.0e-3,
+                        gfa: 0.0,
+                        gfb: 0.0,
+                    }],
+                }],
+                r_external: vec![],
+            }],
+        };
+
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("legacy.nrd.h5");
+        let mut snap = minimal_snapshot();
+        snap.endf_cache = vec![("Zr-90".into(), restored), ("U-238".into(), evaluable)];
+        save_project(&path, &snap).unwrap();
+
+        let loaded = load_project(&path).unwrap();
+
+        // The non-evaluable Zr-90 entry is dropped and recorded; the evaluable
+        // U-238 entry is kept.
+        assert_eq!(loaded.endf_cache.len(), 1, "only the evaluable entry kept");
+        assert_eq!(loaded.endf_cache[0].0, "U-238");
+        assert!(loaded.endf_cache[0].1.has_evaluable_range());
+        assert_eq!(loaded.endf_cache_dropped, vec!["Zr-90".to_string()]);
     }
 
     #[test]

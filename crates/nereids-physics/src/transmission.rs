@@ -105,8 +105,9 @@ fn build_aux_grid(
 /// Extract (energy_eV, gd_eV) pairs from resonance data for fine-structure
 /// grid densification.
 ///
-/// For LRF=1/2/3 (BW and Reich-Moore): `gd = |Γn| + |Γγ| + |Γf1| + |Γf2|`
-/// For LRF=7 (R-Matrix Limited): `gd = |Γγ| + Σ|γ_i|²` (approximate)
+/// For LRF=1/2/3 (BW and Reich-Moore): `gd = |Γn| + |Γγ| + |Γf1| + |Γf2|`,
+/// walked from each resolved range's `l_groups`. Non-evaluable ranges
+/// (LRF=7, LRU=2) carry empty `l_groups` and contribute no pairs.
 ///
 /// SAMMY Ref: dat/mdat4.f90 Fspken — uses total width to define the region
 /// [E_res − gd, E_res + gd] for fine-structure point insertion.
@@ -117,26 +118,14 @@ fn extract_resonance_widths(resonance_data: &[&ResonanceData]) -> Vec<(f64, f64)
             if !range.resolved {
                 continue;
             }
-            // LRF=1/2/3: resonances grouped by L
+            // LRF=1/2/3: resonances grouped by L. LRF=7 (and LRU=2) ranges are
+            // parsed-and-skipped with empty l_groups and are not evaluated, so
+            // they contribute no resonance dips here.
             for lg in &range.l_groups {
                 for res in &lg.resonances {
                     let gd = res.gn.abs() + res.gg.abs() + res.gfa.abs() + res.gfb.abs();
                     if gd > 0.0 {
                         pairs.push((res.energy, gd));
-                    }
-                }
-            }
-            // LRF=7: resonances in spin groups
-            if let Some(ref rml) = range.rml {
-                for sg in &rml.spin_groups {
-                    for res in &sg.resonances {
-                        let mut gd = res.gamma_gamma.abs();
-                        for &w in &res.widths {
-                            gd += w * w; // γ² approximates Γ
-                        }
-                        if gd > 0.0 {
-                            pairs.push((res.energy, gd));
-                        }
                     }
                 }
             }
@@ -1552,8 +1541,6 @@ mod tests {
                         gfb: 0.0,
                     }],
                 }],
-                rml: None,
-                urr: None,
                 ap_table: None,
                 r_external: vec![],
             }],

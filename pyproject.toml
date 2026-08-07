@@ -74,14 +74,23 @@ pdoc = ">=14"
 mdbook = ">=0.5,<0.6"
 
 [tool.pixi.pypi-dependencies]
-# fastmcp removed from default env — causes importlib-metadata conflict
-# with conda's pinned version. Install manually: pixi add --pypi fastmcp
-# when MCP server functionality is needed.
+# fastmcp stays OUT of the default env: it conflicts with conda's pinned
+# importlib-metadata. It lives in the isolated `mcp` feature/environment below
+# so the MCP test suite (tests/test_mcp.py) can run in CI without perturbing
+# the default solve.
+
+[tool.pixi.feature.mcp.pypi-dependencies]
+fastmcp = ">=3.0"
+
+[tool.pixi.environments]
+mcp = ["mcp"]
 
 [tool.pixi.tasks]
 build = { cmd = "env -u VIRTUAL_ENV maturin develop --release --manifest-path bindings/python/Cargo.toml" }
 test-rust = { cmd = "env -u VIRTUAL_ENV cargo test --workspace" }
 test-python = { cmd = "python -m pytest tests/", depends-on = ["build"] }
+# Runs only in the `mcp` environment (fastmcp present): pixi run -e mcp test-mcp
+test-mcp = { cmd = "python -m pytest tests/test_mcp.py -v", depends-on = ["build"] }
 test = { depends-on = ["test-rust", "test-python"] }
 fmt = "cargo fmt --all"
 clippy = "cargo clippy --workspace --exclude nereids-python --all-targets -- -D warnings"

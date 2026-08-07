@@ -166,100 +166,26 @@ pub enum ResonanceFormalism {
     MLBW,
     /// Reich-Moore (LRF=3). Primary formalism for light and actinide isotopes.
     ReichMoore,
-    /// R-Matrix Limited (LRF=7). General multi-channel formalism; used for
-    /// many medium-heavy isotopes (W, Ta, Zr, etc.) in ENDF/B-VIII.0.
+    /// R-Matrix Limited (LRF=7). General multi-channel formalism (W, Ta, Zr,
+    /// etc. in ENDF/B-VIII.0). Parsed for cursor alignment but not evaluated:
+    /// the RML physics was removed because its closed-channel treatment was
+    /// incomplete (the Coulomb/SHF=1 closed-channel shift was unimplemented)
+    /// and the evaluator was never validated against SAMMY. Ranges tagged
+    /// `RMatrixLimited` are non-evaluable and resolve to Skip.
     RMatrixLimited,
-    /// Unresolved Resonance Region (LRU=2). Average cross-sections via
-    /// Hauser-Feshbach formalism. Cross-sections computed in `urr::urr_cross_sections`.
+    /// Unresolved Resonance Region (LRU=2). Parsed for cursor alignment but not
+    /// evaluated: NEREIDS does not compute URR average cross sections. The
+    /// Hauser-Feshbach path was removed because it lacked the ENDF
+    /// width-fluctuation correction (a systematically wrong average). Ranges
+    /// tagged `Unresolved` are non-evaluable and resolve to Skip.
     Unresolved,
-}
-
-// ─── LRU=2 (Unresolved Resonance Region) Data Structures ─────────────────────
-//
-// The URR uses average level-spacing and width parameters rather than discrete
-// resonances. Cross-sections are computed via the Hauser-Feshbach formula.
-//
-// LRF=1: single energy-independent width set per (L, J); Γ_n derived from
-//        reduced neutron width GNO via Γ_n = 2·P_L·GNO.
-// LRF=2: tabulated energy-dependent widths with an interpolation law per
-//        J-group; supported INT codes enforced by the parser at load time.
-//
-// Reference: ENDF-6 Formats Manual §2.2.2
-
-/// Average widths for one (L, J) combination in the Unresolved Resonance Region.
-///
-/// For LRF=1: `energies` is empty; each width vector has exactly one element.
-/// For LRF=2: all vectors have length NE; `int_code` selects the interpolation
-/// law (INT=1..=5 per ENDF-6 §0.5; validated by the parser, dispatched in
-/// `nereids_physics::urr`).
-///
-/// Reference: ENDF-6 Formats Manual §2.2.2
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct UrrJGroup {
-    /// Total angular momentum J.
-    pub j: f64,
-    /// Neutron χ² degrees of freedom (AMUN).
-    pub amun: f64,
-    /// Fission χ² degrees of freedom (AMUF); 0 for LRF=1 non-fissile.
-    pub amuf: f64,
-    /// Tabulation energies (eV). Empty for LRF=1.
-    pub energies: Vec<f64>,
-    /// Average level spacing D (eV). Single-element for LRF=1.
-    pub d: Vec<f64>,
-    /// Competitive width GX (eV). Single-element 0 for LRF=1.
-    pub gx: Vec<f64>,
-    /// Average neutron width (eV). For LRF=1 this is GNO (reduced width);
-    /// for LRF=2 this is the actual average Γ_n from the table.
-    pub gn: Vec<f64>,
-    /// Average gamma (capture) width GG (eV). Single-element for LRF=1.
-    pub gg: Vec<f64>,
-    /// Average fission width GF (eV). Single-element for LRF=1.
-    pub gf: Vec<f64>,
-    /// Interpolation law for the energy table (LRF=2 only).
-    /// INT=1..=5 per ENDF-6 §0.5 (1: histogram; 2: y linear in E;
-    /// 3: y linear in ln E; 4: ln y linear in E; 5: ln y linear in ln E).
-    /// Ignored for LRF=1 (no table).
-    #[serde(default = "default_int_code")]
-    pub int_code: u32,
-}
-
-fn default_int_code() -> u32 {
-    2
-}
-
-/// Average URR parameters for one L-value.
-///
-/// Reference: ENDF-6 Formats Manual §2.2.2
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct UrrLGroup {
-    /// Orbital angular momentum quantum number.
-    pub l: u32,
-    /// Atomic weight ratio for this L-group.
-    pub awri: f64,
-    /// J-groups within this L-value.
-    pub j_groups: Vec<UrrJGroup>,
-}
-
-/// Complete Unresolved Resonance Region data for one energy range (LRU=2).
-///
-/// Stored in `ResonanceRange::urr` when the range is an URR range.
-///
-/// Reference: ENDF-6 Formats Manual §2.2.2
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct UrrData {
-    /// LRF flag: 1 = single-level BWR (energy-independent widths),
-    ///           2 = multi-level BWR (energy-dependent width tables).
-    pub lrf: u32,
-    /// Target spin I.
-    pub spi: f64,
-    /// Scattering radius AP in fm (converted from ENDF 10⁻¹² cm at parse time).
-    pub ap: f64,
-    /// Lower URR energy bound (eV).
-    pub e_low: f64,
-    /// Upper URR energy bound (eV).
-    pub e_high: f64,
-    /// L-groups (one per orbital angular momentum value).
-    pub l_groups: Vec<UrrLGroup>,
+    /// Scattering-radius-only range (LRU=0). ENDF-6 §2.1: the standard stanza
+    /// for materials given a scattering radius but no resonance parameters. It
+    /// carries no resonances, so there is nothing to evaluate — the range is a
+    /// non-evaluable placeholder that resolves to Skip. Captured (rather than
+    /// dropped) so a file whose only range is LRU=0 is rejected with an error
+    /// that names the LRU=0 span instead of misreporting an empty file.
+    ScatteringRadiusOnly,
 }
 
 /// Top-level container for all resonance data parsed from an ENDF file.
@@ -315,16 +241,9 @@ pub struct ResonanceRange {
     /// Reference: ENDF-6 Formats Manual §2.2.1; SAMMY `mlb/mmlb1.f90`
     #[serde(default)]
     pub ap_table: Option<Tab1>,
-    /// Spin groups for LRF=1/2/3 (L-grouped). Empty for LRF=7 and LRU=2.
+    /// Spin groups for LRF=1/2/3 (L-grouped). Empty for LRF=7 and LRU=2 (both
+    /// parsed-and-skipped, non-evaluable).
     pub l_groups: Vec<LGroup>,
-    /// R-Matrix Limited data for LRF=7. `None` for LRF=1/2/3 and LRU=2.
-    pub rml: Option<Box<RmlData>>,
-    /// Unresolved Resonance Region data (LRU=2). `None` for all LRU=1 ranges.
-    ///
-    /// When `Some`, cross-sections are computed via the Hauser-Feshbach
-    /// formula in `nereids_physics::urr::urr_cross_sections`.
-    #[serde(default)]
-    pub urr: Option<Box<UrrData>>,
     /// R-external (background R-matrix) entries per spin group.
     ///
     /// Diagonal, real-valued corrections to the R-matrix that approximate
@@ -460,178 +379,12 @@ impl RExternalEntry {
     }
 }
 
-// ─── LRF=7 (R-Matrix Limited) Data Structures ────────────────────────────────
-//
-// LRF=7 organizes resonances by spin group (J,π) rather than L-value.
-// Each spin group has multiple explicit reaction channels. Resonances carry
-// reduced width amplitudes γ per channel, not formal widths Γ.
-//
-// Reference: ENDF-6 Formats Manual §2.2.1.6; SAMMY manual Ch. 3
-// SAMMY source: rml/mrml01.f (reader), rml/mrml11.f (cross-section calc)
-
-/// Particle pair definition for LRF=7 R-Matrix Limited.
-///
-/// Identifies the two particles in a reaction channel (e.g., neutron + W-184,
-/// or gamma + W-185). Used to determine which channels are entrance (neutron)
-/// channels and which are exit (fission, capture) channels.
-///
-/// Reference: ENDF-6 Formats Manual §2.2.1.6, Table 2.2
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct ParticlePair {
-    /// Mass of particle a (neutron = 1.0, in neutron mass units).
-    pub ma: f64,
-    /// Mass of particle b (target nucleus, in neutron mass units).
-    pub mb: f64,
-    /// Charge number Z of particle a, as stored in the ENDF LRF=7 particle-pair list.
-    /// ENDF LRF=7 stores the charge directly: neutron/photon = 0, proton = 1, alpha = 2.
-    /// Reference: SAMMY rml/mrml03.f — `Docoul = Kzb * Kza` (product of charges).
-    pub za: f64,
-    /// Charge number Z of particle b (target or recoil), as stored in ENDF LRF=7.
-    pub zb: f64,
-    /// Spin of particle a (1/2 for neutron).
-    pub ia: f64,
-    /// Spin of particle b (target spin I).
-    pub ib: f64,
-    /// Q-value for this reaction (eV). 0 for elastic.
-    pub q: f64,
-    /// Penetrability flag (ENDF `PNT`, SAMMY `Lpent`).
-    ///
-    /// `PNT=1`: calculate penetrability P_c and shift S_c analytically
-    /// (Blatt-Weisskopf / Coulomb). Used for open particle channels.
-    /// `PNT=0`: no penetrability — the channel contributes only the
-    /// `Ymat(2,Ii) -= 1` term (SAMMY `rml/mrml07.f:118-122`), encoded here as
-    /// `P_c=1, S_c=B_c`. Always the case for the photon/eliminated channel.
-    /// `PNT∉{0,1}` is rejected at parse time (SAMMY `Check_Quantum`,
-    /// `rml/mrml03.f:22`).
-    pub pnt: i32,
-    /// Shift factor flag.
-    ///
-    /// `SHF=1`: calculate shift factor S_c analytically (Blatt-Weisskopf).
-    /// `SHF=0`: do not calculate; treat S_c = B_c so (S_c − B_c) = 0 in level matrix.
-    pub shf: i32,
-    /// ENDF MT number identifying the reaction (2=elastic, 18=fission, 102=capture).
-    pub mt: u32,
-    /// Parity of particle a.
-    pub pa: f64,
-    /// Parity of particle b.
-    pub pb: f64,
-}
-
-/// A single reaction channel within an LRF=7 spin group.
-///
-/// Specifies which particle pair, what orbital angular momentum, and the
-/// radii used to compute penetrabilities and hard-sphere phase shifts.
-///
-/// Reference: ENDF-6 Formats Manual §2.2.1.6, Table 2.3
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct RmlChannel {
-    /// Index into the parent `RmlData::particle_pairs` vector.
-    pub particle_pair_idx: usize,
-    /// Orbital angular momentum quantum number L.
-    pub l: u32,
-    /// Channel spin S = |I ± 1/2|.
-    pub channel_spin: f64,
-    /// Boundary condition B (usually 0.0; shifts the shift factor reference).
-    pub boundary: f64,
-    /// Effective channel radius APE (fm), used to compute the hard-sphere phase φ_l.
-    ///
-    /// Per SAMMY `rml/mrml07.f:129,134` (`Rhof = Zkfe·Ex`, `Zkfe = Z·Rdeff`) the
-    /// EFFECTIVE radius feeds the phase shift (Sinsix), not the penetrability.
-    /// Independently corroborated by PLEIADES `models.py:385` ("Radius for
-    /// potential scattering").
-    pub effective_radius: f64,
-    /// True channel radius APT (fm), used to compute penetrability P_l and shift S_l.
-    ///
-    /// Per SAMMY `rml/mrml07.f:128,136` (`Rho = Zkte·Ex`, `Zkte = Z·Rdtru`) and
-    /// `rml/mrml03.f:244` (Betset width conversion), the TRUE radius feeds the
-    /// penetrability and shift (Pgh). Corroborated by PLEIADES `models.py:386`
-    /// ("Radius for penetrabilities and shifts").
-    pub true_radius: f64,
-}
-
-/// A single resonance in LRF=7 format.
-///
-/// For KRM=2 (standard R-matrix), `widths` contains reduced width amplitudes
-/// γ_c (eV^{1/2}) and `gamma_gamma = 0.0`.
-///
-/// For KRM=3 (Reich-Moore approximation), `widths` contains formal partial widths
-/// Γ_c (eV) and `gamma_gamma` is the capture width Γ_γ (eV) used to form complex
-/// pole energies: Ẽ_n = E_n - i·Γ_γn/2. The reduced amplitudes are derived as
-/// γ_nc = √(Γ_nc / (2·P_c(E_n))).
-///
-/// Reference: ENDF-6 Formats Manual §2.2.1.6; SAMMY manual §3.1
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct RmlResonance {
-    /// Resonance energy (eV).
-    pub energy: f64,
-    /// Width amplitudes per channel (eV^{1/2} for KRM=2; eV for KRM=3).
-    ///
-    /// Sign convention: sign(γ) encodes interference between resonances.
-    /// `widths.len()` equals the number of channels in the parent `SpinGroup`.
-    pub widths: Vec<f64>,
-    /// Capture (gamma) width Γ_γ (eV) for KRM=3 Reich-Moore approximation.
-    ///
-    /// Used to make the R-matrix denominator complex: E_n → E_n - i·Γ_γ/2.
-    /// Zero for KRM=2 (standard R-matrix, no complex energy shift).
-    pub gamma_gamma: f64,
-}
-
-/// A spin group (J, π) in LRF=7 R-Matrix Limited format.
-///
-/// Groups all resonances with the same total angular momentum J and parity π.
-/// Each spin group has its own set of reaction channels.
-///
-/// Reference: ENDF-6 Formats Manual §2.2.1.6; SAMMY rml/mrml01.f
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct SpinGroup {
-    /// Total angular momentum J.
-    pub j: f64,
-    /// Parity: +1.0 (even) or -1.0 (odd).
-    pub parity: f64,
-    /// Reaction channels for this spin group.
-    pub channels: Vec<RmlChannel>,
-    /// Resonances in this spin group.
-    pub resonances: Vec<RmlResonance>,
-    /// True when the ENDF file contained KBK > 0 or KPS > 0 background correction
-    /// records for this spin group.  The records are consumed by the parser but
-    /// the background terms are **not applied** to the cross-section calculation
-    /// (matching SAMMY behaviour: mrml10.f is a matrix utility, not a background
-    /// reader; KPS is explicitly ignored in mrml07.f).  Cross-sections computed
-    /// for spin groups with background corrections are therefore approximate.
-    #[serde(default)]
-    pub has_background_correction: bool,
-}
-
-/// Complete R-Matrix Limited data for one energy range (LRF=7).
-///
-/// Stored in `ResonanceRange::rml` when the formalism is `RMatrixLimited`.
-///
-/// Reference: ENDF-6 Formats Manual §2.2.1.6; SAMMY rml/mrml01.f
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct RmlData {
-    /// Target spin I.
-    pub target_spin: f64,
-    /// Atomic weight ratio (mass of target / neutron mass).
-    pub awr: f64,
-    /// Global scattering radius AP (fm); used as fallback when per-channel APE = 0.
-    pub scattering_radius: f64,
-    /// R-matrix type flag from ENDF CONT header.
-    ///
-    /// KRM=2: Standard multi-channel R-matrix (widths are reduced amplitudes γ).
-    /// KRM=3: Reich-Moore approximation (widths are formal partial widths Γ;
-    ///        capture enters via complex pole energies Ẽ_n = E_n - i·Γ_γ/2).
-    /// Reference: ENDF-6 Formats Manual §2.2.1.6; SAMMY rml/mrml01.f
-    pub krm: u32,
-    /// Particle pair definitions (NPP entries).
-    pub particle_pairs: Vec<ParticlePair>,
-    /// Spin groups (NJS entries), one per (J, π) combination.
-    pub spin_groups: Vec<SpinGroup>,
-}
-
 impl ResonanceData {
     /// Total number of resonances across all ranges and groups.
     ///
-    /// For LRF=7 ranges, counts resonances across all spin groups.
+    /// Counts the L-grouped resonances of evaluable LRF=1/2/3 ranges. LRF=7
+    /// (and LRU=2) ranges are parsed-and-skipped with empty `l_groups`, so
+    /// they contribute 0 — NEREIDS does not evaluate them.
     ///
     /// A low count for a given evaluation reflects that evaluation's
     /// resolved-resonance-region (RRR) extent, **not** a dropped energy range.
@@ -643,6 +396,39 @@ impl ResonanceData {
     /// in `parser.rs`, which pins the VIII.0 count as a regression guard.
     pub fn total_resonance_count(&self) -> usize {
         self.ranges.iter().map(|r| r.resonance_count()).sum()
+    }
+
+    /// Ranges that are parsed but NOT evaluated (non-evaluable placeholders).
+    ///
+    /// These are the LRF=7 (R-Matrix Limited), LRU=2 (unresolved), and LRU=0
+    /// (scattering-radius-only) ranges: the parser consumes their records for
+    /// cursor alignment and discards any resonance parameters they carry in
+    /// the file (LRF=7 and LRU=2 tapes do carry them; LRU=0 has none), so the
+    /// stored placeholder holds none and contributes exactly zero to every
+    /// cross-section. Any physics computed over their energy span reflects
+    /// only the *other* ranges of the evaluation. Callers that surface data
+    /// to users should warn when this list is non-empty.
+    pub fn unevaluated_ranges(&self) -> Vec<&ResonanceRange> {
+        self.ranges.iter().filter(|r| !r.is_evaluable()).collect()
+    }
+
+    /// Whether any range is a non-evaluable parse-and-skip placeholder.
+    ///
+    /// See [`Self::unevaluated_ranges`].
+    pub fn has_unevaluated_ranges(&self) -> bool {
+        self.ranges.iter().any(|r| !r.is_evaluable())
+    }
+
+    /// Whether at least one range can actually produce non-zero cross-sections.
+    ///
+    /// `false` means every range is a parse-and-skip placeholder (or there are
+    /// no ranges at all): the evaluation would return zero cross-section over
+    /// its full grid (transmission ≡ 1). This is the load-time acceptance
+    /// predicate — the parser rejects such an evaluation, and the project
+    /// loader drops it from the ENDF cache so a stale removed-physics payload
+    /// cannot silently restore as a zero-cross-section isotope.
+    pub fn has_evaluable_range(&self) -> bool {
+        self.ranges.iter().any(|r| r.is_evaluable())
     }
 }
 
@@ -665,13 +451,71 @@ impl ResonanceRange {
         }
     }
 
-    /// Total resonance count for this range (works for both LRF=1/2/3 and LRF=7).
+    /// Total discrete-resonance count for this range.
+    ///
+    /// Counts the L-grouped resonances of an evaluable LRF=1/2/3 range. LRF=7
+    /// (and LRU=2) ranges are parsed-and-skipped with empty `l_groups`, so they
+    /// contribute 0 — NEREIDS does not evaluate them.
     pub fn resonance_count(&self) -> usize {
-        if let Some(rml) = &self.rml {
-            rml.spin_groups.iter().map(|sg| sg.resonances.len()).sum()
-        } else {
-            self.l_groups.iter().map(|lg| lg.resonances.len()).sum()
-        }
+        self.l_groups.iter().map(|lg| lg.resonances.len()).sum()
+    }
+
+    /// Can this range actually produce non-zero cross-sections?
+    ///
+    /// Evaluable means a resolved (LRU=1) range using one of the implemented
+    /// formalisms — SLBW (LRF=1), MLBW (LRF=2), or Reich-Moore (LRF=3) — with
+    /// at least one resonance-bearing L-group. A resolved range whose L-groups
+    /// are all empty evaluates to exactly zero in NEREIDS — an implementation
+    /// property, not a physics statement: NEREIDS derives its J-groups (and
+    /// with them the hard-sphere potential-scattering term) from the resonance
+    /// list, whereas SAMMY builds channels from the quantum numbers before
+    /// reading resonances and retains hard-sphere scattering for a
+    /// resonance-free group. Resonance-free channels are a declared NEREIDS
+    /// limitation; classifying the all-empty range non-evaluable keeps that
+    /// zero from being reported as physics. LRF=7 (R-Matrix Limited), LRU=2
+    /// (unresolved), and LRU=0 (scattering-radius-only) ranges are
+    /// parse-and-skip placeholders — consumed for cursor alignment, never
+    /// evaluated — so they return `false` and contribute zero cross-section
+    /// over their energy span.
+    pub fn is_evaluable(&self) -> bool {
+        self.resolved
+            && matches!(
+                self.formalism,
+                ResonanceFormalism::SLBW
+                    | ResonanceFormalism::MLBW
+                    | ResonanceFormalism::ReichMoore
+            )
+            && self.l_groups.iter().any(|lg| !lg.resonances.is_empty())
+    }
+
+    /// One-line diagnostic for a parse-and-skip placeholder range, e.g.
+    /// `"LRF=7 (R-Matrix Limited) over [1.000000e-5, 1.000000e3] eV"`.
+    ///
+    /// Shared by the parser's no-evaluable-content error, the Python-binding
+    /// `UserWarning`, and the GUI load log so all three surfaces describe a
+    /// skipped range identically. Only meaningful for ranges where
+    /// [`Self::is_evaluable`] is `false`: the resolved-formalism arms label
+    /// the accepted-but-inert no-resonance shape (callers never pass an
+    /// evaluable range).
+    pub fn skip_description(&self) -> String {
+        let kind = match self.formalism {
+            ResonanceFormalism::RMatrixLimited => "LRF=7 (R-Matrix Limited)",
+            ResonanceFormalism::Unresolved => "LRU=2 (URR)",
+            ResonanceFormalism::ScatteringRadiusOnly => {
+                "LRU=0 (scattering-radius-only, no resonance parameters)"
+            }
+            // A resolved LRF=1/2/3 range reaches here only when it carries no
+            // resonances (every L-group empty) — accepted, warn-and-skip.
+            ResonanceFormalism::SLBW => "LRF=1 (SLBW) resolved range with no resonances",
+            ResonanceFormalism::MLBW => "LRF=2 (MLBW) resolved range with no resonances",
+            ResonanceFormalism::ReichMoore => {
+                "LRF=3 (Reich-Moore) resolved range with no resonances"
+            }
+        };
+        format!(
+            "{kind} over [{:.6e}, {:.6e}] eV",
+            self.energy_low, self.energy_high
+        )
     }
 }
 
@@ -815,12 +659,50 @@ mod tests {
             naps: 1,
             ap_table: None,
             l_groups: vec![],
-            rml: None,
-            urr: None,
             r_external: vec![],
         };
         assert_eq!(range.scattering_radius_at(1.0), 9.4285);
         assert_eq!(range.scattering_radius_at(1000.0), 9.4285);
+    }
+
+    /// `is_evaluable` is content-sensitive: a resolved LRF=1/2/3 range whose
+    /// L-groups are all empty is inert (zero cross-section everywhere,
+    /// potential scattering included, because J-groups derive from the
+    /// resonance list) and must not count as evaluable.
+    #[test]
+    fn test_is_evaluable_requires_resonances() {
+        let mut range = ResonanceRange {
+            energy_low: 1e-5,
+            energy_high: 1e4,
+            resolved: true,
+            formalism: crate::resonance::ResonanceFormalism::MLBW,
+            target_spin: 0.0,
+            scattering_radius: 9.4,
+            naps: 1,
+            ap_table: None,
+            l_groups: vec![LGroup {
+                l: 0,
+                awr: 236.0,
+                apl: 0.0,
+                qx: 0.0,
+                lrx: 0,
+                resonances: vec![],
+            }],
+            r_external: vec![],
+        };
+        assert!(!range.is_evaluable(), "all-empty L-groups must be inert");
+        range.l_groups[0].resonances.push(Resonance {
+            energy: 6.674,
+            j: 0.5,
+            gn: 1.5e-3,
+            gg: 2.3e-2,
+            gfa: 0.0,
+            gfb: 0.0,
+        });
+        assert!(
+            range.is_evaluable(),
+            "a resonance-bearing L-group is evaluable"
+        );
     }
 
     /// scattering_radius_at interpolates from ap_table when NRO=1.
@@ -838,8 +720,6 @@ mod tests {
             naps: 1,
             ap_table: Some(table),
             l_groups: vec![],
-            rml: None,
-            urr: None,
             r_external: vec![],
         };
         // At 1 eV: 8.0 fm
@@ -995,12 +875,12 @@ pub mod test_support {
     //
     // The public fixtures below all build a single `ResonanceRange` with one
     // `LGroup` whose body varies only in well-defined ways.  The two private
-    // helpers below absorb the structural skeleton (resolved/rml/urr/ap_table/
+    // helpers below absorb the structural skeleton (resolved/ap_table/
     // r_external/qx/lrx/gfa/gfb) so each public helper carries only the
     // physically-meaningful parameters.
 
     /// One resolved `ResonanceRange` with a single L-group.  All "structural
-    /// invariants" (resolved, `rml`/`urr`/`ap_table`/`r_external`,
+    /// invariants" (resolved, `ap_table`/`r_external`,
     /// `qx`/`lrx`) get the minimal-fixture defaults.
     #[allow(clippy::too_many_arguments)]
     fn make_range(
@@ -1031,8 +911,6 @@ pub mod test_support {
                 lrx: 0,
                 resonances,
             }],
-            rml: None,
-            urr: None,
             ap_table: None,
             r_external: vec![],
         }

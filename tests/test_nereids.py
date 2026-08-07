@@ -222,6 +222,32 @@ class TestResonanceData:
         )
         assert data.n_resonances == 3
 
+    def test_create_resonance_data_rejects_empty_resonances(self):
+        """An empty resonance list raises instead of building inert data.
+
+        A resolved range with no resonances evaluates to zero cross-section
+        everywhere (transmission = 1) — the same silently-inert shape the
+        ENDF load path rejects with its no-evaluable-ranges error.
+        """
+        with pytest.raises(ValueError, match="no resonances"):
+            nereids.create_resonance_data(
+                z=92,
+                a=238,
+                awr=236.006,
+                scattering_radius=9.48,
+                resonances=[],
+            )
+        # The explicit-l_groups arm is guarded the same way.
+        with pytest.raises(ValueError, match="no resonances"):
+            nereids.create_resonance_data(
+                z=92,
+                a=238,
+                awr=236.006,
+                scattering_radius=9.48,
+                resonances=[],
+                l_groups=[(0, [])],
+            )
+
     def test_l_groups(self):
         """Create with explicit L-groups."""
         data = nereids.create_resonance_data(
@@ -263,14 +289,16 @@ class TestResonanceData:
                 formalism="bogus",
             )
 
-    def test_lrf7_n_resonances_counts_rml_spin_groups(self):
-        """LRF=7 R-matrix-limited resonances must be counted (issue #638).
+    def test_pure_lrf7_file_rejected_no_evaluable_ranges(self):
+        """A pure-LRF=7 evaluation is rejected at load, not silently zeroed.
 
-        Their resonances live in ``rml.spin_groups``, not ``l_groups``. The
-        ``n_resonances`` getter previously summed only ``l_groups`` and so
-        reported 0 for R-matrix-limited evaluations. It now delegates to the
-        formalism-aware Rust ``total_resonance_count()``. This synthetic
-        LRF=7/KRM=3 fixture has exactly 2 resonances and zero L-groups.
+        NEREIDS removed the LRF=7 cross-section physics (its closed-channel
+        treatment was incomplete — the Coulomb/SHF=1 closed-channel shift was
+        unimplemented — and it was never validated against SAMMY), so LRF=7
+        ranges are parse-and-skip placeholders. A
+        file whose ONLY range is LRF=7 would produce zero cross-sections
+        everywhere (transmission = 1) — the parser now rejects it loudly
+        instead of loading it with ``n_resonances == 0``.
         """
         root = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
         fixture = os.path.join(
@@ -278,19 +306,67 @@ class TestResonanceData:
         )
         # The fixture is committed to the repo, so a missing file is a
         # packaging/path regression that MUST fail — not a skip that would
-        # silently disable this LRF=7 count guard.
+        # silently disable this no-evaluable-content guard.
         assert os.path.exists(fixture), (
             f"vendored LRF=7 regression fixture must be present at {fixture} "
             "(committed test data)"
         )
 
-        data = nereids.load_endf_file(fixture)
-        assert data.n_resonances > 0, (
-            "LRF=7 evaluation must not report 0 resonances"
+        with pytest.raises(ValueError, match="No evaluable resonance ranges"):
+            nereids.load_endf_file(fixture)
+
+    def test_mixed_evaluation_loads_with_unevaluated_range_warning(self):
+        """A mixed evaluation (resolved + URR) loads, warns, and is flagged.
+
+        U-238 (ENDF/B-VIII.0, SAMMY ex027) carries a resolved Reich-Moore
+        range plus an unresolved (LRU=2) range. The resolved range keeps the
+        file loadable; the skipped URR range must surface as a ``UserWarning``
+        at load time and as ``has_unevaluated_ranges == True``, because its
+        span contributes zero cross-section.
+        """
+        root = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+        fixture = os.path.join(
+            root, "crates/nereids-endf/tests/data/u238_ex027.endf"
         )
-        assert data.n_resonances == 2, "fixture has 2 R-matrix-limited resonances"
+        assert os.path.exists(fixture), (
+            f"vendored U-238 fixture must be present at {fixture} "
+            "(committed test data)"
+        )
+
+        with pytest.warns(UserWarning, match="parsed but NOT evaluated"):
+            data = nereids.load_endf_file(fixture)
+        assert data.has_unevaluated_ranges, (
+            "the skipped URR range must be flagged as unevaluated"
+        )
+        # The resolved Reich-Moore range is fully usable. The vendored tape
+        # is byte-pinned, so the count is exact: a lower bound would still
+        # pass if the parser silently dropped most of the resolved range.
+        # Update this number only when the fixture is deliberately replaced.
+        assert data.n_resonances == 1653
         # Explicit alias must agree with n_resonances.
         assert data.total_resonance_count == data.n_resonances
+
+    def test_mixed_lru0_getters_prefer_evaluable_range(self):
+        """``target_spin`` / ``scattering_radius`` read the first EVALUABLE range.
+
+        The mixed fixture's leading LRU=0 placeholder deliberately carries
+        different SPI/AP (1.5 / 5.0 fm) than the resolved range (2.5 /
+        9.6931 fm), so this test can see which range the getters read: a
+        placeholder's SPI/AP describes a span the cross-section code never
+        evaluates, and the getters must skip it.
+        """
+        root = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+        fixture = os.path.join(
+            root, "tests/data/synthetic/lru0_plus_resolved_mixed.endf"
+        )
+        assert os.path.exists(fixture), (
+            f"vendored mixed LRU=0 fixture must be present at {fixture} "
+            "(committed test data)"
+        )
+        with pytest.warns(UserWarning, match="parsed but NOT evaluated"):
+            data = nereids.load_endf_file(fixture)
+        assert data.target_spin == 2.5
+        assert data.scattering_radius == pytest.approx(9.6931)
 
 
 # ===========================================================================

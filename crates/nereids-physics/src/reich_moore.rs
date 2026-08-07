@@ -17,8 +17,6 @@
 //! | 1        | SLBW                       | `slbw::slbw_evaluate_with_cached_jgroups`         |
 //! | 2        | MLBW                       | `slbw::mlbw_evaluate_with_cached_jgroups`         |
 //! | 3        | Reich-Moore                | `reich_moore_spin_group_precomputed` (+ 2ch/3ch)  |
-//! | 7        | R-Matrix Limited           | `rmatrix_limited::cross_sections_for_rml_range`   |
-//! | URR      | Hauser-Feshbach average    | `urr::urr_cross_sections` |
 //!
 //! ## Reich-Moore Approximation
 //! In the full R-matrix, all channels (neutron, capture, fission) appear
@@ -45,9 +43,7 @@ use nereids_endf::resonance::{ResonanceData, ResonanceFormalism, ResonanceRange,
 
 use crate::channel;
 use crate::penetrability;
-use crate::rmatrix_limited;
 use crate::slbw;
-use crate::urr;
 
 // ─── Per-resonance precomputed invariants ─────────────────────────────────────
 //
@@ -314,9 +310,9 @@ pub struct CrossSections {
 /// Compute cross-sections at a single energy.
 ///
 /// Dispatches each resonance range to the appropriate formalism-specific
-/// calculator (SLBW, MLBW, Reich-Moore, R-Matrix Limited, URR) based on the
-/// formalism stored in that range.  See the module-level table for the full
-/// dispatch map.
+/// calculator (SLBW, MLBW, Reich-Moore) based on the formalism stored in
+/// that range; non-evaluable ranges (LRF=7, LRU=2) resolve to `Skip` and
+/// contribute zero.  See the module-level table for the full dispatch map.
 ///
 /// Adjacent ranges that share a boundary energy use half-open intervals
 /// `[e_low, e_high)` so the boundary point is counted exactly once
@@ -345,17 +341,16 @@ pub struct CrossSections {
 /// Cross-sections in barns.
 ///
 /// # Panics
-/// Panics if `energy_ev` is non-finite or non-positive.  The leaf SLBW /
-/// RML / URR routines already enforce this precondition in release builds;
-/// hoisting the same assert to the top-level pub fn keeps the public
-/// contract symmetric so direct Rust callers cannot bypass validation
-/// by hitting a range that gates entry on a finite-only check (e.g. a
-/// pure-RM range with no SLBW/URR/RML leaf would otherwise silently
-/// return zeros when handed NaN).
+/// Panics if `energy_ev` is non-finite or non-positive.  The SLBW leaf
+/// routine already enforces this precondition in release builds; hoisting
+/// the same assert to the top-level pub fn keeps the public contract
+/// symmetric so direct Rust callers cannot bypass validation by hitting a
+/// range that gates entry on a finite-only check (e.g. a pure-RM range with
+/// no SLBW leaf would otherwise silently return zeros when handed NaN).
 pub fn cross_sections_at_energy(data: &ResonanceData, energy_ev: f64) -> CrossSections {
-    // Symmetric public-API guard.  Matches `slbw_cross_sections_for_range`,
-    // `cross_sections_for_rml_range`, and `urr_cross_sections`.  One branch
-    // at the entry of this O(ranges × resonances) function is negligible.
+    // Symmetric public-API guard.  Matches `slbw_cross_sections_for_range`.
+    // One branch at the entry of this O(ranges × resonances) function is
+    // negligible.
     assert!(
         energy_ev.is_finite() && energy_ev > 0.0,
         "expected positive finite energy_ev, got {energy_ev}"
@@ -427,7 +422,7 @@ pub fn cross_sections_at_energy(data: &ResonanceData, energy_ev: f64) -> CrossSe
 /// single bad energy fails fast with a clear message instead of being
 /// hidden inside the inner loop, matches the symmetric contract on
 /// `cross_sections_at_energy`, and protects direct Rust callers from
-/// the same release-mode silent-zero footgun that the SLBW / RML / URR
+/// the same release-mode silent-zero footgun that the SLBW / Reich-Moore
 /// leaf asserts guard against per-point.
 pub fn cross_sections_on_grid(data: &ResonanceData, energies: &[f64]) -> Vec<CrossSections> {
     if energies.is_empty() {
@@ -586,13 +581,6 @@ enum PrecomputedRangeKind<'a> {
         range: &'a ResonanceRange,
         l_groups: Vec<PrecomputedSlbwLGroupData>,
     },
-    /// R-Matrix Limited (LRF=7): no precompute, evaluate per-energy.
-    RMatrixLimited(&'a nereids_endf::resonance::RmlData),
-    /// URR: no precompute, evaluate per-energy.
-    Urr {
-        urr_data: &'a nereids_endf::resonance::UrrData,
-        range: &'a ResonanceRange,
-    },
     /// Not evaluable (skip).
     Skip,
 }
@@ -621,18 +609,14 @@ fn precompute_range_data<'a>(
         kind,
     };
 
-    // URR ranges.
-    if let Some(urr_data) = &range.urr {
-        return make(PrecomputedRangeKind::Urr { urr_data, range });
-    }
-
-    if !range.resolved {
+    // Literal sync with `ResonanceRange::is_evaluable` (see
+    // `range_is_evaluable` below): every non-evaluable shape — parse-and-skip
+    // placeholders AND accepted-but-inert resolved ranges whose L-groups are
+    // all empty — takes the Skip arm. The inert-resolved shape is unreachable
+    // from the parser and the Python constructor (both guard it) but can
+    // arrive via legacy serialized caches or direct Rust construction.
+    if !range.is_evaluable() {
         return make(PrecomputedRangeKind::Skip);
-    }
-
-    // RML ranges.
-    if let Some(rml) = &range.rml {
-        return make(PrecomputedRangeKind::RMatrixLimited(rml));
     }
 
     // SLBW and MLBW share the precomputed-J-group layout but evaluate
@@ -798,15 +782,6 @@ fn evaluate_precomputed_range(
 ) -> (f64, f64, f64, f64) {
     match &pc.kind {
         PrecomputedRangeKind::Skip => (0.0, 0.0, 0.0, 0.0),
-
-        PrecomputedRangeKind::RMatrixLimited(rml) => {
-            rmatrix_limited::cross_sections_for_rml_range(rml, energy_ev)
-        }
-
-        PrecomputedRangeKind::Urr { urr_data, range } => {
-            let ap_fm = range.scattering_radius_at(energy_ev);
-            urr::urr_cross_sections(urr_data, energy_ev, ap_fm)
-        }
 
         PrecomputedRangeKind::Slbw { range, l_groups } => {
             let pi_over_k2 = channel::pi_over_k_squared_barns(energy_ev, awr);
@@ -1056,32 +1031,17 @@ fn evaluate_precomputed_range(
 
 /// Can this range actually produce non-zero cross-sections?
 ///
-/// Returns `true` for formalisms whose physics evaluation is implemented:
-/// - SLBW (LRF=1) and MLBW (LRF=2) resolved ranges
-/// - Reich-Moore (LRF=3) resolved ranges
-/// - R-Matrix Limited (LRF=7) resolved ranges
-/// - URR ranges with parsed data (`urr.is_some()`)
+/// Delegates to [`ResonanceRange::is_evaluable`]: evaluable = resolved
+/// LRF=1/2/3 (SLBW, MLBW, Reich-Moore). LRF=7 and LRU=2 ranges are
+/// parse-and-skip placeholders and are never evaluated.
 ///
-/// Returns `false` for URR placeholders created when unsupported INT
-/// codes force a skip, or other unrecognized formalisms.
-///
-/// **Keep in sync with `precompute_range_data`.**  Whenever a new
-/// formalism becomes evaluable there, add it to the `matches!` pattern
-/// here so the energy-boundary logic (`next_starts_here`) stays correct.
+/// **In literal sync with `precompute_range_data`**: both key on
+/// [`ResonanceRange::is_evaluable`] (`precompute_range_data` returns its Skip
+/// arm for every non-evaluable range), so the energy-boundary logic
+/// (`next_starts_here`) and the evaluator dispatch cannot disagree. Whenever
+/// a new formalism becomes evaluable, extend `ResonanceRange::is_evaluable`.
 fn range_is_evaluable(range: &ResonanceRange) -> bool {
-    if range.urr.is_some() {
-        return true;
-    }
-    if !range.resolved {
-        return false;
-    }
-    matches!(
-        range.formalism,
-        ResonanceFormalism::SLBW
-            | ResonanceFormalism::MLBW
-            | ResonanceFormalism::ReichMoore
-            | ResonanceFormalism::RMatrixLimited
-    )
+    range.is_evaluable()
 }
 
 /// Cross-sections for a single spin group (J, π) in the Reich-Moore formalism,
@@ -1823,9 +1783,7 @@ mod tests {
                         gfb: 0.0,
                     }],
                 }],
-                rml: None,
                 ap_table: None,
-                urr: None,
                 r_external: vec![],
             }],
         };
@@ -1842,6 +1800,119 @@ mod tests {
             "Fission must be finite and non-negative, got {}",
             xs.fission
         );
+    }
+
+    /// A parsed-but-skipped range contributes EXACTLY zero cross-section over
+    /// its span, through both evaluation entry points.
+    ///
+    /// This pins the branch's central safety property: a non-evaluable
+    /// placeholder range (LRU=2 URR / LRF=7 RML / LRU=0) reached by real mixed
+    /// tapes must add nothing to the four components, so the load-time
+    /// warnings ("these spans contribute zero cross-section") are honoured at
+    /// evaluation time — not just at parse time. The data has one evaluable
+    /// resolved range [1e-5, 1e4] eV (a real U-238 6.674 eV resonance) and one
+    /// disjoint placeholder range [1e4, 1e5] eV.
+    ///
+    /// Non-circular: the same shared primitive (`evaluate_precomputed_range`)
+    /// backs both APIs, so a vacuous "everything is zero" implementation would
+    /// pass a zeros-only check. The nonzero assertion inside the evaluable span
+    /// rules that out; the boundary assertion pins that the skipped range does
+    /// not corrupt the resolved range's inclusive upper edge.
+    #[test]
+    fn test_skipped_range_contributes_exact_zero() {
+        // Evaluable resolved RM range [1e-5, 1e4] with one resonance.
+        let mut data = u238_with_formalism(ResonanceFormalism::ReichMoore);
+        // Append a disjoint non-evaluable placeholder over [1e4, 1e5] (URR-like:
+        // empty l_groups, resolved=false), mirroring a real mixed tape.
+        data.ranges.push(ResonanceRange {
+            energy_low: 1e4,
+            energy_high: 1e5,
+            resolved: false,
+            formalism: ResonanceFormalism::Unresolved,
+            target_spin: 0.0,
+            scattering_radius: 9.4285,
+            naps: 1,
+            ap_table: None,
+            l_groups: vec![],
+            r_external: vec![],
+        });
+
+        assert!(data.has_unevaluated_ranges());
+        assert_eq!(data.unevaluated_ranges().len(), 1);
+
+        // (1) Non-vacuity: the evaluable span must produce a real signal, so
+        // "zero inside the skipped span" is not trivially true everywhere.
+        let e_eval = 6.674; // strictly inside [1e-5, 1e4]
+        let xs_eval = cross_sections_at_energy(&data, e_eval);
+        assert!(
+            xs_eval.total > 0.0 && xs_eval.capture > 0.0,
+            "evaluable span must be nonzero, got {xs_eval:?}"
+        );
+
+        // (2) Exact zero strictly inside the placeholder span, via BOTH APIs.
+        let e_skip = [2.0e4, 5.0e4, 9.0e4]; // strictly inside [1e4, 1e5]
+        for &e in &e_skip {
+            let pt = cross_sections_at_energy(&data, e);
+            assert_eq!(pt.total, 0.0, "per-point total must be exactly 0 at E={e}");
+            assert_eq!(
+                pt.elastic, 0.0,
+                "per-point elastic must be exactly 0 at E={e}"
+            );
+            assert_eq!(
+                pt.capture, 0.0,
+                "per-point capture must be exactly 0 at E={e}"
+            );
+            assert_eq!(
+                pt.fission, 0.0,
+                "per-point fission must be exactly 0 at E={e}"
+            );
+        }
+        for (i, xs) in cross_sections_on_grid(&data, &e_skip).iter().enumerate() {
+            let e = e_skip[i];
+            assert_eq!(xs.total, 0.0, "grid total must be exactly 0 at E={e}");
+            assert_eq!(xs.elastic, 0.0, "grid elastic must be exactly 0 at E={e}");
+            assert_eq!(xs.capture, 0.0, "grid capture must be exactly 0 at E={e}");
+            assert_eq!(xs.fission, 0.0, "grid fission must be exactly 0 at E={e}");
+        }
+
+        // (3) Scalar/grid agreement at shared points (evaluable and skipped).
+        let shared = [6.674, 2.0e4, 5.0e4];
+        let grid = cross_sections_on_grid(&data, &shared);
+        for (i, &e) in shared.iter().enumerate() {
+            let pt = cross_sections_at_energy(&data, e);
+            assert_eq!(
+                pt.total, grid[i].total,
+                "scalar/grid total disagree at E={e}"
+            );
+            assert_eq!(
+                pt.elastic, grid[i].elastic,
+                "scalar/grid elastic disagree at E={e}"
+            );
+            assert_eq!(
+                pt.capture, grid[i].capture,
+                "scalar/grid capture disagree at E={e}"
+            );
+            assert_eq!(
+                pt.fission, grid[i].fission,
+                "scalar/grid fission disagree at E={e}"
+            );
+        }
+
+        // (4) Boundary: the placeholder is non-evaluable, so the resolved range
+        // owns its inclusive upper edge 1e4. At exactly 1e4 the placeholder adds
+        // zero — the value must equal the resolved-range-only value there.
+        let e_edge = 1e4;
+        let edge = cross_sections_at_energy(&data, e_edge);
+        let mut resolved_only = data.clone();
+        resolved_only.ranges.truncate(1);
+        let edge_resolved = cross_sections_at_energy(&resolved_only, e_edge);
+        assert_eq!(
+            edge.total, edge_resolved.total,
+            "skipped range corrupts the boundary total"
+        );
+        assert_eq!(edge.elastic, edge_resolved.elastic);
+        assert_eq!(edge.capture, edge_resolved.capture);
+        assert_eq!(edge.fission, edge_resolved.fission);
     }
 
     /// `cross_sections_on_grid` (batch, precompute hoisted) must produce
@@ -2001,8 +2072,6 @@ mod tests {
                         gfb: 0.0,
                     }],
                 }],
-                rml: None,
-                urr: None,
                 ap_table: None,
                 r_external: vec![],
             }],
@@ -2036,8 +2105,6 @@ mod tests {
                         gfb: 0.0,
                     }],
                 }],
-                rml: None,
-                urr: None,
                 ap_table: None,
                 r_external: vec![],
             }],
@@ -2223,7 +2290,7 @@ mod tests {
 
     // ─── Top-level pub-fn energy-validation guards ─────────────────────────
     //
-    // Mirrors the SLBW / RML / URR test patterns: NaN, ±Inf, 0, and -1 must
+    // Mirrors the SLBW / Reich-Moore test patterns: NaN, ±Inf, 0, and -1 must
     // each panic with the canonical "expected positive finite energy_ev"
     // message.  These tests gate the symmetric defense-in-depth contract on
     // both Reich-Moore top-level pub fns so a future refactor cannot

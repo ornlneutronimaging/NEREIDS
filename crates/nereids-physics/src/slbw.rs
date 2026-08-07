@@ -221,7 +221,7 @@ pub fn slbw_cross_sections_for_range(
     target_spin: f64,
 ) -> (f64, f64, f64, f64) {
     // Defensive input validation at the public boundary (issue #558).
-    // See `urr::urr_cross_sections` for rationale.  The leaf
+    // The leaf
     // `pi_over_k_squared_barns` retains its `debug_assert!`; this entry
     // guard makes the precondition genuinely enforced in release builds
     // for direct Rust callers that bypass the Python wrapper's
@@ -607,8 +607,6 @@ mod tests {
                         gfb: 0.0,
                     }],
                 }],
-                rml: None,
-                urr: None,
                 ap_table: None,
                 r_external: vec![],
             }],
@@ -642,8 +640,6 @@ mod tests {
                         gfb: 0.0,
                     }],
                 }],
-                rml: None,
-                urr: None,
                 ap_table: None,
                 r_external: vec![],
             }],
@@ -700,8 +696,6 @@ mod tests {
                         gfb: 0.0,
                     }],
                 }],
-                rml: None,
-                urr: None,
                 ap_table: None,
                 r_external: vec![],
             }],

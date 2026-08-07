@@ -106,30 +106,60 @@ class ResonanceData:
 
     @property
     def n_resonances(self) -> int:
-        """Total number of resonances across all ranges and formalisms.
+        """Total number of discrete resonances across all evaluable ranges.
 
-        Formalism-aware: counts LRF=1/2/3 L-group resonances *and* LRF=7
-        R-matrix-limited spin-group resonances (which previously reported 0).
+        Counts LRF=1/2/3 L-group resonances only. LRF=7 (R-Matrix Limited)
+        and LRU=2 (URR) ranges are parsed-and-skipped — not evaluated — so
+        they contribute 0. A file with NO evaluable range at all fails to
+        load with a ValueError instead of reporting 0 here.
         """
         ...
 
     @property
     def total_resonance_count(self) -> int:
-        """Total resonance count across all ranges and formalisms.
+        """Total resonance count across all ranges.
 
-        Explicit alias for :attr:`n_resonances`; both delegate to the
-        formalism-aware Rust ``ResonanceData::total_resonance_count()``.
+        Explicit alias for :attr:`n_resonances`; both delegate to the Rust
+        ``ResonanceData::total_resonance_count()`` (skipped LRF=7 / LRU=2
+        ranges contribute 0).
+        """
+        ...
+
+    @property
+    def has_unevaluated_ranges(self) -> bool:
+        """Whether the evaluation carries parsed-but-not-evaluated ranges.
+
+        True when any range is a parse-and-skip placeholder (LRF=7 R-Matrix
+        Limited, LRU=2 URR, or LRU=0 scattering-radius-only). Those spans
+        contribute zero cross-section; a ``UserWarning`` listing them is
+        emitted at load time by :func:`load_endf` / :func:`load_endf_file`.
+        """
+        ...
+
+    @property
+    def skipped_ranges(self) -> list[str]:
+        """One-line descriptions of the parse-and-skip placeholder ranges.
+
+        One string per non-evaluable range (LRF=7, LRU=2, or LRU=0), using the
+        same text as the load-time ``UserWarning`` and the parser's rejection
+        message. Empty when :attr:`has_unevaluated_ranges` is ``False``.
         """
         ...
 
     @property
     def target_spin(self) -> float:
-        """Target nuclear spin (I) of the first resonance range."""
+        """Target nuclear spin (I) of the first evaluable resonance range.
+
+        Parse-and-skip placeholder ranges (LRU=0 / LRF=7 / URR) are skipped.
+        """
         ...
 
     @property
     def scattering_radius(self) -> float:
-        """Effective scattering radius in fm."""
+        """Effective scattering radius in fm, from the first evaluable range.
+
+        Parse-and-skip placeholder ranges (LRU=0 / LRF=7 / URR) are skipped.
+        """
         ...
 
     @property
@@ -841,11 +871,23 @@ def load_endf(
     library: str = "endf8.1",
     mat: int | None = None,
 ) -> ResonanceData:
-    """Load ENDF resonance data for an isotope from the IAEA database."""
+    """Load ENDF resonance data for an isotope from the IAEA database.
+
+    Raises ``ValueError`` when the evaluation has no evaluable resolved
+    (LRF=1/2/3) range — loading it would yield zero cross-section
+    everywhere. Mixed evaluations load with a ``UserWarning`` naming the
+    parsed-but-not-evaluated spans.
+    """
     ...
 
 def load_endf_file(path: str) -> ResonanceData:
-    """Load ENDF resonance data from a local file."""
+    """Load ENDF resonance data from a local file.
+
+    Raises ``ValueError`` when the file has no evaluable resolved
+    (LRF=1/2/3) range — loading it would yield zero cross-section
+    everywhere. Mixed evaluations load with a ``UserWarning`` naming the
+    parsed-but-not-evaluated spans.
+    """
     ...
 
 def create_resonance_data(
@@ -1542,10 +1584,6 @@ def spatial_map_typed(
     fit_back_f: bool = False,
     back_d_init: float = 0.01,
     back_f_init: float = 1.0,
-    fit_alpha_1: bool = False,
-    fit_alpha_2: bool = False,
-    alpha_1_init: float = 1.0,
-    alpha_2_init: float = 1.0,
     c: float = 1.0,
     enable_polish: bool | None = None,
     fit_energy_scale: bool = False,
@@ -1744,10 +1782,6 @@ def fit_counts_spectrum_typed(
     l_scale_init: float = 1.0,
     energy_scale_flight_path_m: float = 25.0,
     detector_background: NDArray[np.float64] | None = None,
-    fit_alpha_1: bool = False,
-    fit_alpha_2: bool = False,
-    alpha_1_init: float = 1.0,
-    alpha_2_init: float = 1.0,
     c: float = 1.0,
     resolution: TabulatedResolution | None = None,
     flight_path_m: float | None = None,
@@ -1808,13 +1842,6 @@ def fit_counts_spectrum_typed(
             wrapper inside the counts-KL fit (A_n + B_A + B_B/√E + B_C√E).
         detector_background: Optional detector/counts background reference
             (for LM-converted path only; counts-KL rejects non-zero values).
-        fit_alpha_1: Research-only; rejected by the counts-KL dispatch
-            because the profile λ̂ absorbs the global flux scale.
-        fit_alpha_2: Research-only; rejected by the counts-KL dispatch
-            (non-zero detector background not currently wired).
-        alpha_1_init: Initial value for alpha_1 (default 1.0); only
-            consumed by the research Fisher helper.
-        alpha_2_init: Initial value for alpha_2 (default 1.0); same.
         c: Proton-charge ratio ``Q_s / Q_ob``.  Default
             1.0 assumes the caller has already PC-normalized the flux.
             For raw VENUS-style counts, set this to the actual ratio

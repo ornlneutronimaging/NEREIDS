@@ -1322,6 +1322,19 @@ pub fn sammy_to_resonance_data(
     // into one ResonanceRange.  R-external entries from one isotope's spin groups
     // could erroneously match another isotope's (L, J) group, corrupting the
     // cross section.  Use sammy_to_resonance_data_multi() for cases with R-ext.
+
+    // Same no-inert-data invariant as the ENDF load path and the Python
+    // constructor: a range with no resonances in any L-group evaluates to
+    // zero cross-section everywhere. A valid .par always carries resonances
+    // (or spin groups, which inject zero-width sentinels above).
+    if l_groups.iter().all(|lg| lg.resonances.is_empty()) {
+        return Err(SammyParseError::new(
+            "SAMMY .par produced no resonances in any L-group; cross-sections \
+             would be identically zero everywhere"
+                .to_string(),
+        ));
+    }
+
     let range = ResonanceRange {
         energy_low: 1e-5,
         energy_high: 2e7,
@@ -1333,8 +1346,6 @@ pub fn sammy_to_resonance_data(
         naps: 1,
         ap_table: None,
         l_groups,
-        rml: None,
-        urr: None,
         r_external: vec![],
     };
 
@@ -1571,6 +1582,17 @@ pub fn sammy_to_resonance_data_multi(
             }
         }
 
+        // Same no-inert-data invariant as the single-isotope path: an
+        // isotope group whose L-groups carry no resonances would evaluate
+        // to zero cross-section everywhere.
+        if l_groups.iter().all(|lg| lg.resonances.is_empty()) {
+            return Err(SammyParseError::new(format!(
+                "SAMMY .par isotope group {key:?} produced no resonances in \
+                 any L-group; cross-sections would be identically zero \
+                 everywhere"
+            )));
+        }
+
         let range = ResonanceRange {
             energy_low: 1e-5,
             energy_high: 2e7,
@@ -1582,8 +1604,6 @@ pub fn sammy_to_resonance_data_multi(
             naps: 1,
             ap_table: None,
             l_groups,
-            rml: None,
-            urr: None,
             r_external: r_external_entries,
         };
 

@@ -38,9 +38,11 @@ Important properties:
 | `a` | `int` | Mass number. |
 | `awr` | `float` | Atomic weight ratio. |
 | `n_resonances` | `int` | Resonance count across parsed ranges. |
-| `target_spin` | `float` | Target spin from the first range. |
-| `scattering_radius` | `float` | Effective scattering radius in fm. |
+| `target_spin` | `float` | Target spin from the first evaluable range (parse-and-skip placeholders are skipped). |
+| `scattering_radius` | `float` | Effective scattering radius in fm, from the first evaluable range. |
 | `l_values` | `list[int]` | Orbital angular momentum values present in the data. |
+| `has_unevaluated_ranges` | `bool` | True when the file carries parsed-but-not-evaluated spans (LRF=7 / URR / LRU=0); those spans contribute zero cross-section. |
+| `skipped_ranges` | `list[str]` | One description per parsed-but-not-evaluated span. |
 
 ### `FitResult`
 
@@ -112,6 +114,12 @@ names include `endf8.0`, `endf8.1`, `jeff3.3`, `jendl5`, `tendl2023`, and
 `cendl3.2`. First use can require network access; cached files are reused
 afterwards. `load_endf_file(...)` parses a local ENDF file and does not
 download data.
+
+Both loaders evaluate resolved LRF=1/2/3 ranges only. A file with **no**
+evaluable range (for example a pure LRF=7 evaluation such as W-182) raises
+`ValueError` — loading it would yield zero cross-section everywhere. A mixed
+evaluation loads, emits a `UserWarning` naming the skipped spans, and flags
+them via `has_unevaluated_ranges` / `skipped_ranges`.
 
 ## Forward Modeling
 
@@ -205,11 +213,14 @@ specific options are:
 
 | Option | Meaning |
 |--------|---------|
-| `detector_background=...` | Optional 1D detector background spectrum; required when `fit_alpha_2=True`. |
-| `fit_alpha_1=False`, `fit_alpha_2=False` | Fit counts-domain nuisance/background terms. |
-| `alpha_1_init=1.0`, `alpha_2_init=1.0` | Initial nuisance/background values. |
+| `detector_background=...` | Optional 1D detector background spectrum. |
 | `c=1.0` | Proton-charge ratio `Q_s / Q_ob`. |
 | `enable_polish=True/False/None` | Override counts-KL polish behavior; `None` uses the dispatcher default. |
+
+The counts-domain `alpha_1`/`alpha_2` nuisance parameters are not fit by
+`fit_counts_spectrum_typed` or `spatial_map_typed`. Only
+`compute_model_jacobian` retains the `alpha` parameters, as a research/UQ
+surface.
 
 ## Spatial Mapping
 
@@ -269,8 +280,6 @@ Keyword arguments:
 | `background=False` | Enable SAMMY-style background for LM/transmission paths. |
 | `fit_back_d=False`, `fit_back_f=False` | Fit the SAMMY exponential background tail (`BackD * exp(-BackF / √E)`).  Requires `background=True`.  Per-pixel `back_d_map` / `back_f_map` are populated on the returned `SpatialResult` (issue #538). |
 | `back_d_init=0.01`, `back_f_init=1.0` | Initial values for the exponential tail. |
-| `fit_alpha_1=False`, `fit_alpha_2=False` | Fit counts-domain nuisance/background terms. |
-| `alpha_1_init=1.0`, `alpha_2_init=1.0` | Initial nuisance/background values. |
 | `c=1.0` | Proton-charge ratio for counts-KL spatial fitting. |
 | `enable_polish=True/False/None` | Override counts-KL polish behavior; `None` auto-disables polish for multi-pixel maps. |
 | `fit_energy_scale=False` | Fit per-pixel `t0_us` and `l_scale` maps. |

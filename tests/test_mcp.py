@@ -19,6 +19,8 @@ from nereids.mcp.server import (
     _fit_result_summary,
     _json_safe,
     _registry,
+    _single_fit_kwargs,
+    _spatial_fit_kwargs,
     compute_cross_sections,
     compute_transmission,
     detect_isotopes,
@@ -32,6 +34,26 @@ from nereids.mcp.server import (
 )
 
 from _fixtures import _synthetic_u238_data, _synthetic_u238_entry
+
+
+def _load_endf_or_skip(**kwargs):
+    """Call the load_endf tool, skipping (not failing) on network errors.
+
+    Several tests fetch live evaluations from the IAEA service on a cold
+    cache; an infrastructure outage must surface as an explicit skip in CI,
+    not a PR-gate failure. Parse-level errors (ValueError) still propagate --
+    they are what the tests assert on.
+    """
+    try:
+        return load_endf(**kwargs)
+    except OSError as exc:  # cache-file I/O failure, not a parse verdict
+        pytest.skip(f"IAEA ENDF service unreachable: {exc}")
+    except RuntimeError as exc:
+        # The PyO3 binding maps retrieval (download) failures to RuntimeError;
+        # only network-shaped messages skip -- other RuntimeErrors propagate.
+        if "Network error" in str(exc) or "Failed to fetch" in str(exc):
+            pytest.skip(f"IAEA ENDF service unreachable: {exc}")
+        raise
 
 
 @pytest.fixture(autouse=True)
@@ -78,7 +100,7 @@ class TestListIsotopes:
 
 class TestLoadEndf:
     def test_load_fe56(self):
-        result = load_endf(isotope="Fe-56")
+        result = _load_endf_or_skip(isotope="Fe-56")
         assert result["z"] == 26
         assert result["a"] == 56
         assert result["n_resonances"] > 0
@@ -90,14 +112,41 @@ class TestLoadEndf:
 
     def test_load_stores_in_registry(self):
         assert "U-238" not in _registry
-        load_endf(isotope="U-238")
+        _load_endf_or_skip(isotope="U-238")
         assert "U-238" in _registry
 
     def test_return_structure(self):
-        result = load_endf(isotope="Fe-56")
+        result = _load_endf_or_skip(isotope="Fe-56")
         for key in ("isotope", "z", "a", "n_resonances", "scattering_radius",
-                     "target_spin", "l_values"):
+                     "target_spin", "l_values", "has_unevaluated_ranges"):
             assert key in result, f"Missing key: {key}"
+
+    def test_pure_lrf7_isotope_rejected(self):
+        """W-182 (pure LRF=7 + URR) has no evaluable range and must be rejected.
+
+        LRF=7/URR evaluation was removed; a file whose every range is a
+        parse-and-skip placeholder fails to load with a ValueError rather than
+        loading as a silent zero-cross-section isotope.
+
+        The library is pinned so this asserts against a fixed evaluation
+        (W-182 is pure LRF=7 + URR in ENDF/B-VIII.1) rather than whatever the
+        tool's default library becomes; requires network on a cold cache, like
+        the other live-download tests in this suite.
+        """
+        with pytest.raises(ValueError, match="No evaluable resonance ranges"):
+            _load_endf_or_skip(isotope="W-182", library="endf8.1")
+
+    def test_mixed_evaluation_reports_skipped_ranges(self):
+        """A mixed evaluation (U-238: resolved RM + URR) flags its skipped span.
+
+        The URR range is parsed-and-skipped, so load_endf must set
+        has_unevaluated_ranges and list the skipped URR span in skipped_ranges.
+        """
+        result = _load_endf_or_skip(isotope="U-238")
+        assert result["has_unevaluated_ranges"] is True
+        assert isinstance(result["skipped_ranges"], list)
+        assert result["skipped_ranges"], "skipped_ranges must be non-empty"
+        assert any("LRU=2" in span for span in result["skipped_ranges"])
 
 
 # ---------------------------------------------------------------------------
@@ -107,7 +156,7 @@ class TestLoadEndf:
 
 class TestGetResonanceParameters:
     def test_loaded_isotope(self):
-        load_endf(isotope="Fe-56")
+        _load_endf_or_skip(isotope="Fe-56")
         result = get_resonance_parameters(isotope="Fe-56")
         assert result["z"] == 26
         assert result["a"] == 56
@@ -117,6 +166,12 @@ class TestGetResonanceParameters:
         with pytest.raises(ValueError, match="not loaded"):
             get_resonance_parameters(isotope="U-238")
 
+    def test_reports_unevaluated_ranges(self):
+        _load_endf_or_skip(isotope="U-238")
+        result = get_resonance_parameters(isotope="U-238")
+        assert result["has_unevaluated_ranges"] is True
+        assert any("LRU=2" in span for span in result["skipped_ranges"])
+
 
 # ---------------------------------------------------------------------------
 # compute_cross_sections
@@ -125,7 +180,7 @@ class TestGetResonanceParameters:
 
 class TestComputeCrossSections:
     def test_basic(self):
-        load_endf(isotope="Fe-56")
+        _load_endf_or_skip(isotope="Fe-56")
         result = compute_cross_sections(
             isotope="Fe-56", energy_min=1.0, energy_max=100.0, n_points=100,
         )
@@ -148,7 +203,7 @@ class TestComputeCrossSections:
 
 class TestComputeTransmission:
     def test_basic(self):
-        load_endf(isotope="Fe-56")
+        _load_endf_or_skip(isotope="Fe-56")
         result = compute_transmission(
             isotope="Fe-56", thickness=0.01,
             energy_min=1.0, energy_max=100.0, n_points=50,
@@ -158,7 +213,7 @@ class TestComputeTransmission:
         assert all(0 <= v <= 1 for v in result["transmission"])
 
     def test_zero_thickness(self):
-        load_endf(isotope="Fe-56")
+        _load_endf_or_skip(isotope="Fe-56")
         result = compute_transmission(
             isotope="Fe-56", thickness=0.0,
             energy_min=1.0, energy_max=100.0, n_points=50,
@@ -178,7 +233,7 @@ class TestComputeTransmission:
 
 class TestForwardModel:
     def test_single_isotope(self):
-        load_endf(isotope="Fe-56")
+        _load_endf_or_skip(isotope="Fe-56")
         result = forward_model(
             isotopes=[{"isotope": "Fe-56", "thickness": 0.01}],
             energy_min=1.0, energy_max=100.0, n_points=50,
@@ -187,8 +242,8 @@ class TestForwardModel:
         assert all(0 <= v <= 1 for v in result["transmission"])
 
     def test_multi_isotope(self):
-        load_endf(isotope="Fe-56")
-        load_endf(isotope="U-238")
+        _load_endf_or_skip(isotope="Fe-56")
+        _load_endf_or_skip(isotope="U-238")
         result = forward_model(
             isotopes=[
                 {"isotope": "Fe-56", "thickness": 0.01},
@@ -211,13 +266,15 @@ class TestForwardModel:
 
 
 class TestDetectIsotopes:
+    # Ta-181 is a mixed evaluation (resolved MLBW LRF=2 + URR) that loads;
+    # W-182 (pure LRF=7 + URR) is now rejected at load, so it cannot be a trace.
     def test_basic(self):
-        load_endf(isotope="Fe-56")
-        load_endf(isotope="W-182")
+        _load_endf_or_skip(isotope="Fe-56")
+        _load_endf_or_skip(isotope="Ta-181")
         result = detect_isotopes(
             matrix_isotope="Fe-56",
             matrix_density=0.01,
-            trace_isotopes=["W-182"],
+            trace_isotopes=["Ta-181"],
             trace_ppm=1000.0,
             energy_min=1.0, energy_max=100.0, n_points=200,
             i0=1e6,
@@ -235,16 +292,16 @@ class TestDetectIsotopes:
             detect_isotopes(
                 matrix_isotope="Fe-56",
                 matrix_density=0.01,
-                trace_isotopes=["W-182"],
+                trace_isotopes=["Ta-181"],
             )
 
     def test_trace_not_loaded(self):
-        load_endf(isotope="Fe-56")
+        _load_endf_or_skip(isotope="Fe-56")
         with pytest.raises(ValueError, match="not loaded"):
             detect_isotopes(
                 matrix_isotope="Fe-56",
                 matrix_density=0.01,
-                trace_isotopes=["W-182"],
+                trace_isotopes=["Ta-181"],
             )
 
 
@@ -256,7 +313,7 @@ class TestDetectIsotopes:
 class TestInputValidation:
     def test_compute_cross_sections_invalid_energy(self):
         """Energy validation catches bad inputs."""
-        load_endf("Fe-56")
+        _load_endf_or_skip(isotope="Fe-56")
         with pytest.raises(ValueError, match="energy_min"):
             compute_cross_sections("Fe-56", energy_min=-1.0)
         with pytest.raises(ValueError, match="n_points"):
@@ -265,23 +322,55 @@ class TestInputValidation:
             compute_cross_sections("Fe-56", energy_min=100.0, energy_max=1.0)
 
     def test_compute_transmission_invalid_thickness(self):
-        load_endf("Fe-56")
+        _load_endf_or_skip(isotope="Fe-56")
         with pytest.raises(ValueError, match="thickness"):
             compute_transmission("Fe-56", thickness=-1.0)
 
     def test_forward_model_missing_key(self):
-        load_endf("Fe-56")
+        _load_endf_or_skip(isotope="Fe-56")
         with pytest.raises(ValueError, match="thickness"):
             forward_model([{"isotope": "Fe-56"}])  # missing thickness
 
     def test_detect_isotopes_empty_traces(self):
-        load_endf("Fe-56")
+        _load_endf_or_skip(isotope="Fe-56")
         with pytest.raises(ValueError, match="empty"):
             detect_isotopes("Fe-56", 0.01, [])
 
     def test_list_isotopes_invalid_z(self):
         with pytest.raises(ValueError, match="z must be"):
             list_isotopes(0)
+
+
+class TestRemovedFitKeys:
+    """The removed alpha_1/alpha_2 fit keys must raise, not silently no-op.
+
+    The fit config is whitelist-filtered, so without the explicit rejection a
+    legacy manifest passing these keys would run with defaults and report
+    success while ignoring the request.
+    """
+
+    REMOVED = ["fit_alpha_1", "fit_alpha_2", "alpha_1_init", "alpha_2_init"]
+
+    @pytest.mark.parametrize("key", REMOVED)
+    def test_single_fit_kwargs_rejects_removed_key(self, key):
+        with pytest.raises(ValueError, match="no longer supported"):
+            _single_fit_kwargs({key: 1.0}, {}, counts=True)
+
+    @pytest.mark.parametrize("key", REMOVED)
+    def test_spatial_fit_kwargs_rejects_removed_key(self, key):
+        with pytest.raises(ValueError, match="no longer supported"):
+            _spatial_fit_kwargs({key: 1.0}, {})
+
+    def test_error_names_every_offending_key(self):
+        config = {"fit_alpha_1": True, "alpha_2_init": 0.5, "max_iter": 10}
+        with pytest.raises(ValueError, match="alpha_2_init.*fit_alpha_1|fit_alpha_1.*alpha_2_init"):
+            _single_fit_kwargs(config, {}, counts=False)
+
+    def test_clean_config_still_accepted(self):
+        kwargs = _single_fit_kwargs({"max_iter": 10}, {}, counts=False)
+        assert kwargs == {"max_iter": 10}
+        kwargs = _spatial_fit_kwargs({"max_iter": 10}, {})
+        assert kwargs == {"max_iter": 10}
 
 
 # ---------------------------------------------------------------------------
