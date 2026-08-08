@@ -595,6 +595,84 @@ fn singular_inverse_lambda_laws_are_rejected() {
 }
 
 #[test]
+fn storage_cdf_matches_arbitrary_precision_convolution_reference() {
+    // Reference values computed OUTSIDE this codebase from the DEFINING
+    // convolution: CDF = (1−r)·Γ₃(ατ) + r·∫₀^τ (α³s²e^{−αs}/2)·(1−e^{−β(τ−s)}) ds
+    // via 40-digit decimal Simpson (40 000 intervals; quadrature error ≲ 1e-14).
+    // They share no code with ic_cdf or ic_pulse, so a storage-term error
+    // common to both implementations cannot hide here. Tolerance covers the
+    // f64 implementations' Taylor truncation near the |u| = 0.05 boundary
+    // (measured 4.7e-12 at case 3 against a 60-digit closed-form check).
+    let pins: [(f64, f64, f64, f64, f64); 4] = [
+        (1.7, 0.45, 0.35, 2.7, 0.665_083_699_251_977_2),
+        (0.6, 2.4, 0.8, 3.0, 0.219_541_992_689_109_74),
+        (1.0, 0.995, 0.5, 8.0, 0.971_788_676_687_669_9),
+        (2.0, 0.25, 0.3, 6.0, 0.899_740_379_887_985_2),
+    ];
+    for (alpha, beta, r, tau, reference) in pins {
+        let cdf = ic_cdf(alpha, beta, r, tau);
+        assert!(
+            (cdf - reference).abs() < 1.0e-11,
+            "ic_cdf({alpha}, {beta}, {r}, {tau}) = {cdf:.16e} vs external reference {reference:.16e}"
+        );
+    }
+}
+
+#[test]
+fn non_finite_rate_parameters_return_visible_nan() {
+    // Domain contract: garbage in stays visible. A NaN rate must not be
+    // floored into a plausible CDF or pulse value.
+    for bad in [f64::NAN, f64::INFINITY, f64::NEG_INFINITY] {
+        assert!(ic_cdf(bad, 0.5, 0.3, 2.0).is_nan());
+        assert!(ic_cdf(2.0, bad, 0.3, 2.0).is_nan());
+        assert!(ic_cdf(2.0, 0.5, bad, 2.0).is_nan());
+        assert!(ic_pulse(bad, 0.5, 0.3, 2.0).is_nan());
+        assert!(ic_pulse(2.0, bad, 0.3, 2.0).is_nan());
+        assert!(ic_pulse(2.0, 0.5, bad, 2.0).is_nan());
+    }
+    // Finite non-positive rates keep the documented floor semantics.
+    assert!(ic_cdf(-1.0, 0.5, 0.0, 2.0).is_finite());
+}
+
+#[test]
+fn singular_exp_milli_ev_r_law_is_rejected() {
+    // κ = 0 (undefined) and tiny-negative κ (divergent law) must not be
+    // silently mapped to R = 0 by eval's floor.
+    for kappa in [0.0, -5.0e-10] {
+        let err = IkedaCarpenter::new(
+            IkedaCarpenterParams {
+                alpha: EnergyLaw::Const(2.0),
+                beta: EnergyLaw::Const(0.5),
+                r: EnergyLaw::ExpMilliEv { kappa },
+                burst_sigma_us: None,
+                channel_fwhm_us: None,
+            },
+            25.0,
+            &SynthesisGrid::new(1.0, 100.0),
+        )
+        .expect_err("singular R law must not construct")
+        .to_string();
+        assert!(
+            err.contains("singular"),
+            "κ = {kappa}: error must name the singularity, got: {err}"
+        );
+    }
+    // A small POSITIVE κ is the legitimate κ → 0⁺ limit (R → 0) and stays valid.
+    IkedaCarpenter::new(
+        IkedaCarpenterParams {
+            alpha: EnergyLaw::Const(2.0),
+            beta: EnergyLaw::Const(0.5),
+            r: EnergyLaw::ExpMilliEv { kappa: 5.0e-10 },
+            burst_sigma_us: None,
+            channel_fwhm_us: None,
+        },
+        25.0,
+        &SynthesisGrid::new(1.0, 100.0),
+    )
+    .expect("positive tiny κ is the valid R → 0 limit");
+}
+
+#[test]
 fn cdf_far_tail_values_are_exact_not_nan() {
     // Far-tail regression: at³ / u³ overflow used to produce inf·0 = NaN,
     // which detector-bin differencing then silently converted to zero mass.

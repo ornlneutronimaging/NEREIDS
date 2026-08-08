@@ -5316,9 +5316,11 @@ Resolution file
 
     #[test]
     fn piecewise_linear_normalized_branch_pins_delta_and_partial_window() {
-        // The normalize_support = true branch gains its consumer in the
-        // tabulated detector-bin work; these pins fix its semantics now so
-        // that consumer inherits a tested contract.
+        // Production currently consumes only the non-normalizing
+        // piecewise_linear_bin_masses path; the normalize_support = true
+        // branch has no production caller yet (the tabulated detector-bin
+        // operator adopts it next). These pins fix its semantics ahead of
+        // that consumer.
         let delta = |t: f64, edges: &[f64]| {
             piecewise_linear_bin_integrals(&[t], &[3.5], edges, true)
                 .expect("one-point kernel is a unit delta under normalization")

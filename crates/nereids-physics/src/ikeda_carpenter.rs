@@ -173,13 +173,12 @@ const MIN_N_TAU: usize = 8;
 /// (strictly: `capped_step > FWHM/3`).
 const TRI_MIN_SAMPLES_PER_SIDE: f64 = 3.0;
 
-/// Reach of the sampled/folded Gaussian burst in standard deviations (±4σ:
-/// e^{−8} ≈ 3.4e-4 of peak at the edge, well below any consuming tolerance
-/// once convolved). Also fixes the burst resolution floor `dtau ≤ σ`
-/// (≥ `GAUSS_REACH_SIGMAS` samples per side). At ±8σ the truncated two-sided
-/// Gaussian mass is erfc(8/√2) ≈ 1.2e-15, so the retained-mass bookkeeping in
+/// Reach of the sampled/folded Gaussian burst in standard deviations. At
+/// ±`GAUSS_REACH_SIGMAS`·σ = ±8σ the truncated two-sided Gaussian mass is
+/// erfc(8/√2) ≈ 1.2e-15, so the retained-mass bookkeeping in
 /// [`gaussian_kernel`] stays exact at f64 scale and no physically meaningful
-/// mass is discarded for any detector window.
+/// mass is discarded for any detector window. Also fixes the burst
+/// resolution floor `dtau ≤ σ` (≥ `GAUSS_REACH_SIGMAS` samples per side).
 const GAUSS_REACH_SIGMAS: f64 = 8.0;
 
 /// Prompt-tail reach in e-folds: the τ-grid spans `FAST_REACH_E_FOLDS / α`
@@ -218,9 +217,9 @@ const R_NEGLIGIBLE: f64 = 1e-9;
 /// whose floor cannot be met within the cap is REJECTED loudly by
 /// [`IkedaCarpenter::new`] instead of silently under-sampled. The actual
 /// guarantee is on the pulse body only: the symmetric burst/channel fold
-/// margin (± `4σ + FWHM` at the resolved step) adds its samples ON TOP of
-/// the cap, so the final grid can exceed `MAX_TAU_SAMPLES` by the margin
-/// sample count.
+/// margin (± `GAUSS_REACH_SIGMAS·σ + FWHM` at the resolved step) adds its
+/// samples ON TOP of the cap, so the final grid can exceed
+/// `MAX_TAU_SAMPLES` by the margin sample count.
 const MAX_TAU_SAMPLES: usize = 8192;
 
 /// Taylor expansion of `h(u)/u³` where `h(u) = 1 − e^{−u}(1 + u + ½u²)`, for
@@ -245,6 +244,11 @@ fn h_over_cube_taylor(u: f64) -> f64 {
 /// near `u = α−β·τ → 0` where that bracket cancels.
 #[must_use]
 pub fn ic_pulse(alpha: f64, beta: f64, r: f64, tau: f64) -> f64 {
+    // Same domain contract as ic_cdf: non-finite parameters return NaN so
+    // garbage in stays visible instead of flooring into a plausible pulse.
+    if !alpha.is_finite() || !beta.is_finite() || !r.is_finite() {
+        return f64::NAN;
+    }
     if !tau.is_finite() || tau < 0.0 {
         return 0.0;
     }
@@ -280,8 +284,15 @@ pub fn ic_pulse(alpha: f64, beta: f64, r: f64, tau: f64) -> f64 {
 ///
 /// The expression is evaluated without subtracting nearly equal exponentials
 /// when `α ≈ β`. This is the bin-integral companion to [`ic_pulse`].
+///
+/// Domain contract: non-finite `alpha`, `beta`, or `r` returns NaN so garbage
+/// in stays visible; finite non-positive rates are floored to [`MIN_RATE`]
+/// and `r <= 0` disables the storage term, matching [`ic_pulse`].
 #[must_use]
 pub fn ic_cdf(alpha: f64, beta: f64, r: f64, tau: f64) -> f64 {
+    if !alpha.is_finite() || !beta.is_finite() || !r.is_finite() {
+        return f64::NAN;
+    }
     if tau.is_nan() || tau <= 0.0 {
         return 0.0;
     }
@@ -414,6 +425,10 @@ impl EnergyLaw {
             EnergyLaw::InverseLambda { a0, a1 } => {
                 inverse_lambda_denom(a0, a1, energy_ev.max(0.0)).abs() < MIN_RATE
             }
+            // κ = 0 is undefined and a tiny NEGATIVE κ is a divergent law
+            // (exp(+E/|κ|)); eval's floor maps both to 0.0, which is the
+            // legitimate κ → 0⁺ limit only for positive κ.
+            EnergyLaw::ExpMilliEv { kappa } => (-MIN_RATE..=0.0).contains(&kappa),
             _ => false,
         }
     }
@@ -479,7 +494,8 @@ pub struct SynthesisGrid {
     /// `n_tau = 8` density, folds at ≥ 3 triangle samples per side / ≥ 1
     /// sample per burst σ): a combination that cannot be resolved within the
     /// cap is rejected by [`IkedaCarpenter::new`]. Active burst/channel folds
-    /// add their ±(4σ + FWHM) margin samples on top of the cap.
+    /// add their ±(`GAUSS_REACH_SIGMAS`·σ + FWHM) margin samples on top of
+    /// the cap.
     pub n_tau: usize,
 }
 
@@ -568,11 +584,12 @@ impl IkedaCarpenter {
         // numerical floor would otherwise convert it into a plausible huge
         // positive rate that the α > 0 / β > 0 checks below cannot distinguish
         // from genuine physics.
-        for (name, law) in [("α", &params.alpha), ("β", &params.beta)] {
+        for (name, law) in [("α", &params.alpha), ("β", &params.beta), ("R", &params.r)] {
             if let Some(&bad) = ref_energies.iter().find(|&&e| law.is_singular_at(e)) {
                 return Err(ResolutionParseError::InvalidFormat(format!(
-                    "Ikeda–Carpenter {name}(E) law is singular at E = {bad} eV: \
-                     its InverseLambda denominator is within ±{MIN_RATE} of zero"
+                    "Ikeda–Carpenter {name}(E) law is singular at E = {bad} eV \
+                     (an InverseLambda denominator or ExpMilliEv κ within \
+                     ±{MIN_RATE} of zero)"
                 )));
             }
         }
@@ -791,11 +808,16 @@ impl IkedaCarpenter {
                 "true energy must be positive and finite, got {energy_ev}"
             )));
         }
-        for (name, law) in [("alpha", &self.params.alpha), ("beta", &self.params.beta)] {
+        for (name, law) in [
+            ("alpha", &self.params.alpha),
+            ("beta", &self.params.beta),
+            ("R", &self.params.r),
+        ] {
             if law.is_singular_at(energy_ev) {
                 return Err(ResolutionParseError::InvalidFormat(format!(
-                    "Ikeda–Carpenter {name}({energy_ev}) law is singular: its \
-                     InverseLambda denominator is within ±{MIN_RATE} of zero"
+                    "Ikeda–Carpenter {name}({energy_ev}) law is singular (an \
+                     InverseLambda denominator or ExpMilliEv κ within \
+                     ±{MIN_RATE} of zero)"
                 )));
             }
         }
@@ -828,7 +850,7 @@ impl IkedaCarpenter {
 /// Gamma(3) pulse (`fast_reach / (n_tau − 1)`) — and REFINED to resolve any
 /// requested instrument fold (triangle: ≥ [`TRI_MIN_SAMPLES_PER_SIDE`]
 /// samples per side, i.e. `dtau ≤ FWHM/3`; Gaussian burst: `dtau ≤ σ`, i.e.
-/// ≥ [`GAUSS_REACH_SIGMAS`] samples per ±4σ side). A longer storage tail
+/// ≥ [`GAUSS_REACH_SIGMAS`] samples per ±`GAUSS_REACH_SIGMAS`·σ side). A longer storage tail
 /// (β ≪ α, R > 0) extends the SAMPLE COUNT (`j_hi ∝ tau_max/dtau`) instead
 /// of the step; [`MAX_TAU_SAMPLES`] bounds that count by widening the step —
 /// but never past the resolution FLOOR (`fast_reach / (MIN_N_TAU − 1)` for
@@ -895,9 +917,9 @@ fn tau_geometry(
     Ok((dtau_req.max(capped_step), tau_max, margin_of(params)))
 }
 
-/// Symmetric τ-grid margin for the burst/channel folds: ±(4σ + FWHM), the
-/// folds' full reach. These samples come ON TOP of [`MAX_TAU_SAMPLES`] (the
-/// cap governs the pulse body only).
+/// Symmetric τ-grid margin for the burst/channel folds:
+/// ±([`GAUSS_REACH_SIGMAS`]·σ + FWHM), the folds' full reach. These samples
+/// come ON TOP of [`MAX_TAU_SAMPLES`] (the cap governs the pulse body only).
 fn margin_of(params: &IkedaCarpenterParams) -> f64 {
     params
         .burst_sigma_us
