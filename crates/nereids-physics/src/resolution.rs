@@ -5313,4 +5313,36 @@ Resolution file
             "the dip must measurably alter at least one in-window target"
         );
     }
+
+    #[test]
+    fn piecewise_linear_normalized_branch_pins_delta_and_partial_window() {
+        // The normalize_support = true branch gains its consumer in the
+        // tabulated detector-bin work; these pins fix its semantics now so
+        // that consumer inherits a tested contract.
+        let delta = |t: f64, edges: &[f64]| {
+            piecewise_linear_bin_integrals(&[t], &[3.5], edges, true)
+                .expect("one-point kernel is a unit delta under normalization")
+        };
+        assert_eq!(delta(2.0, &[0.0, 1.0, 3.0, 5.0]), vec![0.0, 1.0, 0.0]);
+        // The last bin is right-closed: a delta exactly on the final edge
+        // belongs to it.
+        assert_eq!(delta(5.0, &[0.0, 1.0, 3.0, 5.0]), vec![0.0, 0.0, 1.0]);
+        // A delta outside every bin contributes nothing.
+        assert_eq!(delta(9.0, &[0.0, 1.0, 3.0, 5.0]), vec![0.0, 0.0, 0.0]);
+        // A one-point kernel without a defined width is rejected in the
+        // density (masses) mode.
+        assert!(piecewise_linear_bin_integrals(&[2.0], &[3.5], &[0.0, 5.0], false).is_none());
+
+        // Support normalization: a triangle on [0, 2] integrates to one over
+        // its full support, and a partial window reports the true fraction.
+        let times = [0.0, 1.0, 2.0];
+        let weights = [0.0, 4.0, 0.0]; // arbitrary scale — normalization removes it
+        let full = piecewise_linear_bin_integrals(&times, &weights, &[0.0, 2.0], true)
+            .expect("triangle integrates");
+        assert!((full[0] - 1.0).abs() < 1e-15);
+        let halves = piecewise_linear_bin_integrals(&times, &weights, &[0.0, 0.5, 1.0], true)
+            .expect("triangle integrates");
+        assert!((halves[0] - 0.125).abs() < 1e-15);
+        assert!((halves[1] - 0.375).abs() < 1e-15);
+    }
 }

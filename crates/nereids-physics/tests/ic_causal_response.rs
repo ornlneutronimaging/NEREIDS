@@ -1,7 +1,28 @@
 use nereids_physics::ikeda_carpenter::{
-    EnergyLaw, IkedaCarpenter, IkedaCarpenterParams, SynthesisGrid,
+    EnergyLaw, IkedaCarpenter, IkedaCarpenterParams, SynthesisGrid, ic_cdf, ic_pulse,
 };
 use nereids_physics::resolution::TOF_FACTOR;
+
+/// Simpson integral of `f` over `[a, b]` with `2n` intervals, accumulated
+/// with Neumaier compensation so the oracle's summation noise stays below the
+/// tolerances that use it (naive summation of 2e5 terms costs ~1e-11).
+fn simpson(f: impl Fn(f64) -> f64, a: f64, b: f64, n: usize) -> f64 {
+    let h = (b - a) / (2 * n) as f64;
+    let mut sum = f(a) + f(b);
+    let mut compensation = 0.0_f64;
+    for k in 1..2 * n {
+        let w = if k % 2 == 1 { 4.0 } else { 2.0 };
+        let value = w * f(a + k as f64 * h);
+        let t = sum + value;
+        compensation += if sum.abs() >= value.abs() {
+            (sum - t) + value
+        } else {
+            (value - t) + sum
+        };
+        sum = t;
+    }
+    (sum + compensation) * h / 3.0
+}
 
 fn gamma3_cdf(x: f64) -> f64 {
     if x <= 0.0 {
@@ -326,15 +347,6 @@ fn gaussian_fold_preserves_finite_window_tail_mass() {
     let lower = delays[0];
     let upper = delays[delays.len() - 1];
     let nominal_arrival = TOF_FACTOR * flight_path_m / true_energy_ev.sqrt();
-    let got: f64 = model
-        .detector_bin_probabilities(
-            true_energy_ev,
-            &[nominal_arrival + lower, nominal_arrival + upper],
-            0.0,
-        )
-        .expect("valid folded detector window")
-        .iter()
-        .sum();
 
     // Independent oracle: integrate the exact Gamma(3) moderator CDF over a
     // standard normal variable. This does not use the sampled convolution or
@@ -343,27 +355,262 @@ fn gaussian_fold_preserves_finite_window_tail_mass() {
         (-0.5 * (delay / sigma).powi(2)).exp() / (sigma * std::f64::consts::TAU.sqrt())
     };
     let moderator_cdf = |delay: f64| gamma3_cdf(alpha * delay);
-    let integrand = |gaussian_delay: f64| {
-        normal_density(gaussian_delay)
-            * (moderator_cdf(upper - gaussian_delay) - moderator_cdf(lower - gaussian_delay))
+    let window_oracle = |lo: f64, hi: f64| {
+        simpson(
+            |gaussian_delay: f64| {
+                normal_density(gaussian_delay)
+                    * (moderator_cdf(hi - gaussian_delay) - moderator_cdf(lo - gaussian_delay))
+            },
+            -10.0 * sigma,
+            10.0 * sigma,
+            100_000,
+        )
     };
-    let integration_limit = 10.0 * sigma;
-    let intervals = 200_000_usize;
-    let step = 2.0 * integration_limit / intervals as f64;
-    let mut oracle = integrand(-integration_limit) + integrand(integration_limit);
-    for index in 1..intervals {
-        let delay = -integration_limit + index as f64 * step;
-        oracle += if index % 2 == 0 { 2.0 } else { 4.0 } * integrand(delay);
-    }
-    oracle *= step / 3.0;
+    let window_sum = |lo: f64, hi: f64| -> f64 {
+        model
+            .detector_bin_probabilities(
+                true_energy_ev,
+                &[nominal_arrival + lo, nominal_arrival + hi],
+                0.0,
+            )
+            .expect("valid folded detector window")
+            .iter()
+            .sum()
+    };
 
+    // Broad window covering the whole sampled support: with the ±8σ reach the
+    // truncated Gaussian mass is ~1e-15, so a broad window must no longer be
+    // undercounted by the truncation bookkeeping.
+    let got_broad = window_sum(lower, upper);
+    let oracle_broad = window_oracle(lower, upper);
     assert!(
-        1.0 - oracle > 4.0e-5,
-        "oracle window must expose enough missing tail to reject silent renormalization"
+        (got_broad - oracle_broad).abs() < 2.0e-5,
+        "sampled Gaussian-folded probability {got_broad} disagrees with independent integral {oracle_broad}"
     );
     assert!(
-        (got - oracle).abs() < 2.0e-5,
-        "sampled Gaussian-folded probability {got} disagrees with independent integral {oracle}"
+        1.0 - got_broad < 1.0e-6,
+        "broad window undercounted: kernel-truncation bookkeeping discarded {:.3e}",
+        1.0 - got_broad
+    );
+    assert!(
+        got_broad < 1.0,
+        "finite window was silently renormalized to one"
+    );
+
+    // Deliberately cut window: the upper edge sits on a sampled grid point
+    // near +2σ, so real fold mass lies beyond it. Both the oracle and the
+    // sampled path must SEE that loss — a renormalizing implementation would
+    // report ~1 (comparison is loose because the n_tau = 8 grid is
+    // deliberately coarse; the broad-window comparison above is the tight one).
+    let cut = delays
+        .iter()
+        .copied()
+        .min_by(|a, b| (a - 2.0 * sigma).abs().total_cmp(&(b - 2.0 * sigma).abs()))
+        .expect("non-empty sampled support");
+    let got_cut = window_sum(lower, cut);
+    let oracle_cut = window_oracle(lower, cut);
+    assert!(
+        1.0 - oracle_cut > 1.0e-2,
+        "cut-window oracle must expose real missing mass (got {oracle_cut})"
+    );
+    assert!(
+        1.0 - got_cut > 1.0e-2,
+        "cut window silently renormalized: reported {got_cut}"
+    );
+    assert!(
+        got_cut < got_broad,
+        "cutting the window must reduce the reported mass"
+    );
+}
+
+#[test]
+fn unequal_rate_storage_cdf_matches_pulse_quadrature() {
+    // General α ≠ β storage CDF against Simpson integration of the density —
+    // the two functions share no code path for the storage term, so this pins
+    // both the bounded-bracket branch (|u| ≥ 0.05) and the Taylor branch
+    // (0 < |u| < 0.05) against an independent quadrature oracle.
+    let cases: [(f64, f64, f64, f64); 6] = [
+        (1.7, 0.45, 0.35, 0.4),  // bounded branch, early time
+        (1.7, 0.45, 0.35, 2.7),  // bounded branch, mid pulse
+        (1.7, 0.45, 0.35, 12.0), // bounded branch, deep tail
+        (0.6, 2.4, 0.8, 3.0),    // β > α (negative u)
+        (1.0, 0.995, 0.5, 8.0),  // Taylor branch: u = 0.04
+        (1.0, 0.995, 0.5, 1.0),  // Taylor branch: u = 0.005
+    ];
+    // Tolerance: near the |u| = 0.05 Taylor-branch boundary the two
+    // implementations carry independent series truncation — measured against
+    // a 60-digit reference at (1, 0.995, 0.5, 8): ic_cdf 4.7e-12, the
+    // integrated pulse 1.4e-11 — so the comparison budget is their sum.
+    for (alpha, beta, r, tau) in cases {
+        let quad = simpson(|t| ic_pulse(alpha, beta, r, t), 0.0, tau, 100_000);
+        let cdf = ic_cdf(alpha, beta, r, tau);
+        assert!(
+            (cdf - quad).abs() < 5.0e-11,
+            "ic_cdf({alpha}, {beta}, {r}, {tau}) = {cdf:.16e} vs quadrature {quad:.16e}"
+        );
+    }
+}
+
+#[test]
+fn storage_with_channel_fold_preserves_missing_tail_mass() {
+    // The sampled fold path with storage active (r > 0 AND a channel fold):
+    // the oracle is a double quadrature — the triangle channel density folded
+    // with the pulse-density integral — sharing only `ic_pulse` with the code
+    // under test (whose CDF equivalence the quadrature test above pins).
+    let (alpha, beta, r) = (2.0, 0.25, 0.3);
+    let fwhm = 0.7_f64; // triangle half-base = FWHM
+    let flight_path_m = 25.0_f64;
+    let true_energy_ev = 25.0_f64;
+    let model = IkedaCarpenter::new(
+        IkedaCarpenterParams {
+            alpha: EnergyLaw::Const(alpha),
+            beta: EnergyLaw::Const(beta),
+            r: EnergyLaw::Const(r),
+            burst_sigma_us: None,
+            channel_fwhm_us: Some(fwhm),
+        },
+        flight_path_m,
+        &SynthesisGrid::new(1.0, 100.0),
+    )
+    .expect("valid folded storage IC model");
+
+    let nominal = TOF_FACTOR * flight_path_m / true_energy_ev.sqrt();
+    // The window deliberately cuts the slow storage tail (β = 0.25 ⇒ mean
+    // storage delay 4 µs) so real mass lies beyond the last edge.
+    let edges = [nominal - 1.0, nominal + 1.0, nominal + 3.0, nominal + 6.0];
+    let got: f64 = model
+        .detector_bin_probabilities(true_energy_ev, &edges, 0.0)
+        .expect("valid detector bins")
+        .iter()
+        .sum();
+
+    let half_base = fwhm;
+    let triangle = |c: f64| (1.0 - c.abs() / half_base) / half_base;
+    let window_mass = |lo: f64, hi: f64| {
+        simpson(
+            |c| {
+                let a = (lo - c).max(0.0);
+                let b = (hi - c).max(0.0);
+                if b <= a {
+                    0.0
+                } else {
+                    triangle(c) * simpson(|t| ic_pulse(alpha, beta, r, t), a, b, 4_000)
+                }
+            },
+            -half_base,
+            half_base,
+            600,
+        )
+    };
+    let oracle = window_mass(-1.0, 6.0);
+    assert!(
+        1.0 - oracle > 0.05,
+        "window must lose real storage-tail mass (oracle = {oracle:.6})"
+    );
+    assert!(
+        (got - oracle).abs() < 5.0e-5,
+        "folded storage window mass {got:.8} vs double-quadrature oracle {oracle:.8}"
     );
     assert!(got < 1.0, "finite window was silently renormalized to one");
+}
+
+#[test]
+fn singular_inverse_lambda_laws_are_rejected() {
+    let grid = SynthesisGrid::new(5.0, 50.0);
+    // Construction: an all-zero (undefined at every energy) rate law must be
+    // rejected loudly, not floored into a plausible ~1e9 µs⁻¹ rate.
+    for (name, params) in [
+        (
+            "alpha",
+            IkedaCarpenterParams {
+                alpha: EnergyLaw::InverseLambda { a0: 0.0, a1: 0.0 },
+                beta: EnergyLaw::Const(0.1),
+                r: EnergyLaw::Const(0.0),
+                burst_sigma_us: None,
+                channel_fwhm_us: None,
+            },
+        ),
+        (
+            "beta",
+            IkedaCarpenterParams {
+                alpha: EnergyLaw::Const(2.0),
+                beta: EnergyLaw::InverseLambda { a0: 0.0, a1: 0.0 },
+                r: EnergyLaw::Const(0.5),
+                burst_sigma_us: None,
+                channel_fwhm_us: None,
+            },
+        ),
+        (
+            "tiny-negative beta",
+            IkedaCarpenterParams {
+                alpha: EnergyLaw::Const(2.0),
+                beta: EnergyLaw::InverseLambda {
+                    a0: -5.0e-10,
+                    a1: 0.0,
+                },
+                r: EnergyLaw::Const(0.5),
+                burst_sigma_us: None,
+                channel_fwhm_us: None,
+            },
+        ),
+    ] {
+        let err = IkedaCarpenter::new(params, 25.0, &grid)
+            .expect_err("singular law must not construct")
+            .to_string();
+        assert!(
+            err.contains("singular"),
+            "{name}: error must name the singularity, got: {err}"
+        );
+    }
+
+    // Probe-time: a law that is regular over the whole synthesis range but
+    // whose denominator crosses zero at a probe energy outside it must fail
+    // at that probe, not evaluate through the floor. λ(4 eV) is recovered
+    // through the public eval so the crossing is placed exactly.
+    let lambda_at_4 = 1.0 / EnergyLaw::InverseLambda { a0: 0.0, a1: 1.0 }.eval(4.0);
+    let crossing = EnergyLaw::InverseLambda {
+        a0: 1.0,
+        a1: -1.0 / lambda_at_4,
+    };
+    let model = IkedaCarpenter::new(
+        IkedaCarpenterParams {
+            alpha: EnergyLaw::Const(2.0),
+            beta: crossing,
+            r: EnergyLaw::Const(0.2),
+            burst_sigma_us: None,
+            channel_fwhm_us: None,
+        },
+        25.0,
+        &grid,
+    )
+    .expect("regular over the synthesis range");
+    let err = model
+        .kernel_at(4.0)
+        .expect_err("singular probe energy must be rejected")
+        .to_string();
+    assert!(
+        err.contains("singular"),
+        "probe error must name the singularity, got: {err}"
+    );
+}
+
+#[test]
+fn cdf_far_tail_values_are_exact_not_nan() {
+    // Far-tail regression: at³ / u³ overflow used to produce inf·0 = NaN,
+    // which detector-bin differencing then silently converted to zero mass.
+    let deep_prompt = ic_cdf(1.0, 1.0e-6, 0.5, 1.0e103);
+    assert_eq!(deep_prompt, 1.0, "deep prompt tail must saturate at 1");
+
+    let instant_storage = ic_cdf(1.0, 1.0e101, 0.5, 1.0);
+    assert!(
+        instant_storage.is_finite() && (0.0..=1.0).contains(&instant_storage),
+        "instant-storage limit must stay finite, got {instant_storage}"
+    );
+    assert!(
+        (instant_storage - gamma3_cdf(1.0)).abs() < 1.0e-15,
+        "instant storage decays to the prompt CDF"
+    );
+
+    let overflow_prompt = ic_cdf(1.0e155, 1.0, 0.0, 1.0);
+    assert_eq!(overflow_prompt, 1.0, "Γ₃ far tail must saturate at 1");
 }

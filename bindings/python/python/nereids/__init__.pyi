@@ -402,7 +402,10 @@ class IkedaCarpenter:
         burst_sigma_us: float | None = None,
         channel_fwhm_us: float | None = None,
         beta_law: EnergyLaw | None = None,
-    ) -> None: ...
+    ) -> None:
+        """When ``beta_law`` is supplied it overrides the scalar ``beta``
+        (which is still required positionally but otherwise ignored)."""
+        ...
     def as_tabulated(self) -> TabulatedResolution:
         """The synthesized tabulated kernel (usable as a resolution file)."""
         ...
@@ -411,14 +414,20 @@ class IkedaCarpenter:
         """``(tof_offsets_us, weights)`` at one energy; mode at offset 0.
 
         Raises ``ValueError`` when the tau-grid cannot resolve the prompt
-        core and requested folds within the sample cap at this energy.
+        core and requested folds within the sample cap at this energy, or
+        when a parameter law is invalid at this probe energy (non-positive
+        or singular rate, storage fraction outside [0, 1]).
         """
         ...
 
     def source_pulse_at(self, true_energy_ev: float) -> tuple[list[float], list[float]]:
         """Physical ``(moderator_delay_us, density)`` at one true energy.
 
-        Unlike :meth:`kernel_at`, this keeps the pulse's time origin.
+        Unlike :meth:`kernel_at`, this keeps the pulse's time origin. The
+        density is a peak-normalized shape (maximum 1), not a probability
+        density; with a symmetric burst/channel fold the leading delays can
+        be negative. Raises ``ValueError`` for a nonphysical probe energy or
+        a parameter law that is invalid there.
         """
         ...
 

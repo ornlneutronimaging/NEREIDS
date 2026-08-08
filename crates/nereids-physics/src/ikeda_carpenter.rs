@@ -44,7 +44,8 @@
 //!
 //! - `α(E)` [1/µs]: fast moderation/leakage rate; sets the prompt width.
 //!   Leading epithermal scaling `α ∝ √E` (Mantid `α = 1/(α₀+α₁λ)`, λ ∝ 1/√E).
-//! - `β` [1/µs]: slow storage rate; sets the delayed tail. Energy-independent.
+//! - `β(E)` [1/µs]: slow storage rate; sets the delayed tail. Constant by
+//!   default; optionally energy-dependent through an [`EnergyLaw`].
 //! - `R(E)`, 0 ≤ R ≤ 1: storage mixing fraction; `R ≈ exp(−E_meV/κ)` → **R→0 in
 //!   the 1–200 eV resonance regime**, so IC there is dominated by the
 //!   one-parameter prompt Gamma(3, α(E)) term.
@@ -175,8 +176,11 @@ const TRI_MIN_SAMPLES_PER_SIDE: f64 = 3.0;
 /// Reach of the sampled/folded Gaussian burst in standard deviations (±4σ:
 /// e^{−8} ≈ 3.4e-4 of peak at the edge, well below any consuming tolerance
 /// once convolved). Also fixes the burst resolution floor `dtau ≤ σ`
-/// (≥ `GAUSS_REACH_SIGMAS` samples per side).
-const GAUSS_REACH_SIGMAS: f64 = 4.0;
+/// (≥ `GAUSS_REACH_SIGMAS` samples per side). At ±8σ the truncated two-sided
+/// Gaussian mass is erfc(8/√2) ≈ 1.2e-15, so the retained-mass bookkeeping in
+/// [`gaussian_kernel`] stays exact at f64 scale and no physically meaningful
+/// mass is discarded for any detector window.
+const GAUSS_REACH_SIGMAS: f64 = 8.0;
 
 /// Prompt-tail reach in e-folds: the τ-grid spans `FAST_REACH_E_FOLDS / α`
 /// so the prompt Gamma(3) tail `τ²e^{−ατ}` is < ~1e-8 of peak at the edge.
@@ -284,15 +288,26 @@ pub fn ic_cdf(alpha: f64, beta: f64, r: f64, tau: f64) -> f64 {
     if tau == f64::INFINITY {
         return 1.0;
     }
-    if !tau.is_finite() {
-        return 0.0;
-    }
 
     let alpha = alpha.max(MIN_RATE);
     let beta = beta.max(MIN_RATE);
     let at = alpha * tau;
     let fast = gamma3_cdf(at);
     if r <= 0.0 {
+        return fast;
+    }
+
+    // Far in the tails the general expressions overflow — `at³` or `u³`
+    // reach f64::INFINITY and produce inf·0 / inf/inf = NaN — while the
+    // limits are exact to full f64 precision, so return them directly.
+    // For at ≥ 1e100 the prompt CDF is 1 and the storage correction is
+    // exp(−βτ) with relative error ≤ 3βτ/at; for βτ ≥ 1e100 the storage
+    // delay is instantaneous and the correction is 0.
+    const CDF_TAIL_LIMIT: f64 = 1.0e100;
+    if at >= CDF_TAIL_LIMIT {
+        return (1.0 - r * (-beta * tau).exp()).clamp(0.0, 1.0);
+    }
+    if beta * tau >= CDF_TAIL_LIMIT {
         return fast;
     }
 
@@ -313,6 +328,12 @@ pub fn ic_cdf(alpha: f64, beta: f64, r: f64, tau: f64) -> f64 {
 fn gamma3_cdf(x: f64) -> f64 {
     if x <= 0.0 {
         return 0.0;
+    }
+    // Beyond x ≈ 750 the survival term exp(−x)·(1+x+x²/2) underflows to an
+    // exact zero long before the polynomial can overflow (x² reaches
+    // f64::INFINITY only at x ~ 1.3e154, where 0·inf would be NaN).
+    if x >= 750.0 {
+        return 1.0;
     }
     if x < 0.5 {
         // Integral of x² exp(-x) / 2 as an alternating series. The direct
@@ -362,12 +383,7 @@ impl EnergyLaw {
             EnergyLaw::Const(c) => c,
             EnergyLaw::SqrtE { a0, a1 } => a0 * e.sqrt() + a1,
             EnergyLaw::InverseLambda { a0, a1 } => {
-                let lambda = if e > 0.0 {
-                    LAMBDA_ANGSTROM_FACTOR / e.sqrt()
-                } else {
-                    f64::INFINITY
-                };
-                let denom = a0 + a1 * lambda;
+                let denom = inverse_lambda_denom(a0, a1, e);
                 if denom.abs() < MIN_RATE {
                     1.0 / MIN_RATE
                 } else {
@@ -383,6 +399,35 @@ impl EnergyLaw {
             }
         }
     }
+
+    /// True when the law is numerically singular at `energy_ev`: the raw
+    /// `InverseLambda` denominator lies inside the ±[`MIN_RATE`] window that
+    /// [`EnergyLaw::eval`] floors away. The floor keeps a fit trial step from
+    /// dividing by zero mid-optimization, but a *configured* law inside that
+    /// window is a mathematically undefined rate, not a large one — without
+    /// this check the floor converts an undefined (or tiny-negative)
+    /// denominator into a plausible huge positive rate before the range
+    /// validation below can see it.
+    #[must_use]
+    pub(crate) fn is_singular_at(&self, energy_ev: f64) -> bool {
+        match *self {
+            EnergyLaw::InverseLambda { a0, a1 } => {
+                inverse_lambda_denom(a0, a1, energy_ev.max(0.0)).abs() < MIN_RATE
+            }
+            _ => false,
+        }
+    }
+}
+
+/// Raw `InverseLambda` denominator `a0 + a1·λ(E)` — shared by [`EnergyLaw::eval`]
+/// and the singularity check so the two can never disagree on the window.
+fn inverse_lambda_denom(a0: f64, a1: f64, e: f64) -> f64 {
+    let lambda = if e > 0.0 {
+        LAMBDA_ANGSTROM_FACTOR / e.sqrt()
+    } else {
+        f64::INFINITY
+    };
+    a0 + a1 * lambda
 }
 
 /// Parameters of the Ikeda–Carpenter resolution model.
@@ -518,6 +563,19 @@ impl IkedaCarpenter {
             .map(|i| (ln_lo + (i as f64 / denom) * (ln_hi - ln_lo)).exp())
             .collect();
 
+        // Reject singular rate laws before the range checks: a near-zero
+        // InverseLambda denominator is an undefined configuration, and eval's
+        // numerical floor would otherwise convert it into a plausible huge
+        // positive rate that the α > 0 / β > 0 checks below cannot distinguish
+        // from genuine physics.
+        for (name, law) in [("α", &params.alpha), ("β", &params.beta)] {
+            if let Some(&bad) = ref_energies.iter().find(|&&e| law.is_singular_at(e)) {
+                return Err(ResolutionParseError::InvalidFormat(format!(
+                    "Ikeda–Carpenter {name}(E) law is singular at E = {bad} eV: \
+                     its InverseLambda denominator is within ±{MIN_RATE} of zero"
+                )));
+            }
+        }
         // Reject parameter laws that yield a non-positive fast rate α(E): the
         // pulse would otherwise degenerate (synthesis clamps α to a tiny floor,
         // producing a meaningless near-flat kernel rather than failing loudly).
@@ -732,6 +790,14 @@ impl IkedaCarpenter {
             return Err(ResolutionParseError::InvalidFormat(format!(
                 "true energy must be positive and finite, got {energy_ev}"
             )));
+        }
+        for (name, law) in [("alpha", &self.params.alpha), ("beta", &self.params.beta)] {
+            if law.is_singular_at(energy_ev) {
+                return Err(ResolutionParseError::InvalidFormat(format!(
+                    "Ikeda–Carpenter {name}({energy_ev}) law is singular: its \
+                     InverseLambda denominator is within ±{MIN_RATE} of zero"
+                )));
+            }
         }
         let alpha = self.params.alpha.eval(energy_ev);
         let beta = self.params.beta.eval(energy_ev);

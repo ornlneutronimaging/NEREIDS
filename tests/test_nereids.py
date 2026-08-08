@@ -4,6 +4,7 @@ All tests use synthetic data built with ``nereids.create_resonance_data()``
 so no network access or ENDF downloads are required.
 """
 
+import math
 import os
 import tempfile
 import warnings
@@ -4191,6 +4192,63 @@ class TestIkedaCarpenterCausalResponse:
         assert probabilities[0] == 0.0
         assert np.all(probabilities[1:] > 0.0)
         assert 0.999 < probabilities.sum() <= 1.0
+
+    def test_partial_window_reports_known_missing_mass(self):
+        # A deliberately partial window whose true mass is the analytic
+        # Gamma(3, alpha) CDF at the cut: a binding that silently renormalized
+        # the window would report 1.0 instead.
+        flight_path_m = 25.0
+        energy_ev = 4.0
+        alpha = 2.0
+        arrival_us = nereids.energy_to_tof(energy_ev, flight_path_m)
+        ic = nereids.IkedaCarpenter(
+            flight_path_m=flight_path_m,
+            e_min_ev=1.0,
+            e_max_ev=10.0,
+            alpha=nereids.EnergyLaw.const(alpha),
+            beta=0.5,
+            r=nereids.EnergyLaw.const(0.0),
+        )
+
+        probabilities = np.asarray(
+            ic.detector_bin_probabilities(
+                energy_ev, [arrival_us, arrival_us + 1.0], 0.0
+            )
+        )
+
+        x = alpha * 1.0
+        gamma3_at_cut = 1.0 - math.exp(-x) * (1.0 + x + 0.5 * x * x)
+        assert probabilities.shape == (1,)
+        assert probabilities[0] == pytest.approx(gamma3_at_cut, abs=1e-9)
+        assert probabilities[0] < 1.0
+
+    def test_energy_dependent_beta_law_scales_storage_tail(self):
+        # With alpha and beta both proportional to sqrt(E), the pulse is a
+        # pure time rescaling: P(delay <= 2 us at 1 eV) equals
+        # P(delay <= 1 us at 4 eV). A binding that ignored beta_law (or
+        # evaluated it at a fixed reference energy) breaks the equality.
+        flight_path_m = 25.0
+        ic = nereids.IkedaCarpenter(
+            flight_path_m=flight_path_m,
+            e_min_ev=0.5,
+            e_max_ev=10.0,
+            alpha=nereids.EnergyLaw.sqrt_e(2.0, 0.0),
+            beta=999.0,  # overridden by beta_law
+            r=nereids.EnergyLaw.const(0.4),
+            beta_law=nereids.EnergyLaw.sqrt_e(0.5, 0.0),
+        )
+
+        def mass_within(energy_ev, delay_us):
+            arrival = nereids.energy_to_tof(energy_ev, flight_path_m)
+            (p,) = ic.detector_bin_probabilities(
+                energy_ev, [arrival, arrival + delay_us], 0.0
+            )
+            return p
+
+        slow = mass_within(1.0, 2.0)
+        fast = mass_within(4.0, 1.0)
+        assert 0.0 < slow < 1.0
+        assert slow == pytest.approx(fast, abs=1e-9)
 
 
 class TestCalibrateResolution:
