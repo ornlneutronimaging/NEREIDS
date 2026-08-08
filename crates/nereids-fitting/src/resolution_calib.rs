@@ -611,7 +611,7 @@ fn build_resolution(
                     a0: theta[0].exp(),
                     a1: theta[1].exp(),
                 },
-                beta: theta[2].exp(),
+                beta: EnergyLaw::Const(theta[2].exp()),
                 // Scalar R: a free κ in ExpMilliEv is unidentifiable in the eV
                 // regime (R ≡ 0 across 1–200 eV for ANY plausible κ); a scalar
                 // lets the calibrant decide whether a storage tail is present.
@@ -1252,7 +1252,10 @@ mod tests {
         let EnergyLaw::Const(rr) = p.r else {
             panic!("expected a Const R law");
         };
-        (a0, a1, p.beta, rr, p.channel_fwhm_us.unwrap_or(0.0))
+        let EnergyLaw::Const(beta) = p.beta else {
+            panic!("expected a Const beta law");
+        };
+        (a0, a1, beta, rr, p.channel_fwhm_us.unwrap_or(0.0))
     }
 
     fn synthetic_base_udr() -> TabulatedResolution {
@@ -1606,7 +1609,7 @@ mod tests {
         let ic = IkedaCarpenter::new(
             IkedaCarpenterParams {
                 alpha: EnergyLaw::SqrtE { a0: 0.30, a1: 0.0 },
-                beta: 0.1,
+                beta: EnergyLaw::Const(0.1),
                 r: EnergyLaw::ExpMilliEv { kappa: 25.0 },
                 burst_sigma_us: None,
                 channel_fwhm_us: None,
@@ -1810,7 +1813,7 @@ mod tests {
         let ic = IkedaCarpenter::new(
             IkedaCarpenterParams {
                 alpha: EnergyLaw::SqrtE { a0: 0.30, a1: 0.0 },
-                beta: 0.1,
+                beta: EnergyLaw::Const(0.1),
                 r: EnergyLaw::ExpMilliEv { kappa: 25.0 },
                 burst_sigma_us: None,
                 channel_fwhm_us: None,
@@ -2119,7 +2122,7 @@ mod tests {
         let ic_truth = IkedaCarpenter::new(
             IkedaCarpenterParams {
                 alpha: EnergyLaw::SqrtE { a0: 0.35, a1: 0.05 },
-                beta: 0.1,
+                beta: EnergyLaw::Const(0.1),
                 r: EnergyLaw::Const(0.1),
                 burst_sigma_us: None,
                 channel_fwhm_us: Some(0.35),
@@ -2201,7 +2204,7 @@ mod tests {
         let ic_truth = IkedaCarpenter::new(
             IkedaCarpenterParams {
                 alpha: EnergyLaw::SqrtE { a0: 0.35, a1: 0.05 },
-                beta: 0.1,
+                beta: EnergyLaw::Const(0.1),
                 r: EnergyLaw::Const(0.1),
                 burst_sigma_us: None,
                 channel_fwhm_us: Some(psr_true),
@@ -2258,7 +2261,7 @@ mod tests {
         let ic_truth = IkedaCarpenter::new(
             IkedaCarpenterParams {
                 alpha: EnergyLaw::SqrtE { a0: 0.35, a1: 0.05 },
-                beta: 0.1,
+                beta: EnergyLaw::Const(0.1),
                 r: EnergyLaw::Const(0.1),
                 burst_sigma_us: None,
                 channel_fwhm_us: None, // unfolded truth
@@ -2321,7 +2324,7 @@ mod tests {
         let ic_truth = IkedaCarpenter::new(
             IkedaCarpenterParams {
                 alpha: EnergyLaw::SqrtE { a0: 0.35, a1: 0.05 },
-                beta: 0.1, // irrelevant at R = 0 (no storage term)
+                beta: EnergyLaw::Const(0.1), // irrelevant at R = 0 (no storage term)
                 r: EnergyLaw::Const(0.0),
                 burst_sigma_us: None,
                 channel_fwhm_us: Some(0.35),
@@ -2627,7 +2630,7 @@ mod tests {
                     a0: 0.5,
                     a1: IC_A1_MAX,
                 },
-                beta: IC_BETA_MIN,
+                beta: EnergyLaw::Const(IC_BETA_MIN),
                 r: EnergyLaw::Const(IC_R_MAX),
                 burst_sigma_us: None,
                 channel_fwhm_us: Some(fwhm_us),
