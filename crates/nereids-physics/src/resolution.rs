@@ -895,6 +895,92 @@ fn trapezoidal_moments(offsets: &[f64], weights: &[f64]) -> (f64, f64) {
     (centroid, sigma)
 }
 
+/// Integrate a sampled distribution into adjacent requested edges.
+///
+/// With `normalize_support`, a one-point kernel is treated as a unit delta and
+/// a longer kernel is normalized over its supplied support. Without it, the
+/// supplied values retain their physical density scale and a one-point density
+/// is rejected because it has no defined integration width.
+fn piecewise_linear_bin_integrals(
+    times: &[f64],
+    weights: &[f64],
+    edges: &[f64],
+    normalize_support: bool,
+) -> Option<Vec<f64>> {
+    if times.is_empty() || times.len() != weights.len() {
+        return None;
+    }
+
+    if times.len() == 1 {
+        if !normalize_support {
+            return None;
+        }
+        if !times[0].is_finite() || !weights[0].is_finite() || weights[0] <= 0.0 {
+            return None;
+        }
+        let mut probabilities = vec![0.0; edges.len().saturating_sub(1)];
+        for (index, edge) in edges.windows(2).enumerate() {
+            let in_bin = edge[0] <= times[0]
+                && (times[0] < edge[1]
+                    || (index + 1 == probabilities.len() && times[0] == edge[1]));
+            if in_bin {
+                probabilities[index] = 1.0;
+                break;
+            }
+        }
+        return Some(probabilities);
+    }
+
+    let mut cumulative = Vec::with_capacity(times.len());
+    cumulative.push(0.0);
+    for i in 0..times.len() - 1 {
+        let width = times[i + 1] - times[i];
+        let area = 0.5 * (weights[i] + weights[i + 1]) * width;
+        cumulative.push(cumulative[i] + area.max(0.0));
+    }
+    let total = *cumulative.last()?;
+    if !total.is_finite() || total <= 0.0 {
+        return None;
+    }
+    let scale = if normalize_support { total } else { 1.0 };
+
+    let cdf = |x: f64| -> f64 {
+        if x <= times[0] {
+            return 0.0;
+        }
+        if x >= times[times.len() - 1] {
+            return total / scale;
+        }
+        let hi = times.partition_point(|&time| time <= x);
+        let lo = hi - 1;
+        let width = times[hi] - times[lo];
+        let dx = x - times[lo];
+        let slope = (weights[hi] - weights[lo]) / width;
+        let partial = weights[lo] * dx + 0.5 * slope * dx * dx;
+        ((cumulative[lo] + partial) / scale).clamp(0.0, total / scale)
+    };
+
+    Some(
+        edges
+            .windows(2)
+            .map(|edge| (cdf(edge[1]) - cdf(edge[0])).max(0.0))
+            .collect(),
+    )
+}
+
+/// Integrate a sampled density without changing its physical mass scale.
+///
+/// This is used by analytical responses whose source density is already in
+/// probability per unit time. Probability omitted by finite numerical support
+/// therefore remains omitted instead of being redistributed into that support.
+pub(crate) fn piecewise_linear_bin_masses(
+    times: &[f64],
+    densities: &[f64],
+    edges: &[f64],
+) -> Option<Vec<f64>> {
+    piecewise_linear_bin_integrals(times, densities, edges, false)
+}
+
 impl TabulatedResolution {
     /// Reference energies (eV), sorted ascending.
     pub fn ref_energies(&self) -> &[f64] {

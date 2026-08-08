@@ -129,7 +129,9 @@
 //! applies its `psr_fwhm_ns` fold to the IC family only, never to
 //! tabulated/UDR kernels).
 
-use crate::resolution::{ResolutionParseError, TabulatedResolution};
+use crate::resolution::{
+    ResolutionParseError, TOF_FACTOR, TabulatedResolution, piecewise_linear_bin_masses,
+};
 
 /// de Broglie wavelength factor: λ (Å) = `LAMBDA_ANGSTROM_FACTOR` / √(E in eV).
 ///
@@ -265,6 +267,73 @@ pub fn ic_pulse(alpha: f64, beta: f64, r: f64, tau: f64) -> f64 {
     (1.0 - r) * fast + r * slow
 }
 
+/// Cumulative probability of the Ikeda–Carpenter moderator pulse.
+///
+/// Returns `P(U <= tau)` for moderator delay `U`. `tau` is in µs and rates
+/// are in 1/µs. The prompt term is the Gamma(3, α) cumulative distribution;
+/// the storage term is the cumulative distribution of Gamma(3, α) plus an
+/// independent exponential delay with rate β.
+///
+/// The expression is evaluated without subtracting nearly equal exponentials
+/// when `α ≈ β`. This is the bin-integral companion to [`ic_pulse`].
+#[must_use]
+pub fn ic_cdf(alpha: f64, beta: f64, r: f64, tau: f64) -> f64 {
+    if tau.is_nan() || tau <= 0.0 {
+        return 0.0;
+    }
+    if tau == f64::INFINITY {
+        return 1.0;
+    }
+    if !tau.is_finite() {
+        return 0.0;
+    }
+
+    let alpha = alpha.max(MIN_RATE);
+    let beta = beta.max(MIN_RATE);
+    let at = alpha * tau;
+    let fast = gamma3_cdf(at);
+    if r <= 0.0 {
+        return fast;
+    }
+
+    // The storage CDF is the prompt CDF minus the positive survival
+    // correction below. Written this way, the α=β limit is Gamma(4, α).
+    let u = (alpha - beta) * tau;
+    let correction = if u.abs() < 0.05 {
+        at.powi(3) * (-beta * tau).exp() * h_over_cube_taylor(u)
+    } else {
+        // Bounded form: neither exponential can overflow even when β >> α.
+        let bracket = (-beta * tau).exp() - (-alpha * tau).exp() * (1.0 + u + 0.5 * u * u);
+        at.powi(3) * bracket / u.powi(3)
+    };
+    (fast - r * correction).clamp(0.0, 1.0)
+}
+
+/// Gamma(3, rate=1) cumulative distribution at dimensionless time `x`.
+fn gamma3_cdf(x: f64) -> f64 {
+    if x <= 0.0 {
+        return 0.0;
+    }
+    if x < 0.5 {
+        // Integral of x² exp(-x) / 2 as an alternating series. The direct
+        // `1 - exp(-x)(1+x+x²/2)` loses most digits for small x.
+        let mut n = 0_u32;
+        let mut term = x.powi(3) / 6.0;
+        let mut sum = term;
+        loop {
+            let n_f = f64::from(n);
+            term *= -x * (n_f + 3.0) / ((n_f + 1.0) * (n_f + 4.0));
+            let next = sum + term;
+            n += 1;
+            if next == sum || n >= 128 {
+                return next.clamp(0.0, 1.0);
+            }
+            sum = next;
+        }
+    }
+    (1.0 - (-x).exp() * (1.0 + x + 0.5 * x * x)).clamp(0.0, 1.0)
+}
+
 /// Energy-dependence law for an Ikeda–Carpenter parameter.
 ///
 /// A small closed set so the *fixed-or-fit* cases share one representation:
@@ -321,8 +390,8 @@ impl EnergyLaw {
 pub struct IkedaCarpenterParams {
     /// Fast (slowing-down) rate `α(E)`, 1/µs. Must evaluate to > 0.
     pub alpha: EnergyLaw,
-    /// Slow (storage) rate `β`, 1/µs. Energy-independent, must be > 0.
-    pub beta: f64,
+    /// Slow (storage) rate `β(E)`, 1/µs. Must evaluate to > 0.
+    pub beta: EnergyLaw,
     /// Storage mixing fraction `R(E)`, 0 ≤ R ≤ 1.
     pub r: EnergyLaw,
     /// Optional proton-burst Gaussian standard deviation (µs).
@@ -338,7 +407,7 @@ impl IkedaCarpenterParams {
     pub fn constant(alpha: f64, beta: f64, r: f64) -> Self {
         Self {
             alpha: EnergyLaw::Const(alpha),
-            beta,
+            beta: EnergyLaw::Const(beta),
             r: EnergyLaw::Const(r),
             burst_sigma_us: None,
             channel_fwhm_us: None,
@@ -404,7 +473,7 @@ impl IkedaCarpenter {
     /// # Errors
     /// Returns [`ResolutionParseError::InvalidFormat`] for a non-positive
     /// flight path, a degenerate grid (`n_energies < 2`, `n_tau < 8`,
-    /// `e_min ≤ 0`, `e_max ≤ e_min`), a non-positive `β`, a parameter/grid
+    /// `e_min ≤ 0`, `e_max ≤ e_min`), a non-positive `β(E)`, a parameter/grid
     /// combination whose τ-grid cannot resolve the prompt core and requested
     /// folds within the `MAX_TAU_SAMPLES` cap at some reference energy (see
     /// `tau_geometry` — remedy: larger `β`, `R = 0`, or a wider/disabled
@@ -442,13 +511,6 @@ impl IkedaCarpenter {
                 grid.e_min_ev, grid.e_max_ev
             )));
         }
-        if !params.beta.is_finite() || params.beta <= 0.0 {
-            return Err(ResolutionParseError::InvalidFormat(format!(
-                "beta must be a positive finite number, got {}",
-                params.beta
-            )));
-        }
-
         let ln_lo = grid.e_min_ev.ln();
         let ln_hi = grid.e_max_ev.ln();
         let denom = (grid.n_energies - 1) as f64;
@@ -466,6 +528,18 @@ impl IkedaCarpenter {
             return Err(ResolutionParseError::InvalidFormat(format!(
                 "Ikeda–Carpenter α(E) must be > 0, but α({bad}) = {} is not",
                 params.alpha.eval(bad)
+            )));
+        }
+        // β is a rate, so every synthesized reference energy must give a
+        // positive finite value. Reject invalid laws instead of clamping them
+        // into a different pulse.
+        if let Some(&bad) = ref_energies.iter().find(|&&e| {
+            let beta = params.beta.eval(e);
+            !beta.is_finite() || beta <= 0.0
+        }) {
+            return Err(ResolutionParseError::InvalidFormat(format!(
+                "Ikeda–Carpenter β(E) must be > 0, but β({bad}) = {} is not",
+                params.beta.eval(bad)
             )));
         }
         // Reject storage-fraction laws that fall outside [0, 1] (synthesis clamps
@@ -546,14 +620,138 @@ impl IkedaCarpenter {
     /// convention.
     ///
     /// # Errors
-    /// Returns [`ResolutionParseError::InvalidFormat`] when the τ-grid cannot
-    /// resolve the prompt core and requested folds within `MAX_TAU_SAMPLES`
-    /// at this energy. Construction validates every *reference* energy, but a
-    /// probe energy outside `[e_min, e_max]` — for the √E law, above `e_max`,
-    /// where the larger α(E) imposes a finer prompt resolution floor against
-    /// the same storage-tail span — can still leave the resolvable region.
+    /// Returns [`ResolutionParseError::InvalidFormat`] when the requested
+    /// energy or an energy-dependent rate/fraction is non-physical, or when
+    /// the τ-grid cannot resolve the prompt core and requested folds within
+    /// `MAX_TAU_SAMPLES` at this energy. Construction validates every
+    /// *reference* energy, but a probe outside `[e_min, e_max]` can still leave
+    /// the physical or resolvable region.
     pub fn kernel_at(&self, energy_ev: f64) -> Result<(Vec<f64>, Vec<f64>), ResolutionParseError> {
+        self.validate_probe_energy(energy_ev)?;
         synth_kernel(&self.params, self.n_tau, energy_ev)
+    }
+
+    /// Evaluate the physical source pulse at one true neutron energy.
+    ///
+    /// Returns sampled moderator-delay coordinates in µs and peak-normalized
+    /// densities. Unlike [`Self::kernel_at`], this method does not move the
+    /// pulse mode to zero. With no symmetric proton/channel fold, the delay is
+    /// causal and starts at zero. A symmetric fold may extend the sampled
+    /// support below zero relative to its stated time origin.
+    ///
+    /// # Errors
+    /// Returns [`ResolutionParseError::InvalidFormat`] if `energy_ev` is not a
+    /// positive finite true energy, if an energy law is unphysical at that
+    /// energy, or if the requested pulse cannot be resolved by the configured
+    /// sampling limits.
+    pub fn source_pulse_at(
+        &self,
+        energy_ev: f64,
+    ) -> Result<(Vec<f64>, Vec<f64>), ResolutionParseError> {
+        self.validate_probe_energy(energy_ev)?;
+        synth_source_pulse(&self.params, self.n_tau, energy_ev)
+    }
+
+    /// Probability that a neutron of known true energy is recorded in each
+    /// supplied detector-time bin.
+    ///
+    /// `detector_time_edges_us` are the actual measured bin edges. The nominal
+    /// arrival time is
+    /// `timing_offset_us + TOF_FACTOR * flight_path_m / sqrt(true_energy_ev)`.
+    /// `timing_offset_us` represents the shared clock/detector offset; it does
+    /// not absorb or remove the moderator pulse's physical mode.
+    ///
+    /// The returned vector has one entry per adjacent edge pair and is not
+    /// renormalized to the supplied window: bins that do not cover the full
+    /// pulse correctly sum to less than one.
+    ///
+    /// With no burst or channel fold, probabilities come directly from the
+    /// analytical IC CDF. With either optional fold, the continuous pulse is
+    /// represented on the configured synthesis grid and integrated as a
+    /// piecewise-linear density. The finite numerical support is not silently
+    /// renormalized; omitted physical tail probability remains omitted.
+    ///
+    /// # Errors
+    /// Returns [`ResolutionParseError::InvalidFormat`] unless the true energy
+    /// is physical, the timing offset is finite, and at least two finite bin
+    /// edges are supplied in strictly increasing order.
+    pub fn detector_bin_probabilities(
+        &self,
+        true_energy_ev: f64,
+        detector_time_edges_us: &[f64],
+        timing_offset_us: f64,
+    ) -> Result<Vec<f64>, ResolutionParseError> {
+        self.validate_probe_energy(true_energy_ev)?;
+        if !timing_offset_us.is_finite() {
+            return Err(ResolutionParseError::InvalidFormat(format!(
+                "timing_offset_us must be finite, got {timing_offset_us}"
+            )));
+        }
+        if detector_time_edges_us.len() < 2
+            || detector_time_edges_us.iter().any(|x| !x.is_finite())
+            || detector_time_edges_us.windows(2).any(|w| w[0] >= w[1])
+        {
+            return Err(ResolutionParseError::InvalidFormat(
+                "detector time edges must contain at least two finite, strictly increasing values"
+                    .to_string(),
+            ));
+        }
+
+        let nominal_arrival =
+            timing_offset_us + TOF_FACTOR * self.flight_path_m / true_energy_ev.sqrt();
+        let relative_edges: Vec<f64> = detector_time_edges_us
+            .iter()
+            .map(|edge| edge - nominal_arrival)
+            .collect();
+
+        if self.params.burst_sigma_us.unwrap_or(0.0) == 0.0
+            && self.params.channel_fwhm_us.unwrap_or(0.0) == 0.0
+        {
+            let alpha = self.params.alpha.eval(true_energy_ev);
+            let beta = self.params.beta.eval(true_energy_ev);
+            let r = self.params.r.eval(true_energy_ev);
+            return Ok(relative_edges
+                .windows(2)
+                .map(|edge| {
+                    (ic_cdf(alpha, beta, r, edge[1]) - ic_cdf(alpha, beta, r, edge[0])).max(0.0)
+                })
+                .collect());
+        }
+
+        let (times, densities) =
+            synth_source_pulse_density(&self.params, self.n_tau, true_energy_ev)?;
+        piecewise_linear_bin_masses(&times, &densities, &relative_edges).ok_or_else(|| {
+            ResolutionParseError::InvalidFormat(format!(
+                "Ikeda–Carpenter pulse at E = {true_energy_ev} eV has zero sampled area"
+            ))
+        })
+    }
+
+    fn validate_probe_energy(&self, energy_ev: f64) -> Result<(), ResolutionParseError> {
+        if !energy_ev.is_finite() || energy_ev <= 0.0 {
+            return Err(ResolutionParseError::InvalidFormat(format!(
+                "true energy must be positive and finite, got {energy_ev}"
+            )));
+        }
+        let alpha = self.params.alpha.eval(energy_ev);
+        let beta = self.params.beta.eval(energy_ev);
+        let r = self.params.r.eval(energy_ev);
+        if !alpha.is_finite() || alpha <= 0.0 {
+            return Err(ResolutionParseError::InvalidFormat(format!(
+                "Ikeda–Carpenter alpha({energy_ev}) must be positive and finite, got {alpha}"
+            )));
+        }
+        if !beta.is_finite() || beta <= 0.0 {
+            return Err(ResolutionParseError::InvalidFormat(format!(
+                "Ikeda–Carpenter beta({energy_ev}) must be positive and finite, got {beta}"
+            )));
+        }
+        if !r.is_finite() || !(0.0..=1.0).contains(&r) {
+            return Err(ResolutionParseError::InvalidFormat(format!(
+                "Ikeda–Carpenter R({energy_ev}) must be in [0, 1], got {r}"
+            )));
+        }
+        Ok(())
     }
 }
 
@@ -653,8 +851,22 @@ fn synth_kernel(
     n_tau: usize,
     energy_ev: f64,
 ) -> Result<(Vec<f64>, Vec<f64>), ResolutionParseError> {
+    let (mut offsets, weights) = synth_source_pulse(params, n_tau, energy_ev)?;
+    let peak_time = offsets[argmax(&weights)];
+    for offset in &mut offsets {
+        *offset -= peak_time;
+    }
+    Ok((offsets, weights))
+}
+
+/// Synthesize one physical-time source pulse without moving its mode.
+fn synth_source_pulse_density(
+    params: &IkedaCarpenterParams,
+    n_tau: usize,
+    energy_ev: f64,
+) -> Result<(Vec<f64>, Vec<f64>), ResolutionParseError> {
     let alpha = params.alpha.eval(energy_ev).max(MIN_RATE);
-    let beta = params.beta.max(MIN_RATE);
+    let beta = params.beta.eval(energy_ev).max(MIN_RATE);
     let r = params.r.eval(energy_ev).clamp(0.0, 1.0);
 
     let (dtau, tau_max, margin) = tau_geometry(params, n_tau, alpha, beta, r).map_err(|msg| {
@@ -673,10 +885,34 @@ fn synth_kernel(
     let taus: Vec<f64> = (j_lo..=j_hi).map(|j| j as f64 * dtau).collect();
     let mut weights: Vec<f64> = taus.iter().map(|&t| ic_pulse(alpha, beta, r, t)).collect();
 
+    // Correct only the sampled quadrature error of the analytical moderator
+    // density. The target is its exact CDF at the finite grid endpoint, not
+    // one, so physical moderator probability beyond the grid is not moved
+    // back into the sampled support. This matters for the coarsest admitted
+    // n_tau values, where peak-normalization used to hide a large area error.
+    let sampled_area = dtau
+        * (0.5 * weights[0]
+            + weights[1..weights.len() - 1].iter().sum::<f64>()
+            + 0.5 * weights[weights.len() - 1]);
+    let moderator_mass = ic_cdf(alpha, beta, r, *taus.last().expect("non-empty tau grid"));
+    if !sampled_area.is_finite() || sampled_area <= 0.0 {
+        return Err(ResolutionParseError::InvalidFormat(format!(
+            "Ikeda–Carpenter pulse at E = {energy_ev} eV has zero sampled area"
+        )));
+    }
+    let area_correction = moderator_mass / sampled_area;
+    for weight in &mut weights {
+        *weight *= area_correction;
+    }
+
     if let Some(sigma) = params.burst_sigma_us
         && sigma > 0.0
     {
-        weights = convolve_same(&weights, &gaussian_kernel(dtau, sigma));
+        let (kernel, retained_mass) = gaussian_kernel(dtau, sigma);
+        weights = convolve_same(&weights, &kernel);
+        for weight in &mut weights {
+            *weight *= retained_mass;
+        }
     }
     if let Some(fwhm) = params.channel_fwhm_us
         && fwhm > 0.0
@@ -684,10 +920,8 @@ fn synth_kernel(
         weights = convolve_same(&weights, &triangle_kernel(dtau, fwhm));
     }
 
-    // Anchor the mode at offset 0.
     let peak_idx = argmax(&weights);
     let peak_val = weights[peak_idx].max(f64::MIN_POSITIVE);
-    let tau_peak = taus[peak_idx];
 
     // Trim tails below TRIM_REL of peak, keeping one guard sample each side so
     // the convolution's neighbor-difference trapezoid widths stay defined.
@@ -701,9 +935,25 @@ fn synth_kernel(
         .rposition(|&w| w > thresh)
         .map_or(weights.len() - 1, |i| (i + 1).min(weights.len() - 1));
 
-    let offsets: Vec<f64> = (lo..=hi).map(|j| taus[j] - tau_peak).collect();
-    let w: Vec<f64> = (lo..=hi).map(|j| weights[j] / peak_val).collect();
-    Ok((offsets, w))
+    let offsets: Vec<f64> = (lo..=hi).map(|j| taus[j]).collect();
+    let densities: Vec<f64> = (lo..=hi).map(|j| weights[j]).collect();
+    Ok((offsets, densities))
+}
+
+/// Synthesize the public peak-normalized source-pulse representation.
+fn synth_source_pulse(
+    params: &IkedaCarpenterParams,
+    n_tau: usize,
+    energy_ev: f64,
+) -> Result<(Vec<f64>, Vec<f64>), ResolutionParseError> {
+    let (offsets, densities) = synth_source_pulse_density(params, n_tau, energy_ev)?;
+    let peak = densities
+        .iter()
+        .copied()
+        .fold(0.0_f64, f64::max)
+        .max(f64::MIN_POSITIVE);
+    let weights = densities.into_iter().map(|value| value / peak).collect();
+    Ok((offsets, weights))
 }
 
 /// Index of the maximum element (first on ties). Slice is non-empty by
@@ -722,7 +972,7 @@ fn argmax(xs: &[f64]) -> usize {
 
 /// Symmetric, unit-sum Gaussian kernel sampled on a `dtau`-spaced grid out to
 /// ±[`GAUSS_REACH_SIGMAS`]·σ.
-fn gaussian_kernel(dtau: f64, sigma: f64) -> Vec<f64> {
+fn gaussian_kernel(dtau: f64, sigma: f64) -> (Vec<f64>, f64) {
     let half = ((GAUSS_REACH_SIGMAS * sigma / dtau).ceil() as isize).max(1);
     let mut k: Vec<f64> = (-half..=half)
         .map(|j| {
@@ -730,8 +980,10 @@ fn gaussian_kernel(dtau: f64, sigma: f64) -> Vec<f64> {
             (-0.5 * t * t).exp()
         })
         .collect();
+    let raw_sum: f64 = k.iter().sum();
+    let retained_mass = (raw_sum * dtau / (sigma * std::f64::consts::TAU.sqrt())).clamp(0.0, 1.0);
     normalize_sum(&mut k);
-    k
+    (k, retained_mass)
 }
 
 /// Symmetric, unit-sum triangle kernel of FWHM `fwhm` (half-base = FWHM;
@@ -879,7 +1131,7 @@ mod tests {
         // The synthesized kernel must contain no non-finite entries.
         let p = IkedaCarpenterParams {
             alpha: EnergyLaw::Const(0.05),
-            beta: 4.0,
+            beta: EnergyLaw::Const(4.0),
             r: EnergyLaw::Const(0.5),
             burst_sigma_us: None,
             channel_fwhm_us: None,
@@ -956,7 +1208,7 @@ mod tests {
         // α(E) ∝ √E ⇒ prompt width 1/α shrinks with E ⇒ smaller TOF support.
         let p = IkedaCarpenterParams {
             alpha: EnergyLaw::SqrtE { a0: 0.3, a1: 0.0 },
-            beta: 0.1,
+            beta: EnergyLaw::Const(0.1),
             r: EnergyLaw::Const(0.0),
             burst_sigma_us: None,
             channel_fwhm_us: None,
