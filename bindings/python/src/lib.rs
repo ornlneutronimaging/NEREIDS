@@ -948,7 +948,9 @@ impl PyIkedaCarpenter {
     /// Raises ``ValueError`` when the τ-grid cannot resolve the prompt core
     /// and requested folds within the sample cap at this energy (construction
     /// validates the reference energies; a probe energy outside their range
-    /// can still be unresolvable).
+    /// can still be unresolvable), or when a parameter law is invalid at this
+    /// probe energy (non-positive or singular rate, storage fraction outside
+    /// [0, 1]).
     fn kernel_at(&self, energy_ev: f64) -> PyResult<(Vec<f64>, Vec<f64>)> {
         self.inner
             .kernel_at(energy_ev)

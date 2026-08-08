@@ -425,10 +425,13 @@ fn gaussian_fold_preserves_finite_window_tail_mass() {
 
 #[test]
 fn unequal_rate_storage_cdf_matches_pulse_quadrature() {
-    // General α ≠ β storage CDF against Simpson integration of the density —
-    // the two functions share no code path for the storage term, so this pins
-    // both the bounded-bracket branch (|u| ≥ 0.05) and the Taylor branch
-    // (0 < |u| < 0.05) against an independent quadrature oracle.
+    // General α ≠ β storage CDF against Simpson integration of the density.
+    // ic_pulse and ic_cdf DO share h_over_cube_taylor and the bracket
+    // algebra, so this is not a fully independent oracle: its power is the
+    // derivative-vs-integral functional identity (a shared coefficient error
+    // would still break CDF = ∫ pulse above the tolerance), and full
+    // independence comes from the external 40-digit convolution pins in
+    // storage_cdf_matches_arbitrary_precision_convolution_reference.
     let cases: [(f64, f64, f64, f64); 6] = [
         (1.7, 0.45, 0.35, 0.4),  // bounded branch, early time
         (1.7, 0.45, 0.35, 2.7),  // bounded branch, mid pulse
@@ -591,6 +594,100 @@ fn singular_inverse_lambda_laws_are_rejected() {
     assert!(
         err.contains("singular"),
         "probe error must name the singularity, got: {err}"
+    );
+}
+
+#[test]
+fn coarse_folded_grid_meets_per_bin_accuracy_bound() {
+    // The review reproduction: α = 1 µs⁻¹, R = 0, triangle FWHM = 10 µs,
+    // E = 25 eV. At n_tau = 8 the sampled step (2.57 µs) mis-assigned up to
+    // 8.5e-3 of probability per bin (a leading-edge bin returned exactly 0
+    // against a true 1.8e-3) while conserving the total. The detector-bin
+    // gate now REJECTS that grid loudly; an n_tau meeting the FWHM/24
+    // per-bin floor is accepted and EVERY bin — including the leading edge
+    // below the coarse grid's sampled support — must match the analytic
+    // Γ₃⊗triangle oracle within the documented ~1e-4 bound.
+    let (alpha, fwhm) = (1.0_f64, 10.0_f64);
+    let flight_path_m = 25.0_f64;
+    let true_energy_ev = 25.0_f64;
+    let nominal = TOF_FACTOR * flight_path_m / true_energy_ev.sqrt();
+    let delay_edges: Vec<f64> = (0..=13).map(|k| -10.0 + 3.0 * k as f64).collect();
+    let detector_edges: Vec<f64> = delay_edges.iter().map(|d| nominal + d).collect();
+    let grid_with = |n_tau: usize| SynthesisGrid {
+        e_min_ev: 24.0,
+        e_max_ev: 26.0,
+        n_energies: 2,
+        n_tau,
+    };
+    let params = IkedaCarpenterParams {
+        channel_fwhm_us: Some(fwhm),
+        ..IkedaCarpenterParams::constant(alpha, 0.1, 0.0)
+    };
+
+    // (i) The reproduction grid AUTO-REFINES: n_tau = 8 only anchors the
+    // prompt step; the fold refinement targets FWHM/24, the cap affords it,
+    // and the detector-bin gate passes — the coarse-grid mis-assignment is
+    // gone by construction, verified per bin below.
+    let model = IkedaCarpenter::new(params.clone(), flight_path_m, &grid_with(8))
+        .expect("bin-eager refinement admits the coarse anchor");
+    let got = model
+        .detector_bin_probabilities(true_energy_ev, &detector_edges, 0.0)
+        .expect("valid folded detector bins");
+
+    // (ii) A cap-limited configuration (long storage tail forces the step
+    // above the per-bin target, though synthesis stays valid for the
+    // moment-level consumers) fails closed at the detector-bin gate.
+    let cap_limited = IkedaCarpenter::new(
+        IkedaCarpenterParams {
+            channel_fwhm_us: Some(0.35),
+            ..IkedaCarpenterParams::constant(2.0, 0.02, 0.5)
+        },
+        flight_path_m,
+        &SynthesisGrid::new(24.0, 26.0),
+    )
+    .expect("moment-level synthesis admits the cap-limited tail");
+    let err = cap_limited
+        .detector_bin_probabilities(true_energy_ev, &[nominal, nominal + 1.0], 0.0)
+        .expect_err("a cap-limited sampled step must be rejected for per-bin use")
+        .to_string();
+    assert!(
+        err.contains("per-bin accuracy floor"),
+        "rejection must name the per-bin floor, got: {err}"
+    );
+
+    let triangle = |c: f64| {
+        if c.abs() >= fwhm {
+            0.0
+        } else {
+            (1.0 - c.abs() / fwhm) / fwhm
+        }
+    };
+    let bin_oracle = |lo: f64, hi: f64| {
+        simpson(
+            |c| triangle(c) * (gamma3_cdf(alpha * (hi - c)) - gamma3_cdf(alpha * (lo - c))),
+            -fwhm,
+            fwhm,
+            20_000,
+        )
+    };
+    let mut leading_edge_mass = 0.0;
+    for (bin, edge) in delay_edges.windows(2).enumerate() {
+        let want = bin_oracle(edge[0], edge[1]);
+        assert!(
+            (got[bin] - want).abs() < 5.0e-4,
+            "bin {bin} [{}, {}] µs: sampled fold {:.6e} vs analytic oracle {want:.6e}",
+            edge[0],
+            edge[1],
+            got[bin]
+        );
+        if edge[1] <= -6.0 {
+            leading_edge_mass += got[bin];
+        }
+    }
+    assert!(
+        leading_edge_mass > 5.0e-4,
+        "leading-edge bins below the old sampled support must carry their \
+         real mass, got {leading_edge_mass:.3e}"
     );
 }
 

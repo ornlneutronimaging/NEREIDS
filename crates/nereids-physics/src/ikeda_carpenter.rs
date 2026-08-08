@@ -171,7 +171,29 @@ const MIN_N_TAU: usize = 8;
 /// the discrete triangle toward the exact delta `[0, 1, 0]`, silently
 /// erasing a requested fold — [`tau_geometry`] rejects that instead
 /// (strictly: `capped_step > FWHM/3`).
+///
+/// This floor guarantees MOMENT-level accuracy (the calibration consumer's
+/// contract); per-bin detector probabilities need the far stricter
+/// [`TRI_BIN_SAMPLES_PER_SIDE`], enforced at the detector-bin gate rather
+/// than here so realistic long-storage-tail calibrations stay buildable
+/// under the [`MAX_TAU_SAMPLES`] cap.
 const TRI_MIN_SAMPLES_PER_SIDE: f64 = 3.0;
+
+/// Per-bin accuracy floor for the SAMPLED detector-bin path
+/// (`dtau ≤ FWHM / TRI_BIN_SAMPLES_PER_SIDE` required by
+/// `detector_bin_probabilities` when a channel fold is active). The
+/// point-sampled discrete convolution mis-assigns individual detector-bin
+/// probability as O(dtau²) even while the total mass is conserved (the
+/// triangle kernel's kink drives the error; measured at α = 1 µs⁻¹,
+/// FWHM = 10 µs: 7.5e-3 max per-bin error at 3 samples per side, ~1.2e-4 at
+/// 24, ~3e-7 at the 600-sample default). Twenty-four per side bounds the
+/// per-bin error of every accepted call at ~1e-4; a coarser sampled grid is
+/// rejected loudly at the detector-bin gate rather than silently
+/// redistributing leading-edge mass. SAMMY's UDR convolution integrates
+/// piecewise-linear segment products analytically (`udr/mudr4.f90`
+/// `Ud_Convolute`/`Udr_Add`) and needs no such floor; the sampled route
+/// keeps one and enforces it at the consumer whose contract is per-bin.
+const TRI_BIN_SAMPLES_PER_SIDE: f64 = 24.0;
 
 /// Reach of the sampled/folded Gaussian burst in standard deviations. At
 /// ±`GAUSS_REACH_SIGMAS`·σ = ±8σ the truncated two-sided Gaussian mass is
@@ -287,7 +309,9 @@ pub fn ic_pulse(alpha: f64, beta: f64, r: f64, tau: f64) -> f64 {
 ///
 /// Domain contract: non-finite `alpha`, `beta`, or `r` returns NaN so garbage
 /// in stays visible; finite non-positive rates are floored to [`MIN_RATE`]
-/// and `r <= 0` disables the storage term, matching [`ic_pulse`].
+/// and `r <= 0` disables the storage term, matching [`ic_pulse`]. A NaN `tau`
+/// returns 0 — `tau` is the integration coordinate, not a parameter, and a
+/// non-arriving coordinate contributes no mass.
 #[must_use]
 pub fn ic_cdf(alpha: f64, beta: f64, r: f64, tau: f64) -> f64 {
     if !alpha.is_finite() || !beta.is_finite() || !r.is_finite() {
@@ -588,8 +612,8 @@ impl IkedaCarpenter {
             if let Some(&bad) = ref_energies.iter().find(|&&e| law.is_singular_at(e)) {
                 return Err(ResolutionParseError::InvalidFormat(format!(
                     "Ikeda–Carpenter {name}(E) law is singular at E = {bad} eV \
-                     (an InverseLambda denominator or ExpMilliEv κ within \
-                     ±{MIN_RATE} of zero)"
+                     (an InverseLambda denominator within \
+                     ±{MIN_RATE} of zero, or an ExpMilliEv κ in [−{MIN_RATE}, 0])"
                 )));
             }
         }
@@ -795,6 +819,29 @@ impl IkedaCarpenter {
 
         let (times, densities) =
             synth_source_pulse_density(&self.params, self.n_tau, true_energy_ev)?;
+        // Per-bin accuracy gate: the point-sampled channel-triangle
+        // convolution mis-assigns individual bins as O(dtau²) even while
+        // conserving the total (leading-edge mass below the sampled support
+        // silently redistributes into the window). Synthesis accepts the
+        // moment-level FWHM/3 step for the calibration consumer; this
+        // per-bin consumer requires the stricter TRI_BIN_SAMPLES_PER_SIDE
+        // step and rejects a coarser grid loudly.
+        if let Some(fwhm) = self.params.channel_fwhm_us.filter(|&f| f > 0.0)
+            && times.len() >= 2
+        {
+            let dtau = times[1] - times[0];
+            let bin_floor = fwhm / TRI_BIN_SAMPLES_PER_SIDE;
+            if dtau > bin_floor * (1.0 + 1e-12) {
+                return Err(ResolutionParseError::InvalidFormat(format!(
+                    "Ikeda–Carpenter detector-bin probabilities at E = \
+                     {true_energy_ev} eV: the sampled τ-step {dtau:.4} µs \
+                     exceeds the per-bin accuracy floor FWHM/{TRI_BIN_SAMPLES_PER_SIDE} \
+                     = {bin_floor:.4} µs for the {fwhm} µs channel triangle; \
+                     increase n_tau (or shorten the storage tail) so the \
+                     sampled fold meets the per-bin bound"
+                )));
+            }
+        }
         piecewise_linear_bin_masses(&times, &densities, &relative_edges).ok_or_else(|| {
             ResolutionParseError::InvalidFormat(format!(
                 "Ikeda–Carpenter pulse at E = {true_energy_ev} eV has zero sampled area"
@@ -816,8 +863,8 @@ impl IkedaCarpenter {
             if law.is_singular_at(energy_ev) {
                 return Err(ResolutionParseError::InvalidFormat(format!(
                     "Ikeda–Carpenter {name}({energy_ev}) law is singular (an \
-                     InverseLambda denominator or ExpMilliEv κ within \
-                     ±{MIN_RATE} of zero)"
+                     InverseLambda denominator within ±{MIN_RATE} of zero, \
+                     or an ExpMilliEv κ in [−{MIN_RATE}, 0])"
                 )));
             }
         }
@@ -849,7 +896,7 @@ impl IkedaCarpenter {
 /// The step is anchored to the PROMPT core — `n_tau` samples across the fast
 /// Gamma(3) pulse (`fast_reach / (n_tau − 1)`) — and REFINED to resolve any
 /// requested instrument fold (triangle: ≥ [`TRI_MIN_SAMPLES_PER_SIDE`]
-/// samples per side, i.e. `dtau ≤ FWHM/3`; Gaussian burst: `dtau ≤ σ`, i.e.
+/// samples per side, i.e. `dtau ≤ FWHM/TRI_MIN_SAMPLES_PER_SIDE`; Gaussian burst: `dtau ≤ σ`, i.e.
 /// ≥ [`GAUSS_REACH_SIGMAS`] samples per ±`GAUSS_REACH_SIGMAS`·σ side). A longer storage tail
 /// (β ≪ α, R > 0) extends the SAMPLE COUNT (`j_hi ∝ tau_max/dtau`) instead
 /// of the step; [`MAX_TAU_SAMPLES`] bounds that count by widening the step —
@@ -891,8 +938,16 @@ fn tau_geometry(
     if let Some(fwhm) = params.channel_fwhm_us
         && fwhm > 0.0
     {
+        // The REQUESTED step targets the per-bin accuracy floor
+        // (FWHM/TRI_BIN_SAMPLES_PER_SIDE) so the detector-bin path is
+        // accurate whenever the sample cap affords it; the HARD floor stays
+        // at the moment-level FWHM/TRI_MIN_SAMPLES_PER_SIDE so cap-limited
+        // long-tail configurations still synthesize for the moment-level
+        // consumers (calibration), and only the per-bin gate in
+        // `detector_bin_probabilities` rejects them.
+        let tri_bin_target = fwhm / TRI_BIN_SAMPLES_PER_SIDE;
         let tri_floor = fwhm / TRI_MIN_SAMPLES_PER_SIDE;
-        dtau_req = dtau_req.min(tri_floor);
+        dtau_req = dtau_req.min(tri_bin_target);
         floor = floor.min(tri_floor);
         fold_desc.push_str(&format!(", channel triangle FWHM = {fwhm} µs"));
     }
@@ -1469,10 +1524,12 @@ mod tests {
         let prompt_step = (18.0 / alpha) / (n_tau as f64 - 1.0);
 
         // (a) Moderate tail (β = 0.25 ⇒ slow_reach = 64 µs): the cap does not
-        // bite, so the step equals the prompt-core step exactly and the grid
-        // still spans the full tail.
+        // bite and the 0.5 µs triangle's per-bin refinement target
+        // (FWHM/24 ≈ 0.021 µs) sits above the prompt-core step, so the step
+        // equals the prompt-core step exactly and the grid still spans the
+        // full tail.
         let p = IkedaCarpenterParams {
-            channel_fwhm_us: Some(0.35),
+            channel_fwhm_us: Some(0.5),
             ..IkedaCarpenterParams::constant(alpha, 0.25, 0.5)
         };
         let (offs, wts) = synth_kernel(&p, n_tau, 10.0).unwrap();
@@ -1486,7 +1543,7 @@ mod tests {
             "prompt-core spacing {dtau} > fast_reach/(n_tau−1) = {prompt_step}"
         );
         // ≥ 3 nonzero triangle samples per side at this step.
-        let tri = triangle_kernel(dtau, 0.35);
+        let tri = triangle_kernel(dtau, 0.5);
         let nonzero_per_side = tri.iter().take(tri.len() / 2).filter(|&&v| v > 0.0).count();
         assert!(
             nonzero_per_side >= 3,
@@ -1626,46 +1683,48 @@ mod tests {
     }
 
     #[test]
-    fn boundary_step_fwhm_over_3_is_admitted_and_fold_survives() {
-        // Review #645 round 2, F3: pin the exactly-admitted boundary
-        // `dtau = FWHM/3` (rejection is STRICT: `capped_step > floor`). Per
-        // the TRI_MIN_SAMPLES_PER_SIDE doc, each triangle side then samples
-        // at {FWHM/3, 2FWHM/3, FWHM} — weights {2/3, 1/3, 0}: exactly 2
-        // strictly interior nonzero samples, endpoint ON the triangle zero —
-        // and the fold stays effective (non-delta, second moment ≈ 4FWHM²/27).
+    fn boundary_step_at_triangle_floor_is_admitted_and_fold_survives() {
+        // Pin the exactly-admitted uncapped step `dtau = FWHM /
+        // TRI_BIN_SAMPLES_PER_SIDE` (the bin-eager refinement target),
+        // written in terms of the constant so the pin survives value
+        // changes. For N samples per side the discrete triangle's variance
+        // is (1 − 1/N²)·FWHM²/6 exactly (N = 3 gives the historical
+        // 4·FWHM²/27 of the moment-level floor), and each side keeps N − 1
+        // strictly interior nonzero samples with the endpoint ON the
+        // triangle zero.
         //
         // Route to the boundary: n_tau = MIN_N_TAU = 8 with α = 1 gives a
-        // prompt design step 18/7 ≈ 2.57 µs, far coarser than FWHM/3 for a
-        // 1 µs triangle, so the fold refinement pins dtau to exactly
-        // `fwhm / TRI_MIN_SAMPLES_PER_SIDE`. R = 0 keeps the cap inert
-        // (capped step 18/8191 ≪ floor).
+        // prompt design step 18/7 ≈ 2.57 µs, far coarser than the target for
+        // a 1 µs triangle, so the fold refinement pins dtau to exactly the
+        // target. R = 0 keeps the cap inert (capped step 18/8191 ≪ target).
+        let n = TRI_BIN_SAMPLES_PER_SIDE;
         let fwhm = 1.0;
         let p = IkedaCarpenterParams {
             channel_fwhm_us: Some(fwhm),
             ..IkedaCarpenterParams::constant(1.0, 0.1, 0.0)
         };
         let (offs, _) = synth_kernel(&p, MIN_N_TAU, 10.0)
-            .expect("the dtau = FWHM/3 boundary must be admitted, not rejected");
+            .expect("the dtau = floor boundary must be admitted, not rejected");
         let dtau = offs[1] - offs[0];
-        let boundary = fwhm / TRI_MIN_SAMPLES_PER_SIDE;
+        let boundary = fwhm / n;
         assert!(
             (dtau - boundary).abs() < 1e-12,
-            "step {dtau} µs is not the FWHM/3 boundary {boundary} µs"
+            "step {dtau} µs is not the FWHM/{n} boundary {boundary} µs"
         );
 
-        // The sampled triangle at the boundary: ≥ 7 samples, exactly 2
-        // strictly interior nonzero per side, center far below the delta's 1.
+        // The sampled triangle at the boundary: N − 1 strictly interior
+        // nonzero samples per side, center far below the delta's 1.
         let tri = triangle_kernel(dtau, fwhm);
-        assert!(tri.len() >= 7, "boundary triangle too short: {}", tri.len());
         let per_side = tri
             .iter()
             .take(tri.len() / 2)
             .filter(|&&v| v > 1e-9)
             .count();
         assert_eq!(
-            per_side, 2,
-            "boundary triangle must keep 2 strictly interior nonzero samples \
-             per side: {tri:?}"
+            per_side,
+            n as usize - 1,
+            "boundary triangle must keep N − 1 strictly interior nonzero \
+             samples per side: {tri:?}"
         );
         let center = tri[tri.len() / 2];
         assert!(
@@ -1673,15 +1732,12 @@ mod tests {
             "center weight {center} — boundary triangle degenerated toward a delta"
         );
 
-        // Fold effectiveness: the discrete triangle's variance is 4·FWHM²/27
-        // (samples {0, ±FWHM/3, ±2FWHM/3} with weights ∝ {1, 2/3, 1/3}),
-        // ≈ 89 % of the analytic FWHM²/6 — the fold physics survives the
-        // 2-interior-sample discretization.
+        // Fold effectiveness: discrete variance (1 − 1/N²)·FWHM²/6.
         let tri_offs: Vec<f64> = (0..tri.len())
             .map(|i| (i as f64 - (tri.len() / 2) as f64) * dtau)
             .collect();
         let v = kernel_variance(&tri_offs, &tri);
-        let want = 4.0 * fwhm * fwhm / 27.0;
+        let want = (1.0 - 1.0 / (n * n)) * fwhm * fwhm / 6.0;
         assert!(
             ((v - want) / want).abs() < 0.02,
             "boundary triangle variance {v} µs² vs discrete analytic {want} µs²"
