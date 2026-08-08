@@ -401,6 +401,7 @@ class IkedaCarpenter:
         n_tau: int = 600,
         burst_sigma_us: float | None = None,
         channel_fwhm_us: float | None = None,
+        beta_law: EnergyLaw | None = None,
     ) -> None: ...
     def as_tabulated(self) -> TabulatedResolution:
         """The synthesized tabulated kernel (usable as a resolution file)."""
@@ -411,6 +412,26 @@ class IkedaCarpenter:
 
         Raises ``ValueError`` when the tau-grid cannot resolve the prompt
         core and requested folds within the sample cap at this energy.
+        """
+        ...
+
+    def source_pulse_at(self, true_energy_ev: float) -> tuple[list[float], list[float]]:
+        """Physical ``(moderator_delay_us, density)`` at one true energy.
+
+        Unlike :meth:`kernel_at`, this keeps the pulse's time origin.
+        """
+        ...
+
+    def detector_bin_probabilities(
+        self,
+        true_energy_ev: float,
+        detector_time_edges_us: list[float],
+        timing_offset_us: float,
+    ) -> list[float]:
+        """Probability in each detector-time bin for one true energy.
+
+        The probabilities are not renormalized when the supplied time window
+        omits part of the pulse.
         """
         ...
 

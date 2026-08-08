@@ -4149,6 +4149,50 @@ class TestCalibrateEnergySmoke:
         np.testing.assert_array_equal(uncertainty, s_before)
 
 
+class TestIkedaCarpenterCausalResponse:
+    def test_source_pulse_keeps_physical_delay_origin(self):
+        ic = nereids.IkedaCarpenter(
+            flight_path_m=25.0,
+            e_min_ev=1.0,
+            e_max_ev=10.0,
+            alpha=nereids.EnergyLaw.const(2.0),
+            beta=0.5,
+            r=nereids.EnergyLaw.const(0.3),
+        )
+
+        delay_us, density = map(np.asarray, ic.source_pulse_at(4.0))
+
+        assert delay_us[0] == 0.0
+        assert delay_us[np.argmax(density)] > 0.0
+        assert np.all(np.diff(delay_us) > 0.0)
+
+    def test_detector_bin_probabilities_preserve_probability_and_clock(self):
+        flight_path_m = 25.0
+        energy_ev = 4.0
+        arrival_us = nereids.energy_to_tof(energy_ev, flight_path_m)
+        ic = nereids.IkedaCarpenter(
+            flight_path_m=flight_path_m,
+            e_min_ev=1.0,
+            e_max_ev=10.0,
+            alpha=nereids.EnergyLaw.const(2.0),
+            beta=0.5,
+            r=nereids.EnergyLaw.const(0.3),
+        )
+
+        probabilities = np.asarray(
+            ic.detector_bin_probabilities(
+                energy_ev,
+                [arrival_us - 1.0, arrival_us, arrival_us + 1.0, arrival_us + 80.0],
+                0.0,
+            )
+        )
+
+        assert probabilities.shape == (3,)
+        assert probabilities[0] == 0.0
+        assert np.all(probabilities[1:] > 0.0)
+        assert 0.999 < probabilities.sum() <= 1.0
+
+
 class TestCalibrateResolution:
     """Resolution calibration binding: position is PINNED by default; the shared
     SAMMY energy-scale ``(t0, L_scale)`` is an explicit, prior-constrained opt-in
