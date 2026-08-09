@@ -910,6 +910,12 @@ fn piecewise_linear_bin_integrals(
     if times.is_empty() || times.len() != weights.len() {
         return None;
     }
+    // A duplicated (or decreasing) time gives a zero-width segment whose
+    // slope is ±inf/NaN inside the CDF interpolation when an edge lands
+    // there; mirror the strictly-increasing edge validation instead.
+    if times.windows(2).any(|w| w[1] <= w[0]) {
+        return None;
+    }
 
     if times.len() == 1 {
         if !normalize_support {
@@ -5334,6 +5340,19 @@ Resolution file
         // A one-point kernel without a defined width is rejected in the
         // density (masses) mode.
         assert!(piecewise_linear_bin_integrals(&[2.0], &[3.5], &[0.0, 5.0], false).is_none());
+        // Non-strictly-increasing times are rejected in both modes: a
+        // zero-width segment would otherwise put ±inf/NaN into the CDF slope.
+        for mode in [true, false] {
+            assert!(
+                piecewise_linear_bin_integrals(
+                    &[0.0, 1.0, 1.0, 2.0],
+                    &[0.0, 1.0, 1.0, 0.0],
+                    &[0.5, 1.5],
+                    mode
+                )
+                .is_none()
+            );
+        }
 
         // Support normalization: a triangle on [0, 2] integrates to one over
         // its full support, and a partial window reports the true fraction.

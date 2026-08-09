@@ -2362,10 +2362,13 @@ mod tests {
         // that no MATERIAL storage fraction is claimed either way; the
         // deterministic positive pin for the bounds_hit labeling mechanism
         // is bounds_hit_labels_saturated_upper_bound below.
-        let (_, _, _, r_cal, _) = decoded_ic(&r);
+        let (_, _, beta_cal, r_cal, _) = decoded_ic(&r);
         assert!(
-            r.bounds_hit.iter().any(|s| s == "r:lower") || r_cal < 0.1,
-            "R = 0 truth must not claim a material storage fraction: \
+            r.bounds_hit.iter().any(|s| s == "r:lower") || (r_cal < 0.08 && beta_cal > 1.0),
+            "R = 0 truth must not claim a material storage fraction: an \
+             interior ridge endpoint is admissible only when the claimed \
+             storage is small AND fast (β above the ~1.6 µs⁻¹ prompt rate, \
+             i.e. absorbable) — a slow visible tail must fail. \
              bounds_hit = {:?}, decoded = {:?}",
             r.bounds_hit,
             decoded_ic(&r)

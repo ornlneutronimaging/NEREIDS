@@ -692,6 +692,82 @@ fn coarse_folded_grid_meets_per_bin_accuracy_bound() {
 }
 
 #[test]
+fn coarse_gaussian_burst_meets_per_bin_accuracy_bound() {
+    // The round-4 sibling of the triangle case: a burst-only fold at a
+    // coarse anchor (σ = 2 µs, n_tau = 8) used to be admitted with
+    // dtau = σ and mis-assigned up to 1.46e-2 per bin while conserving the
+    // total. The bin-eager refinement now targets σ/12, and every bin must
+    // match the analytic Gaussian⊗Γ₃-CDF oracle within the documented
+    // ~1e-4 bound; a cap-limited burst grid fails closed at the gate.
+    let (alpha, sigma) = (1.0_f64, 2.0_f64);
+    let flight_path_m = 25.0_f64;
+    let true_energy_ev = 25.0_f64;
+    let nominal = TOF_FACTOR * flight_path_m / true_energy_ev.sqrt();
+    let model = IkedaCarpenter::new(
+        IkedaCarpenterParams {
+            burst_sigma_us: Some(sigma),
+            ..IkedaCarpenterParams::constant(alpha, 0.1, 0.0)
+        },
+        flight_path_m,
+        &SynthesisGrid {
+            e_min_ev: 24.0,
+            e_max_ev: 26.0,
+            n_energies: 2,
+            n_tau: 8,
+        },
+    )
+    .expect("bin-eager refinement admits the coarse burst anchor");
+
+    let delay_edges: Vec<f64> = (0..=10).map(|k| -6.0 + 2.5 * k as f64).collect();
+    let detector_edges: Vec<f64> = delay_edges.iter().map(|d| nominal + d).collect();
+    let got = model
+        .detector_bin_probabilities(true_energy_ev, &detector_edges, 0.0)
+        .expect("valid burst detector bins");
+
+    let normal_density =
+        |c: f64| (-0.5 * (c / sigma).powi(2)).exp() / (sigma * std::f64::consts::TAU.sqrt());
+    let bin_oracle = |lo: f64, hi: f64| {
+        simpson(
+            |c| normal_density(c) * (gamma3_cdf(alpha * (hi - c)) - gamma3_cdf(alpha * (lo - c))),
+            -10.0 * sigma,
+            10.0 * sigma,
+            50_000,
+        )
+    };
+    for (bin, edge) in delay_edges.windows(2).enumerate() {
+        let want = bin_oracle(edge[0], edge[1]);
+        assert!(
+            (got[bin] - want).abs() < 5.0e-4,
+            "bin {bin} [{}, {}] µs: sampled burst {:.6e} vs analytic oracle {want:.6e}",
+            edge[0],
+            edge[1],
+            got[bin]
+        );
+    }
+
+    // Cap-limited burst (long storage tail forces the step above σ/12
+    // though synthesis stays valid at the moment level): fail closed,
+    // naming the Gaussian floor.
+    let cap_limited = IkedaCarpenter::new(
+        IkedaCarpenterParams {
+            burst_sigma_us: Some(0.5),
+            ..IkedaCarpenterParams::constant(2.0, 0.02, 0.5)
+        },
+        flight_path_m,
+        &SynthesisGrid::new(24.0, 26.0),
+    )
+    .expect("moment-level synthesis admits the cap-limited burst tail");
+    let err = cap_limited
+        .detector_bin_probabilities(true_energy_ev, &[nominal, nominal + 1.0], 0.0)
+        .expect_err("a cap-limited burst step must be rejected for per-bin use")
+        .to_string();
+    assert!(
+        err.contains("per-bin accuracy floor") && err.contains("Gaussian burst"),
+        "rejection must name the Gaussian per-bin floor, got: {err}"
+    );
+}
+
+#[test]
 fn storage_cdf_matches_arbitrary_precision_convolution_reference() {
     // Reference values computed OUTSIDE this codebase from the DEFINING
     // convolution: CDF = (1−r)·Γ₃(ατ) + r·∫₀^τ (α³s²e^{−αs}/2)·(1−e^{−β(τ−s)}) ds

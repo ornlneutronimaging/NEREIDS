@@ -186,14 +186,35 @@ const TRI_MIN_SAMPLES_PER_SIDE: f64 = 3.0;
 /// probability as O(dtau²) even while the total mass is conserved (the
 /// triangle kernel's kink drives the error; measured at α = 1 µs⁻¹,
 /// FWHM = 10 µs: 7.5e-3 max per-bin error at 3 samples per side, ~1.2e-4 at
-/// 24, ~3e-7 at the 600-sample default). Twenty-four per side bounds the
-/// per-bin error of every accepted call at ~1e-4; a coarser sampled grid is
-/// rejected loudly at the detector-bin gate rather than silently
-/// redistributing leading-edge mass. SAMMY's UDR convolution integrates
-/// piecewise-linear segment products analytically (`udr/mudr4.f90`
-/// `Ud_Convolute`/`Udr_Add`) and needs no such floor; the sampled route
-/// keeps one and enforces it at the consumer whose contract is per-bin.
+/// 24, ~3e-7 at the 600-sample default). The per-bin gate takes the
+/// STRICTEST of the applicable floors — this one, the burst
+/// [`GAUSS_BIN_SAMPLES_PER_SIGMA`], and the prompt-core
+/// [`PROMPT_BIN_SAMPLES`] — so every accepted per-bin call is bounded at
+/// ~1e-4 whichever feature binds; a coarser sampled grid is rejected loudly
+/// rather than silently redistributing leading-edge mass. SAMMY's UDR
+/// convolution integrates piecewise-linear segment products analytically
+/// (`udr/mudr4.f90` `Ud_Convolute`/`Udr_Add`) and needs no such floor; the
+/// sampled route keeps one and enforces it at the consumer whose contract
+/// is per-bin.
 const TRI_BIN_SAMPLES_PER_SIDE: f64 = 24.0;
+
+/// Per-bin accuracy floor for a sampled Gaussian burst
+/// (`dtau ≤ σ / GAUSS_BIN_SAMPLES_PER_SIGMA` at the detector-bin gate).
+/// Measured at α = 1 µs⁻¹, σ = 2 µs, admitted `dtau = σ`: 1.46e-2 max
+/// per-bin error while the total conserved to 5e-10; the O(dtau²) scaling
+/// puts twelve samples per σ at ~1e-4. SAMMY integrates the Gaussian burst
+/// analytically over piecewise-linear segments (`Ud_Burst`) and needs no
+/// floor; the sampled sibling of the triangle gate keeps one.
+const GAUSS_BIN_SAMPLES_PER_SIGMA: f64 = 12.0;
+
+/// Per-bin accuracy floor for the PROMPT core on the sampled fold path
+/// (`dtau ≤ fast_reach / PROMPT_BIN_SAMPLES`). A wide fold can set a bin
+/// floor far coarser than the Γ₃ pulse's own structure (scale `1/α`), so
+/// the fold floors alone would admit prompt-undersampled grids; the α = 1,
+/// FWHM = 10 µs measurement (1.2e-4 at dtau = fast_reach/43) anchors
+/// forty-eight samples across the prompt reach at ~1e-4. Only the sampled
+/// fold path needs this — the fold-free branch is analytic.
+const PROMPT_BIN_SAMPLES: f64 = 48.0;
 
 /// Reach of the sampled/folded Gaussian burst in standard deviations. At
 /// ±`GAUSS_REACH_SIGMAS`·σ = ±8σ the truncated two-sided Gaussian mass is
@@ -819,26 +840,39 @@ impl IkedaCarpenter {
 
         let (times, densities) =
             synth_source_pulse_density(&self.params, self.n_tau, true_energy_ev)?;
-        // Per-bin accuracy gate: the point-sampled channel-triangle
-        // convolution mis-assigns individual bins as O(dtau²) even while
-        // conserving the total (leading-edge mass below the sampled support
-        // silently redistributes into the window). Synthesis accepts the
-        // moment-level FWHM/3 step for the calibration consumer; this
-        // per-bin consumer requires the stricter TRI_BIN_SAMPLES_PER_SIDE
-        // step and rejects a coarser grid loudly.
-        if let Some(fwhm) = self.params.channel_fwhm_us.filter(|&f| f > 0.0)
-            && times.len() >= 2
-        {
+        // Per-bin accuracy gate: the point-sampled fold convolution
+        // mis-assigns individual bins as O(dtau²) even while conserving the
+        // total (leading-edge mass below the sampled support silently
+        // redistributes into the window). Synthesis accepts the moment-level
+        // steps for the calibration consumer; this per-bin consumer requires
+        // the STRICTEST applicable bin floor — prompt core, channel
+        // triangle, Gaussian burst — and rejects a coarser grid loudly.
+        if times.len() >= 2 {
             let dtau = times[1] - times[0];
-            let bin_floor = fwhm / TRI_BIN_SAMPLES_PER_SIDE;
+            let alpha_probe = self.params.alpha.eval(true_energy_ev);
+            let mut bin_floor = FAST_REACH_E_FOLDS / alpha_probe.max(MIN_RATE) / PROMPT_BIN_SAMPLES;
+            let mut binding = "prompt core".to_string();
+            if let Some(fwhm) = self.params.channel_fwhm_us.filter(|&f| f > 0.0) {
+                let tri = fwhm / TRI_BIN_SAMPLES_PER_SIDE;
+                if tri < bin_floor {
+                    bin_floor = tri;
+                    binding = format!("{fwhm} µs channel triangle");
+                }
+            }
+            if let Some(sigma) = self.params.burst_sigma_us.filter(|&s| s > 0.0) {
+                let gauss = sigma / GAUSS_BIN_SAMPLES_PER_SIGMA;
+                if gauss < bin_floor {
+                    bin_floor = gauss;
+                    binding = format!("{sigma} µs Gaussian burst");
+                }
+            }
             if dtau > bin_floor * (1.0 + 1e-12) {
                 return Err(ResolutionParseError::InvalidFormat(format!(
                     "Ikeda–Carpenter detector-bin probabilities at E = \
                      {true_energy_ev} eV: the sampled τ-step {dtau:.4} µs \
-                     exceeds the per-bin accuracy floor FWHM/{TRI_BIN_SAMPLES_PER_SIDE} \
-                     = {bin_floor:.4} µs for the {fwhm} µs channel triangle; \
-                     increase n_tau (or shorten the storage tail) so the \
-                     sampled fold meets the per-bin bound"
+                     exceeds the per-bin accuracy floor {bin_floor:.4} µs \
+                     set by the {binding}; increase n_tau (or shorten the \
+                     storage tail) so the sampled fold meets the per-bin bound"
                 )));
             }
         }
@@ -935,26 +969,30 @@ fn tau_geometry(
     let mut dtau_req = fast_reach / (n_tau as f64 - 1.0);
     let mut floor = fast_reach / (MIN_N_TAU as f64 - 1.0);
     let mut fold_desc = String::new();
+    // With any fold active, the REQUESTED step targets the per-bin accuracy
+    // floors (prompt core, triangle, burst — see the *_BIN_* constants) so
+    // the detector-bin path is accurate whenever the sample cap affords it;
+    // the HARD floors stay at the moment level (MIN_N_TAU prompt density,
+    // FWHM/TRI_MIN_SAMPLES_PER_SIDE, σ) so cap-limited long-tail
+    // configurations still synthesize for the moment-level consumers
+    // (calibration), and only the per-bin gate in
+    // `detector_bin_probabilities` rejects them.
+    let any_fold = params.channel_fwhm_us.filter(|&f| f > 0.0).is_some()
+        || params.burst_sigma_us.filter(|&s| s > 0.0).is_some();
+    if any_fold {
+        dtau_req = dtau_req.min(fast_reach / PROMPT_BIN_SAMPLES);
+    }
     if let Some(fwhm) = params.channel_fwhm_us
         && fwhm > 0.0
     {
-        // The REQUESTED step targets the per-bin accuracy floor
-        // (FWHM/TRI_BIN_SAMPLES_PER_SIDE) so the detector-bin path is
-        // accurate whenever the sample cap affords it; the HARD floor stays
-        // at the moment-level FWHM/TRI_MIN_SAMPLES_PER_SIDE so cap-limited
-        // long-tail configurations still synthesize for the moment-level
-        // consumers (calibration), and only the per-bin gate in
-        // `detector_bin_probabilities` rejects them.
-        let tri_bin_target = fwhm / TRI_BIN_SAMPLES_PER_SIDE;
-        let tri_floor = fwhm / TRI_MIN_SAMPLES_PER_SIDE;
-        dtau_req = dtau_req.min(tri_bin_target);
-        floor = floor.min(tri_floor);
+        dtau_req = dtau_req.min(fwhm / TRI_BIN_SAMPLES_PER_SIDE);
+        floor = floor.min(fwhm / TRI_MIN_SAMPLES_PER_SIDE);
         fold_desc.push_str(&format!(", channel triangle FWHM = {fwhm} µs"));
     }
     if let Some(sigma) = params.burst_sigma_us
         && sigma > 0.0
     {
-        dtau_req = dtau_req.min(sigma);
+        dtau_req = dtau_req.min(sigma / GAUSS_BIN_SAMPLES_PER_SIGMA);
         floor = floor.min(sigma);
         fold_desc.push_str(&format!(", burst σ = {sigma} µs"));
     }
