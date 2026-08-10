@@ -611,7 +611,7 @@ fn build_resolution(
                     a0: theta[0].exp(),
                     a1: theta[1].exp(),
                 },
-                beta: theta[2].exp(),
+                beta: EnergyLaw::Const(theta[2].exp()),
                 // Scalar R: a free κ in ExpMilliEv is unidentifiable in the eV
                 // regime (R ≡ 0 across 1–200 eV for ANY plausible κ); a scalar
                 // lets the calibrant decide whether a storage tail is present.
@@ -1252,7 +1252,10 @@ mod tests {
         let EnergyLaw::Const(rr) = p.r else {
             panic!("expected a Const R law");
         };
-        (a0, a1, p.beta, rr, p.channel_fwhm_us.unwrap_or(0.0))
+        let EnergyLaw::Const(beta) = p.beta else {
+            panic!("expected a Const beta law");
+        };
+        (a0, a1, beta, rr, p.channel_fwhm_us.unwrap_or(0.0))
     }
 
     fn synthetic_base_udr() -> TabulatedResolution {
@@ -1606,7 +1609,7 @@ mod tests {
         let ic = IkedaCarpenter::new(
             IkedaCarpenterParams {
                 alpha: EnergyLaw::SqrtE { a0: 0.30, a1: 0.0 },
-                beta: 0.1,
+                beta: EnergyLaw::Const(0.1),
                 r: EnergyLaw::ExpMilliEv { kappa: 25.0 },
                 burst_sigma_us: None,
                 channel_fwhm_us: None,
@@ -1810,7 +1813,7 @@ mod tests {
         let ic = IkedaCarpenter::new(
             IkedaCarpenterParams {
                 alpha: EnergyLaw::SqrtE { a0: 0.30, a1: 0.0 },
-                beta: 0.1,
+                beta: EnergyLaw::Const(0.1),
                 r: EnergyLaw::ExpMilliEv { kappa: 25.0 },
                 burst_sigma_us: None,
                 channel_fwhm_us: None,
@@ -2119,7 +2122,7 @@ mod tests {
         let ic_truth = IkedaCarpenter::new(
             IkedaCarpenterParams {
                 alpha: EnergyLaw::SqrtE { a0: 0.35, a1: 0.05 },
-                beta: 0.1,
+                beta: EnergyLaw::Const(0.1),
                 r: EnergyLaw::Const(0.1),
                 burst_sigma_us: None,
                 channel_fwhm_us: Some(0.35),
@@ -2201,7 +2204,7 @@ mod tests {
         let ic_truth = IkedaCarpenter::new(
             IkedaCarpenterParams {
                 alpha: EnergyLaw::SqrtE { a0: 0.35, a1: 0.05 },
-                beta: 0.1,
+                beta: EnergyLaw::Const(0.1),
                 r: EnergyLaw::Const(0.1),
                 burst_sigma_us: None,
                 channel_fwhm_us: Some(psr_true),
@@ -2258,7 +2261,7 @@ mod tests {
         let ic_truth = IkedaCarpenter::new(
             IkedaCarpenterParams {
                 alpha: EnergyLaw::SqrtE { a0: 0.35, a1: 0.05 },
-                beta: 0.1,
+                beta: EnergyLaw::Const(0.1),
                 r: EnergyLaw::Const(0.1),
                 burst_sigma_us: None,
                 channel_fwhm_us: None, // unfolded truth
@@ -2321,7 +2324,7 @@ mod tests {
         let ic_truth = IkedaCarpenter::new(
             IkedaCarpenterParams {
                 alpha: EnergyLaw::SqrtE { a0: 0.35, a1: 0.05 },
-                beta: 0.1, // irrelevant at R = 0 (no storage term)
+                beta: EnergyLaw::Const(0.1), // irrelevant at R = 0 (no storage term)
                 r: EnergyLaw::Const(0.0),
                 burst_sigma_us: None,
                 channel_fwhm_us: Some(0.35),
@@ -2352,9 +2355,81 @@ mod tests {
             &cfg,
         )
         .unwrap();
+        // At R_truth = 0 the β↔R ridge is FLAT: a fast-β storage term is
+        // absorbable by the freed α(E) coefficients, so the optimizer's
+        // endpoint — pinned on the r lower bound, or slightly interior —
+        // depends on the kernel discretization. The physical contract is
+        // that no MATERIAL storage fraction is claimed either way; the
+        // deterministic positive pin for the bounds_hit labeling mechanism
+        // is bounds_hit_labels_saturated_upper_bound below.
+        let (_, _, beta_cal, r_cal, _) = decoded_ic(&r);
         assert!(
-            r.bounds_hit.iter().any(|s| s == "r:lower"),
-            "R = 0 truth must pin the storage fraction: bounds_hit = {:?}, decoded = {:?}",
+            r.bounds_hit.iter().any(|s| s == "r:lower") || (r_cal < 0.08 && beta_cal > 1.0),
+            "R = 0 truth must not claim a material storage fraction: an \
+             interior ridge endpoint is admissible only when the claimed \
+             storage is small AND fast (β above the ~1.6 µs⁻¹ prompt rate, \
+             i.e. absorbable) — a slow visible tail must fail. \
+             bounds_hit = {:?}, decoded = {:?}",
+            r.bounds_hit,
+            decoded_ic(&r)
+        );
+    }
+
+    #[test]
+    fn bounds_hit_labels_saturated_upper_bound() {
+        // A truth channel fold WIDER than the fitted PSR box (2.5 µs vs
+        // PSR_FWHM_US_MAX = 1.0 µs) pulls the fitted width monotonically
+        // into the upper bound: fold width is identifiable through the
+        // kernel's second moment (unlike the β↔R ridge coordinates), so the
+        // pin is deterministic — the positive test for the bounds_hit
+        // labeling mechanism.
+        let iso = synthetic_isotope(72, 178, 20.0, 0.05, 0.06);
+        let sample = SampleParams::new(300.0, vec![(iso, 2.0e-3)]).unwrap();
+        let energies: Vec<f64> = (0..120).map(|i| 14.0 + i as f64 * 0.05).collect();
+        let cfg = CalibrationConfig {
+            ic_n_energies: 32,
+            ic_n_tau: 300,
+            restarts: 1,
+            ..Default::default()
+        };
+        let ic_truth = IkedaCarpenter::new(
+            IkedaCarpenterParams {
+                alpha: EnergyLaw::SqrtE { a0: 0.35, a1: 0.05 },
+                beta: EnergyLaw::Const(0.1),
+                r: EnergyLaw::Const(0.0),
+                burst_sigma_us: None,
+                channel_fwhm_us: Some(2.5),
+            },
+            cfg.flight_path_m,
+            &SynthesisGrid {
+                e_min_ev: (energies[0] * 0.5).max(1e-3),
+                e_max_ev: energies.last().unwrap() * 2.0,
+                n_energies: cfg.ic_n_energies,
+                n_tau: cfg.ic_n_tau,
+            },
+        )
+        .unwrap();
+        let truth = ResolutionFunction::IkedaCarpenter(Arc::new(ic_truth));
+        let data = forward_model(
+            &energies,
+            &sample,
+            Some(&InstrumentParams { resolution: truth }),
+        )
+        .unwrap();
+        let unc = vec![0.004; energies.len()];
+        let r = calibrate_resolution(
+            ResolutionFamily::IkedaCarpenter { fit_psr: true },
+            &energies,
+            &data,
+            &unc,
+            &sample,
+            &cfg,
+        )
+        .unwrap();
+        assert!(
+            r.bounds_hit.iter().any(|s| s == "psr_fwhm_us:upper"),
+            "a truth fold wider than the PSR box must pin the upper bound: \
+             bounds_hit = {:?}, decoded = {:?}",
             r.bounds_hit,
             decoded_ic(&r)
         );
@@ -2627,7 +2702,7 @@ mod tests {
                     a0: 0.5,
                     a1: IC_A1_MAX,
                 },
-                beta: IC_BETA_MIN,
+                beta: EnergyLaw::Const(IC_BETA_MIN),
                 r: EnergyLaw::Const(IC_R_MAX),
                 burst_sigma_us: None,
                 channel_fwhm_us: Some(fwhm_us),

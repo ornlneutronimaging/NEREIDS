@@ -44,7 +44,8 @@
 //!
 //! - `α(E)` [1/µs]: fast moderation/leakage rate; sets the prompt width.
 //!   Leading epithermal scaling `α ∝ √E` (Mantid `α = 1/(α₀+α₁λ)`, λ ∝ 1/√E).
-//! - `β` [1/µs]: slow storage rate; sets the delayed tail. Energy-independent.
+//! - `β(E)` [1/µs]: slow storage rate; sets the delayed tail. Constant by
+//!   default; optionally energy-dependent through an [`EnergyLaw`].
 //! - `R(E)`, 0 ≤ R ≤ 1: storage mixing fraction; `R ≈ exp(−E_meV/κ)` → **R→0 in
 //!   the 1–200 eV resonance regime**, so IC there is dominated by the
 //!   one-parameter prompt Gamma(3, α(E)) term.
@@ -129,7 +130,9 @@
 //! applies its `psr_fwhm_ns` fold to the IC family only, never to
 //! tabulated/UDR kernels).
 
-use crate::resolution::{ResolutionParseError, TabulatedResolution};
+use crate::resolution::{
+    ResolutionParseError, TOF_FACTOR, TabulatedResolution, piecewise_linear_bin_masses,
+};
 
 /// de Broglie wavelength factor: λ (Å) = `LAMBDA_ANGSTROM_FACTOR` / √(E in eV).
 ///
@@ -168,13 +171,58 @@ const MIN_N_TAU: usize = 8;
 /// the discrete triangle toward the exact delta `[0, 1, 0]`, silently
 /// erasing a requested fold — [`tau_geometry`] rejects that instead
 /// (strictly: `capped_step > FWHM/3`).
+///
+/// This floor guarantees MOMENT-level accuracy (the calibration consumer's
+/// contract); per-bin detector probabilities need the far stricter
+/// [`TRI_BIN_SAMPLES_PER_SIDE`], enforced at the detector-bin gate rather
+/// than here so realistic long-storage-tail calibrations stay buildable
+/// under the [`MAX_TAU_SAMPLES`] cap.
 const TRI_MIN_SAMPLES_PER_SIDE: f64 = 3.0;
 
-/// Reach of the sampled/folded Gaussian burst in standard deviations (±4σ:
-/// e^{−8} ≈ 3.4e-4 of peak at the edge, well below any consuming tolerance
-/// once convolved). Also fixes the burst resolution floor `dtau ≤ σ`
-/// (≥ `GAUSS_REACH_SIGMAS` samples per side).
-const GAUSS_REACH_SIGMAS: f64 = 4.0;
+/// Per-bin accuracy floor for the SAMPLED detector-bin path
+/// (`dtau ≤ FWHM / TRI_BIN_SAMPLES_PER_SIDE` required by
+/// `detector_bin_probabilities` when a channel fold is active). The
+/// point-sampled discrete convolution mis-assigns individual detector-bin
+/// probability as O(dtau²) even while the total mass is conserved (the
+/// triangle kernel's kink drives the error; measured at α = 1 µs⁻¹,
+/// FWHM = 10 µs: 7.5e-3 max per-bin error at 3 samples per side, ~1.2e-4 at
+/// 24, ~3e-7 at the 600-sample default). The per-bin gate takes the
+/// STRICTEST of the applicable floors — this one, the burst
+/// [`GAUSS_BIN_SAMPLES_PER_SIGMA`], and the prompt-core
+/// [`PROMPT_BIN_SAMPLES`] — so every accepted per-bin call is bounded at
+/// ~1e-4 whichever feature binds; a coarser sampled grid is rejected loudly
+/// rather than silently redistributing leading-edge mass. SAMMY's UDR
+/// convolution integrates piecewise-linear segment products analytically
+/// (`udr/mudr4.f90` `Ud_Convolute`/`Udr_Add`) and needs no such floor; the
+/// sampled route keeps one and enforces it at the consumer whose contract
+/// is per-bin.
+const TRI_BIN_SAMPLES_PER_SIDE: f64 = 24.0;
+
+/// Per-bin accuracy floor for a sampled Gaussian burst
+/// (`dtau ≤ σ / GAUSS_BIN_SAMPLES_PER_SIGMA` at the detector-bin gate).
+/// Measured at α = 1 µs⁻¹, σ = 2 µs, admitted `dtau = σ`: 1.46e-2 max
+/// per-bin error while the total conserved to 5e-10; the O(dtau²) scaling
+/// puts twelve samples per σ at ~1e-4. SAMMY integrates the Gaussian burst
+/// analytically over piecewise-linear segments (`Ud_Burst`) and needs no
+/// floor; the sampled sibling of the triangle gate keeps one.
+const GAUSS_BIN_SAMPLES_PER_SIGMA: f64 = 12.0;
+
+/// Per-bin accuracy floor for the PROMPT core on the sampled fold path
+/// (`dtau ≤ fast_reach / PROMPT_BIN_SAMPLES`). A wide fold can set a bin
+/// floor far coarser than the Γ₃ pulse's own structure (scale `1/α`), so
+/// the fold floors alone would admit prompt-undersampled grids; the α = 1,
+/// FWHM = 10 µs measurement (1.2e-4 at dtau = fast_reach/43) anchors
+/// forty-eight samples across the prompt reach at ~1e-4. Only the sampled
+/// fold path needs this — the fold-free branch is analytic.
+const PROMPT_BIN_SAMPLES: f64 = 48.0;
+
+/// Reach of the sampled/folded Gaussian burst in standard deviations. At
+/// ±`GAUSS_REACH_SIGMAS`·σ = ±8σ the truncated two-sided Gaussian mass is
+/// erfc(8/√2) ≈ 1.2e-15, so the retained-mass bookkeeping in
+/// [`gaussian_kernel`] stays exact at f64 scale and no physically meaningful
+/// mass is discarded for any detector window. Also fixes the burst
+/// resolution floor `dtau ≤ σ` (≥ `GAUSS_REACH_SIGMAS` samples per side).
+const GAUSS_REACH_SIGMAS: f64 = 8.0;
 
 /// Prompt-tail reach in e-folds: the τ-grid spans `FAST_REACH_E_FOLDS / α`
 /// so the prompt Gamma(3) tail `τ²e^{−ατ}` is < ~1e-8 of peak at the edge.
@@ -212,9 +260,9 @@ const R_NEGLIGIBLE: f64 = 1e-9;
 /// whose floor cannot be met within the cap is REJECTED loudly by
 /// [`IkedaCarpenter::new`] instead of silently under-sampled. The actual
 /// guarantee is on the pulse body only: the symmetric burst/channel fold
-/// margin (± `4σ + FWHM` at the resolved step) adds its samples ON TOP of
-/// the cap, so the final grid can exceed `MAX_TAU_SAMPLES` by the margin
-/// sample count.
+/// margin (± `GAUSS_REACH_SIGMAS·σ + FWHM` at the resolved step) adds its
+/// samples ON TOP of the cap, so the final grid can exceed
+/// `MAX_TAU_SAMPLES` by the margin sample count.
 const MAX_TAU_SAMPLES: usize = 8192;
 
 /// Taylor expansion of `h(u)/u³` where `h(u) = 1 − e^{−u}(1 + u + ½u²)`, for
@@ -239,6 +287,11 @@ fn h_over_cube_taylor(u: f64) -> f64 {
 /// near `u = α−β·τ → 0` where that bracket cancels.
 #[must_use]
 pub fn ic_pulse(alpha: f64, beta: f64, r: f64, tau: f64) -> f64 {
+    // Same domain contract as ic_cdf: non-finite parameters return NaN so
+    // garbage in stays visible instead of flooring into a plausible pulse.
+    if !alpha.is_finite() || !beta.is_finite() || !r.is_finite() {
+        return f64::NAN;
+    }
     if !tau.is_finite() || tau < 0.0 {
         return 0.0;
     }
@@ -263,6 +316,100 @@ pub fn ic_pulse(alpha: f64, beta: f64, r: f64, tau: f64) -> f64 {
         coeff * bracket / (u * u * u)
     };
     (1.0 - r) * fast + r * slow
+}
+
+/// Cumulative probability of the Ikeda–Carpenter moderator pulse.
+///
+/// Returns `P(U <= tau)` for moderator delay `U`. `tau` is in µs and rates
+/// are in 1/µs. The prompt term is the Gamma(3, α) cumulative distribution;
+/// the storage term is the cumulative distribution of Gamma(3, α) plus an
+/// independent exponential delay with rate β.
+///
+/// The expression is evaluated without subtracting nearly equal exponentials
+/// when `α ≈ β`. This is the bin-integral companion to [`ic_pulse`].
+///
+/// Domain contract: non-finite `alpha`, `beta`, or `r` returns NaN so garbage
+/// in stays visible; finite non-positive rates are floored to `MIN_RATE`
+/// (1e-9 µs⁻¹) and `r <= 0` disables the storage term, matching
+/// [`ic_pulse`]. A NaN `tau`
+/// returns 0 — `tau` is the integration coordinate, not a parameter, and a
+/// non-arriving coordinate contributes no mass.
+#[must_use]
+pub fn ic_cdf(alpha: f64, beta: f64, r: f64, tau: f64) -> f64 {
+    if !alpha.is_finite() || !beta.is_finite() || !r.is_finite() {
+        return f64::NAN;
+    }
+    if tau.is_nan() || tau <= 0.0 {
+        return 0.0;
+    }
+    if tau == f64::INFINITY {
+        return 1.0;
+    }
+
+    let alpha = alpha.max(MIN_RATE);
+    let beta = beta.max(MIN_RATE);
+    let at = alpha * tau;
+    let fast = gamma3_cdf(at);
+    if r <= 0.0 {
+        return fast;
+    }
+
+    // Far in the tails the general expressions overflow — `at³` or `u³`
+    // reach f64::INFINITY and produce inf·0 / inf/inf = NaN — while the
+    // limits are exact to full f64 precision, so return them directly.
+    // For at ≥ 1e100 the prompt CDF is 1 and the storage correction is
+    // exp(−βτ) with relative error ≤ 3βτ/at; for βτ ≥ 1e100 the storage
+    // delay is instantaneous and the correction is 0.
+    const CDF_TAIL_LIMIT: f64 = 1.0e100;
+    if at >= CDF_TAIL_LIMIT {
+        return (1.0 - r * (-beta * tau).exp()).clamp(0.0, 1.0);
+    }
+    if beta * tau >= CDF_TAIL_LIMIT {
+        return fast;
+    }
+
+    // The storage CDF is the prompt CDF minus the positive survival
+    // correction below. Written this way, the α=β limit is Gamma(4, α).
+    let u = (alpha - beta) * tau;
+    let correction = if u.abs() < 0.05 {
+        at.powi(3) * (-beta * tau).exp() * h_over_cube_taylor(u)
+    } else {
+        // Bounded form: neither exponential can overflow even when β >> α.
+        let bracket = (-beta * tau).exp() - (-alpha * tau).exp() * (1.0 + u + 0.5 * u * u);
+        at.powi(3) * bracket / u.powi(3)
+    };
+    (fast - r * correction).clamp(0.0, 1.0)
+}
+
+/// Gamma(3, rate=1) cumulative distribution at dimensionless time `x`.
+fn gamma3_cdf(x: f64) -> f64 {
+    if x <= 0.0 {
+        return 0.0;
+    }
+    // Beyond x ≈ 750 the survival term exp(−x)·(1+x+x²/2) underflows to an
+    // exact zero long before the polynomial can overflow (x² reaches
+    // f64::INFINITY only at x ~ 1.3e154, where 0·inf would be NaN).
+    if x >= 750.0 {
+        return 1.0;
+    }
+    if x < 0.5 {
+        // Integral of x² exp(-x) / 2 as an alternating series. The direct
+        // `1 - exp(-x)(1+x+x²/2)` loses most digits for small x.
+        let mut n = 0_u32;
+        let mut term = x.powi(3) / 6.0;
+        let mut sum = term;
+        loop {
+            let n_f = f64::from(n);
+            term *= -x * (n_f + 3.0) / ((n_f + 1.0) * (n_f + 4.0));
+            let next = sum + term;
+            n += 1;
+            if next == sum || n >= 128 {
+                return next.clamp(0.0, 1.0);
+            }
+            sum = next;
+        }
+    }
+    (1.0 - (-x).exp() * (1.0 + x + 0.5 * x * x)).clamp(0.0, 1.0)
 }
 
 /// Energy-dependence law for an Ikeda–Carpenter parameter.
@@ -293,12 +440,7 @@ impl EnergyLaw {
             EnergyLaw::Const(c) => c,
             EnergyLaw::SqrtE { a0, a1 } => a0 * e.sqrt() + a1,
             EnergyLaw::InverseLambda { a0, a1 } => {
-                let lambda = if e > 0.0 {
-                    LAMBDA_ANGSTROM_FACTOR / e.sqrt()
-                } else {
-                    f64::INFINITY
-                };
-                let denom = a0 + a1 * lambda;
+                let denom = inverse_lambda_denom(a0, a1, e);
                 if denom.abs() < MIN_RATE {
                     1.0 / MIN_RATE
                 } else {
@@ -314,6 +456,39 @@ impl EnergyLaw {
             }
         }
     }
+
+    /// True when the law is numerically singular at `energy_ev`: the raw
+    /// `InverseLambda` denominator lies inside the ±[`MIN_RATE`] window that
+    /// [`EnergyLaw::eval`] floors away. The floor keeps a fit trial step from
+    /// dividing by zero mid-optimization, but a *configured* law inside that
+    /// window is a mathematically undefined rate, not a large one — without
+    /// this check the floor converts an undefined (or tiny-negative)
+    /// denominator into a plausible huge positive rate before the range
+    /// validation below can see it.
+    #[must_use]
+    pub(crate) fn is_singular_at(&self, energy_ev: f64) -> bool {
+        match *self {
+            EnergyLaw::InverseLambda { a0, a1 } => {
+                inverse_lambda_denom(a0, a1, energy_ev.max(0.0)).abs() < MIN_RATE
+            }
+            // κ = 0 is undefined and a tiny NEGATIVE κ is a divergent law
+            // (exp(+E/|κ|)); eval's floor maps both to 0.0, which is the
+            // legitimate κ → 0⁺ limit only for positive κ.
+            EnergyLaw::ExpMilliEv { kappa } => (-MIN_RATE..=0.0).contains(&kappa),
+            _ => false,
+        }
+    }
+}
+
+/// Raw `InverseLambda` denominator `a0 + a1·λ(E)` — shared by [`EnergyLaw::eval`]
+/// and the singularity check so the two can never disagree on the window.
+fn inverse_lambda_denom(a0: f64, a1: f64, e: f64) -> f64 {
+    let lambda = if e > 0.0 {
+        LAMBDA_ANGSTROM_FACTOR / e.sqrt()
+    } else {
+        f64::INFINITY
+    };
+    a0 + a1 * lambda
 }
 
 /// Parameters of the Ikeda–Carpenter resolution model.
@@ -321,8 +496,8 @@ impl EnergyLaw {
 pub struct IkedaCarpenterParams {
     /// Fast (slowing-down) rate `α(E)`, 1/µs. Must evaluate to > 0.
     pub alpha: EnergyLaw,
-    /// Slow (storage) rate `β`, 1/µs. Energy-independent, must be > 0.
-    pub beta: f64,
+    /// Slow (storage) rate `β(E)`, 1/µs. Must evaluate to > 0.
+    pub beta: EnergyLaw,
     /// Storage mixing fraction `R(E)`, 0 ≤ R ≤ 1.
     pub r: EnergyLaw,
     /// Optional proton-burst Gaussian standard deviation (µs).
@@ -338,7 +513,7 @@ impl IkedaCarpenterParams {
     pub fn constant(alpha: f64, beta: f64, r: f64) -> Self {
         Self {
             alpha: EnergyLaw::Const(alpha),
-            beta,
+            beta: EnergyLaw::Const(beta),
             r: EnergyLaw::Const(r),
             burst_sigma_us: None,
             channel_fwhm_us: None,
@@ -365,7 +540,8 @@ pub struct SynthesisGrid {
     /// `n_tau = 8` density, folds at ≥ 3 triangle samples per side / ≥ 1
     /// sample per burst σ): a combination that cannot be resolved within the
     /// cap is rejected by [`IkedaCarpenter::new`]. Active burst/channel folds
-    /// add their ±(4σ + FWHM) margin samples on top of the cap.
+    /// add their ±(`GAUSS_REACH_SIGMAS`·σ + FWHM) margin samples on top of
+    /// the cap.
     pub n_tau: usize,
 }
 
@@ -404,7 +580,7 @@ impl IkedaCarpenter {
     /// # Errors
     /// Returns [`ResolutionParseError::InvalidFormat`] for a non-positive
     /// flight path, a degenerate grid (`n_energies < 2`, `n_tau < 8`,
-    /// `e_min ≤ 0`, `e_max ≤ e_min`), a non-positive `β`, a parameter/grid
+    /// `e_min ≤ 0`, `e_max ≤ e_min`), a non-positive `β(E)`, a parameter/grid
     /// combination whose τ-grid cannot resolve the prompt core and requested
     /// folds within the `MAX_TAU_SAMPLES` cap at some reference energy (see
     /// `tau_geometry` — remedy: larger `β`, `R = 0`, or a wider/disabled
@@ -442,13 +618,6 @@ impl IkedaCarpenter {
                 grid.e_min_ev, grid.e_max_ev
             )));
         }
-        if !params.beta.is_finite() || params.beta <= 0.0 {
-            return Err(ResolutionParseError::InvalidFormat(format!(
-                "beta must be a positive finite number, got {}",
-                params.beta
-            )));
-        }
-
         let ln_lo = grid.e_min_ev.ln();
         let ln_hi = grid.e_max_ev.ln();
         let denom = (grid.n_energies - 1) as f64;
@@ -456,6 +625,20 @@ impl IkedaCarpenter {
             .map(|i| (ln_lo + (i as f64 / denom) * (ln_hi - ln_lo)).exp())
             .collect();
 
+        // Reject singular rate laws before the range checks: a near-zero
+        // InverseLambda denominator is an undefined configuration, and eval's
+        // numerical floor would otherwise convert it into a plausible huge
+        // positive rate that the α > 0 / β > 0 checks below cannot distinguish
+        // from genuine physics.
+        for (name, law) in [("α", &params.alpha), ("β", &params.beta), ("R", &params.r)] {
+            if let Some(&bad) = ref_energies.iter().find(|&&e| law.is_singular_at(e)) {
+                return Err(ResolutionParseError::InvalidFormat(format!(
+                    "Ikeda–Carpenter {name}(E) law is singular at E = {bad} eV \
+                     (an InverseLambda denominator within \
+                     ±{MIN_RATE} of zero, or an ExpMilliEv κ in [−{MIN_RATE}, 0])"
+                )));
+            }
+        }
         // Reject parameter laws that yield a non-positive fast rate α(E): the
         // pulse would otherwise degenerate (synthesis clamps α to a tiny floor,
         // producing a meaningless near-flat kernel rather than failing loudly).
@@ -466,6 +649,18 @@ impl IkedaCarpenter {
             return Err(ResolutionParseError::InvalidFormat(format!(
                 "Ikeda–Carpenter α(E) must be > 0, but α({bad}) = {} is not",
                 params.alpha.eval(bad)
+            )));
+        }
+        // β is a rate, so every synthesized reference energy must give a
+        // positive finite value. Reject invalid laws instead of clamping them
+        // into a different pulse.
+        if let Some(&bad) = ref_energies.iter().find(|&&e| {
+            let beta = params.beta.eval(e);
+            !beta.is_finite() || beta <= 0.0
+        }) {
+            return Err(ResolutionParseError::InvalidFormat(format!(
+                "Ikeda–Carpenter β(E) must be > 0, but β({bad}) = {} is not",
+                params.beta.eval(bad)
             )));
         }
         // Reject storage-fraction laws that fall outside [0, 1] (synthesis clamps
@@ -546,14 +741,187 @@ impl IkedaCarpenter {
     /// convention.
     ///
     /// # Errors
-    /// Returns [`ResolutionParseError::InvalidFormat`] when the τ-grid cannot
-    /// resolve the prompt core and requested folds within `MAX_TAU_SAMPLES`
-    /// at this energy. Construction validates every *reference* energy, but a
-    /// probe energy outside `[e_min, e_max]` — for the √E law, above `e_max`,
-    /// where the larger α(E) imposes a finer prompt resolution floor against
-    /// the same storage-tail span — can still leave the resolvable region.
+    /// Returns [`ResolutionParseError::InvalidFormat`] when the requested
+    /// energy or an energy-dependent rate/fraction is non-physical, or when
+    /// the τ-grid cannot resolve the prompt core and requested folds within
+    /// `MAX_TAU_SAMPLES` at this energy. Construction validates every
+    /// *reference* energy, but a probe outside `[e_min, e_max]` can still leave
+    /// the physical or resolvable region.
     pub fn kernel_at(&self, energy_ev: f64) -> Result<(Vec<f64>, Vec<f64>), ResolutionParseError> {
+        self.validate_probe_energy(energy_ev)?;
         synth_kernel(&self.params, self.n_tau, energy_ev)
+    }
+
+    /// Evaluate the physical source pulse at one true neutron energy.
+    ///
+    /// Returns sampled moderator-delay coordinates in µs and peak-normalized
+    /// densities. Unlike [`Self::kernel_at`], this method does not move the
+    /// pulse mode to zero. With no symmetric proton/channel fold, the delay is
+    /// causal and starts at zero. A symmetric fold may extend the sampled
+    /// support below zero relative to its stated time origin.
+    ///
+    /// # Errors
+    /// Returns [`ResolutionParseError::InvalidFormat`] if `energy_ev` is not a
+    /// positive finite true energy, if an energy law is unphysical at that
+    /// energy, or if the requested pulse cannot be resolved by the configured
+    /// sampling limits.
+    pub fn source_pulse_at(
+        &self,
+        energy_ev: f64,
+    ) -> Result<(Vec<f64>, Vec<f64>), ResolutionParseError> {
+        self.validate_probe_energy(energy_ev)?;
+        synth_source_pulse(&self.params, self.n_tau, energy_ev)
+    }
+
+    /// Probability that a neutron of known true energy is recorded in each
+    /// supplied detector-time bin.
+    ///
+    /// `detector_time_edges_us` are the actual measured bin edges. The nominal
+    /// arrival time is
+    /// `timing_offset_us + TOF_FACTOR * flight_path_m / sqrt(true_energy_ev)`.
+    /// `timing_offset_us` represents the shared clock/detector offset; it does
+    /// not absorb or remove the moderator pulse's physical mode.
+    ///
+    /// The returned vector has one entry per adjacent edge pair and is not
+    /// renormalized to the supplied window: bins that do not cover the full
+    /// pulse correctly sum to less than one.
+    ///
+    /// With no burst or channel fold, probabilities come directly from the
+    /// analytical IC CDF. With either optional fold, the continuous pulse is
+    /// represented on the configured synthesis grid and integrated as a
+    /// piecewise-linear density. The finite numerical support is not silently
+    /// renormalized; omitted physical tail probability remains omitted.
+    ///
+    /// # Errors
+    /// Returns [`ResolutionParseError::InvalidFormat`] unless the true energy
+    /// is physical, the timing offset is finite, and at least two finite bin
+    /// edges are supplied in strictly increasing order.
+    pub fn detector_bin_probabilities(
+        &self,
+        true_energy_ev: f64,
+        detector_time_edges_us: &[f64],
+        timing_offset_us: f64,
+    ) -> Result<Vec<f64>, ResolutionParseError> {
+        self.validate_probe_energy(true_energy_ev)?;
+        if !timing_offset_us.is_finite() {
+            return Err(ResolutionParseError::InvalidFormat(format!(
+                "timing_offset_us must be finite, got {timing_offset_us}"
+            )));
+        }
+        if detector_time_edges_us.len() < 2
+            || detector_time_edges_us.iter().any(|x| !x.is_finite())
+            || detector_time_edges_us.windows(2).any(|w| w[0] >= w[1])
+        {
+            return Err(ResolutionParseError::InvalidFormat(
+                "detector time edges must contain at least two finite, strictly increasing values"
+                    .to_string(),
+            ));
+        }
+
+        let nominal_arrival =
+            timing_offset_us + TOF_FACTOR * self.flight_path_m / true_energy_ev.sqrt();
+        let relative_edges: Vec<f64> = detector_time_edges_us
+            .iter()
+            .map(|edge| edge - nominal_arrival)
+            .collect();
+
+        if self.params.burst_sigma_us.unwrap_or(0.0) == 0.0
+            && self.params.channel_fwhm_us.unwrap_or(0.0) == 0.0
+        {
+            let alpha = self.params.alpha.eval(true_energy_ev);
+            let beta = self.params.beta.eval(true_energy_ev);
+            let r = self.params.r.eval(true_energy_ev);
+            return Ok(relative_edges
+                .windows(2)
+                .map(|edge| {
+                    (ic_cdf(alpha, beta, r, edge[1]) - ic_cdf(alpha, beta, r, edge[0])).max(0.0)
+                })
+                .collect());
+        }
+
+        let (times, densities) =
+            synth_source_pulse_density(&self.params, self.n_tau, true_energy_ev)?;
+        // Per-bin accuracy gate: the point-sampled fold convolution
+        // mis-assigns individual bins as O(dtau²) even while conserving the
+        // total (leading-edge mass below the sampled support silently
+        // redistributes into the window). Synthesis accepts the moment-level
+        // steps for the calibration consumer; this per-bin consumer requires
+        // the STRICTEST applicable bin floor — prompt core, channel
+        // triangle, Gaussian burst — and rejects a coarser grid loudly.
+        if times.len() >= 2 {
+            let dtau = times[1] - times[0];
+            let alpha_probe = self.params.alpha.eval(true_energy_ev);
+            let mut bin_floor = FAST_REACH_E_FOLDS / alpha_probe.max(MIN_RATE) / PROMPT_BIN_SAMPLES;
+            let mut binding = "prompt core".to_string();
+            if let Some(fwhm) = self.params.channel_fwhm_us.filter(|&f| f > 0.0) {
+                let tri = fwhm / TRI_BIN_SAMPLES_PER_SIDE;
+                if tri < bin_floor {
+                    bin_floor = tri;
+                    binding = format!("{fwhm} µs channel triangle");
+                }
+            }
+            if let Some(sigma) = self.params.burst_sigma_us.filter(|&s| s > 0.0) {
+                let gauss = sigma / GAUSS_BIN_SAMPLES_PER_SIGMA;
+                if gauss < bin_floor {
+                    bin_floor = gauss;
+                    binding = format!("{sigma} µs Gaussian burst");
+                }
+            }
+            if dtau > bin_floor * (1.0 + 1e-12) {
+                return Err(ResolutionParseError::InvalidFormat(format!(
+                    "Ikeda–Carpenter detector-bin probabilities at E = \
+                     {true_energy_ev} eV: the sampled τ-step {dtau:.4} µs \
+                     exceeds the per-bin accuracy floor {bin_floor:.4} µs \
+                     set by the {binding}; increase n_tau (or shorten the \
+                     storage tail) so the sampled fold meets the per-bin bound"
+                )));
+            }
+        }
+        piecewise_linear_bin_masses(&times, &densities, &relative_edges).ok_or_else(|| {
+            ResolutionParseError::InvalidFormat(format!(
+                "Ikeda–Carpenter pulse at E = {true_energy_ev} eV has zero sampled area"
+            ))
+        })
+    }
+
+    fn validate_probe_energy(&self, energy_ev: f64) -> Result<(), ResolutionParseError> {
+        if !energy_ev.is_finite() || energy_ev <= 0.0 {
+            return Err(ResolutionParseError::InvalidFormat(format!(
+                "true energy must be positive and finite, got {energy_ev}"
+            )));
+        }
+        for (name, law) in [
+            ("alpha", &self.params.alpha),
+            ("beta", &self.params.beta),
+            ("R", &self.params.r),
+        ] {
+            if law.is_singular_at(energy_ev) {
+                return Err(ResolutionParseError::InvalidFormat(format!(
+                    "Ikeda–Carpenter {name}({energy_ev}) law is singular (an \
+                     InverseLambda denominator within ±{MIN_RATE} of zero, \
+                     or an ExpMilliEv κ in [−{MIN_RATE}, 0])"
+                )));
+            }
+        }
+        let alpha = self.params.alpha.eval(energy_ev);
+        let beta = self.params.beta.eval(energy_ev);
+        let r = self.params.r.eval(energy_ev);
+        if !alpha.is_finite() || alpha <= 0.0 {
+            return Err(ResolutionParseError::InvalidFormat(format!(
+                "Ikeda–Carpenter alpha({energy_ev}) must be positive and finite, got {alpha}"
+            )));
+        }
+        if !beta.is_finite() || beta <= 0.0 {
+            return Err(ResolutionParseError::InvalidFormat(format!(
+                "Ikeda–Carpenter beta({energy_ev}) must be positive and finite, got {beta}"
+            )));
+        }
+        if !r.is_finite() || !(0.0..=1.0).contains(&r) {
+            return Err(ResolutionParseError::InvalidFormat(format!(
+                "Ikeda–Carpenter R({energy_ev}) must be in [0, 1], got {r}"
+            )));
+        }
+        Ok(())
     }
 }
 
@@ -563,8 +931,8 @@ impl IkedaCarpenter {
 /// The step is anchored to the PROMPT core — `n_tau` samples across the fast
 /// Gamma(3) pulse (`fast_reach / (n_tau − 1)`) — and REFINED to resolve any
 /// requested instrument fold (triangle: ≥ [`TRI_MIN_SAMPLES_PER_SIDE`]
-/// samples per side, i.e. `dtau ≤ FWHM/3`; Gaussian burst: `dtau ≤ σ`, i.e.
-/// ≥ [`GAUSS_REACH_SIGMAS`] samples per ±4σ side). A longer storage tail
+/// samples per side, i.e. `dtau ≤ FWHM/TRI_MIN_SAMPLES_PER_SIDE`; Gaussian burst: `dtau ≤ σ`, i.e.
+/// ≥ [`GAUSS_REACH_SIGMAS`] samples per ±`GAUSS_REACH_SIGMAS`·σ side). A longer storage tail
 /// (β ≪ α, R > 0) extends the SAMPLE COUNT (`j_hi ∝ tau_max/dtau`) instead
 /// of the step; [`MAX_TAU_SAMPLES`] bounds that count by widening the step —
 /// but never past the resolution FLOOR (`fast_reach / (MIN_N_TAU − 1)` for
@@ -602,18 +970,30 @@ fn tau_geometry(
     let mut dtau_req = fast_reach / (n_tau as f64 - 1.0);
     let mut floor = fast_reach / (MIN_N_TAU as f64 - 1.0);
     let mut fold_desc = String::new();
+    // With any fold active, the REQUESTED step targets the per-bin accuracy
+    // floors (prompt core, triangle, burst — see the *_BIN_* constants) so
+    // the detector-bin path is accurate whenever the sample cap affords it;
+    // the HARD floors stay at the moment level (MIN_N_TAU prompt density,
+    // FWHM/TRI_MIN_SAMPLES_PER_SIDE, σ) so cap-limited long-tail
+    // configurations still synthesize for the moment-level consumers
+    // (calibration), and only the per-bin gate in
+    // `detector_bin_probabilities` rejects them.
+    let any_fold = params.channel_fwhm_us.filter(|&f| f > 0.0).is_some()
+        || params.burst_sigma_us.filter(|&s| s > 0.0).is_some();
+    if any_fold {
+        dtau_req = dtau_req.min(fast_reach / PROMPT_BIN_SAMPLES);
+    }
     if let Some(fwhm) = params.channel_fwhm_us
         && fwhm > 0.0
     {
-        let tri_floor = fwhm / TRI_MIN_SAMPLES_PER_SIDE;
-        dtau_req = dtau_req.min(tri_floor);
-        floor = floor.min(tri_floor);
+        dtau_req = dtau_req.min(fwhm / TRI_BIN_SAMPLES_PER_SIDE);
+        floor = floor.min(fwhm / TRI_MIN_SAMPLES_PER_SIDE);
         fold_desc.push_str(&format!(", channel triangle FWHM = {fwhm} µs"));
     }
     if let Some(sigma) = params.burst_sigma_us
         && sigma > 0.0
     {
-        dtau_req = dtau_req.min(sigma);
+        dtau_req = dtau_req.min(sigma / GAUSS_BIN_SAMPLES_PER_SIGMA);
         floor = floor.min(sigma);
         fold_desc.push_str(&format!(", burst σ = {sigma} µs"));
     }
@@ -631,9 +1011,9 @@ fn tau_geometry(
     Ok((dtau_req.max(capped_step), tau_max, margin_of(params)))
 }
 
-/// Symmetric τ-grid margin for the burst/channel folds: ±(4σ + FWHM), the
-/// folds' full reach. These samples come ON TOP of [`MAX_TAU_SAMPLES`] (the
-/// cap governs the pulse body only).
+/// Symmetric τ-grid margin for the burst/channel folds:
+/// ±([`GAUSS_REACH_SIGMAS`]·σ + FWHM), the folds' full reach. These samples
+/// come ON TOP of [`MAX_TAU_SAMPLES`] (the cap governs the pulse body only).
 fn margin_of(params: &IkedaCarpenterParams) -> f64 {
     params
         .burst_sigma_us
@@ -653,8 +1033,22 @@ fn synth_kernel(
     n_tau: usize,
     energy_ev: f64,
 ) -> Result<(Vec<f64>, Vec<f64>), ResolutionParseError> {
+    let (mut offsets, weights) = synth_source_pulse(params, n_tau, energy_ev)?;
+    let peak_time = offsets[argmax(&weights)];
+    for offset in &mut offsets {
+        *offset -= peak_time;
+    }
+    Ok((offsets, weights))
+}
+
+/// Synthesize one physical-time source pulse without moving its mode.
+fn synth_source_pulse_density(
+    params: &IkedaCarpenterParams,
+    n_tau: usize,
+    energy_ev: f64,
+) -> Result<(Vec<f64>, Vec<f64>), ResolutionParseError> {
     let alpha = params.alpha.eval(energy_ev).max(MIN_RATE);
-    let beta = params.beta.max(MIN_RATE);
+    let beta = params.beta.eval(energy_ev).max(MIN_RATE);
     let r = params.r.eval(energy_ev).clamp(0.0, 1.0);
 
     let (dtau, tau_max, margin) = tau_geometry(params, n_tau, alpha, beta, r).map_err(|msg| {
@@ -673,10 +1067,34 @@ fn synth_kernel(
     let taus: Vec<f64> = (j_lo..=j_hi).map(|j| j as f64 * dtau).collect();
     let mut weights: Vec<f64> = taus.iter().map(|&t| ic_pulse(alpha, beta, r, t)).collect();
 
+    // Correct only the sampled quadrature error of the analytical moderator
+    // density. The target is its exact CDF at the finite grid endpoint, not
+    // one, so physical moderator probability beyond the grid is not moved
+    // back into the sampled support. This matters for the coarsest admitted
+    // n_tau values, where peak-normalization used to hide a large area error.
+    let sampled_area = dtau
+        * (0.5 * weights[0]
+            + weights[1..weights.len() - 1].iter().sum::<f64>()
+            + 0.5 * weights[weights.len() - 1]);
+    let moderator_mass = ic_cdf(alpha, beta, r, *taus.last().expect("non-empty tau grid"));
+    if !sampled_area.is_finite() || sampled_area <= 0.0 {
+        return Err(ResolutionParseError::InvalidFormat(format!(
+            "Ikeda–Carpenter pulse at E = {energy_ev} eV has zero sampled area"
+        )));
+    }
+    let area_correction = moderator_mass / sampled_area;
+    for weight in &mut weights {
+        *weight *= area_correction;
+    }
+
     if let Some(sigma) = params.burst_sigma_us
         && sigma > 0.0
     {
-        weights = convolve_same(&weights, &gaussian_kernel(dtau, sigma));
+        let (kernel, retained_mass) = gaussian_kernel(dtau, sigma);
+        weights = convolve_same(&weights, &kernel);
+        for weight in &mut weights {
+            *weight *= retained_mass;
+        }
     }
     if let Some(fwhm) = params.channel_fwhm_us
         && fwhm > 0.0
@@ -684,10 +1102,8 @@ fn synth_kernel(
         weights = convolve_same(&weights, &triangle_kernel(dtau, fwhm));
     }
 
-    // Anchor the mode at offset 0.
     let peak_idx = argmax(&weights);
     let peak_val = weights[peak_idx].max(f64::MIN_POSITIVE);
-    let tau_peak = taus[peak_idx];
 
     // Trim tails below TRIM_REL of peak, keeping one guard sample each side so
     // the convolution's neighbor-difference trapezoid widths stay defined.
@@ -701,9 +1117,25 @@ fn synth_kernel(
         .rposition(|&w| w > thresh)
         .map_or(weights.len() - 1, |i| (i + 1).min(weights.len() - 1));
 
-    let offsets: Vec<f64> = (lo..=hi).map(|j| taus[j] - tau_peak).collect();
-    let w: Vec<f64> = (lo..=hi).map(|j| weights[j] / peak_val).collect();
-    Ok((offsets, w))
+    let offsets: Vec<f64> = (lo..=hi).map(|j| taus[j]).collect();
+    let densities: Vec<f64> = (lo..=hi).map(|j| weights[j]).collect();
+    Ok((offsets, densities))
+}
+
+/// Synthesize the public peak-normalized source-pulse representation.
+fn synth_source_pulse(
+    params: &IkedaCarpenterParams,
+    n_tau: usize,
+    energy_ev: f64,
+) -> Result<(Vec<f64>, Vec<f64>), ResolutionParseError> {
+    let (offsets, densities) = synth_source_pulse_density(params, n_tau, energy_ev)?;
+    let peak = densities
+        .iter()
+        .copied()
+        .fold(0.0_f64, f64::max)
+        .max(f64::MIN_POSITIVE);
+    let weights = densities.into_iter().map(|value| value / peak).collect();
+    Ok((offsets, weights))
 }
 
 /// Index of the maximum element (first on ties). Slice is non-empty by
@@ -722,7 +1154,7 @@ fn argmax(xs: &[f64]) -> usize {
 
 /// Symmetric, unit-sum Gaussian kernel sampled on a `dtau`-spaced grid out to
 /// ±[`GAUSS_REACH_SIGMAS`]·σ.
-fn gaussian_kernel(dtau: f64, sigma: f64) -> Vec<f64> {
+fn gaussian_kernel(dtau: f64, sigma: f64) -> (Vec<f64>, f64) {
     let half = ((GAUSS_REACH_SIGMAS * sigma / dtau).ceil() as isize).max(1);
     let mut k: Vec<f64> = (-half..=half)
         .map(|j| {
@@ -730,8 +1162,10 @@ fn gaussian_kernel(dtau: f64, sigma: f64) -> Vec<f64> {
             (-0.5 * t * t).exp()
         })
         .collect();
+    let raw_sum: f64 = k.iter().sum();
+    let retained_mass = (raw_sum * dtau / (sigma * std::f64::consts::TAU.sqrt())).clamp(0.0, 1.0);
     normalize_sum(&mut k);
-    k
+    (k, retained_mass)
 }
 
 /// Symmetric, unit-sum triangle kernel of FWHM `fwhm` (half-base = FWHM;
@@ -879,7 +1313,7 @@ mod tests {
         // The synthesized kernel must contain no non-finite entries.
         let p = IkedaCarpenterParams {
             alpha: EnergyLaw::Const(0.05),
-            beta: 4.0,
+            beta: EnergyLaw::Const(4.0),
             r: EnergyLaw::Const(0.5),
             burst_sigma_us: None,
             channel_fwhm_us: None,
@@ -956,7 +1390,7 @@ mod tests {
         // α(E) ∝ √E ⇒ prompt width 1/α shrinks with E ⇒ smaller TOF support.
         let p = IkedaCarpenterParams {
             alpha: EnergyLaw::SqrtE { a0: 0.3, a1: 0.0 },
-            beta: 0.1,
+            beta: EnergyLaw::Const(0.1),
             r: EnergyLaw::Const(0.0),
             burst_sigma_us: None,
             channel_fwhm_us: None,
@@ -1129,10 +1563,12 @@ mod tests {
         let prompt_step = (18.0 / alpha) / (n_tau as f64 - 1.0);
 
         // (a) Moderate tail (β = 0.25 ⇒ slow_reach = 64 µs): the cap does not
-        // bite, so the step equals the prompt-core step exactly and the grid
-        // still spans the full tail.
+        // bite and the 0.5 µs triangle's per-bin refinement target
+        // (FWHM/24 ≈ 0.021 µs) sits above the prompt-core step, so the step
+        // equals the prompt-core step exactly and the grid still spans the
+        // full tail.
         let p = IkedaCarpenterParams {
-            channel_fwhm_us: Some(0.35),
+            channel_fwhm_us: Some(0.5),
             ..IkedaCarpenterParams::constant(alpha, 0.25, 0.5)
         };
         let (offs, wts) = synth_kernel(&p, n_tau, 10.0).unwrap();
@@ -1146,7 +1582,7 @@ mod tests {
             "prompt-core spacing {dtau} > fast_reach/(n_tau−1) = {prompt_step}"
         );
         // ≥ 3 nonzero triangle samples per side at this step.
-        let tri = triangle_kernel(dtau, 0.35);
+        let tri = triangle_kernel(dtau, 0.5);
         let nonzero_per_side = tri.iter().take(tri.len() / 2).filter(|&&v| v > 0.0).count();
         assert!(
             nonzero_per_side >= 3,
@@ -1286,46 +1722,48 @@ mod tests {
     }
 
     #[test]
-    fn boundary_step_fwhm_over_3_is_admitted_and_fold_survives() {
-        // Review #645 round 2, F3: pin the exactly-admitted boundary
-        // `dtau = FWHM/3` (rejection is STRICT: `capped_step > floor`). Per
-        // the TRI_MIN_SAMPLES_PER_SIDE doc, each triangle side then samples
-        // at {FWHM/3, 2FWHM/3, FWHM} — weights {2/3, 1/3, 0}: exactly 2
-        // strictly interior nonzero samples, endpoint ON the triangle zero —
-        // and the fold stays effective (non-delta, second moment ≈ 4FWHM²/27).
+    fn boundary_step_at_triangle_floor_is_admitted_and_fold_survives() {
+        // Pin the exactly-admitted uncapped step `dtau = FWHM /
+        // TRI_BIN_SAMPLES_PER_SIDE` (the bin-eager refinement target),
+        // written in terms of the constant so the pin survives value
+        // changes. For N samples per side the discrete triangle's variance
+        // is (1 − 1/N²)·FWHM²/6 exactly (N = 3 gives the historical
+        // 4·FWHM²/27 of the moment-level floor), and each side keeps N − 1
+        // strictly interior nonzero samples with the endpoint ON the
+        // triangle zero.
         //
         // Route to the boundary: n_tau = MIN_N_TAU = 8 with α = 1 gives a
-        // prompt design step 18/7 ≈ 2.57 µs, far coarser than FWHM/3 for a
-        // 1 µs triangle, so the fold refinement pins dtau to exactly
-        // `fwhm / TRI_MIN_SAMPLES_PER_SIDE`. R = 0 keeps the cap inert
-        // (capped step 18/8191 ≪ floor).
+        // prompt design step 18/7 ≈ 2.57 µs, far coarser than the target for
+        // a 1 µs triangle, so the fold refinement pins dtau to exactly the
+        // target. R = 0 keeps the cap inert (capped step 18/8191 ≪ target).
+        let n = TRI_BIN_SAMPLES_PER_SIDE;
         let fwhm = 1.0;
         let p = IkedaCarpenterParams {
             channel_fwhm_us: Some(fwhm),
             ..IkedaCarpenterParams::constant(1.0, 0.1, 0.0)
         };
         let (offs, _) = synth_kernel(&p, MIN_N_TAU, 10.0)
-            .expect("the dtau = FWHM/3 boundary must be admitted, not rejected");
+            .expect("the dtau = floor boundary must be admitted, not rejected");
         let dtau = offs[1] - offs[0];
-        let boundary = fwhm / TRI_MIN_SAMPLES_PER_SIDE;
+        let boundary = fwhm / n;
         assert!(
             (dtau - boundary).abs() < 1e-12,
-            "step {dtau} µs is not the FWHM/3 boundary {boundary} µs"
+            "step {dtau} µs is not the FWHM/{n} boundary {boundary} µs"
         );
 
-        // The sampled triangle at the boundary: ≥ 7 samples, exactly 2
-        // strictly interior nonzero per side, center far below the delta's 1.
+        // The sampled triangle at the boundary: N − 1 strictly interior
+        // nonzero samples per side, center far below the delta's 1.
         let tri = triangle_kernel(dtau, fwhm);
-        assert!(tri.len() >= 7, "boundary triangle too short: {}", tri.len());
         let per_side = tri
             .iter()
             .take(tri.len() / 2)
             .filter(|&&v| v > 1e-9)
             .count();
         assert_eq!(
-            per_side, 2,
-            "boundary triangle must keep 2 strictly interior nonzero samples \
-             per side: {tri:?}"
+            per_side,
+            n as usize - 1,
+            "boundary triangle must keep N − 1 strictly interior nonzero \
+             samples per side: {tri:?}"
         );
         let center = tri[tri.len() / 2];
         assert!(
@@ -1333,15 +1771,12 @@ mod tests {
             "center weight {center} — boundary triangle degenerated toward a delta"
         );
 
-        // Fold effectiveness: the discrete triangle's variance is 4·FWHM²/27
-        // (samples {0, ±FWHM/3, ±2FWHM/3} with weights ∝ {1, 2/3, 1/3}),
-        // ≈ 89 % of the analytic FWHM²/6 — the fold physics survives the
-        // 2-interior-sample discretization.
+        // Fold effectiveness: discrete variance (1 − 1/N²)·FWHM²/6.
         let tri_offs: Vec<f64> = (0..tri.len())
             .map(|i| (i as f64 - (tri.len() / 2) as f64) * dtau)
             .collect();
         let v = kernel_variance(&tri_offs, &tri);
-        let want = 4.0 * fwhm * fwhm / 27.0;
+        let want = (1.0 - 1.0 / (n * n)) * fwhm * fwhm / 6.0;
         assert!(
             ((v - want) / want).abs() < 0.02,
             "boundary triangle variance {v} µs² vs discrete analytic {want} µs²"

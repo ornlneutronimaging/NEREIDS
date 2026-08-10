@@ -102,7 +102,7 @@ fn closed_loop(t_true_k: f64) {
                 a0: A0_TRUE,
                 a1: A1_TRUE,
             },
-            beta: BETA_TRUE,
+            beta: EnergyLaw::Const(BETA_TRUE),
             r: EnergyLaw::Const(R_TRUE),
             burst_sigma_us: None,
             channel_fwhm_us: Some(PSR_TRUE_US),
@@ -180,15 +180,18 @@ fn closed_loop(t_true_k: f64) {
     let EnergyLaw::Const(r_cal) = p.r else {
         panic!("expected a Const R law");
     };
+    let EnergyLaw::Const(beta_cal) = p.beta else {
+        panic!("expected a Const beta law");
+    };
     assert!(a1 > 0.0, "α(E) positive by construction (a1 = {a1})");
     assert!(
         (a0 - A0_TRUE).abs() < 0.10,
         "a0 = {a0}, truth {A0_TRUE} (T = {t_true_k} K)"
     );
     assert!(
-        (p.beta - BETA_TRUE).abs() < 0.20,
+        (beta_cal - BETA_TRUE).abs() < 0.20,
         "β = {}, truth {BETA_TRUE} (T = {t_true_k} K)",
-        p.beta
+        beta_cal
     );
     assert!(
         (r_cal - R_TRUE).abs() < 0.12,
@@ -266,7 +269,7 @@ fn closed_loop(t_true_k: f64) {
     eprintln!(
         "closed_loop(T={t_true_k} K): χ²/dof={:.3}, a0={a0:.3}, a1={a1:.4}, β={:.3}, R={:.3}, \
          T_fit={t_fit:.1} ± {sigma_t:.1} K",
-        cal.chi2_dof, p.beta, r_cal
+        cal.chi2_dof, beta_cal, r_cal
     );
 }
 

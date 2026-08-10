@@ -861,9 +861,11 @@ impl PyEnergyLaw {
 /// the *same* broadening path as a Monte-Carlo file, so the IC-vs-tabulated
 /// comparison differs only in kernel source.
 ///
-/// Parameters: `alpha`/`r` are [`EnergyLaw`]s (fixed-or-fit general case),
-/// `beta` (1/µs) is the storage rate; optional `burst_sigma_us` (Gaussian) and
-/// `channel_fwhm_us` (triangle) fold in the proton-burst and chopper terms.
+/// Parameters: `alpha`/`r` are [`EnergyLaw`]s (fixed-or-fit general case).
+/// `beta` keeps the original constant-rate API; the optional trailing
+/// `beta_law` overrides it with an energy-dependent rate. Optional
+/// `burst_sigma_us` (Gaussian) and `channel_fwhm_us` (triangle) fold in the
+/// proton-burst and chopper terms.
 #[pyclass(name = "IkedaCarpenter", skip_from_py_object)]
 #[derive(Clone)]
 struct PyIkedaCarpenter {
@@ -884,6 +886,7 @@ impl PyIkedaCarpenter {
         n_tau = 600,
         burst_sigma_us = None,
         channel_fwhm_us = None,
+        beta_law = None,
     ))]
     #[allow(clippy::too_many_arguments)]
     fn new(
@@ -897,6 +900,7 @@ impl PyIkedaCarpenter {
         n_tau: usize,
         burst_sigma_us: Option<f64>,
         channel_fwhm_us: Option<f64>,
+        beta_law: Option<PyEnergyLaw>,
     ) -> PyResult<Self> {
         for (name, v) in [
             ("burst_sigma_us", burst_sigma_us),
@@ -912,7 +916,7 @@ impl PyIkedaCarpenter {
         }
         let params = IkedaCarpenterParams {
             alpha: alpha.inner,
-            beta,
+            beta: beta_law.map_or(EnergyLaw::Const(beta), |law| law.inner),
             r: r.inner,
             burst_sigma_us,
             channel_fwhm_us,
@@ -944,10 +948,37 @@ impl PyIkedaCarpenter {
     /// Raises ``ValueError`` when the τ-grid cannot resolve the prompt core
     /// and requested folds within the sample cap at this energy (construction
     /// validates the reference energies; a probe energy outside their range
-    /// can still be unresolvable).
+    /// can still be unresolvable), or when a parameter law is invalid at this
+    /// probe energy (non-positive or singular rate, storage fraction outside
+    /// [0, 1]).
     fn kernel_at(&self, energy_ev: f64) -> PyResult<(Vec<f64>, Vec<f64>)> {
         self.inner
             .kernel_at(energy_ev)
+            .map_err(|e| pyo3::exceptions::PyValueError::new_err(e.to_string()))
+    }
+
+    /// `(moderator_delay_us, density)` for the physical source pulse at one
+    /// true energy. Unlike `kernel_at`, this keeps the pulse's time origin.
+    /// The density is a peak-normalized shape (maximum 1), not a probability
+    /// density; with a symmetric burst/channel fold the leading delays can be
+    /// negative (the fold reaches before the moderator origin).
+    fn source_pulse_at(&self, true_energy_ev: f64) -> PyResult<(Vec<f64>, Vec<f64>)> {
+        self.inner
+            .source_pulse_at(true_energy_ev)
+            .map_err(|e| pyo3::exceptions::PyValueError::new_err(e.to_string()))
+    }
+
+    /// Probability that a neutron at one true energy is recorded in each
+    /// adjacent detector-time bin. The result is not renormalized when the
+    /// supplied time window omits part of the pulse.
+    fn detector_bin_probabilities(
+        &self,
+        true_energy_ev: f64,
+        detector_time_edges_us: Vec<f64>,
+        timing_offset_us: f64,
+    ) -> PyResult<Vec<f64>> {
+        self.inner
+            .detector_bin_probabilities(true_energy_ev, &detector_time_edges_us, timing_offset_us)
             .map_err(|e| pyo3::exceptions::PyValueError::new_err(e.to_string()))
     }
 
@@ -1467,7 +1498,9 @@ impl PyResolutionCalibration {
                         d.set_item("a0", *a0)?;
                         d.set_item("a1", *a1)?;
                     }
-                    d.set_item("beta", p.beta)?;
+                    if let EnergyLaw::Const(beta) = p.beta {
+                        d.set_item("beta", beta)?;
+                    }
                     if let EnergyLaw::Const(r) = &p.r {
                         d.set_item("r", *r)?;
                     }

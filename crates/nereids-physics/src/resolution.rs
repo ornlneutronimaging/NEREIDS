@@ -895,6 +895,105 @@ fn trapezoidal_moments(offsets: &[f64], weights: &[f64]) -> (f64, f64) {
     (centroid, sigma)
 }
 
+/// Integrate a sampled distribution into adjacent requested edges.
+///
+/// With `normalize_support`, a one-point kernel is treated as a unit delta and
+/// a longer kernel is normalized over its supplied support. Without it, the
+/// supplied values retain their physical density scale and a one-point density
+/// is rejected because it has no defined integration width.
+fn piecewise_linear_bin_integrals(
+    times: &[f64],
+    weights: &[f64],
+    edges: &[f64],
+    normalize_support: bool,
+) -> Option<Vec<f64>> {
+    if times.is_empty() || times.len() != weights.len() {
+        return None;
+    }
+    // A duplicated (or decreasing) time gives a zero-width segment whose
+    // slope is ±inf/NaN inside the CDF interpolation when an edge lands
+    // there — and a NaN time passes a pure monotonicity check (every NaN
+    // comparison is false) only to underflow `hi - 1` in the CDF closure
+    // (`partition_point` returns 0 when the first predicate is false).
+    // Validate finiteness and strict ordering of BOTH coordinate arrays up
+    // front; NaN weights are caught downstream by the total-mass check.
+    if times.iter().any(|t| !t.is_finite()) || times.windows(2).any(|w| w[1] <= w[0]) {
+        return None;
+    }
+    if edges.iter().any(|e| !e.is_finite()) || edges.windows(2).any(|w| w[1] <= w[0]) {
+        return None;
+    }
+
+    if times.len() == 1 {
+        if !normalize_support {
+            return None;
+        }
+        if !times[0].is_finite() || !weights[0].is_finite() || weights[0] <= 0.0 {
+            return None;
+        }
+        let mut probabilities = vec![0.0; edges.len().saturating_sub(1)];
+        for (index, edge) in edges.windows(2).enumerate() {
+            let in_bin = edge[0] <= times[0]
+                && (times[0] < edge[1]
+                    || (index + 1 == probabilities.len() && times[0] == edge[1]));
+            if in_bin {
+                probabilities[index] = 1.0;
+                break;
+            }
+        }
+        return Some(probabilities);
+    }
+
+    let mut cumulative = Vec::with_capacity(times.len());
+    cumulative.push(0.0);
+    for i in 0..times.len() - 1 {
+        let width = times[i + 1] - times[i];
+        let area = 0.5 * (weights[i] + weights[i + 1]) * width;
+        cumulative.push(cumulative[i] + area.max(0.0));
+    }
+    let total = *cumulative.last()?;
+    if !total.is_finite() || total <= 0.0 {
+        return None;
+    }
+    let scale = if normalize_support { total } else { 1.0 };
+
+    let cdf = |x: f64| -> f64 {
+        if x <= times[0] {
+            return 0.0;
+        }
+        if x >= times[times.len() - 1] {
+            return total / scale;
+        }
+        let hi = times.partition_point(|&time| time <= x);
+        let lo = hi - 1;
+        let width = times[hi] - times[lo];
+        let dx = x - times[lo];
+        let slope = (weights[hi] - weights[lo]) / width;
+        let partial = weights[lo] * dx + 0.5 * slope * dx * dx;
+        ((cumulative[lo] + partial) / scale).clamp(0.0, total / scale)
+    };
+
+    Some(
+        edges
+            .windows(2)
+            .map(|edge| (cdf(edge[1]) - cdf(edge[0])).max(0.0))
+            .collect(),
+    )
+}
+
+/// Integrate a sampled density without changing its physical mass scale.
+///
+/// This is used by analytical responses whose source density is already in
+/// probability per unit time. Probability omitted by finite numerical support
+/// therefore remains omitted instead of being redistributed into that support.
+pub(crate) fn piecewise_linear_bin_masses(
+    times: &[f64],
+    densities: &[f64],
+    edges: &[f64],
+) -> Option<Vec<f64>> {
+    piecewise_linear_bin_integrals(times, densities, edges, false)
+}
+
 impl TabulatedResolution {
     /// Reference energies (eV), sorted ascending.
     pub fn ref_energies(&self) -> &[f64] {
@@ -5226,5 +5325,66 @@ Resolution file
             included_differs,
             "the dip must measurably alter at least one in-window target"
         );
+    }
+
+    #[test]
+    fn piecewise_linear_normalized_branch_pins_delta_and_partial_window() {
+        // Production currently consumes only the non-normalizing
+        // piecewise_linear_bin_masses path; the normalize_support = true
+        // branch has no production caller yet (the tabulated detector-bin
+        // operator adopts it next). These pins fix its semantics ahead of
+        // that consumer.
+        let delta = |t: f64, edges: &[f64]| {
+            piecewise_linear_bin_integrals(&[t], &[3.5], edges, true)
+                .expect("one-point kernel is a unit delta under normalization")
+        };
+        assert_eq!(delta(2.0, &[0.0, 1.0, 3.0, 5.0]), vec![0.0, 1.0, 0.0]);
+        // The last bin is right-closed: a delta exactly on the final edge
+        // belongs to it.
+        assert_eq!(delta(5.0, &[0.0, 1.0, 3.0, 5.0]), vec![0.0, 0.0, 1.0]);
+        // A delta outside every bin contributes nothing.
+        assert_eq!(delta(9.0, &[0.0, 1.0, 3.0, 5.0]), vec![0.0, 0.0, 0.0]);
+        // A one-point kernel without a defined width is rejected in the
+        // density (masses) mode.
+        assert!(piecewise_linear_bin_integrals(&[2.0], &[3.5], &[0.0, 5.0], false).is_none());
+        // Non-strictly-increasing or non-finite coordinates are rejected in
+        // both modes: a zero-width segment would put ±inf/NaN into the CDF
+        // slope, and a NaN time passes monotonicity (every NaN comparison is
+        // false) only to underflow the CDF's partition_point index.
+        let w3 = [0.0, 1.0, 0.0];
+        for mode in [true, false] {
+            assert!(
+                piecewise_linear_bin_integrals(
+                    &[0.0, 1.0, 1.0, 2.0],
+                    &[0.0, 1.0, 1.0, 0.0],
+                    &[0.5, 1.5],
+                    mode
+                )
+                .is_none()
+            );
+            for bad_times in [[0.0, f64::NAN, 2.0], [0.0, 1.0, f64::INFINITY]] {
+                assert!(
+                    piecewise_linear_bin_integrals(&bad_times, &w3, &[0.5, 1.5], mode).is_none()
+                );
+            }
+            for bad_edges in [[0.5, f64::NAN], [1.5, 0.5]] {
+                assert!(
+                    piecewise_linear_bin_integrals(&[0.0, 1.0, 2.0], &w3, &bad_edges, mode)
+                        .is_none()
+                );
+            }
+        }
+
+        // Support normalization: a triangle on [0, 2] integrates to one over
+        // its full support, and a partial window reports the true fraction.
+        let times = [0.0, 1.0, 2.0];
+        let weights = [0.0, 4.0, 0.0]; // arbitrary scale — normalization removes it
+        let full = piecewise_linear_bin_integrals(&times, &weights, &[0.0, 2.0], true)
+            .expect("triangle integrates");
+        assert!((full[0] - 1.0).abs() < 1e-15);
+        let halves = piecewise_linear_bin_integrals(&times, &weights, &[0.0, 0.5, 1.0], true)
+            .expect("triangle integrates");
+        assert!((halves[0] - 0.125).abs() < 1e-15);
+        assert!((halves[1] - 0.375).abs() < 1e-15);
     }
 }
