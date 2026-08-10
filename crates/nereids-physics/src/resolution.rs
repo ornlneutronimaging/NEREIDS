@@ -912,8 +912,15 @@ fn piecewise_linear_bin_integrals(
     }
     // A duplicated (or decreasing) time gives a zero-width segment whose
     // slope is ±inf/NaN inside the CDF interpolation when an edge lands
-    // there; mirror the strictly-increasing edge validation instead.
-    if times.windows(2).any(|w| w[1] <= w[0]) {
+    // there — and a NaN time passes a pure monotonicity check (every NaN
+    // comparison is false) only to underflow `hi - 1` in the CDF closure
+    // (`partition_point` returns 0 when the first predicate is false).
+    // Validate finiteness and strict ordering of BOTH coordinate arrays up
+    // front; NaN weights are caught downstream by the total-mass check.
+    if times.iter().any(|t| !t.is_finite()) || times.windows(2).any(|w| w[1] <= w[0]) {
+        return None;
+    }
+    if edges.iter().any(|e| !e.is_finite()) || edges.windows(2).any(|w| w[1] <= w[0]) {
         return None;
     }
 
@@ -5340,8 +5347,11 @@ Resolution file
         // A one-point kernel without a defined width is rejected in the
         // density (masses) mode.
         assert!(piecewise_linear_bin_integrals(&[2.0], &[3.5], &[0.0, 5.0], false).is_none());
-        // Non-strictly-increasing times are rejected in both modes: a
-        // zero-width segment would otherwise put ±inf/NaN into the CDF slope.
+        // Non-strictly-increasing or non-finite coordinates are rejected in
+        // both modes: a zero-width segment would put ±inf/NaN into the CDF
+        // slope, and a NaN time passes monotonicity (every NaN comparison is
+        // false) only to underflow the CDF's partition_point index.
+        let w3 = [0.0, 1.0, 0.0];
         for mode in [true, false] {
             assert!(
                 piecewise_linear_bin_integrals(
@@ -5352,6 +5362,17 @@ Resolution file
                 )
                 .is_none()
             );
+            for bad_times in [[0.0, f64::NAN, 2.0], [0.0, 1.0, f64::INFINITY]] {
+                assert!(
+                    piecewise_linear_bin_integrals(&bad_times, &w3, &[0.5, 1.5], mode).is_none()
+                );
+            }
+            for bad_edges in [[0.5, f64::NAN], [1.5, 0.5]] {
+                assert!(
+                    piecewise_linear_bin_integrals(&[0.0, 1.0, 2.0], &w3, &bad_edges, mode)
+                        .is_none()
+                );
+            }
         }
 
         // Support normalization: a triangle on [0, 2] integrates to one over
