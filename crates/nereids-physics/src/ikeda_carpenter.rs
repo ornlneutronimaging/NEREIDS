@@ -329,8 +329,9 @@ pub fn ic_pulse(alpha: f64, beta: f64, r: f64, tau: f64) -> f64 {
 /// when `α ≈ β`. This is the bin-integral companion to [`ic_pulse`].
 ///
 /// Domain contract: non-finite `alpha`, `beta`, or `r` returns NaN so garbage
-/// in stays visible; finite non-positive rates are floored to [`MIN_RATE`]
-/// and `r <= 0` disables the storage term, matching [`ic_pulse`]. A NaN `tau`
+/// in stays visible; finite non-positive rates are floored to `MIN_RATE`
+/// (1e-9 µs⁻¹) and `r <= 0` disables the storage term, matching
+/// [`ic_pulse`]. A NaN `tau`
 /// returns 0 — `tau` is the integration coordinate, not a parameter, and a
 /// non-arriving coordinate contributes no mass.
 #[must_use]
