@@ -177,7 +177,7 @@ jobs:
       # per-tool tags (e.g. `cargo-llvm-cov`): those are orphan commits on
       # no branch, and Dependabot's github_actions updater hard-errors on
       # them ("no such commit"), killing the whole update run.
-      - uses: taiki-e/install-action@cb33e69fad06166ca28a42b2575e4dadabf62ee8 # v2.85.8
+      - uses: taiki-e/install-action@7f4eb899022d8fe70b20c4f3de697aa85c309026 # v2.85.11
         with:
           tool: cargo-llvm-cov
       - name: Generate coverage
