@@ -1158,13 +1158,38 @@ pub fn poisson_fit(
 /// end users, which is precisely why the production path no longer
 /// uses this struct).
 ///
+/// ## Physical count-response contract
+///
+/// This low-level wrapper cannot inspect `transmission_model` to determine how
+/// instrument resolution was applied.  Its output must already be the
+/// physically valid effective sample/open count response.  With response
+/// operator `R` and incident spectrum `Φ`, the required ratio is
+///
+/// ```text
+/// T_eff = R[Φ · T] / R[Φ].
+/// ```
+///
+/// A post-hoc broadened transmission `R[T]` is not a valid substitute and
+/// must never be wrapped here as though it were.  In particular, do not
+/// directly wrap a resolution-bearing
+/// [`TransmissionFitModel`](crate::transmission_model::TransmissionFitModel),
+/// because that model returns `R[T]`.  An ordinary transmission is valid when
+/// resolution is disabled, and a custom inner model that already returns the
+/// exact effective ratio is also valid.  Otherwise, model the open and sample
+/// response arms separately or call the guarded pipeline, which rejects
+/// unsupported counts-plus-resolution combinations.  When resolution is
+/// active, `flux` must be the matching resolved open-arm response `R[Φ]`.
+///
 /// The `flux` and `background` slices must have the same length as the
 /// transmission vector returned by the inner model.  In debug builds,
 /// `evaluate()` asserts this invariant.
 pub struct CountsModel<'a> {
-    /// Underlying transmission model.
+    /// Underlying effective count-ratio model.
+    ///
+    /// See the struct-level physical count-response contract.  In particular,
+    /// this must not be a post-hoc broadened transmission `R[T]`.
     pub transmission_model: &'a dyn FitModel,
-    /// Incident flux (counts per bin in open beam, after normalization).
+    /// Open-arm flux response (counts per bin, after normalization).
     pub flux: &'a [f64],
     /// Background counts per bin.
     pub background: &'a [f64],
@@ -1255,11 +1280,27 @@ impl<'a> crate::forward_model::ForwardModel for CountsModel<'a> {
 /// `evaluate_jacobian_and_fisher` (Epic #394 spatial-regularization
 /// prototype) and from this module's `#[cfg(test)]` tests.
 ///
-/// Given a transmission model `T(θ)`, predicts:
+/// Given an effective count-ratio model `T_eff(θ)`, predicts:
 ///
-///   Y(E) = α₁ · [Φ(E) · T(θ)] + α₂ · B(E)
+///   Y(E) = α₁ · [F_open(E) · T_eff(θ)] + α₂ · B(E)
 ///
-/// where `α₁` and `α₂` are parameter-vector entries.
+/// where `F_open` is the observed open-arm count response and `α₁` and
+/// `α₂` are parameter-vector entries.
+///
+/// ## Physical count-response contract
+///
+/// This low-level wrapper cannot inspect `transmission_model` to determine how
+/// instrument resolution was applied.  The inner model must already return
+/// the physically valid effective sample/open count response
+/// `R[Φ · T] / R[Φ]`.  It must never return a post-hoc broadened
+/// transmission `R[T]` as a substitute.  In particular, do not directly wrap
+/// a resolution-bearing
+/// [`TransmissionFitModel`](crate::transmission_model::TransmissionFitModel),
+/// because that model returns `R[T]`.  No-resolution models and custom models
+/// that already compute the exact effective ratio remain valid.  Otherwise,
+/// model the two response arms separately or call the guarded pipeline, which
+/// rejects unsupported counts-plus-resolution combinations.  When resolution
+/// is active, `flux` must be the matching resolved open-arm response `R[Φ]`.
 ///
 /// ## Index invariant
 ///
@@ -1272,9 +1313,12 @@ impl<'a> crate::forward_model::ForwardModel for CountsModel<'a> {
 /// `alpha1_index == alpha2_index`, IS supported: the columns
 /// accumulate.)
 pub struct CountsBackgroundScaleModel<'a> {
-    /// Underlying transmission model.
+    /// Underlying effective count-ratio model.
+    ///
+    /// See the struct-level physical count-response contract.  In particular,
+    /// this must not be a post-hoc broadened transmission `R[T]`.
     pub transmission_model: &'a dyn FitModel,
-    /// Incident flux spectrum.
+    /// Open-arm flux response.
     pub flux: &'a [f64],
     /// Detector background spectrum.
     pub background: &'a [f64],

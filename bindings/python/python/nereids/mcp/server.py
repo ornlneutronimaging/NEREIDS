@@ -33,6 +33,13 @@ _MANIFEST_NAMES = (
     "nereids_mcp.json",
     "analysis.json",
 )
+_COUNTS_RESOLUTION_UNSUPPORTED = (
+    "counts input with instrument resolution is unsupported: the current counts "
+    "path broadens transmission as R[T], but the physical detector model requires "
+    "separate open/sample response arms R[Phi] and R[Phi*T]. Supply pre-normalized "
+    "transmission, or disable instrument resolution until an exact counts response "
+    "is implemented."
+)
 _SAFE_KEY = re.compile(r"[^A-Za-z0-9_]+")
 
 
@@ -1145,16 +1152,33 @@ def _validate_workflow(manifest: dict[str, Any]) -> dict[str, Any]:
             errors.append(f"isotope entry is missing isotope/z/a/endf_file: {entry}")
 
     resolution = config.get("resolution")
+    resolution_kind: str | None = None
     if isinstance(resolution, dict):
-        kind = _normalise_kind(resolution.get("kind", "none"), "none")
-        if kind in {"tabulated", "file", "resolution_file"}:
+        resolution_kind = _normalise_kind(resolution.get("kind", "none"), "none")
+        if resolution_kind in {"tabulated", "file", "resolution_file"}:
             path = _resolve_path(base, resolution.get("path"))
             if path is None or not path.exists():
                 errors.append(f"resolution file does not exist: {path}")
-        if kind in {"none", "disabled", "false"}:
+        if resolution_kind in {"none", "disabled", "false"}:
             warnings.append("resolution disabled; appropriate for synthetic data")
+    elif isinstance(resolution, str):
+        resolution_kind = _normalise_kind(resolution, "none")
     elif resolution is None and mode in {"density_map", "spatial_map"}:
         warnings.append("no resolution configured; OK for synthetic/demo data")
+
+    # Raw count inputs need two separately broadened response arms:
+    # R[Phi] for the open beam and R[Phi*T] for the sample.  The current
+    # fitting API only has R[T], so approving this manifest would make a
+    # dry run disagree with the production pipeline's fail-closed gate.
+    counts_input = effective_kind in {
+        "counts_npz",
+        "counts",
+        "nexus_histogram",
+        "nexus",
+    }
+    resolution_active = resolution_kind not in {None, "none", "disabled", "false"}
+    if counts_input and resolution_active:
+        errors.append(_COUNTS_RESOLUTION_UNSUPPORTED)
 
     return {
         "valid": not errors,

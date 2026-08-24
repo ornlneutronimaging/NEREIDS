@@ -54,6 +54,7 @@ winit = { version = "0.30", default-features = false, features = ["wayland-dlope
 
 [dev-dependencies]
 tempfile = { workspace = true }
+nereids-endf = { workspace = true, features = ["test-support"] }
 
 # macOS app bundle configuration for cargo-bundle
 [package.metadata.bundle]

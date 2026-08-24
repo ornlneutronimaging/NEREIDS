@@ -174,8 +174,15 @@ fn ensure_selected_pixel(state: &mut AppState) {
 
 // ---- Fit Controls ----
 
+fn invalidate_if_solver_method_changed(state: &mut AppState, previous: SolverMethod) {
+    if state.solver_method != previous {
+        state.invalidate_analysis_outputs();
+    }
+}
+
 fn fit_controls(ui: &mut egui::Ui, state: &mut AppState, available_height_hint: f32) {
     // -- Solver configuration --
+    let prev_solver_method = state.solver_method;
     let method_text = match state.solver_method {
         SolverMethod::LevenbergMarquardt => "Levenberg-Marquardt",
         SolverMethod::PoissonKL => "Poisson KL",
@@ -212,6 +219,7 @@ fn fit_controls(ui: &mut egui::Ui, state: &mut AppState, available_height_hint: 
         ui.horizontal(|ui| draw_method(ui, state));
         ui.horizontal(|ui| draw_max_iter(ui, state));
     }
+    invalidate_if_solver_method_changed(state, prev_solver_method);
 
     // Advanced solver controls (collapsible)
     let auto_show_advanced = available_height_hint > 300.0;
@@ -1090,11 +1098,7 @@ fn apply_roi_editor_result(state: &mut AppState, result: RoiEditorResult) {
 
 /// Clear downstream fit results when ROI changes.
 fn clear_analyze_downstream(state: &mut AppState) {
-    state.pixel_fit_result = None;
-    state.spatial_result = None;
-    state.last_fit_feedback = None;
-    state.fitting_rois.clear();
-    state.show_analyze_fit_info = false;
+    state.invalidate_analysis_outputs();
 }
 
 // ---- Spectrum Panel (Column 3) ----
@@ -1469,40 +1473,54 @@ fn spectrum_panel(ui: &mut egui::Ui, state: &mut AppState) {
     // and the SAMMY 6-term background polynomial
     // (BackA + BackB/√E + BackC·√E + BackD·exp(-BackF/√E)) before
     // multiplying by the counts scale, so the overlay reflects the
-    // full forward model the solver fit — not just bare T·c·OB.
+    // full forward model the solver fit — not just bare T·c·OB.  That
+    // reconstruction is disabled below when resolution is active because
+    // c·OB·R[T] is not the required two-arm count response.
     let fit_result_for_overlay = match selection {
         SpectrumSelection::Pixel { y, x } => selected_pixel_fit_result_for_overlay(state, y, x),
         SpectrumSelection::Roi { .. } => state.pixel_fit_result.clone(),
     };
-    let fit_line = fit_result_for_overlay.as_ref().and_then(|result| {
-        let energies = state.energies.as_ref()?;
-        let (all_rd, density_indices, density_ratios) =
-            design::collect_all_resonance_data_with_mapping(state);
-        let instrument = design::build_resolution_function(
-            state.resolution_enabled,
-            &state.resolution_mode,
-            state.beamline.flight_path_m,
-        )
-        .ok()
-        .flatten()
-        .map(|r| Arc::new(nereids_physics::transmission::InstrumentParams { resolution: r }));
-        design::build_fit_line(&design::FitLineParams {
-            result,
-            resonance_data: &all_rd,
-            density_indices: &density_indices,
-            density_ratios: &density_ratios,
-            energies,
-            temperature_k: state.temperature_k,
-            x_values: &x_values,
-            n_plot,
-            instrument,
-            y_multiplier: if show_counts {
-                Some(&counts_scale)
-            } else {
-                None
-            },
+    let count_resolution_overlay_unsupported =
+        design::counts_resolution_overlay_unsupported(show_counts, state.resolution_enabled);
+    if count_resolution_overlay_unsupported {
+        ui.colored_label(
+            crate::theme::semantic::ORANGE,
+            design::COUNTS_RESOLUTION_OVERLAY_MESSAGE,
+        );
+    }
+    let fit_line = if count_resolution_overlay_unsupported {
+        None
+    } else {
+        fit_result_for_overlay.as_ref().and_then(|result| {
+            let energies = state.energies.as_ref()?;
+            let (all_rd, density_indices, density_ratios) =
+                design::collect_all_resonance_data_with_mapping(state);
+            let instrument = design::build_resolution_function(
+                state.resolution_enabled,
+                &state.resolution_mode,
+                state.beamline.flight_path_m,
+            )
+            .ok()
+            .flatten()
+            .map(|r| Arc::new(nereids_physics::transmission::InstrumentParams { resolution: r }));
+            design::build_fit_line(&design::FitLineParams {
+                result,
+                resonance_data: &all_rd,
+                density_indices: &density_indices,
+                density_ratios: &density_ratios,
+                energies,
+                temperature_k: state.temperature_k,
+                x_values: &x_values,
+                n_plot,
+                instrument,
+                y_multiplier: if show_counts {
+                    Some(&counts_scale)
+                } else {
+                    None
+                },
+            })
         })
-    });
+    };
 
     // TOF position marker x-value
     let tof_marker_x = x_values
@@ -2339,7 +2357,10 @@ fn build_fit_config(state: &AppState) -> Result<(UnifiedFitConfig, Range<usize>)
 }
 
 fn fit_pixel(state: &mut AppState) {
-    state.last_fit_feedback = None;
+    // A new attempt owns the pixel/ROI result slot immediately.  Clear the
+    // previous fit before validation so every early return and solver error
+    // leaves no stale curve or fit-details payload behind.
+    state.clear_pixel_fit_output();
 
     let (config, energy_range) = match build_fit_config(state) {
         Ok(c) => c,
@@ -2489,7 +2510,9 @@ fn fit_pixel(state: &mut AppState) {
 }
 
 fn fit_roi(state: &mut AppState) {
-    state.last_fit_feedback = None;
+    // Pixel and ROI fits share `pixel_fit_result`; claim the slot before any
+    // validation so a rejected ROI run cannot fall back to the previous one.
+    state.clear_pixel_fit_output();
 
     let (config, energy_range) = match build_fit_config(state) {
         Ok(c) => c,
@@ -2684,6 +2707,9 @@ fn fit_roi(state: &mut AppState) {
 }
 
 pub fn run_spatial_map(state: &mut AppState) {
+    // Results/export must stop seeing the previous map as soon as a new run is
+    // requested, including when config validation or the worker later fails.
+    state.clear_spatial_fit_output();
     state.last_fit_feedback = None;
 
     let (config, energy_range) = match build_fit_config(state) {
@@ -2852,4 +2878,180 @@ pub fn run_spatial_map(state: &mut AppState) {
             }
         }
     });
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::state::{EndfStatus, ResolutionMode};
+    use ndarray::{Array2, Array3};
+    use nereids_endf::resonance::test_support::synthetic_single_resonance;
+    use nereids_io::normalization::NormalizedData;
+    use nereids_pipeline::spatial::SpatialResult;
+    use std::time::Duration;
+
+    fn stale_spectrum_result() -> SpectrumFitResult {
+        SpectrumFitResult {
+            densities: vec![9.9],
+            uncertainties: Some(vec![0.1]),
+            reduced_chi_squared: 1.0,
+            converged: true,
+            iterations: 1,
+            temperature_k: None,
+            temperature_k_unc: None,
+            anorm: 1.0,
+            background: [0.0; 3],
+            back_d: None,
+            back_f: None,
+            t0_us: None,
+            l_scale: None,
+            energy_scale_flight_path_m: None,
+            deviance_per_dof: None,
+            baseline: None,
+            baseline_e_ref_ev: None,
+            warnings: Vec::new(),
+        }
+    }
+
+    fn stale_spatial_result() -> SpatialResult {
+        let map = || Array2::from_elem((1, 1), 9.9);
+        SpatialResult {
+            density_maps: vec![map()],
+            uncertainty_maps: vec![map()],
+            chi_squared_map: map(),
+            deviance_per_dof_map: None,
+            converged_map: Array2::from_elem((1, 1), true),
+            temperature_map: None,
+            temperature_uncertainty_map: None,
+            isotope_labels: vec!["U-238".into()],
+            anorm_map: None,
+            background_maps: None,
+            back_d_map: None,
+            back_f_map: None,
+            t0_us_map: None,
+            l_scale_map: None,
+            energy_scale_flight_path_m: None,
+            baseline_global: None,
+            baseline_e_ref_ev: None,
+            baseline_maps: None,
+            warnings: Vec::new(),
+            n_converged: 1,
+            n_total: 1,
+            n_failed: 0,
+        }
+    }
+
+    fn rejected_counts_resolution_state() -> AppState {
+        let n = 32;
+        let sample = Arc::new(Array3::from_elem((n, 1, 1), 900.0));
+        let open_beam = Arc::new(Array3::from_elem((n, 1, 1), 1000.0));
+        let normalized = Arc::new(NormalizedData {
+            transmission: Array3::from_elem((n, 1, 1), 0.9),
+            uncertainty: Array3::from_elem((n, 1, 1), 0.02),
+        });
+        AppState {
+            sample_data: Some(sample),
+            open_beam_data: Some(open_beam),
+            normalized: Some(normalized),
+            energies: Some((1..=n).map(|i| i as f64).collect()),
+            isotope_entries: vec![IsotopeEntry {
+                z: 92,
+                a: 238,
+                symbol: "U-238".into(),
+                initial_density: 0.001,
+                resonance_data: Some(synthetic_single_resonance(92, 238, 236.0, 7.0)),
+                enabled: true,
+                endf_status: EndfStatus::Loaded,
+            }],
+            resolution_enabled: true,
+            resolution_mode: ResolutionMode::Gaussian {
+                delta_t_us: 1.0,
+                delta_l_m: 0.01,
+            },
+            solver_method: SolverMethod::PoissonKL,
+            selected_pixel: Some((0, 0)),
+            rois: vec![RoiSelection {
+                y_start: 0,
+                y_end: 1,
+                x_start: 0,
+                x_end: 1,
+            }],
+            ..Default::default()
+        }
+    }
+
+    #[test]
+    fn solver_method_change_clears_fit_outputs_but_preserves_inputs() {
+        let mut state = rejected_counts_resolution_state();
+        state.pixel_fit_result = Some(stale_spectrum_result());
+        state.spatial_result = Some(stale_spatial_result());
+        state.export_status = Some("old export".into());
+        state.is_fetching_endf = true;
+        let unrelated_cancel_token = Arc::clone(&state.cancel_token);
+        let previous = state.solver_method;
+        state.solver_method = SolverMethod::LevenbergMarquardt;
+
+        invalidate_if_solver_method_changed(&mut state, previous);
+
+        assert!(state.pixel_fit_result.is_none());
+        assert!(state.spatial_result.is_none());
+        assert!(state.export_status.is_none());
+        assert!(state.normalized.is_some());
+        assert!(state.sample_data.is_some());
+        assert!(state.open_beam_data.is_some());
+        assert!(state.energies.is_some());
+        assert_eq!(state.selected_pixel, Some((0, 0)));
+        assert_eq!(state.rois.len(), 1);
+        assert!(state.is_fetching_endf);
+        assert!(Arc::ptr_eq(&state.cancel_token, &unrelated_cancel_token));
+    }
+
+    #[test]
+    fn rejected_counts_resolution_pixel_and_roi_clear_stale_result() {
+        let mut pixel_state = rejected_counts_resolution_state();
+        pixel_state.pixel_fit_result = Some(stale_spectrum_result());
+        fit_pixel(&mut pixel_state);
+        assert!(pixel_state.pixel_fit_result.is_none());
+        assert!(
+            pixel_state
+                .last_fit_feedback
+                .as_ref()
+                .is_some_and(|f| f.summary.contains("separate open/sample response arms"))
+        );
+
+        let mut roi_state = rejected_counts_resolution_state();
+        roi_state.pixel_fit_result = Some(stale_spectrum_result());
+        fit_roi(&mut roi_state);
+        assert!(roi_state.pixel_fit_result.is_none());
+        assert!(
+            roi_state
+                .last_fit_feedback
+                .as_ref()
+                .is_some_and(|f| f.summary.contains("separate open/sample response arms"))
+        );
+    }
+
+    #[test]
+    fn rejected_counts_resolution_spatial_attempt_clears_stale_map() {
+        let mut state = rejected_counts_resolution_state();
+        state.spatial_result = Some(stale_spatial_result());
+        state.export_status = Some("old export".into());
+
+        run_spatial_map(&mut state);
+
+        assert!(state.spatial_result.is_none());
+        assert!(state.export_status.is_none());
+        let rx = state
+            .pending_spatial
+            .take()
+            .expect("rejected spatial run should still report its worker error");
+        let err = rx
+            .recv_timeout(Duration::from_secs(2))
+            .expect("spatial worker should reject counts plus resolution")
+            .expect_err("counts plus resolution must fail closed");
+        assert!(err.contains("separate open/sample response arms"), "{err}");
+        assert!(state.normalized.is_some());
+        assert_eq!(state.selected_pixel, Some((0, 0)));
+        assert_eq!(state.rois.len(), 1);
+    }
 }
