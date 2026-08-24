@@ -349,6 +349,20 @@ class TabulatedResolution:
         """Number of points per kernel."""
         ...
 
+    def detector_bin_probabilities(
+        self,
+        true_energy_ev: float,
+        detector_time_edges_us: list[float],
+        timing_offset_us: float,
+    ) -> list[float]:
+        """Probability in each adjacent detector-time bin.
+
+        The loaded tabulated response is evaluated at ``true_energy_ev``.
+        Probability outside the supplied time window is not renormalized into
+        the window.
+        """
+        ...
+
 class EnergyLaw:
     """Energy-dependence law for an Ikeda-Carpenter parameter.
 
@@ -981,6 +995,27 @@ def apply_resolution(
     resolution: TabulatedResolution,
 ) -> NDArray[np.float64]:
     """Apply tabulated resolution broadening to a spectrum."""
+    ...
+
+def two_arm_count_response(
+    true_energies_ev: NDArray[np.float64],
+    incident_fluence_weights: NDArray[np.float64],
+    transmission: NDArray[np.float64],
+    detector_time_edges_us: NDArray[np.float64],
+    resolution: TabulatedResolution | IkedaCarpenter,
+    timing_offset_us: float = 0.0,
+) -> tuple[NDArray[np.float64], NDArray[np.float64], float, float]:
+    """Predict open-beam and sample counts on detector-time bins.
+
+    ``incident_fluence_weights[j]`` is the incident flux density at true
+    energy ``j`` times detector efficiency times the caller's
+    energy-integration weight (the discrete form of the contract's
+    ``Phi * epsilon``). The validated response is applied to the open and
+    attenuated sample arms separately. Probability outside the supplied
+    acquisition window is not renormalized into that window; the last two
+    return values quantify the expected open-beam and sample counts lost
+    outside it.
+    """
     ...
 
 def load_tiff_stack(
