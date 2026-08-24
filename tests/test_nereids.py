@@ -631,6 +631,149 @@ class TestTabulatedKernelOrientation:
         )
 
 
+class TestTabulatedDetectorBins:
+    """The public tabulated-response API integrates the loaded UDR directly
+    into measured detector-time bins."""
+
+    TOF_FACTOR = 72.298254398292800
+    L = 25.0
+
+    @staticmethod
+    def _write_kernel(path):
+        path.write_text(
+            "\n".join(
+                [
+                    "synthetic asymmetric triangular response",
+                    "-----",
+                    "   2.50000e+001   0.00000e+000",
+                    "-1.0 0.0",
+                    "0.0 1.0",
+                    "2.0 0.0",
+                    "",
+                ]
+            )
+        )
+
+    def test_exact_bin_probabilities_without_window_renormalization(self, tmp_path):
+        kernel_path = tmp_path / "synthetic_exact_bins.txt"
+        self._write_kernel(kernel_path)
+        response = nereids.load_resolution(str(kernel_path), self.L)
+        arrival = self.TOF_FACTOR * self.L / np.sqrt(25.0)
+
+        probabilities = np.asarray(
+            response.detector_bin_probabilities(
+                25.0,
+                [arrival - 2.0, arrival - 1.0, arrival, arrival + 1.0],
+                0.0,
+            )
+        )
+
+        np.testing.assert_allclose(probabilities, [0.0, 1.0 / 3.0, 1.0 / 2.0])
+        assert probabilities.sum() == pytest.approx(5.0 / 6.0)
+
+    def test_invalid_flight_path_is_rejected_when_loading(self, tmp_path):
+        kernel_path = tmp_path / "synthetic_invalid_path.txt"
+        self._write_kernel(kernel_path)
+
+        with pytest.raises(ValueError, match="flight_path"):
+            nereids.load_resolution(str(kernel_path), float("nan"))
+
+
+class TestTwoArmCountResponse:
+    """The public operator keeps the open and sample detector arms separate."""
+
+    TOF_FACTOR = 72.298254398292800
+    L = 25.0
+
+    @staticmethod
+    def _write_triangle(path):
+        path.write_text(
+            "\n".join(
+                [
+                    "synthetic one-microsecond triangle",
+                    "-----",
+                    "   2.50000e+001   0.00000e+000",
+                    "-1.0 0.0",
+                    "0.0 1.0",
+                    "1.0 0.0",
+                    "",
+                ]
+            )
+        )
+
+    def test_public_tabulated_operator_integrates_two_true_energies(self, tmp_path):
+        kernel_path = tmp_path / "two_arm_triangle.txt"
+        self._write_triangle(kernel_path)
+        response = nereids.load_resolution(str(kernel_path), self.L)
+        arrival_0 = self.TOF_FACTOR * self.L / np.sqrt(25.0)
+        energy_1 = (self.TOF_FACTOR * self.L / (arrival_0 + 1.0)) ** 2
+
+        open_beam, sample, open_loss, sample_loss = nereids.two_arm_count_response(
+            np.array([25.0, energy_1]),
+            np.array([100.0, 200.0]),
+            np.array([0.2, 0.8]),
+            np.array(
+                [arrival_0 - 1.0, arrival_0, arrival_0 + 1.0, arrival_0 + 2.0]
+            ),
+            response,
+        )
+
+        np.testing.assert_allclose(open_beam, [50.0, 150.0, 100.0], atol=2e-11)
+        np.testing.assert_allclose(sample, [10.0, 90.0, 80.0], atol=2e-11)
+        # Both pulses lie fully inside the window: the quantified
+        # acquisition-window loss report is (numerically) zero counts.
+        assert open_loss == pytest.approx(0.0, abs=2e-11)
+        assert sample_loss == pytest.approx(0.0, abs=2e-11)
+
+    def test_window_loss_is_reported_not_renormalized(self, tmp_path):
+        kernel_path = tmp_path / "two_arm_truncated.txt"
+        self._write_triangle(kernel_path)
+        response = nereids.load_resolution(str(kernel_path), self.L)
+        arrival = self.TOF_FACTOR * self.L / np.sqrt(25.0)
+
+        open_beam, sample, open_loss, sample_loss = nereids.two_arm_count_response(
+            np.array([25.0]),
+            np.array([100.0]),
+            np.array([0.4]),
+            np.array([arrival, arrival + 1.0]),
+            response,
+        )
+
+        # Half of the pulse falls before the window start: the in-window
+        # expectation stays un-renormalized and the lost counts are reported.
+        np.testing.assert_allclose(open_beam, [50.0], atol=1e-12)
+        np.testing.assert_allclose(sample, [20.0], atol=1e-12)
+        assert open_loss == pytest.approx(50.0, abs=1e-12)
+        assert sample_loss == pytest.approx(20.0, abs=1e-12)
+
+    def test_public_operator_accepts_analytical_ic_without_conversion(self):
+        ic = nereids.IkedaCarpenter(
+            flight_path_m=self.L,
+            e_min_ev=20.0,
+            e_max_ev=30.0,
+            alpha=nereids.EnergyLaw.const(1.2),
+            beta=0.2,
+            r=nereids.EnergyLaw.const(0.25),
+        )
+        arrival = self.TOF_FACTOR * self.L / np.sqrt(25.0)
+        edges = np.array([arrival, arrival + 1.0, arrival + 5.0, arrival + 20.0])
+        probabilities = np.asarray(ic.detector_bin_probabilities(25.0, edges, 0.0))
+
+        open_beam, sample, open_loss, sample_loss = nereids.two_arm_count_response(
+            np.array([25.0]),
+            np.array([80.0]),
+            np.array([0.5]),
+            edges,
+            ic,
+        )
+
+        np.testing.assert_allclose(open_beam, 80.0 * probabilities, atol=2e-12)
+        np.testing.assert_allclose(sample, 40.0 * probabilities, atol=2e-12)
+        outside = 1.0 - probabilities.sum()
+        assert open_loss == pytest.approx(80.0 * outside, abs=2e-12)
+        assert sample_loss == pytest.approx(40.0 * outside, abs=2e-12)
+
+
 class TestTabulatedKernelWidthInterpolation:
     """Regression for issue #632: kernel width between reference energies
     must follow the physical power law, not the arithmetic blend chord.

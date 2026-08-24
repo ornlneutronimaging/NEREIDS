@@ -981,6 +981,22 @@ fn piecewise_linear_bin_integrals(
     )
 }
 
+/// Integrate a sampled probability distribution into adjacent requested
+/// edges. A one-point kernel is treated as a delta mass at that point; longer
+/// kernels are piecewise-linear densities.
+///
+/// The density is normalized over its complete supplied support. The result
+/// is deliberately not renormalized to `edges`: a requested detector window
+/// that covers only part of the supplied pulse therefore sums to less than
+/// one.
+pub(crate) fn piecewise_linear_bin_probabilities(
+    times: &[f64],
+    weights: &[f64],
+    edges: &[f64],
+) -> Option<Vec<f64>> {
+    piecewise_linear_bin_integrals(times, weights, edges, true)
+}
+
 /// Integrate a sampled density without changing its physical mass scale.
 ///
 /// This is used by analytical responses whose source density is already in
@@ -1009,6 +1025,69 @@ impl TabulatedResolution {
     /// Flight path length in meters (needed for TOF↔energy conversion).
     pub fn flight_path_m(&self) -> f64 {
         self.flight_path_m
+    }
+
+    /// Probability that a neutron of known true energy is recorded in each
+    /// supplied detector-time bin.
+    ///
+    /// The tabulated pulse is selected and interpolated at `true_energy_ev`.
+    /// Its offsets are relative to the reference pulse mode, so the nominal
+    /// arrival is `timing_offset_us + TOF_FACTOR * flight_path_m / sqrt(E)`.
+    /// `timing_offset_us` is the effective clock/energy-axis offset calibrated
+    /// for the measurement; this method does not invent an absolute moderator
+    /// emission time that is absent from a mode-centred UDR file.
+    ///
+    /// The returned vector has one entry per adjacent edge pair and is not
+    /// renormalized to the supplied window.  Probability outside the measured
+    /// window remains outside it; the quantified acquisition-window loss at
+    /// this energy is one minus the sum of the returned vector (the
+    /// pipeline-map contract's R5·7 window-loss disclosure).
+    ///
+    /// # Errors
+    /// Returns [`ResolutionParseError::InvalidFormat`] unless the true energy
+    /// is positive and finite, the timing offset is finite, and at least two
+    /// finite bin edges are supplied in strictly increasing order.  It also
+    /// fails if the interpolated tabulated pulse has zero area.
+    pub fn detector_bin_probabilities(
+        &self,
+        true_energy_ev: f64,
+        detector_time_edges_us: &[f64],
+        timing_offset_us: f64,
+    ) -> Result<Vec<f64>, ResolutionParseError> {
+        if !true_energy_ev.is_finite() || true_energy_ev <= 0.0 {
+            return Err(ResolutionParseError::InvalidFormat(format!(
+                "true energy must be positive and finite, got {true_energy_ev}"
+            )));
+        }
+        if !timing_offset_us.is_finite() {
+            return Err(ResolutionParseError::InvalidFormat(format!(
+                "timing_offset_us must be finite, got {timing_offset_us}"
+            )));
+        }
+        if detector_time_edges_us.len() < 2
+            || detector_time_edges_us.iter().any(|edge| !edge.is_finite())
+            || detector_time_edges_us
+                .windows(2)
+                .any(|edge| edge[0] >= edge[1])
+        {
+            return Err(ResolutionParseError::InvalidFormat(
+                "detector time edges must contain at least two finite, strictly increasing values"
+                    .to_string(),
+            ));
+        }
+
+        let nominal_arrival =
+            timing_offset_us + TOF_FACTOR * self.flight_path_m / true_energy_ev.sqrt();
+        let relative_edges: Vec<f64> = detector_time_edges_us
+            .iter()
+            .map(|edge| edge - nominal_arrival)
+            .collect();
+        let (times, weights) = self.interpolated_kernel(true_energy_ev);
+        piecewise_linear_bin_probabilities(&times, &weights, &relative_edges).ok_or_else(|| {
+            ResolutionParseError::InvalidFormat(format!(
+                "tabulated resolution at E = {true_energy_ev} eV has zero sampled area"
+            ))
+        })
     }
 
     /// Width-corrected copy of this tabulated kernel.
@@ -1272,6 +1351,41 @@ pub enum ResolutionFunction {
     Tabulated(Arc<TabulatedResolution>),
     /// Analytical Ikeda–Carpenter moderator resolution model.
     IkedaCarpenter(Arc<crate::ikeda_carpenter::IkedaCarpenter>),
+}
+
+impl ResolutionFunction {
+    /// Probability that one neutron of known true energy is recorded in each
+    /// supplied detector-time bin.
+    ///
+    /// The tabulated and Ikeda–Carpenter variants are evaluated directly in
+    /// detector time. In particular, the analytical IC variant does not pass
+    /// through its legacy synthesized [`TabulatedResolution`] broadening
+    /// table. The older Gaussian energy-broadening model has no physical
+    /// detector-time probability law and is therefore rejected rather than
+    /// silently treated as one.
+    pub fn detector_bin_probabilities(
+        &self,
+        true_energy_ev: f64,
+        detector_time_edges_us: &[f64],
+        timing_offset_us: f64,
+    ) -> Result<Vec<f64>, ResolutionParseError> {
+        match self {
+            Self::Tabulated(tabulated) => tabulated.detector_bin_probabilities(
+                true_energy_ev,
+                detector_time_edges_us,
+                timing_offset_us,
+            ),
+            Self::IkedaCarpenter(ic) => ic.detector_bin_probabilities(
+                true_energy_ev,
+                detector_time_edges_us,
+                timing_offset_us,
+            ),
+            Self::Gaussian(_) => Err(ResolutionParseError::InvalidFormat(
+                "Gaussian energy broadening cannot produce detector-time bin probabilities; use a validated tabulated or Ikeda–Carpenter time response"
+                    .to_string(),
+            )),
+        }
+    }
 }
 
 /// Pre-built resolution-broadening plan for a specific target energy grid.
@@ -1797,6 +1911,11 @@ impl TabulatedResolution {
     /// * `text` — File contents as a string.
     /// * `flight_path_m` — Flight path length in meters.
     pub fn from_text(text: &str, flight_path_m: f64) -> Result<Self, ResolutionParseError> {
+        if !flight_path_m.is_finite() || flight_path_m <= 0.0 {
+            return Err(ResolutionParseError::InvalidFormat(format!(
+                "Flight path must be positive and finite, got {flight_path_m}"
+            )));
+        }
         let mut lines = text.lines();
 
         // Skip header and separator
@@ -1960,15 +2079,21 @@ impl TabulatedResolution {
     /// offsets/weights.
     ///
     /// # Errors
-    /// Returns [`ResolutionParseError::InvalidFormat`] if the reference
-    /// energies are empty / not strictly ascending, if the energy and kernel
-    /// counts differ, if any kernel is empty, if a kernel's offset and weight
-    /// vectors differ in length, or if any offset/weight is non-finite.
+    /// Returns [`ResolutionParseError::InvalidFormat`] if the flight path is
+    /// not positive and finite, if the reference energies are empty / not
+    /// strictly ascending, if the energy and kernel counts differ, if any
+    /// kernel is empty, if a kernel's offset and weight vectors differ in
+    /// length, or if any offset/weight is non-finite.
     pub fn from_kernels(
         ref_energies: Vec<f64>,
         kernels: Vec<(Vec<f64>, Vec<f64>)>,
         flight_path_m: f64,
     ) -> Result<Self, ResolutionParseError> {
+        if !flight_path_m.is_finite() || flight_path_m <= 0.0 {
+            return Err(ResolutionParseError::InvalidFormat(format!(
+                "Flight path must be positive and finite, got {flight_path_m}"
+            )));
+        }
         if ref_energies.is_empty() {
             return Err(ResolutionParseError::InvalidFormat(
                 "No reference energies provided".into(),
