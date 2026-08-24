@@ -1352,12 +1352,42 @@ impl AppState {
     pub fn invalidate_fit_results(&mut self) {
         self.cancel_pending_tasks();
         self.normalized = None;
+        self.clear_pixel_fit_output();
+        self.clear_spatial_fit_output();
+    }
+
+    /// Clear the cached single-spectrum result before starting a new pixel or
+    /// ROI fit.  Input data, normalization, selection, and spatial-map results
+    /// remain valid and are deliberately preserved.
+    pub fn clear_pixel_fit_output(&mut self) {
         self.pixel_fit_result = None;
         self.residuals_cache = None;
-        self.spatial_result = None;
         self.last_fit_feedback = None;
+        self.show_analyze_fit_info = false;
+    }
+
+    /// Clear the cached map before starting a new spatial fit.  This prevents
+    /// Results and export actions from reusing an older map while the new run
+    /// is pending or after it fails.
+    pub fn clear_spatial_fit_output(&mut self) {
+        self.pending_spatial = None;
+        self.is_fitting = false;
+        self.fitting_progress = None;
+        self.spatial_result = None;
+        self.residuals_cache = None;
         self.fitting_rois.clear();
         self.export_status = None;
+    }
+
+    /// Invalidate all fit outputs after a fit-control change while preserving
+    /// loaded inputs, normalization, energy grid, pixel selection, and ROIs.
+    /// Any in-flight spatial receiver is detached so its old-configuration
+    /// result cannot arrive after the invalidation.  The shared cancellation
+    /// token is deliberately left alone because it also belongs to unrelated
+    /// ENDF, forward-model, and detectability workers.
+    pub fn invalidate_analysis_outputs(&mut self) {
+        self.clear_pixel_fit_output();
+        self.clear_spatial_fit_output();
     }
 
     /// Recompute the effective pixel mask FROM SCRATCH (#646):

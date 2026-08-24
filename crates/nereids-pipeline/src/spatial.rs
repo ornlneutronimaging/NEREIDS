@@ -166,7 +166,8 @@ pub struct SpatialResult {
 use crate::pipeline::{
     InputData, MultiplicativeBaselineConfig, SolverConfig, UnifiedFitConfig, count_free_params,
     degenerate_normalization_warning, fit_spectrum_typed, required_active_bins,
-    validate_multiplicative_baseline, validate_transmission_background,
+    validate_counts_resolution_route, validate_multiplicative_baseline,
+    validate_transmission_background,
 };
 
 /// 3D input data for spatial mapping.
@@ -327,6 +328,10 @@ fn validate_spatial_fit_preflight(
     // `UnifiedFitConfig` but takes the 1D `InputData`; inline the
     // resolution here so we do not have to materialise a 1D stub.
     let is_counts = input.is_counts();
+    // Hoist the scientifically unsupported counts + resolution combination so
+    // it becomes one actionable boundary error, not an all-NaN map after every
+    // per-pixel error is swallowed by the rayon loop.
+    validate_counts_resolution_route(is_counts, config)?;
     let is_kl = matches!(config.solver(), SolverConfig::PoissonKL(_))
         || (matches!(config.solver(), SolverConfig::Auto) && is_counts);
 
@@ -3629,6 +3634,54 @@ mod tests {
             msg.contains("counts-KL") || msg.contains("joint-Poisson"),
             "error must reference the counts-KL incompatibility, got: {msg}"
         );
+    }
+
+    /// Gate 1: spatial count fitting must surface the unsupported response
+    /// model once at the public boundary.  Returning an all-NaN map would hide
+    /// the fact that every pixel tried to use R[T] instead of the physical
+    /// separate-arm response R[Phi*T] / R[Phi].
+    #[test]
+    fn spatial_counts_resolution_requires_exact_count_response() {
+        use nereids_physics::resolution::{ResolutionFunction, ResolutionParams};
+
+        let rd = u238_single_resonance();
+        let energies: Vec<f64> = (0..51).map(|i| 1.0 + (i as f64) * 0.2).collect();
+        let (sample, ob) = synthetic_4x4_counts(&rd, 0.0005, &energies, 1000.0);
+        let flux = Array3::from_elem((energies.len(), 4, 4), 1000.0);
+        let background = Array3::zeros((energies.len(), 4, 4));
+        let config = UnifiedFitConfig::new(
+            energies,
+            vec![rd],
+            vec!["U-238".into()],
+            293.6,
+            Some(ResolutionFunction::Gaussian(
+                ResolutionParams::new(25.0, 0.5, 0.005, 0.0).unwrap(),
+            )),
+            vec![0.001],
+        )
+        .unwrap();
+
+        let inputs = [
+            InputData3D::Counts {
+                sample_counts: sample.view(),
+                open_beam_counts: ob.view(),
+            },
+            InputData3D::CountsWithNuisance {
+                sample_counts: sample.view(),
+                flux: flux.view(),
+                background: background.view(),
+            },
+        ];
+        for input in inputs {
+            let err = spatial_map_typed(&input, &config, None, None, None)
+                .expect_err("spatial counts + resolution must fail at preflight");
+            let msg = err.to_string();
+            assert!(
+                msg.contains("instrument resolution")
+                    && msg.contains("separate open/sample response arms"),
+                "expected physical counts-response rejection, got: {msg}"
+            );
+        }
     }
 
     /// `CountsWithNuisance + LM` is rejected up-front so the caller
