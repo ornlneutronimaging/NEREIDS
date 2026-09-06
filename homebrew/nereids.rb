@@ -14,9 +14,10 @@ cask "nereids" do
 
   app "NEREIDS.app"
 
-  postflight do
-    system_command "/usr/bin/xattr",
-                   args: ["-cr", "#{appdir}/NEREIDS.app"]
+  # The app is not code-signed, so strip the quarantine attribute that would
+  # otherwise make Gatekeeper report it as damaged.
+  postflight_steps do
+    run "/usr/bin/xattr", args: ["-cr", "{{appdir}}/NEREIDS.app"]
   end
 
   zap trash: [
