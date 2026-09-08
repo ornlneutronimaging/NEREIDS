@@ -1030,9 +1030,12 @@ impl TabulatedResolution {
     /// Probability that a neutron of known true energy is recorded in each
     /// supplied detector-time bin.
     ///
-    /// The tabulated pulse is selected and interpolated at `true_energy_ev`.
-    /// Its offsets are relative to the reference pulse mode, so the nominal
-    /// arrival is `timing_offset_us + TOF_FACTOR * flight_path_m / sqrt(E)`.
+    /// The tabulated pulse is selected and interpolated at `true_energy_ev`;
+    /// an energy outside the tabulated reference range uses the nearest
+    /// reference kernel unchanged (the same clamping the broadening path
+    /// applies).  Its offsets are relative to the reference pulse mode, so
+    /// the nominal arrival is
+    /// `timing_offset_us + TOF_FACTOR * flight_path_m / sqrt(E)`.
     /// `timing_offset_us` is the effective clock/energy-axis offset calibrated
     /// for the measurement; this method does not invent an absolute moderator
     /// emission time that is absent from a mode-centred UDR file.
@@ -1085,7 +1088,8 @@ impl TabulatedResolution {
         let (times, weights) = self.interpolated_kernel(true_energy_ev);
         piecewise_linear_bin_probabilities(&times, &weights, &relative_edges).ok_or_else(|| {
             ResolutionParseError::InvalidFormat(format!(
-                "tabulated resolution at E = {true_energy_ev} eV has zero sampled area"
+                "tabulated resolution at E = {true_energy_ev} eV has zero sampled \
+                 area or a degenerate interpolated kernel"
             ))
         })
     }

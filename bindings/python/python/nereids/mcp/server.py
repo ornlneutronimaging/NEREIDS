@@ -1157,12 +1157,6 @@ def _validate_workflow(manifest: dict[str, Any]) -> dict[str, Any]:
     resolution_kind: str | None = None
     if isinstance(resolution, dict):
         resolution_kind = _normalise_kind(resolution.get("kind", "none"), "none")
-        if resolution_kind in {"tabulated", "file", "resolution_file"}:
-            path = _resolve_path(base, resolution.get("path"))
-            if path is None or not path.exists():
-                errors.append(f"resolution file does not exist: {path}")
-        if resolution_kind in {"none", "disabled", "false"}:
-            warnings.append("resolution disabled; appropriate for synthetic data")
     elif isinstance(resolution, str):
         resolution_kind = _normalise_kind(resolution, "none")
     elif resolution is not None:
@@ -1175,6 +1169,34 @@ def _validate_workflow(manifest: dict[str, Any]) -> dict[str, Any]:
         )
     elif mode in {"density_map", "spatial_map"}:
         warnings.append("no resolution configured; OK for synthetic/demo data")
+
+    # Mirror _resolution_kwargs' full contract, kind by kind, so validation
+    # never approves a resolution config the run path rejects (unknown kind,
+    # missing gaussian parameters, missing tabulated path/flight path).
+    if resolution_kind is not None:
+        if resolution_kind in {"none", "disabled", "false"}:
+            warnings.append("resolution disabled; appropriate for synthetic data")
+        elif resolution_kind in {"gaussian", "sammy_gaussian"}:
+            params = resolution if isinstance(resolution, dict) else {}
+            missing = [
+                key
+                for key in ("flight_path_m", "delta_t_us", "delta_l_m")
+                if key not in params
+            ]
+            if missing:
+                errors.append(
+                    "gaussian resolution requires flight_path_m, delta_t_us, "
+                    f"and delta_l_m: missing {', '.join(missing)}"
+                )
+        elif resolution_kind in {"tabulated", "file", "resolution_file"}:
+            params = resolution if isinstance(resolution, dict) else {}
+            path = _resolve_path(base, params.get("path"))
+            if path is None or not path.exists():
+                errors.append(f"resolution file does not exist: {path}")
+            if "flight_path_m" not in params:
+                errors.append("tabulated resolution requires flight_path_m")
+        else:
+            errors.append(f"unknown resolution kind: {resolution_kind}")
 
     # Raw count inputs fitted in the COUNTS DOMAIN need two separately
     # broadened response arms: R[Phi] for the open beam and R[Phi*T] for the
@@ -1203,10 +1225,12 @@ def _validate_workflow(manifest: dict[str, Any]) -> dict[str, Any]:
                 "transmission" if solver == "lm" else "counts",
             )
         ).lower()
-        # Case-sensitive on purpose: the run path routes on
-        # `data_path.suffix == ".npz"`, so `DATA.NPZ` is text-parsed there
-        # and must not be treated as a counts-domain npz here.
-        is_npz = str(data_config.get("path") or "").endswith(".npz")
+        # Byte-identical to the run path's routing check
+        # (`data_path.suffix == ".npz"` on the resolved path): `DATA.NPZ`
+        # or a symlink to a non-npz target is text-parsed there and must
+        # not be treated as a counts-domain npz here.
+        resolved_data_path = _resolve_path(base, data_config.get("path"))
+        is_npz = resolved_data_path is not None and resolved_data_path.suffix == ".npz"
         counts_domain_fit = counts_input and is_npz and fit_domain == "counts"
     else:
         counts_domain_fit = counts_input

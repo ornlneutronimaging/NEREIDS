@@ -446,8 +446,12 @@ pub(crate) fn push_fm_to_config(state: &mut AppState) {
     state.temperature_k = state.fm_temperature_k;
     state.resolution_enabled = state.fm_resolution_enabled;
     state.resolution_mode = state.fm_resolution_mode.clone();
-    state.spatial_result = None;
-    state.pixel_fit_result = None;
+    // Full analysis invalidation, matching the other resolution-change
+    // paths: the pushed isotopes/temperature/resolution obsolete any
+    // in-flight spatial worker (cancelled via its dedicated token) and the
+    // ancillary outputs — a completing old-configuration worker must not
+    // install its map and erase the dirty marker set below.
+    state.invalidate_analysis_outputs();
     // Mark pipeline dirty so the Studio re-run button becomes active.
     state.mark_dirty(GuidedStep::Analyze);
 }
@@ -511,4 +515,45 @@ pub(crate) fn fm_fetch_endf_data(state: &mut AppState) {
 
     tracing::info!(isotopes = work.len(), "spawning ENDF fetch (forward model)");
     std::thread::spawn(move || design::endf_fetch_worker(work, cancel, tx));
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::state::ResolutionMode;
+    use std::sync::Arc;
+    use std::sync::atomic::{AtomicBool, Ordering};
+    use std::sync::mpsc;
+
+    #[test]
+    fn push_fm_to_config_cancels_in_flight_spatial_and_keeps_dirty_marker() {
+        let mut state = AppState {
+            fm_resolution_enabled: true,
+            fm_resolution_mode: ResolutionMode::Gaussian {
+                delta_t_us: 2.0,
+                delta_l_m: 0.02,
+            },
+            ..Default::default()
+        };
+        let in_flight_spatial = Arc::new(AtomicBool::new(false));
+        state.spatial_cancel_token = Some(Arc::clone(&in_flight_spatial));
+        let (_tx, rx) = mpsc::channel();
+        state.pending_spatial = Some(rx);
+
+        push_fm_to_config(&mut state);
+
+        // The pushed settings obsolete the old run: its dedicated token is
+        // cancelled and its receiver detached, so a completing
+        // old-configuration worker can neither install its map nor
+        // clear_dirty() the marker set by the push.
+        assert!(in_flight_spatial.load(Ordering::Relaxed));
+        assert!(state.spatial_cancel_token.is_none());
+        assert!(state.pending_spatial.is_none());
+        assert!(state.resolution_enabled);
+        assert!(matches!(
+            state.resolution_mode,
+            ResolutionMode::Gaussian { delta_t_us, .. } if delta_t_us == 2.0
+        ));
+        assert!(state.dirty_from.is_some());
+    }
 }

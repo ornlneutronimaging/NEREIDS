@@ -882,6 +882,59 @@ class TestManifestWorkflowTools:
             assert validation["valid"] is True, (fit, validation["errors"])
             assert not any("counts input" in error for error in validation["errors"])
 
+    def test_process_runs_counts_manifest_with_resolution_on_transmission_route(
+        self, tmp_path
+    ):
+        # End-to-end anchor for the validate-allows/run-succeeds pair: the
+        # dry-run consistency assertions elsewhere compare two invocations of
+        # the same validator, so only a real run can prove the hand-copied
+        # routing mirror agrees with what execution actually does.
+        energies = np.linspace(1.0, 30.0, 160)
+        true_density = 0.002
+        isotope = _synthetic_u238_data()
+        # Generate with the SAME gaussian resolution the manifest fits with,
+        # so the recovered density is unbiased.
+        transmission = np.asarray(
+            nereids.forward_model(
+                energies,
+                [(isotope, true_density)],
+                flight_path_m=25.0,
+                delta_t_us=1.0,
+                delta_l_m=0.01,
+            )
+        )
+        open_beam = np.full_like(transmission, 100000.0)
+        sample = transmission * open_beam
+        np.savez(
+            tmp_path / "counts.npz",
+            energies_ev=energies,
+            sample_counts=sample,
+            open_beam_counts=open_beam,
+        )
+        _write_json_frontmatter_manifest(
+            tmp_path,
+            {
+                "mode": "single_spectrum",
+                "data": {"kind": "counts_npz", "path": "counts.npz"},
+                "isotopes": [_synthetic_u238_entry(initial_density=0.001)],
+                "fit": {"solver": "lm", "max_iter": 50},
+                "resolution": {
+                    "kind": "gaussian",
+                    "flight_path_m": 25.0,
+                    "delta_t_us": 1.0,
+                    "delta_l_m": 0.01,
+                },
+                "output": {"directory": "output"},
+            },
+        )
+
+        result = process_resonance_dataset(str(tmp_path))
+
+        assert result["success"] is True, result.get("validation", result)
+        fit = result["results"]["density_fits"][0]
+        assert fit["isotope"] == "U-238"
+        assert fit["density_atoms_per_barn"] == pytest.approx(true_density, rel=0.15)
+
     def test_validation_rejects_density_map_counts_with_resolution_any_solver(
         self, tmp_path
     ):
@@ -917,6 +970,44 @@ class TestManifestWorkflowTools:
             "counts input with instrument resolution is unsupported" in error
             for error in validation["errors"]
         )
+
+    def test_validation_mirrors_resolution_kwargs_contract(self, tmp_path):
+        # _resolution_kwargs rejects unknown kinds and KeyErrors on gaussian
+        # dicts missing required parameters; validation must mirror both
+        # instead of approving a manifest the run path will refuse.
+        np.savez(
+            tmp_path / "spectrum.npz",
+            energies_ev=np.linspace(1.0, 30.0, 20),
+            transmission=np.ones(20),
+            uncertainty=np.full(20, 0.01),
+        )
+        cases = [
+            ({"kind": "gausian", "flight_path_m": 25.0}, "unknown resolution kind"),
+            (
+                {"kind": "gaussian", "flight_path_m": 25.0, "delta_t_us": 1.0},
+                "gaussian resolution requires",
+            ),
+            ({"kind": "tabulated", "path": "missing.txt"}, "does not exist"),
+        ]
+        for resolution, expected in cases:
+            _write_json_frontmatter_manifest(
+                tmp_path,
+                {
+                    "mode": "single_spectrum",
+                    "data": {"kind": "transmission_npz", "path": "spectrum.npz"},
+                    "isotopes": [_synthetic_u238_entry()],
+                    "fit": {"solver": "lm", "max_iter": 5},
+                    "resolution": resolution,
+                },
+            )
+
+            validation = validate_resonance_dataset(str(tmp_path))
+
+            assert validation["valid"] is False, (resolution, validation)
+            assert any(expected in error for error in validation["errors"]), (
+                resolution,
+                validation["errors"],
+            )
 
     def test_validation_rejects_malformed_resolution_value(self, tmp_path):
         # A bool/number/list resolution used to be treated as "inactive" and
