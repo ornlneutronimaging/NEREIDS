@@ -1037,6 +1037,25 @@ class TestManifestWorkflowTools:
             for error in validation["errors"]
         )
 
+        # Falsy values are NOT malformed: the run path's
+        # `config.get("resolution") or {}` treats them as disabled, so
+        # validation must accept them (validate/run agreement in the other
+        # direction).
+        _write_json_frontmatter_manifest(
+            tmp_path,
+            {
+                "mode": "single_spectrum",
+                "data": {"kind": "transmission_npz", "path": "spectrum.npz"},
+                "isotopes": [_synthetic_u238_entry()],
+                "fit": {"solver": "lm", "max_iter": 5},
+                "resolution": False,
+            },
+        )
+
+        validation = validate_resonance_dataset(str(tmp_path))
+
+        assert validation["valid"] is True, validation["errors"]
+
     def test_fit_summary_is_strict_json_safe(self):
         result = SimpleNamespace(
             densities=np.asarray([np.nan]),

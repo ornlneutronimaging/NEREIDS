@@ -1367,6 +1367,14 @@ impl ResolutionFunction {
     /// table. The older Gaussian energy-broadening model has no physical
     /// detector-time probability law and is therefore rejected rather than
     /// silently treated as one.
+    ///
+    /// `timing_offset_us` is convention-dependent and NOT transferable
+    /// between variants: a mode-centred tabulated (UDR) kernel places its
+    /// pulse mode at the nominal arrival, so the offset must absorb the
+    /// calibrated moderator mean delay, while the causal Ikeda–Carpenter
+    /// pulse rises from the nominal arrival onward and its offset is a pure
+    /// clock/detector shift.  Swapping response models under one calibrated
+    /// offset shifts every bin systematically.
     pub fn detector_bin_probabilities(
         &self,
         true_energy_ev: f64,

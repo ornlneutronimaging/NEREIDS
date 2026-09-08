@@ -5796,7 +5796,7 @@ impl PyModelJacobianResult {
     }
 }
 
-/// Compute the exact resolved analytical Jacobian and expected Fisher at given
+/// Compute the exact analytical Jacobian and expected Fisher at given
 /// parameter values.
 ///
 /// Uses the same model construction as ``fit_counts_spectrum_typed()`` but does
@@ -5817,7 +5817,12 @@ impl PyModelJacobianResult {
 ///     fit_temperature: If True, include temperature as a free parameter
 ///         in the Jacobian.
 ///     flight_path_m, delta_t_us, delta_l_m: Gaussian resolution parameters.
-///     resolution: Tabulated resolution object.
+///         Rejected: this counts-space helper fails closed for any active
+///         resolution (the physical model needs separate open/sample
+///         response arms) until the exact two-arm counts response route
+///         exists.
+///     resolution: Tabulated resolution object.  Rejected, same as the
+///         Gaussian parameters above.
 ///     detector_background: Detector background B(E) for counts background model.
 ///     fit_alpha_1: If True, include signal scale α₁ as free parameter.
 ///     fit_alpha_2: If True, include background scale α₂ as free parameter.

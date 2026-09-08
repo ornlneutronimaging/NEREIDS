@@ -21,6 +21,12 @@
 //! source spectrum must choose and disclose its energy quadrature, then pass
 //! `F_j = w_j ε(E_j) Φ(E_j)`. The detector-time integration itself is
 //! performed by the response model over the supplied measured bin edges.
+//!
+//! The `timing_offset_us` handed to the response is convention-dependent
+//! (mode-relative for tabulated kernels, emission-onset-relative for the
+//! analytical Ikeda–Carpenter pulse); see
+//! [`ResolutionFunction::detector_bin_probabilities`] — a calibrated offset
+//! is not transferable between response variants.
 
 use std::fmt;
 

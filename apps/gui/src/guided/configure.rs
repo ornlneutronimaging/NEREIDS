@@ -29,11 +29,19 @@ pub fn configure_step(ui: &mut egui::Ui, state: &mut AppState) {
             .spacing([8.0, 6.0])
             .show(ui, |ui| {
                 ui.label("Flight Path (m):");
+                let prev_flight_path = state.beamline.flight_path_m;
                 ui.add(
                     egui::DragValue::new(&mut state.beamline.flight_path_m)
                         .range(1.0..=100.0)
                         .speed(0.1),
                 );
+                if state.beamline.flight_path_m != prev_flight_path {
+                    // Flight path parameterizes the resolution function and
+                    // the TOF→energy axis: treat it like the other
+                    // resolution-change paths and drop analysis outputs
+                    // (cancelling any in-flight spatial worker).
+                    state.invalidate_analysis_outputs();
+                }
                 ui.label("Delay (μs):");
                 ui.add(
                     egui::DragValue::new(&mut state.beamline.delay_us)

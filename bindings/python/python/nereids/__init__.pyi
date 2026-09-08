@@ -1991,7 +1991,7 @@ def compute_model_jacobian(
     groups: list[IsotopeGroup] | None = None,
     initial_densities: list[float] | None = None,
 ) -> ModelJacobianResult:
-    """Compute exact resolved analytical Jacobian and expected Fisher.
+    """Compute exact analytical Jacobian and expected Fisher.
 
     Uses the same model construction as ``fit_counts_spectrum_typed()`` but
     evaluates at the given parameter values without optimising.
@@ -2000,5 +2000,10 @@ def compute_model_jacobian(
     When ``groups`` is provided, each group maps to one density parameter.
 
     Research-oriented function for Fisher-based regularisation studies.
+
+    Any active instrument resolution (Gaussian parameters or
+    ``resolution=``) is rejected: this counts-space helper fails closed
+    (the physical model needs separate open/sample response arms) until
+    the exact two-arm counts response route exists.
     """
     ...

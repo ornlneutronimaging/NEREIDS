@@ -1159,15 +1159,17 @@ def _validate_workflow(manifest: dict[str, Any]) -> dict[str, Any]:
         resolution_kind = _normalise_kind(resolution.get("kind", "none"), "none")
     elif isinstance(resolution, str):
         resolution_kind = _normalise_kind(resolution, "none")
-    elif resolution is not None:
-        # A malformed value (bool/number/list) would sail through as
-        # "inactive" here and then fail differently at run time — the exact
-        # validate-vs-run disagreement this function exists to prevent.
+    elif resolution:
+        # A truthy malformed value (true/number/non-empty list) raises
+        # "resolution must be an object" at run time; erroring here keeps
+        # validate and run in agreement.  Falsy values (false/0/[]) fall
+        # through: the run path's `config.get("resolution") or {}` treats
+        # them as resolution-disabled.
         errors.append(
             "resolution must be an object or kind string, got "
             f"{type(resolution).__name__}"
         )
-    elif mode in {"density_map", "spatial_map"}:
+    elif resolution is None and mode in {"density_map", "spatial_map"}:
         warnings.append("no resolution configured; OK for synthetic/demo data")
 
     # Mirror _resolution_kwargs' full contract, kind by kind, so validation

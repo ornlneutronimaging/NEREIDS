@@ -774,6 +774,37 @@ class TestTwoArmCountResponse:
         assert sample_loss == pytest.approx(40.0 * outside, abs=2e-12)
 
 
+class TestComputeModelJacobianCountsGate:
+    """The research Fisher helper is a counts-space model: it must reject
+    instrument resolution like the production fit routes, and keep working
+    without one."""
+
+    def _args(self):
+        energies = np.linspace(1.0, 30.0, 40)
+        rd = _make_single_resonance()
+        open_beam = np.full_like(energies, 5000.0)
+        return open_beam, energies, [(rd, 0.001)]
+
+    def test_rejects_any_active_resolution(self):
+        open_beam, energies, isotopes = self._args()
+        with pytest.raises(ValueError, match="separate open/sample response arms"):
+            nereids.compute_model_jacobian(
+                open_beam,
+                energies,
+                isotopes,
+                flight_path_m=25.0,
+                delta_t_us=0.5,
+                delta_l_m=0.005,
+            )
+
+    def test_no_resolution_path_still_evaluates(self):
+        open_beam, energies, isotopes = self._args()
+        result = nereids.compute_model_jacobian(open_beam, energies, isotopes)
+        prediction = np.asarray(result.model_prediction)
+        assert prediction.shape == energies.shape
+        assert np.isfinite(prediction).all()
+
+
 class TestTabulatedKernelWidthInterpolation:
     """Regression for issue #632: kernel width between reference energies
     must follow the physical power law, not the arithmetic blend chord.
