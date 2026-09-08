@@ -817,8 +817,10 @@ fn on_resolution_file_picked(state: &mut AppState, target: ResolutionTarget, pat
     let flight_path_m = state.beamline.flight_path_m;
     let (mode, invalidate): (&mut ResolutionMode, fn(&mut AppState)) = match target {
         ResolutionTarget::Configure => (&mut state.resolution_mode, |s| {
-            s.spatial_result = None;
-            s.pixel_fit_result = None;
+            // Mirror configure.rs's resolution-change invalidation: the
+            // analysis outputs and any in-flight spatial worker belong to
+            // the previous resolution setting.
+            s.invalidate_analysis_outputs();
         }),
         ResolutionTarget::ForwardModel => (&mut state.fm_resolution_mode, |s| {
             s.fm_spectrum = None;

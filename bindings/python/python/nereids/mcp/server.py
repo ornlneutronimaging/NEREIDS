@@ -37,9 +37,10 @@ _COUNTS_RESOLUTION_UNSUPPORTED = (
     "counts input with instrument resolution is unsupported: the current counts "
     "path broadens transmission as R[T], but the physical detector model requires "
     "separate open/sample response arms R[Phi] and R[Phi*T]. Fit pre-normalized "
-    "transmission instead (valid as a transmission-domain model, though not a "
-    "counts likelihood), or disable instrument resolution until an exact counts "
-    "response is implemented."
+    "transmission instead (a transmission-domain model, not a counts likelihood; "
+    "its broadened ratio matches the measured R[Phi*T]/R[Phi] only where the "
+    "incident flux is smooth over the kernel width), or disable instrument "
+    "resolution until an exact counts response is implemented."
 )
 _SAFE_KEY = re.compile(r"[^A-Za-z0-9_]+")
 
@@ -1202,7 +1203,10 @@ def _validate_workflow(manifest: dict[str, Any]) -> dict[str, Any]:
                 "transmission" if solver == "lm" else "counts",
             )
         ).lower()
-        is_npz = str(data_config.get("path") or "").lower().endswith(".npz")
+        # Case-sensitive on purpose: the run path routes on
+        # `data_path.suffix == ".npz"`, so `DATA.NPZ` is text-parsed there
+        # and must not be treated as a counts-domain npz here.
+        is_npz = str(data_config.get("path") or "").endswith(".npz")
         counts_domain_fit = counts_input and is_npz and fit_domain == "counts"
     else:
         counts_domain_fit = counts_input

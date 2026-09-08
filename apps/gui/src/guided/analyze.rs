@@ -1492,8 +1492,10 @@ fn spectrum_panel(ui: &mut egui::Ui, state: &mut AppState) {
     .ok()
     .flatten()
     .map(|r| Arc::new(nereids_physics::transmission::InstrumentParams { resolution: r }));
-    let count_resolution_overlay_unsupported =
-        design::counts_resolution_overlay_unsupported(show_counts, overlay_instrument.is_some());
+    // Only warn when there is actually a fit result whose overlay is being
+    // suppressed; before any fit exists there is nothing to hide.
+    let count_resolution_overlay_unsupported = fit_result_for_overlay.is_some()
+        && design::counts_resolution_overlay_unsupported(show_counts, overlay_instrument.is_some());
     if count_resolution_overlay_unsupported {
         ui.colored_label(
             crate::theme::semantic::ORANGE,
@@ -2726,7 +2728,12 @@ pub fn run_spatial_map(state: &mut AppState) {
 
     let norm = match state.normalized {
         Some(ref n) => Arc::clone(n),
-        None => return,
+        None => {
+            // The eager clear above has already dropped the previous map;
+            // say why nothing new is coming instead of failing silently.
+            state.status_message = "Run normalization before spatial mapping.".into();
+            return;
+        }
     };
 
     // Combine dead_pixels with ROI mask: pixels outside all ROIs are treated as dead.

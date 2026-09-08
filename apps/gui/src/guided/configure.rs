@@ -78,8 +78,11 @@ pub fn configure_step(ui: &mut egui::Ui, state: &mut AppState) {
         crate::file_dialog::ResolutionTarget::Configure,
     );
     if res.changed {
-        state.spatial_result = None;
-        state.pixel_fit_result = None;
+        // Full analysis invalidation, matching the solver-method path: a
+        // resolution change also obsoletes any in-flight spatial worker
+        // (cancelled via its dedicated token) and the ancillary outputs
+        // (feedback, export status, residuals, fitting ROIs).
+        state.invalidate_analysis_outputs();
     }
 
     // --- Isotopes card ---

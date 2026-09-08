@@ -795,7 +795,7 @@ class TestManifestWorkflowTools:
                 "mode": "single_spectrum",
                 "data": {"kind": "counts_npz", "path": "counts.npz"},
                 "isotopes": [_synthetic_u238_entry()],
-                "fit": {"solver": "poisson_kl", "max_iter": 5},
+                "fit": {"solver": "kl", "max_iter": 5},
                 "resolution": {
                     "kind": "gaussian",
                     "flight_path_m": 25.0,
@@ -859,7 +859,7 @@ class TestManifestWorkflowTools:
         )
         for fit in (
             {"solver": "lm", "max_iter": 5},
-            {"solver": "poisson_kl", "fit_domain": "transmission", "max_iter": 5},
+            {"solver": "kl", "fit_domain": "transmission", "max_iter": 5},
         ):
             _write_json_frontmatter_manifest(
                 tmp_path,

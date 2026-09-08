@@ -1154,10 +1154,11 @@ pub(crate) fn validate_counts_resolution_route(
             "counts input with instrument resolution is unsupported: the current \
              counts path broadens transmission as R[T], but the physical detector \
              model requires separate open/sample response arms R[Phi] and \
-             R[Phi*T]. Fit pre-normalized transmission instead (valid as a \
-             transmission-domain model, though not a counts likelihood), or \
-             disable instrument resolution until an exact counts response is \
-             implemented."
+             R[Phi*T]. Fit pre-normalized transmission instead (a \
+             transmission-domain model, not a counts likelihood; its broadened \
+             ratio matches the measured R[Phi*T]/R[Phi] only where the incident \
+             flux is smooth over the kernel width), or disable instrument \
+             resolution until an exact counts response is implemented."
                 .into(),
         ));
     }
