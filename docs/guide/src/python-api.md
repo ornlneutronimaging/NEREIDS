@@ -207,9 +207,12 @@ data to the counts-KL dispatch. Use `c=Q_s / Q_ob` when sample and open-beam
 counts have different proton charge or dwell-time normalization. The primary
 GOF for this path is `FitResult.deviance_per_dof`.
 
-Counts fitting accepts the same temperature, background, group, resolution,
-energy-scale, and `fit_energy_range` options as transmission fitting. Counts
-specific options are:
+Counts fitting accepts the same temperature, background, group, energy-scale,
+and `fit_energy_range` options as transmission fitting.
+Instrument resolution is the exception: any counts fit with an active resolution fails closed with a `ValueError` —
+the physical detector model needs separate open/sample response arms (`R[Φ]` and `R[Φ·T]`), which the current fitter does not have.
+Fit pre-normalized transmission when resolution is required (valid as a transmission-domain model, though not a counts likelihood), or fit counts without resolution.
+Counts specific options are:
 
 | Option | Meaning |
 |--------|---------|
@@ -285,8 +288,8 @@ Keyword arguments:
 | `fit_energy_scale=False` | Fit per-pixel `t0_us` and `l_scale` maps. |
 | `t0_init_us=0.0`, `l_scale_init=1.0` | Initial energy-scale values. |
 | `energy_scale_flight_path_m=25.0` | Nominal flight path for energy-scale fitting. |
-| `resolution=...` | Tabulated resolution from `load_resolution(...)`. **Mutually exclusive with the Gaussian parameters below** — pass either `resolution=` (tabulated) or the `flight_path_m`/`delta_t_us`/`delta_l_m` trio (Gaussian), never both. |
-| `flight_path_m=...`, `delta_t_us=...`, `delta_l_m=...` | Gaussian resolution parameters (mutually exclusive with `resolution=`). |
+| `resolution=...` | Tabulated resolution from `load_resolution(...)`. **Mutually exclusive with the Gaussian parameters below** — pass either `resolution=` (tabulated) or the `flight_path_m`/`delta_t_us`/`delta_l_m` trio (Gaussian), never both. **Rejected for count cubes**: counts input with active resolution fails closed (separate open/sample response arms required) — fit pre-normalized transmission cubes instead. |
+| `flight_path_m=...`, `delta_t_us=...`, `delta_l_m=...` | Gaussian resolution parameters (mutually exclusive with `resolution=`; same count-cube rejection applies). |
 | `groups=[...]` | Fit isotope groups instead of individual isotopes. |
 | `tzero_jacobian="..."` | Select the TZERO Jacobian implementation. |
 | `fit_energy_range=(emin, emax)` | Restrict the cost function to an energy window. |

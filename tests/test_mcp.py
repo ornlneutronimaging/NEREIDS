@@ -843,6 +843,109 @@ class TestManifestWorkflowTools:
         assert validation["valid"] is True
         assert not any("counts input" in error for error in validation["errors"])
 
+    def test_validation_allows_counts_with_resolution_on_transmission_route(
+        self, tmp_path
+    ):
+        # The run path fits counts_npz + solver=lm in the TRANSMISSION domain
+        # (Python converts counts to a pre-normalized spectrum), which
+        # legitimately accepts resolution — validation must mirror that
+        # routing, not the raw data kind.  Same for an explicit
+        # fit_domain=transmission under a counts-domain solver.
+        np.savez(
+            tmp_path / "counts.npz",
+            energies_ev=np.linspace(1.0, 30.0, 20),
+            sample_counts=np.full(20, 900.0),
+            open_beam_counts=np.full(20, 1000.0),
+        )
+        for fit in (
+            {"solver": "lm", "max_iter": 5},
+            {"solver": "poisson_kl", "fit_domain": "transmission", "max_iter": 5},
+        ):
+            _write_json_frontmatter_manifest(
+                tmp_path,
+                {
+                    "mode": "single_spectrum",
+                    "data": {"kind": "counts_npz", "path": "counts.npz"},
+                    "isotopes": [_synthetic_u238_entry()],
+                    "fit": fit,
+                    "resolution": {
+                        "kind": "gaussian",
+                        "flight_path_m": 25.0,
+                        "delta_t_us": 1.0,
+                        "delta_l_m": 0.01,
+                    },
+                },
+            )
+
+            validation = validate_resonance_dataset(str(tmp_path))
+
+            assert validation["valid"] is True, (fit, validation["errors"])
+            assert not any("counts input" in error for error in validation["errors"])
+
+    def test_validation_rejects_density_map_counts_with_resolution_any_solver(
+        self, tmp_path
+    ):
+        # density_map count cubes always fit in the counts domain
+        # (from_counts), regardless of solver — the rejection must not be
+        # narrowed by the single-spectrum fit-domain logic.
+        np.savez(
+            tmp_path / "cube.npz",
+            energies_ev=np.linspace(1.0, 30.0, 5),
+            sample_counts=np.ones((5, 2, 2)),
+            open_beam_counts=np.ones((5, 2, 2)),
+        )
+        _write_json_frontmatter_manifest(
+            tmp_path,
+            {
+                "mode": "density_map",
+                "data": {"kind": "counts_npz", "path": "cube.npz"},
+                "isotopes": [_synthetic_u238_entry()],
+                "fit": {"solver": "lm", "max_iter": 5},
+                "resolution": {
+                    "kind": "gaussian",
+                    "flight_path_m": 25.0,
+                    "delta_t_us": 1.0,
+                    "delta_l_m": 0.01,
+                },
+            },
+        )
+
+        validation = validate_resonance_dataset(str(tmp_path))
+
+        assert validation["valid"] is False
+        assert any(
+            "counts input with instrument resolution is unsupported" in error
+            for error in validation["errors"]
+        )
+
+    def test_validation_rejects_malformed_resolution_value(self, tmp_path):
+        # A bool/number/list resolution used to be treated as "inactive" and
+        # sail through validation, only to fail differently at run time.
+        np.savez(
+            tmp_path / "spectrum.npz",
+            energies_ev=np.linspace(1.0, 30.0, 20),
+            transmission=np.ones(20),
+            uncertainty=np.full(20, 0.01),
+        )
+        _write_json_frontmatter_manifest(
+            tmp_path,
+            {
+                "mode": "single_spectrum",
+                "data": {"kind": "transmission_npz", "path": "spectrum.npz"},
+                "isotopes": [_synthetic_u238_entry()],
+                "fit": {"solver": "lm", "max_iter": 5},
+                "resolution": True,
+            },
+        )
+
+        validation = validate_resonance_dataset(str(tmp_path))
+
+        assert validation["valid"] is False
+        assert any(
+            "resolution must be an object or kind string" in error
+            for error in validation["errors"]
+        )
+
     def test_fit_summary_is_strict_json_safe(self):
         result = SimpleNamespace(
             densities=np.asarray([np.nan]),

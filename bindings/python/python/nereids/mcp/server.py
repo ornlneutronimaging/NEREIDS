@@ -36,9 +36,10 @@ _MANIFEST_NAMES = (
 _COUNTS_RESOLUTION_UNSUPPORTED = (
     "counts input with instrument resolution is unsupported: the current counts "
     "path broadens transmission as R[T], but the physical detector model requires "
-    "separate open/sample response arms R[Phi] and R[Phi*T]. Supply pre-normalized "
-    "transmission, or disable instrument resolution until an exact counts response "
-    "is implemented."
+    "separate open/sample response arms R[Phi] and R[Phi*T]. Fit pre-normalized "
+    "transmission instead (valid as a transmission-domain model, though not a "
+    "counts likelihood), or disable instrument resolution until an exact counts "
+    "response is implemented."
 )
 _SAFE_KEY = re.compile(r"[^A-Za-z0-9_]+")
 
@@ -1163,21 +1164,50 @@ def _validate_workflow(manifest: dict[str, Any]) -> dict[str, Any]:
             warnings.append("resolution disabled; appropriate for synthetic data")
     elif isinstance(resolution, str):
         resolution_kind = _normalise_kind(resolution, "none")
-    elif resolution is None and mode in {"density_map", "spatial_map"}:
+    elif resolution is not None:
+        # A malformed value (bool/number/list) would sail through as
+        # "inactive" here and then fail differently at run time — the exact
+        # validate-vs-run disagreement this function exists to prevent.
+        errors.append(
+            "resolution must be an object or kind string, got "
+            f"{type(resolution).__name__}"
+        )
+    elif mode in {"density_map", "spatial_map"}:
         warnings.append("no resolution configured; OK for synthetic/demo data")
 
-    # Raw count inputs need two separately broadened response arms:
-    # R[Phi] for the open beam and R[Phi*T] for the sample.  The current
-    # fitting API only has R[T], so approving this manifest would make a
-    # dry run disagree with the production pipeline's fail-closed gate.
+    # Raw count inputs fitted in the COUNTS DOMAIN need two separately
+    # broadened response arms: R[Phi] for the open beam and R[Phi*T] for the
+    # sample.  The current fitting API only has R[T], so approving such a
+    # manifest would make a dry run disagree with the production pipeline's
+    # fail-closed gate.  Mirror the run path's routing exactly:
+    # density_map/spatial count cubes always fit in the counts domain
+    # (from_counts), while a single_spectrum counts input does so only when
+    # the effective fit domain is "counts" (fit.fit_domain, defaulting by
+    # solver) — the transmission fit domain converts to a pre-normalized
+    # transmission fit, which legitimately accepts resolution.  A non-.npz
+    # single_spectrum path is coerced to a transmission spectrum by the run
+    # path regardless of the declared kind.
     counts_input = effective_kind in {
         "counts_npz",
         "counts",
         "nexus_histogram",
         "nexus",
     }
+    if mode in {"single_spectrum", "fit_spectrum", "spectrum"}:
+        fit_config = _get_fit_config(config)
+        solver = str(fit_config.get("solver", "lm")).lower()
+        fit_domain = str(
+            fit_config.get(
+                "fit_domain",
+                "transmission" if solver == "lm" else "counts",
+            )
+        ).lower()
+        is_npz = str(data_config.get("path") or "").lower().endswith(".npz")
+        counts_domain_fit = counts_input and is_npz and fit_domain == "counts"
+    else:
+        counts_domain_fit = counts_input
     resolution_active = resolution_kind not in {None, "none", "disabled", "false"}
-    if counts_input and resolution_active:
+    if counts_domain_fit and resolution_active:
         errors.append(_COUNTS_RESOLUTION_UNSUPPORTED)
 
     return {

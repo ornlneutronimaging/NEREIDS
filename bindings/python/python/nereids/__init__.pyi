@@ -1727,6 +1727,11 @@ def spatial_map_typed(
         l_scale_init: Initial flight-path scale factor (default 1.0).
         energy_scale_flight_path_m: Nominal flight path (m) for the
             energy-scale model (default 25.0).
+        resolution: Optional resolution function.  Rejected when fitting
+            count cubes: counts input with instrument resolution fails
+            closed (the physical model needs separate open/sample response
+            arms) until the exact two-arm counts response route exists; fit
+            pre-normalized transmission cubes instead.
         scale_by_chi2: When ``True``, inflate the covariance-only
             uncertainties (incl. ``temperature_uncertainty_map``) by
             ``sqrt(chi2/dof)`` at the converged point, turning the inverse-Fisher
@@ -1912,7 +1917,11 @@ def fit_counts_spectrum_typed(
             For raw VENUS-style counts, set this to the actual ratio
             (typically ~5–6).  Used by the counts-KL dispatch; ignored
             by the LM path.
-        resolution: Optional resolution function.
+        resolution: Optional resolution function.  Rejected for counts
+            input: any counts fit with instrument resolution fails closed
+            (the physical model needs separate open/sample response arms)
+            until the exact two-arm counts response route exists; fit
+            pre-normalized transmission instead.
         groups: List of IsotopeGroup objects (mutually exclusive with isotopes).
         initial_densities: Initial density guesses when using groups.
         fix_densities: Freeze all densities at their initial values and fit

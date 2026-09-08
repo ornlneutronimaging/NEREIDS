@@ -152,6 +152,9 @@ For synthetic demo data, resolution can be disabled:
 For real instrument data, use Gaussian resolution parameters or a tabulated
 resolution file. Synthetic data often does not need an instrument resolution
 file; real experiments normally do.
+The exception is counts-domain fitting: count inputs fitted in the counts domain (all `density_map`/`spatial_map` count or NeXus cubes, and `single_spectrum` counts with `fit.fit_domain: "counts"` or a counts-domain solver) reject an active resolution —
+the physical detector model needs separate open/sample response arms, which the current fitter does not have.
+Use a transmission input (or the `single_spectrum` transmission fit domain) when resolution is required, or disable resolution for counts-domain fits.
 
 ## Supported Workflow Inputs
 
@@ -211,16 +214,14 @@ Example NeXus density-map manifest:
       "solver": "lm",
       "max_iter": 100
     },
-    "resolution": {
-      "kind": "gaussian",
-      "flight_path_m": 25.0,
-      "delta_t_us": 0.5,
-      "delta_l_m": 0.005
-    }
+    "resolution": {"kind": "none"}
   }
 }
 ---
 ```
+
+NeXus density maps fit raw count cubes in the counts domain, which rejects an active instrument resolution (see the resolution note above) — hence `"kind": "none"` here.
+Convert to pre-normalized transmission cubes when resolution broadening is required.
 
 ## Result Files
 

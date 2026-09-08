@@ -97,6 +97,11 @@ fn acquisition_window_loss_is_not_renormalized() {
     );
 }
 
+// NOTE: this is a ROUTING and fluence/transmission-scaling check, not an
+// independent IC oracle — `expected_probability` comes from the same
+// `detector_bin_probabilities` law the operator dispatches to.  Independent
+// verification of the IC probability law itself (closed forms, Simpson
+// integrals) lives in `ic_causal_response.rs`.
 #[test]
 fn analytical_ic_is_evaluated_directly_in_detector_time() {
     let ic = Arc::new(

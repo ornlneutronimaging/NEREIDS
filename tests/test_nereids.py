@@ -2782,6 +2782,87 @@ class TestVenusMlbwRegression:
             f"A dispatch regression can prevent convergence entirely — investigate."
         )
 
+    def test_counts_kl_fit_matches_baseline(self, venus_data):
+        """Counts-KL (joint-Poisson) fit on the same real VENUS spectrum.
+
+        This is the real-data regression gate for the counts-path solver:
+        it substantiates, in-tree, the docs' claim that the joint-Poisson
+        deviance path is exercised against real VENUS counts — the
+        synthetic counts-KL tests elsewhere use NEREIDS-generated
+        observations and cannot do that.
+
+        Unlike the pre-Wave-1 form of this gate, the fit runs WITHOUT
+        instrument resolution: counts + resolution now fails closed (the
+        rejection gate below), and a resolution-free counts fit is the
+        valid configuration — the response operator R is then the
+        identity.  Anchors were re-captured for that configuration; they
+        are machine-generated regression anchors (produced by the code
+        under test), with correctness of the deviance math carried by the
+        analytic joint-Poisson unit tests in nereids-fitting.
+
+        ``deviance_per_dof`` lands in the >> 1 regime (measured ~3.1e4):
+        real VENUS counts carry un-modelled upstream physics, so D/dof
+        saturates at 10^4-10^5.  A sudden drop to O(1) would mean the gate
+        silently switched to a synthetic-like input, not that the model
+        got better.
+
+        Tolerances follow the LM gate's cross-backend rationale: anchors
+        captured on macOS (Accelerate); ``rel=1e-6`` absorbs BLAS/libm
+        sum-ordering differences on Linux CI while staying orders of
+        magnitude tighter than any real dispatch regression.
+        """
+        E, S_agg, O_agg, c, hf177 = venus_data
+
+        result = nereids.fit_counts_spectrum_typed(
+            S_agg,
+            O_agg,
+            E,
+            isotopes=[(hf177, 1.0e-5)],
+            solver="kl",
+            temperature_k=293.6,
+            max_iter=200,
+            background=False,
+            c=c,
+        )
+
+        EXPECTED_DENSITY = 2.7591191549411417e-05
+        EXPECTED_DEVIANCE_PER_DOF = 31471.485549664278
+
+        assert bool(result.converged) is True, (
+            f"counts-KL fit did not converge on the real VENUS fixture "
+            f"(converged={bool(result.converged)})"
+        )
+        assert float(result.densities[0]) == pytest.approx(
+            EXPECTED_DENSITY, rel=1e-6
+        ), (
+            f"counts-KL density drifted: got {float(result.densities[0])!r}, "
+            f"expected {EXPECTED_DENSITY!r} (±1e-6 rel)"
+        )
+        # Coarse physical bracket, independent of the machine-generated
+        # anchor above: both solver families land in (2.7-8.1)e-5
+        # atoms/barn on this measured Hf spectrum, so any value outside
+        # [1e-5, 1e-4] means solver breakage, not sample physics.  This
+        # prevents a future wholesale re-anchoring commit from silently
+        # absorbing an order-of-magnitude regression.
+        assert 1e-5 < float(result.densities[0]) < 1e-4, (
+            f"counts-KL density {float(result.densities[0])!r} fell outside "
+            f"the physical bracket [1e-5, 1e-4] for this measured sample"
+        )
+        assert result.deviance_per_dof is not None, (
+            "counts-KL dispatch must populate deviance_per_dof (primary GOF)"
+        )
+        assert float(result.deviance_per_dof) == pytest.approx(
+            EXPECTED_DEVIANCE_PER_DOF, rel=1e-6
+        ), (
+            f"deviance/dof drifted: got {float(result.deviance_per_dof)!r}, "
+            f"expected {EXPECTED_DEVIANCE_PER_DOF!r} (±1e-6 rel)"
+        )
+        assert float(result.deviance_per_dof) > 1e3, (
+            "real-data regime check: D/dof should be >> 1 on raw VENUS "
+            "counts (un-modelled upstream physics); an O(1) value means "
+            "the gate is no longer fitting real data"
+        )
+
     def test_counts_with_resolution_fails_before_fitting(self, venus_data):
         """Resolved counts must fail closed instead of fitting R[T].
 
@@ -2791,12 +2872,10 @@ class TestVenusMlbwRegression:
         fall back to a scientifically wrong count model (Wave-1 PR-2a
         gate; the exact separate-arm route lands with PR-2b).
 
-        This replaces the counts-KL anchor gate that previously ran here:
-        its machine-generated anchors were produced through the now-
+        The pre-Wave-1 counts-KL anchors were captured through the now-
         rejected R[T] route and cannot be reproduced by any valid
-        configuration.  The joint-Poisson deviance math keeps its analytic
-        unit tests in nereids-fitting; the no-resolution counts-KL path
-        keeps its synthetic anchors elsewhere in this file.
+        configuration; the real-data counts-KL gate above re-anchors the
+        valid (resolution-free) configuration instead.
         """
         E, S_agg, O_agg, c, hf177 = venus_data
 

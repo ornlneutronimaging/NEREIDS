@@ -4934,7 +4934,11 @@ fn spatial_result_to_py(
 ///     l_scale_init: Initial flight-path scale factor (default 1.0).
 ///     energy_scale_flight_path_m: Nominal flight path (m) for the
 ///         energy-scale model. Must match the grid used to compute `energies`.
-///     resolution: Optional resolution function.
+///     resolution: Optional resolution function.  Rejected when fitting
+///         count cubes: counts input with instrument resolution fails closed
+///         (the physical model needs separate open/sample response arms)
+///         until the exact two-arm counts response route exists; fit
+///         pre-normalized transmission cubes instead.
 ///     groups: list of IsotopeGroup objects (mutually exclusive with isotopes).
 ///     fit_anorm: Whether Anorm is free when ``background=True`` (default
 ///         True).  Must be False to combine ``background=True`` with
@@ -5357,7 +5361,11 @@ fn py_spatial_map_typed<'py>(
 ///     solver: "lm" (default), "kl", or "auto".
 ///     background: Enable transmission-lift background inside the counts fit.
 ///     detector_background: Optional detector/counts background reference.
-///     resolution: Optional resolution function.
+///     resolution: Optional resolution function.  Rejected for counts
+///         input: any counts fit with instrument resolution fails closed
+///         (the physical model needs separate open/sample response arms)
+///         until the exact two-arm counts response route exists; fit
+///         pre-normalized transmission instead.
 ///     groups: list of IsotopeGroup objects (mutually exclusive with isotopes).
 ///     initial_densities: Initial density guesses when using groups (default 0.001 each).
 ///     enable_polish: Override the Nelder-Mead polish phase on the
