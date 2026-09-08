@@ -270,6 +270,7 @@ fn poll_pending_tasks(state: &mut AppState) {
                 state.residuals_cache = None;
                 state.active_tab = Tab::Map;
                 state.pending_spatial = None;
+                state.spatial_cancel_token = None;
                 // Pipeline re-run completed successfully — clear dirty state.
                 state.clear_dirty();
             }

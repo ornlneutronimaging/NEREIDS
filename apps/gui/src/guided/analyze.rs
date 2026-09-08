@@ -2755,7 +2755,10 @@ pub fn run_spatial_map(state: &mut AppState) {
     state.pending_spatial = Some(rx);
     state.is_fitting = true;
     state.status_message = "Running spatial mapping...".into();
-    let cancel = Arc::clone(&state.cancel_token);
+    // Dedicated per-run token: lets invalidation stop THIS worker without
+    // cancelling unrelated workers on the shared `cancel_token`.
+    let cancel = Arc::new(AtomicBool::new(false));
+    state.spatial_cancel_token = Some(Arc::clone(&cancel));
 
     // Progress: single FittingProgress struct holds the Arc<AtomicUsize> counter
     // and the pixel total.  Display code reads the atomic directly each frame.
@@ -2800,6 +2803,7 @@ pub fn run_spatial_map(state: &mut AppState) {
             state.status_message = format!("Failed to create thread pool: {e}");
             state.is_fitting = false;
             state.fitting_progress = None;
+            state.spatial_cancel_token = None;
             return;
         }
     };
@@ -2987,6 +2991,8 @@ mod tests {
         state.spatial_result = Some(stale_spatial_result());
         state.export_status = Some("old export".into());
         state.is_fetching_endf = true;
+        let in_flight_spatial = Arc::new(AtomicBool::new(false));
+        state.spatial_cancel_token = Some(Arc::clone(&in_flight_spatial));
         let unrelated_cancel_token = Arc::clone(&state.cancel_token);
         let previous = state.solver_method;
         state.solver_method = SolverMethod::LevenbergMarquardt;
@@ -3004,6 +3010,35 @@ mod tests {
         assert_eq!(state.rois.len(), 1);
         assert!(state.is_fetching_endf);
         assert!(Arc::ptr_eq(&state.cancel_token, &unrelated_cancel_token));
+        // The obsolete spatial worker is stopped through its dedicated token;
+        // the shared token stays untouched for unrelated workers.
+        assert!(in_flight_spatial.load(Ordering::Relaxed));
+        assert!(state.spatial_cancel_token.is_none());
+        assert!(!state.cancel_token.load(Ordering::Relaxed));
+    }
+
+    #[test]
+    fn spatial_invalidation_cancels_only_the_dedicated_spatial_token() {
+        let mut state = rejected_counts_resolution_state();
+        let spatial = Arc::new(AtomicBool::new(false));
+        state.spatial_cancel_token = Some(Arc::clone(&spatial));
+        let shared = Arc::clone(&state.cancel_token);
+
+        state.clear_spatial_fit_output();
+
+        assert!(spatial.load(Ordering::Relaxed));
+        assert!(state.spatial_cancel_token.is_none());
+        assert!(Arc::ptr_eq(&state.cancel_token, &shared));
+        assert!(!shared.load(Ordering::Relaxed));
+
+        // cancel_pending_tasks (the whole-pipeline reset) must also stop a
+        // dedicated spatial run, since the worker no longer listens on the
+        // shared token.
+        let spatial_2 = Arc::new(AtomicBool::new(false));
+        state.spatial_cancel_token = Some(Arc::clone(&spatial_2));
+        state.cancel_pending_tasks();
+        assert!(spatial_2.load(Ordering::Relaxed));
+        assert!(state.spatial_cancel_token.is_none());
     }
 
     #[test]
