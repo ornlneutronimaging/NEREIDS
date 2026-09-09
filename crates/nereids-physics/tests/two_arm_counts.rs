@@ -1,6 +1,8 @@
 use std::sync::Arc;
 
-use nereids_physics::counts_response::{CountsResponseError, two_arm_count_response};
+use nereids_physics::counts_response::{
+    CountsResponseError, DetectorBinResponseMatrix, two_arm_count_response,
+};
 use nereids_physics::ikeda_carpenter::{
     EnergyLaw, IkedaCarpenter, IkedaCarpenterParams, SynthesisGrid,
 };
@@ -186,4 +188,68 @@ fn unsupported_or_unphysical_inputs_fail_clearly() {
         ),
         Err(CountsResponseError::InvalidTransmission { .. })
     ));
+}
+
+#[test]
+fn compact_response_keeps_every_nonzero_and_reconstructs_interior_zeros() {
+    let response = triangle_response();
+    let arrival_0 = TOF_FACTOR * 25.0 / 25.0_f64.sqrt();
+    let arrival_1 = arrival_0 + 1.0;
+    let energy_1 = (TOF_FACTOR * 25.0 / arrival_1).powi(2);
+    let matrix = DetectorBinResponseMatrix::new(
+        &[25.0, energy_1],
+        &[arrival_0 - 1.0, arrival_0, arrival_0 + 1.0, arrival_0 + 2.0],
+        0.0,
+        &response,
+    )
+    .expect("valid compact response");
+
+    assert_eq!(matrix.nnz(), 4);
+    assert_eq!(
+        matrix.storage_bytes(),
+        3 * std::mem::size_of::<usize>()
+            + 4 * std::mem::size_of::<u32>()
+            + 4 * std::mem::size_of::<f64>()
+    );
+    assert_eq!(
+        matrix.row_entries(0).collect::<Vec<_>>(),
+        [(0, 0.5), (1, 0.5)]
+    );
+    assert_eq!(
+        matrix.row_entries(1).collect::<Vec<_>>(),
+        [(1, 0.5), (2, 0.5)]
+    );
+    assert_eq!(matrix.probability(0, 2), 0.0);
+    assert_eq!(matrix.probability(1, 0), 0.0);
+    assert_eq!(matrix.probability(0, 0), 0.5);
+
+    let got = matrix
+        .apply(&[100.0, 200.0], &[0.2, 0.8])
+        .expect("valid compact response application");
+    assert_eq!(got.open_beam, [50.0, 150.0, 100.0]);
+    assert_eq!(got.sample, [10.0, 90.0, 80.0]);
+    // Both pulses lie fully inside the window: the matrix must report the
+    // same (numerically zero) window loss as the streaming operator.
+    assert!(got.open_beam_window_loss.abs() < 2.0e-11);
+    assert!(got.sample_window_loss.abs() < 2.0e-11);
+}
+
+#[test]
+fn compact_response_reports_window_loss_like_the_streaming_operator() {
+    let response = triangle_response();
+    let arrival = TOF_FACTOR * 25.0 / 25.0_f64.sqrt();
+    // Window starts at the pulse mode: half of the triangle falls outside.
+    let edges = [arrival, arrival + 1.0];
+
+    let matrix = DetectorBinResponseMatrix::new(&[25.0], &edges, 0.0, &response)
+        .expect("valid truncated compact response");
+    let from_matrix = matrix
+        .apply(&[100.0], &[0.4])
+        .expect("valid truncated application");
+    let from_operator = two_arm_count_response(&[25.0], &[100.0], &[0.4], &edges, 0.0, &response)
+        .expect("valid truncated streaming response");
+
+    assert_eq!(from_matrix, from_operator);
+    assert!((from_matrix.open_beam_window_loss - 50.0).abs() < 1.0e-12);
+    assert!((from_matrix.sample_window_loss - 20.0).abs() < 1.0e-12);
 }
