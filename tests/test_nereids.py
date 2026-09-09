@@ -774,6 +774,73 @@ class TestTwoArmCountResponse:
         assert sample_loss == pytest.approx(40.0 * outside, abs=2e-12)
 
 
+class TestExactResolvedCountsRoute:
+    """End-to-end anchor for the exact separate-arm count route (Wave-1 PR-2b).
+
+    Counts are synthesized with the public two-arm operator on a detector-time
+    grid that deliberately differs from the true-energy quadrature, then fitted
+    back through ``fit_counts_spectrum_typed`` with the exact-response inputs.
+    A future ratio-on-one-grid shortcut cannot satisfy this test.
+    """
+
+    TOF_FACTOR = 72.298254398292800
+    L = 25.0
+
+    @staticmethod
+    def _write_triangle(path):
+        path.write_text(
+            "\n".join(
+                [
+                    "synthetic six-microsecond triangle at 6.5 eV",
+                    "-----",
+                    "   6.50000e+000   0.00000e+000",
+                    "-3.0 0.0",
+                    "0.0 1.0",
+                    "3.0 0.0",
+                    "",
+                ]
+            )
+        )
+
+    def test_exact_count_route_recovers_density_end_to_end(self, u238_data, tmp_path):
+        kernel_path = tmp_path / "exact_route_triangle.txt"
+        self._write_triangle(kernel_path)
+        response = nereids.load_resolution(str(kernel_path), self.L)
+
+        true_density = 5.0e-4
+        energies = np.linspace(5.0, 8.0, 80)
+        xs_total = np.asarray(nereids.cross_sections(energies, u238_data)["total"])
+        true_transmission = np.asarray(nereids.beer_lambert(xs_total, true_density))
+
+        source = 4.0e4 * (1.0 + 0.4 * np.arange(80) / 79.0)
+        detector_edges = 630.0 + 2.5 * np.arange(102)
+
+        open_beam, sample, _open_loss, _sample_loss = nereids.two_arm_count_response(
+            energies,
+            source,
+            true_transmission,
+            detector_edges,
+            response,
+        )
+
+        result = nereids.fit_counts_spectrum_typed(
+            sample_counts=np.asarray(sample),
+            open_beam_counts=np.asarray(open_beam),
+            energies=energies,
+            isotopes=[(u238_data, 2.0e-4)],
+            solver="kl",
+            max_iter=400,
+            resolution=response,
+            incident_fluence_weights=source,
+            detector_time_edges_us=detector_edges,
+        )
+
+        assert result.converged
+        assert result.densities[0] == pytest.approx(true_density, abs=2.0e-6)
+        assert result.deviance_per_dof is not None
+        assert result.deviance_per_dof < 1.0e-8
+
+
 class TestComputeModelJacobianCountsGate:
     """The research Fisher helper is a counts-space model: it must reject
     instrument resolution like the production fit routes, and keep working
