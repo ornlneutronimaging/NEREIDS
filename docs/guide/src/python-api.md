@@ -84,7 +84,7 @@ Returned by `spatial_map_typed(...)`.
 | `converged_map` | `NDArray[bool_]` | Per-pixel convergence flags. |
 | `n_converged`, `n_failed`, `n_total` | `int` | Pixel fit counts. |
 | `temperature_map` | `NDArray[float64] or None` | Fitted temperature map when enabled. |
-| `temperature_uncertainty_map` | `NDArray[float64] or None` | Per-pixel 1σ temperature uncertainty (K) when `fit_temperature=True`. **Covariance-only lower bound** on the Poisson-KL / joint-Poisson paths: it captures only statistical curvature (inverse Fisher matrix), omits baseline/model noise, and on real data can underestimate the observed per-superpixel scatter by ~3–4×. Pass `scale_by_chi2=True` for a goodness-of-fit-scaled estimate: σ is multiplied by `sqrt` of the reduced χ² each pixel's result reports (Gaussian `reduced_chi_squared` on the transmission paths, `deviance_per_dof` on the counts joint-Poisson path). This inflates σ for an under-fit pixel (χ²/dof > 1) and, less commonly, shrinks it for an over-fit one (χ²/dof < 1). The flag is a no-op on the already-χ²-scaled LM transmission path. |
+| `temperature_uncertainty_map` | `NDArray[float64] or None` | Per-pixel 1σ temperature uncertainty (K) when `fit_temperature=True`. **Covariance-only lower bound** on the raw-count joint-Poisson path: it captures only statistical curvature (inverse Fisher matrix), omits baseline/model noise, and on real data can underestimate the observed per-superpixel scatter by ~3–4×. Pass `scale_by_chi2=True` for a goodness-of-fit-scaled estimate: σ is multiplied by `sqrt` of the `deviance_per_dof` each pixel's result reports. This inflates σ for an under-fit pixel (D/dof > 1) and, less commonly, shrinks it for an over-fit one (D/dof < 1). The flag is a no-op on the already-χ²-scaled LM transmission path. |
 | `anorm_map`, `background_maps` | `NDArray[float64] / list[...] or None` | SAMMY `Anorm` and the polynomial background `[BackA, BackB, BackC]` per pixel when `background=True`. |
 | `back_d_map`, `back_f_map` | `NDArray[float64] or None` | SAMMY exponential background `BackD` / `BackF` per pixel when `background=True` and `fit_back_d=True` / `fit_back_f=True`. Counts-KL spatial runs always return `None` for both (the joint-Poisson dispatch never fits the exponential tail). |
 | `t0_us_map`, `l_scale_map` | `NDArray[float64] or None` | Energy-scale maps when enabled. |
@@ -175,7 +175,7 @@ Keyword arguments:
 | `temperature_k=293.6` | Sample temperature in kelvin. |
 | `fit_temperature=False` | Fit sample temperature in addition to densities. |
 | `max_iter=200` | Maximum optimizer iterations. |
-| `solver="lm"` | `"lm"`, `"kl"`, `"auto"`, `"poisson"`, or `"joint_poisson"`. `"poisson"` and `"joint_poisson"` are aliases used by the counts dispatch and accepted here for symmetry. |
+| `solver="lm"` | `"lm"` (default) or `"auto"`. The count-likelihood names (`"kl"`, `"poisson"`, `"joint_poisson"`) are rejected for normalized transmission — a ratio is not Poisson count data. |
 | `background=False` | Enable SAMMY-style transmission background parameters. |
 | `fit_back_d=False`, `fit_back_f=False` | Fit optional exponential background terms. |
 | `back_d_init=0.01`, `back_f_init=1.0` | Initial exponential background values. |
@@ -203,22 +203,52 @@ result = nereids.fit_counts_spectrum_typed(
 ```
 
 `solver="auto"`, `"kl"`, `"poisson"`, and `"joint_poisson"` all route counts
-data to the counts-KL dispatch. Use `c=Q_s / Q_ob` when sample and open-beam
-counts have different proton charge or dwell-time normalization. The primary
-GOF for this path is `FitResult.deviance_per_dof`.
+data to the counts-KL dispatch; `solver="lm"` is rejected because dividing the
+count arms into transmission loses count statistics. Use `c=Q_s / Q_ob` when
+sample and open-beam counts have different proton charge or dwell-time
+normalization. The primary GOF for this path is `FitResult.deviance_per_dof`.
 
-Counts fitting accepts the same temperature, background, group, energy-scale,
-and `fit_energy_range` options as transmission fitting.
-Instrument resolution is the exception: any counts fit with an active resolution fails closed with a `ValueError` —
-the physical detector model needs separate open/sample response arms (`R[Φ]` and `R[Φ·T]`), which the current fitter does not have.
-Fit pre-normalized transmission when resolution is required (valid as a transmission-domain model, though not a counts likelihood), or fit counts without resolution.
+Counts fitting accepts the same temperature, background, and group options as
+transmission fitting.
+
+### Resolved Counts (Exact Separate-Arm Response)
+
+Instrument response acts on the open and sample count arms separately: the
+detector observes `O_i = Σ_j F_j R_ij` and `S_i = Σ_j F_j T_j R_ij`, never a
+broadened transmission ratio `R[T]`. To fit raw counts with an active
+resolution, supply the exact-response inputs:
+
+```python
+result = nereids.fit_counts_spectrum_typed(
+    sample_counts,               # per measured detector-time bin
+    open_beam_counts,            # per measured detector-time bin
+    energies,                    # true-energy quadrature (may differ in length)
+    [(u238, 0.0005)],
+    solver="kl",
+    resolution=response,         # TabulatedResolution or IkedaCarpenter
+    incident_fluence_weights=F,  # F_j = w_j * eps(E_j) * Phi(E_j)
+    detector_time_edges_us=edges,  # len(edges) == len(sample_counts) + 1
+    timing_offset_us=0.0,
+)
+```
+
+The true-energy grid and the measured detector-time bins are different axes:
+`energies` drives the physics model while the count arrays live on the
+detector clock. `two_arm_count_response(...)` is the same operator exposed
+standalone for synthesizing or checking expected counts (it additionally
+reports the per-arm acquisition-window loss). A resolution *without* the
+exact-response inputs still fails closed with a `ValueError`, and
+`fit_energy_scale` / `fit_energy_range` are not yet supported through the
+exact response (the response clock and the energy axis would disagree).
+
 Counts specific options are:
 
 | Option | Meaning |
 |--------|---------|
-| `detector_background=...` | Optional 1D detector background spectrum. |
+| `detector_background=...` | Reserved detector background spectrum; the counts-KL dispatch rejects non-zero values. |
 | `c=1.0` | Proton-charge ratio `Q_s / Q_ob`. |
 | `enable_polish=True/False/None` | Override counts-KL polish behavior; `None` uses the dispatcher default. |
+| `resolution=...`, `incident_fluence_weights=...`, `detector_time_edges_us=...`, `timing_offset_us=0.0` | Exact separate-arm response inputs (see above). |
 
 The counts-domain `alpha_1`/`alpha_2` nuisance parameters are not fit by
 `fit_counts_spectrum_typed` or `spatial_map_typed`. Only
@@ -240,11 +270,10 @@ result = nereids.spatial_map_typed(
 )
 ```
 
-For `from_transmission(...)` inputs the default `solver="lm"` and `solver="auto"`
-both route to LM (this is the dispatcher contract in `__init__.pyi`:
-"`from_transmission + solver="lm"` (default for transmission) → LM"). The
-explicit `solver="kl"` opt-in for `from_transmission` runs the legacy
-Poisson-NLL-on-transmission path. `density_maps[0]` is the fitted U-238 map.
+For `from_transmission(...)` inputs both `solver="lm"` (default) and
+`solver="auto"` route to LM; a Poisson/KL count likelihood is rejected for
+normalized transmission because the separate open/sample count arms are no
+longer available. `density_maps[0]` is the fitted U-238 map.
 
 ### Raw Count Cubes
 
@@ -288,7 +317,7 @@ Keyword arguments:
 | `fit_energy_scale=False` | Fit per-pixel `t0_us` and `l_scale` maps. |
 | `t0_init_us=0.0`, `l_scale_init=1.0` | Initial energy-scale values. |
 | `energy_scale_flight_path_m=25.0` | Nominal flight path for energy-scale fitting. |
-| `resolution=...` | Tabulated resolution from `load_resolution(...)`. **Mutually exclusive with the Gaussian parameters below** — pass either `resolution=` (tabulated) or the `flight_path_m`/`delta_t_us`/`delta_l_m` trio (Gaussian), never both. **Rejected for count cubes**: counts input with active resolution fails closed (separate open/sample response arms required) — fit pre-normalized transmission cubes instead. |
+| `resolution=...` | Tabulated resolution from `load_resolution(...)`. **Mutually exclusive with the Gaussian parameters below** — pass either `resolution=` (tabulated) or the `flight_path_m`/`delta_t_us`/`delta_l_m` trio (Gaussian), never both. **Rejected for count cubes**: counts input with active resolution fails closed (the exact separate-arm model is single-spectrum only for now) — fit pre-normalized transmission cubes instead. |
 | `flight_path_m=...`, `delta_t_us=...`, `delta_l_m=...` | Gaussian resolution parameters (mutually exclusive with `resolution=`; same count-cube rejection applies). |
 | `groups=[...]` | Fit isotope groups instead of individual isotopes. |
 | `tzero_jacobian="..."` | Select the TZERO Jacobian implementation. |

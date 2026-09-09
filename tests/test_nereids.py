@@ -809,8 +809,11 @@ class TestExactResolvedCountsRoute:
 
         true_density = 5.0e-4
         energies = np.linspace(5.0, 8.0, 80)
-        xs_total = np.asarray(nereids.cross_sections(energies, u238_data)["total"])
-        true_transmission = np.asarray(nereids.beer_lambert(xs_total, true_density))
+        # Same temperature as the fit default (293.6 K): this anchor pins the
+        # detector-response routing — the Doppler physics has its own oracles.
+        true_transmission = np.asarray(
+            nereids.forward_model(energies, [(u238_data, true_density)])
+        )
 
         source = 4.0e4 * (1.0 + 0.4 * np.arange(80) / 79.0)
         detector_edges = 630.0 + 2.5 * np.arange(102)
@@ -854,7 +857,7 @@ class TestComputeModelJacobianCountsGate:
 
     def test_rejects_any_active_resolution(self):
         open_beam, energies, isotopes = self._args()
-        with pytest.raises(ValueError, match="separate open/sample response arms"):
+        with pytest.raises(ValueError, match="separate-arm model"):
             nereids.compute_model_jacobian(
                 open_beam,
                 energies,
@@ -2962,16 +2965,16 @@ class TestVenusMlbwRegression:
         )
 
     def test_counts_with_resolution_fails_before_fitting(self, venus_data):
-        """Resolved counts must fail closed instead of fitting R[T].
+        """Resolved counts without the exact-response inputs fail closed.
 
         Instrument response acts separately on the open and sample count
-        arms; the current counts path can only broaden the transmission
-        ratio, so the public API must reject the combination rather than
-        fall back to a scientifically wrong count model (Wave-1 PR-2a
-        gate; the exact separate-arm route lands with PR-2b).
+        arms. The exact separate-arm route (Wave-1 PR-2b) needs incident
+        fluence weights and measured detector-time bin edges; a resolution
+        without them must be rejected rather than fall back to the
+        scientifically wrong broadened-ratio count model R[T].
 
-        The pre-Wave-1 counts-KL anchors were captured through the now-
-        rejected R[T] route and cannot be reproduced by any valid
+        The pre-Wave-1 counts-KL anchors were captured through the
+        long-rejected R[T] route and cannot be reproduced by any valid
         configuration; the real-data counts-KL gate above re-anchors the
         valid (resolution-free) configuration instead.
         """
@@ -2979,7 +2982,7 @@ class TestVenusMlbwRegression:
 
         with pytest.raises(
             ValueError,
-            match="separate open/sample response arms",
+            match="separate-arm model",
         ):
             nereids.fit_counts_spectrum_typed(
                 S_agg,
@@ -3215,40 +3218,29 @@ class TestFixDensities:
             f"frozen density must report NaN σ, got {r.uncertainties[0]}"
         )
 
-    def test_fix_densities_kl_reports_temperature_uncertainty(self, u238_data):
-        """The KL transmission solver (``solver="kl"``) must also report a
-        finite temperature 1-σ with a density frozen — the parallel path the
-        LM tests don't exercise. Pre-fix a leftover full-index overwrite
-        clobbered ``temperature_k_unc`` to None on this path (review R2 P0)."""
+    def test_fix_densities_does_not_enable_transmission_kl(self, u238_data):
+        """Freezing density does not make fractional transmission valid
+        Poisson count data: ``solver="kl"`` on transmission is rejected."""
         energies = np.linspace(1.0, 30.0, 400)
         true_density = 8.0e-4
-        true_temp = 350.0
         t = np.asarray(
             nereids.forward_model(
-                energies, [(u238_data, true_density)], temperature_k=true_temp
+                energies, [(u238_data, true_density)], temperature_k=350.0
             )
         )
         sigma = np.full_like(t, 0.005)
-        r = nereids.fit_spectrum_typed(
-            transmission=t,
-            uncertainty=sigma,
-            energies=energies,
-            isotopes=[(u238_data, true_density)],
-            solver="kl",
-            temperature_k=300.0,
-            fit_temperature=True,
-            fix_densities=True,
-            max_iter=200,
-        )
-        assert bool(r.converged) is True
-        assert r.densities[0] == true_density
-        assert r.temperature_k is not None
-        # The regression: temperature_k_unc was None pre-fix on the KL path.
-        assert r.temperature_k_unc is not None
-        assert np.isfinite(r.temperature_k_unc) and r.temperature_k_unc > 0.0, (
-            "KL frozen-density temperature σ must be finite positive, "
-            f"got {r.temperature_k_unc}"
-        )
+        with pytest.raises(ValueError, match="Poisson/KL count"):
+            nereids.fit_spectrum_typed(
+                transmission=t,
+                uncertainty=sigma,
+                energies=energies,
+                isotopes=[(u238_data, true_density)],
+                solver="kl",
+                temperature_k=300.0,
+                fit_temperature=True,
+                fix_densities=True,
+                max_iter=200,
+            )
 
     def test_fix_densities_counts_path_holds_density_and_reports_uncertainty(
         self, u238_data
@@ -3375,33 +3367,17 @@ class TestFixDensities:
             "default (flag absent) must equal scale_by_chi2=False"
         )
 
-    def test_scale_by_chi2_transmission_kl_scales_by_reduced_chi2(self, u238_data):
-        """Issue #638 (review R1): on the transmission Poisson-KL path
-        (``fit_spectrum_typed(solver="kl")``), ``scale_by_chi2=True`` scales σ by
-        ``sqrt(reduced_chi_squared)`` — the SAME Gaussian goodness-of-fit the
-        result reports, the identical prescription the LM path applies — NOT a
-        Poisson deviance on transmission fractions. The direction guard is the
-        regression check: a deliberately poor fit (reduced-χ² > 1) must GROW σ;
-        the original bug scaled by the transmission Poisson deviance, which gave
-        ``D ≪ dof`` on a poor pseudo-Poisson fit and SHRANK σ (~30×)."""
+    def test_transmission_kl_rejected_regardless_of_scale_by_chi2(self, u238_data):
+        """The transmission Poisson-KL path was deleted with the exact-count
+        route: ``solver="kl"`` on normalized transmission is rejected before
+        any fit, with or without ``scale_by_chi2``."""
         energies = np.linspace(1.0, 30.0, 300)
-        true_density = 8.0e-4
-        t_clean = np.asarray(
-            nereids.forward_model(energies, [(u238_data, true_density)])
-        )
+        t_clean = np.asarray(nereids.forward_model(energies, [(u238_data, 8.0e-4)]))
         sigma = 0.01 * np.maximum(t_clean, 0.01)
-
-        # ±k (relative) high-frequency zig-zag the smooth density model cannot
-        # absorb. Multiplicative so transmission stays strictly positive; since
-        # σ = 0.01·max(t, 0.01), the reported Gaussian reduced-χ² ≈ (100·k)².
-        def zigzag(k):
-            sign = np.where(np.arange(t_clean.size) % 2 == 0, 1.0, -1.0)
-            return t_clean * (1.0 + k * sign)
-
-        def check(t):
-            def run(scale):
-                return nereids.fit_spectrum_typed(
-                    transmission=t,
+        for scale in (False, True):
+            with pytest.raises(ValueError, match="Poisson/KL count"):
+                nereids.fit_spectrum_typed(
+                    transmission=t_clean,
                     uncertainty=sigma,
                     energies=energies,
                     isotopes=[(u238_data, 5.0e-4)],
@@ -3409,32 +3385,6 @@ class TestFixDensities:
                     max_iter=200,
                     scale_by_chi2=scale,
                 )
-
-            unscaled = run(False)
-            scaled = run(True)
-            assert bool(unscaled.converged) and bool(scaled.converged)
-            rcs = float(scaled.reduced_chi_squared)
-            # The flag only rescales the post-convergence covariance, so the fit
-            # (and its reported GOF) is identical between the two runs.
-            assert float(unscaled.reduced_chi_squared) == pytest.approx(rcs, rel=1e-9)
-            assert np.isfinite(rcs) and rcs > 0.0
-            factor = float(np.sqrt(rcs))
-            s_un = float(unscaled.uncertainties[0])
-            s_sc = float(scaled.uncertainties[0])
-            assert s_sc == pytest.approx(s_un * factor, rel=1e-6), (
-                f"σ_scaled {s_sc} must equal σ_unscaled {s_un} × sqrt(rcs {rcs})"
-            )
-            return rcs, s_sc / s_un
-
-        # Poor fit (±3% → reduced-χ² ≈ 9 > 1): σ GROWS (bug inverted this).
-        rcs_poor, ratio_poor = check(zigzag(0.03))
-        assert rcs_poor > 1.0, f"zig-zag fit should give reduced-χ² > 1, got {rcs_poor}"
-        assert ratio_poor > 1.0, f"poor fit must grow σ, ratio = {ratio_poor}"
-
-        # Good fit (±0.3% → reduced-χ² ≈ 0.09 < 1): σ shrinks.
-        rcs_good, ratio_good = check(zigzag(0.003))
-        assert rcs_good < 1.0, f"clean-ish fit should give reduced-χ² < 1, got {rcs_good}"
-        assert ratio_good < 1.0, f"good fit must shrink σ, ratio = {ratio_good}"
 
     def test_fix_densities_spatial_map_holds_density(self, u238_data):
         """``spatial_map_typed`` must freeze densities per pixel: the frozen

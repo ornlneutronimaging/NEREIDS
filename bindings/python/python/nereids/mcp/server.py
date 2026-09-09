@@ -34,13 +34,12 @@ _MANIFEST_NAMES = (
     "analysis.json",
 )
 _COUNTS_RESOLUTION_UNSUPPORTED = (
-    "counts input with instrument resolution is unsupported: the current counts "
-    "path broadens transmission as R[T], but the physical detector model requires "
-    "separate open/sample response arms R[Phi] and R[Phi*T]. Fit pre-normalized "
-    "transmission instead (a transmission-domain model, not a counts likelihood; "
-    "its broadened ratio matches the measured R[Phi*T]/R[Phi] only where the "
-    "incident flux is smooth over the kernel width), or disable instrument "
-    "resolution until an exact counts response is implemented."
+    "counts input with instrument resolution is not available through the MCP "
+    "manifest: an exact count fit requires the separate-arm model R[Phi] and "
+    "R[Phi*T] built from incident fluence weights and measured detector-time "
+    "bin edges, which this manifest schema does not carry. Use the direct "
+    "Python fit_counts_spectrum_typed exact-count arguments, supply "
+    "pre-normalized transmission, or disable instrument resolution."
 )
 _SAFE_KEY = re.compile(r"[^A-Za-z0-9_]+")
 
@@ -682,8 +681,6 @@ def _process_single_spectrum(
         entries, base, default_library=str(config.get("library", "endf8.1"))
     )
     resolution = _resolution_kwargs(base, config)
-    solver = str(fit_config.get("solver", "lm")).lower()
-
     if kind in {"counts_npz", "counts"}:
         sample_key = data_config.get("sample_key", "sample_counts")
         open_beam_key = data_config.get("open_beam_key", "open_beam_counts")
@@ -703,40 +700,46 @@ def _process_single_spectrum(
         if sample.ndim != 1 or open_beam.ndim != 1:
             raise ValueError("single_spectrum counts arrays must be 1D or 3D")
         c = float(data_config.get("pc_ratio", arrays.get("pc_ratio", 1.0)))
-        fit_domain = str(
-            fit_config.get(
-                "fit_domain",
-                "transmission" if solver == "lm" else "counts",
+        fit_domain = str(fit_config.get("fit_domain", "counts")).lower()
+        if fit_domain != "counts":
+            raise ValueError(
+                "raw count input cannot be fit in the transmission domain: "
+                "the conversion discards open-beam count uncertainty; use "
+                "fit_domain='counts' with solver='auto' or solver='kl'"
             )
-        ).lower()
-        if fit_domain == "counts":
-            kwargs = _single_fit_kwargs(fit_config, resolution, counts=True)
-            kwargs["c"] = float(fit_config.get("c", c))
-            result = nereids.fit_counts_spectrum_typed(
-                sample_counts=sample,
-                open_beam_counts=open_beam,
-                energies=energies,
-                isotopes=isotopes,
-                **kwargs,
+        requested_solver = str(fit_config.get("solver", "auto")).lower()
+        if requested_solver == "lm":
+            raise ValueError(
+                "raw count input cannot use solver='lm': the least-squares "
+                "transmission engine would discard open-beam count uncertainty; "
+                "use solver='auto' or solver='kl'"
             )
-            transmission = sample / np.maximum(kwargs["c"] * open_beam, 1.0)
-            uncertainty = transmission * np.sqrt(
-                1.0 / np.maximum(sample, 1.0) + 1.0 / np.maximum(open_beam, 1.0)
-            )
-        else:
-            transmission = sample / np.maximum(c * open_beam, 1.0)
-            uncertainty = transmission * np.sqrt(
-                1.0 / np.maximum(sample, 1.0) + 1.0 / np.maximum(open_beam, 1.0)
-            )
-            kwargs = _single_fit_kwargs(fit_config, resolution, counts=False)
-            result = nereids.fit_spectrum_typed(
-                transmission=transmission,
-                uncertainty=uncertainty,
-                energies=energies,
-                isotopes=isotopes,
-                **kwargs,
-            )
+        kwargs = _single_fit_kwargs(fit_config, resolution, counts=True)
+        kwargs["c"] = float(fit_config.get("c", c))
+        result = nereids.fit_counts_spectrum_typed(
+            sample_counts=sample,
+            open_beam_counts=open_beam,
+            energies=energies,
+            isotopes=isotopes,
+            **kwargs,
+        )
+        transmission = sample / np.maximum(kwargs["c"] * open_beam, 1.0)
+        uncertainty = transmission * np.sqrt(
+            1.0 / np.maximum(sample, 1.0) + 1.0 / np.maximum(open_beam, 1.0)
+        )
     elif kind in {"transmission_npz", "transmission", "spectrum"}:
+        fit_domain = str(fit_config.get("fit_domain", "transmission")).lower()
+        if fit_domain != "transmission":
+            raise ValueError(
+                "normalized transmission input must use fit_domain='transmission' "
+                "with solver='auto' or solver='lm'"
+            )
+        requested_solver = str(fit_config.get("solver", "auto")).lower()
+        if requested_solver in {"kl", "poisson", "poisson_kl", "joint_poisson"}:
+            raise ValueError(
+                "normalized transmission input cannot use a Poisson/KL count "
+                "likelihood; use solver='auto' or solver='lm'"
+            )
         trans_key = data_config.get("transmission_key", "transmission")
         unc_key = data_config.get("uncertainty_key", "uncertainty")
         _require_npz_keys(
@@ -963,6 +966,22 @@ def _process_density_map(
     initial_densities = [density for _, density in isotopes]
     isotope_data = [data for data, _ in isotopes]
     kwargs = _spatial_fit_kwargs(fit_config, _resolution_kwargs(base, config))
+    requested_solver = str(fit_config.get("solver", "auto")).lower()
+    if input_kind == "counts" and requested_solver == "lm":
+        raise ValueError(
+            "raw count maps cannot use solver='lm': use solver='auto' or "
+            "solver='kl' so the separate sample/open-beam arms are preserved"
+        )
+    if input_kind == "transmission" and requested_solver in {
+        "kl",
+        "poisson",
+        "poisson_kl",
+        "joint_poisson",
+    }:
+        raise ValueError(
+            "normalized transmission maps cannot use a Poisson/KL count "
+            "likelihood; use solver='auto' or solver='lm'"
+        )
     if c is not None and "c" not in kwargs:
         kwargs["c"] = c
     result = nereids.spatial_map_typed(
@@ -1200,41 +1219,75 @@ def _validate_workflow(manifest: dict[str, Any]) -> dict[str, Any]:
         else:
             errors.append(f"unknown resolution kind: {resolution_kind}")
 
-    # Raw count inputs fitted in the COUNTS DOMAIN need two separately
-    # broadened response arms: R[Phi] for the open beam and R[Phi*T] for the
-    # sample.  The current fitting API only has R[T], so approving such a
-    # manifest would make a dry run disagree with the production pipeline's
-    # fail-closed gate.  Mirror the run path's routing exactly:
-    # density_map/spatial count cubes always fit in the counts domain
-    # (from_counts), while a single_spectrum counts input does so only when
-    # the effective fit domain is "counts" (fit.fit_domain, defaulting by
-    # solver) — the transmission fit domain converts to a pre-normalized
-    # transmission fit, which legitimately accepts resolution.  A non-.npz
-    # single_spectrum path is coerced to a transmission spectrum by the run
-    # path regardless of the declared kind.
+    # Mirror the run path's domain/solver routing branch by branch so a dry
+    # run never approves a manifest the production pipeline rejects (or vice
+    # versa).  Raw counts always fit in the counts domain now — the legacy
+    # counts→transmission conversion was deleted with the exact-count route —
+    # and cross-domain solver requests are rejected on both run and validate.
+    # Raw count inputs with an active resolution still error through MCP: the
+    # exact separate-arm fit needs incident fluence weights and measured
+    # detector-time bin edges, which the manifest schema does not carry.
     counts_input = effective_kind in {
         "counts_npz",
         "counts",
         "nexus_histogram",
         "nexus",
     }
+    fit_config = _get_fit_config(config)
+    solver = str(fit_config.get("solver", "auto")).lower()
     if mode in {"single_spectrum", "fit_spectrum", "spectrum"}:
-        fit_config = _get_fit_config(config)
-        solver = str(fit_config.get("solver", "lm")).lower()
-        fit_domain = str(
-            fit_config.get(
-                "fit_domain",
-                "transmission" if solver == "lm" else "counts",
-            )
-        ).lower()
         # Byte-identical to the run path's routing check
         # (`data_path.suffix == ".npz"` on the resolved path): `DATA.NPZ`
         # or a symlink to a non-npz target is text-parsed there and must
         # not be treated as a counts-domain npz here.
         resolved_data_path = _resolve_path(base, data_config.get("path"))
         is_npz = resolved_data_path is not None and resolved_data_path.suffix == ".npz"
-        counts_domain_fit = counts_input and is_npz and fit_domain == "counts"
+        counts_route = counts_input and is_npz
+        if counts_route:
+            fit_domain = str(fit_config.get("fit_domain", "counts")).lower()
+            if fit_domain != "counts":
+                errors.append(
+                    "raw count input cannot be fit in the transmission domain: "
+                    "the conversion discards open-beam count uncertainty; use "
+                    "fit_domain='counts' with solver='auto' or solver='kl'"
+                )
+            elif solver == "lm":
+                errors.append(
+                    "raw count input cannot use solver='lm': the least-squares "
+                    "transmission engine would discard open-beam count "
+                    "uncertainty; use solver='auto' or solver='kl'"
+                )
+        else:
+            fit_domain = str(fit_config.get("fit_domain", "transmission")).lower()
+            if fit_domain != "transmission":
+                errors.append(
+                    "normalized transmission input must use "
+                    "fit_domain='transmission' with solver='auto' or solver='lm'"
+                )
+            elif solver in {"kl", "poisson", "poisson_kl", "joint_poisson"}:
+                errors.append(
+                    "normalized transmission input cannot use a Poisson/KL count "
+                    "likelihood; use solver='auto' or solver='lm'"
+                )
+        counts_domain_fit = counts_route
     else:
+        if mode in {"density_map", "spatial_map"}:
+            if counts_input and solver == "lm":
+                errors.append(
+                    "raw count maps cannot use solver='lm': use solver='auto' or "
+                    "solver='kl' so the separate sample/open-beam arms are "
+                    "preserved"
+                )
+            if not counts_input and solver in {
+                "kl",
+                "poisson",
+                "poisson_kl",
+                "joint_poisson",
+            }:
+                errors.append(
+                    "normalized transmission maps cannot use a Poisson/KL count "
+                    "likelihood; use solver='auto' or solver='lm'"
+                )
         counts_domain_fit = counts_input
     resolution_active = resolution_kind not in {None, "none", "disabled", "false"}
     if counts_domain_fit and resolution_active:

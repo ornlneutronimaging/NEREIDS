@@ -133,7 +133,7 @@ Minimal spectrum manifest:
     "isotopes": [
       {"isotope": "Hf-177", "endf_file": "Hf-177.endf", "initial_density": 1e-5}
     ],
-    "fit": {"solver": "lm", "fit_domain": "transmission", "max_iter": 100},
+    "fit": {"solver": "kl", "fit_domain": "counts", "max_iter": 100},
     "resolution": {
       "kind": "gaussian",
       "flight_path_m": 25.0,

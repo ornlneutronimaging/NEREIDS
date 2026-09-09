@@ -75,8 +75,9 @@ Poisson KL divergence — is set on the Analyze step.)
 
 ### Analyze
 
-Choose the solver (Levenberg-Marquardt or Poisson KL divergence), then run the
-fit. For spatial maps, a progress bar tracks per-pixel fitting with rayon
+Choose the solver (Levenberg-Marquardt, or Poisson KL divergence when both
+sample and open-beam count cubes are loaded — the count likelihood needs the
+separate arms), then run the fit. For spatial maps, a progress bar tracks per-pixel fitting with rayon
 parallelism. Click any pixel to inspect its individual fit. Fit feedback shows
 green (good fit) or red (failed) status.
 
