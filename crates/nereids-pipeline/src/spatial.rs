@@ -252,7 +252,7 @@ fn apply_spatial_polish_default(config: UnifiedFitConfig, n_pixels: usize) -> Un
 /// `Err(_) => failed_count += 1` swallow at the bottom of the loop.
 ///
 /// Every gate here mirrors a per-pixel `Err(PipelineError::InvalidParameter)`
-/// raised inside `fit_spectrum_typed` / `fit_transmission_poisson` /
+/// raised inside `fit_spectrum_typed` /
 /// `fit_counts_joint_poisson` whose decision depends only on
 /// `(input variant, config)` — i.e. fires identically for every pixel.
 /// Per-pixel error variants (numerical fit failure, per-pixel detector
@@ -328,25 +328,38 @@ fn validate_spatial_fit_preflight(
     // `UnifiedFitConfig` but takes the 1D `InputData`; inline the
     // resolution here so we do not have to materialise a 1D stub.
     let is_counts = input.is_counts();
+    if config.exact_count_response().is_some() {
+        return Err(PipelineError::InvalidParameter(
+            "exact resolved counts are currently supported by the single-spectrum \
+             count fitter only; spatial mapping would rebuild the detector matrix \
+             for every pixel and is disabled until that fixed matrix is cached once"
+                .into(),
+        ));
+    }
     // Hoist the scientifically unsupported counts + resolution combination so
     // it becomes one actionable boundary error, not an all-NaN map after every
     // per-pixel error is swallowed by the rayon loop.
-    validate_counts_resolution_route(is_counts, config)?;
+    validate_counts_resolution_route(is_counts, input.shape().0, config)?;
     let is_kl = matches!(config.solver(), SolverConfig::PoissonKL(_))
         || (matches!(config.solver(), SolverConfig::Auto) && is_counts);
 
-    // Gate: transmission + Poisson-KL solver path does not honour
-    // `fit_energy_range` — `fit_transmission_poisson` rejects this
-    // combination per-pixel (`pipeline.rs::fit_transmission_poisson`).
-    // Without hoisting, every pixel errors and the spatial layer
-    // hides the dispatch-level incompatibility.  Counts-KL (joint-
-    // Poisson) and LM transmission both honour the mask correctly,
-    // so this gate is scoped to the transmission + KL combination.
-    if !is_counts && is_kl && config.fit_energy_range().is_some() {
+    // Fractional transmission is not Poisson count data. Hoist the
+    // single-spectrum rejection so the pixel loop cannot turn it into an
+    // all-NaN success-shaped result.
+    if !is_counts && is_kl {
         return Err(PipelineError::InvalidParameter(
-            "fit_energy_range is not supported for the transmission + \
-             Poisson-KL solver path. Use joint-Poisson (provide sample + \
-             open-beam counts) or switch to the LM transmission solver."
+            "spatial_map_typed: normalized transmission cannot use the Poisson/KL \
+             count objective because fractional transmission is not Poisson count \
+             data and the supplied uncertainty would be ignored; use the LM \
+             least-squares transmission engine, or supply separate open/sample counts"
+                .into(),
+        ));
+    }
+    if !is_counts && config.counts_background().is_some() {
+        return Err(PipelineError::InvalidParameter(
+            "spatial_map_typed: counts background configuration cannot be used with \
+             transmission data; use SAMMY transmission_background or \
+             multiplicative_baseline, or supply separate open/sample counts"
                 .into(),
         ));
     }
@@ -763,8 +776,9 @@ fn validate_spatial_data_values(
 /// `input` selects the per-pixel objective: pre-normalized
 /// [`InputData3D::Transmission`] (+ per-bin uncertainty),
 /// [`InputData3D::Counts`] (sample + open-beam), or
-/// [`InputData3D::CountsWithNuisance`] (sample + flux + background
-/// nuisance arms; counts-domain solvers only).
+/// [`InputData3D::CountsWithNuisance`] (legacy compatibility input; a nonzero
+/// background is rejected because it is not connected to the physical
+/// two-arm likelihood).
 ///
 /// # Validation (all up-front, before any pixel is fitted)
 ///
@@ -778,11 +792,9 @@ fn validate_spatial_data_values(
 ///   map.  For transmission inputs
 ///   with a `fit_energy_range`, the value checks are scoped to the
 ///   active bins — out-of-range bins may contain NaN by design.
-/// * Known-degenerate configurations are rejected with a diagnostic
-///   rather than letting every pixel fail into an all-NaN map:
-///   counts + LM + `fit_energy_scale` (numerically ill-conditioned
-///   per-pixel — issue #458 B3) and `CountsWithNuisance` with an LM
-///   solver (requires a counts-domain solver).
+/// * Invalid domain/engine configurations are rejected with a diagnostic
+///   rather than letting every pixel fail into an all-NaN map. Raw counts use
+///   the joint-Poisson engine; LM is reserved for normalized transmission.
 ///   `transmission_background` settings are validated here for the
 ///   same reason.  (`fit_energy_scale` together with `fit_temperature`
 ///   is SUPPORTED since issue #634 — the energy-scale model carries a
@@ -882,58 +894,23 @@ pub fn spatial_map_typed(
         )));
     }
 
-    // Reject known-broken configurations at entry.
+    // Raw counts are not silently divided into transmission for LM. Hoist the
+    // single-spectrum rejection so a spatial call cannot degrade into an
+    // all-NaN success-shaped result after every pixel fails. This subsumes
+    // both the historical #458 B3 counts+LM+energy-scale instability guard
+    // and the CountsWithNuisance+LM hoist: every count variant plus LM is
+    // rejected at the boundary now.
     //
-    // Issue #458 B3: per-pixel LM with `fit_energy_scale=True` on
-    // counts data is numerically ill-conditioned.  On real VENUS Hf
-    // 120 min, only ~8 % of pixels converged; `t0` drifts to the
-    // ±10 µs bounds while `density` absorbs the compensating shift
-    // (4-order-of-magnitude errors).  Reject upfront with a pointer
-    // to the global-calibration workaround.
-    //
-    // Note: the LM-on-transmission path with `fit_energy_scale=True`
-    // has the same structural issue, but is left unblocked here —
-    // per-pixel transmission has higher SNR per bin (pre-normalised
-    // by open-beam) and this combination is sometimes useful for
-    // calibration crosschecks.  The config still produces NaN maps
-    // for failed pixels thanks to B1 gating.
-    if input.is_counts()
-        && matches!(config.solver(), SolverConfig::LevenbergMarquardt(_))
-        && config.fit_energy_scale()
-    {
-        return Err(PipelineError::InvalidParameter(
-            "spatial_map_typed: solver='lm' + fit_energy_scale=true on counts input is \
-             numerically unstable per-pixel (issue #458 B3). Recommended workaround: fit \
-             TZERO once on the aggregated spectrum via fit_counts_spectrum_typed, then \
-             build the corrected energy grid and pass it to spatial_map_typed with \
-             fit_energy_scale=false. For counts data, solver='kl' (or 'auto') is robust \
-             with per-pixel TZERO fitting."
-                .into(),
-        ));
-    }
-
-    // Issue #634: `fit_energy_scale` + `fit_temperature` is now supported —
+    // Issue #634: `fit_energy_scale` + `fit_temperature` is supported —
     // `EnergyScaleTransmissionModel` wires a fitted temperature column, so
     // per-pixel `fit_spectrum_typed` handles the combination and no spatial
-    // guard is needed. (The #458 B3 guard above — LM + fit_energy_scale on
-    // counts — is a separate, still-active numerical-stability restriction.)
-
-    // `fit_spectrum_typed` rejects `CountsWithNuisance + LM` per-pixel
-    // (see `validate_input_solver` in `pipeline.rs` — "CountsWithNuisance
-    // requires a counts-domain solver"), but per-pixel errors here are
-    // swallowed as `n_failed` and `spatial_map_typed` returns
-    // `Ok(SpatialResult)` with all-NaN maps.  Hoist the rejection so
-    // callers get a clear diagnostic instead of a silently-failed
-    // spatial result.
-    if matches!(input, InputData3D::CountsWithNuisance { .. })
-        && matches!(config.solver(), SolverConfig::LevenbergMarquardt(_))
-    {
+    // guard is needed.
+    if input.is_counts() && matches!(config.solver(), SolverConfig::LevenbergMarquardt(_)) {
         return Err(PipelineError::InvalidParameter(
-            "spatial_map_typed: InputData3D::CountsWithNuisance requires a counts-domain \
-             solver (joint-Poisson via SolverConfig::PoissonKL or SolverConfig::Auto); \
-             SolverConfig::LevenbergMarquardt cannot use the user-supplied nuisance \
-             parameters (alpha_1, alpha_2).  Choose a counts-domain solver, or drop the \
-             nuisance arm by passing `InputData3D::Counts` instead."
+            "spatial_map_typed: separate open/sample counts cannot use the LM \
+             least-squares transmission engine because silent ratio conversion loses \
+             open-beam uncertainty and count statistics; use the Poisson/KL count \
+             engine or SolverConfig::Auto"
                 .into(),
         ));
     }
@@ -1046,11 +1023,11 @@ pub fn spatial_map_typed(
     // Whether the per-pixel dispatch routes through the counts-KL
     // (joint-Poisson) solver.  True iff the input is counts AND the
     // effective solver is either explicit `PoissonKL` or `Auto`
-    // (Auto resolves to PoissonKL on counts input).  When false (LM
-    // dispatch on counts, or any transmission input), per-pixel
-    // SpectrumFitResult.deviance_per_dof is `None`, so the spatial
-    // deviance_per_dof_map should also be `None` — otherwise GUI /
-    // Python consumers using `is_some()` to label GOF as "D/dof"
+    // (Auto resolves to PoissonKL on counts input; counts + LM was
+    // rejected at preflight).  When false (a transmission LM input),
+    // per-pixel SpectrumFitResult.deviance_per_dof is `None`, so the
+    // spatial deviance_per_dof_map should also be `None` — otherwise
+    // GUI / Python consumers using `is_some()` to label GOF as "D/dof"
     // would mislabel an all-NaN map.
     let dispatches_to_counts_kl =
         input.is_counts() && !matches!(config.solver(), SolverConfig::LevenbergMarquardt(_));
@@ -3677,14 +3654,13 @@ mod tests {
                 .expect_err("spatial counts + resolution must fail at preflight");
             let msg = err.to_string();
             assert!(
-                msg.contains("instrument resolution")
-                    && msg.contains("separate open/sample response arms"),
+                msg.contains("instrument resolution") && msg.contains("separate-arm model"),
                 "expected physical counts-response rejection, got: {msg}"
             );
         }
     }
 
-    /// `CountsWithNuisance + LM` is rejected up-front so the caller
+    /// Every count variant plus LM is rejected up-front so the caller
     /// does not get an all-NaN spatial result from per-pixel `n_failed`
     /// swallowing.  `fit_spectrum_typed` rejects this combo per-pixel;
     /// the hoisted spatial-level rejection surfaces the same diagnostic
@@ -3719,8 +3695,8 @@ mod tests {
             .expect_err("CountsWithNuisance + LM must be rejected up-front");
         let msg = err.to_string();
         assert!(
-            msg.contains("CountsWithNuisance") && msg.contains("counts-domain"),
-            "error must mention CountsWithNuisance + counts-domain requirement, got: {msg}"
+            msg.contains("counts") && msg.contains("least-squares") && msg.contains("Poisson"),
+            "error must explain the count-domain engine requirement, got: {msg}"
         );
     }
 
@@ -3774,7 +3750,7 @@ mod tests {
             "expected InvalidParameter, got {err:?}"
         );
         assert!(
-            msg.contains("CountsWithNuisance") && msg.contains("counts-domain"),
+            msg.contains("counts") && msg.contains("least-squares") && msg.contains("Poisson"),
             "error must surface the solver mismatch (not the fit-range gate), got: {msg}"
         );
         assert!(
@@ -3946,12 +3922,10 @@ mod tests {
         assert!(dpd.iter().all(|v| v.is_finite()));
     }
 
-    /// `(Counts, LM)` spatial dispatch must NOT allocate a
-    /// `deviance_per_dof_map` — the per-pixel LM path doesn't populate
-    /// `deviance_per_dof`, so an `Some(all-NaN)` map would mislead GUI /
-    /// Python consumers that switch the GOF label on `is_some()`.
+    /// `(Counts, LM)` is rejected at the spatial boundary rather than
+    /// returning a success-shaped map from a lossy ratio conversion.
     #[test]
-    fn test_spatial_map_typed_counts_lm_no_deviance_map() {
+    fn test_spatial_map_typed_counts_lm_is_rejected() {
         let data = u238_single_resonance();
         let energies: Vec<f64> = (0..51).map(|i| 1.0 + (i as f64) * 0.1).collect();
         let (t_3d, _) = synthetic_4x4_transmission(&data, 0.0005, &energies);
@@ -3975,21 +3949,19 @@ mod tests {
             vec![0.001],
         )
         .unwrap()
-        // Force LM (counts → transmission conversion under the hood); no
-        // deviance is computed by that dispatch.
         .with_solver(SolverConfig::LevenbergMarquardt(LmConfig::default()));
 
         let input = InputData3D::Counts {
             sample_counts: sample.view(),
             open_beam_counts: open_beam.view(),
         };
-        let r = spatial_map_typed(&input, &config, None, None, None).unwrap();
+        let err = spatial_map_typed(&input, &config, None, None, None)
+            .expect_err("counts + LM must be rejected at the spatial boundary");
+        let msg = err.to_string();
         assert!(
-            r.deviance_per_dof_map.is_none(),
-            "(Counts, LM) must not allocate deviance_per_dof_map (would mislabel GOF in GUI)"
+            msg.contains("counts") && msg.contains("least-squares") && msg.contains("Poisson"),
+            "error must explain the count-domain engine requirement, got: {msg}"
         );
-        // chi_squared_map (Pearson) is the GOF on the LM path.
-        assert!(r.chi_squared_map.iter().any(|v| v.is_finite()));
     }
 
     /// Transmission input must never produce a `deviance_per_dof_map`
@@ -4108,10 +4080,9 @@ mod tests {
         assert!(result.l_scale_map.is_none());
     }
 
-    /// `(Counts + LM + fit_energy_scale=true)` must be rejected at
-    /// `spatial_map_typed` entry (issue #458 B3).  The combination
-    /// passed silently before and produced 92 % non-convergence with
-    /// garbage parameter values on real VENUS data.
+    /// `(Counts + LM + fit_energy_scale=true)` stays rejected — historically
+    /// as the #458 B3 instability guard, now subsumed by the blanket
+    /// counts+LM route rejection.
     #[test]
     fn test_spatial_map_typed_rejects_counts_lm_with_energy_scale() {
         let rd = u238_single_resonance();
@@ -4137,12 +4108,8 @@ mod tests {
             .expect_err("LM + counts + fit_energy_scale must be rejected");
         let msg = err.to_string();
         assert!(
-            msg.contains("fit_energy_scale") && msg.contains("lm"),
-            "error message should name both culprits, got: {msg}"
-        );
-        assert!(
-            msg.contains("#458"),
-            "error message should reference the tracking issue, got: {msg}"
+            msg.contains("counts") && msg.contains("least-squares") && msg.contains("Poisson"),
+            "error must explain the count-domain engine requirement, got: {msg}"
         );
     }
 
@@ -4318,7 +4285,7 @@ mod tests {
     }
 
     #[test]
-    fn test_spatial_map_transmission_poisson_rejects_fit_energy_range_up_front() {
+    fn test_spatial_map_transmission_poisson_rejected_up_front() {
         let rd = u238_single_resonance();
         let energies: Vec<f64> = (0..51).map(|i| 1.0 + (i as f64) * 0.2).collect();
         let (t_3d, u_3d) = synthetic_4x4_transmission(&rd, 0.001, &energies);
@@ -4326,10 +4293,8 @@ mod tests {
             transmission: t_3d.view(),
             uncertainty: u_3d.view(),
         };
-        // Transmission + Poisson-KL + any `fit_energy_range` is
-        // unsupported because the transmission-domain `poisson_fit`
-        // does not honour the active mask.  The per-pixel rejection
-        // would otherwise silently produce an all-NaN map.
+        // Fractional transmission is not Poisson count data; the per-pixel
+        // rejection would otherwise silently produce an all-NaN map.
         let config = UnifiedFitConfig::new(
             energies,
             vec![rd],
@@ -4339,19 +4304,17 @@ mod tests {
             vec![0.001],
         )
         .unwrap()
-        .with_solver(SolverConfig::PoissonKL(PoissonConfig::default()))
-        .with_fit_energy_range(Some((2.0, 8.0)))
-        .unwrap();
+        .with_solver(SolverConfig::PoissonKL(PoissonConfig::default()));
 
         let err = spatial_map_typed(&data, &config, None, None, None)
-            .expect_err("transmission + Poisson-KL + fit_energy_range must be rejected up-front");
+            .expect_err("transmission + Poisson-KL must be rejected up-front");
         let msg = err.to_string();
         assert!(
             matches!(err, PipelineError::InvalidParameter(_)),
             "expected InvalidParameter, got {err:?}"
         );
         assert!(
-            msg.contains("fit_energy_range") && msg.contains("Poisson-KL"),
+            msg.contains("normalized transmission") && msg.contains("Poisson"),
             "error must name the incompatibility, got: {msg}"
         );
     }

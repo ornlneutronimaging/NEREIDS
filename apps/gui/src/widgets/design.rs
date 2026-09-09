@@ -1079,12 +1079,9 @@ pub(crate) fn counts_resolution_overlay_unsupported(
     shows_counts && has_instrument_resolution
 }
 
-pub(crate) const COUNTS_RESOLUTION_OVERLAY_MESSAGE: &str = "Count fit overlay hidden: instrument resolution needs separate open/sample response arms \
-     R[Phi] and R[Phi*T]. Multiplying c*OB by R[T] is not a physical count model. Fit \
-     pre-normalized transmission instead (a transmission-domain model, not a counts \
-     likelihood; its broadened ratio matches the measurement only for flux smooth over \
-     the kernel width), or disable instrument resolution until an exact count response \
-     is implemented.";
+pub(crate) const COUNTS_RESOLUTION_OVERLAY_MESSAGE: &str = "Count fit overlay hidden: instrument resolution needs the exact separate-arm model \
+     R[Phi] and R[Phi*T]. Multiplying c*OB by R[T] is not a physical count model, so \
+     the transmission-only overlay cannot represent a resolved count fit.";
 
 /// Build a fit overlay line from a `SpectrumFitResult`.
 ///
