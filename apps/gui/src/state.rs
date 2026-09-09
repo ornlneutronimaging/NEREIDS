@@ -916,6 +916,11 @@ pub struct AppState {
 
     // -- Background task receivers and cancellation --
     pub pending_spatial: Option<mpsc::Receiver<Result<SpatialResult, String>>>,
+    /// Cancellation token owned by the current in-flight spatial run, if any.
+    /// Dedicated per run so an obsolete spatial worker can be stopped without
+    /// cancelling the unrelated ENDF / forward-model / detectability workers
+    /// that share `cancel_token`.
+    pub spatial_cancel_token: Option<Arc<AtomicBool>>,
     pub pending_endf: Option<mpsc::Receiver<EndfFetchResult>>,
     pub cancel_token: Arc<AtomicBool>,
 
@@ -1294,6 +1299,11 @@ impl AppState {
         self.cancel_token.store(true, Ordering::Relaxed);
         // Replace with a fresh token for future tasks
         self.cancel_token = Arc::new(AtomicBool::new(false));
+        // The spatial worker listens on its own per-run token, not the
+        // shared one; stop it explicitly.
+        if let Some(token) = self.spatial_cancel_token.take() {
+            token.store(true, Ordering::Relaxed);
+        }
         self.pending_spatial = None;
         self.pending_endf = None;
         self.pending_fm_endf = None;
@@ -1352,12 +1362,48 @@ impl AppState {
     pub fn invalidate_fit_results(&mut self) {
         self.cancel_pending_tasks();
         self.normalized = None;
+        self.clear_pixel_fit_output();
+        self.clear_spatial_fit_output();
+    }
+
+    /// Clear the cached single-spectrum result before starting a new pixel or
+    /// ROI fit.  Input data, normalization, selection, and spatial-map results
+    /// remain valid and are deliberately preserved.
+    pub fn clear_pixel_fit_output(&mut self) {
         self.pixel_fit_result = None;
         self.residuals_cache = None;
-        self.spatial_result = None;
         self.last_fit_feedback = None;
+        self.show_analyze_fit_info = false;
+    }
+
+    /// Clear the cached map before starting a new spatial fit.  This prevents
+    /// Results and export actions from reusing an older map while the new run
+    /// is pending or after it fails.  An in-flight spatial worker is stopped
+    /// through its dedicated per-run token so its obsolete computation does
+    /// not keep burning CPU after the UI has dropped the receiver.
+    pub fn clear_spatial_fit_output(&mut self) {
+        if let Some(token) = self.spatial_cancel_token.take() {
+            token.store(true, Ordering::Relaxed);
+        }
+        self.pending_spatial = None;
+        self.is_fitting = false;
+        self.fitting_progress = None;
+        self.spatial_result = None;
+        self.residuals_cache = None;
         self.fitting_rois.clear();
         self.export_status = None;
+    }
+
+    /// Invalidate all fit outputs after a fit-control change while preserving
+    /// loaded inputs, normalization, energy grid, pixel selection, and ROIs.
+    /// Any in-flight spatial worker is cancelled through its dedicated
+    /// per-run token and its receiver detached, so an old-configuration
+    /// result can neither arrive nor keep computing.  The shared cancellation
+    /// token is deliberately left alone because it belongs to unrelated
+    /// ENDF, forward-model, and detectability workers.
+    pub fn invalidate_analysis_outputs(&mut self) {
+        self.clear_pixel_fit_output();
+        self.clear_spatial_fit_output();
     }
 
     /// Recompute the effective pixel mask FROM SCRATCH (#646):
@@ -1677,6 +1723,7 @@ impl Default for AppState {
             analyze_tof_slice_index: 0,
 
             pending_spatial: None,
+            spatial_cancel_token: None,
             pending_endf: None,
             cancel_token: Arc::new(AtomicBool::new(false)),
 

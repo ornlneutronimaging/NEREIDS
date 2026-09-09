@@ -55,6 +55,7 @@ use nereids_fitting::resolution_calib::{
 };
 use nereids_io::normalization::{self as norm, NormalizationParams};
 use nereids_io::tof::BeamlineParams;
+use nereids_physics::counts_response;
 use nereids_physics::doppler::{self, DopplerParams};
 use nereids_physics::ikeda_carpenter::{
     EnergyLaw, IkedaCarpenter, IkedaCarpenterParams, SynthesisGrid,
@@ -64,6 +65,10 @@ use nereids_physics::resolution::{
 };
 use nereids_physics::transmission::{self, InstrumentParams, SampleParams};
 use nereids_pipeline::detectability;
+
+// PyO3 needs a literal here to expose the real default through
+// `inspect.signature`; keep that public literal locked to the core default.
+const _: () = assert!(DEFAULT_PSR_FWHM_NS == 350.0);
 
 /// Python wrapper for ENDF resonance data.
 ///
@@ -781,6 +786,21 @@ impl PyTabulatedResolution {
             .first()
             .map(|(o, _)| o.len())
             .unwrap_or(0)
+    }
+
+    /// Probability that a neutron at one true energy is recorded in each
+    /// adjacent detector-time bin. The tabulated UDR is evaluated directly;
+    /// the result is not renormalized when the supplied time window omits part
+    /// of the pulse.
+    fn detector_bin_probabilities(
+        &self,
+        true_energy_ev: f64,
+        detector_time_edges_us: Vec<f64>,
+        timing_offset_us: f64,
+    ) -> PyResult<Vec<f64>> {
+        self.inner
+            .detector_bin_probabilities(true_energy_ev, &detector_time_edges_us, timing_offset_us)
+            .map_err(|error| pyo3::exceptions::PyValueError::new_err(error.to_string()))
     }
 
     fn __repr__(&self) -> String {
@@ -1616,7 +1636,7 @@ impl PyResolutionCalibration {
     restarts=1, ic_n_energies=64, ic_n_tau=500,
     fit_t0=false, fit_l_scale=false, t0_center_us=0.0, l_scale_center=1.0,
     t0_prior_us=None, l_scale_prior=None,
-    psr_fwhm_ns=DEFAULT_PSR_FWHM_NS, fit_psr=false
+    psr_fwhm_ns=350.0, fit_psr=false
 ))]
 #[allow(clippy::too_many_arguments)]
 fn calibrate_resolution(
@@ -2383,6 +2403,74 @@ fn py_apply_resolution<'py>(
     let result = py.detach(move || resolution::apply_resolution(&e_owned, &s_owned, &res_fn));
     let result = result.map_err(|e| pyo3::exceptions::PyValueError::new_err(format!("{}", e)))?;
     Ok(PyArray1::from_vec(py, result))
+}
+
+/// Predict separate open-beam and sample counts on actual detector-time bins.
+///
+/// ``incident_fluence_weights[j]`` is the incident flux density at true energy
+/// ``j`` times detector efficiency times the caller's energy-integration
+/// weight (the discrete form of the contract's Phi*epsilon; pipeline-map
+/// R5·7). The response is applied to the open and attenuated sample arms
+/// separately; this function never broadens a transmission ratio. The last
+/// two returned values are the expected open-beam and sample counts falling
+/// outside the supplied acquisition window — reported, never renormalized
+/// into the window.
+#[pyfunction]
+#[pyo3(name = "two_arm_count_response", signature = (
+    true_energies_ev,
+    incident_fluence_weights,
+    transmission,
+    detector_time_edges_us,
+    resolution,
+    timing_offset_us = 0.0,
+))]
+fn py_two_arm_count_response<'py>(
+    py: Python<'py>,
+    true_energies_ev: PyReadonlyArray1<f64>,
+    incident_fluence_weights: PyReadonlyArray1<f64>,
+    transmission: PyReadonlyArray1<f64>,
+    detector_time_edges_us: PyReadonlyArray1<f64>,
+    resolution: &Bound<'_, PyAny>,
+    timing_offset_us: f64,
+) -> PyResult<(
+    Bound<'py, PyArray1<f64>>,
+    Bound<'py, PyArray1<f64>>,
+    f64,
+    f64,
+)> {
+    let response = if let Ok(tabulated) = resolution.extract::<PyRef<'_, PyTabulatedResolution>>() {
+        ResolutionFunction::Tabulated(Arc::clone(&tabulated.inner))
+    } else if let Ok(ic) = resolution.extract::<PyRef<'_, PyIkedaCarpenter>>() {
+        ResolutionFunction::IkedaCarpenter(Arc::clone(&ic.inner))
+    } else {
+        return Err(pyo3::exceptions::PyTypeError::new_err(
+            "resolution must be a TabulatedResolution or IkedaCarpenter",
+        ));
+    };
+
+    let energies = true_energies_ev.as_slice()?.to_vec();
+    let fluence = incident_fluence_weights.as_slice()?.to_vec();
+    let transmission = transmission.as_slice()?.to_vec();
+    let detector_edges = detector_time_edges_us.as_slice()?.to_vec();
+    let result = py.detach(move || {
+        counts_response::two_arm_count_response(
+            &energies,
+            &fluence,
+            &transmission,
+            &detector_edges,
+            timing_offset_us,
+            &response,
+        )
+    });
+    let result = result.map_err(|error| {
+        pyo3::exceptions::PyValueError::new_err(format!("two-arm count response: {error}"))
+    })?;
+    Ok((
+        PyArray1::from_vec(py, result.open_beam),
+        PyArray1::from_vec(py, result.sample),
+        result.open_beam_window_loss,
+        result.sample_window_loss,
+    ))
 }
 
 /// Parse a Python-facing pixel-value policy string.
@@ -4311,6 +4399,7 @@ fn nereids(m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_function(wrap_pyfunction!(resolution_broaden, m)?)?;
     m.add_function(wrap_pyfunction!(load_resolution, m)?)?;
     m.add_function(wrap_pyfunction!(py_apply_resolution, m)?)?;
+    m.add_function(wrap_pyfunction!(py_two_arm_count_response, m)?)?;
     m.add_function(wrap_pyfunction!(load_tiff_stack, m)?)?;
     m.add_function(wrap_pyfunction!(load_tiff_folder, m)?)?;
     m.add_function(wrap_pyfunction!(read_tof_sidecar, m)?)?;
@@ -4845,7 +4934,11 @@ fn spatial_result_to_py(
 ///     l_scale_init: Initial flight-path scale factor (default 1.0).
 ///     energy_scale_flight_path_m: Nominal flight path (m) for the
 ///         energy-scale model. Must match the grid used to compute `energies`.
-///     resolution: Optional resolution function.
+///     resolution: Optional resolution function.  Rejected when fitting
+///         count cubes: counts input with instrument resolution fails closed
+///         (the physical model needs separate open/sample response arms)
+///         until the exact two-arm counts response route exists; fit
+///         pre-normalized transmission cubes instead.
 ///     groups: list of IsotopeGroup objects (mutually exclusive with isotopes).
 ///     fit_anorm: Whether Anorm is free when ``background=True`` (default
 ///         True).  Must be False to combine ``background=True`` with
@@ -5268,7 +5361,11 @@ fn py_spatial_map_typed<'py>(
 ///     solver: "lm" (default), "kl", or "auto".
 ///     background: Enable transmission-lift background inside the counts fit.
 ///     detector_background: Optional detector/counts background reference.
-///     resolution: Optional resolution function.
+///     resolution: Optional resolution function.  Rejected for counts
+///         input: any counts fit with instrument resolution fails closed
+///         (the physical model needs separate open/sample response arms)
+///         until the exact two-arm counts response route exists; fit
+///         pre-normalized transmission instead.
 ///     groups: list of IsotopeGroup objects (mutually exclusive with isotopes).
 ///     initial_densities: Initial density guesses when using groups (default 0.001 each).
 ///     enable_polish: Override the Nelder-Mead polish phase on the
@@ -5699,7 +5796,7 @@ impl PyModelJacobianResult {
     }
 }
 
-/// Compute the exact resolved analytical Jacobian and expected Fisher at given
+/// Compute the exact analytical Jacobian and expected Fisher at given
 /// parameter values.
 ///
 /// Uses the same model construction as ``fit_counts_spectrum_typed()`` but does
@@ -5720,7 +5817,12 @@ impl PyModelJacobianResult {
 ///     fit_temperature: If True, include temperature as a free parameter
 ///         in the Jacobian.
 ///     flight_path_m, delta_t_us, delta_l_m: Gaussian resolution parameters.
-///     resolution: Tabulated resolution object.
+///         Rejected: this counts-space helper fails closed for any active
+///         resolution (the physical model needs separate open/sample
+///         response arms) until the exact two-arm counts response route
+///         exists.
+///     resolution: Tabulated resolution object.  Rejected, same as the
+///         Gaussian parameters above.
 ///     detector_background: Detector background B(E) for counts background model.
 ///     fit_alpha_1: If True, include signal scale α₁ as free parameter.
 ///     fit_alpha_2: If True, include background scale α₂ as free parameter.

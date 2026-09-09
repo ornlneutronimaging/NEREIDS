@@ -33,6 +33,15 @@ _MANIFEST_NAMES = (
     "nereids_mcp.json",
     "analysis.json",
 )
+_COUNTS_RESOLUTION_UNSUPPORTED = (
+    "counts input with instrument resolution is unsupported: the current counts "
+    "path broadens transmission as R[T], but the physical detector model requires "
+    "separate open/sample response arms R[Phi] and R[Phi*T]. Fit pre-normalized "
+    "transmission instead (a transmission-domain model, not a counts likelihood; "
+    "its broadened ratio matches the measured R[Phi*T]/R[Phi] only where the "
+    "incident flux is smooth over the kernel width), or disable instrument "
+    "resolution until an exact counts response is implemented."
+)
 _SAFE_KEY = re.compile(r"[^A-Za-z0-9_]+")
 
 
@@ -1145,16 +1154,91 @@ def _validate_workflow(manifest: dict[str, Any]) -> dict[str, Any]:
             errors.append(f"isotope entry is missing isotope/z/a/endf_file: {entry}")
 
     resolution = config.get("resolution")
+    resolution_kind: str | None = None
     if isinstance(resolution, dict):
-        kind = _normalise_kind(resolution.get("kind", "none"), "none")
-        if kind in {"tabulated", "file", "resolution_file"}:
-            path = _resolve_path(base, resolution.get("path"))
-            if path is None or not path.exists():
-                errors.append(f"resolution file does not exist: {path}")
-        if kind in {"none", "disabled", "false"}:
-            warnings.append("resolution disabled; appropriate for synthetic data")
+        resolution_kind = _normalise_kind(resolution.get("kind", "none"), "none")
+    elif isinstance(resolution, str):
+        resolution_kind = _normalise_kind(resolution, "none")
+    elif resolution:
+        # A truthy malformed value (true/number/non-empty list) raises
+        # "resolution must be an object" at run time; erroring here keeps
+        # validate and run in agreement.  Falsy values (false/0/[]) fall
+        # through: the run path's `config.get("resolution") or {}` treats
+        # them as resolution-disabled.
+        errors.append(
+            "resolution must be an object or kind string, got "
+            f"{type(resolution).__name__}"
+        )
     elif resolution is None and mode in {"density_map", "spatial_map"}:
         warnings.append("no resolution configured; OK for synthetic/demo data")
+
+    # Mirror _resolution_kwargs' full contract, kind by kind, so validation
+    # never approves a resolution config the run path rejects (unknown kind,
+    # missing gaussian parameters, missing tabulated path/flight path).
+    if resolution_kind is not None:
+        if resolution_kind in {"none", "disabled", "false"}:
+            warnings.append("resolution disabled; appropriate for synthetic data")
+        elif resolution_kind in {"gaussian", "sammy_gaussian"}:
+            params = resolution if isinstance(resolution, dict) else {}
+            missing = [
+                key
+                for key in ("flight_path_m", "delta_t_us", "delta_l_m")
+                if key not in params
+            ]
+            if missing:
+                errors.append(
+                    "gaussian resolution requires flight_path_m, delta_t_us, "
+                    f"and delta_l_m: missing {', '.join(missing)}"
+                )
+        elif resolution_kind in {"tabulated", "file", "resolution_file"}:
+            params = resolution if isinstance(resolution, dict) else {}
+            path = _resolve_path(base, params.get("path"))
+            if path is None or not path.exists():
+                errors.append(f"resolution file does not exist: {path}")
+            if "flight_path_m" not in params:
+                errors.append("tabulated resolution requires flight_path_m")
+        else:
+            errors.append(f"unknown resolution kind: {resolution_kind}")
+
+    # Raw count inputs fitted in the COUNTS DOMAIN need two separately
+    # broadened response arms: R[Phi] for the open beam and R[Phi*T] for the
+    # sample.  The current fitting API only has R[T], so approving such a
+    # manifest would make a dry run disagree with the production pipeline's
+    # fail-closed gate.  Mirror the run path's routing exactly:
+    # density_map/spatial count cubes always fit in the counts domain
+    # (from_counts), while a single_spectrum counts input does so only when
+    # the effective fit domain is "counts" (fit.fit_domain, defaulting by
+    # solver) — the transmission fit domain converts to a pre-normalized
+    # transmission fit, which legitimately accepts resolution.  A non-.npz
+    # single_spectrum path is coerced to a transmission spectrum by the run
+    # path regardless of the declared kind.
+    counts_input = effective_kind in {
+        "counts_npz",
+        "counts",
+        "nexus_histogram",
+        "nexus",
+    }
+    if mode in {"single_spectrum", "fit_spectrum", "spectrum"}:
+        fit_config = _get_fit_config(config)
+        solver = str(fit_config.get("solver", "lm")).lower()
+        fit_domain = str(
+            fit_config.get(
+                "fit_domain",
+                "transmission" if solver == "lm" else "counts",
+            )
+        ).lower()
+        # Byte-identical to the run path's routing check
+        # (`data_path.suffix == ".npz"` on the resolved path): `DATA.NPZ`
+        # or a symlink to a non-npz target is text-parsed there and must
+        # not be treated as a counts-domain npz here.
+        resolved_data_path = _resolve_path(base, data_config.get("path"))
+        is_npz = resolved_data_path is not None and resolved_data_path.suffix == ".npz"
+        counts_domain_fit = counts_input and is_npz and fit_domain == "counts"
+    else:
+        counts_domain_fit = counts_input
+    resolution_active = resolution_kind not in {None, "none", "disabled", "false"}
+    if counts_domain_fit and resolution_active:
+        errors.append(_COUNTS_RESOLUTION_UNSUPPORTED)
 
     return {
         "valid": not errors,

@@ -48,14 +48,40 @@ use crate::parameters::ParameterSet;
 
 /// Joint-Poisson objective.
 ///
-/// Wraps a transmission `FitModel` (which produces `T_i = model.evaluate(θ)`)
-/// together with the observed open-beam counts `O_i`, sample counts `S_i`,
-/// and proton-charge ratio `c = Q_s / Q_ob`.
+/// Wraps an effective count-ratio `FitModel` (which produces
+/// `T_eff,i = model.evaluate(θ)`) together with the observed open-beam counts
+/// `O_i`, sample counts `S_i`, and proton-charge ratio `c = Q_s / Q_ob`.
+///
+/// ## Physical count-response contract
+///
+/// This is a low-level API: it cannot inspect a `dyn FitModel` to determine
+/// how instrument resolution was applied.  The supplied model must already
+/// return the physically valid effective sample/open count response on the
+/// observed bins.  With an instrument response operator `R` and incident
+/// spectrum `Φ`, that response is
+///
+/// ```text
+/// T_eff = R[Φ · T] / R[Φ].
+/// ```
+///
+/// A post-hoc broadened transmission `R[T]` is not this response and must
+/// never be supplied as though it were.  In particular, do not directly wrap
+/// a resolution-bearing
+/// [`TransmissionFitModel`](crate::transmission_model::TransmissionFitModel),
+/// because that model returns `R[T]`.  A no-resolution transmission model
+/// remains valid because `R` is then the identity; a custom model that already
+/// returns the exact effective ratio is also valid.  Otherwise, callers must
+/// model the open and sample response arms separately or use the guarded
+/// pipeline entry point, which rejects unsupported counts-plus-resolution
+/// combinations.
 ///
 /// The caller is responsible for ensuring `o`, `s`, and `model.evaluate()`
 /// output all have the same length.
 pub struct JointPoissonObjective<'a> {
-    /// Transmission model: `evaluate(θ) → T(E)`.
+    /// Effective count-ratio model: `evaluate(θ) → T_eff(E)`.
+    ///
+    /// See the struct-level physical count-response contract.  In particular,
+    /// this must not be a post-hoc broadened transmission `R[T]`.
     pub model: &'a dyn FitModel,
     /// Open-beam counts per bin.
     pub o: &'a [f64],

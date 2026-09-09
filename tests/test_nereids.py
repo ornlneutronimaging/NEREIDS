@@ -631,6 +631,180 @@ class TestTabulatedKernelOrientation:
         )
 
 
+class TestTabulatedDetectorBins:
+    """The public tabulated-response API integrates the loaded UDR directly
+    into measured detector-time bins."""
+
+    TOF_FACTOR = 72.298254398292800
+    L = 25.0
+
+    @staticmethod
+    def _write_kernel(path):
+        path.write_text(
+            "\n".join(
+                [
+                    "synthetic asymmetric triangular response",
+                    "-----",
+                    "   2.50000e+001   0.00000e+000",
+                    "-1.0 0.0",
+                    "0.0 1.0",
+                    "2.0 0.0",
+                    "",
+                ]
+            )
+        )
+
+    def test_exact_bin_probabilities_without_window_renormalization(self, tmp_path):
+        kernel_path = tmp_path / "synthetic_exact_bins.txt"
+        self._write_kernel(kernel_path)
+        response = nereids.load_resolution(str(kernel_path), self.L)
+        arrival = self.TOF_FACTOR * self.L / np.sqrt(25.0)
+
+        probabilities = np.asarray(
+            response.detector_bin_probabilities(
+                25.0,
+                [arrival - 2.0, arrival - 1.0, arrival, arrival + 1.0],
+                0.0,
+            )
+        )
+
+        np.testing.assert_allclose(probabilities, [0.0, 1.0 / 3.0, 1.0 / 2.0])
+        assert probabilities.sum() == pytest.approx(5.0 / 6.0)
+
+    def test_invalid_flight_path_is_rejected_when_loading(self, tmp_path):
+        kernel_path = tmp_path / "synthetic_invalid_path.txt"
+        self._write_kernel(kernel_path)
+
+        with pytest.raises(ValueError, match="flight_path"):
+            nereids.load_resolution(str(kernel_path), float("nan"))
+
+
+class TestTwoArmCountResponse:
+    """The public operator keeps the open and sample detector arms separate."""
+
+    TOF_FACTOR = 72.298254398292800
+    L = 25.0
+
+    @staticmethod
+    def _write_triangle(path):
+        path.write_text(
+            "\n".join(
+                [
+                    "synthetic one-microsecond triangle",
+                    "-----",
+                    "   2.50000e+001   0.00000e+000",
+                    "-1.0 0.0",
+                    "0.0 1.0",
+                    "1.0 0.0",
+                    "",
+                ]
+            )
+        )
+
+    def test_public_tabulated_operator_integrates_two_true_energies(self, tmp_path):
+        kernel_path = tmp_path / "two_arm_triangle.txt"
+        self._write_triangle(kernel_path)
+        response = nereids.load_resolution(str(kernel_path), self.L)
+        arrival_0 = self.TOF_FACTOR * self.L / np.sqrt(25.0)
+        energy_1 = (self.TOF_FACTOR * self.L / (arrival_0 + 1.0)) ** 2
+
+        open_beam, sample, open_loss, sample_loss = nereids.two_arm_count_response(
+            np.array([25.0, energy_1]),
+            np.array([100.0, 200.0]),
+            np.array([0.2, 0.8]),
+            np.array(
+                [arrival_0 - 1.0, arrival_0, arrival_0 + 1.0, arrival_0 + 2.0]
+            ),
+            response,
+        )
+
+        np.testing.assert_allclose(open_beam, [50.0, 150.0, 100.0], atol=2e-11)
+        np.testing.assert_allclose(sample, [10.0, 90.0, 80.0], atol=2e-11)
+        # Both pulses lie fully inside the window: the quantified
+        # acquisition-window loss report is (numerically) zero counts.
+        assert open_loss == pytest.approx(0.0, abs=2e-11)
+        assert sample_loss == pytest.approx(0.0, abs=2e-11)
+
+    def test_window_loss_is_reported_not_renormalized(self, tmp_path):
+        kernel_path = tmp_path / "two_arm_truncated.txt"
+        self._write_triangle(kernel_path)
+        response = nereids.load_resolution(str(kernel_path), self.L)
+        arrival = self.TOF_FACTOR * self.L / np.sqrt(25.0)
+
+        open_beam, sample, open_loss, sample_loss = nereids.two_arm_count_response(
+            np.array([25.0]),
+            np.array([100.0]),
+            np.array([0.4]),
+            np.array([arrival, arrival + 1.0]),
+            response,
+        )
+
+        # Half of the pulse falls before the window start: the in-window
+        # expectation stays un-renormalized and the lost counts are reported.
+        np.testing.assert_allclose(open_beam, [50.0], atol=1e-12)
+        np.testing.assert_allclose(sample, [20.0], atol=1e-12)
+        assert open_loss == pytest.approx(50.0, abs=1e-12)
+        assert sample_loss == pytest.approx(20.0, abs=1e-12)
+
+    def test_public_operator_accepts_analytical_ic_without_conversion(self):
+        ic = nereids.IkedaCarpenter(
+            flight_path_m=self.L,
+            e_min_ev=20.0,
+            e_max_ev=30.0,
+            alpha=nereids.EnergyLaw.const(1.2),
+            beta=0.2,
+            r=nereids.EnergyLaw.const(0.25),
+        )
+        arrival = self.TOF_FACTOR * self.L / np.sqrt(25.0)
+        edges = np.array([arrival, arrival + 1.0, arrival + 5.0, arrival + 20.0])
+        probabilities = np.asarray(ic.detector_bin_probabilities(25.0, edges, 0.0))
+
+        open_beam, sample, open_loss, sample_loss = nereids.two_arm_count_response(
+            np.array([25.0]),
+            np.array([80.0]),
+            np.array([0.5]),
+            edges,
+            ic,
+        )
+
+        np.testing.assert_allclose(open_beam, 80.0 * probabilities, atol=2e-12)
+        np.testing.assert_allclose(sample, 40.0 * probabilities, atol=2e-12)
+        outside = 1.0 - probabilities.sum()
+        assert open_loss == pytest.approx(80.0 * outside, abs=2e-12)
+        assert sample_loss == pytest.approx(40.0 * outside, abs=2e-12)
+
+
+class TestComputeModelJacobianCountsGate:
+    """The research Fisher helper is a counts-space model: it must reject
+    instrument resolution like the production fit routes, and keep working
+    without one."""
+
+    def _args(self):
+        energies = np.linspace(1.0, 30.0, 40)
+        rd = _make_single_resonance()
+        open_beam = np.full_like(energies, 5000.0)
+        return open_beam, energies, [(rd, 0.001)]
+
+    def test_rejects_any_active_resolution(self):
+        open_beam, energies, isotopes = self._args()
+        with pytest.raises(ValueError, match="separate open/sample response arms"):
+            nereids.compute_model_jacobian(
+                open_beam,
+                energies,
+                isotopes,
+                flight_path_m=25.0,
+                delta_t_us=0.5,
+                delta_l_m=0.005,
+            )
+
+    def test_no_resolution_path_still_evaluates(self):
+        open_beam, energies, isotopes = self._args()
+        result = nereids.compute_model_jacobian(open_beam, energies, isotopes)
+        prediction = np.asarray(result.model_prediction)
+        assert prediction.shape == energies.shape
+        assert np.isfinite(prediction).all()
+
+
 class TestTabulatedKernelWidthInterpolation:
     """Regression for issue #632: kernel width between reference energies
     must follow the physical power law, not the arithmetic blend chord.
@@ -2648,35 +2822,25 @@ class TestVenusMlbwRegression:
         synthetic counts-KL tests elsewhere use NEREIDS-generated
         observations and cannot do that.
 
-        Two properties are pinned:
+        Unlike the pre-Wave-1 form of this gate, the fit runs WITHOUT
+        instrument resolution: counts + resolution now fails closed (the
+        rejection gate below), and a resolution-free counts fit is the
+        valid configuration — the response operator R is then the
+        identity.  Anchors were re-captured for that configuration; they
+        are machine-generated regression anchors (produced by the code
+        under test), with correctness of the deviance math carried by the
+        analytic joint-Poisson unit tests in nereids-fitting.
 
-        * The fit converges with the anchored density.  As with the LM
-          gate above, the pinned values are machine-generated regression
-          anchors (produced by the code under test); correctness of the
-          deviance math is carried by the analytic joint-Poisson unit
-          tests in nereids-fitting.
-        * ``deviance_per_dof`` lands in the >> 1 regime (measured ~3.1e4).
-          Real VENUS counts carry un-modelled upstream physics, so D/dof
-          saturates at 10^4-10^5 — exactly the regime documented on
-          ``JointPoissonFitConfig::enable_polish`` (and the reason polish
-          is off by default).  A sudden drop to O(1) would mean the gate
-          silently switched to a synthetic-like input, not that the model
-          got better.
-
-        The KL density (~2.9e-5) deliberately differs from the LM gate's
-        (~8.1e-5): with a mis-specified no-background single-isotope model
-        on real data, the transmission-domain least-squares and the
-        counts-domain deviance weight bins differently and converge to
-        different biased optima.  Both anchors move only when their
-        respective solver paths change.
+        ``deviance_per_dof`` lands in the >> 1 regime (measured ~3.1e4):
+        real VENUS counts carry un-modelled upstream physics, so D/dof
+        saturates at 10^4-10^5.  A sudden drop to O(1) would mean the gate
+        silently switched to a synthetic-like input, not that the model
+        got better.
 
         Tolerances follow the LM gate's cross-backend rationale: anchors
-        were captured on macOS (Accelerate); ``rel=1e-6`` absorbs
-        BLAS/libm sum-ordering differences on Linux CI while staying
-        orders of magnitude tighter than any real dispatch regression.
-        If this gate ever flaps across backends, relax the deviance
-        anchor first — the sum over ~4e3 bins amplifies bin-level libm
-        differences far more than the converged density does.
+        captured on macOS (Accelerate); ``rel=1e-6`` absorbs BLAS/libm
+        sum-ordering differences on Linux CI while staying orders of
+        magnitude tighter than any real dispatch regression.
         """
         E, S_agg, O_agg, c, hf177 = venus_data
 
@@ -2690,22 +2854,10 @@ class TestVenusMlbwRegression:
             max_iter=200,
             background=False,
             c=c,
-            flight_path_m=25.0,
-            delta_t_us=0.5,
-            delta_l_m=0.005,
         )
 
-        # Anchors regenerated after #635's analytic-Jacobian availability
-        # fix. The old anchor was captured at an identity-Fisher
-        # gradient-descent STALL: without an analytic transmission Jacobian
-        # the joint-Poisson stage 1 silently degraded to projected gradient
-        # descent, which stopped 1.7 % away (in density) from the true
-        # optimum of the SAME objective. With the analytic Fisher the fit
-        # reaches a strictly BETTER minimum (deviance/dof 31445.853 <
-        # 31445.957) in 3 iterations. The model is unchanged (bit-exact
-        # parity verified); only the optimum actually attained improved.
-        EXPECTED_DENSITY = 2.9596692297867937e-05
-        EXPECTED_DEVIANCE_PER_DOF = 31445.852761391532
+        EXPECTED_DENSITY = 2.7591191549411417e-05
+        EXPECTED_DEVIANCE_PER_DOF = 31471.485549664278
 
         assert bool(result.converged) is True, (
             f"counts-KL fit did not converge on the real VENUS fixture "
@@ -2718,7 +2870,7 @@ class TestVenusMlbwRegression:
             f"expected {EXPECTED_DENSITY!r} (±1e-6 rel)"
         )
         # Coarse physical bracket, independent of the machine-generated
-        # anchor above: both solver families land in (2.9-8.1)e-5
+        # anchor above: both solver families land in (2.7-8.1)e-5
         # atoms/barn on this measured Hf spectrum, so any value outside
         # [1e-5, 1e-4] means solver breakage, not sample physics.  This
         # prevents a future wholesale re-anchoring commit from silently
@@ -2741,6 +2893,41 @@ class TestVenusMlbwRegression:
             "counts (un-modelled upstream physics); an O(1) value means "
             "the gate is no longer fitting real data"
         )
+
+    def test_counts_with_resolution_fails_before_fitting(self, venus_data):
+        """Resolved counts must fail closed instead of fitting R[T].
+
+        Instrument response acts separately on the open and sample count
+        arms; the current counts path can only broaden the transmission
+        ratio, so the public API must reject the combination rather than
+        fall back to a scientifically wrong count model (Wave-1 PR-2a
+        gate; the exact separate-arm route lands with PR-2b).
+
+        The pre-Wave-1 counts-KL anchors were captured through the now-
+        rejected R[T] route and cannot be reproduced by any valid
+        configuration; the real-data counts-KL gate above re-anchors the
+        valid (resolution-free) configuration instead.
+        """
+        E, S_agg, O_agg, c, hf177 = venus_data
+
+        with pytest.raises(
+            ValueError,
+            match="separate open/sample response arms",
+        ):
+            nereids.fit_counts_spectrum_typed(
+                S_agg,
+                O_agg,
+                E,
+                isotopes=[(hf177, 1.0e-5)],
+                solver="kl",
+                temperature_k=293.6,
+                max_iter=200,
+                background=False,
+                c=c,
+                flight_path_m=25.0,
+                delta_t_us=0.5,
+                delta_l_m=0.005,
+            )
 
 
 # ===========================================================================
@@ -4525,6 +4712,8 @@ class TestCalibrateResolution:
         # signature froze, so they must sit at the END — inserting them
         # mid-signature would silently shift every pre-existing call passing
         # >= 14 positional arguments.
+        import inspect
+
         sig = nereids.calibrate_resolution.__text_signature__
         assert sig is not None
         assert (
@@ -4532,6 +4721,14 @@ class TestCalibrateResolution:
             < sig.index("psr_fwhm_ns")
             < sig.index("fit_psr")
         ), f"psr_fwhm_ns/fit_psr must trail the signature: {sig}"
+        # Named Rust constants are rendered as ``...`` by PyO3 even though the
+        # call path uses the right value.  Keep the introspected public default
+        # equal to the stub and to the fitting-core default instead of exposing
+        # an unusable Ellipsis value to help(), IDEs, and manifest checks.
+        default = inspect.signature(nereids.calibrate_resolution).parameters[
+            "psr_fwhm_ns"
+        ].default
+        assert default == 350.0
 
 
 

@@ -349,6 +349,20 @@ class TabulatedResolution:
         """Number of points per kernel."""
         ...
 
+    def detector_bin_probabilities(
+        self,
+        true_energy_ev: float,
+        detector_time_edges_us: list[float],
+        timing_offset_us: float,
+    ) -> list[float]:
+        """Probability in each adjacent detector-time bin.
+
+        The loaded tabulated response is evaluated at ``true_energy_ev``.
+        Probability outside the supplied time window is not renormalized into
+        the window.
+        """
+        ...
+
 class EnergyLaw:
     """Energy-dependence law for an Ikeda-Carpenter parameter.
 
@@ -981,6 +995,27 @@ def apply_resolution(
     resolution: TabulatedResolution,
 ) -> NDArray[np.float64]:
     """Apply tabulated resolution broadening to a spectrum."""
+    ...
+
+def two_arm_count_response(
+    true_energies_ev: NDArray[np.float64],
+    incident_fluence_weights: NDArray[np.float64],
+    transmission: NDArray[np.float64],
+    detector_time_edges_us: NDArray[np.float64],
+    resolution: TabulatedResolution | IkedaCarpenter,
+    timing_offset_us: float = 0.0,
+) -> tuple[NDArray[np.float64], NDArray[np.float64], float, float]:
+    """Predict open-beam and sample counts on detector-time bins.
+
+    ``incident_fluence_weights[j]`` is the incident flux density at true
+    energy ``j`` times detector efficiency times the caller's
+    energy-integration weight (the discrete form of the contract's
+    ``Phi * epsilon``). The validated response is applied to the open and
+    attenuated sample arms separately. Probability outside the supplied
+    acquisition window is not renormalized into that window; the last two
+    return values quantify the expected open-beam and sample counts lost
+    outside it.
+    """
     ...
 
 def load_tiff_stack(
@@ -1692,6 +1727,11 @@ def spatial_map_typed(
         l_scale_init: Initial flight-path scale factor (default 1.0).
         energy_scale_flight_path_m: Nominal flight path (m) for the
             energy-scale model (default 25.0).
+        resolution: Optional resolution function.  Rejected when fitting
+            count cubes: counts input with instrument resolution fails
+            closed (the physical model needs separate open/sample response
+            arms) until the exact two-arm counts response route exists; fit
+            pre-normalized transmission cubes instead.
         scale_by_chi2: When ``True``, inflate the covariance-only
             uncertainties (incl. ``temperature_uncertainty_map``) by
             ``sqrt(chi2/dof)`` at the converged point, turning the inverse-Fisher
@@ -1877,7 +1917,11 @@ def fit_counts_spectrum_typed(
             For raw VENUS-style counts, set this to the actual ratio
             (typically ~5–6).  Used by the counts-KL dispatch; ignored
             by the LM path.
-        resolution: Optional resolution function.
+        resolution: Optional resolution function.  Rejected for counts
+            input: any counts fit with instrument resolution fails closed
+            (the physical model needs separate open/sample response arms)
+            until the exact two-arm counts response route exists; fit
+            pre-normalized transmission instead.
         groups: List of IsotopeGroup objects (mutually exclusive with isotopes).
         initial_densities: Initial density guesses when using groups.
         fix_densities: Freeze all densities at their initial values and fit
@@ -1947,7 +1991,7 @@ def compute_model_jacobian(
     groups: list[IsotopeGroup] | None = None,
     initial_densities: list[float] | None = None,
 ) -> ModelJacobianResult:
-    """Compute exact resolved analytical Jacobian and expected Fisher.
+    """Compute exact analytical Jacobian and expected Fisher.
 
     Uses the same model construction as ``fit_counts_spectrum_typed()`` but
     evaluates at the given parameter values without optimising.
@@ -1956,5 +2000,10 @@ def compute_model_jacobian(
     When ``groups`` is provided, each group maps to one density parameter.
 
     Research-oriented function for Fisher-based regularisation studies.
+
+    Any active instrument resolution (Gaussian parameters or
+    ``resolution=``) is rejected: this counts-space helper fails closed
+    (the physical model needs separate open/sample response arms) until
+    the exact two-arm counts response route exists.
     """
     ...

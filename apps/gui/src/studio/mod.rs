@@ -1218,6 +1218,10 @@ fn beamline_card(ui: &mut egui::Ui, state: &mut AppState) {
                     .suffix(" m"),
             );
             if state.beamline.flight_path_m != prev {
+                // Same treatment as the other resolution-change paths: the
+                // outputs (and any in-flight spatial worker) belong to the
+                // previous flight path.
+                state.invalidate_analysis_outputs();
                 state.mark_dirty(GuidedStep::Normalize);
             }
         });

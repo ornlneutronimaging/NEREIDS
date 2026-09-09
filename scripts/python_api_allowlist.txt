@@ -27,6 +27,11 @@ doppler_broaden
 resolution_broaden
 apply_resolution
 precompute_cross_sections
+# Wave-1 two-arm count response operator (open/sample arms broadened
+# separately; window loss reported).  pdoc covers the signature; the curated
+# narrative section belongs with the exact counts fit route that consumes it
+# (Wave-1 PR-2b), not as a floating entry before that route exists.
+two_arm_count_response
 
 # ---------------------------------------------------------------------------
 # Tabulated resolution helper class returned by load_resolution(...); the
