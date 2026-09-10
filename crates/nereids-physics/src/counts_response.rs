@@ -198,6 +198,10 @@ impl DetectorBinResponseMatrix {
 
     /// Stored `(detector_bin, probability)` pairs for one true-energy row.
     pub fn row_entries(&self, true_index: usize) -> impl Iterator<Item = (usize, f64)> + '_ {
+        assert!(
+            true_index < self.n_true_energies,
+            "true-energy row out of range"
+        );
         let start = self.row_offsets[true_index];
         let end = self.row_offsets[true_index + 1];
         self.detector_bins[start..end]
@@ -209,6 +213,10 @@ impl DetectorBinResponseMatrix {
     /// Probability that true-energy row `true_index` lands in detector bin
     /// `detector_bin`.
     pub fn probability(&self, true_index: usize, detector_bin: usize) -> f64 {
+        assert!(
+            true_index < self.n_true_energies,
+            "true-energy row out of range"
+        );
         assert!(
             detector_bin < self.n_detector_bins,
             "detector bin out of range"

@@ -212,7 +212,7 @@ Example NeXus density-map manifest:
       {"isotope": "U-238", "initial_density": 0.001}
     ],
     "fit": {
-      "solver": "lm",
+      "solver": "kl",
       "max_iter": 100
     },
     "resolution": {"kind": "none"}

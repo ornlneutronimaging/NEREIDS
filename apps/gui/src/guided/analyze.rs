@@ -2111,6 +2111,19 @@ fn build_fit_config(state: &AppState) -> Result<(UnifiedFitConfig, Range<usize>)
                 .to_string(),
         );
     }
+    // The exact separate-arm inputs (incident fluence weights, detector-time
+    // bin edges) are not a GUI-configurable surface, so surface the two
+    // remedies the GUI can actually express instead of the pipeline's
+    // exact_count_response message.
+    if matches!(state.solver_method, SolverMethod::PoissonKL) && state.resolution_enabled {
+        return Err(
+            "Count fits with instrument resolution need the exact separate-arm \
+             model, which the GUI does not configure yet: disable instrument \
+             resolution for count fits, or fit normalized transmission with \
+             Levenberg-Marquardt"
+                .to_string(),
+        );
+    }
     let full_energies = state
         .energies
         .as_ref()
@@ -2921,7 +2934,6 @@ mod tests {
     use nereids_endf::resonance::test_support::synthetic_single_resonance;
     use nereids_io::normalization::NormalizedData;
     use nereids_pipeline::spatial::SpatialResult;
-    use std::time::Duration;
 
     fn stale_spectrum_result() -> SpectrumFitResult {
         SpectrumFitResult {
@@ -3119,15 +3131,17 @@ mod tests {
 
         assert!(state.spatial_result.is_none());
         assert!(state.export_status.is_none());
-        let rx = state
-            .pending_spatial
-            .take()
-            .expect("rejected spatial run should still report its worker error");
-        let err = rx
-            .recv_timeout(Duration::from_secs(2))
-            .expect("spatial worker should reject counts plus resolution")
-            .expect_err("counts plus resolution must fail closed");
-        assert!(err.contains("separate-arm model"), "{err}");
+        // The GUI-level guard now rejects counts + resolution BEFORE any
+        // worker is spawned, with a remedy the GUI can actually express.
+        assert!(
+            state.pending_spatial.is_none(),
+            "rejected spatial run must not spawn a worker"
+        );
+        assert!(
+            state.status_message.contains("separate-arm model"),
+            "{}",
+            state.status_message
+        );
         assert!(state.normalized.is_some());
         assert_eq!(state.selected_pixel, Some((0, 0)));
         assert_eq!(state.rois.len(), 1);

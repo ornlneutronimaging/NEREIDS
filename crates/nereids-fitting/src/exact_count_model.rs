@@ -18,6 +18,19 @@ use crate::lm::{FitModel, FlatMatrix};
 ///
 /// The open and sample arms are therefore broadened separately. This is not
 /// the invalid post-hoc shortcut `R[T]`.
+///
+/// # Dead-bin precondition
+///
+/// A detector bin whose open-arm expectation `sum_j F_j R_ij` is at or below
+/// the pivot floor is a **dead bin**: the ratio is undefined there, so
+/// `evaluate` fills it with `T_eff = 1.0` and `analytical_jacobian` zeroes
+/// its row. That filler is harmless only when the caller guarantees dead
+/// bins carry **no observed counts** — a joint-Poisson objective then ignores
+/// the bin entirely (its profiled rate is zero). Callers fitting observed
+/// data MUST enforce that invariant before constructing this model, as
+/// `fit_counts_joint_poisson` does with its occupied-bin pre-check: observed
+/// counts in a dead bin would otherwise be silently compared against an
+/// arbitrary `T = 1` instead of raising an error.
 pub struct ExactTwoArmRatioModel {
     inner: Box<dyn FitModel>,
     response: DetectorBinResponseMatrix,

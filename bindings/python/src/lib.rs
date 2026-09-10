@@ -2166,11 +2166,11 @@ fn require_non_empty_energy_grid(e: &[f64]) -> PyResult<()> {
     validate_energy_grid(e)
 }
 
-/// Build a `ResolutionFunction` from Python arguments.
-///
-/// Validates mutual exclusivity (Gaussian vs. tabulated) and completeness
-/// of Gaussian parameters. Returns `None` when no resolution is requested.
 /// Extract a detector-time response that has exact bin probabilities.
+///
+/// Accepts a `TabulatedResolution` or `IkedaCarpenter` Python object and
+/// rejects anything else with a `TypeError`; unlike [`build_resolution`],
+/// it never returns `None` and performs no Gaussian-parameter handling.
 fn extract_detector_time_resolution(resolution: &Bound<'_, PyAny>) -> PyResult<ResolutionFunction> {
     if let Ok(tabulated) = resolution.extract::<PyRef<'_, PyTabulatedResolution>>() {
         Ok(ResolutionFunction::Tabulated(Arc::clone(&tabulated.inner)))
@@ -2183,6 +2183,10 @@ fn extract_detector_time_resolution(resolution: &Bound<'_, PyAny>) -> PyResult<R
     }
 }
 
+/// Build a `ResolutionFunction` from Python arguments.
+///
+/// Validates mutual exclusivity (Gaussian vs. tabulated) and completeness
+/// of Gaussian parameters. Returns `None` when no resolution is requested.
 fn build_resolution(
     flight_path_m: Option<f64>,
     delta_t_us: Option<f64>,

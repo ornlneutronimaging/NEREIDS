@@ -47,8 +47,8 @@ pub struct SpatialResult {
     pub chi_squared_map: Array2<f64>,
     /// Per-pixel conditional binomial deviance `D/(n−k)` map.  `Some` when
     /// the effective per-pixel solver is the counts-KL dispatch
-    /// (joint-Poisson); `None` for LM-only runs and transmission+PoissonKL
-    /// where Pearson χ²/dof is the GOF.
+    /// (joint-Poisson); `None` for LM transmission runs, where Pearson
+    /// χ²/dof is the GOF.
     /// NaN at pixels where `converged_map` is `false`.
     pub deviance_per_dof_map: Option<Array2<f64>>,
     /// Convergence map (true = converged).
@@ -216,7 +216,8 @@ impl InputData3D<'_> {
 /// Spatial mapping using the typed input data API.
 ///
 /// Dispatches per-pixel fitting based on the `InputData3D` variant:
-/// - **Transmission**: per-pixel LM (or KL, opt-in) on transmission values.
+/// - **Transmission**: per-pixel LM on transmission values (a Poisson/KL
+///   count objective is rejected for ratios).
 /// - **Counts**: per-pixel counts-KL dispatch (joint-Poisson conditional
 ///   binomial deviance) on the sample cube, paired
 ///   against the **spatially-averaged open-beam flux**.  See the inline
