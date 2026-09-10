@@ -844,6 +844,89 @@ class TestExactResolvedCountsRoute:
         assert result.deviance_per_dof < 1.0e-8
 
 
+class TestExactCountArgumentGuards:
+    """Binding-level validation of the exact-response kwargs: every rejection
+    arm must fire before any Rust fit machinery is reached."""
+
+    @staticmethod
+    def _base_kwargs(u238_data):
+        n = 20
+        return dict(
+            sample_counts=np.full(n, 900.0),
+            open_beam_counts=np.full(n, 1000.0),
+            energies=np.linspace(1.0, 30.0, n),
+            isotopes=[(u238_data, 1.0e-4)],
+            solver="kl",
+            max_iter=5,
+        )
+
+    def test_weights_without_edges_rejected(self, u238_data):
+        kwargs = self._base_kwargs(u238_data)
+        with pytest.raises(ValueError, match="must be supplied together"):
+            nereids.fit_counts_spectrum_typed(
+                incident_fluence_weights=np.full(20, 1.0), **kwargs
+            )
+
+    def test_edges_without_weights_rejected(self, u238_data):
+        kwargs = self._base_kwargs(u238_data)
+        with pytest.raises(ValueError, match="must be supplied together"):
+            nereids.fit_counts_spectrum_typed(
+                detector_time_edges_us=np.linspace(100.0, 200.0, 21), **kwargs
+            )
+
+    def test_timing_offset_alone_rejected(self, u238_data):
+        kwargs = self._base_kwargs(u238_data)
+        with pytest.raises(ValueError, match="timing_offset_us requires"):
+            nereids.fit_counts_spectrum_typed(timing_offset_us=3.0, **kwargs)
+
+    def test_fluence_length_mismatch_rejected(self, u238_data):
+        kwargs = self._base_kwargs(u238_data)
+        with pytest.raises(
+            ValueError, match="incident_fluence_weights length"
+        ):
+            nereids.fit_counts_spectrum_typed(
+                incident_fluence_weights=np.full(19, 1.0),
+                detector_time_edges_us=np.linspace(100.0, 200.0, 21),
+                **kwargs,
+            )
+
+    def test_edges_length_mismatch_rejected(self, u238_data):
+        kwargs = self._base_kwargs(u238_data)
+        with pytest.raises(ValueError, match="detector_time_edges_us length"):
+            nereids.fit_counts_spectrum_typed(
+                incident_fluence_weights=np.full(20, 1.0),
+                detector_time_edges_us=np.linspace(100.0, 200.0, 20),
+                **kwargs,
+            )
+
+    def test_exact_kwargs_without_resolution_rejected(self, u238_data):
+        kwargs = self._base_kwargs(u238_data)
+        with pytest.raises(
+            ValueError,
+            match="require resolution=TabulatedResolution or IkedaCarpenter",
+        ):
+            nereids.fit_counts_spectrum_typed(
+                incident_fluence_weights=np.full(20, 1.0),
+                detector_time_edges_us=np.linspace(100.0, 200.0, 21),
+                **kwargs,
+            )
+
+    def test_exact_kwargs_with_gaussian_resolution_rejected(self, u238_data):
+        kwargs = self._base_kwargs(u238_data)
+        # Gaussian trio + exact inputs: the Gaussian model can never provide
+        # detector-time bin probabilities, so the pipeline names the workable
+        # remedy (a detector-time response) instead.
+        with pytest.raises(ValueError, match="separate-arm model"):
+            nereids.fit_counts_spectrum_typed(
+                incident_fluence_weights=np.full(20, 1.0),
+                detector_time_edges_us=np.linspace(100.0, 200.0, 21),
+                flight_path_m=25.0,
+                delta_t_us=0.5,
+                delta_l_m=0.005,
+                **kwargs,
+            )
+
+
 class TestComputeModelJacobianCountsGate:
     """The research Fisher helper is a counts-space model: it must reject
     instrument resolution like the production fit routes, and keep working

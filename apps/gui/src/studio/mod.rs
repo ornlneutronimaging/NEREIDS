@@ -9,7 +9,7 @@
 use std::sync::Arc;
 
 use crate::guided::{detectability, forward_model, result_widgets};
-use crate::state::{AppState, Colormap, EndfStatus, InputMode, SpectrumAxis, StudioDocTab};
+use crate::state::{AppState, Colormap, EndfStatus, SpectrumAxis, StudioDocTab};
 use crate::theme::ThemeColors;
 use crate::widgets::design;
 use crate::widgets::image_view::show_colormapped_image;
@@ -1249,12 +1249,10 @@ fn solver_card(ui: &mut egui::Ui, state: &mut AppState) {
         ui.horizontal(|ui| {
             ui.label("Method:");
             let prev = state.solver_method;
-            // Mirror the Analyze-panel availability rule: KL is a raw-count
+            // Same availability rule as the Analyze panel: KL is a raw-count
             // likelihood, and without both count arms a KL request would land
             // on the rejected transmission+Poisson route.
-            let counts_available = state.sample_data.is_some()
-                && state.open_beam_data.is_some()
-                && !matches!(state.input_mode, InputMode::TransmissionTiff);
+            let counts_available = crate::guided::analyze::display_as_counts(state);
             egui::ComboBox::from_id_salt("studio_solver_method")
                 .selected_text(match state.solver_method {
                     SolverMethod::LevenbergMarquardt => "LM",

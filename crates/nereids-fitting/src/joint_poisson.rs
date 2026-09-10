@@ -109,9 +109,26 @@ impl<'a> JointPoissonObjective<'a> {
 
     /// Number of *active* data bins — `n_data` when no mask is set,
     /// or the count of `true` entries in `active_mask` otherwise.
-    /// This is the count that should drive deviance-per-dof reporting.
     pub fn n_active(&self) -> usize {
         crate::active_mask::active_count(self.active_mask, self.o.len())
+    }
+
+    /// Number of *informative* active bins: active bins with a nonzero
+    /// count total `O_i + S_i > 0`.  A zero-total bin is degenerate under
+    /// the conditional-binomial model — its profiled rate is zero and it
+    /// contributes exactly zero deviance for every parameter value — so
+    /// counting it as a degree of freedom deflates `deviance_per_dof`
+    /// (and the opt-in `scale_by_chi2` σ inflation) by the empty-bin
+    /// fraction.  The exact detector-time route makes wide acquisition
+    /// windows with many empty bins routine, so deviance-per-dof
+    /// reporting must use THIS count.
+    pub fn n_informative(&self) -> usize {
+        self.o
+            .iter()
+            .zip(self.s.iter())
+            .enumerate()
+            .filter(|&(i, (&o, &s))| self.bin_active(i) && o + s > 0.0)
+            .count()
     }
 
     /// Predicate: is bin `i` active?  Returns `true` when no mask is
@@ -846,7 +863,11 @@ impl Default for JointPoissonFitConfig {
 pub struct JointPoissonResult {
     /// Final deviance D at the fitted parameters.
     pub deviance: f64,
-    /// D / (n − k).  The primary goodness-of-fit statistic for the counts path.
+    /// D / dof.  The primary goodness-of-fit statistic for the counts path.
+    /// `dof` counts *informative* active bins (`O_i + S_i > 0`) minus the
+    /// free parameters — zero-total bins are degenerate under the
+    /// conditional-binomial model and are excluded so wide detector windows
+    /// with empty bins do not deflate the ratio.
     pub deviance_per_dof: f64,
     /// Number of data bins on the configured grid (n).  This is the
     /// total bin count; when a fit-energy-range mask is in effect, the
@@ -855,9 +876,9 @@ pub struct JointPoissonResult {
     pub n_data: usize,
     /// Number of *active* data bins — equal to `n_data` when no mask is
     /// set, or the count of `true` entries in the objective's
-    /// `active_mask` otherwise.  The deviance / dof ratio uses
-    /// `(n_active − n_free)` so reduced deviance is unbiased when a
-    /// fit-energy-range mask is in effect (SAMMY EMIN/EMAX semantics, #514).
+    /// `active_mask` otherwise (SAMMY EMIN/EMAX semantics, #514).  The
+    /// deviance / dof ratio additionally drops zero-total active bins
+    /// (see [`JointPoissonObjective::n_informative`]).
     pub n_active: usize,
     /// Number of free parameters (k).
     pub n_free: usize,
@@ -1078,13 +1099,17 @@ pub fn joint_poisson_fit(
     // Active-bin masking (SAMMY EMIN/EMAX): when a fit-energy-range mask
     // is in effect, dof must use the count of bins that contributed to
     // the deviance — otherwise deviance-per-dof is biased low by the
-    // ratio (n_active / n_data).  The `n_active < n_free` case has
-    // already been short-circuited above; here `n_active >= n_free`,
-    // so `dof` is non-negative and exactly-determined fits
-    // (`n_active == n_free`) report `deviance_per_dof = NaN` (0/0)
+    // ratio (n_active / n_data).  Within the active set, zero-total bins
+    // (`O_i + S_i == 0`) are additionally excluded: they are degenerate
+    // under the conditional-binomial model (identically zero deviance for
+    // any T), so counting them deflates D/dof and the opt-in
+    // `scale_by_chi2` σ inflation by the empty-bin fraction — routine on
+    // the exact detector-time route, whose acquisition windows legitimately
+    // contain unoccupied bins.  Fits with no informative surplus
+    // (`n_informative <= n_free`) report `deviance_per_dof = NaN` (0/0)
     // as in LM (`lm.rs:784`).
     let n_active = objective.n_active();
-    let dof = n_active.saturating_sub(n_free);
+    let dof = objective.n_informative().saturating_sub(n_free);
     let deviance_per_dof = if dof > 0 {
         final_deviance / dof as f64
     } else {

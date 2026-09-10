@@ -1118,7 +1118,7 @@ fn clear_analyze_downstream(state: &mut AppState) {
 /// input is already a ratio). This is also the availability rule for the
 /// Poisson KL solver: without both count arms a KL request would land on the
 /// rejected transmission+Poisson route.
-fn display_as_counts(state: &AppState) -> bool {
+pub(crate) fn display_as_counts(state: &AppState) -> bool {
     state.sample_data.is_some()
         && state.open_beam_data.is_some()
         && !matches!(state.input_mode, InputMode::TransmissionTiff)

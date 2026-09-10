@@ -1674,6 +1674,16 @@ fn fit_counts_joint_poisson(
                 .into(),
         ));
     }
+    // NaN bypasses a plain magnitude guard (`NaN.abs() > 1e-12` is false),
+    // which would let a non-finite background through to be silently treated
+    // as zero — pair the comparison with an explicit finiteness check.
+    if detector_background.iter().any(|&v| !v.is_finite()) {
+        return Err(PipelineError::InvalidParameter(
+            "detector_background contains non-finite values; supply zeros (or omit \
+             the array) — B_det wiring is deferred and nonzero values are rejected."
+                .into(),
+        ));
+    }
     if detector_background.iter().any(|&v| v.abs() > 1e-12) {
         return Err(PipelineError::InvalidParameter(
             "joint-Poisson solver with non-zero detector_background is not yet supported \
@@ -3340,17 +3350,25 @@ pub fn evaluate_jacobian_and_fisher(
     flux: &[f64],
     background: &[f64],
 ) -> Result<ModelJacobianResult, PipelineError> {
-    if config.exact_count_response().is_some() {
+    // This helper builds a counts-space Jacobian/Fisher from the legacy
+    // transmission-first chain and does not implement the exact two-arm
+    // detector operator at all — intercept BOTH resolved-count shapes
+    // (resolution attached, exact inputs attached, or either alone) before
+    // the shared validator, whose "provide exact_count_response" remedy
+    // would send this entry point's callers to a config the next line
+    // rejects. Resolved counts belong to fit_counts_spectrum_typed.
+    if config.exact_count_response().is_some() || config.resolution().is_some() {
         return Err(PipelineError::InvalidParameter(
             "evaluate_jacobian_and_fisher does not implement the exact two-arm \
-             detector operator; use the single-spectrum count fitter for resolved \
-             counts rather than reporting a Jacobian for a different model"
+             detector operator required for resolved counts (the separate-arm \
+             model R[Phi] and R[Phi*T]); use fit_counts_spectrum_typed with \
+             exact_count_response for resolved counts, or drop the instrument \
+             resolution for this research helper"
                 .into(),
         ));
     }
-    // This helper builds a counts-space Jacobian/Fisher from the same
-    // transmission-first chain as production fitting.  It is no more physical
-    // under instrument resolution than the optimizer route, so reject it too.
+    // Shared boundary check kept for the remaining (unresolved-counts)
+    // invariants so this helper cannot drift from the fit routes.
     validate_counts_resolution_route(true, flux.len(), config)?;
 
     // Reject a malformed caller-supplied precomputed cross-section stack here,
@@ -6280,6 +6298,15 @@ mod tests {
                 if open == 0.0 {
                     0.0
                 } else {
+                    // Deliberately the SAME pseudo-energy convention the route
+                    // implements (bin center in TIME, fixed offset subtracted,
+                    // then TOF->energy) — the pinned contract for where SAMMY's
+                    // apparent-transmission background is evaluated (Norm() in
+                    // sammy/src/cro/mnrm1.f90 applies it per measured point).
+                    // This closed loop pins fixture/implementation coherence of
+                    // that convention; the implementation-independent numeric
+                    // anchor for the response itself is the hand-computed test
+                    // below. Do not "simplify" one side without the other.
                     let measured_energy =
                         tof_to_energy(0.5 * (edges[0] + edges[1]) - timing_offset_us, 25.0);
                     open * (fixed_anorm * sample / open
@@ -6353,6 +6380,405 @@ mod tests {
     #[test]
     fn exact_resolved_counts_closed_loop_with_timing_offset() {
         run_exact_closed_loop(5.0);
+    }
+
+    /// FREE normalization through the exact composition: Anorm and BackA are
+    /// fitted (seeded off truth) on the detector-pseudo-energy side of the
+    /// separate-arm ratio, exercising the NormalizedTransmissionModel
+    /// analytical-Jacobian columns through the new stacking order rather
+    /// than only frozen values.
+    #[test]
+    fn exact_resolved_counts_recovers_free_normalization() {
+        use nereids_physics::counts_response::two_arm_count_response;
+        use nereids_physics::resolution::{ResolutionFunction, TabulatedResolution};
+
+        let data = u238_single_resonance();
+        let true_density = 5.0e-4;
+        let true_anorm = 0.97;
+        let true_back_a = 0.015;
+        let energies: Vec<f64> = (0..80).map(|i| 5.0 + i as f64 * 3.0 / 79.0).collect();
+        let (true_transmission, _) = synthetic_transmission(&data, true_density, &energies);
+        let response = ResolutionFunction::Tabulated(Arc::new(
+            TabulatedResolution::from_kernels(
+                vec![6.5],
+                vec![(vec![-3.0, 0.0, 3.0], vec![0.0, 1.0, 0.0])],
+                25.0,
+            )
+            .expect("valid detector-time response"),
+        ));
+        let source: Vec<f64> = energies
+            .iter()
+            .enumerate()
+            .map(|(index, _)| 4.0e4 * (1.0 + 0.4 * index as f64 / 79.0))
+            .collect();
+        let detector_edges: Vec<f64> = (0..102).map(|i| 630.0 + i as f64 * 2.5).collect();
+        let expected = two_arm_count_response(
+            &energies,
+            &source,
+            &true_transmission,
+            &detector_edges,
+            0.0,
+            &response,
+        )
+        .expect("valid synthetic count response");
+        let sample_counts: Vec<f64> = expected
+            .open_beam
+            .iter()
+            .zip(&expected.sample)
+            .map(|(&open, &sample)| {
+                if open == 0.0 {
+                    0.0
+                } else {
+                    open * (true_anorm * sample / open + true_back_a)
+                }
+            })
+            .collect();
+
+        let config = UnifiedFitConfig::new(
+            energies,
+            vec![data],
+            vec!["U-238".into()],
+            0.0,
+            Some(response),
+            vec![2.0e-4],
+        )
+        .unwrap()
+        .with_solver(SolverConfig::PoissonKL(PoissonConfig {
+            max_iter: 600,
+            ..Default::default()
+        }))
+        .with_exact_count_response(ExactCountResponseConfig {
+            incident_fluence_weights: source,
+            detector_time_edges_us: detector_edges,
+            timing_offset_us: 0.0,
+        })
+        .with_transmission_background(BackgroundConfig {
+            anorm_init: 1.0,  // seeded off truth
+            back_a_init: 0.0, // seeded off truth
+            back_b_init: 0.0,
+            back_c_init: 0.0,
+            back_d_init: 0.01,
+            back_f_init: 1.0,
+            fit_anorm: true,
+            fit_back_a: true,
+            fit_back_b: false,
+            fit_back_c: false,
+            fit_back_d: false,
+            fit_back_f: false,
+        });
+        let result = fit_spectrum_typed(
+            &InputData::Counts {
+                sample_counts,
+                open_beam_counts: expected.open_beam,
+            },
+            &config,
+        )
+        .expect("exact fit with free normalization");
+
+        assert!(result.converged, "fit did not converge");
+        assert!(
+            (result.densities[0] - true_density).abs() / true_density < 1.0e-3,
+            "density: fitted={}, true={true_density}",
+            result.densities[0]
+        );
+        assert!(
+            (result.anorm - true_anorm).abs() < 1.0e-3,
+            "anorm: fitted={}, true={true_anorm}",
+            result.anorm
+        );
+        assert!(
+            (result.background[0] - true_back_a).abs() < 1.0e-3,
+            "back_a: fitted={}, true={true_back_a}",
+            result.background[0]
+        );
+        assert!(result.deviance_per_dof.unwrap_or(f64::INFINITY) < 1.0e-6);
+    }
+
+    /// FREE multiplicative baseline through the exact composition: a
+    /// log-linear tilt `b1` is applied to the TRUE-ENERGY sample arm before
+    /// detector response (a constant `b0` would be exactly degenerate with
+    /// Anorm through the linear response, so the tilt is the identifiable
+    /// probe of the inside-the-response placement) and must be recovered by
+    /// the fit.
+    #[test]
+    fn exact_resolved_counts_recovers_free_baseline_tilt() {
+        use nereids_physics::counts_response::two_arm_count_response;
+        use nereids_physics::resolution::{ResolutionFunction, TabulatedResolution};
+
+        let data = u238_single_resonance();
+        let true_density = 5.0e-4;
+        let true_b1 = 0.02;
+        let energies: Vec<f64> = (0..80).map(|i| 5.0 + i as f64 * 3.0 / 79.0).collect();
+        let (true_transmission, _) = synthetic_transmission(&data, true_density, &energies);
+        // Baseline reference energy: the fit uses
+        // baseline_reference_energy_active(energies, None); mirror it by
+        // computing the same mid-grid reference the production helper uses.
+        let e_ref =
+            nereids_fitting::transmission_model::baseline_reference_energy_active(&energies, None);
+        let baselined: Vec<f64> = energies
+            .iter()
+            .zip(&true_transmission)
+            .map(|(&e, &t)| (1.0 + true_b1 * (e / e_ref).ln()) * t)
+            .collect();
+        let response = ResolutionFunction::Tabulated(Arc::new(
+            TabulatedResolution::from_kernels(
+                vec![6.5],
+                vec![(vec![-3.0, 0.0, 3.0], vec![0.0, 1.0, 0.0])],
+                25.0,
+            )
+            .expect("valid detector-time response"),
+        ));
+        let source: Vec<f64> = energies
+            .iter()
+            .enumerate()
+            .map(|(index, _)| 4.0e4 * (1.0 + 0.4 * index as f64 / 79.0))
+            .collect();
+        let detector_edges: Vec<f64> = (0..102).map(|i| 630.0 + i as f64 * 2.5).collect();
+        let expected = two_arm_count_response(
+            &energies,
+            &source,
+            &baselined,
+            &detector_edges,
+            0.0,
+            &response,
+        )
+        .expect("valid synthetic count response");
+
+        let config = UnifiedFitConfig::new(
+            energies,
+            vec![data],
+            vec!["U-238".into()],
+            0.0,
+            Some(response),
+            vec![2.0e-4],
+        )
+        .unwrap()
+        .with_solver(SolverConfig::PoissonKL(PoissonConfig {
+            max_iter: 600,
+            ..Default::default()
+        }))
+        .with_exact_count_response(ExactCountResponseConfig {
+            incident_fluence_weights: source,
+            detector_time_edges_us: detector_edges,
+            timing_offset_us: 0.0,
+        })
+        .with_multiplicative_baseline(MultiplicativeBaselineConfig {
+            b0_init: 1.0,
+            b1_init: 0.0, // seeded off truth
+            b2_init: 0.0,
+            fit_b0: false,
+            fit_b1: true,
+            fit_b2: false,
+            ..Default::default()
+        });
+        let result = fit_spectrum_typed(
+            &InputData::Counts {
+                sample_counts: expected.sample,
+                open_beam_counts: expected.open_beam,
+            },
+            &config,
+        )
+        .expect("exact fit with free baseline tilt");
+
+        assert!(result.converged, "fit did not converge");
+        assert!(
+            (result.densities[0] - true_density).abs() / true_density < 1.0e-3,
+            "density: fitted={}, true={true_density}",
+            result.densities[0]
+        );
+        let baseline = result.baseline.expect("baseline coefficients reported");
+        assert!(
+            (baseline[1] - true_b1).abs() < 1.0e-3,
+            "b1: fitted={}, true={true_b1}",
+            baseline[1]
+        );
+        assert!(result.deviance_per_dof.unwrap_or(f64::INFINITY) < 1.0e-6);
+    }
+
+    /// Every rejection arm of the exact-route validation surface, exercised.
+    /// The occupied-dead-bin pre-check is the load-bearing one: it is the
+    /// invariant ExactTwoArmRatioModel's rustdoc requires callers to enforce
+    /// (observed counts in a bin outside the response support must be a hard
+    /// error, never a silent comparison against the dead-bin T=1 filler).
+    #[test]
+    fn exact_route_validation_arms_reject_each_misuse() {
+        use nereids_physics::resolution::{ResolutionFunction, TOF_FACTOR, TabulatedResolution};
+
+        let make_response = || {
+            ResolutionFunction::Tabulated(Arc::new(
+                TabulatedResolution::from_kernels(
+                    vec![25.0],
+                    vec![(vec![-1.0, 0.0, 1.0], vec![0.0, 1.0, 0.0])],
+                    25.0,
+                )
+                .expect("valid triangle response"),
+            ))
+        };
+        let arrival = TOF_FACTOR * 25.0 / 25.0_f64.sqrt();
+        let data = u238_single_resonance();
+        let base_config = |resolution: Option<ResolutionFunction>| {
+            UnifiedFitConfig::new(
+                vec![25.0],
+                vec![data.clone()],
+                vec!["U-238".into()],
+                0.0,
+                resolution,
+                vec![1.0e-4],
+            )
+            .unwrap()
+            .with_solver(SolverConfig::PoissonKL(PoissonConfig::default()))
+        };
+        let exact = |edges: Vec<f64>| ExactCountResponseConfig {
+            incident_fluence_weights: vec![100.0],
+            detector_time_edges_us: edges,
+            timing_offset_us: 0.0,
+        };
+        let two_bin_edges = vec![arrival - 1.0, arrival, arrival + 1.0];
+        let counts_2 = InputData::Counts {
+            sample_counts: vec![10.0, 10.0],
+            open_beam_counts: vec![50.0, 50.0],
+        };
+
+        // (a) Occupied dead bin: window entirely outside the response
+        // support, but the observed arrays carry counts.
+        let err = fit_spectrum_typed(
+            &counts_2,
+            &base_config(Some(make_response())).with_exact_count_response(exact(vec![
+                arrival + 10.0,
+                arrival + 11.0,
+                arrival + 12.0,
+            ])),
+        )
+        .expect_err("occupied dead bin must be a hard error");
+        assert!(
+            err.to_string()
+                .contains("zero detector response in occupied detector bin"),
+            "{err}"
+        );
+
+        // (b) Exact config attached to normalized transmission input.
+        let err = fit_spectrum_typed(
+            &InputData::Transmission {
+                transmission: vec![0.9],
+                uncertainty: vec![0.01],
+            },
+            &base_config(Some(make_response()))
+                .with_solver(SolverConfig::LevenbergMarquardt(LmConfig::default()))
+                .with_exact_count_response(exact(two_bin_edges.clone())),
+        )
+        .expect_err("exact config on transmission must be rejected");
+        assert!(
+            err.to_string()
+                .contains("cannot be attached to normalized transmission"),
+            "{err}"
+        );
+
+        // (c) Exact config without any resolution model.
+        let err = fit_spectrum_typed(
+            &counts_2,
+            &base_config(None).with_exact_count_response(exact(two_bin_edges.clone())),
+        )
+        .expect_err("exact config without resolution must be rejected");
+        assert!(
+            err.to_string()
+                .contains("requires an instrument resolution model"),
+            "{err}"
+        );
+
+        // (d) Fluence length != true-energy grid length.
+        let err = fit_spectrum_typed(
+            &counts_2,
+            &base_config(Some(make_response())).with_exact_count_response(
+                ExactCountResponseConfig {
+                    incident_fluence_weights: vec![100.0, 100.0],
+                    detector_time_edges_us: two_bin_edges.clone(),
+                    timing_offset_us: 0.0,
+                },
+            ),
+        )
+        .expect_err("fluence length mismatch must be rejected");
+        assert!(
+            err.to_string().contains("incident_fluence_weights length"),
+            "{err}"
+        );
+
+        // (e) Edge count != observed bins + 1.
+        let err = fit_spectrum_typed(
+            &counts_2,
+            &base_config(Some(make_response()))
+                .with_exact_count_response(exact(vec![arrival - 1.0, arrival])),
+        )
+        .expect_err("edge/bin length mismatch must be rejected");
+        assert!(
+            err.to_string().contains("detector_time_edges_us length"),
+            "{err}"
+        );
+
+        // (f) Non-finite timing offset.
+        let err = fit_spectrum_typed(
+            &counts_2,
+            &base_config(Some(make_response())).with_exact_count_response(
+                ExactCountResponseConfig {
+                    incident_fluence_weights: vec![100.0],
+                    detector_time_edges_us: two_bin_edges.clone(),
+                    timing_offset_us: f64::NAN,
+                },
+            ),
+        )
+        .expect_err("NaN timing offset must be rejected");
+        assert!(
+            err.to_string().contains("timing_offset_us must be finite"),
+            "{err}"
+        );
+
+        // (g) Energy-scale fitting through the exact response.
+        let err = fit_spectrum_typed(
+            &counts_2,
+            &base_config(Some(make_response()))
+                .with_exact_count_response(exact(two_bin_edges.clone()))
+                .with_energy_scale(0.0, 1.0, 25.0),
+        )
+        .expect_err("energy-scale through the exact response must be rejected");
+        assert!(
+            err.to_string()
+                .contains("not yet connected to the exact two-arm"),
+            "{err}"
+        );
+
+        // (h) fit_energy_range through the exact response.
+        let err = fit_spectrum_typed(
+            &counts_2,
+            &base_config(Some(make_response()))
+                .with_exact_count_response(exact(two_bin_edges.clone()))
+                .with_fit_energy_range(Some((10.0, 30.0)))
+                .unwrap(),
+        )
+        .expect_err("fit_energy_range through the exact response must be rejected");
+        assert!(
+            err.to_string()
+                .contains("fit_energy_range is not yet supported"),
+            "{err}"
+        );
+
+        // (i) Spatial mapping with an exact config: single-spectrum only.
+        let sample = ndarray::Array3::from_elem((1, 2, 2), 10.0);
+        let open_beam = ndarray::Array3::from_elem((1, 2, 2), 50.0);
+        let err = crate::spatial::spatial_map_typed(
+            &crate::spatial::InputData3D::Counts {
+                sample_counts: sample.view(),
+                open_beam_counts: open_beam.view(),
+            },
+            &base_config(Some(make_response())).with_exact_count_response(exact(two_bin_edges)),
+            None,
+            None,
+            None,
+        )
+        .expect_err("spatial exact-count mapping must be rejected");
+        assert!(
+            err.to_string()
+                .contains("single-spectrum count fitter only"),
+            "{err}"
+        );
     }
 
     /// Implementation-independent numeric anchor for the exact fit route:

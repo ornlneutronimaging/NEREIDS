@@ -963,8 +963,10 @@ pub fn spatial_map_typed(
                 "spatial_map_typed: transmission_background with fit_back_d=true / \
                  fit_back_f=true cannot be combined with the counts-KL (joint-Poisson) \
                  dispatch. The joint-Poisson solver does not fit the SAMMY exponential \
-                 tail. Either switch to SolverConfig::LevenbergMarquardt or disable the \
-                 exponential tail (fit_back_d=false, fit_back_f=false)."
+                 tail. Disable the exponential tail (fit_back_d=false, \
+                 fit_back_f=false), or fit pre-normalized transmission with \
+                 uncertainties via SolverConfig::LevenbergMarquardt (raw counts \
+                 cannot use LM)."
                     .into(),
             ));
         }
