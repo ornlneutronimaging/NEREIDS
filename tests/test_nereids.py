@@ -774,6 +774,109 @@ class TestTwoArmCountResponse:
         assert sample_loss == pytest.approx(40.0 * outside, abs=2e-12)
 
 
+class TestTwoArmCountBackground:
+    """Amplitude estimation for independently measured count backgrounds.
+
+    Contract R5.7 clause (2): a non-negative two-arm amplitude fit over
+    declared spectral templates, with identifiability reported. The neutron
+    signal and every template shape stay fixed; only amplitudes are fitted.
+    Background is added *after* the instrument response, so it is never
+    broadened a second time.
+    """
+
+    TOF_FACTOR = 72.298254398292800
+    L = 25.0
+
+    @staticmethod
+    def _write_triangle(path):
+        path.write_text(
+            "\n".join(
+                [
+                    "synthetic one-microsecond triangle",
+                    "-----",
+                    "   2.50000e+001   0.00000e+000",
+                    "-1.0 0.0",
+                    "0.0 1.0",
+                    "1.0 0.0",
+                    "",
+                ]
+            )
+        )
+
+    def _two_arm_signal(self, tmp_path):
+        """Neutron-only expectation on three detector-time bins."""
+        kernel_path = tmp_path / "background_triangle.txt"
+        self._write_triangle(kernel_path)
+        response = nereids.load_resolution(str(kernel_path), self.L)
+        arrival_0 = self.TOF_FACTOR * self.L / np.sqrt(25.0)
+        energy_1 = (self.TOF_FACTOR * self.L / (arrival_0 + 1.0)) ** 2
+        edges = np.array(
+            [arrival_0 - 1.0, arrival_0, arrival_0 + 1.0, arrival_0 + 2.0]
+        )
+        open_beam, sample, _open_loss, _sample_loss = nereids.two_arm_count_response(
+            np.array([25.0, energy_1]),
+            np.array([1.0e5, 2.0e5]),
+            np.array([0.2, 0.8]),
+            edges,
+            response,
+        )
+        return np.asarray(open_beam), np.asarray(sample)
+
+    def test_recovers_independent_template_amplitude(self, tmp_path):
+        open_signal, sample_signal = self._two_arm_signal(tmp_path)
+
+        # One blocked-beam component, flat across the acquisition, present in
+        # both arms at a known amplitude.
+        true_amplitude = 2.0e4
+        open_template = np.ones_like(open_signal)
+        sample_template = np.ones_like(sample_signal)
+
+        rng = np.random.default_rng(20260911)
+        observed_open = rng.poisson(
+            open_signal + true_amplitude * open_template
+        ).astype(float)
+        observed_sample = rng.poisson(
+            sample_signal + true_amplitude * sample_template
+        ).astype(float)
+
+        fit = nereids.fit_two_arm_background_templates(
+            observed_open,
+            observed_sample,
+            open_signal,
+            sample_signal,
+            1.0,
+            1.0,
+            ["blocked_beam"],
+            open_template[np.newaxis, :],
+            sample_template[np.newaxis, :],
+            np.array([1.0e3]),
+        )
+
+        assert fit.converged
+        assert fit.names == ["blocked_beam"]
+        # A single template is trivially independent, so the amplitude is
+        # separately determined and an uncertainty is reported.
+        assert fit.amplitudes_identifiable
+        assert np.isfinite(fit.amplitude_uncertainties[0])
+        assert fit.amplitudes[0] == pytest.approx(true_amplitude, rel=0.05)
+
+        # The three pieces are returned separately and must reconstruct the
+        # total exactly: background is added after the response, not folded
+        # into the neutron signal.
+        np.testing.assert_allclose(fit.open_neutron_signal, open_signal, rtol=1e-12)
+        np.testing.assert_allclose(
+            np.asarray(fit.open_total),
+            np.asarray(fit.open_neutron_signal) + np.asarray(fit.open_background),
+            rtol=1e-12,
+        )
+        np.testing.assert_allclose(
+            np.asarray(fit.sample_total),
+            np.asarray(fit.sample_neutron_signal)
+            + np.asarray(fit.sample_background),
+            rtol=1e-12,
+        )
+
+
 class TestExactResolvedCountsRoute:
     """End-to-end anchor for the exact separate-arm count route (Wave-1 PR-2b).
 
