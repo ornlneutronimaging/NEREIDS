@@ -55,6 +55,41 @@ pub struct TwoArmCounts {
     pub sample_window_loss: f64,
 }
 
+/// Signal, additive background, and total expected counts for one measured arm.
+///
+/// Background is expressed directly in the detector bins of that measurement
+/// and is added *after* source attenuation and instrument response. It is not
+/// the SAMMY additive transmission curve, and it is not convolved a second
+/// time by the instrument response.
+#[derive(Debug, Clone, PartialEq)]
+pub struct ArmCountPrediction {
+    /// Neutron counts produced by source, sample, and instrument response.
+    pub neutron_signal: Vec<f64>,
+    /// Independently supplied additive expected counts in the measured bins.
+    pub background: Vec<f64>,
+    /// Complete expectation, `neutron_signal + background`.
+    pub total: Vec<f64>,
+    /// Expected neutron counts lost outside the acquisition window, carried
+    /// through from [`TwoArmCounts`].
+    ///
+    /// The pipeline-map contract (R5·7) requires the acquisition-window loss
+    /// to stay disclosed rather than renormalized away. Forming a total
+    /// expectation is exactly where that report would otherwise be dropped,
+    /// so it travels with the arm it belongs to. Only the neutron signal can
+    /// leave the window: a background template is supplied already binned
+    /// into the acquisition, so it contributes no additional loss.
+    pub window_loss: f64,
+}
+
+/// Complete expected counts for the open-beam and sample measurements.
+#[derive(Debug, Clone, PartialEq)]
+pub struct TwoArmCountPrediction {
+    /// Open-beam measurement components.
+    pub open_beam: ArmCountPrediction,
+    /// Sample measurement components.
+    pub sample: ArmCountPrediction,
+}
+
 /// Detector-bin probabilities for a fixed instrument response.
 ///
 /// Rows correspond to `true_energies_ev`; columns correspond to consecutive
@@ -326,6 +361,19 @@ pub enum CountsResponseError {
     InvalidIncidentFluence { index: usize, value: f64 },
     /// A physical sample transmission was outside `[0, 1]` or non-finite.
     InvalidTransmission { index: usize, value: f64 },
+    /// A signal or background expected count was negative or non-finite.
+    InvalidExpectedCount {
+        field: &'static str,
+        index: usize,
+        value: f64,
+    },
+    /// Signal and background arrays did not describe the same detector bins.
+    DetectorBinCountMismatch {
+        open_signal: usize,
+        sample_signal: usize,
+        open_background: usize,
+        sample_background: usize,
+    },
     /// The response could not evaluate detector-bin probabilities.
     Resolution(ResolutionParseError),
 }
@@ -354,6 +402,23 @@ impl fmt::Display for CountsResponseError {
                 f,
                 "transmission[{index}] must be finite and in [0, 1], got {value}"
             ),
+            Self::InvalidExpectedCount {
+                field,
+                index,
+                value,
+            } => write!(
+                f,
+                "{field}[{index}] must be finite and >= 0 expected counts, got {value}"
+            ),
+            Self::DetectorBinCountMismatch {
+                open_signal,
+                sample_signal,
+                open_background,
+                sample_background,
+            } => write!(
+                f,
+                "open neutron signal ({open_signal} bins), sample neutron signal ({sample_signal}), open_background_counts ({open_background}), and sample_background_counts ({sample_background}) must have equal lengths"
+            ),
             Self::Resolution(error) => write!(f, "detector-time response failed: {error}"),
         }
     }
@@ -372,6 +437,125 @@ impl From<ResolutionParseError> for CountsResponseError {
     fn from(value: ResolutionParseError) -> Self {
         Self::Resolution(value)
     }
+}
+
+/// Add detector-bin backgrounds to an already evaluated two-arm neutron signal.
+///
+/// Both background arrays are expected counts for the corresponding complete
+/// acquisition, already mapped into the same detector-time bins as `signal`.
+/// A measured dark or blocked-beam reference may therefore be supplied
+/// directly after applying its independently justified run normalization.
+/// This function does not guess an exposure, fit a smooth curve, or
+/// reinterpret a SAMMY transmission-level background as detector counts.
+///
+/// A sample-scattering calculation that starts from a true-energy spectrum is
+/// not an input here: it must first be propagated through the instrument
+/// response. Only a scattering reference already measured in the detector
+/// bins can enter directly.
+///
+/// The per-arm acquisition-window loss carried by `signal` travels into the
+/// returned prediction unchanged (pipeline-map R5·7). Backgrounds are already
+/// binned into the acquisition, so they add no further loss.
+pub fn add_count_backgrounds(
+    signal: TwoArmCounts,
+    open_background_counts: &[f64],
+    sample_background_counts: &[f64],
+) -> Result<TwoArmCountPrediction, CountsResponseError> {
+    let n_bins = signal.open_beam.len();
+    if signal.sample.len() != n_bins
+        || open_background_counts.len() != n_bins
+        || sample_background_counts.len() != n_bins
+    {
+        return Err(CountsResponseError::DetectorBinCountMismatch {
+            open_signal: n_bins,
+            sample_signal: signal.sample.len(),
+            open_background: open_background_counts.len(),
+            sample_background: sample_background_counts.len(),
+        });
+    }
+
+    validate_expected_counts("open_neutron_signal", &signal.open_beam)?;
+    validate_expected_counts("sample_neutron_signal", &signal.sample)?;
+    validate_expected_counts("open_background_counts", open_background_counts)?;
+    validate_expected_counts("sample_background_counts", sample_background_counts)?;
+    for (field, value) in [
+        ("open_beam_window_loss", signal.open_beam_window_loss),
+        ("sample_window_loss", signal.sample_window_loss),
+    ] {
+        if !value.is_finite() || value < 0.0 {
+            return Err(CountsResponseError::InvalidExpectedCount {
+                field,
+                index: 0,
+                value,
+            });
+        }
+    }
+
+    let open_total = sum_expected_counts(
+        "open_total_expected_counts",
+        &signal.open_beam,
+        open_background_counts,
+    )?;
+    let sample_total = sum_expected_counts(
+        "sample_total_expected_counts",
+        &signal.sample,
+        sample_background_counts,
+    )?;
+
+    Ok(TwoArmCountPrediction {
+        open_beam: ArmCountPrediction {
+            neutron_signal: signal.open_beam,
+            background: open_background_counts.to_vec(),
+            total: open_total,
+            window_loss: signal.open_beam_window_loss,
+        },
+        sample: ArmCountPrediction {
+            neutron_signal: signal.sample,
+            background: sample_background_counts.to_vec(),
+            total: sample_total,
+            window_loss: signal.sample_window_loss,
+        },
+    })
+}
+
+fn validate_expected_counts(
+    field: &'static str,
+    values: &[f64],
+) -> Result<(), CountsResponseError> {
+    for (index, &value) in values.iter().enumerate() {
+        if !value.is_finite() || value < 0.0 {
+            return Err(CountsResponseError::InvalidExpectedCount {
+                field,
+                index,
+                value,
+            });
+        }
+    }
+    Ok(())
+}
+
+fn sum_expected_counts(
+    field: &'static str,
+    neutron_signal: &[f64],
+    background: &[f64],
+) -> Result<Vec<f64>, CountsResponseError> {
+    neutron_signal
+        .iter()
+        .zip(background)
+        .enumerate()
+        .map(|(index, (&neutron, &background))| {
+            let total = neutron + background;
+            if total.is_finite() {
+                Ok(total)
+            } else {
+                Err(CountsResponseError::InvalidExpectedCount {
+                    field,
+                    index,
+                    value: total,
+                })
+            }
+        })
+        .collect()
 }
 
 /// Apply one instrument response to the open-beam and sample arms separately.
