@@ -804,7 +804,13 @@ pub struct JointPoissonFitConfig {
     pub compute_covariance: bool,
     /// Inflate the covariance-only uncertainties by the goodness-of-fit factor
     /// at the converged point: `Cov → (D/dof)·Cov`, i.e. `σ → σ·√(D/dof)`, where
-    /// `D` is the final Poisson deviance and `dof = n_active − n_free`.
+    /// `D` is the final Poisson deviance and
+    /// `dof = n_informative − n_free` — the count of active bins carrying data
+    /// (`O_i + S_i > 0`) minus the free parameters. Zero-total bins are
+    /// degenerate under the conditional-binomial model (identically zero
+    /// deviance for any `T`) and are excluded so a wide detector window with
+    /// empty bins cannot deflate the factor; see
+    /// [`JointPoissonObjective::n_informative`].
     ///
     /// Off by default, so the reported σ stays the raw Cramér-Rao (inverse-Fisher)
     /// lower bound, which omits baseline/model mis-specification noise and can
@@ -1106,8 +1112,9 @@ pub fn joint_poisson_fit(
     // `scale_by_chi2` σ inflation by the empty-bin fraction — routine on
     // the exact detector-time route, whose acquisition windows legitimately
     // contain unoccupied bins.  Fits with no informative surplus
-    // (`n_informative <= n_free`) report `deviance_per_dof = NaN` (0/0)
-    // as in LM (`lm.rs:784`).
+    // (`n_informative <= n_free`) report `deviance_per_dof = NaN` (0/0),
+    // matching the zero-dof handling in `lm.rs`'s reduced-chi-squared
+    // computation (cite the behaviour, not a line number that drifts).
     let n_active = objective.n_active();
     let dof = objective.n_informative().saturating_sub(n_free);
     let deviance_per_dof = if dof > 0 {
@@ -1945,6 +1952,102 @@ mod tests {
             (0.85..=1.15).contains(&result.deviance_per_dof),
             "D/(n-k) out of band: {}",
             result.deviance_per_dof
+        );
+    }
+
+    /// Degenerate (zero-total) bins must not dilute the deviance dof.
+    ///
+    /// A bin with `O_i + S_i == 0` contributes identically zero deviance for
+    /// every parameter value, so counting it as a degree of freedom deflates
+    /// `deviance_per_dof` (and the opt-in `scale_by_chi2` σ inflation) by the
+    /// empty-bin fraction — routine on the exact detector-time route, whose
+    /// acquisition windows legitimately contain unoccupied bins.
+    ///
+    /// This test is deliberately DISCRIMINATING: padding a fit with empty
+    /// bins must leave `deviance` AND `deviance_per_dof` unchanged while
+    /// `n_active` grows, and the reported ratio must equal
+    /// `deviance / (n_occupied − n_free)` exactly.  Reverting the divisor to
+    /// `n_active − n_free` fails every one of those assertions.
+    #[test]
+    fn empty_bins_do_not_dilute_deviance_dof() {
+        let n_occupied = 40_usize;
+        let n_empty = 20_usize;
+        let c = 1.0_f64;
+
+        // Per-bin ratios vary, so a single constant T cannot match every bin
+        // and the fitted deviance is strictly positive (non-vacuous ratio).
+        let open: Vec<f64> = (0..n_occupied).map(|i| 400.0 + 3.0 * i as f64).collect();
+        let sample: Vec<f64> = (0..n_occupied)
+            .map(|i| {
+                let t_i = 0.55 + 0.12 * ((i % 5) as f64 / 4.0 - 0.5);
+                (open[i] * t_i).round()
+            })
+            .collect();
+
+        let fit = |o: &[f64], s: &[f64]| {
+            let model = ConstModel { n_e: o.len() };
+            let obj = JointPoissonObjective {
+                model: &model,
+                o,
+                s,
+                c,
+                active_mask: None,
+            };
+            let mut params = ParameterSet::new(vec![FitParameter::non_negative("t", 0.5)]);
+            joint_poisson_fit(&obj, &mut params, &JointPoissonFitConfig::default()).unwrap()
+        };
+
+        let base = fit(&open, &sample);
+
+        // Same data, padded with wholly unoccupied trailing bins.
+        let mut open_padded = open.clone();
+        let mut sample_padded = sample.clone();
+        open_padded.extend(std::iter::repeat_n(0.0, n_empty));
+        sample_padded.extend(std::iter::repeat_n(0.0, n_empty));
+        let padded = fit(&open_padded, &sample_padded);
+
+        // Non-vacuity: the fit must actually misfit, or the ratio assertions
+        // below would hold for any divisor.
+        assert!(
+            base.deviance > 1.0,
+            "fixture must produce a positive deviance, got {}",
+            base.deviance
+        );
+        assert_eq!(base.n_free, 1);
+
+        // The padding is visible in n_active (so the test cannot pass by the
+        // padding being silently dropped upstream)...
+        assert_eq!(base.n_active, n_occupied);
+        assert_eq!(padded.n_active, n_occupied + n_empty);
+
+        // ...but invisible in the deviance and in the reported GOF.
+        assert!(
+            (padded.deviance - base.deviance).abs() < 1e-9,
+            "empty bins changed the deviance: {} vs {}",
+            padded.deviance,
+            base.deviance
+        );
+        assert!(
+            (padded.deviance_per_dof - base.deviance_per_dof).abs() < 1e-9,
+            "empty bins diluted deviance_per_dof: {} vs {}",
+            padded.deviance_per_dof,
+            base.deviance_per_dof
+        );
+
+        // Exact denominator: informative bins minus free parameters.
+        let expected = padded.deviance / (n_occupied - 1) as f64;
+        assert!(
+            (padded.deviance_per_dof - expected).abs() < 1e-9,
+            "deviance_per_dof {} != deviance/(n_occupied - n_free) {}",
+            padded.deviance_per_dof,
+            expected
+        );
+        // And the diluted value the pre-fix divisor would have produced is
+        // measurably different — the assertions above have teeth.
+        let diluted = padded.deviance / (n_occupied + n_empty - 1) as f64;
+        assert!(
+            (expected - diluted).abs() > 1e-3,
+            "fixture too weak to distinguish the two divisors"
         );
     }
 

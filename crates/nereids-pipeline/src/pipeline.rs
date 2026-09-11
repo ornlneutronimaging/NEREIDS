@@ -1217,6 +1217,28 @@ pub(crate) fn validate_counts_resolution_route(
                 config.energies().len()
             )));
         }
+        // Validate the fluence VALUES at the boundary, not deep inside
+        // `ExactTwoArmRatioModel::new` after the parallel response-matrix
+        // build: a caller error must surface as InvalidParameter (Python
+        // ValueError) like its sibling exact-input errors, never as a
+        // solver-class Fitting error (RuntimeError), and must not pay for
+        // the matrix build first.
+        for (index, &fluence) in exact.incident_fluence_weights.iter().enumerate() {
+            if !fluence.is_finite() || fluence < 0.0 {
+                return Err(PipelineError::InvalidParameter(format!(
+                    "exact_count_response incident_fluence_weights[{index}] must be \
+                     finite and >= 0, got {fluence}"
+                )));
+            }
+        }
+        if !exact.incident_fluence_weights.iter().any(|&f| f > 0.0) {
+            return Err(PipelineError::InvalidParameter(
+                "exact_count_response incident_fluence_weights must contain at least \
+                 one positive value; an all-zero incident source cannot produce the \
+                 observed counts"
+                    .into(),
+            ));
+        }
         if exact.detector_time_edges_us.len() != observed_bin_count + 1 {
             return Err(PipelineError::ShapeMismatch(format!(
                 "exact_count_response detector_time_edges_us length {} must be one \
@@ -1866,9 +1888,19 @@ fn fit_counts_joint_poisson(
                 "failed to build exact detector-bin response: {error}"
             ))
         })?;
+        // Config-shaped failures here (fluence values/length) are already
+        // rejected by `validate_counts_resolution_route`; map anything that
+        // still escapes to InvalidParameter so the taxonomy matches the
+        // adjacent matrix-build error rather than reporting a caller mistake
+        // as a solver failure.
         let exact_model =
-            ExactTwoArmRatioModel::new(stacked, matrix, &exact.incident_fluence_weights)
-                .map_err(PipelineError::Fitting)?;
+            ExactTwoArmRatioModel::new(stacked, matrix, &exact.incident_fluence_weights).map_err(
+                |error| {
+                    PipelineError::InvalidParameter(format!(
+                        "failed to build the exact two-arm ratio model: {error}"
+                    ))
+                },
+            )?;
         for (bin, ((&observed_open, &observed_sample), &predicted_open)) in flux
             .iter()
             .zip(sample_counts)
@@ -1886,27 +1918,71 @@ fn fit_counts_joint_poisson(
         stacked = Box::new(exact_model);
 
         if let Some(bi) = bg_indices {
-            let detector_energies: Result<Vec<f64>, PipelineError> = exact
+            // The SAMMY apparent-transmission background is evaluated per
+            // MEASURED bin, so each detector-time bin needs a pseudo-energy:
+            // bin center in time, fixed offset removed, then TOF -> energy.
+            //
+            // A real acquisition's time axis may start at the frame trigger,
+            // BEFORE the calibrated offset, so leading bins have a
+            // non-positive corrected TOF and no physical energy. Those bins
+            // are unoccupied (an occupied one with no detector response was
+            // already rejected by the pre-check above), and an unoccupied bin
+            // contributes identically zero deviance for every parameter value
+            // (its profiled rate is zero), so its background value cannot
+            // affect the fit. Rejecting the whole fit for them would refuse a
+            // mainstream acquisition that fits fine without background; only
+            // an OCCUPIED bin without a physical energy is a real error.
+            let flight_path_m = response.flight_path_m();
+            let raw_energies: Vec<Option<f64>> = exact
                 .detector_time_edges_us
                 .windows(2)
-                .enumerate()
-                .map(|(bin, edges)| {
+                .map(|edges| {
                     let corrected_tof_us = 0.5 * (edges[0] + edges[1]) - exact.timing_offset_us;
-                    let energy = tof_to_energy(corrected_tof_us, response.flight_path_m());
-                    if energy.is_finite() && energy > 0.0 {
-                        Ok(energy)
-                    } else {
-                        Err(PipelineError::InvalidParameter(format!(
-                            "detector-time bin {bin} has non-positive time after the fixed \
-                             timing offset; SAMMY apparent-transmission background cannot \
-                             be evaluated on that bin"
-                        )))
+                    let energy = tof_to_energy(corrected_tof_us, flight_path_m);
+                    (energy.is_finite() && energy > 0.0).then_some(energy)
+                })
+                .collect();
+            for (bin, energy) in raw_energies.iter().enumerate() {
+                let occupied = flux[bin] + sample_counts[bin] > 0.0;
+                if energy.is_none() && occupied {
+                    return Err(PipelineError::InvalidParameter(format!(
+                        "detector-time bin {bin} carries observed counts but has \
+                         non-positive time after the fixed timing offset, so the \
+                         SAMMY apparent-transmission background has no physical \
+                         energy there; check timing_offset_us against the \
+                         detector-time axis"
+                    )));
+                }
+            }
+            // Fill the non-contributing bins with their nearest valid
+            // neighbour's energy: any finite positive value leaves the model
+            // finite (no NaN into the Jacobian/Fisher rows) and the bin's
+            // zero deviance weight makes the choice unobservable.
+            let first_valid = raw_energies
+                .iter()
+                .flatten()
+                .copied()
+                .next()
+                .ok_or_else(|| {
+                    PipelineError::InvalidParameter(
+                        "no detector-time bin has a positive time after the fixed timing \
+                     offset; the entire acquisition window precedes timing_offset_us"
+                            .to_string(),
+                    )
+                })?;
+            let mut last_valid = first_valid;
+            let detector_energies: Vec<f64> = raw_energies
+                .into_iter()
+                .map(|energy| {
+                    if let Some(value) = energy {
+                        last_valid = value;
                     }
+                    last_valid
                 })
                 .collect();
             stacked = Box::new(NormalizedTransmissionModel::new(
                 stacked,
-                &detector_energies?,
+                &detector_energies,
                 bi.anorm,
                 bi.back_a,
                 bi.back_b,
@@ -6781,36 +6857,61 @@ mod tests {
         );
     }
 
-    /// Implementation-independent numeric anchor for the exact fit route:
-    /// every expected count below is HAND-COMPUTED from the unit-triangle
-    /// kernel (each pulse splits 0.5/0.5 across two adjacent 1 µs bins), not
+    /// Implementation-independent numeric anchor for the exact fit route,
+    /// parameterized by the fixed clock offset.
+    ///
+    /// Every expected count is HAND-COMPUTED from the unit-triangle kernel
+    /// (each pulse splits 0.5/0.5 across two adjacent 1 µs bins), not
     /// synthesized with `two_arm_count_response` — so a shared defect in
     /// `detector_bin_probabilities` cannot cancel between oracle and fit.
+    /// The fixed SAMMY background uses `BackB/√E`, with the pseudo-energies
+    /// written from the closed-form `E = (TOF_FACTOR·L/t)²` at
+    /// `t = center − offset`, so BOTH uses of the offset (kernel placement
+    /// and background pseudo-energy) are anchored without calling either
+    /// production helper. Note the corrected times are offset-independent by
+    /// construction: a sign flip in either use breaks recovery at offset ≠ 0.
     /// The inner physics is a precomputed cross-section stack chosen so the
     /// true transmission is exactly [0.2, 0.8] at the true density.
-    #[test]
-    fn exact_route_matches_hand_computed_detector_counts() {
+    fn run_hand_computed_anchor(timing_offset_us: f64) {
         use nereids_physics::resolution::{ResolutionFunction, TOF_FACTOR, TabulatedResolution};
 
-        let arrival_0 = TOF_FACTOR * 25.0 / 25.0_f64.sqrt();
-        let energy_1 = (TOF_FACTOR * 25.0 / (arrival_0 + 1.0)).powi(2);
+        let flight_path_m = 25.0_f64;
+        let arrival_0 = TOF_FACTOR * flight_path_m / 25.0_f64.sqrt();
+        let energy_1 = (TOF_FACTOR * flight_path_m / (arrival_0 + 1.0)).powi(2);
         let energies = vec![25.0, energy_1];
         let response = ResolutionFunction::Tabulated(Arc::new(
             TabulatedResolution::from_kernels(
                 vec![25.0],
                 vec![(vec![-1.0, 0.0, 1.0], vec![0.0, 1.0, 0.0])],
-                25.0,
+                flight_path_m,
             )
             .expect("valid triangle response"),
         ));
-        // Hand-derived triangle bin probabilities on edges
-        // [a-1, a, a+1, a+2]: E0 -> [0.5, 0.5, 0], E1 -> [0, 0.5, 0.5].
+        // Pulses sit at `offset + TOF(E)`, so the window shifts with the
+        // offset and the hand-derived triangle bin probabilities on edges
+        // [a-1, a, a+1, a+2] are unchanged:
+        //   E0 -> [0.5, 0.5, 0], E1 -> [0, 0.5, 0.5].
         // With fluence F = [100, 200] and T = [0.2, 0.8]:
-        //   open   = [50, 150, 100]
-        //   sample = [10, 90, 80]   (T_eff = [0.2, 0.6, 0.8])
-        let detector_edges = vec![arrival_0 - 1.0, arrival_0, arrival_0 + 1.0, arrival_0 + 2.0];
+        //   open   = [50, 150, 100]   and   T_eff = [0.2, 0.6, 0.8].
+        let base = timing_offset_us + arrival_0;
+        let detector_edges = vec![base - 1.0, base, base + 1.0, base + 2.0];
         let open_beam_counts = vec![50.0, 150.0, 100.0];
-        let sample_counts = vec![10.0, 90.0, 80.0];
+        let t_eff = [0.2_f64, 0.6, 0.8];
+
+        // Fixed SAMMY background on the measured bins: BackB/√E at the
+        // hand-written pseudo-energy of each bin center, offset removed.
+        let fixed_anorm = 1.0_f64;
+        let fixed_back_b = 0.05_f64;
+        let sample_counts: Vec<f64> = detector_edges
+            .windows(2)
+            .zip(t_eff)
+            .zip(&open_beam_counts)
+            .map(|((edges, t), &open)| {
+                let corrected_tof_us = 0.5 * (edges[0] + edges[1]) - timing_offset_us;
+                let pseudo_energy = (TOF_FACTOR * flight_path_m / corrected_tof_us).powi(2);
+                open * (fixed_anorm * t + fixed_back_b / pseudo_energy.sqrt())
+            })
+            .collect();
 
         // Cross sections chosen so exp(-d_true * sigma_j) = [0.2, 0.8].
         let true_density = 1.0e-3;
@@ -6837,7 +6938,21 @@ mod tests {
         .with_exact_count_response(ExactCountResponseConfig {
             incident_fluence_weights: vec![100.0, 200.0],
             detector_time_edges_us: detector_edges,
-            timing_offset_us: 0.0,
+            timing_offset_us,
+        })
+        .with_transmission_background(BackgroundConfig {
+            anorm_init: fixed_anorm,
+            back_a_init: 0.0,
+            back_b_init: fixed_back_b,
+            back_c_init: 0.0,
+            back_d_init: 0.0,
+            back_f_init: 1.0,
+            fit_anorm: false,
+            fit_back_a: false,
+            fit_back_b: false,
+            fit_back_c: false,
+            fit_back_d: false,
+            fit_back_f: false,
         });
         let result = fit_spectrum_typed(
             &InputData::Counts {
@@ -6855,6 +6970,176 @@ mod tests {
             result.densities[0]
         );
         assert!(result.deviance_per_dof.unwrap_or(f64::INFINITY) < 1.0e-10);
+    }
+
+    #[test]
+    fn exact_route_matches_hand_computed_detector_counts() {
+        run_hand_computed_anchor(0.0);
+    }
+
+    /// Empty pre-trigger bins must not block a background fit.
+    ///
+    /// A real acquisition's time axis can start at the frame trigger, before
+    /// the calibrated `timing_offset_us`, so leading bins have no physical
+    /// pseudo-energy. They are also unoccupied and dead in response, hence
+    /// contribute identically zero deviance — rejecting the whole fit for
+    /// them would refuse a mainstream acquisition that fits fine WITHOUT
+    /// background (the asymmetry a reviewer reproduced). An OCCUPIED bin
+    /// with no physical energy still fails closed.
+    #[test]
+    fn exact_route_tolerates_empty_pre_trigger_bins_with_background() {
+        use nereids_physics::counts_response::two_arm_count_response;
+        use nereids_physics::resolution::{ResolutionFunction, TabulatedResolution};
+
+        let timing_offset_us = 5.0_f64;
+        let data = u238_single_resonance();
+        let true_density = 5.0e-4;
+        let energies: Vec<f64> = (0..60).map(|i| 5.0 + i as f64 * 3.0 / 59.0).collect();
+        let (true_transmission, _) = synthetic_transmission(&data, true_density, &energies);
+        let response = ResolutionFunction::Tabulated(Arc::new(
+            TabulatedResolution::from_kernels(
+                vec![6.5],
+                vec![(vec![-3.0, 0.0, 3.0], vec![0.0, 1.0, 0.0])],
+                25.0,
+            )
+            .expect("valid detector-time response"),
+        ));
+        let source: Vec<f64> = vec![4.0e4; energies.len()];
+        // Window starts at t = 0 (frame trigger): the first two bin centers
+        // (1.25 µs, 3.75 µs) precede the 5 µs offset.
+        let detector_edges: Vec<f64> = (0..340).map(|i| i as f64 * 2.5).collect();
+        let expected = two_arm_count_response(
+            &energies,
+            &source,
+            &true_transmission,
+            &detector_edges,
+            timing_offset_us,
+            &response,
+        )
+        .expect("valid synthetic count response");
+        assert!(
+            expected.open_beam[0] == 0.0 && expected.sample[0] == 0.0,
+            "fixture must have an empty pre-trigger bin 0"
+        );
+
+        let config = UnifiedFitConfig::new(
+            energies,
+            vec![data],
+            vec!["U-238".into()],
+            0.0,
+            Some(response),
+            vec![2.0e-4],
+        )
+        .unwrap()
+        .with_solver(SolverConfig::PoissonKL(PoissonConfig {
+            max_iter: 400,
+            ..Default::default()
+        }))
+        .with_exact_count_response(ExactCountResponseConfig {
+            incident_fluence_weights: source,
+            detector_time_edges_us: detector_edges,
+            timing_offset_us,
+        })
+        // Background ON: this is the combination that used to be rejected.
+        .with_transmission_background(BackgroundConfig {
+            anorm_init: 1.0,
+            back_a_init: 0.0,
+            back_b_init: 0.0,
+            back_c_init: 0.0,
+            back_d_init: 0.0,
+            back_f_init: 1.0,
+            fit_anorm: false,
+            fit_back_a: true,
+            fit_back_b: false,
+            fit_back_c: false,
+            fit_back_d: false,
+            fit_back_f: false,
+        });
+        let result = fit_spectrum_typed(
+            &InputData::Counts {
+                sample_counts: expected.sample,
+                open_beam_counts: expected.open_beam,
+            },
+            &config,
+        )
+        .expect("empty pre-trigger bins must not reject a background fit");
+
+        assert!(result.converged, "fit did not converge");
+        assert!(
+            (result.densities[0] - true_density).abs() / true_density < 1.0e-3,
+            "density: fitted={}, true={true_density}",
+            result.densities[0]
+        );
+    }
+
+    /// The pre-trigger tolerance above must NOT weaken the occupied case:
+    /// counts in a bin with no physical energy remain a hard error.
+    #[test]
+    fn exact_route_rejects_occupied_pre_trigger_bin_with_background() {
+        use nereids_physics::resolution::{ResolutionFunction, TOF_FACTOR, TabulatedResolution};
+
+        let timing_offset_us = 5.0_f64;
+        let arrival = TOF_FACTOR * 25.0 / 25.0_f64.sqrt();
+        let response = ResolutionFunction::Tabulated(Arc::new(
+            TabulatedResolution::from_kernels(
+                vec![25.0],
+                vec![(vec![-1.0, 0.0, 1.0], vec![0.0, 1.0, 0.0])],
+                25.0,
+            )
+            .expect("valid triangle response"),
+        ));
+        // Bin 0 precedes the offset AND carries counts; bins 1-2 hold the
+        // pulse so the occupied-dead-bin pre-check passes and this reaches
+        // the background pseudo-energy mapping.
+        let detector_edges = vec![
+            0.0,
+            2.5,
+            timing_offset_us + arrival - 1.0,
+            timing_offset_us + arrival,
+            timing_offset_us + arrival + 1.0,
+        ];
+        let config = UnifiedFitConfig::new(
+            vec![25.0],
+            vec![u238_single_resonance()],
+            vec!["U-238".into()],
+            0.0,
+            Some(response),
+            vec![1.0e-4],
+        )
+        .unwrap()
+        .with_solver(SolverConfig::PoissonKL(PoissonConfig::default()))
+        .with_exact_count_response(ExactCountResponseConfig {
+            incident_fluence_weights: vec![100.0],
+            detector_time_edges_us: detector_edges,
+            timing_offset_us,
+        })
+        .with_transmission_background(BackgroundConfig {
+            fit_anorm: false,
+            fit_back_a: true,
+            ..BackgroundConfig::default()
+        });
+        let err = fit_spectrum_typed(
+            &InputData::Counts {
+                sample_counts: vec![5.0, 0.0, 20.0, 20.0],
+                open_beam_counts: vec![10.0, 0.0, 50.0, 50.0],
+            },
+            &config,
+        )
+        .expect_err("occupied bin without a physical energy must fail closed");
+        let msg = err.to_string();
+        assert!(
+            msg.contains("carries observed counts") || msg.contains("zero detector response"),
+            "{msg}"
+        );
+    }
+
+    /// Same hand-computed anchor at a nonzero clock offset: the only
+    /// implementation-independent check of the offset conventions, covering
+    /// kernel placement (`offset + TOF`) and background pseudo-energy
+    /// (`center − offset`) simultaneously.
+    #[test]
+    fn exact_route_matches_hand_computed_counts_with_timing_offset() {
+        run_hand_computed_anchor(7.5);
     }
 
     // ──────────────────────────────────────────────────────────────────

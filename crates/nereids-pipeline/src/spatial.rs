@@ -337,8 +337,24 @@ fn validate_spatial_fit_preflight(
                 .into(),
         ));
     }
-    // Hoist the scientifically unsupported counts + resolution combination so
-    // it becomes one actionable boundary error, not an all-NaN map after every
+    // Counts + resolution: intercept BEFORE the shared validator, whose
+    // remedy ("provide ... through exact_count_response") is unreachable
+    // here — the gate directly above rejects any exact config on the spatial
+    // path. Sending a caller to a config this same function refuses is the
+    // misdirected-remedy pattern; name the spatial-actionable options.
+    if is_counts && config.resolution().is_some() {
+        return Err(PipelineError::InvalidParameter(
+            "spatial_map_typed: resolved count mapping needs the exact separate-arm \
+             model R[Phi] and R[Phi*T], which is currently available on the \
+             single-spectrum count fitter only: fit pre-normalized transmission \
+             cubes with resolution, aggregate to a spectrum and use \
+             fit_counts_spectrum_typed with exact_count_response, or disable \
+             instrument resolution for this count map"
+                .into(),
+        ));
+    }
+    // Hoist the remaining scientifically unsupported combinations so they
+    // become one actionable boundary error, not an all-NaN map after every
     // per-pixel error is swallowed by the rayon loop.
     validate_counts_resolution_route(is_counts, input.shape().0, config)?;
     let is_kl = matches!(config.solver(), SolverConfig::PoissonKL(_))
