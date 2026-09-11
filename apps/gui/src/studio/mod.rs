@@ -1249,6 +1249,10 @@ fn solver_card(ui: &mut egui::Ui, state: &mut AppState) {
         ui.horizontal(|ui| {
             ui.label("Method:");
             let prev = state.solver_method;
+            // Same availability rule as the Analyze panel: KL is a raw-count
+            // likelihood, and without both count arms a KL request would land
+            // on the rejected transmission+Poisson route.
+            let counts_available = crate::guided::analyze::display_as_counts(state);
             egui::ComboBox::from_id_salt("studio_solver_method")
                 .selected_text(match state.solver_method {
                     SolverMethod::LevenbergMarquardt => "LM",
@@ -1261,11 +1265,13 @@ fn solver_card(ui: &mut egui::Ui, state: &mut AppState) {
                         SolverMethod::LevenbergMarquardt,
                         "Levenberg-Marquardt",
                     );
-                    ui.selectable_value(
-                        &mut state.solver_method,
-                        SolverMethod::PoissonKL,
-                        "Poisson KL",
-                    );
+                    ui.add_enabled_ui(counts_available, |ui| {
+                        ui.selectable_value(
+                            &mut state.solver_method,
+                            SolverMethod::PoissonKL,
+                            "Poisson KL (raw counts)",
+                        );
+                    });
                 });
             if state.solver_method != prev {
                 state.mark_dirty(GuidedStep::Analyze);

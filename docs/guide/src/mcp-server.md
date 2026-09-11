@@ -152,9 +152,10 @@ For synthetic demo data, resolution can be disabled:
 For real instrument data, use Gaussian resolution parameters or a tabulated
 resolution file. Synthetic data often does not need an instrument resolution
 file; real experiments normally do.
-The exception is counts-domain fitting: count inputs fitted in the counts domain (all `density_map`/`spatial_map` count or NeXus cubes, and `single_spectrum` counts with `fit.fit_domain: "counts"` or a counts-domain solver) reject an active resolution —
-the physical detector model needs separate open/sample response arms, which the current fitter does not have.
-Use a transmission input (or the `single_spectrum` transmission fit domain) when resolution is required, or disable resolution for counts-domain fits.
+The exception is count inputs: raw counts always fit in the counts domain (the legacy counts-to-transmission conversion was removed), and a count input with an active resolution is rejected through MCP —
+the exact separate-arm count fit needs incident fluence weights and measured detector-time bin edges, which the manifest schema does not carry.
+Use the direct Python `fit_counts_spectrum_typed` exact-count arguments when resolution is required, supply pre-normalized transmission, or disable resolution for count inputs.
+Cross-domain solver requests are also rejected on both validate and run: counts with `solver: "lm"`, and transmission with a Poisson/KL solver name.
 
 ## Supported Workflow Inputs
 
@@ -211,7 +212,7 @@ Example NeXus density-map manifest:
       {"isotope": "U-238", "initial_density": 0.001}
     ],
     "fit": {
-      "solver": "lm",
+      "solver": "kl",
       "max_iter": 100
     },
     "resolution": {"kind": "none"}

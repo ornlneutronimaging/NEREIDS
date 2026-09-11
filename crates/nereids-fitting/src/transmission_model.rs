@@ -2809,6 +2809,26 @@ pub fn baseline_reference_energy_active(energies: &[f64], active: Option<&[bool]
 /// model, or [`NormalizedTransmissionModel`] when the SAMMY additive
 /// background is also configured (the baseline is the OUTERMOST factor).
 ///
+/// ## Placement differs on the exact resolved-count route
+///
+/// "Outermost" describes the TRANSMISSION routes, where the model lives in
+/// the measured bins and `B(E)` corrects the measured sample/open-beam
+/// ratio: `y(E) = B(E)·[Anorm·T + additive background]`.
+///
+/// The exact separate-arm count route has two distinct axes (true-energy
+/// quadrature vs detector-time bins), so it places `B` on the TRUE-ENERGY
+/// sample arm, BEFORE the detector response, and applies the Anorm/ABC
+/// wrapper afterwards on the measured bins:
+/// `Anorm·R[Φ·B·T]/R[Φ] + background`. That ordering is deliberate — a
+/// sample-side multiplicative correction is a property of the sample arm,
+/// and applying it after the ratio would make it a detector-space term
+/// instead — but it means `B` is NOT the outermost factor there, and a
+/// fitted `baseline` / `baseline_e_ref_ev` is **not directly comparable**
+/// across the two routes: on the transmission routes `E` is the measured
+/// bin energy, on the exact count route it is the true quadrature energy.
+/// Note `b0` remains degenerate with `Anorm` on both (the response is
+/// linear), which is why the free-`Anorm` rejection applies to both.
+///
 /// ## INTENTIONAL DEPARTURE from SAMMY
 ///
 /// SAMMY's modern data-reduction path applies a SCALAR normalization plus

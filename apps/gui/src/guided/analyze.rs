@@ -187,6 +187,7 @@ fn fit_controls(ui: &mut egui::Ui, state: &mut AppState, available_height_hint: 
         SolverMethod::LevenbergMarquardt => "Levenberg-Marquardt",
         SolverMethod::PoissonKL => "Poisson KL",
     };
+    let counts_available = display_as_counts(state);
     let draw_method = |ui: &mut egui::Ui, state: &mut AppState| {
         ui.label("Method:");
         egui::ComboBox::from_id_salt("solver_method")
@@ -197,12 +198,17 @@ fn fit_controls(ui: &mut egui::Ui, state: &mut AppState, available_height_hint: 
                     SolverMethod::LevenbergMarquardt,
                     "Levenberg-Marquardt",
                 );
-                ui.selectable_value(
-                    &mut state.solver_method,
-                    SolverMethod::PoissonKL,
-                    "Poisson KL",
-                );
+                ui.add_enabled_ui(counts_available, |ui| {
+                    ui.selectable_value(
+                        &mut state.solver_method,
+                        SolverMethod::PoissonKL,
+                        "Poisson KL (raw counts)",
+                    );
+                });
             });
+        if !counts_available {
+            ui.weak("Poisson KL needs separate sample and open-beam counts");
+        }
     };
     let draw_max_iter = |ui: &mut egui::Ui, state: &mut AppState| {
         ui.label("Max iter:");
@@ -1106,12 +1112,13 @@ fn clear_analyze_downstream(state: &mut AppState) {
 /// Whether the Analyze panels should display raw sample counts +
 /// open-beam reference rather than the normalised transmission ratio.
 ///
-/// The rule is **input-data-driven**, not solver-driven: KL works with
-/// either domain.  Counts mode requires both sample + OB to be loaded
-/// (so the c·OB reference line and counts-scale fit overlay are
-/// computable), and the input mode must not be `TransmissionTiff` (a
-/// pre-normalised transmission stack — its raw input *is* a ratio).
-fn display_as_counts(state: &AppState) -> bool {
+/// Counts mode requires both sample + OB to be loaded (so the c·OB reference
+/// line and counts-scale fit overlay are computable), and the input mode must
+/// not be `TransmissionTiff` (a pre-normalized transmission stack — its raw
+/// input is already a ratio). This is also the availability rule for the
+/// Poisson KL solver: without both count arms a KL request would land on the
+/// rejected transmission+Poisson route.
+pub(crate) fn display_as_counts(state: &AppState) -> bool {
     state.sample_data.is_some()
         && state.open_beam_data.is_some()
         && !matches!(state.input_mode, InputMode::TransmissionTiff)
@@ -2093,6 +2100,30 @@ fn fit_energy_range_indices(
 }
 
 fn build_fit_config(state: &AppState) -> Result<(UnifiedFitConfig, Range<usize>), String> {
+    // Poisson KL is a raw-count likelihood. Without both count arms the fit
+    // call would fall back to normalized transmission and land on the
+    // pipeline's rejected transmission+Poisson route — surface the actionable
+    // cause here instead.
+    if matches!(state.solver_method, SolverMethod::PoissonKL) && !display_as_counts(state) {
+        return Err(
+            "Poisson KL requires separate sample and open-beam count cubes; \
+             normalized transmission can only use Levenberg-Marquardt"
+                .to_string(),
+        );
+    }
+    // The exact separate-arm inputs (incident fluence weights, detector-time
+    // bin edges) are not a GUI-configurable surface, so surface the two
+    // remedies the GUI can actually express instead of the pipeline's
+    // exact_count_response message.
+    if matches!(state.solver_method, SolverMethod::PoissonKL) && state.resolution_enabled {
+        return Err(
+            "Count fits with instrument resolution need the exact separate-arm \
+             model, which the GUI does not configure yet: disable instrument \
+             resolution for count fits, or fit normalized transmission with \
+             Levenberg-Marquardt"
+                .to_string(),
+        );
+    }
     let full_energies = state
         .energies
         .as_ref()
@@ -2446,8 +2477,8 @@ fn fit_pixel(state: &mut AppState) {
         }
     }
 
-    // Use counts-domain input only when the solver is Poisson KL AND both
-    // sample and open beam are available. LM always uses Transmission.
+    // The config builder already proved both count arms are present for KL.
+    // LM deliberately uses the separately normalized transmission path.
     let use_counts = matches!(state.solver_method, SolverMethod::PoissonKL);
     let input = if use_counts
         && let (Some(sample), Some(open_beam)) = (&state.sample_data, &state.open_beam_data)
@@ -2626,8 +2657,8 @@ fn fit_roi(state: &mut AppState) {
         }
     }
 
-    // Use counts-domain only when the solver is Poisson KL AND both
-    // sample and open beam are available. LM always uses Transmission.
+    // The config builder already proved both count arms are present for KL.
+    // LM deliberately uses the separately normalized transmission path.
     let use_counts = matches!(state.solver_method, SolverMethod::PoissonKL);
     let roi_input = if use_counts
         && let (Some(sample), Some(open_beam)) = (&state.sample_data, &state.open_beam_data)
@@ -2844,8 +2875,8 @@ pub fn run_spatial_map(state: &mut AppState) {
 
         // Run spatial_map_typed on the dedicated pool so its par_iter doesn't
         // share the global pool with inner physics par_iter calls.
-        // Use counts-domain only when the solver is Poisson KL AND both
-        // sample and open beam are available. LM always uses Transmission.
+        // The config builder already proved both count arms are present for
+        // KL. LM deliberately uses normalized transmission.
         //
         // SAMMY EMIN/EMAX-equivalent fit-energy-range restriction (#514):
         // when `state.fit_energy_range` is set, `build_fit_config` slices
@@ -2903,7 +2934,6 @@ mod tests {
     use nereids_endf::resonance::test_support::synthetic_single_resonance;
     use nereids_io::normalization::NormalizedData;
     use nereids_pipeline::spatial::SpatialResult;
-    use std::time::Duration;
 
     fn stale_spectrum_result() -> SpectrumFitResult {
         SpectrumFitResult {
@@ -2996,6 +3026,20 @@ mod tests {
     }
 
     #[test]
+    fn transmission_only_input_rejects_poisson_solver_before_fit() {
+        let mut state = rejected_counts_resolution_state();
+        state.input_mode = InputMode::TransmissionTiff;
+        state.sample_data = None;
+        state.open_beam_data = None;
+        state.resolution_enabled = false;
+
+        let error = build_fit_config(&state)
+            .expect_err("transmission-only data must not enter a count likelihood");
+
+        assert!(error.contains("requires separate sample and open-beam count cubes"));
+    }
+
+    #[test]
     fn solver_method_change_clears_fit_outputs_but_preserves_inputs() {
         let mut state = rejected_counts_resolution_state();
         state.pixel_fit_result = Some(stale_spectrum_result());
@@ -3062,7 +3106,7 @@ mod tests {
             pixel_state
                 .last_fit_feedback
                 .as_ref()
-                .is_some_and(|f| f.summary.contains("separate open/sample response arms"))
+                .is_some_and(|f| f.summary.contains("separate-arm model"))
         );
 
         let mut roi_state = rejected_counts_resolution_state();
@@ -3073,7 +3117,7 @@ mod tests {
             roi_state
                 .last_fit_feedback
                 .as_ref()
-                .is_some_and(|f| f.summary.contains("separate open/sample response arms"))
+                .is_some_and(|f| f.summary.contains("separate-arm model"))
         );
     }
 
@@ -3087,15 +3131,17 @@ mod tests {
 
         assert!(state.spatial_result.is_none());
         assert!(state.export_status.is_none());
-        let rx = state
-            .pending_spatial
-            .take()
-            .expect("rejected spatial run should still report its worker error");
-        let err = rx
-            .recv_timeout(Duration::from_secs(2))
-            .expect("spatial worker should reject counts plus resolution")
-            .expect_err("counts plus resolution must fail closed");
-        assert!(err.contains("separate open/sample response arms"), "{err}");
+        // The GUI-level guard now rejects counts + resolution BEFORE any
+        // worker is spawned, with a remedy the GUI can actually express.
+        assert!(
+            state.pending_spatial.is_none(),
+            "rejected spatial run must not spawn a worker"
+        );
+        assert!(
+            state.status_message.contains("separate-arm model"),
+            "{}",
+            state.status_message
+        );
         assert!(state.normalized.is_some());
         assert_eq!(state.selected_pixel, Some((0, 0)));
         assert_eq!(state.rois.len(), 1);

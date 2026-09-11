@@ -552,7 +552,7 @@ class TestManifestWorkflowTools:
                     "open_beam_path": open_beam_path.name,
                 },
                 "isotopes": [_synthetic_u238_entry(initial_density=0.001)],
-                "fit": {"solver": "lm", "max_iter": 5},
+                "fit": {"solver": "kl", "max_iter": 5},
                 "resolution": {"kind": "none"},
                 "output": {"directory": "output"},
             },
@@ -577,7 +577,7 @@ class TestManifestWorkflowTools:
                 "mode": "single_spectrum",
                 "data": {"kind": "counts_npz", "path": "counts.npz"},
                 "isotopes": [_synthetic_u238_entry()],
-                "fit": {"solver": "lm", "max_iter": 5},
+                "fit": {"solver": "kl", "max_iter": 5},
                 "resolution": {"kind": "none"},
             },
         )
@@ -599,7 +599,7 @@ class TestManifestWorkflowTools:
                 "mode": "single_spectrum",
                 "data": {"kind": "counts_npz", "path": "counts.npz"},
                 "isotopes": [_synthetic_u238_entry()],
-                "fit": {"solver": "lm", "max_iter": 5},
+                "fit": {"solver": "kl", "max_iter": 5},
                 "resolution": {"kind": "none"},
             },
         )
@@ -645,7 +645,7 @@ class TestManifestWorkflowTools:
                 "mode": "density_map",
                 "data": {"kind": "counts_npz", "path": "density-map.npz"},
                 "isotopes": [_synthetic_u238_entry()],
-                "fit": {"solver": "lm", "max_iter": 5},
+                "fit": {"solver": "kl", "max_iter": 5},
                 "resolution": {"kind": "none"},
             },
         )
@@ -735,7 +735,7 @@ class TestManifestWorkflowTools:
                     "open_beam_path": open_beam_path.name,
                 },
                 "isotopes": [_synthetic_u238_entry()],
-                "fit": {"solver": "lm", "max_iter": 5},
+                "fit": {"solver": "kl", "max_iter": 5},
                 "resolution": {"kind": "none"},
             },
         )
@@ -812,8 +812,8 @@ class TestManifestWorkflowTools:
         assert dry_run["success"] is False
         assert dry_run["validation"]["errors"] == validation["errors"]
         message = "\n".join(validation["errors"])
-        assert "counts input with instrument resolution is unsupported" in message
-        assert "separate open/sample response arms R[Phi] and R[Phi*T]" in message
+        assert "counts input with instrument resolution is not available" in message
+        assert "separate-arm model R[Phi] and R[Phi*T]" in message
 
     def test_validation_allows_transmission_with_active_resolution(self, tmp_path):
         np.savez(
@@ -843,23 +843,23 @@ class TestManifestWorkflowTools:
         assert validation["valid"] is True
         assert not any("counts input" in error for error in validation["errors"])
 
-    def test_validation_allows_counts_with_resolution_on_transmission_route(
-        self, tmp_path
-    ):
-        # The run path fits counts_npz + solver=lm in the TRANSMISSION domain
-        # (Python converts counts to a pre-normalized spectrum), which
-        # legitimately accepts resolution — validation must mirror that
-        # routing, not the raw data kind.  Same for an explicit
-        # fit_domain=transmission under a counts-domain solver.
+    def test_validation_rejects_counts_transmission_route_requests(self, tmp_path):
+        # The legacy counts->transmission conversion was deleted with the
+        # exact-count route (Wave-1 PR-2b): a counts manifest asking for the
+        # transmission domain (explicitly, or implicitly via solver=lm) must
+        # be rejected by validation exactly as the run path rejects it.
         np.savez(
             tmp_path / "counts.npz",
             energies_ev=np.linspace(1.0, 30.0, 20),
             sample_counts=np.full(20, 900.0),
             open_beam_counts=np.full(20, 1000.0),
         )
-        for fit in (
-            {"solver": "lm", "max_iter": 5},
-            {"solver": "kl", "fit_domain": "transmission", "max_iter": 5},
+        for fit, expected in (
+            ({"solver": "lm", "max_iter": 5}, "cannot use solver='lm'"),
+            (
+                {"solver": "kl", "fit_domain": "transmission", "max_iter": 5},
+                "cannot be fit in the transmission domain",
+            ),
         ):
             _write_json_frontmatter_manifest(
                 tmp_path,
@@ -868,40 +868,285 @@ class TestManifestWorkflowTools:
                     "data": {"kind": "counts_npz", "path": "counts.npz"},
                     "isotopes": [_synthetic_u238_entry()],
                     "fit": fit,
-                    "resolution": {
-                        "kind": "gaussian",
-                        "flight_path_m": 25.0,
-                        "delta_t_us": 1.0,
-                        "delta_l_m": 0.01,
-                    },
+                    "resolution": {"kind": "none"},
                 },
             )
 
             validation = validate_resonance_dataset(str(tmp_path))
+            run = process_resonance_dataset(str(tmp_path))
 
-            assert validation["valid"] is True, (fit, validation["errors"])
-            assert not any("counts input" in error for error in validation["errors"])
+            assert validation["valid"] is False, (fit, validation["errors"])
+            message = "\n".join(validation["errors"])
+            assert expected in message, (fit, validation["errors"])
+            # Validate and run must agree branch by branch: the run stops at
+            # its validation stage with the same errors.
+            assert run["success"] is False, fit
+            assert expected in "\n".join(run["validation"]["errors"]), (fit, run)
 
-    def test_process_runs_counts_manifest_with_resolution_on_transmission_route(
-        self, tmp_path
+    @pytest.mark.parametrize("solver", ["typo", "poisson_kl", "KL "])
+    def test_unsupported_solver_rejected_by_validate_and_run(
+        self, tmp_path, monkeypatch, solver
     ):
+        """Validate/run parity for solver NAMES, not just domain combinations.
+
+        The domain rules describe combinations of real solvers, so a name the
+        binding does not accept (a typo, or `poisson_kl`, which was never a
+        supported alias) previously passed a dry run and failed later in
+        `parse_solver_config` — exactly the validate/run divergence this layer
+        exists to prevent.
+        """
+        np.savez(
+            tmp_path / "counts.npz",
+            energies_ev=np.linspace(1.0, 30.0, 20),
+            sample_counts=np.full(20, 900.0),
+            open_beam_counts=np.full(20, 1000.0),
+        )
+        fitter_called = False
+
+        def forbidden_count_fit(**_kwargs):
+            nonlocal fitter_called
+            fitter_called = True
+            raise AssertionError("an unsupported solver reached the fitter")
+
+        monkeypatch.setattr(nereids, "fit_counts_spectrum_typed", forbidden_count_fit)
+        _write_json_frontmatter_manifest(
+            tmp_path,
+            {
+                "mode": "single_spectrum",
+                "data": {"kind": "counts_npz", "path": "counts.npz"},
+                "isotopes": [_synthetic_u238_entry()],
+                "fit": {"solver": solver, "max_iter": 5},
+                "resolution": {"kind": "none"},
+            },
+        )
+
+        validation = validate_resonance_dataset(str(tmp_path))
+        run = process_resonance_dataset(str(tmp_path))
+
+        assert validation["valid"] is False, validation["errors"]
+        assert any("unsupported solver" in e for e in validation["errors"])
+        assert run["success"] is False
+        assert any(
+            "unsupported solver" in e for e in run["validation"]["errors"]
+        ), run
+        assert fitter_called is False
+
+    def test_solver_case_is_normalized_through_to_the_binding(
+        self, tmp_path, monkeypatch
+    ):
+        """The manifest layer is case-insensitive, so the binding must receive
+        the SAME normalized name the routing checks used — passing the raw
+        string through made `solver: "KL"` validate and then fail dispatch."""
+        np.savez(
+            tmp_path / "counts.npz",
+            energies_ev=np.linspace(1.0, 30.0, 20),
+            sample_counts=np.full(20, 900.0),
+            open_beam_counts=np.full(20, 1000.0),
+        )
+        seen = {}
+
+        def capture_fit(**kwargs):
+            seen.update(kwargs)
+            return SimpleNamespace(
+                densities=[0.001],
+                uncertainties=[0.0001],
+                converged=True,
+                chi_squared=1.0,
+                reduced_chi_squared=1.0,
+                iterations=3,
+                temperature_k=None,
+                temperature_k_unc=None,
+                deviance_per_dof=1.0,
+                anorm=1.0,
+                background=[0.0, 0.0, 0.0],
+                back_d=None,
+                back_f=None,
+                t0_us=None,
+                l_scale=None,
+                baseline=None,
+                baseline_e_ref_ev=None,
+            )
+
+        monkeypatch.setattr(nereids, "fit_counts_spectrum_typed", capture_fit)
+        _write_json_frontmatter_manifest(
+            tmp_path,
+            {
+                "mode": "single_spectrum",
+                "data": {"kind": "counts_npz", "path": "counts.npz"},
+                "isotopes": [_synthetic_u238_entry()],
+                "fit": {"solver": "KL", "max_iter": 5},
+                "resolution": {"kind": "none"},
+                "output": {"directory": "output"},
+            },
+        )
+
+        validation = validate_resonance_dataset(str(tmp_path))
+        result = process_resonance_dataset(str(tmp_path))
+
+        assert validation["valid"] is True, validation["errors"]
+        assert result["success"] is True, result.get("validation", result)
+        assert seen["solver"] == "kl", seen.get("solver")
+
+    @pytest.mark.parametrize(
+        "solver", ["auto", "lm", "kl", "poisson", "joint_poisson", "typo", "poisson_kl"]
+    )
+    @pytest.mark.parametrize("kind", ["counts_npz", "transmission_npz"])
+    def test_validate_and_run_agree_for_every_solver_and_domain(
+        self, tmp_path, monkeypatch, kind, solver
+    ):
+        """Exhaustive validate/run parity over the solver x domain matrix.
+
+        Copilot found one cell where a dry run approved a manifest the run
+        path then refused (an unsupported solver name). Rather than pin that
+        single cell, enumerate the whole matrix: for EVERY combination the
+        validator's verdict must match what execution actually does. The
+        fitters are stubbed, so this tests routing, not numerics.
+        """
+        counts = kind == "counts_npz"
+        if counts:
+            np.savez(
+                tmp_path / "data.npz",
+                energies_ev=np.linspace(1.0, 30.0, 20),
+                sample_counts=np.full(20, 900.0),
+                open_beam_counts=np.full(20, 1000.0),
+            )
+        else:
+            np.savez(
+                tmp_path / "data.npz",
+                energies_ev=np.linspace(1.0, 30.0, 20),
+                transmission=np.full(20, 0.9),
+                uncertainty=np.full(20, 0.01),
+            )
+
+        def stub_fit(**_kwargs):
+            return SimpleNamespace(
+                densities=[0.001],
+                uncertainties=[0.0001],
+                converged=True,
+                chi_squared=1.0,
+                reduced_chi_squared=1.0,
+                iterations=3,
+                temperature_k=None,
+                temperature_k_unc=None,
+                deviance_per_dof=1.0,
+                anorm=1.0,
+                background=[0.0, 0.0, 0.0],
+                back_d=None,
+                back_f=None,
+                t0_us=None,
+                l_scale=None,
+                baseline=None,
+                baseline_e_ref_ev=None,
+            )
+
+        monkeypatch.setattr(nereids, "fit_counts_spectrum_typed", stub_fit)
+        monkeypatch.setattr(nereids, "fit_spectrum_typed", stub_fit)
+        _write_json_frontmatter_manifest(
+            tmp_path,
+            {
+                "mode": "single_spectrum",
+                "data": {"kind": kind, "path": "data.npz"},
+                "isotopes": [_synthetic_u238_entry()],
+                "fit": {"solver": solver, "max_iter": 5},
+                "resolution": {"kind": "none"},
+                "output": {"directory": "output"},
+            },
+        )
+
+        validation = validate_resonance_dataset(str(tmp_path))
+        run = process_resonance_dataset(str(tmp_path))
+
+        assert validation["valid"] == run["success"], (
+            f"validate/run disagree for kind={kind} solver={solver}: "
+            f"validate={validation['valid']} run={run['success']} "
+            f"errors={validation['errors']}"
+        )
+
+    def test_count_spectrum_rejects_lm_before_fit(self, tmp_path, monkeypatch):
+        np.savez(
+            tmp_path / "counts.npz",
+            energies_ev=np.linspace(1.0, 30.0, 20),
+            sample_counts=np.full(20, 900.0),
+            open_beam_counts=np.full(20, 1000.0),
+        )
+        fitter_called = False
+
+        def forbidden_count_fit(**_kwargs):
+            nonlocal fitter_called
+            fitter_called = True
+            raise AssertionError("invalid counts + LM route reached the fitter")
+
+        monkeypatch.setattr(nereids, "fit_counts_spectrum_typed", forbidden_count_fit)
+        _write_json_frontmatter_manifest(
+            tmp_path,
+            {
+                "mode": "single_spectrum",
+                "data": {"kind": "counts_npz", "path": "counts.npz"},
+                "isotopes": [_synthetic_u238_entry()],
+                "fit": {"solver": "lm", "max_iter": 5},
+                "resolution": {"kind": "none"},
+            },
+        )
+
+        result = process_resonance_dataset(str(tmp_path))
+
+        assert result["success"] is False
+        assert "raw count input cannot use solver='lm'" in "\n".join(
+            result["validation"]["errors"]
+        )
+        assert fitter_called is False
+
+    def test_transmission_spectrum_rejects_joint_poisson_before_fit(
+        self, tmp_path, monkeypatch
+    ):
+        np.savez(
+            tmp_path / "spectrum.npz",
+            energies_ev=np.linspace(1.0, 30.0, 20),
+            transmission=np.ones(20),
+            uncertainty=np.full(20, 0.01),
+        )
+        fitter_called = False
+
+        def forbidden_transmission_fit(**_kwargs):
+            nonlocal fitter_called
+            fitter_called = True
+            raise AssertionError(
+                "invalid transmission + joint Poisson route reached the fitter"
+            )
+
+        monkeypatch.setattr(nereids, "fit_spectrum_typed", forbidden_transmission_fit)
+        _write_json_frontmatter_manifest(
+            tmp_path,
+            {
+                "mode": "single_spectrum",
+                "data": {"kind": "transmission_npz", "path": "spectrum.npz"},
+                "isotopes": [_synthetic_u238_entry()],
+                "fit": {"solver": "joint_poisson", "max_iter": 5},
+                "resolution": {"kind": "none"},
+            },
+        )
+
+        result = process_resonance_dataset(str(tmp_path))
+
+        assert result["success"] is False
+        assert (
+            "normalized transmission input cannot use a Poisson/KL count likelihood"
+            in "\n".join(result["validation"]["errors"])
+        )
+        assert fitter_called is False
+
+    def test_process_runs_counts_manifest_in_counts_domain(self, tmp_path):
         # End-to-end anchor for the validate-allows/run-succeeds pair: the
         # dry-run consistency assertions elsewhere compare two invocations of
         # the same validator, so only a real run can prove the hand-copied
-        # routing mirror agrees with what execution actually does.
+        # routing mirror agrees with what execution actually does.  The
+        # counts domain (resolution-free) is the one supported counts route
+        # through the manifest schema.
         energies = np.linspace(1.0, 30.0, 160)
         true_density = 0.002
         isotope = _synthetic_u238_data()
-        # Generate with the SAME gaussian resolution the manifest fits with,
-        # so the recovered density is unbiased.
         transmission = np.asarray(
-            nereids.forward_model(
-                energies,
-                [(isotope, true_density)],
-                flight_path_m=25.0,
-                delta_t_us=1.0,
-                delta_l_m=0.01,
-            )
+            nereids.forward_model(energies, [(isotope, true_density)])
         )
         open_beam = np.full_like(transmission, 100000.0)
         sample = transmission * open_beam
@@ -917,19 +1162,16 @@ class TestManifestWorkflowTools:
                 "mode": "single_spectrum",
                 "data": {"kind": "counts_npz", "path": "counts.npz"},
                 "isotopes": [_synthetic_u238_entry(initial_density=0.001)],
-                "fit": {"solver": "lm", "max_iter": 50},
-                "resolution": {
-                    "kind": "gaussian",
-                    "flight_path_m": 25.0,
-                    "delta_t_us": 1.0,
-                    "delta_l_m": 0.01,
-                },
+                "fit": {"solver": "kl", "max_iter": 200},
+                "resolution": {"kind": "none"},
                 "output": {"directory": "output"},
             },
         )
 
+        validation = validate_resonance_dataset(str(tmp_path))
         result = process_resonance_dataset(str(tmp_path))
 
+        assert validation["valid"] is True, validation["errors"]
         assert result["success"] is True, result.get("validation", result)
         fit = result["results"]["density_fits"][0]
         assert fit["isotope"] == "U-238"
@@ -967,9 +1209,54 @@ class TestManifestWorkflowTools:
 
         assert validation["valid"] is False
         assert any(
-            "counts input with instrument resolution is unsupported" in error
+            "counts input with instrument resolution is not available" in error
             for error in validation["errors"]
         )
+
+    def test_density_map_counts_rejects_lm_before_spatial_fit(
+        self, tmp_path, monkeypatch
+    ):
+        # A counts-cube manifest with solver='lm' used to reach counts+LM at
+        # spatial_map_typed; both run and validate now reject it before any
+        # fitter is invoked.
+        np.savez(
+            tmp_path / "cube.npz",
+            energies_ev=np.linspace(1.0, 30.0, 5),
+            sample_counts=np.ones((5, 2, 2)),
+            open_beam_counts=np.ones((5, 2, 2)),
+        )
+        fitter_called = False
+
+        def forbidden_spatial_fit(*_args, **_kwargs):
+            nonlocal fitter_called
+            fitter_called = True
+            raise AssertionError("invalid counts + LM route reached spatial_map_typed")
+
+        monkeypatch.setattr(nereids, "spatial_map_typed", forbidden_spatial_fit)
+        _write_json_frontmatter_manifest(
+            tmp_path,
+            {
+                "mode": "density_map",
+                "data": {"kind": "counts_npz", "path": "cube.npz"},
+                "isotopes": [_synthetic_u238_entry()],
+                "fit": {"solver": "lm", "max_iter": 5},
+                "resolution": {"kind": "none"},
+            },
+        )
+
+        validation = validate_resonance_dataset(str(tmp_path))
+        result = process_resonance_dataset(str(tmp_path))
+
+        assert validation["valid"] is False
+        assert any(
+            "raw count maps cannot use solver='lm'" in error
+            for error in validation["errors"]
+        )
+        assert result["success"] is False
+        assert "raw count maps cannot use solver='lm'" in "\n".join(
+            result["validation"]["errors"]
+        )
+        assert fitter_called is False
 
     def test_validation_mirrors_resolution_kwargs_contract(self, tmp_path):
         # _resolution_kwargs rejects unknown kinds and KeyErrors on gaussian

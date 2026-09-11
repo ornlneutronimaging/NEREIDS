@@ -30,7 +30,11 @@
 
 use std::fmt;
 
+use rayon::prelude::*;
+
 use crate::resolution::{ResolutionFunction, ResolutionParseError};
+
+type CompactResponseRow = (Vec<u32>, Vec<f64>, f64);
 
 /// Expected detector-bin counts for the open-beam and sample measurements.
 #[derive(Debug, Clone, PartialEq)]
@@ -49,6 +53,260 @@ pub struct TwoArmCounts {
     /// Expected sample counts falling outside the supplied acquisition
     /// window: `sum_j F_j T_j (1 - sum_i R_i(E_j))`.
     pub sample_window_loss: f64,
+}
+
+/// Detector-bin probabilities for a fixed instrument response.
+///
+/// Rows correspond to `true_energies_ev`; columns correspond to consecutive
+/// intervals in `detector_time_edges_us`. Building the matrix evaluates the
+/// analytical IC/tabulated bin integrals once. Reusing it during optimization
+/// changes only the true-energy sample transmission, not the detector physics.
+///
+/// Only entries whose evaluated probability is strictly greater than zero are
+/// stored. This is lossless: there is no numerical cutoff, and every nonzero
+/// value returned by the response model is retained. Probability outside the
+/// acquisition window is likewise never renormalized into the stored rows —
+/// each row's out-of-window fraction is kept alongside it so [`Self::apply`]
+/// can report the quantified window loss exactly as
+/// [`two_arm_count_response`] does (pipeline-map R5·7).
+#[derive(Debug, Clone, PartialEq)]
+pub struct DetectorBinResponseMatrix {
+    row_offsets: Vec<usize>,
+    detector_bins: Vec<u32>,
+    probabilities: Vec<f64>,
+    /// Per-row out-of-window probability `(1 - sum_i R_i(E_j)).max(0)`.
+    lost_fractions: Vec<f64>,
+    n_true_energies: usize,
+    n_detector_bins: usize,
+}
+
+impl DetectorBinResponseMatrix {
+    /// Build a fixed detector-bin response matrix.
+    pub fn new(
+        true_energies_ev: &[f64],
+        detector_time_edges_us: &[f64],
+        timing_offset_us: f64,
+        response: &ResolutionFunction,
+    ) -> Result<Self, CountsResponseError> {
+        if true_energies_ev.is_empty() {
+            return Err(CountsResponseError::EmptyTrueEnergyGrid);
+        }
+        for (index, &energy) in true_energies_ev.iter().enumerate() {
+            if !energy.is_finite() || energy <= 0.0 {
+                return Err(CountsResponseError::InvalidTrueEnergy {
+                    index,
+                    value: energy,
+                });
+            }
+        }
+
+        let n_detector_bins = detector_time_edges_us.len().saturating_sub(1);
+        if n_detector_bins > u32::MAX as usize {
+            return Err(CountsResponseError::Resolution(
+                ResolutionParseError::InvalidFormat(format!(
+                    "detector response has {n_detector_bins} bins, exceeding the u32 storage limit"
+                )),
+            ));
+        }
+        // Each true-energy response is independent. Rayon preserves the input
+        // order of this indexed parallel collect, so rows and all subsequent
+        // accumulation orders remain deterministic.
+        let row_results: Vec<Result<CompactResponseRow, ResolutionParseError>> = true_energies_ev
+            .par_iter()
+            .map(|&energy| {
+                let row = response.detector_bin_probabilities(
+                    energy,
+                    detector_time_edges_us,
+                    timing_offset_us,
+                )?;
+                debug_assert_eq!(row.len(), n_detector_bins);
+                let mut bins = Vec::new();
+                let mut values = Vec::new();
+                let mut in_window = 0.0_f64;
+                for (detector_bin, probability) in row.into_iter().enumerate() {
+                    if !probability.is_finite() || probability < 0.0 {
+                        return Err(ResolutionParseError::InvalidFormat(format!(
+                            "detector response probability at E = {energy} eV, bin {detector_bin} must be finite and >= 0, got {probability}"
+                        )));
+                    }
+                    in_window += probability;
+                    if probability > 0.0 {
+                        bins.push(detector_bin as u32);
+                        values.push(probability);
+                    }
+                }
+                Ok::<_, ResolutionParseError>((bins, values, (1.0 - in_window).max(0.0)))
+            })
+            .collect();
+        // Resolve errors after the ordered collect so the first failing input
+        // row is reported deterministically regardless of thread scheduling.
+        let rows: Vec<CompactResponseRow> = row_results.into_iter().collect::<Result<_, _>>()?;
+        let nonzero_count = rows.iter().try_fold(0_usize, |total, (_, values, _)| {
+            total.checked_add(values.len()).ok_or_else(|| {
+                CountsResponseError::Resolution(ResolutionParseError::InvalidFormat(
+                    "detector response nonzero count overflows usize".into(),
+                ))
+            })
+        })?;
+
+        let mut row_offsets = Vec::with_capacity(true_energies_ev.len() + 1);
+        let mut detector_bins = Vec::with_capacity(nonzero_count);
+        let mut probabilities = Vec::with_capacity(nonzero_count);
+        let mut lost_fractions = Vec::with_capacity(true_energies_ev.len());
+        row_offsets.push(0);
+        for (mut bins, mut values, lost) in rows {
+            detector_bins.append(&mut bins);
+            probabilities.append(&mut values);
+            row_offsets.push(probabilities.len());
+            lost_fractions.push(lost);
+        }
+
+        Ok(Self {
+            row_offsets,
+            detector_bins,
+            probabilities,
+            lost_fractions,
+            n_true_energies: true_energies_ev.len(),
+            n_detector_bins,
+        })
+    }
+
+    /// Number of true-energy quadrature points.
+    pub fn n_true_energies(&self) -> usize {
+        self.n_true_energies
+    }
+
+    /// Number of measured detector-time bins.
+    pub fn n_detector_bins(&self) -> usize {
+        self.n_detector_bins
+    }
+
+    /// Number of stored nonzero probabilities.
+    pub fn nnz(&self) -> usize {
+        self.probabilities.len()
+    }
+
+    /// Heap bytes used by the compact probability storage.
+    ///
+    /// This excludes the small fixed-size `Self` value, the per-row window-loss
+    /// fractions, and allocator overhead.
+    pub fn storage_bytes(&self) -> usize {
+        self.row_offsets.capacity() * std::mem::size_of::<usize>()
+            + self.detector_bins.capacity() * std::mem::size_of::<u32>()
+            + self.probabilities.capacity() * std::mem::size_of::<f64>()
+    }
+
+    /// Stored `(detector_bin, probability)` pairs for one true-energy row.
+    pub fn row_entries(&self, true_index: usize) -> impl Iterator<Item = (usize, f64)> + '_ {
+        assert!(
+            true_index < self.n_true_energies,
+            "true-energy row out of range"
+        );
+        let start = self.row_offsets[true_index];
+        let end = self.row_offsets[true_index + 1];
+        self.detector_bins[start..end]
+            .iter()
+            .map(|&bin| bin as usize)
+            .zip(self.probabilities[start..end].iter().copied())
+    }
+
+    /// Probability that true-energy row `true_index` lands in detector bin
+    /// `detector_bin`.
+    pub fn probability(&self, true_index: usize, detector_bin: usize) -> f64 {
+        assert!(
+            true_index < self.n_true_energies,
+            "true-energy row out of range"
+        );
+        assert!(
+            detector_bin < self.n_detector_bins,
+            "detector bin out of range"
+        );
+        let start = self.row_offsets[true_index];
+        let end = self.row_offsets[true_index + 1];
+        match self.detector_bins[start..end].binary_search(&(detector_bin as u32)) {
+            Ok(offset) => self.probabilities[start + offset],
+            Err(_) => 0.0,
+        }
+    }
+
+    /// Apply the fixed response separately to open and sample arms.
+    ///
+    /// Numerically equivalent to [`two_arm_count_response`] on the same
+    /// inputs, including the per-arm acquisition-window loss report.
+    pub fn apply(
+        &self,
+        incident_fluence_weights: &[f64],
+        transmission: &[f64],
+    ) -> Result<TwoArmCounts, CountsResponseError> {
+        if incident_fluence_weights.len() != self.n_true_energies
+            || transmission.len() != self.n_true_energies
+        {
+            return Err(CountsResponseError::LengthMismatch {
+                energies: self.n_true_energies,
+                incident_fluence: incident_fluence_weights.len(),
+                transmission: transmission.len(),
+            });
+        }
+        for (index, &fluence) in incident_fluence_weights.iter().enumerate() {
+            if !fluence.is_finite() || fluence < 0.0 {
+                return Err(CountsResponseError::InvalidIncidentFluence {
+                    index,
+                    value: fluence,
+                });
+            }
+        }
+        for (index, &value) in transmission.iter().enumerate() {
+            if !value.is_finite() || !(0.0..=1.0).contains(&value) {
+                return Err(CountsResponseError::InvalidTransmission { index, value });
+            }
+        }
+
+        let mut open_beam = vec![0.0; self.n_detector_bins];
+        let mut sample = vec![0.0; self.n_detector_bins];
+        let mut open_compensation = vec![0.0; self.n_detector_bins];
+        let mut sample_compensation = vec![0.0; self.n_detector_bins];
+        let mut open_window_loss = 0.0;
+        let mut open_window_loss_compensation = 0.0;
+        let mut sample_window_loss = 0.0;
+        let mut sample_window_loss_compensation = 0.0;
+        for true_index in 0..self.n_true_energies {
+            let fluence = incident_fluence_weights[true_index];
+            let sample_weight = fluence * transmission[true_index];
+            let lost = self.lost_fractions[true_index];
+            compensated_add(
+                &mut open_window_loss,
+                &mut open_window_loss_compensation,
+                fluence * lost,
+            );
+            compensated_add(
+                &mut sample_window_loss,
+                &mut sample_window_loss_compensation,
+                sample_weight * lost,
+            );
+            for (detector_bin, probability) in self.row_entries(true_index) {
+                compensated_add(
+                    &mut open_beam[detector_bin],
+                    &mut open_compensation[detector_bin],
+                    fluence * probability,
+                );
+                compensated_add(
+                    &mut sample[detector_bin],
+                    &mut sample_compensation[detector_bin],
+                    sample_weight * probability,
+                );
+            }
+        }
+        for detector_bin in 0..self.n_detector_bins {
+            open_beam[detector_bin] += open_compensation[detector_bin];
+            sample[detector_bin] += sample_compensation[detector_bin];
+        }
+        Ok(TwoArmCounts {
+            open_beam,
+            sample,
+            open_beam_window_loss: open_window_loss + open_window_loss_compensation,
+            sample_window_loss: sample_window_loss + sample_window_loss_compensation,
+        })
+    }
 }
 
 /// Invalid inputs or unsupported response models for [`two_arm_count_response`].
@@ -197,6 +455,22 @@ pub fn two_arm_count_response(
             timing_offset_us,
         )?;
         debug_assert_eq!(probabilities.len(), n_bins);
+
+        // Same validity contract as `DetectorBinResponseMatrix::new`, so the
+        // two paths cannot disagree on what a valid response is: without it
+        // a NaN probability would propagate into the arms AND be reported as
+        // zero window loss (`NaN.max(0.0) == 0.0`), i.e. a silent corruption
+        // where the matrix path raises.
+        for (detector_bin, &probability) in probabilities.iter().enumerate() {
+            if !probability.is_finite() || probability < 0.0 {
+                return Err(CountsResponseError::Resolution(
+                    ResolutionParseError::InvalidFormat(format!(
+                        "detector response probability at E = {energy} eV, bin \
+                         {detector_bin} must be finite and >= 0, got {probability}"
+                    )),
+                ));
+            }
+        }
 
         // The bin probabilities come from a normalized CDF, so the in-window
         // total is <= 1; the remainder is the quantified acquisition-window

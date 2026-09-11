@@ -10,16 +10,15 @@
 //! using a projected damped Gauss-Newton / Fisher optimizer with
 //! backtracking line search and finite-difference fallback.
 //!
-//! **Scope note.**  In the current pipeline this solver is only reached
-//! for the **transmission + PoissonKL** path (via
-//! `crate::transmission_model::TransmissionKLBackgroundModel`).  The
-//! **counts** path uses the joint-Poisson conditional-binomial-deviance
-//! solver in [`crate::joint_poisson`], which replaced the older
-//! fixed-flux counts NLL that lived here.  The helpers [`CountsModel`]
-//! and [`CountsBackgroundScaleModel`] exposed from this module are
-//! retained for the [`crate::lm`]-side `evaluate_jacobian_and_fisher`
-//! Fisher-information helper and for spatial-regularization research
-//! drivers; they are not part of the production fit path.
+//! **Scope note.** The production pipeline does not apply this single-arm
+//! objective to normalized transmission. Raw open/sample counts use the
+//! joint-Poisson conditional-binomial-deviance solver in
+//! [`crate::joint_poisson`]. This module remains available to the
+//! `evaluate_jacobian_and_fisher` Fisher-information helper (via
+//! [`CountsModel`], [`CountsBackgroundScaleModel`] and
+//! [`TransmissionKLBackgroundModel`], all three of which that helper still
+//! constructs) and to spatial-regularization research drivers; it is not a
+//! public transmission fitting route.
 //!
 //! ## TRINIDI Reference
 //! - `trinidi/reconstruct.py` — Poisson NLL and APGM optimizer
@@ -1101,13 +1100,9 @@ pub fn poisson_fit(
             if let Some(cov) = crate::lm::invert_matrix(&fisher) {
                 // Raw Cramér-Rao (inverse-Fisher) covariance-only bound. This
                 // fitter deliberately does NOT apply the optional χ²-scaling
-                // (`scale_by_chi2`, issue #638): the objective here is the
-                // Poisson NLL on transmission fractions (~0..1), so a Poisson
-                // deviance would be a pseudo-Poisson statistic, not a valid
-                // reduced-χ². The pipeline extraction layer
-                // (`pipeline::poisson_to_lm_result`) scales this σ by the
-                // Gaussian reduced-χ² the result reports — the same GOF the LM
-                // transmission path uses — when the caller opts in, keeping the
+                // (`scale_by_chi2`, issue #638): the objective here is a
+                // single-arm Poisson NLL, and any goodness-of-fit scaling
+                // belongs to the caller's extraction layer, keeping the
                 // formalism-agnostic scaling out of this count-statistics
                 // fitter.
                 let n_free = cov.nrows;
@@ -1599,11 +1594,10 @@ mod tests {
     /// `y_model ≥ POISSON_EPSILON`).
     ///
     /// Reference formula kept under `#[cfg(test)]` as an independently
-    /// hand-checked oracle (issue #638). The production σ-scaling on the
-    /// transmission Poisson-KL path scales by the Gaussian reduced-χ² the
-    /// result reports (see `nereids_pipeline::pipeline::poisson_to_lm_result`),
-    /// NOT this Poisson deviance, which on transmission fractions would be a
-    /// pseudo-Poisson statistic rather than a valid reduced-χ².
+    /// hand-checked oracle (issue #638). On transmission fractions this
+    /// Poisson deviance would be a pseudo-Poisson statistic rather than a
+    /// valid reduced-χ² — one reason the deleted transmission-Poisson route
+    /// never scaled σ by it.
     fn poisson_deviance(y_obs: &[f64], y_model: &[f64]) -> f64 {
         // Poisson deviance is undefined for negative observations (the term
         // `obs * ln(obs/m)` has no meaning); guard the impossible state.

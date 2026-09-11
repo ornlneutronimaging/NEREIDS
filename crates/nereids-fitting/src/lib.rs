@@ -21,6 +21,7 @@
 
 pub mod active_mask;
 pub mod error;
+pub mod exact_count_model;
 pub mod forward_model;
 pub mod joint_poisson;
 pub mod lm;
