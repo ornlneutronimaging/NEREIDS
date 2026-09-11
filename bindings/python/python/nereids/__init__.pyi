@@ -1909,8 +1909,7 @@ def fit_counts_spectrum_typed(
         c: Proton-charge ratio ``Q_s / Q_ob``.  Default
             1.0 assumes the caller has already PC-normalized the flux.
             For raw VENUS-style counts, set this to the actual ratio
-            (typically ~5–6).  Used by the counts-KL dispatch; ignored
-            by the LM path.
+            (typically ~5–6).  Used by the counts-KL dispatch.
         resolution: Exact detector-time response for resolved raw-count
             fitting: a ``TabulatedResolution`` or ``IkedaCarpenter``, supplied
             together with ``incident_fluence_weights`` and

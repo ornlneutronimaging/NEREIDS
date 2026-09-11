@@ -41,7 +41,30 @@ _COUNTS_RESOLUTION_UNSUPPORTED = (
     "Python fit_counts_spectrum_typed exact-count arguments, supply "
     "pre-normalized transmission, or disable instrument resolution."
 )
+# The solver names `parse_solver_config` (bindings/python/src/lib.rs) actually
+# accepts. Validation MUST check against this set before the domain-specific
+# rules: rejecting only the known cross-domain combinations let an unsupported
+# name ("typo", or the never-supported "poisson_kl") pass a dry run and then
+# fail at dispatch, breaking the validate/run parity this layer promises.
+_SUPPORTED_SOLVERS = ("auto", "lm", "kl", "poisson", "joint_poisson")
+# Count-likelihood names among those; rejected for normalized transmission.
+_COUNT_LIKELIHOOD_SOLVERS = frozenset({"kl", "poisson", "joint_poisson"})
+_UNSUPPORTED_SOLVER = (
+    "unsupported solver: {solver!r}; the fitting engine accepts "
+    + ", ".join(repr(name) for name in _SUPPORTED_SOLVERS)
+)
 _SAFE_KEY = re.compile(r"[^A-Za-z0-9_]+")
+
+
+def _requested_solver(fit_config: dict[str, Any]) -> str:
+    """Case-normalized solver name from a manifest fit block.
+
+    The manifest layer is case-insensitive (every routing check here
+    lowercases), so the normalized value is what must reach the binding too —
+    passing the raw string through would let `solver: "KL"` satisfy these
+    checks and then fail `parse_solver_config` as an unknown name.
+    """
+    return str(fit_config.get("solver", "auto")).lower()
 
 
 def _json_safe(value: Any) -> Any:
@@ -532,6 +555,9 @@ def _single_fit_kwargs(
             }
         )
     kwargs = {key: fit_config[key] for key in keys if key in fit_config}
+    if "solver" in kwargs:
+        # Hand the binding the SAME normalized name the routing checks used.
+        kwargs["solver"] = _requested_solver(fit_config)
     if "fit_energy_range" in fit_config:
         kwargs["fit_energy_range"] = _fit_energy_range(fit_config["fit_energy_range"])
     kwargs.update(resolution)
@@ -565,6 +591,9 @@ def _spatial_fit_kwargs(
         "tzero_jacobian",
     }
     kwargs = {key: fit_config[key] for key in keys if key in fit_config}
+    if "solver" in kwargs:
+        # Hand the binding the SAME normalized name the routing checks used.
+        kwargs["solver"] = _requested_solver(fit_config)
     if "fit_energy_range" in fit_config:
         kwargs["fit_energy_range"] = _fit_energy_range(fit_config["fit_energy_range"])
     kwargs.update(resolution)
@@ -707,7 +736,9 @@ def _process_single_spectrum(
                 "the conversion discards open-beam count uncertainty; use "
                 "fit_domain='counts' with solver='auto' or solver='kl'"
             )
-        requested_solver = str(fit_config.get("solver", "auto")).lower()
+        requested_solver = _requested_solver(fit_config)
+        if requested_solver not in _SUPPORTED_SOLVERS:
+            raise ValueError(_UNSUPPORTED_SOLVER.format(solver=requested_solver))
         if requested_solver == "lm":
             raise ValueError(
                 "raw count input cannot use solver='lm': the least-squares "
@@ -734,8 +765,10 @@ def _process_single_spectrum(
                 "normalized transmission input must use fit_domain='transmission' "
                 "with solver='auto' or solver='lm'"
             )
-        requested_solver = str(fit_config.get("solver", "auto")).lower()
-        if requested_solver in {"kl", "poisson", "poisson_kl", "joint_poisson"}:
+        requested_solver = _requested_solver(fit_config)
+        if requested_solver not in _SUPPORTED_SOLVERS:
+            raise ValueError(_UNSUPPORTED_SOLVER.format(solver=requested_solver))
+        if requested_solver in _COUNT_LIKELIHOOD_SOLVERS:
             raise ValueError(
                 "normalized transmission input cannot use a Poisson/KL count "
                 "likelihood; use solver='auto' or solver='lm'"
@@ -966,18 +999,15 @@ def _process_density_map(
     initial_densities = [density for _, density in isotopes]
     isotope_data = [data for data, _ in isotopes]
     kwargs = _spatial_fit_kwargs(fit_config, _resolution_kwargs(base, config))
-    requested_solver = str(fit_config.get("solver", "auto")).lower()
+    requested_solver = _requested_solver(fit_config)
+    if requested_solver not in _SUPPORTED_SOLVERS:
+        raise ValueError(_UNSUPPORTED_SOLVER.format(solver=requested_solver))
     if input_kind == "counts" and requested_solver == "lm":
         raise ValueError(
             "raw count maps cannot use solver='lm': use solver='auto' or "
             "solver='kl' so the separate sample/open-beam arms are preserved"
         )
-    if input_kind == "transmission" and requested_solver in {
-        "kl",
-        "poisson",
-        "poisson_kl",
-        "joint_poisson",
-    }:
+    if input_kind == "transmission" and requested_solver in _COUNT_LIKELIHOOD_SOLVERS:
         raise ValueError(
             "normalized transmission maps cannot use a Poisson/KL count "
             "likelihood; use solver='auto' or solver='lm'"
@@ -1234,7 +1264,11 @@ def _validate_workflow(manifest: dict[str, Any]) -> dict[str, Any]:
         "nexus",
     }
     fit_config = _get_fit_config(config)
-    solver = str(fit_config.get("solver", "auto")).lower()
+    solver = _requested_solver(fit_config)
+    # Unsupported names must fail validation, not sail through to dispatch:
+    # the domain rules below only describe combinations of REAL solvers.
+    if solver not in _SUPPORTED_SOLVERS:
+        errors.append(_UNSUPPORTED_SOLVER.format(solver=solver))
     if mode in {"single_spectrum", "fit_spectrum", "spectrum"}:
         # Byte-identical to the run path's routing check
         # (`data_path.suffix == ".npz"` on the resolved path): `DATA.NPZ`
@@ -1264,7 +1298,7 @@ def _validate_workflow(manifest: dict[str, Any]) -> dict[str, Any]:
                     "normalized transmission input must use "
                     "fit_domain='transmission' with solver='auto' or solver='lm'"
                 )
-            elif solver in {"kl", "poisson", "poisson_kl", "joint_poisson"}:
+            elif solver in _COUNT_LIKELIHOOD_SOLVERS:
                 errors.append(
                     "normalized transmission input cannot use a Poisson/KL count "
                     "likelihood; use solver='auto' or solver='lm'"
@@ -1278,12 +1312,7 @@ def _validate_workflow(manifest: dict[str, Any]) -> dict[str, Any]:
                     "solver='kl' so the separate sample/open-beam arms are "
                     "preserved"
                 )
-            if not counts_input and solver in {
-                "kl",
-                "poisson",
-                "poisson_kl",
-                "joint_poisson",
-            }:
+            if not counts_input and solver in _COUNT_LIKELIHOOD_SOLVERS:
                 errors.append(
                     "normalized transmission maps cannot use a Poisson/KL count "
                     "likelihood; use solver='auto' or solver='lm'"
