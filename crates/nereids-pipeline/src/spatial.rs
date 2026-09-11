@@ -2281,8 +2281,16 @@ mod tests {
         let data = u238_single_resonance();
         let energies: Vec<f64> = (0..101).map(|i| 1.0 + (i as f64) * 0.1).collect();
         // A wide grid: many real LM fits, so the watcher reliably flips
-        // `cancel` mid-run (after pixel 1, with dozens of pixels left to skip).
-        let (t_3d, u_3d) = synthetic_grid_transmission(&data, 0.0005, &energies, 1, 64);
+        // `cancel` mid-run (after pixel 1, with hundreds of pixels left to
+        // skip).
+        //
+        // Sized in pixels, not seconds, because the per-pixel cost is not
+        // stable: when the workspace gained `[profile.test] opt-level = 2`
+        // the sweep got roughly an order of magnitude faster and a 64-pixel
+        // grid began losing this race outright on the macOS runner — every
+        // attempt finished before the flip landed. Pixel count is what buys
+        // the watcher a window, so keep this generous.
+        let (t_3d, u_3d) = synthetic_grid_transmission(&data, 0.0005, &energies, 1, 768);
 
         let config = UnifiedFitConfig::new(
             energies,
@@ -2313,10 +2321,13 @@ mod tests {
             let cancel = AtomicBool::new(false);
             let progress = AtomicUsize::new(0);
 
+            let watcher_ready = AtomicBool::new(false);
+
             let result = std::thread::scope(|s| {
                 // Watcher: once at least one pixel has finished, request
                 // cancellation while the rest are still being fit.
                 s.spawn(|| {
+                    watcher_ready.store(true, Ordering::Release);
                     while progress.load(Ordering::Relaxed) < 1 {
                         // yield instead of spinning: on a fully subscribed
                         // CI box a busy-spin can be starved for the whole
@@ -2325,6 +2336,14 @@ mod tests {
                     }
                     cancel.store(true, Ordering::Relaxed);
                 });
+                // Do not start the sweep until the watcher is actually
+                // running. Otherwise thread-spawn latency is charged against
+                // the race, and a fast sweep can finish before the watcher
+                // is ever scheduled — which is a property of the runner, not
+                // of the behaviour under test.
+                while !watcher_ready.load(Ordering::Acquire) {
+                    std::thread::yield_now();
+                }
                 spatial_map_typed(&input, &config, None, Some(&cancel), Some(&progress))
             });
 
