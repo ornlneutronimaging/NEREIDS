@@ -256,10 +256,12 @@ fn apply_spatial_polish_default(config: UnifiedFitConfig, n_pixels: usize) -> Un
 /// raised inside `fit_spectrum_typed` /
 /// `fit_counts_joint_poisson` whose decision depends only on
 /// `(input variant, config)` — i.e. fires identically for every pixel.
-/// Per-pixel error variants (numerical fit failure, per-pixel detector
-/// background contamination on `CountsWithNuisance`) intentionally stay
-/// inside the closure where they correctly produce a NaN-only single
-/// pixel rather than a whole-map error.
+/// Per-pixel numerical fit failures intentionally stay inside the closure,
+/// where they correctly produce a NaN-only single pixel rather than a
+/// whole-map error. Unsupported detector background is *not* such a case:
+/// it is a model choice that no pixel can honour, so it is validated
+/// across every live pixel by `validate_spatial_data_values` before the
+/// closure starts.
 ///
 /// The error messages here are kept byte-identical to the originating
 /// per-pixel sites so the user-facing diagnostic does not bifurcate
@@ -439,10 +441,9 @@ fn validate_spatial_fit_preflight(
     // Every gate below mirrors a per-pixel rejection in
     // `pipeline.rs::fit_counts_joint_poisson`.  All fire identically
     // across the map because they depend only on shared config flags
-    // (alpha fitting, B_A/B/C interlock, `c` value); per-pixel
-    // detector-background contamination is *not* hoisted because
-    // `CountsWithNuisance` carries per-pixel `background` slices and
-    // contamination is a legitimately per-pixel signal.
+    // (alpha fitting, B_A/B/C interlock, `c` value). Unsupported nonzero
+    // detector background is rejected across all live pixels by
+    // `validate_spatial_data_values` before any fit starts.
     if is_counts && is_kl {
         if let Some(bg) = config.counts_background() {
             if bg.fit_alpha_1 || bg.fit_alpha_2 {
@@ -700,8 +701,9 @@ fn check_cube(
 ///   quantities, where a bad value anywhere is an upstream bug (matching the
 ///   all-bins `validate_counts`).
 /// - **background** (CountsWithNuisance) is checked **finite, all bins**,
-///   closing the `NaN.abs() > 1e-12 == false` finiteness leak in the
-///   per-pixel detector-background gate.
+///   and then rejected outright if any live pixel carries an exact nonzero
+///   in any bin. Finiteness is checked first so a NaN is reported as
+///   malformed input rather than as an unsupported background value.
 fn validate_spatial_data_values(
     input: &InputData3D<'_>,
     live_pixels: &[(usize, usize)],
@@ -772,6 +774,23 @@ fn validate_spatial_data_values(
                 live_pixels,
                 None,
             )?;
+            // `B_det` is not wired into the fit at all, so a nonzero
+            // background is an unsupported model choice rather than a
+            // per-pixel data defect. Left inside the per-pixel closure it
+            // fails every live pixel and the swallow at the bottom of the
+            // loop turns that into an all-NaN map returned as `Ok` — the
+            // exact degradation this preflight exists to prevent. Checked
+            // after the finiteness pass above, so NaN is reported as
+            // malformed input rather than as a nonzero value.
+            if live_pixels.iter().any(|&(y, x)| {
+                (0..background.shape()[0]).any(|energy| background[[energy, y, x]] != 0.0)
+            }) {
+                return Err(PipelineError::InvalidParameter(
+                    "joint-Poisson solver with non-zero detector_background is not yet \
+                     supported (B_det wiring is deferred)."
+                        .into(),
+                ));
+            }
         }
     }
     Ok(())
@@ -1784,8 +1803,9 @@ pub fn spatial_map_typed(
                     // guard) is gone.
                     //
                     // Check effective solver: KL uses CountsWithNuisance
-                    // (averaged flux), LM uses raw Counts (auto-converts to
-                    // transmission inside fit_spectrum_typed).
+                    // (averaged flux). The non-KL arm is unreachable for a
+                    // counts cube now that counts + LM is rejected outright,
+                    // and is kept only so the match stays total.
                     let effective = fast_config.effective_solver(&InputData::Counts {
                         sample_counts: spectrum_a.clone(),
                         open_beam_counts: ob_spectrum.clone(),
@@ -4777,9 +4797,9 @@ mod tests {
 
     #[test]
     fn test_spatial_counts_with_nuisance_rejects_nonfinite_background() {
-        // Background is validated finite (sign deferred to the per-pixel
-        // detector-background gate); this closes the `NaN.abs() > 1e-12 ==
-        // false` finiteness leak in that gate at the boundary.
+        // Background is validated finite before the nonzero-background gate,
+        // so a NaN is reported as malformed input rather than slipping into
+        // the `NaN != 0.0` comparison and being named an unsupported value.
         let energies: Vec<f64> = (0..51).map(|i| 1.0 + (i as f64) * 0.2).collect();
         for bad in [f64::NAN, f64::INFINITY] {
             let data = u238_single_resonance();
@@ -4804,6 +4824,65 @@ mod tests {
                 "error must name the background cube, got: {err}"
             );
         }
+    }
+
+    /// `B_det` is unwired, so a nonzero background cannot be honoured for any
+    /// pixel. Left per-pixel it failed every live pixel and the `n_failed`
+    /// swallow returned an all-NaN map as `Ok`; it must surface as one
+    /// boundary error instead. 5e-13 is below the magnitude tolerance the
+    /// guard used to carry.
+    #[test]
+    fn test_spatial_counts_with_nuisance_rejects_nonzero_live_background() {
+        let energies: Vec<f64> = (0..51).map(|i| 1.0 + (i as f64) * 0.2).collect();
+        for nonzero_background in [1.0, 5.0e-13] {
+            let data = u238_single_resonance();
+            let (sample, _ob) = synthetic_4x4_counts(&data, 0.0005, &energies, 1000.0);
+            let flux = Array3::from_elem((energies.len(), 4, 4), 1000.0);
+            let mut background = Array3::from_elem((energies.len(), 4, 4), 0.0);
+            background[[2, 3, 3]] = nonzero_background;
+            let config = kl_counts_config(energies.clone(), data);
+            let input = InputData3D::CountsWithNuisance {
+                sample_counts: sample.view(),
+                flux: flux.view(),
+                background: background.view(),
+            };
+
+            let err = spatial_map_typed(&input, &config, None, None, None)
+                .expect_err("unsupported detector background must fail before pixel fitting");
+            assert!(
+                matches!(err, PipelineError::InvalidParameter(_)),
+                "got {err:?}"
+            );
+            assert!(
+                err.to_string().contains("non-zero detector_background"),
+                "error must name the unsupported detector background, got: {err}"
+            );
+        }
+    }
+
+    /// The ordinary case: a background cube nonzero *everywhere*. This is what
+    /// previously produced `Ok(SpatialResult)` with every pixel NaN, which is
+    /// indistinguishable from a converged map that simply fit badly.
+    #[test]
+    fn test_spatial_uniform_nonzero_background_errors_instead_of_all_nan_map() {
+        let energies: Vec<f64> = (0..51).map(|i| 1.0 + (i as f64) * 0.2).collect();
+        let data = u238_single_resonance();
+        let (sample, _ob) = synthetic_4x4_counts(&data, 0.0005, &energies, 1000.0);
+        let flux = Array3::from_elem((energies.len(), 4, 4), 1000.0);
+        let background = Array3::from_elem((energies.len(), 4, 4), 2.0);
+        let config = kl_counts_config(energies.clone(), data);
+        let input = InputData3D::CountsWithNuisance {
+            sample_counts: sample.view(),
+            flux: flux.view(),
+            background: background.view(),
+        };
+
+        let err = spatial_map_typed(&input, &config, None, None, None)
+            .expect_err("a wholly unsupported background must not report success");
+        assert!(
+            err.to_string().contains("non-zero detector_background"),
+            "got: {err}"
+        );
     }
 
     #[test]
