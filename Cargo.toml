@@ -105,3 +105,14 @@ tracing-subscriber = { version = "0.3", default-features = false, features = ["f
 opener = { version = "0.8", features = ["reveal"] }
 time = { version = "0.3", default-features = false, features = ["formatting", "macros"] }
 tempfile = "3"
+
+# Tests and dev builds default to opt-level 0.  The resonance kernels are
+# numeric inner loops, and unoptimized they dominate the test battery.
+# `profile.test` inherits `profile.dev`, and dependencies of test targets
+# build under `profile.dev`, so both are set.  `debug-assertions` is
+# untouched, and opt-level does not relax IEEE float semantics.
+[profile.dev]
+opt-level = 2
+
+[profile.test]
+opt-level = 2
