@@ -7,7 +7,39 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
 
 ## [Unreleased]
 
+### Added
+
+- **Exact separate-arm response for resolved count fitting.** A count fit
+  with an active instrument resolution now evaluates the physical detector
+  equation — the open and sample arms broadened separately,
+  `T_eff,i = Σ_j F_j T_j R_ij / Σ_j F_j R_ij` — instead of failing closed.
+  `fit_counts_spectrum_typed` gains `incident_fluence_weights`,
+  `detector_time_edges_us` and `timing_offset_us`, and accepts a
+  `TabulatedResolution` or `IkedaCarpenter` detector-time response; the
+  true-energy quadrature and the measured detector-time bins are distinct
+  axes. New public Rust surface: `ExactCountResponseConfig`,
+  `DetectorBinResponseMatrix` and `ExactTwoArmRatioModel`. Spatial mapping
+  and the research Fisher helper stay fail-closed for resolved counts.
+
 ### Changed (breaking)
+
+- **Removed the two cross-domain fit routes.** Normalized transmission with
+  a Poisson/KL solver is rejected (a fractional ratio is not Poisson count
+  data, and the supplied uncertainty would be ignored), and raw
+  sample/open-beam counts with the LM least-squares engine is rejected
+  (dividing the arms loses open-beam uncertainty and count statistics).
+  This applies at every boundary: `fit_spectrum_typed`,
+  `spatial_map_typed`, the Python bindings, the MCP manifest (validate and
+  run alike, including the counts→transmission conversion, now deleted),
+  and the GUI solver picker. The internal helpers `counts_to_transmission`,
+  `fit_transmission_poisson` and `poisson_to_lm_result` are gone.
+- **`deviance_per_dof` now divides by informative bins.** Active bins with
+  no counts (`O_i + S_i == 0`) are degenerate under the conditional-binomial
+  model — identically zero deviance for any transmission — so they no longer
+  count as degrees of freedom. Reported goodness-of-fit and the opt-in
+  `scale_by_chi2` σ inflation change for any fit whose window contains empty
+  bins (routine on the exact detector-time route); fully occupied fits,
+  including the VENUS regression anchors, are unaffected.
 
 - **Removed URR (LRU=2) and R-Matrix Limited (LRF=7) cross-section
   evaluation.** The URR Hauser-Feshbach path lacked the ENDF

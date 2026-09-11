@@ -15,9 +15,10 @@
 //! joint-Poisson conditional-binomial-deviance solver in
 //! [`crate::joint_poisson`]. This module remains available to the
 //! `evaluate_jacobian_and_fisher` Fisher-information helper (via
-//! [`CountsModel`] and [`CountsBackgroundScaleModel`]) and to
-//! spatial-regularization research drivers; it is not a public
-//! transmission fitting route.
+//! [`CountsModel`], [`CountsBackgroundScaleModel`] and
+//! [`TransmissionKLBackgroundModel`], all three of which that helper still
+//! constructs) and to spatial-regularization research drivers; it is not a
+//! public transmission fitting route.
 //!
 //! ## TRINIDI Reference
 //! - `trinidi/reconstruct.py` — Poisson NLL and APGM optimizer

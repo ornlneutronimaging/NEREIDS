@@ -4988,10 +4988,9 @@ fn spatial_result_to_py(
 ///     scale_by_chi2: When True, inflate the covariance-only uncertainties
 ///         (incl. ``temperature_uncertainty_map``) by ``sqrt(chi2/dof)`` at
 ///         convergence — the inverse-Fisher lower bound becomes a
-///         goodness-of-fit-scaled estimate, scaled by the goodness-of-fit each
-///         pixel's result reports (Gaussian reduced-chi2 on the transmission
-///         paths incl. Poisson-KL, deviance-per-dof on the counts joint-Poisson
-///         path). No-op on the already-chi2-scaled LM transmission path.
+///         goodness-of-fit-scaled estimate, scaled by the deviance-per-dof each
+///         pixel's result reports on the counts joint-Poisson path. No-op on
+///         the already-chi2-scaled LM transmission path.
 ///         Default False (issue #638).
 ///
 /// Returns:

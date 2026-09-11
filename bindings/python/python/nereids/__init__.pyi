@@ -1721,17 +1721,18 @@ def spatial_map_typed(
         energy_scale_flight_path_m: Nominal flight path (m) for the
             energy-scale model (default 25.0).
         resolution: Optional resolution function.  Rejected when fitting
-            count cubes: counts input with instrument resolution fails
-            closed (the physical model needs separate open/sample response
-            arms) until the exact two-arm counts response route exists; fit
-            pre-normalized transmission cubes instead.
+            count cubes: a resolved count fit needs the exact separate-arm
+            model, which the single-spectrum ``fit_counts_spectrum_typed``
+            provides via ``incident_fluence_weights`` /
+            ``detector_time_edges_us``; spatial count mapping stays
+            fail-closed until that fixed matrix is cached per map. Fit
+            pre-normalized transmission cubes when resolution is required.
         scale_by_chi2: When ``True``, inflate the covariance-only
             uncertainties (incl. ``temperature_uncertainty_map``) by
             ``sqrt(chi2/dof)`` at the converged point, turning the inverse-Fisher
             lower bound into a goodness-of-fit-scaled estimate. Sigma is scaled
-            by sqrt of the goodness-of-fit each pixel's result reports (Gaussian
-            reduced-chi2 on the transmission paths incl. Poisson-KL,
-            deviance-per-dof on the counts joint-Poisson path). No-op on the
+            by sqrt of the deviance-per-dof each pixel's result reports on the
+            counts joint-Poisson path. No-op on the
             already-chi2-scaled LM transmission path. Default ``False``
             (issue #638).
 

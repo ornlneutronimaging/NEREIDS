@@ -133,9 +133,16 @@ impl<'a> JointPoissonObjective<'a> {
 
     /// Predicate: is bin `i` active?  Returns `true` when no mask is
     /// set (full-grid default).
+    ///
+    /// A mask shorter than the data (rejected by [`Self::validate_inputs`]
+    /// on every path that optimizes) reads as INACTIVE past its end rather
+    /// than panicking, so the infallible public accessors — which by
+    /// signature cannot report a `LengthMismatch` — degrade predictably on
+    /// a malformed caller-built objective instead of aborting.
     #[inline]
     fn bin_active(&self, i: usize) -> bool {
-        self.active_mask.is_none_or(|m| m[i])
+        self.active_mask
+            .is_none_or(|m| m.get(i).copied().unwrap_or(false))
     }
 
     /// Runtime guard for the public methods that bypass `joint_poisson_fit`'s
@@ -1014,14 +1021,23 @@ pub fn joint_poisson_fit(
         });
     }
 
-    // Underdetermined-check: when a fit-energy-range mask leaves fewer
-    // active bins than free parameters, the problem is rank-deficient
-    // and any deviance / dof ratio would be deceptive (the previous
-    // `.max(1)` divisor produced a finite-looking deviance-per-dof for
-    // empty / too-narrow masks).  Mirror LM's behaviour at
-    // `lm.rs:578-588`: return a non-converged result up-front, before
-    // wasting cycles on the damped-Fisher stage.
-    if n_active_initial < n_free_initial {
+    // Underdetermined-check: when too few bins CONSTRAIN the fit, the
+    // problem is rank-deficient and any deviance / dof ratio would be
+    // deceptive (the previous `.max(1)` divisor produced a finite-looking
+    // deviance-per-dof for empty / too-narrow masks).  Mirror LM's
+    // behaviour: return a non-converged result up-front, before wasting
+    // cycles on the damped-Fisher stage.
+    //
+    // The count that matters is the INFORMATIVE one (`O_i + S_i > 0`),
+    // matching the dof denominator below: a zero-total bin contributes
+    // identically zero deviance AND zero Fisher curvature, so it carries no
+    // rank. Keying this guard on `n_active` instead would let a wholly
+    // empty acquisition — every bin zero, routine to hit by mis-specifying
+    // the detector window on the exact route — run to completion and report
+    // `gn_converged = true` at the untouched initial guess with a NaN
+    // deviance, i.e. a success-shaped result from a fit that saw no data.
+    let n_informative_initial = objective.n_informative();
+    if n_informative_initial < n_free_initial.max(1) {
         return Ok(JointPoissonResult {
             deviance: f64::NAN,
             deviance_per_dof: f64::NAN,
@@ -2049,6 +2065,65 @@ mod tests {
             (expected - diluted).abs() > 1e-3,
             "fixture too weak to distinguish the two divisors"
         );
+    }
+
+    /// An acquisition with no observed counts anywhere must not be reported
+    /// as a converged fit.
+    ///
+    /// Every bin is degenerate (zero deviance, zero Fisher curvature), so
+    /// the deviance-based convergence test would otherwise see `D == 0` at
+    /// the untouched initial guess and declare success — a success-shaped
+    /// result from a fit that saw no data. Easy to hit on the exact
+    /// detector-time route by mis-specifying the acquisition window.
+    #[test]
+    fn all_empty_acquisition_does_not_report_convergence() {
+        let n_bins = 32_usize;
+        let zeros = vec![0.0_f64; n_bins];
+        let model = ConstModel { n_e: n_bins };
+        let obj = JointPoissonObjective {
+            model: &model,
+            o: &zeros,
+            s: &zeros,
+            c: 1.0,
+            active_mask: None,
+        };
+        let seed = 0.42_f64;
+        let mut params = ParameterSet::new(vec![FitParameter::non_negative("t", seed)]);
+        let result =
+            joint_poisson_fit(&obj, &mut params, &JointPoissonFitConfig::default()).unwrap();
+
+        assert!(
+            !result.gn_converged,
+            "a zero-count acquisition must not report convergence"
+        );
+        assert!(result.deviance.is_nan(), "deviance: {}", result.deviance);
+        assert!(result.deviance_per_dof.is_nan());
+        assert!(result.covariance.is_none() && result.uncertainties.is_none());
+        // The bins are visible as active but none of them constrain anything.
+        assert_eq!(result.n_active, n_bins);
+        assert_eq!(obj.n_informative(), 0);
+    }
+
+    /// The infallible public accessors must not panic on a caller-built
+    /// objective whose mask is shorter than the data: `validate_inputs`
+    /// rejects that shape on every optimizing path, and a `usize`-returning
+    /// accessor cannot report the mismatch, so it degrades to inactive.
+    #[test]
+    fn short_active_mask_does_not_panic_public_accessors() {
+        let model = ConstModel { n_e: 3 };
+        let short_mask = [true];
+        let obj = JointPoissonObjective {
+            model: &model,
+            o: &[10.0, 10.0, 10.0],
+            s: &[5.0, 5.0, 5.0],
+            c: 1.0,
+            active_mask: Some(&short_mask),
+        };
+        // Bin 0 is in-mask and occupied; bins 1-2 fall past the mask end.
+        assert_eq!(obj.n_informative(), 1);
+        // And the optimizing path still rejects the malformed shape loudly.
+        let mut params = ParameterSet::new(vec![FitParameter::non_negative("t", 0.5)]);
+        assert!(joint_poisson_fit(&obj, &mut params, &JointPoissonFitConfig::default()).is_err());
     }
 
     // ------------------------------------------------------------------

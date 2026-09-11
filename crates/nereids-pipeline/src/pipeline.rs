@@ -3834,15 +3834,14 @@ pub struct SpectrumFitResult {
     pub temperature_k: Option<f64>,
     /// 1-sigma uncertainty on the fitted temperature (from covariance matrix).
     ///
-    /// **Covariance-only lower bound** for the raw-covariance solver paths
-    /// (Poisson-KL, joint-Poisson): this is `sqrt` of the temperature diagonal
+    /// **Covariance-only lower bound** for the raw-count joint-Poisson path:
+    /// this is `sqrt` of the temperature diagonal
     /// of the inverse curvature (Fisher) matrix at convergence. It reflects only
     /// statistical curvature — baseline/model noise is not in the covariance —
     /// so on real data it can **underestimate the observed per-superpixel scatter
     /// by ~3–4×**. Set `UnifiedFitConfig::scale_by_chi2` to inflate it by `sqrt`
-    /// of the goodness-of-fit this result reports (Gaussian `reduced_chi_squared`
-    /// on the transmission paths, `deviance_per_dof` on the counts joint-Poisson
-    /// path) for a goodness-of-fit-scaled estimate. The LM transmission path is
+    /// of the `deviance_per_dof` this result reports, for a
+    /// goodness-of-fit-scaled estimate. The LM transmission path is
     /// already χ²-scaled (Numerical Recipes §15.6), so the flag is a no-op there.
     pub temperature_k_unc: Option<f64>,
     /// Fitted normalization scale (SAMMY `Anorm`).  When background
@@ -7072,34 +7071,152 @@ mod tests {
         );
     }
 
+    /// The exact route accepts an analytical Ikeda–Carpenter response as
+    /// well as a tabulated kernel, but every other exact-route test uses a
+    /// tabulated triangle — this closes the IC branch end to end, through
+    /// `DetectorBinResponseMatrix::new` -> `IkedaCarpenter::
+    /// detector_bin_probabilities` (its per-bin tau-step accuracy gate
+    /// included) and back out of the fit.
+    ///
+    /// Note the causal IC pulse rises FROM the nominal arrival onward, so
+    /// the acquisition window is placed after it — unlike the mode-centred
+    /// tabulated kernel, whose offset convention is not transferable.
+    #[test]
+    fn exact_resolved_counts_closed_loop_with_ikeda_carpenter() {
+        use nereids_physics::counts_response::two_arm_count_response;
+        use nereids_physics::ikeda_carpenter::{
+            IkedaCarpenter, IkedaCarpenterParams, SynthesisGrid,
+        };
+        use nereids_physics::resolution::{ResolutionFunction, TOF_FACTOR};
+
+        let flight_path_m = 25.0_f64;
+        let data = u238_single_resonance();
+        let true_density = 5.0e-4;
+        let energies: Vec<f64> = (0..60).map(|i| 5.0 + i as f64 * 3.0 / 59.0).collect();
+        let (true_transmission, _) = synthetic_transmission(&data, true_density, &energies);
+        let response = ResolutionFunction::IkedaCarpenter(Arc::new(
+            IkedaCarpenter::new(
+                IkedaCarpenterParams::constant(2.0, 0.1, 0.0),
+                flight_path_m,
+                &SynthesisGrid::new(4.0, 9.0),
+            )
+            .expect("valid prompt-only IC model"),
+        ));
+        let source: Vec<f64> = vec![4.0e4; energies.len()];
+        // Causal pulse: start the window at the earliest nominal arrival
+        // (highest energy) and run past the latest one.
+        let first_arrival = TOF_FACTOR * flight_path_m / 8.0_f64.sqrt();
+        let detector_edges: Vec<f64> = (0..160).map(|i| first_arrival + i as f64 * 2.0).collect();
+        let expected = two_arm_count_response(
+            &energies,
+            &source,
+            &true_transmission,
+            &detector_edges,
+            0.0,
+            &response,
+        )
+        .expect("valid IC synthetic count response");
+        assert!(
+            expected.open_beam.iter().any(|&v| v > 0.0),
+            "IC fixture must deposit counts in the window"
+        );
+
+        let config = UnifiedFitConfig::new(
+            energies,
+            vec![data],
+            vec!["U-238".into()],
+            0.0,
+            Some(response),
+            vec![2.0e-4],
+        )
+        .unwrap()
+        .with_solver(SolverConfig::PoissonKL(PoissonConfig {
+            max_iter: 400,
+            ..Default::default()
+        }))
+        .with_exact_count_response(ExactCountResponseConfig {
+            incident_fluence_weights: source,
+            detector_time_edges_us: detector_edges,
+            timing_offset_us: 0.0,
+        });
+        let result = fit_spectrum_typed(
+            &InputData::Counts {
+                sample_counts: expected.sample,
+                open_beam_counts: expected.open_beam,
+            },
+            &config,
+        )
+        .expect("exact resolved count fit with an IC response");
+
+        assert!(result.converged, "IC exact fit did not converge");
+        assert!(
+            (result.densities[0] - true_density).abs() / true_density < 1.0e-3,
+            "density: fitted={}, true={true_density}",
+            result.densities[0]
+        );
+    }
+
     /// The pre-trigger tolerance above must NOT weaken the occupied case:
     /// counts in a bin with no physical energy remain a hard error.
+    ///
+    /// The fixture must reach the BACKGROUND pseudo-energy guard, not the
+    /// earlier occupied-dead-bin pre-check, so bin 0 needs observed counts
+    /// AND nonzero detector response while still preceding the offset. A
+    /// mode-centred kernel whose negative half-width (20 µs) exceeds the
+    /// true-energy flight time (~10 µs at 32.7 keV over 25 m) deposits
+    /// probability before the trigger; the assertion therefore pins the
+    /// pre-trigger message alone.
     #[test]
     fn exact_route_rejects_occupied_pre_trigger_bin_with_background() {
+        use nereids_physics::counts_response::DetectorBinResponseMatrix;
         use nereids_physics::resolution::{ResolutionFunction, TOF_FACTOR, TabulatedResolution};
 
-        let timing_offset_us = 5.0_f64;
-        let arrival = TOF_FACTOR * 25.0 / 25.0_f64.sqrt();
+        let flight_path_m = 25.0_f64;
+        let true_energy = 32_670.0_f64;
+        let tof_us = TOF_FACTOR * flight_path_m / true_energy.sqrt();
+        let timing_offset_us = 30.0_f64;
+        let arrival = timing_offset_us + tof_us; // ≈ 40 µs
+        assert!(
+            tof_us < 20.0,
+            "fixture needs a flight time inside the kernel half-width, got {tof_us}"
+        );
         let response = ResolutionFunction::Tabulated(Arc::new(
             TabulatedResolution::from_kernels(
-                vec![25.0],
-                vec![(vec![-1.0, 0.0, 1.0], vec![0.0, 1.0, 0.0])],
-                25.0,
+                vec![true_energy],
+                vec![(vec![-20.0, 0.0, 20.0], vec![0.0, 1.0, 0.0])],
+                flight_path_m,
             )
-            .expect("valid triangle response"),
+            .expect("valid wide triangle response"),
         ));
-        // Bin 0 precedes the offset AND carries counts; bins 1-2 hold the
-        // pulse so the occupied-dead-bin pre-check passes and this reaches
-        // the background pseudo-energy mapping.
+        // Bin 0 = [arrival-22, arrival-14]: inside the kernel's negative
+        // tail (nonzero response) and entirely before the trigger offset.
         let detector_edges = vec![
-            0.0,
-            2.5,
-            timing_offset_us + arrival - 1.0,
-            timing_offset_us + arrival,
-            timing_offset_us + arrival + 1.0,
+            arrival - 22.0,
+            arrival - 14.0,
+            arrival - 6.0,
+            arrival + 2.0,
+            arrival + 10.0,
         ];
+        // Guard the guard: prove bin 0 really has response, so this test
+        // cannot silently degrade into the dead-bin pre-check again.
+        let matrix = DetectorBinResponseMatrix::new(
+            &[true_energy],
+            &detector_edges,
+            timing_offset_us,
+            &response,
+        )
+        .expect("valid response matrix");
+        assert!(
+            matrix.probability(0, 0) > 0.0,
+            "fixture bin 0 must have nonzero detector response"
+        );
+        assert!(
+            0.5 * (detector_edges[0] + detector_edges[1]) < timing_offset_us,
+            "fixture bin 0 must precede the timing offset"
+        );
+
         let config = UnifiedFitConfig::new(
-            vec![25.0],
+            vec![true_energy],
             vec![u238_single_resonance()],
             vec!["U-238".into()],
             0.0,
@@ -7120,16 +7237,16 @@ mod tests {
         });
         let err = fit_spectrum_typed(
             &InputData::Counts {
-                sample_counts: vec![5.0, 0.0, 20.0, 20.0],
-                open_beam_counts: vec![10.0, 0.0, 50.0, 50.0],
+                sample_counts: vec![5.0, 20.0, 20.0, 5.0],
+                open_beam_counts: vec![10.0, 50.0, 50.0, 10.0],
             },
             &config,
         )
         .expect_err("occupied bin without a physical energy must fail closed");
         let msg = err.to_string();
         assert!(
-            msg.contains("carries observed counts") || msg.contains("zero detector response"),
-            "{msg}"
+            msg.contains("carries observed counts"),
+            "expected the pre-trigger occupied-bin rejection, got: {msg}"
         );
     }
 

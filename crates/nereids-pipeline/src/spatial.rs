@@ -60,8 +60,8 @@ pub struct SpatialResult {
     /// `Some` when `config.fit_temperature()` is true.
     /// Entries are NaN where uncertainty was unavailable for that pixel.
     ///
-    /// **Covariance-only lower bound.** For the raw-covariance solver paths
-    /// (Poisson-KL, joint-Poisson) each σ_T is the square root of the
+    /// **Covariance-only lower bound.** For the raw-count joint-Poisson
+    /// path each σ_T is the square root of the
     /// temperature entry of the inverse curvature (Fisher) matrix at the
     /// converged point. That is a *lower bound* on the true uncertainty: it
     /// captures only the statistical curvature and omits baseline/model

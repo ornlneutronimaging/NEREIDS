@@ -456,6 +456,22 @@ pub fn two_arm_count_response(
         )?;
         debug_assert_eq!(probabilities.len(), n_bins);
 
+        // Same validity contract as `DetectorBinResponseMatrix::new`, so the
+        // two paths cannot disagree on what a valid response is: without it
+        // a NaN probability would propagate into the arms AND be reported as
+        // zero window loss (`NaN.max(0.0) == 0.0`), i.e. a silent corruption
+        // where the matrix path raises.
+        for (detector_bin, &probability) in probabilities.iter().enumerate() {
+            if !probability.is_finite() || probability < 0.0 {
+                return Err(CountsResponseError::Resolution(
+                    ResolutionParseError::InvalidFormat(format!(
+                        "detector response probability at E = {energy} eV, bin \
+                         {detector_bin} must be finite and >= 0, got {probability}"
+                    )),
+                ));
+            }
+        }
+
         // The bin probabilities come from a normalized CDF, so the in-window
         // total is <= 1; the remainder is the quantified acquisition-window
         // loss disclosed on the result (pipeline-map R5·7).
