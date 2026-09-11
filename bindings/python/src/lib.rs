@@ -2480,6 +2480,267 @@ fn py_two_arm_count_response<'py>(
     ))
 }
 
+/// Python result for a fixed-signal, measured-template count-background fit.
+#[pyclass(name = "TwoArmBackgroundFitResult")]
+struct PyTwoArmBackgroundFitResult {
+    names: Vec<String>,
+    amplitudes: Vec<f64>,
+    amplitude_uncertainties: Option<Vec<f64>>,
+    amplitudes_identifiable: bool,
+    open_neutron_signal: Vec<f64>,
+    open_background: Vec<f64>,
+    open_total: Vec<f64>,
+    open_window_loss: f64,
+    sample_neutron_signal: Vec<f64>,
+    sample_background: Vec<f64>,
+    sample_total: Vec<f64>,
+    sample_window_loss: f64,
+    poisson_deviance: f64,
+    deviance_per_dof: f64,
+    n_informative: usize,
+    converged: bool,
+    iterations: usize,
+}
+
+#[pymethods]
+impl PyTwoArmBackgroundFitResult {
+    #[getter]
+    fn names(&self) -> Vec<String> {
+        self.names.clone()
+    }
+
+    #[getter]
+    fn amplitudes<'py>(&self, py: Python<'py>) -> Bound<'py, PyArray1<f64>> {
+        PyArray1::from_vec(py, self.amplitudes.clone())
+    }
+
+    /// One-sigma amplitude uncertainties, or all-NaN when they are withheld.
+    ///
+    /// Uncertainties are reported only for a converged fit whose templates are
+    /// separately determined; check `amplitudes_identifiable` before reading.
+    #[getter]
+    fn amplitude_uncertainties<'py>(&self, py: Python<'py>) -> Bound<'py, PyArray1<f64>> {
+        PyArray1::from_vec(
+            py,
+            self.amplitude_uncertainties
+                .clone()
+                .unwrap_or_else(|| vec![f64::NAN; self.amplitudes.len()]),
+        )
+    }
+
+    #[getter]
+    fn amplitudes_identifiable(&self) -> bool {
+        self.amplitudes_identifiable
+    }
+
+    #[getter]
+    fn open_neutron_signal<'py>(&self, py: Python<'py>) -> Bound<'py, PyArray1<f64>> {
+        PyArray1::from_vec(py, self.open_neutron_signal.clone())
+    }
+
+    #[getter]
+    fn open_background<'py>(&self, py: Python<'py>) -> Bound<'py, PyArray1<f64>> {
+        PyArray1::from_vec(py, self.open_background.clone())
+    }
+
+    #[getter]
+    fn open_total<'py>(&self, py: Python<'py>) -> Bound<'py, PyArray1<f64>> {
+        PyArray1::from_vec(py, self.open_total.clone())
+    }
+
+    /// Expected open-beam neutron counts lost outside the acquisition window,
+    /// after exposure scaling (pipeline-map R5·7: disclosed, not renormalized).
+    #[getter]
+    fn open_window_loss(&self) -> f64 {
+        self.open_window_loss
+    }
+
+    #[getter]
+    fn sample_neutron_signal<'py>(&self, py: Python<'py>) -> Bound<'py, PyArray1<f64>> {
+        PyArray1::from_vec(py, self.sample_neutron_signal.clone())
+    }
+
+    #[getter]
+    fn sample_background<'py>(&self, py: Python<'py>) -> Bound<'py, PyArray1<f64>> {
+        PyArray1::from_vec(py, self.sample_background.clone())
+    }
+
+    #[getter]
+    fn sample_total<'py>(&self, py: Python<'py>) -> Bound<'py, PyArray1<f64>> {
+        PyArray1::from_vec(py, self.sample_total.clone())
+    }
+
+    /// Expected sample counts lost outside the acquisition window, after
+    /// exposure scaling.
+    #[getter]
+    fn sample_window_loss(&self) -> f64 {
+        self.sample_window_loss
+    }
+
+    #[getter]
+    fn poisson_deviance(&self) -> f64 {
+        self.poisson_deviance
+    }
+
+    #[getter]
+    fn deviance_per_dof(&self) -> f64 {
+        self.deviance_per_dof
+    }
+
+    /// Concatenated bins able to discriminate between amplitude vectors.
+    ///
+    /// Bins with no observation, no neutron signal, and no template capacity
+    /// yield identically zero deviance for any amplitude, so they are excluded
+    /// from the degrees of freedom behind `deviance_per_dof`.
+    #[getter]
+    fn n_informative(&self) -> usize {
+        self.n_informative
+    }
+
+    #[getter]
+    fn converged(&self) -> bool {
+        self.converged
+    }
+
+    #[getter]
+    fn iterations(&self) -> usize {
+        self.iterations
+    }
+}
+
+/// Fit non-negative amplitudes for independently measured count backgrounds.
+///
+/// Each row of the two template matrices is one named component. Templates
+/// must already be normalized into the detector bins of the corresponding
+/// complete acquisition. Only amplitudes are fitted; shapes and neutron
+/// signals remain fixed. The two required exposure scales convert the common
+/// reference signal into expected counts for each complete acquisition.
+#[pyfunction]
+#[pyo3(name = "fit_two_arm_background_templates", signature = (
+    observed_open_counts,
+    observed_sample_counts,
+    open_neutron_signal,
+    sample_neutron_signal,
+    open_exposure_scale,
+    sample_exposure_scale,
+    template_names,
+    open_background_templates,
+    sample_background_templates,
+    initial_amplitudes,
+    open_window_loss = 0.0,
+    sample_window_loss = 0.0,
+    max_iter = 200,
+))]
+#[allow(clippy::too_many_arguments)]
+fn py_fit_two_arm_background_templates<'py>(
+    py: Python<'py>,
+    observed_open_counts: PyReadonlyArray1<'py, f64>,
+    observed_sample_counts: PyReadonlyArray1<'py, f64>,
+    open_neutron_signal: PyReadonlyArray1<'py, f64>,
+    sample_neutron_signal: PyReadonlyArray1<'py, f64>,
+    open_exposure_scale: f64,
+    sample_exposure_scale: f64,
+    template_names: Vec<String>,
+    open_background_templates: PyReadonlyArray2<'py, f64>,
+    sample_background_templates: PyReadonlyArray2<'py, f64>,
+    initial_amplitudes: PyReadonlyArray1<'py, f64>,
+    open_window_loss: f64,
+    sample_window_loss: f64,
+    max_iter: usize,
+) -> PyResult<PyTwoArmBackgroundFitResult> {
+    use nereids_fitting::count_background::{
+        TwoArmBackgroundTemplate, fit_two_arm_background_templates as rust_fit_background,
+    };
+    use nereids_fitting::poisson::PoissonConfig;
+    use nereids_physics::counts_response::TwoArmCounts;
+
+    let open_template_array = open_background_templates.as_array();
+    let sample_template_array = sample_background_templates.as_array();
+    let open_shape = open_template_array.shape();
+    let sample_shape = sample_template_array.shape();
+    if open_shape != sample_shape {
+        return Err(pyo3::exceptions::PyValueError::new_err(format!(
+            "open_background_templates shape {open_shape:?} must match sample_background_templates shape {sample_shape:?}"
+        )));
+    }
+    if template_names.len() != open_shape[0] {
+        return Err(pyo3::exceptions::PyValueError::new_err(format!(
+            "template_names length ({}) must match template rows ({})",
+            template_names.len(),
+            open_shape[0]
+        )));
+    }
+    let initial = initial_amplitudes.as_slice()?.to_vec();
+    if initial.len() != open_shape[0] {
+        return Err(pyo3::exceptions::PyValueError::new_err(format!(
+            "initial_amplitudes length ({}) must match template rows ({})",
+            initial.len(),
+            open_shape[0]
+        )));
+    }
+
+    let templates: Vec<TwoArmBackgroundTemplate> = template_names
+        .into_iter()
+        .zip(open_template_array.outer_iter())
+        .zip(sample_template_array.outer_iter())
+        .map(|((name, open_beam), sample)| TwoArmBackgroundTemplate {
+            name,
+            open_beam: open_beam.to_vec(),
+            sample: sample.to_vec(),
+        })
+        .collect();
+    let observed_open = observed_open_counts.as_slice()?.to_vec();
+    let observed_sample = observed_sample_counts.as_slice()?.to_vec();
+    let signal = TwoArmCounts {
+        open_beam: open_neutron_signal.as_slice()?.to_vec(),
+        sample: sample_neutron_signal.as_slice()?.to_vec(),
+        open_beam_window_loss: open_window_loss,
+        sample_window_loss,
+    };
+    let config = PoissonConfig {
+        max_iter,
+        ..PoissonConfig::default()
+    };
+    let result = py.detach(move || {
+        rust_fit_background(
+            &observed_open,
+            &observed_sample,
+            signal,
+            open_exposure_scale,
+            sample_exposure_scale,
+            &templates,
+            &initial,
+            &config,
+        )
+    });
+    let result = result.map_err(|error| match error {
+        nereids_fitting::error::FittingError::EvaluationFailed(_) => {
+            pyo3::exceptions::PyRuntimeError::new_err(error.to_string())
+        }
+        _ => pyo3::exceptions::PyValueError::new_err(error.to_string()),
+    })?;
+
+    Ok(PyTwoArmBackgroundFitResult {
+        names: result.names,
+        amplitudes: result.amplitudes,
+        amplitude_uncertainties: result.amplitude_uncertainties,
+        amplitudes_identifiable: result.amplitudes_identifiable,
+        open_neutron_signal: result.prediction.open_beam.neutron_signal,
+        open_background: result.prediction.open_beam.background,
+        open_total: result.prediction.open_beam.total,
+        open_window_loss: result.prediction.open_beam.window_loss,
+        sample_neutron_signal: result.prediction.sample.neutron_signal,
+        sample_background: result.prediction.sample.background,
+        sample_total: result.prediction.sample.total,
+        sample_window_loss: result.prediction.sample.window_loss,
+        poisson_deviance: result.poisson_deviance,
+        deviance_per_dof: result.deviance_per_dof,
+        n_informative: result.n_informative,
+        converged: result.converged,
+        iterations: result.iterations,
+    })
+}
+
 /// Parse a Python-facing pixel-value policy string.
 ///
 /// Accepted values: ``"reject"`` (default — negative or non-finite pixels
@@ -4393,6 +4654,7 @@ fn nereids(m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_class::<PyResolutionCalibration>()?;
     m.add_class::<PySpatialResult>()?;
     m.add_class::<PyTraceDetectabilityReport>()?;
+    m.add_class::<PyTwoArmBackgroundFitResult>()?;
     m.add_function(wrap_pyfunction!(cross_sections, m)?)?;
     m.add_function(wrap_pyfunction!(forward_model, m)?)?;
     m.add_function(wrap_pyfunction!(calibrate_resolution, m)?)?;
@@ -4407,6 +4669,7 @@ fn nereids(m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_function(wrap_pyfunction!(load_resolution, m)?)?;
     m.add_function(wrap_pyfunction!(py_apply_resolution, m)?)?;
     m.add_function(wrap_pyfunction!(py_two_arm_count_response, m)?)?;
+    m.add_function(wrap_pyfunction!(py_fit_two_arm_background_templates, m)?)?;
     m.add_function(wrap_pyfunction!(load_tiff_stack, m)?)?;
     m.add_function(wrap_pyfunction!(load_tiff_folder, m)?)?;
     m.add_function(wrap_pyfunction!(read_tof_sidecar, m)?)?;

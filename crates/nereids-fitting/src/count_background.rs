@@ -59,7 +59,9 @@ pub struct TwoArmBackgroundFitResult {
     pub deviance_per_dof: f64,
     /// Concatenated bins that can discriminate between amplitude vectors.
     ///
-    /// See [`count_informative_bins`] for why this is not simply `2 * n_bins`.
+    /// This is not simply `2 * n_bins`: a bin whose observation, neutron
+    /// signal, and every template are all exactly zero yields identically zero
+    /// deviance for any amplitude vector, so it cannot be a degree of freedom.
     pub n_informative: usize,
     /// Whether the bounded optimizer converged.
     pub converged: bool,

@@ -876,6 +876,119 @@ class TestTwoArmCountBackground:
             rtol=1e-12,
         )
 
+    def test_wrong_template_shape_leaves_a_bad_count_fit(self, tmp_path):
+        """A template that does not describe the data must not absorb it."""
+        open_signal, sample_signal = self._two_arm_signal(tmp_path)
+        # Truth rises across the acquisition; the candidate is flat.
+        true_open = np.array([1.0, 2.0, 4.0]) * 1.0e4
+        true_sample = np.array([4.0, 2.0, 1.0]) * 1.0e4
+        observed_open = open_signal + true_open
+        observed_sample = sample_signal + true_sample
+
+        fit = nereids.fit_two_arm_background_templates(
+            observed_open,
+            observed_sample,
+            open_signal,
+            sample_signal,
+            1.0,
+            1.0,
+            ["wrong_flat_reference"],
+            np.ones((1, open_signal.size)),
+            np.ones((1, sample_signal.size)),
+            np.array([1.0e3]),
+        )
+
+        assert fit.converged
+        assert fit.deviance_per_dof > 5.0, (
+            f"wrong template silently accepted: D/dof = {fit.deviance_per_dof}"
+        )
+
+    def test_template_units_do_not_change_the_physical_fit(self, tmp_path):
+        """Amplitude units are the caller's; the physical fit must not move."""
+        open_signal, sample_signal = self._two_arm_signal(tmp_path)
+        true_background = 2.0e4
+        observed_open = open_signal + true_background
+        observed_sample = sample_signal + true_background
+
+        results = []
+        for unit in [1.0, 1.0e-8]:
+            fit = nereids.fit_two_arm_background_templates(
+                observed_open,
+                observed_sample,
+                open_signal,
+                sample_signal,
+                1.0,
+                1.0,
+                ["same_reference"],
+                np.full((1, open_signal.size), unit),
+                np.full((1, sample_signal.size), unit),
+                np.array([0.0]),
+            )
+            assert fit.converged
+            results.append(fit)
+
+        # Amplitude scales inversely with template units; the background
+        # counts they imply must be identical.
+        np.testing.assert_allclose(
+            np.asarray(results[0].open_background),
+            np.asarray(results[1].open_background),
+            rtol=1e-6,
+        )
+        assert results[0].amplitudes[0] == pytest.approx(true_background, rel=0.05)
+        assert results[1].amplitudes[0] == pytest.approx(
+            true_background / 1.0e-8, rel=0.05
+        )
+
+    def test_exposure_scale_is_not_fitted_as_false_background(self, tmp_path):
+        """A known run-normalization difference is not a background."""
+        open_signal, sample_signal = self._two_arm_signal(tmp_path)
+        # The sample arm ran twice as long. With that declared, nothing is
+        # left for a background to explain.
+        fit = nereids.fit_two_arm_background_templates(
+            open_signal,
+            2.0 * sample_signal,
+            open_signal,
+            sample_signal,
+            1.0,
+            2.0,
+            ["sample_only"],
+            np.zeros((1, open_signal.size)),
+            np.ones((1, sample_signal.size)),
+            np.array([10.0]),
+        )
+
+        assert fit.converged
+        assert fit.amplitudes[0] < 1.0e-6
+        assert fit.poisson_deviance == pytest.approx(0.0, abs=1e-6)
+
+    def test_dependent_components_are_marked_unidentifiable(self, tmp_path):
+        """Proportional shapes share one direction: amounts are not separable."""
+        open_signal, sample_signal = self._two_arm_signal(tmp_path)
+        observed_open = open_signal + 2.0e4
+        observed_sample = sample_signal + 2.0e4
+
+        fit = nereids.fit_two_arm_background_templates(
+            observed_open,
+            observed_sample,
+            open_signal,
+            sample_signal,
+            1.0,
+            1.0,
+            ["dark", "gamma"],
+            np.array([np.ones(3), 2.0 * np.ones(3)]),
+            np.array([np.ones(3), 2.0 * np.ones(3)]),
+            np.array([0.0, 5.0]),
+        )
+
+        assert fit.converged
+        assert not fit.amplitudes_identifiable
+        # Uncertainties are withheld rather than reported as if meaningful.
+        assert np.all(np.isnan(np.asarray(fit.amplitude_uncertainties)))
+        # The total background is still well determined.
+        np.testing.assert_allclose(
+            np.asarray(fit.open_background), 2.0e4, rtol=0.05
+        )
+
 
 class TestExactResolvedCountsRoute:
     """End-to-end anchor for the exact separate-arm count route (Wave-1 PR-2b).

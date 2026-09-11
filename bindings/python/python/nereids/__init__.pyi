@@ -1014,6 +1014,86 @@ def two_arm_count_response(
     """
     ...
 
+class TwoArmBackgroundFitResult:
+    """Fitted amplitudes for independently measured count backgrounds."""
+
+    @property
+    def names(self) -> list[str]: ...
+    @property
+    def amplitudes(self) -> NDArray[np.float64]: ...
+    @property
+    def amplitude_uncertainties(self) -> NDArray[np.float64]:
+        """One-sigma uncertainties, all-NaN when withheld.
+
+        Reported only for a converged fit whose templates are separately
+        determined; check ``amplitudes_identifiable`` before reading.
+        """
+        ...
+
+    @property
+    def amplitudes_identifiable(self) -> bool: ...
+    @property
+    def open_neutron_signal(self) -> NDArray[np.float64]: ...
+    @property
+    def open_background(self) -> NDArray[np.float64]: ...
+    @property
+    def open_total(self) -> NDArray[np.float64]: ...
+    @property
+    def open_window_loss(self) -> float: ...
+    @property
+    def sample_neutron_signal(self) -> NDArray[np.float64]: ...
+    @property
+    def sample_background(self) -> NDArray[np.float64]: ...
+    @property
+    def sample_total(self) -> NDArray[np.float64]: ...
+    @property
+    def sample_window_loss(self) -> float: ...
+    @property
+    def poisson_deviance(self) -> float: ...
+    @property
+    def deviance_per_dof(self) -> float: ...
+    @property
+    def n_informative(self) -> int: ...
+    @property
+    def converged(self) -> bool: ...
+    @property
+    def iterations(self) -> int: ...
+
+def fit_two_arm_background_templates(
+    observed_open_counts: NDArray[np.float64],
+    observed_sample_counts: NDArray[np.float64],
+    open_neutron_signal: NDArray[np.float64],
+    sample_neutron_signal: NDArray[np.float64],
+    open_exposure_scale: float,
+    sample_exposure_scale: float,
+    template_names: list[str],
+    open_background_templates: NDArray[np.float64],
+    sample_background_templates: NDArray[np.float64],
+    initial_amplitudes: NDArray[np.float64],
+    open_window_loss: float = 0.0,
+    sample_window_loss: float = 0.0,
+    max_iter: int = 200,
+) -> TwoArmBackgroundFitResult:
+    """Fit non-negative amplitudes for measured detector-bin backgrounds.
+
+    Each row of the two template matrices is one named component, already
+    expressed in the detector bins of the corresponding complete acquisition.
+    Only amplitudes are fitted: the neutron signal and every template shape
+    stay fixed, and the background is added after the instrument response
+    rather than broadened a second time.
+
+    ``open_exposure_scale`` and ``sample_exposure_scale`` convert the common
+    reference neutron signal into expected counts for each acquisition, so a
+    run-normalization factor cannot be absorbed as background.
+
+    Raises ``ValueError`` for malformed inputs (shape mismatch, negative or
+    non-finite counts, duplicate or empty template names, a template that is
+    zero in both arms, or too few informative bins to determine the
+    amplitudes) and ``RuntimeError`` when a fitted amplitude cannot be
+    represented in the supplied template units.
+    """
+    ...
+
 def load_tiff_stack(
     path: str,
     pixel_policy: str = "reject",
