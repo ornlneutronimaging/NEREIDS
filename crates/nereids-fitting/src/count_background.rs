@@ -42,8 +42,21 @@ pub struct TwoArmBackgroundFitResult {
     pub names: Vec<String>,
     /// Fitted non-negative template amplitudes.
     pub amplitudes: Vec<f64>,
-    /// Local one-sigma amplitude uncertainties, when available.
+    /// Local one-sigma amplitude uncertainties from the expected (Fisher)
+    /// information at the solution, when available.
+    ///
+    /// `None` when the fit did not converge, when the amplitudes are not
+    /// identifiable, or when the information matrix is numerically singular.
+    /// An individual entry is `NaN` when its variance is non-positive even
+    /// though the matrix inverted, so a reported number is never zero. For an
+    /// amplitude pinned on its zero bound (see `amplitude_at_bound`) the value
+    /// is the one-sided curvature scale of the objective at the boundary, not
+    /// a symmetric interval.
     pub amplitude_uncertainties: Option<Vec<f64>>,
+    /// Whether each fitted amplitude sits on its non-negativity bound with the
+    /// gradient still pushing it negative — a one-sided limit rather than an
+    /// interior estimate.
+    pub amplitude_at_bound: Vec<bool>,
     /// Whether every named template amplitude is separately determined.
     ///
     /// `false` means that at least two supplied shapes are linearly dependent:
@@ -57,11 +70,12 @@ pub struct TwoArmBackgroundFitResult {
     pub poisson_deviance: f64,
     /// Deviance divided by `n_informative - template_rank`.
     pub deviance_per_dof: f64,
-    /// Concatenated bins that can discriminate between amplitude vectors.
+    /// Concatenated bins that contribute to the deviance: the observation,
+    /// the neutron signal, or at least one template is nonzero there.
     ///
-    /// This is not simply `2 * n_bins`: a bin whose observation, neutron
-    /// signal, and every template are all exactly zero yields identically zero
-    /// deviance for any amplitude vector, so it cannot be a degree of freedom.
+    /// This is not simply `2 * n_bins`: a bin where all three are exactly
+    /// zero yields identically zero deviance for any amplitude vector, so it
+    /// cannot be a degree of freedom.
     pub n_informative: usize,
     /// Whether the bounded optimizer converged.
     pub converged: bool,
@@ -99,6 +113,7 @@ pub fn fit_two_arm_background_templates(
         templates,
         initial_amplitudes,
     )?;
+    validate_config(config)?;
     let neutron_signal =
         scale_neutron_signal(neutron_signal, open_exposure_scale, sample_exposure_scale)?;
     let n_bins = observed_open_counts.len();
@@ -142,10 +157,15 @@ pub fn fit_two_arm_background_templates(
         count_informative_bins(&observed_joined, &neutron_joined, &normalized_basis);
     let template_rank = background_template_rank(&normalized_basis);
     let amplitudes_identifiable = template_rank == normalized_basis.len();
-    if n_informative <= templates.len() {
+    // Degrees of freedom are `n_informative - template_rank`, so the guard
+    // keys on the rank the same way: a dependent template set spans fewer
+    // directions than it has names and is still fittable (its total is
+    // determined; its individual amplitudes are reported as unidentifiable).
+    if n_informative <= template_rank {
         return Err(FittingError::InvalidConfig(format!(
-            "{} background amplitudes cannot be fitted from {n_informative} informative count \
-             value(s) with positive degrees of freedom",
+            "{} background amplitudes spanning {template_rank} independent direction(s) cannot \
+             be fitted from {n_informative} informative count value(s) with positive degrees of \
+             freedom",
             templates.len(),
         )));
     }
@@ -214,6 +234,7 @@ pub fn fit_two_arm_background_templates(
             .collect(),
         amplitudes,
         amplitude_uncertainties,
+        amplitude_at_bound: fit.at_bound,
         amplitudes_identifiable,
         prediction,
         poisson_deviance,
@@ -281,6 +302,7 @@ fn scale_neutron_signal(
 struct LinearPoissonFit {
     amplitudes: Vec<f64>,
     uncertainties: Option<Vec<f64>>,
+    at_bound: Vec<bool>,
     converged: bool,
     iterations: usize,
 }
@@ -288,10 +310,22 @@ struct LinearPoissonFit {
 /// Minimize the exact count likelihood for a non-negative linear background.
 ///
 /// With fixed neutron counts `s`, fixed non-negative templates `B`, and
-/// non-negative amplitudes `a`, the expectation is `mu = s + B a`. Its
-/// Poisson objective is convex. Each coordinate therefore has one bounded
-/// minimum, found here from the analytical derivative. Repeated coordinate
-/// minimization converges to the joint constrained minimum.
+/// non-negative amplitudes `a`, the expectation is `mu = s + B a` and the
+/// Poisson objective is convex in `a`. Each iteration takes one joint
+/// Fisher-scoring step on the free amplitudes — those off the zero bound, or
+/// on it with the gradient pulling inward — projected back onto `a >= 0`
+/// with backtracking on the objective.
+///
+/// The joint step matters for the ordinary inputs: a flat detector-dark
+/// reference beside a slowly varying blocked-beam one are highly correlated,
+/// and a coordinate-at-a-time sweep zig-zags between them for tens of
+/// thousands of passes while the joint step resolves them in a handful. The
+/// safeguarded per-coordinate solve remains as the fallback whenever the
+/// reduced information matrix cannot be inverted (dependent templates, or
+/// counts so large that `1/mu` underflows the pivot floor) or the joint step
+/// fails to decrease the objective, so those cases still reach their
+/// constrained minimum. Convergence is the scale-free KKT test on the
+/// normalized gradient in every case.
 fn fit_non_negative_poisson_linear(
     observed: &[f64],
     neutron_signal: &[f64],
@@ -306,26 +340,57 @@ fn fit_non_negative_poisson_linear(
     }
     let mut converged = false;
     let mut iterations = 0;
+    let mut gradient = vec![0.0; basis.len()];
 
     for iteration in 0..config.max_iter {
-        for component in 0..basis.len() {
-            let base =
-                linear_prediction_without_component(neutron_signal, basis, &amplitudes, component)?;
-            amplitudes[component] =
-                coordinate_minimum(observed, &base, &basis[component], amplitudes[component])?;
+        let prediction = linear_prediction(neutron_signal, basis, &amplitudes)?;
+        poisson_gradient_into(observed, &prediction, basis, &mut gradient);
+        let free: Vec<usize> = (0..basis.len())
+            .filter(|&component| amplitudes[component] > 0.0 || gradient[component] < 0.0)
+            .collect();
+
+        let joint_step =
+            fisher_scoring_direction(&prediction, basis, &gradient, &free).and_then(|direction| {
+                projected_backtracking_step(
+                    observed,
+                    neutron_signal,
+                    basis,
+                    &amplitudes,
+                    &prediction,
+                    &direction,
+                )
+            });
+        match joint_step {
+            Some(next) => amplitudes = next,
+            None => {
+                for component in 0..basis.len() {
+                    let base = linear_prediction_without_component(
+                        neutron_signal,
+                        basis,
+                        &amplitudes,
+                        component,
+                    )?;
+                    amplitudes[component] = coordinate_minimum(
+                        observed,
+                        &base,
+                        &basis[component],
+                        amplitudes[component],
+                    )?;
+                }
+            }
         }
         iterations = iteration + 1;
 
         let prediction = linear_prediction(neutron_signal, basis, &amplitudes)?;
+        poisson_gradient_into(observed, &prediction, basis, &mut gradient);
         let maximum_violation = basis
             .iter()
             .enumerate()
             .map(|(component, template)| {
-                let gradient = poisson_coordinate_gradient(observed, &prediction, template);
                 let violation = if amplitudes[component] == 0.0 {
-                    (-gradient).max(0.0)
+                    (-gradient[component]).max(0.0)
                 } else {
-                    gradient.abs()
+                    gradient[component].abs()
                 };
                 violation / template.iter().sum::<f64>()
             })
@@ -337,17 +402,132 @@ fn fit_non_negative_poisson_linear(
     }
 
     let prediction = linear_prediction(neutron_signal, basis, &amplitudes)?;
+    poisson_gradient_into(observed, &prediction, basis, &mut gradient);
+    // An amplitude on its zero bound with the gradient still positive is held
+    // there by the constraint, not by the data: report it as a one-sided
+    // limit rather than an interior estimate.
+    let at_bound: Vec<bool> = amplitudes
+        .iter()
+        .zip(&gradient)
+        .map(|(&amplitude, &slope)| amplitude == 0.0 && slope > 0.0)
+        .collect();
     let uncertainties = if converged && config.compute_covariance {
-        poisson_linear_uncertainties(observed, &prediction, basis)
+        poisson_linear_uncertainties(&prediction, basis)
     } else {
         None
     };
     Ok(LinearPoissonFit {
         amplitudes,
         uncertainties,
+        at_bound,
         converged,
         iterations,
     })
+}
+
+fn poisson_gradient_into(
+    observed: &[f64],
+    prediction: &[f64],
+    basis: &[Vec<f64>],
+    gradient: &mut [f64],
+) {
+    for (slot, template) in gradient.iter_mut().zip(basis) {
+        *slot = poisson_coordinate_gradient(observed, prediction, template);
+    }
+}
+
+/// Expected (Fisher) information between two templates at the current
+/// expectation: `sum_i B_ij B_ik / mu_i` over bins with `mu_i > 0`.
+///
+/// Unlike the observed information `sum_i B_ij B_ik y_i / mu_i^2`, this does
+/// not vanish on zero-count bins, so the background-consistent-with-zero
+/// case keeps a finite, meaningful bound. It is the same convention as the
+/// joint-Poisson curvature elsewhere in this crate. Bins with `mu_i == 0`
+/// carry either no counts (no information) or an infinite deviance already.
+fn expected_information(prediction: &[f64], left: &[f64], right: &[f64]) -> f64 {
+    prediction
+        .iter()
+        .zip(left)
+        .zip(right)
+        .filter(|&((&expected, &l), &r)| expected > 0.0 && l != 0.0 && r != 0.0)
+        .map(|((&expected, &l), &r)| (l / expected) * r)
+        .sum()
+}
+
+/// Fisher-scoring direction on the free amplitudes, zero elsewhere.
+///
+/// `None` when the reduced information matrix cannot be inverted or the
+/// direction is not finite; the caller then falls back to a coordinate
+/// sweep, which is always well posed one amplitude at a time.
+fn fisher_scoring_direction(
+    prediction: &[f64],
+    basis: &[Vec<f64>],
+    gradient: &[f64],
+    free: &[usize],
+) -> Option<Vec<f64>> {
+    if free.is_empty() {
+        return None;
+    }
+    let mut information = FlatMatrix::zeros(free.len(), free.len());
+    for (row, &j) in free.iter().enumerate() {
+        for (column, &k) in free.iter().enumerate() {
+            *information.get_mut(row, column) =
+                expected_information(prediction, &basis[j], &basis[k]);
+        }
+    }
+    let inverse = invert_matrix(&information)?;
+    let mut direction = vec![0.0; basis.len()];
+    for (row, &j) in free.iter().enumerate() {
+        direction[j] = -(0..free.len())
+            .map(|column| inverse.get(row, column) * gradient[free[column]])
+            .sum::<f64>();
+    }
+    direction
+        .iter()
+        .all(|value| value.is_finite())
+        .then_some(direction)
+}
+
+/// Move along `direction`, projecting onto `a >= 0`, halving the step until
+/// the Poisson deviance strictly decreases. `None` when no step length does —
+/// including at the solution itself, where the fallback sweep then confirms
+/// the KKT conditions at negligible cost.
+fn projected_backtracking_step(
+    observed: &[f64],
+    neutron_signal: &[f64],
+    basis: &[Vec<f64>],
+    amplitudes: &[f64],
+    prediction: &[f64],
+    direction: &[f64],
+) -> Option<Vec<f64>> {
+    let current = poisson_deviance(observed, prediction);
+    let mut step = 1.0;
+    for _ in 0..40 {
+        let trial: Vec<f64> = amplitudes
+            .iter()
+            .zip(direction)
+            .map(|(&amplitude, &delta)| (amplitude + step * delta).max(0.0))
+            .collect();
+        if let Ok(trial_prediction) = linear_prediction(neutron_signal, basis, &trial)
+            && poisson_deviance(observed, &trial_prediction) < current
+        {
+            return Some(trial);
+        }
+        step *= 0.5;
+    }
+    None
+}
+
+fn validate_config(config: &PoissonConfig) -> Result<(), FittingError> {
+    // A non-finite tolerance would accept the first iteration unconditionally
+    // and report convergence for an arbitrary amplitude vector.
+    if !config.tol_param.is_finite() || config.tol_param <= 0.0 {
+        return Err(FittingError::InvalidConfig(format!(
+            "tol_param must be finite and > 0, got {}",
+            config.tol_param
+        )));
+    }
+    Ok(())
 }
 
 fn coordinate_minimum(
@@ -535,28 +715,16 @@ fn weighted_count_ratio(weight: f64, count: f64, expected: f64) -> f64 {
     }
 }
 
-fn poisson_linear_uncertainties(
-    observed: &[f64],
-    prediction: &[f64],
-    basis: &[Vec<f64>],
-) -> Option<Vec<f64>> {
+/// One-sigma amplitude uncertainties from the inverse expected information.
+///
+/// `None` when the matrix is singular. A diagonal entry that inverts to a
+/// non-positive variance is reported as `NaN`, never as zero.
+fn poisson_linear_uncertainties(prediction: &[f64], basis: &[Vec<f64>]) -> Option<Vec<f64>> {
     let mut fisher = FlatMatrix::zeros(basis.len(), basis.len());
     for row in 0..basis.len() {
         for column in 0..basis.len() {
-            *fisher.get_mut(row, column) = observed
-                .iter()
-                .zip(prediction)
-                .enumerate()
-                .map(|(bin, (&count, &expected))| {
-                    let left = basis[row][bin];
-                    let right = basis[column][bin];
-                    if left == 0.0 || right == 0.0 || count == 0.0 {
-                        0.0
-                    } else {
-                        (left / expected) * weighted_count_ratio(right, count, expected)
-                    }
-                })
-                .sum();
+            *fisher.get_mut(row, column) =
+                expected_information(prediction, &basis[row], &basis[column]);
         }
     }
     invert_matrix(&fisher).map(|covariance| {
@@ -703,6 +871,22 @@ fn validate_fit_inputs(
             )));
         }
     }
+    // Validated here, before any optimization, so a bad value is reported as
+    // malformed input (InvalidConfig) rather than surfacing from the physics
+    // layer after a full fit as an evaluation failure.
+    for (name, value) in [
+        (
+            "open_beam_window_loss",
+            neutron_signal.open_beam_window_loss,
+        ),
+        ("sample_window_loss", neutron_signal.sample_window_loss),
+    ] {
+        if !value.is_finite() || value < 0.0 {
+            return Err(FittingError::InvalidConfig(format!(
+                "{name} must be finite and >= 0 expected counts, got {value}"
+            )));
+        }
+    }
 
     let mut names = HashSet::with_capacity(templates.len());
     for (index, (template, &initial)) in templates.iter().zip(initial_amplitudes).enumerate() {
@@ -781,7 +965,10 @@ fn poisson_deviance(observed: &[f64], predicted: &[f64]) -> f64 {
                         * (0.5
                             + r * (-1.0 / 6.0
                                 + r * (1.0 / 12.0 + r * (-1.0 / 20.0 + r * (1.0 / 30.0)))));
-                    2.0 * model * h
+                    // The small factor is applied first: `(2 * model) * h`
+                    // overflows for `model > MAX / 2` even when the exact
+                    // term is representable.
+                    2.0 * (model * h)
                 } else {
                     // Away from equality the direct form does not suffer
                     // cancellation.  Subtracting logarithms also avoids an
@@ -815,6 +1002,17 @@ mod tests {
         let deviance = poisson_deviance(&observed, &predicted);
         assert!(deviance.is_finite());
         assert!(deviance >= 0.0, "deviance = {deviance}");
+    }
+
+    /// `(2 * model) * h` overflows for `model > MAX / 2` although the exact
+    /// term `2 * model * h` is representable; the factor order matters.
+    #[test]
+    fn near_equality_extreme_counts_keep_finite_deviance() {
+        let deviance = poisson_deviance(&[1.0001e308], &[1.0e308]);
+        assert!(
+            deviance.is_finite() && deviance > 0.0,
+            "deviance = {deviance}"
+        );
     }
 
     #[test]

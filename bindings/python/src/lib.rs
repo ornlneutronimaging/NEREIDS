@@ -2486,6 +2486,7 @@ struct PyTwoArmBackgroundFitResult {
     names: Vec<String>,
     amplitudes: Vec<f64>,
     amplitude_uncertainties: Option<Vec<f64>>,
+    amplitude_at_bound: Vec<bool>,
     amplitudes_identifiable: bool,
     open_neutron_signal: Vec<f64>,
     open_background: Vec<f64>,
@@ -2514,10 +2515,15 @@ impl PyTwoArmBackgroundFitResult {
         PyArray1::from_vec(py, self.amplitudes.clone())
     }
 
-    /// One-sigma amplitude uncertainties, or all-NaN when they are withheld.
+    /// One-sigma amplitude uncertainties from the expected (Fisher)
+    /// information, or all-NaN when withheld.
     ///
-    /// Uncertainties are reported only for a converged fit whose templates are
-    /// separately determined; check `amplitudes_identifiable` before reading.
+    /// Withheld when the fit did not converge, when the amplitudes are not
+    /// separately determined, or when the information matrix is singular; an
+    /// individual entry is NaN when its variance is non-positive even though
+    /// the matrix inverted. For an amplitude on its zero bound (see
+    /// `amplitude_at_bound`) the value is a one-sided curvature scale, not a
+    /// symmetric interval.
     #[getter]
     fn amplitude_uncertainties<'py>(&self, py: Python<'py>) -> Bound<'py, PyArray1<f64>> {
         PyArray1::from_vec(
@@ -2526,6 +2532,14 @@ impl PyTwoArmBackgroundFitResult {
                 .clone()
                 .unwrap_or_else(|| vec![f64::NAN; self.amplitudes.len()]),
         )
+    }
+
+    /// Whether each amplitude is held at zero by its non-negativity bound
+    /// with the gradient still pushing it negative — a one-sided limit rather
+    /// than an interior estimate.
+    #[getter]
+    fn amplitude_at_bound(&self) -> Vec<bool> {
+        self.amplitude_at_bound.clone()
     }
 
     #[getter]
@@ -2630,6 +2644,7 @@ impl PyTwoArmBackgroundFitResult {
     open_window_loss = 0.0,
     sample_window_loss = 0.0,
     max_iter = 200,
+    tol = 1.0e-8,
 ))]
 #[allow(clippy::too_many_arguments)]
 fn py_fit_two_arm_background_templates<'py>(
@@ -2647,6 +2662,7 @@ fn py_fit_two_arm_background_templates<'py>(
     open_window_loss: f64,
     sample_window_loss: f64,
     max_iter: usize,
+    tol: f64,
 ) -> PyResult<PyTwoArmBackgroundFitResult> {
     use nereids_fitting::count_background::{
         TwoArmBackgroundTemplate, fit_two_arm_background_templates as rust_fit_background,
@@ -2699,6 +2715,7 @@ fn py_fit_two_arm_background_templates<'py>(
     };
     let config = PoissonConfig {
         max_iter,
+        tol_param: tol,
         ..PoissonConfig::default()
     };
     let result = py.detach(move || {
@@ -2724,6 +2741,7 @@ fn py_fit_two_arm_background_templates<'py>(
         names: result.names,
         amplitudes: result.amplitudes,
         amplitude_uncertainties: result.amplitude_uncertainties,
+        amplitude_at_bound: result.amplitude_at_bound,
         amplitudes_identifiable: result.amplitudes_identifiable,
         open_neutron_signal: result.prediction.open_beam.neutron_signal,
         open_background: result.prediction.open_beam.background,

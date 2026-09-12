@@ -989,6 +989,95 @@ class TestTwoArmCountBackground:
             np.asarray(fit.open_background), 2.0e4, rtol=0.05
         )
 
+    def test_correlated_templates_converge_at_default_budget(self, tmp_path):
+        """Flat dark + slowly varying blocked beam: the intended inputs.
+
+        These shapes are highly correlated, which is where a coordinate
+        sweep stalls; the joint step must resolve them within the default
+        iteration budget and recover both amplitudes.
+        """
+        open_signal, sample_signal = self._two_arm_signal(tmp_path)
+        n = open_signal.size
+        dark = np.ones(n)
+        blocked = 1.0 + 0.02 * np.arange(n) / n
+        truth = np.array([2.0e4, 3.0e4])
+        observed_open = open_signal + truth[0] * dark + truth[1] * blocked
+        observed_sample = sample_signal + truth[0] * dark + truth[1] * blocked
+
+        fit = nereids.fit_two_arm_background_templates(
+            observed_open,
+            observed_sample,
+            open_signal,
+            sample_signal,
+            1.0,
+            1.0,
+            ["dark", "blocked_beam"],
+            np.array([dark, blocked]),
+            np.array([dark, blocked]),
+            np.array([1.0, 1.0]),
+        )
+
+        assert fit.converged, f"iterations={fit.iterations}"
+        assert fit.amplitudes_identifiable
+        np.testing.assert_allclose(np.asarray(fit.amplitudes), truth, rtol=1e-6)
+        assert np.all(np.isfinite(np.asarray(fit.amplitude_uncertainties)))
+        assert fit.amplitude_at_bound == [False, False]
+
+    def test_bound_held_amplitude_is_flagged(self, tmp_path):
+        """A template the data reject is pinned at zero, and says so."""
+        open_signal, sample_signal = self._two_arm_signal(tmp_path)
+        # Observations below the neutron-only expectation: any positive
+        # background makes the fit worse.
+        fit = nereids.fit_two_arm_background_templates(
+            0.9 * open_signal,
+            0.9 * sample_signal,
+            open_signal,
+            sample_signal,
+            1.0,
+            1.0,
+            ["unwanted"],
+            np.ones((1, open_signal.size)),
+            np.ones((1, sample_signal.size)),
+            np.array([100.0]),
+        )
+        assert fit.converged
+        assert fit.amplitudes[0] == 0.0
+        assert fit.amplitude_at_bound == [True]
+
+    def test_invalid_tolerance_is_a_value_error(self, tmp_path):
+        open_signal, sample_signal = self._two_arm_signal(tmp_path)
+        with pytest.raises(ValueError, match="tol_param"):
+            nereids.fit_two_arm_background_templates(
+                open_signal,
+                sample_signal,
+                open_signal,
+                sample_signal,
+                1.0,
+                1.0,
+                ["dark"],
+                np.ones((1, open_signal.size)),
+                np.ones((1, sample_signal.size)),
+                np.array([0.0]),
+                tol=float("inf"),
+            )
+
+    def test_negative_window_loss_is_a_value_error_not_runtime(self, tmp_path):
+        open_signal, sample_signal = self._two_arm_signal(tmp_path)
+        with pytest.raises(ValueError, match="window_loss"):
+            nereids.fit_two_arm_background_templates(
+                open_signal,
+                sample_signal,
+                open_signal,
+                sample_signal,
+                1.0,
+                1.0,
+                ["dark"],
+                np.ones((1, open_signal.size)),
+                np.ones((1, sample_signal.size)),
+                np.array([0.0]),
+                sample_window_loss=-1.0,
+            )
+
 
 class TestExactResolvedCountsRoute:
     """End-to-end anchor for the exact separate-arm count route (Wave-1 PR-2b).

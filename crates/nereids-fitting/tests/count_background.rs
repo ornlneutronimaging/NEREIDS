@@ -327,11 +327,14 @@ fn finite_ratio_of_large_count_sums_does_not_overflow() {
     assert_eq!(result.poisson_deviance, 0.0);
 }
 
-#[test]
-fn unresolved_background_separation_never_reports_zero_uncertainty() {
-    let n_bins = 3;
+/// Two templates that differ only slightly in shape, observed with the
+/// amplitudes they were generated from. Fit from a start far from the truth.
+fn nearly_dependent_fixture(
+    difference: f64,
+    n_bins: usize,
+) -> (Observed, TwoArmCounts, Vec<TwoArmBackgroundTemplate>) {
     let signal = signal(vec![100.0; n_bins], vec![100.0; n_bins]);
-    let nearly_same = 1.0e-11;
+    let ramp = |i: usize| (i as f64 - (n_bins as f64 - 1.0) / 2.0) / (n_bins as f64);
     let first = TwoArmBackgroundTemplate {
         name: "first".into(),
         open_beam: vec![1.0; n_bins],
@@ -339,8 +342,8 @@ fn unresolved_background_separation_never_reports_zero_uncertainty() {
     };
     let second = TwoArmBackgroundTemplate {
         name: "nearly_the_same".into(),
-        open_beam: vec![1.0 - nearly_same, 1.0, 1.0 + nearly_same],
-        sample: vec![1.0 + nearly_same, 1.0, 1.0 - nearly_same],
+        open_beam: (0..n_bins).map(|i| 1.0 + difference * ramp(i)).collect(),
+        sample: (0..n_bins).map(|i| 1.0 - difference * ramp(i)).collect(),
     };
     let templates = vec![first, second];
     let mut observed = Observed {
@@ -361,6 +364,15 @@ fn unresolved_background_separation_never_reports_zero_uncertainty() {
     {
         *count += 10.0 * a + 20.0 * b;
     }
+    (observed, signal, templates)
+}
+
+/// Shapes that are close but resolvable must yield reported uncertainties that
+/// are present, finite and strictly positive — asserted unconditionally, so
+/// the test cannot pass by the uncertainties simply being absent.
+#[test]
+fn nearly_dependent_but_resolvable_templates_report_finite_positive_uncertainties() {
+    let (observed, signal, templates) = nearly_dependent_fixture(1.0e-3, 9);
 
     let result = fit_two_arm_background_templates(
         &observed.open_beam,
@@ -369,16 +381,143 @@ fn unresolved_background_separation_never_reports_zero_uncertainty() {
         1.0,
         1.0,
         &templates,
-        &[10.0, 20.0],
+        &[1.0, 1.0],
+        &PoissonConfig::default(),
+    )
+    .expect("resolvable templates fit");
+
+    assert!(result.converged, "iterations = {}", result.iterations);
+    assert!(result.amplitudes_identifiable);
+    assert!(
+        (result.amplitudes[0] - 10.0).abs() < 1.0e-6,
+        "{:?}",
+        result.amplitudes
+    );
+    assert!(
+        (result.amplitudes[1] - 20.0).abs() < 1.0e-6,
+        "{:?}",
+        result.amplitudes
+    );
+    let uncertainties = result
+        .amplitude_uncertainties
+        .expect("an invertible information matrix yields uncertainties");
+    assert!(
+        uncertainties
+            .iter()
+            .all(|value| value.is_finite() && *value > 0.0),
+        "{uncertainties:?}"
+    );
+}
+
+/// Shapes distinct at floating-point resolution but with a numerically
+/// singular information matrix: the amplitudes are nominally identifiable, yet
+/// no uncertainty can be reported. The documented outcome is withheld (NaN),
+/// never a misleading zero.
+#[test]
+fn numerically_singular_information_withholds_uncertainties_rather_than_zero() {
+    let (observed, signal, templates) = nearly_dependent_fixture(1.0e-11, 3);
+
+    let result = fit_two_arm_background_templates(
+        &observed.open_beam,
+        &observed.sample,
+        signal,
+        1.0,
+        1.0,
+        &templates,
+        &[1.0, 1.0],
         &PoissonConfig::default(),
     )
     .expect("nearly dependent templates still have a prediction");
 
     assert!(result.converged);
     assert!(result.amplitudes_identifiable);
-    if let Some(uncertainties) = result.amplitude_uncertainties {
-        assert!(uncertainties.iter().all(|value| *value != 0.0));
+    match result.amplitude_uncertainties {
+        None => {}
+        Some(uncertainties) => assert!(
+            uncertainties.iter().all(|value| value.is_nan()),
+            "a singular information matrix must not yield a numeric sigma: {uncertainties:?}"
+        ),
     }
+}
+
+/// The intended use: a flat detector-dark template plus a slowly varying
+/// blocked-beam template. The two are highly correlated, which is precisely
+/// where a coordinate-at-a-time sweep zig-zags for tens of thousands of
+/// iterations. The fit must converge within the default budget and recover
+/// both amplitudes.
+#[test]
+fn correlated_dark_and_sloped_blocked_beam_converge_at_default_budget() {
+    let n_bins = 400;
+    let neutron: Vec<f64> = (0..n_bins)
+        .map(|i| 5000.0 * (-(i as f64) / 160.0).exp())
+        .collect();
+    let signal = signal(neutron.clone(), neutron.iter().map(|v| 0.6 * v).collect());
+    let dark = TwoArmBackgroundTemplate {
+        name: "dark".into(),
+        open_beam: vec![1.0; n_bins],
+        sample: vec![1.0; n_bins],
+    };
+    let blocked = TwoArmBackgroundTemplate {
+        name: "blocked_beam".into(),
+        open_beam: (0..n_bins)
+            .map(|i| 1.0 + 0.02 * i as f64 / n_bins as f64)
+            .collect(),
+        sample: (0..n_bins)
+            .map(|i| 1.0 + 0.02 * i as f64 / n_bins as f64)
+            .collect(),
+    };
+    let truth = [200.0, 300.0];
+    let templates = vec![dark, blocked];
+    let mut observed = Observed {
+        open_beam: signal.open_beam.clone(),
+        sample: signal.sample.clone(),
+    };
+    for (&amplitude, template) in truth.iter().zip(&templates) {
+        for (count, &basis) in observed.open_beam.iter_mut().zip(&template.open_beam) {
+            *count += amplitude * basis;
+        }
+        for (count, &basis) in observed.sample.iter_mut().zip(&template.sample) {
+            *count += amplitude * basis;
+        }
+    }
+
+    let result = fit_two_arm_background_templates(
+        &observed.open_beam,
+        &observed.sample,
+        signal,
+        1.0,
+        1.0,
+        &templates,
+        &[1.0, 1.0],
+        &PoissonConfig::default(),
+    )
+    .expect("correlated templates fit");
+
+    assert!(
+        result.converged,
+        "not converged after {} iterations: amplitudes {:?}",
+        result.iterations, result.amplitudes
+    );
+    assert!(
+        result.iterations < 50,
+        "a joint step should converge in a handful of iterations, took {}",
+        result.iterations
+    );
+    for (&actual, &expected) in result.amplitudes.iter().zip(&truth) {
+        assert!(
+            (actual / expected - 1.0).abs() < 1.0e-6,
+            "{:?}",
+            result.amplitudes
+        );
+    }
+    let uncertainties = result
+        .amplitude_uncertainties
+        .expect("converged and identifiable");
+    assert!(
+        uncertainties
+            .iter()
+            .all(|value| value.is_finite() && *value > 0.0)
+    );
 }
 
 #[test]
@@ -524,6 +663,163 @@ fn dead_bins_do_not_deflate_the_reported_goodness_of_fit() {
     assert_eq!(compact.amplitudes[0], padded.amplitudes[0]);
     assert_eq!(compact.poisson_deviance, padded.poisson_deviance);
     assert_eq!(compact.deviance_per_dof, padded.deviance_per_dof);
+}
+
+/// A non-finite tolerance would accept the first iteration unconditionally
+/// and certify an arbitrary amplitude vector as converged.
+#[test]
+fn non_finite_tolerance_is_rejected_before_fitting() {
+    let template = shaped_template("blocked_beam");
+    let signal = signals();
+    let observed = synthetic_observation(signal.clone(), &template, 25.0);
+    for bad in [f64::INFINITY, f64::NAN, 0.0, -1.0e-8] {
+        let config = PoissonConfig {
+            tol_param: bad,
+            ..PoissonConfig::default()
+        };
+        let error = fit_two_arm_background_templates(
+            &observed.open_beam,
+            &observed.sample,
+            signal.clone(),
+            1.0,
+            1.0,
+            std::slice::from_ref(&template),
+            &[1.0],
+            &config,
+        )
+        .expect_err("tolerance must be validated");
+        assert!(
+            matches!(
+                error,
+                nereids_fitting::error::FittingError::InvalidConfig(_)
+            ),
+            "{error:?}"
+        );
+        assert!(error.to_string().contains("tol_param"), "{error}");
+    }
+}
+
+/// A negative or non-finite window loss is malformed input and must be
+/// reported as such before any optimization runs, not surface afterwards as a
+/// model-evaluation failure.
+#[test]
+fn bad_window_loss_is_rejected_as_invalid_input_before_fitting() {
+    let template = shaped_template("blocked_beam");
+    let observed = synthetic_observation(signals(), &template, 25.0);
+    for bad in [-1.0, f64::NAN, f64::INFINITY] {
+        let mut signal = signals();
+        signal.sample_window_loss = bad;
+        let error = fit_two_arm_background_templates(
+            &observed.open_beam,
+            &observed.sample,
+            signal,
+            1.0,
+            1.0,
+            std::slice::from_ref(&template),
+            &[1.0],
+            &PoissonConfig::default(),
+        )
+        .expect_err("bad window loss must be rejected");
+        assert!(
+            matches!(
+                error,
+                nereids_fitting::error::FittingError::InvalidConfig(_)
+            ),
+            "expected InvalidConfig for {bad}, got {error:?}"
+        );
+        assert!(error.to_string().contains("window_loss"), "{error}");
+    }
+}
+
+/// Dependent templates span fewer directions than they have names. With two
+/// informative bins and three proportional templates the raw count would
+/// reject the fit, but the rank is one and the degrees of freedom are
+/// positive: the total is determined and must be fitted, with the individual
+/// amplitudes reported as unidentifiable.
+#[test]
+fn dependent_templates_with_positive_rank_dof_are_fitted_not_rejected() {
+    let templates: Vec<TwoArmBackgroundTemplate> = [1.0, 2.0, 3.0]
+        .iter()
+        .enumerate()
+        .map(|(index, &scale)| TwoArmBackgroundTemplate {
+            name: format!("proportional_{index}"),
+            open_beam: vec![scale],
+            sample: vec![scale],
+        })
+        .collect();
+
+    let result = fit_two_arm_background_templates(
+        &[30.0],
+        &[30.0],
+        signal(vec![10.0], vec![10.0]),
+        1.0,
+        1.0,
+        &templates,
+        &[0.0, 0.0, 0.0],
+        &PoissonConfig::default(),
+    )
+    .expect("rank-one templates with two informative bins have one degree of freedom");
+
+    assert!(result.converged);
+    assert!(!result.amplitudes_identifiable);
+    assert!(result.amplitude_uncertainties.is_none());
+    assert_eq!(result.n_informative, 2);
+    assert!((result.prediction.open_beam.total[0] - 30.0).abs() < 1.0e-9);
+    assert!(result.poisson_deviance < 1.0e-18);
+}
+
+/// When the unconstrained optimum is negative the amplitude is held at zero by
+/// the bound, not chosen by the data. The result must say so, and the
+/// reported sigma is then a one-sided curvature scale, not an interval.
+#[test]
+fn amplitude_held_on_the_zero_bound_is_flagged() {
+    let template = TwoArmBackgroundTemplate {
+        name: "over_predicted".into(),
+        open_beam: vec![1.0; 4],
+        sample: vec![1.0; 4],
+    };
+
+    // The neutron signal alone already over-predicts every bin, so any
+    // positive background makes the fit worse.
+    let result = fit_two_arm_background_templates(
+        &[90.0; 4],
+        &[90.0; 4],
+        signal(vec![100.0; 4], vec![100.0; 4]),
+        1.0,
+        1.0,
+        &[template],
+        &[5.0],
+        &PoissonConfig::default(),
+    )
+    .expect("bound-active fit");
+
+    assert!(result.converged);
+    assert_eq!(result.amplitudes, vec![0.0]);
+    assert_eq!(result.amplitude_at_bound, vec![true]);
+    let uncertainties = result
+        .amplitude_uncertainties
+        .expect("expected information is finite on the boundary");
+    assert!(uncertainties[0].is_finite() && uncertainties[0] > 0.0);
+}
+
+/// An interior solution is not on its bound.
+#[test]
+fn interior_amplitude_is_not_flagged_as_bound() {
+    let template = shaped_template("blocked_beam");
+    let signal = signals();
+    let observed = synthetic_observation(signal.clone(), &template, 25.0);
+    let result = fit_two_arm_background_templates(
+        &observed.open_beam,
+        &observed.sample,
+        signal,
+        1.0,
+        1.0,
+        std::slice::from_ref(&template),
+        &[1.0],
+        &PoissonConfig::default(),
+    )
+    .expect("interior fit");
+    assert_eq!(result.amplitude_at_bound, vec![false]);
 }
 
 /// Degrees of freedom must stay positive after dead bins are excluded, and the

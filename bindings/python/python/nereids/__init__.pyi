@@ -1023,10 +1023,23 @@ class TwoArmBackgroundFitResult:
     def amplitudes(self) -> NDArray[np.float64]: ...
     @property
     def amplitude_uncertainties(self) -> NDArray[np.float64]:
-        """One-sigma uncertainties, all-NaN when withheld.
+        """One-sigma uncertainties from the expected (Fisher) information.
 
-        Reported only for a converged fit whose templates are separately
-        determined; check ``amplitudes_identifiable`` before reading.
+        All-NaN when withheld: the fit did not converge, the amplitudes are
+        not separately determined, or the information matrix is singular.
+        An individual entry is NaN when its variance is non-positive even
+        though the matrix inverted, so a reported number is never zero. For
+        an amplitude on its zero bound (see ``amplitude_at_bound``) the
+        value is a one-sided curvature scale, not a symmetric interval.
+        """
+        ...
+
+    @property
+    def amplitude_at_bound(self) -> list[bool]:
+        """Whether each amplitude is held at zero by its non-negativity bound.
+
+        True means the data pull the amplitude negative and the constraint
+        holds it at zero: a one-sided limit rather than an interior estimate.
         """
         ...
 
@@ -1053,7 +1066,16 @@ class TwoArmBackgroundFitResult:
     @property
     def deviance_per_dof(self) -> float: ...
     @property
-    def n_informative(self) -> int: ...
+    def n_informative(self) -> int:
+        """Bins that contribute to the deviance.
+
+        A concatenated open/sample bin counts when its observation, its
+        neutron signal, or at least one template is nonzero. Bins where all
+        three are exactly zero yield identically zero deviance for any
+        amplitude vector and are excluded from the degrees of freedom behind
+        ``deviance_per_dof``.
+        """
+        ...
     @property
     def converged(self) -> bool: ...
     @property
@@ -1073,6 +1095,7 @@ def fit_two_arm_background_templates(
     open_window_loss: float = 0.0,
     sample_window_loss: float = 0.0,
     max_iter: int = 200,
+    tol: float = 1e-8,
 ) -> TwoArmBackgroundFitResult:
     """Fit non-negative amplitudes for measured detector-bin backgrounds.
 
@@ -1086,11 +1109,17 @@ def fit_two_arm_background_templates(
     reference neutron signal into expected counts for each acquisition, so a
     run-normalization factor cannot be absorbed as background.
 
-    Raises ``ValueError`` for malformed inputs (shape mismatch, negative or
-    non-finite counts, duplicate or empty template names, a template that is
-    zero in both arms, or too few informative bins to determine the
-    amplitudes) and ``RuntimeError`` when a fitted amplitude cannot be
-    represented in the supplied template units.
+    ``max_iter`` bounds the joint Fisher-scoring iterations and ``tol`` is
+    the scale-free KKT gradient tolerance that declares convergence; both
+    are validated (``tol`` must be finite and positive).
+
+    Raises ``ValueError`` for malformed inputs: shape mismatch, negative or
+    non-finite counts, window losses, exposure scales or tolerance,
+    duplicate or empty template names, a template that is zero in both
+    arms, or too few informative bins for the template rank. Raises
+    ``RuntimeError`` for model-evaluation failures during the fit, such as
+    a fitted amplitude that cannot be represented in the supplied template
+    units or an expectation that overflows.
     """
     ...
 
