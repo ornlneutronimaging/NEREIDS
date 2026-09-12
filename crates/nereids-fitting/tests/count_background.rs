@@ -799,7 +799,242 @@ fn amplitude_held_on_the_zero_bound_is_flagged() {
     let uncertainties = result
         .amplitude_uncertainties
         .expect("expected information is finite on the boundary");
-    assert!(uncertainties[0].is_finite() && uncertainties[0] > 0.0);
+    // Value-level oracle that discriminates the information convention:
+    // eight bins with mu = 100 and unit weight give expected information
+    // 8/100, so sigma = sqrt(12.5). The observed-information form would
+    // give sqrt(100^2 / (8 * 90)) = 3.7268 instead.
+    assert!(
+        (uncertainties[0] - 12.5_f64.sqrt()).abs() < 1.0e-9,
+        "sigma = {}",
+        uncertainties[0]
+    );
+}
+
+/// Independent oracle with `y != mu` on an interior two-template solution:
+/// the reported sigmas must be the square roots of the diagonal of the
+/// inverse expected-information matrix, computed here by hand from the
+/// fitted expectation and the raw templates.
+#[test]
+fn interior_two_template_sigmas_match_the_inverse_information_diagonal() {
+    let ramp = vec![0.25, 0.5, 0.75, 1.0];
+    let templates = vec![
+        TwoArmBackgroundTemplate {
+            name: "dark".into(),
+            open_beam: vec![1.0; 4],
+            sample: vec![1.0; 4],
+        },
+        TwoArmBackgroundTemplate {
+            name: "ramp".into(),
+            open_beam: ramp.clone(),
+            sample: ramp.clone(),
+        },
+    ];
+    let result = fit_two_arm_background_templates(
+        &[130.0, 110.0, 120.0, 140.0],
+        &[125.0, 135.0, 115.0, 145.0],
+        signal(vec![100.0; 4], vec![100.0; 4]),
+        1.0,
+        1.0,
+        &templates,
+        &[1.0, 1.0],
+        &PoissonConfig::default(),
+    )
+    .expect("interior fit");
+    assert!(result.converged);
+    assert_eq!(
+        result.amplitude_at_bound,
+        vec![false, false],
+        "{:?}",
+        result.amplitudes
+    );
+
+    let mu: Vec<f64> = result
+        .prediction
+        .open_beam
+        .total
+        .iter()
+        .chain(&result.prediction.sample.total)
+        .copied()
+        .collect();
+    let joined = |t: &TwoArmBackgroundTemplate| -> Vec<f64> {
+        t.open_beam.iter().chain(&t.sample).copied().collect()
+    };
+    let (b1, b2) = (joined(&templates[0]), joined(&templates[1]));
+    let info = |x: &[f64], y: &[f64]| -> f64 {
+        x.iter().zip(y).zip(&mu).map(|((a, b), m)| a * b / m).sum()
+    };
+    let (i11, i12, i22) = (info(&b1, &b1), info(&b1, &b2), info(&b2, &b2));
+    let det = i11 * i22 - i12 * i12;
+    let expected = [(i22 / det).sqrt(), (i11 / det).sqrt()];
+
+    let sigma = result
+        .amplitude_uncertainties
+        .expect("interior, identifiable");
+    for (got, want) in sigma.iter().zip(&expected) {
+        assert!(
+            (got / want - 1.0).abs() < 1.0e-9,
+            "sigma {sigma:?} vs {expected:?}"
+        );
+    }
+}
+
+/// The module's stated ordinary inputs — flat dark plus slowly varying
+/// blocked beam — with the dark amplitude pushed onto its bound. The free
+/// amplitude is determined to a fraction of a percent; its sigma must be the
+/// reduced-set value, not the marginal over the direction the constraint
+/// removed (which is ~200x larger for this near-collinear pair).
+#[test]
+fn free_amplitude_sigma_is_conditioned_on_the_pinned_partner() {
+    let n_bins = 400;
+    let neutron: Vec<f64> = (0..n_bins)
+        .map(|i| 5000.0 * (-(i as f64) / 160.0).exp())
+        .collect();
+    let dark = vec![1.0; n_bins];
+    let blocked: Vec<f64> = (0..n_bins)
+        .map(|i| 1.0 + 0.02 * i as f64 / n_bins as f64)
+        .collect();
+    let observed: Vec<f64> = (0..n_bins)
+        .map(|i| neutron[i] + 300.0 * blocked[i] - 50.0 * dark[i])
+        .collect();
+    let templates = vec![
+        TwoArmBackgroundTemplate {
+            name: "dark".into(),
+            open_beam: dark.clone(),
+            sample: dark.clone(),
+        },
+        TwoArmBackgroundTemplate {
+            name: "blocked_beam".into(),
+            open_beam: blocked.clone(),
+            sample: blocked.clone(),
+        },
+    ];
+
+    let result = fit_two_arm_background_templates(
+        &observed,
+        &observed,
+        signal(neutron.clone(), neutron.clone()),
+        1.0,
+        1.0,
+        &templates,
+        &[10.0, 10.0],
+        &PoissonConfig::default(),
+    )
+    .expect("bound-active correlated fit");
+    assert!(result.converged, "iterations {}", result.iterations);
+    assert_eq!(
+        result.amplitude_at_bound,
+        vec![true, false],
+        "{:?}",
+        result.amplitudes
+    );
+    assert_eq!(result.amplitudes[0], 0.0);
+
+    let mu: Vec<f64> = result
+        .prediction
+        .open_beam
+        .total
+        .iter()
+        .chain(&result.prediction.sample.total)
+        .copied()
+        .collect();
+    let both = |t: &[f64]| -> Vec<f64> { t.iter().chain(t).copied().collect() };
+    let info = |x: &[f64], y: &[f64]| -> f64 {
+        x.iter().zip(y).zip(&mu).map(|((a, b), m)| a * b / m).sum()
+    };
+    let (d, b) = (both(&dark), both(&blocked));
+    let (i11, i12, i22) = (info(&d, &d), info(&d, &b), info(&b, &b));
+    let reduced_free = 1.0 / i22.sqrt();
+    let marginal_free = (i11 / (i11 * i22 - i12 * i12)).sqrt();
+    let pinned_direct = 1.0 / i11.sqrt();
+
+    let sigma = result
+        .amplitude_uncertainties
+        .expect("identifiable and converged");
+    assert!(
+        (sigma[1] / reduced_free - 1.0).abs() < 1.0e-9,
+        "free sigma {} vs reduced {reduced_free}",
+        sigma[1]
+    );
+    assert!(
+        marginal_free > 50.0 * sigma[1],
+        "the marginal ({marginal_free}) must be far above the conditioned value ({})",
+        sigma[1]
+    );
+    assert!(
+        (sigma[0] / pinned_direct - 1.0).abs() < 1.0e-9,
+        "pinned sigma {} vs direct curvature {pinned_direct}",
+        sigma[0]
+    );
+}
+
+/// At the boundary of the Poisson support the expected information diverges.
+/// The uncertainty must be withheld there, not reported as the number that
+/// dropping the bin happens to produce — which jumps discontinuously as the
+/// expectation reaches zero.
+#[test]
+fn zero_expectation_on_a_sensitive_bin_withholds_the_sigma() {
+    let template = TwoArmBackgroundTemplate {
+        name: "flat".into(),
+        open_beam: vec![1.0, 1.0],
+        sample: vec![1.0, 1.0],
+    };
+    let fit = |epsilon: f64| {
+        fit_two_arm_background_templates(
+            &[0.0, 90.0],
+            &[0.0, 90.0],
+            signal(vec![epsilon, 100.0], vec![epsilon, 100.0]),
+            1.0,
+            1.0,
+            std::slice::from_ref(&template),
+            &[0.0],
+            &PoissonConfig::default(),
+        )
+        .expect("boundary fit")
+    };
+
+    let near = fit(1.0e-4);
+    assert_eq!(near.amplitude_at_bound, vec![true]);
+    let near_sigma = near.amplitude_uncertainties.expect("regular")[0];
+    assert!(near_sigma.is_finite() && near_sigma < 0.1, "{near_sigma}");
+
+    let boundary = fit(0.0);
+    assert!(boundary.converged);
+    assert_eq!(boundary.amplitude_at_bound, vec![true]);
+    let boundary_sigma = boundary
+        .amplitude_uncertainties
+        .expect("entry withheld, not the array")[0];
+    assert!(
+        boundary_sigma.is_nan(),
+        "got {boundary_sigma}, expected NaN"
+    );
+}
+
+#[test]
+fn zero_max_iter_is_rejected_before_fitting() {
+    let template = shaped_template("blocked_beam");
+    let observed = synthetic_observation(signals(), &template, 25.0);
+    let error = fit_two_arm_background_templates(
+        &observed.open_beam,
+        &observed.sample,
+        signals(),
+        1.0,
+        1.0,
+        std::slice::from_ref(&template),
+        &[1.0],
+        &PoissonConfig {
+            max_iter: 0,
+            ..PoissonConfig::default()
+        },
+    )
+    .expect_err("zero iterations is not a fit");
+    assert!(
+        matches!(
+            error,
+            nereids_fitting::error::FittingError::InvalidConfig(_)
+        ),
+        "{error:?}"
+    );
+    assert!(error.to_string().contains("max_iter"), "{error}");
 }
 
 /// An interior solution is not on its bound.

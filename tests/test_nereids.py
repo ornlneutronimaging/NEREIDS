@@ -982,12 +982,54 @@ class TestTwoArmCountBackground:
 
         assert fit.converged
         assert not fit.amplitudes_identifiable
-        # Uncertainties are withheld rather than reported as if meaningful.
-        assert np.all(np.isnan(np.asarray(fit.amplitude_uncertainties)))
+        # Withheld means absent, not a sentinel array.
+        assert fit.amplitude_uncertainties is None
         # The total background is still well determined.
         np.testing.assert_allclose(
             np.asarray(fit.open_background), 2.0e4, rtol=0.05
         )
+
+    def test_zero_expectation_bin_withholds_that_sigma_entry(self):
+        """At the Poisson support boundary the Fisher estimate is not regular.
+
+        The array is present (the fit converged and is identifiable) but the
+        affected entry is NaN rather than the discontinuous number that
+        dropping the bin would produce.
+        """
+        fit = nereids.fit_two_arm_background_templates(
+            np.array([0.0, 90.0]),
+            np.array([0.0, 90.0]),
+            np.array([0.0, 100.0]),
+            np.array([0.0, 100.0]),
+            1.0,
+            1.0,
+            ["flat"],
+            np.ones((1, 2)),
+            np.ones((1, 2)),
+            np.array([0.0]),
+        )
+        assert fit.converged
+        assert fit.amplitude_at_bound == [True]
+        sigma = fit.amplitude_uncertainties
+        assert sigma is not None
+        assert np.isnan(sigma[0])
+
+    def test_zero_max_iter_is_a_value_error(self, tmp_path):
+        open_signal, sample_signal = self._two_arm_signal(tmp_path)
+        with pytest.raises(ValueError, match="max_iter"):
+            nereids.fit_two_arm_background_templates(
+                open_signal,
+                sample_signal,
+                open_signal,
+                sample_signal,
+                1.0,
+                1.0,
+                ["dark"],
+                np.ones((1, open_signal.size)),
+                np.ones((1, sample_signal.size)),
+                np.array([0.0]),
+                max_iter=0,
+            )
 
     def test_correlated_templates_converge_at_default_budget(self, tmp_path):
         """Flat dark + slowly varying blocked beam: the intended inputs.

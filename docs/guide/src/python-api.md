@@ -296,7 +296,7 @@ separately determined:
 |-----------|---------|
 | `amplitudes`, `names` | Fitted non-negative amplitude per named component. |
 | `amplitudes_identifiable` | `False` when two supplied shapes are linearly dependent. The total background is still valid, but the individual amplitudes are not physically interpretable. |
-| `amplitude_uncertainties` | One-sigma values from the expected (Fisher) information. Withheld (all-NaN) unless the fit converged, the amplitudes are identifiable, *and* the information matrix inverts; an individual entry is NaN when its variance is non-positive, so a reported number is never zero. |
+| `amplitude_uncertainties` | One-sigma values from the expected (Fisher) information of the constrained fit, or `None` when withheld (the fit did not converge, the amplitudes are not identifiable, or the free block of the information matrix is singular). Free amplitudes are conditioned on any partner held at its bound. An individual entry is NaN when its variance is non-positive or when its template is sensitive on a bin with zero expectation, where the expected information diverges; a reported number is never zero. |
 | `amplitude_at_bound` | `True` where the data pull an amplitude negative and the non-negativity bound holds it at zero. Its reported sigma is then a one-sided curvature scale, not a symmetric interval. |
 | `open_total`, `sample_total` | `neutron_signal + background`, exactly. |
 | `open_window_loss`, `sample_window_loss` | Expected counts lost outside the acquisition window, exposure-scaled and reported rather than renormalized away. |

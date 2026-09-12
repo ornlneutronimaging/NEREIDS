@@ -1022,15 +1022,21 @@ class TwoArmBackgroundFitResult:
     @property
     def amplitudes(self) -> NDArray[np.float64]: ...
     @property
-    def amplitude_uncertainties(self) -> NDArray[np.float64]:
-        """One-sigma uncertainties from the expected (Fisher) information.
+    def amplitude_uncertainties(self) -> NDArray[np.float64] | None:
+        """One-sigma uncertainties of the constrained fit, or ``None``.
 
-        All-NaN when withheld: the fit did not converge, the amplitudes are
-        not separately determined, or the information matrix is singular.
-        An individual entry is NaN when its variance is non-positive even
-        though the matrix inverted, so a reported number is never zero. For
-        an amplitude on its zero bound (see ``amplitude_at_bound``) the
-        value is a one-sided curvature scale, not a symmetric interval.
+        ``None`` when withheld: the fit did not converge, the amplitudes
+        are not separately determined, or the free block of the expected
+        (Fisher) information matrix is singular. An individual entry is NaN
+        when its variance is non-positive, or when its template is
+        sensitive on a bin with zero expectation — the boundary of the
+        Poisson support, where the expected information diverges and no
+        regular estimate exists. A reported number is never zero.
+
+        Free amplitudes are conditioned on any partner held at its bound
+        (the information is restricted to the free set before inversion).
+        An amplitude on its own zero bound (see ``amplitude_at_bound``)
+        reports a one-sided curvature scale, not a symmetric interval.
         """
         ...
 
@@ -1111,7 +1117,8 @@ def fit_two_arm_background_templates(
 
     ``max_iter`` bounds the joint Fisher-scoring iterations and ``tol`` is
     the scale-free KKT gradient tolerance that declares convergence; both
-    are validated (``tol`` must be finite and positive).
+    are validated (``max_iter`` must be at least 1, ``tol`` finite and
+    positive).
 
     Raises ``ValueError`` for malformed inputs: shape mismatch, negative or
     non-finite counts, window losses, exposure scales or tolerance,

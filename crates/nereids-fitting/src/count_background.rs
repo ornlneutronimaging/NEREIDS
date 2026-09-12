@@ -43,15 +43,23 @@ pub struct TwoArmBackgroundFitResult {
     /// Fitted non-negative template amplitudes.
     pub amplitudes: Vec<f64>,
     /// Local one-sigma amplitude uncertainties from the expected (Fisher)
-    /// information at the solution, when available.
+    /// information of the constrained objective at the solution.
+    ///
+    /// Free amplitudes are conditioned on the constraint: the information is
+    /// restricted to the free set before inversion, so an amplitude whose
+    /// correlated partner is held on its bound is not reported with the
+    /// marginal over a direction the constraint removed. An amplitude on its
+    /// zero bound (see `amplitude_at_bound`) reports `1 / sqrt(I_jj)`, the
+    /// one-sided curvature scale of the objective at the boundary, not a
+    /// symmetric interval.
     ///
     /// `None` when the fit did not converge, when the amplitudes are not
-    /// identifiable, or when the information matrix is numerically singular.
-    /// An individual entry is `NaN` when its variance is non-positive even
-    /// though the matrix inverted, so a reported number is never zero. For an
-    /// amplitude pinned on its zero bound (see `amplitude_at_bound`) the value
-    /// is the one-sided curvature scale of the objective at the boundary, not
-    /// a symmetric interval.
+    /// identifiable, or when the free block of the information matrix is
+    /// singular. An individual entry is `NaN` when its variance is
+    /// non-positive, or when its template is sensitive on a bin with zero
+    /// expectation — the boundary of the Poisson support, where the expected
+    /// information diverges and no regular estimate exists. A reported number
+    /// is therefore never zero.
     pub amplitude_uncertainties: Option<Vec<f64>>,
     /// Whether each fitted amplitude sits on its non-negativity bound with the
     /// gradient still pushing it negative — a one-sided limit rather than an
@@ -412,7 +420,7 @@ fn fit_non_negative_poisson_linear(
         .map(|(&amplitude, &slope)| amplitude == 0.0 && slope > 0.0)
         .collect();
     let uncertainties = if converged && config.compute_covariance {
-        poisson_linear_uncertainties(&prediction, basis)
+        poisson_linear_uncertainties(&prediction, basis, &at_bound)
     } else {
         None
     };
@@ -526,6 +534,14 @@ fn validate_config(config: &PoissonConfig) -> Result<(), FittingError> {
             "tol_param must be finite and > 0, got {}",
             config.tol_param
         )));
+    }
+    // Zero iterations would return the clamped initial guess as an
+    // unconverged result with no error, which is a request that cannot be
+    // meant.
+    if config.max_iter == 0 {
+        return Err(FittingError::InvalidConfig(
+            "max_iter must be at least 1".into(),
+        ));
     }
     Ok(())
 }
@@ -715,30 +731,69 @@ fn weighted_count_ratio(weight: f64, count: f64, expected: f64) -> f64 {
     }
 }
 
-/// One-sigma amplitude uncertainties from the inverse expected information.
+/// One-sigma amplitude uncertainties at the constrained solution.
 ///
-/// `None` when the matrix is singular. A diagonal entry that inverts to a
-/// non-positive variance is reported as `NaN`, never as zero.
-fn poisson_linear_uncertainties(prediction: &[f64], basis: &[Vec<f64>]) -> Option<Vec<f64>> {
-    let mut fisher = FlatMatrix::zeros(basis.len(), basis.len());
-    for row in 0..basis.len() {
-        for column in 0..basis.len() {
-            *fisher.get_mut(row, column) =
-                expected_information(prediction, &basis[row], &basis[column]);
+/// The local curvature of the constrained objective is the expected
+/// information restricted to the free amplitudes, so the free block is
+/// inverted on its own. A partner held on its bound has been removed as a
+/// direction; marginalizing over it would report the flat direction of a
+/// near-collinear pair as the uncertainty of an amplitude the data in fact
+/// pin to a fraction of a percent. An amplitude on its bound reports
+/// `1 / sqrt(I_jj)`, the direct curvature scale of the objective at the
+/// boundary.
+///
+/// A template that is sensitive on a bin with zero expectation sits on the
+/// boundary of the Poisson support, where its expected information diverges
+/// and the Fisher approximation is not a regular estimate. Such entries are
+/// `NaN` rather than a number that would jump discontinuously as the
+/// expectation reaches zero. `None` only when the free block is singular.
+fn poisson_linear_uncertainties(
+    prediction: &[f64],
+    basis: &[Vec<f64>],
+    at_bound: &[bool],
+) -> Option<Vec<f64>> {
+    let support_boundary: Vec<bool> = basis
+        .iter()
+        .map(|template| {
+            prediction
+                .iter()
+                .zip(template)
+                .any(|(&expected, &weight)| expected == 0.0 && weight != 0.0)
+        })
+        .collect();
+    let free: Vec<usize> = (0..basis.len())
+        .filter(|&j| !at_bound[j] && !support_boundary[j])
+        .collect();
+
+    let mut sigma = vec![f64::NAN; basis.len()];
+    if !free.is_empty() {
+        let mut information = FlatMatrix::zeros(free.len(), free.len());
+        for (row, &j) in free.iter().enumerate() {
+            for (column, &k) in free.iter().enumerate() {
+                *information.get_mut(row, column) =
+                    expected_information(prediction, &basis[j], &basis[k]);
+            }
+        }
+        let covariance = invert_matrix(&information)?;
+        for (row, &j) in free.iter().enumerate() {
+            sigma[j] = positive_sqrt_or_nan(covariance.get(row, row));
         }
     }
-    invert_matrix(&fisher).map(|covariance| {
-        (0..basis.len())
-            .map(|index| {
-                let variance = covariance.get(index, index);
-                if variance.is_finite() && variance > 0.0 {
-                    variance.sqrt()
-                } else {
-                    f64::NAN
-                }
-            })
-            .collect()
-    })
+    for (j, template) in basis.iter().enumerate() {
+        if at_bound[j] && !support_boundary[j] {
+            sigma[j] =
+                positive_sqrt_or_nan(1.0 / expected_information(prediction, template, template));
+        }
+    }
+    Some(sigma)
+}
+
+fn positive_sqrt_or_nan(variance: f64) -> f64 {
+    if variance.is_finite() && variance > 0.0 {
+        variance.sqrt()
+    } else {
+        f64::NAN
+    }
 }
 
 fn normalize_templates(

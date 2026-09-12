@@ -2516,22 +2516,21 @@ impl PyTwoArmBackgroundFitResult {
     }
 
     /// One-sigma amplitude uncertainties from the expected (Fisher)
-    /// information, or all-NaN when withheld.
+    /// information of the constrained objective, or `None` when withheld.
     ///
-    /// Withheld when the fit did not converge, when the amplitudes are not
-    /// separately determined, or when the information matrix is singular; an
-    /// individual entry is NaN when its variance is non-positive even though
-    /// the matrix inverted. For an amplitude on its zero bound (see
-    /// `amplitude_at_bound`) the value is a one-sided curvature scale, not a
-    /// symmetric interval.
+    /// `None` (absent, not a sentinel) when the fit did not converge, the
+    /// amplitudes are not separately determined, or the free block of the
+    /// information matrix is singular. An individual entry is NaN when its
+    /// variance is non-positive or its template is sensitive on a bin with
+    /// zero expectation, where the expected information diverges. Free
+    /// amplitudes are conditioned on any partner held at its bound; an
+    /// amplitude on its own zero bound (see `amplitude_at_bound`) reports a
+    /// one-sided curvature scale, not a symmetric interval.
     #[getter]
-    fn amplitude_uncertainties<'py>(&self, py: Python<'py>) -> Bound<'py, PyArray1<f64>> {
-        PyArray1::from_vec(
-            py,
-            self.amplitude_uncertainties
-                .clone()
-                .unwrap_or_else(|| vec![f64::NAN; self.amplitudes.len()]),
-        )
+    fn amplitude_uncertainties<'py>(&self, py: Python<'py>) -> Option<Bound<'py, PyArray1<f64>>> {
+        self.amplitude_uncertainties
+            .as_ref()
+            .map(|values| PyArray1::from_vec(py, values.clone()))
     }
 
     /// Whether each amplitude is held at zero by its non-negativity bound
