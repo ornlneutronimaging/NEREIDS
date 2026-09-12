@@ -1014,6 +1014,134 @@ def two_arm_count_response(
     """
     ...
 
+class TwoArmBackgroundFitResult:
+    """Fitted amplitudes for independently measured count backgrounds."""
+
+    @property
+    def names(self) -> list[str]: ...
+    @property
+    def amplitudes(self) -> NDArray[np.float64]: ...
+    @property
+    def amplitude_uncertainties(self) -> NDArray[np.float64] | None:
+        """One-sigma uncertainties of the constrained fit, or ``None``.
+
+        ``None`` when withheld: the fit did not converge, the amplitudes
+        are not separately determined, or the free block of the expected
+        (Fisher) information matrix is singular. An individual entry is NaN
+        when its variance is non-positive, or when its template is
+        sensitive on a bin with zero expectation — the boundary of the
+        Poisson support, where the expected information diverges and no
+        regular estimate exists. A reported number is never zero.
+
+        Free amplitudes are conditioned on any partner held at its bound
+        (the information is restricted to the free set before inversion).
+        An amplitude on its own zero bound (see ``amplitude_at_bound``)
+        reports a one-sided curvature scale, not a symmetric interval.
+        """
+        ...
+
+    @property
+    def amplitude_at_bound(self) -> list[bool]:
+        """Whether each amplitude is held at zero by its non-negativity bound.
+
+        True means the data pull the amplitude negative and the constraint
+        holds it at zero: a one-sided limit rather than an interior estimate.
+        """
+        ...
+
+    @property
+    def amplitudes_identifiable(self) -> bool: ...
+    @property
+    def open_neutron_signal(self) -> NDArray[np.float64]: ...
+    @property
+    def open_background(self) -> NDArray[np.float64]: ...
+    @property
+    def open_total(self) -> NDArray[np.float64]: ...
+    @property
+    def open_window_loss(self) -> float: ...
+    @property
+    def sample_neutron_signal(self) -> NDArray[np.float64]: ...
+    @property
+    def sample_background(self) -> NDArray[np.float64]: ...
+    @property
+    def sample_total(self) -> NDArray[np.float64]: ...
+    @property
+    def sample_window_loss(self) -> float: ...
+    @property
+    def poisson_deviance(self) -> float: ...
+    @property
+    def deviance_per_dof(self) -> float: ...
+    @property
+    def n_informative(self) -> int:
+        """Bins that contribute to the deviance.
+
+        A concatenated open/sample bin counts when its observation, its
+        neutron signal, or at least one template is nonzero. Bins where all
+        three are exactly zero yield identically zero deviance for any
+        amplitude vector and are excluded from the degrees of freedom behind
+        ``deviance_per_dof``.
+        """
+        ...
+    @property
+    def converged(self) -> bool: ...
+    @property
+    def iterations(self) -> int: ...
+
+def fit_two_arm_background_templates(
+    observed_open_counts: NDArray[np.float64],
+    observed_sample_counts: NDArray[np.float64],
+    open_neutron_signal: NDArray[np.float64],
+    sample_neutron_signal: NDArray[np.float64],
+    open_exposure_scale: float,
+    sample_exposure_scale: float,
+    template_names: list[str],
+    open_background_templates: NDArray[np.float64],
+    sample_background_templates: NDArray[np.float64],
+    initial_amplitudes: NDArray[np.float64],
+    open_window_loss: float,
+    sample_window_loss: float,
+    max_iter: int = 200,
+    tol: float = 1e-8,
+) -> TwoArmBackgroundFitResult:
+    """Fit non-negative amplitudes for measured detector-bin backgrounds.
+
+    Each row of the two template matrices is one named component, already
+    expressed in the detector bins of the corresponding complete acquisition.
+    Only amplitudes are fitted: the neutron signal and every template shape
+    stay fixed, and the background is added after the instrument response
+    rather than broadened a second time.
+
+    ``open_exposure_scale`` and ``sample_exposure_scale`` convert the common
+    reference neutron signal into expected counts for each acquisition, so a
+    run-normalization factor cannot be absorbed as background.
+
+    ``open_window_loss`` and ``sample_window_loss`` are required: pass the
+    two loss values returned by ``two_arm_count_response`` for the same
+    reference signal. They are the acquisition-window loss disclosure the
+    result carries forward (exposure-scaled), so defaulting them would
+    silently report "no loss".
+
+    The exposure scales apply to the neutron signal and its window losses
+    only. Templates are never multiplied by them: supply each arm's
+    template already expressed in that arm's own exposure.
+
+    ``max_iter`` bounds every joint Fisher-scoring iteration, including the
+    short post-convergence polish that resolves the active set, so the
+    reported ``iterations`` never exceeds it; ``tol`` is the scale-free KKT
+    gradient tolerance that declares convergence. Both are validated under
+    these names (``max_iter`` at least 1, ``tol`` finite and positive).
+
+    Raises ``ValueError`` for malformed inputs: shape mismatch, negative or
+    non-finite counts, window losses, exposure scales, ``tol`` or
+    ``max_iter``, duplicate or empty template names, a template that is
+    zero in both arms, or too few informative bins for the template rank.
+    Raises ``RuntimeError`` for model-evaluation failures during the fit,
+    such as a fitted amplitude that cannot be represented in the supplied
+    template units (overflow or underflow) or an expectation that
+    overflows.
+    """
+    ...
+
 def load_tiff_stack(
     path: str,
     pixel_policy: str = "reject",

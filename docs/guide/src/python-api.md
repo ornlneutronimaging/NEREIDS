@@ -255,6 +255,71 @@ The counts-domain `alpha_1`/`alpha_2` nuisance parameters are not fit by
 `compute_model_jacobian` retains the `alpha` parameters, as a research/UQ
 surface.
 
+### Independently Measured Count Backgrounds
+
+```python
+background_fit = nereids.fit_two_arm_background_templates(
+    observed_open_counts,
+    observed_sample_counts,
+    open_signal,                 # from two_arm_count_response(...)
+    sample_signal,
+    open_exposure_scale,
+    sample_exposure_scale,
+    ["blocked_beam"],
+    open_background_templates,   # 2-D, one row per named component
+    sample_background_templates,
+    initial_amplitudes,
+    open_loss,                   # the two losses from the same
+    sample_loss,                 # two_arm_count_response(...) call
+)
+```
+
+Each row of the two template matrices is a fixed detector-bin shape from an
+independent measurement such as blocked-beam or detector-only data. NEREIDS
+fits only a non-negative amplitude per component and returns all three pieces
+for each arm — the fixed neutron signal, the fitted background, and their exact
+total — so they are never conflated. This count background is added *after* the
+instrument response and is not the SAMMY transmission-level background.
+
+The code deliberately does not generate a flexible residual curve, and it
+cannot establish a template's provenance: fitting a free curve to the residual
+it is meant to explain would identify nothing physical, so callers must retain
+the independent measurement record themselves.
+
+`open_exposure_scale` and `sample_exposure_scale` are required. They convert
+the common reference neutron signal into expected counts for each complete
+acquisition (proton charge, live time, or another documented exposure), so a
+run-normalization difference between the arms cannot be absorbed as background.
+The scales apply to the neutron signal and its window losses only — templates
+are never multiplied by them, so supply each arm's template already expressed
+in that arm's own exposure. (Supplying a per-unit-exposure template to a
+3× exposure arm biases its amplitude by ~50% while the fit still looks only
+mildly poor.)
+
+`open_window_loss` and `sample_window_loss` are also required: pass the two
+losses that `two_arm_count_response` returned alongside the signals. They are
+the acquisition-window disclosure the result carries forward, exposure-scaled;
+they are never defaulted, because a default of zero would be a false "no loss"
+report.
+
+The returned `TwoArmBackgroundFitResult` reports whether the amplitudes are
+separately determined:
+
+| Attribute | Meaning |
+|-----------|---------|
+| `amplitudes`, `names` | Fitted non-negative amplitude per named component. |
+| `amplitudes_identifiable` | `False` when two supplied shapes are linearly dependent. The total background is still valid, but the individual amplitudes are not physically interpretable. |
+| `amplitude_uncertainties` | One-sigma values from the expected (Fisher) information of the constrained fit, or `None` when withheld (the fit did not converge, the amplitudes are not identifiable, or the free block of the information matrix is singular). Free amplitudes are conditioned on any partner held at its bound. An individual entry is NaN when its variance is non-positive or when its template is sensitive on a bin with zero expectation, where the expected information diverges; a reported number is never zero. |
+| `amplitude_at_bound` | `True` where the data pull an amplitude negative and the non-negativity bound holds it at zero. Its reported sigma is then a one-sided curvature scale, not a symmetric interval. |
+| `open_total`, `sample_total` | `neutron_signal + background`, exactly. |
+| `open_window_loss`, `sample_window_loss` | Expected counts lost outside the acquisition window, exposure-scaled and reported rather than renormalized away. |
+| `poisson_deviance`, `deviance_per_dof` | Goodness of fit. |
+| `n_informative` | Bins that contribute to the deviance — the observation, the neutron signal, or at least one template is nonzero there. Bins where all three are exactly zero are excluded from the degrees of freedom. |
+
+Background amplitude estimation is a standalone analysis surface: it is not a
+solver route, and the counts-KL dispatch still rejects a non-zero
+`detector_background` (see the option table above).
+
 ## Spatial Mapping
 
 ### Pre-Normalized Transmission Cubes

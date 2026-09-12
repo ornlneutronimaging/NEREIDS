@@ -1,7 +1,8 @@
 use std::sync::Arc;
 
 use nereids_physics::counts_response::{
-    CountsResponseError, DetectorBinResponseMatrix, two_arm_count_response,
+    CountsResponseError, DetectorBinResponseMatrix, TwoArmCounts, add_count_backgrounds,
+    two_arm_count_response,
 };
 use nereids_physics::ikeda_carpenter::{
     EnergyLaw, IkedaCarpenter, IkedaCarpenterParams, SynthesisGrid,
@@ -252,4 +253,93 @@ fn compact_response_reports_window_loss_like_the_streaming_operator() {
     assert_eq!(from_matrix, from_operator);
     assert!((from_matrix.open_beam_window_loss - 50.0).abs() < 1.0e-12);
     assert!((from_matrix.sample_window_loss - 20.0).abs() < 1.0e-12);
+}
+
+fn signal_with_loss(open_loss: f64, sample_loss: f64) -> TwoArmCounts {
+    TwoArmCounts {
+        open_beam: vec![50.0, 150.0, 100.0],
+        sample: vec![10.0, 90.0, 80.0],
+        open_beam_window_loss: open_loss,
+        sample_window_loss: sample_loss,
+    }
+}
+
+#[test]
+fn count_background_is_added_after_response_and_returned_separately() {
+    let prediction = add_count_backgrounds(
+        signal_with_loss(0.0, 0.0),
+        &[2.0, 3.0, 4.0],
+        &[5.0, 7.0, 11.0],
+    )
+    .expect("valid detector-bin backgrounds");
+
+    assert_eq!(prediction.open_beam.neutron_signal, [50.0, 150.0, 100.0]);
+    assert_eq!(prediction.open_beam.background, [2.0, 3.0, 4.0]);
+    assert_eq!(prediction.open_beam.total, [52.0, 153.0, 104.0]);
+    assert_eq!(prediction.sample.neutron_signal, [10.0, 90.0, 80.0]);
+    assert_eq!(prediction.sample.background, [5.0, 7.0, 11.0]);
+    assert_eq!(prediction.sample.total, [15.0, 97.0, 91.0]);
+}
+
+/// Pipeline-map R5·7 requires the acquisition-window loss to stay disclosed.
+/// Forming the total expectation is precisely where that report is at risk of
+/// being dropped, so it must survive into the prediction untouched — and it
+/// must not be inflated by a background that is already inside the window.
+#[test]
+fn count_background_carries_window_loss_through_untouched() {
+    let prediction = add_count_backgrounds(
+        signal_with_loss(50.0, 20.0),
+        &[2.0, 3.0, 4.0],
+        &[5.0, 7.0, 11.0],
+    )
+    .expect("valid detector-bin backgrounds");
+
+    assert_eq!(prediction.open_beam.window_loss, 50.0);
+    assert_eq!(prediction.sample.window_loss, 20.0);
+}
+
+#[test]
+fn count_background_rejects_shape_mismatch_and_negative_counts() {
+    let signal = signal_with_loss(0.0, 0.0);
+    assert!(matches!(
+        add_count_backgrounds(signal.clone(), &[1.0], &[2.0, 3.0, 4.0]),
+        Err(CountsResponseError::DetectorBinCountMismatch { .. })
+    ));
+    assert!(matches!(
+        add_count_backgrounds(signal.clone(), &[1.0, 2.0, 3.0], &[0.0, -1.0, 0.0]),
+        Err(CountsResponseError::InvalidExpectedCount {
+            field: "sample_background_counts",
+            index: 1,
+            ..
+        })
+    ));
+    for bad in [f64::NAN, f64::INFINITY] {
+        assert!(matches!(
+            add_count_backgrounds(signal.clone(), &[1.0, bad, 3.0], &[1.0, 2.0, 3.0]),
+            Err(CountsResponseError::InvalidExpectedCount {
+                field: "open_background_counts",
+                index: 1,
+                ..
+            })
+        ));
+    }
+}
+
+/// A non-finite window loss would otherwise ride into the prediction without
+/// touching any per-bin value, since it never enters the totals.
+#[test]
+fn count_background_rejects_non_finite_window_loss() {
+    for bad in [f64::NAN, f64::INFINITY, -1.0] {
+        assert!(matches!(
+            add_count_backgrounds(
+                signal_with_loss(bad, 0.0),
+                &[1.0, 2.0, 3.0],
+                &[1.0, 2.0, 3.0]
+            ),
+            Err(CountsResponseError::InvalidExpectedCount {
+                field: "open_beam_window_loss",
+                ..
+            })
+        ));
+    }
 }

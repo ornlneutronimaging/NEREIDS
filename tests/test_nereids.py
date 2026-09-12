@@ -774,6 +774,432 @@ class TestTwoArmCountResponse:
         assert sample_loss == pytest.approx(40.0 * outside, abs=2e-12)
 
 
+class TestTwoArmCountBackground:
+    """Amplitude estimation for independently measured count backgrounds.
+
+    Contract R5.7 clause (2): a non-negative two-arm amplitude fit over
+    declared spectral templates, with identifiability reported. The neutron
+    signal and every template shape stay fixed; only amplitudes are fitted.
+    Background is added *after* the instrument response, so it is never
+    broadened a second time.
+    """
+
+    TOF_FACTOR = 72.298254398292800
+    L = 25.0
+
+    @staticmethod
+    def _write_triangle(path):
+        path.write_text(
+            "\n".join(
+                [
+                    "synthetic one-microsecond triangle",
+                    "-----",
+                    "   2.50000e+001   0.00000e+000",
+                    "-1.0 0.0",
+                    "0.0 1.0",
+                    "1.0 0.0",
+                    "",
+                ]
+            )
+        )
+
+    def _two_arm_signal(self, tmp_path):
+        """Neutron-only expectation on three detector-time bins."""
+        kernel_path = tmp_path / "background_triangle.txt"
+        self._write_triangle(kernel_path)
+        response = nereids.load_resolution(str(kernel_path), self.L)
+        arrival_0 = self.TOF_FACTOR * self.L / np.sqrt(25.0)
+        energy_1 = (self.TOF_FACTOR * self.L / (arrival_0 + 1.0)) ** 2
+        edges = np.array(
+            [arrival_0 - 1.0, arrival_0, arrival_0 + 1.0, arrival_0 + 2.0]
+        )
+        open_beam, sample, open_loss, sample_loss = nereids.two_arm_count_response(
+            np.array([25.0, energy_1]),
+            np.array([1.0e5, 2.0e5]),
+            np.array([0.2, 0.8]),
+            edges,
+            response,
+        )
+        return np.asarray(open_beam), np.asarray(sample), open_loss, sample_loss
+
+    def test_recovers_independent_template_amplitude(self, tmp_path):
+        open_signal, sample_signal, open_loss, sample_loss = self._two_arm_signal(tmp_path)
+
+        # One blocked-beam component, flat across the acquisition, present in
+        # both arms at a known amplitude.
+        true_amplitude = 2.0e4
+        open_template = np.ones_like(open_signal)
+        sample_template = np.ones_like(sample_signal)
+
+        rng = np.random.default_rng(20260911)
+        observed_open = rng.poisson(
+            open_signal + true_amplitude * open_template
+        ).astype(float)
+        observed_sample = rng.poisson(
+            sample_signal + true_amplitude * sample_template
+        ).astype(float)
+
+        fit = nereids.fit_two_arm_background_templates(
+            observed_open,
+            observed_sample,
+            open_signal,
+            sample_signal,
+            1.0,
+            1.0,
+            ["blocked_beam"],
+            open_template[np.newaxis, :],
+            sample_template[np.newaxis, :],
+            np.array([1.0e3]),
+            open_window_loss=open_loss,
+            sample_window_loss=sample_loss,
+        )
+
+        assert fit.converged
+        assert fit.names == ["blocked_beam"]
+        # A single template is trivially independent, so the amplitude is
+        # separately determined and an uncertainty is reported.
+        assert fit.amplitudes_identifiable
+        assert np.isfinite(fit.amplitude_uncertainties[0])
+        assert fit.amplitudes[0] == pytest.approx(true_amplitude, rel=0.05)
+
+        # The three pieces are returned separately and must reconstruct the
+        # total exactly: background is added after the response, not folded
+        # into the neutron signal.
+        np.testing.assert_allclose(fit.open_neutron_signal, open_signal, rtol=1e-12)
+        np.testing.assert_allclose(
+            np.asarray(fit.open_total),
+            np.asarray(fit.open_neutron_signal) + np.asarray(fit.open_background),
+            rtol=1e-12,
+        )
+        np.testing.assert_allclose(
+            np.asarray(fit.sample_total),
+            np.asarray(fit.sample_neutron_signal)
+            + np.asarray(fit.sample_background),
+            rtol=1e-12,
+        )
+
+    def test_wrong_template_shape_leaves_a_bad_count_fit(self, tmp_path):
+        """A template that does not describe the data must not absorb it."""
+        open_signal, sample_signal, open_loss, sample_loss = self._two_arm_signal(tmp_path)
+        # Truth rises across the acquisition; the candidate is flat.
+        true_open = np.array([1.0, 2.0, 4.0]) * 1.0e4
+        true_sample = np.array([4.0, 2.0, 1.0]) * 1.0e4
+        observed_open = open_signal + true_open
+        observed_sample = sample_signal + true_sample
+
+        fit = nereids.fit_two_arm_background_templates(
+            observed_open,
+            observed_sample,
+            open_signal,
+            sample_signal,
+            1.0,
+            1.0,
+            ["wrong_flat_reference"],
+            np.ones((1, open_signal.size)),
+            np.ones((1, sample_signal.size)),
+            np.array([1.0e3]),
+            open_window_loss=open_loss,
+            sample_window_loss=sample_loss,
+        )
+
+        assert fit.converged
+        assert fit.deviance_per_dof > 5.0, (
+            f"wrong template silently accepted: D/dof = {fit.deviance_per_dof}"
+        )
+
+    def test_template_units_do_not_change_the_physical_fit(self, tmp_path):
+        """Amplitude units are the caller's; the physical fit must not move."""
+        open_signal, sample_signal, open_loss, sample_loss = self._two_arm_signal(tmp_path)
+        true_background = 2.0e4
+        observed_open = open_signal + true_background
+        observed_sample = sample_signal + true_background
+
+        results = []
+        for unit in [1.0, 1.0e-8]:
+            fit = nereids.fit_two_arm_background_templates(
+                observed_open,
+                observed_sample,
+                open_signal,
+                sample_signal,
+                1.0,
+                1.0,
+                ["same_reference"],
+                np.full((1, open_signal.size), unit),
+                np.full((1, sample_signal.size), unit),
+                np.array([0.0]),
+                open_window_loss=open_loss,
+                sample_window_loss=sample_loss,
+            )
+            assert fit.converged
+            results.append(fit)
+
+        # Amplitude scales inversely with template units; the background
+        # counts they imply must be identical.
+        np.testing.assert_allclose(
+            np.asarray(results[0].open_background),
+            np.asarray(results[1].open_background),
+            rtol=1e-6,
+        )
+        assert results[0].amplitudes[0] == pytest.approx(true_background, rel=0.05)
+        assert results[1].amplitudes[0] == pytest.approx(
+            true_background / 1.0e-8, rel=0.05
+        )
+
+    def test_exposure_scale_is_not_fitted_as_false_background(self, tmp_path):
+        """A known run-normalization difference is not a background."""
+        open_signal, sample_signal, open_loss, sample_loss = self._two_arm_signal(tmp_path)
+        # The sample arm ran twice as long. With that declared, nothing is
+        # left for a background to explain.
+        fit = nereids.fit_two_arm_background_templates(
+            open_signal,
+            2.0 * sample_signal,
+            open_signal,
+            sample_signal,
+            1.0,
+            2.0,
+            ["sample_only"],
+            np.zeros((1, open_signal.size)),
+            np.ones((1, sample_signal.size)),
+            np.array([10.0]),
+            open_window_loss=open_loss,
+            sample_window_loss=sample_loss,
+        )
+
+        assert fit.converged
+        assert fit.amplitudes[0] < 1.0e-6
+        assert fit.poisson_deviance == pytest.approx(0.0, abs=1e-6)
+
+    def test_dependent_components_are_marked_unidentifiable(self, tmp_path):
+        """Proportional shapes share one direction: amounts are not separable."""
+        open_signal, sample_signal, open_loss, sample_loss = self._two_arm_signal(tmp_path)
+        observed_open = open_signal + 2.0e4
+        observed_sample = sample_signal + 2.0e4
+
+        fit = nereids.fit_two_arm_background_templates(
+            observed_open,
+            observed_sample,
+            open_signal,
+            sample_signal,
+            1.0,
+            1.0,
+            ["dark", "gamma"],
+            np.array([np.ones(3), 2.0 * np.ones(3)]),
+            np.array([np.ones(3), 2.0 * np.ones(3)]),
+            np.array([0.0, 5.0]),
+            open_window_loss=open_loss,
+            sample_window_loss=sample_loss,
+        )
+
+        assert fit.converged
+        assert not fit.amplitudes_identifiable
+        # Withheld means absent, not a sentinel array.
+        assert fit.amplitude_uncertainties is None
+        # The total background is still well determined.
+        np.testing.assert_allclose(
+            np.asarray(fit.open_background), 2.0e4, rtol=0.05
+        )
+
+    def test_zero_expectation_bin_withholds_that_sigma_entry(self):
+        """At the Poisson support boundary the Fisher estimate is not regular.
+
+        The array is present (the fit converged and is identifiable) but the
+        affected entry is NaN rather than the discontinuous number that
+        dropping the bin would produce.
+        """
+        fit = nereids.fit_two_arm_background_templates(
+            np.array([0.0, 90.0]),
+            np.array([0.0, 90.0]),
+            np.array([0.0, 100.0]),
+            np.array([0.0, 100.0]),
+            1.0,
+            1.0,
+            ["flat"],
+            np.ones((1, 2)),
+            np.ones((1, 2)),
+            np.array([0.0]),
+            open_window_loss=0.0,
+            sample_window_loss=0.0,
+        )
+        assert fit.converged
+        assert fit.amplitude_at_bound == [True]
+        sigma = fit.amplitude_uncertainties
+        assert sigma is not None
+        assert np.isnan(sigma[0])
+
+    def test_zero_max_iter_is_a_value_error(self, tmp_path):
+        open_signal, sample_signal, open_loss, sample_loss = self._two_arm_signal(tmp_path)
+        with pytest.raises(ValueError, match="max_iter"):
+            nereids.fit_two_arm_background_templates(
+                open_signal,
+                sample_signal,
+                open_signal,
+                sample_signal,
+                1.0,
+                1.0,
+                ["dark"],
+                np.ones((1, open_signal.size)),
+                np.ones((1, sample_signal.size)),
+                np.array([0.0]),
+                max_iter=0,
+                open_window_loss=open_loss,
+                sample_window_loss=sample_loss,
+            )
+
+    def test_correlated_templates_converge_at_default_budget(self, tmp_path):
+        """Flat dark + slowly varying blocked beam: the intended inputs.
+
+        These shapes are highly correlated, which is where a coordinate
+        sweep stalls; the joint step must resolve them within the default
+        iteration budget and recover both amplitudes.
+        """
+        open_signal, sample_signal, open_loss, sample_loss = self._two_arm_signal(tmp_path)
+        n = open_signal.size
+        dark = np.ones(n)
+        blocked = 1.0 + 0.02 * np.arange(n) / n
+        truth = np.array([2.0e4, 3.0e4])
+        observed_open = open_signal + truth[0] * dark + truth[1] * blocked
+        observed_sample = sample_signal + truth[0] * dark + truth[1] * blocked
+
+        fit = nereids.fit_two_arm_background_templates(
+            observed_open,
+            observed_sample,
+            open_signal,
+            sample_signal,
+            1.0,
+            1.0,
+            ["dark", "blocked_beam"],
+            np.array([dark, blocked]),
+            np.array([dark, blocked]),
+            np.array([1.0, 1.0]),
+            open_window_loss=open_loss,
+            sample_window_loss=sample_loss,
+        )
+
+        assert fit.converged, f"iterations={fit.iterations}"
+        assert fit.amplitudes_identifiable
+        np.testing.assert_allclose(np.asarray(fit.amplitudes), truth, rtol=1e-6)
+        assert np.all(np.isfinite(np.asarray(fit.amplitude_uncertainties)))
+        assert fit.amplitude_at_bound == [False, False]
+
+    def test_bound_held_amplitude_is_flagged(self, tmp_path):
+        """A template the data reject is pinned at zero, and says so."""
+        open_signal, sample_signal, open_loss, sample_loss = self._two_arm_signal(tmp_path)
+        # Observations below the neutron-only expectation: any positive
+        # background makes the fit worse.
+        fit = nereids.fit_two_arm_background_templates(
+            0.9 * open_signal,
+            0.9 * sample_signal,
+            open_signal,
+            sample_signal,
+            1.0,
+            1.0,
+            ["unwanted"],
+            np.ones((1, open_signal.size)),
+            np.ones((1, sample_signal.size)),
+            np.array([100.0]),
+            open_window_loss=open_loss,
+            sample_window_loss=sample_loss,
+        )
+        assert fit.converged
+        assert fit.amplitudes[0] == 0.0
+        assert fit.amplitude_at_bound == [True]
+
+    def test_invalid_tolerance_is_a_value_error(self, tmp_path):
+        open_signal, sample_signal, open_loss, sample_loss = self._two_arm_signal(tmp_path)
+        with pytest.raises(ValueError, match="tol must be finite"):
+            nereids.fit_two_arm_background_templates(
+                open_signal,
+                sample_signal,
+                open_signal,
+                sample_signal,
+                1.0,
+                1.0,
+                ["dark"],
+                np.ones((1, open_signal.size)),
+                np.ones((1, sample_signal.size)),
+                np.array([0.0]),
+                tol=float("inf"),
+                open_window_loss=open_loss,
+                sample_window_loss=sample_loss,
+            )
+
+    def test_negative_window_loss_is_a_value_error_not_runtime(self, tmp_path):
+        open_signal, sample_signal, open_loss, sample_loss = self._two_arm_signal(tmp_path)
+        with pytest.raises(ValueError, match="window_loss"):
+            nereids.fit_two_arm_background_templates(
+                open_signal,
+                sample_signal,
+                open_signal,
+                sample_signal,
+                1.0,
+                1.0,
+                ["dark"],
+                np.ones((1, open_signal.size)),
+                np.ones((1, sample_signal.size)),
+                np.array([0.0]),
+                sample_window_loss=-1.0,
+                open_window_loss=open_loss,
+            )
+
+    def test_window_losses_are_required_and_round_trip_exposure_scaled(self, tmp_path):
+        """The R5.7 window-loss disclosure travels through the fit, scaled.
+
+        The losses are required arguments: a default of zero would report
+        "no loss" for a caller who simply forgot them.
+        """
+        open_signal, sample_signal, open_loss, sample_loss = self._two_arm_signal(tmp_path)
+        fit = nereids.fit_two_arm_background_templates(
+            2.0 * open_signal,
+            3.0 * sample_signal,
+            open_signal,
+            sample_signal,
+            2.0,
+            3.0,
+            ["dark"],
+            np.ones((1, open_signal.size)),
+            np.ones((1, sample_signal.size)),
+            np.array([0.0]),
+            open_window_loss=12.5,
+            sample_window_loss=4.0,
+        )
+        assert fit.converged
+        assert fit.open_window_loss == pytest.approx(2.0 * 12.5)
+        assert fit.sample_window_loss == pytest.approx(3.0 * 4.0)
+
+        with pytest.raises(TypeError, match="window_loss"):
+            nereids.fit_two_arm_background_templates(
+                open_signal,
+                sample_signal,
+                open_signal,
+                sample_signal,
+                1.0,
+                1.0,
+                ["dark"],
+                np.ones((1, open_signal.size)),
+                np.ones((1, sample_signal.size)),
+                np.array([0.0]),
+            )
+
+    def test_negative_max_iter_is_a_value_error_not_overflow(self, tmp_path):
+        open_signal, sample_signal, open_loss, sample_loss = self._two_arm_signal(tmp_path)
+        with pytest.raises(ValueError, match="max_iter"):
+            nereids.fit_two_arm_background_templates(
+                open_signal,
+                sample_signal,
+                open_signal,
+                sample_signal,
+                1.0,
+                1.0,
+                ["dark"],
+                np.ones((1, open_signal.size)),
+                np.ones((1, sample_signal.size)),
+                np.array([0.0]),
+                open_window_loss=open_loss,
+                sample_window_loss=sample_loss,
+                max_iter=-5,
+            )
+
+
 class TestExactResolvedCountsRoute:
     """End-to-end anchor for the exact separate-arm count route (Wave-1 PR-2b).
 
