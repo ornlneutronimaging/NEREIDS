@@ -2640,8 +2640,8 @@ impl PyTwoArmBackgroundFitResult {
     open_background_templates,
     sample_background_templates,
     initial_amplitudes,
-    open_window_loss = 0.0,
-    sample_window_loss = 0.0,
+    open_window_loss,
+    sample_window_loss,
     max_iter = 200,
     tol = 1.0e-8,
 ))]
@@ -2660,7 +2660,7 @@ fn py_fit_two_arm_background_templates<'py>(
     initial_amplitudes: PyReadonlyArray1<'py, f64>,
     open_window_loss: f64,
     sample_window_loss: f64,
-    max_iter: usize,
+    max_iter: i64,
     tol: f64,
 ) -> PyResult<PyTwoArmBackgroundFitResult> {
     use nereids_fitting::count_background::{
@@ -2712,8 +2712,21 @@ fn py_fit_two_arm_background_templates<'py>(
         open_beam_window_loss: open_window_loss,
         sample_window_loss,
     };
+    // Validated here under the Python parameter names, so the message a
+    // caller sees matches the signature they wrote against (the Rust layer
+    // re-checks under its own field names).
+    if !tol.is_finite() || tol <= 0.0 {
+        return Err(pyo3::exceptions::PyValueError::new_err(format!(
+            "tol must be finite and > 0, got {tol}"
+        )));
+    }
+    if max_iter < 1 {
+        return Err(pyo3::exceptions::PyValueError::new_err(format!(
+            "max_iter must be at least 1, got {max_iter}"
+        )));
+    }
     let config = PoissonConfig {
-        max_iter,
+        max_iter: max_iter as usize,
         tol_param: tol,
         ..PoissonConfig::default()
     };

@@ -54,8 +54,9 @@ pub struct TwoArmBackgroundFitResult {
     /// symmetric interval.
     ///
     /// `None` when the fit did not converge, when the amplitudes are not
-    /// identifiable, or when the free block of the information matrix is
-    /// singular. An individual entry is `NaN` when its variance is
+    /// identifiable, when the free block of the information matrix is
+    /// singular, or when the caller's `PoissonConfig` has
+    /// `compute_covariance == false`. An individual entry is `NaN` when its variance is
     /// non-positive, or when its template is sensitive on a bin with zero
     /// expectation — the boundary of the Poisson support, where the expected
     /// information diverges and no regular estimate exists. A reported number
@@ -192,7 +193,17 @@ pub fn fit_two_arm_background_templates(
         .zip(&template_scales)
         .map(|(&normalized_amplitude, &scale)| normalized_amplitude / scale)
         .collect();
-    if amplitudes.iter().any(|amplitude| !amplitude.is_finite()) {
+    // Both overflow and underflow are unrepresentable: an amplitude that
+    // underflows to zero could not rebuild the nonzero background the fit
+    // actually found, so the pair would contradict each other.
+    let unrepresentable =
+        amplitudes
+            .iter()
+            .zip(&fit.amplitudes)
+            .any(|(&amplitude, &normalized)| {
+                !amplitude.is_finite() || (amplitude == 0.0 && normalized != 0.0)
+            });
+    if unrepresentable {
         return Err(FittingError::EvaluationFailed(
             "a fitted amplitude cannot be represented in the supplied template units; rescale the template counts"
                 .into(),
@@ -253,7 +264,7 @@ pub fn fit_two_arm_background_templates(
     })
 }
 
-/// Count concatenated bins that can discriminate between amplitude vectors.
+/// Count concatenated bins that contribute to the deviance.
 ///
 /// Under this Poisson objective a bin contributes identically zero deviance
 /// for *every* amplitude vector when its observation, its neutron signal, and
@@ -350,63 +361,31 @@ fn fit_non_negative_poisson_linear(
     let mut iterations = 0;
     let mut gradient = vec![0.0; basis.len()];
 
-    for iteration in 0..config.max_iter {
-        let prediction = linear_prediction(neutron_signal, basis, &amplitudes)?;
-        poisson_gradient_into(observed, &prediction, basis, &mut gradient);
-        let free: Vec<usize> = (0..basis.len())
-            .filter(|&component| amplitudes[component] > 0.0 || gradient[component] < 0.0)
-            .collect();
-
-        let joint_step =
-            fisher_scoring_direction(&prediction, basis, &gradient, &free).and_then(|direction| {
-                projected_backtracking_step(
-                    observed,
-                    neutron_signal,
-                    basis,
-                    &amplitudes,
-                    &prediction,
-                    &direction,
-                )
-            });
-        match joint_step {
-            Some(next) => amplitudes = next,
-            None => {
-                for component in 0..basis.len() {
-                    let base = linear_prediction_without_component(
-                        neutron_signal,
-                        basis,
-                        &amplitudes,
-                        component,
-                    )?;
-                    amplitudes[component] = coordinate_minimum(
-                        observed,
-                        &base,
-                        &basis[component],
-                        amplitudes[component],
-                    )?;
-                }
-            }
-        }
-        iterations = iteration + 1;
-
-        let prediction = linear_prediction(neutron_signal, basis, &amplitudes)?;
-        poisson_gradient_into(observed, &prediction, basis, &mut gradient);
-        let maximum_violation = basis
-            .iter()
-            .enumerate()
-            .map(|(component, template)| {
-                let violation = if amplitudes[component] == 0.0 {
-                    (-gradient[component]).max(0.0)
-                } else {
-                    gradient[component].abs()
-                };
-                violation / template.iter().sum::<f64>()
-            })
-            .fold(0.0_f64, f64::max);
-        if maximum_violation <= config.tol_param {
+    for _ in 0..config.max_iter {
+        joint_iteration(
+            observed,
+            neutron_signal,
+            basis,
+            &mut amplitudes,
+            &mut gradient,
+        )?;
+        iterations += 1;
+        if kkt_violation(observed, neutron_signal, basis, &amplitudes, &mut gradient)?
+            <= config.tol_param
+        {
             converged = true;
             break;
         }
+    }
+    if converged {
+        iterations += polish_active_set(
+            observed,
+            neutron_signal,
+            basis,
+            &mut amplitudes,
+            &mut gradient,
+            config.tol_param,
+        )?;
     }
 
     let prediction = linear_prediction(neutron_signal, basis, &amplitudes)?;
@@ -442,6 +421,131 @@ fn poisson_gradient_into(
     for (slot, template) in gradient.iter_mut().zip(basis) {
         *slot = poisson_coordinate_gradient(observed, prediction, template);
     }
+}
+
+/// One joint step: Fisher scoring on the free amplitudes with projected
+/// backtracking, or a coordinate sweep when that step is unavailable or
+/// fails to decrease the objective.
+fn joint_iteration(
+    observed: &[f64],
+    neutron_signal: &[f64],
+    basis: &[Vec<f64>],
+    amplitudes: &mut Vec<f64>,
+    gradient: &mut [f64],
+) -> Result<(), FittingError> {
+    let prediction = linear_prediction(neutron_signal, basis, amplitudes)?;
+    poisson_gradient_into(observed, &prediction, basis, gradient);
+    let free: Vec<usize> = (0..basis.len())
+        .filter(|&component| amplitudes[component] > 0.0 || gradient[component] < 0.0)
+        .collect();
+
+    let joint_step =
+        fisher_scoring_direction(&prediction, basis, gradient, &free).and_then(|direction| {
+            projected_backtracking_step(
+                observed,
+                neutron_signal,
+                basis,
+                amplitudes,
+                &prediction,
+                &direction,
+            )
+        });
+    match joint_step {
+        Some(next) => *amplitudes = next,
+        None => {
+            for component in 0..basis.len() {
+                let base = linear_prediction_without_component(
+                    neutron_signal,
+                    basis,
+                    amplitudes,
+                    component,
+                )?;
+                amplitudes[component] =
+                    coordinate_minimum(observed, &base, &basis[component], amplitudes[component])?;
+            }
+        }
+    }
+    Ok(())
+}
+
+/// Scale-free KKT residual at the current amplitudes: the largest normalized
+/// gradient violation, refreshing `gradient` on the way.
+fn kkt_violation(
+    observed: &[f64],
+    neutron_signal: &[f64],
+    basis: &[Vec<f64>],
+    amplitudes: &[f64],
+    gradient: &mut [f64],
+) -> Result<f64, FittingError> {
+    let prediction = linear_prediction(neutron_signal, basis, amplitudes)?;
+    poisson_gradient_into(observed, &prediction, basis, gradient);
+    Ok(basis
+        .iter()
+        .enumerate()
+        .map(|(component, template)| {
+            let violation = if amplitudes[component] == 0.0 {
+                (-gradient[component]).max(0.0)
+            } else {
+                gradient[component].abs()
+            };
+            violation / template.iter().sum::<f64>()
+        })
+        .fold(0.0_f64, f64::max))
+}
+
+/// Resolve the active set at the converged point.
+///
+/// The stopping rule accepts a KKT residual up to `tol_param`, but along a
+/// nearly degenerate direction of a near-collinear template set the true
+/// multiplier of an active bound can be smaller than that slack. The
+/// iteration can then stop with an amplitude a hair above zero and its bound
+/// read as inactive — or the reverse — depending on the start and the
+/// tolerance, and the conditioned sigma flips regime with it. A few extra
+/// joint iterations at a much tighter tolerance sharpen the point (the
+/// Fisher-scoring step converges quadratically, so this is cheap), and an
+/// exact one-dimensional test then settles each amplitude: if its objective
+/// with the others held fixed is minimized at zero, it is snapped there and
+/// its bound is active. Returns the number of extra iterations taken.
+fn polish_active_set(
+    observed: &[f64],
+    neutron_signal: &[f64],
+    basis: &[Vec<f64>],
+    amplitudes: &mut Vec<f64>,
+    gradient: &mut [f64],
+    tol_param: f64,
+) -> Result<usize, FittingError> {
+    const POLISH_ROUNDS: usize = 4;
+    const POLISH_ITERATIONS: usize = 8;
+    let polish_tol = (tol_param * 1.0e-6).max(1.0e-15);
+    let mut extra = 0;
+    for _ in 0..POLISH_ROUNDS {
+        for _ in 0..POLISH_ITERATIONS {
+            if kkt_violation(observed, neutron_signal, basis, amplitudes, gradient)? <= polish_tol {
+                break;
+            }
+            joint_iteration(observed, neutron_signal, basis, amplitudes, gradient)?;
+            extra += 1;
+        }
+        let mut snapped = false;
+        for component in 0..basis.len() {
+            if amplitudes[component] > 0.0 {
+                let base = linear_prediction_without_component(
+                    neutron_signal,
+                    basis,
+                    amplitudes,
+                    component,
+                )?;
+                if poisson_coordinate_gradient_at(observed, &base, &basis[component], 0.0) >= 0.0 {
+                    amplitudes[component] = 0.0;
+                    snapped = true;
+                }
+            }
+        }
+        if !snapped {
+            break;
+        }
+    }
+    Ok(extra)
 }
 
 /// Expected (Fisher) information between two templates at the current
@@ -623,13 +727,16 @@ fn amplitude_upper_bound(observed: &[f64], template: &[f64]) -> Result<f64, Fitt
         .sum();
     let template_sum: f64 = template.iter().sum();
     let upper = maximum_observed * (scaled_observed_sum / template_sum);
-    if upper.is_finite() {
-        Ok(upper)
-    } else {
-        Err(FittingError::EvaluationFailed(
+    if upper.is_nan() {
+        return Err(FittingError::EvaluationFailed(
             "could not form a finite upper bound for a background amplitude".into(),
-        ))
+        ));
     }
+    // This is a loose bracket, not the solution. When it exceeds the largest
+    // representable value the root is still bracketed by `f64::MAX`, so an
+    // overflow here must not abort a fit whose optimum is representable — a
+    // zero-background optimum in particular fits any observation.
+    Ok(upper.min(f64::MAX))
 }
 
 fn linear_prediction_without_component(
@@ -719,15 +826,24 @@ fn poisson_coordinate_gradient_and_curvature_at(
 }
 
 /// Compute `weight * count / expected` without avoidable intermediate
-/// overflow. Exact zero observations contribute zero; a positive observation
-/// with zero expectation contributes infinity, as required by Poisson counts.
+/// overflow or precision loss. Exact zero observations contribute zero; a
+/// positive observation with zero expectation contributes infinity, as
+/// required by Poisson counts.
+///
+/// `count / expected` is the accurate form whenever it is representable:
+/// the alternative `weight / expected` goes subnormal once `expected`
+/// approaches `f64::MAX`, and the rounding it suffers then turns an exact
+/// zero gradient at the bound into a spurious sign that drives the
+/// one-dimensional solve up to the sub-ULP plateau of the counts.
 fn weighted_count_ratio(weight: f64, count: f64, expected: f64) -> f64 {
     if weight == 0.0 || count == 0.0 {
-        0.0
-    } else if weight <= expected {
-        count * (weight / expected)
+        return 0.0;
+    }
+    let ratio = count / expected;
+    if ratio.is_finite() {
+        weight * ratio
     } else {
-        weight * (count / expected)
+        count * (weight / expected)
     }
 }
 

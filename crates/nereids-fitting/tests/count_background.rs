@@ -1057,6 +1057,139 @@ fn interior_amplitude_is_not_flagged_as_bound() {
     assert_eq!(result.amplitude_at_bound, vec![false]);
 }
 
+/// Three genuinely independent, near-collinear templates with one partner
+/// whose true amplitude is negative, so its bound is active with a small
+/// multiplier — smaller than the default stopping slack along that nearly
+/// degenerate direction. The active set, and with it the conditioned sigma,
+/// must not depend on where the iteration started or how tight the
+/// tolerance was.
+#[test]
+fn active_set_and_sigma_are_invariant_to_start_and_tolerance() {
+    let n_bins = 200;
+    let x = |i: usize| i as f64 / n_bins as f64;
+    let neutron: Vec<f64> = (0..n_bins)
+        .map(|i| 5000.0 * (-(i as f64) / 80.0).exp())
+        .collect();
+    let dark = vec![1.0; n_bins];
+    let blocked: Vec<f64> = (0..n_bins).map(|i| 1.0 + 0.02 * x(i)).collect();
+    let third: Vec<f64> = (0..n_bins)
+        .map(|i| 1.0 + 0.02 * x(i) + 0.003 * x(i) * x(i))
+        .collect();
+    let observed: Vec<f64> = (0..n_bins)
+        .map(|i| neutron[i] + 100.0 * dark[i] - 30.0 * blocked[i] + 200.0 * third[i])
+        .collect();
+    let template = |name: &str, shape: &Vec<f64>| TwoArmBackgroundTemplate {
+        name: name.into(),
+        open_beam: shape.clone(),
+        sample: shape.clone(),
+    };
+    let templates = vec![
+        template("dark", &dark),
+        template("blocked_beam", &blocked),
+        template("third", &third),
+    ];
+
+    let mut reference: Option<(Vec<f64>, Vec<f64>)> = None;
+    for start in [[0.0; 3], [10.0; 3], [500.0; 3]] {
+        for tol in [1.0e-8, 1.0e-12] {
+            let result = fit_two_arm_background_templates(
+                &observed,
+                &observed,
+                signal(neutron.clone(), neutron.clone()),
+                1.0,
+                1.0,
+                &templates,
+                &start,
+                &PoissonConfig {
+                    tol_param: tol,
+                    ..PoissonConfig::default()
+                },
+            )
+            .expect("near-collinear fit");
+            assert!(result.converged, "start {start:?} tol {tol}");
+            assert_eq!(
+                result.amplitude_at_bound,
+                vec![false, true, false],
+                "start {start:?} tol {tol}: amplitudes {:?}",
+                result.amplitudes
+            );
+            let sigma = result.amplitude_uncertainties.expect("identifiable");
+            match &reference {
+                None => reference = Some((result.amplitudes.clone(), sigma)),
+                Some((amplitudes_0, sigma_0)) => {
+                    for ((a, a0), (s, s0)) in result
+                        .amplitudes
+                        .iter()
+                        .zip(amplitudes_0)
+                        .zip(sigma.iter().zip(sigma_0))
+                    {
+                        assert!(
+                            (a - a0).abs() <= 1.0e-6 * a0.abs().max(1.0),
+                            "amplitude drift at start {start:?} tol {tol}: {a} vs {a0}"
+                        );
+                        assert!(
+                            (s / s0 - 1.0).abs() < 1.0e-6,
+                            "sigma regime flipped at start {start:?} tol {tol}: {s} vs {s0}"
+                        );
+                    }
+                }
+            }
+        }
+    }
+}
+
+/// A conversion that underflows to zero would return an amplitude that cannot
+/// rebuild the nonzero background the fit found. It is as unrepresentable as
+/// an overflow and must be refused the same way.
+#[test]
+fn amplitude_conversion_underflow_is_rejected_like_overflow() {
+    let template = TwoArmBackgroundTemplate {
+        name: "enormous_units".into(),
+        open_beam: vec![1.0e308],
+        sample: vec![1.0e308],
+    };
+    let error = fit_two_arm_background_templates(
+        &[1.0e-20],
+        &[1.0e-20],
+        signal(vec![0.0], vec![0.0]),
+        1.0,
+        1.0,
+        &[template],
+        &[5.0e-324],
+        &PoissonConfig::default(),
+    )
+    .expect_err("an amplitude that underflows to zero must not escape the API");
+    assert!(
+        error.to_string().contains("rescale the template counts"),
+        "{error}"
+    );
+}
+
+/// The loose search bracket can overflow while the optimum itself is a
+/// perfectly representable zero. The overflow must not abort the fit.
+#[test]
+fn overflowing_search_bracket_does_not_reject_a_representable_optimum() {
+    let template = TwoArmBackgroundTemplate {
+        name: "lopsided".into(),
+        open_beam: vec![1.0],
+        sample: vec![0.1],
+    };
+    let result = fit_two_arm_background_templates(
+        &[1.0e308],
+        &[1.0e308],
+        signal(vec![1.0e308], vec![1.0e308]),
+        1.0,
+        1.0,
+        &[template],
+        &[0.0],
+        &PoissonConfig::default(),
+    )
+    .expect("zero background fits these observations exactly");
+    assert!(result.converged);
+    assert_eq!(result.amplitudes, vec![0.0]);
+    assert_eq!(result.poisson_deviance, 0.0);
+}
+
 /// Degrees of freedom must stay positive after dead bins are excluded, and the
 /// rejection must count informative bins rather than raw array length.
 #[test]

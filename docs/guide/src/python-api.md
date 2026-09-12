@@ -269,6 +269,8 @@ background_fit = nereids.fit_two_arm_background_templates(
     open_background_templates,   # 2-D, one row per named component
     sample_background_templates,
     initial_amplitudes,
+    open_loss,                   # the two losses from the same
+    sample_loss,                 # two_arm_count_response(...) call
 )
 ```
 
@@ -288,6 +290,17 @@ the independent measurement record themselves.
 the common reference neutron signal into expected counts for each complete
 acquisition (proton charge, live time, or another documented exposure), so a
 run-normalization difference between the arms cannot be absorbed as background.
+The scales apply to the neutron signal and its window losses only — templates
+are never multiplied by them, so supply each arm's template already expressed
+in that arm's own exposure. (Supplying a per-unit-exposure template to a
+3× exposure arm biases its amplitude by ~50% while the fit still looks only
+mildly poor.)
+
+`open_window_loss` and `sample_window_loss` are also required: pass the two
+losses that `two_arm_count_response` returned alongside the signals. They are
+the acquisition-window disclosure the result carries forward, exposure-scaled;
+they are never defaulted, because a default of zero would be a false "no loss"
+report.
 
 The returned `TwoArmBackgroundFitResult` reports whether the amplitudes are
 separately determined:

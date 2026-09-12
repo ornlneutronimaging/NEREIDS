@@ -1098,8 +1098,8 @@ def fit_two_arm_background_templates(
     open_background_templates: NDArray[np.float64],
     sample_background_templates: NDArray[np.float64],
     initial_amplitudes: NDArray[np.float64],
-    open_window_loss: float = 0.0,
-    sample_window_loss: float = 0.0,
+    open_window_loss: float,
+    sample_window_loss: float,
     max_iter: int = 200,
     tol: float = 1e-8,
 ) -> TwoArmBackgroundFitResult:
@@ -1115,18 +1115,29 @@ def fit_two_arm_background_templates(
     reference neutron signal into expected counts for each acquisition, so a
     run-normalization factor cannot be absorbed as background.
 
+    ``open_window_loss`` and ``sample_window_loss`` are required: pass the
+    two loss values returned by ``two_arm_count_response`` for the same
+    reference signal. They are the acquisition-window loss disclosure the
+    result carries forward (exposure-scaled), so defaulting them would
+    silently report "no loss".
+
+    The exposure scales apply to the neutron signal and its window losses
+    only. Templates are never multiplied by them: supply each arm's
+    template already expressed in that arm's own exposure.
+
     ``max_iter`` bounds the joint Fisher-scoring iterations and ``tol`` is
     the scale-free KKT gradient tolerance that declares convergence; both
-    are validated (``max_iter`` must be at least 1, ``tol`` finite and
-    positive).
+    are validated under these names (``max_iter`` at least 1, ``tol``
+    finite and positive).
 
     Raises ``ValueError`` for malformed inputs: shape mismatch, negative or
-    non-finite counts, window losses, exposure scales or tolerance,
-    duplicate or empty template names, a template that is zero in both
-    arms, or too few informative bins for the template rank. Raises
-    ``RuntimeError`` for model-evaluation failures during the fit, such as
-    a fitted amplitude that cannot be represented in the supplied template
-    units or an expectation that overflows.
+    non-finite counts, window losses, exposure scales, ``tol`` or
+    ``max_iter``, duplicate or empty template names, a template that is
+    zero in both arms, or too few informative bins for the template rank.
+    Raises ``RuntimeError`` for model-evaluation failures during the fit,
+    such as a fitted amplitude that cannot be represented in the supplied
+    template units (overflow or underflow) or an expectation that
+    overflows.
     """
     ...
 
