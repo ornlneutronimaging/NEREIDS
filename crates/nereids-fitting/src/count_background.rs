@@ -88,7 +88,8 @@ pub struct TwoArmBackgroundFitResult {
     pub n_informative: usize,
     /// Whether the bounded optimizer converged.
     pub converged: bool,
-    /// Optimizer iterations.
+    /// Joint iterations taken, including the post-convergence active-set
+    /// polish; never exceeds the caller's `max_iter`.
     pub iterations: usize,
 }
 
@@ -385,6 +386,7 @@ fn fit_non_negative_poisson_linear(
             &mut amplitudes,
             &mut gradient,
             config.tol_param,
+            config.max_iter - iterations,
         )?;
     }
 
@@ -513,18 +515,32 @@ fn polish_active_set(
     amplitudes: &mut Vec<f64>,
     gradient: &mut [f64],
     tol_param: f64,
+    budget: usize,
 ) -> Result<usize, FittingError> {
     const POLISH_ROUNDS: usize = 4;
     const POLISH_ITERATIONS: usize = 8;
+    // The polish spends only what the caller's `max_iter` has left, so the
+    // reported iteration count never exceeds the contract. With no budget
+    // remaining the active set is read as converged; that is the documented
+    // price of an exhausted budget, not a hidden extra cost.
+    if budget == 0 {
+        return Ok(0);
+    }
     let polish_tol = (tol_param * 1.0e-6).max(1.0e-15);
     let mut extra = 0;
     for _ in 0..POLISH_ROUNDS {
         for _ in 0..POLISH_ITERATIONS {
-            if kkt_violation(observed, neutron_signal, basis, amplitudes, gradient)? <= polish_tol {
+            if extra == budget
+                || kkt_violation(observed, neutron_signal, basis, amplitudes, gradient)?
+                    <= polish_tol
+            {
                 break;
             }
             joint_iteration(observed, neutron_signal, basis, amplitudes, gradient)?;
             extra += 1;
+        }
+        if extra == budget {
+            break;
         }
         let mut snapped = false;
         for component in 0..basis.len() {
@@ -562,7 +578,17 @@ fn expected_information(prediction: &[f64], left: &[f64], right: &[f64]) -> f64 
         .zip(left)
         .zip(right)
         .filter(|&((&expected, &l), &r)| expected > 0.0 && l != 0.0 && r != 0.0)
-        .map(|((&expected, &l), &r)| (l / expected) * r)
+        .map(|((&expected, &l), &r)| {
+            // Split the expectation symmetrically between the two weights.
+            // `(l / expected) * r` overflows for a subnormal expectation while
+            // the reversed order does not, which would make the nominally
+            // symmetric information matrix asymmetric. Normalized weights
+            // are at most one, so `w / sqrt(expected)` stays finite down to
+            // the smallest subnormal, and the term is identical in both
+            // orders by construction.
+            let scale = expected.sqrt();
+            (l / scale) * (r / scale)
+        })
         .sum()
 }
 
@@ -1158,7 +1184,7 @@ fn poisson_deviance(observed: &[f64], predicted: &[f64]) -> f64 {
 
 #[cfg(test)]
 mod tests {
-    use super::{count_informative_bins, poisson_deviance};
+    use super::{count_informative_bins, expected_information, poisson_deviance};
 
     #[test]
     fn exact_zero_observation_and_prediction_have_zero_deviance() {
@@ -1177,6 +1203,19 @@ mod tests {
 
     /// `(2 * model) * h` overflows for `model > MAX / 2` although the exact
     /// term `2 * model * h` is representable; the factor order matters.
+    /// `(l / expected) * r` overflows for a subnormal expectation while the
+    /// reversed order does not, which would make the information matrix
+    /// asymmetric. The symmetric split must give the same finite value in
+    /// both orders.
+    #[test]
+    fn expected_information_is_symmetric_and_finite_at_subnormal_expectation() {
+        let forward = expected_information(&[1.0e-320], &[1.0], &[1.0e-320]);
+        let reversed = expected_information(&[1.0e-320], &[1.0e-320], &[1.0]);
+        assert!(forward.is_finite(), "forward = {forward}");
+        assert_eq!(forward, reversed);
+        assert!((forward - 1.0).abs() < 1.0e-9, "forward = {forward}");
+    }
+
     #[test]
     fn near_equality_extreme_counts_keep_finite_deviance() {
         let deviance = poisson_deviance(&[1.0001e308], &[1.0e308]);

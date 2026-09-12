@@ -1125,10 +1125,11 @@ def fit_two_arm_background_templates(
     only. Templates are never multiplied by them: supply each arm's
     template already expressed in that arm's own exposure.
 
-    ``max_iter`` bounds the joint Fisher-scoring iterations and ``tol`` is
-    the scale-free KKT gradient tolerance that declares convergence; both
-    are validated under these names (``max_iter`` at least 1, ``tol``
-    finite and positive).
+    ``max_iter`` bounds every joint Fisher-scoring iteration, including the
+    short post-convergence polish that resolves the active set, so the
+    reported ``iterations`` never exceeds it; ``tol`` is the scale-free KKT
+    gradient tolerance that declares convergence. Both are validated under
+    these names (``max_iter`` at least 1, ``tol`` finite and positive).
 
     Raises ``ValueError`` for malformed inputs: shape mismatch, negative or
     non-finite counts, window losses, exposure scales, ``tol`` or

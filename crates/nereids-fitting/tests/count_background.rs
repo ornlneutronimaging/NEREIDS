@@ -1190,6 +1190,37 @@ fn overflowing_search_bracket_does_not_reject_a_representable_optimum() {
     assert_eq!(result.poisson_deviance, 0.0);
 }
 
+/// `max_iter` is the caller's whole iteration budget: the post-convergence
+/// active-set polish spends only what the main loop left, so the reported
+/// count can never exceed it — including the tightest budget of one.
+#[test]
+fn max_iter_caps_the_reported_iterations_including_the_polish() {
+    let template = shaped_template("blocked_beam");
+    let signal = signals();
+    let observed = synthetic_observation(signal.clone(), &template, 25.0);
+    for max_iter in [1, 2, 3, 200] {
+        let result = fit_two_arm_background_templates(
+            &observed.open_beam,
+            &observed.sample,
+            signal.clone(),
+            1.0,
+            1.0,
+            std::slice::from_ref(&template),
+            &[1.0],
+            &PoissonConfig {
+                max_iter,
+                ..PoissonConfig::default()
+            },
+        )
+        .expect("fit within budget");
+        assert!(
+            result.iterations <= max_iter,
+            "max_iter {max_iter} but reported {} iterations",
+            result.iterations
+        );
+    }
+}
+
 /// Degrees of freedom must stay positive after dead bins are excluded, and the
 /// rejection must count informative bins rather than raw array length.
 #[test]
