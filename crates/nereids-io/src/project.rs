@@ -2053,9 +2053,16 @@ fn read_results(file: &hdf5::File, snap: &mut ProjectSnapshot) -> Result<(), IoE
             let json: VarLenUnicode = ds
                 .read_scalar()
                 .map_err(|e| hdf5_err("/results/single_fit/doppler_routes", e))?;
-            let routes: Vec<IsotopeDopplerRoute> = serde_json::from_str(json.as_str())
-                .map_err(|e| hdf5_err("deserialize /results/single_fit/doppler_routes", e))?;
-            snap.single_fit_doppler_routes = Some(routes);
+            // The routes are disclosure, not data the fit needs, and a
+            // project written by a newer build may name a route reason this
+            // build does not know: the project still opens, without them.
+            match serde_json::from_str::<Vec<IsotopeDopplerRoute>>(json.as_str()) {
+                Ok(routes) => snap.single_fit_doppler_routes = Some(routes),
+                Err(e) => eprintln!(
+                    "load_project: warning: /results/single_fit/doppler_routes could not be \
+                     read ({e}); the fit's Doppler routes are not restored"
+                ),
+            }
         }
     }
 
@@ -2246,6 +2253,33 @@ mod tests {
             endf_cache_dropped: vec![],
             provenance: vec![],
         }
+    }
+
+    #[test]
+    fn unreadable_doppler_routes_load_as_none() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("routes.nrd.h5");
+        let mut snap = minimal_snapshot();
+        snap.single_fit_densities = Some(vec![0.001]);
+        snap.single_fit_doppler_routes = Some(vec![IsotopeDopplerRoute {
+            isotope: nereids_core::types::Isotope::new(74, 182).unwrap(),
+            route: DopplerRoute::Unbroadened,
+        }]);
+        save_project(&path, &snap).unwrap();
+        {
+            let file = hdf5::File::open_rw(&path).unwrap();
+            let sf = file.group("results").unwrap().group("single_fit").unwrap();
+            sf.unlink("doppler_routes").unwrap();
+            let vlu: VarLenUnicode = r#"{"routes": "written by a newer build"}"#.parse().unwrap();
+            sf.new_dataset::<VarLenUnicode>()
+                .shape(())
+                .create("doppler_routes")
+                .and_then(|ds| ds.write_scalar(&vlu))
+                .unwrap();
+        }
+        let loaded = load_project(&path).unwrap();
+        assert_eq!(loaded.single_fit_densities, Some(vec![0.001]));
+        assert!(loaded.single_fit_doppler_routes.is_none());
     }
 
     #[test]

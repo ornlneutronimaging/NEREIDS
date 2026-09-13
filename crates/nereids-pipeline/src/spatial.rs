@@ -12,7 +12,7 @@ use nereids_fitting::transmission_model::TEMPERATURE_FIT_UPPER_BOUND_K;
 use nereids_physics::doppler_route::{DopplerRoute, IsotopeDopplerRoute, edge_fallback_warning};
 use nereids_physics::resolution::build_resolution_plan;
 use nereids_physics::transmission::{
-    DopplerPlan, InstrumentParams, broadened_cross_sections_on_working_grid,
+    DopplerPlan, InstrumentParams, broadened_cross_sections_on_working_grid, explicit_table_routes,
 };
 
 use crate::error::PipelineError;
@@ -1609,28 +1609,35 @@ pub fn spatial_map_typed(
     // Decide the Doppler routes once for the whole map at the fit's upper
     // temperature bound and build the zero-kelvin rows only the
     // sampled-table isotopes need; every pixel shares the plan, so no pixel
-    // re-evaluates the resonance equation.
+    // re-evaluates the resonance equation. A caller-supplied zero-kelvin
+    // table supersedes the plan: every pixel broadens that table, so that
+    // is what the map discloses (never an edge fallback, so no warning),
+    // and no plan is built for it.
     let mut planned_routes: Option<Vec<DopplerRoute>> = None;
     let fast_config = if config.fit_temperature() {
-        // Bare `?`: the `From<TransmissionError>` impl maps
-        // `TransmissionError::Cancelled` to `PipelineError::Cancelled`,
-        // keeping the documented uniform-Cancelled contract when the user
-        // cancels during this (expensive) precompute.  A
-        // `.map_err(PipelineError::Transmission)` here would bypass that
-        // conversion and surface cancellation as an error.
-        let plan = DopplerPlan::new(
-            config.energies(),
-            config.resonance_data(),
-            TEMPERATURE_FIT_UPPER_BOUND_K,
-            instrument.as_ref(),
-            cancel,
-        )?;
-        planned_routes = Some(plan.routes().to_vec());
         let mut cfg = config
             .clone()
             .with_precomputed_cross_sections(xs)
-            .with_precomputed_doppler_plan(Arc::new(plan))
             .with_compute_covariance(true);
+        if config.precomputed_base_xs().is_some() {
+            planned_routes = Some(explicit_table_routes(config.resonance_data().len()));
+        } else {
+            // Bare `?`: the `From<TransmissionError>` impl maps
+            // `TransmissionError::Cancelled` to `PipelineError::Cancelled`,
+            // keeping the documented uniform-Cancelled contract when the
+            // user cancels during this (expensive) precompute.  A
+            // `.map_err(PipelineError::Transmission)` here would bypass that
+            // conversion and surface cancellation as an error.
+            let plan = DopplerPlan::new(
+                config.energies(),
+                config.resonance_data(),
+                TEMPERATURE_FIT_UPPER_BOUND_K,
+                instrument.as_ref(),
+                cancel,
+            )?;
+            planned_routes = Some(plan.routes().to_vec());
+            cfg = cfg.with_precomputed_doppler_plan(Arc::new(plan));
+        }
         if let Some(plan) = resolution_plan.clone() {
             cfg = cfg.with_precomputed_resolution_plan(plan);
         }
@@ -5595,6 +5602,55 @@ mod tests {
         assert!(!result.warnings.iter().any(|w| w.starts_with("Doppler")));
 
         // What the map discloses is what a pixel executed.
+        let pixel = InputData::Transmission {
+            transmission: t_3d.slice(s![.., 0, 0]).to_vec(),
+            uncertainty: u_3d.slice(s![.., 0, 0]).to_vec(),
+        };
+        let per_pixel = fit_spectrum_typed(&pixel, &config).unwrap();
+        assert_eq!(per_pixel.doppler_routes, result.doppler_routes);
+    }
+
+    /// A caller's zero-kelvin table supersedes the plan on the
+    /// free-temperature path; the map discloses what every pixel executed.
+    #[test]
+    fn spatial_explicit_table_free_temperature_discloses_the_table_route() {
+        let rd = u238_with_formalism(ResonanceFormalism::MLBW);
+        let energies: Vec<f64> = (0..101).map(|i| 4.0 + (i as f64) * 0.05).collect();
+        let (t_3d, u_3d) = synthetic_grid_transmission(&rd, 0.001, &energies, 2, 2);
+        let data = InputData3D::Transmission {
+            transmission: t_3d.view(),
+            uncertainty: u_3d.view(),
+        };
+        let table = nereids_physics::transmission::unbroadened_cross_sections(
+            &energies,
+            std::slice::from_ref(&rd),
+            None,
+        )
+        .unwrap();
+        let config = UnifiedFitConfig::new(
+            energies,
+            vec![rd],
+            vec!["U-238".into()],
+            300.0,
+            None,
+            vec![0.0005],
+        )
+        .unwrap()
+        .with_solver(SolverConfig::LevenbergMarquardt(LmConfig {
+            max_iter: 3,
+            ..LmConfig::default()
+        }))
+        .with_fit_temperature(true)
+        .with_precomputed_base_xs(Arc::new(table));
+        let result = spatial_map_typed(&data, &config, None, None, None).unwrap();
+        let routes = result.doppler_routes.as_ref().unwrap();
+        assert_eq!(routes.len(), 1);
+        assert_eq!(
+            routes[0].to_string(),
+            "U-238: sampled-table kernel-on-grid (caller-supplied zero-kelvin table)"
+        );
+        assert!(!result.warnings.iter().any(|w| w.starts_with("Doppler")));
+
         let pixel = InputData::Transmission {
             transmission: t_3d.slice(s![.., 0, 0]).to_vec(),
             uncertainty: u_3d.slice(s![.., 0, 0]).to_vec(),

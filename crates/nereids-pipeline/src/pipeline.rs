@@ -1102,6 +1102,11 @@ impl UnifiedFitConfig {
     pub fn precomputed_cross_sections(&self) -> Option<&Arc<Vec<Vec<f64>>>> {
         self.precomputed_cross_sections.as_ref()
     }
+    /// The caller's zero-kelvin table, when one supersedes the resonance
+    /// source for Doppler broadening (see [`Self::with_precomputed_base_xs`]).
+    pub(crate) fn precomputed_base_xs(&self) -> Option<&Arc<Vec<Vec<f64>>>> {
+        self.precomputed_base_xs.as_ref()
+    }
     /// Number of density parameters (one per group or per isotope).
     pub fn n_density_params(&self) -> usize {
         self.n_density_params.unwrap_or(self.resonance_data.len())
@@ -9482,6 +9487,37 @@ mod tests {
             "{warning}"
         );
         assert!(warning.ends_with("(route gate at 5000 K)"), "{warning}");
+    }
+
+    /// MLBW whose range ends at 8 eV on a grid that stops at 6.9 eV and
+    /// resumes at 9 eV: no thermal window crosses the edge, the grid jumps
+    /// past it, and the demotion is disclosed and warned about.
+    #[test]
+    fn fit_result_warns_when_the_grid_leaves_the_resolved_range() {
+        let mut short_range = u238_with_formalism(ResonanceFormalism::MLBW);
+        short_range.ranges[0].energy_high = 8.0;
+        let mut energies: Vec<f64> = (0..201).map(|i| 4.0 + (i as f64) * 0.0145).collect();
+        energies.extend((0..4).map(|i| 9.0 + (i as f64) * 0.1));
+        let result = fit_with(&short_range, &energies, false);
+        assert!(matches!(
+            result.doppler_routes.as_ref().unwrap()[0].route,
+            DopplerRoute::SampledTable {
+                reason: SampledTableReason::GridLeavesResolvedRange { .. }
+            }
+        ));
+        let warning = result
+            .warnings
+            .iter()
+            .find(|w| w.starts_with("Doppler: U-238 took the sampled-table route"))
+            .expect("a grid past the resolved range must be warned about");
+        assert!(
+            warning.contains(
+                "although it is resolved MLBW: grid energy 9.00e0 eV lies outside the \
+                 resolved MLBW range [1.00e-5, 8.00e0] eV"
+            ),
+            "{warning}"
+        );
+        assert!(warning.ends_with("(route gate at 300 K)"), "{warning}");
     }
 
     #[test]
