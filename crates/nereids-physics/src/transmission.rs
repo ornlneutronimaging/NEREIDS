@@ -30,7 +30,9 @@ use rayon::prelude::*;
 
 use nereids_endf::resonance::ResonanceData;
 
+use crate::continuous_doppler::{self, ContinuousDopplerError};
 use crate::doppler::{self, DopplerParams, DopplerParamsError};
+use crate::doppler_route::{DopplerRoute, SampledTableReason};
 use crate::reich_moore;
 use crate::resolution::{self, ResolutionError, ResolutionFunction};
 
@@ -181,12 +183,87 @@ fn build_extended_xs_from_base(
     for (data_i, &ext_i) in data_indices.iter().enumerate() {
         xs_ext[ext_i] = xs_raw[data_i];
     }
+    let plan = reich_moore::CrossSectionPlan::new(rd);
     for (j, &e) in ext_energies.iter().enumerate() {
         if !is_data_point[j] {
-            xs_ext[j] = reich_moore::cross_sections_at_energy(rd, e).total;
+            xs_ext[j] = plan.evaluate_one(e).total;
         }
     }
     xs_ext
+}
+
+/// The unbroadened total cross-section of one isotope on a grid.
+fn unbroadened_totals(rd: &ResonanceData, energies: &[f64]) -> Vec<f64> {
+    reich_moore::cross_sections_on_grid(rd, energies)
+        .into_iter()
+        .map(|xs| xs.total)
+        .collect()
+}
+
+/// Tier 2: kernel-on-grid broadening of a zero-kelvin table.
+fn broaden_sampled_table(
+    work_energies: &[f64],
+    table: Vec<f64>,
+    rd: &ResonanceData,
+    temperature_k: f64,
+) -> Result<Vec<f64>, TransmissionError> {
+    if temperature_k > 0.0 {
+        let params = DopplerParams::new(temperature_k, rd.awr)?;
+        doppler::doppler_broaden(work_energies, &table, &params).map_err(Into::into)
+    } else {
+        Ok(table)
+    }
+}
+
+/// Tier 2 with the analytical temperature derivative.
+fn broaden_sampled_table_with_derivative(
+    work_energies: &[f64],
+    table: Vec<f64>,
+    rd: &ResonanceData,
+    temperature_k: f64,
+) -> Result<(Vec<f64>, Vec<f64>), TransmissionError> {
+    if temperature_k > 0.0 {
+        let params = DopplerParams::new(temperature_k, rd.awr)?;
+        doppler::doppler_broaden_with_derivative(work_energies, &table, &params).map_err(Into::into)
+    } else {
+        let zeros = vec![0.0; work_energies.len()];
+        Ok((table, zeros))
+    }
+}
+
+/// Doppler-broaden one isotope on a working grid by the route the gate
+/// assigns it, and report that route.
+///
+/// This is the one place the two tiers meet: the gate decides, tier 1
+/// integrates the resonance equation, tier 2 samples it on the grid and
+/// convolves. A tier-1 failure is an error, never a fallback to tier 2.
+fn broaden_isotope_on_grid(
+    work_energies: &[f64],
+    rd: &ResonanceData,
+    temperature_k: f64,
+    cancel: Option<&AtomicBool>,
+) -> Result<(Vec<f64>, DopplerRoute), TransmissionError> {
+    if temperature_k <= 0.0 {
+        return Ok((
+            unbroadened_totals(rd, work_energies),
+            DopplerRoute::Unbroadened,
+        ));
+    }
+    let params = DopplerParams::new(temperature_k, rd.awr)?;
+    let route = continuous_doppler::classify_isotope(rd, work_energies, params.u());
+    let sigma = match route {
+        DopplerRoute::Unbroadened => unbroadened_totals(rd, work_energies),
+        DopplerRoute::Continuous { .. } => {
+            continuous_doppler::broaden(work_energies, rd, &params, cancel)?
+        }
+        DopplerRoute::SampledTable { .. } => broaden_sampled_table(
+            work_energies,
+            unbroadened_totals(rd, work_energies),
+            rd,
+            temperature_k,
+        )?,
+    };
+    Ok((sigma, route))
 }
 
 /// Validate `base_xs` shape against `resonance_data` and `energies`.
@@ -291,6 +368,9 @@ pub enum TransmissionError {
     Doppler(DopplerParamsError),
     /// Doppler broadening input validation failed (e.g. length mismatch).
     DopplerBroadening(crate::doppler::DopplerError),
+    /// The continuous (tier-1) Doppler integral failed: a quadrature limit
+    /// or an invalid result. Never a silent fallback to the sampled table.
+    ContinuousDoppler(ContinuousDopplerError),
     /// Computation was cancelled via the cancel token.
     Cancelled,
     /// Input array mismatch (e.g. cross-sections vs thicknesses length).
@@ -303,6 +383,7 @@ impl fmt::Display for TransmissionError {
             Self::Resolution(e) => write!(f, "resolution broadening error: {}", e),
             Self::Doppler(e) => write!(f, "Doppler parameter error: {}", e),
             Self::DopplerBroadening(e) => write!(f, "Doppler broadening error: {}", e),
+            Self::ContinuousDoppler(e) => write!(f, "continuous Doppler error: {}", e),
             Self::Cancelled => write!(f, "computation cancelled"),
             Self::InputMismatch(msg) => write!(f, "input mismatch: {}", msg),
         }
@@ -315,6 +396,7 @@ impl std::error::Error for TransmissionError {
             Self::Resolution(e) => Some(e),
             Self::Doppler(e) => Some(e),
             Self::DopplerBroadening(e) => Some(e),
+            Self::ContinuousDoppler(e) => Some(e),
             Self::Cancelled => None,
             Self::InputMismatch(_) => None,
         }
@@ -330,6 +412,17 @@ impl From<ResolutionError> for TransmissionError {
 impl From<DopplerParamsError> for TransmissionError {
     fn from(e: DopplerParamsError) -> Self {
         Self::Doppler(e)
+    }
+}
+
+impl From<ContinuousDopplerError> for TransmissionError {
+    /// Cancellation observed inside the tier-1 integral is the same
+    /// cancellation every other path reports.
+    fn from(e: ContinuousDopplerError) -> Self {
+        match e {
+            ContinuousDopplerError::Cancelled => Self::Cancelled,
+            other => Self::ContinuousDoppler(other),
+        }
     }
 }
 
@@ -406,6 +499,8 @@ pub struct WorkingGridXs {
     pub sigma: Vec<Vec<f64>>,
     /// Working-grid layout (energies + data-grid index map).
     pub layout: WorkingGridLayout,
+    /// The Doppler route each isotope took, aligned with `sigma`.
+    pub routes: Vec<DopplerRoute>,
 }
 
 /// Working-grid Doppler-broadened cross-sections and their analytical
@@ -422,6 +517,8 @@ pub struct WorkingGridXsWithDerivative {
     pub dsigma_dt: Vec<Vec<f64>>,
     /// Working-grid layout (energies + data-grid index map).
     pub layout: WorkingGridLayout,
+    /// The Doppler route each isotope took, aligned with `sigma`.
+    pub routes: Vec<DopplerRoute>,
 }
 
 /// Compute transmission from cross-sections via Beer-Lambert law.
@@ -652,16 +749,8 @@ pub fn forward_model(
         .par_iter()
         .filter(|(_, thickness)| *thickness > 0.0)
         .map(|(res_data, thickness)| {
-            let unbroadened: Vec<f64> = work_energies
-                .iter()
-                .map(|&e| reich_moore::cross_sections_at_energy(res_data, e).total)
-                .collect();
-            let after_doppler = if sample.temperature_k() > 0.0 {
-                let params = DopplerParams::new(sample.temperature_k(), res_data.awr)?;
-                doppler::doppler_broaden(work_energies, &unbroadened, &params)?
-            } else {
-                unbroadened
-            };
+            let (after_doppler, _route) =
+                broaden_isotope_on_grid(work_energies, res_data, sample.temperature_k(), None)?;
             Ok((after_doppler, *thickness))
         })
         .collect();
@@ -737,7 +826,7 @@ pub fn broadened_cross_sections(
 ) -> Result<Vec<Vec<f64>>, TransmissionError> {
     // Delegate to the working-grid variant and extract the data points.
     // Doppler runs on the working (aux) grid for boundary accuracy.
-    let WorkingGridXs { sigma, layout } = broadened_cross_sections_on_working_grid(
+    let WorkingGridXs { sigma, layout, .. } = broadened_cross_sections_on_working_grid(
         energies,
         resonance_data,
         temperature_k,
@@ -782,24 +871,14 @@ pub fn broadened_cross_sections_on_working_grid(
     // must be applied after Beer-Lambert on total transmission).  σ is returned
     // on the working grid WITHOUT extracting the data points.
     // Cancellation is checked per-isotope inside the parallel map.
-    let result: Result<Vec<Vec<f64>>, TransmissionError> = resonance_data
+    let result: Result<Vec<(Vec<f64>, DopplerRoute)>, TransmissionError> = resonance_data
         .par_iter()
         .map(|rd| {
             // Check cancellation before starting this isotope.
             if cancel.is_some_and(|c| c.load(Ordering::Relaxed)) {
                 return Err(TransmissionError::Cancelled);
             }
-
-            let unbroadened: Vec<f64> = work_energies
-                .iter()
-                .map(|&e| reich_moore::cross_sections_at_energy(rd, e).total)
-                .collect();
-            if temperature_k > 0.0 {
-                let params = DopplerParams::new(temperature_k, rd.awr)?;
-                doppler::doppler_broaden(work_energies, &unbroadened, &params).map_err(Into::into)
-            } else {
-                Ok(unbroadened)
-            }
+            broaden_isotope_on_grid(work_energies, rd, temperature_k, cancel)
         })
         .collect();
 
@@ -809,9 +888,11 @@ pub fn broadened_cross_sections_on_working_grid(
         return Err(TransmissionError::Cancelled);
     }
 
+    let (sigma, routes) = result?.into_iter().unzip();
     Ok(WorkingGridXs {
-        sigma: result?,
+        sigma,
         layout,
+        routes,
     })
 }
 
@@ -875,78 +956,36 @@ pub fn broadened_cross_sections_for_transmission(
                 return Err(TransmissionError::Cancelled);
             }
 
-            let sigma_eff = if let Some((ref ext_energies, ref data_indices)) = ext_grid {
-                // Extended grid available: evaluate the full pipeline on the
-                // extended grid and extract at data positions.
+            // The working grid is the extended grid when one exists.
+            let (grid, data_indices): (&[f64], Option<&[usize]>) = match &ext_grid {
+                Some((ext_energies, data_indices)) => {
+                    (ext_energies.as_slice(), Some(data_indices.as_slice()))
+                }
+                None => (energies, None),
+            };
 
-                // 1. Unbroadened cross sections on extended grid.
-                let unbroadened: Vec<f64> = ext_energies
+            // 1-2. Doppler-broadened σ on the working grid.
+            let (after_doppler, _route) = broaden_isotope_on_grid(grid, rd, temperature_k, cancel)?;
+
+            // 3. Convert to transmission: T = exp(-nd × σ_D).
+            let transmission: Vec<f64> = after_doppler
+                .iter()
+                .map(|&sigma| (-nd * sigma).exp())
+                .collect();
+
+            // 4. Resolution-broaden T.
+            let t_broadened =
+                resolution::apply_resolution_presorted(grid, &transmission, &instrument.resolution);
+
+            // 5. Convert back to effective σ at the data points:
+            //    σ_eff = -ln(T_broad) / nd.
+            let to_sigma = |t: f64| -t.clamp(1e-30, 1.0).ln() / nd;
+            let sigma_eff: Vec<f64> = match data_indices {
+                Some(data_indices) => data_indices
                     .iter()
-                    .map(|&e| reich_moore::cross_sections_at_energy(rd, e).total)
-                    .collect();
-
-                // 2. Doppler broadening.
-                let after_doppler = if temperature_k > 0.0 {
-                    let params = DopplerParams::new(temperature_k, rd.awr)?;
-                    doppler::doppler_broaden(ext_energies, &unbroadened, &params)?
-                } else {
-                    unbroadened
-                };
-
-                // 3. Convert to transmission: T = exp(-nd × σ_D).
-                let transmission: Vec<f64> = after_doppler
-                    .iter()
-                    .map(|&sigma| (-nd * sigma).exp())
-                    .collect();
-
-                // 4. Resolution-broaden T.
-                let t_broadened = resolution::apply_resolution_presorted(
-                    ext_energies,
-                    &transmission,
-                    &instrument.resolution,
-                );
-
-                // 5. Convert back to effective σ: σ_eff = -ln(T_broad) / nd.
-                data_indices
-                    .iter()
-                    .map(|&i| {
-                        let t = t_broadened[i].clamp(1e-30, 1.0);
-                        -t.ln() / nd
-                    })
-                    .collect()
-            } else {
-                // No extended grid (e.g. tabulated resolution with no aux grid):
-                // Doppler on data grid, Beer-Lambert, resolution on data grid.
-                let unbroadened: Vec<f64> = energies
-                    .iter()
-                    .map(|&e| reich_moore::cross_sections_at_energy(rd, e).total)
-                    .collect();
-
-                let after_doppler = if temperature_k > 0.0 {
-                    let params = DopplerParams::new(temperature_k, rd.awr)?;
-                    doppler::doppler_broaden(energies, &unbroadened, &params)?
-                } else {
-                    unbroadened
-                };
-
-                let transmission: Vec<f64> = after_doppler
-                    .iter()
-                    .map(|&sigma| (-nd * sigma).exp())
-                    .collect();
-
-                let t_broadened = resolution::apply_resolution_presorted(
-                    energies,
-                    &transmission,
-                    &instrument.resolution,
-                );
-
-                t_broadened
-                    .iter()
-                    .map(|&t| {
-                        let t_clamped = t.clamp(1e-30, 1.0);
-                        -t_clamped.ln() / nd
-                    })
-                    .collect()
+                    .map(|&i| to_sigma(t_broadened[i]))
+                    .collect(),
+                None => t_broadened.iter().map(|&t| to_sigma(t)).collect(),
             };
 
             Ok(sigma_eff)
@@ -980,11 +1019,7 @@ pub fn unbroadened_cross_sections(
             if cancel.is_some_and(|c| c.load(Ordering::Relaxed)) {
                 return Err(TransmissionError::Cancelled);
             }
-            let xs: Vec<f64> = energies
-                .iter()
-                .map(|&e| reich_moore::cross_sections_at_energy(rd, e).total)
-                .collect();
-            Ok(xs)
+            Ok(unbroadened_totals(rd, energies))
         })
         .collect();
 
@@ -1015,7 +1050,7 @@ pub fn broadened_cross_sections_from_base(
     // Doppler runs on the working (aux) grid for boundary accuracy; resolution
     // is NOT applied here (issue #442).  Extracting the data points here keeps
     // this function's contract (data-grid σ) unchanged.
-    let WorkingGridXs { sigma, layout } = broadened_cross_sections_from_base_on_working_grid(
+    let WorkingGridXs { sigma, layout, .. } = broadened_cross_sections_from_base_on_working_grid(
         energies,
         base_xs,
         resonance_data,
@@ -1067,19 +1102,26 @@ pub fn broadened_cross_sections_from_base_on_working_grid(
             } else {
                 xs_raw.clone()
             };
-            if temperature_k > 0.0 {
-                let params = DopplerParams::new(temperature_k, rd.awr)?;
-                doppler::doppler_broaden(work_energies, &xs_work, &params).map_err(Into::into)
-            } else {
-                Ok(xs_work)
-            }
+            broaden_sampled_table(work_energies, xs_work, rd, temperature_k)
         })
         .collect();
 
     Ok(WorkingGridXs {
         sigma: sigma?,
         layout,
+        routes: explicit_table_routes(resonance_data.len()),
     })
+}
+
+/// Every isotope of a caller-supplied table takes the sampled-table route
+/// for that reason: the engine never evaluated its source.
+fn explicit_table_routes(n_isotopes: usize) -> Vec<DopplerRoute> {
+    vec![
+        DopplerRoute::SampledTable {
+            reason: SampledTableReason::ExplicitTable,
+        };
+        n_isotopes
+    ]
 }
 
 /// Compute Doppler-broadened cross-sections and their **analytical**
@@ -1106,6 +1148,7 @@ pub fn broadened_cross_sections_with_analytical_derivative_from_base(
         sigma,
         dsigma_dt,
         layout,
+        ..
     } = broadened_cross_sections_with_analytical_derivative_from_base_on_working_grid(
         energies,
         base_xs,
@@ -1158,14 +1201,7 @@ pub fn broadened_cross_sections_with_analytical_derivative_from_base_on_working_
             } else {
                 xs_raw.clone()
             };
-            if temperature_k > 0.0 {
-                let params = DopplerParams::new(temperature_k, rd.awr)?;
-                doppler::doppler_broaden_with_derivative(work_energies, &xs_work, &params)
-                    .map_err(Into::into)
-            } else {
-                let zeros = vec![0.0; work_energies.len()];
-                Ok((xs_work, zeros))
-            }
+            broaden_sampled_table_with_derivative(work_energies, xs_work, rd, temperature_k)
         })
         .collect();
 
@@ -1181,6 +1217,7 @@ pub fn broadened_cross_sections_with_analytical_derivative_from_base_on_working_
         sigma,
         dsigma_dt,
         layout,
+        routes: explicit_table_routes(resonance_data.len()),
     })
 }
 
@@ -1274,12 +1311,7 @@ pub fn forward_model_from_base_xs(
             } else {
                 xs_raw.clone()
             };
-            if temperature_k > 0.0 {
-                let params = DopplerParams::new(temperature_k, rd.awr)?;
-                doppler::doppler_broaden(work_energies, &xs_ext, &params).map_err(Into::into)
-            } else {
-                Ok(xs_ext)
-            }
+            broaden_sampled_table(work_energies, xs_ext, rd, temperature_k)
         })
         .collect();
     let doppler_xs = doppler_xs?;
@@ -1313,11 +1345,301 @@ pub fn forward_model_from_base_xs(
     }
 }
 
+/// Decide the Doppler route of every isotope on the same working grid the
+/// broadening entry points use, without broadening anything.
+///
+/// The working grid (the auxiliary extended grid under Gaussian resolution,
+/// else the data grid) is part of the gate input, so this takes the same
+/// `instrument` the broadeners take; a query that ignored it could disclose
+/// a route the broadeners do not execute. `temperature_k <= 0` means no
+/// broadening, so every isotope is [`DopplerRoute::Unbroadened`].
+///
+/// # Errors
+/// * [`TransmissionError::Resolution`] — `instrument` is `Some` and
+///   `energies` is not sorted ascending.
+/// * [`TransmissionError::Doppler`] — `DopplerParams` validation fails.
+pub fn doppler_routes(
+    energies: &[f64],
+    resonance_data: &[ResonanceData],
+    temperature_k: f64,
+    instrument: Option<&InstrumentParams>,
+) -> Result<Vec<DopplerRoute>, TransmissionError> {
+    if instrument.is_some() && !energies.windows(2).all(|w| w[0] <= w[1]) {
+        return Err(ResolutionError::UnsortedEnergies.into());
+    }
+    if temperature_k <= 0.0 {
+        return Ok(vec![DopplerRoute::Unbroadened; resonance_data.len()]);
+    }
+    let rd_refs: Vec<&ResonanceData> = resonance_data.iter().collect();
+    let ext_grid = build_aux_grid(energies, instrument, &rd_refs);
+    let (work_energies, _) = working_grid_layout(energies, ext_grid.as_ref());
+    resonance_data
+        .iter()
+        .map(|rd| {
+            let params = DopplerParams::new(temperature_k, rd.awr)?;
+            Ok(continuous_doppler::classify_isotope(
+                rd,
+                work_energies,
+                params.u(),
+            ))
+        })
+        .collect()
+}
+
+/// Per-isotope Doppler routes decided once for a fit, plus the zero-kelvin
+/// data-grid rows that only the sampled-table isotopes need.
+///
+/// A free-temperature fit evaluates the model at many temperatures. The
+/// route must not flip between them, so it is decided once at
+/// `gate_temperature_k` — the fit's upper temperature bound. Both tier-1
+/// conditions are monotone in the kernel width `u ∝ √T`, so tier 1 at the
+/// bound is tier 1 at every lower temperature. Tier-1 isotopes carry no
+/// table (their broadening never samples the source on the grid); every
+/// other isotope carries the unbroadened equation on the data grid, which
+/// each evaluation extends to the auxiliary points and convolves.
+///
+/// [`DopplerPlan::from_explicit_table`] wraps a caller-supplied table: the
+/// engine never evaluates that source, so every isotope discloses
+/// [`SampledTableReason::ExplicitTable`] and no temperature gate applies.
+#[derive(Debug, Clone)]
+pub struct DopplerPlan {
+    routes: Vec<DopplerRoute>,
+    gate_temperature_k: f64,
+    /// `Some` for every isotope that is not on the continuous route.
+    table_rows: Vec<Option<Vec<f64>>>,
+}
+
+impl DopplerPlan {
+    /// Decide the routes at `gate_temperature_k` and build the rows the
+    /// sampled-table isotopes need. `cancel` is polled per isotope.
+    ///
+    /// # Errors
+    /// As [`doppler_routes`], plus [`TransmissionError::Cancelled`].
+    pub fn new(
+        energies: &[f64],
+        resonance_data: &[ResonanceData],
+        gate_temperature_k: f64,
+        instrument: Option<&InstrumentParams>,
+        cancel: Option<&AtomicBool>,
+    ) -> Result<Self, TransmissionError> {
+        let routes = doppler_routes(energies, resonance_data, gate_temperature_k, instrument)?;
+        let table_rows: Result<Vec<Option<Vec<f64>>>, TransmissionError> = routes
+            .par_iter()
+            .zip(resonance_data.par_iter())
+            .map(|(route, rd)| {
+                if cancel.is_some_and(|c| c.load(Ordering::Relaxed)) {
+                    return Err(TransmissionError::Cancelled);
+                }
+                Ok(match route {
+                    DopplerRoute::Continuous { .. } => None,
+                    DopplerRoute::Unbroadened | DopplerRoute::SampledTable { .. } => {
+                        Some(unbroadened_totals(rd, energies))
+                    }
+                })
+            })
+            .collect();
+        if cancel.is_some_and(|c| c.load(Ordering::Relaxed)) {
+            return Err(TransmissionError::Cancelled);
+        }
+        Ok(Self {
+            routes,
+            gate_temperature_k,
+            table_rows: table_rows?,
+        })
+    }
+
+    /// Wrap a caller-supplied zero-kelvin table on the data grid.
+    ///
+    /// # Errors
+    /// [`TransmissionError::InputMismatch`] if the table's shape does not
+    /// match `resonance_data` and `energies`.
+    pub fn from_explicit_table(
+        energies: &[f64],
+        resonance_data: &[ResonanceData],
+        table: &[Vec<f64>],
+    ) -> Result<Self, TransmissionError> {
+        validate_base_xs(energies, table, resonance_data)?;
+        Ok(Self {
+            routes: explicit_table_routes(resonance_data.len()),
+            gate_temperature_k: f64::INFINITY,
+            table_rows: table.iter().cloned().map(Some).collect(),
+        })
+    }
+
+    /// The route of each isotope, aligned with the resonance data the plan
+    /// was built for.
+    pub fn routes(&self) -> &[DopplerRoute] {
+        &self.routes
+    }
+
+    /// The temperature the routes were decided at (`+∞` for an explicit
+    /// table, which is never gated).
+    pub fn gate_temperature_k(&self) -> f64 {
+        self.gate_temperature_k
+    }
+
+    fn check(
+        &self,
+        energies: &[f64],
+        resonance_data: &[ResonanceData],
+        temperature_k: f64,
+        instrument: Option<&InstrumentParams>,
+    ) -> Result<(), TransmissionError> {
+        if resonance_data.len() != self.routes.len() {
+            return Err(TransmissionError::InputMismatch(format!(
+                "Doppler plan covers {} isotopes but {} were supplied",
+                self.routes.len(),
+                resonance_data.len(),
+            )));
+        }
+        for (i, row) in self.table_rows.iter().enumerate() {
+            let Some(row) = row else {
+                continue;
+            };
+            if row.len() != energies.len() {
+                return Err(TransmissionError::InputMismatch(format!(
+                    "Doppler plan row {i} has {} energies but the grid has {}",
+                    row.len(),
+                    energies.len(),
+                )));
+            }
+        }
+        if temperature_k.is_nan() || temperature_k > self.gate_temperature_k {
+            return Err(TransmissionError::InputMismatch(format!(
+                "temperature {temperature_k} K is above the Doppler plan's gate temperature {} K",
+                self.gate_temperature_k,
+            )));
+        }
+        if instrument.is_some() && !energies.windows(2).all(|w| w[0] <= w[1]) {
+            return Err(ResolutionError::UnsortedEnergies.into());
+        }
+        Ok(())
+    }
+
+    /// Doppler-broadened σ per isotope on the working grid at
+    /// `temperature_k`, each by its planned route.
+    ///
+    /// # Errors
+    /// [`TransmissionError::InputMismatch`] if `temperature_k` exceeds the
+    /// gate temperature or the inputs do not match the plan; the broadening
+    /// errors otherwise.
+    pub fn broaden_on_working_grid(
+        &self,
+        energies: &[f64],
+        resonance_data: &[ResonanceData],
+        temperature_k: f64,
+        instrument: Option<&InstrumentParams>,
+    ) -> Result<WorkingGridXs, TransmissionError> {
+        self.check(energies, resonance_data, temperature_k, instrument)?;
+        let rd_refs: Vec<&ResonanceData> = resonance_data.iter().collect();
+        let ext_grid = build_aux_grid(energies, instrument, &rd_refs);
+        let is_data_point = data_point_mask(ext_grid.as_ref());
+        let (work_energies, layout) = working_grid_layout(energies, ext_grid.as_ref());
+
+        let sigma: Result<Vec<Vec<f64>>, TransmissionError> = self
+            .routes
+            .par_iter()
+            .zip(self.table_rows.par_iter())
+            .zip(resonance_data.par_iter())
+            .map(|((route, row), rd)| match (route, row) {
+                (DopplerRoute::Continuous { .. }, _) if temperature_k <= 0.0 => {
+                    Ok(unbroadened_totals(rd, work_energies))
+                }
+                (DopplerRoute::Continuous { .. }, _) => {
+                    let params = DopplerParams::new(temperature_k, rd.awr)?;
+                    continuous_doppler::broaden(work_energies, rd, &params, None)
+                        .map_err(Into::into)
+                }
+                (_, Some(row)) => {
+                    let table =
+                        self.extend_row(row, rd, ext_grid.as_ref(), is_data_point.as_deref());
+                    broaden_sampled_table(work_energies, table, rd, temperature_k)
+                }
+                (_, None) => unreachable!("sampled-table isotopes always carry a row"),
+            })
+            .collect();
+
+        Ok(WorkingGridXs {
+            sigma: sigma?,
+            layout,
+            routes: self.routes.clone(),
+        })
+    }
+
+    /// Like [`Self::broaden_on_working_grid`] with the analytical
+    /// temperature derivative `∂σ/∂T` per isotope.
+    ///
+    /// # Errors
+    /// As [`Self::broaden_on_working_grid`].
+    pub fn broaden_with_derivative_on_working_grid(
+        &self,
+        energies: &[f64],
+        resonance_data: &[ResonanceData],
+        temperature_k: f64,
+        instrument: Option<&InstrumentParams>,
+    ) -> Result<WorkingGridXsWithDerivative, TransmissionError> {
+        self.check(energies, resonance_data, temperature_k, instrument)?;
+        let rd_refs: Vec<&ResonanceData> = resonance_data.iter().collect();
+        let ext_grid = build_aux_grid(energies, instrument, &rd_refs);
+        let is_data_point = data_point_mask(ext_grid.as_ref());
+        let (work_energies, layout) = working_grid_layout(energies, ext_grid.as_ref());
+
+        let results: Result<Vec<_>, TransmissionError> = self
+            .routes
+            .par_iter()
+            .zip(self.table_rows.par_iter())
+            .zip(resonance_data.par_iter())
+            .map(|((route, row), rd)| match (route, row) {
+                (DopplerRoute::Continuous { .. }, _) if temperature_k <= 0.0 => {
+                    let zeros = vec![0.0; work_energies.len()];
+                    Ok((unbroadened_totals(rd, work_energies), zeros))
+                }
+                (DopplerRoute::Continuous { .. }, _) => {
+                    let params = DopplerParams::new(temperature_k, rd.awr)?;
+                    continuous_doppler::broaden_with_derivative(work_energies, rd, &params, None)
+                        .map_err(Into::into)
+                }
+                (_, Some(row)) => {
+                    let table =
+                        self.extend_row(row, rd, ext_grid.as_ref(), is_data_point.as_deref());
+                    broaden_sampled_table_with_derivative(work_energies, table, rd, temperature_k)
+                }
+                (_, None) => unreachable!("sampled-table isotopes always carry a row"),
+            })
+            .collect();
+
+        let (sigma, dsigma_dt) = results?.into_iter().unzip();
+        Ok(WorkingGridXsWithDerivative {
+            sigma,
+            dsigma_dt,
+            layout,
+            routes: self.routes.clone(),
+        })
+    }
+
+    /// A data-grid row on the working grid: the row's values at the data
+    /// points, the resonance equation at auxiliary-only points.
+    fn extend_row(
+        &self,
+        row: &[f64],
+        rd: &ResonanceData,
+        ext_grid: Option<&(Vec<f64>, Vec<usize>)>,
+        is_data_point: Option<&[bool]>,
+    ) -> Vec<f64> {
+        match (ext_grid, is_data_point) {
+            (Some((ext_energies, data_indices)), Some(mask)) => {
+                build_extended_xs_from_base(ext_energies, data_indices, mask, row, rd)
+            }
+            _ => row.to_vec(),
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
     use nereids_core::types::Isotope;
-    use nereids_endf::resonance::test_support::u238_single_resonance;
+    use nereids_endf::resonance::test_support::{u238_single_resonance, u238_with_formalism};
     use nereids_endf::resonance::{LGroup, Resonance, ResonanceFormalism, ResonanceRange};
 
     /// Issue #608 R2: the spatial pipeline builds the working-grid σ
@@ -2410,5 +2732,336 @@ mod tests {
         )
         .unwrap_err();
         assert!(e3.to_string().contains("sorted"), "got: {e3}");
+    }
+
+    // ── Doppler routes ─────────────────────────────────────────────────────
+
+    fn gaussian_instrument() -> InstrumentParams {
+        InstrumentParams {
+            resolution: resolution::ResolutionFunction::Gaussian(
+                resolution::ResolutionParams::new(25.0, 0.5, 0.005, 0.0).unwrap(),
+            ),
+        }
+    }
+
+    fn resonance_grid() -> Vec<f64> {
+        (0..401).map(|i| 4.0 + (i as f64) * 0.015).collect()
+    }
+
+    fn assert_close_rows(a: &[f64], b: &[f64], rel: f64) {
+        assert_eq!(a.len(), b.len());
+        for (x, y) in a.iter().zip(b) {
+            assert!(
+                (x - y).abs() <= rel * x.abs().max(y.abs()).max(1e-300),
+                "{x} vs {y}"
+            );
+        }
+    }
+
+    /// Reich-Moore stays on the sampled-table route and its numbers are
+    /// the legacy pipeline's, bit for bit, with and without an auxiliary
+    /// grid.
+    #[test]
+    fn reich_moore_broadening_is_bit_identical_to_the_sampled_kernel() {
+        let data = u238_single_resonance();
+        let energies = resonance_grid();
+        for instrument in [None, Some(gaussian_instrument())] {
+            let working = broadened_cross_sections_on_working_grid(
+                &energies,
+                std::slice::from_ref(&data),
+                293.6,
+                instrument.as_ref(),
+                None,
+            )
+            .unwrap();
+            let legacy_grid = resolution_working_grid(&energies, instrument.as_ref(), &[&data])
+                .unwrap()
+                .energies;
+            let unbroadened: Vec<f64> = legacy_grid
+                .iter()
+                .map(|&e| reich_moore::cross_sections_at_energy(&data, e).total)
+                .collect();
+            let params = DopplerParams::new(293.6, data.awr).unwrap();
+            let legacy = doppler::doppler_broaden(&legacy_grid, &unbroadened, &params).unwrap();
+            assert_eq!(working.sigma[0], legacy);
+            assert_eq!(
+                working.routes,
+                vec![DopplerRoute::SampledTable {
+                    reason: SampledTableReason::Formalism {
+                        energy_ev: legacy_grid[0],
+                        formalism: Some(ResonanceFormalism::ReichMoore),
+                    }
+                }]
+            );
+        }
+    }
+
+    #[test]
+    fn disclosed_routes_are_the_executed_routes() {
+        let both = [
+            u238_single_resonance(),
+            u238_with_formalism(ResonanceFormalism::MLBW),
+        ];
+        let energies = resonance_grid();
+        let inst = gaussian_instrument();
+        let routes = doppler_routes(&energies, &both, 293.6, Some(&inst)).unwrap();
+        assert!(matches!(
+            routes[0],
+            DopplerRoute::SampledTable {
+                reason: SampledTableReason::Formalism {
+                    formalism: Some(ResonanceFormalism::ReichMoore),
+                    ..
+                }
+            }
+        ));
+        assert_eq!(
+            routes[1],
+            DopplerRoute::Continuous {
+                formalism: ResonanceFormalism::MLBW
+            }
+        );
+        let working =
+            broadened_cross_sections_on_working_grid(&energies, &both, 293.6, Some(&inst), None)
+                .unwrap();
+        assert_eq!(working.routes, routes);
+
+        assert_eq!(
+            doppler_routes(&energies, &both, 0.0, Some(&inst)).unwrap(),
+            vec![DopplerRoute::Unbroadened; 2]
+        );
+        let cold =
+            broadened_cross_sections_on_working_grid(&energies, &both, 0.0, Some(&inst), None)
+                .unwrap();
+        assert_eq!(cold.routes, vec![DopplerRoute::Unbroadened; 2]);
+
+        assert!(matches!(
+            doppler_routes(&[6.9, 6.5], &both, 293.6, Some(&inst)),
+            Err(TransmissionError::Resolution(
+                ResolutionError::UnsortedEnergies
+            ))
+        ));
+    }
+
+    #[test]
+    fn continuous_route_values_are_the_tier_one_integral() {
+        let mlbw = u238_with_formalism(ResonanceFormalism::MLBW);
+        let energies = resonance_grid();
+        let working = broadened_cross_sections_on_working_grid(
+            &energies,
+            std::slice::from_ref(&mlbw),
+            293.6,
+            None,
+            None,
+        )
+        .unwrap();
+        let params = DopplerParams::new(293.6, mlbw.awr).unwrap();
+        let expected = continuous_doppler::broaden(&energies, &mlbw, &params, None).unwrap();
+        assert_eq!(working.sigma[0], expected);
+
+        let sample = SampleParams::new(293.6, vec![(mlbw.clone(), 0.01)]).unwrap();
+        let transmission = forward_model(&energies, &sample, None).unwrap();
+        for (t, s) in transmission.iter().zip(&expected) {
+            assert_eq!(*t, (-0.01 * s).exp());
+        }
+
+        // Control: the sampled route on this grid is measurably different.
+        let sampled =
+            doppler::doppler_broaden(&energies, &unbroadened_totals(&mlbw, &energies), &params)
+                .unwrap();
+        assert!(
+            sampled
+                .iter()
+                .zip(&expected)
+                .any(|(a, b)| (a - b).abs() / b > 1e-6)
+        );
+    }
+
+    #[test]
+    fn doppler_plan_builds_rows_only_for_sampled_isotopes_and_matches_direct_entry_points() {
+        let both = [
+            u238_single_resonance(),
+            u238_with_formalism(ResonanceFormalism::MLBW),
+        ];
+        let energies = resonance_grid();
+        for instrument in [None, Some(gaussian_instrument())] {
+            let plan =
+                DopplerPlan::new(&energies, &both, 5000.0, instrument.as_ref(), None).unwrap();
+            assert_eq!(plan.gate_temperature_k(), 5000.0);
+            assert!(plan.table_rows[0].is_some(), "Reich-Moore carries a table");
+            assert!(
+                plan.table_rows[1].is_none(),
+                "a tier-1 isotope carries none"
+            );
+
+            for temperature_k in [0.0, 293.6, 5000.0] {
+                let via_plan = plan
+                    .broaden_on_working_grid(&energies, &both, temperature_k, instrument.as_ref())
+                    .unwrap();
+                let direct = broadened_cross_sections_on_working_grid(
+                    &energies,
+                    &both,
+                    temperature_k,
+                    instrument.as_ref(),
+                    None,
+                )
+                .unwrap();
+                assert_eq!(via_plan.sigma, direct.sigma);
+                assert_eq!(via_plan.layout.energies, direct.layout.energies);
+                assert_eq!(via_plan.routes, plan.routes());
+
+                let with_derivative = plan
+                    .broaden_with_derivative_on_working_grid(
+                        &energies,
+                        &both,
+                        temperature_k,
+                        instrument.as_ref(),
+                    )
+                    .unwrap();
+                assert_eq!(with_derivative.routes, plan.routes());
+                // Converging the derivative refines the panels further, so
+                // the tier-1 value differs from the value-only run within
+                // the declared quadrature tolerance, never beyond it.
+                assert_close_rows(&with_derivative.sigma[1], &direct.sigma[1], 1e-8);
+                assert_close_rows(&with_derivative.sigma[0], &direct.sigma[0], 1e-12);
+                if temperature_k <= 0.0 {
+                    assert!(
+                        with_derivative
+                            .dsigma_dt
+                            .iter()
+                            .all(|row| row.iter().all(|&v| v == 0.0))
+                    );
+                } else {
+                    let params = DopplerParams::new(temperature_k, both[1].awr).unwrap();
+                    let (_, expected) = continuous_doppler::broaden_with_derivative(
+                        &direct.layout.energies,
+                        &both[1],
+                        &params,
+                        None,
+                    )
+                    .unwrap();
+                    assert_eq!(with_derivative.dsigma_dt[1], expected);
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn doppler_plan_rejects_a_temperature_above_its_gate_and_mismatched_inputs() {
+        let mlbw = u238_with_formalism(ResonanceFormalism::MLBW);
+        let energies = resonance_grid();
+        let plan =
+            DopplerPlan::new(&energies, std::slice::from_ref(&mlbw), 300.0, None, None).unwrap();
+        assert!(matches!(
+            plan.broaden_on_working_grid(&energies, std::slice::from_ref(&mlbw), 300.5, None),
+            Err(TransmissionError::InputMismatch(_))
+        ));
+        assert!(matches!(
+            plan.broaden_on_working_grid(&energies, std::slice::from_ref(&mlbw), f64::NAN, None),
+            Err(TransmissionError::InputMismatch(_))
+        ));
+        assert!(matches!(
+            plan.broaden_on_working_grid(&energies, &[], 300.0, None),
+            Err(TransmissionError::InputMismatch(_))
+        ));
+        assert!(
+            plan.broaden_on_working_grid(&energies, std::slice::from_ref(&mlbw), 300.0, None)
+                .is_ok()
+        );
+    }
+
+    #[test]
+    fn explicit_table_plan_discloses_the_table_and_never_re_derives_it() {
+        let mlbw = u238_with_formalism(ResonanceFormalism::MLBW);
+        let energies = resonance_grid();
+        let table: Vec<Vec<f64>> = vec![
+            unbroadened_totals(&mlbw, &energies)
+                .iter()
+                .map(|s| 2.0 * s)
+                .collect(),
+        ];
+        let plan = DopplerPlan::from_explicit_table(&energies, std::slice::from_ref(&mlbw), &table)
+            .unwrap();
+        assert_eq!(
+            plan.routes(),
+            &[DopplerRoute::SampledTable {
+                reason: SampledTableReason::ExplicitTable
+            }]
+        );
+        assert_eq!(plan.gate_temperature_k(), f64::INFINITY);
+
+        // The rows are the caller's, not the source's (which would be half).
+        let cold = plan
+            .broaden_on_working_grid(&energies, std::slice::from_ref(&mlbw), 0.0, None)
+            .unwrap();
+        assert_eq!(cold.sigma[0], table[0]);
+        let warm = plan
+            .broaden_on_working_grid(&energies, std::slice::from_ref(&mlbw), 293.6, None)
+            .unwrap();
+        let params = DopplerParams::new(293.6, mlbw.awr).unwrap();
+        assert_eq!(
+            warm.sigma[0],
+            doppler::doppler_broaden(&energies, &table[0], &params).unwrap()
+        );
+        assert_eq!(warm.routes, plan.routes());
+        assert!(
+            plan.broaden_on_working_grid(&energies, std::slice::from_ref(&mlbw), 1e6, None)
+                .is_ok()
+        );
+
+        assert!(matches!(
+            DopplerPlan::from_explicit_table(&energies, std::slice::from_ref(&mlbw), &[vec![1.0]]),
+            Err(TransmissionError::InputMismatch(_))
+        ));
+        let from_base = broadened_cross_sections_from_base_on_working_grid(
+            &energies,
+            &table,
+            std::slice::from_ref(&mlbw),
+            293.6,
+            None,
+        )
+        .unwrap();
+        assert_eq!(from_base.routes, plan.routes());
+        assert_eq!(from_base.sigma, warm.sigma);
+    }
+
+    #[test]
+    fn doppler_plan_observes_cancellation() {
+        let mlbw = u238_with_formalism(ResonanceFormalism::MLBW);
+        let cancel = AtomicBool::new(true);
+        assert!(matches!(
+            DopplerPlan::new(
+                &resonance_grid(),
+                std::slice::from_ref(&mlbw),
+                300.0,
+                None,
+                Some(&cancel)
+            ),
+            Err(TransmissionError::Cancelled)
+        ));
+        assert!(matches!(
+            broadened_cross_sections_on_working_grid(
+                &resonance_grid(),
+                std::slice::from_ref(&mlbw),
+                300.0,
+                None,
+                Some(&cancel)
+            ),
+            Err(TransmissionError::Cancelled)
+        ));
+    }
+
+    #[test]
+    fn continuous_doppler_errors_convert_without_losing_cancellation() {
+        assert!(matches!(
+            TransmissionError::from(ContinuousDopplerError::Cancelled),
+            TransmissionError::Cancelled
+        ));
+        assert!(matches!(
+            TransmissionError::from(ContinuousDopplerError::PanelLimit {
+                energy_ev: 1.0,
+                limit: 1
+            }),
+            TransmissionError::ContinuousDoppler(ContinuousDopplerError::PanelLimit { .. })
+        ));
     }
 }
