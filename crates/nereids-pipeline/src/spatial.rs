@@ -1789,12 +1789,9 @@ pub fn spatial_map_typed(
             .inspect(|w| eprintln!("spatial_map_typed: warning: {w}"))
             .collect()
     };
-    warnings.extend(
-        doppler_routes
-            .iter()
-            .flatten()
-            .flat_map(|r| edge_warnings(std::slice::from_ref(r))),
-    );
+    if let Some(routes) = &doppler_routes {
+        warnings.extend(edge_warnings(routes));
+    }
 
     // Stage 1 (global mode): fit the baseline ONCE on the aggregated mean
     // spectrum, then FREEZE it into the per-pixel config (the same
