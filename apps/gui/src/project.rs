@@ -162,6 +162,7 @@ pub fn snapshot_from_state(state: &AppState) -> ProjectSnapshot {
         baseline_global,
         baseline_e_ref_ev,
         baseline_maps,
+        spatial_doppler_routes,
     ) = if let Some(ref sr) = state.spatial_result {
         (
             Some(sr.density_maps.clone()),
@@ -181,11 +182,15 @@ pub fn snapshot_from_state(state: &AppState) -> ProjectSnapshot {
             sr.baseline_global,
             sr.baseline_e_ref_ev,
             sr.baseline_maps.clone(),
+            // The route each isotope took is part of the map result: a
+            // reloaded map must still state the physics it was computed
+            // with, as the single-pixel path already does.
+            sr.doppler_routes.clone(),
         )
     } else {
         (
             None, None, None, None, None, None, None, None, None, None, None, None, None, None,
-            None,
+            None, None,
         )
     };
 
@@ -393,6 +398,7 @@ pub fn snapshot_from_state(state: &AppState) -> ProjectSnapshot {
         baseline_global,
         baseline_e_ref_ev,
         baseline_maps,
+        spatial_doppler_routes,
         single_fit_densities,
         single_fit_uncertainties,
         single_fit_chi_squared,
@@ -1350,7 +1356,9 @@ fn state_from_snapshot(snap: ProjectSnapshot, state: &mut AppState, path: &Path)
             baseline_e_ref_ev: snap.baseline_e_ref_ev,
             baseline_maps: snap.baseline_maps.clone(),
             warnings: Vec::new(),
-            doppler_routes: None,
+            // Restored disclosure: the convergence summary renders these,
+            // so the map still names its Doppler routes after a reload.
+            doppler_routes: snap.spatial_doppler_routes,
             n_converged: snap.n_converged.unwrap_or(0),
             n_total: snap.n_total.unwrap_or(0),
             n_failed: snap.n_failed.unwrap_or(0),
@@ -1698,6 +1706,76 @@ mod tests {
         assert_eq!(
             restored.last_fit_feedback.as_ref().unwrap().doppler_routes,
             vec!["Hf-177: continuous free-gas integral over the MLBW resonance equation"]
+        );
+    }
+
+    /// The routes a spatial map disclosed are part of its result too: the
+    /// convergence summary renders them, and `SpatialResult::doppler_routes`
+    /// documents `None` as "nothing was broadened", which a restored map
+    /// that did broaden must not claim.
+    #[test]
+    fn test_spatial_doppler_routes_survive_save_and_load() {
+        use nereids_physics::doppler_route::{DopplerRoute, IsotopeDopplerRoute};
+        let routes = vec![IsotopeDopplerRoute {
+            isotope: nereids_core::types::Isotope::new(72, 177).unwrap(),
+            route: DopplerRoute::Continuous {
+                formalisms: vec![
+                    nereids_endf::resonance::ResonanceFormalism::SLBW,
+                    nereids_endf::resonance::ResonanceFormalism::MLBW,
+                ],
+            },
+        }];
+        let map = || Array2::from_elem((2, 2), 1.2e-4);
+        let state = AppState {
+            spatial_result: Some(SpatialResult {
+                density_maps: vec![map()],
+                uncertainty_maps: vec![Array2::from_elem((2, 2), 1e-6)],
+                chi_squared_map: Array2::from_elem((2, 2), 1.1),
+                deviance_per_dof_map: None,
+                converged_map: Array2::from_elem((2, 2), true),
+                temperature_map: None,
+                temperature_uncertainty_map: None,
+                isotope_labels: vec!["Hf-177".into()],
+                anorm_map: None,
+                background_maps: None,
+                back_d_map: None,
+                back_f_map: None,
+                t0_us_map: None,
+                l_scale_map: None,
+                energy_scale_flight_path_m: None,
+                baseline_global: None,
+                baseline_e_ref_ev: None,
+                baseline_maps: None,
+                warnings: Vec::new(),
+                doppler_routes: Some(routes.clone()),
+                n_converged: 4,
+                n_total: 4,
+                n_failed: 0,
+            }),
+            ..AppState::default()
+        };
+        let snap = snapshot_from_state(&state);
+        assert_eq!(snap.spatial_doppler_routes, Some(routes.clone()));
+
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("map_routes.nrd.h5");
+        save_project(&path, &snap).unwrap();
+        let mut restored = AppState::default();
+        state_from_snapshot(load_project(&path).unwrap(), &mut restored, &path);
+        let result = restored.spatial_result.as_ref().unwrap();
+        assert_eq!(result.doppler_routes, Some(routes));
+        // The convergence summary renders one line per restored route.
+        assert_eq!(
+            result
+                .doppler_routes
+                .iter()
+                .flatten()
+                .map(ToString::to_string)
+                .collect::<Vec<_>>(),
+            vec![
+                "Hf-177: continuous free-gas integral over the SLBW and MLBW resonance \
+                 equations"
+            ]
         );
     }
 

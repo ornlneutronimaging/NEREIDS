@@ -231,6 +231,12 @@ pub struct ProjectSnapshot {
     /// fit disclosed it.  `None` when nothing was broadened or the file
     /// predates the field; absence reads as `None`.
     pub single_fit_doppler_routes: Option<Vec<IsotopeDopplerRoute>>,
+    /// The Doppler route each isotope took over the whole spatial map, as
+    /// the map disclosed it.  Restored so a reloaded map still states the
+    /// physics it was computed with; `None` when the map disclosed none
+    /// (see `SpatialResult::doppler_routes`) or the file predates the
+    /// field; absence reads as `None`.
+    pub spatial_doppler_routes: Option<Vec<IsotopeDopplerRoute>>,
 
     // -- flags --
     /// True when per-bin uncertainty was estimated (not measured).
@@ -368,6 +374,7 @@ impl Default for ProjectSnapshot {
             single_fit_baseline: None,
             single_fit_baseline_e_ref_ev: None,
             single_fit_doppler_routes: None,
+            spatial_doppler_routes: None,
             uncertainty_is_estimated: None,
             lm_background_enabled: None,
             kl_background_enabled: None,
@@ -1108,6 +1115,22 @@ fn write_results(file: &hdf5::File, snap: &ProjectSnapshot) -> Result<(), IoErro
             .create("result_isotopes")
             .and_then(|ds| ds.write_raw(&vlu))
             .map_err(|e| hdf5_err("/results/result_isotopes", e))?;
+    }
+
+    // The routes the map disclosed are part of the result: a reloaded map
+    // must still state the physics it was computed with.
+    if let Some(ref routes) = snap.spatial_doppler_routes {
+        let json = serde_json::to_string(routes)
+            .map_err(|e| hdf5_err("serialize /results/doppler_routes", e))?;
+        let vlu: VarLenUnicode = json
+            .parse()
+            .map_err(|e| hdf5_err("/results/doppler_routes", e))?;
+        results
+            .new_dataset::<VarLenUnicode>()
+            .shape(())
+            .create("doppler_routes")
+            .and_then(|ds| ds.write_scalar(&vlu))
+            .map_err(|e| hdf5_err("/results/doppler_routes", e))?;
     }
 
     // Single-pixel fit results (optional)
@@ -1990,6 +2013,22 @@ fn read_results(file: &hdf5::File, snap: &mut ProjectSnapshot) -> Result<(), IoE
         snap.n_failed = Some(nf as usize);
     }
 
+    if let Ok(ds) = results.dataset("doppler_routes") {
+        let json: VarLenUnicode = ds
+            .read_scalar()
+            .map_err(|e| hdf5_err("/results/doppler_routes", e))?;
+        // The routes are disclosure, not data the map needs, and a project
+        // written by a newer build may name a route reason this build does
+        // not know: the project still opens, without them.
+        match serde_json::from_str::<Vec<IsotopeDopplerRoute>>(json.as_str()) {
+            Ok(routes) => snap.spatial_doppler_routes = Some(routes),
+            Err(e) => eprintln!(
+                "load_project: warning: /results/doppler_routes could not be read ({e}); \
+                 the map's Doppler routes are not restored"
+            ),
+        }
+    }
+
     // Single-pixel fit results
     if let Ok(sf) = results.group("single_fit") {
         if let Ok(ds) = sf.dataset("densities") {
@@ -2243,6 +2282,7 @@ mod tests {
             single_fit_baseline: None,
             single_fit_baseline_e_ref_ev: None,
             single_fit_doppler_routes: None,
+            spatial_doppler_routes: None,
             uncertainty_is_estimated: Some(false),
             lm_background_enabled: None,
             kl_background_enabled: None,
@@ -2280,6 +2320,36 @@ mod tests {
         let loaded = load_project(&path).unwrap();
         assert_eq!(loaded.single_fit_densities, Some(vec![0.001]));
         assert!(loaded.single_fit_doppler_routes.is_none());
+    }
+
+    /// The map's own route dataset degrades the same way: a payload this
+    /// build cannot read costs the disclosure, never the project.
+    #[test]
+    fn unreadable_spatial_doppler_routes_load_as_none() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("map_routes.nrd.h5");
+        let mut snap = minimal_snapshot();
+        snap.n_converged = Some(7);
+        snap.spatial_doppler_routes = Some(vec![IsotopeDopplerRoute {
+            isotope: nereids_core::types::Isotope::new(74, 182).unwrap(),
+            route: DopplerRoute::Unbroadened,
+        }]);
+        save_project(&path, &snap).unwrap();
+        {
+            let file = hdf5::File::open_rw(&path).unwrap();
+            let results = file.group("results").unwrap();
+            results.unlink("doppler_routes").unwrap();
+            let vlu: VarLenUnicode = r#"{"routes": "written by a newer build"}"#.parse().unwrap();
+            results
+                .new_dataset::<VarLenUnicode>()
+                .shape(())
+                .create("doppler_routes")
+                .and_then(|ds| ds.write_scalar(&vlu))
+                .unwrap();
+        }
+        let loaded = load_project(&path).unwrap();
+        assert_eq!(loaded.n_converged, Some(7));
+        assert!(loaded.spatial_doppler_routes.is_none());
     }
 
     #[test]
@@ -2638,9 +2708,22 @@ mod tests {
             },
         ];
         snap.single_fit_doppler_routes = Some(routes.clone());
+        // The map discloses its own routes, decided once for every pixel;
+        // they round-trip beside the single-pixel fit's.
+        let map_routes = vec![IsotopeDopplerRoute {
+            isotope: nereids_core::types::Isotope::new(74, 182).unwrap(),
+            route: DopplerRoute::Continuous {
+                formalisms: vec![
+                    nereids_endf::resonance::ResonanceFormalism::SLBW,
+                    nereids_endf::resonance::ResonanceFormalism::MLBW,
+                ],
+            },
+        }];
+        snap.spatial_doppler_routes = Some(map_routes.clone());
         save_project(&path, &snap).unwrap();
         let loaded = load_project(&path).unwrap();
         assert_eq!(loaded.single_fit_doppler_routes, Some(routes));
+        assert_eq!(loaded.spatial_doppler_routes, Some(map_routes));
 
         let dm = loaded.density_maps.unwrap();
         assert_eq!(dm.len(), 2);
