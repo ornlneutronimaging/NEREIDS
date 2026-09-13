@@ -10,7 +10,7 @@ categories = ["science"]
 
 [features]
 default = []
-hdf5 = ["dep:hdf5", "dep:serde_json", "dep:nereids-endf"]
+hdf5 = ["dep:hdf5", "dep:serde_json", "dep:nereids-endf", "dep:nereids-physics"]
 
 [dependencies]
 nereids-core = { workspace = true }
@@ -20,6 +20,7 @@ tiff = { workspace = true }
 hdf5 = { workspace = true, optional = true }
 serde_json = { workspace = true, optional = true }
 nereids-endf = { workspace = true, optional = true }
+nereids-physics = { workspace = true, optional = true }
 
 [dev-dependencies]
 tempfile = "3"

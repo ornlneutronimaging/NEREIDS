@@ -1070,6 +1070,74 @@ pub(crate) struct FitLineParams<'a> {
     pub y_multiplier: Option<&'a [f64]>,
 }
 
+/// The model that redraws a fit result: the forward model at the displayed
+/// temperature with the Doppler routes decided the way the fit decided them.
+///
+/// A free-temperature fit gates its routes once at the fit's upper bound;
+/// redrawing at the fitted temperature must gate there too, or an isotope
+/// the fit demoted to the sampled table near a range edge would be redrawn
+/// through the continuous integral. A fixed-temperature fit gated at that
+/// temperature. The plan's routes are compared with the routes the result
+/// disclosed and a disagreement is logged at debug level: the overlay is
+/// still drawn, but the log says it is not the fit's curve.
+///
+/// Returns `None` when the model or its plan cannot be built (the caller
+/// then draws no overlay, as before).
+pub(crate) fn build_overlay_model(
+    energies: Vec<f64>,
+    resonance_data: Vec<nereids_endf::resonance::ResonanceData>,
+    temperature_k: f64,
+    instrument: Option<Arc<nereids_physics::transmission::InstrumentParams>>,
+    density_mapping: (Vec<usize>, Vec<f64>),
+    free_temperature: bool,
+    disclosed_routes: Option<&[nereids_physics::doppler_route::IsotopeDopplerRoute]>,
+) -> Option<nereids_fitting::transmission_model::TransmissionFitModel> {
+    use nereids_fitting::transmission_model::{
+        TEMPERATURE_FIT_UPPER_BOUND_K, TransmissionFitModel,
+    };
+    use nereids_physics::transmission::DopplerPlan;
+
+    let gate_temperature_k = if free_temperature {
+        TEMPERATURE_FIT_UPPER_BOUND_K
+    } else {
+        temperature_k
+    };
+    let plan = DopplerPlan::new(
+        &energies,
+        &resonance_data,
+        gate_temperature_k,
+        instrument.as_deref(),
+        None,
+    )
+    .ok()?;
+    if let Some(disclosed) = disclosed_routes {
+        let agree = disclosed.len() == plan.routes().len()
+            && disclosed
+                .iter()
+                .zip(plan.routes())
+                .all(|(d, p)| d.route.same_kind(p));
+        if !agree {
+            tracing::debug!(
+                gate_temperature_k,
+                disclosed = %disclosed.iter().map(ToString::to_string).collect::<Vec<_>>().join("; "),
+                overlay = %plan.routes().iter().map(ToString::to_string).collect::<Vec<_>>().join("; "),
+                "fit overlay Doppler routes differ from the routes the fit disclosed"
+            );
+        }
+    }
+    TransmissionFitModel::new(
+        energies,
+        resonance_data,
+        temperature_k,
+        instrument,
+        density_mapping,
+        None,
+        None,
+    )
+    .ok()
+    .map(|model| model.with_doppler_plan(Arc::new(plan)))
+}
+
 /// Counts and instrument resolution cannot share the transmission-only fit
 /// overlay until the detector response has separate open/sample arms.
 pub(crate) fn counts_resolution_overlay_unsupported(
@@ -1103,16 +1171,15 @@ pub(crate) fn build_fit_line(p: &FitLineParams<'_>) -> Option<Line<'static>> {
     }
     let resonance_data: Vec<_> = p.resonance_data.to_vec();
     let overlay_temp = p.result.temperature_k.unwrap_or(p.temperature_k);
-    let model = nereids_fitting::transmission_model::TransmissionFitModel::new(
+    let model = build_overlay_model(
         p.energies.to_vec(),
         resonance_data,
         overlay_temp,
         p.instrument.clone(),
         (p.density_indices.to_vec(), p.density_ratios.to_vec()),
-        None,
-        None,
-    )
-    .ok()?;
+        p.result.temperature_k.is_some(),
+        p.result.doppler_routes.as_deref(),
+    )?;
 
     use nereids_fitting::lm::FitModel;
     let fitted_t = model.evaluate(&p.result.densities).ok()?;
@@ -1229,7 +1296,12 @@ pub(crate) fn collect_all_resonance_data_with_mapping(
 
 #[cfg(test)]
 mod tests {
-    use super::counts_resolution_overlay_unsupported;
+    use super::{build_overlay_model, counts_resolution_overlay_unsupported};
+    use nereids_endf::resonance::ResonanceFormalism;
+    use nereids_endf::resonance::test_support::u238_with_formalism;
+    use nereids_fitting::lm::FitModel;
+    use nereids_fitting::transmission_model::TransmissionFitModel;
+    use nereids_physics::doppler_route::{DopplerRoute, SampledTableReason};
 
     #[test]
     fn count_overlay_is_suppressed_only_with_active_resolution() {
@@ -1237,5 +1309,66 @@ mod tests {
         assert!(!counts_resolution_overlay_unsupported(true, false));
         assert!(!counts_resolution_overlay_unsupported(false, true));
         assert!(!counts_resolution_overlay_unsupported(false, false));
+    }
+
+    /// MLBW whose range ends at 8 eV on a 4-6.9 eV grid: continuous at
+    /// 293.6 K, demoted at the free-temperature gate. The overlay of a
+    /// free-temperature result must take the demoted route at the fitted
+    /// temperature, and the fixed-temperature overlay must be the forward
+    /// model exactly.
+    #[test]
+    fn overlay_model_gates_its_routes_the_way_the_fit_did() {
+        let mut near_edge = u238_with_formalism(ResonanceFormalism::MLBW);
+        near_edge.ranges[0].energy_high = 8.0;
+        let energies: Vec<f64> = (0..201).map(|i| 4.0 + (i as f64) * 0.0145).collect();
+        let build = |free_temperature: bool| {
+            build_overlay_model(
+                energies.clone(),
+                vec![near_edge.clone()],
+                293.6,
+                None,
+                (vec![0], vec![1.0]),
+                free_temperature,
+                None,
+            )
+            .unwrap()
+        };
+
+        let free = build(true);
+        assert!(matches!(
+            free.doppler_routes().unwrap().unwrap()[0],
+            DopplerRoute::SampledTable {
+                reason: SampledTableReason::WindowCrossesRangeBoundary { .. }
+            }
+        ));
+        let fixed = build(false);
+        assert!(matches!(
+            fixed.doppler_routes().unwrap().unwrap()[0],
+            DopplerRoute::Continuous {
+                formalism: ResonanceFormalism::MLBW
+            }
+        ));
+        let forward = TransmissionFitModel::new(
+            energies,
+            vec![near_edge],
+            293.6,
+            None,
+            (vec![0], vec![1.0]),
+            None,
+            None,
+        )
+        .unwrap();
+        assert_eq!(
+            fixed.evaluate(&[0.001]).unwrap(),
+            forward.evaluate(&[0.001]).unwrap()
+        );
+        let free_curve = free.evaluate(&[0.001]).unwrap();
+        assert!(
+            free_curve
+                .iter()
+                .zip(forward.evaluate(&[0.001]).unwrap())
+                .any(|(a, b)| (a - b).abs() > 1e-9),
+            "the two routes must differ for the gate to matter"
+        );
     }
 }

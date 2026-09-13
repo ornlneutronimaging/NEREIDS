@@ -2859,6 +2859,7 @@ dependencies = [
  "ndarray",
  "nereids-core",
  "nereids-endf",
+ "nereids-physics",
  "serde_json",
  "tempfile",
  "thiserror 2.0.20",
@@ -2875,6 +2876,7 @@ dependencies = [
  "nereids-physics",
  "num-complex",
  "rayon",
+ "serde",
 ]
 
 [[package]]

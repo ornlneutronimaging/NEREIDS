@@ -11,6 +11,7 @@ use hdf5::types::VarLenUnicode;
 use ndarray::{Array2, Array3};
 
 use nereids_endf::resonance::ResonanceData;
+use nereids_physics::doppler_route::IsotopeDopplerRoute;
 
 use crate::error::IoError;
 
@@ -226,6 +227,10 @@ pub struct ProjectSnapshot {
     pub single_fit_baseline: Option<[f64; 3]>,
     /// Baseline reference energy E_ref (eV) for the single-pixel fit.
     pub single_fit_baseline_e_ref_ev: Option<f64>,
+    /// The Doppler route each isotope took in the single-pixel fit, as the
+    /// fit disclosed it.  `None` when nothing was broadened or the file
+    /// predates the field; absence reads as `None`.
+    pub single_fit_doppler_routes: Option<Vec<IsotopeDopplerRoute>>,
 
     // -- flags --
     /// True when per-bin uncertainty was estimated (not measured).
@@ -362,6 +367,7 @@ impl Default for ProjectSnapshot {
             single_fit_background: None,
             single_fit_baseline: None,
             single_fit_baseline_e_ref_ev: None,
+            single_fit_doppler_routes: None,
             uncertainty_is_estimated: None,
             lm_background_enabled: None,
             kl_background_enabled: None,
@@ -1170,6 +1176,18 @@ fn write_results(file: &hdf5::File, snap: &ProjectSnapshot) -> Result<(), IoErro
         }
         if let Some(e_ref) = snap.single_fit_baseline_e_ref_ev {
             write_f64_attr(&sf, "baseline_e_ref_ev", e_ref)?;
+        }
+        if let Some(ref routes) = snap.single_fit_doppler_routes {
+            let json = serde_json::to_string(routes)
+                .map_err(|e| hdf5_err("serialize /results/single_fit/doppler_routes", e))?;
+            let vlu: VarLenUnicode = json
+                .parse()
+                .map_err(|e| hdf5_err("/results/single_fit/doppler_routes", e))?;
+            sf.new_dataset::<VarLenUnicode>()
+                .shape(())
+                .create("doppler_routes")
+                .and_then(|ds| ds.write_scalar(&vlu))
+                .map_err(|e| hdf5_err("/results/single_fit/doppler_routes", e))?;
         }
     }
 
@@ -2031,6 +2049,14 @@ fn read_results(file: &hdf5::File, snap: &mut ProjectSnapshot) -> Result<(), IoE
                     .into(),
             ));
         }
+        if let Ok(ds) = sf.dataset("doppler_routes") {
+            let json: VarLenUnicode = ds
+                .read_scalar()
+                .map_err(|e| hdf5_err("/results/single_fit/doppler_routes", e))?;
+            let routes: Vec<IsotopeDopplerRoute> = serde_json::from_str(json.as_str())
+                .map_err(|e| hdf5_err("deserialize /results/single_fit/doppler_routes", e))?;
+            snap.single_fit_doppler_routes = Some(routes);
+        }
     }
 
     Ok(())
@@ -2118,6 +2144,8 @@ mod tests {
     use super::*;
     use hdf5::types::VarLenUnicode;
     use ndarray::{Array2, Array3};
+
+    use nereids_physics::doppler_route::{DopplerRoute, SampledTableReason};
 
     fn minimal_snapshot() -> ProjectSnapshot {
         ProjectSnapshot {
@@ -2207,6 +2235,7 @@ mod tests {
             single_fit_background: None,
             single_fit_baseline: None,
             single_fit_baseline_e_ref_ev: None,
+            single_fit_doppler_routes: None,
             uncertainty_is_estimated: Some(false),
             lm_background_enabled: None,
             kl_background_enabled: None,
@@ -2552,8 +2581,32 @@ mod tests {
         snap.n_total = Some(12);
         snap.n_failed = Some(1);
         snap.result_isotope_labels = Some(vec!["W-182".into(), "Fe-56".into()]);
+        snap.single_fit_densities = Some(vec![0.001, 0.002]);
+        let routes = vec![
+            IsotopeDopplerRoute {
+                isotope: nereids_core::types::Isotope::new(74, 182).unwrap(),
+                route: DopplerRoute::Continuous {
+                    formalism: nereids_endf::resonance::ResonanceFormalism::MLBW,
+                },
+            },
+            IsotopeDopplerRoute {
+                isotope: nereids_core::types::Isotope::new(26, 56).unwrap(),
+                route: DopplerRoute::SampledTable {
+                    reason: SampledTableReason::WindowCrossesRangeBoundary {
+                        energy_ev: 9.99e3,
+                        window_low_ev: 9.81e3,
+                        window_high_ev: 1.02e4,
+                        range_low_ev: 1e-5,
+                        range_high_ev: 1e4,
+                        formalism: nereids_endf::resonance::ResonanceFormalism::SLBW,
+                    },
+                },
+            },
+        ];
+        snap.single_fit_doppler_routes = Some(routes.clone());
         save_project(&path, &snap).unwrap();
         let loaded = load_project(&path).unwrap();
+        assert_eq!(loaded.single_fit_doppler_routes, Some(routes));
 
         let dm = loaded.density_maps.unwrap();
         assert_eq!(dm.len(), 2);
@@ -3184,6 +3237,7 @@ mod tests {
         assert!(loaded2.baseline_maps.is_none());
         assert!(loaded2.single_fit_baseline.is_none());
         assert!(loaded2.single_fit_baseline_e_ref_ev.is_none());
+        assert!(loaded2.single_fit_doppler_routes.is_none());
         assert!(
             loaded2.baseline_enabled.is_none(),
             "pre-#635 files read as None"

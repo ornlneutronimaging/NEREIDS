@@ -23,6 +23,7 @@ nereids-endf = { workspace = true }
 num-complex = { workspace = true }
 rayon = { workspace = true }
 microlp = { workspace = true }
+serde = { workspace = true }
 
 [dev-dependencies]
 # Integration tests under `tests/` are compiled as a separate crate

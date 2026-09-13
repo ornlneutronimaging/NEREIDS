@@ -19,13 +19,15 @@ use std::fmt;
 use nereids_core::elements::isotope_to_string;
 use nereids_core::types::Isotope;
 use nereids_endf::resonance::ResonanceFormalism;
+use serde::{Deserialize, Serialize};
 
 /// Which Doppler evaluation route one isotope took, for the whole grid.
 ///
 /// The three tiers are fixed by the physics contract, so the enum is
 /// exhaustive: a matcher that forgets one is a bug the compiler should
-/// report.
-#[derive(Debug, Clone, PartialEq)]
+/// report. Serializable so a saved project can restore the routes a fit
+/// disclosed.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub enum DopplerRoute {
     /// No Doppler broadening was applied (temperature ≤ 0 K). Nothing is
     /// sampled or convolved, so this is neither tier.
@@ -53,7 +55,7 @@ pub enum DopplerRoute {
 /// `#[non_exhaustive]` because a future source of tier-2 routing (a File-3
 /// term that is actually parsed, say) must not be a SemVer break for
 /// downstream matchers.
-#[derive(Debug, Clone, PartialEq)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[non_exhaustive]
 pub enum SampledTableReason {
     /// The caller supplied a zero-kelvin table. The engine never evaluated
@@ -119,7 +121,7 @@ pub enum SampledTableReason {
 ///
 /// Working-grid results align routes positionally with the resonance data;
 /// the label is attached once, at the result boundary.
-#[derive(Debug, Clone, PartialEq)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct IsotopeDopplerRoute {
     /// The isotope the route belongs to.
     pub isotope: Isotope,
@@ -175,6 +177,14 @@ impl DopplerRoute {
                 SampledTableReason::ExplicitTable | SampledTableReason::Formalism { .. }
             ),
         }
+    }
+}
+
+impl IsotopeDopplerRoute {
+    /// The same isotope on the same kind of route (see
+    /// [`DopplerRoute::same_kind`]).
+    pub fn same_kind(&self, other: &Self) -> bool {
+        self.isotope == other.isotope && self.route.same_kind(&other.route)
     }
 }
 

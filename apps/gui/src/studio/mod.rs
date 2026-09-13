@@ -955,16 +955,27 @@ fn build_residuals_cache(
         .map(|resolution| std::sync::Arc::new(InstrumentParams { resolution }))
     };
 
-    let model = nereids_fitting::transmission_model::TransmissionFitModel::new(
+    // The same preference order as `extract_pixel_fit_info`: the explicit
+    // pixel fit, else the spatial map. A free-temperature fit gated its
+    // routes at the fit's upper bound; the overlay must gate there too.
+    let (free_temperature, disclosed_routes) =
+        match (&state.pixel_fit_result, &state.spatial_result) {
+            (Some(result), _) => (
+                result.temperature_k.is_some(),
+                result.doppler_routes.as_deref(),
+            ),
+            (None, Some(sr)) => (sr.temperature_map.is_some(), sr.doppler_routes.as_deref()),
+            (None, None) => (false, None),
+        };
+    let model = design::build_overlay_model(
         energies.clone(),
         resonance_data,
         temperature_k,
         instrument,
         (density_indices, density_ratios),
-        None,
-        None,
-    )
-    .ok()?;
+        free_temperature,
+        disclosed_routes,
+    )?;
 
     use nereids_fitting::lm::FitModel;
     let fitted = model.evaluate(densities).ok()?;

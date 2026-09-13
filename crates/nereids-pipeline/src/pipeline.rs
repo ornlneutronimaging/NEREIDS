@@ -1304,6 +1304,28 @@ pub(crate) fn validate_counts_resolution_route(
     Ok(())
 }
 
+/// Reject a free-temperature start outside
+/// `[TEMPERATURE_FIT_LOWER_BOUND_K, TEMPERATURE_FIT_UPPER_BOUND_K]`.
+///
+/// Shared by the single-spectrum and spatial entry points so both surface
+/// the same message up front (the spatial map would otherwise swallow it
+/// per pixel into an all-NaN result).
+pub(crate) fn validate_fit_temperature_start(
+    config: &UnifiedFitConfig,
+) -> Result<(), PipelineError> {
+    if config.fit_temperature
+        && !(TEMPERATURE_FIT_LOWER_BOUND_K..=TEMPERATURE_FIT_UPPER_BOUND_K)
+            .contains(&config.temperature_k)
+    {
+        return Err(PipelineError::InvalidParameter(format!(
+            "temperature must be between {TEMPERATURE_FIT_LOWER_BOUND_K:.1} K and \
+             {TEMPERATURE_FIT_UPPER_BOUND_K:.1} K when fit_temperature is true, got {}",
+            config.temperature_k,
+        )));
+    }
+    Ok(())
+}
+
 /// Fit a single spectrum using the typed input data API.
 ///
 /// Dispatches to the correct fitting engine based on the `InputData` variant
@@ -1322,13 +1344,10 @@ pub fn fit_spectrum_typed(
 ) -> Result<SpectrumFitResult, PipelineError> {
     let n_e = config.energies().len();
 
-    // Validate temperature when fitting is requested
-    if config.fit_temperature && config.temperature_k < 1.0 {
-        return Err(PipelineError::InvalidParameter(format!(
-            "temperature must be >= 1.0 K when fit_temperature is true, got {}",
-            config.temperature_k,
-        )));
-    }
+    // A free temperature starts inside the fit's bounds: the Doppler routes
+    // are decided once at the upper bound, and a start above it would be
+    // refused by the plan on the first evaluation instead of here.
+    validate_fit_temperature_start(config)?;
 
     // Reject a fully-constrained fit up front (issue #633): freezing every
     // density with no other free parameter leaves nothing to vary, and the
@@ -9463,6 +9482,52 @@ mod tests {
             "{warning}"
         );
         assert!(warning.ends_with("(route gate at 5000 K)"), "{warning}");
+    }
+
+    #[test]
+    fn free_temperature_start_outside_the_fit_bounds_is_rejected_up_front() {
+        let data = u238_single_resonance();
+        let energies: Vec<f64> = (0..201).map(|i| 4.0 + (i as f64) * 0.0145).collect();
+        let (t, sigma) = synthetic_transmission_at_temp(&data, 0.0005, 300.0, &energies);
+        let input = InputData::Transmission {
+            transmission: t,
+            uncertainty: sigma,
+        };
+        for start_k in [0.5, TEMPERATURE_FIT_UPPER_BOUND_K + 1.0] {
+            let config = UnifiedFitConfig::new(
+                energies.clone(),
+                vec![data.clone()],
+                vec!["U-238".into()],
+                start_k,
+                None,
+                vec![0.001],
+            )
+            .unwrap()
+            .with_fit_temperature(true);
+            let err = fit_spectrum_typed(&input, &config).unwrap_err();
+            assert!(matches!(err, PipelineError::InvalidParameter(_)), "{err:?}");
+            let message = err.to_string();
+            assert!(
+                message.contains("between 1.0 K and 5000.0 K")
+                    && message.contains("fit_temperature"),
+                "{message}"
+            );
+        }
+        // The same start is accepted when the temperature is fixed.
+        let config = UnifiedFitConfig::new(
+            energies,
+            vec![data],
+            vec!["U-238".into()],
+            TEMPERATURE_FIT_UPPER_BOUND_K + 1.0,
+            None,
+            vec![0.001],
+        )
+        .unwrap()
+        .with_solver(SolverConfig::LevenbergMarquardt(LmConfig {
+            max_iter: 1,
+            ..LmConfig::default()
+        }));
+        assert!(fit_spectrum_typed(&input, &config).is_ok());
     }
 
     #[test]

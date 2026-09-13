@@ -204,6 +204,7 @@ pub fn snapshot_from_state(state: &AppState) -> ProjectSnapshot {
         single_fit_background,
         single_fit_baseline,
         single_fit_baseline_e_ref_ev,
+        single_fit_doppler_routes,
     ) = if let Some(ref pfr) = state.pixel_fit_result {
         // Prefer labels from FitFeedback (captured at fit time) to avoid
         // desync if isotope_entries are modified after the fit.
@@ -234,10 +235,11 @@ pub fn snapshot_from_state(state: &AppState) -> ProjectSnapshot {
             Some(pfr.background),
             pfr.baseline,
             pfr.baseline_e_ref_ev,
+            pfr.doppler_routes.clone(),
         )
     } else {
         (
-            None, None, None, None, None, None, None, None, None, None, None, None, None,
+            None, None, None, None, None, None, None, None, None, None, None, None, None, None,
         )
     };
 
@@ -404,6 +406,7 @@ pub fn snapshot_from_state(state: &AppState) -> ProjectSnapshot {
         single_fit_background,
         single_fit_baseline,
         single_fit_baseline_e_ref_ev,
+        single_fit_doppler_routes,
         endf_cache,
         // Read-only diagnostic populated by `load_project`; never written back.
         endf_cache_dropped: vec![],
@@ -1385,7 +1388,9 @@ fn state_from_snapshot(snap: ProjectSnapshot, state: &mut AppState, path: &Path)
             baseline: snap.single_fit_baseline,
             baseline_e_ref_ev: snap.single_fit_baseline_e_ref_ev,
             warnings: Vec::new(),
-            doppler_routes: None,
+            // The routes the fit disclosed are part of the result: the
+            // overlay redraws the curve through them.
+            doppler_routes: snap.single_fit_doppler_routes,
         };
         // Rebuild FitFeedback from the restored result
         if let Some(ref labels) = snap.single_fit_labels {
@@ -1642,6 +1647,58 @@ mod tests {
         let snap2 = snapshot_from_state(&restored);
         assert_eq!(snap2.dead_pixels.as_ref().unwrap(), &declared);
         assert_eq!(snap2.detected_dead_pixels.as_ref().unwrap(), &detected);
+    }
+
+    /// The routes a single-pixel fit disclosed are part of its result: the
+    /// overlay redraws the curve through them, so a reload must restore
+    /// them typed on the result and rendered in the fit feedback.
+    #[test]
+    fn test_single_fit_doppler_routes_survive_save_and_load() {
+        use nereids_physics::doppler_route::{DopplerRoute, IsotopeDopplerRoute};
+        let routes = vec![IsotopeDopplerRoute {
+            isotope: nereids_core::types::Isotope::new(72, 177).unwrap(),
+            route: DopplerRoute::Continuous {
+                formalism: nereids_endf::resonance::ResonanceFormalism::MLBW,
+            },
+        }];
+        let state = AppState {
+            pixel_fit_result: Some(nereids_pipeline::pipeline::SpectrumFitResult {
+                densities: vec![1.2e-4],
+                uncertainties: Some(vec![1e-6]),
+                reduced_chi_squared: 1.1,
+                converged: true,
+                iterations: 4,
+                temperature_k: Some(310.0),
+                temperature_k_unc: Some(5.0),
+                anorm: 1.0,
+                background: [0.0, 0.0, 0.0],
+                back_d: None,
+                back_f: None,
+                t0_us: None,
+                l_scale: None,
+                energy_scale_flight_path_m: None,
+                deviance_per_dof: None,
+                baseline: None,
+                baseline_e_ref_ev: None,
+                warnings: Vec::new(),
+                doppler_routes: Some(routes.clone()),
+            }),
+            ..AppState::default()
+        };
+        let snap = snapshot_from_state(&state);
+        assert_eq!(snap.single_fit_doppler_routes, Some(routes.clone()));
+
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("routes.nrd.h5");
+        save_project(&path, &snap).unwrap();
+        let mut restored = AppState::default();
+        state_from_snapshot(load_project(&path).unwrap(), &mut restored, &path);
+        let result = restored.pixel_fit_result.as_ref().unwrap();
+        assert_eq!(result.doppler_routes, Some(routes));
+        assert_eq!(
+            restored.last_fit_feedback.as_ref().unwrap().doppler_routes,
+            vec!["Hf-177: continuous free-gas integral over the MLBW resonance equation"]
+        );
     }
 
     /// #646 R4 P1-1 acceptance (b): save→restore→refit WITHOUT raw stacks

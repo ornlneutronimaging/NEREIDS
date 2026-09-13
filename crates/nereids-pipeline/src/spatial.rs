@@ -16,7 +16,7 @@ use nereids_physics::transmission::{
 };
 
 use crate::error::PipelineError;
-use crate::pipeline::SpectrumFitResult;
+use crate::pipeline::{SpectrumFitResult, validate_fit_temperature_start};
 
 /// Result of spatial mapping over a 2D image.
 ///
@@ -277,17 +277,12 @@ fn validate_spatial_fit_preflight(
     input: &InputData3D<'_>,
     config: &UnifiedFitConfig,
 ) -> Result<(), PipelineError> {
-    // Gate: `fit_temperature && temperature_k < 1.0` (mirrors
-    // `pipeline.rs::fit_spectrum_typed` temperature-init guard).
-    // Without hoisting, a user who forgets units and writes `0.025`
-    // for 25 meV would see `Ok(SpatialResult { n_converged: 0,
-    // density_maps: all-NaN })` instead of the actionable message.
-    if config.fit_temperature() && config.temperature_k() < 1.0 {
-        return Err(PipelineError::InvalidParameter(format!(
-            "temperature must be >= 1.0 K when fit_temperature is true, got {}",
-            config.temperature_k(),
-        )));
-    }
+    // Gate: a free-temperature start outside the fit's bounds (the same
+    // guard as `pipeline.rs::fit_spectrum_typed`).  Without hoisting, a
+    // user who forgets units and writes `0.025` for 25 meV would see
+    // `Ok(SpatialResult { n_converged: 0, density_maps: all-NaN })`
+    // instead of the actionable message.
+    validate_fit_temperature_start(config)?;
 
     // Gate: a fully-constrained fit (issue #633) — every density frozen and
     // no other free parameter — would leave each pixel a converged no-op via
@@ -1766,12 +1761,17 @@ pub fn spatial_map_typed(
     } else {
         config.temperature_k()
     };
-    let disclosed = if config.fit_temperature() {
+    // An energy-scale fit decides the route per pixel on the corrected grid,
+    // so its disclosure is read off the pixel results after the loop; the
+    // nominal-grid verdicts are what the other paths execute.
+    let disclosed = if config.fit_energy_scale() {
+        None
+    } else if config.fit_temperature() {
         planned_routes
     } else {
         fixed_routes
     };
-    let doppler_routes: Option<Vec<IsotopeDopplerRoute>> = disclosed.map(|routes| {
+    let mut doppler_routes: Option<Vec<IsotopeDopplerRoute>> = disclosed.map(|routes| {
         config
             .resonance_data()
             .iter()
@@ -1782,12 +1782,18 @@ pub fn spatial_map_typed(
             })
             .collect()
     });
+    let edge_warnings = |routes: &[IsotopeDopplerRoute]| -> Vec<String> {
+        routes
+            .iter()
+            .filter_map(|route| edge_fallback_warning(route, gate_temperature_k))
+            .inspect(|w| eprintln!("spatial_map_typed: warning: {w}"))
+            .collect()
+    };
     warnings.extend(
         doppler_routes
             .iter()
             .flatten()
-            .filter_map(|route| edge_fallback_warning(route, gate_temperature_k))
-            .inspect(|w| eprintln!("spatial_map_typed: warning: {w}")),
+            .flat_map(|r| edge_warnings(std::slice::from_ref(r))),
     );
 
     // Stage 1 (global mode): fit the baseline ONCE on the aggregated mean
@@ -2087,6 +2093,53 @@ pub fn spatial_map_typed(
             maps[0][[*y, *x]] = b[0];
             maps[1][[*y, *x]] = b[1];
             maps[2][[*y, *x]] = b[2];
+        }
+    }
+
+    // Energy-scale disclosure: the first converged pixel's routes when every
+    // converged pixel took the same kind of route per isotope, nothing (and
+    // a warning) when the pixels disagree — a map-wide route would then be
+    // false for some of them.
+    if config.fit_energy_scale() {
+        let mut per_pixel = results
+            .iter()
+            .filter(|(_, r)| r.converged)
+            .filter_map(|(_, r)| r.doppler_routes.as_deref());
+        if let Some(first) = per_pixel.next() {
+            let differing = per_pixel
+                .filter(|routes| {
+                    routes.len() != first.len()
+                        || routes.iter().zip(first).any(|(a, b)| !a.same_kind(b))
+                })
+                .count();
+            if differing == 0 {
+                warnings.extend(edge_warnings(first));
+                doppler_routes = Some(first.to_vec());
+            } else {
+                let w = format!(
+                    "Doppler routes differ between pixels: {differing} converged pixel(s) took a \
+                     different kind of route from the first converged pixel, so no map-wide \
+                     route is disclosed"
+                );
+                eprintln!("spatial_map_typed: warning: {w}");
+                warnings.push(w);
+            }
+        }
+        let refused_pixels = results
+            .iter()
+            .filter(|(_, r)| {
+                r.warnings
+                    .iter()
+                    .any(|w| w.starts_with("energy-scale fit rejected"))
+            })
+            .count();
+        if refused_pixels > 0 {
+            let w = format!(
+                "energy-scale fit rejected route-changing Doppler probes in {refused_pixels} \
+                 pixel(s); each stayed on the side of the resolved-range edge it started on"
+            );
+            eprintln!("spatial_map_typed: warning: {w}");
+            warnings.push(w);
         }
     }
 
@@ -4397,6 +4450,42 @@ mod tests {
     }
 
     #[test]
+    fn test_spatial_map_rejects_fit_temperature_above_the_upper_bound_up_front() {
+        let rd = u238_single_resonance();
+        let energies: Vec<f64> = (0..51).map(|i| 1.0 + (i as f64) * 0.2).collect();
+        let (t_3d, u_3d) = synthetic_4x4_transmission(&rd, 0.001, &energies);
+        let data = InputData3D::Transmission {
+            transmission: t_3d.view(),
+            uncertainty: u_3d.view(),
+        };
+        // The routes are decided once at the upper bound; a start above it
+        // would be refused by every pixel's plan instead of here.
+        let config = UnifiedFitConfig::new(
+            energies,
+            vec![rd],
+            vec!["U-238".into()],
+            TEMPERATURE_FIT_UPPER_BOUND_K + 1.0,
+            None,
+            vec![0.001],
+        )
+        .unwrap()
+        .with_solver(SolverConfig::LevenbergMarquardt(LmConfig::default()))
+        .with_fit_temperature(true);
+
+        let err = spatial_map_typed(&data, &config, None, None, None)
+            .expect_err("fit_temperature with temperature_k above the bound must be rejected");
+        assert!(
+            matches!(err, PipelineError::InvalidParameter(_)),
+            "expected InvalidParameter, got {err:?}"
+        );
+        let msg = err.to_string();
+        assert!(
+            msg.contains("5000.0 K") && msg.contains("fit_temperature"),
+            "error must name the upper bound, got: {msg}"
+        );
+    }
+
+    #[test]
     fn test_spatial_map_transmission_poisson_rejected_up_front() {
         let rd = u238_single_resonance();
         let energies: Vec<f64> = (0..51).map(|i| 1.0 + (i as f64) * 0.2).collect();
@@ -5477,6 +5566,44 @@ mod tests {
                 assert!(!result.warnings.iter().any(|w| w.starts_with("Doppler:")));
             }
         }
+    }
+
+    #[test]
+    fn spatial_energy_scale_fit_discloses_the_per_pixel_routes() {
+        let rd = u238_with_formalism(ResonanceFormalism::MLBW);
+        let energies: Vec<f64> = (0..101).map(|i| 4.0 + (i as f64) * 0.05).collect();
+        let (t_3d, u_3d) = synthetic_grid_transmission(&rd, 0.001, &energies, 2, 2);
+        let data = InputData3D::Transmission {
+            transmission: t_3d.view(),
+            uncertainty: u_3d.view(),
+        };
+        let config = UnifiedFitConfig::new(
+            energies,
+            vec![rd],
+            vec!["U-238".into()],
+            300.0,
+            None,
+            vec![0.0005],
+        )
+        .unwrap()
+        .with_solver(SolverConfig::LevenbergMarquardt(LmConfig::default()))
+        .with_energy_scale(0.0, 1.0, 25.0);
+        let result = spatial_map_typed(&data, &config, None, None, None).unwrap();
+        assert!(result.n_converged > 0, "{result:?}");
+        let routes = result.doppler_routes.as_ref().unwrap();
+        assert_eq!(
+            routes[0].to_string(),
+            "U-238: continuous free-gas integral over the MLBW resonance equation"
+        );
+        assert!(!result.warnings.iter().any(|w| w.starts_with("Doppler")));
+
+        // What the map discloses is what a pixel executed.
+        let pixel = InputData::Transmission {
+            transmission: t_3d.slice(s![.., 0, 0]).to_vec(),
+            uncertainty: u_3d.slice(s![.., 0, 0]).to_vec(),
+        };
+        let per_pixel = fit_spectrum_typed(&pixel, &config).unwrap();
+        assert_eq!(per_pixel.doppler_routes, result.doppler_routes);
     }
 
     #[test]
