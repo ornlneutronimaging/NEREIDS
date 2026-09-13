@@ -5674,6 +5674,104 @@ mod tests {
         assert_eq!(per_pixel.doppler_routes, result.doppler_routes);
     }
 
+    /// Pixels are not obliged to agree: the `(t0, L_scale)` peak-match seed
+    /// is fitted from each pixel's own dips, so pixels whose data carry
+    /// different energy scales evaluate the physics on different corrected
+    /// grids. When those grids fall on opposite sides of a resolved-range
+    /// edge the pixels take different routes, and a map-wide route would be
+    /// false for one of them: none is disclosed, and the disagreement is
+    /// warned about.
+    #[test]
+    fn spatial_energy_scale_pixels_on_different_routes_disclose_no_map_wide_route() {
+        use nereids_fitting::transmission_model::EnergyScaleTransmissionModel;
+        // MLBW ending at 8 eV, two resonances so the peak-match seed has two
+        // (dip, resonance) pairs to fit a line through. At 300 K the thermal
+        // window reaches the range edge from 7.53 eV up, so a 3.0-7.45 eV
+        // grid is tier 1 at the identity scale and tier 2 once a +8 µs t₀
+        // stretches it past that energy.
+        let mut rd = u238_with_formalism(ResonanceFormalism::MLBW);
+        rd.ranges[0].energy_high = 8.0;
+        let mut lower = rd.ranges[0].l_groups[0].resonances[0].clone();
+        lower.energy = 4.2;
+        rd.ranges[0].l_groups[0].resonances.insert(0, lower);
+        let energies: Vec<f64> = (0..179).map(|i| 3.0 + (i as f64) * 0.025).collect();
+        let truth = |t0_us: f64| {
+            EnergyScaleTransmissionModel::new(
+                Arc::new(vec![rd.clone()]),
+                Arc::new(vec![0]),
+                Arc::new(vec![1.0]),
+                300.0,
+                energies.clone(),
+                25.0,
+                1,
+                2,
+                None,
+            )
+            .evaluate(&[0.001, t0_us, 1.0])
+            .unwrap()
+        };
+        let per_pixel_truth = [truth(0.0), truth(8.0)];
+
+        let n_e = energies.len();
+        let mut t_3d = Array3::zeros((n_e, 1, 2));
+        let mut u_3d = Array3::zeros((n_e, 1, 2));
+        for (x, spectrum) in per_pixel_truth.iter().enumerate() {
+            for (i, &t) in spectrum.iter().enumerate() {
+                t_3d[[i, 0, x]] = t;
+                u_3d[[i, 0, x]] = 0.01 * t.max(0.01);
+            }
+        }
+        let data = InputData3D::Transmission {
+            transmission: t_3d.view(),
+            uncertainty: u_3d.view(),
+        };
+        let config = UnifiedFitConfig::new(
+            energies,
+            vec![rd],
+            vec!["U-238".into()],
+            300.0,
+            None,
+            vec![0.0008],
+        )
+        .unwrap()
+        .with_solver(SolverConfig::LevenbergMarquardt(LmConfig::default()))
+        .with_energy_scale(0.0, 1.0, 25.0);
+
+        // Each pixel on its own: the routes really do differ.
+        let routes_of = |x: usize| {
+            let pixel = InputData::Transmission {
+                transmission: t_3d.slice(s![.., 0, x]).to_vec(),
+                uncertainty: u_3d.slice(s![.., 0, x]).to_vec(),
+            };
+            let result = fit_spectrum_typed(&pixel, &config).unwrap();
+            assert!(result.converged, "pixel {x} must converge: {result:?}");
+            result.doppler_routes.unwrap()
+        };
+        assert!(matches!(
+            routes_of(0)[0].route,
+            DopplerRoute::Continuous { .. }
+        ));
+        assert!(matches!(
+            routes_of(1)[0].route,
+            DopplerRoute::SampledTable { .. }
+        ));
+
+        let result = spatial_map_typed(&data, &config, None, None, None).unwrap();
+        assert_eq!(result.n_converged, 2, "{result:?}");
+        assert!(
+            result.doppler_routes.is_none(),
+            "no route holds for both pixels: {:?}",
+            result.doppler_routes
+        );
+        assert!(
+            result.warnings.iter().any(|w| w.starts_with(
+                "Doppler routes differ between pixels: 1 converged pixel(s) took a different kind"
+            )),
+            "{:?}",
+            result.warnings
+        );
+    }
+
     /// A caller's zero-kelvin table supersedes the plan on the
     /// free-temperature path; the map discloses what every pixel executed.
     #[test]

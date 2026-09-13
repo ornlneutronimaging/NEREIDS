@@ -1869,13 +1869,13 @@ pub struct EnergyScaleTransmissionModel {
     /// rebuilding it twice.  `RefCell` is safe — the model is rebuilt per pixel
     /// and never shared across threads.
     cached_work_xs: RefCell<CachedWorkXs>,
-    /// Doppler routes pinned at the first probe, plus the count of later
-    /// probes refused for wanting a different route. The working grid moves
+    /// Doppler routes of the most recently accepted probe, plus the count of
+    /// probes refused for wanting a different tier. The working grid moves
     /// with every `(t0, L_scale)` probe, so the route is decided per probe;
-    /// a change between probes would make the objective discontinuous, so
-    /// it is a hard error rather than a silent re-route. Shared (`Rc`) with
-    /// the pipeline so the disclosed routes are the executed ones and the
-    /// refusals reach the result's warnings.
+    /// a change of TIER between probes would make the objective
+    /// discontinuous, so it is a hard error rather than a silent re-route.
+    /// Shared (`Rc`) with the pipeline so the disclosed routes are the
+    /// executed ones and the refusals reach the result's warnings.
     pinned_doppler_routes: Rc<RefCell<PinnedDopplerRoutes>>,
     /// Method for the t0 / L_scale Jacobian columns. Initialised from
     /// [`EnergyScaleJacobianMethod::from_env`] in [`Self::new`], which
@@ -1885,8 +1885,8 @@ pub struct EnergyScaleTransmissionModel {
     jacobian_method: EnergyScaleJacobianMethod,
 }
 
-/// What an [`EnergyScaleTransmissionModel`] pinned at its first probe and
-/// how many later probes it refused.
+/// What an [`EnergyScaleTransmissionModel`] pinned across its probes, the
+/// routes its last accepted probe executed, and how many probes it refused.
 ///
 /// A refused probe is one whose corrected grid would have changed some
 /// isotope's tier (two sampled-table routes run the same numerics
@@ -1897,8 +1897,12 @@ pub struct EnergyScaleTransmissionModel {
 /// side. The count makes that barrier visible.
 #[derive(Debug, Clone, Default, PartialEq)]
 pub struct PinnedDopplerRoutes {
-    /// Routes decided at the first probe; `None` until the model has been
-    /// evaluated.
+    /// Routes of the most recently ACCEPTED probe — refreshed on every one
+    /// of them, so a caller that evaluates at the solution reads the routes
+    /// the solution executed. Only the tier is pinned across probes (see
+    /// [`DopplerRoute::same_tier`]); the sampled-table reason and the
+    /// continuous route's formalism set are properties of that probe's
+    /// grid. `None` until the model has been evaluated.
     pub routes: Option<Vec<DopplerRoute>>,
     /// Number of probes refused for wanting a different tier.
     pub refused_probes: usize,
@@ -2106,41 +2110,61 @@ impl EnergyScaleTransmissionModel {
         }
     }
 
-    /// Handle to the Doppler routes pinned at the first probe (routes are
-    /// `None` until the model has been evaluated) and the refused-probe
-    /// count.
+    /// Handle to the Doppler routes of the most recently accepted probe
+    /// (`None` until the model has been evaluated) and the refused-probe
+    /// count. Evaluating at the fitted parameters leaves the solution's
+    /// routes in it.
     pub fn pinned_doppler_routes(&self) -> Rc<RefCell<PinnedDopplerRoutes>> {
         Rc::clone(&self.pinned_doppler_routes)
     }
 
+    /// Hold the tier across probes and record the routes this probe
+    /// executed.
+    ///
+    /// Only the TIER is pinned: the reported energies inside a gate reason
+    /// describe one grid and move with it, and every sampled-table reason
+    /// runs the same numerics, so only the tier must hold for the objective
+    /// to stay continuous between probes. Everything else the route
+    /// discloses — the sampled-table reason, the set of formalisms a
+    /// continuous route was evaluated with — is a property of the grid this
+    /// probe ran on, so an accepted probe REPLACES it. The stored routes are
+    /// therefore those of the most recently accepted probe, which the
+    /// pipeline brings to the solution with one forward evaluation there;
+    /// keeping the first probe's would disclose a route the fit did not
+    /// execute (a grid that moved into an adjacent resolved range would
+    /// still be named with the first probe's formalism).
+    ///
+    /// Refusing leaves the stored routes alone, so the disclosure after a
+    /// refusal is still the last route actually executed.
+    ///
+    /// # Errors
+    /// [`FittingError::EvaluationFailed`] when this probe's routes change
+    /// any isotope's tier; the refusal is counted in
+    /// [`PinnedDopplerRoutes::refused_probes`] and the isotope recorded in
+    /// [`PinnedDopplerRoutes::refused_isotope`].
     fn pin_doppler_routes(&self, routes: &[DopplerRoute]) -> Result<(), FittingError> {
         let mut pinned = self.pinned_doppler_routes.borrow_mut();
-        let Some(first) = pinned.routes.as_deref() else {
-            pinned.routes = Some(routes.to_vec());
-            return Ok(());
-        };
-        // The reported energies inside a gate reason describe one grid and
-        // move with it, and every sampled-table reason runs the same
-        // numerics; only the tier must hold for the objective to stay
-        // continuous between probes.
-        let changed = (0..first.len().max(routes.len())).find(|&i| {
-            first
-                .get(i)
-                .zip(routes.get(i))
-                .is_none_or(|(a, b)| !a.same_tier(b))
-        });
-        let Some(index) = changed else {
-            return Ok(());
-        };
-        let message = format!(
-            "Doppler route changed between energy-scale probes: first probe [{}], \
-             this probe [{}]",
-            describe_routes(first),
-            describe_routes(routes),
-        );
-        pinned.refused_probes += 1;
-        pinned.refused_isotope = Some(index);
-        Err(FittingError::EvaluationFailed(message))
+        if let Some(first) = pinned.routes.as_deref() {
+            let changed = (0..first.len().max(routes.len())).find(|&i| {
+                first
+                    .get(i)
+                    .zip(routes.get(i))
+                    .is_none_or(|(a, b)| !a.same_tier(b))
+            });
+            if let Some(index) = changed {
+                let message = format!(
+                    "Doppler route changed between energy-scale probes: pinned [{}], \
+                     this probe [{}]",
+                    describe_routes(first),
+                    describe_routes(routes),
+                );
+                pinned.refused_probes += 1;
+                pinned.refused_isotope = Some(index);
+                return Err(FittingError::EvaluationFailed(message));
+            }
+        }
+        pinned.routes = Some(routes.to_vec());
+        Ok(())
     }
 
     /// Override the t0 / L_scale Jacobian method for this model instance.
@@ -7178,6 +7202,19 @@ mod tests {
         (0..201).map(|i| 4.0 + (i as f64) * 0.0145).collect()
     }
 
+    /// SLBW on `[1e-5, 100)` with MLBW on `[100, 1e4]` above it: a grid
+    /// well inside either range is tier 1, so an energy-scale probe can
+    /// carry the corrected grid from one resonance equation to the other
+    /// without changing the tier.
+    fn adjacent_slbw_then_mlbw() -> ResonanceData {
+        let mut data = u238_with_formalism(ResonanceFormalism::SLBW);
+        data.ranges[0].energy_high = 100.0;
+        let mut upper = u238_with_formalism(ResonanceFormalism::MLBW).ranges[0].clone();
+        upper.energy_low = 100.0;
+        data.ranges.push(upper);
+        data
+    }
+
     #[test]
     fn free_temperature_model_plans_routes_at_the_upper_bound() {
         let energies = edge_grid();
@@ -7427,6 +7464,63 @@ mod tests {
             "{refused}"
         );
         assert_eq!(model.pinned_doppler_routes().borrow().refused_probes, 1);
+        assert!(
+            matches!(
+                model.pinned_doppler_routes().borrow().routes.as_deref(),
+                Some([DopplerRoute::SampledTable {
+                    reason: SampledTableReason::WindowCrossesRangeBoundary { .. }
+                }])
+            ),
+            "the accepted probe's reason is what was executed; the refusal left it alone"
+        );
+    }
+
+    /// The tier is pinned, the rest of the route is not: a probe whose
+    /// corrected grid moves into the adjacent resolved range runs the other
+    /// formalism's resonance equation, and that is what the handle must
+    /// report — a fit reading it at the solution would otherwise disclose
+    /// the first probe's formalism for a curve evaluated with another.
+    #[test]
+    fn energy_scale_model_discloses_the_routes_of_the_last_accepted_probe() {
+        let energies: Vec<f64> = (0..41).map(|i| 50.0 + (i as f64) * 0.25).collect();
+        let model = EnergyScaleTransmissionModel::new(
+            Arc::new(vec![adjacent_slbw_then_mlbw()]),
+            Arc::new(vec![0]),
+            Arc::new(vec![1.0]),
+            293.6,
+            energies,
+            25.0,
+            1,
+            2,
+            None,
+        );
+        model.evaluate(&[0.001, 0.0, 1.0]).unwrap();
+        assert_eq!(
+            model.pinned_doppler_routes().borrow().routes.as_deref(),
+            Some(
+                [DopplerRoute::Continuous {
+                    formalisms: vec![ResonanceFormalism::SLBW]
+                }]
+                .as_slice()
+            )
+        );
+        // L_scale scales the corrected energies by L²: 3.2 carries the
+        // 50–60 eV grid to 512–614 eV, inside the MLBW range above.
+        model.evaluate(&[0.001, 0.0, 3.2]).unwrap();
+        let pinned = model.pinned_doppler_routes().borrow().clone();
+        assert_eq!(
+            pinned.routes.as_deref(),
+            Some(
+                [DopplerRoute::Continuous {
+                    formalisms: vec![ResonanceFormalism::MLBW]
+                }]
+                .as_slice()
+            ),
+            "an accepted probe executed the MLBW equation; the disclosure must say so"
+        );
+        // The tier never changed, so the refusal barrier is untouched.
+        assert_eq!(pinned.refused_probes, 0);
+        assert_eq!(pinned.refused_isotope, None);
     }
 
     #[test]

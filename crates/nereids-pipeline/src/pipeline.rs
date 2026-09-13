@@ -3050,9 +3050,11 @@ enum RouteSource {
         routes: Vec<DopplerRoute>,
         negative_values: std::rc::Rc<std::cell::RefCell<Vec<usize>>>,
     },
-    /// Pinned by the energy-scale model at its first probe; read after the
-    /// fit, so the disclosed routes are the executed ones and the probes
-    /// refused for wanting another route reach the warnings.
+    /// Recorded by the energy-scale model at each accepted probe (the tier
+    /// alone is pinned across them); read after the fit has been evaluated
+    /// at its solution, so the disclosed routes are the ones the solution
+    /// executed and the probes refused for wanting another tier reach the
+    /// warnings.
     Pinned(std::rc::Rc<std::cell::RefCell<PinnedDopplerRoutes>>),
 }
 
@@ -3112,12 +3114,15 @@ impl RouteSource {
     /// Bring the shared handles to the solution.
     ///
     /// A free-temperature or energy-scale model records its negative-value
-    /// counts at every evaluation, and the optimizer's last call is usually
+    /// counts at every evaluation — and the energy-scale model its routes
+    /// at every accepted probe — while the optimizer's last call is usually
     /// a rejected trial or a finite-difference probe, not the accepted
     /// point. One forward evaluation at the fitted parameters — the only
-    /// evaluation the disclosure adds to the fit — refills the handles
-    /// with the solution's counts. A fixed-temperature source reads its
-    /// counts from the build that preceded the fit and needs nothing.
+    /// evaluation the disclosure adds to the fit — refills the handles with
+    /// the solution's counts and, for the energy-scale model, with the
+    /// routes the solution's corrected grid took. A fixed-temperature
+    /// source reads its counts from the build that preceded the fit and
+    /// needs nothing.
     fn evaluate_at_solution(
         &self,
         model: &dyn FitModel,
@@ -9907,5 +9912,55 @@ mod tests {
                     .to_string()
             ]
         );
+    }
+
+    /// The disclosure names the route the SOLUTION executed, not the one the
+    /// first probe did. Only the tier is held across probes, so an accepted
+    /// probe can move the corrected grid into the adjacent resolved range
+    /// and run the other formalism's resonance equation;
+    /// `evaluate_at_solution` is what brings the handle to the fitted
+    /// parameters, and the result must report what it finds there.
+    #[test]
+    fn energy_scale_disclosure_reports_the_route_of_the_solution() {
+        // SLBW below 100 eV, MLBW above it: a 50-60 eV grid is tier 1 in
+        // the lower range, and at L_scale = 3.2 (E scales as L²) the
+        // corrected 512-614 eV grid is tier 1 in the upper one.
+        let mut data = u238_with_formalism(ResonanceFormalism::SLBW);
+        data.ranges[0].energy_high = 100.0;
+        let mut upper = u238_with_formalism(ResonanceFormalism::MLBW).ranges[0].clone();
+        upper.energy_low = 100.0;
+        data.ranges.push(upper);
+        let energies: Vec<f64> = (0..41).map(|i| 50.0 + (i as f64) * 0.25).collect();
+        let config = UnifiedFitConfig::new(
+            energies,
+            vec![data],
+            vec!["U-238".into()],
+            293.6,
+            None,
+            vec![0.001],
+        )
+        .unwrap()
+        .with_energy_scale(0.0, 1.0, 25.0);
+        let built = build_energy_scale_transmission_model(&config, 1, 2, None).unwrap();
+
+        built.model.evaluate(&[0.001, 0.0, 1.0]).unwrap();
+        let (routes, _) = doppler_disclosure(&config, &built.routes);
+        assert_eq!(
+            routes.unwrap()[0].to_string(),
+            "U-238: continuous free-gas integral over the SLBW resonance equation"
+        );
+
+        built
+            .routes
+            .evaluate_at_solution(&*built.model, &[0.001, 0.0, 3.2])
+            .unwrap();
+        let (routes, warnings) = doppler_disclosure(&config, &built.routes);
+        assert_eq!(
+            routes.unwrap()[0].to_string(),
+            "U-238: continuous free-gas integral over the MLBW resonance equation"
+        );
+        // The tier never moved, so nothing was refused and no barrier
+        // warning is owed.
+        assert!(warnings.is_empty(), "{warnings:?}");
     }
 }
