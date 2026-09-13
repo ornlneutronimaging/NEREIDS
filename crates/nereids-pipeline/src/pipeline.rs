@@ -3649,8 +3649,12 @@ fn extract_result(
         deviance_per_dof: None,
         baseline,
         baseline_e_ref_ev,
+        // Config-time diagnostics first, then what the fit itself reported
+        // (a free parameter whose uncertainty had to be withheld); both
+        // describe the result the caller is holding.
         warnings: degenerate_normalization_warning(config)
             .into_iter()
+            .chain(result.warnings.iter().cloned())
             .collect(),
         doppler_routes: None,
     })
@@ -4889,6 +4893,7 @@ mod tests {
             params: vec![0.001],
             covariance: Some(lm::FlatMatrix::zeros(1, 1)),
             uncertainties: Some(vec![0.123]),
+            warnings: Vec::new(),
         };
 
         // Single free density → its full-layout index 0 is also free-index 0.
@@ -8771,6 +8776,7 @@ mod tests {
             params: vec![0.001, 0.002, 350.0],
             covariance: Some(lm::FlatMatrix::zeros(2, 2)),
             uncertainties: Some(vec![0.02, 4.0]),
+            warnings: Vec::new(),
         };
 
         let extracted = extract_result(&config, &result, 2, &[1, 2], None, None).unwrap();

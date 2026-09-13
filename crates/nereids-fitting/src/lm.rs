@@ -121,6 +121,13 @@ pub struct LmResult {
     pub covariance: Option<FlatMatrix>,
     /// Standard errors of free parameters (diagonal of covariance).
     pub uncertainties: Option<Vec<f64>>,
+    /// Diagnostics the fit itself produced, one line each; empty when it
+    /// has nothing to say.  Today: a free parameter whose uncertainty is
+    /// NaN because the covariance could only be formed over the others.
+    /// A withheld uncertainty is a NaN in `uncertainties`, which carries
+    /// no reason on its own, so the reason is reported here rather than
+    /// left for the reader to infer.
+    pub warnings: Vec<String>,
 }
 
 /// A model function that can be fitted.
@@ -259,6 +266,14 @@ fn has_informative_curvature(jtw_j: &FlatMatrix) -> bool {
 /// across iterations to avoid per-Jacobian allocation.
 ///
 /// J.get(i, j) = ∂model[i] / ∂free_param[j]
+///
+/// Returns the Jacobian and the free-index positions whose column is zero
+/// because no probe could be taken: a bound blocked one side and the model
+/// refused the other (or refused both).  Those columns are unresponsive, so
+/// the covariance path must exclude them instead of inverting a singular
+/// JᵀWJ and dropping every parameter's uncertainty.  The list is empty on
+/// the analytical path and for a well-probed finite-difference Jacobian, so
+/// it costs no allocation in the common case.
 fn compute_jacobian(
     model: &dyn FitModel,
     params: &mut ParameterSet,
@@ -266,7 +281,7 @@ fn compute_jacobian(
     fd_step: f64,
     all_vals_buf: &mut Vec<f64>,
     free_idx_buf: &mut Vec<usize>,
-) -> Result<FlatMatrix, FittingError> {
+) -> Result<(FlatMatrix, Vec<usize>), FittingError> {
     params.free_indices_into(free_idx_buf);
     let n_free = free_idx_buf.len();
     let n_data = y_current.len();
@@ -284,45 +299,48 @@ fn compute_jacobian(
             n_free,
             n_data * n_free,
         );
-        return Ok(j);
+        return Ok((j, Vec::new()));
     }
 
     // Fallback: forward finite differences, reusing y_current as the base.
     let mut jacobian = FlatMatrix::zeros(n_data, n_free);
+    let mut unprobed = Vec::new();
 
     for (j, &idx) in free_idx_buf.iter().enumerate() {
         let original = params.params[idx].value;
         let step = fd_step * (1.0 + original.abs());
 
-        params.params[idx].value = original + step;
-        params.params[idx].clamp();
-        let mut actual_step = params.params[idx].value - original;
-
-        // #112: If the forward step is blocked by an upper bound, try the
-        // backward step so the Jacobian column is not frozen at zero.
-        if actual_step.abs() < PIVOT_FLOOR {
-            params.params[idx].value = original - step;
+        // #112: forward first, backward second.  A step a bound blocks, and
+        // equally a step the model refuses (an energy-scale probe across a
+        // resolved-range edge, say), is replaced by the one-sided
+        // difference on the other side, so the column is not frozen at
+        // zero.  The backward probe only runs when the forward one is
+        // unusable, so a well-behaved parameter still costs one evaluate.
+        let mut probe = None;
+        for signed_step in [step, -step] {
+            params.params[idx].value = original + signed_step;
             params.params[idx].clamp();
-            actual_step = params.params[idx].value - original;
+            let actual_step = params.params[idx].value - original;
             if actual_step.abs() < PIVOT_FLOOR {
-                // Truly stuck at a point constraint — skip this parameter.
-                params.params[idx].value = original;
                 continue;
+            }
+            params.all_values_into(all_vals_buf);
+            if let Ok(v) = model.evaluate(all_vals_buf) {
+                probe = Some((v, actual_step));
+                break;
             }
         }
-
-        params.all_values_into(all_vals_buf);
-        let perturbed = match model.evaluate(all_vals_buf) {
-            Ok(v) => v,
-            Err(_) => {
-                // Restore original before skipping — leaving the column as
-                // zero makes this parameter unresponsive for one LM step,
-                // which is safe (matches Poisson compute_gradient pattern).
-                params.params[idx].value = original;
-                continue;
-            }
-        };
         params.params[idx].value = original;
+
+        let Some((perturbed, actual_step)) = probe else {
+            // Truly stuck at a point constraint, or refused on both sides.
+            // Leaving the column zero makes this parameter unresponsive for
+            // one LM step, which is safe (matches the Poisson
+            // compute_gradient pattern); the covariance path needs to know,
+            // because a zero column makes JᵀWJ singular.
+            unprobed.push(j);
+            continue;
+        };
 
         // The main LM loop checks the trial step via
         // `trial_has_active_nonfinite`, but `compute_jacobian` is also
@@ -353,7 +371,7 @@ fn compute_jacobian(
         }
     }
 
-    Ok(jacobian)
+    Ok((jacobian, unprobed))
 }
 
 /// Solve (A + λ·diag(A)) · x = b using Gaussian elimination.
@@ -607,6 +625,7 @@ pub fn levenberg_marquardt_with_mask(
             params: params.all_values(),
             covariance: None,
             uncertainties: None,
+            warnings: Vec::new(),
         });
     }
 
@@ -656,6 +675,7 @@ pub fn levenberg_marquardt_with_mask(
                 params: params.all_values(),
                 covariance: None,
                 uncertainties: None,
+                warnings: Vec::new(),
             });
         }
 
@@ -680,6 +700,7 @@ pub fn levenberg_marquardt_with_mask(
             params: params.all_values(),
             covariance: Some(FlatMatrix::zeros(0, 0)),
             uncertainties: Some(vec![]),
+            warnings: Vec::new(),
         });
     }
 
@@ -701,6 +722,7 @@ pub fn levenberg_marquardt_with_mask(
             params: params.all_values(),
             covariance: None,
             uncertainties: None,
+            warnings: Vec::new(),
         });
     }
     let dof = n_active - n_free;
@@ -763,7 +785,9 @@ pub fn levenberg_marquardt_with_mask(
         // Compute Jacobian — uses y_current to avoid a redundant evaluate().
         // Analytical Jacobian (if provided by the model) costs 0 extra evaluates;
         // finite-difference fallback costs N_free extra evaluates.
-        let jacobian = compute_jacobian(
+        // The main loop tolerates a zero column for one step; only the
+        // covariance path below needs to know which parameters were refused.
+        let (jacobian, _) = compute_jacobian(
             model,
             params,
             &y_current,
@@ -922,8 +946,8 @@ pub fn levenberg_marquardt_with_mask(
     // inversion.  When `compute_covariance` is false (e.g. per-pixel spatial
     // mapping), we skip it entirely — the caller only needs densities and
     // chi-squared, not uncertainties.
-    let (covariance, uncertainties) = if converged && config.compute_covariance {
-        let jacobian = compute_jacobian(
+    let (covariance, uncertainties, warnings) = if converged && config.compute_covariance {
+        let (jacobian, unprobed) = compute_jacobian(
             model,
             params,
             &y_current,
@@ -958,7 +982,29 @@ pub fn levenberg_marquardt_with_mask(
         // undefined (0/0).  We report NaN and skip covariance scaling entirely,
         // returning None for covariance and uncertainties.
         if dof > 0 {
-            if let Some(mut cov) = invert_matrix(&jtw_j) {
+            // A parameter the model does not respond to leaves a zero row
+            // and column, which makes the whole JᵀWJ singular and would
+            // cost every other parameter its uncertainty.  It is excluded,
+            // reported as NaN and named; the others keep theirs.  Same
+            // treatment as the counts-domain Fisher path in
+            // `joint_poisson_fit`.
+            let (inverse, uninformative) = invert_informative_block(&jtw_j);
+            let warnings: Vec<String> = uninformative
+                .iter()
+                .map(|&j| {
+                    let name = &params.params[free_idx_buf[j]].name;
+                    let cause = if unprobed.contains(&j) {
+                        "the model refused every finite-difference probe of it"
+                    } else {
+                        "the model output does not respond to it at the solution"
+                    };
+                    format!(
+                        "covariance: the uncertainty of `{name}` is NaN because {cause}; the \
+                         covariance covers the other free parameters"
+                    )
+                })
+                .collect();
+            if let Some(mut cov) = inverse {
                 for elem in cov.data.iter_mut() {
                     *elem *= reduced_chi2;
                 }
@@ -972,17 +1018,17 @@ pub fn levenberg_marquardt_with_mask(
                         }
                     })
                     .collect();
-                (Some(cov), Some(unc))
+                (Some(cov), Some(unc), warnings)
             } else {
-                (None, None)
+                (None, None, warnings)
             }
         } else {
             // dof == 0: covariance scaling is undefined; report None.
-            (None, None)
+            (None, None, Vec::new())
         }
     } else {
         // Covariance computation skipped (compute_covariance == false).
-        (None, None)
+        (None, None, Vec::new())
     };
 
     Ok(LmResult {
@@ -993,6 +1039,7 @@ pub fn levenberg_marquardt_with_mask(
         params: params.all_values(),
         covariance,
         uncertainties,
+        warnings,
     })
 }
 
@@ -1950,7 +1997,7 @@ mod tests {
         let y_current = vec![0.5; 4];
         let mut all_vals_buf: Vec<f64> = Vec::new();
         let mut free_idx_buf: Vec<usize> = Vec::new();
-        let jac = compute_jacobian(
+        let (jac, _) = compute_jacobian(
             &model,
             &mut params,
             &y_current,
@@ -1975,5 +2022,138 @@ mod tests {
                 "column 1 (NaN probe) should be zeroed, row {i}"
             );
         }
+    }
+
+    /// `y_i = a·x_i + b`, with a band of `b` values the model refuses:
+    /// the shape of an energy-scale probe the Doppler route gate rejects.
+    struct RefusingLine {
+        x: Vec<f64>,
+        /// `b` strictly above this is refused.
+        refuse_b_above: f64,
+        /// `b` strictly below this is refused.
+        refuse_b_below: f64,
+    }
+
+    impl FitModel for RefusingLine {
+        fn evaluate(&self, params: &[f64]) -> Result<Vec<f64>, FittingError> {
+            let (a, b) = (params[0], params[1]);
+            if b > self.refuse_b_above || b < self.refuse_b_below {
+                return Err(FittingError::EvaluationFailed("route change".into()));
+            }
+            Ok(self.x.iter().map(|&x| a * x + b).collect())
+        }
+        // No analytical_jacobian: the finite-difference path is the subject.
+    }
+
+    /// A probe the model refuses on one side is replaced by the one-sided
+    /// difference on the other, so the column is not frozen at zero, JᵀWJ
+    /// stays full rank and every parameter keeps a finite uncertainty.
+    #[test]
+    fn compute_jacobian_uses_the_other_side_of_a_refused_probe() {
+        let x = vec![0.0, 1.0, 2.0, 3.0];
+        let jacobian_of = |refuse_b_above: f64| {
+            let model = RefusingLine {
+                x: x.clone(),
+                refuse_b_above,
+                refuse_b_below: f64::NEG_INFINITY,
+            };
+            let mut params = ParameterSet::new(vec![
+                FitParameter::unbounded("a", 2.0),
+                FitParameter::unbounded("b", 3.0),
+            ]);
+            let y_current = model.evaluate(&params.all_values()).unwrap();
+            let mut all_vals_buf: Vec<f64> = Vec::new();
+            let mut free_idx_buf: Vec<usize> = Vec::new();
+            let out = compute_jacobian(
+                &model,
+                &mut params,
+                &y_current,
+                1e-6,
+                &mut all_vals_buf,
+                &mut free_idx_buf,
+            )
+            .expect("a refused probe must not fail the Jacobian");
+            assert_eq!(params.params[1].value, 3.0, "the parameter is restored");
+            out
+        };
+        let (central, unrefused) = jacobian_of(f64::INFINITY);
+        assert!(unrefused.is_empty());
+        let (one_sided, refused) = jacobian_of(3.0);
+        assert!(
+            refused.is_empty(),
+            "the backward probe carries the column alone"
+        );
+        for (forward, backward) in central.data.iter().zip(one_sided.data.iter()) {
+            assert!(
+                (forward - backward).abs() <= 1e-6 * forward.abs().max(1.0),
+                "the one-sided column must match the other side: {forward} vs {backward}"
+            );
+        }
+        // The unit-weight JᵀWJ of the one-sided Jacobian is full rank, so no
+        // parameter is excluded and each keeps a positive variance.
+        let mut jtw_j = FlatMatrix::zeros(2, 2);
+        for i in 0..one_sided.nrows {
+            for j in 0..2 {
+                for k in 0..2 {
+                    *jtw_j.get_mut(j, k) += one_sided.get(i, j) * one_sided.get(i, k);
+                }
+            }
+        }
+        let (inverse, excluded) = invert_informative_block(&jtw_j);
+        assert!(excluded.is_empty());
+        let inverse = inverse.expect("the one-sided column keeps the matrix full rank");
+        assert!(inverse.get(0, 0) > 0.0 && inverse.get(1, 1) > 0.0);
+    }
+
+    /// A parameter whose probes are refused on both sides keeps a zero
+    /// column, which would make the whole JᵀWJ singular.  The fit reports
+    /// NaN for that parameter alone, keeps the covariance of the others,
+    /// and names it in a `warnings` line.
+    #[test]
+    fn lm_reports_nan_for_a_parameter_refused_on_both_sides() {
+        // Residuals [1, -1, -1, 1] are orthogonal to both columns, so the
+        // least-squares optimum is exactly (a, b) = (2, 3) with χ² = 4 and
+        // dof = 2: `b` is already at its optimum, and χ²/ν > 0 makes the
+        // surviving uncertainty a real number rather than zero.
+        let x = vec![0.0, 1.0, 2.0, 3.0];
+        let y_obs: Vec<f64> = x
+            .iter()
+            .zip([1.0, -1.0, -1.0, 1.0])
+            .map(|(&xi, r)| 2.0 * xi + 3.0 + r)
+            .collect();
+        let sigma = vec![1.0; 4];
+        // Every perturbation of `b` away from 3.0 is refused, on both
+        // sides, so its column stays zero through the whole fit.
+        let model = RefusingLine {
+            x,
+            refuse_b_above: 3.0,
+            refuse_b_below: 3.0,
+        };
+        let mut params = ParameterSet::new(vec![
+            FitParameter::unbounded("a", 1.0),
+            FitParameter::unbounded("b", 3.0),
+        ]);
+        let result = levenberg_marquardt(&model, &y_obs, &sigma, &mut params, &LmConfig::default())
+            .expect("a refused covariance probe must not fail the fit");
+        assert!(result.converged, "{result:?}");
+        let unc = result
+            .uncertainties
+            .expect("the responsive block is inverted");
+        assert!(
+            unc[0].is_finite() && unc[0] > 0.0,
+            "a keeps its uncertainty: {unc:?}"
+        );
+        assert!(unc[1].is_nan(), "b is refused on both sides: {unc:?}");
+        let cov = result.covariance.expect("the responsive block is inverted");
+        assert!(cov.get(0, 0).is_finite());
+        assert!(cov.get(0, 1).is_nan() && cov.get(1, 0).is_nan() && cov.get(1, 1).is_nan());
+        assert_eq!(
+            result.warnings,
+            vec![
+                "covariance: the uncertainty of `b` is NaN because the model refused every \
+                 finite-difference probe of it; the covariance covers the other free parameters"
+                    .to_string()
+            ]
+        );
     }
 }
