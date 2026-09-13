@@ -1362,9 +1362,15 @@ fn state_from_snapshot(snap: ProjectSnapshot, state: &mut AppState, path: &Path)
             // D-11/D-21: Now persisted; None for old project files.
             anorm_map: snap.anorm_map,
             background_maps: snap.background_maps,
-            // Per-pixel BackD/BackF maps are not yet persisted in
-            // project files (same precedent as the TZERO maps below).
-            // Re-running `spatial_map_typed` regenerates them.
+            // Per-pixel BackD/BackF maps are not persisted, so a reloaded
+            // map redraws without the SAMMY exponential tail.  This is not
+            // the precedent the TZERO maps below follow — those are
+            // persisted precisely because dropping a fitted term silently
+            // changes the model that every redraw shows.  It is sound here
+            // only because the GUI never fits the tail (see the
+            // single-pixel restore below for the flags that would have to
+            // change); re-running `spatial_map_typed` regenerates the maps
+            // for anything that did.
             back_d_map: None,
             back_f_map: None,
             // The fitted SAMMY TZERO energy scale: restored because every
@@ -1406,11 +1412,19 @@ fn state_from_snapshot(snap: ProjectSnapshot, state: &mut AppState, path: &Path)
             temperature_k_unc: snap.single_fit_temperature_unc,
             anorm: snap.single_fit_anorm.unwrap_or(1.0),
             background: snap.single_fit_background.unwrap_or([0.0, 0.0, 0.0]),
-            // `back_d` / `back_f` are `Option<f64>` (`None` =
-            // exponential tail not fit).  The single-pixel snapshot
-            // fields don't yet persist these, so `None` on reload is
-            // the correct "not fit" signal — the curve renderer drops
-            // the exponential term, no misleading 0.0 sentinel.
+            // `back_d` / `back_f` are `Option<f64>` (`None` = exponential
+            // tail not fit) and the single-pixel snapshot does not persist
+            // them.  Dropping a fitted term on reload is exactly what the
+            // energy scale below is persisted to prevent — a dropped tail
+            // is a different forward model, and since the residual dock
+            // subtracts that model it would land in the reported RMS and
+            // Max|r| as well as in the plotted curve.  It is unreachable
+            // today only because the GUI never fits the tail: its one
+            // background config is `BackgroundConfig::default()` with
+            // `fit_anorm` overridden, and the default leaves `fit_back_d`
+            // and `fit_back_f` false (`guided::analyze`).  The moment
+            // either flag becomes settable from the GUI, these two fields
+            // must be persisted like the energy scale.
             back_d: None,
             back_f: None,
             // The fitted energy scale, with the flight path the fit was

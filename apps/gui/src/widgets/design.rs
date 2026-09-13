@@ -1086,9 +1086,13 @@ pub(crate) struct FitLineParams<'a> {
 ///
 /// # Errors
 /// A user-facing line when the stored calibration does not map this grid to
-/// physical energies (a degenerate `t0` at or past its shortest flight
-/// time). The fitted curve cannot be reproduced then, and saying so is
-/// better than drawing the un-calibrated one.
+/// physical energies. The fitted curve cannot be reproduced then, and
+/// saying so is better than drawing the un-calibrated one. Every rejection
+/// of `corrected_energy_grid` reaches the caller this way, not only the
+/// degenerate `t0` at or past the grid's shortest flight time: a non-finite
+/// `t0`; an `l_scale` that is not finite and positive; a flight path that
+/// is not finite and positive; an empty grid; any grid energy that is not
+/// finite and positive; and a grid that is not strictly ascending.
 pub(crate) fn fitted_physics_energies(
     result: &nereids_pipeline::pipeline::SpectrumFitResult,
     nominal: &[f64],
@@ -1228,6 +1232,10 @@ pub(crate) struct OverlayModel {
     /// A user-facing line when the overlay's routes differ from the routes
     /// the result disclosed (the isotope set, grid or resolution changed
     /// since the fit): the overlay is drawn, but it is not the fitted curve.
+    ///
+    /// Also set when the result discloses NO routes and this redraw
+    /// broadens something: the comparison cannot run then, and an
+    /// unchecked redraw must not look like a checked one.
     pub route_mismatch: Option<String>,
 }
 
@@ -1247,6 +1255,14 @@ pub(crate) struct OverlayModel {
 /// fixed-temperature fit gated at that temperature. The plan's routes are
 /// compared with the routes the result disclosed and a disagreement is
 /// returned as [`OverlayModel::route_mismatch`] for the caller to show.
+///
+/// `disclosed_routes` is `None` for a result that carries no disclosure —
+/// a per-pixel result assembled from a spatial map is the case that
+/// reaches the GUI, because a map discloses one map-wide route set and
+/// none per pixel, and withholds even that when its converged pixels
+/// disagree. The comparison cannot run then; a broadening redraw returns
+/// that absence as [`OverlayModel::route_mismatch`] rather than passing
+/// unchecked for checked.
 ///
 /// Returns `None` when the model or its plan cannot be built (the caller
 /// then draws no overlay, as before).
@@ -1292,27 +1308,52 @@ pub(crate) fn build_overlay_model(
             },
         )
         .collect();
-    let route_mismatch = disclosed_routes.and_then(|disclosed| {
-        let agree = disclosed.len() == overlay_routes.len()
-            && disclosed
-                .iter()
-                .zip(&overlay_routes)
-                .all(|(d, o)| d.same_kind(o));
-        if agree {
-            return None;
+    let describe = |routes: &mut dyn Iterator<Item = String>| routes.collect::<Vec<_>>().join("; ");
+    let route_mismatch = match disclosed_routes {
+        Some(disclosed) => {
+            let agree = disclosed.len() == overlay_routes.len()
+                && disclosed
+                    .iter()
+                    .zip(&overlay_routes)
+                    .all(|(d, o)| d.same_kind(o));
+            if agree {
+                None
+            } else {
+                let message = format!(
+                    "Fit overlay is not the fitted curve: it redraws [{}] where the fit disclosed \
+                     [{}] (route gate at {gate_temperature_k} K); the isotope set, grid or \
+                     resolution changed since the fit",
+                    describe(&mut overlay_routes.iter().map(ToString::to_string)),
+                    describe(&mut disclosed.iter().map(ToString::to_string)),
+                );
+                tracing::warn!("{message}");
+                Some(message)
+            }
         }
-        let describe =
-            |routes: &mut dyn Iterator<Item = String>| routes.collect::<Vec<_>>().join("; ");
-        let message = format!(
-            "Fit overlay is not the fitted curve: it redraws [{}] where the fit disclosed [{}] \
-             (route gate at {gate_temperature_k} K); the isotope set, grid or resolution changed \
-             since the fit",
-            describe(&mut overlay_routes.iter().map(ToString::to_string)),
-            describe(&mut disclosed.iter().map(ToString::to_string)),
-        );
-        tracing::warn!("{message}");
-        Some(message)
-    });
+        // No disclosure to compare against. Silence would present an
+        // unchecked redraw exactly like a checked one, so the absence is
+        // reported wherever the disagreement would have been — but only
+        // when this redraw actually broadens something, since an
+        // unbroadened redraw has no route to get wrong.
+        None if overlay_routes.iter().any(|r| {
+            !matches!(
+                r.route,
+                nereids_physics::doppler_route::DopplerRoute::Unbroadened
+            )
+        }) =>
+        {
+            let message = format!(
+                "Fit overlay is unchecked: it redraws [{}] (route gate at {gate_temperature_k} K) \
+                 but the fit result discloses no routes, so nothing says these are the ones the \
+                 fit took. A spatial map discloses one map-wide route set and none per pixel, and \
+                 withholds even that when its converged pixels disagree",
+                describe(&mut overlay_routes.iter().map(ToString::to_string)),
+            );
+            tracing::warn!("{message}");
+            Some(message)
+        }
+        None => None,
+    };
     let model = TransmissionFitModel::new(
         energies,
         resonance_data,
@@ -1497,6 +1538,12 @@ mod tests {
     /// A converged single-density result whose SAMMY energy scale is
     /// `(t0_us, L_scale = 1)` on a 25 m flight path, with nothing else
     /// composed on top of the transmission.
+    ///
+    /// It discloses the route a real fit of U-238 MLBW on [`line_grid`] at
+    /// 293.6 K discloses — the continuous integral — so a redraw of it is
+    /// CHECKED against that disclosure. A result carrying no disclosure is
+    /// redrawn unchecked, which `build_overlay_model` reports rather than
+    /// hides (see `an_undisclosed_route_set_is_reported_not_assumed`).
     fn energy_scale_result(t0_us: f64) -> SpectrumFitResult {
         SpectrumFitResult {
             densities: vec![0.001],
@@ -1517,7 +1564,12 @@ mod tests {
             baseline: None,
             baseline_e_ref_ev: None,
             warnings: Vec::new(),
-            doppler_routes: None,
+            doppler_routes: Some(vec![IsotopeDopplerRoute {
+                isotope: u238_with_formalism(ResonanceFormalism::MLBW).isotope,
+                route: DopplerRoute::Continuous {
+                    formalisms: vec![ResonanceFormalism::MLBW],
+                },
+            }]),
         }
     }
 
@@ -1867,6 +1919,43 @@ mod tests {
             "the omitted composition must be a visible error, got {}",
             bare.max_abs
         );
+    }
+
+    /// A result that discloses no routes cannot be checked against the
+    /// redraw. That is the per-pixel result of a spatial map whose
+    /// converged pixels disagreed — the map then withholds the map-wide
+    /// set and every pixel carries `None`. The redraw still happens, so
+    /// the missing check is reported; an unbroadened redraw has no route
+    /// to have got wrong and stays silent.
+    #[test]
+    fn an_undisclosed_route_set_is_reported_not_assumed() {
+        let rd = u238_with_formalism(ResonanceFormalism::MLBW);
+        let energies = line_grid();
+        let overlay = |temperature_k: f64| {
+            build_overlay_model(
+                energies.clone(),
+                vec![rd.clone()],
+                temperature_k,
+                None,
+                (vec![0], vec![1.0]),
+                false,
+                None,
+            )
+            .unwrap()
+        };
+
+        let message = overlay(293.6)
+            .route_mismatch
+            .expect("a broadening redraw with no disclosure to check it against");
+        assert!(message.contains("discloses no routes"), "{message}");
+        assert!(
+            message.contains("U-238") && message.contains("continuous free-gas integral"),
+            "the redrawn route is named so the user can judge it: {message}"
+        );
+
+        // 0 K: every route is `Unbroadened`, and an unbroadened redraw
+        // cannot have taken the wrong broadening route.
+        assert_eq!(overlay(0.0).route_mismatch, None);
     }
 
     /// Routes are compared WITH their isotopes: two different isotopes can

@@ -1215,6 +1215,14 @@ pub(crate) fn selected_pixel_fit_result_for_overlay(
             .or(result.baseline_global),
         baseline_e_ref_ev: result.baseline_e_ref_ev,
         warnings: result.warnings.clone(),
+        // The map-wide disclosure, which is the only one a spatial result
+        // has: `SpatialResult` stores no per-pixel routes, and it withholds
+        // the map-wide set (leaving `None` here for EVERY pixel) when its
+        // converged pixels took different kinds of route — which a
+        // per-pixel energy scale makes possible, since each pixel then
+        // gates on its own corrected grid.  `design::build_overlay_model`
+        // cannot check a redraw against `None`, so it reports the absence
+        // instead of drawing an unchecked overlay silently.
         doppler_routes: result.doppler_routes.clone(),
     })
 }
