@@ -6,6 +6,7 @@
 //! ## Modules
 //! - [`auxiliary_grid`] — Auxiliary energy-grid construction for resolution broadening
 //! - [`channel`] — Wave number, ρ parameter, statistical weight calculations
+//! - [`continuous_doppler`] — Free Gas Model Doppler broadening, continuous tier (route gate + quadrature)
 //! - [`doppler`] — Free Gas Model Doppler broadening, sampled-table tier
 //! - [`doppler_route`] — Per-isotope Doppler route (tier) and its disclosure
 //! - [`penetrability`] — Hard-sphere penetrability, shift, and phase shift functions
@@ -25,6 +26,7 @@
 
 pub mod auxiliary_grid;
 pub mod channel;
+pub mod continuous_doppler;
 pub mod counts_response;
 pub mod doppler;
 pub mod doppler_route;

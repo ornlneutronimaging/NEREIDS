@@ -1242,8 +1242,8 @@ mod tests {
             .map(|&e| crate::slbw::slbw_cross_sections(&data, e).capture)
             .collect();
 
-        // Apply FGM Doppler broadening.
-        let params = DopplerParams::new(300.0, 10.0).unwrap();
+        // Apply FGM Doppler broadening at the fixture's mass ratio.
+        let params = DopplerParams::new(300.0, data.awr).unwrap();
         let broadened = doppler_broaden(&energies, &unbroadened, &params).unwrap();
 
         // SAMMY ex001a.lst reference points: (energy, broadened capture σ in barns).
@@ -1268,12 +1268,17 @@ mod tests {
         eprintln!("ex001 FGM: max_rel_err={max_rel_err:.6}");
         // PW-linear segment integration differs from SAMMY's quadrature at
         // grid-spacing transitions (wing region).  Measured with the exact
-        // w²-weighted kernel: 2.37%; the legacy w¹ kernel measured 5.48%
-        // (the A=10 target makes u/v large, so the kernel's first-order
-        // term was a visible part of the old error).
+        // w²-weighted kernel and the fixture's original mass ratio of 10.0:
+        // 2.37%; the legacy w¹ kernel measured 5.48% (the light target makes
+        // u/v large, so the kernel's first-order term was a visible part of
+        // the old error).  With the mass ratio corrected to 10.0 amu in
+        // neutron masses (9.914), which sets the free-gas width SAMMY used,
+        // the same seven points measure 0.80%; the continuous-route oracle in
+        // `continuous_doppler` measures 0.77% over all 315 points of the same
+        // curve, so what remains here is not grid under-sampling.
         assert!(
-            max_rel_err < 0.03,
-            "Max relative error = {:.2}% (exceeds 3%)",
+            max_rel_err < 0.016,
+            "Max relative error = {:.2}% (exceeds 1.6%)",
             max_rel_err * 100.0
         );
 

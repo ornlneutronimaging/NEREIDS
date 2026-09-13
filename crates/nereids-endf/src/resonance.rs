@@ -1223,13 +1223,17 @@ pub mod test_support {
     }
 
     /// SAMMY ex001 hydrogen-anchor: SLBW single resonance at 10 eV on the
-    /// synthetic ZA=1010 (AWR=10).  Doppler-broadening reference suite.
+    /// synthetic ZA=1010 target.  Doppler-broadening reference suite.
     /// Widths are in eV (SAMMY par file has them in meV; conversion baked in).
+    /// The par file gives the target mass as 10.0 amu; the atomic weight
+    /// ratio is that mass in neutron masses, 10.0 / 1.008665 = 9.914, which
+    /// sets both the kinematics and the free-gas Doppler width.
     pub fn ex001_hydrogen_single_resonance() -> ResonanceData {
+        let awr = 10.0 / nereids_core::constants::NEUTRON_MASS_AMU;
         wrap(
             1,
             10,
-            10.0,
+            awr,
             make_range(
                 0.0,
                 100.0,
@@ -1238,7 +1242,7 @@ pub mod test_support {
                 2.908,
                 1,
                 0,
-                10.0,
+                awr,
                 2.908,
                 vec![res(10.0, 0.5, 0.5e-3, 1.0e-3)],
             ),

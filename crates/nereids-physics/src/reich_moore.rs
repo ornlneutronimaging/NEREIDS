@@ -367,18 +367,8 @@ pub fn cross_sections_at_energy(data: &ResonanceData, energy_ev: f64) -> CrossSe
         // Cheap interval check FIRST — precompute is O(n_resonances) per range,
         // so building a plan for a range that doesn't cover `energy_ev` wastes
         // meaningful work on multi-range isotopes or energies outside the
-        // resolved band.  The `next_starts_here` logic here must match
-        // `precompute_range_data` exactly (same half-open convention).
-        let next_starts_here = data
-            .ranges
-            .get(range_idx + 1)
-            .is_some_and(|next| next.energy_low == range.energy_high && range_is_evaluable(next));
-        let in_range = if next_starts_here {
-            energy_ev >= range.energy_low && energy_ev < range.energy_high
-        } else {
-            energy_ev >= range.energy_low && energy_ev <= range.energy_high
-        };
-        if !in_range {
+        // resolved band.
+        if !range_covers(range, upper_bound_is_half_open(data, range_idx), energy_ev) {
             continue;
         }
 
@@ -428,62 +418,119 @@ pub fn cross_sections_on_grid(data: &ResonanceData, energies: &[f64]) -> Vec<Cro
     if energies.is_empty() {
         return Vec::new();
     }
+    CrossSectionPlan::new(data).evaluate(energies)
+}
 
-    // Symmetric public-API guard.  See `cross_sections_at_energy` above.
-    // O(n) — negligible next to the per-range precompute and per-point
-    // resonance evaluation that follow.
-    for &energy_ev in energies {
+/// Whether range `range_idx` excludes its upper bound.
+///
+/// When the next range starts exactly where this one ends and is
+/// evaluable, the shared boundary energy belongs to the next range only,
+/// so a point on the boundary is never evaluated with both formalisms.
+/// Every range-dispatch site — per-point, plan, and the Doppler route
+/// gate — must use this one convention.
+pub(crate) fn upper_bound_is_half_open(data: &ResonanceData, range_idx: usize) -> bool {
+    let range = &data.ranges[range_idx];
+    data.ranges
+        .get(range_idx + 1)
+        .is_some_and(|next| next.energy_low == range.energy_high && range_is_evaluable(next))
+}
+
+/// Whether `range` covers `energy_ev` under the given upper-bound convention.
+pub(crate) fn range_covers(range: &ResonanceRange, half_open_upper: bool, energy_ev: f64) -> bool {
+    if half_open_upper {
+        energy_ev >= range.energy_low && energy_ev < range.energy_high
+    } else {
+        energy_ev >= range.energy_low && energy_ev <= range.energy_high
+    }
+}
+
+/// Reusable evaluation plan for one immutable resonance source.
+///
+/// The formalism-specific resonance caches (J-groups, reduced width
+/// amplitudes, penetrability at each resonance energy) are built once by
+/// [`CrossSectionPlan::new`] and reused by every evaluation. This is the
+/// primitive that lets the continuous Doppler integral evaluate the same
+/// ENDF equation on many adaptively chosen energies without rebuilding the
+/// caches per quadrature panel; [`cross_sections_on_grid`] is the plan
+/// applied to one grid.
+pub struct CrossSectionPlan<'a> {
+    awr: f64,
+    precomputed: Vec<PrecomputedRangeData<'a>>,
+}
+
+impl<'a> CrossSectionPlan<'a> {
+    /// Build the per-range caches for `data`.
+    pub fn new(data: &'a ResonanceData) -> Self {
+        let awr = data.awr;
+        let precomputed = data
+            .ranges
+            .iter()
+            .enumerate()
+            .map(|(range_idx, range)| precompute_range_data(range, range_idx, data, awr))
+            .collect();
+        Self { awr, precomputed }
+    }
+
+    /// Cross-sections at one energy, summed over every range covering it.
+    ///
+    /// # Panics
+    /// Panics if `energy_ev` is non-finite or non-positive — the same
+    /// public contract as [`cross_sections_at_energy`].
+    pub fn evaluate_one(&self, energy_ev: f64) -> CrossSections {
         assert!(
             energy_ev.is_finite() && energy_ev > 0.0,
             "expected positive finite energy_ev, got {energy_ev}"
         );
+
+        let mut total = 0.0;
+        let mut elastic = 0.0;
+        let mut capture = 0.0;
+        let mut fission = 0.0;
+
+        for pc in &self.precomputed {
+            let in_range = if pc.half_open_upper {
+                energy_ev >= pc.energy_low && energy_ev < pc.energy_high
+            } else {
+                energy_ev >= pc.energy_low && energy_ev <= pc.energy_high
+            };
+            if !in_range {
+                continue;
+            }
+
+            let (t, e, c, f) = evaluate_precomputed_range(pc, energy_ev, self.awr);
+            total += t;
+            elastic += e;
+            capture += c;
+            fission += f;
+        }
+
+        CrossSections {
+            total,
+            elastic,
+            capture,
+            fission,
+        }
     }
 
-    let awr = data.awr;
-
-    // Phase 1: precompute per-range data (J-groups, reduced widths, etc.).
-    // This runs once for the entire grid, not per energy point.
-    let precomputed: Vec<PrecomputedRangeData> = data
-        .ranges
-        .iter()
-        .enumerate()
-        .map(|(range_idx, range)| precompute_range_data(range, range_idx, data, awr))
-        .collect();
-
-    // Phase 2: evaluate each energy point using precomputed data.
-    energies
-        .iter()
-        .map(|&energy_ev| {
-            let mut total = 0.0;
-            let mut elastic = 0.0;
-            let mut capture = 0.0;
-            let mut fission = 0.0;
-
-            for pc in &precomputed {
-                let in_range = if pc.half_open_upper {
-                    energy_ev >= pc.energy_low && energy_ev < pc.energy_high
-                } else {
-                    energy_ev >= pc.energy_low && energy_ev <= pc.energy_high
-                };
-                if !in_range {
-                    continue;
-                }
-
-                let (t, e, c, f) = evaluate_precomputed_range(pc, energy_ev, awr);
-                total += t;
-                elastic += e;
-                capture += c;
-                fission += f;
-            }
-
-            CrossSections {
-                total,
-                elastic,
-                capture,
-                fission,
-            }
-        })
-        .collect()
+    /// Cross-sections at every energy of `energies`, in order.
+    ///
+    /// # Panics
+    /// Panics if any element of `energies` is non-finite or non-positive.
+    /// Validating the entire grid up-front (O(n) branch, one pass) means a
+    /// single bad energy fails fast with a clear message instead of being
+    /// hidden inside the inner loop.
+    pub fn evaluate(&self, energies: &[f64]) -> Vec<CrossSections> {
+        for &energy_ev in energies {
+            assert!(
+                energy_ev.is_finite() && energy_ev > 0.0,
+                "expected positive finite energy_ev, got {energy_ev}"
+            );
+        }
+        energies
+            .iter()
+            .map(|&energy_ev| self.evaluate_one(energy_ev))
+            .collect()
+    }
 }
 
 // ─── Precomputed range data for batch grid evaluation ────────────────────────
@@ -596,16 +643,10 @@ fn precompute_range_data<'a>(
     data: &'a ResonanceData,
     awr: f64,
 ) -> PrecomputedRangeData<'a> {
-    // Half-open upper bound logic (same as cross_sections_at_energy).
-    let next_starts_here = data
-        .ranges
-        .get(range_idx + 1)
-        .is_some_and(|next| next.energy_low == range.energy_high && range_is_evaluable(next));
-
     let make = |kind| PrecomputedRangeData {
         energy_low: range.energy_low,
         energy_high: range.energy_high,
-        half_open_upper: next_starts_here,
+        half_open_upper: upper_bound_is_half_open(data, range_idx),
         kind,
     };
 
@@ -2350,5 +2391,34 @@ mod tests {
     fn cross_sections_on_grid_panics_on_negative() {
         let data = u238_single_resonance();
         let _ = cross_sections_on_grid(&data, &[-1.0, 1.0, 2.0]);
+    }
+
+    /// The plan, the grid function and the per-point function are one
+    /// evaluator: every channel agrees bit for bit, for every formalism.
+    #[test]
+    fn plan_grid_and_per_point_evaluators_are_bit_identical() {
+        let energies: Vec<f64> = (1..=400).map(|i| 5.0 + 0.01 * f64::from(i)).collect();
+        for formalism in [
+            ResonanceFormalism::SLBW,
+            ResonanceFormalism::MLBW,
+            ResonanceFormalism::ReichMoore,
+        ] {
+            let data = u238_with_formalism(formalism);
+            let plan = CrossSectionPlan::new(&data);
+            let on_grid = cross_sections_on_grid(&data, &energies);
+            for (&energy, grid) in energies.iter().zip(&on_grid) {
+                let point = cross_sections_at_energy(&data, energy);
+                let one = plan.evaluate_one(energy);
+                for (a, b, c) in [
+                    (grid.total, point.total, one.total),
+                    (grid.elastic, point.elastic, one.elastic),
+                    (grid.capture, point.capture, one.capture),
+                    (grid.fission, point.fission, one.fission),
+                ] {
+                    assert_eq!(a.to_bits(), b.to_bits(), "{formalism:?} at {energy} eV");
+                    assert_eq!(a.to_bits(), c.to_bits(), "{formalism:?} at {energy} eV");
+                }
+            }
+        }
     }
 }
