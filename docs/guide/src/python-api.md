@@ -58,6 +58,8 @@ Returned by `fit_spectrum_typed(...)` and `fit_counts_spectrum_typed(...)`.
 | `iterations` | `int` | Iteration count. |
 | `temperature_k` | `float or None` | Fitted temperature when `fit_temperature=True`. |
 | `t0_us`, `l_scale` | `float or None` | Fitted energy-scale parameters when `fit_energy_scale=True`. |
+| `warnings` | `list[str]` | Fit-configuration warnings, plus one line when a resolved SLBW/MLBW isotope fell to the sampled-table Doppler route for a window reason. |
+| `doppler_routes` | `list[str] or None` | One line per isotope naming the Doppler route the fit executed (see `doppler_routes(...)`). |
 
 ### `InputData`
 
@@ -88,6 +90,7 @@ Returned by `spatial_map_typed(...)`.
 | `anorm_map`, `background_maps` | `NDArray[float64] / list[...] or None` | SAMMY `Anorm` and the polynomial background `[BackA, BackB, BackC]` per pixel when `background=True`. |
 | `back_d_map`, `back_f_map` | `NDArray[float64] or None` | SAMMY exponential background `BackD` / `BackF` per pixel when `background=True` and `fit_back_d=True` / `fit_back_f=True`. Counts-KL spatial runs always return `None` for both (the joint-Poisson dispatch never fits the exponential tail). |
 | `t0_us_map`, `l_scale_map` | `NDArray[float64] or None` | Energy-scale maps when enabled. |
+| `doppler_routes` | `list[str] or None` | One line per isotope naming the Doppler route the whole map executed, decided once at the fit's upper temperature bound when `fit_temperature=True`. |
 
 ### `NexusData`
 
@@ -145,6 +148,23 @@ input energy grid. Pass either `isotopes=[(ResonanceData, density), ...]` or
 `groups=[(IsotopeGroup, density), ...]`, but not both. Gaussian resolution is
 enabled by the `flight_path_m`, `delta_t_us`, and `delta_l_m` parameters.
 Tabulated resolution can be supplied with `resolution=load_resolution(...)`.
+
+### `doppler_routes(energies, isotopes=None, temperature_k=293.6, ..., groups=None)`
+
+Doppler broadening is two-tier.
+A resolved SLBW/MLBW isotope whose thermal support window lies inside its resolved range takes the continuous route: the free-gas kernel integrated over the resonance equation at error-controlled quadrature, independent of the energy grid.
+Every other case takes the sampled-table kernel-on-grid route: Reich-Moore, `sqrt(E) <= 8u`, a window crossing the range boundary, a File-3 term, or a caller-supplied table.
+The route is decided per isotope over the whole grid and never mixed within one isotope.
+
+```python
+nereids.doppler_routes(energies, [hf177], temperature_k=293.6, flight_path_m=25.0, delta_t_us=0.5, delta_l_m=0.005)
+# ['Hf-177: continuous free-gas integral over the MLBW resonance equation']
+nereids.doppler_routes(energies, [u238])
+# ['U-238: sampled-table kernel-on-grid (Reich-Moore formalism)']
+```
+
+`doppler_routes(...)` takes the same resolution arguments as `forward_model(...)` because the working grid is part of the gate input; it reports the route `forward_model(...)` executes for the same arguments.
+Every fit result carries the executed routes on `doppler_routes`; a free-temperature fit decides them once at the upper temperature bound (5000 K) so they cannot change between iterations.
 
 ## Single-Spectrum Fitting
 

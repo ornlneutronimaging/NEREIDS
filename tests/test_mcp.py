@@ -456,6 +456,9 @@ class TestManifestWorkflowTools:
         fit = result["results"]["density_fits"][0]
         assert fit["isotope"] == "U-238"
         assert fit["density_atoms_per_barn"] == pytest.approx(true_density, rel=0.15)
+        assert result["results"]["doppler_routes"] == [
+            "U-238: sampled-table kernel-on-grid (Reich-Moore formalism)"
+        ]
         assert (tmp_path / "output" / "nereids_spectrum_fit.npz").exists()
         assert (tmp_path / "output" / "nereids_mcp_result.json").exists()
 
@@ -491,6 +494,9 @@ class TestManifestWorkflowTools:
         assert result["results"]["n_converged"] == 6
         stats = result["results"]["density_maps"][0]["density_atoms_per_barn"]
         assert stats["mean"] == pytest.approx(true_density, rel=0.15)
+        assert result["results"]["doppler_routes"] == [
+            "U-238: sampled-table kernel-on-grid (Reich-Moore formalism)"
+        ]
         assert (tmp_path / "output" / "nereids_density_map.npz").exists()
 
     def test_nexus_density_map_aligns_counts_with_ascending_energy(

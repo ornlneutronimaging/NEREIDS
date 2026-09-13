@@ -279,6 +279,22 @@ class TestResonanceData:
         )
         assert data.n_resonances == 1
 
+    def test_mlbw_formalism(self):
+        """Create MLBW formalism data: it is the tier-1 Doppler route."""
+        data = nereids.create_resonance_data(
+            z=92,
+            a=238,
+            awr=236.006,
+            scattering_radius=9.48,
+            resonances=[(6.67, 0.5, 0.0015, 0.023)],
+            formalism="mlbw",
+        )
+        assert data.n_resonances == 1
+        energies = np.linspace(4.0, 9.0, 200)
+        assert nereids.doppler_routes(energies, [data]) == [
+            "U-238: continuous free-gas integral over the MLBW resonance equation"
+        ]
+
     def test_invalid_formalism(self):
         with pytest.raises(ValueError, match="Unknown formalism"):
             nereids.create_resonance_data(
@@ -522,6 +538,118 @@ class TestDopplerBroadening:
         with pytest.raises(ValueError):
             nereids.doppler_broaden(e, xs, 236.0, 300.0)
 
+
+
+# ===========================================================================
+# Doppler routes
+# ===========================================================================
+
+
+def _hf177_endf_path():
+    root = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+    return os.path.join(root, "tests/data/endf/Hf-177.endf")
+
+
+class TestDopplerRoutes:
+    """Per-isotope Doppler route disclosure: continuous (tier 1) for resolved
+    SLBW/MLBW inside their range, sampled-table (tier 2) otherwise."""
+
+    RM = "U-238: sampled-table kernel-on-grid (Reich-Moore formalism)"
+    MLBW = "U-238: continuous free-gas integral over the MLBW resonance equation"
+    SLBW = "U-238: continuous free-gas integral over the SLBW resonance equation"
+    HF177 = "Hf-177: continuous free-gas integral over the MLBW resonance equation"
+
+    def test_reich_moore_takes_the_sampled_table_route(self, u238_data, energy_grid):
+        assert nereids.doppler_routes(energy_grid, [u238_data]) == [self.RM]
+
+    def test_synthetic_slbw_and_mlbw_take_the_continuous_route(self, energy_grid):
+        for formalism, expected in (("slbw", self.SLBW), ("mlbw", self.MLBW)):
+            data = _make_single_resonance(formalism=formalism)
+            assert nereids.doppler_routes(energy_grid, [data]) == [expected]
+
+    def test_hf177_takes_the_continuous_route_on_the_venus_grid(self):
+        hf177 = nereids.load_endf_file(_hf177_endf_path())
+        # VENUS-like grid: 7-200 eV, well inside Hf-177's 250 eV resolved range.
+        energies = np.linspace(7.0, 200.0, 500)
+        assert nereids.doppler_routes(
+            energies, [hf177], temperature_k=293.6,
+            flight_path_m=25.0, delta_t_us=0.5, delta_l_m=0.005,
+        ) == [self.HF177]
+
+    def test_zero_temperature_reports_the_unbroadened_route(self, u238_data, energy_grid):
+        assert nereids.doppler_routes(energy_grid, [u238_data], temperature_k=0.0) == [
+            "U-238: no Doppler broadening (temperature 0 K)"
+        ]
+
+    def test_window_crossing_the_range_top_falls_to_the_sampled_table(self):
+        hf177 = nereids.load_endf_file(_hf177_endf_path())
+        # At 249 eV the thermal window reaches past the 250 eV range edge.
+        energies = np.linspace(240.0, 249.0, 50)
+        (route,) = nereids.doppler_routes(energies, [hf177], temperature_k=293.6)
+        assert route.startswith("Hf-177: sampled-table kernel-on-grid (thermal window")
+        assert "leaves the resolved range at 2.50e2 eV" in route
+
+    def test_rejects_both_and_neither_isotopes_and_groups(self, u238_data, energy_grid):
+        with pytest.raises(ValueError, match="either 'isotopes' or 'groups'"):
+            nereids.doppler_routes(energy_grid)
+        with pytest.raises(ValueError, match="not both"):
+            nereids.doppler_routes(energy_grid, [u238_data], groups=[])
+
+    def test_rejects_invalid_temperature_and_grid(self, u238_data, energy_grid):
+        with pytest.raises(ValueError, match="temperature_k"):
+            nereids.doppler_routes(energy_grid, [u238_data], temperature_k=float("nan"))
+        with pytest.raises(ValueError, match="temperature_k"):
+            nereids.doppler_routes(energy_grid, [u238_data], temperature_k=-1.0)
+        with pytest.raises(ValueError):
+            nereids.doppler_routes(np.array([1.0, np.nan]), [u238_data])
+
+    def test_fit_result_exposes_doppler_routes(self, u238_data, energy_grid):
+        t = np.asarray(nereids.forward_model(energy_grid, [(u238_data, 0.001)], temperature_k=300.0))
+        unc = np.full_like(t, 0.01)
+        for fit_temperature in (False, True):
+            result = nereids.fit_spectrum_typed(
+                t, unc, energy_grid, [(u238_data, 0.0012)],
+                temperature_k=300.0, fit_temperature=fit_temperature, max_iter=3,
+            )
+            assert list(result.doppler_routes) == [self.RM]
+            assert not any(w.startswith("Doppler:") for w in result.warnings)
+
+    def test_free_temperature_fit_gates_at_the_upper_bound(self):
+        # Hf-177 up to 240 eV: tier 1 at 293.6 K (window top 243 eV < 250),
+        # tier 2 at the 5000 K gate a free-temperature fit uses (252 eV > 250).
+        hf177 = nereids.load_endf_file(_hf177_endf_path())
+        energies = np.linspace(200.0, 240.0, 120)
+        t = np.asarray(nereids.forward_model(energies, [(hf177, 1e-4)], temperature_k=293.6))
+        unc = np.full_like(t, 0.01)
+        fixed = nereids.fit_spectrum_typed(
+            t, unc, energies, [(hf177, 1.2e-4)], temperature_k=293.6, max_iter=2,
+        )
+        assert list(fixed.doppler_routes) == [self.HF177]
+        assert not any(w.startswith("Doppler:") for w in fixed.warnings)
+        free = nereids.fit_spectrum_typed(
+            t, unc, energies, [(hf177, 1.2e-4)],
+            temperature_k=293.6, fit_temperature=True, max_iter=2,
+        )
+        (route,) = free.doppler_routes
+        assert route.startswith("Hf-177: sampled-table kernel-on-grid (thermal window")
+        (warning,) = [w for w in free.warnings if w.startswith("Doppler:")]
+        assert warning.startswith(
+            "Doppler: Hf-177 took the sampled-table route although it is resolved MLBW"
+        )
+        assert warning.endswith("(route gate at 5000 K)")
+
+    def test_spatial_result_exposes_doppler_routes(self, u238_data, energy_grid):
+        t = np.asarray(nereids.forward_model(energy_grid, [(u238_data, 0.001)], temperature_k=300.0))
+        t3d = np.ascontiguousarray(np.broadcast_to(t[:, None, None], (t.size, 2, 2)))
+        u3d = np.full_like(t3d, 0.01)
+        data = nereids.from_transmission(t3d, u3d)
+        for fit_temperature in (False, True):
+            result = nereids.spatial_map_typed(
+                data, energy_grid, [u238_data],
+                temperature_k=300.0, fit_temperature=fit_temperature,
+                initial_densities=[0.0012], max_iter=3, solver="lm",
+            )
+            assert list(result.doppler_routes) == [self.RM]
 
 # ===========================================================================
 # Resolution broadening
@@ -3360,12 +3488,27 @@ class TestVenusMlbwRegression:
         # shifts -0.07 % and the iteration count halves (14 -> 7) because
         # analytic steps satisfy the relative-chi2 tolerance sooner.
         #
+        # Baseline regenerated 2026-09-12 after the two-tier Doppler route:
+        # Hf-177 is a resolved MLBW source whose thermal windows lie inside
+        # its 250 eV range, so it now takes the continuous route — the
+        # free-gas kernel integrated over the resonance equation at
+        # error-controlled quadrature — instead of the kernel convolved with
+        # a table sampled on this VENUS grid. The VENUS grid under-resolves
+        # Hf-177's narrow lines (the sampled route on 1x/4x/16x/64x this
+        # grid density deviates from the continuous value by 1.9 / 0.35 /
+        # 3.7e-3 / 1.9e-4, converging monotonically), so the change is the
+        # grid's sampling error being removed: density +0.134 % rel,
+        # chi2_r -3.58e-6 rel (the grid-independent sigma fits the measured
+        # data marginally better), iterations unchanged (7). All measured,
+        # no tolerance loosened anywhere; forcing every isotope back onto
+        # the sampled-table route restores the previous anchors.
+        #
         # These pinned values are machine-generated regression anchors
         # (produced by the code under test); the correctness burden is
         # carried by the SAMMY-oracle suites (samtry, ex001) and the
-        # analytic kernel pins in doppler.rs.
-        EXPECTED_DENSITY = 8.10458528518008e-05
-        EXPECTED_CHI2_R = 219657.2439575215
+        # analytic kernel pins in doppler.rs and continuous_doppler.rs.
+        EXPECTED_DENSITY = 8.115412297872134e-05
+        EXPECTED_CHI2_R = 219656.4574858545
         EXPECTED_ITERATIONS = 7
 
         FLOAT_TOL = pytest.approx
@@ -3391,6 +3534,11 @@ class TestVenusMlbwRegression:
             f"fit did not converge: got converged={bool(result.converged)}. "
             f"A dispatch regression can prevent convergence entirely — investigate."
         )
+        # Real-data disclosure gate: the resolved MLBW Hf-177 source must have
+        # taken the continuous route on the VENUS grid.
+        assert list(result.doppler_routes) == [
+            "Hf-177: continuous free-gas integral over the MLBW resonance equation"
+        ]
 
     def test_counts_kl_fit_matches_baseline(self, venus_data):
         """Counts-KL (joint-Poisson) fit on the same real VENUS spectrum.
@@ -3435,8 +3583,15 @@ class TestVenusMlbwRegression:
             c=c,
         )
 
-        EXPECTED_DENSITY = 2.7591191549411417e-05
-        EXPECTED_DEVIANCE_PER_DOF = 31471.485549664278
+        # Anchors regenerated 2026-09-12 after the two-tier Doppler route
+        # (see the LM gate above for the mechanism): Hf-177 now takes the
+        # continuous route, so the VENUS grid's sampling error is gone from
+        # sigma. Counts-KL density +0.75 % rel, D/dof -1.2e-4 rel (better),
+        # converged in 3 iterations as before. All measured, no tolerance
+        # loosened; forcing the sampled-table route restores the previous
+        # anchors.
+        EXPECTED_DENSITY = 2.779837869787754e-05
+        EXPECTED_DEVIANCE_PER_DOF = 31467.62605915999
 
         assert bool(result.converged) is True, (
             f"counts-KL fit did not converge on the real VENUS fixture "
@@ -3472,6 +3627,9 @@ class TestVenusMlbwRegression:
             "counts (un-modelled upstream physics); an O(1) value means "
             "the gate is no longer fitting real data"
         )
+        assert list(result.doppler_routes) == [
+            "Hf-177: continuous free-gas integral over the MLBW resonance equation"
+        ]
 
     def test_counts_with_resolution_fails_before_fitting(self, venus_data):
         """Resolved counts without the exact-response inputs fail closed.

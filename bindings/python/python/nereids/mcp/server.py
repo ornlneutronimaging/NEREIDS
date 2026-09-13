@@ -675,6 +675,11 @@ def _fit_result_summary(result: Any, names: list[str]) -> dict[str, Any]:
         value = getattr(result, attr, None)
         if value is not None:
             summary[attr] = _finite_float_or_none(value)
+    # Per-isotope Doppler route disclosure (continuous vs sampled-table);
+    # key absent when the engine broadened nothing.
+    routes = getattr(result, "doppler_routes", None)
+    if routes is not None:
+        summary["doppler_routes"] = [str(route) for route in routes]
     return summary
 
 
@@ -1115,6 +1120,9 @@ def _process_density_map(
     }
     if fit_param_stats:
         summary["fit_param_stats"] = fit_param_stats
+    routes = getattr(result, "doppler_routes", None)
+    if routes is not None:
+        summary["doppler_routes"] = [str(route) for route in routes]
     return summary
 
 

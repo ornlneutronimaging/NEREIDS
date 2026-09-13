@@ -548,6 +548,9 @@ struct PyFitResult {
     /// Structured fit-configuration warnings (e.g. the degenerate
     /// free-Anorm + free-temperature + free-density trio).
     warnings: Vec<String>,
+    /// One disclosure line per isotope naming the Doppler route it took;
+    /// `None` when the pipeline broadened nothing.
+    doppler_routes: Option<Vec<String>>,
 }
 
 #[pymethods]
@@ -727,6 +730,17 @@ impl PyFitResult {
     #[getter]
     fn warnings(&self) -> Vec<String> {
         self.warnings.clone()
+    }
+
+    /// One line per isotope naming the Doppler route the fit executed, in
+    /// isotope order — ``"Hf-177: continuous free-gas integral over the
+    /// MLBW resonance equation"`` or ``"U-238: sampled-table kernel-on-grid
+    /// (Reich-Moore formalism)"``.  ``None`` only when broadened
+    /// cross-sections were supplied by a Rust caller, which cannot happen
+    /// from Python.
+    #[getter]
+    fn doppler_routes(&self) -> Option<Vec<String>> {
+        self.doppler_routes.clone()
     }
 
     fn __repr__(&self) -> String {
@@ -1072,6 +1086,9 @@ struct PySpatialResult {
     baseline_maps: Option<[Py<PyArray2<f64>>; 3]>,
     /// Structured fit-configuration warnings.
     warnings: Vec<String>,
+    /// One disclosure line per isotope naming the Doppler route it took;
+    /// `None` when the pipeline broadened nothing.
+    doppler_routes: Option<Vec<String>>,
 }
 
 #[pymethods]
@@ -1253,6 +1270,17 @@ impl PySpatialResult {
         self.warnings.clone()
     }
 
+    /// One line per isotope naming the Doppler route the fit executed, in
+    /// isotope order — ``"Hf-177: continuous free-gas integral over the
+    /// MLBW resonance equation"`` or ``"U-238: sampled-table kernel-on-grid
+    /// (Reich-Moore formalism)"``.  ``None`` only when broadened
+    /// cross-sections were supplied by a Rust caller, which cannot happen
+    /// from Python.
+    #[getter]
+    fn doppler_routes(&self) -> Option<Vec<String>> {
+        self.doppler_routes.clone()
+    }
+
     fn __repr__(&self) -> String {
         format!(
             "SpatialResult(shape={}x{}, isotopes={}, converged={}/{})",
@@ -1420,6 +1448,119 @@ fn forward_model<'py>(
     let t = py.detach(move || transmission::forward_model(&e_owned, &sample, instrument.as_ref()));
     let t = t.map_err(|e| pyo3::exceptions::PyValueError::new_err(e.to_string()))?;
     Ok(PyArray1::from_vec(py, t))
+}
+
+/// Report the Doppler route each isotope would take on this grid, without
+/// broadening anything.
+///
+/// Doppler broadening is two-tier.  A resolved SLBW/MLBW isotope whose
+/// thermal support window lies inside its resolved range at
+/// ``temperature_k`` takes the continuous route (the free-gas kernel
+/// integrated over the resonance equation at error-controlled quadrature);
+/// every other case — Reich-Moore, ``√E ≤ 8u``, a window crossing the
+/// range boundary, a File-3 term — takes the sampled-table kernel-on-grid
+/// route.  The route is decided per isotope over the whole grid and is the
+/// one ``forward_model()`` executes for the same arguments: the resolution
+/// arguments matter because the working grid (the auxiliary grid under
+/// Gaussian resolution) is part of the gate input.
+///
+/// Args:
+///     energies: Energy grid in eV (1D numpy array, sorted ascending).
+///     isotopes: List of ResonanceData (mutually exclusive with groups).
+///     temperature_k: Sample temperature in Kelvin (default 293.6).  ``0``
+///         means no broadening, so every isotope reports the unbroadened route.
+///     flight_path_m, delta_t_us, delta_l_m, delta_e_us, resolution: As in
+///         ``forward_model()``.
+///     groups: List of IsotopeGroup (mutually exclusive with isotopes).
+///
+/// Returns:
+///     One disclosure string per isotope, e.g. ``"Hf-177: continuous
+///     free-gas integral over the MLBW resonance equation"``.
+#[pyfunction]
+#[pyo3(signature = (energies, isotopes=None, temperature_k=293.6, flight_path_m=None, delta_t_us=None, delta_l_m=None, resolution=None, delta_e_us=None, groups=None))]
+fn doppler_routes(
+    py: Python<'_>,
+    energies: PyReadonlyArray1<f64>,
+    isotopes: Option<Vec<PyResonanceData>>,
+    temperature_k: f64,
+    flight_path_m: Option<f64>,
+    delta_t_us: Option<f64>,
+    delta_l_m: Option<f64>,
+    resolution: Option<PyTabulatedResolution>,
+    delta_e_us: Option<f64>,
+    groups: Option<Vec<PyIsotopeGroup>>,
+) -> PyResult<Vec<String>> {
+    let has_isotopes = isotopes.is_some();
+    let has_groups = groups.is_some();
+    if has_isotopes && has_groups {
+        return Err(pyo3::exceptions::PyValueError::new_err(
+            "Provide either 'isotopes' or 'groups', not both.",
+        ));
+    }
+    if !has_isotopes && !has_groups {
+        return Err(pyo3::exceptions::PyValueError::new_err(
+            "Must provide either 'isotopes' or 'groups'.",
+        ));
+    }
+    if !temperature_k.is_finite() || temperature_k < 0.0 {
+        return Err(pyo3::exceptions::PyValueError::new_err(format!(
+            "temperature_k must be finite and non-negative, got {temperature_k}"
+        )));
+    }
+    let e_slice = energies.as_slice()?;
+    validate_energy_grid(e_slice)?;
+    let e_owned = e_slice.to_vec();
+
+    let resonance_data: Vec<ResonanceData> = if let Some(isotopes) = isotopes {
+        isotopes
+            .into_iter()
+            .map(|d| Arc::unwrap_or_clone(d.inner))
+            .collect()
+    } else {
+        let mut expanded = Vec::new();
+        for group in &groups.unwrap() {
+            if !group.is_loaded() {
+                return Err(pyo3::exceptions::PyValueError::new_err(format!(
+                    "IsotopeGroup '{}' has not been fully loaded. Call load_endf() first.",
+                    group.inner.name(),
+                )));
+            }
+            for i in 0..group.inner.members().len() {
+                expanded.push(Arc::unwrap_or_clone(
+                    group.resonance_data[i].clone().unwrap(),
+                ));
+            }
+        }
+        expanded
+    };
+
+    let res_fn = build_resolution(flight_path_m, delta_t_us, delta_l_m, resolution, delta_e_us)?;
+    let instrument = res_fn.map(|r| InstrumentParams { resolution: r });
+
+    let routes = py
+        .detach(move || {
+            transmission::doppler_routes(
+                &e_owned,
+                &resonance_data,
+                temperature_k,
+                instrument.as_ref(),
+            )
+            .map(|routes| {
+                resonance_data
+                    .iter()
+                    .zip(routes)
+                    .map(|(rd, route)| {
+                        nereids_physics::doppler_route::IsotopeDopplerRoute {
+                            isotope: rd.isotope,
+                            route,
+                        }
+                        .to_string()
+                    })
+                    .collect::<Vec<String>>()
+            })
+        })
+        .map_err(|e| pyo3::exceptions::PyRuntimeError::new_err(e.to_string()))?;
+    Ok(routes)
 }
 
 /// Result of an instrument-resolution calibration ([`calibrate_resolution`]).
@@ -2005,6 +2146,7 @@ fn load_endf_file(py: Python<'_>, path: &str) -> PyResult<PyResonanceData> {
 ///                - ``None`` or ``"reich_moore"`` (also ``"ReichMoore"``, ``"rm"``,
 ///                  ``"RM"``, ``"reich-moore"``) — Reich-Moore R-matrix (default).
 ///                - ``"slbw"`` or ``"SLBW"`` — Single-Level Breit-Wigner.
+///                - ``"mlbw"`` or ``"MLBW"`` — Multi-Level Breit-Wigner.
 ///
 /// Returns:
 ///     ResonanceData object.
@@ -2022,12 +2164,13 @@ fn create_resonance_data(
 ) -> PyResult<PyResonanceData> {
     let res_formalism = match formalism {
         Some("slbw" | "SLBW") => ResonanceFormalism::SLBW,
+        Some("mlbw" | "MLBW") => ResonanceFormalism::MLBW,
         Some("reich_moore" | "ReichMoore" | "reich-moore" | "rm" | "RM") | None => {
             ResonanceFormalism::ReichMoore
         }
         Some(other) => {
             return Err(pyo3::exceptions::PyValueError::new_err(format!(
-                "Unknown formalism '{other}'. Use 'slbw' or 'reich_moore'."
+                "Unknown formalism '{other}'. Use 'slbw', 'mlbw' or 'reich_moore'."
             )));
         }
     };
@@ -2221,10 +2364,13 @@ fn build_resolution(
 /// Apply Free Gas Model (FGM) Doppler broadening to a cross-section array.
 ///
 /// Convolves the input cross-sections with a Gaussian kernel whose width
-/// depends on the sample temperature and atomic weight ratio. This is the
-/// same broadening applied internally by `forward_model()`, but exposed here
-/// so users can broaden individual components (capture, elastic, fission)
-/// independently.
+/// depends on the sample temperature and atomic weight ratio.  This is the
+/// sampled-table (tier-2) kernel that ``forward_model()`` and the fitters
+/// apply to Reich-Moore isotopes and to any isotope failing the
+/// continuous-route gate; resolved SLBW/MLBW isotopes inside their range
+/// are instead integrated from the resonance equation.  See
+/// ``doppler_routes()``.  Exposed here so users can broaden individual
+/// components (capture, elastic, fission) of a sampled table independently.
 ///
 /// Args:
 ///     energies: Energy grid in eV (1D numpy array, sorted ascending).
@@ -4687,6 +4833,7 @@ fn nereids(m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_class::<PyTwoArmBackgroundFitResult>()?;
     m.add_function(wrap_pyfunction!(cross_sections, m)?)?;
     m.add_function(wrap_pyfunction!(forward_model, m)?)?;
+    m.add_function(wrap_pyfunction!(doppler_routes, m)?)?;
     m.add_function(wrap_pyfunction!(calibrate_resolution, m)?)?;
     m.add_function(wrap_pyfunction!(tof_to_energy, m)?)?;
     m.add_function(wrap_pyfunction!(energy_to_tof, m)?)?;
@@ -5214,6 +5361,10 @@ fn spatial_result_to_py(
         baseline_e_ref_ev: result.baseline_e_ref_ev,
         baseline_maps,
         warnings: result.warnings.clone(),
+        doppler_routes: result
+            .doppler_routes
+            .as_ref()
+            .map(|routes| routes.iter().map(ToString::to_string).collect()),
     }
 }
 
@@ -6138,6 +6289,9 @@ fn py_fit_counts_spectrum_typed<'py>(
         baseline: result.baseline,
         baseline_e_ref_ev: result.baseline_e_ref_ev,
         warnings: result.warnings,
+        doppler_routes: result
+            .doppler_routes
+            .map(|routes| routes.iter().map(ToString::to_string).collect()),
     })
 }
 
@@ -6848,5 +7002,8 @@ fn py_fit_spectrum_typed<'py>(
         baseline: result.baseline,
         baseline_e_ref_ev: result.baseline_e_ref_ev,
         warnings: result.warnings,
+        doppler_routes: result
+            .doppler_routes
+            .map(|routes| routes.iter().map(ToString::to_string).collect()),
     })
 }

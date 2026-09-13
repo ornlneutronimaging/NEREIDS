@@ -295,6 +295,16 @@ class FitResult:
         when nothing is flagged."""
         ...
 
+    @property
+    def doppler_routes(self) -> list[str] | None:
+        """One line per isotope naming the Doppler route the fit executed,
+        in isotope order, e.g. ``"Hf-177: continuous free-gas integral over
+        the MLBW resonance equation"`` or ``"U-238: sampled-table
+        kernel-on-grid (Reich-Moore formalism)"``.  ``None`` only when
+        broadened cross-sections were supplied by a Rust caller, which
+        cannot happen from Python."""
+        ...
+
 class CalibrationResult:
     """Result of energy axis calibration."""
 
@@ -689,6 +699,14 @@ class SpatialResult:
         flagged."""
         ...
 
+    @property
+    def doppler_routes(self) -> list[str] | None:
+        """One line per isotope naming the Doppler route the whole map
+        executed, in isotope order (see ``FitResult.doppler_routes``).
+        ``None`` only when broadened cross-sections were supplied by a Rust
+        caller, which cannot happen from Python."""
+        ...
+
 class IsotopeGroup:
     """A group of isotopes sharing one fitted density parameter.
 
@@ -804,9 +822,6 @@ def cross_sections(
     """Compute cross-sections at given energies for an isotope.
 
     Returns a dict with keys 'total', 'elastic', 'capture', 'fission'.
-
-    Note: MLBW (Multi-Level Breit-Wigner) ranges use SLBW approximation
-    (resonance-resonance interference is ignored).
     """
     ...
 
@@ -826,6 +841,33 @@ def forward_model(
     Either ``isotopes`` or ``groups`` must be provided, but not both.
     When ``groups`` is provided, each group is expanded into its members
     with effective densities = group_density * member_ratio.
+    """
+    ...
+
+def doppler_routes(
+    energies: NDArray[np.float64],
+    isotopes: list[ResonanceData] | None = None,
+    temperature_k: float = 293.6,
+    flight_path_m: float | None = None,
+    delta_t_us: float | None = None,
+    delta_l_m: float | None = None,
+    resolution: TabulatedResolution | None = None,
+    delta_e_us: float | None = None,
+    groups: list[IsotopeGroup] | None = None,
+) -> list[str]:
+    """Report the Doppler route each isotope would take on this grid.
+
+    Doppler broadening is two-tier: a resolved SLBW/MLBW isotope whose
+    thermal support window lies inside its resolved range at
+    ``temperature_k`` takes the continuous route (the free-gas kernel
+    integrated over the resonance equation); every other case — Reich-Moore,
+    ``sqrt(E) <= 8u``, a window crossing the range boundary, a File-3 term —
+    takes the sampled-table kernel-on-grid route.  The route is decided per
+    isotope over the whole grid and is the one ``forward_model()`` executes
+    for the same arguments (the resolution arguments shape the working grid
+    the gate inspects).  Returns one string per isotope, e.g.
+    ``"Hf-177: continuous free-gas integral over the MLBW resonance
+    equation"``; ``temperature_k=0`` reports the unbroadened route.
     """
     ...
 
@@ -940,7 +982,11 @@ def create_resonance_data(
     l_groups: list[tuple[int, list[tuple[float, float, float, float]]]] | None = None,
     formalism: str | None = None,
 ) -> ResonanceData:
-    """Create ResonanceData from parameters (for testing/custom isotopes)."""
+    """Create ResonanceData from parameters (for testing/custom isotopes).
+
+    ``formalism`` selects the resonance formalism: ``None`` or
+    ``"reich_moore"`` (default), ``"slbw"`` or ``"mlbw"``.
+    """
     ...
 
 def beer_lambert(
@@ -958,6 +1004,9 @@ def doppler_broaden(
 ) -> NDArray[np.float64]:
     """Apply Free Gas Model (FGM) Doppler broadening to a cross-section array.
 
+    This is the sampled-table (tier-2) kernel that ``forward_model()`` and
+    the fitters apply to Reich-Moore isotopes and to any isotope failing the
+    continuous-route gate; see ``doppler_routes()``.
     Exact FGM kernel (SAMMY manual Eq. III B1.7, w²-weighted integrand —
     the same weighting as SAMMY's Dopfgm; the numerical quadrature differs).
     Near the grid edges sigma is 1/v-extrapolated beyond the supplied grid;
