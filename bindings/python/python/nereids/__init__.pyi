@@ -869,7 +869,10 @@ def doppler_routes(
     ``sqrt(E) <= 8u``, a window crossing the range boundary, a grid (or its
     auxiliary extension) that leaves the resolved range, another evaluable
     range overlapping the window, a File-3 term — takes the sampled-table
-    kernel-on-grid route.  The route is decided per isotope over the whole
+    kernel-on-grid route.  A grid spanning adjacent resolved ranges of
+    different formalisms is tier 1 throughout and names every formalism it
+    was evaluated with (``"... over the SLBW and MLBW resonance
+    equations"``).  The route is decided per isotope over the whole
     grid and is the one ``forward_model()`` executes for the same arguments
     (the resolution arguments shape the working grid the gate inspects).
     The query treats every listed isotope as active: the auxiliary grid is

@@ -35,6 +35,7 @@ Doppler evaluation is two-tier and declared.
 
 - Tier 1, continuous: a resolved SLBW/MLBW source with `√E > 8u` (`u = √(k_B·T/A)`, the kernel width in `√E`) whose full thermal support window `[(√E−8u)², (√E+8u)²]` lies inside the resolved range, with no File-3 background term, integrates the free-gas kernel over the resonance equation itself at error-controlled quadrature.
   The result at an energy depends only on that energy, the source and the temperature, never on the energy grid.
+  A grid spanning adjacent resolved ranges of different formalisms is tier 1 at every energy, and the route names every formalism it was evaluated with (`continuous free-gas integral over the SLBW and MLBW resonance equations`).
   Module: [`continuous_doppler`](api/nereids_physics/continuous_doppler/).
 - Tier 2, sampled table: every other case — Reich-Moore, `√E ≤ 8u`, a window crossing the range boundary, a grid (or its auxiliary extension) that leaves the resolved range, another evaluable range overlapping the window, a File-3 term, or a caller-supplied table — samples the cross-section on the working grid and convolves it with the kernel.
   Module: [`doppler`](api/nereids_physics/doppler/), `doppler_broaden()` — exact Free Gas Model convolution integral in velocity space (manual Eq. III B1.7, w²-weighted integrand); no psi/chi (Voigt) approximation is used.

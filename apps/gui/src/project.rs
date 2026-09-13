@@ -1658,7 +1658,7 @@ mod tests {
         let routes = vec![IsotopeDopplerRoute {
             isotope: nereids_core::types::Isotope::new(72, 177).unwrap(),
             route: DopplerRoute::Continuous {
-                formalism: nereids_endf::resonance::ResonanceFormalism::MLBW,
+                formalisms: vec![nereids_endf::resonance::ResonanceFormalism::MLBW],
             },
         }];
         let state = AppState {

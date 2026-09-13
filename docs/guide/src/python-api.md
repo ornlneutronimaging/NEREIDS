@@ -155,6 +155,7 @@ Doppler broadening is two-tier.
 A resolved SLBW/MLBW isotope whose thermal support window lies inside its resolved range takes the continuous route: the free-gas kernel integrated over the resonance equation at error-controlled quadrature, independent of the energy grid.
 Every other case takes the sampled-table kernel-on-grid route: Reich-Moore, `sqrt(E) <= 8u`, a window crossing the range boundary, a grid (or its auxiliary extension) that leaves the resolved range, another evaluable range overlapping the window, a File-3 term, or a caller-supplied table.
 The route is decided per isotope over the whole grid and never mixed within one isotope.
+A grid spanning adjacent resolved ranges of different formalisms is still one route — tier 1 throughout — and names every formalism it was evaluated with, as `'... over the SLBW and MLBW resonance equations'`.
 The query treats every listed isotope as active: the auxiliary grid is built from all of them, whereas `forward_model(...)` excludes an isotope whose density is zero from its grid build.
 
 ```python

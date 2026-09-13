@@ -36,8 +36,13 @@ pub enum DopplerRoute {
     /// at error-controlled quadrature. Grid-independent by construction.
     /// Only resolved SLBW and MLBW sources qualify.
     Continuous {
-        /// Formalism of the resolved range the whole grid lies in.
-        formalism: ResonanceFormalism,
+        /// Every formalism the grid was actually evaluated with, in the
+        /// order each first appears along the grid, without repeats. One
+        /// entry for a grid inside a single resolved range; a grid spanning
+        /// adjacent resolved ranges of different formalisms is tier 1 at
+        /// every energy and names both, because each half really was
+        /// integrated over its own resonance equation.
+        formalisms: Vec<ResonanceFormalism>,
     },
     /// Tier 2: kernel-on-grid convolution of a zero-kelvin table sampled
     /// on the working grid. Accuracy depends on the grid resolving every
@@ -164,15 +169,22 @@ impl DopplerRoute {
     /// when the grid moves, so a comparison of what two grids executed — a
     /// redrawn overlay against its fit, the pixels of a map against each
     /// other — compares kinds, not the reported energies. Two continuous
-    /// routes are the same kind whatever their formalism: a grid spanning
-    /// adjacent SLBW and MLBW ranges is tier 1 at every energy, and the
-    /// disclosed formalism is only that of the lowest one.
+    /// routes are the same kind when they name the same formalisms, in any
+    /// order: the callers of this comparison ask whether one disclosure
+    /// may stand for the other, and a grid that also crossed into an
+    /// adjacent MLBW range discloses something the SLBW-only grid does
+    /// not. Whether the tier held across a change of grid — the question a
+    /// fit objective asks between probes — is [`Self::same_tier`].
     pub fn same_kind(&self, other: &Self) -> bool {
         match (self, other) {
             (
                 DopplerRoute::SampledTable { reason: a },
                 DopplerRoute::SampledTable { reason: b },
             ) => a.same_kind(b),
+            (
+                DopplerRoute::Continuous { formalisms: a },
+                DopplerRoute::Continuous { formalisms: b },
+            ) => a.len() == b.len() && a.iter().all(|f| b.contains(f)),
             _ => self.same_tier(other),
         }
     }
@@ -333,6 +345,18 @@ pub fn negative_values_warning(isotope: &Isotope, count: usize) -> Option<String
     })
 }
 
+/// The formalisms of a continuous route as English prose: `SLBW`,
+/// `SLBW and MLBW`, `SLBW, MLBW and Reich-Moore`. Empty for an empty list,
+/// which the gate never produces.
+fn formalism_list(formalisms: &[ResonanceFormalism]) -> String {
+    let names: Vec<&str> = formalisms.iter().map(|f| formalism_name(*f)).collect();
+    match names.split_last() {
+        None => String::new(),
+        Some((last, [])) => (*last).to_string(),
+        Some((last, rest)) => format!("{} and {last}", rest.join(", ")),
+    }
+}
+
 /// Human name of a formalism for disclosure lines.
 fn formalism_name(formalism: ResonanceFormalism) -> &'static str {
     match formalism {
@@ -349,11 +373,27 @@ impl fmt::Display for DopplerRoute {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
             DopplerRoute::Unbroadened => write!(f, "no Doppler broadening (temperature 0 K)"),
-            DopplerRoute::Continuous { formalism } => write!(
-                f,
-                "continuous free-gas integral over the {} resonance equation",
-                formalism_name(*formalism)
-            ),
+            DopplerRoute::Continuous { formalisms } => {
+                // Each named formalism really was integrated over its own
+                // resonance equation, so several of them pluralise.
+                let named = formalism_list(formalisms);
+                if named.is_empty() {
+                    write!(
+                        f,
+                        "continuous free-gas integral over the resonance equation"
+                    )
+                } else if formalisms.len() == 1 {
+                    write!(
+                        f,
+                        "continuous free-gas integral over the {named} resonance equation"
+                    )
+                } else {
+                    write!(
+                        f,
+                        "continuous free-gas integral over the {named} resonance equations"
+                    )
+                }
+            }
             DopplerRoute::SampledTable { reason } => {
                 write!(f, "sampled-table kernel-on-grid ({reason})")
             }
@@ -473,7 +513,7 @@ mod tests {
         let route = IsotopeDopplerRoute {
             isotope: hf177(),
             route: DopplerRoute::Continuous {
-                formalism: ResonanceFormalism::MLBW,
+                formalisms: vec![ResonanceFormalism::MLBW],
             },
         };
         assert_eq!(
@@ -592,7 +632,7 @@ mod tests {
         assert!(!DopplerRoute::Unbroadened.is_edge_fallback());
         assert!(
             !DopplerRoute::Continuous {
-                formalism: ResonanceFormalism::SLBW
+                formalisms: vec![ResonanceFormalism::SLBW]
             }
             .is_edge_fallback()
         );
@@ -682,7 +722,7 @@ mod tests {
         for route in [
             DopplerRoute::Unbroadened,
             DopplerRoute::Continuous {
-                formalism: ResonanceFormalism::MLBW,
+                formalisms: vec![ResonanceFormalism::MLBW],
             },
             DopplerRoute::SampledTable {
                 reason: SampledTableReason::ExplicitTable,
@@ -735,12 +775,12 @@ mod tests {
         assert!(!folded.same_kind(&crossed));
         assert!(folded.same_tier(&sampled(SampledTableReason::ExplicitTable)));
         let continuous = DopplerRoute::Continuous {
-            formalism: ResonanceFormalism::MLBW,
+            formalisms: vec![ResonanceFormalism::MLBW],
         };
         assert!(!continuous.same_tier(&crossed));
         assert!(!continuous.same_tier(&DopplerRoute::Unbroadened));
         assert!(continuous.same_tier(&DopplerRoute::Continuous {
-            formalism: ResonanceFormalism::SLBW,
+            formalisms: vec![ResonanceFormalism::SLBW],
         }));
     }
 
@@ -811,16 +851,54 @@ mod tests {
         );
         assert!(!grid_reason(ResonanceFormalism::MLBW).same_kind(&window_reason()));
 
-        // Both continuous routes are tier 1; an energy-scale probe that
-        // crosses an SLBW/MLBW boundary keeps the tier and is not refused.
-        let continuous = |formalism| DopplerRoute::Continuous { formalism };
-        assert!(
-            continuous(ResonanceFormalism::MLBW).same_kind(&continuous(ResonanceFormalism::MLBW))
-        );
-        assert!(
-            continuous(ResonanceFormalism::MLBW).same_kind(&continuous(ResonanceFormalism::SLBW))
-        );
-        assert!(!continuous(ResonanceFormalism::MLBW).same_kind(&DopplerRoute::Unbroadened));
+        // Continuous routes are the same kind when they disclose the same
+        // formalisms, whatever order the grid met them in; a grid that also
+        // crossed into the MLBW range discloses more than the SLBW-only one.
+        let continuous = |formalisms: Vec<_>| DopplerRoute::Continuous { formalisms };
+        use ResonanceFormalism::{MLBW, SLBW};
+        assert!(continuous(vec![MLBW]).same_kind(&continuous(vec![MLBW])));
+        assert!(!continuous(vec![MLBW]).same_kind(&continuous(vec![SLBW])));
+        assert!(!continuous(vec![SLBW]).same_kind(&continuous(vec![SLBW, MLBW])));
+        assert!(continuous(vec![SLBW, MLBW]).same_kind(&continuous(vec![MLBW, SLBW])));
+        assert!(!continuous(vec![MLBW]).same_kind(&DopplerRoute::Unbroadened));
         assert!(DopplerRoute::Unbroadened.same_kind(&DopplerRoute::Unbroadened));
+    }
+
+    /// The tier holds across a formalism boundary even though the kind does
+    /// not: an energy-scale probe that widens the grid into the adjacent
+    /// range is still tier 1 and must not be refused.
+    #[test]
+    fn same_tier_holds_across_a_change_of_disclosed_formalisms() {
+        let continuous = |formalisms: Vec<_>| DopplerRoute::Continuous { formalisms };
+        use ResonanceFormalism::{MLBW, SLBW};
+        assert!(continuous(vec![SLBW]).same_tier(&continuous(vec![SLBW, MLBW])));
+        assert!(!continuous(vec![SLBW]).same_kind(&continuous(vec![SLBW, MLBW])));
+    }
+
+    #[test]
+    fn display_names_every_formalism_the_grid_was_evaluated_with() {
+        use ResonanceFormalism::{MLBW, SLBW};
+        assert_eq!(
+            DopplerRoute::Continuous {
+                formalisms: vec![SLBW],
+            }
+            .to_string(),
+            "continuous free-gas integral over the SLBW resonance equation"
+        );
+        assert_eq!(
+            DopplerRoute::Continuous {
+                formalisms: vec![SLBW, MLBW],
+            }
+            .to_string(),
+            "continuous free-gas integral over the SLBW and MLBW resonance equations"
+        );
+        assert_eq!(
+            DopplerRoute::Continuous {
+                formalisms: vec![SLBW, MLBW, ResonanceFormalism::ReichMoore],
+            }
+            .to_string(),
+            "continuous free-gas integral over the SLBW, MLBW and Reich-Moore \
+             resonance equations"
+        );
     }
 }

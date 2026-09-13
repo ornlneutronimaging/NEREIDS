@@ -1386,12 +1386,12 @@ mod tests {
             }
         ));
         let fixed = build(false);
-        assert!(matches!(
+        assert_eq!(
             fixed.doppler_routes().unwrap().unwrap()[0],
             DopplerRoute::Continuous {
-                formalism: ResonanceFormalism::MLBW
+                formalisms: vec![ResonanceFormalism::MLBW]
             }
-        ));
+        );
         let forward = TransmissionFitModel::new(
             energies,
             vec![near_edge],
@@ -1463,12 +1463,12 @@ mod tests {
         )
         .unwrap();
         let disclosed = result.doppler_routes.as_deref().unwrap();
-        assert!(matches!(
+        assert_eq!(
             disclosed[0].route,
             DopplerRoute::Continuous {
-                formalism: ResonanceFormalism::MLBW
+                formalisms: vec![ResonanceFormalism::MLBW]
             }
-        ));
+        );
 
         let overlay = |grid: Vec<f64>| {
             build_overlay_model(

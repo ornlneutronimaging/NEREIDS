@@ -334,7 +334,8 @@ impl std::error::Error for ContinuousDopplerError {}
 /// reports a formalism failure at its first range's lower bound (0 eV when
 /// it has no ranges), so the reason stays finite and comparable. A source
 /// whose grid spans an SLBW range and an MLBW range is still tier 1 at
-/// every energy; the disclosed formalism is that of the lowest grid energy.
+/// every energy, and the continuous route names both formalisms: each half
+/// of the grid really was integrated over its own resonance equation.
 pub fn classify_isotope(
     data: &ResonanceData,
     work_energies: &[f64],
@@ -357,28 +358,35 @@ pub(crate) fn classify_isotope_with(
     thermal_u: f64,
     file3_present: &dyn Fn(&ResonanceRange) -> bool,
 ) -> DopplerRoute {
-    let mut formalism = None;
+    // Every formalism the grid was evaluated with, first use first. A
+    // working grid may legitimately span adjacent resolved ranges of
+    // different formalisms; the disclosed route is the executed route, so
+    // it names all of them rather than the lowest energy's alone.
+    let mut formalisms: Vec<ResonanceFormalism> = Vec::new();
     for &energy in work_energies {
         match tier_one_check(data, energy, thermal_u, file3_present) {
             Ok((_, range_formalism)) => {
-                formalism.get_or_insert(range_formalism);
+                if !formalisms.contains(&range_formalism) {
+                    formalisms.push(range_formalism);
+                }
             }
             Err(reason) => return DopplerRoute::SampledTable { reason },
         }
     }
-    match formalism.or_else(|| {
-        data.ranges
-            .iter()
-            .find(|r| is_tier_one_formalism(r))
-            .map(|r| r.formalism)
-    }) {
-        Some(formalism) => DopplerRoute::Continuous { formalism },
-        None => DopplerRoute::SampledTable {
+    if formalisms.is_empty()
+        && let Some(range) = data.ranges.iter().find(|r| is_tier_one_formalism(r))
+    {
+        formalisms.push(range.formalism);
+    }
+    if formalisms.is_empty() {
+        DopplerRoute::SampledTable {
             reason: SampledTableReason::Formalism {
                 energy_ev: data.ranges.first().map_or(0.0, |r| r.energy_low),
                 formalism: data.ranges.first().map(|r| r.formalism),
             },
-        },
+        }
+    } else {
+        DopplerRoute::Continuous { formalisms }
     }
 }
 
@@ -1179,7 +1187,9 @@ mod tests {
             let params = DopplerParams::new(ROOM_K, data.awr).unwrap();
             assert_eq!(
                 classify_isotope(&data, &[6.5, 6.674, 6.9], params.u()),
-                DopplerRoute::Continuous { formalism }
+                DopplerRoute::Continuous {
+                    formalisms: vec![formalism]
+                }
             );
         }
     }
@@ -1214,7 +1224,7 @@ mod tests {
         assert_eq!(
             classify_isotope(&data, &[6.674], thermal_u),
             DopplerRoute::Continuous {
-                formalism: ResonanceFormalism::MLBW
+                formalisms: vec![ResonanceFormalism::MLBW]
             }
         );
     }
@@ -1244,7 +1254,7 @@ mod tests {
         assert_eq!(
             classify_isotope(&data, &[100.0], thermal_u),
             DopplerRoute::Continuous {
-                formalism: ResonanceFormalism::SLBW
+                formalisms: vec![ResonanceFormalism::SLBW]
             }
         );
     }
@@ -1273,7 +1283,7 @@ mod tests {
         assert_eq!(
             classify_isotope(&data, &[6.674], thermal_u),
             DopplerRoute::Continuous {
-                formalism: ResonanceFormalism::MLBW
+                formalisms: vec![ResonanceFormalism::MLBW]
             }
         );
     }
@@ -1307,21 +1317,33 @@ mod tests {
         assert_eq!(
             classify_isotope(&data, &[50.0], thermal_u),
             DopplerRoute::Continuous {
-                formalism: ResonanceFormalism::SLBW
+                formalisms: vec![ResonanceFormalism::SLBW]
             }
         );
         assert_eq!(
             classify_isotope(&data, &[500.0], thermal_u),
             DopplerRoute::Continuous {
-                formalism: ResonanceFormalism::MLBW
+                formalisms: vec![ResonanceFormalism::MLBW]
             }
         );
-        // Both halves are tier 1; the disclosed formalism is the lowest energy's.
+        // Both halves are tier 1 and each was integrated over its own
+        // resonance equation, so the route names both formalisms, in the
+        // order the ascending grid met them, once each.
         assert_eq!(
-            classify_isotope(&data, &[50.0, 500.0], thermal_u),
+            classify_isotope(&data, &[50.0, 60.0, 500.0, 600.0], thermal_u),
             DopplerRoute::Continuous {
-                formalism: ResonanceFormalism::SLBW
+                formalisms: vec![ResonanceFormalism::SLBW, ResonanceFormalism::MLBW]
             }
+        );
+        assert_eq!(
+            classify_isotope(&data, &[50.0, 60.0, 500.0, 600.0], thermal_u).to_string(),
+            "continuous free-gas integral over the SLBW and MLBW resonance equations"
+        );
+        // A grid inside one range still discloses one formalism, rendered
+        // exactly as before.
+        assert_eq!(
+            classify_isotope(&data, &[50.0, 60.0], thermal_u).to_string(),
+            "continuous free-gas integral over the SLBW resonance equation"
         );
     }
 
@@ -1377,7 +1399,7 @@ mod tests {
                 thermal_u
             ),
             DopplerRoute::Continuous {
-                formalism: ResonanceFormalism::MLBW
+                formalisms: vec![ResonanceFormalism::MLBW]
             }
         );
         // Without a tier-1 range the reason names the first range's lower
@@ -1423,7 +1445,7 @@ mod tests {
         assert_eq!(
             classify_isotope_with(&data, &[6.674], thermal_u, &|_| false),
             DopplerRoute::Continuous {
-                formalism: ResonanceFormalism::MLBW
+                formalisms: vec![ResonanceFormalism::MLBW]
             }
         );
     }
@@ -1692,7 +1714,7 @@ mod tests {
         assert_eq!(
             classify_isotope(&data, &energies, params.u()),
             DopplerRoute::Continuous {
-                formalism: ResonanceFormalism::SLBW
+                formalisms: vec![ResonanceFormalism::SLBW]
             }
         );
 
@@ -1881,7 +1903,7 @@ mod tests {
         assert_eq!(
             classify_isotope(&data, &[zeroed, kept], params.u()),
             DopplerRoute::Continuous {
-                formalism: ResonanceFormalism::SLBW
+                formalisms: vec![ResonanceFormalism::SLBW]
             }
         );
         let tier_one = broaden_integrals(

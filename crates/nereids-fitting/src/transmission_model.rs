@@ -7234,7 +7234,7 @@ mod tests {
         assert_eq!(
             free.doppler_routes().unwrap().unwrap(),
             vec![DopplerRoute::Continuous {
-                formalism: ResonanceFormalism::MLBW
+                formalisms: vec![ResonanceFormalism::MLBW]
             }]
         );
         let fixed = TransmissionFitModel::new(
@@ -7343,7 +7343,7 @@ mod tests {
             pinned.routes.as_deref(),
             Some(
                 [DopplerRoute::Continuous {
-                    formalism: ResonanceFormalism::MLBW
+                    formalisms: vec![ResonanceFormalism::MLBW]
                 }]
                 .as_slice()
             )
@@ -7417,7 +7417,7 @@ mod tests {
         assert_eq!(model.pinned_doppler_routes().borrow().refused_probes, 0);
         let refused = model
             .pin_doppler_routes(&[DopplerRoute::Continuous {
-                formalism: ResonanceFormalism::MLBW,
+                formalisms: vec![ResonanceFormalism::MLBW],
             }])
             .unwrap_err();
         assert!(

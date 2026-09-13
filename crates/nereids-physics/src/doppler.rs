@@ -282,13 +282,32 @@ impl DopplerParams {
         if !awr.is_finite() || awr <= 0.0 {
             return Err(DopplerParamsError::InvalidAwr(awr));
         }
+        Self::validate_temperature(temperature_k)?;
+        Ok(Self { temperature_k, awr })
+    }
+
+    /// The temperature half of [`DopplerParams::new`]'s validation, without
+    /// an AWR.
+    ///
+    /// A caller that answers a question *about* broadening rather than
+    /// performing it — the route query, which short-circuits at
+    /// `temperature_k == 0` before it ever builds per-isotope parameters —
+    /// must still refuse the temperatures the broadeners refuse, or it
+    /// would answer for an input no broadening could accept. Sharing the
+    /// check keeps the two answers from drifting apart.
+    ///
+    /// # Errors
+    /// Returns `DopplerParamsError::NonFiniteTemperature` if `temperature_k`
+    /// is NaN or infinity, and `DopplerParamsError::NegativeTemperature` if
+    /// it is negative. Zero is allowed — it means "no broadening".
+    pub fn validate_temperature(temperature_k: f64) -> Result<(), DopplerParamsError> {
         if !temperature_k.is_finite() {
             return Err(DopplerParamsError::NonFiniteTemperature(temperature_k));
         }
         if temperature_k < 0.0 {
             return Err(DopplerParamsError::NegativeTemperature(temperature_k));
         }
-        Ok(Self { temperature_k, awr })
+        Ok(())
     }
 
     /// Returns the effective sample temperature in Kelvin.

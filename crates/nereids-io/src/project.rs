@@ -2620,7 +2620,7 @@ mod tests {
             IsotopeDopplerRoute {
                 isotope: nereids_core::types::Isotope::new(74, 182).unwrap(),
                 route: DopplerRoute::Continuous {
-                    formalism: nereids_endf::resonance::ResonanceFormalism::MLBW,
+                    formalisms: vec![nereids_endf::resonance::ResonanceFormalism::MLBW],
                 },
             },
             IsotopeDopplerRoute {

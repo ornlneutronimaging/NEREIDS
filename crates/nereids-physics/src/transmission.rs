@@ -1469,7 +1469,7 @@ pub fn forward_model_from_base_xs(
 /// isotope as active and builds the auxiliary grid from all of them,
 /// whereas [`forward_model`] excludes an isotope whose thickness is zero
 /// from its grid build; a caller asking about a sample with a zero-density
-/// isotope should leave it out. `temperature_k <= 0` means no broadening,
+/// isotope should leave it out. `temperature_k == 0` means no broadening,
 /// so every isotope is [`DopplerRoute::Unbroadened`].
 ///
 /// # Errors
@@ -1479,7 +1479,10 @@ pub fn forward_model_from_base_xs(
 ///   and positive, or the grid is not strictly ascending: the same
 ///   validation the broadeners apply, so a malformed grid never yields a
 ///   verdict at a NaN energy.
-/// * [`TransmissionError::Doppler`] — `DopplerParams` validation fails.
+/// * [`TransmissionError::Doppler`] — `DopplerParams` validation fails:
+///   a negative or non-finite temperature is refused here exactly as the
+///   broadeners refuse it, so the query never answers for a temperature
+///   nothing could be evaluated at.
 pub fn doppler_routes(
     energies: &[f64],
     resonance_data: &[ResonanceData],
@@ -1502,7 +1505,12 @@ fn routes_on_working_grid(
     resonance_data: &[ResonanceData],
     temperature_k: f64,
 ) -> Result<Vec<DopplerRoute>, TransmissionError> {
-    if temperature_k <= 0.0 {
+    // The unbroadened short-circuit must not be wider than the
+    // temperatures the broadeners accept: a negative or non-finite
+    // temperature has no route at all, because no broadening could run at
+    // it. Zero is the legitimate unbroadened case.
+    DopplerParams::validate_temperature(temperature_k)?;
+    if temperature_k == 0.0 {
         return Ok(vec![DopplerRoute::Unbroadened; resonance_data.len()]);
     }
     resonance_data
@@ -3195,7 +3203,7 @@ mod tests {
         assert_eq!(
             routes[1],
             DopplerRoute::Continuous {
-                formalism: ResonanceFormalism::MLBW
+                formalisms: vec![ResonanceFormalism::MLBW]
             }
         );
         let working =
@@ -3247,6 +3255,45 @@ mod tests {
         assert!(
             DopplerPlan::new(&[6.5, f64::NAN], &mlbw, 300.0, None, None).is_err(),
             "the plan applies the same validation"
+        );
+    }
+
+    /// A temperature the broadeners refuse has no route: the query must
+    /// reject it with the broadener's own error rather than report
+    /// `Unbroadened` for an input no broadening could accept.
+    #[test]
+    fn doppler_routes_rejects_a_temperature_the_broadeners_reject() {
+        let mlbw = [u238_with_formalism(ResonanceFormalism::MLBW)];
+        let energies = resonance_grid();
+        for (temperature_k, expected) in [
+            (-1.0, DopplerParamsError::NegativeTemperature(-1.0)),
+            (f64::NAN, DopplerParamsError::NonFiniteTemperature(f64::NAN)),
+            (
+                f64::NEG_INFINITY,
+                DopplerParamsError::NonFiniteTemperature(f64::NEG_INFINITY),
+            ),
+            (
+                f64::INFINITY,
+                DopplerParamsError::NonFiniteTemperature(f64::INFINITY),
+            ),
+        ] {
+            // `DopplerParamsError` compares by value, and NaN != NaN, so
+            // the variant is compared through the rendered message.
+            let error = doppler_routes(&energies, &mlbw, temperature_k, None).unwrap_err();
+            match error {
+                TransmissionError::Doppler(actual) => {
+                    assert_eq!(actual.to_string(), expected.to_string(), "{temperature_k}");
+                }
+                other => panic!("{temperature_k}: {other}"),
+            }
+            // The same temperature is refused by the broadener the route
+            // query is speaking for.
+            assert!(DopplerParams::new(temperature_k, mlbw[0].awr).is_err());
+        }
+        // Zero is the legitimate unbroadened case, not a rejection.
+        assert_eq!(
+            doppler_routes(&energies, &mlbw, 0.0, None).unwrap(),
+            vec![DopplerRoute::Unbroadened]
         );
     }
 

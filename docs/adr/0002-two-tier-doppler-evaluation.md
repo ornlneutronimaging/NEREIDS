@@ -27,10 +27,18 @@ Doppler evaluation is two-tier, decided per isotope for the whole working grid, 
   A plan remembers a fingerprint of the data grid, of the working grid the routes were decided on and of the source, and refuses any other input, so a plan can never be applied to a same-length shifted grid, a different instrument or a same-count different source.
   The energy-scale model's working grid moves with every probe, so it decides the route per probe and refuses a change of tier between probes as a hard error; the refusals are counted and disclosed as a `warnings` line, because each one is a rejected optimizer step at the resolved-range edge.
   Two sampled-table routes run the same kernel-on-grid numerics whatever their reason, so a probe whose reason changes (a window that folded through zero on one probe and crossed the range edge on the next) is not refused.
-  Two continuous routes are the same kind whatever their formalism, so a probe whose corrected grid crosses an SLBW/MLBW boundary stays tier 1 and is not refused.
+  Two continuous routes are the same tier whatever their formalisms, so a probe whose corrected grid crosses an SLBW/MLBW boundary stays tier 1 and is not refused; they are the same *kind* — the comparison that asks whether one disclosure may stand for another, used by the redrawn overlay and by the map-wide route of an energy-scale map — only when they name the same formalisms.
 - The File-3 predicate `ResonanceRange::has_file3_background` exists before any parser can answer `true`; the gate consults it and a test forces it, so the change that adds MF=3 support cannot let File-3 data take the continuous route silently.
 
 ### Tier boundary
+
+A working grid may legitimately span adjacent resolved ranges of different formalisms, and both halves are tier 1.
+The continuous route therefore names every formalism the grid was actually evaluated with, in the order the ascending grid first met each, so the disclosed route stays the executed route.
+
+| Continuous route | Rendered as |
+|---|---|
+| Grid inside one resolved range | `continuous free-gas integral over the MLBW resonance equation` |
+| Grid spanning adjacent resolved ranges | `continuous free-gas integral over the SLBW and MLBW resonance equations` |
 
 | Reason on the sampled-table route | Rendered as |
 |---|---|
