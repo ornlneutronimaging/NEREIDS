@@ -786,9 +786,13 @@ impl TargetContext<'_, '_> {
         // quadrature nodes as the contributing unbroadened points: an SLBW
         // total whose interference terms outweigh the shared potential term
         // is kept where some node was positive, zeroed (derivative with it)
-        // where none was or where the value is negligible.
+        // where none was or where the value is negligible. The integrand
+        // carries `1/(√π·E)`, so `value·E` is the kernel-weighted mean of
+        // `E′·σ` in barn·eV — the quantity SAMMY tests before `/Em`.
         if value < 0.0 {
-            if zero_negative_value(value, || self.any_source_positive.get()) {
+            if zero_negative_value(value * self.target_energy, || {
+                self.any_source_positive.get()
+            }) {
                 return Ok(TargetIntegral {
                     value: 0.0,
                     derivative: 0.0,

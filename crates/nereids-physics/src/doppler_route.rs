@@ -295,7 +295,7 @@ pub fn edge_fallback_warning(
 /// The `warnings` line for an isotope whose broadened total went negative
 /// at `count` working-grid energies, or `None` when it never did.
 ///
-/// This is SAMMY's "Negative cross section" print (`fgm/mfgm4.f90:96-99`)
+/// This is SAMMY's "Negative cross section" print (`fgm/mfgm4.f90:95-98`)
 /// mapped onto the result: an SLBW total whose same-J interference terms
 /// outweigh the shared potential term is kept negative where a
 /// contributing point is positive, on either tier.

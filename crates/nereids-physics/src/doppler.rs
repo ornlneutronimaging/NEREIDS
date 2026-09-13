@@ -79,26 +79,38 @@ const DOPPLER_N_SIGMA: f64 = 6.0;
 /// create a near-duplicate of the explicit v = 0 anchor point.
 const NEGATIVE_VELOCITY_FLOOR: f64 = 1e-15;
 
-/// Magnitude (barn) below which a negative broadened value is noise and is
-/// set to zero (SAMMY `fgm/mfgm4.f90:84`).
-pub(crate) const NEGATIVE_VALUE_FLOOR_BARN: f64 = 1e-15;
+/// Magnitude (barn·eV) below which a negative broadened value is noise and
+/// is set to zero.
+///
+/// SAMMY tests `Sigma = Σ Wts·σ` (`fgm/mfgm4.f90:84`), where the
+/// Modsmp/Modfpl weights carry `Velcty**2 = E′` (`fgm/mfgm2.f90:101`,
+/// `:203`): the quantity tested is the kernel-weighted mean of `E′·σ(E′)`,
+/// in barn·eV, before the division by `Em` that makes it a cross-section
+/// (`mfgm4.f90:123-136`). In barn the cutoff is therefore `1e-15 / E`.
+pub(crate) const NEGATIVE_VALUE_FLOOR_BARN_EV: f64 = 1e-15;
 
 /// SAMMY's rule for a negative broadened cross-section (`fgm/mfgm4.f90`
-/// lines 83-101, `Dopfgm`): a value above `−1e-15` is set to zero; below
-/// it, the value is set to zero when no contributing unbroadened point is
-/// positive — the source is negative throughout the kernel window, so the
-/// convolution cannot mean anything else — and kept otherwise, where SAMMY
-/// prints "Negative cross section" (an SLBW total whose same-J interference
-/// terms outweigh the shared potential term). `true` means zero it.
+/// lines 83-101, `Dopfgm`): an energy-weighted value `E·σ_D` above
+/// `−1e-15` barn·eV is set to zero; below it, the value is set to zero when
+/// no contributing unbroadened point is positive — the source is negative
+/// throughout the kernel window, so the convolution cannot mean anything
+/// else — and kept otherwise, where SAMMY prints "Negative cross section"
+/// (an SLBW total whose same-J interference terms outweigh the shared
+/// potential term). `true` means zero it.
 ///
-/// `sigma` must be negative. `any_source_positive` is consulted only when
-/// the magnitude test does not decide.
-pub(crate) fn zero_negative_value(sigma: f64, any_source_positive: impl FnOnce() -> bool) -> bool {
+/// `weighted` is `E·σ_D` — SAMMY's `Sigma` before `/Em`: on the sampled
+/// table `sum_y / sum_g`, on the continuous route the integral times the
+/// target energy — and must be negative. `any_source_positive` is consulted
+/// only when the magnitude test does not decide.
+pub(crate) fn zero_negative_value(
+    weighted: f64,
+    any_source_positive: impl FnOnce() -> bool,
+) -> bool {
     debug_assert!(
-        sigma < 0.0,
-        "the rule applies to negative values only, got {sigma}"
+        weighted < 0.0,
+        "the rule applies to negative values only, got {weighted}"
     );
-    sigma > -NEGATIVE_VALUE_FLOOR_BARN || !any_source_positive()
+    weighted > -NEGATIVE_VALUE_FLOOR_BARN_EV || !any_source_positive()
 }
 
 /// A tier-2 broadening with SAMMY's negative-value bookkeeping.
@@ -686,11 +698,14 @@ pub(crate) fn doppler_broaden_counted(
         // are positive). A negative value — an SLBW total whose
         // interference term outweighs potential scattering — goes through
         // SAMMY's rule: zeroed when negligible or when the whole window is
-        // negative, kept and counted otherwise. The continuous route
-        // applies the same rule to its quadrature nodes.
+        // negative, kept and counted otherwise. The magnitude test is on
+        // `sum_y / sum_g`, the kernel-weighted mean of `w²·σ = E′·σ` in
+        // barn·eV — SAMMY's `Sigma` before its division by `Em`
+        // (`mfgm4.f90:84`). The continuous route applies the same rule to
+        // its quadrature nodes.
         let value = sum_y / (sum_g * e);
         if value < 0.0 {
-            if zero_negative_value(value, window_has_positive_node) {
+            if zero_negative_value(sum_y / sum_g, window_has_positive_node) {
                 zeroed.push(i);
                 continue;
             }
@@ -1227,28 +1242,50 @@ mod tests {
         );
     }
 
+    /// SAMMY tests the energy-weighted sum `Σ Wts·σ` (barn·eV) against
+    /// −1e-15 before dividing by the energy (`mfgm4.f90:84`, `:123-136`),
+    /// so the cutoff in barn is `1e-15 / E`: at 100 eV a −9e-16 barn table
+    /// (−9e-14 barn·eV) with a positive node inside the window is kept,
+    /// and a −5e-18 barn table (−5e-16 barn·eV) is zeroed although the
+    /// same node is positive.
     #[test]
-    fn negative_rule_zeroes_a_negligible_value_despite_a_positive_node() {
+    fn negative_rule_tests_the_energy_weighted_value() {
         let energies: Vec<f64> = (0..421).map(|i| 80.0 + 0.1 * i as f64).collect();
         let centre = 200;
-        let mut xs = vec![-9.0e-16; energies.len()];
-        xs[centre + 1] = 1.0e-16;
+        assert_eq!(energies[centre], 100.0);
         let params = DopplerParams::new(300.0, 1.0).unwrap();
-        let unclamped = {
-            // The same table scaled by 1e16 is far below the floor in
-            // magnitude terms only after scaling back: it shows the rule
-            // fired on magnitude, not on the (positive) node.
-            let scaled: Vec<f64> = xs.iter().map(|v| v * 1.0e16).collect();
-            doppler_broaden_counted(&energies, &scaled, &params).unwrap()
+        let with_positive_node = |level: f64| {
+            let mut xs = vec![level; energies.len()];
+            xs[centre + 1] = 1.0e-18;
+            xs
         };
+
+        let kept =
+            doppler_broaden_counted(&energies, &with_positive_node(-9.0e-16), &params).unwrap();
+        assert!(
+            kept.sigma[centre] < 0.0 && !kept.zeroed.contains(&centre),
+            "−9e-14 barn·eV is below the floor and must be kept: {}",
+            kept.sigma[centre]
+        );
+        assert!(kept.negative_values > 0);
+        assert!(kept.sigma[centre] * energies[centre] < -NEGATIVE_VALUE_FLOOR_BARN_EV);
+
+        let zeroed =
+            doppler_broaden_counted(&energies, &with_positive_node(-5.0e-18), &params).unwrap();
+        assert_eq!(zeroed.sigma[centre], 0.0);
+        assert!(zeroed.zeroed.contains(&centre));
+        // The same table scaled by 1e16 is kept: the rule fired on the
+        // magnitude, not on the (positive) node.
+        let scaled: Vec<f64> = with_positive_node(-5.0e-18)
+            .iter()
+            .map(|v| v * 1.0e16)
+            .collect();
+        let unclamped = doppler_broaden_counted(&energies, &scaled, &params).unwrap();
         assert!(
             unclamped.sigma[centre] < 0.0 && unclamped.negative_values > 0,
             "the scaled window must keep its negative value: {}",
             unclamped.sigma[centre]
         );
-        let broadened = doppler_broaden_counted(&energies, &xs, &params).unwrap();
-        assert_eq!(broadened.sigma[centre], 0.0);
-        assert!(broadened.zeroed.contains(&centre));
     }
 
     #[test]
