@@ -1236,8 +1236,10 @@ pub fn broadened_cross_sections_from_base_on_working_grid(
 }
 
 /// Every isotope of a caller-supplied table takes the sampled-table route
-/// for that reason: the engine never evaluated its source. This is the
-/// disclosure for any path that broadens a caller's table.
+/// for that reason: the table replaces the evaluation of the resonance
+/// source on the data grid; under Gaussian resolution the auxiliary-only
+/// points of the working grid are still evaluated from the source. This is
+/// the disclosure for any path that broadens a caller's table.
 pub fn explicit_table_routes(n_isotopes: usize) -> Vec<DopplerRoute> {
     vec![
         DopplerRoute::SampledTable {
@@ -1759,8 +1761,9 @@ impl DopplerPlan {
     }
 
     /// The plan applies to these inputs: the isotope count, the data grid,
-    /// the working grid the routes were decided on, the source and the
-    /// gate temperature all match.
+    /// the working grid the routes were decided on and the source all
+    /// match, and the temperature is one the broadeners accept and the
+    /// gate covers.
     fn check(
         &self,
         energies: &[f64],
@@ -1796,7 +1799,17 @@ impl DopplerPlan {
                 "Doppler plan was decided on different resonance data".into(),
             ));
         }
-        if temperature_k.is_nan() || temperature_k > self.gate_temperature_k {
+        // The plan could not have been built at a negative or non-finite
+        // temperature — `routes_on_working_grid` refuses one, because no
+        // broadening could run at it — so it must not evaluate at one
+        // either. Without this, the sub-zero branch of `broaden_rows`
+        // returns the unbroadened σ while the plan still discloses the
+        // continuous route whose integral never ran. Sharing the
+        // broadeners' own check keeps the two answers from drifting apart,
+        // and leaves zero as the legitimate unbroadened case. It also
+        // covers +∞, which an explicit table's infinite gate would admit.
+        DopplerParams::validate_temperature(temperature_k)?;
+        if temperature_k > self.gate_temperature_k {
             return Err(TransmissionError::InputMismatch(format!(
                 "temperature {temperature_k} K is above the Doppler plan's gate temperature {} K",
                 self.gate_temperature_k,
@@ -1870,9 +1883,13 @@ impl DopplerPlan {
     /// `temperature_k`, each by its planned route.
     ///
     /// # Errors
-    /// [`TransmissionError::InputMismatch`] if `temperature_k` exceeds the
-    /// gate temperature or the inputs do not match the plan; the grid
-    /// validation and broadening errors otherwise.
+    /// * [`TransmissionError::Doppler`] — `temperature_k` is negative or
+    ///   not finite: refused here exactly as the plan's construction and
+    ///   the broadeners refuse it, so the plan never discloses a route for
+    ///   an evaluation that could not run. Zero means no broadening.
+    /// * [`TransmissionError::InputMismatch`] — `temperature_k` exceeds the
+    ///   gate temperature, or the inputs do not match the plan.
+    /// * The grid validation and broadening errors otherwise.
     pub fn broaden_on_working_grid(
         &self,
         energies: &[f64],
@@ -3412,9 +3429,13 @@ mod tests {
             plan.broaden_on_working_grid(&energies, std::slice::from_ref(&mlbw), 300.5, None),
             Err(TransmissionError::InputMismatch(_))
         ));
+        // NaN is not "above the gate" but a temperature nothing can be
+        // broadened at, so it is refused as the broadeners refuse it.
         assert!(matches!(
             plan.broaden_on_working_grid(&energies, std::slice::from_ref(&mlbw), f64::NAN, None),
-            Err(TransmissionError::InputMismatch(_))
+            Err(TransmissionError::Doppler(
+                DopplerParamsError::NonFiniteTemperature(_)
+            ))
         ));
         assert!(matches!(
             plan.broaden_on_working_grid(&energies, &[], 300.0, None),
@@ -3423,6 +3444,82 @@ mod tests {
         assert!(
             plan.broaden_on_working_grid(&energies, std::slice::from_ref(&mlbw), 300.0, None)
                 .is_ok()
+        );
+    }
+
+    /// A plan cannot be *built* at a temperature no broadening could run
+    /// at, so it must not *evaluate* at one: the sub-zero branch returns
+    /// the unbroadened σ, and the plan would disclose the continuous route
+    /// whose integral never ran. The explicit-table plan's gate is `+∞`,
+    /// so its only temperature screen is this one.
+    #[test]
+    fn doppler_plan_refuses_a_temperature_the_broadeners_reject() {
+        let mlbw = u238_with_formalism(ResonanceFormalism::MLBW);
+        let energies = resonance_grid();
+        let one = std::slice::from_ref(&mlbw);
+        let unbroadened = unbroadened_totals(&mlbw, &energies);
+        let table = vec![unbroadened.iter().map(|s| 2.0 * s).collect::<Vec<f64>>()];
+
+        let gated = DopplerPlan::new(&energies, one, 300.0, None, None).unwrap();
+        assert!(
+            gated.has_continuous_route(),
+            "the route this plan would disclose for a refused temperature"
+        );
+        let explicit = DopplerPlan::from_explicit_table(&energies, one, &table).unwrap();
+        assert_eq!(explicit.gate_temperature_k(), f64::INFINITY);
+
+        for plan in [&gated, &explicit] {
+            for (temperature_k, expected) in [
+                (-1.0, DopplerParamsError::NegativeTemperature(-1.0)),
+                (f64::NAN, DopplerParamsError::NonFiniteTemperature(f64::NAN)),
+                (
+                    f64::NEG_INFINITY,
+                    DopplerParamsError::NonFiniteTemperature(f64::NEG_INFINITY),
+                ),
+            ] {
+                let value = plan
+                    .broaden_on_working_grid(&energies, one, temperature_k, None)
+                    .err();
+                let with_derivative = plan
+                    .broaden_with_derivative_on_working_grid(&energies, one, temperature_k, None)
+                    .err();
+                for error in [value, with_derivative] {
+                    // `DopplerParamsError` compares by value, and NaN != NaN,
+                    // so the variant is compared through the rendered message.
+                    match error {
+                        Some(TransmissionError::Doppler(actual)) => {
+                            assert_eq!(actual.to_string(), expected.to_string(), "{temperature_k}");
+                        }
+                        Some(other) => panic!("{temperature_k}: {other}"),
+                        None => panic!("{temperature_k}: broadened anyway"),
+                    }
+                }
+                // The broadener the plan is speaking for refuses it too.
+                assert!(DopplerParams::new(temperature_k, mlbw.awr).is_err());
+            }
+        }
+
+        // Zero stays the legitimate unbroadened case on both plans: the
+        // source equation for the continuous route, the caller's rows for
+        // the explicit table.
+        let cold = gated
+            .broaden_with_derivative_on_working_grid(&energies, one, 0.0, None)
+            .unwrap();
+        assert_eq!(cold.sigma[0], unbroadened);
+        assert!(cold.dsigma_dt[0].iter().all(|d| *d == 0.0));
+        assert_eq!(
+            gated
+                .broaden_on_working_grid(&energies, one, 0.0, None)
+                .unwrap()
+                .sigma[0],
+            unbroadened
+        );
+        assert_eq!(
+            explicit
+                .broaden_on_working_grid(&energies, one, 0.0, None)
+                .unwrap()
+                .sigma[0],
+            table[0]
         );
     }
 
