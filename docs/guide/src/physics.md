@@ -31,12 +31,16 @@ and statistical spin weights.
 ### Doppler Broadening
 
 Free Gas Model (FGM) convolution accounting for thermal motion of target nuclei.
+Doppler evaluation is two-tier and declared.
 
-- Module: [`doppler`](api/nereids_physics/doppler/)
+- Tier 1, continuous: a resolved SLBW/MLBW source with `√E > 8u` (`u = √(k_B·T/A)`, the kernel width in `√E`) whose full thermal support window `[(√E−8u)², (√E+8u)²]` lies inside the resolved range, with no File-3 background term, integrates the free-gas kernel over the resonance equation itself at error-controlled quadrature.
+  The result at an energy depends only on that energy, the source and the temperature, never on the energy grid.
+  Module: [`continuous_doppler`](api/nereids_physics/continuous_doppler/).
+- Tier 2, sampled table: every other case — Reich-Moore, `√E ≤ 8u`, a window crossing the range boundary, a File-3 term, or a caller-supplied table — samples the cross-section on the working grid and convolves it with the kernel.
+  Module: [`doppler`](api/nereids_physics/doppler/), `doppler_broaden()` — exact Free Gas Model convolution integral in velocity space (manual Eq. III B1.7, w²-weighted integrand); no psi/chi (Voigt) approximation is used.
+- The route is chosen per isotope for the whole grid, never mixed within one isotope, and disclosed on `FitResult.doppler_routes`, `SpatialResult.doppler_routes` and through `nereids.doppler_routes()`; a sampled-table result is a declared approximation boundary, never a silent substitution.
+- Free-temperature fits decide the route once, at the temperature upper bound (5000 K), so it cannot change between iterations.
 - SAMMY reference: `fgm/` module (Dopfgm), manual Sec. III.B.1
-- Key function: `doppler_broaden()` — exact Free Gas Model convolution
-  integral in velocity space (manual Eq. III B1.7, w²-weighted integrand);
-  no psi/chi (Voigt) approximation is used
 
 ### Resolution Broadening
 
@@ -58,7 +62,8 @@ total cross-section for isotope i.
 - SAMMY reference: `cro/`, `xxx/` modules, manual Sec. II; transmission
   experiments Sec. III.E.1
 - Handles multi-isotope samples with shared Doppler temperature
-  (one global temperature parameter, optionally fitted jointly with densities)
+  (one global temperature parameter, optionally fitted jointly with densities);
+  the per-isotope Doppler route is reported on the fit result
 
 ## Fitting Engines
 

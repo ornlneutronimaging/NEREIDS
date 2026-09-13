@@ -43,7 +43,7 @@ Key formalisms from SAMMY:
 
 - Reich-Moore R-matrix (LRF=3)
 - Breit-Wigner, single- and multi-level (LRF=1/2)
-- Free Gas Model Doppler broadening
+- Free Gas Model Doppler broadening, two-tier: a continuous integral over resolved SLBW/MLBW sources, the sampled-table kernel otherwise, with the route disclosed per isotope
 - Gaussian + exponential resolution broadening
 
 R-Matrix Limited (LRF=7) and Unresolved Resonance Region (LRU=2) ranges are

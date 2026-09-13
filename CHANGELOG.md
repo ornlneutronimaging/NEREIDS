@@ -9,6 +9,29 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
 
 ### Added
 
+- **Two-tier Doppler broadening with per-isotope route disclosure.**
+  Resolved SLBW/MLBW isotopes whose thermal support window lies inside the
+  resolved range now take a continuous free-gas integral over the
+  resonance equation at error-controlled quadrature; every other case
+  (Reich-Moore, `√E ≤ 8u`, a window crossing the range boundary, a File-3
+  term, or a caller-supplied table) keeps the sampled-table kernel-on-grid
+  broadener. The route is chosen per isotope over the whole grid and
+  disclosed: `FitResult.doppler_routes`, `SpatialResult.doppler_routes`
+  and the new `nereids.doppler_routes()` query; `warnings` gains a line
+  when a resolved SLBW/MLBW isotope falls to the sampled-table route for a
+  window reason. Free-temperature fits decide the route once at the
+  temperature upper bound. New Rust surface:
+  `nereids_physics::doppler_route::{DopplerRoute, SampledTableReason,
+  IsotopeDopplerRoute}`, `continuous_doppler`, `reich_moore::CrossSectionPlan`,
+  `transmission::{doppler_routes, DopplerPlan}`, `WorkingGridXs::routes`,
+  `ResonanceRange::has_file3_background`, and
+  `transmission_model::TEMPERATURE_FIT_UPPER_BOUND_K`;
+  `create_resonance_data` accepts `formalism="mlbw"`. Reich-Moore results
+  are bit-identical; the VENUS Hf-177 regression anchors moved by the
+  measured amounts (LM density +0.134 %, χ²ᵣ −3.6e-6 relative; counts-KL
+  density +0.75 %, deviance per dof −1.2e-4 relative), the VENUS grid's
+  sampling error leaving the cross-section.
+
 - **Exact separate-arm response for resolved count fitting.** A count fit
   with an active instrument resolution now evaluates the physical detector
   equation — the open and sample arms broadened separately,

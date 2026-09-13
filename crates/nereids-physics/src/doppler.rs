@@ -1,9 +1,23 @@
-//! Doppler broadening via the Free Gas Model (FGM).
+//! Doppler broadening via the Free Gas Model (FGM): the sampled-table tier.
 //!
 //! The FGM treats target atoms as a free ideal gas at temperature T.
 //! The Doppler-broadened cross-section is obtained by averaging the
 //! unbroadened cross-section over the Maxwell-Boltzmann velocity
 //! distribution of the target atoms.
+//!
+//! ## Route
+//!
+//! Doppler evaluation is two-tier. This module is the sampled-table tier:
+//! it convolves the kernel with a cross-section already sampled on the
+//! caller's grid, so its accuracy depends on that grid resolving every
+//! line inside each thermal window. The continuous tier
+//! ([`crate::continuous_doppler`]) integrates the same kernel over the
+//! resonance equation itself and is taken by resolved SLBW/MLBW sources
+//! whose thermal window lies inside their range; the selection is made by
+//! [`crate::continuous_doppler::classify_isotope`] and reported through
+//! [`crate::doppler_route::DopplerRoute`] and
+//! [`crate::transmission::doppler_routes`]. Reich-Moore sources always
+//! come here.
 //!
 //! ## SAMMY Reference
 //! - Manual Section III.B.1 (Free-Gas Model of Doppler Broadening)

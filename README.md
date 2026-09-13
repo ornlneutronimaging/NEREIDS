@@ -21,7 +21,10 @@ output spatially resolved isotopic composition maps.
 - **R-matrix cross-sections** -- resolved Breit-Wigner (single- and
   multi-level, LRF=1/2) and Reich-Moore (LRF=3); R-Matrix Limited (LRF=7)
   and unresolved (LRU=2) ranges are parsed-and-skipped, not evaluated
-- **Doppler broadening** -- Free Gas Model (crystal-lattice model planned, not yet implemented)
+- **Doppler broadening** -- Free Gas Model, two-tier: a continuous
+  integral over resolved SLBW/MLBW sources, the sampled-table kernel
+  otherwise, with the route disclosed per isotope (crystal-lattice model
+  planned, not yet implemented)
 - **Resolution broadening** -- Gaussian (channel width + flight path) and
   tabulated instrument functions
 - **ENDF nuclear data** -- automatic retrieval and caching (ENDF/B-VIII.0
