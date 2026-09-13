@@ -24,7 +24,9 @@ use nereids_fitting::transmission_model::{
     TEMPERATURE_FIT_UPPER_BOUND_K, TransmissionFitModel,
 };
 use nereids_physics::counts_response::DetectorBinResponseMatrix;
-use nereids_physics::doppler_route::{DopplerRoute, IsotopeDopplerRoute, edge_fallback_warning};
+use nereids_physics::doppler_route::{
+    DopplerRoute, IsotopeDopplerRoute, edge_fallback_warning, negative_values_warning,
+};
 use nereids_physics::resolution::ResolutionFunction;
 use nereids_physics::transmission::{DopplerPlan, InstrumentParams};
 
@@ -834,11 +836,14 @@ impl UnifiedFitConfig {
     /// Supply a genuinely tabulated zero-kelvin cross-section per isotope on
     /// the data grid for the free-temperature fit.
     ///
-    /// The engine then never evaluates the resonance source: every isotope
-    /// is broadened by the sampled-table kernel and disclosed as
-    /// `SampledTable { ExplicitTable }`. A resolved ENDF evaluation belongs
-    /// in `resonance_data` instead, so the Doppler route gate applies and a
-    /// resolved SLBW/MLBW source can take the continuous route.
+    /// The table replaces the evaluation of the resonance source on the
+    /// data grid: every isotope is broadened by the sampled-table kernel
+    /// and disclosed as `SampledTable { ExplicitTable }`. Under Gaussian
+    /// resolution the auxiliary-only points of the working grid are still
+    /// evaluated from `resonance_data`, so the source must describe the
+    /// same isotope. A resolved ENDF evaluation belongs in `resonance_data`
+    /// alone, so the Doppler route gate applies and a resolved SLBW/MLBW
+    /// source can take the continuous route.
     #[must_use]
     pub fn with_precomputed_base_xs(mut self, xs: Arc<Vec<Vec<f64>>>) -> Self {
         self.precomputed_base_xs = Some(xs);
@@ -3024,33 +3029,70 @@ struct BuiltModel {
     routes: RouteSource,
 }
 
-/// Where a built model's Doppler routes are read from at result time.
+/// Where a built model's Doppler routes, and the per-isotope counts of
+/// negative broadened values, are read from at result time.
 enum RouteSource {
     /// The pipeline did not broaden anything (caller-supplied σ).
     None,
-    /// Decided when the model was built.
-    Known(Vec<DopplerRoute>),
+    /// Decided when the model was built. The counts come from the
+    /// working-grid build that decided the routes (fixed temperature) or
+    /// from the model's most recent evaluation (a free-temperature
+    /// `TransmissionFitModel`, which shares the handle), read after the fit.
+    Known {
+        routes: Vec<DopplerRoute>,
+        negative_values: std::rc::Rc<std::cell::RefCell<Vec<usize>>>,
+    },
     /// Pinned by the energy-scale model at its first probe; read after the
     /// fit, so the disclosed routes are the executed ones and the probes
     /// refused for wanting another route reach the warnings.
     Pinned(std::rc::Rc<std::cell::RefCell<PinnedDopplerRoutes>>),
 }
 
-impl From<Option<Vec<DopplerRoute>>> for RouteSource {
-    fn from(routes: Option<Vec<DopplerRoute>>) -> Self {
-        match routes {
-            Some(routes) => RouteSource::Known(routes),
+impl RouteSource {
+    /// Routes and counts a working-grid build decided; `None` when the
+    /// pipeline broadened nothing.
+    fn decided(build: Option<(Vec<DopplerRoute>, Vec<usize>)>) -> Self {
+        match build {
+            Some((routes, negative_values)) => RouteSource::Known {
+                routes,
+                negative_values: std::rc::Rc::new(std::cell::RefCell::new(negative_values)),
+            },
             None => RouteSource::None,
         }
     }
-}
 
-impl RouteSource {
+    /// Routes from a model's plan, whose counts the model records at each
+    /// evaluation into the shared handle.
+    fn planned(
+        routes: Option<Vec<DopplerRoute>>,
+        negative_values: std::rc::Rc<std::cell::RefCell<Vec<usize>>>,
+    ) -> Self {
+        match routes {
+            Some(routes) => RouteSource::Known {
+                routes,
+                negative_values,
+            },
+            None => RouteSource::None,
+        }
+    }
+
     fn resolve(&self) -> Option<Vec<DopplerRoute>> {
         match self {
             RouteSource::None => None,
-            RouteSource::Known(routes) => Some(routes.clone()),
+            RouteSource::Known { routes, .. } => Some(routes.clone()),
             RouteSource::Pinned(cell) => cell.borrow().routes.clone(),
+        }
+    }
+
+    /// Per isotope, the count of negative broadened values SAMMY's rule
+    /// kept (empty when nothing was broadened or evaluated).
+    fn negative_values(&self) -> Vec<usize> {
+        match self {
+            RouteSource::None => Vec::new(),
+            RouteSource::Known {
+                negative_values, ..
+            } => negative_values.borrow().clone(),
+            RouteSource::Pinned(cell) => cell.borrow().negative_values.clone(),
         }
     }
 
@@ -3083,11 +3125,13 @@ impl RouteSource {
 }
 
 /// Label the routes with their isotopes and build the `warnings` lines for
-/// edge fallbacks: a resolved SLBW/MLBW isotope demoted to the sampled table
-/// for a window reason. The gate temperature named in the line is the fit's
-/// upper bound for a free-temperature fit and the fixed temperature
-/// otherwise. A Reich-Moore isotope on the sampled table is the documented
-/// route and produces no warning.
+/// edge fallbacks (a resolved SLBW/MLBW isotope demoted to the sampled table
+/// for a window reason), for negative broadened totals (SAMMY's "Negative
+/// cross section" print) and for refused energy-scale probes. The gate
+/// temperature named in the line is the fit's upper bound for a
+/// free-temperature fit and the fixed temperature otherwise. A Reich-Moore
+/// isotope on the sampled table is the documented route and produces no
+/// warning.
 fn doppler_disclosure(
     config: &UnifiedFitConfig,
     source: &RouteSource,
@@ -3109,9 +3153,16 @@ fn doppler_disclosure(
             route,
         })
         .collect();
+    let negative_values = source.negative_values();
     let warnings = labelled
         .iter()
         .filter_map(|route| edge_fallback_warning(route, gate_temperature_k))
+        .chain(
+            labelled
+                .iter()
+                .zip(negative_values)
+                .filter_map(|(route, count)| negative_values_warning(&route.isotope, count)),
+        )
         .chain(source.refused_probe_warning(&labelled))
         .collect();
     (Some(labelled), warnings)
@@ -3196,9 +3247,10 @@ fn build_transmission_model(
     temperature_index: Option<usize>,
 ) -> Result<BuiltModel, PipelineError> {
     let n_params = config.n_density_params();
-    // Routes decided by the working-grid build below; `None` when the caller
-    // supplied σ and the pipeline broadened nothing.
-    let mut computed_routes: Option<Vec<DopplerRoute>> = None;
+    // Routes and negative-value counts decided by the working-grid build
+    // below; `None` when the caller supplied σ and the pipeline broadened
+    // nothing.
+    let mut computed: Option<(Vec<DopplerRoute>, Vec<usize>)> = None;
 
     // No-temperature fit without caller-precomputed σ: compute the
     // working-grid σ HERE (same primitive `evaluate_jacobian_and_fisher`
@@ -3234,7 +3286,7 @@ fn build_transmission_model(
             None,
         )
         .map_err(PipelineError::Transmission)?;
-        computed_routes = Some(working.routes.clone());
+        computed = Some((working.routes.clone(), working.negative_values.clone()));
         if working.layout.is_identity() {
             // Tabulated / no resolution: the working grid IS the data grid.
             computed_xs_storage = Arc::new(working.sigma);
@@ -3295,7 +3347,7 @@ fn build_transmission_model(
                     sparse_scalar_plan: None,
                     work_layout: Some(Arc::new(working.layout)),
                 }),
-                routes: RouteSource::from(computed_routes),
+                routes: RouteSource::decided(computed),
             });
         }
     };
@@ -3372,7 +3424,7 @@ fn build_transmission_model(
                 sparse_scalar_plan,
                 work_layout,
             }),
-            routes: RouteSource::from(computed_routes),
+            routes: RouteSource::decided(computed),
         });
     }
 
@@ -3423,9 +3475,10 @@ fn build_transmission_model(
         model = model.with_doppler_plan(Arc::clone(plan));
     }
     // A free-temperature model decides its routes here (once per fit) so the
-    // result can disclose them; the fixed-temperature model has none, and
-    // its routes come from `forward_model` per call.
-    let routes = RouteSource::from(model.doppler_routes()?);
+    // result can disclose them, and records the negative-value counts of
+    // its last evaluation into the shared handle; the fixed-temperature
+    // model has none, and its routes come from `forward_model` per call.
+    let routes = RouteSource::planned(model.doppler_routes()?, model.negative_values());
     Ok(BuiltModel {
         model: Box::new(model),
         routes,
@@ -4178,8 +4231,8 @@ mod tests {
     use super::*;
     use nereids_endf::resonance::ResonanceFormalism;
     use nereids_endf::resonance::test_support::{
-        hf178_mlbw_two_resonances, synthetic_single_resonance, u238_single_resonance,
-        u238_three_resonances, u238_with_formalism,
+        hf178_mlbw_two_resonances, synthetic_single_resonance, synthetic_swave_slbw,
+        u238_single_resonance, u238_three_resonances, u238_with_formalism,
     };
     use nereids_fitting::lm::FitModel;
     use nereids_fitting::transmission_model::{
@@ -9487,6 +9540,96 @@ mod tests {
             "{warning}"
         );
         assert!(warning.ends_with("(route gate at 5000 K)"), "{warning}");
+    }
+
+    /// Two broad same-J s-wave SLBW levels whose interference terms
+    /// outweigh the shared potential term over about 19 940-20 045 eV: the
+    /// broadened total is kept negative next to the sign change on either
+    /// tier (SAMMY's rule), and the result says so — from the working-grid
+    /// build at a fixed temperature, from the model's last evaluation when
+    /// the temperature is free.
+    #[test]
+    fn fit_result_warns_about_negative_broadened_totals() {
+        let mut data = synthetic_swave_slbw(55.45, 20_095.0, 30.0, 0.5, 5.0);
+        data.ranges[0].l_groups[0]
+            .resonances
+            .push(nereids_endf::resonance::Resonance {
+                energy: 20_105.0,
+                j: 0.5,
+                gn: 30.0,
+                gg: 0.5,
+                gfa: 0.0,
+                gfb: 0.0,
+            });
+        let energies: Vec<f64> = (0..101).map(|i| 20_000.0 + (i as f64) * 0.5).collect();
+        for fit_temperature in [false, true] {
+            let result = fit_with(&data, &energies, fit_temperature);
+            assert!(matches!(
+                result.doppler_routes.as_ref().unwrap()[0].route,
+                DopplerRoute::Continuous { .. }
+            ));
+            let warning = result
+                .warnings
+                .iter()
+                .find(|w| {
+                    w.contains("broadened total cross-section value(s) of U-238 are negative")
+                })
+                .unwrap_or_else(|| {
+                    panic!("fit_temperature={fit_temperature}: {:?}", result.warnings)
+                });
+            assert!(warning.starts_with("Doppler: "), "{warning}");
+            assert!(
+                warning.ends_with("(SLBW interference; SAMMY reports the same)"),
+                "{warning}"
+            );
+            let count: usize = warning
+                .trim_start_matches("Doppler: ")
+                .split(' ')
+                .next()
+                .unwrap()
+                .parse()
+                .unwrap();
+            assert!(count > 0, "{warning}");
+        }
+    }
+
+    /// A caller-supplied zero-kelvin table is validated at the entry point:
+    /// an empty table and a non-finite value are configuration errors.
+    #[test]
+    fn fit_rejects_a_malformed_explicit_table() {
+        let data = u238_with_formalism(ResonanceFormalism::MLBW);
+        let energies: Vec<f64> = (0..201).map(|i| 4.0 + (i as f64) * 0.0145).collect();
+        let (t, sigma) = synthetic_transmission_at_temp(&data, 0.0005, 350.0, &energies);
+        let input = InputData::Transmission {
+            transmission: t,
+            uncertainty: sigma,
+        };
+        let mut nan_table = vec![vec![1.0; energies.len()]];
+        nan_table[0][7] = f64::NAN;
+        for (table, expected) in [
+            (Vec::new(), "has 0 isotopes"),
+            (vec![vec![1.0; 3]], "has 3 energies"),
+            (nan_table, "[0][7] is not finite"),
+        ] {
+            let config = UnifiedFitConfig::new(
+                energies.clone(),
+                vec![data.clone()],
+                vec!["U-238".into()],
+                300.0,
+                None,
+                vec![0.001],
+            )
+            .unwrap()
+            .with_solver(SolverConfig::LevenbergMarquardt(LmConfig::default()))
+            .with_fit_temperature(true)
+            .with_precomputed_base_xs(Arc::new(table));
+            let error = fit_spectrum_typed(&input, &config).unwrap_err();
+            assert!(
+                matches!(error, PipelineError::Fitting(_)),
+                "expected a configuration error, got {error:?}"
+            );
+            assert!(error.to_string().contains(expected), "{error}");
+        }
     }
 
     /// MLBW whose range ends at 8 eV on a grid that stops at 6.9 eV and

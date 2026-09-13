@@ -830,6 +830,13 @@ pub struct TransmissionFitModel {
     /// Temperature at which `cached_broadened_xs` was computed.
     /// `Cell` is sufficient because `f64` is `Copy`.
     cached_temperature: Cell<f64>,
+    /// Per isotope, the count of negative broadened values SAMMY's rule
+    /// kept in the most recent planned `evaluate()` (see
+    /// [`transmission::WorkingGridXs::negative_values`]). Shared (`Rc`)
+    /// with the pipeline, which reads it after the fit for the result's
+    /// warnings, the way [`EnergyScaleTransmissionModel`] shares its
+    /// pinned routes.
+    negative_values: Rc<RefCell<Vec<usize>>>,
     /// Optional prebuilt resolution plan for [`Self::energies`].
     ///
     /// When a caller (typically spatial dispatch) builds the plan
@@ -894,25 +901,8 @@ impl TransmissionFitModel {
                 "temperature_index must not overlap with density_indices".into(),
             ));
         }
-        // Validate external base XS shape before accepting.
-        if let Some(ref xs) = external_base_xs {
-            if xs.len() != resonance_data.len() {
-                return Err(FittingError::InvalidConfig(format!(
-                    "external_base_xs has {} isotopes but resonance_data has {}",
-                    xs.len(),
-                    resonance_data.len(),
-                )));
-            }
-            for (i, row) in xs.iter().enumerate() {
-                if row.len() != energies.len() {
-                    return Err(FittingError::InvalidConfig(format!(
-                        "external_base_xs[{i}] has {} energies but expected {}",
-                        row.len(),
-                        energies.len(),
-                    )));
-                }
-            }
-        }
+        // An external table is validated (shape and finiteness) by the
+        // explicit-table plan that wraps it.
         let doppler_plan = OnceCell::new();
         if let Some(xs) = external_base_xs {
             let plan = DopplerPlan::from_explicit_table(&energies, &resonance_data, &xs)
@@ -932,6 +922,7 @@ impl TransmissionFitModel {
             cached_dxs_dt: RefCell::new(Vec::new()),
             cached_work_layout: RefCell::new(None),
             cached_temperature: Cell::new(f64::NAN),
+            negative_values: Rc::new(RefCell::new(Vec::new())),
             resolution_plan: None,
             sparse_cubature_plan: None,
             sparse_scalar_plan: None,
@@ -991,6 +982,12 @@ impl TransmissionFitModel {
         .map_err(|e| FittingError::EvaluationFailed(format!("Doppler plan: {e}")))?;
         let _ = self.doppler_plan.set(Arc::new(plan));
         Ok(self.doppler_plan.get())
+    }
+
+    /// Handle to the per-isotope count of negative broadened values the
+    /// most recent planned `evaluate()` kept (empty until one ran).
+    pub fn negative_values(&self) -> Rc<RefCell<Vec<usize>>> {
+        Rc::clone(&self.negative_values)
     }
 
     /// The Doppler route of each isotope, when the model owns a plan (see
@@ -1125,16 +1122,14 @@ impl FitModel for TransmissionFitModel {
                     Rc::clone(self.cached_work_layout.borrow().as_ref().unwrap()),
                 )
             } else {
-                let (sigma, dsigma_dt, work_layout) = if self.temperature_index.is_some() {
-                    let (working, dsigma_dt) = plan
-                        .broaden_with_continuous_derivative_on_working_grid(
-                            &self.energies,
-                            &self.resonance_data,
-                            temperature_k,
-                            self.instrument.as_deref(),
-                        )
-                        .map_err(|e| FittingError::EvaluationFailed(e.to_string()))?;
-                    (working.sigma, dsigma_dt, working.layout)
+                let (working, dsigma_dt) = if self.temperature_index.is_some() {
+                    plan.broaden_with_continuous_derivative_on_working_grid(
+                        &self.energies,
+                        &self.resonance_data,
+                        temperature_k,
+                        self.instrument.as_deref(),
+                    )
+                    .map_err(|e| FittingError::EvaluationFailed(e.to_string()))?
                 } else {
                     let working = plan
                         .broaden_on_working_grid(
@@ -1144,8 +1139,15 @@ impl FitModel for TransmissionFitModel {
                             self.instrument.as_deref(),
                         )
                         .map_err(|e| FittingError::EvaluationFailed(e.to_string()))?;
-                    (working.sigma, Vec::new(), working.layout)
+                    (working, Vec::new())
                 };
+                let transmission::WorkingGridXs {
+                    sigma,
+                    layout: work_layout,
+                    negative_values,
+                    ..
+                } = working;
+                *self.negative_values.borrow_mut() = negative_values;
                 let xs = Rc::new(sigma);
                 let layout = Rc::new(work_layout);
                 *self.cached_broadened_xs.borrow_mut() = Some(Rc::clone(&xs));
@@ -1901,6 +1903,10 @@ pub struct PinnedDopplerRoutes {
     /// Index into `routes` of the first isotope whose route kind the most
     /// recently refused probe would have changed.
     pub refused_isotope: Option<usize>,
+    /// Per isotope, the count of negative broadened values SAMMY's rule
+    /// kept at the most recent probe (see
+    /// [`transmission::WorkingGridXs::negative_values`]).
+    pub negative_values: Vec<usize>,
 }
 
 /// Capacity-1 working-grid σ cache entry, keyed on
@@ -2366,6 +2372,10 @@ impl EnergyScaleTransmissionModel {
         }
         .map_err(|e| FittingError::EvaluationFailed(e.to_string()))?;
         self.pin_doppler_routes(&work.routes)?;
+        self.pinned_doppler_routes
+            .borrow_mut()
+            .negative_values
+            .clone_from(&work.negative_values);
         Ok(work)
     }
 

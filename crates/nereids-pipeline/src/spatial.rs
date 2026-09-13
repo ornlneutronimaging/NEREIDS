@@ -9,10 +9,13 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 
 use nereids_fitting::transmission_model::TEMPERATURE_FIT_UPPER_BOUND_K;
-use nereids_physics::doppler_route::{DopplerRoute, IsotopeDopplerRoute, edge_fallback_warning};
+use nereids_physics::doppler_route::{
+    DopplerRoute, IsotopeDopplerRoute, edge_fallback_warning, negative_values_warning,
+};
 use nereids_physics::resolution::build_resolution_plan;
 use nereids_physics::transmission::{
     DopplerPlan, InstrumentParams, broadened_cross_sections_on_working_grid, explicit_table_routes,
+    validate_base_xs,
 };
 
 use crate::error::PipelineError;
@@ -1181,6 +1184,15 @@ pub fn spatial_map_typed(
         });
     }
 
+    // A caller-supplied zero-kelvin table is validated once here: inside the
+    // pixel loop a malformed table fails every pixel's model constructor,
+    // and the per-pixel `Err(_) => None` would turn that into an all-NaN
+    // map rather than an error.
+    if let Some(table) = config.precomputed_base_xs() {
+        validate_base_xs(config.energies(), table, config.resonance_data())
+            .map_err(|e| PipelineError::InvalidParameter(format!("precomputed_base_xs: {e}")))?;
+    }
+
     // Reject non-finite / out-of-domain detector-cube VALUES up front —
     // before the (potentially multi-GB) transpose below and the shared
     // cross-section precompute — so bad input fails with a clear
@@ -1280,7 +1292,8 @@ pub fn spatial_map_typed(
     .map_err(PipelineError::Transmission)?;
     let aux_grid_active = !layout.is_identity();
 
-    // (xs = data-grid σ, work_xs = working-grid σ when an aux grid exists).
+    // (xs = data-grid σ, work_xs = working-grid σ when an aux grid exists,
+    // fixed_routes = the routes and negative-value counts of that build).
     let (xs, work_xs, fixed_routes) = match config.precomputed_cross_sections().cloned() {
         // Caller supplied data-grid σ.  When a Gaussian aux grid exists we
         // still need working-grid σ for the #608-correct path, so recompute it
@@ -1296,7 +1309,11 @@ pub fn spatial_map_typed(
                 instrument.as_ref(),
                 cancel,
             )?;
-            (cached, Some(Arc::new(working.sigma)), Some(working.routes))
+            (
+                cached,
+                Some(Arc::new(working.sigma)),
+                Some((working.routes, working.negative_values)),
+            )
         }
         None => {
             let working = broadened_cross_sections_on_working_grid(
@@ -1316,11 +1333,15 @@ pub fn spatial_map_typed(
                 (
                     Arc::new(data_xs),
                     Some(Arc::new(working.sigma)),
-                    Some(working.routes),
+                    Some((working.routes, working.negative_values)),
                 )
             } else {
                 // Working grid == data grid: σ is the data-grid σ directly.
-                (Arc::new(working.sigma), None, Some(working.routes))
+                (
+                    Arc::new(working.sigma),
+                    None,
+                    Some((working.routes, working.negative_values)),
+                )
             }
         }
     };
@@ -1608,11 +1629,13 @@ pub fn spatial_map_typed(
 
     // Decide the Doppler routes once for the whole map at the fit's upper
     // temperature bound and build the zero-kelvin rows only the
-    // sampled-table isotopes need; every pixel shares the plan, so no pixel
-    // re-evaluates the resonance equation. A caller-supplied zero-kelvin
-    // table supersedes the plan: every pixel broadens that table, so that
-    // is what the map discloses (never an edge fallback, so no warning),
-    // and no plan is built for it.
+    // sampled-table isotopes need; every pixel shares the plan, so a
+    // sampled-table isotope's zero-kelvin table is evaluated once for the
+    // map, while a continuous isotope is still integrated by every pixel at
+    // every temperature probe. A caller-supplied zero-kelvin table
+    // supersedes the plan: every pixel broadens that table, so that is
+    // what the map discloses (never an edge fallback, so no warning), and
+    // no plan is built for it.
     let mut planned_routes: Option<Vec<DopplerRoute>> = None;
     let fast_config = if config.fit_temperature() {
         let mut cfg = config
@@ -1771,12 +1794,14 @@ pub fn spatial_map_typed(
     // An energy-scale fit decides the route per pixel on the corrected grid,
     // so its disclosure is read off the pixel results after the loop; the
     // nominal-grid verdicts are what the other paths execute.
-    let disclosed = if config.fit_energy_scale() {
-        None
+    let (disclosed, fixed_negative_values) = if config.fit_energy_scale() {
+        (None, None)
     } else if config.fit_temperature() {
-        planned_routes
+        (planned_routes, None)
     } else {
-        fixed_routes
+        fixed_routes.map_or((None, None), |(routes, negative_values)| {
+            (Some(routes), Some(negative_values))
+        })
     };
     let mut doppler_routes: Option<Vec<IsotopeDopplerRoute>> = disclosed.map(|routes| {
         config
@@ -1798,6 +1823,19 @@ pub fn spatial_map_typed(
     };
     if let Some(routes) = &doppler_routes {
         warnings.extend(edge_warnings(routes));
+    }
+    // At a fixed temperature every pixel shares the working-grid σ built
+    // above, so its negative-value counts are the map's (SAMMY's "Negative
+    // cross section" print); the free-temperature paths report theirs per
+    // pixel, aggregated after the loop.
+    if let (Some(routes), Some(counts)) = (&doppler_routes, &fixed_negative_values) {
+        warnings.extend(
+            routes
+                .iter()
+                .zip(counts)
+                .filter_map(|(route, &count)| negative_values_warning(&route.isotope, count))
+                .inspect(|w| eprintln!("spatial_map_typed: warning: {w}")),
+        );
     }
 
     // Stage 1 (global mode): fit the baseline ONCE on the aggregated mean
@@ -2147,6 +2185,25 @@ pub fn spatial_map_typed(
         }
     }
 
+    if config.fit_temperature() || config.fit_energy_scale() {
+        let negative_pixels = results
+            .iter()
+            .filter(|(_, r)| {
+                r.warnings
+                    .iter()
+                    .any(|w| w.contains("broadened total cross-section value(s)"))
+            })
+            .count();
+        if negative_pixels > 0 {
+            let w = format!(
+                "Doppler: broadened total cross-section values are negative in {negative_pixels} \
+                 pixel(s) (SLBW interference; SAMMY reports the same)"
+            );
+            eprintln!("spatial_map_typed: warning: {w}");
+            warnings.push(w);
+        }
+    }
+
     Ok(SpatialResult {
         density_maps,
         uncertainty_maps,
@@ -2187,7 +2244,8 @@ mod tests {
     use crate::pipeline::{SolverConfig, UnifiedFitConfig};
     use nereids_endf::resonance::ResonanceFormalism;
     use nereids_endf::resonance::test_support::{
-        synthetic_single_resonance, u238_single_resonance, u238_with_formalism,
+        synthetic_single_resonance, synthetic_swave_slbw, u238_single_resonance,
+        u238_with_formalism,
     };
 
     /// Build a synthetic transmission stack of shape `(n_e, height, width)`
@@ -5657,6 +5715,101 @@ mod tests {
         };
         let per_pixel = fit_spectrum_typed(&pixel, &config).unwrap();
         assert_eq!(per_pixel.doppler_routes, result.doppler_routes);
+    }
+
+    /// A malformed caller-supplied table is an error at the entry point,
+    /// not an all-NaN map: inside the loop it would fail every pixel's
+    /// model constructor behind the per-pixel `Err(_) => None`.
+    #[test]
+    fn spatial_rejects_a_malformed_explicit_table() {
+        let rd = u238_single_resonance();
+        let energies: Vec<f64> = (0..101).map(|i| 4.0 + (i as f64) * 0.05).collect();
+        let (t_3d, u_3d) = synthetic_4x4_transmission(&rd, 0.001, &energies);
+        let data = InputData3D::Transmission {
+            transmission: t_3d.view(),
+            uncertainty: u_3d.view(),
+        };
+        let mut nan_table = vec![vec![1.0; energies.len()]];
+        nan_table[0][3] = f64::NAN;
+        for (table, expected) in [
+            (Vec::new(), "has 0 isotopes"),
+            (vec![vec![1.0; 5]], "has 5 energies"),
+            (nan_table, "[0][3] is not finite"),
+        ] {
+            let config = UnifiedFitConfig::new(
+                energies.clone(),
+                vec![rd.clone()],
+                vec!["U-238".into()],
+                300.0,
+                None,
+                vec![0.0005],
+            )
+            .unwrap()
+            .with_solver(SolverConfig::LevenbergMarquardt(LmConfig::default()))
+            .with_fit_temperature(true)
+            .with_precomputed_base_xs(Arc::new(table));
+            let error = spatial_map_typed(&data, &config, None, None, None).unwrap_err();
+            match error {
+                PipelineError::InvalidParameter(message) => {
+                    assert!(message.starts_with("precomputed_base_xs: "), "{message}");
+                    assert!(message.contains(expected), "{message}");
+                }
+                other => panic!("expected an invalid-parameter error, got {other:?}"),
+            }
+        }
+    }
+
+    /// Two same-J SLBW levels whose interference makes the total negative
+    /// near 20 keV: the fixed-temperature map warns per isotope from its
+    /// shared working-grid build, the free-temperature map from the pixels
+    /// that reported it.
+    #[test]
+    fn spatial_map_warns_about_negative_broadened_totals() {
+        let mut rd = synthetic_swave_slbw(55.45, 20_095.0, 30.0, 0.5, 5.0);
+        rd.ranges[0].l_groups[0]
+            .resonances
+            .push(nereids_endf::resonance::Resonance {
+                energy: 20_105.0,
+                j: 0.5,
+                gn: 30.0,
+                gg: 0.5,
+                gfa: 0.0,
+                gfb: 0.0,
+            });
+        let energies: Vec<f64> = (0..101).map(|i| 20_000.0 + (i as f64) * 0.5).collect();
+        let (t_3d, u_3d) = synthetic_grid_transmission(&rd, 0.001, &energies, 2, 2);
+        let data = InputData3D::Transmission {
+            transmission: t_3d.view(),
+            uncertainty: u_3d.view(),
+        };
+        for (fit_temperature, expected) in [
+            (false, "value(s) of U-238 are negative"),
+            (true, "values are negative in 4 pixel(s)"),
+        ] {
+            let config = UnifiedFitConfig::new(
+                energies.clone(),
+                vec![rd.clone()],
+                vec!["U-238".into()],
+                300.0,
+                None,
+                vec![0.001],
+            )
+            .unwrap()
+            .with_solver(SolverConfig::LevenbergMarquardt(LmConfig {
+                max_iter: 3,
+                ..LmConfig::default()
+            }))
+            .with_fit_temperature(fit_temperature);
+            let result = spatial_map_typed(&data, &config, None, None, None).unwrap();
+            assert!(
+                result
+                    .warnings
+                    .iter()
+                    .any(|w| w.starts_with("Doppler: ") && w.contains(expected)),
+                "fit_temperature={fit_temperature}: {:?}",
+                result.warnings
+            );
+        }
     }
 
     #[test]

@@ -1518,11 +1518,21 @@ fn spectrum_panel(ui: &mut egui::Ui, state: &mut AppState) {
             design::COUNTS_RESOLUTION_OVERLAY_MESSAGE,
         );
     }
+    // The overlay is evaluated on the grid the fit ran on — the fit-energy
+    // slice — so its Doppler routes are the fit's; the plot arrays are
+    // sliced to the same range.
     let fit_line = if count_resolution_overlay_unsupported {
         None
     } else {
         fit_result_for_overlay.as_ref().and_then(|result| {
             let energies = state.energies.as_ref()?;
+            let range = fit_grid_range(
+                energies,
+                state.fit_energy_range,
+                overlay_instrument.as_ref().map(|i| &i.resolution),
+            )
+            .ok()?;
+            let plot = range.start.min(n_plot)..range.end.min(n_plot);
             let (all_rd, density_indices, density_ratios) =
                 design::collect_all_resonance_data_with_mapping(state);
             design::build_fit_line(&design::FitLineParams {
@@ -1530,19 +1540,26 @@ fn spectrum_panel(ui: &mut egui::Ui, state: &mut AppState) {
                 resonance_data: &all_rd,
                 density_indices: &density_indices,
                 density_ratios: &density_ratios,
-                energies,
+                energies: &energies[range.clone()],
                 temperature_k: state.temperature_k,
-                x_values: &x_values,
-                n_plot,
+                x_values: &x_values[plot.clone()],
+                n_plot: plot.len(),
                 instrument: overlay_instrument.clone(),
                 y_multiplier: if show_counts {
-                    Some(&counts_scale)
+                    Some(&counts_scale[plot])
                 } else {
                     None
                 },
             })
         })
     };
+    let (fit_line, route_mismatch) = match fit_line {
+        Some(fit) => (Some(fit.line), fit.route_mismatch),
+        None => (None, None),
+    };
+    if let Some(message) = &route_mismatch {
+        ui.colored_label(crate::theme::semantic::ORANGE, message);
+    }
 
     // TOF position marker x-value
     let tof_marker_x = x_values
@@ -2045,11 +2062,30 @@ fn kernel_margin_ev(e_ev: f64, resolution: Option<&ResolutionFunction>) -> f64 {
     }
 }
 
+/// The slice of the loaded grid a fit runs on: the whole grid, or the
+/// fit-energy range extended by the kernel margin (SAMMY EMIN/EMAX, #514).
+/// The fit overlay and the residual view evaluate on the same slice, so
+/// what is drawn is what was fitted — the Doppler route gate reads the
+/// grid, and a display grid running past a resolved range would demote an
+/// isotope the fit range kept continuous.
+pub(crate) fn fit_grid_range(
+    energies: &[f64],
+    fit_energy_range: Option<(f64, f64)>,
+    resolution: Option<&ResolutionFunction>,
+) -> Result<Range<usize>, String> {
+    match fit_energy_range {
+        Some(range) => fit_energy_range_indices(energies, range, resolution),
+        None => Ok(0..energies.len()),
+    }
+}
+
 /// Compute extended-margin slice indices over `energies` for the
 /// active user-specified fit range `[e_min, e_max]`, applying a
 /// `FIT_RANGE_MARGIN_FWHM`×FWHM kernel margin on each side.  Returns
 /// the half-open `[lo, hi)` index range to apply to the energy grid
 /// and per-bin data arrays before passing to `UnifiedFitConfig`.
+/// Callers go through [`fit_grid_range`], which also covers the
+/// unrestricted case.
 ///
 /// Validation:
 /// - `e_min` and `e_max` must be finite and `e_min < e_max`.
@@ -2202,10 +2238,7 @@ fn build_fit_config(state: &AppState) -> Result<(UnifiedFitConfig, Range<usize>)
     )
     .map_err(|e| format!("{e} \u{2014} load a resolution file or disable broadening"))?;
 
-    let energy_range: Range<usize> = match state.fit_energy_range {
-        Some(range) => fit_energy_range_indices(full_energies, range, resolution.as_ref())?,
-        None => 0..full_energies.len(),
-    };
+    let energy_range = fit_grid_range(full_energies, state.fit_energy_range, resolution.as_ref())?;
     let energies: Vec<f64> = full_energies[energy_range.clone()].to_vec();
 
     let enabled: Vec<&IsotopeEntry> = state

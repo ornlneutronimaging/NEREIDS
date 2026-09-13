@@ -441,8 +441,11 @@ impl<'a> JointPoissonObjective<'a> {
     /// where `h_i = ∂² D / ∂ T_i²` is the per-bin deviance curvature
     /// `2·(O_i + S_i)·c / (T_i·(1 + c·T_i)²)` (Fisher-scoring form derived
     /// from binomial logit-link Var(S | N) = N·p·(1−p) with d logit p / dT
-    /// = 1/T — see the module-level docstring §Model).  Returns `Ok(None)`
-    /// only if the base model evaluation itself fails.
+    /// = 1/T — see the module-level docstring §Model).  A perturbed probe
+    /// the model refuses (an energy-scale probe across a resolved-range
+    /// edge, say) leaves its column at zero, as [`Self::deviance_gradient_fd`]
+    /// does, so a converged fit next to such an edge still gets a
+    /// covariance; only a failing base evaluation is an error.
     pub fn fisher_information_fd(
         &self,
         params: &mut ParameterSet,
@@ -461,11 +464,19 @@ impl<'a> JointPoissonObjective<'a> {
         for (col, &idx) in free_idx.iter().enumerate() {
             let original = params.params[idx].value;
             let step = fd_step * (1.0 + original.abs());
+            // A probe the model refuses is treated like a non-finite one:
+            // the column stays at zero (mirroring `deviance_gradient_fd`).
             params.params[idx].value = original + step;
             params.params[idx].clamp();
             let forward_step = params.params[idx].value - original;
             let t_plus = if forward_step.abs() >= PIVOT_FLOOR {
-                Some(self.model.evaluate(&params.all_values())?)
+                match self.model.evaluate(&params.all_values()) {
+                    Ok(t) => Some(t),
+                    Err(_) => {
+                        params.params[idx].value = original;
+                        continue;
+                    }
+                }
             } else {
                 None
             };
@@ -473,7 +484,13 @@ impl<'a> JointPoissonObjective<'a> {
             params.params[idx].clamp();
             let backward_step = original - params.params[idx].value;
             let t_minus = if backward_step.abs() >= PIVOT_FLOOR {
-                Some(self.model.evaluate(&params.all_values())?)
+                match self.model.evaluate(&params.all_values()) {
+                    Ok(t) => Some(t),
+                    Err(_) => {
+                        params.params[idx].value = original;
+                        continue;
+                    }
+                }
             } else {
                 None
             };
@@ -3071,6 +3088,40 @@ mod tests {
                 "fisher_information_fd produced non-finite entry: {v}"
             );
         }
+    }
+
+    /// A perturbed probe the model refuses with `Err` skips its column,
+    /// as `deviance_gradient_fd` does, instead of failing the whole
+    /// Fisher matrix: a converged energy-scale fit whose `+h` probe
+    /// crosses a resolved-range edge still gets a covariance.
+    #[test]
+    fn test_fisher_information_fd_skips_a_refused_probe() {
+        struct RefusingProbe;
+        impl FitModel for RefusingProbe {
+            fn evaluate(&self, params: &[f64]) -> Result<Vec<f64>, FittingError> {
+                if params[0] > 0.6 {
+                    return Err(FittingError::EvaluationFailed("route change".into()));
+                }
+                Ok(vec![params[0]; 3])
+            }
+        }
+        let model = RefusingProbe;
+        let o = vec![10.0; 3];
+        let s = vec![5.0; 3];
+        let obj = JointPoissonObjective {
+            model: &model,
+            o: &o,
+            s: &s,
+            c: 1.0,
+            active_mask: None,
+        };
+        let mut params = ParameterSet::new(vec![FitParameter::non_negative("T", 0.6)]);
+        let info = obj
+            .fisher_information_fd(&mut params, 1e-2)
+            .expect("a refused probe must not fail the Fisher matrix")
+            .expect("the base point is finite");
+        assert_eq!(info.get(0, 0), 0.0, "the refused column is skipped");
+        assert_eq!(params.params[0].value, 0.6, "the parameter is restored");
     }
 
     // ==================================================================

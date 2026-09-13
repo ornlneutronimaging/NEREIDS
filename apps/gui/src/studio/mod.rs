@@ -355,7 +355,7 @@ fn analysis_spectrum_column(ui: &mut egui::Ui, state: &mut AppState) {
         .collect();
     let measured_line = Line::new("Measured", measured_points);
 
-    // Fit curve (if available)
+    // Fit curve (if available), evaluated on the grid the fit ran on.
     let fit_line = state.pixel_fit_result.as_ref().and_then(|result| {
         let energies = state.energies.as_ref()?;
         let (all_rd, density_indices, density_ratios) =
@@ -368,19 +368,33 @@ fn analysis_spectrum_column(ui: &mut egui::Ui, state: &mut AppState) {
         .ok()
         .flatten()
         .map(|r| Arc::new(nereids_physics::transmission::InstrumentParams { resolution: r }));
+        let range = crate::guided::analyze::fit_grid_range(
+            energies,
+            state.fit_energy_range,
+            instrument.as_ref().map(|i| &i.resolution),
+        )
+        .ok()?;
+        let plot = range.start.min(n_plot)..range.end.min(n_plot);
         design::build_fit_line(&design::FitLineParams {
             result,
             resonance_data: &all_rd,
             density_indices: &density_indices,
             density_ratios: &density_ratios,
-            energies,
+            energies: &energies[range],
             temperature_k: state.temperature_k,
-            x_values: &x_values,
-            n_plot,
+            x_values: &x_values[plot.clone()],
+            n_plot: plot.len(),
             instrument,
             y_multiplier: None,
         })
     });
+    let (fit_line, route_mismatch) = match fit_line {
+        Some(fit) => (Some(fit.line), fit.route_mismatch),
+        None => (None, None),
+    };
+    if let Some(message) = &route_mismatch {
+        ui.colored_label(crate::theme::semantic::ORANGE, message);
+    }
 
     // Spectrum plot
     let plot_height = ui.available_height().clamp(200.0, 400.0);
@@ -967,19 +981,32 @@ fn build_residuals_cache(
             (None, Some(sr)) => (sr.temperature_map.is_some(), sr.doppler_routes.as_deref()),
             (None, None) => (false, None),
         };
+    // Residuals are formed on the grid the fit ran on (the fit-energy
+    // slice), so the model is gated the way the fit gated.
+    let range = crate::guided::analyze::fit_grid_range(
+        energies,
+        state.fit_energy_range,
+        instrument.as_ref().map(|i| &i.resolution),
+    )
+    .ok()?;
+    let fit_energies = &energies[range.clone()];
     let model = design::build_overlay_model(
-        energies.clone(),
+        fit_energies.to_vec(),
         resonance_data,
         temperature_k,
         instrument,
         (density_indices, density_ratios),
         free_temperature,
         disclosed_routes,
-    )?;
+    )?
+    .model;
 
     use nereids_fitting::lm::FitModel;
     let fitted = model.evaluate(densities).ok()?;
-    let n_plot = n_tof.min(energies.len()).min(fitted.len());
+    let n_plot = n_tof
+        .saturating_sub(range.start)
+        .min(fit_energies.len())
+        .min(fitted.len());
     if n_plot == 0 {
         return None;
     }
@@ -989,10 +1016,10 @@ fn build_residuals_cache(
     let mut sum_sq = 0.0;
     let mut max_abs = 0.0f64;
     for i in 0..n_plot {
-        let meas = norm.transmission[[i, py, px]];
+        let meas = norm.transmission[[range.start + i, py, px]];
         let res = meas - fitted[i];
         if res.is_finite() {
-            residuals.push((energies[i], res));
+            residuals.push((fit_energies[i], res));
             sum_sq += res * res;
             max_abs = max_abs.max(res.abs());
         }

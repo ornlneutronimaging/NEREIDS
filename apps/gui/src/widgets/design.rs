@@ -1070,16 +1070,32 @@ pub(crate) struct FitLineParams<'a> {
     pub y_multiplier: Option<&'a [f64]>,
 }
 
+/// The model that redraws a fit result, and whether its Doppler routes are
+/// the ones the fit disclosed.
+pub(crate) struct OverlayModel {
+    /// The forward model at the displayed temperature, gated the way the
+    /// fit gated.
+    pub model: nereids_fitting::transmission_model::TransmissionFitModel,
+    /// A user-facing line when the overlay's routes differ from the routes
+    /// the result disclosed (the isotope set, grid or resolution changed
+    /// since the fit): the overlay is drawn, but it is not the fitted curve.
+    pub route_mismatch: Option<String>,
+}
+
 /// The model that redraws a fit result: the forward model at the displayed
 /// temperature with the Doppler routes decided the way the fit decided them.
 ///
-/// A free-temperature fit gates its routes once at the fit's upper bound;
-/// redrawing at the fitted temperature must gate there too, or an isotope
-/// the fit demoted to the sampled table near a range edge would be redrawn
-/// through the continuous integral. A fixed-temperature fit gated at that
-/// temperature. The plan's routes are compared with the routes the result
-/// disclosed and a disagreement is logged at debug level: the overlay is
-/// still drawn, but the log says it is not the fit's curve.
+/// `energies` must be the grid the fit ran on — the fit-energy slice, not
+/// the whole loaded grid (see `analyze::fit_grid_range`) — because the
+/// route gate reads the grid: an acquisition that runs past the resolved
+/// range demotes an isotope on the whole grid while the fit range inside
+/// it stays continuous. A free-temperature fit gates its routes once at
+/// the fit's upper bound; redrawing at the fitted temperature must gate
+/// there too, or an isotope the fit demoted to the sampled table near a
+/// range edge would be redrawn through the continuous integral. A
+/// fixed-temperature fit gated at that temperature. The plan's routes are
+/// compared with the routes the result disclosed and a disagreement is
+/// returned as [`OverlayModel::route_mismatch`] for the caller to show.
 ///
 /// Returns `None` when the model or its plan cannot be built (the caller
 /// then draws no overlay, as before).
@@ -1091,7 +1107,7 @@ pub(crate) fn build_overlay_model(
     density_mapping: (Vec<usize>, Vec<f64>),
     free_temperature: bool,
     disclosed_routes: Option<&[nereids_physics::doppler_route::IsotopeDopplerRoute]>,
-) -> Option<nereids_fitting::transmission_model::TransmissionFitModel> {
+) -> Option<OverlayModel> {
     use nereids_fitting::transmission_model::{
         TEMPERATURE_FIT_UPPER_BOUND_K, TransmissionFitModel,
     };
@@ -1110,22 +1126,28 @@ pub(crate) fn build_overlay_model(
         None,
     )
     .ok()?;
-    if let Some(disclosed) = disclosed_routes {
+    let route_mismatch = disclosed_routes.and_then(|disclosed| {
         let agree = disclosed.len() == plan.routes().len()
             && disclosed
                 .iter()
                 .zip(plan.routes())
                 .all(|(d, p)| d.route.same_kind(p));
-        if !agree {
-            tracing::debug!(
-                gate_temperature_k,
-                disclosed = %disclosed.iter().map(ToString::to_string).collect::<Vec<_>>().join("; "),
-                overlay = %plan.routes().iter().map(ToString::to_string).collect::<Vec<_>>().join("; "),
-                "fit overlay Doppler routes differ from the routes the fit disclosed"
-            );
+        if agree {
+            return None;
         }
-    }
-    TransmissionFitModel::new(
+        let describe =
+            |routes: &mut dyn Iterator<Item = String>| routes.collect::<Vec<_>>().join("; ");
+        let message = format!(
+            "Fit overlay is not the fitted curve: its Doppler routes [{}] differ from the routes \
+             the fit disclosed [{}] (route gate at {gate_temperature_k} K); the isotope set, \
+             grid or resolution changed since the fit",
+            describe(&mut plan.routes().iter().map(ToString::to_string)),
+            describe(&mut disclosed.iter().map(ToString::to_string)),
+        );
+        tracing::warn!("{message}");
+        Some(message)
+    });
+    let model = TransmissionFitModel::new(
         energies,
         resonance_data,
         temperature_k,
@@ -1134,8 +1156,12 @@ pub(crate) fn build_overlay_model(
         None,
         None,
     )
-    .ok()
-    .map(|model| model.with_doppler_plan(Arc::new(plan)))
+    .ok()?
+    .with_doppler_plan(Arc::new(plan));
+    Some(OverlayModel {
+        model,
+        route_mismatch,
+    })
 }
 
 /// Counts and instrument resolution cannot share the transmission-only fit
@@ -1151,15 +1177,25 @@ pub(crate) const COUNTS_RESOLUTION_OVERLAY_MESSAGE: &str = "Count fit overlay hi
      R[Phi] and R[Phi*T]. Multiplying c*OB by R[T] is not a physical count model, so \
      the transmission-only overlay cannot represent a resolved count fit.";
 
+/// A fit overlay line and the route warning that goes with it, if any.
+pub(crate) struct FitLine {
+    pub line: Line<'static>,
+    /// See [`OverlayModel::route_mismatch`].
+    pub route_mismatch: Option<String>,
+}
+
 /// Build a fit overlay line from a `SpectrumFitResult`.
 ///
 /// Returns `None` if the fit didn't converge, no resonance data is provided,
 /// or model construction fails.
 ///
-/// `resonance_data` should contain data for ALL fitted entities
-/// (individual isotopes + group members). `density_indices` and `density_ratios`
-/// map each resonance data entry to a density parameter index and its abundance ratio.
-pub(crate) fn build_fit_line(p: &FitLineParams<'_>) -> Option<Line<'static>> {
+/// `energies`, `x_values` and `y_multiplier` are the fit's slice of the
+/// loaded grid, index-aligned with each other (see
+/// `analyze::fit_grid_range`). `resonance_data` should contain data for ALL
+/// fitted entities (individual isotopes + group members). `density_indices`
+/// and `density_ratios` map each resonance data entry to a density
+/// parameter index and its abundance ratio.
+pub(crate) fn build_fit_line(p: &FitLineParams<'_>) -> Option<FitLine> {
     if counts_resolution_overlay_unsupported(p.y_multiplier.is_some(), p.instrument.is_some()) {
         return None;
     }
@@ -1171,7 +1207,10 @@ pub(crate) fn build_fit_line(p: &FitLineParams<'_>) -> Option<Line<'static>> {
     }
     let resonance_data: Vec<_> = p.resonance_data.to_vec();
     let overlay_temp = p.result.temperature_k.unwrap_or(p.temperature_k);
-    let model = build_overlay_model(
+    let OverlayModel {
+        model,
+        route_mismatch,
+    } = build_overlay_model(
         p.energies.to_vec(),
         resonance_data,
         overlay_temp,
@@ -1243,11 +1282,12 @@ pub(crate) fn build_fit_line(p: &FitLineParams<'_>) -> Option<Line<'static>> {
             [p.x_values[i], y]
         })
         .collect();
-    Some(
-        Line::new("Fit", fit_points)
+    Some(FitLine {
+        line: Line::new("Fit", fit_points)
             .width(1.25_f32)
             .color(egui::Color32::from_rgba_unmultiplied(0, 122, 255, 170)),
-    )
+        route_mismatch,
+    })
 }
 
 // ── Resonance Data Collection ──────────────────────────────────
@@ -1299,9 +1339,12 @@ mod tests {
     use super::{build_overlay_model, counts_resolution_overlay_unsupported};
     use nereids_endf::resonance::ResonanceFormalism;
     use nereids_endf::resonance::test_support::u238_with_formalism;
-    use nereids_fitting::lm::FitModel;
+    use nereids_fitting::lm::{FitModel, LmConfig};
     use nereids_fitting::transmission_model::TransmissionFitModel;
     use nereids_physics::doppler_route::{DopplerRoute, SampledTableReason};
+    use nereids_pipeline::pipeline::{
+        InputData, SolverConfig, UnifiedFitConfig, fit_spectrum_typed,
+    };
 
     #[test]
     fn count_overlay_is_suppressed_only_with_active_resolution() {
@@ -1332,6 +1375,7 @@ mod tests {
                 None,
             )
             .unwrap()
+            .model
         };
 
         let free = build(true);
@@ -1369,6 +1413,97 @@ mod tests {
                 .zip(forward.evaluate(&[0.001]).unwrap())
                 .any(|(a, b)| (a - b).abs() > 1e-9),
             "the two routes must differ for the gate to matter"
+        );
+    }
+
+    /// A loaded grid whose tail (9-9.3 eV) leaves an MLBW range ending at
+    /// 8 eV demotes the isotope on the whole grid; a fit restricted to
+    /// 4-6.9 eV is continuous. The overlay built on the fit's grid takes
+    /// the fit's routes; built on the display grid it would not, and the
+    /// helper says so instead of drawing a different curve silently.
+    #[test]
+    fn overlay_on_the_fit_grid_takes_the_fit_routes() {
+        let mut near_edge = u238_with_formalism(ResonanceFormalism::MLBW);
+        near_edge.ranges[0].energy_high = 8.0;
+        let mut display_grid: Vec<f64> = (0..201).map(|i| 4.0 + (i as f64) * 0.0145).collect();
+        display_grid.extend((0..4).map(|i| 9.0 + (i as f64) * 0.1));
+        let fit_grid = display_grid[..201].to_vec();
+
+        let truth = TransmissionFitModel::new(
+            fit_grid.clone(),
+            vec![near_edge.clone()],
+            300.0,
+            None,
+            (vec![0], vec![1.0]),
+            None,
+            None,
+        )
+        .unwrap();
+        let transmission = truth.evaluate(&[0.001]).unwrap();
+        let uncertainty = vec![0.01; transmission.len()];
+        let config = UnifiedFitConfig::new(
+            fit_grid.clone(),
+            vec![near_edge.clone()],
+            vec!["U-238".into()],
+            300.0,
+            None,
+            vec![0.0012],
+        )
+        .unwrap()
+        .with_solver(SolverConfig::LevenbergMarquardt(LmConfig {
+            max_iter: 5,
+            ..LmConfig::default()
+        }));
+        let result = fit_spectrum_typed(
+            &InputData::Transmission {
+                transmission,
+                uncertainty,
+            },
+            &config,
+        )
+        .unwrap();
+        let disclosed = result.doppler_routes.as_deref().unwrap();
+        assert!(matches!(
+            disclosed[0].route,
+            DopplerRoute::Continuous {
+                formalism: ResonanceFormalism::MLBW
+            }
+        ));
+
+        let overlay = |grid: Vec<f64>| {
+            build_overlay_model(
+                grid,
+                vec![near_edge.clone()],
+                300.0,
+                None,
+                (vec![0], vec![1.0]),
+                result.temperature_k.is_some(),
+                Some(disclosed),
+            )
+            .unwrap()
+        };
+        let on_fit_grid = overlay(fit_grid);
+        assert_eq!(on_fit_grid.route_mismatch, None);
+        let routes = on_fit_grid.model.doppler_routes().unwrap().unwrap();
+        assert_eq!(routes.len(), disclosed.len());
+        assert!(
+            routes
+                .iter()
+                .zip(disclosed)
+                .all(|(overlay, fit)| fit.route.same_kind(overlay))
+        );
+
+        let on_display_grid = overlay(display_grid);
+        let mismatch = on_display_grid
+            .route_mismatch
+            .expect("the display grid demotes the isotope, which the fit did not");
+        assert!(
+            mismatch.contains("grid energy 9.00e0 eV lies outside the resolved MLBW range"),
+            "{mismatch}"
+        );
+        assert!(
+            mismatch.contains("continuous free-gas integral"),
+            "{mismatch}"
         );
     }
 }
