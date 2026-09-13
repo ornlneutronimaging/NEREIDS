@@ -1132,7 +1132,14 @@ pub(crate) fn display_as_counts(state: &AppState) -> bool {
         && !matches!(state.input_mode, InputMode::TransmissionTiff)
 }
 
-fn selected_pixel_fit_result_for_overlay(
+/// The fit result to redraw at one pixel: the explicit single-pixel fit
+/// when there is one, else the spatial map's per-pixel values assembled
+/// into the same type. `None` when neither has a converged fit there.
+///
+/// Every redraw of that pixel — the spectrum overlay and the residual dock
+/// — goes through this one assembly, so they cannot disagree about what the
+/// fit produced.
+pub(crate) fn selected_pixel_fit_result_for_overlay(
     state: &AppState,
     y: usize,
     x: usize,
@@ -1554,7 +1561,7 @@ fn spectrum_panel(ui: &mut egui::Ui, state: &mut AppState) {
         })
     };
     let (fit_line, route_mismatch) = match fit_line {
-        Some(fit) => (Some(fit.line), fit.route_mismatch),
+        Some(fit) => (fit.line, fit.warning),
         None => (None, None),
     };
     if let Some(message) = &route_mismatch {

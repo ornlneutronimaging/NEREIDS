@@ -704,6 +704,12 @@ pub struct CachedResiduals {
     pub max_abs: f64,
     /// Number of finite residual points.
     pub n_points: usize,
+    /// The overlay's route-disagreement line, when the model these
+    /// residuals were taken against is not the one the fit disclosed (see
+    /// `design::OverlayModel::route_mismatch`). The residual dock shows it:
+    /// residuals against a differently-routed model are as untrustworthy as
+    /// the curve the spectrum panel warns about.
+    pub warning: Option<String>,
 }
 
 /// Main application state.

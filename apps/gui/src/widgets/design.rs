@@ -1070,6 +1070,155 @@ pub(crate) struct FitLineParams<'a> {
     pub y_multiplier: Option<&'a [f64]>,
 }
 
+/// The energy grid the fitted physics was evaluated on, for `nominal` —
+/// the fit's slice of the loaded grid.
+///
+/// An energy-scale fit (SAMMY TZERO) solves for `(t0, L_scale)` and
+/// evaluates the resonance physics at the CALIBRATED energies, never at the
+/// nominal ones. Every redraw of such a fit has to map the same grid
+/// through the same transform or it shows a curve the fit never computed,
+/// displaced wherever the calibration is not the identity. The transform
+/// comes from the result itself — [`nereids_pipeline::pipeline::SpectrumFitResult::corrected_energies`]
+/// reuses the fitter's own `corrected_energy_grid` with the flight path the
+/// fit was configured with — so no redraw re-derives it.
+///
+/// Returns the nominal grid unchanged when the energy scale was not fitted.
+///
+/// # Errors
+/// A user-facing line when the stored calibration does not map this grid to
+/// physical energies (a degenerate `t0` at or past its shortest flight
+/// time). The fitted curve cannot be reproduced then, and saying so is
+/// better than drawing the un-calibrated one.
+pub(crate) fn fitted_physics_energies(
+    result: &nereids_pipeline::pipeline::SpectrumFitResult,
+    nominal: &[f64],
+) -> Result<Vec<f64>, String> {
+    match result.corrected_energies(nominal) {
+        None => Ok(nominal.to_vec()),
+        Some(Ok(corrected)) => Ok(corrected),
+        Some(Err(e)) => Err(format!(
+            "Fit curve hidden: the fitted energy scale (t0 = {t0} \u{b5}s, L_scale = {l_scale}) \
+             does not map this grid to physical energies ({e})",
+            t0 = result.t0_us.unwrap_or(f64::NAN),
+            l_scale = result.l_scale.unwrap_or(f64::NAN),
+        )),
+    }
+}
+
+/// The fitted forward model's curve on the fit's grid:
+///
+/// ```text
+/// y(E) = B(E)·[Anorm·T(E) + BackA + BackB/√E + BackC·√E + BackD·exp(−BackF/√E)]
+/// ```
+///
+/// `transmission` is the inner physics model's output, evaluated on the
+/// CALIBRATED grid (see [`fitted_physics_energies`]).
+/// `nominal_energies` are the NOMINAL energies of the same bins, because
+/// the fit composes the SAMMY background polynomial and the `ln(E/E_ref)`
+/// baseline on the nominal grid — `fit_transmission_lm` wraps the physics
+/// model in `NormalizedTransmissionModel` / `MultiplicativeBaselineModel`
+/// with `config.energies()` — while only the inner physics moves with the
+/// fitted energy scale.
+///
+/// Shared by the spectrum overlay and the residual dock so the two cannot
+/// disagree about what the fit predicted: a residual taken against bare
+/// Beer-Lambert transmission carries the whole background and baseline as
+/// fake signal.
+pub(crate) fn compose_fitted_curve(
+    result: &nereids_pipeline::pipeline::SpectrumFitResult,
+    nominal_energies: &[f64],
+    transmission: &[f64],
+) -> Vec<f64> {
+    let n = nominal_energies.len().min(transmission.len());
+    (0..n)
+        .map(|i| {
+            let e = nominal_energies[i];
+            let bg_poly = if e > 0.0 && e.is_finite() {
+                let sqrt_e = e.sqrt();
+                // `back_d` / `back_f` are `Option<f64>`: `None` means
+                // "exponential tail not fit" (counts-KL path, LM with
+                // `fit_back_d=false`, or a project reload that dropped
+                // the unpersisted maps).  Drop the tail term entirely
+                // in that case.  SAMMY pairs BackD/BackF, so
+                // `(Some, Some)` is the only arm that fires in
+                // practice.
+                let exp_tail = match (result.back_d, result.back_f) {
+                    (Some(bd), Some(bf)) => bd * (-bf / sqrt_e).exp(),
+                    _ => 0.0,
+                };
+                result.background[0]
+                    + result.background[1] / sqrt_e
+                    + result.background[2] * sqrt_e
+                    + exp_tail
+            } else {
+                // Non-positive or non-finite energy: skip the polynomial.
+                // BackB/√E and BackD·exp(-BackF/√E) blow up at E ≤ 0, and
+                // the spectrum already filters non-finite x via
+                // build_spectrum_x_axis.
+                0.0
+            };
+            let y = result.anorm * transmission[i] + bg_poly;
+            // Issue #635: the multiplicative baseline is OUTERMOST —
+            // y = B(E)·[Anorm·T + additive background] — reconstructed with
+            // the EXACT E_ref the fit used (stored on the result).  `None`
+            // (baseline not fit, or a reload that dropped it) leaves the
+            // curve unchanged.
+            match (result.baseline, result.baseline_e_ref_ev) {
+                (Some(b), Some(e_ref)) if e > 0.0 && e.is_finite() && e_ref > 0.0 => {
+                    let z = (e / e_ref).ln();
+                    (b[0] + b[1] * z + b[2] * z * z) * y
+                }
+                _ => y,
+            }
+        })
+        .collect()
+}
+
+/// What the residual dock shows for one fit: the per-bin residuals and
+/// their summary statistics.
+pub(crate) struct FitResiduals {
+    /// `(nominal energy eV, measured − fitted)` for every finite residual.
+    pub residuals: Vec<(f64, f64)>,
+    pub rms: f64,
+    pub max_abs: f64,
+}
+
+/// Residuals of `measured` against the fitted forward model — measured
+/// minus the SAME curve the overlay draws (see [`compose_fitted_curve`]),
+/// so the dock's plot, RMS and Max|r| describe the fit that was actually
+/// performed. Bins whose residual is not finite are dropped, as they
+/// cannot be plotted or summarised.
+pub(crate) fn fit_residuals(
+    result: &nereids_pipeline::pipeline::SpectrumFitResult,
+    nominal_energies: &[f64],
+    transmission: &[f64],
+    measured: &[f64],
+) -> FitResiduals {
+    let fitted = compose_fitted_curve(result, nominal_energies, transmission);
+    let n = fitted.len().min(measured.len());
+    let mut residuals = Vec::with_capacity(n);
+    let mut sum_sq = 0.0;
+    let mut max_abs = 0.0_f64;
+    for i in 0..n {
+        let res = measured[i] - fitted[i];
+        if res.is_finite() {
+            residuals.push((nominal_energies[i], res));
+            sum_sq += res * res;
+            max_abs = max_abs.max(res.abs());
+        }
+    }
+    let rms = if residuals.is_empty() {
+        0.0
+    } else {
+        (sum_sq / residuals.len() as f64).sqrt()
+    };
+    FitResiduals {
+        residuals,
+        rms,
+        max_abs,
+    }
+}
+
 /// The model that redraws a fit result, and whether its Doppler routes are
 /// the ones the fit disclosed.
 pub(crate) struct OverlayModel {
@@ -1085,8 +1234,10 @@ pub(crate) struct OverlayModel {
 /// The model that redraws a fit result: the forward model at the displayed
 /// temperature with the Doppler routes decided the way the fit decided them.
 ///
-/// `energies` must be the grid the fit ran on — the fit-energy slice, not
-/// the whole loaded grid (see `analyze::fit_grid_range`) — because the
+/// `energies` must be the grid the fit evaluated the physics on: the
+/// fit-energy slice, not the whole loaded grid (see
+/// `analyze::fit_grid_range`), mapped through the fitted energy scale (see
+/// [`fitted_physics_energies`]) — because the
 /// route gate reads the grid: an acquisition that runs past the resolved
 /// range demotes an isotope on the whole grid while the fit range inside
 /// it stays continuous. A free-temperature fit gates its routes once at
@@ -1126,22 +1277,37 @@ pub(crate) fn build_overlay_model(
         None,
     )
     .ok()?;
+    // Label the plan's routes with the isotopes they were decided for, as
+    // the fit's own disclosure is labelled: a positional comparison of the
+    // bare routes answers "same kind of route" for a DIFFERENT isotope,
+    // so swapping one Reich-Moore isotope for another would agree and the
+    // redrawn curve would be presented as the fitted one.
+    let overlay_routes: Vec<nereids_physics::doppler_route::IsotopeDopplerRoute> = resonance_data
+        .iter()
+        .zip(plan.routes())
+        .map(
+            |(rd, route)| nereids_physics::doppler_route::IsotopeDopplerRoute {
+                isotope: rd.isotope,
+                route: route.clone(),
+            },
+        )
+        .collect();
     let route_mismatch = disclosed_routes.and_then(|disclosed| {
-        let agree = disclosed.len() == plan.routes().len()
+        let agree = disclosed.len() == overlay_routes.len()
             && disclosed
                 .iter()
-                .zip(plan.routes())
-                .all(|(d, p)| d.route.same_kind(p));
+                .zip(&overlay_routes)
+                .all(|(d, o)| d.same_kind(o));
         if agree {
             return None;
         }
         let describe =
             |routes: &mut dyn Iterator<Item = String>| routes.collect::<Vec<_>>().join("; ");
         let message = format!(
-            "Fit overlay is not the fitted curve: its Doppler routes [{}] differ from the routes \
-             the fit disclosed [{}] (route gate at {gate_temperature_k} K); the isotope set, \
-             grid or resolution changed since the fit",
-            describe(&mut plan.routes().iter().map(ToString::to_string)),
+            "Fit overlay is not the fitted curve: it redraws [{}] where the fit disclosed [{}] \
+             (route gate at {gate_temperature_k} K); the isotope set, grid or resolution changed \
+             since the fit",
+            describe(&mut overlay_routes.iter().map(ToString::to_string)),
             describe(&mut disclosed.iter().map(ToString::to_string)),
         );
         tracing::warn!("{message}");
@@ -1177,11 +1343,16 @@ pub(crate) const COUNTS_RESOLUTION_OVERLAY_MESSAGE: &str = "Count fit overlay hi
      R[Phi] and R[Phi*T]. Multiplying c*OB by R[T] is not a physical count model, so \
      the transmission-only overlay cannot represent a resolved count fit.";
 
-/// A fit overlay line and the route warning that goes with it, if any.
+/// A fit overlay line and the warning that goes with it, if any.
 pub(crate) struct FitLine {
-    pub line: Line<'static>,
-    /// See [`OverlayModel::route_mismatch`].
-    pub route_mismatch: Option<String>,
+    /// `None` when the fitted curve cannot be reproduced — currently a
+    /// degenerate energy-scale calibration, which `warning` then explains.
+    /// Drawing nothing is the honest outcome: the alternative is a curve
+    /// the fit never computed.
+    pub line: Option<Line<'static>>,
+    /// A user-facing line to show beside the plot: an
+    /// [`OverlayModel::route_mismatch`], or the reason no curve is drawn.
+    pub warning: Option<String>,
 }
 
 /// Build a fit overlay line from a `SpectrumFitResult`.
@@ -1207,11 +1378,26 @@ pub(crate) fn build_fit_line(p: &FitLineParams<'_>) -> Option<FitLine> {
     }
     let resonance_data: Vec<_> = p.resonance_data.to_vec();
     let overlay_temp = p.result.temperature_k.unwrap_or(p.temperature_k);
+    // The physics is redrawn on the grid the fit evaluated it on — the
+    // nominal slice mapped through the fitted energy scale — while the
+    // x-axis, the SAMMY background polynomial and the ln(E/E_ref) baseline
+    // stay on the NOMINAL grid, because that is how the fit composed them
+    // (see `compose_fitted_curve`).
+    let physics_energies = match fitted_physics_energies(p.result, p.energies) {
+        Ok(grid) => grid,
+        Err(message) => {
+            tracing::warn!("{message}");
+            return Some(FitLine {
+                line: None,
+                warning: Some(message),
+            });
+        }
+    };
     let OverlayModel {
         model,
         route_mismatch,
     } = build_overlay_model(
-        p.energies.to_vec(),
+        physics_energies,
         resonance_data,
         overlay_temp,
         p.instrument.clone(),
@@ -1222,71 +1408,29 @@ pub(crate) fn build_fit_line(p: &FitLineParams<'_>) -> Option<FitLine> {
 
     use nereids_fitting::lm::FitModel;
     let fitted_t = model.evaluate(&p.result.densities).ok()?;
-    let n_fit = p.n_plot.min(fitted_t.len()).min(p.x_values.len());
-    // Apply the fitted Anorm + SAMMY 6-term background polynomial so the
-    // overlay matches the actual forward model the solver fitted, not just
-    // bare Beer-Lambert transmission.
-    //
-    //   y = Anorm · T(E) + BackA + BackB/√E + BackC·√E + BackD·exp(-BackF/√E)
-    //
-    // Then `y_multiplier` (= c·OB[i] in counts mode) scales the result to
-    // the displayed y-axis.  When bg fit was absent, the pipeline emits
-    // `anorm = 1.0` and `background = [0, 0, 0]` (the joint-Poisson
-    // convention — see `fit_counts_joint_poisson`'s background readout
-    // fallback in pipeline.rs), so this reduces to bare T·multiplier — i.e.
-    // identical to the pre-fix overlay for fits without background.
+    // Compose the fitted Anorm, SAMMY background and multiplicative
+    // baseline so the overlay is the forward model the solver fitted, not
+    // bare Beer-Lambert transmission.  `y_multiplier` (= c·OB[i] in counts
+    // mode) then scales the result to the displayed y-axis.
+    let composed = compose_fitted_curve(p.result, p.energies, &fitted_t);
+    let n_fit = p.n_plot.min(composed.len()).min(p.x_values.len());
     let fit_points: PlotPoints = (0..n_fit)
         .filter(|&i| p.x_values[i].is_finite())
         .map(|i| {
-            let e = p.energies.get(i).copied().unwrap_or(f64::NAN);
-            let bg_poly = if e > 0.0 && e.is_finite() {
-                let sqrt_e = e.sqrt();
-                // `back_d` / `back_f` are `Option<f64>`: `None` means
-                // "exponential tail not fit" (counts-KL path, LM with
-                // `fit_back_d=false`, or a project reload that dropped
-                // the unpersisted maps).  Drop the tail term entirely
-                // in that case.  SAMMY pairs BackD/BackF, so
-                // `(Some, Some)` is the only arm that fires in
-                // practice.
-                let exp_tail = match (p.result.back_d, p.result.back_f) {
-                    (Some(bd), Some(bf)) => bd * (-bf / sqrt_e).exp(),
-                    _ => 0.0,
-                };
-                p.result.background[0]
-                    + p.result.background[1] / sqrt_e
-                    + p.result.background[2] * sqrt_e
-                    + exp_tail
-            } else {
-                // Non-positive or non-finite energy: skip the polynomial.
-                // BackB/√E and BackD·exp(-BackF/√E) blow up at E ≤ 0, and
-                // the spectrum already filters non-finite x via build_spectrum_x_axis.
-                0.0
-            };
-            let y_corrected = p.result.anorm * fitted_t[i] + bg_poly;
-            // Issue #635: the multiplicative baseline is OUTERMOST —
-            // y = B(E)·[Anorm·T + additive background] — reconstructed with
-            // the EXACT E_ref the fit used (stored on the result).  `None`
-            // (baseline not fit, or a reload that dropped it) leaves the
-            // overlay unchanged.
-            let y_corrected = match (p.result.baseline, p.result.baseline_e_ref_ev) {
-                (Some(b), Some(e_ref)) if e > 0.0 && e.is_finite() && e_ref > 0.0 => {
-                    let z = (e / e_ref).ln();
-                    (b[0] + b[1] * z + b[2] * z * z) * y_corrected
-                }
-                _ => y_corrected,
-            };
             let y = match p.y_multiplier {
-                Some(m) if i < m.len() => m[i] * y_corrected,
-                _ => y_corrected,
+                Some(m) if i < m.len() => m[i] * composed[i],
+                _ => composed[i],
             };
             [p.x_values[i], y]
         })
         .collect();
     Some(FitLine {
-        line: Line::new("Fit", fit_points)
-            .width(1.25_f32)
-            .color(egui::Color32::from_rgba_unmultiplied(0, 122, 255, 170)),
-        route_mismatch,
+        line: Some(
+            Line::new("Fit", fit_points)
+                .width(1.25_f32)
+                .color(egui::Color32::from_rgba_unmultiplied(0, 122, 255, 170)),
+        ),
+        warning: route_mismatch,
     })
 }
 
@@ -1336,15 +1480,94 @@ pub(crate) fn collect_all_resonance_data_with_mapping(
 
 #[cfg(test)]
 mod tests {
-    use super::{build_overlay_model, counts_resolution_overlay_unsupported};
+    use super::{
+        FitLineParams, build_fit_line, build_overlay_model, compose_fitted_curve,
+        counts_resolution_overlay_unsupported, fit_residuals, fitted_physics_energies,
+    };
+    use egui_plot::{PlotGeometry, PlotItem};
     use nereids_endf::resonance::ResonanceFormalism;
     use nereids_endf::resonance::test_support::u238_with_formalism;
     use nereids_fitting::lm::{FitModel, LmConfig};
     use nereids_fitting::transmission_model::TransmissionFitModel;
-    use nereids_physics::doppler_route::{DopplerRoute, SampledTableReason};
+    use nereids_physics::doppler_route::{DopplerRoute, IsotopeDopplerRoute, SampledTableReason};
     use nereids_pipeline::pipeline::{
-        InputData, SolverConfig, UnifiedFitConfig, fit_spectrum_typed,
+        InputData, SolverConfig, SpectrumFitResult, UnifiedFitConfig, fit_spectrum_typed,
     };
+
+    /// A converged single-density result whose SAMMY energy scale is
+    /// `(t0_us, L_scale = 1)` on a 25 m flight path, with nothing else
+    /// composed on top of the transmission.
+    fn energy_scale_result(t0_us: f64) -> SpectrumFitResult {
+        SpectrumFitResult {
+            densities: vec![0.001],
+            uncertainties: None,
+            reduced_chi_squared: 1.0,
+            converged: true,
+            iterations: 3,
+            temperature_k: None,
+            temperature_k_unc: None,
+            anorm: 1.0,
+            background: [0.0; 3],
+            back_d: None,
+            back_f: None,
+            t0_us: Some(t0_us),
+            l_scale: Some(1.0),
+            energy_scale_flight_path_m: Some(25.0),
+            deviance_per_dof: None,
+            baseline: None,
+            baseline_e_ref_ev: None,
+            warnings: Vec::new(),
+            doppler_routes: None,
+        }
+    }
+
+    /// A grid across the U-238 6.674 eV line.
+    fn line_grid() -> Vec<f64> {
+        (0..161).map(|i| 6.0 + (i as f64) * 0.01).collect()
+    }
+
+    /// The U-238 MLBW transmission at density 1e-3 on `grid`, 293.6 K.
+    fn curve_on(rd: &nereids_endf::resonance::ResonanceData, grid: Vec<f64>) -> Vec<f64> {
+        TransmissionFitModel::new(
+            grid,
+            vec![rd.clone()],
+            293.6,
+            None,
+            (vec![0], vec![1.0]),
+            None,
+            None,
+        )
+        .unwrap()
+        .evaluate(&[0.001])
+        .unwrap()
+    }
+
+    fn drawn_y(line: &egui_plot::Line<'static>) -> Vec<f64> {
+        match line.geometry() {
+            PlotGeometry::Points(points) => points.iter().map(|p| p.y).collect(),
+            _ => panic!("a fit overlay line is built from explicit points"),
+        }
+    }
+
+    fn fit_line_of(
+        result: &SpectrumFitResult,
+        rd: &nereids_endf::resonance::ResonanceData,
+        nominal: &[f64],
+    ) -> super::FitLine {
+        build_fit_line(&FitLineParams {
+            result,
+            resonance_data: std::slice::from_ref(rd),
+            density_indices: &[0],
+            density_ratios: &[1.0],
+            energies: nominal,
+            temperature_k: 293.6,
+            x_values: nominal,
+            n_plot: nominal.len(),
+            instrument: None,
+            y_multiplier: None,
+        })
+        .expect("a converged result with resonance data draws something")
+    }
 
     #[test]
     fn count_overlay_is_suppressed_only_with_active_resolution() {
@@ -1505,5 +1728,186 @@ mod tests {
             mismatch.contains("continuous free-gas integral"),
             "{mismatch}"
         );
+    }
+
+    /// An energy-scale fit evaluated the physics at the CALIBRATED energies.
+    /// The drawn curve must be that one — on a U-238 line a 1 µs t₀ moves
+    /// the transmission by more than 0.05, so redrawing on the nominal grid
+    /// is a visibly different curve presented as the fit.
+    #[test]
+    fn fit_line_redraws_the_physics_on_the_fitted_energy_scale() {
+        let rd = u238_with_formalism(ResonanceFormalism::MLBW);
+        let nominal = line_grid();
+        let result = energy_scale_result(1.0);
+
+        let calibrated = curve_on(
+            &rd,
+            result
+                .corrected_energies(&nominal)
+                .expect("the energy scale was fitted")
+                .expect("and is not degenerate"),
+        );
+        let uncalibrated = curve_on(&rd, nominal.clone());
+        let displacement = calibrated
+            .iter()
+            .zip(&uncalibrated)
+            .map(|(a, b)| (a - b).abs())
+            .fold(0.0_f64, f64::max);
+        assert!(
+            displacement > 0.05,
+            "the calibrated and nominal grids must give visibly different curves for this \
+             test to mean anything, got {displacement}"
+        );
+
+        let fit = fit_line_of(&result, &rd, &nominal);
+        assert_eq!(fit.warning, None);
+        assert_eq!(drawn_y(fit.line.as_ref().unwrap()), calibrated);
+    }
+
+    /// The drawn curve is the whole fitted forward model — Anorm, the SAMMY
+    /// background and the multiplicative baseline — and it is
+    /// `compose_fitted_curve` that produces it, which is what the residual
+    /// dock subtracts from the measurement.
+    #[test]
+    fn the_drawn_curve_is_the_fitted_composition_not_bare_transmission() {
+        let rd = u238_with_formalism(ResonanceFormalism::MLBW);
+        let nominal = line_grid();
+        let mut result = energy_scale_result(0.0);
+        result.anorm = 0.97;
+        result.background = [0.02, 0.01, 0.003];
+        result.back_d = Some(0.05);
+        result.back_f = Some(1.5);
+        result.baseline = Some([1.01, -0.02, 0.004]);
+        result.baseline_e_ref_ev = Some(6.7);
+
+        // The identity energy scale isolates the composition.
+        let transmission = curve_on(&rd, nominal.clone());
+        let composed = compose_fitted_curve(&result, &nominal, &transmission);
+        let gap = composed
+            .iter()
+            .zip(&transmission)
+            .map(|(a, b)| (a - b).abs())
+            .fold(0.0_f64, f64::max);
+        assert!(
+            gap > 0.05,
+            "the composition must differ from bare transmission for this test to mean \
+             anything, got {gap}"
+        );
+
+        let fit = fit_line_of(&result, &rd, &nominal);
+        assert_eq!(drawn_y(fit.line.as_ref().unwrap()), composed);
+    }
+
+    /// A `t0` past the grid's shortest flight time maps it to non-physical
+    /// energies. The fitted curve cannot be reproduced then, so none is
+    /// drawn and the caller is told why — the alternative is the
+    /// un-calibrated curve, silently.
+    #[test]
+    fn a_degenerate_energy_scale_hides_the_curve_and_says_why() {
+        let rd = u238_with_formalism(ResonanceFormalism::MLBW);
+        let nominal = line_grid();
+        let result = energy_scale_result(1.0e4);
+        assert!(fitted_physics_energies(&result, &nominal).is_err());
+
+        let fit = fit_line_of(&result, &rd, &nominal);
+        assert!(fit.line.is_none());
+        let warning = fit.warning.expect("the refusal reaches the caller");
+        assert!(
+            warning.contains("does not map this grid to physical energies"),
+            "{warning}"
+        );
+    }
+
+    /// A grid with no energy scale fitted is its own physics grid — `None`
+    /// on the result means "not fitted", not "fitted to the identity".
+    #[test]
+    fn an_unfitted_energy_scale_leaves_the_grid_alone() {
+        let mut result = energy_scale_result(1.0);
+        result.t0_us = None;
+        result.l_scale = None;
+        result.energy_scale_flight_path_m = None;
+        let nominal = line_grid();
+        assert_eq!(fitted_physics_energies(&result, &nominal).unwrap(), nominal);
+    }
+
+    /// The residual dock subtracts the same composed curve the overlay
+    /// draws. Against bare Beer-Lambert transmission the whole background
+    /// and baseline would land in the residual — and in the RMS and Max|r|
+    /// the dock reports — for any fit with those boxes ticked.
+    #[test]
+    fn residuals_are_taken_against_the_composed_fit() {
+        let rd = u238_with_formalism(ResonanceFormalism::MLBW);
+        let nominal = line_grid();
+        let mut result = energy_scale_result(0.0);
+        result.anorm = 0.97;
+        result.background = [0.1, 0.01, 0.003];
+
+        // A measurement that IS the fitted model: every residual is zero.
+        let transmission = curve_on(&rd, nominal.clone());
+        let measured = compose_fitted_curve(&result, &nominal, &transmission);
+        let stats = fit_residuals(&result, &nominal, &transmission, &measured);
+        assert_eq!(stats.residuals.len(), nominal.len());
+        assert_eq!(stats.max_abs, 0.0, "a perfect fit has no residual");
+        assert_eq!(stats.rms, 0.0);
+
+        // The same measurement against bare transmission would report the
+        // background as signal.
+        let bare = fit_residuals(
+            &SpectrumFitResult {
+                anorm: 1.0,
+                background: [0.0; 3],
+                ..energy_scale_result(0.0)
+            },
+            &nominal,
+            &transmission,
+            &measured,
+        );
+        assert!(
+            bare.max_abs > 0.05,
+            "the omitted composition must be a visible error, got {}",
+            bare.max_abs
+        );
+    }
+
+    /// Routes are compared WITH their isotopes: two different isotopes can
+    /// take the same kind of route, and a curve computed for another
+    /// isotope is not the fitted curve however much the routes agree.
+    #[test]
+    fn overlay_routes_are_compared_with_their_isotopes() {
+        let rd = u238_with_formalism(ResonanceFormalism::MLBW);
+        let energies = line_grid();
+        let mlbw = || DopplerRoute::Continuous {
+            formalisms: vec![ResonanceFormalism::MLBW],
+        };
+        let overlay = |disclosed: &[IsotopeDopplerRoute]| {
+            build_overlay_model(
+                energies.clone(),
+                vec![rd.clone()],
+                293.6,
+                None,
+                (vec![0], vec![1.0]),
+                false,
+                Some(disclosed),
+            )
+            .unwrap()
+        };
+
+        let other_isotope = [IsotopeDopplerRoute {
+            isotope: nereids_core::types::Isotope::new(72, 178).unwrap(),
+            route: mlbw(),
+        }];
+        let message = overlay(&other_isotope)
+            .route_mismatch
+            .expect("another isotope on the same kind of route is not the fitted curve");
+        assert!(
+            message.contains("U-238") && message.contains("Hf-178"),
+            "the message must name the isotope on both sides: {message}"
+        );
+
+        let same_isotope = [IsotopeDopplerRoute {
+            isotope: rd.isotope,
+            route: mlbw(),
+        }];
+        assert_eq!(overlay(&same_isotope).route_mismatch, None);
     }
 }

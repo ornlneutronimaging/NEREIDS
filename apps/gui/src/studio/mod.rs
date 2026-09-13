@@ -389,7 +389,7 @@ fn analysis_spectrum_column(ui: &mut egui::Ui, state: &mut AppState) {
         })
     });
     let (fit_line, route_mismatch) = match fit_line {
-        Some(fit) => (Some(fit.line), fit.route_mismatch),
+        Some(fit) => (fit.line, fit.warning),
         None => (None, None),
     };
     if let Some(message) = &route_mismatch {
@@ -791,22 +791,27 @@ fn dock_residuals(ui: &mut egui::Ui, state: &mut AppState) {
         }
     };
 
-    // Extract densities, temperature, chi2, and convergence from either
-    // pixel_fit_result (priority) or spatial_result.
-    let pixel_info = extract_pixel_fit_info(state, py, px);
-    let (densities, effective_temp, chi2_r, converged) = match pixel_info {
-        Some(info) => info,
+    // The whole fit result for this pixel — from `pixel_fit_result` when a
+    // single-pixel fit is loaded, else assembled from the spatial maps.
+    // The residual needs every piece of it, not just the densities: the
+    // fitted Anorm, background and baseline are part of what the fit
+    // predicted, and the fitted energy scale decides where the physics was
+    // evaluated.
+    let result = match crate::guided::analyze::selected_pixel_fit_result_for_overlay(state, py, px)
+    {
+        Some(result) => result,
         None => {
             ui.label(
-                egui::RichText::new("No fit data for this pixel.")
+                egui::RichText::new("No converged fit for this pixel.")
                     .small()
                     .color(colors.fg3),
             );
             return;
         }
     };
+    let effective_temp = result.temperature_k.unwrap_or(state.temperature_k);
 
-    if !converged {
+    if !result.converged {
         ui.label(
             egui::RichText::new("Fit did not converge \u{2014} no residuals to display.")
                 .small()
@@ -826,7 +831,7 @@ fn dock_residuals(ui: &mut egui::Ui, state: &mut AppState) {
     });
 
     if !cache_valid {
-        let new_cache = build_residuals_cache(state, (py, px), &densities, effective_temp, chi2_r);
+        let new_cache = build_residuals_cache(state, &result, (py, px), effective_temp);
         state.residuals_cache = new_cache;
     }
 
@@ -843,6 +848,13 @@ fn dock_residuals(ui: &mut egui::Ui, state: &mut AppState) {
             return;
         }
     };
+
+    // The residual is measured minus the model the overlay draws, so a
+    // route disagreement makes these numbers as untrustworthy as the curve
+    // in the spectrum panel: say so here too rather than only there.
+    if let Some(message) = &cache.warning {
+        ui.colored_label(crate::theme::semantic::ORANGE, message);
+    }
 
     // Stats row
     design::stat_row(
@@ -883,56 +895,22 @@ fn dock_residuals(ui: &mut egui::Ui, state: &mut AppState) {
         });
 }
 
-/// Extract per-pixel fit info from `pixel_fit_result` or `spatial_result`.
+/// Build the residuals cache by constructing the overlay model, evaluating
+/// the fitted forward model, and computing residuals against measured data.
 ///
-/// Returns `(densities, effective_temperature, chi2_r, converged)`.
-fn extract_pixel_fit_info(
-    state: &AppState,
-    py: usize,
-    px: usize,
-) -> Option<(Vec<f64>, f64, f64, bool)> {
-    // Prefer pixel_fit_result (from explicit Fit Pixel / Fit ROI).
-    if let Some(ref result) = state.pixel_fit_result {
-        let temp = result.temperature_k.unwrap_or(state.temperature_k);
-        return Some((
-            result.densities.clone(),
-            temp,
-            result.reduced_chi_squared,
-            result.converged,
-        ));
-    }
-
-    // Fall back to spatial_result maps.
-    let sr = state.spatial_result.as_ref()?;
-    if py >= sr.converged_map.nrows() || px >= sr.converged_map.ncols() {
-        return None;
-    }
-    let n_isotopes = sr.density_maps.len();
-    if n_isotopes == 0 {
-        return None;
-    }
-    let densities: Vec<f64> = (0..n_isotopes)
-        .map(|i| sr.density_maps[i][[py, px]])
-        .collect();
-    let temp = sr
-        .temperature_map
-        .as_ref()
-        .map_or(state.temperature_k, |m| m[[py, px]]);
-    let chi2_r = sr.chi_squared_map[[py, px]];
-    let converged = sr.converged_map[[py, px]];
-    Some((densities, temp, chi2_r, converged))
-}
-
-/// Build the residuals cache by constructing a `TransmissionFitModel`, evaluating
-/// the forward model, and computing residuals against measured data.
+/// `result` is the fit being redrawn, and the residual is measured minus
+/// the SAME composed curve the spectrum panel plots — the physics on the
+/// fitted energy scale, then Anorm, the SAMMY background and the
+/// multiplicative baseline (see `design::compose_fitted_curve`). Residuals
+/// against bare Beer-Lambert transmission would carry every one of those
+/// terms as fake signal, in the plot and in the displayed RMS / Max|r|.
 ///
 /// Returns `None` if any prerequisite is missing (no energies, etc.).
 fn build_residuals_cache(
     state: &AppState,
+    result: &nereids_pipeline::pipeline::SpectrumFitResult,
     pixel: (usize, usize),
-    densities: &[f64],
     temperature_k: f64,
-    chi2_r: f64,
 ) -> Option<crate::state::CachedResiduals> {
     let energies = state.energies.as_ref()?;
     let norm = state.normalized.as_ref()?;
@@ -953,7 +931,7 @@ fn build_residuals_cache(
 
     // Guard: density parameter count must match the mapping's expected count.
     let n_density_params = density_indices.iter().max().map_or(0, |&m| m + 1);
-    if densities.len() != n_density_params {
+    if result.densities.len() != n_density_params {
         return None; // stale result with different isotope config
     }
 
@@ -969,20 +947,9 @@ fn build_residuals_cache(
         .map(|resolution| std::sync::Arc::new(InstrumentParams { resolution }))
     };
 
-    // The same preference order as `extract_pixel_fit_info`: the explicit
-    // pixel fit, else the spatial map. A free-temperature fit gated its
-    // routes at the fit's upper bound; the overlay must gate there too.
-    let (free_temperature, disclosed_routes) =
-        match (&state.pixel_fit_result, &state.spatial_result) {
-            (Some(result), _) => (
-                result.temperature_k.is_some(),
-                result.doppler_routes.as_deref(),
-            ),
-            (None, Some(sr)) => (sr.temperature_map.is_some(), sr.doppler_routes.as_deref()),
-            (None, None) => (false, None),
-        };
     // Residuals are formed on the grid the fit ran on (the fit-energy
-    // slice), so the model is gated the way the fit gated.
+    // slice), so the model is gated the way the fit gated: a
+    // free-temperature fit gated its routes at the fit's upper bound.
     let range = crate::guided::analyze::fit_grid_range(
         energies,
         state.fit_energy_range,
@@ -990,46 +957,44 @@ fn build_residuals_cache(
     )
     .ok()?;
     let fit_energies = &energies[range.clone()];
-    let model = design::build_overlay_model(
-        fit_energies.to_vec(),
+    // The physics is evaluated where the fit evaluated it — the nominal
+    // slice through the fitted energy scale — while the residual's x-axis
+    // and the composed background / baseline stay nominal.
+    let physics_energies = match design::fitted_physics_energies(result, fit_energies) {
+        Ok(grid) => grid,
+        Err(message) => {
+            tracing::warn!("{message}");
+            return None;
+        }
+    };
+    let design::OverlayModel {
+        model,
+        route_mismatch,
+    } = design::build_overlay_model(
+        physics_energies,
         resonance_data,
         temperature_k,
         instrument,
         (density_indices, density_ratios),
-        free_temperature,
-        disclosed_routes,
-    )?
-    .model;
+        result.temperature_k.is_some(),
+        result.doppler_routes.as_deref(),
+    )?;
 
     use nereids_fitting::lm::FitModel;
-    let fitted = model.evaluate(densities).ok()?;
-    let n_plot = n_tof
-        .saturating_sub(range.start)
-        .min(fit_energies.len())
-        .min(fitted.len());
-    if n_plot == 0 {
+    let transmission = model.evaluate(&result.densities).ok()?;
+    let n_measured = n_tof.saturating_sub(range.start).min(fit_energies.len());
+    let measured: Vec<f64> = (0..n_measured)
+        .map(|i| norm.transmission[[range.start + i, py, px]])
+        .collect();
+    let design::FitResiduals {
+        residuals,
+        rms,
+        max_abs,
+    } = design::fit_residuals(result, fit_energies, &transmission, &measured);
+    if residuals.is_empty() {
         return None;
     }
-
-    // Compute residuals and statistics.
-    let mut residuals = Vec::with_capacity(n_plot);
-    let mut sum_sq = 0.0;
-    let mut max_abs = 0.0f64;
-    for i in 0..n_plot {
-        let meas = norm.transmission[[range.start + i, py, px]];
-        let res = meas - fitted[i];
-        if res.is_finite() {
-            residuals.push((fit_energies[i], res));
-            sum_sq += res * res;
-            max_abs = max_abs.max(res.abs());
-        }
-    }
     let n_points = residuals.len();
-    let rms = if n_points > 0 {
-        (sum_sq / n_points as f64).sqrt()
-    } else {
-        0.0
-    };
 
     Some(crate::state::CachedResiduals {
         fit_gen: state.fit_result_gen,
@@ -1038,11 +1003,12 @@ fn build_residuals_cache(
         resolution_mode: state.resolution_mode.clone(),
         flight_path_m: state.beamline.flight_path_m,
         temperature_k,
-        chi2_r,
+        chi2_r: result.reduced_chi_squared,
         residuals,
         rms,
         max_abs,
         n_points,
+        warning: route_mismatch,
     })
 }
 
@@ -1373,6 +1339,14 @@ fn isotopes_card(ui: &mut egui::Ui, state: &mut AppState) {
                 );
                 if state.isotope_entries[i].enabled != prev_enabled {
                     state.mark_dirty(GuidedStep::Analyze);
+                    // Enabling or disabling an isotope changes the model the
+                    // result was fitted with, but not `fit_result_gen` — so
+                    // the residual cache would still test as valid and the
+                    // dock would go on showing residuals against the
+                    // previous isotope set. Drop both, as the group toggle
+                    // below does.
+                    state.pixel_fit_result = None;
+                    state.residuals_cache = None;
                 }
 
                 // Colored dot + symbol
