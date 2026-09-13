@@ -23,10 +23,10 @@ use serde::{Deserialize, Serialize};
 
 /// Which Doppler evaluation route one isotope took, for the whole grid.
 ///
-/// The three tiers are fixed by the physics contract, so the enum is
-/// exhaustive: a matcher that forgets one is a bug the compiler should
-/// report. Serializable so a saved project can restore the routes a fit
-/// disclosed.
+/// The two tiers and the unbroadened case are fixed by the physics
+/// contract, so the enum is exhaustive: a matcher that forgets one is a
+/// bug the compiler should report. Serializable so a saved project can
+/// restore the routes a fit disclosed.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub enum DopplerRoute {
     /// No Doppler broadening was applied (temperature ≤ 0 K). Nothing is
@@ -62,12 +62,27 @@ pub enum SampledTableReason {
     /// the resonance source, so no tier-1 condition was tested.
     ExplicitTable,
     /// The range covering `energy_ev` is not a resolved SLBW/MLBW range
-    /// (`Some`), or no evaluable range covers `energy_ev` at all (`None`).
+    /// (`Some`), or no range covers `energy_ev` and the source has no
+    /// resolved SLBW/MLBW range at all (`None`).
     Formalism {
         /// Grid energy at which the condition failed (eV).
         energy_ev: f64,
         /// Formalism of the covering range, if any.
         formalism: Option<ResonanceFormalism>,
+    },
+    /// No range covers `energy_ev`, although the source has a resolved
+    /// SLBW/MLBW range: the grid, or its auxiliary extension, reaches past
+    /// the resolved region, so the whole grid is demoted. The bounds are
+    /// those of the resolved SLBW/MLBW range nearest to `energy_ev`.
+    GridLeavesResolvedRange {
+        /// Grid energy at which the condition failed (eV).
+        energy_ev: f64,
+        /// Lower edge of the nearest resolved SLBW/MLBW range (eV).
+        range_low_ev: f64,
+        /// Upper edge of that range (eV).
+        range_high_ev: f64,
+        /// Formalism of that range.
+        formalism: ResonanceFormalism,
     },
     /// `√E ≤ 8u` at `energy_ev`: the thermal support window would fold
     /// through zero energy.
@@ -137,13 +152,13 @@ impl DopplerRoute {
     /// when the grid moves. A caller that must hold the route fixed across
     /// grids — the energy-scale model, whose working grid follows every
     /// `(t0, L_scale)` probe — compares kinds, not the reported energies.
+    /// Two continuous routes are the same kind whatever their formalism:
+    /// a grid spanning adjacent SLBW and MLBW ranges is tier 1 at every
+    /// energy, and the disclosed formalism is only that of the lowest one.
     pub fn same_kind(&self, other: &Self) -> bool {
         match (self, other) {
-            (DopplerRoute::Unbroadened, DopplerRoute::Unbroadened) => true,
-            (
-                DopplerRoute::Continuous { formalism: a },
-                DopplerRoute::Continuous { formalism: b },
-            ) => a == b,
+            (DopplerRoute::Unbroadened, DopplerRoute::Unbroadened)
+            | (DopplerRoute::Continuous { .. }, DopplerRoute::Continuous { .. }) => true,
             (
                 DopplerRoute::SampledTable { reason: a },
                 DopplerRoute::SampledTable { reason: b },
@@ -206,6 +221,10 @@ impl SampledTableReason {
                 R::WindowCrossesRangeBoundary { formalism: a, .. },
                 R::WindowCrossesRangeBoundary { formalism: b, .. },
             )
+            | (
+                R::GridLeavesResolvedRange { formalism: a, .. },
+                R::GridLeavesResolvedRange { formalism: b, .. },
+            )
             | (R::File3Background { formalism: a, .. }, R::File3Background { formalism: b, .. }) => {
                 a == b
             }
@@ -243,6 +262,7 @@ pub fn edge_fallback_warning(
         SampledTableReason::ExplicitTable | SampledTableReason::Formalism { .. } => return None,
         SampledTableReason::ThermalWindowFoldsThroughZero { formalism, .. }
         | SampledTableReason::WindowCrossesRangeBoundary { formalism, .. }
+        | SampledTableReason::GridLeavesResolvedRange { formalism, .. }
         | SampledTableReason::OverlappingRange { formalism, .. }
         | SampledTableReason::File3Background { formalism, .. } => *formalism,
     };
@@ -320,6 +340,17 @@ impl fmt::Display for SampledTableReason {
                      resolved range at {edge:.2e} eV"
                 )
             }
+            SampledTableReason::GridLeavesResolvedRange {
+                energy_ev,
+                range_low_ev,
+                range_high_ev,
+                formalism,
+            } => write!(
+                f,
+                "grid energy {energy_ev:.2e} eV lies outside the resolved {} range \
+                 [{range_low_ev:.2e}, {range_high_ev:.2e}] eV",
+                formalism_name(*formalism)
+            ),
             SampledTableReason::OverlappingRange {
                 energy_ev,
                 other_range_index,
@@ -358,6 +389,15 @@ mod tests {
             range_low_ev: 1e-5,
             range_high_ev: 1e4,
             formalism: ResonanceFormalism::MLBW,
+        }
+    }
+
+    fn grid_reason(formalism: ResonanceFormalism) -> SampledTableReason {
+        SampledTableReason::GridLeavesResolvedRange {
+            energy_ev: 255.0,
+            range_low_ev: 1e-5,
+            range_high_ev: 250.0,
+            formalism,
         }
     }
 
@@ -418,6 +458,10 @@ mod tests {
             (
                 window_reason(),
                 "thermal window [9.81e3, 1.02e4] eV leaves the resolved range at 1.00e4 eV",
+            ),
+            (
+                grid_reason(ResonanceFormalism::MLBW),
+                "grid energy 2.55e2 eV lies outside the resolved MLBW range [1.00e-5, 2.50e2] eV",
             ),
             (
                 SampledTableReason::OverlappingRange {
@@ -495,6 +539,7 @@ mod tests {
         );
         for reason in [
             window_reason(),
+            grid_reason(ResonanceFormalism::SLBW),
             SampledTableReason::ThermalWindowFoldsThroughZero {
                 energy_ev: 1e-3,
                 thermal_u: 0.1,
@@ -532,6 +577,21 @@ mod tests {
         );
         let fixed = edge_fallback_warning(&route, 293.6).unwrap();
         assert!(fixed.ends_with("(route gate at 293.6 K)"));
+
+        let grid = IsotopeDopplerRoute {
+            isotope: hf177(),
+            route: DopplerRoute::SampledTable {
+                reason: grid_reason(ResonanceFormalism::SLBW),
+            },
+        };
+        assert_eq!(
+            edge_fallback_warning(&grid, 293.6).as_deref(),
+            Some(
+                "Doppler: Hf-177 took the sampled-table route although it is resolved SLBW: \
+                 grid energy 2.55e2 eV lies outside the resolved SLBW range [1.00e-5, 2.50e2] eV \
+                 (route gate at 293.6 K)"
+            )
+        );
     }
 
     #[test]
@@ -560,7 +620,7 @@ mod tests {
     }
 
     #[test]
-    fn same_kind_ignores_the_reported_energy_but_not_the_reason_or_formalism() {
+    fn same_kind_ignores_the_reported_energy_and_compares_tier_then_reason() {
         let rm_at = |energy_ev: f64| DopplerRoute::SampledTable {
             reason: SampledTableReason::Formalism {
                 energy_ev,
@@ -599,13 +659,25 @@ mod tests {
         };
         assert!(!window_reason().same_kind(&slbw_window));
         assert!(!window_reason().same_kind(&SampledTableReason::ExplicitTable));
+        let mut moved_grid = grid_reason(ResonanceFormalism::MLBW);
+        if let SampledTableReason::GridLeavesResolvedRange { energy_ev, .. } = &mut moved_grid {
+            *energy_ev += 10.0;
+        }
+        assert!(grid_reason(ResonanceFormalism::MLBW).same_kind(&moved_grid));
+        assert!(
+            !grid_reason(ResonanceFormalism::MLBW)
+                .same_kind(&grid_reason(ResonanceFormalism::SLBW))
+        );
+        assert!(!grid_reason(ResonanceFormalism::MLBW).same_kind(&window_reason()));
 
+        // Both continuous routes are tier 1; an energy-scale probe that
+        // crosses an SLBW/MLBW boundary keeps the tier and is not refused.
         let continuous = |formalism| DopplerRoute::Continuous { formalism };
         assert!(
             continuous(ResonanceFormalism::MLBW).same_kind(&continuous(ResonanceFormalism::MLBW))
         );
         assert!(
-            !continuous(ResonanceFormalism::MLBW).same_kind(&continuous(ResonanceFormalism::SLBW))
+            continuous(ResonanceFormalism::MLBW).same_kind(&continuous(ResonanceFormalism::SLBW))
         );
         assert!(!continuous(ResonanceFormalism::MLBW).same_kind(&DopplerRoute::Unbroadened));
         assert!(DopplerRoute::Unbroadened.same_kind(&DopplerRoute::Unbroadened));

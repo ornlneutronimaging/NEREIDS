@@ -315,7 +315,9 @@ impl std::error::Error for ContinuousDopplerError {}
 ///
 /// 1. the range covering the energy is a resolved, evaluable SLBW or MLBW
 ///    range (under the same half-open boundary convention as the
-///    cross-section dispatcher);
+///    cross-section dispatcher); an energy no range covers is a
+///    grid-leaves-range failure naming the nearest resolved SLBW/MLBW
+///    range when the source has one, a formalism failure otherwise;
 /// 2. `√E > 8u`, so the window does not fold through zero;
 /// 3. the window `[(√E − 8u)², (√E + 8u)²]` lies inside that range — on a
 ///    half-open upper bound the window's top must stay strictly below it,
@@ -387,6 +389,35 @@ fn is_tier_one_formalism(range: &ResonanceRange) -> bool {
         )
 }
 
+/// The reason for an energy no range covers: the nearest resolved
+/// SLBW/MLBW range when the source has one, so a grid reaching past the
+/// resolved region is disclosed as such and warned about; a formalism
+/// failure without a formalism otherwise.
+fn uncovered_energy_reason(data: &ResonanceData, energy_ev: f64) -> SampledTableReason {
+    let distance = |range: &ResonanceRange| {
+        (range.energy_low - energy_ev)
+            .max(energy_ev - range.energy_high)
+            .max(0.0)
+    };
+    match data
+        .ranges
+        .iter()
+        .filter(|range| is_tier_one_formalism(range))
+        .min_by(|a, b| distance(a).total_cmp(&distance(b)))
+    {
+        Some(range) => SampledTableReason::GridLeavesResolvedRange {
+            energy_ev,
+            range_low_ev: range.energy_low,
+            range_high_ev: range.energy_high,
+            formalism: range.formalism,
+        },
+        None => SampledTableReason::Formalism {
+            energy_ev,
+            formalism: None,
+        },
+    }
+}
+
 /// The tier-1 conditions at one energy; `Ok` carries the covering range's
 /// index and formalism.
 fn tier_one_check(
@@ -408,10 +439,7 @@ fn tier_one_check(
         .find(|entry| entry.1.is_evaluable() && covers(*entry))
         .or_else(|| data.ranges.iter().enumerate().find(|entry| covers(*entry)));
     let Some((index, range)) = covering else {
-        return Err(SampledTableReason::Formalism {
-            energy_ev,
-            formalism: None,
-        });
+        return Err(uncovered_energy_reason(data, energy_ev));
     };
     if !is_tier_one_formalism(range) {
         return Err(SampledTableReason::Formalism {
@@ -719,7 +747,9 @@ impl TargetContext<'_, '_> {
     }
 }
 
-fn validate_energies(energies: &[f64]) -> Result<(), ContinuousDopplerError> {
+/// Every energy finite and positive, the grid strictly ascending — the
+/// contract of every broadener and of the route query.
+pub(crate) fn validate_energies(energies: &[f64]) -> Result<(), ContinuousDopplerError> {
     for (index, &energy) in energies.iter().enumerate() {
         if !energy.is_finite() || energy <= 0.0 {
             return Err(ContinuousDopplerError::InvalidEnergy {
@@ -1179,11 +1209,38 @@ mod tests {
     }
 
     #[test]
-    fn energy_outside_every_range_is_a_formalism_failure_without_a_formalism() {
+    fn energy_outside_every_range_names_the_nearest_tier_one_range_or_no_formalism() {
         let data = u238_with_formalism(ResonanceFormalism::MLBW);
         let thermal_u = DopplerParams::new(ROOM_K, data.awr).unwrap().u();
+        // Above and below the single MLBW range [1e-5, 1e4] eV: the grid
+        // leaves the resolved region, and the verdict names that range.
+        for energy_ev in [2.5e4, 5e-6] {
+            assert_eq!(
+                classify_isotope(&data, &[energy_ev], thermal_u),
+                DopplerRoute::SampledTable {
+                    reason: SampledTableReason::GridLeavesResolvedRange {
+                        energy_ev,
+                        range_low_ev: 1e-5,
+                        range_high_ev: 1e4,
+                        formalism: ResonanceFormalism::MLBW,
+                    }
+                }
+            );
+        }
+        // The lowest failing energy is the one reported, and the demotion is
+        // an edge fallback that earns a warning.
+        let verdict = classify_isotope(&data, &[6.0, 1.5e4, 2.5e4], thermal_u);
+        assert!(matches!(
+            verdict,
+            DopplerRoute::SampledTable {
+                reason: SampledTableReason::GridLeavesResolvedRange { energy_ev, .. }
+            } if energy_ev == 1.5e4
+        ));
+        assert!(verdict.is_edge_fallback());
+        // A source without any tier-1 range has no range to name.
+        let reich_moore = u238_with_formalism(ResonanceFormalism::ReichMoore);
         assert_eq!(
-            classify_isotope(&data, &[2.5e4], thermal_u),
+            classify_isotope(&reich_moore, &[2.5e4], thermal_u),
             DopplerRoute::SampledTable {
                 reason: SampledTableReason::Formalism {
                     energy_ev: 2.5e4,
@@ -1489,7 +1546,8 @@ mod tests {
     /// Lorentzian tails), which is how SAMMY's `Dopfgm` integrates; the
     /// sampled route in this crate reproduces the same 8.0e-3 against the
     /// same reference (`doppler::tests::test_sammy_ex001_fgm_doppler`).
-    /// The gate is held at 1e-2; the wing agreement is pinned at 1e-4.
+    /// The gate is held at 8.5e-3, so a further 0.4 % of drift over the
+    /// measured 7.7e-3 fails; the wing agreement is pinned at 1e-4.
     #[test]
     fn sammy_ex001_full_curve_through_tier_one() {
         let data = ex001_hydrogen_single_resonance();
@@ -1526,7 +1584,7 @@ mod tests {
             "ex001 tier 1: max_rel_err={max_rel:.3e} at E={} eV (ours {} vs SAMMY {})",
             energies[worst_index], ours[worst_index], reference[worst_index]
         );
-        assert!(max_rel < 0.01, "max relative error {max_rel:.3e}");
+        assert!(max_rel < 8.5e-3, "max relative error {max_rel:.3e}");
 
         // Free-gas broadening conserves ∫E·σ dE, so the ratio of the two
         // curves' trapezoid areas over SAMMY's own energies isolates an
@@ -1744,6 +1802,60 @@ mod tests {
             derivative_rel <= 1.0e-10,
             "derivative: adaptive={:.16e} trapezoid={oracle_derivative:.16e} rel={derivative_rel:.3e}",
             derivatives[0]
+        );
+    }
+
+    /// Oracle (e): the kernel width, with nothing taken from
+    /// `DopplerParams::u`.
+    ///
+    /// The free-gas kernel is Gaussian in the speed `√E` with width `u`, so
+    /// for a line far narrower than the Doppler width `Δ_D = 2√E_r·u =
+    /// √(4·E_r·k_B·T/A)` the broadened `E·σ(E)` is `exp(−(√E − √E_r)²/u²)`
+    /// (the `1/E` of the integral cancels the `E′` weight at the line):
+    /// its half-maximum points `√E_± = √E_r ± u√ln2` are
+    /// `E_+ − E_- = 2√ln2·Δ_D` apart, the Gaussian FWHM in energy. The
+    /// line here is Γ = 3 µeV against Δ_D ≈ 0.32 eV, so the Voigt
+    /// correction to the FWHM (≈ 0.535·Γ) is 3.0e-6 of it, and the linear
+    /// interpolation of the crossings on a 0.5 meV grid is below 1e-7.
+    /// Measured 3.03e-6 — the Voigt correction itself; the gate is set at
+    /// twice that.
+    #[test]
+    fn narrow_line_broadens_to_the_free_gas_fwhm() {
+        let (resonance_ev, temperature_k, awr) = (10.0_f64, 300.0_f64, 10.0_f64);
+        let data = synthetic_swave_slbw(awr, resonance_ev, 1.5e-6, 1.5e-6, 5.0);
+        let params = DopplerParams::new(temperature_k, awr).unwrap();
+        let doppler_width = (4.0 * resonance_ev * BOLTZMANN_EV_PER_K * temperature_k / awr).sqrt();
+        let expected_fwhm = 2.0 * 2.0_f64.ln().sqrt() * doppler_width;
+        assert!(
+            doppler_width > 1e4 * 3e-6,
+            "the line must be far narrower than the kernel"
+        );
+
+        let step = 5.0e-4;
+        let energies: Vec<f64> = (0..=2400).map(|i| 9.4 + i as f64 * step).collect();
+        let capture = broaden_channel(&energies, &data, &params, Channel::Capture, None).unwrap();
+        let profile: Vec<f64> = energies.iter().zip(&capture).map(|(e, s)| e * s).collect();
+        let half = 0.5 * profile.iter().copied().fold(f64::MIN, f64::max);
+        let crossing = |i: usize| {
+            energies[i]
+                + (half - profile[i]) / (profile[i + 1] - profile[i])
+                    * (energies[i + 1] - energies[i])
+        };
+        let rise = (0..profile.len() - 1)
+            .find(|&i| profile[i] < half && profile[i + 1] >= half)
+            .unwrap();
+        let fall = (rise + 1..profile.len() - 1)
+            .find(|&i| profile[i] >= half && profile[i + 1] < half)
+            .unwrap();
+        let fwhm = crossing(fall) - crossing(rise);
+        let rel = (fwhm - expected_fwhm).abs() / expected_fwhm;
+        eprintln!(
+            "free-gas FWHM: measured {fwhm:.9e} eV, Gaussian 2\u{221a}ln2\u{b7}\u{394}_D \
+             {expected_fwhm:.9e} eV, rel={rel:.3e}"
+        );
+        assert!(
+            rel <= 6.1e-6,
+            "FWHM {fwhm} vs {expected_fwhm}: rel={rel:.3e}"
         );
     }
 
