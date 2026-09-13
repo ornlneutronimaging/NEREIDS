@@ -163,6 +163,9 @@ pub fn snapshot_from_state(state: &AppState) -> ProjectSnapshot {
         baseline_e_ref_ev,
         baseline_maps,
         spatial_doppler_routes,
+        t0_us_map,
+        l_scale_map,
+        energy_scale_flight_path_m,
     ) = if let Some(ref sr) = state.spatial_result {
         (
             Some(sr.density_maps.clone()),
@@ -186,11 +189,17 @@ pub fn snapshot_from_state(state: &AppState) -> ProjectSnapshot {
             // reloaded map must still state the physics it was computed
             // with, as the single-pixel path already does.
             sr.doppler_routes.clone(),
+            // The fitted energy scale decides WHERE the physics was
+            // evaluated: without it a reloaded map redraws at the nominal
+            // energies, which is a different model.
+            sr.t0_us_map.clone(),
+            sr.l_scale_map.clone(),
+            sr.energy_scale_flight_path_m,
         )
     } else {
         (
             None, None, None, None, None, None, None, None, None, None, None, None, None, None,
-            None, None,
+            None, None, None, None, None,
         )
     };
 
@@ -210,6 +219,9 @@ pub fn snapshot_from_state(state: &AppState) -> ProjectSnapshot {
         single_fit_baseline,
         single_fit_baseline_e_ref_ev,
         single_fit_doppler_routes,
+        single_fit_t0_us,
+        single_fit_l_scale,
+        single_fit_energy_scale_flight_path_m,
     ) = if let Some(ref pfr) = state.pixel_fit_result {
         // Prefer labels from FitFeedback (captured at fit time) to avoid
         // desync if isotope_entries are modified after the fit.
@@ -241,10 +253,17 @@ pub fn snapshot_from_state(state: &AppState) -> ProjectSnapshot {
             pfr.baseline,
             pfr.baseline_e_ref_ev,
             pfr.doppler_routes.clone(),
+            // The fitted energy scale is part of the result the overlay
+            // redraws: the physics was evaluated at the calibrated
+            // energies, so all three travel with it.
+            pfr.t0_us,
+            pfr.l_scale,
+            pfr.energy_scale_flight_path_m,
         )
     } else {
         (
             None, None, None, None, None, None, None, None, None, None, None, None, None, None,
+            None, None, None,
         )
     };
 
@@ -399,6 +418,9 @@ pub fn snapshot_from_state(state: &AppState) -> ProjectSnapshot {
         baseline_e_ref_ev,
         baseline_maps,
         spatial_doppler_routes,
+        t0_us_map,
+        l_scale_map,
+        energy_scale_flight_path_m,
         single_fit_densities,
         single_fit_uncertainties,
         single_fit_chi_squared,
@@ -413,6 +435,9 @@ pub fn snapshot_from_state(state: &AppState) -> ProjectSnapshot {
         single_fit_baseline,
         single_fit_baseline_e_ref_ev,
         single_fit_doppler_routes,
+        single_fit_t0_us,
+        single_fit_l_scale,
+        single_fit_energy_scale_flight_path_m,
         endf_cache,
         // Read-only diagnostic populated by `load_project`; never written back.
         endf_cache_dropped: vec![],
@@ -1342,13 +1367,14 @@ fn state_from_snapshot(snap: ProjectSnapshot, state: &mut AppState, path: &Path)
             // Re-running `spatial_map_typed` regenerates them.
             back_d_map: None,
             back_f_map: None,
-            // TZERO maps are not yet persisted in project files — None on
-            // restore.  Re-running spatial_map_typed regenerates them.
-            t0_us_map: None,
-            l_scale_map: None,
-            // Snapshots don't persist the energy-scale flight path yet; the
-            // overlay accessor treats `None` as "energy scale not fitted".
-            energy_scale_flight_path_m: None,
+            // The fitted SAMMY TZERO energy scale: restored because every
+            // redraw evaluates the physics at the calibrated energies these
+            // define (`SpectrumFitResult::corrected_energies`).  Dropping
+            // them reverted a reloaded energy-scale map to the identity
+            // scale — a different model, drawn without a word.
+            t0_us_map: snap.t0_us_map,
+            l_scale_map: snap.l_scale_map,
+            energy_scale_flight_path_m: snap.energy_scale_flight_path_m,
             // #635: baseline outputs are persisted so the overlay rebuilds
             // B(E) exactly as fitted.  Warnings are config-time diagnostics
             // and regenerate on refit — not persisted.
@@ -1387,9 +1413,13 @@ fn state_from_snapshot(snap: ProjectSnapshot, state: &mut AppState, path: &Path)
             // the exponential term, no misleading 0.0 sentinel.
             back_d: None,
             back_f: None,
-            t0_us: None,
-            l_scale: None,
-            energy_scale_flight_path_m: None,
+            // The fitted energy scale, with the flight path the fit was
+            // configured with: the overlay maps the nominal grid through
+            // these before it evaluates the physics, so a reload that
+            // dropped them would silently redraw the fit uncalibrated.
+            t0_us: snap.single_fit_t0_us,
+            l_scale: snap.single_fit_l_scale,
+            energy_scale_flight_path_m: snap.single_fit_energy_scale_flight_path_m,
             deviance_per_dof: None,
             // #635: restore the fitted baseline so the overlay applies the
             // same B(E) the fit used.  Pre-#635 project files read as None.
@@ -1659,9 +1689,12 @@ mod tests {
 
     /// The routes a single-pixel fit disclosed are part of its result: the
     /// overlay redraws the curve through them, so a reload must restore
-    /// them typed on the result and rendered in the fit feedback.
+    /// them typed on the result and rendered in the fit feedback. So is the
+    /// fitted energy scale — the overlay evaluates the physics at the
+    /// energies it defines, and a reload that dropped it would redraw the
+    /// fit at the nominal ones without saying anything.
     #[test]
-    fn test_single_fit_doppler_routes_survive_save_and_load() {
+    fn test_single_fit_routes_and_energy_scale_survive_save_and_load() {
         use nereids_physics::doppler_route::{DopplerRoute, IsotopeDopplerRoute};
         let routes = vec![IsotopeDopplerRoute {
             isotope: nereids_core::types::Isotope::new(72, 177).unwrap(),
@@ -1682,9 +1715,9 @@ mod tests {
                 background: [0.0, 0.0, 0.0],
                 back_d: None,
                 back_f: None,
-                t0_us: None,
-                l_scale: None,
-                energy_scale_flight_path_m: None,
+                t0_us: Some(-0.83),
+                l_scale: Some(0.9972),
+                energy_scale_flight_path_m: Some(25.0),
                 deviance_per_dof: None,
                 baseline: None,
                 baseline_e_ref_ev: None,
@@ -1695,6 +1728,7 @@ mod tests {
         };
         let snap = snapshot_from_state(&state);
         assert_eq!(snap.single_fit_doppler_routes, Some(routes.clone()));
+        assert_eq!(snap.single_fit_t0_us, Some(-0.83));
 
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("routes.nrd.h5");
@@ -1707,14 +1741,29 @@ mod tests {
             restored.last_fit_feedback.as_ref().unwrap().doppler_routes,
             vec!["Hf-177: continuous free-gas integral over the MLBW resonance equation"]
         );
+        assert_eq!(result.t0_us, Some(-0.83));
+        assert_eq!(result.l_scale, Some(0.9972));
+        assert_eq!(result.energy_scale_flight_path_m, Some(25.0));
+        // The restored result maps a nominal grid the way the fit did: a
+        // dropped energy scale would leave this `None` (the identity).
+        let corrected = result
+            .corrected_energies(&[4.0, 5.0, 6.0])
+            .expect("the restored result carries an energy scale")
+            .expect("the calibration is not degenerate");
+        assert!(
+            corrected.iter().zip([4.0, 5.0, 6.0]).all(|(c, n)| *c != n),
+            "{corrected:?}"
+        );
     }
 
     /// The routes a spatial map disclosed are part of its result too: the
     /// convergence summary renders them, and `SpatialResult::doppler_routes`
     /// documents `None` as "nothing was broadened", which a restored map
-    /// that did broaden must not claim.
+    /// that did broaden must not claim. The per-pixel energy scale is part
+    /// of it for the same reason as the single-pixel fit: the overlay at a
+    /// selected pixel evaluates the physics at the energies it defines.
     #[test]
-    fn test_spatial_doppler_routes_survive_save_and_load() {
+    fn test_spatial_routes_and_energy_scale_survive_save_and_load() {
         use nereids_physics::doppler_route::{DopplerRoute, IsotopeDopplerRoute};
         let routes = vec![IsotopeDopplerRoute {
             isotope: nereids_core::types::Isotope::new(72, 177).unwrap(),
@@ -1740,9 +1789,9 @@ mod tests {
                 background_maps: None,
                 back_d_map: None,
                 back_f_map: None,
-                t0_us_map: None,
-                l_scale_map: None,
-                energy_scale_flight_path_m: None,
+                t0_us_map: Some(Array2::from_elem((2, 2), 0.47)),
+                l_scale_map: Some(Array2::from_elem((2, 2), 1.0031)),
+                energy_scale_flight_path_m: Some(25.0),
                 baseline_global: None,
                 baseline_e_ref_ev: None,
                 baseline_maps: None,
@@ -1756,6 +1805,7 @@ mod tests {
         };
         let snap = snapshot_from_state(&state);
         assert_eq!(snap.spatial_doppler_routes, Some(routes.clone()));
+        assert_eq!(snap.energy_scale_flight_path_m, Some(25.0));
 
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("map_routes.nrd.h5");
@@ -1764,6 +1814,12 @@ mod tests {
         state_from_snapshot(load_project(&path).unwrap(), &mut restored, &path);
         let result = restored.spatial_result.as_ref().unwrap();
         assert_eq!(result.doppler_routes, Some(routes));
+        assert_eq!(result.t0_us_map.as_ref().expect("t0 map")[[1, 1]], 0.47);
+        assert_eq!(
+            result.l_scale_map.as_ref().expect("L_scale map")[[0, 1]],
+            1.0031
+        );
+        assert_eq!(result.energy_scale_flight_path_m, Some(25.0));
         // The convergence summary renders one line per restored route.
         assert_eq!(
             result

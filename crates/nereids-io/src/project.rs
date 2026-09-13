@@ -207,6 +207,21 @@ pub struct ProjectSnapshot {
     /// Per-pixel baseline coefficient maps [b0, b1, b2] (issue #635,
     /// per-pixel mode).  Stored like `background_maps`.
     pub baseline_maps: Option<[Array2<f64>; 3]>,
+    /// Per-pixel fitted TOF offset t₀ (µs) from a SAMMY TZERO energy-scale
+    /// map.  Persisted with [`Self::l_scale_map`] and
+    /// [`Self::energy_scale_flight_path_m`] because a redraw evaluates the
+    /// physics at the CALIBRATED energies: a reload that dropped them would
+    /// silently revert the map to the identity scale and show a curve the
+    /// fit never computed.  `None` when the energy scale was not fitted.
+    pub t0_us_map: Option<Array2<f64>>,
+    /// Per-pixel fitted flight-path scale L_scale (dimensionless); see
+    /// [`Self::t0_us_map`].
+    pub l_scale_map: Option<Array2<f64>>,
+    /// The nominal flight path (m) the energy-scale map was configured
+    /// with — stored so the redraw reproduces the transform with the SAME
+    /// flight path the fit used, not the live beamline setting.  `None`
+    /// when the energy scale was not fitted.
+    pub energy_scale_flight_path_m: Option<f64>,
 
     // -- results/single_fit (single-pixel fit, optional) --
     pub single_fit_densities: Option<Vec<f64>>,
@@ -227,6 +242,19 @@ pub struct ProjectSnapshot {
     pub single_fit_baseline: Option<[f64; 3]>,
     /// Baseline reference energy E_ref (eV) for the single-pixel fit.
     pub single_fit_baseline_e_ref_ev: Option<f64>,
+    /// Fitted TOF offset t₀ (µs) from a single-pixel SAMMY TZERO
+    /// energy-scale fit.  Persisted with [`Self::single_fit_l_scale`] and
+    /// [`Self::single_fit_energy_scale_flight_path_m`]: the overlay
+    /// evaluates the physics at the CALIBRATED energies, so a reload that
+    /// dropped them would silently redraw the fit at the identity scale.
+    /// `None` when the energy scale was not fitted.
+    pub single_fit_t0_us: Option<f64>,
+    /// Fitted flight-path scale L_scale (dimensionless) from a
+    /// single-pixel fit; see [`Self::single_fit_t0_us`].
+    pub single_fit_l_scale: Option<f64>,
+    /// The nominal flight path (m) the single-pixel energy-scale fit was
+    /// configured with; see [`Self::single_fit_t0_us`].
+    pub single_fit_energy_scale_flight_path_m: Option<f64>,
     /// The Doppler route each isotope took in the single-pixel fit, as the
     /// fit disclosed it.  `None` when nothing was broadened or the file
     /// predates the field; absence reads as `None`.
@@ -360,6 +388,9 @@ impl Default for ProjectSnapshot {
             baseline_global: None,
             baseline_e_ref_ev: None,
             baseline_maps: None,
+            t0_us_map: None,
+            l_scale_map: None,
+            energy_scale_flight_path_m: None,
             single_fit_densities: None,
             single_fit_uncertainties: None,
             single_fit_chi_squared: None,
@@ -373,6 +404,9 @@ impl Default for ProjectSnapshot {
             single_fit_background: None,
             single_fit_baseline: None,
             single_fit_baseline_e_ref_ev: None,
+            single_fit_t0_us: None,
+            single_fit_l_scale: None,
+            single_fit_energy_scale_flight_path_m: None,
             single_fit_doppler_routes: None,
             spatial_doppler_routes: None,
             uncertainty_is_estimated: None,
@@ -1089,6 +1123,30 @@ fn write_results(file: &hdf5::File, snap: &ProjectSnapshot) -> Result<(), IoErro
         }
     }
 
+    // SAMMY TZERO energy-scale outputs.  The redraw evaluates the physics
+    // at the CALIBRATED energies these define, so dropping them would
+    // silently reload an energy-scale map as an uncalibrated one.
+    for (label, map) in [
+        ("t0_us", snap.t0_us_map.as_ref()),
+        ("l_scale", snap.l_scale_map.as_ref()),
+    ] {
+        if let Some(m) = map {
+            let shape = [m.shape()[0], m.shape()[1]];
+            let data: Vec<f64> = m.iter().copied().collect();
+            results
+                .new_dataset::<f64>()
+                .shape(shape)
+                .chunk(shape)
+                .deflate(4)
+                .create(label)
+                .and_then(|ds| ds.write_raw(&data))
+                .map_err(|e| hdf5_err(&format!("/results/{label}"), e))?;
+        }
+    }
+    if let Some(flight_path_m) = snap.energy_scale_flight_path_m {
+        write_f64_attr(&results, "energy_scale_flight_path_m", flight_path_m)?;
+    }
+
     if let Some(nc) = snap.n_converged {
         write_u64_attr(&results, "n_converged", nc as u64)?;
     }
@@ -1199,6 +1257,17 @@ fn write_results(file: &hdf5::File, snap: &ProjectSnapshot) -> Result<(), IoErro
         }
         if let Some(e_ref) = snap.single_fit_baseline_e_ref_ev {
             write_f64_attr(&sf, "baseline_e_ref_ev", e_ref)?;
+        }
+        // SAMMY TZERO energy scale: the overlay redraws the physics at the
+        // calibrated energies, so the three travel together.
+        if let Some(t0) = snap.single_fit_t0_us {
+            write_f64_attr(&sf, "t0_us", t0)?;
+        }
+        if let Some(l_scale) = snap.single_fit_l_scale {
+            write_f64_attr(&sf, "l_scale", l_scale)?;
+        }
+        if let Some(flight_path_m) = snap.single_fit_energy_scale_flight_path_m {
+            write_f64_attr(&sf, "energy_scale_flight_path_m", flight_path_m)?;
         }
         if let Some(ref routes) = snap.single_fit_doppler_routes {
             let json = serde_json::to_string(routes)
@@ -2002,6 +2071,46 @@ fn read_results(file: &hdf5::File, snap: &mut ProjectSnapshot) -> Result<(), IoE
         ));
     }
 
+    // SAMMY TZERO energy-scale maps.  FAIL CLOSED on a partial set for the
+    // same reason as the baseline: the redraw applies the calibration only
+    // when t₀, L_scale AND the flight path are all present, so a missing
+    // member would silently reload a calibrated map as an uncalibrated one.
+    for (label, slot) in [
+        ("t0_us", &mut snap.t0_us_map),
+        ("l_scale", &mut snap.l_scale_map),
+    ] {
+        if let Ok(ds) = results.dataset(label) {
+            let shape = ds.shape();
+            if shape.len() != 2 {
+                return Err(IoError::Hdf5Error(format!(
+                    "/results/{label}: expected a 2-D map, got {} dimension(s) \
+                     (corrupted project file)",
+                    shape.len()
+                )));
+            }
+            let data: Vec<f64> = ds
+                .read_raw()
+                .map_err(|e| hdf5_err(&format!("/results/{label}"), e))?;
+            *slot = Some(
+                Array2::from_shape_vec((shape[0], shape[1]), data)
+                    .map_err(|e| hdf5_err(&format!("/results/{label} reshape"), e))?,
+            );
+        }
+    }
+    snap.energy_scale_flight_path_m = read_f64_attr(&results, "energy_scale_flight_path_m").ok();
+    if (snap.t0_us_map.is_some() || snap.l_scale_map.is_some())
+        && !(snap.t0_us_map.is_some()
+            && snap.l_scale_map.is_some()
+            && snap.energy_scale_flight_path_m.is_some())
+    {
+        return Err(IoError::Hdf5Error(
+            "an energy-scale map is present but /results/t0_us, /results/l_scale and the \
+             energy_scale_flight_path_m attribute do not all exist — the fitted energy \
+             scale cannot be reconstructed (corrupted project file)"
+                .into(),
+        ));
+    }
+
     // Scalar attrs
     if let Ok(nc) = read_u64_attr(&results, "n_converged") {
         snap.n_converged = Some(nc as usize);
@@ -2078,6 +2187,25 @@ fn read_results(file: &hdf5::File, snap: &mut ProjectSnapshot) -> Result<(), IoE
                 )));
             }
             snap.single_fit_baseline = Some([data[0], data[1], data[2]]);
+        }
+        snap.single_fit_t0_us = read_f64_attr(&sf, "t0_us").ok();
+        snap.single_fit_l_scale = read_f64_attr(&sf, "l_scale").ok();
+        snap.single_fit_energy_scale_flight_path_m =
+            read_f64_attr(&sf, "energy_scale_flight_path_m").ok();
+        // FAIL CLOSED on a partial energy scale: `corrected_energies`
+        // applies the calibration only when all three are present, so a
+        // missing member would silently redraw the fit uncalibrated.
+        if (snap.single_fit_t0_us.is_some() || snap.single_fit_l_scale.is_some())
+            && !(snap.single_fit_t0_us.is_some()
+                && snap.single_fit_l_scale.is_some()
+                && snap.single_fit_energy_scale_flight_path_m.is_some())
+        {
+            return Err(IoError::Hdf5Error(
+                "/results/single_fit carries part of an energy scale but not all of \
+                 t0_us, l_scale and energy_scale_flight_path_m — the fitted energy \
+                 scale cannot be reconstructed (corrupted project file)"
+                    .into(),
+            ));
         }
         snap.single_fit_baseline_e_ref_ev = read_f64_attr(&sf, "baseline_e_ref_ev").ok();
         if snap.single_fit_baseline.is_some() && snap.single_fit_baseline_e_ref_ev.is_none() {
@@ -2268,6 +2396,9 @@ mod tests {
             baseline_global: None,
             baseline_e_ref_ev: None,
             baseline_maps: None,
+            t0_us_map: None,
+            l_scale_map: None,
+            energy_scale_flight_path_m: None,
             single_fit_densities: None,
             single_fit_uncertainties: None,
             single_fit_chi_squared: None,
@@ -2281,6 +2412,9 @@ mod tests {
             single_fit_background: None,
             single_fit_baseline: None,
             single_fit_baseline_e_ref_ev: None,
+            single_fit_t0_us: None,
+            single_fit_l_scale: None,
+            single_fit_energy_scale_flight_path_m: None,
             single_fit_doppler_routes: None,
             spatial_doppler_routes: None,
             uncertainty_is_estimated: Some(false),
@@ -3358,6 +3492,94 @@ mod tests {
         assert!(
             loaded2.baseline_enabled.is_none(),
             "pre-#635 files read as None"
+        );
+    }
+
+    /// The fitted SAMMY TZERO energy scale must survive save/load: the
+    /// redraw evaluates the physics at the energies `(t0, L_scale)` and the
+    /// fit's flight path define, so dropping them reloads a calibrated fit
+    /// as an uncalibrated one — a different model, drawn without a word.
+    #[test]
+    fn test_roundtrip_energy_scale_fields() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("energy_scale.nrd.h5");
+        let mut snap = minimal_snapshot();
+        snap.t0_us_map = Some(Array2::from_elem((2, 2), 0.47));
+        snap.l_scale_map = Some(Array2::from_elem((2, 2), 1.0031));
+        snap.energy_scale_flight_path_m = Some(25.0);
+        snap.single_fit_densities = Some(vec![0.002]);
+        snap.single_fit_t0_us = Some(-0.83);
+        snap.single_fit_l_scale = Some(0.9972);
+        snap.single_fit_energy_scale_flight_path_m = Some(25.0);
+        save_project(&path, &snap).unwrap();
+
+        let loaded = load_project(&path).unwrap();
+        assert_eq!(loaded.t0_us_map.as_ref().expect("t0 map")[[1, 1]], 0.47);
+        assert_eq!(
+            loaded.l_scale_map.as_ref().expect("L_scale map")[[0, 1]],
+            1.0031
+        );
+        assert_eq!(loaded.energy_scale_flight_path_m, Some(25.0));
+        assert_eq!(loaded.single_fit_t0_us, Some(-0.83));
+        assert_eq!(loaded.single_fit_l_scale, Some(0.9972));
+        assert_eq!(loaded.single_fit_energy_scale_flight_path_m, Some(25.0));
+
+        // Absence round-trips as None (files written before the fields
+        // existed, and every fit without an energy scale).
+        let path2 = dir.path().join("no_energy_scale.nrd.h5");
+        save_project(&path2, &minimal_snapshot()).unwrap();
+        let loaded2 = load_project(&path2).unwrap();
+        assert!(loaded2.t0_us_map.is_none());
+        assert!(loaded2.l_scale_map.is_none());
+        assert!(loaded2.energy_scale_flight_path_m.is_none());
+        assert!(loaded2.single_fit_t0_us.is_none());
+        assert!(loaded2.single_fit_l_scale.is_none());
+        assert!(loaded2.single_fit_energy_scale_flight_path_m.is_none());
+    }
+
+    /// A partial energy scale must FAIL CLOSED: `corrected_energies`
+    /// applies the calibration only when t₀, L_scale and the flight path
+    /// are all present, so a truncated file would silently redraw the fit
+    /// uncalibrated.  The fixtures are built by hand with the hdf5 API (NOT
+    /// by save_project) so this cannot be circular with the writer.
+    #[test]
+    fn test_partial_energy_scale_fails_closed() {
+        let dir = tempfile::tempdir().unwrap();
+
+        // (a) a t0 map with no L_scale map and no flight path.
+        let path = dir.path().join("partial_map.nrd.h5");
+        save_project(&path, &minimal_snapshot()).unwrap();
+        {
+            let f = hdf5::File::open_rw(&path).unwrap();
+            let results = f.group("results").unwrap();
+            results
+                .new_dataset::<f64>()
+                .shape([2, 2])
+                .create("t0_us")
+                .and_then(|ds| ds.write_raw(&[0.1f64; 4]))
+                .unwrap();
+        }
+        let err = load_project(&path).expect_err("a half-written energy scale must fail closed");
+        assert!(
+            format!("{err}").contains("energy scale cannot be reconstructed"),
+            "{err}"
+        );
+
+        // (b) a single-fit t0 with no L_scale.
+        let path = dir.path().join("partial_single_fit.nrd.h5");
+        let mut snap = minimal_snapshot();
+        snap.single_fit_densities = Some(vec![0.002]);
+        save_project(&path, &snap).unwrap();
+        {
+            let f = hdf5::File::open_rw(&path).unwrap();
+            let sf = f.group("results").unwrap().group("single_fit").unwrap();
+            let attr = sf.new_attr::<f64>().shape(()).create("t0_us").unwrap();
+            attr.write_scalar(&0.5f64).unwrap();
+        }
+        let err = load_project(&path).expect_err("a half-written energy scale must fail closed");
+        assert!(
+            format!("{err}").contains("energy scale cannot be reconstructed"),
+            "{err}"
         );
     }
 
