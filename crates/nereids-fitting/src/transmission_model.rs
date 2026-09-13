@@ -13,7 +13,9 @@ use nereids_endf::resonance::ResonanceData;
 use nereids_physics::doppler_route::DopplerRoute;
 use nereids_physics::resolution::{self, ResolutionFunction, ResolutionPlan};
 use nereids_physics::surrogate::{ScalarSurrogatePlan, SparseEmpiricalCubaturePlan};
-use nereids_physics::transmission::{self, DopplerPlan, InstrumentParams, SampleParams};
+use nereids_physics::transmission::{
+    self, DopplerPlan, InstrumentParams, PartialDerivativeRows, SampleParams,
+};
 
 use crate::error::FittingError;
 use crate::lm::{FitModel, FlatMatrix};
@@ -814,11 +816,12 @@ pub struct TransmissionFitModel {
     /// `FitModel::evaluate` takes `&self`.  Safe because `TransmissionFitModel`
     /// is constructed per-pixel and never shared across threads.
     cached_broadened_xs: RefCell<Option<Rc<Vec<Vec<f64>>>>>,
-    /// Cached analytical temperature derivative ∂σ/∂T, on the **working grid**,
-    /// computed on-demand by `analytical_jacobian()` when the temperature
-    /// column is needed.  Invalidated when temperature changes (cleared in
-    /// `evaluate()`).
-    cached_dxs_dt: RefCell<Option<Rc<Vec<Vec<f64>>>>>,
+    /// Cached analytical temperature derivative ∂σ/∂T per isotope, on the
+    /// **working grid**.  A continuous (tier-1) isotope's row is converged
+    /// with its σ in `evaluate()`; a sampled-table isotope's row is `None`
+    /// until `analytical_jacobian()` needs the temperature column and fills
+    /// it.  Empty when nothing is cached; replaced whenever σ is recomputed.
+    cached_dxs_dt: RefCell<PartialDerivativeRows>,
     /// Working-grid layout (energies + data-index map) matching
     /// `cached_broadened_xs` / `cached_dxs_dt`.  Resolution broadening is
     /// applied on `layout.energies` and the data points are extracted last
@@ -926,7 +929,7 @@ impl TransmissionFitModel {
             temperature_index,
             doppler_plan,
             cached_broadened_xs: RefCell::new(None),
-            cached_dxs_dt: RefCell::new(None),
+            cached_dxs_dt: RefCell::new(Vec::new()),
             cached_work_layout: RefCell::new(None),
             cached_temperature: Cell::new(f64::NAN),
             resolution_plan: None,
@@ -958,7 +961,7 @@ impl TransmissionFitModel {
     pub fn with_doppler_plan(mut self, plan: Arc<DopplerPlan>) -> Self {
         self.doppler_plan = OnceCell::from(plan);
         self.cached_broadened_xs = RefCell::new(None);
-        self.cached_dxs_dt = RefCell::new(None);
+        self.cached_dxs_dt = RefCell::new(Vec::new());
         self.cached_work_layout = RefCell::new(None);
         self.cached_temperature = Cell::new(f64::NAN);
         self
@@ -1106,14 +1109,13 @@ impl FitModel for TransmissionFitModel {
             // forward_model.  The previous cached path collapsed σ to the
             // coarse data grid before resolution, degrading the convolution.
             //
-            // Derivative ∂σ/∂T: for a sampled-table plan it is computed
-            // on-demand in analytical_jacobian(), NOT here — evaluate() is
-            // called many times during line-search trials and the
-            // convolution's derivative pass would dominate. For a plan with
-            // a continuous (tier-1) isotope the value and the derivative
-            // converge on the same quadrature panels, so asking for both
-            // here costs one integration where value-now plus
-            // derivative-later would cost two per accepted step.
+            // Derivative ∂σ/∂T, per isotope by its route: a continuous
+            // (tier-1) isotope's converges on the same quadrature panels as
+            // its value, so asking for both here costs one integration where
+            // value-now plus derivative-later would cost two per accepted
+            // step; a sampled-table isotope's is a second convolution, left
+            // to analytical_jacobian() on demand — evaluate() is called many
+            // times during line-search trials and that pass would dominate.
             let (broadened_xs, layout) = if (temperature_k - self.cached_temperature.get()).abs()
                 < 1e-15
                 && self.cached_broadened_xs.borrow().is_some()
@@ -1123,35 +1125,34 @@ impl FitModel for TransmissionFitModel {
                     Rc::clone(self.cached_work_layout.borrow().as_ref().unwrap()),
                 )
             } else {
-                let (sigma, dsigma_dt, work_layout) =
-                    if self.temperature_index.is_some() && plan.has_continuous_route() {
-                        let working = plan
-                            .broaden_with_derivative_on_working_grid(
-                                &self.energies,
-                                &self.resonance_data,
-                                temperature_k,
-                                self.instrument.as_deref(),
-                            )
-                            .map_err(|e| FittingError::EvaluationFailed(e.to_string()))?;
-                        (working.sigma, Some(working.dsigma_dt), working.layout)
-                    } else {
-                        let working = plan
-                            .broaden_on_working_grid(
-                                &self.energies,
-                                &self.resonance_data,
-                                temperature_k,
-                                self.instrument.as_deref(),
-                            )
-                            .map_err(|e| FittingError::EvaluationFailed(e.to_string()))?;
-                        (working.sigma, None, working.layout)
-                    };
+                let (sigma, dsigma_dt, work_layout) = if self.temperature_index.is_some() {
+                    let (working, dsigma_dt) = plan
+                        .broaden_with_continuous_derivative_on_working_grid(
+                            &self.energies,
+                            &self.resonance_data,
+                            temperature_k,
+                            self.instrument.as_deref(),
+                        )
+                        .map_err(|e| FittingError::EvaluationFailed(e.to_string()))?;
+                    (working.sigma, dsigma_dt, working.layout)
+                } else {
+                    let working = plan
+                        .broaden_on_working_grid(
+                            &self.energies,
+                            &self.resonance_data,
+                            temperature_k,
+                            self.instrument.as_deref(),
+                        )
+                        .map_err(|e| FittingError::EvaluationFailed(e.to_string()))?;
+                    (working.sigma, Vec::new(), working.layout)
+                };
                 let xs = Rc::new(sigma);
                 let layout = Rc::new(work_layout);
                 *self.cached_broadened_xs.borrow_mut() = Some(Rc::clone(&xs));
                 *self.cached_work_layout.borrow_mut() = Some(Rc::clone(&layout));
                 // The old ∂σ/∂T belongs to the previous temperature; keep
-                // only a derivative converged alongside this σ.
-                *self.cached_dxs_dt.borrow_mut() = dsigma_dt.map(Rc::new);
+                // only the rows converged alongside this σ.
+                *self.cached_dxs_dt.borrow_mut() = dsigma_dt;
                 self.cached_temperature.set(temperature_k);
                 (xs, layout)
             };
@@ -1219,13 +1220,12 @@ impl FitModel for TransmissionFitModel {
     ///   from the most recent `evaluate()` call.  Same formula as
     ///   `PrecomputedTransmissionModel`, zero extra broadening calls.
     /// - **Temperature column**: analytical chain rule via `∂σ/∂T`.
-    ///   `∂T/∂T_temp = -T(E) · Σᵢ nᵢ·rᵢ·∂σᵢ/∂T`.  The derivative is
-    ///   computed once per temperature via
-    ///   `DopplerPlan::broaden_with_derivative_on_working_grid()` and
-    ///   cached until temperature changes: `evaluate()` already produced
-    ///   it when the plan has a continuous isotope (value and derivative
-    ///   share the quadrature panels), and it is computed on demand here
-    ///   otherwise.
+    ///   `∂T/∂T_temp = -T(E) · Σᵢ nᵢ·rᵢ·∂σᵢ/∂T`.  Each isotope's derivative
+    ///   is computed once per temperature and cached until the temperature
+    ///   changes: `evaluate()` already produced the continuous isotopes'
+    ///   rows (value and derivative share the quadrature panels), and the
+    ///   sampled-table rows are filled on demand here via
+    ///   `DopplerPlan::fill_missing_derivatives_on_working_grid()`.
     ///
     /// Returns `None` for the no-plan path (full forward model), which
     /// falls back to finite-difference in the LM solver.
@@ -1389,24 +1389,29 @@ impl FitModel for TransmissionFitModel {
 
         // ── Temperature column: ∂T/∂Temp or ∂T_obs/∂Temp ──
         if let Some(col) = temp_col {
-            // Compute ∂σ/∂T (on the working grid) on-demand if not cached.
+            // Fill the ∂σ/∂T rows evaluate() left out (the sampled-table
+            // isotopes', or every isotope's when nothing is cached).
             {
-                let needs_compute = self.cached_dxs_dt.borrow().as_ref().is_none();
-                if needs_compute {
-                    let temperature_k = self.cached_temperature.get();
-                    let working = plan
-                        .broaden_with_derivative_on_working_grid(
-                            &self.energies,
-                            &self.resonance_data,
-                            temperature_k,
-                            self.instrument.as_deref(),
-                        )
-                        .ok()?;
-                    *self.cached_dxs_dt.borrow_mut() = Some(Rc::new(working.dsigma_dt));
+                let mut rows = self.cached_dxs_dt.borrow_mut();
+                if rows.len() != self.resonance_data.len() {
+                    *rows = vec![None; self.resonance_data.len()];
+                }
+                if rows.iter().any(Option::is_none) {
+                    plan.fill_missing_derivatives_on_working_grid(
+                        &self.energies,
+                        &self.resonance_data,
+                        self.cached_temperature.get(),
+                        self.instrument.as_deref(),
+                        &mut rows,
+                    )
+                    .ok()?;
                 }
             }
             let cached_dxs = self.cached_dxs_dt.borrow();
-            let dxs_dt = cached_dxs.as_ref()?;
+            let dxs_dt: Vec<&[f64]> = cached_dxs
+                .iter()
+                .map(|row| row.as_deref())
+                .collect::<Option<_>>()?;
 
             // Inner derivative on the working grid: -T · Σᵢ nᵢ rᵢ ∂σᵢ/∂T.
             let inner: Vec<f64> = (0..work_len)
@@ -7385,7 +7390,7 @@ mod tests {
 
         let model = model.with_doppler_plan(table_plan(2.0));
         assert!(model.cached_broadened_xs.borrow().is_none());
-        assert!(model.cached_dxs_dt.borrow().is_none());
+        assert!(model.cached_dxs_dt.borrow().is_empty());
         assert!(model.cached_work_layout.borrow().is_none());
         assert!(model.cached_temperature.get().is_nan());
         let two_barn = model.evaluate(&[0.001, 300.0]).unwrap();
@@ -7417,7 +7422,7 @@ mod tests {
         let params = [0.001, 300.0];
         let y = model.evaluate(&params).unwrap();
         assert!(
-            model.cached_dxs_dt.borrow().is_some(),
+            model.cached_dxs_dt.borrow()[0].is_some(),
             "evaluate must leave ∂σ/∂T behind for the Jacobian"
         );
 
@@ -7455,7 +7460,7 @@ mod tests {
         )
         .unwrap();
         let y_rm = rm.evaluate(&params).unwrap();
-        assert!(rm.cached_dxs_dt.borrow().is_none());
+        assert!(rm.cached_dxs_dt.borrow().iter().all(Option::is_none));
         let fixed = TransmissionFitModel::new(
             energies,
             vec![u238_single_resonance()],
@@ -7468,6 +7473,65 @@ mod tests {
         .unwrap();
         assert_eq!(y_rm, fixed.evaluate(&[0.001]).unwrap());
         assert!(rm.analytical_jacobian(&params, &[0, 1], &y_rm).is_some());
-        assert!(rm.cached_dxs_dt.borrow().is_some());
+        assert!(rm.cached_dxs_dt.borrow()[0].is_some());
+    }
+
+    /// A mixed fit pays the tier-1 derivative with the value and defers the
+    /// sampled-table convolution's derivative to the Jacobian, which then
+    /// equals the one built from the all-isotope entry point.
+    #[test]
+    fn mixed_model_converges_only_the_continuous_derivative_in_evaluate() {
+        let energies = edge_grid();
+        let both = vec![
+            u238_single_resonance(),
+            u238_with_formalism(ResonanceFormalism::MLBW),
+        ];
+        let model = TransmissionFitModel::new(
+            energies.clone(),
+            both.clone(),
+            0.0,
+            None,
+            (vec![0, 1], vec![1.0, 1.0]),
+            Some(2),
+            None,
+        )
+        .unwrap();
+        let params = [0.001, 0.0005, 300.0];
+        let y = model.evaluate(&params).unwrap();
+        {
+            let rows = model.cached_dxs_dt.borrow();
+            assert_eq!(rows.len(), 2);
+            assert!(
+                rows[0].is_none(),
+                "the Reich-Moore row waits for the Jacobian"
+            );
+            assert!(
+                rows[1].is_some(),
+                "the MLBW row is converged with its value"
+            );
+        }
+
+        let jacobian = model.analytical_jacobian(&params, &[0, 1, 2], &y).unwrap();
+        assert!(model.cached_dxs_dt.borrow()[0].is_some());
+        let working = model
+            .doppler_plan()
+            .unwrap()
+            .unwrap()
+            .broaden_with_derivative_on_working_grid(&energies, &both, 300.0, None)
+            .unwrap();
+        for (i, &t) in y.iter().enumerate() {
+            let expected = [
+                -working.sigma[0][i] * t,
+                -working.sigma[1][i] * t,
+                -t * (params[0] * working.dsigma_dt[0][i] + params[1] * working.dsigma_dt[1][i]),
+            ];
+            for (col, expected) in expected.into_iter().enumerate() {
+                let got = jacobian.get(i, col);
+                assert!(
+                    (got - expected).abs() <= 1e-12 * expected.abs().max(1.0),
+                    "row {i} col {col}: {got} vs {expected}"
+                );
+            }
+        }
     }
 }
