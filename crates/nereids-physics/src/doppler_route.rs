@@ -70,6 +70,16 @@ pub enum SampledTableReason {
         /// Formalism of the covering range, if any.
         formalism: Option<ResonanceFormalism>,
     },
+    /// The range covering `energy_ev` is resolved SLBW/MLBW but carries no
+    /// resonances: the parser accepts it and it evaluates to nothing, so
+    /// there is no equation to integrate. Not an edge fallback — the
+    /// formalism qualifies, the data does not.
+    EmptyResolvedRange {
+        /// Grid energy at which the condition failed (eV).
+        energy_ev: f64,
+        /// Formalism of the empty covering range.
+        formalism: ResonanceFormalism,
+    },
     /// No range covers `energy_ev`, although the source has a resolved
     /// SLBW/MLBW range: the grid, or its auxiliary extension, reaches past
     /// the resolved region, so the whole grid is demoted. The bounds are
@@ -189,7 +199,9 @@ impl DopplerRoute {
             DopplerRoute::Unbroadened | DopplerRoute::Continuous { .. } => false,
             DopplerRoute::SampledTable { reason } => !matches!(
                 reason,
-                SampledTableReason::ExplicitTable | SampledTableReason::Formalism { .. }
+                SampledTableReason::ExplicitTable
+                    | SampledTableReason::Formalism { .. }
+                    | SampledTableReason::EmptyResolvedRange { .. }
             ),
         }
     }
@@ -214,6 +226,10 @@ impl SampledTableReason {
             (R::ExplicitTable, R::ExplicitTable) => true,
             (R::Formalism { formalism: a, .. }, R::Formalism { formalism: b, .. }) => a == b,
             (
+                R::EmptyResolvedRange { formalism: a, .. },
+                R::EmptyResolvedRange { formalism: b, .. },
+            )
+            | (
                 R::ThermalWindowFoldsThroughZero { formalism: a, .. },
                 R::ThermalWindowFoldsThroughZero { formalism: b, .. },
             )
@@ -259,7 +275,9 @@ pub fn edge_fallback_warning(
         return None;
     };
     let formalism = match reason {
-        SampledTableReason::ExplicitTable | SampledTableReason::Formalism { .. } => return None,
+        SampledTableReason::ExplicitTable
+        | SampledTableReason::Formalism { .. }
+        | SampledTableReason::EmptyResolvedRange { .. } => return None,
         SampledTableReason::ThermalWindowFoldsThroughZero { formalism, .. }
         | SampledTableReason::WindowCrossesRangeBoundary { formalism, .. }
         | SampledTableReason::GridLeavesResolvedRange { formalism, .. }
@@ -272,6 +290,23 @@ pub fn edge_fallback_warning(
         isotope_to_string(&route.isotope),
         formalism_name(formalism),
     ))
+}
+
+/// The `warnings` line for an isotope whose broadened total went negative
+/// at `count` working-grid energies, or `None` when it never did.
+///
+/// This is SAMMY's "Negative cross section" print (`fgm/mfgm4.f90:96-99`)
+/// mapped onto the result: an SLBW total whose same-J interference terms
+/// outweigh the shared potential term is kept negative where a
+/// contributing point is positive, on either tier.
+pub fn negative_values_warning(isotope: &Isotope, count: usize) -> Option<String> {
+    (count > 0).then(|| {
+        format!(
+            "Doppler: {count} broadened total cross-section value(s) of {} are negative \
+             (SLBW interference; SAMMY reports the same)",
+            isotope_to_string(isotope),
+        )
+    })
 }
 
 /// Human name of a formalism for disclosure lines.
@@ -314,6 +349,14 @@ impl fmt::Display for SampledTableReason {
                 energy_ev,
                 formalism: None,
             } => write!(f, "no evaluable resolved range at {energy_ev:.2e} eV"),
+            SampledTableReason::EmptyResolvedRange {
+                energy_ev,
+                formalism,
+            } => write!(
+                f,
+                "resolved {} range with no resonances at {energy_ev:.2e} eV",
+                formalism_name(*formalism)
+            ),
             SampledTableReason::ThermalWindowFoldsThroughZero {
                 energy_ev,
                 thermal_u,
@@ -478,6 +521,13 @@ mod tests {
                 },
                 "File-3 background term present at 7.00e0 eV",
             ),
+            (
+                SampledTableReason::EmptyResolvedRange {
+                    energy_ev: 6.674,
+                    formalism: ResonanceFormalism::SLBW,
+                },
+                "resolved SLBW range with no resonances at 6.67e0 eV",
+            ),
         ];
         for (reason, expected) in cases {
             assert_eq!(reason.to_string(), expected);
@@ -533,6 +583,15 @@ mod tests {
                 reason: SampledTableReason::Formalism {
                     energy_ev: 1.0,
                     formalism: Some(ResonanceFormalism::ReichMoore),
+                }
+            }
+            .is_edge_fallback()
+        );
+        assert!(
+            !DopplerRoute::SampledTable {
+                reason: SampledTableReason::EmptyResolvedRange {
+                    energy_ev: 1.0,
+                    formalism: ResonanceFormalism::SLBW,
                 }
             }
             .is_edge_fallback()
@@ -610,6 +669,12 @@ mod tests {
                     formalism: Some(ResonanceFormalism::ReichMoore),
                 },
             },
+            DopplerRoute::SampledTable {
+                reason: SampledTableReason::EmptyResolvedRange {
+                    energy_ev: 1.0,
+                    formalism: ResonanceFormalism::MLBW,
+                },
+            },
         ] {
             let labelled = IsotopeDopplerRoute {
                 isotope: hf177(),
@@ -617,6 +682,18 @@ mod tests {
             };
             assert_eq!(edge_fallback_warning(&labelled, 5000.0), None);
         }
+    }
+
+    #[test]
+    fn negative_values_warning_counts_per_isotope() {
+        assert_eq!(negative_values_warning(&hf177(), 0), None);
+        assert_eq!(
+            negative_values_warning(&hf177(), 3).as_deref(),
+            Some(
+                "Doppler: 3 broadened total cross-section value(s) of Hf-177 are negative \
+                 (SLBW interference; SAMMY reports the same)"
+            )
+        );
     }
 
     #[test]
@@ -659,6 +736,22 @@ mod tests {
         };
         assert!(!window_reason().same_kind(&slbw_window));
         assert!(!window_reason().same_kind(&SampledTableReason::ExplicitTable));
+        let empty = |energy_ev, formalism| SampledTableReason::EmptyResolvedRange {
+            energy_ev,
+            formalism,
+        };
+        assert!(
+            empty(4.0, ResonanceFormalism::SLBW).same_kind(&empty(4.5, ResonanceFormalism::SLBW))
+        );
+        assert!(
+            !empty(4.0, ResonanceFormalism::SLBW).same_kind(&empty(4.0, ResonanceFormalism::MLBW))
+        );
+        assert!(
+            !empty(4.0, ResonanceFormalism::SLBW).same_kind(&SampledTableReason::Formalism {
+                energy_ev: 4.0,
+                formalism: Some(ResonanceFormalism::SLBW),
+            })
+        );
         let mut moved_grid = grid_reason(ResonanceFormalism::MLBW);
         if let SampledTableReason::GridLeavesResolvedRange { energy_ev, .. } = &mut moved_grid {
             *energy_ev += 10.0;

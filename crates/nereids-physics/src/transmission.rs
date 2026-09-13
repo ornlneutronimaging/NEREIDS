@@ -201,35 +201,72 @@ fn unbroadened_totals(rd: &ResonanceData, energies: &[f64]) -> Vec<f64> {
         .collect()
 }
 
-/// Tier 2: kernel-on-grid broadening of a zero-kelvin table.
+/// One isotope broadened on the working grid: σ, `∂σ/∂T` when asked for,
+/// and the count of negative values SAMMY's rule kept (see
+/// [`doppler::doppler_broaden`]).
+struct BroadenedRows {
+    sigma: Vec<f64>,
+    dsigma_dt: Option<Vec<f64>>,
+    negative_values: usize,
+}
+
+/// Tier 2: kernel-on-grid broadening of a zero-kelvin table, with the
+/// derivative when `with_derivative`.
 fn broaden_sampled_table(
     work_energies: &[f64],
     table: Vec<f64>,
     rd: &ResonanceData,
     temperature_k: f64,
-) -> Result<Vec<f64>, TransmissionError> {
-    if temperature_k > 0.0 {
-        let params = DopplerParams::new(temperature_k, rd.awr)?;
-        doppler::doppler_broaden(work_energies, &table, &params).map_err(Into::into)
-    } else {
-        Ok(table)
+    with_derivative: bool,
+) -> Result<BroadenedRows, TransmissionError> {
+    if temperature_k <= 0.0 {
+        return Ok(BroadenedRows {
+            sigma: table,
+            dsigma_dt: with_derivative.then(|| vec![0.0; work_energies.len()]),
+            negative_values: 0,
+        });
     }
+    let params = DopplerParams::new(temperature_k, rd.awr)?;
+    let (broadened, dsigma_dt) = if with_derivative {
+        let (broadened, derivative) =
+            doppler::doppler_broaden_with_derivative_counted(work_energies, &table, &params)?;
+        (broadened, Some(derivative))
+    } else {
+        (
+            doppler::doppler_broaden_counted(work_energies, &table, &params)?,
+            None,
+        )
+    };
+    Ok(BroadenedRows {
+        sigma: broadened.sigma,
+        dsigma_dt,
+        negative_values: broadened.negative_values,
+    })
 }
 
-/// Tier 2 with the analytical temperature derivative.
-fn broaden_sampled_table_with_derivative(
+/// Tier 1: the free-gas kernel integrated over the resonance equation,
+/// with the derivative when `with_derivative`.
+fn broaden_continuous(
     work_energies: &[f64],
-    table: Vec<f64>,
     rd: &ResonanceData,
-    temperature_k: f64,
-) -> Result<(Vec<f64>, Vec<f64>), TransmissionError> {
-    if temperature_k > 0.0 {
-        let params = DopplerParams::new(temperature_k, rd.awr)?;
-        doppler::doppler_broaden_with_derivative(work_energies, &table, &params).map_err(Into::into)
-    } else {
-        let zeros = vec![0.0; work_energies.len()];
-        Ok((table, zeros))
-    }
+    params: &DopplerParams,
+    with_derivative: bool,
+    cancel: Option<&AtomicBool>,
+) -> Result<BroadenedRows, TransmissionError> {
+    let broadening = continuous_doppler::broaden_integrals(
+        work_energies,
+        rd,
+        params,
+        continuous_doppler::Channel::Total,
+        with_derivative,
+        continuous_doppler::QuadratureBudget::default(),
+        cancel,
+    )?;
+    Ok(BroadenedRows {
+        sigma: broadening.values,
+        dsigma_dt: with_derivative.then_some(broadening.derivatives),
+        negative_values: broadening.negative_values,
+    })
 }
 
 /// Doppler-broaden one isotope on a working grid by the route the gate
@@ -243,35 +280,50 @@ fn broaden_isotope_on_grid(
     rd: &ResonanceData,
     temperature_k: f64,
     cancel: Option<&AtomicBool>,
-) -> Result<(Vec<f64>, DopplerRoute), TransmissionError> {
+) -> Result<(BroadenedRows, DopplerRoute), TransmissionError> {
     if temperature_k <= 0.0 {
         return Ok((
-            unbroadened_totals(rd, work_energies),
+            BroadenedRows {
+                sigma: unbroadened_totals(rd, work_energies),
+                dsigma_dt: None,
+                negative_values: 0,
+            },
             DopplerRoute::Unbroadened,
         ));
     }
     let params = DopplerParams::new(temperature_k, rd.awr)?;
     let route = continuous_doppler::classify_isotope(rd, work_energies, params.u());
-    let sigma = match route {
-        DopplerRoute::Unbroadened => unbroadened_totals(rd, work_energies),
+    let rows = match route {
+        DopplerRoute::Unbroadened => BroadenedRows {
+            sigma: unbroadened_totals(rd, work_energies),
+            dsigma_dt: None,
+            negative_values: 0,
+        },
         DopplerRoute::Continuous { .. } => {
-            continuous_doppler::broaden(work_energies, rd, &params, cancel)?
+            broaden_continuous(work_energies, rd, &params, false, cancel)?
         }
         DopplerRoute::SampledTable { .. } => broaden_sampled_table(
             work_energies,
             unbroadened_totals(rd, work_energies),
             rd,
             temperature_k,
+            false,
         )?,
     };
-    Ok((sigma, route))
+    Ok((rows, route))
 }
 
-/// Validate `base_xs` shape against `resonance_data` and `energies`.
+/// Validate a caller-supplied zero-kelvin table against `resonance_data`
+/// and `energies`: one row per isotope, one finite value per energy.
 ///
-/// Shared by the base-XS broadening family so the same `InputMismatch`
-/// diagnostics are produced from one place.
-fn validate_base_xs(
+/// Shared by the base-XS broadening family, [`DopplerPlan::from_explicit_table`]
+/// and the pipeline entry points so the same `InputMismatch` diagnostics
+/// are produced from one place.
+///
+/// # Errors
+/// [`TransmissionError::InputMismatch`] naming the first row count, row
+/// length or non-finite value that disagrees.
+pub fn validate_base_xs(
     energies: &[f64],
     base_xs: &[Vec<f64>],
     resonance_data: &[ResonanceData],
@@ -289,6 +341,11 @@ fn validate_base_xs(
                 "base_xs[{i}] has {} energies but expected {}",
                 row.len(),
                 energies.len(),
+            )));
+        }
+        if let Some((j, value)) = row.iter().enumerate().find(|(_, v)| !v.is_finite()) {
+            return Err(TransmissionError::InputMismatch(format!(
+                "base_xs[{i}][{j}] is not finite ({value})"
             )));
         }
     }
@@ -520,6 +577,10 @@ pub struct WorkingGridXs {
     pub layout: WorkingGridLayout,
     /// The Doppler route each isotope took, aligned with `sigma`.
     pub routes: Vec<DopplerRoute>,
+    /// Per isotope, how many working-grid values SAMMY's negative-value
+    /// rule kept negative (see [`doppler::doppler_broaden`]); the
+    /// disclosure of SAMMY's "Negative cross section" print.
+    pub negative_values: Vec<usize>,
 }
 
 /// Working-grid Doppler-broadened cross-sections and their analytical
@@ -538,6 +599,8 @@ pub struct WorkingGridXsWithDerivative {
     pub layout: WorkingGridLayout,
     /// The Doppler route each isotope took, aligned with `sigma`.
     pub routes: Vec<DopplerRoute>,
+    /// As [`WorkingGridXs::negative_values`].
+    pub negative_values: Vec<usize>,
 }
 
 /// Compute transmission from cross-sections via Beer-Lambert law.
@@ -768,9 +831,9 @@ pub fn forward_model(
         .par_iter()
         .filter(|(_, thickness)| *thickness > 0.0)
         .map(|(res_data, thickness)| {
-            let (after_doppler, _route) =
+            let (rows, _route) =
                 broaden_isotope_on_grid(work_energies, res_data, sample.temperature_k(), None)?;
-            Ok((after_doppler, *thickness))
+            Ok((rows.sigma, *thickness))
         })
         .collect();
     let doppler_xs = doppler_xs?;
@@ -890,7 +953,7 @@ pub fn broadened_cross_sections_on_working_grid(
     // must be applied after Beer-Lambert on total transmission).  σ is returned
     // on the working grid WITHOUT extracting the data points.
     // Cancellation is checked per-isotope inside the parallel map.
-    let result: Result<Vec<(Vec<f64>, DopplerRoute)>, TransmissionError> = resonance_data
+    let result: Result<Vec<(BroadenedRows, DopplerRoute)>, TransmissionError> = resonance_data
         .par_iter()
         .map(|rd| {
             // Check cancellation before starting this isotope.
@@ -907,12 +970,51 @@ pub fn broadened_cross_sections_on_working_grid(
         return Err(TransmissionError::Cancelled);
     }
 
-    let (sigma, routes) = result?.into_iter().unzip();
-    Ok(WorkingGridXs {
-        sigma,
+    let (rows, routes): (Vec<BroadenedRows>, Vec<DopplerRoute>) = result?.into_iter().unzip();
+    Ok(collect_values(rows, layout, routes))
+}
+
+/// Assemble a [`WorkingGridXs`] from per-isotope rows whose derivatives
+/// were not asked for.
+fn collect_values(
+    rows: Vec<BroadenedRows>,
+    layout: WorkingGridLayout,
+    routes: Vec<DopplerRoute>,
+) -> WorkingGridXs {
+    let negative_values = rows.iter().map(|row| row.negative_values).collect();
+    WorkingGridXs {
+        sigma: rows.into_iter().map(|row| row.sigma).collect(),
         layout,
         routes,
-    })
+        negative_values,
+    }
+}
+
+/// Assemble a [`WorkingGridXsWithDerivative`] from per-isotope rows that
+/// were all asked for their derivative.
+fn collect_values_and_derivatives(
+    rows: Vec<BroadenedRows>,
+    layout: WorkingGridLayout,
+    routes: Vec<DopplerRoute>,
+) -> WorkingGridXsWithDerivative {
+    let negative_values = rows.iter().map(|row| row.negative_values).collect();
+    let (sigma, dsigma_dt) = rows
+        .into_iter()
+        .map(|row| {
+            (
+                row.sigma,
+                row.dsigma_dt
+                    .expect("every isotope was asked for its derivative"),
+            )
+        })
+        .unzip();
+    WorkingGridXsWithDerivative {
+        sigma,
+        dsigma_dt,
+        layout,
+        routes,
+        negative_values,
+    }
 }
 
 /// Compute Doppler+resolution-broadened cross-sections using SAMMY's
@@ -984,7 +1086,8 @@ pub fn broadened_cross_sections_for_transmission(
             };
 
             // 1-2. Doppler-broadened σ on the working grid.
-            let (after_doppler, _route) = broaden_isotope_on_grid(grid, rd, temperature_k, cancel)?;
+            let (rows, _route) = broaden_isotope_on_grid(grid, rd, temperature_k, cancel)?;
+            let after_doppler = rows.sigma;
 
             // 3. Convert to transmission: T = exp(-nd × σ_D).
             let transmission: Vec<f64> = after_doppler
@@ -1111,7 +1214,7 @@ pub fn broadened_cross_sections_from_base_on_working_grid(
 
     // Resolution is NOT applied (issue #442).  Doppler broadening on the
     // working grid, returned WITHOUT extracting the data points.
-    let sigma: Result<Vec<Vec<f64>>, TransmissionError> = base_xs
+    let rows: Result<Vec<BroadenedRows>, TransmissionError> = base_xs
         .par_iter()
         .zip(resonance_data.par_iter())
         .map(|(xs_raw, rd)| {
@@ -1121,15 +1224,15 @@ pub fn broadened_cross_sections_from_base_on_working_grid(
             } else {
                 xs_raw.clone()
             };
-            broaden_sampled_table(work_energies, xs_work, rd, temperature_k)
+            broaden_sampled_table(work_energies, xs_work, rd, temperature_k, false)
         })
         .collect();
 
-    Ok(WorkingGridXs {
-        sigma: sigma?,
+    Ok(collect_values(
+        rows?,
         layout,
-        routes: explicit_table_routes(resonance_data.len()),
-    })
+        explicit_table_routes(resonance_data.len()),
+    ))
 }
 
 /// Every isotope of a caller-supplied table takes the sampled-table route
@@ -1210,8 +1313,7 @@ pub fn broadened_cross_sections_with_analytical_derivative_from_base_on_working_
     // Per-isotope: Doppler broaden with analytical derivative on the WORKING
     // grid, returned WITHOUT extracting the data points.
     // Resolution is NOT applied (issue #442).
-    type IsotopeXsDxs = Result<(Vec<f64>, Vec<f64>), TransmissionError>;
-    let results: Vec<IsotopeXsDxs> = base_xs
+    let rows: Result<Vec<BroadenedRows>, TransmissionError> = base_xs
         .par_iter()
         .zip(resonance_data.par_iter())
         .map(|(xs_raw, rd)| {
@@ -1221,24 +1323,15 @@ pub fn broadened_cross_sections_with_analytical_derivative_from_base_on_working_
             } else {
                 xs_raw.clone()
             };
-            broaden_sampled_table_with_derivative(work_energies, xs_work, rd, temperature_k)
+            broaden_sampled_table(work_energies, xs_work, rd, temperature_k, true)
         })
         .collect();
 
-    // Separate into (sigma, dsigma_dt) on the working grid.
-    let mut sigma = Vec::with_capacity(base_xs.len());
-    let mut dsigma_dt = Vec::with_capacity(base_xs.len());
-    for r in results {
-        let (xs, dxs) = r?;
-        sigma.push(xs);
-        dsigma_dt.push(dxs);
-    }
-    Ok(WorkingGridXsWithDerivative {
-        sigma,
-        dsigma_dt,
+    Ok(collect_values_and_derivatives(
+        rows?,
         layout,
-        routes: explicit_table_routes(resonance_data.len()),
-    })
+        explicit_table_routes(resonance_data.len()),
+    ))
 }
 
 /// Compute a transmission spectrum from precomputed unbroadened cross-sections.
@@ -1331,7 +1424,8 @@ pub fn forward_model_from_base_xs(
             } else {
                 xs_raw.clone()
             };
-            broaden_sampled_table(work_energies, xs_ext, rd, temperature_k)
+            broaden_sampled_table(work_energies, xs_ext, rd, temperature_k, false)
+                .map(|rows| rows.sigma)
         })
         .collect();
     let doppler_xs = doppler_xs?;
@@ -1420,6 +1514,26 @@ fn routes_on_working_grid(
         .collect()
 }
 
+/// What [`DopplerPlan::broaden_rows`] computes for one isotope.
+#[derive(Debug, Clone, Copy)]
+enum IsotopeWork {
+    /// Nothing: the caller already holds what it needs for this isotope.
+    Skip,
+    /// The broadened σ only.
+    Value,
+    /// The broadened σ and its temperature derivative.
+    ValueAndDerivative,
+}
+
+/// Per-isotope `∂σ/∂T` on the working grid, `None` where it has not been
+/// computed yet.
+pub type PartialDerivativeRows = Vec<Option<Vec<f64>>>;
+
+/// The rows of an isotope that was not skipped.
+fn evaluated(rows: Option<BroadenedRows>) -> BroadenedRows {
+    rows.expect("the isotope was asked for its value")
+}
+
 /// Per-isotope Doppler routes decided once for a fit, plus the zero-kelvin
 /// data-grid rows that only the sampled-table isotopes need.
 ///
@@ -1446,30 +1560,6 @@ fn routes_on_working_grid(
 /// [`DopplerPlan::from_explicit_table`] wraps a caller-supplied table: the
 /// engine never evaluates that source, so every isotope discloses
 /// [`SampledTableReason::ExplicitTable`] and no temperature gate applies.
-/// What [`DopplerPlan::broaden_rows`] computes for one isotope.
-#[derive(Debug, Clone, Copy)]
-enum IsotopeWork {
-    /// Nothing: the caller already holds what it needs for this isotope.
-    Skip,
-    /// The broadened σ only.
-    Value,
-    /// The broadened σ and its temperature derivative.
-    ValueAndDerivative,
-}
-
-/// One isotope's rows from [`DopplerPlan::broaden_rows`]: `None` when
-/// skipped, else σ and, when asked for, `∂σ/∂T`.
-type IsotopeRows = Option<(Vec<f64>, Option<Vec<f64>>)>;
-
-/// Per-isotope `∂σ/∂T` on the working grid, `None` where it has not been
-/// computed yet.
-pub type PartialDerivativeRows = Vec<Option<Vec<f64>>>;
-
-/// The rows of an isotope that was not skipped.
-fn evaluated(rows: IsotopeRows) -> (Vec<f64>, Option<Vec<f64>>) {
-    rows.expect("the isotope was asked for its value")
-}
-
 #[derive(Debug, Clone)]
 pub struct DopplerPlan {
     routes: Vec<DopplerRoute>,
@@ -1495,9 +1585,10 @@ fn fingerprint_grid(energies: &[f64]) -> u64 {
 
 /// Fingerprint of a source: each isotope's identity and mass; every
 /// range's bounds, formalism, resolved flag, target spin, scattering
-/// radius, radius flag and AP(E) table; every L-group's `l`, mass, radius,
-/// Q-value and competitive-width flag; and every resonance's energy, spin
-/// and widths — everything the route gate and the resonance equation read.
+/// radius, radius flag, AP(E) table and R-external entries; every
+/// L-group's `l`, mass, radius, Q-value and competitive-width flag; and
+/// every resonance's energy, spin and widths — everything the route gate
+/// and the resonance equation read.
 fn fingerprint_source(resonance_data: &[ResonanceData]) -> u64 {
     let mut hasher = DefaultHasher::new();
     resonance_data.len().hash(&mut hasher);
@@ -1521,6 +1612,22 @@ fn fingerprint_source(resonance_data: &[ResonanceData]) -> u64 {
                 for (x, y) in &table.points {
                     x.to_bits().hash(&mut hasher);
                     y.to_bits().hash(&mut hasher);
+                }
+            }
+            range.r_external.len().hash(&mut hasher);
+            for entry in &range.r_external {
+                entry.l.hash(&mut hasher);
+                for value in [
+                    entry.j,
+                    entry.e_low,
+                    entry.e_up,
+                    entry.r_con,
+                    entry.r_lin,
+                    entry.s_con,
+                    entry.s_lin,
+                    entry.r_quad,
+                ] {
+                    value.to_bits().hash(&mut hasher);
                 }
             }
             range.l_groups.len().hash(&mut hasher);
@@ -1695,7 +1802,7 @@ impl DopplerPlan {
         temperature_k: f64,
         instrument: Option<&InstrumentParams>,
         work: impl Fn(usize, &DopplerRoute) -> IsotopeWork + Sync,
-    ) -> Result<(Vec<IsotopeRows>, WorkingGridLayout), TransmissionError> {
+    ) -> Result<(Vec<Option<BroadenedRows>>, WorkingGridLayout), TransmissionError> {
         validate_grid(energies, instrument)?;
         let rd_refs: Vec<&ResonanceData> = resonance_data.iter().collect();
         let ext_grid = build_aux_grid(energies, instrument, &rd_refs);
@@ -1703,7 +1810,7 @@ impl DopplerPlan {
         let (work_energies, layout) = working_grid_layout(energies, ext_grid.as_ref());
         self.check(energies, work_energies, resonance_data, temperature_k)?;
 
-        let rows: Result<Vec<IsotopeRows>, TransmissionError> = self
+        let rows: Result<Vec<Option<BroadenedRows>>, TransmissionError> = self
             .routes
             .par_iter()
             .zip(self.table_rows.par_iter())
@@ -1716,44 +1823,25 @@ impl DopplerPlan {
                     IsotopeWork::ValueAndDerivative => true,
                 };
                 let rows = match (route, row) {
-                    (DopplerRoute::Continuous { .. }, _) if temperature_k <= 0.0 => (
-                        unbroadened_totals(rd, work_energies),
-                        with_derivative.then(|| vec![0.0; work_energies.len()]),
-                    ),
+                    (DopplerRoute::Continuous { .. }, _) if temperature_k <= 0.0 => BroadenedRows {
+                        sigma: unbroadened_totals(rd, work_energies),
+                        dsigma_dt: with_derivative.then(|| vec![0.0; work_energies.len()]),
+                        negative_values: 0,
+                    },
                     (DopplerRoute::Continuous { .. }, _) => {
                         let params = DopplerParams::new(temperature_k, rd.awr)?;
-                        if with_derivative {
-                            let (sigma, dsigma_dt) = continuous_doppler::broaden_with_derivative(
-                                work_energies,
-                                rd,
-                                &params,
-                                None,
-                            )?;
-                            (sigma, Some(dsigma_dt))
-                        } else {
-                            (
-                                continuous_doppler::broaden(work_energies, rd, &params, None)?,
-                                None,
-                            )
-                        }
+                        broaden_continuous(work_energies, rd, &params, with_derivative, None)?
                     }
                     (_, Some(row)) => {
                         let table =
                             self.extend_row(row, rd, ext_grid.as_ref(), is_data_point.as_deref());
-                        if with_derivative {
-                            let (sigma, dsigma_dt) = broaden_sampled_table_with_derivative(
-                                work_energies,
-                                table,
-                                rd,
-                                temperature_k,
-                            )?;
-                            (sigma, Some(dsigma_dt))
-                        } else {
-                            (
-                                broaden_sampled_table(work_energies, table, rd, temperature_k)?,
-                                None,
-                            )
-                        }
+                        broaden_sampled_table(
+                            work_energies,
+                            table,
+                            rd,
+                            temperature_k,
+                            with_derivative,
+                        )?
                     }
                     (_, None) => unreachable!("sampled-table isotopes always carry a row"),
                 };
@@ -1784,11 +1872,11 @@ impl DopplerPlan {
             instrument,
             |_, _| IsotopeWork::Value,
         )?;
-        Ok(WorkingGridXs {
-            sigma: rows.into_iter().map(|row| evaluated(row).0).collect(),
+        Ok(collect_values(
+            rows.into_iter().map(evaluated).collect(),
             layout,
-            routes: self.routes.clone(),
-        })
+            self.routes.clone(),
+        ))
     }
 
     /// Like [`Self::broaden_on_working_grid`] with the analytical
@@ -1810,22 +1898,11 @@ impl DopplerPlan {
             instrument,
             |_, _| IsotopeWork::ValueAndDerivative,
         )?;
-        let (sigma, dsigma_dt) = rows
-            .into_iter()
-            .map(|row| {
-                let (sigma, dsigma_dt) = evaluated(row);
-                (
-                    sigma,
-                    dsigma_dt.expect("every isotope was asked for its derivative"),
-                )
-            })
-            .unzip();
-        Ok(WorkingGridXsWithDerivative {
-            sigma,
-            dsigma_dt,
+        Ok(collect_values_and_derivatives(
+            rows.into_iter().map(evaluated).collect(),
             layout,
-            routes: self.routes.clone(),
-        })
+            self.routes.clone(),
+        ))
     }
 
     /// Like [`Self::broaden_on_working_grid`] with `∂σ/∂T` for the
@@ -1858,15 +1935,9 @@ impl DopplerPlan {
                 DopplerRoute::Unbroadened | DopplerRoute::SampledTable { .. } => IsotopeWork::Value,
             },
         )?;
-        let (sigma, dsigma_dt) = rows.into_iter().map(evaluated).unzip();
-        Ok((
-            WorkingGridXs {
-                sigma,
-                layout,
-                routes: self.routes.clone(),
-            },
-            dsigma_dt,
-        ))
+        let mut rows: Vec<BroadenedRows> = rows.into_iter().map(evaluated).collect();
+        let dsigma_dt = rows.iter_mut().map(|row| row.dsigma_dt.take()).collect();
+        Ok((collect_values(rows, layout, self.routes.clone()), dsigma_dt))
     }
 
     /// Fill every `None` row of `dsigma_dt` with that isotope's `∂σ/∂T` on
@@ -1908,8 +1979,8 @@ impl DopplerPlan {
             },
         )?;
         for (slot, row) in dsigma_dt.iter_mut().zip(rows) {
-            if let Some((_, derivative)) = row {
-                *slot = derivative;
+            if let Some(row) = row {
+                *slot = row.dsigma_dt;
             }
         }
         Ok(())
@@ -1938,7 +2009,9 @@ mod tests {
     use super::*;
     use nereids_core::types::Isotope;
     use nereids_endf::resonance::test_support::{u238_single_resonance, u238_with_formalism};
-    use nereids_endf::resonance::{LGroup, Resonance, ResonanceFormalism, ResonanceRange, Tab1};
+    use nereids_endf::resonance::{
+        LGroup, RExternalEntry, Resonance, ResonanceFormalism, ResonanceRange, Tab1,
+    };
 
     /// Issue #608 R2: the spatial pipeline builds the working-grid σ
     /// (`broadened_cross_sections_on_working_grid`) and the shared layout
@@ -3236,6 +3309,8 @@ mod tests {
                 assert_eq!(via_plan.sigma, direct.sigma);
                 assert_eq!(via_plan.layout.energies, direct.layout.energies);
                 assert_eq!(via_plan.routes, plan.routes());
+                assert_eq!(via_plan.negative_values, direct.negative_values);
+                assert_eq!(direct.negative_values, vec![0, 0]);
 
                 let with_derivative = plan
                     .broaden_with_derivative_on_working_grid(
@@ -3342,7 +3417,21 @@ mod tests {
             });
             let mut apl = mlbw.clone();
             apl.ranges[0].l_groups[0].apl = 9.0;
-            for source in [other_nuclide, nudged, radius, ap_table, apl] {
+            let mut r_external = mlbw.clone();
+            r_external.ranges[0].r_external.push(RExternalEntry {
+                l: 0,
+                j: 0.5,
+                e_low: 1e-5,
+                e_up: 1e4,
+                r_con: 0.1,
+                r_lin: 0.0,
+                s_con: 0.0,
+                s_lin: 0.0,
+                r_quad: 0.0,
+            });
+            let mut r_external_changed = r_external.clone();
+            r_external_changed.ranges[0].r_external[0].r_lin = 1e-9;
+            for source in [other_nuclide, nudged, radius, ap_table, apl, r_external] {
                 let message = mismatch_message(plan.broaden_on_working_grid(
                     &energies,
                     std::slice::from_ref(&source),
@@ -3360,6 +3449,26 @@ mod tests {
                     .is_err()
                 );
             }
+
+            // A plan decided on a source with an R-external entry refuses
+            // the same source with one coefficient of that entry changed.
+            let r_external_plan = DopplerPlan::new(
+                &energies,
+                std::slice::from_ref(&r_external_changed),
+                300.0,
+                None,
+                None,
+            )
+            .unwrap();
+            let mut original = r_external_changed.clone();
+            original.ranges[0].r_external[0].r_lin = 0.0;
+            let message = mismatch_message(r_external_plan.broaden_on_working_grid(
+                &energies,
+                std::slice::from_ref(&original),
+                300.0,
+                None,
+            ));
+            assert!(message.contains("resonance data"), "{message}");
 
             // The inputs the plan was decided on pass on both entry points.
             assert!(

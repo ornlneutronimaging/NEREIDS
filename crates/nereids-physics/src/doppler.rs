@@ -79,6 +79,40 @@ const DOPPLER_N_SIGMA: f64 = 6.0;
 /// create a near-duplicate of the explicit v = 0 anchor point.
 const NEGATIVE_VELOCITY_FLOOR: f64 = 1e-15;
 
+/// Magnitude (barn) below which a negative broadened value is noise and is
+/// set to zero (SAMMY `fgm/mfgm4.f90:84`).
+pub(crate) const NEGATIVE_VALUE_FLOOR_BARN: f64 = 1e-15;
+
+/// SAMMY's rule for a negative broadened cross-section (`fgm/mfgm4.f90`
+/// lines 83-101, `Dopfgm`): a value above `−1e-15` is set to zero; below
+/// it, the value is set to zero when no contributing unbroadened point is
+/// positive — the source is negative throughout the kernel window, so the
+/// convolution cannot mean anything else — and kept otherwise, where SAMMY
+/// prints "Negative cross section" (an SLBW total whose same-J interference
+/// terms outweigh the shared potential term). `true` means zero it.
+///
+/// `sigma` must be negative. `any_source_positive` is consulted only when
+/// the magnitude test does not decide.
+pub(crate) fn zero_negative_value(sigma: f64, any_source_positive: impl FnOnce() -> bool) -> bool {
+    debug_assert!(
+        sigma < 0.0,
+        "the rule applies to negative values only, got {sigma}"
+    );
+    sigma > -NEGATIVE_VALUE_FLOOR_BARN || !any_source_positive()
+}
+
+/// A tier-2 broadening with SAMMY's negative-value bookkeeping.
+#[derive(Debug)]
+pub(crate) struct SampledBroadening {
+    /// The broadened table.
+    pub(crate) sigma: Vec<f64>,
+    /// Points whose negative value [`zero_negative_value`] set to zero; the
+    /// temperature derivative is zero with the value.
+    pub(crate) zeroed: Vec<usize>,
+    /// Points whose negative value was kept.
+    pub(crate) negative_values: usize,
+}
+
 /// Errors from `DopplerParams` construction.
 #[derive(Debug, PartialEq)]
 pub enum DopplerParamsError {
@@ -457,11 +491,24 @@ fn build_extended_fgm_grid(
 /// 3. Compute the integrand Y(w) = w² · s(w) on the extended grid.
 /// 4. For each output velocity, evaluate the Gaussian convolution integral.
 /// 5. Transform back: σ_D(E) = result / E.
+/// 6. Apply SAMMY's negative-value rule (`fgm/mfgm4.f90:83-101`): a
+///    negative result is zeroed when it is above −1e-15 barn or when no
+///    table node inside the kernel window is positive, and kept otherwise.
 pub fn doppler_broaden(
     energies: &[f64],
     cross_sections: &[f64],
     params: &DopplerParams,
 ) -> Result<Vec<f64>, DopplerError> {
+    doppler_broaden_counted(energies, cross_sections, params).map(|broadened| broadened.sigma)
+}
+
+/// [`doppler_broaden`] with the points the negative-value rule zeroed and
+/// the count of negative values it kept.
+pub(crate) fn doppler_broaden_counted(
+    energies: &[f64],
+    cross_sections: &[f64],
+    params: &DopplerParams,
+) -> Result<SampledBroadening, DopplerError> {
     if energies.len() != cross_sections.len() {
         return Err(DopplerError::LengthMismatch {
             energies: energies.len(),
@@ -476,13 +523,18 @@ pub fn doppler_broaden(
     // unsorted grids would give unspecified `partition_point` indices.
     validate_doppler_grid(energies)?;
 
+    let unbroadened = || SampledBroadening {
+        sigma: cross_sections.to_vec(),
+        zeroed: Vec::new(),
+        negative_values: 0,
+    };
     if params.temperature_k() <= 0.0 || energies.is_empty() {
-        return Ok(cross_sections.to_vec());
+        return Ok(unbroadened());
     }
 
     let u = params.u();
     if u < NEAR_ZERO_FLOOR {
-        return Ok(cross_sections.to_vec());
+        return Ok(unbroadened());
     }
 
     let n = energies.len();
@@ -528,6 +580,8 @@ pub fn doppler_broaden(
     // zeroth-order Voronoi cell approach (error ∝ h).
 
     let mut broadened = vec![0.0f64; n];
+    let mut zeroed = Vec::new();
+    let mut negative_values = 0usize;
 
     for i in 0..n {
         let v = velocities[i];
@@ -561,6 +615,12 @@ pub fn doppler_broaden(
             n_passthrough += 1;
             continue;
         }
+        // The table nodes inside the window are the contributing
+        // unbroadened points of SAMMY's negative-value rule. `Y = w²·σ` on
+        // the positive branch and `−w²·σ` on the image branch, so the sign
+        // of `Y·w` is the sign of σ at every node but `w = 0`, where σ is
+        // not sampled.
+        let window_has_positive_node = || (j_lo..j_hi).any(|j| ext_y[j] * ext_v[j] > 0.0);
 
         // PW-linear FGM integral: segment-by-segment exact integration.
         //
@@ -622,12 +682,21 @@ pub fn doppler_broaden(
         }
 
         // σ_D(E) = Σ(C × J₀ − u × slope × J₁) / (Σ J₀ × E)
-        // The sign is the table's: a positive table broadens to a positive
-        // value (the kernel weights are positive), and a negative SLBW
-        // total — the interference term outweighing potential scattering —
-        // is passed through, exactly as the derivative path and the
-        // continuous route treat it.
-        broadened[i] = sum_y / (sum_g * e);
+        // A positive table broadens to a positive value (the kernel weights
+        // are positive). A negative value — an SLBW total whose
+        // interference term outweighs potential scattering — goes through
+        // SAMMY's rule: zeroed when negligible or when the whole window is
+        // negative, kept and counted otherwise. The continuous route
+        // applies the same rule to its quadrature nodes.
+        let value = sum_y / (sum_g * e);
+        if value < 0.0 {
+            if zero_negative_value(value, window_has_positive_node) {
+                zeroed.push(i);
+                continue;
+            }
+            negative_values += 1;
+        }
+        broadened[i] = value;
     }
 
     // SAMMY parity diagnostic (`fgm/mfgm1.f90:240`: "No Doppler broadening
@@ -647,7 +716,11 @@ pub fn doppler_broaden(
         });
     }
 
-    Ok(broadened)
+    Ok(SampledBroadening {
+        sigma: broadened,
+        zeroed,
+        negative_values,
+    })
 }
 
 /// Doppler-broaden cross-sections AND compute the analytical temperature
@@ -683,6 +756,10 @@ pub fn doppler_broaden(
 /// * `cross_sections` — Unbroadened cross-sections in barns at each energy point.
 /// * `params` — Doppler broadening parameters (temperature and AWR).
 ///
+/// A point whose negative value the rule of [`doppler_broaden`] set to
+/// zero has a zero derivative: the value no longer moves with the
+/// temperature.
+///
 /// # Errors
 /// Returns the same `DopplerError` variants as [`doppler_broaden`].
 pub fn doppler_broaden_with_derivative(
@@ -690,9 +767,20 @@ pub fn doppler_broaden_with_derivative(
     cross_sections: &[f64],
     params: &DopplerParams,
 ) -> Result<(Vec<f64>, Vec<f64>), DopplerError> {
+    doppler_broaden_with_derivative_counted(energies, cross_sections, params)
+        .map(|(broadened, derivative)| (broadened.sigma, derivative))
+}
+
+/// [`doppler_broaden_with_derivative`] with the negative-value bookkeeping
+/// of [`doppler_broaden_counted`].
+pub(crate) fn doppler_broaden_with_derivative_counted(
+    energies: &[f64],
+    cross_sections: &[f64],
+    params: &DopplerParams,
+) -> Result<(SampledBroadening, Vec<f64>), DopplerError> {
     // First, compute the broadened values using the SAME code path as
     // doppler_broaden to guarantee identical forward-pass results.
-    let broadened = doppler_broaden(energies, cross_sections, params)?;
+    let broadened = doppler_broaden_counted(energies, cross_sections, params)?;
 
     let n = energies.len();
     if n == 0 {
@@ -801,6 +889,9 @@ pub fn doppler_broaden_with_derivative(
         } else {
             derivative[i] = 0.0;
         }
+    }
+    for &i in &broadened.zeroed {
+        derivative[i] = 0.0;
     }
 
     Ok((broadened, derivative))
@@ -1108,6 +1199,91 @@ mod tests {
             doppler_broaden_with_derivative(&[], &[], &params_300).unwrap();
         assert!(broadened.is_empty());
         assert!(derivative.is_empty());
+    }
+
+    /// SAMMY's negative-value rule (`fgm/mfgm4.f90:83-101`), branch by
+    /// branch: a window with no positive table node is zeroed, a
+    /// negligible negative value is zeroed although the window holds a
+    /// positive node, and a mixed window keeps its negative value. The
+    /// derivative is zero wherever the value was zeroed.
+    #[test]
+    fn negative_rule_zeroes_an_all_negative_window() {
+        let energies: Vec<f64> = (0..421).map(|i| 80.0 + 0.1 * i as f64).collect();
+        let xs = vec![-10.0; energies.len()];
+        let params = DopplerParams::new(300.0, 1.0).unwrap();
+        let (broadened, derivative) =
+            doppler_broaden_with_derivative_counted(&energies, &xs, &params).unwrap();
+        assert!(
+            broadened.sigma.iter().all(|&v| v == 0.0),
+            "{:?}",
+            broadened.sigma
+        );
+        assert_eq!(broadened.negative_values, 0);
+        assert_eq!(broadened.zeroed.len(), energies.len());
+        assert!(derivative.iter().all(|&d| d == 0.0));
+        assert_eq!(
+            doppler_broaden(&energies, &xs, &params).unwrap(),
+            broadened.sigma
+        );
+    }
+
+    #[test]
+    fn negative_rule_zeroes_a_negligible_value_despite_a_positive_node() {
+        let energies: Vec<f64> = (0..421).map(|i| 80.0 + 0.1 * i as f64).collect();
+        let centre = 200;
+        let mut xs = vec![-9.0e-16; energies.len()];
+        xs[centre + 1] = 1.0e-16;
+        let params = DopplerParams::new(300.0, 1.0).unwrap();
+        let unclamped = {
+            // The same table scaled by 1e16 is far below the floor in
+            // magnitude terms only after scaling back: it shows the rule
+            // fired on magnitude, not on the (positive) node.
+            let scaled: Vec<f64> = xs.iter().map(|v| v * 1.0e16).collect();
+            doppler_broaden_counted(&energies, &scaled, &params).unwrap()
+        };
+        assert!(
+            unclamped.sigma[centre] < 0.0 && unclamped.negative_values > 0,
+            "the scaled window must keep its negative value: {}",
+            unclamped.sigma[centre]
+        );
+        let broadened = doppler_broaden_counted(&energies, &xs, &params).unwrap();
+        assert_eq!(broadened.sigma[centre], 0.0);
+        assert!(broadened.zeroed.contains(&centre));
+    }
+
+    #[test]
+    fn negative_rule_keeps_a_mixed_window() {
+        // AWR = 1 at 300 K: u ≈ 0.16 √eV, so the ±6u window at 100 eV spans
+        // 82–120 eV; a −20 barn core over 97–103 eV surrounded by +10 barn
+        // broadens negative with positive nodes inside the window.
+        let energies: Vec<f64> = (0..421).map(|i| 80.0 + 0.1 * i as f64).collect();
+        let xs: Vec<f64> = energies
+            .iter()
+            .map(|&e| {
+                if (97.0..=103.0).contains(&e) {
+                    -20.0
+                } else {
+                    10.0
+                }
+            })
+            .collect();
+        let centre = 200;
+        assert_eq!(energies[centre], 100.0);
+        let params = DopplerParams::new(300.0, 1.0).unwrap();
+        let (broadened, derivative) =
+            doppler_broaden_with_derivative_counted(&energies, &xs, &params).unwrap();
+        assert!(
+            broadened.sigma[centre] < -1.0,
+            "the core must broaden negative: {}",
+            broadened.sigma[centre]
+        );
+        assert!(broadened.negative_values > 0);
+        assert!(!broadened.zeroed.contains(&centre));
+        assert!(
+            derivative[centre].is_finite() && derivative[centre] != 0.0,
+            "a kept value keeps its derivative: {}",
+            derivative[centre]
+        );
     }
 
     #[test]

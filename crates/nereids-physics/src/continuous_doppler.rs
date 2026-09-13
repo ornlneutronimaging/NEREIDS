@@ -50,6 +50,7 @@
 //! K21 result is kept and `|K21 − G10|` is the error estimate. Exceeding
 //! a hard limit is an error, never a silently degraded value.
 
+use std::cell::Cell;
 use std::cmp::Ordering;
 use std::collections::BinaryHeap;
 use std::fmt;
@@ -58,7 +59,7 @@ use std::sync::atomic::{AtomicBool, Ordering as AtomicOrdering};
 use nereids_endf::resonance::{ResonanceData, ResonanceFormalism, ResonanceRange};
 use rayon::prelude::*;
 
-use crate::doppler::DopplerParams;
+use crate::doppler::{DopplerParams, zero_negative_value};
 use crate::doppler_route::{DopplerRoute, SampledTableReason};
 use crate::reich_moore::{CrossSectionPlan, CrossSections, range_covers, upper_bound_is_half_open};
 
@@ -206,8 +207,8 @@ pub enum ContinuousDopplerError {
     },
     /// The converged integral is non-finite. A negative value is not an
     /// error: an SLBW total can be negative where the interference term
-    /// outweighs potential scattering, and the sampled-table route passes
-    /// the same values through.
+    /// outweighs potential scattering, and both tiers apply SAMMY's rule
+    /// to it (`fgm/mfgm4.f90:83-101`; see [`crate::doppler::doppler_broaden`]).
     InvalidIntegral {
         /// Target energy (eV).
         energy_ev: f64,
@@ -442,6 +443,20 @@ fn tier_one_check(
         return Err(uncovered_energy_reason(data, energy_ev));
     };
     if !is_tier_one_formalism(range) {
+        // A resolved SLBW/MLBW range with no resonances is accepted by the
+        // parser but evaluates to nothing, so it is not the formalism that
+        // demotes the isotope; name the empty range instead.
+        if range.resolved
+            && matches!(
+                range.formalism,
+                ResonanceFormalism::SLBW | ResonanceFormalism::MLBW
+            )
+        {
+            return Err(SampledTableReason::EmptyResolvedRange {
+                energy_ev,
+                formalism: range.formalism,
+            });
+        }
         return Err(SampledTableReason::Formalism {
             energy_ev,
             formalism: Some(range.formalism),
@@ -508,6 +523,26 @@ struct Integral {
     derivative: f64,
 }
 
+/// One target's converged integral after SAMMY's negative-value rule.
+#[derive(Debug, Clone, Copy)]
+struct TargetIntegral {
+    value: f64,
+    derivative: f64,
+    /// The value is negative and the rule kept it.
+    kept_negative: bool,
+}
+
+/// What [`broaden_integrals`] returns for one channel on a grid.
+#[derive(Debug)]
+pub(crate) struct TierOneBroadening {
+    /// The broadened channel at every target energy.
+    pub(crate) values: Vec<f64>,
+    /// Its temperature derivative (zero unless requested).
+    pub(crate) derivatives: Vec<f64>,
+    /// Targets whose negative value the rule kept.
+    pub(crate) negative_values: usize,
+}
+
 #[derive(Debug, Clone)]
 struct Panel {
     left: f64,
@@ -555,6 +590,10 @@ struct TargetContext<'plan, 'data> {
     temperature_k: f64,
     require_derivative: bool,
     budget: QuadratureBudget,
+    /// Whether any quadrature node evaluated so far had a positive σ: the
+    /// contributing unbroadened points of SAMMY's negative-value rule are
+    /// the nodes the integral was built from.
+    any_source_positive: Cell<bool>,
 }
 
 impl TargetContext<'_, '_> {
@@ -562,6 +601,9 @@ impl TargetContext<'_, '_> {
     fn integrand(&self, x: f64) -> (f64, f64) {
         let source_energy = (self.target_speed + self.thermal_u * x).powi(2);
         let sigma = self.channel.pick(&self.plan.evaluate_one(source_energy));
+        if sigma > 0.0 {
+            self.any_source_positive.set(true);
+        }
         let value = (-x * x).exp() * source_energy * sigma / (SQRT_PI * self.target_energy);
         (value, value * (x * x - 0.5) / self.temperature_k)
     }
@@ -666,7 +708,7 @@ impl TargetContext<'_, '_> {
         points
     }
 
-    fn integrate(&self, range: &ResonanceRange) -> Result<Integral, ContinuousDopplerError> {
+    fn integrate(&self, range: &ResonanceRange) -> Result<TargetIntegral, ContinuousDopplerError> {
         let points = self.breakpoints(range);
         let mut heap = BinaryHeap::with_capacity(points.len());
         let mut value = 0.0;
@@ -728,9 +770,6 @@ impl TargetContext<'_, '_> {
             heap.extend(children);
         }
 
-        // Sign is the source's property, not the integral's: the SLBW
-        // interference term makes the documented negative totals that the
-        // sampled-table route passes through, so only finiteness is checked.
         if !value.is_finite() {
             return Err(ContinuousDopplerError::InvalidIntegral {
                 energy_ev: self.target_energy,
@@ -743,7 +782,30 @@ impl TargetContext<'_, '_> {
                 value: derivative,
             });
         }
-        Ok(Integral { value, derivative })
+        // SAMMY's negative-value rule (`fgm/mfgm4.f90:83-101`), with the
+        // quadrature nodes as the contributing unbroadened points: an SLBW
+        // total whose interference terms outweigh the shared potential term
+        // is kept where some node was positive, zeroed (derivative with it)
+        // where none was or where the value is negligible.
+        if value < 0.0 {
+            if zero_negative_value(value, || self.any_source_positive.get()) {
+                return Ok(TargetIntegral {
+                    value: 0.0,
+                    derivative: 0.0,
+                    kept_negative: false,
+                });
+            }
+            return Ok(TargetIntegral {
+                value,
+                derivative,
+                kept_negative: true,
+            });
+        }
+        Ok(TargetIntegral {
+            value,
+            derivative,
+            kept_negative: false,
+        })
     }
 }
 
@@ -769,7 +831,8 @@ pub(crate) fn validate_energies(energies: &[f64]) -> Result<(), ContinuousDopple
 }
 
 /// Value and (optionally converged) derivative of one channel at every
-/// target energy, under an explicit quadrature budget.
+/// target energy, under an explicit quadrature budget, with the count of
+/// negative values SAMMY's rule kept.
 ///
 /// The gate runs first at the kernel width of `params`, so a source that
 /// does not qualify is refused with [`ContinuousDopplerError::NotTierOne`]
@@ -785,7 +848,7 @@ pub(crate) fn broaden_integrals(
     require_derivative: bool,
     budget: QuadratureBudget,
     cancel: Option<&AtomicBool>,
-) -> Result<(Vec<f64>, Vec<f64>), ContinuousDopplerError> {
+) -> Result<TierOneBroadening, ContinuousDopplerError> {
     validate_energies(energies)?;
     let thermal_u = params.u();
     let temperature_k = params.temperature_k();
@@ -803,7 +866,11 @@ pub(crate) fn broaden_integrals(
         }
     }
     if energies.is_empty() {
-        return Ok((Vec::new(), Vec::new()));
+        return Ok(TierOneBroadening {
+            values: Vec::new(),
+            derivatives: Vec::new(),
+            negative_values: 0,
+        });
     }
 
     let plan = CrossSectionPlan::new(data);
@@ -812,7 +879,11 @@ pub(crate) fn broaden_integrals(
             .iter()
             .map(|&energy| channel.pick(&plan.evaluate_one(energy)))
             .collect();
-        return Ok((values, vec![0.0; energies.len()]));
+        return Ok(TierOneBroadening {
+            values,
+            derivatives: vec![0.0; energies.len()],
+            negative_values: 0,
+        });
     }
 
     // Each target is an independent integral, so the targets are the unit
@@ -820,7 +891,7 @@ pub(crate) fn broaden_integrals(
     // per-isotope parallelism alone would leave this serial). Results are
     // gathered as a plain vector so that the error reported is always the
     // lowest-index failure, independent of thread scheduling.
-    let results: Vec<Result<Integral, ContinuousDopplerError>> = energies
+    let results: Vec<Result<TargetIntegral, ContinuousDopplerError>> = energies
         .par_iter()
         .zip(ranges.par_iter())
         .map(|(&target_energy, range)| {
@@ -836,17 +907,24 @@ pub(crate) fn broaden_integrals(
                 temperature_k,
                 require_derivative,
                 budget,
+                any_source_positive: Cell::new(false),
             }
             .integrate(range)
         })
         .collect();
     let integrals = results
         .into_iter()
-        .collect::<Result<Vec<Integral>, ContinuousDopplerError>>()?;
-    Ok(integrals
+        .collect::<Result<Vec<TargetIntegral>, ContinuousDopplerError>>()?;
+    let negative_values = integrals.iter().filter(|i| i.kept_negative).count();
+    let (values, derivatives) = integrals
         .into_iter()
         .map(|integral| (integral.value, integral.derivative))
-        .unzip())
+        .unzip();
+    Ok(TierOneBroadening {
+        values,
+        derivatives,
+        negative_values,
+    })
 }
 
 /// Tier-1 cross-section of one channel at every target energy.
@@ -871,7 +949,7 @@ pub fn broaden_channel(
         QuadratureBudget::default(),
         cancel,
     )
-    .map(|(values, _)| values)
+    .map(|broadening| broadening.values)
 }
 
 /// Tier-1 total cross-section at every target energy.
@@ -907,6 +985,7 @@ pub fn broaden_with_derivative(
         QuadratureBudget::default(),
         cancel,
     )
+    .map(|broadening| (broadening.values, broadening.derivatives))
 }
 
 #[cfg(test)]
@@ -1053,6 +1132,40 @@ mod tests {
             broaden(&[6.674], &data, &params, None),
             Err(ContinuousDopplerError::NotTierOne { reason: expected })
         );
+    }
+
+    /// A resolved SLBW range that the parser accepted with no resonances
+    /// evaluates to nothing, so it is named as such — neither "SLBW
+    /// formalism" (which would qualify) nor an edge fallback.
+    #[test]
+    fn empty_resolved_range_is_named_and_is_not_an_edge_fallback() {
+        let mut empty = u238_with_formalism(ResonanceFormalism::SLBW);
+        for group in &mut empty.ranges[0].l_groups {
+            group.resonances.clear();
+        }
+        assert!(!empty.ranges[0].is_evaluable());
+        let params = DopplerParams::new(ROOM_K, empty.awr).unwrap();
+        let route = classify_isotope(&empty, &[6.674, 6.9], params.u());
+        assert_eq!(
+            route,
+            DopplerRoute::SampledTable {
+                reason: SampledTableReason::EmptyResolvedRange {
+                    energy_ev: 6.674,
+                    formalism: ResonanceFormalism::SLBW,
+                }
+            }
+        );
+        assert_eq!(
+            route.to_string(),
+            "sampled-table kernel-on-grid (resolved SLBW range with no resonances at 6.67e0 eV)"
+        );
+        assert!(!route.is_edge_fallback());
+        assert!(matches!(
+            broaden(&[6.674], &empty, &params, None),
+            Err(ContinuousDopplerError::NotTierOne {
+                reason: SampledTableReason::EmptyResolvedRange { .. }
+            })
+        ));
     }
 
     #[test]
@@ -1546,8 +1659,14 @@ mod tests {
     /// Lorentzian tails), which is how SAMMY's `Dopfgm` integrates; the
     /// sampled route in this crate reproduces the same 8.0e-3 against the
     /// same reference (`doppler::tests::test_sammy_ex001_fgm_doppler`).
-    /// The gate is held at 8.5e-3, so a further 0.4 % of drift over the
-    /// measured 7.7e-3 fails; the wing agreement is pinned at 1e-4.
+    /// The gate is held at 8.5e-3, 0.08 percentage points above the
+    /// measured 7.73e-3, so it catches a shape change in the Doppler core
+    /// but is blind to a shift of the whole curve of that size: the
+    /// mass-ratio correction from 10.0 to 10.0 amu in neutron masses moved
+    /// the kernel width by 0.43 %, which this gate sees only through the
+    /// width-sensitive core, so the FWHM oracle
+    /// (`narrow_line_broadens_to_the_free_gas_fwhm`) pins the width
+    /// directly; the wing agreement is pinned at 1e-4.
     #[test]
     fn sammy_ex001_full_curve_through_tier_one() {
         let data = ex001_hydrogen_single_resonance();
@@ -1735,45 +1854,77 @@ mod tests {
         data
     }
 
+    /// SAMMY's negative-value rule on both tiers (`fgm/mfgm4.f90:83-101`).
+    /// At 20 020 eV the total is negative and both tiers see a positive
+    /// contributing point (the sign change near 20 045 eV lies inside
+    /// tier 2's ±6u window and tier 1's ±8u nodes), so both keep the
+    /// value and agree; at 19 960 eV every contributing point is negative
+    /// on both tiers, so both zero it and the derivative with it.
     #[test]
     fn negative_slbw_totals_broaden_through_tier_one() {
         let data = two_level_slbw_with_negative_total();
         let params = DopplerParams::new(300.0, data.awr).unwrap();
-        let target = 20_000.0;
-        let unbroadened = CrossSectionPlan::new(&data).evaluate_one(target).total;
-        assert!(
-            unbroadened < 0.0,
-            "the control needs a negative unbroadened total: {unbroadened}"
-        );
+        let kept = 20_020.0;
+        let zeroed = 19_960.0;
+        let plan = CrossSectionPlan::new(&data);
+        for target in [kept, zeroed] {
+            let unbroadened = plan.evaluate_one(target).total;
+            assert!(
+                unbroadened < 0.0,
+                "the control needs a negative unbroadened total at {target}: {unbroadened}"
+            );
+        }
         assert_eq!(
-            classify_isotope(&data, &[target], params.u()),
+            classify_isotope(&data, &[zeroed, kept], params.u()),
             DopplerRoute::Continuous {
                 formalism: ResonanceFormalism::SLBW
             }
         );
-        let (values, derivatives) =
-            broaden_with_derivative(&[target], &data, &params, None).unwrap();
-        assert!(
-            values[0].is_finite() && values[0] < 0.0,
-            "tier 1 must pass the negative total through: {}",
-            values[0]
+        let tier_one = broaden_integrals(
+            &[zeroed, kept],
+            &data,
+            &params,
+            Channel::Total,
+            true,
+            QuadratureBudget::default(),
+            None,
+        )
+        .unwrap();
+        assert_eq!(tier_one.negative_values, 1);
+        assert_eq!(
+            (tier_one.values[0], tier_one.derivatives[0]),
+            (0.0, 0.0),
+            "an all-negative window is zeroed with its derivative"
         );
-        assert!(derivatives[0].is_finite());
+        assert!(
+            tier_one.values[1].is_finite() && tier_one.values[1] < 0.0,
+            "tier 1 must keep the negative total of a mixed window: {}",
+            tier_one.values[1]
+        );
+        assert!(tier_one.derivatives[1].is_finite() && tier_one.derivatives[1] != 0.0);
 
         // The sampled route on a 0.5 eV base grid refined 64× (7.8 meV
-        // steps against 30 eV line widths) agrees with the integral.
+        // steps against 30 eV line widths) applies the same rule to its
+        // window nodes and agrees with the integral where both keep.
         let grid: Vec<f64> = (0..=25_600)
             .map(|i| 19_900.0 + i as f64 * (200.0 / 25_600.0))
             .collect();
-        let index = 12_800;
-        assert_eq!(grid[index], target);
-        let sampled = sampled_total(&grid, &data, &params)[index];
-        assert!(sampled < 0.0, "tier 2 must not clamp the sign: {sampled}");
-        let rel = (sampled - values[0]).abs() / values[0].abs();
+        let step = 200.0 / 25_600.0;
+        let index_of = |target: f64| ((target - 19_900.0) / step).round() as usize;
+        assert_eq!(grid[index_of(kept)], kept);
+        assert_eq!(grid[index_of(zeroed)], zeroed);
+        let sampled = sampled_total(&grid, &data, &params);
+        assert_eq!(sampled[index_of(zeroed)], 0.0);
+        let sampled = sampled[index_of(kept)];
+        assert!(
+            sampled < 0.0,
+            "tier 2 must keep the mixed window: {sampled}"
+        );
+        let rel = (sampled - tier_one.values[1]).abs() / tier_one.values[1].abs();
         assert!(
             rel <= 1.0e-4,
             "continuous={} sampled={sampled} rel={rel:.3e}",
-            values[0]
+            tier_one.values[1]
         );
     }
 
