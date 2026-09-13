@@ -6,7 +6,8 @@
 //! ## Modules
 //! - [`auxiliary_grid`] — Auxiliary energy-grid construction for resolution broadening
 //! - [`channel`] — Wave number, ρ parameter, statistical weight calculations
-//! - [`doppler`] — Free Gas Model Doppler broadening
+//! - [`doppler`] — Free Gas Model Doppler broadening, sampled-table tier
+//! - [`doppler_route`] — Per-isotope Doppler route (tier) and its disclosure
 //! - [`penetrability`] — Hard-sphere penetrability, shift, and phase shift functions
 //! - [`reich_moore`] — Reich-Moore R-matrix cross-section formalism
 //! - [`resolution`] — Instrument resolution broadening (Gaussian convolution)
@@ -26,6 +27,7 @@ pub mod auxiliary_grid;
 pub mod channel;
 pub mod counts_response;
 pub mod doppler;
+pub mod doppler_route;
 pub mod ikeda_carpenter;
 pub mod penetrability;
 pub mod reich_moore;

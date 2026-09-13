@@ -488,6 +488,20 @@ impl ResonanceRange {
             && self.l_groups.iter().any(|lg| !lg.resonances.is_empty())
     }
 
+    /// Whether this range carries a File-3 (MF=3) smooth background
+    /// cross-section term.
+    ///
+    /// Only File 2 is parsed; MF=3 is unrepresented anywhere in the
+    /// codebase, so this is `false` for every range today. The predicate
+    /// exists because the two-tier Doppler contract routes any isotope with
+    /// a File-3 term to the sampled-table tier, and the route gate already
+    /// consults it: the change that introduces MF=3 support must make this
+    /// observe the parsed data, and then File-3 data cannot silently take
+    /// the continuous route.
+    pub fn has_file3_background(&self) -> bool {
+        false
+    }
+
     /// One-line diagnostic for a parse-and-skip placeholder range, e.g.
     /// `"LRF=7 (R-Matrix Limited) over [1.000000e-5, 1.000000e3] eV"`.
     ///
@@ -702,6 +716,10 @@ mod tests {
         assert!(
             range.is_evaluable(),
             "a resonance-bearing L-group is evaluable"
+        );
+        assert!(
+            !range.has_file3_background(),
+            "File 2 alone never carries an MF=3 background term"
         );
     }
 
