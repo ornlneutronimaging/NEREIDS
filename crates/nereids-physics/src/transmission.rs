@@ -1573,10 +1573,15 @@ fn evaluated(rows: Option<BroadenedRows>) -> BroadenedRows {
 ///
 /// [`DopplerPlan::from_explicit_table`] wraps a caller-supplied table: the
 /// table replaces the evaluation of the resonance source on the data grid,
-/// so every isotope discloses [`SampledTableReason::ExplicitTable`] and no
-/// temperature gate applies; under Gaussian resolution the auxiliary-only
-/// points of the working grid are still evaluated from the source, which
-/// must therefore describe the same isotope.
+/// so every isotope discloses [`SampledTableReason::ExplicitTable`] and the
+/// TIER gate never runs — the caller fixed the route, no temperature chose
+/// it, and the plan's gate temperature is `+∞` so no evaluation is ever
+/// above it. The temperature CONTRACT still binds such a plan: `check`
+/// refuses every temperature the broadeners refuse (negative, NaN, `±∞`),
+/// because a plan that discloses a route must not evaluate at a temperature
+/// nothing could have been broadened at. Under Gaussian resolution the
+/// auxiliary-only points of the working grid are still evaluated from the
+/// source, which must therefore describe the same isotope.
 #[derive(Debug, Clone)]
 pub struct DopplerPlan {
     routes: Vec<DopplerRoute>,
@@ -1746,8 +1751,12 @@ impl DopplerPlan {
         &self.routes
     }
 
-    /// The temperature the routes were decided at (`+∞` for an explicit
-    /// table, which is never gated).
+    /// The temperature the TIER gate decided the routes at. `+∞` for an
+    /// explicit table, whose routes the caller fixed without any tier gate
+    /// running, so the ceiling this value expresses is vacuous there. It is
+    /// not the plan's whole temperature contract: `check` refuses a
+    /// temperature the broadeners refuse (negative, NaN, `±∞`) before it
+    /// compares against this ceiling, on every plan.
     pub fn gate_temperature_k(&self) -> f64 {
         self.gate_temperature_k
     }
@@ -3452,6 +3461,11 @@ mod tests {
     /// the unbroadened σ, and the plan would disclose the continuous route
     /// whose integral never ran. The explicit-table plan's gate is `+∞`,
     /// so its only temperature screen is this one.
+    ///
+    /// `+∞` is in the loop because it is the case the two screens disagree
+    /// about: the gate alone refuses it on a finite-gate plan (as "above
+    /// the gate") and admits it on the `+∞`-gate explicit table, so only
+    /// the broadeners' own check refuses it on both.
     #[test]
     fn doppler_plan_refuses_a_temperature_the_broadeners_reject() {
         let mlbw = u238_with_formalism(ResonanceFormalism::MLBW);
@@ -3475,6 +3489,10 @@ mod tests {
                 (
                     f64::NEG_INFINITY,
                     DopplerParamsError::NonFiniteTemperature(f64::NEG_INFINITY),
+                ),
+                (
+                    f64::INFINITY,
+                    DopplerParamsError::NonFiniteTemperature(f64::INFINITY),
                 ),
             ] {
                 let value = plan
