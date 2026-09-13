@@ -11,6 +11,7 @@ use std::fmt;
 use std::sync::Arc;
 
 use nereids_core::constants::{EV_TO_JOULES, NEUTRON_MASS_KG, PIVOT_FLOOR, tof_to_energy};
+use nereids_core::elements::isotope_to_string;
 use nereids_endf::resonance::ResonanceData;
 use nereids_fitting::exact_count_model::ExactTwoArmRatioModel;
 use nereids_fitting::joint_poisson::{self, JointPoissonFitConfig, JointPoissonObjective};
@@ -19,8 +20,8 @@ use nereids_fitting::parameters::{FitParameter, ParameterSet};
 use nereids_fitting::poisson::{self, PoissonConfig};
 use nereids_fitting::transmission_model::{
     EnergyScaleTransmissionModel, MultiplicativeBaselineModel, NormalizedTransmissionModel,
-    PrecomputedTransmissionModel, TEMPERATURE_FIT_LOWER_BOUND_K, TEMPERATURE_FIT_UPPER_BOUND_K,
-    TransmissionFitModel,
+    PinnedDopplerRoutes, PrecomputedTransmissionModel, TEMPERATURE_FIT_LOWER_BOUND_K,
+    TEMPERATURE_FIT_UPPER_BOUND_K, TransmissionFitModel,
 };
 use nereids_physics::counts_response::DetectorBinResponseMatrix;
 use nereids_physics::doppler_route::{DopplerRoute, IsotopeDopplerRoute, edge_fallback_warning};
@@ -3006,8 +3007,9 @@ enum RouteSource {
     /// Decided when the model was built.
     Known(Vec<DopplerRoute>),
     /// Pinned by the energy-scale model at its first probe; read after the
-    /// fit, so the disclosed routes are the executed ones.
-    Pinned(std::rc::Rc<std::cell::RefCell<Option<Vec<DopplerRoute>>>>),
+    /// fit, so the disclosed routes are the executed ones and the probes
+    /// refused for wanting another route reach the warnings.
+    Pinned(std::rc::Rc<std::cell::RefCell<PinnedDopplerRoutes>>),
 }
 
 impl From<Option<Vec<DopplerRoute>>> for RouteSource {
@@ -3024,8 +3026,35 @@ impl RouteSource {
         match self {
             RouteSource::None => None,
             RouteSource::Known(routes) => Some(routes.clone()),
-            RouteSource::Pinned(cell) => cell.borrow().clone(),
+            RouteSource::Pinned(cell) => cell.borrow().routes.clone(),
         }
+    }
+
+    /// The `warnings` line for probes the energy-scale model refused, or
+    /// `None` when nothing was refused (or the routes were not pinned).
+    ///
+    /// A refused probe is a rejected optimizer step: the fit stays on the
+    /// pinned side of the resolved-range edge and the finite-difference
+    /// column across it reads zero, so the barrier is disclosed rather
+    /// than left silent.
+    fn refused_probe_warning(&self, labelled: &[IsotopeDopplerRoute]) -> Option<String> {
+        let RouteSource::Pinned(cell) = self else {
+            return None;
+        };
+        let pinned = cell.borrow();
+        if pinned.refused_probes == 0 {
+            return None;
+        }
+        let route = pinned
+            .refused_isotope
+            .and_then(|index| labelled.get(index))?;
+        Some(format!(
+            "energy-scale fit rejected {} probe(s) that would have changed the Doppler route \
+             of {}; the fit stayed on the {} side of the resolved-range edge",
+            pinned.refused_probes,
+            isotope_to_string(&route.isotope),
+            route.route.tier_label(),
+        ))
     }
 }
 
@@ -3059,6 +3088,7 @@ fn doppler_disclosure(
     let warnings = labelled
         .iter()
         .filter_map(|route| edge_fallback_warning(route, gate_temperature_k))
+        .chain(source.refused_probe_warning(&labelled))
         .collect();
     (Some(labelled), warnings)
 }
@@ -9506,6 +9536,45 @@ mod tests {
         assert_eq!(
             result.doppler_routes.as_ref().unwrap()[0].to_string(),
             "Hf-178: continuous free-gas integral over the MLBW resonance equation"
+        );
+    }
+
+    #[test]
+    fn energy_scale_disclosure_warns_about_refused_route_probes() {
+        // MLBW whose range ends at 8 eV on a 4-6.9 eV grid: continuous at
+        // the first probe; a scale of 1.2 would carry the corrected grid
+        // past the edge and is refused.
+        let mut near_edge = u238_with_formalism(ResonanceFormalism::MLBW);
+        near_edge.ranges[0].energy_high = 8.0;
+        let energies: Vec<f64> = (0..201).map(|i| 4.0 + (i as f64) * 0.0145).collect();
+        let config = UnifiedFitConfig::new(
+            energies,
+            vec![near_edge],
+            vec!["U-238".into()],
+            293.6,
+            None,
+            vec![0.001],
+        )
+        .unwrap()
+        .with_energy_scale(0.0, 1.0, 25.0);
+        let built = build_energy_scale_transmission_model(&config, 1, 2, None).unwrap();
+        built.model.evaluate(&[0.001, 0.0, 1.0]).unwrap();
+        let (_, warnings) = doppler_disclosure(&config, &built.routes);
+        assert!(warnings.is_empty(), "{warnings:?}");
+
+        assert!(built.model.evaluate(&[0.001, 0.0, 1.2]).is_err());
+        let (routes, warnings) = doppler_disclosure(&config, &built.routes);
+        assert!(matches!(
+            routes.as_ref().unwrap()[0].route,
+            DopplerRoute::Continuous { .. }
+        ));
+        assert_eq!(
+            warnings,
+            vec![
+                "energy-scale fit rejected 1 probe(s) that would have changed the Doppler route \
+                 of U-238; the fit stayed on the continuous side of the resolved-range edge"
+                    .to_string()
+            ]
         );
     }
 }

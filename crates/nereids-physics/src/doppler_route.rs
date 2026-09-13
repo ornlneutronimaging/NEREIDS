@@ -150,6 +150,16 @@ impl DopplerRoute {
         }
     }
 
+    /// The tier as one word, for prose that names which side of a route
+    /// boundary a fit stayed on.
+    pub fn tier_label(&self) -> &'static str {
+        match self {
+            DopplerRoute::Unbroadened => "unbroadened",
+            DopplerRoute::Continuous { .. } => "continuous",
+            DopplerRoute::SampledTable { .. } => "sampled-table",
+        }
+    }
+
     /// True when a resolved SLBW/MLBW isotope fell to tier 2 for a reason
     /// other than its formalism or the caller's explicit table.
     ///
