@@ -153,8 +153,9 @@ Tabulated resolution can be supplied with `resolution=load_resolution(...)`.
 
 Doppler broadening is two-tier.
 A resolved SLBW/MLBW isotope whose thermal support window lies inside its resolved range takes the continuous route: the free-gas kernel integrated over the resonance equation at error-controlled quadrature, independent of the energy grid.
-Every other case takes the sampled-table kernel-on-grid route: Reich-Moore, `sqrt(E) <= 8u`, a window crossing the range boundary, a File-3 term, or a caller-supplied table.
+Every other case takes the sampled-table kernel-on-grid route: Reich-Moore, `sqrt(E) <= 8u`, a window crossing the range boundary, a grid (or its auxiliary extension) that leaves the resolved range, another evaluable range overlapping the window, a File-3 term, or a caller-supplied table.
 The route is decided per isotope over the whole grid and never mixed within one isotope.
+The query treats every listed isotope as active: the auxiliary grid is built from all of them, whereas `forward_model(...)` excludes an isotope whose density is zero from its grid build.
 
 ```python
 nereids.doppler_routes(energies, [hf177], temperature_k=293.6, flight_path_m=25.0, delta_t_us=0.5, delta_l_m=0.005)

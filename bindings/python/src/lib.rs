@@ -1458,11 +1458,16 @@ fn forward_model<'py>(
 /// ``temperature_k`` takes the continuous route (the free-gas kernel
 /// integrated over the resonance equation at error-controlled quadrature);
 /// every other case — Reich-Moore, ``√E ≤ 8u``, a window crossing the
-/// range boundary, a File-3 term — takes the sampled-table kernel-on-grid
-/// route.  The route is decided per isotope over the whole grid and is the
-/// one ``forward_model()`` executes for the same arguments: the resolution
+/// range boundary, a grid (or its auxiliary extension) that leaves the
+/// resolved range, another evaluable range overlapping the window, a
+/// File-3 term — takes the sampled-table kernel-on-grid route.  The route
+/// is decided per isotope over the whole grid and is the one
+/// ``forward_model()`` executes for the same arguments: the resolution
 /// arguments matter because the working grid (the auxiliary grid under
-/// Gaussian resolution) is part of the gate input.
+/// Gaussian resolution) is part of the gate input.  The query treats every
+/// listed isotope as active — the auxiliary grid is built from all of them
+/// — whereas ``forward_model()`` excludes an isotope whose density is zero
+/// from its grid build.
 ///
 /// Args:
 ///     energies: Energy grid in eV (1D numpy array, sorted ascending).

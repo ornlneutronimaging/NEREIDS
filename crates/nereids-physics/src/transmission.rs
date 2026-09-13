@@ -1465,8 +1465,12 @@ pub fn forward_model_from_base_xs(
 /// The working grid (the auxiliary extended grid under Gaussian resolution,
 /// else the data grid) is part of the gate input, so this takes the same
 /// `instrument` the broadeners take; a query that ignored it could disclose
-/// a route the broadeners do not execute. `temperature_k <= 0` means no
-/// broadening, so every isotope is [`DopplerRoute::Unbroadened`].
+/// a route the broadeners do not execute. The query treats every listed
+/// isotope as active and builds the auxiliary grid from all of them,
+/// whereas [`forward_model`] excludes an isotope whose thickness is zero
+/// from its grid build; a caller asking about a sample with a zero-density
+/// isotope should leave it out. `temperature_k <= 0` means no broadening,
+/// so every isotope is [`DopplerRoute::Unbroadened`].
 ///
 /// # Errors
 /// * [`TransmissionError::Resolution`] — `instrument` is `Some` and

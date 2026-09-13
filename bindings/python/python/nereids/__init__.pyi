@@ -703,8 +703,13 @@ class SpatialResult:
     def doppler_routes(self) -> list[str] | None:
         """One line per isotope naming the Doppler route the whole map
         executed, in isotope order (see ``FitResult.doppler_routes``).
-        ``None`` only when broadened cross-sections were supplied by a Rust
-        caller, which cannot happen from Python."""
+        ``None`` when no pixel was fitted (every pixel masked as dead), when
+        an energy-scale map has no converged pixel, or when the converged
+        pixels of an energy-scale map disagree on the kind of route (a
+        ``warnings`` line says so, because a map-wide route would be false
+        for some of them); also when a Rust caller supplied broadened
+        cross-sections for a fixed-temperature map without Gaussian
+        resolution, which cannot happen from Python."""
         ...
 
 class IsotopeGroup:
@@ -861,11 +866,16 @@ def doppler_routes(
     thermal support window lies inside its resolved range at
     ``temperature_k`` takes the continuous route (the free-gas kernel
     integrated over the resonance equation); every other case — Reich-Moore,
-    ``sqrt(E) <= 8u``, a window crossing the range boundary, a File-3 term —
-    takes the sampled-table kernel-on-grid route.  The route is decided per
-    isotope over the whole grid and is the one ``forward_model()`` executes
-    for the same arguments (the resolution arguments shape the working grid
-    the gate inspects).  Returns one string per isotope, e.g.
+    ``sqrt(E) <= 8u``, a window crossing the range boundary, a grid (or its
+    auxiliary extension) that leaves the resolved range, another evaluable
+    range overlapping the window, a File-3 term — takes the sampled-table
+    kernel-on-grid route.  The route is decided per isotope over the whole
+    grid and is the one ``forward_model()`` executes for the same arguments
+    (the resolution arguments shape the working grid the gate inspects).
+    The query treats every listed isotope as active: the auxiliary grid is
+    built from all of them, whereas ``forward_model()`` excludes an isotope
+    whose density is zero from its grid build.  Returns one string per
+    isotope, e.g.
     ``"Hf-177: continuous free-gas integral over the MLBW resonance
     equation"``; ``temperature_k=0`` reports the unbroadened route.
     """
