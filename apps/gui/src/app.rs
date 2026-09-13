@@ -256,10 +256,20 @@ fn poll_pending_tasks(state: &mut AppState) {
                         result.warnings.len()
                     )
                 };
+                // The audit trail records which Doppler route each isotope
+                // took, so a stored map can be read back with its physics.
+                let doppler_routes = result
+                    .doppler_routes
+                    .as_ref()
+                    .map(|routes| {
+                        let lines: Vec<String> = routes.iter().map(ToString::to_string).collect();
+                        format!("; Doppler routes: {}", lines.join(", "))
+                    })
+                    .unwrap_or_default();
                 state.log_provenance(
                     ProvenanceEventKind::AnalysisRun,
                     format!(
-                        "Spatial mapping: {}/{} converged",
+                        "Spatial mapping: {}/{} converged{doppler_routes}",
                         result.n_converged, result.n_total
                     ),
                 );
@@ -667,6 +677,7 @@ mod tests {
             baseline_e_ref_ev: None,
             baseline_maps: None,
             warnings: Vec::new(),
+            doppler_routes: None,
             n_converged: 1,
             n_total: 1,
             n_failed: 0,

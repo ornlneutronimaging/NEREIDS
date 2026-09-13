@@ -4,18 +4,39 @@
 //! that the LM optimizer can call. The fit parameters are the areal densities
 //! (thicknesses) of each isotope in the sample.
 
-use std::cell::{Cell, RefCell};
+use std::cell::{Cell, OnceCell, RefCell};
 use std::rc::Rc;
 use std::sync::Arc;
 
 use nereids_core::constants::{EV_TO_JOULES, NEUTRON_MASS_KG};
 use nereids_endf::resonance::ResonanceData;
+use nereids_physics::doppler_route::DopplerRoute;
 use nereids_physics::resolution::{self, ResolutionFunction, ResolutionPlan};
 use nereids_physics::surrogate::{ScalarSurrogatePlan, SparseEmpiricalCubaturePlan};
-use nereids_physics::transmission::{self, InstrumentParams, SampleParams};
+use nereids_physics::transmission::{self, DopplerPlan, InstrumentParams, SampleParams};
 
 use crate::error::FittingError;
 use crate::lm::{FitModel, FlatMatrix};
+
+/// Lower bound of a fitted sample temperature (K).
+pub const TEMPERATURE_FIT_LOWER_BOUND_K: f64 = 1.0;
+
+/// Upper bound of a fitted sample temperature (K).
+///
+/// A free-temperature fit decides each isotope's Doppler route once, at
+/// this bound: both tier-1 conditions are monotone in the kernel width
+/// `u ∝ √T`, so tier 1 here is tier 1 at every temperature the optimizer
+/// can visit, and the route cannot change between probes.
+pub const TEMPERATURE_FIT_UPPER_BOUND_K: f64 = 5000.0;
+
+/// One line per route, for error messages.
+fn describe_routes(routes: &[DopplerRoute]) -> String {
+    routes
+        .iter()
+        .map(ToString::to_string)
+        .collect::<Vec<_>>()
+        .join("; ")
+}
 
 /// Absolute-magnitude threshold for `L_scale` division safety in the
 /// partial-GAL rank-1 derivation of the energy-scale Jacobian.  When
@@ -772,12 +793,15 @@ pub struct TransmissionFitModel {
     /// and included as a free parameter in the fit. The Doppler broadening
     /// kernel is recomputed at each `evaluate()` call.
     temperature_index: Option<usize>,
-    /// Cached unbroadened (Reich-Moore) cross-sections, computed once in
-    /// `new()` when `temperature_index` is `Some`. Eliminates redundant
-    /// O(N_energy × N_resonances) computation on every `evaluate()` call.
-    /// Wrapped in `Arc` so `spatial_map` can share a single allocation across
-    /// all per-pixel `TransmissionFitModel` instances without deep cloning.
-    base_xs: Option<Arc<Vec<Vec<f64>>>>,
+    /// Per-isotope Doppler routes plus the zero-kelvin rows the
+    /// sampled-table isotopes need. Set eagerly by `new()` for a
+    /// caller-supplied table, attached by [`Self::with_doppler_plan`] when
+    /// spatial dispatch shares one plan across pixels, and otherwise built
+    /// on first use at [`TEMPERATURE_FIT_UPPER_BOUND_K`] for a
+    /// free-temperature fit. Empty on the fixed-temperature path, where
+    /// `forward_model` decides the route per call. Wrapped in `Arc` so one
+    /// plan can serve every per-pixel model without deep cloning.
+    doppler_plan: OnceCell<Arc<DopplerPlan>>,
     /// Cached broadened cross-sections from the last `evaluate()` call, on the
     /// **working grid** (auxiliary extended grid when Gaussian resolution is
     /// active, else the data grid).  Used by `analytical_jacobian()` to provide
@@ -883,18 +907,12 @@ impl TransmissionFitModel {
                 }
             }
         }
-        let base_xs = match external_base_xs {
-            Some(xs) => Some(xs),
-            None if temperature_index.is_some() => Some(Arc::new(
-                transmission::unbroadened_cross_sections(&energies, &resonance_data, None)
-                    .map_err(|e| {
-                        FittingError::InvalidConfig(format!(
-                            "failed to compute unbroadened cross-sections: {e}"
-                        ))
-                    })?,
-            )),
-            None => None,
-        };
+        let doppler_plan = OnceCell::new();
+        if let Some(xs) = external_base_xs {
+            let plan = DopplerPlan::from_explicit_table(&energies, &resonance_data, &xs)
+                .map_err(|e| FittingError::InvalidConfig(format!("external_base_xs: {e}")))?;
+            let _ = doppler_plan.set(Arc::new(plan));
+        }
         Ok(Self {
             energies,
             resonance_data,
@@ -903,7 +921,7 @@ impl TransmissionFitModel {
             density_indices,
             density_ratios,
             temperature_index,
-            base_xs,
+            doppler_plan,
             cached_broadened_xs: RefCell::new(None),
             cached_dxs_dt: RefCell::new(None),
             cached_work_layout: RefCell::new(None),
@@ -925,6 +943,51 @@ impl TransmissionFitModel {
     pub fn with_resolution_plan(mut self, plan: Option<Arc<ResolutionPlan>>) -> Self {
         self.resolution_plan = plan;
         self
+    }
+
+    /// Attach a Doppler plan built once for the model's grid, resonance
+    /// data and resolution (typically by spatial dispatch, so every pixel
+    /// shares one set of routes and zero-kelvin rows). Replaces any plan
+    /// the model already holds.
+    #[must_use]
+    pub fn with_doppler_plan(mut self, plan: Arc<DopplerPlan>) -> Self {
+        self.doppler_plan = OnceCell::from(plan);
+        self
+    }
+
+    /// The model's Doppler plan: the attached or caller-table plan, else —
+    /// for a free-temperature fit — one built now at
+    /// [`TEMPERATURE_FIT_UPPER_BOUND_K`]. `None` on the fixed-temperature
+    /// path, which broadens through `forward_model`.
+    ///
+    /// # Errors
+    /// `FittingError::EvaluationFailed` if the plan cannot be built.
+    pub fn doppler_plan(&self) -> Result<Option<&Arc<DopplerPlan>>, FittingError> {
+        if let Some(plan) = self.doppler_plan.get() {
+            return Ok(Some(plan));
+        }
+        if self.temperature_index.is_none() {
+            return Ok(None);
+        }
+        let plan = DopplerPlan::new(
+            &self.energies,
+            &self.resonance_data,
+            TEMPERATURE_FIT_UPPER_BOUND_K,
+            self.instrument.as_deref(),
+            None,
+        )
+        .map_err(|e| FittingError::EvaluationFailed(format!("Doppler plan: {e}")))?;
+        let _ = self.doppler_plan.set(Arc::new(plan));
+        Ok(self.doppler_plan.get())
+    }
+
+    /// The Doppler route of each isotope, when the model owns a plan (see
+    /// [`Self::doppler_plan`]).
+    ///
+    /// # Errors
+    /// As [`Self::doppler_plan`].
+    pub fn doppler_routes(&self) -> Result<Option<Vec<DopplerRoute>>, FittingError> {
+        Ok(self.doppler_plan()?.map(|plan| plan.routes().to_vec()))
     }
 
     /// Attach a prebuilt sparse empirical cubature plan.  See
@@ -1009,8 +1072,10 @@ impl FitModel for TransmissionFitModel {
             None => self.temperature_k,
         };
 
-        if let Some(ref base_xs) = self.base_xs {
-            // Fast path: reuse cached unbroadened XS, only redo Doppler + Beer-Lambert.
+        if let Some(plan) = self.doppler_plan()? {
+            // Planned path: each isotope is broadened by its planned Doppler
+            // route — tier 1 from the resonance source, tier 2 from its
+            // zero-kelvin row — then Beer-Lambert.
             // Validate temperature (same rules as SampleParams::new in the slow path)
             // so the optimizer can't silently evaluate an unphysical model.
             if !temperature_k.is_finite() || temperature_k < 0.0 {
@@ -1044,14 +1109,14 @@ impl FitModel for TransmissionFitModel {
                     Rc::clone(self.cached_work_layout.borrow().as_ref().unwrap()),
                 )
             } else {
-                let working = transmission::broadened_cross_sections_from_base_on_working_grid(
-                    &self.energies,
-                    base_xs,
-                    &self.resonance_data,
-                    temperature_k,
-                    self.instrument.as_deref(),
-                )
-                .map_err(|e| FittingError::EvaluationFailed(e.to_string()))?;
+                let working = plan
+                    .broaden_on_working_grid(
+                        &self.energies,
+                        &self.resonance_data,
+                        temperature_k,
+                        self.instrument.as_deref(),
+                    )
+                    .map_err(|e| FittingError::EvaluationFailed(e.to_string()))?;
                 let xs = Rc::new(working.sigma);
                 let layout = Rc::new(working.layout);
                 *self.cached_broadened_xs.borrow_mut() = Some(Rc::clone(&xs));
@@ -1120,18 +1185,18 @@ impl FitModel for TransmissionFitModel {
 
     /// Analytical Jacobian for the transmission model with temperature fitting.
     ///
-    /// When `base_xs` is available (temperature fitting path):
+    /// When a Doppler plan is available (temperature fitting path):
     /// - **Density columns**: `∂T/∂nᵢ = -σᵢ(E)·T(E)` using cached broadened XS
     ///   from the most recent `evaluate()` call.  Same formula as
     ///   `PrecomputedTransmissionModel`, zero extra broadening calls.
     /// - **Temperature column**: analytical chain rule via on-demand `∂σ/∂T`.
     ///   `∂T/∂T_temp = -T(E) · Σᵢ nᵢ·rᵢ·∂σᵢ/∂T`.  The derivative is
     ///   computed once per temperature via
-    ///   `broadened_cross_sections_with_analytical_derivative_from_base()`
+    ///   `DopplerPlan::broaden_with_derivative_on_working_grid()`
     ///   and cached until temperature changes.  Costs one broadening call
     ///   per Jacobian (same as the old FD approach, but exact).
     ///
-    /// Returns `None` for the no-base_xs path (full forward model), which
+    /// Returns `None` for the no-plan path (full forward model), which
     /// falls back to finite-difference in the LM solver.
     /// Analytical Jacobian for density and temperature fitting.
     ///
@@ -1143,7 +1208,7 @@ impl FitModel for TransmissionFitModel {
     ///   ∂T_obs/∂N_g = R\[-(Σ_{i∈g} rᵢ σᵢ) · T\]
     ///   ∂T_obs/∂Temp = R\[-T · Σᵢ nᵢ rᵢ ∂σᵢ/∂T\]
     ///
-    /// Returns `None` only when `base_xs` is not available (full forward
+    /// Returns `None` only when no Doppler plan is available (full forward
     /// model path falls back to FD) or when the temperature cache is stale.
     fn analytical_jacobian(
         &self,
@@ -1193,9 +1258,9 @@ impl FitModel for TransmissionFitModel {
         // see the docstring at the corresponding
         // site in `TransmissionFitModel::evaluate()` above.
 
-        // Only provide analytical Jacobian when base_xs is available
-        // (temperature-fitting fast path with cached broadened XS).
-        let _base_xs_guard = self.base_xs.as_ref()?;
+        // Only provide analytical Jacobian when a Doppler plan is available
+        // (temperature-fitting path with cached broadened XS).
+        let plan = self.doppler_plan().ok().flatten()?;
         let cached_xs = self.cached_broadened_xs.borrow();
         let broadened_xs = cached_xs.as_ref()?;
         // Working-grid layout matching the cached σ (issue #608).  Inner
@@ -1297,12 +1362,10 @@ impl FitModel for TransmissionFitModel {
             {
                 let needs_compute = self.cached_dxs_dt.borrow().as_ref().is_none();
                 if needs_compute {
-                    let base_xs = self.base_xs.as_ref()?;
                     let temperature_k = self.cached_temperature.get();
-                    let working =
-                        transmission::broadened_cross_sections_with_analytical_derivative_from_base_on_working_grid(
+                    let working = plan
+                        .broaden_with_derivative_on_working_grid(
                             &self.energies,
-                            base_xs,
                             &self.resonance_data,
                             temperature_k,
                             self.instrument.as_deref(),
@@ -1768,6 +1831,12 @@ pub struct EnergyScaleTransmissionModel {
     /// rebuilding it twice.  `RefCell` is safe — the model is rebuilt per pixel
     /// and never shared across threads.
     cached_work_xs: RefCell<CachedWorkXs>,
+    /// Doppler routes pinned at the first probe. The working grid moves with
+    /// every `(t0, L_scale)` probe, so the route is decided per probe; a
+    /// change between probes would make the objective discontinuous, so it
+    /// is a hard error rather than a silent re-route. Shared (`Rc`) with the
+    /// pipeline so the disclosed routes are the executed ones.
+    pinned_doppler_routes: Rc<RefCell<Option<Vec<DopplerRoute>>>>,
     /// Method for the t0 / L_scale Jacobian columns. Initialised from
     /// [`EnergyScaleJacobianMethod::from_env`] in [`Self::new`], which
     /// defaults to `PartialGal` since issue #489 (and respects the
@@ -1966,7 +2035,36 @@ impl EnergyScaleTransmissionModel {
             instrument,
             cached_plans: RefCell::new(CachedPlanRing::default()),
             cached_work_xs: RefCell::new(None),
+            pinned_doppler_routes: Rc::new(RefCell::new(None)),
             jacobian_method: EnergyScaleJacobianMethod::from_env(),
+        }
+    }
+
+    /// Handle to the Doppler routes pinned at the first probe (`None` until
+    /// the model has been evaluated).
+    pub fn pinned_doppler_routes(&self) -> Rc<RefCell<Option<Vec<DopplerRoute>>>> {
+        Rc::clone(&self.pinned_doppler_routes)
+    }
+
+    fn pin_doppler_routes(&self, routes: &[DopplerRoute]) -> Result<(), FittingError> {
+        let mut pinned = self.pinned_doppler_routes.borrow_mut();
+        // The reported energies inside a gate reason describe one grid and
+        // move with it; the tier and the kind of reason are what must hold.
+        let same_kind = |first: &[DopplerRoute]| {
+            first.len() == routes.len() && first.iter().zip(routes).all(|(a, b)| a.same_kind(b))
+        };
+        match pinned.as_deref() {
+            None => {
+                *pinned = Some(routes.to_vec());
+                Ok(())
+            }
+            Some(first) if same_kind(first) => Ok(()),
+            Some(first) => Err(FittingError::EvaluationFailed(format!(
+                "Doppler route changed between energy-scale probes: first probe [{}], \
+                 this probe [{}]",
+                describe_routes(first),
+                describe_routes(routes),
+            ))),
         }
     }
 
@@ -2172,14 +2270,38 @@ impl EnergyScaleTransmissionModel {
                  t0 / L_scale give a degenerate calibration"
             )));
         }
-        transmission::broadened_cross_sections_on_working_grid(
-            e_corr,
-            &self.resonance_data,
-            temperature_k,
-            self.instrument.as_deref(),
-            None,
-        )
-        .map_err(|e| FittingError::EvaluationFailed(e.to_string()))
+        // The working grid moves with every (t0, L_scale) probe, so the
+        // route is decided per probe: at the fit's upper temperature bound
+        // when temperature is free (a temperature step can then never flip
+        // it), at the fixed temperature otherwise.
+        let work = if self.temperature_index.is_some() {
+            DopplerPlan::new(
+                e_corr,
+                &self.resonance_data,
+                TEMPERATURE_FIT_UPPER_BOUND_K,
+                self.instrument.as_deref(),
+                None,
+            )
+            .and_then(|plan| {
+                plan.broaden_on_working_grid(
+                    e_corr,
+                    &self.resonance_data,
+                    temperature_k,
+                    self.instrument.as_deref(),
+                )
+            })
+        } else {
+            transmission::broadened_cross_sections_on_working_grid(
+                e_corr,
+                &self.resonance_data,
+                temperature_k,
+                self.instrument.as_deref(),
+                None,
+            )
+        }
+        .map_err(|e| FittingError::EvaluationFailed(e.to_string()))?;
+        self.pin_doppler_routes(&work.routes)?;
+        Ok(work)
     }
 
     /// Working-grid σ for the current probe, cached (capacity 1, keyed on
@@ -3135,8 +3257,9 @@ mod tests {
     use crate::lm::{self, FitModel, LmConfig};
     use crate::parameters::{FitParameter, ParameterSet};
     use nereids_core::types::Isotope;
-    use nereids_endf::resonance::test_support::u238_single_resonance;
+    use nereids_endf::resonance::test_support::{u238_single_resonance, u238_with_formalism};
     use nereids_endf::resonance::{LGroup, Resonance, ResonanceFormalism, ResonanceRange};
+    use nereids_physics::doppler_route::SampledTableReason;
 
     /// ∞-norm of the residual between two equal-length spectra.
     /// (Issue #608 aux-grid regression-test helper.)
@@ -6958,6 +7081,191 @@ mod tests {
             "L_scale rel L₂ = {rel_l2:.4e} exceeds tolerance {tol:.4e}; \
              tighten or loosen `PARTIAL_GAL_REL_L2_TOLERANCE` (see rustdoc)",
             tol = PARTIAL_GAL_REL_L2_TOLERANCE,
+        );
+    }
+
+    // ── Doppler routes in the fit models ───────────────────────────────────
+
+    /// MLBW source whose resolved range ends at 8 eV: tier 1 at room
+    /// temperature on a 4–6.9 eV grid, tier 2 at the 5000 K gate (the
+    /// window then reaches past 8 eV).
+    fn mlbw_near_range_edge() -> ResonanceData {
+        let mut data = u238_with_formalism(ResonanceFormalism::MLBW);
+        data.ranges[0].energy_high = 8.0;
+        data
+    }
+
+    fn edge_grid() -> Vec<f64> {
+        (0..201).map(|i| 4.0 + (i as f64) * 0.0145).collect()
+    }
+
+    #[test]
+    fn free_temperature_model_plans_routes_at_the_upper_bound() {
+        let energies = edge_grid();
+        // Reich-Moore: sampled table either way, and bit-identical to the
+        // fixed-temperature forward model at the same temperature.
+        let rm = TransmissionFitModel::new(
+            energies.clone(),
+            vec![u238_single_resonance()],
+            0.0,
+            None,
+            (vec![0], vec![1.0]),
+            Some(1),
+            None,
+        )
+        .unwrap();
+        let routes = rm.doppler_routes().unwrap().unwrap();
+        assert!(matches!(
+            routes[0],
+            DopplerRoute::SampledTable {
+                reason: SampledTableReason::Formalism {
+                    formalism: Some(ResonanceFormalism::ReichMoore),
+                    ..
+                }
+            }
+        ));
+        let fixed = TransmissionFitModel::new(
+            energies.clone(),
+            vec![u238_single_resonance()],
+            293.6,
+            None,
+            (vec![0], vec![1.0]),
+            None,
+            None,
+        )
+        .unwrap();
+        assert!(fixed.doppler_routes().unwrap().is_none());
+        assert_eq!(
+            rm.evaluate(&[0.001, 293.6]).unwrap(),
+            fixed.evaluate(&[0.001]).unwrap()
+        );
+
+        // MLBW well inside its range: continuous in both models, identical.
+        let mlbw = u238_with_formalism(ResonanceFormalism::MLBW);
+        let free = TransmissionFitModel::new(
+            energies.clone(),
+            vec![mlbw.clone()],
+            0.0,
+            None,
+            (vec![0], vec![1.0]),
+            Some(1),
+            None,
+        )
+        .unwrap();
+        assert_eq!(
+            free.doppler_routes().unwrap().unwrap(),
+            vec![DopplerRoute::Continuous {
+                formalism: ResonanceFormalism::MLBW
+            }]
+        );
+        let fixed = TransmissionFitModel::new(
+            energies.clone(),
+            vec![mlbw],
+            293.6,
+            None,
+            (vec![0], vec![1.0]),
+            None,
+            None,
+        )
+        .unwrap();
+        assert_eq!(
+            free.evaluate(&[0.001, 293.6]).unwrap(),
+            fixed.evaluate(&[0.001]).unwrap()
+        );
+
+        // MLBW near its range edge: tier 1 at 293.6 K, demoted at the gate.
+        let near_edge = TransmissionFitModel::new(
+            energies,
+            vec![mlbw_near_range_edge()],
+            0.0,
+            None,
+            (vec![0], vec![1.0]),
+            Some(1),
+            None,
+        )
+        .unwrap();
+        let routes = near_edge.doppler_routes().unwrap().unwrap();
+        assert!(
+            matches!(
+                routes[0],
+                DopplerRoute::SampledTable {
+                    reason: SampledTableReason::WindowCrossesRangeBoundary { range_high_ev, .. }
+                } if range_high_ev == 8.0
+            ),
+            "{routes:?}"
+        );
+        assert!(routes[0].is_edge_fallback());
+        assert!(near_edge.evaluate(&[0.001, 293.6]).is_ok());
+    }
+
+    #[test]
+    fn explicit_table_model_discloses_the_table_and_shared_plan_replaces_it() {
+        let energies = edge_grid();
+        let mlbw = u238_with_formalism(ResonanceFormalism::MLBW);
+        let table = Arc::new(vec![vec![1.0; energies.len()]]);
+        let model = TransmissionFitModel::new(
+            energies.clone(),
+            vec![mlbw.clone()],
+            0.0,
+            None,
+            (vec![0], vec![1.0]),
+            Some(1),
+            Some(table),
+        )
+        .unwrap();
+        assert_eq!(
+            model.doppler_routes().unwrap().unwrap(),
+            vec![DopplerRoute::SampledTable {
+                reason: SampledTableReason::ExplicitTable
+            }]
+        );
+        let shared = Arc::new(
+            DopplerPlan::new(
+                &energies,
+                std::slice::from_ref(&mlbw),
+                TEMPERATURE_FIT_UPPER_BOUND_K,
+                None,
+                None,
+            )
+            .unwrap(),
+        );
+        let model = model.with_doppler_plan(Arc::clone(&shared));
+        assert_eq!(model.doppler_routes().unwrap().unwrap(), shared.routes());
+    }
+
+    #[test]
+    fn energy_scale_model_pins_routes_and_refuses_a_flip() {
+        let energies = edge_grid();
+        let model = EnergyScaleTransmissionModel::new(
+            Arc::new(vec![mlbw_near_range_edge()]),
+            Arc::new(vec![0]),
+            Arc::new(vec![1.0]),
+            293.6,
+            energies,
+            25.0,
+            1,
+            2,
+            None,
+        );
+        assert!(model.pinned_doppler_routes().borrow().is_none());
+        model.evaluate(&[0.001, 0.0, 1.0]).unwrap();
+        let pinned = model.pinned_doppler_routes().borrow().clone().unwrap();
+        assert_eq!(
+            pinned,
+            vec![DopplerRoute::Continuous {
+                formalism: ResonanceFormalism::MLBW
+            }]
+        );
+        // A small energy-scale step keeps the route.
+        model.evaluate(&[0.001, 0.01, 1.001]).unwrap();
+        // A scale that pushes the corrected grid past the 8 eV range edge
+        // would change the route: a hard error, never a silent re-route.
+        let flipped = model.evaluate(&[0.001, 0.0, 1.2]).unwrap_err();
+        assert!(
+            flipped
+                .to_string()
+                .contains("Doppler route changed between energy-scale probes"),
+            "{flipped}"
         );
     }
 }

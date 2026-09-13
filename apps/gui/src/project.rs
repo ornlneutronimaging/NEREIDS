@@ -1347,6 +1347,7 @@ fn state_from_snapshot(snap: ProjectSnapshot, state: &mut AppState, path: &Path)
             baseline_e_ref_ev: snap.baseline_e_ref_ev,
             baseline_maps: snap.baseline_maps.clone(),
             warnings: Vec::new(),
+            doppler_routes: None,
             n_converged: snap.n_converged.unwrap_or(0),
             n_total: snap.n_total.unwrap_or(0),
             n_failed: snap.n_failed.unwrap_or(0),
@@ -1384,6 +1385,7 @@ fn state_from_snapshot(snap: ProjectSnapshot, state: &mut AppState, path: &Path)
             baseline: snap.single_fit_baseline,
             baseline_e_ref_ev: snap.single_fit_baseline_e_ref_ev,
             warnings: Vec::new(),
+            doppler_routes: None,
         };
         // Rebuild FitFeedback from the restored result
         if let Some(ref labels) = snap.single_fit_labels {
@@ -1414,6 +1416,12 @@ fn state_from_snapshot(snap: ProjectSnapshot, state: &mut AppState, path: &Path)
                 // carries none (they are not persisted — re-fitting
                 // regenerates them).
                 warnings: result.warnings.clone(),
+                doppler_routes: result
+                    .doppler_routes
+                    .iter()
+                    .flatten()
+                    .map(ToString::to_string)
+                    .collect(),
             });
         }
         state.selected_pixel = snap.single_fit_pixel;

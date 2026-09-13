@@ -8,9 +8,11 @@ use rayon::prelude::*;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 
+use nereids_fitting::transmission_model::TEMPERATURE_FIT_UPPER_BOUND_K;
+use nereids_physics::doppler_route::{DopplerRoute, IsotopeDopplerRoute, edge_fallback_warning};
 use nereids_physics::resolution::build_resolution_plan;
 use nereids_physics::transmission::{
-    InstrumentParams, broadened_cross_sections_on_working_grid, unbroadened_cross_sections,
+    DopplerPlan, InstrumentParams, broadened_cross_sections_on_working_grid,
 };
 
 use crate::error::PipelineError;
@@ -151,6 +153,10 @@ pub struct SpatialResult {
     /// ≥1 free density).  Mirrors `SpectrumFitResult::warnings`; also
     /// printed once to stderr since spatial runs are long.
     pub warnings: Vec<String>,
+    /// The Doppler route each isotope took, in `resonance_data` order,
+    /// decided once for the whole map. `None` only when the caller supplied
+    /// broadened cross-sections, so the pipeline never broadened anything.
+    pub doppler_routes: Option<Vec<IsotopeDopplerRoute>>,
     /// Number of pixels that converged.
     pub n_converged: usize,
     /// Total number of pixels fitted.
@@ -1173,6 +1179,7 @@ pub fn spatial_map_typed(
             warnings: degenerate_normalization_warning(config)
                 .into_iter()
                 .collect(),
+            doppler_routes: None,
             n_converged: 0,
             n_total: 0,
             n_failed: 0,
@@ -1279,13 +1286,13 @@ pub fn spatial_map_typed(
     let aux_grid_active = !layout.is_identity();
 
     // (xs = data-grid σ, work_xs = working-grid σ when an aux grid exists).
-    let (xs, work_xs) = match config.precomputed_cross_sections().cloned() {
+    let (xs, work_xs, fixed_routes) = match config.precomputed_cross_sections().cloned() {
         // Caller supplied data-grid σ.  When a Gaussian aux grid exists we
         // still need working-grid σ for the #608-correct path, so recompute it
         // from resonance data (the data-grid σ alone cannot be de-extracted
         // back onto the aux grid).  When no aux grid exists the supplied σ is
         // already the working-grid σ and we skip Doppler broadening entirely.
-        Some(cached) if !aux_grid_active => (cached, None),
+        Some(cached) if !aux_grid_active => (cached, None, None),
         Some(cached) => {
             let working = broadened_cross_sections_on_working_grid(
                 config.energies(),
@@ -1294,7 +1301,7 @@ pub fn spatial_map_typed(
                 instrument.as_ref(),
                 cancel,
             )?;
-            (cached, Some(Arc::new(working.sigma)))
+            (cached, Some(Arc::new(working.sigma)), Some(working.routes))
         }
         None => {
             let working = broadened_cross_sections_on_working_grid(
@@ -1311,10 +1318,14 @@ pub fn spatial_map_typed(
                     .iter()
                     .map(|s| working.layout.extract(s))
                     .collect();
-                (Arc::new(data_xs), Some(Arc::new(working.sigma)))
+                (
+                    Arc::new(data_xs),
+                    Some(Arc::new(working.sigma)),
+                    Some(working.routes),
+                )
             } else {
                 // Working grid == data grid: σ is the data-grid σ directly.
-                (Arc::new(working.sigma), None)
+                (Arc::new(working.sigma), None, Some(working.routes))
             }
         }
     };
@@ -1600,22 +1611,30 @@ pub fn spatial_map_typed(
         })
     });
 
-    // Precompute unbroadened (base) cross-sections for temperature fitting.
-    // This avoids 74× overhead from redundant Reich-Moore evaluation per
-    // KL iteration (112ms Reich-Moore vs 1.5ms Doppler rebroadening).
+    // Decide the Doppler routes once for the whole map at the fit's upper
+    // temperature bound and build the zero-kelvin rows only the
+    // sampled-table isotopes need; every pixel shares the plan, so no pixel
+    // re-evaluates the resonance equation.
+    let mut planned_routes: Option<Vec<DopplerRoute>> = None;
     let fast_config = if config.fit_temperature() {
         // Bare `?`: the `From<TransmissionError>` impl maps
         // `TransmissionError::Cancelled` to `PipelineError::Cancelled`,
         // keeping the documented uniform-Cancelled contract when the user
-        // cancels during this (expensive) Reich-Moore precompute.  A
+        // cancels during this (expensive) precompute.  A
         // `.map_err(PipelineError::Transmission)` here would bypass that
         // conversion and surface cancellation as an error.
-        let base_xs: Vec<Vec<f64>> =
-            unbroadened_cross_sections(config.energies(), config.resonance_data(), cancel)?;
+        let plan = DopplerPlan::new(
+            config.energies(),
+            config.resonance_data(),
+            TEMPERATURE_FIT_UPPER_BOUND_K,
+            instrument.as_ref(),
+            cancel,
+        )?;
+        planned_routes = Some(plan.routes().to_vec());
         let mut cfg = config
             .clone()
             .with_precomputed_cross_sections(xs)
-            .with_precomputed_base_xs(Arc::new(base_xs))
+            .with_precomputed_doppler_plan(Arc::new(plan))
             .with_compute_covariance(true);
         if let Some(plan) = resolution_plan.clone() {
             cfg = cfg.with_precomputed_resolution_plan(plan);
@@ -1733,10 +1752,43 @@ pub fn spatial_map_typed(
     // Surface the degenerate-normalization warning once, up front (spatial
     // runs are long; a warning buried after the rayon loop is useless), and
     // carry it on the result for GUI / Python consumers.
-    let warnings: Vec<String> = degenerate_normalization_warning(config)
+    let mut warnings: Vec<String> = degenerate_normalization_warning(config)
         .into_iter()
         .inspect(|w| eprintln!("spatial_map_typed: warning: {w}"))
         .collect();
+
+    // Doppler route disclosure for the whole map, plus a warning line for any
+    // resolved SLBW/MLBW isotope demoted to the sampled table for a window
+    // reason (a Reich-Moore isotope on the sampled table is the documented
+    // route and does not warn).
+    let gate_temperature_k = if config.fit_temperature() {
+        TEMPERATURE_FIT_UPPER_BOUND_K
+    } else {
+        config.temperature_k()
+    };
+    let disclosed = if config.fit_temperature() {
+        planned_routes
+    } else {
+        fixed_routes
+    };
+    let doppler_routes: Option<Vec<IsotopeDopplerRoute>> = disclosed.map(|routes| {
+        config
+            .resonance_data()
+            .iter()
+            .zip(routes)
+            .map(|(rd, route)| IsotopeDopplerRoute {
+                isotope: rd.isotope,
+                route,
+            })
+            .collect()
+    });
+    warnings.extend(
+        doppler_routes
+            .iter()
+            .flatten()
+            .filter_map(|route| edge_fallback_warning(route, gate_temperature_k))
+            .inspect(|w| eprintln!("spatial_map_typed: warning: {w}")),
+    );
 
     // Stage 1 (global mode): fit the baseline ONCE on the aggregated mean
     // spectrum, then FREEZE it into the per-pixel config (the same
@@ -2058,6 +2110,7 @@ pub fn spatial_map_typed(
         baseline_e_ref_ev,
         baseline_maps,
         warnings,
+        doppler_routes,
         n_converged,
         n_total: pixel_coords.len(),
         n_failed: failed_count.load(Ordering::Relaxed),
@@ -2075,8 +2128,9 @@ mod tests {
     use nereids_fitting::transmission_model::PrecomputedTransmissionModel;
 
     use crate::pipeline::{SolverConfig, UnifiedFitConfig};
+    use nereids_endf::resonance::ResonanceFormalism;
     use nereids_endf::resonance::test_support::{
-        synthetic_single_resonance, u238_single_resonance,
+        synthetic_single_resonance, u238_single_resonance, u238_with_formalism,
     };
 
     /// Build a synthetic transmission stack of shape `(n_e, height, width)`
@@ -5378,5 +5432,82 @@ mod tests {
             "spatial result must carry the degenerate-trio warning, got {:?}",
             r.warnings
         );
+    }
+
+    // ── Doppler route disclosure ───────────────────────────────────────────
+
+    #[test]
+    fn spatial_result_discloses_routes_fixed_and_free_temperature() {
+        let energies: Vec<f64> = (0..101).map(|i| 4.0 + (i as f64) * 0.05).collect();
+        let cases = [
+            (
+                u238_single_resonance(),
+                "U-238: sampled-table kernel-on-grid (Reich-Moore formalism)",
+            ),
+            (
+                u238_with_formalism(ResonanceFormalism::MLBW),
+                "U-238: continuous free-gas integral over the MLBW resonance equation",
+            ),
+        ];
+        for (rd, expected) in cases {
+            let (t_3d, u_3d) = synthetic_4x4_transmission(&rd, 0.001, &energies);
+            let data = InputData3D::Transmission {
+                transmission: t_3d.view(),
+                uncertainty: u_3d.view(),
+            };
+            for fit_temperature in [false, true] {
+                let config = UnifiedFitConfig::new(
+                    energies.clone(),
+                    vec![rd.clone()],
+                    vec!["U-238".into()],
+                    300.0,
+                    None,
+                    vec![0.0005],
+                )
+                .unwrap()
+                .with_solver(SolverConfig::LevenbergMarquardt(LmConfig {
+                    max_iter: 3,
+                    ..LmConfig::default()
+                }))
+                .with_fit_temperature(fit_temperature);
+                let result = spatial_map_typed(&data, &config, None, None, None).unwrap();
+                let routes = result.doppler_routes.as_ref().unwrap();
+                assert_eq!(routes.len(), 1);
+                assert_eq!(routes[0].to_string(), expected);
+                assert!(!result.warnings.iter().any(|w| w.starts_with("Doppler:")));
+            }
+        }
+    }
+
+    #[test]
+    fn spatial_caller_supplied_cross_sections_yield_no_routes() {
+        let rd = u238_single_resonance();
+        let energies: Vec<f64> = (0..101).map(|i| 4.0 + (i as f64) * 0.05).collect();
+        let (t_3d, u_3d) = synthetic_4x4_transmission(&rd, 0.001, &energies);
+        let data = InputData3D::Transmission {
+            transmission: t_3d.view(),
+            uncertainty: u_3d.view(),
+        };
+        let xs = nereids_physics::transmission::broadened_cross_sections(
+            &energies,
+            std::slice::from_ref(&rd),
+            300.0,
+            None,
+            None,
+        )
+        .unwrap();
+        let config = UnifiedFitConfig::new(
+            energies,
+            vec![rd],
+            vec!["U-238".into()],
+            300.0,
+            None,
+            vec![0.0005],
+        )
+        .unwrap()
+        .with_solver(SolverConfig::LevenbergMarquardt(LmConfig::default()))
+        .with_precomputed_cross_sections(Arc::new(xs));
+        let result = spatial_map_typed(&data, &config, None, None, None).unwrap();
+        assert!(result.doppler_routes.is_none());
     }
 }

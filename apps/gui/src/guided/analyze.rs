@@ -802,6 +802,10 @@ fn fit_feedback_panel(ui: &mut egui::Ui, state: &AppState) {
                         .size(11.0),
                 );
             }
+            // Doppler route disclosure: informational, one line per isotope.
+            for route in &fb.doppler_routes {
+                ui.label(egui::RichText::new(format!("Doppler: {route}")).size(11.0));
+            }
         });
 }
 
@@ -833,6 +837,10 @@ fn convergence_summary(ui: &mut egui::Ui, state: &AppState) {
                 .color(egui::Color32::from_rgb(220, 160, 40))
                 .size(11.0),
         );
+    }
+    // Doppler route disclosure for the whole map, one line per isotope.
+    for route in result.doppler_routes.iter().flatten() {
+        ui.label(egui::RichText::new(format!("Doppler: {route}")).size(11.0));
     }
 }
 
@@ -1200,6 +1208,7 @@ fn selected_pixel_fit_result_for_overlay(
             .or(result.baseline_global),
         baseline_e_ref_ev: result.baseline_e_ref_ev,
         warnings: result.warnings.clone(),
+        doppler_routes: result.doppler_routes.clone(),
     })
 }
 
@@ -2408,6 +2417,7 @@ fn fit_pixel(state: &mut AppState) {
                 densities: vec![],
                 temperature_k: None,
                 warnings: vec![],
+                doppler_routes: vec![],
             });
             state.status_message = e;
             return;
@@ -2424,6 +2434,7 @@ fn fit_pixel(state: &mut AppState) {
                 densities: vec![],
                 temperature_k: None,
                 warnings: vec![],
+                doppler_routes: vec![],
             });
             state.status_message = msg;
             return;
@@ -2444,6 +2455,7 @@ fn fit_pixel(state: &mut AppState) {
             densities: vec![],
             temperature_k: None,
             warnings: vec![],
+            doppler_routes: vec![],
         });
         state.status_message = msg;
         return;
@@ -2507,6 +2519,7 @@ fn fit_pixel(state: &mut AppState) {
                 densities: vec![],
                 temperature_k: None,
                 warnings: vec![],
+                doppler_routes: vec![],
             });
             state.status_message = msg;
             return;
@@ -2540,6 +2553,12 @@ fn fit_pixel(state: &mut AppState) {
         densities,
         temperature_k: fitted_temp,
         warnings: result.warnings.clone(),
+        doppler_routes: result
+            .doppler_routes
+            .iter()
+            .flatten()
+            .map(ToString::to_string)
+            .collect(),
     });
     state.status_message = summary;
     state.pixel_fit_result = Some(result);
@@ -2560,6 +2579,7 @@ fn fit_roi(state: &mut AppState) {
                 densities: vec![],
                 temperature_k: None,
                 warnings: vec![],
+                doppler_routes: vec![],
             });
             state.status_message = e;
             return;
@@ -2579,6 +2599,7 @@ fn fit_roi(state: &mut AppState) {
             densities: vec![],
             temperature_k: None,
             warnings: vec![],
+            doppler_routes: vec![],
         });
         state.status_message = msg;
         return;
@@ -2620,6 +2641,7 @@ fn fit_roi(state: &mut AppState) {
             densities: vec![],
             temperature_k: None,
             warnings: vec![],
+            doppler_routes: vec![],
         });
         state.status_message = msg;
         return;
@@ -2704,6 +2726,7 @@ fn fit_roi(state: &mut AppState) {
                 densities: vec![],
                 temperature_k: None,
                 warnings: vec![],
+                doppler_routes: vec![],
             });
             state.status_message = msg;
             return;
@@ -2737,6 +2760,12 @@ fn fit_roi(state: &mut AppState) {
         densities,
         temperature_k: fitted_temp,
         warnings: result.warnings.clone(),
+        doppler_routes: result
+            .doppler_routes
+            .iter()
+            .flatten()
+            .map(ToString::to_string)
+            .collect(),
     });
     state.status_message = summary;
     state.pixel_fit_result = Some(result);
@@ -2955,6 +2984,7 @@ mod tests {
             baseline: None,
             baseline_e_ref_ev: None,
             warnings: Vec::new(),
+            doppler_routes: None,
         }
     }
 
@@ -2980,6 +3010,7 @@ mod tests {
             baseline_e_ref_ev: None,
             baseline_maps: None,
             warnings: Vec::new(),
+            doppler_routes: None,
             n_converged: 1,
             n_total: 1,
             n_failed: 0,

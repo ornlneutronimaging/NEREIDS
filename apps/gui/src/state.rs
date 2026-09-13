@@ -434,6 +434,9 @@ pub struct FitFeedback {
     /// #635 — e.g. the degenerate free-Anorm + free-T + free-density
     /// trio).  Rendered as amber lines under the summary.
     pub warnings: Vec<String>,
+    /// The Doppler route each isotope took, one line per isotope, as
+    /// disclosed on the fit result. Empty when nothing was broadened.
+    pub doppler_routes: Vec<String>,
 }
 
 /// A single provenance event in the session audit trail.

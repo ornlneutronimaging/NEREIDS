@@ -19,11 +19,13 @@ use nereids_fitting::parameters::{FitParameter, ParameterSet};
 use nereids_fitting::poisson::{self, PoissonConfig};
 use nereids_fitting::transmission_model::{
     EnergyScaleTransmissionModel, MultiplicativeBaselineModel, NormalizedTransmissionModel,
-    PrecomputedTransmissionModel, TransmissionFitModel,
+    PrecomputedTransmissionModel, TEMPERATURE_FIT_LOWER_BOUND_K, TEMPERATURE_FIT_UPPER_BOUND_K,
+    TransmissionFitModel,
 };
 use nereids_physics::counts_response::DetectorBinResponseMatrix;
+use nereids_physics::doppler_route::{DopplerRoute, IsotopeDopplerRoute, edge_fallback_warning};
 use nereids_physics::resolution::ResolutionFunction;
-use nereids_physics::transmission::InstrumentParams;
+use nereids_physics::transmission::{DopplerPlan, InstrumentParams};
 
 use crate::error::PipelineError;
 
@@ -445,6 +447,11 @@ pub struct UnifiedFitConfig {
     /// precomputed branch.
     precomputed_work_cross_sections: Option<PrecomputedWorkXs>,
     precomputed_base_xs: Option<Arc<Vec<Vec<f64>>>>,
+    /// Doppler plan built once for `(energies, resonance_data, resolution)`
+    /// by `spatial_map_typed` on the free-temperature path, so every pixel
+    /// shares one set of routes and zero-kelvin rows. Ignored when
+    /// `precomputed_base_xs` is set: an explicit table supersedes it.
+    precomputed_doppler_plan: Option<Arc<DopplerPlan>>,
     /// Resolution broadening plan built once for `(energies, resolution)`.
     ///
     /// Populated by [`spatial_map_typed`] when the data grid is shared
@@ -601,6 +608,7 @@ impl UnifiedFitConfig {
             precomputed_cross_sections: None,
             precomputed_work_cross_sections: None,
             precomputed_base_xs: None,
+            precomputed_doppler_plan: None,
             precomputed_resolution_plan: None,
             precomputed_sparse_cubature_plan: None,
             precomputed_sparse_scalar_plan: None,
@@ -822,14 +830,31 @@ impl UnifiedFitConfig {
         self
     }
 
+    /// Supply a genuinely tabulated zero-kelvin cross-section per isotope on
+    /// the data grid for the free-temperature fit.
+    ///
+    /// The engine then never evaluates the resonance source: every isotope
+    /// is broadened by the sampled-table kernel and disclosed as
+    /// `SampledTable { ExplicitTable }`. A resolved ENDF evaluation belongs
+    /// in `resonance_data` instead, so the Doppler route gate applies and a
+    /// resolved SLBW/MLBW source can take the continuous route.
     #[must_use]
     pub fn with_precomputed_base_xs(mut self, xs: Arc<Vec<Vec<f64>>>) -> Self {
         self.precomputed_base_xs = Some(xs);
+        self.precomputed_doppler_plan = None;
         // Base XS swap implies σ will be re-Doppler-broadened, so
         // the cubature's σ stack becomes stale.  Invalidate for
         // the same reason as `with_precomputed_cross_sections`.
         self.precomputed_sparse_cubature_plan = None;
         self.precomputed_sparse_scalar_plan = None;
+        self
+    }
+
+    /// Share a Doppler plan built once for this config's grid, resonance
+    /// data and resolution across per-pixel free-temperature fits.
+    #[must_use]
+    pub(crate) fn with_precomputed_doppler_plan(mut self, plan: Arc<DopplerPlan>) -> Self {
+        self.precomputed_doppler_plan = Some(plan);
         self
     }
 
@@ -965,6 +990,7 @@ impl UnifiedFitConfig {
         self.precomputed_cross_sections = None;
         self.precomputed_work_cross_sections = None;
         self.precomputed_base_xs = None;
+        self.precomputed_doppler_plan = None;
         // Clear the cubature plan too: atoms are σ-coordinates in
         // ℝ^k and `k` / σ-stack change when groups are reconfigured,
         // so a stale plan would silently produce wrong forward /
@@ -1544,7 +1570,10 @@ fn fit_transmission_lm(
     lm_cfg.compute_covariance = config.compute_covariance;
 
     // Build model — use EnergyScaleTransmissionModel when energy-scale is enabled
-    let model: Box<dyn FitModel> = if let Some((t0_idx, ls_idx)) = energy_scale_indices {
+    let BuiltModel {
+        model,
+        routes: doppler_route_source,
+    } = if let Some((t0_idx, ls_idx)) = energy_scale_indices {
         build_energy_scale_transmission_model(config, t0_idx, ls_idx, temperature_index)?
     } else {
         build_transmission_model(config, n_density_params, temperature_index)?
@@ -1656,6 +1685,10 @@ fn fit_transmission_lm(
         sr.l_scale = Some(result.params[ls_idx]);
         sr.energy_scale_flight_path_m = Some(config.flight_path_m);
     }
+
+    let (doppler_routes, doppler_warnings) = doppler_disclosure(config, &doppler_route_source);
+    sr.doppler_routes = doppler_routes;
+    sr.warnings.extend(doppler_warnings);
 
     Ok(sr)
 }
@@ -1807,7 +1840,10 @@ fn fit_counts_joint_poisson(
         true_model_config.precomputed_sparse_cubature_plan = None;
         true_model_config.precomputed_sparse_scalar_plan = None;
     }
-    let t_model: Box<dyn FitModel> = if let Some((t0_idx, ls_idx)) = energy_scale_indices {
+    let BuiltModel {
+        model: t_model,
+        routes: doppler_route_source,
+    } = if let Some((t0_idx, ls_idx)) = energy_scale_indices {
         build_energy_scale_transmission_model(
             &true_model_config,
             t0_idx,
@@ -2105,6 +2141,7 @@ fn fit_counts_joint_poisson(
         (None, None)
     };
 
+    let (doppler_routes, doppler_warnings) = doppler_disclosure(config, &doppler_route_source);
     Ok(SpectrumFitResult {
         densities,
         uncertainties,
@@ -2132,7 +2169,9 @@ fn fit_counts_joint_poisson(
         baseline_e_ref_ev: baseline_e_ref_out,
         warnings: degenerate_normalization_warning(config)
             .into_iter()
+            .chain(doppler_warnings)
             .collect(),
+        doppler_routes,
     })
 }
 
@@ -2178,8 +2217,8 @@ fn append_temperature_param(
     param_vec.push(FitParameter {
         name: "temperature_k".into(),
         value: config.temperature_k,
-        lower: 1.0,
-        upper: 5000.0,
+        lower: TEMPERATURE_FIT_LOWER_BOUND_K,
+        upper: TEMPERATURE_FIT_UPPER_BOUND_K,
         fixed: false,
     });
     Some(idx)
@@ -2954,6 +2993,76 @@ fn append_multiplicative_baseline_params(
     BaselineIndices { b0, b1, b2 }
 }
 
+/// A built forward model and where its per-isotope Doppler routes come from.
+struct BuiltModel {
+    model: Box<dyn FitModel>,
+    routes: RouteSource,
+}
+
+/// Where a built model's Doppler routes are read from at result time.
+enum RouteSource {
+    /// The pipeline did not broaden anything (caller-supplied σ).
+    None,
+    /// Decided when the model was built.
+    Known(Vec<DopplerRoute>),
+    /// Pinned by the energy-scale model at its first probe; read after the
+    /// fit, so the disclosed routes are the executed ones.
+    Pinned(std::rc::Rc<std::cell::RefCell<Option<Vec<DopplerRoute>>>>),
+}
+
+impl From<Option<Vec<DopplerRoute>>> for RouteSource {
+    fn from(routes: Option<Vec<DopplerRoute>>) -> Self {
+        match routes {
+            Some(routes) => RouteSource::Known(routes),
+            None => RouteSource::None,
+        }
+    }
+}
+
+impl RouteSource {
+    fn resolve(&self) -> Option<Vec<DopplerRoute>> {
+        match self {
+            RouteSource::None => None,
+            RouteSource::Known(routes) => Some(routes.clone()),
+            RouteSource::Pinned(cell) => cell.borrow().clone(),
+        }
+    }
+}
+
+/// Label the routes with their isotopes and build the `warnings` lines for
+/// edge fallbacks: a resolved SLBW/MLBW isotope demoted to the sampled table
+/// for a window reason. The gate temperature named in the line is the fit's
+/// upper bound for a free-temperature fit and the fixed temperature
+/// otherwise. A Reich-Moore isotope on the sampled table is the documented
+/// route and produces no warning.
+fn doppler_disclosure(
+    config: &UnifiedFitConfig,
+    source: &RouteSource,
+) -> (Option<Vec<IsotopeDopplerRoute>>, Vec<String>) {
+    let Some(routes) = source.resolve() else {
+        return (None, Vec::new());
+    };
+    let gate_temperature_k = if config.fit_temperature {
+        TEMPERATURE_FIT_UPPER_BOUND_K
+    } else {
+        config.temperature_k
+    };
+    let labelled: Vec<IsotopeDopplerRoute> = config
+        .resonance_data
+        .iter()
+        .zip(routes)
+        .map(|(rd, route)| IsotopeDopplerRoute {
+            isotope: rd.isotope,
+            route,
+        })
+        .collect();
+    let warnings = labelled
+        .iter()
+        .filter_map(|route| edge_fallback_warning(route, gate_temperature_k))
+        .collect();
+    (Some(labelled), warnings)
+}
+
 /// Build an [`EnergyScaleTransmissionModel`] for the energy-scale fit branch
 /// of `fit_transmission_lm` / `fit_counts_joint_poisson`.
 ///
@@ -2981,7 +3090,7 @@ fn build_energy_scale_transmission_model(
     t0_idx: usize,
     ls_idx: usize,
     temperature_index: Option<usize>,
-) -> Result<Box<dyn FitModel>, PipelineError> {
+) -> Result<BuiltModel, PipelineError> {
     let instrument = config
         .resolution
         .clone()
@@ -3019,7 +3128,11 @@ fn build_energy_scale_transmission_model(
     if let Some(method) = config.tzero_jacobian_method {
         es_model = es_model.with_jacobian_method(method);
     }
-    Ok(Box::new(es_model))
+    let routes = RouteSource::Pinned(es_model.pinned_doppler_routes());
+    Ok(BuiltModel {
+        model: Box::new(es_model),
+        routes,
+    })
 }
 
 /// Build the transmission forward model, selecting precomputed or full path.
@@ -3027,8 +3140,11 @@ fn build_transmission_model(
     config: &UnifiedFitConfig,
     n_density_params: usize,
     temperature_index: Option<usize>,
-) -> Result<Box<dyn FitModel>, PipelineError> {
+) -> Result<BuiltModel, PipelineError> {
     let n_params = config.n_density_params();
+    // Routes decided by the working-grid build below; `None` when the caller
+    // supplied σ and the pipeline broadened nothing.
+    let mut computed_routes: Option<Vec<DopplerRoute>> = None;
 
     // No-temperature fit without caller-precomputed σ: compute the
     // working-grid σ HERE (same primitive `evaluate_jacobian_and_fisher`
@@ -3064,6 +3180,7 @@ fn build_transmission_model(
             None,
         )
         .map_err(PipelineError::Transmission)?;
+        computed_routes = Some(working.routes.clone());
         if working.layout.is_identity() {
             // Tabulated / no resolution: the working grid IS the data grid.
             computed_xs_storage = Arc::new(working.sigma);
@@ -3111,18 +3228,21 @@ fn build_transmission_model(
                     eff[idx][j] += ratio * sigma;
                 }
             }
-            return Ok(Box::new(PrecomputedTransmissionModel {
-                cross_sections: Arc::new(eff),
-                density_indices: Arc::new((0..n_params).collect()),
-                energies: instrument
-                    .as_ref()
-                    .map(|_| Arc::new(config.energies.clone())),
-                instrument,
-                resolution_plan: None,
-                sparse_cubature_plan: None,
-                sparse_scalar_plan: None,
-                work_layout: Some(Arc::new(working.layout)),
-            }));
+            return Ok(BuiltModel {
+                model: Box::new(PrecomputedTransmissionModel {
+                    cross_sections: Arc::new(eff),
+                    density_indices: Arc::new((0..n_params).collect()),
+                    energies: instrument
+                        .as_ref()
+                        .map(|_| Arc::new(config.energies.clone())),
+                    instrument,
+                    resolution_plan: None,
+                    sparse_cubature_plan: None,
+                    sparse_scalar_plan: None,
+                    work_layout: Some(Arc::new(working.layout)),
+                }),
+                routes: RouteSource::from(computed_routes),
+            });
         }
     };
 
@@ -3185,18 +3305,21 @@ fn build_transmission_model(
         } else {
             None
         };
-        return Ok(Box::new(PrecomputedTransmissionModel {
-            cross_sections: effective_xs,
-            density_indices: Arc::new((0..n_params).collect()),
-            energies: instrument
-                .as_ref()
-                .map(|_| Arc::new(config.energies.clone())),
-            instrument,
-            resolution_plan,
-            sparse_cubature_plan,
-            sparse_scalar_plan,
-            work_layout,
-        }));
+        return Ok(BuiltModel {
+            model: Box::new(PrecomputedTransmissionModel {
+                cross_sections: effective_xs,
+                density_indices: Arc::new((0..n_params).collect()),
+                energies: instrument
+                    .as_ref()
+                    .map(|_| Arc::new(config.energies.clone())),
+                instrument,
+                resolution_plan,
+                sparse_cubature_plan,
+                sparse_scalar_plan,
+                work_layout,
+            }),
+            routes: RouteSource::from(computed_routes),
+        });
     }
 
     let instrument = config
@@ -3228,20 +3351,31 @@ fn build_transmission_model(
     } else {
         None
     };
-    Ok(Box::new(
-        TransmissionFitModel::new(
-            config.energies.clone(),
-            config.resonance_data.clone(),
-            config.temperature_k,
-            instrument,
-            (density_indices, density_ratios),
-            temperature_index,
-            base_xs,
-        )?
-        .with_resolution_plan(resolution_plan)
-        .with_sparse_cubature_plan(sparse_cubature_plan)
-        .with_sparse_scalar_plan(sparse_scalar_plan),
-    ))
+    let mut model = TransmissionFitModel::new(
+        config.energies.clone(),
+        config.resonance_data.clone(),
+        config.temperature_k,
+        instrument,
+        (density_indices, density_ratios),
+        temperature_index,
+        base_xs,
+    )?
+    .with_resolution_plan(resolution_plan)
+    .with_sparse_cubature_plan(sparse_cubature_plan)
+    .with_sparse_scalar_plan(sparse_scalar_plan);
+    if config.precomputed_base_xs.is_none()
+        && let Some(plan) = &config.precomputed_doppler_plan
+    {
+        model = model.with_doppler_plan(Arc::clone(plan));
+    }
+    // A free-temperature model decides its routes here (once per fit) so the
+    // result can disclose them; the fixed-temperature model has none, and
+    // its routes come from `forward_model` per call.
+    let routes = RouteSource::from(model.doppler_routes()?);
+    Ok(BuiltModel {
+        model: Box::new(model),
+        routes,
+    })
 }
 
 /// Uncertainty of the full-layout parameter `full_index`, read from the
@@ -3375,6 +3509,7 @@ fn extract_result(
         warnings: degenerate_normalization_warning(config)
             .into_iter()
             .collect(),
+        doppler_routes: None,
     })
 }
 
@@ -3493,8 +3628,8 @@ pub fn evaluate_jacobian_and_fisher(
         param_vec.push(FitParameter {
             name: "temperature_k".into(),
             value: config.temperature_k,
-            lower: 1.0,
-            upper: 5000.0,
+            lower: TEMPERATURE_FIT_LOWER_BOUND_K,
+            upper: TEMPERATURE_FIT_UPPER_BOUND_K,
             fixed: false,
         });
         Some(idx)
@@ -3632,7 +3767,8 @@ pub fn evaluate_jacobian_and_fisher(
         };
 
     // ── Build transmission model (same as production path) ──────────
-    let t_model = build_transmission_model(effective_config, n_density_params, temperature_index)?;
+    let t_model =
+        build_transmission_model(effective_config, n_density_params, temperature_index)?.model;
 
     // ── Build counts model chain and evaluate ───────────────────────
     // Use a closure that evaluates and computes Jacobian for any FitModel.
@@ -3935,6 +4071,10 @@ pub struct SpectrumFitResult {
     /// tracing dependency, and structured warnings survive across the
     /// PyO3 / GUI boundaries.
     pub warnings: Vec<String>,
+    /// The Doppler route each isotope took, in `resonance_data` order.
+    /// `None` only when the caller supplied broadened cross-sections, so the
+    /// pipeline never broadened anything.
+    pub doppler_routes: Option<Vec<IsotopeDopplerRoute>>,
 }
 
 impl SpectrumFitResult {
@@ -3982,14 +4122,16 @@ impl SpectrumFitResult {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use nereids_endf::resonance::ResonanceFormalism;
     use nereids_endf::resonance::test_support::{
         hf178_mlbw_two_resonances, synthetic_single_resonance, u238_single_resonance,
-        u238_three_resonances,
+        u238_three_resonances, u238_with_formalism,
     };
     use nereids_fitting::lm::FitModel;
     use nereids_fitting::transmission_model::{
         EnergyScaleJacobianMethod, EnergyScaleTransmissionModel,
     };
+    use nereids_physics::doppler_route::SampledTableReason;
     use nereids_physics::transmission as phys_transmission;
 
     /// Gauss–Jordan inverse of a small dense matrix (test-only; the crate's
@@ -5944,6 +6086,7 @@ mod tests {
             baseline: None,
             baseline_e_ref_ev: None,
             warnings: Vec::new(),
+            doppler_routes: None,
         };
 
         // Fitted energy scale → Some(corrected grid) == the canonical
@@ -9107,7 +9250,7 @@ mod tests {
             vec![density],
         )
         .unwrap();
-        let model = build_transmission_model(&config, 1, None).unwrap();
+        let model = build_transmission_model(&config, 1, None).unwrap().model;
         let t_model = model.evaluate(&[density]).unwrap();
         let sample = SampleParams::new(293.6, vec![(data.clone(), density)]).unwrap();
         let t_fwd = phys_transmission::forward_model(&energies, &sample, None).unwrap();
@@ -9133,7 +9276,9 @@ mod tests {
             vec![density],
         )
         .unwrap();
-        let model_res = build_transmission_model(&config_res, 1, None).unwrap();
+        let model_res = build_transmission_model(&config_res, 1, None)
+            .unwrap()
+            .model;
         let t_model_res = model_res.evaluate(&[density]).unwrap();
         let inst = InstrumentParams { resolution: res };
         let sample_res = SampleParams::new(293.6, vec![(data.clone(), density)]).unwrap();
@@ -9181,7 +9326,9 @@ mod tests {
             vec![density],
         )
         .unwrap();
-        let model_tab = build_transmission_model(&config_tab, 1, None).unwrap();
+        let model_tab = build_transmission_model(&config_tab, 1, None)
+            .unwrap()
+            .model;
         let t_model_tab = model_tab.evaluate(&[density]).unwrap();
         let inst_tab = InstrumentParams {
             resolution: res_tab,
@@ -9197,5 +9344,168 @@ mod tests {
                 "tabulated-resolution arm, bin {i}: {a:e} != {b:e}"
             );
         }
+    }
+
+    // ── Doppler route disclosure ───────────────────────────────────────────
+
+    fn fit_with(
+        data: &ResonanceData,
+        energies: &[f64],
+        fit_temperature: bool,
+    ) -> SpectrumFitResult {
+        let (t, sigma) = synthetic_transmission_at_temp(data, 0.0005, 350.0, energies);
+        let config = UnifiedFitConfig::new(
+            energies.to_vec(),
+            vec![data.clone()],
+            vec!["U-238".into()],
+            300.0,
+            None,
+            vec![0.001],
+        )
+        .unwrap()
+        .with_solver(SolverConfig::LevenbergMarquardt(LmConfig {
+            max_iter: 5,
+            ..LmConfig::default()
+        }))
+        .with_fit_temperature(fit_temperature);
+        let input = InputData::Transmission {
+            transmission: t,
+            uncertainty: sigma,
+        };
+        fit_spectrum_typed(&input, &config).unwrap()
+    }
+
+    #[test]
+    fn fit_result_discloses_routes_and_warns_only_on_edge_fallback() {
+        let energies: Vec<f64> = (0..201).map(|i| 4.0 + (i as f64) * 0.0145).collect();
+
+        // Reich-Moore: sampled table, documented, no warning — fixed or free T.
+        for fit_temperature in [false, true] {
+            let result = fit_with(&u238_single_resonance(), &energies, fit_temperature);
+            let routes = result.doppler_routes.as_ref().unwrap();
+            assert_eq!(routes.len(), 1);
+            assert_eq!(
+                routes[0].to_string(),
+                "U-238: sampled-table kernel-on-grid (Reich-Moore formalism)"
+            );
+            assert!(!result.warnings.iter().any(|w| w.starts_with("Doppler:")));
+        }
+
+        // MLBW well inside its range: continuous, fixed or free T.
+        for fit_temperature in [false, true] {
+            let result = fit_with(
+                &u238_with_formalism(ResonanceFormalism::MLBW),
+                &energies,
+                fit_temperature,
+            );
+            assert_eq!(
+                result.doppler_routes.as_ref().unwrap()[0].to_string(),
+                "U-238: continuous free-gas integral over the MLBW resonance equation"
+            );
+            assert!(!result.warnings.iter().any(|w| w.starts_with("Doppler:")));
+        }
+
+        // MLBW whose range ends at 8 eV: continuous at the fixed 300 K, but a
+        // free-temperature fit gates at 5000 K, where the window at 6.9 eV
+        // reaches past the range edge — disclosed, and warned about.
+        let mut near_edge = u238_with_formalism(ResonanceFormalism::MLBW);
+        near_edge.ranges[0].energy_high = 8.0;
+        let fixed = fit_with(&near_edge, &energies, false);
+        assert!(matches!(
+            fixed.doppler_routes.as_ref().unwrap()[0].route,
+            DopplerRoute::Continuous { .. }
+        ));
+        assert!(!fixed.warnings.iter().any(|w| w.starts_with("Doppler:")));
+        let free = fit_with(&near_edge, &energies, true);
+        assert!(matches!(
+            free.doppler_routes.as_ref().unwrap()[0].route,
+            DopplerRoute::SampledTable {
+                reason: SampledTableReason::WindowCrossesRangeBoundary { .. }
+            }
+        ));
+        let warning = free
+            .warnings
+            .iter()
+            .find(|w| w.starts_with("Doppler: U-238 took the sampled-table route"))
+            .expect("edge fallback must be warned about");
+        assert!(
+            warning.contains("although it is resolved MLBW"),
+            "{warning}"
+        );
+        assert!(warning.ends_with("(route gate at 5000 K)"), "{warning}");
+    }
+
+    #[test]
+    fn caller_supplied_cross_sections_yield_no_routes() {
+        let data = u238_single_resonance();
+        let energies: Vec<f64> = (0..201).map(|i| 4.0 + (i as f64) * 0.0145).collect();
+        let (t, sigma) = synthetic_transmission_at_temp(&data, 0.0005, 300.0, &energies);
+        let xs = phys_transmission::broadened_cross_sections(
+            &energies,
+            std::slice::from_ref(&data),
+            300.0,
+            None,
+            None,
+        )
+        .unwrap();
+        let config = UnifiedFitConfig::new(
+            energies,
+            vec![data],
+            vec!["U-238".into()],
+            300.0,
+            None,
+            vec![0.001],
+        )
+        .unwrap()
+        .with_solver(SolverConfig::LevenbergMarquardt(LmConfig::default()))
+        .with_precomputed_cross_sections(Arc::new(xs));
+        let input = InputData::Transmission {
+            transmission: t,
+            uncertainty: sigma,
+        };
+        let result = fit_spectrum_typed(&input, &config).unwrap();
+        assert!(result.doppler_routes.is_none());
+    }
+
+    #[test]
+    fn energy_scale_fit_discloses_the_pinned_routes() {
+        let data = hf178_mlbw_two_resonances();
+        let energies: Vec<f64> = (0..400).map(|i| 4.0 + (i as f64) * 0.05).collect();
+        let model = EnergyScaleTransmissionModel::new(
+            Arc::new(vec![data.clone()]),
+            Arc::new(vec![0]),
+            Arc::new(vec![1.0]),
+            293.6,
+            energies.clone(),
+            25.0,
+            1,
+            2,
+            None,
+        );
+        let t = model.evaluate(&[0.05, 0.5, 1.001]).unwrap();
+        let sigma: Vec<f64> = t.iter().map(|v| 0.01 * v.max(0.01)).collect();
+        let config = UnifiedFitConfig::new(
+            energies,
+            vec![data],
+            vec!["Hf-178".into()],
+            293.6,
+            None,
+            vec![0.04],
+        )
+        .unwrap()
+        .with_solver(SolverConfig::LevenbergMarquardt(LmConfig {
+            max_iter: 3,
+            ..LmConfig::default()
+        }))
+        .with_energy_scale(0.5, 1.001, 25.0);
+        let input = InputData::Transmission {
+            transmission: t,
+            uncertainty: sigma,
+        };
+        let result = fit_spectrum_typed(&input, &config).unwrap();
+        assert_eq!(
+            result.doppler_routes.as_ref().unwrap()[0].to_string(),
+            "Hf-178: continuous free-gas integral over the MLBW resonance equation"
+        );
     }
 }

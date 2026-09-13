@@ -952,6 +952,7 @@ mod tests {
             baseline_e_ref_ev: None,
             baseline_maps: None,
             warnings: Vec::new(),
+            doppler_routes: None,
             n_converged: 4,
             n_total: 4,
             n_failed: 0,

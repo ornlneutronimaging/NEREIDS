@@ -128,6 +128,28 @@ pub struct IsotopeDopplerRoute {
 }
 
 impl DopplerRoute {
+    /// Whether two routes are the same tier for the same kind of reason.
+    ///
+    /// Gate reasons carry the energy at which the condition failed (and the
+    /// window or kernel width there); those describe one grid and move
+    /// when the grid moves. A caller that must hold the route fixed across
+    /// grids — the energy-scale model, whose working grid follows every
+    /// `(t0, L_scale)` probe — compares kinds, not the reported energies.
+    pub fn same_kind(&self, other: &Self) -> bool {
+        match (self, other) {
+            (DopplerRoute::Unbroadened, DopplerRoute::Unbroadened) => true,
+            (
+                DopplerRoute::Continuous { formalism: a },
+                DopplerRoute::Continuous { formalism: b },
+            ) => a == b,
+            (
+                DopplerRoute::SampledTable { reason: a },
+                DopplerRoute::SampledTable { reason: b },
+            ) => a.same_kind(b),
+            _ => false,
+        }
+    }
+
     /// True when a resolved SLBW/MLBW isotope fell to tier 2 for a reason
     /// other than its formalism or the caller's explicit table.
     ///
@@ -142,6 +164,44 @@ impl DopplerRoute {
                 reason,
                 SampledTableReason::ExplicitTable | SampledTableReason::Formalism { .. }
             ),
+        }
+    }
+}
+
+impl SampledTableReason {
+    /// Same variant and, where the variant carries one, the same formalism
+    /// or overlapping-range index; the energy at which the condition failed
+    /// and the window or kernel width there are not compared (see
+    /// [`DopplerRoute::same_kind`]).
+    pub fn same_kind(&self, other: &Self) -> bool {
+        use SampledTableReason as R;
+        match (self, other) {
+            (R::ExplicitTable, R::ExplicitTable) => true,
+            (R::Formalism { formalism: a, .. }, R::Formalism { formalism: b, .. }) => a == b,
+            (
+                R::ThermalWindowFoldsThroughZero { formalism: a, .. },
+                R::ThermalWindowFoldsThroughZero { formalism: b, .. },
+            )
+            | (
+                R::WindowCrossesRangeBoundary { formalism: a, .. },
+                R::WindowCrossesRangeBoundary { formalism: b, .. },
+            )
+            | (R::File3Background { formalism: a, .. }, R::File3Background { formalism: b, .. }) => {
+                a == b
+            }
+            (
+                R::OverlappingRange {
+                    other_range_index: i,
+                    formalism: a,
+                    ..
+                },
+                R::OverlappingRange {
+                    other_range_index: j,
+                    formalism: b,
+                    ..
+                },
+            ) => i == j && a == b,
+            _ => false,
         }
     }
 }
@@ -477,5 +537,57 @@ mod tests {
             };
             assert_eq!(edge_fallback_warning(&labelled, 5000.0), None);
         }
+    }
+
+    #[test]
+    fn same_kind_ignores_the_reported_energy_but_not_the_reason_or_formalism() {
+        let rm_at = |energy_ev: f64| DopplerRoute::SampledTable {
+            reason: SampledTableReason::Formalism {
+                energy_ev,
+                formalism: Some(ResonanceFormalism::ReichMoore),
+            },
+        };
+        assert!(rm_at(4.0).same_kind(&rm_at(4.1)));
+        assert_ne!(rm_at(4.0), rm_at(4.1));
+        assert!(!rm_at(4.0).same_kind(&DopplerRoute::SampledTable {
+            reason: SampledTableReason::Formalism {
+                energy_ev: 4.0,
+                formalism: None,
+            },
+        }));
+
+        let mut shifted = window_reason();
+        if let SampledTableReason::WindowCrossesRangeBoundary {
+            energy_ev,
+            window_low_ev,
+            window_high_ev,
+            ..
+        } = &mut shifted
+        {
+            *energy_ev += 0.5;
+            *window_low_ev += 0.5;
+            *window_high_ev += 0.5;
+        }
+        assert!(window_reason().same_kind(&shifted));
+        let slbw_window = SampledTableReason::WindowCrossesRangeBoundary {
+            energy_ev: 9.99e3,
+            window_low_ev: 9.81e3,
+            window_high_ev: 1.02e4,
+            range_low_ev: 1e-5,
+            range_high_ev: 1e4,
+            formalism: ResonanceFormalism::SLBW,
+        };
+        assert!(!window_reason().same_kind(&slbw_window));
+        assert!(!window_reason().same_kind(&SampledTableReason::ExplicitTable));
+
+        let continuous = |formalism| DopplerRoute::Continuous { formalism };
+        assert!(
+            continuous(ResonanceFormalism::MLBW).same_kind(&continuous(ResonanceFormalism::MLBW))
+        );
+        assert!(
+            !continuous(ResonanceFormalism::MLBW).same_kind(&continuous(ResonanceFormalism::SLBW))
+        );
+        assert!(!continuous(ResonanceFormalism::MLBW).same_kind(&DopplerRoute::Unbroadened));
+        assert!(DopplerRoute::Unbroadened.same_kind(&DopplerRoute::Unbroadened));
     }
 }
