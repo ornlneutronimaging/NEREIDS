@@ -441,42 +441,40 @@ impl<'a> JointPoissonObjective<'a> {
     /// where `h_i = ∂² D / ∂ T_i²` is the per-bin deviance curvature
     /// `2·(O_i + S_i)·c / (T_i·(1 + c·T_i)²)` (Fisher-scoring form derived
     /// from binomial logit-link Var(S | N) = N·p·(1−p) with d logit p / dT
-    /// = 1/T — see the module-level docstring §Model).  A perturbed probe
-    /// the model refuses (an energy-scale probe across a resolved-range
-    /// edge, say) leaves its column at zero, as [`Self::deviance_gradient_fd`]
-    /// does, so a converged fit next to such an edge still gets a
-    /// covariance; only a failing base evaluation is an error.
+    /// = 1/T — see the module-level docstring §Model).
+    ///
+    /// A perturbed probe the model refuses (an energy-scale probe across a
+    /// resolved-range edge, say) is replaced by the one-sided difference on
+    /// the other side, as `lm::compute_jacobian` does when a bound blocks
+    /// the forward step, so a converged fit next to such an edge keeps a
+    /// full-rank matrix.  A parameter refused on both sides (or on the one
+    /// side its bounds allow) keeps a zero column and is listed in
+    /// [`FdFisherInformation::unprobed`]; [`joint_poisson_fit`] then inverts
+    /// the block of the other parameters and reports NaN for it.  Only a
+    /// failing base evaluation is an error.
     pub fn fisher_information_fd(
         &self,
         params: &mut ParameterSet,
         fd_step: f64,
-    ) -> Result<Option<FlatMatrix>, FittingError> {
+    ) -> Result<FdFisherInformation, FittingError> {
         let free_idx = params.free_indices();
         let base_values = params.all_values();
         let t_base = self.model.evaluate(&base_values)?;
         self.validate_inputs(t_base.len())?;
         let n_e = t_base.len();
         let n_free = free_idx.len();
-        if n_free == 0 {
-            return Ok(Some(FlatMatrix::zeros(0, 0)));
-        }
         let mut jac = FlatMatrix::zeros(n_e, n_free);
+        let mut unprobed = Vec::new();
         for (col, &idx) in free_idx.iter().enumerate() {
             let original = params.params[idx].value;
             let step = fd_step * (1.0 + original.abs());
-            // A probe the model refuses is treated like a non-finite one:
-            // the column stays at zero (mirroring `deviance_gradient_fd`).
+            // A probe the model refuses is absent on its side; the other
+            // side then carries the column alone.
             params.params[idx].value = original + step;
             params.params[idx].clamp();
             let forward_step = params.params[idx].value - original;
             let t_plus = if forward_step.abs() >= PIVOT_FLOOR {
-                match self.model.evaluate(&params.all_values()) {
-                    Ok(t) => Some(t),
-                    Err(_) => {
-                        params.params[idx].value = original;
-                        continue;
-                    }
-                }
+                self.model.evaluate(&params.all_values()).ok()
             } else {
                 None
             };
@@ -484,13 +482,7 @@ impl<'a> JointPoissonObjective<'a> {
             params.params[idx].clamp();
             let backward_step = original - params.params[idx].value;
             let t_minus = if backward_step.abs() >= PIVOT_FLOOR {
-                match self.model.evaluate(&params.all_values()) {
-                    Ok(t) => Some(t),
-                    Err(_) => {
-                        params.params[idx].value = original;
-                        continue;
-                    }
-                }
+                self.model.evaluate(&params.all_values()).ok()
             } else {
                 None
             };
@@ -499,7 +491,10 @@ impl<'a> JointPoissonObjective<'a> {
                 (Some(tp), Some(tm)) => (tp, tm, forward_step + backward_step),
                 (Some(tp), None) => (tp, t_base.clone(), forward_step),
                 (None, Some(tm)) => (t_base.clone(), tm, backward_step),
-                (None, None) => continue,
+                (None, None) => {
+                    unprobed.push(col);
+                    continue;
+                }
             };
             if denom.abs() < PIVOT_FLOOR {
                 continue;
@@ -554,7 +549,7 @@ impl<'a> JointPoissonObjective<'a> {
                 }
             }
         }
-        Ok(Some(info))
+        Ok(FdFisherInformation { info, unprobed })
     }
 
     /// Finite-difference gradient of the deviance.
@@ -767,7 +762,7 @@ fn deviance_curvature(s: f64, o: f64, t: f64, c: f64) -> f64 {
 // joint_poisson_fit — two-stage solver (damped Fisher + Nelder-Mead polish)
 // ======================================================================
 
-use crate::lm::{invert_matrix, solve_damped_system};
+use crate::lm::{invert_informative_block, solve_damped_system};
 use crate::nelder_mead::{NelderMeadConfig, nelder_mead_minimize};
 
 /// Configuration for [`joint_poisson_fit`].
@@ -888,6 +883,16 @@ impl Default for JointPoissonFitConfig {
     }
 }
 
+/// What [`JointPoissonObjective::fisher_information_fd`] returns.
+#[derive(Debug)]
+pub struct FdFisherInformation {
+    /// `I(θ)` over the free parameters, in free-index order.
+    pub info: FlatMatrix,
+    /// Free-index positions whose column is zero because no probe could be
+    /// taken: the model refused every perturbation the bounds allowed.
+    pub unprobed: Vec<usize>,
+}
+
 /// Outcome of [`joint_poisson_fit`].
 #[derive(Debug, Clone)]
 pub struct JointPoissonResult {
@@ -934,6 +939,11 @@ pub struct JointPoissonResult {
     pub covariance: Option<FlatMatrix>,
     /// `√diag(covariance)` for each free parameter, in free-index order.
     pub uncertainties: Option<Vec<f64>>,
+    /// One line per free parameter whose uncertainty is NaN because it
+    /// carries no Fisher information at the solution — every
+    /// finite-difference probe of it refused by the model, or a model that
+    /// does not respond to it — naming the parameter.
+    pub warnings: Vec<String>,
 }
 
 /// Two-stage joint-Poisson fit: damped Fisher stage followed by
@@ -1035,6 +1045,7 @@ pub fn joint_poisson_fit(
             params: params.all_values(),
             covariance: None,
             uncertainties: None,
+            warnings: Vec::new(),
         });
     }
 
@@ -1069,6 +1080,7 @@ pub fn joint_poisson_fit(
             params: params.all_values(),
             covariance: None,
             uncertainties: None,
+            warnings: Vec::new(),
         });
     }
 
@@ -1184,36 +1196,55 @@ pub fn joint_poisson_fit(
         } else {
             1.0
         };
-    let (covariance, uncertainties) = if config.compute_covariance {
+    let (covariance, uncertainties, warnings) = if config.compute_covariance {
         let free_idx = params.free_indices();
-        let info_opt = match objective.fisher_information(&final_values, &free_idx)? {
-            Some(info) => Some(info),
-            None => objective.fisher_information_fd(params, config.fd_step)?,
+        let (info, unprobed) = match objective.fisher_information(&final_values, &free_idx)? {
+            Some(info) => (info, Vec::new()),
+            None => {
+                let fd = objective.fisher_information_fd(params, config.fd_step)?;
+                (fd.info, fd.unprobed)
+            }
         };
-        match info_opt {
-            Some(info) => match invert_matrix(&info) {
-                Some(mut cov) => {
-                    // Rescale: invert_matrix returned (2I)^{-1}; multiply
-                    // every entry by 2 to obtain I^{-1}, and by `var_scale`
-                    // (= D/dof when scale_by_chi2, else 1.0) for the optional
-                    // χ²-inflation. `u` picks up √(var_scale) automatically.
-                    for v in cov.data.iter_mut() {
-                        *v *= 2.0 * var_scale;
-                    }
-                    let u: Vec<f64> = (0..cov.nrows)
-                        .map(|i| {
-                            let v = cov.get(i, i);
-                            if v > 0.0 { v.sqrt() } else { f64::NAN }
-                        })
-                        .collect();
-                    (Some(cov), Some(u))
+        // A parameter without Fisher information would make the whole
+        // matrix singular and cost every parameter its uncertainty; it is
+        // excluded, reported as NaN and named, and the others keep theirs.
+        let (inverse, uninformative) = invert_informative_block(&info);
+        let warnings = uninformative
+            .iter()
+            .map(|&j| {
+                let name = &params.params[free_idx[j]].name;
+                let cause = if unprobed.contains(&j) {
+                    "the model refused every finite-difference probe of it"
+                } else {
+                    "it carries no Fisher information at the solution"
+                };
+                format!(
+                    "covariance: the uncertainty of `{name}` is NaN because {cause}; the \
+                     covariance covers the other free parameters"
+                )
+            })
+            .collect();
+        match inverse {
+            Some(mut cov) => {
+                // Rescale: the inverse is (2I)^{-1}; multiply every entry by
+                // 2 to obtain I^{-1}, and by `var_scale` (= D/dof when
+                // scale_by_chi2, else 1.0) for the optional χ²-inflation.
+                // `u` picks up √(var_scale) automatically.
+                for v in cov.data.iter_mut() {
+                    *v *= 2.0 * var_scale;
                 }
-                None => (None, None),
-            },
-            None => (None, None),
+                let u: Vec<f64> = (0..cov.nrows)
+                    .map(|i| {
+                        let v = cov.get(i, i);
+                        if v > 0.0 { v.sqrt() } else { f64::NAN }
+                    })
+                    .collect();
+                (Some(cov), Some(u), warnings)
+            }
+            None => (None, None, warnings),
         }
     } else {
-        (None, None)
+        (None, None, Vec::new())
     };
 
     Ok(JointPoissonResult {
@@ -1230,6 +1261,7 @@ pub fn joint_poisson_fit(
         params: final_values,
         covariance,
         uncertainties,
+        warnings,
     })
 }
 
@@ -3080,7 +3112,7 @@ mod tests {
         let info = obj
             .fisher_information_fd(&mut params, 1e-2)
             .expect("fisher_information_fd should not return Err on a finite base")
-            .expect("fisher_information_fd should return Some(matrix)");
+            .info;
         // Every entry must be finite — column was skipped on NaN probe.
         for v in info.data.iter() {
             assert!(
@@ -3090,24 +3122,96 @@ mod tests {
         }
     }
 
-    /// A perturbed probe the model refuses with `Err` skips its column,
-    /// as `deviance_gradient_fd` does, instead of failing the whole
-    /// Fisher matrix: a converged energy-scale fit whose `+h` probe
-    /// crosses a resolved-range edge still gets a covariance.
-    #[test]
-    fn test_fisher_information_fd_skips_a_refused_probe() {
-        struct RefusingProbe;
-        impl FitModel for RefusingProbe {
-            fn evaluate(&self, params: &[f64]) -> Result<Vec<f64>, FittingError> {
-                if params[0] > 0.6 {
-                    return Err(FittingError::EvaluationFailed("route change".into()));
-                }
-                Ok(vec![params[0]; 3])
+    /// `T_i = A·s_i + B·c_i`, linear in both parameters so one-sided and
+    /// central differences agree to rounding.
+    struct TwoColumnModel {
+        /// `B` values above this are refused with `Err`.
+        refuse_b_above: f64,
+        /// `B` values below this are refused with `Err`.
+        refuse_b_below: f64,
+    }
+
+    impl FitModel for TwoColumnModel {
+        fn evaluate(&self, params: &[f64]) -> Result<Vec<f64>, FittingError> {
+            if params[1] > self.refuse_b_above || params[1] < self.refuse_b_below {
+                return Err(FittingError::EvaluationFailed("route change".into()));
             }
+            let (a, b) = (params[0], params[1]);
+            Ok([(0.5, 0.2), (0.6, 0.0), (0.7, 0.1)]
+                .iter()
+                .map(|&(s, c)| a * s + b * c)
+                .collect())
         }
-        let model = RefusingProbe;
+    }
+
+    /// A perturbed probe the model refuses with `Err` on one side is
+    /// replaced by the one-sided difference on the other, so the Fisher
+    /// matrix stays full-rank and every parameter keeps its uncertainty:
+    /// a converged energy-scale fit whose `+h` probe crosses a
+    /// resolved-range edge still gets a covariance for all its parameters.
+    #[test]
+    fn test_fisher_information_fd_uses_the_other_side_of_a_refused_probe() {
         let o = vec![10.0; 3];
         let s = vec![5.0; 3];
+        let fisher = |model: &TwoColumnModel| {
+            let obj = JointPoissonObjective {
+                model,
+                o: &o,
+                s: &s,
+                c: 1.0,
+                active_mask: None,
+            };
+            let mut params = ParameterSet::new(vec![
+                FitParameter::non_negative("A", 0.4),
+                FitParameter::non_negative("B", 0.3),
+            ]);
+            let fd = obj
+                .fisher_information_fd(&mut params, 1e-2)
+                .expect("a refused probe must not fail the Fisher matrix");
+            assert_eq!(params.params[1].value, 0.3, "the parameter is restored");
+            fd
+        };
+        let unrefused = fisher(&TwoColumnModel {
+            refuse_b_above: f64::INFINITY,
+            refuse_b_below: f64::NEG_INFINITY,
+        });
+        assert!(unrefused.unprobed.is_empty());
+        let forward_refused = fisher(&TwoColumnModel {
+            refuse_b_above: 0.3,
+            refuse_b_below: f64::NEG_INFINITY,
+        });
+        assert!(forward_refused.unprobed.is_empty());
+        for (central, one_sided) in unrefused
+            .info
+            .data
+            .iter()
+            .zip(forward_refused.info.data.iter())
+        {
+            assert!(
+                (central - one_sided).abs() <= 1e-9 * central.abs(),
+                "one-sided column must match the central one: {central} vs {one_sided}"
+            );
+        }
+        let (inverse, excluded) = invert_informative_block(&forward_refused.info);
+        assert!(excluded.is_empty());
+        let inverse = inverse.expect("the one-sided column keeps the matrix full-rank");
+        assert!(inverse.get(0, 0) > 0.0 && inverse.get(1, 1) > 0.0);
+    }
+
+    /// A parameter whose probes are refused on both sides keeps a zero
+    /// column; the fit reports NaN for it alone, keeps the covariance of
+    /// the other parameters, and names it in a `warnings` line.
+    #[test]
+    fn joint_poisson_fit_reports_nan_for_a_parameter_refused_on_both_sides() {
+        // Every perturbation of `B` away from 0.3 is refused; the optimizer
+        // never moves it (its gradient probe reads zero), so the fit
+        // converges on `A` and the covariance step meets the refusal.
+        let model = TwoColumnModel {
+            refuse_b_above: 0.3,
+            refuse_b_below: 0.3,
+        };
+        let o = vec![100.0; 3];
+        let s = vec![30.0; 3];
         let obj = JointPoissonObjective {
             model: &model,
             o: &o,
@@ -3115,13 +3219,31 @@ mod tests {
             c: 1.0,
             active_mask: None,
         };
-        let mut params = ParameterSet::new(vec![FitParameter::non_negative("T", 0.6)]);
-        let info = obj
-            .fisher_information_fd(&mut params, 1e-2)
-            .expect("a refused probe must not fail the Fisher matrix")
-            .expect("the base point is finite");
-        assert_eq!(info.get(0, 0), 0.0, "the refused column is skipped");
-        assert_eq!(params.params[0].value, 0.6, "the parameter is restored");
+        let mut params = ParameterSet::new(vec![
+            FitParameter::non_negative("A", 0.4),
+            FitParameter::non_negative("B", 0.3),
+        ]);
+        let result = joint_poisson_fit(&obj, &mut params, &JointPoissonFitConfig::default())
+            .expect("a refused covariance probe must not fail the fit");
+        let unc = result
+            .uncertainties
+            .expect("the responsive block is inverted");
+        assert!(
+            unc[0].is_finite() && unc[0] > 0.0,
+            "A keeps its uncertainty: {unc:?}"
+        );
+        assert!(unc[1].is_nan(), "B is refused on both sides: {unc:?}");
+        let cov = result.covariance.unwrap();
+        assert!(cov.get(0, 0).is_finite());
+        assert!(cov.get(0, 1).is_nan() && cov.get(1, 0).is_nan() && cov.get(1, 1).is_nan());
+        assert_eq!(
+            result.warnings,
+            vec![
+                "covariance: the uncertainty of `B` is NaN because the model refused every \
+                 finite-difference probe of it; the covariance covers the other free parameters"
+                    .to_string()
+            ]
+        );
     }
 
     // ==================================================================

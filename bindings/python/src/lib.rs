@@ -1270,12 +1270,17 @@ impl PySpatialResult {
         self.warnings.clone()
     }
 
-    /// One line per isotope naming the Doppler route the fit executed, in
-    /// isotope order — ``"Hf-177: continuous free-gas integral over the
-    /// MLBW resonance equation"`` or ``"U-238: sampled-table kernel-on-grid
-    /// (Reich-Moore formalism)"``.  ``None`` only when broadened
-    /// cross-sections were supplied by a Rust caller, which cannot happen
-    /// from Python.
+    /// One line per isotope naming the Doppler route the whole map
+    /// executed, in isotope order — ``"Hf-177: continuous free-gas integral
+    /// over the MLBW resonance equation"`` or ``"U-238: sampled-table
+    /// kernel-on-grid (Reich-Moore formalism)"``.  ``None`` when no pixel
+    /// was fitted (every pixel masked as dead), when an energy-scale map
+    /// has no converged pixel, or when the converged pixels of an
+    /// energy-scale map disagree on the kind of route (a ``warnings`` line
+    /// says so, because a map-wide route would be false for some of them);
+    /// also when a Rust caller supplied broadened cross-sections for a
+    /// fixed-temperature map without Gaussian resolution, which cannot
+    /// happen from Python.
     #[getter]
     fn doppler_routes(&self) -> Option<Vec<String>> {
         self.doppler_routes.clone()

@@ -1889,18 +1889,20 @@ pub struct EnergyScaleTransmissionModel {
 /// how many later probes it refused.
 ///
 /// A refused probe is one whose corrected grid would have changed some
-/// isotope's route kind. The model returns an error for it, which the
-/// optimizer treats as a rejected step: the fit stays on the pinned side
-/// of the resolved-range edge, and a finite-difference column probing
-/// across it is silently zero. The count makes that barrier visible.
+/// isotope's tier (two sampled-table routes run the same numerics
+/// whatever their reason, so a change of reason is not refused). The model
+/// returns an error for it, which the optimizer treats as a rejected step:
+/// the fit stays on the pinned side of the resolved-range edge, and a
+/// finite-difference column probing across it falls back to the other
+/// side. The count makes that barrier visible.
 #[derive(Debug, Clone, Default, PartialEq)]
 pub struct PinnedDopplerRoutes {
     /// Routes decided at the first probe; `None` until the model has been
     /// evaluated.
     pub routes: Option<Vec<DopplerRoute>>,
-    /// Number of probes refused for wanting a different route kind.
+    /// Number of probes refused for wanting a different tier.
     pub refused_probes: usize,
-    /// Index into `routes` of the first isotope whose route kind the most
+    /// Index into `routes` of the first isotope whose tier the most
     /// recently refused probe would have changed.
     pub refused_isotope: Option<usize>,
     /// Per isotope, the count of negative broadened values SAMMY's rule
@@ -2118,12 +2120,14 @@ impl EnergyScaleTransmissionModel {
             return Ok(());
         };
         // The reported energies inside a gate reason describe one grid and
-        // move with it; the tier and the kind of reason are what must hold.
+        // move with it, and every sampled-table reason runs the same
+        // numerics; only the tier must hold for the objective to stay
+        // continuous between probes.
         let changed = (0..first.len().max(routes.len())).find(|&i| {
             first
                 .get(i)
                 .zip(routes.get(i))
-                .is_none_or(|(a, b)| !a.same_kind(b))
+                .is_none_or(|(a, b)| !a.same_tier(b))
         });
         let Some(index) = changed else {
             return Ok(());
@@ -7367,6 +7371,62 @@ mod tests {
             Some(1),
             "the pinned routes survive a refusal"
         );
+    }
+
+    /// The pin holds the tier: two sampled-table reasons run the same
+    /// numerics, so a change of reason between probes is accepted, while a
+    /// change of tier is still refused.
+    #[test]
+    fn energy_scale_model_pins_the_tier_not_the_sampled_table_reason() {
+        let model = EnergyScaleTransmissionModel::new(
+            Arc::new(vec![u238_single_resonance()]),
+            Arc::new(vec![0]),
+            Arc::new(vec![1.0]),
+            293.6,
+            edge_grid(),
+            25.0,
+            1,
+            2,
+            None,
+        );
+        model.evaluate(&[0.001, 0.0, 1.0]).unwrap();
+        let pinned = model
+            .pinned_doppler_routes()
+            .borrow()
+            .routes
+            .clone()
+            .unwrap();
+        assert!(matches!(
+            pinned[0],
+            DopplerRoute::SampledTable {
+                reason: SampledTableReason::Formalism { .. }
+            }
+        ));
+        model
+            .pin_doppler_routes(&[DopplerRoute::SampledTable {
+                reason: SampledTableReason::WindowCrossesRangeBoundary {
+                    energy_ev: 6.9,
+                    window_low_ev: 6.5,
+                    window_high_ev: 8.1,
+                    range_low_ev: 1e-5,
+                    range_high_ev: 8.0,
+                    formalism: ResonanceFormalism::MLBW,
+                },
+            }])
+            .expect("a sampled-table reason change is the same tier");
+        assert_eq!(model.pinned_doppler_routes().borrow().refused_probes, 0);
+        let refused = model
+            .pin_doppler_routes(&[DopplerRoute::Continuous {
+                formalism: ResonanceFormalism::MLBW,
+            }])
+            .unwrap_err();
+        assert!(
+            refused
+                .to_string()
+                .contains("Doppler route changed between energy-scale probes"),
+            "{refused}"
+        );
+        assert_eq!(model.pinned_doppler_routes().borrow().refused_probes, 1);
     }
 
     #[test]

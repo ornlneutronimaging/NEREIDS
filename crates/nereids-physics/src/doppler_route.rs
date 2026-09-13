@@ -58,8 +58,10 @@ pub enum DopplerRoute {
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[non_exhaustive]
 pub enum SampledTableReason {
-    /// The caller supplied a zero-kelvin table. The engine never evaluated
-    /// the resonance source, so no tier-1 condition was tested.
+    /// The caller supplied a zero-kelvin table, which replaces the
+    /// evaluation of the resonance source on the data grid, so no tier-1
+    /// condition was tested; under Gaussian resolution the auxiliary-only
+    /// points of the working grid are still evaluated from the source.
     ExplicitTable,
     /// The range covering `energy_ev` is not a resolved SLBW/MLBW range
     /// (`Some`), or no range covers `energy_ev` and the source has no
@@ -159,22 +161,44 @@ impl DopplerRoute {
     ///
     /// Gate reasons carry the energy at which the condition failed (and the
     /// window or kernel width there); those describe one grid and move
-    /// when the grid moves. A caller that must hold the route fixed across
-    /// grids — the energy-scale model, whose working grid follows every
-    /// `(t0, L_scale)` probe — compares kinds, not the reported energies.
-    /// Two continuous routes are the same kind whatever their formalism:
-    /// a grid spanning adjacent SLBW and MLBW ranges is tier 1 at every
-    /// energy, and the disclosed formalism is only that of the lowest one.
+    /// when the grid moves, so a comparison of what two grids executed — a
+    /// redrawn overlay against its fit, the pixels of a map against each
+    /// other — compares kinds, not the reported energies. Two continuous
+    /// routes are the same kind whatever their formalism: a grid spanning
+    /// adjacent SLBW and MLBW ranges is tier 1 at every energy, and the
+    /// disclosed formalism is only that of the lowest one.
     pub fn same_kind(&self, other: &Self) -> bool {
         match (self, other) {
-            (DopplerRoute::Unbroadened, DopplerRoute::Unbroadened)
-            | (DopplerRoute::Continuous { .. }, DopplerRoute::Continuous { .. }) => true,
             (
                 DopplerRoute::SampledTable { reason: a },
                 DopplerRoute::SampledTable { reason: b },
             ) => a.same_kind(b),
-            _ => false,
+            _ => self.same_tier(other),
         }
+    }
+
+    /// Whether two routes are the same tier, whatever the reason for a
+    /// sampled table.
+    ///
+    /// Every sampled-table route runs the same kernel-on-grid numerics, so
+    /// a fit objective is continuous across a change of reason (a window
+    /// that folded through zero on one probe and crossed the range edge on
+    /// the next) and discontinuous only across a change of tier. The
+    /// energy-scale model, whose working grid follows every `(t0, L_scale)`
+    /// probe, holds the tier fixed across probes for that reason.
+    pub fn same_tier(&self, other: &Self) -> bool {
+        matches!(
+            (self, other),
+            (DopplerRoute::Unbroadened, DopplerRoute::Unbroadened)
+                | (
+                    DopplerRoute::Continuous { .. },
+                    DopplerRoute::Continuous { .. }
+                )
+                | (
+                    DopplerRoute::SampledTable { .. },
+                    DopplerRoute::SampledTable { .. }
+                )
+        )
     }
 
     /// The tier as one word, for prose that names which side of a route
@@ -694,6 +718,30 @@ mod tests {
                  (SLBW interference; SAMMY reports the same)"
             )
         );
+    }
+
+    /// The tier comparison accepts any two sampled-table reasons and
+    /// refuses a change of tier.
+    #[test]
+    fn same_tier_ignores_the_sampled_table_reason() {
+        let sampled = |reason| DopplerRoute::SampledTable { reason };
+        let folded = sampled(SampledTableReason::ThermalWindowFoldsThroughZero {
+            energy_ev: 3.1e-3,
+            thermal_u: 1.2e-2,
+            formalism: ResonanceFormalism::MLBW,
+        });
+        let crossed = sampled(window_reason());
+        assert!(folded.same_tier(&crossed));
+        assert!(!folded.same_kind(&crossed));
+        assert!(folded.same_tier(&sampled(SampledTableReason::ExplicitTable)));
+        let continuous = DopplerRoute::Continuous {
+            formalism: ResonanceFormalism::MLBW,
+        };
+        assert!(!continuous.same_tier(&crossed));
+        assert!(!continuous.same_tier(&DopplerRoute::Unbroadened));
+        assert!(continuous.same_tier(&DopplerRoute::Continuous {
+            formalism: ResonanceFormalism::SLBW,
+        }));
     }
 
     #[test]

@@ -157,8 +157,14 @@ pub struct SpatialResult {
     /// printed once to stderr since spatial runs are long.
     pub warnings: Vec<String>,
     /// The Doppler route each isotope took, in `resonance_data` order,
-    /// decided once for the whole map. `None` only when the caller supplied
-    /// broadened cross-sections, so the pipeline never broadened anything.
+    /// decided once for the whole map. `None` when no pixel was fitted
+    /// (every pixel masked as dead), when an energy-scale map has no
+    /// converged pixel, when the converged pixels of an energy-scale map
+    /// disagree on the kind of route (a `warnings` line says so, because a
+    /// map-wide route would be false for some of them), or when the caller
+    /// supplied broadened cross-sections for a fixed-temperature map
+    /// without Gaussian resolution, so the pipeline never broadened
+    /// anything.
     pub doppler_routes: Option<Vec<IsotopeDopplerRoute>>,
     /// Number of pixels that converged.
     pub n_converged: usize,

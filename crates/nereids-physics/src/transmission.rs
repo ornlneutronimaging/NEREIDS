@@ -1562,8 +1562,11 @@ fn evaluated(rows: Option<BroadenedRows>) -> BroadenedRows {
 /// gets [`TransmissionError::InputMismatch`], never a silently wrong route.
 ///
 /// [`DopplerPlan::from_explicit_table`] wraps a caller-supplied table: the
-/// engine never evaluates that source, so every isotope discloses
-/// [`SampledTableReason::ExplicitTable`] and no temperature gate applies.
+/// table replaces the evaluation of the resonance source on the data grid,
+/// so every isotope discloses [`SampledTableReason::ExplicitTable`] and no
+/// temperature gate applies; under Gaussian resolution the auxiliary-only
+/// points of the working grid are still evaluated from the source, which
+/// must therefore describe the same isotope.
 #[derive(Debug, Clone)]
 pub struct DopplerPlan {
     routes: Vec<DopplerRoute>,

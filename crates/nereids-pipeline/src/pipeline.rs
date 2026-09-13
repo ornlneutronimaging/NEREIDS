@@ -1698,6 +1698,7 @@ fn fit_transmission_lm(
         &lm_cfg,
         active_mask.as_deref(),
     )?;
+    doppler_route_source.evaluate_at_solution(&*stacked, &result.params)?;
 
     let free_indices = params.free_indices();
     let mut sr = extract_result(
@@ -2110,6 +2111,7 @@ fn fit_counts_joint_poisson(
     // FittingError.
     let result = joint_poisson::joint_poisson_fit(&objective, &mut params, &cfg)
         .map_err(PipelineError::Fitting)?;
+    doppler_route_source.evaluate_at_solution(&*stacked, &result.params)?;
 
     // ── Extract fitted quantities ──
     let densities: Vec<f64> = (0..n_density_params).map(|i| result.params[i]).collect();
@@ -2200,6 +2202,7 @@ fn fit_counts_joint_poisson(
         warnings: degenerate_normalization_warning(config)
             .into_iter()
             .chain(doppler_warnings)
+            .chain(result.warnings)
             .collect(),
         doppler_routes,
     })
@@ -3034,11 +3037,16 @@ struct BuiltModel {
 enum RouteSource {
     /// The pipeline did not broaden anything (caller-supplied σ).
     None,
-    /// Decided when the model was built. The counts come from the
-    /// working-grid build that decided the routes (fixed temperature) or
-    /// from the model's most recent evaluation (a free-temperature
-    /// `TransmissionFitModel`, which shares the handle), read after the fit.
-    Known {
+    /// Decided by the working-grid build that preceded a fixed-temperature
+    /// fit, whose counts are the fit's.
+    Decided {
+        routes: Vec<DopplerRoute>,
+        negative_values: Vec<usize>,
+    },
+    /// Decided by a free-temperature model's plan; the counts are those of
+    /// the model's most recent evaluation, read through the shared handle
+    /// after [`Self::evaluate_at_solution`].
+    Planned {
         routes: Vec<DopplerRoute>,
         negative_values: std::rc::Rc<std::cell::RefCell<Vec<usize>>>,
     },
@@ -3053,9 +3061,9 @@ impl RouteSource {
     /// pipeline broadened nothing.
     fn decided(build: Option<(Vec<DopplerRoute>, Vec<usize>)>) -> Self {
         match build {
-            Some((routes, negative_values)) => RouteSource::Known {
+            Some((routes, negative_values)) => RouteSource::Decided {
                 routes,
-                negative_values: std::rc::Rc::new(std::cell::RefCell::new(negative_values)),
+                negative_values,
             },
             None => RouteSource::None,
         }
@@ -3068,7 +3076,7 @@ impl RouteSource {
         negative_values: std::rc::Rc<std::cell::RefCell<Vec<usize>>>,
     ) -> Self {
         match routes {
-            Some(routes) => RouteSource::Known {
+            Some(routes) => RouteSource::Planned {
                 routes,
                 negative_values,
             },
@@ -3079,7 +3087,9 @@ impl RouteSource {
     fn resolve(&self) -> Option<Vec<DopplerRoute>> {
         match self {
             RouteSource::None => None,
-            RouteSource::Known { routes, .. } => Some(routes.clone()),
+            RouteSource::Decided { routes, .. } | RouteSource::Planned { routes, .. } => {
+                Some(routes.clone())
+            }
             RouteSource::Pinned(cell) => cell.borrow().routes.clone(),
         }
     }
@@ -3089,10 +3099,36 @@ impl RouteSource {
     fn negative_values(&self) -> Vec<usize> {
         match self {
             RouteSource::None => Vec::new(),
-            RouteSource::Known {
+            RouteSource::Decided {
+                negative_values, ..
+            } => negative_values.clone(),
+            RouteSource::Planned {
                 negative_values, ..
             } => negative_values.borrow().clone(),
             RouteSource::Pinned(cell) => cell.borrow().negative_values.clone(),
+        }
+    }
+
+    /// Bring the shared handles to the solution.
+    ///
+    /// A free-temperature or energy-scale model records its negative-value
+    /// counts at every evaluation, and the optimizer's last call is usually
+    /// a rejected trial or a finite-difference probe, not the accepted
+    /// point. One forward evaluation at the fitted parameters — the only
+    /// evaluation the disclosure adds to the fit — refills the handles
+    /// with the solution's counts. A fixed-temperature source reads its
+    /// counts from the build that preceded the fit and needs nothing.
+    fn evaluate_at_solution(
+        &self,
+        model: &dyn FitModel,
+        params: &[f64],
+    ) -> Result<(), PipelineError> {
+        match self {
+            RouteSource::None | RouteSource::Decided { .. } => Ok(()),
+            RouteSource::Planned { .. } | RouteSource::Pinned(_) => model
+                .evaluate(params)
+                .map(drop)
+                .map_err(PipelineError::Fitting),
         }
     }
 
@@ -9543,13 +9579,8 @@ mod tests {
     }
 
     /// Two broad same-J s-wave SLBW levels whose interference terms
-    /// outweigh the shared potential term over about 19 940-20 045 eV: the
-    /// broadened total is kept negative next to the sign change on either
-    /// tier (SAMMY's rule), and the result says so — from the working-grid
-    /// build at a fixed temperature, from the model's last evaluation when
-    /// the temperature is free.
-    #[test]
-    fn fit_result_warns_about_negative_broadened_totals() {
+    /// outweigh the shared potential term over about 19 940-20 045 eV.
+    fn slbw_with_negative_total() -> (ResonanceData, Vec<f64>) {
         let mut data = synthetic_swave_slbw(55.45, 20_095.0, 30.0, 0.5, 5.0);
         data.ranges[0].l_groups[0]
             .resonances
@@ -9561,36 +9592,86 @@ mod tests {
                 gfa: 0.0,
                 gfb: 0.0,
             });
-        let energies: Vec<f64> = (0..101).map(|i| 20_000.0 + (i as f64) * 0.5).collect();
+        let energies = (0..101).map(|i| 20_000.0 + (i as f64) * 0.5).collect();
+        (data, energies)
+    }
+
+    /// The count in the result's "Negative cross section" line for U-238.
+    fn disclosed_negative_count(result: &SpectrumFitResult) -> usize {
+        let warning = result
+            .warnings
+            .iter()
+            .find(|w| w.contains("broadened total cross-section value(s) of U-238 are negative"))
+            .unwrap_or_else(|| panic!("{:?}", result.warnings));
+        assert!(warning.starts_with("Doppler: "), "{warning}");
+        assert!(
+            warning.ends_with("(SLBW interference; SAMMY reports the same)"),
+            "{warning}"
+        );
+        warning
+            .trim_start_matches("Doppler: ")
+            .split(' ')
+            .next()
+            .unwrap()
+            .parse()
+            .unwrap()
+    }
+
+    /// The broadened total of [`slbw_with_negative_total`] is kept negative
+    /// next to the sign change on either tier (SAMMY's rule), and the
+    /// result says so — from the working-grid build at a fixed
+    /// temperature, from the model evaluated at the solution when the
+    /// temperature is free.
+    #[test]
+    fn fit_result_warns_about_negative_broadened_totals() {
+        let (data, energies) = slbw_with_negative_total();
         for fit_temperature in [false, true] {
             let result = fit_with(&data, &energies, fit_temperature);
             assert!(matches!(
                 result.doppler_routes.as_ref().unwrap()[0].route,
                 DopplerRoute::Continuous { .. }
             ));
-            let warning = result
-                .warnings
-                .iter()
-                .find(|w| {
-                    w.contains("broadened total cross-section value(s) of U-238 are negative")
-                })
-                .unwrap_or_else(|| {
-                    panic!("fit_temperature={fit_temperature}: {:?}", result.warnings)
-                });
-            assert!(warning.starts_with("Doppler: "), "{warning}");
-            assert!(
-                warning.ends_with("(SLBW interference; SAMMY reports the same)"),
-                "{warning}"
-            );
-            let count: usize = warning
-                .trim_start_matches("Doppler: ")
-                .split(' ')
-                .next()
-                .unwrap()
-                .parse()
-                .unwrap();
-            assert!(count > 0, "{warning}");
+            assert!(disclosed_negative_count(&result) > 0);
         }
+    }
+
+    /// A free-temperature fit discloses the counts of the solution, not of
+    /// the optimizer's last call (a rejected trial or a finite-difference
+    /// probe): the disclosed count equals a fresh evaluation of the same
+    /// model at the fitted parameters.
+    #[test]
+    fn free_temperature_fit_discloses_the_negative_values_of_the_solution() {
+        let (data, energies) = slbw_with_negative_total();
+        let (t, sigma) = synthetic_transmission_at_temp(&data, 0.0005, 350.0, &energies);
+        let config = UnifiedFitConfig::new(
+            energies,
+            vec![data],
+            vec!["U-238".into()],
+            300.0,
+            None,
+            vec![0.001],
+        )
+        .unwrap()
+        .with_solver(SolverConfig::LevenbergMarquardt(LmConfig {
+            max_iter: 5,
+            ..LmConfig::default()
+        }))
+        .with_fit_temperature(true);
+        let input = InputData::Transmission {
+            transmission: t,
+            uncertainty: sigma,
+        };
+        let result = fit_spectrum_typed(&input, &config).unwrap();
+        let built = build_transmission_model(&config, 1, Some(1)).unwrap();
+        assert!(matches!(built.routes, RouteSource::Planned { .. }));
+        built
+            .model
+            .evaluate(&[result.densities[0], result.temperature_k.unwrap()])
+            .unwrap();
+        assert_eq!(
+            built.routes.negative_values(),
+            vec![disclosed_negative_count(&result)]
+        );
     }
 
     /// A caller-supplied zero-kelvin table is validated at the entry point:

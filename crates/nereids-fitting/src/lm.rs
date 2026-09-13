@@ -423,6 +423,40 @@ pub(crate) fn solve_damped_system(a: &FlatMatrix, b: &[f64], lambda: f64) -> Opt
     Some(x)
 }
 
+/// Invert the block of a Fisher matrix whose parameters carry information.
+///
+/// A zero diagonal entry `Σ h_i·J_ij²` (non-negative curvature `h_i`) means
+/// the Jacobian column is zero at every contributing bin, so the whole row
+/// and column are zero and the matrix is singular.  Such a parameter is
+/// excluded, its row and column of the inverse are NaN, and the block of
+/// the other parameters is inverted on its own.  Returns the inverse
+/// (`None` when that block is itself singular) and the excluded positions.
+pub(crate) fn invert_informative_block(a: &FlatMatrix) -> (Option<FlatMatrix>, Vec<usize>) {
+    let n = a.nrows;
+    let excluded: Vec<usize> = (0..n).filter(|&j| a.get(j, j) == 0.0).collect();
+    if excluded.is_empty() {
+        return (invert_matrix(a), excluded);
+    }
+    let kept: Vec<usize> = (0..n).filter(|j| !excluded.contains(j)).collect();
+    let mut block = FlatMatrix::zeros(kept.len(), kept.len());
+    for (bi, &i) in kept.iter().enumerate() {
+        for (bj, &j) in kept.iter().enumerate() {
+            *block.get_mut(bi, bj) = a.get(i, j);
+        }
+    }
+    let Some(inverse) = invert_matrix(&block) else {
+        return (None, excluded);
+    };
+    let mut full = FlatMatrix::zeros(n, n);
+    full.data.fill(f64::NAN);
+    for (bi, &i) in kept.iter().enumerate() {
+        for (bj, &j) in kept.iter().enumerate() {
+            *full.get_mut(i, j) = inverse.get(bi, bj);
+        }
+    }
+    (Some(full), excluded)
+}
+
 /// Invert a symmetric positive definite matrix (for covariance).
 ///
 /// Input: flat n×n matrix. Output: flat n×n inverse, or None if singular.
@@ -1244,6 +1278,36 @@ mod tests {
         assert!((inv.get(0, 1) - (-0.7)).abs() < 1e-10);
         assert!((inv.get(1, 0) - (-0.2)).abs() < 1e-10);
         assert!((inv.get(1, 1) - 0.4).abs() < 1e-10);
+    }
+
+    /// A zero row and column is excluded rather than making the whole
+    /// inverse `None`: the other parameters' block is inverted, the
+    /// excluded parameter's row and column are NaN.
+    #[test]
+    fn invert_informative_block_excludes_a_zero_parameter() {
+        let a = FlatMatrix {
+            data: vec![4.0, 0.0, 7.0, 0.0, 0.0, 0.0, 2.0, 0.0, 6.0],
+            nrows: 3,
+            ncols: 3,
+        };
+        let (inverse, excluded) = invert_informative_block(&a);
+        assert_eq!(excluded, vec![1]);
+        let inv = inverse.unwrap();
+        for (i, j, expected) in [(0, 0, 0.6), (0, 2, -0.7), (2, 0, -0.2), (2, 2, 0.4)] {
+            assert!((inv.get(i, j) - expected).abs() < 1e-10, "({i}, {j})");
+        }
+        for (i, j) in [(0, 1), (1, 0), (1, 1), (1, 2), (2, 1)] {
+            assert!(inv.get(i, j).is_nan(), "({i}, {j}) must be NaN");
+        }
+
+        let full = FlatMatrix {
+            data: vec![4.0, 7.0, 2.0, 6.0],
+            nrows: 2,
+            ncols: 2,
+        };
+        let (inverse, excluded) = invert_informative_block(&full);
+        assert!(excluded.is_empty());
+        assert!(inverse.unwrap().data.iter().all(|v| v.is_finite()));
     }
 
     // ---- Edge-case tests for issue #125 ----
