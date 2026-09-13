@@ -622,12 +622,12 @@ pub fn doppler_broaden(
         }
 
         // σ_D(E) = Σ(C × J₀ − u × slope × J₁) / (Σ J₀ × E)
+        // The sign is the table's: a positive table broadens to a positive
+        // value (the kernel weights are positive), and a negative SLBW
+        // total — the interference term outweighing potential scattering —
+        // is passed through, exactly as the derivative path and the
+        // continuous route treat it.
         broadened[i] = sum_y / (sum_g * e);
-
-        // Ensure non-negative
-        if broadened[i] < 0.0 {
-            broadened[i] = 0.0;
-        }
     }
 
     // SAMMY parity diagnostic (`fgm/mfgm1.f90:240`: "No Doppler broadening

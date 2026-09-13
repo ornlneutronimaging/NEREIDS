@@ -24,6 +24,7 @@
 //!   Section III.E.1
 
 use std::fmt;
+use std::hash::{DefaultHasher, Hash, Hasher};
 use std::sync::atomic::{AtomicBool, Ordering};
 
 use rayon::prelude::*;
@@ -1391,12 +1392,21 @@ pub fn doppler_routes(
 ///
 /// A free-temperature fit evaluates the model at many temperatures. The
 /// route must not flip between them, so it is decided once at
-/// `gate_temperature_k` — the fit's upper temperature bound. Both tier-1
-/// conditions are monotone in the kernel width `u ∝ √T`, so tier 1 at the
-/// bound is tier 1 at every lower temperature. Tier-1 isotopes carry no
-/// table (their broadening never samples the source on the grid); every
-/// other isotope carries the unbroadened equation on the data grid, which
-/// each evaluation extends to the auxiliary points and convolves.
+/// `gate_temperature_k` — the fit's upper temperature bound. Every
+/// temperature-dependent tier-1 condition (fold-through-zero,
+/// window-in-range, overlapping-range) is monotone in the kernel width
+/// `u ∝ √T`, and the formalism and File-3 conditions do not depend on
+/// temperature, so tier 1 at the bound is tier 1 at every lower
+/// temperature. Tier-1 isotopes carry no table (their broadening never
+/// samples the source on the grid); every other isotope carries the
+/// unbroadened equation on the data grid, which each evaluation extends to
+/// the auxiliary points and convolves.
+///
+/// The plan remembers a fingerprint of the grid and of the source it was
+/// built for, and every evaluation is checked against both: a plan is only
+/// as good as the inputs it was decided on, and a caller that hands it a
+/// same-length shifted grid or a same-count different source gets
+/// [`TransmissionError::InputMismatch`], never a silently wrong route.
 ///
 /// [`DopplerPlan::from_explicit_table`] wraps a caller-supplied table: the
 /// engine never evaluates that source, so every isotope discloses
@@ -1407,6 +1417,55 @@ pub struct DopplerPlan {
     gate_temperature_k: f64,
     /// `Some` for every isotope that is not on the continuous route.
     table_rows: Vec<Option<Vec<f64>>>,
+    grid_fingerprint: u64,
+    source_fingerprint: u64,
+}
+
+/// Fingerprint of a grid: its length and every energy's bit pattern.
+fn fingerprint_grid(energies: &[f64]) -> u64 {
+    let mut hasher = DefaultHasher::new();
+    energies.len().hash(&mut hasher);
+    for energy in energies {
+        energy.to_bits().hash(&mut hasher);
+    }
+    hasher.finish()
+}
+
+/// Fingerprint of a source: each isotope's identity and mass, every
+/// range's bounds, formalism and resolved flag, and every resonance's
+/// energy, spin and widths — everything the route gate and the resonance
+/// equation read.
+fn fingerprint_source(resonance_data: &[ResonanceData]) -> u64 {
+    let mut hasher = DefaultHasher::new();
+    resonance_data.len().hash(&mut hasher);
+    for rd in resonance_data {
+        rd.isotope.hash(&mut hasher);
+        rd.awr.to_bits().hash(&mut hasher);
+        rd.ranges.len().hash(&mut hasher);
+        for range in &rd.ranges {
+            range.energy_low.to_bits().hash(&mut hasher);
+            range.energy_high.to_bits().hash(&mut hasher);
+            std::mem::discriminant(&range.formalism).hash(&mut hasher);
+            range.resolved.hash(&mut hasher);
+            range.l_groups.len().hash(&mut hasher);
+            for group in &range.l_groups {
+                group.resonances.len().hash(&mut hasher);
+                for resonance in &group.resonances {
+                    for value in [
+                        resonance.energy,
+                        resonance.j,
+                        resonance.gn,
+                        resonance.gg,
+                        resonance.gfa,
+                        resonance.gfb,
+                    ] {
+                        value.to_bits().hash(&mut hasher);
+                    }
+                }
+            }
+        }
+    }
+    hasher.finish()
 }
 
 impl DopplerPlan {
@@ -1445,6 +1504,8 @@ impl DopplerPlan {
             routes,
             gate_temperature_k,
             table_rows: table_rows?,
+            grid_fingerprint: fingerprint_grid(energies),
+            source_fingerprint: fingerprint_source(resonance_data),
         })
     }
 
@@ -1463,6 +1524,8 @@ impl DopplerPlan {
             routes: explicit_table_routes(resonance_data.len()),
             gate_temperature_k: f64::INFINITY,
             table_rows: table.iter().cloned().map(Some).collect(),
+            grid_fingerprint: fingerprint_grid(energies),
+            source_fingerprint: fingerprint_source(resonance_data),
         })
     }
 
@@ -1476,6 +1539,14 @@ impl DopplerPlan {
     /// table, which is never gated).
     pub fn gate_temperature_k(&self) -> f64 {
         self.gate_temperature_k
+    }
+
+    /// Whether any isotope is on the continuous route (tier 1), whose
+    /// evaluation is an integral rather than a convolution of a table.
+    pub fn has_continuous_route(&self) -> bool {
+        self.routes
+            .iter()
+            .any(|route| matches!(route, DopplerRoute::Continuous { .. }))
     }
 
     fn check(
@@ -1492,17 +1563,16 @@ impl DopplerPlan {
                 resonance_data.len(),
             )));
         }
-        for (i, row) in self.table_rows.iter().enumerate() {
-            let Some(row) = row else {
-                continue;
-            };
-            if row.len() != energies.len() {
-                return Err(TransmissionError::InputMismatch(format!(
-                    "Doppler plan row {i} has {} energies but the grid has {}",
-                    row.len(),
-                    energies.len(),
-                )));
-            }
+        if fingerprint_grid(energies) != self.grid_fingerprint {
+            return Err(TransmissionError::InputMismatch(format!(
+                "Doppler plan was decided on a different energy grid ({} energies supplied)",
+                energies.len(),
+            )));
+        }
+        if fingerprint_source(resonance_data) != self.source_fingerprint {
+            return Err(TransmissionError::InputMismatch(
+                "Doppler plan was decided on different resonance data".into(),
+            ));
         }
         if temperature_k.is_nan() || temperature_k > self.gate_temperature_k {
             return Err(TransmissionError::InputMismatch(format!(
@@ -2967,6 +3037,76 @@ mod tests {
             plan.broaden_on_working_grid(&energies, std::slice::from_ref(&mlbw), 300.0, None)
                 .is_ok()
         );
+    }
+
+    #[test]
+    fn doppler_plan_rejects_a_shifted_grid_and_a_different_source_of_the_same_shape() {
+        let mlbw = u238_with_formalism(ResonanceFormalism::MLBW);
+        let energies = resonance_grid();
+        let mismatch_message = |result: Result<WorkingGridXs, TransmissionError>| match result {
+            Err(TransmissionError::InputMismatch(message)) => message,
+            Err(other) => panic!("expected an input mismatch, got {other}"),
+            Ok(_) => panic!("expected an input mismatch, got a broadened result"),
+        };
+        for plan in [
+            DopplerPlan::new(&energies, std::slice::from_ref(&mlbw), 300.0, None, None).unwrap(),
+            DopplerPlan::from_explicit_table(
+                &energies,
+                std::slice::from_ref(&mlbw),
+                &[vec![1.0; energies.len()]],
+            )
+            .unwrap(),
+        ] {
+            // Same length, every energy moved by a part in a million.
+            let shifted: Vec<f64> = energies.iter().map(|e| e * (1.0 + 1e-6)).collect();
+            let message = mismatch_message(plan.broaden_on_working_grid(
+                &shifted,
+                std::slice::from_ref(&mlbw),
+                300.0,
+                None,
+            ));
+            assert!(message.contains("energy grid"), "{message}");
+
+            // Same isotope count: a different nuclide, then the same nuclide
+            // with one resonance energy nudged.
+            let mut other_nuclide = mlbw.clone();
+            other_nuclide.isotope = Isotope::new(92, 235).unwrap();
+            let mut nudged = mlbw.clone();
+            nudged.ranges[0].l_groups[0].resonances[0].energy += 1e-9;
+            for source in [other_nuclide, nudged] {
+                let message = mismatch_message(plan.broaden_on_working_grid(
+                    &energies,
+                    std::slice::from_ref(&source),
+                    300.0,
+                    None,
+                ));
+                assert!(message.contains("resonance data"), "{message}");
+                assert!(
+                    plan.broaden_with_derivative_on_working_grid(
+                        &energies,
+                        std::slice::from_ref(&source),
+                        300.0,
+                        None
+                    )
+                    .is_err()
+                );
+            }
+
+            // The inputs the plan was decided on pass on both entry points.
+            assert!(
+                plan.broaden_on_working_grid(&energies, std::slice::from_ref(&mlbw), 300.0, None)
+                    .is_ok()
+            );
+            assert!(
+                plan.broaden_with_derivative_on_working_grid(
+                    &energies,
+                    std::slice::from_ref(&mlbw),
+                    300.0,
+                    None
+                )
+                .is_ok()
+            );
+        }
     }
 
     #[test]

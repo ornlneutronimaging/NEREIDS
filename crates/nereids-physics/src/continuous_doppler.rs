@@ -204,7 +204,10 @@ pub enum ContinuousDopplerError {
         /// The first failing condition at the lowest failing energy.
         reason: SampledTableReason,
     },
-    /// The converged integral is non-finite or negative.
+    /// The converged integral is non-finite. A negative value is not an
+    /// error: an SLBW total can be negative where the interference term
+    /// outweighs potential scattering, and the sampled-table route passes
+    /// the same values through.
     InvalidIntegral {
         /// Target energy (eV).
         energy_ev: f64,
@@ -324,9 +327,11 @@ impl std::error::Error for ContinuousDopplerError {}
 /// 5. the range carries no File-3 background term.
 ///
 /// An empty grid has no energy to fail at; its verdict is that of the
-/// source's first resolved SLBW/MLBW range, if any. A source whose grid
-/// spans an SLBW range and an MLBW range is still tier 1 at every energy;
-/// the disclosed formalism is that of the lowest grid energy.
+/// source's first resolved SLBW/MLBW range, if any. A source without one
+/// reports a formalism failure at its first range's lower bound (0 eV when
+/// it has no ranges), so the reason stays finite and comparable. A source
+/// whose grid spans an SLBW range and an MLBW range is still tier 1 at
+/// every energy; the disclosed formalism is that of the lowest grid energy.
 pub fn classify_isotope(
     data: &ResonanceData,
     work_energies: &[f64],
@@ -367,7 +372,7 @@ pub(crate) fn classify_isotope_with(
         Some(formalism) => DopplerRoute::Continuous { formalism },
         None => DopplerRoute::SampledTable {
             reason: SampledTableReason::Formalism {
-                energy_ev: f64::NAN,
+                energy_ev: data.ranges.first().map_or(0.0, |r| r.energy_low),
                 formalism: data.ranges.first().map(|r| r.formalism),
             },
         },
@@ -590,12 +595,24 @@ impl TargetContext<'_, '_> {
         }
     }
 
-    /// Initial panel edges in `x`: the window ends plus the resonance
-    /// breakpoints that fall inside it.
+    /// Initial panel edges in `x`: the window ends, the resonance
+    /// breakpoints that fall inside it, and every knot of an
+    /// energy-dependent scattering radius AP(E′) inside it. The SLBW/MLBW
+    /// evaluator interpolates AP(E′) piecewise, so each knot is a kink in
+    /// σ(E′) that both quadrature rules would otherwise straddle.
     fn breakpoints(&self, range: &ResonanceRange) -> Vec<f64> {
         let low_energy = (self.target_speed - SUPPORT_X * self.thermal_u).powi(2);
         let high_energy = (self.target_speed + SUPPORT_X * self.thermal_u).powi(2);
         let mut points = vec![-SUPPORT_X, SUPPORT_X];
+        let mut push_source_energy = |source_energy: f64| {
+            if source_energy <= 0.0 {
+                return;
+            }
+            let coordinate = (source_energy.sqrt() - self.target_speed) / self.thermal_u;
+            if coordinate > -SUPPORT_X && coordinate < SUPPORT_X {
+                points.push(coordinate);
+            }
+        };
         for group in &range.l_groups {
             for resonance in &group.resonances {
                 let total_width = resonance.gn.abs()
@@ -609,16 +626,12 @@ impl TargetContext<'_, '_> {
                     continue;
                 }
                 for multiplier in BREAKPOINT_WIDTHS {
-                    let source_energy = resonance.energy + multiplier * total_width;
-                    if source_energy <= 0.0 {
-                        continue;
-                    }
-                    let coordinate = (source_energy.sqrt() - self.target_speed) / self.thermal_u;
-                    if coordinate > -SUPPORT_X && coordinate < SUPPORT_X {
-                        points.push(coordinate);
-                    }
+                    push_source_energy(resonance.energy + multiplier * total_width);
                 }
             }
+        }
+        for &(knot_energy, _) in range.ap_table.iter().flat_map(|table| &table.points) {
+            push_source_energy(knot_energy);
         }
         points.sort_by(f64::total_cmp);
         points.dedup_by(|left, right| left.to_bits() == right.to_bits());
@@ -687,7 +700,10 @@ impl TargetContext<'_, '_> {
             heap.extend(children);
         }
 
-        if !value.is_finite() || value < 0.0 {
+        // Sign is the source's property, not the integral's: the SLBW
+        // interference term makes the documented negative totals that the
+        // sampled-table route passes through, so only finiteness is checked.
+        if !value.is_finite() {
             return Err(ContinuousDopplerError::InvalidIntegral {
                 energy_ev: self.target_energy,
                 value,
@@ -872,6 +888,7 @@ mod tests {
     use nereids_endf::resonance::test_support::{
         ex001_hydrogen_single_resonance, synthetic_swave_slbw, u238_with_formalism,
     };
+    use nereids_endf::resonance::{Resonance, Tab1};
     use std::sync::atomic::AtomicBool;
 
     const ROOM_K: f64 = 293.6;
@@ -1189,19 +1206,31 @@ mod tests {
                 formalism: ResonanceFormalism::MLBW
             }
         );
-        assert!(matches!(
-            classify_isotope(
-                &u238_with_formalism(ResonanceFormalism::ReichMoore),
-                &[],
-                thermal_u
-            ),
+        // Without a tier-1 range the reason names the first range's lower
+        // bound, so the verdict is finite and compares equal to itself.
+        let reich_moore = u238_with_formalism(ResonanceFormalism::ReichMoore);
+        let verdict = classify_isotope(&reich_moore, &[], thermal_u);
+        assert_eq!(
+            verdict,
             DopplerRoute::SampledTable {
                 reason: SampledTableReason::Formalism {
+                    energy_ev: 1e-5,
                     formalism: Some(ResonanceFormalism::ReichMoore),
-                    ..
                 }
             }
-        ));
+        );
+        assert_eq!(verdict, classify_isotope(&reich_moore, &[], thermal_u));
+        let mut no_ranges = reich_moore;
+        no_ranges.ranges.clear();
+        assert_eq!(
+            classify_isotope(&no_ranges, &[], thermal_u),
+            DopplerRoute::SampledTable {
+                reason: SampledTableReason::Formalism {
+                    energy_ev: 0.0,
+                    formalism: None,
+                }
+            }
+        );
     }
 
     #[test]
@@ -1445,13 +1474,22 @@ mod tests {
     /// auto-refined sampled grid and the par file declares an abundance of
     /// 0.999999, so agreement below about 1e-6 is not expected.
     ///
-    /// Measured: 7.7e-3 maximum relative deviation over the 315 points, and
-    /// the deviation is a smooth amplitude factor of about +0.7% across the
-    /// whole curve (peak and both wings alike), not a shape difference. The
-    /// quadrature is pinned to 1e-10 by the trapezoid oracle and the
-    /// sampled route converges onto these values with grid refinement, so
-    /// the residual is between the two codes' unbroadened line strengths,
-    /// not in the broadening. The gate is held at 1e-2.
+    /// Measured: 7.7e-3 maximum relative deviation over the 315 points, at
+    /// 9.54 eV in the Doppler core. The residual is not an amplitude
+    /// factor: ours/SAMMY is 1.0076 at the peak and across the core but
+    /// 1.000005 at the low wing (8.05 eV) and 1.000002 at the high wing
+    /// (11.95 eV), so scaling ours by the E·σ trapezoid-area ratio
+    /// (1.0076, measured below) leaves a 7.6e-3 residual at the wings
+    /// instead of removing the deviation. Free-gas broadening conserves
+    /// ∫E·σ dE and the quadrature is pinned to 1e-10 by the trapezoid
+    /// oracle, so our curve carries the exact line's area and SAMMY's
+    /// carries 0.76 % less of it, all of it missing from the core. That is
+    /// the signature of a Γ = 1.5 meV line sampled on a grid before
+    /// convolution (area lost where the line is narrow, none in the smooth
+    /// Lorentzian tails), which is how SAMMY's `Dopfgm` integrates; the
+    /// sampled route in this crate reproduces the same 8.0e-3 against the
+    /// same reference (`doppler::tests::test_sammy_ex001_fgm_doppler`).
+    /// The gate is held at 1e-2; the wing agreement is pinned at 1e-4.
     #[test]
     fn sammy_ex001_full_curve_through_tier_one() {
         let data = ex001_hydrogen_single_resonance();
@@ -1489,21 +1527,74 @@ mod tests {
             energies[worst_index], ours[worst_index], reference[worst_index]
         );
         assert!(max_rel < 0.01, "max relative error {max_rel:.3e}");
+
+        // Free-gas broadening conserves ∫E·σ dE, so the ratio of the two
+        // curves' trapezoid areas over SAMMY's own energies isolates an
+        // amplitude factor; what the scaled curve still misses is shape.
+        let area = |values: &[f64]| -> f64 {
+            energies
+                .windows(2)
+                .zip(values.windows(2))
+                .map(|(e, v)| 0.5 * (e[1] - e[0]) * (e[0] * v[0] + e[1] * v[1]))
+                .sum()
+        };
+        let area_ratio = area(&ours) / area(&reference);
+        let (scaled_worst, scaled_max_rel) = ours
+            .iter()
+            .zip(&reference)
+            .enumerate()
+            .map(|(i, (a, b))| (i, (a / area_ratio - b).abs() / b))
+            .fold((0, 0.0_f64), |acc, x| if x.1 > acc.1 { x } else { acc });
+        let peak = reference
+            .iter()
+            .enumerate()
+            .max_by(|a, b| a.1.total_cmp(b.1))
+            .map(|(i, _)| i)
+            .unwrap();
+        eprintln!(
+            "ex001 tier 1: E·σ area ratio ours/SAMMY={area_ratio:.6}; ratio at the peak \
+             ({} eV)={:.6}, at the low wing ({} eV)={:.6}, at the high wing ({} eV)={:.6}; \
+             max relative shape residual after scaling={scaled_max_rel:.3e} at {} eV",
+            energies[peak],
+            ours[peak] / reference[peak],
+            energies[0],
+            ours[0] / reference[0],
+            energies[314],
+            ours[314] / reference[314],
+            energies[scaled_worst],
+        );
+        assert!(
+            (area_ratio - 1.0).abs() < 0.01,
+            "area ratio {area_ratio} is not within 1% of 1"
+        );
+        for index in [0, 314] {
+            let wing_ratio = ours[index] / reference[index];
+            assert!(
+                (wing_ratio - 1.0).abs() < 1e-4,
+                "wing at {} eV: ratio {wing_ratio}",
+                energies[index]
+            );
+        }
+        // Measured 7.6e-3 (see the rustdoc): the residual is confined to
+        // the core, so scaling by the area ratio does not remove it. Kept
+        // as a printed measurement, not a gate.
+        assert!(scaled_max_rel.is_finite());
     }
 
-    /// Oracle (c): an independent fixed-step trapezoid in kernel coordinates,
-    /// with none of this module's panels, breakpoints, rule, or error
-    /// estimator — value and temperature derivative.
-    #[test]
-    fn hf177_matches_uniform_speed_trapezoid_oracle() {
-        let data = hf177();
-        let target_energy = 8.876_917_538_350_767_f64;
-        let temperature_k = 300.0_f64;
-        let n_points = 400_001_usize;
+    /// A fixed-step trapezoid in kernel coordinates over `[−8, 8]`, with
+    /// none of this module's panels, breakpoints, rule, or error estimator:
+    /// the value and temperature derivative of the total cross-section at
+    /// one target energy.
+    fn trapezoid_oracle(
+        data: &ResonanceData,
+        target_energy: f64,
+        temperature_k: f64,
+        n_points: usize,
+    ) -> (f64, f64) {
         let dx = 2.0 * SUPPORT_X / (n_points - 1) as f64;
         let thermal_u = (BOLTZMANN_EV_PER_K * temperature_k / data.awr).sqrt();
         let target_speed = target_energy.sqrt();
-        let plan = CrossSectionPlan::new(&data);
+        let plan = CrossSectionPlan::new(data);
         let normalization = std::f64::consts::PI.sqrt() * target_energy;
         let (mut value_sum, mut derivative_sum) = (0.0, 0.0);
         for index in 0..n_points {
@@ -1520,7 +1611,124 @@ mod tests {
             value_sum += contribution;
             derivative_sum += contribution * (x * x - 0.5) / temperature_k;
         }
-        let (oracle_value, oracle_derivative) = (value_sum * dx, derivative_sum * dx);
+        (value_sum * dx, derivative_sum * dx)
+    }
+
+    /// An s-wave SLBW source with a resonance far above the window and,
+    /// optionally, a triangular AP(E′) feature 2e-4 eV wide just above
+    /// 10 eV: the evaluator interpolates the radius between the knots, so
+    /// σ(E′) has three kinks that no resonance breakpoint isolates.
+    fn slbw_with_radius_feature(feature: bool) -> ResonanceData {
+        let mut data = synthetic_swave_slbw(236.006, 500.0, 0.05, 0.02, 9.0);
+        if feature {
+            data.ranges[0].ap_table = Some(Tab1 {
+                boundaries: vec![3],
+                interp_codes: vec![2],
+                points: vec![(10.0120, 9.0), (10.0121, 10.0), (10.0122, 9.0)],
+            });
+        }
+        data
+    }
+
+    #[test]
+    fn ap_table_knots_inside_the_window_are_breakpoints() {
+        let target_energy = 10.0_f64;
+        let temperature_k = 300.0;
+        let featured = slbw_with_radius_feature(true);
+        let flat = slbw_with_radius_feature(false);
+        let params = DopplerParams::new(temperature_k, featured.awr).unwrap();
+        // The feature sits at x ≈ 0.18 of the ±8 window, 3e-3 wide in x.
+        let knot_x = (10.0121_f64.sqrt() - target_energy.sqrt()) / params.u();
+        assert!(knot_x > 0.1 && knot_x < 0.3, "{knot_x}");
+
+        let with_feature = continuous_total(&[target_energy], &featured, &params)[0];
+        let without = continuous_total(&[target_energy], &flat, &params)[0];
+        let feature_effect = (with_feature - without).abs() / without;
+        assert!(
+            feature_effect > RELATIVE_TOLERANCE,
+            "the radius feature must change the integral beyond the tolerance: {feature_effect:.3e}"
+        );
+
+        let (oracle, _) = trapezoid_oracle(&featured, target_energy, temperature_k, 4_000_001);
+        let rel = (with_feature - oracle).abs() / oracle.abs();
+        assert!(
+            rel <= 1.0e-8,
+            "adaptive={with_feature:.16e} trapezoid={oracle:.16e} rel={rel:.3e}"
+        );
+    }
+
+    /// Two broad s-wave J = 1/2 levels about 100 eV above 20 keV on a light
+    /// target with a 5 fm radius. A single SLBW level's total dips to zero
+    /// at `E_r − (Γ/2)·cot φ` (≈ 99 eV below the level here, over a width
+    /// of order Γ = 30 eV, far wider than the 4 eV thermal kernel), where
+    /// its interference term cancels the whole potential term; two levels
+    /// of the same J share one potential term, so where both dips coincide
+    /// the incoherent sum is about `−σ_pot`.
+    fn two_level_slbw_with_negative_total() -> ResonanceData {
+        let mut data = synthetic_swave_slbw(55.45, 20_095.0, 30.0, 0.5, 5.0);
+        data.ranges[0].l_groups[0].resonances.push(Resonance {
+            energy: 20_105.0,
+            j: 0.5,
+            gn: 30.0,
+            gg: 0.5,
+            gfa: 0.0,
+            gfb: 0.0,
+        });
+        data
+    }
+
+    #[test]
+    fn negative_slbw_totals_broaden_through_tier_one() {
+        let data = two_level_slbw_with_negative_total();
+        let params = DopplerParams::new(300.0, data.awr).unwrap();
+        let target = 20_000.0;
+        let unbroadened = CrossSectionPlan::new(&data).evaluate_one(target).total;
+        assert!(
+            unbroadened < 0.0,
+            "the control needs a negative unbroadened total: {unbroadened}"
+        );
+        assert_eq!(
+            classify_isotope(&data, &[target], params.u()),
+            DopplerRoute::Continuous {
+                formalism: ResonanceFormalism::SLBW
+            }
+        );
+        let (values, derivatives) =
+            broaden_with_derivative(&[target], &data, &params, None).unwrap();
+        assert!(
+            values[0].is_finite() && values[0] < 0.0,
+            "tier 1 must pass the negative total through: {}",
+            values[0]
+        );
+        assert!(derivatives[0].is_finite());
+
+        // The sampled route on a 0.5 eV base grid refined 64× (7.8 meV
+        // steps against 30 eV line widths) agrees with the integral.
+        let grid: Vec<f64> = (0..=25_600)
+            .map(|i| 19_900.0 + i as f64 * (200.0 / 25_600.0))
+            .collect();
+        let index = 12_800;
+        assert_eq!(grid[index], target);
+        let sampled = sampled_total(&grid, &data, &params)[index];
+        assert!(sampled < 0.0, "tier 2 must not clamp the sign: {sampled}");
+        let rel = (sampled - values[0]).abs() / values[0].abs();
+        assert!(
+            rel <= 1.0e-4,
+            "continuous={} sampled={sampled} rel={rel:.3e}",
+            values[0]
+        );
+    }
+
+    /// Oracle (c): an independent fixed-step trapezoid in kernel coordinates,
+    /// with none of this module's panels, breakpoints, rule, or error
+    /// estimator — value and temperature derivative.
+    #[test]
+    fn hf177_matches_uniform_speed_trapezoid_oracle() {
+        let data = hf177();
+        let target_energy = 8.876_917_538_350_767_f64;
+        let temperature_k = 300.0_f64;
+        let (oracle_value, oracle_derivative) =
+            trapezoid_oracle(&data, target_energy, temperature_k, 400_001);
 
         let params = DopplerParams::new(temperature_k, data.awr).unwrap();
         let (values, derivatives) =
