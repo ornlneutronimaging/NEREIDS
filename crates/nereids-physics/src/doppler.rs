@@ -65,6 +65,42 @@ const DOPPLER_N_SIGMA: f64 = 6.0;
 /// create a near-duplicate of the explicit v = 0 anchor point.
 const NEGATIVE_VELOCITY_FLOOR: f64 = 1e-15;
 
+/// Magnitude (barn·eV) below which a negative broadened value is noise and
+/// is set to zero.
+///
+/// SAMMY tests `Sigma = Σ Wts·σ` (`fgm/mfgm4.f90:84`), where the
+/// Modsmp/Modfpl weights carry `Velcty**2 = E′` (`fgm/mfgm2.f90:101`,
+/// `:203`): the quantity tested is the kernel-weighted mean of `E′·σ(E′)`,
+/// in barn·eV, BEFORE the division by `Em` that makes it a cross-section
+/// (`mfgm4.f90:123-136`). Expressed in barn the cutoff would be `1e-15/E`,
+/// which is why the rule is applied to the energy-weighted value.
+pub(crate) const NEGATIVE_VALUE_FLOOR_BARN_EV: f64 = 1e-15;
+
+/// SAMMY's rule for a negative broadened cross-section (`fgm/mfgm4.f90`
+/// lines 83-101, `Dopfgm`).
+///
+/// An energy-weighted value `E·σ_D` above `−1e-15` barn·eV is noise and is
+/// set to zero. Below it, the value is zeroed when no contributing
+/// unbroadened point was positive — the source is negative throughout the
+/// kernel window, so the convolution cannot mean anything else — and kept
+/// otherwise, which is where SAMMY prints "Negative cross section". A kept
+/// negative is physical: an SLBW total whose same-J interference terms
+/// outweigh the shared potential term really is negative there.
+///
+/// `weighted` is `E·σ_D`, SAMMY's `Sigma` before `/Em`, and must be
+/// negative. `any_source_positive` is consulted only when the magnitude
+/// test does not decide. `true` means zero it.
+pub(crate) fn zero_negative_value(
+    weighted: f64,
+    any_source_positive: impl FnOnce() -> bool,
+) -> bool {
+    debug_assert!(
+        weighted < 0.0,
+        "the rule applies to negative values only, got {weighted}"
+    );
+    weighted > -NEGATIVE_VALUE_FLOOR_BARN_EV || !any_source_positive()
+}
+
 /// Errors from `DopplerParams` construction.
 #[derive(Debug, PartialEq)]
 pub enum DopplerParamsError {
@@ -111,6 +147,48 @@ pub enum DopplerError {
     InvalidParams(DopplerParamsError),
     /// The energy grid is empty, so there is nothing to answer about.
     EmptyGrid,
+    /// The source does not qualify for tier-1 broadening on this grid. The
+    /// reason is the one the route gate discloses.
+    NotTierOne {
+        /// First failing condition, at the lowest failing energy.
+        reason: crate::doppler_route::SampledTableReason,
+    },
+    /// A converged tier-1 value or temperature derivative is non-finite.
+    /// A NEGATIVE value is not an error: SAMMY keeps a genuinely negative
+    /// broadened cross-section (`fgm/mfgm4.f90:83-101`) rather than
+    /// clamping it. A NaN or infinity is.
+    NonFiniteIntegral {
+        /// Target energy (eV).
+        energy_ev: f64,
+        /// The offending value.
+        value: f64,
+        /// Whether it was the derivative rather than the value.
+        derivative: bool,
+    },
+    /// Tier-1 refinement would exceed the active-panel limit.
+    PanelLimit {
+        /// Target energy (eV).
+        energy_ev: f64,
+        /// The limit that was hit.
+        limit: usize,
+    },
+    /// Tier-1 refinement would exceed the bisection depth limit.
+    DepthLimit {
+        /// Target energy (eV).
+        energy_ev: f64,
+        /// The limit that was hit.
+        depth: usize,
+    },
+    /// A tier-1 panel is too narrow to bisect in floating point: its
+    /// midpoint equals one of its own edges, so refinement cannot progress.
+    MidpointStagnation {
+        /// Target energy (eV).
+        energy_ev: f64,
+        /// Panel left edge in kernel coordinate `x`.
+        left: f64,
+        /// Panel right edge in kernel coordinate `x`.
+        right: f64,
+    },
     /// An energy value is non-finite (NaN/±∞) or non-positive (≤ 0).
     ///
     /// The FGM velocity transform computes `v = √E`, so non-positive or
@@ -155,6 +233,41 @@ impl fmt::Display for DopplerError {
             ),
             Self::InvalidParams(e) => write!(f, "invalid broadening parameters: {e}"),
             Self::EmptyGrid => write!(f, "the energy grid is empty"),
+            Self::NotTierOne { reason } => {
+                write!(
+                    f,
+                    "the source is not eligible for tier-1 broadening: {reason}"
+                )
+            }
+            Self::NonFiniteIntegral {
+                energy_ev,
+                value,
+                derivative,
+            } => write!(
+                f,
+                "the tier-1 {} at {energy_ev:.2e} eV converged to {value}, which is not finite",
+                if *derivative {
+                    "derivative"
+                } else {
+                    "integral"
+                }
+            ),
+            Self::PanelLimit { energy_ev, limit } => write!(
+                f,
+                "tier-1 quadrature at {energy_ev:.2e} eV would exceed {limit} active panels"
+            ),
+            Self::DepthLimit { energy_ev, depth } => write!(
+                f,
+                "tier-1 quadrature at {energy_ev:.2e} eV would exceed bisection depth {depth}"
+            ),
+            Self::MidpointStagnation {
+                energy_ev,
+                left,
+                right,
+            } => write!(
+                f,
+                "tier-1 panel [{left}, {right}] at {energy_ev:.2e} eV cannot be bisected further"
+            ),
             Self::InvalidEnergy { index, value } => write!(
                 f,
                 "energies[{index}] = {value} is not finite or not strictly positive (Doppler broadening requires every energy to satisfy is_finite() && > 0)"

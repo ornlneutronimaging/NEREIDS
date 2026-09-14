@@ -6,7 +6,7 @@
 //! ## Modules
 //! - [`auxiliary_grid`] — Auxiliary energy-grid construction for resolution broadening
 //! - [`channel`] — Wave number, ρ parameter, statistical weight calculations
-//! - [`continuous_doppler`] — Which isotopes may be Doppler-broadened by integration
+//! - [`continuous_doppler`] — Tier-1 Doppler: the free-gas kernel integrated over the resonance equation
 //! - [`doppler`] — Free Gas Model Doppler broadening
 //! - [`doppler_route`] — Which Doppler route an isotope took, and why
 //! - [`penetrability`] — Hard-sphere penetrability, shift, and phase shift functions
