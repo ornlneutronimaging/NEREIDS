@@ -107,6 +107,10 @@ pub enum DopplerError {
         /// Number of cross-section values.
         cross_sections: usize,
     },
+    /// The broadening parameters themselves are invalid.
+    InvalidParams(DopplerParamsError),
+    /// The energy grid is empty, so there is nothing to answer about.
+    EmptyGrid,
     /// An energy value is non-finite (NaN/±∞) or non-positive (≤ 0).
     ///
     /// The FGM velocity transform computes `v = √E`, so non-positive or
@@ -149,6 +153,8 @@ impl fmt::Display for DopplerError {
                 f,
                 "energies length ({energies}) must match cross_sections length ({cross_sections})"
             ),
+            Self::InvalidParams(e) => write!(f, "invalid broadening parameters: {e}"),
+            Self::EmptyGrid => write!(f, "the energy grid is empty"),
             Self::InvalidEnergy { index, value } => write!(
                 f,
                 "energies[{index}] = {value} is not finite or not strictly positive (Doppler broadening requires every energy to satisfy is_finite() && > 0)"
@@ -168,6 +174,12 @@ impl fmt::Display for DopplerError {
 
 impl std::error::Error for DopplerError {}
 
+impl From<DopplerParamsError> for DopplerError {
+    fn from(e: DopplerParamsError) -> Self {
+        Self::InvalidParams(e)
+    }
+}
+
 /// Validate that `energies` satisfies the Doppler-broadening grid contract:
 /// every entry is finite, strictly positive, and strictly greater than the
 /// previous entry. An empty slice is permitted (the caller has its own
@@ -177,7 +189,7 @@ impl std::error::Error for DopplerError {}
 /// `doppler_broaden` and `doppler_broaden_with_derivative` so that
 /// malformed grids surface as a typed `Err` rather than silent NaN
 /// propagation or unspecified `partition_point` behaviour.
-fn validate_doppler_grid(energies: &[f64]) -> Result<(), DopplerError> {
+pub(crate) fn validate_doppler_grid(energies: &[f64]) -> Result<(), DopplerError> {
     for (i, &e) in energies.iter().enumerate() {
         if !e.is_finite() || e <= 0.0 {
             return Err(DopplerError::InvalidEnergy { index: i, value: e });
