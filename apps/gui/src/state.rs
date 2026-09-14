@@ -704,11 +704,14 @@ pub struct CachedResiduals {
     pub max_abs: f64,
     /// Number of finite residual points.
     pub n_points: usize,
-    /// The overlay's route-disagreement line, when the model these
-    /// residuals were taken against is not the one the fit disclosed (see
-    /// `design::OverlayModel::route_mismatch`). The residual dock shows it:
-    /// residuals against a differently-routed model are as untrustworthy as
-    /// the curve the spectrum panel warns about.
+    /// The dock's copy of the overlay's route line (see
+    /// `design::OverlayModel::route_mismatch`), which carries either of two
+    /// things: that the model these residuals were taken against is not the
+    /// one the fit disclosed, or that the fit disclosed no routes at all and
+    /// this redraw could not be checked against anything. The residual dock
+    /// shows whichever fired: residuals taken against a model that is not
+    /// known to be the fitted one are as untrustworthy as the curve the
+    /// spectrum panel warns about.
     pub warning: Option<String>,
 }
 
@@ -1385,16 +1388,77 @@ impl AppState {
         self.show_analyze_fit_info = false;
     }
 
-    /// Drop the single-spectrum fit output because the ENABLED ISOTOPE SET
-    /// changed.
+    /// Drop the single-spectrum fit output because the ENABLED ISOTOPE SET —
+    /// or the resonance data behind it — changed.
     ///
-    /// Enabling or disabling an isotope or a group changes the model a
-    /// stored result was fitted with, but not `fit_result_gen` — which the
-    /// residual cache is keyed on. Without this the cache still tests as
+    /// Enabling or disabling an isotope or a group, adding or removing one,
+    /// or swapping the ENDF library changes the model a stored result was
+    /// fitted with, but not `fit_result_gen` — which the residual cache is
+    /// keyed on. Without this the cache still tests as
     /// valid and the dock goes on subtracting a curve built from the
     /// previous isotope set, reporting its RMS and Max|r| as this one's.
+    ///
+    /// That is the whole guarantee: the single-pixel result and its residual
+    /// cache are gone. `spatial_result` is deliberately left alone — a map
+    /// costs minutes to recompute — so the dock's spatial fallback
+    /// ([`crate::guided::analyze::selected_pixel_fit_result_for_overlay`])
+    /// can still assemble a per-pixel result that was fitted with the
+    /// previous set. Three things stand between that result and a silent
+    /// wrong answer: the density-parameter count guard in the dock's cache
+    /// builder, which refuses a stored result whose density count no longer
+    /// matches the enabled set; the identity-aware route comparison in
+    /// `design::build_overlay_model`, which reports a redraw whose routes
+    /// are not the disclosed ones; and — since a spatial result discloses no
+    /// per-pixel routes — the undisclosed-redraw warning, which says the
+    /// redraw was never checked against anything.
     pub fn clear_pixel_fit_for_isotope_change(&mut self) {
         self.clear_pixel_fit_output();
+    }
+
+    /// Enable or disable one isotope entry, with everything that change
+    /// implies.
+    ///
+    /// The flip and the invalidation are one operation, not two steps a call
+    /// site can get half right. A handler that flips the flag and forgets
+    /// [`Self::clear_pixel_fit_for_isotope_change`] leaves the residual dock
+    /// reporting the previous isotope set's RMS and Max|r|, because the
+    /// residual cache is keyed on `fit_result_gen` and a toggle does not
+    /// bump it — [`Self::mark_dirty`] only records which pipeline step went
+    /// stale.
+    ///
+    /// A no-op for an out-of-range index, or when the flag already has the
+    /// requested value.
+    pub fn set_isotope_enabled(&mut self, index: usize, enabled: bool) {
+        let Some(entry) = self.isotope_entries.get_mut(index) else {
+            return;
+        };
+        if entry.enabled == enabled {
+            return;
+        }
+        entry.enabled = enabled;
+        self.on_enabled_isotope_set_changed();
+    }
+
+    /// Enable or disable one isotope group — the group equivalent of
+    /// [`Self::set_isotope_enabled`], with the same coupling of the flip to
+    /// the invalidation.
+    pub fn set_isotope_group_enabled(&mut self, index: usize, enabled: bool) {
+        let Some(group) = self.isotope_groups.get_mut(index) else {
+            return;
+        };
+        if group.enabled == enabled {
+            return;
+        }
+        group.enabled = enabled;
+        self.on_enabled_isotope_set_changed();
+    }
+
+    /// What every change to the enabled isotope set costs: the Analyze step
+    /// is stale, and so is any single-spectrum fit performed with the old
+    /// set.
+    fn on_enabled_isotope_set_changed(&mut self) {
+        self.mark_dirty(GuidedStep::Analyze);
+        self.clear_pixel_fit_for_isotope_change();
     }
 
     /// Clear the cached map before starting a new spatial fit.  This prevents
@@ -1823,15 +1887,26 @@ impl Default for AppState {
 mod tests {
     use super::*;
 
-    /// Enabling or disabling an isotope changes the model a stored fit was
-    /// performed with, and the residual cache is keyed on `fit_result_gen`,
-    /// which the toggle does NOT bump. So the toggle has to drop the result
-    /// and the cache itself; without that the dock goes on subtracting a
-    /// curve built from the previous isotope set and reporting its RMS and
-    /// Max|r| as this one's.
-    #[test]
-    fn an_isotope_toggle_drops_the_fit_it_invalidates() {
-        let mut state = AppState {
+    /// A state carrying one isotope, one group, and a single-pixel fit with
+    /// its residual cache — both computed with that isotope set.
+    fn state_with_a_cached_pixel_fit() -> AppState {
+        AppState {
+            isotope_entries: vec![IsotopeEntry {
+                z: 92,
+                a: 238,
+                symbol: "U-238".into(),
+                initial_density: 0.001,
+                resonance_data: None,
+                enabled: true,
+                endf_status: EndfStatus::Pending,
+            }],
+            isotope_groups: vec![IsotopeGroupEntry {
+                z: 72,
+                name: "Hf".into(),
+                members: Vec::new(),
+                initial_density: 0.001,
+                enabled: true,
+            }],
             pixel_fit_result: Some(SpectrumFitResult {
                 densities: vec![0.001],
                 uncertainties: None,
@@ -1871,7 +1946,18 @@ mod tests {
                 warning: None,
             }),
             ..AppState::default()
-        };
+        }
+    }
+
+    /// Enabling or disabling an isotope changes the model a stored fit was
+    /// performed with, and the residual cache is keyed on `fit_result_gen`,
+    /// which the toggle does NOT bump. So the toggle has to drop the result
+    /// and the cache itself; without that the dock goes on subtracting a
+    /// curve built from the previous isotope set and reporting its RMS and
+    /// Max|r| as this one's.
+    #[test]
+    fn an_isotope_toggle_drops_the_fit_it_invalidates() {
+        let mut state = state_with_a_cached_pixel_fit();
 
         state.clear_pixel_fit_for_isotope_change();
 
@@ -1886,6 +1972,50 @@ mod tests {
         // The cache key cannot be what protects it: the toggle leaves the
         // generation counter exactly where the stale cache's key is.
         assert_eq!(state.fit_result_gen, 0);
+    }
+
+    /// The toggle handlers flip the flag THROUGH these methods, which is
+    /// what keeps the flip and the invalidation from coming apart: a
+    /// handler that writes the field itself and forgets the invalidation
+    /// compiles, renders, and leaves the residual dock reporting the
+    /// previous isotope set's RMS and Max|r|.
+    #[test]
+    fn setting_an_isotope_enabled_flips_it_and_invalidates_the_fit() {
+        let mut state = state_with_a_cached_pixel_fit();
+        state.set_isotope_enabled(0, false);
+        assert!(!state.isotope_entries[0].enabled, "the flag has to flip");
+        assert!(
+            state.pixel_fit_result.is_none(),
+            "the result was fitted with the isotope that was just disabled"
+        );
+        assert!(
+            state.residuals_cache.is_none(),
+            "the residuals were taken against that same model"
+        );
+        assert_eq!(state.dirty_from, Some(GuidedStep::Analyze));
+        // Nothing else can catch this: the key the cache is checked on is
+        // exactly where it was.
+        assert_eq!(state.fit_result_gen, 0);
+
+        // A group is the same event and takes the same route.
+        let mut state = state_with_a_cached_pixel_fit();
+        state.set_isotope_group_enabled(0, false);
+        assert!(!state.isotope_groups[0].enabled, "the flag has to flip");
+        assert!(state.pixel_fit_result.is_none());
+        assert!(state.residuals_cache.is_none());
+        assert_eq!(state.dirty_from, Some(GuidedStep::Analyze));
+
+        // A call that changes nothing is not a change. These run on every
+        // repaint, so a stored fit must survive the frames where the user
+        // touched nothing, and an out-of-range index must do nothing at all.
+        let mut state = state_with_a_cached_pixel_fit();
+        state.set_isotope_enabled(0, true);
+        state.set_isotope_group_enabled(0, true);
+        state.set_isotope_enabled(7, false);
+        state.set_isotope_group_enabled(7, false);
+        assert!(state.pixel_fit_result.is_some());
+        assert!(state.residuals_cache.is_some());
+        assert_eq!(state.dirty_from, None);
     }
 
     /// The #646 accumulation pin: re-detection REPLACES the previous

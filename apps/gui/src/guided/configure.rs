@@ -151,16 +151,19 @@ pub fn configure_step(ui: &mut egui::Ui, state: &mut AppState) {
                 }
             }
             state.spatial_result = None;
-            state.pixel_fit_result = None;
+            state.clear_pixel_fit_for_isotope_change();
         }
 
         ui.add_space(8.0);
 
-        // Isotope chips
+        // Isotope chips. Adding, removing or re-enabling a chip changes the
+        // enabled isotope set, which is the same event the Studio toggles
+        // raise: it goes through the same state method, so the residual
+        // cache cannot survive here while it is dropped there.
         let chip_result = isotope_chips_flow(ui, state);
         if chip_result.changed {
             state.spatial_result = None;
-            state.pixel_fit_result = None;
+            state.clear_pixel_fit_for_isotope_change();
         }
 
         ui.add_space(6.0);

@@ -1244,13 +1244,21 @@ pub(crate) enum ResidualsUnavailable {
     /// physical energies, so the curve to subtract cannot be reproduced.
     /// Carries the reason from [`fitted_physics_energies`].
     EnergyScale(String),
-    /// The forward model could not be rebuilt on this grid — an invalid
-    /// resolution setting, a fit-energy range that selects nothing, or a
-    /// Doppler plan that refuses these inputs.
+    /// The forward model could not be rebuilt on this grid, or could not be
+    /// evaluated once rebuilt — an invalid resolution setting, a fit-energy
+    /// range that selects nothing, a Doppler plan that refuses these inputs,
+    /// or an evaluation that failed.
     ModelUnavailable,
-    /// Every bin's residual was non-finite, so there is nothing to plot or
-    /// summarise. Distinct from `MissingData`: the model was rebuilt and
-    /// the measurement was read, and one of them is not a number.
+    /// The fit window holds no measured bin: the loaded energy grid runs
+    /// past the end of the cube's time-of-flight axis, so the window and the
+    /// measurement do not overlap. Nothing can be subtracted from nothing,
+    /// and this is not a statement about the numbers in either.
+    NoMeasuredOverlap,
+    /// The window did hold measured bins and every one of their residuals
+    /// was non-finite, so there is nothing to plot or summarise. Distinct
+    /// from `MissingData`: the model was rebuilt and the measurement was
+    /// read, and one of them is not a number. Distinct from
+    /// `NoMeasuredOverlap`, which is the empty window.
     NoFiniteResiduals,
 }
 
@@ -1267,11 +1275,16 @@ impl ResidualsUnavailable {
                 )
             }
             Self::ModelUnavailable => "Could not compute residuals: the fitted forward model \
-                 could not be rebuilt here (check the resolution settings and the fit energy \
-                 range)."
+                 could not be rebuilt or evaluated on this window \u{2014} an unusable resolution \
+                 setting, a fit energy range that selects nothing, or a Doppler plan that refuses \
+                 these isotopes on this grid."
                 .to_string(),
-            Self::NoFiniteResiduals => "No finite residuals on the fit window: every bin is \
-                 NaN or infinite in the measurement or in the fitted curve."
+            Self::NoMeasuredOverlap => "No residuals on the fit window: it contains no measured \
+                 bin, because the loaded energy grid runs past the end of the measured \
+                 time-of-flight axis."
+                .to_string(),
+            Self::NoFiniteResiduals => "No finite residuals on the fit window: every bin in it \
+                 is NaN or infinite in the measurement or in the fitted curve."
                 .to_string(),
         }
     }
@@ -1332,6 +1345,14 @@ pub(crate) struct ResidualsRequest<'a> {
 pub(crate) fn residuals_for_fit(
     req: ResidualsRequest<'_>,
 ) -> Result<DockResiduals, ResidualsUnavailable> {
+    // An empty window and a window whose every residual is non-finite both
+    // end with an empty residual list, and they are different refusals: one
+    // is about where the measurement reaches, the other about the numbers
+    // in it. Separate them here, before the model is built, so neither is
+    // reported as the other.
+    if req.nominal_energies.is_empty() || req.measured.is_empty() {
+        return Err(ResidualsUnavailable::NoMeasuredOverlap);
+    }
     let physics_energies = fitted_physics_energies(req.result, req.nominal_energies)
         .map_err(ResidualsUnavailable::EnergyScale)?;
     let OverlayModel {
@@ -1400,13 +1421,17 @@ pub(crate) struct OverlayModel {
 /// compared with the routes the result disclosed and a disagreement is
 /// returned as [`OverlayModel::route_mismatch`] for the caller to show.
 ///
-/// `disclosed_routes` is `None` for a result that carries no disclosure —
-/// a per-pixel result assembled from a spatial map is the case that
-/// reaches the GUI, because a map discloses one map-wide route set and
-/// none per pixel, and withholds even that when its converged pixels
-/// disagree. The comparison cannot run then; a broadening redraw returns
-/// that absence as [`OverlayModel::route_mismatch`] rather than passing
-/// unchecked for checked.
+/// `disclosed_routes` is `None` for a result that carries no disclosure.
+/// Two things produce one in the GUI: a per-pixel result assembled from a
+/// spatial map, because a map discloses one map-wide route set and none per
+/// pixel and withholds even that when its converged pixels disagree; and a
+/// single-pixel result restored from a project file written before the
+/// routes were persisted (see
+/// `nereids_io::project::ProjectSnapshot::single_fit_doppler_routes`).
+/// Which one it was is not recoverable here, so the message names them as
+/// possibilities. The comparison cannot run either way; a broadening redraw
+/// returns that absence as [`OverlayModel::route_mismatch`] rather than
+/// passing unchecked for checked.
 ///
 /// Returns `None` when the model or its plan cannot be built (the caller
 /// then draws no overlay, as before).
@@ -1489,8 +1514,10 @@ pub(crate) fn build_overlay_model(
             let message = format!(
                 "Fit overlay is unchecked: it redraws [{}] (route gate at {gate_temperature_k} K) \
                  but the fit result discloses no routes, so nothing says these are the ones the \
-                 fit took. A spatial map discloses one map-wide route set and none per pixel, and \
-                 withholds even that when its converged pixels disagree",
+                 fit took. A result carries no disclosure when it comes from a spatial map (which \
+                 discloses one map-wide route set and none per pixel, and withholds even that when \
+                 its converged pixels disagree) or when it was restored from a project file \
+                 written before the routes were recorded",
                 describe(&mut overlay_routes.iter().map(ToString::to_string)),
             );
             tracing::warn!("{message}");
@@ -2110,6 +2137,15 @@ mod tests {
             warning.contains("does not map this grid to physical energies"),
             "{warning}"
         );
+        // The cause alone is only half the message: the same refusal costs
+        // the spectrum panel its curve and the dock its residuals, and each
+        // caller has to say which one the user is not being shown. Bare, it
+        // reads as a remark about the calibration next to a plot that looks
+        // merely empty.
+        assert!(
+            warning.starts_with("Fit curve hidden: "),
+            "the spectrum panel's consequence is missing: {warning}"
+        );
     }
 
     /// A grid with no energy scale fitted is its own physics grid — `None`
@@ -2361,11 +2397,12 @@ mod tests {
         );
     }
 
-    /// The two refusals the dock can reach are different things and must
-    /// say which one fired: a calibration that cannot be reproduced, and a
-    /// window holding no finite residual. One "missing data or isotope
-    /// mismatch" line for both — which is what the dock showed — sends the
-    /// user after a problem they do not have.
+    /// The refusals the dock can reach are different things and must say
+    /// which one fired: a calibration that cannot be reproduced, a window
+    /// the measurement does not reach, and a window holding no finite
+    /// residual. One "missing data or isotope mismatch" line for all of
+    /// them — which is what the dock showed — sends the user after a
+    /// problem they do not have.
     #[test]
     fn residuals_name_the_refusal_that_actually_fired() {
         let rd = u238_with_formalism(ResonanceFormalism::MLBW);
@@ -2384,6 +2421,28 @@ mod tests {
             "{}",
             scale.message()
         );
+        // The cause alone is half the message: the dock has to say that
+        // this is why there are no residuals, as the spectrum panel says it
+        // is why there is no curve (see
+        // `a_degenerate_energy_scale_hides_the_curve_and_says_why`).
+        assert!(
+            scale.message().starts_with("Residuals hidden: "),
+            "the dock's consequence is missing: {}",
+            scale.message()
+        );
+
+        // An empty window is not a statement about the numbers in it: the
+        // loaded grid can run past the cube's last time bin, and reporting
+        // that as "every bin is NaN or infinite" describes data that was
+        // never read.
+        let no_overlap = residuals_for_fit(residuals_request(&result, &nominal, &[], &rd))
+            .expect_err("a window the measurement does not reach has nothing to subtract");
+        assert_eq!(no_overlap, ResidualsUnavailable::NoMeasuredOverlap);
+        assert!(
+            no_overlap.message().contains("no measured bin"),
+            "{}",
+            no_overlap.message()
+        );
 
         let nothing_finite = vec![f64::NAN; nominal.len()];
         let no_residual =
@@ -2396,12 +2455,37 @@ mod tests {
             no_residual.message()
         );
 
-        // The three messages are three different sentences: neither cause
-        // is reported as the missing-data one, nor as the other.
+        // The messages are four different sentences: no cause is reported
+        // as the missing-data one, nor as any of the others.
         let missing = ResidualsUnavailable::MissingData.message();
-        assert_ne!(scale.message(), no_residual.message());
-        assert_ne!(scale.message(), missing);
-        assert_ne!(no_residual.message(), missing);
+        for (a, b) in [
+            (scale.message(), no_residual.message()),
+            (scale.message(), no_overlap.message()),
+            (no_overlap.message(), no_residual.message()),
+            (scale.message(), missing.clone()),
+            (no_overlap.message(), missing.clone()),
+            (no_residual.message(), missing.clone()),
+        ] {
+            assert_ne!(a, b);
+        }
+    }
+
+    /// `ModelUnavailable` is reached three ways — a resolution setting or
+    /// fit range the caller could not turn into a model, a Doppler plan or
+    /// model build that refused these inputs, and an evaluation that failed
+    /// — and the one line it shows has to be true of all three. Naming only
+    /// the settings sends a user whose isotope the plan refused to check a
+    /// resolution box that is fine.
+    #[test]
+    fn the_model_refusal_names_every_path_that_reaches_it() {
+        let message = ResidualsUnavailable::ModelUnavailable.message();
+        assert!(message.contains("resolution"), "{message}");
+        assert!(message.contains("fit energy range"), "{message}");
+        assert!(message.contains("Doppler plan"), "{message}");
+        assert!(
+            message.contains("rebuilt or evaluated"),
+            "an evaluation failure is not a build failure: {message}"
+        );
     }
 
     /// A result that discloses no routes cannot be checked against the
@@ -2435,10 +2519,62 @@ mod tests {
             message.contains("U-238") && message.contains("continuous free-gas integral"),
             "the redrawn route is named so the user can judge it: {message}"
         );
+        // What is true is that there is no disclosure. WHY there is none is
+        // not knowable here: a spatial map discloses nothing per pixel, and
+        // so does a single-pixel fit reloaded from a project file written
+        // before routes were persisted. Asserting the map as the cause
+        // tells that second user something false about their own session,
+        // so both are named as possibilities.
+        assert!(
+            message.contains("spatial map") && message.contains("project file"),
+            "the message states one cause as fact: {message}"
+        );
 
         // 0 K: every route is `Unbroadened`, and an unbroadened redraw
         // cannot have taken the wrong broadening route.
         assert_eq!(overlay(0.0).route_mismatch, None);
+    }
+
+    /// The dock gates the redrawn routes the way the fit gated them, and it
+    /// is the RESULT's own fitted temperature that decides which gate. On an
+    /// MLBW range ending at 8 eV, a free-temperature fit gates at the fit's
+    /// upper bound and is demoted to the sampled table, while the same fit
+    /// at a fixed temperature stays on the continuous integral — two
+    /// different curves to take the measurement against. Every other dock
+    /// fixture has `temperature_k = None`, so nothing else exercises the
+    /// hand-off.
+    #[test]
+    fn the_dock_gates_on_the_temperature_the_fit_fitted() {
+        let mut near_edge = u238_with_formalism(ResonanceFormalism::MLBW);
+        near_edge.ranges[0].energy_high = 8.0;
+        let nominal: Vec<f64> = (0..201).map(|i| 4.0 + (i as f64) * 0.0145).collect();
+        let measured = vec![0.9; nominal.len()];
+        // No disclosure, so the route the redraw took is reported verbatim
+        // and can be read back out of the warning.
+        let undisclosed = |temperature_k: Option<f64>| SpectrumFitResult {
+            temperature_k,
+            doppler_routes: None,
+            ..energy_scale_result(0.0)
+        };
+        let route_taken = |result: &SpectrumFitResult| {
+            residuals_for_fit(residuals_request(result, &nominal, &measured, &near_edge))
+                .expect("a finite measurement on a reproducible fit")
+                .warning
+                .expect("an undisclosed redraw is reported unchecked")
+        };
+
+        let fixed = route_taken(&undisclosed(None));
+        assert!(
+            fixed.contains("continuous free-gas integral"),
+            "a fixed-temperature fit gated at its own temperature: {fixed}"
+        );
+
+        let free = route_taken(&undisclosed(Some(293.6)));
+        assert!(
+            free.contains("sampled-table kernel-on-grid"),
+            "a free-temperature fit gated at the fit's upper bound, where this range \
+             no longer covers the thermal window: {free}"
+        );
     }
 
     /// Routes are compared WITH their isotopes: two different isotopes can

@@ -3200,6 +3200,47 @@ mod tests {
         );
     }
 
+    /// The per-pixel result assembled from a spatial map carries the map's
+    /// route disclosure, which is the only disclosure such a result can
+    /// have. It is what `design::build_overlay_model` checks the redraw
+    /// against: dropped on the way through, every spatial-pixel redraw
+    /// reports itself as unchecked, and the warning that exists to catch a
+    /// real disagreement fires on every pixel of every map instead.
+    #[test]
+    fn a_spatial_pixel_result_carries_the_maps_route_disclosure() {
+        use nereids_endf::resonance::ResonanceFormalism;
+        use nereids_physics::doppler_route::{DopplerRoute, IsotopeDopplerRoute};
+
+        let routes = vec![IsotopeDopplerRoute {
+            isotope: nereids_core::types::Isotope::new(92, 238).unwrap(),
+            route: DopplerRoute::Continuous {
+                formalisms: vec![ResonanceFormalism::MLBW],
+            },
+        }];
+        let mut state = AppState {
+            spatial_result: Some(SpatialResult {
+                doppler_routes: Some(routes.clone()),
+                ..stale_spatial_result()
+            }),
+            ..AppState::default()
+        };
+
+        let assembled = selected_pixel_fit_result_for_overlay(&state, 0, 0)
+            .expect("the map converged at this pixel");
+        assert_eq!(
+            assembled.doppler_routes.as_deref(),
+            Some(routes.as_slice()),
+            "the redraw of this pixel has nothing else to be checked against"
+        );
+
+        // A map that withheld its disclosure hands on the absence rather
+        // than a fabricated agreement.
+        state.spatial_result = Some(stale_spatial_result());
+        let undisclosed = selected_pixel_fit_result_for_overlay(&state, 0, 0)
+            .expect("the map converged at this pixel");
+        assert_eq!(undisclosed.doppler_routes, None);
+    }
+
     #[test]
     fn rejected_counts_resolution_spatial_attempt_clears_stale_map() {
         let mut state = rejected_counts_resolution_state();

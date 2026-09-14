@@ -830,14 +830,24 @@ fn dock_residuals(ui: &mut egui::Ui, state: &mut AppState) {
             && c.temperature_k == effective_temp
     });
 
-    if !cache_valid {
-        let built = build_residuals_cache(state, &result, (py, px), effective_temp);
-        match built {
-            Ok(cache) => state.residuals_cache = Some(cache),
+    // Take the valid cache out and render from it, putting it back at the
+    // end, rather than rebuilding and then re-reading the field: re-reading
+    // needs a `None` arm that cannot be reached and would render an empty
+    // dock if it ever were.
+    let reusable = if cache_valid {
+        state.residuals_cache.take()
+    } else {
+        None
+    };
+    let cache = match reusable {
+        Some(cache) => cache,
+        None => match build_residuals_cache(state, &result, (py, px), effective_temp) {
+            Ok(cache) => cache,
             Err(reason) => {
-                // Say which refusal fired: a degenerate energy scale and a
-                // wholly non-finite window are not "missing data", and the
-                // user can only act on the cause that actually happened.
+                // Say which refusal fired: a degenerate energy scale, a
+                // window holding no measured bin and a wholly non-finite
+                // one are not "missing data", and the user can only act on
+                // the cause that actually happened.
                 state.residuals_cache = None;
                 ui.label(
                     egui::RichText::new(reason.message())
@@ -846,16 +856,13 @@ fn dock_residuals(ui: &mut egui::Ui, state: &mut AppState) {
                 );
                 return;
             }
-        }
-    }
-
-    let Some(cache) = state.residuals_cache.as_ref() else {
-        return;
+        },
     };
 
     // The residual is measured minus the model the overlay draws, so a
-    // route disagreement makes these numbers as untrustworthy as the curve
-    // in the spectrum panel: say so here too rather than only there.
+    // route disagreement — or a redraw with no disclosure to check itself
+    // against — makes these numbers as untrustworthy as the curve in the
+    // spectrum panel: say so here too rather than only there.
     if let Some(message) = &cache.warning {
         ui.colored_label(crate::theme::semantic::ORANGE, message);
     }
@@ -897,6 +904,7 @@ fn dock_residuals(ui: &mut egui::Ui, state: &mut AppState) {
                     .style(egui_plot::LineStyle::dashed_loose()),
             );
         });
+    state.residuals_cache = Some(cache);
 }
 
 /// Gather what [`design::residuals_for_fit`] needs out of the application
@@ -925,7 +933,6 @@ fn build_residuals_cache(
     let (py, px) = pixel;
 
     let shape = norm.transmission.shape();
-    let n_tof = shape[0];
     if py >= shape[1] || px >= shape[2] {
         return Err(MissingData);
     }
@@ -964,11 +971,8 @@ fn build_residuals_cache(
         instrument.as_ref().map(|i| &i.resolution),
     )
     .map_err(|_| ModelUnavailable)?;
-    let fit_energies = &energies[range.clone()];
-    let n_measured = n_tof.saturating_sub(range.start).min(fit_energies.len());
-    let measured: Vec<f64> = (0..n_measured)
-        .map(|i| norm.transmission[[range.start + i, py, px]])
-        .collect();
+    let (fit_energies, measured) =
+        fit_window_measurement(energies, &norm.transmission, pixel, &range);
 
     let design::DockResiduals { stats, warning } =
         design::residuals_for_fit(design::ResidualsRequest {
@@ -996,6 +1000,44 @@ fn build_residuals_cache(
         n_points,
         warning,
     })
+}
+
+/// The fit window's nominal energies, and the measurement on exactly those
+/// bins.
+///
+/// Two choices live here, and both decide what the dock computes rather
+/// than how it is wired:
+///
+/// - The energies are the fit window's SLICE of the loaded grid (see
+///   [`crate::guided::analyze::fit_grid_range`]), because that is the grid
+///   the fit ran on — it is the residual plot's x-axis, the grid the
+///   composed background and baseline are evaluated on, and the grid the
+///   Doppler route gate reads. Handing over the whole loaded grid instead
+///   pairs every residual with the wrong energy and the wrong measured
+///   value for any window that does not start at bin 0.
+/// - The measurement is read at `range.start + i`, the cube's
+///   time-of-flight bin belonging to window bin `i`. Reading it at `i`
+///   would subtract the fitted curve from the first bins of the
+///   acquisition rather than from the fitted ones.
+///
+/// The measurement stops where the cube's time-of-flight axis stops, so a
+/// loaded energy grid that outruns the cube yields a shorter — possibly
+/// empty — measurement instead of an out-of-bounds index.
+fn fit_window_measurement<'a>(
+    energies: &'a [f64],
+    transmission: &ndarray::Array3<f64>,
+    pixel: (usize, usize),
+    range: &std::ops::Range<usize>,
+) -> (&'a [f64], Vec<f64>) {
+    let (py, px) = pixel;
+    let fit_energies = &energies[range.clone()];
+    let n_measured = transmission.shape()[0]
+        .saturating_sub(range.start)
+        .min(fit_energies.len());
+    let measured = (0..n_measured)
+        .map(|i| transmission[[range.start + i, py, px]])
+        .collect();
+    (fit_energies, measured)
 }
 
 /// Provenance log (flat list, no collapsing header).
@@ -1317,16 +1359,14 @@ fn isotopes_card(ui: &mut egui::Ui, state: &mut AppState) {
 
         for i in 0..state.isotope_entries.len() {
             ui.horizontal(|ui| {
-                // Enable checkbox
-                let prev_enabled = state.isotope_entries[i].enabled;
-                ui.add_enabled(
-                    !locked,
-                    egui::Checkbox::without_text(&mut state.isotope_entries[i].enabled),
-                );
-                if state.isotope_entries[i].enabled != prev_enabled {
-                    state.mark_dirty(GuidedStep::Analyze);
-                    state.clear_pixel_fit_for_isotope_change();
-                }
+                // Enable checkbox. The widget writes to a local flag and the
+                // state change goes through `set_isotope_enabled`, so the
+                // flip and the invalidation it implies cannot come apart:
+                // flipping the field here and forgetting the invalidation
+                // leaves the dock on the previous isotope set's numbers.
+                let mut enabled = state.isotope_entries[i].enabled;
+                ui.add_enabled(!locked, egui::Checkbox::without_text(&mut enabled));
+                state.set_isotope_enabled(i, enabled);
 
                 // Colored dot + symbol
                 let dot_color = design::isotope_dot_color(&state.isotope_entries[i].symbol);
@@ -1360,16 +1400,11 @@ fn isotopes_card(ui: &mut egui::Ui, state: &mut AppState) {
         // Isotope groups
         for i in 0..state.isotope_groups.len() {
             ui.horizontal(|ui| {
-                // Enable checkbox
-                let prev_enabled = state.isotope_groups[i].enabled;
-                ui.add_enabled(
-                    !locked,
-                    egui::Checkbox::without_text(&mut state.isotope_groups[i].enabled),
-                );
-                if state.isotope_groups[i].enabled != prev_enabled {
-                    state.mark_dirty(GuidedStep::Analyze);
-                    state.clear_pixel_fit_for_isotope_change();
-                }
+                // Enable checkbox — see the per-isotope checkbox above for
+                // why the flip goes through the state method.
+                let mut enabled = state.isotope_groups[i].enabled;
+                ui.add_enabled(!locked, egui::Checkbox::without_text(&mut enabled));
+                state.set_isotope_group_enabled(i, enabled);
 
                 // Colored dot + name
                 let dot_color = design::isotope_dot_color(&state.isotope_groups[i].name);
@@ -1420,4 +1455,56 @@ fn no_results_placeholder(ui: &mut egui::Ui) {
             .color(colors.fg3),
         );
     });
+}
+
+#[cfg(test)]
+mod tests {
+    use super::fit_window_measurement;
+    use ndarray::Array3;
+
+    /// A cube whose value at `[t, y, x]` is `t*100 + y*10 + x` — a marker
+    /// per (time bin, pixel) rather than a physical transmission, so reading
+    /// the wrong bin or the wrong pixel is visible in the value itself.
+    fn marked_cube(n_tof: usize) -> Array3<f64> {
+        Array3::from_shape_fn((n_tof, 2, 2), |(t, y, x)| (t * 100 + y * 10 + x) as f64)
+    }
+
+    /// The dock's residuals are formed on the FIT WINDOW, and each one is
+    /// taken against the cube's time-of-flight bin that window bin belongs
+    /// to. A window starting at bin 0 cannot tell either choice apart from
+    /// its opposite, so this one starts at bin 3: handing over the whole
+    /// loaded grid, or reading the cube from bin 0, each pairs every
+    /// residual with a different energy and a different measurement.
+    #[test]
+    fn the_residual_window_is_the_fit_window_and_its_own_measured_bins() {
+        let energies: Vec<f64> = (0..10).map(|i| 6.0 + i as f64 * 0.01).collect();
+        let cube = marked_cube(10);
+
+        let (window, measured) = fit_window_measurement(&energies, &cube, (1, 0), &(3..7));
+
+        assert_eq!(window, &energies[3..7]);
+        assert_eq!(measured, vec![310.0, 410.0, 510.0, 610.0]);
+        // Non-vacuity: this window is neither the whole grid nor the
+        // cube's leading bins, so both mutations change what is returned.
+        assert!(window.len() < energies.len());
+        assert_ne!(measured[0], cube[[0, 1, 0]]);
+    }
+
+    /// A loaded energy grid can outrun the cube's time-of-flight axis. The
+    /// measurement then stops where the cube stops — and a window lying
+    /// entirely past it yields nothing, which `residuals_for_fit` reports as
+    /// the empty-window refusal rather than as non-finite numbers.
+    #[test]
+    fn a_window_past_the_cube_truncates_instead_of_indexing_past_it() {
+        let energies: Vec<f64> = (0..14).map(|i| 6.0 + i as f64 * 0.01).collect();
+        let cube = marked_cube(10);
+
+        let (window, measured) = fit_window_measurement(&energies, &cube, (1, 1), &(8..14));
+        assert_eq!(window.len(), 6);
+        assert_eq!(measured, vec![811.0, 911.0]);
+
+        let (window, measured) = fit_window_measurement(&energies, &cube, (1, 1), &(10..14));
+        assert_eq!(window.len(), 4);
+        assert!(measured.is_empty());
+    }
 }
