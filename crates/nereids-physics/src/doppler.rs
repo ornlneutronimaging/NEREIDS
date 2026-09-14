@@ -872,6 +872,18 @@ pub fn doppler_broaden_with_derivative(
             continue;
         }
 
+        // SAMMY's negative-value rule may have zeroed the forward value
+        // (`fgm/mfgm4.f90:83-101`).  The derivative of a value the rule
+        // replaced with zero is zero — reporting a moving derivative for a
+        // flat reported cross-section would be incoherent, and it is what
+        // the continuous tier already does by returning value and
+        // derivative together as zero.  Reading the forward result rather
+        // than re-testing the predicate keeps one decision in one place.
+        if broadened[i] == 0.0 {
+            derivative[i] = 0.0;
+            continue;
+        }
+
         // Re-integrate to get sum_y and sum_g (needed for quotient rule).
         // Also accumulate derivative terms in the same loop.
         let mut sum_y = 0.0f64;
@@ -1193,6 +1205,36 @@ mod tests {
             "an all-negative window must zero, got {:?}",
             broadened.iter().copied().fold(f64::MIN, f64::max)
         );
+    }
+
+    /// A value SAMMY's rule zeroed must come back with a zero derivative:
+    /// the reported cross-section is flat there, so a moving derivative
+    /// would describe a curve the forward pass does not return.
+    #[test]
+    fn a_zeroed_value_has_a_zeroed_temperature_derivative() {
+        let params = DopplerParams::new(293.6, 55.45).unwrap();
+        let energies: Vec<f64> = (0..=200).map(|i| 100.0 + f64::from(i) * 0.5).collect();
+        let dead: Vec<f64> = energies.iter().map(|_| -5.0).collect();
+
+        let (values, derivatives) =
+            doppler_broaden_with_derivative(&energies, &dead, &params).unwrap();
+        assert!(values.iter().all(|&v| v == 0.0), "the rule must zero these");
+        for (i, (&value, &derivative)) in values.iter().zip(&derivatives).enumerate() {
+            assert!(
+                value != 0.0 || derivative == 0.0,
+                "E={} eV reports value {value} with derivative {derivative}",
+                energies[i]
+            );
+        }
+
+        // Control: a positive source is untouched by the rule and DOES
+        // have a nonzero derivative, so the assertion above is not vacuous.
+        let live: Vec<f64> = energies
+            .iter()
+            .map(|&e| 100.0 / (1.0 + (e - 150.0).powi(2)))
+            .collect();
+        let (_, derivatives) = doppler_broaden_with_derivative(&energies, &live, &params).unwrap();
+        assert!(derivatives.iter().any(|&d| d != 0.0));
     }
 
     /// The same rule where the kernel window reaches BELOW zero velocity,
