@@ -505,7 +505,15 @@ impl TargetContext<'_, '_> {
             self.any_source_positive.set(true);
         }
         let value = (-x * x).exp() * source_energy * sigma / (SQRT_PI * self.target_energy);
-        (value, value * (x * x - 0.5) / self.temperature_k)
+        // The derivative costs a multiply and a divide at every node, and
+        // the value-only entry points discard it, so it is not computed
+        // for them.
+        let derivative = if self.require_derivative {
+            value * (x * x - 0.5) / self.temperature_k
+        } else {
+            0.0
+        };
+        (value, derivative)
     }
 
     /// G10/K21 on `[left, right]`, returning `(kronrod, gauss)`. The Gauss
@@ -1083,19 +1091,33 @@ mod tests {
     ///
     /// The sampled-table tier sits at +0.80% on the same curve. The two
     /// tiers therefore agree with EACH OTHER to well under 0.1% while both
-    /// stand 0.8% from SAMMY, so the residual is not this integrator. The
-    /// core's integrated strength is ~0.77% larger than SAMMY's while the
-    /// wings match — the signature of an effective width difference of
-    /// about 11 μeV on Γ = 1.5 meV, most plausibly SAMMY's own `Dopfgm`
-    /// under-resolving a 1.5 meV core on its grid.
+    /// stand 0.8% from SAMMY, so the residual is not this integrator.
     ///
-    /// That last step is a hypothesis, not a measurement: this is an OPEN
-    /// discrepancy against the only external reference available here, and
-    /// it must be resolved before any claim of SAMMY-equivalent broadening
-    /// is made in print. The assertion below is therefore a two-sided pin
-    /// on the value we actually observe, not a loose bound — a loose
-    /// tolerance here would absorb a sub-0.8% physics error, which is
+    /// ## Why SAMMY is the low one
+    ///
+    /// SAMMY's own run log for this case (`samexm/ex001/answers/
+    /// ex001aa.lpt`) reports `** One resonance has fewer than 9 points
+    /// across width` and `Number of points in auxiliary grid = 396`. That
+    /// is 396 points spanning 8.04-11.96 eV, about 9.9 meV apart, against a
+    /// natural width `Γ = Γn + Γγ = 1.5 meV` — SAMMY samples the Lorentzian
+    /// at roughly 0.15 points across its OWN width before convolving.
+    /// Under-sampling a narrow line loses line area, so SAMMY's broadened
+    /// curve comes out low; we place quadrature breakpoints ON the
+    /// resonance and integrate it to 1e-8, so we keep the area. A loss on
+    /// SAMMY's side is the direction and the localisation we measure: the
+    /// deficit lives in the core and the wings, where the line is
+    /// resolved, agree to 1e-4.
+    ///
+    /// So the residual is SAMMY's grid, not our kernel — but it is still
+    /// 0.77%, so it is pinned tightly rather than waved through. The
+    /// assertion below is a two-sided band on the value actually observed;
+    /// a loose tolerance would absorb a sub-0.8% physics error, which is
     /// larger than the 0.43% kernel-width error this very branch removed.
+    ///
+    /// The same log independently confirms the mass ratio this branch
+    /// corrected: it prints `mass of neutron = 1.008664915600000 in amu`
+    /// and `Dopp_FWHM` at 10 eV as 0.5378 eV, which is the width AWR
+    /// 9.9141 gives (0.537766) and not the one AWR 10 gives (0.535451).
     #[test]
     fn the_sammy_ex001_capture_curve_is_matched_to_a_measured_residual() {
         let data = ex001_hydrogen_single_resonance();

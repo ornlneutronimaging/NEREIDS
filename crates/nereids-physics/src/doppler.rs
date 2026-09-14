@@ -741,9 +741,22 @@ pub fn doppler_broaden(
         // is `Sigma` BEFORE its `/Em`, which is `sum_y / sum_g` here, in
         // barn·eV; the contributing unbroadened points are the extended-grid
         // samples this target's window actually integrated over.
+        //
+        // SAMMY counts points whose CROSS-SECTION is positive
+        // (`mfgm4.f90:89`, on the stored sigma), and `ext_y` is not sigma:
+        // it is the odd-extended integrand `w²·σ(w²)`, built as `−w²·σ`
+        // over the negative-velocity image branch (see
+        // `build_extended_fgm_grid`).  A positive `ext_y` there therefore
+        // means a NEGATIVE cross-section.  Multiplying by `ext_v` undoes
+        // that: `ext_y·ext_v > 0` is `σ > 0` on both branches, and the
+        // `w = 0` anchor gives exactly 0, which is correctly no evidence
+        // either way.
         if broadened[i] < 0.0
             && zero_negative_value(sum_y / sum_g, || {
-                ext_y[seg_lo..=seg_hi].iter().any(|&sample| sample > 0.0)
+                ext_y[seg_lo..=seg_hi]
+                    .iter()
+                    .zip(&ext_v[seg_lo..=seg_hi])
+                    .any(|(&integrand, &velocity)| integrand * velocity > 0.0)
             })
         {
             broadened[i] = 0.0;
@@ -1178,6 +1191,41 @@ mod tests {
         assert!(
             broadened.iter().all(|&v| v == 0.0),
             "an all-negative window must zero, got {:?}",
+            broadened.iter().copied().fold(f64::MIN, f64::max)
+        );
+    }
+
+    /// The same rule where the kernel window reaches BELOW zero velocity,
+    /// so the extended grid carries image nodes.
+    ///
+    /// The evidence SAMMY counts is the sign of σ, and over the image
+    /// branch the stored integrand is `−w²·σ`, so reading the integrand
+    /// directly inverts it exactly there. A light target at low energy is
+    /// where that happens: AWR 1 at 300 K gives u ≈ 0.16 √eV, so at 0.02 eV
+    /// the window's lower edge `√E − 6u` is about −0.82 and the image
+    /// branch is populated.
+    #[test]
+    fn the_negative_rule_reads_cross_section_sign_across_the_velocity_image() {
+        let params = DopplerParams::new(300.0, 1.0).unwrap();
+        let energies: Vec<f64> = (1..=200).map(|i| f64::from(i) * 2.0e-4).collect();
+        assert!(
+            energies[0].sqrt() - 6.0 * params.u() < 0.0,
+            "the fixture must reach below zero velocity, or it cannot see this"
+        );
+
+        // Negative everywhere: no positive σ anywhere, image branch or not,
+        // so SAMMY zeroes. Reading the raw integrand would find positive
+        // samples in the mirror region and wrongly KEEP these.
+        let dead: Vec<f64> = energies.iter().map(|_| -3.0).collect();
+        let broadened = doppler_broaden(&energies, &dead, &params).unwrap();
+        assert!(
+            broadened.iter().all(|&v| v <= 0.0),
+            "an all-negative source must never broaden positive"
+        );
+        assert!(
+            broadened.iter().all(|&v| v == 0.0),
+            "an all-negative source has no positive contributing point, so it zeroes;              got min {:?} max {:?}",
+            broadened.iter().copied().fold(f64::MAX, f64::min),
             broadened.iter().copied().fold(f64::MIN, f64::max)
         );
     }
