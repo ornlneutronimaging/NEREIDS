@@ -30,7 +30,9 @@ use rayon::prelude::*;
 
 use nereids_endf::resonance::ResonanceData;
 
+use crate::continuous_doppler;
 use crate::doppler::{self, DopplerParams, DopplerParamsError};
+use crate::doppler_route::DopplerRoute;
 use crate::reich_moore;
 use crate::resolution::{self, ResolutionError, ResolutionFunction};
 
@@ -652,16 +654,8 @@ pub fn forward_model(
         .par_iter()
         .filter(|(_, thickness)| *thickness > 0.0)
         .map(|(res_data, thickness)| {
-            let unbroadened: Vec<f64> = work_energies
-                .iter()
-                .map(|&e| reich_moore::cross_sections_at_energy(res_data, e).total)
-                .collect();
-            let after_doppler = if sample.temperature_k() > 0.0 {
-                let params = DopplerParams::new(sample.temperature_k(), res_data.awr)?;
-                doppler::doppler_broaden(work_energies, &unbroadened, &params)?
-            } else {
-                unbroadened
-            };
+            let after_doppler =
+                broaden_isotope_on_grid(work_energies, res_data, sample.temperature_k())?;
             Ok((after_doppler, *thickness))
         })
         .collect();
@@ -690,6 +684,64 @@ pub fn forward_model(
     } else {
         Ok(transmission)
     }
+}
+
+/// Doppler-broaden ONE isotope's total cross-section on `work_energies`,
+/// choosing the tier the route gate chooses.
+///
+/// This is the single place the four "sample the resonance equation, then
+/// broaden" sites in this file go through, so they cannot drift apart on
+/// which tier they take or on how a refusal is reported.
+///
+/// [`continuous_doppler::classify_isotope`] decides once, per isotope, for
+/// the whole grid. A tier-1 refusal is NOT a fallback that happens per
+/// energy: the gate returns `SampledTable` with the condition that failed,
+/// and the sampled tier runs for the whole isotope. Mixing tiers within one
+/// isotope would make the answer depend on where the caller's grid fell.
+///
+/// The caller-supplied-table family (`*_from_base_*`) deliberately does NOT
+/// use this. Tier 1 integrates the resonance equation, so it cannot
+/// reproduce a table the caller computed some other way, and nothing in
+/// that signature says whether `base_xs` IS the resonance equation on that
+/// grid. Those sites stay on the sampled tier until something can assert
+/// that.
+///
+/// # Errors
+/// [`TransmissionError::DopplerBroadening`] for an invalid temperature or
+/// grid, or for a tier-1 quadrature that cannot converge.
+fn broaden_isotope_on_grid(
+    work_energies: &[f64],
+    rd: &ResonanceData,
+    temperature_k: f64,
+) -> Result<Vec<f64>, TransmissionError> {
+    // Below zero the old behaviour is preserved exactly: no kernel, no grid
+    // validation, the unbroadened equation. The gate agrees (it answers
+    // `Unbroadened` at zero), but reaching it would newly validate grids
+    // that this path has always accepted, which is a separate change.
+    if temperature_k <= 0.0 {
+        return Ok(unbroadened_totals(rd, work_energies));
+    }
+    match continuous_doppler::classify_isotope(rd, work_energies, temperature_k)? {
+        DopplerRoute::Unbroadened => Ok(unbroadened_totals(rd, work_energies)),
+        DopplerRoute::Continuous { .. } => {
+            continuous_doppler::broaden(work_energies, rd, temperature_k).map_err(Into::into)
+        }
+        DopplerRoute::SampledTable { .. } => {
+            let params = DopplerParams::new(temperature_k, rd.awr)?;
+            let unbroadened = unbroadened_totals(rd, work_energies);
+            doppler::doppler_broaden(work_energies, &unbroadened, &params).map_err(Into::into)
+        }
+    }
+}
+
+/// The zero-kelvin total cross-section of one isotope on a grid, built once
+/// per isotope rather than once per energy.
+fn unbroadened_totals(rd: &ResonanceData, energies: &[f64]) -> Vec<f64> {
+    reich_moore::CrossSectionPlan::new(rd)
+        .evaluate(energies)
+        .into_iter()
+        .map(|xs| xs.total)
+        .collect()
 }
 
 /// Compute Doppler-broadened cross-sections for each isotope.
@@ -790,16 +842,7 @@ pub fn broadened_cross_sections_on_working_grid(
                 return Err(TransmissionError::Cancelled);
             }
 
-            let unbroadened: Vec<f64> = work_energies
-                .iter()
-                .map(|&e| reich_moore::cross_sections_at_energy(rd, e).total)
-                .collect();
-            if temperature_k > 0.0 {
-                let params = DopplerParams::new(temperature_k, rd.awr)?;
-                doppler::doppler_broaden(work_energies, &unbroadened, &params).map_err(Into::into)
-            } else {
-                Ok(unbroadened)
-            }
+            broaden_isotope_on_grid(work_energies, rd, temperature_k)
         })
         .collect();
 
@@ -879,19 +922,9 @@ pub fn broadened_cross_sections_for_transmission(
                 // Extended grid available: evaluate the full pipeline on the
                 // extended grid and extract at data positions.
 
-                // 1. Unbroadened cross sections on extended grid.
-                let unbroadened: Vec<f64> = ext_energies
-                    .iter()
-                    .map(|&e| reich_moore::cross_sections_at_energy(rd, e).total)
-                    .collect();
-
-                // 2. Doppler broadening.
-                let after_doppler = if temperature_k > 0.0 {
-                    let params = DopplerParams::new(temperature_k, rd.awr)?;
-                    doppler::doppler_broaden(ext_energies, &unbroadened, &params)?
-                } else {
-                    unbroadened
-                };
+                // 1-2. Zero-kelvin cross-section and Doppler broadening on
+                //      the extended grid, at whichever tier the gate chose.
+                let after_doppler = broaden_isotope_on_grid(ext_energies, rd, temperature_k)?;
 
                 // 3. Convert to transmission: T = exp(-nd × σ_D).
                 let transmission: Vec<f64> = after_doppler
@@ -917,17 +950,7 @@ pub fn broadened_cross_sections_for_transmission(
             } else {
                 // No extended grid (e.g. tabulated resolution with no aux grid):
                 // Doppler on data grid, Beer-Lambert, resolution on data grid.
-                let unbroadened: Vec<f64> = energies
-                    .iter()
-                    .map(|&e| reich_moore::cross_sections_at_energy(rd, e).total)
-                    .collect();
-
-                let after_doppler = if temperature_k > 0.0 {
-                    let params = DopplerParams::new(temperature_k, rd.awr)?;
-                    doppler::doppler_broaden(energies, &unbroadened, &params)?
-                } else {
-                    unbroadened
-                };
+                let after_doppler = broaden_isotope_on_grid(energies, rd, temperature_k)?;
 
                 let transmission: Vec<f64> = after_doppler
                     .iter()
@@ -1317,7 +1340,7 @@ pub fn forward_model_from_base_xs(
 mod tests {
     use super::*;
     use nereids_core::types::Isotope;
-    use nereids_endf::resonance::test_support::u238_single_resonance;
+    use nereids_endf::resonance::test_support::{u238_single_resonance, u238_with_formalism};
     use nereids_endf::resonance::{LGroup, Resonance, ResonanceFormalism, ResonanceRange};
 
     /// Issue #608 R2: the spatial pipeline builds the working-grid σ
@@ -1365,6 +1388,123 @@ mod tests {
                 "working-grid energies must be bit-identical"
             );
         }
+    }
+
+
+    // ── tier dispatch through transmission (PR-4c) ─────────────────────────
+    //
+    // Every OTHER test in this module uses `u238_single_resonance`, which is
+    // Reich-Moore and therefore always takes the sampled tier. A wiring that
+    // never reached the integral at all would leave all of them green, so
+    // these three carry the whole weight of proving the dispatch works.
+
+    /// An MLBW source really is integrated: `forward_model`'s per-isotope
+    /// cross-section equals `continuous_doppler::broaden` to the bit.
+    ///
+    /// Asserted against the integral itself rather than a number copied out
+    /// of a run, so it pins the DISPATCH rather than today's output.
+    #[test]
+    fn an_mlbw_isotope_is_broadened_by_the_integral() {
+        let data = u238_with_formalism(ResonanceFormalism::MLBW);
+        let temperature_k = 293.6;
+        let energies: Vec<f64> = (0..=60).map(|i| 6.4 + f64::from(i) * 0.01).collect();
+
+        // The gate must actually accept this source and grid, or the
+        // comparison below is vacuous.
+        assert!(matches!(
+            crate::continuous_doppler::classify_isotope(&data, &energies, temperature_k).unwrap(),
+            DopplerRoute::Continuous { .. }
+        ));
+
+        let ours = broaden_isotope_on_grid(&energies, &data, temperature_k).unwrap();
+        let integral =
+            crate::continuous_doppler::broaden(&energies, &data, temperature_k).unwrap();
+        for (a, b) in ours.iter().zip(&integral) {
+            assert_eq!(a.to_bits(), b.to_bits());
+        }
+
+        // Non-vacuity: the sampled tier must give a DIFFERENT answer on this
+        // grid, or "took tier 1" would be indistinguishable from "took tier 2".
+        let params = DopplerParams::new(temperature_k, data.awr).unwrap();
+        let sampled =
+            doppler::doppler_broaden(&energies, &unbroadened_totals(&data, &energies), &params)
+                .unwrap();
+        assert!(
+            ours.iter().zip(&sampled).any(|(a, b)| a.to_bits() != b.to_bits()),
+            "the two tiers agree bit-for-bit here, so this test cannot fail"
+        );
+    }
+
+    /// A Reich-Moore source is bit-identical to the sampled tier, which is
+    /// what every pre-existing baseline in the workspace depends on: samtry,
+    /// ic_closed_loop and all 29 tests in this module use Reich-Moore data.
+    #[test]
+    fn a_reich_moore_isotope_is_unchanged_by_the_rewiring() {
+        let data = u238_single_resonance();
+        let temperature_k = 293.6;
+        let energies: Vec<f64> = (0..=60).map(|i| 6.4 + f64::from(i) * 0.01).collect();
+
+        assert!(matches!(
+            crate::continuous_doppler::classify_isotope(&data, &energies, temperature_k).unwrap(),
+            DopplerRoute::SampledTable { .. }
+        ));
+
+        let params = DopplerParams::new(temperature_k, data.awr).unwrap();
+        let expected =
+            doppler::doppler_broaden(&energies, &unbroadened_totals(&data, &energies), &params)
+                .unwrap();
+        let ours = broaden_isotope_on_grid(&energies, &data, temperature_k).unwrap();
+        for (a, b) in ours.iter().zip(&expected) {
+            assert_eq!(a.to_bits(), b.to_bits());
+        }
+    }
+
+    /// Zero temperature returns the unbroadened equation without validating
+    /// the grid, exactly as the four replaced blocks did. The grid here is
+    /// descending, which every broadening path rejects — so if the rewiring
+    /// had started validating at 0 K, this would now error.
+    #[test]
+    fn zero_temperature_still_skips_broadening_and_grid_validation() {
+        let data = u238_with_formalism(ResonanceFormalism::MLBW);
+        let descending = [7.0, 6.674, 6.5];
+        let ours = broaden_isotope_on_grid(&descending, &data, 0.0).unwrap();
+        assert_eq!(ours, unbroadened_totals(&data, &descending));
+    }
+
+    /// The caller-supplied-table family stays on the sampled tier even for an
+    /// MLBW source: tier 1 integrates the resonance equation and cannot
+    /// reproduce a table the caller computed some other way.
+    #[test]
+    fn the_base_xs_family_stays_on_the_sampled_tier_for_mlbw() {
+        let data = u238_with_formalism(ResonanceFormalism::MLBW);
+        let temperature_k = 293.6;
+        let energies: Vec<f64> = (0..=60).map(|i| 6.4 + f64::from(i) * 0.01).collect();
+        let base = vec![unbroadened_totals(&data, &energies)];
+
+        let from_base = broadened_cross_sections_from_base_on_working_grid(
+            &energies,
+            &base,
+            std::slice::from_ref(&data),
+            temperature_k,
+            None,
+        )
+        .unwrap();
+        let params = DopplerParams::new(temperature_k, data.awr).unwrap();
+        let sampled = doppler::doppler_broaden(&energies, &base[0], &params).unwrap();
+        for (a, b) in from_base.sigma[0].iter().zip(&sampled) {
+            assert_eq!(a.to_bits(), b.to_bits());
+        }
+
+        // And it therefore differs from the fresh-sample family, which DOES
+        // integrate. That difference is the thing 4d has to disclose.
+        let integrated = broaden_isotope_on_grid(&energies, &data, temperature_k).unwrap();
+        assert!(
+            integrated
+                .iter()
+                .zip(&from_base.sigma[0])
+                .any(|(a, b)| a.to_bits() != b.to_bits()),
+            "the two families must differ here, or this test is pinning nothing"
+        );
     }
 
     #[test]

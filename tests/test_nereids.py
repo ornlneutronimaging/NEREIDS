@@ -3360,12 +3360,27 @@ class TestVenusMlbwRegression:
         # shifts -0.07 % and the iteration count halves (14 -> 7) because
         # analytic steps satisfy the relative-chi2 tolerance sooner.
         #
+        # Baseline regenerated after the tier-1 Doppler wiring (PR-4c).
+        # Hf-177 is MLBW (LRU=1, LRF=2), so the route gate now sends it to
+        # the continuous tier: the free-gas kernel is INTEGRATED over the
+        # resonance equation instead of convolved with a table sampled on
+        # the working grid. Density +0.134 % and chi2_r -3.6e-6 rel -- the
+        # integral fits the measured data BETTER, which is the direction a
+        # method that stops discretising the line should move.
+        #
+        # That the move is the tier change and NOTHING else was verified by
+        # mutation: forcing the `Continuous` arm of `broaden_isotope_on_grid`
+        # back to the sampled table reproduces the PREVIOUS anchors exactly
+        # (8.10458528518008e-05 / 219657.2439575215), so the grid, the
+        # CrossSectionPlan swap and the AWR correction are all ruled out as
+        # causes.
+        #
         # These pinned values are machine-generated regression anchors
         # (produced by the code under test); the correctness burden is
         # carried by the SAMMY-oracle suites (samtry, ex001) and the
         # analytic kernel pins in doppler.rs.
-        EXPECTED_DENSITY = 8.10458528518008e-05
-        EXPECTED_CHI2_R = 219657.2439575215
+        EXPECTED_DENSITY = 8.115412297872134e-05
+        EXPECTED_CHI2_R = 219656.4574858545
         EXPECTED_ITERATIONS = 7
 
         FLOAT_TOL = pytest.approx
@@ -3410,6 +3425,15 @@ class TestVenusMlbwRegression:
         under test), with correctness of the deviance math carried by the
         analytic joint-Poisson unit tests in nereids-fitting.
 
+        Re-captured again after the tier-1 Doppler wiring (PR-4c): Hf-177
+        is MLBW, so the route gate sends it to the continuous tier and the
+        kernel is integrated over the resonance equation rather than
+        convolved with a sampled table.  Density +0.75 %, D/dof -1.2e-4
+        rel.  Forcing the continuous arm back to the sampled table
+        reproduces the previous anchors exactly (2.7591191549411417e-05 /
+        31471.485549664278), which is what rules out every cause other
+        than the tier change.
+
         ``deviance_per_dof`` lands in the >> 1 regime (measured ~3.1e4):
         real VENUS counts carry un-modelled upstream physics, so D/dof
         saturates at 10^4-10^5.  A sudden drop to O(1) would mean the gate
@@ -3435,8 +3459,8 @@ class TestVenusMlbwRegression:
             c=c,
         )
 
-        EXPECTED_DENSITY = 2.7591191549411417e-05
-        EXPECTED_DEVIANCE_PER_DOF = 31471.485549664278
+        EXPECTED_DENSITY = 2.779837869787754e-05
+        EXPECTED_DEVIANCE_PER_DOF = 31467.62605915999
 
         assert bool(result.converged) is True, (
             f"counts-KL fit did not converge on the real VENUS fixture "
