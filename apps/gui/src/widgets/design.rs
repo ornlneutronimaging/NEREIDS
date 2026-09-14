@@ -2493,6 +2493,9 @@ mod tests {
     /// — and the one line it shows has to be true of all three. Naming only
     /// the settings sends a user whose isotope the plan refused to check a
     /// resolution box that is fine.
+    ///
+    /// This one covers the LINE only; the routing that reaches it is
+    /// covered by `both_ways_the_model_fails_are_reported_as_the_model`.
     #[test]
     fn the_model_refusal_names_every_path_that_reaches_it() {
         let message = ResidualsUnavailable::ModelUnavailable.message();
@@ -2503,6 +2506,51 @@ mod tests {
             message.contains("rebuilt or evaluated"),
             "an evaluation failure is not a build failure: {message}"
         );
+    }
+
+    /// `ModelUnavailable` is returned from two different places inside
+    /// `residuals_for_fit`, and they are different failures: the model
+    /// could not be BUILT on this grid, or it was built and could not be
+    /// EVALUATED. Both must arrive as the model refusal — routing either to
+    /// `MissingData` puts the old wrong-cause line back in front of the
+    /// user, who then goes looking for absent data that is all present.
+    #[test]
+    fn both_ways_the_model_fails_are_reported_as_the_model() {
+        let rd = u238_with_formalism(ResonanceFormalism::MLBW);
+        let nominal = line_grid();
+        let measured = vec![0.9; nominal.len()];
+        let result = energy_scale_result(0.0);
+
+        // Non-vacuity: these inputs otherwise produce residuals, so each
+        // refusal below is caused by the one thing that was changed.
+        residuals_for_fit(residuals_request(&result, &nominal, &measured, &rd))
+            .expect("the unmodified request is buildable and evaluable");
+
+        // Build failure: two resonance-data entries against one density
+        // index, which `TransmissionFitModel::new` rejects, so
+        // `build_overlay_model` has nothing to return.
+        let unbuildable = residuals_for_fit(ResidualsRequest {
+            resonance_data: vec![rd.clone(), rd.clone()],
+            density_mapping: (vec![0], vec![1.0]),
+            ..residuals_request(&result, &nominal, &measured, &rd)
+        })
+        .expect_err("a density mapping that does not cover the isotopes builds nothing");
+        assert_eq!(unbuildable, ResidualsUnavailable::ModelUnavailable);
+
+        // Evaluation failure: the plan gates at the fit's upper bound
+        // because the result fitted a temperature, so it builds — and then
+        // the model is asked to evaluate at a temperature no broadener
+        // accepts.
+        let free_temperature = SpectrumFitResult {
+            temperature_k: Some(293.6),
+            ..energy_scale_result(0.0)
+        };
+        let unevaluable = residuals_for_fit(ResidualsRequest {
+            temperature_k: -1.0,
+            ..residuals_request(&free_temperature, &nominal, &measured, &rd)
+        })
+        .expect_err("nothing can be broadened at a negative temperature");
+        assert_eq!(unevaluable, ResidualsUnavailable::ModelUnavailable);
     }
 
     /// A result that discloses no routes cannot be checked against the

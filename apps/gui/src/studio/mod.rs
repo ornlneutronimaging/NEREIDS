@@ -820,70 +820,38 @@ fn dock_residuals(ui: &mut egui::Ui, state: &mut AppState) {
         return;
     }
 
-    // Check if the cache is still valid.
-    let cache_valid = state.residuals_cache.as_ref().is_some_and(|c| {
-        c.fit_gen == state.fit_result_gen
-            && c.pixel == (py, px)
-            && c.resolution_enabled == state.resolution_enabled
-            && c.resolution_mode == state.resolution_mode
-            && c.flight_path_m == state.beamline.flight_path_m
-            && c.temperature_k == effective_temp
-    });
-
-    // Take the valid cache out and render from it, putting it back at the
-    // end, rather than rebuilding and then re-reading the field: re-reading
-    // needs a `None` arm that cannot be reached and would render an empty
-    // dock if it ever were.
-    let reusable = if cache_valid {
-        state.residuals_cache.take()
-    } else {
-        None
-    };
-    let cache = match reusable {
-        Some(cache) => cache,
-        None => match build_residuals_cache(state, &result, (py, px), effective_temp) {
-            Ok(cache) => cache,
-            Err(reason) => {
-                // Say which refusal fired: a degenerate energy scale, a
-                // window holding no measured bin and a wholly non-finite
-                // one are not "missing data", and the user can only act on
-                // the cause that actually happened.
-                state.residuals_cache = None;
-                ui.label(
-                    egui::RichText::new(reason.message())
-                        .small()
-                        .color(colors.fg3),
-                );
-                return;
-            }
-        },
+    // Take the cache out and hand it over, putting it back at the end,
+    // rather than rebuilding and then re-reading the field: re-reading needs
+    // a `None` arm that cannot be reached and would render an empty dock if
+    // it ever were.
+    let held = state.residuals_cache.take();
+    let cache = match residuals_to_render(state, &result, effective_temp, held) {
+        Ok(cache) => cache,
+        Err(reason) => {
+            // Say which refusal fired: a degenerate energy scale, a window
+            // holding no measured bin and a wholly non-finite one are not
+            // "missing data", and the user can only act on the cause that
+            // actually happened.
+            state.residuals_cache = None;
+            ui.label(
+                egui::RichText::new(reason.message())
+                    .small()
+                    .color(colors.fg3),
+            );
+            return;
+        }
     };
 
-    // The residual is measured minus the model the overlay draws, so a
-    // route disagreement — or a redraw with no disclosure to check itself
-    // against — makes these numbers as untrustworthy as the curve in the
-    // spectrum panel: say so here too rather than only there.
-    if let Some(message) = &cache.warning {
+    let view = dock_residual_view(&cache, state.uncertainty_is_estimated);
+    if let Some(message) = &view.warning {
         ui.colored_label(crate::theme::semantic::ORANGE, message);
     }
-
-    // Stats row
-    design::stat_row(
-        ui,
-        &[
-            (&format!("{:.2e}", cache.rms), "RMS"),
-            (&format!("{:.2e}", cache.max_abs), "Max |r|"),
-            (&cache.n_points.to_string(), "Points"),
-            (
-                &if state.uncertainty_is_estimated {
-                    format!("{:.4}~", cache.chi2_r)
-                } else {
-                    format!("{:.4}", cache.chi2_r)
-                },
-                "\u{03c7}\u{00b2}_r",
-            ),
-        ],
-    );
+    let stats: Vec<(&str, &str)> = view
+        .stats
+        .iter()
+        .map(|(value, label)| (value.as_str(), *label))
+        .collect();
+    design::stat_row(ui, &stats);
     ui.add_space(4.0);
 
     // Residual plot
@@ -907,6 +875,125 @@ fn dock_residuals(ui: &mut egui::Ui, state: &mut AppState) {
     state.residuals_cache = Some(cache);
 }
 
+/// Everything the residual dock shows out of a computed cache, before any
+/// of it is painted.
+///
+/// Separated from the painting so that WHAT is shown is testable while only
+/// the egui calls that show it are not. The warning in particular is not
+/// decoration: it says the residuals were taken against a model that is
+/// not, or is not known to be, the fitted one.
+#[derive(Debug, PartialEq, Eq)]
+struct DockResidualView {
+    /// The route warning carried on the cache, when there is one.
+    warning: Option<String>,
+    /// `(value, label)` for each statistic, already formatted.
+    stats: Vec<(String, &'static str)>,
+}
+
+/// What the dock renders for `cache`.
+///
+/// `uncertainty_is_estimated` appends a tilde to χ²_r: the fit's σ was
+/// estimated from the data rather than measured, so the number is a
+/// goodness-of-fit indicator and not a χ² against known errors, and the
+/// mark is the only thing that says so.
+fn dock_residual_view(
+    cache: &crate::state::CachedResiduals,
+    uncertainty_is_estimated: bool,
+) -> DockResidualView {
+    DockResidualView {
+        warning: cache.warning.clone(),
+        stats: vec![
+            (format!("{:.2e}", cache.rms), "RMS"),
+            (format!("{:.2e}", cache.max_abs), "Max |r|"),
+            (cache.n_points.to_string(), "Points"),
+            (
+                if uncertainty_is_estimated {
+                    format!("{:.4}~", cache.chi2_r)
+                } else {
+                    format!("{:.4}", cache.chi2_r)
+                },
+                "\u{03c7}\u{00b2}_r",
+            ),
+        ],
+    }
+}
+
+/// The residuals to render this frame: `held` when it still describes this
+/// state, otherwise a freshly built cache.
+///
+/// The reuse decision is the difference between showing this fit's
+/// residuals and showing the previous state's, so it lives here rather than
+/// in the dock where no test can reach it. `held` is only good while every
+/// input [`build_residuals_cache`] reads is unchanged, and the fit
+/// generation alone does not say that: the selected pixel, the resolution
+/// settings, the flight path and the temperature the model is evaluated at
+/// all move without it.
+///
+/// # Errors
+/// The [`design::ResidualsUnavailable`] that fired while rebuilding.
+fn residuals_to_render(
+    state: &AppState,
+    result: &nereids_pipeline::pipeline::SpectrumFitResult,
+    temperature_k: f64,
+    held: Option<crate::state::CachedResiduals>,
+) -> Result<crate::state::CachedResiduals, design::ResidualsUnavailable> {
+    if let Some(cache) = held
+        && cache.fit_gen == state.fit_result_gen
+        && Some(cache.pixel) == state.selected_pixel
+        && cache.resolution_enabled == state.resolution_enabled
+        && cache.resolution_mode == state.resolution_mode
+        && cache.flight_path_m == state.beamline.flight_path_m
+        && cache.temperature_k == temperature_k
+    {
+        return Ok(cache);
+    }
+    build_residuals_cache(state, result, temperature_k)
+}
+
+/// Which bins of the loaded grid the dock's residuals are formed on, and
+/// whose spectrum they are taken from.
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct ResidualWindow {
+    /// The fit window's index range into the LOADED energy grid.
+    range: std::ops::Range<usize>,
+    /// The cube pixel, in the cube's own `[t, row, column]` order.
+    pixel: (usize, usize),
+}
+
+/// Choose the window and the pixel the dock's residuals belong to.
+///
+/// These two are decisions about WHAT is computed, and they are the two a
+/// caller can get wrong without the compiler noticing, so they are made
+/// once here where a test can call them and then travel together into
+/// [`fit_window_measurement`]:
+///
+/// - the window is the fit's own slice of the loaded grid
+///   ([`crate::guided::analyze::fit_grid_range`]), not `0..range.end`,
+///   which pairs every residual with a different energy and a different
+///   measured value for any fit that does not start at bin 0;
+/// - the pixel keeps the cube's `(row, column)` order — the transposed
+///   pair reads a different pixel's spectrum and reports its residuals as
+///   this one's.
+///
+/// # Errors
+/// [`design::ResidualsUnavailable::MissingData`] when no energy grid is
+/// loaded or no pixel is selected;
+/// [`design::ResidualsUnavailable::ModelUnavailable`] when the fit-energy
+/// range selects nothing on this grid.
+fn residual_window(
+    state: &AppState,
+    resolution: Option<&nereids_physics::resolution::ResolutionFunction>,
+) -> Result<ResidualWindow, design::ResidualsUnavailable> {
+    use design::ResidualsUnavailable::{MissingData, ModelUnavailable};
+
+    let energies = state.energies.as_ref().ok_or(MissingData)?;
+    let pixel = state.selected_pixel.ok_or(MissingData)?;
+    let range =
+        crate::guided::analyze::fit_grid_range(energies, state.fit_energy_range, resolution)
+            .map_err(|_| ModelUnavailable)?;
+    Ok(ResidualWindow { range, pixel })
+}
+
 /// Gather what [`design::residuals_for_fit`] needs out of the application
 /// state, call it, and key the answer to the state it was computed from.
 ///
@@ -923,19 +1010,12 @@ fn dock_residuals(ui: &mut egui::Ui, state: &mut AppState) {
 fn build_residuals_cache(
     state: &AppState,
     result: &nereids_pipeline::pipeline::SpectrumFitResult,
-    pixel: (usize, usize),
     temperature_k: f64,
 ) -> Result<crate::state::CachedResiduals, design::ResidualsUnavailable> {
     use design::ResidualsUnavailable::{MissingData, ModelUnavailable};
 
     let energies = state.energies.as_ref().ok_or(MissingData)?;
     let norm = state.normalized.as_ref().ok_or(MissingData)?;
-    let (py, px) = pixel;
-
-    let shape = norm.transmission.shape();
-    if py >= shape[1] || px >= shape[2] {
-        return Err(MissingData);
-    }
 
     // Collect resonance data for all enabled isotopes and groups.
     let (resonance_data, density_indices, density_ratios) =
@@ -965,14 +1045,13 @@ fn build_residuals_cache(
     // Residuals are formed on the grid the fit ran on (the fit-energy
     // slice), so the model is gated the way the fit gated: a
     // free-temperature fit gated its routes at the fit's upper bound.
-    let range = crate::guided::analyze::fit_grid_range(
-        energies,
-        state.fit_energy_range,
-        instrument.as_ref().map(|i| &i.resolution),
-    )
-    .map_err(|_| ModelUnavailable)?;
-    let (fit_energies, measured) =
-        fit_window_measurement(energies, &norm.transmission, pixel, &range);
+    let window = residual_window(state, instrument.as_ref().map(|i| &i.resolution))?;
+    let (py, px) = window.pixel;
+    let shape = norm.transmission.shape();
+    if py >= shape[1] || px >= shape[2] {
+        return Err(MissingData);
+    }
+    let (fit_energies, measured) = fit_window_measurement(energies, &norm.transmission, &window);
 
     let design::DockResiduals { stats, warning } =
         design::residuals_for_fit(design::ResidualsRequest {
@@ -988,7 +1067,7 @@ fn build_residuals_cache(
 
     Ok(crate::state::CachedResiduals {
         fit_gen: state.fit_result_gen,
-        pixel,
+        pixel: window.pixel,
         resolution_enabled: state.resolution_enabled,
         resolution_mode: state.resolution_mode.clone(),
         flight_path_m: state.beamline.flight_path_m,
@@ -1020,16 +1099,19 @@ fn build_residuals_cache(
 ///   would subtract the fitted curve from the first bins of the
 ///   acquisition rather than from the fitted ones.
 ///
+/// The window and the pixel arrive together in a [`ResidualWindow`] built by
+/// [`residual_window`], so neither can be picked ad hoc at the call site.
+///
 /// The measurement stops where the cube's time-of-flight axis stops, so a
 /// loaded energy grid that outruns the cube yields a shorter — possibly
 /// empty — measurement instead of an out-of-bounds index.
 fn fit_window_measurement<'a>(
     energies: &'a [f64],
     transmission: &ndarray::Array3<f64>,
-    pixel: (usize, usize),
-    range: &std::ops::Range<usize>,
+    window: &ResidualWindow,
 ) -> (&'a [f64], Vec<f64>) {
-    let (py, px) = pixel;
+    let (py, px) = window.pixel;
+    let range = &window.range;
     let fit_energies = &energies[range.clone()];
     let n_measured = transmission.shape()[0]
         .saturating_sub(range.start)
@@ -1464,8 +1546,17 @@ fn no_results_placeholder(ui: &mut egui::Ui) {
 
 #[cfg(test)]
 mod tests {
-    use super::fit_window_measurement;
+    use super::{
+        AppState, DockResidualView, ResidualWindow, dock_residual_view, fit_window_measurement,
+        residual_window, residuals_to_render,
+    };
+    use crate::state::CachedResiduals;
+    use crate::widgets::design::ResidualsUnavailable;
     use ndarray::Array3;
+
+    fn window(range: std::ops::Range<usize>, pixel: (usize, usize)) -> ResidualWindow {
+        ResidualWindow { range, pixel }
+    }
 
     /// A cube whose value at `[t, y, x]` is `t*100 + y*10 + x` — a marker
     /// per (time bin, pixel) rather than a physical transmission, so reading
@@ -1485,13 +1576,13 @@ mod tests {
         let energies: Vec<f64> = (0..10).map(|i| 6.0 + i as f64 * 0.01).collect();
         let cube = marked_cube(10);
 
-        let (window, measured) = fit_window_measurement(&energies, &cube, (1, 0), &(3..7));
+        let (bins, measured) = fit_window_measurement(&energies, &cube, &window(3..7, (1, 0)));
 
-        assert_eq!(window, &energies[3..7]);
+        assert_eq!(bins, &energies[3..7]);
         assert_eq!(measured, vec![310.0, 410.0, 510.0, 610.0]);
         // Non-vacuity: this window is neither the whole grid nor the
         // cube's leading bins, so both mutations change what is returned.
-        assert!(window.len() < energies.len());
+        assert!(bins.len() < energies.len());
         assert_ne!(measured[0], cube[[0, 1, 0]]);
     }
 
@@ -1504,12 +1595,251 @@ mod tests {
         let energies: Vec<f64> = (0..14).map(|i| 6.0 + i as f64 * 0.01).collect();
         let cube = marked_cube(10);
 
-        let (window, measured) = fit_window_measurement(&energies, &cube, (1, 1), &(8..14));
-        assert_eq!(window.len(), 6);
+        let (bins, measured) = fit_window_measurement(&energies, &cube, &window(8..14, (1, 1)));
+        assert_eq!(bins.len(), 6);
         assert_eq!(measured, vec![811.0, 911.0]);
 
-        let (window, measured) = fit_window_measurement(&energies, &cube, (1, 1), &(10..14));
-        assert_eq!(window.len(), 4);
+        let (bins, measured) = fit_window_measurement(&energies, &cube, &window(10..14, (1, 1)));
+        assert_eq!(bins.len(), 4);
         assert!(measured.is_empty());
+    }
+
+    /// The window and the pixel are the two arguments the dock could hand
+    /// over wrong without the compiler noticing, so they are chosen here.
+    /// The fit-energy range picks a window that starts well inside the
+    /// grid, which is what tells the fit's own slice apart from `0..end`;
+    /// the pixel is `(row, column)` and must come back in that order, not
+    /// transposed.
+    #[test]
+    fn the_dock_takes_the_fit_window_and_the_selected_pixel() {
+        let energies: Vec<f64> = (0..100).map(|i| 6.0 + i as f64 * 0.01).collect();
+        let state = AppState {
+            energies: Some(energies.clone()),
+            fit_energy_range: Some((6.30, 6.60)),
+            selected_pixel: Some((7, 3)),
+            ..AppState::default()
+        };
+
+        let chosen = residual_window(&state, None).expect("a loaded grid and a selected pixel");
+        assert!(
+            chosen.range.start > 0 && chosen.range.end < energies.len(),
+            "a window that starts at bin 0 cannot tell the fit slice from 0..end: {chosen:?}"
+        );
+        assert!(energies[chosen.range.start] >= 6.30);
+        assert!(energies[chosen.range.end - 1] <= 6.60);
+        assert_eq!(
+            chosen.pixel,
+            (7, 3),
+            "the cube is indexed [t, row, column]; the transposed pair is another pixel"
+        );
+
+        // With no fit-energy range the window is the whole grid — the one
+        // case where `0..end` happens to be right.
+        let unrestricted = AppState {
+            fit_energy_range: None,
+            ..AppState {
+                energies: Some(energies.clone()),
+                selected_pixel: Some((7, 3)),
+                ..AppState::default()
+            }
+        };
+        assert_eq!(
+            residual_window(&unrestricted, None),
+            Ok(window(0..energies.len(), (7, 3)))
+        );
+
+        // The prerequisites are named apart: nothing loaded and nothing
+        // selected are both "missing data", a range that selects nothing on
+        // this grid is a model failure.
+        let no_grid = AppState {
+            selected_pixel: Some((7, 3)),
+            ..AppState::default()
+        };
+        assert_eq!(
+            residual_window(&no_grid, None),
+            Err(ResidualsUnavailable::MissingData)
+        );
+        let no_pixel = AppState {
+            energies: Some(energies.clone()),
+            ..AppState::default()
+        };
+        assert_eq!(
+            residual_window(&no_pixel, None),
+            Err(ResidualsUnavailable::MissingData)
+        );
+        let empty_range = AppState {
+            fit_energy_range: Some((100.0, 200.0)),
+            ..state
+        };
+        assert_eq!(
+            residual_window(&empty_range, None),
+            Err(ResidualsUnavailable::ModelUnavailable)
+        );
+    }
+
+    /// A cache whose every key still matches is handed straight back; one
+    /// whose key has moved is not, whatever else is true of it. The state
+    /// here cannot build anything (no energy grid), so a rebuild is visible
+    /// as the refusal — which is exactly the difference between showing
+    /// this fit's residuals and showing the previous state's.
+    #[test]
+    fn a_cache_is_reused_only_while_it_describes_this_state() {
+        let cache = CachedResiduals {
+            fit_gen: 4,
+            pixel: (2, 5),
+            resolution_enabled: false,
+            resolution_mode: crate::state::ResolutionMode::Gaussian {
+                delta_t_us: 0.0,
+                delta_l_m: 0.0,
+            },
+            flight_path_m: 25.0,
+            temperature_k: 293.6,
+            chi2_r: 1.0,
+            // A value nothing could recompute, so a returned cache is
+            // provably the one that went in.
+            residuals: vec![(6.0, 0.25)],
+            rms: 12345.0,
+            max_abs: 12345.0,
+            n_points: 1,
+            warning: None,
+        };
+        // The state the cache was computed from. `energies: None` (the
+        // default) means nothing can be rebuilt, so a rebuild shows up as
+        // the refusal and reuse shows up as the sentinel RMS.
+        let matching = || {
+            let mut state = AppState {
+                fit_result_gen: 4,
+                selected_pixel: Some((2, 5)),
+                resolution_enabled: false,
+                resolution_mode: cache.resolution_mode.clone(),
+                ..AppState::default()
+            };
+            state.beamline.flight_path_m = 25.0;
+            state
+        };
+        let result = fit_result_shell();
+
+        let reused = residuals_to_render(&matching(), &result, 293.6, Some(cache.clone()))
+            .expect("the key still describes this state");
+        assert_eq!(reused.rms, 12345.0, "the held cache is what came back");
+
+        // Each key field ON ITS OWN forces the rebuild, which this state
+        // cannot do — so the stale cache is refused rather than shown.
+        let refused = |state: &AppState, temperature_k: f64| {
+            residuals_to_render(state, &result, temperature_k, Some(cache.clone())).unwrap_err()
+        };
+        assert_eq!(
+            refused(&matching(), 500.0),
+            ResidualsUnavailable::MissingData,
+            "the temperature the model is evaluated at moved"
+        );
+
+        let mut moved = matching();
+        moved.selected_pixel = Some((5, 2));
+        assert_eq!(refused(&moved, 293.6), ResidualsUnavailable::MissingData);
+
+        let mut moved = matching();
+        moved.fit_result_gen = 5;
+        assert_eq!(refused(&moved, 293.6), ResidualsUnavailable::MissingData);
+
+        let mut moved = matching();
+        moved.resolution_enabled = true;
+        assert_eq!(refused(&moved, 293.6), ResidualsUnavailable::MissingData);
+
+        let mut moved = matching();
+        moved.beamline.flight_path_m = 30.0;
+        assert_eq!(refused(&moved, 293.6), ResidualsUnavailable::MissingData);
+
+        let mut moved = matching();
+        moved.resolution_mode = crate::state::ResolutionMode::Gaussian {
+            delta_t_us: 1.0,
+            delta_l_m: 0.0,
+        };
+        assert_eq!(refused(&moved, 293.6), ResidualsUnavailable::MissingData);
+
+        // And with nothing held there is nothing to reuse.
+        assert_eq!(
+            residuals_to_render(&matching(), &result, 293.6, None).unwrap_err(),
+            ResidualsUnavailable::MissingData
+        );
+    }
+
+    /// What the dock puts on screen out of a cache: the four statistics as
+    /// they are formatted and labelled, and the route warning — which is
+    /// not decoration, it says these residuals were taken against a model
+    /// that is not, or is not known to be, the fitted one. The tilde on
+    /// χ²_r is the only mark saying the σ behind it was estimated from the
+    /// data rather than measured.
+    ///
+    /// The egui calls that paint this view are not covered: no UI harness
+    /// exists in this crate, so deleting a paint call still compiles and
+    /// still passes.
+    #[test]
+    fn the_dock_shows_the_statistics_and_the_warning_it_was_given() {
+        let cache = CachedResiduals {
+            fit_gen: 0,
+            pixel: (0, 0),
+            resolution_enabled: false,
+            resolution_mode: crate::state::ResolutionMode::Gaussian {
+                delta_t_us: 0.0,
+                delta_l_m: 0.0,
+            },
+            flight_path_m: 25.0,
+            temperature_k: 293.6,
+            chi2_r: 1.25,
+            residuals: vec![(6.0, 0.01), (6.1, -0.02)],
+            rms: 0.0158,
+            max_abs: 0.02,
+            n_points: 2,
+            warning: Some("Fit overlay is unchecked".to_string()),
+        };
+
+        let view = dock_residual_view(&cache, false);
+        assert_eq!(
+            view,
+            DockResidualView {
+                warning: Some("Fit overlay is unchecked".to_string()),
+                stats: vec![
+                    ("1.58e-2".to_string(), "RMS"),
+                    ("2.00e-2".to_string(), "Max |r|"),
+                    ("2".to_string(), "Points"),
+                    ("1.2500".to_string(), "\u{03c7}\u{00b2}_r"),
+                ],
+            }
+        );
+
+        let estimated = dock_residual_view(&cache, true);
+        assert_eq!(estimated.stats[3].0, "1.2500~");
+
+        let silent = CachedResiduals {
+            warning: None,
+            ..cache
+        };
+        assert_eq!(dock_residual_view(&silent, false).warning, None);
+    }
+
+    /// A converged single-pixel result with nothing composed on top.
+    fn fit_result_shell() -> nereids_pipeline::pipeline::SpectrumFitResult {
+        nereids_pipeline::pipeline::SpectrumFitResult {
+            densities: Vec::new(),
+            uncertainties: None,
+            reduced_chi_squared: 1.0,
+            converged: true,
+            iterations: 1,
+            temperature_k: None,
+            temperature_k_unc: None,
+            anorm: 1.0,
+            background: [0.0; 3],
+            back_d: None,
+            back_f: None,
+            t0_us: None,
+            l_scale: None,
+            energy_scale_flight_path_m: None,
+            deviance_per_dof: None,
+            baseline: None,
+            baseline_e_ref_ev: None,
+            warnings: Vec::new(),
+            doppler_routes: None,
+        }
     }
 }
