@@ -831,22 +831,26 @@ fn dock_residuals(ui: &mut egui::Ui, state: &mut AppState) {
     });
 
     if !cache_valid {
-        let new_cache = build_residuals_cache(state, &result, (py, px), effective_temp);
-        state.residuals_cache = new_cache;
+        let built = build_residuals_cache(state, &result, (py, px), effective_temp);
+        match built {
+            Ok(cache) => state.residuals_cache = Some(cache),
+            Err(reason) => {
+                // Say which refusal fired: a degenerate energy scale and a
+                // wholly non-finite window are not "missing data", and the
+                // user can only act on the cause that actually happened.
+                state.residuals_cache = None;
+                ui.label(
+                    egui::RichText::new(reason.message())
+                        .small()
+                        .color(colors.fg3),
+                );
+                return;
+            }
+        }
     }
 
-    let cache = match &state.residuals_cache {
-        Some(c) => c,
-        None => {
-            ui.label(
-                egui::RichText::new(
-                    "Could not compute residuals (missing data or isotope mismatch).",
-                )
-                .small()
-                .color(colors.fg3),
-            );
-            return;
-        }
+    let Some(cache) = state.residuals_cache.as_ref() else {
+        return;
     };
 
     // The residual is measured minus the model the overlay draws, so a
@@ -895,44 +899,48 @@ fn dock_residuals(ui: &mut egui::Ui, state: &mut AppState) {
         });
 }
 
-/// Build the residuals cache by constructing the overlay model, evaluating
-/// the fitted forward model, and computing residuals against measured data.
+/// Gather what [`design::residuals_for_fit`] needs out of the application
+/// state, call it, and key the answer to the state it was computed from.
 ///
-/// `result` is the fit being redrawn, and the residual is measured minus
-/// the SAME composed curve the spectrum panel plots — the physics on the
-/// fitted energy scale, then Anorm, the SAMMY background and the
-/// multiplicative baseline (see `design::compose_fitted_curve`). Residuals
-/// against bare Beer-Lambert transmission would carry every one of those
-/// terms as fake signal, in the plot and in the displayed RMS / Max|r|.
+/// Everything physical — which grid the physics is evaluated on, what curve
+/// the measurement is taken against, and which refusals are possible —
+/// lives in `design::residuals_for_fit`, where it is tested directly. This
+/// function is the state plumbing around that one call: the loaded grid and
+/// cube, the fit window, the enabled isotopes, the resolution settings, and
+/// the cache key.
 ///
-/// Returns `None` if any prerequisite is missing (no energies, etc.).
+/// # Errors
+/// The [`design::ResidualsUnavailable`] that fired, so the dock can name
+/// the cause instead of guessing one.
 fn build_residuals_cache(
     state: &AppState,
     result: &nereids_pipeline::pipeline::SpectrumFitResult,
     pixel: (usize, usize),
     temperature_k: f64,
-) -> Option<crate::state::CachedResiduals> {
-    let energies = state.energies.as_ref()?;
-    let norm = state.normalized.as_ref()?;
+) -> Result<crate::state::CachedResiduals, design::ResidualsUnavailable> {
+    use design::ResidualsUnavailable::{MissingData, ModelUnavailable};
+
+    let energies = state.energies.as_ref().ok_or(MissingData)?;
+    let norm = state.normalized.as_ref().ok_or(MissingData)?;
     let (py, px) = pixel;
 
     let shape = norm.transmission.shape();
     let n_tof = shape[0];
     if py >= shape[1] || px >= shape[2] {
-        return None;
+        return Err(MissingData);
     }
 
     // Collect resonance data for all enabled isotopes and groups.
     let (resonance_data, density_indices, density_ratios) =
         design::collect_all_resonance_data_with_mapping(state);
     if resonance_data.is_empty() {
-        return None;
+        return Err(MissingData);
     }
 
     // Guard: density parameter count must match the mapping's expected count.
     let n_density_params = density_indices.iter().max().map_or(0, |&m| m + 1);
     if result.densities.len() != n_density_params {
-        return None; // stale result with different isotope config
+        return Err(MissingData); // stale result with different isotope config
     }
 
     // Build instrument params from current resolution settings.
@@ -943,7 +951,7 @@ fn build_residuals_cache(
             &state.resolution_mode,
             state.beamline.flight_path_m,
         )
-        .ok()?
+        .map_err(|_| ModelUnavailable)?
         .map(|resolution| std::sync::Arc::new(InstrumentParams { resolution }))
     };
 
@@ -955,48 +963,26 @@ fn build_residuals_cache(
         state.fit_energy_range,
         instrument.as_ref().map(|i| &i.resolution),
     )
-    .ok()?;
+    .map_err(|_| ModelUnavailable)?;
     let fit_energies = &energies[range.clone()];
-    // The physics is evaluated where the fit evaluated it — the nominal
-    // slice through the fitted energy scale — while the residual's x-axis
-    // and the composed background / baseline stay nominal.
-    let physics_energies = match design::fitted_physics_energies(result, fit_energies) {
-        Ok(grid) => grid,
-        Err(message) => {
-            tracing::warn!("{message}");
-            return None;
-        }
-    };
-    let design::OverlayModel {
-        model,
-        route_mismatch,
-    } = design::build_overlay_model(
-        physics_energies,
-        resonance_data,
-        temperature_k,
-        instrument,
-        (density_indices, density_ratios),
-        result.temperature_k.is_some(),
-        result.doppler_routes.as_deref(),
-    )?;
-
-    use nereids_fitting::lm::FitModel;
-    let transmission = model.evaluate(&result.densities).ok()?;
     let n_measured = n_tof.saturating_sub(range.start).min(fit_energies.len());
     let measured: Vec<f64> = (0..n_measured)
         .map(|i| norm.transmission[[range.start + i, py, px]])
         .collect();
-    let design::FitResiduals {
-        residuals,
-        rms,
-        max_abs,
-    } = design::fit_residuals(result, fit_energies, &transmission, &measured);
-    if residuals.is_empty() {
-        return None;
-    }
-    let n_points = residuals.len();
 
-    Some(crate::state::CachedResiduals {
+    let design::DockResiduals { stats, warning } =
+        design::residuals_for_fit(design::ResidualsRequest {
+            result,
+            nominal_energies: fit_energies,
+            measured: &measured,
+            resonance_data,
+            density_mapping: (density_indices, density_ratios),
+            temperature_k,
+            instrument,
+        })?;
+    let n_points = stats.residuals.len();
+
+    Ok(crate::state::CachedResiduals {
         fit_gen: state.fit_result_gen,
         pixel,
         resolution_enabled: state.resolution_enabled,
@@ -1004,11 +990,11 @@ fn build_residuals_cache(
         flight_path_m: state.beamline.flight_path_m,
         temperature_k,
         chi2_r: result.reduced_chi_squared,
-        residuals,
-        rms,
-        max_abs,
+        residuals: stats.residuals,
+        rms: stats.rms,
+        max_abs: stats.max_abs,
         n_points,
-        warning: route_mismatch,
+        warning,
     })
 }
 
@@ -1339,14 +1325,7 @@ fn isotopes_card(ui: &mut egui::Ui, state: &mut AppState) {
                 );
                 if state.isotope_entries[i].enabled != prev_enabled {
                     state.mark_dirty(GuidedStep::Analyze);
-                    // Enabling or disabling an isotope changes the model the
-                    // result was fitted with, but not `fit_result_gen` — so
-                    // the residual cache would still test as valid and the
-                    // dock would go on showing residuals against the
-                    // previous isotope set. Drop both, as the group toggle
-                    // below does.
-                    state.pixel_fit_result = None;
-                    state.residuals_cache = None;
+                    state.clear_pixel_fit_for_isotope_change();
                 }
 
                 // Colored dot + symbol
@@ -1389,8 +1368,7 @@ fn isotopes_card(ui: &mut egui::Ui, state: &mut AppState) {
                 );
                 if state.isotope_groups[i].enabled != prev_enabled {
                     state.mark_dirty(GuidedStep::Analyze);
-                    state.pixel_fit_result = None;
-                    state.residuals_cache = None;
+                    state.clear_pixel_fit_for_isotope_change();
                 }
 
                 // Colored dot + name

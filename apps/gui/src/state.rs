@@ -1385,6 +1385,18 @@ impl AppState {
         self.show_analyze_fit_info = false;
     }
 
+    /// Drop the single-spectrum fit output because the ENABLED ISOTOPE SET
+    /// changed.
+    ///
+    /// Enabling or disabling an isotope or a group changes the model a
+    /// stored result was fitted with, but not `fit_result_gen` — which the
+    /// residual cache is keyed on. Without this the cache still tests as
+    /// valid and the dock goes on subtracting a curve built from the
+    /// previous isotope set, reporting its RMS and Max|r| as this one's.
+    pub fn clear_pixel_fit_for_isotope_change(&mut self) {
+        self.clear_pixel_fit_output();
+    }
+
     /// Clear the cached map before starting a new spatial fit.  This prevents
     /// Results and export actions from reusing an older map while the new run
     /// is pending or after it fails.  An in-flight spatial worker is stopped
@@ -1810,6 +1822,71 @@ impl Default for AppState {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Enabling or disabling an isotope changes the model a stored fit was
+    /// performed with, and the residual cache is keyed on `fit_result_gen`,
+    /// which the toggle does NOT bump. So the toggle has to drop the result
+    /// and the cache itself; without that the dock goes on subtracting a
+    /// curve built from the previous isotope set and reporting its RMS and
+    /// Max|r| as this one's.
+    #[test]
+    fn an_isotope_toggle_drops_the_fit_it_invalidates() {
+        let mut state = AppState {
+            pixel_fit_result: Some(SpectrumFitResult {
+                densities: vec![0.001],
+                uncertainties: None,
+                reduced_chi_squared: 1.0,
+                converged: true,
+                iterations: 3,
+                temperature_k: None,
+                temperature_k_unc: None,
+                anorm: 1.0,
+                background: [0.0; 3],
+                back_d: None,
+                back_f: None,
+                t0_us: None,
+                l_scale: None,
+                energy_scale_flight_path_m: None,
+                deviance_per_dof: None,
+                baseline: None,
+                baseline_e_ref_ev: None,
+                warnings: Vec::new(),
+                doppler_routes: None,
+            }),
+            residuals_cache: Some(CachedResiduals {
+                fit_gen: 0,
+                pixel: (1, 1),
+                resolution_enabled: false,
+                resolution_mode: ResolutionMode::Gaussian {
+                    delta_t_us: 0.0,
+                    delta_l_m: 0.0,
+                },
+                flight_path_m: 25.0,
+                temperature_k: 293.6,
+                chi2_r: 1.0,
+                residuals: vec![(6.0, 0.01)],
+                rms: 0.01,
+                max_abs: 0.01,
+                n_points: 1,
+                warning: None,
+            }),
+            ..AppState::default()
+        };
+
+        state.clear_pixel_fit_for_isotope_change();
+
+        assert!(
+            state.pixel_fit_result.is_none(),
+            "the result was fitted with the previous isotope set"
+        );
+        assert!(
+            state.residuals_cache.is_none(),
+            "residuals against the previous isotope set are not this one's"
+        );
+        // The cache key cannot be what protects it: the toggle leaves the
+        // generation counter exactly where the stale cache's key is.
+        assert_eq!(state.fit_result_gen, 0);
+    }
 
     /// The #646 accumulation pin: re-detection REPLACES the previous
     /// detection instead of unioning with it — only the file-declared

@@ -1085,9 +1085,12 @@ pub(crate) struct FitLineParams<'a> {
 /// Returns the nominal grid unchanged when the energy scale was not fitted.
 ///
 /// # Errors
-/// A user-facing line when the stored calibration does not map this grid to
-/// physical energies. The fitted curve cannot be reproduced then, and
-/// saying so is better than drawing the un-calibrated one. Every rejection
+/// The reason, as a user-facing clause, when the stored calibration does
+/// not map this grid to physical energies — each caller prefixes what it
+/// is therefore not showing, because the consequence differs (no curve in
+/// the spectrum panel, no residuals in the dock). The fitted curve cannot
+/// be reproduced then, and saying so is better than drawing the
+/// un-calibrated one. Every rejection
 /// of `corrected_energy_grid` reaches the caller this way, not only the
 /// degenerate `t0` at or past the grid's shortest flight time: a non-finite
 /// `t0`; an `l_scale` that is not finite and positive; a flight path that
@@ -1101,7 +1104,7 @@ pub(crate) fn fitted_physics_energies(
         None => Ok(nominal.to_vec()),
         Some(Ok(corrected)) => Ok(corrected),
         Some(Err(e)) => Err(format!(
-            "Fit curve hidden: the fitted energy scale (t0 = {t0} \u{b5}s, L_scale = {l_scale}) \
+            "the fitted energy scale (t0 = {t0} \u{b5}s, L_scale = {l_scale}) \
              does not map this grid to physical energies ({e})",
             t0 = result.t0_us.unwrap_or(f64::NAN),
             l_scale = result.l_scale.unwrap_or(f64::NAN),
@@ -1180,6 +1183,7 @@ pub(crate) fn compose_fitted_curve(
 
 /// What the residual dock shows for one fit: the per-bin residuals and
 /// their summary statistics.
+#[derive(Debug)]
 pub(crate) struct FitResiduals {
     /// `(nominal energy eV, measured − fitted)` for every finite residual.
     pub residuals: Vec<(f64, f64)>,
@@ -1221,6 +1225,146 @@ pub(crate) fn fit_residuals(
         rms,
         max_abs,
     }
+}
+
+/// Why the residual dock has nothing to show for the selected fit.
+///
+/// A typed cause rather than a bare `None`: the dock used to report
+/// "missing data or isotope mismatch" for every refusal, including two
+/// that are neither, and a user cannot act on a cause that is not the
+/// real one.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) enum ResidualsUnavailable {
+    /// A prerequisite is absent: no loaded or normalised data, a pixel
+    /// outside the cube, no enabled isotope carrying resonance data, or a
+    /// stored result whose density count belongs to a different isotope
+    /// set.
+    MissingData,
+    /// The stored energy-scale calibration does not map this grid to
+    /// physical energies, so the curve to subtract cannot be reproduced.
+    /// Carries the reason from [`fitted_physics_energies`].
+    EnergyScale(String),
+    /// The forward model could not be rebuilt on this grid — an invalid
+    /// resolution setting, a fit-energy range that selects nothing, or a
+    /// Doppler plan that refuses these inputs.
+    ModelUnavailable,
+    /// Every bin's residual was non-finite, so there is nothing to plot or
+    /// summarise. Distinct from `MissingData`: the model was rebuilt and
+    /// the measurement was read, and one of them is not a number.
+    NoFiniteResiduals,
+}
+
+impl ResidualsUnavailable {
+    /// The line the dock shows, naming the cause that actually fired.
+    pub(crate) fn message(&self) -> String {
+        match self {
+            Self::MissingData => {
+                "Could not compute residuals (missing data or isotope mismatch).".to_string()
+            }
+            Self::EnergyScale(reason) => {
+                format!(
+                    "Residuals hidden: {reason}, so the fitted curve to subtract cannot be reproduced."
+                )
+            }
+            Self::ModelUnavailable => "Could not compute residuals: the fitted forward model \
+                 could not be rebuilt here (check the resolution settings and the fit energy \
+                 range)."
+                .to_string(),
+            Self::NoFiniteResiduals => "No finite residuals on the fit window: every bin is \
+                 NaN or infinite in the measurement or in the fitted curve."
+                .to_string(),
+        }
+    }
+}
+
+/// What the residual dock caches for one fit.
+#[derive(Debug)]
+pub(crate) struct DockResiduals {
+    /// The per-bin residuals and their summary statistics.
+    pub stats: FitResiduals,
+    /// The overlay's route warning, carried through so the dock can say
+    /// that these residuals were taken against a model that is not (or is
+    /// not known to be) the fitted one — see
+    /// [`OverlayModel::route_mismatch`].
+    pub warning: Option<String>,
+}
+
+/// Everything [`residuals_for_fit`] needs, gathered by the caller.
+pub(crate) struct ResidualsRequest<'a> {
+    /// The fit being redrawn — its densities, its composition terms, its
+    /// energy scale and its route disclosure.
+    pub result: &'a nereids_pipeline::pipeline::SpectrumFitResult,
+    /// The NOMINAL energies of the fit window (`analyze::fit_grid_range`'s
+    /// slice of the loaded grid), which is also the residual plot's x-axis.
+    pub nominal_energies: &'a [f64],
+    /// The measured values on those same bins, index-aligned.
+    pub measured: &'a [f64],
+    /// Resonance data for every enabled isotope and group member.
+    pub resonance_data: Vec<nereids_endf::resonance::ResonanceData>,
+    /// `(density_indices, density_ratios)` mapping each entry of
+    /// `resonance_data` to its density parameter.
+    pub density_mapping: (Vec<usize>, Vec<f64>),
+    /// The temperature the model is evaluated at (the fitted one when the
+    /// fit fitted it).
+    pub temperature_k: f64,
+    /// The instrument response the fit ran with, if any.
+    pub instrument: Option<Arc<nereids_physics::transmission::InstrumentParams>>,
+}
+
+/// The residual dock's whole computation: rebuild the fit's forward model,
+/// evaluate it, and take the measurement against it.
+///
+/// The physics is evaluated on the grid the fit evaluated it on — the
+/// nominal window mapped through the fitted energy scale (see
+/// [`fitted_physics_energies`]) — and the residual is taken against the
+/// full composed curve the spectrum overlay draws (see
+/// [`compose_fitted_curve`]), not against bare Beer-Lambert transmission,
+/// which would carry Anorm, the SAMMY background and the multiplicative
+/// baseline into the plot and into the reported RMS and Max|r| as fake
+/// signal.
+///
+/// Pure: everything it reads is in `req`, so what the dock shows is
+/// testable without a UI.
+///
+/// # Errors
+/// A [`ResidualsUnavailable`] naming the cause, never a bare "something is
+/// missing".
+pub(crate) fn residuals_for_fit(
+    req: ResidualsRequest<'_>,
+) -> Result<DockResiduals, ResidualsUnavailable> {
+    let physics_energies = fitted_physics_energies(req.result, req.nominal_energies)
+        .map_err(ResidualsUnavailable::EnergyScale)?;
+    let OverlayModel {
+        model,
+        route_mismatch,
+    } = build_overlay_model(
+        physics_energies,
+        req.resonance_data,
+        req.temperature_k,
+        req.instrument,
+        req.density_mapping,
+        req.result.temperature_k.is_some(),
+        req.result.doppler_routes.as_deref(),
+    )
+    .ok_or(ResidualsUnavailable::ModelUnavailable)?;
+
+    use nereids_fitting::lm::FitModel;
+    let transmission = model
+        .evaluate(&req.result.densities)
+        .map_err(|_| ResidualsUnavailable::ModelUnavailable)?;
+    let stats = fit_residuals(
+        req.result,
+        req.nominal_energies,
+        &transmission,
+        req.measured,
+    );
+    if stats.residuals.is_empty() {
+        return Err(ResidualsUnavailable::NoFiniteResiduals);
+    }
+    Ok(DockResiduals {
+        stats,
+        warning: route_mismatch,
+    })
 }
 
 /// The model that redraws a fit result, and whether its Doppler routes are
@@ -1426,7 +1570,8 @@ pub(crate) fn build_fit_line(p: &FitLineParams<'_>) -> Option<FitLine> {
     // (see `compose_fitted_curve`).
     let physics_energies = match fitted_physics_energies(p.result, p.energies) {
         Ok(grid) => grid,
-        Err(message) => {
+        Err(reason) => {
+            let message = format!("Fit curve hidden: {reason}");
             tracing::warn!("{message}");
             return Some(FitLine {
                 line: None,
@@ -1522,8 +1667,9 @@ pub(crate) fn collect_all_resonance_data_with_mapping(
 #[cfg(test)]
 mod tests {
     use super::{
-        FitLineParams, build_fit_line, build_overlay_model, compose_fitted_curve,
-        counts_resolution_overlay_unsupported, fit_residuals, fitted_physics_energies,
+        FitLineParams, ResidualsRequest, ResidualsUnavailable, build_fit_line, build_overlay_model,
+        compose_fitted_curve, counts_resolution_overlay_unsupported, fit_residuals,
+        fitted_physics_energies, residuals_for_fit,
     };
     use egui_plot::{PlotGeometry, PlotItem};
     use nereids_endf::resonance::ResonanceFormalism;
@@ -1571,6 +1717,110 @@ mod tests {
                 },
             }]),
         }
+    }
+
+    /// [`energy_scale_result`] with every composition term non-trivial:
+    /// `Anorm != 1`, all three SAMMY background coefficients, the
+    /// BackD/BackF exponential tail, and a multiplicative baseline whose
+    /// reference energy sits well below the grid, so `ln(E/E_ref)` is
+    /// nowhere near zero and its SIGN is load-bearing.
+    fn fully_composed_result(t0_us: f64) -> SpectrumFitResult {
+        SpectrumFitResult {
+            anorm: 0.97,
+            background: [0.02, 0.01, 0.003],
+            back_d: Some(0.05),
+            back_f: Some(1.5),
+            baseline: Some([1.01, 0.05, 0.004]),
+            baseline_e_ref_ev: Some(2.0),
+            ..energy_scale_result(t0_us)
+        }
+    }
+
+    /// The FITTING CRATE's own composition of `result`'s terms over the
+    /// physics evaluated on `physics_grid`: the exact wrapper stack
+    /// `fit_transmission_lm` builds (inner physics →
+    /// `NormalizedTransmissionModel` → `MultiplicativeBaselineModel`, the
+    /// two wrappers wired to the NOMINAL grid, the parameter vector laid
+    /// out density → background → baseline as the pipeline appends it),
+    /// evaluated through the public `FitModel` API.
+    ///
+    /// This is the oracle for [`compose_fitted_curve`], which is a
+    /// hand-copy of that stack's algebra living in the GUI. An expectation
+    /// built by calling `compose_fitted_curve` itself would agree with
+    /// whatever formula it happened to contain.
+    fn fitting_crate_composition(
+        result: &SpectrumFitResult,
+        rd: &nereids_endf::resonance::ResonanceData,
+        physics_grid: Vec<f64>,
+        nominal: &[f64],
+    ) -> Vec<f64> {
+        use nereids_fitting::transmission_model::{
+            MultiplicativeBaselineModel, NormalizedTransmissionModel,
+        };
+        let baseline = result.baseline.expect("the oracle composes a baseline");
+        let params = vec![
+            result.densities[0],
+            result.anorm,
+            result.background[0],
+            result.background[1],
+            result.background[2],
+            result.back_d.expect("the oracle composes the tail"),
+            result.back_f.expect("the oracle composes the tail"),
+            baseline[0],
+            baseline[1],
+            baseline[2],
+        ];
+        let physics = TransmissionFitModel::new(
+            physics_grid,
+            vec![rd.clone()],
+            293.6,
+            None,
+            (vec![0], vec![1.0]),
+            None,
+            None,
+        )
+        .unwrap();
+        let with_background =
+            NormalizedTransmissionModel::new_with_exponential(physics, nominal, 1, 2, 3, 4, 5, 6);
+        MultiplicativeBaselineModel::new(
+            with_background,
+            nominal,
+            result
+                .baseline_e_ref_ev
+                .expect("the oracle composes a baseline"),
+            7,
+            8,
+            9,
+        )
+        .evaluate(&params)
+        .unwrap()
+    }
+
+    /// A residual-dock request for one isotope at 293.6 K with no
+    /// instrument response.
+    fn residuals_request<'a>(
+        result: &'a SpectrumFitResult,
+        nominal: &'a [f64],
+        measured: &'a [f64],
+        rd: &nereids_endf::resonance::ResonanceData,
+    ) -> ResidualsRequest<'a> {
+        ResidualsRequest {
+            result,
+            nominal_energies: nominal,
+            measured,
+            resonance_data: vec![rd.clone()],
+            density_mapping: (vec![0], vec![1.0]),
+            temperature_k: 293.6,
+            instrument: None,
+        }
+    }
+
+    /// The largest absolute gap between two curves.
+    fn largest_gap(a: &[f64], b: &[f64]) -> f64 {
+        a.iter()
+            .zip(b)
+            .map(|(x, y)| (x - y).abs())
+            .fold(0.0_f64, f64::max)
     }
 
     /// A grid across the U-238 6.674 eV line.
@@ -1800,11 +2050,7 @@ mod tests {
                 .expect("and is not degenerate"),
         );
         let uncalibrated = curve_on(&rd, nominal.clone());
-        let displacement = calibrated
-            .iter()
-            .zip(&uncalibrated)
-            .map(|(a, b)| (a - b).abs())
-            .fold(0.0_f64, f64::max);
+        let displacement = largest_gap(&calibrated, &uncalibrated);
         assert!(
             displacement > 0.05,
             "the calibrated and nominal grids must give visibly different curves for this \
@@ -1835,11 +2081,7 @@ mod tests {
         // The identity energy scale isolates the composition.
         let transmission = curve_on(&rd, nominal.clone());
         let composed = compose_fitted_curve(&result, &nominal, &transmission);
-        let gap = composed
-            .iter()
-            .zip(&transmission)
-            .map(|(a, b)| (a - b).abs())
-            .fold(0.0_f64, f64::max);
+        let gap = largest_gap(&composed, &transmission);
         assert!(
             gap > 0.05,
             "the composition must differ from bare transmission for this test to mean \
@@ -1882,33 +2124,151 @@ mod tests {
         assert_eq!(fitted_physics_energies(&result, &nominal).unwrap(), nominal);
     }
 
+    /// The GUI's composed curve is a hand-copy of the wrapper stack the
+    /// fitter itself builds — `NormalizedTransmissionModel` inside
+    /// `MultiplicativeBaselineModel` — and a hand-copy is worth only the
+    /// check on it. The check is that stack: same result, same grids, same
+    /// values, computed by the fitting crate rather than by the function
+    /// under test.
+    #[test]
+    fn the_composed_curve_is_the_one_the_fitter_composes() {
+        let rd = u238_with_formalism(ResonanceFormalism::MLBW);
+        let nominal = line_grid();
+        // The identity energy scale isolates the composition: the physics
+        // is evaluated on the nominal grid on both sides.
+        let result = fully_composed_result(0.0);
+        let transmission = curve_on(&rd, nominal.clone());
+        let oracle = fitting_crate_composition(&result, &rd, nominal.clone(), &nominal);
+
+        // Non-vacuity: each term must move the ORACLE, or the comparison
+        // would also pass on an implementation that dropped that term.
+        let without = |changed: SpectrumFitResult| {
+            largest_gap(
+                &fitting_crate_composition(&changed, &rd, nominal.clone(), &nominal),
+                &oracle,
+            )
+        };
+        let bg = result.background;
+        let baseline = result.baseline.unwrap();
+        for (term, gap) in [
+            (
+                "Anorm",
+                without(SpectrumFitResult {
+                    anorm: 1.0,
+                    ..result.clone()
+                }),
+            ),
+            (
+                "BackA",
+                without(SpectrumFitResult {
+                    background: [0.0, bg[1], bg[2]],
+                    ..result.clone()
+                }),
+            ),
+            (
+                "BackB",
+                without(SpectrumFitResult {
+                    background: [bg[0], 0.0, bg[2]],
+                    ..result.clone()
+                }),
+            ),
+            (
+                "BackC",
+                without(SpectrumFitResult {
+                    background: [bg[0], bg[1], 0.0],
+                    ..result.clone()
+                }),
+            ),
+            (
+                "the BackD/BackF tail",
+                without(SpectrumFitResult {
+                    back_d: Some(0.0),
+                    ..result.clone()
+                }),
+            ),
+            (
+                "the baseline slope",
+                without(SpectrumFitResult {
+                    baseline: Some([baseline[0], 0.0, baseline[2]]),
+                    ..result.clone()
+                }),
+            ),
+        ] {
+            assert!(
+                gap > 1e-3,
+                "{term} must be load-bearing in this fixture, it moves the curve by {gap}"
+            );
+        }
+
+        let composed = compose_fitted_curve(&result, &nominal, &transmission);
+        assert_eq!(composed.len(), oracle.len());
+        for (i, (c, o)) in composed.iter().zip(&oracle).enumerate() {
+            assert!(
+                (c - o).abs() <= 1e-12,
+                "bin {i} (E = {} eV): the GUI composes {c}, the fitter's own stack {o}",
+                nominal[i]
+            );
+        }
+    }
+
     /// The residual dock subtracts the same composed curve the overlay
-    /// draws. Against bare Beer-Lambert transmission the whole background
-    /// and baseline would land in the residual — and in the RMS and Max|r|
-    /// the dock reports — for any fit with those boxes ticked.
+    /// draws. The measurement here is the FITTER's composition plus a known
+    /// per-bin offset, so every residual must BE that offset — synthesising
+    /// the measurement with `compose_fitted_curve` and asserting zero would
+    /// hold for any formula that function contained.
     #[test]
     fn residuals_are_taken_against_the_composed_fit() {
         let rd = u238_with_formalism(ResonanceFormalism::MLBW);
         let nominal = line_grid();
-        let mut result = energy_scale_result(0.0);
-        result.anorm = 0.97;
-        result.background = [0.1, 0.01, 0.003];
-
-        // A measurement that IS the fitted model: every residual is zero.
+        let result = fully_composed_result(0.0);
         let transmission = curve_on(&rd, nominal.clone());
-        let measured = compose_fitted_curve(&result, &nominal, &transmission);
+        let oracle = fitting_crate_composition(&result, &rd, nominal.clone(), &nominal);
+
+        let offset = |i: usize| 0.003 * ((i % 7) as f64 - 3.0);
+        let measured: Vec<f64> = oracle
+            .iter()
+            .enumerate()
+            .map(|(i, y)| y + offset(i))
+            .collect();
+
         let stats = fit_residuals(&result, &nominal, &transmission, &measured);
         assert_eq!(stats.residuals.len(), nominal.len());
-        assert_eq!(stats.max_abs, 0.0, "a perfect fit has no residual");
-        assert_eq!(stats.rms, 0.0);
+        for (i, &(e, r)) in stats.residuals.iter().enumerate() {
+            assert_eq!(e, nominal[i], "the x-axis stays on the nominal grid");
+            assert!(
+                (r - offset(i)).abs() <= 1e-12,
+                "bin {i}: residual {r}, offset put there {}",
+                offset(i)
+            );
+        }
+        assert!(
+            (stats.max_abs - 0.009).abs() <= 1e-12,
+            "the largest offset is 0.009, got {}",
+            stats.max_abs
+        );
+        let expected_rms = ((0..nominal.len())
+            .map(|i| offset(i) * offset(i))
+            .sum::<f64>()
+            / nominal.len() as f64)
+            .sqrt();
+        assert!(
+            (stats.rms - expected_rms).abs() <= 1e-12,
+            "RMS {} vs {expected_rms}",
+            stats.rms
+        );
 
-        // The same measurement against bare transmission would report the
-        // background as signal.
+        // Against bare Beer-Lambert transmission the whole composition
+        // would land in the residual — and in the RMS and Max|r| the dock
+        // reports — for any fit with those boxes ticked.
         let bare = fit_residuals(
             &SpectrumFitResult {
                 anorm: 1.0,
                 background: [0.0; 3],
-                ..energy_scale_result(0.0)
+                back_d: None,
+                back_f: None,
+                baseline: None,
+                baseline_e_ref_ev: None,
+                ..fully_composed_result(0.0)
             },
             &nominal,
             &transmission,
@@ -1919,6 +2279,129 @@ mod tests {
             "the omitted composition must be a visible error, got {}",
             bare.max_abs
         );
+    }
+
+    /// The dock's whole computation, on a fit with a non-identity energy
+    /// scale AND every composition term: the measurement is exactly what
+    /// that fit predicts — the fitter's composition over the physics on the
+    /// CALIBRATED grid — so the dock must report no residual. Redrawing the
+    /// physics on the nominal grid, or subtracting bare transmission, each
+    /// shows up as a residual larger than 0.05.
+    #[test]
+    fn residuals_use_the_fitted_grid_and_the_composed_curve() {
+        let rd = u238_with_formalism(ResonanceFormalism::MLBW);
+        let nominal = line_grid();
+        let result = fully_composed_result(1.0);
+        let calibrated = result
+            .corrected_energies(&nominal)
+            .expect("the energy scale was fitted")
+            .expect("and is not degenerate");
+
+        let measured = fitting_crate_composition(&result, &rd, calibrated.clone(), &nominal);
+
+        // Non-vacuity, both halves at once: the same measurement against
+        // the nominal-grid physics, and against the uncomposed calibrated
+        // transmission, is visibly wrong.
+        let on_nominal_grid = fitting_crate_composition(&result, &rd, nominal.clone(), &nominal);
+        let grid_gap = largest_gap(&measured, &on_nominal_grid);
+        assert!(
+            grid_gap > 0.05,
+            "the calibrated and nominal grids must give visibly different curves for this \
+             test to mean anything, got {grid_gap}"
+        );
+        let composition_gap = largest_gap(&measured, &curve_on(&rd, calibrated));
+        assert!(
+            composition_gap > 0.05,
+            "the composition must differ from bare transmission for this test to mean \
+             anything, got {composition_gap}"
+        );
+
+        let dock = residuals_for_fit(residuals_request(&result, &nominal, &measured, &rd))
+            .expect("a reproducible fit with finite residuals");
+        assert_eq!(dock.stats.residuals.len(), nominal.len());
+        assert!(
+            dock.stats.max_abs < 1e-12,
+            "the dock redrew something other than the fit that was performed, Max|r| = {}",
+            dock.stats.max_abs
+        );
+        assert!(dock.stats.rms < 1e-12, "RMS = {}", dock.stats.rms);
+        assert_eq!(
+            dock.warning, None,
+            "this redraw takes the routes the fit disclosed"
+        );
+    }
+
+    /// Residuals taken against a model that is not the fitted one are as
+    /// untrustworthy as the curve the spectrum panel warns about, and the
+    /// dock is where their RMS and Max|r| are read — so the warning has to
+    /// travel with them.
+    #[test]
+    fn the_route_warning_travels_with_the_residuals() {
+        let rd = u238_with_formalism(ResonanceFormalism::MLBW);
+        let nominal = line_grid();
+        let result = SpectrumFitResult {
+            doppler_routes: Some(vec![IsotopeDopplerRoute {
+                isotope: nereids_core::types::Isotope::new(72, 178).unwrap(),
+                route: DopplerRoute::Continuous {
+                    formalisms: vec![ResonanceFormalism::MLBW],
+                },
+            }]),
+            ..fully_composed_result(0.0)
+        };
+        let measured = fitting_crate_composition(&result, &rd, nominal.clone(), &nominal);
+
+        let dock = residuals_for_fit(residuals_request(&result, &nominal, &measured, &rd))
+            .expect("the residuals are computed, and flagged");
+        let warning = dock
+            .warning
+            .expect("a redraw of another isotope's routes is not the fitted model");
+        assert!(
+            warning.contains("U-238") && warning.contains("Hf-178"),
+            "{warning}"
+        );
+    }
+
+    /// The two refusals the dock can reach are different things and must
+    /// say which one fired: a calibration that cannot be reproduced, and a
+    /// window holding no finite residual. One "missing data or isotope
+    /// mismatch" line for both — which is what the dock showed — sends the
+    /// user after a problem they do not have.
+    #[test]
+    fn residuals_name_the_refusal_that_actually_fired() {
+        let rd = u238_with_formalism(ResonanceFormalism::MLBW);
+        let nominal = line_grid();
+        let result = fully_composed_result(0.0);
+        let measured = fitting_crate_composition(&result, &rd, nominal.clone(), &nominal);
+
+        let degenerate = fully_composed_result(1.0e4);
+        let scale = residuals_for_fit(residuals_request(&degenerate, &nominal, &measured, &rd))
+            .expect_err("a t0 past the shortest flight time is not reproducible");
+        assert!(matches!(scale, ResidualsUnavailable::EnergyScale(_)));
+        assert!(
+            scale
+                .message()
+                .contains("does not map this grid to physical energies"),
+            "{}",
+            scale.message()
+        );
+
+        let nothing_finite = vec![f64::NAN; nominal.len()];
+        let no_residual =
+            residuals_for_fit(residuals_request(&result, &nominal, &nothing_finite, &rd))
+                .expect_err("a wholly non-finite window has no residual to show");
+        assert_eq!(no_residual, ResidualsUnavailable::NoFiniteResiduals);
+        assert!(
+            no_residual.message().contains("No finite residuals"),
+            "{}",
+            no_residual.message()
+        );
+
+        // The three messages are three different sentences: neither cause
+        // is reported as the missing-data one, nor as the other.
+        let missing = ResidualsUnavailable::MissingData.message();
+        assert_ne!(scale.message(), no_residual.message());
+        assert_ne!(scale.message(), missing);
+        assert_ne!(no_residual.message(), missing);
     }
 
     /// A result that discloses no routes cannot be checked against the
