@@ -245,13 +245,17 @@ pub fn classify_isotope(
     // NaN compares false against everything, so one left in the grid would
     // pin the reported reason to itself.
     validate_doppler_grid(work_energies)?;
-    // At absolute zero there is no kernel to apply by either route, so the
-    // tier question does not arise. `DopplerParams` rejects a negative
-    // temperature outright, which is why this tests for equality.
-    if params.temperature_k() == 0.0 {
+    // No kernel means the tier question does not arise. That is absolute
+    // zero, and ALSO any temperature small enough that `u` underflows to
+    // zero — the broadening entry points return the unbroadened equation
+    // in both cases, so testing only `T == 0` here would let the route
+    // claim `Continuous` for a curve that was never broadened.
+    // `DopplerParams` rejects a negative temperature outright, which is why
+    // the first test is for equality.
+    let thermal_u = params.u();
+    if params.temperature_k() == 0.0 || thermal_u == 0.0 {
         return Ok(DopplerRoute::Unbroadened);
     }
-    let thermal_u = params.u();
     // Every formalism the grid was evaluated with, first use first. A grid
     // may legitimately span adjacent resolved ranges of different
     // formalisms; the disclosed route is the executed route, so it names
@@ -1238,10 +1242,16 @@ mod tests {
         assert_eq!(derivatives, vec![0.0; 3]);
 
         // A temperature so small that u underflows to zero takes the same
-        // path, rather than dividing by a zero width.
+        // path, rather than dividing by a zero width — and the ROUTE must
+        // say so too, or it would disclose a continuous integral over a
+        // curve that was never broadened.
         let tiny = f64::from_bits(1);
         assert_eq!(DopplerParams::new(tiny, data.awr).unwrap().u(), 0.0);
         assert_eq!(broaden(&energies, &data, tiny).unwrap(), expected);
+        assert_eq!(
+            classify_isotope(&data, &energies, tiny).unwrap(),
+            DopplerRoute::Unbroadened
+        );
 
         // At 0 K the route gate says `Unbroadened` for ANY source, so a
         // tier-2-only formalism must get the unbroadened equation here and

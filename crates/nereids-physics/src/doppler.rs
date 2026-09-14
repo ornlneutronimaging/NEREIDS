@@ -1121,6 +1121,67 @@ mod tests {
 
     // --- End validation tests ---
 
+    /// SAMMY's negative-value rule (`fgm/mfgm4.f90:83-101`) has three
+    /// outcomes and one call site per tier, so each outcome is pinned here
+    /// directly rather than only through a broadening that happens to
+    /// reach it.
+    #[test]
+    fn the_sammy_negative_value_rule_has_three_outcomes() {
+        // Above the floor: noise, zero it, whatever the source did.
+        assert!(zero_negative_value(-1e-16, || true));
+        assert!(zero_negative_value(-1e-16, || false));
+        // Below the floor with no positive contributing point: the source
+        // is negative throughout the window, so the convolution cannot mean
+        // anything else.
+        assert!(zero_negative_value(-1.0, || false));
+        // Below the floor WITH a positive contributing point: keep it.
+        // This is the "Negative cross section" case SAMMY prints.
+        assert!(!zero_negative_value(-1.0, || true));
+        // The floor is exactly 1e-15 barn·eV and the comparison is strict.
+        assert!(zero_negative_value(
+            -NEGATIVE_VALUE_FLOOR_BARN_EV * 0.5,
+            || true
+        ));
+        assert!(!zero_negative_value(
+            -NEGATIVE_VALUE_FLOOR_BARN_EV * 2.0,
+            || true
+        ));
+    }
+
+    /// The sampled tier applies that rule to its own window, so a genuine
+    /// negative survives and an all-negative window is zeroed. Before this,
+    /// the tier hard-clamped every negative and disagreed with the
+    /// continuous tier on the same isotope.
+    #[test]
+    fn the_sampled_tier_keeps_a_genuine_negative_and_zeroes_a_dead_window() {
+        let params = DopplerParams::new(293.6, 55.45).unwrap();
+        let energies: Vec<f64> = (0..=200).map(|i| 100.0 + f64::from(i) * 0.5).collect();
+
+        // A dip that goes negative in the middle of a positive curve: the
+        // window around it still contains positive samples, so SAMMY keeps
+        // the negative.
+        let mut kept: Vec<f64> = energies.iter().map(|_| 5.0).collect();
+        for value in kept.iter_mut().skip(98).take(5) {
+            *value = -4.0;
+        }
+        let broadened = doppler_broaden(&energies, &kept, &params).unwrap();
+        assert!(
+            broadened.iter().any(|&v| v < 0.0),
+            "a negative with positive neighbours must survive, got min {:?}",
+            broadened.iter().copied().fold(f64::MAX, f64::min)
+        );
+
+        // A curve that is negative everywhere has no positive contributing
+        // point anywhere, so every output is zeroed.
+        let dead: Vec<f64> = energies.iter().map(|_| -5.0).collect();
+        let broadened = doppler_broaden(&energies, &dead, &params).unwrap();
+        assert!(
+            broadened.iter().all(|&v| v == 0.0),
+            "an all-negative window must zero, got {:?}",
+            broadened.iter().copied().fold(f64::MIN, f64::max)
+        );
+    }
+
     #[test]
     fn test_doppler_width_u238() {
         // SAMMY reports Doppler width at 6.075 eV = 0.05159437 eV for U-238
