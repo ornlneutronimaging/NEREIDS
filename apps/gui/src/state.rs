@@ -1461,6 +1461,59 @@ impl AppState {
         self.clear_pixel_fit_for_isotope_change();
     }
 
+    /// Set the live sample temperature, with everything that change implies.
+    ///
+    /// This box is a MODEL input, not a display setting.
+    /// `SpectrumFitResult::temperature_k` is `Some` only for a fit that
+    /// fitted the temperature, so every ordinary fixed-temperature result
+    /// carries `None` and both redraw paths — the spectrum overlay
+    /// (`design::build_fit_line`) and the residual dock
+    /// (`studio::dock_residuals`) — fall back to this value for the
+    /// temperature the physics is re-evaluated at.
+    ///
+    /// Nothing else would catch the change. `fit_result_gen` is not bumped
+    /// by an edit here, and [`Self::mark_dirty`] only records which pipeline
+    /// step went stale — it drops no output. The residual cache IS keyed on
+    /// the effective temperature, so the dock does not show stale numbers;
+    /// it silently RE-COMPUTES at the new temperature and presents the
+    /// answer as the stored fit's RMS and Max|r|, while the overlay redraws
+    /// the same way still labelled "Fit". Dropping the stored fit is what
+    /// stops that, exactly as an isotope toggle drops it
+    /// ([`Self::set_isotope_enabled`]).
+    ///
+    /// The spatial map is deliberately left alone, for the same reason and
+    /// with the same protection as an isotope toggle: a map costs minutes to
+    /// recompute, and a per-pixel result assembled from one discloses no
+    /// Doppler routes, so `design::build_overlay_model` reports every
+    /// broadening redraw of it as unchecked rather than passing it off as
+    /// the fitted curve.
+    ///
+    /// A no-op when the value does not change: this runs on every repaint.
+    pub fn set_temperature_k(&mut self, temperature_k: f64) {
+        if self.temperature_k == temperature_k {
+            return;
+        }
+        self.temperature_k = temperature_k;
+        self.mark_dirty(GuidedStep::Analyze);
+        self.clear_pixel_fit_output();
+    }
+
+    /// Drop every fit because the ISOTOPE LIST itself changed — a chip
+    /// added or removed, or the ENDF library swapped underneath the
+    /// resonance data.
+    ///
+    /// Stronger than [`Self::clear_pixel_fit_for_isotope_change`], which a
+    /// mere enable/disable raises: there the map's own resonance data still
+    /// exists and its per-pixel results can still be assembled and reported
+    /// as unchecked, so the map is kept. Here the resonance data behind the
+    /// map is gone or replaced, so the map cannot be redrawn against
+    /// anything at all and is dropped with the single-pixel fit, its
+    /// residual cache, its feedback and its panel flag.
+    pub fn clear_fits_for_isotope_list_change(&mut self) {
+        self.spatial_result = None;
+        self.clear_pixel_fit_for_isotope_change();
+    }
+
     /// Clear the cached map before starting a new spatial fit.  This prevents
     /// Results and export actions from reusing an older map while the new run
     /// is pending or after it fails.  An in-flight spatial worker is stopped
@@ -1887,10 +1940,43 @@ impl Default for AppState {
 mod tests {
     use super::*;
 
-    /// A state carrying one isotope, one group, and a single-pixel fit with
-    /// its residual cache — both computed with that isotope set.
+    /// A one-pixel spatial map, present only so that "the map was kept" and
+    /// "the map was dropped" are distinguishable.
+    fn a_spatial_map() -> SpatialResult {
+        let map = || Array2::from_elem((1, 1), 1e-3);
+        SpatialResult {
+            density_maps: vec![map()],
+            uncertainty_maps: vec![map()],
+            chi_squared_map: map(),
+            deviance_per_dof_map: None,
+            converged_map: Array2::from_elem((1, 1), true),
+            temperature_map: None,
+            temperature_uncertainty_map: None,
+            isotope_labels: vec!["U-238".into()],
+            anorm_map: None,
+            background_maps: None,
+            back_d_map: None,
+            back_f_map: None,
+            t0_us_map: None,
+            l_scale_map: None,
+            energy_scale_flight_path_m: None,
+            baseline_global: None,
+            baseline_e_ref_ev: None,
+            baseline_maps: None,
+            warnings: Vec::new(),
+            doppler_routes: None,
+            n_converged: 1,
+            n_total: 1,
+            n_failed: 0,
+        }
+    }
+
+    /// A state carrying one isotope, one group, a spatial map, and a
+    /// single-pixel fit with its residual cache — all computed with that
+    /// isotope set.
     fn state_with_a_cached_pixel_fit() -> AppState {
         AppState {
+            spatial_result: Some(a_spatial_map()),
             isotope_entries: vec![IsotopeEntry {
                 z: 92,
                 a: 238,
@@ -2016,6 +2102,98 @@ mod tests {
         assert!(state.pixel_fit_result.is_some());
         assert!(state.residuals_cache.is_some());
         assert_eq!(state.dirty_from, None);
+    }
+
+    /// The live temperature box is a model input: every fixed-temperature
+    /// result carries `temperature_k: None`, so both redraw paths fall back
+    /// to it. Moving it therefore changes the curve the dock subtracts and
+    /// the overlay draws — and because the residual cache is KEYED on that
+    /// temperature, the dock does not go stale, it silently re-computes at
+    /// the new value and reports the answer as the stored fit's RMS and
+    /// Max|r|. Dropping the fit is the only thing that stops that: the
+    /// generation counter the cache is checked on does not move.
+    #[test]
+    fn a_temperature_edit_drops_the_fit_it_would_otherwise_recompute() {
+        let mut state = state_with_a_cached_pixel_fit();
+        let before = state.temperature_k;
+
+        state.set_temperature_k(before + 100.0);
+
+        assert_eq!(state.temperature_k, before + 100.0, "the value has to move");
+        assert!(
+            state.pixel_fit_result.is_none(),
+            "the result was fitted at the previous temperature"
+        );
+        assert!(
+            state.residuals_cache.is_none(),
+            "the residuals were taken against a curve evaluated at it"
+        );
+        assert_eq!(state.dirty_from, Some(GuidedStep::Analyze));
+        // Nothing else can catch this: the key the cache is checked on is
+        // exactly where it was, and the cache's own temperature field moves
+        // WITH the box, so the cache would test as valid at the new value.
+        assert_eq!(state.fit_result_gen, 0);
+        // Same trade as an isotope toggle: the map costs minutes and its
+        // per-pixel redraws are reported as unchecked, so it is kept.
+        assert!(state.spatial_result.is_some());
+
+        // A call that changes nothing is not a change. This runs on every
+        // repaint, so a stored fit must survive the frames where the user
+        // touched nothing.
+        let mut state = state_with_a_cached_pixel_fit();
+        state.set_temperature_k(state.temperature_k);
+        assert!(state.pixel_fit_result.is_some());
+        assert!(state.residuals_cache.is_some());
+        assert_eq!(state.dirty_from, None);
+    }
+
+    /// Adding or removing an isotope chip, or swapping the ENDF library,
+    /// destroys or replaces the resonance data the MAP was computed from —
+    /// unlike an enable/disable, after which the map's own data still exists
+    /// and its per-pixel results can still be reported as unchecked. So this
+    /// one drops the map as well, and it drops the whole single-fit output
+    /// with it: the residual cache, the feedback and the panel flag, not
+    /// just `pixel_fit_result`.
+    #[test]
+    fn an_isotope_list_change_drops_the_map_and_the_whole_single_fit_output() {
+        let mut state = state_with_a_cached_pixel_fit();
+        state.last_fit_feedback = Some(FitFeedback {
+            success: true,
+            summary: "converged".into(),
+            densities: vec![("U-238".into(), 1e-3)],
+            temperature_k: None,
+            warnings: Vec::new(),
+            doppler_routes: Vec::new(),
+        });
+        state.show_analyze_fit_info = true;
+
+        state.clear_fits_for_isotope_list_change();
+
+        assert!(state.spatial_result.is_none());
+        assert!(state.pixel_fit_result.is_none());
+        assert!(
+            state.residuals_cache.is_none(),
+            "residuals against the previous resonance data are not this one's"
+        );
+        assert!(
+            state.last_fit_feedback.is_none(),
+            "the feedback describes a fit that no longer exists"
+        );
+        assert!(
+            !state.show_analyze_fit_info,
+            "the fit-info panel has nothing left to show"
+        );
+
+        // The weaker isotope-set invalidation keeps the map on purpose, so
+        // the two are not interchangeable and this one is not vacuous.
+        let mut state = state_with_a_cached_pixel_fit();
+        state.clear_pixel_fit_for_isotope_change();
+        assert!(state.pixel_fit_result.is_none());
+        assert!(
+            state.spatial_result.is_some(),
+            "an enable/disable keeps the map: it costs minutes and its \
+             per-pixel redraws are reported as unchecked"
+        );
     }
 
     /// The #646 accumulation pin: re-detection REPLACES the previous

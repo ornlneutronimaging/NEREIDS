@@ -51,11 +51,17 @@ pub fn configure_step(ui: &mut egui::Ui, state: &mut AppState) {
                 ui.end_row();
 
                 ui.label("Temperature (K):");
+                // Same route as the Studio Temp box: the widget writes to a
+                // local value and the state change goes through
+                // `set_temperature_k`, so the stored fit cannot survive an
+                // edit here while it is dropped there.
+                let mut temperature_k = state.temperature_k;
                 ui.add(
-                    egui::DragValue::new(&mut state.temperature_k)
+                    egui::DragValue::new(&mut temperature_k)
                         .range(1.0..=5000.0)
                         .speed(1.0),
                 );
+                state.set_temperature_k(temperature_k);
                 ui.label("PC sample:");
                 ui.add(
                     egui::DragValue::new(&mut state.proton_charge_sample)
@@ -150,8 +156,7 @@ pub fn configure_step(ui: &mut egui::Ui, state: &mut AppState) {
                     m.endf_status = EndfStatus::Pending;
                 }
             }
-            state.spatial_result = None;
-            state.clear_pixel_fit_for_isotope_change();
+            state.clear_fits_for_isotope_list_change();
         }
 
         ui.add_space(8.0);
@@ -162,8 +167,7 @@ pub fn configure_step(ui: &mut egui::Ui, state: &mut AppState) {
         // cache cannot survive here while it is dropped there.
         let chip_result = isotope_chips_flow(ui, state);
         if chip_result.changed {
-            state.spatial_result = None;
-            state.clear_pixel_fit_for_isotope_change();
+            state.clear_fits_for_isotope_list_change();
         }
 
         ui.add_space(6.0);

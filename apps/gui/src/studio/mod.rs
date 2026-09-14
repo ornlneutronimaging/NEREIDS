@@ -1321,16 +1321,21 @@ fn solver_card(ui: &mut egui::Ui, state: &mut AppState) {
 
         ui.horizontal(|ui| {
             ui.label("Temp:");
-            let prev = state.temperature_k;
+            // The widget writes to a local value and the state change goes
+            // through `set_temperature_k`, so the edit and the invalidation
+            // it implies cannot come apart: this is the temperature both
+            // redraw paths fall back to for every fit that did not fit one,
+            // and editing the field here without dropping the stored fit
+            // leaves the dock re-computing at the new temperature and
+            // reporting the answer as the fit's.
+            let mut temperature_k = state.temperature_k;
             ui.add(
-                egui::DragValue::new(&mut state.temperature_k)
+                egui::DragValue::new(&mut temperature_k)
                     .speed(1.0)
                     .range(1.0..=2000.0)
                     .suffix(" K"),
             );
-            if state.temperature_k != prev {
-                state.mark_dirty(GuidedStep::Analyze);
-            }
+            state.set_temperature_k(temperature_k);
         });
 
         let prev_fit_temp = state.fit_temperature;

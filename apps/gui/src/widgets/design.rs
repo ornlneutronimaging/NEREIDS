@@ -1193,9 +1193,13 @@ pub(crate) struct FitResiduals {
 
 /// Residuals of `measured` against the fitted forward model — measured
 /// minus the SAME curve the overlay draws (see [`compose_fitted_curve`]),
-/// so the dock's plot, RMS and Max|r| describe the fit that was actually
-/// performed. Bins whose residual is not finite are dropped, as they
-/// cannot be plotted or summarised.
+/// rather than against bare Beer-Lambert transmission. Bins whose residual
+/// is not finite are dropped, as they cannot be plotted or summarised.
+///
+/// `transmission` is whatever the caller evaluated; this function cannot
+/// check that it is the fit's own curve, and it is only as much the fit's
+/// as the caller's inputs are (see [`residuals_for_fit`] for the one input
+/// that is not carried by `result`).
 pub(crate) fn fit_residuals(
     result: &nereids_pipeline::pipeline::SpectrumFitResult,
     nominal_energies: &[f64],
@@ -1336,6 +1340,16 @@ pub(crate) struct ResidualsRequest<'a> {
 /// baseline into the plot and into the reported RMS and Max|r| as fake
 /// signal.
 ///
+/// What comes out is the fit that was performed only as far as `req` says
+/// so. Every input but one is carried by `result` itself; the exception is
+/// [`ResidualsRequest::temperature_k`], which `result` carries only when
+/// the fit fitted a temperature and which the caller otherwise supplies —
+/// in the GUI, from the live temperature box. That box is coupled to
+/// dropping the stored fit (`AppState::set_temperature_k`), so the two
+/// cannot diverge there; a caller that supplies some other temperature gets
+/// the fit's model AT THAT TEMPERATURE, which is not the fitted curve and
+/// whose RMS and Max|r| are not the fit's.
+///
 /// Pure: everything it reads is in `req`, so what the dock shows is
 /// testable without a UI.
 ///
@@ -1395,8 +1409,10 @@ pub(crate) struct OverlayModel {
     /// fit gated.
     pub model: nereids_fitting::transmission_model::TransmissionFitModel,
     /// A user-facing line when the overlay's routes differ from the routes
-    /// the result disclosed (the isotope set, grid or resolution changed
-    /// since the fit): the overlay is drawn, but it is not the fitted curve.
+    /// the result disclosed (one of the gate's inputs — the isotope set, the
+    /// sample temperature, the energy grid or the resolution — is not what
+    /// it was at the fit): the overlay is drawn, but it is not the fitted
+    /// curve.
     ///
     /// Also set when the result discloses NO routes and this redraw
     /// broadens something: the comparison cannot run then, and an
@@ -1490,8 +1506,9 @@ pub(crate) fn build_overlay_model(
             } else {
                 let message = format!(
                     "Fit overlay is not the fitted curve: it redraws [{}] where the fit disclosed \
-                     [{}] (route gate at {gate_temperature_k} K); the isotope set, grid or \
-                     resolution changed since the fit",
+                     [{}] (route gate at {gate_temperature_k} K); one of the inputs the gate \
+                     reads — the isotope set, the sample temperature, the energy grid or the \
+                     resolution — is not what it was at the fit",
                     describe(&mut overlay_routes.iter().map(ToString::to_string)),
                     describe(&mut disclosed.iter().map(ToString::to_string)),
                 );
@@ -2535,16 +2552,24 @@ mod tests {
         assert_eq!(overlay(0.0).route_mismatch, None);
     }
 
-    /// The dock gates the redrawn routes the way the fit gated them, and it
-    /// is the RESULT's own fitted temperature that decides which gate. On an
-    /// MLBW range ending at 8 eV, a free-temperature fit gates at the fit's
-    /// upper bound and is demoted to the sampled table, while the same fit
-    /// at a fixed temperature stays on the continuous integral — two
-    /// different curves to take the measurement against. Every other dock
-    /// fixture has `temperature_k = None`, so nothing else exercises the
-    /// hand-off.
+    /// The dock gates the redrawn routes the way the fit gated them, and
+    /// what decides which gate is whether the RESULT fitted a temperature at
+    /// all. On an MLBW range ending at 8 eV, a free-temperature fit gates at
+    /// the fit's upper bound and is demoted to the sampled table, while the
+    /// same fit at a fixed temperature stays on the continuous integral —
+    /// two different curves to take the measurement against. Every other
+    /// dock fixture has `temperature_k = None`, so nothing else exercises
+    /// the hand-off.
+    ///
+    /// Scope: `residuals_request` hands the evaluation temperature over
+    /// explicitly, so this covers the free-versus-fixed switch only. It
+    /// cannot see production's fallback, where a fixed-temperature result
+    /// carries `temperature_k: None` and the dock supplies the live
+    /// temperature box instead (`studio::dock_residuals`) — a box
+    /// `AppState::set_temperature_k` couples to dropping the stored fit,
+    /// which is what makes the value it supplies the one the fit ran at.
     #[test]
-    fn the_dock_gates_on_the_temperature_the_fit_fitted() {
+    fn the_dock_gates_on_whether_the_fit_fitted_a_temperature() {
         let mut near_edge = u238_with_formalism(ResonanceFormalism::MLBW);
         near_edge.ranges[0].energy_high = 8.0;
         let nominal: Vec<f64> = (0..201).map(|i| 4.0 + (i as f64) * 0.0145).collect();
@@ -2611,6 +2636,20 @@ mod tests {
             message.contains("U-238") && message.contains("Hf-178"),
             "the message must name the isotope on both sides: {message}"
         );
+        // The causes it offers are the gate's own inputs. The sample
+        // temperature is one of them and is live-editable, so leaving it out
+        // sends the user looking at the three things they did not touch.
+        for cause in [
+            "isotope set",
+            "sample temperature",
+            "energy grid",
+            "resolution",
+        ] {
+            assert!(
+                message.contains(cause),
+                "the gate reads {cause}, so a disagreement can come from it: {message}"
+            );
+        }
 
         let same_isotope = [IsotopeDopplerRoute {
             isotope: rd.isotope,
