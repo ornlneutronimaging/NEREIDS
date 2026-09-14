@@ -1001,32 +1001,41 @@ mod tests {
 
     #[test]
     fn test_doppler_width_u238() {
-        // SAMMY reports: Doppler width at 6.075 eV = 0.05159437 eV for U-238 at 300K
-        // AWR = 238.050972, T = 300 K
-        let params = DopplerParams::new(300.0, 238.050972).unwrap();
+        // SAMMY reports Doppler width at 6.075 eV = 0.05159437 eV for U-238
+        // at 300 K.  AWR is mass ÷ NEUTRON mass: U-238's 238.050972 amu
+        // gives 236.006, and passing the amu figure instead makes the width
+        // 0.43% low (0.05137067).  A comment here used to blame that on
+        // SAMMY's kB differing from CODATA, which cannot be the cause: kB
+        // moves this width by 0.003%, two orders below the discrepancy.
+        let params = DopplerParams::new(300.0, 236.006).unwrap();
         let dw = params.doppler_width(6.075);
-        // SAMMY uses kB = 0.000086173420 eV/K (slightly different from CODATA 2018)
-        // Our kB = 8.617333262e-5. The difference is ~0.003%.
-        // So we expect close but not exact match.
+        // Tolerance just above the residual the correct ratio leaves
+        // (3.1e-5 relative), so reintroducing the amu mass fails here.
         assert!(
-            (dw - 0.05159437).abs() < 5e-4,
-            "Doppler width = {}, expected ~0.05159",
-            dw
+            (dw - 0.05159437).abs() < 2e-6,
+            "Doppler width = {dw}, expected ~0.0515928"
         );
     }
 
     #[test]
     fn test_doppler_width_fictitious() {
-        // ex001: A=10, T=300K. Δ_D at 10 eV = √(4kBTE/AWR).
-        // SAMMY reports Δ_D = 0.3216 eV, FWHM = 2√(ln2) × Δ_D = 0.5355 eV.
-        // (SAMMY lpt uses slightly different kB, giving FWHM = 0.5378 eV.)
-        let params = DopplerParams::new(300.0, 10.0).unwrap();
+        // ex001's fictitious target is 10 amu, so AWR = 10/1.008665 =
+        // 9.9141 and Δ_D(10 eV) = √(4·kB·T·E/AWR) = 0.322961 eV, whose
+        // FWHM 2√(ln2)·Δ_D = 0.537766 eV is SAMMY's reported 0.5378 to its
+        // own four figures.  The amu figure gives 0.321571 and an FWHM of
+        // 0.535451, which does NOT match SAMMY — the gap was previously
+        // explained away as a kB difference, but kB moves this by 5e-7.
+        let data = nereids_endf::resonance::test_support::ex001_hydrogen_single_resonance();
+        let params = DopplerParams::new(300.0, data.awr).unwrap();
         let dw = params.doppler_width(10.0);
-        // Δ_D = √(4 × 8.617e-5 × 300 × 10 / 10) = √(0.10341) ≈ 0.3216 eV
         assert!(
-            (dw - 0.3216).abs() < 0.01,
-            "Doppler width = {}, expected ~0.32",
-            dw
+            (dw - 0.322961).abs() < 1e-5,
+            "Doppler width = {dw}, expected ~0.322961"
+        );
+        let fwhm = 2.0 * 2.0_f64.ln().sqrt() * dw;
+        assert!(
+            (fwhm - 0.5378).abs() < 5e-5,
+            "FWHM = {fwhm}, SAMMY lpt reports 0.5378"
         );
     }
 
@@ -1223,8 +1232,10 @@ mod tests {
     #[test]
     fn test_sammy_ex001_fgm_doppler() {
         // Build the ex001 resonance data: single SLBW resonance at 10 eV,
-        // ZA=1010, AWR=10.0, AP=2.908 fm (SAMMY par-file widths in meV are
+        // ZA=1010, AP=2.908 fm (SAMMY par-file widths in meV are
         // pre-converted to eV inside `ex001_hydrogen_single_resonance`).
+        // Broadening uses the fixture's OWN awr, so the mass ratio cannot
+        // drift between the cross-section and the kernel.
         let data = nereids_endf::resonance::test_support::ex001_hydrogen_single_resonance();
 
         // Generate unbroadened cross-sections on a non-uniform grid.
@@ -1255,7 +1266,7 @@ mod tests {
             .collect();
 
         // Apply FGM Doppler broadening.
-        let params = DopplerParams::new(300.0, 10.0).unwrap();
+        let params = DopplerParams::new(300.0, data.awr).unwrap();
         let broadened = doppler_broaden(&energies, &unbroadened, &params).unwrap();
 
         // SAMMY ex001a.lst reference points: (energy, broadened capture σ in barns).
@@ -1280,12 +1291,15 @@ mod tests {
         eprintln!("ex001 FGM: max_rel_err={max_rel_err:.6}");
         // PW-linear segment integration differs from SAMMY's quadrature at
         // grid-spacing transitions (wing region).  Measured with the exact
-        // w²-weighted kernel: 2.37%; the legacy w¹ kernel measured 5.48%
-        // (the A=10 target makes u/v large, so the kernel's first-order
-        // term was a visible part of the old error).
+        // w²-weighted kernel and the corrected mass ratio: 0.80%.  The same
+        // kernel against the amu figure measured 2.37%, and the legacy w¹
+        // kernel 5.48% (the A=10 target makes u/v large, so the kernel's
+        // first-order term was a visible part of that old error).  The
+        // tolerance sits just above the measured residual so that
+        // reintroducing the amu mass fails here rather than being absorbed.
         assert!(
-            max_rel_err < 0.03,
-            "Max relative error = {:.2}% (exceeds 3%)",
+            max_rel_err < 0.016,
+            "Max relative error = {:.2}% (exceeds 1.6%)",
             max_rel_err * 100.0
         );
 
