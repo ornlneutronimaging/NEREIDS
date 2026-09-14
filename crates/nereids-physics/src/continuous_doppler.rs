@@ -610,6 +610,18 @@ impl TargetContext<'_, '_> {
 
     fn integrate(&self, range: &ResonanceRange) -> Result<TargetIntegral, DopplerError> {
         let points = self.breakpoints(range);
+        // The budget bounds the INITIAL panels as well as the refined ones.
+        // A source with many resonances, or a dense AP(E) table, produces
+        // its panel count from the breakpoints alone, so checking only
+        // inside the refinement loop would let a wide source allocate past
+        // the limit and — if those panels happened to converge — never
+        // consult it at all.
+        if points.len() - 1 > self.budget.max_active_panels {
+            return Err(DopplerError::PanelLimit {
+                energy_ev: self.target_energy,
+                limit: self.budget.max_active_panels,
+            });
+        }
         let mut heap = BinaryHeap::with_capacity(points.len());
         let mut value = 0.0;
         let mut derivative = 0.0;
@@ -723,38 +735,69 @@ impl TargetContext<'_, '_> {
 pub struct TierOneBroadening {
     /// Broadened cross-section at each target energy (barn).
     pub values: Vec<f64>,
-    /// Temperature derivative at each target (barn/K), all zero when the
-    /// caller did not ask for it.
+    /// Temperature derivative at each target (barn/K). All zero when the
+    /// caller did not ask for one, because an unrequested derivative was
+    /// never converged to its own tolerance.
     pub derivatives: Vec<f64>,
-    /// Targets where SAMMY's rule KEPT a negative value.
+    /// Targets whose reported value is negative: SAMMY's rule KEPT them
+    /// when broadening ran, and on the unbroadened path they are simply
+    /// the negative values of the resonance equation.
     pub negative_values: usize,
 }
 
 /// Value and (optionally) temperature derivative of one channel at every
 /// target energy, under an explicit quadrature budget.
 ///
-/// The gate runs first, so a source that does not qualify is refused with
-/// [`DopplerError::NotTierOne`] rather than integrated. At zero temperature,
-/// or an underflowed `u`, the values are the unbroadened equation and the
-/// derivatives are zero.
+/// The kernel width `u = √(k_B T / A)` is built from the source's OWN
+/// `awr`, exactly as [`classify_isotope`] builds it, so the width and the
+/// resonance equation can never describe different nuclides. Taking a
+/// caller-supplied [`DopplerParams`] would allow that: an AWR wrong by
+/// 0.87% moves the width by 0.43%, which is below every tolerance in this
+/// module.
+///
+/// At zero temperature, or an underflowed `u`, there is no kernel and the
+/// values are the unbroadened equation — for ANY source, matching
+/// [`classify_isotope`] answering [`DopplerRoute::Unbroadened`] before it
+/// gates. Above zero the gate runs, and a source that does not qualify is
+/// refused with [`DopplerError::NotTierOne`] rather than integrated.
 ///
 /// # Errors
-/// [`DopplerError`] for an invalid grid or parameters, for a source that is
-/// not tier-1, or for a quadrature that cannot converge inside `budget`.
+/// [`DopplerError`] for an invalid grid or temperature, for a source that
+/// is not tier-1, or for a quadrature that cannot converge inside `budget`.
 pub fn broaden_with_budget(
     energies: &[f64],
     data: &ResonanceData,
-    params: &DopplerParams,
+    temperature_k: f64,
     channel: Channel,
     require_derivative: bool,
     budget: QuadratureBudget,
 ) -> Result<TierOneBroadening, DopplerError> {
+    let params = DopplerParams::new(temperature_k, data.awr)?;
     validate_doppler_grid(energies)?;
     if energies.is_empty() {
         return Err(DopplerError::EmptyGrid);
     }
     let thermal_u = params.u();
-    let temperature_k = params.temperature_k();
+    let plan = CrossSectionPlan::new(data);
+
+    // No kernel: the "integral" is the resonance equation itself. This sits
+    // ABOVE the gate because the gate is about which BROADENING tier to
+    // take, and at 0 K neither runs — the route gate says `Unbroadened`
+    // here, so refusing a Reich-Moore source would contradict it.
+    if temperature_k <= 0.0 || thermal_u == 0.0 {
+        let values: Vec<f64> = energies
+            .iter()
+            .map(|&energy| channel.pick(&plan.evaluate_one(energy)))
+            .collect();
+        // The unbroadened equation can itself be negative, so the count has
+        // to be taken here too rather than assumed zero.
+        let negative_values = values.iter().filter(|&&v| v < 0.0).count();
+        return Ok(TierOneBroadening {
+            values,
+            derivatives: vec![0.0; energies.len()],
+            negative_values,
+        });
+    }
 
     // Gate every target BEFORE integrating any of them: the verdict is
     // per isotope and all-or-nothing, so a grid that fails anywhere must
@@ -765,22 +808,6 @@ pub fn broaden_with_budget(
             Ok(index) => ranges.push(&data.ranges[index]),
             Err(reason) => return Err(DopplerError::NotTierOne { reason }),
         }
-    }
-
-    let plan = CrossSectionPlan::new(data);
-    if temperature_k <= 0.0 || thermal_u == 0.0 {
-        // No kernel: the "integral" is the resonance equation itself, and
-        // returning it bit-exactly is what makes the zero-temperature limit
-        // testable rather than approximate.
-        let values = energies
-            .iter()
-            .map(|&energy| channel.pick(&plan.evaluate_one(energy)))
-            .collect();
-        return Ok(TierOneBroadening {
-            values,
-            derivatives: vec![0.0; energies.len()],
-            negative_values: 0,
-        });
     }
 
     // Each target is an independent integral, so targets are the unit of
@@ -810,13 +837,22 @@ pub fn broaden_with_budget(
         .into_iter()
         .collect::<Result<Vec<TargetIntegral>, DopplerError>>()?;
     let negative_values = integrals.iter().filter(|i| i.kept_negative).count();
-    let (values, derivatives) = integrals
+    let (values, derivatives): (Vec<f64>, Vec<f64>) = integrals
         .into_iter()
         .map(|integral| (integral.value, integral.derivative))
         .unzip();
     Ok(TierOneBroadening {
+        // A derivative the caller did not ask for was refined against the
+        // VALUE's error criterion only, so it is not converged and its
+        // finiteness was never checked. Returning it would look like an
+        // answer; zeroing it matches the documented contract and the
+        // zero-temperature path.
+        derivatives: if require_derivative {
+            derivatives
+        } else {
+            vec![0.0; values.len()]
+        },
         values,
-        derivatives,
         negative_values,
     })
 }
@@ -828,13 +864,13 @@ pub fn broaden_with_budget(
 pub fn broaden_channel(
     energies: &[f64],
     data: &ResonanceData,
-    params: &DopplerParams,
+    temperature_k: f64,
     channel: Channel,
 ) -> Result<Vec<f64>, DopplerError> {
     broaden_with_budget(
         energies,
         data,
-        params,
+        temperature_k,
         channel,
         false,
         QuadratureBudget::default(),
@@ -849,9 +885,9 @@ pub fn broaden_channel(
 pub fn broaden(
     energies: &[f64],
     data: &ResonanceData,
-    params: &DopplerParams,
+    temperature_k: f64,
 ) -> Result<Vec<f64>, DopplerError> {
-    broaden_channel(energies, data, params, Channel::Total)
+    broaden_channel(energies, data, temperature_k, Channel::Total)
 }
 
 /// Tier-1 total cross-section and its exact temperature derivative
@@ -862,12 +898,12 @@ pub fn broaden(
 pub fn broaden_with_derivative(
     energies: &[f64],
     data: &ResonanceData,
-    params: &DopplerParams,
+    temperature_k: f64,
 ) -> Result<(Vec<f64>, Vec<f64>), DopplerError> {
     broaden_with_budget(
         energies,
         data,
-        params,
+        temperature_k,
         Channel::Total,
         true,
         QuadratureBudget::default(),
@@ -948,9 +984,15 @@ mod tests {
 
     // ── independent quadrature oracle ──────────────────────────────────────
 
-    /// A uniform-speed trapezoid rule over the same window: a completely
-    /// different quadrature of the same integral, so agreement cannot come
-    /// from sharing the adaptive scheme's mistakes.
+    /// A uniform-speed trapezoid rule over the same window.
+    ///
+    /// This is an independent QUADRATURE, not an independent PHYSICS
+    /// oracle. It deliberately reuses `CrossSectionPlan::evaluate_one`, the
+    /// `(√E + u·x)²` mapping, the same `u`, and the same `E′σ/(√π E)`
+    /// weighting, so it can only catch an error in the adaptive scheme —
+    /// the panels, the error estimate, the refinement order. An error in
+    /// the kernel itself would move both sides together and pass. SAMMY
+    /// ex001 and the free-gas FWHM are what constrain the physics.
     fn trapezoid_oracle(
         data: &ResonanceData,
         target_energy: f64,
@@ -1002,9 +1044,8 @@ mod tests {
         let (oracle_value, oracle_derivative) =
             trapezoid_oracle(&data, target_energy, temperature_k, 400_001);
 
-        let params = DopplerParams::new(temperature_k, data.awr).unwrap();
         let (values, derivatives) =
-            broaden_with_derivative(&[target_energy], &data, &params).unwrap();
+            broaden_with_derivative(&[target_energy], &data, temperature_k).unwrap();
         let value_rel = (values[0] - oracle_value).abs() / oracle_value.abs();
         let derivative_rel = (derivatives[0] - oracle_derivative).abs() / oracle_derivative.abs();
         assert!(
@@ -1025,10 +1066,35 @@ mod tests {
     /// file are SAMMY echoing its input data and match
     /// `samexm/ex001/ex001a.dat` byte for byte; column 4 is its theory
     /// curve, the Doppler-broadened capture cross-section at 300 K.
+    ///
+    /// ## What the residual is, and what it is not
+    ///
+    /// We sit a FLAT +0.77% above SAMMY across the resonance line and agree
+    /// to ~1e-6 in the wings. That shape is measured, not assumed, and it
+    /// rules out the obvious causes: an AWR error would give an S-shaped
+    /// residual changing sign across the peak (scanning AWR 9.90-10.00
+    /// never brings the maximum below 7.7e-3), 300 K is the optimum over
+    /// 295-305 K, and the two plausible alternative kernel weightings give
+    /// 8.1e-2 and 4.3e-2 instead of 7.7e-3.
+    ///
+    /// The sampled-table tier sits at +0.80% on the same curve. The two
+    /// tiers therefore agree with EACH OTHER to well under 0.1% while both
+    /// stand 0.8% from SAMMY, so the residual is not this integrator. The
+    /// core's integrated strength is ~0.77% larger than SAMMY's while the
+    /// wings match — the signature of an effective width difference of
+    /// about 11 μeV on Γ = 1.5 meV, most plausibly SAMMY's own `Dopfgm`
+    /// under-resolving a 1.5 meV core on its grid.
+    ///
+    /// That last step is a hypothesis, not a measurement: this is an OPEN
+    /// discrepancy against the only external reference available here, and
+    /// it must be resolved before any claim of SAMMY-equivalent broadening
+    /// is made in print. The assertion below is therefore a two-sided pin
+    /// on the value we actually observe, not a loose bound — a loose
+    /// tolerance here would absorb a sub-0.8% physics error, which is
+    /// larger than the 0.43% kernel-width error this very branch removed.
     #[test]
-    fn the_sammy_ex001_capture_curve_is_reproduced() {
+    fn the_sammy_ex001_capture_curve_is_matched_to_a_measured_residual() {
         let data = ex001_hydrogen_single_resonance();
-        let params = DopplerParams::new(300.0, data.awr).unwrap();
         let (energies, reference): (Vec<f64>, Vec<f64>) =
             include_str!("../tests/data/sammy_ex001a_answers.lst")
                 .lines()
@@ -1053,7 +1119,7 @@ mod tests {
             continuous(&[ResonanceFormalism::SLBW])
         );
 
-        let ours = broaden_channel(&energies, &data, &params, Channel::Capture).unwrap();
+        let ours = broaden_channel(&energies, &data, 300.0, Channel::Capture).unwrap();
         let (worst, max_rel) = ours
             .iter()
             .zip(&reference)
@@ -1064,7 +1130,28 @@ mod tests {
             "ex001 tier 1: max_rel={max_rel:.3e} at E={} eV (ours {} vs SAMMY {})",
             energies[worst], ours[worst], reference[worst]
         );
-        assert!(max_rel < 8.5e-3, "max relative error {max_rel:.3e}");
+        // Two-sided: moving in EITHER direction is a change worth seeing.
+        assert!(
+            (7.5e-3..8.0e-3).contains(&max_rel),
+            "max relative error {max_rel:.3e} left the measured band [7.5e-3, 8.0e-3]"
+        );
+
+        // The residual is in the line, not the wings, and it is one-signed.
+        let wing = ours
+            .iter()
+            .zip(&reference)
+            .zip(&energies)
+            .filter(|(_, e)| **e < 8.5 || **e > 11.5)
+            .map(|((a, b), _)| (a - b).abs() / b)
+            .fold(0.0_f64, f64::max);
+        assert!(
+            wing < 1.0e-4,
+            "the wings should agree closely, got {wing:.3e}"
+        );
+        assert!(
+            ours.iter().zip(&reference).all(|(a, b)| a >= b),
+            "the residual is one-signed: we sit above SAMMY everywhere"
+        );
     }
 
     // ── analytic oracles ───────────────────────────────────────────────────
@@ -1076,7 +1163,6 @@ mod tests {
     fn a_narrow_line_broadens_to_the_free_gas_fwhm() {
         let (resonance_ev, temperature_k, awr) = (10.0_f64, 300.0_f64, 10.0_f64);
         let data = synthetic_swave_slbw(awr, resonance_ev, 1.5e-6, 1.5e-6, 5.0);
-        let params = DopplerParams::new(temperature_k, awr).unwrap();
         let doppler_width = (4.0 * resonance_ev * BOLTZMANN_EV_PER_K * temperature_k / awr).sqrt();
         let expected_fwhm = 2.0 * 2.0_f64.ln().sqrt() * doppler_width;
         assert!(
@@ -1085,7 +1171,7 @@ mod tests {
         );
 
         let energies: Vec<f64> = (0..=2400).map(|i| 9.4 + f64::from(i) * 5.0e-4).collect();
-        let capture = broaden_channel(&energies, &data, &params, Channel::Capture).unwrap();
+        let capture = broaden_channel(&energies, &data, temperature_k, Channel::Capture).unwrap();
         let profile: Vec<f64> = energies.iter().zip(&capture).map(|(e, s)| e * s).collect();
         let half = 0.5 * profile.iter().copied().fold(f64::MIN, f64::max);
         let crossing = |i: usize| {
@@ -1116,17 +1202,9 @@ mod tests {
         let energies = [6.5, 6.674, 7.1];
         let t = 300.0_f64;
         let h = 2.0_f64;
-        let params = DopplerParams::new(t, data.awr).unwrap();
-        let (_, analytic) = broaden_with_derivative(&energies, &data, &params).unwrap();
+        let (_, analytic) = broaden_with_derivative(&energies, &data, t).unwrap();
 
-        let at = |temperature: f64| {
-            broaden(
-                &energies,
-                &data,
-                &DopplerParams::new(temperature, data.awr).unwrap(),
-            )
-            .unwrap()
-        };
+        let at = |temperature: f64| broaden(&energies, &data, temperature).unwrap();
         let (m2, m1, p1, p2) = (at(t - 2.0 * h), at(t - h), at(t + h), at(t + 2.0 * h));
         for i in 0..energies.len() {
             let fd = (m2[i] - 8.0 * m1[i] + 8.0 * p1[i] - p2[i]) / (12.0 * h);
@@ -1155,16 +1233,25 @@ mod tests {
             .map(|xs| xs.total)
             .collect();
 
-        let cold = DopplerParams::new(0.0, data.awr).unwrap();
-        let (values, derivatives) = broaden_with_derivative(&energies, &data, &cold).unwrap();
+        let (values, derivatives) = broaden_with_derivative(&energies, &data, 0.0).unwrap();
         assert_eq!(values, expected);
         assert_eq!(derivatives, vec![0.0; 3]);
 
         // A temperature so small that u underflows to zero takes the same
         // path, rather than dividing by a zero width.
-        let underflowed = DopplerParams::new(f64::from_bits(1), data.awr).unwrap();
-        assert_eq!(underflowed.u(), 0.0);
-        assert_eq!(broaden(&energies, &data, &underflowed).unwrap(), expected);
+        let tiny = f64::from_bits(1);
+        assert_eq!(DopplerParams::new(tiny, data.awr).unwrap().u(), 0.0);
+        assert_eq!(broaden(&energies, &data, tiny).unwrap(), expected);
+
+        // At 0 K the route gate says `Unbroadened` for ANY source, so a
+        // tier-2-only formalism must get the unbroadened equation here and
+        // not a tier-1 refusal.
+        let rm = u238_with_formalism(ResonanceFormalism::ReichMoore);
+        assert_eq!(
+            classify_isotope(&rm, &energies, 0.0).unwrap(),
+            DopplerRoute::Unbroadened
+        );
+        assert!(broaden(&energies, &rm, 0.0).is_ok());
     }
 
     /// The sampled table converges to the integral as its grid is refined:
@@ -1175,7 +1262,7 @@ mod tests {
         let data = u238_with_formalism(ResonanceFormalism::MLBW);
         let params = DopplerParams::new(293.6, data.awr).unwrap();
         let targets = [6.4, 6.674, 6.95];
-        let exact = broaden(&targets, &data, &params).unwrap();
+        let exact = broaden(&targets, &data, 293.6).unwrap();
 
         let mut previous = f64::INFINITY;
         for refinement in [1usize, 4, 16] {
@@ -1215,15 +1302,14 @@ mod tests {
     #[test]
     fn a_target_is_bit_identical_across_grids_that_contain_it() {
         let data = u238_with_formalism(ResonanceFormalism::MLBW);
-        let params = DopplerParams::new(293.6, data.awr).unwrap();
-        let alone = broaden(&[6.674], &data, &params).unwrap()[0];
+        let alone = broaden(&[6.674], &data, 293.6).unwrap()[0];
         for grid in [
             vec![6.674, 7.0],
             vec![6.0, 6.674],
             vec![6.0, 6.3, 6.674, 7.0, 7.5],
         ] {
             let index = grid.iter().position(|&e| e == 6.674).unwrap();
-            let together = broaden(&grid, &data, &params).unwrap()[index];
+            let together = broaden(&grid, &data, 293.6).unwrap()[index];
             assert_eq!(
                 together.to_bits(),
                 alone.to_bits(),
@@ -1237,9 +1323,8 @@ mod tests {
     #[test]
     fn a_source_the_gate_refuses_is_an_error() {
         let data = u238_with_formalism(ResonanceFormalism::ReichMoore);
-        let params = DopplerParams::new(293.6, data.awr).unwrap();
         assert!(matches!(
-            broaden(&[6.674], &data, &params),
+            broaden(&[6.674], &data, 293.6),
             Err(DopplerError::NotTierOne {
                 reason: SampledTableReason::Formalism { .. }
             })
@@ -1258,9 +1343,8 @@ mod tests {
     #[test]
     fn an_exhausted_quadrature_budget_is_reported_not_absorbed() {
         let data = synthetic_swave_slbw(10.0, 10.0, 1.5e-6, 1.5e-6, 5.0);
-        let params = DopplerParams::new(300.0, 10.0).unwrap();
         let limited =
-            |budget| broaden_with_budget(&[10.0], &data, &params, Channel::Capture, false, budget);
+            |budget| broaden_with_budget(&[10.0], &data, 300.0, Channel::Capture, false, budget);
         assert!(matches!(
             limited(QuadratureBudget {
                 max_depth: 4,
@@ -1293,7 +1377,6 @@ mod tests {
             gfa: 0.0,
             gfb: 0.0,
         });
-        let params = DopplerParams::new(293.6, data.awr).unwrap();
         // The destructive-interference trough between the two same-J levels
         // sits near 20.00 keV, well BELOW both resonance energies.
         let energies: Vec<f64> = (0..=40).map(|i| 19_990.0 + f64::from(i) * 0.5).collect();
@@ -1309,7 +1392,7 @@ mod tests {
         let broadened = broaden_with_budget(
             &energies,
             &data,
-            &params,
+            293.6,
             Channel::Total,
             false,
             QuadratureBudget::default(),
@@ -1329,6 +1412,71 @@ mod tests {
             broadened.negative_values,
             broadened.values.iter().filter(|&&v| v < 0.0).count()
         );
+    }
+
+    /// An unrequested derivative was refined against the VALUE's error
+    /// criterion only, so it is not converged. Returning it would look like
+    /// an answer.
+    #[test]
+    fn a_derivative_that_was_not_requested_comes_back_zero() {
+        let data = u238_with_formalism(ResonanceFormalism::MLBW);
+        let energies = [6.5, 6.674, 7.1];
+        let without = broaden_with_budget(
+            &energies,
+            &data,
+            293.6,
+            Channel::Total,
+            false,
+            QuadratureBudget::default(),
+        )
+        .unwrap();
+        assert_eq!(without.derivatives, vec![0.0; energies.len()]);
+
+        // Control: asking for it gives something that is NOT zero, so the
+        // assertion above pins the opt-out rather than a dead code path.
+        let with = broaden_with_budget(
+            &energies,
+            &data,
+            293.6,
+            Channel::Total,
+            true,
+            QuadratureBudget::default(),
+        )
+        .unwrap();
+        assert!(with.derivatives.iter().all(|d| d.abs() > 0.0));
+        // The values agree to rounding but NOT to the bit: asking for the
+        // derivative puts its error into the refinement priority, so the
+        // panels are split in a different order and the sum reassociates.
+        for (a, b) in with.values.iter().zip(&without.values) {
+            assert!((a - b).abs() / b.abs() < 1e-12, "{a} vs {b}");
+        }
+    }
+
+    /// The budget bounds the panels the BREAKPOINTS produce, not only the
+    /// ones refinement adds. Before this, a source wide enough to exceed
+    /// the cap on its initial panels sailed past it, and if those panels
+    /// converged the cap was never consulted at all.
+    #[test]
+    fn the_panel_budget_bounds_the_initial_panels_too() {
+        let data = u238_with_formalism(ResonanceFormalism::MLBW);
+        // One resonance yields five breakpoints, so the initial panel count
+        // is above 1 but the target converges without any refinement — the
+        // case that used to escape.
+        assert!(matches!(
+            broaden_with_budget(
+                &[6.674],
+                &data,
+                293.6,
+                Channel::Total,
+                false,
+                QuadratureBudget {
+                    max_depth: MAX_DEPTH,
+                    max_active_panels: 1,
+                },
+            ),
+            Err(DopplerError::PanelLimit { limit: 1, .. })
+        ));
+        assert!(broaden(&[6.674], &data, 293.6).is_ok());
     }
 
     /// Condition 1, the eligible case: a resolved SLBW or MLBW source with

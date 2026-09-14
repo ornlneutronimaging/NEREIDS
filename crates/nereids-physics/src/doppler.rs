@@ -735,8 +735,17 @@ pub fn doppler_broaden(
         // σ_D(E) = Σ(C × J₀ − u × slope × J₁) / (Σ J₀ × E)
         broadened[i] = sum_y / (sum_g * e);
 
-        // Ensure non-negative
-        if broadened[i] < 0.0 {
+        // SAMMY's negative-value rule (`fgm/mfgm4.f90:83-101`) — the same
+        // rule the continuous tier applies, so one isotope cannot get
+        // different physics from the two tiers.  The quantity SAMMY tests
+        // is `Sigma` BEFORE its `/Em`, which is `sum_y / sum_g` here, in
+        // barn·eV; the contributing unbroadened points are the extended-grid
+        // samples this target's window actually integrated over.
+        if broadened[i] < 0.0
+            && zero_negative_value(sum_y / sum_g, || {
+                ext_y[seg_lo..=seg_hi].iter().any(|&sample| sample > 0.0)
+            })
+        {
             broadened[i] = 0.0;
         }
     }
@@ -1341,7 +1350,7 @@ mod tests {
     /// Reference: ex001a.lst (column 4 = theoretical Doppler-broadened capture σ)
     /// Par file: E₀ = 10 eV, Γγ = 1.0 meV, Γn = 0.5 meV
     /// SAMMY par file widths are in meV; we convert to eV (×0.001) for our code.
-    /// AWR = 10.0, radius = 2.908 fm, T = 300 K
+    /// mass = 10 amu so AWR = 10/1.008665 = 9.9141, radius = 2.908 fm, T = 300 K
     #[test]
     fn test_sammy_ex001_fgm_doppler() {
         // Build the ex001 resonance data: single SLBW resonance at 10 eV,
