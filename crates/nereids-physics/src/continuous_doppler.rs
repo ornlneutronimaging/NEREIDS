@@ -23,16 +23,23 @@
 //! ## Why the verdict is per isotope and all-or-nothing
 //!
 //! Mixing tiers within one isotope would make the reported cross-section a
-//! function of where the caller's grid happened to fall. The gate therefore
-//! reports the first failing condition at the lowest failing energy and
-//! demotes the whole isotope, so the answer depends on the source and the
-//! temperature rather than on the request.
+//! function of where in the grid each point happened to fall. The gate
+//! therefore reports the first failing condition at the lowest failing
+//! energy and demotes the whole isotope.
+//!
+//! The verdict does depend on the grid's EXTENT: a grid reaching past the
+//! resolved region asks a different question from one that stops inside it,
+//! and answering both the same way would hide the reach. What it does not
+//! depend on is the grid's ORDER, nor on where in the grid a failing energy
+//! sits — the same energies in any sequence give the same route, the same
+//! reason and the same formalism list.
 //!
 //! Nothing in the workspace calls this yet; the integral it guards arrives
 //! separately.
 
 use nereids_endf::resonance::{ResonanceData, ResonanceFormalism, ResonanceRange};
 
+use crate::doppler::DopplerParams;
 use crate::doppler_route::{DopplerRoute, SampledTableReason};
 use crate::reich_moore::{covers, upper_bound_is_half_open};
 
@@ -41,8 +48,14 @@ use crate::reich_moore::{covers, upper_bound_is_half_open};
 /// lies outside it, far below any tolerance the integral works to.
 pub const SUPPORT_X: f64 = 8.0;
 
-/// The Doppler route of one isotope over `work_energies`, at kernel width
-/// `thermal_u = √(k_B T / A)`.
+/// The Doppler route of one isotope over `work_energies`.
+///
+/// `params` must be the broadening parameters of THIS isotope, since the
+/// kernel width `u = √(k_B T / A)` is read from them. Taking the validated
+/// type rather than a bare `u` is what keeps that width finite and
+/// non-negative: a negative `u` puts the window's lower edge ABOVE its upper
+/// edge, and both containment tests below then pass on a window that does
+/// not exist.
 ///
 /// The verdict covers the whole grid: the lowest energy that fails a tier-1
 /// condition demotes the isotope and names the reason. Conditions are tested
@@ -51,12 +64,12 @@ pub const SUPPORT_X: f64 = 8.0;
 pub fn classify_isotope(
     data: &ResonanceData,
     work_energies: &[f64],
-    thermal_u: f64,
+    params: &DopplerParams,
 ) -> DopplerRoute {
     classify_isotope_with(
         data,
         work_energies,
-        thermal_u,
+        params,
         &ResonanceRange::has_file3_background,
     )
 }
@@ -67,22 +80,40 @@ pub fn classify_isotope(
 pub(crate) fn classify_isotope_with(
     data: &ResonanceData,
     work_energies: &[f64],
-    thermal_u: f64,
+    params: &DopplerParams,
     file3_present: &dyn Fn(&ResonanceRange) -> bool,
 ) -> DopplerRoute {
-    // Every formalism the grid was evaluated with, first use first. A grid
-    // may legitimately span adjacent resolved ranges of different
-    // formalisms; the disclosed route is the executed route, so it names
-    // all of them rather than the lowest energy's alone.
-    let mut formalisms: Vec<ResonanceFormalism> = Vec::new();
+    // At absolute zero there is no kernel to apply by either route, so the
+    // tier question does not arise. `DopplerParams` rejects a negative
+    // temperature outright, which is why this tests for equality.
+    if params.temperature_k() == 0.0 {
+        return DopplerRoute::Unbroadened;
+    }
+    // One pass up front, so the reduction below is provably free of values
+    // it cannot order: NaN compares false against everything, so a single
+    // NaN left in the grid would pin the reported reason to itself and mask
+    // the genuine lowest failing energy.
+    if let Some(&energy_ev) = work_energies.iter().find(|e| !e.is_finite() || **e <= 0.0) {
+        return DopplerRoute::SampledTable {
+            reason: SampledTableReason::NonPhysicalEnergy { energy_ev },
+        };
+    }
+    let thermal_u = params.u();
+    // Every range the grid was evaluated in, by range index. A grid may
+    // legitimately span adjacent resolved ranges of different formalisms;
+    // the disclosed route is the executed route, so it names all of them
+    // rather than the lowest energy's alone. Indices rather than formalisms,
+    // because the disclosure is then ordered by the source's own ranges
+    // instead of by the order the caller happened to list its energies in.
+    let mut range_indices: Vec<usize> = Vec::new();
     // The lowest failing energy, not the first one encountered: the grid is
     // a request, and its ORDER must not change the verdict either.
     let mut failure: Option<(f64, SampledTableReason)> = None;
     for &energy in work_energies {
         match tier_one_check(data, energy, thermal_u, file3_present) {
-            Ok(formalism) => {
-                if !formalisms.contains(&formalism) {
-                    formalisms.push(formalism);
+            Ok(index) => {
+                if !range_indices.contains(&index) {
+                    range_indices.push(index);
                 }
             }
             Err(reason) => {
@@ -95,9 +126,12 @@ pub(crate) fn classify_isotope_with(
     if let Some((_, reason)) = failure {
         return DopplerRoute::SampledTable { reason };
     }
-    // Only an empty grid gets here with nothing accumulated: it has no
-    // energy to fail at, so the verdict describes the source alone.
-    if formalisms.is_empty() {
+    // Only an empty grid gets here with nothing accumulated. With no energy
+    // to test, the only condition that can be evaluated is the formalism
+    // one: the window, overlap and File-3 conditions all need an energy, so
+    // an empty grid reports whether the source has ANY tier-1 range, and not
+    // whether a real grid over it would be routed continuously.
+    if range_indices.is_empty() {
         return match data.ranges.iter().find(|r| is_tier_one_formalism(r)) {
             Some(range) => DopplerRoute::Continuous {
                 formalisms: vec![range.formalism],
@@ -109,6 +143,14 @@ pub(crate) fn classify_isotope_with(
                 },
             },
         };
+    }
+    range_indices.sort_unstable();
+    let mut formalisms: Vec<ResonanceFormalism> = Vec::new();
+    for index in range_indices {
+        let formalism = data.ranges[index].formalism;
+        if !formalisms.contains(&formalism) {
+            formalisms.push(formalism);
+        }
     }
     DopplerRoute::Continuous { formalisms }
 }
@@ -122,14 +164,14 @@ fn is_tier_one_formalism(range: &ResonanceRange) -> bool {
         )
 }
 
-/// The tier-1 conditions at one energy, in order. `Ok` carries the covering
-/// range's formalism.
+/// The tier-1 conditions at one energy, in order. `Ok` carries the index of
+/// the covering range, which is what orders the disclosure.
 fn tier_one_check(
     data: &ResonanceData,
     energy_ev: f64,
     thermal_u: f64,
     file3_present: &dyn Fn(&ResonanceRange) -> bool,
-) -> Result<ResonanceFormalism, SampledTableReason> {
+) -> Result<usize, SampledTableReason> {
     let covering = |(index, range): &(usize, &ResonanceRange)| {
         covers(
             range.energy_low,
@@ -226,7 +268,7 @@ fn tier_one_check(
             formalism,
         });
     }
-    Ok(formalism)
+    Ok(index)
 }
 
 /// The reason for an energy that no range covers: the nearest resolved
@@ -266,14 +308,14 @@ mod tests {
 
     const ROOM_K: f64 = 293.6;
 
-    /// Kernel width at room temperature for the U-238 fixtures: 8u ≈ 0.083
-    /// √eV, so the window at 6.674 eV spans about ±0.43 eV.
-    fn u238_u() -> f64 {
-        DopplerParams::new(ROOM_K, 236.006).unwrap().u()
+    /// Room-temperature U-238: 8u ≈ 0.083 √eV, so the window at 6.674 eV
+    /// spans about ±0.43 eV.
+    fn u238_params() -> DopplerParams {
+        DopplerParams::new(ROOM_K, 236.006).unwrap()
     }
 
     fn route(data: &ResonanceData, energies: &[f64]) -> DopplerRoute {
-        classify_isotope(data, energies, u238_u())
+        classify_isotope(data, energies, &u238_params())
     }
 
     fn continuous(formalisms: &[ResonanceFormalism]) -> DopplerRoute {
@@ -364,19 +406,19 @@ mod tests {
     #[test]
     fn a_window_that_would_fold_through_zero_is_refused() {
         let data = synthetic_swave_slbw(1.0, 10.0, 1e-3, 1e-3, 3.0);
-        let thermal_u = DopplerParams::new(300.0, 1.0).unwrap().u();
+        let params = DopplerParams::new(300.0, 1.0).unwrap();
         assert_eq!(
-            classify_isotope(&data, &[0.01, 100.0], thermal_u),
+            classify_isotope(&data, &[0.01, 100.0], &params),
             DopplerRoute::SampledTable {
                 reason: SampledTableReason::ThermalWindowFoldsThroughZero {
                     energy_ev: 0.01,
-                    thermal_u,
+                    thermal_u: params.u(),
                     formalism: ResonanceFormalism::SLBW,
                 }
             }
         );
         assert_eq!(
-            classify_isotope(&data, &[100.0], thermal_u),
+            classify_isotope(&data, &[100.0], &params),
             continuous(&[ResonanceFormalism::SLBW])
         );
     }
@@ -429,7 +471,7 @@ mod tests {
             }
         );
         // Control: a non-evaluable neighbour contributes no cross-section,
-        // so it is not an overlap -- and placed FIRST it must not mask the
+        // so it is not an overlap — and placed FIRST it must not mask the
         // range that does carry the cross-section either.
         data.ranges[1].formalism = ResonanceFormalism::Unresolved;
         data.ranges[1].resolved = false;
@@ -449,7 +491,7 @@ mod tests {
     fn a_file3_background_is_refused_and_the_real_predicate_is_the_one_consulted() {
         let data = u238_with_formalism(ResonanceFormalism::MLBW);
         assert_eq!(
-            classify_isotope_with(&data, &[6.674], u238_u(), &|_| true),
+            classify_isotope_with(&data, &[6.674], &u238_params(), &|_| true),
             DopplerRoute::SampledTable {
                 reason: SampledTableReason::File3Background {
                     energy_ev: 6.674,
@@ -458,13 +500,20 @@ mod tests {
             }
         );
         assert_eq!(
-            classify_isotope_with(&data, &[6.674], u238_u(), &|_| false),
+            classify_isotope_with(&data, &[6.674], &u238_params(), &|_| false),
             continuous(&[ResonanceFormalism::MLBW])
         );
         // The pair that must be updated together when MF=3 support lands.
         assert!(data.ranges.iter().all(|r| !r.has_file3_background()));
         assert_eq!(
             route(&data, &[6.674]),
+            continuous(&[ResonanceFormalism::MLBW])
+        );
+        // The empty grid does NOT consult the predicate, because it has no
+        // energy to consult it at. Pinned so the limitation is visible
+        // rather than mistaken for a File-3 refusal that never ran.
+        assert_eq!(
+            classify_isotope_with(&data, &[], &u238_params(), &|_| true),
             continuous(&[ResonanceFormalism::MLBW])
         );
     }
@@ -489,10 +538,15 @@ mod tests {
             route(&data, &[500.0]),
             continuous(&[ResonanceFormalism::MLBW])
         );
+        // Ordered by the source's ranges, not by the caller's grid: a
+        // TOF-derived grid runs DESCENDING in energy and must disclose the
+        // same route, comparing equal to the ascending one.
+        let ascending = route(&data, &[50.0, 500.0]);
         assert_eq!(
-            route(&data, &[50.0, 500.0]),
+            ascending,
             continuous(&[ResonanceFormalism::SLBW, ResonanceFormalism::MLBW])
         );
+        assert_eq!(route(&data, &[500.0, 50.0]), ascending);
         // At 99.9 eV the window reaches the shared bound, where a source
         // energy would be evaluated with the MLBW range above.
         let DopplerRoute::SampledTable {
@@ -526,10 +580,12 @@ mod tests {
         }
     }
 
-    /// An empty grid has no energy to fail at, so the verdict describes the
-    /// source alone.
+    /// An empty grid has no energy to test, so only the formalism condition
+    /// can be evaluated. It reports whether the source has any tier-1 range
+    /// at all — NOT that a real grid over it would be routed continuously,
+    /// which the narrowed-range case below makes explicit.
     #[test]
-    fn an_empty_grid_takes_the_verdict_of_the_source() {
+    fn an_empty_grid_reports_the_formalism_condition_alone() {
         assert_eq!(
             route(&u238_with_formalism(ResonanceFormalism::MLBW), &[]),
             continuous(&[ResonanceFormalism::MLBW])
@@ -541,6 +597,71 @@ mod tests {
                     formalism: Some(ResonanceFormalism::ReichMoore),
                     ..
                 }
+            }
+        ));
+        // A range too narrow to hold any window: every real grid over it is
+        // refused, the empty grid still reports Continuous.
+        let mut narrow = u238_with_formalism(ResonanceFormalism::MLBW);
+        narrow.ranges[0].energy_low = 6.6;
+        narrow.ranges[0].energy_high = 6.7;
+        assert!(matches!(
+            route(&narrow, &[6.674]),
+            DopplerRoute::SampledTable {
+                reason: SampledTableReason::WindowCrossesRangeBoundary { .. }
+            }
+        ));
+        assert_eq!(route(&narrow, &[]), continuous(&[ResonanceFormalism::MLBW]));
+    }
+
+    /// 0 K is neither tier: `DopplerParams` accepts it as "no broadening",
+    /// and the gate must not report a continuous integral over a kernel of
+    /// zero width.
+    #[test]
+    fn absolute_zero_is_neither_tier() {
+        let data = u238_with_formalism(ResonanceFormalism::MLBW);
+        let cold = DopplerParams::new(0.0, 236.006).unwrap();
+        assert_eq!(
+            classify_isotope(&data, &[6.674], &cold),
+            DopplerRoute::Unbroadened
+        );
+        // Control: the same source, the same grid, one kelvin up.
+        let warm = DopplerParams::new(1.0, 236.006).unwrap();
+        assert_eq!(
+            classify_isotope(&data, &[6.674], &warm),
+            continuous(&[ResonanceFormalism::MLBW])
+        );
+    }
+
+    /// A grid energy that is not positive and finite is named as such, and
+    /// — the point of rejecting it up front — does NOT displace the real
+    /// lowest failing energy, which is what a NaN left in the reduction
+    /// would do, since NaN compares false against every other value.
+    #[test]
+    fn a_non_physical_grid_energy_is_named_and_does_not_mask_the_real_failure() {
+        let data = u238_with_formalism(ResonanceFormalism::MLBW);
+        for bad in [f64::NAN, f64::INFINITY, -5.0, 0.0] {
+            let DopplerRoute::SampledTable {
+                reason: SampledTableReason::NonPhysicalEnergy { energy_ev },
+            } = route(&data, &[bad, 6.674])
+            else {
+                panic!("energy {bad} must be refused as non-physical");
+            };
+            assert_eq!(energy_ev.to_bits(), bad.to_bits(), "bad energy {bad}");
+        }
+        // The masking falsifier: 9990 eV alone is refused for crossing the
+        // range edge, and putting NaN in front of it must not silently
+        // convert that diagnosis into the NaN one.
+        let DopplerRoute::SampledTable {
+            reason: SampledTableReason::WindowCrossesRangeBoundary { energy_ev, .. },
+        } = route(&data, &[9990.0])
+        else {
+            panic!("9990 eV must be refused at the range edge");
+        };
+        assert_eq!(energy_ev, 9990.0);
+        assert!(matches!(
+            route(&data, &[f64::NAN, 9990.0]),
+            DopplerRoute::SampledTable {
+                reason: SampledTableReason::NonPhysicalEnergy { .. }
             }
         ));
     }

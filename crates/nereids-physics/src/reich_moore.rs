@@ -2407,20 +2407,68 @@ mod tests {
             ResonanceFormalism::ReichMoore,
         ] {
             let data = u238_with_formalism(formalism);
-            let plan = CrossSectionPlan::new(&data);
-            let on_grid = cross_sections_on_grid(&data, &energies);
-            for (&energy, grid) in energies.iter().zip(&on_grid) {
-                let point = cross_sections_at_energy(&data, energy);
-                let one = plan.evaluate_one(energy);
-                for (a, b, c) in [
-                    (grid.total, point.total, one.total),
-                    (grid.elastic, point.elastic, one.elastic),
-                    (grid.capture, point.capture, one.capture),
-                    (grid.fission, point.fission, one.fission),
-                ] {
-                    assert_eq!(a.to_bits(), b.to_bits(), "{formalism:?} at {energy} eV");
-                    assert_eq!(a.to_bits(), c.to_bits(), "{formalism:?} at {energy} eV");
-                }
+            assert_bit_identical(&data, &energies, formalism);
+        }
+    }
+
+    /// The same three evaluators across a bound SHARED by two evaluable
+    /// ranges, which is the only arrangement that makes
+    /// `upper_bound_is_half_open` answer `true`. The single-range fixture
+    /// above can never reach that branch, so without this the consolidated
+    /// `covers` predicate would be pinned only on its inclusive side and the
+    /// three dispatch sites could drift apart exactly where the rule bites.
+    #[test]
+    fn the_three_evaluators_agree_on_a_shared_range_bound() {
+        let mut data = u238_with_formalism(ResonanceFormalism::SLBW);
+        data.ranges[0].energy_high = 100.0;
+        let mut upper = u238_with_formalism(ResonanceFormalism::MLBW).ranges[0].clone();
+        upper.energy_low = 100.0;
+        upper.l_groups[0].resonances[0].energy = 150.0;
+        data.ranges.push(upper);
+        assert!(
+            upper_bound_is_half_open(&data, 0),
+            "the fixture must share a bound"
+        );
+
+        // Non-vacuity: the two ranges must disagree at the shared bound, or
+        // agreeing on which one owns it would prove nothing. Each is asked
+        // alone, with its own bound widened so that it does cover 100 eV.
+        let alone = |index: usize| {
+            let mut one = data.clone();
+            one.ranges = vec![one.ranges[index].clone()];
+            one.ranges[0].energy_low = 1e-5;
+            one.ranges[0].energy_high = 1e4;
+            cross_sections_at_energy(&one, 100.0)
+        };
+        let (lower_only, upper_only) = (alone(0), alone(1));
+        assert_ne!(lower_only.total.to_bits(), upper_only.total.to_bits());
+
+        let energies = [99.0, 99.999_999, 100.0, 100.000_001, 101.0];
+        assert_bit_identical(&data, &energies, ResonanceFormalism::SLBW);
+
+        // The bound itself belongs to the upper range alone.
+        assert_eq!(
+            cross_sections_at_energy(&data, 100.0).total.to_bits(),
+            upper_only.total.to_bits()
+        );
+    }
+
+    /// Every channel of the plan, the grid function and the per-point
+    /// function, compared to the bit.
+    fn assert_bit_identical(data: &ResonanceData, energies: &[f64], label: ResonanceFormalism) {
+        let plan = CrossSectionPlan::new(data);
+        let on_grid = cross_sections_on_grid(data, energies);
+        for (&energy, grid) in energies.iter().zip(&on_grid) {
+            let point = cross_sections_at_energy(data, energy);
+            let one = plan.evaluate_one(energy);
+            for (a, b, c) in [
+                (grid.total, point.total, one.total),
+                (grid.elastic, point.elastic, one.elastic),
+                (grid.capture, point.capture, one.capture),
+                (grid.fission, point.fission, one.fission),
+            ] {
+                assert_eq!(a.to_bits(), b.to_bits(), "{label:?} at {energy} eV");
+                assert_eq!(a.to_bits(), c.to_bits(), "{label:?} at {energy} eV");
             }
         }
     }

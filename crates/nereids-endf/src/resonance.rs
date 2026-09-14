@@ -491,12 +491,14 @@ impl ResonanceRange {
     /// Whether this range carries a File-3 (MF=3) smooth background
     /// cross-section term.
     ///
-    /// Only File 2 is parsed, so this is `false` for every range today. The
-    /// predicate exists ahead of the data because the two-tier Doppler
-    /// contract routes any isotope with a File-3 term to the sampled-table
-    /// tier, and the route gate already consults it: whichever change adds
-    /// MF=3 support must make this observe the parsed data, and until it
-    /// does, File-3 data cannot silently take the continuous route.
+    /// Only File 2 is parsed, so the answer is unknown for every range today
+    /// and this reports `false` — it does not detect a background term, and
+    /// an evaluation carrying one is indistinguishable here from one that
+    /// does not. The predicate exists ahead of its data as the integration
+    /// point: the two-tier Doppler contract routes any isotope with a File-3
+    /// term to the sampled-table tier and the route gate already consults
+    /// this, so whichever change adds MF=3 support has one place to make the
+    /// answer real rather than a gate to discover afterwards.
     pub fn has_file3_background(&self) -> bool {
         false
     }

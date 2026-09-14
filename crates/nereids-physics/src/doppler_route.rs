@@ -18,8 +18,10 @@ use nereids_endf::resonance::ResonanceFormalism;
 /// The Doppler route one isotope took, for the whole grid.
 #[derive(Debug, Clone, PartialEq)]
 pub enum DopplerRoute {
-    /// No broadening was applied (temperature ≤ 0 K). Nothing is sampled
-    /// and nothing is integrated, so this is neither tier.
+    /// No broadening was applied: the sample is at 0 K, the one temperature
+    /// `DopplerParams` accepts as meaning no kernel at all (it rejects a
+    /// negative one). Nothing is sampled and nothing is integrated, so this
+    /// is neither tier.
     Unbroadened,
     /// Tier 1: the free-gas kernel integrated over the resonance equation.
     /// Grid-independent by construction.
@@ -115,6 +117,14 @@ pub enum SampledTableReason {
         other_range_index: usize,
         /// Formalism of the covering range.
         formalism: ResonanceFormalism,
+    },
+    /// A grid energy is not a positive, finite number, so no window can be
+    /// placed around it. Rejected up front rather than per energy: NaN
+    /// compares false against every other value, so one left in the grid
+    /// would mask the genuine lowest failing energy.
+    NonPhysicalEnergy {
+        /// The offending grid energy (eV).
+        energy_ev: f64,
     },
     /// The covering range carries a File-3 (MF=3) background term, which
     /// the resonance equation does not represent.
@@ -234,6 +244,12 @@ impl fmt::Display for SampledTableReason {
                 "resonance range {other_range_index} overlaps the thermal window at \
                  {energy_ev:.2e} eV"
             ),
+            Self::NonPhysicalEnergy { energy_ev } => {
+                write!(
+                    f,
+                    "grid energy {energy_ev:.2e} eV is not positive and finite"
+                )
+            }
             Self::File3Background { energy_ev, .. } => {
                 write!(f, "File-3 background term present at {energy_ev:.2e} eV")
             }
@@ -254,6 +270,17 @@ mod tests {
             (
                 DopplerRoute::Unbroadened,
                 "no Doppler broadening (temperature 0 K)",
+            ),
+            (
+                sampled(SampledTableReason::NonPhysicalEnergy {
+                    energy_ev: f64::NAN,
+                }),
+                "sampled-table kernel-on-grid (grid energy NaN eV is not positive and finite)",
+            ),
+            (
+                sampled(SampledTableReason::NonPhysicalEnergy { energy_ev: -5.0 }),
+                "sampled-table kernel-on-grid (grid energy -5.00e0 eV is not positive and \
+                 finite)",
             ),
             (
                 DopplerRoute::Continuous {
