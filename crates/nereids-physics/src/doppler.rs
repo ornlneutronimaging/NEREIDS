@@ -65,6 +65,42 @@ const DOPPLER_N_SIGMA: f64 = 6.0;
 /// create a near-duplicate of the explicit v = 0 anchor point.
 const NEGATIVE_VELOCITY_FLOOR: f64 = 1e-15;
 
+/// Magnitude (barn·eV) below which a negative broadened value is noise and
+/// is set to zero.
+///
+/// SAMMY tests `Sigma = Σ Wts·σ` (`fgm/mfgm4.f90:84`), where the
+/// Modsmp/Modfpl weights carry `Velcty**2 = E′` (`fgm/mfgm2.f90:101`,
+/// `:203`): the quantity tested is the kernel-weighted mean of `E′·σ(E′)`,
+/// in barn·eV, BEFORE the division by `Em` that makes it a cross-section
+/// (`mfgm4.f90:123-136`). Expressed in barn the cutoff would be `1e-15/E`,
+/// which is why the rule is applied to the energy-weighted value.
+pub(crate) const NEGATIVE_VALUE_FLOOR_BARN_EV: f64 = 1e-15;
+
+/// SAMMY's rule for a negative broadened cross-section (`fgm/mfgm4.f90`
+/// lines 83-101, `Dopfgm`).
+///
+/// An energy-weighted value `E·σ_D` above `−1e-15` barn·eV is noise and is
+/// set to zero. Below it, the value is zeroed when no contributing
+/// unbroadened point was positive — the source is negative throughout the
+/// kernel window, so the convolution cannot mean anything else — and kept
+/// otherwise, which is where SAMMY prints "Negative cross section". A kept
+/// negative is physical: an SLBW total whose same-J interference terms
+/// outweigh the shared potential term really is negative there.
+///
+/// `weighted` is `E·σ_D`, SAMMY's `Sigma` before `/Em`, and must be
+/// negative. `any_source_positive` is consulted only when the magnitude
+/// test does not decide. `true` means zero it.
+pub(crate) fn zero_negative_value(
+    weighted: f64,
+    any_source_positive: impl FnOnce() -> bool,
+) -> bool {
+    debug_assert!(
+        weighted < 0.0,
+        "the rule applies to negative values only, got {weighted}"
+    );
+    weighted > -NEGATIVE_VALUE_FLOOR_BARN_EV || !any_source_positive()
+}
+
 /// Errors from `DopplerParams` construction.
 #[derive(Debug, PartialEq)]
 pub enum DopplerParamsError {
@@ -111,6 +147,48 @@ pub enum DopplerError {
     InvalidParams(DopplerParamsError),
     /// The energy grid is empty, so there is nothing to answer about.
     EmptyGrid,
+    /// The source does not qualify for tier-1 broadening on this grid. The
+    /// reason is the one the route gate discloses.
+    NotTierOne {
+        /// First failing condition, at the lowest failing energy.
+        reason: crate::doppler_route::SampledTableReason,
+    },
+    /// A converged tier-1 value or temperature derivative is non-finite.
+    /// A NEGATIVE value is not an error: SAMMY keeps a genuinely negative
+    /// broadened cross-section (`fgm/mfgm4.f90:83-101`) rather than
+    /// clamping it. A NaN or infinity is.
+    NonFiniteIntegral {
+        /// Target energy (eV).
+        energy_ev: f64,
+        /// The offending value.
+        value: f64,
+        /// Whether it was the derivative rather than the value.
+        derivative: bool,
+    },
+    /// Tier-1 refinement would exceed the active-panel limit.
+    PanelLimit {
+        /// Target energy (eV).
+        energy_ev: f64,
+        /// The limit that was hit.
+        limit: usize,
+    },
+    /// Tier-1 refinement would exceed the bisection depth limit.
+    DepthLimit {
+        /// Target energy (eV).
+        energy_ev: f64,
+        /// The limit that was hit.
+        depth: usize,
+    },
+    /// A tier-1 panel is too narrow to bisect in floating point: its
+    /// midpoint equals one of its own edges, so refinement cannot progress.
+    MidpointStagnation {
+        /// Target energy (eV).
+        energy_ev: f64,
+        /// Panel left edge in kernel coordinate `x`.
+        left: f64,
+        /// Panel right edge in kernel coordinate `x`.
+        right: f64,
+    },
     /// An energy value is non-finite (NaN/±∞) or non-positive (≤ 0).
     ///
     /// The FGM velocity transform computes `v = √E`, so non-positive or
@@ -155,6 +233,41 @@ impl fmt::Display for DopplerError {
             ),
             Self::InvalidParams(e) => write!(f, "invalid broadening parameters: {e}"),
             Self::EmptyGrid => write!(f, "the energy grid is empty"),
+            Self::NotTierOne { reason } => {
+                write!(
+                    f,
+                    "the source is not eligible for tier-1 broadening: {reason}"
+                )
+            }
+            Self::NonFiniteIntegral {
+                energy_ev,
+                value,
+                derivative,
+            } => write!(
+                f,
+                "the tier-1 {} at {energy_ev:.2e} eV converged to {value}, which is not finite",
+                if *derivative {
+                    "derivative"
+                } else {
+                    "integral"
+                }
+            ),
+            Self::PanelLimit { energy_ev, limit } => write!(
+                f,
+                "tier-1 quadrature at {energy_ev:.2e} eV would exceed {limit} active panels"
+            ),
+            Self::DepthLimit { energy_ev, depth } => write!(
+                f,
+                "tier-1 quadrature at {energy_ev:.2e} eV would exceed bisection depth {depth}"
+            ),
+            Self::MidpointStagnation {
+                energy_ev,
+                left,
+                right,
+            } => write!(
+                f,
+                "tier-1 panel [{left}, {right}] at {energy_ev:.2e} eV cannot be bisected further"
+            ),
             Self::InvalidEnergy { index, value } => write!(
                 f,
                 "energies[{index}] = {value} is not finite or not strictly positive (Doppler broadening requires every energy to satisfy is_finite() && > 0)"
@@ -622,8 +735,30 @@ pub fn doppler_broaden(
         // σ_D(E) = Σ(C × J₀ − u × slope × J₁) / (Σ J₀ × E)
         broadened[i] = sum_y / (sum_g * e);
 
-        // Ensure non-negative
-        if broadened[i] < 0.0 {
+        // SAMMY's negative-value rule (`fgm/mfgm4.f90:83-101`) — the same
+        // rule the continuous tier applies, so one isotope cannot get
+        // different physics from the two tiers.  The quantity SAMMY tests
+        // is `Sigma` BEFORE its `/Em`, which is `sum_y / sum_g` here, in
+        // barn·eV; the contributing unbroadened points are the extended-grid
+        // samples this target's window actually integrated over.
+        //
+        // SAMMY counts points whose CROSS-SECTION is positive
+        // (`mfgm4.f90:89`, on the stored sigma), and `ext_y` is not sigma:
+        // it is the odd-extended integrand `w²·σ(w²)`, built as `−w²·σ`
+        // over the negative-velocity image branch (see
+        // `build_extended_fgm_grid`).  A positive `ext_y` there therefore
+        // means a NEGATIVE cross-section.  Multiplying by `ext_v` undoes
+        // that: `ext_y·ext_v > 0` is `σ > 0` on both branches, and the
+        // `w = 0` anchor gives exactly 0, which is correctly no evidence
+        // either way.
+        if broadened[i] < 0.0
+            && zero_negative_value(sum_y / sum_g, || {
+                ext_y[seg_lo..=seg_hi]
+                    .iter()
+                    .zip(&ext_v[seg_lo..=seg_hi])
+                    .any(|(&integrand, &velocity)| integrand * velocity > 0.0)
+            })
+        {
             broadened[i] = 0.0;
         }
     }
@@ -733,6 +868,18 @@ pub fn doppler_broaden_with_derivative(
         // derivative is exactly zero.
         let window_truncated = v_lo < ext_v[0] || v_hi > ext_v[n_ext - 1];
         if window_truncated && j_hi - j_lo < 3 {
+            derivative[i] = 0.0;
+            continue;
+        }
+
+        // SAMMY's negative-value rule may have zeroed the forward value
+        // (`fgm/mfgm4.f90:83-101`).  The derivative of a value the rule
+        // replaced with zero is zero — reporting a moving derivative for a
+        // flat reported cross-section would be incoherent, and it is what
+        // the continuous tier already does by returning value and
+        // derivative together as zero.  Reading the forward result rather
+        // than re-testing the predicate keeps one decision in one place.
+        if broadened[i] == 0.0 {
             derivative[i] = 0.0;
             continue;
         }
@@ -999,6 +1146,132 @@ mod tests {
 
     // --- End validation tests ---
 
+    /// SAMMY's negative-value rule (`fgm/mfgm4.f90:83-101`) has three
+    /// outcomes and one call site per tier, so each outcome is pinned here
+    /// directly rather than only through a broadening that happens to
+    /// reach it.
+    #[test]
+    fn the_sammy_negative_value_rule_has_three_outcomes() {
+        // Above the floor: noise, zero it, whatever the source did.
+        assert!(zero_negative_value(-1e-16, || true));
+        assert!(zero_negative_value(-1e-16, || false));
+        // Below the floor with no positive contributing point: the source
+        // is negative throughout the window, so the convolution cannot mean
+        // anything else.
+        assert!(zero_negative_value(-1.0, || false));
+        // Below the floor WITH a positive contributing point: keep it.
+        // This is the "Negative cross section" case SAMMY prints.
+        assert!(!zero_negative_value(-1.0, || true));
+        // The floor is exactly 1e-15 barn·eV and the comparison is strict.
+        assert!(zero_negative_value(
+            -NEGATIVE_VALUE_FLOOR_BARN_EV * 0.5,
+            || true
+        ));
+        assert!(!zero_negative_value(
+            -NEGATIVE_VALUE_FLOOR_BARN_EV * 2.0,
+            || true
+        ));
+    }
+
+    /// The sampled tier applies that rule to its own window, so a genuine
+    /// negative survives and an all-negative window is zeroed. Before this,
+    /// the tier hard-clamped every negative and disagreed with the
+    /// continuous tier on the same isotope.
+    #[test]
+    fn the_sampled_tier_keeps_a_genuine_negative_and_zeroes_a_dead_window() {
+        let params = DopplerParams::new(293.6, 55.45).unwrap();
+        let energies: Vec<f64> = (0..=200).map(|i| 100.0 + f64::from(i) * 0.5).collect();
+
+        // A dip that goes negative in the middle of a positive curve: the
+        // window around it still contains positive samples, so SAMMY keeps
+        // the negative.
+        let mut kept: Vec<f64> = energies.iter().map(|_| 5.0).collect();
+        for value in kept.iter_mut().skip(98).take(5) {
+            *value = -4.0;
+        }
+        let broadened = doppler_broaden(&energies, &kept, &params).unwrap();
+        assert!(
+            broadened.iter().any(|&v| v < 0.0),
+            "a negative with positive neighbours must survive, got min {:?}",
+            broadened.iter().copied().fold(f64::MAX, f64::min)
+        );
+
+        // A curve that is negative everywhere has no positive contributing
+        // point anywhere, so every output is zeroed.
+        let dead: Vec<f64> = energies.iter().map(|_| -5.0).collect();
+        let broadened = doppler_broaden(&energies, &dead, &params).unwrap();
+        assert!(
+            broadened.iter().all(|&v| v == 0.0),
+            "an all-negative window must zero, got {:?}",
+            broadened.iter().copied().fold(f64::MIN, f64::max)
+        );
+    }
+
+    /// A value SAMMY's rule zeroed must come back with a zero derivative:
+    /// the reported cross-section is flat there, so a moving derivative
+    /// would describe a curve the forward pass does not return.
+    #[test]
+    fn a_zeroed_value_has_a_zeroed_temperature_derivative() {
+        let params = DopplerParams::new(293.6, 55.45).unwrap();
+        let energies: Vec<f64> = (0..=200).map(|i| 100.0 + f64::from(i) * 0.5).collect();
+        let dead: Vec<f64> = energies.iter().map(|_| -5.0).collect();
+
+        let (values, derivatives) =
+            doppler_broaden_with_derivative(&energies, &dead, &params).unwrap();
+        assert!(values.iter().all(|&v| v == 0.0), "the rule must zero these");
+        for (i, (&value, &derivative)) in values.iter().zip(&derivatives).enumerate() {
+            assert!(
+                value != 0.0 || derivative == 0.0,
+                "E={} eV reports value {value} with derivative {derivative}",
+                energies[i]
+            );
+        }
+
+        // Control: a positive source is untouched by the rule and DOES
+        // have a nonzero derivative, so the assertion above is not vacuous.
+        let live: Vec<f64> = energies
+            .iter()
+            .map(|&e| 100.0 / (1.0 + (e - 150.0).powi(2)))
+            .collect();
+        let (_, derivatives) = doppler_broaden_with_derivative(&energies, &live, &params).unwrap();
+        assert!(derivatives.iter().any(|&d| d != 0.0));
+    }
+
+    /// The same rule where the kernel window reaches BELOW zero velocity,
+    /// so the extended grid carries image nodes.
+    ///
+    /// The evidence SAMMY counts is the sign of σ, and over the image
+    /// branch the stored integrand is `−w²·σ`, so reading the integrand
+    /// directly inverts it exactly there. A light target at low energy is
+    /// where that happens: AWR 1 at 300 K gives u ≈ 0.16 √eV, so at 0.02 eV
+    /// the window's lower edge `√E − 6u` is about −0.82 and the image
+    /// branch is populated.
+    #[test]
+    fn the_negative_rule_reads_cross_section_sign_across_the_velocity_image() {
+        let params = DopplerParams::new(300.0, 1.0).unwrap();
+        let energies: Vec<f64> = (1..=200).map(|i| f64::from(i) * 2.0e-4).collect();
+        assert!(
+            energies[0].sqrt() - 6.0 * params.u() < 0.0,
+            "the fixture must reach below zero velocity, or it cannot see this"
+        );
+
+        // Negative everywhere: no positive σ anywhere, image branch or not,
+        // so SAMMY zeroes. Reading the raw integrand would find positive
+        // samples in the mirror region and wrongly KEEP these.
+        let dead: Vec<f64> = energies.iter().map(|_| -3.0).collect();
+        let broadened = doppler_broaden(&energies, &dead, &params).unwrap();
+        assert!(
+            broadened.iter().all(|&v| v <= 0.0),
+            "an all-negative source must never broaden positive"
+        );
+        assert!(
+            broadened.iter().all(|&v| v == 0.0),
+            "an all-negative source has no positive contributing point, so it zeroes;              got min {:?} max {:?}",
+            broadened.iter().copied().fold(f64::MAX, f64::min),
+            broadened.iter().copied().fold(f64::MIN, f64::max)
+        );
+    }
+
     #[test]
     fn test_doppler_width_u238() {
         // SAMMY reports Doppler width at 6.075 eV = 0.05159437 eV for U-238
@@ -1228,7 +1501,7 @@ mod tests {
     /// Reference: ex001a.lst (column 4 = theoretical Doppler-broadened capture σ)
     /// Par file: E₀ = 10 eV, Γγ = 1.0 meV, Γn = 0.5 meV
     /// SAMMY par file widths are in meV; we convert to eV (×0.001) for our code.
-    /// AWR = 10.0, radius = 2.908 fm, T = 300 K
+    /// mass = 10 amu so AWR = 10/1.008665 = 9.9141, radius = 2.908 fm, T = 300 K
     #[test]
     fn test_sammy_ex001_fgm_doppler() {
         // Build the ex001 resonance data: single SLBW resonance at 10 eV,

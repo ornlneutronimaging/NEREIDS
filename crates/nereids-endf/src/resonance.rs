@@ -1211,8 +1211,9 @@ pub mod test_support {
     /// The SAMMY input gives this fictitious target a mass of 10 amu, but
     /// AWR is mass ÷ NEUTRON mass, so the ratio is 9.9141 and not 10.  The
     /// difference is 0.87%, and the free-gas kernel width goes as
-    /// `1/√AWR`, so using the amu figure makes every broadened curve built
-    /// from this fixture 0.43% too wide.
+    /// `1/√AWR`, so the LARGER amu figure makes every broadened curve built
+    /// from this fixture 0.43% too NARROW (Δ_D 0.32157 eV instead of
+    /// 0.32296 eV at 10 eV and 300 K).
     pub fn ex001_hydrogen_single_resonance() -> ResonanceData {
         let awr = 10.0 / nereids_core::constants::NEUTRON_MASS_AMU;
         wrap(
