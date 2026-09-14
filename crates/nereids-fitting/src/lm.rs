@@ -475,6 +475,30 @@ pub(crate) fn invert_informative_block(a: &FlatMatrix) -> (Option<FlatMatrix>, V
     (Some(full), excluded)
 }
 
+/// The `warnings` line for one parameter [`invert_informative_block`]
+/// excluded, saying what the exclusion actually cost.
+///
+/// `cause` names why the parameter carries no information. The consequence
+/// is decided by what came back with it: when the retained block inverted,
+/// every other free parameter keeps its uncertainty and only this one is
+/// NaN. When it did not — the parameters left after the exclusion are
+/// themselves degenerate — the fit returns NO covariance and NO
+/// uncertainties at all, and promising the caller a covariance over "the
+/// other free parameters" names a matrix it was never given.
+pub(crate) fn uninformative_parameter_warning(
+    name: &str,
+    cause: &str,
+    covariance_survived: bool,
+) -> String {
+    let consequence = if covariance_survived {
+        "the covariance covers the other free parameters"
+    } else {
+        "the block left after excluding it is itself singular, so no covariance and no \
+         uncertainties are reported for any parameter"
+    };
+    format!("covariance: the uncertainty of `{name}` is NaN because {cause}; {consequence}")
+}
+
 /// Invert a symmetric positive definite matrix (for covariance).
 ///
 /// Input: flat n×n matrix. Output: flat n×n inverse, or None if singular.
@@ -998,10 +1022,7 @@ pub fn levenberg_marquardt_with_mask(
                     } else {
                         "the model output does not respond to it at the solution"
                     };
-                    format!(
-                        "covariance: the uncertainty of `{name}` is NaN because {cause}; the \
-                         covariance covers the other free parameters"
-                    )
+                    uninformative_parameter_warning(name, cause, inverse.is_some())
                 })
                 .collect();
             if let Some(mut cov) = inverse {
@@ -2152,6 +2173,83 @@ mod tests {
             vec![
                 "covariance: the uncertainty of `b` is NaN because the model refused every \
                  finite-difference probe of it; the covariance covers the other free parameters"
+                    .to_string()
+            ]
+        );
+    }
+
+    /// `y_i = (a + c)·x_i`, with `b` absent from the output entirely.
+    ///
+    /// The Jacobian is analytical so the degeneracy is EXACT: `a` and `c`
+    /// get the identical column `x`, and `b` a column of zeros. A
+    /// finite-difference Jacobian of the same model would give `a` and `c`
+    /// columns that differ in the last bits, which is near-singular, not
+    /// singular, and would invert.
+    struct CollinearModel {
+        x: Vec<f64>,
+    }
+
+    impl FitModel for CollinearModel {
+        fn evaluate(&self, params: &[f64]) -> Result<Vec<f64>, FittingError> {
+            let (a, c) = (params[0], params[2]);
+            Ok(self.x.iter().map(|&x| (a + c) * x).collect())
+        }
+
+        fn analytical_jacobian(
+            &self,
+            _params: &[f64],
+            free_param_indices: &[usize],
+            y_current: &[f64],
+        ) -> Option<FlatMatrix> {
+            let mut j = FlatMatrix::zeros(y_current.len(), free_param_indices.len());
+            for (col, &idx) in free_param_indices.iter().enumerate() {
+                if idx == 1 {
+                    continue; // `b` does nothing
+                }
+                for (row, &x) in self.x.iter().enumerate() {
+                    *j.get_mut(row, col) = x;
+                }
+            }
+            Some(j)
+        }
+    }
+
+    /// Excluding an unprobed parameter does not always leave an invertible
+    /// block. When the parameters that remain are themselves degenerate the
+    /// fit returns NO covariance and NO uncertainties — so the line must not
+    /// go on promising a covariance "over the other free parameters", which
+    /// sends the reader looking for numbers that were never produced.
+    #[test]
+    fn lm_says_no_covariance_survived_when_the_retained_block_is_singular_too() {
+        // Residuals [1, -1, -1, 1] are orthogonal to the shared column, so
+        // the optimum is a + c = 2 with χ² = 4 and dof = 4 - 3 = 1 > 0,
+        // which is what lets the covariance block run at all.
+        let x = vec![0.0, 1.0, 2.0, 3.0];
+        let y_obs: Vec<f64> = x
+            .iter()
+            .zip([1.0, -1.0, -1.0, 1.0])
+            .map(|(&xi, r)| 2.0 * xi + r)
+            .collect();
+        let sigma = vec![1.0; 4];
+        let model = CollinearModel { x };
+        let mut params = ParameterSet::new(vec![
+            FitParameter::unbounded("a", 1.0),
+            FitParameter::unbounded("b", 3.0),
+            FitParameter::unbounded("c", 0.5),
+        ]);
+        let result = levenberg_marquardt(&model, &y_obs, &sigma, &mut params, &LmConfig::default())
+            .expect("a degenerate covariance must not fail the fit");
+        assert!(result.converged, "{result:?}");
+        assert!(
+            result.covariance.is_none() && result.uncertainties.is_none(),
+            "the retained a/c block is singular, so nothing is reported: {result:?}"
+        );
+        assert_eq!(
+            result.warnings,
+            vec![
+                "covariance: the uncertainty of `b` is NaN because the model output does not \
+                 respond to it at the solution; the block left after excluding it is itself \
+                 singular, so no covariance and no uncertainties are reported for any parameter"
                     .to_string()
             ]
         );

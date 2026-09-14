@@ -767,6 +767,14 @@ pub struct InstrumentParams {
 /// * [`TransmissionError::Doppler`] — if Doppler broadening is enabled
 ///   (`temperature_k > 0.0`) and `DopplerParams` validation fails
 ///   (e.g., non-positive or non-finite AWR).
+/// * [`TransmissionError::ContinuousDoppler`] — if an isotope the route
+///   gate put on the continuous (tier-1) route fails its integral:
+///   a malformed grid (an energy that is not finite and positive, or not
+///   strictly ascending), a quadrature limit (`PanelLimit`, `DepthLimit`,
+///   `MidpointStagnation`) or a non-finite result (`InvalidIntegral`,
+///   `InvalidDerivative`). A tier-1 failure is an error, never a silent
+///   fall back to the sampled table, so this call can refuse where it
+///   previously always produced a value.
 ///
 /// **Note**: isotopes with thickness <= 0.0 are silently skipped
 /// (they contribute zero attenuation). This allows callers to include
@@ -899,6 +907,10 @@ pub fn forward_model(
 /// * [`TransmissionError::Doppler`] — if Doppler broadening is enabled
 ///   (`temperature_k > 0.0`) and `DopplerParams` validation fails
 ///   (e.g., non-positive or non-finite AWR).
+/// * [`TransmissionError::ContinuousDoppler`] — as
+///   [`broadened_cross_sections_on_working_grid`], which this delegates to:
+///   a tier-1 isotope whose integral fails is an error here too, never a
+///   silent fall back to the sampled table.
 pub fn broadened_cross_sections(
     energies: &[f64],
     resonance_data: &[ResonanceData],
@@ -927,6 +939,24 @@ pub fn broadened_cross_sections(
 /// applies Beer-Lambert + resolution on the working grid and extracts the data
 /// points last — matching [`forward_model`] (issue #608).  Resolution is NOT
 /// applied (issue #442).
+///
+/// # Errors
+/// * [`TransmissionError::Cancelled`] — if the `cancel` flag was observed
+///   during parallel execution (either before an isotope started or after
+///   all tasks completed).
+/// * [`TransmissionError::Resolution`] — if `instrument` is `Some` and
+///   `energies` is not sorted ascending.
+/// * [`TransmissionError::Doppler`] — if Doppler broadening is enabled
+///   (`temperature_k > 0.0`) and `DopplerParams` validation fails
+///   (e.g., non-positive or non-finite AWR).
+/// * [`TransmissionError::ContinuousDoppler`] — if an isotope the route
+///   gate put on the continuous (tier-1) route fails its integral:
+///   a malformed grid (an energy that is not finite and positive, or not
+///   strictly ascending), a quadrature limit (`PanelLimit`, `DepthLimit`,
+///   `MidpointStagnation`) or a non-finite result (`InvalidIntegral`,
+///   `InvalidDerivative`). A tier-1 failure is an error, never a silent
+///   fall back to the sampled table, so this call can refuse where it
+///   previously always produced a value.
 pub fn broadened_cross_sections_on_working_grid(
     energies: &[f64],
     resonance_data: &[ResonanceData],

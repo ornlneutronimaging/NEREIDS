@@ -762,7 +762,7 @@ fn deviance_curvature(s: f64, o: f64, t: f64, c: f64) -> f64 {
 // joint_poisson_fit — two-stage solver (damped Fisher + Nelder-Mead polish)
 // ======================================================================
 
-use crate::lm::{invert_informative_block, solve_damped_system};
+use crate::lm::{invert_informative_block, solve_damped_system, uninformative_parameter_warning};
 use crate::nelder_mead::{NelderMeadConfig, nelder_mead_minimize};
 
 /// Configuration for [`joint_poisson_fit`].
@@ -1218,10 +1218,7 @@ pub fn joint_poisson_fit(
                 } else {
                     "it carries no Fisher information at the solution"
                 };
-                format!(
-                    "covariance: the uncertainty of `{name}` is NaN because {cause}; the \
-                     covariance covers the other free parameters"
-                )
+                uninformative_parameter_warning(name, cause, inverse.is_some())
             })
             .collect();
         match inverse {
@@ -3241,6 +3238,80 @@ mod tests {
             vec![
                 "covariance: the uncertainty of `B` is NaN because the model refused every \
                  finite-difference probe of it; the covariance covers the other free parameters"
+                    .to_string()
+            ]
+        );
+    }
+
+    /// `T_i = (A + C)·k_i`, with `B` absent from the transmission entirely.
+    ///
+    /// The Jacobian is analytical so the degeneracy is EXACT: `A` and `C`
+    /// get the identical column `k`, `B` a column of zeros, and the Fisher
+    /// matrix accumulates the same products into all four `A`/`C` cells.
+    struct CollinearCountModel {
+        k: [f64; 3],
+    }
+
+    impl FitModel for CollinearCountModel {
+        fn evaluate(&self, params: &[f64]) -> Result<Vec<f64>, FittingError> {
+            let (a, c) = (params[0], params[2]);
+            Ok(self.k.iter().map(|&k| (a + c) * k).collect())
+        }
+
+        fn analytical_jacobian(
+            &self,
+            _params: &[f64],
+            free_param_indices: &[usize],
+            y_current: &[f64],
+        ) -> Option<FlatMatrix> {
+            let mut j = FlatMatrix::zeros(y_current.len(), free_param_indices.len());
+            for (col, &idx) in free_param_indices.iter().enumerate() {
+                if idx == 1 {
+                    continue; // `B` does nothing
+                }
+                for (row, &k) in self.k.iter().enumerate() {
+                    *j.get_mut(row, col) = k;
+                }
+            }
+            Some(j)
+        }
+    }
+
+    /// Excluding a parameter that carries no Fisher information does not
+    /// always leave an invertible block. When the parameters that remain are
+    /// themselves degenerate the counts fit returns NO covariance and NO
+    /// uncertainties — so the line must not go on promising a covariance
+    /// "over the other free parameters", which sends the reader looking for
+    /// numbers that were never produced.
+    #[test]
+    fn joint_poisson_fit_says_no_covariance_survived_when_the_retained_block_is_singular_too() {
+        let model = CollinearCountModel { k: [0.5, 0.6, 0.7] };
+        let o = vec![100.0; 3];
+        let s = vec![30.0; 3];
+        let obj = JointPoissonObjective {
+            model: &model,
+            o: &o,
+            s: &s,
+            c: 1.0,
+            active_mask: None,
+        };
+        let mut params = ParameterSet::new(vec![
+            FitParameter::non_negative("A", 0.2),
+            FitParameter::non_negative("B", 0.3),
+            FitParameter::non_negative("C", 0.2),
+        ]);
+        let result = joint_poisson_fit(&obj, &mut params, &JointPoissonFitConfig::default())
+            .expect("a degenerate covariance must not fail the fit");
+        assert!(
+            result.covariance.is_none() && result.uncertainties.is_none(),
+            "the retained A/C block is singular, so nothing is reported: {result:?}"
+        );
+        assert_eq!(
+            result.warnings,
+            vec![
+                "covariance: the uncertainty of `B` is NaN because it carries no Fisher \
+                 information at the solution; the block left after excluding it is itself \
+                 singular, so no covariance and no uncertainties are reported for any parameter"
                     .to_string()
             ]
         );

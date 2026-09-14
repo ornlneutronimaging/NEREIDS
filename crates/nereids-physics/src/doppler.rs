@@ -522,9 +522,13 @@ fn build_extended_fgm_grid(
 /// 3. Compute the integrand Y(w) = w² · s(w) on the extended grid.
 /// 4. For each output velocity, evaluate the Gaussian convolution integral.
 /// 5. Transform back: σ_D(E) = result / E.
-/// 6. Apply SAMMY's negative-value rule (`fgm/mfgm4.f90:83-101`): a
-///    negative result is zeroed when it is above −1e-15 barn or when no
-///    table node inside the kernel window is positive, and kept otherwise.
+/// 6. Apply SAMMY's negative-value rule (`fgm/mfgm4.f90:83-101`). The test
+///    is on the ENERGY-WEIGHTED value `E′·σ` in barn·eV — SAMMY's `Sigma`,
+///    before its division by `Em` — not on the cross-section: a negative
+///    result is zeroed when that weighted value is above −1e-15 barn·eV,
+///    which is a cutoff of `1e-15 / E` in barn (1e-17 barn at 100 eV, not
+///    1e-15), or when no table node inside the kernel window is positive,
+///    and kept otherwise.
 pub fn doppler_broaden(
     energies: &[f64],
     cross_sections: &[f64],
@@ -1126,34 +1130,58 @@ mod tests {
 
     // --- End validation tests ---
 
+    /// U-238 at 6.075 eV and 300 K, against the Doppler width SAMMY
+    /// reports: 0.05159437 eV.
+    ///
+    /// AWR is the atomic weight RATIO — the mass in neutron masses — not
+    /// the mass in amu. U-238's 238.050972 amu is 236.006 neutron masses,
+    /// which is the AWR ENDF/B carries, and the free-gas width goes as
+    /// 1/√AWR: reading the amu figure as the ratio gives 0.0513707 eV,
+    /// 0.43% low. At the ratio the agreement is 0.0031%, and that residual
+    /// is not the kB difference either — SAMMY's 0.000086173420 eV/K is
+    /// 1.0e-6 from CODATA's 8.617333262e-5, and the width goes as √kB, so
+    /// kB can move it by 5e-7 relative.
     #[test]
     fn test_doppler_width_u238() {
-        // SAMMY reports: Doppler width at 6.075 eV = 0.05159437 eV for U-238 at 300K
-        // AWR = 238.050972, T = 300 K
-        let params = DopplerParams::new(300.0, 238.050972).unwrap();
+        let awr = 238.050972 / nereids_core::constants::NEUTRON_MASS_AMU;
+        let params = DopplerParams::new(300.0, awr).unwrap();
         let dw = params.doppler_width(6.075);
-        // SAMMY uses kB = 0.000086173420 eV/K (slightly different from CODATA 2018)
-        // Our kB = 8.617333262e-5. The difference is ~0.003%.
-        // So we expect close but not exact match.
         assert!(
-            (dw - 0.05159437).abs() < 5e-4,
-            "Doppler width = {}, expected ~0.05159",
-            dw
+            (dw - 0.05159437).abs() < 2e-6,
+            "Doppler width = {dw}, SAMMY reports 0.05159437 at AWR = {awr}"
         );
     }
 
+    /// ex001 at T = 300 K: Δ_D at 10 eV = √(4·kB·T·E / AWR), against the
+    /// FWHM SAMMY's lpt file prints.
+    ///
+    /// The mass ratio is taken from the fixture, not written in here: the
+    /// SAMMY par file gives the target MASS as 10.0 amu, and the atomic
+    /// weight ratio the free-gas width is built from is that mass in
+    /// neutron masses, 10.0 / 1.008665 = 9.9141. Reading 10.0 as the ratio
+    /// gives Δ_D = 0.32157 eV and FWHM = 0.53545 eV against SAMMY's 0.5378,
+    /// a 0.44% gap that was once explained as a different kB — which cannot
+    /// be: SAMMY's 0.000086173420 eV/K differs from CODATA's 8.617333262e-5
+    /// by 1.0e-6 relative, and the width goes as √kB, so kB can move the
+    /// FWHM by 5e-7 relative, not by 4e-3.
     #[test]
     fn test_doppler_width_fictitious() {
-        // ex001: A=10, T=300K. Δ_D at 10 eV = √(4kBTE/AWR).
-        // SAMMY reports Δ_D = 0.3216 eV, FWHM = 2√(ln2) × Δ_D = 0.5355 eV.
-        // (SAMMY lpt uses slightly different kB, giving FWHM = 0.5378 eV.)
-        let params = DopplerParams::new(300.0, 10.0).unwrap();
+        let data = nereids_endf::resonance::test_support::ex001_hydrogen_single_resonance();
+        let params = DopplerParams::new(300.0, data.awr).unwrap();
         let dw = params.doppler_width(10.0);
-        // Δ_D = √(4 × 8.617e-5 × 300 × 10 / 10) = √(0.10341) ≈ 0.3216 eV
+        // Δ_D = √(4 × 8.617333262e-5 × 300 × 10 / 9.914095) = 0.322961 eV
         assert!(
-            (dw - 0.3216).abs() < 0.01,
-            "Doppler width = {}, expected ~0.32",
-            dw
+            (dw - 0.322961).abs() < 1e-5,
+            "Doppler width = {dw}, expected 0.322961 at AWR = {}",
+            data.awr
+        );
+        // FWHM = 2√(ln2) × Δ_D = 0.537766 eV. SAMMY's lpt prints 0.5378 eV,
+        // which is this value at the four figures it carries; the whole
+        // remaining discrepancy is 3.4e-5 eV, i.e. that rounding.
+        let fwhm = 2.0 * f64::sqrt(std::f64::consts::LN_2) * dw;
+        assert!(
+            (fwhm - 0.5378).abs() < 5e-5,
+            "FWHM = {fwhm}, SAMMY lpt reports 0.5378 eV"
         );
     }
 
@@ -1448,16 +1476,19 @@ mod tests {
         );
     }
 
-    /// SAMMY ex001 validation: single resonance, A=10, T=300K, FGM Doppler.
+    /// SAMMY ex001 validation: single resonance, target mass 10 amu,
+    /// T = 300 K, FGM Doppler.
     ///
     /// Reference: ex001a.lst (column 4 = theoretical Doppler-broadened capture σ)
     /// Par file: E₀ = 10 eV, Γγ = 1.0 meV, Γn = 0.5 meV
     /// SAMMY par file widths are in meV; we convert to eV (×0.001) for our code.
-    /// AWR = 10.0, radius = 2.908 fm, T = 300 K
+    /// The par file's 10.0 is a MASS in amu; the atomic weight ratio that the
+    /// kinematics and the free-gas Doppler width take is that mass in neutron
+    /// masses, 10.0 / 1.008665 = 9.9141. Radius = 2.908 fm, T = 300 K.
     #[test]
     fn test_sammy_ex001_fgm_doppler() {
         // Build the ex001 resonance data: single SLBW resonance at 10 eV,
-        // ZA=1010, AWR=10.0, AP=2.908 fm (SAMMY par-file widths in meV are
+        // ZA=1010, AWR=9.9141, AP=2.908 fm (SAMMY par-file widths in meV are
         // pre-converted to eV inside `ex001_hydrogen_single_resonance`).
         let data = nereids_endf::resonance::test_support::ex001_hydrogen_single_resonance();
 
