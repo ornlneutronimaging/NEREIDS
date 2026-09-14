@@ -431,8 +431,11 @@ pub fn cross_sections_on_grid(data: &ResonanceData, energies: &[f64]) -> Vec<Cro
 /// When the next range starts exactly where this one ends and is
 /// evaluable, the shared boundary energy belongs to the next range only,
 /// so a point on the boundary is never evaluated with both formalisms.
-/// Every range-dispatch site — per-point, plan, and the Doppler route
-/// gate — must use this one convention.
+/// The per-point dispatcher, the plan and the Doppler route gate all use
+/// this one convention. [`crate::slbw::slbw_cross_sections`] deliberately
+/// does not: it closes both ends so that a point on a resolved/unresolved
+/// boundary is not dropped by both ranges, which its own comment explains.
+/// Treat that as the documented exception rather than a site left behind.
 pub(crate) fn upper_bound_is_half_open(data: &ResonanceData, range_idx: usize) -> bool {
     let range = &data.ranges[range_idx];
     data.ranges

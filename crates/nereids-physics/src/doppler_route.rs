@@ -26,10 +26,12 @@ pub enum DopplerRoute {
     /// Tier 1: the free-gas kernel integrated over the resonance equation.
     /// Grid-independent by construction.
     Continuous {
-        /// Every formalism the grid was evaluated with, in order of first
-        /// use. A grid may legitimately span adjacent resolved ranges of
-        /// different formalisms, and the disclosure names all of them
-        /// rather than only the lowest energy's.
+        /// Every formalism the grid was evaluated with, in the order the
+        /// grid first reached them. A grid may legitimately span adjacent
+        /// resolved ranges of different formalisms, and the disclosure
+        /// names all of them rather than only the lowest energy's. The
+        /// broadening contract makes the grid strictly ascending, so that
+        /// order is energy order.
         formalisms: Vec<ResonanceFormalism>,
     },
     /// Tier 2: the kernel convolved with a sampled zero-kelvin table.
@@ -118,22 +120,6 @@ pub enum SampledTableReason {
         /// Formalism of the covering range.
         formalism: ResonanceFormalism,
     },
-    /// A grid energy is not a positive, finite number, so no window can be
-    /// placed around it. Rejected up front rather than per energy: NaN
-    /// compares false against every other value, so one left in the grid
-    /// would mask the genuine lowest failing energy.
-    NonPhysicalEnergy {
-        /// The offending grid energy (eV).
-        energy_ev: f64,
-    },
-    /// The covering range carries a File-3 (MF=3) background term, which
-    /// the resonance equation does not represent.
-    File3Background {
-        /// Grid energy at which the condition failed (eV).
-        energy_ev: f64,
-        /// Formalism of the covering range.
-        formalism: ResonanceFormalism,
-    },
 }
 
 /// Human name of a formalism, for disclosure lines.
@@ -183,9 +169,13 @@ impl fmt::Display for SampledTableReason {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
             Self::Formalism {
+                energy_ev,
                 formalism: Some(formalism),
-                ..
-            } => write!(f, "{} formalism", formalism_name(*formalism)),
+            } => write!(
+                f,
+                "{} formalism at {energy_ev:.2e} eV",
+                formalism_name(*formalism)
+            ),
             Self::Formalism {
                 energy_ev,
                 formalism: None,
@@ -244,15 +234,6 @@ impl fmt::Display for SampledTableReason {
                 "resonance range {other_range_index} overlaps the thermal window at \
                  {energy_ev:.2e} eV"
             ),
-            Self::NonPhysicalEnergy { energy_ev } => {
-                write!(
-                    f,
-                    "grid energy {energy_ev:.2e} eV is not positive and finite"
-                )
-            }
-            Self::File3Background { energy_ev, .. } => {
-                write!(f, "File-3 background term present at {energy_ev:.2e} eV")
-            }
         }
     }
 }
@@ -272,17 +253,6 @@ mod tests {
                 "no Doppler broadening (temperature 0 K)",
             ),
             (
-                sampled(SampledTableReason::NonPhysicalEnergy {
-                    energy_ev: f64::NAN,
-                }),
-                "sampled-table kernel-on-grid (grid energy NaN eV is not positive and finite)",
-            ),
-            (
-                sampled(SampledTableReason::NonPhysicalEnergy { energy_ev: -5.0 }),
-                "sampled-table kernel-on-grid (grid energy -5.00e0 eV is not positive and \
-                 finite)",
-            ),
-            (
                 DopplerRoute::Continuous {
                     formalisms: vec![ResonanceFormalism::MLBW],
                 },
@@ -299,7 +269,7 @@ mod tests {
                     energy_ev: 1.0,
                     formalism: Some(ResonanceFormalism::ReichMoore),
                 }),
-                "sampled-table kernel-on-grid (Reich-Moore formalism)",
+                "sampled-table kernel-on-grid (Reich-Moore formalism at 1.00e0 eV)",
             ),
             (
                 sampled(SampledTableReason::Formalism {
@@ -348,13 +318,6 @@ mod tests {
                 }),
                 "sampled-table kernel-on-grid (resonance range 1 overlaps the thermal window at \
                  5.00e0 eV)",
-            ),
-            (
-                sampled(SampledTableReason::File3Background {
-                    energy_ev: 7.0,
-                    formalism: ResonanceFormalism::MLBW,
-                }),
-                "sampled-table kernel-on-grid (File-3 background term present at 7.00e0 eV)",
             ),
         ];
         for (route, expected) in cases {
