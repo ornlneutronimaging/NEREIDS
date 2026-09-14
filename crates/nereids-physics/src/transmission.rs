@@ -753,6 +753,63 @@ fn unbroadened_totals(rd: &ResonanceData, energies: &[f64]) -> Vec<f64> {
         .collect()
 }
 
+/// What a caller-supplied `base_xs` table actually is.
+///
+/// The tier-1 integral evaluates the resonance equation at its own
+/// quadrature nodes, so it can only stand in for a table that IS the
+/// resonance equation on that grid. Nothing in a `&[Vec<f64>]` says which
+/// case it is, and guessing wrong is not a rounding error: the broadened
+/// result differs by 1.8% on a fine grid and by more than 100% on one
+/// coarser than the Doppler width, which a temperature fit absorbs as a
+/// shifted temperature. So the caller states it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum BaseXsOrigin {
+    /// The table is the zero-kelvin resonance equation evaluated on the
+    /// data grid — what [`unbroadened_cross_sections`] returns. The tier-1
+    /// integral may replace it, and for a tier-1 isotope the table is not
+    /// read at all: the integral evaluates the equation directly.
+    ResonanceEquation,
+    /// The table came from somewhere else. Only the sampled tier can
+    /// broaden it, whatever formalism the source carries.
+    Explicit,
+}
+
+/// [`broaden_isotope_on_grid`] with the exact temperature derivative.
+///
+/// # Errors
+/// As [`broaden_isotope_on_grid`].
+fn broaden_isotope_on_grid_with_derivative(
+    work_energies: &[f64],
+    rd: &ResonanceData,
+    temperature_k: f64,
+) -> Result<(Vec<f64>, Vec<f64>), TransmissionError> {
+    if work_energies.is_empty() {
+        return Ok((Vec::new(), Vec::new()));
+    }
+    if temperature_k <= 0.0 {
+        let sigma = unbroadened_totals(rd, work_energies);
+        let zeros = vec![0.0; sigma.len()];
+        return Ok((sigma, zeros));
+    }
+    match continuous_doppler::classify_isotope(rd, work_energies, temperature_k)? {
+        DopplerRoute::Unbroadened => {
+            let sigma = unbroadened_totals(rd, work_energies);
+            let zeros = vec![0.0; sigma.len()];
+            Ok((sigma, zeros))
+        }
+        DopplerRoute::Continuous { .. } => {
+            continuous_doppler::broaden_with_derivative(work_energies, rd, temperature_k)
+                .map_err(Into::into)
+        }
+        DopplerRoute::SampledTable { .. } => {
+            let params = DopplerParams::new(temperature_k, rd.awr)?;
+            let unbroadened = unbroadened_totals(rd, work_energies);
+            doppler::doppler_broaden_with_derivative(work_energies, &unbroadened, &params)
+                .map_err(Into::into)
+        }
+    }
+}
+
 /// Compute Doppler-broadened cross-sections for each isotope.
 ///
 /// Returns **Doppler-only** cross-sections.  Resolution broadening is NOT
@@ -1041,6 +1098,7 @@ pub fn broadened_cross_sections_from_base(
     base_xs: &[Vec<f64>],
     resonance_data: &[ResonanceData],
     temperature_k: f64,
+    base_origin: BaseXsOrigin,
     instrument: Option<&InstrumentParams>,
 ) -> Result<Vec<Vec<f64>>, TransmissionError> {
     // Delegate to the working-grid variant and extract the data points.
@@ -1052,6 +1110,7 @@ pub fn broadened_cross_sections_from_base(
         base_xs,
         resonance_data,
         temperature_k,
+        base_origin,
         instrument,
     )?;
     Ok(sigma.iter().map(|s| layout.extract(s)).collect())
@@ -1070,6 +1129,7 @@ pub fn broadened_cross_sections_from_base_on_working_grid(
     base_xs: &[Vec<f64>],
     resonance_data: &[ResonanceData],
     temperature_k: f64,
+    base_origin: BaseXsOrigin,
     instrument: Option<&InstrumentParams>,
 ) -> Result<WorkingGridXs, TransmissionError> {
     validate_base_xs(energies, base_xs, resonance_data)?;
@@ -1099,11 +1159,22 @@ pub fn broadened_cross_sections_from_base_on_working_grid(
             } else {
                 xs_raw.clone()
             };
-            if temperature_k > 0.0 {
-                let params = DopplerParams::new(temperature_k, rd.awr)?;
-                doppler::doppler_broaden(work_energies, &xs_work, &params).map_err(Into::into)
-            } else {
-                Ok(xs_work)
+            match base_origin {
+                // The table IS the resonance equation, so the gate decides
+                // and a tier-1 isotope is integrated rather than resampled.
+                // `xs_work` is then not read at all.
+                BaseXsOrigin::ResonanceEquation => {
+                    broaden_isotope_on_grid(work_energies, rd, temperature_k)
+                }
+                BaseXsOrigin::Explicit => {
+                    if temperature_k > 0.0 {
+                        let params = DopplerParams::new(temperature_k, rd.awr)?;
+                        doppler::doppler_broaden(work_energies, &xs_work, &params)
+                            .map_err(Into::into)
+                    } else {
+                        Ok(xs_work)
+                    }
+                }
             }
         })
         .collect();
@@ -1130,6 +1201,7 @@ pub fn broadened_cross_sections_with_analytical_derivative_from_base(
     base_xs: &[Vec<f64>],
     resonance_data: &[ResonanceData],
     temperature_k: f64,
+    base_origin: BaseXsOrigin,
     instrument: Option<&InstrumentParams>,
 ) -> Result<BroadenedXsWithDerivative, TransmissionError> {
     // Delegate to the working-grid variant and extract the data points for
@@ -1143,6 +1215,7 @@ pub fn broadened_cross_sections_with_analytical_derivative_from_base(
         base_xs,
         resonance_data,
         temperature_k,
+        base_origin,
         instrument,
     )?;
     let xs_all = sigma.iter().map(|s| layout.extract(s)).collect();
@@ -1163,6 +1236,7 @@ pub fn broadened_cross_sections_with_analytical_derivative_from_base_on_working_
     base_xs: &[Vec<f64>],
     resonance_data: &[ResonanceData],
     temperature_k: f64,
+    base_origin: BaseXsOrigin,
     instrument: Option<&InstrumentParams>,
 ) -> Result<WorkingGridXsWithDerivative, TransmissionError> {
     validate_base_xs(energies, base_xs, resonance_data)?;
@@ -1190,13 +1264,20 @@ pub fn broadened_cross_sections_with_analytical_derivative_from_base_on_working_
             } else {
                 xs_raw.clone()
             };
-            if temperature_k > 0.0 {
-                let params = DopplerParams::new(temperature_k, rd.awr)?;
-                doppler::doppler_broaden_with_derivative(work_energies, &xs_work, &params)
-                    .map_err(Into::into)
-            } else {
-                let zeros = vec![0.0; work_energies.len()];
-                Ok((xs_work, zeros))
+            match base_origin {
+                BaseXsOrigin::ResonanceEquation => {
+                    broaden_isotope_on_grid_with_derivative(work_energies, rd, temperature_k)
+                }
+                BaseXsOrigin::Explicit => {
+                    if temperature_k > 0.0 {
+                        let params = DopplerParams::new(temperature_k, rd.awr)?;
+                        doppler::doppler_broaden_with_derivative(work_energies, &xs_work, &params)
+                            .map_err(Into::into)
+                    } else {
+                        let zeros = vec![0.0; work_energies.len()];
+                        Ok((xs_work, zeros))
+                    }
+                }
             }
         })
         .collect();
@@ -1245,6 +1326,7 @@ pub fn forward_model_from_base_xs(
     resonance_data: &[ResonanceData],
     thicknesses: &[f64],
     temperature_k: f64,
+    base_origin: BaseXsOrigin,
     instrument: Option<&InstrumentParams>,
 ) -> Result<Vec<f64>, TransmissionError> {
     if base_xs.len() != resonance_data.len() || thicknesses.len() != resonance_data.len() {
@@ -1306,11 +1388,19 @@ pub fn forward_model_from_base_xs(
             } else {
                 xs_raw.clone()
             };
-            if temperature_k > 0.0 {
-                let params = DopplerParams::new(temperature_k, rd.awr)?;
-                doppler::doppler_broaden(work_energies, &xs_ext, &params).map_err(Into::into)
-            } else {
-                Ok(xs_ext)
+            match base_origin {
+                BaseXsOrigin::ResonanceEquation => {
+                    broaden_isotope_on_grid(work_energies, rd, temperature_k)
+                }
+                BaseXsOrigin::Explicit => {
+                    if temperature_k > 0.0 {
+                        let params = DopplerParams::new(temperature_k, rd.awr)?;
+                        doppler::doppler_broaden(work_energies, &xs_ext, &params)
+                            .map_err(Into::into)
+                    } else {
+                        Ok(xs_ext)
+                    }
+                }
             }
         })
         .collect();
@@ -1506,39 +1596,98 @@ mod tests {
         assert_eq!(ours, unbroadened_totals(&data, &descending));
     }
 
-    /// The caller-supplied-table family stays on the sampled tier even for an
-    /// MLBW source: tier 1 integrates the resonance equation and cannot
-    /// reproduce a table the caller computed some other way.
+    /// The two families agree for an MLBW source when the base table IS the
+    /// resonance equation, and the cached path is then not a second physics
+    /// model but the same one.
+    ///
+    /// Before this, the fresh-sample family integrated while the cached
+    /// family sampled, so a temperature fit -- which uses the cached family
+    /// for its trial temperatures and the fresh one elsewhere -- was fitting
+    /// one model to another model's data. The recovered temperature absorbed
+    /// the difference: 350 K came back as 347.5 K on a 0.01 eV grid and as
+    /// 253 K on a 0.05 eV one.
     #[test]
-    fn the_base_xs_family_stays_on_the_sampled_tier_for_mlbw() {
+    fn both_families_agree_for_mlbw_when_the_base_is_the_resonance_equation() {
         let data = u238_with_formalism(ResonanceFormalism::MLBW);
         let temperature_k = 293.6;
         let energies: Vec<f64> = (0..=60).map(|i| 6.4 + f64::from(i) * 0.01).collect();
         let base = vec![unbroadened_totals(&data, &energies)];
 
-        let from_base = broadened_cross_sections_from_base_on_working_grid(
+        let fresh = broaden_isotope_on_grid(&energies, &data, temperature_k).unwrap();
+        let cached = broadened_cross_sections_from_base_on_working_grid(
             &energies,
             &base,
             std::slice::from_ref(&data),
             temperature_k,
+            BaseXsOrigin::ResonanceEquation,
+            None,
+        )
+        .unwrap();
+        for (a, b) in fresh.iter().zip(&cached.sigma[0]) {
+            assert_eq!(a.to_bits(), b.to_bits());
+        }
+
+        // The derivative path has to agree too, or the Jacobian describes a
+        // different model than the residual.
+        let (_, dxs) =
+            broaden_isotope_on_grid_with_derivative(&energies, &data, temperature_k).unwrap();
+        let cached_d =
+            broadened_cross_sections_with_analytical_derivative_from_base_on_working_grid(
+                &energies,
+                &base,
+                std::slice::from_ref(&data),
+                temperature_k,
+                BaseXsOrigin::ResonanceEquation,
+                None,
+            )
+            .unwrap();
+        for (a, b) in dxs.iter().zip(&cached_d.dsigma_dt[0]) {
+            assert_eq!(a.to_bits(), b.to_bits());
+        }
+    }
+
+    /// A table the caller supplied is broadened as given, whatever formalism
+    /// the source carries: the integral evaluates the resonance equation and
+    /// cannot stand in for a table produced some other way.
+    #[test]
+    fn an_explicit_base_table_is_broadened_by_the_sampled_tier() {
+        let data = u238_with_formalism(ResonanceFormalism::MLBW);
+        let temperature_k = 293.6;
+        let energies: Vec<f64> = (0..=60).map(|i| 6.4 + f64::from(i) * 0.01).collect();
+        let base = vec![unbroadened_totals(&data, &energies)];
+
+        let explicit = broadened_cross_sections_from_base_on_working_grid(
+            &energies,
+            &base,
+            std::slice::from_ref(&data),
+            temperature_k,
+            BaseXsOrigin::Explicit,
             None,
         )
         .unwrap();
         let params = DopplerParams::new(temperature_k, data.awr).unwrap();
         let sampled = doppler::doppler_broaden(&energies, &base[0], &params).unwrap();
-        for (a, b) in from_base.sigma[0].iter().zip(&sampled) {
+        for (a, b) in explicit.sigma[0].iter().zip(&sampled) {
             assert_eq!(a.to_bits(), b.to_bits());
         }
 
-        // And it therefore differs from the fresh-sample family, which DOES
-        // integrate. That difference is the thing 4d has to disclose.
-        let integrated = broaden_isotope_on_grid(&energies, &data, temperature_k).unwrap();
+        // Non-vacuity: `Explicit` and `ResonanceEquation` must differ here,
+        // or the distinction this enum exists to draw would be untested.
+        let derived = broadened_cross_sections_from_base_on_working_grid(
+            &energies,
+            &base,
+            std::slice::from_ref(&data),
+            temperature_k,
+            BaseXsOrigin::ResonanceEquation,
+            None,
+        )
+        .unwrap();
         assert!(
-            integrated
+            explicit.sigma[0]
                 .iter()
-                .zip(&from_base.sigma[0])
+                .zip(&derived.sigma[0])
                 .any(|(a, b)| a.to_bits() != b.to_bits()),
-            "the two families must differ here, or this test is pinning nothing"
+            "the two origins agree bit-for-bit here, so this test pins nothing"
         );
     }
 
@@ -1772,6 +1921,7 @@ mod tests {
             &base_xs,
             std::slice::from_ref(&data),
             temperature,
+            BaseXsOrigin::ResonanceEquation,
             None,
         )
         .unwrap();
@@ -1843,6 +1993,7 @@ mod tests {
             &base_xs,
             std::slice::from_ref(&data),
             0.05,
+            BaseXsOrigin::ResonanceEquation,
             None,
         )
         .unwrap();
@@ -1861,6 +2012,7 @@ mod tests {
             &base_xs,
             std::slice::from_ref(&data),
             0.0,
+            BaseXsOrigin::ResonanceEquation,
             None,
         )
         .unwrap();
@@ -1933,6 +2085,7 @@ mod tests {
             std::slice::from_ref(&data),
             &[thickness],
             temperature,
+            BaseXsOrigin::ResonanceEquation,
             None,
         )
         .unwrap();
@@ -1970,6 +2123,7 @@ mod tests {
             &base_xs,
             std::slice::from_ref(&data),
             temperature,
+            BaseXsOrigin::ResonanceEquation,
             None,
         )
         .unwrap();
@@ -2000,6 +2154,7 @@ mod tests {
             &base_xs,
             std::slice::from_ref(&data),
             temperature,
+            BaseXsOrigin::ResonanceEquation,
             None,
         )
         .unwrap();
@@ -2228,6 +2383,7 @@ mod tests {
             &base_xs,
             std::slice::from_ref(&data),
             temperature,
+            BaseXsOrigin::ResonanceEquation,
             Some(&inst),
         )
         .unwrap();
@@ -2238,6 +2394,7 @@ mod tests {
             &base_xs,
             std::slice::from_ref(&data),
             temperature,
+            BaseXsOrigin::ResonanceEquation,
             None,
         )
         .unwrap();
@@ -2292,6 +2449,7 @@ mod tests {
             std::slice::from_ref(&data),
             &[thickness],
             temperature,
+            BaseXsOrigin::ResonanceEquation,
             Some(&inst),
         )
         .unwrap();
@@ -2321,6 +2479,7 @@ mod tests {
             std::slice::from_ref(&data),
             &[thickness],
             temperature,
+            BaseXsOrigin::ResonanceEquation,
             None,
         )
         .unwrap();
@@ -2353,6 +2512,7 @@ mod tests {
             std::slice::from_ref(&data),
             &[thickness],
             temperature,
+            BaseXsOrigin::ResonanceEquation,
             None,
         )
         .unwrap();
@@ -2392,6 +2552,7 @@ mod tests {
             &base_xs,
             std::slice::from_ref(&data),
             temperature,
+            BaseXsOrigin::ResonanceEquation,
             Some(&inst),
         )
         .unwrap();
@@ -2402,6 +2563,7 @@ mod tests {
             &base_xs,
             std::slice::from_ref(&data),
             temperature,
+            BaseXsOrigin::ResonanceEquation,
             None,
         )
         .unwrap();
@@ -2458,6 +2620,7 @@ mod tests {
             &base_xs,
             std::slice::from_ref(&data),
             temperature,
+            BaseXsOrigin::ResonanceEquation,
             None,
         )
         .unwrap();
@@ -2554,6 +2717,7 @@ mod tests {
             &[vec![10.0; n_e], vec![10.0; n_e]],
             &rd,
             300.0,
+            BaseXsOrigin::ResonanceEquation,
             None,
         )
         .unwrap_err();
@@ -2564,6 +2728,7 @@ mod tests {
             &[vec![10.0; n_e - 1]],
             &rd,
             300.0,
+            BaseXsOrigin::ResonanceEquation,
             None,
         )
         .unwrap_err();
@@ -2581,6 +2746,7 @@ mod tests {
             &good_base,
             &rd,
             300.0,
+            BaseXsOrigin::ResonanceEquation,
             Some(&inst),
         )
         .unwrap_err();

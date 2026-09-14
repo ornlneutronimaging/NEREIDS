@@ -778,6 +778,15 @@ pub struct TransmissionFitModel {
     /// Wrapped in `Arc` so `spatial_map` can share a single allocation across
     /// all per-pixel `TransmissionFitModel` instances without deep cloning.
     base_xs: Option<Arc<Vec<Vec<f64>>>>,
+    /// Whether [`Self::base_xs`] is the resonance equation this model would
+    /// have evaluated itself, or a table the caller supplied.
+    ///
+    /// The tier-1 Doppler integral can stand in for the first and not the
+    /// second, and getting it wrong shifts a fitted temperature rather than
+    /// perturbing it: the two tiers differ by ~1.8% on a fine grid and by
+    /// more than 100% on one coarser than the Doppler width, which the fit
+    /// absorbs into T.
+    base_origin: transmission::BaseXsOrigin,
     /// Cached broadened cross-sections from the last `evaluate()` call, on the
     /// **working grid** (auxiliary extended grid when Gaussian resolution is
     /// active, else the data grid).  Used by `analytical_jacobian()` to provide
@@ -883,6 +892,11 @@ impl TransmissionFitModel {
                 }
             }
         }
+        let base_origin = if external_base_xs.is_some() {
+            transmission::BaseXsOrigin::Explicit
+        } else {
+            transmission::BaseXsOrigin::ResonanceEquation
+        };
         let base_xs = match external_base_xs {
             Some(xs) => Some(xs),
             None if temperature_index.is_some() => Some(Arc::new(
@@ -904,6 +918,7 @@ impl TransmissionFitModel {
             density_ratios,
             temperature_index,
             base_xs,
+            base_origin,
             cached_broadened_xs: RefCell::new(None),
             cached_dxs_dt: RefCell::new(None),
             cached_work_layout: RefCell::new(None),
@@ -1049,6 +1064,7 @@ impl FitModel for TransmissionFitModel {
                     base_xs,
                     &self.resonance_data,
                     temperature_k,
+                    self.base_origin,
                     self.instrument.as_deref(),
                 )
                 .map_err(|e| FittingError::EvaluationFailed(e.to_string()))?;
@@ -1305,6 +1321,7 @@ impl FitModel for TransmissionFitModel {
                             base_xs,
                             &self.resonance_data,
                             temperature_k,
+                            self.base_origin,
                             self.instrument.as_deref(),
                         )
                         .ok()?;
