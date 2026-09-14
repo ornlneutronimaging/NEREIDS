@@ -714,6 +714,15 @@ fn broaden_isotope_on_grid(
     rd: &ResonanceData,
     temperature_k: f64,
 ) -> Result<Vec<f64>, TransmissionError> {
+    // An empty grid is nothing to broaden, not an error. The sampled tier
+    // has always answered `Ok(vec![])` here — `validate_doppler_grid`
+    // permits an empty slice — and only `forward_model` guards `n == 0`
+    // before reaching this point, so routing the other sites through the
+    // gate (which rejects an empty grid) would turn a working call into a
+    // failure.
+    if work_energies.is_empty() {
+        return Ok(Vec::new());
+    }
     // Below zero the old behaviour is preserved exactly: no kernel, no grid
     // validation, the unbroadened equation. The gate agrees (it answers
     // `Unbroadened` at zero), but reaching it would newly validate grids
@@ -1390,7 +1399,6 @@ mod tests {
         }
     }
 
-
     // ── tier dispatch through transmission (PR-4c) ─────────────────────────
     //
     // Every OTHER test in this module uses `u238_single_resonance`, which is
@@ -1417,8 +1425,7 @@ mod tests {
         ));
 
         let ours = broaden_isotope_on_grid(&energies, &data, temperature_k).unwrap();
-        let integral =
-            crate::continuous_doppler::broaden(&energies, &data, temperature_k).unwrap();
+        let integral = crate::continuous_doppler::broaden(&energies, &data, temperature_k).unwrap();
         for (a, b) in ours.iter().zip(&integral) {
             assert_eq!(a.to_bits(), b.to_bits());
         }
@@ -1430,7 +1437,9 @@ mod tests {
             doppler::doppler_broaden(&energies, &unbroadened_totals(&data, &energies), &params)
                 .unwrap();
         assert!(
-            ours.iter().zip(&sampled).any(|(a, b)| a.to_bits() != b.to_bits()),
+            ours.iter()
+                .zip(&sampled)
+                .any(|(a, b)| a.to_bits() != b.to_bits()),
             "the two tiers agree bit-for-bit here, so this test cannot fail"
         );
     }
@@ -1457,6 +1466,32 @@ mod tests {
         for (a, b) in ours.iter().zip(&expected) {
             assert_eq!(a.to_bits(), b.to_bits());
         }
+    }
+
+    /// An empty grid stays `Ok(empty)` at a POSITIVE temperature, which is
+    /// what the sampled tier has always answered. The gate rejects an empty
+    /// grid, and only `forward_model` guards `n == 0` before broadening, so
+    /// without the helper's own guard the other entry points would turn a
+    /// working call into `DopplerError::EmptyGrid`.
+    #[test]
+    fn an_empty_grid_is_not_an_error_at_any_temperature() {
+        let data = u238_with_formalism(ResonanceFormalism::MLBW);
+        for temperature_k in [0.0, 293.6] {
+            assert_eq!(
+                broaden_isotope_on_grid(&[], &data, temperature_k).unwrap(),
+                Vec::<f64>::new()
+            );
+        }
+        // The entry point that does NOT guard n == 0 itself must survive it.
+        let working = broadened_cross_sections_on_working_grid(
+            &[],
+            std::slice::from_ref(&data),
+            293.6,
+            None,
+            None,
+        )
+        .unwrap();
+        assert_eq!(working.sigma, vec![Vec::<f64>::new()]);
     }
 
     /// Zero temperature returns the unbroadened equation without validating
