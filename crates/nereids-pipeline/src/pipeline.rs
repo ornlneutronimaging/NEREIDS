@@ -1669,9 +1669,16 @@ fn fit_transmission_lm(
 /// `reduced_chi_squared` is set to the same value so GUI consumers that
 /// still read the legacy field see a deviance-based metric.
 ///
-/// Current scope: `fit_alpha_1`, `fit_alpha_2`,
-/// and non-zero `detector_background` remain rejected (`λ̂` absorbs the
-/// global flux scale; `B_det` / alpha_2 wiring is not yet implemented).
+/// `detector_background` is expected counts per bin, and it enters BOTH
+/// arms with the same value: it is a detector-space term, present whether or
+/// not the sample is in the beam. A background that DIFFERS between the arms
+/// — the sample's own scatter and gammas — needs a second array this entry
+/// point does not carry, though `JointPoissonObjective` takes the two arms
+/// separately.
+///
+/// Current scope: `fit_alpha_1` and `fit_alpha_2` remain rejected (`λ̂`
+/// absorbs the global flux scale, and fitting the background amplitudes is
+/// not implemented — the background here is declared, not fitted).
 /// `transmission_background` with `A_n` + `B_A` / `B_B` / `B_C` is
 /// supported, subject to the operational rule that `B_A` must
 /// be enabled if any of `B_A` / `B_B` / `B_C` is enabled (benchmarked:
@@ -1904,7 +1911,6 @@ fn fit_counts_joint_poisson(
         // fitted as neutron flux. It carries no information about any fitted
         // parameter either: the background here is declared, not fitted. So
         // it is dropped from the active set rather than explained away.
-        let has_background = !detector_background.iter().all(|&v| v == 0.0);
         let mut dead_occupied = Vec::new();
         for (bin, ((&observed_open, &observed_sample), &predicted_open)) in flux
             .iter()
@@ -1913,7 +1919,10 @@ fn fit_counts_joint_poisson(
             .enumerate()
         {
             if observed_open + observed_sample > 0.0 && predicted_open <= PIVOT_FLOOR {
-                if !has_background {
+                // Per BIN, not per run: a background somewhere else in the
+                // spectrum explains nothing about THIS bin. Without one here,
+                // its counts still have no source and the hard error stands.
+                if detector_background[bin] <= 0.0 {
                     return Err(PipelineError::InvalidParameter(format!(
                         "exact incident source has zero detector response in occupied \
                          detector bin {bin}; the supplied source/response cannot explain \
@@ -6796,6 +6805,29 @@ mod tests {
             !message.contains("zero detector response in occupied detector bin"),
             "the no-background rejection must not fire once a background is \
              declared: {message}"
+        );
+
+        // (a3) A background elsewhere in the spectrum explains nothing about
+        // THIS bin. With background on one bin and none on the dead one, the
+        // hard error must still fire — otherwise a single backgrounded bin
+        // anywhere would silence the check for every bin.
+        let err = fit_spectrum_typed(
+            &InputData::CountsWithNuisance {
+                sample_counts: vec![10.0, 10.0],
+                flux: vec![50.0, 50.0],
+                background: vec![0.0, 5.0],
+            },
+            &base_config(Some(make_response())).with_exact_count_response(exact(vec![
+                arrival + 10.0,
+                arrival + 11.0,
+                arrival + 12.0,
+            ])),
+        )
+        .expect_err("a dead bin with no background of its own is still unexplained");
+        assert!(
+            err.to_string()
+                .contains("zero detector response in occupied detector bin 0"),
+            "the bin without a local background must be the one reported: {err}"
         );
 
         // (b) Exact config attached to normalized transmission input.
