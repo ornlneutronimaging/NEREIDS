@@ -109,6 +109,19 @@ pub const MAX_DEPTH: usize = 20;
 /// instead of an out-of-memory.
 pub const MAX_ACTIVE_PANELS: usize = 4_096;
 
+/// A bisection counts as roundoff-limited when it moves the integral by less
+/// than this, relatively. QUADPACK `qagse` uses `1e-5`.
+const ROUNDOFF_VALUE_TOLERANCE: f64 = 1.0e-5;
+
+/// ...and leaves at least this fraction of the parent's error estimate.
+/// QUADPACK `qagse` uses `0.99`.
+const ROUNDOFF_ERROR_FRACTION: f64 = 0.99;
+
+/// Roundoff-limited bisections tolerated before the result is accepted at the
+/// accuracy actually achieved. QUADPACK `qagse` uses 6 for the non-extrapolated
+/// case.
+const ROUNDOFF_LIMIT: usize = 6;
+
 const SQRT_PI: f64 = 1.772_453_850_905_516;
 
 /// Breakpoint offsets from each resonance energy in units of its total
@@ -271,7 +284,6 @@ struct TargetContext<'plan, 'data> {
     target_speed: f64,
     thermal_u: f64,
     temperature_k: f64,
-    require_derivative: bool,
     budget: QuadratureBudget,
     /// Whether any quadrature node so far had a positive `σ`. These nodes
     /// ARE the contributing unbroadened points of SAMMY's negative rule.
@@ -313,14 +325,12 @@ impl TargetContext<'_, '_> {
         }
         let value = (-x * x).exp() * source_speed.signum() * source_energy * sigma
             / (SQRT_PI * self.target_energy);
-        // The derivative costs a multiply and a divide at every node, and
-        // the value-only entry points discard it, so it is not computed
-        // for them.
-        let derivative = if self.require_derivative {
-            value * (x * x - 0.5) / self.temperature_k
-        } else {
-            0.0
-        };
+        // Always computed, even when the caller discards it. Refining
+        // against the derivative's error too changes the panel set, and a
+        // panel set that depends on what the caller asked for would make the
+        // cross-section itself depend on it — measured at 2.9e-13 relative on
+        // 56 of 201 targets before this was removed.
+        let derivative = value * (x * x - 0.5) / self.temperature_k;
         (value, derivative)
     }
 
@@ -377,11 +387,7 @@ impl TargetContext<'_, '_> {
             // The derivative carries a 1/T, so comparing its raw error
             // against the value's would make the derivative dominate the
             // refinement order at low temperature for no reason.
-            priority: if self.require_derivative {
-                value_error.max(self.temperature_k * derivative_error)
-            } else {
-                value_error
-            },
+            priority: value_error.max(self.temperature_k * derivative_error),
             sequence,
         }
     }
@@ -477,6 +483,7 @@ impl TargetContext<'_, '_> {
                 limit: self.budget.max_active_panels,
             });
         }
+        let mut stalled_bisections = 0usize;
         let mut heap = BinaryHeap::with_capacity(points.len());
         let mut value = 0.0;
         let mut derivative = 0.0;
@@ -494,10 +501,8 @@ impl TargetContext<'_, '_> {
         }
 
         while value_error > ABSOLUTE_TOLERANCE_BARN + RELATIVE_TOLERANCE * value.abs()
-            || (self.require_derivative
-                && derivative_error
-                    > ABSOLUTE_DERIVATIVE_TOLERANCE_BARN_PER_K
-                        + RELATIVE_TOLERANCE * derivative.abs())
+            || derivative_error
+                > ABSOLUTE_DERIVATIVE_TOLERANCE_BARN_PER_K + RELATIVE_TOLERANCE * derivative.abs()
         {
             if heap.len() >= self.budget.max_active_panels {
                 return Err(DopplerError::PanelLimit {
@@ -527,6 +532,49 @@ impl TargetContext<'_, '_> {
                 self.evaluate_panel(middle, panel.right, panel.depth + 1, sequence + 1),
             ];
             sequence += 2;
+
+            // QUADPACK `qagse`'s roundoff detection, which this loop was
+            // missing.
+            //
+            // A bisection that leaves the value unchanged AND barely reduces
+            // the error estimate is not making progress: the two halves'
+            // error estimates have reached the floor set by floating-point
+            // cancellation, where halving an interval no longer halves its
+            // reported error. Past that point every further bisection ADDS a
+            // floor-level estimate to the running total, so the total grows
+            // with the panel count and the tolerance moves further away.
+            //
+            // Measured on the SAMMY tr165 pseudo-Al case at 1e-5 eV: the
+            // worst single panel was wrong by 2.4e-10 on a 24.8 barn answer,
+            // yet 4096 of those summed to 3.9e-7 against a 2.6e-7 tolerance.
+            // The same integral needed ~2600 panels to sit UNDER tolerance,
+            // so refining past that made the certificate worse while the
+            // answer stayed right (24.79 barn against SAMMY's 24.89).
+            //
+            // QUADPACK counts these and returns the accuracy it achieved
+            // (`ier = 2`) instead of refining until a budget stops it.
+            let children_value = children[0].value + children[1].value;
+            let children_value_error = children[0].value_error + children[1].value_error;
+            let children_derivative = children[0].derivative + children[1].derivative;
+            let children_derivative_error =
+                children[0].derivative_error + children[1].derivative_error;
+            let stalled = |parent: f64, child: f64, parent_err: f64, child_err: f64| {
+                (parent - child).abs() <= ROUNDOFF_VALUE_TOLERANCE * child.abs()
+                    && child_err >= ROUNDOFF_ERROR_FRACTION * parent_err
+            };
+            if stalled(
+                panel.value,
+                children_value,
+                panel.value_error,
+                children_value_error,
+            ) && stalled(
+                panel.derivative,
+                children_derivative,
+                panel.derivative_error,
+                children_derivative_error,
+            ) {
+                stalled_bisections += 1;
+            }
             // Running totals are corrected by the delta rather than
             // recomputed, so the cost per bisection stays constant.
             value += children[0].value + children[1].value - panel.value;
@@ -539,6 +587,11 @@ impl TargetContext<'_, '_> {
                     - panel.derivative_error)
                     .max(0.0);
             heap.extend(children);
+
+            if stalled_bisections >= ROUNDOFF_LIMIT {
+                // Refining further would only inflate the summed estimate.
+                break;
+            }
         }
 
         if !value.is_finite() {
@@ -548,7 +601,7 @@ impl TargetContext<'_, '_> {
                 derivative: false,
             });
         }
-        if self.require_derivative && !derivative.is_finite() {
+        if !derivative.is_finite() {
             return Err(DopplerError::NonFiniteIntegral {
                 energy_ev: self.target_energy,
                 value: derivative,
@@ -620,7 +673,6 @@ pub fn broaden_with_budget(
     data: &ResonanceData,
     temperature_k: f64,
     channel: Channel,
-    require_derivative: bool,
     budget: QuadratureBudget,
 ) -> Result<TierOneBroadening, DopplerError> {
     let params = DopplerParams::new(temperature_k, data.awr)?;
@@ -665,7 +717,6 @@ pub fn broaden_with_budget(
                 target_speed: target_energy.sqrt(),
                 thermal_u,
                 temperature_k,
-                require_derivative,
                 budget,
                 any_source_positive: std::cell::Cell::new(false),
             }
@@ -681,16 +732,7 @@ pub fn broaden_with_budget(
         .map(|integral| (integral.value, integral.derivative))
         .unzip();
     Ok(TierOneBroadening {
-        // A derivative the caller did not ask for was refined against the
-        // VALUE's error criterion only, so it is not converged and its
-        // finiteness was never checked. Returning it would look like an
-        // answer; zeroing it matches the documented contract and the
-        // zero-temperature path.
-        derivatives: if require_derivative {
-            derivatives
-        } else {
-            vec![0.0; values.len()]
-        },
+        derivatives,
         values,
         negative_values,
     })
@@ -711,7 +753,6 @@ pub fn broaden_channel(
         data,
         temperature_k,
         channel,
-        false,
         QuadratureBudget::default(),
     )
     .map(|broadening| broadening.values)
@@ -744,7 +785,6 @@ pub fn broaden_with_derivative(
         data,
         temperature_k,
         Channel::Total,
-        true,
         QuadratureBudget::default(),
     )
     .map(|broadening| (broadening.values, broadening.derivatives))
@@ -1244,8 +1284,7 @@ mod tests {
     #[test]
     fn an_exhausted_quadrature_budget_is_reported_not_absorbed() {
         let data = synthetic_swave_slbw(10.0, 10.0, 1.5e-6, 1.5e-6, 5.0);
-        let limited =
-            |budget| broaden_with_budget(&[10.0], &data, 300.0, Channel::Capture, false, budget);
+        let limited = |budget| broaden_with_budget(&[10.0], &data, 300.0, Channel::Capture, budget);
         assert!(matches!(
             limited(QuadratureBudget {
                 max_depth: 4,
@@ -1295,7 +1334,6 @@ mod tests {
             &data,
             293.6,
             Channel::Total,
-            false,
             QuadratureBudget::default(),
         )
         .unwrap();
@@ -1315,42 +1353,38 @@ mod tests {
         );
     }
 
-    /// An unrequested derivative was refined against the VALUE's error
-    /// criterion only, so it is not converged. Returning it would look like
-    /// an answer.
+    /// The cross-section does not depend on whether the caller also asked
+    /// for its slope.
+    ///
+    /// Refining against the derivative's error too changes which panels get
+    /// split, and that used to change the converged value: 56 of 201 targets
+    /// differed, worst 2.9e-13 relative. Divided by a finite-difference step
+    /// that is enough to fail an analytic-vs-FD Jacobian check, and it is the
+    /// same shape of defect as a model whose derivative describes a different
+    /// curve from the one it reports. The derivative is now always computed
+    /// and always part of the refinement criterion, so there is one panel set
+    /// and one value.
     #[test]
-    fn a_derivative_that_was_not_requested_comes_back_zero() {
+    fn asking_for_the_derivative_does_not_change_the_value() {
         let data = u238_with_formalism(ResonanceFormalism::MLBW);
-        let energies = [6.5, 6.674, 7.1];
-        let without = broaden_with_budget(
-            &energies,
-            &data,
-            293.6,
-            Channel::Total,
-            false,
-            QuadratureBudget::default(),
-        )
-        .unwrap();
-        assert_eq!(without.derivatives, vec![0.0; energies.len()]);
+        let energies: Vec<f64> = (0..201).map(|i| 1.0 + f64::from(i) * 0.05).collect();
 
-        // Control: asking for it gives something that is NOT zero, so the
-        // assertion above pins the opt-out rather than a dead code path.
-        let with = broaden_with_budget(
-            &energies,
-            &data,
-            293.6,
-            Channel::Total,
-            true,
-            QuadratureBudget::default(),
-        )
-        .unwrap();
-        assert!(with.derivatives.iter().all(|d| d.abs() > 0.0));
-        // The values agree to rounding but NOT to the bit: asking for the
-        // derivative puts its error into the refinement priority, so the
-        // panels are split in a different order and the sum reassociates.
-        for (a, b) in with.values.iter().zip(&without.values) {
-            assert!((a - b).abs() / b.abs() < 1e-12, "{a} vs {b}");
+        let value_only = broaden(&energies, &data, 293.6).unwrap();
+        let (value_with, derivatives) = broaden_with_derivative(&energies, &data, 293.6).unwrap();
+
+        for (i, (a, b)) in value_only.iter().zip(&value_with).enumerate() {
+            assert_eq!(
+                a.to_bits(),
+                b.to_bits(),
+                "target {i} at {} eV: {a} without the derivative, {b} with it",
+                energies[i]
+            );
         }
+        // Non-vacuity: the derivative is a real converged quantity, not zero.
+        assert!(
+            derivatives.iter().any(|d| d.abs() > 0.0),
+            "no derivative was produced, so the equality above is vacuous"
+        );
     }
 
     /// The budget bounds the panels the BREAKPOINTS produce, not only the
@@ -1369,7 +1403,6 @@ mod tests {
                 &data,
                 293.6,
                 Channel::Total,
-                false,
                 QuadratureBudget {
                     max_depth: MAX_DEPTH,
                     max_active_panels: 1,
