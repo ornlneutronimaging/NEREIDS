@@ -56,8 +56,13 @@
 //! `AP(E′)` inside the window — each is a kink both rules would otherwise
 //! straddle and mis-estimate.
 //!
-//! Every failure is hard. A broadening that cannot converge returns an error
-//! rather than a degraded number.
+//! Failures are hard, with one reported exception. A broadening that cannot
+//! converge returns an error rather than a degraded number — except when
+//! refinement has stopped helping at all, where QUADPACK `qagse` returns the
+//! accuracy achieved (`ier = 2`) instead of refining until a budget stops it.
+//! Those targets are counted on [`TierOneBroadening::roundoff_limited`], so a
+//! caller that needs the error certificate can see it was not met rather than
+//! having to assume it was.
 //!
 //! ## Not implemented here
 //!
@@ -270,6 +275,9 @@ impl Ord for Panel {
 struct TargetIntegral {
     value: f64,
     derivative: f64,
+    /// Whether refinement stopped because it had stopped helping, so the
+    /// requested error certificate was never met.
+    roundoff_limited: bool,
     /// Whether SAMMY's rule KEPT a negative value here.
     kept_negative: bool,
 }
@@ -484,6 +492,7 @@ impl TargetContext<'_, '_> {
             });
         }
         let mut stalled_bisections = 0usize;
+        let mut roundoff_limited = false;
         let mut heap = BinaryHeap::with_capacity(points.len());
         let mut value = 0.0;
         let mut derivative = 0.0;
@@ -590,6 +599,7 @@ impl TargetContext<'_, '_> {
 
             if stalled_bisections >= ROUNDOFF_LIMIT {
                 // Refining further would only inflate the summed estimate.
+                roundoff_limited = true;
                 break;
             }
         }
@@ -622,18 +632,21 @@ impl TargetContext<'_, '_> {
                     value: 0.0,
                     derivative: 0.0,
                     kept_negative: false,
+                    roundoff_limited,
                 });
             }
             return Ok(TargetIntegral {
                 value,
                 derivative,
                 kept_negative: true,
+                roundoff_limited,
             });
         }
         Ok(TargetIntegral {
             value,
             derivative,
             kept_negative: false,
+            roundoff_limited,
         })
     }
 }
@@ -651,6 +664,16 @@ pub struct TierOneBroadening {
     /// when broadening ran, and on the unbroadened path they are simply
     /// the negative values of the resonance equation.
     pub negative_values: usize,
+    /// Targets whose refinement stopped because it had stopped helping,
+    /// rather than because the requested tolerance was met.
+    ///
+    /// The value at such a target is stationary — six consecutive bisections
+    /// moved it by less than 1e-5 relative — but its error certificate was
+    /// never satisfied, and a caller that needs one must not assume it. This
+    /// is QUADPACK `qagse`'s `ier = 2` reported rather than swallowed: the
+    /// alternative is refining until a budget stops it and failing on a
+    /// value that was already correct.
+    pub roundoff_limited: usize,
 }
 
 /// Value and (optionally) temperature derivative of one channel at every
@@ -699,6 +722,8 @@ pub fn broaden_with_budget(
             values,
             derivatives: vec![0.0; energies.len()],
             negative_values,
+            // No kernel, no quadrature, nothing to be roundoff-limited by.
+            roundoff_limited: 0,
         });
     }
 
@@ -727,6 +752,7 @@ pub fn broaden_with_budget(
         .into_iter()
         .collect::<Result<Vec<TargetIntegral>, DopplerError>>()?;
     let negative_values = integrals.iter().filter(|i| i.kept_negative).count();
+    let roundoff_limited = integrals.iter().filter(|i| i.roundoff_limited).count();
     let (values, derivatives): (Vec<f64>, Vec<f64>) = integrals
         .into_iter()
         .map(|integral| (integral.value, integral.derivative))
@@ -735,6 +761,7 @@ pub fn broaden_with_budget(
         derivatives,
         values,
         negative_values,
+        roundoff_limited,
     })
 }
 
@@ -1384,6 +1411,72 @@ mod tests {
         assert!(
             derivatives.iter().any(|d| d.abs() > 0.0),
             "no derivative was produced, so the equality above is vacuous"
+        );
+    }
+
+    /// A roundoff-limited target is COUNTED, not silently passed off as
+    /// converged.
+    ///
+    /// The tr165 pseudo-Al source at the bottom of its grid is the case that
+    /// forced this: its window spans four decades of energy, so the summed
+    /// per-panel error estimate cannot reach the tolerance however far the
+    /// panels are split. The value is right — it agrees with SAMMY to 0.4 %
+    /// — but its error certificate was never met, and a caller that needs
+    /// one has to be able to tell.
+    #[test]
+    fn a_roundoff_limited_target_is_reported_as_such() {
+        let dir = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+            .parent()
+            .unwrap()
+            .parent()
+            .unwrap()
+            .join("tests/data/samtry/tr165_pseudo_al_total_xs");
+        let inp = nereids_endf::sammy::parse_sammy_inp(
+            &std::fs::read_to_string(dir.join("t165a.inp")).unwrap(),
+        )
+        .unwrap();
+        let par = nereids_endf::sammy::parse_sammy_par(
+            &std::fs::read_to_string(dir.join("t165a.par")).unwrap(),
+        )
+        .unwrap();
+        let data = nereids_endf::sammy::sammy_to_resonance_data(&inp, &par).unwrap();
+
+        // The first data point of SAMMY's own answer grid, which is where the
+        // window is widest relative to the energy.
+        let broadening = broaden_with_budget(
+            &[9.99999975e-6],
+            &data,
+            300.0,
+            Channel::Total,
+            QuadratureBudget::default(),
+        )
+        .expect("a roundoff-limited target returns its value rather than failing");
+
+        assert_eq!(
+            broadening.roundoff_limited, 1,
+            "this target is the one that cannot meet its certificate; if it now \
+             can, the report is untested rather than unnecessary"
+        );
+        assert!(
+            broadening.values[0] > 20.0 && broadening.values[0] < 30.0,
+            "the reported value must still be the right one (SAMMY gives \
+             24.894 barn), got {}",
+            broadening.values[0]
+        );
+
+        // Control: an ordinary target meets its certificate, so the count is
+        // reporting a real distinction rather than being always set.
+        let ordinary = broaden_with_budget(
+            &[10.0],
+            &data,
+            300.0,
+            Channel::Total,
+            QuadratureBudget::default(),
+        )
+        .expect("an ordinary target converges");
+        assert_eq!(
+            ordinary.roundoff_limited, 0,
+            "an ordinary target must not be reported as roundoff-limited"
         );
     }
 

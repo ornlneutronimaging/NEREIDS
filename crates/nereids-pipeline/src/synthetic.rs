@@ -103,7 +103,16 @@ impl Truth {
     /// ascending time, which is the order the response matrix and the
     /// recorded counts both use. Edges are bin boundaries, so there is one
     /// more of them than there are energies.
+    /// # Panics
+    /// Panics if `nominal_energies_ev` has fewer than two points: the bin
+    /// widths at each end are taken from the first and last spacing, and a
+    /// grid with no spacing has no bins to describe.
     pub fn detector_time_edges_us(&self) -> Vec<f64> {
+        assert!(
+            self.nominal_energies_ev.len() >= 2,
+            "a detector time axis needs at least two nominal energies, got {}",
+            self.nominal_energies_ev.len()
+        );
         let kl = TOF_FACTOR * self.flight_path_m;
         let mut times: Vec<f64> = self
             .nominal_energies_ev

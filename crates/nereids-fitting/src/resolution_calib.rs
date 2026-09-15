@@ -567,10 +567,13 @@ pub struct CalibrationResult {
     /// `n_free_params × n_free_params`, in the same raw optimizer space as
     /// [`theta`](Self::theta) (plus any fitted `t0` / `L_scale`).
     ///
-    /// `None` when the solution is not an interior minimum — most often
-    /// because a coordinate rests on a box bound, which
-    /// [`bounds_hit`](Self::bounds_hit) reports. A covariance from such a
-    /// point would be a fabrication rather than an uncertainty.
+    /// `None` when the solution is not a verified interior minimum: a
+    /// coordinate resting on a box bound (which
+    /// [`bounds_hit`](Self::bounds_hit) reports), a run that exhausted its
+    /// iteration budget without self-converging (which
+    /// [`converged`](Self::converged) reports), or a curvature that is not
+    /// positive definite. A covariance from any of those would be a
+    /// fabrication rather than an uncertainty.
     ///
     /// This is what a sample fit needs in order to carry the calibrated
     /// resolution as a correlated prior instead of pinning it. Pinning does
@@ -840,15 +843,48 @@ where
             covariance[row * k + col] = *value;
         }
     }
-    // A negative variance means the point is not a minimum in that
-    // coordinate; reporting a sigma from it would be a fabrication.
-    if (0..k).any(|i| {
-        let variance = covariance[i * k + i];
-        !variance.is_finite() || variance <= 0.0
-    }) {
+    // Positive DEFINITE, not merely positive on the diagonal: an indefinite
+    // Hessian can invert to a matrix whose diagonal is entirely positive
+    // while a correlation exceeds one, which is not a covariance. The
+    // measured example is the Gaussian family's two width coordinates, whose
+    // finite-difference Hessian produced a correlation of 1.004 before the
+    // step was corrected. A Cholesky factorization succeeds exactly when the
+    // matrix is positive definite, so it is the test rather than a proxy for
+    // one.
+    if !is_positive_definite(&covariance, k) {
         return None;
     }
     Some(covariance)
+}
+
+/// Whether a symmetric `k × k` row-major matrix is positive definite, by
+/// attempting a Cholesky factorization.
+fn is_positive_definite(matrix: &[f64], k: usize) -> bool {
+    let mut lower = vec![0.0; k * k];
+    for i in 0..k {
+        for j in 0..=i {
+            let mut sum = matrix[i * k + j];
+            for m in 0..j {
+                sum -= lower[i * k + m] * lower[j * k + m];
+            }
+            if i == j {
+                if !sum.is_finite() || sum <= 0.0 {
+                    return false;
+                }
+                lower[i * k + j] = sum.sqrt();
+            } else {
+                let pivot = lower[j * k + j];
+                if pivot == 0.0 {
+                    return false;
+                }
+                lower[i * k + j] = sum / pivot;
+                if !lower[i * k + j].is_finite() {
+                    return false;
+                }
+            }
+        }
+    }
+    true
 }
 
 fn solve_small(a: &[f64], b: &[f64], k: usize) -> Option<Vec<f64>> {
@@ -1363,7 +1399,12 @@ pub fn calibrate_resolution(
     // clamped to stay inside, so a Hessian still comes out, and it would be
     // reported as an uncertainty that the fit never had. `bounds_hit` is the
     // same test the caller is given, so the two cannot disagree.
-    let covariance = if bounds_hit.is_empty() {
+    // Two conditions, both necessary. A solution on a box bound is not an
+    // interior minimum, and the curvature there describes the box. A run that
+    // exhausted its iteration budget has not shown it reached a minimum at
+    // all, interior or not — Nelder-Mead stops wherever it happens to be, and
+    // curvature at an unverified point is not a calibrated uncertainty.
+    let covariance = if bounds_hit.is_empty() && best.self_converged {
         covariance_at_minimum(&mut obj, &best.x, &bounds)
     } else {
         None
@@ -2998,12 +3039,12 @@ mod tests {
         .expect("calibration runs");
 
         let Some(covariance) = result.covariance.as_ref() else {
-            // An edge solution reports no covariance by design, and then
-            // `bounds_hit` must say why rather than leaving it unexplained.
+            // Declining is by design, but it must be explained by something
+            // the caller can also see rather than left unaccounted for.
             assert!(
-                !result.bounds_hit.is_empty(),
-                "no covariance was reported and no bound was hit, so the \
-                 solution's rejection is unexplained"
+                !result.bounds_hit.is_empty() || !result.converged,
+                "no covariance was reported, yet the solution is interior and \
+                 self-converged, so its rejection is unexplained"
             );
             return;
         };

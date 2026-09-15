@@ -1815,11 +1815,10 @@ fn fit_counts_joint_poisson(
     // Build the per-bin active mask (SAMMY EMIN/EMAX-equivalent fit-energy
     // -range restriction).  `None` when no range is configured — the
     // JP objective treats that as "all bins active".
-    let active_mask = nereids_fitting::active_mask::build_active_mask(
+    let mut active_mask = nereids_fitting::active_mask::build_active_mask(
         config.energies(),
         config.fit_energy_range(),
     );
-    let active_mask_slice = active_mask.as_deref();
 
     // Reject early when the configured range selects fewer active
     // bins than the joint-Poisson dispatch can solve.  `joint_poisson_fit`
@@ -1831,8 +1830,10 @@ fn fit_counts_joint_poisson(
     // degree of freedom.  See [`required_active_bins`] for the
     // combined `max(2, n_free)` requirement.
     if let Some((e_min, e_max)) = config.fit_energy_range() {
-        let n_active =
-            nereids_fitting::active_mask::active_count(active_mask_slice, config.energies().len());
+        let n_active = nereids_fitting::active_mask::active_count(
+            active_mask.as_deref(),
+            config.energies().len(),
+        );
         let required = required_active_bins(config);
         if n_active < required {
             return Err(PipelineError::InvalidParameter(format!(
@@ -1892,6 +1893,19 @@ fn fit_counts_joint_poisson(
                     ))
                 },
             )?;
+        // An occupied bin with no neutron response means the supplied
+        // source/response cannot explain the counts — UNLESS a background is
+        // declared, in which case pure-background counts in a tail or
+        // source-gap bin are exactly what is expected.
+        //
+        // Such a bin still cannot be fitted. `ExactTwoArmRatioModel` reports
+        // T = 1 where there is no response, and the objective profiles a free
+        // flux per bin, so leaving it active lets background fluctuations be
+        // fitted as neutron flux. It carries no information about any fitted
+        // parameter either: the background here is declared, not fitted. So
+        // it is dropped from the active set rather than explained away.
+        let has_background = !detector_background.iter().all(|&v| v == 0.0);
+        let mut dead_occupied = Vec::new();
         for (bin, ((&observed_open, &observed_sample), &predicted_open)) in flux
             .iter()
             .zip(sample_counts)
@@ -1899,10 +1913,28 @@ fn fit_counts_joint_poisson(
             .enumerate()
         {
             if observed_open + observed_sample > 0.0 && predicted_open <= PIVOT_FLOOR {
+                if !has_background {
+                    return Err(PipelineError::InvalidParameter(format!(
+                        "exact incident source has zero detector response in occupied \
+                         detector bin {bin}; the supplied source/response cannot explain \
+                         the observed counts"
+                    )));
+                }
+                dead_occupied.push(bin);
+            }
+        }
+        if !dead_occupied.is_empty() {
+            let mask = active_mask.get_or_insert_with(|| vec![true; flux.len()]);
+            for &bin in &dead_occupied {
+                mask[bin] = false;
+            }
+            let remaining = mask.iter().filter(|&&active| active).count();
+            let required = required_active_bins(config);
+            if remaining < required {
                 return Err(PipelineError::InvalidParameter(format!(
-                    "exact incident source has zero detector response in occupied \
-                     detector bin {bin}; the supplied source/response cannot explain \
-                     the observed counts"
+                    "{} detector bin(s) hold only background and cannot be fitted, \
+                     leaving {remaining} active bin(s); at least {required} are required",
+                    dead_occupied.len()
                 )));
             }
         }
@@ -2001,14 +2033,14 @@ fn fit_counts_joint_poisson(
                     config.energies(),
                     nereids_fitting::transmission_model::baseline_reference_energy_active(
                         config.energies(),
-                        active_mask_slice,
+                        active_mask.as_deref(),
                     ),
                     bli.b0,
                     bli.b1,
                     bli.b2,
                 )
                 // Scope the runtime positivity guard to the fit window (#514).
-                .with_active_mask(active_mask_slice),
+                .with_active_mask(active_mask.as_deref()),
             );
         }
     }
@@ -2028,7 +2060,7 @@ fn fit_counts_joint_poisson(
         o: flux,
         s: sample_counts,
         c,
-        active_mask: active_mask_slice,
+        active_mask: active_mask.as_deref(),
         open_background: background,
         sample_background: background,
     };
@@ -2097,7 +2129,7 @@ fn fit_counts_joint_poisson(
             Some(
                 nereids_fitting::transmission_model::baseline_reference_energy_active(
                     config.energies(),
-                    active_mask_slice,
+                    active_mask.as_deref(),
                 ),
             ),
         )
@@ -6733,6 +6765,37 @@ mod tests {
             err.to_string()
                 .contains("zero detector response in occupied detector bin"),
             "{err}"
+        );
+
+        // (a2) The SAME dead bin, with a background declared: no longer an
+        // error, because pure-background counts in a bin with no neutron
+        // response are exactly what a declared background predicts. It must
+        // still not be fitted — a free flux there would let background
+        // fluctuations be read as neutrons — so it is dropped from the
+        // active set, and with only two bins that leaves too few to fit.
+        let err = fit_spectrum_typed(
+            &InputData::CountsWithNuisance {
+                sample_counts: vec![10.0, 10.0],
+                flux: vec![50.0, 50.0],
+                background: vec![5.0, 5.0],
+            },
+            &base_config(Some(make_response())).with_exact_count_response(exact(vec![
+                arrival + 10.0,
+                arrival + 11.0,
+                arrival + 12.0,
+            ])),
+        )
+        .expect_err("dropping every bin must be reported, not fitted");
+        let message = err.to_string();
+        assert!(
+            message.contains("hold only background and cannot be fitted"),
+            "a declared background must reclassify the dead bin rather than \
+             rejecting the source: {message}"
+        );
+        assert!(
+            !message.contains("zero detector response in occupied detector bin"),
+            "the no-background rejection must not fire once a background is \
+             declared: {message}"
         );
 
         // (b) Exact config attached to normalized transmission input.
