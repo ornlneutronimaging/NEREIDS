@@ -8,7 +8,6 @@
 //! - [`channel`] — Wave number, ρ parameter, statistical weight calculations
 //! - [`continuous_doppler`] — Tier-1 Doppler: the free-gas kernel integrated over the resonance equation
 //! - [`doppler`] — Free Gas Model Doppler broadening
-//! - [`doppler_route`] — Which Doppler route an isotope took, and why
 //! - [`penetrability`] — Hard-sphere penetrability, shift, and phase shift functions
 //! - [`reich_moore`] — Reich-Moore R-matrix cross-section formalism
 //! - [`resolution`] — Instrument resolution broadening (Gaussian convolution)
@@ -29,7 +28,6 @@ pub mod channel;
 pub mod continuous_doppler;
 pub mod counts_response;
 pub mod doppler;
-pub mod doppler_route;
 pub mod ikeda_carpenter;
 pub mod penetrability;
 pub mod reich_moore;
