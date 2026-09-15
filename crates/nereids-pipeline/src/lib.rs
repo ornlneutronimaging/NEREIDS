@@ -17,3 +17,11 @@ pub mod detectability;
 pub mod error;
 pub mod pipeline;
 pub mod spatial;
+/// Synthetic counts-domain measurements with known ground truth, for tests.
+///
+/// Gated on `#[cfg(any(test, feature = "test-support"))]` exactly as
+/// `nereids_endf::resonance::test_support` is: visible to this crate's own
+/// tests and to downstream crates that enable `test-support` in their
+/// `[dev-dependencies]`. Never built into a release.
+#[cfg(any(test, feature = "test-support"))]
+pub mod synthetic;

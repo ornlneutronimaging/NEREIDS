@@ -16,10 +16,25 @@ nereids-fitting = { workspace = true }
 ndarray = { workspace = true }
 rand = { workspace = true }
 rand_distr = { workspace = true }
+# Pins the noise stream algorithm (ChaCha12) for the synthetic fixture.
+# StdRng's stream is documented unstable across rand versions and would
+# silently change a recorded bias on an upgrade. test-support only.
+rand_chacha = { workspace = true, optional = true }
 rayon = { workspace = true }
 thiserror = { workspace = true }
+
+[features]
+default = []
+# Exposes `synthetic` — counts-domain measurements with known ground truth,
+# used by this crate's tests and available to downstream crates' tests.
+# Never enabled in release builds.
+test-support = ["dep:rand_chacha"]
 
 [dev-dependencies]
 # Exposes `nereids_endf::resonance::test_support` — synthetic
 # `ResonanceData` builders shared with sibling crates' tests.
 nereids-endf = { workspace = true, features = ["test-support"] }
+# Path-only self dev-dep so the integration tests see `synthetic`. Must NOT
+# be versioned: a versioned self dev-dep pins the unpublished current
+# version and breaks `cargo publish`.
+nereids-pipeline = { path = ".", features = ["test-support"] }
