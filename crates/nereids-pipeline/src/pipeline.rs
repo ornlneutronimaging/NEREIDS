@@ -1696,25 +1696,12 @@ fn fit_counts_joint_poisson(
                 .into(),
         ));
     }
-    // A non-finite background must be named as such rather than falling into
-    // the nonzero test below, which would report it as an unsupported
-    // background value instead of as malformed input.
-    if detector_background.iter().any(|&v| !v.is_finite()) {
+    if detector_background
+        .iter()
+        .any(|&v| !v.is_finite() || v < 0.0)
+    {
         return Err(PipelineError::InvalidParameter(
-            "detector_background contains non-finite values; supply zeros (or omit \
-             the array) — B_det wiring is deferred and nonzero values are rejected."
-                .into(),
-        ));
-    }
-    // Every exact nonzero is rejected, with no magnitude tolerance. Supplying
-    // a background is a model choice, and `B_det` is not wired at all; a small
-    // value is still a request this code cannot honour, so treating it as zero
-    // would silently fit a different model than the caller asked for.
-    if detector_background.iter().any(|&v| v != 0.0) {
-        return Err(PipelineError::InvalidParameter(
-            "joint-Poisson solver with non-zero detector_background is not yet supported \
-             (B_det wiring is deferred)."
-                .into(),
+            "detector_background must be finite and non-negative expected counts".into(),
         ));
     }
 
@@ -2025,12 +2012,25 @@ fn fit_counts_joint_poisson(
             );
         }
     }
+    // `detector_background` is a detector-space term: it is present whether
+    // or not the sample is in the beam, so it enters BOTH arms. That is the
+    // convention the energy-scale seed already uses, which forms its
+    // transmission proxy as `(S - b) / (O - b)`.
+    //
+    // A background that DIFFERS between the arms — the sample's own scatter
+    // and gammas — is a second array this entry point does not yet carry.
+    // `JointPoissonObjective` takes the two arms separately, so supplying it
+    // is a plumbing change rather than a likelihood one.
+    let background =
+        (!detector_background.iter().all(|&v| v == 0.0)).then_some(detector_background);
     let objective = JointPoissonObjective {
         model: &*stacked,
         o: flux,
         s: sample_counts,
         c,
         active_mask: active_mask_slice,
+        open_background: background,
+        sample_background: background,
     };
     let mut cfg = jp_cfg.clone();
     cfg.compute_covariance = config.compute_covariance;
@@ -7416,23 +7416,75 @@ mod tests {
         );
     }
 
-    /// Joint-Poisson rejects a non-zero detector-background nuisance arm
-    /// (B_det wiring is deferred): the profiled flux cannot represent a
-    /// constant additive term, so the gate fails loudly up-front instead
-    /// of silently mis-fitting.
+    /// A detector background is now fitted through, and ignoring one biases
+    /// density.
+    ///
+    /// Counts are built WITH a background in both arms. Fitting them while
+    /// telling the solver the background is zero must recover a worse density
+    /// than fitting them while declaring it — otherwise the background is not
+    /// reaching the likelihood.
     #[test]
-    fn test_joint_poisson_rejects_nonzero_detector_background() {
+    fn test_joint_poisson_uses_the_detector_background() {
+        let data = u238_single_resonance();
+        let energies: Vec<f64> = (0..51).map(|i| 1.0 + (i as f64) * 0.05).collect();
+        let true_density = 0.001;
+        let (t, _) = synthetic_transmission(&data, true_density, &energies);
+        let b_det = 60.0_f64;
+        // Expected counts with a background present in BOTH arms.
+        let flux: Vec<f64> = vec![2000.0 + b_det; energies.len()];
+        let s: Vec<f64> = t.iter().map(|&ti| 2000.0 * ti + b_det).collect();
+
+        let fit = |background: Vec<f64>| {
+            let config = UnifiedFitConfig::new(
+                energies.clone(),
+                vec![data.clone()],
+                vec!["U-238".into()],
+                0.0,
+                None,
+                vec![0.0005],
+            )
+            .unwrap()
+            .with_solver(SolverConfig::PoissonKL(PoissonConfig::default()))
+            .with_counts_background(CountsBackgroundConfig {
+                c: 1.0,
+                ..Default::default()
+            });
+            let input = InputData::CountsWithNuisance {
+                sample_counts: s.clone(),
+                flux: flux.clone(),
+                background,
+            };
+            let result = fit_spectrum_typed(&input, &config).expect("counts-KL fit runs");
+            (result.densities[0] - true_density).abs() / true_density
+        };
+
+        let declared = fit(vec![b_det; energies.len()]);
+        let ignored = fit(vec![0.0; energies.len()]);
+
+        assert!(
+            declared < 0.02,
+            "declaring the background must recover density; bias {:.3} %",
+            100.0 * declared
+        );
+        assert!(
+            ignored > 4.0 * declared,
+            "ignoring a background that IS in the counts gave bias {:.3} % against \
+             {:.3} % when declared — the background is not reaching the likelihood",
+            100.0 * ignored,
+            100.0 * declared
+        );
+    }
+
+    /// A malformed background is still refused.
+    #[test]
+    fn test_joint_poisson_rejects_malformed_detector_background() {
         let data = u238_single_resonance();
         let energies: Vec<f64> = (0..51).map(|i| 1.0 + (i as f64) * 0.05).collect();
         let (t, _) = synthetic_transmission(&data, 0.0005, &energies);
         let flux: Vec<f64> = vec![500.0; energies.len()];
         let s: Vec<f64> = t.iter().map(|&ti| 500.0 * ti).collect();
 
-        // 5e-13 sits below the magnitude tolerance this guard used to carry.
-        // Supplying a background is a model choice and `B_det` is not wired,
-        // so every exact nonzero must be refused rather than rounded to zero.
-        for nonzero_background in [5.0, 5.0e-13] {
-            let background: Vec<f64> = vec![nonzero_background; energies.len()];
+        for bad in [f64::NAN, f64::INFINITY, -1.0] {
             let config = UnifiedFitConfig::new(
                 energies.clone(),
                 vec![data.clone()],
@@ -7447,17 +7499,15 @@ mod tests {
                 c: 1.0,
                 ..Default::default()
             });
-
             let input = InputData::CountsWithNuisance {
                 sample_counts: s.clone(),
                 flux: flux.clone(),
-                background,
+                background: vec![bad; energies.len()],
             };
-            let err = fit_spectrum_typed(&input, &config).unwrap_err();
-            let msg = err.to_string();
+            let msg = fit_spectrum_typed(&input, &config).unwrap_err().to_string();
             assert!(
-                msg.contains("B_det"),
-                "expected deferred-B_det rejection for {nonzero_background}, got: {msg}"
+                msg.contains("finite and non-negative"),
+                "expected a malformed-background rejection for {bad}, got: {msg}"
             );
         }
     }
