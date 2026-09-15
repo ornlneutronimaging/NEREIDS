@@ -1,12 +1,28 @@
-//! Tier-1 Doppler broadening: the free-gas kernel integrated over the
-//! resonance equation, and the gate deciding which isotopes may take it.
+//! Doppler broadening by integrating the free-gas kernel over the resonance
+//! equation.
 //!
 //! ## What is integrated
 //!
-//! `σ_D(E) = (1/(√π·E)) ∫ e^{−x²} E′ σ(E′) dx` over `|x| ≤ 8`, with the
-//! source energy `E′ = (√E + u·x)²`. Substituting the kernel into that form
-//! is what removes the `1/v²` prefactor of the lab-frame convolution, so
-//! the integrand is bounded wherever `σ` is.
+//! SAMMY manual Eq. III B1.6/B1.7, in velocity space:
+//!
+//! ```text
+//! σ_D(E) = (1/(√π·E)) ∫ e^{−x²} w² · s(w) dx      w = √E + u·x
+//! s(w) = +σ(w²)   w > 0
+//! s(w) = −σ(w²)   w < 0
+//! ```
+//!
+//! with `u = √(k_B T / A)` the thermal width in √eV. The `w²` weight is what
+//! removes the `1/v²` prefactor of the lab-frame convolution, so the
+//! integrand is bounded wherever `σ` is.
+//!
+//! `s` is ODD through `w = 0`: the negative-`w` half is the reflected branch,
+//! the target overtaking the neutron. It is not a correction to be dropped at
+//! low energy — it is what makes the integral correct there. SAMMY manual
+//! Sec. III.B.1: "Negative velocities are included as needed, in order to
+//! properly evaluate the integral at low values of E". The share of the
+//! kernel it carries is `erfc(√E/u)/2`, which is 24% at `√E/u = 0.5` and 7.9%
+//! at 1. [`crate::doppler`] builds the same odd extension for a sampled
+//! table.
 //!
 //! Differentiating at fixed source SPEED — the source energies do not move
 //! with `T`, only the weight on them does — turns `d/dT` of `e^{−x²}` into
@@ -14,72 +30,54 @@
 //! share every panel, and a derivative converged on those panels costs one
 //! extra multiply per node rather than a second adaptive pass.
 //!
-//! ## The condition
+//! ## Why there is no eligibility test
 //!
-//! With `v = √E` the neutron speed in √eV and `u = √(k_B T / A)` the thermal
-//! width in the same units, the free-gas kernel (SAMMY manual Sec. III.B.1)
-//! carries a direct term in `√E − √E′` and a reflected term in `√E + √E′`.
-//! Dropping the reflected term leaves a single Gaussian in `√E`, which is
-//! what an integral over the resonance equation can evaluate directly. The
-//! reflected term is below `exp(−64)` exactly when `√E > 8u`, which is also
-//! the condition under which the truncated window `|x| ≤ 8` contains only
-//! positive source energies. That one inequality is why [`SUPPORT_X`] is 8
-//! and why it appears in both the gate and the window.
+//! Every source energy is evaluated through
+//! [`CrossSectionPlan::evaluate_one`], which sums whichever ranges cover it
+//! and dispatches SLBW, MLBW and Reich-Moore alike. So a window spanning two
+//! ranges, or a Reich-Moore evaluation, needs nothing special: the
+//! quadrature's only job is to know where the structure is, which is a
+//! question about breakpoints.
 //!
-//! The remaining conditions exist because the integral evaluates the
-//! resonance equation at source energies spread across the whole window, not
-//! only at the target: every one of those energies must be governed by the
-//! same resolved SLBW or MLBW range, or the integral would silently mix
-//! formalisms, or integrate a range whose parameters do not describe the
-//! source there.
-//!
-//! One tier-1 condition of the contract is NOT implemented here. A range
-//! carrying a File-3 (MF=3) smooth background must take the sampled-table
-//! tier, because the resonance equation does not represent that background.
-//! Only File 2 is parsed, so nothing can answer whether a range has one, and
-//! a gate that cannot see the data cannot enforce it. Whichever change adds
-//! MF=3 parsing owes this condition; until then an evaluation carrying a
-//! File-3 background would be integrated without it.
-//!
-//! ## Why the verdict is per isotope and all-or-nothing
-//!
-//! Mixing tiers within one isotope would make the reported cross-section a
-//! function of where in the grid each point happened to fall. The gate
-//! therefore reports the first failing condition at the lowest failing
-//! energy and demotes the whole isotope.
-//!
-//! The verdict does depend on the grid's EXTENT: a grid reaching past the
-//! resolved region asks a different question from one that stops inside it,
-//! and answering both the same way would hide the reach. The reported
-//! reason is the LOWEST failing energy, which the ascending-grid contract
-//! makes the same as the first one reached.
+//! This matters beyond tidiness. An earlier revision chose between this
+//! integral and the sampled table per isotope, from the working grid and the
+//! temperature. Both are moved by a fit, so the choice could flip mid-fit and
+//! σ stepped where the two methods disagreed. Selecting a method by anything
+//! a fit can vary makes the forward model discontinuous in the parameter
+//! being fitted; selecting it by what the INPUT IS cannot.
 //!
 //! ## Quadrature
 //!
-//! Gauss–Kronrod G10/K21 (QUADPACK `qk21`) with adaptive bisection: the
-//! panel with the largest error estimate is split until the total error
-//! meets the tolerance. Initial panel edges are the window ends, the
-//! resonance breakpoints, and every knot of an energy-dependent scattering
-//! radius `AP(E′)` inside the window — the SLBW/MLBW evaluator interpolates
-//! `AP` piecewise, so each knot is a kink in `σ(E′)` that both rules would
-//! otherwise straddle and mis-estimate.
+//! Gauss–Kronrod G10/K21 (QUADPACK `qk21`) with adaptive bisection: the panel
+//! with the largest error estimate is split until the total error meets the
+//! tolerance. Initial panel edges are the window ends, the zero crossing when
+//! the window reaches it, each covering range's bounds, the resonance
+//! breakpoints, and every knot of an energy-dependent scattering radius
+//! `AP(E′)` inside the window — each is a kink both rules would otherwise
+//! straddle and mis-estimate.
 //!
-//! Every failure is hard. A tier-1 broadening that cannot converge returns
-//! an error rather than a degraded number, because the whole point of the
-//! two tiers is that the caller is told which one ran.
+//! Every failure is hard. A broadening that cannot converge returns an error
+//! rather than a degraded number.
 //!
-//! Nothing in the workspace calls this yet; `transmission.rs` is wired
-//! separately.
+//! ## Not implemented here
+//!
+//! A range carrying a File-3 (MF=3) smooth background is integrated without
+//! it, because only File 2 is parsed and nothing can answer whether a range
+//! has one. Whichever change adds MF=3 parsing owes this.
+//!
+//! Below a resolved range's lower bound the dispatcher returns zero, while
+//! [`crate::doppler`] extrapolates 1/v. The two therefore disagree about a
+//! window reaching under that bound. Both are approximations of a File-3
+//! background neither can see.
 
 use std::cmp::Ordering;
 use std::collections::BinaryHeap;
 
-use nereids_endf::resonance::{ResonanceData, ResonanceFormalism, ResonanceRange};
+use nereids_endf::resonance::ResonanceData;
 use rayon::prelude::*;
 
 use crate::doppler::{DopplerError, DopplerParams, validate_doppler_grid, zero_negative_value};
-use crate::doppler_route::{DopplerRoute, SampledTableReason};
-use crate::reich_moore::{CrossSectionPlan, CrossSections, covers, upper_bound_is_half_open};
+use crate::reich_moore::{CrossSectionPlan, CrossSections};
 
 /// Half-width of the kernel support in units of `u`, so the thermal window
 /// is `[(√E − 8u)², (√E + 8u)²]`. `erfc(8) ≈ 1.1e-29` of the kernel mass
@@ -208,217 +206,6 @@ impl Channel {
     }
 }
 
-/// The Doppler route of one isotope over `work_energies` at `temperature_k`.
-///
-/// The kernel width `u = √(k_B T / A)` is built here from the source's OWN
-/// `awr`, so it cannot be computed for a different nuclide than the one
-/// being routed: the same grid and temperature against AWR 1 rather than
-/// AWR 236 moves `8u` by a factor of 15 and flips the verdict.
-///
-/// The verdict covers the whole grid: the lowest energy that fails a tier-1
-/// condition demotes the isotope and names the reason. Conditions are tested
-/// in a fixed order so the reported reason is deterministic rather than an
-/// artefact of which check happened to run first.
-///
-/// # Errors
-///
-/// Returns [`DopplerError`] when the temperature or the source's `awr` is
-/// not a valid [`DopplerParams`], or when `work_energies` is empty or is not
-/// the grid broadening requires — finite, strictly positive and strictly
-/// ascending.
-/// An unroutable input is an error and not a route: the sampled-table tier
-/// rejects exactly these grids too, so reporting one as tier 2 would send
-/// the caller down a path that cannot run.
-pub fn classify_isotope(
-    data: &ResonanceData,
-    work_energies: &[f64],
-    temperature_k: f64,
-) -> Result<DopplerRoute, DopplerError> {
-    let params = DopplerParams::new(temperature_k, data.awr)?;
-    if work_energies.is_empty() {
-        return Err(DopplerError::EmptyGrid);
-    }
-    // The same contract the broadening entry points enforce, checked by the
-    // same function: an energy this rejects cannot be routed by EITHER tier,
-    // so it is an error rather than a reason to prefer the sampled table.
-    // It also leaves the reduction below free of values it cannot order —
-    // NaN compares false against everything, so one left in the grid would
-    // pin the reported reason to itself.
-    validate_doppler_grid(work_energies)?;
-    // No kernel means the tier question does not arise. That is absolute
-    // zero, and ALSO any temperature small enough that `u` underflows to
-    // zero — the broadening entry points return the unbroadened equation
-    // in both cases, so testing only `T == 0` here would let the route
-    // claim `Continuous` for a curve that was never broadened.
-    // `DopplerParams` rejects a negative temperature outright, which is why
-    // the first test is for equality.
-    let thermal_u = params.u();
-    if params.temperature_k() == 0.0 || thermal_u == 0.0 {
-        return Ok(DopplerRoute::Unbroadened);
-    }
-    // Every formalism the grid was evaluated with, first use first. A grid
-    // may legitimately span adjacent resolved ranges of different
-    // formalisms; the disclosed route is the executed route, so it names
-    // all of them rather than the lowest energy's alone. The grid is
-    // non-empty and strictly ascending by the contract checked above, so
-    // "first use" is energy order and at least one entry is produced.
-    let mut formalisms: Vec<ResonanceFormalism> = Vec::new();
-    for &energy in work_energies {
-        match tier_one_check(data, energy, thermal_u) {
-            Ok(index) => {
-                let formalism = data.ranges[index].formalism;
-                if !formalisms.contains(&formalism) {
-                    formalisms.push(formalism);
-                }
-            }
-            // The grid ascends, so the first energy to fail is the lowest
-            // one that fails, and there is nothing later that could report
-            // a better reason.
-            Err(reason) => return Ok(DopplerRoute::SampledTable { reason }),
-        }
-    }
-    Ok(DopplerRoute::Continuous { formalisms })
-}
-
-/// A resolved SLBW or MLBW range that actually carries resonances.
-fn is_tier_one_formalism(range: &ResonanceRange) -> bool {
-    range.is_evaluable()
-        && matches!(
-            range.formalism,
-            ResonanceFormalism::SLBW | ResonanceFormalism::MLBW
-        )
-}
-
-/// The tier-1 conditions at one energy, in order. `Ok` carries the index of
-/// the covering range, which is both the formalism the route discloses and
-/// the range the integral must evaluate over.
-fn tier_one_check(
-    data: &ResonanceData,
-    energy_ev: f64,
-    thermal_u: f64,
-) -> Result<usize, SampledTableReason> {
-    let covering = |(index, range): &(usize, &ResonanceRange)| {
-        covers(
-            range.energy_low,
-            range.energy_high,
-            upper_bound_is_half_open(data, *index),
-            energy_ev,
-        )
-    };
-    // Prefer the evaluable covering range: a parse-and-skip placeholder
-    // spanning the same energies contributes nothing to the cross-section
-    // and must not mask the range that does.
-    let ranges = || data.ranges.iter().enumerate();
-    let Some((index, range)) = ranges()
-        .find(|entry| entry.1.is_evaluable() && covering(entry))
-        .or_else(|| ranges().find(covering))
-    else {
-        return Err(uncovered_energy_reason(data, energy_ev));
-    };
-
-    if !is_tier_one_formalism(range) {
-        // A resolved SLBW/MLBW range with no resonances is accepted by the
-        // parser but evaluates to nothing. Its formalism is not what
-        // demoted the isotope, so name the empty range instead of reporting
-        // "SLBW formalism", which would read as though SLBW were tier 2.
-        if range.resolved
-            && matches!(
-                range.formalism,
-                ResonanceFormalism::SLBW | ResonanceFormalism::MLBW
-            )
-        {
-            return Err(SampledTableReason::EmptyResolvedRange {
-                energy_ev,
-                formalism: range.formalism,
-            });
-        }
-        return Err(SampledTableReason::Formalism {
-            energy_ev,
-            formalism: Some(range.formalism),
-        });
-    }
-    let formalism = range.formalism;
-
-    let speed = energy_ev.sqrt();
-    let low_speed = speed - SUPPORT_X * thermal_u;
-    if low_speed <= 0.0 {
-        return Err(SampledTableReason::ThermalWindowFoldsThroughZero {
-            energy_ev,
-            thermal_u,
-            formalism,
-        });
-    }
-    let window_low_ev = low_speed * low_speed;
-    let window_high_ev = (speed + SUPPORT_X * thermal_u).powi(2);
-
-    // The window's top must respect the same half-open convention the
-    // cross-section dispatcher uses: at a bound shared with an evaluable
-    // neighbour, a source energy exactly on it belongs to the next range,
-    // which is the cross-formalism mixing this gate exists to prevent.
-    let top_inside = if upper_bound_is_half_open(data, index) {
-        window_high_ev < range.energy_high
-    } else {
-        window_high_ev <= range.energy_high
-    };
-    if window_low_ev < range.energy_low || !top_inside {
-        return Err(SampledTableReason::WindowCrossesRangeBoundary {
-            energy_ev,
-            window_low_ev,
-            window_high_ev,
-            range_low_ev: range.energy_low,
-            range_high_ev: range.energy_high,
-            formalism,
-        });
-    }
-
-    // ENDF-6 forbids overlapping ranges, but the parser does not validate
-    // it and the dispatcher sums every range containing a point, so an
-    // overlap would put a second formalism inside the window.
-    if let Some((other_range_index, _)) = ranges().find(|(i, other)| {
-        *i != index
-            && other.is_evaluable()
-            && other.energy_low < window_high_ev
-            && other.energy_high > window_low_ev
-    }) {
-        return Err(SampledTableReason::OverlappingRange {
-            energy_ev,
-            other_range_index,
-            formalism,
-        });
-    }
-
-    Ok(index)
-}
-
-/// The reason for an energy that no range covers: the nearest resolved
-/// SLBW/MLBW range when the source has one, so a grid reaching past the
-/// resolved region says so; otherwise a formalism failure with no
-/// formalism to name.
-fn uncovered_energy_reason(data: &ResonanceData, energy_ev: f64) -> SampledTableReason {
-    let distance = |range: &ResonanceRange| {
-        (range.energy_low - energy_ev)
-            .max(energy_ev - range.energy_high)
-            .max(0.0)
-    };
-    match data
-        .ranges
-        .iter()
-        .filter(|range| is_tier_one_formalism(range))
-        .min_by(|a, b| distance(a).total_cmp(&distance(b)))
-    {
-        Some(range) => SampledTableReason::GridLeavesResolvedRange {
-            energy_ev,
-            range_low_ev: range.energy_low,
-            range_high_ev: range.energy_high,
-            formalism: range.formalism,
-        },
-        None => SampledTableReason::Formalism {
-            energy_ev,
-            formalism: None,
-        },
-    }
-}
-
 /// One panel's contribution, value and temperature derivative together.
 #[derive(Debug, Clone, Copy, Default)]
 struct Integral {
@@ -494,17 +281,38 @@ struct TargetContext<'plan, 'data> {
 impl TargetContext<'_, '_> {
     /// Value and derivative integrands at kernel coordinate `x`.
     ///
-    /// `evaluate_one` panics on a non-positive energy; `(√E + u·x)²` is
-    /// positive for `|x| ≤ 8` exactly because the gate already required
-    /// `√E > 8u`. That condition is load-bearing here, not just a physics
-    /// nicety — weakening it would turn a refusal into a panic.
+    /// SAMMY Eq. III B1.6 integrates `w²·s(w)` over the source speed
+    /// `w = √E + u·x`, with
+    ///
+    /// ```text
+    /// s(w) = +σ(w²)   w > 0
+    /// s(w) = −σ(w²)   w < 0
+    /// ```
+    ///
+    /// so the integrand is ODD through `w = 0` and passes through zero
+    /// there. The negative-`w` half is the reflected branch: the target
+    /// overtaking the neutron. It is what makes the integral correct at low
+    /// energy, where the thermal window reaches below zero speed — SAMMY
+    /// manual Sec. III.B.1, "Negative velocities are included as needed, in
+    /// order to properly evaluate the integral at low values of E". The
+    /// sampled path builds the same extension in
+    /// [`build_extended_fgm_grid`](crate::doppler).
+    ///
+    /// `evaluate_one` is called with `w²`, which is positive whenever `w`
+    /// is non-zero, and `w == 0` returns early — so its positive-energy
+    /// assertion cannot fire for any `x`.
     fn integrand(&self, x: f64) -> (f64, f64) {
-        let source_energy = (self.target_speed + self.thermal_u * x).powi(2);
+        let source_speed = self.target_speed + self.thermal_u * x;
+        if source_speed == 0.0 {
+            return (0.0, 0.0);
+        }
+        let source_energy = source_speed * source_speed;
         let sigma = self.channel.pick(&self.plan.evaluate_one(source_energy));
         if sigma > 0.0 {
             self.any_source_positive.set(true);
         }
-        let value = (-x * x).exp() * source_energy * sigma / (SQRT_PI * self.target_energy);
+        let value = (-x * x).exp() * source_speed.signum() * source_energy * sigma
+            / (SQRT_PI * self.target_energy);
         // The derivative costs a multiply and a divide at every node, and
         // the value-only entry points discard it, so it is not computed
         // for them.
@@ -580,48 +388,83 @@ impl TargetContext<'_, '_> {
 
     /// Initial panel edges in `x`: the window ends, every resonance
     /// breakpoint inside it, and every `AP(E′)` knot inside it.
-    fn breakpoints(&self, range: &ResonanceRange) -> Vec<f64> {
-        let low_energy = (self.target_speed - SUPPORT_X * self.thermal_u).powi(2);
-        let high_energy = (self.target_speed + SUPPORT_X * self.thermal_u).powi(2);
+    fn breakpoints(&self, data: &ResonanceData) -> Vec<f64> {
+        let speed_low = self.target_speed - SUPPORT_X * self.thermal_u;
+        let speed_high = self.target_speed + SUPPORT_X * self.thermal_u;
+        // A window reaching below zero speed covers every energy down to
+        // zero on its reflected branch, so the culling bound below must not
+        // be `speed_low²` — that would discard resonances the window
+        // actually sees.
+        let folds = speed_low < 0.0;
+        let low_energy = if folds { 0.0 } else { speed_low * speed_low };
+        let high_energy = speed_high * speed_high;
         let mut points = vec![-SUPPORT_X, SUPPORT_X];
+        // `w²·s(w)` is continuous through `w = 0` but has a kink there, and
+        // Gauss-Kronrod converges slowly across a kink it is not told
+        // about. Make the crossing a panel boundary.
+        if folds {
+            points.push(-self.target_speed / self.thermal_u);
+        }
         let mut push_source_energy = |source_energy: f64| {
             if source_energy <= 0.0 {
                 return;
             }
-            let coordinate = (source_energy.sqrt() - self.target_speed) / self.thermal_u;
-            if coordinate > -SUPPORT_X && coordinate < SUPPORT_X {
-                points.push(coordinate);
+            let speed = source_energy.sqrt();
+            // A folded window reaches one source energy at BOTH ±√E. When
+            // it does not fold, the reflected coordinate lands outside
+            // `±SUPPORT_X` and the filter drops it, so no test is needed.
+            for signed_speed in [speed, -speed] {
+                let coordinate = (signed_speed - self.target_speed) / self.thermal_u;
+                if coordinate > -SUPPORT_X && coordinate < SUPPORT_X {
+                    points.push(coordinate);
+                }
             }
         };
-        for group in &range.l_groups {
-            for resonance in &group.resonances {
-                let total_width = resonance.gn.abs()
-                    + resonance.gg.abs()
-                    + resonance.gfa.abs()
-                    + resonance.gfb.abs();
-                // Skip resonances whose Lorentzian cannot reach the window;
-                // their breakpoints would all be clipped anyway.
-                if total_width <= 0.0
-                    || resonance.energy + 4.0 * total_width < low_energy
-                    || resonance.energy - 4.0 * total_width > high_energy
-                {
-                    continue;
-                }
-                for multiplier in BREAKPOINT_WIDTHS {
-                    push_source_energy(resonance.energy + multiplier * total_width);
+        // Every range the window reaches, not just the target's own. The
+        // cross-section dispatcher already evaluates each source energy
+        // with whichever range covers it, so the quadrature's only job is
+        // to know where the structure is.
+        for range in &data.ranges {
+            if !range.is_evaluable()
+                || range.energy_high < low_energy
+                || range.energy_low > high_energy
+            {
+                continue;
+            }
+            // σ can step where one range stops contributing and the next
+            // starts, so the edges are panel boundaries.
+            push_source_energy(range.energy_low);
+            push_source_energy(range.energy_high);
+            for group in &range.l_groups {
+                for resonance in &group.resonances {
+                    let total_width = resonance.gn.abs()
+                        + resonance.gg.abs()
+                        + resonance.gfa.abs()
+                        + resonance.gfb.abs();
+                    // Skip resonances whose Lorentzian cannot reach the
+                    // window; their breakpoints would all be clipped anyway.
+                    if total_width <= 0.0
+                        || resonance.energy + 4.0 * total_width < low_energy
+                        || resonance.energy - 4.0 * total_width > high_energy
+                    {
+                        continue;
+                    }
+                    for multiplier in BREAKPOINT_WIDTHS {
+                        push_source_energy(resonance.energy + multiplier * total_width);
+                    }
                 }
             }
-        }
-        for &(knot_energy, _) in range.ap_table.iter().flat_map(|table| &table.points) {
-            push_source_energy(knot_energy);
+            for &(knot_energy, _) in range.ap_table.iter().flat_map(|table| &table.points) {
+                push_source_energy(knot_energy);
+            }
         }
         points.sort_by(f64::total_cmp);
         points.dedup_by(|left, right| left.to_bits() == right.to_bits());
         points
     }
 
-    fn integrate(&self, range: &ResonanceRange) -> Result<TargetIntegral, DopplerError> {
-        let points = self.breakpoints(range);
+    fn integrate(&self, data: &ResonanceData) -> Result<TargetIntegral, DopplerError> {
+        let points = self.breakpoints(data);
         // The budget bounds the INITIAL panels as well as the refined ones.
         // A source with many resonances, or a dense AP(E) table, produces
         // its panel count from the breakpoints alone, so checking only
@@ -761,21 +604,17 @@ pub struct TierOneBroadening {
 /// target energy, under an explicit quadrature budget.
 ///
 /// The kernel width `u = √(k_B T / A)` is built from the source's OWN
-/// `awr`, exactly as [`classify_isotope`] builds it, so the width and the
-/// resonance equation can never describe different nuclides. Taking a
-/// caller-supplied [`DopplerParams`] would allow that: an AWR wrong by
-/// 0.87% moves the width by 0.43%, which is below every tolerance in this
-/// module.
+/// `awr`, so the kernel width and the resonance equation can never describe
+/// different nuclides. Taking a caller-supplied [`DopplerParams`] would
+/// allow that: an AWR wrong by 0.87% moves the width by 0.43%, which is
+/// below every tolerance in this module.
 ///
 /// At zero temperature, or an underflowed `u`, there is no kernel and the
-/// values are the unbroadened equation — for ANY source, matching
-/// [`classify_isotope`] answering [`DopplerRoute::Unbroadened`] before it
-/// gates. Above zero the gate runs, and a source that does not qualify is
-/// refused with [`DopplerError::NotTierOne`] rather than integrated.
+/// values are the unbroadened equation.
 ///
 /// # Errors
-/// [`DopplerError`] for an invalid grid or temperature, for a source that
-/// is not tier-1, or for a quadrature that cannot converge inside `budget`.
+/// [`DopplerError`] for an invalid grid or temperature, or for a quadrature
+/// that cannot converge inside `budget`.
 pub fn broaden_with_budget(
     energies: &[f64],
     data: &ResonanceData,
@@ -811,17 +650,6 @@ pub fn broaden_with_budget(
         });
     }
 
-    // Gate every target BEFORE integrating any of them: the verdict is
-    // per isotope and all-or-nothing, so a grid that fails anywhere must
-    // not return half a curve.
-    let mut ranges = Vec::with_capacity(energies.len());
-    for &energy in energies {
-        match tier_one_check(data, energy, thermal_u) {
-            Ok(index) => ranges.push(&data.ranges[index]),
-            Err(reason) => return Err(DopplerError::NotTierOne { reason }),
-        }
-    }
-
     // Each target is an independent integral, so targets are the unit of
     // parallelism — the common thermometry case has ONE isotope, so
     // per-isotope parallelism would leave this serial. Results are gathered
@@ -829,8 +657,7 @@ pub fn broaden_with_budget(
     // failure, whatever order the threads finished in.
     let results: Vec<Result<TargetIntegral, DopplerError>> = energies
         .par_iter()
-        .zip(ranges.par_iter())
-        .map(|(&target_energy, range)| {
+        .map(|&target_energy| {
             TargetContext {
                 plan: &plan,
                 channel,
@@ -842,7 +669,7 @@ pub fn broaden_with_budget(
                 budget,
                 any_source_positive: std::cell::Cell::new(false),
             }
-            .integrate(range)
+            .integrate(data)
         })
         .collect();
     let integrals = results
@@ -929,25 +756,14 @@ mod tests {
     use crate::doppler::{DopplerParams, doppler_broaden};
     use nereids_core::constants::BOLTZMANN_EV_PER_K;
     use nereids_endf::parser::parse_endf_file2;
-    use nereids_endf::resonance::Resonance;
     use nereids_endf::resonance::test_support::{
         ex001_hydrogen_single_resonance, synthetic_swave_slbw, u238_with_formalism,
     };
+    use nereids_endf::resonance::{Resonance, ResonanceFormalism};
 
     /// Room temperature. For the U-238 fixtures 8u ≈ 0.083 √eV, so the
     /// window at 6.674 eV spans about ±0.43 eV.
     const ROOM_K: f64 = 293.6;
-
-    /// The kernel width the gate derives for the U-238 fixtures.
-    fn route(data: &ResonanceData, energies: &[f64]) -> DopplerRoute {
-        classify_isotope(data, energies, ROOM_K).expect("valid params and grid")
-    }
-
-    fn continuous(formalisms: &[ResonanceFormalism]) -> DopplerRoute {
-        DopplerRoute::Continuous {
-            formalisms: formalisms.to_vec(),
-        }
-    }
 
     // ── the quadrature rule itself ─────────────────────────────────────────
 
@@ -1139,11 +955,6 @@ mod tests {
                 })
                 .unzip();
         assert_eq!(energies.len(), 315);
-        // The whole curve must be eligible, or the comparison is vacuous.
-        assert_eq!(
-            classify_isotope(&data, &energies, 300.0).unwrap(),
-            continuous(&[ResonanceFormalism::SLBW])
-        );
 
         let ours = broaden_channel(&energies, &data, 300.0, Channel::Capture).unwrap();
         let (worst, max_rel) = ours
@@ -1270,19 +1081,11 @@ mod tests {
         let tiny = f64::from_bits(1);
         assert_eq!(DopplerParams::new(tiny, data.awr).unwrap().u(), 0.0);
         assert_eq!(broaden(&energies, &data, tiny).unwrap(), expected);
-        assert_eq!(
-            classify_isotope(&data, &energies, tiny).unwrap(),
-            DopplerRoute::Unbroadened
-        );
 
-        // At 0 K the route gate says `Unbroadened` for ANY source, so a
-        // tier-2-only formalism must get the unbroadened equation here and
-        // not a tier-1 refusal.
+        // Every formalism the cross-section dispatcher evaluates goes
+        // through the same integral, so Reich-Moore is not a special case
+        // here or anywhere else.
         let rm = u238_with_formalism(ResonanceFormalism::ReichMoore);
-        assert_eq!(
-            classify_isotope(&rm, &energies, 0.0).unwrap(),
-            DopplerRoute::Unbroadened
-        );
         assert!(broaden(&energies, &rm, 0.0).is_ok());
     }
 
@@ -1328,6 +1131,85 @@ mod tests {
         assert!(previous < 5.0e-3, "finest grid still {previous:.3e} away");
     }
 
+    /// The integral must cover the part of the thermal window that folds
+    /// through zero velocity.
+    ///
+    /// SAMMY Eq. III B1.6 integrates `w²·s(w)` with `s(w) = σ(w²)` for
+    /// `w > 0` and `−σ(w²)` for `w < 0` — an ODD integrand through the
+    /// origin. The sampled path builds exactly that odd extension
+    /// (`build_extended_fgm_grid`), quoting the SAMMY manual Sec. III.B.1:
+    /// negative velocities are included "in order to properly evaluate the
+    /// integral at low values of E".
+    ///
+    /// How much the reflected branch matters is set by `√E/u`, and NOT by
+    /// whether the truncated window happens to fold. The fraction of kernel
+    /// mass on the reflected side is `erfc(√E/u)/2`: it is 24% at
+    /// `√E/u = 0.5`, 7.9% at 1, and already 2e-3 at 2. Choosing targets by
+    /// the old gate's `√E < 8u` instead would put them at `√E/u ≈ 4`, where
+    /// the reflected mass is 1e-8 and the test measures nothing.
+    ///
+    /// `awr = 1` makes `u` large, so these ratios occur at energies well
+    /// above the fixture's 1e-5 eV resolved-range floor — below that floor
+    /// the dispatcher returns zero while the sampled path extrapolates
+    /// 1/v, and keeping the targets clear of it keeps that disagreement out
+    /// of this measurement.
+    ///
+    /// Measured against the sampled reference: with the sign the integral
+    /// agrees to 2e-4 or better; without it the error is 34%, 11% and 3.7%
+    /// at the three ratios.
+    #[test]
+    fn the_reflected_branch_carries_the_integral_at_low_energy() {
+        let data = synthetic_swave_slbw(1.0, 5.0, 1.0e-3, 2.0e-2, 5.0);
+        let params = DopplerParams::new(ROOM_K, data.awr).unwrap();
+        let thermal_u = params.u();
+
+        let step = 2.0e-5;
+        let grid: Vec<f64> = (1..=20_000).map(|i| f64::from(i) * step).collect();
+        let table: Vec<f64> = CrossSectionPlan::new(&data)
+            .evaluate(&grid)
+            .into_iter()
+            .map(|xs| xs.total)
+            .collect();
+        let sampled = doppler_broaden(&grid, &table, &params).unwrap();
+
+        for ratio in [0.5_f64, 0.75, 1.0] {
+            let index = grid
+                .iter()
+                .position(|&e| (e - (ratio * thermal_u).powi(2)).abs() < 0.5 * step)
+                .expect("target on the sampled grid");
+            let target = grid[index];
+
+            // Non-vacuity: at least 5% of the kernel must sit on the
+            // reflected side, or this target proves nothing about it.
+            let reflected_mass = 0.5 * erfc_approximation(ratio);
+            assert!(
+                reflected_mass > 0.05,
+                "√E/u = {ratio} leaves only {reflected_mass:.2e} reflected mass"
+            );
+
+            let ours = broaden(&[target], &data, ROOM_K).unwrap()[0];
+            let want = sampled[index];
+            let relative = (ours - want).abs() / want.abs();
+            assert!(
+                relative < 1.0e-3,
+                "at √E/u = {ratio} (E = {target:.3e} eV, {reflected_mass:.3e} of \
+                 the kernel reflected) the integral gives {ours:.6e} against the \
+                 sampled reference {want:.6e} — {relative:.3e} relative"
+            );
+        }
+    }
+
+    /// Abramowitz & Stegun 7.1.26. Only used to state how much kernel mass a
+    /// test target puts on the reflected side, so ~1e-7 absolute is ample.
+    fn erfc_approximation(x: f64) -> f64 {
+        let t = 1.0 / (1.0 + 0.327_591_1 * x);
+        let poly = t
+            * (0.254_829_592
+                + t * (-0.284_496_736
+                    + t * (1.421_413_741 + t * (-1.453_152_027 + t * 1.061_405_429))));
+        poly * (-x * x).exp()
+    }
+
     /// The value at one target does not depend on which grid asked for it.
     /// Targets are independent integrals, and this pins that they stay so
     /// once they are farmed out to threads.
@@ -1348,19 +1230,6 @@ mod tests {
                 "grid {grid:?} moved the value at 6.674 eV"
             );
         }
-    }
-
-    /// A source the gate refuses is an error, not a silently degraded
-    /// answer: the caller must learn which tier ran.
-    #[test]
-    fn a_source_the_gate_refuses_is_an_error() {
-        let data = u238_with_formalism(ResonanceFormalism::ReichMoore);
-        assert!(matches!(
-            broaden(&[6.674], &data, 293.6),
-            Err(DopplerError::NotTierOne {
-                reason: SampledTableReason::Formalism { .. }
-            })
-        ));
     }
 
     /// A budget too small to converge reports the limit and the energy it
@@ -1511,292 +1380,41 @@ mod tests {
         assert!(broaden(&[6.674], &data, 293.6).is_ok());
     }
 
-    /// Condition 1, the eligible case: a resolved SLBW or MLBW source with
-    /// the whole window inside its range integrates.
+    /// Every formalism the cross-section dispatcher evaluates is broadened
+    /// by the same integral.
+    ///
+    /// The integrand calls [`CrossSectionPlan::evaluate_one`], which
+    /// dispatches SLBW, MLBW and Reich-Moore alike, so there is nothing for
+    /// the broadening to special-case. Reich-Moore used to be refused here,
+    /// which is what made the choice of method a runtime decision.
+    ///
+    /// The results must also DIFFER between formalisms, or the test would
+    /// pass on an integrand that ignored the formalism entirely.
     #[test]
-    fn a_resolved_breit_wigner_source_inside_its_range_is_continuous() {
-        for formalism in [ResonanceFormalism::SLBW, ResonanceFormalism::MLBW] {
-            let data = u238_with_formalism(formalism);
-            assert_eq!(route(&data, &[6.5, 6.674, 6.9]), continuous(&[formalism]));
-        }
-    }
-
-    /// Condition 1, refused: Reich-Moore is a tier-2 formalism, named as
-    /// such rather than as a window or range failure.
-    #[test]
-    fn reich_moore_is_refused_by_formalism() {
-        let data = u238_with_formalism(ResonanceFormalism::ReichMoore);
-        assert_eq!(
-            route(&data, &[6.674]),
-            DopplerRoute::SampledTable {
-                reason: SampledTableReason::Formalism {
-                    energy_ev: 6.674,
-                    formalism: Some(ResonanceFormalism::ReichMoore),
-                }
-            }
-        );
-    }
-
-    /// A resolved SLBW range carrying no resonances is not a formalism
-    /// failure: it evaluates to nothing, and reporting "SLBW formalism"
-    /// would read as though SLBW itself were tier 2.
-    #[test]
-    fn an_empty_resolved_range_is_named_as_empty_not_as_its_formalism() {
-        let mut data = u238_with_formalism(ResonanceFormalism::SLBW);
-        data.ranges[0].l_groups[0].resonances.clear();
-        assert_eq!(
-            route(&data, &[6.674]),
-            DopplerRoute::SampledTable {
-                reason: SampledTableReason::EmptyResolvedRange {
-                    energy_ev: 6.674,
-                    formalism: ResonanceFormalism::SLBW,
-                }
-            }
-        );
-    }
-
-    /// An energy past the resolved region names the range it left, which is
-    /// the common real-data case: an acquisition, or the auxiliary grid a
-    /// resolution function adds, reaching beyond the evaluation.
-    #[test]
-    fn a_grid_past_the_resolved_region_names_the_range_it_left() {
-        let data = u238_with_formalism(ResonanceFormalism::MLBW);
-        assert_eq!(
-            route(&data, &[6.674, 2.5e4]),
-            DopplerRoute::SampledTable {
-                reason: SampledTableReason::GridLeavesResolvedRange {
-                    energy_ev: 2.5e4,
-                    range_low_ev: 1e-5,
-                    range_high_ev: 1e4,
-                    formalism: ResonanceFormalism::MLBW,
-                }
-            }
-        );
-        // Control: a source with no tier-1 range at all has no range to
-        // name, and reports the formalism failure instead.
-        let rm = u238_with_formalism(ResonanceFormalism::ReichMoore);
-        assert_eq!(
-            route(&rm, &[2.5e4]),
-            DopplerRoute::SampledTable {
-                reason: SampledTableReason::Formalism {
-                    energy_ev: 2.5e4,
-                    formalism: None,
-                }
-            }
-        );
-    }
-
-    /// Condition 2: below `8u` the window folds through zero energy, where
-    /// the kernel's reflected term the integral drops is no longer small.
-    /// A mass-1 target at 300 K has 8u ≈ 1.29 √eV, so 0.01 eV fails and
-    /// 100 eV passes.
-    #[test]
-    fn a_window_that_would_fold_through_zero_is_refused() {
-        // synthetic_swave_slbw builds a source whose awr is its first
-        // argument, so the gate derives u for mass 1 from that.
-        let data = synthetic_swave_slbw(1.0, 10.0, 1e-3, 1e-3, 3.0);
-        let thermal_u = DopplerParams::new(300.0, 1.0).unwrap().u();
-        assert_eq!(
-            classify_isotope(&data, &[0.01, 100.0], 300.0).unwrap(),
-            DopplerRoute::SampledTable {
-                reason: SampledTableReason::ThermalWindowFoldsThroughZero {
-                    energy_ev: 0.01,
-                    thermal_u,
-                    formalism: ResonanceFormalism::SLBW,
-                }
-            }
-        );
-        assert_eq!(
-            classify_isotope(&data, &[100.0], 300.0).unwrap(),
-            continuous(&[ResonanceFormalism::SLBW])
-        );
-    }
-
-    /// Condition 3: the window must lie inside the range, not merely the
-    /// target energy. At 9990 eV the target is inside a range ending at
-    /// 1e4 eV but the window is not.
-    #[test]
-    fn a_window_crossing_the_range_edge_is_refused_though_the_energy_is_inside() {
-        let data = u238_with_formalism(ResonanceFormalism::MLBW);
-        let DopplerRoute::SampledTable {
-            reason:
-                SampledTableReason::WindowCrossesRangeBoundary {
-                    energy_ev,
-                    window_high_ev,
-                    range_high_ev,
-                    ..
-                },
-        } = route(&data, &[9990.0])
-        else {
-            panic!("a window past the range top must be refused");
-        };
-        assert_eq!((energy_ev, range_high_ev), (9990.0, 1e4));
-        assert!(window_high_ev > range_high_ev);
-        // Control: the same range, with the window well inside it.
-        assert_eq!(
-            route(&data, &[6.674]),
-            continuous(&[ResonanceFormalism::MLBW])
-        );
-    }
-
-    /// Condition 4: a second evaluable range inside the window would put a
-    /// second formalism under the integral, because the dispatcher sums
-    /// every range containing a source energy.
-    #[test]
-    fn an_overlapping_evaluable_range_is_refused() {
-        let mut data = u238_with_formalism(ResonanceFormalism::MLBW);
-        let mut overlapping = data.ranges[0].clone();
-        overlapping.energy_low = 5.0;
-        overlapping.energy_high = 8.0;
-        data.ranges.push(overlapping);
-        assert_eq!(
-            route(&data, &[6.674]),
-            DopplerRoute::SampledTable {
-                reason: SampledTableReason::OverlappingRange {
-                    energy_ev: 6.674,
-                    other_range_index: 1,
-                    formalism: ResonanceFormalism::MLBW,
-                }
-            }
-        );
-        // Control: a non-evaluable neighbour contributes no cross-section,
-        // so it is not an overlap — and placed FIRST it must not mask the
-        // range that does carry the cross-section either.
-        data.ranges[1].formalism = ResonanceFormalism::Unresolved;
-        data.ranges[1].resolved = false;
-        for _ in 0..2 {
-            assert_eq!(
-                route(&data, &[6.674]),
-                continuous(&[ResonanceFormalism::MLBW])
-            );
-            data.ranges.swap(0, 1);
-        }
-    }
-
-    /// A grid spanning adjacent resolved ranges of different formalisms is
-    /// eligible, and the verdict names both, because both were evaluated.
-    /// The window at a shared, half-open bound is refused for the same
-    /// reason the dispatcher hands that energy to the next range.
-    #[test]
-    fn adjacent_ranges_are_both_eligible_and_both_named() {
-        let mut data = u238_with_formalism(ResonanceFormalism::SLBW);
-        data.ranges[0].energy_high = 100.0;
-        let mut upper = u238_with_formalism(ResonanceFormalism::MLBW).ranges[0].clone();
-        upper.energy_low = 100.0;
-        data.ranges.push(upper);
-
-        assert_eq!(
-            route(&data, &[50.0]),
-            continuous(&[ResonanceFormalism::SLBW])
-        );
-        assert_eq!(
-            route(&data, &[500.0]),
-            continuous(&[ResonanceFormalism::MLBW])
-        );
-        assert_eq!(
-            route(&data, &[50.0, 500.0]),
-            continuous(&[ResonanceFormalism::SLBW, ResonanceFormalism::MLBW])
-        );
-        // The grid contract is what makes "first reached" mean energy
-        // order: a descending grid is not a differently-ordered request,
-        // it is refused before any routing happens.
-        assert!(matches!(
-            classify_isotope(&data, &[500.0, 50.0], ROOM_K),
-            Err(DopplerError::UnsortedEnergies { .. })
-        ));
-        // At 99.9 eV the window reaches the shared bound, where a source
-        // energy would be evaluated with the MLBW range above.
-        let DopplerRoute::SampledTable {
-            reason: SampledTableReason::WindowCrossesRangeBoundary { range_high_ev, .. },
-        } = route(&data, &[99.9])
-        else {
-            panic!("a window reaching a shared range bound must be refused");
-        };
-        assert_eq!(range_high_ev, 100.0);
-    }
-
-    /// The verdict is all-or-nothing and reports the LOWEST failing energy,
-    /// so passing energies before or after the failure do not change what
-    /// the user is told.
-    #[test]
-    fn the_lowest_failing_energy_decides_for_the_whole_isotope() {
-        let data = u238_with_formalism(ResonanceFormalism::MLBW);
-        for grid in [
-            vec![6.674, 9990.0, 9999.0],
-            vec![9990.0, 9999.0],
-            vec![9990.0],
+    fn every_formalism_the_dispatcher_evaluates_is_integrated() {
+        let targets = [6.5, 6.674, 6.9];
+        let mut results = Vec::new();
+        for formalism in [
+            ResonanceFormalism::SLBW,
+            ResonanceFormalism::MLBW,
+            ResonanceFormalism::ReichMoore,
         ] {
-            let DopplerRoute::SampledTable {
-                reason: SampledTableReason::WindowCrossesRangeBoundary { energy_ev, .. },
-            } = route(&data, &grid)
-            else {
-                panic!("the grid reaches past the range top and must be refused");
-            };
-            assert_eq!(energy_ev, 9990.0, "grid {grid:?}");
-        }
-    }
-
-    /// 0 K is neither tier: `DopplerParams` accepts it as "no broadening",
-    /// and the gate must not report a continuous integral over a kernel of
-    /// zero width.
-    #[test]
-    fn absolute_zero_is_neither_tier() {
-        let data = u238_with_formalism(ResonanceFormalism::MLBW);
-        assert_eq!(
-            classify_isotope(&data, &[6.674], 0.0).unwrap(),
-            DopplerRoute::Unbroadened
-        );
-        // Control: the same source, the same grid, one kelvin up.
-        assert_eq!(
-            classify_isotope(&data, &[6.674], 1.0).unwrap(),
-            continuous(&[ResonanceFormalism::MLBW])
-        );
-        // Grid validity is answered independently of the temperature: 0 K
-        // must not become a way to smuggle a malformed grid past the check.
-        assert!(matches!(
-            classify_isotope(&data, &[f64::NAN], 0.0),
-            Err(DopplerError::InvalidEnergy { .. })
-        ));
-        assert!(matches!(
-            classify_isotope(&data, &[], 0.0),
-            Err(DopplerError::EmptyGrid)
-        ));
-    }
-
-    /// An unroutable grid is an error, not a route. The sampled-table tier
-    /// rejects exactly these grids too (`validate_doppler_grid` is the same
-    /// function both use), so answering "take tier 2" would send the caller
-    /// somewhere that cannot run. Rejecting up front also keeps the
-    /// lowest-failing-energy reduction free of values it cannot order: NaN
-    /// compares false against everything, so one left in the grid would pin
-    /// the reported reason to itself.
-    #[test]
-    fn an_unroutable_grid_is_an_error_and_not_a_route() {
-        let data = u238_with_formalism(ResonanceFormalism::MLBW);
-        for bad in [f64::NAN, f64::INFINITY, -5.0, 0.0] {
+            let data = u238_with_formalism(formalism);
+            let values = broaden(&targets, &data, ROOM_K)
+                .unwrap_or_else(|e| panic!("{formalism:?} was not integrated: {e:?}"));
             assert!(
-                matches!(
-                    classify_isotope(&data, &[bad, 6.674], ROOM_K),
-                    Err(DopplerError::InvalidEnergy { index: 0, .. })
-                ),
-                "energy {bad} must be refused"
+                values.iter().all(|v| v.is_finite() && *v > 0.0),
+                "{formalism:?} produced {values:?}"
+            );
+            results.push((formalism, values));
+        }
+        for pair in results.windows(2) {
+            let ((left, a), (right, b)) = (&pair[0], &pair[1]);
+            assert!(
+                a.iter().zip(b).any(|(x, y)| x != y),
+                "{left:?} and {right:?} broadened identically, so the \
+                 formalism never reached the integrand"
             );
         }
-        // The masking falsifier: 9990 eV alone is refused for crossing the
-        // range edge, and a NaN in front of it must not quietly become the
-        // reported reason.
-        let DopplerRoute::SampledTable {
-            reason: SampledTableReason::WindowCrossesRangeBoundary { energy_ev, .. },
-        } = route(&data, &[9990.0])
-        else {
-            panic!("9990 eV must be refused at the range edge");
-        };
-        assert_eq!(energy_ev, 9990.0);
-        // A temperature the parameters reject is likewise an error, and the
-        // AWR is never a caller's to get wrong: it comes from the source.
-        assert!(matches!(
-            classify_isotope(&data, &[6.674], -1.0),
-            Err(DopplerError::InvalidParams(_))
-        ));
     }
 }

@@ -147,12 +147,6 @@ pub enum DopplerError {
     InvalidParams(DopplerParamsError),
     /// The energy grid is empty, so there is nothing to answer about.
     EmptyGrid,
-    /// The source does not qualify for tier-1 broadening on this grid. The
-    /// reason is the one the route gate discloses.
-    NotTierOne {
-        /// First failing condition, at the lowest failing energy.
-        reason: crate::doppler_route::SampledTableReason,
-    },
     /// A converged tier-1 value or temperature derivative is non-finite.
     /// A NEGATIVE value is not an error: SAMMY keeps a genuinely negative
     /// broadened cross-section (`fgm/mfgm4.f90:83-101`) rather than
@@ -233,12 +227,6 @@ impl fmt::Display for DopplerError {
             ),
             Self::InvalidParams(e) => write!(f, "invalid broadening parameters: {e}"),
             Self::EmptyGrid => write!(f, "the energy grid is empty"),
-            Self::NotTierOne { reason } => {
-                write!(
-                    f,
-                    "the source is not eligible for tier-1 broadening: {reason}"
-                )
-            }
             Self::NonFiniteIntegral {
                 energy_ev,
                 value,
