@@ -54,10 +54,15 @@ fn resolution(grid: &[f64]) -> ResolutionFunction {
     ResolutionFunction::IkedaCarpenter(Arc::new(ic))
 }
 
-/// Backgrounds are zero here. The counts path cannot represent a detector
-/// background at all — it rejects any non-zero value — so a fixture with
-/// `B_s != B_o` measures that gap rather than the joint recovery this test is
-/// about. That measurement belongs with the fix for it.
+/// Backgrounds are zero here, and the reason is narrower than it used to be.
+///
+/// The counts path now accepts a detector background: one shared array,
+/// entering both arms, supplied through `CountsWithNuisance`. What it cannot
+/// yet take is a background that DIFFERS between the arms, which is what this
+/// fixture generates — the sample arm carries its own scatter and gammas. A
+/// non-zero fixture here would therefore be measuring that remaining gap
+/// rather than the joint recovery this test is about, so it belongs with the
+/// fix for it.
 fn truth() -> Truth {
     let grid = energies();
     Truth {
