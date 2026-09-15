@@ -563,6 +563,21 @@ pub struct CalibrationResult {
     /// dof bookkeeping explicit now that families differ in size (IC is 4–5
     /// parameters, Gaussian/UdrCorr are 2).
     pub n_free_params: usize,
+    /// Covariance of the fitted coordinates at the solution, row-major
+    /// `n_free_params × n_free_params`, in the same raw optimizer space as
+    /// [`theta`](Self::theta) (plus any fitted `t0` / `L_scale`).
+    ///
+    /// `None` when the solution is not an interior minimum — most often
+    /// because a coordinate rests on a box bound, which
+    /// [`bounds_hit`](Self::bounds_hit) reports. A covariance from such a
+    /// point would be a fabrication rather than an uncertainty.
+    ///
+    /// This is what a sample fit needs in order to carry the calibrated
+    /// resolution as a correlated prior instead of pinning it. Pinning does
+    /// not bias the fitted temperature much, but it reports it as more
+    /// certain than it is: resolution width and temperature both broaden the
+    /// line, so the uncertainty that belongs to their degeneracy is dropped.
+    pub covariance: Option<Vec<f64>>,
     /// Coordinates that finished within `BOUND_HIT_REL_TOL·(hi−lo)` of a box
     /// bound, as `"name:lower"` / `"name:upper"` (names from
     /// [`ResolutionFamily::param_names`], plus `"t0_us"` / `"l_scale"` when
@@ -717,6 +732,125 @@ fn position_prior_penalty(t0_us: f64, l_scale: f64, cfg: &CalibrationConfig) -> 
 
 /// Solve a small `k×k` linear system `A x = b` (k ≤ 3) by Gaussian elimination
 /// with partial pivoting. Returns `None` on a singular system.
+/// Central-difference step for the calibration Hessian, as a fraction of
+/// each coordinate's box width. Large enough that the chi-squared surface's
+/// own numerical noise does not dominate the second difference, small enough
+/// that the quadratic approximation still holds across it.
+const HESSIAN_STEP_FRACTION: f64 = 1.0e-3;
+
+/// Floor on the coordinate magnitude the step is taken relative to, so a
+/// coordinate that happens to sit near zero still gets a finite probe.
+const HESSIAN_MIN_SCALE: f64 = 1.0e-3;
+
+/// Parameter covariance at a converged chi-squared minimum.
+///
+/// The outer optimizer is Nelder-Mead, which is derivative-free and produces
+/// no curvature, so the covariance has to be built at the solution. The
+/// objective is a RAW chi-squared, so
+///
+/// ```text
+/// Cov = 2 * H^-1,    H_ij = d^2 chi^2 / d(theta_i) d(theta_j)
+/// ```
+///
+/// which is the standard result for a Gaussian likelihood with known
+/// uncertainties: chi^2 = -2 ln L up to a constant.
+///
+/// `H` is evaluated by central differences with a step relative to each
+/// coordinate's own box width, so a coordinate encoded in ln-space and one in
+/// physical units are probed on comparable scales.
+///
+/// Returns `None` when the Hessian is singular, when any probe is
+/// infeasible, or when the result is not positive definite on its diagonal —
+/// all of which mean the solution is not an interior minimum and a
+/// covariance would be a fabrication. A coordinate resting on a bound is the
+/// common cause, and [`CalibrationResult::bounds_hit`] already reports it.
+fn covariance_at_minimum<F>(
+    objective: &mut F,
+    theta: &[f64],
+    bounds: &[(f64, f64)],
+) -> Option<Vec<f64>>
+where
+    F: FnMut(&[f64]) -> Result<f64, FittingError>,
+{
+    let k = theta.len();
+    if k == 0 || bounds.len() != k {
+        return None;
+    }
+    // Step relative to each COORDINATE's own magnitude, with the box only as
+    // a clamp. Sizing it by the box width instead puts the probe far outside
+    // the quadratic region whenever the box is much wider than the value —
+    // a `[0.001, 50]` bound on a coordinate of 0.3 gives a step of 0.05, or
+    // 17 % of it, and the resulting second difference is not a curvature.
+    let steps: Vec<f64> = theta
+        .iter()
+        .zip(bounds)
+        .map(|(&t, &(lo, hi))| {
+            let step = HESSIAN_STEP_FRACTION * t.abs().max(HESSIAN_MIN_SCALE);
+            step.min((hi - t).abs() * 0.5).min((t - lo).abs() * 0.5)
+        })
+        .collect();
+    if steps.iter().any(|&h| !h.is_finite() || h <= 0.0) {
+        return None;
+    }
+
+    let probe = |x: &[f64], objective: &mut F| -> Option<f64> {
+        objective(x).ok().filter(|v| v.is_finite())
+    };
+    let f0 = probe(theta, objective)?;
+
+    let mut hessian = vec![0.0; k * k];
+    for i in 0..k {
+        let mut plus = theta.to_vec();
+        let mut minus = theta.to_vec();
+        plus[i] += steps[i];
+        minus[i] -= steps[i];
+        let fp = probe(&plus, objective)?;
+        let fm = probe(&minus, objective)?;
+        hessian[i * k + i] = (fp - 2.0 * f0 + fm) / (steps[i] * steps[i]);
+    }
+    for i in 0..k {
+        for j in (i + 1)..k {
+            let mut pp = theta.to_vec();
+            let mut pm = theta.to_vec();
+            let mut mp = theta.to_vec();
+            let mut mm = theta.to_vec();
+            pp[i] += steps[i];
+            pp[j] += steps[j];
+            pm[i] += steps[i];
+            pm[j] -= steps[j];
+            mp[i] -= steps[i];
+            mp[j] += steps[j];
+            mm[i] -= steps[i];
+            mm[j] -= steps[j];
+            let value = (probe(&pp, objective)? - probe(&pm, objective)? - probe(&mp, objective)?
+                + probe(&mm, objective)?)
+                / (4.0 * steps[i] * steps[j]);
+            hessian[i * k + j] = value;
+            hessian[j * k + i] = value;
+        }
+    }
+
+    // Cov = 2 H^-1, by solving H X = 2 I column by column.
+    let mut covariance = vec![0.0; k * k];
+    for col in 0..k {
+        let mut rhs = vec![0.0; k];
+        rhs[col] = 2.0;
+        let column = solve_small(&hessian, &rhs, k)?;
+        for (row, value) in column.iter().enumerate() {
+            covariance[row * k + col] = *value;
+        }
+    }
+    // A negative variance means the point is not a minimum in that
+    // coordinate; reporting a sigma from it would be a fabrication.
+    if (0..k).any(|i| {
+        let variance = covariance[i * k + i];
+        !variance.is_finite() || variance <= 0.0
+    }) {
+        return None;
+    }
+    Some(covariance)
+}
+
 fn solve_small(a: &[f64], b: &[f64], k: usize) -> Option<Vec<f64>> {
     // Relative pivot threshold scaled by the matrix norm, so ill-conditioned
     // systems (not just exactly-singular ones) are reported infeasible.
@@ -1072,6 +1206,40 @@ pub fn calibrate_resolution(
     };
 
     let mut best: Option<NelderMeadResult> = None;
+    // Hoisted out of the restart loop: the objective does not depend on the
+    // restart, and the covariance at the end needs the same function that was
+    // minimized rather than a rebuilt copy of it.
+    let mut obj = |theta: &[f64]| -> Result<f64, FittingError> {
+        // theta = [resolution params (n_res)..., t0?, L_scale?]. The resolution
+        // kernel uses only the first n_res; (t0, L_scale) set the energy scale.
+        // An UNRESOLVABLE θ — nereids-physics rejects a kernel whose τ-grid
+        // cannot resolve the requested fold / prompt core within the
+        // MAX_TAU_SAMPLES cap (e.g. a fitted PSR at its 0.05 µs floor
+        // against β at its own floor) — is an infeasible POINT of the
+        // search, not a broken calibration: step away (mirrors the
+        // corrected-TOF ≤ 0 guard below). Config-level failures cannot
+        // reach here: they are rejected up front by calibrate_resolution.
+        let Ok(res) = build_resolution(&family, theta, e_min, e_max, config) else {
+            return Ok(f64::INFINITY);
+        };
+        let inst = InstrumentParams { resolution: res };
+        let (t0, l_scale) = unpack_position(theta);
+        // Infeasible energy scale (corrected TOF ≤ 0) → step away.
+        let Ok(grid) = corrected_energy_grid(energies, t0, l_scale, config.flight_path_m) else {
+            return Ok(f64::INFINITY);
+        };
+        let model = forward_model(&grid, sample, Some(&inst))
+            .map_err(|e| FittingError::EvaluationFailed(format!("forward: {e:?}")))?;
+        if !model.iter().all(|v| v.is_finite()) {
+            return Err(FittingError::EvaluationFailed("non-finite model".into()));
+        }
+        // Minimize RAW χ²_data + metrology prior penalty (same units — adding
+        // the penalty to a reduced χ² would rescale the prior by the dof).
+        let Some((ssr, _k)) = inner_ssr(data, unc, &model, config.fit_background) else {
+            return Ok(f64::INFINITY);
+        };
+        Ok(ssr + position_prior_penalty(t0, l_scale, config))
+    };
     for r in 0..config.restarts.max(1) {
         // Additive perturbation (a fraction of each parameter's bound range) so
         // restarts move even for zero-valued start components — a multiplicative
@@ -1081,38 +1249,6 @@ pub fn calibrate_resolution(
             .zip(&bounds)
             .map(|(&v, &(lo, hi))| (v + 0.1 * r as f64 * (hi - lo)).clamp(lo, hi))
             .collect();
-        let mut obj = |theta: &[f64]| -> Result<f64, FittingError> {
-            // theta = [resolution params (n_res)..., t0?, L_scale?]. The resolution
-            // kernel uses only the first n_res; (t0, L_scale) set the energy scale.
-            // An UNRESOLVABLE θ — nereids-physics rejects a kernel whose τ-grid
-            // cannot resolve the requested fold / prompt core within the
-            // MAX_TAU_SAMPLES cap (e.g. a fitted PSR at its 0.05 µs floor
-            // against β at its own floor) — is an infeasible POINT of the
-            // search, not a broken calibration: step away (mirrors the
-            // corrected-TOF ≤ 0 guard below). Config-level failures cannot
-            // reach here: they are rejected up front by calibrate_resolution.
-            let Ok(res) = build_resolution(&family, theta, e_min, e_max, config) else {
-                return Ok(f64::INFINITY);
-            };
-            let inst = InstrumentParams { resolution: res };
-            let (t0, l_scale) = unpack_position(theta);
-            // Infeasible energy scale (corrected TOF ≤ 0) → step away.
-            let Ok(grid) = corrected_energy_grid(energies, t0, l_scale, config.flight_path_m)
-            else {
-                return Ok(f64::INFINITY);
-            };
-            let model = forward_model(&grid, sample, Some(&inst))
-                .map_err(|e| FittingError::EvaluationFailed(format!("forward: {e:?}")))?;
-            if !model.iter().all(|v| v.is_finite()) {
-                return Err(FittingError::EvaluationFailed("non-finite model".into()));
-            }
-            // Minimize RAW χ²_data + metrology prior penalty (same units — adding
-            // the penalty to a reduced χ² would rescale the prior by the dof).
-            let Some((ssr, _k)) = inner_ssr(data, unc, &model, config.fit_background) else {
-                return Ok(f64::INFINITY);
-            };
-            Ok(ssr + position_prior_penalty(t0, l_scale, config))
-        };
         let mut res = nelder_mead_minimize(&mut obj, &start, Some(&bounds), &nm)?;
         // Simplex RE-INFLATION: Nelder–Mead's known failure mode is premature
         // simplex collapse — the spread criteria are met (`self_converged`)
@@ -1218,10 +1354,26 @@ pub fn calibrate_resolution(
             hits
         })
         .collect();
+    // Curvature at the solution, in the same coordinates the optimizer used.
+    // `obj` is the raw chi-squared plus the position prior, so this is the
+    // covariance of exactly what was minimized.
+    //
+    // A solution resting on a box bound is not an interior minimum, and the
+    // curvature there describes the box rather than the data: the step is
+    // clamped to stay inside, so a Hessian still comes out, and it would be
+    // reported as an uncertainty that the fit never had. `bounds_hit` is the
+    // same test the caller is given, so the two cannot disagree.
+    let covariance = if bounds_hit.is_empty() {
+        covariance_at_minimum(&mut obj, &best.x, &bounds)
+    } else {
+        None
+    };
+
     Ok(CalibrationResult {
         family: family.label().to_string(),
         theta,
         chi2_dof,
+        covariance,
         resolution: inst.resolution,
         iterations: best.iterations,
         converged: best.self_converged,
@@ -2792,5 +2944,105 @@ mod tests {
             "decoded solution must be feasible and inside the box: β = {beta}, \
              psr = {psr_us} µs"
         );
+    }
+    /// The reported covariance is a covariance: right shape, symmetric,
+    /// positive variances, and produced only at an interior solution.
+    ///
+    /// It also has to carry the correlation. The Gaussian family's two width
+    /// coordinates are nearly degenerate over one flight path — both scale
+    /// the same broadening — so a covariance that came back diagonal would
+    /// be describing something other than this objective. Measured here at
+    /// about -0.998, which is the information hard-pinning discards: each
+    /// width alone is poorly determined while their combination is tight.
+    ///
+    /// Not checked here: the absolute scale of the factor 2 in `Cov = 2H^-1`.
+    /// Confirming it means stepping along a covariance column and measuring
+    /// the chi-squared rise, which needs the calibration objective exposed.
+    #[test]
+    fn the_calibration_covariance_is_the_curvature_of_the_objective() {
+        // Data generated FROM a known resolution, so the objective has an
+        // interior optimum to find. A flat spectrum constrains nothing and
+        // drives the optimizer to a box bound, where a covariance would
+        // describe the box rather than the measurement.
+        let iso = synthetic_isotope(72, 178, 20.0, 0.05, 0.06);
+        let sample = SampleParams::new(300.0, vec![(iso, 2.0e-3)]).unwrap();
+        let energies: Vec<f64> = (0..120).map(|i| 18.0 + i as f64 * 0.04).collect();
+        let cfg = CalibrationConfig {
+            ic_n_energies: 8,
+            ic_n_tau: 32,
+            max_iter: 400,
+            ..Default::default()
+        };
+        let truth_resolution = ResolutionFunction::Gaussian(
+            ResolutionParams::new(cfg.flight_path_m, 0.30, 0.05, 0.0)
+                .expect("valid truth resolution"),
+        );
+        let truth = forward_model(
+            &energies,
+            &sample,
+            Some(&InstrumentParams {
+                resolution: truth_resolution,
+            }),
+        )
+        .expect("truth forward model");
+        let unc = vec![0.002; energies.len()];
+
+        let result = calibrate_resolution(
+            ResolutionFamily::Gaussian,
+            &energies,
+            &truth,
+            &unc,
+            &sample,
+            &cfg,
+        )
+        .expect("calibration runs");
+
+        let Some(covariance) = result.covariance.as_ref() else {
+            // An edge solution reports no covariance by design, and then
+            // `bounds_hit` must say why rather than leaving it unexplained.
+            assert!(
+                !result.bounds_hit.is_empty(),
+                "no covariance was reported and no bound was hit, so the \
+                 solution's rejection is unexplained"
+            );
+            return;
+        };
+
+        let k = result.n_free_params;
+        assert_eq!(covariance.len(), k * k, "covariance must be k x k");
+        for i in 0..k {
+            assert!(
+                covariance[i * k + i] > 0.0,
+                "variance {i} is not positive: {}",
+                covariance[i * k + i]
+            );
+        }
+        // The off-diagonal must be real: these coordinates are correlated,
+        // and a diagonal result would mean the cross-terms were never
+        // computed.
+        if k >= 2 {
+            let correlation = covariance[1] / (covariance[0] * covariance[k + 1]).sqrt();
+            assert!(
+                correlation.abs() > 0.1,
+                "covariance came back effectively diagonal (r = {correlation:.4}); the \
+                 two width coordinates are degenerate and must correlate"
+            );
+            assert!(
+                correlation.abs() < 1.0,
+                "correlation {correlation:.6} is not physical"
+            );
+        }
+        // Symmetry: a Hessian inverse that is not symmetric is not a
+        // covariance.
+        for i in 0..k {
+            for j in 0..k {
+                let a = covariance[i * k + j];
+                let b = covariance[j * k + i];
+                assert!(
+                    (a - b).abs() <= 1e-6 * a.abs().max(b.abs()).max(1e-30),
+                    "covariance is not symmetric at ({i},{j}): {a} vs {b}"
+                );
+            }
+        }
     }
 }
