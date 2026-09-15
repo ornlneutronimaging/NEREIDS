@@ -1615,7 +1615,18 @@ pub fn spatial_map_typed(
         let mut cfg = config
             .clone()
             .with_precomputed_cross_sections(xs)
-            .with_precomputed_base_xs(Arc::new(base_xs))
+            .with_precomputed_base_xs(
+                Arc::new(base_xs),
+                // Built two lines up by `unbroadened_cross_sections` from
+                // this config's own resonance data.
+                nereids_physics::transmission::BaseXsOrigin::ResonanceEquation {
+                    // Temperature is FITTED on this path, so the tier is
+                    // decided at the parameter's upper bound rather than at
+                    // any single trial value.
+                    gate_temperature_k:
+                        nereids_fitting::transmission_model::TEMPERATURE_FIT_UPPER_BOUND_K,
+                },
+            )
             .with_compute_covariance(true);
         if let Some(plan) = resolution_plan.clone() {
             cfg = cfg.with_precomputed_resolution_plan(plan);

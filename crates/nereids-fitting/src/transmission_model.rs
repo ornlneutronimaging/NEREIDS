@@ -731,6 +731,15 @@ impl FitModel for PrecomputedTransmissionModel {
     }
 }
 
+/// Upper bound of the fitted-temperature parameter, and therefore the
+/// temperature the Doppler tier is decided at when temperature is free.
+///
+/// Must match the bound the pipeline puts on `"temperature_k"`; a tier
+/// decided below the temperature the optimiser may actually reach would not
+/// cover every trial value, which is the discontinuity this exists to
+/// prevent.
+pub const TEMPERATURE_FIT_UPPER_BOUND_K: f64 = 5000.0;
+
 /// Forward model for fitting isotopic areal densities from transmission data.
 ///
 /// The model computes T(E) for a set of isotopes with variable areal densities.
@@ -835,6 +844,10 @@ pub struct TransmissionFitModel {
 impl TransmissionFitModel {
     /// Create a validated `TransmissionFitModel`.
     ///
+    /// `external_base_xs` carries its [`transmission::BaseXsOrigin`]: the
+    /// tier-1 integral may stand in for a table that IS the resonance
+    /// equation and must not for any other, and only the producer knows.
+    ///
     /// When `external_base_xs` is `Some`, uses those precomputed unbroadened
     /// cross-sections instead of computing them (expensive Reich-Moore).
     /// `spatial_map` precomputes once for all pixels and passes them here.
@@ -849,7 +862,7 @@ impl TransmissionFitModel {
         instrument: Option<Arc<InstrumentParams>>,
         density_mapping: (Vec<usize>, Vec<f64>),
         temperature_index: Option<usize>,
-        external_base_xs: Option<Arc<Vec<Vec<f64>>>>,
+        external_base_xs: Option<(Arc<Vec<Vec<f64>>>, transmission::BaseXsOrigin)>,
     ) -> Result<Self, FittingError> {
         let (density_indices, density_ratios) = density_mapping;
         if density_indices.len() != resonance_data.len() {
@@ -874,7 +887,7 @@ impl TransmissionFitModel {
             ));
         }
         // Validate external base XS shape before accepting.
-        if let Some(ref xs) = external_base_xs {
+        if let Some((ref xs, _)) = external_base_xs {
             if xs.len() != resonance_data.len() {
                 return Err(FittingError::InvalidConfig(format!(
                     "external_base_xs has {} isotopes but resonance_data has {}",
@@ -892,13 +905,28 @@ impl TransmissionFitModel {
                 }
             }
         }
-        let base_origin = if external_base_xs.is_some() {
-            transmission::BaseXsOrigin::Explicit
+        // The origin travels WITH the table. Inferring it from
+        // `external_base_xs.is_some()` was wrong: `spatial_map_typed`
+        // supplies one it built with `unbroadened_cross_sections`, which IS
+        // the resonance equation, so the guess forced every spatial
+        // temperature fit onto the sampled tier while the uncached path
+        // integrated — the same two-models-one-fit bias, on the per-pixel
+        // maps.
+        // Fixed temperature: the gate and the evaluation coincide. Fitted:
+        // gate at the parameter's upper bound, so the one verdict covers
+        // every trial value the optimiser can reach and the tier cannot
+        // move underneath it.
+        let gate_temperature_k = if temperature_index.is_some() {
+            TEMPERATURE_FIT_UPPER_BOUND_K
         } else {
-            transmission::BaseXsOrigin::ResonanceEquation
+            temperature_k
         };
+        let base_origin = external_base_xs.as_ref().map_or(
+            transmission::BaseXsOrigin::ResonanceEquation { gate_temperature_k },
+            |(_, o)| *o,
+        );
         let base_xs = match external_base_xs {
-            Some(xs) => Some(xs),
+            Some((xs, _)) => Some(xs),
             None if temperature_index.is_some() => Some(Arc::new(
                 transmission::unbroadened_cross_sections(&energies, &resonance_data, None)
                     .map_err(|e| {
@@ -3280,6 +3308,73 @@ mod tests {
     }
 
     // ── TransmissionFitModel ─────────────────────────────────────────────────
+
+    /// The cached and uncached temperature paths must be ONE model.
+    ///
+    /// `evaluate()` uses the precomputed base table when there is one and
+    /// `forward_model` when there is not. If those take different Doppler
+    /// tiers, a temperature fit is fitting one model to another model's
+    /// data and the recovered temperature absorbs the difference — measured
+    /// at 350 K coming back as 253 K on a 0.05 eV grid before this was
+    /// fixed.
+    ///
+    /// The source has to be SLBW/MLBW: a Reich-Moore source takes the
+    /// sampled tier on both paths, so it cannot see the divergence. That is
+    /// why the pre-existing suite missed it — every temperature-fit test in
+    /// the workspace uses Reich-Moore data.
+    #[test]
+    fn cached_and_uncached_temperature_paths_are_one_model_for_mlbw() {
+        use nereids_endf::resonance::ResonanceFormalism;
+        use nereids_endf::resonance::test_support::u238_with_formalism;
+
+        let data = u238_with_formalism(ResonanceFormalism::MLBW);
+        let energies: Vec<f64> = (0..=60).map(|i| 6.4 + f64::from(i) * 0.01).collect();
+        let base = Arc::new(
+            transmission::unbroadened_cross_sections(&energies, std::slice::from_ref(&data), None)
+                .unwrap(),
+        );
+
+        let build = |base: Option<(Arc<Vec<Vec<f64>>>, transmission::BaseXsOrigin)>| {
+            TransmissionFitModel::new(
+                energies.clone(),
+                vec![data.clone()],
+                293.6,
+                None,
+                (vec![0], vec![1.0]),
+                Some(1),
+                base,
+            )
+            .unwrap()
+        };
+
+        let params = [5.0e-4, 293.6];
+        let uncached = build(None).evaluate(&params).unwrap();
+        let cached = build(Some((
+            Arc::clone(&base),
+            transmission::BaseXsOrigin::ResonanceEquation {
+                gate_temperature_k: 293.6,
+            },
+        )))
+        .evaluate(&params)
+        .unwrap();
+        for (a, b) in uncached.iter().zip(&cached) {
+            assert_eq!(a.to_bits(), b.to_bits(), "cached path is a different model");
+        }
+
+        // Non-vacuity: labelling the SAME table `Explicit` must give a
+        // different answer, or this test would pass however the origin were
+        // wired.
+        let explicit = build(Some((base, transmission::BaseXsOrigin::Explicit)))
+            .evaluate(&params)
+            .unwrap();
+        assert!(
+            uncached
+                .iter()
+                .zip(&explicit)
+                .any(|(a, b)| a.to_bits() != b.to_bits()),
+            "the two origins agree here, so this test pins nothing"
+        );
+    }
 
     #[test]
     fn test_recover_single_isotope_thickness() {

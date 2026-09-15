@@ -654,8 +654,13 @@ pub fn forward_model(
         .par_iter()
         .filter(|(_, thickness)| *thickness > 0.0)
         .map(|(res_data, thickness)| {
-            let after_doppler =
-                broaden_isotope_on_grid(work_energies, res_data, sample.temperature_k())?;
+            let after_doppler = broaden_isotope_on_grid(
+                work_energies,
+                res_data,
+                sample.temperature_k(),
+                // Fixed temperature: the gate and the evaluation are the same.
+                sample.temperature_k(),
+            )?;
             Ok((after_doppler, *thickness))
         })
         .collect();
@@ -693,6 +698,22 @@ pub fn forward_model(
 /// broaden" sites in this file go through, so they cannot drift apart on
 /// which tier they take or on how a refusal is reported.
 ///
+/// The gate runs at `gate_temperature_k`, which is NOT always the
+/// temperature being evaluated. The gate's conditions are monotone in T —
+/// `u = √(k_B T/A)` grows with T, so the thermal window widens and is
+/// harder to keep inside the resolved range — which means a verdict taken
+/// at the HIGHEST temperature a caller may ask about is valid for every
+/// lower one. A temperature fit passes its upper bound here and its trial
+/// temperature as `temperature_k`, so the tier cannot change underneath
+/// the optimiser.
+///
+/// That matters: re-gating per trial temperature makes σ discontinuous in
+/// the parameter being fitted. On real Hf-177 over 0.01-20 eV the route
+/// flips at 298.279426 K and σ jumps 2.7% across a 6e-14 K step, while the
+/// analytic ∂σ/∂T reports the smooth within-tier slope on both sides — so
+/// the optimiser steps on a derivative that does not describe where it
+/// lands. A caller with a fixed temperature passes it for both.
+///
 /// [`continuous_doppler::classify_isotope`] decides once, per isotope, for
 /// the whole grid. A tier-1 refusal is NOT a fallback that happens per
 /// energy: the gate returns `SampledTable` with the condition that failed,
@@ -713,6 +734,7 @@ fn broaden_isotope_on_grid(
     work_energies: &[f64],
     rd: &ResonanceData,
     temperature_k: f64,
+    gate_temperature_k: f64,
 ) -> Result<Vec<f64>, TransmissionError> {
     // An empty grid is nothing to broaden, not an error. The sampled tier
     // has always answered `Ok(vec![])` here — `validate_doppler_grid`
@@ -730,7 +752,7 @@ fn broaden_isotope_on_grid(
     if temperature_k <= 0.0 {
         return Ok(unbroadened_totals(rd, work_energies));
     }
-    match continuous_doppler::classify_isotope(rd, work_energies, temperature_k)? {
+    match continuous_doppler::classify_isotope(rd, work_energies, gate_temperature_k)? {
         DopplerRoute::Unbroadened => Ok(unbroadened_totals(rd, work_energies)),
         DopplerRoute::Continuous { .. } => {
             continuous_doppler::broaden(work_energies, rd, temperature_k).map_err(Into::into)
@@ -762,13 +784,25 @@ fn unbroadened_totals(rd: &ResonanceData, energies: &[f64]) -> Vec<f64> {
 /// result differs by 1.8% on a fine grid and by more than 100% on one
 /// coarser than the Doppler width, which a temperature fit absorbs as a
 /// shifted temperature. So the caller states it.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq)]
 pub enum BaseXsOrigin {
     /// The table is the zero-kelvin resonance equation evaluated on the
     /// data grid — what [`unbroadened_cross_sections`] returns. The tier-1
     /// integral may replace it, and for a tier-1 isotope the table is not
     /// read at all: the integral evaluates the equation directly.
-    ResonanceEquation,
+    ResonanceEquation {
+        /// Temperature the tier is decided at: the HIGHEST the caller may
+        /// broaden with, not necessarily the one being broadened at now.
+        ///
+        /// The gate's conditions are monotone in T, so a verdict taken at
+        /// the top of a caller's range holds for every temperature below
+        /// it. A fixed-temperature caller passes that temperature; a
+        /// temperature fit passes its upper bound, which is what stops the
+        /// tier moving underneath the optimiser. It lives here rather than
+        /// beside `temperature_k` because it means nothing for
+        /// [`Self::Explicit`], which never consults the gate.
+        gate_temperature_k: f64,
+    },
     /// The table came from somewhere else. Only the sampled tier can
     /// broaden it, whatever formalism the source carries.
     Explicit,
@@ -782,6 +816,7 @@ fn broaden_isotope_on_grid_with_derivative(
     work_energies: &[f64],
     rd: &ResonanceData,
     temperature_k: f64,
+    gate_temperature_k: f64,
 ) -> Result<(Vec<f64>, Vec<f64>), TransmissionError> {
     if work_energies.is_empty() {
         return Ok((Vec::new(), Vec::new()));
@@ -791,7 +826,7 @@ fn broaden_isotope_on_grid_with_derivative(
         let zeros = vec![0.0; sigma.len()];
         return Ok((sigma, zeros));
     }
-    match continuous_doppler::classify_isotope(rd, work_energies, temperature_k)? {
+    match continuous_doppler::classify_isotope(rd, work_energies, gate_temperature_k)? {
         DopplerRoute::Unbroadened => {
             let sigma = unbroadened_totals(rd, work_energies);
             let zeros = vec![0.0; sigma.len()];
@@ -908,7 +943,7 @@ pub fn broadened_cross_sections_on_working_grid(
                 return Err(TransmissionError::Cancelled);
             }
 
-            broaden_isotope_on_grid(work_energies, rd, temperature_k)
+            broaden_isotope_on_grid(work_energies, rd, temperature_k, temperature_k)
         })
         .collect();
 
@@ -990,7 +1025,8 @@ pub fn broadened_cross_sections_for_transmission(
 
                 // 1-2. Zero-kelvin cross-section and Doppler broadening on
                 //      the extended grid, at whichever tier the gate chose.
-                let after_doppler = broaden_isotope_on_grid(ext_energies, rd, temperature_k)?;
+                let after_doppler =
+                    broaden_isotope_on_grid(ext_energies, rd, temperature_k, temperature_k)?;
 
                 // 3. Convert to transmission: T = exp(-nd × σ_D).
                 let transmission: Vec<f64> = after_doppler
@@ -1016,7 +1052,8 @@ pub fn broadened_cross_sections_for_transmission(
             } else {
                 // No extended grid (e.g. tabulated resolution with no aux grid):
                 // Doppler on data grid, Beer-Lambert, resolution on data grid.
-                let after_doppler = broaden_isotope_on_grid(energies, rd, temperature_k)?;
+                let after_doppler =
+                    broaden_isotope_on_grid(energies, rd, temperature_k, temperature_k)?;
 
                 let transmission: Vec<f64> = after_doppler
                     .iter()
@@ -1163,8 +1200,8 @@ pub fn broadened_cross_sections_from_base_on_working_grid(
                 // The table IS the resonance equation, so the gate decides
                 // and a tier-1 isotope is integrated rather than resampled.
                 // `xs_work` is then not read at all.
-                BaseXsOrigin::ResonanceEquation => {
-                    broaden_isotope_on_grid(work_energies, rd, temperature_k)
+                BaseXsOrigin::ResonanceEquation { gate_temperature_k } => {
+                    broaden_isotope_on_grid(work_energies, rd, temperature_k, gate_temperature_k)
                 }
                 BaseXsOrigin::Explicit => {
                     if temperature_k > 0.0 {
@@ -1265,8 +1302,13 @@ pub fn broadened_cross_sections_with_analytical_derivative_from_base_on_working_
                 xs_raw.clone()
             };
             match base_origin {
-                BaseXsOrigin::ResonanceEquation => {
-                    broaden_isotope_on_grid_with_derivative(work_energies, rd, temperature_k)
+                BaseXsOrigin::ResonanceEquation { gate_temperature_k } => {
+                    broaden_isotope_on_grid_with_derivative(
+                        work_energies,
+                        rd,
+                        temperature_k,
+                        gate_temperature_k,
+                    )
                 }
                 BaseXsOrigin::Explicit => {
                     if temperature_k > 0.0 {
@@ -1389,8 +1431,8 @@ pub fn forward_model_from_base_xs(
                 xs_raw.clone()
             };
             match base_origin {
-                BaseXsOrigin::ResonanceEquation => {
-                    broaden_isotope_on_grid(work_energies, rd, temperature_k)
+                BaseXsOrigin::ResonanceEquation { gate_temperature_k } => {
+                    broaden_isotope_on_grid(work_energies, rd, temperature_k, gate_temperature_k)
                 }
                 BaseXsOrigin::Explicit => {
                     if temperature_k > 0.0 {
@@ -1514,7 +1556,7 @@ mod tests {
             DopplerRoute::Continuous { .. }
         ));
 
-        let ours = broaden_isotope_on_grid(&energies, &data, temperature_k).unwrap();
+        let ours = broaden_isotope_on_grid(&energies, &data, temperature_k, temperature_k).unwrap();
         let integral = crate::continuous_doppler::broaden(&energies, &data, temperature_k).unwrap();
         for (a, b) in ours.iter().zip(&integral) {
             assert_eq!(a.to_bits(), b.to_bits());
@@ -1552,7 +1594,7 @@ mod tests {
         let expected =
             doppler::doppler_broaden(&energies, &unbroadened_totals(&data, &energies), &params)
                 .unwrap();
-        let ours = broaden_isotope_on_grid(&energies, &data, temperature_k).unwrap();
+        let ours = broaden_isotope_on_grid(&energies, &data, temperature_k, temperature_k).unwrap();
         for (a, b) in ours.iter().zip(&expected) {
             assert_eq!(a.to_bits(), b.to_bits());
         }
@@ -1568,7 +1610,7 @@ mod tests {
         let data = u238_with_formalism(ResonanceFormalism::MLBW);
         for temperature_k in [0.0, 293.6] {
             assert_eq!(
-                broaden_isotope_on_grid(&[], &data, temperature_k).unwrap(),
+                broaden_isotope_on_grid(&[], &data, temperature_k, temperature_k).unwrap(),
                 Vec::<f64>::new()
             );
         }
@@ -1592,8 +1634,71 @@ mod tests {
     fn zero_temperature_still_skips_broadening_and_grid_validation() {
         let data = u238_with_formalism(ResonanceFormalism::MLBW);
         let descending = [7.0, 6.674, 6.5];
-        let ours = broaden_isotope_on_grid(&descending, &data, 0.0).unwrap();
+        let ours = broaden_isotope_on_grid(&descending, &data, 0.0, 0.0).unwrap();
         assert_eq!(ours, unbroadened_totals(&data, &descending));
+    }
+
+    /// Gating at a FIXED temperature removes the step that gating per
+    /// evaluation puts in σ(T) at the tier flip point.
+    ///
+    /// Real Hf-177 over 0.01-20 eV flips at 298.279426 K: below it the
+    /// thermal window's lower edge sits inside the resolved range's 1e-5 eV
+    /// bound, above it the window has widened past it. The test compares
+    /// the SAME two temperatures under both gating modes, so it calibrates
+    /// itself: whatever σ change 2 K of real broadening produces appears in
+    /// both, and only the tier step distinguishes them.
+    #[test]
+    fn a_fixed_gate_temperature_removes_the_step_at_the_flip_point() {
+        let path = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+            .parent()
+            .unwrap()
+            .parent()
+            .unwrap()
+            .join("tests/data/endf/Hf-177.endf");
+        let text = std::fs::read_to_string(&path).unwrap();
+        let data = nereids_endf::parser::parse_endf_file2(&text).unwrap();
+        let energies: Vec<f64> = (0..1000)
+            .map(|i| 0.01 + f64::from(i) * (20.0 - 0.01) / 999.0)
+            .collect();
+
+        const FLIP_K: f64 = 298.279_426;
+        let (lo, hi) = (FLIP_K - 1.0, FLIP_K + 1.0);
+
+        // The flip is real on this fixture, or there would be nothing to fix.
+        let route_at = |t: f64| crate::continuous_doppler::classify_isotope(&data, &energies, t);
+        assert!(matches!(
+            route_at(lo).unwrap(),
+            DopplerRoute::Continuous { .. }
+        ));
+        assert!(matches!(
+            route_at(hi).unwrap(),
+            DopplerRoute::SampledTable { .. }
+        ));
+
+        let step = |gate_lo: f64, gate_hi: f64| {
+            let a = broaden_isotope_on_grid(&energies, &data, lo, gate_lo).unwrap();
+            let b = broaden_isotope_on_grid(&energies, &data, hi, gate_hi).unwrap();
+            a.iter()
+                .zip(&b)
+                .map(|(x, y)| (x - y).abs() / x.abs().max(1e-30))
+                .fold(0.0_f64, f64::max)
+        };
+
+        // Gating per evaluation: the isotope changes tier between the two
+        // calls, so the step contains 2 K of broadening AND a tier change.
+        let per_evaluation = step(lo, hi);
+        // Gating once, above both: one tier throughout, so the step is 2 K
+        // of broadening alone.
+        let fixed = step(400.0, 400.0);
+
+        assert!(
+            per_evaluation > 1.0e-2,
+            "the fixture must actually step under per-evaluation gating, got {per_evaluation:.3e}"
+        );
+        assert!(
+            fixed * 5.0 < per_evaluation,
+            "fixed gating still steps {fixed:.3e} against {per_evaluation:.3e} per-evaluation"
+        );
     }
 
     /// The two families agree for an MLBW source when the base table IS the
@@ -1613,13 +1718,16 @@ mod tests {
         let energies: Vec<f64> = (0..=60).map(|i| 6.4 + f64::from(i) * 0.01).collect();
         let base = vec![unbroadened_totals(&data, &energies)];
 
-        let fresh = broaden_isotope_on_grid(&energies, &data, temperature_k).unwrap();
+        let fresh =
+            broaden_isotope_on_grid(&energies, &data, temperature_k, temperature_k).unwrap();
         let cached = broadened_cross_sections_from_base_on_working_grid(
             &energies,
             &base,
             std::slice::from_ref(&data),
             temperature_k,
-            BaseXsOrigin::ResonanceEquation,
+            BaseXsOrigin::ResonanceEquation {
+                gate_temperature_k: temperature_k,
+            },
             None,
         )
         .unwrap();
@@ -1630,14 +1738,17 @@ mod tests {
         // The derivative path has to agree too, or the Jacobian describes a
         // different model than the residual.
         let (_, dxs) =
-            broaden_isotope_on_grid_with_derivative(&energies, &data, temperature_k).unwrap();
+            broaden_isotope_on_grid_with_derivative(&energies, &data, temperature_k, temperature_k)
+                .unwrap();
         let cached_d =
             broadened_cross_sections_with_analytical_derivative_from_base_on_working_grid(
                 &energies,
                 &base,
                 std::slice::from_ref(&data),
                 temperature_k,
-                BaseXsOrigin::ResonanceEquation,
+                BaseXsOrigin::ResonanceEquation {
+                    gate_temperature_k: temperature_k,
+                },
                 None,
             )
             .unwrap();
@@ -1678,7 +1789,9 @@ mod tests {
             &base,
             std::slice::from_ref(&data),
             temperature_k,
-            BaseXsOrigin::ResonanceEquation,
+            BaseXsOrigin::ResonanceEquation {
+                gate_temperature_k: temperature_k,
+            },
             None,
         )
         .unwrap();
@@ -1921,7 +2034,9 @@ mod tests {
             &base_xs,
             std::slice::from_ref(&data),
             temperature,
-            BaseXsOrigin::ResonanceEquation,
+            BaseXsOrigin::ResonanceEquation {
+                gate_temperature_k: temperature,
+            },
             None,
         )
         .unwrap();
@@ -1993,7 +2108,9 @@ mod tests {
             &base_xs,
             std::slice::from_ref(&data),
             0.05,
-            BaseXsOrigin::ResonanceEquation,
+            BaseXsOrigin::ResonanceEquation {
+                gate_temperature_k: 0.05,
+            },
             None,
         )
         .unwrap();
@@ -2012,7 +2129,9 @@ mod tests {
             &base_xs,
             std::slice::from_ref(&data),
             0.0,
-            BaseXsOrigin::ResonanceEquation,
+            BaseXsOrigin::ResonanceEquation {
+                gate_temperature_k: 0.0,
+            },
             None,
         )
         .unwrap();
@@ -2085,7 +2204,9 @@ mod tests {
             std::slice::from_ref(&data),
             &[thickness],
             temperature,
-            BaseXsOrigin::ResonanceEquation,
+            BaseXsOrigin::ResonanceEquation {
+                gate_temperature_k: temperature,
+            },
             None,
         )
         .unwrap();
@@ -2123,7 +2244,9 @@ mod tests {
             &base_xs,
             std::slice::from_ref(&data),
             temperature,
-            BaseXsOrigin::ResonanceEquation,
+            BaseXsOrigin::ResonanceEquation {
+                gate_temperature_k: temperature,
+            },
             None,
         )
         .unwrap();
@@ -2154,7 +2277,9 @@ mod tests {
             &base_xs,
             std::slice::from_ref(&data),
             temperature,
-            BaseXsOrigin::ResonanceEquation,
+            BaseXsOrigin::ResonanceEquation {
+                gate_temperature_k: temperature,
+            },
             None,
         )
         .unwrap();
@@ -2383,7 +2508,9 @@ mod tests {
             &base_xs,
             std::slice::from_ref(&data),
             temperature,
-            BaseXsOrigin::ResonanceEquation,
+            BaseXsOrigin::ResonanceEquation {
+                gate_temperature_k: temperature,
+            },
             Some(&inst),
         )
         .unwrap();
@@ -2394,7 +2521,9 @@ mod tests {
             &base_xs,
             std::slice::from_ref(&data),
             temperature,
-            BaseXsOrigin::ResonanceEquation,
+            BaseXsOrigin::ResonanceEquation {
+                gate_temperature_k: temperature,
+            },
             None,
         )
         .unwrap();
@@ -2449,7 +2578,9 @@ mod tests {
             std::slice::from_ref(&data),
             &[thickness],
             temperature,
-            BaseXsOrigin::ResonanceEquation,
+            BaseXsOrigin::ResonanceEquation {
+                gate_temperature_k: temperature,
+            },
             Some(&inst),
         )
         .unwrap();
@@ -2479,7 +2610,9 @@ mod tests {
             std::slice::from_ref(&data),
             &[thickness],
             temperature,
-            BaseXsOrigin::ResonanceEquation,
+            BaseXsOrigin::ResonanceEquation {
+                gate_temperature_k: temperature,
+            },
             None,
         )
         .unwrap();
@@ -2512,7 +2645,9 @@ mod tests {
             std::slice::from_ref(&data),
             &[thickness],
             temperature,
-            BaseXsOrigin::ResonanceEquation,
+            BaseXsOrigin::ResonanceEquation {
+                gate_temperature_k: temperature,
+            },
             None,
         )
         .unwrap();
@@ -2552,7 +2687,9 @@ mod tests {
             &base_xs,
             std::slice::from_ref(&data),
             temperature,
-            BaseXsOrigin::ResonanceEquation,
+            BaseXsOrigin::ResonanceEquation {
+                gate_temperature_k: temperature,
+            },
             Some(&inst),
         )
         .unwrap();
@@ -2563,7 +2700,9 @@ mod tests {
             &base_xs,
             std::slice::from_ref(&data),
             temperature,
-            BaseXsOrigin::ResonanceEquation,
+            BaseXsOrigin::ResonanceEquation {
+                gate_temperature_k: temperature,
+            },
             None,
         )
         .unwrap();
@@ -2620,7 +2759,9 @@ mod tests {
             &base_xs,
             std::slice::from_ref(&data),
             temperature,
-            BaseXsOrigin::ResonanceEquation,
+            BaseXsOrigin::ResonanceEquation {
+                gate_temperature_k: temperature,
+            },
             None,
         )
         .unwrap();
@@ -2717,7 +2858,9 @@ mod tests {
             &[vec![10.0; n_e], vec![10.0; n_e]],
             &rd,
             300.0,
-            BaseXsOrigin::ResonanceEquation,
+            BaseXsOrigin::ResonanceEquation {
+                gate_temperature_k: 300.0,
+            },
             None,
         )
         .unwrap_err();
@@ -2728,7 +2871,9 @@ mod tests {
             &[vec![10.0; n_e - 1]],
             &rd,
             300.0,
-            BaseXsOrigin::ResonanceEquation,
+            BaseXsOrigin::ResonanceEquation {
+                gate_temperature_k: 300.0,
+            },
             None,
         )
         .unwrap_err();
@@ -2746,7 +2891,9 @@ mod tests {
             &good_base,
             &rd,
             300.0,
-            BaseXsOrigin::ResonanceEquation,
+            BaseXsOrigin::ResonanceEquation {
+                gate_temperature_k: 300.0,
+            },
             Some(&inst),
         )
         .unwrap_err();

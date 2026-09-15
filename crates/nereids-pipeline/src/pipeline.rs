@@ -444,7 +444,10 @@ pub struct UnifiedFitConfig {
     /// working-grid copy consumed only by `build_transmission_model`'s
     /// precomputed branch.
     precomputed_work_cross_sections: Option<PrecomputedWorkXs>,
-    precomputed_base_xs: Option<Arc<Vec<Vec<f64>>>>,
+    precomputed_base_xs: Option<(
+        Arc<Vec<Vec<f64>>>,
+        nereids_physics::transmission::BaseXsOrigin,
+    )>,
     /// Resolution broadening plan built once for `(energies, resolution)`.
     ///
     /// Populated by [`spatial_map_typed`] when the data grid is shared
@@ -823,8 +826,12 @@ impl UnifiedFitConfig {
     }
 
     #[must_use]
-    pub fn with_precomputed_base_xs(mut self, xs: Arc<Vec<Vec<f64>>>) -> Self {
-        self.precomputed_base_xs = Some(xs);
+    pub fn with_precomputed_base_xs(
+        mut self,
+        xs: Arc<Vec<Vec<f64>>>,
+        origin: nereids_physics::transmission::BaseXsOrigin,
+    ) -> Self {
+        self.precomputed_base_xs = Some((xs, origin));
         // Base XS swap implies σ will be re-Doppler-broadened, so
         // the cubature's σ stack becomes stale.  Invalidate for
         // the same reason as `with_precomputed_cross_sections`.
