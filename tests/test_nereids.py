@@ -5852,3 +5852,94 @@ class TestRunLogAndBankSpectrum:
                     path, "monitor1", n_bins=2, tof_min_us=0.0,
                     tof_max_us=1000.0, keep_intervals=[bad],
                 )
+
+
+class TestResolutionWidthConvention:
+    """The width convention at the Python surface.
+
+    ``delta_t_us`` / ``delta_l_m`` are W-parameters (the width in
+    ``exp(-x^2/W^2)``), not standard deviations. The docstrings said 1-sigma
+    for a long time, which invited a kernel sqrt(2) too narrow; a too-narrow
+    resolution is absorbed into a fitted temperature that is too high. These
+    tests pin the convention at the boundary where a user supplies the number.
+    """
+
+    # Grid half-span in units of the nominal width; beyond 6 the remaining
+    # Gaussian mass is below 1e-16, so 12 is generous.
+    SPAN_IN_WIDTHS = 12
+    # Grid points per nominal width. The trapezoidal second-moment error and
+    # the one-bin impulse's own variance (step^2/12) both scale as (step/W)^2;
+    # at 50 they are ~1e-4 of the measured sigma, two orders below the
+    # tolerances asserted below, while convolution cost scales as the square of
+    # the point count.
+    SAMPLES_PER_WIDTH = 50
+
+    @classmethod
+    def _measured_sigma_ev(cls, flight_path_m, delta_t_us, delta_l_m, center_ev, nominal_width_ev):
+        """Read the kernel's standard deviation off the broadened impulse.
+
+        ``nominal_width_ev`` only sizes the grid; the measurement never uses
+        it, so the result cannot agree with the library by construction.
+        """
+        n = 2 * cls.SPAN_IN_WIDTHS * cls.SAMPLES_PER_WIDTH + 1
+        half_span_ev = cls.SPAN_IN_WIDTHS * nominal_width_ev
+        energies = np.linspace(center_ev - half_span_ev, center_ev + half_span_ev, n)
+        step = float(energies[1] - energies[0])
+        impulse = np.zeros(n)
+        impulse[(n - 1) // 2] = 1.0 / step
+
+        kernel = nereids.resolution_broaden(
+            energies, impulse, flight_path_m, delta_t_us, delta_l_m
+        )
+        mass = float(kernel.sum() * step)
+        assert abs(mass - 1.0) < 1e-3, f"kernel not normalised on this span: {mass}"
+        mean = float((kernel * energies).sum() * step / mass)
+        var = float((kernel * (energies - mean) ** 2).sum() * step / mass)
+        return math.sqrt(var)
+
+    def test_width_from_sigma_produces_the_requested_standard_deviation(self):
+        """A measured 1-sigma, converted, gives a kernel with that sigma."""
+        flight_path_m = 25.0
+        sigma_t_us = 1.0
+        w_t_us = nereids.width_from_sigma(sigma_t_us)
+        assert w_t_us == pytest.approx(sigma_t_us * math.sqrt(2.0), rel=1e-15)
+
+        center = 10.0
+        # sigma_E = 2 * sigma_t * E^(3/2) / (TOF_FACTOR * L), ordinary propagation
+        # through E = (1/2) m (L/t)^2.
+        tof_factor = 72.2982543982928
+        expected = 2.0 * sigma_t_us * center**1.5 / (tof_factor * flight_path_m)
+
+        measured = self._measured_sigma_ev(flight_path_m, w_t_us, 0.0, center, expected)
+        assert measured == pytest.approx(expected, rel=3e-3), (
+            f"converted width gives sigma {measured!r}, asked for {expected!r}"
+        )
+
+    def test_passing_sigma_unconverted_is_narrower_by_root_two(self):
+        """The error the old docstring invited, measured rather than asserted."""
+        flight_path_m = 25.0
+        sigma_t_us = 1.0
+        center = 10.0
+        tof_factor = 72.2982543982928
+        # Both grids are sized from the same nominal width, so the two
+        # measurements are made on identical abscissae and the ratio below is
+        # a property of the kernels, not of the sampling.
+        nominal = 2.0 * sigma_t_us * center**1.5 / (tof_factor * flight_path_m)
+
+        converted = self._measured_sigma_ev(
+            flight_path_m, nereids.width_from_sigma(sigma_t_us), 0.0, center, nominal
+        )
+        unconverted = self._measured_sigma_ev(
+            flight_path_m, sigma_t_us, 0.0, center, nominal
+        )
+        assert converted / unconverted == pytest.approx(math.sqrt(2.0), rel=5e-3), (
+            "unconverted 1-sigma input is not exactly sqrt(2) too narrow: "
+            f"{converted!r} vs {unconverted!r}"
+        )
+
+    def test_width_from_fwhm_matches_the_sammy_deltag_conversion(self):
+        """SAMMY's Deltag is a FWHM; the same divisor must apply here."""
+        delta_g = 0.022  # tr007's BROADENING card timing value
+        assert nereids.width_from_fwhm(delta_g) == pytest.approx(
+            delta_g / (2.0 * math.sqrt(math.log(2.0))), rel=1e-15
+        )

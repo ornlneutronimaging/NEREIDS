@@ -22,6 +22,15 @@ use std::sync::{Arc, mpsc};
 /// Values are manually premultiplied: RGBA(180, 80, 80, 50) → (35, 15, 15, 50).
 pub const RESONANCE_DIP_COLOR: Color32 = Color32::from_rgba_premultiplied(35, 15, 15, 50);
 
+/// Hover text for the Gaussian Δt / ΔL fields.
+///
+/// These are the only place a user types a resolution width into the
+/// application, so they are where the convention has to be stated: a 1σ
+/// metrology number entered here unconverted gives a kernel √2 too narrow.
+const WIDTH_CONVENTION_HINT: &str = "W-parameter, the width in exp(-x²/W²) — not a standard \
+     deviation. σ = W/√2 and FWHM = 1.6651·W. This is SAMMY's convention, shared with the Doppler \
+     width. Multiply a measured 1σ value by √2 before entering it here.";
+
 // ── Content Header ──────────────────────────────────────────────
 
 /// Page-level title (22px bold) + subtitle (13px fg2).
@@ -640,13 +649,15 @@ pub fn resolution_card(
                         egui::DragValue::new(delta_t_us)
                             .speed(0.1)
                             .range(0.0..=100.0),
-                    );
+                    )
+                    .on_hover_text(WIDTH_CONVENTION_HINT);
                     ui.label("\u{0394}L (m):");
                     ui.add(
                         egui::DragValue::new(delta_l_m)
                             .speed(0.001)
                             .range(0.0..=1.0),
-                    );
+                    )
+                    .on_hover_text(WIDTH_CONVENTION_HINT);
                 });
                 if *delta_t_us != prev_dt || *delta_l_m != prev_dl {
                     changed = true;
