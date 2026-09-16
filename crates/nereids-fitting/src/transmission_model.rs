@@ -2039,13 +2039,13 @@ impl EnergyScaleTransmissionModel {
         t0_us: f64,
         l_scale: f64,
         working_energies: &[f64],
+        resolution: &nereids_physics::resolution::ResolutionFunction,
     ) -> Option<Arc<ResolutionPlan>> {
-        let inst = self.instrument.as_ref()?;
-        // Match on a reference to `inst.resolution` defensively so the
-        // check never attempts to move a non-`Copy` `ResolutionFunction`
-        // out of a shared `Arc<InstrumentParams>`.
+        // The plan is built from the flight-path-corrected kernel the caller
+        // passes, not from `self.instrument`: the cache key already carries
+        // `l_scale`, and the plan it stores has to be the one that matches it.
         if !matches!(
-            &inst.resolution,
+            resolution,
             nereids_physics::resolution::ResolutionFunction::Tabulated(_)
         ) {
             // Only Tabulated opts into plan caching. Gaussian genuinely has no
@@ -2059,7 +2059,7 @@ impl EnergyScaleTransmissionModel {
             return Some(plan);
         }
         // Miss: build, insert, return.
-        let plan = resolution::build_resolution_plan(working_energies, &inst.resolution)
+        let plan = resolution::build_resolution_plan(working_energies, resolution)
             .ok()
             .flatten()?;
         let arc = Arc::new(plan);
@@ -2103,6 +2103,32 @@ impl EnergyScaleTransmissionModel {
             )));
         }
         Ok(())
+    }
+
+    /// The Jacobian method that will actually be used for the `t0` and
+    /// `L_scale` columns.
+    ///
+    /// The rank-1 identity `J[:, L_scale] = ((tof - t0)/L_scale)·J[:, t0]`
+    /// holds only when `L_scale` reaches the prediction through the corrected
+    /// energy grid and nowhere else. With a resolution kernel it reaches it
+    /// twice: the kernel is read against `L·L_scale`, so its width moves with
+    /// the same parameter. That second route is absent from the identity, so
+    /// deriving the column understates it.
+    ///
+    /// The distinction is physical rather than a special case — it is whether
+    /// an instrument response exists at all. Without one the identity is exact
+    /// to f64 roundoff (`partial_gal_no_resolution_matches_fd2`).
+    ///
+    /// The identity was adopted for speed (1.28× on resolved energy-scale
+    /// fits) at a time when the kernel ignored `L_scale` entirely — an
+    /// optimization that held only because of the defect it sat on.
+    #[must_use]
+    pub fn effective_jacobian_method(&self) -> EnergyScaleJacobianMethod {
+        if self.instrument.is_some() {
+            EnergyScaleJacobianMethod::FiniteDifference
+        } else {
+            self.jacobian_method
+        }
     }
 
     fn corrected_energies(&self, t0_us: f64, l_scale: f64) -> Vec<f64> {
@@ -2271,10 +2297,25 @@ impl EnergyScaleTransmissionModel {
         // `e_corr`, so the `(t0, L_scale)`-keyed plan (built on `e_corr`) still
         // matches; for Gaussian the plan is `None` and broadening runs on the
         // auxiliary grid via `apply_resolution`.
+        // The kernel is read against the SAME flight path the corrected energy
+        // grid was built with. `corrected_energies` uses `L·L_scale`; a kernel
+        // still holding the nominal `L` converts energy to detector time
+        // through a different map, and applies a width wrong by exactly that
+        // factor — on every family, since all three convert through `L`.
+        // Rebinding resynthesizes nothing: the flight path is not part of what
+        // a kernel is, only of the map it is applied through.
+        let l_scale = params[self.l_scale_index];
+        let corrected_resolution = inst
+            .resolution
+            .with_flight_path(self.flight_path_m * l_scale)
+            .map_err(|e| {
+                FittingError::EvaluationFailed(format!(
+                    "resolution at the fitted energy scale: {e}"
+                ))
+            })?;
         let plan = if use_plan_cache {
             let t0 = params[self.t0_index];
-            let l_scale = params[self.l_scale_index];
-            self.cached_resolution_plan(t0, l_scale, work_e)
+            self.cached_resolution_plan(t0, l_scale, work_e, &corrected_resolution)
         } else {
             None
         };
@@ -2282,7 +2323,7 @@ impl EnergyScaleTransmissionModel {
             plan.as_deref(),
             work_e,
             &t_unbroadened,
-            &inst.resolution,
+            &corrected_resolution,
         )
         .map_err(|e| FittingError::EvaluationFailed(format!("resolution broadening: {e}")))?;
         Ok(work.layout.extract(&t_broadened))
@@ -2323,7 +2364,7 @@ impl FitModel for EnergyScaleTransmissionModel {
         let t0 = params[self.t0_index];
         let l_scale = params[self.l_scale_index];
         let e_corr = self.corrected_energies(t0, l_scale);
-        let energy_scale_method = self.jacobian_method;
+        let energy_scale_method = self.effective_jacobian_method();
         let t0_free_pos = free_param_indices
             .iter()
             .position(|&idx| idx == self.t0_index);
@@ -2441,7 +2482,18 @@ impl FitModel for EnergyScaleTransmissionModel {
         // The non-tabulated / build-failure branches still return
         // `None` → `apply_resolution_with_plan(None, …)` forwards
         // byte-identically to `apply_resolution`.
-        let density_plan = self.cached_resolution_plan(t0, l_scale, work_e);
+        // Same rebinding as `evaluate_at_with_cache`: the density columns are
+        // broadened at this `(t0, L_scale)` probe, so the kernel is read
+        // against `L·L_scale` too.
+        let density_plan = self
+            .instrument
+            .as_ref()
+            .and_then(|inst| {
+                inst.resolution
+                    .with_flight_path(self.flight_path_m * l_scale)
+                    .ok()
+            })
+            .and_then(|corrected| self.cached_resolution_plan(t0, l_scale, work_e, &corrected));
 
         // Role indices (t0/L_scale/temperature/densities) are assumed
         // DISTINCT — first-match layout; aliasing is not supported in
@@ -6780,159 +6832,88 @@ mod tests {
             "a physical l_scale must produce a Jacobian"
         );
     }
-
-    /// In-tree regression for the partial-GAL rank-1 approximation in
-    /// the presence of a non-trivial resolution kernel.  Issue #499.
+    /// With a resolution kernel present, the energy-scale columns are
+    /// measured, not derived.
     ///
-    /// **Motivation.**  The empirical bound supporting the post-#489
-    /// default flip to `PartialGal` was measured on real VENUS Hf
-    /// 120-min KL+per-iso+TZERO 4×4 data: 15 of 16 fitted pixels landed
-    /// within 0.1·σ_Fisher of the FD2 reference for the L_scale
-    /// column.  That measurement was made against the production
-    /// USR/FTS tabulated resolution kernel, which ORNL release policy
-    /// keeps out of the repository — so it cannot ship as an in-tree
-    /// fixture.  Without an in-tree analogue, a future refactor could
-    /// silently regress the rank-1 bound on real workloads.
+    /// The rank-1 identity behind partial-GAL assumes `L_scale` reaches the
+    /// prediction only through the corrected energy grid. Once the kernel is
+    /// read against `L·L_scale` that is false, and the derived column was
+    /// measured at 1.3e-4 relative L₂ against finite difference — about nine
+    /// times worse than before the kernel tracked the energy scale. The
+    /// covariance is built from this same Jacobian, so the error reaches the
+    /// reported uncertainties, not just the step direction.
     ///
-    /// **Synthetic stand-in.**  This test exercises the same code path
-    /// with a sharp Gaussian "resonance" cross-section convolved by a
-    /// Gaussian resolution kernel — a deliberately rough stand-in for
-    /// the SAMMY-format tabulated VENUS USR/FTS kernel.  The Gaussian
-    /// kernel is *not* a fidelity replacement; it is the simplest
-    /// non-trivial resolution operator that activates the partial-GAL
-    /// resolution-bearing branch without introducing a binary fixture.
-    ///
-    /// **Tolerance.**  Density and t0 columns retain the same tight
-    /// bound as the no-resolution test (the resolution operator does
-    /// not couple into those columns differently).  The L_scale column
-    /// is checked via relative L₂ norm against the FD2 reference with
-    /// tolerance `PARTIAL_GAL_REL_L2_TOLERANCE = 1.5e-5`.  On the U-238
-    /// resonance grid below (kernel sized so it spans several bins and
-    /// meaningfully broadens the resonance) the measured relative L₂ is
-    /// `~4.3e-6` — the tolerance gives roughly 3× headroom over the current
-    /// measurement, tight enough to catch a non-trivial regression
-    /// of the rank-1 simplification while loose enough to absorb
-    /// FD-truncation noise.  An upstream pre-check (see below)
-    /// asserts the kernel itself is non-trivial so a future tweak
-    /// to grid spacing or kernel parameters cannot silently degrade
-    /// this back into a vacuous "no-resolution-in-disguise" test
-    /// (a regression that has occurred before).  The
-    /// measured relative L₂ surfaces in the assert message if the
-    /// bound is ever exceeded so future tightening is straightforward.
+    /// The request is therefore overridden rather than honoured. This test
+    /// pins that: asking for partial-GAL with a kernel present yields exactly
+    /// the finite-difference Jacobian.
     #[test]
-    fn partial_gal_with_resolution_matches_fd2() {
+    fn resolution_forces_finite_difference_energy_scale_columns() {
         use nereids_physics::resolution::{ResolutionFunction, ResolutionParams};
 
-        // Tolerance for relative L₂ error on the L_scale column.
-        // Measured rel L₂ on this synthetic grid is ~9.3e-4; 3e-3
-        // gives ~3× headroom — tight enough to catch a non-trivial
-        // regression of the rank-1 simplification under resolution,
-        // loose enough to absorb FD truncation noise.  See rustdoc
-        // above for why this bound is conservative rather than the
-        // tighter empirical 0.1·σ_Fisher seen on real workloads.
-        const PARTIAL_GAL_REL_L2_TOLERANCE: f64 = 1.5e-5;
-
-        // Dense grid over the sharp U-238 resonance (~6.67 eV) so the σ feature
-        // is well resolved and the resolution kernel meaningfully broadens it.
         let energies: Vec<f64> = (0..101).map(|i| 4.0 + (i as f64) * 0.06).collect();
-
-        // Gaussian resolution kernel sized to be NON-TRIVIAL on this grid (it
-        // broadens the U-238 resonance by ~1%, verified by the pre-check below).
-        // A kernel-too-narrow vacuous-test regression has occurred before;
-        // the pre-check guards against re-introducing it.
         let instrument = Some(Arc::new(InstrumentParams {
             resolution: ResolutionFunction::Gaussian(
-                ResolutionParams::new(25.0, 0.5, 0.005, 0.0).unwrap(),
+                ResolutionParams::new(25.0, 0.5, 0.0, 0.0).expect("valid params"),
             ),
         }));
-
-        // Pin FD2 first so the comparison is independent of the
-        // process-global `NEREIDS_TZERO_JACOBIAN` env var, matching
-        // the pattern used by `partial_gal_no_resolution_matches_fd2`.
-        let mut model = make_energy_scale_u238(energies.clone(), instrument)
-            .with_jacobian_method(EnergyScaleJacobianMethod::FiniteDifference);
-
         let params = [0.001, 0.05, 1.002]; // density, t0, l_scale
         let free = vec![0, 1, 2];
 
-        // Pre-check: confirm the resolution kernel actually broadens the
-        // spectrum on this grid, so the comparison is not a vacuous
-        // no-resolution-in-disguise test.
-        let model_no_resolution = make_energy_scale_u238(energies.clone(), None)
-            .with_jacobian_method(EnergyScaleJacobianMethod::FiniteDifference);
-        let t_no_res = model_no_resolution.evaluate(&params).unwrap();
-        let t_with_res = model.evaluate(&params).unwrap();
-        let diff_inf = t_no_res
+        // Non-vacuity: the kernel must actually broaden on this grid, or the
+        // test degrades into a no-resolution case in disguise.
+        let no_res = make_energy_scale_u238(energies.clone(), None);
+        let with_res = make_energy_scale_u238(energies.clone(), instrument.clone());
+        let t_none = no_res.evaluate(&params).unwrap();
+        let t_kernel = with_res.evaluate(&params).unwrap();
+        let diff_inf = t_none
             .iter()
-            .zip(t_with_res.iter())
+            .zip(&t_kernel)
             .map(|(a, b)| (a - b).abs())
             .fold(0.0_f64, f64::max);
-        let t_inf = t_no_res.iter().map(|x| x.abs()).fold(0.0_f64, f64::max);
+        let t_inf = t_none.iter().map(|x| x.abs()).fold(0.0_f64, f64::max);
         assert!(
             diff_inf > 1e-3 * t_inf,
             "resolution kernel must broaden the spectrum nontrivially \
-             (got ||T_kernel - T_none||_∞ = {diff_inf:.3e}, ||T_none||_∞ = {t_inf:.3e}, \
-             ratio = {ratio:.3e}); widen the kernel or sharpen the resonance",
-            ratio = diff_inf / t_inf.max(1e-30),
+             (||T_kernel - T_none||_inf = {diff_inf:.3e} vs ||T_none||_inf = {t_inf:.3e})"
         );
 
-        // FD2 reference Jacobian (explicitly pinned above).
-        let jac_fd2 = model
-            .analytical_jacobian(&params, &free, &model.evaluate(&params).unwrap())
-            .expect("FD2 Jacobian should be available with resolution kernel");
-
-        // Flip to partial-GAL.
-        model = model.with_jacobian_method(EnergyScaleJacobianMethod::PartialGal);
-        let jac_pg = model
-            .analytical_jacobian(&params, &free, &model.evaluate(&params).unwrap())
-            .expect("partial-GAL Jacobian should be available with resolution kernel");
-
-        // Density column: tight bound — resolution doesn't change the
-        // density derivative path.
-        for i in 0..energies.len() {
-            let fd2 = jac_fd2.get(i, 0);
-            let pg = jac_pg.get(i, 0);
-            let abs_err = (fd2 - pg).abs();
-            let rel_err = abs_err / fd2.abs().max(1e-15);
-            assert!(
-                rel_err < 1e-3 || abs_err < 1e-8,
-                "density bin {i}: fd2={fd2:.6e} pg={pg:.6e} rel={rel_err:.2e}"
-            );
-        }
-
-        // t0 column: tight bound — both methods use the same FD pair
-        // on t0 (partial-GAL just hoists it out of the per-coord loop).
-        for i in 0..energies.len() {
-            let fd2 = jac_fd2.get(i, 1);
-            let pg = jac_pg.get(i, 1);
-            let abs_err = (fd2 - pg).abs();
-            let rel_err = abs_err / fd2.abs().max(1e-15);
-            assert!(
-                rel_err < 1e-3 || abs_err < 1e-8,
-                "t0 bin {i}: fd2={fd2:.6e} pg={pg:.6e} rel={rel_err:.2e}"
-            );
-        }
-
-        // L_scale column: relative L₂ norm bound.  In the presence of
-        // a non-trivial resolution kernel the rank-1 identity is no
-        // longer exact; the resolution operator introduces an
-        // additional (t0, L_scale)-dependence that partial-GAL
-        // approximates as zero.  The bound captures the residual.
-        let mut num_sq = 0.0_f64;
-        let mut den_sq = 0.0_f64;
-        for i in 0..energies.len() {
-            let fd2 = jac_fd2.get(i, 2);
-            let pg = jac_pg.get(i, 2);
-            let diff = pg - fd2;
-            num_sq += diff * diff;
-            den_sq += fd2 * fd2;
-        }
-        let rel_l2 = (num_sq / den_sq.max(1e-30)).sqrt();
-        assert!(
-            rel_l2 < PARTIAL_GAL_REL_L2_TOLERANCE,
-            "L_scale rel L₂ = {rel_l2:.4e} exceeds tolerance {tol:.4e}; \
-             tighten or loosen `PARTIAL_GAL_REL_L2_TOLERANCE` (see rustdoc)",
-            tol = PARTIAL_GAL_REL_L2_TOLERANCE,
+        // The gate itself, stated once and asserted directly.
+        assert_eq!(
+            make_energy_scale_u238(energies.clone(), instrument.clone())
+                .with_jacobian_method(EnergyScaleJacobianMethod::PartialGal)
+                .effective_jacobian_method(),
+            EnergyScaleJacobianMethod::FiniteDifference,
+            "a kernel is present, so the derivation must be refused"
         );
+        assert_eq!(
+            make_energy_scale_u238(energies.clone(), None)
+                .with_jacobian_method(EnergyScaleJacobianMethod::PartialGal)
+                .effective_jacobian_method(),
+            EnergyScaleJacobianMethod::PartialGal,
+            "without a kernel the identity is exact and must still be used"
+        );
+
+        // And the override reaches the numbers: requesting partial-GAL with a
+        // kernel yields the finite-difference Jacobian bit for bit.
+        let requested_pg = make_energy_scale_u238(energies.clone(), instrument.clone())
+            .with_jacobian_method(EnergyScaleJacobianMethod::PartialGal);
+        let requested_fd = make_energy_scale_u238(energies.clone(), instrument.clone())
+            .with_jacobian_method(EnergyScaleJacobianMethod::FiniteDifference);
+        let y = requested_fd.evaluate(&params).unwrap();
+        let jac_pg = requested_pg
+            .analytical_jacobian(&params, &free, &y)
+            .expect("Jacobian available");
+        let jac_fd = requested_fd
+            .analytical_jacobian(&params, &free, &y)
+            .expect("Jacobian available");
+        for col in 0..3 {
+            for i in 0..energies.len() {
+                assert_eq!(
+                    jac_pg.get(i, col).to_bits(),
+                    jac_fd.get(i, col).to_bits(),
+                    "col {col} bin {i}: the partial-GAL request was not overridden"
+                );
+            }
+        }
     }
 }

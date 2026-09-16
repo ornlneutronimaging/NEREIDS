@@ -728,6 +728,26 @@ impl IkedaCarpenter {
         self.flight_path_m
     }
 
+    /// The same pulse read against a different flight path.
+    ///
+    /// The synthesized kernels are emission-time distributions built from
+    /// α(E), β(E) and R(E) — no flight path appears in the synthesis. The
+    /// flight path enters only the TOF↔energy map and the nominal arrival
+    /// time, so rebinding it is exact and does not resynthesize the table.
+    ///
+    /// # Errors
+    /// Returns [`ResolutionParseError::InvalidFormat`] if `flight_path_m` is
+    /// not positive and finite.
+    pub fn with_flight_path(&self, flight_path_m: f64) -> Result<Self, ResolutionParseError> {
+        Ok(Self {
+            params: self.params.clone(),
+            flight_path_m,
+            ref_energies: self.ref_energies.clone(),
+            n_tau: self.n_tau,
+            tabulated: self.tabulated.with_flight_path(flight_path_m)?,
+        })
+    }
+
     /// Reference energies (eV, ascending) the table was synthesized on.
     #[must_use]
     pub fn ref_energies(&self) -> &[f64] {
