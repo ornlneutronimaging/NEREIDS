@@ -84,6 +84,15 @@ fix; retargeted at the quantity that actually governs the effect,
 - **GPG-signed commits**: always use `git commit -S`. The GPG agent is working.
 - **Atomic commits**: commit early and often. Huge monolithic commits make it
   hard to catch off-rail behaviour.
+- **PR descriptions: two sentences, or blank.** What changed and why.
+  Nothing else — no headings, no tables, no bolded verdicts, no emoji, no
+  validation inventory, no risk section, no review narration. The diff and
+  the commit messages carry the detail; that is their job.
+
+  **Running unattended, a blank body is preferred over generated prose.**
+  Given the choice between a written paragraph and nothing, publish
+  nothing. The same applies to issue comments and review replies: never
+  post unprompted narration of the work.
 - **No temp file litter**: clean up all one-off scripts immediately.
 - **Do not touch `.Codex/worktrees/`**: this directory is managed by
   Codex for isolated worktree sessions. Never delete, modify, or

@@ -84,12 +84,23 @@ fix; retargeted at the quantity that actually governs the effect,
 - **GPG-signed commits**: always use `git commit -S`. The GPG agent is working.
 - **Atomic commits**: commit early and often. Huge monolithic commits make it
   hard to catch off-rail behaviour.
-- **PR descriptions are concise and professional**: a short summary of what
-  changed and why, the validation performed, and any risk or follow-up —
-  a few sentences or bullets total. Do NOT inventory individual edits (the
-  diff shows those), narrate review rounds, or paste investigation memos.
-  Long-form audit/investigation material goes in a PR **comment** or the
-  commit messages, never the description.
+- **PR descriptions: two sentences, or blank.** What changed and why.
+  Nothing else — no headings, no tables, no bolded verdicts, no emoji, no
+  validation inventory, no risk section, no review narration. The diff and
+  the commit messages carry the detail; that is their job.
+
+  **Running unattended, a blank body is preferred over generated prose.**
+  Given the choice between a paragraph I wrote and nothing, publish
+  nothing. The same applies to issue comments and review replies: never
+  post unprompted narration of what I did.
+
+  This bullet used to read "a short summary of what changed and why, the
+  validation performed, and any risk or follow-up — a few sentences or
+  bullets total." That licensed exactly what it was meant to prevent:
+  on #778 and #779 I turned it into Validation and Risk sections with
+  tables and bolded conclusions, and the user deleted one and retyped it
+  as a single sentence. A rule that needs judgment about how much is
+  "a few" is a rule I will rationalise around. Two sentences is checkable.
 - **No temp file litter**: clean up all one-off scripts immediately.
 - **Do not touch `.claude/worktrees/`**: this directory is managed by
   Claude Code for isolated worktree sessions. Never delete, modify, or
