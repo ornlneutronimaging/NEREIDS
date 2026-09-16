@@ -2132,6 +2132,43 @@ mod tests {
         synthetic_grid_transmission(res_data, true_density, energies, 4, 4)
     }
 
+    /// As [`synthetic_4x4_transmission`], with the truth Doppler-broadened
+    /// at `temperature_k`.
+    ///
+    /// A fixture that fits temperature has to put the true value INSIDE the
+    /// parameter's bounds. Generating truth at 0 K while the fit searches
+    /// from 1 K upward leaves the optimum outside the search range, so LM
+    /// pins temperature to the bound and never reports convergence — with
+    /// every other parameter recovered to six digits.
+    fn synthetic_4x4_transmission_at(
+        res_data: &nereids_endf::resonance::ResonanceData,
+        true_density: f64,
+        energies: &[f64],
+        temperature_k: f64,
+    ) -> (Array3<f64>, Array3<f64>) {
+        let xs = nereids_physics::transmission::broadened_cross_sections(
+            energies,
+            std::slice::from_ref(res_data),
+            temperature_k,
+            None,
+            None,
+        )
+        .unwrap();
+        let n_e = energies.len();
+        let mut t_3d = Array3::zeros((n_e, 4, 4));
+        let mut u_3d = Array3::zeros((n_e, 4, 4));
+        for i in 0..n_e {
+            let t = (-true_density * xs[0][i]).exp();
+            for y in 0..4 {
+                for x in 0..4 {
+                    t_3d[[i, y, x]] = t;
+                    u_3d[[i, y, x]] = 0.01;
+                }
+            }
+        }
+        (t_3d, u_3d)
+    }
+
     /// Build a 4x4 synthetic counts stack from known density.
     fn synthetic_4x4_counts(
         res_data: &nereids_endf::resonance::ResonanceData,
@@ -4211,7 +4248,8 @@ mod tests {
     fn test_spatial_map_typed_allows_energy_scale_with_temperature() {
         let rd = u238_single_resonance();
         let energies: Vec<f64> = (0..51).map(|i| 1.0 + (i as f64) * 0.2).collect();
-        let (t_3d, u_3d) = synthetic_4x4_transmission(&rd, 0.001, &energies);
+        // Truth at the temperature the fit searches for, not at 0 K.
+        let (t_3d, u_3d) = synthetic_4x4_transmission_at(&rd, 0.001, &energies, 300.0);
         let data = InputData3D::Transmission {
             transmission: t_3d.view(),
             uncertainty: u_3d.view(),

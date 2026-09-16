@@ -17,29 +17,19 @@ use nereids_physics::transmission::{self, InstrumentParams, SampleParams};
 use crate::error::FittingError;
 use crate::lm::{FitModel, FlatMatrix};
 
-/// Absolute-magnitude threshold for `L_scale` division safety in the
-/// partial-GAL rank-1 derivation of the energy-scale Jacobian.  When
-/// `|l_scale| < L_SCALE_EPSILON`, the per-bin
-/// `(tof_i - t0_clamped) / l_scale` factor in
-/// [`EnergyScaleTransmissionModel::analytical_jacobian`] blows up,
-/// and combined with the FD-based reference t0 column (which goes to
-/// ~0 at the same boundary) produces NaN entries in the L_scale
-/// Jacobian column.
+/// Smallest flight-path scale that still describes this instrument.
 ///
-/// Below this threshold the L_scale column falls through to the
-/// per-coordinate central-FD path that already follows the partial-GAL
-/// block in the same function.
-///
-/// **Note:** the literal `1.0e-12` matches the `1e-12` factor in the
-/// t0 clamp at [`EnergyScaleTransmissionModel::corrected_energies`]
-/// and the partial-GAL t0 FD precompute, but the semantic role
-/// differs — the t0 clamp is *relative* (`min_tof_us * (1 - 1e-12)`)
-/// while this constant is an *absolute* magnitude bound.  Both
-/// guards protect against the same `(tof - t0) / l_eff` blow-up at
-/// the energy-scale-degenerate corner; the value choice is
-/// coincident, not tied.  See issue #500 for the L_scale gap
-/// closure.
-const L_SCALE_EPSILON: f64 = 1.0e-12;
+/// `l_scale` corrects a surveyed flight path, so a value far from one is not
+/// a calibration — it is a different instrument. The production fit searches
+/// a much tighter band; this is the hard limit below which the model refuses
+/// to answer, because the corrected energies stop being energies any neutron
+/// has. Rejecting here is what removes the need for divide-by-zero guards in
+/// the Jacobian (issue #500).
+const L_SCALE_PHYSICAL_LO: f64 = 0.5;
+
+/// Largest flight-path scale that still describes this instrument; see
+/// [`L_SCALE_PHYSICAL_LO`].
+const L_SCALE_PHYSICAL_HI: f64 = 2.0;
 
 /// Transmission model backed by precomputed Doppler-broadened cross-sections.
 ///
@@ -2096,6 +2086,25 @@ impl EnergyScaleTransmissionModel {
     /// stays monotone and physical.  This is a safety net; the expected
     /// path is that the optimizer's parameter bounds keep `t0_us` well
     /// below the clamp threshold.
+    /// Reject an `l_scale` that does not describe this instrument.
+    ///
+    /// `l_scale` corrects a surveyed flight path. A value outside
+    /// [`L_SCALE_PHYSICAL_LO`, `L_SCALE_PHYSICAL_HI`] is not a calibration of
+    /// this instrument, it is a different one — and a near-zero value asks
+    /// for cross-sections at energies no neutron has. Checking it here, at
+    /// the public entry points, is what keeps every downstream stage free of
+    /// guards against a state that can no longer arrive.
+    fn validate_energy_scale(&self, params: &[f64]) -> Result<(), FittingError> {
+        let l_scale = params[self.l_scale_index];
+        if !l_scale.is_finite() || !(L_SCALE_PHYSICAL_LO..=L_SCALE_PHYSICAL_HI).contains(&l_scale) {
+            return Err(FittingError::EvaluationFailed(format!(
+                "l_scale {l_scale} is outside the physical range \
+                 [{L_SCALE_PHYSICAL_LO}, {L_SCALE_PHYSICAL_HI}]"
+            )));
+        }
+        Ok(())
+    }
+
     fn corrected_energies(&self, t0_us: f64, l_scale: f64) -> Vec<f64> {
         if self.nominal_energies.is_empty() {
             return Vec::new();
@@ -2282,6 +2291,7 @@ impl EnergyScaleTransmissionModel {
 
 impl FitModel for EnergyScaleTransmissionModel {
     fn evaluate(&self, params: &[f64]) -> Result<Vec<f64>, FittingError> {
+        self.validate_energy_scale(params)?;
         let t0 = params[self.t0_index];
         let l_scale = params[self.l_scale_index];
         let e_corr = self.corrected_energies(t0, l_scale);
@@ -2309,6 +2319,7 @@ impl FitModel for EnergyScaleTransmissionModel {
         let n_free = free_param_indices.len();
         let mut jacobian = FlatMatrix::zeros(n_e, n_free);
 
+        self.validate_energy_scale(params).ok()?;
         let t0 = params[self.t0_index];
         let l_scale = params[self.l_scale_index];
         let e_corr = self.corrected_energies(t0, l_scale);
@@ -2469,40 +2480,26 @@ impl FitModel for EnergyScaleTransmissionModel {
                         continue;
                     }
                     if fp_idx == self.l_scale_index {
+                        // `validate_energy_scale` has already rejected an
+                        // `l_scale` near zero, so the rank-1 factor below
+                        // cannot blow up (issue #500).
                         let l_scale = params[self.l_scale_index];
-                        // Issue #500: at `l_scale ≈ 0` the rank-1 factor
-                        // `(tof - t0_clamped) / l_scale` blows up and
-                        // produces NaN columns when combined with the
-                        // FD-based t0 reference (which goes to ~0 at the
-                        // same boundary).  Skip the partial-GAL path
-                        // and fall through to the per-coordinate FD
-                        // section below — mirrors the t0 clamp-boundary
-                        // fallthrough (when
-                        // `partial_gal_t0_column` is `None`, the entire
-                        // partial-GAL block is skipped).  Production
-                        // L_scale bounds are typically `[0.99, 1.01]`,
-                        // so this guard fires only at API edge cases.
-                        if l_scale.abs() >= L_SCALE_EPSILON {
-                            let t0 = params[self.t0_index];
-                            // Match the `corrected_energies` t0 clamp so the
-                            // (tof - t0) factor in the rank-1 derivation
-                            // agrees with the production forward at the
-                            // clamp boundary.
-                            let min_tof_us = self
-                                .nominal_energies
-                                .iter()
-                                .map(|&e| self.tof_factor * self.flight_path_m / e.sqrt())
-                                .fold(f64::INFINITY, f64::min);
-                            let t0_clamped = t0.min(min_tof_us * (1.0 - 1.0e-12));
-                            for (i, &e_nom) in self.nominal_energies.iter().enumerate() {
-                                let tof_i = self.tof_factor * self.flight_path_m / e_nom.sqrt();
-                                let scale = (tof_i - t0_clamped) / l_scale;
-                                *jacobian.get_mut(i, col) = scale * partial_t0_col[i];
-                            }
-                            continue;
+                        let t0 = params[self.t0_index];
+                        // Match the `corrected_energies` t0 clamp so the
+                        // (tof - t0) factor in the rank-1 derivation agrees
+                        // with the production forward at the clamp boundary.
+                        let min_tof_us = self
+                            .nominal_energies
+                            .iter()
+                            .map(|&e| self.tof_factor * self.flight_path_m / e.sqrt())
+                            .fold(f64::INFINITY, f64::min);
+                        let t0_clamped = t0.min(min_tof_us * (1.0 - 1.0e-12));
+                        for (i, &e_nom) in self.nominal_energies.iter().enumerate() {
+                            let tof_i = self.tof_factor * self.flight_path_m / e_nom.sqrt();
+                            let scale = (tof_i - t0_clamped) / l_scale;
+                            *jacobian.get_mut(i, col) = scale * partial_t0_col[i];
                         }
-                        // l_scale ≈ 0: do NOT `continue`; flow falls
-                        // through to the FD path below for this column.
+                        continue;
                     }
                 }
                 // Finite difference for energy-scale parameters.
@@ -2532,6 +2529,12 @@ impl FitModel for EnergyScaleTransmissionModel {
                 } else if is_temperature {
                     1e-4 * params[fp_idx].max(1.0)
                 } else {
+                    // L_scale stays at an absolute 1e-7. It rescales the
+                    // energy axis, so a step that looks small still slides
+                    // the grid across resonance flanks where the second
+                    // derivative is large: measured on U-238, the central
+                    // difference is stable to 1e-9 relative for h <= 1e-6,
+                    // then degrades to 3e-3 at 1e-4 and 36 % at 1e-3.
                     1e-7
                 };
                 let mut p_plus = params.to_vec();
@@ -3567,13 +3570,27 @@ mod tests {
         assert_eq!(jac.nrows, y.len());
         assert_eq!(jac.ncols, 2);
 
-        // Central-difference reference.
-        let h = 1e-6f64;
+        // Central-difference reference.        //
+        // The step is sized for the model's convergence, not for machine
+        // epsilon. Cross-sections come from adaptive quadrature converged to
+        // a tolerance, so the transmission carries ~1e-14 of noise; a central
+        // difference of it resolves a derivative only to noise/(2h). At
+        // h = 1e-6 that floor is ~2e-11, which is 2 % of the ~1e-9 derivative
+        // far below the resonance, and the check failed there while agreeing
+        // to 3e-14 at the resonance itself. At h = 1e-4 the same elements
+        // agree to ~2e-14; truncation error is still negligible because the
+        // transmission is smooth in temperature.
+        let h = 1e-4f64;
         for (col, &p_idx) in free.iter().enumerate() {
+            // Relative to each parameter's OWN scale. An absolute step sized
+            // for temperature (300 K) is 20 % of the areal density (5e-4) and
+            // its truncation error then swamps the density column.
+            let scale = params[p_idx].abs();
+            let step = if scale > 0.0 { h * scale } else { h };
             let mut p_plus = params;
             let mut p_minus = params;
-            p_plus[p_idx] += h * (1.0 + params[p_idx].abs());
-            p_minus[p_idx] -= h * (1.0 + params[p_idx].abs());
+            p_plus[p_idx] += step;
+            p_minus[p_idx] -= step;
 
             let y_plus = model.evaluate(&p_plus).unwrap();
             let y_minus = model.evaluate(&p_minus).unwrap();
@@ -6721,89 +6738,47 @@ mod tests {
         }
     }
 
-    /// Regression for #500: at `l_scale ≈ 0` the partial-GAL rank-1
-    /// derivation `(tof - t0_clamped) / l_scale` divides by zero,
-    /// producing a NaN L_scale Jacobian column.  After the fix, the
-    /// L_scale column falls through to the per-coordinate FD path —
-    /// every Jacobian entry must be finite, and the L_scale column
-    /// must agree with the FD2 reference (which uses the same
-    /// per-coordinate FD).
+    /// Regression for #500: an `l_scale` near zero is refused, not computed.
     ///
-    /// Setup mirrors `partial_gal_no_resolution_matches_fd2` so the
-    /// FD-tolerance comparison against FD2 stays apples-to-apples.
+    /// The original fix guarded the rank-1 Jacobian factor
+    /// `(tof - t0_clamped) / l_scale` against dividing by zero, and fell
+    /// through to finite differences. But finite differences evaluate the
+    /// model, and at `l_scale = 1e-13` the corrected energies are ~4e-26 eV —
+    /// so the fallthrough was differencing a model no neutron could produce,
+    /// and the test only checked the result stayed finite. The guard is gone;
+    /// the value is rejected where it enters.
     #[test]
-    fn partial_gal_l_scale_zero_falls_through_to_finite_jacobian() {
+    fn an_unphysical_l_scale_is_rejected_not_computed() {
         let energies: Vec<f64> = (0..101).map(|i| 4.0 + (i as f64) * 0.06).collect();
-        let mut model = make_energy_scale_u238(energies.clone(), None)
+        let model = make_energy_scale_u238(energies, None)
             .with_jacobian_method(EnergyScaleJacobianMethod::FiniteDifference);
 
-        // l_scale = 0.0 — well below `L_SCALE_EPSILON = 1e-12` — so the
-        // partial-GAL guard fires and falls through to FD.
-        //
-        // **Active code path (regression target):** the test inputs
-        // are chosen so the new `L_SCALE_EPSILON` guard is what fires,
-        // *not* the older `t0 + h >= t0_limit` precompute fallthrough.
-        // Specifically:
-        //
-        //   - `min_tof_us = tof_factor * 25.0 / sqrt(max_E ≈ 10.0) ≈ 5.7e2 µs`
-        //   - `t0 + h = 0.05 + 1e-4 = 0.0501 µs ≪ min_tof * (1 - 1e-12)`
-        //
-        // So `partial_gal_t0_column = Some(...)` (not `None`), the
-        // partial-GAL block at line ~2208 enters, and the L_scale
-        // branch reaches the new `l_scale.abs() < L_SCALE_EPSILON`
-        // guard.  Pre-fix, the inner `(tof_i - t0_clamped) / 0.0 =
-        // ±inf` then `inf * 0 = NaN` would poison the column.  If a
-        // future refactor changes these inputs, verify that
-        // `partial_gal_t0_column.is_some()` still holds for this test
-        // — otherwise the regression target shifts to a different
-        // code path.
-        let params = [0.001, 0.05, 1e-13]; // density, t0, l_scale ≈ 0 (< L_SCALE_EPSILON)
-        let free = vec![0, 1, 2];
-
-        // FD2 reference Jacobian.  FD2 computes each column via its
-        // own per-coordinate FD pair, so it produces well-defined
-        // finite values at l_scale = 0 (no division by l_scale in the
-        // FD2 path).
-        let jac_fd2 = model
-            .analytical_jacobian(&params, &free, &model.evaluate(&params).unwrap())
-            .expect("FD2 Jacobian should be available at l_scale = 0");
-
-        // Partial-GAL Jacobian — with the #500 guard, L_scale column
-        // falls through to the same per-coordinate FD path.
-        model = model.with_jacobian_method(EnergyScaleJacobianMethod::PartialGal);
-        let jac_pg = model
-            .analytical_jacobian(&params, &free, &model.evaluate(&params).unwrap())
-            .expect("partial-GAL Jacobian should be available at l_scale = 0 (fallthrough to FD)");
-
-        // Primary regression: every entry finite.  Pre-fix the L_scale
-        // column would be NaN from the `1 / l_scale` division.
-        for i in 0..jac_pg.nrows {
-            for c in 0..jac_pg.ncols {
-                let v = jac_pg.get(i, c);
-                assert!(
-                    v.is_finite(),
-                    "partial-GAL Jacobian must be finite at l_scale = 0; \
-                     got non-finite at ({i},{c}) = {v}"
-                );
-            }
+        for l_scale in [1e-13, 0.0, -1.0, 0.4, 2.1, f64::NAN] {
+            let params = [0.001, 0.05, l_scale];
+            let error = model
+                .evaluate(&params)
+                .expect_err(&format!("l_scale {l_scale} must be refused"));
+            assert!(
+                error.to_string().contains("outside the physical range"),
+                "l_scale {l_scale} was refused for the wrong reason: {error}"
+            );
+            assert!(
+                model
+                    .analytical_jacobian(&params, &[0, 1, 2], &[])
+                    .is_none(),
+                "l_scale {l_scale} must not produce a Jacobian"
+            );
         }
 
-        // Bit-equivalent to FD2 across every column — confirms the
-        // L_scale fallthrough lands on the same FD code path FD2 uses,
-        // and the density / t0 columns are unchanged by the guard.
-        for c in 0..jac_pg.ncols {
-            for i in 0..jac_pg.nrows {
-                let fd2 = jac_fd2.get(i, c);
-                let pg = jac_pg.get(i, c);
-                let abs_err = (fd2 - pg).abs();
-                let rel_err = abs_err / fd2.abs().max(1e-15);
-                assert!(
-                    rel_err < 1e-3 || abs_err < 1e-8,
-                    "partial-GAL must match FD2 at l_scale = 0; \
-                     col {c} bin {i}: fd2={fd2:.6e} pg={pg:.6e} rel={rel_err:.2e}"
-                );
-            }
-        }
+        // Non-vacuity: a physical value on the same model still works, so the
+        // rejections above pin the range rather than a broken model.
+        let ok = [0.001, 0.05, 1.0];
+        let y = model.evaluate(&ok).expect("l_scale 1.0 is physical");
+        assert!(y.iter().all(|v| v.is_finite() && *v > 0.0));
+        assert!(
+            model.analytical_jacobian(&ok, &[0, 1, 2], &y).is_some(),
+            "a physical l_scale must produce a Jacobian"
+        );
     }
 
     /// In-tree regression for the partial-GAL rank-1 approximation in

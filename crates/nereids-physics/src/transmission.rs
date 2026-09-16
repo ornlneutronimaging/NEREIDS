@@ -30,7 +30,8 @@ use rayon::prelude::*;
 
 use nereids_endf::resonance::ResonanceData;
 
-use crate::doppler::{self, DopplerParams, DopplerParamsError};
+use crate::continuous_doppler;
+use crate::doppler::DopplerParamsError;
 use crate::reich_moore;
 use crate::resolution::{self, ResolutionError, ResolutionFunction};
 
@@ -652,16 +653,8 @@ pub fn forward_model(
         .par_iter()
         .filter(|(_, thickness)| *thickness > 0.0)
         .map(|(res_data, thickness)| {
-            let unbroadened: Vec<f64> = work_energies
-                .iter()
-                .map(|&e| reich_moore::cross_sections_at_energy(res_data, e).total)
-                .collect();
-            let after_doppler = if sample.temperature_k() > 0.0 {
-                let params = DopplerParams::new(sample.temperature_k(), res_data.awr)?;
-                doppler::doppler_broaden(work_energies, &unbroadened, &params)?
-            } else {
-                unbroadened
-            };
+            let after_doppler =
+                continuous_doppler::broaden(work_energies, res_data, sample.temperature_k())?;
             Ok((after_doppler, *thickness))
         })
         .collect();
@@ -790,16 +783,7 @@ pub fn broadened_cross_sections_on_working_grid(
                 return Err(TransmissionError::Cancelled);
             }
 
-            let unbroadened: Vec<f64> = work_energies
-                .iter()
-                .map(|&e| reich_moore::cross_sections_at_energy(rd, e).total)
-                .collect();
-            if temperature_k > 0.0 {
-                let params = DopplerParams::new(temperature_k, rd.awr)?;
-                doppler::doppler_broaden(work_energies, &unbroadened, &params).map_err(Into::into)
-            } else {
-                Ok(unbroadened)
-            }
+            continuous_doppler::broaden(work_energies, rd, temperature_k).map_err(Into::into)
         })
         .collect();
 
@@ -879,19 +863,8 @@ pub fn broadened_cross_sections_for_transmission(
                 // Extended grid available: evaluate the full pipeline on the
                 // extended grid and extract at data positions.
 
-                // 1. Unbroadened cross sections on extended grid.
-                let unbroadened: Vec<f64> = ext_energies
-                    .iter()
-                    .map(|&e| reich_moore::cross_sections_at_energy(rd, e).total)
-                    .collect();
-
-                // 2. Doppler broadening.
-                let after_doppler = if temperature_k > 0.0 {
-                    let params = DopplerParams::new(temperature_k, rd.awr)?;
-                    doppler::doppler_broaden(ext_energies, &unbroadened, &params)?
-                } else {
-                    unbroadened
-                };
+                // 1. Doppler-broadened cross sections on the extended grid.
+                let after_doppler = continuous_doppler::broaden(ext_energies, rd, temperature_k)?;
 
                 // 3. Convert to transmission: T = exp(-nd × σ_D).
                 let transmission: Vec<f64> = after_doppler
@@ -917,17 +890,7 @@ pub fn broadened_cross_sections_for_transmission(
             } else {
                 // No extended grid (e.g. tabulated resolution with no aux grid):
                 // Doppler on data grid, Beer-Lambert, resolution on data grid.
-                let unbroadened: Vec<f64> = energies
-                    .iter()
-                    .map(|&e| reich_moore::cross_sections_at_energy(rd, e).total)
-                    .collect();
-
-                let after_doppler = if temperature_k > 0.0 {
-                    let params = DopplerParams::new(temperature_k, rd.awr)?;
-                    doppler::doppler_broaden(energies, &unbroadened, &params)?
-                } else {
-                    unbroadened
-                };
+                let after_doppler = continuous_doppler::broaden(energies, rd, temperature_k)?;
 
                 let transmission: Vec<f64> = after_doppler
                     .iter()
@@ -1061,18 +1024,22 @@ pub fn broadened_cross_sections_from_base_on_working_grid(
         .par_iter()
         .zip(resonance_data.par_iter())
         .map(|(xs_raw, rd)| {
+            if temperature_k > 0.0 {
+                // The base table IS the resonance equation sampled on the
+                // data grid, so integrating from `rd` answers the same
+                // question without the sampling error. Broadening the table
+                // instead cost a systematic -3.7 K on the synthetic
+                // temperature fixture.
+                return continuous_doppler::broaden(work_energies, rd, temperature_k)
+                    .map_err(Into::into);
+            }
             let xs_work = if let Some((ref ext_energies, ref data_indices)) = ext_grid {
                 let mask = is_data_point.as_ref().unwrap();
                 build_extended_xs_from_base(ext_energies, data_indices, mask, xs_raw, rd)
             } else {
                 xs_raw.clone()
             };
-            if temperature_k > 0.0 {
-                let params = DopplerParams::new(temperature_k, rd.awr)?;
-                doppler::doppler_broaden(work_energies, &xs_work, &params).map_err(Into::into)
-            } else {
-                Ok(xs_work)
-            }
+            Ok(xs_work)
         })
         .collect();
 
@@ -1152,20 +1119,25 @@ pub fn broadened_cross_sections_with_analytical_derivative_from_base_on_working_
         .par_iter()
         .zip(resonance_data.par_iter())
         .map(|(xs_raw, rd)| {
+            if temperature_k > 0.0 {
+                // Value and derivative converge on the SAME quadrature
+                // panels, so the optimiser cannot step on a derivative that
+                // describes a different curve from the one it lands on.
+                return continuous_doppler::broaden_with_derivative(
+                    work_energies,
+                    rd,
+                    temperature_k,
+                )
+                .map_err(Into::into);
+            }
             let xs_work = if let Some((ref ext_energies, ref data_indices)) = ext_grid {
                 let mask = is_data_point.as_ref().unwrap();
                 build_extended_xs_from_base(ext_energies, data_indices, mask, xs_raw, rd)
             } else {
                 xs_raw.clone()
             };
-            if temperature_k > 0.0 {
-                let params = DopplerParams::new(temperature_k, rd.awr)?;
-                doppler::doppler_broaden_with_derivative(work_energies, &xs_work, &params)
-                    .map_err(Into::into)
-            } else {
-                let zeros = vec![0.0; work_energies.len()];
-                Ok((xs_work, zeros))
-            }
+            let zeros = vec![0.0; work_energies.len()];
+            Ok((xs_work, zeros))
         })
         .collect();
 
@@ -1268,18 +1240,17 @@ pub fn forward_model_from_base_xs(
         .par_iter()
         .zip(resonance_data.par_iter())
         .map(|(xs_raw, rd)| {
+            if temperature_k > 0.0 {
+                return continuous_doppler::broaden(work_energies, rd, temperature_k)
+                    .map_err(Into::into);
+            }
             let xs_ext = if let Some((ref ext_energies, ref data_indices)) = ext_grid {
                 let mask = is_data_point.as_ref().unwrap();
                 build_extended_xs_from_base(ext_energies, data_indices, mask, xs_raw, rd)
             } else {
                 xs_raw.clone()
             };
-            if temperature_k > 0.0 {
-                let params = DopplerParams::new(temperature_k, rd.awr)?;
-                doppler::doppler_broaden(work_energies, &xs_ext, &params).map_err(Into::into)
-            } else {
-                Ok(xs_ext)
-            }
+            Ok(xs_ext)
         })
         .collect();
     let doppler_xs = doppler_xs?;
@@ -1888,13 +1859,11 @@ mod tests {
 
         // --- Build expected from first principles ---
 
-        // Step 1: Doppler-broadened σ on the data grid.
-        let unbroadened: Vec<f64> = energies
-            .iter()
-            .map(|&e| reich_moore::cross_sections_at_energy(&data, e).total)
-            .collect();
-        let doppler_params = doppler::DopplerParams::new(temperature, data.awr).unwrap();
-        let sigma_d = doppler::doppler_broaden(&energies, &unbroadened, &doppler_params).unwrap();
+        // Step 1: Doppler-broadened σ on the data grid, by the same method
+        // the model uses. This test is about the ORDER of Beer-Lambert and
+        // resolution; building the reference with a different broadening
+        // method would fold that difference into the discriminant below.
+        let sigma_d = continuous_doppler::broaden(&energies, &data, temperature).unwrap();
 
         // Step 2: Beer-Lambert on total transmission.
         let transmission: Vec<f64> = sigma_d.iter().map(|&s| (-thickness * s).exp()).collect();
