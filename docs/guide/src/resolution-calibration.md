@@ -130,7 +130,10 @@ reported `β` carries no information.
 
 Use `.as_tabulated()` for `udr_corr` / `ic` (a `TabulatedResolution` to pass as
 `resolution=`); use `.gaussian_params()` → `(delta_t_us, delta_l_m)` for the
-Gaussian family. For `ic`, `cal.params()` returns the decoded
+Gaussian family.
+Those two are W-parameters, the width in `exp(-x^2/W^2)`, so `sigma = W/sqrt(2)`
+and `FWHM = 1.6651*W` — convert before comparing them against a metrology
+number, or convert the metrology number with `nereids.width_from_sigma`. For `ic`, `cal.params()` returns the decoded
 `{a0, a1, beta, r, psr_fwhm_us}` (the raw `theta` is ln/box-encoded optimizer
 space).
 

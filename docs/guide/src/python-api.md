@@ -146,6 +146,16 @@ input energy grid. Pass either `isotopes=[(ResonanceData, density), ...]` or
 enabled by the `flight_path_m`, `delta_t_us`, and `delta_l_m` parameters.
 Tabulated resolution can be supplied with `resolution=load_resolution(...)`.
 
+`delta_t_us` and `delta_l_m` are **W-parameters**, the width in
+`exp(-x^2/W^2)`, not standard deviations.
+The conversions are `sigma = W/sqrt(2)` and `FWHM = 2*sqrt(ln 2)*W = 1.6651*W`.
+This is SAMMY's convention, shared with the Doppler width, so the two kernels
+compose without a conversion.
+A measured 1-sigma timing jitter must be multiplied by `sqrt(2)` before it is
+passed here; supplying it unconverted gives a kernel 29 % too narrow, and a
+resolution that is too narrow is absorbed into a fitted temperature that is too
+high.
+
 ## Single-Spectrum Fitting
 
 ### Transmission Data

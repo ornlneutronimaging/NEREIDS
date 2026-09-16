@@ -1339,8 +1339,8 @@ fn cross_sections<'py>(
 ///     isotopes: List of (ResonanceData, areal_density) tuples (mutually exclusive with groups).
 ///     temperature_k: Sample temperature in Kelvin (default 293.6).
 ///     flight_path_m: Flight path in meters for Gaussian resolution (optional).
-///     delta_t_us: Timing uncertainty in microseconds (optional).
-///     delta_l_m: Path length uncertainty in meters (optional).
+///     delta_t_us: Timing width in microseconds, W-parameter (optional).
+///     delta_l_m: Path length width in meters, W-parameter (optional).
 ///     delta_e_us: Exponential tail parameter in SAMMY Deltae units (optional,
 ///         default None/0.0). When non-zero, adds an exponential tail to the
 ///         resolution kernel (SAMMY Iesopr=3).
@@ -2291,16 +2291,24 @@ fn doppler_broaden<'py>(
 /// Apply Gaussian resolution broadening to a cross-section or spectrum array.
 ///
 /// Convolves the input with an energy-dependent Gaussian kernel derived from
-/// the instrument's timing uncertainty and flight path length uncertainty.
-/// This is the same broadening applied internally by `forward_model()`, but
-/// exposed here for independent use on arbitrary arrays.
+/// the instrument's timing and flight-path widths. This is the same broadening
+/// applied internally by `forward_model()`, but exposed here for independent
+/// use on arbitrary arrays.
+///
+/// Width convention: the kernel is ``exp(-x^2 / W^2)``, so ``delta_t_us`` and
+/// ``delta_l_m`` are W-parameters — ``sigma = W / sqrt(2)`` and
+/// ``FWHM = 2*sqrt(ln 2)*W``. This is SAMMY's convention and matches the
+/// Doppler width. Passing a measured 1-sigma value directly gives a kernel
+/// sqrt(2) too narrow; multiply it by ``sqrt(2)`` first.
 ///
 /// Args:
 ///     energies: Energy grid in eV (1D numpy array, sorted ascending).
 ///     cross_sections: Values to broaden (1D numpy array, same length).
 ///     flight_path_m: Flight path length in meters (source to detector).
-///     delta_t_us: Total timing uncertainty (1σ Gaussian) in microseconds.
-///     delta_l_m: Flight path uncertainty (1σ Gaussian) in meters.
+///     delta_t_us: Total timing width in microseconds, as a W-parameter
+///         (sigma = W/sqrt(2)), NOT a standard deviation.
+///     delta_l_m: Flight path width in meters, as a W-parameter
+///         (sigma = W/sqrt(2)), NOT a standard deviation.
 ///
 /// Returns:
 ///     1D numpy array of resolution-broadened values.
@@ -2344,6 +2352,42 @@ fn resolution_broaden<'py>(
     let result = py.detach(move || resolution::resolution_broaden(&e_owned, &xs_owned, &params));
     let result = result.map_err(|e| pyo3::exceptions::PyValueError::new_err(format!("{}", e)))?;
     Ok(PyArray1::from_vec(py, result))
+}
+
+/// Convert a standard deviation to the W-parameter this API expects.
+///
+/// ``delta_t_us`` and ``delta_l_m`` are W-parameters — the width in
+/// ``exp(-x^2/W^2)`` — while instrument metrology is usually quoted as a
+/// 1-sigma jitter. This applies ``W = sigma * sqrt(2)``.
+///
+/// Args:
+///     sigma: A standard deviation, in any unit.
+///
+/// Returns:
+///     The same width expressed as a W-parameter, in the same unit.
+///
+/// Example:
+///     >>> nereids.width_from_sigma(0.5)  # a measured 0.5 us 1-sigma jitter
+///     0.7071067811865476
+#[pyfunction]
+fn width_from_sigma(sigma: f64) -> f64 {
+    sigma * std::f64::consts::SQRT_2
+}
+
+/// Convert a full width at half maximum to the W-parameter this API expects.
+///
+/// Applies ``W = FWHM / (2*sqrt(ln 2))``. This is the measure SAMMY's
+/// ``Deltag`` uses, so a timing width taken from a SAMMY ``.inp`` can be passed
+/// through this function directly.
+///
+/// Args:
+///     fwhm: A full width at half maximum, in any unit.
+///
+/// Returns:
+///     The same width expressed as a W-parameter, in the same unit.
+#[pyfunction]
+fn width_from_fwhm(fwhm: f64) -> f64 {
+    fwhm / (2.0 * 2.0_f64.ln().sqrt())
 }
 
 /// Load a tabulated resolution function from a VENUS/FTS-format file.
@@ -3393,8 +3437,8 @@ impl PyTraceDetectabilityReport {
 ///     i0: Expected counts per energy bin (for Poisson noise estimate).
 ///     temperature_k: Sample temperature in Kelvin (default 293.6).
 ///     flight_path_m: Flight path for Gaussian resolution (optional).
-///     delta_t_us: Timing uncertainty for Gaussian resolution (optional).
-///     delta_l_m: Path length uncertainty for Gaussian resolution (optional).
+///     delta_t_us: Timing width for Gaussian resolution, W-parameter (optional).
+///     delta_l_m: Path length width for Gaussian resolution, W-parameter (optional).
 ///     resolution: TabulatedResolution for tabulated broadening (optional).
 ///     snr_threshold: Detection threshold in σ (default 3.0).
 ///
@@ -3494,8 +3538,8 @@ fn py_trace_detectability(
 ///     i0: Expected counts per energy bin (for Poisson noise estimate).
 ///     temperature_k: Sample temperature in Kelvin (default 293.6).
 ///     flight_path_m: Flight path for Gaussian resolution (optional).
-///     delta_t_us: Timing uncertainty for Gaussian resolution (optional).
-///     delta_l_m: Path length uncertainty for Gaussian resolution (optional).
+///     delta_t_us: Timing width for Gaussian resolution, W-parameter (optional).
+///     delta_l_m: Path length width for Gaussian resolution, W-parameter (optional).
 ///     resolution: TabulatedResolution for tabulated broadening (optional).
 ///     snr_threshold: Detection threshold in σ (default 3.0).
 ///
@@ -3605,8 +3649,8 @@ fn py_trace_detectability_survey(
 ///     isotopes: List of ResonanceData objects.
 ///     temperature_k: Sample temperature in Kelvin (default 0.0).
 ///     flight_path_m: Flight path in meters for Gaussian resolution (optional).
-///     delta_t_us: Timing uncertainty in microseconds (optional).
-///     delta_l_m: Path length uncertainty in meters (optional).
+///     delta_t_us: Timing width in microseconds, W-parameter (optional).
+///     delta_l_m: Path length width in meters, W-parameter (optional).
 ///     resolution: TabulatedResolution from ``load_resolution()`` (optional).
 ///
 /// Returns:
@@ -4696,6 +4740,8 @@ fn nereids(m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_function(wrap_pyfunction!(beer_lambert, m)?)?;
     m.add_function(wrap_pyfunction!(doppler_broaden, m)?)?;
     m.add_function(wrap_pyfunction!(resolution_broaden, m)?)?;
+    m.add_function(wrap_pyfunction!(width_from_sigma, m)?)?;
+    m.add_function(wrap_pyfunction!(width_from_fwhm, m)?)?;
     m.add_function(wrap_pyfunction!(load_resolution, m)?)?;
     m.add_function(wrap_pyfunction!(py_apply_resolution, m)?)?;
     m.add_function(wrap_pyfunction!(py_two_arm_count_response, m)?)?;

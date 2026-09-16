@@ -16,16 +16,38 @@
 //!   (R3-revision numbering — see `compute_xcoef_weights` and the
 //!   Gaussian+exponential path in `resolution_broaden_presorted`)
 //!
+//! ## Width convention — read before supplying a number
+//!
+//! Every width here is a **W-parameter**, the width appearing in
+//! `exp(-x²/W²)`, not a standard deviation. The two differ by √2:
+//!
+//!   σ = W/√2        FWHM = 2·√(ln 2)·W = 1.6651·W
+//!
+//! This is SAMMY's convention, and it is the same one the Doppler width Δ_D
+//! uses, so the two broadening kernels compose without a conversion. Supplying
+//! a 1σ value where a W is expected yields a kernel √2 too narrow — 29 % — and
+//! a resolution that is too narrow is absorbed into a fitted temperature that
+//! is too high.
+//!
+//! [`ResolutionParams::from_sigma`] and [`ResolutionParams::from_fwhm`] convert
+//! for you. Use them rather than scaling by hand.
+//!
+//! SAMMY's own inputs are in yet other measures — `Deltag` is a FWHM and
+//! `Deltal` is the full width of a rectangular path spread — so reading a
+//! SAMMY `.inp` goes through `nereids_endf::sammy::sammy_to_nereids_resolution`
+//! (`Deltag/(2√ln2)`, `Deltal/√6`), never straight into these fields.
+//!
 //! ## Physics
 //!
 //! For a time-of-flight instrument, the energy resolution is:
 //!
 //!   (ΔE/E)² = (2·Δt/t)² + (2·ΔL/L)²
 //!
-//! where t = L/v is the neutron time-of-flight, Δt is the total timing
-//! uncertainty, and ΔL is the flight path uncertainty. Since t ∝ 1/√E,
-//! the timing contribution gives ΔE ∝ E^(3/2) while the path contribution
-//! gives ΔE ∝ E.
+//! where t = L/v is the neutron time-of-flight, Δt is the total timing width,
+//! and ΔL is the flight path width — both W-parameters, as above, so ΔE is one
+//! too. The factor 2 is the kinematic derivative dE/E = 2·dt/t; it is not a
+//! width-measure conversion. Since t ∝ 1/√E, the timing contribution gives
+//! ΔE ∝ E^(3/2) while the path contribution gives ΔE ∝ E.
 //!
 //! The broadened cross-section is:
 //!
@@ -43,8 +65,16 @@
 //! exp(-x/We)·H(x).
 
 use nereids_core::constants::{DIVISION_FLOOR, NEAR_ZERO_FLOOR};
+use std::f64::consts::SQRT_2;
 use std::fmt;
 use std::sync::Arc;
+
+/// FWHM of `exp(-x²/W²)` divided by W: `2·√(ln 2)` = 1.6651.
+///
+/// The conversion between this module's W-parameters and a full width at half
+/// maximum. Paired with σ = W/√2 it fixes all three width measures against each
+/// other; see the module's width-convention section.
+const FWHM_PER_W: f64 = 1.665_109_222_315_395_4;
 
 /// TOF conversion factor: `t (μs) = TOF_FACTOR × L (m) / √(E in eV)`.
 ///
@@ -162,10 +192,12 @@ impl std::error::Error for ResolutionParamsError {}
 pub struct ResolutionParams {
     /// Flight path length in meters (source to detector).
     flight_path_m: f64,
-    /// Total timing uncertainty (1σ Gaussian) in microseconds.
+    /// Total timing width in microseconds, as a W-parameter (σ = W/√2).
     /// Combines moderator pulse width, detector timing, and electronics.
+    ///
+    /// Not a standard deviation — see the module's width-convention section.
     delta_t_us: f64,
-    /// Flight path uncertainty (1σ Gaussian) in meters.
+    /// Flight path width in meters, as a W-parameter (σ = W/√2).
     delta_l_m: f64,
     /// Exponential tail parameter (SAMMY Deltae, raw SAMMY units).
     ///
@@ -180,10 +212,15 @@ pub struct ResolutionParams {
 impl ResolutionParams {
     /// Create validated resolution parameters.
     ///
+    /// `delta_t_us` and `delta_l_m` are W-parameters (σ = W/√2), not standard
+    /// deviations. If your instrument numbers are 1σ or FWHM, use
+    /// [`from_sigma`](Self::from_sigma) or [`from_fwhm`](Self::from_fwhm)
+    /// instead of converting by hand.
+    ///
     /// # Arguments
     /// * `flight_path_m` — Flight path length in meters (must be > 0).
-    /// * `delta_t_us` — Timing uncertainty in microseconds (must be >= 0).
-    /// * `delta_l_m` — Flight path uncertainty in meters (must be >= 0).
+    /// * `delta_t_us` — Timing width in microseconds, W-parameter (must be >= 0).
+    /// * `delta_l_m` — Flight path width in meters, W-parameter (must be >= 0).
     /// * `delta_e_us` — Exponential tail parameter in SAMMY Deltae units
     ///   (must be >= 0). When 0, pure Gaussian broadening is used.
     ///
@@ -222,22 +259,73 @@ impl ResolutionParams {
         })
     }
 
+    /// Create resolution parameters from standard deviations.
+    ///
+    /// Instrument metrology is usually quoted as a 1σ jitter, while this type
+    /// stores W-parameters. This constructor applies W = σ·√2 to the timing and
+    /// flight-path terms, so a measured 1σ can be passed in directly.
+    ///
+    /// `delta_e_us` is not a Gaussian width — it is SAMMY's exponential tail
+    /// parameter Deltae — so it is passed through unchanged.
+    ///
+    /// # Errors
+    /// Same as [`new`](Self::new), on the converted values.
+    pub fn from_sigma(
+        flight_path_m: f64,
+        sigma_t_us: f64,
+        sigma_l_m: f64,
+        delta_e_us: f64,
+    ) -> Result<Self, ResolutionParamsError> {
+        Self::new(
+            flight_path_m,
+            sigma_t_us * SQRT_2,
+            sigma_l_m * SQRT_2,
+            delta_e_us,
+        )
+    }
+
+    /// Create resolution parameters from full widths at half maximum.
+    ///
+    /// Applies W = FWHM/(2·√(ln 2)) to the timing and flight-path terms. This
+    /// is the measure SAMMY's `Deltag` uses, so a value taken from a SAMMY
+    /// `.inp` timing field can be passed in directly.
+    ///
+    /// `delta_e_us` is SAMMY's exponential tail parameter, not a Gaussian
+    /// width, so it is passed through unchanged.
+    ///
+    /// # Errors
+    /// Same as [`new`](Self::new), on the converted values.
+    pub fn from_fwhm(
+        flight_path_m: f64,
+        fwhm_t_us: f64,
+        fwhm_l_m: f64,
+        delta_e_us: f64,
+    ) -> Result<Self, ResolutionParamsError> {
+        Self::new(
+            flight_path_m,
+            fwhm_t_us / FWHM_PER_W,
+            fwhm_l_m / FWHM_PER_W,
+            delta_e_us,
+        )
+    }
+
     /// Returns the flight path length in meters.
     #[must_use]
     pub fn flight_path_m(&self) -> f64 {
         self.flight_path_m
     }
 
-    /// Total timing uncertainty (1σ Gaussian) in microseconds.
+    /// Total timing width in microseconds, as a W-parameter (σ = W/√2).
     ///
     /// The factor of 2 in [`gaussian_width()`](Self::gaussian_width) comes from
-    /// the energy-TOF derivative dE/E = 2·dt/t, not from a σ-to-FWHM conversion.
+    /// the energy-TOF derivative dE/E = 2·dt/t, not from a width-measure
+    /// conversion — the convention is unchanged between time and energy.
     #[must_use]
     pub fn delta_t_us(&self) -> f64 {
         self.delta_t_us
     }
 
-    /// Returns the flight path uncertainty (1σ Gaussian) in meters.
+    /// Returns the flight path width in meters, as a W-parameter (σ = W/√2).
     #[must_use]
     pub fn delta_l_m(&self) -> f64 {
         self.delta_l_m
@@ -269,32 +357,37 @@ impl ResolutionParams {
         2.0 * self.delta_e_us * energy_ev.powf(1.5) / (TOF_FACTOR * self.flight_path_m)
     }
 
-    /// Gaussian resolution width σ_E(E) in eV.
+    /// Gaussian resolution width W_g(E) in eV — the W of `exp(-x²/W_g²)`.
     ///
     /// Combines timing and flight-path contributions in quadrature:
-    ///   σ_E² = (2·Δt/t × E)² + (2·ΔL/L × E)²
+    ///   W_g² = (2·Δt/t × E)² + (2·ΔL/L × E)²
     ///
-    /// where t = TOF_FACTOR × L / √E is the time-of-flight in μs.
+    /// where t = TOF_FACTOR × L / √E is the time-of-flight in μs. Δt and ΔL are
+    /// W-parameters too, so the convention carries through unchanged; the
+    /// standard deviation is `W_g/√2` and the FWHM is [`fwhm`](Self::fwhm).
     #[must_use]
     pub fn gaussian_width(&self, energy_ev: f64) -> f64 {
         if energy_ev <= 0.0 || self.flight_path_m <= 0.0 {
             return 0.0;
         }
 
-        // Timing contribution: σ_t = 2 × Δt × E^(3/2) / (TOF_FACTOR × L)
+        // Timing contribution: W_t = 2 × Δt × E^(3/2) / (TOF_FACTOR × L)
         let timing =
             2.0 * self.delta_t_us * energy_ev.powf(1.5) / (TOF_FACTOR * self.flight_path_m);
 
-        // Path length contribution: σ_L = 2 × ΔL × E / L
+        // Path length contribution: W_L = 2 × ΔL × E / L
         let path = 2.0 * self.delta_l_m * energy_ev / self.flight_path_m;
 
         (timing * timing + path * path).sqrt()
     }
 
     /// FWHM of the resolution function at energy E, in eV.
+    ///
+    /// `FWHM = 2·√(ln 2)·W`, the conversion for `exp(-x²/W²)`. For the standard
+    /// deviation instead, use `gaussian_width(E)/√2`.
     #[must_use]
     pub fn fwhm(&self, energy_ev: f64) -> f64 {
-        2.0 * (2.0_f64.ln()).sqrt() * self.gaussian_width(energy_ev)
+        FWHM_PER_W * self.gaussian_width(energy_ev)
     }
 }
 
@@ -5532,5 +5625,163 @@ Resolution file
             .expect("triangle integrates");
         assert!((halves[0] - 0.125).abs() < 1e-15);
         assert!((halves[1] - 0.375).abs() < 1e-15);
+    }
+}
+
+#[cfg(test)]
+mod width_convention_tests {
+    use super::*;
+
+    /// The kernel's second moment, measured numerically rather than taken from
+    /// the width parameter the kernel was built from.
+    ///
+    /// Broadens a unit impulse and reads the standard deviation back off the
+    /// result. Nothing here uses `gaussian_width`, so it cannot agree with the
+    /// code by construction — that is the point.
+    fn measured_sigma_ev(params: &ResolutionParams, center_ev: f64, half_span_ev: f64) -> f64 {
+        const N: usize = 40_001;
+        let step = 2.0 * half_span_ev / (N - 1) as f64;
+        let energies: Vec<f64> = (0..N)
+            .map(|i| center_ev - half_span_ev + i as f64 * step)
+            .collect();
+        // A unit impulse at the centre bin: broadening it returns the kernel.
+        let mut impulse = vec![0.0; N];
+        impulse[(N - 1) / 2] = 1.0 / step;
+
+        let kernel = resolution_broaden(&energies, &impulse, params).expect("broadening runs");
+
+        let mass: f64 = kernel.iter().sum::<f64>() * step;
+        assert!(
+            (mass - 1.0).abs() < 1.0e-3,
+            "kernel is not normalised on this span: mass {mass}"
+        );
+        let mean: f64 = kernel
+            .iter()
+            .zip(&energies)
+            .map(|(k, e)| k * e * step)
+            .sum::<f64>()
+            / mass;
+        let variance: f64 = kernel
+            .iter()
+            .zip(&energies)
+            .map(|(k, e)| k * (e - mean) * (e - mean) * step)
+            .sum::<f64>()
+            / mass;
+        variance.sqrt()
+    }
+
+    /// `gaussian_width` returns W, and W/√2 is the standard deviation.
+    ///
+    /// This is the assertion that fixes the convention. If the width were a
+    /// standard deviation instead, the measured σ would come back a factor √2
+    /// larger than W/√2 and this fails by 41 %.
+    #[test]
+    fn gaussian_width_is_a_w_parameter_not_a_standard_deviation() {
+        let center = 10.0;
+        let params = ResolutionParams::new(25.0, 1.0, 0.0, 0.0).expect("valid params");
+        let w = params.gaussian_width(center);
+        assert!(w > 0.0, "test is vacuous without a width");
+
+        let measured = measured_sigma_ev(&params, center, 12.0 * w);
+        let expected = w / SQRT_2;
+        assert!(
+            (measured - expected).abs() / expected < 2.0e-3,
+            "measured σ {measured:.9} but W/√2 is {expected:.9} (W = {w:.9})"
+        );
+        // And it is NOT the standard deviation itself, by a clear margin.
+        assert!(
+            (measured - w).abs() / w > 0.25,
+            "measured σ {measured:.9} is indistinguishable from W {w:.9}"
+        );
+    }
+
+    /// `fwhm()` is the full width at half maximum of the kernel it describes.
+    #[test]
+    fn fwhm_matches_the_kernel_measured_half_maximum() {
+        let center = 10.0;
+        let params = ResolutionParams::new(25.0, 1.0, 0.0, 0.0).expect("valid params");
+        let w = params.gaussian_width(center);
+        let measured_sigma = measured_sigma_ev(&params, center, 12.0 * w);
+        // FWHM of a Gaussian in terms of its own standard deviation.
+        let fwhm_from_measured = 2.0 * (2.0 * 2.0_f64.ln()).sqrt() * measured_sigma;
+        let reported = params.fwhm(center);
+        assert!(
+            (reported - fwhm_from_measured).abs() / fwhm_from_measured < 2.0e-3,
+            "fwhm() reports {reported:.9} but the kernel measures {fwhm_from_measured:.9}"
+        );
+    }
+
+    /// `FWHM_PER_W` is exactly what the previous open-coded expression produced.
+    #[test]
+    fn fwhm_per_w_constant_is_bit_exact() {
+        assert_eq!(
+            FWHM_PER_W.to_bits(),
+            (2.0 * (2.0_f64.ln()).sqrt()).to_bits(),
+            "the named constant changed the value it replaced"
+        );
+    }
+
+    /// `from_sigma` accepts a standard deviation and produces that σ.
+    #[test]
+    fn from_sigma_takes_a_standard_deviation() {
+        let sigma_t_us = 1.0;
+        let from_sigma = ResolutionParams::from_sigma(25.0, sigma_t_us, 0.0, 0.0).expect("valid");
+        let direct = ResolutionParams::new(25.0, sigma_t_us, 0.0, 0.0).expect("valid");
+
+        // The converted parameters are √2 wider than the raw ones.
+        assert!(
+            (from_sigma.delta_t_us() - sigma_t_us * SQRT_2).abs() < 1.0e-15,
+            "from_sigma did not apply W = σ·√2"
+        );
+
+        // And the kernel it builds has the σ the caller asked for, in energy:
+        // σ_E = 2·σ_t·E^{3/2}/(TOF_FACTOR·L), the ordinary propagation.
+        let center = 10.0_f64;
+        let expected_sigma_e =
+            2.0 * sigma_t_us * center.powf(1.5) / (TOF_FACTOR * from_sigma.flight_path_m());
+        let measured = measured_sigma_ev(
+            &from_sigma,
+            center,
+            12.0 * from_sigma.gaussian_width(center),
+        );
+        assert!(
+            (measured - expected_sigma_e).abs() / expected_sigma_e < 2.0e-3,
+            "from_sigma kernel measures σ {measured:.9}, asked for {expected_sigma_e:.9}"
+        );
+        // The direct constructor, given the same number, is √2 narrower —
+        // which is exactly the error the documentation used to invite.
+        let measured_direct =
+            measured_sigma_ev(&direct, center, 12.0 * direct.gaussian_width(center));
+        assert!(
+            (measured_direct * SQRT_2 - measured).abs() / measured < 5.0e-3,
+            "the two constructors do not differ by √2"
+        );
+    }
+
+    /// `from_fwhm` accepts a full width at half maximum.
+    #[test]
+    fn from_fwhm_takes_a_full_width_at_half_maximum() {
+        let fwhm_t_us = 1.0;
+        let params = ResolutionParams::from_fwhm(25.0, fwhm_t_us, 0.0, 0.0).expect("valid");
+        assert!(
+            (params.delta_t_us() - fwhm_t_us / FWHM_PER_W).abs() < 1.0e-15,
+            "from_fwhm did not apply W = FWHM/(2√ln2)"
+        );
+    }
+
+    /// `from_fwhm` is the conversion SAMMY's `Deltag` needs.
+    ///
+    /// `nereids_endf::sammy::sammy_to_nereids_resolution` divides Deltag by
+    /// 2√(ln 2) to reach this module's convention; the two must agree, because
+    /// the samtry baselines depend on that mapping being the right one.
+    #[test]
+    fn from_fwhm_agrees_with_the_sammy_deltag_conversion() {
+        let delta_g = 0.022_f64; // tr007's BROADENING card value.
+        let via_constructor = ResolutionParams::from_fwhm(25.0, delta_g, 0.0, 0.0).expect("valid");
+        let sammy_mapping = delta_g / (2.0 * 2.0_f64.ln().sqrt());
+        assert!(
+            (via_constructor.delta_t_us() - sammy_mapping).abs() < 1.0e-15,
+            "from_fwhm disagrees with the SAMMY Deltag conversion"
+        );
     }
 }

@@ -975,7 +975,21 @@ def resolution_broaden(
     delta_l_m: float,
     delta_e_us: float = 0.0,
 ) -> NDArray[np.float64]:
-    """Apply resolution broadening (Gaussian, or Gaussian+exponential tail) to a cross-section or spectrum array."""
+    """Apply resolution broadening (Gaussian, or Gaussian+exponential tail) to a cross-section or spectrum array.
+
+    ``delta_t_us`` and ``delta_l_m`` are W-parameters, the width in
+    ``exp(-x^2/W^2)``: ``sigma = W/sqrt(2)`` and ``FWHM = 1.6651*W``. Convert a
+    measured width with :func:`width_from_sigma` or :func:`width_from_fwhm`
+    rather than passing it unconverted.
+    """
+    ...
+
+def width_from_sigma(sigma: float) -> float:
+    """Convert a standard deviation to the W-parameter this API expects (``W = sigma*sqrt(2)``)."""
+    ...
+
+def width_from_fwhm(fwhm: float) -> float:
+    """Convert a full width at half maximum to the W-parameter this API expects (``W = FWHM/(2*sqrt(ln 2))``)."""
     ...
 
 def load_resolution(
