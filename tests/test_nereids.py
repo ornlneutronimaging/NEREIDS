@@ -4980,8 +4980,24 @@ class TestCalibrateResolution:
     SAMMY energy-scale ``(t0, L_scale)`` is an explicit, prior-constrained opt-in
     (replacing the retired per-family ``position_nuisance_us``)."""
 
+    # Samples across the narrowest observed dip. The calibrant's 15 eV
+    # resonance has a measured FWHM of 0.67 eV once Doppler and the IC kernel
+    # are applied, so 5 samples per FWHM fixes the grid at ~415 points over
+    # 5-60 eV. The former 1000 points was 12 per FWHM — 2.4x more than a fit
+    # needs, paid on every objective evaluation of every restart.
+    SAMPLES_PER_FWHM = 5
+    OBSERVED_FWHM_EV = 0.67
+
+    # Contract tests assert parameter counts, decoded fields and box membership,
+    # not fit quality, so they run on a deliberately coarse grid and a coarse IC
+    # synthesis. `_assert_calibrant_is_not_flat` keeps "coarse" from becoming
+    # "featureless" — a fixture with no dip would satisfy those assertions while
+    # fitting nothing.
+    CONTRACT_POINTS = 120
+    CONTRACT_IC_GRID = {"ic_n_energies": 32, "ic_n_tau": 128}
+
     @staticmethod
-    def _calibrant():
+    def _calibrant(n_points=None):
         # Synthetic IC-broadened, non-black calibrant with TWO well-separated
         # resonances (15 + 45 eV) so the width is identifiable (no width<->position
         # ridge) — mirrors the Rust erosion test, so a chi2 change is attributable to
@@ -4995,7 +5011,16 @@ class TestCalibrateResolution:
             target_spin=3.5,
         )
         flight = 25.0
-        energies = np.linspace(5.0, 60.0, 1000)
+        if n_points is None:
+            span_ev = 60.0 - 5.0
+            n_points = int(
+                math.ceil(
+                    span_ev
+                    * TestCalibrateResolution.SAMPLES_PER_FWHM
+                    / TestCalibrateResolution.OBSERVED_FWHM_EV
+                )
+            )
+        energies = np.linspace(5.0, 60.0, n_points)
         ic = nereids.IkedaCarpenter(
             flight_path_m=flight,
             e_min_ev=0.5e-3,
@@ -5015,10 +5040,41 @@ class TestCalibrateResolution:
         unc = np.full_like(t, 0.004)
         return iso, energies, t, unc
 
+    @staticmethod
+    def _assert_calibrant_is_not_flat(transmission):
+        """A coarse grid must still contain the feature being fitted.
+
+        Every contract test below would pass on a featureless spectrum — they
+        assert parameter counts and box membership, which a fit to a flat line
+        still satisfies. This is the guard that makes "coarse" honest.
+        """
+        depth = float(1.0 - np.min(transmission))
+        assert depth > 0.5, (
+            f"calibrant grid is too coarse to see the resonance: dip depth {depth:.3f}"
+        )
+
+    @classmethod
+    def _contract_calibrant(cls):
+        """Coarse calibrant for the binding-contract tests.
+
+        These assert what the API returns — parameter counts, decoded fields,
+        box membership, guard rails — not how well the fit describes the data,
+        so they do not need the sampling the numerical tests do.
+        """
+        iso, e, t, unc = cls._calibrant(n_points=cls.CONTRACT_POINTS)
+        cls._assert_calibrant_is_not_flat(t)
+        return iso, e, t, unc
+
     def test_pins_position_by_default(self):
-        iso, e, t, unc = self._calibrant()
+        iso, e, t, unc = self._contract_calibrant()
         cal = nereids.calibrate_resolution(
-            e, t, unc, "ic", isotopes=[(iso, 5.0e-4)], temperature_k=300.0
+            e,
+            t,
+            unc,
+            "ic",
+            isotopes=[(iso, 5.0e-4)],
+            temperature_k=300.0,
+            **self.CONTRACT_IC_GRID,
         )
         assert np.isfinite(cal.chi2)
         # Default config pins position at its center and incurs no prior penalty.
@@ -5027,7 +5083,9 @@ class TestCalibrateResolution:
         assert cal.prior_penalty == 0.0
 
     def test_fit_position_kwargs_accepted_with_prior(self):
-        iso, e, t, unc = self._calibrant()
+        # One restart: this asserts that the kwargs are accepted and that the
+        # guard rails hold, not that a second restart finds a better optimum.
+        iso, e, t, unc = self._contract_calibrant()
         cal = nereids.calibrate_resolution(
             e,
             t,
@@ -5039,7 +5097,8 @@ class TestCalibrateResolution:
             fit_l_scale=True,
             t0_prior_us=0.5,
             l_scale_prior=0.002,
-            restarts=2,
+            restarts=1,
+            **self.CONTRACT_IC_GRID,
         )
         assert np.isfinite(cal.chi2)
         assert np.isfinite(cal.position_t0_us)
@@ -5121,9 +5180,15 @@ class TestCalibrateResolution:
         # The bounded "ic" family (#642) exposes decoded physical parameters
         # (single source of truth: the calibrated resolution, not the
         # ln/box-encoded theta) plus the degeneracy report.
-        iso, e, t, unc = self._calibrant()
+        iso, e, t, unc = self._contract_calibrant()
         cal = nereids.calibrate_resolution(
-            e, t, unc, "ic", isotopes=[(iso, 5.0e-4)], temperature_k=300.0
+            e,
+            t,
+            unc,
+            "ic",
+            isotopes=[(iso, 5.0e-4)],
+            temperature_k=300.0,
+            **self.CONTRACT_IC_GRID,
         )
         p = cal.params()
         for key in ("a0", "a1", "beta", "r", "psr_fwhm_us"):
@@ -5140,7 +5205,7 @@ class TestCalibrateResolution:
         assert "n_free_params=4" in repr(cal)
 
     def test_fit_psr_appends_fifth_parameter(self):
-        iso, e, t, unc = self._calibrant()
+        iso, e, t, unc = self._contract_calibrant()
         cal = nereids.calibrate_resolution(
             e,
             t,
@@ -5149,6 +5214,7 @@ class TestCalibrateResolution:
             isotopes=[(iso, 5.0e-4)],
             temperature_k=300.0,
             fit_psr=True,
+            **self.CONTRACT_IC_GRID,
         )
         assert cal.n_free_params == 5
         assert len(cal.theta) == 5
