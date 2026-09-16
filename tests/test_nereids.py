@@ -3360,12 +3360,19 @@ class TestVenusMlbwRegression:
         # shifts -0.07 % and the iteration count halves (14 -> 7) because
         # analytic steps satisfy the relative-chi2 tolerance sooner.
         #
+        # Baseline regenerated after the sampled Doppler table was replaced by
+        # the exact free-gas integral on every transmission path. Hf-177 is
+        # MLBW and was previously broadened by the sampled table, so this
+        # whole fit changed kernel: density +0.134 %, chi2_r -3.6e-6 rel --
+        # the exact kernel describes the measured data marginally better --
+        # with iteration count unchanged at 7.
+        #
         # These pinned values are machine-generated regression anchors
         # (produced by the code under test); the correctness burden is
         # carried by the SAMMY-oracle suites (samtry, ex001) and the
         # analytic kernel pins in doppler.rs.
-        EXPECTED_DENSITY = 8.10458528518008e-05
-        EXPECTED_CHI2_R = 219657.2439575215
+        EXPECTED_DENSITY = 8.115412297872146e-05
+        EXPECTED_CHI2_R = 219656.45748585448
         EXPECTED_ITERATIONS = 7
 
         FLOAT_TOL = pytest.approx
@@ -3435,8 +3442,12 @@ class TestVenusMlbwRegression:
             c=c,
         )
 
-        EXPECTED_DENSITY = 2.7591191549411417e-05
-        EXPECTED_DEVIANCE_PER_DOF = 31471.485549664278
+        # Re-anchored with the LM gate above, and for the same reason: the
+        # exact free-gas integral replaced the sampled Doppler table on every
+        # transmission path. Density +0.751 %, D/dof -1.2e-4 rel -- the
+        # deviance moves the same direction as the LM chi2_r.
+        EXPECTED_DENSITY = 2.7798378697877555e-05
+        EXPECTED_DEVIANCE_PER_DOF = 31467.626059159993
 
         assert bool(result.converged) is True, (
             f"counts-KL fit did not converge on the real VENUS fixture "

@@ -99,6 +99,23 @@ pub struct JointPoissonObjective<'a> {
     /// Length must equal `o.len()`; the GUI / pipeline dispatch builds
     /// it from the configured `[E_min, E_max]` against the energy grid.
     pub active_mask: Option<&'a [bool]>,
+    /// Expected background counts in the OPEN-beam acquisition, per bin.
+    ///
+    /// `None` is the background-free case and keeps the binomial reduction
+    /// documented above. `Some` switches to the Poisson form, because with
+    /// a background in either arm the flux no longer cancels out of the
+    /// conditional likelihood.
+    ///
+    /// These are counts for the acquisition they belong to, already binned —
+    /// a measured dark or blocked-beam reference after its own run
+    /// normalization, not a transmission-level curve.
+    pub open_background: Option<&'a [f64]>,
+    /// Expected background counts in the SAMPLE acquisition, per bin.
+    ///
+    /// Distinct from [`Self::open_background`]: the sample scatters neutrons
+    /// and emits gammas, so equal backgrounds is not a physical case. Their
+    /// difference is exactly what the two arms can separate.
+    pub sample_background: Option<&'a [f64]>,
 }
 
 impl<'a> JointPoissonObjective<'a> {
@@ -211,6 +228,21 @@ impl<'a> JointPoissonObjective<'a> {
         // (`NaN <= 0.0` is `false`) or silently swallow a negative as zero.
         validate_counts(self.o, "open_beam_counts")?;
         validate_counts(self.s, "sample_counts")?;
+        for (name, background) in [
+            ("open_background", self.open_background),
+            ("sample_background", self.sample_background),
+        ] {
+            if let Some(b) = background {
+                if b.len() != self.o.len() {
+                    return Err(FittingError::LengthMismatch {
+                        expected: self.o.len(),
+                        actual: b.len(),
+                        field: name,
+                    });
+                }
+                validate_counts(b, name)?;
+            }
+        }
         Ok(())
     }
 
@@ -227,6 +259,96 @@ impl<'a> JointPoissonObjective<'a> {
         }
     }
 
+    /// Background counts for one bin, `(open, sample)`. Zero when absent.
+    #[inline]
+    fn backgrounds(&self, i: usize) -> (f64, f64) {
+        (
+            self.open_background.map_or(0.0, |b| b[i]),
+            self.sample_background.map_or(0.0, |b| b[i]),
+        )
+    }
+
+    /// Whether either arm carries a background, which decides whether the
+    /// binomial reduction applies.
+    #[inline]
+    fn has_background(&self) -> bool {
+        self.open_background.is_some() || self.sample_background.is_some()
+    }
+
+    /// Profile MLE for the per-bin flux WITH backgrounds present.
+    ///
+    /// With `E[O] = λ/c + b_o` and `E[S] = λ·T + b_s`, the score equation
+    ///
+    /// ```text
+    /// -1/c + O/(λ + c·b_o) - T + S·T/(λ·T + b_s) = 0
+    /// ```
+    ///
+    /// clears to a quadratic `a λ² + b λ + d = 0` with
+    ///
+    /// ```text
+    /// a = T·(1/c + T)
+    /// b = (1/c + T)·(b_s + c·b_o·T) - T·(O + S)
+    /// d = c·b_o·b_s·(1/c + T) - O·b_s - S·T·c·b_o
+    /// ```
+    ///
+    /// `a > 0` and `d <= 0` whenever the counts are non-negative, so there is
+    /// exactly one non-negative root and it is the `+` branch. Setting
+    /// `b_o = b_s = 0` gives `d = 0` and `λ̂ = -b/a = c(O+S)/(1+cT)`, the
+    /// background-free closed form — which is the check that this reduces
+    /// correctly, and is asserted by
+    /// `zero_backgrounds_reproduce_the_binomial_profile`.
+    ///
+    /// Solved with the numerically stable quadratic form: the `+` branch of
+    /// `(-b + sqrt(disc))/(2a)` cancels catastrophically when `b > 0`, so it
+    /// is evaluated as `-2d/(b + sqrt(disc))` there.
+    #[inline]
+    pub fn profile_lambda_with_background(
+        &self,
+        t_i: f64,
+        o_i: f64,
+        s_i: f64,
+        b_o: f64,
+        b_s: f64,
+    ) -> f64 {
+        let t = t_i.max(POISSON_EPSILON);
+        let inv_c = 1.0 / self.c;
+        let a = t * (inv_c + t);
+        if a <= POISSON_EPSILON {
+            return 0.0;
+        }
+        let b = (inv_c + t) * (b_s + self.c * b_o * t) - t * (o_i + s_i);
+        let d = self.c * b_o * b_s * (inv_c + t) - o_i * b_s - s_i * t * self.c * b_o;
+        let disc = (b * b - 4.0 * a * d).max(0.0);
+        let root = disc.sqrt();
+        let lambda = if b > 0.0 {
+            // -b + root cancels; use the algebraically equal form.
+            -2.0 * d / (b + root)
+        } else {
+            (-b + root) / (2.0 * a)
+        };
+        lambda.max(0.0)
+    }
+
+    /// Poisson deviance for one bin with backgrounds present.
+    ///
+    /// The binomial reduction needs the flux to cancel between the arms,
+    /// which it does not once either arm has a term the flux does not
+    /// multiply. So the deviance is the ordinary two-arm Poisson one against
+    /// the saturated model:
+    ///
+    /// ```text
+    /// D_i = 2·[ O·ln(O/μ_O) - (O - μ_O) + S·ln(S/μ_S) - (S - μ_S) ]
+    /// μ_O = λ̂/c + b_o     μ_S = λ̂·T + b_s
+    /// ```
+    #[inline]
+    fn poisson_deviance_term(&self, t_i: f64, o_i: f64, s_i: f64, b_o: f64, b_s: f64) -> f64 {
+        let t = t_i.max(POISSON_EPSILON);
+        let lambda = self.profile_lambda_with_background(t, o_i, s_i, b_o, b_s);
+        let mu_o = (lambda / self.c + b_o).max(POISSON_EPSILON);
+        let mu_s = (lambda * t + b_s).max(POISSON_EPSILON);
+        2.0 * (xlogy_ratio(o_i, mu_o) - (o_i - mu_o) + xlogy_ratio(s_i, mu_s) - (s_i - mu_s))
+    }
+
     /// Vector form of [`profile_lambda`](Self::profile_lambda).
     ///
     /// Validates `t.len() == o.len() == s.len()` and `c > 0`; returns
@@ -238,7 +360,15 @@ impl<'a> JointPoissonObjective<'a> {
         Ok(t.iter()
             .zip(self.o.iter())
             .zip(self.s.iter())
-            .map(|((&ti, &oi), &si)| self.profile_lambda(ti, oi, si))
+            .enumerate()
+            .map(|(i, ((&ti, &oi), &si))| {
+                if self.has_background() {
+                    let (b_o, b_s) = self.backgrounds(i);
+                    self.profile_lambda_with_background(ti, oi, si, b_o, b_s)
+                } else {
+                    self.profile_lambda(ti, oi, si)
+                }
+            })
             .collect())
     }
 
@@ -268,7 +398,12 @@ impl<'a> JointPoissonObjective<'a> {
             if !self.bin_active(i) {
                 continue;
             }
-            d += binomial_deviance_term(s_i, o_i, t_i, self.c);
+            d += if self.has_background() {
+                let (b_o, b_s) = self.backgrounds(i);
+                self.poisson_deviance_term(t_i, o_i, s_i, b_o, b_s)
+            } else {
+                binomial_deviance_term(s_i, o_i, t_i, self.c)
+            };
             weight_scale += o_i + s_i;
         }
         // Each conditional-binomial term is nonnegative by Gibbs' inequality,
@@ -331,6 +466,18 @@ impl<'a> JointPoissonObjective<'a> {
         params: &[f64],
         free_param_indices: &[usize],
     ) -> Result<Option<Vec<f64>>, FittingError> {
+        // The analytic gradient and Fisher below are derived from the
+        // BINOMIAL reduction, which needs the flux to cancel between the
+        // arms. A background in either arm breaks that, so the closed forms
+        // no longer describe this objective. Declining here sends the solver
+        // to its finite-difference fallback, which differentiates the
+        // deviance actually in use.
+        //
+        // Deriving the background-bearing analytic forms is a speed change,
+        // not a correctness one, and is deliberately not attempted here.
+        if self.has_background() {
+            return Ok(None);
+        }
         let t = self.model.evaluate(params)?;
         self.validate_inputs(t.len())?;
         let jac = match self
@@ -387,6 +534,18 @@ impl<'a> JointPoissonObjective<'a> {
         params: &[f64],
         free_param_indices: &[usize],
     ) -> Result<Option<FlatMatrix>, FittingError> {
+        // The analytic gradient and Fisher below are derived from the
+        // BINOMIAL reduction, which needs the flux to cancel between the
+        // arms. A background in either arm breaks that, so the closed forms
+        // no longer describe this objective. Declining here sends the solver
+        // to its finite-difference fallback, which differentiates the
+        // deviance actually in use.
+        //
+        // Deriving the background-bearing analytic forms is a speed change,
+        // not a correctness one, and is deliberately not attempted here.
+        if self.has_background() {
+            return Ok(None);
+        }
         let t = self.model.evaluate(params)?;
         self.validate_inputs(t.len())?;
         let jac = match self
@@ -1403,6 +1562,147 @@ mod tests {
     use crate::parameters::FitParameter;
 
     // ------------------------------------------------------------------
+    // Backgrounds
+    // ------------------------------------------------------------------
+
+    fn objective_with<'a>(
+        model: &'a dyn FitModel,
+        o: &'a [f64],
+        s: &'a [f64],
+        b_o: Option<&'a [f64]>,
+        b_s: Option<&'a [f64]>,
+    ) -> JointPoissonObjective<'a> {
+        JointPoissonObjective {
+            model,
+            o,
+            s,
+            c: 1.0,
+            active_mask: None,
+            open_background: b_o,
+            sample_background: b_s,
+        }
+    }
+
+    /// Zero backgrounds must reproduce the binomial profile exactly.
+    ///
+    /// This is the check that the quadratic derivation is right: setting
+    /// `b_o = b_s = 0` kills its constant term, and the remaining root is
+    /// the documented `λ̂ = c(O+S)/(1+cT)`.
+    #[test]
+    fn zero_backgrounds_reproduce_the_binomial_profile() {
+        let model = ConstModel { n_e: 1 };
+        let o = [500.0];
+        let s = [180.0];
+        let zeros = [0.0];
+        let plain = objective_with(&model, &o, &s, None, None);
+        let zeroed = objective_with(&model, &o, &s, Some(&zeros), Some(&zeros));
+
+        for &t in &[0.05_f64, 0.2, 0.5, 0.9, 1.0] {
+            let closed = plain.profile_lambda(t, o[0], s[0]);
+            let quadratic = zeroed.profile_lambda_with_background(t, o[0], s[0], 0.0, 0.0);
+            let rel = (closed - quadratic).abs() / closed.abs().max(1e-30);
+            assert!(
+                rel < 1e-12,
+                "T={t}: binomial profile {closed} vs quadratic {quadratic} (rel {rel:e})"
+            );
+        }
+    }
+
+    /// The profile solves the score equation it was derived from.
+    ///
+    /// Independent of the algebra above: differentiate the two-arm Poisson
+    /// log-likelihood numerically at the returned lambda and confirm it is
+    /// stationary. A sign slip or a dropped term in the quadratic would move
+    /// the root without this noticing otherwise.
+    #[test]
+    fn the_profile_is_stationary_for_the_two_arm_likelihood() {
+        let model = ConstModel { n_e: 1 };
+        let o = [500.0];
+        let s = [180.0];
+        let b_o = [12.0];
+        let b_s = [37.0];
+        let obj = objective_with(&model, &o, &s, Some(&b_o), Some(&b_s));
+
+        for &t in &[0.05_f64, 0.2, 0.5, 0.9] {
+            let lambda = obj.profile_lambda_with_background(t, o[0], s[0], b_o[0], b_s[0]);
+            assert!(lambda > 0.0, "T={t}: profile returned {lambda}");
+            let log_likelihood = |l: f64| {
+                let mu_o = l / obj.c + b_o[0];
+                let mu_s = l * t + b_s[0];
+                -mu_o + o[0] * mu_o.ln() - mu_s + s[0] * mu_s.ln()
+            };
+            let h = lambda * 1e-6;
+            let slope = (log_likelihood(lambda + h) - log_likelihood(lambda - h)) / (2.0 * h);
+            // Scale the stationarity test by the curvature, so it means "the
+            // root is in the right place" rather than "the slope is small".
+            let curvature = (log_likelihood(lambda + h) - 2.0 * log_likelihood(lambda)
+                + log_likelihood(lambda - h))
+                / (h * h);
+            let offset = (slope / curvature).abs() / lambda;
+            assert!(
+                offset < 1e-6,
+                "T={t}: stationary point is {offset:e} of lambda away from the returned root"
+            );
+        }
+    }
+
+    /// A background in the sample arm alone changes the deviance, and the
+    /// two arms are not interchangeable.
+    #[test]
+    fn the_two_arms_carry_their_backgrounds_separately() {
+        let model = ConstModel { n_e: 1 };
+        let o = [500.0];
+        let s = [180.0];
+        let none = [0.0];
+        let some = [40.0];
+        let t = [0.35_f64];
+
+        let plain = objective_with(&model, &o, &s, None, None)
+            .deviance_from_transmission(&t)
+            .unwrap();
+        let sample_only = objective_with(&model, &o, &s, Some(&none), Some(&some))
+            .deviance_from_transmission(&t)
+            .unwrap();
+        let open_only = objective_with(&model, &o, &s, Some(&some), Some(&none))
+            .deviance_from_transmission(&t)
+            .unwrap();
+
+        assert!(
+            (sample_only - plain).abs() > 1e-6,
+            "a sample-arm background left the deviance unchanged"
+        );
+        assert!(
+            (sample_only - open_only).abs() > 1e-6,
+            "putting the background in either arm gave the same deviance, so \
+             the arms are not being distinguished"
+        );
+    }
+
+    /// Zero backgrounds must also reproduce the binomial DEVIANCE, not only
+    /// the profile — the Poisson and binomial forms differ by terms that
+    /// cancel only when the flux cancels.
+    #[test]
+    fn zero_backgrounds_reproduce_the_binomial_deviance() {
+        let model = ConstModel { n_e: 3 };
+        let o = [500.0, 420.0, 610.0];
+        let s = [180.0, 205.0, 150.0];
+        let zeros = [0.0, 0.0, 0.0];
+        let t = [0.35_f64, 0.40, 0.25];
+
+        let binomial = objective_with(&model, &o, &s, None, None)
+            .deviance_from_transmission(&t)
+            .unwrap();
+        let poisson = objective_with(&model, &o, &s, Some(&zeros), Some(&zeros))
+            .deviance_from_transmission(&t)
+            .unwrap();
+        let rel = (binomial - poisson).abs() / binomial.abs().max(1e-30);
+        assert!(
+            rel < 1e-10,
+            "binomial deviance {binomial} vs Poisson deviance {poisson} (rel {rel:e})"
+        );
+    }
+
+    // ------------------------------------------------------------------
     // Test fixtures
     // ------------------------------------------------------------------
 
@@ -1497,6 +1797,8 @@ mod tests {
                 s: &[s],
                 c,
                 active_mask: None,
+                open_background: None,
+                sample_background: None,
             };
             let closed = obj.profile_lambda(t, o, s);
 
@@ -1545,6 +1847,8 @@ mod tests {
             s: &s,
             c,
             active_mask: None,
+            open_background: None,
+            sample_background: None,
         };
         let d = obj.deviance_from_transmission(&t).unwrap();
         assert!(d.abs() < 1e-8, "D should be ≈ 0 at exact match, got {d}");
@@ -1579,6 +1883,8 @@ mod tests {
             s: &s,
             c,
             active_mask: None,
+            open_background: None,
+            sample_background: None,
         };
 
         // Evaluate gradient at a point slightly off truth so it is nonzero.
@@ -1642,6 +1948,8 @@ mod tests {
                 s: &s,
                 c,
                 active_mask: None,
+                open_background: None,
+                sample_background: None,
             };
 
             // 1D grid search over T, then local refinement via Brent-like
@@ -1721,6 +2029,8 @@ mod tests {
             s: &[0.0, 5.0, 2.0],
             c: 1.5,
             active_mask: None,
+            open_background: None,
+            sample_background: None,
         };
         let d_full = obj.deviance_from_transmission(&[0.6, 0.6, 0.6]).unwrap();
         // Drop the zero-N bin — result must be identical.
@@ -1730,6 +2040,8 @@ mod tests {
             s: &[5.0, 2.0],
             c: 1.5,
             active_mask: None,
+            open_background: None,
+            sample_background: None,
         };
         let d_reduced = obj_reduced.deviance_from_transmission(&[0.6, 0.6]).unwrap();
         assert!((d_full - d_reduced).abs() < 1e-12);
@@ -1754,6 +2066,8 @@ mod tests {
             s: &s,
             c,
             active_mask: None,
+            open_background: None,
+            sample_background: None,
         };
         let mut ps = ParameterSet::new(vec![
             FitParameter::non_negative("theta_0", 0.85),
@@ -1789,6 +2103,8 @@ mod tests {
             s: &s,
             c,
             active_mask: None,
+            open_background: None,
+            sample_background: None,
         };
         let info = obj
             .fisher_information(&theta, &[0, 1])
@@ -1950,6 +2266,8 @@ mod tests {
             s: &s,
             c,
             active_mask: None,
+            open_background: None,
+            sample_background: None,
         };
         let mut params = ParameterSet::new(vec![FitParameter::non_negative("n", 0.1)]);
         let cfg = JointPoissonFitConfig {
@@ -2008,6 +2326,8 @@ mod tests {
                 s,
                 c,
                 active_mask: None,
+                open_background: None,
+                sample_background: None,
             };
             let mut params = ParameterSet::new(vec![FitParameter::non_negative("t", 0.5)]);
             joint_poisson_fit(&obj, &mut params, &JointPoissonFitConfig::default()).unwrap()
@@ -2086,6 +2406,8 @@ mod tests {
             s: &zeros,
             c: 1.0,
             active_mask: None,
+            open_background: None,
+            sample_background: None,
         };
         let seed = 0.42_f64;
         let mut params = ParameterSet::new(vec![FitParameter::non_negative("t", seed)]);
@@ -2118,6 +2440,8 @@ mod tests {
             s: &[5.0, 5.0, 5.0],
             c: 1.0,
             active_mask: Some(&short_mask),
+            open_background: None,
+            sample_background: None,
         };
         // Bin 0 is in-mask and occupied; bins 1-2 fall past the mask end.
         assert_eq!(obj.n_informative(), 1);
@@ -2177,6 +2501,8 @@ mod tests {
             s: &s,
             c,
             active_mask: None,
+            open_background: None,
+            sample_background: None,
         };
 
         // x0 analogous to the stall-prone backgrounded regime: n near truth, A_n = 1, all
@@ -2276,6 +2602,8 @@ mod tests {
             s: &s,
             c,
             active_mask: None,
+            open_background: None,
+            sample_background: None,
         };
         let mut params = ParameterSet::new(vec![FitParameter::non_negative("n", 0.1)]);
         let cfg = JointPoissonFitConfig {
@@ -2326,6 +2654,8 @@ mod tests {
             s: &s,
             c,
             active_mask: None,
+            open_background: None,
+            sample_background: None,
         };
         let mut params = ParameterSet::new(vec![FitParameter::non_negative("T", t_true)]);
         let cfg = JointPoissonFitConfig {
@@ -2375,6 +2705,8 @@ mod tests {
             s: &s_full,
             c,
             active_mask: Some(&mask),
+            open_background: None,
+            sample_background: None,
         };
         let d_masked = obj_full.deviance_from_transmission(&t_full).unwrap();
 
@@ -2389,6 +2721,8 @@ mod tests {
             s: &s_sub,
             c,
             active_mask: None,
+            open_background: None,
+            sample_background: None,
         };
         let d_subset = obj_sub.deviance_from_transmission(&t_sub).unwrap();
 
@@ -2423,6 +2757,8 @@ mod tests {
             s: &s_full,
             c,
             active_mask: Some(&mask),
+            open_background: None,
+            sample_background: None,
         };
 
         let params_full = ParameterSet::new(vec![
@@ -2447,6 +2783,8 @@ mod tests {
             s: &s_sub,
             c,
             active_mask: None,
+            open_background: None,
+            sample_background: None,
         };
         let grad_sub = obj_sub
             .deviance_gradient_analytical(&theta_eval, &free_idx)
@@ -2481,6 +2819,8 @@ mod tests {
             s: &s,
             c: 1.0,
             active_mask: Some(&mask),
+            open_background: None,
+            sample_background: None,
         };
         let mut params = ParameterSet::new(vec![FitParameter::non_negative("T", 0.5)]);
         let cfg = JointPoissonFitConfig::default();
@@ -2528,6 +2868,8 @@ mod tests {
             s: &s,
             c: 1.0,
             active_mask: Some(&mask),
+            open_background: None,
+            sample_background: None,
         };
         let mut params = ParameterSet::new(vec![FitParameter::fixed("T", 0.5)]);
         let r = joint_poisson_fit(&obj, &mut params, &JointPoissonFitConfig::default()).unwrap();
@@ -2557,6 +2899,8 @@ mod tests {
             s: &s,
             c: 1.0,
             active_mask: Some(&mask_wrong),
+            open_background: None,
+            sample_background: None,
         };
         let mut params = ParameterSet::new(vec![FitParameter::non_negative("T", 0.5)]);
         let cfg = JointPoissonFitConfig::default();
@@ -2599,6 +2943,8 @@ mod tests {
             s: &s,
             c: 1.0,
             active_mask: None,
+            open_background: None,
+            sample_background: None,
         };
         let mut params = ParameterSet::new(vec![FitParameter::non_negative("T", 0.5)]);
         let err =
@@ -2633,6 +2979,8 @@ mod tests {
             s: &s,
             c: 0.0,
             active_mask: None,
+            open_background: None,
+            sample_background: None,
         };
         let err = joint_poisson_fit(&obj_zero, &mut params, &JointPoissonFitConfig::default())
             .unwrap_err();
@@ -2649,6 +2997,8 @@ mod tests {
             s: &s,
             c: -1.5,
             active_mask: None,
+            open_background: None,
+            sample_background: None,
         };
         let err = joint_poisson_fit(&obj_neg, &mut params2, &JointPoissonFitConfig::default())
             .unwrap_err();
@@ -2665,6 +3015,8 @@ mod tests {
             s: &s,
             c: f64::NAN,
             active_mask: None,
+            open_background: None,
+            sample_background: None,
         };
         let err = joint_poisson_fit(&obj_nan, &mut params3, &JointPoissonFitConfig::default())
             .unwrap_err();
@@ -2775,6 +3127,8 @@ mod tests {
             s: &s,
             c: 1.0,
             active_mask: None,
+            open_background: None,
+            sample_background: None,
         };
         // Initial point lands in the NaN region.
         let mut params = ParameterSet::new(vec![FitParameter::non_negative("T", 0.05)]);
@@ -2837,6 +3191,8 @@ mod tests {
             s: &s,
             c: 1.0,
             active_mask: None,
+            open_background: None,
+            sample_background: None,
         };
         let mut params = ParameterSet::new(vec![FitParameter::fixed("T", 0.5)]);
         let cfg = JointPoissonFitConfig::default();
@@ -2901,6 +3257,8 @@ mod tests {
             s: &s,
             c: 1.0,
             active_mask: None,
+            open_background: None,
+            sample_background: None,
         };
         let mut params = ParameterSet::new(vec![FitParameter::fixed("T", 0.5)]);
         let cfg = JointPoissonFitConfig {
@@ -2978,6 +3336,8 @@ mod tests {
             s: &s,
             c: 1.0,
             active_mask: None,
+            open_background: None,
+            sample_background: None,
         };
         // At least one FREE parameter so polish actually runs (unlike
         // `test_joint_poisson_all_fixed_nan_transmission_with_polish_does_not_panic`,
@@ -3058,6 +3418,8 @@ mod tests {
             s: &s,
             c: 1.0,
             active_mask: None,
+            open_background: None,
+            sample_background: None,
         };
         let mut params = ParameterSet::new(vec![FitParameter::non_negative("T", 0.6)]);
         let info = obj
@@ -3108,6 +3470,8 @@ mod tests {
             s: &s,
             c: 1.0,
             active_mask: None,
+            open_background: None,
+            sample_background: None,
         };
         let t = vec![0.5; n_bins];
         let err = obj.deviance_from_transmission(&t).unwrap_err();
@@ -3125,6 +3489,8 @@ mod tests {
             s: &s_inf,
             c: 1.0,
             active_mask: None,
+            open_background: None,
+            sample_background: None,
         };
         let err = obj_inf.deviance_from_transmission(&t).unwrap_err();
         assert!(
@@ -3151,6 +3517,8 @@ mod tests {
             s: &s,
             c: 1.0,
             active_mask: None,
+            open_background: None,
+            sample_background: None,
         };
         let t = vec![0.5; n_bins];
         let err = obj.deviance_from_transmission(&t).unwrap_err();
@@ -3176,6 +3544,8 @@ mod tests {
             s: &s,
             c: 1.0,
             active_mask: None,
+            open_background: None,
+            sample_background: None,
         };
         let t = vec![0.5; n_bins];
 
@@ -3226,6 +3596,8 @@ mod tests {
             s: &s,
             c: 1.0,
             active_mask: None,
+            open_background: None,
+            sample_background: None,
         };
         // Caller passes `t` shorter than `o`/`s`.
         let t_short = vec![0.5; n_bins - 2];

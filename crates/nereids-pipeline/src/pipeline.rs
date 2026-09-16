@@ -1669,9 +1669,16 @@ fn fit_transmission_lm(
 /// `reduced_chi_squared` is set to the same value so GUI consumers that
 /// still read the legacy field see a deviance-based metric.
 ///
-/// Current scope: `fit_alpha_1`, `fit_alpha_2`,
-/// and non-zero `detector_background` remain rejected (`λ̂` absorbs the
-/// global flux scale; `B_det` / alpha_2 wiring is not yet implemented).
+/// `detector_background` is expected counts per bin, and it enters BOTH
+/// arms with the same value: it is a detector-space term, present whether or
+/// not the sample is in the beam. A background that DIFFERS between the arms
+/// — the sample's own scatter and gammas — needs a second array this entry
+/// point does not carry, though `JointPoissonObjective` takes the two arms
+/// separately.
+///
+/// Current scope: `fit_alpha_1` and `fit_alpha_2` remain rejected (`λ̂`
+/// absorbs the global flux scale, and fitting the background amplitudes is
+/// not implemented — the background here is declared, not fitted).
 /// `transmission_background` with `A_n` + `B_A` / `B_B` / `B_C` is
 /// supported, subject to the operational rule that `B_A` must
 /// be enabled if any of `B_A` / `B_B` / `B_C` is enabled (benchmarked:
@@ -1696,25 +1703,12 @@ fn fit_counts_joint_poisson(
                 .into(),
         ));
     }
-    // A non-finite background must be named as such rather than falling into
-    // the nonzero test below, which would report it as an unsupported
-    // background value instead of as malformed input.
-    if detector_background.iter().any(|&v| !v.is_finite()) {
+    if detector_background
+        .iter()
+        .any(|&v| !v.is_finite() || v < 0.0)
+    {
         return Err(PipelineError::InvalidParameter(
-            "detector_background contains non-finite values; supply zeros (or omit \
-             the array) — B_det wiring is deferred and nonzero values are rejected."
-                .into(),
-        ));
-    }
-    // Every exact nonzero is rejected, with no magnitude tolerance. Supplying
-    // a background is a model choice, and `B_det` is not wired at all; a small
-    // value is still a request this code cannot honour, so treating it as zero
-    // would silently fit a different model than the caller asked for.
-    if detector_background.iter().any(|&v| v != 0.0) {
-        return Err(PipelineError::InvalidParameter(
-            "joint-Poisson solver with non-zero detector_background is not yet supported \
-             (B_det wiring is deferred)."
-                .into(),
+            "detector_background must be finite and non-negative expected counts".into(),
         ));
     }
 
@@ -1828,11 +1822,10 @@ fn fit_counts_joint_poisson(
     // Build the per-bin active mask (SAMMY EMIN/EMAX-equivalent fit-energy
     // -range restriction).  `None` when no range is configured — the
     // JP objective treats that as "all bins active".
-    let active_mask = nereids_fitting::active_mask::build_active_mask(
+    let mut active_mask = nereids_fitting::active_mask::build_active_mask(
         config.energies(),
         config.fit_energy_range(),
     );
-    let active_mask_slice = active_mask.as_deref();
 
     // Reject early when the configured range selects fewer active
     // bins than the joint-Poisson dispatch can solve.  `joint_poisson_fit`
@@ -1844,8 +1837,10 @@ fn fit_counts_joint_poisson(
     // degree of freedom.  See [`required_active_bins`] for the
     // combined `max(2, n_free)` requirement.
     if let Some((e_min, e_max)) = config.fit_energy_range() {
-        let n_active =
-            nereids_fitting::active_mask::active_count(active_mask_slice, config.energies().len());
+        let n_active = nereids_fitting::active_mask::active_count(
+            active_mask.as_deref(),
+            config.energies().len(),
+        );
         let required = required_active_bins(config);
         if n_active < required {
             return Err(PipelineError::InvalidParameter(format!(
@@ -1905,6 +1900,18 @@ fn fit_counts_joint_poisson(
                     ))
                 },
             )?;
+        // An occupied bin with no neutron response means the supplied
+        // source/response cannot explain the counts — UNLESS a background is
+        // declared, in which case pure-background counts in a tail or
+        // source-gap bin are exactly what is expected.
+        //
+        // Such a bin still cannot be fitted. `ExactTwoArmRatioModel` reports
+        // T = 1 where there is no response, and the objective profiles a free
+        // flux per bin, so leaving it active lets background fluctuations be
+        // fitted as neutron flux. It carries no information about any fitted
+        // parameter either: the background here is declared, not fitted. So
+        // it is dropped from the active set rather than explained away.
+        let mut dead_occupied = Vec::new();
         for (bin, ((&observed_open, &observed_sample), &predicted_open)) in flux
             .iter()
             .zip(sample_counts)
@@ -1912,10 +1919,31 @@ fn fit_counts_joint_poisson(
             .enumerate()
         {
             if observed_open + observed_sample > 0.0 && predicted_open <= PIVOT_FLOOR {
+                // Per BIN, not per run: a background somewhere else in the
+                // spectrum explains nothing about THIS bin. Without one here,
+                // its counts still have no source and the hard error stands.
+                if detector_background[bin] <= 0.0 {
+                    return Err(PipelineError::InvalidParameter(format!(
+                        "exact incident source has zero detector response in occupied \
+                         detector bin {bin}; the supplied source/response cannot explain \
+                         the observed counts"
+                    )));
+                }
+                dead_occupied.push(bin);
+            }
+        }
+        if !dead_occupied.is_empty() {
+            let mask = active_mask.get_or_insert_with(|| vec![true; flux.len()]);
+            for &bin in &dead_occupied {
+                mask[bin] = false;
+            }
+            let remaining = mask.iter().filter(|&&active| active).count();
+            let required = required_active_bins(config);
+            if remaining < required {
                 return Err(PipelineError::InvalidParameter(format!(
-                    "exact incident source has zero detector response in occupied \
-                     detector bin {bin}; the supplied source/response cannot explain \
-                     the observed counts"
+                    "{} detector bin(s) hold only background and cannot be fitted, \
+                     leaving {remaining} active bin(s); at least {required} are required",
+                    dead_occupied.len()
                 )));
             }
         }
@@ -2014,23 +2042,36 @@ fn fit_counts_joint_poisson(
                     config.energies(),
                     nereids_fitting::transmission_model::baseline_reference_energy_active(
                         config.energies(),
-                        active_mask_slice,
+                        active_mask.as_deref(),
                     ),
                     bli.b0,
                     bli.b1,
                     bli.b2,
                 )
                 // Scope the runtime positivity guard to the fit window (#514).
-                .with_active_mask(active_mask_slice),
+                .with_active_mask(active_mask.as_deref()),
             );
         }
     }
+    // `detector_background` is a detector-space term: it is present whether
+    // or not the sample is in the beam, so it enters BOTH arms. That is the
+    // convention the energy-scale seed already uses, which forms its
+    // transmission proxy as `(S - b) / (O - b)`.
+    //
+    // A background that DIFFERS between the arms — the sample's own scatter
+    // and gammas — is a second array this entry point does not yet carry.
+    // `JointPoissonObjective` takes the two arms separately, so supplying it
+    // is a plumbing change rather than a likelihood one.
+    let background =
+        (!detector_background.iter().all(|&v| v == 0.0)).then_some(detector_background);
     let objective = JointPoissonObjective {
         model: &*stacked,
         o: flux,
         s: sample_counts,
         c,
-        active_mask: active_mask_slice,
+        active_mask: active_mask.as_deref(),
+        open_background: background,
+        sample_background: background,
     };
     let mut cfg = jp_cfg.clone();
     cfg.compute_covariance = config.compute_covariance;
@@ -2097,7 +2138,7 @@ fn fit_counts_joint_poisson(
             Some(
                 nereids_fitting::transmission_model::baseline_reference_energy_active(
                     config.energies(),
-                    active_mask_slice,
+                    active_mask.as_deref(),
                 ),
             ),
         )
@@ -6735,6 +6776,60 @@ mod tests {
             "{err}"
         );
 
+        // (a2) The SAME dead bin, with a background declared: no longer an
+        // error, because pure-background counts in a bin with no neutron
+        // response are exactly what a declared background predicts. It must
+        // still not be fitted — a free flux there would let background
+        // fluctuations be read as neutrons — so it is dropped from the
+        // active set, and with only two bins that leaves too few to fit.
+        let err = fit_spectrum_typed(
+            &InputData::CountsWithNuisance {
+                sample_counts: vec![10.0, 10.0],
+                flux: vec![50.0, 50.0],
+                background: vec![5.0, 5.0],
+            },
+            &base_config(Some(make_response())).with_exact_count_response(exact(vec![
+                arrival + 10.0,
+                arrival + 11.0,
+                arrival + 12.0,
+            ])),
+        )
+        .expect_err("dropping every bin must be reported, not fitted");
+        let message = err.to_string();
+        assert!(
+            message.contains("hold only background and cannot be fitted"),
+            "a declared background must reclassify the dead bin rather than \
+             rejecting the source: {message}"
+        );
+        assert!(
+            !message.contains("zero detector response in occupied detector bin"),
+            "the no-background rejection must not fire once a background is \
+             declared: {message}"
+        );
+
+        // (a3) A background elsewhere in the spectrum explains nothing about
+        // THIS bin. With background on one bin and none on the dead one, the
+        // hard error must still fire — otherwise a single backgrounded bin
+        // anywhere would silence the check for every bin.
+        let err = fit_spectrum_typed(
+            &InputData::CountsWithNuisance {
+                sample_counts: vec![10.0, 10.0],
+                flux: vec![50.0, 50.0],
+                background: vec![0.0, 5.0],
+            },
+            &base_config(Some(make_response())).with_exact_count_response(exact(vec![
+                arrival + 10.0,
+                arrival + 11.0,
+                arrival + 12.0,
+            ])),
+        )
+        .expect_err("a dead bin with no background of its own is still unexplained");
+        assert!(
+            err.to_string()
+                .contains("zero detector response in occupied detector bin 0"),
+            "the bin without a local background must be the one reported: {err}"
+        );
+
         // (b) Exact config attached to normalized transmission input.
         let err = fit_spectrum_typed(
             &InputData::Transmission {
@@ -7416,23 +7511,75 @@ mod tests {
         );
     }
 
-    /// Joint-Poisson rejects a non-zero detector-background nuisance arm
-    /// (B_det wiring is deferred): the profiled flux cannot represent a
-    /// constant additive term, so the gate fails loudly up-front instead
-    /// of silently mis-fitting.
+    /// A detector background is now fitted through, and ignoring one biases
+    /// density.
+    ///
+    /// Counts are built WITH a background in both arms. Fitting them while
+    /// telling the solver the background is zero must recover a worse density
+    /// than fitting them while declaring it — otherwise the background is not
+    /// reaching the likelihood.
     #[test]
-    fn test_joint_poisson_rejects_nonzero_detector_background() {
+    fn test_joint_poisson_uses_the_detector_background() {
+        let data = u238_single_resonance();
+        let energies: Vec<f64> = (0..51).map(|i| 1.0 + (i as f64) * 0.05).collect();
+        let true_density = 0.001;
+        let (t, _) = synthetic_transmission(&data, true_density, &energies);
+        let b_det = 60.0_f64;
+        // Expected counts with a background present in BOTH arms.
+        let flux: Vec<f64> = vec![2000.0 + b_det; energies.len()];
+        let s: Vec<f64> = t.iter().map(|&ti| 2000.0 * ti + b_det).collect();
+
+        let fit = |background: Vec<f64>| {
+            let config = UnifiedFitConfig::new(
+                energies.clone(),
+                vec![data.clone()],
+                vec!["U-238".into()],
+                0.0,
+                None,
+                vec![0.0005],
+            )
+            .unwrap()
+            .with_solver(SolverConfig::PoissonKL(PoissonConfig::default()))
+            .with_counts_background(CountsBackgroundConfig {
+                c: 1.0,
+                ..Default::default()
+            });
+            let input = InputData::CountsWithNuisance {
+                sample_counts: s.clone(),
+                flux: flux.clone(),
+                background,
+            };
+            let result = fit_spectrum_typed(&input, &config).expect("counts-KL fit runs");
+            (result.densities[0] - true_density).abs() / true_density
+        };
+
+        let declared = fit(vec![b_det; energies.len()]);
+        let ignored = fit(vec![0.0; energies.len()]);
+
+        assert!(
+            declared < 0.02,
+            "declaring the background must recover density; bias {:.3} %",
+            100.0 * declared
+        );
+        assert!(
+            ignored > 4.0 * declared,
+            "ignoring a background that IS in the counts gave bias {:.3} % against \
+             {:.3} % when declared — the background is not reaching the likelihood",
+            100.0 * ignored,
+            100.0 * declared
+        );
+    }
+
+    /// A malformed background is still refused.
+    #[test]
+    fn test_joint_poisson_rejects_malformed_detector_background() {
         let data = u238_single_resonance();
         let energies: Vec<f64> = (0..51).map(|i| 1.0 + (i as f64) * 0.05).collect();
         let (t, _) = synthetic_transmission(&data, 0.0005, &energies);
         let flux: Vec<f64> = vec![500.0; energies.len()];
         let s: Vec<f64> = t.iter().map(|&ti| 500.0 * ti).collect();
 
-        // 5e-13 sits below the magnitude tolerance this guard used to carry.
-        // Supplying a background is a model choice and `B_det` is not wired,
-        // so every exact nonzero must be refused rather than rounded to zero.
-        for nonzero_background in [5.0, 5.0e-13] {
-            let background: Vec<f64> = vec![nonzero_background; energies.len()];
+        for bad in [f64::NAN, f64::INFINITY, -1.0] {
             let config = UnifiedFitConfig::new(
                 energies.clone(),
                 vec![data.clone()],
@@ -7447,17 +7594,15 @@ mod tests {
                 c: 1.0,
                 ..Default::default()
             });
-
             let input = InputData::CountsWithNuisance {
                 sample_counts: s.clone(),
                 flux: flux.clone(),
-                background,
+                background: vec![bad; energies.len()],
             };
-            let err = fit_spectrum_typed(&input, &config).unwrap_err();
-            let msg = err.to_string();
+            let msg = fit_spectrum_typed(&input, &config).unwrap_err().to_string();
             assert!(
-                msg.contains("B_det"),
-                "expected deferred-B_det rejection for {nonzero_background}, got: {msg}"
+                msg.contains("finite and non-negative"),
+                "expected a malformed-background rejection for {bad}, got: {msg}"
             );
         }
     }
