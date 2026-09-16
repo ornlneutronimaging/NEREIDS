@@ -151,10 +151,29 @@ Tabulated resolution can be supplied with `resolution=load_resolution(...)`.
 The conversions are `sigma = W/sqrt(2)` and `FWHM = 2*sqrt(ln 2)*W = 1.6651*W`.
 This is SAMMY's convention, shared with the Doppler width, so the two kernels
 compose without a conversion.
-A measured 1-sigma timing jitter must be multiplied by `sqrt(2)` before it is
-passed here; supplying it unconverted gives a kernel 29 % too narrow, and a
-resolution that is too narrow is absorbed into a fitted temperature that is too
-high.
+A measured 1-sigma timing jitter must be converted before it is passed here;
+supplying it unconverted gives a kernel 29 % too narrow, and a resolution that
+is too narrow is absorbed into a fitted temperature that is too high.
+
+Two helpers do the conversion, so no one has to scale by hand:
+
+| Function | Converts | Formula |
+|---|---|---|
+| `width_from_sigma(sigma)` | a standard deviation | `W = sigma * sqrt(2)` |
+| `width_from_fwhm(fwhm)` | a full width at half maximum | `W = FWHM / (2*sqrt(ln 2))` |
+
+```python
+resolution = nereids.resolution_broaden(
+    energies,
+    cross_sections,
+    flight_path_m=25.0,
+    delta_t_us=nereids.width_from_sigma(0.5),   # 0.5 us measured 1-sigma
+    delta_l_m=nereids.width_from_sigma(2e-3),
+)
+```
+
+`width_from_fwhm` is also the conversion SAMMY's `Deltag` needs, so a timing
+width read from a SAMMY `.inp` can be passed straight through it.
 
 ## Single-Spectrum Fitting
 
