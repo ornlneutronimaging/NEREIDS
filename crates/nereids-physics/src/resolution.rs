@@ -5632,21 +5632,36 @@ Resolution file
 mod width_convention_tests {
     use super::*;
 
+    /// Grid half-span, in units of the nominal width. Beyond 6 the remaining
+    /// Gaussian mass is below 1e-16, so 12 is already generous.
+    const SPAN_IN_WIDTHS: usize = 12;
+
+    /// Grid points per nominal width.
+    ///
+    /// Two errors scale as `(step/W)²` here: the trapezoidal second-moment
+    /// quadrature, and the variance the one-bin-wide impulse carries in its own
+    /// right (`step²/12`). At 50 samples per width both are ~1e-4 of the
+    /// measured σ, two orders below the tolerances these tests assert, while
+    /// the convolution cost scales as the square of the point count.
+    const SAMPLES_PER_WIDTH: usize = 50;
+
     /// The kernel's second moment, measured numerically rather than taken from
     /// the width parameter the kernel was built from.
     ///
     /// Broadens a unit impulse and reads the standard deviation back off the
-    /// result. Nothing here uses `gaussian_width`, so it cannot agree with the
-    /// code by construction — that is the point.
-    fn measured_sigma_ev(params: &ResolutionParams, center_ev: f64, half_span_ev: f64) -> f64 {
-        const N: usize = 40_001;
-        let step = 2.0 * half_span_ev / (N - 1) as f64;
-        let energies: Vec<f64> = (0..N)
+    /// result. `nominal_width_ev` only sizes the grid — the measurement itself
+    /// never uses it, so the result cannot agree with `gaussian_width` by
+    /// construction. That independence is the point of the test.
+    fn measured_sigma_ev(params: &ResolutionParams, center_ev: f64, nominal_width_ev: f64) -> f64 {
+        let n: usize = 2 * SPAN_IN_WIDTHS * SAMPLES_PER_WIDTH + 1;
+        let half_span_ev = SPAN_IN_WIDTHS as f64 * nominal_width_ev;
+        let step = 2.0 * half_span_ev / (n - 1) as f64;
+        let energies: Vec<f64> = (0..n)
             .map(|i| center_ev - half_span_ev + i as f64 * step)
             .collect();
         // A unit impulse at the centre bin: broadening it returns the kernel.
-        let mut impulse = vec![0.0; N];
-        impulse[(N - 1) / 2] = 1.0 / step;
+        let mut impulse = vec![0.0; n];
+        impulse[(n - 1) / 2] = 1.0 / step;
 
         let kernel = resolution_broaden(&energies, &impulse, params).expect("broadening runs");
 
@@ -5682,7 +5697,7 @@ mod width_convention_tests {
         let w = params.gaussian_width(center);
         assert!(w > 0.0, "test is vacuous without a width");
 
-        let measured = measured_sigma_ev(&params, center, 12.0 * w);
+        let measured = measured_sigma_ev(&params, center, w);
         let expected = w / SQRT_2;
         assert!(
             (measured - expected).abs() / expected < 2.0e-3,
@@ -5701,7 +5716,7 @@ mod width_convention_tests {
         let center = 10.0;
         let params = ResolutionParams::new(25.0, 1.0, 0.0, 0.0).expect("valid params");
         let w = params.gaussian_width(center);
-        let measured_sigma = measured_sigma_ev(&params, center, 12.0 * w);
+        let measured_sigma = measured_sigma_ev(&params, center, w);
         // FWHM of a Gaussian in terms of its own standard deviation.
         let fwhm_from_measured = 2.0 * (2.0 * 2.0_f64.ln()).sqrt() * measured_sigma;
         let reported = params.fwhm(center);
@@ -5739,19 +5754,14 @@ mod width_convention_tests {
         let center = 10.0_f64;
         let expected_sigma_e =
             2.0 * sigma_t_us * center.powf(1.5) / (TOF_FACTOR * from_sigma.flight_path_m());
-        let measured = measured_sigma_ev(
-            &from_sigma,
-            center,
-            12.0 * from_sigma.gaussian_width(center),
-        );
+        let measured = measured_sigma_ev(&from_sigma, center, from_sigma.gaussian_width(center));
         assert!(
             (measured - expected_sigma_e).abs() / expected_sigma_e < 2.0e-3,
             "from_sigma kernel measures σ {measured:.9}, asked for {expected_sigma_e:.9}"
         );
         // The direct constructor, given the same number, is √2 narrower —
         // which is exactly the error the documentation used to invite.
-        let measured_direct =
-            measured_sigma_ev(&direct, center, 12.0 * direct.gaussian_width(center));
+        let measured_direct = measured_sigma_ev(&direct, center, direct.gaussian_width(center));
         assert!(
             (measured_direct * SQRT_2 - measured).abs() / measured < 5.0e-3,
             "the two constructors do not differ by √2"
