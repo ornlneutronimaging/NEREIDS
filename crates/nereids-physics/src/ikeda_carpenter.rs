@@ -1396,7 +1396,9 @@ mod tests {
         .expect("valid IC");
         let table = model.tabulated();
 
-        for energy in [2.0_f64, 10.0, 60.0] {
+        // Between reference energies, so the width blend is exercised: it
+        // scales offsets about 0, which is the emission instant.
+        for energy in [3.7_f64, 17.3, 55.0] {
             let tof = TOF_FACTOR * 25.0 / energy.sqrt();
             let edges: Vec<f64> = (0..=3000).map(|i| tof - 5.0 + i as f64 * 0.01).collect();
             let mean = |p: &[f64]| -> f64 {
@@ -1413,6 +1415,17 @@ mod tests {
             let from_table = table
                 .detector_bin_probabilities(energy, &edges, 0.0)
                 .expect("table evaluates");
+            let peak = from_model.iter().copied().fold(0.0_f64, f64::max);
+            let shape = from_model
+                .iter()
+                .zip(&from_table)
+                .map(|(a, b)| (a - b).abs())
+                .fold(0.0_f64, f64::max);
+            assert!(
+                shape < 0.01 * peak,
+                "E={energy}: table differs from the analytic pulse by {:.2}% of peak",
+                100.0 * shape / peak
+            );
             let gap = mean(&from_model) - mean(&from_table);
             assert!(
                 gap.abs() < 0.01,
