@@ -5065,6 +5065,34 @@ class TestCalibrateResolution:
         cls._assert_calibrant_is_not_flat(t)
         return iso, e, t, unc
 
+    def test_intervals_are_off_by_default_and_bracket_the_solution(self):
+        """The one-sigma range reaches Python, and says something true.
+
+        Off by default, so the field is None until asked for. When asked for,
+        there is one range per fitted parameter and each brackets the value
+        the calibration returned -- a range that excludes its own solution
+        would not be an uncertainty.
+        """
+        iso, e, t, unc = self._contract_calibrant()
+        kw = dict(
+            isotopes=[(iso, 5.0e-4)],
+            temperature_k=300.0,
+            flight_path_m=25.0,
+        )
+        pinned = nereids.calibrate_resolution(e, t, unc, "gaussian", **kw)
+        assert pinned.intervals is None
+
+        measured = nereids.calibrate_resolution(
+            e, t, unc, "gaussian", intervals=True, **kw
+        )
+        assert measured.converged
+        assert measured.intervals is not None
+        assert len(measured.intervals) == measured.n_free_params
+        for value, (lo, hi) in zip(measured.theta, measured.intervals):
+            assert lo <= value <= hi, (
+                f"the range [{lo}, {hi}] excludes its own solution {value}"
+            )
+
     def test_pins_position_by_default(self):
         iso, e, t, unc = self._contract_calibrant()
         cal = nereids.calibrate_resolution(

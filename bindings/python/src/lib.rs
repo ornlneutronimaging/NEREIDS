@@ -1567,6 +1567,21 @@ impl PyResolutionCalibration {
         }
     }
 
+    /// One-sigma `(lower, upper)` range of each fitted parameter, in the same
+    /// order and raw optimizer space as `theta`.
+    ///
+    /// Each bound is where the objective, minimized over the other
+    /// parameters, rises by one above its floor, so the two sides differ when
+    /// the surface is asymmetric. A bound equal to the parameter's box edge
+    /// means the data does not constrain that side.
+    ///
+    /// `None` unless `calibrate_resolution(..., intervals=True)` asked for
+    /// them, or when the run never self-converged.
+    #[getter]
+    fn intervals(&self) -> Option<Vec<(f64, f64)>> {
+        self.inner.intervals.clone()
+    }
+
     fn __repr__(&self) -> String {
         format!(
             "ResolutionCalibration(family={}, chi2/dof={:.4}, converged={}, n_free_params={}, bounds_hit={:?})",
@@ -1619,11 +1634,16 @@ impl PyResolutionCalibration {
 ///         and a fit that stays there reports ``psr_fwhm_us:lower`` /
 ///         ``:upper`` in ``bounds_hit``; ``psr_fwhm_ns`` must then be > 0:
 ///         a zero start contradicts "0 disables").
+///     intervals: also measure ``.intervals``, the one-sigma range of each
+///         fitted parameter. Off by default: it walks each parameter out
+///         from the solution, re-minimizing the others at every step, and
+///         costs several times the calibration itself.
 ///
 /// Returns:
 ///     ResolutionCalibration with the fitted params, data χ²/dof, the fitted (or
 ///     pinned) ``position_t0_us`` / ``position_l_scale`` / ``prior_penalty``, and
 ///     the calibrated resolution (``.as_tabulated()`` / ``.gaussian_params()``).
+///     ``.intervals`` is populated only when ``intervals=True``.
 // `psr_fwhm_ns` / `fit_psr` sit at the END of the signature (after every
 // parameter that predates them): inserting them mid-signature would silently
 // shift the meaning of existing ≥ 14-positional-argument calls (review #645
@@ -1635,7 +1655,7 @@ impl PyResolutionCalibration {
     restarts=1, ic_n_energies=64, ic_n_tau=500,
     fit_t0=false, fit_l_scale=false, t0_center_us=0.0, l_scale_center=1.0,
     t0_prior_us=None, l_scale_prior=None,
-    psr_fwhm_ns=350.0, fit_psr=false
+    psr_fwhm_ns=350.0, fit_psr=false, intervals=false
 ))]
 #[allow(clippy::too_many_arguments)]
 fn calibrate_resolution(
@@ -1661,6 +1681,7 @@ fn calibrate_resolution(
     l_scale_prior: Option<f64>,
     psr_fwhm_ns: f64,
     fit_psr: bool,
+    intervals: bool,
 ) -> PyResult<PyResolutionCalibration> {
     if isotopes.is_some() == groups.is_some() {
         return Err(pyo3::exceptions::PyValueError::new_err(
@@ -1809,6 +1830,7 @@ fn calibrate_resolution(
         position_l_scale_center: l_scale_center,
         position_t0_prior_us: t0_prior_us,
         position_l_scale_prior: l_scale_prior,
+        intervals,
         ..Default::default()
     };
     let (e_owned, d_owned, u_owned) = (e.to_vec(), d.to_vec(), u.to_vec());

@@ -549,6 +549,20 @@ class ResolutionCalibration:
         """``(delta_t_us, delta_l_m)`` for the Gaussian family; ``None`` otherwise."""
         ...
 
+    @property
+    def intervals(self) -> list[tuple[float, float]] | None:
+        """One-sigma ``(lower, upper)`` range of each fitted parameter, in the
+        same order and raw optimizer space as ``theta``.
+
+        Each bound is where the objective, minimized over the other
+        parameters, rises by one above its floor, so the two sides differ when
+        the surface is asymmetric. A bound equal to the parameter's box edge
+        means the data does not constrain that side.
+
+        ``None`` unless ``calibrate_resolution(..., intervals=True)`` asked
+        for them, or when the run never self-converged."""
+        ...
+
 class SpatialResult:
     """Result of per-pixel spatial mapping (LM fitter)."""
 
@@ -851,6 +865,7 @@ def calibrate_resolution(
     l_scale_prior: float | None = None,
     psr_fwhm_ns: float = 350.0,
     fit_psr: bool = False,
+    intervals: bool = False,
 ) -> ResolutionCalibration:
     """Calibrate instrument-resolution parameters against a known-(rho,T) calibrant.
 
