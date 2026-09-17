@@ -189,9 +189,10 @@ calibrant -- and the resolution is the only thing the two spectra share.
 `delta_t_us` / `delta_l_m` are starting values here rather than pins, and a
 standalone `calibrate_resolution` result is the natural seed.
 
-On a synthetic pair where repeating the whole calibrate-then-fit procedure
-scatters the recovered temperature by 10.9 K, the pinned route reports 8.5 K
-and the joint route 9.6 K.
+Expect a larger `temperature_k_unc` than the pinned route reports.
+That is the correction, not a regression: the pinned number is the uncertainty
+of a temperature measured with a resolution assumed exact, and the resolution
+is not exact.
 
 ## Choosing a calibrant (important)
 
