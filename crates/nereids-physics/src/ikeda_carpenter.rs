@@ -1042,8 +1042,12 @@ fn margin_of(params: &IkedaCarpenterParams) -> f64 {
 }
 
 /// Synthesize one `(offsets, weights)` kernel for `energy_ev` from the IC
-/// parameters: sample `I(τ)`, fold in burst + channel, anchor the mode at
-/// offset 0, trim negligible tails, peak-normalize.
+/// parameters: sample `I(τ)`, fold in burst + channel, trim negligible tails,
+/// peak-normalize.
+///
+/// Offsets are on the emission clock: `0` is when the pulse begins, which is
+/// where the Ikeda–Carpenter function puts it. A loaded SAMMY UDR file is
+/// anchored differently and never passes through here.
 ///
 /// # Errors
 /// [`ResolutionParseError::InvalidFormat`] when [`tau_geometry`] cannot
@@ -1053,12 +1057,7 @@ fn synth_kernel(
     n_tau: usize,
     energy_ev: f64,
 ) -> Result<(Vec<f64>, Vec<f64>), ResolutionParseError> {
-    let (mut offsets, weights) = synth_source_pulse(params, n_tau, energy_ev)?;
-    let peak_time = offsets[argmax(&weights)];
-    for offset in &mut offsets {
-        *offset -= peak_time;
-    }
-    Ok((offsets, weights))
+    synth_source_pulse(params, n_tau, energy_ev)
 }
 
 /// Synthesize one physical-time source pulse without moving its mode.
@@ -1365,17 +1364,60 @@ mod tests {
         assert!(rr.eval(0.001) > 0.9); // 1 meV
     }
 
+    /// The synthesized table and the model that produced it place the pulse at
+    /// the same instant.
+    ///
+    /// Both are evaluated on the detector clock for the same `timing_offset_us`,
+    /// so their mean arrival must agree. This replaced a test that asserted the
+    /// table's mode sat at offset zero, which pinned an anchoring choice rather
+    /// than physics, and the two disagreed by 1.79 µs at 10 eV.
     #[test]
-    fn kernel_mode_anchored_at_zero() {
-        let p = IkedaCarpenterParams::constant(1.0, 0.1, 0.3);
-        let (offsets, weights) = synth_kernel(&p, 600, 10.0).unwrap();
-        let peak = argmax(&weights);
-        // The peak offset is the closest to zero of all offsets.
-        let peak_abs = offsets[peak].abs();
-        for &o in &offsets {
-            assert!(peak_abs <= o.abs() + 1e-9);
+    fn synthesized_table_agrees_with_the_model_it_came_from() {
+        let model = IkedaCarpenter::new(
+            IkedaCarpenterParams {
+                alpha: EnergyLaw::SqrtE { a0: 0.35, a1: 0.05 },
+                beta: EnergyLaw::Const(0.25),
+                r: EnergyLaw::Const(0.15),
+                burst_sigma_us: None,
+                channel_fwhm_us: None,
+            },
+            25.0,
+            &SynthesisGrid {
+                e_min_ev: 1.0,
+                e_max_ev: 100.0,
+                n_energies: 16,
+                n_tau: 512,
+            },
+        )
+        .expect("valid IC");
+        let table = model.tabulated();
+
+        for energy in [2.0_f64, 10.0, 60.0] {
+            let tof = TOF_FACTOR * 25.0 / energy.sqrt();
+            let edges: Vec<f64> = (0..=3000).map(|i| tof - 5.0 + i as f64 * 0.01).collect();
+            let mean = |p: &[f64]| -> f64 {
+                let mass: f64 = p.iter().sum();
+                p.iter()
+                    .enumerate()
+                    .map(|(i, w)| w * 0.5 * (edges[i] + edges[i + 1]))
+                    .sum::<f64>()
+                    / mass
+            };
+            let from_model = model
+                .detector_bin_probabilities(energy, &edges, 0.0)
+                .expect("model evaluates");
+            let from_table = table
+                .detector_bin_probabilities(energy, &edges, 0.0)
+                .expect("table evaluates");
+            let gap = mean(&from_model) - mean(&from_table);
+            assert!(
+                gap.abs() < 0.01,
+                "E={energy}: model puts the pulse at {:.4} µs, its own table at \
+                 {:.4} µs ({gap:+.4} µs apart)",
+                mean(&from_model),
+                mean(&from_table)
+            );
         }
-        assert!(peak_abs < (offsets[1] - offsets[0]).abs() + 1e-9);
     }
 
     #[test]

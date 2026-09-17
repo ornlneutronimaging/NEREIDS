@@ -98,17 +98,6 @@ fix; retargeted at the quantity that actually governs the effect,
   Codex for isolated worktree sessions. Never delete, modify, or
   flag its contents during reviews.
 
-## Project Layout
-
-- `crates/nereids-core`    — shared types (Isotope, etc.)
-- `crates/nereids-endf`    — ENDF/B file parsing and resonance data structures
-- `crates/nereids-physics` — cross-section physics (Reich-Moore, SLBW, RML)
-- `crates/nereids-fitting` — Levenberg-Marquardt fitting engine
-- `crates/nereids-io`      — TIFF I/O, TOF normalisation
-- `crates/nereids-pipeline`— spatial mapping pipeline (rayon)
-- `crates/nereids-python`  — PyO3 bindings (excluded from `--workspace` clippy/test runs)
-- `apps/gui`               — egui desktop application
-
 ## Mandatory User Checkpoints (NEVER skip these)
 
 The user MUST have the opportunity to review and intervene at these points.
@@ -195,11 +184,14 @@ when working single-threaded on one feature branch.
   but is not added as a local remote (removed to avoid `gh` targeting the
   wrong repo).
 
-## Reference Codebases (siblings of this repo)
+## Reference Codebases (absolute paths; NOT siblings of this repo)
 
-- `../SAMMY`    — physics reference (resonance formalism, SAMMY source)
-- `../PLEIADES` — ORNL data normalisation helpers, ENDF retrieval
-- `../trinidi`  — sparsity-handling reference (Purdue/LANL, mostly abandoned)
+- `/Users/8cz/code.ornl.gov/zhangc/SAMMY` — physics reference (resonance
+  formalism, SAMMY Fortran source under `sammy/src/`)
+- `/Users/8cz/github.com/lanl/PLEIADES` — ORNL data normalisation helpers,
+  ENDF retrieval
+- `/Users/8cz/github.com/lanl/trinidi` — sparsity-handling reference
+  (Purdue/LANL, mostly abandoned)
 
 ## Documentation hygiene — no investigation / audit / debugging memos in `docs/`
 

@@ -101,21 +101,15 @@ fix; retargeted at the quantity that actually governs the effect,
   tables and bolded conclusions, and the user deleted one and retyped it
   as a single sentence. A rule that needs judgment about how much is
   "a few" is a rule I will rationalise around. Two sentences is checkable.
+- **No defensive comments.** A comment says what the code does and why it has
+  this shape. Never what it used to do, never the measurement that justified
+  the change, never an argument aimed at a reviewer. That belongs in the commit
+  message, where it cannot drift; in the source it goes stale and leaves the
+  code, the comment and the test each claiming something different.
 - **No temp file litter**: clean up all one-off scripts immediately.
 - **Do not touch `.claude/worktrees/`**: this directory is managed by
   Claude Code for isolated worktree sessions. Never delete, modify, or
   flag its contents during reviews.
-
-## Project Layout
-
-- `crates/nereids-core`    — shared types (Isotope, etc.)
-- `crates/nereids-endf`    — ENDF/B file parsing and resonance data structures
-- `crates/nereids-physics` — cross-section physics (Reich-Moore, SLBW, RML)
-- `crates/nereids-fitting` — Levenberg-Marquardt fitting engine
-- `crates/nereids-io`      — TIFF I/O, TOF normalisation
-- `crates/nereids-pipeline`— spatial mapping pipeline (rayon)
-- `crates/nereids-python`  — PyO3 bindings (excluded from `--workspace` clippy/test runs)
-- `apps/gui`               — egui desktop application
 
 ## Mandatory User Checkpoints (NEVER skip these)
 
@@ -213,11 +207,14 @@ when working single-threaded on one feature branch.
   but is not added as a local remote (removed to avoid `gh` targeting the
   wrong repo).
 
-## Reference Codebases (siblings of this repo)
+## Reference Codebases (absolute paths; NOT siblings of this repo)
 
-- `../SAMMY`    — physics reference (resonance formalism, SAMMY source)
-- `../PLEIADES` — ORNL data normalisation helpers, ENDF retrieval
-- `../trinidi`  — sparsity-handling reference (Purdue/LANL, mostly abandoned)
+- `/Users/8cz/code.ornl.gov/zhangc/SAMMY` — physics reference (resonance
+  formalism, SAMMY Fortran source under `sammy/src/`)
+- `/Users/8cz/github.com/lanl/PLEIADES` — ORNL data normalisation helpers,
+  ENDF retrieval
+- `/Users/8cz/github.com/lanl/trinidi` — sparsity-handling reference
+  (Purdue/LANL, mostly abandoned)
 
 ## Documentation hygiene — no investigation / audit / debugging memos in `docs/`
 
