@@ -1817,28 +1817,21 @@ impl CachedPlanRing {
 /// Method for computing the t0 / L_scale columns of the
 /// `EnergyScaleTransmissionModel` Jacobian.
 ///
-/// - `PartialGal` (default since issue #489): central FD on `t0` only
-///   (2 evaluations); derive `L_scale` column inline via the rank-1
-///   identity `J[:, L_scale] = ((tof - t0) / L_scale) * J[:, t0]` per
-///   energy bin. Halves the FD probe count on workloads where both
-///   calibration parameters are free.
+/// - `PartialGal`: central FD on `t0` only (2 evaluations); derive the
+///   `L_scale` column inline via the rank-1 identity
+///   `J[:, L_scale] = ((tof - t0) / L_scale) * J[:, t0]` per energy bin,
+///   halving the FD probe count when both calibration parameters are free.
 ///
-///   **Correctness regime**: exact in the no-resolution limit and the
-///   narrow-kernel limit. With a non-trivial resolution operator `R`,
-///   the rank-1 simplification additionally assumes per-bin uniformity
-///   of `(tof - t0) / L_scale` over the kernel support — necessary
-///   because `R` mixes source bins whose ratios differ. `broaden_presorted`
-///   uses `self.flight_path_m` (not the model's `L_nominal * L_scale`) so
-///   tabulated kernels satisfy the structural factorisation through
-///   `e_corr`, but the per-bin homogeneity assumption is empirical.
-///   On real VENUS Hf 120-min KL+per-iso+TZERO 4×4 the approximation is
-///   tight enough that 15/16 pixels converge within 0.1·σ_Fisher of FD2;
-///   median wall-time speedup 1.28× over FD2.
-/// - `FiniteDifference`: central FD on the full inner forward chain,
-///   4 forward evaluations per Jacobian (h_t0=1e-4, h_ls=1e-7).
-///   The pre-#489 production default; reachable via
-///   `NEREIDS_TZERO_JACOBIAN=fd2` env var or `tzero_jacobian="fd2"`
-///   Python kwarg.
+///   Exact only without a resolution operator: with one, `L_scale` also
+///   reaches the prediction through the kernel, which the identity does not
+///   model. [`EnergyScaleTransmissionModel::effective_jacobian_method`]
+///   therefore falls back to `FiniteDifference` whenever a kernel is present,
+///   so this variant applies to unresolved fits.
+///
+/// - `FiniteDifference`: central FD on both columns, 4 forward evaluations
+///   per Jacobian (h_t0=1e-4, h_ls=1e-7).
+///   Selectable via the `NEREIDS_TZERO_JACOBIAN=fd2` env var or the
+///   `tzero_jacobian="fd2"` Python kwarg.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum EnergyScaleJacobianMethod {
     FiniteDifference,

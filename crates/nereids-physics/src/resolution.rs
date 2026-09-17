@@ -2801,8 +2801,9 @@ impl TabulatedResolution {
     /// to produce). SAMMY additionally re-aligns the blended kernel so
     /// its trapezoidal centroid `Ct` sits at T = 0 ("Realign so that
     /// centroid is at T=0", mudr3.f90 lines 266–292);
-    /// NEREIDS keeps kernels mode-anchored instead (deliberately
-    /// unchanged here — the anchoring question is tracked separately).
+    /// NEREIDS does not re-align: the blend scales offsets about 0, so each
+    /// table keeps its own origin — a loaded UDR file its peak, a synthesized
+    /// Ikeda–Carpenter table the emission instant.
     ///
     /// Exactness caveat: the blend reproduces `σ_t` exactly when the
     /// two blocks' width-normalized shapes agree (self-similar
@@ -3767,11 +3768,11 @@ Resolution file
 
     #[test]
     fn interpolated_kernel_blend_stays_ascending_and_mode_anchored() {
-        // Two equal-length, mode-anchored kernels at bracketing
-        // energies going through the width-normalized shape blend (the
-        // path every between-reference energy takes). The blend must be
-        // strictly ascending (the sorted invariant the broadener relies
-        // on) and keep the mode at offset 0.
+        // Two equal-length kernels with their peak at offset 0 — a loaded
+        // UDR file's anchoring — through the width-normalized shape blend
+        // that every between-reference energy takes. The blend must stay
+        // strictly ascending (the sorted invariant the broadener relies on)
+        // and leave whatever sits at 0 there.
         let off_lo = vec![-1.0, -0.4, 0.0, 0.6, 1.5, 3.0];
         let off_hi = vec![-0.5, -0.2, 0.0, 0.3, 0.8, 1.6]; // narrower, same length
         let wts = vec![0.1, 0.5, 1.0, 0.6, 0.3, 0.1]; // mode at index 2 (offset 0)

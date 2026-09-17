@@ -980,8 +980,9 @@ impl PyIkedaCarpenter {
     /// `(moderator_delay_us, density)` for the physical source pulse at one
     /// true energy. Unlike `kernel_at`, this keeps the pulse's time origin.
     /// The density is a peak-normalized shape (maximum 1), not a probability
-    /// density; with a symmetric burst/channel fold the leading delays can be
-    /// negative (the fold reaches before the moderator origin).
+    /// density. Offsets are from the moderator origin; a symmetric burst or
+    /// channel fold reaches before it, so leading delays can be negative.
+    /// `kernel_at` returns the same synthesis on the same origin.
     fn source_pulse_at(&self, true_energy_ev: f64) -> PyResult<(Vec<f64>, Vec<f64>)> {
         self.inner
             .source_pulse_at(true_energy_ev)
