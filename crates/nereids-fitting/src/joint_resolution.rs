@@ -19,8 +19,17 @@
 //! chi^2(T, n, w) = chi^2_sample(T, n, w) + chi^2_calibrant(w)
 //! ```
 //!
-//! whose temperature uncertainty already contains everything the calibrant
-//! failed to pin down. Nothing is summarized, so nothing is approximated.
+//! whose temperature uncertainty already contains what the calibrant failed
+//! to pin down.
+//!
+//! The objective is exact: no part of the calibration is summarized, so the
+//! shape the summary would have lost is still there. The uncertainty READ OFF
+//! it is not. `temperature_k_unc` comes from the optimizer's local curvature
+//! at the solution and is a Gaussian approximation like any other, so on a
+//! surface with a flat side and a wall it describes the solution's
+//! neighbourhood rather than the whole interval. What the joint objective
+//! fixes is that the neighbourhood is now the right one — it includes the
+//! resolution's freedom instead of holding it fixed.
 //!
 //! The calibrant's own density and temperature are what make it a calibrant
 //! and stay fixed; only the resolution is shared.
@@ -108,8 +117,8 @@ impl JointResolutionModel {
     ///
     /// # Errors
     /// [`FittingError::InvalidConfig`] when a spectrum's grid is empty, when
-    /// an index collection does not match its isotope count, or when the
-    /// resolution indices collide with another parameter.
+    /// an index collection does not match its isotope count, or when two
+    /// parameters share an index.
     #[allow(clippy::too_many_arguments)]
     pub fn new(
         sample_energies: Vec<f64>,
@@ -144,20 +153,21 @@ impl JointResolutionModel {
                 calibrant_resonance_data.len(),
             )));
         }
-        if delta_t_index == delta_l_index {
-            return Err(FittingError::InvalidConfig(
-                "the two resolution widths must be separate parameters".into(),
-            ));
-        }
-        let taken = [delta_t_index, delta_l_index];
-        if sample_density_indices
-            .iter()
-            .chain(temperature_index.iter())
-            .any(|i| taken.contains(i))
-        {
-            return Err(FittingError::InvalidConfig(
-                "a resolution index collides with a density or temperature parameter".into(),
-            ));
+        // Every slot the model reads must name one quantity. Two of them
+        // sharing an index makes a single optimizer coordinate move two
+        // different physical things at once.
+        let mut slots: Vec<usize> = sample_density_indices.clone();
+        slots.extend(temperature_index);
+        slots.extend([delta_t_index, delta_l_index]);
+        let mut seen = slots.clone();
+        seen.sort_unstable();
+        seen.dedup();
+        if seen.len() != slots.len() {
+            return Err(FittingError::InvalidConfig(format!(
+                "two parameters share an index: densities {sample_density_indices:?}, \
+                 temperature {temperature_index:?}, widths ({delta_t_index}, \
+                 {delta_l_index})"
+            )));
         }
         Ok(Self {
             sample: Spectrum {
@@ -425,6 +435,47 @@ mod tests {
             "the joint fit reports sigma_T {joint:.4} against an observed \
              two-stage scatter of {observed:.4} (ratio {ratio:.2})"
         );
+    }
+
+    /// No two parameters may name the same slot.
+    ///
+    /// A shared index does not fail loudly — it makes one optimizer
+    /// coordinate move two physical quantities at once, and the fit returns a
+    /// number.
+    #[test]
+    fn parameters_sharing_an_index_are_rejected() {
+        let (iso, energies, _) = fixture();
+        let build = |density: usize, temperature: Option<usize>, dt: usize, dl: usize| {
+            JointResolutionModel::new(
+                energies.clone(),
+                vec![iso.clone()],
+                vec![density],
+                T_TRUE,
+                temperature,
+                energies.clone(),
+                vec![iso.clone()],
+                vec![DENSITY],
+                T_TRUE,
+                L,
+                dt,
+                dl,
+            )
+        };
+        assert!(
+            build(0, Some(1), 2, 3).is_ok(),
+            "the distinct layout is legal"
+        );
+        for (label, density, temperature, dt, dl) in [
+            ("temperature on the density slot", 0, Some(0), 2, 3),
+            ("width on the density slot", 0, Some(1), 0, 3),
+            ("width on the temperature slot", 0, Some(1), 1, 3),
+            ("the two widths on one slot", 0, Some(1), 2, 2),
+        ] {
+            assert!(
+                build(density, temperature, dt, dl).is_err(),
+                "{label} must be rejected"
+            );
+        }
     }
 
     /// The sample arm alone, for the pinned comparison.
