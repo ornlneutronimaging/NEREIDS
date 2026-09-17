@@ -2223,14 +2223,11 @@ impl EnergyScaleTransmissionModel {
     /// density columns at the SAME probe share one reich_moore+Doppler build
     /// instead of rebuilding it twice (issue #608 perf).  FD probes at
     /// perturbed `(t0, L_scale)` miss and rebuild, as required.
-    /// The instrument read against the flight path this probe is using.
+    /// The instrument read against `L·l_scale`, the flight path this probe's
+    /// energy grid was built with.
     ///
-    /// `corrected_energies` builds the grid with `L·L_scale`, so every use of
-    /// the kernel in the same evaluation has to be read against that same
-    /// flight path: the auxiliary grid that sizes the Gaussian boundary
-    /// extension, the broadening of the transmission, and the broadening of
-    /// the density derivative columns. Reading `self.instrument` directly
-    /// anywhere in an evaluation reintroduces the mismatch.
+    /// The only source of a kernel inside an evaluation; reading
+    /// `self.instrument` directly would use the nominal flight path.
     fn instrument_at(&self, l_scale: f64) -> Option<Arc<InstrumentParams>> {
         let inst = self.instrument.as_ref()?;
         let resolution = inst
