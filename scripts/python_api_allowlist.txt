@@ -94,3 +94,15 @@ IkedaCarpenter
 # ---------------------------------------------------------------------------
 calibrate_resolution
 ResolutionCalibration
+
+# ---------------------------------------------------------------------------
+# Joint sample + calibrant fitting.  fit_with_calibrant() fits both spectra
+# against one shared resolution so the reported temperature uncertainty
+# carries the degeneracy that pinning a calibrated resolution drops;
+# JointFitResult is its result.  Same disposition as calibrate_resolution
+# above: covered by docs/guide (resolution calibration section), signatures by
+# the pdoc reference.  Move OUT of the allowlist if a dedicated python-api.md
+# narrative heading is added.
+# ---------------------------------------------------------------------------
+fit_with_calibrant
+JointFitResult
