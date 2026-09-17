@@ -843,6 +843,102 @@ def forward_model(
     """
     ...
 
+class JointFitResult:
+    """Result of a joint sample + calibrant fit."""
+
+    @property
+    def densities(self) -> list[float]:
+        """Fitted areal densities (atoms/barn), one per sample isotope."""
+        ...
+
+    @property
+    def density_uncertainties(self) -> list[float] | None:
+        """One-sigma uncertainty on each density."""
+        ...
+
+    @property
+    def temperature_k(self) -> float | None:
+        """Fitted temperature (K); ``None`` when it was held fixed."""
+        ...
+
+    @property
+    def temperature_k_unc(self) -> float | None:
+        """One-sigma uncertainty on the fitted temperature.
+
+        Larger than the pinned route's, and correctly so: the calibrant that
+        constrains the resolution is in the same objective, so the
+        temperature's degeneracy with the resolution is carried rather than
+        dropped."""
+        ...
+
+    @property
+    def delta_t_us(self) -> float:
+        """Fitted shared timing width (µs), the W-parameter in ``exp(-x^2/W^2)``."""
+        ...
+
+    @property
+    def delta_l_m(self) -> float:
+        """Fitted shared flight-path width (m), same convention."""
+        ...
+
+    @property
+    def reduced_chi_squared(self) -> float:
+        """Reduced chi-squared over both spectra together."""
+        ...
+
+    @property
+    def converged(self) -> bool: ...
+
+    @property
+    def iterations(self) -> int: ...
+
+
+def fit_with_calibrant(
+    transmission: NDArray[np.float64],
+    uncertainty: NDArray[np.float64],
+    energies: NDArray[np.float64],
+    isotopes: list[tuple[ResonanceData, float]],
+    calibrant_transmission: NDArray[np.float64],
+    calibrant_uncertainty: NDArray[np.float64],
+    calibrant_energies: NDArray[np.float64],
+    calibrant_isotopes: list[tuple[ResonanceData, float]],
+    calibrant_temperature_k: float,
+    *,
+    temperature_k: float = 293.6,
+    fit_temperature: bool = True,
+    flight_path_m: float = 25.0,
+    delta_t_us: float = 1.0,
+    delta_l_m: float = 0.0,
+) -> JointFitResult:
+    """Fit a sample and the calibrant that measured its resolution together.
+
+    The usual route calibrates the resolution on a known sample, pins it, and
+    fits the unknown one. That reports the temperature as more certain than it
+    is: resolution width and temperature broaden the line the same way, and
+    pinning discards the uncertainty that belongs to their degeneracy.
+
+    Here both spectra are fitted at once against ONE shared Gaussian
+    resolution, so the calibrant's residuals sit in the same objective as the
+    sample's and the reported ``temperature_k_unc`` already contains what the
+    calibrant failed to pin down.
+
+    Args:
+        transmission, uncertainty, energies: the sample spectrum.
+        isotopes: list of ``(ResonanceData, initial_density)`` for the sample.
+        calibrant_transmission, calibrant_uncertainty, calibrant_energies:
+            the known spectrum, on its own grid.
+        calibrant_isotopes: list of ``(ResonanceData, KNOWN density)``, fixed
+            during the fit.
+        calibrant_temperature_k: the calibrant's known temperature.
+        temperature_k: sample temperature; the start value when fitted.
+        fit_temperature: whether the sample temperature is free.
+        flight_path_m: flight path (m), shared by both spectra.
+        delta_t_us, delta_l_m: starting widths for the shared resolution. A
+            standalone ``calibrate_resolution`` result is the natural seed.
+    """
+    ...
+
+
 def calibrate_resolution(
     energies: NDArray[np.float64],
     data: NDArray[np.float64],

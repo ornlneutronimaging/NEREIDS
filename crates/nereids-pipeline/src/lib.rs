@@ -15,6 +15,7 @@
 pub mod calibration;
 pub mod detectability;
 pub mod error;
+pub mod joint_fit;
 pub mod pipeline;
 pub mod spatial;
 /// Synthetic counts-domain measurements with known ground truth, for tests.
