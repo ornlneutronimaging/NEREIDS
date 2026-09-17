@@ -2171,6 +2171,7 @@ impl EnergyScaleTransmissionModel {
         &self,
         e_corr: &[f64],
         temperature_k: f64,
+        instrument: Option<&InstrumentParams>,
     ) -> Result<transmission::WorkingGridXs, FittingError> {
         // Issue #634 review: validate the (possibly fitted) temperature at
         // the point of consumption, mirroring
@@ -2211,7 +2212,7 @@ impl EnergyScaleTransmissionModel {
             e_corr,
             &self.resonance_data,
             temperature_k,
-            self.instrument.as_deref(),
+            instrument,
             None,
         )
         .map_err(|e| FittingError::EvaluationFailed(e.to_string()))
@@ -2222,6 +2223,23 @@ impl EnergyScaleTransmissionModel {
     /// density columns at the SAME probe share one reich_moore+Doppler build
     /// instead of rebuilding it twice (issue #608 perf).  FD probes at
     /// perturbed `(t0, L_scale)` miss and rebuild, as required.
+    /// The instrument read against the flight path this probe is using.
+    ///
+    /// `corrected_energies` builds the grid with `L·L_scale`, so every use of
+    /// the kernel in the same evaluation has to be read against that same
+    /// flight path: the auxiliary grid that sizes the Gaussian boundary
+    /// extension, the broadening of the transmission, and the broadening of
+    /// the density derivative columns. Reading `self.instrument` directly
+    /// anywhere in an evaluation reintroduces the mismatch.
+    fn instrument_at(&self, l_scale: f64) -> Option<Arc<InstrumentParams>> {
+        let inst = self.instrument.as_ref()?;
+        let resolution = inst
+            .resolution
+            .with_flight_path(self.flight_path_m * l_scale)
+            .ok()?;
+        Some(Arc::new(InstrumentParams { resolution }))
+    }
+
     fn working_xs_for(
         &self,
         params: &[f64],
@@ -2241,7 +2259,8 @@ impl EnergyScaleTransmissionModel {
         if let Some(xs) = hit {
             return Ok(xs);
         }
-        let xs = Rc::new(self.working_xs(e_corr, temperature_k)?);
+        let corrected = self.instrument_at(params[self.l_scale_index]);
+        let xs = Rc::new(self.working_xs(e_corr, temperature_k, corrected.as_deref())?);
         *self.cached_work_xs.borrow_mut() = Some((key, Rc::clone(&xs)));
         Ok(xs)
     }
@@ -2286,11 +2305,11 @@ impl EnergyScaleTransmissionModel {
         }
         let t_unbroadened: Vec<f64> = neg_opt.iter().map(|&d| d.exp()).collect();
 
-        let Some(inst) = self.instrument.as_ref() else {
+        if self.instrument.is_none() {
             // No resolution: the working grid IS the data grid (identity
             // layout), so `extract` is a no-op clone.
             return Ok(work.layout.extract(&t_unbroadened));
-        };
+        }
 
         // Resolution on the working grid, then extract the data points last
         // (issue #442 + #608).  For tabulated resolution the working grid IS
@@ -2305,14 +2324,12 @@ impl EnergyScaleTransmissionModel {
         // Rebinding resynthesizes nothing: the flight path is not part of what
         // a kernel is, only of the map it is applied through.
         let l_scale = params[self.l_scale_index];
-        let corrected_resolution = inst
-            .resolution
-            .with_flight_path(self.flight_path_m * l_scale)
-            .map_err(|e| {
-                FittingError::EvaluationFailed(format!(
-                    "resolution at the fitted energy scale: {e}"
-                ))
-            })?;
+        let corrected = self.instrument_at(l_scale).ok_or_else(|| {
+            FittingError::EvaluationFailed(
+                "resolution cannot be read at the fitted energy scale".to_string(),
+            )
+        })?;
+        let corrected_resolution = corrected.resolution.clone();
         let plan = if use_plan_cache {
             let t0 = params[self.t0_index];
             self.cached_resolution_plan(t0, l_scale, work_e, &corrected_resolution)
@@ -2485,15 +2502,10 @@ impl FitModel for EnergyScaleTransmissionModel {
         // Same rebinding as `evaluate_at_with_cache`: the density columns are
         // broadened at this `(t0, L_scale)` probe, so the kernel is read
         // against `L·L_scale` too.
-        let density_plan = self
-            .instrument
+        let density_instrument = self.instrument_at(l_scale);
+        let density_plan = density_instrument
             .as_ref()
-            .and_then(|inst| {
-                inst.resolution
-                    .with_flight_path(self.flight_path_m * l_scale)
-                    .ok()
-            })
-            .and_then(|corrected| self.cached_resolution_plan(t0, l_scale, work_e, &corrected));
+            .and_then(|inst| self.cached_resolution_plan(t0, l_scale, work_e, &inst.resolution));
 
         // Role indices (t0/L_scale/temperature/densities) are assumed
         // DISTINCT — first-match layout; aliasing is not supported in
@@ -2649,7 +2661,7 @@ impl FitModel for EnergyScaleTransmissionModel {
                 // `apply_resolution_with_plan(None, …)` transparently
                 // forwards to `apply_resolution` — bit-exact with
                 // the pre-cache path.  Issue #483 A1.
-                if let Some(inst) = &self.instrument {
+                if let Some(inst) = &density_instrument {
                     let resolved_deriv = match resolution::apply_resolution_with_plan(
                         density_plan.as_deref(),
                         work_e,

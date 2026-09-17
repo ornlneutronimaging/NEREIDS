@@ -422,7 +422,7 @@ class IkedaCarpenter:
         ...
 
     def kernel_at(self, energy_ev: float) -> tuple[list[float], list[float]]:
-        """``(tof_offsets_us, weights)`` at one energy; mode at offset 0.
+        """``(tof_offsets_us, weights)`` at one energy; 0 is the pulse start.
 
         Raises ``ValueError`` when the tau-grid cannot resolve the prompt
         core and requested folds within the sample cap at this energy, or

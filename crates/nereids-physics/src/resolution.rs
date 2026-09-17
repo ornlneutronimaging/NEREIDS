@@ -938,10 +938,15 @@ pub(crate) fn resolution_broaden_presorted(
 #[derive(Debug, Clone)]
 pub struct TabulatedResolution {
     /// Reference energies (eV), sorted ascending.
-    ref_energies: Vec<f64>,
+    ///
+    /// Shared: a fit with a free `L_scale` rebinds the flight path on every
+    /// forward evaluation, which must cost a reference count, not a copy.
+    ref_energies: Arc<Vec<f64>>,
     /// For each reference energy: (tof_offsets_μs, weights) pairs.
     /// Weights are peak-normalized (max=1.0).
-    kernels: Vec<(Vec<f64>, Vec<f64>)>,
+    ///
+    /// Shared for the same reason as `ref_energies`.
+    kernels: Arc<Vec<(Vec<f64>, Vec<f64>)>>,
     /// Flight path length in meters (needed for TOF↔energy conversion).
     flight_path_m: f64,
 }
@@ -1255,7 +1260,7 @@ impl TabulatedResolution {
             .collect::<Result<Vec<_>, ResolutionError>>()?;
         Ok(TabulatedResolution {
             ref_energies: self.ref_energies.clone(),
-            kernels,
+            kernels: Arc::new(kernels),
             flight_path_m: self.flight_path_m,
         })
     }
@@ -1281,8 +1286,8 @@ impl TabulatedResolution {
             )));
         }
         Ok(Self {
-            ref_energies: self.ref_energies.clone(),
-            kernels: self.kernels.clone(),
+            ref_energies: Arc::clone(&self.ref_energies),
+            kernels: Arc::clone(&self.kernels),
             flight_path_m,
         })
     }
@@ -2235,8 +2240,8 @@ impl TabulatedResolution {
         }
 
         Ok(TabulatedResolution {
-            ref_energies,
-            kernels,
+            ref_energies: Arc::new(ref_energies),
+            kernels: Arc::new(kernels),
             flight_path_m,
         })
     }
@@ -2346,8 +2351,8 @@ impl TabulatedResolution {
             }
         }
         Ok(TabulatedResolution {
-            ref_energies,
-            kernels,
+            ref_energies: Arc::new(ref_energies),
+            kernels: Arc::new(kernels),
             flight_path_m,
         })
     }
@@ -3149,6 +3154,7 @@ impl std::error::Error for ResolutionParseError {}
 #[cfg(any(test, feature = "test-support"))]
 pub mod test_support {
     use super::{DIVISION_FLOOR, NEAR_ZERO_FLOOR, ResolutionPlan, TabulatedResolution};
+    use std::sync::Arc;
 
     /// Build a [`ResolutionPlan`] directly from its SoA fields.
     ///
@@ -3186,8 +3192,8 @@ pub mod test_support {
     /// kernel.
     pub fn trivial_tabulated_resolution(flight_path_m: f64) -> TabulatedResolution {
         TabulatedResolution {
-            ref_energies: vec![100.0],
-            kernels: vec![(vec![-1e-6, 0.0, 1e-6], vec![0.0, 1.0, 0.0])],
+            ref_energies: Arc::new(vec![100.0]),
+            kernels: Arc::new(vec![(vec![-1e-6, 0.0, 1e-6], vec![0.0, 1.0, 0.0])]),
             flight_path_m,
         }
     }
@@ -4315,8 +4321,12 @@ Resolution file
             (offsets, weights)
         }
         TabulatedResolution {
-            ref_energies: vec![5.0, 50.0, 500.0],
-            kernels: vec![triangle(0.5, 31), triangle(1.0, 41), triangle(2.0, 51)],
+            ref_energies: Arc::new(vec![5.0, 50.0, 500.0]),
+            kernels: Arc::new(vec![
+                triangle(0.5, 31),
+                triangle(1.0, 41),
+                triangle(2.0, 51),
+            ]),
             flight_path_m: 25.0,
         }
     }
@@ -5370,8 +5380,8 @@ Resolution file
         let offsets = vec![-1.0, 0.0, 15.0];
         let weights = vec![0.3, 1.0, 0.2];
         let r = TabulatedResolution {
-            ref_energies: vec![100.0],
-            kernels: vec![(offsets, weights)],
+            ref_energies: Arc::new(vec![100.0]),
+            kernels: Arc::new(vec![(offsets, weights)]),
             flight_path_m: 25.0,
         };
         let e: f64 = 100.0;
@@ -5397,8 +5407,8 @@ Resolution file
         let offsets = vec![0.0, 10.0];
         let weights = vec![1.0, 0.5];
         let r = TabulatedResolution {
-            ref_energies: vec![100.0],
-            kernels: vec![(offsets, weights)],
+            ref_energies: Arc::new(vec![100.0]),
+            kernels: Arc::new(vec![(offsets, weights)]),
             flight_path_m: 25.0,
         };
         // Choose E high enough that t = K·L/√E ≤ 10 μs.
@@ -5428,8 +5438,8 @@ Resolution file
         let offsets = vec![-10.0, -1.0, 0.0, 1.0, 10.0];
         let weights = vec![0.0, 0.5, 1.0, 0.5, 0.0];
         let r = TabulatedResolution {
-            ref_energies: vec![100.0],
-            kernels: vec![(offsets, weights)],
+            ref_energies: Arc::new(vec![100.0]),
+            kernels: Arc::new(vec![(offsets, weights)]),
             flight_path_m: 25.0,
         };
         let e: f64 = 100.0;
@@ -5459,11 +5469,11 @@ Resolution file
         // after width normalization — so the blended kernel is
         // positive beyond A's bare w>0 extreme.
         let r = TabulatedResolution {
-            ref_energies: vec![10.0, 1000.0],
-            kernels: vec![
+            ref_energies: Arc::new(vec![10.0, 1000.0]),
+            kernels: Arc::new(vec![
                 (vec![0.0, 5.0, 10.0, 20.0], vec![1.0, 0.1, 0.0, 0.0]),
                 (vec![0.0, 1.0, 5.0, 6.0], vec![1.0, 0.8, 0.05, 0.0]),
-            ],
+            ]),
             flight_path_m: 25.0,
         };
         let e: f64 = 100.0; // strictly between the reference energies
@@ -5516,8 +5526,8 @@ Resolution file
     fn test_tabulated_kernel_support_contains_broadener_footprint() {
         // Asymmetric kernel with a dominant delayed (positive) tail.
         let r = TabulatedResolution {
-            ref_energies: vec![100.0],
-            kernels: vec![(vec![-1.0, 0.0, 6.0], vec![0.2, 1.0, 0.7])],
+            ref_energies: Arc::new(vec![100.0]),
+            kernels: Arc::new(vec![(vec![-1.0, 0.0, 6.0], vec![0.2, 1.0, 0.7])]),
             flight_path_m: 25.0,
         };
         // Dense uniform grid; flat baseline with a single-point dip.
@@ -5585,11 +5595,11 @@ Resolution file
     #[test]
     fn test_tabulated_kernel_support_contains_broadener_footprint_between_refs() {
         let r = TabulatedResolution {
-            ref_energies: vec![10.0, 1000.0],
-            kernels: vec![
+            ref_energies: Arc::new(vec![10.0, 1000.0]),
+            kernels: Arc::new(vec![
                 (vec![-2.0, 0.0, 12.0], vec![0.2, 1.0, 0.7]),
                 (vec![-0.5, 0.0, 3.0], vec![0.2, 1.0, 0.7]),
-            ],
+            ]),
             flight_path_m: 25.0,
         };
         let de = 0.05;
@@ -5920,7 +5930,7 @@ mod flight_path_rebinding_tests {
         assert_eq!(rebound.flight_path_m(), 25.0 * 1.03);
         assert_eq!(base.ref_energies, rebound.ref_energies);
         for (i, ((b_off, b_w), (r_off, r_w))) in
-            base.kernels.iter().zip(&rebound.kernels).enumerate()
+            base.kernels.iter().zip(rebound.kernels.iter()).enumerate()
         {
             assert_eq!(
                 b_off.iter().map(|v| v.to_bits()).collect::<Vec<_>>(),

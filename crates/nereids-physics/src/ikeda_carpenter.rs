@@ -73,9 +73,10 @@
 //! fallback, so the between-reference width follows the physical power law
 //! smoothly. IC also synthesizes a dense reference
 //! grid (default 64 energies), so the between-reference error is negligible. The
-//! kernel is anchored with its **mode at offset 0** (peak-centering), matching the
-//! UDR file convention (peak at offset 0); `interpolated_kernel` does not
-//! re-center it. Because the IC pulse is right-skewed, its *mean* lags its mode by
+//! kernel keeps its offsets on the **emission clock** (0 = pulse start), which
+//! is where the Ikeda–Carpenter function itself places them; a loaded UDR file
+//! is anchored on its peak instead and `interpolated_kernel` re-centers
+//! neither. Because the IC pulse is right-skewed, its *mean* lags its mode by
 //! ~1/α(E) in TOF, so the centroid — and even the minimum — of a broadened
 //! resonance shifts toward **lower apparent energy** by an α(E)-dependent amount
 //! (order 1e-2 eV, ~1e-3 relative, for α≈1.5 in the eV regime; larger toward
@@ -129,6 +130,8 @@
 //! model that also applies it (the `nereids-fitting` calibrator therefore
 //! applies its `psr_fwhm_ns` fold to the IC family only, never to
 //! tabulated/UDR kernels).
+
+use std::sync::Arc;
 
 use crate::resolution::{
     ResolutionParseError, TOF_FACTOR, TabulatedResolution, piecewise_linear_bin_masses,
@@ -569,7 +572,8 @@ impl SynthesisGrid {
 pub struct IkedaCarpenter {
     params: IkedaCarpenterParams,
     flight_path_m: f64,
-    ref_energies: Vec<f64>,
+    /// Shared: rebinding the flight path must not copy it.
+    ref_energies: Arc<Vec<f64>>,
     n_tau: usize,
     tabulated: TabulatedResolution,
 }
@@ -704,7 +708,7 @@ impl IkedaCarpenter {
         Ok(Self {
             params,
             flight_path_m,
-            ref_energies,
+            ref_energies: Arc::new(ref_energies),
             n_tau: grid.n_tau,
             tabulated,
         })
@@ -742,7 +746,7 @@ impl IkedaCarpenter {
         Ok(Self {
             params: self.params.clone(),
             flight_path_m,
-            ref_energies: self.ref_energies.clone(),
+            ref_energies: Arc::clone(&self.ref_energies),
             n_tau: self.n_tau,
             tabulated: self.tabulated.with_flight_path(flight_path_m)?,
         })
@@ -756,7 +760,7 @@ impl IkedaCarpenter {
 
     /// Evaluate the (burst/channel-folded) IC kernel at one energy.
     ///
-    /// Returns ascending TOF-offsets (µs, mode at 0) and peak-normalized
+    /// Returns ascending TOF-offsets (µs, 0 = pulse start) and peak-normalized
     /// weights (max = 1), matching the [`TabulatedResolution`] storage
     /// convention.
     ///

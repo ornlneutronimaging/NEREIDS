@@ -963,7 +963,7 @@ impl PyIkedaCarpenter {
     }
 
     /// `(tof_offsets_us, weights)` kernel at a single energy (eV); offsets
-    /// ascending with the mode at 0, weights peak-normalized.
+    /// ascending, 0 = pulse start, weights peak-normalized.
     ///
     /// Raises ``ValueError`` when the τ-grid cannot resolve the prompt core
     /// and requested folds within the sample cap at this energy (construction
