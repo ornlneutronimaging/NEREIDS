@@ -1267,10 +1267,11 @@ impl TabulatedResolution {
 
     /// The same kernel table read against a different flight path.
     ///
-    /// The stored offsets are emission times in microseconds; the flight path
-    /// enters only the TOF↔energy map this table applies them through. So
-    /// rebinding it is exact and needs no resynthesis — the kernel itself is a
-    /// property of the moderator, not of how far the neutron then flew.
+    /// The stored offsets are times relative to this table's own anchor, and
+    /// the flight path enters only the TOF↔energy map they are applied
+    /// through. So rebinding it is exact and needs no resynthesis — the kernel
+    /// itself is a property of the moderator, not of how far the neutron then
+    /// flew.
     ///
     /// This is what a fitted `L_scale` requires: the data's energy grid is
     /// built with `L·L_scale`, and a kernel still reading `L` applies a width

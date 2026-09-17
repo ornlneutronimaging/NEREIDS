@@ -1842,6 +1842,12 @@ impl CachedPlanRing {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum EnergyScaleJacobianMethod {
     FiniteDifference,
+    /// Derives the `L_scale` column from the `t0` column by a rank-1 identity.
+    ///
+    /// Requested rather than guaranteed: it holds only without a resolution
+    /// kernel, so with one configured
+    /// [`EnergyScaleTransmissionModel::effective_jacobian_method`] uses
+    /// [`Self::FiniteDifference`] regardless.
     PartialGal,
 }
 
@@ -2119,9 +2125,6 @@ impl EnergyScaleTransmissionModel {
     /// an instrument response exists at all. Without one the identity is exact
     /// to f64 roundoff (`partial_gal_no_resolution_matches_fd2`).
     ///
-    /// The identity was adopted for speed (1.28× on resolved energy-scale
-    /// fits) at a time when the kernel ignored `L_scale` entirely — an
-    /// optimization that held only because of the defect it sat on.
     #[must_use]
     pub fn effective_jacobian_method(&self) -> EnergyScaleJacobianMethod {
         if self.instrument.is_some() {
@@ -2228,13 +2231,27 @@ impl EnergyScaleTransmissionModel {
     ///
     /// The only source of a kernel inside an evaluation; reading
     /// `self.instrument` directly would use the nominal flight path.
-    fn instrument_at(&self, l_scale: f64) -> Option<Arc<InstrumentParams>> {
-        let inst = self.instrument.as_ref()?;
+    /// `Ok(None)` means no resolution is configured. A configured resolution
+    /// that cannot be rebound is an error, never `None`: `None` reads
+    /// downstream as "no resolution" and would silently produce an unbroadened
+    /// working grid.
+    ///
+    /// # Errors
+    /// [`FittingError::EvaluationFailed`] when the configured resolution
+    /// cannot be read against `L·l_scale`.
+    fn instrument_at(&self, l_scale: f64) -> Result<Option<Arc<InstrumentParams>>, FittingError> {
+        let Some(inst) = self.instrument.as_ref() else {
+            return Ok(None);
+        };
         let resolution = inst
             .resolution
             .with_flight_path(self.flight_path_m * l_scale)
-            .ok()?;
-        Some(Arc::new(InstrumentParams { resolution }))
+            .map_err(|e| {
+                FittingError::EvaluationFailed(format!(
+                    "resolution at the fitted energy scale: {e}"
+                ))
+            })?;
+        Ok(Some(Arc::new(InstrumentParams { resolution })))
     }
 
     fn working_xs_for(
@@ -2256,7 +2273,7 @@ impl EnergyScaleTransmissionModel {
         if let Some(xs) = hit {
             return Ok(xs);
         }
-        let corrected = self.instrument_at(params[self.l_scale_index]);
+        let corrected = self.instrument_at(params[self.l_scale_index])?;
         let xs = Rc::new(self.working_xs(e_corr, temperature_k, corrected.as_deref())?);
         *self.cached_work_xs.borrow_mut() = Some((key, Rc::clone(&xs)));
         Ok(xs)
@@ -2321,9 +2338,9 @@ impl EnergyScaleTransmissionModel {
         // Rebinding resynthesizes nothing: the flight path is not part of what
         // a kernel is, only of the map it is applied through.
         let l_scale = params[self.l_scale_index];
-        let corrected = self.instrument_at(l_scale).ok_or_else(|| {
+        let corrected = self.instrument_at(l_scale)?.ok_or_else(|| {
             FittingError::EvaluationFailed(
-                "resolution cannot be read at the fitted energy scale".to_string(),
+                "resolution vanished between the presence check and its use".to_string(),
             )
         })?;
         let corrected_resolution = corrected.resolution.clone();
@@ -2499,7 +2516,7 @@ impl FitModel for EnergyScaleTransmissionModel {
         // Same rebinding as `evaluate_at_with_cache`: the density columns are
         // broadened at this `(t0, L_scale)` probe, so the kernel is read
         // against `L·L_scale` too.
-        let density_instrument = self.instrument_at(l_scale);
+        let density_instrument = self.instrument_at(l_scale).ok()?;
         let density_plan = density_instrument
             .as_ref()
             .and_then(|inst| self.cached_resolution_plan(t0, l_scale, work_e, &inst.resolution));
@@ -6636,6 +6653,65 @@ mod tests {
     /// Uses a sharp Breit-Wigner-like resonance on a dense grid so the
     /// energy shift is unambiguous.  Only l_scale is varied (t0 fixed
     /// at 0) to avoid degenerate local minima.
+    /// The model evaluated at `L_scale = s` matches one whose nominal flight
+    /// path IS `L·s`, evaluated at `L_scale = 1`.
+    ///
+    /// Same instrument described two ways, so the spectra must agree. This is
+    /// what fails if any evaluation reads the kernel against the nominal
+    /// flight path instead of the fitted one.
+    #[test]
+    fn a_fitted_l_scale_reaches_every_use_of_the_kernel() {
+        use nereids_physics::resolution::{ResolutionFunction, ResolutionParams};
+
+        let energies: Vec<f64> = (0..160).map(|i| 5.0 + (i as f64) * 0.02).collect();
+        let s = 1.05_f64;
+        let l_nom = 25.0_f64;
+        let kernel = |l: f64| {
+            Some(Arc::new(InstrumentParams {
+                resolution: ResolutionFunction::Gaussian(
+                    ResolutionParams::new(l, 0.8, 0.0, 0.0).expect("valid params"),
+                ),
+            }))
+        };
+
+        // Described at the nominal flight path, with the fit scaling it.
+        let scaled = make_energy_scale_u238(energies.clone(), kernel(l_nom));
+        let at_scaled = scaled
+            .evaluate(&[0.001, 0.0, s])
+            .expect("scaled model evaluates");
+
+        // Described directly at the true flight path. At `L_scale = 1` this
+        // model evaluates theory on its own nominal grid, while the scaled one
+        // evaluates on `E·s²` — so it is given that grid, and both then work
+        // at the same energies with the same flight path.
+        let corrected_grid: Vec<f64> = energies.iter().map(|e| e * s * s).collect();
+        let direct = EnergyScaleTransmissionModel::new(
+            Arc::new(vec![u238_single_resonance()]),
+            Arc::new(vec![0]),
+            Arc::new(vec![1.0]),
+            300.0,
+            corrected_grid,
+            l_nom * s,
+            1,
+            2,
+            kernel(l_nom * s),
+        );
+        let at_direct = direct
+            .evaluate(&[0.001, 0.0, 1.0])
+            .expect("direct model evaluates");
+
+        let worst = at_scaled
+            .iter()
+            .zip(&at_direct)
+            .map(|(a, b)| (a - b).abs())
+            .fold(0.0_f64, f64::max);
+        assert!(
+            worst < 1.0e-6,
+            "the same instrument described two ways disagrees by {worst:.3e} in \
+             transmission; some evaluation is reading the nominal flight path"
+        );
+    }
+
     #[test]
     fn energy_scale_fit_recovers_l_scale() {
         // Dense grid over the sharp U-238 resonance (~6.67 eV) so the energy

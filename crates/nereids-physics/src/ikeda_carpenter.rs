@@ -1372,9 +1372,7 @@ mod tests {
     /// the same instant.
     ///
     /// Both are evaluated on the detector clock for the same `timing_offset_us`,
-    /// so their mean arrival must agree. This replaced a test that asserted the
-    /// table's mode sat at offset zero, which pinned an anchoring choice rather
-    /// than physics, and the two disagreed by 1.79 µs at 10 eV.
+    /// so their mean arrival and their shape must agree.
     #[test]
     fn synthesized_table_agrees_with_the_model_it_came_from() {
         let model = IkedaCarpenter::new(
