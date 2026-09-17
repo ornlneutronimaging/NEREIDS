@@ -464,6 +464,14 @@ pub struct CalibrationConfig {
     pub position_t0_prior_us: Option<f64>,
     /// Gaussian prior σ on `L_scale`; `None` = flat. See [`position_t0_prior_us`](Self::position_t0_prior_us).
     pub position_l_scale_prior: Option<f64>,
+    /// Also measure [`CalibrationResult::intervals`]. Default `false`.
+    ///
+    /// Finding the solution and measuring how well it is determined are two
+    /// separate measurements, and the second costs several times the first:
+    /// every trial point along a coordinate re-minimizes the others. A caller
+    /// that only needs the calibrated resolution to pin into a sample fit
+    /// does not pay for it.
+    pub intervals: bool,
 }
 
 impl Default for CalibrationConfig {
@@ -493,6 +501,7 @@ impl Default for CalibrationConfig {
             position_l_scale_center: 1.0,
             position_t0_prior_us: None,
             position_l_scale_prior: None,
+            intervals: false,
         }
     }
 }
@@ -563,24 +572,31 @@ pub struct CalibrationResult {
     /// dof bookkeeping explicit now that families differ in size (IC is 4–5
     /// parameters, Gaussian/UdrCorr are 2).
     pub n_free_params: usize,
-    /// Covariance of the fitted coordinates at the solution, row-major
-    /// `n_free_params × n_free_params`, in the same raw optimizer space as
-    /// [`theta`](Self::theta) (plus any fitted `t0` / `L_scale`).
+    /// One-sigma interval of each fitted coordinate as absolute `(lower,
+    /// upper)` bounds, in the same raw optimizer space as
+    /// [`theta`](Self::theta) (plus any fitted `t0` / `L_scale`), one entry
+    /// per [`n_free_params`](Self::n_free_params).
     ///
-    /// `None` when the solution is not a verified interior minimum: a
-    /// coordinate resting on a box bound (which
-    /// [`bounds_hit`](Self::bounds_hit) reports), a run that exhausted its
-    /// iteration budget without self-converging (which
-    /// [`converged`](Self::converged) reports), or a curvature that is not
-    /// positive definite. A covariance from any of those would be a
-    /// fabrication rather than an uncertainty.
+    /// Each bound is where the objective, minimized over the other
+    /// coordinates, rises by one above its floor. The two sides are
+    /// independent numbers because the interval is genuinely asymmetric: a
+    /// kernel narrower than the line it broadens stops being visible, so the
+    /// objective is nearly flat below the intrinsic width and steep above it.
+    ///
+    /// A bound equal to the coordinate's box edge means the data does not
+    /// constrain that side at all.
+    ///
+    /// `None` when [`CalibrationConfig::intervals`] is off, or when the run
+    /// exhausted its iteration budget without self-converging (which
+    /// [`converged`](Self::converged) reports): an interval about a point
+    /// that was never shown to be a minimum is not an uncertainty.
     ///
     /// This is what a sample fit needs in order to carry the calibrated
-    /// resolution as a correlated prior instead of pinning it. Pinning does
-    /// not bias the fitted temperature much, but it reports it as more
-    /// certain than it is: resolution width and temperature both broaden the
-    /// line, so the uncertainty that belongs to their degeneracy is dropped.
-    pub covariance: Option<Vec<f64>>,
+    /// resolution as a prior instead of pinning it. Pinning does not bias the
+    /// fitted temperature much, but it reports it as more certain than it is:
+    /// resolution width and temperature both broaden the line, so the
+    /// uncertainty that belongs to their degeneracy is dropped.
+    pub intervals: Option<Vec<(f64, f64)>>,
     /// Coordinates that finished within `BOUND_HIT_REL_TOL·(hi−lo)` of a box
     /// bound, as `"name:lower"` / `"name:upper"` (names from
     /// [`ResolutionFamily::param_names`], plus `"t0_us"` / `"l_scale"` when
@@ -733,160 +749,149 @@ fn position_prior_penalty(t0_us: f64, l_scale: f64, cfg: &CalibrationConfig) -> 
     penalty
 }
 
-/// Solve a small `k×k` linear system `A x = b` (k ≤ 3) by Gaussian elimination
-/// with partial pivoting. Returns `None` on a singular system.
-/// Central-difference step for the calibration Hessian, as a fraction of
-/// each coordinate's box width. Large enough that the chi-squared surface's
-/// own numerical noise does not dominate the second difference, small enough
-/// that the quadratic approximation still holds across it.
-const HESSIAN_STEP_FRACTION: f64 = 1.0e-3;
+/// Rise in the objective that marks one sigma of a single coordinate, the
+/// others minimized over. `chi^2 = -2 ln L` up to a constant, so one sigma is
+/// a rise of one.
+const PROFILE_DELTA_CHI2: f64 = 1.0;
 
-/// Floor on the coordinate magnitude the step is taken relative to, so a
-/// coordinate that happens to sit near zero still gets a finite probe.
-const HESSIAN_MIN_SCALE: f64 = 1.0e-3;
+/// First trial displacement of the bracketing search, as a fraction of the
+/// coordinate's own magnitude. It doubles from there until it crosses the
+/// target or reaches the box edge.
+const PROFILE_BRACKET_START_FRACTION: f64 = 1.0e-2;
 
-/// Parameter covariance at a converged chi-squared minimum.
+/// Floor on the magnitude the first displacement is taken from, so a
+/// coordinate sitting near zero still gets a finite one.
+const PROFILE_MIN_SCALE: f64 = 1.0e-3;
+
+/// Bisections inside the bracket. The bracket is a factor of two wide, so
+/// this locates the crossing to about a percent of it.
+const PROFILE_BISECTION_STEPS: usize = 5;
+
+/// Iteration cap for the minimization over the other coordinates at each
+/// trial point.
+const PROFILE_INNER_MAX_ITER: usize = 60;
+
+/// One-sigma interval for each fitted coordinate, from the rise of the
+/// objective rather than its curvature at the minimum.
 ///
-/// The outer optimizer is Nelder-Mead, which is derivative-free and produces
-/// no curvature, so the covariance has to be built at the solution. The
-/// objective is a RAW chi-squared, so
+/// For a Gaussian likelihood `chi^2 = -2 ln L` up to a constant, so the
+/// one-sigma interval of a coordinate is where the objective, minimized over
+/// every other coordinate, rises by one above its floor. Each bound is found
+/// by bisecting on that crossing.
 ///
-/// ```text
-/// Cov = 2 * H^-1,    H_ij = d^2 chi^2 / d(theta_i) d(theta_j)
-/// ```
+/// The interval is followed rather than inferred from the curvature at the
+/// minimum, because the objective is not quadratic out to one sigma: a kernel
+/// narrower than the line it broadens stops being visible, so the objective
+/// flattens below the intrinsic width, while above it the dip smears and the
+/// objective climbs steeply. Across that turn the two sides differ by more
+/// than an order of magnitude.
 ///
-/// which is the standard result for a Gaussian likelihood with known
-/// uncertainties: chi^2 = -2 ln L up to a constant.
+/// Bounds are absolute values in the same raw optimizer space as
+/// [`CalibrationResult::theta`]. A side whose crossing lies outside the box
+/// is reported as the box edge: the data does not bound the coordinate there,
+/// and the interval touching an edge is how the caller sees it.
 ///
-/// `H` is evaluated by central differences with a step relative to each
-/// coordinate's own box width, so a coordinate encoded in ln-space and one in
-/// physical units are probed on comparable scales.
-///
-/// Returns `None` when the Hessian is singular, when any probe is
-/// infeasible, or when the result is not positive definite on its diagonal —
-/// all of which mean the solution is not an interior minimum and a
-/// covariance would be a fabrication. A coordinate resting on a bound is the
-/// common cause, and [`CalibrationResult::bounds_hit`] already reports it.
-fn covariance_at_minimum<F>(
+/// Returns `None` when the floor cannot be evaluated or a profile
+/// minimization fails.
+fn profile_intervals<F>(
     objective: &mut F,
     theta: &[f64],
     bounds: &[(f64, f64)],
-) -> Option<Vec<f64>>
+    floor: f64,
+    nm: &NelderMeadConfig,
+) -> Option<Vec<(f64, f64)>>
 where
     F: FnMut(&[f64]) -> Result<f64, FittingError>,
 {
     let k = theta.len();
-    if k == 0 || bounds.len() != k {
+    if k == 0 || bounds.len() != k || !floor.is_finite() {
         return None;
     }
-    // Step relative to each COORDINATE's own magnitude, with the box only as
-    // a clamp. Sizing it by the box width instead puts the probe far outside
-    // the quadratic region whenever the box is much wider than the value —
-    // a `[0.001, 50]` bound on a coordinate of 0.3 gives a step of 0.05, or
-    // 17 % of it, and the resulting second difference is not a curvature.
-    let steps: Vec<f64> = theta
-        .iter()
-        .zip(bounds)
-        .map(|(&t, &(lo, hi))| {
-            let step = HESSIAN_STEP_FRACTION * t.abs().max(HESSIAN_MIN_SCALE);
-            step.min((hi - t).abs() * 0.5).min((t - lo).abs() * 0.5)
-        })
-        .collect();
-    if steps.iter().any(|&h| !h.is_finite() || h <= 0.0) {
-        return None;
-    }
-
-    let probe = |x: &[f64], objective: &mut F| -> Option<f64> {
-        objective(x).ok().filter(|v| v.is_finite())
+    let target = floor + PROFILE_DELTA_CHI2;
+    // The minimization at each trial point starts from the solution and only
+    // has to slide along the valley, so it is capped well below the search
+    // that found the solution.
+    let inner_nm = NelderMeadConfig {
+        max_iter: nm.max_iter.min(PROFILE_INNER_MAX_ITER),
+        ..nm.clone()
     };
-    let f0 = probe(theta, objective)?;
 
-    let mut hessian = vec![0.0; k * k];
+    let mut intervals = Vec::with_capacity(k);
     for i in 0..k {
-        let mut plus = theta.to_vec();
-        let mut minus = theta.to_vec();
-        plus[i] += steps[i];
-        minus[i] -= steps[i];
-        let fp = probe(&plus, objective)?;
-        let fm = probe(&minus, objective)?;
-        hessian[i * k + i] = (fp - 2.0 * f0 + fm) / (steps[i] * steps[i]);
-    }
-    for i in 0..k {
-        for j in (i + 1)..k {
-            let mut pp = theta.to_vec();
-            let mut pm = theta.to_vec();
-            let mut mp = theta.to_vec();
-            let mut mm = theta.to_vec();
-            pp[i] += steps[i];
-            pp[j] += steps[j];
-            pm[i] += steps[i];
-            pm[j] -= steps[j];
-            mp[i] -= steps[i];
-            mp[j] += steps[j];
-            mm[i] -= steps[i];
-            mm[j] -= steps[j];
-            let value = (probe(&pp, objective)? - probe(&pm, objective)? - probe(&mp, objective)?
-                + probe(&mm, objective)?)
-                / (4.0 * steps[i] * steps[j]);
-            hessian[i * k + j] = value;
-            hessian[j * k + i] = value;
-        }
-    }
+        let free_bounds: Vec<(f64, f64)> = (0..k).filter(|&j| j != i).map(|j| bounds[j]).collect();
 
-    // Cov = 2 H^-1, by solving H X = 2 I column by column.
-    let mut covariance = vec![0.0; k * k];
-    for col in 0..k {
-        let mut rhs = vec![0.0; k];
-        rhs[col] = 2.0;
-        let column = solve_small(&hessian, &rhs, k)?;
-        for (row, value) in column.iter().enumerate() {
-            covariance[row * k + col] = *value;
-        }
-    }
-    // Positive DEFINITE, not merely positive on the diagonal: an indefinite
-    // Hessian can invert to a matrix whose diagonal is entirely positive
-    // while a correlation exceeds one, which is not a covariance. The
-    // measured example is the Gaussian family's two width coordinates, whose
-    // finite-difference Hessian produced a correlation of 1.004 before the
-    // step was corrected. A Cholesky factorization succeeds exactly when the
-    // matrix is positive definite, so it is the test rather than a proxy for
-    // one.
-    if !is_positive_definite(&covariance, k) {
-        return None;
-    }
-    Some(covariance)
-}
-
-/// Whether a symmetric `k × k` row-major matrix is positive definite, by
-/// attempting a Cholesky factorization.
-fn is_positive_definite(matrix: &[f64], k: usize) -> bool {
-    let mut lower = vec![0.0; k * k];
-    for i in 0..k {
-        for j in 0..=i {
-            let mut sum = matrix[i * k + j];
-            for m in 0..j {
-                sum -= lower[i * k + m] * lower[j * k + m];
+        // The objective at `theta[i] = fixed`, minimized over the rest. The
+        // minimizer starts from where the previous trial point left it: the
+        // trials walk along one valley, so its solution is the next one's
+        // neighbourhood.
+        let profiled = |fixed: f64, start: &mut Vec<f64>, objective: &mut F| -> Option<f64> {
+            let mut at = theta.to_vec();
+            at[i] = fixed;
+            if k == 1 {
+                return objective(&at).ok().filter(|v| v.is_finite());
             }
-            if i == j {
-                if !sum.is_finite() || sum <= 0.0 {
-                    return false;
+            let mut inner = |x: &[f64]| -> Result<f64, FittingError> {
+                let mut full = at.clone();
+                for (slot, &v) in (0..k).filter(|&j| j != i).zip(x) {
+                    full[slot] = v;
                 }
-                lower[i * k + j] = sum.sqrt();
-            } else {
-                let pivot = lower[j * k + j];
-                if pivot == 0.0 {
-                    return false;
+                objective(&full)
+            };
+            let res =
+                nelder_mead_minimize(&mut inner, start, Some(&free_bounds), &inner_nm).ok()?;
+            if !res.fun.is_finite() {
+                return None;
+            }
+            *start = res.x;
+            Some(res.fun)
+        };
+
+        // Walk outward from the solution, doubling the displacement, until
+        // the profile clears the target; then bisect the last bracket. An
+        // edge reached without clearing it means the data does not bound that
+        // side, and the edge is the answer.
+        let side = |edge: f64, objective: &mut F| -> Option<f64> {
+            let reach = (edge - theta[i]).abs();
+            if reach == 0.0 {
+                return Some(edge);
+            }
+            let direction = (edge - theta[i]).signum();
+            let at = |d: f64| theta[i] + direction * d;
+
+            let mut start: Vec<f64> = (0..k).filter(|&j| j != i).map(|j| theta[j]).collect();
+            let mut inside = 0.0_f64;
+            let mut step =
+                (PROFILE_BRACKET_START_FRACTION * theta[i].abs().max(PROFILE_MIN_SCALE)).min(reach);
+            let mut outside = loop {
+                if profiled(at(step), &mut start, objective)? > target {
+                    break step;
                 }
-                lower[i * k + j] = sum / pivot;
-                if !lower[i * k + j].is_finite() {
-                    return false;
+                inside = step;
+                // The edge itself was the last trial and the objective has
+                // still not risen: the data does not bound this side.
+                if step >= reach {
+                    return Some(edge);
+                }
+                step = (step * 2.0).min(reach);
+            };
+            for _ in 0..PROFILE_BISECTION_STEPS {
+                let mid = 0.5 * (inside + outside);
+                if profiled(at(mid), &mut start, objective)? <= target {
+                    inside = mid;
+                } else {
+                    outside = mid;
                 }
             }
-        }
+            Some(at(0.5 * (inside + outside)))
+        };
+
+        intervals.push((side(bounds[i].0, objective)?, side(bounds[i].1, objective)?));
     }
-    true
+    Some(intervals)
 }
 
+/// Solve a small `k×k` linear system `A x = b` (k ≤ 3) by Gaussian elimination
+/// with partial pivoting. Returns `None` on a singular system.
 fn solve_small(a: &[f64], b: &[f64], k: usize) -> Option<Vec<f64>> {
     // Relative pivot threshold scaled by the matrix norm, so ill-conditioned
     // systems (not just exactly-singular ones) are reported infeasible.
@@ -1390,22 +1395,15 @@ pub fn calibrate_resolution(
             hits
         })
         .collect();
-    // Curvature at the solution, in the same coordinates the optimizer used.
-    // `obj` is the raw chi-squared plus the position prior, so this is the
-    // covariance of exactly what was minimized.
+    // Interval in the same coordinates the optimizer used. `obj` is the raw
+    // chi-squared plus the position prior, so this is the interval of exactly
+    // what was minimized.
     //
-    // A solution resting on a box bound is not an interior minimum, and the
-    // curvature there describes the box rather than the data: the step is
-    // clamped to stay inside, so a Hessian still comes out, and it would be
-    // reported as an uncertainty that the fit never had. `bounds_hit` is the
-    // same test the caller is given, so the two cannot disagree.
-    // Two conditions, both necessary. A solution on a box bound is not an
-    // interior minimum, and the curvature there describes the box. A run that
-    // exhausted its iteration budget has not shown it reached a minimum at
-    // all, interior or not — Nelder-Mead stops wherever it happens to be, and
-    // curvature at an unverified point is not a calibrated uncertainty.
-    let covariance = if bounds_hit.is_empty() && best.self_converged {
-        covariance_at_minimum(&mut obj, &best.x, &bounds)
+    // A run that exhausted its iteration budget has not shown it reached a
+    // minimum — Nelder-Mead stops wherever it happens to be, and a rise
+    // measured from an unverified floor is not a calibrated uncertainty.
+    let intervals = if config.intervals && best.self_converged {
+        profile_intervals(&mut obj, &best.x, &bounds, best.fun, &nm)
     } else {
         None
     };
@@ -1414,7 +1412,7 @@ pub fn calibrate_resolution(
         family: family.label().to_string(),
         theta,
         chi2_dof,
-        covariance,
+        intervals,
         resolution: inst.resolution,
         iterations: best.iterations,
         converged: best.self_converged,
@@ -2986,25 +2984,28 @@ mod tests {
              psr = {psr_us} µs"
         );
     }
-    /// The reported covariance is a covariance: right shape, symmetric,
-    /// positive variances, and produced only at an interior solution.
+    /// The reported interval is the spread a repeated calibration actually
+    /// shows.
     ///
-    /// It also has to carry the correlation. The Gaussian family's two width
-    /// coordinates are nearly degenerate over one flight path — both scale
-    /// the same broadening — so a covariance that came back diagonal would
-    /// be describing something other than this objective. Measured here at
-    /// about -0.998, which is the information hard-pinning discards: each
-    /// width alone is poorly determined while their combination is tight.
+    /// An interval checked only for shape can be any pair of numbers and
+    /// still pass. The claim it makes is about repetition, so the oracle is
+    /// repetition: calibrate many noise realizations of one calibrant and
+    /// compare how far the answers scatter against what a single calibration
+    /// said they would.
     ///
-    /// Not checked here: the absolute scale of the factor 2 in `Cov = 2H^-1`.
-    /// Confirming it means stepping along a covariance column and measuring
-    /// the chi-squared rise, which needs the calibration objective exposed.
+    /// Compared against the half-width, `(upper - lower) / 2`. The interval
+    /// itself is asymmetric, and which side is the long one depends on where
+    /// in the flat valley a realization landed, so neither side alone is the
+    /// scatter; their average is.
     #[test]
-    fn the_calibration_covariance_is_the_curvature_of_the_objective() {
-        // Data generated FROM a known resolution, so the objective has an
-        // interior optimum to find. A flat spectrum constrains nothing and
-        // drives the optimizer to a box bound, where a covariance would
-        // describe the box rather than the measurement.
+    fn the_reported_interval_predicts_the_scatter_of_repeated_calibrations() {
+        use rand::SeedableRng;
+        use rand_chacha::ChaCha12Rng;
+        use rand_distr::{Distribution, Normal};
+
+        const REALIZATIONS: usize = 24;
+        const NOISE: f64 = 0.002;
+
         let iso = synthetic_isotope(72, 178, 20.0, 0.05, 0.06);
         let sample = SampleParams::new(300.0, vec![(iso, 2.0e-3)]).unwrap();
         let energies: Vec<f64> = (0..120).map(|i| 18.0 + i as f64 * 0.04).collect();
@@ -3012,17 +3013,106 @@ mod tests {
             ic_n_energies: 8,
             ic_n_tau: 32,
             max_iter: 400,
+            intervals: true,
             ..Default::default()
         };
-        let truth_resolution = ResolutionFunction::Gaussian(
-            ResolutionParams::new(cfg.flight_path_m, 0.30, 0.05, 0.0)
-                .expect("valid truth resolution"),
-        );
         let truth = forward_model(
             &energies,
             &sample,
             Some(&InstrumentParams {
-                resolution: truth_resolution,
+                resolution: ResolutionFunction::Gaussian(
+                    ResolutionParams::new(cfg.flight_path_m, 0.30, 0.05, 0.0)
+                        .expect("valid truth resolution"),
+                ),
+            }),
+        )
+        .expect("truth forward model");
+        let unc = vec![NOISE; energies.len()];
+
+        let mut rng = ChaCha12Rng::seed_from_u64(20260917);
+        let normal = Normal::new(0.0, NOISE).expect("valid noise distribution");
+        let mut widths = Vec::new();
+        let mut half_widths = Vec::new();
+        for _ in 0..REALIZATIONS {
+            let noisy: Vec<f64> = truth.iter().map(|t| t + normal.sample(&mut rng)).collect();
+            let result = calibrate_resolution(
+                ResolutionFamily::Gaussian,
+                &energies,
+                &noisy,
+                &unc,
+                &sample,
+                &cfg,
+            )
+            .expect("calibration runs");
+            let Some(intervals) = result.intervals.as_ref() else {
+                assert!(
+                    !result.converged,
+                    "no interval was reported for a self-converged run, so its \
+                     rejection is unaccounted for"
+                );
+                continue;
+            };
+            let width = result.theta[0].abs();
+            let (lo, hi) = intervals[0];
+            assert!(
+                lo <= width && width <= hi,
+                "the interval [{lo}, {hi}] does not bracket its own solution {width}"
+            );
+            widths.push(width);
+            half_widths.push(0.5 * (hi - lo));
+        }
+        assert!(
+            widths.len() >= REALIZATIONS / 2,
+            "only {} of {REALIZATIONS} realizations reported an interval; the \
+             comparison would be drawn from a selected subset",
+            widths.len()
+        );
+
+        let n = widths.len() as f64;
+        let mean = widths.iter().sum::<f64>() / n;
+        let observed = (widths.iter().map(|w| (w - mean).powi(2)).sum::<f64>() / (n - 1.0)).sqrt();
+        let predicted = half_widths.iter().sum::<f64>() / n;
+        let ratio = observed / predicted;
+        assert!(
+            (0.5..=2.0).contains(&ratio),
+            "the calibrations scatter by {observed:.4e} while their own \
+             intervals predict {predicted:.4e} (ratio {ratio:.2}); an interval \
+             that misses the spread by more than a factor of two is not an \
+             uncertainty"
+        );
+    }
+
+    /// The width has no lower bound on this calibrant, and the interval says
+    /// so.
+    ///
+    /// A resolution kernel narrower than the line it broadens leaves no trace
+    /// in the spectrum, so the objective is flat all the way down and the
+    /// data cannot distinguish a narrow kernel from none. The interval
+    /// reports that by reaching the box floor.
+    ///
+    /// The upper bound is the opposite case and must be strictly inside the
+    /// box: past the intrinsic width the dip smears and the objective climbs,
+    /// so that side is measured, not open.
+    #[test]
+    fn the_width_interval_is_open_below_and_closed_above() {
+        let iso = synthetic_isotope(72, 178, 20.0, 0.05, 0.06);
+        let sample = SampleParams::new(300.0, vec![(iso, 2.0e-3)]).unwrap();
+        let energies: Vec<f64> = (0..120).map(|i| 18.0 + i as f64 * 0.04).collect();
+        let cfg = CalibrationConfig {
+            ic_n_energies: 8,
+            ic_n_tau: 32,
+            max_iter: 400,
+            intervals: true,
+            ..Default::default()
+        };
+        let truth = forward_model(
+            &energies,
+            &sample,
+            Some(&InstrumentParams {
+                resolution: ResolutionFunction::Gaussian(
+                    ResolutionParams::new(cfg.flight_path_m, 0.30, 0.05, 0.0)
+                        .expect("valid truth resolution"),
+                ),
             }),
         )
         .expect("truth forward model");
@@ -3037,53 +3127,63 @@ mod tests {
             &cfg,
         )
         .expect("calibration runs");
+        let intervals = result
+            .intervals
+            .as_ref()
+            .expect("a self-converged calibration reports an interval");
+        assert_eq!(
+            intervals.len(),
+            result.n_free_params,
+            "one interval per fitted coordinate"
+        );
 
-        let Some(covariance) = result.covariance.as_ref() else {
-            // Declining is by design, but it must be explained by something
-            // the caller can also see rather than left unaccounted for.
-            assert!(
-                !result.bounds_hit.is_empty() || !result.converged,
-                "no covariance was reported, yet the solution is interior and \
-                 self-converged, so its rejection is unexplained"
-            );
-            return;
-        };
+        let (box_lo, box_hi) = ResolutionFamily::Gaussian.x0_bounds(&cfg).1[0];
+        let (lo, hi) = intervals[0];
+        let width = result.theta[0].abs();
+        assert!(
+            lo <= box_lo + 1e-9,
+            "the width interval starts at {lo}, inside the box floor {box_lo}; \
+             a kernel narrower than the line leaves no trace, so the data \
+             cannot bound the width from below"
+        );
+        assert!(
+            hi > width && hi < box_hi,
+            "the width interval ends at {hi}, outside ({width}, {box_hi}); \
+             past the intrinsic width the dip smears, so that side is measured"
+        );
+    }
 
-        let k = result.n_free_params;
-        assert_eq!(covariance.len(), k * k, "covariance must be k x k");
-        for i in 0..k {
-            assert!(
-                covariance[i * k + i] > 0.0,
-                "variance {i} is not positive: {}",
-                covariance[i * k + i]
-            );
-        }
-        // The off-diagonal must be real: these coordinates are correlated,
-        // and a diagonal result would mean the cross-terms were never
-        // computed.
-        if k >= 2 {
-            let correlation = covariance[1] / (covariance[0] * covariance[k + 1]).sqrt();
-            assert!(
-                correlation.abs() > 0.1,
-                "covariance came back effectively diagonal (r = {correlation:.4}); the \
-                 two width coordinates are degenerate and must correlate"
-            );
-            assert!(
-                correlation.abs() < 1.0,
-                "correlation {correlation:.6} is not physical"
-            );
-        }
-        // Symmetry: a Hessian inverse that is not symmetric is not a
-        // covariance.
-        for i in 0..k {
-            for j in 0..k {
-                let a = covariance[i * k + j];
-                let b = covariance[j * k + i];
-                assert!(
-                    (a - b).abs() <= 1e-6 * a.abs().max(b.abs()).max(1e-30),
-                    "covariance is not symmetric at ({i},{j}): {a} vs {b}"
-                );
-            }
-        }
+    /// A crossing far from a solution that sits near its box floor is still
+    /// found.
+    ///
+    /// The bracketing walk starts from the coordinate's own magnitude, so a
+    /// solution near zero inside a wide box starts many doublings away from
+    /// its own crossing. Against a parabola of known width the interval is
+    /// `x0 ± sigma` exactly, and the side whose crossing lies outside the box
+    /// is the box edge.
+    #[test]
+    fn a_crossing_far_from_a_small_solution_is_not_reported_as_unbounded() {
+        const X0: f64 = 1.0e-3;
+        const SIGMA: f64 = 20.0;
+        let bounds = [(1.0e-4, 1.0e6)];
+        let mut parabola =
+            |x: &[f64]| -> Result<f64, FittingError> { Ok(((x[0] - X0) / SIGMA).powi(2)) };
+        let nm = NelderMeadConfig::default();
+
+        let intervals = profile_intervals(&mut parabola, &[X0], &bounds, 0.0, &nm)
+            .expect("a parabola has a curvature everywhere");
+        let (lo, hi) = intervals[0];
+        assert!(
+            (hi - (X0 + SIGMA)).abs() < 0.05 * SIGMA,
+            "the upper bound is {hi}, not the analytic crossing {}; a bracket \
+             that stops short of the box reports a measured side as unbounded",
+            X0 + SIGMA
+        );
+        assert!(
+            (lo - bounds[0].0).abs() < 1e-12,
+            "the lower crossing lies below the box floor {}, so the interval \
+             must report the floor, not {lo}",
+            bounds[0].0
+        );
     }
 }

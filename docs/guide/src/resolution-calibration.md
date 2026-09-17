@@ -128,6 +128,18 @@ A pinned bound flags a degenerate direction: e.g. an eV-regime calibrant with
 no storage tail drives `R → 0` (`"r:lower"`), and on that β↔R ridge the
 reported `β` carries no information.
 
+Pass `intervals=True` to also measure `cal.intervals`, the one-sigma
+`(lower, upper)` range of each fitted parameter in the same order as `theta`.
+Each bound is where the fit's chi-squared, minimized over the other
+parameters, rises by one.
+The two sides differ, and by a lot: a kernel narrower than the line it
+broadens leaves no trace, so chi-squared is flat below the intrinsic width and
+climbs steeply above it.
+A bound sitting exactly on the parameter's box edge means the data does not
+constrain that side at all.
+It is off by default because measuring it re-minimizes the other parameters at
+every trial point and costs several times the calibration.
+
 Use `.as_tabulated()` for `udr_corr` / `ic` (a `TabulatedResolution` to pass as
 `resolution=`); use `.gaussian_params()` → `(delta_t_us, delta_l_m)` for the
 Gaussian family.
