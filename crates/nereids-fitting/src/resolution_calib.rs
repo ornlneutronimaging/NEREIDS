@@ -755,10 +755,9 @@ fn position_prior_penalty(t0_us: f64, l_scale: f64, cfg: &CalibrationConfig) -> 
 const PROFILE_DELTA_CHI2: f64 = 1.0;
 
 /// First trial displacement of the bracketing search, as a fraction of the
-/// coordinate's own magnitude, and how many doublings it may take before the
-/// box edge stops it.
+/// coordinate's own magnitude. It doubles from there until it crosses the
+/// target or reaches the box edge.
 const PROFILE_BRACKET_START_FRACTION: f64 = 1.0e-2;
-const PROFILE_BRACKET_DOUBLINGS: usize = 20;
 
 /// Floor on the magnitude the first displacement is taken from, so a
 /// coordinate sitting near zero still gets a finite one.
@@ -861,22 +860,19 @@ where
 
             let mut start: Vec<f64> = (0..k).filter(|&j| j != i).map(|j| theta[j]).collect();
             let mut inside = 0.0_f64;
-            let mut outside = None;
-            let mut step = PROFILE_BRACKET_START_FRACTION * theta[i].abs().max(PROFILE_MIN_SCALE);
-            for _ in 0..PROFILE_BRACKET_DOUBLINGS {
-                step = step.min(reach);
+            let mut step =
+                (PROFILE_BRACKET_START_FRACTION * theta[i].abs().max(PROFILE_MIN_SCALE)).min(reach);
+            let mut outside = loop {
                 if profiled(at(step), &mut start, objective)? > target {
-                    outside = Some(step);
-                    break;
+                    break step;
                 }
                 inside = step;
+                // The edge itself was the last trial and the objective has
+                // still not risen: the data does not bound this side.
                 if step >= reach {
-                    break;
+                    return Some(edge);
                 }
-                step *= 2.0;
-            }
-            let Some(mut outside) = outside else {
-                return Some(edge);
+                step = (step * 2.0).min(reach);
             };
             for _ in 0..PROFILE_BISECTION_STEPS {
                 let mid = 0.5 * (inside + outside);
@@ -3154,6 +3150,40 @@ mod tests {
             hi > width && hi < box_hi,
             "the width interval ends at {hi}, outside ({width}, {box_hi}); \
              past the intrinsic width the dip smears, so that side is measured"
+        );
+    }
+
+    /// A crossing far from a solution that sits near its box floor is still
+    /// found.
+    ///
+    /// The bracketing walk starts from the coordinate's own magnitude, so a
+    /// solution near zero inside a wide box starts many doublings away from
+    /// its own crossing. Against a parabola of known width the interval is
+    /// `x0 ± sigma` exactly, and the side whose crossing lies outside the box
+    /// is the box edge.
+    #[test]
+    fn a_crossing_far_from_a_small_solution_is_not_reported_as_unbounded() {
+        const X0: f64 = 1.0e-3;
+        const SIGMA: f64 = 20.0;
+        let bounds = [(1.0e-4, 1.0e6)];
+        let mut parabola =
+            |x: &[f64]| -> Result<f64, FittingError> { Ok(((x[0] - X0) / SIGMA).powi(2)) };
+        let nm = NelderMeadConfig::default();
+
+        let intervals = profile_intervals(&mut parabola, &[X0], &bounds, 0.0, &nm)
+            .expect("a parabola has a curvature everywhere");
+        let (lo, hi) = intervals[0];
+        assert!(
+            (hi - (X0 + SIGMA)).abs() < 0.05 * SIGMA,
+            "the upper bound is {hi}, not the analytic crossing {}; a bracket \
+             that stops short of the box reports a measured side as unbounded",
+            X0 + SIGMA
+        );
+        assert!(
+            (lo - bounds[0].0).abs() < 1e-12,
+            "the lower crossing lies below the box floor {}, so the interval \
+             must report the floor, not {lo}",
+            bounds[0].0
         );
     }
 }
