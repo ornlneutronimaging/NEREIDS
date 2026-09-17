@@ -73,9 +73,10 @@
 //! fallback, so the between-reference width follows the physical power law
 //! smoothly. IC also synthesizes a dense reference
 //! grid (default 64 energies), so the between-reference error is negligible. The
-//! kernel is anchored with its **mode at offset 0** (peak-centering), matching the
-//! UDR file convention (peak at offset 0); `interpolated_kernel` does not
-//! re-center it. Because the IC pulse is right-skewed, its *mean* lags its mode by
+//! kernel keeps its offsets on the **emission clock** (0 = pulse start), which
+//! is where the Ikeda–Carpenter function itself places them; a loaded UDR file
+//! is anchored on its peak instead and `interpolated_kernel` re-centers
+//! neither. Because the IC pulse is right-skewed, its *mean* lags its mode by
 //! ~1/α(E) in TOF, so the centroid — and even the minimum — of a broadened
 //! resonance shifts toward **lower apparent energy** by an α(E)-dependent amount
 //! (order 1e-2 eV, ~1e-3 relative, for α≈1.5 in the eV regime; larger toward
@@ -129,6 +130,8 @@
 //! model that also applies it (the `nereids-fitting` calibrator therefore
 //! applies its `psr_fwhm_ns` fold to the IC family only, never to
 //! tabulated/UDR kernels).
+
+use std::sync::Arc;
 
 use crate::resolution::{
     ResolutionParseError, TOF_FACTOR, TabulatedResolution, piecewise_linear_bin_masses,
@@ -569,7 +572,8 @@ impl SynthesisGrid {
 pub struct IkedaCarpenter {
     params: IkedaCarpenterParams,
     flight_path_m: f64,
-    ref_energies: Vec<f64>,
+    /// Shared: rebinding the flight path must not copy it.
+    ref_energies: Arc<Vec<f64>>,
     n_tau: usize,
     tabulated: TabulatedResolution,
 }
@@ -704,7 +708,7 @@ impl IkedaCarpenter {
         Ok(Self {
             params,
             flight_path_m,
-            ref_energies,
+            ref_energies: Arc::new(ref_energies),
             n_tau: grid.n_tau,
             tabulated,
         })
@@ -728,6 +732,26 @@ impl IkedaCarpenter {
         self.flight_path_m
     }
 
+    /// The same pulse read against a different flight path.
+    ///
+    /// The synthesized kernels are emission-time distributions built from
+    /// α(E), β(E) and R(E) — no flight path appears in the synthesis. The
+    /// flight path enters only the TOF↔energy map and the nominal arrival
+    /// time, so rebinding it is exact and does not resynthesize the table.
+    ///
+    /// # Errors
+    /// Returns [`ResolutionParseError::InvalidFormat`] if `flight_path_m` is
+    /// not positive and finite.
+    pub fn with_flight_path(&self, flight_path_m: f64) -> Result<Self, ResolutionParseError> {
+        Ok(Self {
+            params: self.params.clone(),
+            flight_path_m,
+            ref_energies: Arc::clone(&self.ref_energies),
+            n_tau: self.n_tau,
+            tabulated: self.tabulated.with_flight_path(flight_path_m)?,
+        })
+    }
+
     /// Reference energies (eV, ascending) the table was synthesized on.
     #[must_use]
     pub fn ref_energies(&self) -> &[f64] {
@@ -736,7 +760,7 @@ impl IkedaCarpenter {
 
     /// Evaluate the (burst/channel-folded) IC kernel at one energy.
     ///
-    /// Returns ascending TOF-offsets (µs, mode at 0) and peak-normalized
+    /// Returns ascending TOF-offsets (µs, 0 = pulse start) and peak-normalized
     /// weights (max = 1), matching the [`TabulatedResolution`] storage
     /// convention.
     ///
@@ -1022,8 +1046,12 @@ fn margin_of(params: &IkedaCarpenterParams) -> f64 {
 }
 
 /// Synthesize one `(offsets, weights)` kernel for `energy_ev` from the IC
-/// parameters: sample `I(τ)`, fold in burst + channel, anchor the mode at
-/// offset 0, trim negligible tails, peak-normalize.
+/// parameters: sample `I(τ)`, fold in burst + channel, trim negligible tails,
+/// peak-normalize.
+///
+/// Offsets are on the emission clock: `0` is when the pulse begins, which is
+/// where the Ikeda–Carpenter function puts it. A loaded SAMMY UDR file is
+/// anchored differently and never passes through here.
 ///
 /// # Errors
 /// [`ResolutionParseError::InvalidFormat`] when [`tau_geometry`] cannot
@@ -1033,12 +1061,7 @@ fn synth_kernel(
     n_tau: usize,
     energy_ev: f64,
 ) -> Result<(Vec<f64>, Vec<f64>), ResolutionParseError> {
-    let (mut offsets, weights) = synth_source_pulse(params, n_tau, energy_ev)?;
-    let peak_time = offsets[argmax(&weights)];
-    for offset in &mut offsets {
-        *offset -= peak_time;
-    }
-    Ok((offsets, weights))
+    synth_source_pulse(params, n_tau, energy_ev)
 }
 
 /// Synthesize one physical-time source pulse without moving its mode.
@@ -1345,17 +1368,71 @@ mod tests {
         assert!(rr.eval(0.001) > 0.9); // 1 meV
     }
 
+    /// The synthesized table and the model that produced it place the pulse at
+    /// the same instant.
+    ///
+    /// Both are evaluated on the detector clock for the same `timing_offset_us`,
+    /// so their mean arrival and their shape must agree.
     #[test]
-    fn kernel_mode_anchored_at_zero() {
-        let p = IkedaCarpenterParams::constant(1.0, 0.1, 0.3);
-        let (offsets, weights) = synth_kernel(&p, 600, 10.0).unwrap();
-        let peak = argmax(&weights);
-        // The peak offset is the closest to zero of all offsets.
-        let peak_abs = offsets[peak].abs();
-        for &o in &offsets {
-            assert!(peak_abs <= o.abs() + 1e-9);
+    fn synthesized_table_agrees_with_the_model_it_came_from() {
+        let model = IkedaCarpenter::new(
+            IkedaCarpenterParams {
+                alpha: EnergyLaw::SqrtE { a0: 0.35, a1: 0.05 },
+                beta: EnergyLaw::Const(0.25),
+                r: EnergyLaw::Const(0.15),
+                burst_sigma_us: None,
+                channel_fwhm_us: None,
+            },
+            25.0,
+            &SynthesisGrid {
+                e_min_ev: 1.0,
+                e_max_ev: 100.0,
+                n_energies: 16,
+                n_tau: 512,
+            },
+        )
+        .expect("valid IC");
+        let table = model.tabulated();
+
+        // Between reference energies, so the width blend is exercised: it
+        // scales offsets about 0, which is the emission instant.
+        for energy in [3.7_f64, 17.3, 55.0] {
+            let tof = TOF_FACTOR * 25.0 / energy.sqrt();
+            let edges: Vec<f64> = (0..=3000).map(|i| tof - 5.0 + i as f64 * 0.01).collect();
+            let mean = |p: &[f64]| -> f64 {
+                let mass: f64 = p.iter().sum();
+                p.iter()
+                    .enumerate()
+                    .map(|(i, w)| w * 0.5 * (edges[i] + edges[i + 1]))
+                    .sum::<f64>()
+                    / mass
+            };
+            let from_model = model
+                .detector_bin_probabilities(energy, &edges, 0.0)
+                .expect("model evaluates");
+            let from_table = table
+                .detector_bin_probabilities(energy, &edges, 0.0)
+                .expect("table evaluates");
+            let peak = from_model.iter().copied().fold(0.0_f64, f64::max);
+            let shape = from_model
+                .iter()
+                .zip(&from_table)
+                .map(|(a, b)| (a - b).abs())
+                .fold(0.0_f64, f64::max);
+            assert!(
+                shape < 0.01 * peak,
+                "E={energy}: table differs from the analytic pulse by {:.2}% of peak",
+                100.0 * shape / peak
+            );
+            let gap = mean(&from_model) - mean(&from_table);
+            assert!(
+                gap.abs() < 0.01,
+                "E={energy}: model puts the pulse at {:.4} µs, its own table at \
+                 {:.4} µs ({gap:+.4} µs apart)",
+                mean(&from_model),
+                mean(&from_table)
+            );
         }
-        assert!(peak_abs < (offsets[1] - offsets[0]).abs() + 1e-9);
     }
 
     #[test]

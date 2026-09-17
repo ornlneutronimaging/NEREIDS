@@ -938,10 +938,15 @@ pub(crate) fn resolution_broaden_presorted(
 #[derive(Debug, Clone)]
 pub struct TabulatedResolution {
     /// Reference energies (eV), sorted ascending.
-    ref_energies: Vec<f64>,
+    ///
+    /// Shared: a fit with a free `L_scale` rebinds the flight path on every
+    /// forward evaluation, which must cost a reference count, not a copy.
+    ref_energies: Arc<Vec<f64>>,
     /// For each reference energy: (tof_offsets_μs, weights) pairs.
     /// Weights are peak-normalized (max=1.0).
-    kernels: Vec<(Vec<f64>, Vec<f64>)>,
+    ///
+    /// Shared for the same reason as `ref_energies`.
+    kernels: Arc<Vec<(Vec<f64>, Vec<f64>)>>,
     /// Flight path length in meters (needed for TOF↔energy conversion).
     flight_path_m: f64,
 }
@@ -1255,8 +1260,36 @@ impl TabulatedResolution {
             .collect::<Result<Vec<_>, ResolutionError>>()?;
         Ok(TabulatedResolution {
             ref_energies: self.ref_energies.clone(),
-            kernels,
+            kernels: Arc::new(kernels),
             flight_path_m: self.flight_path_m,
+        })
+    }
+
+    /// The same kernel table read against a different flight path.
+    ///
+    /// The stored offsets are times relative to this table's own anchor, and
+    /// the flight path enters only the TOF↔energy map they are applied
+    /// through. So rebinding it is exact and needs no resynthesis — the kernel
+    /// itself is a property of the moderator, not of how far the neutron then
+    /// flew.
+    ///
+    /// This is what a fitted `L_scale` requires: the data's energy grid is
+    /// built with `L·L_scale`, and a kernel still reading `L` applies a width
+    /// wrong by that same factor.
+    ///
+    /// # Errors
+    /// Returns [`ResolutionParseError::InvalidFormat`] if `flight_path_m` is
+    /// not positive and finite.
+    pub fn with_flight_path(&self, flight_path_m: f64) -> Result<Self, ResolutionParseError> {
+        if !flight_path_m.is_finite() || flight_path_m <= 0.0 {
+            return Err(ResolutionParseError::InvalidFormat(format!(
+                "Flight path must be a positive finite number, got {flight_path_m}"
+            )));
+        }
+        Ok(Self {
+            ref_energies: Arc::clone(&self.ref_energies),
+            kernels: Arc::clone(&self.kernels),
+            flight_path_m,
         })
     }
 
@@ -1457,6 +1490,38 @@ impl ResolutionFunction {
             Self::Gaussian(params) => params.flight_path_m(),
             Self::Tabulated(tabulated) => tabulated.flight_path_m(),
             Self::IkedaCarpenter(ic) => ic.flight_path_m(),
+        }
+    }
+
+    /// The same resolution function read against a different flight path.
+    ///
+    /// A fit that frees `L_scale` evaluates the theory on an energy grid built
+    /// with `L·L_scale`. The kernel has to be read against the same flight
+    /// path or its width is wrong by that factor — on every family, since all
+    /// three convert between energy and detector time through `L`. No variant
+    /// resynthesizes: the flight path is not part of what the kernel IS, only
+    /// of the map it is applied through.
+    ///
+    /// # Errors
+    /// Returns [`ResolutionParseError::InvalidFormat`] if `flight_path_m` is
+    /// not positive and finite.
+    pub fn with_flight_path(&self, flight_path_m: f64) -> Result<Self, ResolutionParseError> {
+        match self {
+            Self::Gaussian(params) => Ok(Self::Gaussian(
+                ResolutionParams::new(
+                    flight_path_m,
+                    params.delta_t_us(),
+                    params.delta_l_m(),
+                    params.delta_e_us(),
+                )
+                .map_err(|e| ResolutionParseError::InvalidFormat(e.to_string()))?,
+            )),
+            Self::Tabulated(tabulated) => Ok(Self::Tabulated(Arc::new(
+                tabulated.with_flight_path(flight_path_m)?,
+            ))),
+            Self::IkedaCarpenter(ic) => Ok(Self::IkedaCarpenter(Arc::new(
+                ic.with_flight_path(flight_path_m)?,
+            ))),
         }
     }
 
@@ -2176,8 +2241,8 @@ impl TabulatedResolution {
         }
 
         Ok(TabulatedResolution {
-            ref_energies,
-            kernels,
+            ref_energies: Arc::new(ref_energies),
+            kernels: Arc::new(kernels),
             flight_path_m,
         })
     }
@@ -2287,8 +2352,8 @@ impl TabulatedResolution {
             }
         }
         Ok(TabulatedResolution {
-            ref_energies,
-            kernels,
+            ref_energies: Arc::new(ref_energies),
+            kernels: Arc::new(kernels),
             flight_path_m,
         })
     }
@@ -2736,8 +2801,9 @@ impl TabulatedResolution {
     /// to produce). SAMMY additionally re-aligns the blended kernel so
     /// its trapezoidal centroid `Ct` sits at T = 0 ("Realign so that
     /// centroid is at T=0", mudr3.f90 lines 266–292);
-    /// NEREIDS keeps kernels mode-anchored instead (deliberately
-    /// unchanged here — the anchoring question is tracked separately).
+    /// NEREIDS does not re-align: the blend scales offsets about 0, so each
+    /// table keeps its own origin — a loaded UDR file its peak, a synthesized
+    /// Ikeda–Carpenter table the emission instant.
     ///
     /// Exactness caveat: the blend reproduces `σ_t` exactly when the
     /// two blocks' width-normalized shapes agree (self-similar
@@ -3090,6 +3156,7 @@ impl std::error::Error for ResolutionParseError {}
 #[cfg(any(test, feature = "test-support"))]
 pub mod test_support {
     use super::{DIVISION_FLOOR, NEAR_ZERO_FLOOR, ResolutionPlan, TabulatedResolution};
+    use std::sync::Arc;
 
     /// Build a [`ResolutionPlan`] directly from its SoA fields.
     ///
@@ -3127,8 +3194,8 @@ pub mod test_support {
     /// kernel.
     pub fn trivial_tabulated_resolution(flight_path_m: f64) -> TabulatedResolution {
         TabulatedResolution {
-            ref_energies: vec![100.0],
-            kernels: vec![(vec![-1e-6, 0.0, 1e-6], vec![0.0, 1.0, 0.0])],
+            ref_energies: Arc::new(vec![100.0]),
+            kernels: Arc::new(vec![(vec![-1e-6, 0.0, 1e-6], vec![0.0, 1.0, 0.0])]),
             flight_path_m,
         }
     }
@@ -3701,11 +3768,11 @@ Resolution file
 
     #[test]
     fn interpolated_kernel_blend_stays_ascending_and_mode_anchored() {
-        // Two equal-length, mode-anchored kernels at bracketing
-        // energies going through the width-normalized shape blend (the
-        // path every between-reference energy takes). The blend must be
-        // strictly ascending (the sorted invariant the broadener relies
-        // on) and keep the mode at offset 0.
+        // Two equal-length kernels with their peak at offset 0 — a loaded
+        // UDR file's anchoring — through the width-normalized shape blend
+        // that every between-reference energy takes. The blend must stay
+        // strictly ascending (the sorted invariant the broadener relies on)
+        // and leave whatever sits at 0 there.
         let off_lo = vec![-1.0, -0.4, 0.0, 0.6, 1.5, 3.0];
         let off_hi = vec![-0.5, -0.2, 0.0, 0.3, 0.8, 1.6]; // narrower, same length
         let wts = vec![0.1, 0.5, 1.0, 0.6, 0.3, 0.1]; // mode at index 2 (offset 0)
@@ -4256,8 +4323,12 @@ Resolution file
             (offsets, weights)
         }
         TabulatedResolution {
-            ref_energies: vec![5.0, 50.0, 500.0],
-            kernels: vec![triangle(0.5, 31), triangle(1.0, 41), triangle(2.0, 51)],
+            ref_energies: Arc::new(vec![5.0, 50.0, 500.0]),
+            kernels: Arc::new(vec![
+                triangle(0.5, 31),
+                triangle(1.0, 41),
+                triangle(2.0, 51),
+            ]),
             flight_path_m: 25.0,
         }
     }
@@ -5311,8 +5382,8 @@ Resolution file
         let offsets = vec![-1.0, 0.0, 15.0];
         let weights = vec![0.3, 1.0, 0.2];
         let r = TabulatedResolution {
-            ref_energies: vec![100.0],
-            kernels: vec![(offsets, weights)],
+            ref_energies: Arc::new(vec![100.0]),
+            kernels: Arc::new(vec![(offsets, weights)]),
             flight_path_m: 25.0,
         };
         let e: f64 = 100.0;
@@ -5338,8 +5409,8 @@ Resolution file
         let offsets = vec![0.0, 10.0];
         let weights = vec![1.0, 0.5];
         let r = TabulatedResolution {
-            ref_energies: vec![100.0],
-            kernels: vec![(offsets, weights)],
+            ref_energies: Arc::new(vec![100.0]),
+            kernels: Arc::new(vec![(offsets, weights)]),
             flight_path_m: 25.0,
         };
         // Choose E high enough that t = K·L/√E ≤ 10 μs.
@@ -5369,8 +5440,8 @@ Resolution file
         let offsets = vec![-10.0, -1.0, 0.0, 1.0, 10.0];
         let weights = vec![0.0, 0.5, 1.0, 0.5, 0.0];
         let r = TabulatedResolution {
-            ref_energies: vec![100.0],
-            kernels: vec![(offsets, weights)],
+            ref_energies: Arc::new(vec![100.0]),
+            kernels: Arc::new(vec![(offsets, weights)]),
             flight_path_m: 25.0,
         };
         let e: f64 = 100.0;
@@ -5400,11 +5471,11 @@ Resolution file
         // after width normalization — so the blended kernel is
         // positive beyond A's bare w>0 extreme.
         let r = TabulatedResolution {
-            ref_energies: vec![10.0, 1000.0],
-            kernels: vec![
+            ref_energies: Arc::new(vec![10.0, 1000.0]),
+            kernels: Arc::new(vec![
                 (vec![0.0, 5.0, 10.0, 20.0], vec![1.0, 0.1, 0.0, 0.0]),
                 (vec![0.0, 1.0, 5.0, 6.0], vec![1.0, 0.8, 0.05, 0.0]),
-            ],
+            ]),
             flight_path_m: 25.0,
         };
         let e: f64 = 100.0; // strictly between the reference energies
@@ -5457,8 +5528,8 @@ Resolution file
     fn test_tabulated_kernel_support_contains_broadener_footprint() {
         // Asymmetric kernel with a dominant delayed (positive) tail.
         let r = TabulatedResolution {
-            ref_energies: vec![100.0],
-            kernels: vec![(vec![-1.0, 0.0, 6.0], vec![0.2, 1.0, 0.7])],
+            ref_energies: Arc::new(vec![100.0]),
+            kernels: Arc::new(vec![(vec![-1.0, 0.0, 6.0], vec![0.2, 1.0, 0.7])]),
             flight_path_m: 25.0,
         };
         // Dense uniform grid; flat baseline with a single-point dip.
@@ -5526,11 +5597,11 @@ Resolution file
     #[test]
     fn test_tabulated_kernel_support_contains_broadener_footprint_between_refs() {
         let r = TabulatedResolution {
-            ref_energies: vec![10.0, 1000.0],
-            kernels: vec![
+            ref_energies: Arc::new(vec![10.0, 1000.0]),
+            kernels: Arc::new(vec![
                 (vec![-2.0, 0.0, 12.0], vec![0.2, 1.0, 0.7]),
                 (vec![-0.5, 0.0, 3.0], vec![0.2, 1.0, 0.7]),
-            ],
+            ]),
             flight_path_m: 25.0,
         };
         let de = 0.05;
@@ -5793,5 +5864,100 @@ mod width_convention_tests {
             (via_constructor.delta_t_us() - sammy_mapping).abs() < 1.0e-15,
             "from_fwhm disagrees with the SAMMY Deltag conversion"
         );
+    }
+}
+
+#[cfg(test)]
+mod flight_path_rebinding_tests {
+    use super::*;
+
+    /// Rebinding the flight path scales the Gaussian energy width by 1/s.
+    ///
+    /// The oracle is the analytic law, not the code: a timing width Δt maps to
+    /// an energy width `W_E = 2·Δt·E^{3/2}/(F·L)`, so the same Δt read against
+    /// `L·s` gives `W_E/s`. A fit that frees `L_scale` builds its grid with
+    /// `L·L_scale`; if the kernel keeps `L`, this is exactly the factor it is
+    /// wrong by.
+    #[test]
+    fn rebinding_scales_the_gaussian_width_inversely() {
+        let l_nom = 25.0;
+        let delta_t = 1.0;
+        let base = ResolutionParams::new(l_nom, delta_t, 0.0, 0.0).expect("valid");
+        for s in [0.97_f64, 1.0, 1.03, 1.25] {
+            let rebound = ResolutionFunction::Gaussian(base)
+                .with_flight_path(l_nom * s)
+                .expect("positive flight path");
+            let ResolutionFunction::Gaussian(rebound) = rebound else {
+                panic!("rebinding changed the family");
+            };
+            for e in [5.0_f64, 20.0, 100.0] {
+                let analytic = 2.0 * delta_t * e.powf(1.5) / (TOF_FACTOR * l_nom * s);
+                let got = rebound.gaussian_width(e);
+                assert!(
+                    (got - analytic).abs() / analytic < 1.0e-14,
+                    "s={s}, E={e}: width {got:e} but the law gives {analytic:e}"
+                );
+                // And it is the base width divided by s, which is the
+                // statement the fit depends on.
+                let base_w = base.gaussian_width(e);
+                assert!(
+                    (got - base_w / s).abs() / (base_w / s) < 1.0e-14,
+                    "s={s}, E={e}: rebound width is not base/s"
+                );
+            }
+        }
+    }
+
+    /// Rebinding does not touch the tabulated kernel itself.
+    ///
+    /// The stored offsets are emission times. The flight path belongs to the
+    /// map they are applied through, so a rebind must leave every offset and
+    /// weight byte-identical — if it resynthesized or rescaled them it would
+    /// be changing the moderator, not the geometry.
+    #[test]
+    fn rebinding_leaves_the_tabulated_kernel_byte_identical() {
+        let offsets = vec![-2.0, -1.0, 0.0, 1.0, 3.0];
+        let weights = vec![0.1, 0.6, 1.0, 0.5, 0.05];
+        let base = TabulatedResolution::from_kernels(
+            vec![5.0, 50.0],
+            vec![
+                (offsets.clone(), weights.clone()),
+                (offsets.clone(), weights.clone()),
+            ],
+            25.0,
+        )
+        .expect("valid kernel table");
+
+        let rebound = base.with_flight_path(25.0 * 1.03).expect("positive");
+        assert_eq!(rebound.flight_path_m(), 25.0 * 1.03);
+        assert_eq!(base.ref_energies, rebound.ref_energies);
+        for (i, ((b_off, b_w), (r_off, r_w))) in
+            base.kernels.iter().zip(rebound.kernels.iter()).enumerate()
+        {
+            assert_eq!(
+                b_off.iter().map(|v| v.to_bits()).collect::<Vec<_>>(),
+                r_off.iter().map(|v| v.to_bits()).collect::<Vec<_>>(),
+                "rebinding moved the emission-time offsets of block {i}"
+            );
+            assert_eq!(
+                b_w.iter().map(|v| v.to_bits()).collect::<Vec<_>>(),
+                r_w.iter().map(|v| v.to_bits()).collect::<Vec<_>>(),
+                "rebinding changed the weights of block {i}"
+            );
+        }
+    }
+
+    /// A non-positive flight path is refused rather than silently accepted.
+    #[test]
+    fn rebinding_refuses_a_non_physical_flight_path() {
+        let params = ResolutionParams::new(25.0, 1.0, 0.0, 0.0).expect("valid");
+        for bad in [0.0, -1.0, f64::NAN, f64::INFINITY] {
+            assert!(
+                ResolutionFunction::Gaussian(params)
+                    .with_flight_path(bad)
+                    .is_err(),
+                "flight path {bad} was accepted"
+            );
+        }
     }
 }
