@@ -1732,15 +1732,17 @@ fn fit_with_calibrant(
     delta_t_us: f64,
     delta_l_m: f64,
 ) -> PyResult<PyJointFitResult> {
-    let (sample_data, sample_unc, sample_e) = (
-        transmission.as_slice()?.to_vec(),
-        uncertainty.as_slice()?.to_vec(),
-        energies.as_slice()?.to_vec(),
-    );
-    let (rd, n0): (Vec<_>, Vec<_>) = isotopes
-        .iter()
-        .map(|(i, n)| ((*i.inner).clone(), *n))
-        .unzip();
+    let sample = nereids_pipeline::joint_fit::SampleSpectrum {
+        energies: energies.as_slice()?.to_vec(),
+        transmission: transmission.as_slice()?.to_vec(),
+        uncertainty: uncertainty.as_slice()?.to_vec(),
+        isotopes: isotopes
+            .iter()
+            .map(|(i, n)| ((*i.inner).clone(), *n))
+            .collect(),
+        temperature_k,
+        fit_temperature,
+    };
     let calibrant = nereids_pipeline::joint_fit::CalibrantSpectrum {
         energies: calibrant_energies.as_slice()?.to_vec(),
         transmission: calibrant_transmission.as_slice()?.to_vec(),
@@ -1754,13 +1756,7 @@ fn fit_with_calibrant(
     let inner = py
         .detach(move || {
             nereids_pipeline::joint_fit::fit_with_calibrant(
-                &sample_data,
-                &sample_unc,
-                &sample_e,
-                &rd,
-                &n0,
-                temperature_k,
-                fit_temperature,
+                &sample,
                 &calibrant,
                 flight_path_m,
                 delta_t_us,

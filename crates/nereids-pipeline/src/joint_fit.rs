@@ -13,13 +13,29 @@
 //! summarized calibration cannot stand in for those residuals.
 
 use nereids_endf::resonance::ResonanceData;
-use nereids_fitting::joint_resolution::JointResolutionModel;
+use nereids_fitting::joint_resolution::{Densities, JointResolutionModel, SpectrumSpec};
 use nereids_fitting::lm::{self, LmConfig};
 use nereids_fitting::parameters::{FitParameter, ParameterSet};
 use nereids_fitting::resolution_calib::{GAUSSIAN_DELTA_L_BOUNDS_M, GAUSSIAN_DELTA_T_BOUNDS_US};
 
 use crate::error::PipelineError;
 use crate::pipeline::TEMPERATURE_BOUNDS_K;
+
+/// The unknown spectrum and what the fit is free to move in it.
+pub struct SampleSpectrum {
+    /// Energy grid (eV), ascending.
+    pub energies: Vec<f64>,
+    /// Measured transmission on that grid.
+    pub transmission: Vec<f64>,
+    /// One-sigma uncertainty per point.
+    pub uncertainty: Vec<f64>,
+    /// Each isotope with the areal density to start it at.
+    pub isotopes: Vec<(ResonanceData, f64)>,
+    /// Temperature (K); the start value when it is fitted.
+    pub temperature_k: f64,
+    /// Whether the temperature is free.
+    pub fit_temperature: bool,
+}
 
 /// The known spectrum: what it is made of, at what temperature, and what was
 /// measured.
@@ -91,109 +107,94 @@ const fn resolution_indices(n_density: usize, fit_temperature: bool) -> (usize, 
 /// uncertainty is not positive, a density on either arm is not finite and
 /// positive, or a temperature or width seed falls outside the box every fit
 /// path shares, and [`PipelineError::Fitting`] when the optimizer cannot run.
-#[allow(clippy::too_many_arguments)]
 pub fn fit_with_calibrant(
-    transmission: &[f64],
-    uncertainty: &[f64],
-    energies: &[f64],
-    isotopes: &[ResonanceData],
-    initial_densities: &[f64],
-    temperature_k: f64,
-    fit_temperature: bool,
+    sample: &SampleSpectrum,
     calibrant: &CalibrantSpectrum,
     flight_path_m: f64,
     delta_t_init: f64,
     delta_l_init: f64,
 ) -> Result<JointFitResult, PipelineError> {
-    check_spectrum("sample", energies, transmission, uncertainty)?;
-    check_spectrum(
-        "calibrant",
-        &calibrant.energies,
-        &calibrant.transmission,
-        &calibrant.uncertainty,
-    )?;
-    if isotopes.is_empty() {
-        return Err(PipelineError::InvalidParameter(
-            "the sample needs at least one isotope".into(),
-        ));
-    }
-    if initial_densities.len() != isotopes.len() {
-        return Err(PipelineError::ShapeMismatch(format!(
-            "{} initial densities for {} sample isotopes",
-            initial_densities.len(),
-            isotopes.len(),
-        )));
-    }
-    if calibrant.isotopes.is_empty() {
-        return Err(PipelineError::InvalidParameter(
-            "the calibrant needs at least one isotope".into(),
-        ));
-    }
-    check_densities("sample", initial_densities.iter().copied())?;
-    // A calibrant arm whose densities are not positive is transparent: the
-    // forward model skips a non-positive thickness, so the arm carries no
-    // resonance and constrains no resolution, and the fit would return a
-    // number that came only from the sample.
-    check_densities("calibrant", calibrant.isotopes.iter().map(|(_, n)| *n))?;
-    for (label, value) in [
-        ("flight_path_m", flight_path_m),
-        ("delta_t_init", delta_t_init),
-        ("delta_l_init", delta_l_init),
-        ("temperature_k", temperature_k),
-        ("the calibrant temperature", calibrant.temperature_k),
+    for (label, energies, transmission, uncertainty, isotopes) in [
+        (
+            "sample",
+            &sample.energies,
+            &sample.transmission,
+            &sample.uncertainty,
+            &sample.isotopes,
+        ),
+        (
+            "calibrant",
+            &calibrant.energies,
+            &calibrant.transmission,
+            &calibrant.uncertainty,
+            &calibrant.isotopes,
+        ),
     ] {
-        if !value.is_finite() || value < 0.0 {
+        check_spectrum(label, energies, transmission, uncertainty)?;
+        if isotopes.is_empty() {
             return Err(PipelineError::InvalidParameter(format!(
-                "{label} must be finite and non-negative, got {value}"
+                "the {label} needs at least one isotope"
             )));
         }
     }
-    if flight_path_m <= 0.0 {
-        return Err(PipelineError::InvalidParameter(
-            "flight_path_m must be positive".into(),
-        ));
-    }
-    let (t_lo, t_hi) = TEMPERATURE_BOUNDS_K;
-    for (label, value) in [
-        ("temperature_k", temperature_k),
-        ("the calibrant temperature", calibrant.temperature_k),
-    ] {
-        if !(t_lo..=t_hi).contains(&value) {
-            return Err(PipelineError::InvalidParameter(format!(
-                "{label} must lie in [{t_lo}, {t_hi}] K, got {value}"
-            )));
-        }
-    }
-    // The broadening grid is extended by five sigma of the Gaussian width at
-    // each boundary, so its point count grows with the width. A seed far
-    // outside the box the calibration fits in asks for a grid the machine
-    // cannot hold, before the first residual is ever evaluated.
-    for (label, value, (lo, hi)) in [
+    // Every scalar the fit reads has a range it has to lie in. The widths'
+    // is the box the calibration fits in: the broadening grid is extended by
+    // five sigma of the width at each boundary, so a width far outside that
+    // box asks for a grid the machine cannot hold before the first residual
+    // is evaluated. A density of zero or less is transparent -- the forward
+    // model skips a non-positive thickness -- so a calibrant made of them
+    // carries no resonance and constrains no resolution.
+    let positive = (f64::MIN_POSITIVE, f64::INFINITY);
+    for (label, value, range) in [
+        ("flight_path_m", flight_path_m, positive),
+        ("temperature_k", sample.temperature_k, TEMPERATURE_BOUNDS_K),
+        (
+            "the calibrant temperature",
+            calibrant.temperature_k,
+            TEMPERATURE_BOUNDS_K,
+        ),
         ("delta_t_init", delta_t_init, GAUSSIAN_DELTA_T_BOUNDS_US),
         ("delta_l_init", delta_l_init, GAUSSIAN_DELTA_L_BOUNDS_M),
-    ] {
-        if !(lo..=hi).contains(&value) {
-            return Err(PipelineError::InvalidParameter(format!(
-                "{label} must lie in [{lo}, {hi}], got {value}"
-            )));
-        }
+    ]
+    .into_iter()
+    .chain(
+        sample
+            .isotopes
+            .iter()
+            .map(|(_, n)| ("a sample density", *n, positive)),
+    )
+    .chain(
+        calibrant
+            .isotopes
+            .iter()
+            .map(|(_, n)| ("a calibrant density", *n, positive)),
+    ) {
+        check_range(label, value, range)?;
     }
 
-    let (delta_t_index, delta_l_index) = resolution_indices(isotopes.len(), fit_temperature);
-    let temperature_index = fit_temperature.then_some(isotopes.len());
+    let n_isotopes = sample.isotopes.len();
+    let (delta_t_index, delta_l_index) = resolution_indices(n_isotopes, sample.fit_temperature);
+    let temperature_index = sample.fit_temperature.then_some(n_isotopes);
+    let (sample_data, initial_densities): (Vec<_>, Vec<_>) =
+        sample.isotopes.iter().cloned().unzip();
     let (calibrant_data, calibrant_densities): (Vec<_>, Vec<_>) =
         calibrant.isotopes.iter().cloned().unzip();
 
     let model = JointResolutionModel::new(
-        energies.to_vec(),
-        isotopes.to_vec(),
-        (0..isotopes.len()).collect(),
-        temperature_k,
-        temperature_index,
-        calibrant.energies.clone(),
-        calibrant_data,
-        calibrant_densities,
-        calibrant.temperature_k,
+        SpectrumSpec {
+            energies: sample.energies.clone(),
+            resonance_data: sample_data,
+            densities: Densities::Fitted((0..n_isotopes).collect()),
+            temperature_index,
+            temperature_k: sample.temperature_k,
+        },
+        SpectrumSpec {
+            energies: calibrant.energies.clone(),
+            resonance_data: calibrant_data,
+            densities: Densities::Known(calibrant_densities),
+            temperature_index: None,
+            temperature_k: calibrant.temperature_k,
+        },
         flight_path_m,
         delta_t_index,
         delta_l_index,
@@ -205,10 +206,10 @@ pub fn fit_with_calibrant(
         .enumerate()
         .map(|(i, &n)| FitParameter::non_negative(format!("density_{i}"), n))
         .collect();
-    if fit_temperature {
+    if sample.fit_temperature {
         values.push(FitParameter {
             name: "temperature_k".into(),
-            value: temperature_k,
+            value: sample.temperature_k,
             lower: TEMPERATURE_BOUNDS_K.0,
             upper: TEMPERATURE_BOUNDS_K.1,
             fixed: false,
@@ -234,9 +235,9 @@ pub fn fit_with_calibrant(
     let mut params = ParameterSet::new(values);
 
     // The two spectra are concatenated in the order the model predicts them.
-    let mut data = transmission.to_vec();
+    let mut data = sample.transmission.clone();
     data.extend_from_slice(&calibrant.transmission);
-    let mut sigma = uncertainty.to_vec();
+    let mut sigma = sample.uncertainty.clone();
     sigma.extend_from_slice(&calibrant.uncertainty);
 
     let result = lm::levenberg_marquardt(
@@ -260,11 +261,11 @@ pub fn fit_with_calibrant(
             .and_then(|u| u.get(i).copied())
     };
     Ok(JointFitResult {
-        densities: result.params[..isotopes.len()].to_vec(),
+        densities: result.params[..n_isotopes].to_vec(),
         density_uncertainties: result
             .uncertainties
             .as_ref()
-            .map(|u| u[..isotopes.len()].to_vec()),
+            .map(|u| u[..n_isotopes].to_vec()),
         temperature_k: temperature_index.map(|i| result.params[i]),
         temperature_k_unc: temperature_index.and_then(sigma_of),
         delta_t_us: result.params[delta_t_index].max(0.0).sqrt(),
@@ -275,16 +276,14 @@ pub fn fit_with_calibrant(
     })
 }
 
-fn check_densities(label: &str, densities: impl Iterator<Item = f64>) -> Result<(), PipelineError> {
-    for (i, n) in densities.enumerate() {
-        if !n.is_finite() || n <= 0.0 {
-            return Err(PipelineError::InvalidParameter(format!(
-                "{label} density {i} is {n}; every areal density must be finite \
-                 and positive"
-            )));
-        }
+/// Reject a scalar the fit cannot use.
+fn check_range(label: &str, value: f64, (lo, hi): (f64, f64)) -> Result<(), PipelineError> {
+    if value.is_finite() && (lo..=hi).contains(&value) {
+        return Ok(());
     }
-    Ok(())
+    Err(PipelineError::InvalidParameter(format!(
+        "{label} must be finite and lie in [{lo}, {hi}], got {value}"
+    )))
 }
 
 fn check_spectrum(
@@ -364,6 +363,43 @@ mod tests {
         forward_model(energies, &sample, Some(&inst)).unwrap()
     }
 
+    /// A sample arm carrying `t` on `energies`, with its temperature free.
+    fn sample_arm(
+        iso: &nereids_endf::resonance::ResonanceData,
+        energies: &[f64],
+        t: &[f64],
+        unc: &[f64],
+        density: f64,
+        temperature_k: f64,
+    ) -> SampleSpectrum {
+        SampleSpectrum {
+            energies: energies.to_vec(),
+            transmission: t.to_vec(),
+            uncertainty: unc.to_vec(),
+            isotopes: vec![(iso.clone(), density)],
+            temperature_k,
+            fit_temperature: true,
+        }
+    }
+
+    /// A calibrant arm at a known density and temperature.
+    fn calibrant_arm(
+        iso: &nereids_endf::resonance::ResonanceData,
+        energies: &[f64],
+        t: &[f64],
+        unc: &[f64],
+        density: f64,
+        temperature_k: f64,
+    ) -> CalibrantSpectrum {
+        CalibrantSpectrum {
+            energies: energies.to_vec(),
+            transmission: t.to_vec(),
+            uncertainty: unc.to_vec(),
+            isotopes: vec![(iso.clone(), density)],
+            temperature_k,
+        }
+    }
+
     /// The joint fit recovers the sample's density and temperature and the
     /// shared resolution, from a resolution seed that is wrong.
     ///
@@ -393,13 +429,7 @@ mod tests {
         };
 
         let r = fit_with_calibrant(
-            &sample_t,
-            &unc,
-            &sample_e,
-            &[sample_iso],
-            &[1.6e-3],
-            300.0,
-            true,
+            &sample_arm(&sample_iso, &sample_e, &sample_t, &unc, 1.6e-3, 300.0),
             &calibrant,
             L,
             // Seeds off truth by 50 % and 60 %.
@@ -447,22 +477,10 @@ mod tests {
         let energies: Vec<f64> = (0..40).map(|i| 18.0 + i as f64 * 0.05).collect();
         let t = spectrum(&iso, 2.0e-3, 300.0, &energies);
         let unc = vec![1.0e-3; energies.len()];
-        let calibrant = CalibrantSpectrum {
-            energies: energies.clone(),
-            transmission: t.clone(),
-            uncertainty: unc.clone(),
-            isotopes: vec![(iso.clone(), 2.0e-3)],
-            temperature_k: 300.0,
-        };
+        let calibrant = calibrant_arm(&iso, &energies, &t, &unc, 2.0e-3, 300.0);
         let run = |dt: f64, dl: f64| {
             fit_with_calibrant(
-                &t,
-                &unc,
-                &energies,
-                std::slice::from_ref(&iso),
-                &[2.0e-3],
-                300.0,
-                true,
+                &sample_arm(&iso, &energies, &t, &unc, 2.0e-3, 300.0),
                 &calibrant,
                 L,
                 dt,
@@ -532,22 +550,10 @@ mod tests {
         for (what, grid, values) in cases {
             // Once as the sample, once as the calibrant: both arms are read by
             // the same model and neither may skip the check.
-            let sound = CalibrantSpectrum {
-                energies: energies.clone(),
-                transmission: good.clone(),
-                uncertainty: unc.clone(),
-                isotopes: vec![(iso.clone(), 2.0e-3)],
-                temperature_k: 300.0,
-            };
+            let sound = calibrant_arm(&iso, &energies, &good, &unc, 2.0e-3, 300.0);
             assert!(
                 fit_with_calibrant(
-                    &values,
-                    &unc,
-                    &grid,
-                    std::slice::from_ref(&iso),
-                    &[2.0e-3],
-                    300.0,
-                    true,
+                    &sample_arm(&iso, &grid, &values, &unc, 2.0e-3, 300.0),
                     &sound,
                     L,
                     W,
@@ -565,13 +571,7 @@ mod tests {
             };
             assert!(
                 fit_with_calibrant(
-                    &good,
-                    &unc,
-                    &energies,
-                    std::slice::from_ref(&iso),
-                    &[2.0e-3],
-                    300.0,
-                    true,
+                    &sample_arm(&iso, &energies, &good, &unc, 2.0e-3, 300.0),
                     &broken,
                     L,
                     W,
@@ -606,13 +606,7 @@ mod tests {
                 temperature_k: 300.0,
             };
             let Err(err) = fit_with_calibrant(
-                &t,
-                &unc,
-                &energies,
-                std::slice::from_ref(&iso),
-                &[2.0e-3],
-                300.0,
-                true,
+                &sample_arm(&iso, &energies, &t, &unc, 2.0e-3, 300.0),
                 &calibrant,
                 L,
                 W,
@@ -634,25 +628,13 @@ mod tests {
         let energies: Vec<f64> = (0..40).map(|i| 18.0 + i as f64 * 0.05).collect();
         let t = spectrum(&iso, 2.0e-3, 300.0, &energies);
         let unc = vec![1.0e-3; energies.len()];
-        let calibrant = CalibrantSpectrum {
-            energies: energies.clone(),
-            transmission: t.clone(),
-            uncertainty: unc.clone(),
-            isotopes: vec![(iso.clone(), 2.0e-3)],
-            temperature_k: 300.0,
-        };
+        let calibrant = calibrant_arm(&iso, &energies, &t, &unc, 2.0e-3, 300.0);
         // Zero Kelvin has no Doppler broadening at all, so it is not a sample
         // this path describes.
         for seed in [0.0, 6000.0] {
             assert!(
                 fit_with_calibrant(
-                    &t,
-                    &unc,
-                    &energies,
-                    std::slice::from_ref(&iso),
-                    &[2.0e-3],
-                    seed,
-                    true,
+                    &sample_arm(&iso, &energies, &t, &unc, 2.0e-3, seed),
                     &calibrant,
                     L,
                     W,
@@ -680,13 +662,7 @@ mod tests {
             temperature_k: 300.0,
         };
         let err = fit_with_calibrant(
-            &t,
-            &unc,
-            &energies,
-            &[iso],
-            &[2.0e-3],
-            300.0,
-            true,
+            &sample_arm(&iso, &energies, &t, &unc, 2.0e-3, 300.0),
             &calibrant,
             L,
             W,

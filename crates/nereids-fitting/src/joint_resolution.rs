@@ -49,21 +49,46 @@ use nereids_physics::transmission::{self, InstrumentParams, SampleParams};
 use crate::error::FittingError;
 use crate::lm::FitModel;
 
-/// One spectrum in a joint fit: its grid, what is in the beam, and how its
-/// free parameters are read out of the shared vector.
-struct Spectrum {
-    energies: Vec<f64>,
-    resonance_data: Vec<ResonanceData>,
-    /// `params[density_indices[i]]` is isotope `i`'s areal density, or the
-    /// density is fixed at `fixed_densities[i]` when this is empty.
-    density_indices: Vec<usize>,
-    fixed_densities: Vec<f64>,
-    /// `params[temperature_index]` is the temperature, else `temperature_k`.
-    temperature_index: Option<usize>,
-    temperature_k: f64,
+/// Where a spectrum's areal densities come from.
+pub enum Densities {
+    /// `params[i]` for each index: the fit determines them.
+    Fitted(Vec<usize>),
+    /// One value per isotope, held at what the caller knows it to be.
+    Known(Vec<f64>),
 }
 
-impl Spectrum {
+impl Densities {
+    fn len(&self) -> usize {
+        match self {
+            Self::Fitted(indices) => indices.len(),
+            Self::Known(values) => values.len(),
+        }
+    }
+
+    fn at(&self, i: usize, params: &[f64]) -> f64 {
+        match self {
+            Self::Fitted(indices) => params[indices[i]],
+            Self::Known(values) => values[i],
+        }
+    }
+}
+
+/// One spectrum in a joint fit: its grid, what is in the beam, and how its
+/// free parameters are read out of the shared vector.
+pub struct SpectrumSpec {
+    /// Energy grid (eV), ascending.
+    pub energies: Vec<f64>,
+    /// One entry per isotope in the beam.
+    pub resonance_data: Vec<ResonanceData>,
+    /// Areal densities, fitted or known.
+    pub densities: Densities,
+    /// `params[temperature_index]` is the temperature, else `temperature_k`.
+    pub temperature_index: Option<usize>,
+    /// Temperature (K) when it is not fitted.
+    pub temperature_k: f64,
+}
+
+impl SpectrumSpec {
     fn sample_params(&self, params: &[f64]) -> Result<SampleParams, FittingError> {
         let temperature_k = match self.temperature_index {
             Some(i) => params[i],
@@ -73,14 +98,7 @@ impl Spectrum {
             .resonance_data
             .iter()
             .enumerate()
-            .map(|(i, rd)| {
-                let density = if self.density_indices.is_empty() {
-                    self.fixed_densities[i]
-                } else {
-                    params[self.density_indices[i]]
-                };
-                (rd.clone(), density)
-            })
+            .map(|(i, rd)| (rd.clone(), self.densities.at(i, params)))
             .collect();
         SampleParams::new(temperature_k, isotopes)
             .map_err(|e| FittingError::EvaluationFailed(format!("sample params: {e:?}")))
@@ -103,8 +121,8 @@ impl Spectrum {
 /// calibrant's, so the caller fits against the two spectra concatenated in
 /// that order.
 pub struct JointResolutionModel {
-    sample: Spectrum,
-    calibrant: Spectrum,
+    sample: SpectrumSpec,
+    calibrant: SpectrumSpec,
     flight_path_m: f64,
     /// `params[delta_t_sq_index]` / `params[delta_l_sq_index]` are the SQUARED
     /// Gaussian widths, in µs² and m², shared by both spectra.
@@ -115,83 +133,58 @@ pub struct JointResolutionModel {
 impl JointResolutionModel {
     /// Build the joint model.
     ///
-    /// `sample_*` describe the unknown spectrum: its densities come from
-    /// `sample_density_indices` and its temperature from `temperature_index`
-    /// when fitted, otherwise from `sample_temperature_k`. `calibrant_*`
-    /// describe the known one, whose densities and temperature are fixed —
-    /// that is what makes it a calibrant.
+    /// `delta_t_sq_index` / `delta_l_sq_index` are the shared slots holding
+    /// the squared widths. Everything else about each arm, including whether
+    /// its densities and temperature are fitted, is in its
+    /// [`SpectrumSpec`] — the calibrant's being known is what makes it a
+    /// calibrant.
     ///
     /// # Errors
     /// [`FittingError::InvalidConfig`] when a spectrum's grid is empty, when
-    /// an index collection does not match its isotope count, or when two
-    /// parameters share an index.
-    #[allow(clippy::too_many_arguments)]
+    /// its density count does not match its isotope count, or when two
+    /// parameters share a slot.
     pub fn new(
-        sample_energies: Vec<f64>,
-        sample_resonance_data: Vec<ResonanceData>,
-        sample_density_indices: Vec<usize>,
-        sample_temperature_k: f64,
-        temperature_index: Option<usize>,
-        calibrant_energies: Vec<f64>,
-        calibrant_resonance_data: Vec<ResonanceData>,
-        calibrant_densities: Vec<f64>,
-        calibrant_temperature_k: f64,
+        sample: SpectrumSpec,
+        calibrant: SpectrumSpec,
         flight_path_m: f64,
         delta_t_sq_index: usize,
         delta_l_sq_index: usize,
     ) -> Result<Self, FittingError> {
-        if sample_energies.is_empty() || calibrant_energies.is_empty() {
-            return Err(FittingError::InvalidConfig(
-                "both the sample and the calibrant need a non-empty energy grid".into(),
-            ));
-        }
-        if sample_density_indices.len() != sample_resonance_data.len() {
-            return Err(FittingError::InvalidConfig(format!(
-                "sample has {} density indices for {} isotopes",
-                sample_density_indices.len(),
-                sample_resonance_data.len(),
-            )));
-        }
-        if calibrant_densities.len() != calibrant_resonance_data.len() {
-            return Err(FittingError::InvalidConfig(format!(
-                "calibrant has {} densities for {} isotopes",
-                calibrant_densities.len(),
-                calibrant_resonance_data.len(),
-            )));
+        for (label, spec) in [("sample", &sample), ("calibrant", &calibrant)] {
+            if spec.energies.is_empty() {
+                return Err(FittingError::InvalidConfig(format!(
+                    "the {label} needs a non-empty energy grid"
+                )));
+            }
+            if spec.densities.len() != spec.resonance_data.len() {
+                return Err(FittingError::InvalidConfig(format!(
+                    "the {label} has {} densities for {} isotopes",
+                    spec.densities.len(),
+                    spec.resonance_data.len(),
+                )));
+            }
         }
         // Every slot the model reads must name one quantity. Two of them
         // sharing an index makes a single optimizer coordinate move two
         // different physical things at once.
-        let mut slots: Vec<usize> = sample_density_indices.clone();
-        slots.extend(temperature_index);
-        slots.extend([delta_t_sq_index, delta_l_sq_index]);
+        let mut slots = vec![delta_t_sq_index, delta_l_sq_index];
+        for spec in [&sample, &calibrant] {
+            if let Densities::Fitted(indices) = &spec.densities {
+                slots.extend(indices);
+            }
+            slots.extend(spec.temperature_index);
+        }
         let mut seen = slots.clone();
         seen.sort_unstable();
         seen.dedup();
         if seen.len() != slots.len() {
             return Err(FittingError::InvalidConfig(format!(
-                "two parameters share an index: densities {sample_density_indices:?}, \
-                 temperature {temperature_index:?}, widths ({delta_t_sq_index}, \
-                 {delta_l_sq_index})"
+                "two parameters share a slot: {slots:?}"
             )));
         }
         Ok(Self {
-            sample: Spectrum {
-                energies: sample_energies,
-                resonance_data: sample_resonance_data,
-                density_indices: sample_density_indices,
-                fixed_densities: Vec::new(),
-                temperature_index,
-                temperature_k: sample_temperature_k,
-            },
-            calibrant: Spectrum {
-                energies: calibrant_energies,
-                resonance_data: calibrant_resonance_data,
-                density_indices: Vec::new(),
-                fixed_densities: calibrant_densities,
-                temperature_index: None,
-                temperature_k: calibrant_temperature_k,
-            },
+            sample,
+            calibrant,
             flight_path_m,
             delta_t_sq_index,
             delta_l_sq_index,
@@ -261,6 +254,31 @@ mod tests {
     const DL_TRUE: f64 = 0.05;
     const NOISE: f64 = 0.002;
 
+    /// The two arms for a test: the sample's density and temperature fitted
+    /// at the given slots, the calibrant's known.
+    fn arms(
+        iso: &ResonanceData,
+        energies: &[f64],
+        temperature_index: Option<usize>,
+    ) -> (SpectrumSpec, SpectrumSpec) {
+        (
+            SpectrumSpec {
+                energies: energies.to_vec(),
+                resonance_data: vec![iso.clone()],
+                densities: Densities::Fitted(vec![0]),
+                temperature_index,
+                temperature_k: T_TRUE,
+            },
+            SpectrumSpec {
+                energies: energies.to_vec(),
+                resonance_data: vec![iso.clone()],
+                densities: Densities::Known(vec![DENSITY]),
+                temperature_index: None,
+                temperature_k: T_TRUE,
+            },
+        )
+    }
+
     fn fixture() -> (ResonanceData, Vec<f64>, Vec<f64>) {
         let iso = synthetic_isotope(72, 178, 20.0, 0.05, 0.06);
         let energies: Vec<f64> = (0..120).map(|i| 18.0 + i as f64 * 0.04).collect();
@@ -302,20 +320,10 @@ mod tests {
         let calibrant_sample = SampleParams::new(T_TRUE, vec![(iso.clone(), DENSITY)]).unwrap();
 
         let pinned_fit = |data: &[f64], w: f64, dl: f64| -> Option<(f64, f64)> {
-            let model = JointResolutionModel::new(
-                energies.clone(),
-                vec![iso.clone()],
-                vec![0],
-                T_TRUE,
-                Some(1),
-                energies.clone(),
-                vec![iso.clone()],
-                vec![DENSITY],
-                T_TRUE,
-                L,
-                2,
-                3,
-            )
+            let model = {
+                let (sample, calibrant) = arms(&iso, &energies, Some(1));
+                JointResolutionModel::new(sample, calibrant, L, 2, 3)
+            }
             .unwrap();
             // Sample arm only: the calibrant half is masked out by fitting
             // against the sample data alone.
@@ -379,20 +387,10 @@ mod tests {
         // objective.
         let cal_data = noisy();
         let sample_data = noisy();
-        let model = JointResolutionModel::new(
-            energies.clone(),
-            vec![iso.clone()],
-            vec![0],
-            T_TRUE,
-            Some(1),
-            energies.clone(),
-            vec![iso.clone()],
-            vec![DENSITY],
-            T_TRUE,
-            L,
-            2,
-            3,
-        )
+        let model = {
+            let (sample, calibrant) = arms(&iso, &energies, Some(1));
+            JointResolutionModel::new(sample, calibrant, L, 2, 3)
+        }
         .unwrap();
         let mut joint_data = sample_data.clone();
         joint_data.extend_from_slice(&cal_data);
@@ -456,20 +454,10 @@ mod tests {
         const FD_STEP: f64 = 1.0e-6;
 
         let (iso, energies, _) = fixture();
-        let model = JointResolutionModel::new(
-            energies.clone(),
-            vec![iso.clone()],
-            vec![0],
-            T_TRUE,
-            None,
-            energies.clone(),
-            std::slice::from_ref(&iso).to_vec(),
-            vec![DENSITY],
-            T_TRUE,
-            L,
-            1,
-            2,
-        )
+        let model = {
+            let (sample, calibrant) = arms(&iso, &energies, None);
+            JointResolutionModel::new(sample, calibrant, L, 1, 2)
+        }
         .unwrap();
 
         // params = [density, delta_t^2, delta_l^2], the flight-path width at
@@ -512,20 +500,9 @@ mod tests {
     fn parameters_sharing_an_index_are_rejected() {
         let (iso, energies, _) = fixture();
         let build = |density: usize, temperature: Option<usize>, dt: usize, dl: usize| {
-            JointResolutionModel::new(
-                energies.clone(),
-                vec![iso.clone()],
-                vec![density],
-                T_TRUE,
-                temperature,
-                energies.clone(),
-                vec![iso.clone()],
-                vec![DENSITY],
-                T_TRUE,
-                L,
-                dt,
-                dl,
-            )
+            let (mut sample, calibrant) = arms(&iso, &energies, temperature);
+            sample.densities = Densities::Fitted(vec![density]);
+            JointResolutionModel::new(sample, calibrant, L, dt, dl)
         };
         assert!(
             build(0, Some(1), 2, 3).is_ok(),
