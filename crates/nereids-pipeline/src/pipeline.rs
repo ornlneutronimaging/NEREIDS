@@ -2203,10 +2203,18 @@ fn build_density_params(config: &UnifiedFitConfig) -> Vec<FitParameter> {
         .collect()
 }
 
+/// Optimizer box for a fitted sample temperature (K).
+///
+/// The lower edge is above zero because a zero-temperature sample has no
+/// Doppler broadening at all, which is not a sample any of these paths
+/// describe; the upper edge is the range the resonance physics is validated
+/// over. Every fit path that frees a temperature uses this box, so they
+/// cannot disagree about what a temperature is allowed to be.
+pub(crate) const TEMPERATURE_BOUNDS_K: (f64, f64) = (1.0, 5000.0);
+
 /// Append a temperature parameter to the fit vector if
 /// `config.fit_temperature` is `true`.  Returns the parameter index.
 ///
-/// Bounds [1.0, 5000.0] K match the transmission / counts fit paths.
 /// Temperature unit is Kelvin; the initial value is `config.temperature_k`.
 fn append_temperature_param(
     param_vec: &mut Vec<FitParameter>,
@@ -2219,8 +2227,8 @@ fn append_temperature_param(
     param_vec.push(FitParameter {
         name: "temperature_k".into(),
         value: config.temperature_k,
-        lower: 1.0,
-        upper: 5000.0,
+        lower: TEMPERATURE_BOUNDS_K.0,
+        upper: TEMPERATURE_BOUNDS_K.1,
         fixed: false,
     });
     Some(idx)
@@ -3534,8 +3542,8 @@ pub fn evaluate_jacobian_and_fisher(
         param_vec.push(FitParameter {
             name: "temperature_k".into(),
             value: config.temperature_k,
-            lower: 1.0,
-            upper: 5000.0,
+            lower: TEMPERATURE_BOUNDS_K.0,
+            upper: TEMPERATURE_BOUNDS_K.1,
             fixed: false,
         });
         Some(idx)

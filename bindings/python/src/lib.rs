@@ -1594,6 +1594,179 @@ impl PyResolutionCalibration {
     }
 }
 
+/// Result of a joint sample + calibrant fit.
+#[pyclass(name = "JointFitResult")]
+struct PyJointFitResult {
+    inner: nereids_pipeline::joint_fit::JointFitResult,
+}
+
+#[pymethods]
+impl PyJointFitResult {
+    /// Fitted areal densities (atoms/barn), one per sample isotope.
+    #[getter]
+    fn densities(&self) -> Vec<f64> {
+        self.inner.densities.clone()
+    }
+
+    /// One-sigma uncertainty on each density.
+    #[getter]
+    fn density_uncertainties(&self) -> Option<Vec<f64>> {
+        self.inner.density_uncertainties.clone()
+    }
+
+    /// Fitted temperature (K); ``None`` when it was held fixed.
+    #[getter]
+    fn temperature_k(&self) -> Option<f64> {
+        self.inner.temperature_k
+    }
+
+    /// One-sigma uncertainty on the fitted temperature.
+    ///
+    /// Larger than the pinned route's, and correctly so: the calibrant that
+    /// constrains the resolution is in the same objective, so the
+    /// temperature's degeneracy with the resolution is carried rather than
+    /// dropped.
+    #[getter]
+    fn temperature_k_unc(&self) -> Option<f64> {
+        self.inner.temperature_k_unc
+    }
+
+    /// Fitted shared timing width (µs), the W-parameter in ``exp(-x^2/W^2)``.
+    #[getter]
+    fn delta_t_us(&self) -> f64 {
+        self.inner.delta_t_us
+    }
+
+    /// Fitted shared flight-path width (m), same convention.
+    #[getter]
+    fn delta_l_m(&self) -> f64 {
+        self.inner.delta_l_m
+    }
+
+    /// Reduced chi-squared over both spectra together.
+    #[getter]
+    fn reduced_chi_squared(&self) -> f64 {
+        self.inner.reduced_chi_squared
+    }
+
+    #[getter]
+    fn converged(&self) -> bool {
+        self.inner.converged
+    }
+
+    #[getter]
+    fn iterations(&self) -> usize {
+        self.inner.iterations
+    }
+
+    fn __repr__(&self) -> String {
+        let temperature = self
+            .inner
+            .temperature_k
+            .map_or_else(|| "None".to_string(), |t| format!("{t:.3}"));
+        format!(
+            "JointFitResult(densities={:?}, temperature_k={temperature}, \
+             delta_t_us={:.5}, delta_l_m={:.5}, chi2/dof={:.4}, converged={})",
+            self.inner.densities,
+            self.inner.delta_t_us,
+            self.inner.delta_l_m,
+            self.inner.reduced_chi_squared,
+            self.inner.converged
+        )
+    }
+}
+
+/// Fit a sample and the calibrant that measured its resolution together.
+///
+/// The usual route calibrates the resolution on a known sample, pins it, and
+/// fits the unknown one. That reports the temperature as more certain than it
+/// is: resolution width and temperature broaden the line the same way, and
+/// pinning discards the uncertainty that belongs to their degeneracy.
+///
+/// Here both spectra are fitted at once against ONE shared Gaussian
+/// resolution, so the calibrant's residuals sit in the same objective as the
+/// sample's and the reported ``temperature_k_unc`` already contains what the
+/// calibrant failed to pin down.
+///
+/// Args:
+///     transmission, uncertainty, energies: the sample spectrum.
+///     isotopes: list of (ResonanceData, initial_density) for the sample.
+///     calibrant_transmission, calibrant_uncertainty, calibrant_energies:
+///         the known spectrum. Its own grid, so it need not match the
+///         sample's.
+///     calibrant_isotopes: list of (ResonanceData, KNOWN density). Fixed
+///         during the fit -- that is what makes it a calibrant.
+///     calibrant_temperature_k: the calibrant's known temperature.
+///     temperature_k: sample temperature; the start value when fitted.
+///     fit_temperature: whether the sample temperature is free.
+///     flight_path_m: flight path (m), shared by both spectra.
+///     delta_t_us, delta_l_m: starting widths for the shared resolution. A
+///         standalone ``calibrate_resolution`` result is the natural seed.
+///
+/// Returns:
+///     JointFitResult with the sample densities and temperature, the fitted
+///     shared widths, and the uncertainties.
+#[pyfunction]
+#[pyo3(signature = (
+    transmission, uncertainty, energies, isotopes,
+    calibrant_transmission, calibrant_uncertainty, calibrant_energies,
+    calibrant_isotopes, calibrant_temperature_k, *,
+    temperature_k = 293.6, fit_temperature = true,
+    flight_path_m = 25.0, delta_t_us = 1.0, delta_l_m = 0.0
+))]
+#[allow(clippy::too_many_arguments)]
+fn fit_with_calibrant(
+    py: Python<'_>,
+    transmission: PyReadonlyArray1<f64>,
+    uncertainty: PyReadonlyArray1<f64>,
+    energies: PyReadonlyArray1<f64>,
+    isotopes: Vec<(PyResonanceData, f64)>,
+    calibrant_transmission: PyReadonlyArray1<f64>,
+    calibrant_uncertainty: PyReadonlyArray1<f64>,
+    calibrant_energies: PyReadonlyArray1<f64>,
+    calibrant_isotopes: Vec<(PyResonanceData, f64)>,
+    calibrant_temperature_k: f64,
+    temperature_k: f64,
+    fit_temperature: bool,
+    flight_path_m: f64,
+    delta_t_us: f64,
+    delta_l_m: f64,
+) -> PyResult<PyJointFitResult> {
+    let sample = nereids_pipeline::joint_fit::SampleSpectrum {
+        energies: energies.as_slice()?.to_vec(),
+        transmission: transmission.as_slice()?.to_vec(),
+        uncertainty: uncertainty.as_slice()?.to_vec(),
+        isotopes: isotopes
+            .iter()
+            .map(|(i, n)| ((*i.inner).clone(), *n))
+            .collect(),
+        temperature_k,
+        fit_temperature,
+    };
+    let calibrant = nereids_pipeline::joint_fit::CalibrantSpectrum {
+        energies: calibrant_energies.as_slice()?.to_vec(),
+        transmission: calibrant_transmission.as_slice()?.to_vec(),
+        uncertainty: calibrant_uncertainty.as_slice()?.to_vec(),
+        isotopes: calibrant_isotopes
+            .iter()
+            .map(|(i, n)| ((*i.inner).clone(), *n))
+            .collect(),
+        temperature_k: calibrant_temperature_k,
+    };
+    let inner = py
+        .detach(move || {
+            nereids_pipeline::joint_fit::fit_with_calibrant(
+                &sample,
+                &calibrant,
+                flight_path_m,
+                delta_t_us,
+                delta_l_m,
+            )
+        })
+        .map_err(|e| pyo3::exceptions::PyValueError::new_err(e.to_string()))?;
+    Ok(PyJointFitResult { inner })
+}
+
 /// Calibrate instrument-resolution parameters against a known-(ρ,T) calibrant.
 ///
 /// Fits the resolution parameters of `family` while holding the calibrant's
@@ -4749,12 +4922,14 @@ fn nereids(m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_class::<PyEnergyLaw>()?;
     m.add_class::<PyIkedaCarpenter>()?;
     m.add_class::<PyResolutionCalibration>()?;
+    m.add_class::<PyJointFitResult>()?;
     m.add_class::<PySpatialResult>()?;
     m.add_class::<PyTraceDetectabilityReport>()?;
     m.add_class::<PyTwoArmBackgroundFitResult>()?;
     m.add_function(wrap_pyfunction!(cross_sections, m)?)?;
     m.add_function(wrap_pyfunction!(forward_model, m)?)?;
     m.add_function(wrap_pyfunction!(calibrate_resolution, m)?)?;
+    m.add_function(wrap_pyfunction!(fit_with_calibrant, m)?)?;
     m.add_function(wrap_pyfunction!(tof_to_energy, m)?)?;
     m.add_function(wrap_pyfunction!(energy_to_tof, m)?)?;
     m.add_function(wrap_pyfunction!(load_endf, m)?)?;

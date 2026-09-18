@@ -4975,6 +4975,93 @@ class TestIkedaCarpenterCausalResponse:
         assert slow == pytest.approx(fast, abs=1e-9)
 
 
+class TestFitWithCalibrant:
+    """The joint sample + calibrant fit."""
+
+    L = 25.0
+    W = 1.0
+    DL = 0.02
+
+    @classmethod
+    def _spectrum(cls, iso, density, temperature_k, energies):
+        return np.asarray(
+            nereids.forward_model(
+                energies,
+                [(iso, density)],
+                temperature_k=temperature_k,
+                flight_path_m=cls.L,
+                delta_t_us=cls.W,
+                delta_l_m=cls.DL,
+            )
+        )
+
+    def test_recovers_the_sample_and_the_shared_resolution(self):
+        """The fit moves off a deliberately wrong resolution seed.
+
+        Seeding the widths away from truth is the point: a fit that merely
+        echoed its seed would leave the sample parameters absorbing the
+        difference.
+
+        The flight-path width is seeded at zero, where the kernel's quadrature
+        makes its derivative vanish unless the optimizer works in the squared
+        width. The two arms also get different isotopes on different grids, so
+        crossing them would change the result.
+        """
+        sample_iso = _make_single_resonance()
+        calibrant_iso = _make_single_resonance(energy=9.1, gn=0.0021, gg=0.019)
+        sample_e = np.linspace(6.3, 7.1, 280)
+        calibrant_e = np.linspace(8.6, 9.6, 240)
+        unc = np.full(sample_e.shape, 4.0e-3)
+        calibrant_unc = np.full(calibrant_e.shape, 4.0e-3)
+        sample = self._spectrum(sample_iso, 1.0e-4, 320.0, sample_e)
+        calibrant = self._spectrum(calibrant_iso, 1.5e-4, 300.0, calibrant_e)
+
+        fit = nereids.fit_with_calibrant(
+            sample,
+            unc,
+            sample_e,
+            [(sample_iso, 0.8e-4)],
+            calibrant,
+            calibrant_unc,
+            calibrant_e,
+            [(calibrant_iso, 1.5e-4)],
+            300.0,
+            temperature_k=305.0,
+            fit_temperature=True,
+            flight_path_m=self.L,
+            delta_t_us=0.6,
+            delta_l_m=0.0,
+        )
+        assert fit.converged
+        assert fit.temperature_k == pytest.approx(320.0, abs=5.0)
+        assert fit.densities[0] == pytest.approx(1.0e-4, rel=0.05)
+        assert fit.delta_t_us == pytest.approx(self.W, rel=0.2), (
+            "the shared width did not move off its 0.6 seed"
+        )
+        assert fit.delta_l_m == pytest.approx(self.DL, rel=0.3), (
+            "the flight-path width did not move off its zero seed"
+        )
+        assert fit.temperature_k_unc is not None
+
+    def test_mismatched_calibrant_arrays_are_rejected(self):
+        iso = _make_single_resonance()
+        energies = np.linspace(6.3, 7.1, 60)
+        unc = np.full(energies.shape, 4.0e-3)
+        spectrum = self._spectrum(iso, 1.0e-4, 300.0, energies)
+        with pytest.raises(ValueError, match="calibrant"):
+            nereids.fit_with_calibrant(
+                spectrum,
+                unc,
+                energies,
+                [(iso, 1.0e-4)],
+                spectrum,
+                unc[1:],
+                energies,
+                [(iso, 1.0e-4)],
+                300.0,
+            )
+
+
 class TestCalibrateResolution:
     """Resolution calibration binding: position is PINNED by default; the shared
     SAMMY energy-scale ``(t0, L_scale)`` is an explicit, prior-constrained opt-in

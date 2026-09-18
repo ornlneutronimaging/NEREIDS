@@ -160,6 +160,40 @@ fit = nereids.fit_spectrum_typed(
 print(fit.densities, fit.temperature_k, fit.reduced_chi_squared)
 ```
 
+### Fit the sample and the calibrant together
+
+Pinning the calibrated resolution reports the temperature as more certain than
+it is.
+Width and temperature broaden the line the same way, so pinning throws away the
+uncertainty that belongs to their degeneracy.
+Summarising the calibration into a prior does not recover it: the calibration's
+own uncertainty is neither Gaussian nor separable, and for the Gaussian family
+the two width parameters trade off almost exactly.
+
+`fit_with_calibrant` puts both spectra in one objective against one shared
+resolution, so nothing has to be summarised:
+
+```python
+fit = nereids.fit_with_calibrant(
+    sample_T, sample_unc, energies, [(hf, 1e-4)],
+    cal_T, cal_unc, cal_energies, [(hf, 5e-5)], 300.0,   # KNOWN calibrant
+    temperature_k=300.0, fit_temperature=True,
+    flight_path_m=25.0, delta_t_us=dt, delta_l_m=dl,     # seeds, not pins
+)
+print(fit.temperature_k, fit.temperature_k_unc)
+print(fit.delta_t_us, fit.delta_l_m)                      # fitted, not pinned
+```
+
+The calibrant's densities and temperature stay fixed -- that is what makes it a
+calibrant -- and the resolution is the only thing the two spectra share.
+`delta_t_us` / `delta_l_m` are starting values here rather than pins, and a
+standalone `calibrate_resolution` result is the natural seed.
+
+Expect a larger `temperature_k_unc` than the pinned route reports.
+That is the correction, not a regression: the pinned number is the uncertainty
+of a temperature measured with a resolution assumed exact, and the resolution
+is not exact.
+
 ## Choosing a calibrant (important)
 
 The fit absorbs *every* unmodeled broadening into the "resolution", so a poor
