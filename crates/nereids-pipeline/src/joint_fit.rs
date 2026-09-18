@@ -16,6 +16,7 @@ use nereids_endf::resonance::ResonanceData;
 use nereids_fitting::joint_resolution::JointResolutionModel;
 use nereids_fitting::lm::{self, LmConfig};
 use nereids_fitting::parameters::{FitParameter, ParameterSet};
+use nereids_fitting::resolution_calib::{GAUSSIAN_DELTA_L_BOUNDS_M, GAUSSIAN_DELTA_T_BOUNDS_US};
 
 use crate::error::PipelineError;
 use crate::pipeline::TEMPERATURE_BOUNDS_K;
@@ -88,8 +89,8 @@ const fn resolution_indices(n_density: usize, fit_temperature: bool) -> (usize, 
 /// [`PipelineError::ShapeMismatch`] when a spectrum's arrays disagree in
 /// length, [`PipelineError::InvalidParameter`] when a grid is empty, an
 /// uncertainty is not positive, a density on either arm is not finite and
-/// positive, or a temperature falls outside the box every fit path shares,
-/// and [`PipelineError::Fitting`] when the optimizer cannot run.
+/// positive, or a temperature or width seed falls outside the box every fit
+/// path shares, and [`PipelineError::Fitting`] when the optimizer cannot run.
 #[allow(clippy::too_many_arguments)]
 pub fn fit_with_calibrant(
     transmission: &[f64],
@@ -163,6 +164,20 @@ pub fn fit_with_calibrant(
             )));
         }
     }
+    // The broadening grid is extended by five sigma of the Gaussian width at
+    // each boundary, so its point count grows with the width. A seed far
+    // outside the box the calibration fits in asks for a grid the machine
+    // cannot hold, before the first residual is ever evaluated.
+    for (label, value, (lo, hi)) in [
+        ("delta_t_init", delta_t_init, GAUSSIAN_DELTA_T_BOUNDS_US),
+        ("delta_l_init", delta_l_init, GAUSSIAN_DELTA_L_BOUNDS_M),
+    ] {
+        if !(lo..=hi).contains(&value) {
+            return Err(PipelineError::InvalidParameter(format!(
+                "{label} must lie in [{lo}, {hi}], got {value}"
+            )));
+        }
+    }
 
     let (delta_t_index, delta_l_index) = resolution_indices(isotopes.len(), fit_temperature);
     let temperature_index = fit_temperature.then_some(isotopes.len());
@@ -204,14 +219,18 @@ pub fn fit_with_calibrant(
     // and its derivative vanishes at zero, leaving a width seeded at zero
     // unfitted; the squares enter linearly and have a finite derivative
     // there.
-    values.push(FitParameter::non_negative(
-        "delta_t_us_sq",
-        delta_t_init * delta_t_init,
-    ));
-    values.push(FitParameter::non_negative(
-        "delta_l_m_sq",
-        delta_l_init * delta_l_init,
-    ));
+    for (name, seed, (lo, hi)) in [
+        ("delta_t_us_sq", delta_t_init, GAUSSIAN_DELTA_T_BOUNDS_US),
+        ("delta_l_m_sq", delta_l_init, GAUSSIAN_DELTA_L_BOUNDS_M),
+    ] {
+        values.push(FitParameter {
+            name: name.into(),
+            value: seed * seed,
+            lower: lo * lo,
+            upper: hi * hi,
+            fixed: false,
+        });
+    }
     let mut params = ParameterSet::new(values);
 
     // The two spectra are concatenated in the order the model predicts them.
@@ -322,6 +341,9 @@ fn check_spectrum(
 mod tests {
     use super::*;
     use nereids_endf::resonance::test_support::synthetic_isotope;
+    use nereids_fitting::resolution_calib::{
+        GAUSSIAN_DELTA_L_BOUNDS_M, GAUSSIAN_DELTA_T_BOUNDS_US,
+    };
     use nereids_physics::resolution::{ResolutionFunction, ResolutionParams};
     use nereids_physics::transmission::{InstrumentParams, SampleParams, forward_model};
 
@@ -407,6 +429,74 @@ mod tests {
             r.temperature_k_unc
                 .is_some_and(|s| s.is_finite() && s > 0.0),
             "a joint fit must report a temperature uncertainty"
+        );
+    }
+
+    /// A width the broadening grid cannot carry is rejected, and the
+    /// optimizer cannot reach one either.
+    ///
+    /// The Gaussian grid is extended by five sigma of the width at each
+    /// boundary, so its point count grows with the width; a forward model at
+    /// 5000 µs on a 280-point eV-range grid already takes tens of seconds,
+    /// and there is no upper limit at which it merely gets slow rather than
+    /// unrunnable. The seed is checked against the box the calibration fits
+    /// in, and the optimizer's own box is that same range squared.
+    #[test]
+    fn a_width_the_grid_cannot_carry_is_rejected_and_unreachable() {
+        let iso = synthetic_isotope(72, 178, 20.0, 0.05, 0.06);
+        let energies: Vec<f64> = (0..40).map(|i| 18.0 + i as f64 * 0.05).collect();
+        let t = spectrum(&iso, 2.0e-3, 300.0, &energies);
+        let unc = vec![1.0e-3; energies.len()];
+        let calibrant = CalibrantSpectrum {
+            energies: energies.clone(),
+            transmission: t.clone(),
+            uncertainty: unc.clone(),
+            isotopes: vec![(iso.clone(), 2.0e-3)],
+            temperature_k: 300.0,
+        };
+        let run = |dt: f64, dl: f64| {
+            fit_with_calibrant(
+                &t,
+                &unc,
+                &energies,
+                std::slice::from_ref(&iso),
+                &[2.0e-3],
+                300.0,
+                true,
+                &calibrant,
+                L,
+                dt,
+                dl,
+            )
+        };
+
+        let (t_lo, t_hi) = GAUSSIAN_DELTA_T_BOUNDS_US;
+        let (_, l_hi) = GAUSSIAN_DELTA_L_BOUNDS_M;
+        assert!(
+            run(t_hi * 2.0, DL).is_err(),
+            "a timing width above {t_hi} µs must be rejected before any \
+             residual is evaluated"
+        );
+        assert!(
+            run(t_lo / 2.0, DL).is_err(),
+            "a timing width below {t_lo} µs must be rejected"
+        );
+        assert!(
+            run(W, l_hi * 2.0).is_err(),
+            "a flight-path width above {l_hi} m must be rejected"
+        );
+        // And the optimizer's own box is the same range squared, so no trial
+        // step can reach a width the seed check would have refused.
+        let r = run(W, DL).expect("a width inside the box is accepted");
+        assert!(
+            (t_lo..=t_hi).contains(&r.delta_t_us),
+            "the fitted timing width {} left [{t_lo}, {t_hi}]",
+            r.delta_t_us
+        );
+        assert!(
+            r.delta_l_m <= l_hi,
+            "the fitted flight-path width {} exceeded {l_hi}",
+            r.delta_l_m
         );
     }
 

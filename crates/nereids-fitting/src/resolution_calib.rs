@@ -361,7 +361,10 @@ impl ResolutionFamily {
     /// `cfg` supplies the starting PSR FWHM when the IC family fits it.
     fn x0_bounds(&self, cfg: &CalibrationConfig) -> (Vec<f64>, Vec<(f64, f64)>) {
         match self {
-            ResolutionFamily::Gaussian => (vec![2.0, 1e-3], vec![(1e-3, 50.0), (0.0, 0.5)]),
+            ResolutionFamily::Gaussian => (
+                vec![2.0, 1e-3],
+                vec![GAUSSIAN_DELTA_T_BOUNDS_US, GAUSSIAN_DELTA_L_BOUNDS_M],
+            ),
             ResolutionFamily::UdrCorr { .. } => {
                 // (log s0, p): s0 = exp(log_s0) clamped to [0.2, 5].
                 (
@@ -748,6 +751,23 @@ fn position_prior_penalty(t0_us: f64, l_scale: f64, cfg: &CalibrationConfig) -> 
     }
     penalty
 }
+
+/// Optimizer box for the Gaussian timing width `delta_t_us`.
+///
+/// The upper edge is what the auxiliary grid can carry: the Gaussian
+/// broadening grid is extended by five sigma at each boundary, so its point
+/// count grows with the width, and a forward model at 50 µs already costs two
+/// orders of magnitude more than one at 1 µs on a typical eV-range grid. Any
+/// fit that frees this width uses this box, so none of them can wander into a
+/// grid the machine cannot hold.
+pub const GAUSSIAN_DELTA_T_BOUNDS_US: (f64, f64) = (1.0e-3, 50.0);
+
+/// Optimizer box for the Gaussian flight-path width `delta_l_m`.
+///
+/// Zero is a real value here — a beamline with no measurable path spread —
+/// and the upper edge bounds the same grid growth as
+/// [`GAUSSIAN_DELTA_T_BOUNDS_US`].
+pub const GAUSSIAN_DELTA_L_BOUNDS_M: (f64, f64) = (0.0, 0.5);
 
 /// Rise in the objective that marks one sigma of a single coordinate, the
 /// others minimized over. `chi^2 = -2 ln L` up to a constant, so one sigma is
