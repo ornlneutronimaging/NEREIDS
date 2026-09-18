@@ -70,7 +70,7 @@ pub struct JointFitResult {
 }
 
 /// Parameter order in the shared vector: densities, then temperature when
-/// fitted, then the two resolution widths.
+/// fitted, then the two squared resolution widths.
 const fn resolution_indices(n_density: usize, fit_temperature: bool) -> (usize, usize) {
     let after = n_density + if fit_temperature { 1 } else { 0 };
     (after, after + 1)
@@ -199,8 +199,19 @@ pub fn fit_with_calibrant(
             fixed: false,
         });
     }
-    values.push(FitParameter::non_negative("delta_t_us", delta_t_init));
-    values.push(FitParameter::non_negative("delta_l_m", delta_l_init));
+    // The optimizer works in the SQUARED widths. The kernel combines the two
+    // terms in quadrature, so a width itself enters the width quadratically
+    // and its derivative vanishes at zero, leaving a width seeded at zero
+    // unfitted; the squares enter linearly and have a finite derivative
+    // there.
+    values.push(FitParameter::non_negative(
+        "delta_t_us_sq",
+        delta_t_init * delta_t_init,
+    ));
+    values.push(FitParameter::non_negative(
+        "delta_l_m_sq",
+        delta_l_init * delta_l_init,
+    ));
     let mut params = ParameterSet::new(values);
 
     // The two spectra are concatenated in the order the model predicts them.
@@ -237,8 +248,8 @@ pub fn fit_with_calibrant(
             .map(|u| u[..isotopes.len()].to_vec()),
         temperature_k: temperature_index.map(|i| result.params[i]),
         temperature_k_unc: temperature_index.and_then(sigma_of),
-        delta_t_us: result.params[delta_t_index],
-        delta_l_m: result.params[delta_l_index],
+        delta_t_us: result.params[delta_t_index].max(0.0).sqrt(),
+        delta_l_m: result.params[delta_l_index].max(0.0).sqrt(),
         reduced_chi_squared: result.reduced_chi_squared,
         converged: result.converged,
         iterations: result.iterations,
@@ -281,6 +292,29 @@ fn check_spectrum(
             "the {label} uncertainties must all be finite and positive"
         )));
     }
+    // The forward model reads the grid as ascending positive energies and
+    // interpolates the kernel across it; a repeated, reversed or non-positive
+    // energy has no time of flight, and a non-finite transmission makes every
+    // residual NaN, which an optimizer reads as a step it cannot improve on
+    // rather than as bad input.
+    if energies.iter().any(|e| !e.is_finite() || *e <= 0.0) {
+        return Err(PipelineError::InvalidParameter(format!(
+            "the {label} energies must all be finite and positive"
+        )));
+    }
+    if let Some(i) = energies.windows(2).position(|w| w[1] <= w[0]) {
+        return Err(PipelineError::InvalidParameter(format!(
+            "the {label} energies must increase: [{i}] = {} is not below [{}] = {}",
+            energies[i],
+            i + 1,
+            energies[i + 1],
+        )));
+    }
+    if transmission.iter().any(|t| !t.is_finite()) {
+        return Err(PipelineError::InvalidParameter(format!(
+            "the {label} transmission values must all be finite"
+        )));
+    }
     Ok(())
 }
 
@@ -314,27 +348,33 @@ mod tests {
     /// Seeding the widths away from truth is the point: if the fit merely
     /// echoed its seed the recovered resolution would still be wrong and the
     /// sample parameters would absorb the difference.
+    ///
+    /// The two arms get different isotopes on different grids. Sharing one
+    /// would let the arms be crossed — calibrant parameters applied to the
+    /// sample, or one grid used for both — without changing the result.
     #[test]
     fn a_joint_fit_recovers_the_sample_and_the_shared_resolution() {
-        let iso = synthetic_isotope(72, 178, 20.0, 0.05, 0.06);
-        let energies: Vec<f64> = (0..160).map(|i| 18.0 + i as f64 * 0.03).collect();
-        let sample_t = spectrum(&iso, 2.0e-3, 320.0, &energies);
-        let calibrant_t = spectrum(&iso, 2.0e-3, 300.0, &energies);
-        let unc = vec![1.0e-3; energies.len()];
+        let sample_iso = synthetic_isotope(72, 178, 20.0, 0.05, 0.06);
+        let calibrant_iso = synthetic_isotope(72, 177, 31.0, 0.04, 0.07);
+        let sample_e: Vec<f64> = (0..160).map(|i| 18.0 + i as f64 * 0.03).collect();
+        let calibrant_e: Vec<f64> = (0..140).map(|i| 29.0 + i as f64 * 0.032).collect();
+        let sample_t = spectrum(&sample_iso, 2.0e-3, 320.0, &sample_e);
+        let calibrant_t = spectrum(&calibrant_iso, 3.0e-3, 300.0, &calibrant_e);
+        let unc = vec![1.0e-3; sample_e.len()];
 
         let calibrant = CalibrantSpectrum {
-            energies: energies.clone(),
+            energies: calibrant_e,
             transmission: calibrant_t,
-            uncertainty: unc.clone(),
-            isotopes: vec![(iso.clone(), 2.0e-3)],
+            uncertainty: vec![1.0e-3; 140],
+            isotopes: vec![(calibrant_iso, 3.0e-3)],
             temperature_k: 300.0,
         };
 
         let r = fit_with_calibrant(
             &sample_t,
             &unc,
-            &energies,
-            &[iso],
+            &sample_e,
+            &[sample_iso],
             &[1.6e-3],
             300.0,
             true,
@@ -368,6 +408,89 @@ mod tests {
                 .is_some_and(|s| s.is_finite() && s > 0.0),
             "a joint fit must report a temperature uncertainty"
         );
+    }
+
+    /// A grid or a spectrum the forward model cannot read is rejected on both
+    /// arms.
+    ///
+    /// Length agreement is not enough: the model reads the grid as ascending
+    /// positive energies, and a non-finite transmission turns every residual
+    /// into NaN, which the optimizer reads as a step that cannot be improved
+    /// on rather than as bad input.
+    #[test]
+    fn unreadable_grids_and_spectra_are_rejected_on_either_arm() {
+        let iso = synthetic_isotope(72, 178, 20.0, 0.05, 0.06);
+        let energies: Vec<f64> = (0..40).map(|i| 18.0 + i as f64 * 0.05).collect();
+        let good = spectrum(&iso, 2.0e-3, 300.0, &energies);
+        let unc = vec![1.0e-3; energies.len()];
+
+        let mut descending = energies.clone();
+        descending.reverse();
+        let mut repeated = energies.clone();
+        repeated[7] = repeated[6];
+        let mut negative = energies.clone();
+        negative[0] = -1.0;
+        let mut nan_t = good.clone();
+        nan_t[3] = f64::NAN;
+
+        let cases: [(&str, Vec<f64>, Vec<f64>); 4] = [
+            ("descending energies", descending, good.clone()),
+            ("a repeated energy", repeated, good.clone()),
+            ("a negative energy", negative, good.clone()),
+            ("a non-finite transmission", energies.clone(), nan_t),
+        ];
+        for (what, grid, values) in cases {
+            // Once as the sample, once as the calibrant: both arms are read by
+            // the same model and neither may skip the check.
+            let sound = CalibrantSpectrum {
+                energies: energies.clone(),
+                transmission: good.clone(),
+                uncertainty: unc.clone(),
+                isotopes: vec![(iso.clone(), 2.0e-3)],
+                temperature_k: 300.0,
+            };
+            assert!(
+                fit_with_calibrant(
+                    &values,
+                    &unc,
+                    &grid,
+                    std::slice::from_ref(&iso),
+                    &[2.0e-3],
+                    300.0,
+                    true,
+                    &sound,
+                    L,
+                    W,
+                    DL,
+                )
+                .is_err(),
+                "{what} must be rejected on the sample arm"
+            );
+            let broken = CalibrantSpectrum {
+                energies: grid,
+                transmission: values,
+                uncertainty: unc.clone(),
+                isotopes: vec![(iso.clone(), 2.0e-3)],
+                temperature_k: 300.0,
+            };
+            assert!(
+                fit_with_calibrant(
+                    &good,
+                    &unc,
+                    &energies,
+                    std::slice::from_ref(&iso),
+                    &[2.0e-3],
+                    300.0,
+                    true,
+                    &broken,
+                    L,
+                    W,
+                    DL,
+                )
+                .is_err(),
+                "{what} must be rejected on the calibrant arm"
+            );
+        }
     }
 
     /// A calibrant arm that cannot constrain anything is rejected, not fitted.

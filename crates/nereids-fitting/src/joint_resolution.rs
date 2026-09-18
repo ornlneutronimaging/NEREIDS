@@ -33,6 +33,12 @@
 //!
 //! The calibrant's own density and temperature are what make it a calibrant
 //! and stay fixed; only the resolution is shared.
+//!
+//! The two shared slots hold the SQUARED widths, in µs² and m². The kernel
+//! combines the timing and flight-path terms in quadrature,
+//! `W² = timing(Δt)² + path(ΔL)²`, so a width itself enters `W` quadratically
+//! and `∂W/∂ΔL` is exactly zero at `ΔL = 0`. `W²` is linear in the squares,
+//! so `∂W/∂(ΔL²)` is finite there and a width seeded at zero is still fitted.
 
 use std::sync::Arc;
 
@@ -100,10 +106,10 @@ pub struct JointResolutionModel {
     sample: Spectrum,
     calibrant: Spectrum,
     flight_path_m: f64,
-    /// `params[delta_t_index]` / `params[delta_l_index]` are the Gaussian
-    /// widths, shared by both spectra.
-    delta_t_index: usize,
-    delta_l_index: usize,
+    /// `params[delta_t_sq_index]` / `params[delta_l_sq_index]` are the SQUARED
+    /// Gaussian widths, in µs² and m², shared by both spectra.
+    delta_t_sq_index: usize,
+    delta_l_sq_index: usize,
 }
 
 impl JointResolutionModel {
@@ -131,8 +137,8 @@ impl JointResolutionModel {
         calibrant_densities: Vec<f64>,
         calibrant_temperature_k: f64,
         flight_path_m: f64,
-        delta_t_index: usize,
-        delta_l_index: usize,
+        delta_t_sq_index: usize,
+        delta_l_sq_index: usize,
     ) -> Result<Self, FittingError> {
         if sample_energies.is_empty() || calibrant_energies.is_empty() {
             return Err(FittingError::InvalidConfig(
@@ -158,15 +164,15 @@ impl JointResolutionModel {
         // different physical things at once.
         let mut slots: Vec<usize> = sample_density_indices.clone();
         slots.extend(temperature_index);
-        slots.extend([delta_t_index, delta_l_index]);
+        slots.extend([delta_t_sq_index, delta_l_sq_index]);
         let mut seen = slots.clone();
         seen.sort_unstable();
         seen.dedup();
         if seen.len() != slots.len() {
             return Err(FittingError::InvalidConfig(format!(
                 "two parameters share an index: densities {sample_density_indices:?}, \
-                 temperature {temperature_index:?}, widths ({delta_t_index}, \
-                 {delta_l_index})"
+                 temperature {temperature_index:?}, widths ({delta_t_sq_index}, \
+                 {delta_l_sq_index})"
             )));
         }
         Ok(Self {
@@ -187,8 +193,8 @@ impl JointResolutionModel {
                 temperature_k: calibrant_temperature_k,
             },
             flight_path_m,
-            delta_t_index,
-            delta_l_index,
+            delta_t_sq_index,
+            delta_l_sq_index,
         })
     }
 
@@ -216,8 +222,8 @@ impl JointResolutionModel {
     fn instrument(&self, params: &[f64]) -> Result<Arc<InstrumentParams>, FittingError> {
         let resolution = ResolutionParams::new(
             self.flight_path_m,
-            params[self.delta_t_index],
-            params[self.delta_l_index],
+            params[self.delta_t_sq_index].max(0.0).sqrt(),
+            params[self.delta_l_sq_index].max(0.0).sqrt(),
             0.0,
         )
         .map_err(|e| FittingError::EvaluationFailed(format!("shared resolution: {e:?}")))?;
@@ -317,8 +323,8 @@ mod tests {
             let mut params = ParameterSet::new(vec![
                 FitParameter::non_negative("density", DENSITY),
                 FitParameter::non_negative("temperature_k", 285.0),
-                FitParameter::fixed("delta_t_us", w),
-                FitParameter::fixed("delta_l_m", dl),
+                FitParameter::fixed("delta_t_us_sq", w * w),
+                FitParameter::fixed("delta_l_m_sq", dl * dl),
             ]);
             let r = levenberg_marquardt(
                 &sample_only,
@@ -394,8 +400,8 @@ mod tests {
         let mut params = ParameterSet::new(vec![
             FitParameter::non_negative("density", DENSITY),
             FitParameter::non_negative("temperature_k", 285.0),
-            FitParameter::non_negative("delta_t_us", W_TRUE),
-            FitParameter::non_negative("delta_l_m", DL_TRUE),
+            FitParameter::non_negative("delta_t_us_sq", W_TRUE * W_TRUE),
+            FitParameter::non_negative("delta_l_m_sq", DL_TRUE * DL_TRUE),
         ]);
         let r = levenberg_marquardt(
             &model,
@@ -434,6 +440,66 @@ mod tests {
             (0.5..=2.0).contains(&ratio),
             "the joint fit reports sigma_T {joint:.4} against an observed \
              two-stage scatter of {observed:.4} (ratio {ratio:.2})"
+        );
+    }
+
+    /// A flight-path width seeded at zero is still fitted.
+    ///
+    /// The kernel combines the two terms in quadrature, so `W` depends on a
+    /// width through its square and `dW/d(dL)` is exactly zero at `dL = 0`. A
+    /// finite-difference optimizer probing that coordinate sees only the
+    /// second-order term and the width never moves. The measure is the
+    /// Jacobian column the optimizer actually gets at that point, against the
+    /// timing column as the scale of a column it can follow.
+    #[test]
+    fn a_zero_flight_path_width_still_has_a_usable_jacobian_column() {
+        const FD_STEP: f64 = 1.0e-6;
+
+        let (iso, energies, _) = fixture();
+        let model = JointResolutionModel::new(
+            energies.clone(),
+            vec![iso.clone()],
+            vec![0],
+            T_TRUE,
+            None,
+            energies.clone(),
+            std::slice::from_ref(&iso).to_vec(),
+            vec![DENSITY],
+            T_TRUE,
+            L,
+            1,
+            2,
+        )
+        .unwrap();
+
+        // params = [density, delta_t^2, delta_l^2], the flight-path width at
+        // zero and the timing width at its usual scale.
+        let base = [DENSITY, W_TRUE * W_TRUE, 0.0];
+        let column = |slot: usize| -> f64 {
+            let mut probed = base;
+            probed[slot] += FD_STEP * (1.0 + base[slot].abs());
+            let (a, b) = (
+                model.evaluate(&base).expect("base evaluates"),
+                model.evaluate(&probed).expect("probe evaluates"),
+            );
+            a.iter()
+                .zip(&b)
+                .map(|(x, y)| (x - y).abs())
+                .fold(0.0_f64, f64::max)
+                / FD_STEP
+        };
+
+        let timing = column(1);
+        let path = column(2);
+        assert!(
+            timing > 0.0,
+            "the timing column is {timing}, so there is no scale to compare against"
+        );
+        assert!(
+            path > 0.01 * timing,
+            "at a zero flight-path width the column is {path:.4e} against a \
+             timing column of {timing:.4e}; a column that small is below the \
+             noise of any real measurement and the width would never move"
         );
     }
 

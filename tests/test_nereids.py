@@ -5001,34 +5001,45 @@ class TestFitWithCalibrant:
         Seeding the widths away from truth is the point: a fit that merely
         echoed its seed would leave the sample parameters absorbing the
         difference.
+
+        The flight-path width is seeded at zero, where the kernel's quadrature
+        makes its derivative vanish unless the optimizer works in the squared
+        width. The two arms also get different isotopes on different grids, so
+        crossing them would change the result.
         """
-        iso = _make_single_resonance()
-        energies = np.linspace(6.3, 7.1, 280)
-        unc = np.full(energies.shape, 4.0e-3)
-        sample = self._spectrum(iso, 1.0e-4, 320.0, energies)
-        calibrant = self._spectrum(iso, 1.0e-4, 300.0, energies)
+        sample_iso = _make_single_resonance()
+        calibrant_iso = _make_single_resonance(energy=9.1, gn=0.0021, gg=0.019)
+        sample_e = np.linspace(6.3, 7.1, 280)
+        calibrant_e = np.linspace(8.6, 9.6, 240)
+        unc = np.full(sample_e.shape, 4.0e-3)
+        calibrant_unc = np.full(calibrant_e.shape, 4.0e-3)
+        sample = self._spectrum(sample_iso, 1.0e-4, 320.0, sample_e)
+        calibrant = self._spectrum(calibrant_iso, 1.5e-4, 300.0, calibrant_e)
 
         fit = nereids.fit_with_calibrant(
             sample,
             unc,
-            energies,
-            [(iso, 0.8e-4)],
+            sample_e,
+            [(sample_iso, 0.8e-4)],
             calibrant,
-            unc,
-            energies,
-            [(iso, 1.0e-4)],
+            calibrant_unc,
+            calibrant_e,
+            [(calibrant_iso, 1.5e-4)],
             300.0,
             temperature_k=305.0,
             fit_temperature=True,
             flight_path_m=self.L,
             delta_t_us=0.6,
-            delta_l_m=0.01,
+            delta_l_m=0.0,
         )
         assert fit.converged
         assert fit.temperature_k == pytest.approx(320.0, abs=5.0)
         assert fit.densities[0] == pytest.approx(1.0e-4, rel=0.05)
         assert fit.delta_t_us == pytest.approx(self.W, rel=0.2), (
             "the shared width did not move off its 0.6 seed"
+        )
+        assert fit.delta_l_m == pytest.approx(self.DL, rel=0.3), (
+            "the flight-path width did not move off its zero seed"
         )
         assert fit.temperature_k_unc is not None
 
