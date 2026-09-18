@@ -19,7 +19,7 @@
 //!   extension)
 //! - `inp/InputInfoData.cpp` — Default iptdop=9, iptwid=5, nxtra=0
 
-use crate::resolution::ResolutionParams;
+use crate::resolution::{ResolutionFunction, ResolutionParams};
 use nereids_core::constants::NEAR_ZERO_FLOOR;
 
 /// Number of boundary data points used to compute extension spacing.
@@ -87,6 +87,90 @@ pub fn build_extended_grid_boundary_only(
     build_extended_grid_inner(data_energies, resolution, &[], false)
 }
 
+/// Extend a data grid past both ends by the reach of any resolution family.
+///
+/// Boundary extension only: the intermediate points and Fspken fine structure
+/// that [`build_extended_grid`] adds are quadrature devices for the PW-linear
+/// Gaussian path, not a property of the kernel, and the other families do not
+/// use that path.
+pub fn build_extended_grid_for(
+    data_energies: &[f64],
+    resolution: &ResolutionFunction,
+) -> (Vec<f64>, Vec<usize>) {
+    if data_energies.len() < 2 {
+        let indices: Vec<usize> = (0..data_energies.len()).collect();
+        return (data_energies.to_vec(), indices);
+    }
+    let (extend_low, extend_high) =
+        resolution.boundary_reach_ev(data_energies[0], data_energies[data_energies.len() - 1]);
+    extend_boundaries(data_energies, extend_low, extend_high)
+}
+
+/// Extend a grid past both ends, spacing the added points evenly in sqrt(E)
+/// at the edge spacing of the data itself.
+///
+/// SAMMY Ref: `dat/mdata.f90` Vqcon (the FGM sqrt-E convention).
+fn extend_boundaries(
+    data_energies: &[f64],
+    extend_low: f64,
+    extend_high: f64,
+) -> (Vec<f64>, Vec<usize>) {
+    let n = data_energies.len();
+    let e_min = data_energies[0];
+    let e_max = data_energies[n - 1];
+    let mut grid = Vec::with_capacity(n + 200);
+
+    if extend_low > 0.0 && e_min > 0.0 {
+        let n_ref = N_BOUNDARY_REF.min(n);
+        let e_ref = data_energies[n_ref - 1];
+        let d_sqrt = (e_ref.sqrt() - e_min.sqrt()) / (n_ref as f64 - 1.0).max(1.0);
+
+        if d_sqrt > 1e-30 {
+            let target_low = (e_min - extend_low).max(0.001);
+            let sqrt_min = e_min.sqrt();
+            let sqrt_target = target_low.sqrt();
+            let n_ext = ((sqrt_min - sqrt_target) / d_sqrt).ceil() as usize;
+            for k in 1..=n_ext {
+                let sqrt_e = sqrt_min - d_sqrt * k as f64;
+                if sqrt_e > 0.0 {
+                    grid.push(sqrt_e * sqrt_e);
+                }
+            }
+        }
+    }
+
+    grid.extend_from_slice(data_energies);
+
+    if extend_high > 0.0 {
+        let n_ref = N_BOUNDARY_REF.min(n);
+        let e_ref = data_energies[n - n_ref];
+        let d_sqrt = (e_max.sqrt() - e_ref.sqrt()) / (n_ref as f64 - 1.0).max(1.0);
+
+        if d_sqrt > 1e-30 {
+            // A kernel whose delayed tail reaches the nominal flight time
+            // states an unbounded reach; the grid carries what it can, which
+            // is the same clamp the low side makes against E -> 0.
+            let target_high = if extend_high.is_finite() {
+                e_max + extend_high
+            } else {
+                e_max + (e_max - e_min).max(e_max)
+            };
+            let sqrt_max = e_max.sqrt();
+            let sqrt_target = target_high.sqrt();
+            let n_ext = ((sqrt_target - sqrt_max) / d_sqrt).ceil() as usize;
+            for k in 1..=n_ext {
+                let sqrt_e = sqrt_max + d_sqrt * k as f64;
+                grid.push(sqrt_e * sqrt_e);
+            }
+        }
+    }
+
+    grid.sort_unstable_by(|a, b| a.total_cmp(b));
+    dedup(&mut grid);
+    let indices = build_data_indices(&grid, data_energies);
+    (grid, indices)
+}
+
 fn build_extended_grid_inner(
     data_energies: &[f64],
     resolution: Option<&ResolutionParams>,
@@ -111,77 +195,9 @@ fn build_extended_grid_inner(
     let n = data_energies.len();
 
     // ── Step 1: Boundary extension ──────────────────────────────────────
-    // Extend by 5σ of Gaussian width at each boundary, matching SAMMY's
-    // Escale lines 54-97.
-    let n_sigma = 5.0;
-
-    let e_min = data_energies[0];
-    let wg_low = res.gaussian_width(e_min);
-    let extend_low = n_sigma * wg_low;
-
-    let e_max = data_energies[n - 1];
-    let wg_high = res.gaussian_width(e_max);
-    let we_high = res.exp_width(e_max);
-    let extend_high = if we_high > 1e-30 {
-        let rwid = wg_high / we_high;
-        if rwid <= 1.0 {
-            6.25 * we_high
-        } else if rwid <= 2.0 {
-            n_sigma * (3.0 - rwid) * wg_high
-        } else {
-            n_sigma * wg_high
-        }
-    } else {
-        n_sigma * wg_high
-    };
-
-    let mut grid = Vec::with_capacity(n + 200);
-
-    // Low-side extension: equally spaced in √E (SAMMY FGM convention).
-    // SAMMY Ref: dat/mdata.f90 Vqcon
-    if extend_low > 0.0 && e_min > 0.0 {
-        let n_ref = N_BOUNDARY_REF.min(n);
-        let e_ref = data_energies[n_ref - 1];
-        let d_sqrt = (e_ref.sqrt() - e_min.sqrt()) / (n_ref as f64 - 1.0).max(1.0);
-
-        if d_sqrt > 1e-30 {
-            let target_low = (e_min - extend_low).max(0.001);
-            let sqrt_min = e_min.sqrt();
-            let sqrt_target = target_low.sqrt();
-            let n_ext = ((sqrt_min - sqrt_target) / d_sqrt).ceil() as usize;
-            for k in 1..=n_ext {
-                let sqrt_e = sqrt_min - d_sqrt * k as f64;
-                if sqrt_e > 0.0 {
-                    grid.push(sqrt_e * sqrt_e);
-                }
-            }
-        }
-    }
-
-    // Add all data points.
-    grid.extend_from_slice(data_energies);
-
-    // High-side extension: equally spaced in √E (SAMMY FGM convention).
-    if extend_high > 0.0 {
-        let n_ref = N_BOUNDARY_REF.min(n);
-        let e_ref = data_energies[n - n_ref];
-        let d_sqrt = (e_max.sqrt() - e_ref.sqrt()) / (n_ref as f64 - 1.0).max(1.0);
-
-        if d_sqrt > 1e-30 {
-            let target_high = e_max + extend_high;
-            let sqrt_max = e_max.sqrt();
-            let sqrt_target = target_high.sqrt();
-            let n_ext = ((sqrt_target - sqrt_max) / d_sqrt).ceil() as usize;
-            for k in 1..=n_ext {
-                let sqrt_e = sqrt_max + d_sqrt * k as f64;
-                grid.push(sqrt_e * sqrt_e);
-            }
-        }
-    }
-
-    // Sort and deduplicate before inserting intermediate points.
-    grid.sort_unstable_by(|a, b| a.total_cmp(b));
-    dedup(&mut grid);
+    let (extend_low, extend_high) = ResolutionFunction::Gaussian(*res)
+        .boundary_reach_ev(data_energies[0], data_energies[n - 1]);
+    let (mut grid, _) = extend_boundaries(data_energies, extend_low, extend_high);
 
     // ── Step 2: Adaptive intermediate points ────────────────────────────
     // Insert intermediate points where the grid spacing exceeds a fraction

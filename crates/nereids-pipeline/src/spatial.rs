@@ -1384,13 +1384,26 @@ pub fn spatial_map_typed(
                 // `precomputed_cross_sections` is cached (the non-
                 // cached path already surfaces this via
                 // `broadened_cross_sections`).
-                Some(res) => build_resolution_plan(config.energies(), res)
-                    .map_err(|e| {
-                        PipelineError::Transmission(
-                            nereids_physics::transmission::TransmissionError::from(e),
-                        )
-                    })?
-                    .map(Arc::new),
+                // On the working grid, which is the grid the broadening is
+                // applied to: a kernel that reaches past the data ends gets
+                // an extended one, and a plan compiled for the data grid
+                // would be rejected there.
+                Some(res) => {
+                    let work = nereids_physics::transmission::resolution_working_grid(
+                        config.energies(),
+                        Some(&nereids_physics::transmission::InstrumentParams {
+                            resolution: res.clone(),
+                        }),
+                        &rd_refs,
+                    )?;
+                    build_resolution_plan(&work.energies, res)
+                        .map_err(|e| {
+                            PipelineError::Transmission(
+                                nereids_physics::transmission::TransmissionError::from(e),
+                            )
+                        })?
+                        .map(Arc::new)
+                }
                 None => None,
             }
         } else {

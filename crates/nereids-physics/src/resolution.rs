@@ -1342,11 +1342,29 @@ impl TabulatedResolution {
     /// equivalent broadening at the boundaries is correct (#514).
     #[must_use]
     pub fn kernel_support_ev(&self, e_ev: f64) -> f64 {
+        let (below, above) = self.kernel_support_directional_ev(e_ev);
+        above.max(below)
+    }
+
+    /// How far the kernel at `e_ev` reaches, as `(below, above)` in eV.
+    ///
+    /// The two sides are separate numbers because a measured kernel is not
+    /// symmetric: an Ikeda-Carpenter moderator emits late, so its offsets are
+    /// almost all positive and it gathers theory from HIGHER energy only,
+    /// while a mode-anchored table straddles zero and reaches both ways.
+    /// [`Self::kernel_support_ev`] is the larger of the two, which is what a
+    /// caller wants when it pads a window symmetrically.
+    ///
+    /// `above` is `f64::INFINITY` when the positive-offset extreme reaches
+    /// the nominal flight time; see [`Self::kernel_support_ev`] for the rest
+    /// of the contract.
+    #[must_use]
+    pub fn kernel_support_directional_ev(&self, e_ev: f64) -> (f64, f64) {
         if e_ev <= 0.0 || !e_ev.is_finite() {
-            return 0.0;
+            return (0.0, 0.0);
         }
         if self.kernels.is_empty() || self.flight_path_m <= 0.0 {
-            return 0.0;
+            return (0.0, 0.0);
         }
         // Use binary_search to distinguish exact hits from
         // between-ref interpolation:
@@ -1443,17 +1461,15 @@ impl TabulatedResolution {
             }
         }
         let t = TOF_FACTOR * self.flight_path_m / e_ev.sqrt();
-        // Up-side excursion: the positive-offset (delayed-emission)
-        // tail gathers theory at t − dt⁺, i.e. from HIGHER energy.
-        let up = if max_dt_pos >= t {
-            return f64::INFINITY;
-        } else {
-            e_ev * ((t / (t - max_dt_pos)).powi(2) - 1.0)
-        };
         // Down-side excursion: negative offsets gather at t + dt⁻,
         // i.e. from lower energy (bounded below by E' → 0).
         let down = e_ev * (1.0 - (t / (t + max_dt_neg)).powi(2));
-        up.max(down)
+        // Up-side excursion: the positive-offset (delayed-emission)
+        // tail gathers theory at t − dt⁺, i.e. from HIGHER energy.
+        if max_dt_pos >= t {
+            return (down, f64::INFINITY);
+        }
+        (down, e_ev * ((t / (t - max_dt_pos)).powi(2) - 1.0))
     }
 }
 
@@ -1483,7 +1499,59 @@ pub enum ResolutionFunction {
     IkedaCarpenter(Arc<crate::ikeda_carpenter::IkedaCarpenter>),
 }
 
+/// Sigmas of Gaussian width the SAMMY Escale boundary extension carries.
+///
+/// SAMMY Ref: `dat/mdata.f90` Escale lines 54-97.
+const ESCALE_N_SIGMA: f64 = 5.0;
+
 impl ResolutionFunction {
+    /// How far past the ends of a data window the kernel gathers theory, in
+    /// eV, as `(below e_min, above e_max)`.
+    ///
+    /// A broadened value at a point within this reach of a window edge is
+    /// built from theory the window does not contain. Evaluating the model on
+    /// a grid extended by these two distances is what makes the value at the
+    /// edge the same one an infinite window would give.
+    ///
+    /// The families differ in what bounds the reach, which is why they differ
+    /// here: an analytic Gaussian has unbounded tails and is cut at SAMMY's
+    /// five-sigma convention, while a measured or synthesized kernel has
+    /// exact compact support and states its own.
+    #[must_use]
+    pub fn boundary_reach_ev(&self, e_min: f64, e_max: f64) -> (f64, f64) {
+        match self {
+            Self::Gaussian(params) => {
+                let wg_high = params.gaussian_width(e_max);
+                let we_high = params.exp_width(e_max);
+                // The exponential tail is one-sided and wider than the
+                // Gaussian core, so SAMMY grades the high side by their
+                // ratio instead of carrying five sigma of a width the tail
+                // dominates.
+                let above = if we_high > 1e-30 {
+                    let rwid = wg_high / we_high;
+                    if rwid <= 1.0 {
+                        6.25 * we_high
+                    } else if rwid <= 2.0 {
+                        ESCALE_N_SIGMA * (3.0 - rwid) * wg_high
+                    } else {
+                        ESCALE_N_SIGMA * wg_high
+                    }
+                } else {
+                    ESCALE_N_SIGMA * wg_high
+                };
+                (ESCALE_N_SIGMA * params.gaussian_width(e_min), above)
+            }
+            Self::Tabulated(tabulated) => (
+                tabulated.kernel_support_directional_ev(e_min).0,
+                tabulated.kernel_support_directional_ev(e_max).1,
+            ),
+            Self::IkedaCarpenter(ic) => (
+                ic.tabulated().kernel_support_directional_ev(e_min).0,
+                ic.tabulated().kernel_support_directional_ev(e_max).1,
+            ),
+        }
+    }
+
     /// Flight path used to map true neutron energy to detector time.
     pub fn flight_path_m(&self) -> f64 {
         match self {

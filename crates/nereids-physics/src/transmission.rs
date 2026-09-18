@@ -98,7 +98,17 @@ fn build_aux_grid(
                 None
             }
         } else {
-            None
+            // Tabulated and Ikeda-Carpenter kernels get the boundary
+            // extension without the intermediates: those are quadrature
+            // points for the PW-linear Gaussian path, which these families
+            // do not take.
+            let (ext_e, di) =
+                crate::auxiliary_grid::build_extended_grid_for(energies, &inst.resolution);
+            if ext_e.len() > energies.len() {
+                Some((ext_e, di))
+            } else {
+                None
+            }
         }
     })
 }
