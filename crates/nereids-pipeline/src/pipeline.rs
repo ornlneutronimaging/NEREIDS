@@ -1243,6 +1243,14 @@ pub fn fit_spectrum_typed(
     input: &InputData,
     config: &UnifiedFitConfig,
 ) -> Result<SpectrumFitResult, PipelineError> {
+    validate_precomputed_cross_sections(config)?;
+    fit_spectrum_validated(input, config)
+}
+
+pub(crate) fn fit_spectrum_validated(
+    input: &InputData,
+    config: &UnifiedFitConfig,
+) -> Result<SpectrumFitResult, PipelineError> {
     let n_e = config.energies().len();
 
     // Validate temperature when fitting is requested
@@ -1337,11 +1345,6 @@ pub fn fit_spectrum_typed(
     }
 
     validate_counts_resolution_route(input.is_counts(), input.n_energies(), config)?;
-
-    // Reject a malformed caller-supplied precomputed cross-section stack here,
-    // before it reaches the forward-model builders (which would otherwise panic
-    // on `xs[0].len()` / an over-long row, or silently mis-fit).
-    validate_precomputed_cross_sections(config)?;
 
     let effective_solver = config.effective_solver(input);
 
@@ -3203,35 +3206,6 @@ pub struct ModelJacobianResult {
     pub param_names: Vec<String>,
 }
 
-/// Evaluate the exact resolved analytical Jacobian and expected Poisson Fisher
-/// at given parameter values, using the same model construction as the
-/// production counts-domain fitting pipeline.
-///
-/// This is a research-oriented function: it builds the full model chain
-/// (transmission model → optional background wrappers → counts model),
-/// evaluates once at the provided parameters, computes the analytical
-/// Jacobian, and assembles the expected Fisher information matrix.
-///
-/// No optimisation is performed.
-///
-/// # Arguments
-///
-/// * `config` — Unified fit configuration (energies, resonance data,
-///   resolution, initial_densities used as evaluation densities, etc.)
-/// * `flux` — Open-beam counts Φ(E) (length = n_energy)
-/// * `background` — Detector background B(E) (length = n_energy, zeros if none)
-///
-/// Density evaluation values come from `config.initial_densities`.
-/// Temperature evaluation value comes from `config.temperature_k`.
-/// α₁/α₂ evaluation values come from `config.counts_background` init fields.
-///
-/// # Errors
-/// Returns [`PipelineError::InvalidParameter`] if the config carries an
-/// instrument resolution (this counts-space helper would evaluate the
-/// unphysical `R[T]` — same rejection as the production fit routes), and
-/// [`PipelineError::ShapeMismatch`] if `config.precomputed_cross_sections`
-/// is set but malformed (empty, wrong row count, wrong row length, or contains a
-/// non-finite σ), consistent with `fit_spectrum_typed` and `spatial_map_typed`.
 pub fn evaluate_jacobian_and_fisher(
     config: &UnifiedFitConfig,
     flux: &[f64],
@@ -7919,22 +7893,42 @@ mod tests {
             &cfg(&with_res, vec![vec![1.0; n_e]], identity()),
             "is not the working grid",
         );
-        let working = phys_transmission::resolution_working_grid(
-            &energies,
-            Some(&InstrumentParams { resolution: res }),
-            &[&data],
-        )
-        .unwrap();
+        let working = Arc::new(
+            phys_transmission::resolution_working_grid(
+                &energies,
+                Some(&InstrumentParams { resolution: res }),
+                &[&data],
+            )
+            .unwrap(),
+        );
         assert!(!working.is_identity());
         let n_work = working.energies.len();
         assert!(
             validate_precomputed_cross_sections(&cfg(
                 &with_res,
                 vec![vec![1.0; n_work]],
-                Arc::new(working)
+                Arc::clone(&working)
             ))
             .is_ok()
         );
+        let with_indices = |data_indices: Vec<usize>| {
+            Arc::new(WorkingGridLayout {
+                energies: working.energies.clone(),
+                data_indices,
+            })
+        };
+        let mut shortened = working.data_indices.clone();
+        shortened.pop();
+        let mut out_of_range = working.data_indices.clone();
+        out_of_range[0] = n_work + 5;
+        let mut permuted = working.data_indices.clone();
+        permuted.reverse();
+        for bad in [shortened, out_of_range, permuted] {
+            expect(
+                &cfg(&with_res, vec![vec![1.0; n_work]], with_indices(bad)),
+                "is not the working grid",
+            );
+        }
     }
 
     /// Cover the OTHER branches of the #608 `evaluate_jacobian_and_fisher` σ

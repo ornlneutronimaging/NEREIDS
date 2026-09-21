@@ -165,8 +165,8 @@ pub struct SpatialResult {
 
 use crate::pipeline::{
     InputData, MultiplicativeBaselineConfig, SolverConfig, UnifiedFitConfig, count_free_params,
-    degenerate_normalization_warning, fit_spectrum_typed, required_active_bins,
-    validate_counts_resolution_route, validate_multiplicative_baseline,
+    degenerate_normalization_warning, fit_spectrum_typed, fit_spectrum_validated,
+    required_active_bins, validate_counts_resolution_route, validate_multiplicative_baseline,
     validate_transmission_background,
 };
 
@@ -1284,27 +1284,9 @@ pub fn spatial_map_typed(
 
     // The resolution plan once for the shared working grid; the energy-scale
     // path rebuilds its grid per trial and takes the non-plan path.
-    //
-    // `build_resolution_plan` returns `None` for Gaussian resolution
-    // (no worthwhile cache at this level) and `Some(plan)` for
-    // tabulated kernels.  The error branch fires only on an unsorted
-    // grid; when `precomputed_cross_sections` is already cached
-    // (`config.precomputed_cross_sections().is_some()`), the
-    // `broadened_cross_sections` call above is skipped, so the plan
-    // build here is the *first* sort-check in that path.  Wrapping
-    // the `ResolutionError` via `TransmissionError::from` keeps the
-    // outward-facing error variant (`PipelineError::Transmission`)
-    // consistent regardless of cache state.
     let resolution_plan: Option<Arc<nereids_physics::resolution::ResolutionPlan>> =
         if !config.fit_energy_scale() {
             match config.resolution() {
-                // Route the unsorted-grid failure through
-                // `TransmissionError::Resolution` so callers observe
-                // the same error variant whether or not
-                // `precomputed_cross_sections` is cached (the non-
-                // cached path already surfaces this via
-                // `broadened_cross_sections`).
-                // Built on the working grid, the grid the broadening is applied to.
                 Some(res) => build_resolution_plan(plan_grid, res)
                     .map_err(|e| {
                         PipelineError::Transmission(
@@ -1569,6 +1551,7 @@ pub fn spatial_map_typed(
     // polish targets.  The caller can force polish back on via
     // [`UnifiedFitConfig::with_counts_enable_polish(Some(true))`].
     let fast_config = apply_spatial_polish_default(fast_config, pixel_coords.len());
+    crate::pipeline::validate_precomputed_cross_sections(&fast_config)?;
 
     // ── Modeling choice: spatially-averaged open-beam flux ──
     //
@@ -1756,7 +1739,7 @@ pub fn spatial_map_typed(
                 }
             };
 
-            let out = match fit_spectrum_typed(&pixel_input, &fast_config) {
+            let out = match fit_spectrum_validated(&pixel_input, &fast_config) {
                 Ok(result) => Some(((y, x), result)),
                 Err(_) => {
                     failed_count.fetch_add(1, Ordering::Relaxed);
@@ -2680,6 +2663,12 @@ mod tests {
             None,
         )
         .unwrap();
+        let mut working = working;
+        for row in &mut working.sigma {
+            for s in row.iter_mut() {
+                *s *= 2.0;
+            }
+        }
         let config = UnifiedFitConfig::new(
             energies,
             vec![data],
@@ -2711,9 +2700,10 @@ mod tests {
             .map(|(d, _)| *d)
             .sum::<f64>()
             / result.n_converged.max(1) as f64;
+        let expected = 0.5 * true_density;
         assert!(
-            (mean - true_density).abs() / true_density < 0.10,
-            "Some(cached)+aux mean density: {mean}, true: {true_density}"
+            (mean - expected).abs() / expected < 0.10,
+            "a table of 2σ must halve the fitted density: mean {mean}, expected {expected}"
         );
     }
 
