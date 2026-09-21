@@ -37,10 +37,9 @@ use crate::resolution::{self, ResolutionError, ResolutionFunction};
 
 /// Build the auxiliary extended grid for resolution broadening.
 ///
-/// Shared helper that extracts Gaussian resolution params and resonance info
-/// to build the extended grid with boundary extension + adaptive intermediate
-/// points.  Returns `None` if no extension is needed (no resolution, or grid
-/// unchanged).
+/// Every resolution family gets the boundary extension by its kernel's reach;
+/// the Gaussian family also gets the adaptive intermediate points.  Returns
+/// `None` if no extension is needed (no resolution, or grid unchanged).
 ///
 /// Intermediate points are inserted only when the resolution broadening at
 /// the grid midpoint uses the PW-linear Gaussian path (exp tail negligible
@@ -365,14 +364,14 @@ pub type BroadenedXsWithDerivative = (Vec<Vec<f64>>, Vec<Vec<f64>>);
 ///
 /// **Every resolution family gets the boundary extension.**  The working grid
 /// equals the data grid only when no instrument is present, or when the
-/// kernel's reach at both ends is shorter than the grid's own edge spacing.
+/// kernel's reach is zero at both ends.
 /// A [`crate::resolution::ResolutionPlan`] must therefore be built on
 /// [`Self::energies`], not on the data grid: `apply_resolution_with_plan`
 /// rejects a plan whose grid differs from the one it is applied to.
 #[derive(Debug, Clone)]
 pub struct WorkingGridLayout {
     /// Working-grid energies (eV, ascending).  Equals the input data grid
-    /// when no auxiliary grid was built (tabulated/no resolution).
+    /// when no auxiliary grid was built.
     pub energies: Vec<f64>,
     /// `data_indices[i]` is the index of data energy `i` within
     /// [`Self::energies`].  Identity (`0..n`) when no auxiliary grid.

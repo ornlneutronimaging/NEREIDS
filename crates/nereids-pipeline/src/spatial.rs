@@ -1363,7 +1363,7 @@ pub fn spatial_map_typed(
     // Build the resolution broadening plan once for the shared grid.
     //
     // The plan is valid for any per-pixel fit that applies resolution
-    // on the (fixed) data energy grid — i.e. every spatial dispatch
+    // on the (fixed) working grid — i.e. every spatial dispatch
     // EXCEPT the energy-scale (TZERO) path, where the grid changes
     // per (t0, l_scale) trial.  In that case the plan would always
     // miss so we skip the build; `EnergyScaleTransmissionModel` runs

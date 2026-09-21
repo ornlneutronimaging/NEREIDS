@@ -60,10 +60,10 @@ pub struct PrecomputedTransmissionModel {
     ///   apply Beer-Lambert + resolution on this working grid and extract the
     ///   data points LAST via `work_layout.extract(..)` — matching
     ///   `forward_model` (issue #608).
-    /// * `work_layout` is `None` (no resolution, or a kernel whose reach at
-    ///   both ends is shorter than the grid's own edge spacing): the working
-    ///   grid IS the data grid, so σ live on the **data grid** (`energies`),
-    ///   with `n_grid_energies == energies.len()` and no extraction.
+    /// * `work_layout` is `None` (no resolution, or a kernel with zero reach
+    ///   at both ends): the working grid IS the data grid, so σ live on the
+    ///   **data grid** (`energies`), with `n_grid_energies == energies.len()`
+    ///   and no extraction.
     pub cross_sections: Arc<Vec<Vec<f64>>>,
     /// Mapping: `params[density_indices[i]]` is the density of isotope `i`.
     ///
@@ -950,6 +950,27 @@ impl TransmissionFitModel {
     }
 }
 
+impl TransmissionFitModel {
+    /// The working grid this model broadens on, built once from the data
+    /// grid, the instrument and the resonance data.
+    fn work_layout(&self) -> Result<Rc<transmission::WorkingGridLayout>, FittingError> {
+        if let Some(layout) = self.cached_work_layout.borrow().as_ref() {
+            return Ok(Rc::clone(layout));
+        }
+        let rd_refs: Vec<&ResonanceData> = self.resonance_data.iter().collect();
+        let layout = Rc::new(
+            transmission::resolution_working_grid(
+                &self.energies,
+                self.instrument.as_deref(),
+                &rd_refs,
+            )
+            .map_err(|e| FittingError::EvaluationFailed(e.to_string()))?,
+        );
+        *self.cached_work_layout.borrow_mut() = Some(Rc::clone(&layout));
+        Ok(layout)
+    }
+}
+
 impl FitModel for TransmissionFitModel {
     fn evaluate(&self, params: &[f64]) -> Result<Vec<f64>, FittingError> {
         debug_assert!(
@@ -971,13 +992,7 @@ impl FitModel for TransmissionFitModel {
             && self.temperature_index.is_none()
         {
             let params_indices = density_param_indices(&self.density_indices);
-            let rd_refs: Vec<&ResonanceData> = self.resonance_data.iter().collect();
-            let layout = transmission::resolution_working_grid(
-                &self.energies,
-                Some(inst.as_ref()),
-                &rd_refs,
-            )
-            .map_err(|e| FittingError::EvaluationFailed(e.to_string()))?;
+            let layout = self.work_layout()?;
             if cubature_eligible(
                 cubature,
                 &layout.energies,
@@ -1086,9 +1101,8 @@ impl FitModel for TransmissionFitModel {
             // Issue #442: apply resolution broadening to the total transmission
             // AFTER Beer-Lambert, on the working grid; then extract the data
             // points last (issue #608).  For Gaussian resolution `resolution_plan`
-            // is `None` (the planned path is tabulated-only) and broadening runs
-            // on `layout.energies`; for tabulated resolution the working grid IS
-            // the data grid so the data-grid plan still matches.
+            // is `None` (the planned path is tabulated-only); a tabulated plan
+            // is built on the working grid, which is the grid broadened here.
             if let Some(ref inst) = self.instrument {
                 let t_broadened = resolution::apply_resolution_with_plan(
                     self.resolution_plan.as_deref(),
@@ -1165,13 +1179,7 @@ impl FitModel for TransmissionFitModel {
             && self.temperature_index.is_none()
         {
             let params_indices = density_param_indices(&self.density_indices);
-            let rd_refs: Vec<&ResonanceData> = self.resonance_data.iter().collect();
-            let layout = transmission::resolution_working_grid(
-                &self.energies,
-                Some(inst.as_ref()),
-                &rd_refs,
-            )
-            .ok()?;
+            let layout = self.work_layout().ok()?;
             if cubature_eligible(
                 cubature,
                 &layout.energies,
@@ -2054,10 +2062,9 @@ impl EnergyScaleTransmissionModel {
     ///
     /// `working_energies` is the broadening grid the plan is built on — the
     /// model's WORKING grid (`work.layout.energies`), which every caller passes
-    /// post-#608.  For tabulated resolution (the only case that builds a plan)
-    /// the working grid IS the corrected data grid; for Gaussian it is the
-    /// auxiliary extended grid, but that path returns `None` above before the
-    /// grid is used.
+    /// post-#608: the corrected data grid extended by the kernel's reach.  For
+    /// Gaussian resolution the path returns `None` above before the grid is
+    /// used.
     fn cached_resolution_plan(
         &self,
         t0_us: f64,

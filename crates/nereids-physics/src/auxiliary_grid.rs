@@ -5,7 +5,8 @@
 //!
 //! 1. **Boundary extension** (Eqcon/Vqcon): Extend below E_min and above
 //!    E_max using spacing of the first/last 5 data points, uniform in √E
-//!    (FGM Doppler convention).
+//!    (FGM Doppler convention) for the Gaussian family and uniform in time
+//!    of flight for kernels tabulated there.
 //! 2. **Resonance fine-structure** (Fspken/Add_Pnts): Add dense points around
 //!    narrow resonances where the existing grid has fewer than 10 points per
 //!    resonance width (SAMMY default iptdop=9).
@@ -103,65 +104,107 @@ pub fn build_extended_grid_for(
         return (data_energies.to_vec(), indices);
     }
     let (extend_low, extend_high) = resolution.boundary_reach_ev(data_energies);
-    extend_boundaries(data_energies, extend_low, extend_high)
+    let spacing = match resolution {
+        // The Gaussian's width is an energy; SAMMY's velocity-spaced grid
+        // resolves it.
+        ResolutionFunction::Gaussian(_) => Spacing::SqrtEnergy,
+        // These kernels are tabulated in time of flight, and a delayed tail
+        // near the flight time maps to energies without bound.
+        ResolutionFunction::Tabulated(_) | ResolutionFunction::IkedaCarpenter(_) => {
+            Spacing::TimeOfFlight
+        }
+    };
+    extend_boundaries(data_energies, extend_low, extend_high, spacing)
 }
 
-/// Extend a grid past both ends, spacing the added points evenly in sqrt(E)
-/// at the edge spacing of the data itself.
+/// The variable in which the added boundary points are evenly spaced.
 ///
-/// SAMMY Ref: `dat/mdata.f90` Vqcon (the FGM sqrt-E convention).
+/// SAMMY Ref: `dat/mdat4.f90` Escale spaces the added points at the average
+/// spacing of the five data points nearest the edge, in `sqrt(E)` for
+/// free-gas Doppler (`dat/mdata.f90` Vqcon). A kernel tabulated in time of
+/// flight is resolved at the data's own time-of-flight spacing, which is
+/// `1/sqrt(E)` up to the flight path, and that spacing reaches any energy
+/// in a bounded number of points.
+#[derive(Clone, Copy)]
+enum Spacing {
+    SqrtEnergy,
+    TimeOfFlight,
+}
+
+impl Spacing {
+    fn to_u(self, e: f64) -> f64 {
+        match self {
+            Spacing::SqrtEnergy => e.sqrt(),
+            Spacing::TimeOfFlight => 1.0 / e.sqrt(),
+        }
+    }
+
+    fn to_e(self, u: f64) -> f64 {
+        match self {
+            Spacing::SqrtEnergy => u * u,
+            Spacing::TimeOfFlight => 1.0 / (u * u),
+        }
+    }
+}
+
+/// Push the points stepping outward from `e_edge` to `target_e`, evenly
+/// spaced in `spacing` at the average spacing of the `n_ref` data points from
+/// `e_edge` to `e_ref`, and ending at `target_e` itself.
+fn step_outward(
+    spacing: Spacing,
+    e_edge: f64,
+    e_ref: f64,
+    n_ref: usize,
+    target_e: f64,
+    grid: &mut Vec<f64>,
+) {
+    let u_edge = spacing.to_u(e_edge);
+    let step = (u_edge - spacing.to_u(e_ref)) / (n_ref as f64 - 1.0).max(1.0);
+    let steps = (spacing.to_u(target_e) - u_edge) / step;
+    if step.abs() <= 1e-30 || !steps.is_finite() || steps <= 0.0 {
+        return;
+    }
+    let n_between = steps.floor() as usize;
+    grid.extend((1..=n_between).map(|k| spacing.to_e(u_edge + step * k as f64)));
+    grid.push(target_e);
+}
+
+/// Extend a grid past both ends by `extend_low` and `extend_high` eV, at the
+/// edge spacing of the data itself.
 fn extend_boundaries(
     data_energies: &[f64],
     extend_low: f64,
     extend_high: f64,
+    spacing: Spacing,
 ) -> (Vec<f64>, Vec<usize>) {
     let n = data_energies.len();
     let e_min = data_energies[0];
     let e_max = data_energies[n - 1];
+    let n_ref = N_BOUNDARY_REF.min(n);
     let mut grid = Vec::with_capacity(n + 200);
 
     if extend_low > 0.0 && e_min > 0.0 {
-        let n_ref = N_BOUNDARY_REF.min(n);
-        let e_ref = data_energies[n_ref - 1];
-        let d_sqrt = (e_ref.sqrt() - e_min.sqrt()) / (n_ref as f64 - 1.0).max(1.0);
-
-        if d_sqrt > 1e-30 {
-            let target_low = e_min - extend_low;
-            let sqrt_min = e_min.sqrt();
-            let sqrt_target = target_low.sqrt();
-            let n_ext = ((sqrt_min - sqrt_target) / d_sqrt).ceil() as usize;
-            for k in 1..=n_ext {
-                let sqrt_e = sqrt_min - d_sqrt * k as f64;
-                if sqrt_e > 0.0 {
-                    grid.push(sqrt_e * sqrt_e);
-                }
-            }
-        }
+        step_outward(
+            spacing,
+            e_min,
+            data_energies[n_ref - 1],
+            n_ref,
+            e_min - extend_low,
+            &mut grid,
+        );
     }
 
     grid.extend_from_slice(data_energies);
 
     if extend_high > 0.0 {
-        let n_ref = N_BOUNDARY_REF.min(n);
-        let e_ref = data_energies[n - n_ref];
-        let d_sqrt = (e_max.sqrt() - e_ref.sqrt()) / (n_ref as f64 - 1.0).max(1.0);
-
-        if d_sqrt > 1e-30 {
-            // A delayed tail approaching the nominal flight time maps to
-            // energies without bound while carrying almost no mass. The
-            // grid is a finite object: past one window length (or one
-            // e_max, whichever is longer) the kernel points that map there
-            // are dropped and the survivors renormalized, exactly as at any
-            // grid edge.
-            let target_high = e_max + extend_high.min((e_max - e_min).max(e_max));
-            let sqrt_max = e_max.sqrt();
-            let sqrt_target = target_high.sqrt();
-            let n_ext = ((sqrt_target - sqrt_max) / d_sqrt).ceil() as usize;
-            for k in 1..=n_ext {
-                let sqrt_e = sqrt_max + d_sqrt * k as f64;
-                grid.push(sqrt_e * sqrt_e);
-            }
-        }
+        step_outward(
+            spacing,
+            e_max,
+            data_energies[n - n_ref],
+            n_ref,
+            e_max + extend_high,
+            &mut grid,
+        );
     }
 
     grid.sort_unstable_by(|a, b| a.total_cmp(b));
@@ -194,7 +237,8 @@ fn build_extended_grid_inner(
     // ── Step 1: Boundary extension ──────────────────────────────────────
     let (extend_low, extend_high) =
         ResolutionFunction::Gaussian(*res).boundary_reach_ev(data_energies);
-    let (mut grid, _) = extend_boundaries(data_energies, extend_low, extend_high);
+    let (mut grid, _) =
+        extend_boundaries(data_energies, extend_low, extend_high, Spacing::SqrtEnergy);
 
     // ── Step 2: Adaptive intermediate points ────────────────────────────
     // Insert intermediate points where the grid spacing exceeds a fraction
@@ -594,11 +638,14 @@ mod tests {
     ///
     /// The map from a kernel offset to the energy it gathers from diverges as
     /// the offset nears the flight time, so the last surviving sample can
-    /// name an energy of any size while carrying almost nothing. Swept across
-    /// that regime the extension stays bounded and moves smoothly.
+    /// name an energy of any size. The extension never needs more points
+    /// than the instrument has time-of-flight channels, at the data's own
+    /// channel width, between the window edge and zero flight time on the
+    /// high side and out to the earliest offset on the low side; swept across
+    /// that regime it also moves smoothly.
     #[test]
     fn extension_stays_bounded_as_the_tail_nears_the_flight_time() {
-        use crate::resolution::TabulatedResolution;
+        use crate::resolution::{TOF_FACTOR, TabulatedResolution};
         use std::sync::Arc;
 
         let offsets: Vec<f64> = (0..=140).map(|k| -20.0 + k as f64).collect();
@@ -617,10 +664,14 @@ mod tests {
             let data: Vec<f64> = (0..400).map(|i| e_max - 40.0 + i as f64 * 0.1).collect();
             let (grid, _) = build_extended_grid_for(&data, &resolution);
             let added = grid.len() - data.len();
+            let tof = |e: f64| TOF_FACTOR * 25.0 / e.sqrt();
+            let e_top = data[data.len() - 1];
+            let channels_above = tof(e_top) / (tof(data[data.len() - 2]) - tof(e_top));
+            let channels_below = 20.0 / (tof(data[0]) - tof(data[1]));
             assert!(
-                added < 10 * data.len(),
-                "at e_max = {e_max} eV the extension added {added} points to a {}-point grid",
-                data.len()
+                (added as f64) <= channels_above + channels_below + 2.0,
+                "at e_max = {e_max} eV the extension added {added} points, more than the \
+                 {channels_above:.0} + {channels_below:.0} channels the instrument has there"
             );
             if let Some(p) = previous {
                 assert!(

@@ -1301,35 +1301,19 @@ impl TabulatedResolution {
     /// footprint at a given target energy is fully contained within
     /// `[e_ev − support, e_ev + support]`.
     ///
-    /// Computation:
-    ///
-    /// 1. Find the bracketing reference kernel(s) for `e_ev` via
-    ///    binary search on the sorted `ref_energies` grid.
-    /// 2. Take the extreme offsets `dt⁺ = max(dt, 0)` and
-    ///    `dt⁻ = max(−dt, 0)` over the kernel entries that can carry
-    ///    weight at `e_ev`.  Between references,
-    ///    [`Self::broaden`]'s width-normalized shape blend scales each
-    ///    block's support in mode-anchored `z = Δt/σ_b` to the target
-    ///    width `σ_t` and unions them — so the scan takes each block's
-    ///    **closure extremes** (the outermost `w > 0` offset, extended
-    ///    to the adjacent `w == 0` entry if one exists on that side:
-    ///    the linearly interpolated shape is positive on that fringe,
-    ///    and a merged point from the other block can land there),
-    ///    divides by that block's `σ_b`, maxes across the two blocks
-    ///    in z, and multiplies by `σ_t`.  Degenerate blocks (σ ≤ 0)
-    ///    take the nearest-clone fallback at apply time, so both
-    ///    blocks are scanned with their own positive-weight masks.
-    /// 3. Map each extreme through the **exact** TOF→E relation
-    ///    `E' = (TOF_FACTOR·L/(t∓dt))²` with `t = TOF_FACTOR·L/√E`
-    ///    and return the larger energy excursion:
-    ///    `max( E·((t/(t−dt⁺))² − 1), E·(1 − (t/(t+dt⁻))²) )`.
-    ///    The convolution gather reads theory at `t − dt` (see
-    ///    [`Self::broaden`]), so the positive-offset tail reaches
-    ///    *up* in energy — and because the map is convex in `t`, the
-    ///    up-side excursion strictly exceeds the linear chain-rule
-    ///    estimate `2·E^{3/2}·dt/(TOF_FACTOR·L)` that this function
-    ///    previously returned, which under-covered exactly the side
-    ///    the delayed-emission tail loads.
+    /// The kernel scanned is the one [`Self::broaden`] applies at `e_ev`:
+    /// the reference block on an exact hit, the nearest block outside the
+    /// tabulated range, and between references the width-normalized shape
+    /// blend of the two bracketing blocks, so a fringe point that carries
+    /// positive blended weight counts.  Its extreme offsets `dt⁺ = max(dt, 0)`
+    /// and `dt⁻ = max(−dt, 0)` over the positive-weight points map through
+    /// the **exact** TOF→E relation `E' = (TOF_FACTOR·L/(t∓dt))²` with
+    /// `t = TOF_FACTOR·L/√E`, and the larger energy excursion is returned:
+    /// `max( E·((t/(t−dt⁺))² − 1), E·(1 − (t/(t+dt⁻))²) )`.  The convolution
+    /// gather reads theory at `t − dt`, so the positive-offset tail reaches
+    /// *up* in energy, and because the map is convex in `t` the up-side
+    /// excursion exceeds the linear chain-rule estimate
+    /// `2·E^{3/2}·dt/(TOF_FACTOR·L)`.
     ///
     /// Only kernel points the broadening keeps count. A delayed-emission
     /// offset that reaches the nominal flight time (`dt ≥ t`) would gather
@@ -1357,107 +1341,23 @@ impl TabulatedResolution {
     /// See [`Self::kernel_support_ev`] for which kernel points count.
     #[must_use]
     pub fn kernel_support_directional_ev(&self, e_ev: f64) -> (f64, f64) {
-        if e_ev <= 0.0 || !e_ev.is_finite() {
+        if e_ev <= 0.0 || !e_ev.is_finite() || self.kernels.is_empty() || self.flight_path_m <= 0.0
+        {
             return (0.0, 0.0);
         }
-        if self.kernels.is_empty() || self.flight_path_m <= 0.0 {
-            return (0.0, 0.0);
-        }
-        // Use binary_search to distinguish exact hits from
-        // between-ref interpolation:
-        //   Ok(idx)  → e_ev exactly matches ref_energies[idx]; use
-        //              that single kernel.
-        //   Err(idx) → idx is the insertion point.  Use the
-        //              bracketing kernels at idx-1 (lower) and idx
-        //              (upper); clip to grid bounds when e_ev falls
-        //              outside the ref range.
-        let n = self.ref_energies.len();
         let t = TOF_FACTOR * self.flight_path_m / e_ev.sqrt();
+        // The kernel the broadening applies at this energy, whether the
+        // energy hits a reference, falls between two, or lies outside the
+        // tabulated range, so the reach is that of the same points. An
+        // offset at or past the nominal flight time is one the broadening
+        // drops, so it has no reach.
+        let (offsets, weights) = self.interpolated_kernel(e_ev);
         let mut max_dt_pos: f64 = 0.0;
         let mut max_dt_neg: f64 = 0.0;
-        // `consider` folds one offset into the extremes; `visit` scans
-        // one kernel with its own positive-weight mask.  Both take the
-        // accumulators as explicit arguments so the joint-mask arm
-        // below can also fold offsets directly. An offset at or past
-        // the nominal flight time is one the broadening drops, so it
-        // has no reach.
-        let consider = |dt: f64, pos: &mut f64, neg: &mut f64| {
-            if dt.is_finite() && dt < t {
-                *pos = pos.max(dt);
-                *neg = neg.max(-dt);
-            }
-        };
-        let visit = |idx: usize, pos: &mut f64, neg: &mut f64| {
-            let (offsets, weights) = &self.kernels[idx];
-            for (&dt, &w) in offsets.iter().zip(weights.iter()) {
-                if w > 0.0 {
-                    consider(dt, pos, neg);
-                }
-            }
-        };
-        match self.ref_energies.binary_search_by(|probe| {
-            probe
-                .partial_cmp(&e_ev)
-                .unwrap_or(std::cmp::Ordering::Equal)
-        }) {
-            Ok(idx) => visit(idx, &mut max_dt_pos, &mut max_dt_neg),
-            Err(0) => visit(0, &mut max_dt_pos, &mut max_dt_neg),
-            Err(idx) if idx >= n => visit(n - 1, &mut max_dt_pos, &mut max_dt_neg),
-            Err(idx) => {
-                let (off_lo, w_lo) = &self.kernels[idx - 1];
-                let (off_hi, w_hi) = &self.kernels[idx];
-                let (_, s_lo) = trapezoidal_moments(off_lo, w_lo);
-                let (_, s_hi) = trapezoidal_moments(off_hi, w_hi);
-                let e_lo = self.ref_energies[idx - 1];
-                let e_hi = self.ref_energies[idx];
-                let frac = (e_ev.ln() - e_lo.ln()) / (e_hi.ln() - e_lo.ln());
-                if !(s_lo.is_finite()
-                    && s_lo > 0.0
-                    && s_hi.is_finite()
-                    && s_hi > 0.0
-                    && frac.is_finite())
-                {
-                    // Degenerate blocks — and a non-finite fraction
-                    // (defense-in-depth; constructors enforce positive
-                    // reference energies) — take `interpolated_kernel`'s
-                    // nearest-clone fallback; bounding BOTH blocks
-                    // bounds either clone.
-                    visit(idx - 1, &mut max_dt_pos, &mut max_dt_neg);
-                    visit(idx, &mut max_dt_pos, &mut max_dt_neg);
-                } else {
-                    // Width-normalized shape blend (lockstep with
-                    // `interpolated_kernel`): each block's support in
-                    // mode-anchored z = Δt/σ_b is scaled to the target
-                    // width σ_t, and the blended support is the union.
-                    // Per block use CLOSURE extremes — the outermost
-                    // w > 0 offset extended to the adjacent w == 0
-                    // entry if one exists on that side: the linearly
-                    // interpolated shape is positive on that fringe,
-                    // and a merged point from the other block can land
-                    // there with positive blended weight.
-                    let s_t = s_lo * (s_hi / s_lo).powf(frac);
-                    let closure_extents = |offs: &[f64], ws: &[f64]| -> (f64, f64) {
-                        let n_k = offs.len();
-                        let mut pos = 0.0f64;
-                        let mut neg = 0.0f64;
-                        if let Some(kmax) = (0..n_k).rev().find(|&k| ws[k] > 0.0) {
-                            let k_ext = if kmax + 1 < n_k { kmax + 1 } else { kmax };
-                            pos = offs[k_ext].max(0.0);
-                            // kmax exists ⇒ a first positive-weight
-                            // index exists too.
-                            let kmin = (0..n_k).find(|&k| ws[k] > 0.0).unwrap_or(kmax);
-                            let k_ext_n = if kmin > 0 { kmin - 1 } else { kmin };
-                            neg = (-offs[k_ext_n]).max(0.0);
-                        }
-                        (pos, neg)
-                    };
-                    let (p_lo, n_lo) = closure_extents(off_lo, w_lo);
-                    let (p_hi, n_hi) = closure_extents(off_hi, w_hi);
-                    let z_pos = (p_lo / s_lo).max(p_hi / s_hi);
-                    let z_neg = (n_lo / s_lo).max(n_hi / s_hi);
-                    consider(z_pos * s_t, &mut max_dt_pos, &mut max_dt_neg);
-                    consider(-(z_neg * s_t), &mut max_dt_pos, &mut max_dt_neg);
-                }
+        for (&dt, &w) in offsets.iter().zip(weights.iter()) {
+            if w > 0.0 && dt.is_finite() && dt < t {
+                max_dt_pos = max_dt_pos.max(dt);
+                max_dt_neg = max_dt_neg.max(-dt);
             }
         }
         // Down-side excursion: negative offsets gather at t + dt⁻,
@@ -1497,9 +1397,8 @@ pub enum ResolutionFunction {
 
 /// Fraction of a sampled kernel's trapezoidal mass a working grid built by
 /// [`crate::auxiliary_grid::build_extended_grid_for`] carries at every data
-/// point. What the grid does not carry is what the broadening drops and
-/// renormalizes over, and this is held below the trapezoid's own
-/// discretization at a window edge.
+/// point. The grid ends at the energies the last surviving kernel points
+/// gather from, so what it can fail to carry is rounding at its two ends.
 pub const RETAINED_KERNEL_MASS: f64 = 1.0 - 1.0e-6;
 
 /// Widths of Gaussian resolution the broadening limits reach on each side.
@@ -2945,10 +2844,8 @@ impl TabulatedResolution {
 
         // Find bracketing indices
         let pos = self.ref_energies.partition_point(|&e| e < energy);
-        // Interior exact hit: return that reference unchanged, keeping
-        // this function lockstep with `kernel_support_ev`'s `Ok(idx)`
-        // arm (previously an interior hit went through the blend with
-        // `frac == 1.0`, reproducing the kernel only up to ULPs).
+        // Interior exact hit: return that reference unchanged rather than
+        // blending it with itself, which reproduces it only up to ULPs.
         if self.ref_energies[pos] == energy {
             return self.kernels[pos].clone();
         }
@@ -5520,6 +5417,33 @@ Resolution file
         let expected_above = e * ((t / (t - 2.0)).powi(2) - 1.0);
         let (_, above) = r.kernel_support_directional_ev(e);
         assert!(above.is_finite(), "reach must be finite, got {above}");
+        assert!(
+            (above - expected_above).abs() <= 1e-9 * expected_above,
+            "reach {above} should be that of the last surviving offset, {expected_above}"
+        );
+    }
+
+    /// Between two references an offset past the flight time drops only
+    /// itself: the reach is that of the last surviving offset of the blended
+    /// kernel.
+    #[test]
+    fn test_tabulated_kernel_support_between_refs_keeps_surviving_offsets() {
+        let offsets = vec![0.0, 10.0, 20.0, 80.0];
+        let weights = vec![1.0; 4];
+        let r = TabulatedResolution::from_kernels(
+            vec![1.0, 4.0],
+            vec![(offsets.clone(), weights.clone()), (offsets, weights)],
+            1.0,
+        )
+        .expect("valid two-block table");
+        let e: f64 = 2.0;
+        let t = TOF_FACTOR / e.sqrt();
+        assert!(
+            t > 20.0 && t < 80.0,
+            "fixture must drop the 80 μs point and keep the 20 μs point (t = {t})"
+        );
+        let expected_above = e * ((t / (t - 20.0)).powi(2) - 1.0);
+        let (_, above) = r.kernel_support_directional_ev(e);
         assert!(
             (above - expected_above).abs() <= 1e-9 * expected_above,
             "reach {above} should be that of the last surviving offset, {expected_above}"
