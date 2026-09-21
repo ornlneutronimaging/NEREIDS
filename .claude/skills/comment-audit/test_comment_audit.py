@@ -5,7 +5,7 @@ import json
 import pathlib
 import sys
 
-SCRIPT = pathlib.Path(__file__).resolve().parents[1] / "scripts" / "comment_audit.py"
+SCRIPT = pathlib.Path(__file__).resolve().parent / "comment_audit.py"
 spec = importlib.util.spec_from_file_location("comment_audit", SCRIPT)
 ca = importlib.util.module_from_spec(spec)
 sys.modules["comment_audit"] = ca

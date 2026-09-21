@@ -12,7 +12,9 @@ it is provenance; otherwise it is flagged as a place where code and comment
 disagree.
 
 Run before every commit on the changed Rust files. Nothing here needs
-judgment except the flagged pairs.
+judgment except the flagged pairs. The script and its tests live in this
+folder; run the tests with
+`pixi run python -m pytest .claude/skills/comment-audit/`.
 
 ## Arguments
 
@@ -32,8 +34,8 @@ judgment except the flagged pairs.
 2. Strip and bundle into the scratchpad, `$S`:
 
    ```
-   python3 scripts/comment_audit.py strip <files> --out $S/audit --root .
-   python3 scripts/comment_audit.py bundle <files> --out $S/audit --root . --range <range> --repo . > $S/audit/args.json
+   python3 .claude/skills/comment-audit/comment_audit.py strip <files> --out $S/audit --root .
+   python3 .claude/skills/comment-audit/comment_audit.py bundle <files> --out $S/audit --root . --range <range> --repo . > $S/audit/args.json
    ```
 
    Omit `--range` for `--whole-file`. Every file's stripped text and comment
@@ -57,7 +59,7 @@ judgment except the flagged pairs.
    directory the tool result names:
 
    ```
-   python3 scripts/comment_audit.py verify-isolation <transcript dir>
+   python3 .claude/skills/comment-audit/comment_audit.py verify-isolation <transcript dir>
    ```
 
    A non-zero exit means an agent called a tool other than structured
@@ -66,14 +68,14 @@ judgment except the flagged pairs.
 4. Apply every `absent` and `same` id, then format and check:
 
    ```
-   python3 scripts/comment_audit.py apply <file> --comments $S/audit/<file>.comments.json --delete <ids>
+   python3 .claude/skills/comment-audit/comment_audit.py apply <file> --comments $S/audit/<file>.comments.json --delete <ids>
    cargo fmt --all && cargo check --workspace --exclude nereids-python --all-targets
    ```
 
 5. Write the result to `$S/audit/result.json` and print the table:
 
    ```
-   python3 scripts/comment_audit.py report $S/audit/result.json
+   python3 .claude/skills/comment-audit/comment_audit.py report $S/audit/result.json
    ```
 
    For each flagged pair propose one disposition: delete the comment, or

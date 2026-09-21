@@ -3,7 +3,7 @@ export const meta = {
   description:
     'For each stripped Rust file, a tool-less writer regenerates the comments a reader would need, a judge compares every original comment in scope with what was regenerated, and deterministic JS buckets each original as absent, same, keep (provenance) or flagged. Detection only: no file is written.',
   whenToUse:
-    'Invoked by the /comment-audit skill before a commit, never by hand. args = { files: [{ path, windows: [{ start, end, lines }], comments }], writerType?, judgeType? } as scripts/comment_audit.py bundle prints it: the stripped source in windows around the comments in scope, and those comments with their anchors. The agent types default to the tool-less comment-writer and comment-judge.',
+    'Invoked by the /comment-audit skill before a commit, never by hand. args = { files: [{ path, windows: [{ start, end, lines }], comments }], writerType?, judgeType? } as .claude/skills/comment-audit/comment_audit.py bundle prints it: the stripped source in windows around the comments in scope, and those comments with their anchors. The agent types default to the tool-less comment-writer and comment-judge.',
   phases: [
     { title: 'Regenerate', detail: 'one tool-less writer per file, from the stripped source alone' },
     { title: 'Judge', detail: 'one tool-less judge per batch of (original, regenerated) pairs' },
