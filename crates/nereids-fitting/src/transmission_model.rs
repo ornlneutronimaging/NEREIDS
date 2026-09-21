@@ -42,43 +42,17 @@ const L_SCALE_PHYSICAL_HI: f64 = 2.0;
 ///
 /// Issue #442: resolution broadening is applied to T(E) after Beer-Lambert,
 /// not to σ(E) before.
-///
-/// Construct via `nereids_physics::transmission::broadened_cross_sections`,
-/// then wrap in `Arc` so the same precomputed data is shared read-only
-/// across all rayon worker threads.
 pub struct PrecomputedTransmissionModel {
-    /// Doppler-broadened cross-sections σ_D(E) per isotope, shape
-    /// \[n_isotopes\]\[n_grid_energies\].
-    ///
-    /// The σ live on `work_layout.energies` when [`work_layout`](Self::work_layout)
-    /// is `Some`, else on `energies`.
     pub cross_sections: Arc<Vec<Vec<f64>>>,
     /// Mapping: `params[density_indices[i]]` is the density of isotope `i`.
     ///
     /// Wrapped in `Arc` so that parallel pixel loops can share one copy
     /// via cheap reference-count increments instead of deep-cloning per pixel.
-    ///
-    /// Kept `pub` (not `pub(crate)`) because the Python bindings
-    /// (`nereids-python`) construct and access this field directly.
     pub density_indices: Arc<Vec<usize>>,
-    /// Energy grid (eV), required for resolution broadening.
-    /// `None` when resolution is disabled — Beer-Lambert only.
-    pub energies: Option<Arc<Vec<f64>>>,
     /// Instrument resolution parameters.
     /// When `Some`, resolution broadening is applied to the total
     /// transmission after Beer-Lambert in `evaluate()`.
     pub instrument: Option<Arc<InstrumentParams>>,
-    /// Optional pre-built broadening plan for the working grid and the
-    /// resolution: `work_layout.energies` when a layout exists, else
-    /// `energies`.
-    ///
-    /// When a caller builds the plan once (e.g. spatial dispatch for
-    /// a grid shared across every pixel) and passes it via
-    /// `with_resolution_plan`, `evaluate()` and `analytical_jacobian()`
-    /// skip the per-call kernel-interp / bracket / trap-weight work
-    /// and reduce each broadening call to a gather + multiply-add.
-    /// `None` ⇒ fall back to the per-call broadening path, byte-
-    /// identical output.
     pub resolution_plan: Option<Arc<ResolutionPlan>>,
     /// Optional sparse empirical cubature plan.
     ///
@@ -104,16 +78,7 @@ pub struct PrecomputedTransmissionModel {
     /// both the accuracy and wall-time axes; see
     /// `nereids_physics::surrogate` module docs).
     pub sparse_scalar_plan: Option<Arc<ScalarSurrogatePlan>>,
-    /// Working-grid layout matching [`cross_sections`](Self::cross_sections).
-    ///
-    /// When `cross_sections` is stored on the working grid (the data grid
-    /// extended by the kernel's reach, plus the fine-structure points under a
-    /// Gaussian resolution), this maps the working grid back to the data grid
-    /// so `evaluate()` / `analytical_jacobian()` apply resolution on the
-    /// working grid and extract the data points last.  `None` ⇒ the working
-    /// grid is the data grid: Beer-Lambert and resolution run directly on
-    /// `energies` and no extraction is needed.
-    pub work_layout: Option<Arc<transmission::WorkingGridLayout>>,
+    pub layout: Arc<transmission::WorkingGridLayout>,
 }
 
 /// Deduplicate `density_indices` and return the distinct density-
@@ -396,28 +361,12 @@ fn cubature_eligible(
 }
 
 impl PrecomputedTransmissionModel {
-    /// Working-grid energies for resolution broadening (issue #608).
-    ///
-    /// Returns the extended grid when `work_layout` is set, otherwise the data
-    /// grid (`energies`).  Returns `None` only when no instrument is
-    /// configured (Beer-Lambert-only path).
-    fn work_energies(&self) -> Option<&[f64]> {
-        match (&self.work_layout, &self.energies) {
-            (Some(layout), _) => Some(layout.energies.as_slice()),
-            (None, Some(energies)) => Some(energies.as_slice()),
-            (None, None) => None,
-        }
+    fn work_energies(&self) -> &[f64] {
+        &self.layout.energies
     }
 
-    /// Extract the data-grid points from a working-grid spectrum (issue #608).
-    ///
-    /// When `work_layout` is `None` the working grid IS the data grid, so this
-    /// is the identity (a plain clone).
-    fn extract_data_points(&self, working: &[f64]) -> Vec<f64> {
-        match &self.work_layout {
-            Some(layout) => layout.extract(working),
-            None => working.to_vec(),
-        }
+    fn extract_data_points(&self, working: Vec<f64>) -> Vec<f64> {
+        self.layout.extract_owned(working)
     }
 }
 
@@ -434,22 +383,18 @@ impl FitModel for PrecomputedTransmissionModel {
         // the grid + isotope count, and instrument resolution is
         // enabled (cubature folds both `exp(-Σ n σ)` and `apply_R`
         // into a single per-row atom sweep).
-        if let (Some(cubature), Some(inst), Some(energies)) = (
-            &self.sparse_cubature_plan,
-            &self.instrument,
-            self.work_energies(),
-        ) {
+        if let (Some(cubature), Some(inst)) = (&self.sparse_cubature_plan, &self.instrument) {
             let params_indices = density_param_indices(&self.density_indices);
             if cubature_eligible(
                 cubature,
-                energies,
+                self.work_energies(),
                 &inst.resolution,
                 self.resolution_plan.as_deref(),
                 params_indices.len(),
             ) {
                 let n: Vec<f64> = params_indices.iter().map(|&i| params[i]).collect();
                 if density_within_box(cubature, &n) {
-                    return Ok(self.extract_data_points(&cubature.forward(&n)));
+                    return Ok(self.extract_data_points(cubature.forward(&n)));
                 }
                 // Density escaped the training box — fall through
                 // to the exact path (cubature accuracy degrades
@@ -462,11 +407,7 @@ impl FitModel for PrecomputedTransmissionModel {
         // The content-identity guards
         // (σ-fingerprint + Arc::ptr_eq on source resolution plan)
         // close the same-grid stale-plan hole.
-        if let (Some(scalar), Some(inst), Some(energies)) = (
-            &self.sparse_scalar_plan,
-            &self.instrument,
-            self.work_energies(),
-        ) {
+        if let (Some(scalar), Some(inst)) = (&self.sparse_scalar_plan, &self.instrument) {
             let params_indices = density_param_indices(&self.density_indices);
             // Only fire when the σ stack is the single collapsed
             // row the scalar plan was built from (spatial's
@@ -477,7 +418,7 @@ impl FitModel for PrecomputedTransmissionModel {
                 && self.density_indices[0] == params_indices[0]
                 && scalar_eligible(
                     scalar,
-                    energies,
+                    self.work_energies(),
                     &inst.resolution,
                     self.resolution_plan.as_ref(),
                     &self.cross_sections[0],
@@ -486,7 +427,7 @@ impl FitModel for PrecomputedTransmissionModel {
             {
                 let n = params[params_indices[0]];
                 if scalar_density_within_box(scalar, n) {
-                    return Ok(self.extract_data_points(&scalar.forward_scalar(n)));
+                    return Ok(self.extract_data_points(scalar.forward_scalar(n)));
                 }
             }
         }
@@ -509,17 +450,17 @@ impl FitModel for PrecomputedTransmissionModel {
 
         // Resolution on the working grid after Beer-Lambert, then the data
         // points are extracted.
-        if let (Some(inst), Some(work_energies)) = (&self.instrument, self.work_energies()) {
+        if let Some(inst) = &self.instrument {
             let t_broadened = resolution::apply_resolution_with_plan(
                 self.resolution_plan.as_deref(),
-                work_energies,
+                self.work_energies(),
                 &transmission,
                 &inst.resolution,
             )
             .map_err(|e| FittingError::EvaluationFailed(format!("resolution broadening: {e}")))?;
-            Ok(self.extract_data_points(&t_broadened))
+            Ok(self.extract_data_points(t_broadened))
         } else {
-            Ok(self.extract_data_points(&transmission))
+            Ok(self.extract_data_points(transmission))
         }
     }
 
@@ -549,25 +490,18 @@ impl FitModel for PrecomputedTransmissionModel {
         let n_free = free_param_indices.len();
         // Surrogates answer on the working grid; the Jacobian is over the
         // data points, so their rows are read through the layout.
-        let data_rows: Vec<usize> = match &self.work_layout {
-            Some(layout) => layout.data_indices.clone(),
-            None => (0..n_e).collect(),
-        };
+        let data_rows: &[usize] = &self.layout.data_indices;
 
         // Cubature fast path: same eligibility as `evaluate()` plus
         // the requirement that every free param is a density param
         // (cubature can't produce Jacobian columns for non-density
         // params like background / normalization, which are the
         // calling layer's responsibility).
-        if let (Some(cubature), Some(inst), Some(energies)) = (
-            &self.sparse_cubature_plan,
-            &self.instrument,
-            self.work_energies(),
-        ) {
+        if let (Some(cubature), Some(inst)) = (&self.sparse_cubature_plan, &self.instrument) {
             let params_indices = density_param_indices(&self.density_indices);
             if cubature_eligible(
                 cubature,
-                energies,
+                self.work_energies(),
                 &inst.resolution,
                 self.resolution_plan.as_deref(),
                 params_indices.len(),
@@ -605,18 +539,14 @@ impl FitModel for PrecomputedTransmissionModel {
         // Scalar (k = 1) surrogate Jacobian fast path.  For a
         // scalar fit `free_param_indices = [0]`, so
         // the Jacobian has one column.
-        if let (Some(scalar), Some(inst), Some(energies)) = (
-            &self.sparse_scalar_plan,
-            &self.instrument,
-            self.work_energies(),
-        ) {
+        if let (Some(scalar), Some(inst)) = (&self.sparse_scalar_plan, &self.instrument) {
             let params_indices = density_param_indices(&self.density_indices);
             if self.cross_sections.len() == 1
                 && self.density_indices.len() == 1
                 && self.density_indices[0] == params_indices[0]
                 && scalar_eligible(
                     scalar,
-                    energies,
+                    self.work_energies(),
                     &inst.resolution,
                     self.resolution_plan.as_ref(),
                     &self.cross_sections[0],
@@ -668,7 +598,7 @@ impl FitModel for PrecomputedTransmissionModel {
         // y_current is T_obs = R[T] on the DATA grid, which is NOT the same.
         // Same resolution guard as `evaluate` (issue #608) so the two paths
         // agree by construction; the else branch is the no-resolution Jacobian.
-        if let (Some(inst), Some(work_energies)) = (&self.instrument, self.work_energies()) {
+        if let Some(inst) = &self.instrument {
             // Recompute unresolved T on the working grid from σ and params.
             let mut neg_opt = vec![0.0f64; n_e];
             for (i, xs) in self.cross_sections.iter().enumerate() {
@@ -686,25 +616,22 @@ impl FitModel for PrecomputedTransmissionModel {
                     (0..n_e).map(|i| -xs_sum[i] * t_unresolved[i]).collect();
                 let resolved_deriv = resolution::apply_resolution_with_plan(
                     self.resolution_plan.as_deref(),
-                    work_energies,
+                    self.work_energies(),
                     &inner_deriv,
                     &inst.resolution,
                 )
                 .ok()?;
-                let resolved_deriv = self.extract_data_points(&resolved_deriv);
+                let resolved_deriv = self.extract_data_points(resolved_deriv);
                 for (i, &val) in resolved_deriv.iter().enumerate() {
                     *jacobian.get_mut(i, col) = val;
                 }
             }
             Some(jacobian)
         } else {
-            // No resolution → no auxiliary grid: the working grid IS the data
-            // grid (`n_e == n_data`), and y_current IS T(E) directly.
-            //   ∂T/∂N_g = -σ_sum(E) · T(E)
             let mut jacobian = FlatMatrix::zeros(n_data, n_free);
-            for i in 0..n_data {
+            for (row, &i) in data_rows.iter().enumerate() {
                 for (j, xs_sum) in fp_xs_sums.iter().enumerate() {
-                    *jacobian.get_mut(i, j) = -xs_sum[i] * y_current[i];
+                    *jacobian.get_mut(row, j) = -xs_sum[i] * y_current[row];
                 }
             }
             Some(jacobian)
@@ -2697,17 +2624,7 @@ impl ForwardModel for PrecomputedTransmissionModel {
     }
 
     fn n_data(&self) -> usize {
-        // Issue #608: when a Gaussian working-grid layout is attached,
-        // `cross_sections` lives on the (longer) working grid, but the number of
-        // DATA points the model predicts is the layout's data-index count.
-        // Without a layout the working grid IS the data grid.
-        if let Some(layout) = &self.work_layout {
-            layout.data_indices.len()
-        } else if self.cross_sections.is_empty() {
-            0
-        } else {
-            self.cross_sections[0].len()
-        }
+        self.layout.data_indices.len()
     }
 
     fn n_params(&self) -> usize {
@@ -3718,15 +3635,15 @@ mod tests {
         xs: Vec<Vec<f64>>,
         density_indices: Vec<usize>,
     ) -> PrecomputedTransmissionModel {
+        let grid: Vec<f64> = (0..xs[0].len()).map(|i| i as f64).collect();
         PrecomputedTransmissionModel {
             cross_sections: Arc::new(xs),
             density_indices: Arc::new(density_indices),
-            energies: None,
             instrument: None,
             resolution_plan: None,
             sparse_cubature_plan: None,
             sparse_scalar_plan: None,
-            work_layout: None,
+            layout: Arc::new(transmission::WorkingGridLayout::identity(&grid)),
         }
     }
 
@@ -3857,12 +3774,11 @@ mod tests {
         let mut model = PrecomputedTransmissionModel {
             cross_sections: Arc::new(sigmas.clone()),
             density_indices: Arc::new(vec![0, 1]),
-            energies: Some(Arc::new(energies.clone())),
             instrument: Some(make_trivial_instrument()),
             resolution_plan: Some(Arc::clone(&plan)),
             sparse_cubature_plan: Some(Arc::clone(&cubature)),
             sparse_scalar_plan: None,
-            work_layout: None,
+            layout: Arc::new(transmission::WorkingGridLayout::identity(&energies)),
         };
 
         // Evaluate at a training density: cubature ≡ exact to LP
@@ -3939,22 +3855,20 @@ mod tests {
         let model_with_plan = PrecomputedTransmissionModel {
             cross_sections: Arc::new(sigmas_k1.clone()),
             density_indices: Arc::new(vec![0]),
-            energies: Some(Arc::new(energies.clone())),
             instrument: Some(make_trivial_instrument()),
             resolution_plan: None,
             sparse_cubature_plan: Some(Arc::clone(&cubature_k2)),
             sparse_scalar_plan: None,
-            work_layout: None,
+            layout: Arc::new(transmission::WorkingGridLayout::identity(&energies)),
         };
         let model_without_plan = PrecomputedTransmissionModel {
             cross_sections: Arc::new(sigmas_k1.clone()),
             density_indices: Arc::new(vec![0]),
-            energies: Some(Arc::new(energies.clone())),
             instrument: Some(make_trivial_instrument()),
             resolution_plan: None,
             sparse_cubature_plan: None,
             sparse_scalar_plan: None,
-            work_layout: None,
+            layout: Arc::new(transmission::WorkingGridLayout::identity(&energies)),
         };
 
         let n = [1e-4_f64];
@@ -3981,18 +3895,17 @@ mod tests {
         // the dispatch addition
         // must not change the default forward path.
         let n_grid = 40_usize;
-        let (_energies, _plan, _matrix) = synthetic_resolution_setup(n_grid, 4);
+        let (energies, _plan, _matrix) = synthetic_resolution_setup(n_grid, 4);
         let sigmas = synthetic_sigmas(n_grid, 2);
 
         let model = PrecomputedTransmissionModel {
             cross_sections: Arc::new(sigmas.clone()),
             density_indices: Arc::new(vec![0, 1]),
-            energies: None,
             instrument: None,
             resolution_plan: None,
             sparse_cubature_plan: None,
             sparse_scalar_plan: None,
-            work_layout: None,
+            layout: Arc::new(transmission::WorkingGridLayout::identity(&energies)),
         };
 
         let n = [1e-4_f64, 1e-4];
@@ -4025,12 +3938,11 @@ mod tests {
         let model = PrecomputedTransmissionModel {
             cross_sections: Arc::new(sigmas),
             density_indices: Arc::new(vec![0, 1]),
-            energies: Some(Arc::new(energies)),
             instrument: Some(make_trivial_instrument()),
             resolution_plan: Some(Arc::clone(&plan)),
             sparse_cubature_plan: Some(Arc::clone(&cubature)),
             sparse_scalar_plan: None,
-            work_layout: None,
+            layout: Arc::new(transmission::WorkingGridLayout::identity(&energies)),
         };
 
         // Use anchor density: LP pins Jacobian exactly here.
@@ -4327,12 +4239,11 @@ mod tests {
         PrecomputedTransmissionModel {
             cross_sections: Arc::new(sigmas),
             density_indices: Arc::new(density_indices),
-            energies: Some(Arc::new(energies)),
             instrument: Some(make_trivial_instrument()),
             resolution_plan,
             sparse_cubature_plan: None,
             sparse_scalar_plan: scalar_plan,
-            work_layout: None,
+            layout: Arc::new(transmission::WorkingGridLayout::identity(&energies)),
         }
     }
 
@@ -5321,12 +5232,11 @@ mod tests {
         let model = PrecomputedTransmissionModel {
             cross_sections: Arc::new(xs),
             density_indices: Arc::new(vec![0]),
-            energies: Some(Arc::new(energies.clone())),
             instrument: Some(Arc::clone(&inst)),
             resolution_plan: None,
             sparse_cubature_plan: None,
             sparse_scalar_plan: None,
-            work_layout: None,
+            layout: Arc::new(transmission::WorkingGridLayout::identity(&energies)),
         };
         let t_precomputed = model.evaluate(&[thickness]).unwrap();
 
@@ -5406,12 +5316,11 @@ mod tests {
         let model = PrecomputedTransmissionModel {
             cross_sections: Arc::new(xs),
             density_indices: Arc::new(vec![0]),
-            energies: Some(Arc::new(energies.clone())),
             instrument: Some(Arc::clone(&inst)),
             resolution_plan: None,
             sparse_cubature_plan: None,
             sparse_scalar_plan: None,
-            work_layout: None,
+            layout: Arc::new(transmission::WorkingGridLayout::identity(&energies)),
         };
 
         let params = [0.0005f64];
@@ -5458,12 +5367,11 @@ mod tests {
         let model = PrecomputedTransmissionModel {
             cross_sections: Arc::new(xs),
             density_indices: Arc::new(vec![0, 0]), // both share param[0]
-            energies: Some(Arc::new(energies.clone())),
             instrument: Some(Arc::clone(&inst)),
             resolution_plan: None,
             sparse_cubature_plan: None,
             sparse_scalar_plan: None,
-            work_layout: None,
+            layout: Arc::new(transmission::WorkingGridLayout::identity(&energies)),
         };
 
         let params = [0.001f64];
@@ -5742,12 +5650,11 @@ mod tests {
         let model_fixed = PrecomputedTransmissionModel {
             cross_sections: Arc::new(working.sigma),
             density_indices: Arc::new(vec![0]),
-            energies: Some(Arc::new(energies.clone())),
             instrument: Some(Arc::clone(&inst)),
             resolution_plan: None,
             sparse_cubature_plan: None,
             sparse_scalar_plan: None,
-            work_layout: Some(Arc::new(working.layout)),
+            layout: Arc::new(working.layout),
         };
         let t_fixed = model_fixed.evaluate(&[thickness]).unwrap();
 
@@ -5764,12 +5671,11 @@ mod tests {
         let model_old = PrecomputedTransmissionModel {
             cross_sections: Arc::new(xs_data),
             density_indices: Arc::new(vec![0]),
-            energies: Some(Arc::new(energies.clone())),
             instrument: Some(Arc::clone(&inst)),
             resolution_plan: None,
             sparse_cubature_plan: None,
             sparse_scalar_plan: None,
-            work_layout: None,
+            layout: Arc::new(transmission::WorkingGridLayout::identity(&energies)),
         };
         let t_old = model_old.evaluate(&[thickness]).unwrap();
 
@@ -5904,12 +5810,11 @@ mod tests {
         let model = PrecomputedTransmissionModel {
             cross_sections: Arc::new(working.sigma),
             density_indices: Arc::new(vec![0]),
-            energies: Some(Arc::new(energies.clone())),
             instrument: Some(Arc::clone(&inst)),
             resolution_plan: None,
             sparse_cubature_plan: None,
             sparse_scalar_plan: None,
-            work_layout: Some(Arc::new(working.layout)),
+            layout: Arc::new(working.layout),
         };
 
         let params = [thickness];
