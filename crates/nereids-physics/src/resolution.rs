@@ -1293,14 +1293,9 @@ impl TabulatedResolution {
         })
     }
 
-    /// Kernel support at energy `e_ev`, in eV: the larger of the two
-    /// distances in [`Self::gather_bounds_ev`], which is what a caller wants
-    /// when it pads a window symmetrically.  Past this distance the kernel is
-    /// exactly zero, so the broadening footprint at `e_ev` lies within
-    /// `[e_ev − support, e_ev + support]`.
-    ///
-    /// Returns `0.0` for non-positive or non-finite `e_ev`, an empty kernel
-    /// set, or a non-positive flight path.
+    /// Kernel support at energy `e_ev`, in eV: the larger of the two distances
+    /// in [`Self::gather_bounds_ev`].  Returns `0.0` for non-positive or
+    /// non-finite `e_ev`, an empty kernel set, or a non-positive flight path.
     #[must_use]
     pub fn kernel_support_ev(&self, e_ev: f64) -> f64 {
         let (lo, hi) = self.gather_bounds_ev(e_ev);
@@ -1308,29 +1303,10 @@ impl TabulatedResolution {
     }
 
     /// The lowest and highest energies the kernel at `e_ev` gathers theory
-    /// from, as `(low, high)` in eV, with `low ≤ e_ev ≤ high`.
-    ///
-    /// The kernel scanned is the one [`Self::broaden`] applies at `e_ev`:
-    /// the reference block on an exact hit, the nearest block outside the
-    /// tabulated range, and between references the width-normalized shape
-    /// blend of the two bracketing blocks, so a fringe point that carries
-    /// positive blended weight counts.  Each positive-weight offset maps
-    /// through the gather `E' = (TOF_FACTOR·L/(t − dt))²` with
-    /// `t = TOF_FACTOR·L/√E`, in the same arithmetic the broadening uses, so
-    /// a working grid that ends at these two values contains every point the
-    /// broadening keeps.  The convolution reads theory at `t − dt`, so an
-    /// Ikeda-Carpenter moderator, which emits late, gathers from HIGHER
-    /// energy only, while a mode-anchored table straddles zero and reaches
-    /// both ways.
-    ///
-    /// Only kernel points the broadening keeps count.  A delayed-emission
-    /// offset that reaches the nominal flight time (`dt ≥ t`) would gather
-    /// from past infinite energy; [`Self::broaden`] drops such points and
-    /// renormalizes over the rest, so the bounds are those of the surviving
-    /// points and are always finite.
-    ///
-    /// Returns `(e_ev, e_ev)` for non-positive or non-finite `e_ev`, an
-    /// empty kernel set, or a non-positive flight path.
+    /// from, as `(low, high)` in eV with `low ≤ e_ev ≤ high`, over the points
+    /// [`Self::broaden`] keeps and in its arithmetic.  Returns `(e_ev, e_ev)`
+    /// for non-positive or non-finite `e_ev`, an empty kernel set, or a
+    /// non-positive flight path.
     #[must_use]
     pub fn gather_bounds_ev(&self, e_ev: f64) -> (f64, f64) {
         if e_ev <= 0.0 || !e_ev.is_finite() || self.kernels.is_empty() || self.flight_path_m <= 0.0
@@ -1385,39 +1361,19 @@ pub enum ResolutionFunction {
 /// Widths of Gaussian resolution the broadening limits reach on each side.
 ///
 /// SAMMY Ref: `rsl/mrsl4.f90` `Wdsint`, `Wlow = Wup = Brdlim*Widgau`;
-/// `inp/minp06.f` line 212, `Brdlim = 5`. The exponential-tail grading of
-/// `Wup` below is the same routine's `Rwid` branch. SAMMY's pure-exponential
-/// low side, `0.5*Widexp`, has no counterpart here: the Gaussian family
-/// always carries a Gaussian core.
+/// `inp/minp06.f` line 212, `Brdlim = 5`.
 const BRDLIM: f64 = 5.0;
 
-/// Lowest energy the Gaussian working grid extends to, in eV.
-///
-/// The PW-linear quadrature maps points through `1/√E`, which has no value
-/// at zero; SAMMY's own extension can run to `Emind ≤ 0` because its
-/// velocity-spaced grid never evaluates there.
+/// Lowest energy the Gaussian working grid extends to, in eV: the PW-linear
+/// quadrature maps points through `1/√E`, which has no value at zero.
 const GAUSSIAN_LOW_ENERGY_FLOOR_EV: f64 = 0.001;
 
 impl ResolutionFunction {
-    /// The energies a working grid for the data window `energies` has to
-    /// span, as `(low, high)` in eV with `low ≤ e_min` and `high ≥ e_max`.
-    ///
-    /// A broadened value at a point within the kernel's reach of a window
-    /// edge is built from theory the window does not contain. Evaluating the
-    /// model on a grid that spans these two values is what makes the value
-    /// at the edge the same one an infinite window would give.
-    ///
-    /// The families differ in what bounds the reach, which is why they differ
-    /// here: an analytic Gaussian has unbounded tails and is cut at SAMMY's
-    /// five-sigma convention, taken at the two ends of the grid as Escale
-    /// does, while a measured or synthesized kernel has exact compact
-    /// support that varies with energy in no fixed direction, so every
-    /// target on the grid is asked where it gathers from
-    /// ([`TabulatedResolution::gather_bounds_ev`], in the broadening's own
-    /// arithmetic) and the extremes are kept.
-    ///
-    /// `energies` is the data grid, ascending. Returns `(0.0, 0.0)` for an
-    /// empty grid.
+    /// The energies a working grid for the data window `energies` has to span,
+    /// as `(low, high)` in eV with `low ≤ e_min` and `high ≥ e_max`: SAMMY's
+    /// Wdsint limits at the two ends for a Gaussian, the extremes of
+    /// [`TabulatedResolution::gather_bounds_ev`] over the grid for a sampled
+    /// kernel.  Returns `(0.0, 0.0)` for an empty grid.
     #[must_use]
     pub fn grid_bounds_ev(&self, energies: &[f64]) -> (f64, f64) {
         let (Some(&e_min), Some(&e_max)) = (energies.first(), energies.last()) else {
@@ -1433,10 +1389,8 @@ impl ResolutionFunction {
             Self::Gaussian(params) => {
                 let wg_high = params.gaussian_width(e_max);
                 let we_high = params.exp_width(e_max);
-                // The exponential tail is one-sided and wider than the
-                // Gaussian core, so SAMMY grades the high side by their
-                // ratio instead of carrying five sigma of a width the tail
-                // dominates.
+                // SAMMY grades the high side by the ratio of the Gaussian core to
+                // the one-sided exponential tail (Wdsint, `Rwid`).
                 let above = if we_high > 1e-30 {
                     let rwid = wg_high / we_high;
                     if rwid <= 1.0 {
@@ -2352,8 +2306,6 @@ impl TabulatedResolution {
     /// past infinite energy; they are dropped and the kernel
     /// renormalized over the surviving points, mirroring the grid-edge
     /// handling — see the tail-truncation note on `broaden_presorted`.
-    /// [`Self::kernel_support_ev`] reports the reach of the surviving
-    /// points only.
     ///
     /// # Errors
     /// Returns [`ResolutionError::LengthMismatch`] if the arrays differ in
@@ -2394,9 +2346,7 @@ impl TabulatedResolution {
     /// reach — very high energy and/or a short flight path — and is
     /// reachable at *any* target energy because `interpolated_kernel`
     /// clamps to the nearest reference kernel outside the tabulated
-    /// range.  [`Self::kernel_support_ev`] counts only the points that
-    /// survive, so a grid extended by it carries everything the
-    /// broadening will read.
+    /// range.
     ///
     /// ## Inner-loop optimization
     ///
@@ -5373,9 +5323,8 @@ Resolution file
         );
     }
 
-    /// A positive-offset extreme reaching the nominal flight time is a
-    /// point the broadening drops, so it contributes no reach: the
-    /// support is that of the surviving points, and finite.
+    /// An offset at or past the nominal flight time contributes no reach: the
+    /// support is that of the surviving points.
     #[test]
     fn test_tabulated_kernel_support_counts_only_points_the_broadening_keeps() {
         let offsets = vec![0.0, 2.0, 10.0];

@@ -1388,10 +1388,7 @@ pub fn spatial_map_typed(
                 // `precomputed_cross_sections` is cached (the non-
                 // cached path already surfaces this via
                 // `broadened_cross_sections`).
-                // On the working grid, which is the grid the broadening is
-                // applied to: a kernel that reaches past the data ends gets
-                // an extended one, and a plan compiled for the data grid
-                // would be rejected there.
+                // Built on the working grid, the grid the broadening is applied to.
                 Some(res) => build_resolution_plan(plan_grid, res)
                     .map_err(|e| {
                         PipelineError::Transmission(

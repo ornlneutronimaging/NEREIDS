@@ -90,11 +90,8 @@ pub fn build_extended_grid_boundary_only(
 }
 
 /// Extend a data grid past both ends by the reach of any resolution family.
-///
-/// Boundary extension only. The intermediate points [`build_extended_grid`]
-/// adds are a quadrature device of the PW-linear Gaussian path, and its
-/// Fspken fine structure around narrow resonances is built for the Gaussian
-/// family alone.
+/// Boundary extension only: the intermediate points and resonance fine
+/// structure of [`build_extended_grid`] are built for the Gaussian family alone.
 pub fn build_extended_grid_for(
     data_energies: &[f64],
     resolution: &ResolutionFunction,
@@ -105,11 +102,9 @@ pub fn build_extended_grid_for(
     }
     let (low, high) = resolution.grid_bounds_ev(data_energies);
     let spacing = match resolution {
-        // The Gaussian's width is an energy; SAMMY's velocity-spaced grid
-        // resolves it.
+        // The Gaussian's width is an energy.
         ResolutionFunction::Gaussian(_) => Spacing::SqrtEnergy,
-        // These kernels are tabulated in time of flight, and a delayed tail
-        // near the flight time maps to energies without bound.
+        // These kernels are tabulated in time of flight.
         ResolutionFunction::Tabulated(_) | ResolutionFunction::IkedaCarpenter(_) => {
             Spacing::TimeOfFlight
         }
@@ -117,14 +112,11 @@ pub fn build_extended_grid_for(
     extend_boundaries(data_energies, low, high, spacing)
 }
 
-/// The variable in which the added boundary points are evenly spaced.
+/// The variable in which the added boundary points are evenly spaced, at the
+/// average spacing of the five data points nearest the edge.
 ///
-/// SAMMY Ref: `dat/mdat4.f90` Escale spaces the added points at the average
-/// spacing of the five data points nearest the edge, in `sqrt(E)` for
-/// free-gas Doppler (`dat/mdata.f90` Vqcon). A kernel tabulated in time of
-/// flight is resolved at the data's own time-of-flight spacing, which is
-/// `1/sqrt(E)` up to the flight path, and that spacing reaches any energy
-/// in a bounded number of points.
+/// SAMMY Ref: `dat/mdat4.f90` Escale, `sqrt(E)` for free-gas Doppler
+/// (`dat/mdata.f90` Vqcon); time of flight is `1/sqrt(E)` up to the flight path.
 #[derive(Clone, Copy)]
 enum Spacing {
     SqrtEnergy,
@@ -213,8 +205,7 @@ fn extend_boundaries(
     grid.sort_unstable_by(|a, b| a.total_cmp(b));
     dedup(&mut grid);
     // The merge keeps the lower of two points it cannot tell apart, so only
-    // the high end can lose its target, to a data point it lies within the
-    // merge tolerance of.
+    // the high end can lose its target.
     if high > *grid.last().expect("grid holds the data") {
         grid.push(high);
     }
@@ -675,16 +666,10 @@ mod tests {
         assert_eq!(indices, vec![0, 1, 2, 3, 4]);
     }
 
-    /// A delayed tail that approaches the nominal flight time does not
-    /// make the working grid grow without bound.
-    ///
-    /// The map from a kernel offset to the energy it gathers from diverges as
-    /// the offset nears the flight time, so the last surviving sample can
-    /// name an energy of any size. The extension never needs more points
-    /// than the instrument has time-of-flight channels, at the data's own
-    /// channel width, between the window edge and zero flight time on the
-    /// high side and out to the earliest offset on the low side; swept across
-    /// that regime it also moves smoothly.
+    /// A delayed tail that approaches the nominal flight time does not make the
+    /// working grid grow without bound: the extension needs no more points than
+    /// the instrument has time-of-flight channels over the same span, and it
+    /// moves smoothly as the tail crosses the flight time.
     #[test]
     fn extension_stays_bounded_as_the_tail_nears_the_flight_time() {
         use crate::resolution::{TOF_FACTOR, TabulatedResolution};

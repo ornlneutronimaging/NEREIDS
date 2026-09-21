@@ -1,9 +1,5 @@
-//! A broadened value must not depend on where the data window ends.
-//!
-//! The broadened spectrum at a target energy is built from theory within the
-//! kernel's reach of that energy. Whether the caller happened to stop
-//! collecting data just past it is not a property of the sample, so widening
-//! the window must leave the shared targets alone.
+//! A broadened value must not depend on where the data window ends, so
+//! widening the window must leave the shared targets alone.
 
 use nereids_endf::resonance::test_support::synthetic_isotope;
 use nereids_physics::ikeda_carpenter::{
@@ -64,8 +60,7 @@ fn ikeda_carpenter(beta: f64, e_lo: f64, e_hi: f64) -> ResolutionFunction {
         burst_sigma_us: None,
         channel_fwhm_us: Some(0.35),
     };
-    // References bracket the window, as the calibration's own synthesis
-    // grid does, so every data energy lies between two of them.
+    // References bracket the window so every data energy lies between two.
     ResolutionFunction::IkedaCarpenter(std::sync::Arc::new(
         IkedaCarpenter::new(
             params,
@@ -81,11 +76,9 @@ fn ikeda_carpenter(beta: f64, e_lo: f64, e_hi: f64) -> ResolutionFunction {
     ))
 }
 
-/// A mode-anchored kernel with mass on both sides of zero, so it gathers
-/// from below as well as above, at two reference energies bracketing the
-/// window.  `fringe` is the weight of the outermost row on each side: zero
-/// gives a kernel that fades out, a positive value one whose last row still
-/// carries mass, so the point that sets the grid's end is itself weighted.
+/// A mode-anchored kernel with mass on both sides of zero at two reference
+/// energies bracketing the window.  `fringe` is the weight of the outermost
+/// row on each side.
 fn tabulated_resolution(fringe: f64) -> ResolutionFunction {
     let text = format!(
         "header\n---\n\
@@ -111,15 +104,6 @@ fn tabulated_resolution(fringe: f64) -> ResolutionFunction {
 }
 
 /// The kernel regimes the working grid has to serve.
-///
-/// A fast moderator on a fine energy grid, where every kernel point is well
-/// inside the flight time; a mode-anchored table that gathers from both
-/// sides, once fading out and once with mass on its last row; a three-point
-/// kernel on a five-point window, where a third of the kernel rides on the
-/// point that sets the grid's end; and a slow moderator at high energy on
-/// the instrument's own channels, where the kernel's late tail runs past the
-/// flight time and the last surviving point gathers from far above the
-/// window.
 fn fixtures() -> Vec<Fixture> {
     vec![
         Fixture {
@@ -168,8 +152,7 @@ fn fixtures() -> Vec<Fixture> {
 }
 
 fn transmission(energies: &[f64], e_resonance: f64, resolution: &ResolutionFunction) -> Vec<f64> {
-    // A resonance placed AT the window edge: the case the truncation hurts
-    // most, because the kernel there reaches entirely outside the data.
+    // A resonance at the window edge.
     let iso = synthetic_isotope(72, 178, e_resonance, 0.05, 0.06);
     let sample = SampleParams::new(300.0, vec![(iso, 5.0e-6)]).expect("valid sample");
     forward_model(
@@ -184,13 +167,6 @@ fn transmission(energies: &[f64], e_resonance: f64, resolution: &ResolutionFunct
 
 /// Extending the window past the kernel's reach leaves the shared targets
 /// unchanged, whichever way the kernel reaches.
-///
-/// The Ikeda-Carpenter kernel is causal on the emission clock, so its offsets
-/// are positive and it gathers theory from HIGHER energy only; a mode-anchored
-/// table straddles zero and gathers from both sides. Without a boundary
-/// extension the edge of the window has nothing to gather on that side and
-/// the surviving fragment is renormalized to full weight, so the model there
-/// is built from a kernel that is narrower, lighter and mis-centred.
 #[test]
 fn a_wider_window_does_not_change_the_model_inside_it() {
     let mut moved = Vec::new();
@@ -219,9 +195,6 @@ fn a_wider_window_does_not_change_the_model_inside_it() {
         let t_narrow = transmission(&narrow, f.e_hi, &f.resolution);
         let t_wide = transmission(&wide, f.e_hi, &f.resolution);
 
-        // Transmission is the observable and lives in [0, 1], so the
-        // difference is taken as it is measured, not relative to a value
-        // that a black resonance drives to zero.
         let mut worst = 0.0_f64;
         let mut worst_at = 0.0_f64;
         for (i, &e) in narrow.iter().enumerate() {
@@ -240,11 +213,6 @@ fn a_wider_window_does_not_change_the_model_inside_it() {
         );
         moved.push((f.label, worst, worst_at, 1.0 - t_min));
     }
-    // The two runs convolve on different point sets - the wide window
-    // carries its own data where the narrow one carries extension points -
-    // so what is left is the trapezoid's own discretization, not lost
-    // kernel mass. Measured against the dip the model shows, truncation is
-    // orders of magnitude above it.
     let moved: Vec<String> = moved
         .into_iter()
         .filter(|&(_, worst, _, dip)| worst >= 1.0e-3 * dip)
@@ -261,14 +229,8 @@ fn a_wider_window_does_not_change_the_model_inside_it() {
 }
 
 /// The working grid carries every surviving kernel point at every data
-/// point.
-///
-/// The oracle maps the kernel's own samples through the time-of-flight
-/// relation, in the arithmetic the broadening uses, and applies the
-/// broadening's own rule for a sample outside the grid; it does not ask the
-/// reach code where the kernel ends. A kernel renormalized after losing a
-/// point is a different kernel from the one the file describes, so nothing
-/// may fall outside, not even by rounding.
+/// point, by the broadening's own arithmetic and its own rule for a point
+/// outside the grid.
 #[test]
 fn the_working_grid_carries_the_whole_kernel_at_every_data_point() {
     for f in fixtures() {

@@ -93,9 +93,7 @@ fn build_aux_grid(
             }
         } else {
             // Tabulated and Ikeda-Carpenter kernels get the boundary
-            // extension without the intermediates: those are quadrature
-            // points for the PW-linear Gaussian path, which these families
-            // do not take.
+            // extension without the Gaussian path's intermediates.
             crate::auxiliary_grid::build_extended_grid_for(energies, &inst.resolution)
         };
         (ext_e.len() > energies.len()).then_some((ext_e, di))
@@ -362,12 +360,9 @@ pub type BroadenedXsWithDerivative = (Vec<Vec<f64>>, Vec<Vec<f64>>);
 /// *before* resolution broadening, degrading the convolution near grid edges
 /// and around narrow resonances relative to [`forward_model`].
 ///
-/// **Every resolution family gets the boundary extension.**  The working grid
-/// equals the data grid only when no instrument is present, or when the
-/// kernel's reach is zero at both ends.
-/// A [`crate::resolution::ResolutionPlan`] must therefore be built on
-/// [`Self::energies`], not on the data grid: `apply_resolution_with_plan`
-/// rejects a plan whose grid differs from the one it is applied to.
+/// The working grid equals the data grid only when no instrument is present
+/// or the kernel's reach is zero at both ends.  A
+/// [`crate::resolution::ResolutionPlan`] must be built on [`Self::energies`].
 #[derive(Debug, Clone)]
 pub struct WorkingGridLayout {
     /// Working-grid energies (eV, ascending).  Equals the input data grid
