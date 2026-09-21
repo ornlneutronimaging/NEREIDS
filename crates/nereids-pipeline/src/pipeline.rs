@@ -33,21 +33,6 @@ pub struct PrecomputedXs {
     pub layout: Arc<WorkingGridLayout>,
 }
 
-impl PrecomputedXs {
-    pub fn on_data_grid(&self) -> Self {
-        let data_energies = self.layout.extract(&self.layout.energies);
-        Self {
-            sigma: Arc::new(
-                self.sigma
-                    .iter()
-                    .map(|row| self.layout.extract(row))
-                    .collect(),
-            ),
-            layout: Arc::new(WorkingGridLayout::identity(&data_energies)),
-        }
-    }
-}
-
 impl From<WorkingGridXs> for PrecomputedXs {
     fn from(working: WorkingGridXs) -> Self {
         Self {
@@ -1761,10 +1746,6 @@ fn fit_counts_joint_poisson(
     let mut true_model_config = config.clone();
     if config.exact_count_response().is_some() {
         true_model_config.resolution = None;
-        true_model_config.precomputed_cross_sections = true_model_config
-            .precomputed_cross_sections
-            .as_ref()
-            .map(PrecomputedXs::on_data_grid);
         true_model_config.precomputed_resolution_plan = None;
         true_model_config.precomputed_sparse_cubature_plan = None;
         true_model_config.precomputed_sparse_scalar_plan = None;
@@ -2631,27 +2612,35 @@ pub(crate) fn validate_precomputed_cross_sections(
         )));
     }
 
-    let data = config.energies();
-    if xs.layout.data_indices.len() != data.len() {
+    let instrument = if config.exact_count_response().is_some() {
+        None
+    } else {
+        config.resolution().map(|r| InstrumentParams {
+            resolution: r.clone(),
+        })
+    };
+    let rd_refs: Vec<&ResonanceData> = config.resonance_data().iter().collect();
+    let expected = nereids_physics::transmission::resolution_working_grid(
+        config.energies(),
+        instrument.as_ref(),
+        &rd_refs,
+    )
+    .map_err(PipelineError::Transmission)?;
+    let same_energies = xs.layout.energies.len() == expected.energies.len()
+        && xs
+            .layout
+            .energies
+            .iter()
+            .zip(&expected.energies)
+            .all(|(a, b)| a.to_bits() == b.to_bits());
+    if !same_energies || xs.layout.data_indices != expected.data_indices {
         return Err(PipelineError::ShapeMismatch(format!(
-            "precomputed_cross_sections layout maps {} data points but config.energies has {}",
+            "precomputed_cross_sections layout ({} energies, {} data points) is not the \
+             working grid this fit broadens on ({} energies, {} data points)",
+            xs.layout.energies.len(),
             xs.layout.data_indices.len(),
-            data.len(),
-        )));
-    }
-    if let Some(&bad) = xs.layout.data_indices.iter().find(|&&idx| idx >= n_work) {
-        return Err(PipelineError::ShapeMismatch(format!(
-            "precomputed_cross_sections layout index {bad} is out of range for {n_work} \
-             energies",
-        )));
-    }
-    if let Some(i) = (0..data.len())
-        .find(|&i| xs.layout.energies[xs.layout.data_indices[i]].to_bits() != data[i].to_bits())
-    {
-        return Err(PipelineError::ShapeMismatch(format!(
-            "precomputed_cross_sections layout carries {} at data point {i} but \
-             config.energies has {}",
-            xs.layout.energies[xs.layout.data_indices[i]], data[i],
+            expected.energies.len(),
+            expected.data_indices.len(),
         )));
     }
     Ok(())
@@ -2999,15 +2988,6 @@ fn build_transmission_model(
                     }
                 }
                 Arc::new(eff)
-            }
-            (Some(di), Some(dr)) if xs.sigma.len() != n_params => {
-                return Err(PipelineError::InvalidParameter(format!(
-                    "density mapping length mismatch: {} density_indices / {} \
-                     density_ratios for {} per-isotope cross-section rows",
-                    di.len(),
-                    dr.len(),
-                    xs.sigma.len(),
-                )));
             }
             _ => Arc::clone(&xs.sigma),
         };
@@ -7866,37 +7846,27 @@ mod tests {
 
     #[test]
     fn validate_precomputed_cross_sections_error_branches() {
+        use nereids_physics::resolution::{ResolutionFunction, ResolutionParams};
         let data = u238_single_resonance();
         let energies: Vec<f64> = (0..11).map(|i| 1.0 + (i as f64) * 0.1).collect();
         let n_e = energies.len();
-        let n_work = n_e + 2;
         let base = UnifiedFitConfig::new(
             energies.clone(),
-            vec![data],
+            vec![data.clone()],
             vec!["U-238".into()],
             0.0,
             None,
             vec![0.001],
         )
         .unwrap();
-        let grid = || {
-            let mut e = energies.clone();
-            e.insert(0, 0.95);
-            e.push(2.05);
-            e
-        };
-        let good_layout = || {
-            Arc::new(WorkingGridLayout {
-                energies: grid(),
-                data_indices: (1..=n_e).collect(),
-            })
-        };
-        let cfg = |sigma: Vec<Vec<f64>>, layout: Arc<WorkingGridLayout>| {
-            base.clone().with_precomputed_cross_sections(PrecomputedXs {
-                sigma: Arc::new(sigma),
-                layout,
-            })
-        };
+        let identity = || Arc::new(WorkingGridLayout::identity(&energies));
+        let cfg =
+            |base: &UnifiedFitConfig, sigma: Vec<Vec<f64>>, layout: Arc<WorkingGridLayout>| {
+                base.clone().with_precomputed_cross_sections(PrecomputedXs {
+                    sigma: Arc::new(sigma),
+                    layout,
+                })
+            };
         let expect =
             |c: &UnifiedFitConfig, needle: &str| match validate_precomputed_cross_sections(c) {
                 Err(PipelineError::ShapeMismatch(m)) => {
@@ -7905,40 +7875,66 @@ mod tests {
                 other => panic!("expected ShapeMismatch({needle:?}), got {other:?}"),
             };
         assert!(
-            validate_precomputed_cross_sections(&cfg(vec![vec![1.0; n_work]], good_layout()))
+            validate_precomputed_cross_sections(&cfg(&base, vec![vec![1.0; n_e]], identity()))
                 .is_ok()
         );
-        expect(&cfg(vec![], good_layout()), "must not be empty");
+        expect(&cfg(&base, vec![], identity()), "must not be empty");
         expect(
-            &cfg(vec![vec![1.0; n_work - 1]], good_layout()),
+            &cfg(&base, vec![vec![1.0; n_e - 1]], identity()),
             "its grid has",
         );
-        let mut nan_row = vec![1.0; n_work];
+        let mut nan_row = vec![1.0; n_e];
         nan_row[3] = f64::NAN;
-        expect(&cfg(vec![nan_row], good_layout()), "non-finite");
+        expect(&cfg(&base, vec![nan_row], identity()), "non-finite");
         expect(
-            &cfg(vec![vec![1.0; n_work], vec![1.0; n_work]], good_layout()),
+            &cfg(&base, vec![vec![1.0; n_e], vec![1.0; n_e]], identity()),
             "rows but expected",
         );
-        let short = Arc::new(WorkingGridLayout {
-            energies: grid(),
-            data_indices: (1..n_e).collect(),
-        });
-        expect(&cfg(vec![vec![1.0; n_work]], short), "layout maps");
-        let oor = Arc::new(WorkingGridLayout {
-            energies: grid(),
-            data_indices: {
-                let mut v: Vec<usize> = (1..=n_e).collect();
-                v[0] = n_work + 5;
-                v
+        let extended = Arc::new(WorkingGridLayout {
+            energies: {
+                let mut e = energies.clone();
+                e.insert(0, 0.95);
+                e.push(2.05);
+                e
             },
+            data_indices: (1..=n_e).collect(),
         });
-        expect(&cfg(vec![vec![1.0; n_work]], oor), "out of range");
-        let shifted = Arc::new(WorkingGridLayout {
-            energies: grid(),
-            data_indices: (0..n_e).collect(),
-        });
-        expect(&cfg(vec![vec![1.0; n_work]], shifted), "layout carries");
+        expect(
+            &cfg(&base, vec![vec![1.0; n_e + 2]], extended),
+            "is not the working grid",
+        );
+
+        let res =
+            ResolutionFunction::Gaussian(ResolutionParams::new(25.0, 0.5, 0.005, 0.0).unwrap());
+        let with_res = UnifiedFitConfig::new(
+            energies.clone(),
+            vec![data.clone()],
+            vec!["U-238".into()],
+            0.0,
+            Some(res.clone()),
+            vec![0.001],
+        )
+        .unwrap();
+        expect(
+            &cfg(&with_res, vec![vec![1.0; n_e]], identity()),
+            "is not the working grid",
+        );
+        let working = phys_transmission::resolution_working_grid(
+            &energies,
+            Some(&InstrumentParams { resolution: res }),
+            &[&data],
+        )
+        .unwrap();
+        assert!(!working.is_identity());
+        let n_work = working.energies.len();
+        assert!(
+            validate_precomputed_cross_sections(&cfg(
+                &with_res,
+                vec![vec![1.0; n_work]],
+                Arc::new(working)
+            ))
+            .is_ok()
+        );
     }
 
     /// Cover the OTHER branches of the #608 `evaluate_jacobian_and_fisher` σ

@@ -377,6 +377,14 @@ impl WorkingGridLayout {
     pub fn extract(&self, working: &[f64]) -> Vec<f64> {
         self.data_indices.iter().map(|&i| working[i]).collect()
     }
+
+    pub fn extract_owned(&self, working: Vec<f64>) -> Vec<f64> {
+        if self.is_identity() {
+            working
+        } else {
+            self.extract(&working)
+        }
+    }
 }
 
 /// Working-grid Doppler-broadened cross-sections plus the data-grid map.

@@ -2640,12 +2640,6 @@ mod tests {
         }
     }
 
-    /// Issue #608: `spatial_map_typed`'s `Some(cached)` +
-    /// aux-grid arm — when a caller PRE-SUPPLIES data-grid σ AND a Gaussian aux
-    /// grid is active, the working-grid σ is recomputed from resonance data (the
-    /// cached data σ cannot be de-extracted back onto the aux grid).  The
-    /// sibling Gaussian test exercises the `None` arm; this supplies precomputed
-    /// σ to hit the `Some(cached)` arm.
     #[test]
     fn test_spatial_map_typed_gaussian_aux_grid_with_precomputed_sigma() {
         use nereids_physics::resolution::{ResolutionFunction, ResolutionParams};
@@ -2721,6 +2715,53 @@ mod tests {
             (mean - true_density).abs() / true_density < 0.10,
             "Some(cached)+aux mean density: {mean}, true: {true_density}"
         );
+    }
+
+    #[test]
+    fn test_spatial_map_typed_rejects_data_grid_table_under_gaussian() {
+        use nereids_physics::resolution::{ResolutionFunction, ResolutionParams};
+
+        let data = u238_single_resonance();
+        let energies: Vec<f64> = (0..101).map(|i| 1.0 + (i as f64) * 0.1).collect();
+        let (t_3d, u_3d) = synthetic_4x4_transmission(&data, 0.0005, &energies);
+        let resolution =
+            ResolutionFunction::Gaussian(ResolutionParams::new(25.0, 0.5, 0.005, 0.0).unwrap());
+        let working = nereids_physics::transmission::resolution_working_grid(
+            &energies,
+            Some(&InstrumentParams {
+                resolution: resolution.clone(),
+            }),
+            &[&data],
+        )
+        .unwrap();
+        assert!(!working.is_identity());
+        let on_data_grid = nereids_physics::transmission::broadened_cross_sections(
+            &energies,
+            std::slice::from_ref(&data),
+            300.0,
+            None,
+            None,
+        )
+        .unwrap();
+        let config = UnifiedFitConfig::new(
+            energies,
+            vec![data],
+            vec!["U-238".into()],
+            300.0,
+            Some(resolution),
+            vec![0.001],
+        )
+        .unwrap();
+        let config = config
+            .clone()
+            .with_precomputed_cross_sections(table_on_data_grid(&config, on_data_grid));
+        let input = InputData3D::Transmission {
+            transmission: t_3d.view(),
+            uncertainty: u_3d.view(),
+        };
+        let err = spatial_map_typed(&input, &config, None, None, None).unwrap_err();
+        assert!(matches!(err, PipelineError::ShapeMismatch(_)), "{err:?}");
+        assert!(err.to_string().contains("is not the working grid"), "{err}");
     }
 
     #[test]

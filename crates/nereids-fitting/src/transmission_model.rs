@@ -42,10 +42,6 @@ const L_SCALE_PHYSICAL_HI: f64 = 2.0;
 ///
 /// Issue #442: resolution broadening is applied to T(E) after Beer-Lambert,
 /// not to σ(E) before.
-///
-/// Construct via `nereids_physics::transmission::broadened_cross_sections`,
-/// then wrap in `Arc` so the same precomputed data is shared read-only
-/// across all rayon worker threads.
 pub struct PrecomputedTransmissionModel {
     pub cross_sections: Arc<Vec<Vec<f64>>>,
     /// Mapping: `params[density_indices[i]]` is the density of isotope `i`.
@@ -369,8 +365,8 @@ impl PrecomputedTransmissionModel {
         &self.layout.energies
     }
 
-    fn extract_data_points(&self, working: &[f64]) -> Vec<f64> {
-        self.layout.extract(working)
+    fn extract_data_points(&self, working: Vec<f64>) -> Vec<f64> {
+        self.layout.extract_owned(working)
     }
 }
 
@@ -398,7 +394,7 @@ impl FitModel for PrecomputedTransmissionModel {
             ) {
                 let n: Vec<f64> = params_indices.iter().map(|&i| params[i]).collect();
                 if density_within_box(cubature, &n) {
-                    return Ok(self.extract_data_points(&cubature.forward(&n)));
+                    return Ok(self.extract_data_points(cubature.forward(&n)));
                 }
                 // Density escaped the training box — fall through
                 // to the exact path (cubature accuracy degrades
@@ -431,7 +427,7 @@ impl FitModel for PrecomputedTransmissionModel {
             {
                 let n = params[params_indices[0]];
                 if scalar_density_within_box(scalar, n) {
-                    return Ok(self.extract_data_points(&scalar.forward_scalar(n)));
+                    return Ok(self.extract_data_points(scalar.forward_scalar(n)));
                 }
             }
         }
@@ -462,9 +458,9 @@ impl FitModel for PrecomputedTransmissionModel {
                 &inst.resolution,
             )
             .map_err(|e| FittingError::EvaluationFailed(format!("resolution broadening: {e}")))?;
-            Ok(self.extract_data_points(&t_broadened))
+            Ok(self.extract_data_points(t_broadened))
         } else {
-            Ok(self.extract_data_points(&transmission))
+            Ok(self.extract_data_points(transmission))
         }
     }
 
@@ -625,7 +621,7 @@ impl FitModel for PrecomputedTransmissionModel {
                     &inst.resolution,
                 )
                 .ok()?;
-                let resolved_deriv = self.extract_data_points(&resolved_deriv);
+                let resolved_deriv = self.extract_data_points(resolved_deriv);
                 for (i, &val) in resolved_deriv.iter().enumerate() {
                     *jacobian.get_mut(i, col) = val;
                 }
