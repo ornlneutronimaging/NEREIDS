@@ -32,6 +32,9 @@ cargo test --workspace --exclude nereids-python
 Run `cargo fmt` (not `--check`) so formatting is applied — never rely on
 targeted `Edit` patches. Do not suppress clippy warnings with `#[allow(...)]`.
 
+Then run `/comment-audit` on the changed files and apply its deletions. A
+comment the gate deletes is not rewritten to survive it.
+
 ## Physics Rules
 
 - **No approximations**: implement exact SAMMY physics. Never introduce ad-hoc
