@@ -23,18 +23,39 @@ use nereids_fitting::transmission_model::{
 };
 use nereids_physics::counts_response::DetectorBinResponseMatrix;
 use nereids_physics::resolution::ResolutionFunction;
-use nereids_physics::transmission::InstrumentParams;
+use nereids_physics::transmission::{InstrumentParams, WorkingGridLayout, WorkingGridXs};
 
 use crate::error::PipelineError;
 
-/// Working-grid σ + its layout (issue #608): Doppler-broadened σ on the working
-/// grid paired with the data-index map back to the data grid.  Injected by
-/// [`spatial_map_typed`] into [`UnifiedFitConfig`] for the precomputed
-/// Gaussian-resolution path.
-type PrecomputedWorkXs = (
-    Arc<Vec<Vec<f64>>>,
-    Arc<nereids_physics::transmission::WorkingGridLayout>,
-);
+#[derive(Debug, Clone)]
+pub struct PrecomputedXs {
+    pub sigma: Arc<Vec<Vec<f64>>>,
+    pub layout: Arc<WorkingGridLayout>,
+}
+
+impl PrecomputedXs {
+    pub fn on_data_grid(&self) -> Self {
+        let data_energies = self.layout.extract(&self.layout.energies);
+        Self {
+            sigma: Arc::new(
+                self.sigma
+                    .iter()
+                    .map(|row| self.layout.extract(row))
+                    .collect(),
+            ),
+            layout: Arc::new(WorkingGridLayout::identity(&data_energies)),
+        }
+    }
+}
+
+impl From<WorkingGridXs> for PrecomputedXs {
+    fn from(working: WorkingGridXs) -> Self {
+        Self {
+            sigma: Arc::new(working.sigma),
+            layout: Arc::new(working.layout),
+        }
+    }
+}
 
 /// SAMMY-style normalization and background configuration.
 ///
@@ -425,19 +446,7 @@ pub struct UnifiedFitConfig {
     counts_enable_polish: Option<bool>,
 
     // ── Precomputed caches (injected by spatial_map_typed) ──
-    precomputed_cross_sections: Option<Arc<Vec<Vec<f64>>>>,
-    /// Doppler-broadened σ on the **working grid** + the working-grid layout,
-    /// injected by [`spatial_map_typed`] for the fixed-calibration /
-    /// fixed-temperature precomputed path.
-    ///
-    /// `None` when the working grid is the data grid; the model then uses
-    /// `precomputed_cross_sections` directly.
-    ///
-    /// `precomputed_cross_sections` still carries the **data-grid** σ for the
-    /// surrogate-plan builders and shape validation; this field is the separate
-    /// working-grid copy consumed only by `build_transmission_model`'s
-    /// precomputed branch.
-    precomputed_work_cross_sections: Option<PrecomputedWorkXs>,
+    precomputed_cross_sections: Option<PrecomputedXs>,
     precomputed_base_xs: Option<Arc<Vec<Vec<f64>>>>,
     /// Resolution broadening plan built once for `(energies, resolution)`.
     ///
@@ -593,7 +602,6 @@ impl UnifiedFitConfig {
             exact_count_response: None,
             counts_enable_polish: None,
             precomputed_cross_sections: None,
-            precomputed_work_cross_sections: None,
             precomputed_base_xs: None,
             precomputed_resolution_plan: None,
             precomputed_sparse_cubature_plan: None,
@@ -773,45 +781,10 @@ impl UnifiedFitConfig {
     }
 
     #[must_use]
-    pub fn with_precomputed_cross_sections(mut self, xs: Arc<Vec<Vec<f64>>>) -> Self {
+    pub fn with_precomputed_cross_sections(mut self, xs: PrecomputedXs) -> Self {
         self.precomputed_cross_sections = Some(xs);
-        // A new XS cache invalidates any prebuilt cubature — the
-        // cubature's atoms encode the OLD σ stack, so reusing the
-        // plan would silently produce wrong forward / Jacobian
-        // values for the new σ.
         self.precomputed_sparse_cubature_plan = None;
         self.precomputed_sparse_scalar_plan = None;
-        // A new data-grid σ also invalidates the working-grid σ copy
-        // (issue #608): it was Doppler-broadened from the OLD σ on the
-        // OLD grid layout, so reusing it would mix grids.
-        self.precomputed_work_cross_sections = None;
-        self
-    }
-
-    /// Attach the **working-grid** Doppler-broadened σ + its layout for the
-    /// fixed-calibration / fixed-temperature precomputed path (issue #608).
-    ///
-    /// When set, `build_transmission_model` builds a
-    /// [`PrecomputedTransmissionModel`] whose σ live on the working grid and
-    /// whose `evaluate` / `analytical_jacobian` apply resolution on the working
-    /// grid and extract the data points last — matching `forward_model`.  The
-    /// data-grid `precomputed_cross_sections` must still be set (shape
-    /// validation reads it); when the resolution does not extend the grid the
-    /// working grid equals the data grid and this is left `None`.
-    ///
-    /// The σ + layout are not validated here (this is an infallible builder
-    /// setter); shape/consistency are checked once up front in
-    /// `validate_precomputed_cross_sections`, which every public entry point
-    /// (`fit_spectrum_typed`, `evaluate_jacobian_and_fisher`, `spatial_map_typed`)
-    /// calls before any forward-model build or per-pixel loop — mirroring how
-    /// [`Self::with_precomputed_cross_sections`] is validated.
-    #[must_use]
-    pub fn with_precomputed_work_cross_sections(
-        mut self,
-        xs: Arc<Vec<Vec<f64>>>,
-        layout: Arc<nereids_physics::transmission::WorkingGridLayout>,
-    ) -> Self {
-        self.precomputed_work_cross_sections = Some((xs, layout));
         self
     }
 
@@ -956,7 +929,6 @@ impl UnifiedFitConfig {
         // grouping, against the new group density layout.
         // Clear stale caches — the isotope set changed.
         self.precomputed_cross_sections = None;
-        self.precomputed_work_cross_sections = None;
         self.precomputed_base_xs = None;
         // Clear the cubature plan too: atoms are σ-coordinates in
         // ℝ^k and `k` / σ-stack change when groups are reconfigured,
@@ -1065,7 +1037,7 @@ impl UnifiedFitConfig {
             mask.as_deref(),
         )
     }
-    pub fn precomputed_cross_sections(&self) -> Option<&Arc<Vec<Vec<f64>>>> {
+    pub fn precomputed_cross_sections(&self) -> Option<&PrecomputedXs> {
         self.precomputed_cross_sections.as_ref()
     }
     /// Number of density parameters (one per group or per isotope).
@@ -1789,7 +1761,10 @@ fn fit_counts_joint_poisson(
     let mut true_model_config = config.clone();
     if config.exact_count_response().is_some() {
         true_model_config.resolution = None;
-        true_model_config.precomputed_work_cross_sections = None;
+        true_model_config.precomputed_cross_sections = true_model_config
+            .precomputed_cross_sections
+            .as_ref()
+            .map(PrecomputedXs::on_data_grid);
         true_model_config.precomputed_resolution_plan = None;
         true_model_config.precomputed_sparse_cubature_plan = None;
         true_model_config.precomputed_sparse_scalar_plan = None;
@@ -2614,59 +2589,26 @@ pub(crate) fn degenerate_normalization_warning(config: &UnifiedFitConfig) -> Opt
     }
 }
 
-/// Validate a caller-supplied precomputed cross-section stack against the
-/// config's grid and isotope/group mapping, BEFORE it reaches the forward-model
-/// builders or the per-pixel rayon loop.
-///
-/// `precomputed_cross_sections` is consumed by `build_transmission_model` /
-/// `build_energy_scale_transmission_model`, which index `xs[0].len()` (panics
-/// when empty) and `params[density_indices[i]]` for each row, and write
-/// `neg_opt[j]` for every `j` in a row (an over-long row writes out of bounds).
-/// A shape mismatch there either panics deep in the LM iteration or is swallowed
-/// per-pixel as `n_failed`; validating once up front turns it into a typed
-/// `ShapeMismatch` (mapped to `PyValueError` at the Python boundary).
-///
-/// Accepted shapes (matching the builders' collapse logic):
-/// * **non-empty** — at least one σ row.
-/// * every row has length `energies.len()`.
-/// * row count is either `n_density_params` (already group-collapsed / identity)
-///   or, when groups are active, `density_indices.len()` (per-member, collapsed
-///   downstream).
-///
-/// When `precomputed_work_cross_sections` is also set (a resolution whose
-/// reach extends the grid) its working-grid σ + layout are validated against the same
-/// invariants: non-empty, each row length == `work_layout.energies.len()`,
-/// finite σ, row count == the data-grid σ row count (same density mapping), and
-/// a layout whose `data_indices` length == `energies.len()` with every index in
-/// range for the working grid — so `build_transmission_model`'s Beer-Lambert
-/// accumulation and `work_layout.extract(..)` cannot write/read out of bounds.
 pub(crate) fn validate_precomputed_cross_sections(
     config: &UnifiedFitConfig,
 ) -> Result<(), PipelineError> {
     let Some(xs) = config.precomputed_cross_sections() else {
         return Ok(());
     };
-    if xs.is_empty() {
+    if xs.sigma.is_empty() {
         return Err(PipelineError::ShapeMismatch(
             "precomputed_cross_sections must not be empty".into(),
         ));
     }
-
-    let n_e = config.energies().len();
-    for (i, row) in xs.iter().enumerate() {
-        if row.len() != n_e {
+    let n_work = xs.layout.energies.len();
+    for (i, row) in xs.sigma.iter().enumerate() {
+        if row.len() != n_work {
             return Err(PipelineError::ShapeMismatch(format!(
-                "precomputed_cross_sections row {i} has length {} but config.energies \
-                 has {n_e}",
+                "precomputed_cross_sections row {i} has length {} but its grid has {n_work} \
+                 energies",
                 row.len(),
             )));
         }
-        // A correctly-shaped row of NaN / ±∞ σ passes the shape checks but
-        // poisons the forward model: every transmission sample picks up the
-        // non-finite σ and the LM residual / Fisher matrix becomes NaN, which
-        // the per-pixel dispatch then silently swallows as a failed fit.
-        // Reject non-finite σ at the boundary (`is_finite()` excludes both NaN
-        // and ±∞; a bare order comparison would let NaN through).
         if let Some(j) = row.iter().position(|s| !s.is_finite()) {
             return Err(PipelineError::ShapeMismatch(format!(
                 "precomputed_cross_sections row {i} has non-finite σ at energy index {j}: {}",
@@ -2676,10 +2618,8 @@ pub(crate) fn validate_precomputed_cross_sections(
     }
 
     let n_params = config.n_density_params();
-    // When groups are active the per-member form (`density_indices.len()` rows)
-    // is collapsed to `n_params` rows downstream; accept either.
     let member_rows = config.density_indices.as_ref().map(|di| di.len());
-    let row_ok = xs.len() == n_params || member_rows == Some(xs.len());
+    let row_ok = xs.sigma.len() == n_params || member_rows == Some(xs.sigma.len());
     if !row_ok {
         let expected = match member_rows {
             Some(m) if m != n_params => format!("{n_params} (collapsed) or {m} (per-member)"),
@@ -2687,72 +2627,32 @@ pub(crate) fn validate_precomputed_cross_sections(
         };
         return Err(PipelineError::ShapeMismatch(format!(
             "precomputed_cross_sections has {} rows but expected {expected}",
-            xs.len(),
+            xs.sigma.len(),
         )));
     }
 
-    // Issue #608: the working-grid σ + layout attached via
-    // `with_precomputed_work_cross_sections` flows into
-    // `build_transmission_model`, where the model applies Beer-Lambert +
-    // resolution on `work_layout.energies` and then `work_layout.extract(..)`
-    // indexes the broadened spectrum by `work_layout.data_indices`.  An empty
-    // σ panics on `xs[0].len()`; a row whose length ≠ the working-grid length
-    // writes out of bounds in the Beer-Lambert accumulation; a layout whose
-    // `data_indices` length ≠ the data grid, or that indexes past the working
-    // grid, panics in `extract`.  Validate the same shape/consistency
-    // invariants as the data-grid σ above so a malformed setter call surfaces
-    // as a typed `ShapeMismatch` here rather than a per-pixel panic / swallowed
-    // failed fit.
-    if let Some((work_xs, layout)) = &config.precomputed_work_cross_sections {
-        let n_work = layout.energies.len();
-        if work_xs.is_empty() {
-            return Err(PipelineError::ShapeMismatch(
-                "precomputed_work_cross_sections must not be empty".into(),
-            ));
-        }
-        for (i, row) in work_xs.iter().enumerate() {
-            if row.len() != n_work {
-                return Err(PipelineError::ShapeMismatch(format!(
-                    "precomputed_work_cross_sections row {i} has length {} but \
-                     work_layout has {n_work} working-grid energies",
-                    row.len(),
-                )));
-            }
-            if let Some(j) = row.iter().position(|s| !s.is_finite()) {
-                return Err(PipelineError::ShapeMismatch(format!(
-                    "precomputed_work_cross_sections row {i} has non-finite σ at \
-                     working-grid index {j}: {}",
-                    row[j],
-                )));
-            }
-        }
-        // Row count must match the data-grid σ row count (same density mapping):
-        // both feed the SAME `density_indices` in `build_transmission_model`.
-        if work_xs.len() != xs.len() {
-            return Err(PipelineError::ShapeMismatch(format!(
-                "precomputed_work_cross_sections has {} rows but \
-                 precomputed_cross_sections has {} — both index the same density \
-                 mapping and must agree",
-                work_xs.len(),
-                xs.len(),
-            )));
-        }
-        // The layout maps each data energy to a working-grid index.  Its length
-        // must equal the data grid, and every index must be in range so
-        // `extract` cannot panic.
-        if layout.data_indices.len() != n_e {
-            return Err(PipelineError::ShapeMismatch(format!(
-                "precomputed_work_cross_sections layout maps {} data points but \
-                 config.energies has {n_e}",
-                layout.data_indices.len(),
-            )));
-        }
-        if let Some(&bad) = layout.data_indices.iter().find(|&&idx| idx >= n_work) {
-            return Err(PipelineError::ShapeMismatch(format!(
-                "precomputed_work_cross_sections layout index {bad} is out of \
-                 range for {n_work} working-grid energies",
-            )));
-        }
+    let data = config.energies();
+    if xs.layout.data_indices.len() != data.len() {
+        return Err(PipelineError::ShapeMismatch(format!(
+            "precomputed_cross_sections layout maps {} data points but config.energies has {}",
+            xs.layout.data_indices.len(),
+            data.len(),
+        )));
+    }
+    if let Some(&bad) = xs.layout.data_indices.iter().find(|&&idx| idx >= n_work) {
+        return Err(PipelineError::ShapeMismatch(format!(
+            "precomputed_cross_sections layout index {bad} is out of range for {n_work} \
+             energies",
+        )));
+    }
+    if let Some(i) = (0..data.len())
+        .find(|&i| xs.layout.energies[xs.layout.data_indices[i]].to_bits() != data[i].to_bits())
+    {
+        return Err(PipelineError::ShapeMismatch(format!(
+            "precomputed_cross_sections layout carries {} at data point {i} but \
+             config.energies has {}",
+            xs.layout.energies[xs.layout.data_indices[i]], data[i],
+        )));
     }
     Ok(())
 }
@@ -3071,176 +2971,65 @@ fn build_transmission_model(
     temperature_index: Option<usize>,
 ) -> Result<Box<dyn FitModel>, PipelineError> {
     let n_params = config.n_density_params();
-
-    // No-temperature fit without caller-precomputed σ: compute the
-    // working-grid σ HERE (same primitive `evaluate_jacobian_and_fisher`
-    // uses) so this path also returns a `PrecomputedTransmissionModel`.
-    //
-    // Before issue #635 this case fell through to `TransmissionFitModel`,
-    // whose constructor only builds `base_xs` when a temperature index is
-    // present — so `analytical_jacobian` returned `None` and every
-    // downstream consumer silently degraded to finite differences.  For
-    // the LM path that is a hidden slowdown; for the joint-Poisson
-    // stage-1 the degradation is to an IDENTITY-Fisher fallback (plain
-    // projected gradient descent), which crawls once the parameter vector
-    // couples several correlated columns (density + b0/b1/b2 of the
-    // multiplicative baseline needed >3000 iterations to cross a valley
-    // damped-Fisher clears in tens).  σ is computed once per fit — the
-    // same work `TransmissionFitModel` would have done lazily on its
-    // first `evaluate()`.
-    let computed_xs_storage;
-    let effective_precomputed: Option<&Arc<Vec<Vec<f64>>>> = if config.fit_temperature {
-        None
-    } else if let Some(xs) = &config.precomputed_cross_sections {
-        Some(xs)
-    } else {
-        let instrument = config
-            .resolution
-            .clone()
-            .map(|r| Arc::new(InstrumentParams { resolution: r }));
-        let working = nereids_physics::transmission::broadened_cross_sections_on_working_grid(
-            config.energies(),
-            &config.resonance_data,
-            config.temperature_k,
-            instrument.as_deref(),
-            None,
-        )
-        .map_err(PipelineError::Transmission)?;
-        if working.layout.is_identity() {
-            // The kernel does not reach past the data: the working grid IS
-            // the data grid.
-            computed_xs_storage = Arc::new(working.sigma);
-            Some(&computed_xs_storage)
-        } else {
-            // The grid was extended: resolution must be applied on the
-            // working grid and the data points extracted last.  Collapse
-            // per-isotope σ into per-parameter σ_eff (identity mapping when
-            // no groups are configured), then build the model directly with
-            // the working σ + layout.
-            let (density_indices, density_ratios) = (
-                config
-                    .density_indices
-                    .clone()
-                    .unwrap_or_else(|| (0..n_params).collect()),
-                config
-                    .density_ratios
-                    .clone()
-                    .unwrap_or_else(|| vec![1.0; config.resonance_data.len()]),
-            );
-            // Guard the collapse against length mismatch BEFORE zipping —
-            // Iterator::zip silently truncates to the shortest input, which
-            // would under-sum σ_eff.  The sibling `collapse_by_groups`
-            // closure below applies the same three-way equality check
-            // (review R3: one-path-hardened / parallel-path-missed).
-            if density_indices.len() != working.sigma.len()
-                || density_ratios.len() != working.sigma.len()
-            {
-                return Err(PipelineError::InvalidParameter(format!(
-                    "density mapping length mismatch: {} density_indices / {} \
-                     density_ratios for {} per-isotope cross-section rows",
-                    density_indices.len(),
-                    density_ratios.len(),
-                    working.sigma.len(),
-                )));
-            }
-            let n_e = working.sigma[0].len();
-            let mut eff = vec![vec![0.0f64; n_e]; n_params];
-            for ((&idx, &ratio), member_xs) in density_indices
-                .iter()
-                .zip(density_ratios.iter())
-                .zip(working.sigma.iter())
-            {
-                for (j, &sigma) in member_xs.iter().enumerate() {
-                    eff[idx][j] += ratio * sigma;
-                }
-            }
-            return Ok(Box::new(PrecomputedTransmissionModel {
-                cross_sections: Arc::new(eff),
-                density_indices: Arc::new((0..n_params).collect()),
-                energies: instrument
-                    .as_ref()
-                    .map(|_| Arc::new(config.energies.clone())),
-                instrument,
-                resolution_plan: None,
-                sparse_cubature_plan: None,
-                sparse_scalar_plan: None,
-                work_layout: Some(Arc::new(working.layout)),
-            }));
-        }
-    };
-
-    if !config.fit_temperature
-        && let Some(xs) = effective_precomputed
-    {
-        // When groups are active, compute σ_eff per group from member XS.
-        // For ungrouped isotopes, this is a no-op (identity mapping, ratio=1.0).
-        // Only collapse when XS is per-member (shape matches mapping); if XS is
-        // already group-collapsed (len == n_params), this is a clone.
-        let collapse_by_groups = |xs: &Arc<Vec<Vec<f64>>>| -> Arc<Vec<Vec<f64>>> {
-            if let (Some(di), Some(dr)) = (&config.density_indices, &config.density_ratios)
-                && xs.len() == di.len()
-                && di.len() == dr.len()
-            {
-                let n_e = xs[0].len();
-                let mut eff = vec![vec![0.0f64; n_e]; n_params];
-                for ((&idx, &ratio), member_xs) in di.iter().zip(dr.iter()).zip(xs.iter()) {
-                    for (j, &sigma) in member_xs.iter().enumerate() {
-                        eff[idx][j] += ratio * sigma;
-                    }
-                }
-                return Arc::new(eff);
-            }
-            Arc::clone(xs)
-        };
-
-        // The working-grid σ + layout when the spatial builder injected them,
-        // else the data-grid σ with no layout.
-        let (effective_xs, work_layout): (
-            Arc<Vec<Vec<f64>>>,
-            Option<Arc<nereids_physics::transmission::WorkingGridLayout>>,
-        ) = match &config.precomputed_work_cross_sections {
-            Some((work_xs, layout)) => (collapse_by_groups(work_xs), Some(Arc::clone(layout))),
-            None => (collapse_by_groups(xs), None),
-        };
-        // Issue #442: pass energies + instrument so evaluate() applies
-        // resolution after Beer-Lambert on total transmission.
-        let instrument = config
-            .resolution
-            .clone()
-            .map(|r| Arc::new(InstrumentParams { resolution: r }));
-        let resolution_plan = if instrument.is_some() {
-            config.precomputed_resolution_plan.clone()
-        } else {
-            None
-        };
-        let sparse_cubature_plan = if instrument.is_some() {
-            config.precomputed_sparse_cubature_plan.clone()
-        } else {
-            None
-        };
-        let sparse_scalar_plan = if instrument.is_some() {
-            config.precomputed_sparse_scalar_plan.clone()
-        } else {
-            None
-        };
-        return Ok(Box::new(PrecomputedTransmissionModel {
-            cross_sections: effective_xs,
-            density_indices: Arc::new((0..n_params).collect()),
-            energies: instrument
-                .as_ref()
-                .map(|_| Arc::new(config.energies.clone())),
-            instrument,
-            resolution_plan,
-            sparse_cubature_plan,
-            sparse_scalar_plan,
-            work_layout,
-        }));
-    }
-
     let instrument = config
         .resolution
         .clone()
         .map(|r| Arc::new(InstrumentParams { resolution: r }));
+
+    if !config.fit_temperature {
+        let xs = match &config.precomputed_cross_sections {
+            Some(xs) => xs.clone(),
+            None => PrecomputedXs::from(
+                nereids_physics::transmission::broadened_cross_sections_on_working_grid(
+                    config.energies(),
+                    &config.resonance_data,
+                    config.temperature_k,
+                    instrument.as_deref(),
+                    None,
+                )
+                .map_err(PipelineError::Transmission)?,
+            ),
+        };
+        let cross_sections = match (&config.density_indices, &config.density_ratios) {
+            (Some(di), Some(dr)) if xs.sigma.len() == di.len() && di.len() == dr.len() => {
+                let mut eff = vec![vec![0.0f64; xs.sigma[0].len()]; n_params];
+                for ((&idx, &ratio), member) in di.iter().zip(dr.iter()).zip(xs.sigma.iter()) {
+                    for (j, &sigma) in member.iter().enumerate() {
+                        eff[idx][j] += ratio * sigma;
+                    }
+                }
+                Arc::new(eff)
+            }
+            (Some(di), Some(dr)) if xs.sigma.len() != n_params => {
+                return Err(PipelineError::InvalidParameter(format!(
+                    "density mapping length mismatch: {} density_indices / {} \
+                     density_ratios for {} per-isotope cross-section rows",
+                    di.len(),
+                    dr.len(),
+                    xs.sigma.len(),
+                )));
+            }
+            _ => Arc::clone(&xs.sigma),
+        };
+        let (resolution_plan, sparse_cubature_plan, sparse_scalar_plan) = if instrument.is_some() {
+            (
+                config.precomputed_resolution_plan.clone(),
+                config.precomputed_sparse_cubature_plan.clone(),
+                config.precomputed_sparse_scalar_plan.clone(),
+            )
+        } else {
+            (None, None, None)
+        };
+        return Ok(Box::new(PrecomputedTransmissionModel {
+            cross_sections,
+            density_indices: Arc::new((0..n_params).collect()),
+            instrument,
+            resolution_plan,
+            sparse_cubature_plan,
+            sparse_scalar_plan,
+            layout: Arc::clone(&xs.layout),
+        }));
+    }
 
     let base_xs = config.precomputed_base_xs.clone();
     let density_ratios = config
@@ -3602,75 +3391,7 @@ pub fn evaluate_jacobian_and_fisher(
         .map(|&i| params.params[i].name.to_string())
         .collect();
 
-    // ── Precompute cross-sections so that analytical Jacobian is available ──
-    // For the density-only case (no temperature fitting), the model uses
-    // PrecomputedTransmissionModel which requires precomputed XS.
-    // For the temperature case, TransmissionFitModel computes base_xs in
-    // its constructor.  Either way, precomputing here ensures the analytical
-    // Jacobian path is always available.
-    // Issue #608: the non-temperature path uses `PrecomputedTransmissionModel`,
-    // which must apply resolution on the WORKING grid (auxiliary extended grid
-    // under Gaussian resolution) and extract the data points last — the same
-    // #608 path as production fitting + spatial mapping, not the old coarse
-    // data-grid path.  Derive σ from `resonance_data` (the source of truth) on
-    // the working grid here whenever it is not already set up:
-    //   * `fit_temperature` → skip: `TransmissionFitModel` builds its own
-    //     working-grid base σ internally.
-    //   * working-grid σ already attached (a caller did the #608 setup) → skip.
-    //   * otherwise (caller passed no σ, OR only a data-grid σ) → (re)build the
-    //     data-grid σ = `extract(work σ)` AND the working-grid σ + layout from
-    //     `resonance_data`.  A malformed caller-supplied data-grid σ has already
-    //     been rejected by the up-front `validate_precomputed_cross_sections`;
-    //     here a valid caller σ is superseded by the resonance-data-derived
-    //     working-grid σ — the only #608-correct source under Gaussian
-    //     resolution.  Without this, a caller that pre-supplied a data-grid σ
-    //     plus Gaussian resolution silently got coarse-grid broadening in the
-    //     Jacobian/Fisher.
-    let config_with_xs;
-    let effective_config =
-        if config.fit_temperature || config.precomputed_work_cross_sections.is_some() {
-            config
-        } else {
-            let instrument = config
-                .resolution
-                .clone()
-                .map(|r| Arc::new(InstrumentParams { resolution: r }));
-            let working = nereids_physics::transmission::broadened_cross_sections_on_working_grid(
-                config.energies(),
-                &config.resonance_data,
-                config.temperature_k,
-                instrument.as_deref(),
-                None,
-            )
-            .map_err(PipelineError::Transmission)?;
-            config_with_xs = if working.layout.is_identity() {
-                // The kernel does not reach past the data: the working grid
-                // IS the data grid.
-                config
-                    .clone()
-                    .with_precomputed_cross_sections(Arc::new(working.sigma))
-            } else {
-                // Extended grid: attach the extracted data-grid σ, then the
-                // working-grid σ + layout (`with_precomputed_cross_sections` clears
-                // any work σ).
-                let data_xs: Vec<Vec<f64>> = working
-                    .sigma
-                    .iter()
-                    .map(|s| working.layout.extract(s))
-                    .collect();
-                config
-                    .clone()
-                    .with_precomputed_cross_sections(Arc::new(data_xs))
-                    .with_precomputed_work_cross_sections(
-                        Arc::new(working.sigma),
-                        Arc::new(working.layout),
-                    )
-            };
-            &config_with_xs
-        };
-
-    // ── Build transmission model (same as production path) ──────────
-    let t_model = build_transmission_model(effective_config, n_density_params, temperature_index)?;
+    let t_model = build_transmission_model(config, n_density_params, temperature_index)?;
 
     // ── Build counts model chain and evaluate ───────────────────────
     // Use a closure that evaluates and computes Jacobian for any FitModel.
@@ -4402,12 +4123,11 @@ mod tests {
                 .unwrap(),
             ]),
             density_indices: Arc::new(vec![0]),
-            energies: None,
             instrument: None,
             resolution_plan: None,
             sparse_cubature_plan: None,
             sparse_scalar_plan: None,
-            work_layout: None,
+            layout: Arc::new(WorkingGridLayout::identity(energies)),
         };
         let t = model.evaluate(&[true_density]).unwrap();
         let sigma: Vec<f64> = t.iter().map(|&v| 0.01 * v.max(0.01)).collect();
@@ -4459,6 +4179,13 @@ mod tests {
         );
     }
 
+    fn table_on_data_grid(config: &UnifiedFitConfig, sigma: Vec<Vec<f64>>) -> PrecomputedXs {
+        PrecomputedXs {
+            sigma: Arc::new(sigma),
+            layout: Arc::new(WorkingGridLayout::identity(config.energies())),
+        }
+    }
+
     /// Helper: a valid single-isotope transmission config + input on a short
     /// grid, for precomputed-cross-section shape-validation tests.
     fn precomputed_xs_fixture() -> (UnifiedFitConfig, InputData) {
@@ -4487,7 +4214,9 @@ mod tests {
         // An empty XS stack used to panic on `xs[0].len()` deep in the
         // forward-model builder; it must now be a typed up-front error.
         let (config, input) = precomputed_xs_fixture();
-        let config = config.with_precomputed_cross_sections(Arc::new(Vec::new()));
+        let config = config
+            .clone()
+            .with_precomputed_cross_sections(table_on_data_grid(&config, Vec::new()));
         let err = fit_spectrum_typed(&input, &config).unwrap_err();
         assert!(
             matches!(err, PipelineError::ShapeMismatch(_)),
@@ -4502,7 +4231,9 @@ mod tests {
         let (config, input) = precomputed_xs_fixture();
         let n_e = config.energies().len();
         let bad = vec![vec![1.0; n_e], vec![1.0; n_e]];
-        let config = config.with_precomputed_cross_sections(Arc::new(bad));
+        let config = config
+            .clone()
+            .with_precomputed_cross_sections(table_on_data_grid(&config, bad));
         let err = fit_spectrum_typed(&input, &config).unwrap_err();
         assert!(
             matches!(err, PipelineError::ShapeMismatch(_)),
@@ -4517,13 +4248,15 @@ mod tests {
         let (config, input) = precomputed_xs_fixture();
         let n_e = config.energies().len();
         let bad = vec![vec![1.0; n_e + 3]];
-        let config = config.with_precomputed_cross_sections(Arc::new(bad));
+        let config = config
+            .clone()
+            .with_precomputed_cross_sections(table_on_data_grid(&config, bad));
         let err = fit_spectrum_typed(&input, &config).unwrap_err();
         assert!(
             matches!(err, PipelineError::ShapeMismatch(_)),
             "expected ShapeMismatch, got {err:?}"
         );
-        assert!(err.to_string().contains("config.energies"));
+        assert!(err.to_string().contains("its grid has"));
     }
 
     #[test]
@@ -4542,7 +4275,9 @@ mod tests {
         .unwrap();
         assert_eq!(xs.len(), 1);
         assert_eq!(xs[0].len(), n_e);
-        let config = config.with_precomputed_cross_sections(Arc::new(xs));
+        let config = config
+            .clone()
+            .with_precomputed_cross_sections(table_on_data_grid(&config, xs));
         // Must not error on shape; the fit itself may or may not converge,
         // but the call must reach the solver rather than fail validation.
         let result = fit_spectrum_typed(&input, &config);
@@ -4562,7 +4297,9 @@ mod tests {
         let (config, input) = precomputed_xs_fixture();
         let n_e = config.energies().len();
         let bad = vec![vec![f64::NAN; n_e]];
-        let config = config.with_precomputed_cross_sections(Arc::new(bad));
+        let config = config
+            .clone()
+            .with_precomputed_cross_sections(table_on_data_grid(&config, bad));
         let err = fit_spectrum_typed(&input, &config).unwrap_err();
         assert!(
             matches!(err, PipelineError::ShapeMismatch(_)),
@@ -4577,7 +4314,9 @@ mod tests {
         let (config, input) = precomputed_xs_fixture();
         let mut row = vec![1.0; n_e];
         row[n_e / 2] = f64::INFINITY;
-        let config = config.with_precomputed_cross_sections(Arc::new(vec![row]));
+        let config = config
+            .clone()
+            .with_precomputed_cross_sections(table_on_data_grid(&config, vec![row]));
         let err = fit_spectrum_typed(&input, &config).unwrap_err();
         assert!(
             matches!(err, PipelineError::ShapeMismatch(_)),
@@ -4600,7 +4339,7 @@ mod tests {
         // result rather than calling `unwrap_err()`.
         let empty = config
             .clone()
-            .with_precomputed_cross_sections(Arc::new(Vec::new()));
+            .with_precomputed_cross_sections(table_on_data_grid(&config, Vec::new()));
         match evaluate_jacobian_and_fisher(&empty, &flux, &background) {
             Err(PipelineError::ShapeMismatch(msg)) => {
                 assert!(msg.contains("must not be empty"), "got: {msg}");
@@ -4610,7 +4349,12 @@ mod tests {
         }
 
         // Non-finite σ is rejected on this path too.
-        let nan = config.with_precomputed_cross_sections(Arc::new(vec![vec![f64::NAN; n_e]]));
+        let nan = config
+            .clone()
+            .with_precomputed_cross_sections(table_on_data_grid(
+                &config,
+                vec![vec![f64::NAN; n_e]],
+            ));
         match evaluate_jacobian_and_fisher(&nan, &flux, &background) {
             Err(PipelineError::ShapeMismatch(msg)) => {
                 assert!(msg.contains("non-finite"), "got: {msg}");
@@ -4967,12 +4711,11 @@ mod tests {
         let model = PrecomputedTransmissionModel {
             cross_sections: Arc::new(xs),
             density_indices: Arc::new(vec![0]),
-            energies: None,
             instrument: None,
             resolution_plan: None,
             sparse_cubature_plan: None,
             sparse_scalar_plan: None,
-            work_layout: None,
+            layout: Arc::new(WorkingGridLayout::identity(energies)),
         };
         let t = model.evaluate(&[true_density]).unwrap();
         let sigma: Vec<f64> = t.iter().map(|&v| 0.01 * v.max(0.01)).collect();
@@ -7024,31 +6767,33 @@ mod tests {
             Some(response),
             vec![5.0e-4], // seeded off truth so a no-op fit fails
         )
-        .unwrap()
-        .with_precomputed_cross_sections(Arc::new(xs))
-        .with_solver(SolverConfig::PoissonKL(PoissonConfig {
-            max_iter: 200,
-            ..Default::default()
-        }))
-        .with_exact_count_response(ExactCountResponseConfig {
-            incident_fluence_weights: vec![100.0, 200.0],
-            detector_time_edges_us: detector_edges,
-            timing_offset_us,
-        })
-        .with_transmission_background(BackgroundConfig {
-            anorm_init: fixed_anorm,
-            back_a_init: 0.0,
-            back_b_init: fixed_back_b,
-            back_c_init: 0.0,
-            back_d_init: 0.0,
-            back_f_init: 1.0,
-            fit_anorm: false,
-            fit_back_a: false,
-            fit_back_b: false,
-            fit_back_c: false,
-            fit_back_d: false,
-            fit_back_f: false,
-        });
+        .unwrap();
+        let xs = table_on_data_grid(&config, xs);
+        let config = config
+            .with_precomputed_cross_sections(xs)
+            .with_solver(SolverConfig::PoissonKL(PoissonConfig {
+                max_iter: 200,
+                ..Default::default()
+            }))
+            .with_exact_count_response(ExactCountResponseConfig {
+                incident_fluence_weights: vec![100.0, 200.0],
+                detector_time_edges_us: detector_edges,
+                timing_offset_us,
+            })
+            .with_transmission_background(BackgroundConfig {
+                anorm_init: fixed_anorm,
+                back_a_init: 0.0,
+                back_b_init: fixed_back_b,
+                back_c_init: 0.0,
+                back_d_init: 0.0,
+                back_f_init: 1.0,
+                fit_anorm: false,
+                fit_back_a: false,
+                fit_back_b: false,
+                fit_back_c: false,
+                fit_back_d: false,
+                fit_back_f: false,
+            });
         let result = fit_spectrum_typed(
             &InputData::Counts {
                 sample_counts,
@@ -8119,36 +7864,38 @@ mod tests {
         assert!(t0.is_finite() && ls.is_finite(), "t0={t0}, L={ls}");
     }
 
-    /// The #608 working-grid σ + layout validation in
-    /// `validate_precomputed_cross_sections` (the up-front guard for the
-    /// Gaussian aux-grid path) — every malformed-input error branch, so a bad
-    /// `with_precomputed_work_cross_sections` setter call surfaces a typed
-    /// `ShapeMismatch` instead of a per-pixel panic.
     #[test]
-    fn validate_precomputed_work_cross_sections_error_branches() {
-        use nereids_physics::transmission::WorkingGridLayout;
+    fn validate_precomputed_cross_sections_error_branches() {
         let data = u238_single_resonance();
         let energies: Vec<f64> = (0..11).map(|i| 1.0 + (i as f64) * 0.1).collect();
         let n_e = energies.len();
-        let n_work = n_e + 2; // a non-identity aux grid
+        let n_work = n_e + 2;
+        let base = UnifiedFitConfig::new(
+            energies.clone(),
+            vec![data],
+            vec!["U-238".into()],
+            0.0,
+            None,
+            vec![0.001],
+        )
+        .unwrap();
+        let grid = || {
+            let mut e = energies.clone();
+            e.insert(0, 0.95);
+            e.push(2.05);
+            e
+        };
         let good_layout = || {
             Arc::new(WorkingGridLayout {
-                energies: (0..n_work).map(|i| 1.0 + (i as f64) * 0.09).collect(),
-                data_indices: (0..n_e).collect(),
+                energies: grid(),
+                data_indices: (1..=n_e).collect(),
             })
         };
-        let cfg = |work_xs: Vec<Vec<f64>>, layout: Arc<WorkingGridLayout>| {
-            UnifiedFitConfig::new(
-                energies.clone(),
-                vec![data.clone()],
-                vec!["U-238".into()],
-                0.0,
-                None,
-                vec![0.001],
-            )
-            .unwrap()
-            .with_precomputed_cross_sections(Arc::new(vec![vec![1.0f64; n_e]])) // valid data-grid σ
-            .with_precomputed_work_cross_sections(Arc::new(work_xs), layout)
+        let cfg = |sigma: Vec<Vec<f64>>, layout: Arc<WorkingGridLayout>| {
+            base.clone().with_precomputed_cross_sections(PrecomputedXs {
+                sigma: Arc::new(sigma),
+                layout,
+            })
         };
         let expect =
             |c: &UnifiedFitConfig, needle: &str| match validate_precomputed_cross_sections(c) {
@@ -8157,38 +7904,41 @@ mod tests {
                 }
                 other => panic!("expected ShapeMismatch({needle:?}), got {other:?}"),
             };
-        // empty working σ
+        assert!(
+            validate_precomputed_cross_sections(&cfg(vec![vec![1.0; n_work]], good_layout()))
+                .is_ok()
+        );
         expect(&cfg(vec![], good_layout()), "must not be empty");
-        // working-σ row length != working-grid length
         expect(
             &cfg(vec![vec![1.0; n_work - 1]], good_layout()),
-            "working-grid energies",
+            "its grid has",
         );
-        // non-finite working σ
         let mut nan_row = vec![1.0; n_work];
         nan_row[3] = f64::NAN;
         expect(&cfg(vec![nan_row], good_layout()), "non-finite");
-        // working-σ row count != data-grid σ row count (2 work rows vs 1 data row)
         expect(
             &cfg(vec![vec![1.0; n_work], vec![1.0; n_work]], good_layout()),
-            "rows but",
+            "rows but expected",
         );
-        // layout maps a different number of data points than config.energies
         let short = Arc::new(WorkingGridLayout {
-            energies: (0..n_work).map(|i| 1.0 + (i as f64) * 0.09).collect(),
-            data_indices: (0..n_e - 1).collect(),
+            energies: grid(),
+            data_indices: (1..n_e).collect(),
         });
         expect(&cfg(vec![vec![1.0; n_work]], short), "layout maps");
-        // layout index out of range for the working grid
         let oor = Arc::new(WorkingGridLayout {
-            energies: (0..n_work).map(|i| 1.0 + (i as f64) * 0.09).collect(),
+            energies: grid(),
             data_indices: {
-                let mut v: Vec<usize> = (0..n_e).collect();
+                let mut v: Vec<usize> = (1..=n_e).collect();
                 v[0] = n_work + 5;
                 v
             },
         });
-        expect(&cfg(vec![vec![1.0; n_work]], oor), "out of");
+        expect(&cfg(vec![vec![1.0; n_work]], oor), "out of range");
+        let shifted = Arc::new(WorkingGridLayout {
+            energies: grid(),
+            data_indices: (0..n_e).collect(),
+        });
+        expect(&cfg(vec![vec![1.0; n_work]], shifted), "layout carries");
     }
 
     /// Cover the OTHER branches of the #608 `evaluate_jacobian_and_fisher` σ
@@ -8283,9 +8033,11 @@ mod tests {
         )
         .unwrap()
         .with_groups(&[(&group, &[rd1, rd2])], vec![0.001])
-        .unwrap()
-        .with_precomputed_cross_sections(Arc::new(per_member))
-        .with_solver(SolverConfig::LevenbergMarquardt(LmConfig::default()));
+        .unwrap();
+        let per_member = table_on_data_grid(&config, per_member);
+        let config = config
+            .with_precomputed_cross_sections(per_member)
+            .with_solver(SolverConfig::LevenbergMarquardt(LmConfig::default()));
         let input = InputData::Transmission {
             transmission,
             uncertainty,
@@ -9290,13 +9042,30 @@ mod tests {
             );
         }
 
-        // Arm 3 (review R3): tabulated resolution — build_aux_grid returns
-        // None for ResolutionFunction::Tabulated, so this exercises the
-        // identity-layout arm WITH an instrument attached (the working
-        // grid IS the data grid; resolution applies on it after
-        // Beer-Lambert).  A plausible production input now that tabulated
-        // VENUS kernels landed (#631), and the arm the two pins above do
-        // not cover.
+        let working = phys_transmission::broadened_cross_sections_on_working_grid(
+            &energies,
+            std::slice::from_ref(&data),
+            293.6,
+            Some(&inst),
+            None,
+        )
+        .unwrap();
+        assert!(!working.layout.is_identity());
+        let config_given = config_res
+            .clone()
+            .with_precomputed_cross_sections(PrecomputedXs::from(working));
+        let t_given = build_transmission_model(&config_given, 1, None)
+            .unwrap()
+            .evaluate(&[density])
+            .unwrap();
+        for (i, (a, b)) in t_given.iter().zip(t_fwd_res.iter()).enumerate() {
+            assert_eq!(
+                a.to_bits(),
+                b.to_bits(),
+                "Gaussian-resolution arm with a supplied table, bin {i}: {a:e} != {b:e}"
+            );
+        }
+
         let tab_text = "header\n---\n\
              5.0 0.0\n\
              -0.01 0.0\n\
@@ -9337,6 +9106,29 @@ mod tests {
                 a.to_bits(),
                 b.to_bits(),
                 "tabulated-resolution arm, bin {i}: {a:e} != {b:e}"
+            );
+        }
+        let working_tab = phys_transmission::broadened_cross_sections_on_working_grid(
+            &energies,
+            std::slice::from_ref(&sample_tab.isotopes()[0].0),
+            293.6,
+            Some(&inst_tab),
+            None,
+        )
+        .unwrap();
+        assert!(!working_tab.layout.is_identity());
+        let config_given_tab = config_tab
+            .clone()
+            .with_precomputed_cross_sections(PrecomputedXs::from(working_tab));
+        let t_given_tab = build_transmission_model(&config_given_tab, 1, None)
+            .unwrap()
+            .evaluate(&[density])
+            .unwrap();
+        for (i, (a, b)) in t_given_tab.iter().zip(t_fwd_tab.iter()).enumerate() {
+            assert_eq!(
+                a.to_bits(),
+                b.to_bits(),
+                "tabulated-resolution arm with a supplied table, bin {i}: {a:e} != {b:e}"
             );
         }
     }

@@ -242,13 +242,7 @@ fn working_grid_layout<'a>(
                 data_indices: di.clone(),
             },
         ),
-        None => (
-            energies,
-            WorkingGridLayout {
-                energies: energies.to_vec(),
-                data_indices: (0..energies.len()).collect(),
-            },
-        ),
+        None => (energies, WorkingGridLayout::identity(energies)),
     }
 }
 
@@ -361,6 +355,13 @@ pub struct WorkingGridLayout {
 }
 
 impl WorkingGridLayout {
+    pub fn identity(energies: &[f64]) -> Self {
+        Self {
+            energies: energies.to_vec(),
+            data_indices: (0..energies.len()).collect(),
+        }
+    }
+
     /// `true` when the working grid is the data grid itself (no auxiliary
     /// extension was built).  In that case [`Self::extract`] is a no-op clone.
     pub fn is_identity(&self) -> bool {

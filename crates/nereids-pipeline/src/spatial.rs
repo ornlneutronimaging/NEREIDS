@@ -14,7 +14,7 @@ use nereids_physics::transmission::{
 };
 
 use crate::error::PipelineError;
-use crate::pipeline::SpectrumFitResult;
+use crate::pipeline::{PrecomputedXs, SpectrumFitResult};
 
 /// Result of spatial mapping over a 2D image.
 ///
@@ -1244,103 +1244,43 @@ pub fn spatial_map_typed(
         }
     };
 
-    // Precompute cross-sections once, shared across all pixels: `xs` on the
-    // data grid for shape validation, `work_xs` on the working grid when it
-    // differs.
     let instrument = config.resolution().map(|r| InstrumentParams {
         resolution: r.clone(),
     });
-
-    // The working-grid layout alone, before any σ is broadened.
-    let rd_refs: Vec<&_> = config.resonance_data().iter().collect();
-    let layout = nereids_physics::transmission::resolution_working_grid(
-        config.energies(),
-        instrument.as_ref(),
-        &rd_refs,
-    )
-    .map_err(PipelineError::Transmission)?;
-    let aux_grid_active = !layout.is_identity();
-
-    // (xs = data-grid σ, work_xs = working-grid σ when an aux grid exists).
-    let (xs, work_xs) = match config.precomputed_cross_sections().cloned() {
-        // Caller supplied data-grid σ: used as is when the grid is not
-        // extended, else the working-grid σ is recomputed from resonance data.
-        Some(cached) if !aux_grid_active => (cached, None),
-        Some(cached) => {
-            let working = broadened_cross_sections_on_working_grid(
-                config.energies(),
-                config.resonance_data(),
-                config.temperature_k(),
-                instrument.as_ref(),
-                cancel,
-            )?;
-            (cached, Some(Arc::new(working.sigma)))
-        }
-        None => {
-            let working = broadened_cross_sections_on_working_grid(
-                config.energies(),
-                config.resonance_data(),
-                config.temperature_k(),
-                instrument.as_ref(),
-                cancel,
-            )?;
-            if aux_grid_active {
-                // Aux grid: extract the data-grid σ; keep the working σ.
-                let data_xs: Vec<Vec<f64>> = working
-                    .sigma
-                    .iter()
-                    .map(|s| working.layout.extract(s))
-                    .collect();
-                (Arc::new(data_xs), Some(Arc::new(working.sigma)))
-            } else {
-                // Working grid == data grid: σ is the data-grid σ directly.
-                (Arc::new(working.sigma), None)
-            }
-        }
+    let xs: PrecomputedXs = match config.precomputed_cross_sections() {
+        Some(cached) => cached.clone(),
+        None => PrecomputedXs::from(broadened_cross_sections_on_working_grid(
+            config.energies(),
+            config.resonance_data(),
+            config.temperature_k(),
+            instrument.as_ref(),
+            cancel,
+        )?),
     };
 
-    // The layout shared across pixels; `None` when the working grid is the
-    // data grid.
-    let work_layout: Option<Arc<nereids_physics::transmission::WorkingGridLayout>> =
-        if work_xs.is_some() {
-            Some(Arc::new(layout))
-        } else {
-            None
-        };
-
-    // When groups are active and temperature is NOT being fitted, collapse
-    // per-member broadened XS into per-group σ_eff once here.  This avoids
-    // redundant O(n_members × n_energies) collapsing inside
-    // build_transmission_model on every per-pixel call.  Applied to BOTH the
-    // data-grid σ and the working-grid σ so they stay aligned (issue #608).
-    let collapse = |xs: &Arc<Vec<Vec<f64>>>| -> Arc<Vec<Vec<f64>>> {
-        if !config.fit_temperature()
-            && let (Some(di), Some(dr)) = (&config.density_indices, &config.density_ratios)
-            && xs.len() == di.len()
-            && di.len() == dr.len()
-        {
-            let n_e = xs[0].len();
-            let mut eff = vec![vec![0.0f64; n_e]; n_maps];
-            for ((&idx, &ratio), member_xs) in di.iter().zip(dr.iter()).zip(xs.iter()) {
-                for (j, &sigma) in member_xs.iter().enumerate() {
-                    eff[idx][j] += ratio * sigma;
-                }
+    let sigma = if !config.fit_temperature()
+        && let (Some(di), Some(dr)) = (&config.density_indices, &config.density_ratios)
+        && xs.sigma.len() == di.len()
+        && di.len() == dr.len()
+    {
+        let n_e = xs.sigma[0].len();
+        let mut eff = vec![vec![0.0f64; n_e]; n_maps];
+        for ((&idx, &ratio), member_xs) in di.iter().zip(dr.iter()).zip(xs.sigma.iter()) {
+            for (j, &sigma) in member_xs.iter().enumerate() {
+                eff[idx][j] += ratio * sigma;
             }
-            Arc::new(eff)
-        } else {
-            Arc::clone(xs)
         }
+        Arc::new(eff)
+    } else {
+        Arc::clone(&xs.sigma)
     };
-    let xs = collapse(&xs);
-    let work_xs = work_xs.as_ref().map(collapse);
+    let xs = PrecomputedXs {
+        sigma,
+        layout: xs.layout,
+    };
 
-    // The plan and the surrogates compiled from it live on the grid the
-    // broadening is applied to: the working grid whenever it was extended,
-    // the data grid otherwise. Their σ is the σ on that same grid.
-    let plan_grid: &[f64] = work_layout
-        .as_ref()
-        .map_or(config.energies(), |l| l.energies.as_slice());
-    let plan_xs: &Arc<Vec<Vec<f64>>> = work_xs.as_ref().unwrap_or(&xs);
+    let plan_grid: &[f64] = &xs.layout.energies;
+    let plan_xs: &Arc<Vec<Vec<f64>>> = &xs.sigma;
 
     // The resolution plan once for the shared working grid; the energy-scale
     // path rebuilds its grid per trial and takes the non-plan path.
@@ -1587,7 +1527,7 @@ pub fn spatial_map_typed(
             unbroadened_cross_sections(config.energies(), config.resonance_data(), cancel)?;
         let mut cfg = config
             .clone()
-            .with_precomputed_cross_sections(xs)
+            .with_precomputed_cross_sections(xs.clone())
             .with_precomputed_base_xs(Arc::new(base_xs))
             .with_compute_covariance(true);
         if let Some(plan) = resolution_plan.clone() {
@@ -1607,13 +1547,8 @@ pub fn spatial_map_typed(
             cfg.density_ratios = None;
         }
         let mut cfg = cfg
-            .with_precomputed_cross_sections(xs)
+            .with_precomputed_cross_sections(xs.clone())
             .with_compute_covariance(true);
-        // The working-grid σ + layout whenever the grid was extended, after
-        // `with_precomputed_cross_sections`, which clears any work σ.
-        if let (Some(work_xs), Some(layout)) = (work_xs.clone(), work_layout.clone()) {
-            cfg = cfg.with_precomputed_work_cross_sections(work_xs, layout);
-        }
         if let Some(plan) = resolution_plan.clone() {
             cfg = cfg.with_precomputed_resolution_plan(plan);
         }
@@ -2044,6 +1979,15 @@ mod tests {
     use nereids_fitting::transmission_model::PrecomputedTransmissionModel;
 
     use crate::pipeline::{SolverConfig, UnifiedFitConfig};
+
+    fn table_on_data_grid(config: &UnifiedFitConfig, sigma: Vec<Vec<f64>>) -> PrecomputedXs {
+        PrecomputedXs {
+            sigma: Arc::new(sigma),
+            layout: Arc::new(nereids_physics::transmission::WorkingGridLayout::identity(
+                config.energies(),
+            )),
+        }
+    }
     use nereids_endf::resonance::test_support::{
         synthetic_single_resonance, u238_single_resonance,
     };
@@ -2069,12 +2013,13 @@ mod tests {
         let model = PrecomputedTransmissionModel {
             cross_sections: Arc::new(xs),
             density_indices: Arc::new(vec![0]),
-            energies: None,
             instrument: None,
             resolution_plan: None,
             sparse_cubature_plan: None,
             sparse_scalar_plan: None,
-            work_layout: None,
+            layout: Arc::new(nereids_physics::transmission::WorkingGridLayout::identity(
+                energies,
+            )),
         };
         let t_1d = model.evaluate(&[true_density]).unwrap();
         let sigma_1d: Vec<f64> = t_1d.iter().map(|&v| 0.01 * v.max(0.01)).collect();
@@ -2260,7 +2205,7 @@ mod tests {
 
         // 1 isotope → 1 σ row expected; inject 2 rows of the right length.
         let n_e = energies.len();
-        let bad_xs = Arc::new(vec![vec![1.0; n_e], vec![1.0; n_e]]);
+        let bad_xs = vec![vec![1.0; n_e], vec![1.0; n_e]];
         let config = UnifiedFitConfig::new(
             energies,
             vec![data],
@@ -2270,8 +2215,9 @@ mod tests {
             vec![0.001],
         )
         .unwrap()
-        .with_solver(SolverConfig::LevenbergMarquardt(LmConfig::default()))
-        .with_precomputed_cross_sections(bad_xs);
+        .with_solver(SolverConfig::LevenbergMarquardt(LmConfig::default()));
+        let bad_xs = table_on_data_grid(&config, bad_xs);
+        let config = config.with_precomputed_cross_sections(bad_xs);
 
         let input = InputData3D::Transmission {
             transmission: t_3d.view(),
@@ -2446,8 +2392,9 @@ mod tests {
         )
         .unwrap()
         .with_solver(SolverConfig::LevenbergMarquardt(LmConfig::default()))
-        .with_fit_temperature(true)
-        .with_precomputed_cross_sections(precomputed_xs.into());
+        .with_fit_temperature(true);
+        let precomputed_xs = table_on_data_grid(&config, precomputed_xs);
+        let config = config.with_precomputed_cross_sections(precomputed_xs);
 
         let input = InputData3D::Transmission {
             transmission: t_3d.view(),
@@ -2587,15 +2534,6 @@ mod tests {
         }
     }
 
-    /// Issue #608: the GAUSSIAN-resolution spatial path — `spatial_map_typed`'s
-    /// `aux_grid_active` branch (work σ via `broadened_cross_sections_on_working_grid`,
-    /// per-pixel injection through `with_precomputed_work_cross_sections`) plus
-    /// `build_transmission_model`'s working-grid selection — is the bulk of the
-    /// #608 wiring but had no integration test (only the Tabulated/plan path,
-    /// above, was covered).  Mirror that test with `ResolutionFunction::Gaussian`,
-    /// data generated by `forward_model` WITH the same Gaussian (so the fit can
-    /// recover density), a ‖kernel − none‖ non-vacuity pre-check, and per-pixel
-    /// density recovery + determinism assertions.
     #[test]
     fn test_spatial_map_typed_gaussian_aux_grid_recovers_density() {
         use nereids_physics::resolution::{ResolutionFunction, ResolutionParams};
@@ -2711,9 +2649,7 @@ mod tests {
     #[test]
     fn test_spatial_map_typed_gaussian_aux_grid_with_precomputed_sigma() {
         use nereids_physics::resolution::{ResolutionFunction, ResolutionParams};
-        use nereids_physics::transmission::{
-            SampleParams, broadened_cross_sections, forward_model,
-        };
+        use nereids_physics::transmission::{SampleParams, forward_model};
 
         let data = u238_single_resonance();
         let true_density = 0.0005;
@@ -2738,12 +2674,15 @@ mod tests {
                 }
             }
         }
-        // Pre-supply the Doppler-broadened, data-grid σ ⇒ the Some(cached) arm.
-        let data_sigma = broadened_cross_sections(
+        let resolution =
+            ResolutionFunction::Gaussian(ResolutionParams::new(25.0, 0.5, 0.005, 0.0).unwrap());
+        let working = broadened_cross_sections_on_working_grid(
             &energies,
             std::slice::from_ref(&data),
             temperature,
-            None,
+            Some(&InstrumentParams {
+                resolution: resolution.clone(),
+            }),
             None,
         )
         .unwrap();
@@ -2752,13 +2691,11 @@ mod tests {
             vec![data],
             vec!["U-238".into()],
             temperature,
-            Some(ResolutionFunction::Gaussian(
-                ResolutionParams::new(25.0, 0.5, 0.005, 0.0).unwrap(),
-            )),
+            Some(resolution),
             vec![0.001],
         )
         .unwrap()
-        .with_precomputed_cross_sections(Arc::new(data_sigma))
+        .with_precomputed_cross_sections(PrecomputedXs::from(working))
         .with_solver(SolverConfig::LevenbergMarquardt(LmConfig::default()));
         let input = InputData3D::Transmission {
             transmission: t_3d.view(),
@@ -5056,12 +4993,13 @@ mod tests {
         let model = PrecomputedTransmissionModel {
             cross_sections: Arc::new(xs),
             density_indices: Arc::new(vec![0]),
-            energies: None,
             instrument: None,
             resolution_plan: None,
             sparse_cubature_plan: None,
             sparse_scalar_plan: None,
-            work_layout: None,
+            layout: Arc::new(nereids_physics::transmission::WorkingGridLayout::identity(
+                energies,
+            )),
         };
         let t_1d = model.evaluate(&[true_density]).unwrap();
         let e_ref = nereids_fitting::transmission_model::baseline_reference_energy(energies);
