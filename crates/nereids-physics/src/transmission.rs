@@ -37,10 +37,9 @@ use crate::resolution::{self, ResolutionError, ResolutionFunction};
 
 /// Build the auxiliary extended grid for resolution broadening.
 ///
-/// Shared helper that extracts Gaussian resolution params and resonance info
-/// to build the extended grid with boundary extension + adaptive intermediate
-/// points.  Returns `None` if no extension is needed (no resolution, or grid
-/// unchanged).
+/// Every resolution family gets the boundary extension by its kernel's reach;
+/// the Gaussian family also gets the adaptive intermediate points.  Returns
+/// `None` if no extension is needed (no resolution, or grid unchanged).
 ///
 /// Intermediate points are inserted only when the resolution broadening at
 /// the grid midpoint uses the PW-linear Gaussian path (exp tail negligible
@@ -52,7 +51,7 @@ fn build_aux_grid(
     resonance_data: &[&ResonanceData],
 ) -> Option<(Vec<f64>, Vec<usize>)> {
     instrument.and_then(|inst| {
-        if let ResolutionFunction::Gaussian(ref params) = inst.resolution {
+        let (ext_e, di) = if let ResolutionFunction::Gaussian(ref params) = inst.resolution {
             // P-9: Check the Gaussian-to-exp-tail ratio at MULTIPLE energies
             // to decide whether intermediates help or hurt.  The ratio C =
             // W_g/(2·W_e) determines which broadening path is used per-energy
@@ -87,19 +86,17 @@ fn build_aux_grid(
             // SAMMY Ref: dat/mdat4.f90 Fspken lines 243-284
             let resonances = extract_resonance_widths(resonance_data);
 
-            let (ext_e, di) = if use_intermediates {
+            if use_intermediates {
                 crate::auxiliary_grid::build_extended_grid(energies, Some(params), &resonances)
             } else {
                 crate::auxiliary_grid::build_extended_grid_boundary_only(energies, Some(params))
-            };
-            if ext_e.len() > energies.len() {
-                Some((ext_e, di))
-            } else {
-                None
             }
         } else {
-            None
-        }
+            // Tabulated and Ikeda-Carpenter kernels get the boundary
+            // extension without the Gaussian path's intermediates.
+            crate::auxiliary_grid::build_extended_grid_for(energies, &inst.resolution)
+        };
+        (ext_e.len() > energies.len()).then_some((ext_e, di))
     })
 }
 
@@ -257,11 +254,10 @@ fn working_grid_layout<'a>(
 
 /// Compute the working-grid layout for `(energies, instrument, resonance_data)`.
 ///
-/// Returns the auxiliary extended grid (boundary extension + resonance
-/// fine-structure) when a Gaussian resolution function is active, otherwise the
-/// data grid with identity indices.  Fitting models use this to apply
-/// resolution on the same working grid [`forward_model`] uses and extract the
-/// data points last (issue #608).
+/// With a resolution function the grid is extended past both ends by the
+/// kernel's reach ([`ResolutionFunction::grid_bounds_ev`]), and a Gaussian
+/// also gets the intermediate points and resonance fine structure.  Without
+/// one the data grid comes back with identity indices.
 ///
 /// `resonance_data` may be empty (e.g. the energy-scale model has no resonance
 /// data of its own); the auxiliary grid then carries boundary extension only,
@@ -350,28 +346,14 @@ pub type BroadenedXsWithDerivative = (Vec<Vec<f64>>, Vec<Vec<f64>>);
 /// The working energy grid used for broadening, plus the map back to the
 /// data grid.
 ///
-/// `forward_model` and the Beer-Lambert-aware transmission pipeline run
-/// Doppler/Beer-Lambert/resolution on a *working* grid — the auxiliary
-/// extended grid (boundary extension + resonance fine-structure) when a
-/// Gaussian resolution function is active, otherwise the data grid itself —
-/// and extract the data points LAST.  Fitting models that cache broadened σ
-/// for reuse across LM steps need this layout so they can reproduce the same
-/// "broaden-on-working-grid, extract-last" ordering (issue #608): the LM fit's
-/// cached / precomputed paths previously collapsed σ to the coarse data grid
-/// *before* resolution broadening, degrading the convolution near grid edges
-/// and around narrow resonances relative to [`forward_model`].
-///
-/// **Tabulated resolution has no auxiliary grid.**  `build_aux_grid` only
-/// extends the grid for [`ResolutionFunction::Gaussian`]; for tabulated
-/// kernels (and when no instrument is present) `energies` equals the data
-/// grid and `data_indices` is the identity `0..n`.  Callers can therefore
-/// continue to use a data-grid [`crate::resolution::ResolutionPlan`] for
-/// tabulated kernels — the working grid and the data grid coincide, so the
-/// plan's grid-identity check still passes.
+/// Doppler, Beer-Lambert and resolution run on the working grid, the data
+/// grid extended by the kernel's reach plus a Gaussian's intermediate and
+/// fine-structure points, and the data points are extracted last.  A
+/// [`crate::resolution::ResolutionPlan`] must be built on [`Self::energies`].
 #[derive(Debug, Clone)]
 pub struct WorkingGridLayout {
     /// Working-grid energies (eV, ascending).  Equals the input data grid
-    /// when no auxiliary grid was built (tabulated/no resolution).
+    /// when no auxiliary grid was built.
     pub energies: Vec<f64>,
     /// `data_indices[i]` is the index of data energy `i` within
     /// [`Self::energies`].  Identity (`0..n`) when no auxiliary grid.
@@ -741,8 +723,8 @@ pub fn broadened_cross_sections(
 }
 
 /// Like [`broadened_cross_sections`] but returns the Doppler-broadened σ on the
-/// **working grid** (auxiliary extended grid when Gaussian resolution is active,
-/// else the data grid) together with the [`WorkingGridLayout`].
+/// **working grid** (the data grid extended by the kernel's reach, else the
+/// data grid) together with the [`WorkingGridLayout`].
 ///
 /// The spatial production pipeline (`spatial_map_typed`) uses this to pre-store
 /// σ on the working grid so each per-pixel `PrecomputedTransmissionModel`

@@ -428,16 +428,10 @@ pub struct UnifiedFitConfig {
     precomputed_cross_sections: Option<Arc<Vec<Vec<f64>>>>,
     /// Doppler-broadened σ on the **working grid** + the working-grid layout,
     /// injected by [`spatial_map_typed`] for the fixed-calibration /
-    /// fixed-temperature precomputed path (issue #608).
+    /// fixed-temperature precomputed path.
     ///
-    /// When a Gaussian resolution function is active, the working grid is the
-    /// auxiliary extended grid (boundary extension + resonance fine-structure);
-    /// storing σ there lets each per-pixel [`PrecomputedTransmissionModel`]
-    /// apply Beer-Lambert + resolution on the working grid and extract the data
-    /// points last — matching `forward_model`.  For tabulated / no resolution
-    /// the working grid IS the data grid and this is `None` (the model uses the
-    /// data-grid `precomputed_cross_sections` directly, preserving the cubature
-    /// / scalar surrogate fast paths).
+    /// `None` when the working grid is the data grid; the model then uses
+    /// `precomputed_cross_sections` directly.
     ///
     /// `precomputed_cross_sections` still carries the **data-grid** σ for the
     /// surrogate-plan builders and shape validation; this field is the separate
@@ -801,10 +795,9 @@ impl UnifiedFitConfig {
     /// [`PrecomputedTransmissionModel`] whose σ live on the working grid and
     /// whose `evaluate` / `analytical_jacobian` apply resolution on the working
     /// grid and extract the data points last — matching `forward_model`.  The
-    /// data-grid `precomputed_cross_sections` must still be set (for the
-    /// surrogate-plan builders and shape validation); for tabulated / no
-    /// resolution the working grid equals the data grid and this is left
-    /// `None`.
+    /// data-grid `precomputed_cross_sections` must still be set (shape
+    /// validation reads it); when the resolution does not extend the grid the
+    /// working grid equals the data grid and this is left `None`.
     ///
     /// The σ + layout are not validated here (this is an infallible builder
     /// setter); shape/consistency are checked once up front in
@@ -2640,8 +2633,8 @@ pub(crate) fn degenerate_normalization_warning(config: &UnifiedFitConfig) -> Opt
 ///   or, when groups are active, `density_indices.len()` (per-member, collapsed
 ///   downstream).
 ///
-/// When `precomputed_work_cross_sections` is also set (issue #608, Gaussian
-/// aux-grid path) its working-grid σ + layout are validated against the same
+/// When `precomputed_work_cross_sections` is also set (a resolution whose
+/// reach extends the grid) its working-grid σ + layout are validated against the same
 /// invariants: non-empty, each row length == `work_layout.energies.len()`,
 /// finite σ, row count == the data-grid σ row count (same density mapping), and
 /// a layout whose `data_indices` length == `energies.len()` with every index in
@@ -3114,11 +3107,12 @@ fn build_transmission_model(
         )
         .map_err(PipelineError::Transmission)?;
         if working.layout.is_identity() {
-            // Tabulated / no resolution: the working grid IS the data grid.
+            // The kernel does not reach past the data: the working grid IS
+            // the data grid.
             computed_xs_storage = Arc::new(working.sigma);
             Some(&computed_xs_storage)
         } else {
-            // Gaussian aux grid (#608): resolution must be applied on the
+            // The grid was extended: resolution must be applied on the
             // working grid and the data points extracted last.  Collapse
             // per-isotope σ into per-parameter σ_eff (identity mapping when
             // no groups are configured), then build the model directly with
@@ -3199,13 +3193,8 @@ fn build_transmission_model(
             Arc::clone(xs)
         };
 
-        // Issue #608: prefer the WORKING-grid σ + layout when the spatial
-        // builder injected it (Gaussian resolution → auxiliary extended grid).
-        // The model then applies resolution on the working grid and extracts
-        // the data points last.  When absent (tabulated / no resolution) the
-        // working grid is the data grid: use the data-grid σ with no layout, so
-        // the surrogate fast paths and data-grid `resolution_plan` are
-        // unaffected.
+        // The working-grid σ + layout when the spatial builder injected them,
+        // else the data-grid σ with no layout.
         let (effective_xs, work_layout): (
             Arc<Vec<Vec<f64>>>,
             Option<Arc<nereids_physics::transmission::WorkingGridLayout>>,
@@ -3655,15 +3644,15 @@ pub fn evaluate_jacobian_and_fisher(
             )
             .map_err(PipelineError::Transmission)?;
             config_with_xs = if working.layout.is_identity() {
-                // Tabulated / no resolution: the working grid IS the data grid.
+                // The kernel does not reach past the data: the working grid
+                // IS the data grid.
                 config
                     .clone()
                     .with_precomputed_cross_sections(Arc::new(working.sigma))
             } else {
-                // Gaussian aux grid: attach BOTH the extracted data-grid σ (for the
-                // surrogate-plan builders + shape validation) and the working-grid σ
-                // + layout (AFTER `with_precomputed_cross_sections`, which clears any
-                // stale work σ).
+                // Extended grid: attach the extracted data-grid σ, then the
+                // working-grid σ + layout (`with_precomputed_cross_sections` clears
+                // any work σ).
                 let data_xs: Vec<Vec<f64>> = working
                     .sigma
                     .iter()

@@ -1293,167 +1293,42 @@ impl TabulatedResolution {
         })
     }
 
-    /// Kernel support at energy `e_ev`, in eV.
-    ///
-    /// Returns the maximum energy offset over which the tabulated
-    /// kernel has non-zero weight at energy `e_ev`.  Past this
-    /// distance the kernel is exactly zero, so the broadening
-    /// footprint at a given target energy is fully contained within
-    /// `[e_ev − support, e_ev + support]`.
-    ///
-    /// Computation:
-    ///
-    /// 1. Find the bracketing reference kernel(s) for `e_ev` via
-    ///    binary search on the sorted `ref_energies` grid.
-    /// 2. Take the extreme offsets `dt⁺ = max(dt, 0)` and
-    ///    `dt⁻ = max(−dt, 0)` over the kernel entries that can carry
-    ///    weight at `e_ev`.  Between references,
-    ///    [`Self::broaden`]'s width-normalized shape blend scales each
-    ///    block's support in mode-anchored `z = Δt/σ_b` to the target
-    ///    width `σ_t` and unions them — so the scan takes each block's
-    ///    **closure extremes** (the outermost `w > 0` offset, extended
-    ///    to the adjacent `w == 0` entry if one exists on that side:
-    ///    the linearly interpolated shape is positive on that fringe,
-    ///    and a merged point from the other block can land there),
-    ///    divides by that block's `σ_b`, maxes across the two blocks
-    ///    in z, and multiplies by `σ_t`.  Degenerate blocks (σ ≤ 0)
-    ///    take the nearest-clone fallback at apply time, so both
-    ///    blocks are scanned with their own positive-weight masks.
-    /// 3. Map each extreme through the **exact** TOF→E relation
-    ///    `E' = (TOF_FACTOR·L/(t∓dt))²` with `t = TOF_FACTOR·L/√E`
-    ///    and return the larger energy excursion:
-    ///    `max( E·((t/(t−dt⁺))² − 1), E·(1 − (t/(t+dt⁻))²) )`.
-    ///    The convolution gather reads theory at `t − dt` (see
-    ///    [`Self::broaden`]), so the positive-offset tail reaches
-    ///    *up* in energy — and because the map is convex in `t`, the
-    ///    up-side excursion strictly exceeds the linear chain-rule
-    ///    estimate `2·E^{3/2}·dt/(TOF_FACTOR·L)` that this function
-    ///    previously returned, which under-covered exactly the side
-    ///    the delayed-emission tail loads.
-    ///
-    /// Returns `0.0` for non-positive `e_ev`, an empty kernel set, or
-    /// a non-positive flight path, and `f64::INFINITY` when the
-    /// positive-offset extreme reaches or exceeds the nominal flight
-    /// time (`t − dt⁺ ≤ 0`: the kernel maps past infinite energy — the
-    /// caller must clamp to its grid, which the GUI's
-    /// `partition_point` slicing already does).  Used by the GUI's
-    /// fit-energy-range slicing to extend the model-evaluation grid
-    /// beyond the user's `[E_min, E_max]` so the SAMMY EMIN/EMAX-
-    /// equivalent broadening at the boundaries is correct (#514).
+    /// Kernel support at energy `e_ev`, in eV: the larger of the two distances
+    /// in [`Self::gather_bounds_ev`].  Returns `0.0` for non-positive or
+    /// non-finite `e_ev`, an empty kernel set, or a non-positive flight path.
     #[must_use]
     pub fn kernel_support_ev(&self, e_ev: f64) -> f64 {
-        if e_ev <= 0.0 || !e_ev.is_finite() {
-            return 0.0;
+        let (lo, hi) = self.gather_bounds_ev(e_ev);
+        (e_ev - lo).max(hi - e_ev).max(0.0)
+    }
+
+    /// The lowest and highest energies the kernel at `e_ev` gathers theory
+    /// from, as `(low, high)` in eV with `low ≤ e_ev ≤ high`, over the points
+    /// [`Self::broaden`] keeps and in its arithmetic.  Returns `(e_ev, e_ev)`
+    /// for non-positive or non-finite `e_ev`, an empty kernel set, or a
+    /// non-positive flight path.
+    #[must_use]
+    pub fn gather_bounds_ev(&self, e_ev: f64) -> (f64, f64) {
+        if e_ev <= 0.0 || !e_ev.is_finite() || self.kernels.is_empty() || self.flight_path_m <= 0.0
+        {
+            return (e_ev, e_ev);
         }
-        if self.kernels.is_empty() || self.flight_path_m <= 0.0 {
-            return 0.0;
+        let tof_center = TOF_FACTOR * self.flight_path_m / e_ev.sqrt();
+        let (offsets, weights) = self.interpolated_kernel(e_ev);
+        let (mut low, mut high) = (e_ev, e_ev);
+        for (&dt, &w) in offsets.iter().zip(weights.iter()) {
+            if w <= 0.0 {
+                continue;
+            }
+            let tof_prime = tof_center - dt;
+            if tof_prime <= 0.0 {
+                continue;
+            }
+            let e_prime = (TOF_FACTOR * self.flight_path_m / tof_prime).powi(2);
+            low = low.min(e_prime);
+            high = high.max(e_prime);
         }
-        // Use binary_search to distinguish exact hits from
-        // between-ref interpolation:
-        //   Ok(idx)  → e_ev exactly matches ref_energies[idx]; use
-        //              that single kernel.
-        //   Err(idx) → idx is the insertion point.  Use the
-        //              bracketing kernels at idx-1 (lower) and idx
-        //              (upper); clip to grid bounds when e_ev falls
-        //              outside the ref range.
-        let n = self.ref_energies.len();
-        let mut max_dt_pos: f64 = 0.0;
-        let mut max_dt_neg: f64 = 0.0;
-        // `consider` folds one offset into the extremes; `visit` scans
-        // one kernel with its own positive-weight mask.  Both take the
-        // accumulators as explicit arguments so the joint-mask arm
-        // below can also fold offsets directly.
-        let consider = |dt: f64, pos: &mut f64, neg: &mut f64| {
-            if dt.is_finite() {
-                *pos = pos.max(dt);
-                *neg = neg.max(-dt);
-            }
-        };
-        let visit = |idx: usize, pos: &mut f64, neg: &mut f64| {
-            let (offsets, weights) = &self.kernels[idx];
-            for (&dt, &w) in offsets.iter().zip(weights.iter()) {
-                if w > 0.0 {
-                    consider(dt, pos, neg);
-                }
-            }
-        };
-        match self.ref_energies.binary_search_by(|probe| {
-            probe
-                .partial_cmp(&e_ev)
-                .unwrap_or(std::cmp::Ordering::Equal)
-        }) {
-            Ok(idx) => visit(idx, &mut max_dt_pos, &mut max_dt_neg),
-            Err(0) => visit(0, &mut max_dt_pos, &mut max_dt_neg),
-            Err(idx) if idx >= n => visit(n - 1, &mut max_dt_pos, &mut max_dt_neg),
-            Err(idx) => {
-                let (off_lo, w_lo) = &self.kernels[idx - 1];
-                let (off_hi, w_hi) = &self.kernels[idx];
-                let (_, s_lo) = trapezoidal_moments(off_lo, w_lo);
-                let (_, s_hi) = trapezoidal_moments(off_hi, w_hi);
-                let e_lo = self.ref_energies[idx - 1];
-                let e_hi = self.ref_energies[idx];
-                let frac = (e_ev.ln() - e_lo.ln()) / (e_hi.ln() - e_lo.ln());
-                if !(s_lo.is_finite()
-                    && s_lo > 0.0
-                    && s_hi.is_finite()
-                    && s_hi > 0.0
-                    && frac.is_finite())
-                {
-                    // Degenerate blocks — and a non-finite fraction
-                    // (defense-in-depth; constructors enforce positive
-                    // reference energies) — take `interpolated_kernel`'s
-                    // nearest-clone fallback; bounding BOTH blocks
-                    // bounds either clone.
-                    visit(idx - 1, &mut max_dt_pos, &mut max_dt_neg);
-                    visit(idx, &mut max_dt_pos, &mut max_dt_neg);
-                } else {
-                    // Width-normalized shape blend (lockstep with
-                    // `interpolated_kernel`): each block's support in
-                    // mode-anchored z = Δt/σ_b is scaled to the target
-                    // width σ_t, and the blended support is the union.
-                    // Per block use CLOSURE extremes — the outermost
-                    // w > 0 offset extended to the adjacent w == 0
-                    // entry if one exists on that side: the linearly
-                    // interpolated shape is positive on that fringe,
-                    // and a merged point from the other block can land
-                    // there with positive blended weight.
-                    let s_t = s_lo * (s_hi / s_lo).powf(frac);
-                    let closure_extents = |offs: &[f64], ws: &[f64]| -> (f64, f64) {
-                        let n_k = offs.len();
-                        let mut pos = 0.0f64;
-                        let mut neg = 0.0f64;
-                        if let Some(kmax) = (0..n_k).rev().find(|&k| ws[k] > 0.0) {
-                            let k_ext = if kmax + 1 < n_k { kmax + 1 } else { kmax };
-                            pos = offs[k_ext].max(0.0);
-                            // kmax exists ⇒ a first positive-weight
-                            // index exists too.
-                            let kmin = (0..n_k).find(|&k| ws[k] > 0.0).unwrap_or(kmax);
-                            let k_ext_n = if kmin > 0 { kmin - 1 } else { kmin };
-                            neg = (-offs[k_ext_n]).max(0.0);
-                        }
-                        (pos, neg)
-                    };
-                    let (p_lo, n_lo) = closure_extents(off_lo, w_lo);
-                    let (p_hi, n_hi) = closure_extents(off_hi, w_hi);
-                    let z_pos = (p_lo / s_lo).max(p_hi / s_hi);
-                    let z_neg = (n_lo / s_lo).max(n_hi / s_hi);
-                    consider(z_pos * s_t, &mut max_dt_pos, &mut max_dt_neg);
-                    consider(-(z_neg * s_t), &mut max_dt_pos, &mut max_dt_neg);
-                }
-            }
-        }
-        let t = TOF_FACTOR * self.flight_path_m / e_ev.sqrt();
-        // Up-side excursion: the positive-offset (delayed-emission)
-        // tail gathers theory at t − dt⁺, i.e. from HIGHER energy.
-        let up = if max_dt_pos >= t {
-            return f64::INFINITY;
-        } else {
-            e_ev * ((t / (t - max_dt_pos)).powi(2) - 1.0)
-        };
-        // Down-side excursion: negative offsets gather at t + dt⁻,
-        // i.e. from lower energy (bounded below by E' → 0).
-        let down = e_ev * (1.0 - (t / (t + max_dt_neg)).powi(2));
-        up.max(down)
+        (low, high)
     }
 }
 
@@ -1483,7 +1358,61 @@ pub enum ResolutionFunction {
     IkedaCarpenter(Arc<crate::ikeda_carpenter::IkedaCarpenter>),
 }
 
+/// Widths of Gaussian resolution the broadening limits reach on each side.
+///
+/// SAMMY Ref: `rsl/mrsl4.f90` `Wdsint`, `Wlow = Wup = Brdlim*Widgau`;
+/// `inp/minp06.f` line 212, `Brdlim = 5`.
+const BRDLIM: f64 = 5.0;
+
+/// Lowest energy the Gaussian working grid extends to, in eV: the PW-linear
+/// quadrature maps points through `1/√E`, which has no value at zero.
+const GAUSSIAN_LOW_ENERGY_FLOOR_EV: f64 = 0.001;
+
 impl ResolutionFunction {
+    /// The energies a working grid for the data window `energies` has to span,
+    /// as `(low, high)` in eV with `low ≤ e_min` and `high ≥ e_max`: SAMMY's
+    /// Wdsint limits at the two ends for a Gaussian, the extremes of
+    /// [`TabulatedResolution::gather_bounds_ev`] over the grid for a sampled
+    /// kernel.  Returns `(0.0, 0.0)` for an empty grid.
+    #[must_use]
+    pub fn grid_bounds_ev(&self, energies: &[f64]) -> (f64, f64) {
+        let (Some(&e_min), Some(&e_max)) = (energies.first(), energies.last()) else {
+            return (0.0, 0.0);
+        };
+        let sampled = |table: &TabulatedResolution| {
+            energies.iter().fold((e_min, e_max), |(low, high), &e| {
+                let (l, h) = table.gather_bounds_ev(e);
+                (low.min(l), high.max(h))
+            })
+        };
+        match self {
+            Self::Gaussian(params) => {
+                let wg_high = params.gaussian_width(e_max);
+                let we_high = params.exp_width(e_max);
+                // SAMMY grades the high side by the ratio of the Gaussian core to
+                // the one-sided exponential tail (Wdsint, `Rwid`).
+                let above = if we_high > 1e-30 {
+                    let rwid = wg_high / we_high;
+                    if rwid <= 1.0 {
+                        6.25 * we_high
+                    } else if rwid <= 2.0 {
+                        BRDLIM * (3.0 - rwid) * wg_high
+                    } else {
+                        BRDLIM * wg_high
+                    }
+                } else {
+                    BRDLIM * wg_high
+                };
+                let below = (BRDLIM * params.gaussian_width(e_min))
+                    .min(e_min - GAUSSIAN_LOW_ENERGY_FLOOR_EV)
+                    .max(0.0);
+                (e_min - below, e_max + above)
+            }
+            Self::Tabulated(tabulated) => sampled(tabulated),
+            Self::IkedaCarpenter(ic) => sampled(ic.tabulated()),
+        }
+    }
+
     /// Flight path used to map true neutron energy to detector time.
     pub fn flight_path_m(&self) -> f64 {
         match self {
@@ -2377,9 +2306,6 @@ impl TabulatedResolution {
     /// past infinite energy; they are dropped and the kernel
     /// renormalized over the surviving points, mirroring the grid-edge
     /// handling — see the tail-truncation note on `broaden_presorted`.
-    /// [`Self::kernel_support_ev`] returns `f64::INFINITY` in exactly
-    /// that regime, so callers consuming it as a fit-range margin
-    /// already have the signal.
     ///
     /// # Errors
     /// Returns [`ResolutionError::LengthMismatch`] if the arrays differ in
@@ -2420,9 +2346,7 @@ impl TabulatedResolution {
     /// reach — very high energy and/or a short flight path — and is
     /// reachable at *any* target energy because `interpolated_kernel`
     /// clamps to the nearest reference kernel outside the tabulated
-    /// range.  [`Self::kernel_support_ev`] returns `f64::INFINITY` in
-    /// exactly this regime, so margin-consuming callers already have
-    /// the signal that the kernel footprint is unbounded there.
+    /// range.
     ///
     /// ## Inner-loop optimization
     ///
@@ -2850,10 +2774,8 @@ impl TabulatedResolution {
 
         // Find bracketing indices
         let pos = self.ref_energies.partition_point(|&e| e < energy);
-        // Interior exact hit: return that reference unchanged, keeping
-        // this function lockstep with `kernel_support_ev`'s `Ok(idx)`
-        // arm (previously an interior hit went through the blend with
-        // `frac == 1.0`, reproducing the kernel only up to ULPs).
+        // Interior exact hit: return that reference unchanged rather than
+        // blending it with itself, which reproduces it only up to ULPs.
         if self.ref_energies[pos] == energy {
             return self.kernels[pos].clone();
         }
@@ -5401,25 +5323,62 @@ Resolution file
         );
     }
 
-    /// A positive-offset extreme reaching the nominal flight time maps
-    /// past infinite energy: the support is unbounded and the caller
-    /// must clamp to its grid.
+    /// An offset at or past the nominal flight time contributes no reach: the
+    /// support is that of the surviving points.
     #[test]
-    fn test_tabulated_kernel_support_infinite_when_tail_exceeds_flight_time() {
-        let offsets = vec![0.0, 10.0];
-        let weights = vec![1.0, 0.5];
+    fn test_tabulated_kernel_support_counts_only_points_the_broadening_keeps() {
+        let offsets = vec![0.0, 2.0, 10.0];
+        let weights = vec![1.0, 0.5, 0.5];
         let r = TabulatedResolution {
             ref_energies: Arc::new(vec![100.0]),
             kernels: Arc::new(vec![(offsets, weights)]),
             flight_path_m: 25.0,
         };
-        // Choose E high enough that t = K·L/√E ≤ 10 μs.
+        // Choose E high enough that 2 μs < t = K·L/√E ≤ 10 μs, so the
+        // 10 μs point is dropped and the 2 μs point is the last kept.
         let t_at = |e: f64| TOF_FACTOR * 25.0 / e.sqrt();
         let mut e: f64 = 100.0;
         while t_at(e) > 10.0 {
             e *= 10.0;
         }
-        assert_eq!(r.kernel_support_ev(e), f64::INFINITY);
+        let t = t_at(e);
+        assert!(t > 2.0, "fixture must keep the 2 μs point (t = {t})");
+        let expected_above = e * ((t / (t - 2.0)).powi(2) - 1.0);
+        let (_, high) = r.gather_bounds_ev(e);
+        let above = high - e;
+        assert!(above.is_finite(), "reach must be finite, got {above}");
+        assert!(
+            (above - expected_above).abs() <= 1e-9 * expected_above,
+            "reach {above} should be that of the last surviving offset, {expected_above}"
+        );
+    }
+
+    /// Between two references an offset past the flight time drops only
+    /// itself: the reach is that of the last surviving offset of the blended
+    /// kernel.
+    #[test]
+    fn test_tabulated_kernel_support_between_refs_keeps_surviving_offsets() {
+        let offsets = vec![0.0, 10.0, 20.0, 80.0];
+        let weights = vec![1.0; 4];
+        let r = TabulatedResolution::from_kernels(
+            vec![1.0, 4.0],
+            vec![(offsets.clone(), weights.clone()), (offsets, weights)],
+            1.0,
+        )
+        .expect("valid two-block table");
+        let e: f64 = 2.0;
+        let t = TOF_FACTOR / e.sqrt();
+        assert!(
+            t > 20.0 && t < 80.0,
+            "fixture must drop the 80 μs point and keep the 20 μs point (t = {t})"
+        );
+        let expected_above = e * ((t / (t - 20.0)).powi(2) - 1.0);
+        let (_, high) = r.gather_bounds_ev(e);
+        let above = high - e;
+        assert!(
+            (above - expected_above).abs() <= 1e-9 * expected_above,
+            "reach {above} should be that of the last surviving offset, {expected_above}"
+        );
     }
 
     /// Non-positive / non-finite energy → 0.0 (no broadening footprint).
