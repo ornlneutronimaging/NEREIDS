@@ -50,20 +50,8 @@ pub struct PrecomputedTransmissionModel {
     /// Doppler-broadened cross-sections σ_D(E) per isotope, shape
     /// \[n_isotopes\]\[n_grid_energies\].
     ///
-    /// **The grid these σ live on is determined by
-    /// [`work_layout`](Self::work_layout):**
-    ///
-    /// * `work_layout` is `Some` (the kernel's reach extends the grid): σ
-    ///   live on the **working grid**, i.e.
-    ///   `work_layout.energies`, with `n_grid_energies ==
-    ///   work_layout.energies.len()`.  `evaluate()` / `analytical_jacobian()`
-    ///   apply Beer-Lambert + resolution on this working grid and extract the
-    ///   data points LAST via `work_layout.extract(..)` — matching
-    ///   `forward_model` (issue #608).
-    /// * `work_layout` is `None` (no resolution, or a kernel with zero reach
-    ///   at both ends): the working grid IS the data grid, so σ live on the
-    ///   **data grid** (`energies`), with `n_grid_energies == energies.len()`
-    ///   and no extraction.
+    /// The σ live on `work_layout.energies` when [`work_layout`](Self::work_layout)
+    /// is `Some`, else on `energies`.
     pub cross_sections: Arc<Vec<Vec<f64>>>,
     /// Mapping: `params[density_indices[i]]` is the density of isotope `i`.
     ///
@@ -503,10 +491,7 @@ impl FitModel for PrecomputedTransmissionModel {
             }
         }
 
-        // Beer-Lambert on the WORKING grid (issue #608): `cross_sections` are
-        // stored on the working grid (the extended grid when the kernel
-        // reaches past the data; the data grid otherwise), so `n_e` is the
-        // working-grid length.
+        // Beer-Lambert on the working grid, where `cross_sections` live.
         let mut neg_opt = vec![0.0f64; n_e];
         // #109.1: No density > 0 guard — let Beer-Lambert handle all densities
         // naturally.  exp(−n·σ) is well-defined for negative n (gives T > 1,
@@ -522,15 +507,8 @@ impl FitModel for PrecomputedTransmissionModel {
         }
         let transmission: Vec<f64> = neg_opt.iter().map(|&d| d.exp()).collect();
 
-        // Issue #442 + #608: apply resolution broadening to the total
-        // transmission AFTER Beer-Lambert, on the WORKING grid, then extract
-        // the data points LAST.  When `work_layout` is `None` the working
-        // grid IS the data grid (`self.energies`) and the extraction is the
-        // identity.
-        // Resolution applies iff there is an instrument AND a working grid to
-        // apply it on (`work_energies()` = the layout grid when present, else the
-        // data grid).  `evaluate` and `analytical_jacobian` share this exact
-        // guard so the two paths cannot diverge (issue #608).
+        // Resolution on the working grid after Beer-Lambert, then the data
+        // points are extracted.
         if let (Some(inst), Some(work_energies)) = (&self.instrument, self.work_energies()) {
             let t_broadened = resolution::apply_resolution_with_plan(
                 self.resolution_plan.as_deref(),
@@ -1047,22 +1025,8 @@ impl FitModel for TransmissionFitModel {
                 )));
             }
 
-            // Compute broadened XS on the WORKING grid (or reuse cache if
-            // temperature unchanged).  Caching avoids redundant Doppler
-            // broadening on rejected LM steps (same T, different lambda) and
-            // enables analytical_jacobian() to read the broadened σ for the
-            // density columns AND to build the inner derivative on the same
-            // working grid.
-            //
-            // Issue #608: Doppler + Beer-Lambert + resolution all run on the
-            // working grid (the data grid extended by the kernel's reach),
-            // with the data points extracted LAST — matching
-            // forward_model.  The previous cached path collapsed σ to the
-            // coarse data grid before resolution, degrading the convolution.
-            //
-            // Derivative ∂σ/∂T is computed on-demand in analytical_jacobian(),
-            // NOT here — evaluate() is called many times during line search
-            // trials, and the derivative overhead would dominate.
+            // Broadened σ on the working grid, cached while the temperature is
+            // unchanged; ∂σ/∂T is built on demand in `analytical_jacobian`.
             let (broadened_xs, layout) = if (temperature_k - self.cached_temperature.get()).abs()
                 < 1e-15
                 && self.cached_broadened_xs.borrow().is_some()
@@ -1103,11 +1067,8 @@ impl FitModel for TransmissionFitModel {
             }
             let transmission: Vec<f64> = neg_opt.iter().map(|&d| d.exp()).collect();
 
-            // Issue #442: apply resolution broadening to the total transmission
-            // AFTER Beer-Lambert, on the working grid; then extract the data
-            // points last (issue #608).  For Gaussian resolution `resolution_plan`
-            // is `None` (the planned path is tabulated-only); a tabulated plan
-            // is built on the working grid, which is the grid broadened here.
+            // Resolution on the working grid after Beer-Lambert, then the data
+            // points are extracted.
             if let Some(ref inst) = self.instrument {
                 let t_broadened = resolution::apply_resolution_with_plan(
                     self.resolution_plan.as_deref(),
@@ -1702,11 +1663,8 @@ impl<M: FitModel> FitModel for NormalizedTransmissionModel<M> {
 ///   1. Convert nominal energy → TOF: `t = TOF_FACTOR * L / √E_nom`
 ///   2. Apply calibration: `t_corr = t - t₀`,
 ///      `E_corr = (TOF_FACTOR * L * L_scale / t_corr)²`
-///   3. Evaluate σ(E_corr) directly via `reich_moore` + Doppler on a working
-///      grid built from `E_corr` (extended by the kernel's reach, and by the
-///      fine-structure points under a Gaussian resolution) — NOT
-///      interpolation of a fixed σ grid, which clamps at the auxiliary
-///      boundary and drops resonance fine-structure.
+///   3. Evaluate σ(E_corr) via `reich_moore` + Doppler on the working grid
+///      built from `E_corr`.
 ///   4. Beer-Lambert + resolution on the working grid, then extract the data
 ///      points last.
 ///
@@ -2065,11 +2023,8 @@ impl EnergyScaleTransmissionModel {
     /// both cases transparently fall back to the non-plan
     /// `apply_resolution` path via `apply_resolution_with_plan(None, …)`.
     ///
-    /// `working_energies` is the broadening grid the plan is built on — the
-    /// model's WORKING grid (`work.layout.energies`), which every caller passes
-    /// post-#608: the corrected data grid extended by the kernel's reach.  For
-    /// Gaussian resolution the path returns `None` above before the grid is
-    /// used.
+    /// `working_energies` is the model's working grid (`work.layout.energies`),
+    /// the grid the plan is built on.
     fn cached_resolution_plan(
         &self,
         t0_us: f64,
@@ -2192,15 +2147,9 @@ impl EnergyScaleTransmissionModel {
     /// Doppler-broadened TRUE σ per isotope on the working grid built from the
     /// corrected energies, plus the data-grid layout (issue #608).
     ///
-    /// Mirrors `forward_model`: builds the auxiliary extended grid on `e_corr`
-    /// WITH the model's resonance data (boundary extension + resonance
-    /// fine-structure), evaluates σ via `reich_moore` at those energies, and
-    /// Doppler-broadens there.  The corrected grid is re-derived per
-    /// `(t0, L_scale)` probe, so the working grid + σ are rebuilt each call —
-    /// the only way to reproduce SAMMY's σ(E_corr) under the energy-scale shift
-    /// (boundary + fine-structure fidelity).  When the kernel does not reach
-    /// past the data the working grid is `e_corr` itself with an identity
-    /// layout.
+    /// Builds the working grid on `e_corr` with the model's resonance data,
+    /// evaluates σ via `reich_moore` there and Doppler-broadens it.  The grid
+    /// and σ are rebuilt on every `(t0, L_scale)` probe.
     fn working_xs(
         &self,
         e_corr: &[f64],
@@ -2326,13 +2275,8 @@ impl EnergyScaleTransmissionModel {
         e_corr: &[f64],
         use_plan_cache: bool,
     ) -> Result<Vec<f64>, FittingError> {
-        // Issue #608: evaluate the TRUE σ at the corrected energies on the
-        // working grid (the extended grid when the kernel reaches past the
-        // data; the data grid otherwise) — reich_moore + Doppler on
-        // the working grid, Beer-Lambert, resolution, extract the data points
-        // last — exactly as `forward_model` does.  This replaces interpolating
-        // a precomputed σ, which clamped at the auxiliary boundary and dropped
-        // resonance fine-structure (a forward_model-fidelity gap; #608).
+        // σ at the corrected energies on the working grid, Beer-Lambert,
+        // resolution, then the data points are extracted.
         let work = self.working_xs_for(params, e_corr)?;
         let work_e = &work.layout.energies;
 
@@ -2505,11 +2449,8 @@ impl FitModel for EnergyScaleTransmissionModel {
             None
         };
 
-        // Issue #608: density columns are formed on the WORKING grid (`e_corr`
-        // extended by the kernel's reach) from the TRUE σ at the corrected
-        // energies (reich_moore +
-        // Doppler), resolution-broadened there, and the data points extracted
-        // last — matching `forward_model` and `evaluate`.
+        // Density columns on the working grid, resolution-broadened there,
+        // then the data points are extracted.
         let work = match self.working_xs_for(params, &e_corr) {
             Ok(w) => w,
             Err(_) => return None,

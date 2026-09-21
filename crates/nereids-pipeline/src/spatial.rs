@@ -1244,27 +1244,14 @@ pub fn spatial_map_typed(
         }
     };
 
-    // Precompute cross-sections once (shared across all pixels).
-    //
-    // Issue #608: broaden σ on the WORKING grid (auxiliary extended grid when a
-    // kernel reaches past the data, else the data grid) so each per-pixel
-    // `PrecomputedTransmissionModel` applies Beer-Lambert + resolution on
-    // the working grid and extracts the data points last — matching
-    // `forward_model`.  `xs` (data-grid σ) is still needed for shape
-    // validation; `work_xs` carries the working-grid σ.  When the layout is
-    // the identity `work_xs` is left unset and the model uses the data-grid
-    // σ directly.
+    // Precompute cross-sections once, shared across all pixels: `xs` on the
+    // data grid for shape validation, `work_xs` on the working grid when it
+    // differs.
     let instrument = config.resolution().map(|r| InstrumentParams {
         resolution: r.clone(),
     });
 
-    // Determine the working-grid layout FIRST, cheaply (no Doppler
-    // broadening): `resolution_working_grid` only builds the auxiliary grid
-    // geometry (boundary extension + resonance fine-structure) — it does NOT
-    // evaluate or broaden σ.  When the layout is the identity the working
-    // grid IS the data grid, so no working-grid σ is needed and we must NOT
-    // pay for the full per-isotope `broadened_cross_sections_on_working_grid`
-    // just to discover the layout is trivial.
+    // The working-grid layout alone, before any σ is broadened.
     let rd_refs: Vec<&_> = config.resonance_data().iter().collect();
     let layout = nereids_physics::transmission::resolution_working_grid(
         config.energies(),
@@ -1276,11 +1263,8 @@ pub fn spatial_map_typed(
 
     // (xs = data-grid σ, work_xs = working-grid σ when an aux grid exists).
     let (xs, work_xs) = match config.precomputed_cross_sections().cloned() {
-        // Caller supplied data-grid σ.  When the grid is extended the model
-        // needs working-grid σ, so recompute it from resonance data (the
-        // data-grid σ alone cannot be de-extracted back onto the working
-        // grid).  When the grid is not extended the supplied σ is already the
-        // working-grid σ and Doppler broadening is skipped entirely.
+        // Caller supplied data-grid σ: used as is when the grid is not
+        // extended, else the working-grid σ is recomputed from resonance data.
         Some(cached) if !aux_grid_active => (cached, None),
         Some(cached) => {
             let working = broadened_cross_sections_on_working_grid(
@@ -1315,10 +1299,8 @@ pub fn spatial_map_typed(
         }
     };
 
-    // Working-grid layout (energies + data-index map) shared across pixels,
-    // reusing the layout computed above.  Only attached when the grid is
-    // extended so the per-pixel precomputed model extracts data points after
-    // resolution; `None` when the working grid is the data grid.
+    // The layout shared across pixels; `None` when the working grid is the
+    // data grid.
     let work_layout: Option<Arc<nereids_physics::transmission::WorkingGridLayout>> =
         if work_xs.is_some() {
             Some(Arc::new(layout))
@@ -1360,14 +1342,8 @@ pub fn spatial_map_typed(
         .map_or(config.energies(), |l| l.energies.as_slice());
     let plan_xs: &Arc<Vec<Vec<f64>>> = work_xs.as_ref().unwrap_or(&xs);
 
-    // Build the resolution broadening plan once for the shared grid.
-    //
-    // The plan is valid for any per-pixel fit that applies resolution
-    // on the (fixed) working grid — i.e. every spatial dispatch
-    // EXCEPT the energy-scale (TZERO) path, where the grid changes
-    // per (t0, l_scale) trial.  In that case the plan would always
-    // miss so we skip the build; `EnergyScaleTransmissionModel` runs
-    // the non-plan broadening path (see its `evaluate_at` comment).
+    // The resolution plan once for the shared working grid; the energy-scale
+    // path rebuilds its grid per trial and takes the non-plan path.
     //
     // `build_resolution_plan` returns `None` for Gaussian resolution
     // (no worthwhile cache at this level) and `Some(plan)` for
@@ -1633,11 +1609,8 @@ pub fn spatial_map_typed(
         let mut cfg = cfg
             .with_precomputed_cross_sections(xs)
             .with_compute_covariance(true);
-        // Issue #608: attach the working-grid σ + layout whenever the grid
-        // was extended, so each per-pixel `PrecomputedTransmissionModel`
-        // applies resolution on the working grid and extracts the data
-        // points last.  `with_precomputed_cross_sections` (above) clears any
-        // stale work σ, so this must come AFTER it.
+        // The working-grid σ + layout whenever the grid was extended, after
+        // `with_precomputed_cross_sections`, which clears any work σ.
         if let (Some(work_xs), Some(layout)) = (work_xs.clone(), work_layout.clone()) {
             cfg = cfg.with_precomputed_work_cross_sections(work_xs, layout);
         }

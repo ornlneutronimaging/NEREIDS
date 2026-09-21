@@ -255,12 +255,9 @@ fn working_grid_layout<'a>(
 /// Compute the working-grid layout for `(energies, instrument, resonance_data)`.
 ///
 /// With a resolution function the grid is extended past both ends by the
-/// kernel's reach there ([`ResolutionFunction::grid_bounds_ev`]); a
-/// Gaussian additionally gets the intermediate points and resonance
-/// fine-structure its PW-linear quadrature needs.  Without one the data grid
-/// comes back with identity indices.  Fitting models use this to apply
-/// resolution on the same working grid [`forward_model`] uses and extract the
-/// data points last (issue #608).
+/// kernel's reach ([`ResolutionFunction::grid_bounds_ev`]), and a Gaussian
+/// also gets the intermediate points and resonance fine structure.  Without
+/// one the data grid comes back with identity indices.
 ///
 /// `resonance_data` may be empty (e.g. the energy-scale model has no resonance
 /// data of its own); the auxiliary grid then carries boundary extension only,
@@ -349,19 +346,9 @@ pub type BroadenedXsWithDerivative = (Vec<Vec<f64>>, Vec<Vec<f64>>);
 /// The working energy grid used for broadening, plus the map back to the
 /// data grid.
 ///
-/// `forward_model` and the Beer-Lambert-aware transmission pipeline run
-/// Doppler/Beer-Lambert/resolution on a *working* grid — the data grid
-/// extended past both ends by the kernel's reach, plus intermediate points
-/// and resonance fine-structure for a Gaussian — and extract the data points
-/// LAST.  Fitting models that cache broadened σ
-/// for reuse across LM steps need this layout so they can reproduce the same
-/// "broaden-on-working-grid, extract-last" ordering (issue #608): the LM fit's
-/// cached / precomputed paths previously collapsed σ to the coarse data grid
-/// *before* resolution broadening, degrading the convolution near grid edges
-/// and around narrow resonances relative to [`forward_model`].
-///
-/// The working grid equals the data grid only when no instrument is present
-/// or the kernel's reach is zero at both ends.  A
+/// Doppler, Beer-Lambert and resolution run on the working grid, the data
+/// grid extended by the kernel's reach plus a Gaussian's intermediate and
+/// fine-structure points, and the data points are extracted last.  A
 /// [`crate::resolution::ResolutionPlan`] must be built on [`Self::energies`].
 #[derive(Debug, Clone)]
 pub struct WorkingGridLayout {

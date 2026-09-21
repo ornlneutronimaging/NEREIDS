@@ -2015,14 +2015,8 @@ const FIT_RANGE_MARGIN_FWHM: f64 = 5.0;
 /// - **Gaussian**: extend by `FIT_RANGE_MARGIN_FWHM × FWHM(E)`.  The
 ///   kernel has infinite tails; 5×FWHM (≈ 11.8σ) puts the residual
 ///   amplitude at ~10⁻³⁰ of peak (see [`FIT_RANGE_MARGIN_FWHM`]).
-/// - **Tabulated**: use `TabulatedResolution::kernel_support_ev(E)`,
-///   the eV distance over which the discrete kernel has positive
-///   weight at `E`.  Past this distance the kernel is exactly zero,
-///   so 1× the support fully captures the broadening footprint — no
-///   safety multiplier needed.  The support maps the actual kernel
-///   offsets through the exact TOF→E relation (see
-///   `TabulatedResolution::kernel_support_ev`), so the margin tracks the
-///   loaded resolution file rather than a hand-picked constant.
+/// - **Tabulated**: `TabulatedResolution::kernel_support_ev(E)`, the eV
+///   distance over which the discrete kernel has positive weight at `E`.
 fn kernel_margin_ev(e_ev: f64, resolution: Option<&ResolutionFunction>) -> f64 {
     match resolution {
         None => 0.0,

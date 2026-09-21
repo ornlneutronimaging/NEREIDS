@@ -430,14 +430,8 @@ pub struct UnifiedFitConfig {
     /// injected by [`spatial_map_typed`] for the fixed-calibration /
     /// fixed-temperature precomputed path.
     ///
-    /// The working grid is the data grid extended past both ends by the
-    /// resolution kernel's reach, plus the resonance fine-structure points
-    /// under a Gaussian resolution; storing σ there lets each per-pixel
-    /// [`PrecomputedTransmissionModel`] apply Beer-Lambert + resolution on
-    /// the working grid and extract the data points last — matching
-    /// `forward_model`.  When the resolution does not extend the grid, or
-    /// there is none, the working grid IS the data grid and this is `None`
-    /// (the model uses the data-grid `precomputed_cross_sections` directly).
+    /// `None` when the working grid is the data grid; the model then uses
+    /// `precomputed_cross_sections` directly.
     ///
     /// `precomputed_cross_sections` still carries the **data-grid** σ for the
     /// surrogate-plan builders and shape validation; this field is the separate
@@ -3199,11 +3193,8 @@ fn build_transmission_model(
             Arc::clone(xs)
         };
 
-        // Issue #608: prefer the WORKING-grid σ + layout when the spatial
-        // builder injected it (any resolution whose reach extends the grid).
-        // The model then applies resolution on the working grid and extracts
-        // the data points last.  When absent the working grid is the data
-        // grid: use the data-grid σ with no layout.
+        // The working-grid σ + layout when the spatial builder injected them,
+        // else the data-grid σ with no layout.
         let (effective_xs, work_layout): (
             Arc<Vec<Vec<f64>>>,
             Option<Arc<nereids_physics::transmission::WorkingGridLayout>>,
@@ -3659,10 +3650,9 @@ pub fn evaluate_jacobian_and_fisher(
                     .clone()
                     .with_precomputed_cross_sections(Arc::new(working.sigma))
             } else {
-                // Extended grid: attach BOTH the extracted data-grid σ (for the
-                // surrogate-plan builders + shape validation) and the working-grid σ
-                // + layout (AFTER `with_precomputed_cross_sections`, which clears any
-                // stale work σ).
+                // Extended grid: attach the extracted data-grid σ, then the
+                // working-grid σ + layout (`with_precomputed_cross_sections` clears
+                // any work σ).
                 let data_xs: Vec<Vec<f64>> = working
                     .sigma
                     .iter()
