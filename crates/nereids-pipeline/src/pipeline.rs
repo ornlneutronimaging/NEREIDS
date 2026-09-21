@@ -7931,10 +7931,6 @@ mod tests {
         }
     }
 
-    /// Cover the OTHER branches of the #608 `evaluate_jacobian_and_fisher` σ
-    /// restructure: the identity-layout path (no resolution ⇒ working grid ==
-    /// data grid) and the early-return when `fit_temperature` is set (the
-    /// `TransmissionFitModel` builds its own working-grid base σ).
     #[test]
     fn evaluate_jacobian_and_fisher_identity_and_temperature_paths() {
         let data = u238_single_resonance();
@@ -7959,8 +7955,6 @@ mod tests {
             f00.is_finite() && f00 > 0.0,
             "identity-path Fisher[0,0]={f00}"
         );
-        // (b) fit_temperature ⇒ the σ-branch early-returns `config`;
-        //     TransmissionFitModel builds its own working-grid base σ.
         let cfg_t = UnifiedFitConfig::new(
             energies,
             vec![data],
