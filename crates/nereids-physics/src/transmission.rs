@@ -257,7 +257,7 @@ fn working_grid_layout<'a>(
 /// Compute the working-grid layout for `(energies, instrument, resonance_data)`.
 ///
 /// With a resolution function the grid is extended past both ends by the
-/// kernel's reach there ([`ResolutionFunction::boundary_reach_ev`]); a
+/// kernel's reach there ([`ResolutionFunction::grid_bounds_ev`]); a
 /// Gaussian additionally gets the intermediate points and resonance
 /// fine-structure its PW-linear quadrature needs.  Without one the data grid
 /// comes back with identity indices.  Fitting models use this to apply
@@ -741,8 +741,8 @@ pub fn broadened_cross_sections(
 }
 
 /// Like [`broadened_cross_sections`] but returns the Doppler-broadened σ on the
-/// **working grid** (auxiliary extended grid when Gaussian resolution is active,
-/// else the data grid) together with the [`WorkingGridLayout`].
+/// **working grid** (the data grid extended by the kernel's reach, else the
+/// data grid) together with the [`WorkingGridLayout`].
 ///
 /// The spatial production pipeline (`spatial_map_typed`) uses this to pre-store
 /// σ on the working grid so each per-pixel `PrecomputedTransmissionModel`

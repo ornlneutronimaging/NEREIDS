@@ -53,8 +53,8 @@ pub struct PrecomputedTransmissionModel {
     /// **The grid these σ live on is determined by
     /// [`work_layout`](Self::work_layout):**
     ///
-    /// * `work_layout` is `Some` (Gaussian resolution → auxiliary extended
-    ///   grid): σ live on the **working grid**, i.e.
+    /// * `work_layout` is `Some` (the kernel's reach extends the grid): σ
+    ///   live on the **working grid**, i.e.
     ///   `work_layout.energies`, with `n_grid_energies ==
     ///   work_layout.energies.len()`.  `evaluate()` / `analytical_jacobian()`
     ///   apply Beer-Lambert + resolution on this working grid and extract the
@@ -80,7 +80,9 @@ pub struct PrecomputedTransmissionModel {
     /// When `Some`, resolution broadening is applied to the total
     /// transmission after Beer-Lambert in `evaluate()`.
     pub instrument: Option<Arc<InstrumentParams>>,
-    /// Optional pre-built broadening plan for `(energies, resolution)`.
+    /// Optional pre-built broadening plan for the working grid and the
+    /// resolution: `work_layout.energies` when a layout exists, else
+    /// `energies`.
     ///
     /// When a caller builds the plan once (e.g. spatial dispatch for
     /// a grid shared across every pixel) and passes it via
@@ -801,7 +803,8 @@ pub struct TransmissionFitModel {
     /// Temperature at which `cached_broadened_xs` was computed.
     /// `Cell` is sufficient because `f64` is `Copy`.
     cached_temperature: Cell<f64>,
-    /// Optional prebuilt resolution plan for [`Self::energies`].
+    /// Optional prebuilt resolution plan for the model's working grid,
+    /// [`Self::energies`] extended by the kernel's reach.
     ///
     /// When a caller (typically spatial dispatch) builds the plan
     /// once for a shared grid, passing it here lets every per-pixel
@@ -915,10 +918,12 @@ impl TransmissionFitModel {
         })
     }
 
-    /// Attach a prebuilt resolution plan for the model's energy grid.
+    /// Attach a prebuilt resolution plan for the model's working grid.
     ///
     /// Safe to call before any `evaluate()`.  Caller contract:
-    /// `plan.target_energies() == energies` — violating this will
+    /// `plan.target_energies()` equals the working grid, which is
+    /// `energies` extended by the kernel's reach
+    /// ([`transmission::resolution_working_grid`]) — violating this will
     /// fail on the first broadening call, either via a length
     /// mismatch or, for a different same-length grid,
     /// `ResolutionError::PlanGridMismatch`.
@@ -1050,8 +1055,8 @@ impl FitModel for TransmissionFitModel {
             // working grid.
             //
             // Issue #608: Doppler + Beer-Lambert + resolution all run on the
-            // working grid (auxiliary extended grid when Gaussian resolution is
-            // active), with the data points extracted LAST — matching
+            // working grid (the data grid extended by the kernel's reach),
+            // with the data points extracted LAST — matching
             // forward_model.  The previous cached path collapsed σ to the
             // coarse data grid before resolution, degrading the convolution.
             //

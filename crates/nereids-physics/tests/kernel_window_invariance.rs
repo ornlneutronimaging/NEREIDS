@@ -10,7 +10,7 @@ use nereids_physics::ikeda_carpenter::{
     EnergyLaw, IkedaCarpenter, IkedaCarpenterParams, SynthesisGrid,
 };
 use nereids_physics::resolution::{
-    RETAINED_KERNEL_MASS, ResolutionFunction, TOF_FACTOR, TabulatedResolution, test_support,
+    ResolutionFunction, TOF_FACTOR, TabulatedResolution, test_support,
 };
 use nereids_physics::transmission::{InstrumentParams, SampleParams, forward_model};
 
@@ -83,38 +83,59 @@ fn ikeda_carpenter(beta: f64, e_lo: f64, e_hi: f64) -> ResolutionFunction {
 
 /// A mode-anchored kernel with mass on both sides of zero, so it gathers
 /// from below as well as above, at two reference energies bracketing the
-/// window.
-fn tabulated_resolution() -> ResolutionFunction {
-    let text = "header\n---\n\
-        3.0 0.0\n\
-        -1.5 0.0\n\
-        -1.0 0.5\n\
-        0.0 1.0\n\
-        2.0 0.6\n\
-        4.0 0.2\n\
-        5.0 0.0\n\
-        \n\
-        12.0 0.0\n\
-        -1.0 0.0\n\
-        -0.6 0.5\n\
-        0.0 1.0\n\
-        1.2 0.6\n\
-        2.4 0.2\n\
-        3.0 0.0\n";
+/// window.  `fringe` is the weight of the outermost row on each side: zero
+/// gives a kernel that fades out, a positive value one whose last row still
+/// carries mass, so the point that sets the grid's end is itself weighted.
+fn tabulated_resolution(fringe: f64) -> ResolutionFunction {
+    let text = format!(
+        "header\n---\n\
+         3.0 0.0\n\
+         -1.5 {fringe}\n\
+         -1.0 0.5\n\
+         0.0 1.0\n\
+         2.0 0.6\n\
+         4.0 0.2\n\
+         5.0 {fringe}\n\
+         \n\
+         12.0 0.0\n\
+         -1.0 {fringe}\n\
+         -0.6 0.5\n\
+         0.0 1.0\n\
+         1.2 0.6\n\
+         2.4 0.2\n\
+         3.0 {fringe}\n"
+    );
     ResolutionFunction::Tabulated(std::sync::Arc::new(
-        TabulatedResolution::from_text(text, FLIGHT_PATH_M).expect("valid kernel text"),
+        TabulatedResolution::from_text(&text, FLIGHT_PATH_M).expect("valid kernel text"),
     ))
 }
 
-/// The three kernel regimes the working grid has to serve.
+/// The kernel regimes the working grid has to serve.
 ///
 /// A fast moderator on a fine energy grid, where every kernel point is well
 /// inside the flight time; a mode-anchored table that gathers from both
-/// sides; and a slow moderator at high energy on the instrument's own
-/// channels, where the kernel's late tail runs past the flight time and the
-/// last surviving point gathers from far above the window.
+/// sides, once fading out and once with mass on its last row; a three-point
+/// kernel on a five-point window, where a third of the kernel rides on the
+/// point that sets the grid's end; and a slow moderator at high energy on
+/// the instrument's own channels, where the kernel's late tail runs past the
+/// flight time and the last surviving point gathers from far above the
+/// window.
 fn fixtures() -> Vec<Fixture> {
     vec![
+        Fixture {
+            label: "three-point kernel",
+            resolution: ResolutionFunction::Tabulated(std::sync::Arc::new(
+                TabulatedResolution::from_kernels(
+                    vec![5.0],
+                    vec![(vec![0.0, 1.0, 2.0], vec![1.0, 1.0, 1.0])],
+                    FLIGHT_PATH_M,
+                )
+                .expect("valid one-block table"),
+            )),
+            lattice: Lattice::Energy { step_ev: 0.01 },
+            e_lo: 4.96,
+            e_hi: 5.0,
+        },
         Fixture {
             label: "ikeda-carpenter",
             resolution: ikeda_carpenter(0.25, 5.0, 9.0),
@@ -124,7 +145,14 @@ fn fixtures() -> Vec<Fixture> {
         },
         Fixture {
             label: "tabulated",
-            resolution: tabulated_resolution(),
+            resolution: tabulated_resolution(0.0),
+            lattice: Lattice::Energy { step_ev: 0.01 },
+            e_lo: 5.0,
+            e_hi: 9.0,
+        },
+        Fixture {
+            label: "tabulated with mass on its last row",
+            resolution: tabulated_resolution(0.4),
             lattice: Lattice::Energy { step_ev: 0.01 },
             e_lo: 5.0,
             e_hi: 9.0,
@@ -143,7 +171,7 @@ fn transmission(energies: &[f64], e_resonance: f64, resolution: &ResolutionFunct
     // A resonance placed AT the window edge: the case the truncation hurts
     // most, because the kernel there reaches entirely outside the data.
     let iso = synthetic_isotope(72, 178, e_resonance, 0.05, 0.06);
-    let sample = SampleParams::new(300.0, vec![(iso, 1.2e-5)]).expect("valid sample");
+    let sample = SampleParams::new(300.0, vec![(iso, 5.0e-6)]).expect("valid sample");
     forward_model(
         energies,
         &sample,
@@ -169,10 +197,11 @@ fn a_wider_window_does_not_change_the_model_inside_it() {
     for f in fixtures() {
         let narrow = f.lattice.points(f.e_lo, f.e_hi);
         let n = narrow.len();
-        let (below, above) = f.resolution.boundary_reach_ev(&narrow);
+        let (low, high) = f.resolution.grid_bounds_ev(&narrow);
+        let (below, above) = (f.e_lo - low, high - f.e_hi);
         assert!(
-            above > 10.0 * (narrow[n - 1] - narrow[n - 2]),
-            "{}: the kernel must reach past several grid steps above for this to test \
+            above > 2.0 * (narrow[n - 1] - narrow[n - 2]),
+            "{}: the kernel must reach past the grid's own steps above for this to test \
              anything, got {above}",
             f.label
         );
@@ -209,16 +238,19 @@ fn a_wider_window_does_not_change_the_model_inside_it() {
              got a minimum transmission of {t_min}",
             f.label
         );
-        moved.push((f.label, worst, worst_at));
+        moved.push((f.label, worst, worst_at, 1.0 - t_min));
     }
     // The two runs convolve on different point sets - the wide window
     // carries its own data where the narrow one carries extension points -
     // so what is left is the trapezoid's own discretization, not lost
-    // kernel mass. Truncation shows up here orders of magnitude above it.
+    // kernel mass. Measured against the dip the model shows, truncation is
+    // orders of magnitude above it.
     let moved: Vec<String> = moved
         .into_iter()
-        .filter(|&(_, worst, _)| worst >= 1.0e-4)
-        .map(|(label, worst, at)| format!("{label} moved by {worst:.3e} at {at} eV"))
+        .filter(|&(_, worst, _, dip)| worst >= 1.0e-3 * dip)
+        .map(|(label, worst, at, dip)| {
+            format!("{label} moved by {worst:.3e} at {at} eV against a dip of {dip:.3e}")
+        })
         .collect();
     assert!(
         moved.is_empty(),
@@ -228,15 +260,15 @@ fn a_wider_window_does_not_change_the_model_inside_it() {
     );
 }
 
-/// The working grid carries essentially all of the kernel's mass at every
-/// data point.
+/// The working grid carries every surviving kernel point at every data
+/// point.
 ///
 /// The oracle maps the kernel's own samples through the time-of-flight
-/// relation and sums the trapezoid weight of those that land inside the
-/// working grid; it does not ask the reach code where the kernel ends. A
-/// kernel renormalized after losing mass is a different kernel from the one
-/// the file describes, and what the grid must guarantee is that the loss is
-/// below what the quadrature can resolve.
+/// relation, in the arithmetic the broadening uses, and applies the
+/// broadening's own rule for a sample outside the grid; it does not ask the
+/// reach code where the kernel ends. A kernel renormalized after losing a
+/// point is a different kernel from the one the file describes, so nothing
+/// may fall outside, not even by rounding.
 #[test]
 fn the_working_grid_carries_the_whole_kernel_at_every_data_point() {
     for f in fixtures() {
@@ -255,12 +287,7 @@ fn the_working_grid_carries_the_whole_kernel_at_every_data_point() {
             f.label
         );
         let work = &layout.energies;
-        // The grid ends where the last surviving kernel point gathers from,
-        // so a point on the boundary is inside up to rounding.
-        let (w_lo, w_hi) = (
-            work[0] * (1.0 - 1.0e-12),
-            work[work.len() - 1] * (1.0 + 1.0e-12),
-        );
+        let (w_lo, w_hi) = (work[0], work[work.len() - 1]);
 
         let table = match &f.resolution {
             ResolutionFunction::Tabulated(t) => std::sync::Arc::clone(t),
@@ -270,7 +297,7 @@ fn the_working_grid_carries_the_whole_kernel_at_every_data_point() {
         let mut dropped_past_flight_time = 0.0_f64;
         for &e in &data {
             let (offsets, weights) = test_support::interpolated_kernel(&table, e);
-            let t = TOF_FACTOR * FLIGHT_PATH_M / e.sqrt();
+            let tof_center = TOF_FACTOR * FLIGHT_PATH_M / e.sqrt();
             let n_k = offsets.len();
             let width = |k: usize| -> f64 {
                 if n_k <= 1 {
@@ -283,30 +310,31 @@ fn the_working_grid_carries_the_whole_kernel_at_every_data_point() {
                     (offsets[k + 1] - offsets[k - 1]) * 0.5
                 }
             };
-            let (mut total, mut inside) = (0.0_f64, 0.0_f64);
+            let (mut total, mut outside) = (0.0_f64, 0.0_f64);
             for k in 0..n_k {
                 let (dt, w) = (offsets[k], weights[k]);
                 if w <= 0.0 {
                     continue;
                 }
                 let mass = w * width(k).abs();
-                if dt >= t {
+                let tof_prime = tof_center - dt;
+                if tof_prime <= 0.0 {
                     dropped_past_flight_time += mass;
                     continue;
                 }
                 total += mass;
-                let e_prime = e * (t / (t - dt)).powi(2);
-                if e_prime >= w_lo && e_prime <= w_hi {
-                    inside += mass;
+                let e_prime = (TOF_FACTOR * FLIGHT_PATH_M / tof_prime).powi(2);
+                if e_prime < w_lo || e_prime > w_hi {
+                    outside += mass;
                 }
             }
             assert!(total > 0.0, "{}: no kernel mass at {e} eV", f.label);
             assert!(
-                inside >= RETAINED_KERNEL_MASS * total,
-                "{}: at {e} eV the working grid [{w_lo}, {w_hi}] carries {:.6} of the \
-                 kernel's mass, below {RETAINED_KERNEL_MASS}",
+                outside == 0.0,
+                "{}: at {e} eV the working grid [{w_lo}, {w_hi}] drops {:.3e} of the \
+                 kernel's mass",
                 f.label,
-                inside / total
+                outside / total
             );
         }
         if f.label.contains("past the flight time") {

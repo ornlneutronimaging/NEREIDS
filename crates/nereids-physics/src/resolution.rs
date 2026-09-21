@@ -1293,79 +1293,66 @@ impl TabulatedResolution {
         })
     }
 
-    /// Kernel support at energy `e_ev`, in eV.
-    ///
-    /// Returns the maximum energy offset over which the tabulated
-    /// kernel has non-zero weight at energy `e_ev`.  Past this
-    /// distance the kernel is exactly zero, so the broadening
-    /// footprint at a given target energy is fully contained within
+    /// Kernel support at energy `e_ev`, in eV: the larger of the two
+    /// distances in [`Self::gather_bounds_ev`], which is what a caller wants
+    /// when it pads a window symmetrically.  Past this distance the kernel is
+    /// exactly zero, so the broadening footprint at `e_ev` lies within
     /// `[e_ev − support, e_ev + support]`.
+    ///
+    /// Returns `0.0` for non-positive or non-finite `e_ev`, an empty kernel
+    /// set, or a non-positive flight path.
+    #[must_use]
+    pub fn kernel_support_ev(&self, e_ev: f64) -> f64 {
+        let (lo, hi) = self.gather_bounds_ev(e_ev);
+        (e_ev - lo).max(hi - e_ev).max(0.0)
+    }
+
+    /// The lowest and highest energies the kernel at `e_ev` gathers theory
+    /// from, as `(low, high)` in eV, with `low ≤ e_ev ≤ high`.
     ///
     /// The kernel scanned is the one [`Self::broaden`] applies at `e_ev`:
     /// the reference block on an exact hit, the nearest block outside the
     /// tabulated range, and between references the width-normalized shape
     /// blend of the two bracketing blocks, so a fringe point that carries
-    /// positive blended weight counts.  Its extreme offsets `dt⁺ = max(dt, 0)`
-    /// and `dt⁻ = max(−dt, 0)` over the positive-weight points map through
-    /// the **exact** TOF→E relation `E' = (TOF_FACTOR·L/(t∓dt))²` with
-    /// `t = TOF_FACTOR·L/√E`, and the larger energy excursion is returned:
-    /// `max( E·((t/(t−dt⁺))² − 1), E·(1 − (t/(t+dt⁻))²) )`.  The convolution
-    /// gather reads theory at `t − dt`, so the positive-offset tail reaches
-    /// *up* in energy, and because the map is convex in `t` the up-side
-    /// excursion exceeds the linear chain-rule estimate
-    /// `2·E^{3/2}·dt/(TOF_FACTOR·L)`.
+    /// positive blended weight counts.  Each positive-weight offset maps
+    /// through the gather `E' = (TOF_FACTOR·L/(t − dt))²` with
+    /// `t = TOF_FACTOR·L/√E`, in the same arithmetic the broadening uses, so
+    /// a working grid that ends at these two values contains every point the
+    /// broadening keeps.  The convolution reads theory at `t − dt`, so an
+    /// Ikeda-Carpenter moderator, which emits late, gathers from HIGHER
+    /// energy only, while a mode-anchored table straddles zero and reaches
+    /// both ways.
     ///
-    /// Only kernel points the broadening keeps count. A delayed-emission
+    /// Only kernel points the broadening keeps count.  A delayed-emission
     /// offset that reaches the nominal flight time (`dt ≥ t`) would gather
     /// from past infinite energy; [`Self::broaden`] drops such points and
-    /// renormalizes over the rest, so the reach is that of the surviving
-    /// points and is always finite.
+    /// renormalizes over the rest, so the bounds are those of the surviving
+    /// points and are always finite.
     ///
-    /// Returns `0.0` for non-positive `e_ev`, an empty kernel set, or
-    /// a non-positive flight path.
+    /// Returns `(e_ev, e_ev)` for non-positive or non-finite `e_ev`, an
+    /// empty kernel set, or a non-positive flight path.
     #[must_use]
-    pub fn kernel_support_ev(&self, e_ev: f64) -> f64 {
-        let (below, above) = self.kernel_support_directional_ev(e_ev);
-        above.max(below)
-    }
-
-    /// How far the kernel at `e_ev` reaches, as `(below, above)` in eV.
-    ///
-    /// The two sides are separate numbers because a measured kernel is not
-    /// symmetric: an Ikeda-Carpenter moderator emits late, so its offsets are
-    /// almost all positive and it gathers theory from HIGHER energy only,
-    /// while a mode-anchored table straddles zero and reaches both ways.
-    /// [`Self::kernel_support_ev`] is the larger of the two, which is what a
-    /// caller wants when it pads a window symmetrically.
-    ///
-    /// See [`Self::kernel_support_ev`] for which kernel points count.
-    #[must_use]
-    pub fn kernel_support_directional_ev(&self, e_ev: f64) -> (f64, f64) {
+    pub fn gather_bounds_ev(&self, e_ev: f64) -> (f64, f64) {
         if e_ev <= 0.0 || !e_ev.is_finite() || self.kernels.is_empty() || self.flight_path_m <= 0.0
         {
-            return (0.0, 0.0);
+            return (e_ev, e_ev);
         }
-        let t = TOF_FACTOR * self.flight_path_m / e_ev.sqrt();
-        // The kernel the broadening applies at this energy, whether the
-        // energy hits a reference, falls between two, or lies outside the
-        // tabulated range, so the reach is that of the same points. An
-        // offset at or past the nominal flight time is one the broadening
-        // drops, so it has no reach.
+        let tof_center = TOF_FACTOR * self.flight_path_m / e_ev.sqrt();
         let (offsets, weights) = self.interpolated_kernel(e_ev);
-        let mut max_dt_pos: f64 = 0.0;
-        let mut max_dt_neg: f64 = 0.0;
+        let (mut low, mut high) = (e_ev, e_ev);
         for (&dt, &w) in offsets.iter().zip(weights.iter()) {
-            if w > 0.0 && dt.is_finite() && dt < t {
-                max_dt_pos = max_dt_pos.max(dt);
-                max_dt_neg = max_dt_neg.max(-dt);
+            if w <= 0.0 {
+                continue;
             }
+            let tof_prime = tof_center - dt;
+            if tof_prime <= 0.0 {
+                continue;
+            }
+            let e_prime = (TOF_FACTOR * self.flight_path_m / tof_prime).powi(2);
+            low = low.min(e_prime);
+            high = high.max(e_prime);
         }
-        // Down-side excursion: negative offsets gather at t + dt⁻,
-        // i.e. from lower energy (bounded below by E' → 0).
-        let down = e_ev * (1.0 - (t / (t + max_dt_neg)).powi(2));
-        // Up-side excursion: the positive-offset (delayed-emission)
-        // tail gathers theory at t − dt⁺, i.e. from HIGHER energy.
-        (down, e_ev * ((t / (t - max_dt_pos)).powi(2) - 1.0))
+        (low, high)
     }
 }
 
@@ -1395,12 +1382,6 @@ pub enum ResolutionFunction {
     IkedaCarpenter(Arc<crate::ikeda_carpenter::IkedaCarpenter>),
 }
 
-/// Fraction of a sampled kernel's trapezoidal mass a working grid built by
-/// [`crate::auxiliary_grid::build_extended_grid_for`] carries at every data
-/// point. The grid ends at the energies the last surviving kernel points
-/// gather from, so what it can fail to carry is rounding at its two ends.
-pub const RETAINED_KERNEL_MASS: f64 = 1.0 - 1.0e-6;
-
 /// Widths of Gaussian resolution the broadening limits reach on each side.
 ///
 /// SAMMY Ref: `rsl/mrsl4.f90` `Wdsint`, `Wlow = Wup = Brdlim*Widgau`;
@@ -1418,36 +1399,35 @@ const BRDLIM: f64 = 5.0;
 const GAUSSIAN_LOW_ENERGY_FLOOR_EV: f64 = 0.001;
 
 impl ResolutionFunction {
-    /// How far past the ends of a data window the kernel gathers theory, in
-    /// eV, as `(below e_min, above e_max)`.
+    /// The energies a working grid for the data window `energies` has to
+    /// span, as `(low, high)` in eV with `low ≤ e_min` and `high ≥ e_max`.
     ///
-    /// A broadened value at a point within this reach of a window edge is
-    /// built from theory the window does not contain. Evaluating the model on
-    /// a grid extended by these two distances is what makes the value at the
-    /// edge the same one an infinite window would give.
+    /// A broadened value at a point within the kernel's reach of a window
+    /// edge is built from theory the window does not contain. Evaluating the
+    /// model on a grid that spans these two values is what makes the value
+    /// at the edge the same one an infinite window would give.
     ///
     /// The families differ in what bounds the reach, which is why they differ
     /// here: an analytic Gaussian has unbounded tails and is cut at SAMMY's
     /// five-sigma convention, taken at the two ends of the grid as Escale
     /// does, while a measured or synthesized kernel has exact compact
     /// support that varies with energy in no fixed direction, so every
-    /// target on the grid is asked how far it reaches and the extremes are
-    /// kept.
+    /// target on the grid is asked where it gathers from
+    /// ([`TabulatedResolution::gather_bounds_ev`], in the broadening's own
+    /// arithmetic) and the extremes are kept.
     ///
     /// `energies` is the data grid, ascending. Returns `(0.0, 0.0)` for an
     /// empty grid.
     #[must_use]
-    pub fn boundary_reach_ev(&self, energies: &[f64]) -> (f64, f64) {
+    pub fn grid_bounds_ev(&self, energies: &[f64]) -> (f64, f64) {
         let (Some(&e_min), Some(&e_max)) = (energies.first(), energies.last()) else {
             return (0.0, 0.0);
         };
         let sampled = |table: &TabulatedResolution| {
-            energies
-                .iter()
-                .fold((0.0_f64, 0.0_f64), |(below, above), &e| {
-                    let (b, a) = table.kernel_support_directional_ev(e);
-                    (below.max(e_min - (e - b)), above.max((e + a) - e_max))
-                })
+            energies.iter().fold((e_min, e_max), |(low, high), &e| {
+                let (l, h) = table.gather_bounds_ev(e);
+                (low.min(l), high.max(h))
+            })
         };
         match self {
             Self::Gaussian(params) => {
@@ -1472,7 +1452,7 @@ impl ResolutionFunction {
                 let below = (BRDLIM * params.gaussian_width(e_min))
                     .min(e_min - GAUSSIAN_LOW_ENERGY_FLOOR_EV)
                     .max(0.0);
-                (below, above)
+                (e_min - below, e_max + above)
             }
             Self::Tabulated(tabulated) => sampled(tabulated),
             Self::IkedaCarpenter(ic) => sampled(ic.tabulated()),
@@ -5415,7 +5395,8 @@ Resolution file
         let t = t_at(e);
         assert!(t > 2.0, "fixture must keep the 2 μs point (t = {t})");
         let expected_above = e * ((t / (t - 2.0)).powi(2) - 1.0);
-        let (_, above) = r.kernel_support_directional_ev(e);
+        let (_, high) = r.gather_bounds_ev(e);
+        let above = high - e;
         assert!(above.is_finite(), "reach must be finite, got {above}");
         assert!(
             (above - expected_above).abs() <= 1e-9 * expected_above,
@@ -5443,7 +5424,8 @@ Resolution file
             "fixture must drop the 80 μs point and keep the 20 μs point (t = {t})"
         );
         let expected_above = e * ((t / (t - 20.0)).powi(2) - 1.0);
-        let (_, above) = r.kernel_support_directional_ev(e);
+        let (_, high) = r.gather_bounds_ev(e);
+        let above = high - e;
         assert!(
             (above - expected_above).abs() <= 1e-9 * expected_above,
             "reach {above} should be that of the last surviving offset, {expected_above}"

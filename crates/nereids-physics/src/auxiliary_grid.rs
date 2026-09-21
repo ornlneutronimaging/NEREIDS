@@ -91,10 +91,10 @@ pub fn build_extended_grid_boundary_only(
 
 /// Extend a data grid past both ends by the reach of any resolution family.
 ///
-/// Boundary extension only: the intermediate points and Fspken fine structure
-/// that [`build_extended_grid`] adds are quadrature devices for the PW-linear
-/// Gaussian path, not a property of the kernel, and the other families do not
-/// use that path.
+/// Boundary extension only. The intermediate points [`build_extended_grid`]
+/// adds are a quadrature device of the PW-linear Gaussian path, and its
+/// Fspken fine structure around narrow resonances is built for the Gaussian
+/// family alone.
 pub fn build_extended_grid_for(
     data_energies: &[f64],
     resolution: &ResolutionFunction,
@@ -103,7 +103,7 @@ pub fn build_extended_grid_for(
         let indices: Vec<usize> = (0..data_energies.len()).collect();
         return (data_energies.to_vec(), indices);
     }
-    let (extend_low, extend_high) = resolution.boundary_reach_ev(data_energies);
+    let (low, high) = resolution.grid_bounds_ev(data_energies);
     let spacing = match resolution {
         // The Gaussian's width is an energy; SAMMY's velocity-spaced grid
         // resolves it.
@@ -114,7 +114,7 @@ pub fn build_extended_grid_for(
             Spacing::TimeOfFlight
         }
     };
-    extend_boundaries(data_energies, extend_low, extend_high, spacing)
+    extend_boundaries(data_energies, low, high, spacing)
 }
 
 /// The variable in which the added boundary points are evenly spaced.
@@ -149,7 +149,9 @@ impl Spacing {
 
 /// Push the points stepping outward from `e_edge` to `target_e`, evenly
 /// spaced in `spacing` at the average spacing of the `n_ref` data points from
-/// `e_edge` to `e_ref`, and ending at `target_e` itself.
+/// `e_edge` to `e_ref`, and ending at `target_e` itself.  A lattice point
+/// the merge would not tell apart from the target is left out, so the
+/// target is the point that survives.
 fn step_outward(
     spacing: Spacing,
     e_edge: f64,
@@ -159,22 +161,23 @@ fn step_outward(
     grid: &mut Vec<f64>,
 ) {
     let u_edge = spacing.to_u(e_edge);
+    let u_target = spacing.to_u(target_e);
     let step = (u_edge - spacing.to_u(e_ref)) / (n_ref as f64 - 1.0).max(1.0);
-    let steps = (spacing.to_u(target_e) - u_edge) / step;
+    let steps = (u_target - u_edge) / step;
     if step.abs() <= 1e-30 || !steps.is_finite() || steps <= 0.0 {
         return;
     }
-    let n_between = steps.floor() as usize;
+    let n_between = (steps - MERGE_RELATIVE_TOL * (u_target / step).abs()).floor() as usize;
     grid.extend((1..=n_between).map(|k| spacing.to_e(u_edge + step * k as f64)));
     grid.push(target_e);
 }
 
-/// Extend a grid past both ends by `extend_low` and `extend_high` eV, at the
-/// edge spacing of the data itself.
+/// Extend a grid so it spans `[low, high]`, at the edge spacing of the data
+/// itself, ending exactly at `low` and `high`.
 fn extend_boundaries(
     data_energies: &[f64],
-    extend_low: f64,
-    extend_high: f64,
+    low: f64,
+    high: f64,
     spacing: Spacing,
 ) -> (Vec<f64>, Vec<usize>) {
     let n = data_energies.len();
@@ -183,32 +186,38 @@ fn extend_boundaries(
     let n_ref = N_BOUNDARY_REF.min(n);
     let mut grid = Vec::with_capacity(n + 200);
 
-    if extend_low > 0.0 && e_min > 0.0 {
+    if low < e_min && e_min > 0.0 {
         step_outward(
             spacing,
             e_min,
             data_energies[n_ref - 1],
             n_ref,
-            e_min - extend_low,
+            low,
             &mut grid,
         );
     }
 
     grid.extend_from_slice(data_energies);
 
-    if extend_high > 0.0 {
+    if high > e_max {
         step_outward(
             spacing,
             e_max,
             data_energies[n - n_ref],
             n_ref,
-            e_max + extend_high,
+            high,
             &mut grid,
         );
     }
 
     grid.sort_unstable_by(|a, b| a.total_cmp(b));
     dedup(&mut grid);
+    // The merge keeps the lower of two points it cannot tell apart, so only
+    // the high end can lose its target, to a data point it lies within the
+    // merge tolerance of.
+    if high > *grid.last().expect("grid holds the data") {
+        grid.push(high);
+    }
     let indices = build_data_indices(&grid, data_energies);
     (grid, indices)
 }
@@ -235,10 +244,8 @@ fn build_extended_grid_inner(
     };
 
     // ── Step 1: Boundary extension ──────────────────────────────────────
-    let (extend_low, extend_high) =
-        ResolutionFunction::Gaussian(*res).boundary_reach_ev(data_energies);
-    let (mut grid, _) =
-        extend_boundaries(data_energies, extend_low, extend_high, Spacing::SqrtEnergy);
+    let (low, high) = ResolutionFunction::Gaussian(*res).grid_bounds_ev(data_energies);
+    let (mut grid, _) = extend_boundaries(data_energies, low, high, Spacing::SqrtEnergy);
 
     // ── Step 2: Adaptive intermediate points ────────────────────────────
     // Insert intermediate points where the grid spacing exceeds a fraction
@@ -631,6 +638,41 @@ mod tests {
         }
         // Both resonances are far outside data range, should have same grid.
         assert_eq!(ext_without.len(), ext_with.len());
+    }
+
+    /// The grid ends exactly at the bounds it was asked to span, even when
+    /// a lattice point or the last data point lies within the merge
+    /// tolerance of that end.
+    #[test]
+    fn grid_ends_exactly_at_its_bounds_through_the_merge() {
+        let data: Vec<f64> = (0..5).map(|i| 100.0 + f64::from(i)).collect();
+        let e_min = data[0];
+        let e_max = data[4];
+        // A high end seven lattice steps out plus a sliver the merge cannot
+        // resolve, in each spacing.
+        for spacing in [Spacing::SqrtEnergy, Spacing::TimeOfFlight] {
+            let u_max = spacing.to_u(e_max);
+            let step = (u_max - spacing.to_u(data[0])) / 4.0;
+            let high = spacing.to_e(u_max + 7.0 * step * (1.0 + 3.0e-11));
+            let (grid, indices) = extend_boundaries(&data, e_min, high, spacing);
+            assert_eq!(*grid.last().unwrap(), high);
+            assert_eq!(grid.len(), data.len() + 7);
+            assert_eq!(indices, vec![0, 1, 2, 3, 4]);
+
+            let u_min = spacing.to_u(e_min);
+            let step = (spacing.to_u(data[4]) - u_min) / 4.0;
+            let low = spacing.to_e(u_min - 7.0 * step * (1.0 + 3.0e-11));
+            let (grid, indices) = extend_boundaries(&data, low, e_max, spacing);
+            assert_eq!(grid[0], low);
+            assert_eq!(grid.len(), data.len() + 7);
+            assert_eq!(indices, vec![7, 8, 9, 10, 11]);
+        }
+        // A high end the merge would fold into the last data point.
+        let high = e_max * (1.0 + 5.0e-11);
+        let (grid, indices) = extend_boundaries(&data, e_min, high, Spacing::SqrtEnergy);
+        assert_eq!(*grid.last().unwrap(), high);
+        assert_eq!(grid.len(), data.len() + 1);
+        assert_eq!(indices, vec![0, 1, 2, 3, 4]);
     }
 
     /// A delayed tail that approaches the nominal flight time does not
