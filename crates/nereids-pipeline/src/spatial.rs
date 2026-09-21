@@ -1247,15 +1247,13 @@ pub fn spatial_map_typed(
     // Precompute cross-sections once (shared across all pixels).
     //
     // Issue #608: broaden σ on the WORKING grid (auxiliary extended grid when a
-    // Gaussian resolution function is active, else the data grid) so each
-    // per-pixel `PrecomputedTransmissionModel` applies Beer-Lambert +
-    // resolution on the working grid and extracts the data points last —
-    // matching `forward_model`.  `xs` (data-grid σ) is still needed for the
-    // cubature / scalar surrogate builders and shape validation; `work_xs`
-    // carries the working-grid σ.  For tabulated / no resolution the working
-    // grid IS the data grid, the layout is the identity, and `work_xs` is left
-    // unset (the model falls back to the data-grid σ, preserving the surrogate
-    // fast paths byte-for-byte).
+    // kernel reaches past the data, else the data grid) so each per-pixel
+    // `PrecomputedTransmissionModel` applies Beer-Lambert + resolution on
+    // the working grid and extracts the data points last — matching
+    // `forward_model`.  `xs` (data-grid σ) is still needed for shape
+    // validation; `work_xs` carries the working-grid σ.  When the layout is
+    // the identity `work_xs` is left unset and the model uses the data-grid
+    // σ directly.
     let instrument = config.resolution().map(|r| InstrumentParams {
         resolution: r.clone(),
     });
@@ -1263,12 +1261,10 @@ pub fn spatial_map_typed(
     // Determine the working-grid layout FIRST, cheaply (no Doppler
     // broadening): `resolution_working_grid` only builds the auxiliary grid
     // geometry (boundary extension + resonance fine-structure) — it does NOT
-    // evaluate or broaden σ.  When the layout is the identity (tabulated / no
-    // resolution) the working grid IS the data grid, so no working-grid σ is
-    // needed and we must NOT pay for the full per-isotope
-    // `broadened_cross_sections_on_working_grid` just to discover the layout
-    // is trivial.  Only the genuine Gaussian aux-grid case below runs the
-    // expensive broadening.
+    // evaluate or broaden σ.  When the layout is the identity the working
+    // grid IS the data grid, so no working-grid σ is needed and we must NOT
+    // pay for the full per-isotope `broadened_cross_sections_on_working_grid`
+    // just to discover the layout is trivial.
     let rd_refs: Vec<&_> = config.resonance_data().iter().collect();
     let layout = nereids_physics::transmission::resolution_working_grid(
         config.energies(),
@@ -1280,11 +1276,11 @@ pub fn spatial_map_typed(
 
     // (xs = data-grid σ, work_xs = working-grid σ when an aux grid exists).
     let (xs, work_xs) = match config.precomputed_cross_sections().cloned() {
-        // Caller supplied data-grid σ.  When a Gaussian aux grid exists we
-        // still need working-grid σ for the #608-correct path, so recompute it
-        // from resonance data (the data-grid σ alone cannot be de-extracted
-        // back onto the aux grid).  When no aux grid exists the supplied σ is
-        // already the working-grid σ and we skip Doppler broadening entirely.
+        // Caller supplied data-grid σ.  When the grid is extended the model
+        // needs working-grid σ, so recompute it from resonance data (the
+        // data-grid σ alone cannot be de-extracted back onto the working
+        // grid).  When the grid is not extended the supplied σ is already the
+        // working-grid σ and Doppler broadening is skipped entirely.
         Some(cached) if !aux_grid_active => (cached, None),
         Some(cached) => {
             let working = broadened_cross_sections_on_working_grid(
@@ -1320,9 +1316,9 @@ pub fn spatial_map_typed(
     };
 
     // Working-grid layout (energies + data-index map) shared across pixels,
-    // reusing the layout computed above.  Only attached when a Gaussian aux
-    // grid is active so the per-pixel precomputed model extracts data points
-    // after resolution; `None` for tabulated / no resolution.
+    // reusing the layout computed above.  Only attached when the grid is
+    // extended so the per-pixel precomputed model extracts data points after
+    // resolution; `None` when the working grid is the data grid.
     let work_layout: Option<Arc<nereids_physics::transmission::WorkingGridLayout>> =
         if work_xs.is_some() {
             Some(Arc::new(layout))
@@ -1356,6 +1352,14 @@ pub fn spatial_map_typed(
     let xs = collapse(&xs);
     let work_xs = work_xs.as_ref().map(collapse);
 
+    // The plan and the surrogates compiled from it live on the grid the
+    // broadening is applied to: the working grid whenever it was extended,
+    // the data grid otherwise. Their σ is the σ on that same grid.
+    let plan_grid: &[f64] = work_layout
+        .as_ref()
+        .map_or(config.energies(), |l| l.energies.as_slice());
+    let plan_xs: &Arc<Vec<Vec<f64>>> = work_xs.as_ref().unwrap_or(&xs);
+
     // Build the resolution broadening plan once for the shared grid.
     //
     // The plan is valid for any per-pixel fit that applies resolution
@@ -1388,22 +1392,13 @@ pub fn spatial_map_typed(
                 // applied to: a kernel that reaches past the data ends gets
                 // an extended one, and a plan compiled for the data grid
                 // would be rejected there.
-                Some(res) => {
-                    let work = nereids_physics::transmission::resolution_working_grid(
-                        config.energies(),
-                        Some(&nereids_physics::transmission::InstrumentParams {
-                            resolution: res.clone(),
-                        }),
-                        &rd_refs,
-                    )?;
-                    build_resolution_plan(&work.energies, res)
-                        .map_err(|e| {
-                            PipelineError::Transmission(
-                                nereids_physics::transmission::TransmissionError::from(e),
-                            )
-                        })?
-                        .map(Arc::new)
-                }
+                Some(res) => build_resolution_plan(plan_grid, res)
+                    .map_err(|e| {
+                        PipelineError::Transmission(
+                            nereids_physics::transmission::TransmissionError::from(e),
+                        )
+                    })?
+                    .map(Arc::new),
                 None => None,
             }
         } else {
@@ -1433,17 +1428,17 @@ pub fn spatial_map_typed(
         if !config.fit_temperature()
             && !config.fit_energy_scale()
             && resolution_plan.is_some()
-            && xs.len() >= 2
+            && plan_xs.len() >= 2
         {
             let plan = resolution_plan.as_deref().expect("guarded above");
             let matrix = plan.compile_to_matrix();
-            let k = xs.len();
+            let k = plan_xs.len();
             let n_rows = matrix.len();
-            // Flatten xs (Vec<Vec<f64>> of shape [k][n_rows]) into the
+            // Flatten σ (Vec<Vec<f64>> of shape [k][n_rows]) into the
             // row-major `sigmas[j * n_rows + ℓ]` layout the cubature
             // builder expects.
             let mut sigmas_flat = Vec::with_capacity(k * n_rows);
-            for row in xs.iter() {
+            for row in plan_xs.iter() {
                 if row.len() != n_rows {
                     // Shape mismatch — surrender cubature, fall back.
                     sigmas_flat.clear();
@@ -1530,9 +1525,7 @@ pub fn spatial_map_typed(
     // attachments across the setter chain below.
     let sparse_cubature_plan = sparse_cubature_plan.or_else(|| {
         caller_cubature.filter(|p| {
-            p.len() == xs.first().map(|r| r.len()).unwrap_or(0)
-                && p.k() == xs.len()
-                && p.target_energies() == config.energies()
+            p.len() == plan_grid.len() && p.k() == plan_xs.len() && p.target_energies() == plan_grid
         })
     });
 
@@ -1554,9 +1547,9 @@ pub fn spatial_map_typed(
         if let Some(plan) = resolution_plan.as_ref()
             && !config.fit_temperature()
             && !config.fit_energy_scale()
-            && xs.len() == 1
+            && plan_xs.len() == 1
         {
-            let sigma_row = &xs[0];
+            let sigma_row = &plan_xs[0];
             // Chebyshev-in-density at M = 16 (bench-off winner).
             // Training box: 2 × the initial density;
             // Chebyshev's interpolant is exact at its nodes and
@@ -1597,18 +1590,12 @@ pub fn spatial_map_typed(
     // the caller-fallback pre-filter.
     let sparse_scalar_plan = sparse_scalar_plan.or_else(|| {
         caller_scalar.filter(|p| {
-            let expected_len = xs.first().map(|r| r.len()).unwrap_or(0);
-            if p.len() != expected_len {
+            if p.len() != plan_grid.len() {
                 return false;
             }
-            let plan_grid = p.target_energies();
-            let cfg_grid = config.energies();
-            if plan_grid.len() != cfg_grid.len() {
-                return false;
-            }
-            plan_grid
+            p.target_energies()
                 .iter()
-                .zip(cfg_grid)
+                .zip(plan_grid)
                 .all(|(a, b)| a.to_bits() == b.to_bits())
         })
     });
@@ -1649,12 +1636,11 @@ pub fn spatial_map_typed(
         let mut cfg = cfg
             .with_precomputed_cross_sections(xs)
             .with_compute_covariance(true);
-        // Issue #608: attach the working-grid σ + layout for the Gaussian
-        // aux-grid path so each per-pixel `PrecomputedTransmissionModel` applies
-        // resolution on the working grid and extracts the data points last.
-        // `with_precomputed_cross_sections` (above) clears any stale work σ, so
-        // this must come AFTER it.  `None` for tabulated / no resolution (the
-        // model uses the data-grid σ directly).
+        // Issue #608: attach the working-grid σ + layout whenever the grid
+        // was extended, so each per-pixel `PrecomputedTransmissionModel`
+        // applies resolution on the working grid and extracts the data
+        // points last.  `with_precomputed_cross_sections` (above) clears any
+        // stale work σ, so this must come AFTER it.
         if let (Some(work_xs), Some(layout)) = (work_xs.clone(), work_layout.clone()) {
             cfg = cfg.with_precomputed_work_cross_sections(work_xs, layout);
         }

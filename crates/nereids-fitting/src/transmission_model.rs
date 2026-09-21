@@ -60,11 +60,10 @@ pub struct PrecomputedTransmissionModel {
     ///   apply Beer-Lambert + resolution on this working grid and extract the
     ///   data points LAST via `work_layout.extract(..)` — matching
     ///   `forward_model` (issue #608).
-    /// * `work_layout` is `None` (tabulated resolution, or no resolution): the
-    ///   working grid IS the data grid, so σ live on the **data grid**
-    ///   (`energies`), with `n_grid_energies == energies.len()`.  No extraction
-    ///   is needed and the surrogate fast paths + data-grid `resolution_plan`
-    ///   behave exactly as before.
+    /// * `work_layout` is `None` (no resolution, or a kernel whose reach at
+    ///   both ends is shorter than the grid's own edge spacing): the working
+    ///   grid IS the data grid, so σ live on the **data grid** (`energies`),
+    ///   with `n_grid_energies == energies.len()` and no extraction.
     pub cross_sections: Arc<Vec<Vec<f64>>>,
     /// Mapping: `params[density_indices[i]]` is the density of isotope `i`.
     ///
@@ -117,14 +116,13 @@ pub struct PrecomputedTransmissionModel {
     pub sparse_scalar_plan: Option<Arc<ScalarSurrogatePlan>>,
     /// Working-grid layout matching [`cross_sections`](Self::cross_sections).
     ///
-    /// Issue #608: when `cross_sections` is stored on the auxiliary extended
-    /// grid (Gaussian resolution), this maps the working grid back to the data
-    /// grid so `evaluate()` / `analytical_jacobian()` apply resolution on the
+    /// When `cross_sections` is stored on the working grid (the data grid
+    /// extended by the kernel's reach, plus the fine-structure points under a
+    /// Gaussian resolution), this maps the working grid back to the data grid
+    /// so `evaluate()` / `analytical_jacobian()` apply resolution on the
     /// working grid and extract the data points last.  `None` ⇒ the working
-    /// grid is the data grid (tabulated / no resolution): Beer-Lambert and
-    /// resolution run directly on `energies` and no extraction is needed, which
-    /// keeps the surrogate fast paths and the data-grid `resolution_plan`
-    /// byte-identical to before.
+    /// grid is the data grid: Beer-Lambert and resolution run directly on
+    /// `energies` and no extraction is needed.
     pub work_layout: Option<Arc<transmission::WorkingGridLayout>>,
 }
 
@@ -410,9 +408,9 @@ fn cubature_eligible(
 impl PrecomputedTransmissionModel {
     /// Working-grid energies for resolution broadening (issue #608).
     ///
-    /// Returns the auxiliary extended grid when `work_layout` is set (Gaussian
-    /// resolution), otherwise the data grid (`energies`).  Returns `None` only
-    /// when no instrument is configured (Beer-Lambert-only path).
+    /// Returns the extended grid when `work_layout` is set, otherwise the data
+    /// grid (`energies`).  Returns `None` only when no instrument is
+    /// configured (Beer-Lambert-only path).
     fn work_energies(&self) -> Option<&[f64]> {
         match (&self.work_layout, &self.energies) {
             (Some(layout), _) => Some(layout.energies.as_slice()),
@@ -446,9 +444,11 @@ impl FitModel for PrecomputedTransmissionModel {
         // the grid + isotope count, and instrument resolution is
         // enabled (cubature folds both `exp(-Σ n σ)` and `apply_R`
         // into a single per-row atom sweep).
-        if let (Some(cubature), Some(inst), Some(energies)) =
-            (&self.sparse_cubature_plan, &self.instrument, &self.energies)
-        {
+        if let (Some(cubature), Some(inst), Some(energies)) = (
+            &self.sparse_cubature_plan,
+            &self.instrument,
+            self.work_energies(),
+        ) {
             let params_indices = density_param_indices(&self.density_indices);
             if cubature_eligible(
                 cubature,
@@ -459,7 +459,7 @@ impl FitModel for PrecomputedTransmissionModel {
             ) {
                 let n: Vec<f64> = params_indices.iter().map(|&i| params[i]).collect();
                 if density_within_box(cubature, &n) {
-                    return Ok(cubature.forward(&n));
+                    return Ok(self.extract_data_points(&cubature.forward(&n)));
                 }
                 // Density escaped the training box — fall through
                 // to the exact path (cubature accuracy degrades
@@ -472,9 +472,11 @@ impl FitModel for PrecomputedTransmissionModel {
         // The content-identity guards
         // (σ-fingerprint + Arc::ptr_eq on source resolution plan)
         // close the same-grid stale-plan hole.
-        if let (Some(scalar), Some(inst), Some(energies)) =
-            (&self.sparse_scalar_plan, &self.instrument, &self.energies)
-        {
+        if let (Some(scalar), Some(inst), Some(energies)) = (
+            &self.sparse_scalar_plan,
+            &self.instrument,
+            self.work_energies(),
+        ) {
             let params_indices = density_param_indices(&self.density_indices);
             // Only fire when the σ stack is the single collapsed
             // row the scalar plan was built from (spatial's
@@ -494,15 +496,15 @@ impl FitModel for PrecomputedTransmissionModel {
             {
                 let n = params[params_indices[0]];
                 if scalar_density_within_box(scalar, n) {
-                    return Ok(scalar.forward_scalar(n));
+                    return Ok(self.extract_data_points(&scalar.forward_scalar(n)));
                 }
             }
         }
 
         // Beer-Lambert on the WORKING grid (issue #608): `cross_sections` are
-        // stored on the working grid (auxiliary extended grid for Gaussian
-        // resolution; the data grid for tabulated / no resolution), so `n_e`
-        // is the working-grid length.
+        // stored on the working grid (the extended grid when the kernel
+        // reaches past the data; the data grid otherwise), so `n_e` is the
+        // working-grid length.
         let mut neg_opt = vec![0.0f64; n_e];
         // #109.1: No density > 0 guard — let Beer-Lambert handle all densities
         // naturally.  exp(−n·σ) is well-defined for negative n (gives T > 1,
@@ -520,10 +522,9 @@ impl FitModel for PrecomputedTransmissionModel {
 
         // Issue #442 + #608: apply resolution broadening to the total
         // transmission AFTER Beer-Lambert, on the WORKING grid, then extract
-        // the data points LAST.  When `work_layout` is `None` (tabulated / no
-        // resolution) the working grid IS the data grid (`self.energies`), the
-        // extraction is the identity, and the data-grid `resolution_plan` still
-        // matches — byte-identical to the pre-#608 path.
+        // the data points LAST.  When `work_layout` is `None` the working
+        // grid IS the data grid (`self.energies`) and the extraction is the
+        // identity.
         // Resolution applies iff there is an instrument AND a working grid to
         // apply it on (`work_energies()` = the layout grid when present, else the
         // data grid).  `evaluate` and `analytical_jacobian` share this exact
@@ -566,15 +567,23 @@ impl FitModel for PrecomputedTransmissionModel {
             self.cross_sections[0].len()
         };
         let n_free = free_param_indices.len();
+        // Surrogates answer on the working grid; the Jacobian is over the
+        // data points, so their rows are read through the layout.
+        let data_rows: Vec<usize> = match &self.work_layout {
+            Some(layout) => layout.data_indices.clone(),
+            None => (0..n_e).collect(),
+        };
 
         // Cubature fast path: same eligibility as `evaluate()` plus
         // the requirement that every free param is a density param
         // (cubature can't produce Jacobian columns for non-density
         // params like background / normalization, which are the
         // calling layer's responsibility).
-        if let (Some(cubature), Some(inst), Some(energies)) =
-            (&self.sparse_cubature_plan, &self.instrument, &self.energies)
-        {
+        if let (Some(cubature), Some(inst), Some(energies)) = (
+            &self.sparse_cubature_plan,
+            &self.instrument,
+            self.work_energies(),
+        ) {
             let params_indices = density_param_indices(&self.density_indices);
             if cubature_eligible(
                 cubature,
@@ -600,10 +609,10 @@ impl FitModel for PrecomputedTransmissionModel {
                         let (_t, jac_flat) = cubature.forward_and_jacobian(&n);
                         // jac_flat[i * k + ell] = ∂T_i / ∂n_ell
                         let k = params_indices.len();
-                        let mut jacobian = FlatMatrix::zeros(n_e, n_free);
+                        let mut jacobian = FlatMatrix::zeros(data_rows.len(), n_free);
                         for (col, &ell) in col_map.iter().enumerate() {
-                            for i in 0..n_e {
-                                *jacobian.get_mut(i, col) = jac_flat[i * k + ell];
+                            for (row, &i) in data_rows.iter().enumerate() {
+                                *jacobian.get_mut(row, col) = jac_flat[i * k + ell];
                             }
                         }
                         return Some(jacobian);
@@ -616,9 +625,11 @@ impl FitModel for PrecomputedTransmissionModel {
         // Scalar (k = 1) surrogate Jacobian fast path.  For a
         // scalar fit `free_param_indices = [0]`, so
         // the Jacobian has one column.
-        if let (Some(scalar), Some(inst), Some(energies)) =
-            (&self.sparse_scalar_plan, &self.instrument, &self.energies)
-        {
+        if let (Some(scalar), Some(inst), Some(energies)) = (
+            &self.sparse_scalar_plan,
+            &self.instrument,
+            self.work_energies(),
+        ) {
             let params_indices = density_param_indices(&self.density_indices);
             if self.cross_sections.len() == 1
                 && self.density_indices.len() == 1
@@ -637,9 +648,9 @@ impl FitModel for PrecomputedTransmissionModel {
                 let n = params[params_indices[0]];
                 if scalar_density_within_box(scalar, n) {
                     let (_t, dt) = scalar.forward_and_derivative_scalar(n);
-                    let mut jacobian = FlatMatrix::zeros(n_e, 1);
-                    for (i, &v) in dt.iter().enumerate() {
-                        *jacobian.get_mut(i, 0) = v;
+                    let mut jacobian = FlatMatrix::zeros(data_rows.len(), 1);
+                    for (row, &i) in data_rows.iter().enumerate() {
+                        *jacobian.get_mut(row, 0) = dt[i];
                     }
                     return Some(jacobian);
                 }
@@ -960,9 +971,16 @@ impl FitModel for TransmissionFitModel {
             && self.temperature_index.is_none()
         {
             let params_indices = density_param_indices(&self.density_indices);
+            let rd_refs: Vec<&ResonanceData> = self.resonance_data.iter().collect();
+            let layout = transmission::resolution_working_grid(
+                &self.energies,
+                Some(inst.as_ref()),
+                &rd_refs,
+            )
+            .map_err(|e| FittingError::EvaluationFailed(e.to_string()))?;
             if cubature_eligible(
                 cubature,
-                &self.energies,
+                &layout.energies,
                 &inst.resolution,
                 self.resolution_plan.as_deref(),
                 params_indices.len(),
@@ -975,7 +993,7 @@ impl FitModel for TransmissionFitModel {
                 // pre-aggregated atoms internally.
                 let n: Vec<f64> = params_indices.iter().map(|&i| params[i]).collect();
                 if density_within_box(cubature, &n) {
-                    return Ok(cubature.forward(&n));
+                    return Ok(layout.extract(&cubature.forward(&n)));
                 }
                 // Density escaped training box → fall through.
             }
@@ -1147,9 +1165,16 @@ impl FitModel for TransmissionFitModel {
             && self.temperature_index.is_none()
         {
             let params_indices = density_param_indices(&self.density_indices);
+            let rd_refs: Vec<&ResonanceData> = self.resonance_data.iter().collect();
+            let layout = transmission::resolution_working_grid(
+                &self.energies,
+                Some(inst.as_ref()),
+                &rd_refs,
+            )
+            .ok()?;
             if cubature_eligible(
                 cubature,
-                &self.energies,
+                &layout.energies,
                 &inst.resolution,
                 self.resolution_plan.as_deref(),
                 params_indices.len(),
@@ -1166,11 +1191,11 @@ impl FitModel for TransmissionFitModel {
                         // exact analytical Jacobian below.
                         let (_t, jac_flat) = cubature.forward_and_jacobian(&n);
                         let k = params_indices.len();
-                        let n_e = self.energies.len();
-                        let mut jacobian = FlatMatrix::zeros(n_e, free_param_indices.len());
+                        let rows = &layout.data_indices;
+                        let mut jacobian = FlatMatrix::zeros(rows.len(), free_param_indices.len());
                         for (col, &ell) in col_map.iter().enumerate() {
-                            for i in 0..n_e {
-                                *jacobian.get_mut(i, col) = jac_flat[i * k + ell];
+                            for (row, &i) in rows.iter().enumerate() {
+                                *jacobian.get_mut(row, col) = jac_flat[i * k + ell];
                             }
                         }
                         return Some(jacobian);
@@ -1665,8 +1690,8 @@ impl<M: FitModel> FitModel for NormalizedTransmissionModel<M> {
 ///   2. Apply calibration: `t_corr = t - t₀`,
 ///      `E_corr = (TOF_FACTOR * L * L_scale / t_corr)²`
 ///   3. Evaluate σ(E_corr) directly via `reich_moore` + Doppler on a working
-///      grid built from `E_corr` (auxiliary extended grid under Gaussian
-///      resolution; `E_corr` itself for tabulated / no resolution) — NOT
+///      grid built from `E_corr` (extended by the kernel's reach, and by the
+///      fine-structure points under a Gaussian resolution) — NOT
 ///      interpolation of a fixed σ grid, which clamps at the auxiliary
 ///      boundary and drops resonance fine-structure.
 ///   4. Beer-Lambert + resolution on the working grid, then extract the data
@@ -2161,8 +2186,9 @@ impl EnergyScaleTransmissionModel {
     /// Doppler-broadens there.  The corrected grid is re-derived per
     /// `(t0, L_scale)` probe, so the working grid + σ are rebuilt each call —
     /// the only way to reproduce SAMMY's σ(E_corr) under the energy-scale shift
-    /// (boundary + fine-structure fidelity).  For tabulated / no resolution the
-    /// working grid is `e_corr` itself with an identity layout.
+    /// (boundary + fine-structure fidelity).  When the kernel does not reach
+    /// past the data the working grid is `e_corr` itself with an identity
+    /// layout.
     fn working_xs(
         &self,
         e_corr: &[f64],
@@ -2289,8 +2315,8 @@ impl EnergyScaleTransmissionModel {
         use_plan_cache: bool,
     ) -> Result<Vec<f64>, FittingError> {
         // Issue #608: evaluate the TRUE σ at the corrected energies on the
-        // working grid (auxiliary extended grid for Gaussian resolution; the
-        // data grid for tabulated / no resolution) — reich_moore + Doppler on
+        // working grid (the extended grid when the kernel reaches past the
+        // data; the data grid otherwise) — reich_moore + Doppler on
         // the working grid, Beer-Lambert, resolution, extract the data points
         // last — exactly as `forward_model` does.  This replaces interpolating
         // a precomputed σ, which clamped at the auxiliary boundary and dropped
@@ -2467,9 +2493,9 @@ impl FitModel for EnergyScaleTransmissionModel {
             None
         };
 
-        // Issue #608: density columns are formed on the WORKING grid (auxiliary
-        // extended grid for Gaussian resolution; `e_corr` for tabulated / no
-        // resolution) from the TRUE σ at the corrected energies (reich_moore +
+        // Issue #608: density columns are formed on the WORKING grid (`e_corr`
+        // extended by the kernel's reach) from the TRUE σ at the corrected
+        // energies (reich_moore +
         // Doppler), resolution-broadened there, and the data points extracted
         // last — matching `forward_model` and `evaluate`.
         let work = match self.working_xs_for(params, &e_corr) {

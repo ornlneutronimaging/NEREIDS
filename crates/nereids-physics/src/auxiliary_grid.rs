@@ -24,7 +24,8 @@ use nereids_core::constants::NEAR_ZERO_FLOOR;
 
 /// Number of boundary data points used to compute extension spacing.
 ///
-/// SAMMY Ref: `dat/mdat4.f90` Escale lines 56-97
+/// SAMMY Ref: `dat/mdat4.f90` Escale lines 56-97 for the spacing; the
+/// amounts come from `rsl/mrsl4.f90` Wdsint
 const N_BOUNDARY_REF: usize = 5;
 
 /// Relative tolerance for duplicate detection during grid merge.
@@ -101,8 +102,7 @@ pub fn build_extended_grid_for(
         let indices: Vec<usize> = (0..data_energies.len()).collect();
         return (data_energies.to_vec(), indices);
     }
-    let (extend_low, extend_high) =
-        resolution.boundary_reach_ev(data_energies[0], data_energies[data_energies.len() - 1]);
+    let (extend_low, extend_high) = resolution.boundary_reach_ev(data_energies);
     extend_boundaries(data_energies, extend_low, extend_high)
 }
 
@@ -126,7 +126,7 @@ fn extend_boundaries(
         let d_sqrt = (e_ref.sqrt() - e_min.sqrt()) / (n_ref as f64 - 1.0).max(1.0);
 
         if d_sqrt > 1e-30 {
-            let target_low = (e_min - extend_low).max(0.001);
+            let target_low = e_min - extend_low;
             let sqrt_min = e_min.sqrt();
             let sqrt_target = target_low.sqrt();
             let n_ext = ((sqrt_min - sqrt_target) / d_sqrt).ceil() as usize;
@@ -147,14 +147,13 @@ fn extend_boundaries(
         let d_sqrt = (e_max.sqrt() - e_ref.sqrt()) / (n_ref as f64 - 1.0).max(1.0);
 
         if d_sqrt > 1e-30 {
-            // A kernel whose delayed tail reaches the nominal flight time
-            // states an unbounded reach; the grid carries what it can, which
-            // is the same clamp the low side makes against E -> 0.
-            let target_high = if extend_high.is_finite() {
-                e_max + extend_high
-            } else {
-                e_max + (e_max - e_min).max(e_max)
-            };
+            // A delayed tail approaching the nominal flight time maps to
+            // energies without bound while carrying almost no mass. The
+            // grid is a finite object: past one window length (or one
+            // e_max, whichever is longer) the kernel points that map there
+            // are dropped and the survivors renormalized, exactly as at any
+            // grid edge.
+            let target_high = e_max + extend_high.min((e_max - e_min).max(e_max));
             let sqrt_max = e_max.sqrt();
             let sqrt_target = target_high.sqrt();
             let n_ext = ((sqrt_target - sqrt_max) / d_sqrt).ceil() as usize;
@@ -192,11 +191,9 @@ fn build_extended_grid_inner(
         }
     };
 
-    let n = data_energies.len();
-
     // ── Step 1: Boundary extension ──────────────────────────────────────
-    let (extend_low, extend_high) = ResolutionFunction::Gaussian(*res)
-        .boundary_reach_ev(data_energies[0], data_energies[n - 1]);
+    let (extend_low, extend_high) =
+        ResolutionFunction::Gaussian(*res).boundary_reach_ev(data_energies);
     let (mut grid, _) = extend_boundaries(data_energies, extend_low, extend_high);
 
     // ── Step 2: Adaptive intermediate points ────────────────────────────
@@ -590,5 +587,49 @@ mod tests {
         }
         // Both resonances are far outside data range, should have same grid.
         assert_eq!(ext_without.len(), ext_with.len());
+    }
+
+    /// A delayed tail that approaches the nominal flight time does not
+    /// make the working grid grow without bound.
+    ///
+    /// The map from a kernel offset to the energy it gathers from diverges as
+    /// the offset nears the flight time, so the last surviving sample can
+    /// name an energy of any size while carrying almost nothing. Swept across
+    /// that regime the extension stays bounded and moves smoothly.
+    #[test]
+    fn extension_stays_bounded_as_the_tail_nears_the_flight_time() {
+        use crate::resolution::TabulatedResolution;
+        use std::sync::Arc;
+
+        let offsets: Vec<f64> = (0..=140).map(|k| -20.0 + k as f64).collect();
+        let weights = vec![1.0; offsets.len()];
+        let table = TabulatedResolution::from_kernels(
+            vec![100.0, 300.0],
+            vec![(offsets.clone(), weights.clone()), (offsets, weights)],
+            25.0,
+        )
+        .expect("valid two-block table");
+        let resolution = ResolutionFunction::Tabulated(Arc::new(table));
+
+        let mut previous: Option<usize> = None;
+        for tenths in 2200..=2300 {
+            let e_max = tenths as f64 / 10.0;
+            let data: Vec<f64> = (0..400).map(|i| e_max - 40.0 + i as f64 * 0.1).collect();
+            let (grid, _) = build_extended_grid_for(&data, &resolution);
+            let added = grid.len() - data.len();
+            assert!(
+                added < 10 * data.len(),
+                "at e_max = {e_max} eV the extension added {added} points to a {}-point grid",
+                data.len()
+            );
+            if let Some(p) = previous {
+                assert!(
+                    added <= 2 * p + 8 && p <= 2 * added + 8,
+                    "the extension jumped from {p} to {added} points between neighbouring \
+                     windows ending near {e_max} eV"
+                );
+            }
+            previous = Some(added);
+        }
     }
 }

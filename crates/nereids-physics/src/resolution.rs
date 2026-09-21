@@ -1331,15 +1331,14 @@ impl TabulatedResolution {
     ///    previously returned, which under-covered exactly the side
     ///    the delayed-emission tail loads.
     ///
+    /// Only kernel points the broadening keeps count. A delayed-emission
+    /// offset that reaches the nominal flight time (`dt ≥ t`) would gather
+    /// from past infinite energy; [`Self::broaden`] drops such points and
+    /// renormalizes over the rest, so the reach is that of the surviving
+    /// points and is always finite.
+    ///
     /// Returns `0.0` for non-positive `e_ev`, an empty kernel set, or
-    /// a non-positive flight path, and `f64::INFINITY` when the
-    /// positive-offset extreme reaches or exceeds the nominal flight
-    /// time (`t − dt⁺ ≤ 0`: the kernel maps past infinite energy — the
-    /// caller must clamp to its grid, which the GUI's
-    /// `partition_point` slicing already does).  Used by the GUI's
-    /// fit-energy-range slicing to extend the model-evaluation grid
-    /// beyond the user's `[E_min, E_max]` so the SAMMY EMIN/EMAX-
-    /// equivalent broadening at the boundaries is correct (#514).
+    /// a non-positive flight path.
     #[must_use]
     pub fn kernel_support_ev(&self, e_ev: f64) -> f64 {
         let (below, above) = self.kernel_support_directional_ev(e_ev);
@@ -1355,9 +1354,7 @@ impl TabulatedResolution {
     /// [`Self::kernel_support_ev`] is the larger of the two, which is what a
     /// caller wants when it pads a window symmetrically.
     ///
-    /// `above` is `f64::INFINITY` when the positive-offset extreme reaches
-    /// the nominal flight time; see [`Self::kernel_support_ev`] for the rest
-    /// of the contract.
+    /// See [`Self::kernel_support_ev`] for which kernel points count.
     #[must_use]
     pub fn kernel_support_directional_ev(&self, e_ev: f64) -> (f64, f64) {
         if e_ev <= 0.0 || !e_ev.is_finite() {
@@ -1375,14 +1372,17 @@ impl TabulatedResolution {
         //              (upper); clip to grid bounds when e_ev falls
         //              outside the ref range.
         let n = self.ref_energies.len();
+        let t = TOF_FACTOR * self.flight_path_m / e_ev.sqrt();
         let mut max_dt_pos: f64 = 0.0;
         let mut max_dt_neg: f64 = 0.0;
         // `consider` folds one offset into the extremes; `visit` scans
         // one kernel with its own positive-weight mask.  Both take the
         // accumulators as explicit arguments so the joint-mask arm
-        // below can also fold offsets directly.
+        // below can also fold offsets directly. An offset at or past
+        // the nominal flight time is one the broadening drops, so it
+        // has no reach.
         let consider = |dt: f64, pos: &mut f64, neg: &mut f64| {
-            if dt.is_finite() {
+            if dt.is_finite() && dt < t {
                 *pos = pos.max(dt);
                 *neg = neg.max(-dt);
             }
@@ -1460,15 +1460,11 @@ impl TabulatedResolution {
                 }
             }
         }
-        let t = TOF_FACTOR * self.flight_path_m / e_ev.sqrt();
         // Down-side excursion: negative offsets gather at t + dt⁻,
         // i.e. from lower energy (bounded below by E' → 0).
         let down = e_ev * (1.0 - (t / (t + max_dt_neg)).powi(2));
         // Up-side excursion: the positive-offset (delayed-emission)
         // tail gathers theory at t − dt⁺, i.e. from HIGHER energy.
-        if max_dt_pos >= t {
-            return (down, f64::INFINITY);
-        }
         (down, e_ev * ((t / (t - max_dt_pos)).powi(2) - 1.0))
     }
 }
@@ -1499,10 +1495,28 @@ pub enum ResolutionFunction {
     IkedaCarpenter(Arc<crate::ikeda_carpenter::IkedaCarpenter>),
 }
 
-/// Sigmas of Gaussian width the SAMMY Escale boundary extension carries.
+/// Fraction of a sampled kernel's trapezoidal mass a working grid built by
+/// [`crate::auxiliary_grid::build_extended_grid_for`] carries at every data
+/// point. What the grid does not carry is what the broadening drops and
+/// renormalizes over, and this is held below the trapezoid's own
+/// discretization at a window edge.
+pub const RETAINED_KERNEL_MASS: f64 = 1.0 - 1.0e-6;
+
+/// Widths of Gaussian resolution the broadening limits reach on each side.
 ///
-/// SAMMY Ref: `dat/mdata.f90` Escale lines 54-97.
-const ESCALE_N_SIGMA: f64 = 5.0;
+/// SAMMY Ref: `rsl/mrsl4.f90` `Wdsint`, `Wlow = Wup = Brdlim*Widgau`;
+/// `inp/minp06.f` line 212, `Brdlim = 5`. The exponential-tail grading of
+/// `Wup` below is the same routine's `Rwid` branch. SAMMY's pure-exponential
+/// low side, `0.5*Widexp`, has no counterpart here: the Gaussian family
+/// always carries a Gaussian core.
+const BRDLIM: f64 = 5.0;
+
+/// Lowest energy the Gaussian working grid extends to, in eV.
+///
+/// The PW-linear quadrature maps points through `1/√E`, which has no value
+/// at zero; SAMMY's own extension can run to `Emind ≤ 0` because its
+/// velocity-spaced grid never evaluates there.
+const GAUSSIAN_LOW_ENERGY_FLOOR_EV: f64 = 0.001;
 
 impl ResolutionFunction {
     /// How far past the ends of a data window the kernel gathers theory, in
@@ -1515,10 +1529,27 @@ impl ResolutionFunction {
     ///
     /// The families differ in what bounds the reach, which is why they differ
     /// here: an analytic Gaussian has unbounded tails and is cut at SAMMY's
-    /// five-sigma convention, while a measured or synthesized kernel has
-    /// exact compact support and states its own.
+    /// five-sigma convention, taken at the two ends of the grid as Escale
+    /// does, while a measured or synthesized kernel has exact compact
+    /// support that varies with energy in no fixed direction, so every
+    /// target on the grid is asked how far it reaches and the extremes are
+    /// kept.
+    ///
+    /// `energies` is the data grid, ascending. Returns `(0.0, 0.0)` for an
+    /// empty grid.
     #[must_use]
-    pub fn boundary_reach_ev(&self, e_min: f64, e_max: f64) -> (f64, f64) {
+    pub fn boundary_reach_ev(&self, energies: &[f64]) -> (f64, f64) {
+        let (Some(&e_min), Some(&e_max)) = (energies.first(), energies.last()) else {
+            return (0.0, 0.0);
+        };
+        let sampled = |table: &TabulatedResolution| {
+            energies
+                .iter()
+                .fold((0.0_f64, 0.0_f64), |(below, above), &e| {
+                    let (b, a) = table.kernel_support_directional_ev(e);
+                    (below.max(e_min - (e - b)), above.max((e + a) - e_max))
+                })
+        };
         match self {
             Self::Gaussian(params) => {
                 let wg_high = params.gaussian_width(e_max);
@@ -1532,23 +1563,20 @@ impl ResolutionFunction {
                     if rwid <= 1.0 {
                         6.25 * we_high
                     } else if rwid <= 2.0 {
-                        ESCALE_N_SIGMA * (3.0 - rwid) * wg_high
+                        BRDLIM * (3.0 - rwid) * wg_high
                     } else {
-                        ESCALE_N_SIGMA * wg_high
+                        BRDLIM * wg_high
                     }
                 } else {
-                    ESCALE_N_SIGMA * wg_high
+                    BRDLIM * wg_high
                 };
-                (ESCALE_N_SIGMA * params.gaussian_width(e_min), above)
+                let below = (BRDLIM * params.gaussian_width(e_min))
+                    .min(e_min - GAUSSIAN_LOW_ENERGY_FLOOR_EV)
+                    .max(0.0);
+                (below, above)
             }
-            Self::Tabulated(tabulated) => (
-                tabulated.kernel_support_directional_ev(e_min).0,
-                tabulated.kernel_support_directional_ev(e_max).1,
-            ),
-            Self::IkedaCarpenter(ic) => (
-                ic.tabulated().kernel_support_directional_ev(e_min).0,
-                ic.tabulated().kernel_support_directional_ev(e_max).1,
-            ),
+            Self::Tabulated(tabulated) => sampled(tabulated),
+            Self::IkedaCarpenter(ic) => sampled(ic.tabulated()),
         }
     }
 
@@ -2445,9 +2473,8 @@ impl TabulatedResolution {
     /// past infinite energy; they are dropped and the kernel
     /// renormalized over the surviving points, mirroring the grid-edge
     /// handling — see the tail-truncation note on `broaden_presorted`.
-    /// [`Self::kernel_support_ev`] returns `f64::INFINITY` in exactly
-    /// that regime, so callers consuming it as a fit-range margin
-    /// already have the signal.
+    /// [`Self::kernel_support_ev`] reports the reach of the surviving
+    /// points only.
     ///
     /// # Errors
     /// Returns [`ResolutionError::LengthMismatch`] if the arrays differ in
@@ -2488,9 +2515,9 @@ impl TabulatedResolution {
     /// reach — very high energy and/or a short flight path — and is
     /// reachable at *any* target energy because `interpolated_kernel`
     /// clamps to the nearest reference kernel outside the tabulated
-    /// range.  [`Self::kernel_support_ev`] returns `f64::INFINITY` in
-    /// exactly this regime, so margin-consuming callers already have
-    /// the signal that the kernel footprint is unbounded there.
+    /// range.  [`Self::kernel_support_ev`] counts only the points that
+    /// survive, so a grid extended by it carries everything the
+    /// broadening will read.
     ///
     /// ## Inner-loop optimization
     ///
@@ -5469,25 +5496,34 @@ Resolution file
         );
     }
 
-    /// A positive-offset extreme reaching the nominal flight time maps
-    /// past infinite energy: the support is unbounded and the caller
-    /// must clamp to its grid.
+    /// A positive-offset extreme reaching the nominal flight time is a
+    /// point the broadening drops, so it contributes no reach: the
+    /// support is that of the surviving points, and finite.
     #[test]
-    fn test_tabulated_kernel_support_infinite_when_tail_exceeds_flight_time() {
-        let offsets = vec![0.0, 10.0];
-        let weights = vec![1.0, 0.5];
+    fn test_tabulated_kernel_support_counts_only_points_the_broadening_keeps() {
+        let offsets = vec![0.0, 2.0, 10.0];
+        let weights = vec![1.0, 0.5, 0.5];
         let r = TabulatedResolution {
             ref_energies: Arc::new(vec![100.0]),
             kernels: Arc::new(vec![(offsets, weights)]),
             flight_path_m: 25.0,
         };
-        // Choose E high enough that t = K·L/√E ≤ 10 μs.
+        // Choose E high enough that 2 μs < t = K·L/√E ≤ 10 μs, so the
+        // 10 μs point is dropped and the 2 μs point is the last kept.
         let t_at = |e: f64| TOF_FACTOR * 25.0 / e.sqrt();
         let mut e: f64 = 100.0;
         while t_at(e) > 10.0 {
             e *= 10.0;
         }
-        assert_eq!(r.kernel_support_ev(e), f64::INFINITY);
+        let t = t_at(e);
+        assert!(t > 2.0, "fixture must keep the 2 μs point (t = {t})");
+        let expected_above = e * ((t / (t - 2.0)).powi(2) - 1.0);
+        let (_, above) = r.kernel_support_directional_ev(e);
+        assert!(above.is_finite(), "reach must be finite, got {above}");
+        assert!(
+            (above - expected_above).abs() <= 1e-9 * expected_above,
+            "reach {above} should be that of the last surviving offset, {expected_above}"
+        );
     }
 
     /// Non-positive / non-finite energy → 0.0 (no broadening footprint).
