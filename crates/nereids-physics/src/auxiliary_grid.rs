@@ -139,33 +139,35 @@ impl Spacing {
     }
 }
 
-/// Push the points stepping outward from `e_edge` to `target_e`, evenly
-/// spaced in `spacing` at the average spacing of the `n_ref` data points from
-/// `e_edge` to `e_ref`, and ending at `target_e` itself.  A lattice point
-/// the merge would not tell apart from the target is left out, so the
-/// target is the point that survives.
+/// The points stepping outward from `e_edge` to `target_e`, evenly spaced in
+/// `spacing` at the average spacing of the `n_ref` data points from `e_edge`
+/// to `e_ref`, ending at `target_e` itself; a lattice point within the merge
+/// tolerance of the target is left out.
 fn step_outward(
     spacing: Spacing,
     e_edge: f64,
     e_ref: f64,
     n_ref: usize,
     target_e: f64,
-    grid: &mut Vec<f64>,
-) {
+) -> Vec<f64> {
     let u_edge = spacing.to_u(e_edge);
     let u_target = spacing.to_u(target_e);
     let step = (u_edge - spacing.to_u(e_ref)) / (n_ref as f64 - 1.0).max(1.0);
     let steps = (u_target - u_edge) / step;
     if step.abs() <= 1e-30 || !steps.is_finite() || steps <= 0.0 {
-        return;
+        return Vec::new();
     }
     let n_between = (steps - MERGE_RELATIVE_TOL * (u_target / step).abs()).floor() as usize;
-    grid.extend((1..=n_between).map(|k| spacing.to_e(u_edge + step * k as f64)));
-    grid.push(target_e);
+    let mut points: Vec<f64> = (1..=n_between)
+        .map(|k| spacing.to_e(u_edge + step * k as f64))
+        .collect();
+    points.push(target_e);
+    points
 }
 
 /// Extend a grid so it spans `[low, high]`, at the edge spacing of the data
-/// itself, ending exactly at `low` and `high`.
+/// itself, ending exactly at `low` and `high`.  The data points are carried
+/// unchanged between the two extensions.
 fn extend_boundaries(
     data_energies: &[f64],
     low: f64,
@@ -176,40 +178,23 @@ fn extend_boundaries(
     let e_min = data_energies[0];
     let e_max = data_energies[n - 1];
     let n_ref = N_BOUNDARY_REF.min(n);
-    let mut grid = Vec::with_capacity(n + 200);
 
-    if low < e_min && e_min > 0.0 {
-        step_outward(
-            spacing,
-            e_min,
-            data_energies[n_ref - 1],
-            n_ref,
-            low,
-            &mut grid,
-        );
-    }
+    let mut below = if low < e_min && e_min > 0.0 {
+        step_outward(spacing, e_min, data_energies[n_ref - 1], n_ref, low)
+    } else {
+        Vec::new()
+    };
+    below.reverse();
+    let above = if high > e_max {
+        step_outward(spacing, e_max, data_energies[n - n_ref], n_ref, high)
+    } else {
+        Vec::new()
+    };
 
+    let indices = (below.len()..below.len() + n).collect();
+    let mut grid = below;
     grid.extend_from_slice(data_energies);
-
-    if high > e_max {
-        step_outward(
-            spacing,
-            e_max,
-            data_energies[n - n_ref],
-            n_ref,
-            high,
-            &mut grid,
-        );
-    }
-
-    grid.sort_unstable_by(|a, b| a.total_cmp(b));
-    dedup(&mut grid);
-    // The merge keeps the lower of two points it cannot tell apart, so only
-    // the high end can lose its target.
-    if high > *grid.last().expect("grid holds the data") {
-        grid.push(high);
-    }
-    let indices = build_data_indices(&grid, data_energies);
+    grid.extend(above);
     (grid, indices)
 }
 
@@ -631,9 +616,9 @@ mod tests {
         assert_eq!(ext_without.len(), ext_with.len());
     }
 
-    /// The grid ends exactly at the bounds it was asked to span, even when
-    /// a lattice point or the last data point lies within the merge
-    /// tolerance of that end.
+    /// The grid ends exactly at the bounds it was asked to span and keeps
+    /// every data point, even when a bound lies within the merge tolerance of
+    /// a lattice point or of the data's own end.
     #[test]
     fn grid_ends_exactly_at_its_bounds_through_the_merge() {
         let data: Vec<f64> = (0..5).map(|i| 100.0 + f64::from(i)).collect();
@@ -658,12 +643,18 @@ mod tests {
             assert_eq!(grid.len(), data.len() + 7);
             assert_eq!(indices, vec![7, 8, 9, 10, 11]);
         }
-        // A high end the merge would fold into the last data point.
+        // Bounds within the merge tolerance of the data's own ends.
         let high = e_max * (1.0 + 5.0e-11);
         let (grid, indices) = extend_boundaries(&data, e_min, high, Spacing::SqrtEnergy);
         assert_eq!(*grid.last().unwrap(), high);
         assert_eq!(grid.len(), data.len() + 1);
         assert_eq!(indices, vec![0, 1, 2, 3, 4]);
+        let low = e_min * (1.0 - 5.0e-11);
+        let (grid, indices) = extend_boundaries(&data, low, e_max, Spacing::TimeOfFlight);
+        assert_eq!(grid[0], low);
+        assert_eq!(grid[1], e_min);
+        assert_eq!(grid.len(), data.len() + 1);
+        assert_eq!(indices, vec![1, 2, 3, 4, 5]);
     }
 
     /// A delayed tail that approaches the nominal flight time does not make the
