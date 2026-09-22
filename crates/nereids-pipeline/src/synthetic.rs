@@ -1,7 +1,7 @@
 //! Synthetic counts-domain measurements with known ground truth:
 //!
 //! ```text
-//! E_true = exact_true_energies(edges, timing_offset, L, t0, L_scale)
+//! E_true = exact_true_energies(edges, timing_offset, L, t0, L_scale, nodes_per_bin)
 //! T_j    = exp(-sum_i (n d)_i sigma_i(E_true_j; T))
 //! O_i    = sum_j F_j R_ij + B_o,i        S_i = sum_j F_j T_j R_ij + B_s,i
 //! ```
@@ -9,6 +9,8 @@
 //! with `R_ij` the detector-bin response of the true resolution kernel,
 //! per-bin backgrounds that differ between the arms, and the recorded
 //! counts a Poisson draw around `O_i` and `S_i`.
+
+use std::ops::Range;
 
 use nereids_endf::resonance::ResonanceData;
 use nereids_physics::counts_response::{add_count_backgrounds, two_arm_count_response};
@@ -18,7 +20,7 @@ use rand::SeedableRng;
 use rand_chacha::ChaCha12Rng;
 use rand_distr::{Distribution, Poisson};
 
-use crate::pipeline::exact_true_energies;
+use crate::pipeline::{exact_node_fluence, exact_true_energies};
 
 /// Everything injected into a synthetic measurement, shared across pixels.
 ///
@@ -28,6 +30,10 @@ use crate::pipeline::exact_true_energies;
 pub struct Truth {
     /// Detector-time bin edges the counts are binned into (µs), ascending.
     pub detector_time_edges_us: Vec<f64>,
+    /// Detector bins the source illuminates; `None` illuminates all of them.
+    pub source_bins: Option<Range<usize>>,
+    /// Quadrature nodes per detector bin the counts are synthesized with.
+    pub nodes_per_bin: usize,
     /// Nominal flight path (m).
     pub flight_path_m: f64,
     /// True TOF zero (µs).
@@ -42,7 +48,8 @@ pub struct Truth {
     pub resolution: ResolutionFunction,
     /// Trigger offset of the detector time axis (µs).
     pub timing_offset_us: f64,
-    /// Expected open-beam neutron counts per detector bin, before background.
+    /// Expected open-beam neutron counts per illuminated detector bin,
+    /// before background.
     pub open_beam_counts_per_bin: f64,
     /// Expected open-arm background counts per detector bin.
     pub open_background_per_bin: f64,
@@ -65,7 +72,7 @@ pub struct Measurement {
     pub true_energies_ev: Vec<f64>,
     /// Detector-time bin edges the counts are binned into (µs), ascending.
     pub detector_time_edges_us: Vec<f64>,
-    /// Incident fluence weight per true energy.
+    /// Expected open-beam neutron counts per detector bin, before background.
     pub incident_fluence_weights: Vec<f64>,
     /// Expected neutron counts that fell outside the acquisition window, per
     /// arm. Reported rather than renormalized away: a fixture that quietly
@@ -118,20 +125,46 @@ pub fn detector_time_edges_around(
 }
 
 impl Truth {
-    /// The energy grid the fit is given: one per detector bin under the
-    /// nominal clock, ascending.
-    pub fn nominal_energies_ev(&self) -> Vec<f64> {
+    /// Expected open-beam neutron counts per detector bin, before background.
+    pub fn fluence_per_bin(&self) -> Vec<f64> {
+        let n_bins = self.detector_time_edges_us.len() - 1;
+        (0..n_bins)
+            .map(|bin| {
+                let lit = self
+                    .source_bins
+                    .as_ref()
+                    .is_none_or(|bins| bins.contains(&bin));
+                if lit {
+                    self.open_beam_counts_per_bin
+                } else {
+                    0.0
+                }
+            })
+            .collect()
+    }
+
+    /// The energy grid a fit at `nodes_per_bin` is given: the quadrature
+    /// under the nominal clock, ascending.
+    ///
+    /// # Panics
+    /// Panics if the detector time axis is not a valid quadrature support.
+    pub fn nominal_energies_ev(&self, nodes_per_bin: usize) -> Vec<f64> {
         exact_true_energies(
             &self.detector_time_edges_us,
             self.timing_offset_us,
             self.flight_path_m,
             0.0,
             1.0,
+            nodes_per_bin,
         )
         .expect("valid detector time axis")
     }
 
-    /// The energies a neutron recorded on this instrument actually had.
+    /// The energies a neutron recorded on this instrument actually had, at
+    /// the synthesis quadrature.
+    ///
+    /// # Panics
+    /// Panics if the detector time axis is not a valid quadrature support.
     pub fn true_energies_ev(&self) -> Vec<f64> {
         exact_true_energies(
             &self.detector_time_edges_us,
@@ -139,6 +172,7 @@ impl Truth {
             self.flight_path_m,
             self.t0_us,
             self.l_scale,
+            self.nodes_per_bin,
         )
         .expect("valid energy-scale truth")
     }
@@ -170,11 +204,12 @@ impl Truth {
             forward_model(&true_energies_ev, &sample, None).expect("valid forward model");
 
         let n_bins = self.detector_time_edges_us.len() - 1;
-        let incident_fluence_weights = vec![self.open_beam_counts_per_bin; n_bins];
+        let incident_fluence_weights = self.fluence_per_bin();
+        let node_fluence = exact_node_fluence(&incident_fluence_weights, self.nodes_per_bin);
 
         let signal = two_arm_count_response(
             &true_energies_ev,
-            &incident_fluence_weights,
+            &node_fluence,
             &transmission,
             &self.detector_time_edges_us,
             self.timing_offset_us,

@@ -248,37 +248,45 @@ broadened transmission ratio `R[T]`. To fit raw counts with an active
 resolution, supply the exact-response inputs:
 
 ```python
+nodes_per_bin = 4                # quadrature nodes per detector bin
 energies = nereids.exact_count_true_energies(
     edges,                       # len(edges) == len(sample_counts) + 1
     timing_offset_us=0.0,
     flight_path_m=25.0,          # the response kernel's flight path
+    nodes_per_bin=nodes_per_bin,
 )
 result = nereids.fit_counts_spectrum_typed(
     sample_counts,               # per measured detector-time bin
     open_beam_counts,            # per measured detector-time bin
-    energies,                    # one true energy per bin, ascending
+    energies,                    # nodes_per_bin true energies per bin, ascending
     [(u238, 0.0005)],
     solver="kl",
     resolution=response,         # TabulatedResolution or IkedaCarpenter
-    incident_fluence_weights=F,  # F_j = eps(E_j) * Phi(E_j), per energy
+    incident_fluence_weights=F,  # expected open-beam counts per detector bin
     detector_time_edges_us=edges,
     timing_offset_us=0.0,
+    nodes_per_bin=nodes_per_bin,
 )
 ```
 
-The true-energy grid is owned by the route: `exact_count_true_energies`
-places one true energy at the centre time of every detector bin under the
-response clock (`timing_offset_us` and the kernel's flight path), ascending,
-so entry `i` belongs to bin `n - 1 - i`. A grid built any other way, including
-`tof_to_energy_centers` (geometric-mean centres) or one built with a
-different clock, is rejected with a `ValueError` naming the first bin that
-differs, and so is a window with bins centred before the clock's zero (trim
-them first). `two_arm_count_response(...)` is the same operator exposed
-standalone for synthesizing or checking expected counts (it additionally
-reports the per-arm acquisition-window loss). A resolution *without* the
-exact-response inputs still fails closed with a `ValueError`, and
-`fit_energy_scale` / `fit_energy_range` are not yet supported through the
-exact response.
+The true-energy quadrature is owned by the route: `exact_count_true_energies`
+places `nodes_per_bin` true energies at the sub-bin centre times of every
+detector bin under the response clock (`timing_offset_us` and the kernel's
+flight path), ascending, so the last `nodes_per_bin` entries belong to bin 0.
+The fluence is supplied per detector bin, as expected open-beam counts with
+efficiency folded in, and the route splits each bin over its nodes. A grid
+built any other way, including `tof_to_energy_centers` (geometric-mean
+centres) or one built with a different clock, is rejected with a `ValueError`
+naming the first point that differs, and so is a window with bins before the
+clock's zero (trim them first). The transmission is integrated over each bin
+with `nodes_per_bin` points, so the count must resolve the resonance
+structure within a bin: refit at twice the count and compare the densities.
+`two_arm_count_response(...)` is the same operator exposed standalone for
+synthesizing or checking expected counts from a per-node fluence (it
+additionally reports the per-arm acquisition-window loss). A resolution
+*without* the exact-response inputs still fails closed with a `ValueError`,
+and `fit_energy_scale` / `fit_energy_range` are not yet supported through
+the exact response.
 
 Counts specific options are:
 

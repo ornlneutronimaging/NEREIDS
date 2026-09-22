@@ -24,10 +24,9 @@ use nereids_pipeline::synthetic::{Truth, detector_time_edges_around};
 const FLIGHT_PATH_M: f64 = 25.0;
 const DENSITY_TRUE: f64 = 5.0e-4;
 const TEMPERATURE_TRUE_K: f64 = 293.6;
-const IC_A0: f64 = 0.35;
-const IC_A1: f64 = 0.05;
-const IC_BETA: f64 = 0.25;
-const IC_R: f64 = 0.15;
+const WINDOW_PAD_BINS: usize = 64;
+const SYNTHESIS_NODES_PER_BIN: usize = 16;
+const FIT_NODES_PER_BIN: usize = 4;
 
 /// 401 points over the U-238 6.674 eV resonance at 0.01 eV spacing. The
 /// Doppler width there is about 0.054 eV against a natural width of 0.025 eV,
@@ -40,12 +39,9 @@ fn energies() -> Vec<f64> {
 fn resolution(grid: &[f64]) -> ResolutionFunction {
     let ic = IkedaCarpenter::new(
         IkedaCarpenterParams {
-            alpha: EnergyLaw::SqrtE {
-                a0: IC_A0,
-                a1: IC_A1,
-            },
-            beta: EnergyLaw::Const(IC_BETA),
-            r: EnergyLaw::Const(IC_R),
+            alpha: EnergyLaw::SqrtE { a0: 0.35, a1: 0.05 },
+            beta: EnergyLaw::Const(0.25),
+            r: EnergyLaw::Const(0.15),
             burst_sigma_us: None,
             channel_fwhm_us: Some(0.35),
         },
@@ -72,9 +68,13 @@ fn resolution(grid: &[f64]) -> ResolutionFunction {
 /// fix for it.
 fn truth() -> Truth {
     let grid = energies();
+    let edges = detector_time_edges_around(&grid, FLIGHT_PATH_M, 0.0, WINDOW_PAD_BINS);
+    let n_bins = edges.len() - 1;
     Truth {
         resolution: resolution(&grid),
-        detector_time_edges_us: detector_time_edges_around(&grid, FLIGHT_PATH_M, 0.0, 64),
+        detector_time_edges_us: edges,
+        source_bins: Some(WINDOW_PAD_BINS..n_bins - WINDOW_PAD_BINS),
+        nodes_per_bin: SYNTHESIS_NODES_PER_BIN,
         flight_path_m: FLIGHT_PATH_M,
         t0_us: 0.0,
         l_scale: 1.0,
@@ -87,26 +87,15 @@ fn truth() -> Truth {
     }
 }
 
-fn window_loss_bound(truth: &Truth) -> f64 {
-    let edges = &truth.detector_time_edges_us;
-    let n_bins = edges.len() - 1;
-    let last_width_us = edges[n_bins] - edges[n_bins - 1];
-    let e_last = truth.nominal_energies_ev()[0];
-    let mean_delay_us = 2.0 / (IC_A0 * e_last.sqrt() + IC_A1) + IC_R / IC_BETA;
-    3.0 * mean_delay_us / last_width_us / n_bins as f64
-}
-
 /// Fit one noise realization from the shared seed stream.
 fn recover(seed: u64) -> (f64, f64, f64) {
     let truth = truth();
     let m = truth.measure(&[DENSITY_TRUE], seed);
 
     let offered: f64 = m.incident_fluence_weights.iter().sum();
-    let bound = window_loss_bound(&truth);
     assert!(
-        m.window_loss.0 / offered < bound && m.window_loss.1 / offered < bound,
-        "fixture loses more than its last bins' kernel tails outside the window: {:?} of {offered} \
-         (bound {bound:.2e})",
+        m.window_loss.0 / offered < 1.0e-3 && m.window_loss.1 / offered < 1.0e-3,
+        "fixture loses counts outside the acquisition window: {:?}",
         m.window_loss
     );
     // And the draw must be noise around the expectation, not the expectation.
@@ -116,7 +105,7 @@ fn recover(seed: u64) -> (f64, f64, f64) {
     // Start both parameters away from truth so the fit has to find them:
     // density 20 % low, temperature 15 % low.
     let config = UnifiedFitConfig::new(
-        truth.nominal_energies_ev(),
+        truth.nominal_energies_ev(FIT_NODES_PER_BIN),
         vec![u238_single_resonance()],
         vec!["U-238".into()],
         TEMPERATURE_TRUE_K * 0.85,
@@ -130,6 +119,7 @@ fn recover(seed: u64) -> (f64, f64, f64) {
         incident_fluence_weights: m.incident_fluence_weights.clone(),
         detector_time_edges_us: m.detector_time_edges_us.clone(),
         timing_offset_us: truth.timing_offset_us,
+        nodes_per_bin: FIT_NODES_PER_BIN,
     });
 
     let result = fit_spectrum_typed(
@@ -210,7 +200,7 @@ fn the_fit_moves_both_parameters_away_from_their_seeds() {
     let density_seed = DENSITY_TRUE * 0.8;
     let temperature_seed = TEMPERATURE_TRUE_K * 0.85;
     let config = UnifiedFitConfig::new(
-        truth.nominal_energies_ev(),
+        truth.nominal_energies_ev(FIT_NODES_PER_BIN),
         vec![u238_single_resonance()],
         vec!["U-238".into()],
         temperature_seed,
@@ -224,6 +214,7 @@ fn the_fit_moves_both_parameters_away_from_their_seeds() {
         incident_fluence_weights: m.incident_fluence_weights.clone(),
         detector_time_edges_us: m.detector_time_edges_us.clone(),
         timing_offset_us: truth.timing_offset_us,
+        nodes_per_bin: FIT_NODES_PER_BIN,
     });
 
     let result = fit_spectrum_typed(

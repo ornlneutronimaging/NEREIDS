@@ -3476,42 +3476,44 @@ fn tof_to_energy_centers<'py>(
     Ok(PyArray1::from_owned_array(py, centers))
 }
 
-/// The true-energy grid the exact resolved-count route requires: one energy
-/// per detector bin at the bin-centre time of the response clock, ascending.
+/// The true-energy quadrature the exact resolved-count route requires:
+/// ``nodes_per_bin`` energies per detector bin at the sub-bin centre times
+/// of the response clock, ascending.
 ///
 /// Args:
 ///     detector_time_edges_us: Detector-time bin edges in microseconds
 ///         (ascending); the same array passed to the fit.
-///     timing_offset_us: Detector-clock offset applied by the response
-///         (default 0.0).
-///     flight_path_m: Flight path of the response kernel in meters
-///         (default 25.0).
-///     t0_us: Pinned energy-scale time zero in microseconds (default 0.0).
-///     l_scale: Pinned flight-path scale (default 1.0).
+///     timing_offset_us: Detector-clock offset applied by the response; the
+///         same value passed to the fit.
+///     flight_path_m: Flight path of the response kernel in meters.
+///     nodes_per_bin: Quadrature nodes per detector bin; the same value
+///         passed to the fit. Must resolve the resonance structure within a
+///         bin: refit at twice the count to check convergence.
 ///
 /// Returns:
-///     1D numpy array of true energies in eV, ascending; entry ``i`` belongs
-///     to detector bin ``n - 1 - i``.
+///     1D numpy array of true energies in eV, ascending; the last
+///     ``nodes_per_bin`` entries belong to detector bin 0.
 ///
 /// Raises:
-///     ValueError: If the edges are not ascending and finite, or a bin is
-///         centred at or before the response clock's zero.
+///     ValueError: If the edges are not ascending and finite, the flight
+///         path is not positive, ``nodes_per_bin`` is zero, or a node lies at
+///         or before the response clock's zero.
 #[pyfunction]
-#[pyo3(signature = (detector_time_edges_us, timing_offset_us=0.0, flight_path_m=25.0, t0_us=0.0, l_scale=1.0))]
+#[pyo3(signature = (detector_time_edges_us, timing_offset_us, flight_path_m, nodes_per_bin))]
 fn exact_count_true_energies<'py>(
     py: Python<'py>,
     detector_time_edges_us: PyReadonlyArray1<f64>,
     timing_offset_us: f64,
     flight_path_m: f64,
-    t0_us: f64,
-    l_scale: f64,
+    nodes_per_bin: usize,
 ) -> PyResult<Bound<'py, PyArray1<f64>>> {
     let energies = nereids_pipeline::pipeline::exact_true_energies(
         detector_time_edges_us.as_slice()?,
         timing_offset_us,
         flight_path_m,
-        t0_us,
-        l_scale,
+        0.0,
+        1.0,
+        nodes_per_bin,
     )
     .map_err(|e| pyo3::exceptions::PyValueError::new_err(e.to_string()))?;
     Ok(PyArray1::from_vec(py, energies))
@@ -5971,16 +5973,21 @@ fn py_spatial_map_typed<'py>(
 ///         ``detector_time_edges_us``.  A resolution without those inputs
 ///         fails closed (the physical model needs the exact separate-arm
 ///         model, never the R[T] shortcut).
-///     incident_fluence_weights: Incident fluence per true energy, with
-///         detector efficiency folded in (the contract's ``F_j = eps*Phi``),
-///         in the grid's ascending order. Required with
-///         detector_time_edges_us.
+///     incident_fluence_weights: Expected open-beam neutron counts per
+///         detector bin with detector efficiency folded in, in detector-time
+///         order; the route splits each bin over its quadrature nodes.
+///         Required with detector_time_edges_us.
 ///     detector_time_edges_us: Actual measured detector-time bin edges. Its
 ///         length must be one greater than the sample/open count arrays, and
 ///         ``energies`` must be ``exact_count_true_energies`` of these edges
-///         under the response's flight path and ``timing_offset_us``.
+///         under the response's flight path, ``timing_offset_us`` and
+///         ``nodes_per_bin``.
 ///     timing_offset_us: Fixed detector-clock offset applied by the response
 ///         (default 0.0; only meaningful with the exact-response inputs).
+///     nodes_per_bin: Quadrature nodes per detector bin the true-energy grid
+///         was built with; required with the exact-response inputs. It must
+///         resolve the resonance structure within a bin: refit at twice the
+///         count and compare.
 ///     groups: list of IsotopeGroup objects (mutually exclusive with isotopes).
 ///     initial_densities: Initial density guesses when using groups (default 0.001 each).
 ///     enable_polish: Override the Nelder-Mead polish phase on the
@@ -6031,6 +6038,7 @@ fn py_spatial_map_typed<'py>(
     incident_fluence_weights = None,
     detector_time_edges_us = None,
     timing_offset_us = 0.0,
+    nodes_per_bin = None,
     flight_path_m = None,
     delta_t_us = None,
     delta_l_m = None,
@@ -6079,6 +6087,7 @@ fn py_fit_counts_spectrum_typed<'py>(
     incident_fluence_weights: Option<PyReadonlyArray1<'py, f64>>,
     detector_time_edges_us: Option<PyReadonlyArray1<'py, f64>>,
     timing_offset_us: f64,
+    nodes_per_bin: Option<usize>,
     flight_path_m: Option<f64>,
     delta_t_us: Option<f64>,
     delta_l_m: Option<f64>,
@@ -6146,6 +6155,11 @@ fn py_fit_counts_spectrum_typed<'py>(
             "timing_offset_us requires incident_fluence_weights and detector_time_edges_us",
         ));
     }
+    if !exact_requested && nodes_per_bin.is_some() {
+        return Err(pyo3::exceptions::PyValueError::new_err(
+            "nodes_per_bin requires incident_fluence_weights and detector_time_edges_us",
+        ));
+    }
     if !exact_requested && sample_slice.len() != e_slice.len() {
         return Err(pyo3::exceptions::PyValueError::new_err(format!(
             "sample_counts length ({}) must match energies length ({})",
@@ -6154,14 +6168,30 @@ fn py_fit_counts_spectrum_typed<'py>(
         )));
     }
     if let Some(source) = exact_source.as_ref()
-        && source.len() != e_slice.len()
+        && source.len() != sample_slice.len()
     {
         return Err(pyo3::exceptions::PyValueError::new_err(format!(
-            "incident_fluence_weights length ({}) must match the true-energy grid length ({})",
+            "incident_fluence_weights length ({}) must match the measured count-bin length ({}): \
+             one weight per detector bin",
             source.len(),
-            e_slice.len(),
+            sample_slice.len(),
         )));
     }
+    let nodes_per_bin = match (exact_requested, nodes_per_bin) {
+        (false, _) => 1,
+        (true, Some(n)) if n >= 1 => n,
+        (true, Some(n)) => {
+            return Err(pyo3::exceptions::PyValueError::new_err(format!(
+                "nodes_per_bin must be at least 1, got {n}"
+            )));
+        }
+        (true, None) => {
+            return Err(pyo3::exceptions::PyValueError::new_err(
+                "nodes_per_bin is required with the exact-response inputs: the quadrature \
+                 nodes per detector bin the true-energy grid was built with",
+            ));
+        }
+    };
     if let Some(edges) = exact_edges.as_ref()
         && edges.len() != sample_slice.len() + 1
     {
@@ -6285,6 +6315,7 @@ fn py_fit_counts_spectrum_typed<'py>(
                 incident_fluence_weights,
                 detector_time_edges_us,
                 timing_offset_us,
+                nodes_per_bin,
             },
         );
     }

@@ -1525,17 +1525,18 @@ def tof_to_energy_centers(
 
 def exact_count_true_energies(
     detector_time_edges_us: NDArray[np.float64],
-    timing_offset_us: float = 0.0,
-    flight_path_m: float = 25.0,
-    t0_us: float = 0.0,
-    l_scale: float = 1.0,
+    timing_offset_us: float,
+    flight_path_m: float,
+    nodes_per_bin: int,
 ) -> NDArray[np.float64]:
-    """The true-energy grid the exact resolved-count route requires.
+    """The true-energy quadrature the exact resolved-count route requires.
 
-    One energy per detector bin at the bin-centre time of the response clock
-    ``timing_offset_us + t0_us`` over ``flight_path_m * l_scale``, ascending;
-    entry ``i`` belongs to detector bin ``n - 1 - i``.  Raises ``ValueError``
-    when the edges are not ascending and finite or a bin is centred at or
+    ``nodes_per_bin`` energies per detector bin at the sub-bin centre times of
+    the response clock ``timing_offset_us`` over ``flight_path_m``, ascending;
+    the last ``nodes_per_bin`` entries belong to detector bin 0.  Pass the
+    same edges, offset, flight path and node count to the fit.  Raises
+    ``ValueError`` when the edges are not ascending and finite, the flight
+    path is not positive, ``nodes_per_bin`` is zero, or a node lies at or
     before the clock's zero.
     """
     ...
@@ -2119,6 +2120,7 @@ def fit_counts_spectrum_typed(
     incident_fluence_weights: NDArray[np.float64] | None = None,
     detector_time_edges_us: NDArray[np.float64] | None = None,
     timing_offset_us: float = 0.0,
+    nodes_per_bin: int | None = None,
     flight_path_m: float | None = None,
     delta_t_us: float | None = None,
     delta_l_m: float | None = None,
@@ -2186,15 +2188,19 @@ def fit_counts_spectrum_typed(
             ``detector_time_edges_us``.  A resolution without those inputs
             fails closed (the physical model needs the exact separate-arm
             model, never the R[T] shortcut).
-        incident_fluence_weights: Incident fluence per true energy, with
-            detector efficiency folded in (the contract's ``F_j = eps*Phi``),
-            in the grid's ascending order.  Required together with
-            ``detector_time_edges_us``.
+        incident_fluence_weights: Expected open-beam neutron counts per
+            detector bin with detector efficiency folded in, in detector-time
+            order; the route splits each bin over its quadrature nodes.
+            Required together with ``detector_time_edges_us``.
         detector_time_edges_us: Actual measured detector-time bin edges in
             ascending microseconds; length must be one greater than the
             sample/open count arrays, and ``energies`` must be
             ``exact_count_true_energies`` of these edges under the response's
-            flight path and ``timing_offset_us``.
+            flight path, ``timing_offset_us`` and ``nodes_per_bin``.
+        nodes_per_bin: Quadrature nodes per detector bin the true-energy grid
+            was built with; required with the exact-response inputs.  It must
+            resolve the resonance structure within a bin: refit at twice the
+            count and compare.
         timing_offset_us: Fixed detector-clock offset applied by the response
             (default 0.0; only meaningful with the exact-response inputs).
         groups: List of IsotopeGroup objects (mutually exclusive with isotopes).

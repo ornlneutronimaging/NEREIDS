@@ -14,14 +14,12 @@ use nereids_pipeline::synthetic::{Truth, detector_time_edges_around};
 
 const FLIGHT_PATH_M: f64 = 25.0;
 const TIMING_OFFSET_US: f64 = 0.0;
+const WINDOW_PAD_BINS: usize = 64;
+const NODES_PER_BIN: usize = 16;
 /// U-238 areal density (at/b), sized so the 6.674 eV dip is deep enough to
 /// carry information but far from black.
 const DENSITY: f64 = 5.0e-4;
 const TEMPERATURE_K: f64 = 293.6;
-const IC_A0: f64 = 0.35;
-const IC_A1: f64 = 0.05;
-const IC_BETA: f64 = 0.25;
-const IC_R: f64 = 0.15;
 
 /// Grid straddling the U-238 6.674 eV resonance.
 fn energies() -> Vec<f64> {
@@ -31,12 +29,9 @@ fn energies() -> Vec<f64> {
 fn resolution(energies: &[f64]) -> ResolutionFunction {
     let ic = IkedaCarpenter::new(
         IkedaCarpenterParams {
-            alpha: EnergyLaw::SqrtE {
-                a0: IC_A0,
-                a1: IC_A1,
-            },
-            beta: EnergyLaw::Const(IC_BETA),
-            r: EnergyLaw::Const(IC_R),
+            alpha: EnergyLaw::SqrtE { a0: 0.35, a1: 0.05 },
+            beta: EnergyLaw::Const(0.25),
+            r: EnergyLaw::Const(0.15),
             burst_sigma_us: None,
             channel_fwhm_us: Some(0.35),
         },
@@ -54,14 +49,13 @@ fn resolution(energies: &[f64]) -> ResolutionFunction {
 
 fn truth() -> Truth {
     let grid = energies();
+    let edges = detector_time_edges_around(&grid, FLIGHT_PATH_M, TIMING_OFFSET_US, WINDOW_PAD_BINS);
+    let n_bins = edges.len() - 1;
     Truth {
         resolution: resolution(&grid),
-        detector_time_edges_us: detector_time_edges_around(
-            &grid,
-            FLIGHT_PATH_M,
-            TIMING_OFFSET_US,
-            64,
-        ),
+        detector_time_edges_us: edges,
+        source_bins: Some(WINDOW_PAD_BINS..n_bins - WINDOW_PAD_BINS),
+        nodes_per_bin: NODES_PER_BIN,
         flight_path_m: FLIGHT_PATH_M,
         t0_us: 0.0,
         l_scale: 1.0,
@@ -74,20 +68,11 @@ fn truth() -> Truth {
     }
 }
 
-fn window_loss_bound(truth: &Truth) -> f64 {
-    let edges = &truth.detector_time_edges_us;
-    let n_bins = edges.len() - 1;
-    let last_width_us = edges[n_bins] - edges[n_bins - 1];
-    let e_last = truth.nominal_energies_ev()[0];
-    let mean_delay_us = 2.0 / (IC_A0 * e_last.sqrt() + IC_A1) + IC_R / IC_BETA;
-    3.0 * mean_delay_us / last_width_us / n_bins as f64
-}
-
 #[test]
 fn detector_time_edges_ascend_and_bracket_the_grid() {
     let truth = truth();
     let edges = &truth.detector_time_edges_us;
-    assert_eq!(edges.len(), truth.nominal_energies_ev().len() + 1);
+    assert_eq!(edges.len(), truth.fluence_per_bin().len() + 1);
     assert!(
         edges.windows(2).all(|w| w[0] < w[1]),
         "detector time edges must ascend"
@@ -242,10 +227,9 @@ fn the_acquisition_window_keeps_the_counts_it_was_given() {
 
     let offered: f64 = m.incident_fluence_weights.iter().sum();
     let (open_loss, sample_loss) = m.window_loss;
-    let bound = window_loss_bound(&truth);
     assert!(
-        open_loss / offered < bound,
-        "open arm loses {open_loss:.3e} of {offered:.3e} outside the window (bound {bound:.2e})"
+        open_loss / offered < 1.0e-3,
+        "open arm loses {open_loss:.3e} of {offered:.3e} outside the window"
     );
     assert!(
         sample_loss <= open_loss,
@@ -265,11 +249,11 @@ fn the_acquisition_window_keeps_the_counts_it_was_given() {
     );
     assert_eq!(
         m.true_energies_ev.len(),
-        m.incident_fluence_weights.len(),
-        "one fluence weight per true energy"
+        m.incident_fluence_weights.len() * NODES_PER_BIN,
+        "nodes_per_bin true energies per detector bin"
     );
     // At the identity energy scale the true energies ARE the nominal ones.
-    assert_eq!(m.true_energies_ev, truth.nominal_energies_ev());
+    assert_eq!(m.true_energies_ev, truth.nominal_energies_ev(NODES_PER_BIN));
 }
 
 /// A non-identity energy scale must move the true energies, or a calibration
