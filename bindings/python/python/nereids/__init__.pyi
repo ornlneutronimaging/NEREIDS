@@ -1523,6 +1523,23 @@ def tof_to_energy_centers(
     """Convert TOF bin edges to energy bin centers."""
     ...
 
+def exact_count_true_energies(
+    detector_time_edges_us: NDArray[np.float64],
+    timing_offset_us: float = 0.0,
+    flight_path_m: float = 25.0,
+    t0_us: float = 0.0,
+    l_scale: float = 1.0,
+) -> NDArray[np.float64]:
+    """The true-energy grid the exact resolved-count route requires.
+
+    One energy per detector bin at the bin-centre time of the response clock
+    ``timing_offset_us + t0_us`` over ``flight_path_m * l_scale``, ascending;
+    entry ``i`` belongs to detector bin ``n - 1 - i``.  Raises ``ValueError``
+    when the edges are not ascending and finite or a bin is centred at or
+    before the clock's zero.
+    """
+    ...
+
 def element_symbol(z: int) -> str | None:
     """Get the element symbol for a given atomic number Z."""
     ...
@@ -2169,13 +2186,15 @@ def fit_counts_spectrum_typed(
             ``detector_time_edges_us``.  A resolution without those inputs
             fails closed (the physical model needs the exact separate-arm
             model, never the R[T] shortcut).
-        incident_fluence_weights: Incident fluence integrated over each point
-            of the true-energy quadrature, with detector efficiency folded in
-            (the contract's ``F_j = w_j*eps*Phi``).  Required together with
+        incident_fluence_weights: Incident fluence per true energy, with
+            detector efficiency folded in (the contract's ``F_j = eps*Phi``),
+            in the grid's ascending order.  Required together with
             ``detector_time_edges_us``.
         detector_time_edges_us: Actual measured detector-time bin edges in
             ascending microseconds; length must be one greater than the
-            sample/open count arrays.
+            sample/open count arrays, and ``energies`` must be
+            ``exact_count_true_energies`` of these edges under the response's
+            flight path and ``timing_offset_us``.
         timing_offset_us: Fixed detector-clock offset applied by the response
             (default 0.0; only meaningful with the exact-response inputs).
         groups: List of IsotopeGroup objects (mutually exclusive with isotopes).

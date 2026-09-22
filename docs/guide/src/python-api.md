@@ -248,27 +248,37 @@ broadened transmission ratio `R[T]`. To fit raw counts with an active
 resolution, supply the exact-response inputs:
 
 ```python
+energies = nereids.exact_count_true_energies(
+    edges,                       # len(edges) == len(sample_counts) + 1
+    timing_offset_us=0.0,
+    flight_path_m=25.0,          # the response kernel's flight path
+)
 result = nereids.fit_counts_spectrum_typed(
     sample_counts,               # per measured detector-time bin
     open_beam_counts,            # per measured detector-time bin
-    energies,                    # true-energy quadrature (may differ in length)
+    energies,                    # one true energy per bin, ascending
     [(u238, 0.0005)],
     solver="kl",
     resolution=response,         # TabulatedResolution or IkedaCarpenter
-    incident_fluence_weights=F,  # F_j = w_j * eps(E_j) * Phi(E_j)
-    detector_time_edges_us=edges,  # len(edges) == len(sample_counts) + 1
+    incident_fluence_weights=F,  # F_j = eps(E_j) * Phi(E_j), per energy
+    detector_time_edges_us=edges,
     timing_offset_us=0.0,
 )
 ```
 
-The true-energy grid and the measured detector-time bins are different axes:
-`energies` drives the physics model while the count arrays live on the
-detector clock. `two_arm_count_response(...)` is the same operator exposed
+The true-energy grid is owned by the route: `exact_count_true_energies`
+places one true energy at the centre time of every detector bin under the
+response clock (`timing_offset_us` and the kernel's flight path), ascending,
+so entry `i` belongs to bin `n - 1 - i`. A grid built any other way, including
+`tof_to_energy_centers` (geometric-mean centres) or one built with a
+different clock, is rejected with a `ValueError` naming the first bin that
+differs, and so is a window with bins centred before the clock's zero (trim
+them first). `two_arm_count_response(...)` is the same operator exposed
 standalone for synthesizing or checking expected counts (it additionally
 reports the per-arm acquisition-window loss). A resolution *without* the
 exact-response inputs still fails closed with a `ValueError`, and
 `fit_energy_scale` / `fit_energy_range` are not yet supported through the
-exact response (the response clock and the energy axis would disagree).
+exact response.
 
 Counts specific options are:
 

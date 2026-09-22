@@ -369,16 +369,17 @@ impl Default for CountsBackgroundConfig {
 
 /// Source and detector-bin information required for exact resolved-count fits.
 ///
-/// `UnifiedFitConfig::energies` supplies the true-energy quadrature points.
-/// The observed open/sample count arrays must be in the same detector-time
-/// order as consecutive intervals in `detector_time_edges_us`.
+/// `UnifiedFitConfig::energies` must be the grid [`exact_true_energies`]
+/// builds from these edges and the response's flight path: one true energy
+/// per detector bin, ascending. The observed open/sample count arrays are in
+/// detector-time order, one per interval of `detector_time_edges_us`.
 #[derive(Debug, Clone)]
 pub struct ExactCountResponseConfig {
-    /// Incident neutron fluence already integrated over each true-energy
-    /// quadrature element, with detector efficiency folded in — the discrete
-    /// `F_j = w_j ε(E_j) Φ(E_j)` of the pipeline-map contract (R5·7). The
-    /// absolute scale cancels in the profiled count likelihood; the energy
-    /// dependence does not.
+    /// Incident neutron fluence per true energy, with detector efficiency
+    /// folded in — the discrete `F_j = ε(E_j) Φ(E_j)` of the pipeline-map
+    /// contract (R5·7), in the grid's ascending order. The absolute scale
+    /// cancels in the profiled count likelihood; the energy dependence does
+    /// not.
     pub incident_fluence_weights: Vec<f64>,
     /// Actual detector-time bin edges in ascending microseconds.
     pub detector_time_edges_us: Vec<f64>,
@@ -1114,6 +1115,55 @@ impl UnifiedFitConfig {
     }
 }
 
+/// One true energy per detector bin, ascending, at the bin-centre time of the
+/// response clock `timing_offset_us + t0_us` over the flight path
+/// `flight_path_m · l_scale`.
+pub fn exact_true_energies(
+    detector_time_edges_us: &[f64],
+    timing_offset_us: f64,
+    flight_path_m: f64,
+    t0_us: f64,
+    l_scale: f64,
+) -> Result<Vec<f64>, PipelineError> {
+    if detector_time_edges_us.len() < 2 {
+        return Err(PipelineError::InvalidParameter(format!(
+            "detector_time_edges_us needs at least two edges, got {}",
+            detector_time_edges_us.len()
+        )));
+    }
+    if !detector_time_edges_us.iter().all(|t| t.is_finite())
+        || !detector_time_edges_us.windows(2).all(|w| w[0] < w[1])
+    {
+        return Err(PipelineError::InvalidParameter(
+            "detector_time_edges_us must be finite and strictly ascending".into(),
+        ));
+    }
+    let clock_shift_us = timing_offset_us + t0_us;
+    let effective_flight_path_m = flight_path_m * l_scale;
+    if !clock_shift_us.is_finite()
+        || !effective_flight_path_m.is_finite()
+        || effective_flight_path_m <= 0.0
+    {
+        return Err(PipelineError::InvalidParameter(format!(
+            "the response clock needs a finite offset and a positive flight path, got \
+             offset {clock_shift_us} µs and {effective_flight_path_m} m"
+        )));
+    }
+    let mut energies = Vec::with_capacity(detector_time_edges_us.len() - 1);
+    for (bin, edges) in detector_time_edges_us.windows(2).enumerate() {
+        let tof_us = 0.5 * (edges[0] + edges[1]) - clock_shift_us;
+        if tof_us <= 0.0 {
+            return Err(PipelineError::InvalidParameter(format!(
+                "detector-time bin {bin} is centred {tof_us} µs after the response clock's \
+                 zero; trim the bins before the trigger"
+            )));
+        }
+        energies.push(tof_to_energy(tof_us, effective_flight_path_m));
+    }
+    energies.reverse();
+    Ok(energies)
+}
+
 /// Validate the exact separate-arm contract for count-domain resolution.
 ///
 /// The physical detector observes separately broadened arms `R[Phi]` and
@@ -1159,12 +1209,53 @@ pub(crate) fn validate_counts_resolution_route(
                     .into(),
             )
         })?;
-        if exact.incident_fluence_weights.len() != config.energies().len() {
+        if exact.detector_time_edges_us.len() != observed_bin_count + 1 {
+            return Err(PipelineError::ShapeMismatch(format!(
+                "exact_count_response detector_time_edges_us length {} must be one \
+                 greater than the observed count-bin length {}",
+                exact.detector_time_edges_us.len(),
+                observed_bin_count
+            )));
+        }
+        if !exact.timing_offset_us.is_finite() {
+            return Err(PipelineError::InvalidParameter(format!(
+                "exact_count_response timing_offset_us must be finite, got {}",
+                exact.timing_offset_us
+            )));
+        }
+        let expected = exact_true_energies(
+            &exact.detector_time_edges_us,
+            exact.timing_offset_us,
+            resolution.flight_path_m(),
+            0.0,
+            1.0,
+        )?;
+        let energies = config.energies();
+        if energies.len() != expected.len() {
+            return Err(PipelineError::InvalidParameter(format!(
+                "the true-energy grid has {} points but the detector axis has {} bins; \
+                 build the grid with exact_true_energies",
+                energies.len(),
+                expected.len()
+            )));
+        }
+        if let Some(i) =
+            (0..energies.len()).find(|&i| energies[i].to_bits() != expected[i].to_bits())
+        {
+            return Err(PipelineError::InvalidParameter(format!(
+                "true-energy grid point {i} is {} eV but the detector clock puts bin {} at \
+                 {} eV; build the grid with exact_true_energies",
+                energies[i],
+                expected.len() - 1 - i,
+                expected[i]
+            )));
+        }
+        if exact.incident_fluence_weights.len() != energies.len() {
             return Err(PipelineError::ShapeMismatch(format!(
                 "exact_count_response incident_fluence_weights length {} must match \
-                 the true-energy grid length {}",
+                 the true-energy grid length {}: one weight per true energy",
                 exact.incident_fluence_weights.len(),
-                config.energies().len()
+                energies.len()
             )));
         }
         // Validate the fluence VALUES at the boundary, not deep inside
@@ -1189,20 +1280,6 @@ pub(crate) fn validate_counts_resolution_route(
                     .into(),
             ));
         }
-        if exact.detector_time_edges_us.len() != observed_bin_count + 1 {
-            return Err(PipelineError::ShapeMismatch(format!(
-                "exact_count_response detector_time_edges_us length {} must be one \
-                 greater than the observed count-bin length {}",
-                exact.detector_time_edges_us.len(),
-                observed_bin_count
-            )));
-        }
-        if !exact.timing_offset_us.is_finite() {
-            return Err(PipelineError::InvalidParameter(format!(
-                "exact_count_response timing_offset_us must be finite, got {}",
-                exact.timing_offset_us
-            )));
-        }
         if config.fit_energy_scale() {
             return Err(PipelineError::InvalidParameter(
                 "energy-scale fitting is not yet connected to the exact two-arm \
@@ -1213,9 +1290,8 @@ pub(crate) fn validate_counts_resolution_route(
         }
         if config.fit_energy_range().is_some() {
             return Err(PipelineError::InvalidParameter(
-                "fit_energy_range is not yet supported by exact detector-time count \
-                 response because true-energy points and detector-time bins are \
-                 different axes"
+                "fit_energy_range is not yet supported by the exact detector-time \
+                 count response"
                     .into(),
             ));
         }
@@ -1902,68 +1978,7 @@ fn fit_counts_joint_poisson(
         stacked = Box::new(exact_model);
 
         if let Some(bi) = bg_indices {
-            // The SAMMY apparent-transmission background is evaluated per
-            // MEASURED bin, so each detector-time bin needs a pseudo-energy:
-            // bin center in time, fixed offset removed, then TOF -> energy.
-            //
-            // A real acquisition's time axis may start at the frame trigger,
-            // BEFORE the calibrated offset, so leading bins have a
-            // non-positive corrected TOF and no physical energy. Those bins
-            // are unoccupied (an occupied one with no detector response was
-            // already rejected by the pre-check above), and an unoccupied bin
-            // contributes identically zero deviance for every parameter value
-            // (its profiled rate is zero), so its background value cannot
-            // affect the fit. Rejecting the whole fit for them would refuse a
-            // mainstream acquisition that fits fine without background; only
-            // an OCCUPIED bin without a physical energy is a real error.
-            let flight_path_m = response.flight_path_m();
-            let raw_energies: Vec<Option<f64>> = exact
-                .detector_time_edges_us
-                .windows(2)
-                .map(|edges| {
-                    let corrected_tof_us = 0.5 * (edges[0] + edges[1]) - exact.timing_offset_us;
-                    let energy = tof_to_energy(corrected_tof_us, flight_path_m);
-                    (energy.is_finite() && energy > 0.0).then_some(energy)
-                })
-                .collect();
-            for (bin, energy) in raw_energies.iter().enumerate() {
-                let occupied = flux[bin] + sample_counts[bin] > 0.0;
-                if energy.is_none() && occupied {
-                    return Err(PipelineError::InvalidParameter(format!(
-                        "detector-time bin {bin} carries observed counts but has \
-                         non-positive time after the fixed timing offset, so the \
-                         SAMMY apparent-transmission background has no physical \
-                         energy there; check timing_offset_us against the \
-                         detector-time axis"
-                    )));
-                }
-            }
-            // Fill the non-contributing bins with their nearest valid
-            // neighbour's energy: any finite positive value leaves the model
-            // finite (no NaN into the Jacobian/Fisher rows) and the bin's
-            // zero deviance weight makes the choice unobservable.
-            let first_valid = raw_energies
-                .iter()
-                .flatten()
-                .copied()
-                .next()
-                .ok_or_else(|| {
-                    PipelineError::InvalidParameter(
-                        "no detector-time bin has a positive time after the fixed timing \
-                     offset; the entire acquisition window precedes timing_offset_us"
-                            .to_string(),
-                    )
-                })?;
-            let mut last_valid = first_valid;
-            let detector_energies: Vec<f64> = raw_energies
-                .into_iter()
-                .map(|energy| {
-                    if let Some(value) = energy {
-                        last_valid = value;
-                    }
-                    last_valid
-                })
-                .collect();
+            let detector_energies: Vec<f64> = config.energies().iter().rev().copied().collect();
             stacked = Box::new(NormalizedTransmissionModel::new(
                 stacked,
                 &detector_energies,
@@ -6060,8 +6075,6 @@ mod tests {
 
     /// Shared closed loop for the resolved-count path: recover a known
     /// density from counts generated by the separate-arm detector equation.
-    /// The true-energy quadrature and detector-time bin counts deliberately
-    /// differ so a future ratio-on-one-grid shortcut cannot satisfy it.
     /// `timing_offset_us` is threaded through BOTH offset uses — the response
     /// kernel placement and the detector pseudo-energy for the fixed SAMMY
     /// background — so the two sign conventions are pinned together.
@@ -6071,7 +6084,11 @@ mod tests {
 
         let data = u238_single_resonance();
         let true_density = 5.0e-4;
-        let energies: Vec<f64> = (0..80).map(|i| 5.0 + i as f64 * 3.0 / 79.0).collect();
+        let detector_edges: Vec<f64> = (0..102)
+            .map(|i| 630.0 + timing_offset_us + i as f64 * 2.5)
+            .collect();
+        let energies = exact_true_energies(&detector_edges, timing_offset_us, 25.0, 0.0, 1.0)
+            .expect("bins after the trigger");
         let (true_transmission, _) = synthetic_transmission(&data, true_density, &energies);
         let response = ResolutionFunction::Tabulated(Arc::new(
             TabulatedResolution::from_kernels(
@@ -6081,15 +6098,9 @@ mod tests {
             )
             .expect("valid detector-time response"),
         ));
-        let source: Vec<f64> = energies
-            .iter()
-            .enumerate()
-            .map(|(index, _)| 4.0e4 * (1.0 + 0.4 * index as f64 / 79.0))
-            .collect();
-        // Shift the acquisition window with the offset so the delayed pulses
-        // land in the same bins relative to the window.
-        let detector_edges: Vec<f64> = (0..102)
-            .map(|i| 630.0 + timing_offset_us + i as f64 * 2.5)
+        let n_e = energies.len();
+        let source: Vec<f64> = (0..n_e)
+            .map(|index| 4.0e4 * (1.0 + 0.4 * index as f64 / (n_e - 1) as f64))
             .collect();
         let expected = two_arm_count_response(
             &energies,
@@ -6112,15 +6123,6 @@ mod tests {
                 if open == 0.0 {
                     0.0
                 } else {
-                    // Deliberately the SAME pseudo-energy convention the route
-                    // implements (bin center in TIME, fixed offset subtracted,
-                    // then TOF->energy) — the pinned contract for where SAMMY's
-                    // apparent-transmission background is evaluated (Norm() in
-                    // sammy/src/cro/mnrm1.f90 applies it per measured point).
-                    // This closed loop pins fixture/implementation coherence of
-                    // that convention; the implementation-independent numeric
-                    // anchor for the response itself is the hand-computed test
-                    // below. Do not "simplify" one side without the other.
                     let measured_energy =
                         tof_to_energy(0.5 * (edges[0] + edges[1]) - timing_offset_us, 25.0);
                     open * (fixed_anorm * sample / open
@@ -6153,9 +6155,6 @@ mod tests {
             back_a_init: fixed_back_a,
             back_b_init: fixed_back_b,
             back_c_init: 0.0,
-            // Both exponential-tail fit flags are false, which BackgroundConfig
-            // documents as DISABLING the BackD/BackF term entirely — these two
-            // seeds are inert here (the fixture correctly carries no tail).
             back_d_init: 0.01,
             back_f_init: 1.0,
             fit_anorm: false,
@@ -6210,7 +6209,9 @@ mod tests {
         let true_density = 5.0e-4;
         let true_anorm = 0.97;
         let true_back_a = 0.015;
-        let energies: Vec<f64> = (0..80).map(|i| 5.0 + i as f64 * 3.0 / 79.0).collect();
+        let detector_edges: Vec<f64> = (0..102).map(|i| 630.0 + i as f64 * 2.5).collect();
+        let energies = exact_true_energies(&detector_edges, 0.0, 25.0, 0.0, 1.0)
+            .expect("bins after the trigger");
         let (true_transmission, _) = synthetic_transmission(&data, true_density, &energies);
         let response = ResolutionFunction::Tabulated(Arc::new(
             TabulatedResolution::from_kernels(
@@ -6223,9 +6224,8 @@ mod tests {
         let source: Vec<f64> = energies
             .iter()
             .enumerate()
-            .map(|(index, _)| 4.0e4 * (1.0 + 0.4 * index as f64 / 79.0))
+            .map(|(index, _)| 4.0e4 * (1.0 + 0.4 * index as f64 / (energies.len() - 1) as f64))
             .collect();
-        let detector_edges: Vec<f64> = (0..102).map(|i| 630.0 + i as f64 * 2.5).collect();
         let expected = two_arm_count_response(
             &energies,
             &source,
@@ -6322,7 +6322,9 @@ mod tests {
         let data = u238_single_resonance();
         let true_density = 5.0e-4;
         let true_b1 = 0.02;
-        let energies: Vec<f64> = (0..80).map(|i| 5.0 + i as f64 * 3.0 / 79.0).collect();
+        let detector_edges: Vec<f64> = (0..102).map(|i| 630.0 + i as f64 * 2.5).collect();
+        let energies = exact_true_energies(&detector_edges, 0.0, 25.0, 0.0, 1.0)
+            .expect("bins after the trigger");
         let (true_transmission, _) = synthetic_transmission(&data, true_density, &energies);
         // Baseline reference energy: the fit uses
         // baseline_reference_energy_active(energies, None); mirror it by
@@ -6345,9 +6347,8 @@ mod tests {
         let source: Vec<f64> = energies
             .iter()
             .enumerate()
-            .map(|(index, _)| 4.0e4 * (1.0 + 0.4 * index as f64 / 79.0))
+            .map(|(index, _)| 4.0e4 * (1.0 + 0.4 * index as f64 / (energies.len() - 1) as f64))
             .collect();
-        let detector_edges: Vec<f64> = (0..102).map(|i| 630.0 + i as f64 * 2.5).collect();
         let expected = two_arm_count_response(
             &energies,
             &source,
@@ -6422,17 +6423,19 @@ mod tests {
             ResolutionFunction::Tabulated(Arc::new(
                 TabulatedResolution::from_kernels(
                     vec![25.0],
-                    vec![(vec![-1.0, 0.0, 1.0], vec![0.0, 1.0, 0.0])],
+                    vec![(vec![-0.25, 0.0, 0.25], vec![0.0, 1.0, 0.0])],
                     25.0,
                 )
                 .expect("valid triangle response"),
             ))
         };
         let arrival = TOF_FACTOR * 25.0 / 25.0_f64.sqrt();
+        let two_bin_edges = vec![arrival - 1.0, arrival, arrival + 1.0];
+        let grid = exact_true_energies(&two_bin_edges, 0.0, 25.0, 0.0, 1.0).unwrap();
         let data = u238_single_resonance();
-        let base_config = |resolution: Option<ResolutionFunction>| {
+        let base_config = |energies: Vec<f64>, resolution: Option<ResolutionFunction>| {
             UnifiedFitConfig::new(
-                vec![25.0],
+                energies,
                 vec![data.clone()],
                 vec!["U-238".into()],
                 0.0,
@@ -6442,31 +6445,27 @@ mod tests {
             .unwrap()
             .with_solver(SolverConfig::PoissonKL(PoissonConfig::default()))
         };
-        let exact = |edges: Vec<f64>| ExactCountResponseConfig {
-            incident_fluence_weights: vec![100.0],
+        let exact = |fluence: Vec<f64>, edges: Vec<f64>| ExactCountResponseConfig {
+            incident_fluence_weights: fluence,
             detector_time_edges_us: edges,
             timing_offset_us: 0.0,
         };
-        let two_bin_edges = vec![arrival - 1.0, arrival, arrival + 1.0];
+        let lit = vec![100.0, 100.0];
+        let bin_0_dead = vec![100.0, 0.0];
         let counts_2 = InputData::Counts {
             sample_counts: vec![10.0, 10.0],
             open_beam_counts: vec![50.0, 50.0],
         };
 
-        // (a) Occupied dead bin: window entirely outside the response
-        // support, but the observed arrays carry counts.
         let err = fit_spectrum_typed(
             &counts_2,
-            &base_config(Some(make_response())).with_exact_count_response(exact(vec![
-                arrival + 10.0,
-                arrival + 11.0,
-                arrival + 12.0,
-            ])),
+            &base_config(grid.clone(), Some(make_response()))
+                .with_exact_count_response(exact(bin_0_dead.clone(), two_bin_edges.clone())),
         )
         .expect_err("occupied dead bin must be a hard error");
         assert!(
             err.to_string()
-                .contains("zero detector response in occupied detector bin"),
+                .contains("zero detector response in occupied detector bin 0"),
             "{err}"
         );
 
@@ -6482,11 +6481,8 @@ mod tests {
                 flux: vec![50.0, 50.0],
                 background: vec![5.0, 5.0],
             },
-            &base_config(Some(make_response())).with_exact_count_response(exact(vec![
-                arrival + 10.0,
-                arrival + 11.0,
-                arrival + 12.0,
-            ])),
+            &base_config(grid.clone(), Some(make_response()))
+                .with_exact_count_response(exact(bin_0_dead.clone(), two_bin_edges.clone())),
         )
         .expect_err("dropping every bin must be reported, not fitted");
         let message = err.to_string();
@@ -6511,11 +6507,8 @@ mod tests {
                 flux: vec![50.0, 50.0],
                 background: vec![0.0, 5.0],
             },
-            &base_config(Some(make_response())).with_exact_count_response(exact(vec![
-                arrival + 10.0,
-                arrival + 11.0,
-                arrival + 12.0,
-            ])),
+            &base_config(grid.clone(), Some(make_response()))
+                .with_exact_count_response(exact(bin_0_dead, two_bin_edges.clone())),
         )
         .expect_err("a dead bin with no background of its own is still unexplained");
         assert!(
@@ -6527,12 +6520,12 @@ mod tests {
         // (b) Exact config attached to normalized transmission input.
         let err = fit_spectrum_typed(
             &InputData::Transmission {
-                transmission: vec![0.9],
-                uncertainty: vec![0.01],
+                transmission: vec![0.9, 0.9],
+                uncertainty: vec![0.01, 0.01],
             },
-            &base_config(Some(make_response()))
+            &base_config(grid.clone(), Some(make_response()))
                 .with_solver(SolverConfig::LevenbergMarquardt(LmConfig::default()))
-                .with_exact_count_response(exact(two_bin_edges.clone())),
+                .with_exact_count_response(exact(lit.clone(), two_bin_edges.clone())),
         )
         .expect_err("exact config on transmission must be rejected");
         assert!(
@@ -6544,7 +6537,8 @@ mod tests {
         // (c) Exact config without any resolution model.
         let err = fit_spectrum_typed(
             &counts_2,
-            &base_config(None).with_exact_count_response(exact(two_bin_edges.clone())),
+            &base_config(grid.clone(), None)
+                .with_exact_count_response(exact(lit.clone(), two_bin_edges.clone())),
         )
         .expect_err("exact config without resolution must be rejected");
         assert!(
@@ -6556,13 +6550,8 @@ mod tests {
         // (d) Fluence length != true-energy grid length.
         let err = fit_spectrum_typed(
             &counts_2,
-            &base_config(Some(make_response())).with_exact_count_response(
-                ExactCountResponseConfig {
-                    incident_fluence_weights: vec![100.0, 100.0],
-                    detector_time_edges_us: two_bin_edges.clone(),
-                    timing_offset_us: 0.0,
-                },
-            ),
+            &base_config(grid.clone(), Some(make_response()))
+                .with_exact_count_response(exact(vec![100.0; 3], two_bin_edges.clone())),
         )
         .expect_err("fluence length mismatch must be rejected");
         assert!(
@@ -6573,8 +6562,8 @@ mod tests {
         // (e) Edge count != observed bins + 1.
         let err = fit_spectrum_typed(
             &counts_2,
-            &base_config(Some(make_response()))
-                .with_exact_count_response(exact(vec![arrival - 1.0, arrival])),
+            &base_config(grid.clone(), Some(make_response()))
+                .with_exact_count_response(exact(lit.clone(), vec![arrival - 1.0, arrival])),
         )
         .expect_err("edge/bin length mismatch must be rejected");
         assert!(
@@ -6585,9 +6574,9 @@ mod tests {
         // (f) Non-finite timing offset.
         let err = fit_spectrum_typed(
             &counts_2,
-            &base_config(Some(make_response())).with_exact_count_response(
+            &base_config(grid.clone(), Some(make_response())).with_exact_count_response(
                 ExactCountResponseConfig {
-                    incident_fluence_weights: vec![100.0],
+                    incident_fluence_weights: lit.clone(),
                     detector_time_edges_us: two_bin_edges.clone(),
                     timing_offset_us: f64::NAN,
                 },
@@ -6602,8 +6591,8 @@ mod tests {
         // (g) Energy-scale fitting through the exact response.
         let err = fit_spectrum_typed(
             &counts_2,
-            &base_config(Some(make_response()))
-                .with_exact_count_response(exact(two_bin_edges.clone()))
+            &base_config(grid.clone(), Some(make_response()))
+                .with_exact_count_response(exact(lit.clone(), two_bin_edges.clone()))
                 .with_energy_scale(0.0, 1.0, 25.0),
         )
         .expect_err("energy-scale through the exact response must be rejected");
@@ -6616,8 +6605,8 @@ mod tests {
         // (h) fit_energy_range through the exact response.
         let err = fit_spectrum_typed(
             &counts_2,
-            &base_config(Some(make_response()))
-                .with_exact_count_response(exact(two_bin_edges.clone()))
+            &base_config(grid.clone(), Some(make_response()))
+                .with_exact_count_response(exact(lit.clone(), two_bin_edges.clone()))
                 .with_fit_energy_range(Some((10.0, 30.0)))
                 .unwrap(),
         )
@@ -6629,14 +6618,15 @@ mod tests {
         );
 
         // (i) Spatial mapping with an exact config: single-spectrum only.
-        let sample = ndarray::Array3::from_elem((1, 2, 2), 10.0);
-        let open_beam = ndarray::Array3::from_elem((1, 2, 2), 50.0);
+        let sample = ndarray::Array3::from_elem((2, 2, 2), 10.0);
+        let open_beam = ndarray::Array3::from_elem((2, 2, 2), 50.0);
         let err = crate::spatial::spatial_map_typed(
             &crate::spatial::InputData3D::Counts {
                 sample_counts: sample.view(),
                 open_beam_counts: open_beam.view(),
             },
-            &base_config(Some(make_response())).with_exact_count_response(exact(two_bin_edges)),
+            &base_config(grid.clone(), Some(make_response()))
+                .with_exact_count_response(exact(lit.clone(), two_bin_edges.clone())),
             None,
             None,
             None,
@@ -6647,30 +6637,44 @@ mod tests {
                 .contains("single-spectrum count fitter only"),
             "{err}"
         );
+
+        let shifted = exact_true_energies(&two_bin_edges, 0.5, 25.0, 0.0, 1.0).unwrap();
+        let err = fit_spectrum_typed(
+            &counts_2,
+            &base_config(shifted, Some(make_response()))
+                .with_exact_count_response(exact(lit.clone(), two_bin_edges.clone())),
+        )
+        .expect_err("a grid off the detector clock must be rejected");
+        assert!(
+            err.to_string()
+                .contains("build the grid with exact_true_energies"),
+            "{err}"
+        );
+
+        let pre_trigger = vec![-1.0, 0.0, 1.0];
+        let err = exact_true_energies(&pre_trigger, 0.0, 25.0, 0.0, 1.0)
+            .expect_err("a bin centred before the trigger has no energy");
+        assert!(
+            err.to_string().contains("trim the bins before the trigger"),
+            "{err}"
+        );
+        let err = fit_spectrum_typed(
+            &counts_2,
+            &base_config(grid, Some(make_response()))
+                .with_exact_count_response(exact(lit, pre_trigger)),
+        )
+        .expect_err("pre-trigger bins must be rejected at the entry point");
+        assert!(
+            err.to_string().contains("trim the bins before the trigger"),
+            "{err}"
+        );
     }
 
-    /// Implementation-independent numeric anchor for the exact fit route,
-    /// parameterized by the fixed clock offset.
-    ///
-    /// Every expected count is HAND-COMPUTED from the unit-triangle kernel
-    /// (each pulse splits 0.5/0.5 across two adjacent 1 µs bins), not
-    /// synthesized with `two_arm_count_response` — so a shared defect in
-    /// `detector_bin_probabilities` cannot cancel between oracle and fit.
-    /// The fixed SAMMY background uses `BackB/√E`, with the pseudo-energies
-    /// written from the closed-form `E = (TOF_FACTOR·L/t)²` at
-    /// `t = center − offset`, so BOTH uses of the offset (kernel placement
-    /// and background pseudo-energy) are anchored without calling either
-    /// production helper. Note the corrected times are offset-independent by
-    /// construction: a sign flip in either use breaks recovery at offset ≠ 0.
-    /// The inner physics is a precomputed cross-section stack chosen so the
-    /// true transmission is exactly [0.2, 0.8] at the true density.
     fn run_hand_computed_anchor(timing_offset_us: f64) {
         use nereids_physics::resolution::{ResolutionFunction, TOF_FACTOR, TabulatedResolution};
 
         let flight_path_m = 25.0_f64;
         let arrival_0 = TOF_FACTOR * flight_path_m / 25.0_f64.sqrt();
-        let energy_1 = (TOF_FACTOR * flight_path_m / (arrival_0 + 1.0)).powi(2);
-        let energies = vec![25.0, energy_1];
         let response = ResolutionFunction::Tabulated(Arc::new(
             TabulatedResolution::from_kernels(
                 vec![25.0],
@@ -6679,39 +6683,67 @@ mod tests {
             )
             .expect("valid triangle response"),
         ));
-        // Pulses sit at `offset + TOF(E)`, so the window shifts with the
-        // offset and the hand-derived triangle bin probabilities on edges
-        // [a-1, a, a+1, a+2] are unchanged:
-        //   E0 -> [0.5, 0.5, 0], E1 -> [0, 0.5, 0.5].
-        // With fluence F = [100, 200] and T = [0.2, 0.8]:
-        //   open   = [50, 150, 100]   and   T_eff = [0.2, 0.6, 0.8].
-        let base = timing_offset_us + arrival_0;
-        let detector_edges = vec![base - 1.0, base, base + 1.0, base + 2.0];
-        let open_beam_counts = vec![50.0, 150.0, 100.0];
-        let t_eff = [0.2_f64, 0.6, 0.8];
+        // ∫ max(0, 1 − |x|) dx over [lo, hi]: the mass a unit triangle of
+        // half-width 1 µs puts into a time interval.
+        fn triangle_mass(lo: f64, hi: f64) -> f64 {
+            let primitive = |x: f64| {
+                let x = x.clamp(-1.0, 1.0);
+                if x < 0.0 {
+                    x + 0.5 * x * x + 0.5
+                } else {
+                    x - 0.5 * x * x + 0.5
+                }
+            };
+            primitive(hi) - primitive(lo)
+        }
 
-        // Fixed SAMMY background on the measured bins: BackB/√E at the
-        // hand-written pseudo-energy of each bin center, offset removed.
+        let base = timing_offset_us + arrival_0;
+        let detector_edges = vec![base - 0.5, base + 0.5, base + 1.5, base + 2.5];
+        let energies =
+            exact_true_energies(&detector_edges, timing_offset_us, flight_path_m, 0.0, 1.0)
+                .expect("bins after the trigger");
+        let fluence_per_bin = [100.0_f64, 200.0, 300.0];
+        let transmission_per_bin = [0.2_f64, 0.5, 0.8];
+        let pulse_centres: Vec<f64> = (0..3).map(|k| base + k as f64).collect();
+        let mass = |pulse: usize, bin: usize| {
+            triangle_mass(
+                detector_edges[bin] - pulse_centres[pulse],
+                detector_edges[bin + 1] - pulse_centres[pulse],
+            )
+        };
+        let open_beam_counts: Vec<f64> = (0..3)
+            .map(|bin| (0..3).map(|p| fluence_per_bin[p] * mass(p, bin)).sum())
+            .collect();
+        let sample_signal: Vec<f64> = (0..3)
+            .map(|bin| {
+                (0..3)
+                    .map(|p| fluence_per_bin[p] * transmission_per_bin[p] * mass(p, bin))
+                    .sum()
+            })
+            .collect();
+
         let fixed_anorm = 1.0_f64;
         let fixed_back_b = 0.05_f64;
         let sample_counts: Vec<f64> = detector_edges
             .windows(2)
-            .zip(t_eff)
+            .zip(&sample_signal)
             .zip(&open_beam_counts)
-            .map(|((edges, t), &open)| {
+            .map(|((edges, &signal), &open)| {
                 let corrected_tof_us = 0.5 * (edges[0] + edges[1]) - timing_offset_us;
                 let pseudo_energy = (TOF_FACTOR * flight_path_m / corrected_tof_us).powi(2);
-                open * (fixed_anorm * t + fixed_back_b / pseudo_energy.sqrt())
+                fixed_anorm * signal + open * fixed_back_b / pseudo_energy.sqrt()
             })
             .collect();
 
-        // Cross sections chosen so exp(-d_true * sigma_j) = [0.2, 0.8].
         let true_density = 1.0e-3;
         let data = u238_single_resonance();
-        let xs: Vec<Vec<f64>> = vec![vec![
-            -(0.2_f64.ln()) / true_density,
-            -(0.8_f64.ln()) / true_density,
-        ]];
+        let xs: Vec<Vec<f64>> = vec![
+            transmission_per_bin
+                .iter()
+                .rev()
+                .map(|t| -t.ln() / true_density)
+                .collect(),
+        ];
 
         let config = UnifiedFitConfig::new(
             energies,
@@ -6730,7 +6762,7 @@ mod tests {
                 ..Default::default()
             }))
             .with_exact_count_response(ExactCountResponseConfig {
-                incident_fluence_weights: vec![100.0, 200.0],
+                incident_fluence_weights: fluence_per_bin.iter().rev().copied().collect(),
                 detector_time_edges_us: detector_edges,
                 timing_offset_us,
             })
@@ -6771,101 +6803,6 @@ mod tests {
         run_hand_computed_anchor(0.0);
     }
 
-    /// Empty pre-trigger bins must not block a background fit.
-    ///
-    /// A real acquisition's time axis can start at the frame trigger, before
-    /// the calibrated `timing_offset_us`, so leading bins have no physical
-    /// pseudo-energy. They are also unoccupied and dead in response, hence
-    /// contribute identically zero deviance — rejecting the whole fit for
-    /// them would refuse a mainstream acquisition that fits fine WITHOUT
-    /// background (the asymmetry a reviewer reproduced). An OCCUPIED bin
-    /// with no physical energy still fails closed.
-    #[test]
-    fn exact_route_tolerates_empty_pre_trigger_bins_with_background() {
-        use nereids_physics::counts_response::two_arm_count_response;
-        use nereids_physics::resolution::{ResolutionFunction, TabulatedResolution};
-
-        let timing_offset_us = 5.0_f64;
-        let data = u238_single_resonance();
-        let true_density = 5.0e-4;
-        let energies: Vec<f64> = (0..60).map(|i| 5.0 + i as f64 * 3.0 / 59.0).collect();
-        let (true_transmission, _) = synthetic_transmission(&data, true_density, &energies);
-        let response = ResolutionFunction::Tabulated(Arc::new(
-            TabulatedResolution::from_kernels(
-                vec![6.5],
-                vec![(vec![-3.0, 0.0, 3.0], vec![0.0, 1.0, 0.0])],
-                25.0,
-            )
-            .expect("valid detector-time response"),
-        ));
-        let source: Vec<f64> = vec![4.0e4; energies.len()];
-        // Window starts at t = 0 (frame trigger): the first two bin centers
-        // (1.25 µs, 3.75 µs) precede the 5 µs offset.
-        let detector_edges: Vec<f64> = (0..340).map(|i| i as f64 * 2.5).collect();
-        let expected = two_arm_count_response(
-            &energies,
-            &source,
-            &true_transmission,
-            &detector_edges,
-            timing_offset_us,
-            &response,
-        )
-        .expect("valid synthetic count response");
-        assert!(
-            expected.open_beam[0] == 0.0 && expected.sample[0] == 0.0,
-            "fixture must have an empty pre-trigger bin 0"
-        );
-
-        let config = UnifiedFitConfig::new(
-            energies,
-            vec![data],
-            vec!["U-238".into()],
-            0.0,
-            Some(response),
-            vec![2.0e-4],
-        )
-        .unwrap()
-        .with_solver(SolverConfig::PoissonKL(PoissonConfig {
-            max_iter: 400,
-            ..Default::default()
-        }))
-        .with_exact_count_response(ExactCountResponseConfig {
-            incident_fluence_weights: source,
-            detector_time_edges_us: detector_edges,
-            timing_offset_us,
-        })
-        // Background ON: this is the combination that used to be rejected.
-        .with_transmission_background(BackgroundConfig {
-            anorm_init: 1.0,
-            back_a_init: 0.0,
-            back_b_init: 0.0,
-            back_c_init: 0.0,
-            back_d_init: 0.0,
-            back_f_init: 1.0,
-            fit_anorm: false,
-            fit_back_a: true,
-            fit_back_b: false,
-            fit_back_c: false,
-            fit_back_d: false,
-            fit_back_f: false,
-        });
-        let result = fit_spectrum_typed(
-            &InputData::Counts {
-                sample_counts: expected.sample,
-                open_beam_counts: expected.open_beam,
-            },
-            &config,
-        )
-        .expect("empty pre-trigger bins must not reject a background fit");
-
-        assert!(result.converged, "fit did not converge");
-        assert!(
-            (result.densities[0] - true_density).abs() / true_density < 1.0e-3,
-            "density: fitted={}, true={true_density}",
-            result.densities[0]
-        );
-    }
-
     /// The exact route accepts an analytical Ikeda–Carpenter response as
     /// well as a tabulated kernel, but every other exact-route test uses a
     /// tabulated triangle — this closes the IC branch end to end, through
@@ -6887,21 +6824,20 @@ mod tests {
         let flight_path_m = 25.0_f64;
         let data = u238_single_resonance();
         let true_density = 5.0e-4;
-        let energies: Vec<f64> = (0..60).map(|i| 5.0 + i as f64 * 3.0 / 59.0).collect();
+        let first_arrival = TOF_FACTOR * flight_path_m / 8.0_f64.sqrt();
+        let detector_edges: Vec<f64> = (0..160).map(|i| first_arrival + i as f64 * 2.0).collect();
+        let energies = exact_true_energies(&detector_edges, 0.0, flight_path_m, 0.0, 1.0)
+            .expect("bins after the trigger");
         let (true_transmission, _) = synthetic_transmission(&data, true_density, &energies);
         let response = ResolutionFunction::IkedaCarpenter(Arc::new(
             IkedaCarpenter::new(
                 IkedaCarpenterParams::constant(2.0, 0.1, 0.0),
                 flight_path_m,
-                &SynthesisGrid::new(4.0, 9.0),
+                &SynthesisGrid::new(3.0, 9.0),
             )
             .expect("valid prompt-only IC model"),
         ));
         let source: Vec<f64> = vec![4.0e4; energies.len()];
-        // Causal pulse: start the window at the earliest nominal arrival
-        // (highest energy) and run past the latest one.
-        let first_arrival = TOF_FACTOR * flight_path_m / 8.0_f64.sqrt();
-        let detector_edges: Vec<f64> = (0..160).map(|i| first_arrival + i as f64 * 2.0).collect();
         let expected = two_arm_count_response(
             &energies,
             &source,
@@ -6948,100 +6884,6 @@ mod tests {
             (result.densities[0] - true_density).abs() / true_density < 1.0e-3,
             "density: fitted={}, true={true_density}",
             result.densities[0]
-        );
-    }
-
-    /// The pre-trigger tolerance above must NOT weaken the occupied case:
-    /// counts in a bin with no physical energy remain a hard error.
-    ///
-    /// The fixture must reach the BACKGROUND pseudo-energy guard, not the
-    /// earlier occupied-dead-bin pre-check, so bin 0 needs observed counts
-    /// AND nonzero detector response while still preceding the offset. A
-    /// mode-centred kernel whose negative half-width (20 µs) exceeds the
-    /// true-energy flight time (~10 µs at 32.7 keV over 25 m) deposits
-    /// probability before the trigger; the assertion therefore pins the
-    /// pre-trigger message alone.
-    #[test]
-    fn exact_route_rejects_occupied_pre_trigger_bin_with_background() {
-        use nereids_physics::counts_response::DetectorBinResponseMatrix;
-        use nereids_physics::resolution::{ResolutionFunction, TOF_FACTOR, TabulatedResolution};
-
-        let flight_path_m = 25.0_f64;
-        let true_energy = 32_670.0_f64;
-        let tof_us = TOF_FACTOR * flight_path_m / true_energy.sqrt();
-        let timing_offset_us = 30.0_f64;
-        let arrival = timing_offset_us + tof_us; // ≈ 40 µs
-        assert!(
-            tof_us < 20.0,
-            "fixture needs a flight time inside the kernel half-width, got {tof_us}"
-        );
-        let response = ResolutionFunction::Tabulated(Arc::new(
-            TabulatedResolution::from_kernels(
-                vec![true_energy],
-                vec![(vec![-20.0, 0.0, 20.0], vec![0.0, 1.0, 0.0])],
-                flight_path_m,
-            )
-            .expect("valid wide triangle response"),
-        ));
-        // Bin 0 = [arrival-22, arrival-14]: inside the kernel's negative
-        // tail (nonzero response) and entirely before the trigger offset.
-        let detector_edges = vec![
-            arrival - 22.0,
-            arrival - 14.0,
-            arrival - 6.0,
-            arrival + 2.0,
-            arrival + 10.0,
-        ];
-        // Guard the guard: prove bin 0 really has response, so this test
-        // cannot silently degrade into the dead-bin pre-check again.
-        let matrix = DetectorBinResponseMatrix::new(
-            &[true_energy],
-            &detector_edges,
-            timing_offset_us,
-            &response,
-        )
-        .expect("valid response matrix");
-        assert!(
-            matrix.probability(0, 0) > 0.0,
-            "fixture bin 0 must have nonzero detector response"
-        );
-        assert!(
-            0.5 * (detector_edges[0] + detector_edges[1]) < timing_offset_us,
-            "fixture bin 0 must precede the timing offset"
-        );
-
-        let config = UnifiedFitConfig::new(
-            vec![true_energy],
-            vec![u238_single_resonance()],
-            vec!["U-238".into()],
-            0.0,
-            Some(response),
-            vec![1.0e-4],
-        )
-        .unwrap()
-        .with_solver(SolverConfig::PoissonKL(PoissonConfig::default()))
-        .with_exact_count_response(ExactCountResponseConfig {
-            incident_fluence_weights: vec![100.0],
-            detector_time_edges_us: detector_edges,
-            timing_offset_us,
-        })
-        .with_transmission_background(BackgroundConfig {
-            fit_anorm: false,
-            fit_back_a: true,
-            ..BackgroundConfig::default()
-        });
-        let err = fit_spectrum_typed(
-            &InputData::Counts {
-                sample_counts: vec![5.0, 20.0, 20.0, 5.0],
-                open_beam_counts: vec![10.0, 50.0, 50.0, 10.0],
-            },
-            &config,
-        )
-        .expect_err("occupied bin without a physical energy must fail closed");
-        let msg = err.to_string();
-        assert!(
-            msg.contains("carries observed counts"),
-            "expected the pre-trigger occupied-bin rejection, got: {msg}"
         );
     }
 

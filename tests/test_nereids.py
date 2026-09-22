@@ -1203,10 +1203,9 @@ class TestTwoArmCountBackground:
 class TestExactResolvedCountsRoute:
     """End-to-end anchor for the exact separate-arm count route (Wave-1 PR-2b).
 
-    Counts are synthesized with the public two-arm operator on a detector-time
-    grid that deliberately differs from the true-energy quadrature, then fitted
-    back through ``fit_counts_spectrum_typed`` with the exact-response inputs.
-    A future ratio-on-one-grid shortcut cannot satisfy this test.
+    Counts are synthesized with the public two-arm operator on the true-energy
+    grid the route derives from the detector-time edges, then fitted back
+    through ``fit_counts_spectrum_typed`` with the exact-response inputs.
     """
 
     TOF_FACTOR = 72.298254398292800
@@ -1234,15 +1233,16 @@ class TestExactResolvedCountsRoute:
         response = nereids.load_resolution(str(kernel_path), self.L)
 
         true_density = 5.0e-4
-        energies = np.linspace(5.0, 8.0, 80)
+        detector_edges = 630.0 + 2.5 * np.arange(102)
+        energies = nereids.exact_count_true_energies(detector_edges, 0.0, self.L)
         # Same temperature as the fit default (293.6 K): this anchor pins the
         # detector-response routing — the Doppler physics has its own oracles.
         true_transmission = np.asarray(
             nereids.forward_model(energies, [(u238_data, true_density)])
         )
 
-        source = 4.0e4 * (1.0 + 0.4 * np.arange(80) / 79.0)
-        detector_edges = 630.0 + 2.5 * np.arange(102)
+        n = len(energies)
+        source = 4.0e4 * (1.0 + 0.4 * np.arange(n) / (n - 1))
 
         open_beam, sample, _open_loss, _sample_loss = nereids.two_arm_count_response(
             energies,
@@ -1350,6 +1350,51 @@ class TestExactCountArgumentGuards:
                 delta_t_us=0.5,
                 delta_l_m=0.005,
                 **kwargs,
+            )
+
+
+class TestExactCountTrueEnergies:
+    """The route-owned true-energy grid and the rejections it enforces."""
+
+    L = 25.0
+
+    @staticmethod
+    def _triangle(tmp_path):
+        kernel_path = tmp_path / "grid_triangle.txt"
+        TestExactResolvedCountsRoute._write_triangle(kernel_path)
+        return nereids.load_resolution(str(kernel_path), 25.0)
+
+    def test_one_energy_per_bin_at_the_bin_centre_time(self):
+        edges = 600.0 + 2.5 * np.arange(41)
+        offset = 7.5
+        energies = nereids.exact_count_true_energies(edges, offset, self.L)
+        assert len(energies) == len(edges) - 1
+        assert np.all(np.diff(energies) > 0.0)
+        centres = 0.5 * (edges[:-1] + edges[1:]) - offset
+        expected = np.array(
+            [nereids.tof_to_energy(float(t), self.L) for t in centres]
+        )[::-1]
+        np.testing.assert_array_equal(energies, expected)
+
+    def test_bins_before_the_clock_zero_are_rejected(self):
+        with pytest.raises(ValueError, match="trim the bins before the trigger"):
+            nereids.exact_count_true_energies(np.array([-1.0, 0.0, 1.0]), 0.0, self.L)
+
+    def test_a_grid_off_the_detector_clock_is_rejected(self, u238_data, tmp_path):
+        response = self._triangle(tmp_path)
+        edges = 630.0 + 2.5 * np.arange(41)
+        shifted = nereids.exact_count_true_energies(edges, 0.5, self.L)
+        with pytest.raises(ValueError, match="build the grid with exact_true_energies"):
+            nereids.fit_counts_spectrum_typed(
+                sample_counts=np.full(40, 900.0),
+                open_beam_counts=np.full(40, 1000.0),
+                energies=shifted,
+                isotopes=[(u238_data, 1.0e-4)],
+                solver="kl",
+                max_iter=5,
+                resolution=response,
+                incident_fluence_weights=np.full(40, 1.0),
+                detector_time_edges_us=edges,
             )
 
 

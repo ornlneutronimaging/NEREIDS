@@ -3476,6 +3476,47 @@ fn tof_to_energy_centers<'py>(
     Ok(PyArray1::from_owned_array(py, centers))
 }
 
+/// The true-energy grid the exact resolved-count route requires: one energy
+/// per detector bin at the bin-centre time of the response clock, ascending.
+///
+/// Args:
+///     detector_time_edges_us: Detector-time bin edges in microseconds
+///         (ascending); the same array passed to the fit.
+///     timing_offset_us: Detector-clock offset applied by the response
+///         (default 0.0).
+///     flight_path_m: Flight path of the response kernel in meters
+///         (default 25.0).
+///     t0_us: Pinned energy-scale time zero in microseconds (default 0.0).
+///     l_scale: Pinned flight-path scale (default 1.0).
+///
+/// Returns:
+///     1D numpy array of true energies in eV, ascending; entry ``i`` belongs
+///     to detector bin ``n - 1 - i``.
+///
+/// Raises:
+///     ValueError: If the edges are not ascending and finite, or a bin is
+///         centred at or before the response clock's zero.
+#[pyfunction]
+#[pyo3(signature = (detector_time_edges_us, timing_offset_us=0.0, flight_path_m=25.0, t0_us=0.0, l_scale=1.0))]
+fn exact_count_true_energies<'py>(
+    py: Python<'py>,
+    detector_time_edges_us: PyReadonlyArray1<f64>,
+    timing_offset_us: f64,
+    flight_path_m: f64,
+    t0_us: f64,
+    l_scale: f64,
+) -> PyResult<Bound<'py, PyArray1<f64>>> {
+    let energies = nereids_pipeline::pipeline::exact_true_energies(
+        detector_time_edges_us.as_slice()?,
+        timing_offset_us,
+        flight_path_m,
+        t0_us,
+        l_scale,
+    )
+    .map_err(|e| pyo3::exceptions::PyValueError::new_err(e.to_string()))?;
+    Ok(PyArray1::from_vec(py, energies))
+}
+
 // ── Element / isotope utilities ──────────────────────────────────────
 
 /// Get the element symbol for a given atomic number Z.
@@ -4962,6 +5003,7 @@ fn nereids(m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_function(wrap_pyfunction!(load_nexus_bank_spectrum, m)?)?;
     m.add_function(wrap_pyfunction!(normalize, m)?)?;
     m.add_function(wrap_pyfunction!(tof_to_energy_centers, m)?)?;
+    m.add_function(wrap_pyfunction!(exact_count_true_energies, m)?)?;
     m.add_function(wrap_pyfunction!(py_element_symbol, m)?)?;
     m.add_function(wrap_pyfunction!(py_element_name, m)?)?;
     m.add_function(wrap_pyfunction!(py_parse_isotope_str, m)?)?;
@@ -5929,26 +5971,22 @@ fn py_spatial_map_typed<'py>(
 ///         ``detector_time_edges_us``.  A resolution without those inputs
 ///         fails closed (the physical model needs the exact separate-arm
 ///         model, never the R[T] shortcut).
-///     incident_fluence_weights: Incident fluence integrated over each point
-///         of the true-energy quadrature, with detector efficiency folded in
-///         (the contract's ``F_j = w_j*eps*Phi``). Required with
+///     incident_fluence_weights: Incident fluence per true energy, with
+///         detector efficiency folded in (the contract's ``F_j = eps*Phi``),
+///         in the grid's ascending order. Required with
 ///         detector_time_edges_us.
 ///     detector_time_edges_us: Actual measured detector-time bin edges. Its
-///         length must be one greater than the sample/open count arrays.
+///         length must be one greater than the sample/open count arrays, and
+///         ``energies`` must be ``exact_count_true_energies`` of these edges
+///         under the response's flight path and ``timing_offset_us``.
 ///     timing_offset_us: Fixed detector-clock offset applied by the response
 ///         (default 0.0; only meaningful with the exact-response inputs).
 ///     groups: list of IsotopeGroup objects (mutually exclusive with isotopes).
 ///     initial_densities: Initial density guesses when using groups (default 0.001 each).
 ///     enable_polish: Override the Nelder-Mead polish phase on the
-///         counts-KL solver (default ``None`` → use the library default,
-///         which is ``False`` as of #486 because polish's absolute
-///         ``fatol = 1e-10`` is sub-f64-ULP on real-data deviance scales
-///         where ``D ≈ 10⁴``–``10⁵``, so polish hits ``max_iter = 5000``
-///         every fit at 70-260× wall cost for ≤ 0.35 Fisher σ parameter
-///         shift).  Pass ``True`` to opt in for clean / synthetic fits
-///         where ``D → 0`` is achievable and the polish tolerances are
-///         physically meaningful.  See ``JointPoissonFitConfig``
-///         ``enable_polish`` field doc for details.
+///         counts-KL solver (default ``None`` → the library default,
+///         ``False``). ``True`` is meaningful only for clean or synthetic
+///         fits where the deviance can reach the polish tolerances.
 ///
 ///     fit_anorm: Whether Anorm is free when ``background=True`` (default
 ///         True).  Must be False to combine ``background=True`` with

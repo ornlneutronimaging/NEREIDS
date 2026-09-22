@@ -10,7 +10,7 @@ use nereids_physics::ikeda_carpenter::{
     EnergyLaw, IkedaCarpenter, IkedaCarpenterParams, SynthesisGrid,
 };
 use nereids_physics::resolution::ResolutionFunction;
-use nereids_pipeline::synthetic::Truth;
+use nereids_pipeline::synthetic::{Truth, detector_time_edges_around};
 
 const FLIGHT_PATH_M: f64 = 25.0;
 const TIMING_OFFSET_US: f64 = 0.0;
@@ -18,6 +18,10 @@ const TIMING_OFFSET_US: f64 = 0.0;
 /// carry information but far from black.
 const DENSITY: f64 = 5.0e-4;
 const TEMPERATURE_K: f64 = 293.6;
+const IC_A0: f64 = 0.35;
+const IC_A1: f64 = 0.05;
+const IC_BETA: f64 = 0.25;
+const IC_R: f64 = 0.15;
 
 /// Grid straddling the U-238 6.674 eV resonance.
 fn energies() -> Vec<f64> {
@@ -27,9 +31,12 @@ fn energies() -> Vec<f64> {
 fn resolution(energies: &[f64]) -> ResolutionFunction {
     let ic = IkedaCarpenter::new(
         IkedaCarpenterParams {
-            alpha: EnergyLaw::SqrtE { a0: 0.35, a1: 0.05 },
-            beta: EnergyLaw::Const(0.25),
-            r: EnergyLaw::Const(0.15),
+            alpha: EnergyLaw::SqrtE {
+                a0: IC_A0,
+                a1: IC_A1,
+            },
+            beta: EnergyLaw::Const(IC_BETA),
+            r: EnergyLaw::Const(IC_R),
             burst_sigma_us: None,
             channel_fwhm_us: Some(0.35),
         },
@@ -49,37 +56,45 @@ fn truth() -> Truth {
     let grid = energies();
     Truth {
         resolution: resolution(&grid),
-        nominal_energies_ev: grid,
+        detector_time_edges_us: detector_time_edges_around(
+            &grid,
+            FLIGHT_PATH_M,
+            TIMING_OFFSET_US,
+            64,
+        ),
         flight_path_m: FLIGHT_PATH_M,
         t0_us: 0.0,
         l_scale: 1.0,
         temperature_k: TEMPERATURE_K,
         isotopes: vec![u238_single_resonance()],
         timing_offset_us: TIMING_OFFSET_US,
-        window_pad_bins: 64,
         open_beam_counts_per_bin: 2.0e4,
         open_background_per_bin: 50.0,
         sample_background_per_bin: 120.0,
     }
 }
 
-/// The detector time axis must ascend and bracket every nominal flight time,
-/// or the response silently drops counts outside the acquisition window.
+fn window_loss_bound(truth: &Truth) -> f64 {
+    let edges = &truth.detector_time_edges_us;
+    let n_bins = edges.len() - 1;
+    let last_width_us = edges[n_bins] - edges[n_bins - 1];
+    let e_last = truth.nominal_energies_ev()[0];
+    let mean_delay_us = 2.0 / (IC_A0 * e_last.sqrt() + IC_A1) + IC_R / IC_BETA;
+    3.0 * mean_delay_us / last_width_us / n_bins as f64
+}
+
 #[test]
 fn detector_time_edges_ascend_and_bracket_the_grid() {
     let truth = truth();
-    let edges = truth.detector_time_edges_us();
-    assert_eq!(
-        edges.len(),
-        truth.nominal_energies_ev.len() + 1 + 2 * truth.window_pad_bins
-    );
+    let edges = &truth.detector_time_edges_us;
+    assert_eq!(edges.len(), truth.nominal_energies_ev().len() + 1);
     assert!(
         edges.windows(2).all(|w| w[0] < w[1]),
         "detector time edges must ascend"
     );
 
     let kl = nereids_physics::resolution::TOF_FACTOR * FLIGHT_PATH_M;
-    for &e in &truth.nominal_energies_ev {
+    for e in energies() {
         let tof = TIMING_OFFSET_US + kl / e.sqrt();
         assert!(
             tof > edges[0] && tof < *edges.last().unwrap(),
@@ -220,12 +235,6 @@ fn counts_are_a_reproducible_poisson_draw() {
     );
 }
 
-/// The acquisition window must hold essentially all of the neutrons.
-///
-/// Counts falling outside the detector time edges are reported rather than
-/// renormalized, so a lossy fixture does not announce itself — it just looks
-/// like a normalization the fit has to absorb, which is exactly where a
-/// density bias would hide.
 #[test]
 fn the_acquisition_window_keeps_the_counts_it_was_given() {
     let truth = truth();
@@ -233,9 +242,10 @@ fn the_acquisition_window_keeps_the_counts_it_was_given() {
 
     let offered: f64 = m.incident_fluence_weights.iter().sum();
     let (open_loss, sample_loss) = m.window_loss;
+    let bound = window_loss_bound(&truth);
     assert!(
-        open_loss / offered < 1.0e-3,
-        "open arm loses {open_loss:.3e} of {offered:.3e} outside the window"
+        open_loss / offered < bound,
+        "open arm loses {open_loss:.3e} of {offered:.3e} outside the window (bound {bound:.2e})"
     );
     assert!(
         sample_loss <= open_loss,
@@ -243,8 +253,6 @@ fn the_acquisition_window_keeps_the_counts_it_was_given() {
          {sample_loss:.3e} against {open_loss:.3e}"
     );
 
-    // Both arms are recorded, on the same detector bins, and the true-energy
-    // grid the cross-sections used is the one the edges were built from.
     assert_eq!(m.open_beam_counts.len(), m.sample_counts.len());
     assert_eq!(
         m.detector_time_edges_us.len(),
@@ -252,7 +260,7 @@ fn the_acquisition_window_keeps_the_counts_it_was_given() {
         "one more edge than bins"
     );
     assert!(
-        m.sample_counts.len() > truth.nominal_energies_ev.len(),
+        m.sample_counts.len() > energies().len(),
         "the acquisition window must be wider than the region of interest"
     );
     assert_eq!(
@@ -261,7 +269,7 @@ fn the_acquisition_window_keeps_the_counts_it_was_given() {
         "one fluence weight per true energy"
     );
     // At the identity energy scale the true energies ARE the nominal ones.
-    assert_eq!(m.true_energies_ev, truth.nominal_energies_ev);
+    assert_eq!(m.true_energies_ev, truth.nominal_energies_ev());
 }
 
 /// A non-identity energy scale must move the true energies, or a calibration

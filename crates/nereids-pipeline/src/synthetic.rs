@@ -1,31 +1,16 @@
-//! Synthetic counts-domain measurements with known ground truth.
-//!
-//! Correctness of a fit is established by injecting values and checking they
-//! come back. Measured VENUS data cannot do that — it has no ground truth —
-//! so it answers a later question.
-//!
-//! What is generated is the observation model the counts-KL path is supposed
-//! to invert, built from the same components the fit uses rather than from a
-//! parallel implementation:
+//! Synthetic counts-domain measurements with known ground truth:
 //!
 //! ```text
-//! E_true = corrected_energy_grid(E_nominal, t0, L_scale, L)
+//! E_true = exact_true_energies(edges, timing_offset, L, t0, L_scale)
 //! T_j    = exp(-sum_i (n d)_i sigma_i(E_true_j; T))
 //! O_i    = sum_j F_j R_ij + B_o,i        S_i = sum_j F_j T_j R_ij + B_s,i
 //! ```
 //!
-//! with `R_ij` the detector-bin response of the true resolution kernel, and
-//! the recorded counts a Poisson draw around `O_i` and `S_i`.
-//!
-//! The two arms are broadened separately. A post-hoc broadened ratio is a
-//! different quantity and would make the fixture agree with a model the
-//! pipeline deliberately refuses.
-//!
-//! Backgrounds are per detector bin and differ between the arms: the sample
-//! adds scatter and gammas, so `B_s = B_o` is not a physical case.
+//! with `R_ij` the detector-bin response of the true resolution kernel,
+//! per-bin backgrounds that differ between the arms, and the recorded
+//! counts a Poisson draw around `O_i` and `S_i`.
 
 use nereids_endf::resonance::ResonanceData;
-use nereids_fitting::resolution_calib::corrected_energy_grid;
 use nereids_physics::counts_response::{add_count_backgrounds, two_arm_count_response};
 use nereids_physics::resolution::{ResolutionFunction, TOF_FACTOR};
 use nereids_physics::transmission::{SampleParams, forward_model};
@@ -33,14 +18,16 @@ use rand::SeedableRng;
 use rand_chacha::ChaCha12Rng;
 use rand_distr::{Distribution, Poisson};
 
+use crate::pipeline::exact_true_energies;
+
 /// Everything injected into a synthetic measurement, shared across pixels.
 ///
 /// `t0_us` and `l_scale` describe the instrument the data was recorded on.
 /// At `(0.0, 1.0)` the true energies equal the nominal ones, which is the
 /// case for a fixture that is not exercising calibration recovery.
 pub struct Truth {
-    /// Energy grid the fit will be given, ascending (eV).
-    pub nominal_energies_ev: Vec<f64>,
+    /// Detector-time bin edges the counts are binned into (µs), ascending.
+    pub detector_time_edges_us: Vec<f64>,
     /// Nominal flight path (m).
     pub flight_path_m: f64,
     /// True TOF zero (µs).
@@ -55,15 +42,6 @@ pub struct Truth {
     pub resolution: ResolutionFunction,
     /// Trigger offset of the detector time axis (µs).
     pub timing_offset_us: f64,
-    /// Extra detector bins beyond each end of the nominal grid's flight
-    /// times.
-    ///
-    /// The acquisition window has to be wider than the region of interest,
-    /// because the moderator's storage tail delivers neutrons well after the
-    /// nominal arrival time. Counts outside the window are lost, and a lossy
-    /// fixture does not announce itself — it looks like a normalization the
-    /// fit must absorb, which is where a density bias would hide.
-    pub window_pad_bins: usize,
     /// Expected open-beam neutron counts per detector bin, before background.
     pub open_beam_counts_per_bin: f64,
     /// Expected open-arm background counts per detector bin.
@@ -96,56 +74,71 @@ pub struct Measurement {
     pub window_loss: (f64, f64),
 }
 
-impl Truth {
-    /// Detector-time bin edges spanning the nominal grid's flight times.
-    ///
-    /// Energies ascend, so flight times descend; the edges are reversed into
-    /// ascending time, which is the order the response matrix and the
-    /// recorded counts both use. Edges are bin boundaries, so there is one
-    /// more of them than there are energies.
-    /// # Panics
-    /// Panics if `nominal_energies_ev` has fewer than two points: the bin
-    /// widths at each end are taken from the first and last spacing, and a
-    /// grid with no spacing has no bins to describe.
-    pub fn detector_time_edges_us(&self) -> Vec<f64> {
-        assert!(
-            self.nominal_energies_ev.len() >= 2,
-            "a detector time axis needs at least two nominal energies, got {}",
-            self.nominal_energies_ev.len()
-        );
-        let kl = TOF_FACTOR * self.flight_path_m;
-        let mut times: Vec<f64> = self
-            .nominal_energies_ev
-            .iter()
-            .map(|&e| self.timing_offset_us + kl / e.sqrt())
-            .collect();
-        times.reverse();
-        let first_width = times[1] - times[0];
-        let last = times.len() - 1;
-        let last_width = times[last] - times[last - 1];
+/// Detector-time bin edges around the flight times of an ascending energy
+/// grid, with `window_pad_bins` extra bins of the end spacing beyond each
+/// end; the padding must cover the kernel's tail past the last arrival, as
+/// counts outside the window are lost.
+///
+/// # Panics
+/// Panics if `nominal_energies_ev` has fewer than two points.
+pub fn detector_time_edges_around(
+    nominal_energies_ev: &[f64],
+    flight_path_m: f64,
+    timing_offset_us: f64,
+    window_pad_bins: usize,
+) -> Vec<f64> {
+    assert!(
+        nominal_energies_ev.len() >= 2,
+        "a detector time axis needs at least two nominal energies, got {}",
+        nominal_energies_ev.len()
+    );
+    let kl = TOF_FACTOR * flight_path_m;
+    let mut times: Vec<f64> = nominal_energies_ev
+        .iter()
+        .map(|&e| timing_offset_us + kl / e.sqrt())
+        .collect();
+    times.reverse();
+    let first_width = times[1] - times[0];
+    let last = times.len() - 1;
+    let last_width = times[last] - times[last - 1];
 
-        let mut edges = Vec::with_capacity(times.len() + 1 + 2 * self.window_pad_bins);
-        for pad in (1..=self.window_pad_bins).rev() {
-            edges.push(times[0] - (0.5 + pad as f64) * first_width);
-        }
-        edges.push(times[0] - 0.5 * first_width);
-        for pair in times.windows(2) {
-            edges.push(0.5 * (pair[0] + pair[1]));
-        }
-        edges.push(times[last] + 0.5 * last_width);
-        for pad in 1..=self.window_pad_bins {
-            edges.push(times[last] + (0.5 + pad as f64) * last_width);
-        }
-        edges
+    let mut edges = Vec::with_capacity(times.len() + 1 + 2 * window_pad_bins);
+    for pad in (1..=window_pad_bins).rev() {
+        edges.push(times[0] - (0.5 + pad as f64) * first_width);
+    }
+    edges.push(times[0] - 0.5 * first_width);
+    for pair in times.windows(2) {
+        edges.push(0.5 * (pair[0] + pair[1]));
+    }
+    edges.push(times[last] + 0.5 * last_width);
+    for pad in 1..=window_pad_bins {
+        edges.push(times[last] + (0.5 + pad as f64) * last_width);
+    }
+    edges
+}
+
+impl Truth {
+    /// The energy grid the fit is given: one per detector bin under the
+    /// nominal clock, ascending.
+    pub fn nominal_energies_ev(&self) -> Vec<f64> {
+        exact_true_energies(
+            &self.detector_time_edges_us,
+            self.timing_offset_us,
+            self.flight_path_m,
+            0.0,
+            1.0,
+        )
+        .expect("valid detector time axis")
     }
 
     /// The energies a neutron recorded on this instrument actually had.
     pub fn true_energies_ev(&self) -> Vec<f64> {
-        corrected_energy_grid(
-            &self.nominal_energies_ev,
+        exact_true_energies(
+            &self.detector_time_edges_us,
+            self.timing_offset_us,
+            self.flight_path_m,
             self.t0_us,
             self.l_scale,
-            self.flight_path_m,
         )
         .expect("valid energy-scale truth")
     }
@@ -176,15 +169,14 @@ impl Truth {
         let transmission =
             forward_model(&true_energies_ev, &sample, None).expect("valid forward model");
 
-        let detector_time_edges_us = self.detector_time_edges_us();
-        let n_bins = detector_time_edges_us.len() - 1;
-        let incident_fluence_weights = vec![self.open_beam_counts_per_bin; true_energies_ev.len()];
+        let n_bins = self.detector_time_edges_us.len() - 1;
+        let incident_fluence_weights = vec![self.open_beam_counts_per_bin; n_bins];
 
         let signal = two_arm_count_response(
             &true_energies_ev,
             &incident_fluence_weights,
             &transmission,
-            &detector_time_edges_us,
+            &self.detector_time_edges_us,
             self.timing_offset_us,
             &self.resolution,
         )
@@ -228,7 +220,7 @@ impl Truth {
             expected_sample,
             expected_open,
             true_energies_ev,
-            detector_time_edges_us,
+            detector_time_edges_us: self.detector_time_edges_us.clone(),
             incident_fluence_weights,
             window_loss,
         }
