@@ -3371,8 +3371,8 @@ class TestVenusMlbwRegression:
         # (produced by the code under test); the correctness burden is
         # carried by the SAMMY-oracle suites (samtry, ex001) and the
         # analytic kernel pins in doppler.rs.
-        EXPECTED_DENSITY = 8.115412297872146e-05
-        EXPECTED_CHI2_R = 219656.45748585448
+        EXPECTED_DENSITY = 8.114730207390052e-05
+        EXPECTED_CHI2_R = 219656.52116644065
         EXPECTED_ITERATIONS = 7
 
         FLOAT_TOL = pytest.approx

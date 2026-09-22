@@ -2220,17 +2220,6 @@ fn validate_broadened_fission(
     // Build resolution parameters.
     let instrument = build_instrument_params(inp);
 
-    // Build extended grid with intermediate + fine-structure points.
-    // The data grid may be coarse at high energies; intermediate points
-    // ensure the resolution convolution has sufficient quadrature density.
-    let res_params = instrument.as_ref().and_then(|inst| {
-        if let ResolutionFunction::Gaussian(ref p) = inst.resolution {
-            Some(p)
-        } else {
-            None
-        }
-    });
-
     // Collect resonance (energy, total_width) pairs for fine-structure points.
     let resonances: Vec<(f64, f64)> = resonance_data
         .ranges
@@ -2250,8 +2239,10 @@ fn validate_broadened_fission(
         })
         .collect();
 
-    let (ext_energies, data_indices) =
-        auxiliary_grid::build_extended_grid(&energies, res_params, &resonances);
+    let (ext_energies, data_indices) = match &instrument {
+        Some(inst) => auxiliary_grid::build_working_grid(&energies, &inst.resolution, &resonances),
+        None => (energies.clone(), (0..energies.len()).collect()),
+    };
 
     // Compute unbroadened fission XS on extended grid.
     let unbroadened: Vec<f64> = ext_energies

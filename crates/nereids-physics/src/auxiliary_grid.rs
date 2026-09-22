@@ -1,27 +1,4 @@
-//! Auxiliary energy grid construction for resolution broadening.
-//!
-//! SAMMY extends the energy grid before computing cross-sections and applying
-//! broadening.  This module reproduces SAMMY's default grid construction:
-//!
-//! 1. **Boundary extension** (Eqcon/Vqcon): Extend below E_min and above
-//!    E_max using spacing of the first/last 5 data points, uniform in √E
-//!    (FGM Doppler convention) for the Gaussian family and uniform in time
-//!    of flight for kernels tabulated there.
-//! 2. **Resonance fine-structure** (Fspken/Add_Pnts): Add dense points around
-//!    narrow resonances where the existing grid has fewer than 10 points per
-//!    resonance width (SAMMY default iptdop=9).
-//! 3. **Intermediate points** (Eqxtra): Insert extra points between each pair.
-//!    Default is 0 — none of our test cases override this.
-//!
-//! ## SAMMY Reference
-//! - `dat/mdat4.f90` — Escale (main entry), Fspken (resonance scan),
-//!   Add_Pnts (fine-structure insertion)
-//! - `dat/mdata.f90` — Eqxtra (intermediate points), Eqcon/Vqcon (boundary
-//!   extension)
-//! - `inp/InputInfoData.cpp` — Default iptdop=9, iptwid=5, nxtra=0
-
 use crate::resolution::{ResolutionFunction, ResolutionParams};
-use nereids_core::constants::NEAR_ZERO_FLOOR;
 
 /// Number of boundary data points used to compute extension spacing.
 ///
@@ -33,72 +10,52 @@ const N_BOUNDARY_REF: usize = 5;
 /// Points closer than `tol * E` are considered duplicates.
 const MERGE_RELATIVE_TOL: f64 = 1e-10;
 
-/// SAMMY default iptdop: controls fine-structure point density.
+/// SAMMY default iptdop: controls resonance point density.
 ///
 /// SAMMY Ref: `inp/InputInfoData.cpp` line 23
 const IPTDOP: usize = 9;
 
-/// Minimum grid points required within one resonance width [E_res−Gd, E_res+Gd].
-/// If the existing grid has fewer, fine-structure points are added.
+/// Grid points within `[E_res − D, E_res + D]` that make resonance points
+/// unnecessary.
 ///
 /// SAMMY Ref: `dat/mdat4.f90` Fspken lines 276-279
 const MIN_POINTS_PER_WIDTH: usize = IPTDOP + 1;
 
-/// Fraction of resonance width used as fine-structure spacing.
-/// `Eg = FRACTN * Gd` gives ~14 uniformly-spaced points across 2·Gd.
+/// Largest spacing across a resonance, as a fraction of its total width.
 ///
 /// SAMMY Ref: `dat/mdat4.f90` Fspken line 310
-const FRACTN: f64 = 2.0 / (IPTDOP as f64 + 5.0);
+pub const FRACTN: f64 = 2.0 / (IPTDOP as f64 + 5.0);
 
-/// Build an extended energy grid with boundary extension and resonance
-/// fine-structure for resolution broadening.
+/// Distance, as a fraction of the resonance spacing, within which an existing
+/// point stands in for a resonance point.
 ///
-/// Returns `(extended_energies, data_indices)` where:
-/// - `extended_energies` is sorted ascending and includes all `data_energies`
-/// - `data_indices[i]` is the index of `data_energies[i]` in `extended_energies`
+/// SAMMY Ref: `dat/mdat4.f90` Add_Pnts lines 380, 400
+const STAND_IN_FRACTION: f64 = 0.1;
+
+/// Largest ratio between neighbouring intervals.
 ///
-/// When `data_energies` has fewer than 2 points or `resolution` is `None`,
-/// returns a copy of the data grid with identity indices.
+/// SAMMY Ref: `dat/mdat5.f90` RefineGrid line 264
+const MAX_SPACING_RATIO: f64 = 2.5;
+
+/// Build the working grid for broadening a spectrum measured at
+/// `data_energies` with `resolution`.
+///
+/// Returns `(energies, data_indices)`: `energies` ascending and containing
+/// every data energy unchanged, and `data_indices[i]` the index of
+/// `data_energies[i]` in it.  Fewer than two data energies come back as they
+/// are.
 ///
 /// # Arguments
-/// * `data_energies` — Experimental energy grid (sorted ascending, eV).
-/// * `resolution` — Resolution parameters (for computing boundary width).
-/// * `resonances` — (energy_eV, gd_eV) pairs for fine-structure densification.
-///   `gd = 0.001 * Σ|Γ_i|` is the resonance half-width parameter from SAMMY's
-///   Fspken convention.
-///
-/// # SAMMY Reference
-/// `dat/mdat4.f90` Escale+Fspken+Add_Pnts, `dat/mdata.f90` Vqcon
-pub fn build_extended_grid(
-    data_energies: &[f64],
-    resolution: Option<&ResolutionParams>,
-    resonances: &[(f64, f64)],
-) -> (Vec<f64>, Vec<usize>) {
-    build_extended_grid_inner(data_energies, resolution, resonances, true)
-}
-
-/// Build extended grid with boundary extension only (no intermediate points).
-///
-/// Used when the combined Gaussian+exponential kernel is active, where
-/// non-uniform spacing from adaptive intermediates degrades the Xcoef
-/// quadrature accuracy.
-pub fn build_extended_grid_boundary_only(
-    data_energies: &[f64],
-    resolution: Option<&ResolutionParams>,
-) -> (Vec<f64>, Vec<usize>) {
-    build_extended_grid_inner(data_energies, resolution, &[], false)
-}
-
-/// Extend a data grid past both ends by the reach of any resolution family.
-/// Boundary extension only: the intermediate points and resonance fine
-/// structure of [`build_extended_grid`] are built for the Gaussian family alone.
-pub fn build_extended_grid_for(
+/// * `data_energies` — Data energies in eV, sorted ascending.
+/// * `resolution` — The blur; sets how far the grid extends.
+/// * `resonances` — `(E_res, D)` pairs in eV, `D` the resonance's total width.
+pub fn build_working_grid(
     data_energies: &[f64],
     resolution: &ResolutionFunction,
+    resonances: &[(f64, f64)],
 ) -> (Vec<f64>, Vec<usize>) {
     if data_energies.len() < 2 {
-        let indices: Vec<usize> = (0..data_energies.len()).collect();
-        return (data_energies.to_vec(), indices);
+        return (data_energies.to_vec(), (0..data_energies.len()).collect());
     }
     let (low, high) = resolution.grid_bounds_ev(data_energies);
     let spacing = match resolution {
@@ -109,7 +66,18 @@ pub fn build_extended_grid_for(
             Spacing::TimeOfFlight
         }
     };
-    extend_boundaries(data_energies, low, high, spacing)
+    let (mut grid, _) = extend_boundaries(data_energies, low, high, spacing);
+    if let ResolutionFunction::Gaussian(params) = resolution {
+        let points = quarter_width_points(&grid, params);
+        merge_points(&mut grid, points);
+    }
+    for &(energy, width) in resonances {
+        let points = resonance_points(&grid, energy, width);
+        merge_points(&mut grid, points);
+    }
+    grade_spacing(&mut grid);
+    let data_indices = build_data_indices(&grid, data_energies);
+    (grid, data_indices)
 }
 
 /// The variable in which the added boundary points are evenly spaced, at the
@@ -139,10 +107,6 @@ impl Spacing {
     }
 }
 
-/// The points stepping outward from `e_edge` to `target_e`, evenly spaced in
-/// `spacing` at the average spacing of the `n_ref` data points from `e_edge`
-/// to `e_ref`, ending at `target_e` itself; a lattice point within the merge
-/// tolerance of the target is left out.
 fn step_outward(
     spacing: Spacing,
     e_edge: f64,
@@ -157,9 +121,10 @@ fn step_outward(
     if step.abs() <= 1e-30 || !steps.is_finite() || steps <= 0.0 {
         return Vec::new();
     }
-    let n_between = (steps - MERGE_RELATIVE_TOL * (u_target / step).abs()).floor() as usize;
-    let mut points: Vec<f64> = (1..=n_between)
-        .map(|k| spacing.to_e(u_edge + step * k as f64))
+    let n = ((steps - MERGE_RELATIVE_TOL * (u_target / step).abs()).ceil() as usize).max(1);
+    let stride = (u_target - u_edge) / n as f64;
+    let mut points: Vec<f64> = (1..n)
+        .map(|k| spacing.to_e(u_edge + stride * k as f64))
         .collect();
     points.push(target_e);
     points
@@ -198,222 +163,111 @@ fn extend_boundaries(
     (grid, indices)
 }
 
-fn build_extended_grid_inner(
-    data_energies: &[f64],
-    resolution: Option<&ResolutionParams>,
-    resonances: &[(f64, f64)],
-    add_intermediate: bool,
-) -> (Vec<f64>, Vec<usize>) {
-    if data_energies.is_empty() {
-        return (vec![], vec![]);
-    }
-    if data_energies.len() == 1 {
-        return (data_energies.to_vec(), vec![0]);
-    }
+fn quarter_width_points(grid: &[f64], params: &ResolutionParams) -> Vec<f64> {
+    grid.windows(2)
+        .flat_map(|pair| {
+            let (lo, hi) = (pair[0], pair[1]);
+            let parts = ((hi - lo) / (0.25 * params.gaussian_width(0.5 * (lo + hi)))).ceil();
+            let parts = if parts.is_finite() { parts as usize } else { 1 };
+            (1..parts).map(move |k| lo + (hi - lo) * k as f64 / parts as f64)
+        })
+        .collect()
+}
 
-    let res = match resolution {
-        Some(r) => r,
-        None => {
-            let indices: Vec<usize> = (0..data_energies.len()).collect();
-            return (data_energies.to_vec(), indices);
+/// Points that sample the resonance at `energy` of total width `width`: its
+/// centre and the ends of `[energy − width, energy + width]` within the grid,
+/// and enough points between them and the grid's own points that no interval
+/// there exceeds `FRACTN · width`.  An existing point within
+/// `STAND_IN_FRACTION` of that spacing stands in for a centre or an end.
+/// Returns none when the centre lies off the grid or the grid already holds
+/// `MIN_POINTS_PER_WIDTH` points across the interval.
+///
+/// SAMMY Ref: `dat/mdat4.f90` Fspken lines 243-284, Add_Pnts lines 333-532
+fn resonance_points(grid: &[f64], energy: f64, width: f64) -> Vec<f64> {
+    let (first, last) = (grid[0], grid[grid.len() - 1]);
+    if energy < first || energy > last {
+        return Vec::new();
+    }
+    let lo = (energy - width).max(first);
+    let hi = (energy + width).min(last);
+    let start = grid.partition_point(|&e| e < lo);
+    let end = grid.partition_point(|&e| e <= hi);
+    if end - start >= MIN_POINTS_PER_WIDTH {
+        return Vec::new();
+    }
+    let step = FRACTN * width;
+    let neighbours = &grid[start.saturating_sub(1)..(end + 1).min(grid.len())];
+    let mut anchors = grid[start..end].to_vec();
+    let mut points = Vec::new();
+    for e in [lo, energy, hi] {
+        if neighbours
+            .iter()
+            .all(|&g| (g - e).abs() >= STAND_IN_FRACTION * step)
+        {
+            anchors.push(e);
+            points.push(e);
         }
-    };
+    }
+    anchors.sort_by(f64::total_cmp);
+    for pair in anchors.windows(2) {
+        let gap = pair[1] - pair[0];
+        let n = (gap / step).ceil() as usize;
+        points.extend((1..n).map(|k| pair[0] + gap * k as f64 / n as f64));
+    }
+    points
+}
 
-    // ── Step 1: Boundary extension ──────────────────────────────────────
-    let (low, high) = ResolutionFunction::Gaussian(*res).grid_bounds_ev(data_energies);
-    let (mut grid, _) = extend_boundaries(data_energies, low, high, Spacing::SqrtEnergy);
+fn merge_points(grid: &mut Vec<f64>, mut points: Vec<f64>) -> usize {
+    points.sort_by(f64::total_cmp);
+    let close = |a: f64, b: f64| (a - b).abs() <= MERGE_RELATIVE_TOL * a.abs().max(b.abs());
+    let mut kept: Vec<f64> = Vec::with_capacity(points.len());
+    for p in points {
+        let i = grid.partition_point(|&g| g < p);
+        let on_grid = grid.get(i).is_some_and(|&g| close(p, g)) || (i > 0 && close(p, grid[i - 1]));
+        if !on_grid && kept.last().is_none_or(|&k| !close(p, k)) {
+            kept.push(p);
+        }
+    }
+    let added = kept.len();
+    grid.extend(kept);
+    grid.sort_by(f64::total_cmp);
+    added
+}
 
-    // ── Step 2: Adaptive intermediate points ────────────────────────────
-    // Insert intermediate points where the grid spacing exceeds a fraction
-    // of the local resolution width.  This ensures the resolution broadening
-    // integral has enough quadrature points even on coarse grids.
-    //
-    // Target: spacing ≤ W/4 (at least ~20 points per 5σ window).
-    //
-    // W/4 is sufficient: the PW-linear Gaussian integration is exact for
-    // linear cross-section segments, so the error depends on the cross-section
-    // curvature × h², not on quadrature point count.  Fine-structure points
-    // (Step 3) densify around narrow resonances where curvature is high.
-    //
-    // SAMMY analogue: dat/mdata.f90 Eqxtra (with nxtra=0 default, but
-    // SAMMY's fine-structure + Xcoef quadrature compensates).
-    if add_intermediate {
-        let mut extra: Vec<f64> = Vec::new();
-        for k in 0..grid.len() - 1 {
-            let e_lo = grid[k];
-            let e_hi = grid[k + 1];
-            let h = e_hi - e_lo;
-            let e_mid = (e_lo + e_hi) * 0.5;
-            let w = res.gaussian_width(e_mid);
-            if w < NEAR_ZERO_FLOOR {
-                continue;
-            }
-            let max_spacing = w * 0.25;
-            if h > max_spacing {
-                // Insert enough uniformly-spaced points.
-                let n_ins = (h / max_spacing).ceil() as usize;
-                let step = h / n_ins as f64;
-                for j in 1..n_ins {
-                    extra.push(e_lo + step * j as f64);
+/// Add points until no interval is more than `MAX_SPACING_RATIO` times either
+/// neighbour, or no further point lies outside the merge tolerance.  A longer
+/// interval is split from its shorter neighbour's side at distances halving
+/// from its middle down to that neighbour's length, so the new intervals
+/// double outward.
+///
+/// SAMMY Ref: `dat/mdat5.f90` RefineGrid lines 264-328, 440-459
+fn grade_spacing(grid: &mut Vec<f64>) {
+    loop {
+        let mut points = Vec::new();
+        for k in 1..grid.len() - 1 {
+            let below = grid[k] - grid[k - 1];
+            let above = grid[k + 1] - grid[k];
+            let finest = MERGE_RELATIVE_TOL * grid[k].abs();
+            if below > MAX_SPACING_RATIO * above {
+                let mut d = below / 2.0;
+                while d >= above.max(finest) {
+                    points.push(grid[k] - d);
+                    d /= 2.0;
+                }
+            } else if above > MAX_SPACING_RATIO * below {
+                let mut d = above / 2.0;
+                while d >= below.max(finest) {
+                    points.push(grid[k] + d);
+                    d /= 2.0;
                 }
             }
         }
-        if !extra.is_empty() {
-            grid.extend(extra);
-            grid.sort_unstable_by(|a, b| a.total_cmp(b));
-            dedup(&mut grid);
+        if merge_points(grid, points) == 0 {
+            return;
         }
     }
-
-    // ── Step 3: Resonance fine-structure (Fspken) ───────────────────────
-    // For each resonance within the grid range, check if the grid has at
-    // least MIN_POINTS_PER_WIDTH points across [E_res-Gd, E_res+Gd].
-    // If not, add uniformly-spaced points with spacing Eg = FRACTN * Gd,
-    // plus exponentially-graded tail/transition points.
-    // SAMMY Ref: dat/mdat4.f90 Fspken lines 243-284, Add_Pnts lines 333-532
-    if !resonances.is_empty() {
-        let mut fine_pts: Vec<f64> = Vec::new();
-        for &(eres, gd) in resonances {
-            let pts = fine_structure_points(&grid, eres, gd);
-            fine_pts.extend(pts);
-        }
-        if !fine_pts.is_empty() {
-            grid.extend(fine_pts);
-            grid.sort_unstable_by(|a, b| a.total_cmp(b));
-            dedup(&mut grid);
-        }
-    }
-
-    // Filter to positive energies.
-    grid.retain(|&e| e > 0.0);
-
-    // Build data_indices.
-    let data_indices = build_data_indices(&grid, data_energies);
-
-    (grid, data_indices)
 }
 
-/// Generate fine-structure points around a single resonance.
-///
-/// SAMMY's `Fspken` identifies resonances where the existing grid has fewer
-/// than `IPTDOP+1` (=10) points within [E_res−Gd, E_res+Gd].  For each such
-/// resonance, `Add_Pnts` inserts:
-/// - Uniform points across [E_res−Gd, E_res+Gd] with spacing `Eg = FRACTN * Gd`
-/// - Exponentially graded transition points beyond ±Gd (spacing doubles each step)
-///   up to ±3·Gd, preventing abrupt density jumps at the fine-structure boundary.
-///
-/// SAMMY Ref: `dat/mdat4.f90` Fspken lines 243-284, Add_Pnts lines 333-532,
-///            DgradV/UgradV (graded transition)
-fn fine_structure_points(grid: &[f64], eres: f64, gd: f64) -> Vec<f64> {
-    if gd < 1e-30 || eres <= 0.0 {
-        return vec![];
-    }
-
-    let xmin = (eres - gd).max(1e-6);
-    let xmax = eres + gd;
-
-    // Skip resonances outside the grid range.
-    // SAMMY Ref: Fspken line 253: `IF (eres.LT.el_energb .OR. eres.GT.eh_energb) cycle`
-    if grid.is_empty() || eres < grid[0] || eres > *grid.last().unwrap() {
-        return vec![];
-    }
-
-    // Count existing grid points in [xmin, xmax].
-    // SAMMY Ref: Fspken lines 269-279 (Pointr + K+iptdop+1 check)
-    let lo = grid.partition_point(|&e| e < xmin);
-    let hi = grid.partition_point(|&e| e <= xmax);
-    let count = hi - lo;
-
-    if count >= MIN_POINTS_PER_WIDTH {
-        return vec![];
-    }
-
-    let eg = FRACTN * gd;
-    if eg < 1e-30 {
-        return vec![];
-    }
-
-    let mut new_points = Vec::new();
-
-    // Uniform points across [xmin, xmax] with spacing eg.
-    // SAMMY Ref: Add_Pnts — uniform fill within resonance width
-    let n_pts = ((xmax - xmin) / eg).ceil() as usize;
-    for i in 0..=n_pts {
-        let e = xmin + eg * i as f64;
-        if e > 0.0 && e <= xmax + eg * 0.01 {
-            new_points.push(e);
-        }
-    }
-
-    // Exponentially graded transition points beyond ±Gd.
-    // Bridge from fine-structure spacing to the surrounding grid spacing
-    // with doubling steps, preventing the abrupt spacing jumps that cause
-    // Xcoef quadrature weight instability.
-    // SAMMY Ref: Add_Pnts — DgradV/UgradV calls at lines 551-553, 659-661
-
-    // Down-side: bridge from xmin to the nearest grid point below.
-    let idx_below = lo; // lo is the first grid index >= xmin
-    if idx_below > 0 {
-        let e_below = grid[idx_below - 1];
-        let gap = xmin - e_below;
-        if gap > eg * 2.0 {
-            let mut spacing = eg;
-            let mut e = xmin;
-            for _ in 0..20 {
-                spacing *= 2.0;
-                e -= spacing;
-                if e <= e_below + MERGE_RELATIVE_TOL * e_below.abs().max(1e-30) {
-                    break;
-                }
-                new_points.push(e);
-            }
-        }
-    }
-
-    // Up-side: bridge from xmax to the nearest grid point above.
-    if hi < grid.len() {
-        let e_above = grid[hi];
-        let gap = e_above - xmax;
-        if gap > eg * 2.0 {
-            let mut spacing = eg;
-            let mut e = xmax;
-            for _ in 0..20 {
-                spacing *= 2.0;
-                e += spacing;
-                if e >= e_above - MERGE_RELATIVE_TOL * e_above.abs().max(1e-30) {
-                    break;
-                }
-                new_points.push(e);
-            }
-        }
-    }
-
-    new_points
-}
-
-/// Sort and deduplicate within tolerance.
-fn dedup(grid: &mut Vec<f64>) {
-    if grid.len() < 2 {
-        return;
-    }
-    let mut deduped = Vec::with_capacity(grid.len());
-    deduped.push(grid[0]);
-    for &val in grid.iter().skip(1) {
-        let prev = *deduped.last().unwrap();
-        let tol = MERGE_RELATIVE_TOL * prev.abs().max(1e-30);
-        if (val - prev).abs() > tol {
-            deduped.push(val);
-        }
-    }
-    *grid = deduped;
-}
-
-/// Build mapping from data energies to their indices in the extended grid.
-///
-/// Each data energy must appear exactly in the grid (guaranteed by
-/// construction — data points are always included and never dropped by dedup).
-///
-/// Uses binary search for O(N log M) where N = data points, M = grid size.
 fn build_data_indices(grid: &[f64], data_energies: &[f64]) -> Vec<usize> {
     data_energies
         .iter()
@@ -439,9 +293,14 @@ fn build_data_indices(grid: &[f64], data_energies: &[f64]) -> Vec<usize> {
 mod tests {
     use super::*;
 
+    fn gaussian(res: ResolutionParams) -> ResolutionFunction {
+        ResolutionFunction::Gaussian(res)
+    }
+
     #[test]
     fn test_empty_grid() {
-        let (ext, indices) = build_extended_grid(&[], None, &[]);
+        let res = ResolutionParams::new(10.0, 0.01, 0.001, 0.0).unwrap();
+        let (ext, indices) = build_working_grid(&[], &gaussian(res), &[]);
         assert!(ext.is_empty());
         assert!(indices.is_empty());
     }
@@ -449,24 +308,17 @@ mod tests {
     #[test]
     fn test_single_point() {
         let energies = vec![100.0];
-        let (ext, indices) = build_extended_grid(&energies, None, &[]);
+        let res = ResolutionParams::new(10.0, 0.01, 0.001, 0.0).unwrap();
+        let (ext, indices) = build_working_grid(&energies, &gaussian(res), &[]);
         assert_eq!(ext, vec![100.0]);
         assert_eq!(indices, vec![0]);
-    }
-
-    #[test]
-    fn test_no_resolution_identity() {
-        let data = vec![1.0, 5.0, 10.0];
-        let (ext, indices) = build_extended_grid(&data, None, &[]);
-        assert_eq!(ext, data);
-        assert_eq!(indices, vec![0, 1, 2]);
     }
 
     #[test]
     fn test_data_indices_roundtrip() {
         let data = vec![1.0, 5.0, 10.0, 100.0];
         let res = ResolutionParams::new(10.0, 0.01, 0.001, 0.0).unwrap();
-        let (ext, indices) = build_extended_grid(&data, Some(&res), &[]);
+        let (ext, indices) = build_working_grid(&data, &gaussian(res), &[]);
         assert!(ext.len() >= data.len());
         for (i, &e) in data.iter().enumerate() {
             assert!(
@@ -482,7 +334,7 @@ mod tests {
     fn test_extension_covers_5sigma() {
         let data: Vec<f64> = (0..20).map(|i| 100.0 + i as f64 * 5.0).collect();
         let res = ResolutionParams::new(10.0, 0.1, 0.01, 0.0).unwrap();
-        let (ext, _) = build_extended_grid(&data, Some(&res), &[]);
+        let (ext, _) = build_working_grid(&data, &gaussian(res), &[]);
 
         assert!(
             ext[0] < data[0],
@@ -500,7 +352,7 @@ mod tests {
     fn test_grid_is_sorted() {
         let data: Vec<f64> = (0..10).map(|i| 1000.0 + i as f64 * 100.0).collect();
         let res = ResolutionParams::new(50.0, 0.05, 0.01, 0.0).unwrap();
-        let (ext, _) = build_extended_grid(&data, Some(&res), &[]);
+        let (ext, _) = build_working_grid(&data, &gaussian(res), &[]);
         for pair in ext.windows(2) {
             assert!(
                 pair[0] < pair[1],
@@ -515,7 +367,7 @@ mod tests {
     fn test_grid_all_positive() {
         let data = vec![1.0, 2.0, 3.0];
         let res = ResolutionParams::new(10.0, 0.1, 0.01, 0.0).unwrap();
-        let (ext, _) = build_extended_grid(&data, Some(&res), &[]);
+        let (ext, _) = build_working_grid(&data, &gaussian(res), &[]);
         for &e in &ext {
             assert!(e > 0.0, "non-positive energy: {e}");
         }
@@ -523,27 +375,27 @@ mod tests {
 
     #[test]
     fn test_fine_structure_adds_points() {
-        // Test fine-structure in isolation (no intermediate points) by calling
-        // build_extended_grid_inner directly.
-        // Sparse grid with a narrow resonance at 500 eV, Gd = 1 eV.
-        // Grid has ~5 eV spacing → only ~0-1 point in [499, 501].
         let data: Vec<f64> = (0..20).map(|i| 490.0 + i as f64 * 5.0).collect();
-        let res = ResolutionParams::new(10.0, 0.01, 0.001, 0.0).unwrap();
-        let resonances = vec![(500.0, 1.0)]; // E_res=500 eV, Gd=1 eV
+        let kernel = (vec![0.0, 1.0, 2.0], vec![1.0, 1.0, 1.0]);
+        let table = crate::resolution::TabulatedResolution::from_kernels(
+            vec![100.0, 1000.0],
+            vec![kernel.clone(), kernel],
+            25.0,
+        )
+        .unwrap();
+        let resolution = ResolutionFunction::Tabulated(std::sync::Arc::new(table));
+        let resonances = vec![(500.0, 1.0)];
 
-        // Without fine-structure, boundary-only:
-        let (ext_without, _) = build_extended_grid_inner(&data, Some(&res), &[], false);
-        // With fine-structure, still no intermediates:
-        let (ext_with, _) = build_extended_grid_inner(&data, Some(&res), &resonances, false);
+        let (ext_without, _) = build_working_grid(&data, &resolution, &[]);
+        let (ext_with, _) = build_working_grid(&data, &resolution, &resonances);
 
         assert!(
             ext_with.len() > ext_without.len(),
-            "fine-structure should add points: {} vs {}",
+            "resonance points should be added: {} vs {}",
             ext_with.len(),
             ext_without.len()
         );
 
-        // Check that there are now ≥10 points in [499, 501].
         let lo = ext_with.partition_point(|&e| e < 499.0);
         let hi = ext_with.partition_point(|&e| e <= 501.0);
         assert!(
@@ -554,6 +406,26 @@ mod tests {
     }
 
     #[test]
+    fn a_repeated_energy_and_a_gap_below_the_merge_tolerance_keep_every_data_point() {
+        let mut data: Vec<f64> = (0..20).map(|i| 490.0 + i as f64 * 5.0).collect();
+        data.insert(11, data[10]);
+        data.insert(6, data[5] * (1.0 + 1e-12));
+        let kernel = (vec![0.0, 1.0, 2.0], vec![1.0, 1.0, 1.0]);
+        let table = crate::resolution::TabulatedResolution::from_kernels(
+            vec![100.0, 1000.0],
+            vec![kernel.clone(), kernel],
+            25.0,
+        )
+        .unwrap();
+        let resolution = ResolutionFunction::Tabulated(std::sync::Arc::new(table));
+
+        let (ext, indices) = build_working_grid(&data, &resolution, &[(500.0, 1.0)]);
+        for (i, &e) in data.iter().enumerate() {
+            assert_eq!(ext[indices[i]], e, "data[{i}] = {e} is not in the grid");
+        }
+    }
+
+    #[test]
     fn test_fine_structure_skips_dense_grid() {
         // Dense grid: 0.1 eV spacing around a resonance with Gd=1.0 eV.
         // Already has ~20 points in [499, 501] → no fine-structure needed.
@@ -561,8 +433,8 @@ mod tests {
         let res = ResolutionParams::new(10.0, 0.01, 0.001, 0.0).unwrap();
         let resonances = vec![(500.0, 1.0)];
 
-        let (ext_without, _) = build_extended_grid(&data, Some(&res), &[]);
-        let (ext_with, _) = build_extended_grid(&data, Some(&res), &resonances);
+        let (ext_without, _) = build_working_grid(&data, &gaussian(res), &[]);
+        let (ext_with, _) = build_working_grid(&data, &gaussian(res), &resonances);
 
         assert_eq!(
             ext_without.len(),
@@ -578,7 +450,7 @@ mod tests {
         let res = ResolutionParams::new(10.0, 0.01, 0.001, 0.0).unwrap();
         let resonances = vec![(500.0, 1.0), (520.0, 0.5)];
 
-        let (ext, indices) = build_extended_grid(&data, Some(&res), &resonances);
+        let (ext, indices) = build_working_grid(&data, &gaussian(res), &resonances);
         assert_eq!(indices.len(), data.len());
         for (i, &e) in data.iter().enumerate() {
             assert!(
@@ -597,8 +469,8 @@ mod tests {
         let res = ResolutionParams::new(10.0, 0.01, 0.001, 0.0).unwrap();
         let resonances = vec![(50.0, 1.0), (300.0, 1.0)]; // Both outside [100, 190]
 
-        let (ext_without, _) = build_extended_grid(&data, Some(&res), &[]);
-        let (ext_with, _) = build_extended_grid(&data, Some(&res), &resonances);
+        let (ext_without, _) = build_working_grid(&data, &gaussian(res), &[]);
+        let (ext_with, _) = build_working_grid(&data, &gaussian(res), &resonances);
 
         // May differ slightly due to boundary extension, but the resonance
         // outside the extended range should not add fine-structure.
@@ -680,7 +552,7 @@ mod tests {
         for tenths in 2200..=2300 {
             let e_max = tenths as f64 / 10.0;
             let data: Vec<f64> = (0..400).map(|i| e_max - 40.0 + i as f64 * 0.1).collect();
-            let (grid, _) = build_extended_grid_for(&data, &resolution);
+            let (grid, _) = build_working_grid(&data, &resolution, &[]);
             let added = grid.len() - data.len();
             let tof = |e: f64| TOF_FACTOR * 25.0 / e.sqrt();
             let e_top = data[data.len() - 1];

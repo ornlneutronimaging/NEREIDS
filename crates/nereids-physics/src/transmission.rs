@@ -35,80 +35,28 @@ use crate::doppler::DopplerParamsError;
 use crate::reich_moore;
 use crate::resolution::{self, ResolutionError, ResolutionFunction};
 
-/// Build the auxiliary extended grid for resolution broadening.
-///
-/// Every resolution family gets the boundary extension by its kernel's reach;
-/// the Gaussian family also gets the adaptive intermediate points.  Returns
-/// `None` if no extension is needed (no resolution, or grid unchanged).
-///
-/// Intermediate points are inserted only when the resolution broadening at
-/// the grid midpoint uses the PW-linear Gaussian path (exp tail negligible
-/// or absent).  For genuine combined-kernel cases, intermediates create
-/// non-uniform spacing transitions that degrade the Xcoef quadrature.
 fn build_aux_grid(
     energies: &[f64],
     instrument: Option<&InstrumentParams>,
     resonance_data: &[&ResonanceData],
 ) -> Option<(Vec<f64>, Vec<usize>)> {
     instrument.and_then(|inst| {
-        let (ext_e, di) = if let ResolutionFunction::Gaussian(ref params) = inst.resolution {
-            // P-9: Check the Gaussian-to-exp-tail ratio at MULTIPLE energies
-            // to decide whether intermediates help or hurt.  The ratio C =
-            // W_g/(2·W_e) determines which broadening path is used per-energy
-            // in resolution_broaden_presorted.  When C > 2.5 the PW-linear
-            // Gaussian path is used, which benefits from intermediates.
-            //
-            // Previously checked at a single midpoint, which could make the
-            // wrong decision if the ratio crosses 2.5 within the energy range.
-            // Now checks at 5 points (lo, 25%, mid, 75%, hi) and uses
-            // intermediates if a MAJORITY of points have C > 2.5.
-            let use_intermediates = if energies.len() >= 2 {
-                let n = energies.len();
-                let check_indices = [0, n / 4, n / 2, 3 * n / 4, n - 1];
-                let n_pw_linear = check_indices
-                    .iter()
-                    .filter(|&&i| {
-                        let e = energies[i];
-                        let wg = params.gaussian_width(e);
-                        let we = params.exp_width(e);
-                        we < 1e-60 || wg / (2.0 * we) > 2.5
-                    })
-                    .count();
-                // Majority rule: use intermediates if ≥3 of 5 points qualify.
-                n_pw_linear >= 3
-            } else {
-                true
-            };
-
-            // Extract (energy_eV, gd_eV) pairs for fine-structure densification.
-            // gd = total resonance width, used by Fspken to identify regions
-            // needing denser grid points around narrow resonances.
-            // SAMMY Ref: dat/mdat4.f90 Fspken lines 243-284
-            let resonances = extract_resonance_widths(resonance_data);
-
-            if use_intermediates {
-                crate::auxiliary_grid::build_extended_grid(energies, Some(params), &resonances)
-            } else {
-                crate::auxiliary_grid::build_extended_grid_boundary_only(energies, Some(params))
-            }
-        } else {
-            // Tabulated and Ikeda-Carpenter kernels get the boundary
-            // extension without the Gaussian path's intermediates.
-            crate::auxiliary_grid::build_extended_grid_for(energies, &inst.resolution)
-        };
+        let resonances = extract_resonance_widths(resonance_data);
+        let (ext_e, di) =
+            crate::auxiliary_grid::build_working_grid(energies, &inst.resolution, &resonances);
         (ext_e.len() > energies.len()).then_some((ext_e, di))
     })
 }
 
-/// Extract (energy_eV, gd_eV) pairs from resonance data for fine-structure
-/// grid densification.
+/// Extract (energy_eV, gd_eV) pairs from resonance data for the working
+/// grid's resonance points.
 ///
 /// For LRF=1/2/3 (BW and Reich-Moore): `gd = |Γn| + |Γγ| + |Γf1| + |Γf2|`,
 /// walked from each resolved range's `l_groups`. Non-evaluable ranges
 /// (LRF=7, LRU=2) carry empty `l_groups` and contribute no pairs.
 ///
 /// SAMMY Ref: dat/mdat4.f90 Fspken — uses total width to define the region
-/// [E_res − gd, E_res + gd] for fine-structure point insertion.
+/// [E_res − gd, E_res + gd] for resonance point insertion.
 fn extract_resonance_widths(resonance_data: &[&ResonanceData]) -> Vec<(f64, f64)> {
     let mut pairs = Vec::new();
     for rd in resonance_data {
@@ -248,14 +196,11 @@ fn working_grid_layout<'a>(
 
 /// Compute the working-grid layout for `(energies, instrument, resonance_data)`.
 ///
-/// With a resolution function the grid is extended past both ends by the
-/// kernel's reach ([`ResolutionFunction::grid_bounds_ev`]), and a Gaussian
-/// also gets the intermediate points and resonance fine structure.  Without
-/// one the data grid comes back with identity indices.
+/// With a resolution function the grid comes from
+/// [`crate::auxiliary_grid::build_working_grid`].  Without one the data grid
+/// comes back with identity indices.
 ///
-/// `resonance_data` may be empty (e.g. the energy-scale model has no resonance
-/// data of its own); the auxiliary grid then carries boundary extension only,
-/// with no resonance fine-structure densification.
+/// `resonance_data` may be empty; the grid then gets no resonance points.
 ///
 /// # Errors
 /// * [`TransmissionError::Resolution`] — if `instrument` is `Some` and
@@ -340,9 +285,9 @@ pub type BroadenedXsWithDerivative = (Vec<Vec<f64>>, Vec<Vec<f64>>);
 /// The working energy grid used for broadening, plus the map back to the
 /// data grid.
 ///
-/// Doppler, Beer-Lambert and resolution run on the working grid, the data
-/// grid extended by the kernel's reach plus a Gaussian's intermediate and
-/// fine-structure points, and the data points are extracted last.  A
+/// Doppler, Beer-Lambert and resolution run on the working grid from
+/// [`crate::auxiliary_grid::build_working_grid`], and the data points are
+/// extracted last.  A
 /// [`crate::resolution::ResolutionPlan`] must be built on [`Self::energies`].
 #[derive(Debug, Clone)]
 pub struct WorkingGridLayout {
