@@ -1532,16 +1532,17 @@ def exact_count_quadrature(
     """The quadrature the exact resolved-count route requires.
 
     Returns ``(quadrature_edges, energies)``: the measured window extended
-    past each end by the kernel's reach, in bins of the end bin's width, and
-    ``nodes_per_bin`` true energies per quadrature bin at the sub-bin centre
-    times of the response clock ``timing_offset_us`` over the kernel's flight
-    path, ascending, so the last ``nodes_per_bin`` entries belong to the
-    earliest quadrature bin.  Pass the measured edges, the offset, the
-    resolution and the node count to the fit, with one fluence weight per
-    quadrature bin.  Raises ``ValueError`` when fewer than two edges are
-    given, the edges are not ascending and finite, the resolution is a
-    Gaussian, ``nodes_per_bin`` is zero, or a node lies at or before the
-    clock's zero.
+    past each end by the kernel's reach, in bins of the end bin's width and
+    stopping at the clock's zero, and ``nodes_per_bin`` true energies per
+    quadrature bin at the sub-bin centre times of the response clock
+    ``timing_offset_us`` over the kernel's flight path, ascending, so the last
+    ``nodes_per_bin`` entries belong to the earliest quadrature bin.  Pass the
+    measured edges, the offset, the resolution and the node count to the fit,
+    with one fluence weight per quadrature bin.  Raises ``TypeError`` unless
+    ``resolution`` is a TabulatedResolution or an IkedaCarpenter, and
+    ``ValueError`` when fewer than two edges are given, the edges are not
+    ascending and finite, the window opens at or before the clock's zero,
+    ``nodes_per_bin`` is zero, or a node lies at or before that zero.
     """
     ...
 

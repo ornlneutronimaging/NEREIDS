@@ -1148,72 +1148,96 @@ fn checked_detector_edges(
     Ok(())
 }
 
-pub(crate) fn pad_detector_edges(edges: &[f64], before: usize, after: usize) -> Vec<f64> {
+pub(crate) fn pad_detector_edges(
+    edges: &[f64],
+    before: usize,
+    after: usize,
+) -> Result<Vec<f64>, PipelineError> {
     let last = edges.len() - 1;
     let first_width = edges[1] - edges[0];
     let last_width = edges[last] - edges[last - 1];
-    (1..=before)
-        .rev()
-        .map(|k| edges[0] - k as f64 * first_width)
-        .chain(edges.iter().copied())
-        .chain((1..=after).map(|k| edges[last] + k as f64 * last_width))
-        .collect()
+    let mut padded: Vec<f64> = Vec::new();
+    [before, edges.len(), after]
+        .into_iter()
+        .try_fold(0usize, usize::checked_add)
+        .and_then(|n_edges| padded.try_reserve_exact(n_edges).ok())
+        .ok_or_else(|| {
+            PipelineError::InvalidParameter(format!(
+                "a detector-time axis of {} bins padded by {before} and {after} cannot be \
+                 allocated",
+                edges.len() - 1
+            ))
+        })?;
+    padded.extend(
+        (1..=before)
+            .rev()
+            .map(|k| edges[0] - k as f64 * first_width),
+    );
+    padded.extend_from_slice(edges);
+    padded.extend((1..=after).map(|k| edges[last] + k as f64 * last_width));
+    Ok(padded)
 }
 
 /// The quadrature bins of the exact resolved-count route: the measured
 /// detector-time window extended past each end, in bins of the end bin's
-/// width, by as far as the response's kernel carries a neutron into the
-/// window. A pad bin is kept while a neutron with nominal arrival at its
-/// near edge has kernel support inside the window, and the leading pad
-/// never reaches the clock's zero.
+/// width, far enough that every neutron the response can record inside the
+/// window has a bin of its own. The leading extension stops at the response
+/// clock's zero, where the source pulse starts, and its first bin is cut
+/// short there.
 ///
 /// # Errors
 /// Returns [`PipelineError::InvalidParameter`] unless the edges are at least
-/// two, finite and strictly ascending, the offset is finite, and the response
-/// is a detector-time kernel (tabulated or Ikeda–Carpenter).
+/// two, finite and strictly ascending, the offset is finite, the window opens
+/// after the clock's zero, and the response is a detector-time kernel
+/// (tabulated or Ikeda–Carpenter).
 pub fn exact_quadrature_edges(
     detector_time_edges_us: &[f64],
     timing_offset_us: f64,
     response: &ResolutionFunction,
 ) -> Result<Vec<f64>, PipelineError> {
     checked_detector_edges(detector_time_edges_us, timing_offset_us)?;
+    let opening_us = detector_time_edges_us[0] - timing_offset_us;
+    if opening_us <= 0.0 {
+        return Err(PipelineError::InvalidParameter(format!(
+            "the detector-time window opens {opening_us} µs after the response clock's zero; \
+             trim the bins before the trigger"
+        )));
+    }
     let flight_path_m = response.flight_path_m();
     let last = detector_time_edges_us.len() - 1;
     let first_width = detector_time_edges_us[1] - detector_time_edges_us[0];
     let last_width = detector_time_edges_us[last] - detector_time_edges_us[last - 1];
-    let support = |nominal_time_us: f64| -> Result<(f64, f64), PipelineError> {
-        let tof_us = nominal_time_us - timing_offset_us;
-        if tof_us <= 0.0 {
-            return Ok((0.0, 0.0));
-        }
+    let energy_at = |time_us: f64| tof_to_energy(time_us - timing_offset_us, flight_path_m);
+    let support = |e_lo: f64, e_hi: f64| -> Result<(f64, f64), PipelineError> {
         response
-            .kernel_support_us(tof_to_energy(tof_us, flight_path_m))
+            .kernel_support_us(e_lo, e_hi)
             .map_err(|error| PipelineError::InvalidParameter(error.to_string()))
     };
-    let mut before = 0;
-    loop {
-        let lower = detector_time_edges_us[0] - (before + 1) as f64 * first_width;
-        let gap = before as f64 * first_width;
-        if lower - timing_offset_us <= 0.0 || support(detector_time_edges_us[0] - gap)?.1 <= gap {
-            break;
-        }
-        before += 1;
+
+    let (_, delay_us) = support(energy_at(detector_time_edges_us[0]), f64::INFINITY)?;
+    let reachable_before = (opening_us / first_width).ceil() as usize;
+    let before = ((delay_us / first_width).ceil().max(0.0) as usize).min(reachable_before);
+    let (advance_us, _) = support(0.0, energy_at(detector_time_edges_us[last]))?;
+    let after = (-advance_us / last_width).ceil().max(0.0) as usize;
+
+    let full_before = before.min((opening_us / first_width).floor() as usize);
+    let mut edges = pad_detector_edges(detector_time_edges_us, full_before, after)?;
+    if before > full_before {
+        edges.insert(0, timing_offset_us);
     }
-    let mut after = 0;
-    loop {
-        let gap = after as f64 * last_width;
-        if -support(detector_time_edges_us[last] + gap)?.0 <= gap {
-            break;
-        }
-        after += 1;
-    }
-    Ok(pad_detector_edges(detector_time_edges_us, before, after))
+    Ok(edges)
 }
 
 /// The true-energy quadrature of the exact resolved-count route: `nodes_per_bin`
 /// energies per detector bin at the sub-bin centre times of the response
 /// clock `timing_offset_us + t0_us` over the flight path
 /// `flight_path_m · l_scale`, ascending.
+///
+/// # Errors
+/// Returns [`PipelineError::InvalidParameter`] unless the edges are at least
+/// two, finite and strictly ascending, the offsets are finite, the flight path
+/// and its scale are positive, `nodes_per_bin` is at least one, and every node
+/// falls after the clock's zero.
 pub fn exact_true_energies(
     detector_time_edges_us: &[f64],
     timing_offset_us: f64,
@@ -1276,9 +1300,6 @@ pub fn exact_true_energies(
     Ok(energies)
 }
 
-/// The fluence of each quadrature node of [`exact_true_energies`]: every
-/// detector bin's fluence split equally over its `nodes_per_bin` nodes, in
-/// the grid's ascending order.
 pub(crate) fn exact_node_fluence(fluence_per_bin: &[f64], nodes_per_bin: usize) -> Vec<f64> {
     let share = nodes_per_bin as f64;
     fluence_per_bin
@@ -6244,7 +6265,7 @@ mod tests {
         let flight_path_m = response.flight_path_m();
         let quadrature = exact_quadrature_edges(detector_edges, timing_offset_us, response)
             .expect("quadrature around the window");
-        let source_edges = pad_detector_edges(&quadrature, extra, extra);
+        let source_edges = pad_detector_edges(&quadrature, extra, extra).unwrap();
         let source_fluence: Vec<f64> = source_edges
             .windows(2)
             .map(|e| fluence_at(0.5 * (e[0] + e[1])))
@@ -6628,7 +6649,7 @@ mod tests {
         let quadrature = exact_quadrature_edges(&two_bin_edges, 0.0, &make_response()).unwrap();
         assert_eq!(
             quadrature,
-            pad_detector_edges(&two_bin_edges, 1, 1),
+            pad_detector_edges(&two_bin_edges, 1, 1).unwrap(),
             "a ±0.25 µs kernel reaches one bin past each end"
         );
         let grid = exact_true_energies(&quadrature, 0.0, 25.0, 0.0, 1.0, 1).unwrap();
@@ -6921,13 +6942,13 @@ mod tests {
             .expect("quadrature around the window");
         assert_eq!(
             quadrature,
-            pad_detector_edges(&detector_edges, 1, 1),
+            pad_detector_edges(&detector_edges, 1, 1).unwrap(),
             "a unit triangle reaches one bin past each end of the window"
         );
         let energies =
             exact_true_energies(&quadrature, timing_offset_us, flight_path_m, 0.0, 1.0, 1)
                 .expect("bins after the trigger");
-        let source_edges = pad_detector_edges(&quadrature, 1, 1);
+        let source_edges = pad_detector_edges(&quadrature, 1, 1).unwrap();
         let source_fluence = [40.0_f64, 50.0, 100.0, 200.0, 300.0, 150.0, 60.0];
         let source_transmission = [0.9_f64, 0.3, 0.2, 0.5, 0.8, 0.6, 0.7];
         let pulse_centres: Vec<f64> = source_edges
@@ -7209,56 +7230,132 @@ mod tests {
     }
 
     #[test]
-    fn exact_quadrature_extends_the_window_by_the_kernel_reach() {
+    fn exact_quadrature_covers_every_arrival_that_reaches_the_window() {
         use nereids_physics::ikeda_carpenter::{
-            IkedaCarpenter, IkedaCarpenterParams, SynthesisGrid,
+            EnergyLaw, IkedaCarpenter, IkedaCarpenterParams, SynthesisGrid,
         };
         use nereids_physics::resolution::{ResolutionFunction, TOF_FACTOR, TabulatedResolution};
 
-        let triangle = ResolutionFunction::Tabulated(Arc::new(
-            TabulatedResolution::from_kernels(
-                vec![6.5],
-                vec![(vec![-3.0, 0.0, 3.0], vec![0.0, 1.0, 0.0])],
-                25.0,
+        let flight_path_m = 25.0_f64;
+        let tabulated = |ref_energies: Vec<f64>, kernels: Vec<(Vec<f64>, Vec<f64>)>| {
+            ResolutionFunction::Tabulated(Arc::new(
+                TabulatedResolution::from_kernels(ref_energies, kernels, flight_path_m)
+                    .expect("valid detector-time response"),
+            ))
+        };
+        let triangles = |ref_energies: Vec<f64>, half_widths: Vec<f64>| {
+            tabulated(
+                ref_energies,
+                half_widths
+                    .into_iter()
+                    .map(|half| (vec![-half, 0.0, half], vec![0.0, 1.0, 0.0]))
+                    .collect(),
             )
-            .expect("valid detector-time response"),
-        ));
-        let window: Vec<f64> = (0..11).map(|i| 630.0 + i as f64 * 2.5).collect();
-        assert_eq!(
-            exact_quadrature_edges(&window, 0.0, &triangle).unwrap(),
-            pad_detector_edges(&window, 2, 2),
-            "a ±3 µs kernel reaches two 2.5 µs bins past each end"
-        );
+        };
+        let pulse = |r: f64, e_min_ev: f64, e_max_ev: f64| {
+            ResolutionFunction::IkedaCarpenter(Arc::new(
+                IkedaCarpenter::new(
+                    IkedaCarpenterParams {
+                        alpha: EnergyLaw::SqrtE { a0: 0.35, a1: 0.05 },
+                        beta: EnergyLaw::Const(0.25),
+                        r: EnergyLaw::Const(r),
+                        burst_sigma_us: None,
+                        channel_fwhm_us: None,
+                    },
+                    flight_path_m,
+                    &SynthesisGrid {
+                        e_min_ev,
+                        e_max_ev,
+                        n_energies: 32,
+                        n_tau: 256,
+                    },
+                )
+                .expect("valid Ikeda–Carpenter model"),
+            ))
+        };
+        let window = |energy_ev: f64, width_us: f64, bins: usize| -> Vec<f64> {
+            let arrival = TOF_FACTOR * flight_path_m / energy_ev.sqrt();
+            (0..=bins).map(|i| arrival + i as f64 * width_us).collect()
+        };
+        let cases: Vec<(&str, ResolutionFunction, Vec<f64>)> = vec![
+            (
+                "a kernel of one width",
+                triangles(vec![6.5], vec![3.0]),
+                window(6.5, 2.5, 10),
+            ),
+            (
+                "a kernel that widens away from the window",
+                triangles(vec![5.0, 5.5, 6.0, 7.0], vec![100.0, 1.0, 1.0, 1.0]),
+                window(6.06, 2.0, 2),
+            ),
+            (
+                "a pulse whose window the synthesis grid covers",
+                pulse(0.0, 3.0, 9.0),
+                window(8.0, 2.0, 20),
+            ),
+            (
+                "a pulse below the synthesis grid",
+                pulse(0.0, 6.0, 9.0),
+                window(2.5, 2.0, 20),
+            ),
+            (
+                "a window opening just after the trigger",
+                triangles(vec![6.5], vec![3.0]),
+                vec![4.0, 6.5, 9.0],
+            ),
+        ];
 
-        let trigger_cut: Vec<f64> = (0..3).map(|i| 4.0 + i as f64 * 2.5).collect();
-        assert_eq!(
-            exact_quadrature_edges(&trigger_cut, 0.0, &triangle).unwrap(),
-            pad_detector_edges(&trigger_cut, 1, 2),
-            "the leading pad stops at the clock's zero"
-        );
+        for (case, response, measured) in cases {
+            let quadrature = exact_quadrature_edges(&measured, 0.0, &response).unwrap();
+            let window_close = *measured.last().unwrap();
+            let reaches = |time_us: f64| {
+                response
+                    .detector_bin_probabilities(
+                        tof_to_energy(time_us, flight_path_m),
+                        &measured,
+                        0.0,
+                    )
+                    .expect("the response places every arrival")
+                    .iter()
+                    .fold(0.0_f64, |a, &b| a + b)
+            };
 
-        let causal = ResolutionFunction::IkedaCarpenter(Arc::new(
-            IkedaCarpenter::new(
-                IkedaCarpenterParams::constant(2.0, 0.1, 0.0),
-                25.0,
-                &SynthesisGrid::new(3.0, 9.0),
-            )
-            .expect("valid prompt-only IC model"),
-        ));
-        let first_arrival = TOF_FACTOR * 25.0 / 8.0_f64.sqrt();
-        let ic_window: Vec<f64> = (0..21).map(|i| first_arrival + i as f64 * 2.0).collect();
-        let quadrature = exact_quadrature_edges(&ic_window, 0.0, &causal).unwrap();
-        let before = quadrature.len() - ic_window.len();
-        assert_eq!(
-            quadrature,
-            pad_detector_edges(&ic_window, before, 0),
-            "a causal pulse reaches the window only from earlier arrivals"
-        );
-        let (_, reach) = causal.kernel_support_us(8.0).unwrap();
-        assert!(
-            before as f64 * 2.0 >= reach && (before - 1) as f64 * 2.0 < reach,
-            "{before} bins of 2 µs must just cover the pulse's reach of {reach} µs"
-        );
+            let step = (window_close - measured[0]) / 32.0;
+            let outside = std::iter::successors(Some(quadrature[0] - step), |t| Some(t - step))
+                .take_while(|&t| t > 0.0)
+                .chain(
+                    std::iter::successors(Some(window_close + step), |t| Some(t + step))
+                        .take_while(|&t| t <= window_close + 40.0 * (window_close - measured[0]))
+                        .filter(|&t| t > *quadrature.last().unwrap()),
+                );
+            let trimmed_tail = 1.0e-5;
+            for time_us in outside {
+                let deposited = reaches(time_us);
+                assert!(
+                    deposited < trimmed_tail,
+                    "{case}: an arrival at {time_us} µs, outside the quadrature \
+                     {}..{:?}, deposits {deposited:.3e} in the measured window",
+                    quadrature[0],
+                    quadrature.last()
+                );
+            }
+
+            let extension: Vec<f64> = quadrature
+                .windows(2)
+                .map(|edges| 0.5 * (edges[0] + edges[1]))
+                .filter(|&centre| centre < measured[0] || centre > window_close)
+                .collect();
+            assert!(
+                !extension.is_empty(),
+                "{case}: the quadrature does not extend past the measured window"
+            );
+            assert!(
+                extension
+                    .iter()
+                    .any(|&centre| reaches(centre) >= trimmed_tail),
+                "{case}: no arrival in the quadrature's extension reaches the window"
+            );
+        }
     }
 
     // ──────────────────────────────────────────────────────────────────

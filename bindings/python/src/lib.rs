@@ -3479,7 +3479,8 @@ fn tof_to_energy_centers<'py>(
 /// The quadrature the exact resolved-count route requires: the measured
 /// window extended past each end by the kernel's reach, and
 /// ``nodes_per_bin`` true energies per quadrature bin at the sub-bin centre
-/// times of the response clock, ascending.
+/// times of the response clock, ascending. The leading extension stops at the
+/// clock's zero, where the source pulse starts.
 ///
 /// Args:
 ///     detector_time_edges_us: Detector-time bin edges in microseconds
@@ -3499,10 +3500,12 @@ fn tof_to_energy_centers<'py>(
 ///     quadrature bin. Pass one fluence weight per quadrature bin to the fit.
 ///
 /// Raises:
+///     TypeError: If ``resolution`` is not a TabulatedResolution or an
+///         IkedaCarpenter.
 ///     ValueError: If fewer than two edges are given, the edges are not
-///         ascending and finite, the resolution is a Gaussian,
-///         ``nodes_per_bin`` is zero, or a node lies at or before the
-///         response clock's zero.
+///         ascending and finite, the window opens at or before the response
+///         clock's zero, ``nodes_per_bin`` is zero, or a node lies at or
+///         before that zero.
 #[pyfunction]
 #[pyo3(signature = (detector_time_edges_us, timing_offset_us, resolution, nodes_per_bin))]
 fn exact_count_quadrature<'py>(

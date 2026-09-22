@@ -1331,16 +1331,51 @@ impl TabulatedResolution {
         (low, high)
     }
 
-    /// The first and last sampled offsets of the kernel at `energy_ev`, in
-    /// µs relative to the nominal arrival: the interval a neutron of that
-    /// energy can be recorded in by [`Self::detector_bin_probabilities`].
+    /// The widest interval `(earliest, latest)`, in µs relative to the nominal
+    /// arrival, a neutron with energy between `e_lo` and `e_hi` can be recorded
+    /// in by [`Self::detector_bin_probabilities`].  Returns `(0.0, 0.0)` for an
+    /// empty kernel set.
     #[must_use]
-    pub fn kernel_support_us(&self, energy_ev: f64) -> (f64, f64) {
-        let (offsets, _) = self.interpolated_kernel(energy_ev);
-        match (offsets.first(), offsets.last()) {
-            (Some(&first), Some(&last)) => (first, last),
-            _ => (0.0, 0.0),
+    pub fn kernel_support_us(&self, e_lo: f64, e_hi: f64) -> (f64, f64) {
+        if self.kernels.is_empty() {
+            return (0.0, 0.0);
         }
+        let first = self
+            .ref_energies
+            .partition_point(|&e| e < e_lo)
+            .saturating_sub(1);
+        let last = self
+            .ref_energies
+            .partition_point(|&e| e <= e_hi)
+            .min(self.kernels.len() - 1);
+        let width_of = |(offsets, weights): &(Vec<f64>, Vec<f64>)| {
+            let (_, width) = trapezoidal_moments(offsets, weights);
+            width
+        };
+        let (mut earliest, mut latest) = (0.0_f64, 0.0_f64);
+        let mut widen = |(offsets, weights): &(Vec<f64>, Vec<f64>), stretch: f64| {
+            let weighted = || weights.iter().enumerate().filter(|(_, w)| **w > 0.0);
+            if let (Some((first_weighted, _)), Some((last_weighted, _))) =
+                (weighted().next(), weighted().next_back())
+            {
+                earliest = earliest.min(offsets[first_weighted.saturating_sub(1)] * stretch);
+                latest = latest.max(offsets[(last_weighted + 1).min(offsets.len() - 1)] * stretch);
+            }
+        };
+        for index in first..=last {
+            widen(&self.kernels[index], 1.0);
+            if index < last {
+                let (here, next) = (
+                    width_of(&self.kernels[index]),
+                    width_of(&self.kernels[index + 1]),
+                );
+                if here > 0.0 && next > 0.0 {
+                    widen(&self.kernels[index], (next / here).max(1.0));
+                    widen(&self.kernels[index + 1], (here / next).max(1.0));
+                }
+            }
+        }
+        (earliest, latest)
     }
 }
 
@@ -1381,17 +1416,25 @@ const BRDLIM: f64 = 5.0;
 const GAUSSIAN_LOW_ENERGY_FLOOR_EV: f64 = 0.001;
 
 impl ResolutionFunction {
-    /// The interval, in µs relative to the nominal arrival, a neutron of
-    /// energy `energy_ev` can be recorded in: the sampled support of the
-    /// tabulated kernel, or of the synthesized Ikeda–Carpenter table.
+    /// The widest interval, in µs relative to the nominal arrival, a neutron
+    /// with energy between `e_lo` and `e_hi` can be recorded in by
+    /// [`Self::detector_bin_probabilities`].
     ///
     /// # Errors
     /// Returns [`ResolutionParseError::InvalidFormat`] for a Gaussian, which
     /// has no detector-time kernel.
-    pub fn kernel_support_us(&self, energy_ev: f64) -> Result<(f64, f64), ResolutionParseError> {
+    pub fn kernel_support_us(
+        &self,
+        e_lo: f64,
+        e_hi: f64,
+    ) -> Result<(f64, f64), ResolutionParseError> {
         match self {
-            Self::Tabulated(tabulated) => Ok(tabulated.kernel_support_us(energy_ev)),
-            Self::IkedaCarpenter(ic) => Ok(ic.tabulated().kernel_support_us(energy_ev)),
+            Self::Tabulated(tabulated) => Ok(tabulated.kernel_support_us(e_lo, e_hi)),
+            Self::IkedaCarpenter(ic) => {
+                let (low_early, low_late) = ic.kernel_support_us(e_lo);
+                let (high_early, high_late) = ic.kernel_support_us(e_hi);
+                Ok((low_early.min(high_early), low_late.max(high_late)))
+            }
             Self::Gaussian(_) => Err(ResolutionParseError::InvalidFormat(
                 "Gaussian energy broadening has no detector-time kernel support".to_string(),
             )),

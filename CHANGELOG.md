@@ -18,9 +18,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
   `timing_offset_us` and `nodes_per_bin`, and accepts a
   `TabulatedResolution` or `IkedaCarpenter` detector-time response. The
   route owns its true-energy quadrature: the measured window extended past
-  each end by the kernel's reach, with `nodes_per_bin` energies per bin at
-  the sub-bin centre times under the response clock, built by
-  `exact_count_quadrature`; any other grid is rejected. New public Rust
+  each end by the kernel's reach and stopping at the clock's zero, with
+  `nodes_per_bin` energies per bin at the sub-bin centre times under the
+  response clock, built by `exact_count_quadrature`; any other grid is
+  rejected, as is a window opening at or before that zero. New public Rust
   surface: `ExactCountResponseConfig`, `DetectorBinResponseMatrix`,
   `ExactTwoArmRatioModel`, `exact_quadrature_edges` and
   `exact_true_energies`. Spatial mapping and the research Fisher helper stay

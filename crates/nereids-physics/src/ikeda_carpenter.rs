@@ -776,6 +776,16 @@ impl IkedaCarpenter {
         synth_kernel(&self.params, self.n_tau, energy_ev)
     }
 
+    /// The interval, in µs relative to the nominal arrival, the pulse at
+    /// `energy_ev` occupies: the fold's spread before the pulse start and the
+    /// tail horizon after it.
+    #[must_use]
+    pub fn kernel_support_us(&self, energy_ev: f64) -> (f64, f64) {
+        let (alpha, beta, r) = rates_at(&self.params, energy_ev);
+        let margin = margin_of(&self.params);
+        (-margin, tau_max_of(alpha, beta, r) + margin)
+    }
+
     /// Evaluate the physical source pulse at one true neutron energy.
     ///
     /// Returns sampled moderator-delay coordinates in µs and peak-normalized
@@ -949,6 +959,15 @@ impl IkedaCarpenter {
     }
 }
 
+fn tau_max_of(alpha: f64, beta: f64, r: f64) -> f64 {
+    let slow_reach = if r > R_NEGLIGIBLE {
+        SLOW_REACH_E_FOLDS / beta
+    } else {
+        0.0
+    };
+    (FAST_REACH_E_FOLDS / alpha).max(slow_reach)
+}
+
 /// τ-grid geometry for one kernel: `(dtau, tau_max, margin)`, or a
 /// descriptive error when no exact sampled representation fits the cap.
 ///
@@ -978,15 +997,8 @@ fn tau_geometry(
     beta: f64,
     r: f64,
 ) -> Result<(f64, f64, f64), String> {
-    // τ_max: reach far enough that the prompt tail (e^{−ατ}) and, when
-    // storage is active, the slow tail (e^{−βτ}) are below the trim level.
     let fast_reach = FAST_REACH_E_FOLDS / alpha;
-    let slow_reach = if r > R_NEGLIGIBLE {
-        SLOW_REACH_E_FOLDS / beta
-    } else {
-        0.0
-    };
-    let tau_max = fast_reach.max(slow_reach);
+    let tau_max = tau_max_of(alpha, beta, r);
 
     // Requested step and resolution floor. `floor ≥ dtau_req` always: the
     // prompt terms satisfy MIN_N_TAU ≤ n_tau (validated by `new`) and the
@@ -1064,15 +1076,21 @@ fn synth_kernel(
     synth_source_pulse(params, n_tau, energy_ev)
 }
 
+fn rates_at(params: &IkedaCarpenterParams, energy_ev: f64) -> (f64, f64, f64) {
+    (
+        params.alpha.eval(energy_ev).max(MIN_RATE),
+        params.beta.eval(energy_ev).max(MIN_RATE),
+        params.r.eval(energy_ev).clamp(0.0, 1.0),
+    )
+}
+
 /// Synthesize one physical-time source pulse without moving its mode.
 fn synth_source_pulse_density(
     params: &IkedaCarpenterParams,
     n_tau: usize,
     energy_ev: f64,
 ) -> Result<(Vec<f64>, Vec<f64>), ResolutionParseError> {
-    let alpha = params.alpha.eval(energy_ev).max(MIN_RATE);
-    let beta = params.beta.eval(energy_ev).max(MIN_RATE);
-    let r = params.r.eval(energy_ev).clamp(0.0, 1.0);
+    let (alpha, beta, r) = rates_at(params, energy_ev);
 
     let (dtau, tau_max, margin) = tau_geometry(params, n_tau, alpha, beta, r).map_err(|msg| {
         ResolutionParseError::InvalidFormat(format!(

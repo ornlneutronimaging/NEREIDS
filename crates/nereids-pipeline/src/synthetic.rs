@@ -77,10 +77,6 @@ pub struct Measurement {
     /// Incident neutrons per bin of the route's quadrature, before the
     /// response and before background.
     pub incident_fluence_weights: Vec<f64>,
-    /// Expected neutron counts that fell outside the acquisition window, per
-    /// arm. Reported rather than renormalized away: a fixture that quietly
-    /// lost counts here would look like an unexplained normalization error in
-    /// whatever fit consumed it.
     pub window_loss: (f64, f64),
 }
 
@@ -115,7 +111,7 @@ pub fn detector_time_edges_around(
         edges.push(0.5 * (pair[0] + pair[1]));
     }
     edges.push(times[last] + 0.5 * (times[last] - times[last - 1]));
-    pad_detector_edges(&edges, window_pad_bins, window_pad_bins)
+    pad_detector_edges(&edges, window_pad_bins, window_pad_bins).expect("a padded time axis")
 }
 
 impl Truth {
@@ -143,6 +139,7 @@ impl Truth {
             self.source_pad_bins,
             self.source_pad_bins,
         )
+        .expect("a padded time axis")
     }
 
     fn source_fluence(&self) -> Vec<f64> {

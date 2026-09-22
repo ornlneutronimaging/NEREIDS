@@ -277,7 +277,8 @@ centre times of every quadrature bin under the response clock
 `nodes_per_bin` entries belong to the earliest quadrature bin. The extension
 holds the neutrons that arrive nominally outside the window but are recorded
 inside it through the kernel; a quadrature confined to the window fits them as
-missing transmission. The fluence is supplied per quadrature bin as the
+missing transmission. It stops at the clock's zero, where the source pulse
+starts, and a window that opens at or before that zero is rejected. The fluence is supplied per quadrature bin as the
 incident neutrons (source fluence times detector efficiency integrated over
 the bin's nominal arrival-time interval) *before* the response broadens them;
 the recorded open-beam spectrum is that quantity after the response and
