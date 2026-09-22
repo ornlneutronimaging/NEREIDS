@@ -1235,23 +1235,39 @@ class TestExactResolvedCountsRoute:
         true_density = 5.0e-4
         nodes = 8
         detector_edges = 630.0 + 2.5 * np.arange(102)
-        energies = nereids.exact_count_true_energies(
-            detector_edges, 0.0, self.L, nodes
+        quadrature_edges, energies = nereids.exact_count_quadrature(
+            detector_edges, 0.0, response, nodes
         )
+        # The source is lit two bins past each end of the quadrature; the
+        # triangle's reach is 3 µs, so those bins add nothing to the window.
+        extra = 2
+        source_edges = np.concatenate(
+            [
+                quadrature_edges[0] - 2.5 * np.arange(extra, 0, -1),
+                quadrature_edges,
+                quadrature_edges[-1] + 2.5 * np.arange(1, extra + 1),
+            ]
+        )
+        _, source_energies = nereids.exact_count_quadrature(
+            source_edges, 0.0, response, nodes
+        )
+        assert len(source_energies) == (len(source_edges) - 1 + 2 * extra) * nodes
+        source_energies = source_energies[extra * nodes : -extra * nodes]
         # Same temperature as the fit default (293.6 K): this anchor pins the
         # detector-response routing — the Doppler physics has its own oracles.
         true_transmission = np.asarray(
-            nereids.forward_model(energies, [(u238_data, true_density)])
+            nereids.forward_model(source_energies, [(u238_data, true_density)])
         )
 
-        n_bins = len(detector_edges) - 1
-        fluence_per_bin = 4.0e4 * (1.0 + 0.4 * np.arange(n_bins) / (n_bins - 1))
+        source_centres = 0.5 * (source_edges[:-1] + source_edges[1:])
+        source_fluence = 4.0e4 * (1.0 + 0.4 * (source_centres - 630.0) / 252.5)
+        fluence_per_bin = source_fluence[extra:-extra]
         # The operator takes the fluence per node in ascending-energy order:
         # bins reversed, each bin split equally over its nodes.
-        source = np.repeat(fluence_per_bin[::-1] / nodes, nodes)
+        source = np.repeat(source_fluence[::-1] / nodes, nodes)
 
         open_beam, sample, _open_loss, _sample_loss = nereids.two_arm_count_response(
-            energies,
+            source_energies,
             source,
             true_transmission,
             detector_edges,
@@ -1336,15 +1352,24 @@ class TestExactCountArgumentGuards:
                 **kwargs,
             )
 
-    def test_fluence_length_mismatch_rejected(self, u238_data):
-        kwargs = self._base_kwargs(u238_data)
+    def test_fluence_length_mismatch_rejected(self, u238_data, tmp_path):
+        response = TestExactCountQuadrature._triangle(tmp_path)
+        edges = 630.0 + 2.5 * np.arange(41)
+        _, energies = nereids.exact_count_quadrature(edges, 0.0, response, 1)
         with pytest.raises(
             ValueError, match="incident_fluence_weights length"
         ):
             nereids.fit_counts_spectrum_typed(
-                incident_fluence_weights=np.full(19, 1.0),
-                detector_time_edges_us=np.linspace(100.0, 200.0, 21),
-                **kwargs,
+                sample_counts=np.full(40, 900.0),
+                open_beam_counts=np.full(40, 1000.0),
+                energies=energies,
+                isotopes=[(u238_data, 1.0e-4)],
+                solver="kl",
+                max_iter=5,
+                resolution=response,
+                incident_fluence_weights=np.full(40, 1.0),
+                detector_time_edges_us=edges,
+                nodes_per_bin=1,
             )
 
     def test_edges_length_mismatch_rejected(self, u238_data):
@@ -1387,8 +1412,8 @@ class TestExactCountArgumentGuards:
             )
 
 
-class TestExactCountTrueEnergies:
-    """The route-owned true-energy grid and the rejections it enforces."""
+class TestExactCountQuadrature:
+    """The route-owned quadrature and the rejections it enforces."""
 
     L = 25.0
 
@@ -1399,68 +1424,88 @@ class TestExactCountTrueEnergies:
         return nereids.load_resolution(str(kernel_path), 25.0)
 
     @pytest.mark.parametrize("nodes", [1, 4])
-    def test_nodes_sit_at_the_sub_bin_centre_times(self, nodes):
+    def test_nodes_sit_at_the_sub_bin_centre_times_of_the_padded_window(
+        self, nodes, tmp_path
+    ):
+        response = self._triangle(tmp_path)
         edges = 600.0 + 2.5 * np.arange(41)
         offset = 7.5
-        energies = nereids.exact_count_true_energies(edges, offset, self.L, nodes)
-        assert len(energies) == (len(edges) - 1) * nodes
+        quadrature_edges, energies = nereids.exact_count_quadrature(
+            edges, offset, response, nodes
+        )
+        # A ±3 µs triangle reaches two 2.5 µs bins past each end.
+        np.testing.assert_array_equal(
+            quadrature_edges,
+            np.concatenate([edges[0] - 2.5 * np.array([2.0, 1.0]), edges, edges[-1] + 2.5 * np.array([1.0, 2.0])]),
+        )
+        assert len(energies) == (len(quadrature_edges) - 1) * nodes
         assert np.all(np.diff(energies) > 0.0)
-        widths = np.diff(edges) / nodes
+        widths = np.diff(quadrature_edges) / nodes
         times = (
-            edges[:-1, None] + (np.arange(nodes) + 0.5)[None, :] * widths[:, None]
+            quadrature_edges[:-1, None]
+            + (np.arange(nodes) + 0.5)[None, :] * widths[:, None]
         ).ravel() - offset
         expected = np.array(
             [nereids.tof_to_energy(float(t), self.L) for t in times]
         )[::-1]
         np.testing.assert_array_equal(energies, expected)
 
-    def test_bins_before_the_clock_zero_are_rejected(self):
+    def test_bins_before_the_clock_zero_are_rejected(self, tmp_path):
+        response = self._triangle(tmp_path)
         with pytest.raises(ValueError, match="trim the bins before the trigger"):
-            nereids.exact_count_true_energies(
-                np.array([-1.0, 0.0, 1.0]), 0.0, self.L, 1
+            nereids.exact_count_quadrature(
+                np.array([-1.0, 0.0, 1.0]), 0.0, response, 1
             )
 
-    def test_zero_nodes_per_bin_rejected(self):
+    def test_zero_nodes_per_bin_rejected(self, tmp_path):
+        response = self._triangle(tmp_path)
         with pytest.raises(ValueError, match="nodes_per_bin must be at least 1"):
-            nereids.exact_count_true_energies(
-                600.0 + 2.5 * np.arange(41), 0.0, self.L, 0
+            nereids.exact_count_quadrature(
+                600.0 + 2.5 * np.arange(41), 0.0, response, 0
             )
+
+    def test_a_single_edge_is_rejected(self, tmp_path):
+        response = self._triangle(tmp_path)
+        with pytest.raises(ValueError, match="at least two edges"):
+            nereids.exact_count_quadrature(np.array([600.0]), 0.0, response, 1)
+
+    def _fit_with_grid(self, u238_data, response, edges, energies):
+        return nereids.fit_counts_spectrum_typed(
+            sample_counts=np.full(40, 900.0),
+            open_beam_counts=np.full(40, 1000.0),
+            energies=energies,
+            isotopes=[(u238_data, 1.0e-4)],
+            solver="kl",
+            max_iter=5,
+            resolution=response,
+            incident_fluence_weights=np.full(44, 1.0),
+            detector_time_edges_us=edges,
+            nodes_per_bin=1,
+        )
 
     def test_a_grid_off_the_detector_clock_is_rejected(self, u238_data, tmp_path):
         response = self._triangle(tmp_path)
         edges = 630.0 + 2.5 * np.arange(41)
-        shifted = nereids.exact_count_true_energies(edges, 0.5, self.L, 1)
+        _, shifted = nereids.exact_count_quadrature(edges, 0.5, response, 1)
         with pytest.raises(ValueError, match="build the grid with exact_true_energies"):
-            nereids.fit_counts_spectrum_typed(
-                sample_counts=np.full(40, 900.0),
-                open_beam_counts=np.full(40, 1000.0),
-                energies=shifted,
-                isotopes=[(u238_data, 1.0e-4)],
-                solver="kl",
-                max_iter=5,
-                resolution=response,
-                incident_fluence_weights=np.full(40, 1.0),
-                detector_time_edges_us=edges,
-                nodes_per_bin=1,
-            )
+            self._fit_with_grid(u238_data, response, edges, shifted)
+
+    def test_a_grid_confined_to_the_window_is_rejected(self, u238_data, tmp_path):
+        response = self._triangle(tmp_path)
+        edges = 630.0 + 2.5 * np.arange(41)
+        centres = 0.5 * (edges[:-1] + edges[1:])
+        window_only = np.array(
+            [nereids.tof_to_energy(float(t), self.L) for t in centres[::-1]]
+        )
+        with pytest.raises(ValueError, match="build the grid with exact_true_energies"):
+            self._fit_with_grid(u238_data, response, edges, window_only)
 
     def test_a_grid_at_the_wrong_node_count_is_rejected(self, u238_data, tmp_path):
         response = self._triangle(tmp_path)
         edges = 630.0 + 2.5 * np.arange(41)
-        two_nodes = nereids.exact_count_true_energies(edges, 0.0, self.L, 2)
+        _, two_nodes = nereids.exact_count_quadrature(edges, 0.0, response, 2)
         with pytest.raises(ValueError, match="build the grid with exact_true_energies"):
-            nereids.fit_counts_spectrum_typed(
-                sample_counts=np.full(40, 900.0),
-                open_beam_counts=np.full(40, 1000.0),
-                energies=two_nodes,
-                isotopes=[(u238_data, 1.0e-4)],
-                solver="kl",
-                max_iter=5,
-                resolution=response,
-                incident_fluence_weights=np.full(40, 1.0),
-                detector_time_edges_us=edges,
-                nodes_per_bin=1,
-            )
+            self._fit_with_grid(u238_data, response, edges, two_nodes)
 
 
 class TestComputeModelJacobianCountsGate:

@@ -1330,6 +1330,18 @@ impl TabulatedResolution {
         }
         (low, high)
     }
+
+    /// The first and last sampled offsets of the kernel at `energy_ev`, in
+    /// µs relative to the nominal arrival: the interval a neutron of that
+    /// energy can be recorded in by [`Self::detector_bin_probabilities`].
+    #[must_use]
+    pub fn kernel_support_us(&self, energy_ev: f64) -> (f64, f64) {
+        let (offsets, _) = self.interpolated_kernel(energy_ev);
+        match (offsets.first(), offsets.last()) {
+            (Some(&first), Some(&last)) => (first, last),
+            _ => (0.0, 0.0),
+        }
+    }
 }
 
 /// Resolution function: analytical Gaussian, tabulated from Monte Carlo, or
@@ -1369,6 +1381,23 @@ const BRDLIM: f64 = 5.0;
 const GAUSSIAN_LOW_ENERGY_FLOOR_EV: f64 = 0.001;
 
 impl ResolutionFunction {
+    /// The interval, in µs relative to the nominal arrival, a neutron of
+    /// energy `energy_ev` can be recorded in: the sampled support of the
+    /// tabulated kernel, or of the synthesized Ikeda–Carpenter table.
+    ///
+    /// # Errors
+    /// Returns [`ResolutionParseError::InvalidFormat`] for a Gaussian, which
+    /// has no detector-time kernel.
+    pub fn kernel_support_us(&self, energy_ev: f64) -> Result<(f64, f64), ResolutionParseError> {
+        match self {
+            Self::Tabulated(tabulated) => Ok(tabulated.kernel_support_us(energy_ev)),
+            Self::IkedaCarpenter(ic) => Ok(ic.tabulated().kernel_support_us(energy_ev)),
+            Self::Gaussian(_) => Err(ResolutionParseError::InvalidFormat(
+                "Gaussian energy broadening has no detector-time kernel support".to_string(),
+            )),
+        }
+    }
+
     /// The energies a working grid for the data window `energies` has to span,
     /// as `(low, high)` in eV with `low ≤ e_min` and `high ≥ e_max`: SAMMY's
     /// Wdsint limits at the two ends for a Gaussian, the extremes of

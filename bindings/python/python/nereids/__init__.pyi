@@ -1523,21 +1523,25 @@ def tof_to_energy_centers(
     """Convert TOF bin edges to energy bin centers."""
     ...
 
-def exact_count_true_energies(
+def exact_count_quadrature(
     detector_time_edges_us: NDArray[np.float64],
     timing_offset_us: float,
-    flight_path_m: float,
+    resolution: TabulatedResolution | IkedaCarpenter,
     nodes_per_bin: int,
-) -> NDArray[np.float64]:
-    """The true-energy quadrature the exact resolved-count route requires.
+) -> tuple[NDArray[np.float64], NDArray[np.float64]]:
+    """The quadrature the exact resolved-count route requires.
 
-    ``nodes_per_bin`` energies per detector bin at the sub-bin centre times of
-    the response clock ``timing_offset_us`` over ``flight_path_m``, ascending;
-    the last ``nodes_per_bin`` entries belong to detector bin 0.  Pass the
-    same edges, offset, flight path and node count to the fit.  Raises
-    ``ValueError`` when the edges are not ascending and finite, the flight
-    path is not positive, ``nodes_per_bin`` is zero, or a node lies at or
-    before the clock's zero.
+    Returns ``(quadrature_edges, energies)``: the measured window extended
+    past each end by the kernel's reach, in bins of the end bin's width, and
+    ``nodes_per_bin`` true energies per quadrature bin at the sub-bin centre
+    times of the response clock ``timing_offset_us`` over the kernel's flight
+    path, ascending, so the last ``nodes_per_bin`` entries belong to the
+    earliest quadrature bin.  Pass the measured edges, the offset, the
+    resolution and the node count to the fit, with one fluence weight per
+    quadrature bin.  Raises ``ValueError`` when fewer than two edges are
+    given, the edges are not ascending and finite, the resolution is a
+    Gaussian, ``nodes_per_bin`` is zero, or a node lies at or before the
+    clock's zero.
     """
     ...
 
@@ -2188,17 +2192,19 @@ def fit_counts_spectrum_typed(
             ``detector_time_edges_us``.  A resolution without those inputs
             fails closed (the physical model needs the exact separate-arm
             model, never the R[T] shortcut).
-        incident_fluence_weights: Expected open-beam neutron counts per
-            detector bin with detector efficiency folded in, in detector-time
-            order; the route splits each bin over its quadrature nodes.
-            Required together with ``detector_time_edges_us``.
+        incident_fluence_weights: Incident neutrons per quadrature bin of
+            ``exact_count_quadrature``, in time order: the source fluence times
+            detector efficiency integrated over the bin's nominal arrival-time
+            interval, before the response broadens it.  The recorded open-beam
+            spectrum is this quantity after the response and cannot be passed
+            in its place.  Required together with ``detector_time_edges_us``.
         detector_time_edges_us: Actual measured detector-time bin edges in
             ascending microseconds; length must be one greater than the
-            sample/open count arrays, and ``energies`` must be
-            ``exact_count_true_energies`` of these edges under the response's
-            flight path, ``timing_offset_us`` and ``nodes_per_bin``.
-        nodes_per_bin: Quadrature nodes per detector bin the true-energy grid
-            was built with; required with the exact-response inputs.  It must
+            sample/open count arrays, and ``energies`` must be the energies of
+            ``exact_count_quadrature`` of these edges under the response,
+            ``timing_offset_us`` and ``nodes_per_bin``.
+        nodes_per_bin: Quadrature nodes per bin the true-energy grid was
+            built with; required with the exact-response inputs.  It must
             resolve the resonance structure within a bin: refit at twice the
             count and compare.
         timing_offset_us: Fixed detector-clock offset applied by the response

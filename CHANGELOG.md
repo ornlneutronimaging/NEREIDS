@@ -13,17 +13,18 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
   with an active instrument resolution now evaluates the physical detector
   equation — the open and sample arms broadened separately,
   `T_eff,i = Σ_j F_j T_j R_ij / Σ_j F_j R_ij` — instead of failing closed.
-  `fit_counts_spectrum_typed` gains `incident_fluence_weights` (expected
-  open-beam counts per detector bin), `detector_time_edges_us`,
+  `fit_counts_spectrum_typed` gains `incident_fluence_weights` (incident
+  neutrons per quadrature bin, before the response), `detector_time_edges_us`,
   `timing_offset_us` and `nodes_per_bin`, and accepts a
   `TabulatedResolution` or `IkedaCarpenter` detector-time response. The
-  route owns its true-energy quadrature: `nodes_per_bin` energies per
-  detector bin at the sub-bin centre times under the response clock, built
-  by `exact_count_true_energies`; any other grid is rejected. New public
-  Rust surface: `ExactCountResponseConfig`, `DetectorBinResponseMatrix`,
-  `ExactTwoArmRatioModel`, `exact_true_energies` and `exact_node_fluence`.
-  Spatial mapping and the research Fisher helper stay fail-closed for
-  resolved counts.
+  route owns its true-energy quadrature: the measured window extended past
+  each end by the kernel's reach, with `nodes_per_bin` energies per bin at
+  the sub-bin centre times under the response clock, built by
+  `exact_count_quadrature`; any other grid is rejected. New public Rust
+  surface: `ExactCountResponseConfig`, `DetectorBinResponseMatrix`,
+  `ExactTwoArmRatioModel`, `exact_quadrature_edges` and
+  `exact_true_energies`. Spatial mapping and the research Fisher helper stay
+  fail-closed for resolved counts.
 
 ### Changed (breaking)
 

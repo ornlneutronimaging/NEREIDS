@@ -1,16 +1,15 @@
 //! Synthetic counts-domain measurements with known ground truth:
 //!
 //! ```text
-//! E_true = exact_true_energies(edges, timing_offset, L, t0, L_scale, nodes_per_bin)
+//! E_true = exact_true_energies(source edges, timing_offset, L, t0, L_scale, nodes_per_bin)
 //! T_j    = exp(-sum_i (n d)_i sigma_i(E_true_j; T))
 //! O_i    = sum_j F_j R_ij + B_o,i        S_i = sum_j F_j T_j R_ij + B_s,i
 //! ```
 //!
-//! with `R_ij` the detector-bin response of the true resolution kernel,
-//! per-bin backgrounds that differ between the arms, and the recorded
-//! counts a Poisson draw around `O_i` and `S_i`.
-
-use std::ops::Range;
+//! with `R_ij` the detector-bin response of the true resolution kernel read
+//! against the true clock `timing_offset + t0` over `L · L_scale`, per-bin
+//! backgrounds that differ between the arms, and the recorded counts a
+//! Poisson draw around `O_i` and `S_i`.
 
 use nereids_endf::resonance::ResonanceData;
 use nereids_physics::counts_response::{add_count_backgrounds, two_arm_count_response};
@@ -20,7 +19,9 @@ use rand::SeedableRng;
 use rand_chacha::ChaCha12Rng;
 use rand_distr::{Distribution, Poisson};
 
-use crate::pipeline::{exact_node_fluence, exact_true_energies};
+use crate::pipeline::{
+    exact_node_fluence, exact_quadrature_edges, exact_true_energies, pad_detector_edges,
+};
 
 /// Everything injected into a synthetic measurement, shared across pixels.
 ///
@@ -30,9 +31,10 @@ use crate::pipeline::{exact_node_fluence, exact_true_energies};
 pub struct Truth {
     /// Detector-time bin edges the counts are binned into (µs), ascending.
     pub detector_time_edges_us: Vec<f64>,
-    /// Detector bins the source illuminates; `None` illuminates all of them.
-    pub source_bins: Option<Range<usize>>,
-    /// Quadrature nodes per detector bin the counts are synthesized with.
+    /// Bins of the end bin's width the source is lit past each end of the
+    /// route's quadrature.
+    pub source_pad_bins: usize,
+    /// Quadrature nodes per bin the counts are synthesized with.
     pub nodes_per_bin: usize,
     /// Nominal flight path (m).
     pub flight_path_m: f64,
@@ -48,8 +50,8 @@ pub struct Truth {
     pub resolution: ResolutionFunction,
     /// Trigger offset of the detector time axis (µs).
     pub timing_offset_us: f64,
-    /// Expected open-beam neutron counts per illuminated detector bin,
-    /// before background.
+    /// Incident neutrons per lit bin, before the response and before
+    /// background.
     pub open_beam_counts_per_bin: f64,
     /// Expected open-arm background counts per detector bin.
     pub open_background_per_bin: f64,
@@ -72,7 +74,8 @@ pub struct Measurement {
     pub true_energies_ev: Vec<f64>,
     /// Detector-time bin edges the counts are binned into (µs), ascending.
     pub detector_time_edges_us: Vec<f64>,
-    /// Expected open-beam neutron counts per detector bin, before background.
+    /// Incident neutrons per bin of the route's quadrature, before the
+    /// response and before background.
     pub incident_fluence_weights: Vec<f64>,
     /// Expected neutron counts that fell outside the acquisition window, per
     /// arm. Reported rather than renormalized away: a fixture that quietly
@@ -105,42 +108,55 @@ pub fn detector_time_edges_around(
         .map(|&e| timing_offset_us + kl / e.sqrt())
         .collect();
     times.reverse();
-    let first_width = times[1] - times[0];
     let last = times.len() - 1;
-    let last_width = times[last] - times[last - 1];
-
-    let mut edges = Vec::with_capacity(times.len() + 1 + 2 * window_pad_bins);
-    for pad in (1..=window_pad_bins).rev() {
-        edges.push(times[0] - (0.5 + pad as f64) * first_width);
-    }
-    edges.push(times[0] - 0.5 * first_width);
+    let mut edges = Vec::with_capacity(times.len() + 1);
+    edges.push(times[0] - 0.5 * (times[1] - times[0]));
     for pair in times.windows(2) {
         edges.push(0.5 * (pair[0] + pair[1]));
     }
-    edges.push(times[last] + 0.5 * last_width);
-    for pad in 1..=window_pad_bins {
-        edges.push(times[last] + (0.5 + pad as f64) * last_width);
-    }
-    edges
+    edges.push(times[last] + 0.5 * (times[last] - times[last - 1]));
+    pad_detector_edges(&edges, window_pad_bins, window_pad_bins)
 }
 
 impl Truth {
-    /// Expected open-beam neutron counts per detector bin, before background.
+    /// The route's quadrature bins for this window under the nominal clock.
+    ///
+    /// # Panics
+    /// Panics if the detector time axis is not a valid quadrature support.
+    pub fn quadrature_edges(&self) -> Vec<f64> {
+        exact_quadrature_edges(
+            &self.detector_time_edges_us,
+            self.timing_offset_us,
+            &self.resolution,
+        )
+        .expect("valid detector time axis")
+    }
+
+    /// The bins the source is lit on: the quadrature extended by
+    /// `source_pad_bins` past each end.
+    ///
+    /// # Panics
+    /// Panics if the detector time axis is not a valid quadrature support.
+    pub fn source_edges(&self) -> Vec<f64> {
+        pad_detector_edges(
+            &self.quadrature_edges(),
+            self.source_pad_bins,
+            self.source_pad_bins,
+        )
+    }
+
+    fn source_fluence(&self) -> Vec<f64> {
+        vec![self.open_beam_counts_per_bin; self.source_edges().len() - 1]
+    }
+
+    /// Incident neutrons per bin of the route's quadrature, before the
+    /// response.
+    ///
+    /// # Panics
+    /// Panics if the detector time axis is not a valid quadrature support.
     pub fn fluence_per_bin(&self) -> Vec<f64> {
-        let n_bins = self.detector_time_edges_us.len() - 1;
-        (0..n_bins)
-            .map(|bin| {
-                let lit = self
-                    .source_bins
-                    .as_ref()
-                    .is_none_or(|bins| bins.contains(&bin));
-                if lit {
-                    self.open_beam_counts_per_bin
-                } else {
-                    0.0
-                }
-            })
-            .collect()
+        let fluence = self.source_fluence();
+        fluence[self.source_pad_bins..fluence.len() - self.source_pad_bins].to_vec()
     }
 
     /// The energy grid a fit at `nodes_per_bin` is given: the quadrature
@@ -150,7 +166,7 @@ impl Truth {
     /// Panics if the detector time axis is not a valid quadrature support.
     pub fn nominal_energies_ev(&self, nodes_per_bin: usize) -> Vec<f64> {
         exact_true_energies(
-            &self.detector_time_edges_us,
+            &self.quadrature_edges(),
             self.timing_offset_us,
             self.flight_path_m,
             0.0,
@@ -160,14 +176,14 @@ impl Truth {
         .expect("valid detector time axis")
     }
 
-    /// The energies a neutron recorded on this instrument actually had, at
-    /// the synthesis quadrature.
+    /// The energies of the source's neutrons on this instrument, at the
+    /// synthesis quadrature, ascending.
     ///
     /// # Panics
     /// Panics if the detector time axis is not a valid quadrature support.
     pub fn true_energies_ev(&self) -> Vec<f64> {
         exact_true_energies(
-            &self.detector_time_edges_us,
+            &self.source_edges(),
             self.timing_offset_us,
             self.flight_path_m,
             self.t0_us,
@@ -204,16 +220,18 @@ impl Truth {
             forward_model(&true_energies_ev, &sample, None).expect("valid forward model");
 
         let n_bins = self.detector_time_edges_us.len() - 1;
-        let incident_fluence_weights = self.fluence_per_bin();
-        let node_fluence = exact_node_fluence(&incident_fluence_weights, self.nodes_per_bin);
-
+        let node_fluence = exact_node_fluence(&self.source_fluence(), self.nodes_per_bin);
+        let response = self
+            .resolution
+            .with_flight_path(self.flight_path_m * self.l_scale)
+            .expect("valid flight path");
         let signal = two_arm_count_response(
             &true_energies_ev,
             &node_fluence,
             &transmission,
             &self.detector_time_edges_us,
-            self.timing_offset_us,
-            &self.resolution,
+            self.timing_offset_us + self.t0_us,
+            &response,
         )
         .expect("valid two-arm response");
 
@@ -256,7 +274,7 @@ impl Truth {
             expected_open,
             true_energies_ev,
             detector_time_edges_us: self.detector_time_edges_us.clone(),
-            incident_fluence_weights,
+            incident_fluence_weights: self.fluence_per_bin(),
             window_loss,
         }
     }

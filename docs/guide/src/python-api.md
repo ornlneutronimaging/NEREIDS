@@ -248,45 +248,51 @@ broadened transmission ratio `R[T]`. To fit raw counts with an active
 resolution, supply the exact-response inputs:
 
 ```python
-nodes_per_bin = 4                # quadrature nodes per detector bin
-energies = nereids.exact_count_true_energies(
+nodes_per_bin = 4                # quadrature nodes per bin
+quadrature_edges, energies = nereids.exact_count_quadrature(
     edges,                       # len(edges) == len(sample_counts) + 1
     timing_offset_us=0.0,
-    flight_path_m=25.0,          # the response kernel's flight path
+    resolution=response,         # TabulatedResolution or IkedaCarpenter
     nodes_per_bin=nodes_per_bin,
 )
 result = nereids.fit_counts_spectrum_typed(
     sample_counts,               # per measured detector-time bin
     open_beam_counts,            # per measured detector-time bin
-    energies,                    # nodes_per_bin true energies per bin, ascending
+    energies,                    # nodes_per_bin true energies per quadrature bin
     [(u238, 0.0005)],
     solver="kl",
-    resolution=response,         # TabulatedResolution or IkedaCarpenter
-    incident_fluence_weights=F,  # expected open-beam counts per detector bin
+    resolution=response,
+    incident_fluence_weights=F,  # incident neutrons per quadrature bin, before the response
     detector_time_edges_us=edges,
     timing_offset_us=0.0,
     nodes_per_bin=nodes_per_bin,
 )
 ```
 
-The true-energy quadrature is owned by the route: `exact_count_true_energies`
-places `nodes_per_bin` true energies at the sub-bin centre times of every
-detector bin under the response clock (`timing_offset_us` and the kernel's
-flight path), ascending, so the last `nodes_per_bin` entries belong to bin 0.
-The fluence is supplied per detector bin, as expected open-beam counts with
-efficiency folded in, and the route splits each bin over its nodes. A grid
-built any other way, including `tof_to_energy_centers` (geometric-mean
-centres) or one built with a different clock, is rejected with a `ValueError`
-naming the first point that differs, and so is a window with bins before the
-clock's zero (trim them first). The transmission is integrated over each bin
-with `nodes_per_bin` points, so the count must resolve the resonance
-structure within a bin: refit at twice the count and compare the densities.
-`two_arm_count_response(...)` is the same operator exposed standalone for
-synthesizing or checking expected counts from a per-node fluence (it
-additionally reports the per-arm acquisition-window loss). A resolution
-*without* the exact-response inputs still fails closed with a `ValueError`,
-and `fit_energy_scale` / `fit_energy_range` are not yet supported through
-the exact response.
+The true-energy quadrature is owned by the route. `exact_count_quadrature`
+extends the measured window past each end by the kernel's reach, in bins of
+the end bin's width, and places `nodes_per_bin` true energies at the sub-bin
+centre times of every quadrature bin under the response clock
+(`timing_offset_us` and the kernel's flight path), ascending, so the last
+`nodes_per_bin` entries belong to the earliest quadrature bin. The extension
+holds the neutrons that arrive nominally outside the window but are recorded
+inside it through the kernel; a quadrature confined to the window fits them as
+missing transmission. The fluence is supplied per quadrature bin as the
+incident neutrons (source fluence times detector efficiency integrated over
+the bin's nominal arrival-time interval) *before* the response broadens them;
+the recorded open-beam spectrum is that quantity after the response and
+cannot be passed in its place. A grid built any other way, including
+`tof_to_energy_centers` (geometric-mean centres) or one built with a
+different clock, is rejected with a `ValueError` naming the first point that
+differs, and so is a window with bins before the clock's zero (trim them
+first). The transmission is integrated over each bin with `nodes_per_bin`
+points, so the count must resolve the resonance structure within a bin: refit
+at twice the count and compare the densities. `two_arm_count_response(...)`
+is the same operator exposed standalone for synthesizing or checking expected
+counts from a per-node fluence (it additionally reports the per-arm
+acquisition-window loss). A resolution *without* the exact-response inputs
+still fails closed with a `ValueError`, and `fit_energy_scale` /
+`fit_energy_range` are not yet supported through the exact response.
 
 Counts specific options are:
 
@@ -295,7 +301,7 @@ Counts specific options are:
 | `detector_background=...` | Reserved detector background spectrum; the counts-KL dispatch rejects non-zero values. |
 | `c=1.0` | Proton-charge ratio `Q_s / Q_ob`. |
 | `enable_polish=True/False/None` | Override counts-KL polish behavior; `None` uses the dispatcher default. |
-| `resolution=...`, `incident_fluence_weights=...`, `detector_time_edges_us=...`, `timing_offset_us=0.0` | Exact separate-arm response inputs (see above). |
+| `resolution=...`, `incident_fluence_weights=...`, `detector_time_edges_us=...`, `timing_offset_us=0.0`, `nodes_per_bin=...` | Exact separate-arm response inputs (see above). |
 
 The counts-domain `alpha_1`/`alpha_2` nuisance parameters are not fit by
 `fit_counts_spectrum_typed` or `spatial_map_typed`. Only

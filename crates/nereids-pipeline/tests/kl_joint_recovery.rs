@@ -25,6 +25,7 @@ const FLIGHT_PATH_M: f64 = 25.0;
 const DENSITY_TRUE: f64 = 5.0e-4;
 const TEMPERATURE_TRUE_K: f64 = 293.6;
 const WINDOW_PAD_BINS: usize = 64;
+const SOURCE_PAD_BINS: usize = 8;
 const SYNTHESIS_NODES_PER_BIN: usize = 16;
 const FIT_NODES_PER_BIN: usize = 4;
 
@@ -68,12 +69,15 @@ fn resolution(grid: &[f64]) -> ResolutionFunction {
 /// fix for it.
 fn truth() -> Truth {
     let grid = energies();
-    let edges = detector_time_edges_around(&grid, FLIGHT_PATH_M, 0.0, WINDOW_PAD_BINS);
-    let n_bins = edges.len() - 1;
     Truth {
         resolution: resolution(&grid),
-        detector_time_edges_us: edges,
-        source_bins: Some(WINDOW_PAD_BINS..n_bins - WINDOW_PAD_BINS),
+        detector_time_edges_us: detector_time_edges_around(
+            &grid,
+            FLIGHT_PATH_M,
+            0.0,
+            WINDOW_PAD_BINS,
+        ),
+        source_pad_bins: SOURCE_PAD_BINS,
         nodes_per_bin: SYNTHESIS_NODES_PER_BIN,
         flight_path_m: FLIGHT_PATH_M,
         t0_us: 0.0,
@@ -92,12 +96,6 @@ fn recover(seed: u64) -> (f64, f64, f64) {
     let truth = truth();
     let m = truth.measure(&[DENSITY_TRUE], seed);
 
-    let offered: f64 = m.incident_fluence_weights.iter().sum();
-    assert!(
-        m.window_loss.0 / offered < 1.0e-3 && m.window_loss.1 / offered < 1.0e-3,
-        "fixture loses counts outside the acquisition window: {:?}",
-        m.window_loss
-    );
     // And the draw must be noise around the expectation, not the expectation.
     assert_ne!(m.sample_counts, m.expected_sample, "counts are not a draw");
     assert_ne!(m.open_beam_counts, m.expected_open, "counts are not a draw");

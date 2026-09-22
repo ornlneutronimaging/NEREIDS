@@ -15,6 +15,7 @@ use nereids_pipeline::synthetic::{Truth, detector_time_edges_around};
 const FLIGHT_PATH_M: f64 = 25.0;
 const TIMING_OFFSET_US: f64 = 0.0;
 const WINDOW_PAD_BINS: usize = 64;
+const SOURCE_PAD_BINS: usize = 8;
 const NODES_PER_BIN: usize = 16;
 /// U-238 areal density (at/b), sized so the 6.674 eV dip is deep enough to
 /// carry information but far from black.
@@ -49,12 +50,15 @@ fn resolution(energies: &[f64]) -> ResolutionFunction {
 
 fn truth() -> Truth {
     let grid = energies();
-    let edges = detector_time_edges_around(&grid, FLIGHT_PATH_M, TIMING_OFFSET_US, WINDOW_PAD_BINS);
-    let n_bins = edges.len() - 1;
     Truth {
         resolution: resolution(&grid),
-        detector_time_edges_us: edges,
-        source_bins: Some(WINDOW_PAD_BINS..n_bins - WINDOW_PAD_BINS),
+        detector_time_edges_us: detector_time_edges_around(
+            &grid,
+            FLIGHT_PATH_M,
+            TIMING_OFFSET_US,
+            WINDOW_PAD_BINS,
+        ),
+        source_pad_bins: SOURCE_PAD_BINS,
         nodes_per_bin: NODES_PER_BIN,
         flight_path_m: FLIGHT_PATH_M,
         t0_us: 0.0,
@@ -72,7 +76,7 @@ fn truth() -> Truth {
 fn detector_time_edges_ascend_and_bracket_the_grid() {
     let truth = truth();
     let edges = &truth.detector_time_edges_us;
-    assert_eq!(edges.len(), truth.fluence_per_bin().len() + 1);
+    assert_eq!(edges.len(), energies().len() + 1 + 2 * WINDOW_PAD_BINS);
     assert!(
         edges.windows(2).all(|w| w[0] < w[1]),
         "detector time edges must ascend"
@@ -221,21 +225,33 @@ fn counts_are_a_reproducible_poisson_draw() {
 }
 
 #[test]
-fn the_acquisition_window_keeps_the_counts_it_was_given() {
+fn the_source_beyond_the_quadrature_never_reaches_the_window() {
+    let quadrature_only = Truth {
+        source_pad_bins: 0,
+        ..truth()
+    }
+    .measure(&[DENSITY], 5);
     let truth = truth();
     let m = truth.measure(&[DENSITY], 5);
 
-    let offered: f64 = m.incident_fluence_weights.iter().sum();
     let (open_loss, sample_loss) = m.window_loss;
     assert!(
-        open_loss / offered < 1.0e-3,
-        "open arm loses {open_loss:.3e} of {offered:.3e} outside the window"
+        open_loss > 0.0 && sample_loss <= open_loss,
+        "the source is lit past the window, so some of it must miss: \
+         {open_loss:.3e} open, {sample_loss:.3e} sample"
     );
-    assert!(
-        sample_loss <= open_loss,
-        "the sample arm cannot lose more than the open arm: \
-         {sample_loss:.3e} against {open_loss:.3e}"
-    );
+    for (bin, (wide, narrow)) in m
+        .expected_open
+        .iter()
+        .zip(&quadrature_only.expected_open)
+        .enumerate()
+    {
+        assert!(
+            (wide - narrow).abs() <= 1.0e-12 * wide,
+            "bin {bin}: neutrons past the quadrature's reach changed the window \
+             ({wide} against {narrow})"
+        );
+    }
 
     assert_eq!(m.open_beam_counts.len(), m.sample_counts.len());
     assert_eq!(
@@ -243,41 +259,37 @@ fn the_acquisition_window_keeps_the_counts_it_was_given() {
         m.sample_counts.len() + 1,
         "one more edge than bins"
     );
-    assert!(
-        m.sample_counts.len() > energies().len(),
-        "the acquisition window must be wider than the region of interest"
-    );
     assert_eq!(
         m.true_energies_ev.len(),
-        m.incident_fluence_weights.len() * NODES_PER_BIN,
-        "nodes_per_bin true energies per detector bin"
+        (m.incident_fluence_weights.len() + 2 * SOURCE_PAD_BINS) * NODES_PER_BIN,
+        "nodes_per_bin true energies per source bin"
     );
-    // At the identity energy scale the true energies ARE the nominal ones.
-    assert_eq!(m.true_energies_ev, truth.nominal_energies_ev(NODES_PER_BIN));
+    assert_eq!(
+        quadrature_only.true_energies_ev,
+        truth.nominal_energies_ev(NODES_PER_BIN)
+    );
 }
 
-/// A non-identity energy scale must move the true energies, or a calibration
-/// recovery test built on this fixture would be measuring nothing.
 #[test]
-fn the_energy_scale_truth_moves_the_true_energies() {
-    let shifted = Truth {
-        t0_us: 0.35,
-        l_scale: 1.004,
-        ..truth()
+fn the_energy_scale_truth_moves_the_recorded_dip() {
+    let dip_centroid_us = |t: &Truth| {
+        let m = t.measure(&[DENSITY], 6);
+        let (weighted, weight) = m
+            .detector_time_edges_us
+            .windows(2)
+            .zip(m.expected_sample.iter().zip(&m.expected_open))
+            .map(|(edges, (s, o))| {
+                let depth = (1.0 - s / o).max(0.0);
+                (0.5 * (edges[0] + edges[1]) * depth, depth)
+            })
+            .fold((0.0, 0.0), |(t, w), (dt, dw)| (t + dt, w + dw));
+        weighted / weight
     };
-    let identity = truth();
-
-    let a = identity.true_energies_ev();
-    let b = shifted.true_energies_ev();
-    let worst = a
-        .iter()
-        .zip(&b)
-        .map(|(x, y)| (x - y).abs() / x)
-        .fold(0.0_f64, f64::max);
+    let t0_us = 2.0;
+    let shift = dip_centroid_us(&Truth { t0_us, ..truth() }) - dip_centroid_us(&truth());
     assert!(
-        worst > 1.0e-3,
-        "energy-scale truth barely moved the grid ({worst:.2e}); calibration \
-         would be unrecoverable from it"
+        (shift - t0_us).abs() < 0.2,
+        "a {t0_us} µs clock offset must move the recorded dip by as much, got {shift:.3} µs"
     );
 }
 
