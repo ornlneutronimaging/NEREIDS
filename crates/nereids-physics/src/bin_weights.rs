@@ -13,8 +13,8 @@
 //! at point `j` and 0 at its neighbours, and `P_k(u)` the chance that the
 //! resolution records a neutron of flight time `u` in bin `k`.
 //!
-//! SAMMY Ref: `udr/mudr4.f` Ud_Convolute and Udr_Add, which integrate
-//! piecewise-linear pieces against the tabulated resolution.
+//! SAMMY Ref: `udr/mudr2.f` Udr_Resb, which forms the same hat-function
+//! weights against a tabulated resolution.
 
 use std::fmt;
 

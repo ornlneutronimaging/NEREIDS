@@ -19,6 +19,8 @@ pub const ACCURACY: f64 = 0.1;
 
 const MAX_DOUBLINGS: usize = 8;
 
+const NEGLIGIBLE_REACH: f64 = 1e-7;
+
 /// A quantity the fit determines from `Fitted`'s starting value, or holds at
 /// its `Known` value.
 #[derive(Debug, Clone, Copy, PartialEq)]
@@ -142,6 +144,16 @@ pub fn fit_counts(
     let phi = beam_at(&base, &beam, kl);
     let mut kept_range =
         kept_energies(&base, &base_weights, &phi, measurement.charge_ratio, &noise);
+    let seen = measurement.isotopes.iter().any(|(isotope, density)| {
+        *density != Value::Known(0.0)
+            && !kept(&extract_resonance_widths(&[isotope]), kept_range).is_empty()
+    });
+    if matches!(measurement.temperature_k, Value::Fitted(_)) && !seen {
+        return Err(PipelineError::InvalidParameter(
+            "a fitted temperature needs a resonance in the sample whose neutrons reach the time bins"
+                .into(),
+        ));
+    }
     let mut grid = with_resonance_points(&base, &kept(&resonances, kept_range));
     let mut weights = weights_at(&grid)?;
 
@@ -182,9 +194,11 @@ pub fn fit_counts(
         let phi = beam_at(&grid, &fitted, kl);
         let c = measurement.charge_ratio;
         let skipped = skipped_counts(&grid, &weights, &phi, c, sample, kept_range);
-        if skipped > ACCURACY {
-            let fresh = kept_energies(&grid, &weights, &phi, c, sample);
-            let wider = (kept_range.0.min(fresh.0), kept_range.1.max(fresh.1));
+        let wider = (skipped > ACCURACY)
+            .then(|| kept_energies(&grid, &weights, &phi, c, sample))
+            .map(|fresh| (kept_range.0.min(fresh.0), kept_range.1.max(fresh.1)))
+            .filter(|&wider| wider != kept_range);
+        if let Some(wider) = wider {
             let newly_kept: Vec<(f64, f64)> = kept(&resonances, wider)
                 .into_iter()
                 .filter(|&(e, _)| e < kept_range.0 || e > kept_range.1)
@@ -214,7 +228,11 @@ pub fn fit_counts(
     let free = params.free_indices();
     let uncertainty = |index: usize| {
         let column = free.iter().position(|&f| f == index)?;
-        result.uncertainties.as_ref().map(|u| u[column])
+        result
+            .uncertainties
+            .as_ref()
+            .map(|u| u[column])
+            .filter(|u| u.is_finite())
     };
     let n_beam = beam.coefficients().len();
     let n_isotopes = isotopes.len();
@@ -265,6 +283,9 @@ fn validate(measurement: &Measurement, calibration: &Calibration) -> Result<(), 
             return invalid(format!("the {name} counts must be finite and non-negative"));
         }
     }
+    if measurement.open_counts.iter().sum::<f64>() == 0.0 {
+        return invalid("the open-beam run has no counts".into());
+    }
     if !(measurement.charge_ratio.is_finite() && measurement.charge_ratio > 0.0) {
         return invalid(format!(
             "the charge ratio must be finite and positive, got {}",
@@ -298,15 +319,6 @@ fn validate(measurement: &Measurement, calibration: &Calibration) -> Result<(), 
                 "a fitted temperature must start within [{low}, {high}] K, got {t}"
             ));
         }
-        let broadens = measurement.isotopes.iter().any(|(isotope, density)| {
-            *density != Value::Known(0.0) && !extract_resonance_widths(&[isotope]).is_empty()
-        });
-        if !broadens {
-            return invalid(
-                "a fitted temperature needs an isotope in the sample with resolved resonances"
-                    .into(),
-            );
-        }
     }
     Ok(())
 }
@@ -321,29 +333,28 @@ fn reach(
         let probabilities = resolution
             .detector_bin_probabilities((kl / u).powi(2), edges, t0)
             .map_err(BinWeightsError::from)?;
-        Ok(probabilities.iter().any(|&p| p > 0.0))
+        Ok(probabilities.iter().sum::<f64>() >= NEGLIGIBLE_REACH)
     };
     let flight_times: Vec<f64> = edges.iter().map(|t| t - t0).collect();
     let n = flight_times.len();
     let mut earlier = Vec::new();
     let step = flight_times[1] - flight_times[0];
-    let mut u = flight_times[0] - step;
-    while u > 0.0 {
+    for u in (1..).map(|k| flight_times[0] - step * f64::from(k)) {
+        if u <= 0.0 {
+            break;
+        }
         earlier.push(u);
         if !recorded(u)? {
             break;
         }
-        u -= step;
     }
     let mut later = Vec::new();
     let step = flight_times[n - 1] - flight_times[n - 2];
-    let mut u = flight_times[n - 1] + step;
-    loop {
+    for u in (1..).map(|k| flight_times[n - 1] + step * f64::from(k)) {
         later.push(u);
         if !recorded(u)? {
             break;
         }
-        u += step;
     }
     Ok(later
         .iter()
@@ -387,19 +398,10 @@ fn fit_beam(
     let criterion = |(spline, deviance): &(BeamSpline, f64)| {
         deviance + 2.0 * spline.coefficients().len() as f64
     };
-    let within_noise = |(spline, deviance): &(BeamSpline, f64)| {
-        *deviance
-            <= open_counts
-                .len()
-                .saturating_sub(spline.coefficients().len()) as f64
-    };
     let mut current = fit(&BeamSpline::constant(window_us.0, window_us.1, per_us))?;
     let mut best = current.clone();
     let mut since_best = 0;
-    while !within_noise(&current)
-        && since_best < 2
-        && current.0.refined().coefficients().len() <= open_counts.len()
-    {
+    while since_best < 2 && current.0.refined().coefficients().len() <= open_counts.len() {
         current = fit(&current.0.refined())?;
         since_best += 1;
         if criterion(&current) < criterion(&best) {

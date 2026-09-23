@@ -349,18 +349,37 @@ fn a_gaussian_resolution_cannot_describe_counts_in_time_bins() {
 }
 
 #[test]
-fn a_temperature_the_counts_cannot_show_is_refused() {
-    let isotope = synthetic_isotope(72, 178, 20.0, 0.02, 0.06);
+fn a_measurement_the_fit_cannot_describe_is_refused() {
+    let seen = synthetic_isotope(72, 178, 20.0, 0.02, 0.06);
+    let unseen = synthetic_isotope(72, 178, 1000.0, 0.02, 0.06);
     let edges: Vec<f64> = (FIRST_EDGE_US..=LAST_EDGE_US).map(f64::from).collect();
     let counts = vec![100.0; edges.len() - 1];
-    for (density, temperature) in [
-        (Value::Known(0.0), Value::Fitted(TEMPERATURE_K)),
-        (Value::Fitted(DENSITY), Value::Fitted(0.5)),
+    let empty = vec![0.0; edges.len() - 1];
+    for (isotope, density, temperature, open) in [
+        (
+            &seen,
+            Value::Known(0.0),
+            Value::Fitted(TEMPERATURE_K),
+            &counts,
+        ),
+        (&seen, Value::Fitted(DENSITY), Value::Fitted(0.5), &counts),
+        (
+            &unseen,
+            Value::Fitted(DENSITY),
+            Value::Fitted(TEMPERATURE_K),
+            &counts,
+        ),
+        (
+            &seen,
+            Value::Fitted(DENSITY),
+            Value::Known(TEMPERATURE_K),
+            &empty,
+        ),
     ] {
         let result = fit_counts(
             &Measurement {
                 time_edges_us: edges.clone(),
-                open_counts: counts.clone(),
+                open_counts: open.clone(),
                 sample_counts: counts.clone(),
                 charge_ratio: CHARGE_RATIO,
                 isotopes: vec![(isotope.clone(), density)],
