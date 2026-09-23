@@ -25,8 +25,9 @@ thiserror = { workspace = true }
 
 [features]
 default = []
-# Exposes `synthetic` — counts-domain measurements with known ground truth,
-# used by this crate's tests and available to downstream crates' tests.
+# Exposes `reference` and `synthetic` — expected and simulated counts with
+# known ground truth, used by this crate's tests and available to downstream
+# crates' tests.
 # Never enabled in release builds.
 test-support = ["dep:rand_chacha"]
 
@@ -34,7 +35,7 @@ test-support = ["dep:rand_chacha"]
 # Exposes `nereids_endf::resonance::test_support` — synthetic
 # `ResonanceData` builders shared with sibling crates' tests.
 nereids-endf = { workspace = true, features = ["test-support"] }
-# Path-only self dev-dep so the integration tests see `synthetic`. Must NOT
-# be versioned: a versioned self dev-dep pins the unpublished current
-# version and breaks `cargo publish`.
+# Path-only self dev-dep so the integration tests see `reference` and
+# `synthetic`. Must NOT be versioned: a versioned self dev-dep pins the
+# unpublished current version and breaks `cargo publish`.
 nereids-pipeline = { path = ".", features = ["test-support"] }
