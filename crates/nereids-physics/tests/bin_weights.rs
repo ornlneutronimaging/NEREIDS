@@ -15,12 +15,21 @@ fn energy(flight_time_us: f64) -> f64 {
     (TOF_FACTOR * FLIGHT_PATH_M / flight_time_us).powi(2)
 }
 
-fn blurs() -> Vec<(&'static str, ResolutionFunction)> {
+const IC_ALPHA: f64 = 0.565;
+const IC_BETA: f64 = 0.25;
+const IC_R: f64 = 0.15;
+const TRIANGLE: [f64; 3] = [-1.0, 0.0, 3.0];
+
+fn flight_time(energy_ev: f64) -> f64 {
+    TOF_FACTOR * FLIGHT_PATH_M / energy_ev.sqrt()
+}
+
+fn energy_independent_pulses() -> Vec<(&'static str, ResolutionFunction, f64)> {
     let ikeda_carpenter = IkedaCarpenter::new(
         IkedaCarpenterParams {
-            alpha: EnergyLaw::Const(0.565),
-            beta: EnergyLaw::Const(0.25),
-            r: EnergyLaw::Const(0.15),
+            alpha: EnergyLaw::Const(IC_ALPHA),
+            beta: EnergyLaw::Const(IC_BETA),
+            r: EnergyLaw::Const(IC_R),
             burst_sigma_us: None,
             channel_fwhm_us: None,
         },
@@ -33,7 +42,7 @@ fn blurs() -> Vec<(&'static str, ResolutionFunction)> {
         },
     )
     .expect("valid IC model");
-    let triangle = (vec![-1.0, 0.0, 3.0], vec![0.0, 1.0, 0.0]);
+    let triangle = (TRIANGLE.to_vec(), vec![0.0, 1.0, 0.0]);
     let tabulated = TabulatedResolution::from_kernels(
         vec![1.0, 100.0],
         vec![triangle.clone(), triangle],
@@ -44,29 +53,46 @@ fn blurs() -> Vec<(&'static str, ResolutionFunction)> {
         (
             "Ikeda–Carpenter",
             ResolutionFunction::IkedaCarpenter(Arc::new(ikeda_carpenter)),
+            3.0 / IC_ALPHA + IC_R / IC_BETA,
         ),
         (
             "triangle",
             ResolutionFunction::Tabulated(Arc::new(tabulated)),
+            TRIANGLE.iter().sum::<f64>() / 3.0,
         ),
     ]
 }
 
 #[test]
-fn a_flat_beam_fills_each_bin_by_its_width_on_coarse_points() {
-    let edges: Vec<f64> = (400..=470).map(f64::from).collect();
-    let mut energies: Vec<f64> = (0..=56)
+fn beams_straight_in_flight_time_fill_each_bin_exactly_however_coarse_the_points() {
+    let bins: Vec<f64> = (400..=470).map(f64::from).collect();
+    let mut coarse: Vec<f64> = (0..=56)
         .map(|i| energy(480.0 - 5.0 * f64::from(i)))
         .collect();
-    energies.sort_by(f64::total_cmp);
-    for (label, resolution) in blurs() {
-        let weights = BinWeights::new(&energies, &edges, T0_US, &resolution).expect("weights");
-        let counts = weights.apply(&vec![1.0; energies.len()]);
-        for (k, c) in counts.iter().enumerate() {
-            assert!(
-                (c - 1.0).abs() < 1e-8,
-                "{label}: bin {k} holds {c}, not its width 1 µs"
-            );
+    coarse.sort_by(f64::total_cmp);
+    let one_piece = [energy(1000.0), energy(100.0)];
+    let narrow_bin = [349.9, 350.1];
+    for (label, resolution, mean_delay) in energy_independent_pulses() {
+        for (energies, edges) in [(&coarse[..], &bins[..]), (&one_piece[..], &narrow_bin[..])] {
+            let weights = BinWeights::new(energies, edges, T0_US, &resolution).expect("weights");
+            let u: Vec<f64> = energies.iter().map(|&e| flight_time(e)).collect();
+            let flat = weights.apply(&vec![1.0; energies.len()]);
+            let linear = weights.apply(&u);
+            for (k, bin) in edges.windows(2).enumerate() {
+                let width = bin[1] - bin[0];
+                let centre = 0.5 * (bin[0] + bin[1]);
+                let expected = width * (centre - T0_US - mean_delay);
+                assert!(
+                    (flat[k] / width - 1.0).abs() < 1e-8,
+                    "{label}: bin {bin:?} holds {}, not its width {width} µs",
+                    flat[k]
+                );
+                assert!(
+                    (linear[k] / expected - 1.0).abs() < 1e-8,
+                    "{label}: bin {bin:?} holds {} for φ = u, not {expected}",
+                    linear[k]
+                );
+            }
         }
     }
 }

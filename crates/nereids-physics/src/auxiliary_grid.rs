@@ -123,14 +123,25 @@ pub fn build_extended_grid_for(
     extend_boundaries(data_energies, low, high, spacing)
 }
 
-/// `grid` with SAMMY's points around each `(E_res, D)` resonance in
-/// `resonances`, `D` its total width in eV, then graded so that no interval
-/// is more than `MAX_SPACING_RATIO` times either neighbour.  The points are
-/// placed against `grid` as given, so the result does not depend on the order
-/// of `resonances`.  A grid of fewer than two energies comes back unchanged.
+/// `grid` with points across each `(E_res, D)` resonance in `resonances`,
+/// `D` its total width in eV, at SAMMY's spacing, then graded until no
+/// interval is more than SAMMY's `MAX_SPACING_RATIO` times either neighbour or
+/// the next point would fall within the merge tolerance.  Each resonance is
+/// placed against `grid` as given, so, unlike SAMMY, the result does not
+/// depend on the order of `resonances`.  A grid of fewer than two energies
+/// comes back unchanged.
 ///
 /// `grid` must be ascending.
+///
+/// # Panics
+/// If a width is not finite and positive.
 pub fn with_resonance_points(grid: &[f64], resonances: &[(f64, f64)]) -> Vec<f64> {
+    if let Some(&(energy, width)) = resonances
+        .iter()
+        .find(|(_, width)| !(width.is_finite() && *width > 0.0))
+    {
+        panic!("the resonance at {energy} eV must have a finite, positive width, got {width}");
+    }
     let mut refined = grid.to_vec();
     if grid.len() < 2 {
         return refined;
@@ -432,7 +443,8 @@ fn fine_structure_points(grid: &[f64], eres: f64, gd: f64) -> Vec<f64> {
 /// Returns none when the centre lies off the grid or the grid already holds
 /// `MIN_POINTS_PER_WIDTH` points across the interval.
 ///
-/// SAMMY Ref: `dat/mdat4.f90` Fspken lines 243-284, Add_Pnts lines 333-532
+/// SAMMY Ref for the spacing, the stand-in distance and the point count:
+/// `dat/mdat4.f90` Fspken lines 243-284, Add_Pnts lines 333-532
 fn resonance_points(grid: &[f64], energy: f64, width: f64) -> Vec<f64> {
     let (first, last) = (grid[0], grid[grid.len() - 1]);
     if energy < first || energy > last {
@@ -494,7 +506,8 @@ fn merge_points(grid: &mut Vec<f64>, mut points: Vec<f64>) -> usize {
 /// from its middle down to that neighbour's length, so the new intervals
 /// double outward.
 ///
-/// SAMMY Ref: `dat/mdat5.f90` RefineGrid lines 264-328, 440-459
+/// SAMMY Ref for the ratio and the halving: `dat/mdat5.f90` RefineGrid lines
+/// 264-328, 440-459
 fn grade_spacing(grid: &mut Vec<f64>) {
     loop {
         let mut points = Vec::new();
@@ -598,6 +611,13 @@ mod tests {
 
         let dense: Vec<f64> = (0..100).map(|i| 495.0 + f64::from(i) * 0.1).collect();
         assert_eq!(with_resonance_points(&dense, &[(500.0, 1.0)]), dense);
+    }
+
+    #[test]
+    #[should_panic(expected = "finite, positive width")]
+    fn a_resonance_without_a_positive_width_is_refused() {
+        let grid: Vec<f64> = (0..20).map(|i| 490.0 + f64::from(i) * 5.0).collect();
+        with_resonance_points(&grid, &[(495.0, -1.0)]);
     }
 
     #[test]

@@ -27,7 +27,8 @@ pub enum PipelineError {
     #[error("Fitting error: {0}")]
     Fitting(FittingError),
 
-    /// The resolution cannot record neutrons in the time bins.
+    /// The weights of the calculation points in the time bins could not be
+    /// built.
     #[error("Bin weights: {0}")]
     BinWeights(BinWeightsError),
 

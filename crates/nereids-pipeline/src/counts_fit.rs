@@ -10,6 +10,7 @@ use nereids_physics::resolution::{ResolutionFunction, TOF_FACTOR};
 use nereids_physics::transmission::extract_resonance_widths;
 
 use crate::error::PipelineError;
+use crate::pipeline::TEMPERATURE_BOUNDS_K;
 
 /// Largest change of the predicted counts, in counting noise over all bins
 /// of both runs together, that the calculation points may leave: when
@@ -27,10 +28,16 @@ pub enum Value {
 }
 
 impl Value {
-    fn parameter(self, name: String) -> FitParameter {
+    fn parameter(self, name: String, (lower, upper): (f64, f64)) -> FitParameter {
         match self {
             Self::Known(v) => FitParameter::fixed(name, v),
-            Self::Fitted(v) => FitParameter::non_negative(name, v),
+            Self::Fitted(v) => FitParameter {
+                name: name.into(),
+                value: v,
+                lower,
+                upper,
+                fixed: false,
+            },
         }
     }
 
@@ -94,8 +101,9 @@ pub struct CountsFit {
 ///
 /// # Errors
 /// [`PipelineError::InvalidParameter`] for invalid inputs,
-/// [`PipelineError::BinWeights`] when the resolution cannot record neutrons
-/// in the time bins (a Gaussian resolution never can),
+/// [`PipelineError::BinWeights`] when the resolution rejects the time bins or
+/// an energy (a Gaussian resolution always does) or the bin weights do not
+/// converge,
 /// [`PipelineError::Fitting`] when the model cannot be evaluated, and
 /// [`PipelineError::PointsNotConverged`] when doubling the points does not
 /// reach [`ACCURACY`].
@@ -124,7 +132,6 @@ pub fn fit_counts(
         &base,
         &base_weights,
         (edges[0] - t0, edges[edges.len() - 1] - t0),
-        calibration.flight_path_m,
         &measurement.open_counts,
     )?;
 
@@ -142,23 +149,24 @@ pub fn fit_counts(
     let mut grid = with_resonance_points(&base, &kept(&resonances, kept_range));
     let mut weights = weights_at(&grid)?;
 
-    let mut params = ParameterSet::new(
-        beam.coefficients()
-            .iter()
-            .enumerate()
-            .map(|(i, &c)| FitParameter::unbounded(format!("beam {i}"), c))
-            .chain(
-                measurement
-                    .isotopes
-                    .iter()
-                    .enumerate()
-                    .map(|(i, (_, n))| n.parameter(format!("density {i}"))),
-            )
-            .chain(std::iter::once(
-                measurement.temperature_k.parameter("temperature".into()),
-            ))
-            .collect(),
-    );
+    let mut params =
+        ParameterSet::new(
+            beam.coefficients()
+                .iter()
+                .enumerate()
+                .map(|(i, &c)| FitParameter::unbounded(format!("beam {i}"), c))
+                .chain(
+                    measurement.isotopes.iter().enumerate().map(|(i, (_, n))| {
+                        n.parameter(format!("density {i}"), (0.0, f64::INFINITY))
+                    }),
+                )
+                .chain(std::iter::once(
+                    measurement
+                        .temperature_k
+                        .parameter("temperature".into(), TEMPERATURE_BOUNDS_K),
+                ))
+                .collect(),
+        );
     let observed: Vec<f64> = measurement
         .open_counts
         .iter()
@@ -168,7 +176,7 @@ pub fn fit_counts(
     let n_bins = edges.len() - 1;
     let mut accuracy = Vec::new();
     let (result, predicted, skipped) = loop {
-        let points = Points::new(&grid, &weights, &beam, calibration.flight_path_m);
+        let points = Points::new(&grid, &weights, &beam);
         let model = TwoRunModel::new(&points, &isotopes, measurement.charge_ratio);
         let result = poisson_fit(&model, &observed, &mut params, &PoissonConfig::default())?;
         let predicted = model.evaluate(&result.params)?;
@@ -193,7 +201,7 @@ pub fn fit_counts(
 
         let finer = doubled(&grid, kept_range, kl);
         let finer_weights = weights_at(&finer)?;
-        let finer_points = Points::new(&finer, &finer_weights, &beam, calibration.flight_path_m);
+        let finer_points = Points::new(&finer, &finer_weights, &beam);
         let finer_model = TwoRunModel::new(&finer_points, &isotopes, measurement.charge_ratio);
         let change = noise_distance(&predicted, &finer_model.evaluate(&result.params)?);
         accuracy.push(change);
@@ -278,8 +286,22 @@ fn validate(measurement: &Measurement, calibration: &Calibration) -> Result<(), 
     {
         return invalid("densities and the temperature must be finite and non-negative".into());
     }
-    if measurement.temperature_k == Value::Fitted(0.0) {
-        return invalid("a fitted temperature must start above 0 K".into());
+    if let Value::Fitted(t) = measurement.temperature_k {
+        let (low, high) = TEMPERATURE_BOUNDS_K;
+        if !(low..=high).contains(&t) {
+            return invalid(format!(
+                "a fitted temperature must start within [{low}, {high}] K, got {t}"
+            ));
+        }
+        let broadens = measurement.isotopes.iter().any(|(isotope, density)| {
+            *density != Value::Known(0.0) && !extract_resonance_widths(&[isotope]).is_empty()
+        });
+        if !broadens {
+            return invalid(
+                "a fitted temperature needs an isotope in the sample with resolved resonances"
+                    .into(),
+            );
+        }
     }
     Ok(())
 }
@@ -288,13 +310,12 @@ fn fit_beam(
     grid: &[f64],
     weights: &BinWeights,
     window_us: (f64, f64),
-    flight_path_m: f64,
     open_counts: &[f64],
 ) -> Result<BeamSpline, PipelineError> {
     let total_weight: f64 = weights.apply(&vec![1.0; grid.len()]).iter().sum();
     let per_us = open_counts.iter().sum::<f64>().max(1.0) / total_weight;
     let fit = |spline: &BeamSpline| -> Result<(BeamSpline, f64), PipelineError> {
-        let points = Points::new(grid, weights, spline, flight_path_m);
+        let points = Points::new(grid, weights, spline);
         let model = OpenBeamModel::new(&points);
         let mut params = ParameterSet::new(
             spline
@@ -309,14 +330,26 @@ fn fit_beam(
             ..PoissonConfig::default()
         };
         let result = poisson_fit(&model, open_counts, &mut params, &config)?;
-        let criterion = 2.0 * result.nll + 2.0 * spline.coefficients().len() as f64;
-        Ok((spline.with_coefficients(&result.params), criterion))
+        let predicted = model.evaluate(&result.params)?;
+        Ok((
+            spline.with_coefficients(&result.params),
+            deviance(open_counts, &predicted),
+        ))
+    };
+    let criterion = |(spline, deviance): &(BeamSpline, f64)| {
+        deviance + 2.0 * spline.coefficients().len() as f64
+    };
+    let within_noise = |(spline, deviance): &(BeamSpline, f64)| {
+        *deviance
+            <= open_counts
+                .len()
+                .saturating_sub(spline.coefficients().len()) as f64
     };
     let mut current = fit(&BeamSpline::constant(window_us.0, window_us.1, per_us))?;
     let mut best = current.clone();
-    while current.0.refined().coefficients().len() <= open_counts.len() {
+    while !within_noise(&current) && current.0.refined().coefficients().len() <= open_counts.len() {
         current = fit(&current.0.refined())?;
-        if current.1 < best.1 {
+        if criterion(&current) < criterion(&best) {
             best = current.clone();
         }
     }
@@ -359,7 +392,10 @@ fn kept_energies(
     let n = grid.len();
     let high = (1..n).rev().find(|&j| !grow(j)).unwrap_or(0);
     let low = (0..high).find(|&j| !grow(j)).unwrap_or(high);
-    (grid[low], grid[high])
+    (
+        low.checked_sub(1).map_or(f64::NEG_INFINITY, |j| grid[j]),
+        grid.get(high + 1).copied().unwrap_or(f64::INFINITY),
+    )
 }
 
 fn skipped_counts(
@@ -372,7 +408,7 @@ fn skipped_counts(
 ) -> f64 {
     let mut counts = vec![0.0; weights.n_bins()];
     for (j, &e) in grid.iter().enumerate() {
-        if e < kept_range.0 || e > kept_range.1 {
+        if e <= kept_range.0 || e >= kept_range.1 {
             unattenuated(weights, phi, charge_ratio, j, &mut counts);
         }
     }

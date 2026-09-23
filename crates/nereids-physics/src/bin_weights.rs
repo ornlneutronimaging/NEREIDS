@@ -102,6 +102,7 @@ pub struct BinWeights {
     bins: Vec<u32>,
     weights: Vec<f64>,
     n_bins: usize,
+    flight_path_m: f64,
 }
 
 type Piece = (Vec<(u32, f64)>, Vec<(u32, f64)>);
@@ -128,14 +129,19 @@ impl BinWeights {
             return Err(BinWeightsError::InvalidEnergies);
         }
         let n_bins = time_edges_us.len().saturating_sub(1);
-        let kl = TOF_FACTOR * resolution.flight_path_m();
+        let narrowest_bin_us = time_edges_us
+            .windows(2)
+            .map(|w| w[1] - w[0])
+            .fold(f64::INFINITY, f64::min);
+        let flight_path_m = resolution.flight_path_m();
+        let kl = TOF_FACTOR * flight_path_m;
         let probabilities =
             |u: f64| resolution.detector_bin_probabilities((kl / u).powi(2), time_edges_us, t0_us);
         let pieces: Vec<Piece> = energies
             .par_windows(2)
             .map(|pair| {
                 let (u_short, u_long) = (kl / pair[1].sqrt(), kl / pair[0].sqrt());
-                match integrate_piece(&probabilities, u_short, u_long, n_bins)? {
+                match integrate_piece(&probabilities, u_short, u_long, narrowest_bin_us, n_bins)? {
                     Some([to_lower, to_upper]) => Ok((sparse(&to_lower), sparse(&to_upper))),
                     None => Err(BinWeightsError::NotConverged {
                         low_ev: pair[0],
@@ -168,6 +174,7 @@ impl BinWeights {
             bins,
             weights,
             n_bins,
+            flight_path_m,
         })
     }
 
@@ -177,6 +184,10 @@ impl BinWeights {
 
     pub fn n_bins(&self) -> usize {
         self.n_bins
+    }
+
+    pub fn flight_path_m(&self) -> f64 {
+        self.flight_path_m
     }
 
     /// Nonzero `(bin, W_jk)` pairs of point `j`.
@@ -216,11 +227,22 @@ fn integrate_piece(
     probabilities: &(dyn Fn(f64) -> Result<Vec<f64>, ResolutionParseError> + Sync),
     u_short: f64,
     u_long: f64,
+    narrowest_bin_us: f64,
     n_bins: usize,
 ) -> Result<Option<[Vec<f64>; 2]>, ResolutionParseError> {
     let length = u_long - u_short;
     let mut total = [vec![0.0; n_bins], vec![0.0; n_bins]];
-    let mut stack = vec![(u_short, u_long, 0_usize)];
+    let parts = (length / narrowest_bin_us).ceil().max(1.0) as usize;
+    let part = length / parts as f64;
+    let mut stack: Vec<(f64, f64, usize)> = (0..parts)
+        .map(|i| {
+            (
+                u_short + part * i as f64,
+                u_short + part * (i + 1) as f64,
+                0,
+            )
+        })
+        .collect();
     while let Some((a, b, halvings)) = stack.pop() {
         let (centre, half) = (0.5 * (a + b), 0.5 * (b - a));
         let mut kronrod = [vec![0.0; n_bins], vec![0.0; n_bins]];

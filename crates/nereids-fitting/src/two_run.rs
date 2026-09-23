@@ -27,19 +27,14 @@ pub struct Points<'a> {
 }
 
 impl<'a> Points<'a> {
-    /// `energies` ascending in eV with their `weights`, the beam described by
-    /// the knots of `beam`, over the flight path `flight_path_m`.
+    /// `energies` ascending in eV with their `weights`, and the beam
+    /// described by the knots of `beam`.
     ///
     /// # Panics
     /// If `weights` does not have one row per energy.
-    pub fn new(
-        energies: &'a [f64],
-        weights: &'a BinWeights,
-        beam: &BeamSpline,
-        flight_path_m: f64,
-    ) -> Self {
+    pub fn new(energies: &'a [f64], weights: &'a BinWeights, beam: &BeamSpline) -> Self {
         assert_eq!(energies.len(), weights.n_points(), "one row per energy");
-        let kl = TOF_FACTOR * flight_path_m;
+        let kl = TOF_FACTOR * weights.flight_path_m();
         Self {
             energies,
             weights,

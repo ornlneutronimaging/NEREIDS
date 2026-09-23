@@ -125,32 +125,57 @@ fn fitted(truth: &Truth, isotope: &ResonanceData, density: Value, temperature: V
     .expect("fit")
 }
 
-fn assert_sample_recovered(fit: &CountsFit) {
-    if let Some(sigma) = fit.density_uncertainties[0] {
-        let pull = (fit.densities[0] - DENSITY) / sigma;
-        assert!(
-            pull.abs() < 0.1,
-            "density {} is {pull:.3}σ off",
-            fit.densities[0]
-        );
-    }
-    if let Some(sigma) = fit.temperature_uncertainty {
-        let pull = (fit.temperature_k - TEMPERATURE_K) / sigma;
-        assert!(
-            pull.abs() < 0.1,
-            "temperature {} is {pull:.3}σ off",
-            fit.temperature_k
-        );
+fn assert_sample_recovered(fit: &CountsFit, density: Value, temperature: Value) {
+    assert!(
+        fit.converged,
+        "{density:?}, {temperature:?} did not converge"
+    );
+    for (label, value, got, sigma, truth) in [
+        (
+            "density",
+            density,
+            fit.densities[0],
+            fit.density_uncertainties[0],
+            DENSITY,
+        ),
+        (
+            "temperature",
+            temperature,
+            fit.temperature_k,
+            fit.temperature_uncertainty,
+            TEMPERATURE_K,
+        ),
+    ] {
+        match value {
+            Value::Known(v) => assert_eq!(got, v, "a known {label} changed"),
+            Value::Fitted(_) => {
+                let sigma = sigma.unwrap_or_else(|| panic!("the fitted {label} has no error"));
+                let pull = (got - truth) / sigma;
+                assert!(pull.abs() < 0.1, "{label} {got} is {pull:.3}σ off");
+            }
+        }
     }
 }
 
-fn assert_recovered(fit: &CountsFit) {
-    assert_sample_recovered(fit);
+fn assert_recovered(fit: &CountsFit, density: Value, temperature: Value) {
+    assert_sample_recovered(fit, density, temperature);
     assert!(
         fit.deviance < ACCURACY * ACCURACY,
         "the fitted counts differ from the simulated ones by a deviance of {}",
         fit.deviance
     );
+}
+
+fn assert_beam(fit: &CountsFit, truth: &Truth, beam_per_us: fn(f64) -> f64, noise_fraction: f64) {
+    for (bin, &counts) in truth.edges.windows(2).zip(&truth.open) {
+        let u = 0.5 * (bin[0] + bin[1]) - T0_US;
+        let relative = fit.beam.per_us(u) / beam_per_us(u) - 1.0;
+        let bound = noise_fraction / counts.sqrt();
+        assert!(
+            relative.abs() <= bound,
+            "the beam at {u} µs is off by {relative:.2e}, more than {bound:.2e}"
+        );
+    }
 }
 
 #[test]
@@ -161,13 +186,10 @@ fn density_temperature_and_both_are_recovered_from_simulated_counts() {
         (Value::Fitted(0.5 * DENSITY), Value::Known(TEMPERATURE_K)),
         (Value::Known(DENSITY), Value::Fitted(200.0)),
         (Value::Fitted(0.5 * DENSITY), Value::Fitted(200.0)),
+        (Value::Fitted(0.5 * DENSITY), Value::Fitted(1000.0)),
     ] {
         let fit = fitted(&truth, &isotope, density, temperature);
-        assert!(
-            fit.converged,
-            "{density:?}, {temperature:?} did not converge"
-        );
-        assert_recovered(&fit);
+        assert_recovered(&fit, density, temperature);
     }
 }
 
@@ -175,19 +197,15 @@ fn density_temperature_and_both_are_recovered_from_simulated_counts() {
 fn the_points_are_doubled_until_the_counts_stop_moving() {
     let isotope = synthetic_isotope(72, 178, 20.0, 0.02, 0.06);
     let truth = simulate(log_quadratic_beam, &isotope);
-    let fit = fitted(
-        &truth,
-        &isotope,
-        Value::Fitted(0.5 * DENSITY),
-        Value::Fitted(200.0),
-    );
+    let (density, temperature) = (Value::Fitted(0.5 * DENSITY), Value::Fitted(200.0));
+    let fit = fitted(&truth, &isotope, density, temperature);
     assert!(
         fit.accuracy[0] > ACCURACY,
         "the first points must be too coarse for this to test anything, moved {}",
         fit.accuracy[0]
     );
     assert!(*fit.accuracy.last().unwrap() <= ACCURACY);
-    assert_recovered(&fit);
+    assert_recovered(&fit, density, temperature);
 }
 
 #[test]
@@ -199,14 +217,10 @@ fn only_resonances_whose_neutrons_reach_the_bins_are_given_points() {
     for resonances in [vec![near, central], vec![near, central, far]] {
         let isotope = synthetic_isotope_multi(72, 178, &resonances);
         let truth = simulate(log_quadratic_beam, &isotope);
-        let fit = fitted(
-            &truth,
-            &isotope,
-            Value::Fitted(0.5 * DENSITY),
-            Value::Fitted(200.0),
-        );
+        let (density, temperature) = (Value::Fitted(0.5 * DENSITY), Value::Fitted(200.0));
+        let fit = fitted(&truth, &isotope, density, temperature);
         assert!(fit.skipped <= ACCURACY);
-        assert_recovered(&fit);
+        assert_recovered(&fit, density, temperature);
         points.push(fit.points);
     }
     assert_eq!(points[0], points[1], "the far resonance was given points");
@@ -215,34 +229,16 @@ fn only_resonances_whose_neutrons_reach_the_bins_are_given_points() {
 #[test]
 fn the_fitted_beam_is_the_beam_before_the_blur() {
     let isotope = synthetic_isotope(72, 178, 20.0, 0.02, 0.06);
-    let truth = simulate(log_quadratic_beam, &isotope);
-    let fit = fitted(
-        &truth,
-        &isotope,
-        Value::Fitted(0.5 * DENSITY),
-        Value::Known(TEMPERATURE_K),
-    );
-    for t in FIRST_EDGE_US..=LAST_EDGE_US {
-        let u = f64::from(t) - T0_US;
-        let relative = fit.beam.per_us(u) / log_quadratic_beam(u) - 1.0;
-        assert!(
-            relative.abs() < 1e-3,
-            "beam at {u} µs is off by {relative:.2e}"
-        );
+    let (density, temperature) = (Value::Fitted(0.5 * DENSITY), Value::Known(TEMPERATURE_K));
+    for (beam, noise_fraction) in [
+        (log_quadratic_beam as fn(f64) -> f64, ACCURACY),
+        (beam_with_dip, 1.0),
+    ] {
+        let truth = simulate(beam, &isotope);
+        let fit = fitted(&truth, &isotope, density, temperature);
+        assert_beam(&fit, &truth, beam, noise_fraction);
+        assert_sample_recovered(&fit, density, temperature);
     }
-
-    let truth = simulate(beam_with_dip, &isotope);
-    let fit = fitted(
-        &truth,
-        &isotope,
-        Value::Fitted(0.5 * DENSITY),
-        Value::Known(TEMPERATURE_K),
-    );
-    assert!(
-        fit.beam.intervals() > 1,
-        "a dip needs more than one interval"
-    );
-    assert_sample_recovered(&fit);
 }
 
 #[test]
@@ -270,6 +266,7 @@ fn the_reported_errors_match_the_scatter_of_repeated_measurements() {
             Value::Fitted(DENSITY),
             Value::Fitted(TEMPERATURE_K),
         );
+        assert!(fit.converged);
         density_pulls.push((fit.densities[0] - DENSITY) / fit.density_uncertainties[0].unwrap());
         temperature_pulls
             .push((fit.temperature_k - TEMPERATURE_K) / fit.temperature_uncertainty.unwrap());
@@ -314,4 +311,31 @@ fn a_gaussian_resolution_cannot_describe_counts_in_time_bins() {
         },
     );
     assert!(matches!(result, Err(PipelineError::BinWeights(_))));
+}
+
+#[test]
+fn a_temperature_the_counts_cannot_show_is_refused() {
+    let isotope = synthetic_isotope(72, 178, 20.0, 0.02, 0.06);
+    let edges: Vec<f64> = (FIRST_EDGE_US..=LAST_EDGE_US).map(f64::from).collect();
+    let counts = vec![100.0; edges.len() - 1];
+    for (density, temperature) in [
+        (Value::Known(0.0), Value::Fitted(TEMPERATURE_K)),
+        (Value::Fitted(DENSITY), Value::Fitted(0.5)),
+    ] {
+        let result = fit_counts(
+            &Measurement {
+                time_edges_us: edges.clone(),
+                open_counts: counts.clone(),
+                sample_counts: counts.clone(),
+                charge_ratio: CHARGE_RATIO,
+                isotopes: vec![(isotope.clone(), density)],
+                temperature_k: temperature,
+            },
+            &calibration(),
+        );
+        assert!(
+            matches!(result, Err(PipelineError::InvalidParameter(_))),
+            "{density:?}, {temperature:?} was accepted"
+        );
+    }
 }
