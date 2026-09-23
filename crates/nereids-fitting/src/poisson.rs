@@ -1,14 +1,15 @@
 //! Poisson-likelihood optimizer for low-count neutron data (transmission
 //! path).
 //!
-//! Minimizes the single-arm Poisson negative log-likelihood
+//! Minimizes half the single-arm Poisson deviance
 //!
 //! ```text
-//! L(θ) = Σᵢ [y_model(θ)ᵢ − y_obs,ᵢ · ln(y_model(θ)ᵢ)]
+//! L(θ) = Σᵢ [μᵢ(θ) − yᵢ + yᵢ · ln(yᵢ / μᵢ(θ))]
 //! ```
 //!
-//! using a projected damped Gauss-Newton / Fisher optimizer with
-//! backtracking line search and finite-difference fallback.
+//! within parameter bounds, by damped Fisher-scoring steps when the model has
+//! an analytical Jacobian and projected L-BFGS steps on finite differences
+//! otherwise, each with a backtracking line search.
 //!
 //! **Scope note.** The production pipeline does not apply this single-arm
 //! objective to normalized transmission. Raw open/sample counts use the
@@ -38,8 +39,8 @@ pub struct PoissonConfig {
     pub fd_step: f64,
     /// Initial step size for line search.
     pub step_size: f64,
-    /// Convergence tolerance used for both parameter displacement (L2 norm of step)
-    /// and gradient-norm convergence checks in `poisson_fit`.
+    /// Convergence tolerance on the projected gradient and on the step, used
+    /// when the model has no analytical Jacobian.
     pub tol_param: f64,
     /// Armijo line search parameter (sufficient decrease).
     pub armijo_c: f64,
@@ -74,38 +75,27 @@ impl Default for PoissonConfig {
 /// Result of Poisson-likelihood optimization.
 #[derive(Debug, Clone)]
 pub struct PoissonResult {
-    /// Final negative log-likelihood.
+    /// Final objective, half the Poisson deviance: `Σ [μ − y + y·ln(y/μ)]`.
     pub nll: f64,
     /// Number of iterations taken.
     pub iterations: usize,
-    /// Whether the optimizer converged.
+    /// Whether the fit ended at a minimum within the parameter bounds.
     pub converged: bool,
     /// Final parameter values (all parameters, including fixed).
     pub params: Vec<f64>,
-    /// Local covariance estimate from the inverse Fisher information matrix
-    /// at the converged parameters: `F⁻¹ = (J^T H J)⁻¹` where
-    /// `H = diag(obs/model²)` is the Poisson Hessian.
-    ///
-    /// This is a local curvature estimate, NOT a Bayesian posterior.
-    /// When an analytical Jacobian is available, it is used directly.
-    /// Otherwise a finite-difference Jacobian is computed as fallback.
-    /// `None` when the fit did not converge, the Fisher matrix is
-    /// singular, or covariance computation is disabled via config.
+    /// Covariance of the free parameters, the inverse of the expected
+    /// information `Jᵀ diag(1/μ) J` over those not on a bound; the rows and
+    /// columns of a parameter without an error bar are NaN.  `None` when the
+    /// fit did not converge or covariance computation is disabled.
     pub covariance: Option<FlatMatrix>,
-    /// Standard errors of free parameters: `√diag(F⁻¹)`.
-    /// `None` when covariance is not available.
-    pub uncertainties: Option<Vec<f64>>,
+    /// Standard error of each free parameter; `None` for one on its bound or
+    /// along a direction the data do not determine.  `None` overall when
+    /// `covariance` is.
+    pub uncertainties: Option<Vec<Option<f64>>>,
+    /// Whether each free parameter ended on one of its bounds.
+    pub on_bound: Vec<bool>,
 }
 
-/// Compute Poisson negative log-likelihood.
-///
-/// NLL = Σᵢ [y_model - y_obs · ln(y_model)]
-///
-/// #109.2: For y_model ≤ epsilon, use a smooth C¹ quadratic extrapolation
-/// instead of a hard 1e30 penalty.  This keeps the NLL and its gradient
-/// continuous, so gradient-based optimizers (projected gradient, L-BFGS)
-/// can smoothly steer back into the feasible region rather than hitting
-/// a discontinuous cliff that stalls the line search.
 fn poisson_nll(y_obs: &[f64], y_model: &[f64]) -> f64 {
     y_obs
         .iter()
@@ -114,45 +104,38 @@ fn poisson_nll(y_obs: &[f64], y_model: &[f64]) -> f64 {
         .sum()
 }
 
-/// Single-bin Poisson NLL with smooth extrapolation for mdl <= epsilon.
-///
-/// For mdl > 0: NLL = mdl - obs * ln(mdl)
-/// For mdl <= epsilon: quadratic Taylor expansion about epsilon,
-///   NLL(ε) + NLL'(ε)·(mdl−ε) + ½·NLL''(ε)·(mdl−ε)²
-/// where NLL'(x) = 1 − obs/x and NLL''(x) = obs/x².
-///
-/// Since delta = ε − mdl ≥ 0, this becomes:
-///   NLL(ε) − NLL'(ε)·delta + ½·NLL''(ε)·delta²
-///
-/// When obs == 0, the exact Hessian obs/ε² vanishes, leaving only a linear
-/// term that decreases without bound as mdl → −∞.  This can cause the
-/// optimizer to diverge.  We impose a minimum curvature of 1/ε so the
-/// quadratic penalty still curves upward for negative predictions.
+pub(crate) fn half_deviance(obs: f64, model: f64) -> f64 {
+    let r = (obs - model) / model;
+    let term = if r.abs() < 1.0e-3 {
+        model
+            * (r * r
+                * (0.5
+                    + r * (-1.0 / 6.0 + r * (1.0 / 12.0 + r * (-1.0 / 20.0 + r * (1.0 / 30.0))))))
+    } else {
+        obs * (obs.ln() - model.ln()) - (obs - model)
+    };
+    term.max(0.0)
+}
+
 #[inline]
 fn poisson_nll_term(obs: f64, mdl: f64) -> f64 {
-    // #125.3: Negative observed counts would produce wrong-signed NLL terms.
-    // Release builds skip this check; callers must ensure non-negative counts. See #125 item 3.
     debug_assert!(
         obs.is_finite() && obs >= 0.0,
         "poisson_nll_term: obs must be finite and >= 0, got {obs}"
     );
+    let saturated = |m: f64| if obs > 0.0 { half_deviance(obs, m) } else { m };
     if mdl > POISSON_EPSILON {
-        mdl - obs * mdl.ln()
+        saturated(mdl)
     } else {
         let eps = POISSON_EPSILON;
-        let nll_eps = eps - obs * eps.ln();
         let grad_eps = 1.0 - obs / eps;
-        // Minimum curvature 1/eps ensures the penalty grows quadratically
-        // even when obs == 0 (where the exact Hessian obs/eps^2 vanishes).
         let hess_eps = if obs > 0.0 {
             obs / (eps * eps)
         } else {
             1.0 / eps
         };
         let delta = eps - mdl;
-        // Taylor expansion: f(eps) + f'(eps)*(mdl - eps) + 0.5*f''(eps)*(mdl - eps)^2
-        // Since (mdl - eps) = -delta, the linear term flips sign.
-        nll_eps - grad_eps * delta + 0.5 * hess_eps * delta * delta
+        saturated(eps) - grad_eps * delta + 0.5 * hess_eps * delta * delta
     }
 }
 
@@ -177,45 +160,17 @@ fn poisson_nll_weight(obs: f64, mdl: f64) -> f64 {
     }
 }
 
-/// Per-bin Poisson NLL curvature: ∂²f(obs, mdl)/∂mdl².
-///
-/// For mdl > ε: h = obs / mdl²
-/// For mdl ≤ ε: curvature of the smooth quadratic extrapolation.
 #[inline]
-fn poisson_nll_curvature(obs: f64, mdl: f64) -> f64 {
-    if mdl > POISSON_EPSILON {
-        obs / (mdl * mdl)
-    } else {
-        let eps = POISSON_EPSILON;
-        if obs > 0.0 {
-            obs / (eps * eps)
-        } else {
-            1.0 / eps
-        }
-    }
+fn expected_information(mdl: f64) -> f64 {
+    1.0 / mdl.max(POISSON_EPSILON)
 }
 
-/// Analytical first/second-order information for the Poisson objective.
 #[derive(Debug)]
 struct AnalyticalStepData {
-    /// Gradient of the Poisson NLL: grad = J^T · w.
     grad: Vec<f64>,
-    /// Full Gauss-Newton / Fisher curvature approximation: J^T H J.
     fisher: FlatMatrix,
 }
 
-/// Compute gradient and Gauss-Newton / Fisher curvature of the Poisson NLL
-/// using the analytical Jacobian.
-///
-/// `grad_j = Σᵢ wᵢ · J_{i,j}` where `wᵢ = ∂NLL/∂y_model_i`
-/// and `J_{i,j} = ∂y_model_i/∂θⱼ` from `model.analytical_jacobian()`.
-///
-/// The curvature uses the Poisson Hessian with respect to the model output:
-/// `fisher_{j,k} = Σᵢ hᵢ · J_{i,j} · J_{i,k}` where
-/// `hᵢ = ∂²NLL/∂y_model_i²`.
-///
-/// Returns `Some(step_data)` if the model provides an analytical Jacobian,
-/// `None` otherwise (caller should fall back to finite differences).
 fn compute_analytical_step_data(
     model: &dyn FitModel,
     params: &ParameterSet,
@@ -233,7 +188,7 @@ fn compute_analytical_step_data(
     let mut fisher = FlatMatrix::zeros(n_free, n_free);
     for i in 0..n_e {
         let w = poisson_nll_weight(y_obs[i], y_model[i]);
-        let h = poisson_nll_curvature(y_obs[i], y_model[i]);
+        let h = expected_information(y_model[i]);
         for (g, j) in grad.iter_mut().zip(0..n_free) {
             let jij = jac.get(i, j);
             *g += w * jij;
@@ -388,6 +343,184 @@ fn extract_submatrix(matrix: &FlatMatrix, positions: &[usize]) -> FlatMatrix {
         }
     }
     sub
+}
+
+const NEWTON_DECREMENT_TOL: f64 = 1e-4;
+
+const DEGENERATE_EIGENVALUE: f64 = 1e-12;
+
+const MAX_JACOBI_SWEEPS: usize = 64;
+
+fn bounds_reached(params: &ParameterSet) -> Vec<bool> {
+    params
+        .free_indices()
+        .iter()
+        .map(|&i| on_bound(&params.params[i]))
+        .collect()
+}
+
+fn on_bound(param: &FitParameter) -> bool {
+    (param.lower.is_finite() && (param.value - param.lower).abs() <= PIVOT_FLOOR)
+        || (param.upper.is_finite() && (param.value - param.upper).abs() <= PIVOT_FLOOR)
+}
+
+fn reduced_newton_direction(
+    fisher: &FlatMatrix,
+    grad: &[f64],
+    positions: &[usize],
+    lambda: f64,
+) -> Vec<f64> {
+    let reduced_fisher = extract_submatrix(fisher, positions);
+    let reduced_grad: Vec<f64> = positions.iter().map(|&pos| grad[pos]).collect();
+    let reduced_dir = crate::lm::solve_damped_system(&reduced_fisher, &reduced_grad, lambda)
+        .unwrap_or_else(|| diagonal_direction(fisher, grad, positions));
+    let mut dir = vec![0.0; grad.len()];
+    for (&pos, &value) in positions.iter().zip(reduced_dir.iter()) {
+        dir[pos] = value;
+    }
+    dir
+}
+
+fn diagonal_direction(fisher: &FlatMatrix, grad: &[f64], positions: &[usize]) -> Vec<f64> {
+    positions
+        .iter()
+        .map(|&pos| grad[pos] / fisher.get(pos, pos).max(1e-12))
+        .collect()
+}
+
+fn symmetric_eigen(matrix: &FlatMatrix) -> (Vec<f64>, FlatMatrix) {
+    let n = matrix.nrows;
+    let mut a = matrix.clone();
+    let mut v = FlatMatrix::zeros(n, n);
+    for i in 0..n {
+        *v.get_mut(i, i) = 1.0;
+    }
+    for _ in 0..MAX_JACOBI_SWEEPS {
+        let off: f64 = (0..n)
+            .flat_map(|i| (i + 1..n).map(move |j| (i, j)))
+            .map(|(i, j)| a.get(i, j).powi(2))
+            .sum();
+        let diagonal: f64 = (0..n).map(|i| a.get(i, i).powi(2)).sum();
+        if off <= (f64::EPSILON * f64::EPSILON) * diagonal {
+            break;
+        }
+        for p in 0..n {
+            for q in p + 1..n {
+                let apq = a.get(p, q);
+                if apq == 0.0 {
+                    continue;
+                }
+                let theta = (a.get(q, q) - a.get(p, p)) / (2.0 * apq);
+                let t = theta.signum() / (theta.abs() + (theta * theta + 1.0).sqrt());
+                let c = 1.0 / (t * t + 1.0).sqrt();
+                let s = t * c;
+                for k in 0..n {
+                    let (akp, akq) = (a.get(k, p), a.get(k, q));
+                    *a.get_mut(k, p) = c * akp - s * akq;
+                    *a.get_mut(k, q) = s * akp + c * akq;
+                }
+                for k in 0..n {
+                    let (apk, aqk) = (a.get(p, k), a.get(q, k));
+                    *a.get_mut(p, k) = c * apk - s * aqk;
+                    *a.get_mut(q, k) = s * apk + c * aqk;
+                }
+                for k in 0..n {
+                    let (vkp, vkq) = (v.get(k, p), v.get(k, q));
+                    *v.get_mut(k, p) = c * vkp - s * vkq;
+                    *v.get_mut(k, q) = s * vkp + c * vkq;
+                }
+            }
+        }
+    }
+    ((0..n).map(|i| a.get(i, i)).collect(), v)
+}
+
+struct ScaledInformation {
+    positions: Vec<usize>,
+    scale: Vec<f64>,
+    values: Vec<f64>,
+    vectors: FlatMatrix,
+}
+
+impl ScaledInformation {
+    fn new(fisher: &FlatMatrix, positions: &[usize]) -> Self {
+        let positions: Vec<usize> = positions
+            .iter()
+            .copied()
+            .filter(|&pos| fisher.get(pos, pos) > 0.0)
+            .collect();
+        let scale: Vec<f64> = positions
+            .iter()
+            .map(|&pos| 1.0 / fisher.get(pos, pos).sqrt())
+            .collect();
+        let n = positions.len();
+        let mut scaled = FlatMatrix::zeros(n, n);
+        for i in 0..n {
+            for j in 0..n {
+                *scaled.get_mut(i, j) =
+                    fisher.get(positions[i], positions[j]) * scale[i] * scale[j];
+            }
+        }
+        let (values, vectors) = symmetric_eigen(&scaled);
+        Self {
+            positions,
+            scale,
+            values,
+            vectors,
+        }
+    }
+
+    fn determined(&self) -> impl Iterator<Item = usize> + '_ {
+        (0..self.values.len()).filter(|&k| self.values[k] >= DEGENERATE_EIGENVALUE)
+    }
+
+    fn newton_decrement(&self, grad: &[f64]) -> f64 {
+        let g: Vec<f64> = self
+            .positions
+            .iter()
+            .zip(&self.scale)
+            .map(|(&pos, &s)| grad[pos] * s)
+            .collect();
+        0.5 * self
+            .determined()
+            .map(|k| {
+                let along: f64 = (0..g.len()).map(|i| self.vectors.get(i, k) * g[i]).sum();
+                along * along / self.values[k]
+            })
+            .sum::<f64>()
+    }
+
+    fn covariance(&self, n_free: usize) -> (FlatMatrix, Vec<Option<f64>>) {
+        let n = self.positions.len();
+        let determined: Vec<usize> = self.determined().collect();
+        let variance_part = |i: usize, j: usize| -> f64 {
+            determined
+                .iter()
+                .map(|&k| self.vectors.get(i, k) * self.vectors.get(j, k) / self.values[k])
+                .sum()
+        };
+        let resolved: Vec<bool> = (0..n)
+            .map(|i| {
+                let undetermined: f64 = (0..self.values.len())
+                    .filter(|&k| self.values[k] < DEGENERATE_EIGENVALUE)
+                    .map(|k| self.vectors.get(i, k).powi(2))
+                    .sum();
+                undetermined / DEGENERATE_EIGENVALUE <= variance_part(i, i)
+            })
+            .collect();
+        let mut covariance = FlatMatrix::zeros(n_free, n_free);
+        covariance.data.fill(f64::NAN);
+        let mut errors = vec![None; n_free];
+        for i in (0..n).filter(|&i| resolved[i]) {
+            for j in (0..n).filter(|&j| resolved[j]) {
+                *covariance.get_mut(self.positions[i], self.positions[j]) =
+                    self.scale[i] * self.scale[j] * variance_part(i, j);
+            }
+            errors[self.positions[i]] =
+                Some(covariance.get(self.positions[i], self.positions[i]).sqrt());
+        }
+        (covariance, errors)
+    }
 }
 
 #[derive(Debug, Clone)]
@@ -724,6 +857,7 @@ fn try_early_return_fixed(
             params: params.all_values(),
             covariance: None,
             uncertainties: None,
+            on_bound: bounds_reached(params),
         }));
     }
     Ok(Some(PoissonResult {
@@ -733,6 +867,7 @@ fn try_early_return_fixed(
         params: params.all_values(),
         covariance: None,
         uncertainties: None,
+        on_bound: Vec::new(),
     }))
 }
 
@@ -748,7 +883,6 @@ fn try_early_return_fixed(
 fn compute_fd_fisher(
     model: &dyn FitModel,
     params: &mut ParameterSet,
-    y_obs: &[f64],
     y_model: &[f64],
     fd_step: f64,
     all_vals_buf: &mut Vec<f64>,
@@ -756,7 +890,7 @@ fn compute_fd_fisher(
 ) -> Option<FlatMatrix> {
     params.free_indices_into(free_idx_buf);
     let n_free = free_idx_buf.len();
-    let n_e = y_obs.len();
+    let n_e = y_model.len();
 
     let mut jac = FlatMatrix::zeros(n_e, n_free);
     for (col, &fi) in free_idx_buf.iter().enumerate() {
@@ -828,8 +962,8 @@ fn compute_fd_fisher(
     }
 
     let mut fisher = FlatMatrix::zeros(n_free, n_free);
-    for i in 0..n_e {
-        let h_i = poisson_nll_curvature(y_obs[i], y_model[i]);
+    for (i, &mu) in y_model.iter().enumerate() {
+        let h_i = expected_information(mu);
         for j in 0..n_free {
             let jij = jac.get(i, j);
             for k in 0..n_free {
@@ -840,12 +974,15 @@ fn compute_fd_fisher(
     Some(fisher)
 }
 
-/// Run Poisson-likelihood optimization using a projected KL optimizer.
+/// Fit `params` to `y_obs` by minimizing half the Poisson deviance within the
+/// parameter bounds.
 ///
-/// Uses damped Gauss-Newton / Fisher steps when an analytical Jacobian is
-/// available, falling back to projected gradient descent otherwise. Both paths
-/// use backtracking line search with Armijo condition and projection onto
-/// parameter bounds after each step.
+/// With an analytical Jacobian the fit has converged when the Newton
+/// decrement `½ gᵀF⁻¹g` over the free parameters not held by a bound is
+/// below 1e-4, `F = Jᵀ diag(1/μ) J` the expected information; a parameter on
+/// its bound whose step would leave the box is held for that step.  Without
+/// one, when the projected gradient or the step falls below
+/// `config.tol_param`.
 ///
 /// # Arguments
 /// * `model` — Forward model (maps parameters → predicted counts).
@@ -893,6 +1030,7 @@ pub fn poisson_fit(
             params: params.all_values(),
             covariance: None,
             uncertainties: None,
+            on_bound: bounds_reached(params),
         });
     }
 
@@ -947,83 +1085,102 @@ pub fn poisson_fit(
                 fd_history.clear();
             }
 
-            // Use projected-gradient optimality for bound-constrained problems.
-            let projected_grad_norm = projected_gradient_norm(params, &free_idx_buf, &grad);
-            if projected_grad_norm < config.tol_param {
+            let inactive_positions = inactive_free_positions(params, &free_idx_buf, &grad);
+            if let Some(ref analytical) = analytical_step {
+                let decrement = ScaledInformation::new(&analytical.fisher, &inactive_positions)
+                    .newton_decrement(&grad);
+                if decrement < NEWTON_DECREMENT_TOL {
+                    converged = true;
+                    break 'outer;
+                }
+            } else if projected_gradient_norm(params, &free_idx_buf, &grad) < config.tol_param {
                 converged = true;
                 break 'outer;
             }
 
-            let (search_dir, initial_alpha): (Vec<f64>, f64) =
-                if let Some(ref analytical) = analytical_step {
-                    let inactive_positions = inactive_free_positions(params, &free_idx_buf, &grad);
-                    if inactive_positions.is_empty() {
-                        converged = true;
-                        break 'outer;
-                    }
-                    let reduced_fisher = extract_submatrix(&analytical.fisher, &inactive_positions);
-                    let reduced_grad: Vec<f64> =
-                        inactive_positions.iter().map(|&pos| grad[pos]).collect();
-                    let reduced_dir = crate::lm::solve_damped_system(
-                        &reduced_fisher,
-                        &reduced_grad,
+            let directions: Vec<(Vec<f64>, f64)> = if let Some(ref analytical) = analytical_step {
+                let mut positions = inactive_positions.clone();
+                let newton = loop {
+                    let dir = reduced_newton_direction(
+                        &analytical.fisher,
+                        &grad,
+                        &positions,
                         config.gauss_newton_lambda,
-                    )
-                    .unwrap_or_else(|| {
-                        reduced_grad
-                            .iter()
-                            .enumerate()
-                            .map(|(j, &g)| g / reduced_fisher.get(j, j).max(1e-12))
-                            .collect()
+                    );
+                    let before = positions.len();
+                    positions.retain(|&pos| {
+                        !is_bound_active(&params.params[free_idx_buf[pos]], dir[pos])
                     });
-                    let mut dir = vec![0.0; grad.len()];
-                    for (&pos, &value) in inactive_positions.iter().zip(reduced_dir.iter()) {
-                        dir[pos] = value;
-                    }
-                    (dir, config.step_size)
-                } else {
-                    let inactive_positions = inactive_free_positions(params, &free_idx_buf, &grad);
-                    if inactive_positions.is_empty() {
-                        converged = true;
-                        break 'outer;
-                    }
-                    let used_history = !fd_history.s_list.is_empty();
-                    let mut dir = fd_history
-                        .apply_on_positions(&grad, &inactive_positions)
-                        .unwrap_or_else(|| {
-                            parameter_scaled_gradient_direction(params, &free_idx_buf, &grad)
-                        });
-                    let descent = dot(&grad, &dir);
-                    if !descent.is_finite() || descent <= 0.0 {
-                        dir = parameter_scaled_gradient_direction(params, &free_idx_buf, &grad);
-                    }
-                    if used_history && descent.is_finite() && descent > 0.0 {
-                        (dir, config.step_size)
-                    } else {
-                        let search_norm: f64 = dir.iter().map(|d| d * d).sum::<f64>().sqrt();
-                        (dir, config.step_size / search_norm.max(1.0))
+                    if positions.len() == before {
+                        break dir;
                     }
                 };
+                let blocked: Vec<usize> = inactive_positions
+                    .iter()
+                    .copied()
+                    .filter(|pos| !positions.contains(pos))
+                    .collect();
+                let mut inward = vec![0.0; grad.len()];
+                for (&pos, value) in
+                    blocked
+                        .iter()
+                        .zip(diagonal_direction(&analytical.fisher, &grad, &blocked))
+                {
+                    inward[pos] = value;
+                }
+                vec![(newton, config.step_size), (inward, config.step_size)]
+            } else {
+                if inactive_positions.is_empty() {
+                    converged = true;
+                    break 'outer;
+                }
+                let used_history = !fd_history.s_list.is_empty();
+                let mut dir = fd_history
+                    .apply_on_positions(&grad, &inactive_positions)
+                    .unwrap_or_else(|| {
+                        parameter_scaled_gradient_direction(params, &free_idx_buf, &grad)
+                    });
+                let descent = dot(&grad, &dir);
+                if !descent.is_finite() || descent <= 0.0 {
+                    dir = parameter_scaled_gradient_direction(params, &free_idx_buf, &grad);
+                }
+                if used_history && descent.is_finite() && descent > 0.0 {
+                    vec![(dir, config.step_size)]
+                } else {
+                    let search_norm: f64 = dir.iter().map(|d| d * d).sum::<f64>().sqrt();
+                    vec![(dir, config.step_size / search_norm.max(1.0))]
+                }
+            };
 
             params.free_values_into(&mut free_vals_buf);
             old_free_buf.clear();
             old_free_buf.extend_from_slice(&free_vals_buf);
 
-            match backtracking_line_search(
-                model,
-                params,
-                y_obs,
-                &old_free_buf,
-                &free_idx_buf,
-                &search_dir,
-                initial_alpha,
-                config,
-                &grad,
-                nll,
-                &mut all_vals_buf,
-                &mut free_vals_buf,
-                &mut trial_free_buf,
-            ) {
+            let mut outcome = LineSearchResult::Failed;
+            for (search_dir, initial_alpha) in &directions {
+                if !using_fd && search_dir.iter().all(|&d| d == 0.0) {
+                    continue;
+                }
+                outcome = backtracking_line_search(
+                    model,
+                    params,
+                    y_obs,
+                    &old_free_buf,
+                    &free_idx_buf,
+                    search_dir,
+                    *initial_alpha,
+                    config,
+                    &grad,
+                    nll,
+                    &mut all_vals_buf,
+                    &mut free_vals_buf,
+                    &mut trial_free_buf,
+                );
+                if matches!(outcome, LineSearchResult::Accepted { .. }) {
+                    break;
+                }
+            }
+            match outcome {
                 LineSearchResult::Accepted {
                     nll: new_nll,
                     y_model: new_y_model,
@@ -1041,7 +1198,7 @@ pub fn poisson_fit(
                     }
                 }
                 LineSearchResult::Stagnated => {
-                    converged = true;
+                    converged = using_fd;
                     break 'outer;
                 }
                 LineSearchResult::Failed => {
@@ -1049,6 +1206,9 @@ pub fn poisson_fit(
                 }
             }
 
+            if !using_fd {
+                break;
+            }
             params.free_values_into(&mut free_vals_buf);
             let step_norm =
                 normalized_step_norm(&old_free_buf, &free_vals_buf, params, &free_idx_buf);
@@ -1061,20 +1221,9 @@ pub fn poisson_fit(
         }
     }
 
-    // Compute local covariance from the inverse Fisher information matrix
-    // at the converged parameters: cov = (J^T H J)^{-1}.
-    // This is a local curvature estimate, not a Bayesian posterior.
-    // Gated by config.compute_covariance to avoid extra evaluations when
-    // the caller only needs densities (e.g., per-pixel spatial mapping).
+    let bounded = bounds_reached(params);
     let (covariance, uncertainties) = if converged && config.compute_covariance {
-        // Use the final y_model from the last accepted step rather than
-        // re-evaluating (avoids extra model call and cannot turn a
-        // successful fit into an error during post-processing).
-
-        // Build the Fisher information matrix J^T H J from the Jacobian at
-        // the converged parameters.  Try the analytical Jacobian first; fall
-        // back to finite differences if not available.
-        let fisher_opt = if let Some(step_data) = compute_analytical_step_data(
+        let fisher = if let Some(step_data) = compute_analytical_step_data(
             model,
             params,
             y_obs,
@@ -1084,44 +1233,23 @@ pub fn poisson_fit(
         ) {
             Some(step_data.fisher)
         } else {
-            // Build Fisher via FD Jacobian.
             compute_fd_fisher(
                 model,
                 params,
-                y_obs,
                 &y_model,
                 config.fd_step,
                 &mut all_vals_buf,
                 &mut free_idx_buf,
             )
         };
-
-        if let Some(fisher) = fisher_opt {
-            if let Some(cov) = crate::lm::invert_matrix(&fisher) {
-                // Raw Cramér-Rao (inverse-Fisher) covariance-only bound. This
-                // fitter deliberately does NOT apply the optional χ²-scaling
-                // (`scale_by_chi2`, issue #638): the objective here is a
-                // single-arm Poisson NLL, and any goodness-of-fit scaling
-                // belongs to the caller's extraction layer, keeping the
-                // formalism-agnostic scaling out of this count-statistics
-                // fitter.
-                let n_free = cov.nrows;
-                let unc: Vec<f64> = (0..n_free)
-                    .map(|i| {
-                        let d = cov.get(i, i);
-                        if d.is_finite() && d > 0.0 {
-                            d.sqrt()
-                        } else {
-                            f64::NAN
-                        }
-                    })
-                    .collect();
-                (Some(cov), Some(unc))
-            } else {
-                (None, None)
+        match fisher {
+            Some(fisher) => {
+                let interior: Vec<usize> = (0..bounded.len()).filter(|&p| !bounded[p]).collect();
+                let (covariance, errors) =
+                    ScaledInformation::new(&fisher, &interior).covariance(bounded.len());
+                (Some(covariance), Some(errors))
             }
-        } else {
-            (None, None)
+            None => (None, None),
         }
     } else {
         (None, None)
@@ -1134,6 +1262,7 @@ pub fn poisson_fit(
         params: params.all_values(),
         covariance,
         uncertainties,
+        on_bound: bounded,
     })
 }
 
@@ -1580,75 +1709,27 @@ impl<'a> crate::forward_model::ForwardModel for TransmissionKLBackgroundModel<'a
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn assert_within_errors(result: &PoissonResult, free: &[usize], truth: &[f64], fraction: f64) {
+        assert!(
+            result.converged,
+            "stopped after {} iterations",
+            result.iterations
+        );
+        let errors = result.uncertainties.as_ref().expect("error bars");
+        for (&index, error) in free.iter().zip(errors) {
+            let error = error.expect("an error bar for every free parameter");
+            let miss = (result.params[index] - truth[index]) / error;
+            assert!(
+                miss.abs() < fraction,
+                "parameter {index} = {} is {miss:.4} errors from {}",
+                result.params[index],
+                truth[index]
+            );
+        }
+    }
     use crate::lm::FitModel;
     use crate::parameters::FitParameter;
-
-    /// Poisson deviance `D = 2·Σ [y_obs·ln(y_obs/y_model) − (y_obs − y_model)]`.
-    ///
-    /// Goodness-of-fit statistic for the Poisson likelihood. Each term is
-    /// non-negative; the `y_obs = 0` term reduces to `2·y_model`. `y_model` is
-    /// HARD-floored at `POISSON_EPSILON` before the logarithm — a simpler
-    /// scheme than [`poisson_nll_term`]'s smooth quadratic sub-`POISSON_EPSILON`
-    /// extrapolation, used here solely to keep the deviance finite for a
-    /// degenerate zero prediction (the two schemes agree only for
-    /// `y_model ≥ POISSON_EPSILON`).
-    ///
-    /// Reference formula kept under `#[cfg(test)]` as an independently
-    /// hand-checked oracle (issue #638). On transmission fractions this
-    /// Poisson deviance would be a pseudo-Poisson statistic rather than a
-    /// valid reduced-χ² — one reason the deleted transmission-Poisson route
-    /// never scaled σ by it.
-    fn poisson_deviance(y_obs: &[f64], y_model: &[f64]) -> f64 {
-        // Poisson deviance is undefined for negative observations (the term
-        // `obs * ln(obs/m)` has no meaning); guard the impossible state.
-        debug_assert!(
-            y_obs.iter().all(|&o| o >= 0.0),
-            "poisson_deviance requires non-negative observations"
-        );
-        y_obs
-            .iter()
-            .zip(y_model.iter())
-            .map(|(&obs, &mdl)| {
-                let m = mdl.max(POISSON_EPSILON);
-                if obs > 0.0 {
-                    2.0 * (obs * (obs / m).ln() - (obs - m))
-                } else {
-                    2.0 * m
-                }
-            })
-            .sum()
-    }
-
-    /// F3 oracle: `poisson_deviance` against a per-bin HAND-COMPUTED value.
-    ///
-    /// Bins exercise every branch:
-    ///  - `obs=4, mdl=2` (main branch): `2·(4·ln(4/2) − (4−2)) = 8·ln2 − 4`.
-    ///  - `obs=1, mdl=1` (main branch, exact match): `2·(1·ln1 − 0) = 0`.
-    ///  - `obs=0, mdl=5` (`obs=0` branch): `2·5 = 10`.
-    ///  - `obs=3, mdl=0` (flooring path, `obs>0`, `mdl<ε`): `mdl` is clamped to
-    ///    `POISSON_EPSILON`, so the term is `2·(3·ln(3/ε) − (3−ε))`. Verifies
-    ///    the hard floor is applied (an unclamped `mdl=0` would give `ln(3/0)=∞`
-    ///    and a non-finite deviance).
-    #[test]
-    fn test_poisson_deviance_hand_computed() {
-        let y_obs = [4.0, 1.0, 0.0, 3.0];
-        let y_model = [2.0, 1.0, 5.0, 0.0];
-
-        let eps = POISSON_EPSILON;
-        let term_main = 8.0 * 2.0_f64.ln() - 4.0; // obs=4, mdl=2
-        let term_match = 0.0; // obs=1, mdl=1
-        let term_zero_obs = 10.0; // obs=0, mdl=5 → 2·5
-        let term_floored = 2.0 * (3.0 * (3.0 / eps).ln() - (3.0 - eps)); // obs=3, mdl=0
-        let expected = term_main + term_match + term_zero_obs + term_floored;
-
-        let got = poisson_deviance(&y_obs, &y_model);
-        assert!(
-            (got - expected).abs() < 1e-9,
-            "poisson_deviance = {got}, hand-computed = {expected}"
-        );
-        // Each term is non-negative and the floored bin stayed finite.
-        assert!(got.is_finite() && got > 0.0, "deviance = {got}");
-    }
 
     /// Simple model: y = a * exp(-b * x)
     /// This mimics transmission: counts = flux * exp(-density * sigma)
@@ -1670,17 +1751,10 @@ mod tests {
     }
 
     #[test]
-    fn test_poisson_nll_perfect_match() {
-        let y_obs = vec![10.0, 20.0, 30.0];
-        let y_model = vec![10.0, 20.0, 30.0];
-        let nll = poisson_nll(&y_obs, &y_model);
-        // NLL = Σ(y_model - y_obs*ln(y_model))
-        let expected: f64 = y_obs
-            .iter()
-            .zip(y_model.iter())
-            .map(|(&o, &m)| m - o * m.ln())
-            .sum();
-        assert!((nll - expected).abs() < 1e-10);
+    fn the_objective_is_half_the_poisson_deviance() {
+        assert_eq!(poisson_nll(&[10.0, 20.0, 30.0], &[10.0, 20.0, 30.0]), 0.0);
+        let expected = (10.0 * (10.0_f64 / 20.0).ln() + 10.0) + 5.0;
+        assert!((poisson_nll(&[10.0, 0.0], &[20.0, 5.0]) - expected).abs() < 1e-12);
     }
 
     #[test]
@@ -2449,36 +2523,12 @@ mod tests {
         };
         let result = poisson_fit(&wrapped, &y_obs, &mut params, &config).unwrap();
 
-        assert!(result.converged, "fit did not converge: {result:?}");
         assert!(
             result.iterations <= 80,
             "expected convergence well before max_iter; got {}",
             result.iterations,
         );
-        assert!(
-            (result.params[0] - true_params[0]).abs() / true_params[0] < 0.05,
-            "density fit={}, true={}",
-            result.params[0],
-            true_params[0],
-        );
-        assert!(
-            (result.params[1] - true_params[1]).abs() < 8.0,
-            "temperature fit={}, true={}",
-            result.params[1],
-            true_params[1],
-        );
-        assert!(
-            (result.params[2] - true_params[2]).abs() < 5e-3,
-            "b0 fit={}, true={}",
-            result.params[2],
-            true_params[2],
-        );
-        assert!(
-            (result.params[3] - true_params[3]).abs() < 5e-3,
-            "b1 fit={}, true={}",
-            result.params[3],
-            true_params[3],
-        );
+        assert_within_errors(&result, &[0, 1, 2, 3], &true_params, 0.02);
     }
 
     /// Inner params FREE + inner model WITHOUT `analytical_jacobian` →
@@ -2741,5 +2791,227 @@ mod tests {
                 jac.get(row, 0),
             );
         }
+    }
+
+    struct DecayModel {
+        t: Vec<f64>,
+    }
+
+    impl FitModel for DecayModel {
+        fn evaluate(&self, params: &[f64]) -> Result<Vec<f64>, FittingError> {
+            Ok(self
+                .t
+                .iter()
+                .map(|&t| params[0] * (-params[1] * t).exp())
+                .collect())
+        }
+
+        fn analytical_jacobian(
+            &self,
+            params: &[f64],
+            free_param_indices: &[usize],
+            _y_current: &[f64],
+        ) -> Option<FlatMatrix> {
+            let mut jacobian = FlatMatrix::zeros(self.t.len(), free_param_indices.len());
+            for (row, &t) in self.t.iter().enumerate() {
+                let decay = (-params[1] * t).exp();
+                for (col, &index) in free_param_indices.iter().enumerate() {
+                    *jacobian.get_mut(row, col) = match index {
+                        0 => decay,
+                        _ => -params[0] * t * decay,
+                    };
+                }
+            }
+            Some(jacobian)
+        }
+    }
+
+    fn decay_times() -> Vec<f64> {
+        vec![0.0, 0.5, 1.0, 1.5, 2.0, 3.0]
+    }
+
+    #[test]
+    fn a_step_blocked_by_a_bound_does_not_end_the_fit() {
+        let model = DecayModel { t: decay_times() };
+        let observed = model.evaluate(&[1000.0, 1.5]).unwrap();
+        for (lower, upper, start) in [
+            (600.0, f64::INFINITY, [600.0, 6.0]),
+            (0.0, 2400.0, [2400.0, 0.3]),
+        ] {
+            let mut params = ParameterSet::new(vec![
+                FitParameter {
+                    name: "a".into(),
+                    value: start[0],
+                    lower,
+                    upper,
+                    fixed: false,
+                },
+                FitParameter::non_negative("b", start[1]),
+            ]);
+            let result =
+                poisson_fit(&model, &observed, &mut params, &PoissonConfig::default()).unwrap();
+            assert_within_errors(&result, &[0, 1], &[1000.0, 1.5], 0.02);
+        }
+    }
+
+    fn decay_information(t: &[f64], a: f64, b: f64) -> [[f64; 2]; 2] {
+        let mut information = [[0.0; 2]; 2];
+        for &t in t {
+            let decay = (-b * t).exp();
+            let (mu, j) = (a * decay, [decay, -a * t * decay]);
+            for p in 0..2 {
+                for q in 0..2 {
+                    information[p][q] += j[p] * j[q] / mu;
+                }
+            }
+        }
+        information
+    }
+
+    fn relative(a: f64, b: f64) -> f64 {
+        (a / b - 1.0).abs()
+    }
+
+    #[test]
+    fn error_bars_are_the_expected_information_of_the_parameters_off_their_bounds() {
+        let t = vec![0.0, 0.5, 1.0, 1.5, 2.0, 3.0, 4.0];
+        let observed = [1012.0, 460.0, 231.0, 99.0, 52.0, 9.0, 0.0];
+        let model = DecayModel { t: t.clone() };
+
+        let mut params = ParameterSet::new(vec![
+            FitParameter::non_negative("a", 800.0),
+            FitParameter::non_negative("b", 1.0),
+        ]);
+        let result =
+            poisson_fit(&model, &observed, &mut params, &PoissonConfig::default()).unwrap();
+        assert!(result.converged && result.on_bound == [false, false]);
+        let [[faa, fab], [_, fbb]] = decay_information(&t, result.params[0], result.params[1]);
+        let det = faa * fbb - fab * fab;
+        let errors = result.uncertainties.unwrap();
+        assert!(
+            relative(errors[0].unwrap(), (fbb / det).sqrt()) < 1e-8,
+            "{errors:?}"
+        );
+        assert!(
+            relative(errors[1].unwrap(), (faa / det).sqrt()) < 1e-8,
+            "{errors:?}"
+        );
+
+        let mut params = ParameterSet::new(vec![
+            FitParameter::non_negative("a", 800.0),
+            FitParameter {
+                name: "b".into(),
+                value: 2.5,
+                lower: 2.0,
+                upper: f64::INFINITY,
+                fixed: false,
+            },
+        ]);
+        let result =
+            poisson_fit(&model, &observed, &mut params, &PoissonConfig::default()).unwrap();
+        assert!(result.converged && result.on_bound == [false, true] && result.params[1] == 2.0);
+        let [[faa, _], _] = decay_information(&t, result.params[0], result.params[1]);
+        let errors = result.uncertainties.unwrap();
+        assert!(errors[1].is_none(), "{errors:?}");
+        assert!(
+            relative(errors[0].unwrap(), faa.sqrt().recip()) < 1e-8,
+            "{errors:?}"
+        );
+    }
+
+    #[test]
+    fn convergence_does_not_depend_on_the_parameters_units() {
+        let sigma: Vec<f64> = (0..40).map(|i| 500.0 * f64::from(i)).collect();
+        let observed: Vec<f64> = DecayModel { t: sigma.clone() }
+            .evaluate(&[1.0e5, 5.0e-4])
+            .unwrap()
+            .iter()
+            .enumerate()
+            .map(|(i, &mu)| (mu + mu.sqrt() * [1.0, -1.0, 0.5, -0.5][i % 4]).round())
+            .collect();
+        let fits: Vec<(f64, f64)> = [1.0e-12, 1.0, 1.0e12]
+            .into_iter()
+            .map(|unit| {
+                let model = DecayModel {
+                    t: sigma.iter().map(|s| s * unit).collect(),
+                };
+                let mut params = ParameterSet::new(vec![
+                    FitParameter::non_negative("flux", 5.0e4),
+                    FitParameter::non_negative("density", 2.5e-4 / unit),
+                ]);
+                let result =
+                    poisson_fit(&model, &observed, &mut params, &PoissonConfig::default()).unwrap();
+                assert!(
+                    result.converged,
+                    "unit {unit}: stopped after {}",
+                    result.iterations
+                );
+                let error = result.uncertainties.unwrap()[1].unwrap();
+                (result.params[1] * unit, error * unit)
+            })
+            .collect();
+        for &(density, _) in &fits[1..] {
+            let (reference, error) = fits[0];
+            assert!(((density - reference) / error).abs() < 0.02, "{fits:?}");
+        }
+    }
+
+    struct SplitAmplitude {
+        t: Vec<f64>,
+    }
+
+    impl FitModel for SplitAmplitude {
+        fn evaluate(&self, params: &[f64]) -> Result<Vec<f64>, FittingError> {
+            Ok(self
+                .t
+                .iter()
+                .map(|&t| (params[0] + params[1]) * (-params[2] * t).exp())
+                .collect())
+        }
+
+        fn analytical_jacobian(
+            &self,
+            params: &[f64],
+            free_param_indices: &[usize],
+            _y_current: &[f64],
+        ) -> Option<FlatMatrix> {
+            let mut jacobian = FlatMatrix::zeros(self.t.len(), free_param_indices.len());
+            for (row, &t) in self.t.iter().enumerate() {
+                let decay = (-params[2] * t).exp();
+                for (col, &index) in free_param_indices.iter().enumerate() {
+                    *jacobian.get_mut(row, col) = match index {
+                        0 | 1 => decay,
+                        _ => -(params[0] + params[1]) * t * decay,
+                    };
+                }
+            }
+            Some(jacobian)
+        }
+    }
+
+    #[test]
+    fn parameters_the_data_cannot_tell_apart_have_no_error_bars() {
+        let model = SplitAmplitude { t: decay_times() };
+        let observed = model.evaluate(&[400.0, 600.0, 1.5]).unwrap();
+        let mut params = ParameterSet::new(vec![
+            FitParameter::non_negative("a", 300.0),
+            FitParameter::non_negative("b", 300.0),
+            FitParameter::non_negative("c", 1.0),
+        ]);
+        let result =
+            poisson_fit(&model, &observed, &mut params, &PoissonConfig::default()).unwrap();
+        assert!(
+            result.converged,
+            "stopped after {} iterations",
+            result.iterations
+        );
+        let errors = result.uncertainties.unwrap();
+        assert!(errors[0].is_none() && errors[1].is_none(), "{errors:?}");
+        let error = errors[2].expect("the decay rate is determined");
+        assert!(
+            ((result.params[2] - 1.5) / error).abs() < 0.02,
+            "{:?}",
+            result.params
+        );
     }
 }

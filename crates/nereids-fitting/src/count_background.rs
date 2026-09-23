@@ -1152,29 +1152,7 @@ fn poisson_deviance(observed: &[f64], predicted: &[f64]) -> f64 {
                 if model == 0.0 {
                     return f64::INFINITY;
                 }
-                // h(r) = (1+r) ln(1+r) - r, where r=(obs-model)/model.
-                // A short series avoids subtracting nearly equal, very large
-                // numbers when the fitted and observed counts almost match.
-                let r = (obs - model) / model;
-                let deviance = if r.abs() < 1.0e-3 {
-                    let h = r
-                        * r
-                        * (0.5
-                            + r * (-1.0 / 6.0
-                                + r * (1.0 / 12.0 + r * (-1.0 / 20.0 + r * (1.0 / 30.0)))));
-                    // The small factor is applied first: `(2 * model) * h`
-                    // overflows for `model > MAX / 2` even when the exact
-                    // term is representable.
-                    2.0 * (model * h)
-                } else {
-                    // Away from equality the direct form does not suffer
-                    // cancellation.  Subtracting logarithms also avoids an
-                    // intermediate obs/model overflow or underflow.
-                    2.0 * (obs * (obs.ln() - model.ln()) - (obs - model))
-                };
-                // Each exact deviance term is non-negative.  Guard only
-                // against a final sub-ulp negative caused by floating point.
-                deviance.max(0.0)
+                2.0 * crate::poisson::half_deviance(obs, model)
             } else {
                 2.0 * model
             }
