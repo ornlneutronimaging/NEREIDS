@@ -10,6 +10,9 @@ const FLIGHT_PATH_M: f64 = 25.0;
 const T0_US: f64 = 3.0;
 const COUNTS_PER_US: f64 = 1000.0;
 const STEP_US: f64 = 1.0e-3;
+const IC_ALPHA: f64 = 0.565;
+const IC_BETA: f64 = 0.25;
+const IC_R: f64 = 0.15;
 
 const TRIANGLE: [(f64, f64); 3] = [(-1.0, 0.0), (0.0, 1.0), (3.0, 0.0)];
 
@@ -32,9 +35,9 @@ fn ikeda_carpenter() -> ResolutionFunction {
     ResolutionFunction::IkedaCarpenter(Arc::new(
         IkedaCarpenter::new(
             IkedaCarpenterParams {
-                alpha: EnergyLaw::Const(0.565),
-                beta: EnergyLaw::Const(0.25),
-                r: EnergyLaw::Const(0.15),
+                alpha: EnergyLaw::Const(IC_ALPHA),
+                beta: EnergyLaw::Const(IC_BETA),
+                r: EnergyLaw::Const(IC_R),
                 burst_sigma_us: None,
                 channel_fwhm_us: None,
             },
@@ -107,7 +110,8 @@ fn a_beam_uniform_in_flight_time_fills_every_bin_in_proportion_to_its_width() {
         ("triangle", triangle()),
         ("ikeda-carpenter", ikeda_carpenter()),
     ] {
-        let instrument = instrument(resolution, FLIGHT_PATH_M, T0_US);
+        let mut instrument = instrument(resolution, FLIGHT_PATH_M, T0_US);
+        instrument.time_edges_us = vec![400.0, 401.0, 403.0, 407.0, 415.0, 431.0, 470.0];
         let result =
             instrument.expected_counts(&beam, &open, (energy(560.0), energy(250.0)), STEP_US);
         assert!(
@@ -116,9 +120,10 @@ fn a_beam_uniform_in_flight_time_fills_every_bin_in_proportion_to_its_width() {
             result.edge_probability
         );
         for (k, &c) in result.counts.iter().enumerate() {
+            let width = instrument.time_edges_us[k + 1] - instrument.time_edges_us[k];
             assert!(
-                (c - COUNTS_PER_US).abs() <= 1.0e-6 * COUNTS_PER_US,
-                "{label}: bin {k} holds {c}, not {COUNTS_PER_US}"
+                (c - COUNTS_PER_US * width).abs() <= 1.0e-6 * COUNTS_PER_US * width,
+                "{label}: bin {k}, {width} µs wide, holds {c}"
             );
         }
     }
@@ -180,12 +185,15 @@ fn transmission_sees_ascending_energies_and_the_low_edge_is_first() {
     let result = instrument(triangle(), FLIGHT_PATH_M, T0_US).expected_counts(
         &beam,
         &ascending,
-        (energy(450.0), energy(300.0)),
+        (energy(470.5 - T0_US), energy(300.0)),
         STEP_US,
     );
+    let early_side = (0.5 * 0.5 * 0.5) / (0.5 * 4.0 * 1.0);
     assert!(
-        result.edge_probability[0] > 0.5 && result.edge_probability[1] == 0.0,
-        "a neutron at 450 µs lands in the bins and one at 300 µs does not, got {:?}",
+        (result.edge_probability[0] - early_side).abs() <= 1.0e-12
+            && result.edge_probability[1] == 0.0,
+        "a neutron nominally 0.5 µs after the last edge lands in it with chance \
+         {early_side}, one at 300 µs never does; got {:?}",
         result.edge_probability
     );
 }
@@ -218,4 +226,27 @@ fn repeated_calls_give_identical_counts() {
             "the same call returned different counts"
         );
     }
+}
+
+#[test]
+fn an_ikeda_carpenter_band_centres_at_its_mean_delay() {
+    let mut instrument = instrument(ikeda_carpenter(), FLIGHT_PATH_M, T0_US);
+    instrument.time_edges_us = (400..=540).map(f64::from).collect();
+    let (_, centroid) = removed(&instrument);
+    let expected = T0_US + 445.0 + 3.0 / IC_ALPHA + IC_R / IC_BETA;
+    assert!(
+        (centroid - expected).abs() <= 1.0e-3,
+        "the removed counts centre at {centroid} µs, not {expected} µs"
+    );
+}
+
+#[test]
+#[should_panic(expected = "must bracket the time window")]
+fn a_range_that_misses_the_window_is_refused() {
+    instrument(triangle(), FLIGHT_PATH_M, T0_US).expected_counts(
+        &beam,
+        &open,
+        (energy(300.0), energy(250.0)),
+        STEP_US,
+    );
 }

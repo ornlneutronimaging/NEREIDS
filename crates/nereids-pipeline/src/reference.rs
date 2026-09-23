@@ -4,7 +4,8 @@ use rayon::prelude::*;
 /// The detector's time bins and the arrival time of a neutron of known
 /// energy: `t0_us + TOF_FACTOR · flight_path_m / √E` plus an offset drawn
 /// from `resolution`, whose zero follows that resolution's anchor (see
-/// [`ResolutionFunction::detector_bin_probabilities`]).
+/// [`ResolutionFunction::detector_bin_probabilities`]).  The chance of
+/// landing in each bin is that resolution's own, the one the fits use.
 pub struct Instrument {
     /// Time-bin edges in µs, strictly ascending.
     pub time_edges_us: Vec<f64>,
@@ -27,16 +28,19 @@ const CHUNK: usize = 1024;
 impl Instrument {
     /// Expected counts per time bin from a beam `beam(E)` in neutrons per eV
     /// through a sample of transmission `transmission(energies)`, integrated
-    /// over energies in `energy_range_ev` with flight-time step `step_us`.
+    /// over energies in `energy_range_ev` with a flight-time step of at most
+    /// `step_us`.
     ///
     /// `transmission` receives ascending energies and returns one value per
     /// energy.
     ///
     /// # Panics
-    /// If the energy range is not `0 < low < high`, the step is not finite
-    /// and positive, `transmission` returns a different number of values
-    /// than it was given energies, or the resolution rejects the flight
-    /// path, the time edges, `t0_us` or an energy.
+    /// If the energy range is not `0 < low < high` or its neutrons do not
+    /// arrive from before the first time edge to after the last, the step is
+    /// not finite and positive, `transmission` returns a different number of
+    /// values than it was given energies, the resolution is Gaussian, or the
+    /// resolution rejects the flight path, the time edges, `t0_us` or an
+    /// energy.
     pub fn expected_counts(
         &self,
         beam: &(dyn Fn(f64) -> f64 + Sync),
@@ -67,6 +71,17 @@ impl Instrument {
 
         let kl = TOF_FACTOR * self.flight_path_m;
         let (u_lo, u_hi) = (kl / e_hi.sqrt(), kl / e_lo.sqrt());
+        let (first, last) = (
+            self.time_edges_us[0],
+            self.time_edges_us[self.time_edges_us.len() - 1],
+        );
+        assert!(
+            self.t0_us + u_lo <= first && self.t0_us + u_hi >= last,
+            "the energy range must bracket the time window: its neutrons arrive from {} to {} µs, \
+             the bins span {first} to {last} µs",
+            self.t0_us + u_lo,
+            self.t0_us + u_hi
+        );
         let steps = ((u_hi - u_lo) / step_us).ceil() as usize;
         let h = (u_hi - u_lo) / steps as f64;
         let mut energies: Vec<f64> = (0..=steps)
