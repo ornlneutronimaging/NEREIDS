@@ -109,7 +109,7 @@ fn build_aux_grid(
 ///
 /// SAMMY Ref: dat/mdat4.f90 Fspken — uses total width to define the region
 /// [E_res − gd, E_res + gd] for fine-structure point insertion.
-fn extract_resonance_widths(resonance_data: &[&ResonanceData]) -> Vec<(f64, f64)> {
+pub fn extract_resonance_widths(resonance_data: &[&ResonanceData]) -> Vec<(f64, f64)> {
     let mut pairs = Vec::new();
     for rd in resonance_data {
         for range in &rd.ranges {

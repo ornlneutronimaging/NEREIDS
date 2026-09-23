@@ -50,6 +50,17 @@ const MIN_POINTS_PER_WIDTH: usize = IPTDOP + 1;
 /// SAMMY Ref: `dat/mdat4.f90` Fspken line 310
 const FRACTN: f64 = 2.0 / (IPTDOP as f64 + 5.0);
 
+/// Distance, as a fraction of the resonance spacing, within which an existing
+/// point stands in for a resonance point.
+///
+/// SAMMY Ref: `dat/mdat4.f90` Add_Pnts lines 380, 400
+const STAND_IN_FRACTION: f64 = 0.1;
+
+/// Largest ratio between neighbouring intervals.
+///
+/// SAMMY Ref: `dat/mdat5.f90` RefineGrid line 264
+const MAX_SPACING_RATIO: f64 = 2.5;
+
 /// Build an extended energy grid with boundary extension and resonance
 /// fine-structure for resolution broadening.
 ///
@@ -110,6 +121,27 @@ pub fn build_extended_grid_for(
         }
     };
     extend_boundaries(data_energies, low, high, spacing)
+}
+
+/// `grid` with SAMMY's points around each `(E_res, D)` resonance in
+/// `resonances`, `D` its total width in eV, then graded so that no interval
+/// is more than `MAX_SPACING_RATIO` times either neighbour.  The points are
+/// placed against `grid` as given, so the result does not depend on the order
+/// of `resonances`.  A grid of fewer than two energies comes back unchanged.
+///
+/// `grid` must be ascending.
+pub fn with_resonance_points(grid: &[f64], resonances: &[(f64, f64)]) -> Vec<f64> {
+    let mut refined = grid.to_vec();
+    if grid.len() < 2 {
+        return refined;
+    }
+    let points = resonances
+        .iter()
+        .flat_map(|&(energy, width)| resonance_points(grid, energy, width))
+        .collect();
+    merge_points(&mut refined, points);
+    grade_spacing(&mut refined);
+    refined
 }
 
 /// The variable in which the added boundary points are evenly spaced, at the
@@ -391,6 +423,105 @@ fn fine_structure_points(grid: &[f64], eres: f64, gd: f64) -> Vec<f64> {
     new_points
 }
 
+/// Points that sample the resonance at `energy` of total width `width`: its
+/// centre and the ends of `[energy − width, energy + width]` within the grid,
+/// and enough points between them and the grid's own points that no interval
+/// there exceeds `FRACTN · width`.  A grid point within `STAND_IN_FRACTION` of
+/// that spacing stands in for a centre or an end, and the gap beside it is
+/// filled too.
+/// Returns none when the centre lies off the grid or the grid already holds
+/// `MIN_POINTS_PER_WIDTH` points across the interval.
+///
+/// SAMMY Ref: `dat/mdat4.f90` Fspken lines 243-284, Add_Pnts lines 333-532
+fn resonance_points(grid: &[f64], energy: f64, width: f64) -> Vec<f64> {
+    let (first, last) = (grid[0], grid[grid.len() - 1]);
+    if energy < first || energy > last {
+        return Vec::new();
+    }
+    let lo = (energy - width).max(first);
+    let hi = (energy + width).min(last);
+    let start = grid.partition_point(|&e| e < lo);
+    let end = grid.partition_point(|&e| e <= hi);
+    if end - start >= MIN_POINTS_PER_WIDTH {
+        return Vec::new();
+    }
+    let step = FRACTN * width;
+    let neighbours = &grid[start.saturating_sub(1)..(end + 1).min(grid.len())];
+    let mut anchors = grid[start..end].to_vec();
+    let mut points = Vec::new();
+    let mut anchor = |e: f64| match neighbours
+        .iter()
+        .find(|&&g| (g - e).abs() < STAND_IN_FRACTION * step)
+    {
+        Some(&g) => anchors.push(g),
+        None => {
+            anchors.push(e);
+            points.push(e);
+        }
+    };
+    for e in [lo, energy, hi] {
+        anchor(e);
+    }
+    anchors.sort_by(f64::total_cmp);
+    for pair in anchors.windows(2) {
+        let gap = pair[1] - pair[0];
+        let n = (gap / step).ceil() as usize;
+        points.extend((1..n).map(|k| pair[0] + gap * k as f64 / n as f64));
+    }
+    points
+}
+
+fn merge_points(grid: &mut Vec<f64>, mut points: Vec<f64>) -> usize {
+    points.sort_by(f64::total_cmp);
+    let close = |a: f64, b: f64| (a - b).abs() <= MERGE_RELATIVE_TOL * a.abs().max(b.abs());
+    let mut kept: Vec<f64> = Vec::with_capacity(points.len());
+    for p in points {
+        let i = grid.partition_point(|&g| g < p);
+        let on_grid = grid.get(i).is_some_and(|&g| close(p, g)) || (i > 0 && close(p, grid[i - 1]));
+        if !on_grid && kept.last().is_none_or(|&k| !close(p, k)) {
+            kept.push(p);
+        }
+    }
+    let added = kept.len();
+    grid.extend(kept);
+    grid.sort_by(f64::total_cmp);
+    added
+}
+
+/// Add points until no interval is more than `MAX_SPACING_RATIO` times either
+/// neighbour, or no further point lies outside the merge tolerance.  A longer
+/// interval is split from its shorter neighbour's side at distances halving
+/// from its middle down to that neighbour's length, so the new intervals
+/// double outward.
+///
+/// SAMMY Ref: `dat/mdat5.f90` RefineGrid lines 264-328, 440-459
+fn grade_spacing(grid: &mut Vec<f64>) {
+    loop {
+        let mut points = Vec::new();
+        for k in 1..grid.len() - 1 {
+            let below = grid[k] - grid[k - 1];
+            let above = grid[k + 1] - grid[k];
+            let finest = MERGE_RELATIVE_TOL * grid[k].abs();
+            if below > MAX_SPACING_RATIO * above {
+                let mut d = below / 2.0;
+                while d >= above.max(finest) {
+                    points.push(grid[k] - d);
+                    d /= 2.0;
+                }
+            } else if above > MAX_SPACING_RATIO * below {
+                let mut d = above / 2.0;
+                while d >= below.max(finest) {
+                    points.push(grid[k] + d);
+                    d /= 2.0;
+                }
+            }
+        }
+        if merge_points(grid, points) == 0 {
+            return;
+        }
+    }
+}
+
 /// Sort and deduplicate within tolerance.
 fn dedup(grid: &mut Vec<f64>) {
     if grid.len() < 2 {
@@ -438,6 +569,46 @@ fn build_data_indices(grid: &[f64], data_energies: &[f64]) -> Vec<usize> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn graded(grid: &[f64]) -> bool {
+        grid.windows(3).all(|w| {
+            let (below, above) = (w[1] - w[0], w[2] - w[1]);
+            below <= MAX_SPACING_RATIO * above * (1.0 + 1e-9)
+                && above <= MAX_SPACING_RATIO * below * (1.0 + 1e-9)
+        })
+    }
+
+    #[test]
+    fn a_resonance_is_sampled_at_sammys_spacing_and_its_points_graded_outward() {
+        let grid: Vec<f64> = (0..20).map(|i| 490.0 + f64::from(i) * 5.0).collect();
+        let refined = with_resonance_points(&grid, &[(500.0, 1.0)]);
+        let across: Vec<f64> = refined
+            .iter()
+            .copied()
+            .filter(|e| (499.0..=501.0).contains(e))
+            .collect();
+        assert_eq!((across[0], across[across.len() - 1]), (499.0, 501.0));
+        assert!(
+            across
+                .windows(2)
+                .all(|w| w[1] - w[0] <= FRACTN * (1.0 + 1e-12))
+        );
+        assert!(graded(&refined));
+        assert!(grid.iter().all(|e| refined.contains(e)));
+
+        let dense: Vec<f64> = (0..100).map(|i| 495.0 + f64::from(i) * 0.1).collect();
+        assert_eq!(with_resonance_points(&dense, &[(500.0, 1.0)]), dense);
+    }
+
+    #[test]
+    fn resonance_points_do_not_depend_on_the_order_of_the_resonances() {
+        let grid: Vec<f64> = (0..20).map(|i| 490.0 + f64::from(i) * 5.0).collect();
+        let resonances = [(500.0, 1.0), (501.5, 0.3), (530.0, 0.05)];
+        let reversed: Vec<(f64, f64)> = resonances.iter().rev().copied().collect();
+        let refined = with_resonance_points(&grid, &resonances);
+        assert_eq!(refined, with_resonance_points(&grid, &reversed));
+        assert!(graded(&refined));
+    }
 
     #[test]
     fn test_empty_grid() {
