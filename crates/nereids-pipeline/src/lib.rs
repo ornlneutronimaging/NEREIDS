@@ -13,6 +13,7 @@
 //! - [`spatial`] — Per-pixel parallel mapping with rayon (spatial_map_typed)
 
 pub mod calibration;
+pub mod counts_fit;
 pub mod detectability;
 pub mod error;
 pub mod joint_fit;

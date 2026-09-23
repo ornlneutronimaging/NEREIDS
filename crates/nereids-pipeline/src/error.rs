@@ -1,6 +1,7 @@
 //! Error types for the nereids-pipeline crate.
 
 use nereids_fitting::error::FittingError;
+use nereids_physics::bin_weights::BinWeightsError;
 use nereids_physics::transmission::TransmissionError;
 
 /// Errors that can occur during pipeline operations.
@@ -25,6 +26,21 @@ pub enum PipelineError {
     /// Error from the fitting engine (e.g. empty data, length mismatch).
     #[error("Fitting error: {0}")]
     Fitting(FittingError),
+
+    /// The resolution cannot record neutrons in the time bins.
+    #[error("Bin weights: {0}")]
+    BinWeights(BinWeightsError),
+
+    /// Doubling the calculation points this many times did not bring the
+    /// predicted counts within the accuracy bound.
+    #[error("the calculation points did not converge after {0} doublings")]
+    PointsNotConverged(usize),
+}
+
+impl From<BinWeightsError> for PipelineError {
+    fn from(e: BinWeightsError) -> Self {
+        PipelineError::BinWeights(e)
+    }
 }
 
 impl From<TransmissionError> for PipelineError {
