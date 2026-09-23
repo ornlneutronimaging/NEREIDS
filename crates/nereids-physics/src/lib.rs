@@ -24,6 +24,7 @@
 //!   experiments Sec. III.E.1
 
 pub mod auxiliary_grid;
+pub mod bin_weights;
 pub mod channel;
 pub mod continuous_doppler;
 pub mod counts_response;
