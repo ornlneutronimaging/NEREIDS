@@ -40,7 +40,8 @@ pub struct PoissonConfig {
     /// Initial step size for line search.
     pub step_size: f64,
     /// Convergence tolerance on the projected gradient and on the step, used
-    /// when the model has no analytical Jacobian.
+    /// when the model has no analytical Jacobian, and on the KKT residual of
+    /// the counts fit with a background.
     pub tol_param: f64,
     /// Armijo line search parameter (sufficient decrease).
     pub armijo_c: f64,
@@ -84,9 +85,11 @@ pub struct PoissonResult {
     /// Final parameter values (all parameters, including fixed).
     pub params: Vec<f64>,
     /// Covariance of the free parameters, the inverse of the expected
-    /// information `Jᵀ diag(1/μ) J` over those not on a bound; the rows and
-    /// columns of a parameter without an error bar are NaN.  `None` when the
-    /// fit did not converge or covariance computation is disabled.
+    /// information `Jᵀ diag(1/μ) J` over those not on a bound, restricted to
+    /// the directions the data determine; the rows and columns of a parameter
+    /// without an error bar are NaN.  `None` when the fit did not converge,
+    /// covariance computation is disabled, or the information cannot be
+    /// evaluated.
     pub covariance: Option<FlatMatrix>,
     /// Standard error of each free parameter; `None` for one on its bound or
     /// along a direction the data do not determine.  `None` overall when
@@ -106,15 +109,14 @@ fn poisson_nll(y_obs: &[f64], y_model: &[f64]) -> f64 {
 
 pub(crate) fn half_deviance(obs: f64, model: f64) -> f64 {
     let r = (obs - model) / model;
-    let term = if r.abs() < 1.0e-3 {
+    if r.abs() < 1.0e-3 {
         model
             * (r * r
                 * (0.5
                     + r * (-1.0 / 6.0 + r * (1.0 / 12.0 + r * (-1.0 / 20.0 + r * (1.0 / 30.0))))))
     } else {
         obs * (obs.ln() - model.ln()) - (obs - model)
-    };
-    term.max(0.0)
+    }
 }
 
 #[inline]
@@ -123,7 +125,7 @@ fn poisson_nll_term(obs: f64, mdl: f64) -> f64 {
         obs.is_finite() && obs >= 0.0,
         "poisson_nll_term: obs must be finite and >= 0, got {obs}"
     );
-    let saturated = |m: f64| if obs > 0.0 { half_deviance(obs, m) } else { m };
+    let saturated = |m: f64| if obs == 0.0 { m } else { half_deviance(obs, m) };
     if mdl > POISSON_EPSILON {
         saturated(mdl)
     } else {
@@ -501,10 +503,11 @@ impl ScaledInformation {
         };
         let resolved: Vec<bool> = (0..n)
             .map(|i| {
-                let undetermined: f64 = (0..self.values.len())
-                    .filter(|&k| self.values[k] < DEGENERATE_EIGENVALUE)
-                    .map(|k| self.vectors.get(i, k).powi(2))
-                    .sum();
+                let undetermined = 1.0
+                    - determined
+                        .iter()
+                        .map(|&k| self.vectors.get(i, k).powi(2))
+                        .sum::<f64>();
                 undetermined / DEGENERATE_EIGENVALUE <= variance_part(i, i)
             })
             .collect();
@@ -1087,6 +1090,13 @@ pub fn poisson_fit(
 
             let inactive_positions = inactive_free_positions(params, &free_idx_buf, &grad);
             if let Some(ref analytical) = analytical_step {
+                if !grad
+                    .iter()
+                    .chain(&analytical.fisher.data)
+                    .all(|v| v.is_finite())
+                {
+                    break 'outer;
+                }
                 let decrement = ScaledInformation::new(&analytical.fisher, &inactive_positions)
                     .newton_decrement(&grad);
                 if decrement < NEWTON_DECREMENT_TOL {
@@ -2954,6 +2964,69 @@ mod tests {
             let (reference, error) = fits[0];
             assert!(((density - reference) / error).abs() < 0.02, "{fits:?}");
         }
+    }
+
+    struct InfiniteSlope(DecayModel);
+
+    impl FitModel for InfiniteSlope {
+        fn evaluate(&self, params: &[f64]) -> Result<Vec<f64>, FittingError> {
+            self.0.evaluate(params)
+        }
+
+        fn analytical_jacobian(
+            &self,
+            params: &[f64],
+            free_param_indices: &[usize],
+            y_current: &[f64],
+        ) -> Option<FlatMatrix> {
+            let mut jacobian = self
+                .0
+                .analytical_jacobian(params, free_param_indices, y_current)?;
+            *jacobian.get_mut(0, 1) = f64::INFINITY;
+            Some(jacobian)
+        }
+    }
+
+    #[test]
+    fn a_fit_with_an_infinite_slope_has_not_converged() {
+        let model = InfiniteSlope(DecayModel { t: decay_times() });
+        let observed = model.evaluate(&[1000.0, 1.5]).unwrap();
+        let mut params = ParameterSet::new(vec![
+            FitParameter::non_negative("a", 800.0),
+            FitParameter::non_negative("b", 1.0),
+        ]);
+        let result =
+            poisson_fit(&model, &observed, &mut params, &PoissonConfig::default()).unwrap();
+        assert!(!result.converged);
+        assert!(result.uncertainties.is_none());
+    }
+
+    #[test]
+    fn a_nan_information_matrix_gives_no_error_bars() {
+        let mut fisher = FlatMatrix::zeros(2, 2);
+        fisher.data.copy_from_slice(&[1.0, f64::NAN, f64::NAN, 1.0]);
+        let (_, errors) = ScaledInformation::new(&fisher, &[0, 1]).covariance(2);
+        assert_eq!(errors, vec![None, None]);
+    }
+
+    #[test]
+    fn an_infinite_prediction_stops_the_fit_before_it_starts() {
+        let model = DecayModel {
+            t: vec![-1.0e6, 0.0, 1.0],
+        };
+        let mut params = ParameterSet::new(vec![
+            FitParameter::non_negative("a", 1000.0),
+            FitParameter::non_negative("b", 1.0),
+        ]);
+        let result = poisson_fit(
+            &model,
+            &[5.0, 1000.0, 368.0],
+            &mut params,
+            &PoissonConfig::default(),
+        )
+        .unwrap();
+        assert!(!result.converged);
+        assert_eq!(result.iterations, 0);
     }
 
     struct SplitAmplitude {
