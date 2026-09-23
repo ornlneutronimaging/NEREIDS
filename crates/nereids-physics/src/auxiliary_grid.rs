@@ -1,4 +1,4 @@
-use crate::resolution::{ResolutionFunction, ResolutionParams};
+use crate::resolution::{ResolutionError, ResolutionFunction, ResolutionParams};
 
 /// Number of boundary data points used to compute extension spacing.
 ///
@@ -24,7 +24,7 @@ const MIN_POINTS_PER_WIDTH: usize = IPTDOP + 1;
 /// Largest spacing across a resonance, as a fraction of its total width.
 ///
 /// SAMMY Ref: `dat/mdat4.f90` Fspken line 310
-pub const FRACTN: f64 = 2.0 / (IPTDOP as f64 + 5.0);
+const FRACTN: f64 = 2.0 / (IPTDOP as f64 + 5.0);
 
 /// Distance, as a fraction of the resonance spacing, within which an existing
 /// point stands in for a resonance point.
@@ -46,16 +46,33 @@ const MAX_SPACING_RATIO: f64 = 2.5;
 /// are.
 ///
 /// # Arguments
-/// * `data_energies` — Data energies in eV, sorted ascending.
-/// * `resolution` — The blur; sets how far the grid extends.
+/// * `data_energies` — Data energies in eV, finite, positive and sorted
+///   ascending.
+/// * `resolution` — The blur; sets how far the grid extends and, for a
+///   Gaussian, where quarter-width points go.
 /// * `resonances` — `(E_res, D)` pairs in eV, `D` the resonance's total width.
+///
+/// # Errors
+/// * [`ResolutionError::InvalidEnergy`] — a data energy is not finite and
+///   positive.
+/// * [`ResolutionError::UnsortedEnergies`] — the data energies descend.
 pub fn build_working_grid(
     data_energies: &[f64],
     resolution: &ResolutionFunction,
     resonances: &[(f64, f64)],
-) -> (Vec<f64>, Vec<usize>) {
+) -> Result<(Vec<f64>, Vec<usize>), ResolutionError> {
+    if let Some((index, &value)) = data_energies
+        .iter()
+        .enumerate()
+        .find(|(_, e)| !(e.is_finite() && **e > 0.0))
+    {
+        return Err(ResolutionError::InvalidEnergy { index, value });
+    }
+    if !data_energies.windows(2).all(|w| w[0] <= w[1]) {
+        return Err(ResolutionError::UnsortedEnergies);
+    }
     if data_energies.len() < 2 {
-        return (data_energies.to_vec(), (0..data_energies.len()).collect());
+        return Ok((data_energies.to_vec(), (0..data_energies.len()).collect()));
     }
     let (low, high) = resolution.grid_bounds_ev(data_energies);
     let spacing = match resolution {
@@ -71,13 +88,14 @@ pub fn build_working_grid(
         let points = quarter_width_points(&grid, params);
         merge_points(&mut grid, points);
     }
-    for &(energy, width) in resonances {
-        let points = resonance_points(&grid, energy, width);
-        merge_points(&mut grid, points);
-    }
+    let points = resonances
+        .iter()
+        .flat_map(|&(energy, width)| resonance_points(&grid, energy, width))
+        .collect();
+    merge_points(&mut grid, points);
     grade_spacing(&mut grid);
     let data_indices = build_data_indices(&grid, data_energies);
-    (grid, data_indices)
+    Ok((grid, data_indices))
 }
 
 /// The variable in which the added boundary points are evenly spaced, at the
@@ -165,6 +183,7 @@ fn extend_boundaries(
 
 fn quarter_width_points(grid: &[f64], params: &ResolutionParams) -> Vec<f64> {
     grid.windows(2)
+        .filter(|pair| params.exp_tail_negligible(0.5 * (pair[0] + pair[1])))
         .flat_map(|pair| {
             let (lo, hi) = (pair[0], pair[1]);
             let parts = ((hi - lo) / (0.25 * params.gaussian_width(0.5 * (lo + hi)))).ceil();
@@ -177,8 +196,9 @@ fn quarter_width_points(grid: &[f64], params: &ResolutionParams) -> Vec<f64> {
 /// Points that sample the resonance at `energy` of total width `width`: its
 /// centre and the ends of `[energy − width, energy + width]` within the grid,
 /// and enough points between them and the grid's own points that no interval
-/// there exceeds `FRACTN · width`.  An existing point within
-/// `STAND_IN_FRACTION` of that spacing stands in for a centre or an end.
+/// there exceeds `FRACTN · width`.  A grid point within `STAND_IN_FRACTION` of
+/// that spacing stands in for a centre or an end, and the gap beside it is
+/// filled too.
 /// Returns none when the centre lies off the grid or the grid already holds
 /// `MIN_POINTS_PER_WIDTH` points across the interval.
 ///
@@ -199,14 +219,18 @@ fn resonance_points(grid: &[f64], energy: f64, width: f64) -> Vec<f64> {
     let neighbours = &grid[start.saturating_sub(1)..(end + 1).min(grid.len())];
     let mut anchors = grid[start..end].to_vec();
     let mut points = Vec::new();
-    for e in [lo, energy, hi] {
-        if neighbours
-            .iter()
-            .all(|&g| (g - e).abs() >= STAND_IN_FRACTION * step)
-        {
+    let mut anchor = |e: f64| match neighbours
+        .iter()
+        .find(|&&g| (g - e).abs() < STAND_IN_FRACTION * step)
+    {
+        Some(&g) => anchors.push(g),
+        None => {
             anchors.push(e);
             points.push(e);
         }
+    };
+    for e in [lo, energy, hi] {
+        anchor(e);
     }
     anchors.sort_by(f64::total_cmp);
     for pair in anchors.windows(2) {
@@ -300,7 +324,7 @@ mod tests {
     #[test]
     fn test_empty_grid() {
         let res = ResolutionParams::new(10.0, 0.01, 0.001, 0.0).unwrap();
-        let (ext, indices) = build_working_grid(&[], &gaussian(res), &[]);
+        let (ext, indices) = build_working_grid(&[], &gaussian(res), &[]).unwrap();
         assert!(ext.is_empty());
         assert!(indices.is_empty());
     }
@@ -309,7 +333,7 @@ mod tests {
     fn test_single_point() {
         let energies = vec![100.0];
         let res = ResolutionParams::new(10.0, 0.01, 0.001, 0.0).unwrap();
-        let (ext, indices) = build_working_grid(&energies, &gaussian(res), &[]);
+        let (ext, indices) = build_working_grid(&energies, &gaussian(res), &[]).unwrap();
         assert_eq!(ext, vec![100.0]);
         assert_eq!(indices, vec![0]);
     }
@@ -318,7 +342,7 @@ mod tests {
     fn test_data_indices_roundtrip() {
         let data = vec![1.0, 5.0, 10.0, 100.0];
         let res = ResolutionParams::new(10.0, 0.01, 0.001, 0.0).unwrap();
-        let (ext, indices) = build_working_grid(&data, &gaussian(res), &[]);
+        let (ext, indices) = build_working_grid(&data, &gaussian(res), &[]).unwrap();
         assert!(ext.len() >= data.len());
         for (i, &e) in data.iter().enumerate() {
             assert!(
@@ -334,7 +358,7 @@ mod tests {
     fn test_extension_covers_5sigma() {
         let data: Vec<f64> = (0..20).map(|i| 100.0 + i as f64 * 5.0).collect();
         let res = ResolutionParams::new(10.0, 0.1, 0.01, 0.0).unwrap();
-        let (ext, _) = build_working_grid(&data, &gaussian(res), &[]);
+        let (ext, _) = build_working_grid(&data, &gaussian(res), &[]).unwrap();
 
         assert!(
             ext[0] < data[0],
@@ -352,7 +376,7 @@ mod tests {
     fn test_grid_is_sorted() {
         let data: Vec<f64> = (0..10).map(|i| 1000.0 + i as f64 * 100.0).collect();
         let res = ResolutionParams::new(50.0, 0.05, 0.01, 0.0).unwrap();
-        let (ext, _) = build_working_grid(&data, &gaussian(res), &[]);
+        let (ext, _) = build_working_grid(&data, &gaussian(res), &[]).unwrap();
         for pair in ext.windows(2) {
             assert!(
                 pair[0] < pair[1],
@@ -367,7 +391,7 @@ mod tests {
     fn test_grid_all_positive() {
         let data = vec![1.0, 2.0, 3.0];
         let res = ResolutionParams::new(10.0, 0.1, 0.01, 0.0).unwrap();
-        let (ext, _) = build_working_grid(&data, &gaussian(res), &[]);
+        let (ext, _) = build_working_grid(&data, &gaussian(res), &[]).unwrap();
         for &e in &ext {
             assert!(e > 0.0, "non-positive energy: {e}");
         }
@@ -386,8 +410,8 @@ mod tests {
         let resolution = ResolutionFunction::Tabulated(std::sync::Arc::new(table));
         let resonances = vec![(500.0, 1.0)];
 
-        let (ext_without, _) = build_working_grid(&data, &resolution, &[]);
-        let (ext_with, _) = build_working_grid(&data, &resolution, &resonances);
+        let (ext_without, _) = build_working_grid(&data, &resolution, &[]).unwrap();
+        let (ext_with, _) = build_working_grid(&data, &resolution, &resonances).unwrap();
 
         assert!(
             ext_with.len() > ext_without.len(),
@@ -419,9 +443,27 @@ mod tests {
         .unwrap();
         let resolution = ResolutionFunction::Tabulated(std::sync::Arc::new(table));
 
-        let (ext, indices) = build_working_grid(&data, &resolution, &[(500.0, 1.0)]);
+        let (ext, indices) = build_working_grid(&data, &resolution, &[(500.0, 1.0)]).unwrap();
         for (i, &e) in data.iter().enumerate() {
             assert_eq!(ext[indices[i]], e, "data[{i}] = {e} is not in the grid");
+        }
+    }
+
+    #[test]
+    fn an_energy_that_is_not_finite_and_positive_is_rejected() {
+        let res = ResolutionParams::new(25.0, 0.5, 0.005, 0.0).unwrap();
+        for data in [
+            [1.0, 2.0, 3.0, f64::INFINITY],
+            [0.0, 1.0, 2.0, 3.0],
+            [-1.0, 1.0, 2.0, 3.0],
+        ] {
+            assert!(
+                matches!(
+                    build_working_grid(&data, &gaussian(res), &[]),
+                    Err(ResolutionError::InvalidEnergy { .. })
+                ),
+                "{data:?} must be rejected"
+            );
         }
     }
 
@@ -433,8 +475,8 @@ mod tests {
         let res = ResolutionParams::new(10.0, 0.01, 0.001, 0.0).unwrap();
         let resonances = vec![(500.0, 1.0)];
 
-        let (ext_without, _) = build_working_grid(&data, &gaussian(res), &[]);
-        let (ext_with, _) = build_working_grid(&data, &gaussian(res), &resonances);
+        let (ext_without, _) = build_working_grid(&data, &gaussian(res), &[]).unwrap();
+        let (ext_with, _) = build_working_grid(&data, &gaussian(res), &resonances).unwrap();
 
         assert_eq!(
             ext_without.len(),
@@ -450,7 +492,7 @@ mod tests {
         let res = ResolutionParams::new(10.0, 0.01, 0.001, 0.0).unwrap();
         let resonances = vec![(500.0, 1.0), (520.0, 0.5)];
 
-        let (ext, indices) = build_working_grid(&data, &gaussian(res), &resonances);
+        let (ext, indices) = build_working_grid(&data, &gaussian(res), &resonances).unwrap();
         assert_eq!(indices.len(), data.len());
         for (i, &e) in data.iter().enumerate() {
             assert!(
@@ -469,8 +511,8 @@ mod tests {
         let res = ResolutionParams::new(10.0, 0.01, 0.001, 0.0).unwrap();
         let resonances = vec![(50.0, 1.0), (300.0, 1.0)]; // Both outside [100, 190]
 
-        let (ext_without, _) = build_working_grid(&data, &gaussian(res), &[]);
-        let (ext_with, _) = build_working_grid(&data, &gaussian(res), &resonances);
+        let (ext_without, _) = build_working_grid(&data, &gaussian(res), &[]).unwrap();
+        let (ext_with, _) = build_working_grid(&data, &gaussian(res), &resonances).unwrap();
 
         // May differ slightly due to boundary extension, but the resonance
         // outside the extended range should not add fine-structure.
@@ -552,7 +594,7 @@ mod tests {
         for tenths in 2200..=2300 {
             let e_max = tenths as f64 / 10.0;
             let data: Vec<f64> = (0..400).map(|i| e_max - 40.0 + i as f64 * 0.1).collect();
-            let (grid, _) = build_working_grid(&data, &resolution, &[]);
+            let (grid, _) = build_working_grid(&data, &resolution, &[]).unwrap();
             let added = grid.len() - data.len();
             let tof = |e: f64| TOF_FACTOR * 25.0 / e.sqrt();
             let e_top = data[data.len() - 1];

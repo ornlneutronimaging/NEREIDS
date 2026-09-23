@@ -30,7 +30,6 @@
 //! | HEGA Doppler + Gaussian | tr006 | <3.3% | Doppler method mismatch |
 //! | FGM + HEGA, no Doppler | tr008 | <3.0% | HEGA vs FGM difference |
 //! | FGM + Gauss + Exp tail | tr007, tr047 | <2.9% | Resonance peak sampling |
-//! | FGM + Gauss + Exp, sparse | tr029, tr030 | <2.5% | Sparse grid + exp tail |
 //! | 3-ch fission, unbroadened | tr028, tr018 | <0.1% | Direct R-matrix (exact) |
 //! | 3-ch fission, broadened | tr019 | <1.7% | Resonance peak sampling |
 //! | FGM + Gauss (BL), Ni-58 | tr012, tr041 | <0.1% | Beer-Lambert path (exact) |
@@ -825,10 +824,9 @@ fn test_tr029_ni58_broadened() {
     // Wide range (40-53k eV) with 1032 points — good grid density at lower
     // energies where most resonances live.  Boundary extension improves
     // edge effects.  Error from sparse grid at high energies + Doppler.
-    // Measured: 0.63% mean.
     assert!(
-        result.mean_rel_error < 0.01,
-        "broadened mean error {:.4} > 1%",
+        result.mean_rel_error < 0.001,
+        "broadened mean error {:.4} > 0.1%",
         result.mean_rel_error
     );
 }
@@ -872,10 +870,9 @@ fn test_tr030_ni58_broadened() {
     // via negative spin group).  The exponential tail's relative effect is
     // amplified when few resonances contribute.  Boundary extension helps but
     // exp tail quadrature on coarse grids remains a limitation.
-    // Measured: 2.5% mean.
     assert!(
-        result.mean_rel_error < 0.04,
-        "broadened mean error {:.4} > 4%",
+        result.mean_rel_error < 0.001,
+        "broadened mean error {:.4} > 0.1%",
         result.mean_rel_error
     );
 }
@@ -2240,7 +2237,8 @@ fn validate_broadened_fission(
         .collect();
 
     let (ext_energies, data_indices) = match &instrument {
-        Some(inst) => auxiliary_grid::build_working_grid(&energies, &inst.resolution, &resonances),
+        Some(inst) => auxiliary_grid::build_working_grid(&energies, &inst.resolution, &resonances)
+            .expect("valid working grid"),
         None => (energies.clone(), (0..energies.len()).collect()),
     };
 

@@ -35,17 +35,20 @@ use crate::doppler::DopplerParamsError;
 use crate::reich_moore;
 use crate::resolution::{self, ResolutionError, ResolutionFunction};
 
+type ExtendedGrid = (Vec<f64>, Vec<usize>);
+
 fn build_aux_grid(
     energies: &[f64],
     instrument: Option<&InstrumentParams>,
     resonance_data: &[&ResonanceData],
-) -> Option<(Vec<f64>, Vec<usize>)> {
-    instrument.and_then(|inst| {
-        let resonances = extract_resonance_widths(resonance_data);
-        let (ext_e, di) =
-            crate::auxiliary_grid::build_working_grid(energies, &inst.resolution, &resonances);
-        (ext_e.len() > energies.len()).then_some((ext_e, di))
-    })
+) -> Result<Option<ExtendedGrid>, ResolutionError> {
+    let Some(inst) = instrument else {
+        return Ok(None);
+    };
+    let resonances = extract_resonance_widths(resonance_data);
+    let (ext_e, di) =
+        crate::auxiliary_grid::build_working_grid(energies, &inst.resolution, &resonances)?;
+    Ok((ext_e.len() > energies.len()).then_some((ext_e, di)))
 }
 
 /// Extract (energy_eV, gd_eV) pairs from resonance data for the working
@@ -106,16 +109,6 @@ pub fn resonance_center_energies(resonance_data: &[&ResonanceData]) -> Vec<f64> 
     e
 }
 
-/// Build the unbroadened cross-section vector on the extended/auxiliary grid
-/// from cached data-grid values.
-///
-/// Data-grid positions are copied verbatim from `xs_raw` (the cached
-/// unbroadened σ for this isotope); the auxiliary-only positions (boundary
-/// extension + fine-structure points) are evaluated fresh.  `is_data_point`
-/// marks which extended-grid indices are data-grid points.
-///
-/// This is the cheap reuse of cached XS that the base-XS family relies on: only
-/// the few hundred auxiliary points are recomputed, not the full grid.
 fn build_extended_xs_from_base(
     ext_energies: &[f64],
     data_indices: &[usize],
@@ -210,10 +203,7 @@ pub fn resolution_working_grid(
     instrument: Option<&InstrumentParams>,
     resonance_data: &[&ResonanceData],
 ) -> Result<WorkingGridLayout, TransmissionError> {
-    if instrument.is_some() && !energies.windows(2).all(|w| w[0] <= w[1]) {
-        return Err(ResolutionError::UnsortedEnergies.into());
-    }
-    let ext_grid = build_aux_grid(energies, instrument, resonance_data);
+    let ext_grid = build_aux_grid(energies, instrument, resonance_data)?;
     let (_, layout) = working_grid_layout(energies, ext_grid.as_ref());
     Ok(layout)
 }
@@ -539,13 +529,6 @@ pub fn forward_model(
         return Ok(vec![]);
     }
 
-    // Validate energy grid once before the per-isotope loop so that
-    // resolution broadening can use the presorted (unchecked) path,
-    // avoiding redundant O(N) sort checks per isotope.
-    if instrument.is_some() && !energies.windows(2).all(|w| w[0] <= w[1]) {
-        return Err(ResolutionError::UnsortedEnergies.into());
-    }
-
     // Build auxiliary grid with boundary extension + resonance fine-structure.
     // Collect references to avoid cloning full ResonanceData structs.
     // SAMMY Ref: dat/mdat4.f90 Escale, Fspken, Add_Pnts
@@ -555,7 +538,7 @@ pub fn forward_model(
         .filter(|(_, t)| *t > 0.0)
         .map(|(rd, _)| rd)
         .collect();
-    let ext_grid = build_aux_grid(energies, instrument, &active_rd);
+    let ext_grid = build_aux_grid(energies, instrument, &active_rd)?;
 
     // Compute Doppler-broadened cross-sections for all isotopes in parallel.
     // Resolution is NOT applied here — it must be applied after Beer-Lambert
@@ -692,18 +675,13 @@ pub fn broadened_cross_sections_on_working_grid(
     instrument: Option<&InstrumentParams>,
     cancel: Option<&AtomicBool>,
 ) -> Result<WorkingGridXs, TransmissionError> {
-    // Validate energy grid once before the per-isotope loop.
-    if instrument.is_some() && !energies.windows(2).all(|w| w[0] <= w[1]) {
-        return Err(ResolutionError::UnsortedEnergies.into());
-    }
-
     // Build auxiliary grid with boundary extension + resonance fine-structure.
     // SAMMY extends the energy grid beyond the data range and adds dense points
     // around narrow resonances so the broadening convolution integrals have
     // adequate quadrature points.
     // SAMMY Ref: dat/mdat4.f90 Escale+Fspken+Add_Pnts, dat/mdata.f90 Vqcon
     let rd_refs: Vec<&ResonanceData> = resonance_data.iter().collect();
-    let ext_grid = build_aux_grid(energies, instrument, &rd_refs);
+    let ext_grid = build_aux_grid(energies, instrument, &rd_refs)?;
     let (work_energies, layout) = working_grid_layout(energies, ext_grid.as_ref());
 
     // Parallelize across isotopes — Doppler broadening for each isotope is
@@ -780,12 +758,8 @@ pub fn broadened_cross_sections_for_transmission(
             "thickness_atoms_barn must be finite and > 0, got {thickness_atoms_barn}"
         )));
     }
-    if !energies.windows(2).all(|w| w[0] <= w[1]) {
-        return Err(ResolutionError::UnsortedEnergies.into());
-    }
-
     let rd_refs: Vec<&ResonanceData> = resonance_data.iter().collect();
-    let ext_grid = build_aux_grid(energies, Some(instrument), &rd_refs);
+    let ext_grid = build_aux_grid(energies, Some(instrument), &rd_refs)?;
     let nd = thickness_atoms_barn;
 
     let result: Result<Vec<Vec<f64>>, TransmissionError> = resonance_data
@@ -940,17 +914,9 @@ pub fn broadened_cross_sections_from_base_on_working_grid(
     instrument: Option<&InstrumentParams>,
 ) -> Result<WorkingGridXs, TransmissionError> {
     validate_base_xs(energies, base_xs, resonance_data)?;
-    if instrument.is_some() && !energies.windows(2).all(|w| w[0] <= w[1]) {
-        return Err(ResolutionError::UnsortedEnergies.into());
-    }
 
-    // Build auxiliary grid with boundary extension + resonance fine-structure.
-    // base_xs is on the data grid; we extend it to the aux grid by evaluating
-    // cross-sections at the auxiliary-only points (cheap: only the few hundred
-    // extra points, not the full grid).
-    // SAMMY Ref: dat/mdat4.f90 Escale+Fspken+Add_Pnts
     let rd_refs: Vec<&ResonanceData> = resonance_data.iter().collect();
-    let ext_grid = build_aux_grid(energies, instrument, &rd_refs);
+    let ext_grid = build_aux_grid(energies, instrument, &rd_refs)?;
     let is_data_point = data_point_mask(ext_grid.as_ref());
     let (work_energies, layout) = working_grid_layout(energies, ext_grid.as_ref());
 
@@ -1037,13 +1003,10 @@ pub fn broadened_cross_sections_with_analytical_derivative_from_base_on_working_
     instrument: Option<&InstrumentParams>,
 ) -> Result<WorkingGridXsWithDerivative, TransmissionError> {
     validate_base_xs(energies, base_xs, resonance_data)?;
-    if instrument.is_some() && !energies.windows(2).all(|w| w[0] <= w[1]) {
-        return Err(ResolutionError::UnsortedEnergies.into());
-    }
 
     // Build auxiliary grid (same as broadened_cross_sections_from_base).
     let rd_refs: Vec<&ResonanceData> = resonance_data.iter().collect();
-    let ext_grid = build_aux_grid(energies, instrument, &rd_refs);
+    let ext_grid = build_aux_grid(energies, instrument, &rd_refs)?;
     let is_data_point = data_point_mask(ext_grid.as_ref());
     let (work_energies, layout) = working_grid_layout(energies, ext_grid.as_ref());
 
@@ -1145,16 +1108,10 @@ pub fn forward_model_from_base_xs(
         return Ok(vec![]);
     }
 
-    // Validate the data grid once before the per-isotope loop so resolution can
-    // use the presorted (unchecked) path, matching forward_model.
-    if instrument.is_some() && !energies.windows(2).all(|w| w[0] <= w[1]) {
-        return Err(ResolutionError::UnsortedEnergies.into());
-    }
-
     // Build the auxiliary extended grid (boundary + resonance fine-structure).
     // SAMMY Ref: dat/mdat4.f90 Escale+Fspken+Add_Pnts.
     let rd_refs: Vec<&ResonanceData> = resonance_data.iter().collect();
-    let ext_grid = build_aux_grid(energies, instrument, &rd_refs);
+    let ext_grid = build_aux_grid(energies, instrument, &rd_refs)?;
     let is_data_point: Option<Vec<bool>> = ext_grid.as_ref().map(|(ext_e, di)| {
         let mut mask = vec![false; ext_e.len()];
         for &idx in di {

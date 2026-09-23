@@ -95,7 +95,10 @@ pub enum ResolutionError {
     /// The energy grid is not sorted in ascending order.
     UnsortedEnergies,
     /// The energy grid and data arrays have mismatched lengths.
-    LengthMismatch { energies: usize, data: usize },
+    LengthMismatch {
+        energies: usize,
+        data: usize,
+    },
     /// A [`ResolutionPlan`] was passed together with an `energies`
     /// slice that does not match the grid the plan was built for.
     ///
@@ -105,17 +108,29 @@ pub enum ResolutionError {
     /// mismatch fires `PlanGridMismatch` with the index of the first
     /// differing element so callers can diagnose silent-staleness
     /// bugs at the cache layer.
-    PlanGridMismatch { first_diff_index: usize },
+    PlanGridMismatch {
+        first_diff_index: usize,
+    },
     /// A [`ResolutionMatrix`] was passed together with an `energies`
     /// slice that does not match the grid the matrix was compiled for.
     /// Same semantics as [`Self::PlanGridMismatch`] but for the CSR
     /// path (see [`apply_r`]).
-    MatrixGridMismatch { first_diff_index: usize },
+    MatrixGridMismatch {
+        first_diff_index: usize,
+    },
     /// [`TabulatedResolution::width_corrected`] was called with invalid
     /// parameters: `s0` must be finite and `> 0`, `e_ref` finite and `> 0`,
     /// and `p` finite. A non-positive `s0` would reverse/collapse the
     /// (ascending) offset ordering the broadening loop assumes.
-    InvalidWidthCorrection { s0: f64, p: f64, e_ref: f64 },
+    InvalidWidthCorrection {
+        s0: f64,
+        p: f64,
+        e_ref: f64,
+    },
+    InvalidEnergy {
+        index: usize,
+        value: f64,
+    },
 }
 
 impl fmt::Display for ResolutionError {
@@ -146,6 +161,10 @@ impl fmt::Display for ResolutionError {
                 f,
                 "width_corrected requires finite s0 > 0, finite e_ref > 0, and finite p; \
                  got s0={s0}, p={p}, e_ref={e_ref}"
+            ),
+            Self::InvalidEnergy { index, value } => write!(
+                f,
+                "energy grid entry {index} is {value}; every energy must be finite and positive"
             ),
         }
     }
@@ -355,6 +374,13 @@ impl ResolutionParams {
             return 0.0;
         }
         2.0 * self.delta_e_us * energy_ev.powf(1.5) / (TOF_FACTOR * self.flight_path_m)
+    }
+
+    #[must_use]
+    pub(crate) fn exp_tail_negligible(&self, energy_ev: f64) -> bool {
+        let widexp = self.exp_width(energy_ev);
+        widexp <= NEAR_ZERO_FLOOR
+            || self.gaussian_width(energy_ev) / (2.0 * widexp) > EXP_TAIL_NEGLIGIBLE_C
     }
 
     /// Gaussian resolution width W_g(E) in eV — the W of `exp(-x²/W_g²)`.
@@ -799,8 +825,7 @@ pub(crate) fn resolution_broaden_presorted(
         // Per-energy decision: use combined kernel only when the exp tail
         // is significant at THIS energy.
         let widexp = params.exp_width(e);
-        let use_combined =
-            widexp > NEAR_ZERO_FLOOR && widgau / (2.0 * widexp) <= EXP_TAIL_NEGLIGIBLE_C;
+        let use_combined = !params.exp_tail_negligible(e);
 
         // Compute integration limits.
         let (e_low, e_high) = if use_combined {
