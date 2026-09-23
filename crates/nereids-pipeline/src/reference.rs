@@ -44,7 +44,7 @@ impl Instrument {
     /// energy.
     pub fn expected_counts(
         &self,
-        beam: &(dyn Fn(f64) -> f64 + Sync),
+        beam: &dyn Fn(f64) -> f64,
         transmission: &dyn Fn(&[f64]) -> Vec<f64>,
         energy_range_ev: (f64, f64),
         step_us: f64,
@@ -99,24 +99,28 @@ impl Instrument {
             t.iter().all(|v| (0.0..=1.0).contains(v)),
             "transmission must lie in [0, 1]"
         );
+        let phi: Vec<f64> = energies.iter().map(|&e| beam(e)).collect();
+        if let Some((&e, &p)) = energies
+            .iter()
+            .zip(&phi)
+            .find(|(_, p)| !(p.is_finite() && **p >= 0.0))
+        {
+            panic!("the beam must be finite and non-negative, got {p} at {e} eV");
+        }
 
         let n_bins = self.time_edges_us.len() - 1;
         let partials: Vec<Vec<f64>> = energies
             .par_chunks(CHUNK)
             .zip(t.par_chunks(CHUNK))
+            .zip(phi.par_chunks(CHUNK))
             .enumerate()
-            .map(|(chunk, (es, ts))| {
+            .map(|(chunk, ((es, ts), phis))| {
                 let mut acc = vec![0.0; n_bins];
-                for (i, (&e, &t_e)) in es.iter().zip(ts).enumerate() {
+                for (i, ((&e, &t_e), &phi_e)) in es.iter().zip(ts).zip(phis).enumerate() {
                     let j = chunk * CHUNK + i;
                     let weight = if j == 0 || j == steps { 0.5 * h } else { h };
-                    let phi = beam(e);
-                    assert!(
-                        phi.is_finite() && phi >= 0.0,
-                        "the beam must be finite and non-negative, got {phi} at {e} eV"
-                    );
                     let u = kl / e.sqrt();
-                    let density = weight * phi * t_e * 2.0 * e / u;
+                    let density = weight * phi_e * t_e * 2.0 * e / u;
                     for (a, p) in acc.iter_mut().zip(probabilities(e)) {
                         *a += density * p;
                     }
