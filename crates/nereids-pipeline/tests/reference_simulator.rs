@@ -89,12 +89,8 @@ fn triangle_mean_us() -> f64 {
 
 fn removed(instrument: &Instrument) -> (f64, f64) {
     let range = (energy(560.0), energy(300.0));
-    let o = instrument
-        .expected_counts(&beam, &open, range, STEP_US)
-        .expect("counts");
-    let s = instrument
-        .expected_counts(&beam, &band, range, STEP_US)
-        .expect("counts");
+    let o = instrument.expected_counts(&beam, &open, range, STEP_US);
+    let s = instrument.expected_counts(&beam, &band, range, STEP_US);
     let edges = &instrument.time_edges_us;
     let (mut total, mut moment) = (0.0, 0.0);
     for k in 0..edges.len() - 1 {
@@ -112,9 +108,8 @@ fn a_beam_uniform_in_flight_time_fills_every_bin_in_proportion_to_its_width() {
         ("ikeda-carpenter", ikeda_carpenter()),
     ] {
         let instrument = instrument(resolution, FLIGHT_PATH_M, T0_US);
-        let result = instrument
-            .expected_counts(&beam, &open, (energy(560.0), energy(250.0)), STEP_US)
-            .expect("counts");
+        let result =
+            instrument.expected_counts(&beam, &open, (energy(560.0), energy(250.0)), STEP_US);
         assert!(
             result.edge_probability.iter().all(|&p| p < 1.0e-12),
             "{label}: neutrons beyond the integrated energies reach the bins: {:?}",
@@ -147,12 +142,10 @@ fn a_black_band_removes_the_beam_it_covers_where_it_arrives() {
 #[test]
 fn t0_delays_every_count_by_the_same_time() {
     let range = (energy(560.0), energy(300.0));
-    let early = instrument(triangle(), FLIGHT_PATH_M, T0_US)
-        .expected_counts(&beam, &band, range, STEP_US)
-        .expect("counts");
+    let early =
+        instrument(triangle(), FLIGHT_PATH_M, T0_US).expected_counts(&beam, &band, range, STEP_US);
     let late = instrument(triangle(), FLIGHT_PATH_M, T0_US + 1.0)
-        .expected_counts(&beam, &band, range, STEP_US)
-        .expect("counts");
+        .expected_counts(&beam, &band, range, STEP_US);
     for k in 1..late.counts.len() {
         assert!(
             (late.counts[k] - early.counts[k - 1]).abs() <= 1.0e-9 * early.counts[k - 1],
@@ -173,4 +166,56 @@ fn the_flight_path_sets_where_the_band_arrives() {
         (centroid - expected).abs() <= 1.0e-3,
         "over {longer} m the removed counts centre at {centroid} µs, not {expected} µs"
     );
+}
+
+#[test]
+fn transmission_sees_ascending_energies_and_the_low_edge_is_first() {
+    let ascending = |e: &[f64]| {
+        assert!(
+            e.windows(2).all(|w| w[0] < w[1]),
+            "transmission was handed energies out of order"
+        );
+        open(e)
+    };
+    let result = instrument(triangle(), FLIGHT_PATH_M, T0_US).expected_counts(
+        &beam,
+        &ascending,
+        (energy(450.0), energy(300.0)),
+        STEP_US,
+    );
+    assert!(
+        result.edge_probability[0] > 0.5 && result.edge_probability[1] == 0.0,
+        "a neutron at 450 µs lands in the bins and one at 300 µs does not, got {:?}",
+        result.edge_probability
+    );
+}
+
+#[test]
+#[should_panic(expected = "one value per energy")]
+fn a_transmission_of_the_wrong_length_is_refused() {
+    let short = |e: &[f64]| vec![1.0; e.len() / 2];
+    instrument(triangle(), FLIGHT_PATH_M, T0_US).expected_counts(
+        &beam,
+        &short,
+        (energy(560.0), energy(300.0)),
+        STEP_US,
+    );
+}
+
+#[test]
+fn repeated_calls_give_identical_counts() {
+    let instrument = instrument(ikeda_carpenter(), FLIGHT_PATH_M, T0_US);
+    let range = (energy(560.0), energy(250.0));
+    let first = instrument.expected_counts(&beam, &band, range, STEP_US);
+    for _ in 0..5 {
+        let again = instrument.expected_counts(&beam, &band, range, STEP_US);
+        assert!(
+            first
+                .counts
+                .iter()
+                .zip(&again.counts)
+                .all(|(a, b)| a.to_bits() == b.to_bits()),
+            "the same call returned different counts"
+        );
+    }
 }
