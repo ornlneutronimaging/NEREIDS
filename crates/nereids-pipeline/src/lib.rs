@@ -17,7 +17,6 @@ pub mod detectability;
 pub mod error;
 pub mod joint_fit;
 pub mod pipeline;
-pub mod spatial;
 /// Synthetic counts-domain measurements with known ground truth, for tests.
 ///
 /// Gated on the `test-support` feature ALONE, not on `cfg(test)` as well.
@@ -26,5 +25,8 @@ pub mod spatial;
 /// off — it happens to build today only because the self dev-dependency
 /// unifies the feature across the package, which is not something to rely
 /// on. Never built into a release.
+#[cfg(feature = "test-support")]
+pub mod reference;
+pub mod spatial;
 #[cfg(feature = "test-support")]
 pub mod synthetic;
