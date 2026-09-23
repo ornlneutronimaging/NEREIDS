@@ -51,18 +51,16 @@ const GAUSS_WEIGHTS: [f64; 4] = [
 
 const WEIGHT_TOLERANCE: f64 = 1e-10;
 
-const MAX_HALVINGS: usize = 40;
-
 #[derive(Debug)]
 pub enum BinWeightsError {
     /// The calculation energies are not finite, positive and strictly
     /// ascending, or there are fewer than two.
     InvalidEnergies,
-    /// The resolution rejected an energy, the time edges or `t0`.
+    /// The time edges are not finite and strictly ascending, or there are
+    /// fewer than two.
+    InvalidTimeEdges,
+    /// The resolution rejected an energy or `t0`.
     Resolution(ResolutionParseError),
-    /// The weights of the piece between these energies did not reach the
-    /// tolerance within the allowed halvings.
-    NotConverged { low_ev: f64, high_ev: f64 },
 }
 
 impl fmt::Display for BinWeightsError {
@@ -72,11 +70,11 @@ impl fmt::Display for BinWeightsError {
                 f,
                 "calculation energies must be at least two, finite, positive and strictly ascending"
             ),
-            Self::Resolution(e) => write!(f, "resolution: {e}"),
-            Self::NotConverged { low_ev, high_ev } => write!(
+            Self::InvalidTimeEdges => write!(
                 f,
-                "bin weights between {low_ev} and {high_ev} eV did not converge"
+                "time edges must be at least two, finite and strictly ascending"
             ),
+            Self::Resolution(e) => write!(f, "resolution: {e}"),
         }
     }
 }
@@ -113,9 +111,9 @@ impl BinWeights {
     /// over its own flight path.
     ///
     /// # Errors
-    /// [`BinWeightsError`] for invalid energies, a resolution that rejects
-    /// its inputs (a Gaussian resolution always does), or a piece whose
-    /// weights do not converge.
+    /// [`BinWeightsError`] for invalid energies or time edges, or a
+    /// resolution that rejects its inputs (a Gaussian resolution always
+    /// does).
     pub fn new(
         energies: &[f64],
         time_edges_us: &[f64],
@@ -127,6 +125,12 @@ impl BinWeights {
             || energies.windows(2).any(|w| w[0] >= w[1])
         {
             return Err(BinWeightsError::InvalidEnergies);
+        }
+        if time_edges_us.len() < 2
+            || time_edges_us.iter().any(|t| !t.is_finite())
+            || time_edges_us.windows(2).any(|w| w[0] >= w[1])
+        {
+            return Err(BinWeightsError::InvalidTimeEdges);
         }
         let n_bins = time_edges_us.len().saturating_sub(1);
         let narrowest_bin_us = time_edges_us
@@ -141,13 +145,9 @@ impl BinWeights {
             .par_windows(2)
             .map(|pair| {
                 let (u_short, u_long) = (kl / pair[1].sqrt(), kl / pair[0].sqrt());
-                match integrate_piece(&probabilities, u_short, u_long, narrowest_bin_us, n_bins)? {
-                    Some([to_lower, to_upper]) => Ok((sparse(&to_lower), sparse(&to_upper))),
-                    None => Err(BinWeightsError::NotConverged {
-                        low_ev: pair[0],
-                        high_ev: pair[1],
-                    }),
-                }
+                let [to_lower, to_upper] =
+                    integrate_piece(&probabilities, u_short, u_long, narrowest_bin_us, n_bins)?;
+                Ok((sparse(&to_lower), sparse(&to_upper)))
             })
             .collect::<Result<_, BinWeightsError>>()?;
 
@@ -229,60 +229,52 @@ fn integrate_piece(
     u_long: f64,
     narrowest_bin_us: f64,
     n_bins: usize,
-) -> Result<Option<[Vec<f64>; 2]>, ResolutionParseError> {
+) -> Result<[Vec<f64>; 2], ResolutionParseError> {
     let length = u_long - u_short;
     let mut total = [vec![0.0; n_bins], vec![0.0; n_bins]];
     let parts = (length / narrowest_bin_us).ceil().max(1.0) as usize;
     let part = length / parts as f64;
-    let mut stack: Vec<(f64, f64, usize)> = (0..parts)
-        .map(|i| {
-            (
-                u_short + part * i as f64,
-                u_short + part * (i + 1) as f64,
-                0,
-            )
-        })
-        .collect();
-    while let Some((a, b, halvings)) = stack.pop() {
-        let (centre, half) = (0.5 * (a + b), 0.5 * (b - a));
-        let mut kronrod = [vec![0.0; n_bins], vec![0.0; n_bins]];
-        let mut gauss = [vec![0.0; n_bins], vec![0.0; n_bins]];
-        for (i, &x) in KRONROD_NODES.iter().enumerate() {
-            let nodes = if x == 0.0 { 1 } else { 2 };
-            for u in [centre - half * x, centre + half * x]
-                .into_iter()
-                .take(nodes)
-            {
-                let row = probabilities(u)?;
-                let share = (u - u_short) / length;
-                for (k, &p) in row.iter().enumerate() {
-                    for (side, part) in [share * p, (1.0 - share) * p].into_iter().enumerate() {
-                        kronrod[side][k] += KRONROD_WEIGHTS[i] * part;
-                        if i % 2 == 1 {
-                            gauss[side][k] += GAUSS_WEIGHTS[i / 2] * part;
+    for i in 0..parts {
+        let mut stack = vec![(u_short + part * i as f64, u_short + part * (i + 1) as f64)];
+        while let Some((a, b)) = stack.pop() {
+            let (centre, half) = (0.5 * (a + b), 0.5 * (b - a));
+            let mut kronrod = [vec![0.0; n_bins], vec![0.0; n_bins]];
+            let mut gauss = [vec![0.0; n_bins], vec![0.0; n_bins]];
+            for (i, &x) in KRONROD_NODES.iter().enumerate() {
+                let nodes = if x == 0.0 { 1 } else { 2 };
+                for u in [centre - half * x, centre + half * x]
+                    .into_iter()
+                    .take(nodes)
+                {
+                    let row = probabilities(u)?;
+                    let share = (u - u_short) / length;
+                    for (k, &p) in row.iter().enumerate() {
+                        for (side, part) in [share * p, (1.0 - share) * p].into_iter().enumerate() {
+                            kronrod[side][k] += KRONROD_WEIGHTS[i] * part;
+                            if i % 2 == 1 {
+                                gauss[side][k] += GAUSS_WEIGHTS[i / 2] * part;
+                            }
                         }
                     }
                 }
             }
-        }
-        let error = half
-            * kronrod
-                .iter()
-                .zip(&gauss)
-                .flat_map(|(kr, g)| kr.iter().zip(g).map(|(kr, g)| (kr - g).abs()))
-                .sum::<f64>();
-        if error <= WEIGHT_TOLERANCE * (b - a) {
-            for (sum, part) in total.iter_mut().zip(&kronrod) {
-                for (s, p) in sum.iter_mut().zip(part) {
-                    *s += half * p;
+            let error = half
+                * kronrod
+                    .iter()
+                    .zip(&gauss)
+                    .flat_map(|(kr, g)| kr.iter().zip(g).map(|(kr, g)| (kr - g).abs()))
+                    .sum::<f64>();
+            if error <= WEIGHT_TOLERANCE * (b - a) || b - a <= WEIGHT_TOLERANCE * length {
+                for (sum, part) in total.iter_mut().zip(&kronrod) {
+                    for (s, p) in sum.iter_mut().zip(part) {
+                        *s += half * p;
+                    }
                 }
+            } else {
+                stack.push((a, centre));
+                stack.push((centre, b));
             }
-        } else if halvings < MAX_HALVINGS {
-            stack.push((a, centre, halvings + 1));
-            stack.push((centre, b, halvings + 1));
-        } else {
-            return Ok(None);
         }
     }
-    Ok(Some(total))
+    Ok(total)
 }

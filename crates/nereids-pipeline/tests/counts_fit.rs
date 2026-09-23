@@ -6,7 +6,9 @@ use nereids_physics::continuous_doppler;
 use nereids_physics::ikeda_carpenter::{
     EnergyLaw, IkedaCarpenter, IkedaCarpenterParams, SynthesisGrid,
 };
-use nereids_physics::resolution::{ResolutionFunction, ResolutionParams, TOF_FACTOR};
+use nereids_physics::resolution::{
+    ResolutionFunction, ResolutionParams, TOF_FACTOR, TabulatedResolution,
+};
 use nereids_pipeline::counts_fit::{
     ACCURACY, Calibration, CountsFit, Measurement, Value, fit_counts,
 };
@@ -29,7 +31,7 @@ fn energy(flight_time_us: f64) -> f64 {
     (TOF_FACTOR * FLIGHT_PATH_M / flight_time_us).powi(2)
 }
 
-fn resolution() -> ResolutionFunction {
+fn ikeda_carpenter() -> ResolutionFunction {
     ResolutionFunction::IkedaCarpenter(Arc::new(
         IkedaCarpenter::new(
             IkedaCarpenterParams {
@@ -51,11 +53,23 @@ fn resolution() -> ResolutionFunction {
     ))
 }
 
-fn calibration() -> Calibration {
+fn triangle() -> ResolutionFunction {
+    let kernel = (vec![-1.0, 0.0, 3.0], vec![0.0, 1.0, 0.0]);
+    ResolutionFunction::Tabulated(Arc::new(
+        TabulatedResolution::from_kernels(
+            vec![1.0, 200.0],
+            vec![kernel.clone(), kernel],
+            FLIGHT_PATH_M,
+        )
+        .expect("valid table"),
+    ))
+}
+
+fn calibration(resolution: ResolutionFunction) -> Calibration {
     Calibration {
         flight_path_m: FLIGHT_PATH_M,
         t0_us: T0_US,
-        resolution: resolution(),
+        resolution,
     }
 }
 
@@ -69,18 +83,27 @@ fn beam_with_dip(u: f64) -> f64 {
 }
 
 struct Truth {
+    resolution: ResolutionFunction,
     edges: Vec<f64>,
     open: Vec<f64>,
     sample: Vec<f64>,
 }
 
 fn simulate(beam_per_us: fn(f64) -> f64, isotope: &ResonanceData) -> Truth {
+    simulate_with(ikeda_carpenter(), beam_per_us, isotope)
+}
+
+fn simulate_with(
+    resolution: ResolutionFunction,
+    beam_per_us: fn(f64) -> f64,
+    isotope: &ResonanceData,
+) -> Truth {
     let edges: Vec<f64> = (FIRST_EDGE_US..=LAST_EDGE_US).map(f64::from).collect();
     let instrument = Instrument {
         time_edges_us: edges.clone(),
         flight_path_m: FLIGHT_PATH_M,
         t0_us: T0_US,
-        resolution: resolution(),
+        resolution: resolution.clone(),
     };
     let per_ev = |e: f64| {
         let u = TOF_FACTOR * FLIGHT_PATH_M / e.sqrt();
@@ -104,6 +127,7 @@ fn simulate(beam_per_us: fn(f64) -> f64, isotope: &ResonanceData) -> Truth {
         );
     }
     Truth {
+        resolution,
         edges,
         open: open.counts,
         sample: sample.counts,
@@ -120,7 +144,7 @@ fn fitted(truth: &Truth, isotope: &ResonanceData, density: Value, temperature: V
             isotopes: vec![(isotope.clone(), density)],
             temperature_k: temperature,
         },
-        &calibration(),
+        &calibration(truth.resolution.clone()),
     )
     .expect("fit")
 }
@@ -194,6 +218,16 @@ fn density_temperature_and_both_are_recovered_from_simulated_counts() {
 }
 
 #[test]
+fn the_calculation_points_reach_as_far_as_the_pulse_does() {
+    let isotope =
+        synthetic_isotope_multi(72, 178, &[(energy(345.0), 0.05, 0.06), (20.0, 0.02, 0.06)]);
+    let truth = simulate_with(triangle(), log_quadratic_beam, &isotope);
+    let (density, temperature) = (Value::Fitted(0.5 * DENSITY), Value::Fitted(200.0));
+    let fit = fitted(&truth, &isotope, density, temperature);
+    assert_recovered(&fit, density, temperature);
+}
+
+#[test]
 fn the_points_are_doubled_until_the_counts_stop_moving() {
     let isotope = synthetic_isotope(72, 178, 20.0, 0.02, 0.06);
     let truth = simulate(log_quadratic_beam, &isotope);
@@ -256,6 +290,7 @@ fn the_reported_errors_match_the_scatter_of_repeated_measurements() {
     let (mut density_pulls, mut temperature_pulls) = (Vec::new(), Vec::new());
     for _ in 0..DRAWS {
         let noisy = Truth {
+            resolution: truth.resolution.clone(),
             edges: truth.edges.clone(),
             open: draw(&truth.open),
             sample: draw(&truth.sample),
@@ -307,7 +342,7 @@ fn a_gaussian_resolution_cannot_describe_counts_in_time_bins() {
             resolution: ResolutionFunction::Gaussian(
                 ResolutionParams::new(FLIGHT_PATH_M, 0.5, 0.005, 0.0).expect("valid"),
             ),
-            ..calibration()
+            ..calibration(ikeda_carpenter())
         },
     );
     assert!(matches!(result, Err(PipelineError::BinWeights(_))));
@@ -331,7 +366,7 @@ fn a_temperature_the_counts_cannot_show_is_refused() {
                 isotopes: vec![(isotope.clone(), density)],
                 temperature_k: temperature,
             },
-            &calibration(),
+            &calibration(ikeda_carpenter()),
         );
         assert!(
             matches!(result, Err(PipelineError::InvalidParameter(_))),

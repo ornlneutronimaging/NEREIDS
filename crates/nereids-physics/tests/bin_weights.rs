@@ -49,6 +49,13 @@ fn energy_independent_pulses() -> Vec<(&'static str, ResolutionFunction, f64)> {
         FLIGHT_PATH_M,
     )
     .expect("valid table");
+    let single = (vec![0.0], vec![1.0]);
+    let single_sample = TabulatedResolution::from_kernels(
+        vec![1.0, 100.0],
+        vec![single.clone(), single],
+        FLIGHT_PATH_M,
+    )
+    .expect("valid table");
     vec![
         (
             "Ikeda–Carpenter",
@@ -59,6 +66,11 @@ fn energy_independent_pulses() -> Vec<(&'static str, ResolutionFunction, f64)> {
             "triangle",
             ResolutionFunction::Tabulated(Arc::new(tabulated)),
             TRIANGLE.iter().sum::<f64>() / 3.0,
+        ),
+        (
+            "single sample",
+            ResolutionFunction::Tabulated(Arc::new(single_sample)),
+            0.0,
         ),
     ]
 }
@@ -98,7 +110,7 @@ fn beams_straight_in_flight_time_fill_each_bin_exactly_however_coarse_the_points
 }
 
 #[test]
-fn a_gaussian_resolution_has_no_bin_weights() {
+fn a_gaussian_resolution_or_an_empty_bin_has_no_bin_weights() {
     let gaussian = ResolutionFunction::Gaussian(
         ResolutionParams::new(FLIGHT_PATH_M, 0.5, 0.005, 0.0).expect("valid"),
     );
@@ -106,5 +118,10 @@ fn a_gaussian_resolution_has_no_bin_weights() {
     assert!(matches!(
         BinWeights::new(&energies, &[400.0, 401.0], T0_US, &gaussian),
         Err(BinWeightsError::Resolution(_))
+    ));
+    let (_, triangle, _) = energy_independent_pulses().swap_remove(1);
+    assert!(matches!(
+        BinWeights::new(&energies, &[400.0, 400.0, 401.0], T0_US, &triangle),
+        Err(BinWeightsError::InvalidTimeEdges)
     ));
 }

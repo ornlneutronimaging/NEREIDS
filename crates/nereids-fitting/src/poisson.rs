@@ -10,15 +10,11 @@
 //! using a projected damped Gauss-Newton / Fisher optimizer with
 //! backtracking line search and finite-difference fallback.
 //!
-//! **Scope note.** The production pipeline does not apply this single-arm
-//! objective to normalized transmission. Raw open/sample counts use the
-//! joint-Poisson conditional-binomial-deviance solver in
-//! [`crate::joint_poisson`]. This module remains available to the
-//! `evaluate_jacobian_and_fisher` Fisher-information helper (via
-//! [`CountsModel`], [`CountsBackgroundScaleModel`] and
-//! [`TransmissionKLBackgroundModel`], all three of which that helper still
-//! constructs) and to spatial-regularization research drivers; it is not a
-//! public transmission fitting route.
+//! Used by `nereids_pipeline::counts_fit` to fit open-beam and sample counts
+//! jointly, by the `evaluate_jacobian_and_fisher` Fisher-information helper
+//! through [`CountsModel`], [`CountsBackgroundScaleModel`] and
+//! [`TransmissionKLBackgroundModel`], and by spatial-regularization research
+//! drivers.
 //!
 //! ## TRINIDI Reference
 //! - `trinidi/reconstruct.py` — Poisson NLL and APGM optimizer

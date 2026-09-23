@@ -4,8 +4,8 @@ use nereids_fitting::lm::FitModel;
 use nereids_fitting::parameters::{FitParameter, ParameterSet};
 use nereids_fitting::poisson::{PoissonConfig, poisson_fit};
 use nereids_fitting::two_run::{OpenBeamModel, Points, TwoRunModel};
-use nereids_physics::auxiliary_grid::{build_extended_grid_for, with_resonance_points};
-use nereids_physics::bin_weights::BinWeights;
+use nereids_physics::auxiliary_grid::with_resonance_points;
+use nereids_physics::bin_weights::{BinWeights, BinWeightsError};
 use nereids_physics::resolution::{ResolutionFunction, TOF_FACTOR};
 use nereids_physics::transmission::extract_resonance_widths;
 
@@ -48,7 +48,8 @@ impl Value {
     }
 }
 
-/// An open-beam run and a sample run recorded in the same time bins.
+/// An open-beam run and a sample run recorded in the same time bins, each
+/// counting neutrons alone: the fit has no background term.
 pub struct Measurement {
     /// Time-bin edges in µs, strictly ascending.
     pub time_edges_us: Vec<f64>,
@@ -63,7 +64,7 @@ pub struct Measurement {
 }
 
 /// The energy scale and the resolution: a neutron of energy `E` arrives at
-/// `t0_us + TOF_FACTOR · flight_path_m / √E` plus a delay drawn from
+/// `t0_us + TOF_FACTOR · flight_path_m / √E` plus an offset drawn from
 /// `resolution`.
 pub struct Calibration {
     pub flight_path_m: f64,
@@ -101,9 +102,9 @@ pub struct CountsFit {
 ///
 /// # Errors
 /// [`PipelineError::InvalidParameter`] for invalid inputs,
-/// [`PipelineError::BinWeights`] when the resolution rejects the time bins or
-/// an energy (a Gaussian resolution always does) or the bin weights do not
-/// converge,
+/// [`PipelineError::ShapeMismatch`] when a run's counts do not match the time
+/// bins, [`PipelineError::BinWeights`] when the resolution rejects an energy
+/// (a Gaussian resolution always does),
 /// [`PipelineError::Fitting`] when the model cannot be evaluated, and
 /// [`PipelineError::PointsNotConverged`] when doubling the points does not
 /// reach [`ACCURACY`].
@@ -119,12 +120,7 @@ pub fn fit_counts(
     let edges = &measurement.time_edges_us;
     let t0 = calibration.t0_us;
     let kl = TOF_FACTOR * calibration.flight_path_m;
-    let edge_energies: Vec<f64> = edges
-        .iter()
-        .rev()
-        .map(|t| (kl / (t - t0)).powi(2))
-        .collect();
-    let (base, _) = build_extended_grid_for(&edge_energies, &resolution);
+    let base = reach(edges, t0, &resolution)?;
     let weights_at = |grid: &[f64]| BinWeights::new(grid, edges, t0, &resolution);
 
     let base_weights = weights_at(&base)?;
@@ -286,6 +282,15 @@ fn validate(measurement: &Measurement, calibration: &Calibration) -> Result<(), 
     {
         return invalid("densities and the temperature must be finite and non-negative".into());
     }
+    let isotopes: Vec<&ResonanceData> = measurement.isotopes.iter().map(|i| &i.0).collect();
+    if let Some((energy, width)) = extract_resonance_widths(&isotopes)
+        .into_iter()
+        .find(|(_, width)| !width.is_finite())
+    {
+        return invalid(format!(
+            "the resonance at {energy} eV has a width of {width}"
+        ));
+    }
     if let Value::Fitted(t) = measurement.temperature_k {
         let (low, high) = TEMPERATURE_BOUNDS_K;
         if !(low..=high).contains(&t) {
@@ -304,6 +309,49 @@ fn validate(measurement: &Measurement, calibration: &Calibration) -> Result<(), 
         }
     }
     Ok(())
+}
+
+fn reach(
+    edges: &[f64],
+    t0: f64,
+    resolution: &ResolutionFunction,
+) -> Result<Vec<f64>, PipelineError> {
+    let kl = TOF_FACTOR * resolution.flight_path_m();
+    let recorded = |u: f64| -> Result<bool, PipelineError> {
+        let probabilities = resolution
+            .detector_bin_probabilities((kl / u).powi(2), edges, t0)
+            .map_err(BinWeightsError::from)?;
+        Ok(probabilities.iter().any(|&p| p > 0.0))
+    };
+    let flight_times: Vec<f64> = edges.iter().map(|t| t - t0).collect();
+    let n = flight_times.len();
+    let mut earlier = Vec::new();
+    let step = flight_times[1] - flight_times[0];
+    let mut u = flight_times[0] - step;
+    while u > 0.0 {
+        earlier.push(u);
+        if !recorded(u)? {
+            break;
+        }
+        u -= step;
+    }
+    let mut later = Vec::new();
+    let step = flight_times[n - 1] - flight_times[n - 2];
+    let mut u = flight_times[n - 1] + step;
+    loop {
+        later.push(u);
+        if !recorded(u)? {
+            break;
+        }
+        u += step;
+    }
+    Ok(later
+        .iter()
+        .rev()
+        .chain(flight_times.iter().rev())
+        .chain(&earlier)
+        .map(|u| (kl / u).powi(2))
+        .collect())
 }
 
 fn fit_beam(
@@ -347,10 +395,16 @@ fn fit_beam(
     };
     let mut current = fit(&BeamSpline::constant(window_us.0, window_us.1, per_us))?;
     let mut best = current.clone();
-    while !within_noise(&current) && current.0.refined().coefficients().len() <= open_counts.len() {
+    let mut since_best = 0;
+    while !within_noise(&current)
+        && since_best < 2
+        && current.0.refined().coefficients().len() <= open_counts.len()
+    {
         current = fit(&current.0.refined())?;
+        since_best += 1;
         if criterion(&current) < criterion(&best) {
             best = current.clone();
+            since_best = 0;
         }
     }
     Ok(best.0)
@@ -419,8 +473,7 @@ fn noise_norm(counts: &[f64], expected: &[f64]) -> f64 {
     counts
         .iter()
         .zip(expected)
-        .filter(|(_, n)| **n > 0.0)
-        .map(|(c, n)| c * c / n)
+        .map(|(c, n)| if *c == 0.0 { 0.0 } else { c * c / n })
         .sum::<f64>()
         .sqrt()
 }

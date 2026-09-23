@@ -4,6 +4,7 @@
 //!
 //! ## Modules
 //! - [`active_mask`] — Active-bin masking for fit-energy-range restriction
+//! - [`beam`] — The beam as a cubic spline of its logarithm in log flight time
 //! - [`error`] — Error types for the fitting crate
 //! - [`forward_model`] — Solver-agnostic forward model trait
 //! - [`joint_poisson`] — Joint-Poisson profile binomial deviance (counts path)
@@ -12,6 +13,7 @@
 //! - [`parameters`] — Fit parameter types, bounds, constraints
 //! - [`poisson`] — Poisson-likelihood optimizer for low-count data
 //! - [`transmission_model`] — Transmission forward model adapter for fitting
+//! - [`two_run`] — Expected open-beam and sample counts at calculation points
 //!
 //! ## SAMMY Reference
 //! - Fitting: `fit/` module, `fitAPI/`, manual Sec. IV

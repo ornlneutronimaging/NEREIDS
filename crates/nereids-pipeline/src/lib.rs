@@ -7,6 +7,7 @@
 //!
 //! ## Modules
 //! - [`calibration`] — Energy calibration for TOF neutron instruments (t0 + flight-path scale)
+//! - [`counts_fit`] — Densities and temperature from open-beam and sample counts
 //! - [`detectability`] — Trace-detectability analysis (pre-experiment SNR check)
 //! - [`error`] — Pipeline error types
 //! - [`pipeline`] — Single-spectrum analysis pipeline (fit_spectrum_typed)
