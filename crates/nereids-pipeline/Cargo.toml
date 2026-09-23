@@ -36,7 +36,6 @@ test-support = ["dep:rand_chacha"]
 # `ResonanceData` builders shared with sibling crates' tests.
 nereids-endf = { workspace = true, features = ["test-support"] }
 # Path-only self dev-dep so the integration tests see `reference` and
-# `synthetic`. Must NOT
-# be versioned: a versioned self dev-dep pins the unpublished current
-# version and breaks `cargo publish`.
+# `synthetic`. Must NOT be versioned: a versioned self dev-dep pins the
+# unpublished current version and breaks `cargo publish`.
 nereids-pipeline = { path = ".", features = ["test-support"] }

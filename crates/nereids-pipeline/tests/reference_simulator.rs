@@ -90,18 +90,21 @@ fn triangle_mean_us() -> f64 {
     TRIANGLE.iter().map(|p| p.0).sum::<f64>() / 3.0
 }
 
-fn removed(instrument: &Instrument) -> (f64, f64) {
+fn removed_moments(instrument: &Instrument) -> (f64, f64, f64) {
     let range = (energy(560.0), energy(300.0));
     let o = instrument.expected_counts(&beam, &open, range, STEP_US);
     let s = instrument.expected_counts(&beam, &band, range, STEP_US);
     let edges = &instrument.time_edges_us;
-    let (mut total, mut moment) = (0.0, 0.0);
+    let (mut total, mut first, mut second) = (0.0, 0.0, 0.0);
     for k in 0..edges.len() - 1 {
         let dn = o.counts[k] - s.counts[k];
+        let mid = 0.5 * (edges[k] + edges[k + 1]);
         total += dn;
-        moment += dn * 0.5 * (edges[k] + edges[k + 1]);
+        first += dn * mid;
+        second += dn * mid * mid;
     }
-    (total, moment / total)
+    let mean = first / total;
+    (total, mean, second / total - mean * mean)
 }
 
 #[test]
@@ -131,7 +134,7 @@ fn a_beam_uniform_in_flight_time_fills_every_bin_in_proportion_to_its_width() {
 
 #[test]
 fn a_black_band_removes_the_beam_it_covers_where_it_arrives() {
-    let (total, centroid) = removed(&instrument(triangle(), FLIGHT_PATH_M, T0_US));
+    let (total, centroid, _) = removed_moments(&instrument(triangle(), FLIGHT_PATH_M, T0_US));
     assert!(
         (total - 10.0 * COUNTS_PER_US).abs() <= 2.0 * STEP_US * COUNTS_PER_US,
         "the band removed {total} counts, not {}",
@@ -165,7 +168,7 @@ fn t0_delays_every_count_by_the_same_time() {
 #[test]
 fn the_flight_path_sets_where_the_band_arrives() {
     let longer = 1.01 * FLIGHT_PATH_M;
-    let (_, centroid) = removed(&instrument(triangle(), longer, T0_US));
+    let (_, centroid, _) = removed_moments(&instrument(triangle(), longer, T0_US));
     let expected = T0_US + 445.0 * longer / FLIGHT_PATH_M + triangle_mean_us();
     assert!(
         (centroid - expected).abs() <= 1.0e-3,
@@ -232,7 +235,7 @@ fn repeated_calls_give_identical_counts() {
 fn an_ikeda_carpenter_band_centres_at_its_mean_delay() {
     let mut instrument = instrument(ikeda_carpenter(), FLIGHT_PATH_M, T0_US);
     instrument.time_edges_us = (400..=540).map(f64::from).collect();
-    let (_, centroid) = removed(&instrument);
+    let (_, centroid, _) = removed_moments(&instrument);
     let expected = T0_US + 445.0 + 3.0 / IC_ALPHA + IC_R / IC_BETA;
     assert!(
         (centroid - expected).abs() <= 1.0e-3,
@@ -272,4 +275,61 @@ fn a_negative_beam_is_refused() {
         (energy(560.0), energy(300.0)),
         STEP_US,
     );
+}
+
+#[test]
+fn an_ikeda_carpenter_band_spreads_by_its_pulse_variance() {
+    let mut instrument = instrument(ikeda_carpenter(), FLIGHT_PATH_M, T0_US);
+    instrument.time_edges_us = (400..=540).map(f64::from).collect();
+    let (_, _, variance) = removed_moments(&instrument);
+    let (slow_mean, slow_var) = (3.0 / IC_ALPHA, 3.0 / IC_ALPHA.powi(2));
+    let stored_mean = slow_mean + 1.0 / IC_BETA;
+    let second = (1.0 - IC_R) * (slow_var + slow_mean.powi(2))
+        + IC_R * (slow_var + 1.0 / IC_BETA.powi(2) + stored_mean.powi(2));
+    let pulse_var = second - (slow_mean + IC_R / IC_BETA).powi(2);
+    let band_var = 10.0_f64.powi(2) / 12.0;
+    let bin_var = 1.0 / 12.0;
+    let expected = band_var + pulse_var + bin_var;
+    assert!(
+        (variance - expected).abs() <= 1.0e-2,
+        "the removed counts spread by {variance} µs², not {expected} µs²"
+    );
+}
+
+#[test]
+fn a_beam_given_per_ev_puts_its_energy_integral_in_each_bin() {
+    let kernel = (vec![-0.01, 0.0, 0.01], vec![0.0, 1.0, 0.0]);
+    let narrow = ResolutionFunction::Tabulated(Arc::new(
+        TabulatedResolution::from_kernels(
+            vec![1.0, 1000.0],
+            vec![kernel.clone(), kernel],
+            FLIGHT_PATH_M,
+        )
+        .expect("valid table"),
+    ));
+    let mut instrument = instrument(narrow, FLIGHT_PATH_M, T0_US);
+    instrument.time_edges_us = vec![100.0, 130.0, 200.0, 400.0];
+    let flat = |_: f64| COUNTS_PER_US;
+    let falling = |e: f64| COUNTS_PER_US / e;
+    let range = (energy(450.0), energy(50.0));
+    let flat_counts = instrument.expected_counts(&flat, &open, range, STEP_US);
+    let falling_counts = instrument.expected_counts(&falling, &open, range, STEP_US);
+    for k in 0..3 {
+        let (e_early, e_late) = (
+            energy(instrument.time_edges_us[k] - T0_US),
+            energy(instrument.time_edges_us[k + 1] - T0_US),
+        );
+        let expected_flat = COUNTS_PER_US * (e_early - e_late);
+        let expected_falling = COUNTS_PER_US * (e_early / e_late).ln();
+        assert!(
+            (flat_counts.counts[k] - expected_flat).abs() <= 1.0e-6 * expected_flat,
+            "a flat beam put {} in bin {k}, not {expected_flat}",
+            flat_counts.counts[k]
+        );
+        assert!(
+            (falling_counts.counts[k] - expected_falling).abs() <= 1.0e-6 * expected_falling,
+            "a 1/E beam put {} in bin {k}, not {expected_falling}",
+            falling_counts.counts[k]
+        );
+    }
 }
