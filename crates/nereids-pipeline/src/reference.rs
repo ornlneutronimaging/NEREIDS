@@ -38,8 +38,9 @@ impl Instrument {
     /// If the energy range is not `0 < low < high` or its neutrons do not
     /// arrive from before the first time edge to after the last, the step is
     /// not finite and positive, `transmission` returns a different number of
-    /// values than it was given energies, the resolution is Gaussian, or the
-    /// resolution rejects the flight path, the time edges, `t0_us` or an
+    /// values than it was given energies or one outside `[0, 1]`, `beam`
+    /// returns a negative or non-finite value, the resolution is Gaussian, or
+    /// the resolution rejects the flight path, the time edges, `t0_us` or an
     /// energy.
     pub fn expected_counts(
         &self,
@@ -94,6 +95,10 @@ impl Instrument {
             energies.len(),
             "transmission must return one value per energy"
         );
+        assert!(
+            t.iter().all(|v| (0.0..=1.0).contains(v)),
+            "transmission must lie in [0, 1]"
+        );
 
         let n_bins = self.time_edges_us.len() - 1;
         let partials: Vec<Vec<f64>> = energies
@@ -105,8 +110,13 @@ impl Instrument {
                 for (i, (&e, &t_e)) in es.iter().zip(ts).enumerate() {
                     let j = chunk * CHUNK + i;
                     let weight = if j == 0 || j == steps { 0.5 * h } else { h };
+                    let phi = beam(e);
+                    assert!(
+                        phi.is_finite() && phi >= 0.0,
+                        "the beam must be finite and non-negative, got {phi} at {e} eV"
+                    );
                     let u = kl / e.sqrt();
-                    let density = weight * beam(e) * t_e * 2.0 * e / u;
+                    let density = weight * phi * t_e * 2.0 * e / u;
                     for (a, p) in acc.iter_mut().zip(probabilities(e)) {
                         *a += density * p;
                     }

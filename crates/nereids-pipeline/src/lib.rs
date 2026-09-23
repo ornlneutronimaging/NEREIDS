@@ -17,6 +17,7 @@ pub mod detectability;
 pub mod error;
 pub mod joint_fit;
 pub mod pipeline;
+/// Expected detector counts from the counts measurement equation, for tests.
 #[cfg(feature = "test-support")]
 pub mod reference;
 pub mod spatial;

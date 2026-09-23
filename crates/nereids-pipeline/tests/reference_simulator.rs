@@ -250,3 +250,26 @@ fn a_range_that_misses_the_window_is_refused() {
         STEP_US,
     );
 }
+
+#[test]
+#[should_panic(expected = "transmission must lie in [0, 1]")]
+fn a_transmission_above_one_is_refused() {
+    let bright = |e: &[f64]| vec![1.01; e.len()];
+    instrument(triangle(), FLIGHT_PATH_M, T0_US).expected_counts(
+        &beam,
+        &bright,
+        (energy(560.0), energy(300.0)),
+        STEP_US,
+    );
+}
+
+#[test]
+#[should_panic(expected = "the beam must be finite and non-negative")]
+fn a_negative_beam_is_refused() {
+    instrument(triangle(), FLIGHT_PATH_M, T0_US).expected_counts(
+        &|e| -beam(e),
+        &open,
+        (energy(560.0), energy(300.0)),
+        STEP_US,
+    );
+}
