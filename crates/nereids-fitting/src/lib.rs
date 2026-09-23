@@ -20,6 +20,7 @@
 //! - `trinidi/reconstruct.py` for Poisson-likelihood and APGM approach
 
 pub mod active_mask;
+pub mod beam;
 pub mod count_background;
 pub mod error;
 pub mod exact_count_model;
