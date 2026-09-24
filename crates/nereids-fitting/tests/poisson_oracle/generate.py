@@ -122,13 +122,15 @@ def newton_decrement(case, y, theta, lower, upper):
     mu, jac = predict(case, theta)
     grad = gradient(y, mu, jac)
     free = np.flatnonzero(~active_set(theta, grad, lower, upper))
-    _, scaled, _, _ = scaled_weighted_jacobian(case, theta, free)
+    _, scaled, norms, keep = scaled_weighted_jacobian(case, theta, free)
     residual = (mu - y) * inverse_root(mu)
     if scaled.shape[1] == 0:
         return 0.0
-    u, s, _ = np.linalg.svd(scaled, full_matrices=False)
+    zero_slope = jac[mu == 0.0][:, free].sum(axis=0)[keep] / norms[keep]
+    u, s, vt = np.linalg.svd(scaled, full_matrices=False)
     spanned = s > EPS * max(scaled.shape) * s.max()
-    return 0.5 * float(np.sum((u[:, spanned].T @ residual) ** 2))
+    along = u[:, spanned].T @ residual + (vt[spanned] @ zero_slope) / s[spanned]
+    return 0.5 * float(np.sum(along**2))
 
 
 def polish(case, y, theta, lower, upper):
@@ -245,6 +247,13 @@ def case_record(case, y, truth, start, lower, upper, rng_starts):
     well_determined = bool(unique and quadratic(case, y, theta, value, lower, upper))
     decrement = newton_decrement(case, y, theta, lower, upper)
     on_bound, sigma, covariance = error_bars(case, theta, lower, upper)
+    if "twins" in case:
+        a, b = (jac_col * inverse_root(predict(case, theta)[0]) for jac_col in predict(case, theta)[1].T)
+        cross = sum((a[i] * b[j] - a[j] * b[i]) ** 2 for i in range(len(a)) for j in range(i + 1, len(a)))
+        cosine = (a @ b) / (np.linalg.norm(a) * np.linalg.norm(b))
+        smallest = cross / (a @ a) / (b @ b) / (1.0 + abs(cosine))
+        expected = smallest >= DEGENERATE_EIGENVALUE
+        assert [v is not None for v in sigma] == [expected, expected], (case["name"], sigma, smallest)
     if "null" in case:
         expected = [not (bound or component != 0.0) for bound, component in zip(on_bound, case["null"])]
         assert [v is not None for v in sigma] == expected, (case["name"], sigma, case["null"])
@@ -339,7 +348,7 @@ def main():
                 truth, [0.0] * k, [inf] * k, [[5.0] * k, rng.uniform(0.0, 40.0, k).tolist()], range(1, 6))
     for delta in (1e-7, 1e-5):
         signs = np.tile([1.0, -1.0], 10)
-        add(dict(name=f"linear/near-twin-delta{delta:g}", family="linear",
+        add(dict(name=f"linear/near-twin-delta{delta:g}", family="linear", twins=True,
                  x=np.column_stack([np.full(20, 1.0e3), 1.0e3 * (1.0 + signs * delta)]).tolist(),
                  offset=[1.0e6] * 20),
             [0.0, 0.0], [-inf, -inf], [inf, inf], [[0.0, 0.0], [300.0, -300.0]], range(1, 4))

@@ -126,6 +126,7 @@ fn deviance(y_obs: &[f64], y_model: &[f64]) -> f64 {
 struct Linearization {
     weighted: FlatMatrix,
     residual: Vec<f64>,
+    zero_slope: Vec<f64>,
     gradient: Vec<f64>,
 }
 
@@ -156,14 +157,14 @@ fn linearize(
         }
     }
     let root: Vec<f64> = y_model.iter().map(|mean| mean.sqrt()).collect();
-    let mut gradient = vec![0.0; weighted.ncols];
+    let mut zero_slope = vec![0.0; weighted.ncols];
     for (i, &r) in root.iter().enumerate() {
-        for (j, g) in gradient.iter_mut().enumerate() {
+        for (j, z) in zero_slope.iter_mut().enumerate() {
             let slope = weighted.get(i, j);
             if r > 0.0 {
                 *weighted.get_mut(i, j) = slope / r;
             } else {
-                *g += slope;
+                *z += slope;
                 *weighted.get_mut(i, j) = 0.0;
             }
         }
@@ -174,14 +175,19 @@ fn linearize(
         .zip(&root)
         .map(|((&obs, &mean), &r)| if r > 0.0 { (mean - obs) / r } else { 0.0 })
         .collect();
-    for (j, g) in gradient.iter_mut().enumerate() {
-        *g += (0..weighted.nrows)
-            .map(|i| weighted.get(i, j) * residual[i])
-            .sum::<f64>();
-    }
+    let gradient = zero_slope
+        .iter()
+        .enumerate()
+        .map(|(j, z)| {
+            z + (0..weighted.nrows)
+                .map(|i| weighted.get(i, j) * residual[i])
+                .sum::<f64>()
+        })
+        .collect();
     Ok(Linearization {
         weighted,
         residual,
+        zero_slope,
         gradient,
     })
 }
@@ -285,22 +291,28 @@ impl Decomposition {
         (0..self.singular.len()).filter(move |&k| self.singular[k] > rank_floor)
     }
 
-    fn along(&self, k: usize, residual: &[f64]) -> f64 {
-        dot(&self.left[k], residual) / self.singular[k]
+    fn along(&self, k: usize, linear: &Linearization) -> f64 {
+        let zero_part: f64 = self
+            .columns
+            .iter()
+            .enumerate()
+            .map(|(i, &col)| self.right[k][i] * self.unscale(i, linear.zero_slope[col]))
+            .sum();
+        (dot(&self.left[k], &linear.residual) + zero_part) / self.singular[k]
     }
 
-    fn newton_decrement(&self, residual: &[f64]) -> f64 {
+    fn newton_decrement(&self, linear: &Linearization) -> f64 {
         0.5 * self
             .spanned()
-            .map(|k| self.along(k, residual).powi(2))
+            .map(|k| self.along(k, linear).powi(2))
             .sum::<f64>()
     }
 
-    fn step(&self, residual: &[f64], n_free: usize, damping: f64) -> Vec<f64> {
+    fn step(&self, linear: &Linearization, n_free: usize, damping: f64) -> Vec<f64> {
         let mut direction = vec![0.0; n_free];
         for k in self.spanned() {
             let s = self.singular[k];
-            let coefficient = self.along(k, residual) * s / (s * s + damping);
+            let coefficient = self.along(k, linear) * s / (s * s + damping);
             for (i, &col) in self.columns.iter().enumerate() {
                 direction[col] += self.unscale(i, self.right[k][i] * coefficient);
             }
@@ -373,22 +385,22 @@ fn held_by_bound(param: &FitParameter, gradient: f64) -> bool {
 /// `F = Jᵀ diag(1/μ) J` the expected information, is below 1e-6: the
 /// quadratic model built from `F` predicts less than 1e-6 of further
 /// decrease.  Where the deviance is quadratic near the minimum this puts the
-/// fit within about 0.0014 standard errors of it; at about one count per bin
-/// the remaining decrease has been seen to reach six times the prediction.  Where it is not — weakly
+/// fit within about 0.0014 standard errors of it, and within 0.01 where the
+/// expected information understates the curvature, as at one count per bin.  Where it is not — weakly
 /// determined parameters on a curved or flat likelihood ridge, a minimum at
 /// infinity, or a parameter that adds counts to a bin predicted near zero —
 /// the fit can stop short of the minimum, or at another local minimum, and
 /// the error bars are not standard errors.
 ///
 /// It stops unconverged when no step lowers the deviance, when the Jacobian
-/// is not finite, when the start predicts zero where something was counted,
-/// or after `config.max_iter` steps.
+/// is not finite, when the start predicts a negative count or zero where
+/// something was counted, or after `config.max_iter` steps.
 ///
 /// # Errors
 /// `FittingError::EmptyData` if `y_obs` is empty;
 /// `FittingError::InvalidConfig` if an observation is negative or not
-/// finite, a free parameter's
-/// bounds are inverted or NaN, or the model returns no analytical Jacobian;
+/// finite, a parameter value is not finite, a free parameter's bounds are
+/// inverted or NaN, or the model returns no analytical Jacobian;
 /// `FittingError::LengthMismatch` if the prediction or the Jacobian does not
 /// match `y_obs` and the free parameters; the model's error if it fails at
 /// the start.
@@ -410,14 +422,13 @@ pub fn poisson_fit(
     if y_obs.is_empty() {
         return Err(FittingError::EmptyData);
     }
-    if let Some(p) = params
-        .params
-        .iter()
-        .find(|p| !p.fixed && (p.lower.is_nan() || p.upper.is_nan() || p.lower > p.upper))
-    {
+    if let Some(p) = params.params.iter().find(|p| {
+        !p.value.is_finite()
+            || (!p.fixed && (p.lower.is_nan() || p.upper.is_nan() || p.lower > p.upper))
+    }) {
         return Err(FittingError::InvalidConfig(format!(
-            "parameter {} has bounds [{}, {}]",
-            p.name, p.lower, p.upper
+            "parameter {} = {} with bounds [{}, {}]",
+            p.name, p.value, p.lower, p.upper
         )));
     }
     params.set_free_values(&params.free_values());
@@ -443,7 +454,7 @@ pub fn poisson_fit(
             .filter(|&j| !held_by_bound(&params.params[free[j]], linear.gradient[j]))
             .collect();
         let decomposition = Decomposition::new(&linear.weighted, &movable);
-        if decomposition.newton_decrement(&linear.residual) < NEWTON_DECREMENT_TOL {
+        if decomposition.newton_decrement(&linear) < NEWTON_DECREMENT_TOL {
             at_minimum = Some(linear);
             break;
         }
@@ -453,7 +464,7 @@ pub fn poisson_fit(
         let start = params.free_values();
         let mut accepted = None;
         for _ in 0..MAX_REJECTIONS {
-            let direction = decomposition.step(&linear.residual, free.len(), damping);
+            let direction = decomposition.step(&linear, free.len(), damping);
             let unprojected: Vec<f64> = start.iter().zip(&direction).map(|(x, d)| x - d).collect();
             params.set_free_values(&unprojected);
             if let Ok(trial_model) = model.evaluate(&params.all_values()) {
@@ -465,7 +476,7 @@ pub fn poisson_fit(
                 }
             }
             params.set_free_values(&start);
-            damping *= DAMPING_FACTOR;
+            damping = (damping * DAMPING_FACTOR).max(INITIAL_DAMPING);
         }
         let Some((trial_model, trial_value)) = accepted else {
             break;
@@ -1043,9 +1054,6 @@ mod tests {
 
     #[test]
     fn test_transmission_kl_background_has_no_jacobian_when_inner_lacks_one() {
-        // ExponentialModel has no analytical_jacobian (trait default None).
-        // Counts-scale data (flux 1000, backgrounds 20/10) keeps the
-        // Poisson NLL well-conditioned for parameter recovery.
         let x: Vec<f64> = (0..40).map(|i| 1.0 + 0.25 * i as f64).collect();
         let inner = ExponentialModel {
             x: x.clone(),
@@ -1063,8 +1071,6 @@ mod tests {
         let true_params = vec![0.4, 20.0, 10.0];
         let y_obs = wrapped.evaluate(&true_params).unwrap();
 
-        // Inner param 0 free (alone and together with b0/b1): no analytic
-        // inner Jacobian → wrapper falls back to FD.
         assert!(
             wrapped
                 .analytical_jacobian(&true_params, &[0, 1, 2], &y_obs)
@@ -1081,7 +1087,6 @@ mod tests {
 
     #[test]
     fn test_transmission_kl_background_background_only_analytic_jacobian() {
-        // Counts-scale data — see the FD-fallback test above.
         let x: Vec<f64> = (0..40).map(|i| 1.0 + 0.25 * i as f64).collect();
         let inner = ExponentialModel {
             x: x.clone(),
@@ -1581,5 +1586,120 @@ mod tests {
             result.converged && result.params[0] == 0.0 && result.on_bound == vec![true],
             "{result:?}"
         );
+    }
+
+    struct Line2 {
+        offset: [f64; 2],
+        slope: [f64; 2],
+    }
+
+    impl FitModel for Line2 {
+        fn evaluate(&self, params: &[f64]) -> Result<Vec<f64>, FittingError> {
+            Ok((0..2)
+                .map(|i| self.offset[i] + self.slope[i] * params[0])
+                .collect())
+        }
+
+        fn analytical_jacobian(
+            &self,
+            _params: &[f64],
+            free_param_indices: &[usize],
+            _y_current: &[f64],
+        ) -> Option<FlatMatrix> {
+            let mut jacobian = FlatMatrix::zeros(2, free_param_indices.len());
+            jacobian.data.copy_from_slice(&self.slope);
+            Some(jacobian)
+        }
+    }
+
+    fn bounded(value: f64, upper: f64) -> ParameterSet {
+        ParameterSet::new(vec![FitParameter {
+            name: "theta".into(),
+            value,
+            lower: 0.0,
+            upper,
+            fixed: false,
+        }])
+    }
+
+    #[test]
+    fn a_zero_bin_slope_enters_the_convergence_test() {
+        let model = Line2 {
+            offset: [0.0, 4.0],
+            slope: [1.0, -2.0],
+        };
+        let result = poisson_fit(
+            &model,
+            &[0.0, 2.0],
+            &mut bounded(0.0, 1.5),
+            &PoissonConfig::default(),
+        )
+        .unwrap();
+        assert!(
+            result.converged && result.iterations == 0 && result.params[0] == 0.0,
+            "{result:?}"
+        );
+    }
+
+    #[test]
+    fn a_non_finite_slope_in_a_zero_bin_ends_the_fit_unconverged() {
+        let model = Line2 {
+            offset: [0.0, 1.0],
+            slope: [f64::NAN, 1.0],
+        };
+        let result = poisson_fit(
+            &model,
+            &[0.0, 1.0],
+            &mut bounded(0.0, f64::INFINITY),
+            &PoissonConfig::default(),
+        )
+        .unwrap();
+        assert!(!result.converged, "{result:?}");
+    }
+
+    struct Wall;
+
+    impl FitModel for Wall {
+        fn evaluate(&self, params: &[f64]) -> Result<Vec<f64>, FittingError> {
+            let x = params[0];
+            Ok(vec![(100.0 - x + (x - 80.0).max(0.0).powi(2)).exp()])
+        }
+
+        fn analytical_jacobian(
+            &self,
+            params: &[f64],
+            free_param_indices: &[usize],
+            _y_current: &[f64],
+        ) -> Option<FlatMatrix> {
+            let x = params[0];
+            let mean = (100.0 - x + (x - 80.0).max(0.0).powi(2)).exp();
+            let mut jacobian = FlatMatrix::zeros(1, free_param_indices.len());
+            jacobian.data[0] = mean * (2.0 * (x - 80.0).max(0.0) - 1.0);
+            Some(jacobian)
+        }
+    }
+
+    #[test]
+    fn damping_recovers_after_many_accepted_steps_to_reach_the_minimum() {
+        let mut params = ParameterSet::new(vec![FitParameter::unbounded("x", 0.0)]);
+        let result = poisson_fit(&Wall, &[0.0], &mut params, &PoissonConfig::default()).unwrap();
+        assert!((result.params[0] - 80.5).abs() < 1e-3, "{result:?}");
+    }
+
+    #[test]
+    fn non_finite_parameter_values_are_refused() {
+        let model = decay(1.0);
+        let observed = model.evaluate(&[100.0, 1.5]).unwrap();
+        for (a, b) in [(f64::NAN, 1.0), (50.0, f64::INFINITY)] {
+            let mut params = ParameterSet::new(vec![
+                FitParameter::non_negative("a", a),
+                FitParameter::fixed("b", b),
+            ]);
+            let result = poisson_fit(&model, &observed, &mut params, &PoissonConfig::default());
+            assert!(
+                matches!(result, Err(FittingError::InvalidConfig(_))),
+                "{a}, {b}"
+            );
+        }
     }
 }

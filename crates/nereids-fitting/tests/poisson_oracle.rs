@@ -245,7 +245,7 @@ fn check(model: &Model, case: &Case) -> Vec<String> {
     if !result.converged {
         fail(format!("not converged after {} steps", result.iterations));
     }
-    if result.deviance > case.reference_deviance + 2e-4 {
+    if result.deviance > case.reference_deviance + 1e-5 {
         fail(format!(
             "deviance {} above the reference {}",
             result.deviance, case.reference_deviance
@@ -255,7 +255,7 @@ fn check(model: &Model, case: &Case) -> Vec<String> {
         let unique = case.sigma[i].is_some() || case.on_bound[i];
         if let (true, Some(scale)) = (unique, case.sigma[i].or(case.scale[i])) {
             let miss = (result.params[i] - case.reference[i]) / scale;
-            if miss.abs() > 0.02 {
+            if miss.abs() > 0.01 {
                 fail(format!(
                     "parameter {i} is {miss:.3} error bars from the reference"
                 ));
