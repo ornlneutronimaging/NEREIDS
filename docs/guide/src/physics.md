@@ -78,9 +78,10 @@ Maximum-likelihood fitting for low-count data where Gaussian statistics break do
   joint-Poisson fit (conditional binomial deviance); the production path for
   counts data
 - Module: [`poisson`](api/nereids_fitting/poisson/) -- low-level single-arm
-  Poisson likelihood (projected damped Gauss-Newton); research diagnostics
+  Poisson likelihood (projected Levenberg–Marquardt in the Fisher metric); research diagnostics
   and the Fisher-information helper only — not a production fit route
-- Reference: TRINIDI approach (`trinidi/reconstruct.py`)
+- Reference: D. W. Marquardt, "An algorithm for least-squares estimation of
+  nonlinear parameters", J. Soc. Indust. Appl. Math. 11, 431–441 (1963)
 
 ## ENDF Nuclear Data
 

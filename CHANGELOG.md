@@ -23,6 +23,17 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
 
 ### Changed (breaking)
 
+- **`poisson_fit` takes counts and an analytical Jacobian.** It minimizes
+  half the Poisson deviance by projected Levenberg–Marquardt steps in the
+  Fisher metric and reports `converged` when its Newton decrement is below
+  1e-6, within about 0.0014 standard errors of a minimum inside the bounds
+  where the deviance is quadratic. Models without an analytical Jacobian,
+  observations that are not finite non-negative counts, and bounds that are
+  inverted, NaN or admit no finite value are refused. `PoissonResult.nll` is now `deviance`,
+  `uncertainties` holds `None` for a parameter on a bound or along a
+  direction the data do not determine, and `on_bound` is new.
+  `PoissonConfig` loses `fd_step`, `step_size`, `armijo_c`, `backtrack`,
+  `gauss_newton_lambda` and `lbfgs_history`.
 - **Removed the two cross-domain fit routes.** Normalized transmission with
   a Poisson/KL solver is rejected (a fractional ratio is not Poisson count
   data, and the supplied uncertainty would be ignored), and raw

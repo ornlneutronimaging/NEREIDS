@@ -1435,10 +1435,6 @@ fn damped_fisher_stage(
             Some(g) => g,
             None => objective.deviance_gradient_fd(params, config.fd_step)?,
         };
-        // Fisher information (Gauss-Newton curvature).  If absent, use a
-        // diagonal identity fallback scaled by gradient magnitude — this
-        // degenerates the stage into projected gradient descent, which is
-        // exactly how `poisson.rs` behaves in the FD regime.
         let info = match objective.fisher_information(&all_vals, &free_idx)? {
             Some(m) => m,
             None => {
