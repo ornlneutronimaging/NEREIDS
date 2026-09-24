@@ -25,3 +25,5 @@ nereids-endf = { workspace = true, features = ["test-support"] }
 rand = { workspace = true }
 rand_chacha = { workspace = true }
 rand_distr = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
