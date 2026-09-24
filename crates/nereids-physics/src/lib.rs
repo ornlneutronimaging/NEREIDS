@@ -28,6 +28,7 @@ pub mod channel;
 pub mod continuous_doppler;
 pub mod counts_response;
 pub mod doppler;
+pub mod flight_time_grid;
 pub mod ikeda_carpenter;
 pub mod penetrability;
 pub mod reich_moore;

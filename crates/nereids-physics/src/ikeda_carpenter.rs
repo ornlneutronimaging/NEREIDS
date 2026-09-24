@@ -134,7 +134,8 @@
 use std::sync::Arc;
 
 use crate::resolution::{
-    ResolutionParseError, TOF_FACTOR, TabulatedResolution, piecewise_linear_bin_masses,
+    PulseDelays, ResolutionParseError, TOF_FACTOR, TabulatedResolution, argmax,
+    piecewise_linear_bin_masses,
 };
 
 /// de Broglie wavelength factor: λ (Å) = `LAMBDA_ANGSTROM_FACTOR` / √(E in eV).
@@ -776,6 +777,38 @@ impl IkedaCarpenter {
         synth_kernel(&self.params, self.n_tau, energy_ev)
     }
 
+    fn folded(&self) -> bool {
+        self.params.burst_sigma_us.unwrap_or(0.0) != 0.0
+            || self.params.channel_fwhm_us.unwrap_or(0.0) != 0.0
+    }
+
+    /// The pulse's delays at one true neutron energy.  Without a burst or
+    /// channel fold the pulse starts at 0 and its last delay is where the
+    /// chance of a later arrival, `1 − ic_cdf`, falls to
+    /// [`NEGLIGIBLE_ARRIVAL_PROBABILITY`]; with a fold they are the ends of
+    /// the sampled pulse its bin probabilities integrate.
+    ///
+    /// # Errors
+    /// As [`Self::source_pulse_at`].
+    pub fn pulse_delays(&self, energy_ev: f64) -> Result<PulseDelays, ResolutionParseError> {
+        self.validate_probe_energy(energy_ev)?;
+        let (times, densities) = synth_source_pulse_density(&self.params, self.n_tau, energy_ev)?;
+        let last_us = if self.folded() {
+            times[times.len() - 1]
+        } else {
+            tail_delay(
+                self.params.alpha.eval(energy_ev),
+                self.params.beta.eval(energy_ev),
+                self.params.r.eval(energy_ev),
+            )
+        };
+        Ok(PulseDelays {
+            first_us: times[0],
+            peak_us: times[argmax(&densities)],
+            last_us,
+        })
+    }
+
     /// Evaluate the physical source pulse at one true neutron energy.
     ///
     /// Returns sampled moderator-delay coordinates in µs and peak-normalized
@@ -849,9 +882,7 @@ impl IkedaCarpenter {
             .map(|edge| edge - nominal_arrival)
             .collect();
 
-        if self.params.burst_sigma_us.unwrap_or(0.0) == 0.0
-            && self.params.channel_fwhm_us.unwrap_or(0.0) == 0.0
-        {
+        if !self.folded() {
             let alpha = self.params.alpha.eval(true_energy_ev);
             let beta = self.params.beta.eval(true_energy_ev);
             let r = self.params.r.eval(true_energy_ev);
@@ -947,6 +978,28 @@ impl IkedaCarpenter {
         }
         Ok(())
     }
+}
+
+/// The chance of a later arrival below which an Ikeda–Carpenter pulse's
+/// tail is treated as ended.
+pub const NEGLIGIBLE_ARRIVAL_PROBABILITY: f64 = 1e-7;
+
+fn tail_delay(alpha: f64, beta: f64, r: f64) -> f64 {
+    let later = |tau: f64| 1.0 - ic_cdf(alpha, beta, r, tau);
+    let mut high = 1.0 / alpha.min(beta).max(MIN_RATE);
+    while later(high) > NEGLIGIBLE_ARRIVAL_PROBABILITY {
+        high *= 2.0;
+    }
+    let mut low = 0.0;
+    while high - low > f64::EPSILON * high {
+        let middle = 0.5 * (low + high);
+        if later(middle) > NEGLIGIBLE_ARRIVAL_PROBABILITY {
+            low = middle;
+        } else {
+            high = middle;
+        }
+    }
+    high
 }
 
 /// τ-grid geometry for one kernel: `(dtau, tau_max, margin)`, or a
@@ -1159,20 +1212,6 @@ fn synth_source_pulse(
         .max(f64::MIN_POSITIVE);
     let weights = densities.into_iter().map(|value| value / peak).collect();
     Ok((offsets, weights))
-}
-
-/// Index of the maximum element (first on ties). Slice is non-empty by
-/// construction in [`synth_kernel`].
-fn argmax(xs: &[f64]) -> usize {
-    let mut best = 0;
-    let mut best_v = xs[0];
-    for (i, &x) in xs.iter().enumerate().skip(1) {
-        if x > best_v {
-            best_v = x;
-            best = i;
-        }
-    }
-    best
 }
 
 /// Symmetric, unit-sum Gaussian kernel sampled on a `dtau`-spaced grid out to

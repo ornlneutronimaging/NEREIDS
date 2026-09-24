@@ -1368,6 +1368,70 @@ const BRDLIM: f64 = 5.0;
 /// quadrature maps points through `1/√E`, which has no value at zero.
 const GAUSSIAN_LOW_ENERGY_FLOOR_EV: f64 = 0.001;
 
+/// Delays of a neutron's arrival after its nominal arrival
+/// `timing_offset + TOF_FACTOR·L/√E`, in µs: the first and last delay the
+/// bin probabilities integrate over, and the delay of the pulse's peak.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct PulseDelays {
+    pub first_us: f64,
+    pub peak_us: f64,
+    pub last_us: f64,
+}
+
+pub(crate) fn argmax(xs: &[f64]) -> usize {
+    let mut best = 0;
+    let mut best_v = xs[0];
+    for (i, &x) in xs.iter().enumerate().skip(1) {
+        if x > best_v {
+            best_v = x;
+            best = i;
+        }
+    }
+    best
+}
+
+impl TabulatedResolution {
+    /// The first, peak and last offset of the kernel interpolated at
+    /// `energy_ev`, zero-weight samples included.
+    #[must_use]
+    pub fn pulse_delays(&self, energy_ev: f64) -> PulseDelays {
+        let (offsets, weights) = self.interpolated_kernel(energy_ev);
+        PulseDelays {
+            first_us: offsets[0],
+            peak_us: offsets[argmax(&weights)],
+            last_us: offsets[offsets.len() - 1],
+        }
+    }
+}
+
+impl ResolutionFunction {
+    /// The pulse's delays at `energy_ev`; see [`PulseDelays`].
+    ///
+    /// # Errors
+    /// A Gaussian resolution has no pulse; an Ikeda–Carpenter pulse errors
+    /// where its laws are unphysical or cannot be sampled.
+    pub fn pulse_delays(&self, energy_ev: f64) -> Result<PulseDelays, ResolutionParseError> {
+        match self {
+            Self::Gaussian(_) => Err(ResolutionParseError::InvalidFormat(
+                "a Gaussian resolution has no pulse delays".into(),
+            )),
+            Self::Tabulated(table) => Ok(table.pulse_delays(energy_ev)),
+            Self::IkedaCarpenter(pulse) => pulse.pulse_delays(energy_ev),
+        }
+    }
+
+    /// The ascending energies, in eV, the pulse was calibrated at; `None`
+    /// for a Gaussian resolution.
+    #[must_use]
+    pub fn reference_energies(&self) -> Option<&[f64]> {
+        match self {
+            Self::Gaussian(_) => None,
+            Self::Tabulated(table) => Some(table.ref_energies()),
+            Self::IkedaCarpenter(pulse) => Some(pulse.ref_energies()),
+        }
+    }
+}
+
 impl ResolutionFunction {
     /// The energies a working grid for the data window `energies` has to span,
     /// as `(low, high)` in eV with `low ≤ e_min` and `high ≥ e_max`: SAMMY's
