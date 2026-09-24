@@ -372,13 +372,13 @@ fn held_by_bound(param: &FitParameter, gradient: f64) -> bool {
 /// The model must provide an analytical Jacobian at every point the fit
 /// visits, and non-negative predictions; a bin predicted zero must have no
 /// counts, and adds its slope to the gradient and nothing to the
-/// information.  Each step is the Levenberg–Marquardt step
-/// `(F + λI)⁻¹g` in coordinates scaled to unit Fisher information, projected
-/// onto the box; `λ` is divided by 10 after a step that lowers the deviance
-/// and multiplied by 10 before retrying one that does not (D. W. Marquardt,
-/// J. Soc. Indust. Appl. Math. 11, 431–441, 1963).  A
-/// free parameter on its bound whose gradient points out of the box is held
-/// there for the step and left out of the convergence test.
+/// information.  Each step is the Levenberg–Marquardt step `(F + λI)⁻¹g` in
+/// coordinates scaled to unit Fisher information, projected onto the box;
+/// `λ` is divided by 10 after a step that lowers the deviance, and
+/// multiplied by 10, to at least its starting 1e-3, before retrying one that
+/// does not (D. W. Marquardt, J. Soc. Indust. Appl. Math. 11, 431–441,
+/// 1963).  A free parameter on its bound whose gradient points out of the
+/// box is held there for the step and left out of the convergence test.
 ///
 /// The fit has converged when the Newton decrement `½ gᵀF⁺g` over the
 /// parameters not held by a bound (on it, gradient pointing out),
@@ -386,21 +386,25 @@ fn held_by_bound(param: &FitParameter, gradient: f64) -> bool {
 /// quadratic model built from `F` predicts less than 1e-6 of further
 /// decrease.  Where the deviance is quadratic near the minimum this puts the
 /// fit within about 0.0014 standard errors of it, and within 0.01 where the
-/// expected information understates the curvature, as at one count per bin.  Where it is not — weakly
-/// determined parameters on a curved or flat likelihood ridge, a minimum at
-/// infinity, or a parameter that adds counts to a bin predicted near zero —
-/// the fit can stop short of the minimum, or at another local minimum, and
-/// the error bars are not standard errors.
+/// expected information overstates the curvature, as at one count per bin.
+/// Where it is not quadratic — weakly determined parameters on a curved or
+/// flat likelihood ridge, a minimum at infinity, or a parameter that adds
+/// counts to a bin predicted near zero — the fit can stop short of the
+/// minimum, or at another local minimum, and the error bars are not standard
+/// errors.  A minimum where a bin's prediction reaches zero inside the box is
+/// reported unconverged.
 ///
 /// It stops unconverged when no step lowers the deviance, when the Jacobian
 /// is not finite, when the start predicts a negative count or zero where
-/// something was counted, or after `config.max_iter` steps.
+/// something was counted, or after `config.max_iter` steps.  A trial whose
+/// prediction has a different length from `y_obs` is rejected.
 ///
 /// # Errors
 /// `FittingError::EmptyData` if `y_obs` is empty;
 /// `FittingError::InvalidConfig` if an observation is negative or not
 /// finite, a parameter value is not finite, a free parameter's bounds are
-/// inverted or NaN, or the model returns no analytical Jacobian;
+/// inverted, NaN or admit no finite value, or the model returns no
+/// analytical Jacobian;
 /// `FittingError::LengthMismatch` if the prediction or the Jacobian does not
 /// match `y_obs` and the free parameters; the model's error if it fails at
 /// the start.
@@ -424,7 +428,12 @@ pub fn poisson_fit(
     }
     if let Some(p) = params.params.iter().find(|p| {
         !p.value.is_finite()
-            || (!p.fixed && (p.lower.is_nan() || p.upper.is_nan() || p.lower > p.upper))
+            || (!p.fixed
+                && (p.lower.is_nan()
+                    || p.upper.is_nan()
+                    || p.lower > p.upper
+                    || p.lower == f64::INFINITY
+                    || p.upper == f64::NEG_INFINITY))
     }) {
         return Err(FittingError::InvalidConfig(format!(
             "parameter {} = {} with bounds [{}, {}]",
@@ -447,7 +456,13 @@ pub fn poisson_fit(
     let mut damping = INITIAL_DAMPING;
     while value.is_finite() {
         let linear = linearize(model, params, &free, y_obs, &y_model)?;
-        if !linear.weighted.data.iter().all(|v| v.is_finite()) {
+        if !linear
+            .weighted
+            .data
+            .iter()
+            .chain(&linear.zero_slope)
+            .all(|v| v.is_finite())
+        {
             break;
         }
         let movable: Vec<usize> = (0..free.len())
@@ -467,7 +482,11 @@ pub fn poisson_fit(
             let direction = decomposition.step(&linear, free.len(), damping);
             let unprojected: Vec<f64> = start.iter().zip(&direction).map(|(x, d)| x - d).collect();
             params.set_free_values(&unprojected);
-            if let Ok(trial_model) = model.evaluate(&params.all_values()) {
+            if let Some(trial_model) = model
+                .evaluate(&params.all_values())
+                .ok()
+                .filter(|trial| trial.len() == y_obs.len())
+            {
                 let trial_value = deviance(y_obs, &trial_model);
                 if trial_value < value {
                     damping /= DAMPING_FACTOR;
@@ -1528,7 +1547,13 @@ mod tests {
     fn inverted_or_nan_bounds_are_refused() {
         let model = decay(1.0);
         let observed = model.evaluate(&[100.0, 1.5]).unwrap();
-        for (lower, upper) in [(1.0, 0.0), (f64::NAN, 1.0), (0.0, f64::NAN)] {
+        for (lower, upper) in [
+            (1.0, 0.0),
+            (f64::NAN, 1.0),
+            (0.0, f64::NAN),
+            (f64::INFINITY, f64::INFINITY),
+            (f64::NEG_INFINITY, f64::NEG_INFINITY),
+        ] {
             let mut params = ParameterSet::new(vec![
                 FitParameter {
                     name: "a".into(),
@@ -1641,16 +1666,32 @@ mod tests {
         );
     }
 
+    struct SilentZeroBin;
+
+    impl FitModel for SilentZeroBin {
+        fn evaluate(&self, _params: &[f64]) -> Result<Vec<f64>, FittingError> {
+            Ok(vec![0.0])
+        }
+
+        fn analytical_jacobian(
+            &self,
+            _params: &[f64],
+            free_param_indices: &[usize],
+            _y_current: &[f64],
+        ) -> Option<FlatMatrix> {
+            let mut jacobian = FlatMatrix::zeros(1, free_param_indices.len());
+            jacobian.data[0] = f64::NAN;
+            Some(jacobian)
+        }
+    }
+
     #[test]
     fn a_non_finite_slope_in_a_zero_bin_ends_the_fit_unconverged() {
-        let model = Line2 {
-            offset: [0.0, 1.0],
-            slope: [f64::NAN, 1.0],
-        };
+        let mut params = ParameterSet::new(vec![FitParameter::unbounded("theta", 0.0)]);
         let result = poisson_fit(
-            &model,
-            &[0.0, 1.0],
-            &mut bounded(0.0, f64::INFINITY),
+            &SilentZeroBin,
+            &[0.0],
+            &mut params,
             &PoissonConfig::default(),
         )
         .unwrap();
@@ -1701,5 +1742,43 @@ mod tests {
                 "{a}, {b}"
             );
         }
+    }
+
+    struct Shrinking;
+
+    impl FitModel for Shrinking {
+        fn evaluate(&self, params: &[f64]) -> Result<Vec<f64>, FittingError> {
+            let bins = if params[0] < 0.5 { 3 } else { 2 };
+            Ok(vec![1.0 + params[0]; bins])
+        }
+
+        fn analytical_jacobian(
+            &self,
+            params: &[f64],
+            free_param_indices: &[usize],
+            _y_current: &[f64],
+        ) -> Option<FlatMatrix> {
+            let bins = if params[0] < 0.5 { 3 } else { 2 };
+            let mut jacobian = FlatMatrix::zeros(bins, free_param_indices.len());
+            jacobian.data.fill(1.0);
+            Some(jacobian)
+        }
+    }
+
+    #[test]
+    fn a_trial_prediction_of_the_wrong_length_is_rejected() {
+        let mut params = ParameterSet::new(vec![FitParameter::non_negative("theta", 0.0)]);
+        let result = poisson_fit(
+            &Shrinking,
+            &[3.0; 3],
+            &mut params,
+            &PoissonConfig::default(),
+        )
+        .unwrap();
+        assert_eq!(
+            Shrinking.evaluate(&result.params).unwrap().len(),
+            3,
+            "{result:?}"
+        );
     }
 }

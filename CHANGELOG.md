@@ -28,8 +28,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
   Fisher metric and reports `converged` when its Newton decrement is below
   1e-6, within about 0.0014 standard errors of a minimum inside the bounds
   where the deviance is quadratic. Models without an analytical Jacobian,
-  observations that are not finite non-negative counts, and inverted or NaN
-  bounds are refused. `PoissonResult.nll` is now `deviance`,
+  observations that are not finite non-negative counts, and bounds that are
+  inverted, NaN or admit no finite value are refused. `PoissonResult.nll` is now `deviance`,
   `uncertainties` holds `None` for a parameter on a bound or along a
   direction the data do not determine, and `on_bound` is new.
   `PoissonConfig` loses `fd_step`, `step_size`, `armijo_c`, `backtrack`,

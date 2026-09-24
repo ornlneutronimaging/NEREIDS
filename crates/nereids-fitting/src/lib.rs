@@ -15,9 +15,6 @@
 //!
 //! ## SAMMY Reference
 //! - Fitting: `fit/` module, `fitAPI/`, manual Sec. IV
-//!
-//! ## TRINIDI Reference
-//! - `trinidi/reconstruct.py` for Poisson-likelihood and APGM approach
 
 pub mod active_mask;
 pub mod count_background;
