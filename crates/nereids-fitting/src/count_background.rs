@@ -1148,14 +1148,10 @@ fn poisson_deviance(observed: &[f64], predicted: &[f64]) -> f64 {
         .iter()
         .zip(predicted)
         .map(|(&obs, &model)| {
-            if obs > 0.0 {
-                if model == 0.0 {
-                    return f64::INFINITY;
-                }
-                2.0 * crate::poisson::half_deviance(obs, model)
-            } else {
-                2.0 * model
+            if obs > 0.0 && model == 0.0 {
+                return f64::INFINITY;
             }
+            2.0 * crate::poisson::half_deviance(obs, model)
         })
         .sum()
 }
