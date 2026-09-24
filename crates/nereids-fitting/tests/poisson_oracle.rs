@@ -30,6 +30,13 @@ enum Model {
         peak: f64,
         width_300k: f64,
     },
+    Saturated {
+        energy: Vec<f64>,
+        flux: Vec<f64>,
+        center: f64,
+        peak: f64,
+        width_300k: f64,
+    },
     Linear {
         x: Vec<Vec<f64>>,
         offset: Vec<f64>,
@@ -42,6 +49,7 @@ struct Case {
     model: usize,
     observed: Vec<f64>,
     start: Vec<f64>,
+    start_valid: bool,
     lower: Vec<Option<f64>>,
     upper: Vec<Option<f64>>,
     reference: Vec<f64>,
@@ -49,6 +57,7 @@ struct Case {
     on_bound: Vec<bool>,
     sigma: Vec<Option<f64>>,
     covariance: Vec<Vec<Option<f64>>>,
+    scale: Vec<Option<f64>>,
 }
 
 impl Model {
@@ -106,6 +115,26 @@ impl Model {
                 }
                 let db = vec![1.0; energy.len()];
                 (mu, vec![dn, dt, db])
+            }
+            Self::Saturated {
+                energy,
+                flux,
+                center,
+                peak,
+                width_300k,
+            } => {
+                let width = width_300k * (p[1] / 300.0).sqrt();
+                let dwidth_dt = width_300k / (2.0 * (300.0 * p[1]).sqrt());
+                let (mut mu, mut dn, mut dt) = (vec![], vec![], vec![]);
+                for (&e, &f) in energy.iter().zip(flux) {
+                    let delta = e - center;
+                    let sigma = peak * (-(delta * delta) / (2.0 * width * width)).exp();
+                    let counts = f * (-p[0] * sigma).exp();
+                    mu.push(counts);
+                    dn.push(-counts * sigma);
+                    dt.push(-counts * p[0] * sigma * delta * delta / width.powi(3) * dwidth_dt);
+                }
+                (mu, vec![dn, dt])
             }
             Self::Linear { x, offset } => {
                 let mu = x
@@ -185,6 +214,15 @@ fn check(model: &Model, case: &Case) -> Vec<String> {
     }
 
     let result = fit(model, case, &case.start, false);
+    if !case.start_valid {
+        if result.converged || result.iterations != 0 {
+            fail(format!(
+                "a start predicting zero where counts exist gave converged {} after {} steps",
+                result.converged, result.iterations
+            ));
+        }
+        return failures;
+    }
     if !result.converged {
         fail(format!("not converged after {} steps", result.iterations));
     }
@@ -194,10 +232,11 @@ fn check(model: &Model, case: &Case) -> Vec<String> {
             result.deviance, case.reference_deviance
         ));
     }
-    for (i, sigma) in case.sigma.iter().enumerate() {
-        if let Some(sigma) = sigma {
-            let miss = (result.params[i] - case.reference[i]) / sigma;
-            if miss.abs() > 0.05 {
+    for i in 0..case.reference.len() {
+        let unique = case.sigma[i].is_some() || case.on_bound[i];
+        if let (true, Some(scale)) = (unique, case.sigma[i].or(case.scale[i])) {
+            let miss = (result.params[i] - case.reference[i]) / scale;
+            if miss.abs() > 0.02 {
                 fail(format!(
                     "parameter {i} is {miss:.3} error bars from the reference"
                 ));

@@ -48,6 +48,15 @@ def predict(case, theta):
         trans = np.exp(-n * sigma)
         mu = flux * trans + bkg
         jac = np.column_stack([-flux * trans * sigma, -flux * trans * n * dsigma_dt, np.ones_like(energy)])
+    elif f == "saturated":
+        energy, flux = np.asarray(case["energy"]), np.asarray(case["flux"])
+        n, temp = theta
+        width = case["width_300k"] * np.sqrt(temp / 300.0)
+        delta = energy - case["center"]
+        sigma = case["peak"] * np.exp(-(delta**2) / (2.0 * width**2))
+        dsigma_dt = sigma * delta**2 / width**3 * case["width_300k"] / (2.0 * np.sqrt(300.0 * temp))
+        mu = flux * np.exp(-n * sigma)
+        jac = np.column_stack([-mu * sigma, -mu * n * dsigma_dt])
     elif f == "linear":
         x, offset = np.asarray(case["x"]), np.asarray(case["offset"])
         mu = offset + x @ np.asarray(theta)
@@ -58,10 +67,21 @@ def predict(case, theta):
 
 
 def half_deviance(y, mu):
-    if np.any(~np.isfinite(mu)) or np.any(mu <= 0.0):
+    if np.any(~np.isfinite(mu)) or np.any(mu < 0.0) or np.any((mu == 0.0) & (y > 0)):
         return np.inf
-    ratio = np.where(y > 0, y / mu, 1.0)
+    safe = np.where(mu > 0, mu, 1.0)
+    ratio = np.where(y > 0, y / safe, 1.0)
     return float(np.sum(mu - y + y * np.log(ratio)))
+
+
+def inverse_root(mu):
+    """1/sqrt(mu), and 0 for a bin whose prediction is exactly zero."""
+    return np.where(mu > 0, 1.0 / np.sqrt(np.where(mu > 0, mu, 1.0)), 0.0)
+
+
+def gradient(y, mu, jac):
+    root = inverse_root(mu)
+    return jac.sum(axis=0) - (jac * root[:, None]).T @ (y * root)
 
 
 def objective(case, y, theta):
@@ -69,7 +89,7 @@ def objective(case, y, theta):
     value = half_deviance(y, mu)
     if not np.isfinite(value):
         return np.inf, np.zeros_like(theta)
-    return value, jac.T @ (1.0 - y / mu)
+    return value, gradient(y, mu, jac)
 
 
 def check_jacobian(case, theta):
@@ -92,7 +112,7 @@ def active_set(theta, grad, lower, upper):
 
 def scaled_weighted_jacobian(case, theta, columns):
     mu, jac = predict(case, theta)
-    weighted = jac[:, columns] / np.sqrt(mu)[:, None]
+    weighted = jac[:, columns] * inverse_root(mu)[:, None]
     norms = np.linalg.norm(weighted, axis=0)
     keep = norms > 0
     return mu, weighted[:, keep] / norms[keep], norms, keep
@@ -100,10 +120,10 @@ def scaled_weighted_jacobian(case, theta, columns):
 
 def newton_decrement(case, y, theta, lower, upper):
     mu, jac = predict(case, theta)
-    grad = jac.T @ (1.0 - y / mu)
+    grad = gradient(y, mu, jac)
     free = np.flatnonzero(~active_set(theta, grad, lower, upper))
     _, scaled, _, _ = scaled_weighted_jacobian(case, theta, free)
-    residual = (mu - y) / np.sqrt(mu)
+    residual = (mu - y) * inverse_root(mu)
     if scaled.shape[1] == 0:
         return 0.0
     u, s, _ = np.linalg.svd(scaled, full_matrices=False)
@@ -118,7 +138,7 @@ def polish(case, y, theta, lower, upper):
     for _ in range(100):
         mu, scaled, norms, keep = scaled_weighted_jacobian(case, theta, columns)
         value = half_deviance(y, mu)
-        residual = (mu - y) / np.sqrt(mu)
+        residual = (mu - y) * inverse_root(mu)
         step = np.zeros_like(theta)
         solution = np.linalg.lstsq(scaled, residual, rcond=EPS * max(scaled.shape))[0]
         step[keep] = solution / norms[keep]
@@ -138,7 +158,7 @@ def error_bars(case, theta, lower, upper):
     mu, jac = predict(case, theta)
     on_bound = (np.isfinite(lower) & (theta == lower)) | (np.isfinite(upper) & (theta == upper))
     interior = np.flatnonzero(~on_bound)
-    weighted = jac[:, interior] / np.sqrt(mu)[:, None]
+    weighted = jac[:, interior] * inverse_root(mu)[:, None]
     norms = np.linalg.norm(weighted, axis=0)
     keep = norms > 0
     cols = interior[keep]
@@ -151,7 +171,7 @@ def error_bars(case, theta, lower, upper):
         values = np.zeros(len(cols))
         values[: len(s)] = s
         determined = values**2 >= DEGENERATE_EIGENVALUE
-        floor = max(scaled.shape) * EPS
+        floor = (max(scaled.shape) * EPS) ** 2
         resolved = [np.sum(v[i, ~determined] ** 2) <= floor for i in range(len(cols))]
         for i, col in enumerate(cols):
             for j, row in enumerate(cols):
@@ -165,7 +185,7 @@ def error_bars(case, theta, lower, upper):
 
 def reference(case, y, starts, truth, lower, upper):
     mu, jac = predict(case, np.asarray(truth, float))
-    scale = 1.0 / np.sqrt(np.maximum(np.sum(jac**2 / mu[:, None], axis=0), 1e-300))
+    scale = 1.0 / np.maximum(np.linalg.norm(jac * inverse_root(mu)[:, None], axis=0), 1e-150)
     bounds = [(None if not np.isfinite(lo) else lo / s, None if not np.isfinite(hi) else hi / s)
               for lo, hi, s in zip(lower, upper, scale)]
     best_theta, best_value = None, np.inf
@@ -198,11 +218,15 @@ def case_record(case, y, truth, start, lower, upper, rng_starts):
     decrement = newton_decrement(case, y, theta, lower, upper)
     certified = bool(np.isfinite(value) and decrement < CERTIFIED_DECREMENT)
     on_bound, sigma, covariance = error_bars(case, theta, lower, upper)
+    if "null" in case:
+        expected = [not (bound or component != 0.0) for bound, component in zip(on_bound, case["null"])]
+        assert [v is not None for v in sigma] == expected, (case["name"], sigma, case["null"])
     record = dict(
         name=case["name"],
         observed=y.tolist(),
         truth=list(map(float, truth)),
         start=list(map(float, start)),
+        start_valid=bool(np.isfinite(half_deviance(y, predict(case, np.clip(np.asarray(start, float), lower, upper))[0]))),
         lower=[float(v) if np.isfinite(v) else None for v in lower],
         upper=[float(v) if np.isfinite(v) else None for v in upper],
         reference=theta.tolist(),
@@ -212,6 +236,8 @@ def case_record(case, y, truth, start, lower, upper, rng_starts):
         on_bound=on_bound,
         sigma=sigma,
         covariance=covariance,
+        scale=[float(1.0 / v) if v > 0 else None
+               for v in np.linalg.norm(predict(case, theta)[1] * inverse_root(predict(case, theta)[0])[:, None], axis=0)],
     )
     return record
 
@@ -259,12 +285,25 @@ def main():
                 truth, [0, 1, 0], [inf, 5000, inf],
                 [[0.01, 200.0, 0.0], [0.04, 1000.0, 0.1 * flux], [0.005, 3000.0, 0.0]], range(1, 4))
 
-    add(dict(name="split", family="split", t=t), [400.0, 600.0, 1.5], [0, 0, 0], [inf, inf, inf],
+    add(dict(name="split", family="split", t=t, null=[1.0, -1.0, 0.0]), [400.0, 600.0, 1.5], [0, 0, 0], [inf, inf, inf],
         [[300.0, 300.0, 1.0], [900.0, 50.0, 3.0]], range(1, 5))
-    for delta in (1e-7, 1e-3):
+    for delta in (1e-3, 1e-7, 1e-8, 1e-9):
         add(dict(name=f"linear/null-delta{delta:g}", family="linear",
-                 x=[[1.0, 0.0, delta], [0.0, 1.0, 1.0], [0.0, 0.0, 0.0]], offset=[100.0, 100.0, 100.0]),
+                 x=[[1.0, 0.0, delta], [0.0, 1.0, 1.0], [0.0, 0.0, 0.0]], offset=[100.0, 100.0, 100.0],
+                 null=[-delta, -1.0, 1.0]),
             [0.0, 0.0, 0.0], [-inf, -inf, -inf], [inf, inf, inf], [[5.0, -5.0, 3.0]], range(1, 4))
+    for n in (0.1, 0.5):
+        add(dict(name=f"saturated/n{n:g}", family="saturated", energy=energy.tolist(),
+                 flux=(1.0e4 * (energy / 6.0) ** -0.5).tolist(), center=6.0, peak=1.0e4, width_300k=0.12),
+            [n, 300.0], [0, 1], [inf, 5000], [[n * 0.5, 200.0], [n * 2.0, 800.0]], range(1, 5))
+    for rho in (0.99, 0.999):
+        for k in (3, 5, 7):
+            common = rng.uniform(0.5, 1.5, 40)
+            spread = np.sqrt((1.0 - rho) / rho) * 0.3
+            x = np.clip(common[:, None] + spread * rng.normal(size=(40, k)), 0.0, None)
+            truth = [20.0 if j % 2 == 0 else 0.0 for j in range(k)]
+            add(dict(name=f"linear/corr{rho:g}/k{k}", family="linear", x=x.tolist(), offset=[1.0] * 40),
+                truth, [0.0] * k, [inf] * k, [[5.0] * k, rng.uniform(0.0, 40.0, k).tolist()], range(1, 6))
     for delta in (1e-7, 1e-5):
         signs = np.tile([1.0, -1.0], 10)
         add(dict(name=f"linear/near-twin-delta{delta:g}", family="linear",

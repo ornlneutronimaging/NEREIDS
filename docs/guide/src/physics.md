@@ -78,9 +78,10 @@ Maximum-likelihood fitting for low-count data where Gaussian statistics break do
   joint-Poisson fit (conditional binomial deviance); the production path for
   counts data
 - Module: [`poisson`](api/nereids_fitting/poisson/) -- low-level single-arm
-  Poisson likelihood (projected damped Gauss-Newton); research diagnostics
+  Poisson likelihood (projected Fisher scoring); research diagnostics
   and the Fisher-information helper only — not a production fit route
-- Reference: TRINIDI approach (`trinidi/reconstruct.py`)
+- Reference: D. P. Bertsekas, "Projected Newton methods for optimization
+  problems with simple constraints", SIAM J. Control Optim. 20, 221–246 (1982)
 
 ## ENDF Nuclear Data
 

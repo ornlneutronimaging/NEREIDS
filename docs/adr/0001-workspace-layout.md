@@ -63,10 +63,9 @@ The decision above stands; two details have evolved since it was written:
   `nereids-endf`'s MAT-number table, with newly added natural-abundance
   data.
 - The fitting stack listed under `nereids-fitting` has evolved: the
-  standalone L-BFGS-B solver path (internal to `poisson.rs`) was deleted
-  (an L-BFGS-history fallback remains inside the transmission-domain
-  Poisson/KL optimizer); the current engines are Levenberg-Marquardt, the
-  Poisson/KL optimizer, and a counts-domain joint-Poisson (conditional
-  binomial deviance) solver.
+  L-BFGS solver paths inside `poisson.rs` were deleted; the current engines
+  are Levenberg-Marquardt, the single-arm Poisson fitter (projected Fisher
+  scoring, analytical Jacobian only), and a counts-domain joint-Poisson
+  (conditional binomial deviance) solver.
 
 The SAMMY reference document is ORNL/TM-9179/R8.
