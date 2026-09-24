@@ -7,7 +7,7 @@
 //! L(θ) = Σᵢ [μᵢ(θ) − yᵢ + yᵢ · ln(yᵢ / μᵢ(θ))]
 //! ```
 //!
-//! within parameter bounds, by damped Fisher-scoring steps when the model has
+//! within parameter bounds, by Fisher-scoring steps when the model has
 //! an analytical Jacobian and projected L-BFGS steps on finite differences
 //! otherwise, each with a backtracking line search.
 //!
@@ -49,8 +49,6 @@ pub struct PoissonConfig {
     pub armijo_c: f64,
     /// Line search backtracking factor.
     pub backtrack: f64,
-    /// Relative diagonal damping for analytical Gauss-Newton / Fisher steps.
-    pub gauss_newton_lambda: f64,
     /// History size for the finite-difference L-BFGS fallback.
     pub lbfgs_history: usize,
     /// Whether to compute the Fisher covariance matrix (and uncertainties)
@@ -68,7 +66,6 @@ impl Default for PoissonConfig {
             tol_param: 1e-8,
             armijo_c: 1e-4,
             backtrack: 0.5,
-            gauss_newton_lambda: 1e-3,
             lbfgs_history: 8,
             compute_covariance: true,
         }
@@ -82,8 +79,9 @@ pub struct PoissonResult {
     pub nll: f64,
     /// Number of iterations taken.
     pub iterations: usize,
-    /// Whether the fit ended within 0.014 standard errors of a minimum within
-    /// the parameter bounds.
+    /// Whether the fit ended at a minimum within the parameter bounds: with an
+    /// analytical Jacobian, within 0.014 standard errors of it; without one,
+    /// when the projected gradient or the step fell below `tol_param`.
     pub converged: bool,
     /// Final parameter values (all parameters, including fixed).
     pub params: Vec<f64>,
@@ -174,7 +172,6 @@ fn expected_information(mdl: f64) -> f64 {
 #[derive(Debug)]
 struct AnalyticalStepData {
     grad: Vec<f64>,
-    fisher: FlatMatrix,
     weighted_jacobian: FlatMatrix,
     residual: Vec<f64>,
 }
@@ -188,19 +185,6 @@ fn weighted_jacobian(jac: &FlatMatrix, y_model: &[f64]) -> FlatMatrix {
         }
     }
     weighted
-}
-
-fn information(weighted: &FlatMatrix) -> FlatMatrix {
-    let n = weighted.ncols;
-    let mut fisher = FlatMatrix::zeros(n, n);
-    for i in 0..weighted.nrows {
-        for j in 0..n {
-            for k in 0..n {
-                *fisher.get_mut(j, k) += weighted.get(i, j) * weighted.get(i, k);
-            }
-        }
-    }
-    fisher
 }
 
 fn compute_analytical_step_data(
@@ -229,7 +213,6 @@ fn compute_analytical_step_data(
         .collect();
     Some(AnalyticalStepData {
         grad,
-        fisher: information(&weighted),
         weighted_jacobian: weighted,
         residual,
     })
@@ -369,17 +352,6 @@ fn projected_gradient_norm(
         .sqrt()
 }
 
-fn extract_submatrix(matrix: &FlatMatrix, positions: &[usize]) -> FlatMatrix {
-    let n = positions.len();
-    let mut sub = FlatMatrix::zeros(n, n);
-    for (row_out, &row_in) in positions.iter().enumerate() {
-        for (col_out, &col_in) in positions.iter().enumerate() {
-            *sub.get_mut(row_out, col_out) = matrix.get(row_in, col_in);
-        }
-    }
-    sub
-}
-
 const NEWTON_DECREMENT_TOL: f64 = 1e-4;
 
 const DEGENERATE_EIGENVALUE: f64 = 1e-12;
@@ -397,30 +369,6 @@ fn bounds_reached(params: &ParameterSet) -> Vec<bool> {
 fn on_bound(param: &FitParameter) -> bool {
     (param.lower.is_finite() && (param.value - param.lower).abs() <= PIVOT_FLOOR)
         || (param.upper.is_finite() && (param.value - param.upper).abs() <= PIVOT_FLOOR)
-}
-
-fn reduced_newton_direction(
-    fisher: &FlatMatrix,
-    grad: &[f64],
-    positions: &[usize],
-    lambda: f64,
-) -> Vec<f64> {
-    let reduced_fisher = extract_submatrix(fisher, positions);
-    let reduced_grad: Vec<f64> = positions.iter().map(|&pos| grad[pos]).collect();
-    let reduced_dir = crate::lm::solve_damped_system(&reduced_fisher, &reduced_grad, lambda)
-        .unwrap_or_else(|| diagonal_direction(fisher, grad, positions));
-    let mut dir = vec![0.0; grad.len()];
-    for (&pos, &value) in positions.iter().zip(reduced_dir.iter()) {
-        dir[pos] = value;
-    }
-    dir
-}
-
-fn diagonal_direction(fisher: &FlatMatrix, grad: &[f64], positions: &[usize]) -> Vec<f64> {
-    positions
-        .iter()
-        .map(|&pos| grad[pos] / fisher.get(pos, pos).max(1e-12))
-        .collect()
 }
 
 fn singular_value_decomposition(matrix: &FlatMatrix) -> (Vec<f64>, FlatMatrix, FlatMatrix) {
@@ -479,16 +427,23 @@ struct ScaledJacobian {
 
 impl ScaledJacobian {
     fn new(weighted: &FlatMatrix, positions: &[usize]) -> Self {
-        let norm = |pos: usize| {
+        let largest = |pos: usize| {
             (0..weighted.nrows)
-                .map(|i| weighted.get(i, pos).powi(2))
-                .sum::<f64>()
-                .sqrt()
+                .map(|i| weighted.get(i, pos).abs())
+                .fold(0.0, f64::max)
+        };
+        let norm = |pos: usize| {
+            let largest = largest(pos);
+            largest
+                * (0..weighted.nrows)
+                    .map(|i| (weighted.get(i, pos) / largest).powi(2))
+                    .sum::<f64>()
+                    .sqrt()
         };
         let positions: Vec<usize> = positions
             .iter()
             .copied()
-            .filter(|&pos| norm(pos) > 0.0)
+            .filter(|&pos| largest(pos) > 0.0)
             .collect();
         let scale: Vec<f64> = positions.iter().map(|&pos| 1.0 / norm(pos)).collect();
         let mut scaled = FlatMatrix::zeros(weighted.nrows, positions.len());
@@ -511,19 +466,35 @@ impl ScaledJacobian {
         (0..self.singular.len()).filter(|&k| self.singular[k].powi(2) >= DEGENERATE_EIGENVALUE)
     }
 
-    fn newton_decrement(&self, residual: &[f64]) -> f64 {
+    fn spanned(&self) -> impl Iterator<Item = usize> + '_ {
         let largest = self.singular.iter().copied().fold(0.0, f64::max);
         let rank_floor = f64::EPSILON * self.left.nrows.max(self.left.ncols) as f64 * largest;
-        0.5 * (0..self.singular.len())
-            .filter(|&k| self.singular[k] > rank_floor)
-            .map(|k| {
-                let along = (0..residual.len())
-                    .map(|i| self.left.get(i, k) * residual[i])
-                    .sum::<f64>()
-                    / self.singular[k];
-                along * along
-            })
+        (0..self.singular.len()).filter(move |&k| self.singular[k] > rank_floor)
+    }
+
+    fn along(&self, k: usize, residual: &[f64]) -> f64 {
+        (0..residual.len())
+            .map(|i| self.left.get(i, k) * residual[i])
             .sum::<f64>()
+            / self.singular[k]
+    }
+
+    fn newton_decrement(&self, residual: &[f64]) -> f64 {
+        0.5 * self
+            .spanned()
+            .map(|k| self.along(k, residual).powi(2))
+            .sum::<f64>()
+    }
+
+    fn step(&self, residual: &[f64], n_free: usize) -> Vec<f64> {
+        let mut dir = vec![0.0; n_free];
+        for k in self.spanned() {
+            let coefficient = self.along(k, residual) / self.singular[k];
+            for (i, &pos) in self.positions.iter().enumerate() {
+                dir[pos] += self.scale[i] * self.vectors.get(i, k) * coefficient;
+            }
+        }
+        dir
     }
 
     fn covariance(&self, n_free: usize) -> (FlatMatrix, Vec<Option<f64>>) {
@@ -560,6 +531,14 @@ impl ScaledJacobian {
         }
         (covariance, errors)
     }
+}
+
+fn error_bars(weighted: &FlatMatrix, bounded: &[bool]) -> Option<(FlatMatrix, Vec<Option<f64>>)> {
+    if !weighted.data.iter().all(|v| v.is_finite()) {
+        return None;
+    }
+    let interior: Vec<usize> = (0..bounded.len()).filter(|&p| !bounded[p]).collect();
+    Some(ScaledJacobian::new(weighted, &interior).covariance(bounded.len()))
 }
 
 #[derive(Debug, Clone)]
@@ -847,6 +826,18 @@ fn backtracking_line_search(
 /// valid result with converged=true, or a non-finite NLL with converged=false).
 /// Returns `Ok(None)` if there are free parameters and optimization should
 /// proceed. Returns `Err(FittingError)` if model evaluation fails.
+fn predict(model: &dyn FitModel, params: &[f64], y_obs: &[f64]) -> Result<Vec<f64>, FittingError> {
+    let y_model = model.evaluate(params)?;
+    if y_model.len() != y_obs.len() {
+        return Err(FittingError::LengthMismatch {
+            expected: y_model.len(),
+            actual: y_obs.len(),
+            field: "y_obs",
+        });
+    }
+    Ok(y_model)
+}
+
 fn try_early_return_fixed(
     model: &dyn FitModel,
     y_obs: &[f64],
@@ -855,7 +846,7 @@ fn try_early_return_fixed(
     if params.n_free() != 0 {
         return Ok(None);
     }
-    let y_model = model.evaluate(&params.all_values())?;
+    let y_model = predict(model, &params.all_values(), y_obs)?;
     let nll = poisson_nll(y_obs, &y_model);
     if !nll.is_finite() {
         return Ok(Some(PoissonResult {
@@ -982,7 +973,8 @@ fn compute_fd_weighted_jacobian(
 ///
 /// # Returns
 /// `Ok(PoissonResult)` with final NLL, parameters, and convergence status.
-/// `Err(FittingError)` if model evaluation fails at the initial point.
+/// `Err(FittingError)` if the model's prediction and `y_obs` differ in
+/// length, or if model evaluation fails at the initial point.
 /// Evaluation errors during line-search trials are treated as bad steps
 /// (backtrack), not fatal errors.
 pub fn poisson_fit(
@@ -1007,7 +999,7 @@ pub fn poisson_fit(
     let mut pending_fd_state: Option<(Vec<f64>, Vec<f64>, Vec<bool>)> = None;
 
     params.all_values_into(&mut all_vals_buf);
-    let mut y_model = model.evaluate(&all_vals_buf)?;
+    let mut y_model = predict(model, &all_vals_buf, y_obs)?;
     let mut nll = poisson_nll(y_obs, &y_model);
 
     // Guard: if the initial NLL is non-finite, bail out immediately rather
@@ -1076,9 +1068,10 @@ pub fn poisson_fit(
 
             let inactive_positions = inactive_free_positions(params, &free_idx_buf, &grad);
             if let Some(ref analytical) = analytical_step {
-                if !grad
+                if !analytical
+                    .weighted_jacobian
+                    .data
                     .iter()
-                    .chain(&analytical.weighted_jacobian.data)
                     .all(|v| v.is_finite())
                 {
                     break 'outer;
@@ -1099,14 +1092,13 @@ pub fn poisson_fit(
             }
 
             let directions: Vec<(Vec<f64>, f64)> = if let Some(ref analytical) = analytical_step {
+                let scoring_step = |positions: &[usize]| {
+                    ScaledJacobian::new(&analytical.weighted_jacobian, positions)
+                        .step(&analytical.residual, grad.len())
+                };
                 let mut positions = inactive_positions.clone();
                 let newton = loop {
-                    let dir = reduced_newton_direction(
-                        &analytical.fisher,
-                        &grad,
-                        &positions,
-                        config.gauss_newton_lambda,
-                    );
+                    let dir = scoring_step(&positions);
                     let before = positions.len();
                     positions.retain(|&pos| {
                         !is_bound_active(&params.params[free_idx_buf[pos]], dir[pos])
@@ -1120,15 +1112,10 @@ pub fn poisson_fit(
                     .copied()
                     .filter(|pos| !positions.contains(pos))
                     .collect();
-                let mut inward = vec![0.0; grad.len()];
-                for (&pos, value) in
-                    blocked
-                        .iter()
-                        .zip(diagonal_direction(&analytical.fisher, &grad, &blocked))
-                {
-                    inward[pos] = value;
-                }
-                vec![(newton, config.step_size), (inward, config.step_size)]
+                vec![
+                    (newton, config.step_size),
+                    (scoring_step(&blocked), config.step_size),
+                ]
             } else {
                 if inactive_positions.is_empty() {
                     converged = true;
@@ -1243,15 +1230,9 @@ pub fn poisson_fit(
                 &mut free_idx_buf,
             )
         };
-        match weighted {
-            Some(weighted) => {
-                let interior: Vec<usize> = (0..bounded.len()).filter(|&p| !bounded[p]).collect();
-                let (covariance, errors) =
-                    ScaledJacobian::new(&weighted, &interior).covariance(bounded.len());
-                (Some(covariance), Some(errors))
-            }
-            None => (None, None),
-        }
+        weighted
+            .and_then(|weighted| error_bars(&weighted, &bounded))
+            .unzip()
     } else {
         (None, None)
     };
@@ -2039,7 +2020,6 @@ mod tests {
 
         let config = PoissonConfig {
             max_iter: 200,
-            gauss_newton_lambda: 1e-4,
             ..PoissonConfig::default()
         };
         let result = poisson_fit(&model, &y_obs, &mut params, &config).unwrap();
@@ -2550,7 +2530,6 @@ mod tests {
 
         let config = PoissonConfig {
             max_iter: 120,
-            gauss_newton_lambda: 1e-4,
             ..PoissonConfig::default()
         };
         let result = poisson_fit(&counts, &y_obs, &mut params, &config).unwrap();
@@ -3031,12 +3010,11 @@ mod tests {
 
     #[test]
     fn a_non_finite_jacobian_gives_no_error_bars() {
-        let mut weighted = FlatMatrix::zeros(2, 2);
+        let mut weighted = FlatMatrix::zeros(3, 2);
         weighted
             .data
-            .copy_from_slice(&[1.0, f64::INFINITY, 1.0, 1.0]);
-        let (_, errors) = ScaledJacobian::new(&weighted, &[0, 1]).covariance(2);
-        assert_eq!(errors, vec![None, None]);
+            .copy_from_slice(&[1.0, f64::NAN, 1.0, 1.0, 1.0, 0.5]);
+        assert!(error_bars(&weighted, &[false, false]).is_none());
     }
 
     #[test]
@@ -3123,7 +3101,124 @@ mod tests {
             &PoissonConfig::default(),
         )
         .unwrap();
-        assert!(result.nll < 1.0 || !result.converged, "{result:?}");
+        assert!(result.converged && result.nll < 1.0e-6, "{result:?}");
+    }
+
+    struct Correlated {
+        u: Vec<f64>,
+        w: Vec<f64>,
+        analytic: bool,
+    }
+
+    impl FitModel for Correlated {
+        fn evaluate(&self, params: &[f64]) -> Result<Vec<f64>, FittingError> {
+            Ok(self
+                .u
+                .iter()
+                .zip(&self.w)
+                .map(|(&u, &w)| params[0] * (-params[1] * u - params[2] * (u + w)).exp())
+                .collect())
+        }
+
+        fn analytical_jacobian(
+            &self,
+            params: &[f64],
+            free_param_indices: &[usize],
+            _y_current: &[f64],
+        ) -> Option<FlatMatrix> {
+            if !self.analytic {
+                return None;
+            }
+            let mut jacobian = FlatMatrix::zeros(self.u.len(), free_param_indices.len());
+            for (row, (&u, &w)) in self.u.iter().zip(&self.w).enumerate() {
+                let decay = (-params[1] * u - params[2] * (u + w)).exp();
+                for (col, &index) in free_param_indices.iter().enumerate() {
+                    *jacobian.get_mut(row, col) = match index {
+                        0 => decay,
+                        1 => -params[0] * u * decay,
+                        _ => -params[0] * (u + w) * decay,
+                    };
+                }
+            }
+            Some(jacobian)
+        }
+    }
+
+    #[test]
+    fn strongly_correlated_parameters_converge() {
+        let u: Vec<f64> = (0..400).map(|i| f64::from(i) / 200.0).collect();
+        let w: Vec<f64> = u.iter().map(|&x| 0.01 * (7.0 * x).cos()).collect();
+        let model = |analytic| Correlated {
+            u: u.clone(),
+            w: w.clone(),
+            analytic,
+        };
+        let observed: Vec<f64> = model(true)
+            .evaluate(&[1000.0, 0.5, 0.5])
+            .unwrap()
+            .iter()
+            .enumerate()
+            .map(|(i, &mu)| (mu + mu.sqrt() * [1.0, -1.0, 0.5, -0.5][i % 4]).round())
+            .collect();
+        let fit = |analytic| {
+            let mut params = ParameterSet::new(vec![
+                FitParameter::unbounded("A", 800.0),
+                FitParameter::unbounded("a", 0.3),
+                FitParameter::unbounded("b", 0.7),
+            ]);
+            poisson_fit(
+                &model(analytic),
+                &observed,
+                &mut params,
+                &PoissonConfig::default(),
+            )
+            .unwrap()
+        };
+        let scoring = fit(true);
+        let lbfgs = fit(false);
+        assert!(scoring.converged, "{scoring:?}");
+        assert!(scoring.nll <= lbfgs.nll + 1.0e-6, "{scoring:?} {lbfgs:?}");
+    }
+
+    struct Steep;
+
+    impl FitModel for Steep {
+        fn evaluate(&self, params: &[f64]) -> Result<Vec<f64>, FittingError> {
+            Ok(vec![100.0 * (1.0e160 * params[0]).exp(); 3])
+        }
+
+        fn analytical_jacobian(
+            &self,
+            params: &[f64],
+            free_param_indices: &[usize],
+            _y_current: &[f64],
+        ) -> Option<FlatMatrix> {
+            let mut jacobian = FlatMatrix::zeros(3, free_param_indices.len());
+            jacobian.data.fill(1.0e162 * (1.0e160 * params[0]).exp());
+            Some(jacobian)
+        }
+    }
+
+    #[test]
+    fn a_slope_too_large_to_square_is_still_fitted() {
+        let mut params = ParameterSet::new(vec![FitParameter::unbounded("theta", 0.0)]);
+        let result =
+            poisson_fit(&Steep, &[200.0; 3], &mut params, &PoissonConfig::default()).unwrap();
+        assert!(result.converged && result.nll < 1.0e-6, "{result:?}");
+    }
+
+    #[test]
+    fn data_that_do_not_match_the_prediction_are_refused() {
+        let model = DecayModel { t: decay_times() };
+        for observed in [vec![], vec![1.0; 5]] {
+            let mut params = ParameterSet::new(vec![
+                FitParameter::non_negative("a", 1000.0),
+                FitParameter::non_negative("b", 1.0),
+            ]);
+            assert!(
+                poisson_fit(&model, &observed, &mut params, &PoissonConfig::default()).is_err()
+            );
+        }
     }
 
     struct SplitAmplitude {
