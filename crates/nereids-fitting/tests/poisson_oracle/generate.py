@@ -183,40 +183,67 @@ def error_bars(case, theta, lower, upper):
     return on_bound.tolist(), sigma, covariance
 
 
-def reference(case, y, starts, truth, lower, upper):
+def local_minimum(case, y, start, truth, lower, upper):
+    """L-BFGS-B in variables scaled by the Fisher information at the truth,
+    restarted from its own answer, then Poisson least-squares polishing when
+    no parameter is on a bound."""
     mu, jac = predict(case, np.asarray(truth, float))
     scale = 1.0 / np.maximum(np.linalg.norm(jac * inverse_root(mu)[:, None], axis=0), 1e-150)
     bounds = [(None if not np.isfinite(lo) else lo / s, None if not np.isfinite(hi) else hi / s)
               for lo, hi, s in zip(lower, upper, scale)]
-    best_theta, best_value = None, np.inf
-    for start in starts:
-        z = np.clip(np.asarray(start, float), lower, upper) / scale
-        for _ in range(4):
-            res = minimize(
-                lambda zz: (lambda v, g: (v, g * scale))(*objective(case, y, zz * scale)),
-                z,
-                jac=True,
-                method="L-BFGS-B",
-                bounds=bounds,
-                options={"ftol": 1e-16, "gtol": 1e-14, "maxiter": 50000, "maxfun": 100000, "maxcor": 30},
-            )
-            z = res.x
-        theta = np.clip(z * scale, lower, upper)
-        value = half_deviance(y, predict(case, theta)[0])
-        if value < best_value:
-            best_theta, best_value = theta, value
-    return best_theta, best_value
+    z = np.clip(np.asarray(start, float), lower, upper) / scale
+    for _ in range(4):
+        res = minimize(
+            lambda zz: (lambda v, g: (v, g * scale))(*objective(case, y, zz * scale)),
+            z,
+            jac=True,
+            method="L-BFGS-B",
+            bounds=bounds,
+            options={"ftol": 1e-16, "gtol": 1e-14, "maxiter": 50000, "maxfun": 100000, "maxcor": 30},
+        )
+        z = res.x
+    theta = np.clip(z * scale, lower, upper)
+    if not np.any(theta == lower) and not np.any(theta == upper):
+        theta = polish(case, y, theta, lower, upper)
+    value = half_deviance(y, predict(case, theta)[0])
+    certified = bool(np.isfinite(value) and newton_decrement(case, y, theta, lower, upper) < CERTIFIED_DECREMENT)
+    return theta, value, certified
+
+
+def quadratic(case, y, theta, value, lower, upper):
+    """Whether the deviance rises by 0.5 +/- 0.1 one error bar away from the
+    minimum along every determined direction of the parameters off their
+    bounds, on each side that stays inside the box."""
+    on_bound = (np.isfinite(lower) & (theta == lower)) | (np.isfinite(upper) & (theta == upper))
+    interior = np.flatnonzero(~on_bound)
+    _, scaled, norms, keep = scaled_weighted_jacobian(case, theta, interior)
+    if scaled.shape[1] == 0:
+        return True
+    _, s, vt = np.linalg.svd(scaled, full_matrices=False)
+    for k in np.flatnonzero(s**2 >= DEGENERATE_EIGENVALUE):
+        step = np.zeros_like(theta)
+        step[interior[keep]] = vt[k] / s[k] / norms[keep]
+        for sign in (1.0, -1.0):
+            moved = theta + sign * step
+            if np.all((moved >= lower) & (moved <= upper)):
+                rise = half_deviance(y, predict(case, moved)[0]) - value
+                if not 0.4 <= rise <= 0.6:
+                    return False
+    return True
 
 
 def case_record(case, y, truth, start, lower, upper, rng_starts):
     check_jacobian(case, np.asarray(truth, float))
-    starts = [start, truth] + rng_starts
-    theta, value = reference(case, y, starts, truth, lower, upper)
-    if not np.any(theta == lower) and not np.any(theta == upper):
-        theta = polish(case, y, theta, lower, upper)
-        value = half_deviance(y, predict(case, theta)[0])
+    starts = [s for s in [start, truth] + rng_starts
+              if np.isfinite(half_deviance(y, predict(case, np.clip(np.asarray(s, float), lower, upper))[0]))]
+    runs = [local_minimum(case, y, s, truth, lower, upper) for s in starts]
+    minima = sorted({round(v, 9): (t, v) for t, v, ok in runs if ok}.values(), key=lambda m: m[1])
+    certified = bool(minima)
+    theta, value = minima[0] if certified else min(((t, v) for t, v, _ in runs), key=lambda m: m[1])
+    unique = certified and all(abs(v - value) <= 1e-6 * max(1.0, value) for _, v, ok in runs if ok) \
+        and all(ok for _, _, ok in runs)
+    well_determined = bool(unique and quadratic(case, y, theta, value, lower, upper))
     decrement = newton_decrement(case, y, theta, lower, upper)
-    certified = bool(np.isfinite(value) and decrement < CERTIFIED_DECREMENT)
     on_bound, sigma, covariance = error_bars(case, theta, lower, upper)
     if "null" in case:
         expected = [not (bound or component != 0.0) for bound, component in zip(on_bound, case["null"])]
@@ -233,6 +260,8 @@ def case_record(case, y, truth, start, lower, upper, rng_starts):
         reference_deviance=value,
         reference_decrement=float(decrement),
         certified=certified,
+        well_determined=well_determined,
+        minima=[v for _, v in minima],
         on_bound=on_bound,
         sigma=sigma,
         covariance=covariance,
@@ -292,6 +321,10 @@ def main():
                  x=[[1.0, 0.0, delta], [0.0, 1.0, 1.0], [0.0, 0.0, 0.0]], offset=[100.0, 100.0, 100.0],
                  null=[-delta, -1.0, 1.0]),
             [0.0, 0.0, 0.0], [-inf, -inf, -inf], [inf, inf, inf], [[5.0, -5.0, 3.0]], range(1, 4))
+    for flux in (0.3, 1.0, 3.0):
+        add(dict(name=f"saturated/low-flux{flux:g}", family="saturated", energy=energy.tolist(),
+                 flux=(flux * (energy / 6.0) ** -0.5).tolist(), center=6.0, peak=110.0, width_300k=0.12),
+            [0.02, 300.0], [0, 1], [inf, 5000], [[0.01, 200.0], [0.04, 1000.0], [0.005, 3000.0]], range(1, 11))
     for n in (0.1, 0.5):
         add(dict(name=f"saturated/n{n:g}", family="saturated", energy=energy.tolist(),
                  flux=(1.0e4 * (energy / 6.0) ** -0.5).tolist(), center=6.0, peak=1.0e4, width_300k=0.12),
@@ -318,10 +351,12 @@ def main():
     out = pathlib.Path(__file__).with_name("cases.json")
     out.write_text(json.dumps({"models": models, "cases": records}))
     certified = sum(r["certified"] for r in records)
-    print(f"{len(records)} cases, {certified} certified by the reference, written to {out}")
+    determined = sum(r["well_determined"] for r in records)
+    print(f"{len(records)} cases: {determined} well determined, {certified - determined} certified "
+          f"but not quadratic or not unique, {len(records) - certified} with no certified minimum; written to {out}")
     for r in records:
-        if not r["certified"]:
-            print(f"  not certified: {r['name']} decrement {r['reference_decrement']:.3e}")
+        if not r["well_determined"]:
+            print(f"  {'certified' if r['certified'] else 'no minimum'}: {r['name']} minima {r['minima']}")
 
 
 if __name__ == "__main__":

@@ -54,6 +54,9 @@ struct Case {
     upper: Vec<Option<f64>>,
     reference: Vec<f64>,
     reference_deviance: f64,
+    certified: bool,
+    well_determined: bool,
+    minima: Vec<f64>,
     on_bound: Vec<bool>,
     sigma: Vec<Option<f64>>,
     covariance: Vec<Vec<Option<f64>>>,
@@ -219,6 +222,22 @@ fn check(model: &Model, case: &Case) -> Vec<String> {
             fail(format!(
                 "a start predicting zero where counts exist gave converged {} after {} steps",
                 result.converged, result.iterations
+            ));
+        }
+        return failures;
+    }
+    if !case.certified {
+        return failures;
+    }
+    if !case.well_determined {
+        let at_a_minimum = case
+            .minima
+            .iter()
+            .any(|m| (result.deviance - m).abs() <= 1e-3);
+        if result.converged && !at_a_minimum {
+            fail(format!(
+                "converged at deviance {} away from every certified minimum {:?}",
+                result.deviance, case.minima
             ));
         }
         return failures;

@@ -6,10 +6,8 @@
 //! D(θ) = Σᵢ [μᵢ(θ) − yᵢ + yᵢ ln(yᵢ / μᵢ(θ))]
 //! ```
 //!
-//! within box bounds, by projected Fisher scoring with step halving
-//! (D. P. Bertsekas, "Projected Newton methods for optimization problems with
-//! simple constraints", SIAM J. Control Optim. 20, 221–246, 1982), for models
-//! with an analytical Jacobian.
+//! within box bounds, by projected Levenberg–Marquardt steps in the Fisher
+//! metric, for models with an analytical Jacobian.
 //!
 //! **Scope note.** The production pipeline does not apply this single-arm
 //! objective to normalized transmission. Raw open/sample counts use the
@@ -33,10 +31,6 @@ pub struct PoissonConfig {
     /// Convergence tolerance of the count-background solver; [`poisson_fit`]
     /// stops on the Newton decrement instead.
     pub tol_param: f64,
-    /// Armijo sufficient-decrease parameter.
-    pub armijo_c: f64,
-    /// Factor by which a rejected step is shortened.
-    pub backtrack: f64,
     /// Whether to compute the covariance and error bars after convergence.
     pub compute_covariance: bool,
 }
@@ -46,8 +40,6 @@ impl Default for PoissonConfig {
         Self {
             max_iter: 200,
             tol_param: 1e-8,
-            armijo_c: 1e-4,
-            backtrack: 0.5,
             compute_covariance: true,
         }
     }
@@ -60,8 +52,9 @@ pub struct PoissonResult {
     pub deviance: f64,
     /// Number of steps taken.
     pub iterations: usize,
-    /// Whether the fit ended within 0.014 standard errors of a minimum inside
-    /// the bounds.
+    /// Whether the expected-information Newton decrement fell below 1e-6
+    /// inside the bounds: within about 0.0014 standard errors of a minimum
+    /// where the deviance is quadratic there; see [`poisson_fit`].
     pub converged: bool,
     /// Final parameter values (all parameters, including fixed).
     pub params: Vec<f64>,
@@ -77,19 +70,21 @@ pub struct PoissonResult {
     pub on_bound: Vec<bool>,
 }
 
-const NEWTON_DECREMENT_TOL: f64 = 1e-4;
+const NEWTON_DECREMENT_TOL: f64 = 1e-6;
 
 const DEGENERATE_EIGENVALUE: f64 = 1e-12;
 
 const MAX_JACOBI_SWEEPS: usize = 64;
 
-const MAX_HALVINGS: usize = 60;
+const MAX_REJECTIONS: usize = 60;
 
-const ACTIVE_SET_EPSILON: f64 = 1.0;
+const INITIAL_DAMPING: f64 = 1e-3;
+
+const DAMPING_FACTOR: f64 = 10.0;
 
 /// `obs·ln(obs/mean) + mean − obs`, by C. Loader's `bd0` ("Fast and
 /// accurate computation of binomial probabilities", 2000): a series in
-/// `v = (obs − mean)/(obs + mean)` when `obs` and `mean` are within 10%.
+/// `v = (obs − mean)/(obs + mean)` when `|obs − mean| < 0.1 (obs + mean)`.
 fn half_deviance(obs: f64, mean: f64) -> f64 {
     let half_sum = obs / 2.0 + mean / 2.0;
     let difference = obs - mean;
@@ -110,7 +105,7 @@ fn half_deviance(obs: f64, mean: f64) -> f64 {
     } else if obs == 0.0 {
         mean
     } else {
-        obs * (obs / mean).ln() + mean - obs
+        obs * (obs.ln() - mean.ln()) + mean - obs
     }
 }
 
@@ -160,28 +155,30 @@ fn linearize(
             });
         }
     }
-    let inverse_root: Vec<f64> = y_model
-        .iter()
-        .map(|&mean| if mean > 0.0 { 1.0 / mean.sqrt() } else { 0.0 })
-        .collect();
-    for (i, &w) in inverse_root.iter().enumerate() {
-        for j in 0..weighted.ncols {
-            *weighted.get_mut(i, j) *= w;
+    let root: Vec<f64> = y_model.iter().map(|mean| mean.sqrt()).collect();
+    let mut gradient = vec![0.0; weighted.ncols];
+    for (i, &r) in root.iter().enumerate() {
+        for (j, g) in gradient.iter_mut().enumerate() {
+            let slope = weighted.get(i, j);
+            if r > 0.0 {
+                *weighted.get_mut(i, j) = slope / r;
+            } else {
+                *g += slope;
+                *weighted.get_mut(i, j) = 0.0;
+            }
         }
     }
     let residual: Vec<f64> = y_obs
         .iter()
         .zip(y_model)
-        .zip(&inverse_root)
-        .map(|((&obs, &mean), &w)| (mean - obs) * w)
+        .zip(&root)
+        .map(|((&obs, &mean), &r)| if r > 0.0 { (mean - obs) / r } else { 0.0 })
         .collect();
-    let gradient = (0..weighted.ncols)
-        .map(|j| {
-            (0..weighted.nrows)
-                .map(|i| weighted.get(i, j) * residual[i])
-                .sum()
-        })
-        .collect();
+    for (j, g) in gradient.iter_mut().enumerate() {
+        *g += (0..weighted.nrows)
+            .map(|i| weighted.get(i, j) * residual[i])
+            .sum::<f64>();
+    }
     Ok(Linearization {
         weighted,
         residual,
@@ -299,10 +296,11 @@ impl Decomposition {
             .sum::<f64>()
     }
 
-    fn step(&self, residual: &[f64], n_free: usize) -> Vec<f64> {
+    fn step(&self, residual: &[f64], n_free: usize, damping: f64) -> Vec<f64> {
         let mut direction = vec![0.0; n_free];
         for k in self.spanned() {
-            let coefficient = self.along(k, residual) / self.singular[k];
+            let s = self.singular[k];
+            let coefficient = self.along(k, residual) * s / (s * s + damping);
             for (i, &col) in self.columns.iter().enumerate() {
                 direction[col] += self.unscale(i, self.right[k][i] * coefficient);
             }
@@ -356,109 +354,44 @@ fn held_by_bound(param: &FitParameter, gradient: f64) -> bool {
     (param.value == param.lower && gradient > 0.0) || (param.value == param.upper && gradient < 0.0)
 }
 
-fn projected_scoring_step(
-    linear: &Linearization,
-    params: &ParameterSet,
-    free: &[usize],
-) -> Vec<f64> {
-    let n = free.len();
-    let scale: Vec<(f64, f64)> = (0..n).map(|j| column_scale(&linear.weighted, j)).collect();
-    let in_errors = |j: usize, distance: f64| distance * scale[j].0 * scale[j].1;
-    let diagonal: Vec<f64> = (0..n)
-        .map(|j| {
-            let (peak, length) = scale[j];
-            if peak > 0.0 {
-                linear.gradient[j] / peak / length / peak / length
-            } else {
-                0.0
-            }
-        })
-        .collect();
-    let projected_gradient = (0..n)
-        .map(|j| {
-            let p = &params.params[free[j]];
-            in_errors(j, p.value - (p.value - diagonal[j]).clamp(p.lower, p.upper)).powi(2)
-        })
-        .sum::<f64>()
-        .sqrt();
-    let reach = ACTIVE_SET_EPSILON.min(projected_gradient);
-    let near_bound: Vec<bool> = (0..n)
-        .map(|j| {
-            let p = &params.params[free[j]];
-            let g = linear.gradient[j];
-            (g > 0.0 && in_errors(j, p.value - p.lower) <= reach)
-                || (g < 0.0 && in_errors(j, p.upper - p.value) <= reach)
-        })
-        .collect();
-    let others: Vec<usize> = (0..n).filter(|&j| !near_bound[j]).collect();
-    let mut direction = Decomposition::new(&linear.weighted, &others).step(&linear.residual, n);
-    for j in (0..n).filter(|&j| near_bound[j]) {
-        direction[j] = diagonal[j];
-    }
-    direction
-}
-
-fn line_search(
-    model: &dyn FitModel,
-    params: &mut ParameterSet,
-    y_obs: &[f64],
-    direction: &[f64],
-    gradient: &[f64],
-    value: f64,
-    config: &PoissonConfig,
-) -> Option<(Vec<f64>, f64)> {
-    let start = params.free_values();
-    let mut alpha = 1.0;
-    for _ in 0..MAX_HALVINGS {
-        let unprojected: Vec<f64> = start
-            .iter()
-            .zip(direction)
-            .map(|(&x, &d)| x - alpha * d)
-            .collect();
-        params.set_free_values(&unprojected);
-        let trial = params.free_values();
-        if let Ok(y_model) = model.evaluate(&params.all_values()) {
-            let trial_value = deviance(y_obs, &y_model);
-            let decrease = gradient
-                .iter()
-                .zip(&start)
-                .zip(&trial)
-                .map(|((g, x), t)| g * (x - t))
-                .sum::<f64>();
-            if trial_value < value - config.armijo_c * decrease {
-                return Some((y_model, trial_value));
-            }
-        }
-        alpha *= config.backtrack;
-    }
-    params.set_free_values(&start);
-    None
-}
-
 /// Fit `params` to the counts `y_obs` by minimizing half the Poisson
 /// deviance within the parameter bounds.
 ///
-/// The model must provide an analytical Jacobian and non-negative
-/// predictions; a bin predicted zero must have no counts, and carries no
-/// information.  A free parameter within one standard error of a bound, and
-/// within the scaled projected-gradient step, whose gradient points out of
-/// the box takes a gradient step scaled by its Fisher information; the others
-/// take the Fisher-scoring step.  The step is projected onto the box and
-/// halved until the deviance decreases enough.  The fit has converged when
-/// the Newton decrement `½ gᵀF⁺g` over the parameters not held by a bound (on
-/// it, gradient pointing out), `F = Jᵀ diag(1/μ) J` the expected
-/// information, is below 1e-4, which puts it within 0.014 standard errors of
-/// a minimum.  It stops unconverged when no step lowers the deviance, when
-/// the Jacobian is not finite, when the start predicts zero where something
-/// was counted, or after `config.max_iter` steps.
+/// The model must provide an analytical Jacobian at every point the fit
+/// visits, and non-negative predictions; a bin predicted zero must have no
+/// counts, and adds its slope to the gradient and nothing to the
+/// information.  Each step is the Levenberg–Marquardt step
+/// `(F + λI)⁻¹g` in coordinates scaled to unit Fisher information, projected
+/// onto the box; `λ` is divided by 10 after a step that lowers the deviance
+/// and multiplied by 10 before retrying one that does not (D. W. Marquardt,
+/// J. Soc. Indust. Appl. Math. 11, 431–441, 1963).  A
+/// free parameter on its bound whose gradient points out of the box is held
+/// there for the step and left out of the convergence test.
+///
+/// The fit has converged when the Newton decrement `½ gᵀF⁺g` over the
+/// parameters not held by a bound (on it, gradient pointing out),
+/// `F = Jᵀ diag(1/μ) J` the expected information, is below 1e-6: the
+/// quadratic model built from `F` predicts less than 1e-6 of further
+/// decrease.  Where the deviance is quadratic near the minimum this puts the
+/// fit within about 0.0014 standard errors of it; at about one count per bin
+/// the remaining decrease has been seen to reach six times the prediction.  Where it is not — weakly
+/// determined parameters on a curved or flat likelihood ridge, a minimum at
+/// infinity, or a parameter that adds counts to a bin predicted near zero —
+/// the fit can stop short of the minimum, or at another local minimum, and
+/// the error bars are not standard errors.
+///
+/// It stops unconverged when no step lowers the deviance, when the Jacobian
+/// is not finite, when the start predicts zero where something was counted,
+/// or after `config.max_iter` steps.
 ///
 /// # Errors
 /// `FittingError::EmptyData` if `y_obs` is empty;
 /// `FittingError::InvalidConfig` if an observation is negative or not
-/// finite, `armijo_c` or `backtrack` is outside (0, 1), or the model has no
-/// analytical Jacobian; `FittingError::LengthMismatch` if the prediction or
-/// the Jacobian does not match `y_obs` and the free parameters; the model's
-/// error if it fails at the start.
+/// finite, a free parameter's
+/// bounds are inverted or NaN, or the model returns no analytical Jacobian;
+/// `FittingError::LengthMismatch` if the prediction or the Jacobian does not
+/// match `y_obs` and the free parameters; the model's error if it fails at
+/// the start.
 pub fn poisson_fit(
     model: &dyn FitModel,
     y_obs: &[f64],
@@ -477,15 +410,15 @@ pub fn poisson_fit(
     if y_obs.is_empty() {
         return Err(FittingError::EmptyData);
     }
-    for (name, value) in [
-        ("armijo_c", config.armijo_c),
-        ("backtrack", config.backtrack),
-    ] {
-        if !(value > 0.0 && value < 1.0) {
-            return Err(FittingError::InvalidConfig(format!(
-                "{name} must lie in (0, 1), got {value}"
-            )));
-        }
+    if let Some(p) = params
+        .params
+        .iter()
+        .find(|p| !p.fixed && (p.lower.is_nan() || p.upper.is_nan() || p.lower > p.upper))
+    {
+        return Err(FittingError::InvalidConfig(format!(
+            "parameter {} has bounds [{}, {}]",
+            p.name, p.lower, p.upper
+        )));
     }
     params.set_free_values(&params.free_values());
     let mut y_model = model.evaluate(&params.all_values())?;
@@ -500,6 +433,7 @@ pub fn poisson_fit(
     let mut value = deviance(y_obs, &y_model);
     let mut iterations = 0;
     let mut at_minimum = None;
+    let mut damping = INITIAL_DAMPING;
     while value.is_finite() {
         let linear = linearize(model, params, &free, y_obs, &y_model)?;
         if !linear.weighted.data.iter().all(|v| v.is_finite()) {
@@ -516,16 +450,24 @@ pub fn poisson_fit(
         if iterations == config.max_iter {
             break;
         }
-        let direction = projected_scoring_step(&linear, params, &free);
-        let Some((trial_model, trial_value)) = line_search(
-            model,
-            params,
-            y_obs,
-            &direction,
-            &linear.gradient,
-            value,
-            config,
-        ) else {
+        let start = params.free_values();
+        let mut accepted = None;
+        for _ in 0..MAX_REJECTIONS {
+            let direction = decomposition.step(&linear.residual, free.len(), damping);
+            let unprojected: Vec<f64> = start.iter().zip(&direction).map(|(x, d)| x - d).collect();
+            params.set_free_values(&unprojected);
+            if let Ok(trial_model) = model.evaluate(&params.all_values()) {
+                let trial_value = deviance(y_obs, &trial_model);
+                if trial_value < value {
+                    damping /= DAMPING_FACTOR;
+                    accepted = Some((trial_model, trial_value));
+                    break;
+                }
+            }
+            params.set_free_values(&start);
+            damping *= DAMPING_FACTOR;
+        }
+        let Some((trial_model, trial_value)) = accepted else {
             break;
         };
         y_model = trial_model;
@@ -1354,6 +1296,7 @@ mod tests {
             (0.0, 2.5, 2.5),
             (1.0e308, 9.0e307, 5.360_515_657_826_301e305),
             (1.7e308, 1.65e308, 7.500_373_544_579_622e304),
+            (1.0, 1.0e-310, 712.801_378_828_154_2),
         ] {
             let got = half_deviance(obs, mean);
             assert!(
@@ -1577,30 +1520,66 @@ mod tests {
     }
 
     #[test]
-    fn line_search_settings_outside_zero_to_one_are_refused() {
+    fn inverted_or_nan_bounds_are_refused() {
         let model = decay(1.0);
         let observed = model.evaluate(&[100.0, 1.5]).unwrap();
-        for (armijo_c, backtrack) in [
-            (0.0, 0.5),
-            (1.0, 0.5),
-            (f64::NAN, 0.5),
-            (1e-4, 0.0),
-            (1e-4, 1.0),
-            (1e-4, -0.5),
-        ] {
-            let config = PoissonConfig {
-                armijo_c,
-                backtrack,
-                ..PoissonConfig::default()
-            };
-            let mut params = decay_params(50.0, 1.0, f64::INFINITY);
+        for (lower, upper) in [(1.0, 0.0), (f64::NAN, 1.0), (0.0, f64::NAN)] {
+            let mut params = ParameterSet::new(vec![
+                FitParameter {
+                    name: "a".into(),
+                    value: 50.0,
+                    lower,
+                    upper,
+                    fixed: false,
+                },
+                FitParameter::non_negative("b", 1.0),
+            ]);
+            let result = poisson_fit(&model, &observed, &mut params, &PoissonConfig::default());
             assert!(
-                matches!(
-                    poisson_fit(&model, &observed, &mut params, &config),
-                    Err(FittingError::InvalidConfig(_))
-                ),
-                "{armijo_c}, {backtrack}"
+                matches!(result, Err(FittingError::InvalidConfig(_))),
+                "{lower}, {upper}"
             );
         }
+    }
+
+    struct Additive;
+
+    impl FitModel for Additive {
+        fn evaluate(&self, params: &[f64]) -> Result<Vec<f64>, FittingError> {
+            Ok(vec![2.0 * params[0], 1.0 - params[0]])
+        }
+
+        fn analytical_jacobian(
+            &self,
+            _params: &[f64],
+            free_param_indices: &[usize],
+            _y_current: &[f64],
+        ) -> Option<FlatMatrix> {
+            let mut jacobian = FlatMatrix::zeros(2, free_param_indices.len());
+            jacobian.data.copy_from_slice(&[2.0, -1.0]);
+            Some(jacobian)
+        }
+    }
+
+    #[test]
+    fn a_bin_predicted_zero_keeps_its_slope_in_the_gradient() {
+        let mut params = ParameterSet::new(vec![FitParameter {
+            name: "theta".into(),
+            value: 0.0,
+            lower: 0.0,
+            upper: 1.0,
+            fixed: false,
+        }]);
+        let result = poisson_fit(
+            &Additive,
+            &[0.0, 0.0],
+            &mut params,
+            &PoissonConfig::default(),
+        )
+        .unwrap();
+        assert!(
+            result.converged && result.params[0] == 0.0 && result.on_bound == vec![true],
+            "{result:?}"
+        );
     }
 }

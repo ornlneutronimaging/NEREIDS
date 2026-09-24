@@ -64,8 +64,9 @@ The decision above stands; two details have evolved since it was written:
   data.
 - The fitting stack listed under `nereids-fitting` has evolved: the
   L-BFGS solver paths inside `poisson.rs` were deleted; the current engines
-  are Levenberg-Marquardt, the single-arm Poisson fitter (projected Fisher
-  scoring, analytical Jacobian only), and a counts-domain joint-Poisson
+  are Levenberg-Marquardt, the single-arm Poisson fitter (projected
+  Levenberg-Marquardt in the Fisher metric, analytical Jacobian only), and
+  a counts-domain joint-Poisson
   (conditional binomial deviance) solver.
 
 The SAMMY reference document is ORNL/TM-9179/R8.

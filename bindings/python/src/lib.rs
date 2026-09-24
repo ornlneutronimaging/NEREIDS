@@ -561,9 +561,7 @@ impl PyFitResult {
     /// Uncertainties on fitted densities.
     ///
     /// Returns NaN-filled array when covariance computation was skipped.
-    /// Uncertainty values are NaN when covariance is not available
-    /// (e.g., Poisson fits via `poisson_fit`, which does not
-    /// compute an analytic Hessian for uncertainty estimation).
+    /// Uncertainty values are NaN when covariance is not available.
     #[getter]
     fn uncertainties<'py>(&self, py: Python<'py>) -> Bound<'py, PyArray1<f64>> {
         let unc = self
