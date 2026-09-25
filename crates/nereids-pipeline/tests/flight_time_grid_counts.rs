@@ -90,7 +90,7 @@ fn counts(grid: &FlightTimeGrid) -> Vec<f64> {
         .iter()
         .map(|&u| beam_per_us(u))
         .collect();
-    grid.predict(&beam)
+    grid.predict(&beam).expect("one value per grid point")
 }
 
 fn spread(counts: &[f64], expected: &[f64]) -> f64 {

@@ -213,6 +213,11 @@ fn invalid_windows_and_unaffordable_grids_are_refused() {
         FlightTimeGrid::new(&edges(), T0_US, &sharp(2000.0)),
         Err(FlightTimeGridError::TooManyPoints { .. })
     ));
+    let grid = FlightTimeGrid::new(&edges(), T0_US, constant).expect("grid");
+    assert!(matches!(
+        grid.predict(&[1.0]),
+        Err(FlightTimeGridError::ValuesLength { found: 1, .. })
+    ));
     let near_cap = FlightTimeGrid::new(&edges(), T0_US, &sharp(700.0)).expect("near the cap");
     assert!(matches!(
         near_cap.halved(),
@@ -305,4 +310,19 @@ fn pulses_whose_arrival_can_fall_with_flight_time_are_refused() {
             other => panic!("{parameter}: {other:?}"),
         }
     }
+}
+
+#[test]
+fn a_falling_beta_without_storage_is_accepted() {
+    let pulse = pulse(
+        EnergyLaw::Const(0.565),
+        EnergyLaw::SqrtE {
+            a0: -0.001,
+            a1: 0.3,
+        },
+        EnergyLaw::Const(0.0),
+        None,
+        None,
+    );
+    assert!(FlightTimeGrid::new(&edges(), T0_US, &pulse).is_ok());
 }

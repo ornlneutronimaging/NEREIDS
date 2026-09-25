@@ -3,9 +3,9 @@
 //!
 //! A neutron of flight time `u` has energy `E = (TOF_FACTOR·L/u)²` and
 //! arrives at `t0 + u + delay`, the delay drawn from the Ikeda–Carpenter
-//! pulse at `E`.  The grid spans every flight time whose neutrons can reach
-//! the bins, and refuses a window that neutrons from outside the pulse's
-//! synthesis grid can reach.
+//! pulse at `E`.  The grid spans every flight time whose neutrons reach the
+//! bins with more than [`NEGLIGIBLE_ARRIVAL_PROBABILITY`](crate::ikeda_carpenter::NEGLIGIBLE_ARRIVAL_PROBABILITY) chance, and refuses
+//! a window that neutrons from outside the pulse's synthesis grid can reach.
 
 use std::fmt;
 use std::sync::Arc;
@@ -25,7 +25,8 @@ pub enum FlightTimeGridError {
     /// The timing offset is not finite.
     InvalidTimingOffset(f64),
     /// Not supported: the pulse's `parameter` law lengthens the pulse as
-    /// energy rises (α or β falling, or R rising).  The range relies on
+    /// energy rises (α falling, β falling with a storage term, or R rising).
+    /// The range relies on
     /// arrival times growing with flight time, which such a pulse does not
     /// guarantee.
     LengthensWithEnergy { parameter: &'static str },
@@ -38,6 +39,8 @@ pub enum FlightTimeGridError {
     TooManyPoints { step_us: f64 },
     /// The bin probabilities could not be built.
     Response(CountsResponseError),
+    /// `found` values were given for a grid of `expected` points.
+    ValuesLength { expected: usize, found: usize },
 }
 
 impl fmt::Display for FlightTimeGridError {
@@ -67,6 +70,10 @@ impl fmt::Display for FlightTimeGridError {
                 "a step of {step_us} µs needs more than {MAX_POINTS} grid points"
             ),
             Self::Response(e) => write!(f, "bin probabilities: {e}"),
+            Self::ValuesLength { expected, found } => write!(
+                f,
+                "{found} values were given for a grid of {expected} points"
+            ),
         }
     }
 }
@@ -94,8 +101,9 @@ pub struct FlightTimeGrid {
 
 impl FlightTimeGrid {
     /// The grid for bins `time_edges_us` (µs) with timing offset `t0_us`,
-    /// the flight path taken from `pulse`.  The step is half the pulse's
-    /// shorter rise at the two ends of the range.
+    /// the flight path taken from `pulse`.  The step, half the pulse's
+    /// shorter rise at the two ends of the range, is a starting step: the
+    /// counts are converged once [`Self::halved`] no longer changes them.
     ///
     /// # Errors
     /// See [`FlightTimeGridError`].
@@ -119,7 +127,10 @@ impl FlightTimeGrid {
         let change = |law: &EnergyLaw| law.eval(e_max) - law.eval(e_min);
         for (parameter, lengthens) in [
             ("α", change(&params.alpha) < 0.0),
-            ("β", change(&params.beta) < 0.0),
+            (
+                "β",
+                change(&params.beta) < 0.0 && params.r.eval(e_min) > 0.0,
+            ),
             ("R", change(&params.r) > 0.0),
         ] {
             if lengthens {
@@ -237,22 +248,27 @@ impl FlightTimeGrid {
     /// `values[j]` neutrons per µs at each grid point predicts, or, for any
     /// other per-point values, the same linear map.  It differs from the
     /// trapezoid rule by half a step of the end points' terms, where `P_k`
-    /// is zero, or at most [`NEGLIGIBLE_ARRIVAL_PROBABILITY`](crate::ikeda_carpenter::NEGLIGIBLE_ARRIVAL_PROBABILITY)
-    /// at the fast end for an unfolded pulse.  Features of the values
-    /// narrower than the step are not resolved.
+    /// is zero, or at most [`NEGLIGIBLE_ARRIVAL_PROBABILITY`](crate::ikeda_carpenter::NEGLIGIBLE_ARRIVAL_PROBABILITY) at the fast end
+    /// for an unfolded pulse.  Features of the values narrower than the step
+    /// are not resolved.
     ///
-    /// # Panics
-    /// If `values` does not have one entry per grid point.
-    #[must_use]
-    pub fn predict(&self, values: &[f64]) -> Vec<f64> {
-        assert_eq!(values.len(), self.flight_times_us.len());
+    /// # Errors
+    /// [`FlightTimeGridError::ValuesLength`] unless `values` has one entry
+    /// per grid point.
+    pub fn predict(&self, values: &[f64]) -> Result<Vec<f64>, FlightTimeGridError> {
+        if values.len() != self.flight_times_us.len() {
+            return Err(FlightTimeGridError::ValuesLength {
+                expected: self.flight_times_us.len(),
+                found: values.len(),
+            });
+        }
         let mut counts = vec![0.0; self.response.n_detector_bins()];
         for (j, &v) in values.iter().enumerate() {
             for (k, p) in self.response.row_entries(j) {
                 counts[k] += self.step_us * v * p;
             }
         }
-        counts
+        Ok(counts)
     }
 }
 
