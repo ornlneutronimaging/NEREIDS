@@ -782,11 +782,11 @@ impl IkedaCarpenter {
     }
 
     /// The first and last delay, in µs after the nominal arrival, of a
-    /// neutron of `energy_ev`, outside which its chance of arriving is below
-    /// [`NEGLIGIBLE_ARRIVAL_PROBABILITY`]: without a fold, 0 and the delay
-    /// where `1 − ic_cdf` falls to that chance; with a fold, the fold's reach
-    /// before 0 and the end of the sample grid its bin probabilities are
-    /// integrated on.
+    /// neutron of `energy_ev`, outside which [`Self::detector_bin_probabilities`]
+    /// gives it less than [`NEGLIGIBLE_ARRIVAL_PROBABILITY`] chance of
+    /// arriving: without a fold, 0 and the delay where `1 − ic_cdf` falls to
+    /// that chance; with a fold, the fold's reach before 0 and a bound on the
+    /// end of the sampled pulse those probabilities integrate.
     ///
     /// # Errors
     /// [`ResolutionParseError::InvalidFormat`] when `energy_ev` is not

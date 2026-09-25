@@ -279,16 +279,25 @@ fn a_neutron_arrives_between_its_delays_but_for_a_negligible_chance() {
 }
 
 #[test]
-fn pulses_that_lengthen_as_energy_rises_are_refused() {
+fn pulses_whose_arrival_can_fall_with_flight_time_are_refused() {
     let (c, sqrt_e) = (EnergyLaw::Const, |a0, a1| EnergyLaw::SqrtE { a0, a1 });
     for (parameter, pulse) in [
-        ("α", pulse(sqrt_e(-0.05, 1.2), c(0.25), c(0.15), None, None)),
+        ("α", pulse(sqrt_e(-0.05, 1.0), c(0.25), c(0.0), None, None)),
         (
             "β",
-            pulse(c(0.565), sqrt_e(-0.01, 0.3), c(0.15), None, None),
+            pulse(c(0.565), sqrt_e(-0.02, 0.3), c(0.15), None, None),
         ),
-        ("R", pulse(c(0.565), c(0.25), sqrt_e(0.01, 0.1), None, None)),
+        (
+            "R",
+            pulse(c(0.565), c(0.002), sqrt_e(0.07, 0.0), None, None),
+        ),
     ] {
+        let latest = |u: f64| u + pulse.delays_us((CLOCK / u).powi(2)).expect("delays").1;
+        let fastest = CLOCK / E_MAX_EV.sqrt();
+        let falls = (0..1000)
+            .map(|i| fastest + 0.5 * f64::from(i))
+            .any(|u| latest(u + 0.5) < latest(u));
+        assert!(falls, "{parameter}");
         match FlightTimeGrid::new(&edges(), T0_US, &pulse) {
             Err(FlightTimeGridError::LengthensWithEnergy { parameter: found }) => {
                 assert_eq!(found, parameter);
