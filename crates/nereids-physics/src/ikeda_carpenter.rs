@@ -134,8 +134,7 @@
 use std::sync::Arc;
 
 use crate::resolution::{
-    PulseDelays, ResolutionParseError, TOF_FACTOR, TabulatedResolution, argmax,
-    piecewise_linear_bin_masses,
+    ResolutionParseError, TOF_FACTOR, TabulatedResolution, piecewise_linear_bin_masses,
 };
 
 /// de Broglie wavelength factor: λ (Å) = `LAMBDA_ANGSTROM_FACTOR` / √(E in eV).
@@ -782,31 +781,46 @@ impl IkedaCarpenter {
             || self.params.channel_fwhm_us.unwrap_or(0.0) != 0.0
     }
 
-    /// The pulse's delays at one true neutron energy.  Without a burst or
-    /// channel fold the pulse starts at 0 and its last delay is where the
-    /// chance of a later arrival, `1 − ic_cdf`, falls to
-    /// [`NEGLIGIBLE_ARRIVAL_PROBABILITY`]; with a fold they are the ends of
-    /// the sampled pulse its bin probabilities integrate.
+    /// The lowest first delay and the highest last delay, in µs after the
+    /// nominal arrival, of neutrons with energies in `[e_low, e_high]`: the
+    /// delays of the pulse with the lowest α and β and the highest R that
+    /// the laws take at the two energies.  Without a fold that pulse starts
+    /// at 0 and ends where the chance of a later arrival falls to
+    /// [`NEGLIGIBLE_ARRIVAL_PROBABILITY`]; with a fold it spans the sample
+    /// grid its bin probabilities are integrated on.
+    ///
+    /// # Errors
+    /// As [`Self::source_pulse_at`] at either energy.
+    pub fn delay_bounds(
+        &self,
+        e_low: f64,
+        e_high: f64,
+    ) -> Result<(f64, f64), ResolutionParseError> {
+        self.validate_probe_energy(e_low)?;
+        self.validate_probe_energy(e_high)?;
+        let lowest = |law: &EnergyLaw| law.eval(e_low).min(law.eval(e_high));
+        let (alpha, beta) = (lowest(&self.params.alpha), lowest(&self.params.beta));
+        let r = self.params.r.eval(e_low).max(self.params.r.eval(e_high));
+        if !self.folded() {
+            return Ok((0.0, tail_delay(alpha, beta, r)));
+        }
+        let (alpha, beta, r) = (alpha.max(MIN_RATE), beta.max(MIN_RATE), r.clamp(0.0, 1.0));
+        let tau_max = tau_reach(alpha, beta, r);
+        let widest_step = (FAST_REACH_E_FOLDS / alpha / (self.n_tau as f64 - 1.0))
+            .max(tau_max / (MAX_TAU_SAMPLES as f64 - 1.0));
+        let reach = margin_of(&self.params) + widest_step;
+        Ok((-reach, tau_max + reach))
+    }
+
+    /// The time in µs from the first sample of the pulse at `energy_ev` to
+    /// its peak.
     ///
     /// # Errors
     /// As [`Self::source_pulse_at`].
-    pub fn pulse_delays(&self, energy_ev: f64) -> Result<PulseDelays, ResolutionParseError> {
+    pub fn rise_us(&self, energy_ev: f64) -> Result<f64, ResolutionParseError> {
         self.validate_probe_energy(energy_ev)?;
         let (times, densities) = synth_source_pulse_density(&self.params, self.n_tau, energy_ev)?;
-        let last_us = if self.folded() {
-            times[times.len() - 1]
-        } else {
-            tail_delay(
-                self.params.alpha.eval(energy_ev),
-                self.params.beta.eval(energy_ev),
-                self.params.r.eval(energy_ev),
-            )
-        };
-        Ok(PulseDelays {
-            first_us: times[0],
-            peak_us: times[argmax(&densities)],
-            last_us,
-        })
+        Ok(times[argmax(&densities)] - times[0])
     }
 
     /// Evaluate the physical source pulse at one true neutron energy.
@@ -1031,15 +1045,8 @@ fn tau_geometry(
     beta: f64,
     r: f64,
 ) -> Result<(f64, f64, f64), String> {
-    // τ_max: reach far enough that the prompt tail (e^{−ατ}) and, when
-    // storage is active, the slow tail (e^{−βτ}) are below the trim level.
     let fast_reach = FAST_REACH_E_FOLDS / alpha;
-    let slow_reach = if r > R_NEGLIGIBLE {
-        SLOW_REACH_E_FOLDS / beta
-    } else {
-        0.0
-    };
-    let tau_max = fast_reach.max(slow_reach);
+    let tau_max = tau_reach(alpha, beta, r);
 
     // Requested step and resolution floor. `floor ≥ dtau_req` always: the
     // prompt terms satisfy MIN_N_TAU ≤ n_tau (validated by `new`) and the
@@ -1086,6 +1093,15 @@ fn tau_geometry(
         ));
     }
     Ok((dtau_req.max(capped_step), tau_max, margin_of(params)))
+}
+
+fn tau_reach(alpha: f64, beta: f64, r: f64) -> f64 {
+    let fast_reach = FAST_REACH_E_FOLDS / alpha;
+    if r > R_NEGLIGIBLE {
+        fast_reach.max(SLOW_REACH_E_FOLDS / beta)
+    } else {
+        fast_reach
+    }
 }
 
 /// Symmetric τ-grid margin for the burst/channel folds:
@@ -1212,6 +1228,20 @@ fn synth_source_pulse(
         .max(f64::MIN_POSITIVE);
     let weights = densities.into_iter().map(|value| value / peak).collect();
     Ok((offsets, weights))
+}
+
+/// Index of the maximum element (first on ties). Slice is non-empty by
+/// construction in [`synth_kernel`].
+fn argmax(xs: &[f64]) -> usize {
+    let mut best = 0;
+    let mut best_v = xs[0];
+    for (i, &x) in xs.iter().enumerate().skip(1) {
+        if x > best_v {
+            best_v = x;
+            best = i;
+        }
+    }
+    best
 }
 
 /// Symmetric, unit-sum Gaussian kernel sampled on a `dtau`-spaced grid out to
