@@ -3,21 +3,19 @@
 //!
 //! A neutron of flight time `u` has energy `E = (TOF_FACTOR·L/u)²` and
 //! arrives at `t0 + u + delay`, the delay drawn from the Ikeda–Carpenter
-//! pulse at `E`.  The grid spans every flight time in the pulse's synthesis
-//! grid whose neutrons can reach the bins; beyond the synthesis grid the
-//! pulse is taken to be the pulse at its nearer end.
+//! pulse at `E`.  The grid spans every flight time whose neutrons can reach
+//! the bins, and refuses a window that neutrons from outside the pulse's
+//! synthesis grid can reach.
 
 use std::fmt;
 use std::sync::Arc;
 
 use crate::counts_response::{CountsResponseError, DetectorBinResponseMatrix};
-use crate::ikeda_carpenter::IkedaCarpenter;
+use crate::ikeda_carpenter::{EnergyLaw, IkedaCarpenter};
 use crate::resolution::{ResolutionFunction, ResolutionParseError, TOF_FACTOR};
 
 /// Largest number of grid points a window may need.
 pub const MAX_POINTS: usize = 100_000;
-
-const SEARCH_WIDTH: f64 = 1e-9;
 
 /// Why a window has no flight-time grid.
 #[derive(Debug)]
@@ -26,10 +24,15 @@ pub enum FlightTimeGridError {
     InvalidTimeEdges,
     /// The timing offset is not finite.
     InvalidTimingOffset(f64),
+    /// Not supported: the pulse's `parameter` law lengthens the pulse as
+    /// energy rises (α or β falling, or R rising).  The range relies on
+    /// arrival times growing with flight time, which such a pulse does not
+    /// guarantee.
+    LengthensWithEnergy { parameter: &'static str },
     /// The pulse cannot be evaluated.
     Pulse(ResolutionParseError),
     /// Neutrons with energies outside the pulse's synthesis grid,
-    /// `low_ev` to `high_ev`, can reach the window, or none inside it can.
+    /// `low_ev` to `high_ev`, can reach the window.
     OutsideCalibration { low_ev: f64, high_ev: f64 },
     /// A grid at `step_us` would need more than [`MAX_POINTS`] points.
     TooManyPoints { step_us: f64 },
@@ -47,11 +50,17 @@ impl fmt::Display for FlightTimeGridError {
                 )
             }
             Self::InvalidTimingOffset(t0) => write!(f, "t0 = {t0} µs must be finite"),
+            Self::LengthensWithEnergy { parameter } => write!(
+                f,
+                "unsupported pulse: its {parameter} law lengthens the pulse as energy rises; \
+                 the flight-time grid needs α and β that do not fall and R that does not \
+                 rise with energy"
+            ),
             Self::Pulse(e) => write!(f, "pulse: {e}"),
             Self::OutsideCalibration { low_ev, high_ev } => write!(
                 f,
-                "the window is reached from outside the pulse's synthesis grid, \
-                 {low_ev} to {high_ev} eV"
+                "neutrons from outside the pulse's synthesis grid, {low_ev} to \
+                 {high_ev} eV, can reach the window"
             ),
             Self::TooManyPoints { step_us } => write!(
                 f,
@@ -106,43 +115,40 @@ impl FlightTimeGrid {
         }
         let references = pulse.ref_energies();
         let (e_min, e_max) = (references[0], references[references.len() - 1]);
-        let outside = FlightTimeGridError::OutsideCalibration {
-            low_ev: e_min,
-            high_ev: e_max,
-        };
+        let params = pulse.params();
+        let change = |law: &EnergyLaw| law.eval(e_max) - law.eval(e_min);
+        for (parameter, lengthens) in [
+            ("α", change(&params.alpha) < 0.0),
+            ("β", change(&params.beta) < 0.0),
+            ("R", change(&params.r) > 0.0),
+        ] {
+            if lengthens {
+                return Err(FlightTimeGridError::LengthensWithEnergy { parameter });
+            }
+        }
         let clock = TOF_FACTOR * pulse.flight_path_m();
         let energy = |u: f64| (clock / u).powi(2);
-        let flight_time = |e: f64| clock / e.sqrt();
         let first_edge = time_edges_us[0] - t0_us;
         let last_edge = time_edges_us[time_edges_us.len() - 1] - t0_us;
-
-        let (_, fastest_last) = pulse.delay_bounds(e_max, e_max)?;
-        let (slowest_first, _) = pulse.delay_bounds(e_min, e_min)?;
-        if flight_time(e_max) + fastest_last > first_edge
-            || flight_time(e_min) + slowest_first < last_edge
-        {
-            return Err(outside);
-        }
-        let reaches = |fast: f64, slow: f64| -> Result<bool, ResolutionParseError> {
-            let (first, last) = pulse.delay_bounds(energy(slow), energy(fast))?;
-            Ok(slow + last > first_edge && fast + first < last_edge)
+        let latest = |u: f64| {
+            pulse
+                .delays_us(energy(u))
+                .map(|(_, last)| u + last - first_edge)
         };
-        let cells: Vec<(f64, f64)> = references
-            .windows(2)
-            .rev()
-            .map(|w| (flight_time(w[1]), flight_time(w[0])))
-            .collect();
-        let u_lo = cells
-            .iter()
-            .find_map(|&(fast, slow)| outermost_reach(&reaches, fast, slow, true).transpose())
-            .transpose()?;
-        let u_hi = cells
-            .iter()
-            .rev()
-            .find_map(|&(fast, slow)| outermost_reach(&reaches, fast, slow, false).transpose())
-            .transpose()?;
-        let (Some(u_lo), Some(u_hi)) = (u_lo, u_hi) else {
-            return Err(outside);
+        let earliest = |u: f64| {
+            pulse
+                .delays_us(energy(u))
+                .map(|(first, _)| u + first - last_edge)
+        };
+        let (fastest, slowest) = (clock / e_max.sqrt(), clock / e_min.sqrt());
+        let (Some(u_lo), Some(u_hi)) = (
+            crossing(&latest, fastest, slowest)?,
+            crossing(&earliest, fastest, slowest)?,
+        ) else {
+            return Err(FlightTimeGridError::OutsideCalibration {
+                low_ev: e_min,
+                high_ev: e_max,
+            });
         };
 
         let rise = pulse
@@ -250,26 +256,22 @@ impl FlightTimeGrid {
     }
 }
 
-fn outermost_reach(
-    reaches: &dyn Fn(f64, f64) -> Result<bool, ResolutionParseError>,
+fn crossing(
+    signed: &dyn Fn(f64) -> Result<f64, ResolutionParseError>,
     fast: f64,
     slow: f64,
-    from_fast: bool,
 ) -> Result<Option<f64>, ResolutionParseError> {
-    if !reaches(fast, slow)? {
+    if signed(fast)? >= 0.0 || signed(slow)? < 0.0 {
         return Ok(None);
     }
-    if slow - fast <= SEARCH_WIDTH * slow {
-        return Ok(Some(if from_fast { fast } else { slow }));
+    let (mut low, mut high) = (fast, slow);
+    while high - low > f64::EPSILON * high {
+        let middle = 0.5 * (low + high);
+        if signed(middle)? < 0.0 {
+            low = middle;
+        } else {
+            high = middle;
+        }
     }
-    let middle = 0.5 * (fast + slow);
-    let (near, far) = if from_fast {
-        ((fast, middle), (middle, slow))
-    } else {
-        ((middle, slow), (fast, middle))
-    };
-    match outermost_reach(reaches, near.0, near.1, from_fast)? {
-        Some(u) => Ok(Some(u)),
-        None => outermost_reach(reaches, far.0, far.1, from_fast),
-    }
+    Ok(Some(high))
 }

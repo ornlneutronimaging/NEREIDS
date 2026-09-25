@@ -781,26 +781,21 @@ impl IkedaCarpenter {
             || self.params.channel_fwhm_us.unwrap_or(0.0) != 0.0
     }
 
-    /// The lowest first delay and the highest last delay, in µs after the
-    /// nominal arrival, of neutrons with energies in `[e_low, e_high]`: the
-    /// delays of the pulse with the lowest α and β and the highest R that
-    /// the laws take at the two energies.  Without a fold that pulse starts
-    /// at 0 and ends where the chance of a later arrival falls to
-    /// [`NEGLIGIBLE_ARRIVAL_PROBABILITY`]; with a fold it spans the sample
-    /// grid its bin probabilities are integrated on.
+    /// The first and last delay, in µs after the nominal arrival, of a
+    /// neutron of `energy_ev`, outside which its chance of arriving is below
+    /// [`NEGLIGIBLE_ARRIVAL_PROBABILITY`]: without a fold, 0 and the delay
+    /// where `1 − ic_cdf` falls to that chance; with a fold, the fold's reach
+    /// before 0 and the end of the sample grid its bin probabilities are
+    /// integrated on.
     ///
     /// # Errors
-    /// As [`Self::source_pulse_at`] at either energy.
-    pub fn delay_bounds(
-        &self,
-        e_low: f64,
-        e_high: f64,
-    ) -> Result<(f64, f64), ResolutionParseError> {
-        self.validate_probe_energy(e_low)?;
-        self.validate_probe_energy(e_high)?;
-        let lowest = |law: &EnergyLaw| law.eval(e_low).min(law.eval(e_high));
-        let (alpha, beta) = (lowest(&self.params.alpha), lowest(&self.params.beta));
-        let r = self.params.r.eval(e_low).max(self.params.r.eval(e_high));
+    /// [`ResolutionParseError::InvalidFormat`] when `energy_ev` is not
+    /// positive and finite, or a law is singular or out of range there.
+    pub fn delays_us(&self, energy_ev: f64) -> Result<(f64, f64), ResolutionParseError> {
+        self.validate_probe_energy(energy_ev)?;
+        let alpha = self.params.alpha.eval(energy_ev);
+        let beta = self.params.beta.eval(energy_ev);
+        let r = self.params.r.eval(energy_ev);
         if !self.folded() {
             return Ok((0.0, tail_delay(alpha, beta, r)));
         }
@@ -808,8 +803,8 @@ impl IkedaCarpenter {
         let tau_max = tau_reach(alpha, beta, r);
         let widest_step = (FAST_REACH_E_FOLDS / alpha / (self.n_tau as f64 - 1.0))
             .max(tau_max / (MAX_TAU_SAMPLES as f64 - 1.0));
-        let reach = margin_of(&self.params) + widest_step;
-        Ok((-reach, tau_max + reach))
+        let margin = margin_of(&self.params);
+        Ok((-margin, tau_max + margin + widest_step))
     }
 
     /// The time in µs from the first sample of the pulse at `energy_ev` to

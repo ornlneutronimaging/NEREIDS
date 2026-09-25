@@ -16,26 +16,6 @@ fn edges() -> Vec<f64> {
     (350..=470).map(f64::from).collect()
 }
 
-fn pulse_on(
-    params: IkedaCarpenterParams,
-    (e_min_ev, e_max_ev): (f64, f64),
-    n_tau: usize,
-) -> Arc<IkedaCarpenter> {
-    Arc::new(
-        IkedaCarpenter::new(
-            params,
-            FLIGHT_PATH_M,
-            &SynthesisGrid {
-                e_min_ev,
-                e_max_ev,
-                n_energies: 32,
-                n_tau,
-            },
-        )
-        .expect("valid IC model"),
-    )
-}
-
 fn pulse(
     alpha: EnergyLaw,
     beta: EnergyLaw,
@@ -43,16 +23,24 @@ fn pulse(
     burst_sigma_us: Option<f64>,
     channel_fwhm_us: Option<f64>,
 ) -> Arc<IkedaCarpenter> {
-    pulse_on(
-        IkedaCarpenterParams {
-            alpha,
-            beta,
-            r,
-            burst_sigma_us,
-            channel_fwhm_us,
-        },
-        (E_MIN_EV, E_MAX_EV),
-        256,
+    Arc::new(
+        IkedaCarpenter::new(
+            IkedaCarpenterParams {
+                alpha,
+                beta,
+                r,
+                burst_sigma_us,
+                channel_fwhm_us,
+            },
+            FLIGHT_PATH_M,
+            &SynthesisGrid {
+                e_min_ev: E_MIN_EV,
+                e_max_ev: E_MAX_EV,
+                n_energies: 32,
+                n_tau: 256,
+            },
+        )
+        .expect("valid IC model"),
     )
 }
 
@@ -84,16 +72,6 @@ fn unfolded() -> Vec<(&'static str, Arc<IkedaCarpenter>)> {
                 EnergyLaw::SqrtE { a0: 0.35, a1: 0.05 },
                 EnergyLaw::SqrtE { a0: 0.02, a1: 0.2 },
                 EnergyLaw::ExpMilliEv { kappa: 5.0e4 },
-                None,
-                None,
-            ),
-        ),
-        (
-            "alpha falling as energy rises",
-            pulse(
-                EnergyLaw::SqrtE { a0: -0.05, a1: 1.2 },
-                EnergyLaw::Const(0.25),
-                EnergyLaw::Const(0.15),
                 None,
                 None,
             ),
@@ -152,17 +130,13 @@ fn largest_outside(pulse: &IkedaCarpenter, grid: &FlightTimeGrid) -> f64 {
 
 #[test]
 fn no_flight_time_outside_the_range_reaches_a_bin() {
-    for (name, pulse) in unfolded() {
+    for (name, pulse) in unfolded().into_iter().chain(folded()) {
         let grid = FlightTimeGrid::new(&edges(), T0_US, &pulse).expect(name);
         let largest = largest_outside(&pulse, &grid);
         assert!(
             largest < NEGLIGIBLE_ARRIVAL_PROBABILITY,
             "{name}: {largest}"
         );
-    }
-    for (name, pulse) in folded() {
-        let grid = FlightTimeGrid::new(&edges(), T0_US, &pulse).expect(name);
-        assert_eq!(largest_outside(&pulse, &grid), 0.0, "{name}");
     }
 }
 
@@ -247,27 +221,30 @@ fn invalid_windows_and_unaffordable_grids_are_refused() {
 }
 
 #[test]
-fn the_delay_bounds_hold_every_arrival_of_every_energy_between() {
+fn a_neutron_arrives_between_its_delays_but_for_a_negligible_chance() {
     let (c, sqrt_e) = (EnergyLaw::Const, |a0, a1| EnergyLaw::SqrtE { a0, a1 });
-    let r_law = |kappa| EnergyLaw::ExpMilliEv { kappa };
     let witnesses = [
         (
-            "alpha law",
             pulse(sqrt_e(0.35, 0.05), c(0.25), c(0.15), None, None),
-            NEGLIGIBLE_ARRIVAL_PROBABILITY,
+            false,
         ),
         (
-            "beta law",
             pulse(c(0.565), sqrt_e(0.02, 0.05), c(0.5), None, None),
-            NEGLIGIBLE_ARRIVAL_PROBABILITY,
+            false,
         ),
         (
-            "R law",
-            pulse(c(0.565), c(0.1), r_law(5.0e4), None, None),
-            NEGLIGIBLE_ARRIVAL_PROBABILITY,
+            pulse(
+                c(0.565),
+                c(0.1),
+                EnergyLaw::ExpMilliEv { kappa: 5.0e4 },
+                None,
+                None,
+            ),
+            false,
         ),
+        (pulse(c(0.565), c(0.25), c(0.15), Some(1.0), None), true),
+        (pulse(c(0.565), c(0.25), c(0.0), None, Some(2.0)), true),
         (
-            "folded alpha and beta laws",
             pulse(
                 sqrt_e(0.35, 0.05),
                 sqrt_e(0.02, 0.2),
@@ -275,61 +252,48 @@ fn the_delay_bounds_hold_every_arrival_of_every_energy_between() {
                 Some(0.5),
                 Some(2.0),
             ),
-            0.0,
-        ),
-        (
-            "folded, R crossing its storage cutoff",
-            pulse_on(
-                IkedaCarpenterParams {
-                    alpha: c(1.0),
-                    beta: sqrt_e(-0.1, 1.0001),
-                    r: r_law(4535.964588767297),
-                    burst_sigma_us: Some(1.0),
-                    channel_fwhm_us: None,
-                },
-                (1.0, 100.0),
-                600,
-            ),
-            0.0,
+            true,
         ),
     ];
-    for (name, pulse, tail) in witnesses {
-        let references = pulse.ref_energies();
-        let whole = (references[0], references[references.len() - 1]);
-        for (e_low, e_high) in references.windows(2).map(|w| (w[0], w[1])).chain([whole]) {
-            let (first, last) = pulse.delay_bounds(e_low, e_high).expect(name);
-            for k in 0..=20 {
-                let e = e_low * (e_high / e_low).powf(f64::from(k) / 20.0);
-                let nominal = -TOF_FACTOR * FLIGHT_PATH_M / e.sqrt();
-                let chance = |edges: [f64; 2]| -> f64 {
-                    pulse
-                        .detector_bin_probabilities(e, &edges, nominal)
-                        .expect("probabilities")[0]
-                };
-                assert_eq!(chance([first - 1.0e4, first]), 0.0, "{name} {e}");
-                assert!(chance([last, last + 1.0e6]) <= tail, "{name} {e}");
-            }
+    for (w, (pulse, folded)) in witnesses.iter().enumerate() {
+        for k in 0..=60 {
+            let e = E_MIN_EV * (E_MAX_EV / E_MIN_EV).powf(f64::from(k) / 60.0);
+            let (first, last) = pulse.delays_us(e).expect("delays");
+            let nominal = -TOF_FACTOR * FLIGHT_PATH_M / e.sqrt();
+            let chance = |edges: [f64; 2]| -> f64 {
+                pulse
+                    .detector_bin_probabilities(e, &edges, nominal)
+                    .expect("probabilities")[0]
+            };
+            let before = chance([first - 1.0e4, first]);
+            let after = chance([last, last + 1.0e6]);
+            assert!(
+                before <= NEGLIGIBLE_ARRIVAL_PROBABILITY,
+                "{w} {e}: {before}"
+            );
+            assert!(after <= NEGLIGIBLE_ARRIVAL_PROBABILITY, "{w} {e}: {after}");
+            assert_eq!(chance([first - 1.0e4, 0.0]) > 0.0, *folded, "{w} {e}");
+            assert_eq!(after == 0.0, *folded, "{w} {e}");
         }
     }
 }
 
 #[test]
-fn the_search_backs_out_of_intervals_whose_bounds_reach_but_whose_neutrons_do_not() {
-    let (fastest_us, slowest_us) = (120.0, 400.0);
-    let pulse = pulse_on(
-        IkedaCarpenterParams {
-            alpha: EnergyLaw::SqrtE {
-                a0: -100.0 / CLOCK,
-                a1: 1.0,
-            },
-            beta: EnergyLaw::Const(0.25),
-            r: EnergyLaw::Const(0.0),
-            burst_sigma_us: None,
-            channel_fwhm_us: None,
-        },
-        ((CLOCK / slowest_us).powi(2), (CLOCK / fastest_us).powi(2)),
-        256,
-    );
-    let window: Vec<f64> = (260..=270).map(f64::from).collect();
-    assert_tight("alpha falling steeply", &pulse, &window, 0.0);
+fn pulses_that_lengthen_as_energy_rises_are_refused() {
+    let (c, sqrt_e) = (EnergyLaw::Const, |a0, a1| EnergyLaw::SqrtE { a0, a1 });
+    for (parameter, pulse) in [
+        ("α", pulse(sqrt_e(-0.05, 1.2), c(0.25), c(0.15), None, None)),
+        (
+            "β",
+            pulse(c(0.565), sqrt_e(-0.01, 0.3), c(0.15), None, None),
+        ),
+        ("R", pulse(c(0.565), c(0.25), sqrt_e(0.01, 0.1), None, None)),
+    ] {
+        match FlightTimeGrid::new(&edges(), T0_US, &pulse) {
+            Err(FlightTimeGridError::LengthensWithEnergy { parameter: found }) => {
+                assert_eq!(found, parameter);
+            }
+            other => panic!("{parameter}: {other:?}"),
+        }
+    }
 }
