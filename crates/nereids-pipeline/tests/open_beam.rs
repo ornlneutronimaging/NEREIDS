@@ -71,7 +71,7 @@ fn true_beam(counts_per_us: f64) -> impl Fn(f64) -> f64 {
     }
 }
 
-fn open_counts(pulse: &Arc<IkedaCarpenter>, beam: &dyn Fn(f64) -> f64) -> Vec<f64> {
+fn simulated(pulse: &Arc<IkedaCarpenter>, beam: &dyn Fn(f64) -> f64) -> Vec<f64> {
     Instrument {
         time_edges_us: edges(),
         flight_path_m: FLIGHT_PATH_M,
@@ -88,9 +88,10 @@ fn open_counts(pulse: &Arc<IkedaCarpenter>, beam: &dyn Fn(f64) -> f64) -> Vec<f6
         SIMULATOR_STEP_US,
     )
     .counts
-    .into_iter()
-    .map(f64::round)
-    .collect()
+}
+
+fn open_counts(pulse: &Arc<IkedaCarpenter>, beam: &dyn Fn(f64) -> f64) -> Vec<f64> {
+    simulated(pulse, beam).into_iter().map(f64::round).collect()
 }
 
 fn calibration(pulse: &Arc<IkedaCarpenter>) -> Calibration {
@@ -157,6 +158,12 @@ fn the_fit_is_on_the_finer_grid_of_the_first_pair_halving_leaves_unchanged() {
             "{level:e}"
         );
         assert_eq!(fit.step_us, chain[accepted].step_us(), "{level:e}");
+        let distance: f64 = predicted(&chain[accepted], &beam)
+            .iter()
+            .zip(simulated(pulse, &beam))
+            .map(|(p, s)| (p - s).powi(2) / s)
+            .sum();
+        assert!(distance <= BOUND, "{level:e}: {distance}");
         let (knot_low, knot_high) = fit.beam.knot_span_us();
         let (u_low, u_high) = chain[accepted].range_us();
         assert!(
@@ -205,6 +212,21 @@ fn counts_that_are_not_an_open_beam_are_refused() {
         fit_open_beam(&edges(), &counts[1..], &calibration(pulse)),
         Err(PipelineError::ShapeMismatch(_))
     ));
+}
+
+#[test]
+fn counts_that_cannot_determine_the_beam_leave_its_covariance_undetermined() {
+    let pulse = &pulses()[0].1;
+    for (bin, count) in [(60, 1.0), (119, 3.0)] {
+        let mut counts = vec![0.0; edges().len() - 1];
+        counts[bin] = count;
+        let fit = fit_open_beam(&edges(), &counts, &calibration(pulse)).expect("a fit");
+        assert!(
+            fit.covariance
+                .is_none_or(|c| (0..4).any(|i| c.get(i, i).is_nan())),
+            "bin {bin}"
+        );
+    }
 }
 
 #[test]

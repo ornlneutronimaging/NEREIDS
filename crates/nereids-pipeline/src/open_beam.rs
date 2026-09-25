@@ -13,8 +13,9 @@ use nereids_physics::ikeda_carpenter::IkedaCarpenter;
 use crate::beam::BeamSpline;
 use crate::error::PipelineError;
 
-/// Largest `Σ_k (μ_fine − μ_coarse)² / μ_fine` by which halving the grid may
-/// change the predicted counts for the finer grid to be accepted.
+/// Largest `Σ_k (μ_fine − μ_coarse)² / μ_fine`, over bins predicted non-empty,
+/// by which halving the grid may change the predicted counts for the finer
+/// grid to be accepted.
 pub const BOUND: f64 = 0.01;
 
 /// A neutron of flight time `u` arrives at `t0_us + u` plus a delay drawn from
@@ -37,10 +38,12 @@ pub struct OpenBeamFit {
     /// the counts determine every coefficient; `covariance` shows that.
     pub converged: bool,
     /// Covariance of the beam's coefficients; rows and columns of a
-    /// coefficient the counts leave undetermined are NaN.
+    /// coefficient the counts leave undetermined are NaN.  `None` when the fit
+    /// did not converge.
     pub covariance: Option<FlatMatrix>,
-    /// Step, in µs, and number of points of the accepted grid.
+    /// Step, in µs, of the accepted grid.
     pub step_us: f64,
+    /// Number of points of the accepted grid.
     pub points: usize,
     /// How many times the first grid was halved to reach the accepted one.
     pub halvings: usize,
@@ -50,9 +53,9 @@ pub struct OpenBeamFit {
 /// `time_edges_us` (µs).  The beam is one cubic in `ln u` over the flight-time
 /// grid's range; neutrons faster than that range, each reaching the bins with
 /// less than [`NEGLIGIBLE_ARRIVAL_PROBABILITY`](nereids_physics::ikeda_carpenter::NEGLIGIBLE_ARRIVAL_PROBABILITY)
-/// chance, are left out.  The grid is halved until a halving changes the
-/// predicted counts by at most [`BOUND`], and the fit on the finer grid of that
-/// pair is returned.
+/// chance, are left out.  The grid is halved, and the beam refitted on each
+/// finer grid, until the refitted beam's predicted counts differ from the
+/// coarser grid's by at most [`BOUND`]; that fit is returned.
 ///
 /// # Errors
 /// [`PipelineError::ShapeMismatch`] unless there is one count per bin;
@@ -91,20 +94,17 @@ pub fn fit_open_beam(
     let (u_lo, u_hi) = grid.range_us();
     let per_unit_beam = grid.predict(&vec![1.0; grid.flight_times_us().len()])?;
     let per_us = open_counts.iter().sum::<f64>() / per_unit_beam.iter().sum::<f64>();
-    let (mut beam, _) = fit(
-        &grid,
-        &BeamSpline::constant(u_lo, u_hi, per_us),
-        open_counts,
-    )?;
+    let mut beam = BeamSpline::constant(u_lo, u_hi, per_us);
     let mut halvings = 0;
     loop {
         let finer = grid.halved()?;
-        let spread: f64 = counts(&finer, &beam)?
+        let (refit, result) = fit(&finer, &beam, open_counts)?;
+        let spread: f64 = counts(&finer, &refit)?
             .iter()
-            .zip(counts(&grid, &beam)?)
+            .zip(counts(&grid, &refit)?)
+            .filter(|(fine, _)| **fine > 0.0)
             .map(|(fine, coarse)| (fine - coarse).powi(2) / fine)
             .sum();
-        let (refit, result) = fit(&finer, &beam, open_counts)?;
         grid = finer;
         beam = refit;
         halvings += 1;
@@ -146,12 +146,15 @@ fn fit(
             .collect(),
     );
     let result = poisson_fit(&model, open_counts, &mut params, &PoissonConfig::default())?;
-    Ok((start.with_coefficients(&result.params), result))
+    Ok((
+        start.with_coefficients(std::array::from_fn(|i| result.params[i])),
+        result,
+    ))
 }
 
 struct OpenBeamModel<'a> {
     grid: &'a FlightTimeGrid,
-    basis: Vec<[(usize, f64); 4]>,
+    basis: Vec<[f64; 4]>,
 }
 
 impl<'a> OpenBeamModel<'a> {
@@ -171,7 +174,8 @@ impl<'a> OpenBeamModel<'a> {
             .iter()
             .map(|b| {
                 b.iter()
-                    .map(|&(i, w)| w * coefficients[i])
+                    .zip(coefficients)
+                    .map(|(w, c)| w * c)
                     .sum::<f64>()
                     .exp()
             })
@@ -203,7 +207,7 @@ impl FitModel for OpenBeamModel<'_> {
                 .basis
                 .iter()
                 .zip(&beam)
-                .map(|(b, &phi)| phi * b.iter().filter(|p| p.0 == index).map(|p| p.1).sum::<f64>())
+                .map(|(b, &phi)| phi * b[index])
                 .collect();
             for (row, value) in self.counts(&values).ok()?.into_iter().enumerate() {
                 *jacobian.get_mut(row, col) = value;
