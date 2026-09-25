@@ -1,6 +1,7 @@
 //! Error types for the nereids-pipeline crate.
 
 use nereids_fitting::error::FittingError;
+use nereids_physics::flight_time_grid::FlightTimeGridError;
 use nereids_physics::transmission::TransmissionError;
 
 /// Errors that can occur during pipeline operations.
@@ -25,6 +26,10 @@ pub enum PipelineError {
     /// Error from the fitting engine (e.g. empty data, length mismatch).
     #[error("Fitting error: {0}")]
     Fitting(FittingError),
+
+    /// The flight-time grid refused the window or the pulse.
+    #[error("Flight-time grid: {0}")]
+    FlightTimeGrid(#[from] FlightTimeGridError),
 }
 
 impl From<TransmissionError> for PipelineError {
