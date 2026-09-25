@@ -229,10 +229,11 @@ impl FlightTimeGrid {
 
     /// `step · Σ_j v_j P_k(u_j)` for each bin `k`: the counts a beam of
     /// `values[j]` neutrons per µs at each grid point predicts, or, for any
-    /// other per-point values, the same linear map.  This is the trapezoid
-    /// rule, since `P_k` falls to zero, or to [`NEGLIGIBLE_ARRIVAL_PROBABILITY`](crate::ikeda_carpenter::NEGLIGIBLE_ARRIVAL_PROBABILITY)
-    /// for an unfolded pulse, at both ends of the range.  Features of the
-    /// values narrower than the step are not resolved.
+    /// other per-point values, the same linear map.  It differs from the
+    /// trapezoid rule by half a step of the end points' terms, where `P_k`
+    /// is zero, or at most [`NEGLIGIBLE_ARRIVAL_PROBABILITY`](crate::ikeda_carpenter::NEGLIGIBLE_ARRIVAL_PROBABILITY)
+    /// at the fast end for an unfolded pulse.  Features of the values
+    /// narrower than the step are not resolved.
     ///
     /// # Panics
     /// If `values` does not have one entry per grid point.
