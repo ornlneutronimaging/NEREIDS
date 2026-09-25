@@ -29,18 +29,29 @@ pub struct Calibration {
 /// The fitted open beam.
 #[derive(Debug, Clone)]
 pub struct OpenBeamFit {
-    /// The beam per µs of flight time, on the accepted grid's flight-time
-    /// range.
+    /// The beam per µs of flight time; its knots span the window's flight
+    /// times.
     pub beam: BeamSpline,
     /// Half the Poisson deviance at the fit.
     pub deviance: f64,
     /// Whether the fitter converged.  It certifies the minimisation, not that
     /// the counts determine every coefficient; `covariance` shows that.
     pub converged: bool,
-    /// Covariance of the beam's coefficients; rows and columns of a
-    /// coefficient the counts leave undetermined are NaN.  `None` when the fit
-    /// did not converge.
+    /// Covariance of the beam's coefficients, scaled by `overdispersion`; rows
+    /// and columns of a coefficient the counts leave undetermined are NaN.
+    /// `None` when the fit did not converge.
     pub covariance: Option<FlatMatrix>,
+    /// Variance of the counts over their Poisson variance, at least 1: the
+    /// richest fitted beam's deviance per degree of freedom, for independent
+    /// bins.  Beam structure finer than every candidate is counted in it as
+    /// noise; such a beam is not supported and is fitted smooth, which shows
+    /// as an overdispersion far above the detector's.  `None` when the fit did
+    /// not converge.
+    pub overdispersion: Option<f64>,
+    /// Whether the chosen beam is the richest fitted; the counts may then hold
+    /// structure finer than its intervals, whose misfit `overdispersion`
+    /// includes.
+    pub at_limit: bool,
     /// Step, in µs, of the accepted grid.
     pub step_us: f64,
     /// Number of points of the accepted grid.
@@ -50,30 +61,38 @@ pub struct OpenBeamFit {
 }
 
 /// Fit the beam to the raw open-beam counts `open_counts` of the time bins
-/// `time_edges_us` (µs).  `ln φ`, the logarithm of the beam, is one cubic in
-/// `ln u` over the flight-time grid's range; neutrons faster than that range,
-/// each reaching the bins with less than
+/// `time_edges_us` (µs).  `ln φ`, the logarithm of the beam, is a cubic spline
+/// in `ln u` with knots over the window's flight times; neutrons faster than
+/// the flight-time grid's range, each reaching the bins with less than
 /// [`NEGLIGIBLE_ARRIVAL_PROBABILITY`](nereids_physics::ikeda_carpenter::NEGLIGIBLE_ARRIVAL_PROBABILITY)
-/// chance, are left out.  The grid is halved, and the beam refitted on each
-/// finer grid, until the refitted beam's predicted counts differ from the
-/// coarser grid's by at most [`BOUND`]; that fit is returned.
+/// chance, are left out.
 ///
-/// Counts too sparse to determine the beam are not supported: their fitted
-/// beam can vary faster than a grid within the point cap resolves, and the fit
-/// ends with that refusal.
+/// The spline's intervals are halved from one while the coefficients number at
+/// most half the bins.  Each candidate is fitted on a grid halved, and the
+/// beam refitted on each finer grid, until the refitted beam's predicted counts
+/// differ from the coarser grid's by at most [`BOUND`].  A candidate that does
+/// not converge, or needs more grid points than allowed, ends the ladder.  The
+/// candidate with the lowest `D / overdispersion + 2k` is returned, `D` twice
+/// its deviance and `k` its coefficients.
+///
+/// Counts too sparse to determine the beam are not supported: a beam fitted to
+/// them can vary faster than a grid within the point cap resolves, which ends
+/// the ladder or, for the first candidate, refuses the fit.
 ///
 /// # Errors
 /// [`PipelineError::ShapeMismatch`] unless there is one count per bin;
 /// [`PipelineError::InvalidParameter`] if a count is not a whole non-negative
-/// number, or every count is zero; [`PipelineError::FlightTimeGrid`] for the
-/// grid's refusals, including a halving past its point cap;
-/// [`PipelineError::Fitting`] if the fitter refuses.
+/// number, every count is zero, or there are fewer than 8 bins (one interval's
+/// four coefficients and as many bins again to measure the noise);
+/// [`PipelineError::FlightTimeGrid`] for the grid's refusals, including the
+/// first candidate's halving past the point cap; [`PipelineError::Fitting`] if
+/// the fitter refuses.
 pub fn fit_open_beam(
     time_edges_us: &[f64],
     open_counts: &[f64],
     calibration: &Calibration,
 ) -> Result<OpenBeamFit, PipelineError> {
-    let mut grid = FlightTimeGrid::new(time_edges_us, calibration.t0_us, &calibration.pulse)?;
+    let grid = FlightTimeGrid::new(time_edges_us, calibration.t0_us, &calibration.pulse)?;
     if open_counts.len() + 1 != time_edges_us.len() {
         return Err(PipelineError::ShapeMismatch(format!(
             "{} open-beam counts for {} time edges",
@@ -96,10 +115,95 @@ pub fn fit_open_beam(
         ));
     }
 
-    let (u_lo, u_hi) = grid.range_us();
+    let coefficients = |intervals: usize| intervals + 3;
+    let admits = |intervals: usize| 2 * coefficients(intervals) <= open_counts.len();
+    if !admits(1) {
+        return Err(PipelineError::InvalidParameter(format!(
+            "the open-beam fit needs at least {} time bins, one interval's {} coefficients \
+             and as many again to measure the noise; got {}",
+            2 * coefficients(1),
+            coefficients(1),
+            open_counts.len()
+        )));
+    }
+
+    let (_, u_last) = grid.range_us();
+    let u_first = time_edges_us[0] - calibration.t0_us;
     let per_unit_beam = grid.predict(&vec![1.0; grid.flight_times_us().len()])?;
     let per_us = open_counts.iter().sum::<f64>() / per_unit_beam.iter().sum::<f64>();
-    let mut beam = BeamSpline::constant(u_lo, u_hi, per_us);
+    let mut ladder = vec![fit_beam(
+        &grid,
+        &BeamSpline::constant(u_first, u_last, per_us),
+        open_counts,
+    )?];
+    while let Some(start) = ladder
+        .last()
+        .filter(|fit| fit.result.converged && admits(2 * fit.beam.intervals()))
+        .map(|fit| fit.beam.refined())
+    {
+        match fit_beam(&grid, &start, open_counts) {
+            Ok(fit) if fit.result.converged => ladder.push(fit),
+            Ok(_)
+            | Err(PipelineError::FlightTimeGrid(FlightTimeGridError::TooManyPoints { .. })) => {
+                break;
+            }
+            Err(error) => return Err(error),
+        }
+    }
+
+    let richest = &ladder[ladder.len() - 1];
+    let overdispersion = richest.result.converged.then(|| {
+        let freedom = open_counts.len() - richest.beam.coefficients().len();
+        (2.0 * richest.result.deviance / freedom as f64).max(1.0)
+    });
+    let scale = overdispersion.unwrap_or(1.0);
+    let criterion = |fit: &Candidate| {
+        2.0 * fit.result.deviance / scale + 2.0 * fit.beam.coefficients().len() as f64
+    };
+    let (chosen, _) =
+        ladder
+            .iter()
+            .map(criterion)
+            .enumerate()
+            .fold(
+                (0, f64::INFINITY),
+                |best, (i, q)| {
+                    if q < best.1 { (i, q) } else { best }
+                },
+            );
+    let at_limit = chosen + 1 == ladder.len();
+    let fit = ladder.swap_remove(chosen);
+    Ok(OpenBeamFit {
+        beam: fit.beam,
+        deviance: fit.result.deviance,
+        converged: fit.result.converged,
+        covariance: fit.result.covariance.map(|mut covariance| {
+            covariance.data.iter_mut().for_each(|v| *v *= scale);
+            covariance
+        }),
+        overdispersion,
+        at_limit,
+        step_us: fit.step_us,
+        points: fit.points,
+        halvings: fit.halvings,
+    })
+}
+
+struct Candidate {
+    beam: BeamSpline,
+    result: PoissonResult,
+    step_us: f64,
+    points: usize,
+    halvings: usize,
+}
+
+fn fit_beam(
+    first_grid: &FlightTimeGrid,
+    start: &BeamSpline,
+    open_counts: &[f64],
+) -> Result<Candidate, PipelineError> {
+    let mut grid = first_grid.clone();
+    let mut beam = start.clone();
     let mut halvings = 0;
     loop {
         let finer = grid.halved()?;
@@ -114,11 +218,9 @@ pub fn fit_open_beam(
         beam = refit;
         halvings += 1;
         if spread <= BOUND {
-            return Ok(OpenBeamFit {
+            return Ok(Candidate {
                 beam,
-                deviance: result.deviance,
-                converged: result.converged,
-                covariance: result.covariance,
+                result,
                 step_us: grid.step_us(),
                 points: grid.flight_times_us().len(),
                 halvings,
@@ -151,15 +253,12 @@ fn fit(
             .collect(),
     );
     let result = poisson_fit(&model, open_counts, &mut params, &PoissonConfig::default())?;
-    Ok((
-        start.with_coefficients(std::array::from_fn(|i| result.params[i])),
-        result,
-    ))
+    Ok((start.with_coefficients(&result.params), result))
 }
 
 struct OpenBeamModel<'a> {
     grid: &'a FlightTimeGrid,
-    basis: Vec<[f64; 4]>,
+    basis: Vec<(usize, [f64; 4])>,
 }
 
 impl<'a> OpenBeamModel<'a> {
@@ -177,9 +276,10 @@ impl<'a> OpenBeamModel<'a> {
     fn beam(&self, coefficients: &[f64]) -> Vec<f64> {
         self.basis
             .iter()
-            .map(|b| {
-                b.iter()
-                    .zip(coefficients)
+            .map(|(first, weights)| {
+                weights
+                    .iter()
+                    .zip(&coefficients[*first..])
                     .map(|(w, c)| w * c)
                     .sum::<f64>()
                     .exp()
@@ -212,7 +312,12 @@ impl FitModel for OpenBeamModel<'_> {
                 .basis
                 .iter()
                 .zip(&beam)
-                .map(|(b, &phi)| phi * b[index])
+                .map(|((first, weights), &phi)| {
+                    index
+                        .checked_sub(*first)
+                        .and_then(|i| weights.get(i))
+                        .map_or(0.0, |w| phi * w)
+                })
                 .collect();
             for (row, value) in self.counts(&values).ok()?.into_iter().enumerate() {
                 *jacobian.get_mut(row, col) = value;
@@ -254,29 +359,42 @@ mod tests {
     fn the_jacobian_is_the_slope_of_the_counts() {
         for channel_fwhm_us in [None, Some(2.0)] {
             let grid = grid(channel_fwhm_us);
-            let (u_lo, u_hi) = grid.range_us();
-            let beam = BeamSpline::constant(u_lo, u_hi, 1.0e4);
-            let model = OpenBeamModel::new(&grid, &beam);
-            let coefficients = [9.1, 9.4, 9.0, 8.7];
-            let counts = model.evaluate(&coefficients).expect("counts");
-            let jacobian = model
-                .analytical_jacobian(&coefficients, &[0, 1, 2, 3], &counts)
-                .expect("jacobian");
-            for index in 0..4 {
-                let h = 1e-4;
-                let shifted = |d: f64| {
-                    let mut c = coefficients;
-                    c[index] += d;
-                    model.evaluate(&c).expect("counts")
-                };
-                let (up, down) = (shifted(h), shifted(-h));
-                for (row, (u, d)) in up.iter().zip(&down).enumerate() {
-                    let slope = (u - d) / (2.0 * h);
-                    let analytic = jacobian.get(row, index);
-                    assert!(
-                        (analytic - slope).abs() <= 1e-6 * slope.abs(),
-                        "{channel_fwhm_us:?} {index} {row}: {analytic} vs {slope}"
-                    );
+            let (_, u_hi) = grid.range_us();
+            for beam in [
+                BeamSpline::constant(347.0, u_hi, 1.0e4),
+                BeamSpline::constant(347.0, u_hi, 1.0e4).refined().refined(),
+            ] {
+                let model = OpenBeamModel::new(&grid, &beam);
+                let coefficients: Vec<f64> = (0..beam.coefficients().len())
+                    .map(|i| 9.0 + 0.3 * (i as f64).sin())
+                    .collect();
+                let counts = model.evaluate(&coefficients).expect("counts");
+                let indices: Vec<usize> = (0..coefficients.len()).collect();
+                let jacobian = model
+                    .analytical_jacobian(&coefficients, &indices, &counts)
+                    .expect("jacobian");
+                for index in indices {
+                    let h = 1e-4;
+                    let shifted = |d: f64| {
+                        let mut c = coefficients.clone();
+                        c[index] += d;
+                        model.evaluate(&c).expect("counts")
+                    };
+                    let (up, down) = (shifted(h), shifted(-h));
+                    let slopes: Vec<f64> = up
+                        .iter()
+                        .zip(&down)
+                        .map(|(u, d)| (u - d) / (2.0 * h))
+                        .collect();
+                    let column = slopes.iter().fold(0.0_f64, |m, s| m.max(s.abs()));
+                    for (row, &slope) in slopes.iter().enumerate() {
+                        let analytic = jacobian.get(row, index);
+                        assert!(
+                            (analytic - slope).abs() <= 1e-6 * column,
+                            "{channel_fwhm_us:?} {} {index} {row}: {analytic} vs {slope}",
+                            beam.intervals()
+                        );
+                    }
                 }
             }
         }
