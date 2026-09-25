@@ -776,6 +776,48 @@ impl IkedaCarpenter {
         synth_kernel(&self.params, self.n_tau, energy_ev)
     }
 
+    fn folded(&self) -> bool {
+        self.params.burst_sigma_us.unwrap_or(0.0) != 0.0
+            || self.params.channel_fwhm_us.unwrap_or(0.0) != 0.0
+    }
+
+    /// The first and last delay, in µs after the nominal arrival, of a
+    /// neutron of `energy_ev`, outside which [`Self::detector_bin_probabilities`]
+    /// gives it less than [`NEGLIGIBLE_ARRIVAL_PROBABILITY`] chance of
+    /// arriving: without a fold, 0 and the delay where `1 − ic_cdf` falls to
+    /// that chance; with a fold, the fold's reach before 0 and a bound on the
+    /// end of the sampled pulse those probabilities integrate.
+    ///
+    /// # Errors
+    /// [`ResolutionParseError::InvalidFormat`] when `energy_ev` is not
+    /// positive and finite, or a law is singular or out of range there.
+    pub fn delays_us(&self, energy_ev: f64) -> Result<(f64, f64), ResolutionParseError> {
+        self.validate_probe_energy(energy_ev)?;
+        let alpha = self.params.alpha.eval(energy_ev);
+        let beta = self.params.beta.eval(energy_ev);
+        let r = self.params.r.eval(energy_ev);
+        if !self.folded() {
+            return Ok((0.0, tail_delay(alpha, beta, r)));
+        }
+        let (alpha, beta, r) = (alpha.max(MIN_RATE), beta.max(MIN_RATE), r.clamp(0.0, 1.0));
+        let tau_max = tau_reach(alpha, beta, r);
+        let widest_step = (FAST_REACH_E_FOLDS / alpha / (self.n_tau as f64 - 1.0))
+            .max(tau_max / (MAX_TAU_SAMPLES as f64 - 1.0));
+        let margin = margin_of(&self.params);
+        Ok((-margin, tau_max + margin + widest_step))
+    }
+
+    /// The time in µs from the first sample of the pulse at `energy_ev` to
+    /// its peak.
+    ///
+    /// # Errors
+    /// As [`Self::source_pulse_at`].
+    pub fn rise_us(&self, energy_ev: f64) -> Result<f64, ResolutionParseError> {
+        self.validate_probe_energy(energy_ev)?;
+        let (times, densities) = synth_source_pulse_density(&self.params, self.n_tau, energy_ev)?;
+        Ok(times[argmax(&densities)] - times[0])
+    }
+
     /// Evaluate the physical source pulse at one true neutron energy.
     ///
     /// Returns sampled moderator-delay coordinates in µs and peak-normalized
@@ -849,9 +891,7 @@ impl IkedaCarpenter {
             .map(|edge| edge - nominal_arrival)
             .collect();
 
-        if self.params.burst_sigma_us.unwrap_or(0.0) == 0.0
-            && self.params.channel_fwhm_us.unwrap_or(0.0) == 0.0
-        {
+        if !self.folded() {
             let alpha = self.params.alpha.eval(true_energy_ev);
             let beta = self.params.beta.eval(true_energy_ev);
             let r = self.params.r.eval(true_energy_ev);
@@ -949,6 +989,28 @@ impl IkedaCarpenter {
     }
 }
 
+/// The chance of a later arrival below which an Ikeda–Carpenter pulse's
+/// tail is treated as ended.
+pub const NEGLIGIBLE_ARRIVAL_PROBABILITY: f64 = 1e-7;
+
+fn tail_delay(alpha: f64, beta: f64, r: f64) -> f64 {
+    let later = |tau: f64| 1.0 - ic_cdf(alpha, beta, r, tau);
+    let mut high = 1.0 / alpha.min(beta).max(MIN_RATE);
+    while later(high) > NEGLIGIBLE_ARRIVAL_PROBABILITY {
+        high *= 2.0;
+    }
+    let mut low = 0.0;
+    while high - low > f64::EPSILON * high {
+        let middle = 0.5 * (low + high);
+        if later(middle) > NEGLIGIBLE_ARRIVAL_PROBABILITY {
+            low = middle;
+        } else {
+            high = middle;
+        }
+    }
+    high
+}
+
 /// τ-grid geometry for one kernel: `(dtau, tau_max, margin)`, or a
 /// descriptive error when no exact sampled representation fits the cap.
 ///
@@ -978,15 +1040,8 @@ fn tau_geometry(
     beta: f64,
     r: f64,
 ) -> Result<(f64, f64, f64), String> {
-    // τ_max: reach far enough that the prompt tail (e^{−ατ}) and, when
-    // storage is active, the slow tail (e^{−βτ}) are below the trim level.
     let fast_reach = FAST_REACH_E_FOLDS / alpha;
-    let slow_reach = if r > R_NEGLIGIBLE {
-        SLOW_REACH_E_FOLDS / beta
-    } else {
-        0.0
-    };
-    let tau_max = fast_reach.max(slow_reach);
+    let tau_max = tau_reach(alpha, beta, r);
 
     // Requested step and resolution floor. `floor ≥ dtau_req` always: the
     // prompt terms satisfy MIN_N_TAU ≤ n_tau (validated by `new`) and the
@@ -1033,6 +1088,15 @@ fn tau_geometry(
         ));
     }
     Ok((dtau_req.max(capped_step), tau_max, margin_of(params)))
+}
+
+fn tau_reach(alpha: f64, beta: f64, r: f64) -> f64 {
+    let fast_reach = FAST_REACH_E_FOLDS / alpha;
+    if r > R_NEGLIGIBLE {
+        fast_reach.max(SLOW_REACH_E_FOLDS / beta)
+    } else {
+        fast_reach
+    }
 }
 
 /// Symmetric τ-grid margin for the burst/channel folds:
