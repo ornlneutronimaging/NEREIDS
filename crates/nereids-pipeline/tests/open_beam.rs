@@ -215,23 +215,29 @@ fn counts_that_are_not_an_open_beam_are_refused() {
 }
 
 #[test]
-fn counts_that_cannot_determine_the_beam_leave_its_covariance_undetermined() {
+fn counts_that_cannot_determine_the_beam_are_reported_undetermined() {
     let pulse = &pulses()[0].1;
     for (bin, count) in [(60, 1.0), (119, 3.0)] {
         let mut counts = vec![0.0; edges().len() - 1];
         counts[bin] = count;
         let fit = fit_open_beam(&edges(), &counts, &calibration(pulse)).expect("a fit");
-        assert!(
-            fit.covariance
-                .is_none_or(|c| (0..4).any(|i| c.get(i, i).is_nan())),
-            "bin {bin}"
-        );
+        let determined = fit.converged
+            && fit
+                .covariance
+                .is_some_and(|c| (0..4).all(|i| c.get(i, i).is_finite()));
+        assert!(!determined, "bin {bin}");
     }
 }
 
 #[test]
 fn the_grid_s_refusals_reach_the_caller() {
     let counts = open_counts(&pulses()[0].1, &true_beam(1.0e6));
+    assert!(matches!(
+        fit_open_beam(&[350.0], &[], &calibration(&pulses()[0].1)),
+        Err(PipelineError::FlightTimeGrid(
+            FlightTimeGridError::InvalidTimeEdges
+        ))
+    ));
     let c = EnergyLaw::Const;
     let lengthening = pulse(
         EnergyLaw::SqrtE { a0: -0.05, a1: 1.2 },

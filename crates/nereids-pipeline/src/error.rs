@@ -29,7 +29,7 @@ pub enum PipelineError {
 
     /// The flight-time grid refused the window or the pulse.
     #[error("Flight-time grid: {0}")]
-    FlightTimeGrid(#[from] FlightTimeGridError),
+    FlightTimeGrid(FlightTimeGridError),
 }
 
 impl From<TransmissionError> for PipelineError {
@@ -44,5 +44,11 @@ impl From<TransmissionError> for PipelineError {
 impl From<FittingError> for PipelineError {
     fn from(e: FittingError) -> Self {
         PipelineError::Fitting(e)
+    }
+}
+
+impl From<FlightTimeGridError> for PipelineError {
+    fn from(e: FlightTimeGridError) -> Self {
+        PipelineError::FlightTimeGrid(e)
     }
 }

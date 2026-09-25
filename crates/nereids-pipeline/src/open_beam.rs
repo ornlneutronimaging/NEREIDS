@@ -50,12 +50,17 @@ pub struct OpenBeamFit {
 }
 
 /// Fit the beam to the raw open-beam counts `open_counts` of the time bins
-/// `time_edges_us` (µs).  The beam is one cubic in `ln u` over the flight-time
-/// grid's range; neutrons faster than that range, each reaching the bins with
-/// less than [`NEGLIGIBLE_ARRIVAL_PROBABILITY`](nereids_physics::ikeda_carpenter::NEGLIGIBLE_ARRIVAL_PROBABILITY)
+/// `time_edges_us` (µs).  `ln φ`, the logarithm of the beam, is one cubic in
+/// `ln u` over the flight-time grid's range; neutrons faster than that range,
+/// each reaching the bins with less than
+/// [`NEGLIGIBLE_ARRIVAL_PROBABILITY`](nereids_physics::ikeda_carpenter::NEGLIGIBLE_ARRIVAL_PROBABILITY)
 /// chance, are left out.  The grid is halved, and the beam refitted on each
 /// finer grid, until the refitted beam's predicted counts differ from the
 /// coarser grid's by at most [`BOUND`]; that fit is returned.
+///
+/// Counts too sparse to determine the beam are not supported: their fitted
+/// beam can vary faster than a grid within the point cap resolves, and the fit
+/// ends with that refusal.
 ///
 /// # Errors
 /// [`PipelineError::ShapeMismatch`] unless there is one count per bin;
@@ -68,6 +73,7 @@ pub fn fit_open_beam(
     open_counts: &[f64],
     calibration: &Calibration,
 ) -> Result<OpenBeamFit, PipelineError> {
+    let mut grid = FlightTimeGrid::new(time_edges_us, calibration.t0_us, &calibration.pulse)?;
     if open_counts.len() + 1 != time_edges_us.len() {
         return Err(PipelineError::ShapeMismatch(format!(
             "{} open-beam counts for {} time edges",
@@ -90,7 +96,6 @@ pub fn fit_open_beam(
         ));
     }
 
-    let mut grid = FlightTimeGrid::new(time_edges_us, calibration.t0_us, &calibration.pulse)?;
     let (u_lo, u_hi) = grid.range_us();
     let per_unit_beam = grid.predict(&vec![1.0; grid.flight_times_us().len()])?;
     let per_us = open_counts.iter().sum::<f64>() / per_unit_beam.iter().sum::<f64>();
