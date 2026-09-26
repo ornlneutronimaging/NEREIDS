@@ -29,10 +29,10 @@ pub struct Calibration {
 /// The fitted open beam.
 #[derive(Debug, Clone)]
 pub struct OpenBeamFit {
-    /// The beam per µs of flight time; its knots span the first edge's flight
-    /// time to the flight-time grid's slow end.  Only the last bins see the
-    /// beam near that slow end, so `covariance` shows it least determined
-    /// there.
+    /// The beam per µs of flight time over the flight-time grid's range; its
+    /// knots span the first edge's flight time to the grid's slow end.  Only
+    /// the last bins see the beam near that slow end, so `covariance` shows it
+    /// least determined there.
     pub beam: BeamSpline,
     /// Half the Poisson deviance at the fit.
     pub deviance: f64,
@@ -83,12 +83,10 @@ pub struct OpenBeamFit {
 /// them can vary faster than a grid within the point cap resolves, which ends
 /// the ladder or, for the first candidate, refuses the fit.
 ///
-/// Beam structure at or near the window's first edge is not supported: before
-/// that edge, where neutrons reach the bins through the pulse tail, `ln φ` is
-/// the spline's second-order Taylor expansion at the first knot, which such
-/// structure makes grow without bound.  It shows as `at_limit` with an
-/// overdispersion far above the detector's; start the window where the beam
-/// is smooth.
+/// Beam structure that extends before the window's first edge is not
+/// supported: the fit follows its part inside the window, but before the
+/// edge, where neutrons reach the bins only through the pulse's delay, the
+/// beam is the spline's continuation, which the open-beam counts cannot check.
 ///
 /// # Errors
 /// [`PipelineError::ShapeMismatch`] unless there is one count per bin;
@@ -285,7 +283,7 @@ fn fit(
 
 struct OpenBeamModel<'a> {
     grid: &'a FlightTimeGrid,
-    basis: Vec<(usize, [f64; 4])>,
+    basis: Vec<[(usize, f64); 5]>,
 }
 
 impl<'a> OpenBeamModel<'a> {
@@ -303,11 +301,10 @@ impl<'a> OpenBeamModel<'a> {
     fn beam(&self, coefficients: &[f64]) -> Vec<f64> {
         self.basis
             .iter()
-            .map(|(first, weights)| {
-                weights
+            .map(|pairs| {
+                pairs
                     .iter()
-                    .zip(&coefficients[*first..])
-                    .map(|(w, c)| w * c)
+                    .map(|&(i, w)| w * coefficients[i])
                     .sum::<f64>()
                     .exp()
             })
@@ -339,11 +336,12 @@ impl FitModel for OpenBeamModel<'_> {
                 .basis
                 .iter()
                 .zip(&beam)
-                .map(|((first, weights), &phi)| {
-                    index
-                        .checked_sub(*first)
-                        .and_then(|i| weights.get(i))
-                        .map_or(0.0, |w| phi * w)
+                .map(|(pairs, &phi)| {
+                    phi * pairs
+                        .iter()
+                        .filter(|&&(i, _)| i == index)
+                        .map(|&(_, w)| w)
+                        .sum::<f64>()
                 })
                 .collect();
             for (row, value) in self.counts(&values).ok()?.into_iter().enumerate() {

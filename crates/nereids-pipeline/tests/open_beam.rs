@@ -117,22 +117,41 @@ fn dipped(centre_us: f64, fwhm_us: f64) -> impl Fn(f64) -> f64 {
     move |u: f64| smooth(u) * (1.0 - 0.6 * (-(u - centre_us).powi(2) / (2.0 * sigma * sigma)).exp())
 }
 
-fn distance_from(pulse: &Arc<IkedaCarpenter>, beam: &BeamSpline, expected: &[f64]) -> f64 {
-    let (low, high) = FlightTimeGrid::new(&edges(), T0_US, pulse)
-        .expect("grid")
-        .range_us();
-    let on_range = |u: f64| {
-        if (low..=high).contains(&u) {
-            beam.per_us(u)
+fn counts_between(
+    pulse: &Arc<IkedaCarpenter>,
+    beam: &dyn Fn(f64) -> f64,
+    low_us: f64,
+    high_us: f64,
+) -> Vec<f64> {
+    let between = |u: f64| {
+        if (low_us..=high_us).contains(&u) {
+            beam(u)
         } else {
             0.0
         }
     };
-    simulated(pulse, &on_range)
+    simulated(pulse, &between)
+}
+
+fn distance(fitted: &[f64], truth: &[f64], expected: &[f64]) -> f64 {
+    fitted
         .iter()
+        .zip(truth)
         .zip(expected)
-        .map(|(fitted, mu)| (fitted - mu).powi(2) / mu)
+        .map(|((f, t), mu)| (f - t).powi(2) / mu)
         .sum()
+}
+
+fn grid_range(pulse: &Arc<IkedaCarpenter>) -> (f64, f64) {
+    FlightTimeGrid::new(&edges(), T0_US, pulse)
+        .expect("grid")
+        .range_us()
+}
+
+fn distance_from(pulse: &Arc<IkedaCarpenter>, beam: &BeamSpline, expected: &[f64]) -> f64 {
+    let (low, high) = grid_range(pulse);
+    let fitted = counts_between(pulse, &|u| beam.per_us(u), low, high);
+    distance(&fitted, expected, expected)
 }
 
 fn richest_coefficients(bins: usize) -> usize {
@@ -370,11 +389,19 @@ fn a_dip_the_candidates_can_follow_is_followed() {
             "{centre_us}"
         );
         let k = noiseless.beam.coefficients().len() as f64;
-        let distance = distance_from(pulse, &noiseless.beam, &expected);
+        let within = distance_from(pulse, &noiseless.beam, &expected);
         assert!(
-            distance <= k + 4.0 * (2.0 * k).sqrt(),
-            "{centre_us}: {distance}"
+            within <= k + 4.0 * (2.0 * k).sqrt(),
+            "{centre_us}: {within}"
         );
+        let (low, _) = grid_range(pulse);
+        let first_edge = edges()[0] - T0_US;
+        let before = distance(
+            &counts_between(pulse, &|u| noiseless.beam.per_us(u), low, first_edge),
+            &counts_between(pulse, &dipped(centre_us, fwhm_us), low, first_edge),
+            &expected,
+        );
+        assert!(before <= 3.0 * 3.0, "{centre_us}: {before}");
     }
     let expected = simulated(pulse, &dipped(407.0, 40.0));
     for seed in 200..206 {
@@ -382,8 +409,38 @@ fn a_dip_the_candidates_can_follow_is_followed() {
             fit_open_beam(&edges(), &draw(&expected, seed, 1.0), &calibration(pulse)).expect("fit");
         assert!(fit.beam.intervals() > 1 && !fit.at_limit, "{seed}");
         let k = fit.beam.coefficients().len() as f64;
-        let distance = distance_from(pulse, &fit.beam, &expected);
-        assert!(distance <= k + 4.0 * (2.0 * k).sqrt(), "{seed}: {distance}");
+        let within = distance_from(pulse, &fit.beam, &expected);
+        assert!(within <= k + 4.0 * (2.0 * k).sqrt(), "{seed}: {within}");
+    }
+}
+
+#[test]
+fn a_dip_at_the_first_edge_is_followed_inside_the_window() {
+    let c = EnergyLaw::Const;
+    for ic in [
+        Arc::clone(&pulses()[0].1),
+        pulse(c(0.565), c(0.25), c(0.0), None),
+    ] {
+        for (centre_us, fwhm_us) in [(347.0, 20.0), (360.0, 15.0)] {
+            let expected = simulated(&ic, &dipped(centre_us, fwhm_us));
+            let rounded: Vec<f64> = expected.iter().map(|mu| mu.round()).collect();
+            let fit = fit_open_beam(&edges(), &rounded, &calibration(&ic)).expect("fit");
+            let k = fit.beam.coefficients().len() as f64;
+            let within = distance_from(&ic, &fit.beam, &expected);
+            assert!(
+                within <= k + 4.0 * (2.0 * k).sqrt(),
+                "{centre_us}: {within}"
+            );
+        }
+    }
+    let ic = &pulses()[0].1;
+    let expected = simulated(ic, &dipped(347.0, 20.0));
+    for seed in 200..206 {
+        let fit =
+            fit_open_beam(&edges(), &draw(&expected, seed, 1.0), &calibration(ic)).expect("fit");
+        let k = fit.beam.coefficients().len() as f64;
+        let within = distance_from(ic, &fit.beam, &expected);
+        assert!(within <= k + 4.0 * (2.0 * k).sqrt(), "{seed}: {within}");
     }
 }
 
@@ -425,7 +482,7 @@ fn a_richer_beam_the_counts_or_the_grid_cannot_resolve_ends_the_ladder() {
         }
         fit_open_beam(&edges(), &counts, &calibration(pulse)).expect("fit")
     };
-    let unconverged_next = sparse(&[(10, 2.0), (90, 2.0), (100, 1.0)]);
+    let unconverged_next = sparse(&[(30, 2.0), (90, 2.0), (100, 1.0)]);
     assert!(unconverged_next.converged && unconverged_next.at_limit);
     assert!(sparse(&[(0, 1.0), (30, 1.0), (60, 1.0)]).converged);
     let infinite_next = draw(&simulated(pulse, &true_beam(0.5)), 20069, 1.0);
@@ -434,15 +491,12 @@ fn a_richer_beam_the_counts_or_the_grid_cannot_resolve_ends_the_ladder() {
             .expect("fit")
             .converged
     );
-    let past_the_point_cap: Vec<f64> = simulated(pulse, &dipped(360.0, 15.0))
+    let past_the_point_cap: Vec<f64> = simulated(pulse, &dipped(352.0, 1.0))
         .iter()
         .map(|mu| mu.round())
         .collect();
-    assert!(
-        fit_open_beam(&edges(), &past_the_point_cap, &calibration(pulse))
-            .expect("fit")
-            .at_limit
-    );
+    let capped = fit_open_beam(&edges(), &past_the_point_cap, &calibration(pulse)).expect("fit");
+    assert!(capped.beam.intervals() == 16 && capped.at_limit);
 }
 
 #[test]
