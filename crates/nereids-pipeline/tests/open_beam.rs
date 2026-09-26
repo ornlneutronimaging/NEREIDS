@@ -5,9 +5,13 @@ use nereids_physics::ikeda_carpenter::{
     EnergyLaw, IkedaCarpenter, IkedaCarpenterParams, SynthesisGrid,
 };
 use nereids_physics::resolution::{ResolutionFunction, TOF_FACTOR};
+use nereids_pipeline::beam::BeamSpline;
 use nereids_pipeline::error::PipelineError;
-use nereids_pipeline::open_beam::{BOUND, Calibration, fit_open_beam};
+use nereids_pipeline::open_beam::{BOUND, Calibration, OpenBeamFit, fit_open_beam};
 use nereids_pipeline::reference::Instrument;
+use rand::SeedableRng;
+use rand_chacha::ChaCha12Rng;
+use rand_distr::{Distribution, Poisson};
 
 const FLIGHT_PATH_M: f64 = 25.0;
 const T0_US: f64 = 3.0;
@@ -94,6 +98,51 @@ fn open_counts(pulse: &Arc<IkedaCarpenter>, beam: &dyn Fn(f64) -> f64) -> Vec<f6
     simulated(pulse, beam).into_iter().map(f64::round).collect()
 }
 
+fn draw(expected: &[f64], seed: u64, counts_per_neutron: f64) -> Vec<f64> {
+    let mut rng = ChaCha12Rng::seed_from_u64(seed);
+    expected
+        .iter()
+        .map(|&mu| {
+            counts_per_neutron
+                * Poisson::new(mu / counts_per_neutron)
+                    .expect("positive rate")
+                    .sample(&mut rng)
+        })
+        .collect()
+}
+
+fn dipped(centre_us: f64, fwhm_us: f64) -> impl Fn(f64) -> f64 {
+    let smooth = true_beam(1.0e6);
+    let sigma = fwhm_us / (8.0 * 2.0_f64.ln()).sqrt();
+    move |u: f64| smooth(u) * (1.0 - 0.6 * (-(u - centre_us).powi(2) / (2.0 * sigma * sigma)).exp())
+}
+
+fn distance_from(pulse: &Arc<IkedaCarpenter>, beam: &BeamSpline, expected: &[f64]) -> f64 {
+    let (low, high) = FlightTimeGrid::new(&edges(), T0_US, pulse)
+        .expect("grid")
+        .range_us();
+    let on_range = |u: f64| {
+        if (low..=high).contains(&u) {
+            beam.per_us(u)
+        } else {
+            0.0
+        }
+    };
+    simulated(pulse, &on_range)
+        .iter()
+        .zip(expected)
+        .map(|(fitted, mu)| (fitted - mu).powi(2) / mu)
+        .sum()
+}
+
+fn richest_coefficients(bins: usize) -> usize {
+    (0..)
+        .map(|p| (1_usize << p) + 3)
+        .take_while(|k| 2 * k <= bins)
+        .last()
+        .expect("a candidate")
+}
+
 fn calibration(pulse: &Arc<IkedaCarpenter>) -> Calibration {
     Calibration {
         t0_us: T0_US,
@@ -120,6 +169,8 @@ fn the_fitted_beam_is_the_beam_before_the_blur() {
         let fit =
             fit_open_beam(&edges(), &open_counts(&pulse, &beam), &calibration(&pulse)).expect(name);
         assert!(fit.converged, "{name}");
+        assert_eq!(fit.beam.intervals(), 1, "{name}");
+        assert_eq!(fit.overdispersion, Some(1.0), "{name}");
         for u in bin_centres() {
             let error = fit.beam.per_us(u) / beam(u) - 1.0;
             assert!(error.abs() <= 1e-6, "{name} at {u} µs: {error}");
@@ -165,7 +216,7 @@ fn the_fit_is_on_the_finer_grid_of_the_first_pair_halving_leaves_unchanged() {
             .sum();
         assert!(distance <= BOUND, "{level:e}: {distance}");
         let (knot_low, knot_high) = fit.beam.knot_span_us();
-        let (u_low, u_high) = chain[accepted].range_us();
+        let (u_low, u_high) = (edges()[0] - T0_US, chain[accepted].range_us().1);
         assert!(
             (knot_low / u_low - 1.0).abs() <= 1e-12 && (knot_high / u_high - 1.0).abs() <= 1e-12,
             "{level:e}"
@@ -212,6 +263,140 @@ fn counts_that_are_not_an_open_beam_are_refused() {
         fit_open_beam(&edges(), &counts[1..], &calibration(pulse)),
         Err(PipelineError::ShapeMismatch(_))
     ));
+    assert!(matches!(
+        fit_open_beam(&edges()[..8], &counts[..7], &calibration(pulse)),
+        Err(PipelineError::InvalidParameter(_))
+    ));
+    assert!(fit_open_beam(&edges()[..9], &counts[..8], &calibration(pulse)).is_ok());
+}
+
+#[test]
+fn a_smooth_beam_keeps_one_interval_in_most_poisson_draws() {
+    let pulse = &pulses()[0].1;
+    let expected = simulated(pulse, &true_beam(1.0e6));
+    let kept = (0..20)
+        .filter(|&seed| {
+            fit_open_beam(&edges(), &draw(&expected, seed, 1.0), &calibration(pulse))
+                .expect("fit")
+                .beam
+                .intervals()
+                == 1
+        })
+        .count();
+    assert!(kept >= 12, "{kept} of 20");
+}
+
+#[test]
+fn the_overdispersion_is_the_variance_over_the_poisson_variance() {
+    let pulse = &pulses()[0].1;
+    let counts_per_neutron = 7.0;
+    let expected = simulated(pulse, &true_beam(1.0e6));
+    let fits: Vec<OpenBeamFit> = (100..110)
+        .map(|seed| {
+            fit_open_beam(
+                &edges(),
+                &draw(&expected, seed, counts_per_neutron),
+                &calibration(pulse),
+            )
+            .expect("fit")
+        })
+        .collect();
+    let draws = fits.len() as f64;
+    let mean = fits
+        .iter()
+        .map(|fit| fit.overdispersion.expect("converged") / counts_per_neutron)
+        .sum::<f64>()
+        / draws;
+    let freedom = (expected.len() - richest_coefficients(expected.len())) as f64;
+    let bound = 3.0 * (2.0 / freedom).sqrt() / draws.sqrt();
+    assert!((mean - 1.0).abs() <= bound, "{mean} vs 1 ± {bound}");
+    let at_limit = fits.iter().filter(|fit| fit.at_limit).count();
+    assert!(at_limit <= 3, "{at_limit} of 10 at the limit");
+}
+
+#[test]
+fn a_low_count_open_beam_is_fitted_and_its_overdispersion_measured() {
+    let pulse = &pulses()[0].1;
+    let counts_per_neutron = 3.0;
+    let expected = simulated(pulse, &true_beam(5.0));
+    let ratios: Vec<f64> = (1000..1020)
+        .map(|seed| {
+            fit_open_beam(
+                &edges(),
+                &draw(&expected, seed, counts_per_neutron),
+                &calibration(pulse),
+            )
+            .expect("fit")
+            .overdispersion
+            .expect("converged")
+                / counts_per_neutron
+        })
+        .collect();
+    let draws = ratios.len() as f64;
+    let mean = ratios.iter().sum::<f64>() / draws;
+    let freedom = (expected.len() - richest_coefficients(expected.len())) as f64;
+    let bound = 3.0 * (2.0 / freedom).sqrt() / draws.sqrt();
+    assert!((mean - 1.0).abs() <= bound, "{mean} vs 1 ± {bound}");
+}
+
+#[test]
+fn counting_every_neutron_seven_times_scales_the_overdispersion_not_the_error_bars() {
+    let pulse = &pulses()[0].1;
+    let once = draw(&simulated(pulse, &true_beam(1.0e6)), 300, 3.0);
+    let seven: Vec<f64> = once.iter().map(|c| 7.0 * c).collect();
+    let fit = |counts: &[f64]| fit_open_beam(&edges(), counts, &calibration(pulse)).expect("fit");
+    let (a, b) = (fit(&once), fit(&seven));
+    assert_eq!(a.beam.intervals(), b.beam.intervals());
+    let ratio = b.overdispersion.expect("converged") / a.overdispersion.expect("converged");
+    assert!((ratio / 7.0 - 1.0).abs() <= 1e-3, "{ratio}");
+    let (a, b) = (
+        a.covariance.expect("covariance"),
+        b.covariance.expect("covariance"),
+    );
+    for (x, y) in a.data.iter().zip(&b.data) {
+        assert!((y - x).abs() <= 1e-3 * x.abs(), "{x} vs {y}");
+    }
+}
+
+#[test]
+fn a_dip_the_candidates_can_follow_is_followed() {
+    let pulse = &pulses()[0].1;
+    for (centre_us, fwhm_us) in [(407.0, 40.0), (380.0, 30.0)] {
+        let expected = simulated(pulse, &dipped(centre_us, fwhm_us));
+        let rounded: Vec<f64> = expected.iter().map(|mu| mu.round()).collect();
+        let noiseless = fit_open_beam(&edges(), &rounded, &calibration(pulse)).expect("fit");
+        assert!(
+            noiseless.beam.intervals() > 1 && !noiseless.at_limit,
+            "{centre_us}"
+        );
+        let k = noiseless.beam.coefficients().len() as f64;
+        let distance = distance_from(pulse, &noiseless.beam, &expected);
+        assert!(
+            distance <= k + 4.0 * (2.0 * k).sqrt(),
+            "{centre_us}: {distance}"
+        );
+    }
+    let expected = simulated(pulse, &dipped(407.0, 40.0));
+    for seed in 200..206 {
+        let fit =
+            fit_open_beam(&edges(), &draw(&expected, seed, 1.0), &calibration(pulse)).expect("fit");
+        assert!(fit.beam.intervals() > 1 && !fit.at_limit, "{seed}");
+        let k = fit.beam.coefficients().len() as f64;
+        let distance = distance_from(pulse, &fit.beam, &expected);
+        assert!(distance <= k + 4.0 * (2.0 * k).sqrt(), "{seed}: {distance}");
+    }
+}
+
+#[test]
+fn a_dip_finer_than_every_candidate_is_reported_at_the_limit() {
+    let pulse = &pulses()[0].1;
+    let expected = simulated(pulse, &dipped(407.0, 4.7));
+    let fit =
+        fit_open_beam(&edges(), &draw(&expected, 200, 1.0), &calibration(pulse)).expect("fit");
+    assert!(fit.at_limit);
+    let k = fit.beam.coefficients().len() as f64;
+    let distance = distance_from(pulse, &fit.beam, &expected);
+    assert!(distance > k + 4.0 * (2.0 * k).sqrt(), "{distance}");
 }
 
 #[test]
@@ -226,7 +411,38 @@ fn counts_that_cannot_determine_the_beam_are_reported_undetermined() {
                 .covariance
                 .is_some_and(|c| (0..4).all(|i| c.get(i, i).is_finite()));
         assert!(!determined, "bin {bin}");
+        assert!(fit.overdispersion.is_none_or(f64::is_finite), "bin {bin}");
     }
+}
+
+#[test]
+fn a_richer_beam_the_counts_or_the_grid_cannot_resolve_ends_the_ladder() {
+    let pulse = &pulses()[0].1;
+    let sparse = |bins: &[(usize, f64)]| {
+        let mut counts = vec![0.0; edges().len() - 1];
+        for &(bin, count) in bins {
+            counts[bin] = count;
+        }
+        fit_open_beam(&edges(), &counts, &calibration(pulse)).expect("fit")
+    };
+    let unconverged_next = sparse(&[(10, 2.0), (90, 2.0), (100, 1.0)]);
+    assert!(unconverged_next.converged && unconverged_next.at_limit);
+    assert!(sparse(&[(0, 1.0), (30, 1.0), (60, 1.0)]).converged);
+    let infinite_next = draw(&simulated(pulse, &true_beam(0.5)), 20069, 1.0);
+    assert!(
+        fit_open_beam(&edges(), &infinite_next, &calibration(pulse))
+            .expect("fit")
+            .converged
+    );
+    let past_the_point_cap: Vec<f64> = simulated(pulse, &dipped(360.0, 15.0))
+        .iter()
+        .map(|mu| mu.round())
+        .collect();
+    assert!(
+        fit_open_beam(&edges(), &past_the_point_cap, &calibration(pulse))
+            .expect("fit")
+            .at_limit
+    );
 }
 
 #[test]
