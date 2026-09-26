@@ -2,9 +2,12 @@
 
 /// `ln φ(u)`, the logarithm of the beam per µs at flight time `u`, as a
 /// uniform cubic B-spline in `x = ln u` over
-/// [`knot_span_us`](Self::knot_span_us).  Faster than that span, `ln φ` is the
-/// spline's second-order Taylor expansion in `x` at the first knot; slower,
-/// the last interval's cubic continues.
+/// [`knot_span_us`](Self::knot_span_us).  Faster than that span, `ln φ`
+/// continues from the spline's value and slope at the first knot with the
+/// spline's mean curvature over the span, so a beam whose curvature changes
+/// across the span is continued with its mean; slower, the last interval's
+/// cubic continues.  The curve is the beam only over the flight times a fit
+/// integrates.
 #[derive(Debug, Clone, PartialEq)]
 pub struct BeamSpline {
     x_low: f64,
@@ -64,44 +67,43 @@ impl BeamSpline {
         (self.x_low.exp(), self.x_high.exp())
     }
 
-    /// `(first, weights)` with `ln φ(u) = Σ weights[i] · coefficients[first + i]`,
-    /// for `u_us > 0`.
+    /// `(index, weight)` pairs with `ln φ(u) = Σ weight · coefficients[index]`,
+    /// for `u_us > 0`; an index may appear more than once.
     #[must_use]
-    pub fn basis(&self, u_us: f64) -> (usize, [f64; 4]) {
-        let h = (self.x_high - self.x_low) / self.intervals() as f64;
+    pub fn basis(&self, u_us: f64) -> [(usize, f64); 5] {
+        let n = self.intervals();
+        let h = (self.x_high - self.x_low) / n as f64;
         let s = (u_us.ln() - self.x_low) / h;
         if s < 0.0 {
-            return (
-                0,
-                [
-                    1.0 / 6.0 - s / 2.0 + s * s / 2.0,
-                    2.0 / 3.0 - s * s,
-                    1.0 / 6.0 + s / 2.0 + s * s / 2.0,
-                    0.0,
-                ],
-            );
+            let mean_curvature = s * s / (4.0 * n as f64);
+            return [
+                (0, 1.0 / 6.0 - s / 2.0 + mean_curvature),
+                (1, 2.0 / 3.0),
+                (2, 1.0 / 6.0 + s / 2.0 - mean_curvature),
+                (n, -mean_curvature),
+                (n + 2, mean_curvature),
+            ];
         }
-        let first = (s.floor() as usize).min(self.intervals() - 1);
+        let first = (s.floor() as usize).min(n - 1);
         let t = s - first as f64;
-        (
-            first,
-            [
-                (1.0 - t).powi(3) / 6.0,
-                (3.0 * t.powi(3) - 6.0 * t * t + 4.0) / 6.0,
+        [
+            (first, (1.0 - t).powi(3) / 6.0),
+            (first + 1, (3.0 * t.powi(3) - 6.0 * t * t + 4.0) / 6.0),
+            (
+                first + 2,
                 (-3.0 * t.powi(3) + 3.0 * t * t + 3.0 * t + 1.0) / 6.0,
-                t.powi(3) / 6.0,
-            ],
-        )
+            ),
+            (first + 3, t.powi(3) / 6.0),
+            (first, 0.0),
+        ]
     }
 
     /// The beam per µs at flight time `u_us > 0`.
     #[must_use]
     pub fn per_us(&self, u_us: f64) -> f64 {
-        let (first, weights) = self.basis(u_us);
-        weights
+        self.basis(u_us)
             .iter()
-            .zip(&self.coefficients[first..])
-            .map(|(w, c)| w * c)
+            .map(|&(i, w)| w * self.coefficients[i])
             .sum::<f64>()
             .exp()
     }
@@ -150,35 +152,43 @@ mod tests {
         }
     }
 
+    fn slope_at_first_node(f: &dyn Fn(f64) -> f64, nodes: [f64; 4]) -> f64 {
+        let mut d = nodes.map(f);
+        for k in 1..4 {
+            for i in (k..4).rev() {
+                d[i] = (d[i] - d[i - 1]) / (nodes[i] - nodes[i - k]);
+            }
+        }
+        d[1] + (nodes[0] - nodes[1]) * (d[2] + d[3] * (nodes[0] - nodes[2]))
+    }
+
     #[test]
-    fn below_the_knots_the_curve_is_its_taylor_expansion_at_the_first_knot() {
-        let spline = wavy();
-        let x0 = 280.0_f64.ln();
-        let f = |x: f64| ln_beam(&spline, x.exp());
-        let h = (470.0_f64 / 280.0).ln() / spline.intervals() as f64;
-        let nodes = [0.0, h / 3.0, 2.0 * h / 3.0, h];
-        let values = nodes.map(|dx| f(x0 + dx));
-        let others = |i: usize| (0..4).filter(move |&j| j != i);
-        let cubic = |dx: f64| -> f64 {
-            (0..4)
-                .map(|i| {
-                    values[i]
-                        * others(i)
-                            .map(|j| (dx - nodes[j]) / (nodes[i] - nodes[j]))
-                            .product::<f64>()
-                })
-                .sum()
-        };
-        let leading: f64 = (0..4)
-            .map(|i| values[i] / others(i).map(|j| nodes[i] - nodes[j]).product::<f64>())
-            .sum();
-        for dx in [-0.05, -0.2, -0.4] {
-            let taylor = cubic(dx) - leading * dx.powi(3);
-            assert!(
-                (f(x0 + dx) - taylor).abs() < 1e-9 * (1.0 + taylor.abs()),
-                "{dx}: {} vs {taylor}",
-                f(x0 + dx)
-            );
+    fn below_the_knots_the_curve_continues_with_the_mean_curvature() {
+        let (x_low, x_high) = (280.0_f64.ln(), 470.0_f64.ln());
+        let mut spline = BeamSpline::constant(280.0, 470.0, 1.0);
+        for _ in 0..3 {
+            let c: Vec<f64> = (0..spline.coefficients().len())
+                .map(|i| (i as f64 * 0.7).sin())
+                .collect();
+            let wavy = spline.with_coefficients(&c);
+            let f = |x: f64| ln_beam(&wavy, x.exp());
+            let h = (x_high - x_low) / wavy.intervals() as f64;
+            let within = |end: f64, toward: f64| {
+                [0.0, 1.0 / 3.0, 2.0 / 3.0, 1.0].map(|k| end + toward * k * h)
+            };
+            let slope_low = slope_at_first_node(&f, within(x_low, 1.0));
+            let slope_high = slope_at_first_node(&f, within(x_high, -1.0));
+            let curvature = (slope_high - slope_low) / (x_high - x_low);
+            for dx in [-0.05, -0.2, -0.4] {
+                let expected = f(x_low) + slope_low * dx + curvature * dx * dx / 2.0;
+                assert!(
+                    (f(x_low + dx) - expected).abs() < 1e-9 * (1.0 + expected.abs()),
+                    "{} intervals, {dx}: {} vs {expected}",
+                    wavy.intervals(),
+                    f(x_low + dx)
+                );
+            }
+            spline = spline.refined();
         }
     }
 }
