@@ -30,9 +30,8 @@ pub struct Calibration {
 #[derive(Debug, Clone)]
 pub struct OpenBeamFit {
     /// The beam per µs of flight time over the flight-time grid's range; its
-    /// knots span the first edge's flight time to the grid's slow end.  Only
-    /// the last bins see the beam near that slow end, so `covariance` shows it
-    /// least determined there.
+    /// knots span the first edge's flight time to the grid's slow end.
+    /// `covariance` shows how well the counts determine it.
     pub beam: BeamSpline,
     /// Half the Poisson deviance at the fit.
     pub deviance: f64,
@@ -83,10 +82,11 @@ pub struct OpenBeamFit {
 /// them can vary faster than a grid within the point cap resolves, which ends
 /// the ladder or, for the first candidate, refuses the fit.
 ///
-/// Beam structure that extends before the window's first edge is not
-/// supported: the fit follows its part inside the window, but before the
-/// edge, where neutrons reach the bins only through the pulse's delay, the
-/// beam is the spline's continuation, which the open-beam counts cannot check.
+/// Beam structure at or near the window's first edge is not supported: the
+/// counts are still matched, but before the edge, where neutrons reach the bins
+/// only through the pulse's delay, the beam is the spline's continuation, which
+/// the counts cannot check, and its error biases the fitted beam near that
+/// edge and, through the continuation's mean curvature, elsewhere.
 ///
 /// # Errors
 /// [`PipelineError::ShapeMismatch`] unless there is one count per bin;

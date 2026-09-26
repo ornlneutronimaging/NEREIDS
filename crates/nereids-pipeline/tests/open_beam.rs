@@ -394,14 +394,21 @@ fn a_dip_the_candidates_can_follow_is_followed() {
             within <= k + 4.0 * (2.0 * k).sqrt(),
             "{centre_us}: {within}"
         );
-        let (low, _) = grid_range(pulse);
-        let first_edge = edges()[0] - T0_US;
-        let before = distance(
-            &counts_between(pulse, &|u| noiseless.beam.per_us(u), low, first_edge),
-            &counts_between(pulse, &dipped(centre_us, fwhm_us), low, first_edge),
-            &expected,
-        );
-        assert!(before <= 3.0 * 3.0, "{centre_us}: {before}");
+        let truth = dipped(centre_us, fwhm_us);
+        let covariance = noiseless.covariance.as_ref().expect("covariance");
+        for u in bin_centres() {
+            let pairs = noiseless.beam.basis(u);
+            let variance: f64 = pairs
+                .iter()
+                .flat_map(|&(i, a)| {
+                    pairs
+                        .iter()
+                        .map(move |&(j, b)| a * b * covariance.get(i, j))
+                })
+                .sum();
+            let z = (noiseless.beam.per_us(u) / truth(u)).ln() / variance.sqrt();
+            assert!(z.abs() <= 4.0, "{centre_us} at {u} µs: {z}");
+        }
     }
     let expected = simulated(pulse, &dipped(407.0, 40.0));
     for seed in 200..206 {
@@ -415,7 +422,7 @@ fn a_dip_the_candidates_can_follow_is_followed() {
 }
 
 #[test]
-fn a_dip_at_the_first_edge_is_followed_inside_the_window() {
+fn a_dip_at_the_first_edge_still_matches_the_counts() {
     let c = EnergyLaw::Const;
     for ic in [
         Arc::clone(&pulses()[0].1),
@@ -459,16 +466,22 @@ fn a_dip_finer_than_every_candidate_is_reported_at_the_limit() {
 #[test]
 fn counts_that_cannot_determine_the_beam_are_reported_undetermined() {
     let pulse = &pulses()[0].1;
-    for (bin, count) in [(60, 1.0), (119, 3.0)] {
+    for sparse in [
+        &[(60, 1.0)][..],
+        &[(119, 3.0)],
+        &[(10, 2.0), (90, 2.0), (100, 1.0)],
+    ] {
         let mut counts = vec![0.0; edges().len() - 1];
-        counts[bin] = count;
+        for &(bin, count) in sparse {
+            counts[bin] = count;
+        }
         let fit = fit_open_beam(&edges(), &counts, &calibration(pulse)).expect("a fit");
         let determined = fit.converged
             && fit
                 .covariance
                 .is_some_and(|c| (0..4).all(|i| c.get(i, i).is_finite()));
-        assert!(!determined, "bin {bin}");
-        assert!(fit.overdispersion.is_none_or(f64::is_finite), "bin {bin}");
+        assert!(!determined, "{sparse:?}");
+        assert!(fit.overdispersion.is_none_or(f64::is_finite), "{sparse:?}");
     }
 }
 
