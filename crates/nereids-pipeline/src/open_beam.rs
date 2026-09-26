@@ -38,16 +38,18 @@ pub struct OpenBeamFit {
     /// Whether the fitter converged.  It certifies the minimisation, not that
     /// the counts determine every coefficient; `covariance` shows that.
     pub converged: bool,
-    /// Covariance of the beam's coefficients, scaled by `overdispersion`; rows
-    /// and columns of a coefficient the counts leave undetermined are NaN.
-    /// `None` when the fit did not converge.
+    /// Covariance of the beam's coefficients, scaled by `overdispersion`, or
+    /// at the Poisson scale when that is `None`; rows and columns of a
+    /// coefficient the counts leave undetermined are NaN.  `None` when the
+    /// fit did not converge.
     pub covariance: Option<FlatMatrix>,
     /// Variance of the counts over their Poisson variance, at least 1: the
-    /// richest fitted beam's Pearson χ² per degree of freedom, for independent
-    /// bins.  Beam structure finer than every candidate is counted in it as
-    /// noise; such a beam is not supported and is fitted smooth, which shows
-    /// as an overdispersion far above the detector's.  `None` when the fit did
-    /// not converge.
+    /// richest fitted beam's Pearson χ² per degree of freedom over the bins
+    /// predicted at least one count, for independent bins.  Beam structure
+    /// finer than every candidate is counted in it as noise; such a beam is
+    /// not supported and is fitted smooth, which shows as an overdispersion
+    /// far above the detector's.  `None` when the fit did not converge or
+    /// those bins do not outnumber the coefficients.
     pub overdispersion: Option<f64>,
     /// Whether the chosen beam is the richest fitted; the counts may then hold
     /// structure finer than its intervals, whose misfit `overdispersion`
@@ -104,28 +106,12 @@ pub fn fit_open_beam(
     open_counts: &[f64],
     calibration: &Calibration,
 ) -> Result<OpenBeamFit, PipelineError> {
-    let grid = FlightTimeGrid::new(time_edges_us, calibration.t0_us, &calibration.pulse)?;
-    if open_counts.len() + 1 != time_edges_us.len() {
-        return Err(PipelineError::ShapeMismatch(format!(
-            "{} open-beam counts for {} time edges",
-            open_counts.len(),
-            time_edges_us.len()
-        )));
-    }
-    if let Some((bin, count)) = open_counts
-        .iter()
-        .enumerate()
-        .find(|(_, c)| !(c.is_finite() && **c >= 0.0 && c.fract() == 0.0))
-    {
-        return Err(PipelineError::InvalidParameter(format!(
-            "open-beam counts must be whole non-negative numbers, got {count} in bin {bin}"
-        )));
-    }
-    if open_counts.iter().all(|&c| c == 0.0) {
-        return Err(PipelineError::InvalidParameter(
-            "the open beam has no counts".into(),
-        ));
-    }
+    let grid = Arc::new(FlightTimeGrid::new(
+        time_edges_us,
+        calibration.t0_us,
+        &calibration.pulse,
+    )?);
+    validate_counts("open-beam", open_counts, time_edges_us.len() - 1)?;
 
     let coefficients = |intervals: usize| intervals + 3;
     let admits = |intervals: usize| 2 * coefficients(intervals) <= open_counts.len();
@@ -150,11 +136,11 @@ pub fn fit_open_beam(
     )?];
     while let Some(start) = ladder
         .last()
-        .filter(|fit| fit.converged && admits(2 * fit.beam.intervals()))
-        .map(|fit| fit.beam.refined())
+        .filter(|candidate| candidate.fit.converged && admits(2 * candidate.beam.intervals()))
+        .map(|candidate| candidate.beam.refined())
     {
         match fit_beam(&grid, &start, open_counts) {
-            Ok(fit) if fit.converged => ladder.push(fit),
+            Ok(candidate) if candidate.fit.converged => ladder.push(candidate),
             Ok(_)
             | Err(PipelineError::FlightTimeGrid(FlightTimeGridError::TooManyPoints { .. })) => {
                 break;
@@ -163,20 +149,12 @@ pub fn fit_open_beam(
         }
     }
 
-    let richest = &ladder[ladder.len() - 1];
-    let overdispersion = richest.converged.then(|| {
-        let pearson: f64 = open_counts
-            .iter()
-            .zip(&richest.predicted)
-            .filter(|(_, mu)| **mu > 0.0)
-            .map(|(y, mu)| (y - mu).powi(2) / mu)
-            .sum();
-        let freedom = open_counts.len() - richest.beam.coefficients().len();
-        (pearson / freedom as f64).clamp(1.0, f64::INFINITY)
-    });
+    let richest = &ladder[ladder.len() - 1].fit;
+    let overdispersion = overdispersion(open_counts, richest);
     let scale = overdispersion.unwrap_or(1.0);
-    let criterion = |fit: &Candidate| {
-        2.0 * fit.result.deviance / scale + 2.0 * fit.beam.coefficients().len() as f64
+    let criterion = |candidate: &Candidate| {
+        2.0 * candidate.fit.result.deviance / scale
+            + 2.0 * candidate.beam.coefficients().len() as f64
     };
     let (chosen, _) =
         ladder
@@ -190,9 +168,9 @@ pub fn fit_open_beam(
                 },
             );
     let at_limit = chosen + 1 == ladder.len();
-    let fit = ladder.swap_remove(chosen);
+    let Candidate { beam, fit } = ladder.swap_remove(chosen);
     Ok(OpenBeamFit {
-        beam: fit.beam,
+        beam,
         deviance: fit.result.deviance,
         converged: fit.converged,
         covariance: fit
@@ -211,43 +189,110 @@ pub fn fit_open_beam(
     })
 }
 
+pub(crate) fn validate_counts(run: &str, counts: &[f64], bins: usize) -> Result<(), PipelineError> {
+    if counts.len() != bins {
+        return Err(PipelineError::ShapeMismatch(format!(
+            "{} {run} counts for {bins} time bins",
+            counts.len()
+        )));
+    }
+    if let Some((bin, count)) = counts
+        .iter()
+        .enumerate()
+        .find(|(_, c)| !(c.is_finite() && **c >= 0.0 && c.fract() == 0.0))
+    {
+        return Err(PipelineError::InvalidParameter(format!(
+            "{run} counts must be whole non-negative numbers, got {count} in bin {bin}"
+        )));
+    }
+    if counts.iter().all(|&c| c == 0.0) {
+        return Err(PipelineError::InvalidParameter(format!(
+            "the {run} run has no counts"
+        )));
+    }
+    Ok(())
+}
+
+const COUNTS_TO_MEASURE_NOISE: f64 = 1.0;
+
+pub(crate) fn overdispersion(observed: &[f64], fit: &GridFit) -> Option<f64> {
+    let (pearson, bins) = observed
+        .iter()
+        .zip(&fit.predicted)
+        .filter(|(_, mu)| **mu >= COUNTS_TO_MEASURE_NOISE)
+        .fold((0.0, 0_usize), |(sum, bins), (y, mu)| {
+            (sum + (y - mu).powi(2) / mu, bins + 1)
+        });
+    let parameters = fit.result.on_bound.iter().filter(|&&on| !on).count();
+    let freedom = bins.checked_sub(parameters).filter(|&f| f > 0)?;
+    fit.converged
+        .then(|| (pearson / freedom as f64).clamp(1.0, f64::INFINITY))
+}
+
 struct Candidate {
     beam: BeamSpline,
-    converged: bool,
-    result: PoissonResult,
-    predicted: Vec<f64>,
-    step_us: f64,
-    points: usize,
-    halvings: usize,
+    fit: GridFit,
 }
 
 fn fit_beam(
-    first_grid: &FlightTimeGrid,
+    first_grid: &Arc<FlightTimeGrid>,
     start: &BeamSpline,
     open_counts: &[f64],
 ) -> Result<Candidate, PipelineError> {
-    let mut grid = first_grid.clone();
-    let mut beam = start.clone();
+    let mut parameters = ParameterSet::new(
+        start
+            .coefficients()
+            .iter()
+            .enumerate()
+            .map(|(i, &c)| FitParameter::unbounded(format!("beam {i}"), c))
+            .collect(),
+    );
+    let fit = fit_on_halved_grids(first_grid, &mut parameters, open_counts, |grid| {
+        Ok(OpenBeamModel::new(grid, start))
+    })?;
+    Ok(Candidate {
+        beam: start.with_coefficients(&fit.result.params),
+        fit,
+    })
+}
+
+pub(crate) struct GridFit {
+    pub(crate) result: PoissonResult,
+    pub(crate) converged: bool,
+    pub(crate) predicted: Vec<f64>,
+    pub(crate) step_us: f64,
+    pub(crate) points: usize,
+    pub(crate) halvings: usize,
+}
+
+pub(crate) fn fit_on_halved_grids<M: FitModel>(
+    first_grid: &Arc<FlightTimeGrid>,
+    parameters: &mut ParameterSet,
+    observed: &[f64],
+    model_on: impl Fn(&Arc<FlightTimeGrid>) -> Result<M, PipelineError>,
+) -> Result<GridFit, PipelineError> {
+    let mut grid = Arc::clone(first_grid);
+    let mut coarse = model_on(&grid)?;
     let mut halvings = 0;
     loop {
-        let finer = grid.halved()?;
-        let (refit, result) = fit(&finer, &beam, open_counts)?;
-        let converged = result.converged && refit.coefficients().iter().all(|c| c.is_finite());
-        let predicted = counts(&finer, &refit)?;
+        let finer = Arc::new(grid.halved()?);
+        let fine = model_on(&finer)?;
+        let result = poisson_fit(&fine, observed, parameters, &PoissonConfig::default())?;
+        let converged = result.converged && result.params.iter().all(|p| p.is_finite());
+        let predicted = fine.evaluate(&result.params)?;
         let spread: f64 = predicted
             .iter()
-            .zip(counts(&grid, &refit)?)
+            .zip(coarse.evaluate(&result.params)?)
             .filter(|(fine, _)| **fine > 0.0)
             .map(|(fine, coarse)| (fine - coarse).powi(2) / fine)
             .sum();
         grid = finer;
-        beam = refit;
+        coarse = fine;
         halvings += 1;
         if spread <= BOUND || !converged {
-            return Ok(Candidate {
-                beam,
-                converged,
+            return Ok(GridFit {
                 result,
+                converged,
                 predicted,
                 step_us: grid.step_us(),
                 points: grid.flight_times_us().len(),
@@ -257,42 +302,15 @@ fn fit_beam(
     }
 }
 
-fn counts(grid: &FlightTimeGrid, beam: &BeamSpline) -> Result<Vec<f64>, FlightTimeGridError> {
-    let values: Vec<f64> = grid
-        .flight_times_us()
-        .iter()
-        .map(|&u| beam.per_us(u))
-        .collect();
-    grid.predict(&values)
-}
-
-fn fit(
-    grid: &FlightTimeGrid,
-    start: &BeamSpline,
-    open_counts: &[f64],
-) -> Result<(BeamSpline, PoissonResult), PipelineError> {
-    let model = OpenBeamModel::new(grid, start);
-    let mut params = ParameterSet::new(
-        start
-            .coefficients()
-            .iter()
-            .enumerate()
-            .map(|(i, &c)| FitParameter::unbounded(format!("beam {i}"), c))
-            .collect(),
-    );
-    let result = poisson_fit(&model, open_counts, &mut params, &PoissonConfig::default())?;
-    Ok((start.with_coefficients(&result.params), result))
-}
-
-struct OpenBeamModel<'a> {
-    grid: &'a FlightTimeGrid,
+pub(crate) struct OpenBeamModel {
+    grid: Arc<FlightTimeGrid>,
     basis: Vec<[(usize, f64); 5]>,
 }
 
-impl<'a> OpenBeamModel<'a> {
-    fn new(grid: &'a FlightTimeGrid, beam: &BeamSpline) -> Self {
+impl OpenBeamModel {
+    pub(crate) fn new(grid: &Arc<FlightTimeGrid>, beam: &BeamSpline) -> Self {
         Self {
-            grid,
+            grid: Arc::clone(grid),
             basis: grid
                 .flight_times_us()
                 .iter()
@@ -301,7 +319,7 @@ impl<'a> OpenBeamModel<'a> {
         }
     }
 
-    fn beam(&self, coefficients: &[f64]) -> Vec<f64> {
+    pub(crate) fn beam(&self, coefficients: &[f64]) -> Vec<f64> {
         self.basis
             .iter()
             .map(|pairs| {
@@ -314,14 +332,27 @@ impl<'a> OpenBeamModel<'a> {
             .collect()
     }
 
-    fn counts(&self, values: &[f64]) -> Result<Vec<f64>, FittingError> {
+    pub(crate) fn log_slope(&self, index: usize) -> Vec<f64> {
+        self.basis
+            .iter()
+            .map(|pairs| {
+                pairs
+                    .iter()
+                    .filter(|&&(i, _)| i == index)
+                    .map(|&(_, w)| w)
+                    .sum()
+            })
+            .collect()
+    }
+
+    pub(crate) fn counts(&self, values: &[f64]) -> Result<Vec<f64>, FittingError> {
         self.grid
             .predict(values)
             .map_err(|e| FittingError::EvaluationFailed(e.to_string()))
     }
 }
 
-impl FitModel for OpenBeamModel<'_> {
+impl FitModel for OpenBeamModel {
     fn evaluate(&self, params: &[f64]) -> Result<Vec<f64>, FittingError> {
         self.counts(&self.beam(params))
     }
@@ -336,16 +367,10 @@ impl FitModel for OpenBeamModel<'_> {
         let mut jacobian = FlatMatrix::zeros(y_current.len(), free_param_indices.len());
         for (col, &index) in free_param_indices.iter().enumerate() {
             let values: Vec<f64> = self
-                .basis
+                .log_slope(index)
                 .iter()
                 .zip(&beam)
-                .map(|(pairs, &phi)| {
-                    phi * pairs
-                        .iter()
-                        .filter(|&&(i, _)| i == index)
-                        .map(|&(_, w)| w)
-                        .sum::<f64>()
-                })
+                .map(|(slope, phi)| slope * phi)
                 .collect();
             for (row, value) in self.counts(&values).ok()?.into_iter().enumerate() {
                 *jacobian.get_mut(row, col) = value;
@@ -356,12 +381,12 @@ impl FitModel for OpenBeamModel<'_> {
 }
 
 #[cfg(test)]
-mod tests {
+pub(crate) mod tests {
     use nereids_physics::ikeda_carpenter::{EnergyLaw, IkedaCarpenterParams, SynthesisGrid};
 
     use super::*;
 
-    fn grid(channel_fwhm_us: Option<f64>) -> FlightTimeGrid {
+    pub(crate) fn grid(channel_fwhm_us: Option<f64>) -> Arc<FlightTimeGrid> {
         let pulse = IkedaCarpenter::new(
             IkedaCarpenterParams {
                 alpha: EnergyLaw::SqrtE { a0: 0.35, a1: 0.05 },
@@ -380,7 +405,7 @@ mod tests {
         )
         .expect("valid IC model");
         let edges: Vec<f64> = (350..=470).map(f64::from).collect();
-        FlightTimeGrid::new(&edges, 3.0, &Arc::new(pulse)).expect("grid")
+        Arc::new(FlightTimeGrid::new(&edges, 3.0, &Arc::new(pulse)).expect("grid"))
     }
 
     #[test]
