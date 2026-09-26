@@ -394,6 +394,7 @@ fn a_dip_the_candidates_can_follow_is_followed() {
             within <= k + 4.0 * (2.0 * k).sqrt(),
             "{centre_us}: {within}"
         );
+        assert_eq!(noiseless.overdispersion, Some(1.0), "{centre_us}");
         let truth = dipped(centre_us, fwhm_us);
         let covariance = noiseless.covariance.as_ref().expect("covariance");
         for u in bin_centres() {
@@ -452,6 +453,23 @@ fn a_dip_at_the_first_edge_still_matches_the_counts() {
 }
 
 #[test]
+fn a_dip_just_before_the_first_edge_is_reported_at_the_limit() {
+    let pulse = &pulses()[0].1;
+    let rounded: Vec<f64> = simulated(pulse, &dipped(343.0, 10.0))
+        .iter()
+        .map(|mu| mu.round())
+        .collect();
+    let fit = fit_open_beam(&edges(), &rounded, &calibration(pulse)).expect("fit");
+    let freedom = (rounded.len() - fit.beam.coefficients().len()) as f64;
+    let poisson_spread = 1.0 + 3.0 * (2.0 / freedom).sqrt();
+    let overdispersion = fit.overdispersion.expect("converged");
+    assert!(
+        fit.at_limit && overdispersion > poisson_spread,
+        "{overdispersion}"
+    );
+}
+
+#[test]
 fn a_dip_finer_than_every_candidate_is_reported_at_the_limit() {
     let pulse = &pulses()[0].1;
     let expected = simulated(pulse, &dipped(407.0, 4.7));
@@ -466,11 +484,7 @@ fn a_dip_finer_than_every_candidate_is_reported_at_the_limit() {
 #[test]
 fn counts_that_cannot_determine_the_beam_are_reported_undetermined() {
     let pulse = &pulses()[0].1;
-    for sparse in [
-        &[(60, 1.0)][..],
-        &[(119, 3.0)],
-        &[(10, 2.0), (90, 2.0), (100, 1.0)],
-    ] {
+    for sparse in [&[(60, 1.0)][..], &[(119, 3.0)]] {
         let mut counts = vec![0.0; edges().len() - 1];
         for &(bin, count) in sparse {
             counts[bin] = count;

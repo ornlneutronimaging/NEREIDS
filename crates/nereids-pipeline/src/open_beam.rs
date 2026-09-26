@@ -78,15 +78,18 @@ pub struct OpenBeamFit {
 /// ends the ladder.  The candidate with the lowest `D / overdispersion + 2k` is
 /// returned, `D` twice its deviance and `k` its coefficients.
 ///
-/// Counts too sparse to determine the beam are not supported: a beam fitted to
-/// them can vary faster than a grid within the point cap resolves, which ends
-/// the ladder or, for the first candidate, refuses the fit.
+/// Counts too sparse to determine the beam are not supported: the fit may not
+/// converge, may leave coefficients undetermined (NaN in `covariance`), or,
+/// when its beam varies faster than a grid within the point cap resolves, end
+/// the ladder or, for the first candidate, refuse the fit.
 ///
-/// Beam structure at or near the window's first edge is not supported: the
-/// counts are still matched, but before the edge, where neutrons reach the bins
-/// only through the pulse's delay, the beam is the spline's continuation, which
-/// the counts cannot check, and its error biases the fitted beam near that
-/// edge and, through the continuation's mean curvature, elsewhere.
+/// Beam structure at or near the window's first edge is not supported: before
+/// the edge, where neutrons reach the bins only through the pulse's delay, the
+/// beam is the spline's continuation, which the counts cannot check.  Its error
+/// biases the fitted beam near that edge and, through the continuation's mean
+/// curvature, elsewhere; structure just before the edge can leave the first
+/// bins unmatched, which shows as `at_limit` with an overdispersion far above
+/// the detector's.  Start the window where the beam is smooth.
 ///
 /// # Errors
 /// [`PipelineError::ShapeMismatch`] unless there is one count per bin;
