@@ -111,10 +111,10 @@ fn draw(expected: &[f64], seed: u64, counts_per_neutron: f64) -> Vec<f64> {
         .collect()
 }
 
-fn dipped(fwhm_us: f64) -> impl Fn(f64) -> f64 {
+fn dipped(centre_us: f64, fwhm_us: f64) -> impl Fn(f64) -> f64 {
     let smooth = true_beam(1.0e6);
     let sigma = fwhm_us / (8.0 * 2.0_f64.ln()).sqrt();
-    move |u: f64| smooth(u) * (1.0 - 0.6 * (-(u - 407.0).powi(2) / (2.0 * sigma * sigma)).exp())
+    move |u: f64| smooth(u) * (1.0 - 0.6 * (-(u - centre_us).powi(2) / (2.0 * sigma * sigma)).exp())
 }
 
 fn distance_from(pulse: &Arc<IkedaCarpenter>, beam: &BeamSpline, expected: &[f64]) -> f64 {
@@ -361,11 +361,22 @@ fn counting_every_neutron_seven_times_scales_the_overdispersion_not_the_error_ba
 #[test]
 fn a_dip_the_candidates_can_follow_is_followed() {
     let pulse = &pulses()[0].1;
-    let expected = simulated(pulse, &dipped(40.0));
-    let rounded: Vec<f64> = expected.iter().map(|mu| mu.round()).collect();
-    let noiseless = fit_open_beam(&edges(), &rounded, &calibration(pulse)).expect("fit");
-    assert!(noiseless.beam.intervals() > 1 && !noiseless.at_limit);
-    assert!(2.0 * noiseless.deviance <= 1.0, "{}", noiseless.deviance);
+    for (centre_us, fwhm_us) in [(407.0, 40.0), (380.0, 30.0)] {
+        let expected = simulated(pulse, &dipped(centre_us, fwhm_us));
+        let rounded: Vec<f64> = expected.iter().map(|mu| mu.round()).collect();
+        let noiseless = fit_open_beam(&edges(), &rounded, &calibration(pulse)).expect("fit");
+        assert!(
+            noiseless.beam.intervals() > 1 && !noiseless.at_limit,
+            "{centre_us}"
+        );
+        let k = noiseless.beam.coefficients().len() as f64;
+        let distance = distance_from(pulse, &noiseless.beam, &expected);
+        assert!(
+            distance <= k + 4.0 * (2.0 * k).sqrt(),
+            "{centre_us}: {distance}"
+        );
+    }
+    let expected = simulated(pulse, &dipped(407.0, 40.0));
     for seed in 200..206 {
         let fit =
             fit_open_beam(&edges(), &draw(&expected, seed, 1.0), &calibration(pulse)).expect("fit");
@@ -379,7 +390,7 @@ fn a_dip_the_candidates_can_follow_is_followed() {
 #[test]
 fn a_dip_finer_than_every_candidate_is_reported_at_the_limit() {
     let pulse = &pulses()[0].1;
-    let expected = simulated(pulse, &dipped(4.7));
+    let expected = simulated(pulse, &dipped(407.0, 4.7));
     let fit =
         fit_open_beam(&edges(), &draw(&expected, 200, 1.0), &calibration(pulse)).expect("fit");
     assert!(fit.at_limit);
@@ -417,6 +428,21 @@ fn a_richer_beam_the_counts_or_the_grid_cannot_resolve_ends_the_ladder() {
     let unconverged_next = sparse(&[(10, 2.0), (90, 2.0), (100, 1.0)]);
     assert!(unconverged_next.converged && unconverged_next.at_limit);
     assert!(sparse(&[(0, 1.0), (30, 1.0), (60, 1.0)]).converged);
+    let infinite_next = draw(&simulated(pulse, &true_beam(0.5)), 20069, 1.0);
+    assert!(
+        fit_open_beam(&edges(), &infinite_next, &calibration(pulse))
+            .expect("fit")
+            .converged
+    );
+    let past_the_point_cap: Vec<f64> = simulated(pulse, &dipped(360.0, 15.0))
+        .iter()
+        .map(|mu| mu.round())
+        .collect();
+    assert!(
+        fit_open_beam(&edges(), &past_the_point_cap, &calibration(pulse))
+            .expect("fit")
+            .at_limit
+    );
 }
 
 #[test]

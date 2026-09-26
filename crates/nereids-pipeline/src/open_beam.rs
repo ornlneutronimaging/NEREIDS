@@ -30,7 +30,9 @@ pub struct Calibration {
 #[derive(Debug, Clone)]
 pub struct OpenBeamFit {
     /// The beam per µs of flight time; its knots span the first edge's flight
-    /// time to the flight-time grid's slow end.
+    /// time to the flight-time grid's slow end.  Only the last bins see the
+    /// beam near that slow end, so `covariance` shows it least determined
+    /// there.
     pub beam: BeamSpline,
     /// Half the Poisson deviance at the fit.
     pub deviance: f64,
@@ -52,11 +54,12 @@ pub struct OpenBeamFit {
     /// structure finer than its intervals, whose misfit `overdispersion`
     /// includes.
     pub at_limit: bool,
-    /// Step, in µs, of the accepted grid.
+    /// Step, in µs, of the returned fit's grid, which meets [`BOUND`] when the
+    /// fit converged.
     pub step_us: f64,
-    /// Number of points of the accepted grid.
+    /// Number of points of that grid.
     pub points: usize,
-    /// How many times the first grid was halved to reach the accepted one.
+    /// How many times the first grid was halved to reach it.
     pub halvings: usize,
 }
 
@@ -80,10 +83,12 @@ pub struct OpenBeamFit {
 /// them can vary faster than a grid within the point cap resolves, which ends
 /// the ladder or, for the first candidate, refuses the fit.
 ///
-/// Beam structure at the window's first edge is not supported: before that
-/// edge, where neutrons reach the bins through the pulse tail, `ln φ` is the
-/// spline's second-order Taylor expansion at the first knot, which such
-/// structure makes grow without bound.  Start the window clear of beam dips.
+/// Beam structure at or near the window's first edge is not supported: before
+/// that edge, where neutrons reach the bins through the pulse tail, `ln φ` is
+/// the spline's second-order Taylor expansion at the first knot, which such
+/// structure makes grow without bound.  It shows as `at_limit` with an
+/// overdispersion far above the detector's; start the window where the beam
+/// is smooth.
 ///
 /// # Errors
 /// [`PipelineError::ShapeMismatch`] unless there is one count per bin;
@@ -144,11 +149,11 @@ pub fn fit_open_beam(
     )?];
     while let Some(start) = ladder
         .last()
-        .filter(|fit| fit.result.converged && admits(2 * fit.beam.intervals()))
+        .filter(|fit| fit.converged && admits(2 * fit.beam.intervals()))
         .map(|fit| fit.beam.refined())
     {
         match fit_beam(&grid, &start, open_counts) {
-            Ok(fit) if fit.result.converged => ladder.push(fit),
+            Ok(fit) if fit.converged => ladder.push(fit),
             Ok(_)
             | Err(PipelineError::FlightTimeGrid(FlightTimeGridError::TooManyPoints { .. })) => {
                 break;
@@ -158,7 +163,7 @@ pub fn fit_open_beam(
     }
 
     let richest = &ladder[ladder.len() - 1];
-    let overdispersion = richest.result.converged.then(|| {
+    let overdispersion = richest.converged.then(|| {
         let pearson: f64 = open_counts
             .iter()
             .zip(&richest.predicted)
@@ -188,11 +193,15 @@ pub fn fit_open_beam(
     Ok(OpenBeamFit {
         beam: fit.beam,
         deviance: fit.result.deviance,
-        converged: fit.result.converged,
-        covariance: fit.result.covariance.map(|mut covariance| {
-            covariance.data.iter_mut().for_each(|v| *v *= scale);
-            covariance
-        }),
+        converged: fit.converged,
+        covariance: fit
+            .result
+            .covariance
+            .filter(|_| fit.converged)
+            .map(|mut covariance| {
+                covariance.data.iter_mut().for_each(|v| *v *= scale);
+                covariance
+            }),
         overdispersion,
         at_limit,
         step_us: fit.step_us,
@@ -203,6 +212,7 @@ pub fn fit_open_beam(
 
 struct Candidate {
     beam: BeamSpline,
+    converged: bool,
     result: PoissonResult,
     predicted: Vec<f64>,
     step_us: f64,
@@ -221,6 +231,7 @@ fn fit_beam(
     loop {
         let finer = grid.halved()?;
         let (refit, result) = fit(&finer, &beam, open_counts)?;
+        let converged = result.converged && refit.coefficients().iter().all(|c| c.is_finite());
         let predicted = counts(&finer, &refit)?;
         let spread: f64 = predicted
             .iter()
@@ -231,9 +242,10 @@ fn fit_beam(
         grid = finer;
         beam = refit;
         halvings += 1;
-        if spread <= BOUND || !result.converged {
+        if spread <= BOUND || !converged {
             return Ok(Candidate {
                 beam,
+                converged,
                 result,
                 predicted,
                 step_us: grid.step_us(),
