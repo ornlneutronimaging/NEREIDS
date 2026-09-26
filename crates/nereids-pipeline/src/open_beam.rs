@@ -106,7 +106,11 @@ pub fn fit_open_beam(
     open_counts: &[f64],
     calibration: &Calibration,
 ) -> Result<OpenBeamFit, PipelineError> {
-    let grid = FlightTimeGrid::new(time_edges_us, calibration.t0_us, &calibration.pulse)?;
+    let grid = Arc::new(FlightTimeGrid::new(
+        time_edges_us,
+        calibration.t0_us,
+        &calibration.pulse,
+    )?);
     validate_counts("open-beam", open_counts, time_edges_us.len() - 1)?;
 
     let coefficients = |intervals: usize| intervals + 3;
@@ -231,7 +235,7 @@ struct Candidate {
 }
 
 fn fit_beam(
-    first_grid: &FlightTimeGrid,
+    first_grid: &Arc<FlightTimeGrid>,
     start: &BeamSpline,
     open_counts: &[f64],
 ) -> Result<Candidate, PipelineError> {
@@ -262,16 +266,16 @@ pub(crate) struct GridFit {
 }
 
 pub(crate) fn fit_on_halved_grids<M: FitModel>(
-    first_grid: &FlightTimeGrid,
+    first_grid: &Arc<FlightTimeGrid>,
     parameters: &mut ParameterSet,
     observed: &[f64],
-    model_on: impl Fn(&FlightTimeGrid) -> Result<M, PipelineError>,
+    model_on: impl Fn(&Arc<FlightTimeGrid>) -> Result<M, PipelineError>,
 ) -> Result<GridFit, PipelineError> {
-    let mut grid = first_grid.clone();
+    let mut grid = Arc::clone(first_grid);
     let mut coarse = model_on(&grid)?;
     let mut halvings = 0;
     loop {
-        let finer = grid.halved()?;
+        let finer = Arc::new(grid.halved()?);
         let fine = model_on(&finer)?;
         let result = poisson_fit(&fine, observed, parameters, &PoissonConfig::default())?;
         let converged = result.converged && result.params.iter().all(|p| p.is_finite());
@@ -299,14 +303,14 @@ pub(crate) fn fit_on_halved_grids<M: FitModel>(
 }
 
 pub(crate) struct OpenBeamModel {
-    grid: FlightTimeGrid,
+    grid: Arc<FlightTimeGrid>,
     basis: Vec<[(usize, f64); 5]>,
 }
 
 impl OpenBeamModel {
-    pub(crate) fn new(grid: &FlightTimeGrid, beam: &BeamSpline) -> Self {
+    pub(crate) fn new(grid: &Arc<FlightTimeGrid>, beam: &BeamSpline) -> Self {
         Self {
-            grid: grid.clone(),
+            grid: Arc::clone(grid),
             basis: grid
                 .flight_times_us()
                 .iter()
@@ -382,7 +386,7 @@ pub(crate) mod tests {
 
     use super::*;
 
-    pub(crate) fn grid(channel_fwhm_us: Option<f64>) -> FlightTimeGrid {
+    pub(crate) fn grid(channel_fwhm_us: Option<f64>) -> Arc<FlightTimeGrid> {
         let pulse = IkedaCarpenter::new(
             IkedaCarpenterParams {
                 alpha: EnergyLaw::SqrtE { a0: 0.35, a1: 0.05 },
@@ -401,7 +405,7 @@ pub(crate) mod tests {
         )
         .expect("valid IC model");
         let edges: Vec<f64> = (350..=470).map(f64::from).collect();
-        FlightTimeGrid::new(&edges, 3.0, &Arc::new(pulse)).expect("grid")
+        Arc::new(FlightTimeGrid::new(&edges, 3.0, &Arc::new(pulse)).expect("grid"))
     }
 
     #[test]

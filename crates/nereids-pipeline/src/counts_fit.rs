@@ -1,6 +1,8 @@
 //! Areal densities of a sample's isotopes, fitted to the counts of an
 //! open-beam run and a sample run recorded in the same time bins.
 
+use std::sync::Arc;
+
 use nereids_endf::resonance::ResonanceData;
 use nereids_fitting::error::FittingError;
 use nereids_fitting::lm::{FitModel, FlatMatrix};
@@ -230,7 +232,7 @@ pub fn fit_counts(
     );
     let resonances: Vec<ResonanceData> = isotopes.iter().map(|(data, _)| data.clone()).collect();
     let observed: Vec<f64> = open_counts.iter().chain(sample_counts).copied().collect();
-    let fit = fit_on_halved_grids(&first, &mut parameters, &observed, |grid| {
+    let fit = fit_on_halved_grids(&Arc::new(first), &mut parameters, &observed, |grid| {
         TwoRunModel::new(grid, &open.beam, &resonances, *temperature_k, *charge_ratio)
     })?;
 
@@ -325,7 +327,7 @@ struct TwoRunModel {
 
 impl TwoRunModel {
     fn new(
-        grid: &FlightTimeGrid,
+        grid: &Arc<FlightTimeGrid>,
         beam: &BeamSpline,
         isotopes: &[ResonanceData],
         temperature_k: f64,
