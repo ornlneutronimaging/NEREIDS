@@ -46,10 +46,11 @@ pub struct Measurement {
 pub struct CountsFit {
     /// Areal density of each isotope in atoms/barn, in the order given.
     pub densities: Vec<f64>,
-    /// Covariance of the densities, in the order given, scaled by
-    /// `overdispersion`, or at the Poisson scale when that is `None`; the row
-    /// and column of a density on its bound of 0 or not determined are NaN.
-    /// `None` when the fit did not converge.
+    /// Covariance of the densities, in the order given: the inverse of the
+    /// expected information at the fit, which holds when the counts are
+    /// large, scaled by `overdispersion`, or at the Poisson scale when that is
+    /// `None`.  The row and column of a density on its bound of 0 or not
+    /// determined are NaN.  `None` when the fit did not converge.
     pub covariance: Option<FlatMatrix>,
     /// The beam per µs of flight time, fitted to both runs, with the
     /// intervals the open-beam fit chose.
@@ -90,7 +91,9 @@ pub struct CountsFit {
 /// The grid's first step is at most half the narrowest Doppler full width at
 /// half maximum, in flight time, of any resonance inside its energy span; it
 /// is then halved until the counts of both runs meet
-/// [`BOUND`](crate::open_beam::BOUND).
+/// [`BOUND`](crate::open_beam::BOUND).  The step is uniform, so a wide window
+/// whose span holds a narrow resonance at high energy can exceed the grid's
+/// point cap.
 ///
 /// The overdispersion scales the covariance; it assumes both runs share it
 /// and their bins are independent.
@@ -103,7 +106,8 @@ pub struct CountsFit {
 /// not finite and non-negative, the temperature is outside 1–5000 K, an
 /// isotope's resonance data are not finite, or the energies its broadened
 /// cross section reads, down to zero for a window within the thermal spread
-/// of zero energy, are not inside one of its resolved ranges;
+/// of zero energy, are not inside a single one of its evaluated (SLBW, MLBW or
+/// Reich–Moore) resolved ranges;
 /// [`PipelineError::UnmodelledCounts`] if at the fit, converged or not, a bin
 /// holds counts predicted below [`NEGLIGIBLE_PREDICTION`]: background, or
 /// starting densities whose transmission vanishes where counts were recorded,
@@ -124,10 +128,6 @@ pub fn fit_counts(
         isotopes,
         temperature_k,
     } = measurement;
-    let grid = FlightTimeGrid::new(time_edges_us, calibration.t0_us, &calibration.pulse)?;
-    let bins = time_edges_us.len() - 1;
-    validate_counts("open-beam", open_counts, bins)?;
-    validate_counts("sample", sample_counts, bins)?;
     let invalid = |message: String| Err(PipelineError::InvalidParameter(message));
     if !(charge_ratio.is_finite() && *charge_ratio > 0.0) {
         return invalid(format!(
@@ -143,8 +143,7 @@ pub fn fit_counts(
             "the temperature must be within {t_low}–{t_high} K, got {temperature_k}"
         ));
     }
-    let energies = grid.energies_ev();
-    let span_ev = (energies[energies.len() - 1], energies[0]);
+    let mut dopplers = Vec::with_capacity(isotopes.len());
     for (i, (isotope, density)) in isotopes.iter().enumerate() {
         if isotopes[..i]
             .iter()
@@ -167,30 +166,37 @@ pub fn fit_counts(
                 isotope.isotope
             ));
         }
-        let u = DopplerParams::new(*temperature_k, isotope.awr)
-            .map_err(|e| PipelineError::InvalidParameter(e.to_string()))?
-            .u();
+        dopplers.push(
+            DopplerParams::new(*temperature_k, isotope.awr)
+                .map_err(|e| PipelineError::InvalidParameter(e.to_string()))?,
+        );
+    }
+    let grid = FlightTimeGrid::new(time_edges_us, calibration.t0_us, &calibration.pulse)?;
+    let bins = time_edges_us.len() - 1;
+    validate_counts("open-beam", open_counts, bins)?;
+    validate_counts("sample", sample_counts, bins)?;
+
+    let energies = grid.energies_ev();
+    let span_ev = (energies[energies.len() - 1], energies[0]);
+    let clock = TOF_FACTOR * calibration.pulse.flight_path_m();
+    let half_maximum = 2.0 * std::f64::consts::LN_2.sqrt();
+    let mut narrowest_us = f64::INFINITY;
+    for ((isotope, _), doppler) in isotopes.iter().zip(&dopplers) {
         let read = (
-            (span_ev.0.sqrt() - SUPPORT_X * u).max(0.0).powi(2),
-            (span_ev.1.sqrt() + SUPPORT_X * u).powi(2),
+            (span_ev.0.sqrt() - SUPPORT_X * doppler.u())
+                .max(0.0)
+                .powi(2),
+            (span_ev.1.sqrt() + SUPPORT_X * doppler.u()).powi(2),
         );
         if !isotope.ranges.iter().any(|range| {
             range.is_evaluable() && range.energy_low <= read.0 && read.1 <= range.energy_high
         }) {
             return invalid(format!(
-                "the Doppler-broadened cross section of {} reads {:.6e}–{:.6e} eV, \
-                 outside each of its resolved ranges",
+                "the Doppler-broadened cross section of {} reads {:.6e}–{:.6e} eV, which no \
+                 single one of its evaluated (SLBW, MLBW or Reich–Moore) resolved ranges holds",
                 isotope.isotope, read.0, read.1
             ));
         }
-    }
-
-    let clock = TOF_FACTOR * calibration.pulse.flight_path_m();
-    let half_maximum = 2.0 * std::f64::consts::LN_2.sqrt();
-    let mut narrowest_us = f64::INFINITY;
-    for (isotope, _) in isotopes {
-        let doppler = DopplerParams::new(*temperature_k, isotope.awr)
-            .map_err(|e| PipelineError::InvalidParameter(e.to_string()))?;
         for energy in resonance_center_energies(&[isotope])
             .into_iter()
             .filter(|e| (span_ev.0..=span_ev.1).contains(e))
