@@ -315,6 +315,31 @@ fn the_overdispersion_is_the_variance_over_the_poisson_variance() {
 }
 
 #[test]
+fn a_low_count_open_beam_is_fitted_and_its_overdispersion_measured() {
+    let pulse = &pulses()[0].1;
+    let counts_per_neutron = 3.0;
+    let expected = simulated(pulse, &true_beam(5.0));
+    let ratios: Vec<f64> = (1000..1020)
+        .map(|seed| {
+            fit_open_beam(
+                &edges(),
+                &draw(&expected, seed, counts_per_neutron),
+                &calibration(pulse),
+            )
+            .expect("fit")
+            .overdispersion
+            .expect("converged")
+                / counts_per_neutron
+        })
+        .collect();
+    let draws = ratios.len() as f64;
+    let mean = ratios.iter().sum::<f64>() / draws;
+    let freedom = (expected.len() - richest_coefficients(expected.len())) as f64;
+    let bound = 3.0 * (2.0 / freedom).sqrt() / draws.sqrt();
+    assert!((mean - 1.0).abs() <= bound, "{mean} vs 1 ± {bound}");
+}
+
+#[test]
 fn counting_every_neutron_seven_times_scales_the_overdispersion_not_the_error_bars() {
     let pulse = &pulses()[0].1;
     let once = draw(&simulated(pulse, &true_beam(1.0e6)), 300, 3.0);
@@ -375,6 +400,7 @@ fn counts_that_cannot_determine_the_beam_are_reported_undetermined() {
                 .covariance
                 .is_some_and(|c| (0..4).all(|i| c.get(i, i).is_finite()));
         assert!(!determined, "bin {bin}");
+        assert!(fit.overdispersion.is_none_or(f64::is_finite), "bin {bin}");
     }
 }
 

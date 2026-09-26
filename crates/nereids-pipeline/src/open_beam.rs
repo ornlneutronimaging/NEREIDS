@@ -29,8 +29,8 @@ pub struct Calibration {
 /// The fitted open beam.
 #[derive(Debug, Clone)]
 pub struct OpenBeamFit {
-    /// The beam per µs of flight time; its knots span the window's flight
-    /// times.
+    /// The beam per µs of flight time; its knots span the first edge's flight
+    /// time to the flight-time grid's slow end.
     pub beam: BeamSpline,
     /// Half the Poisson deviance at the fit.
     pub deviance: f64,
@@ -42,7 +42,7 @@ pub struct OpenBeamFit {
     /// `None` when the fit did not converge.
     pub covariance: Option<FlatMatrix>,
     /// Variance of the counts over their Poisson variance, at least 1: the
-    /// richest fitted beam's deviance per degree of freedom, for independent
+    /// richest fitted beam's Pearson χ² per degree of freedom, for independent
     /// bins.  Beam structure finer than every candidate is counted in it as
     /// noise; such a beam is not supported and is fitted smooth, which shows
     /// as an overdispersion far above the detector's.  `None` when the fit did
@@ -62,22 +62,28 @@ pub struct OpenBeamFit {
 
 /// Fit the beam to the raw open-beam counts `open_counts` of the time bins
 /// `time_edges_us` (µs).  `ln φ`, the logarithm of the beam, is a cubic spline
-/// in `ln u` with knots over the window's flight times; neutrons faster than
-/// the flight-time grid's range, each reaching the bins with less than
+/// in `ln u` with knots from the first edge's flight time to the flight-time
+/// grid's slow end; neutrons faster than the grid's range, each reaching the
+/// bins with less than
 /// [`NEGLIGIBLE_ARRIVAL_PROBABILITY`](nereids_physics::ikeda_carpenter::NEGLIGIBLE_ARRIVAL_PROBABILITY)
 /// chance, are left out.
 ///
-/// The spline's intervals are halved from one while the coefficients number at
-/// most half the bins.  Each candidate is fitted on a grid halved, and the
-/// beam refitted on each finer grid, until the refitted beam's predicted counts
-/// differ from the coarser grid's by at most [`BOUND`].  A candidate that does
-/// not converge, or needs more grid points than allowed, ends the ladder.  The
-/// candidate with the lowest `D / overdispersion + 2k` is returned, `D` twice
-/// its deviance and `k` its coefficients.
+/// The number of spline intervals doubles from one while the coefficients
+/// number at most half the bins.  Each candidate is fitted on a grid halved,
+/// and the beam refitted on each finer grid, until the refitted beam's
+/// predicted counts differ from the coarser grid's by at most [`BOUND`].  A
+/// candidate that does not converge, or needs more grid points than allowed,
+/// ends the ladder.  The candidate with the lowest `D / overdispersion + 2k` is
+/// returned, `D` twice its deviance and `k` its coefficients.
 ///
 /// Counts too sparse to determine the beam are not supported: a beam fitted to
 /// them can vary faster than a grid within the point cap resolves, which ends
 /// the ladder or, for the first candidate, refuses the fit.
+///
+/// Beam structure at the window's first edge is not supported: before that
+/// edge, where neutrons reach the bins through the pulse tail, `ln φ` is the
+/// spline's second-order Taylor expansion at the first knot, which such
+/// structure makes grow without bound.  Start the window clear of beam dips.
 ///
 /// # Errors
 /// [`PipelineError::ShapeMismatch`] unless there is one count per bin;
@@ -153,8 +159,14 @@ pub fn fit_open_beam(
 
     let richest = &ladder[ladder.len() - 1];
     let overdispersion = richest.result.converged.then(|| {
+        let pearson: f64 = open_counts
+            .iter()
+            .zip(&richest.predicted)
+            .filter(|(_, mu)| **mu > 0.0)
+            .map(|(y, mu)| (y - mu).powi(2) / mu)
+            .sum();
         let freedom = open_counts.len() - richest.beam.coefficients().len();
-        (2.0 * richest.result.deviance / freedom as f64).max(1.0)
+        (pearson / freedom as f64).clamp(1.0, f64::INFINITY)
     });
     let scale = overdispersion.unwrap_or(1.0);
     let criterion = |fit: &Candidate| {
@@ -192,6 +204,7 @@ pub fn fit_open_beam(
 struct Candidate {
     beam: BeamSpline,
     result: PoissonResult,
+    predicted: Vec<f64>,
     step_us: f64,
     points: usize,
     halvings: usize,
@@ -208,7 +221,8 @@ fn fit_beam(
     loop {
         let finer = grid.halved()?;
         let (refit, result) = fit(&finer, &beam, open_counts)?;
-        let spread: f64 = counts(&finer, &refit)?
+        let predicted = counts(&finer, &refit)?;
+        let spread: f64 = predicted
             .iter()
             .zip(counts(&grid, &refit)?)
             .filter(|(fine, _)| **fine > 0.0)
@@ -217,10 +231,11 @@ fn fit_beam(
         grid = finer;
         beam = refit;
         halvings += 1;
-        if spread <= BOUND {
+        if spread <= BOUND || !result.converged {
             return Ok(Candidate {
                 beam,
                 result,
+                predicted,
                 step_us: grid.step_us(),
                 points: grid.flight_times_us().len(),
                 halvings,
