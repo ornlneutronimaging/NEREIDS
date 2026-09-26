@@ -47,8 +47,9 @@ pub struct CountsFit {
     /// Areal density of each isotope in atoms/barn, in the order given.
     pub densities: Vec<f64>,
     /// Covariance of the densities, in the order given, scaled by
-    /// `overdispersion`; the row and column of a density on its bound of 0
-    /// are NaN.  `None` when the fit did not converge.
+    /// `overdispersion`, or at the Poisson scale when that is `None`; the row
+    /// and column of a density on its bound of 0 or not determined are NaN.
+    /// `None` when the fit did not converge.
     pub covariance: Option<FlatMatrix>,
     /// The beam per µs of flight time, fitted to both runs, with the
     /// intervals the open-beam fit chose.
@@ -83,11 +84,13 @@ pub struct CountsFit {
 /// cross section, `c` the charge ratio and `P_k` the chance of a neutron being
 /// counted in bin `k`.  The beam `φ` has the intervals [`fit_open_beam`]
 /// chooses and is fitted with the densities to both runs, starting from the
-/// open-beam fit.  There is no background term.
+/// open-beam fit.  There is no background term: background counts bias the
+/// densities, and are refused only where the model predicts none.
 ///
-/// The grid's first step is at most half the narrowest Doppler width, in
-/// flight time, of any resonance inside its energy span; it is then halved
-/// until the counts of both runs meet [`BOUND`](crate::open_beam::BOUND).
+/// The grid's first step is at most half the narrowest Doppler full width at
+/// half maximum, in flight time, of any resonance inside its energy span; it
+/// is then halved until the counts of both runs meet
+/// [`BOUND`](crate::open_beam::BOUND).
 ///
 /// The overdispersion scales the covariance; it assumes both runs share it
 /// and their bins are independent.
@@ -99,9 +102,12 @@ pub struct CountsFit {
 /// there are no isotopes, an isotope is listed twice, a starting density is
 /// not finite and non-negative, the temperature is outside 1–5000 K, an
 /// isotope's resonance data are not finite, or the energies its broadened
-/// cross section reads are not inside one of its resolved ranges;
-/// [`PipelineError::UnmodelledCounts`] if at the fit a bin holds counts
-/// predicted below [`NEGLIGIBLE_PREDICTION`], such as background;
+/// cross section reads, down to zero for a window within the thermal spread
+/// of zero energy, are not inside one of its resolved ranges;
+/// [`PipelineError::UnmodelledCounts`] if at the fit, converged or not, a bin
+/// holds counts predicted below [`NEGLIGIBLE_PREDICTION`]: background, or
+/// starting densities whose transmission vanishes where counts were recorded,
+/// which the fitter cannot leave;
 /// everything [`fit_open_beam`] refuses; [`PipelineError::FlightTimeGrid`]
 /// for the grid's refusals, including more points than it allows;
 /// [`PipelineError::Transmission`] and [`PipelineError::Fitting`] if the
@@ -274,16 +280,34 @@ pub fn fit_counts(
 fn finite(isotope: &ResonanceData) -> bool {
     isotope.awr.is_finite()
         && isotope.ranges.iter().all(|range| {
-            range.scattering_radius.is_finite()
-                && range.l_groups.iter().all(|group| {
-                    group.awr.is_finite()
-                        && group.apl.is_finite()
-                        && group.resonances.iter().all(|r| {
-                            [r.energy, r.j, r.gn, r.gg, r.gfa, r.gfb]
-                                .iter()
-                                .all(|v| v.is_finite())
-                        })
-                })
+            let radii = range
+                .ap_table
+                .iter()
+                .flat_map(|table| table.points.iter().flat_map(|&(e, r)| [e, r]));
+            let external = range.r_external.iter().flat_map(|r| {
+                [
+                    r.j, r.e_low, r.e_up, r.r_con, r.r_lin, r.s_con, r.s_lin, r.r_quad,
+                ]
+            });
+            let groups = range.l_groups.iter().flat_map(|group| {
+                [group.awr, group.apl, group.qx].into_iter().chain(
+                    group
+                        .resonances
+                        .iter()
+                        .flat_map(|r| [r.energy, r.j, r.gn, r.gg, r.gfa, r.gfb]),
+                )
+            });
+            [
+                range.energy_low,
+                range.energy_high,
+                range.target_spin,
+                range.scattering_radius,
+            ]
+            .into_iter()
+            .chain(radii)
+            .chain(external)
+            .chain(groups)
+            .all(f64::is_finite)
         })
 }
 

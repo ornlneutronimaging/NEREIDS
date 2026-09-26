@@ -38,9 +38,10 @@ pub struct OpenBeamFit {
     /// Whether the fitter converged.  It certifies the minimisation, not that
     /// the counts determine every coefficient; `covariance` shows that.
     pub converged: bool,
-    /// Covariance of the beam's coefficients, scaled by `overdispersion`; rows
-    /// and columns of a coefficient the counts leave undetermined are NaN.
-    /// `None` when the fit did not converge.
+    /// Covariance of the beam's coefficients, scaled by `overdispersion`, or
+    /// at the Poisson scale when that is `None`; rows and columns of a
+    /// coefficient the counts leave undetermined are NaN.  `None` when the
+    /// fit did not converge.
     pub covariance: Option<FlatMatrix>,
     /// Variance of the counts over their Poisson variance, at least 1: the
     /// richest fitted beam's Pearson χ² per degree of freedom over the bins

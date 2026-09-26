@@ -502,7 +502,7 @@ fn the_covariance_is_the_inverse_of_the_information_in_the_counts() {
     let setup = standard();
     let truth = [
         (hafnium_like(20.0), 3.0 / 7805.1),
-        (synthetic_isotope(74, 182, 20.3, 0.01, 0.06), 3.0 / 7805.1),
+        (synthetic_isotope(74, 182, 20.3, 0.01, 0.06), 1.5 / 7805.1),
     ];
     let counts = expected(&setup, &beam(1.0e6), &truth);
     let fit = fit_counts(
@@ -525,6 +525,10 @@ fn the_covariance_is_the_inverse_of_the_information_in_the_counts() {
             beam.per_us(u) * (step * slope).exp()
         }
     };
+    for (i, (_, n)) in truth.iter().enumerate() {
+        let pull = (fit.densities[i] - n) / error_bar(&fit, i);
+        assert!(pull.abs() <= BOUND.sqrt(), "{i}: {pull}");
+    }
     let fitted: Vec<(ResonanceData, f64)> = truth
         .iter()
         .zip(&fit.densities)
@@ -632,6 +636,7 @@ fn measurements_the_fit_does_not_describe_are_refused() {
     invalid(&|m| m.temperature_k = f64::NAN);
     invalid(&|m| m.isotopes[0].0.ranges[0].l_groups[0].resonances[0].energy = f64::NAN);
     invalid(&|m| m.isotopes[0].0.ranges[0].l_groups[0].resonances[0].gg = f64::NAN);
+    invalid(&|m| m.isotopes[0].0.ranges[0].target_spin = f64::NAN);
     invalid(&|m| m.isotopes[0].0.ranges[0].energy_high = 20.0);
 
     let slow = Setup {
