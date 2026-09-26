@@ -30,6 +30,19 @@ pub enum PipelineError {
     /// The flight-time grid refused the window or the pulse.
     #[error("Flight-time grid: {0}")]
     FlightTimeGrid(FlightTimeGridError),
+
+    /// A bin holds counts the fitted model predicts almost none of, such as
+    /// background, which the model does not include.
+    #[error(
+        "bin {bin} of the {run} run holds {counts} counts where the model predicts {predicted}; \
+         the model has no background"
+    )]
+    UnmodelledCounts {
+        run: &'static str,
+        bin: usize,
+        counts: f64,
+        predicted: f64,
+    },
 }
 
 impl From<TransmissionError> for PipelineError {

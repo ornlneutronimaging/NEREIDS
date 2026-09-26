@@ -244,6 +244,16 @@ impl FlightTimeGrid {
         &self.flight_times_us
     }
 
+    /// The energy, in eV, of each grid point, descending.
+    #[must_use]
+    pub fn energies_ev(&self) -> Vec<f64> {
+        let clock = TOF_FACTOR * self.pulse.flight_path_m();
+        self.flight_times_us
+            .iter()
+            .map(|u| (clock / u).powi(2))
+            .collect()
+    }
+
     /// `step · Σ_j v_j P_k(u_j)` for each bin `k`: the counts a beam of
     /// `values[j]` neutrons per µs at each grid point predicts, or, for any
     /// other per-point values, the same linear map.  It differs from the
