@@ -960,7 +960,11 @@ mod error_bar_pulls {
 
     impl Ensemble {
         fn expected(&self) -> (Vec<f64>, Vec<f64>) {
-            let (open, sample) = expected(&self.setup, &beam(self.level), &[self.sample.clone()]);
+            let (open, sample) = expected(
+                &self.setup,
+                &beam(self.level),
+                std::slice::from_ref(&self.sample),
+            );
             let open = open.iter().map(|mu| mu * self.open_run_fraction).collect();
             (open, sample)
         }

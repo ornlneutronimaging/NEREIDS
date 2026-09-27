@@ -76,9 +76,12 @@ pub struct CountsFit {
     /// ends on an edge of 1–5000 K, where the densities are fitted at a
     /// temperature the counts would take outside the box.  `None` when the fit
     /// did not converge.
-    /// Where the counts barely determine a sample's temperature or density,
-    /// as for a thin sample at low counts, the error bars can be narrower than
-    /// the scatter of the fitted values.
+    ///
+    /// The error bars take `calibration` as exact.  Where the counts determine
+    /// the densities and the temperature well they match the scatter of
+    /// repeated measurements; where they barely determine them, as for a thin
+    /// sample or a fitted temperature at few counts, they are narrower than
+    /// that scatter, by up to half.
     pub covariance: Option<FlatMatrix>,
     /// The beam per µs of flight time, fitted to both runs, with the
     /// intervals the open-beam fit chose.
