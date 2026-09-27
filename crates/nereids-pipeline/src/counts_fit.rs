@@ -59,7 +59,7 @@ pub struct Measurement {
     pub temperature_k: Value,
 }
 
-/// The fitted densities.
+/// The fitted densities and temperature.
 #[derive(Debug, Clone)]
 pub struct CountsFit {
     /// Areal density of each isotope in atoms/barn, in the order given.
@@ -120,10 +120,12 @@ pub struct CountsFit {
 /// repeated from its answer on a first grid built at the fitted temperature.
 /// The step is uniform, so a wide window whose span holds a narrow resonance
 /// at high energy, or a low fitted temperature, can exceed the grid's point
-/// cap.
+/// cap; a temperature the counts barely determine can run to 1 K and refuse
+/// the fit that way.
 ///
 /// The fitter finds a local minimum.  A thin sample hotter than about
-/// 1,500 K fitted from room temperature can end in a false one.
+/// 1,500 K fitted from room temperature can end in a false one, reported
+/// converged with an overdispersion far above 1.
 ///
 /// The overdispersion scales the covariance; it assumes both runs share it
 /// and their bins are independent.
@@ -145,8 +147,8 @@ pub struct CountsFit {
 /// which the fitter cannot leave;
 /// everything [`fit_open_beam`] refuses; [`PipelineError::FlightTimeGrid`]
 /// for the grid's refusals, including more points than it allows;
-/// [`PipelineError::Transmission`] and [`PipelineError::Fitting`] if the
-/// cross sections or the fitter fail.
+/// [`PipelineError::Fitting`] if the fitter fails, or the cross sections
+/// fail at the start; a failure at a trial temperature is a rejected step.
 pub fn fit_counts(
     measurement: &Measurement,
     calibration: &Calibration,

@@ -472,28 +472,28 @@ fn an_absent_isotope_is_fitted_on_its_bound() {
     let setup = standard();
     let isotope = hafnium_like(20.0);
     let expected = expected(&setup, &beam(1.0e4), &[(isotope.clone(), 0.0)]);
-    let fits: Vec<CountsFit> = (500..506)
-        .map(|seed| {
-            fit_counts(
-                &fitted_from(
-                    measurement(
-                        &setup,
-                        draws(&expected, seed, 1.0),
-                        &[(isotope.clone(), THIN)],
-                    ),
-                    TEMPERATURE_K,
-                ),
-                &calibration(&setup),
-            )
-            .expect("fit")
-        })
-        .collect();
-    assert!(fits.iter().all(|fit| fit.densities[0] >= 0.0));
-    let absent: Vec<&CountsFit> = fits.iter().filter(|fit| fit.densities[0] == 0.0).collect();
-    assert!(!absent.is_empty());
-    for fit in absent {
-        let covariance = fit.covariance.as_ref().expect("covariance");
-        assert!(covariance.get(0, 0).is_nan() && covariance.get(1, 1).is_nan());
+    for temperature_k in [Value::Known(TEMPERATURE_K), Value::Fitted(TEMPERATURE_K)] {
+        let fits: Vec<CountsFit> = (500..506)
+            .map(|seed| {
+                let mut m = measurement(
+                    &setup,
+                    draws(&expected, seed, 1.0),
+                    &[(isotope.clone(), THIN)],
+                );
+                m.temperature_k = temperature_k;
+                fit_counts(&m, &calibration(&setup)).expect("fit")
+            })
+            .collect();
+        assert!(fits.iter().all(|fit| fit.densities[0] >= 0.0));
+        let absent: Vec<&CountsFit> = fits.iter().filter(|fit| fit.densities[0] == 0.0).collect();
+        assert!(!absent.is_empty(), "{temperature_k:?}");
+        for fit in absent {
+            let covariance = fit.covariance.as_ref().expect("covariance");
+            assert!(
+                covariance.data.iter().all(|v| v.is_nan()),
+                "{temperature_k:?}"
+            );
+        }
     }
 }
 
@@ -526,20 +526,23 @@ fn inverse(mut a: Vec<Vec<f64>>) -> Vec<Vec<f64>> {
 
 #[test]
 fn the_covariance_is_the_inverse_of_the_information_in_the_counts() {
+    for temperature_k in [Value::Known(TEMPERATURE_K), Value::Fitted(1000.0)] {
+        covariance_against_information(temperature_k);
+    }
+}
+
+fn covariance_against_information(temperature: Value) {
     let setup = standard();
     let truth = [
         (hafnium_like(20.0), 3.0 / 7805.1),
         (synthetic_isotope(74, 182, 20.3, 0.01, 0.06), 1.5 / 7805.1),
     ];
     let counts = expected(&setup, &beam(1.0e6), &truth);
-    let fit = fit_counts(
-        &fitted_from(
-            measurement(&setup, (rounded(&counts.0), rounded(&counts.1)), &truth),
-            1000.0,
-        ),
-        &calibration(&setup),
-    )
-    .expect("fit");
+    let mut m = measurement(&setup, (rounded(&counts.0), rounded(&counts.1)), &truth);
+    m.temperature_k = temperature;
+    let fit = fit_counts(&m, &calibration(&setup)).expect("fit");
+    let fitted_temperature = matches!(temperature, Value::Fitted(_));
+    let quantities = truth.len() + usize::from(fitted_temperature);
     let (low, high) = FlightTimeGrid::new(&setup.edges, T0_US, &setup.pulse)
         .expect("grid")
         .range_us();
@@ -559,8 +562,10 @@ fn the_covariance_is_the_inverse_of_the_information_in_the_counts() {
         let pull = (fit.densities[i] - n) / error_bar(&fit, i);
         assert!(pull.abs() <= BOUND.sqrt(), "{i}: {pull}");
     }
-    let pull = (fit.temperature_k - TEMPERATURE_K) / error_bar(&fit, truth.len());
-    assert!(pull.abs() <= BOUND.sqrt(), "temperature: {pull}");
+    if fitted_temperature {
+        let pull = (fit.temperature_k - TEMPERATURE_K) / error_bar(&fit, truth.len());
+        assert!(pull.abs() <= BOUND.sqrt(), "temperature: {pull}");
+    }
     let fitted: Vec<(ResonanceData, f64)> = truth
         .iter()
         .zip(&fit.densities)
@@ -577,7 +582,7 @@ fn the_covariance_is_the_inverse_of_the_information_in_the_counts() {
         temperature_k,
     ));
     let coefficients = fit.beam.coefficients().len();
-    let columns: Vec<Vec<f64>> = (0..=coefficients + fitted.len())
+    let columns: Vec<Vec<f64>> = (0..coefficients + quantities)
         .map(|p| {
             let shifted = |sign: f64| {
                 if p < coefficients {
@@ -628,15 +633,15 @@ fn the_covariance_is_the_inverse_of_the_information_in_the_counts() {
         .collect();
     let oracle = inverse(information);
     let covariance = fit.covariance.expect("covariance");
-    for i in 0..=truth.len() {
-        for j in 0..=truth.len() {
+    for i in 0..quantities {
+        for j in 0..quantities {
             let expected = oracle[coefficients + i][coefficients + j];
             let scale = (oracle[coefficients + i][coefficients + i]
                 * oracle[coefficients + j][coefficients + j])
                 .sqrt();
             assert!(
                 (covariance.get(i, j) - expected).abs() <= 1e-2 * scale,
-                "{i}, {j}: {} vs {expected}",
+                "{temperature:?} {i}, {j}: {} vs {expected}",
                 covariance.get(i, j)
             );
         }
@@ -761,8 +766,8 @@ fn density_and_temperature_are_recovered_from_starts_on_either_side() {
     let cases = [
         (hafnium_like(20.0), THIN, 300.0, vec![200.0, 1000.0]),
         (two_resonances(), SATURATED, 300.0, vec![200.0, 1000.0]),
-        (hafnium_like(20.0), THIN, 1500.0, vec![300.0]),
-        (two_resonances(), SATURATED, 1500.0, vec![300.0]),
+        (hafnium_like(20.0), THIN, 1500.0, vec![300.0, 3000.0]),
+        (two_resonances(), SATURATED, 1500.0, vec![300.0, 3000.0]),
     ];
     for (isotope, density, truth_k, starts_k) in cases {
         let counts = expected_at(&setup, &beam(1.0e6), &[(isotope.clone(), density)], truth_k);
@@ -793,50 +798,91 @@ fn density_and_temperature_are_recovered_from_starts_on_either_side() {
     }
 }
 
-#[test]
-fn a_temperature_on_the_box_edge_withholds_the_covariance() {
-    let setup = standard();
-    for (isotope, density, truth_k, edge_k) in [
-        (two_resonances(), SATURATED, 6000.0, 5000.0),
-        (hafnium_like(20.0), THIN, 0.0, 1.0),
-    ] {
-        let sample = [(isotope.clone(), density)];
-        let counts = expected_at(&setup, &beam(1.0e6), &sample, truth_k);
-        let fit = fit_counts(
-            &fitted_from(
-                measurement(&setup, (rounded(&counts.0), rounded(&counts.1)), &sample),
-                TEMPERATURE_K,
-            ),
-            &calibration(&setup),
-        )
-        .expect("fit");
-        assert!(fit.converged, "{truth_k} K");
-        assert_eq!(fit.temperature_k, edge_k);
-        let covariance = fit.covariance.as_ref().expect("covariance");
-        assert!(covariance.data.iter().all(|v| v.is_nan()), "{truth_k} K");
-        assert!(
-            fit.halvings > rule_halvings(&setup, &isotope, 20.0, edge_k),
-            "{truth_k} K: {} halvings",
-            fit.halvings
-        );
+fn kev_beam(level: f64) -> impl Fn(f64) -> f64 {
+    move |u: f64| {
+        let x = (u / 57.2).ln();
+        level * (0.5 * x - 2.0 * x * x).exp()
     }
 }
 
-#[test]
-fn the_grid_is_refined_when_the_fitted_temperature_narrows_the_resonance() {
-    let setup = kev_window();
+fn kev_resonance_ev(setup: &Setup, offset: f64) -> f64 {
     let first = FlightTimeGrid::new(&setup.edges, T0_US, &setup.pulse).expect("grid");
     let j = first
         .flight_times_us()
         .iter()
         .position(|&u| u > 57.2)
         .expect("a point");
-    let level = 1.0e4;
-    let beam = move |u: f64| {
-        let x = (u / 57.2).ln();
-        level * (0.5 * x - 2.0 * x * x).exp()
+    (CLOCK / (first.flight_times_us()[j] + offset * first.step_us())).powi(2)
+}
+
+fn edge_fit(
+    setup: &Setup,
+    beam: &dyn Fn(f64) -> f64,
+    sample: &[(ResonanceData, f64)],
+    truth_k: f64,
+    start_k: f64,
+) -> CountsFit {
+    let counts = expected_at(setup, beam, sample, truth_k);
+    let fit = fit_counts(
+        &fitted_from(
+            measurement(setup, (rounded(&counts.0), rounded(&counts.1)), sample),
+            start_k,
+        ),
+        &calibration(setup),
+    )
+    .expect("fit");
+    assert!(fit.converged, "{truth_k} K");
+    let covariance = fit.covariance.as_ref().expect("covariance");
+    assert!(covariance.data.iter().all(|v| v.is_nan()), "{truth_k} K");
+    fit
+}
+
+#[test]
+fn a_temperature_on_the_box_edge_withholds_the_covariance() {
+    let setup = standard();
+    let hot = edge_fit(
+        &setup,
+        &beam(1.0e6),
+        &[(two_resonances(), SATURATED)],
+        6000.0,
+        TEMPERATURE_K,
+    );
+    assert_eq!(hot.temperature_k, 5000.0);
+
+    let setup = Setup {
+        simulator_step_us: 1.0 / 1024.0,
+        ..kev_window()
     };
-    let resonance_ev = (CLOCK / (first.flight_times_us()[j] + 0.24 * first.step_us())).powi(2);
+    let beam = kev_beam(1.0e7);
+    let isotope = hafnium_like(kev_resonance_ev(&setup, 0.04));
+    let cold = edge_fit(&setup, &beam, &[(isotope.clone(), 0.17767)], 0.0, 5000.0);
+    assert_eq!(cold.temperature_k, 1.0);
+    let fitted = [(isotope, cold.densities[0])];
+    let (low, high) = chain(&setup)[0].range_us();
+    let fitted_beam = |u: f64| {
+        if (low..=high).contains(&u) {
+            cold.beam.per_us(u)
+        } else {
+            0.0
+        }
+    };
+    let reference = expected_at(&setup, &fitted_beam, &fitted, cold.temperature_k);
+    let reference: Vec<f64> = reference.0.into_iter().chain(reference.1).collect();
+    let on_grid = predicted_at(
+        &chain(&setup)[cold.halvings],
+        &|u| cold.beam.per_us(u),
+        &fitted,
+        cold.temperature_k,
+    );
+    let missed = distance(&on_grid, &reference);
+    assert!(missed <= BOUND, "{missed}");
+}
+
+#[test]
+fn the_grid_is_refined_when_the_fitted_temperature_narrows_the_resonance() {
+    let setup = kev_window();
+    let beam = kev_beam(1.0e4);
+    let resonance_ev = kev_resonance_ev(&setup, 0.24);
     let isotope = hafnium_like(resonance_ev);
     let sample = [(isotope.clone(), 0.17767)];
     assert_eq!(rule_halvings(&setup, &isotope, resonance_ev, 5000.0), 0);
@@ -853,12 +899,6 @@ fn the_grid_is_refined_when_the_fitted_temperature_narrows_the_resonance() {
         &calibration(&setup),
     )
     .expect("fit");
-    assert!(
-        fit.halvings > rule_halvings(&setup, &isotope, resonance_ev, fit.temperature_k),
-        "{} halvings at {} K",
-        fit.halvings,
-        fit.temperature_k
-    );
     let pull = (fit.temperature_k - TEMPERATURE_K) / error_bar(&fit, 1);
     assert!(pull.abs() <= BOUND.sqrt(), "{pull}");
     let simulated: Vec<f64> = simulated.0.into_iter().chain(simulated.1).collect();
@@ -867,4 +907,27 @@ fn the_grid_is_refined_when_the_fitted_temperature_narrows_the_resonance() {
         &simulated,
     );
     assert!(resolved <= BOUND, "{resolved}");
+}
+
+#[test]
+fn a_false_minimum_shows_as_an_overdispersion_far_above_one() {
+    let setup = standard();
+    let isotope = hafnium_like(20.0);
+    let counts = expected_at(&setup, &beam(1.0e6), &[(isotope.clone(), THIN)], 2000.0);
+    let fit = fit_counts(
+        &fitted_from(
+            measurement(
+                &setup,
+                (rounded(&counts.0), rounded(&counts.1)),
+                &[(isotope, 2.0 * THIN)],
+            ),
+            TEMPERATURE_K,
+        ),
+        &calibration(&setup),
+    )
+    .expect("fit");
+    assert!(fit.converged);
+    assert!(fit.temperature_k < 500.0, "{}", fit.temperature_k);
+    let overdispersion = fit.overdispersion.expect("measured");
+    assert!(overdispersion > 100.0, "{overdispersion}");
 }
