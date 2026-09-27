@@ -69,13 +69,16 @@ pub struct CountsFit {
     pub temperature_k: f64,
     /// Covariance of the densities, in the order given, then of the
     /// temperature when it is fitted: the inverse of the expected information
-    /// at the fit, which holds when the counts are large, scaled by
-    /// `overdispersion`, or at the Poisson scale when that is `None`.  The row
-    /// and column of a density on its bound of 0, or of a quantity the counts
-    /// do not determine, are NaN; every entry is NaN when a fitted temperature
-    /// ends on an edge of 1–5000 K, where the densities are fitted at a
-    /// temperature the counts would take outside the box.  `None` when the fit
-    /// did not converge.
+    /// at the fit, scaled by `overdispersion`, or at the Poisson scale when
+    /// that is `None`.  The row and column of a density on its bound of 0, or
+    /// of a quantity the counts do not determine, are NaN; every entry is NaN
+    /// when a fitted temperature ends on an edge of 1–5000 K.  `None` when the
+    /// fit did not converge.
+    ///
+    /// The error bars take the [`Calibration`] passed to [`fit_counts`] as
+    /// exact.  They are not reliable where the counts barely determine a
+    /// fitted temperature or barely separate it from a density, as at few
+    /// counts or for a thin sample at modest counts.
     pub covariance: Option<FlatMatrix>,
     /// The beam per µs of flight time, fitted to both runs, with the
     /// intervals the open-beam fit chose.

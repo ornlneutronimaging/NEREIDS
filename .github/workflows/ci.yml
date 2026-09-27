@@ -79,10 +79,11 @@ jobs:
 
   # ── Tests (cross-platform) ─────────────────────────────────────────
   # ubuntu-latest is deliberately NOT in this matrix: the `coverage` job below
-  # already runs the full `cargo test --workspace` suite on ubuntu (under
-  # cargo-llvm-cov, which fails the job on any test failure), so listing ubuntu
-  # here would run the identical suite a second time. This matrix covers only
-  # the platforms the coverage job does not (macOS, Windows).
+  # already runs the `cargo test --workspace` suite on ubuntu (under
+  # cargo-llvm-cov, which fails the job on any test failure), except the
+  # error-bar ensembles (`error_bar_pulls::`), which add no coverage and would
+  # cost it tens of minutes; they run here. This matrix covers only the
+  # platforms the coverage job does not (macOS, Windows).
   test:
     name: Test (${{ matrix.os }})
     needs: check
@@ -181,7 +182,7 @@ jobs:
         with:
           tool: cargo-llvm-cov
       - name: Generate coverage
-        run: cargo llvm-cov --workspace --exclude nereids-python --lcov --output-path lcov.info
+        run: cargo llvm-cov --workspace --exclude nereids-python --lcov --output-path lcov.info -- --skip error_bar_pulls::
       - name: Upload to Codecov
         uses: codecov/codecov-action@303a32d7a59b442fa8d48b6a1cc6825c09c847a5 # v7.1.1
         with:

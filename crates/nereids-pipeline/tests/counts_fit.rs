@@ -931,3 +931,244 @@ fn a_false_minimum_shows_as_an_overdispersion_far_above_one() {
     let overdispersion = fit.overdispersion.expect("measured");
     assert!(overdispersion > 100.0, "{overdispersion}");
 }
+
+mod error_bar_pulls {
+    use rayon::prelude::*;
+
+    use super::*;
+
+    const Z: f64 = 3.5;
+    const MOST_FAILED: usize = 2;
+
+    struct Ensemble {
+        setup: Setup,
+        sample: (ResonanceData, f64),
+        temperature_k: Value,
+        level: f64,
+        counts_per_neutron: f64,
+        open_run_fraction: f64,
+        seeds: std::ops::Range<u64>,
+    }
+
+    struct Draw {
+        pulls: Vec<f64>,
+        estimates: Vec<f64>,
+        reported_correlation: Option<f64>,
+        overdispersion: f64,
+        deviance: f64,
+    }
+
+    impl Ensemble {
+        fn expected(&self) -> (Vec<f64>, Vec<f64>) {
+            let (open, sample) = expected(
+                &self.setup,
+                &beam(self.level),
+                std::slice::from_ref(&self.sample),
+            );
+            let open = open.iter().map(|mu| mu * self.open_run_fraction).collect();
+            (open, sample)
+        }
+
+        fn measurement(
+            &self,
+            expected: &(Vec<f64>, Vec<f64>),
+            seed: u64,
+            start: (f64, Value),
+        ) -> Measurement {
+            let counts = draws(expected, seed, self.counts_per_neutron);
+            let mut m = measurement(&self.setup, counts, &[(self.sample.0.clone(), start.0)]);
+            m.charge_ratio = CHARGE_RATIO / self.open_run_fraction;
+            m.temperature_k = start.1;
+            m
+        }
+
+        fn draw(
+            &self,
+            expected: &(Vec<f64>, Vec<f64>),
+            seed: u64,
+            start: (f64, Value),
+        ) -> Option<Draw> {
+            let measurement = self.measurement(expected, seed, start);
+            let fit = fit_counts(&measurement, &calibration(&self.setup)).ok()?;
+            let covariance = fit.covariance.as_ref().filter(|_| fit.converged)?;
+            let mut estimates = vec![fit.densities[0]];
+            let mut truths = vec![self.sample.1];
+            if matches!(self.temperature_k, Value::Fitted(_)) {
+                estimates.push(fit.temperature_k);
+                truths.push(TEMPERATURE_K);
+            }
+            let pulls: Vec<f64> = estimates
+                .iter()
+                .zip(&truths)
+                .enumerate()
+                .map(|(i, (x, truth))| (x - truth) / covariance.get(i, i).sqrt())
+                .collect();
+            let reported_correlation = (estimates.len() == 2).then(|| {
+                covariance.get(0, 1) / (covariance.get(0, 0) * covariance.get(1, 1)).sqrt()
+            });
+            pulls.iter().all(|p| p.is_finite()).then_some(Draw {
+                pulls,
+                estimates,
+                reported_correlation,
+                overdispersion: fit.overdispersion?,
+                deviance: fit.deviance,
+            })
+        }
+
+        fn draws(&self, expected: &(Vec<f64>, Vec<f64>), start: (f64, Value)) -> Vec<Option<Draw>> {
+            self.seeds
+                .clone()
+                .into_par_iter()
+                .map(|seed| self.draw(expected, seed, start))
+                .collect()
+        }
+
+        fn draws_from_truth(&self) -> Vec<Option<Draw>> {
+            self.draws(&self.expected(), (self.sample.1, self.temperature_k))
+        }
+    }
+
+    fn moments(values: &[f64]) -> (f64, f64) {
+        let m = values.len() as f64;
+        let mean = values.iter().sum::<f64>() / m;
+        let variance = values.iter().map(|v| (v - mean).powi(2)).sum::<f64>() / (m - 1.0);
+        (mean, variance.sqrt())
+    }
+
+    fn check(draws: &[Option<Draw>]) -> Vec<&Draw> {
+        let kept: Vec<&Draw> = draws.iter().flatten().collect();
+        let failed = draws.len() - kept.len();
+        assert!(failed <= MOST_FAILED, "{failed} draws failed");
+        let m = kept.len() as f64;
+        for quantity in 0..kept[0].pulls.len() {
+            let pulls: Vec<f64> = kept.iter().map(|d| d.pulls[quantity]).collect();
+            let (mean, sd) = moments(&pulls);
+            assert!(mean.abs() <= Z / m.sqrt(), "{quantity}: mean {mean}");
+            let band = Z / (2.0 * (m - 1.0)).sqrt();
+            assert!(
+                (sd - 1.0).abs() <= band,
+                "{quantity}: sd {sd} vs 1 ± {band}"
+            );
+        }
+        if let Some(reported) = kept
+            .iter()
+            .map(|d| d.reported_correlation)
+            .collect::<Option<Vec<f64>>>()
+        {
+            let columns = |i: usize| kept.iter().map(|d| d.estimates[i]).collect::<Vec<f64>>();
+            let (n, t) = (columns(0), columns(1));
+            let (mn, sn) = moments(&n);
+            let (mt, st) = moments(&t);
+            let measured = n
+                .iter()
+                .zip(&t)
+                .map(|(a, b)| (a - mn) * (b - mt))
+                .sum::<f64>()
+                / ((m - 1.0) * sn * st);
+            let reported = reported.iter().sum::<f64>() / m;
+            let gap = (measured.atanh() - reported.atanh()).abs();
+            assert!(
+                gap <= Z / (m - 3.0).sqrt(),
+                "correlation {measured} vs {reported}"
+            );
+        }
+        kept
+    }
+
+    fn overdispersion_matches(kept: &[&Draw], counts_per_neutron: f64) {
+        let ratios: Vec<f64> = kept
+            .iter()
+            .map(|d| d.overdispersion / counts_per_neutron)
+            .collect();
+        let (mean, sd) = moments(&ratios);
+        let band = Z * sd / (ratios.len() as f64).sqrt();
+        assert!((mean - 1.0).abs() <= band, "overdispersion {mean} ± {band}");
+    }
+
+    fn saturated(
+        temperature_k: Value,
+        level: f64,
+        counts_per_neutron: f64,
+        open_run_fraction: f64,
+        seeds: std::ops::Range<u64>,
+    ) -> Ensemble {
+        Ensemble {
+            setup: standard(),
+            sample: (two_resonances(), SATURATED),
+            temperature_k,
+            level,
+            counts_per_neutron,
+            open_run_fraction,
+            seeds,
+        }
+    }
+
+    #[test]
+    fn a_thin_sample_s_error_bars_are_its_scatter() {
+        let ensemble = Ensemble {
+            setup: standard(),
+            sample: (hafnium_like(20.0), THIN),
+            temperature_k: Value::Fitted(TEMPERATURE_K),
+            level: 1.0e5,
+            counts_per_neutron: 1.0,
+            open_run_fraction: 1.0,
+            seeds: 10_000..10_400,
+        };
+        let expected = ensemble.expected();
+        let draws = ensemble.draws(&expected, (THIN, Value::Fitted(TEMPERATURE_K)));
+        check(&draws);
+        let restarted: Vec<Option<Draw>> = (10_000..10_200)
+            .into_par_iter()
+            .map(|seed| ensemble.draw(&expected, seed, (2.0 * THIN, Value::Fitted(1000.0))))
+            .collect();
+        let apart = draws[..restarted.len()]
+            .iter()
+            .zip(&restarted)
+            .filter(|(a, b)| match (a, b) {
+                (Some(a), Some(b)) => (a.deviance - b.deviance).abs() > 1e-3,
+                _ => true,
+            })
+            .count();
+        assert!(apart <= MOST_FAILED, "{apart} draws depend on the start");
+    }
+
+    #[test]
+    fn compound_counts_scale_the_error_bars_by_the_overdispersion() {
+        let ensemble = saturated(
+            Value::Fitted(TEMPERATURE_K),
+            1.0e4,
+            7.0,
+            1.0,
+            20_000..20_400,
+        );
+        let draws = ensemble.draws_from_truth();
+        let kept = check(&draws);
+        overdispersion_matches(&kept, 7.0);
+    }
+
+    #[test]
+    fn a_short_open_run_widens_the_error_bars_by_its_noise() {
+        let ensemble = saturated(
+            Value::Fitted(TEMPERATURE_K),
+            1.0e4,
+            1.0,
+            0.1,
+            30_000..30_400,
+        );
+        check(&ensemble.draws_from_truth());
+    }
+
+    #[test]
+    fn a_few_counts_per_bin_with_empty_bins_give_their_error_bars() {
+        let ensemble = saturated(Value::Known(TEMPERATURE_K), 3.0, 1.0, 1.0, 40_000..40_400);
+        check(&ensemble.draws_from_truth());
+    }
+
+    #[test]
+    fn the_overdispersion_measures_compound_counts_at_a_few_counts_per_bin() {
+        let ensemble = saturated(Value::Known(TEMPERATURE_K), 3.0, 7.0, 1.0, 50_000..50_400);
+        let draws = ensemble.draws_from_truth();
+        let kept = check(&draws);
+        overdispersion_matches(&kept, 7.0);
+    }
+}
