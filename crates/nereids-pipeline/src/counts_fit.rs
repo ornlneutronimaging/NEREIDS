@@ -76,15 +76,9 @@ pub struct CountsFit {
     /// ends on an edge of 1–5000 K, where the densities are fitted at a
     /// temperature the counts would take outside the box.  `None` when the fit
     /// did not converge.
-    ///
-    /// Checked against the scatter of repeated simulated measurements, for a
-    /// known calibration: 300 K samples of one isotope, Poisson and
-    /// seven-counts-per-neutron noise in independent bins, from 3 to 1e5
-    /// counts per µs of beam, an open run as long as the sample run or ten
-    /// times shorter.  There the error bars match the scatter within the
-    /// ensembles' resolution.  A thin sample whose temperature is barely
-    /// determined (about 11% relative error) has error bars about 9% narrow,
-    /// and about 15% narrow at 3 counts per µs with the temperature known.
+    /// Where the counts barely determine a sample's temperature or density,
+    /// as for a thin sample at low counts, the error bars can be narrower than
+    /// the scatter of the fitted values.
     pub covariance: Option<FlatMatrix>,
     /// The beam per µs of flight time, fitted to both runs, with the
     /// intervals the open-beam fit chose.

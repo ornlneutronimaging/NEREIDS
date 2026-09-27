@@ -937,8 +937,6 @@ mod error_bar_pulls {
 
     use super::*;
 
-    const WIDTH_POISSON: f64 = 0.98;
-    const WIDTH_COMPOUND: f64 = 1.00;
     const Z: f64 = 3.5;
     const MOST_FAILED: usize = 2;
 
@@ -1004,16 +1002,13 @@ mod error_bar_pulls {
             let reported_correlation = (estimates.len() == 2).then(|| {
                 covariance.get(0, 1) / (covariance.get(0, 0) * covariance.get(1, 1)).sqrt()
             });
-            pulls
-                .iter()
-                .all(|p| p.is_finite() && p.abs() <= 5.0)
-                .then_some(Draw {
-                    pulls,
-                    estimates,
-                    reported_correlation,
-                    overdispersion: fit.overdispersion?,
-                    deviance: fit.deviance,
-                })
+            pulls.iter().all(|p| p.is_finite()).then_some(Draw {
+                pulls,
+                estimates,
+                reported_correlation,
+                overdispersion: fit.overdispersion?,
+                deviance: fit.deviance,
+            })
         }
 
         fn draws(&self, expected: &(Vec<f64>, Vec<f64>), start: (f64, Value)) -> Vec<Option<Draw>> {
@@ -1029,27 +1024,26 @@ mod error_bar_pulls {
         }
     }
 
-    fn moments(values: &[f64]) -> (f64, f64, f64) {
+    fn moments(values: &[f64]) -> (f64, f64) {
         let m = values.len() as f64;
         let mean = values.iter().sum::<f64>() / m;
-        let central = |k: i32| values.iter().map(|v| (v - mean).powi(k)).sum::<f64>() / m;
-        let sd = (central(2) * m / (m - 1.0)).sqrt();
-        (mean, sd, central(4) / central(2).powi(2))
+        let variance = values.iter().map(|v| (v - mean).powi(2)).sum::<f64>() / (m - 1.0);
+        (mean, variance.sqrt())
     }
 
-    fn check(draws: &[Option<Draw>], width: f64) -> Vec<&Draw> {
+    fn check(draws: &[Option<Draw>]) -> Vec<&Draw> {
         let kept: Vec<&Draw> = draws.iter().flatten().collect();
         let failed = draws.len() - kept.len();
         assert!(failed <= MOST_FAILED, "{failed} draws failed");
         let m = kept.len() as f64;
         for quantity in 0..kept[0].pulls.len() {
             let pulls: Vec<f64> = kept.iter().map(|d| d.pulls[quantity]).collect();
-            let (mean, sd, kurtosis) = moments(&pulls);
+            let (mean, sd) = moments(&pulls);
             assert!(mean.abs() <= Z / m.sqrt(), "{quantity}: mean {mean}");
-            let band = Z * ((kurtosis - 1.0) / (4.0 * m)).sqrt();
+            let band = Z / (2.0 * (m - 1.0)).sqrt();
             assert!(
-                (sd - width).abs() <= band,
-                "{quantity}: sd {sd} vs {width} ± {band}"
+                (sd - 1.0).abs() <= band,
+                "{quantity}: sd {sd} vs 1 ± {band}"
             );
         }
         if let Some(reported) = kept
@@ -1059,8 +1053,8 @@ mod error_bar_pulls {
         {
             let columns = |i: usize| kept.iter().map(|d| d.estimates[i]).collect::<Vec<f64>>();
             let (n, t) = (columns(0), columns(1));
-            let (mn, sn, _) = moments(&n);
-            let (mt, st, _) = moments(&t);
+            let (mn, sn) = moments(&n);
+            let (mt, st) = moments(&t);
             let measured = n
                 .iter()
                 .zip(&t)
@@ -1082,7 +1076,7 @@ mod error_bar_pulls {
             .iter()
             .map(|d| d.overdispersion / counts_per_neutron)
             .collect();
-        let (mean, sd, _) = moments(&ratios);
+        let (mean, sd) = moments(&ratios);
         let band = Z * sd / (ratios.len() as f64).sqrt();
         assert!((mean - 1.0).abs() <= band, "overdispersion {mean} ± {band}");
     }
@@ -1114,13 +1108,16 @@ mod error_bar_pulls {
             level: 1.0e5,
             counts_per_neutron: 1.0,
             open_run_fraction: 1.0,
-            seeds: 10_000..10_200,
+            seeds: 10_000..10_400,
         };
         let expected = ensemble.expected();
         let draws = ensemble.draws(&expected, (THIN, Value::Fitted(TEMPERATURE_K)));
-        check(&draws, WIDTH_POISSON);
-        let restarted = ensemble.draws(&expected, (2.0 * THIN, Value::Fitted(1000.0)));
-        let apart = draws
+        check(&draws);
+        let restarted: Vec<Option<Draw>> = (10_000..10_200)
+            .into_par_iter()
+            .map(|seed| ensemble.draw(&expected, seed, (2.0 * THIN, Value::Fitted(1000.0))))
+            .collect();
+        let apart = draws[..restarted.len()]
             .iter()
             .zip(&restarted)
             .filter(|(a, b)| match (a, b) {
@@ -1138,10 +1135,10 @@ mod error_bar_pulls {
             1.0e4,
             7.0,
             1.0,
-            20_000..20_100,
+            20_000..20_400,
         );
         let draws = ensemble.draws_from_truth();
-        let kept = check(&draws, WIDTH_COMPOUND);
+        let kept = check(&draws);
         overdispersion_matches(&kept, 7.0);
     }
 
@@ -1152,22 +1149,22 @@ mod error_bar_pulls {
             1.0e4,
             1.0,
             0.1,
-            30_000..30_100,
+            30_000..30_400,
         );
-        check(&ensemble.draws_from_truth(), WIDTH_POISSON);
+        check(&ensemble.draws_from_truth());
     }
 
     #[test]
     fn a_few_counts_per_bin_with_empty_bins_give_their_error_bars() {
-        let ensemble = saturated(Value::Known(TEMPERATURE_K), 3.0, 1.0, 1.0, 40_000..40_200);
-        check(&ensemble.draws_from_truth(), WIDTH_POISSON);
+        let ensemble = saturated(Value::Known(TEMPERATURE_K), 3.0, 1.0, 1.0, 40_000..40_400);
+        check(&ensemble.draws_from_truth());
     }
 
     #[test]
-    fn the_overdispersion_leaves_out_bins_expecting_less_than_a_count() {
-        let ensemble = saturated(Value::Known(TEMPERATURE_K), 3.0, 7.0, 1.0, 50_000..50_200);
+    fn the_overdispersion_measures_compound_counts_at_a_few_counts_per_bin() {
+        let ensemble = saturated(Value::Known(TEMPERATURE_K), 3.0, 7.0, 1.0, 50_000..50_400);
         let draws = ensemble.draws_from_truth();
-        let kept = check(&draws, WIDTH_COMPOUND);
+        let kept = check(&draws);
         overdispersion_matches(&kept, 7.0);
     }
 }
