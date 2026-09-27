@@ -1,17 +1,19 @@
 //! Areal densities of a sample's isotopes, fitted to the counts of an
 //! open-beam run and a sample run recorded in the same time bins.
 
+use std::cell::RefCell;
 use std::sync::Arc;
 
 use nereids_endf::resonance::ResonanceData;
 use nereids_fitting::error::FittingError;
 use nereids_fitting::lm::{FitModel, FlatMatrix};
 use nereids_fitting::parameters::{FitParameter, ParameterSet};
-use nereids_physics::continuous_doppler::SUPPORT_X;
+use nereids_physics::continuous_doppler::{SUPPORT_X, broaden_with_derivative};
 use nereids_physics::doppler::DopplerParams;
 use nereids_physics::flight_time_grid::FlightTimeGrid;
 use nereids_physics::resolution::TOF_FACTOR;
-use nereids_physics::transmission::{broadened_cross_sections, resonance_center_energies};
+use nereids_physics::transmission::resonance_center_energies;
+use rayon::prelude::*;
 
 use crate::beam::BeamSpline;
 use crate::error::PipelineError;
@@ -23,6 +25,21 @@ use crate::pipeline::TEMPERATURE_BOUNDS_K;
 /// A count in a bin predicted fewer counts than this has a chance below it
 /// under the model.
 pub const NEGLIGIBLE_PREDICTION: f64 = 1e-10;
+
+/// A quantity the fit holds at a known value or fits from a starting value.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub enum Value {
+    Known(f64),
+    Fitted(f64),
+}
+
+impl Value {
+    fn value(self) -> f64 {
+        match self {
+            Self::Known(v) | Self::Fitted(v) => v,
+        }
+    }
+}
 
 /// An open-beam run and a sample run recorded in the same time bins.
 #[derive(Debug, Clone)]
@@ -39,20 +56,26 @@ pub struct Measurement {
     /// Each isotope in the sample with the areal density, in atoms/barn, the
     /// fit starts from.
     pub isotopes: Vec<(ResonanceData, f64)>,
-    /// The sample's temperature in K.
-    pub temperature_k: f64,
+    /// The sample's temperature in K, known or fitted within 1–5000 K.
+    pub temperature_k: Value,
 }
 
-/// The fitted densities.
+/// The fitted densities and temperature.
 #[derive(Debug, Clone)]
 pub struct CountsFit {
     /// Areal density of each isotope in atoms/barn, in the order given.
     pub densities: Vec<f64>,
-    /// Covariance of the densities, in the order given: the inverse of the
-    /// expected information at the fit, which holds when the counts are
-    /// large, scaled by `overdispersion`, or at the Poisson scale when that is
-    /// `None`.  The row and column of a density on its bound of 0 or not
-    /// determined are NaN.  `None` when the fit did not converge.
+    /// The sample's temperature in K: the known one, or the fitted one.
+    pub temperature_k: f64,
+    /// Covariance of the densities, in the order given, then of the
+    /// temperature when it is fitted: the inverse of the expected information
+    /// at the fit, which holds when the counts are large, scaled by
+    /// `overdispersion`, or at the Poisson scale when that is `None`.  The row
+    /// and column of a density on its bound of 0, or of a quantity the counts
+    /// do not determine, are NaN; every entry is NaN when a fitted temperature
+    /// ends on an edge of 1–5000 K, where the densities are fitted at a
+    /// temperature the counts would take outside the box.  `None` when the fit
+    /// did not converge.
     pub covariance: Option<FlatMatrix>,
     /// The beam per µs of flight time, fitted to both runs, with the
     /// intervals the open-beam fit chose.
@@ -79,9 +102,9 @@ pub struct CountsFit {
     pub halvings: usize,
 }
 
-/// Fit the isotopes' areal densities, at the known temperature, to the raw
-/// counts of both runs of `measurement`.  The open-beam counts are
-/// `O_k = Σ_j w φ(u_j) P_k(u_j)` and the sample counts
+/// Fit the isotopes' areal densities, and the temperature unless it is
+/// known, to the raw counts of both runs of `measurement`.  The open-beam
+/// counts are `O_k = Σ_j w φ(u_j) P_k(u_j)` and the sample counts
 /// `S_k = c Σ_j w φ(u_j) T(E_j) P_k(u_j)` on a uniform flight-time grid,
 /// with `T = exp(−Σ_i n_i σ_i)`, `σ_i` the isotope's Doppler-broadened total
 /// cross section, `c` the charge ratio and `P_k` the chance of a neutron being
@@ -91,11 +114,19 @@ pub struct CountsFit {
 /// densities, and are refused only where the model predicts none.
 ///
 /// The grid's first step is at most half the narrowest Doppler full width at
-/// half maximum, in flight time, of any resonance inside its energy span; it
-/// is then halved until the counts of both runs meet
-/// [`BOUND`](crate::open_beam::BOUND).  The step is uniform, so a wide window
-/// whose span holds a narrow resonance at high energy can exceed the grid's
-/// point cap.
+/// half maximum, in flight time, of any resonance inside its energy span, at
+/// the starting temperature; it is then halved until the counts of both runs
+/// meet [`BOUND`](crate::open_beam::BOUND).  When the coarser grid of that
+/// accepted pair is wider than the rule at the fitted temperature, the fit is
+/// repeated from its answer on a first grid built at the fitted temperature.
+/// The step is uniform, so a wide window whose span holds a narrow resonance
+/// at high energy, or a low fitted temperature, can exceed the grid's point
+/// cap; a temperature the counts barely determine can run to 1 K and refuse
+/// the fit that way.
+///
+/// The fitter finds a local minimum.  A thin sample hotter than about
+/// 1,500 K fitted from room temperature can end in a false one, reported
+/// converged with an overdispersion far above 1.
 ///
 /// The overdispersion scales the covariance; it assumes both runs share it
 /// and their bins are independent.
@@ -105,10 +136,11 @@ pub struct CountsFit {
 /// [`PipelineError::InvalidParameter`] if a count is not a whole non-negative
 /// number, a run has no counts, the charge ratio is not finite and positive,
 /// there are no isotopes, an isotope is listed twice, a starting density is
-/// not finite and non-negative, the temperature is outside 1–5000 K, an
-/// isotope's resonance data are not finite, or the energies its broadened
-/// cross section reads, down to zero for a window within the thermal spread
-/// of zero energy, are not inside a single one of its evaluated (SLBW, MLBW or
+/// not finite and non-negative, the temperature or its start is outside
+/// 1–5000 K, an isotope's resonance data are not finite, or the energies its
+/// broadened cross section reads, at the known temperature or at 5000 K for a
+/// fitted one, down to zero for a window within the thermal spread of zero
+/// energy, are not inside a single one of its evaluated (SLBW, MLBW or
 /// Reich–Moore) resolved ranges;
 /// [`PipelineError::UnmodelledCounts`] if at the fit, converged or not, a bin
 /// holds counts predicted below [`NEGLIGIBLE_PREDICTION`]: background, or
@@ -116,8 +148,8 @@ pub struct CountsFit {
 /// which the fitter cannot leave;
 /// everything [`fit_open_beam`] refuses; [`PipelineError::FlightTimeGrid`]
 /// for the grid's refusals, including more points than it allows;
-/// [`PipelineError::Transmission`] and [`PipelineError::Fitting`] if the
-/// cross sections or the fitter fail.
+/// [`PipelineError::Fitting`] if the fitter fails, or the cross sections
+/// fail at the start; a failure at a trial temperature is a rejected step.
 pub fn fit_counts(
     measurement: &Measurement,
     calibration: &Calibration,
@@ -140,11 +172,16 @@ pub fn fit_counts(
         return invalid("the sample has no isotopes".into());
     }
     let (t_low, t_high) = TEMPERATURE_BOUNDS_K;
-    if !(t_low..=t_high).contains(temperature_k) {
+    let start_k = temperature_k.value();
+    if !(t_low..=t_high).contains(&start_k) {
         return invalid(format!(
-            "the temperature must be within {t_low}–{t_high} K, got {temperature_k}"
+            "the temperature must be within {t_low}–{t_high} K, got {start_k}"
         ));
     }
+    let reach_k = match temperature_k {
+        Value::Known(t) => *t,
+        Value::Fitted(_) => t_high,
+    };
     let mut dopplers = Vec::with_capacity(isotopes.len());
     for (i, (isotope, density)) in isotopes.iter().enumerate() {
         if isotopes[..i]
@@ -169,7 +206,7 @@ pub fn fit_counts(
             ));
         }
         dopplers.push(
-            DopplerParams::new(*temperature_k, isotope.awr)
+            DopplerParams::new(reach_k, isotope.awr)
                 .map_err(|e| PipelineError::InvalidParameter(e.to_string()))?,
         );
     }
@@ -180,9 +217,7 @@ pub fn fit_counts(
 
     let energies = grid.energies_ev();
     let span_ev = (energies[energies.len() - 1], energies[0]);
-    let clock = TOF_FACTOR * calibration.pulse.flight_path_m();
-    let half_maximum = 2.0 * std::f64::consts::LN_2.sqrt();
-    let mut narrowest_us = f64::INFINITY;
+    let mut resonances_in_span = Vec::with_capacity(isotopes.len());
     for ((isotope, _), doppler) in isotopes.iter().zip(&dopplers) {
         let read = (
             (span_ev.0.sqrt() - SUPPORT_X * doppler.u())
@@ -199,23 +234,51 @@ pub fn fit_counts(
                 isotope.isotope, read.0, read.1
             ));
         }
-        for energy in resonance_center_energies(&[isotope])
-            .into_iter()
-            .filter(|e| (span_ev.0..=span_ev.1).contains(e))
-        {
-            let width_ev = half_maximum * doppler.doppler_width(energy);
-            narrowest_us = narrowest_us.min(clock / energy.sqrt() * width_ev / (2.0 * energy));
+        resonances_in_span.push(
+            resonance_center_energies(&[isotope])
+                .into_iter()
+                .filter(|e| (span_ev.0..=span_ev.1).contains(e))
+                .collect::<Vec<f64>>(),
+        );
+    }
+    let clock = TOF_FACTOR * calibration.pulse.flight_path_m();
+    let half_maximum = 2.0 * std::f64::consts::LN_2.sqrt();
+    let narrowest_us = |temperature_k: f64| -> Result<f64, PipelineError> {
+        let mut narrowest = f64::INFINITY;
+        for ((isotope, _), energies) in isotopes.iter().zip(&resonances_in_span) {
+            let doppler = DopplerParams::new(temperature_k, isotope.awr)
+                .map_err(|e| PipelineError::InvalidParameter(e.to_string()))?;
+            for &energy in energies {
+                let width_ev = half_maximum * doppler.doppler_width(energy);
+                narrowest = narrowest.min(clock / energy.sqrt() * width_ev / (2.0 * energy));
+            }
         }
-    }
-    let mut first = grid;
-    let mut halvings = 0;
-    while first.step_us() > 0.5 * narrowest_us {
-        first = first.halved()?;
-        halvings += 1;
-    }
+        Ok(narrowest)
+    };
+    let first_grid = |temperature_k: f64| -> Result<(Arc<FlightTimeGrid>, usize), PipelineError> {
+        let rule_us = 0.5 * narrowest_us(temperature_k)?;
+        let mut first = grid.clone();
+        let mut halvings = 0;
+        while first.step_us() > rule_us {
+            first = first.halved()?;
+            halvings += 1;
+        }
+        Ok((Arc::new(first), halvings))
+    };
 
     let open = fit_open_beam(time_edges_us, open_counts, calibration)?;
     let beam_coefficients = open.beam.coefficients().len();
+    let temperature_index = beam_coefficients + isotopes.len();
+    let temperature = match temperature_k {
+        Value::Known(t) => FitParameter::fixed("temperature", *t),
+        Value::Fitted(t) => FitParameter {
+            name: "temperature".into(),
+            value: *t,
+            lower: t_low,
+            upper: t_high,
+            fixed: false,
+        },
+    };
     let mut parameters = ParameterSet::new(
         open.beam
             .coefficients()
@@ -228,13 +291,28 @@ pub fn fit_counts(
                     .enumerate()
                     .map(|(i, (_, n))| FitParameter::non_negative(format!("density {i}"), *n)),
             )
+            .chain(std::iter::once(temperature))
             .collect(),
     );
-    let resonances: Vec<ResonanceData> = isotopes.iter().map(|(data, _)| data.clone()).collect();
+    let resonances: Arc<[ResonanceData]> = isotopes.iter().map(|(data, _)| data.clone()).collect();
     let observed: Vec<f64> = open_counts.iter().chain(sample_counts).copied().collect();
-    let fit = fit_on_halved_grids(&Arc::new(first), &mut parameters, &observed, |grid| {
-        TwoRunModel::new(grid, &open.beam, &resonances, *temperature_k, *charge_ratio)
-    })?;
+    let mut rule_k = start_k;
+    let (fit, rule_halvings) = loop {
+        let (first, rule_halvings) = first_grid(rule_k)?;
+        let fit = fit_on_halved_grids(&first, &mut parameters, &observed, |grid| {
+            Ok(TwoRunModel::new(
+                grid,
+                &open.beam,
+                &resonances,
+                *charge_ratio,
+            ))
+        })?;
+        let fitted_k = fit.result.params[temperature_index];
+        if !fit.converged || 2.0 * fit.step_us <= 0.5 * narrowest_us(fitted_k)? {
+            break (fit, rule_halvings);
+        }
+        rule_k = fitted_k;
+    };
 
     if let Some((k, (&counts, &predicted))) = observed
         .iter()
@@ -252,25 +330,37 @@ pub fn fit_counts(
     }
 
     let overdispersion = overdispersion(&observed, &fit);
-    let scale = overdispersion.unwrap_or(1.0);
-    let densities = fit.result.params[beam_coefficients..].to_vec();
+    let free = parameters.free_indices();
+    let on_edge = free
+        .iter()
+        .position(|&i| i == temperature_index)
+        .is_some_and(|p| fit.result.on_bound[p]);
+    let scale = if on_edge {
+        f64::NAN
+    } else {
+        overdispersion.unwrap_or(1.0)
+    };
+    let sample_quantities: Vec<usize> = (0..free.len())
+        .filter(|&p| free[p] >= beam_coefficients)
+        .collect();
     let covariance = fit
         .result
         .covariance
         .as_ref()
         .filter(|_| fit.converged)
         .map(|full| {
-            let mut block = FlatMatrix::zeros(densities.len(), densities.len());
-            for i in 0..densities.len() {
-                for j in 0..densities.len() {
-                    *block.get_mut(i, j) =
-                        scale * full.get(beam_coefficients + i, beam_coefficients + j);
+            let size = sample_quantities.len();
+            let mut block = FlatMatrix::zeros(size, size);
+            for (a, &p) in sample_quantities.iter().enumerate() {
+                for (b, &q) in sample_quantities.iter().enumerate() {
+                    *block.get_mut(a, b) = scale * full.get(p, q);
                 }
             }
             block
         });
     Ok(CountsFit {
-        densities,
+        densities: fit.result.params[beam_coefficients..temperature_index].to_vec(),
+        temperature_k: fit.result.params[temperature_index],
         covariance,
         beam: open
             .beam
@@ -281,7 +371,7 @@ pub fn fit_counts(
         overdispersion,
         step_us: fit.step_us,
         points: fit.points,
-        halvings: halvings + fit.halvings,
+        halvings: rule_halvings + fit.halvings,
     })
 }
 
@@ -321,54 +411,94 @@ fn finite(isotope: &ResonanceData) -> bool {
 
 struct TwoRunModel {
     beam: OpenBeamModel,
-    cross_sections: Vec<Vec<f64>>,
+    isotopes: Arc<[ResonanceData]>,
+    energies: Vec<f64>,
     charge_ratio: f64,
+    cross_sections: RefCell<Option<CrossSections>>,
+}
+
+struct CrossSections {
+    temperature_k: f64,
+    values: Vec<Vec<f64>>,
+    slopes: Vec<Vec<f64>>,
 }
 
 impl TwoRunModel {
     fn new(
         grid: &Arc<FlightTimeGrid>,
         beam: &BeamSpline,
-        isotopes: &[ResonanceData],
-        temperature_k: f64,
+        isotopes: &Arc<[ResonanceData]>,
         charge_ratio: f64,
-    ) -> Result<Self, PipelineError> {
+    ) -> Self {
         let mut energies = grid.energies_ev();
         energies.reverse();
-        let mut cross_sections =
-            broadened_cross_sections(&energies, isotopes, temperature_k, None, None)?;
-        for sigma in &mut cross_sections {
-            sigma.reverse();
-        }
-        Ok(Self {
+        Self {
             beam: OpenBeamModel::new(grid, beam),
-            cross_sections,
+            isotopes: Arc::clone(isotopes),
+            energies,
             charge_ratio,
-        })
+            cross_sections: RefCell::new(None),
+        }
     }
 
-    fn beams(&self, params: &[f64]) -> (Vec<f64>, Vec<f64>) {
-        let (coefficients, densities) = params.split_at(params.len() - self.cross_sections.len());
-        let open = self.beam.beam(coefficients);
+    fn at(&self, temperature_k: f64) -> Result<std::cell::Ref<'_, CrossSections>, FittingError> {
+        let current = self
+            .cross_sections
+            .borrow()
+            .as_ref()
+            .is_some_and(|c| c.temperature_k.to_bits() == temperature_k.to_bits());
+        if !current {
+            let energies = &self.energies;
+            let (values, slopes) = self
+                .isotopes
+                .par_iter()
+                .map(|isotope| {
+                    let (mut sigma, mut slope) =
+                        broaden_with_derivative(energies, isotope, temperature_k)
+                            .map_err(|e| FittingError::EvaluationFailed(e.to_string()))?;
+                    sigma.reverse();
+                    slope.reverse();
+                    Ok((sigma, slope))
+                })
+                .collect::<Result<Vec<_>, FittingError>>()?
+                .into_iter()
+                .unzip();
+            *self.cross_sections.borrow_mut() = Some(CrossSections {
+                temperature_k,
+                values,
+                slopes,
+            });
+        }
+        Ok(std::cell::Ref::map(self.cross_sections.borrow(), |c| {
+            c.as_ref().expect("computed above")
+        }))
+    }
+
+    fn beams(&self, params: &[f64]) -> Result<(Vec<f64>, Vec<f64>), FittingError> {
+        let densities = &params[params.len() - 1 - self.isotopes.len()..params.len() - 1];
+        let sigma = self.at(params[params.len() - 1])?;
+        let open = self
+            .beam
+            .beam(&params[..params.len() - 1 - self.isotopes.len()]);
         let sample = open
             .iter()
             .enumerate()
             .map(|(j, phi)| {
                 let depth: f64 = densities
                     .iter()
-                    .zip(&self.cross_sections)
+                    .zip(&sigma.values)
                     .map(|(n, sigma)| n * sigma[j])
                     .sum();
                 self.charge_ratio * phi * (-depth).exp()
             })
             .collect();
-        (open, sample)
+        Ok((open, sample))
     }
 }
 
 impl FitModel for TwoRunModel {
     fn evaluate(&self, params: &[f64]) -> Result<Vec<f64>, FittingError> {
-        let (open, sample) = self.beams(params);
+        let (open, sample) = self.beams(params)?;
         let mut counts = self.beam.counts(&open)?;
         counts.extend(self.beam.counts(&sample)?);
         Ok(counts)
@@ -380,16 +510,29 @@ impl FitModel for TwoRunModel {
         free_param_indices: &[usize],
         y_current: &[f64],
     ) -> Option<FlatMatrix> {
-        let (open, sample) = self.beams(params);
-        let beam_coefficients = params.len() - self.cross_sections.len();
+        let (open, sample) = self.beams(params).ok()?;
+        let sigma = self.at(params[params.len() - 1]).ok()?;
+        let temperature_index = params.len() - 1;
+        let beam_coefficients = temperature_index - self.isotopes.len();
         let mut jacobian = FlatMatrix::zeros(y_current.len(), free_param_indices.len());
         for (col, &index) in free_param_indices.iter().enumerate() {
             let (open_slope, sample_slope) = if index < beam_coefficients {
                 let slope = self.beam.log_slope(index);
                 (slope.clone(), slope)
+            } else if index < temperature_index {
+                let values = &sigma.values[index - beam_coefficients];
+                (vec![0.0; open.len()], values.iter().map(|s| -s).collect())
             } else {
-                let sigma = &self.cross_sections[index - beam_coefficients];
-                (vec![0.0; open.len()], sigma.iter().map(|s| -s).collect())
+                let broadening: Vec<f64> = (0..open.len())
+                    .map(|j| {
+                        -params[beam_coefficients..temperature_index]
+                            .iter()
+                            .zip(&sigma.slopes)
+                            .map(|(n, slope)| n * slope[j])
+                            .sum::<f64>()
+                    })
+                    .collect();
+                (vec![0.0; open.len()], broadening)
             };
             let times = |beam: &[f64], slope: &[f64]| -> Vec<f64> {
                 beam.iter().zip(slope).map(|(b, s)| b * s).collect()
@@ -416,16 +559,19 @@ mod tests {
         let grid = grid(None);
         let (_, u_hi) = grid.range_us();
         let beam = BeamSpline::constant(347.0, u_hi, 1.0e4).refined().refined();
-        let isotopes = [
+        let isotopes: Arc<[ResonanceData]> = Arc::new([
             synthetic_isotope(72, 180, 20.0, 0.01, 0.06),
             synthetic_isotope(74, 182, 20.3, 0.01, 0.06),
-        ];
-        let model = TwoRunModel::new(&grid, &beam, &isotopes, 300.0, 1.2).expect("model");
+        ]);
+        let model = TwoRunModel::new(&grid, &beam, &isotopes, 1.2);
         let params: Vec<f64> = (0..beam.coefficients().len())
             .map(|i| 9.0 + 0.3 * (i as f64).sin())
-            .chain([3.0e-4, 5.0e-4])
+            .chain([3.0e-4, 5.0e-4, 300.0])
             .collect();
         let counts = model.evaluate(&params).expect("counts");
+        let mut colder = params.clone();
+        *colder.last_mut().expect("a temperature") = 250.0;
+        model.evaluate(&colder).expect("counts");
         let indices: Vec<usize> = (0..params.len()).collect();
         let jacobian = model
             .analytical_jacobian(&params, &indices, &counts)
