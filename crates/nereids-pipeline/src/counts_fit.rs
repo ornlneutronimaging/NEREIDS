@@ -13,6 +13,7 @@ use nereids_physics::doppler::DopplerParams;
 use nereids_physics::flight_time_grid::FlightTimeGrid;
 use nereids_physics::resolution::TOF_FACTOR;
 use nereids_physics::transmission::resonance_center_energies;
+use rayon::prelude::*;
 
 use crate::beam::BeamSpline;
 use crate::error::PipelineError;
@@ -64,7 +65,7 @@ pub struct Measurement {
 pub struct CountsFit {
     /// Areal density of each isotope in atoms/barn, in the order given.
     pub densities: Vec<f64>,
-    /// The sample's temperature in K, as given when known.
+    /// The sample's temperature in K: the known one, or the fitted one.
     pub temperature_k: f64,
     /// Covariance of the densities, in the order given, then of the
     /// temperature when it is fitted: the inverse of the expected information
@@ -447,16 +448,21 @@ impl TwoRunModel {
             .as_ref()
             .is_some_and(|c| c.temperature_k.to_bits() == temperature_k.to_bits());
         if !current {
-            let (mut values, mut slopes) = (Vec::new(), Vec::new());
-            for isotope in self.isotopes.iter() {
-                let (mut sigma, mut slope) =
-                    broaden_with_derivative(&self.energies, isotope, temperature_k)
-                        .map_err(|e| FittingError::EvaluationFailed(e.to_string()))?;
-                sigma.reverse();
-                slope.reverse();
-                values.push(sigma);
-                slopes.push(slope);
-            }
+            let energies = &self.energies;
+            let (values, slopes) = self
+                .isotopes
+                .par_iter()
+                .map(|isotope| {
+                    let (mut sigma, mut slope) =
+                        broaden_with_derivative(energies, isotope, temperature_k)
+                            .map_err(|e| FittingError::EvaluationFailed(e.to_string()))?;
+                    sigma.reverse();
+                    slope.reverse();
+                    Ok((sigma, slope))
+                })
+                .collect::<Result<Vec<_>, FittingError>>()?
+                .into_iter()
+                .unzip();
             *self.cross_sections.borrow_mut() = Some(CrossSections {
                 temperature_k,
                 values,
