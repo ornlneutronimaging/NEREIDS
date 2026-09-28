@@ -92,6 +92,10 @@ pixi run test-python
 All five must pass before tagging. If any fails, the release commit
 should NOT be created.
 
+The slow tests marked `#[ignore]` do not run in that suite. Before tagging,
+trigger the Nightly workflow on the release commit
+(`gh workflow run nightly.yml --ref <branch>`) and require it to pass.
+
 The `--examples` gate catches drift between mdBook quickstart snippets and
 the live crate APIs (the snippets in `docs/guide/src/quickstart-rust.md`
 are `{{#include}}`-spliced from `crates/nereids-fitting/examples/quickstart.rs`).
