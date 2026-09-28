@@ -274,11 +274,13 @@ fn closed_loop(t_true_k: f64) {
 }
 
 #[test]
+#[ignore = "slow; runs nightly"]
 fn closed_loop_recovers_temperature_at_300k() {
     closed_loop(300.0);
 }
 
 #[test]
+#[ignore = "slow; runs nightly"]
 fn closed_loop_recovers_temperature_at_1073k() {
     closed_loop(1073.0);
 }

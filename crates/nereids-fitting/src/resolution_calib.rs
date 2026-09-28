@@ -1806,6 +1806,7 @@ mod tests {
     }
 
     #[test]
+    #[ignore = "slow; runs nightly"]
     fn free_l_scale_absorbs_asymmetric_lag_and_erodes_discrimination() {
         // The asymmetric IC mode→centroid lag is pure 1/√E — the SAME basis as an
         // L_scale error. So a Gaussian fitting an IC-broadened calibrant fits much
@@ -2006,6 +2007,7 @@ mod tests {
     }
 
     #[test]
+    #[ignore = "slow; runs nightly"]
     fn cross_family_chi2_selects_the_true_shape() {
         // Model-family discrimination at a KNOWN (pinned) energy scale: an
         // asymmetric IC-broadened calibrant generated at the nominal position
@@ -2071,6 +2073,7 @@ mod tests {
     }
 
     #[test]
+    #[ignore = "slow; runs nightly"]
     fn gaussian_and_ic_families_run_and_converge() {
         let iso = synthetic_isotope(72, 178, 20.0, 0.05, 0.06);
         let sample = SampleParams::new(300.0, vec![(iso, 2.0e-3)]).unwrap();
@@ -2314,6 +2317,7 @@ mod tests {
     }
 
     #[test]
+    #[ignore = "slow; runs nightly"]
     fn ic_recovers_known_alpha() {
         // Loop-closure / optimizer test (same caveat as udr_corr): truth and fit
         // both use the IC synthesis, so this checks the optimizer recovers the
@@ -2388,6 +2392,7 @@ mod tests {
     }
 
     #[test]
+    #[ignore = "slow; runs nightly"]
     fn ic_recovers_known_psr_when_fit() {
         // Loop-closure / optimizer test for fit_psr (#645 F2, same caveat as
         // ic_recovers_known_alpha: truth and fit share the IC synthesis, so
@@ -2457,6 +2462,7 @@ mod tests {
     }
 
     #[test]
+    #[ignore = "slow; runs nightly"]
     fn psr_disabled_at_zero_width() {
         // psr_fwhm_ns = 0.0 disables the triangle fold entirely: an UNFOLDED
         // truth is reproduced and the calibrated kernel carries no channel.
@@ -2519,6 +2525,7 @@ mod tests {
     }
 
     #[test]
+    #[ignore = "slow; runs nightly"]
     fn bounds_hit_reports_pinned_parameter() {
         // A truth WITHOUT a storage tail (R = 0) drives the fitted R onto its
         // lower box bound; the result must say so ("r:lower") — the β↔R-ridge
@@ -2587,6 +2594,7 @@ mod tests {
     }
 
     #[test]
+    #[ignore = "slow; runs nightly"]
     fn bounds_hit_labels_saturated_upper_bound() {
         // A truth channel fold WIDER than the fitted PSR box (2.5 µs vs
         // PSR_FWHM_US_MAX = 1.0 µs) pulls the fitted width monotonically
@@ -2957,6 +2965,7 @@ mod tests {
     }
 
     #[test]
+    #[ignore = "slow; runs nightly"]
     fn ic_infeasible_pocket_inside_box_completes_calibration() {
         // Review #645 round 3, F4 — the calibration-level half of the claim
         // above: with fit_psr the box CONTAINS the unresolvable pocket (PSR
@@ -3018,6 +3027,7 @@ mod tests {
     /// in the flat valley a realization landed, so neither side alone is the
     /// scatter; their average is.
     #[test]
+    #[ignore = "slow; runs nightly"]
     fn the_reported_interval_predicts_the_scatter_of_repeated_calibrations() {
         use rand::SeedableRng;
         use rand_chacha::ChaCha12Rng;

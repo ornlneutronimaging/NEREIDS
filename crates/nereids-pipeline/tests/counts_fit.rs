@@ -1104,6 +1104,7 @@ mod error_bar_pulls {
     }
 
     #[test]
+    #[ignore = "slow; runs nightly"]
     fn a_thin_sample_s_error_bars_are_its_scatter() {
         let ensemble = Ensemble {
             setup: standard(),
@@ -1133,6 +1134,7 @@ mod error_bar_pulls {
     }
 
     #[test]
+    #[ignore = "slow; runs nightly"]
     fn compound_counts_scale_the_error_bars_by_the_overdispersion() {
         let ensemble = saturated(
             Value::Fitted(TEMPERATURE_K),
@@ -1147,6 +1149,7 @@ mod error_bar_pulls {
     }
 
     #[test]
+    #[ignore = "slow; runs nightly"]
     fn a_short_open_run_widens_the_error_bars_by_its_noise() {
         let ensemble = saturated(
             Value::Fitted(TEMPERATURE_K),
@@ -1159,12 +1162,14 @@ mod error_bar_pulls {
     }
 
     #[test]
+    #[ignore = "slow; runs nightly"]
     fn a_few_counts_per_bin_with_empty_bins_give_their_error_bars() {
         let ensemble = saturated(Value::Known(TEMPERATURE_K), 3.0, 1.0, 1.0, 40_000..40_400);
         check(&ensemble.draws_from_truth());
     }
 
     #[test]
+    #[ignore = "slow; runs nightly"]
     fn the_overdispersion_measures_compound_counts_at_a_few_counts_per_bin() {
         let ensemble = saturated(Value::Known(TEMPERATURE_K), 3.0, 7.0, 1.0, 50_000..50_400);
         let draws = ensemble.draws_from_truth();
