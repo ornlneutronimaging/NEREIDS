@@ -1636,12 +1636,14 @@ mod tests {
     }
 
     #[test]
+    #[ignore = "slow; runs nightly"]
     fn test_calibrate_wide_offset_venus_scale_at_paper_density() {
         // 0.3 % L + 1 µs at the SoftwareX U-238 foil density.
         assert_wide_offset_recovery(1.003, 1.0, 5e-3, 0.15);
     }
 
     #[test]
+    #[ignore = "slow; runs nightly"]
     fn test_calibrate_wide_offset_venus_scale_at_trace_density() {
         // Same offsets at trace density — the silent-failure regime
         // (wrong answer previously carried chi²_r ≈ 1e-4).
@@ -1649,6 +1651,7 @@ mod tests {
     }
 
     #[test]
+    #[ignore = "slow; runs nightly"]
     fn test_calibrate_wide_offset_beyond_one_box_at_paper_density() {
         // 1.2 % L exceeds the per-fit ±1 % L_scale box → exercises the
         // re-anchoring composition; 6 µs t0 is mid coarse-grid.
@@ -1656,6 +1659,7 @@ mod tests {
     }
 
     #[test]
+    #[ignore = "slow; runs nightly"]
     fn test_calibrate_wide_offset_beyond_one_box_at_midband_density() {
         assert_wide_offset_recovery(1.012, 6.0, 1.5e-4, 0.15);
     }
@@ -1702,6 +1706,7 @@ mod tests {
     /// the true density sits at the edge, and that is correct
     /// behaviour for a smooth optimisation landscape.
     #[test]
+    #[ignore = "slow; runs nightly"]
     fn test_calibrate_energy_accepts_density_at_documented_lower_bound() {
         let true_n = 1.0e-5;
         let (result, _, _) = calibrate_round_trip_at_density(true_n)
@@ -1731,6 +1736,7 @@ mod tests {
     /// `[1e-5, 1e-2]` — a smooth optimum at the edge can land just
     /// outside without indicating any defect.
     #[test]
+    #[ignore = "slow; runs nightly"]
     fn test_calibrate_energy_accepts_density_at_documented_upper_bound() {
         let true_n = 1.0e-2;
         let (result, _, _) = calibrate_round_trip_at_density(true_n)
@@ -1771,6 +1777,7 @@ mod tests {
     /// log-space golden-section refactor this density must round-
     /// trip with full Phase-3 precision.
     #[test]
+    #[ignore = "slow; runs nightly"]
     fn test_calibrate_energy_recovers_density_1e_3() {
         let true_n = 1e-3;
         let (result, _, _) = calibrate_round_trip_at_density(true_n)
@@ -1790,6 +1797,7 @@ mod tests {
     /// that the paper's calibration narrative relies on; it sits a
     /// factor 10× above the old reachable maximum.
     #[test]
+    #[ignore = "slow; runs nightly"]
     fn test_calibrate_energy_recovers_density_5e_3() {
         let true_n = 5e-3;
         let (result, _, _) = calibrate_round_trip_at_density(true_n)

@@ -302,6 +302,7 @@ mod tests {
     /// fit has the calibrant residuals in its objective and should report
     /// both.
     #[test]
+    #[ignore = "slow; runs nightly"]
     fn the_joint_fit_reports_the_temperature_uncertainty_pinning_drops() {
         const REALIZATIONS: usize = 16;
         let (iso, energies, truth) = fixture();
