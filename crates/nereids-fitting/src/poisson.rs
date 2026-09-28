@@ -309,12 +309,17 @@ impl Decomposition {
 
     fn error_bars(&self, n_free: usize) -> (FlatMatrix, Vec<Option<f64>>) {
         let n = self.columns.len();
-        let rounding = (f64::EPSILON * self.rows.max(n) as f64).powi(2);
         let determined: Vec<bool> = self
             .singular
             .iter()
             .map(|s| s * s >= DEGENERATE_EIGENVALUE)
             .collect();
+        let largest = self.singular.iter().fold(0.0_f64, |m, &s| m.max(s));
+        let smallest_determined = (0..n)
+            .filter(|&k| determined[k])
+            .fold(largest, |m, k| m.min(self.singular[k]));
+        let rounding =
+            (f64::EPSILON * self.rows.max(n) as f64 * largest / smallest_determined).powi(2);
         let resolved: Vec<bool> = (0..n)
             .map(|i| {
                 (0..n)

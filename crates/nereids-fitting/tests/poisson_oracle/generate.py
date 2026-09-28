@@ -173,7 +173,8 @@ def error_bars(case, theta, lower, upper):
         values = np.zeros(len(cols))
         values[: len(s)] = s
         determined = values**2 >= DEGENERATE_EIGENVALUE
-        floor = (max(scaled.shape) * EPS) ** 2
+        smallest = values[determined].min() if determined.any() else values.max()
+        floor = (max(scaled.shape) * EPS * values.max() / smallest) ** 2
         resolved = [np.sum(v[i, ~determined] ** 2) <= floor for i in range(len(cols))]
         for i, col in enumerate(cols):
             for j, row in enumerate(cols):
@@ -359,6 +360,13 @@ def main():
     add(dict(name="linear/wide", family="linear", x=[[1.0, 0.0, 1.0], [0.0, 1.0, 1.0]], offset=[100.0, 100.0],
              null=[1.0, 1.0, -1.0]),
         [0.0, 0.0, 0.0], [-inf, -inf, -inf], [inf, inf, inf], [[5.0, -5.0, 3.0]], range(1, 4))
+    alias = [0.081491810163634, -1.0032182254457815, 0.16300051480924363]
+    third = [0.1112249317425662, -1.0088403400884873, 0.1307277540395161]
+    for name, columns, null in (("alias-first", [alias, alias, third], [1.0, -1.0, 0.0]),
+                                ("alias-last", [third, alias, alias], [0.0, 1.0, -1.0])):
+        add(dict(name=f"linear/{name}", family="linear", x=np.column_stack(columns).tolist(),
+                 offset=[100.0, 100.0, 100.0], null=null),
+            [0.0, 0.0, 0.0], [-inf, -inf, -inf], [inf, inf, inf], [[5.0, -5.0, 3.0]], range(1, 4))
 
     out = pathlib.Path(__file__).with_name("cases.json")
     out.write_text(json.dumps({"models": models, "cases": records}))
