@@ -68,9 +68,8 @@ pub struct PoissonResult {
     pub covariance: Option<FlatMatrix>,
     /// Standard error of each free parameter; `None` for a parameter on a
     /// bound or with a component along a direction the data do not
-    /// determine, larger than the SVD's rounding for that parameter, and for
-    /// every parameter when the SVD does not converge.  `None` overall when
-    /// `covariance` is.
+    /// determine, larger than the SVD's rounding for that parameter.  `None`
+    /// overall when `covariance` is.
     pub uncertainties: Option<Vec<Option<f64>>>,
     /// Whether each free parameter ended on one of its bounds.
     pub on_bound: Vec<bool>,
@@ -336,9 +335,7 @@ impl Decomposition {
                 .map(|k| self.right[k][i] * self.right[k][j] / self.singular[k].powi(2))
                 .sum()
         };
-        let mut covariance = FlatMatrix::zeros(n_free, n_free);
-        covariance.data.fill(f64::NAN);
-        let mut errors = vec![None; n_free];
+        let (mut covariance, mut errors) = withheld(n_free);
         for i in (0..n).filter(|&i| resolved[i]) {
             for j in (0..n).filter(|&j| resolved[j]) {
                 *covariance.get_mut(self.columns[i], self.columns[j]) =
@@ -348,6 +345,12 @@ impl Decomposition {
         }
         (covariance, errors)
     }
+}
+
+fn withheld(n_free: usize) -> (FlatMatrix, Vec<Option<f64>>) {
+    let mut covariance = FlatMatrix::zeros(n_free, n_free);
+    covariance.data.fill(f64::NAN);
+    (covariance, vec![None; n_free])
 }
 
 fn on_bound(param: &FitParameter) -> bool {
@@ -387,10 +390,9 @@ fn held_by_bound(param: &FitParameter, gradient: f64) -> bool {
 /// reported unconverged.
 ///
 /// It stops unconverged when no step lowers the deviance, when the Jacobian
-/// is not finite or its SVD does not converge, when the start predicts a
-/// negative count or zero where something was counted, or after
-/// `config.max_iter` steps.  A trial whose prediction has a different length
-/// from `y_obs` is rejected.
+/// is not finite, when the start predicts a negative count or zero where
+/// something was counted, or after `config.max_iter` steps.  A trial whose
+/// prediction has a different length from `y_obs` is rejected.
 ///
 /// # Errors
 /// `FittingError::EmptyData` if `y_obs` is empty;
@@ -508,11 +510,7 @@ pub fn poisson_fit(
         Some(linear) if config.compute_covariance => {
             let interior: Vec<usize> = (0..free.len()).filter(|&j| !bounded[j]).collect();
             let (covariance, errors) = Decomposition::new(&linear.weighted, &interior).map_or_else(
-                || {
-                    let mut covariance = FlatMatrix::zeros(free.len(), free.len());
-                    covariance.data.fill(f64::NAN);
-                    (covariance, vec![None; free.len()])
-                },
+                || withheld(free.len()),
                 |decomposition| decomposition.error_bars(free.len()),
             );
             (Some(covariance), Some(errors))
@@ -1669,7 +1667,7 @@ mod tests {
 
     struct Affine {
         offset: Vec<f64>,
-        jacobian: Vec<[f64; 2]>,
+        jacobian: Vec<Vec<f64>>,
     }
 
     impl FitModel for Affine {
@@ -1678,7 +1676,9 @@ mod tests {
                 .offset
                 .iter()
                 .zip(&self.jacobian)
-                .map(|(offset, row)| offset + row[0] * params[0] + row[1] * params[1])
+                .map(|(offset, row)| {
+                    offset + row.iter().zip(params).map(|(j, p)| j * p).sum::<f64>()
+                })
                 .collect())
         }
 
@@ -1689,7 +1689,7 @@ mod tests {
             _y_current: &[f64],
         ) -> Option<FlatMatrix> {
             let mut jacobian = FlatMatrix::zeros(self.offset.len(), free_param_indices.len());
-            jacobian.data.copy_from_slice(self.jacobian.as_flattened());
+            jacobian.data.copy_from_slice(&self.jacobian.concat());
             Some(jacobian)
         }
     }
@@ -1712,7 +1712,7 @@ mod tests {
     fn a_weak_direction_keeps_its_share_of_the_newton_decrement() {
         let model = Affine {
             offset: vec![1.0; 2],
-            jacobian: vec![[1.0, 1.0], [1.0e-14, -1.0e-14]],
+            jacobian: vec![vec![1.0, 1.0], vec![1.0e-14, -1.0e-14]],
         };
         for observed in [[0.999, 0.998999], [0.999, 0.999001]] {
             let decrement = 0.5
@@ -1731,7 +1731,7 @@ mod tests {
 
     #[test]
     fn a_zero_bin_slope_enters_every_direction_of_the_decrement() {
-        let jacobian: Vec<[f64; 2]> = vec![[1.0, 2.0], [1.0, 3.0], [2.0, -1.0]];
+        let jacobian = vec![vec![1.0, 2.0], vec![1.0, 3.0], vec![2.0, -1.0]];
         let offset: Vec<f64> = vec![0.0, 4.0, 9.0];
         let root = [offset[1].sqrt(), offset[2].sqrt()];
         let w = [
@@ -1763,6 +1763,66 @@ mod tests {
                 result.converged,
                 decrement < NEWTON_DECREMENT_TOL,
                 "{decrement:e}: {result:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn a_fit_with_hundreds_of_parameters_has_the_error_bars_of_its_inverse_information() {
+        use rand::SeedableRng;
+        use rand_chacha::ChaCha12Rng;
+        use rand_distr::{Distribution, StandardNormal};
+        let (bins, count, level) = (300, 150, 1.0e4);
+        let mut rng = ChaCha12Rng::seed_from_u64(806);
+        let jacobian: Vec<Vec<f64>> = (0..bins)
+            .map(|_| {
+                (0..count)
+                    .map(|_| StandardNormal.sample(&mut rng))
+                    .collect()
+            })
+            .collect();
+        let model = Affine {
+            offset: vec![level; bins],
+            jacobian: jacobian.clone(),
+        };
+        let mut params = ParameterSet::new(
+            (0..count)
+                .map(|j| FitParameter::unbounded(format!("c{j}"), 0.0))
+                .collect(),
+        );
+        let result = poisson_fit(
+            &model,
+            &vec![level; bins],
+            &mut params,
+            &PoissonConfig::default(),
+        )
+        .unwrap();
+        assert!(result.converged && result.iterations == 0, "{result:?}");
+        let mut cholesky = vec![vec![0.0; count]; count];
+        for a in 0..count {
+            for b in 0..=a {
+                let information: f64 = jacobian.iter().map(|row| row[a] * row[b] / level).sum();
+                let rest =
+                    information - (0..b).map(|c| cholesky[a][c] * cholesky[b][c]).sum::<f64>();
+                cholesky[a][b] = if a == b {
+                    rest.sqrt()
+                } else {
+                    rest / cholesky[b][b]
+                };
+            }
+        }
+        for (j, error) in result.uncertainties.unwrap().into_iter().enumerate() {
+            let mut solved = vec![0.0; count];
+            for a in 0..count {
+                let unit = if a == j { 1.0 } else { 0.0 };
+                solved[a] = (unit - (0..a).map(|c| cholesky[a][c] * solved[c]).sum::<f64>())
+                    / cholesky[a][a];
+            }
+            let expected = solved.iter().map(|v| v * v).sum::<f64>().sqrt();
+            let error = error.unwrap();
+            assert!(
+                (error / expected - 1.0).abs() < 1e-10,
+                "{j}: {error} vs {expected}"
             );
         }
     }
