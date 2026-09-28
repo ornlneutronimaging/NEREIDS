@@ -68,7 +68,9 @@ pub struct PoissonResult {
     pub covariance: Option<FlatMatrix>,
     /// Standard error of each free parameter; `None` for a parameter on a
     /// bound or with a component along a direction the data do not
-    /// determine.  `None` overall when `covariance` is.
+    /// determine, larger than the SVD's rounding for that parameter, and for
+    /// every parameter when the SVD does not converge.  `None` overall when
+    /// `covariance` is.
     pub uncertainties: Option<Vec<Option<f64>>>,
     /// Whether each free parameter ended on one of its bounds.
     pub on_bound: Vec<bool>,
@@ -502,24 +504,25 @@ pub fn poisson_fit(
         .iter()
         .map(|&idx| on_bound(&params.params[idx]))
         .collect();
-    let (converged, covariance, uncertainties) = match &at_minimum {
+    let (covariance, uncertainties) = match &at_minimum {
         Some(linear) if config.compute_covariance => {
             let interior: Vec<usize> = (0..free.len()).filter(|&j| !bounded[j]).collect();
-            match Decomposition::new(&linear.weighted, &interior) {
-                Some(decomposition) => {
-                    let (covariance, errors) = decomposition.error_bars(free.len());
-                    (true, Some(covariance), Some(errors))
-                }
-                None => (false, None, None),
-            }
+            let (covariance, errors) = Decomposition::new(&linear.weighted, &interior).map_or_else(
+                || {
+                    let mut covariance = FlatMatrix::zeros(free.len(), free.len());
+                    covariance.data.fill(f64::NAN);
+                    (covariance, vec![None; free.len()])
+                },
+                |decomposition| decomposition.error_bars(free.len()),
+            );
+            (Some(covariance), Some(errors))
         }
-        Some(_) => (true, None, None),
-        None => (false, None, None),
+        _ => (None, None),
     };
     Ok(PoissonResult {
         deviance: value,
         iterations,
-        converged,
+        converged: at_minimum.is_some(),
         params: params.all_values(),
         covariance,
         uncertainties,
