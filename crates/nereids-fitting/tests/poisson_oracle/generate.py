@@ -173,8 +173,10 @@ def error_bars(case, theta, lower, upper):
         values = np.zeros(len(cols))
         values[: len(s)] = s
         determined = values**2 >= DEGENERATE_EIGENVALUE
-        floor = (max(scaled.shape) * EPS) ** 2
-        resolved = [np.sum(v[i, ~determined] ** 2) <= floor for i in range(len(cols))]
+        base = max(scaled.shape) * EPS * values.max()
+        resolved = [np.sum(v[i, ~determined] ** 2)
+                    <= (base * np.sum(np.abs(v[i, determined]) / values[determined])) ** 2
+                    for i in range(len(cols))]
         for i, col in enumerate(cols):
             for j, row in enumerate(cols):
                 if resolved[i] and resolved[j]:
@@ -356,6 +358,20 @@ def main():
     add(dict(name="linear/nonneg", family="linear", x=x.tolist(), offset=[1.0] * 40),
         [20.0, 0.0, 15.0, 0.0], [0, 0, 0, 0], [inf, inf, inf, inf],
         [[5.0, 5.0, 5.0, 5.0], [50.0, 0.0, 0.0, 50.0]], range(1, 7))
+    add(dict(name="linear/wide", family="linear", x=[[1.0, 0.0, 1.0], [0.0, 1.0, 1.0]], offset=[100.0, 100.0],
+             null=[1.0, 1.0, -1.0]),
+        [0.0, 0.0, 0.0], [-inf, -inf, -inf], [inf, inf, inf], [[5.0, -5.0, 3.0]], range(1, 4))
+    alias = [0.081491810163634, -1.0032182254457815, 0.16300051480924363]
+    third = [0.1112249317425662, -1.0088403400884873, 0.1307277540395161]
+    for name, columns, null in (("alias-first", [alias, alias, third], [1.0, -1.0, 0.0]),
+                                ("alias-last", [third, alias, alias], [0.0, 1.0, -1.0])):
+        add(dict(name=f"linear/{name}", family="linear", x=np.column_stack(columns).tolist(),
+                 offset=[100.0, 100.0, 100.0], null=null),
+            [0.0, 0.0, 0.0], [-inf, -inf, -inf], [inf, inf, inf], [[5.0, -5.0, 3.0]], range(1, 4))
+    add(dict(name="linear/weak-beside-null", family="linear",
+             x=[[1.0, 0.0, 0.0, 1e-10], [0.0, 1.0, 1.0, 1.0], [0.0, 0.0, 1e-5, 0.0], [0.0, 0.0, 0.0, 0.0]],
+             offset=[100.0] * 4, null=[-1e-10, -1.0, 0.0, 1.0]),
+        [0.0] * 4, [-inf] * 4, [inf] * 4, [[5.0, -5.0, 3.0, 1.0]], range(1, 4))
 
     out = pathlib.Path(__file__).with_name("cases.json")
     out.write_text(json.dumps({"models": models, "cases": records}))
