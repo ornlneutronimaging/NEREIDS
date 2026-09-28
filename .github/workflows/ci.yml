@@ -182,7 +182,7 @@ jobs:
         with:
           tool: cargo-llvm-cov
       - name: Generate coverage
-        run: cargo llvm-cov --workspace --exclude nereids-python --lcov --output-path lcov.info -- --skip error_bar_pulls::
+        run: 'cargo llvm-cov --workspace --exclude nereids-python --lcov --output-path lcov.info -- --skip error_bar_pulls::'
       - name: Upload to Codecov
         uses: codecov/codecov-action@303a32d7a59b442fa8d48b6a1cc6825c09c847a5 # v7.1.1
         with:
