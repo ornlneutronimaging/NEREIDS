@@ -356,6 +356,9 @@ def main():
     add(dict(name="linear/nonneg", family="linear", x=x.tolist(), offset=[1.0] * 40),
         [20.0, 0.0, 15.0, 0.0], [0, 0, 0, 0], [inf, inf, inf, inf],
         [[5.0, 5.0, 5.0, 5.0], [50.0, 0.0, 0.0, 50.0]], range(1, 7))
+    add(dict(name="linear/wide", family="linear", x=[[1.0, 0.0, 1.0], [0.0, 1.0, 1.0]], offset=[100.0, 100.0],
+             null=[1.0, 1.0, -1.0]),
+        [0.0, 0.0, 0.0], [-inf, -inf, -inf], [inf, inf, inf], [[5.0, -5.0, 3.0]], range(1, 4))
 
     out = pathlib.Path(__file__).with_name("cases.json")
     out.write_text(json.dumps({"models": models, "cases": records}))

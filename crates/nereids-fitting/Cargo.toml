@@ -9,6 +9,7 @@ keywords = ["fitting", "levenberg-marquardt", "optimization", "poisson", "neutro
 categories = ["science"]
 
 [dependencies]
+faer = { workspace = true }
 nereids-core = { workspace = true }
 nereids-endf = { workspace = true }
 nereids-physics = { workspace = true }

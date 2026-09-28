@@ -19,6 +19,10 @@
 //! constructs) and to spatial-regularization research drivers; it is not a
 //! public transmission fitting route.
 
+use faer::dyn_stack::{MemBuffer, MemStack};
+use faer::linalg::svd::{ComputeSvdVectors, svd, svd_scratch};
+use faer::{Mat, Par};
+
 use crate::error::FittingError;
 use crate::lm::{FitModel, FlatMatrix};
 use crate::parameters::{FitParameter, ParameterSet};
@@ -60,7 +64,8 @@ pub struct PoissonResult {
     pub params: Vec<f64>,
     /// Covariance of the free parameters; the rows and columns of a
     /// parameter without an error bar are NaN.  `None` when the fit did not
-    /// converge or covariance computation is disabled.
+    /// converge, covariance computation is disabled, or the SVD of the
+    /// information did not converge.
     pub covariance: Option<FlatMatrix>,
     /// Standard error of each free parameter; `None` for a parameter on a
     /// bound or with a component along a direction the data do not
@@ -73,8 +78,6 @@ pub struct PoissonResult {
 const NEWTON_DECREMENT_TOL: f64 = 1e-6;
 
 const DEGENERATE_EIGENVALUE: f64 = 1e-12;
-
-const MAX_JACOBI_SWEEPS: usize = 64;
 
 const MAX_REJECTIONS: usize = 60;
 
@@ -192,47 +195,6 @@ fn linearize(
     })
 }
 
-fn dot(a: &[f64], b: &[f64]) -> f64 {
-    a.iter().zip(b).map(|(x, y)| x * y).sum()
-}
-
-fn one_sided_jacobi(columns: &mut [Vec<f64>]) -> Vec<Vec<f64>> {
-    let k = columns.len();
-    let mut v: Vec<Vec<f64>> = (0..k)
-        .map(|i| (0..k).map(|j| if i == j { 1.0 } else { 0.0 }).collect())
-        .collect();
-    let rotate = |a: &mut [Vec<f64>], p: usize, q: usize, c: f64, s: f64| {
-        for row in 0..a[p].len() {
-            let (x, y) = (a[p][row], a[q][row]);
-            a[p][row] = c * x - s * y;
-            a[q][row] = s * x + c * y;
-        }
-    };
-    for _ in 0..MAX_JACOBI_SWEEPS {
-        let mut rotated = false;
-        for p in 0..k {
-            for q in p + 1..k {
-                let alpha = dot(&columns[p], &columns[p]);
-                let beta = dot(&columns[q], &columns[q]);
-                let gamma = dot(&columns[p], &columns[q]);
-                if gamma.abs() <= f64::EPSILON * (alpha * beta).sqrt() {
-                    continue;
-                }
-                rotated = true;
-                let zeta = (beta - alpha) / (2.0 * gamma);
-                let t = zeta.signum() / (zeta.abs() + zeta.hypot(1.0));
-                let c = 1.0 / t.hypot(1.0);
-                rotate(columns, p, q, c, c * t);
-                rotate(&mut v, p, q, c, c * t);
-            }
-        }
-        if !rotated {
-            break;
-        }
-    }
-    v
-}
-
 fn column_scale(weighted: &FlatMatrix, col: usize) -> (f64, f64) {
     let peak = (0..weighted.nrows).fold(0.0_f64, |m, i| m.max(weighted.get(i, col).abs()));
     let length = (0..weighted.nrows)
@@ -246,38 +208,61 @@ struct Decomposition {
     columns: Vec<usize>,
     largest: Vec<f64>,
     length: Vec<f64>,
+    rows: usize,
     singular: Vec<f64>,
-    left: Vec<Vec<f64>>,
+    left: Mat<f64>,
     right: Vec<Vec<f64>>,
 }
 
 impl Decomposition {
-    fn new(weighted: &FlatMatrix, columns: &[usize]) -> Self {
-        let mut kept = vec![];
-        let (mut largest, mut length, mut left) = (vec![], vec![], vec![]);
+    fn new(weighted: &FlatMatrix, columns: &[usize]) -> Option<Self> {
+        let (mut kept, mut largest, mut length) = (vec![], vec![], vec![]);
         for &col in columns {
             let (peak, norm) = column_scale(weighted, col);
             if peak > 0.0 {
                 kept.push(col);
                 largest.push(peak);
                 length.push(norm);
-                left.push(
-                    (0..weighted.nrows)
-                        .map(|i| weighted.get(i, col) / peak / norm)
-                        .collect(),
-                );
             }
         }
-        let right = one_sided_jacobi(&mut left);
-        let singular = left.iter().map(|u| dot(u, u).sqrt()).collect();
-        Self {
+        let (rows, k) = (weighted.nrows, kept.len());
+        let scaled = Mat::from_fn(rows, k, |row, i| {
+            weighted.get(row, kept[i]) / largest[i] / length[i]
+        });
+        let mut values = Mat::<f64>::zeros(rows.min(k), rows.min(k));
+        let mut left = Mat::<f64>::zeros(rows, rows.min(k));
+        let mut v = Mat::<f64>::zeros(k, k);
+        let params = Default::default();
+        svd(
+            scaled.as_ref(),
+            values.diagonal_mut(),
+            Some(left.as_mut()),
+            Some(v.as_mut()),
+            Par::Seq,
+            MemStack::new(&mut MemBuffer::new(svd_scratch::<f64>(
+                rows,
+                k,
+                ComputeSvdVectors::Thin,
+                ComputeSvdVectors::Full,
+                Par::Seq,
+                params,
+            ))),
+            params,
+        )
+        .ok()?;
+        Some(Self {
             columns: kept,
             largest,
             length,
-            singular,
+            rows,
+            singular: (0..k)
+                .map(|j| if j < rows { values[(j, j)] } else { 0.0 })
+                .collect(),
             left,
-            right,
-        }
+            right: (0..k)
+                .map(|j| (0..k).map(|i| v[(i, j)]).collect())
+                .collect(),
+        })
     }
 
     fn unscale(&self, i: usize, value: f64) -> f64 {
@@ -286,8 +271,7 @@ impl Decomposition {
 
     fn spanned(&self) -> impl Iterator<Item = usize> + '_ {
         let largest = self.singular.iter().fold(0.0_f64, |m, &s| m.max(s));
-        let rows = self.left.first().map_or(0, Vec::len);
-        let rank_floor = f64::EPSILON * rows.max(self.singular.len()) as f64 * largest;
+        let rank_floor = f64::EPSILON * self.rows.max(self.singular.len()) as f64 * largest;
         (0..self.singular.len()).filter(move |&k| self.singular[k] > rank_floor)
     }
 
@@ -298,7 +282,10 @@ impl Decomposition {
             .enumerate()
             .map(|(i, &col)| self.right[k][i] * self.unscale(i, linear.zero_slope[col]))
             .sum();
-        (dot(&self.left[k], &linear.residual) + zero_part) / self.singular[k]
+        let residual_part: f64 = (0..self.rows)
+            .map(|row| self.left[(row, k)] * linear.residual[row])
+            .sum();
+        residual_part + zero_part / self.singular[k]
     }
 
     fn newton_decrement(&self, linear: &Linearization) -> f64 {
@@ -322,8 +309,7 @@ impl Decomposition {
 
     fn error_bars(&self, n_free: usize) -> (FlatMatrix, Vec<Option<f64>>) {
         let n = self.columns.len();
-        let rows = self.left.first().map_or(0, Vec::len);
-        let rounding = (f64::EPSILON * rows.max(n) as f64).powi(2);
+        let rounding = (f64::EPSILON * self.rows.max(n) as f64).powi(2);
         let determined: Vec<bool> = self
             .singular
             .iter()
@@ -395,9 +381,10 @@ fn held_by_bound(param: &FitParameter, gradient: f64) -> bool {
 /// reported unconverged.
 ///
 /// It stops unconverged when no step lowers the deviance, when the Jacobian
-/// is not finite, when the start predicts a negative count or zero where
-/// something was counted, or after `config.max_iter` steps.  A trial whose
-/// prediction has a different length from `y_obs` is rejected.
+/// is not finite or its SVD does not converge, when the start predicts a
+/// negative count or zero where something was counted, or after
+/// `config.max_iter` steps.  A trial whose prediction has a different length
+/// from `y_obs` is rejected.
 ///
 /// # Errors
 /// `FittingError::EmptyData` if `y_obs` is empty;
@@ -468,7 +455,9 @@ pub fn poisson_fit(
         let movable: Vec<usize> = (0..free.len())
             .filter(|&j| !held_by_bound(&params.params[free[j]], linear.gradient[j]))
             .collect();
-        let decomposition = Decomposition::new(&linear.weighted, &movable);
+        let Some(decomposition) = Decomposition::new(&linear.weighted, &movable) else {
+            break;
+        };
         if decomposition.newton_decrement(&linear) < NEWTON_DECREMENT_TOL {
             at_minimum = Some(linear);
             break;
@@ -512,9 +501,13 @@ pub fn poisson_fit(
     let (covariance, uncertainties) = match &at_minimum {
         Some(linear) if config.compute_covariance => {
             let interior: Vec<usize> = (0..free.len()).filter(|&j| !bounded[j]).collect();
-            let (covariance, errors) =
-                Decomposition::new(&linear.weighted, &interior).error_bars(free.len());
-            (Some(covariance), Some(errors))
+            match Decomposition::new(&linear.weighted, &interior) {
+                Some(decomposition) => {
+                    let (covariance, errors) = decomposition.error_bars(free.len());
+                    (Some(covariance), Some(errors))
+                }
+                None => (None, None),
+            }
         }
         _ => (None, None),
     };
@@ -1651,11 +1644,11 @@ mod tests {
     fn a_zero_bin_slope_enters_the_convergence_test() {
         let model = Line2 {
             offset: [0.0, 4.0],
-            slope: [1.0, -2.0],
+            slope: [1.0, -4.0],
         };
         let result = poisson_fit(
             &model,
-            &[0.0, 2.0],
+            &[0.0, 3.0],
             &mut bounded(0.0, 1.5),
             &PoissonConfig::default(),
         )
@@ -1664,6 +1657,51 @@ mod tests {
             result.converged && result.iterations == 0 && result.params[0] == 0.0,
             "{result:?}"
         );
+    }
+
+    struct Plane {
+        jacobian: [[f64; 2]; 2],
+    }
+
+    impl FitModel for Plane {
+        fn evaluate(&self, params: &[f64]) -> Result<Vec<f64>, FittingError> {
+            Ok(self
+                .jacobian
+                .iter()
+                .map(|row| 1.0 + row[0] * params[0] + row[1] * params[1])
+                .collect())
+        }
+
+        fn analytical_jacobian(
+            &self,
+            _params: &[f64],
+            free_param_indices: &[usize],
+            _y_current: &[f64],
+        ) -> Option<FlatMatrix> {
+            let mut jacobian = FlatMatrix::zeros(2, free_param_indices.len());
+            jacobian.data.copy_from_slice(self.jacobian.as_flattened());
+            Some(jacobian)
+        }
+    }
+
+    #[test]
+    fn a_weak_direction_keeps_its_share_of_the_newton_decrement() {
+        let model = Plane {
+            jacobian: [[1.0, 1.0], [1.0e-14, -1.0e-14]],
+        };
+        let observed: [f64; 2] = [0.999, 0.998999];
+        let decrement = 0.5 * observed.iter().map(|y| (1.0 - y).powi(2)).sum::<f64>();
+        assert!(decrement > NEWTON_DECREMENT_TOL);
+        let mut params = ParameterSet::new(vec![
+            FitParameter::unbounded("a", 0.0),
+            FitParameter::unbounded("b", 0.0),
+        ]);
+        let config = PoissonConfig {
+            max_iter: 0,
+            ..PoissonConfig::default()
+        };
+        let result = poisson_fit(&model, &observed, &mut params, &config).unwrap();
+        assert!(!result.converged, "{result:?}");
     }
 
     struct SilentZeroBin;
