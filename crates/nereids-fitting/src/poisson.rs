@@ -65,7 +65,7 @@ pub struct PoissonResult {
     /// Covariance of the free parameters; the rows and columns of a
     /// parameter without an error bar are NaN.  `None` when the fit did not
     /// converge, covariance computation is disabled, or the SVD of the
-    /// information did not converge.
+    /// weighted Jacobian did not converge.
     pub covariance: Option<FlatMatrix>,
     /// Standard error of each free parameter; `None` for a parameter on a
     /// bound or with a component along a direction the data do not
@@ -1689,19 +1689,27 @@ mod tests {
         let model = Plane {
             jacobian: [[1.0, 1.0], [1.0e-14, -1.0e-14]],
         };
-        let observed: [f64; 2] = [0.999, 0.998999];
-        let decrement = 0.5 * observed.iter().map(|y| (1.0 - y).powi(2)).sum::<f64>();
-        assert!(decrement > NEWTON_DECREMENT_TOL);
-        let mut params = ParameterSet::new(vec![
-            FitParameter::unbounded("a", 0.0),
-            FitParameter::unbounded("b", 0.0),
-        ]);
         let config = PoissonConfig {
             max_iter: 0,
             ..PoissonConfig::default()
         };
-        let result = poisson_fit(&model, &observed, &mut params, &config).unwrap();
-        assert!(!result.converged, "{result:?}");
+        for observed in [[0.999, 0.998999], [0.999, 0.999001]] {
+            let decrement = 0.5
+                * observed
+                    .iter()
+                    .map(|y: &f64| (1.0 - y).powi(2))
+                    .sum::<f64>();
+            let mut params = ParameterSet::new(vec![
+                FitParameter::unbounded("a", 0.0),
+                FitParameter::unbounded("b", 0.0),
+            ]);
+            let result = poisson_fit(&model, &observed, &mut params, &config).unwrap();
+            assert_eq!(
+                result.converged,
+                decrement < NEWTON_DECREMENT_TOL,
+                "{decrement:e}: {result:?}"
+            );
+        }
     }
 
     struct SilentZeroBin;
