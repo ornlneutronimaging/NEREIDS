@@ -64,8 +64,7 @@ pub struct PoissonResult {
     pub params: Vec<f64>,
     /// Covariance of the free parameters; the rows and columns of a
     /// parameter without an error bar are NaN.  `None` when the fit did not
-    /// converge, covariance computation is disabled, or the SVD of the
-    /// weighted Jacobian did not converge.
+    /// converge or covariance computation is disabled.
     pub covariance: Option<FlatMatrix>,
     /// Standard error of each free parameter; `None` for a parameter on a
     /// bound or with a component along a direction the data do not
@@ -315,18 +314,18 @@ impl Decomposition {
             .map(|s| s * s >= DEGENERATE_EIGENVALUE)
             .collect();
         let largest = self.singular.iter().fold(0.0_f64, |m, &s| m.max(s));
-        let smallest_determined = (0..n)
-            .filter(|&k| determined[k])
-            .fold(largest, |m, k| m.min(self.singular[k]));
-        let rounding =
-            (f64::EPSILON * self.rows.max(n) as f64 * largest / smallest_determined).powi(2);
         let resolved: Vec<bool> = (0..n)
             .map(|i| {
+                let sensitivity: f64 = (0..n)
+                    .filter(|&k| determined[k])
+                    .map(|k| self.right[k][i].abs() / self.singular[k])
+                    .sum();
+                let rounding = f64::EPSILON * self.rows.max(n) as f64 * largest * sensitivity;
                 (0..n)
                     .filter(|&k| !determined[k])
                     .map(|k| self.right[k][i].powi(2))
                     .sum::<f64>()
-                    <= rounding
+                    <= rounding.powi(2)
             })
             .collect();
         let variance = |i: usize, j: usize| -> f64 {
@@ -503,23 +502,24 @@ pub fn poisson_fit(
         .iter()
         .map(|&idx| on_bound(&params.params[idx]))
         .collect();
-    let (covariance, uncertainties) = match &at_minimum {
+    let (converged, covariance, uncertainties) = match &at_minimum {
         Some(linear) if config.compute_covariance => {
             let interior: Vec<usize> = (0..free.len()).filter(|&j| !bounded[j]).collect();
             match Decomposition::new(&linear.weighted, &interior) {
                 Some(decomposition) => {
                     let (covariance, errors) = decomposition.error_bars(free.len());
-                    (Some(covariance), Some(errors))
+                    (true, Some(covariance), Some(errors))
                 }
-                None => (None, None),
+                None => (false, None, None),
             }
         }
-        _ => (None, None),
+        Some(_) => (true, None, None),
+        None => (false, None, None),
     };
     Ok(PoissonResult {
         deviance: value,
         iterations,
-        converged: at_minimum.is_some(),
+        converged,
         params: params.all_values(),
         covariance,
         uncertainties,
@@ -1664,16 +1664,18 @@ mod tests {
         );
     }
 
-    struct Plane {
-        jacobian: [[f64; 2]; 2],
+    struct Affine {
+        offset: Vec<f64>,
+        jacobian: Vec<[f64; 2]>,
     }
 
-    impl FitModel for Plane {
+    impl FitModel for Affine {
         fn evaluate(&self, params: &[f64]) -> Result<Vec<f64>, FittingError> {
             Ok(self
-                .jacobian
+                .offset
                 .iter()
-                .map(|row| 1.0 + row[0] * params[0] + row[1] * params[1])
+                .zip(&self.jacobian)
+                .map(|(offset, row)| offset + row[0] * params[0] + row[1] * params[1])
                 .collect())
         }
 
@@ -1683,20 +1685,31 @@ mod tests {
             free_param_indices: &[usize],
             _y_current: &[f64],
         ) -> Option<FlatMatrix> {
-            let mut jacobian = FlatMatrix::zeros(2, free_param_indices.len());
+            let mut jacobian = FlatMatrix::zeros(self.offset.len(), free_param_indices.len());
             jacobian.data.copy_from_slice(self.jacobian.as_flattened());
             Some(jacobian)
         }
     }
 
-    #[test]
-    fn a_weak_direction_keeps_its_share_of_the_newton_decrement() {
-        let model = Plane {
-            jacobian: [[1.0, 1.0], [1.0e-14, -1.0e-14]],
-        };
-        let config = PoissonConfig {
+    fn two_free() -> ParameterSet {
+        ParameterSet::new(vec![
+            FitParameter::unbounded("a", 0.0),
+            FitParameter::unbounded("b", 0.0),
+        ])
+    }
+
+    fn at_the_start() -> PoissonConfig {
+        PoissonConfig {
             max_iter: 0,
             ..PoissonConfig::default()
+        }
+    }
+
+    #[test]
+    fn a_weak_direction_keeps_its_share_of_the_newton_decrement() {
+        let model = Affine {
+            offset: vec![1.0; 2],
+            jacobian: vec![[1.0, 1.0], [1.0e-14, -1.0e-14]],
         };
         for observed in [[0.999, 0.998999], [0.999, 0.999001]] {
             let decrement = 0.5
@@ -1704,11 +1717,45 @@ mod tests {
                     .iter()
                     .map(|y: &f64| (1.0 - y).powi(2))
                     .sum::<f64>();
-            let mut params = ParameterSet::new(vec![
-                FitParameter::unbounded("a", 0.0),
-                FitParameter::unbounded("b", 0.0),
-            ]);
-            let result = poisson_fit(&model, &observed, &mut params, &config).unwrap();
+            let result = poisson_fit(&model, &observed, &mut two_free(), &at_the_start()).unwrap();
+            assert_eq!(
+                result.converged,
+                decrement < NEWTON_DECREMENT_TOL,
+                "{decrement:e}: {result:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn a_zero_bin_slope_enters_every_direction_of_the_decrement() {
+        let jacobian: Vec<[f64; 2]> = vec![[1.0, 2.0], [1.0, 3.0], [2.0, -1.0]];
+        let offset: Vec<f64> = vec![0.0, 4.0, 9.0];
+        let root = [offset[1].sqrt(), offset[2].sqrt()];
+        let w = [
+            [jacobian[1][0] / root[0], jacobian[1][1] / root[0]],
+            [jacobian[2][0] / root[1], jacobian[2][1] / root[1]],
+        ];
+        let information = |a: usize, b: usize| w[0][a] * w[0][b] + w[1][a] * w[1][b];
+        let inverse_00 =
+            information(1, 1) / (information(0, 0) * information(1, 1) - information(0, 1).powi(2));
+        let transpose_det = w[0][0] * w[1][1] - w[1][0] * w[0][1];
+        for decrement in [0.99e-6_f64, 1.01e-6] {
+            let gradient = [(2.0 * decrement / inverse_00).sqrt(), 0.0];
+            let rhs = [gradient[0] - jacobian[0][0], gradient[1] - jacobian[0][1]];
+            let residual = [
+                (rhs[0] * w[1][1] - w[1][0] * rhs[1]) / transpose_det,
+                (w[0][0] * rhs[1] - w[0][1] * rhs[0]) / transpose_det,
+            ];
+            let observed = [
+                0.0,
+                offset[1] - residual[0] * root[0],
+                offset[2] - residual[1] * root[1],
+            ];
+            let model = Affine {
+                offset: offset.clone(),
+                jacobian: jacobian.clone(),
+            };
+            let result = poisson_fit(&model, &observed, &mut two_free(), &at_the_start()).unwrap();
             assert_eq!(
                 result.converged,
                 decrement < NEWTON_DECREMENT_TOL,
