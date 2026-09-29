@@ -27,6 +27,7 @@ const TEMPERATURE_K: f64 = 300.0;
 const CHARGE_RATIO: f64 = 1.2;
 const THIN: f64 = 7.687e-4;
 const SATURATED: f64 = 3.844e-2;
+const TERMS: [f64; 4] = [0.93, 0.05, 0.5, 0.0];
 
 struct Setup {
     edges: Vec<f64>,
@@ -128,24 +129,41 @@ fn expected_at(
     )
 }
 
+fn with_background(
+    setup: &Setup,
+    beam: &dyn Fn(f64) -> f64,
+    sample: &[(ResonanceData, f64)],
+    temperature_k: f64,
+    [a, back_a, back_b, back_c]: [f64; 4],
+) -> (Vec<f64>, Vec<f64>) {
+    let (open, transmitted) = expected_at(setup, beam, sample, temperature_k);
+    let scattered = |u: f64| a * beam(u) * (back_a + back_b * u / CLOCK + back_c * CLOCK / u);
+    let (_, scattered) = expected_at(setup, &scattered, &[], temperature_k);
+    let sample = transmitted.iter().zip(&scattered).map(|(t, b)| a * t + b);
+    (open, sample.collect())
+}
+
 fn rounded(counts: &[f64]) -> Vec<f64> {
     counts.iter().map(|c| c.round()).collect()
 }
 
-fn live_fractions(expected: &[f64]) -> Vec<f64> {
-    let most = expected.iter().fold(0.0_f64, |m, &mu| m.max(mu));
-    expected
-        .iter()
-        .map(|mu| 1.0 / (1.0 + 0.25 * mu / most))
-        .collect()
-}
-
-fn recorded(expected: &[f64], live: &[f64]) -> Vec<f64> {
-    expected
-        .iter()
-        .zip(live)
-        .map(|(mu, l)| (l * mu).round())
-        .collect()
+fn recorded(
+    setup: &Setup,
+    (open, sample): (Vec<f64>, Vec<f64>),
+    isotopes: &[(ResonanceData, f64)],
+) -> Measurement {
+    let live = |mu: &[f64]| -> Vec<f64> {
+        let most = mu.iter().fold(0.0_f64, |m, &c| m.max(c));
+        mu.iter().map(|c| 1.0 / (1.0 + 0.25 * c / most)).collect()
+    };
+    let (open_live, sample_live) = (live(&open), live(&sample));
+    let times =
+        |mu: &[f64], live: &[f64]| mu.iter().zip(live).map(|(c, l)| (l * c).round()).collect();
+    let counts = (times(&open, &open_live), times(&sample, &sample_live));
+    let mut m = measurement(setup, counts, isotopes);
+    m.open_live = Some(open_live);
+    m.sample_live = Some(sample_live);
+    m
 }
 
 fn calibration(setup: &Setup) -> Calibration {
@@ -167,6 +185,8 @@ fn measurement(
         open_live: None,
         sample_live: None,
         charge_ratio: CHARGE_RATIO,
+        normalization: Value::Known(1.0),
+        background: [Value::Known(0.0); 3],
         isotopes: isotopes.to_vec(),
         temperature_k: Value::Known(TEMPERATURE_K),
     }
@@ -186,22 +206,34 @@ fn error_bar(fit: &CountsFit, i: usize) -> f64 {
 }
 
 #[test]
-fn densities_are_recovered_from_starts_on_either_side() {
+fn densities_normalization_and_background_are_recovered_from_starts_on_either_side() {
     let setup = standard();
     for truth in [THIN, SATURATED] {
         let isotope = hafnium_like(20.0);
-        let (open, sample) = expected(&setup, &beam(1.0e6), &[(isotope.clone(), truth)]);
-        let live = (live_fractions(&open), live_fractions(&sample));
-        let counts = (recorded(&open, &live.0), recorded(&sample, &live.1));
-        for start in [0.5 * truth, 2.0 * truth] {
-            let mut m = measurement(&setup, counts.clone(), &[(isotope.clone(), start)]);
-            m.open_live = Some(live.0.clone());
-            m.sample_live = Some(live.1.clone());
+        let sample = [(isotope.clone(), truth)];
+        let counts = with_background(&setup, &beam(1.0e6), &sample, TEMPERATURE_K, TERMS);
+        for (start, a, back_a, back_b) in [
+            (0.5 * truth, 1.0, 0.02, 0.2),
+            (2.0 * truth, 0.85, 0.12, 0.8),
+        ] {
+            let mut m = recorded(&setup, counts.clone(), &[(isotope.clone(), start)]);
+            m.normalization = Value::Fitted(a);
+            m.background[0] = Value::Fitted(back_a);
+            m.background[1] = Value::Fitted(back_b);
             let fit = fit_counts(&m, &calibration(&setup)).expect("fit");
             assert!(fit.converged, "{truth} from {start}");
             assert_eq!(fit.overdispersion, Some(1.0), "{truth} from {start}");
-            let pull = (fit.densities[0] - truth) / error_bar(&fit, 0);
-            assert!(pull.abs() <= BOUND.sqrt(), "{truth} from {start}: {pull}");
+            let pull = |i: usize, x: f64, t: f64| (x - t) / error_bar(&fit, i);
+            let pulls = [
+                pull(0, fit.densities[0], truth),
+                pull(1, fit.normalization, TERMS[0]),
+                pull(2, fit.background[0], TERMS[1]),
+                pull(3, fit.background[1], TERMS[2]),
+            ];
+            assert!(
+                pulls.iter().all(|p| p.abs() <= BOUND.sqrt()),
+                "{truth} from {start}: {pulls:?}"
+            );
         }
     }
 }
@@ -544,23 +576,26 @@ fn inverse(mut a: Vec<Vec<f64>>) -> Vec<Vec<f64>> {
 
 #[test]
 fn the_covariance_is_the_inverse_of_the_information_in_the_counts() {
-    for temperature_k in [Value::Known(TEMPERATURE_K), Value::Fitted(1000.0)] {
-        covariance_against_information(temperature_k);
-    }
+    covariance_against_information(Value::Known(TEMPERATURE_K), Value::Fitted);
+    covariance_against_information(Value::Fitted(1000.0), Value::Known);
 }
 
-fn covariance_against_information(temperature: Value) {
+fn covariance_against_information(temperature: Value, scale: fn(f64) -> Value) {
     let setup = standard();
     let truth = [
         (hafnium_like(20.0), 3.0 / 7805.1),
         (synthetic_isotope(74, 182, 20.3, 0.01, 0.06), 1.5 / 7805.1),
     ];
-    let counts = expected(&setup, &beam(1.0e6), &truth);
-    let mut m = measurement(&setup, (rounded(&counts.0), rounded(&counts.1)), &truth);
+    let counts = with_background(&setup, &beam(1.0e6), &truth, TEMPERATURE_K, TERMS);
+    let mut m = recorded(&setup, counts, &truth);
     m.temperature_k = temperature;
+    m.normalization = scale(TERMS[0]);
+    m.background[0] = scale(TERMS[1]);
+    m.background[1] = scale(TERMS[2]);
     let fit = fit_counts(&m, &calibration(&setup)).expect("fit");
     let fitted_temperature = matches!(temperature, Value::Fitted(_));
-    let quantities = truth.len() + usize::from(fitted_temperature);
+    let scales = matches!(m.normalization, Value::Fitted(_));
+    let quantities = truth.len() + usize::from(fitted_temperature) + 3 * usize::from(scales);
     let (low, high) = FlightTimeGrid::new(&setup.edges, T0_US, &setup.pulse)
         .expect("grid")
         .range_us();
@@ -584,13 +619,31 @@ fn covariance_against_information(temperature: Value) {
         let pull = (fit.temperature_k - TEMPERATURE_K) / error_bar(&fit, truth.len());
         assert!(pull.abs() <= BOUND.sqrt(), "temperature: {pull}");
     }
+    let mut terms = [fit.normalization; 4];
+    terms[1..].copy_from_slice(&fit.background);
+    let first_term = truth.len() + usize::from(fitted_temperature);
+    for i in (0..3).filter(|_| scales) {
+        let pull = (terms[i] - TERMS[i]) / error_bar(&fit, first_term + i);
+        assert!(pull.abs() <= BOUND.sqrt(), "term {i}: {pull}");
+    }
     let fitted: Vec<(ResonanceData, f64)> = truth
         .iter()
         .zip(&fit.densities)
         .map(|((data, _), &n)| (data.clone(), n))
         .collect();
+    let live: Vec<f64> = m
+        .open_live
+        .iter()
+        .chain(&m.sample_live)
+        .flatten()
+        .copied()
+        .collect();
     let joined = |(open, sample): (Vec<f64>, Vec<f64>)| -> Vec<f64> {
-        open.into_iter().chain(sample).collect()
+        let counts = open.into_iter().chain(sample);
+        counts.zip(&live).map(|(c, l)| l * c).collect()
+    };
+    let expected_at = |setup: &Setup, beam: &dyn Fn(f64) -> f64, sample: &[_], kelvin: f64| {
+        with_background(setup, beam, sample, kelvin, terms)
     };
     let temperature_k = fit.temperature_k;
     let mu = joined(expected_at(
@@ -619,11 +672,18 @@ fn covariance_against_information(temperature: Value) {
                         joined(expected_at(&setup, &beam, &sample, temperature_k)),
                         h,
                     )
-                } else {
+                } else if p < first_term + coefficients {
                     let h = 1e-4 * temperature_k;
                     let beam = beam_times(None, 0.0);
                     let shifted_k = temperature_k + sign * h;
                     (joined(expected_at(&setup, &beam, &fitted, shifted_k)), h)
+                } else {
+                    let mut shifted = terms;
+                    let h = 1e-4 * terms[p - first_term - coefficients];
+                    shifted[p - first_term - coefficients] += sign * h;
+                    let beam = beam_times(None, 0.0);
+                    let counts = with_background(&setup, &beam, &fitted, temperature_k, shifted);
+                    (joined(counts), h)
                 }
             };
             let ((up, h), (down, _)) = (shifted(1.0), shifted(-1.0));
@@ -704,6 +764,13 @@ fn measurements_the_fit_does_not_describe_are_refused() {
     invalid(&|m| m.sample_counts.iter_mut().for_each(|c| *c = 0.0));
     invalid(&|m| m.charge_ratio = 0.0);
     invalid(&|m| m.charge_ratio = f64::NAN);
+    invalid(&|m| m.normalization = Value::Fitted(0.0));
+    invalid(&|m| m.normalization = Value::Known(f64::INFINITY));
+    invalid(&|m| m.background[1] = Value::Fitted(f64::NAN));
+    assert!(matches!(
+        refused(&|m| m.background[0] = Value::Fitted(-2.0)),
+        PipelineError::UnmodelledCounts { run: "sample", .. }
+    ));
     invalid(&|m| m.isotopes.clear());
     invalid(&|m| m.isotopes.push((isotope.clone(), THIN)));
     invalid(&|m| m.isotopes[0].1 = -1.0);

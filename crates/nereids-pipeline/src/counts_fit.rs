@@ -40,6 +40,13 @@ impl Value {
             Self::Known(v) | Self::Fitted(v) => v,
         }
     }
+
+    fn parameter(self, name: &'static str) -> FitParameter {
+        match self {
+            Self::Known(v) => FitParameter::fixed(name, v),
+            Self::Fitted(v) => FitParameter::unbounded(name, v),
+        }
+    }
 }
 
 /// An open-beam run and a sample run recorded in the same time bins.
@@ -60,6 +67,13 @@ pub struct Measurement {
     /// The sample run's beam over the open-beam run's, the ratio of their
     /// proton charges.
     pub charge_ratio: f64,
+    /// `a`, the normalization of the sample run, known or fitted from the
+    /// value given.
+    pub normalization: Value,
+    /// `BackA`, `BackB` in √eV and `BackC` in 1/√eV of the background
+    /// `b(E) = BackA + BackB/√E + BackC·√E`, each known or fitted from the
+    /// value given.
+    pub background: [Value; 3],
     /// Each isotope in the sample with the areal density, in atoms/barn, the
     /// fit starts from.
     pub isotopes: Vec<(ResonanceData, f64)>,
@@ -67,15 +81,21 @@ pub struct Measurement {
     pub temperature_k: Value,
 }
 
-/// The fitted densities and temperature.
+/// The fitted densities, temperature, normalization and background.
 #[derive(Debug, Clone)]
 pub struct CountsFit {
     /// Areal density of each isotope in atoms/barn, in the order given.
     pub densities: Vec<f64>,
     /// The sample's temperature in K: the known one, or the fitted one.
     pub temperature_k: f64,
+    /// The normalization `a`: the known one, or the fitted one.
+    pub normalization: f64,
+    /// `BackA`, `BackB` in √eV and `BackC` in 1/√eV, each the known or the
+    /// fitted one.  SAMMY's card-set-6 values are `normalization` times these.
+    pub background: [f64; 3],
     /// Covariance of the densities, in the order given, then of the
-    /// temperature when it is fitted: the inverse of the expected information
+    /// temperature, the normalization, `BackA`, `BackB` and `BackC`, each when
+    /// it is fitted: the inverse of the expected information
     /// at the fit, scaled by `overdispersion`, or at the Poisson scale when
     /// that is `None`.  The row and column of a density on its bound of 0, or
     /// of a quantity the counts do not determine, are NaN; every entry is NaN
@@ -112,17 +132,29 @@ pub struct CountsFit {
     pub halvings: usize,
 }
 
-/// Fit the isotopes' areal densities, and the temperature unless it is
-/// known, to the raw counts of both runs of `measurement`.  The open-beam
-/// counts are `O_k = ℓ^O_k Σ_j w φ(u_j) P_k(u_j)` and the sample counts
-/// `S_k = ℓ^S_k c Σ_j w φ(u_j) T(E_j) P_k(u_j)` on a uniform flight-time grid,
-/// with `T = exp(−Σ_i n_i σ_i)`, `σ_i` the isotope's Doppler-broadened total
-/// cross section, `c` the charge ratio, `ℓ^O_k` and `ℓ^S_k` each run's live
-/// fraction and `P_k` the chance of a neutron arriving in bin `k`.  The beam
-/// `φ` has the intervals [`fit_open_beam`] chooses and is fitted with the
-/// densities to both runs, starting from the open-beam fit.  There is no
-/// background term: background counts bias the densities, and are refused
-/// only where the model predicts none.
+/// Fit the isotopes' areal densities, and the temperature, normalization and
+/// background terms that are not known, to the raw counts of both runs of
+/// `measurement`.  On a uniform grid of flight times `u_i`, energies `E_i` and
+/// step `w`, the counts in bin `k` are
+///
+/// ```text
+/// O_k  = ℓ^O_k · w Σ_i φ_i P_ki
+/// S_k  = ℓ^S_k · c_q · a · w Σ_i φ_i [T_i + b(E_i)] P_ki
+/// T_i  = exp(−Σ_m n_m σ_m(E_i))
+/// b(E) = BackA + BackB/√E + BackC·√E
+/// ```
+///
+/// with `φ_i` the beam per µs, `P_ki` the chance of a neutron at `u_i`
+/// arriving in bin `k`, `n_m` and `σ_m` each isotope's density and
+/// Doppler-broadened total cross section, `c_q` the charge ratio, `a` the
+/// normalization and `ℓ^O_k`, `ℓ^S_k` each run's live fraction.  The
+/// background is beam neutrons that reach the detector another way, so it
+/// passes through the pulse and scales with the normalization; SAMMY's
+/// `BackA`, `BackB`, `BackC` (`cro/mnrm1.f90`) are `a` times these, to within
+/// the background's change over the pulse's delay.  Counts that bypass the
+/// pulse, such as gammas, are not modelled.  The beam `φ` has the intervals
+/// [`fit_open_beam`] chooses and is fitted with the rest to both runs,
+/// starting from the open-beam fit.
 ///
 /// The grid's first step is at most half the narrowest Doppler full width at
 /// half maximum, in flight time, of any resonance inside its energy span, at
@@ -147,17 +179,19 @@ pub struct CountsFit {
 /// live fraction when given, per bin;
 /// [`PipelineError::InvalidParameter`] if a count is not a whole non-negative
 /// number, a run has no counts, a live fraction is not in (0, 1], the charge
-/// ratio is not finite and positive, there are no isotopes, an isotope is
-/// listed twice, a starting density is not finite and non-negative, the
-/// temperature or its start is outside 1–5000 K, an isotope's resonance data
-/// are not finite, or the energies its broadened cross section reads, at the
-/// known temperature or at 5000 K for a fitted one, down to zero for a window
-/// within the thermal spread of zero energy, are not inside a single one of
-/// its evaluated (SLBW, MLBW or Reich–Moore) resolved ranges;
+/// ratio or the normalization is not finite and positive, a background term
+/// is not finite,
+/// there are no isotopes, an isotope is listed twice, a starting density is
+/// not finite and non-negative, the temperature or its start is outside
+/// 1–5000 K, an isotope's resonance data are not finite, or the energies its
+/// broadened cross section reads, at the known temperature or at 5000 K for a
+/// fitted one, down to zero for a window within the thermal spread of zero
+/// energy, are not inside a single one of its evaluated (SLBW, MLBW or
+/// Reich–Moore) resolved ranges;
 /// [`PipelineError::UnmodelledCounts`] if at the fit, converged or not, a bin
-/// holds counts predicted below [`NEGLIGIBLE_PREDICTION`]: background, or
-/// starting densities whose transmission vanishes where counts were recorded,
-/// which the fitter cannot leave;
+/// holds counts predicted below [`NEGLIGIBLE_PREDICTION`]: starting values
+/// predicting no counts, or negative ones, where counts were recorded, which
+/// the fitter cannot leave;
 /// everything [`fit_open_beam`] refuses; [`PipelineError::FlightTimeGrid`]
 /// for the grid's refusals, including more points than it allows;
 /// [`PipelineError::Fitting`] if the fitter fails, or the cross sections
@@ -173,6 +207,8 @@ pub fn fit_counts(
         open_live,
         sample_live,
         charge_ratio,
+        normalization,
+        background,
         isotopes,
         temperature_k,
     } = measurement;
@@ -180,6 +216,13 @@ pub fn fit_counts(
     if !(charge_ratio.is_finite() && *charge_ratio > 0.0) {
         return invalid(format!(
             "the charge ratio must be finite and positive, got {charge_ratio}"
+        ));
+    }
+    let a = normalization.value();
+    if !(a.is_finite() && a > 0.0 && background.iter().all(|b| b.value().is_finite())) {
+        return invalid(format!(
+            "the normalization must be finite and positive and the background finite, \
+             got {normalization:?} and {background:?}"
         ));
     }
     if isotopes.is_empty() {
@@ -308,6 +351,13 @@ pub fn fit_counts(
                     .map(|(i, (_, n))| FitParameter::non_negative(format!("density {i}"), *n)),
             )
             .chain(std::iter::once(temperature))
+            .chain(std::iter::once(normalization.parameter("normalization")))
+            .chain(
+                ["BackA", "BackB", "BackC"]
+                    .into_iter()
+                    .zip(background)
+                    .map(|(name, term)| term.parameter(name)),
+            )
             .collect(),
     );
     let resonances: Arc<[ResonanceData]> = isotopes.iter().map(|(data, _)| data.clone()).collect();
@@ -376,6 +426,8 @@ pub fn fit_counts(
     Ok(CountsFit {
         densities: fit.result.params[beam_coefficients..temperature_index].to_vec(),
         temperature_k: fit.result.params[temperature_index],
+        normalization: fit.result.params[temperature_index + 1],
+        background: [2, 3, 4].map(|i| fit.result.params[temperature_index + i]),
         covariance,
         beam: open
             .beam
@@ -428,7 +480,9 @@ struct TwoRunModel {
     beam: OpenBeamModel,
     isotopes: Arc<[ResonanceData]>,
     energies: Vec<f64>,
+    shapes: [Vec<f64>; 3],
     charge_ratio: f64,
+    temperature_index: usize,
     cross_sections: RefCell<Option<CrossSections>>,
 }
 
@@ -446,12 +500,19 @@ impl TwoRunModel {
         charge_ratio: f64,
     ) -> Self {
         let mut energies = grid.energies_ev();
+        let shapes = [
+            vec![1.0; energies.len()],
+            energies.iter().map(|e| 1.0 / e.sqrt()).collect(),
+            energies.iter().map(|e| e.sqrt()).collect(),
+        ];
         energies.reverse();
         Self {
             beam: OpenBeamModel::new(grid, beam),
             isotopes: Arc::clone(isotopes),
             energies,
+            shapes,
             charge_ratio,
+            temperature_index: beam.coefficients().len() + isotopes.len(),
             cross_sections: RefCell::new(None),
         }
     }
@@ -489,31 +550,39 @@ impl TwoRunModel {
         }))
     }
 
-    fn beams(&self, params: &[f64]) -> Result<(Vec<f64>, Vec<f64>), FittingError> {
-        let densities = &params[params.len() - 1 - self.isotopes.len()..params.len() - 1];
-        let sigma = self.at(params[params.len() - 1])?;
-        let open = self
-            .beam
-            .beam(&params[..params.len() - 1 - self.isotopes.len()]);
-        let sample = open
+    fn beams(&self, params: &[f64]) -> Result<[Vec<f64>; 4], FittingError> {
+        let t = self.temperature_index;
+        let densities = &params[t - self.isotopes.len()..t];
+        let sigma = self.at(params[t])?;
+        let open = self.beam.beam(&params[..t - self.isotopes.len()]);
+        let normalized: Vec<f64> = open
+            .iter()
+            .map(|phi| self.charge_ratio * params[t + 1] * phi)
+            .collect();
+        let (transmitted, sample) = normalized
             .iter()
             .enumerate()
-            .map(|(j, phi)| {
+            .map(|(j, beam)| {
                 let depth: f64 = densities
                     .iter()
                     .zip(&sigma.values)
                     .map(|(n, sigma)| n * sigma[j])
                     .sum();
-                self.charge_ratio * phi * (-depth).exp()
+                let background: f64 = params[t + 2..]
+                    .iter()
+                    .zip(&self.shapes)
+                    .map(|(b, g)| b * g[j])
+                    .sum();
+                (beam * (-depth).exp(), beam * ((-depth).exp() + background))
             })
-            .collect();
-        Ok((open, sample))
+            .unzip();
+        Ok([open, sample, transmitted, normalized])
     }
 }
 
 impl FitModel for TwoRunModel {
     fn evaluate(&self, params: &[f64]) -> Result<Vec<f64>, FittingError> {
-        let (open, sample) = self.beams(params)?;
+        let [open, sample, ..] = self.beams(params)?;
         let mut counts = self.beam.counts(&open)?;
         counts.extend(self.beam.counts(&sample)?);
         Ok(counts)
@@ -525,19 +594,20 @@ impl FitModel for TwoRunModel {
         free_param_indices: &[usize],
         y_current: &[f64],
     ) -> Option<FlatMatrix> {
-        let (open, sample) = self.beams(params).ok()?;
-        let sigma = self.at(params[params.len() - 1]).ok()?;
-        let temperature_index = params.len() - 1;
+        let [open, sample, transmitted, normalized] = self.beams(params).ok()?;
+        let temperature_index = self.temperature_index;
+        let sigma = self.at(params[temperature_index]).ok()?;
         let beam_coefficients = temperature_index - self.isotopes.len();
         let mut jacobian = FlatMatrix::zeros(y_current.len(), free_param_indices.len());
         for (col, &index) in free_param_indices.iter().enumerate() {
-            let (open_slope, sample_slope) = if index < beam_coefficients {
+            let (open_slope, (base, sample_slope)) = if index < beam_coefficients {
                 let slope = self.beam.log_slope(index);
-                (slope.clone(), slope)
+                (slope.clone(), (&sample, slope))
             } else if index < temperature_index {
                 let values = &sigma.values[index - beam_coefficients];
-                (vec![0.0; open.len()], values.iter().map(|s| -s).collect())
-            } else {
+                let slope = values.iter().map(|s| -s).collect();
+                (vec![0.0; open.len()], (&transmitted, slope))
+            } else if index == temperature_index {
                 let broadening: Vec<f64> = (0..open.len())
                     .map(|j| {
                         -params[beam_coefficients..temperature_index]
@@ -547,13 +617,19 @@ impl FitModel for TwoRunModel {
                             .sum::<f64>()
                     })
                     .collect();
-                (vec![0.0; open.len()], broadening)
+                (vec![0.0; open.len()], (&transmitted, broadening))
+            } else if index == temperature_index + 1 {
+                let slope = vec![1.0 / params[index]; open.len()];
+                (vec![0.0; open.len()], (&sample, slope))
+            } else {
+                let shape = self.shapes[index - temperature_index - 2].clone();
+                (vec![0.0; open.len()], (&normalized, shape))
             };
             let times = |beam: &[f64], slope: &[f64]| -> Vec<f64> {
                 beam.iter().zip(slope).map(|(b, s)| b * s).collect()
             };
             let open_column = self.beam.counts(&times(&open, &open_slope)).ok()?;
-            let sample_column = self.beam.counts(&times(&sample, &sample_slope)).ok()?;
+            let sample_column = self.beam.counts(&times(base, &sample_slope)).ok()?;
             for (row, value) in open_column.into_iter().chain(sample_column).enumerate() {
                 *jacobian.get_mut(row, col) = value;
             }
@@ -580,7 +656,7 @@ mod tests {
         ]);
         let params: Vec<f64> = (0..beam.coefficients().len())
             .map(|i| 9.0 + 0.3 * (i as f64).sin())
-            .chain([3.0e-4, 5.0e-4, 300.0])
+            .chain([3.0e-4, 5.0e-4, 300.0, 0.93, 0.05, 0.5, -0.01])
             .collect();
         let model = TwoRunModel::new(&grid, &beam, &isotopes, 1.2);
         let live: Vec<f64> = (0..model.evaluate(&params).expect("counts").len())
@@ -589,7 +665,7 @@ mod tests {
         let model = Recorded { model, live: &live };
         let counts = model.evaluate(&params).expect("counts");
         let mut colder = params.clone();
-        *colder.last_mut().expect("a temperature") = 250.0;
+        colder[model.model.temperature_index] = 250.0;
         model.evaluate(&colder).expect("counts");
         let indices: Vec<usize> = (0..params.len()).collect();
         let jacobian = model
@@ -616,6 +692,50 @@ mod tests {
                     "{index} {row}: {analytic} vs {slope}"
                 );
             }
+        }
+    }
+
+    #[test]
+    fn the_background_lags_sammy_s_by_the_pulse_s_mean_delay() {
+        let grid = grid(None);
+        let (_, u_hi) = grid.range_us();
+        let beam = BeamSpline::constant(347.0, u_hi, 1.0e4);
+        let isotopes: Arc<[ResonanceData]> = Arc::new([
+            synthetic_isotope(72, 180, 20.0, 0.01, 0.06),
+            synthetic_isotope(74, 182, 20.3, 0.01, 0.06),
+        ]);
+        let (charge_ratio, normalization) = (1.2, 0.93);
+        let model = TwoRunModel::new(&grid, &beam, &isotopes, charge_ratio);
+        let counts = |background: [f64; 3]| {
+            let params: Vec<f64> = beam
+                .coefficients()
+                .iter()
+                .copied()
+                .chain([3.0e-4, 5.0e-4, 300.0, normalization])
+                .chain(background)
+                .collect();
+            model.evaluate(&params).expect("counts")
+        };
+        let [back_a, back_b, back_c] = [0.05, 0.5, -0.01];
+        let (with, without) = (counts([back_a, back_b, back_c]), counts([0.0; 3]));
+        let bins = with.len() / 2;
+        let clock = TOF_FACTOR * 25.0;
+        for k in 0..bins {
+            let u = 350.5 + k as f64 - 3.0;
+            let root_e = clock / u;
+            let b = back_a + back_b / root_e + back_c * root_e;
+            let slope = back_b / clock - back_c * clock / (u * u);
+            let curvature = 2.0 * back_c * clock / u.powi(3);
+            let (alpha, beta, r) = (0.35 * root_e + 0.05, 0.25, 0.15);
+            let mean = 3.0 / alpha + r / beta;
+            let square = mean * mean + 3.0 / (alpha * alpha) + r * (2.0 - r) / (beta * beta);
+            let lagged = (with[bins + k] - without[bins + k]) / (charge_ratio * normalization);
+            let residual = lagged / with[k] - b + slope * mean;
+            let tolerance = 0.5 * slope.abs() + 0.5 * curvature.abs() * square;
+            assert!(
+                residual.abs() <= tolerance,
+                "{k}: {residual} vs {tolerance}"
+            );
         }
     }
 }

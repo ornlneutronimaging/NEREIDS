@@ -365,9 +365,9 @@ fn held_by_bound(param: &FitParameter, gradient: f64) -> bool {
 /// deviance within the parameter bounds.
 ///
 /// The model must provide an analytical Jacobian at every point the fit
-/// visits, and non-negative predictions; a bin predicted zero must have no
-/// counts, and adds its slope to the gradient and nothing to the
-/// information.  Each step is the Levenberg–Marquardt step `(F + λI)⁻¹g` in
+/// visits.  A trial predicting a negative count, or zero where something was
+/// counted, is rejected; a bin predicted zero with no counts adds its slope
+/// to the gradient and nothing to the information.  Each step is the Levenberg–Marquardt step `(F + λI)⁻¹g` in
 /// coordinates scaled to unit Fisher information, projected onto the box;
 /// `λ` is divided by 10 after a step that lowers the deviance, and
 /// multiplied by 10, to at least its starting 1e-3, before retrying one that
