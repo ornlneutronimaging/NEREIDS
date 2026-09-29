@@ -157,10 +157,10 @@ fn with_background(
     beam: &dyn Fn(f64) -> f64,
     sample: &[(ResonanceData, f64)],
     temperature_k: f64,
-    [a, back_a, back_b, back_c]: [f64; 4],
+    [a, b0, b1, b2]: [f64; 4],
 ) -> (Vec<f64>, Vec<f64>) {
     let (open, transmitted) = expected_at(setup, beam, sample, temperature_k);
-    let scattered = |u: f64| a * beam(u) * (back_a + back_b * u / CLOCK + back_c * CLOCK / u);
+    let scattered = |u: f64| a * beam(u) * (b0 + b1 * u / CLOCK + b2 * CLOCK / u);
     let scattered = run(setup, CHARGE_RATIO, &scattered, &[], temperature_k);
     let sample = transmitted.iter().zip(&scattered).map(|(t, b)| a * t + b);
     (open, sample.collect())
@@ -234,18 +234,18 @@ fn error_bar(fit: &CountsFit, i: usize) -> f64 {
 #[test]
 fn densities_normalization_and_background_are_recovered_and_follow_a_density_on_its_bound() {
     let setup = standard();
-    for (truth, back_c) in [
+    for (truth, b2) in [
         (THIN, Value::Known(TERMS[3])),
         (SATURATED, Value::Fitted(0.0)),
     ] {
         let isotope = hafnium_like(20.0);
         let sample = [(isotope.clone(), truth)];
         let counts = with_background(&setup, &beam(1.0e6), &sample, TEMPERATURE_K, TERMS);
-        let fit = |(density, a, back_a, back_b): (Value, f64, f64, f64)| {
+        let fit = |(density, a, b0, b1): (Value, f64, f64, f64)| {
             let mut m = recorded(&setup, counts.clone(), &sample);
             m.isotopes[0].1 = density;
             m.normalization = Value::Fitted(a);
-            m.background = [Value::Fitted(back_a), Value::Fitted(back_b), back_c];
+            m.background = [Value::Fitted(b0), Value::Fitted(b1), b2];
             let fit = fit_counts(&m, &calibration(&setup)).expect("fit");
             assert!(fit.converged, "{truth} from {density:?}");
             assert_eq!(fit.overdispersion, Some(1.0), "{truth} from {density:?}");

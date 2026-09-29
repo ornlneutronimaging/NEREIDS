@@ -94,8 +94,8 @@ pub struct Measurement {
     pub charge_ratio: f64,
     /// `a`, the normalization of the sample run, positive.
     pub normalization: Value,
-    /// `BackA` (dimensionless), `BackB` in √eV and `BackC` in 1/√eV of the
-    /// background `b(E) = BackA + BackB/√E + BackC·√E`, each any real number.
+    /// `b0` (dimensionless), `b1` in √eV and `b2` in 1/√eV of the background
+    /// `b(E) = b0 + b1/√E + b2·√E`, each any real number.
     pub background: [Value; 3],
     /// Each isotope in the sample with its areal density in atoms/barn, known
     /// or fitted, at least 0.
@@ -114,14 +114,12 @@ pub struct CountsFit {
     pub temperature_k: f64,
     /// The normalization `a`: the known one, or the fitted one.
     pub normalization: f64,
-    /// `BackA` (dimensionless), `BackB` in √eV and `BackC` in 1/√eV, each the
-    /// known or the fitted one.  SAMMY's `BackA`, `BackB`, `BackC` are
-    /// `normalization` times these, to within the background's change over
-    /// the pulse's delay.
+    /// `b0` (dimensionless), `b1` in √eV and `b2` in 1/√eV, each the known or
+    /// the fitted one.
     pub background: [f64; 3],
     /// Covariance of the fitted quantities among the densities, in the order
-    /// given, the temperature, the normalization, `BackA`, `BackB` and
-    /// `BackC`, in that order: the inverse of the expected information
+    /// given, the temperature, the normalization, `b0`, `b1` and `b2`, in
+    /// that order: the inverse of the expected information
     /// at the fit, scaled by `overdispersion`, or at the Poisson scale when
     /// that is `None`.  The row and column of a quantity on one of its bounds,
     /// or that the counts do not determine, are NaN; every entry is NaN
@@ -170,7 +168,7 @@ pub struct CountsFit {
 /// O_k  = ℓ^O_k · w Σ_i φ_i P_ki
 /// S_k  = ℓ^S_k · c_q · a · w Σ_i φ_i [T_i + b(E_i)] P_ki
 /// T_i  = exp(−Σ_m n_m σ_m(E_i))
-/// b(E) = BackA + BackB/√E + BackC·√E
+/// b(E) = b0 + b1/√E + b2·√E
 /// ```
 ///
 /// with `φ_i` the beam per µs, `P_ki` the chance of a neutron at `u_i`
@@ -179,8 +177,8 @@ pub struct CountsFit {
 /// normalization and `ℓ^O_k`, `ℓ^S_k` each run's live fraction.  The
 /// background is beam neutrons that reach the detector another way, so it
 /// passes through the pulse and scales with the normalization; SAMMY's
-/// `BackA`, `BackB`, `BackC` (`cro/mnrm1.f90`) are `a` times these, to within
-/// the background's change over the pulse's delay.  Counts that bypass the
+/// `BackA`, `BackB`, `BackC` (`cro/mnrm1.f90`) are `a·b0`, `a·b1`, `a·b2`, to
+/// within the background's change over the pulse's delay.  Counts that bypass the
 /// pulse, such as gammas, are not modelled.  The beam `φ` has the intervals
 /// [`fit_open_beam`] chooses and is fitted with the rest to both runs,
 /// starting from the open-beam fit.
@@ -201,7 +199,7 @@ pub struct CountsFit {
 /// converged with an overdispersion far above 1.  Where a black resonance
 /// empties bins and the background is near zero, a fitted background with no
 /// lower bound can drive a black bin's prediction to zero, and the fit ends
-/// unconverged; `BackA` bounded below by 0 ends on that bound, converged.
+/// unconverged; `b0` bounded below by 0 ends on that bound, converged.
 ///
 /// The overdispersion scales the covariance; it assumes both runs share it
 /// and their bins are independent.
@@ -251,7 +249,7 @@ pub fn fit_counts(
     }
     let normalization =
         normalization.parameter("normalization", f64::MIN_POSITIVE..=f64::INFINITY)?;
-    let background = ["BackA", "BackB", "BackC"]
+    let background = ["b0", "b1", "b2"]
         .into_iter()
         .zip(background)
         .map(|(name, term)| term.parameter(name, f64::NEG_INFINITY..=f64::INFINITY))
@@ -758,16 +756,16 @@ mod tests {
                 .collect();
             model.evaluate(&params).expect("counts")
         };
-        let [back_a, back_b, back_c] = [0.05, 0.5, -0.01];
-        let (with, without) = (counts([back_a, back_b, back_c]), counts([0.0; 3]));
+        let [b0, b1, b2] = [0.05, 0.5, -0.01];
+        let (with, without) = (counts([b0, b1, b2]), counts([0.0; 3]));
         let bins = with.len() / 2;
         let clock = TOF_FACTOR * FLIGHT_PATH_M;
         for k in 0..bins {
             let u = first_edge_us + 0.5 + k as f64 - T0_US;
             let root_e = clock / u;
-            let b = back_a + back_b / root_e + back_c * root_e;
-            let slope = back_b / clock - back_c * clock / (u * u);
-            let curvature = 2.0 * back_c * clock / u.powi(3);
+            let b = b0 + b1 / root_e + b2 * root_e;
+            let slope = b1 / clock - b2 * clock / (u * u);
+            let curvature = 2.0 * b2 * clock / u.powi(3);
             let energy = root_e * root_e;
             let (alpha, beta, r) = (ALPHA.eval(energy), BETA.eval(energy), R.eval(energy));
             let mean = 3.0 / alpha + r / beta;
