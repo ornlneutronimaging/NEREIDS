@@ -1,6 +1,7 @@
 //! Areal densities of a sample's isotopes, fitted to the counts of an
 //! open-beam run and a sample run recorded in the same time bins.
 
+use std::borrow::Cow;
 use std::cell::RefCell;
 use std::ops::RangeInclusive;
 use std::sync::Arc;
@@ -28,25 +29,49 @@ use crate::pipeline::TEMPERATURE_BOUNDS_K;
 /// under the model.
 pub const NEGLIGIBLE_PREDICTION: f64 = 1e-10;
 
-/// A quantity the fit holds at a known value or fits from a starting value.
+/// A quantity the fit holds at a known value, fits from a starting value
+/// over the quantity's range, or fits from `start` within `lower..=upper`
+/// inside that range.
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub enum Value {
     Known(f64),
     Fitted(f64),
+    Within { start: f64, lower: f64, upper: f64 },
 }
 
 impl Value {
-    fn value(self) -> f64 {
-        match self {
-            Self::Known(v) | Self::Fitted(v) => v,
+    fn parameter(
+        self,
+        name: impl Into<Cow<'static, str>>,
+        range: RangeInclusive<f64>,
+    ) -> Result<FitParameter, PipelineError> {
+        let name = name.into();
+        let (value, lower, upper) = match self {
+            Self::Known(v) | Self::Fitted(v) => (v, *range.start(), *range.end()),
+            Self::Within {
+                start,
+                lower,
+                upper,
+            } => (start, lower, upper),
+        };
+        if !(value.is_finite()
+            && range.contains(&lower)
+            && lower < upper
+            && range.contains(&upper)
+            && (lower..=upper).contains(&value))
+        {
+            return Err(PipelineError::InvalidParameter(format!(
+                "{name} must be finite and in {range:?}, and any bounds lower < upper in it \
+                 with the start between them; got {self:?}"
+            )));
         }
-    }
-
-    fn parameter(self, name: &'static str) -> FitParameter {
-        match self {
-            Self::Known(v) => FitParameter::fixed(name, v),
-            Self::Fitted(v) => FitParameter::unbounded(name, v),
-        }
+        Ok(FitParameter {
+            name,
+            value,
+            lower,
+            upper,
+            fixed: matches!(self, Self::Known(_)),
+        })
     }
 }
 
@@ -67,28 +92,23 @@ pub struct Measurement {
     pub sample_live: Option<Vec<f64>>,
     /// `c_q`, the sample run's proton charge over the open-beam run's.
     pub charge_ratio: f64,
-    /// `a`, the normalization of the sample run, known or fitted from the
-    /// value given.
+    /// `a`, the normalization of the sample run, at least 0.
     pub normalization: Value,
     /// `BackA`, `BackB` in √eV and `BackC` in 1/√eV of the background
-    /// `b(E) = BackA + BackB/√E + BackC·√E`, each known or fitted from the
-    /// value given.
+    /// `b(E) = BackA + BackB/√E + BackC·√E`, each any real number.
     pub background: [Value; 3],
-    /// Each isotope in the sample with the areal density, in atoms/barn, the
-    /// fit starts from, and the bounds, in atoms/barn, the fitted density is
-    /// held within: `lower..=upper` with `0 ≤ lower < upper` and the start
-    /// inside, or `None` for any non-negative density.
-    pub isotopes: Vec<(ResonanceData, f64, Option<RangeInclusive<f64>>)>,
-    /// The sample's temperature in K, known or fitted within 1–5000 K.
+    /// Each isotope in the sample with its areal density in atoms/barn, known
+    /// or fitted, at least 0.
+    pub isotopes: Vec<(ResonanceData, Value)>,
+    /// The sample's temperature in K, within 1–5000 K.
     pub temperature_k: Value,
 }
 
 #[derive(Debug, Clone)]
 pub struct CountsFit {
-    /// Areal density of each isotope in atoms/barn, in the order given.
+    /// Areal density of each isotope in atoms/barn, in the order given: the
+    /// known one, or the fitted one.
     pub densities: Vec<f64>,
-    /// Whether each density, in the order given, ended on one of its bounds.
-    pub density_on_bound: Vec<bool>,
     /// The sample's temperature in K: the known one, or the fitted one.
     pub temperature_k: f64,
     /// The normalization `a`: the known one, or the fitted one.
@@ -96,13 +116,13 @@ pub struct CountsFit {
     /// `BackA`, `BackB` in √eV and `BackC` in 1/√eV, each the known or the
     /// fitted one.  SAMMY's card-set-6 values are `normalization` times these.
     pub background: [f64; 3],
-    /// Covariance of the densities, in the order given, then of the
-    /// temperature, the normalization, `BackA`, `BackB` and `BackC`, each when
-    /// it is fitted: the inverse of the expected information
+    /// Covariance of the fitted quantities among the densities, in the order
+    /// given, the temperature, the normalization, `BackA`, `BackB` and
+    /// `BackC`, in that order: the inverse of the expected information
     /// at the fit, scaled by `overdispersion`, or at the Poisson scale when
-    /// that is `None`.  The row and column of a density on a bound, or of a
-    /// quantity the counts do not determine, are NaN; every entry is NaN
-    /// when a fitted temperature ends on an edge of 1–5000 K.  `None` when the
+    /// that is `None`.  The row and column of a quantity on one of its bounds,
+    /// or that the counts do not determine, are NaN; every entry is NaN
+    /// when a fitted temperature ends on one of its bounds.  `None` when the
     /// fit did not converge.
     ///
     /// The error bars take the [`Calibration`] passed to [`fit_counts`] as
@@ -110,6 +130,9 @@ pub struct CountsFit {
     /// fitted temperature or barely separate it from a density, as at few
     /// counts or for a thin sample at modest counts.
     pub covariance: Option<FlatMatrix>,
+    /// Whether each fitted quantity, in the covariance's order, ended on one
+    /// of its bounds.
+    pub on_bound: Vec<bool>,
     /// The beam per µs of flight time, fitted to both runs, with the
     /// intervals the open-beam fit chose.
     pub beam: BeamSpline,
@@ -135,10 +158,10 @@ pub struct CountsFit {
     pub halvings: usize,
 }
 
-/// Fit the isotopes' areal densities, and the temperature, normalization and
-/// background terms that are not known, to the raw counts of both runs of
-/// `measurement`.  On a uniform grid of flight times `u_i`, energies `E_i` and
-/// step `w`, the counts in bin `k` are
+/// Fit the areal densities, temperature, normalization and background terms
+/// of `measurement` that are not known to the raw counts of both runs.  On a
+/// uniform grid of flight times `u_i`, energies `E_i` and step `w`, the counts
+/// in bin `k` are
 ///
 /// ```text
 /// O_k  = ℓ^O_k · w Σ_i φ_i P_ki
@@ -172,7 +195,10 @@ pub struct CountsFit {
 ///
 /// The fitter finds a local minimum.  A thin sample hotter than about
 /// 1,500 K fitted from room temperature can end in a false one, reported
-/// converged with an overdispersion far above 1.
+/// converged with an overdispersion far above 1.  Where a black resonance
+/// empties bins and the background is near zero, a fitted background with no
+/// lower bound can drive a black bin's prediction to zero, and the fit ends
+/// unconverged; `BackA` bounded below by 0 ends on that bound, converged.
 ///
 /// The overdispersion scales the covariance; it assumes both runs share it
 /// and their bins are independent.
@@ -182,15 +208,14 @@ pub struct CountsFit {
 /// live fraction when given, per bin;
 /// [`PipelineError::InvalidParameter`] if a count is not a whole non-negative
 /// number, a run has no counts, a live fraction is not in (0, 1], the charge
-/// ratio or the normalization is not finite and positive, a background term
-/// is not finite, there are no isotopes, an isotope is listed twice, a
-/// density's bounds are not `0 ≤ lower < upper`, a starting density is not
-/// finite and within its bounds, the temperature or its start is outside
-/// 1–5000 K, an isotope's resonance data are not finite, or the energies its
-/// broadened cross section reads, at the known temperature or at 5000 K for a
-/// fitted one, down to zero for a window within the thermal spread of zero
-/// energy, are not inside a single one of its evaluated (SLBW, MLBW or
-/// Reich–Moore) resolved ranges;
+/// ratio is not finite and positive, a known or starting value is not finite
+/// and in its quantity's range, bounds are not `lower < upper` in that range
+/// with the start between them, there are no isotopes, an isotope is listed
+/// twice, an isotope's resonance data are not finite, or the energies its
+/// broadened cross section reads, at the known temperature or at the upper
+/// bound of a fitted one, down to zero for a window within the thermal
+/// spread of zero energy, are not inside a single one of its evaluated
+/// (SLBW, MLBW or Reich–Moore) resolved ranges;
 /// [`PipelineError::UnmodelledCounts`] if at the fit, converged or not, a bin
 /// holds counts predicted below [`NEGLIGIBLE_PREDICTION`]: starting or known
 /// values predicting no counts, or negative ones, where counts were recorded,
@@ -221,60 +246,38 @@ pub fn fit_counts(
             "the charge ratio must be finite and positive, got {charge_ratio}"
         ));
     }
-    let a = normalization.value();
-    if !(a.is_finite() && a > 0.0 && background.iter().all(|b| b.value().is_finite())) {
-        return invalid(format!(
-            "the normalization must be finite and positive and the background finite, \
-             got {normalization:?} and {background:?}"
-        ));
-    }
+    let normalization = normalization.parameter("normalization", 0.0..=f64::INFINITY)?;
+    let background = ["BackA", "BackB", "BackC"]
+        .into_iter()
+        .zip(background)
+        .map(|(name, term)| term.parameter(name, f64::NEG_INFINITY..=f64::INFINITY))
+        .collect::<Result<Vec<FitParameter>, PipelineError>>()?;
     if isotopes.is_empty() {
         return invalid("the sample has no isotopes".into());
     }
     let (t_low, t_high) = TEMPERATURE_BOUNDS_K;
-    let start_k = temperature_k.value();
-    if !(t_low..=t_high).contains(&start_k) {
-        return invalid(format!(
-            "the temperature must be within {t_low}–{t_high} K, got {start_k}"
-        ));
-    }
-    let reach_k = match temperature_k {
-        Value::Known(t) => *t,
-        Value::Fitted(_) => t_high,
+    let temperature = temperature_k.parameter("temperature", t_low..=t_high)?;
+    let reach_k = if temperature.fixed {
+        temperature.value
+    } else {
+        temperature.upper
     };
     let mut dopplers = Vec::with_capacity(isotopes.len());
     let mut densities = Vec::with_capacity(isotopes.len());
-    for (i, (isotope, density, bounds)) in isotopes.iter().enumerate() {
+    for (i, (isotope, density)) in isotopes.iter().enumerate() {
         if isotopes[..i]
             .iter()
-            .any(|(other, ..)| other.za == isotope.za)
+            .any(|(other, _)| other.za == isotope.za)
         {
             return invalid(format!(
                 "{} is listed twice; its densities cannot be told apart",
                 isotope.isotope
             ));
         }
-        let (lower, upper) = bounds
-            .as_ref()
-            .map_or((0.0, f64::INFINITY), |b| (*b.start(), *b.end()));
-        if !(density.is_finite()
-            && 0.0 <= lower
-            && lower < upper
-            && (lower..=upper).contains(density))
-        {
-            return invalid(format!(
-                "the starting density of {} must be finite and within its bounds, which \
-                 must satisfy 0 ≤ lower < upper; got {density} and {lower}..={upper}",
-                isotope.isotope
-            ));
-        }
-        densities.push(FitParameter {
-            name: format!("density {i}").into(),
-            value: *density,
-            lower,
-            upper,
-            fixed: false,
-        });
+        densities.push(density.parameter(
+            format!("density of {}", isotope.isotope),
+            0.0..=f64::INFINITY,
+        )?);
         if !finite(isotope) {
             return invalid(format!(
                 "the resonance data of {} are not finite",
@@ -296,7 +299,7 @@ pub fn fit_counts(
     let energies = grid.energies_ev();
     let span_ev = (energies[energies.len() - 1], energies[0]);
     let mut resonances_in_span = Vec::with_capacity(isotopes.len());
-    for ((isotope, ..), doppler) in isotopes.iter().zip(&dopplers) {
+    for ((isotope, _), doppler) in isotopes.iter().zip(&dopplers) {
         let read = (
             (span_ev.0.sqrt() - SUPPORT_X * doppler.u())
                 .max(0.0)
@@ -323,7 +326,7 @@ pub fn fit_counts(
     let half_maximum = 2.0 * std::f64::consts::LN_2.sqrt();
     let narrowest_us = |temperature_k: f64| -> Result<f64, PipelineError> {
         let mut narrowest = f64::INFINITY;
-        for ((isotope, ..), energies) in isotopes.iter().zip(&resonances_in_span) {
+        for ((isotope, _), energies) in isotopes.iter().zip(&resonances_in_span) {
             let doppler = DopplerParams::new(temperature_k, isotope.awr)
                 .map_err(|e| PipelineError::InvalidParameter(e.to_string()))?;
             for &energy in energies {
@@ -346,16 +349,6 @@ pub fn fit_counts(
 
     let open = fit_open_beam(time_edges_us, open_counts, calibration, Some(&open_live))?;
     let layout = Layout::new(open.beam.coefficients().len(), isotopes.len());
-    let temperature = match temperature_k {
-        Value::Known(t) => FitParameter::fixed("temperature", *t),
-        Value::Fitted(t) => FitParameter {
-            name: "temperature".into(),
-            value: *t,
-            lower: t_low,
-            upper: t_high,
-            fixed: false,
-        },
-    };
     let mut parameters = ParameterSet::new(
         open.beam
             .coefficients()
@@ -363,20 +356,14 @@ pub fn fit_counts(
             .enumerate()
             .map(|(i, &c)| FitParameter::unbounded(format!("beam {i}"), c))
             .chain(densities)
-            .chain(std::iter::once(temperature))
-            .chain(std::iter::once(normalization.parameter("normalization")))
-            .chain(
-                ["BackA", "BackB", "BackC"]
-                    .into_iter()
-                    .zip(background)
-                    .map(|(name, term)| term.parameter(name)),
-            )
+            .chain([temperature, normalization])
+            .chain(background)
             .collect(),
     );
-    let resonances: Arc<[ResonanceData]> = isotopes.iter().map(|(data, ..)| data.clone()).collect();
+    let resonances: Arc<[ResonanceData]> = isotopes.iter().map(|(data, _)| data.clone()).collect();
     let observed: Vec<f64> = open_counts.iter().chain(sample_counts).copied().collect();
     let live: Vec<f64> = open_live.into_iter().chain(sample_live).collect();
-    let mut rule_k = start_k;
+    let mut rule_k = parameters.params[layout.temperature].value;
     let (fit, rule_halvings) = loop {
         let (first, rule_halvings) = first_grid(rule_k)?;
         let fit = fit_on_halved_grids(&first, &mut parameters, &observed, |grid| {
@@ -439,11 +426,14 @@ pub fn fit_counts(
     let params = &fit.result.params;
     Ok(CountsFit {
         densities: params[layout.densities..layout.temperature].to_vec(),
-        density_on_bound: fit.result.on_bound[layout.densities..layout.temperature].to_vec(),
         temperature_k: params[layout.temperature],
         normalization: params[layout.normalization],
         background: [0, 1, 2].map(|i| params[layout.background + i]),
         covariance,
+        on_bound: sample_quantities
+            .iter()
+            .map(|&p| fit.result.on_bound[p])
+            .collect(),
         beam: open.beam.with_coefficients(&params[..layout.densities]),
         beam_at_limit: open.at_limit,
         deviance: fit.result.deviance,

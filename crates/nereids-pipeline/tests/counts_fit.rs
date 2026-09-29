@@ -212,7 +212,7 @@ fn measurement(
         background: [Value::Known(0.0); 3],
         isotopes: isotopes
             .iter()
-            .map(|(d, n)| (d.clone(), *n, None))
+            .map(|(d, n)| (d.clone(), Value::Fitted(*n)))
             .collect(),
         temperature_k: Value::Known(TEMPERATURE_K),
     }
@@ -238,15 +238,15 @@ fn densities_normalization_and_background_are_recovered_and_follow_a_density_on_
         let isotope = hafnium_like(20.0);
         let sample = [(isotope.clone(), truth)];
         let counts = with_background(&setup, &beam(1.0e6), &sample, TEMPERATURE_K, TERMS);
-        let fit = |(start, a, back_a, back_b): (f64, f64, f64, f64), bounds| {
-            let mut m = recorded(&setup, counts.clone(), &[(isotope.clone(), start)]);
-            m.isotopes[0].2 = bounds;
+        let fit = |(density, a, back_a, back_b): (Value, f64, f64, f64)| {
+            let mut m = recorded(&setup, counts.clone(), &sample);
+            m.isotopes[0].1 = density;
             m.normalization = Value::Fitted(a);
             m.background[0] = Value::Fitted(back_a);
             m.background[1] = Value::Fitted(back_b);
             let fit = fit_counts(&m, &calibration(&setup)).expect("fit");
-            assert!(fit.converged, "{truth} from {start}");
-            assert_eq!(fit.overdispersion, Some(1.0), "{truth} from {start}");
+            assert!(fit.converged, "{truth} from {density:?}");
+            assert_eq!(fit.overdispersion, Some(1.0), "{truth} from {density:?}");
             fit
         };
         let estimates = |fit: &CountsFit| {
@@ -258,12 +258,12 @@ fn densities_normalization_and_background_are_recovered_and_follow_a_density_on_
             ]
         };
         let starts = [
-            (0.5 * truth, 1.0, 0.02, 0.2),
-            (2.0 * truth, 0.85, 0.12, 0.8),
+            (Value::Fitted(0.5 * truth), 1.0, 0.02, 0.2),
+            (Value::Fitted(2.0 * truth), 0.85, 0.12, 0.8),
         ];
-        let free = starts.map(|start| fit(start, None));
+        let free = starts.map(fit);
         for fit in &free {
-            assert_eq!(fit.density_on_bound, [false], "{truth}");
+            assert_eq!(fit.on_bound, [false; 4], "{truth}");
             let pulls: Vec<f64> = estimates(fit)
                 .iter()
                 .zip([truth, TERMS[0], TERMS[1], TERMS[2]])
@@ -278,9 +278,14 @@ fn densities_normalization_and_background_are_recovered_and_follow_a_density_on_
 
         let free = &free[0];
         let upper = truth - 3.0 * error_bar(free, 0);
-        let bounded = fit(starts[0], Some(0.25 * truth..=upper));
+        let density = Value::Within {
+            start: 0.5 * truth,
+            lower: 0.25 * truth,
+            upper,
+        };
+        let bounded = fit((density, 1.0, 0.02, 0.2));
         assert_eq!(bounded.densities[0], upper, "{truth}");
-        assert_eq!(bounded.density_on_bound, [true], "{truth}");
+        assert_eq!(bounded.on_bound, [true, false, false, false], "{truth}");
         let covariance = free.covariance.as_ref().expect("covariance");
         let (x, x_free) = (estimates(&bounded), estimates(free));
         for i in 1..4 {
@@ -525,7 +530,7 @@ fn counting_every_neutron_seven_times_scales_the_overdispersion_not_the_error_ba
 }
 
 #[test]
-fn counts_the_model_cannot_make_are_refused_and_rare_ones_leave_the_noise_alone() {
+fn black_bins_refuse_counts_hold_a_bounded_background_at_zero_and_rare_ones_leave_the_noise() {
     let setup = Setup {
         pulse: pulse(0.0, 200.0),
         ..standard()
@@ -553,6 +558,19 @@ fn counts_the_model_cannot_make_are_refused_and_rare_ones_leave_the_noise_alone(
         }
         other => panic!("{other:?}"),
     }
+
+    let counts = draws(&expected, 401, 1.0);
+    let mut m = fitted_from(measurement(&setup, counts, &sample), TEMPERATURE_K);
+    m.background[0] = Value::Within {
+        start: 1e-3,
+        lower: 0.0,
+        upper: f64::INFINITY,
+    };
+    let fit = fit_counts(&m, &calibration(&setup)).expect("fit");
+    assert!(fit.converged);
+    assert_eq!(fit.background[0], 0.0);
+    assert_eq!(fit.on_bound, [false, false, true]);
+    assert!(error_bar(&fit, 0).is_finite() && error_bar(&fit, 1).is_finite());
 
     let counts_per_neutron = 7.0;
     let (open, mut counts) = draws(&expected, 400, counts_per_neutron);
@@ -806,7 +824,7 @@ fn measurements_the_fit_does_not_describe_are_refused() {
     invalid(&|m| m.sample_counts.iter_mut().for_each(|c| *c = 0.0));
     invalid(&|m| m.charge_ratio = 0.0);
     invalid(&|m| m.charge_ratio = f64::NAN);
-    invalid(&|m| m.normalization = Value::Fitted(0.0));
+    invalid(&|m| m.normalization = Value::Fitted(-1.0));
     invalid(&|m| m.normalization = Value::Known(f64::INFINITY));
     invalid(&|m| m.background[1] = Value::Fitted(f64::NAN));
     assert!(matches!(
@@ -814,12 +832,18 @@ fn measurements_the_fit_does_not_describe_are_refused() {
         PipelineError::UnmodelledCounts { run: "sample", .. }
     ));
     invalid(&|m| m.isotopes.clear());
-    invalid(&|m| m.isotopes.push((isotope.clone(), THIN, None)));
-    invalid(&|m| m.isotopes[0].1 = -1.0);
-    invalid(&|m| m.isotopes[0].1 = f64::NAN);
-    invalid(&|m| m.isotopes[0].2 = Some(2.0 * THIN..=3.0 * THIN));
-    invalid(&|m| m.isotopes[0].2 = Some(THIN..=THIN));
-    invalid(&|m| m.isotopes[0].2 = Some(-THIN..=2.0 * THIN));
+    invalid(&|m| m.isotopes.push((isotope.clone(), Value::Fitted(THIN))));
+    invalid(&|m| m.isotopes[0].1 = Value::Known(-1.0));
+    invalid(&|m| m.isotopes[0].1 = Value::Fitted(f64::NAN));
+    for (lower, upper) in [(2.0 * THIN, 3.0 * THIN), (THIN, THIN), (-THIN, 2.0 * THIN)] {
+        invalid(&|m| {
+            m.isotopes[0].1 = Value::Within {
+                start: THIN,
+                lower,
+                upper,
+            }
+        });
+    }
     for temperature_k in [0.5, 6000.0, f64::NAN] {
         invalid(&|m| m.temperature_k = Value::Known(temperature_k));
         invalid(&|m| m.temperature_k = Value::Fitted(temperature_k));
