@@ -18,7 +18,8 @@ use rayon::prelude::*;
 use crate::beam::BeamSpline;
 use crate::error::PipelineError;
 use crate::open_beam::{
-    Calibration, OpenBeamModel, fit_on_halved_grids, fit_open_beam, overdispersion, validate_counts,
+    Calibration, OpenBeamModel, Recorded, fit_on_halved_grids, fit_open_beam, overdispersion,
+    validate_counts, validate_live,
 };
 use crate::pipeline::TEMPERATURE_BOUNDS_K;
 
@@ -50,6 +51,12 @@ pub struct Measurement {
     pub open_counts: Vec<f64>,
     /// Raw counts of the sample run, one per bin.
     pub sample_counts: Vec<f64>,
+    /// The fraction of the open-beam run's neutrons arriving in each bin that
+    /// the detector records, in (0, 1]; `None` records every one.
+    pub open_live: Option<Vec<f64>>,
+    /// The fraction of the sample run's neutrons arriving in each bin that the
+    /// detector records, in (0, 1]; `None` records every one.
+    pub sample_live: Option<Vec<f64>>,
     /// The sample run's beam over the open-beam run's, the ratio of their
     /// proton charges.
     pub charge_ratio: f64,
@@ -107,14 +114,15 @@ pub struct CountsFit {
 
 /// Fit the isotopes' areal densities, and the temperature unless it is
 /// known, to the raw counts of both runs of `measurement`.  The open-beam
-/// counts are `O_k = Σ_j w φ(u_j) P_k(u_j)` and the sample counts
-/// `S_k = c Σ_j w φ(u_j) T(E_j) P_k(u_j)` on a uniform flight-time grid,
+/// counts are `O_k = ℓ^O_k Σ_j w φ(u_j) P_k(u_j)` and the sample counts
+/// `S_k = ℓ^S_k c Σ_j w φ(u_j) T(E_j) P_k(u_j)` on a uniform flight-time grid,
 /// with `T = exp(−Σ_i n_i σ_i)`, `σ_i` the isotope's Doppler-broadened total
-/// cross section, `c` the charge ratio and `P_k` the chance of a neutron being
-/// counted in bin `k`.  The beam `φ` has the intervals [`fit_open_beam`]
-/// chooses and is fitted with the densities to both runs, starting from the
-/// open-beam fit.  There is no background term: background counts bias the
-/// densities, and are refused only where the model predicts none.
+/// cross section, `c` the charge ratio, `ℓ^O_k` and `ℓ^S_k` each run's live
+/// fraction and `P_k` the chance of a neutron arriving in bin `k`.  The beam
+/// `φ` has the intervals [`fit_open_beam`] chooses and is fitted with the
+/// densities to both runs, starting from the open-beam fit.  There is no
+/// background term: background counts bias the densities, and are refused
+/// only where the model predicts none.
 ///
 /// The grid's first step is at most half the narrowest Doppler full width at
 /// half maximum, in flight time, of any resonance inside its energy span, at
@@ -135,16 +143,17 @@ pub struct CountsFit {
 /// and their bins are independent.
 ///
 /// # Errors
-/// [`PipelineError::ShapeMismatch`] unless each run has one count per bin;
+/// [`PipelineError::ShapeMismatch`] unless each run has one count, and one
+/// live fraction when given, per bin;
 /// [`PipelineError::InvalidParameter`] if a count is not a whole non-negative
-/// number, a run has no counts, the charge ratio is not finite and positive,
-/// there are no isotopes, an isotope is listed twice, a starting density is
-/// not finite and non-negative, the temperature or its start is outside
-/// 1–5000 K, an isotope's resonance data are not finite, or the energies its
-/// broadened cross section reads, at the known temperature or at 5000 K for a
-/// fitted one, down to zero for a window within the thermal spread of zero
-/// energy, are not inside a single one of its evaluated (SLBW, MLBW or
-/// Reich–Moore) resolved ranges;
+/// number, a run has no counts, a live fraction is not in (0, 1], the charge
+/// ratio is not finite and positive, there are no isotopes, an isotope is
+/// listed twice, a starting density is not finite and non-negative, the
+/// temperature or its start is outside 1–5000 K, an isotope's resonance data
+/// are not finite, or the energies its broadened cross section reads, at the
+/// known temperature or at 5000 K for a fitted one, down to zero for a window
+/// within the thermal spread of zero energy, are not inside a single one of
+/// its evaluated (SLBW, MLBW or Reich–Moore) resolved ranges;
 /// [`PipelineError::UnmodelledCounts`] if at the fit, converged or not, a bin
 /// holds counts predicted below [`NEGLIGIBLE_PREDICTION`]: background, or
 /// starting densities whose transmission vanishes where counts were recorded,
@@ -161,6 +170,8 @@ pub fn fit_counts(
         time_edges_us,
         open_counts,
         sample_counts,
+        open_live,
+        sample_live,
         charge_ratio,
         isotopes,
         temperature_k,
@@ -217,6 +228,8 @@ pub fn fit_counts(
     let bins = time_edges_us.len() - 1;
     validate_counts("open-beam", open_counts, bins)?;
     validate_counts("sample", sample_counts, bins)?;
+    let open_live = validate_live("open-beam", open_live.as_deref(), bins)?;
+    let sample_live = validate_live("sample", sample_live.as_deref(), bins)?;
 
     let energies = grid.energies_ev();
     let span_ev = (energies[energies.len() - 1], energies[0]);
@@ -269,7 +282,7 @@ pub fn fit_counts(
         Ok((Arc::new(first), halvings))
     };
 
-    let open = fit_open_beam(time_edges_us, open_counts, calibration)?;
+    let open = fit_open_beam(time_edges_us, open_counts, calibration, Some(&open_live))?;
     let beam_coefficients = open.beam.coefficients().len();
     let temperature_index = beam_coefficients + isotopes.len();
     let temperature = match temperature_k {
@@ -299,16 +312,15 @@ pub fn fit_counts(
     );
     let resonances: Arc<[ResonanceData]> = isotopes.iter().map(|(data, _)| data.clone()).collect();
     let observed: Vec<f64> = open_counts.iter().chain(sample_counts).copied().collect();
+    let live: Vec<f64> = open_live.into_iter().chain(sample_live).collect();
     let mut rule_k = start_k;
     let (fit, rule_halvings) = loop {
         let (first, rule_halvings) = first_grid(rule_k)?;
         let fit = fit_on_halved_grids(&first, &mut parameters, &observed, |grid| {
-            Ok(TwoRunModel::new(
-                grid,
-                &open.beam,
-                &resonances,
-                *charge_ratio,
-            ))
+            Ok(Recorded {
+                model: TwoRunModel::new(grid, &open.beam, &resonances, *charge_ratio),
+                live: &live,
+            })
         })?;
         let fitted_k = fit.result.params[temperature_index];
         if !fit.converged || 2.0 * fit.step_us <= 0.5 * narrowest_us(fitted_k)? {
@@ -566,11 +578,15 @@ mod tests {
             synthetic_isotope(72, 180, 20.0, 0.01, 0.06),
             synthetic_isotope(74, 182, 20.3, 0.01, 0.06),
         ]);
-        let model = TwoRunModel::new(&grid, &beam, &isotopes, 1.2);
         let params: Vec<f64> = (0..beam.coefficients().len())
             .map(|i| 9.0 + 0.3 * (i as f64).sin())
             .chain([3.0e-4, 5.0e-4, 300.0])
             .collect();
+        let model = TwoRunModel::new(&grid, &beam, &isotopes, 1.2);
+        let live: Vec<f64> = (0..model.evaluate(&params).expect("counts").len())
+            .map(|k| 0.9 + 0.1 * (0.3 * k as f64).sin())
+            .collect();
+        let model = Recorded { model, live: &live };
         let counts = model.evaluate(&params).expect("counts");
         let mut colder = params.clone();
         *colder.last_mut().expect("a temperature") = 250.0;

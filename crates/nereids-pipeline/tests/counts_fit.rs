@@ -132,6 +132,22 @@ fn rounded(counts: &[f64]) -> Vec<f64> {
     counts.iter().map(|c| c.round()).collect()
 }
 
+fn live_fractions(expected: &[f64]) -> Vec<f64> {
+    let most = expected.iter().fold(0.0_f64, |m, &mu| m.max(mu));
+    expected
+        .iter()
+        .map(|mu| 1.0 / (1.0 + 0.25 * mu / most))
+        .collect()
+}
+
+fn recorded(expected: &[f64], live: &[f64]) -> Vec<f64> {
+    expected
+        .iter()
+        .zip(live)
+        .map(|(mu, l)| (l * mu).round())
+        .collect()
+}
+
 fn calibration(setup: &Setup) -> Calibration {
     Calibration {
         t0_us: T0_US,
@@ -148,6 +164,8 @@ fn measurement(
         time_edges_us: setup.edges.clone(),
         open_counts: open,
         sample_counts: sample,
+        open_live: None,
+        sample_live: None,
         charge_ratio: CHARGE_RATIO,
         isotopes: isotopes.to_vec(),
         temperature_k: Value::Known(TEMPERATURE_K),
@@ -172,14 +190,14 @@ fn densities_are_recovered_from_starts_on_either_side() {
     let setup = standard();
     for truth in [THIN, SATURATED] {
         let isotope = hafnium_like(20.0);
-        let counts = expected(&setup, &beam(1.0e6), &[(isotope.clone(), truth)]);
-        let counts = (rounded(&counts.0), rounded(&counts.1));
+        let (open, sample) = expected(&setup, &beam(1.0e6), &[(isotope.clone(), truth)]);
+        let live = (live_fractions(&open), live_fractions(&sample));
+        let counts = (recorded(&open, &live.0), recorded(&sample, &live.1));
         for start in [0.5 * truth, 2.0 * truth] {
-            let fit = fit_counts(
-                &measurement(&setup, counts.clone(), &[(isotope.clone(), start)]),
-                &calibration(&setup),
-            )
-            .expect("fit");
+            let mut m = measurement(&setup, counts.clone(), &[(isotope.clone(), start)]);
+            m.open_live = Some(live.0.clone());
+            m.sample_live = Some(live.1.clone());
+            let fit = fit_counts(&m, &calibration(&setup)).expect("fit");
             assert!(fit.converged, "{truth} from {start}");
             assert_eq!(fit.overdispersion, Some(1.0), "{truth} from {start}");
             let pull = (fit.densities[0] - truth) / error_bar(&fit, 0);
@@ -675,6 +693,12 @@ fn measurements_the_fit_does_not_describe_are_refused() {
         }),
         PipelineError::ShapeMismatch(_)
     ));
+    assert!(matches!(
+        refused(&|m| m.sample_live = Some(vec![1.0; 3])),
+        PipelineError::ShapeMismatch(_)
+    ));
+    invalid(&|m| m.sample_live = Some(vec![0.0; m.sample_counts.len()]));
+    invalid(&|m| m.open_live = Some(vec![f64::NAN; m.open_counts.len()]));
     invalid(&|m| m.sample_counts[5] += 0.5);
     invalid(&|m| m.sample_counts[5] = -1.0);
     invalid(&|m| m.sample_counts.iter_mut().for_each(|c| *c = 0.0));

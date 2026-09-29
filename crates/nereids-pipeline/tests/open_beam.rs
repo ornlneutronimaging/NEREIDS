@@ -7,7 +7,7 @@ use nereids_physics::ikeda_carpenter::{
 use nereids_physics::resolution::{ResolutionFunction, TOF_FACTOR};
 use nereids_pipeline::beam::BeamSpline;
 use nereids_pipeline::error::PipelineError;
-use nereids_pipeline::open_beam::{BOUND, Calibration, OpenBeamFit, fit_open_beam};
+use nereids_pipeline::open_beam::{self, BOUND, Calibration, OpenBeamFit};
 use nereids_pipeline::reference::Instrument;
 use rand::SeedableRng;
 use rand_chacha::ChaCha12Rng;
@@ -172,6 +172,14 @@ fn calibration(pulse: &Arc<IkedaCarpenter>) -> Calibration {
     }
 }
 
+fn fit_open_beam(
+    edges: &[f64],
+    counts: &[f64],
+    calibration: &Calibration,
+) -> Result<OpenBeamFit, PipelineError> {
+    open_beam::fit_open_beam(edges, counts, calibration, None)
+}
+
 fn bin_centres() -> Vec<f64> {
     edges()
         .windows(2)
@@ -188,8 +196,19 @@ fn predicted(grid: &FlightTimeGrid, beam: &dyn Fn(f64) -> f64) -> Vec<f64> {
 fn the_fitted_beam_is_the_beam_before_the_blur() {
     let beam = true_beam(1.0e6);
     for (name, pulse) in pulses() {
-        let fit =
-            fit_open_beam(&edges(), &open_counts(&pulse, &beam), &calibration(&pulse)).expect(name);
+        let expected = simulated(&pulse, &beam);
+        let most = expected.iter().fold(0.0_f64, |m, &mu| m.max(mu));
+        let live: Vec<f64> = expected
+            .iter()
+            .map(|mu| 1.0 / (1.0 + 0.25 * mu / most))
+            .collect();
+        let counts: Vec<f64> = expected
+            .iter()
+            .zip(&live)
+            .map(|(mu, l)| (l * mu).round())
+            .collect();
+        let fit = open_beam::fit_open_beam(&edges(), &counts, &calibration(&pulse), Some(&live))
+            .expect(name);
         assert!(fit.converged, "{name}");
         assert_eq!(fit.beam.intervals(), 1, "{name}");
         assert_eq!(fit.overdispersion, Some(1.0), "{name}");
@@ -285,6 +304,21 @@ fn counts_that_are_not_an_open_beam_are_refused() {
         fit_open_beam(&edges(), &counts[1..], &calibration(pulse)),
         Err(PipelineError::ShapeMismatch(_))
     ));
+    let live = |fraction: f64, bins: usize| {
+        let mut live = vec![1.0; bins];
+        live[5] = fraction;
+        open_beam::fit_open_beam(&edges(), &counts, &calibration(pulse), Some(&live))
+    };
+    assert!(matches!(
+        live(1.0, counts.len() - 1),
+        Err(PipelineError::ShapeMismatch(_))
+    ));
+    for fraction in [0.0, 1.5, f64::NAN] {
+        assert!(matches!(
+            live(fraction, counts.len()),
+            Err(PipelineError::InvalidParameter(_))
+        ));
+    }
     assert!(matches!(
         fit_open_beam(&edges()[..8], &counts[..7], &calibration(pulse)),
         Err(PipelineError::InvalidParameter(_))
