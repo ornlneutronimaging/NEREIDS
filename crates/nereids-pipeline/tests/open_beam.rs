@@ -18,6 +18,7 @@ const T0_US: f64 = 3.0;
 const CLOCK: f64 = TOF_FACTOR * FLIGHT_PATH_M;
 const E_MIN_EV: f64 = 1.0;
 const E_MAX_EV: f64 = 200.0;
+const SIMULATOR_RANGE_EV: (f64, f64) = (10.0, 50.0);
 const SIMULATOR_STEP_US: f64 = 1.0 / 32.0;
 
 fn edges() -> Vec<f64> {
@@ -88,7 +89,7 @@ fn simulated(pulse: &Arc<IkedaCarpenter>, beam: &dyn Fn(f64) -> f64) -> Vec<f64>
             beam(u) * u / (2.0 * e)
         },
         &|es| vec![1.0; es.len()],
-        (E_MIN_EV, E_MAX_EV),
+        SIMULATOR_RANGE_EV,
         SIMULATOR_STEP_US,
     )
     .counts

@@ -61,7 +61,7 @@ fn standard() -> Setup {
     Setup {
         edges: (350..=470).map(f64::from).collect(),
         pulse: pulse(0.15, 200.0),
-        energy_range_ev: (1.0, 200.0),
+        energy_range_ev: (10.0, 50.0),
         simulator_step_us: 1.0 / 32.0,
     }
 }
