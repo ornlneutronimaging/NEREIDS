@@ -830,7 +830,8 @@ fn measurements_the_fit_does_not_describe_are_refused() {
     invalid(&|m| m.sample_counts.iter_mut().for_each(|c| *c = 0.0));
     invalid(&|m| m.charge_ratio = 0.0);
     invalid(&|m| m.charge_ratio = f64::NAN);
-    invalid(&|m| m.normalization = Value::Fitted(-1.0));
+    invalid(&|m| m.normalization = Value::Fitted(0.0));
+    invalid(&|m| m.normalization = Value::Known(0.0));
     invalid(&|m| m.normalization = Value::Known(f64::INFINITY));
     invalid(&|m| m.background[1] = Value::Fitted(f64::NAN));
     let black = [(isotope.clone(), 4.0e3 / 7805.1)];

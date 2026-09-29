@@ -92,7 +92,7 @@ pub struct Measurement {
     pub sample_live: Option<Vec<f64>>,
     /// `c_q`, the sample run's proton charge over the open-beam run's.
     pub charge_ratio: f64,
-    /// `a`, the normalization of the sample run, at least 0.
+    /// `a`, the normalization of the sample run, positive.
     pub normalization: Value,
     /// `BackA` (dimensionless), `BackB` in √eV and `BackC` in 1/√eV of the
     /// background `b(E) = BackA + BackB/√E + BackC·√E`, each any real number.
@@ -249,7 +249,8 @@ pub fn fit_counts(
             "the charge ratio must be finite and positive, got {charge_ratio}"
         ));
     }
-    let normalization = normalization.parameter("normalization", 0.0..=f64::INFINITY)?;
+    let normalization =
+        normalization.parameter("normalization", f64::MIN_POSITIVE..=f64::INFINITY)?;
     let background = ["BackA", "BackB", "BackC"]
         .into_iter()
         .zip(background)
