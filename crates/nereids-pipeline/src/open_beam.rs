@@ -455,16 +455,23 @@ pub(crate) mod tests {
 
     use super::*;
 
+    pub(crate) const FLIGHT_PATH_M: f64 = 25.0;
+    pub(crate) const T0_US: f64 = 3.0;
+    pub(crate) const EDGES_US: std::ops::RangeInclusive<u32> = 350..=470;
+    pub(crate) const ALPHA: EnergyLaw = EnergyLaw::SqrtE { a0: 0.35, a1: 0.05 };
+    pub(crate) const BETA: EnergyLaw = EnergyLaw::Const(0.25);
+    pub(crate) const R: EnergyLaw = EnergyLaw::Const(0.15);
+
     pub(crate) fn grid(channel_fwhm_us: Option<f64>) -> Arc<FlightTimeGrid> {
         let pulse = IkedaCarpenter::new(
             IkedaCarpenterParams {
-                alpha: EnergyLaw::SqrtE { a0: 0.35, a1: 0.05 },
-                beta: EnergyLaw::Const(0.25),
-                r: EnergyLaw::Const(0.15),
+                alpha: ALPHA,
+                beta: BETA,
+                r: R,
                 burst_sigma_us: None,
                 channel_fwhm_us,
             },
-            25.0,
+            FLIGHT_PATH_M,
             &SynthesisGrid {
                 e_min_ev: 1.0,
                 e_max_ev: 200.0,
@@ -473,8 +480,8 @@ pub(crate) mod tests {
             },
         )
         .expect("valid IC model");
-        let edges: Vec<f64> = (350..=470).map(f64::from).collect();
-        Arc::new(FlightTimeGrid::new(&edges, 3.0, &Arc::new(pulse)).expect("grid"))
+        let edges: Vec<f64> = EDGES_US.map(f64::from).collect();
+        Arc::new(FlightTimeGrid::new(&edges, T0_US, &Arc::new(pulse)).expect("grid"))
     }
 
     #[test]

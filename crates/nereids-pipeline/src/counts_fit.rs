@@ -680,7 +680,7 @@ mod tests {
     use nereids_endf::resonance::test_support::synthetic_isotope;
 
     use super::*;
-    use crate::open_beam::tests::grid;
+    use crate::open_beam::tests::{ALPHA, BETA, EDGES_US, FLIGHT_PATH_M, R, T0_US, grid};
 
     #[test]
     fn the_jacobian_is_the_slope_of_both_runs_counts() {
@@ -736,7 +736,8 @@ mod tests {
     fn the_background_lags_sammy_s_by_the_pulse_s_mean_delay() {
         let grid = grid(None);
         let (_, u_hi) = grid.range_us();
-        let beam = BeamSpline::constant(347.0, u_hi, 1.0e4);
+        let first_edge_us = f64::from(*EDGES_US.start());
+        let beam = BeamSpline::constant(first_edge_us - T0_US, u_hi, 1.0e4);
         let isotopes: Arc<[ResonanceData]> = Arc::new([
             synthetic_isotope(72, 180, 20.0, 0.01, 0.06),
             synthetic_isotope(74, 182, 20.3, 0.01, 0.06),
@@ -756,14 +757,15 @@ mod tests {
         let [back_a, back_b, back_c] = [0.05, 0.5, -0.01];
         let (with, without) = (counts([back_a, back_b, back_c]), counts([0.0; 3]));
         let bins = with.len() / 2;
-        let clock = TOF_FACTOR * 25.0;
+        let clock = TOF_FACTOR * FLIGHT_PATH_M;
         for k in 0..bins {
-            let u = 350.5 + k as f64 - 3.0;
+            let u = first_edge_us + 0.5 + k as f64 - T0_US;
             let root_e = clock / u;
             let b = back_a + back_b / root_e + back_c * root_e;
             let slope = back_b / clock - back_c * clock / (u * u);
             let curvature = 2.0 * back_c * clock / u.powi(3);
-            let (alpha, beta, r) = (0.35 * root_e + 0.05, 0.25, 0.15);
+            let energy = root_e * root_e;
+            let (alpha, beta, r) = (ALPHA.eval(energy), BETA.eval(energy), R.eval(energy));
             let mean = 3.0 / alpha + r / beta;
             let square = mean * mean + 3.0 / (alpha * alpha) + r * (2.0 - r) / (beta * beta);
             let lagged = (with[bins + k] - without[bins + k]) / (charge_ratio * normalization);
