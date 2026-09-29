@@ -83,7 +83,6 @@ pub struct Measurement {
     pub temperature_k: Value,
 }
 
-/// The fitted densities, temperature, normalization and background.
 #[derive(Debug, Clone)]
 pub struct CountsFit {
     /// Areal density of each isotope in atoms/barn, in the order given.
@@ -490,8 +489,6 @@ fn finite(isotope: &ResonanceData) -> bool {
         })
 }
 
-/// Positions in the parameter vector: the beam's coefficients, then the
-/// densities, the temperature, the normalization and `BackA`, `BackB`, `BackC`.
 #[derive(Clone, Copy)]
 struct Layout {
     densities: usize,
@@ -522,8 +519,6 @@ struct TwoRunModel {
     cross_sections: RefCell<Option<CrossSections>>,
 }
 
-/// The beam per µs at each grid point: `φ` of the open-beam run, and
-/// `c_q·a·φ`, `c_q·a·φ·T` and `c_q·a·φ·(T + b)` of the sample run.
 struct Beams {
     open: Vec<f64>,
     normalized: Vec<f64>,
