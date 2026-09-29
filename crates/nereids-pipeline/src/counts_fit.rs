@@ -94,8 +94,8 @@ pub struct Measurement {
     pub charge_ratio: f64,
     /// `a`, the normalization of the sample run, at least 0.
     pub normalization: Value,
-    /// `BackA`, `BackB` in √eV and `BackC` in 1/√eV of the background
-    /// `b(E) = BackA + BackB/√E + BackC·√E`, each any real number.
+    /// `BackA` (dimensionless), `BackB` in √eV and `BackC` in 1/√eV of the
+    /// background `b(E) = BackA + BackB/√E + BackC·√E`, each any real number.
     pub background: [Value; 3],
     /// Each isotope in the sample with its areal density in atoms/barn, known
     /// or fitted, at least 0.
@@ -104,6 +104,7 @@ pub struct Measurement {
     pub temperature_k: Value,
 }
 
+/// The fitted densities, temperature, normalization and background.
 #[derive(Debug, Clone)]
 pub struct CountsFit {
     /// Areal density of each isotope in atoms/barn, in the order given: the
@@ -113,8 +114,10 @@ pub struct CountsFit {
     pub temperature_k: f64,
     /// The normalization `a`: the known one, or the fitted one.
     pub normalization: f64,
-    /// `BackA`, `BackB` in √eV and `BackC` in 1/√eV, each the known or the
-    /// fitted one.  SAMMY's card-set-6 values are `normalization` times these.
+    /// `BackA` (dimensionless), `BackB` in √eV and `BackC` in 1/√eV, each the
+    /// known or the fitted one.  SAMMY's `BackA`, `BackB`, `BackC` are
+    /// `normalization` times these, to within the background's change over
+    /// the pulse's delay.
     pub background: [f64; 3],
     /// Covariance of the fitted quantities among the densities, in the order
     /// given, the temperature, the normalization, `BackA`, `BackB` and
