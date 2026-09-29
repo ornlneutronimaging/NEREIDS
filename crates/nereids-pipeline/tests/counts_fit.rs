@@ -831,6 +831,19 @@ fn measurements_the_fit_does_not_describe_are_refused() {
         refused(&|m| m.background[0] = Value::Fitted(-2.0)),
         PipelineError::UnmodelledCounts { run: "sample", .. }
     ));
+    let black = [(isotope.clone(), 4.0e3 / 7805.1)];
+    let counts = expected(&setup, &beam(1.0e4), &black);
+    let mut empty = measurement(&setup, (rounded(&counts.0), rounded(&counts.1)), &black);
+    empty.background[0] = Value::Fitted(-1e-5);
+    match fit_counts(&empty, &calibration(&setup)) {
+        Err(PipelineError::UnmodelledCounts {
+            run: "sample",
+            counts: 0.0,
+            predicted,
+            ..
+        }) => assert!(predicted < 0.0, "{predicted}"),
+        other => panic!("{other:?}"),
+    }
     invalid(&|m| m.isotopes.clear());
     invalid(&|m| m.isotopes.push((isotope.clone(), Value::Fitted(THIN))));
     invalid(&|m| m.isotopes[0].1 = Value::Known(-1.0));
