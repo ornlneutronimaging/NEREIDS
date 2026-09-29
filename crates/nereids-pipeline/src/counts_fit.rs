@@ -45,6 +45,7 @@ impl Value {
         self,
         name: impl Into<Cow<'static, str>>,
         range: RangeInclusive<f64>,
+        allowed: &str,
     ) -> Result<FitParameter, PipelineError> {
         let name = name.into();
         let (value, lower, upper) = match self {
@@ -61,10 +62,13 @@ impl Value {
             && range.contains(&upper)
             && (lower..=upper).contains(&value))
         {
-            return Err(PipelineError::InvalidParameter(format!(
-                "{name} must be finite and in {range:?}, and any bounds lower < upper in it \
-                 with the start between them; got {self:?}"
-            )));
+            return Err(PipelineError::InvalidParameter(match self {
+                Self::Within { .. } => format!(
+                    "{name} must be {allowed}, with bounds lower < upper and a finite start \
+                     between them; got {self:?}"
+                ),
+                _ => format!("{name} must be finite and {allowed}; got {self:?}"),
+            }));
         }
         Ok(FitParameter {
             name,
@@ -251,18 +255,25 @@ pub fn fit_counts(
             "the charge ratio must be finite and positive, got {charge_ratio}"
         ));
     }
-    let normalization =
-        normalization.parameter("normalization", f64::MIN_POSITIVE..=f64::INFINITY)?;
+    let normalization = normalization.parameter(
+        "normalization",
+        f64::MIN_POSITIVE..=f64::INFINITY,
+        "positive",
+    )?;
     let background = ["b0", "b1", "b2"]
         .into_iter()
         .zip(background)
-        .map(|(name, term)| term.parameter(name, f64::NEG_INFINITY..=f64::INFINITY))
+        .map(|(name, term)| term.parameter(name, f64::NEG_INFINITY..=f64::INFINITY, "of any sign"))
         .collect::<Result<Vec<FitParameter>, PipelineError>>()?;
     if isotopes.is_empty() {
         return invalid("the sample has no isotopes".into());
     }
     let (t_low, t_high) = TEMPERATURE_BOUNDS_K;
-    let temperature = temperature_k.parameter("temperature", t_low..=t_high)?;
+    let temperature = temperature_k.parameter(
+        "temperature",
+        t_low..=t_high,
+        &format!("within {t_low}–{t_high} K"),
+    )?;
     let reach_k = if temperature.fixed {
         temperature.value
     } else {
@@ -283,6 +294,7 @@ pub fn fit_counts(
         densities.push(density.parameter(
             format!("density of {}", isotope.isotope),
             0.0..=f64::INFINITY,
+            "0 or more",
         )?);
         if !finite(isotope) {
             return invalid(format!(
