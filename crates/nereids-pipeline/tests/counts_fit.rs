@@ -1014,7 +1014,7 @@ fn edge_fit(
 }
 
 #[test]
-fn a_temperature_on_the_box_edge_withholds_the_covariance() {
+fn only_a_temperature_on_the_box_edge_withholds_the_whole_covariance() {
     let setup = standard();
     let hot = edge_fit(
         &setup,
@@ -1024,6 +1024,20 @@ fn a_temperature_on_the_box_edge_withholds_the_covariance() {
         TEMPERATURE_K,
     );
     assert_eq!(hot.temperature_k, 5000.0);
+
+    let sample = [(hafnium_like(20.0), THIN)];
+    let counts = expected(&setup, &beam(1.0e6), &sample);
+    let mut m = measurement(&setup, (rounded(&counts.0), rounded(&counts.1)), &sample);
+    m.temperature_k = Value::Within {
+        start: 150.0,
+        lower: 100.0,
+        upper: 200.0,
+    };
+    let bounded = fit_counts(&m, &calibration(&setup)).expect("fit");
+    assert!(bounded.converged);
+    assert_eq!(bounded.temperature_k, 200.0);
+    assert_eq!(bounded.on_bound, [false, true]);
+    assert!(error_bar(&bounded, 0).is_finite());
 
     let setup = Setup {
         simulator_step_us: 1.0 / 1024.0,

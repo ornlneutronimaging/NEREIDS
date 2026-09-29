@@ -125,8 +125,8 @@ pub struct CountsFit {
     /// at the fit, scaled by `overdispersion`, or at the Poisson scale when
     /// that is `None`.  The row and column of a quantity on one of its bounds,
     /// or that the counts do not determine, are NaN; every entry is NaN
-    /// when a fitted temperature ends on one of its bounds.  `None` when the
-    /// fit did not converge.
+    /// when a fitted temperature ends at 1 K or 5000 K.  `None` when the fit
+    /// did not converge.
     ///
     /// The error bars take the [`Calibration`] passed to [`fit_counts`] as
     /// exact.  They are not reliable where the counts barely determine a
@@ -400,10 +400,8 @@ pub fn fit_counts(
 
     let overdispersion = overdispersion(&observed, &fit);
     let free = parameters.free_indices();
-    let on_edge = free
-        .iter()
-        .position(|&i| i == layout.temperature)
-        .is_some_and(|p| fit.result.on_bound[p]);
+    let on_edge = free.contains(&layout.temperature)
+        && [t_low, t_high].contains(&fit.result.params[layout.temperature]);
     let scale = if on_edge {
         f64::NAN
     } else {
