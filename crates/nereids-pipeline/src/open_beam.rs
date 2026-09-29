@@ -30,7 +30,7 @@ pub struct Calibration {
 #[derive(Debug, Clone)]
 pub struct OpenBeamFit {
     /// The beam per µs of flight time over the flight-time grid's range; its
-    /// knots span the first edge's flight time to the grid's slow end.
+    /// knots span the flight times of the first and last edges.
     /// `covariance` shows how well the counts determine it.
     pub beam: BeamSpline,
     /// Half the Poisson deviance at the fit.
@@ -66,9 +66,10 @@ pub struct OpenBeamFit {
 
 /// Fit the beam to the raw open-beam counts `open_counts` of the time bins
 /// `time_edges_us` (µs).  `ln φ`, the logarithm of the beam, is a cubic spline
-/// in `ln u` with knots from the first edge's flight time to the flight-time
-/// grid's slow end; neutrons faster than the grid's range, each reaching the
-/// bins with less than
+/// in `ln u` with knots from the first edge's flight time to the last edge's;
+/// outside them the beam is the spline's continuation, which reaches the bins
+/// only through the pulse's delay or, for a folded pulse, its early tail.
+/// Neutrons faster than the grid's range, each reaching the bins with less than
 /// [`NEGLIGIBLE_ARRIVAL_PROBABILITY`](nereids_physics::ikeda_carpenter::NEGLIGIBLE_ARRIVAL_PROBABILITY)
 /// chance, are left out.
 ///
@@ -125,8 +126,8 @@ pub fn fit_open_beam(
         )));
     }
 
-    let (_, u_last) = grid.range_us();
     let u_first = time_edges_us[0] - calibration.t0_us;
+    let u_last = time_edges_us[time_edges_us.len() - 1] - calibration.t0_us;
     let per_unit_beam = grid.predict(&vec![1.0; grid.flight_times_us().len()])?;
     let per_us = open_counts.iter().sum::<f64>() / per_unit_beam.iter().sum::<f64>();
     let mut ladder = vec![fit_beam(
