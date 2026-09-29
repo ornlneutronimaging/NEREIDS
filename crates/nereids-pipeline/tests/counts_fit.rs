@@ -210,7 +210,10 @@ fn measurement(
         charge_ratio: CHARGE_RATIO,
         normalization: Value::Known(1.0),
         background: [Value::Known(0.0); 3],
-        isotopes: isotopes.to_vec(),
+        isotopes: isotopes
+            .iter()
+            .map(|(d, n)| (d.clone(), *n, None))
+            .collect(),
         temperature_k: Value::Known(TEMPERATURE_K),
     }
 }
@@ -229,34 +232,62 @@ fn error_bar(fit: &CountsFit, i: usize) -> f64 {
 }
 
 #[test]
-fn densities_normalization_and_background_are_recovered_from_starts_on_either_side() {
+fn densities_normalization_and_background_are_recovered_and_follow_a_density_on_its_bound() {
     let setup = standard();
     for truth in [THIN, SATURATED] {
         let isotope = hafnium_like(20.0);
         let sample = [(isotope.clone(), truth)];
         let counts = with_background(&setup, &beam(1.0e6), &sample, TEMPERATURE_K, TERMS);
-        for (start, a, back_a, back_b) in [
-            (0.5 * truth, 1.0, 0.02, 0.2),
-            (2.0 * truth, 0.85, 0.12, 0.8),
-        ] {
+        let fit = |(start, a, back_a, back_b): (f64, f64, f64, f64), bounds| {
             let mut m = recorded(&setup, counts.clone(), &[(isotope.clone(), start)]);
+            m.isotopes[0].2 = bounds;
             m.normalization = Value::Fitted(a);
             m.background[0] = Value::Fitted(back_a);
             m.background[1] = Value::Fitted(back_b);
             let fit = fit_counts(&m, &calibration(&setup)).expect("fit");
             assert!(fit.converged, "{truth} from {start}");
             assert_eq!(fit.overdispersion, Some(1.0), "{truth} from {start}");
-            let pull = |i: usize, x: f64, t: f64| (x - t) / error_bar(&fit, i);
-            let pulls = [
-                pull(0, fit.densities[0], truth),
-                pull(1, fit.normalization, TERMS[0]),
-                pull(2, fit.background[0], TERMS[1]),
-                pull(3, fit.background[1], TERMS[2]),
-            ];
+            fit
+        };
+        let estimates = |fit: &CountsFit| {
+            [
+                fit.densities[0],
+                fit.normalization,
+                fit.background[0],
+                fit.background[1],
+            ]
+        };
+        let starts = [
+            (0.5 * truth, 1.0, 0.02, 0.2),
+            (2.0 * truth, 0.85, 0.12, 0.8),
+        ];
+        let free = starts.map(|start| fit(start, None));
+        for fit in &free {
+            assert_eq!(fit.density_on_bound, [false], "{truth}");
+            let pulls: Vec<f64> = estimates(fit)
+                .iter()
+                .zip([truth, TERMS[0], TERMS[1], TERMS[2]])
+                .enumerate()
+                .map(|(i, (x, t))| (x - t) / error_bar(fit, i))
+                .collect();
             assert!(
                 pulls.iter().all(|p| p.abs() <= BOUND.sqrt()),
-                "{truth} from {start}: {pulls:?}"
+                "{truth}: {pulls:?}"
             );
+        }
+
+        let free = &free[0];
+        let upper = truth - 3.0 * error_bar(free, 0);
+        let bounded = fit(starts[0], Some(0.25 * truth..=upper));
+        assert_eq!(bounded.densities[0], upper, "{truth}");
+        assert_eq!(bounded.density_on_bound, [true], "{truth}");
+        let covariance = free.covariance.as_ref().expect("covariance");
+        let (x, x_free) = (estimates(&bounded), estimates(free));
+        for i in 1..4 {
+            let regression = covariance.get(i, 0) / covariance.get(0, 0);
+            let conditional = x_free[i] + regression * (upper - x_free[0]);
+            let pull = (x[i] - conditional) / error_bar(free, i);
+            assert!(pull.abs() <= BOUND.sqrt(), "{truth} {i}: {pull}");
         }
     }
 }
@@ -783,9 +814,12 @@ fn measurements_the_fit_does_not_describe_are_refused() {
         PipelineError::UnmodelledCounts { run: "sample", .. }
     ));
     invalid(&|m| m.isotopes.clear());
-    invalid(&|m| m.isotopes.push((isotope.clone(), THIN)));
+    invalid(&|m| m.isotopes.push((isotope.clone(), THIN, None)));
     invalid(&|m| m.isotopes[0].1 = -1.0);
     invalid(&|m| m.isotopes[0].1 = f64::NAN);
+    invalid(&|m| m.isotopes[0].2 = Some(2.0 * THIN..=3.0 * THIN));
+    invalid(&|m| m.isotopes[0].2 = Some(THIN..=THIN));
+    invalid(&|m| m.isotopes[0].2 = Some(-THIN..=2.0 * THIN));
     for temperature_k in [0.5, 6000.0, f64::NAN] {
         invalid(&|m| m.temperature_k = Value::Known(temperature_k));
         invalid(&|m| m.temperature_k = Value::Fitted(temperature_k));
