@@ -29,7 +29,7 @@ const TEMPERATURE_K: f64 = 300.0;
 const CHARGE_RATIO: f64 = 1.2;
 const THIN: f64 = 7.687e-4;
 const SATURATED: f64 = 3.844e-2;
-const TERMS: [f64; 4] = [0.93, 0.05, 0.5, 0.0];
+const TERMS: [f64; 4] = [0.93, 0.05, 0.5, 0.01];
 
 struct Setup {
     edges: Vec<f64>,
@@ -234,7 +234,10 @@ fn error_bar(fit: &CountsFit, i: usize) -> f64 {
 #[test]
 fn densities_normalization_and_background_are_recovered_and_follow_a_density_on_its_bound() {
     let setup = standard();
-    for truth in [THIN, SATURATED] {
+    for (truth, back_c) in [
+        (THIN, Value::Known(TERMS[3])),
+        (SATURATED, Value::Fitted(0.0)),
+    ] {
         let isotope = hafnium_like(20.0);
         let sample = [(isotope.clone(), truth)];
         let counts = with_background(&setup, &beam(1.0e6), &sample, TEMPERATURE_K, TERMS);
@@ -242,8 +245,7 @@ fn densities_normalization_and_background_are_recovered_and_follow_a_density_on_
             let mut m = recorded(&setup, counts.clone(), &sample);
             m.isotopes[0].1 = density;
             m.normalization = Value::Fitted(a);
-            m.background[0] = Value::Fitted(back_a);
-            m.background[1] = Value::Fitted(back_b);
+            m.background = [Value::Fitted(back_a), Value::Fitted(back_b), back_c];
             let fit = fit_counts(&m, &calibration(&setup)).expect("fit");
             assert!(fit.converged, "{truth} from {density:?}");
             assert_eq!(fit.overdispersion, Some(1.0), "{truth} from {density:?}");
@@ -255,6 +257,7 @@ fn densities_normalization_and_background_are_recovered_and_follow_a_density_on_
                 fit.normalization,
                 fit.background[0],
                 fit.background[1],
+                fit.background[2],
             ]
         };
         let starts = [
@@ -263,10 +266,11 @@ fn densities_normalization_and_background_are_recovered_and_follow_a_density_on_
         ];
         let free = starts.map(fit);
         for fit in &free {
-            assert_eq!(fit.on_bound, [false; 4], "{truth}");
+            assert!(!fit.on_bound.contains(&true), "{truth}");
             let pulls: Vec<f64> = estimates(fit)
                 .iter()
-                .zip([truth, TERMS[0], TERMS[1], TERMS[2]])
+                .zip([truth, TERMS[0], TERMS[1], TERMS[2], TERMS[3]])
+                .take(fit.on_bound.len())
                 .enumerate()
                 .map(|(i, (x, t))| (x - t) / error_bar(fit, i))
                 .collect();
@@ -285,10 +289,11 @@ fn densities_normalization_and_background_are_recovered_and_follow_a_density_on_
         };
         let bounded = fit((density, 1.0, 0.02, 0.2));
         assert_eq!(bounded.densities[0], upper, "{truth}");
-        assert_eq!(bounded.on_bound, [true, false, false, false], "{truth}");
+        assert!(bounded.on_bound[0], "{truth}");
+        assert!(!bounded.on_bound[1..].contains(&true), "{truth}");
         let covariance = free.covariance.as_ref().expect("covariance");
         let (x, x_free) = (estimates(&bounded), estimates(free));
-        for i in 1..4 {
+        for i in 1..free.on_bound.len() {
             let regression = covariance.get(i, 0) / covariance.get(0, 0);
             let conditional = x_free[i] + regression * (upper - x_free[0]);
             let pull = (x[i] - conditional) / error_bar(free, i);
@@ -664,6 +669,7 @@ fn covariance_against_information(temperature: Value) {
     m.normalization = Value::Fitted(TERMS[0]);
     m.background[0] = Value::Fitted(TERMS[1]);
     m.background[1] = Value::Fitted(TERMS[2]);
+    m.background[2] = Value::Known(TERMS[3]);
     let fit = fit_counts(&m, &calibration(&setup)).expect("fit");
     let fitted_temperature = matches!(temperature, Value::Fitted(_));
     let quantities = truth.len() + usize::from(fitted_temperature) + 3;
