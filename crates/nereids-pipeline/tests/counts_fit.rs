@@ -1134,6 +1134,7 @@ mod error_bar_pulls {
         setup: Setup,
         sample: (ResonanceData, f64),
         temperature_k: Value,
+        terms: Option<[f64; 4]>,
         level: f64,
         counts_per_neutron: f64,
         open_run_fraction: f64,
@@ -1150,10 +1151,12 @@ mod error_bar_pulls {
 
     impl Ensemble {
         fn expected(&self) -> (Vec<f64>, Vec<f64>) {
-            let (open, sample) = expected(
+            let (open, sample) = with_background(
                 &self.setup,
                 &beam(self.level),
                 std::slice::from_ref(&self.sample),
+                TEMPERATURE_K,
+                self.terms.unwrap_or([1.0, 0.0, 0.0, 0.0]),
             );
             let open = open.iter().map(|mu| mu * self.open_run_fraction).collect();
             (open, sample)
@@ -1169,6 +1172,10 @@ mod error_bar_pulls {
             let mut m = measurement(&self.setup, counts, &[(self.sample.0.clone(), start.0)]);
             m.charge_ratio = CHARGE_RATIO / self.open_run_fraction;
             m.temperature_k = start.1;
+            if let Some([a, b0, b1, b2]) = self.terms {
+                m.normalization = Value::Fitted(a);
+                m.background = [Value::Fitted(b0), Value::Fitted(b1), Value::Known(b2)];
+            }
             m
         }
 
@@ -1187,13 +1194,17 @@ mod error_bar_pulls {
                 estimates.push(fit.temperature_k);
                 truths.push(TEMPERATURE_K);
             }
+            if let Some(terms) = self.terms {
+                estimates.extend([fit.normalization, fit.background[0], fit.background[1]]);
+                truths.extend(&terms[..3]);
+            }
             let pulls: Vec<f64> = estimates
                 .iter()
                 .zip(&truths)
                 .enumerate()
                 .map(|(i, (x, truth))| (x - truth) / covariance.get(i, i).sqrt())
                 .collect();
-            let reported_correlation = (estimates.len() == 2).then(|| {
+            let reported_correlation = (estimates.len() >= 2).then(|| {
                 covariance.get(0, 1) / (covariance.get(0, 0) * covariance.get(1, 1)).sqrt()
             });
             pulls.iter().all(|p| p.is_finite()).then_some(Draw {
@@ -1286,6 +1297,7 @@ mod error_bar_pulls {
             setup: standard(),
             sample: (two_resonances(), SATURATED),
             temperature_k,
+            terms: None,
             level,
             counts_per_neutron,
             open_run_fraction,
@@ -1300,6 +1312,7 @@ mod error_bar_pulls {
             setup: standard(),
             sample: (hafnium_like(20.0), THIN),
             temperature_k: Value::Fitted(TEMPERATURE_K),
+            terms: None,
             level: 1.0e5,
             counts_per_neutron: 1.0,
             open_run_fraction: 1.0,
@@ -1365,5 +1378,21 @@ mod error_bar_pulls {
         let draws = ensemble.draws_from_truth();
         let kept = check(&draws);
         overdispersion_matches(&kept, 7.0);
+    }
+
+    #[test]
+    #[ignore = "slow; runs nightly"]
+    fn error_bars_with_the_normalization_and_background_fitted_are_the_scatter() {
+        let ensemble = Ensemble {
+            terms: Some(TERMS),
+            ..saturated(
+                Value::Fitted(TEMPERATURE_K),
+                1.0e4,
+                1.0,
+                1.0,
+                60_000..60_400,
+            )
+        };
+        check(&ensemble.draws_from_truth());
     }
 }
