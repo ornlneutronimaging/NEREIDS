@@ -340,7 +340,8 @@ pub(crate) fn fit_on_halved_grids<M: FitModel>(
 }
 
 /// The counts `model` predicts, each bin recording the fraction `live` of
-/// them.
+/// them; `model`'s Jacobian is passed the recorded counts as `y_current`, so
+/// it may read only their length.
 pub(crate) struct Recorded<'a, M> {
     pub(crate) model: M,
     pub(crate) live: &'a [f64],

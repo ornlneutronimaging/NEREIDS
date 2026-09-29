@@ -64,8 +64,7 @@ pub struct Measurement {
     /// The fraction of the sample run's neutrons arriving in each bin that the
     /// detector records, in (0, 1]; `None` records every one.
     pub sample_live: Option<Vec<f64>>,
-    /// The sample run's beam over the open-beam run's, the ratio of their
-    /// proton charges.
+    /// `c_q`, the sample run's proton charge over the open-beam run's.
     pub charge_ratio: f64,
     /// `a`, the normalization of the sample run, known or fitted from the
     /// value given.
@@ -189,9 +188,9 @@ pub struct CountsFit {
 /// energy, are not inside a single one of its evaluated (SLBW, MLBW or
 /// Reich–Moore) resolved ranges;
 /// [`PipelineError::UnmodelledCounts`] if at the fit, converged or not, a bin
-/// holds counts predicted below [`NEGLIGIBLE_PREDICTION`]: starting values
-/// predicting no counts, or negative ones, where counts were recorded, which
-/// the fitter cannot leave;
+/// holds counts predicted below [`NEGLIGIBLE_PREDICTION`]: starting or known
+/// values predicting no counts, or negative ones, where counts were recorded,
+/// which the fitter cannot leave;
 /// everything [`fit_open_beam`] refuses; [`PipelineError::FlightTimeGrid`]
 /// for the grid's refusals, including more points than it allows;
 /// [`PipelineError::Fitting`] if the fitter fails, or the cross sections
