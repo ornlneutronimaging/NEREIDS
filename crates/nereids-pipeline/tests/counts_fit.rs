@@ -599,11 +599,11 @@ fn inverse(mut a: Vec<Vec<f64>>) -> Vec<Vec<f64>> {
 
 #[test]
 fn the_covariance_is_the_inverse_of_the_information_in_the_counts() {
-    covariance_against_information(Value::Known(TEMPERATURE_K), Value::Fitted);
-    covariance_against_information(Value::Fitted(1000.0), Value::Known);
+    covariance_against_information(Value::Known(TEMPERATURE_K));
+    covariance_against_information(Value::Fitted(1000.0));
 }
 
-fn covariance_against_information(temperature: Value, scale: fn(f64) -> Value) {
+fn covariance_against_information(temperature: Value) {
     let setup = standard();
     let truth = [
         (hafnium_like(20.0), 3.0 / 7805.1),
@@ -612,13 +612,12 @@ fn covariance_against_information(temperature: Value, scale: fn(f64) -> Value) {
     let counts = with_background(&setup, &beam(1.0e6), &truth, TEMPERATURE_K, TERMS);
     let mut m = recorded(&setup, counts, &truth);
     m.temperature_k = temperature;
-    m.normalization = scale(TERMS[0]);
-    m.background[0] = scale(TERMS[1]);
-    m.background[1] = scale(TERMS[2]);
+    m.normalization = Value::Fitted(TERMS[0]);
+    m.background[0] = Value::Fitted(TERMS[1]);
+    m.background[1] = Value::Fitted(TERMS[2]);
     let fit = fit_counts(&m, &calibration(&setup)).expect("fit");
     let fitted_temperature = matches!(temperature, Value::Fitted(_));
-    let scales = matches!(m.normalization, Value::Fitted(_));
-    let quantities = truth.len() + usize::from(fitted_temperature) + 3 * usize::from(scales);
+    let quantities = truth.len() + usize::from(fitted_temperature) + 3;
     let (low, high) = FlightTimeGrid::new(&setup.edges, T0_US, &setup.pulse)
         .expect("grid")
         .range_us();
@@ -645,7 +644,7 @@ fn covariance_against_information(temperature: Value, scale: fn(f64) -> Value) {
     let mut terms = [fit.normalization; 4];
     terms[1..].copy_from_slice(&fit.background);
     let first_term = truth.len() + usize::from(fitted_temperature);
-    for i in (0..3).filter(|_| scales) {
+    for i in 0..3 {
         let pull = (terms[i] - TERMS[i]) / error_bar(&fit, first_term + i);
         assert!(pull.abs() <= BOUND.sqrt(), "term {i}: {pull}");
     }
@@ -665,15 +664,14 @@ fn covariance_against_information(temperature: Value, scale: fn(f64) -> Value) {
         let counts = open.into_iter().chain(sample);
         counts.zip(&live).map(|(c, l)| l * c).collect()
     };
-    let expected_at = |setup: &Setup, beam: &dyn Fn(f64) -> f64, sample: &[_], kelvin: f64| {
-        with_background(setup, beam, sample, kelvin, terms)
-    };
     let temperature_k = fit.temperature_k;
-    let mu = joined(expected_at(
+    let beam = beam_times(None, 0.0);
+    let mu = joined(with_background(
         &setup,
-        &beam_times(None, 0.0),
+        &beam,
         &fitted,
         temperature_k,
+        terms,
     ));
     let coefficients = fit.beam.coefficients().len();
     let columns: Vec<Vec<f64>> = (0..coefficients + quantities)
@@ -682,32 +680,22 @@ fn covariance_against_information(temperature: Value, scale: fn(f64) -> Value) {
                 if p < coefficients {
                     let h = 1e-4;
                     let beam = beam_times(Some(p), sign * h);
-                    (
-                        joined(expected_at(&setup, &beam, &fitted, temperature_k)),
-                        h,
-                    )
-                } else if p < coefficients + fitted.len() {
-                    let mut sample = fitted.clone();
-                    let h = 1e-4 * sample[p - coefficients].1;
-                    sample[p - coefficients].1 += sign * h;
-                    let beam = beam_times(None, 0.0);
-                    (
-                        joined(expected_at(&setup, &beam, &sample, temperature_k)),
-                        h,
-                    )
-                } else if p < first_term + coefficients {
-                    let h = 1e-4 * temperature_k;
-                    let beam = beam_times(None, 0.0);
-                    let shifted_k = temperature_k + sign * h;
-                    (joined(expected_at(&setup, &beam, &fitted, shifted_k)), h)
-                } else {
-                    let mut shifted = terms;
-                    let h = 1e-4 * terms[p - first_term - coefficients];
-                    shifted[p - first_term - coefficients] += sign * h;
-                    let beam = beam_times(None, 0.0);
-                    let counts = with_background(&setup, &beam, &fitted, temperature_k, shifted);
-                    (joined(counts), h)
+                    let counts = with_background(&setup, &beam, &fitted, temperature_k, terms);
+                    return (joined(counts), h);
                 }
+                let (mut sample, mut kelvin, mut shifted) = (fitted.clone(), temperature_k, terms);
+                let q = p - coefficients;
+                let value = if q < fitted.len() {
+                    &mut sample[q].1
+                } else if q < first_term {
+                    &mut kelvin
+                } else {
+                    &mut shifted[q - first_term]
+                };
+                let h = 1e-4 * *value;
+                *value += sign * h;
+                let counts = with_background(&setup, &beam, &sample, kelvin, shifted);
+                (joined(counts), h)
             };
             let ((up, h), (down, _)) = (shifted(1.0), shifted(-1.0));
             up.iter()
