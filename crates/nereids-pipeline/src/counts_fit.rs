@@ -325,8 +325,7 @@ pub fn fit_counts(
     };
 
     let open = fit_open_beam(time_edges_us, open_counts, calibration, Some(&open_live))?;
-    let beam_coefficients = open.beam.coefficients().len();
-    let temperature_index = beam_coefficients + isotopes.len();
+    let layout = Layout::new(open.beam.coefficients().len(), isotopes.len());
     let temperature = match temperature_k {
         Value::Known(t) => FitParameter::fixed("temperature", *t),
         Value::Fitted(t) => FitParameter {
@@ -371,7 +370,7 @@ pub fn fit_counts(
                 live: &live,
             })
         })?;
-        let fitted_k = fit.result.params[temperature_index];
+        let fitted_k = fit.result.params[layout.temperature];
         if !fit.converged || 2.0 * fit.step_us <= 0.5 * narrowest_us(fitted_k)? {
             break (fit, rule_halvings);
         }
@@ -397,7 +396,7 @@ pub fn fit_counts(
     let free = parameters.free_indices();
     let on_edge = free
         .iter()
-        .position(|&i| i == temperature_index)
+        .position(|&i| i == layout.temperature)
         .is_some_and(|p| fit.result.on_bound[p]);
     let scale = if on_edge {
         f64::NAN
@@ -405,7 +404,7 @@ pub fn fit_counts(
         overdispersion.unwrap_or(1.0)
     };
     let sample_quantities: Vec<usize> = (0..free.len())
-        .filter(|&p| free[p] >= beam_coefficients)
+        .filter(|&p| free[p] >= layout.densities)
         .collect();
     let covariance = fit
         .result
@@ -422,15 +421,14 @@ pub fn fit_counts(
             }
             block
         });
+    let params = &fit.result.params;
     Ok(CountsFit {
-        densities: fit.result.params[beam_coefficients..temperature_index].to_vec(),
-        temperature_k: fit.result.params[temperature_index],
-        normalization: fit.result.params[temperature_index + 1],
-        background: [2, 3, 4].map(|i| fit.result.params[temperature_index + i]),
+        densities: params[layout.densities..layout.temperature].to_vec(),
+        temperature_k: params[layout.temperature],
+        normalization: params[layout.normalization],
+        background: [0, 1, 2].map(|i| params[layout.background + i]),
         covariance,
-        beam: open
-            .beam
-            .with_coefficients(&fit.result.params[..beam_coefficients]),
+        beam: open.beam.with_coefficients(&params[..layout.densities]),
         beam_at_limit: open.at_limit,
         deviance: fit.result.deviance,
         converged: fit.converged,
@@ -475,14 +473,45 @@ fn finite(isotope: &ResonanceData) -> bool {
         })
 }
 
+/// Positions in the parameter vector: the beam's coefficients, then the
+/// densities, the temperature, the normalization and `BackA`, `BackB`, `BackC`.
+#[derive(Clone, Copy)]
+struct Layout {
+    densities: usize,
+    temperature: usize,
+    normalization: usize,
+    background: usize,
+}
+
+impl Layout {
+    fn new(beam_coefficients: usize, isotopes: usize) -> Self {
+        let temperature = beam_coefficients + isotopes;
+        Self {
+            densities: beam_coefficients,
+            temperature,
+            normalization: temperature + 1,
+            background: temperature + 2,
+        }
+    }
+}
+
 struct TwoRunModel {
     beam: OpenBeamModel,
     isotopes: Arc<[ResonanceData]>,
     energies: Vec<f64>,
     shapes: [Vec<f64>; 3],
     charge_ratio: f64,
-    temperature_index: usize,
+    layout: Layout,
     cross_sections: RefCell<Option<CrossSections>>,
+}
+
+/// The beam per µs at each grid point: `φ` of the open-beam run, and
+/// `c_q·a·φ`, `c_q·a·φ·T` and `c_q·a·φ·(T + b)` of the sample run.
+struct Beams {
+    open: Vec<f64>,
+    normalized: Vec<f64>,
+    transmitted: Vec<f64>,
+    sample: Vec<f64>,
 }
 
 struct CrossSections {
@@ -511,7 +540,7 @@ impl TwoRunModel {
             energies,
             shapes,
             charge_ratio,
-            temperature_index: beam.coefficients().len() + isotopes.len(),
+            layout: Layout::new(beam.coefficients().len(), isotopes.len()),
             cross_sections: RefCell::new(None),
         }
     }
@@ -549,14 +578,14 @@ impl TwoRunModel {
         }))
     }
 
-    fn beams(&self, params: &[f64]) -> Result<[Vec<f64>; 4], FittingError> {
-        let t = self.temperature_index;
-        let densities = &params[t - self.isotopes.len()..t];
-        let sigma = self.at(params[t])?;
-        let open = self.beam.beam(&params[..t - self.isotopes.len()]);
+    fn beams(&self, params: &[f64]) -> Result<Beams, FittingError> {
+        let layout = self.layout;
+        let densities = &params[layout.densities..layout.temperature];
+        let sigma = self.at(params[layout.temperature])?;
+        let open = self.beam.beam(&params[..layout.densities]);
         let normalized: Vec<f64> = open
             .iter()
-            .map(|phi| self.charge_ratio * params[t + 1] * phi)
+            .map(|phi| self.charge_ratio * params[layout.normalization] * phi)
             .collect();
         let (transmitted, sample) = normalized
             .iter()
@@ -567,7 +596,7 @@ impl TwoRunModel {
                     .zip(&sigma.values)
                     .map(|(n, sigma)| n * sigma[j])
                     .sum();
-                let background: f64 = params[t + 2..]
+                let background: f64 = params[layout.background..]
                     .iter()
                     .zip(&self.shapes)
                     .map(|(b, g)| b * g[j])
@@ -575,13 +604,18 @@ impl TwoRunModel {
                 (beam * (-depth).exp(), beam * ((-depth).exp() + background))
             })
             .unzip();
-        Ok([open, sample, transmitted, normalized])
+        Ok(Beams {
+            open,
+            normalized,
+            transmitted,
+            sample,
+        })
     }
 }
 
 impl FitModel for TwoRunModel {
     fn evaluate(&self, params: &[f64]) -> Result<Vec<f64>, FittingError> {
-        let [open, sample, ..] = self.beams(params)?;
+        let Beams { open, sample, .. } = self.beams(params)?;
         let mut counts = self.beam.counts(&open)?;
         counts.extend(self.beam.counts(&sample)?);
         Ok(counts)
@@ -593,23 +627,27 @@ impl FitModel for TwoRunModel {
         free_param_indices: &[usize],
         y_current: &[f64],
     ) -> Option<FlatMatrix> {
-        let [open, sample, transmitted, normalized] = self.beams(params).ok()?;
-        let temperature_index = self.temperature_index;
-        let sigma = self.at(params[temperature_index]).ok()?;
-        let beam_coefficients = temperature_index - self.isotopes.len();
+        let Beams {
+            open,
+            normalized,
+            transmitted,
+            sample,
+        } = self.beams(params).ok()?;
+        let layout = self.layout;
+        let sigma = self.at(params[layout.temperature]).ok()?;
         let mut jacobian = FlatMatrix::zeros(y_current.len(), free_param_indices.len());
         for (col, &index) in free_param_indices.iter().enumerate() {
-            let (open_slope, (base, sample_slope)) = if index < beam_coefficients {
+            let (open_slope, (base, sample_slope)) = if index < layout.densities {
                 let slope = self.beam.log_slope(index);
                 (slope.clone(), (&sample, slope))
-            } else if index < temperature_index {
-                let values = &sigma.values[index - beam_coefficients];
+            } else if index < layout.temperature {
+                let values = &sigma.values[index - layout.densities];
                 let slope = values.iter().map(|s| -s).collect();
                 (vec![0.0; open.len()], (&transmitted, slope))
-            } else if index == temperature_index {
+            } else if index == layout.temperature {
                 let broadening: Vec<f64> = (0..open.len())
                     .map(|j| {
-                        -params[beam_coefficients..temperature_index]
+                        -params[layout.densities..layout.temperature]
                             .iter()
                             .zip(&sigma.slopes)
                             .map(|(n, slope)| n * slope[j])
@@ -617,11 +655,11 @@ impl FitModel for TwoRunModel {
                     })
                     .collect();
                 (vec![0.0; open.len()], (&transmitted, broadening))
-            } else if index == temperature_index + 1 {
+            } else if index == layout.normalization {
                 let slope = vec![1.0 / params[index]; open.len()];
                 (vec![0.0; open.len()], (&sample, slope))
             } else {
-                let shape = self.shapes[index - temperature_index - 2].clone();
+                let shape = self.shapes[index - layout.background].clone();
                 (vec![0.0; open.len()], (&normalized, shape))
             };
             let times = |beam: &[f64], slope: &[f64]| -> Vec<f64> {
@@ -664,7 +702,7 @@ mod tests {
         let model = Recorded { model, live: &live };
         let counts = model.evaluate(&params).expect("counts");
         let mut colder = params.clone();
-        colder[model.model.temperature_index] = 250.0;
+        colder[model.model.layout.temperature] = 250.0;
         model.evaluate(&colder).expect("counts");
         let indices: Vec<usize> = (0..params.len()).collect();
         let jacobian = model
