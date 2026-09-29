@@ -847,6 +847,16 @@ fn measurements_the_fit_does_not_describe_are_refused() {
         }) => assert!(predicted < 0.0, "{predicted}"),
         other => panic!("{other:?}"),
     }
+    let mut huge = good.clone();
+    huge.normalization = Value::Known(1e308);
+    match fit_counts(&huge, &calibration(&setup)) {
+        Err(PipelineError::UnmodelledCounts {
+            run: "sample",
+            predicted,
+            ..
+        }) => assert!(!predicted.is_finite(), "{predicted}"),
+        other => panic!("{other:?}"),
+    }
     invalid(&|m| m.isotopes.clear());
     invalid(&|m| m.isotopes.push((isotope.clone(), Value::Fitted(THIN))));
     invalid(&|m| m.isotopes[0].1 = Value::Known(-1.0));

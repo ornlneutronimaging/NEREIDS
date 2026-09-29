@@ -226,7 +226,7 @@ pub struct CountsFit {
 /// spread of zero energy, are not inside a single one of its evaluated
 /// (SLBW, MLBW or Reich–Moore) resolved ranges;
 /// [`PipelineError::UnmodelledCounts`] if at the fit, converged or not, a bin
-/// is predicted negative counts, or holds counts predicted below
+/// is predicted negative or non-finite counts, or holds counts predicted below
 /// [`NEGLIGIBLE_PREDICTION`]: starting or known values the fitter cannot
 /// leave;
 /// everything [`fit_open_beam`] refuses; [`PipelineError::FlightTimeGrid`]
@@ -397,11 +397,14 @@ pub fn fit_counts(
         rule_k = fitted_k;
     };
 
-    if let Some((k, (&counts, &predicted))) = observed
-        .iter()
-        .zip(&fit.predicted)
-        .enumerate()
-        .find(|(_, (y, mu))| **mu < 0.0 || (**y > 0.0 && **mu < NEGLIGIBLE_PREDICTION))
+    if let Some((k, (&counts, &predicted))) =
+        observed
+            .iter()
+            .zip(&fit.predicted)
+            .enumerate()
+            .find(|(_, (y, mu))| {
+                !mu.is_finite() || **mu < 0.0 || (**y > 0.0 && **mu < NEGLIGIBLE_PREDICTION)
+            })
     {
         let run = if k < bins { "open-beam" } else { "sample" };
         return Err(PipelineError::UnmodelledCounts {
