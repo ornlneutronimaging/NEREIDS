@@ -1,4 +1,5 @@
-//! Areal densities of a sample's isotopes, fitted to the counts of an
+//! The areal densities of a sample's isotopes, its temperature, and the
+//! sample run's normalization and background, fitted to the counts of an
 //! open-beam run and a sample run recorded in the same time bins.
 
 use std::borrow::Cow;
@@ -119,12 +120,13 @@ pub struct CountsFit {
     pub background: [f64; 3],
     /// Covariance of the fitted quantities among the densities, in the order
     /// given, the temperature, the normalization, `b0`, `b1` and `b2`, in
-    /// that order: the inverse of the expected information
-    /// at the fit, scaled by `overdispersion`, or at the Poisson scale when
-    /// that is `None`.  The row and column of a quantity on one of its bounds,
-    /// or that the counts do not determine, are NaN; every entry is NaN
-    /// when a fitted temperature ends at 1 K or 5000 K.  `None` when the fit
-    /// did not converge.
+    /// that order: the inverse of the expected information at the fit,
+    /// scaled by `overdispersion`, or at the Poisson scale when that is
+    /// `None`.  The row and column of a quantity on one of its bounds, or
+    /// that the counts do not determine, are NaN, and the other entries are
+    /// conditional on every quantity that ended on a bound being held there;
+    /// every entry is NaN when a fitted temperature ends at 1 K or 5000 K.
+    /// `None` when the fit did not converge.
     ///
     /// The error bars take the [`Calibration`] passed to [`fit_counts`] as
     /// exact.  They are not reliable where the counts barely determine a
@@ -178,8 +180,9 @@ pub struct CountsFit {
 /// background is beam neutrons that reach the detector another way, so it
 /// passes through the pulse and scales with the normalization; SAMMY's
 /// `BackA`, `BackB`, `BackC` (`cro/mnrm1.f90`) are `a·b0`, `a·b1`, `a·b2`, to
-/// within the background's change over the pulse's delay.  Counts that bypass the
-/// pulse, such as gammas, are not modelled.  The beam `φ` has the intervals
+/// within the background's change over the pulse's delay.  SAMMY's
+/// `BackD·exp(−BackF/√E)` term, and counts that bypass the pulse, such as
+/// gammas, are not modelled.  The beam `φ` has the intervals
 /// [`fit_open_beam`] chooses and is fitted with the rest to both runs,
 /// starting from the open-beam fit.
 ///
@@ -199,7 +202,8 @@ pub struct CountsFit {
 /// converged with an overdispersion far above 1.  Where a black resonance
 /// empties bins and the background is near zero, a fitted background with no
 /// lower bound can drive a black bin's prediction to zero, and the fit ends
-/// unconverged; `b0` bounded below by 0 ends on that bound, converged.
+/// unconverged; with `b1` and `b2` known, `b0` bounded below by 0 ends on
+/// that bound, converged.
 ///
 /// The overdispersion scales the covariance; it assumes both runs share it
 /// and their bins are independent.
