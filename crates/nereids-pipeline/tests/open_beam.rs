@@ -7,7 +7,7 @@ use nereids_physics::ikeda_carpenter::{
 use nereids_physics::resolution::{ResolutionFunction, TOF_FACTOR};
 use nereids_pipeline::beam::BeamSpline;
 use nereids_pipeline::error::PipelineError;
-use nereids_pipeline::open_beam::{BOUND, Calibration, OpenBeamFit, fit_open_beam};
+use nereids_pipeline::open_beam::{self, BOUND, Calibration, OpenBeamFit};
 use nereids_pipeline::reference::Instrument;
 use rand::SeedableRng;
 use rand_chacha::ChaCha12Rng;
@@ -18,6 +18,7 @@ const T0_US: f64 = 3.0;
 const CLOCK: f64 = TOF_FACTOR * FLIGHT_PATH_M;
 const E_MIN_EV: f64 = 1.0;
 const E_MAX_EV: f64 = 200.0;
+const SIMULATOR_RANGE_EV: (f64, f64) = (10.0, 50.0);
 const SIMULATOR_STEP_US: f64 = 1.0 / 32.0;
 
 fn edges() -> Vec<f64> {
@@ -28,6 +29,7 @@ fn pulse(
     alpha: EnergyLaw,
     beta: EnergyLaw,
     r: EnergyLaw,
+    burst_sigma_us: Option<f64>,
     channel_fwhm_us: Option<f64>,
 ) -> Arc<IkedaCarpenter> {
     Arc::new(
@@ -36,7 +38,7 @@ fn pulse(
                 alpha,
                 beta,
                 r,
-                burst_sigma_us: None,
+                burst_sigma_us,
                 channel_fwhm_us,
             },
             FLIGHT_PATH_M,
@@ -54,7 +56,7 @@ fn pulse(
 fn pulses() -> Vec<(&'static str, Arc<IkedaCarpenter>)> {
     let c = EnergyLaw::Const;
     vec![
-        ("constant", pulse(c(0.565), c(0.25), c(0.15), None)),
+        ("constant", pulse(c(0.565), c(0.25), c(0.15), None, None)),
         (
             "energy laws",
             pulse(
@@ -62,9 +64,10 @@ fn pulses() -> Vec<(&'static str, Arc<IkedaCarpenter>)> {
                 EnergyLaw::SqrtE { a0: 0.02, a1: 0.2 },
                 EnergyLaw::ExpMilliEv { kappa: 5.0e4 },
                 None,
+                None,
             ),
         ),
-        ("folded", pulse(c(0.565), c(0.25), c(0.15), Some(2.0))),
+        ("folded", pulse(c(0.565), c(0.25), c(0.15), None, Some(2.0))),
     ]
 }
 
@@ -88,7 +91,7 @@ fn simulated(pulse: &Arc<IkedaCarpenter>, beam: &dyn Fn(f64) -> f64) -> Vec<f64>
             beam(u) * u / (2.0 * e)
         },
         &|es| vec![1.0; es.len()],
-        (E_MIN_EV, E_MAX_EV),
+        SIMULATOR_RANGE_EV,
         SIMULATOR_STEP_US,
     )
     .counts
@@ -169,6 +172,14 @@ fn calibration(pulse: &Arc<IkedaCarpenter>) -> Calibration {
     }
 }
 
+fn fit_open_beam(
+    edges: &[f64],
+    counts: &[f64],
+    calibration: &Calibration,
+) -> Result<OpenBeamFit, PipelineError> {
+    open_beam::fit_open_beam(edges, counts, calibration, None)
+}
+
 fn bin_centres() -> Vec<f64> {
     edges()
         .windows(2)
@@ -185,8 +196,19 @@ fn predicted(grid: &FlightTimeGrid, beam: &dyn Fn(f64) -> f64) -> Vec<f64> {
 fn the_fitted_beam_is_the_beam_before_the_blur() {
     let beam = true_beam(1.0e6);
     for (name, pulse) in pulses() {
-        let fit =
-            fit_open_beam(&edges(), &open_counts(&pulse, &beam), &calibration(&pulse)).expect(name);
+        let expected = simulated(&pulse, &beam);
+        let most = expected.iter().fold(0.0_f64, |m, &mu| m.max(mu));
+        let live: Vec<f64> = expected
+            .iter()
+            .map(|mu| 1.0 / (1.0 + 0.25 * mu / most))
+            .collect();
+        let counts: Vec<f64> = expected
+            .iter()
+            .zip(&live)
+            .map(|(mu, l)| (l * mu).round())
+            .collect();
+        let fit = open_beam::fit_open_beam(&edges(), &counts, &calibration(&pulse), Some(&live))
+            .expect(name);
         assert!(fit.converged, "{name}");
         assert_eq!(fit.beam.intervals(), 1, "{name}");
         assert_eq!(fit.overdispersion, Some(1.0), "{name}");
@@ -235,7 +257,7 @@ fn the_fit_is_on_the_finer_grid_of_the_first_pair_halving_leaves_unchanged() {
             .sum();
         assert!(distance <= BOUND, "{level:e}: {distance}");
         let (knot_low, knot_high) = fit.beam.knot_span_us();
-        let (u_low, u_high) = (edges()[0] - T0_US, chain[accepted].range_us().1);
+        let (u_low, u_high) = (edges()[0] - T0_US, edges()[edges().len() - 1] - T0_US);
         assert!(
             (knot_low / u_low - 1.0).abs() <= 1e-12 && (knot_high / u_high - 1.0).abs() <= 1e-12,
             "{level:e}"
@@ -282,6 +304,21 @@ fn counts_that_are_not_an_open_beam_are_refused() {
         fit_open_beam(&edges(), &counts[1..], &calibration(pulse)),
         Err(PipelineError::ShapeMismatch(_))
     ));
+    let live = |fraction: f64, bins: usize| {
+        let mut live = vec![1.0; bins];
+        live[5] = fraction;
+        open_beam::fit_open_beam(&edges(), &counts, &calibration(pulse), Some(&live))
+    };
+    assert!(matches!(
+        live(1.0, counts.len() - 1),
+        Err(PipelineError::ShapeMismatch(_))
+    ));
+    for fraction in [0.0, 1.5, f64::NAN] {
+        assert!(matches!(
+            live(fraction, counts.len()),
+            Err(PipelineError::InvalidParameter(_))
+        ));
+    }
     assert!(matches!(
         fit_open_beam(&edges()[..8], &counts[..7], &calibration(pulse)),
         Err(PipelineError::InvalidParameter(_))
@@ -379,17 +416,19 @@ fn counting_every_neutron_seven_times_scales_the_overdispersion_not_the_error_ba
 
 #[test]
 fn a_dip_the_candidates_can_follow_is_followed() {
+    let c = EnergyLaw::Const;
+    let burst = pulse(c(0.565), c(0.25), c(0.15), Some(2.0), None);
     let pulse = &pulses()[0].1;
-    for (centre_us, fwhm_us) in [(407.0, 40.0), (380.0, 30.0)] {
-        let expected = simulated(pulse, &dipped(centre_us, fwhm_us));
+    for (ic, centre_us, fwhm_us) in [(pulse, 407.0, 40.0), (&burst, 380.0, 30.0)] {
+        let expected = simulated(ic, &dipped(centre_us, fwhm_us));
         let rounded: Vec<f64> = expected.iter().map(|mu| mu.round()).collect();
-        let noiseless = fit_open_beam(&edges(), &rounded, &calibration(pulse)).expect("fit");
+        let noiseless = fit_open_beam(&edges(), &rounded, &calibration(ic)).expect("fit");
         assert!(
             noiseless.beam.intervals() > 1 && !noiseless.at_limit,
             "{centre_us}"
         );
         let k = noiseless.beam.coefficients().len() as f64;
-        let within = distance_from(pulse, &noiseless.beam, &expected);
+        let within = distance_from(ic, &noiseless.beam, &expected);
         assert!(
             within <= k + 4.0 * (2.0 * k).sqrt(),
             "{centre_us}: {within}"
@@ -427,7 +466,7 @@ fn a_dip_at_the_first_edge_still_matches_the_counts() {
     let c = EnergyLaw::Const;
     for ic in [
         Arc::clone(&pulses()[0].1),
-        pulse(c(0.565), c(0.25), c(0.0), None),
+        pulse(c(0.565), c(0.25), c(0.0), None, None),
     ] {
         for (centre_us, fwhm_us) in [(347.0, 20.0), (360.0, 15.0)] {
             let expected = simulated(&ic, &dipped(centre_us, fwhm_us));
@@ -541,6 +580,7 @@ fn the_grid_s_refusals_reach_the_caller() {
         c(0.25),
         c(0.15),
         None,
+        None,
     );
     assert!(matches!(
         fit_open_beam(&edges(), &counts, &calibration(&lengthening)),
@@ -548,7 +588,7 @@ fn the_grid_s_refusals_reach_the_caller() {
             FlightTimeGridError::LengthensWithEnergy { .. }
         ))
     ));
-    let near_the_point_cap = pulse(c(700.0), c(0.25), c(0.0), None);
+    let near_the_point_cap = pulse(c(700.0), c(0.25), c(0.0), None, None);
     assert!(matches!(
         fit_open_beam(&edges(), &counts, &calibration(&near_the_point_cap)),
         Err(PipelineError::FlightTimeGrid(

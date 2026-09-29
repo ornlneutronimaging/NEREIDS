@@ -30,7 +30,7 @@ pub struct Calibration {
 #[derive(Debug, Clone)]
 pub struct OpenBeamFit {
     /// The beam per µs of flight time over the flight-time grid's range; its
-    /// knots span the first edge's flight time to the grid's slow end.
+    /// knots span the flight times of the first and last edges.
     /// `covariance` shows how well the counts determine it.
     pub beam: BeamSpline,
     /// Half the Poisson deviance at the fit.
@@ -65,10 +65,13 @@ pub struct OpenBeamFit {
 }
 
 /// Fit the beam to the raw open-beam counts `open_counts` of the time bins
-/// `time_edges_us` (µs).  `ln φ`, the logarithm of the beam, is a cubic spline
-/// in `ln u` with knots from the first edge's flight time to the flight-time
-/// grid's slow end; neutrons faster than the grid's range, each reaching the
-/// bins with less than
+/// `time_edges_us` (µs), each bin recording the fraction `open_live` of the
+/// neutrons arriving in it, or every one when that is `None`.  `ln φ`, the
+/// logarithm of the beam, is a cubic spline in `ln u` with knots from the
+/// first edge's flight time to the last edge's; outside them the beam is the
+/// spline's continuation, which reaches the bins only through the pulse's
+/// delay or, for a folded pulse, its early tail.  Neutrons faster than the
+/// grid's range, each reaching the bins with less than
 /// [`NEGLIGIBLE_ARRIVAL_PROBABILITY`](nereids_physics::ikeda_carpenter::NEGLIGIBLE_ARRIVAL_PROBABILITY)
 /// chance, are left out.
 ///
@@ -94,10 +97,12 @@ pub struct OpenBeamFit {
 /// the detector's.  Start the window where the beam is smooth.
 ///
 /// # Errors
-/// [`PipelineError::ShapeMismatch`] unless there is one count per bin;
+/// [`PipelineError::ShapeMismatch`] unless there is one count, and one live
+/// fraction when given, per bin;
 /// [`PipelineError::InvalidParameter`] if a count is not a whole non-negative
-/// number, every count is zero, or there are fewer than 8 bins (one interval's
-/// four coefficients and as many bins again to measure the noise);
+/// number, every count is zero, a live fraction is not in (0, 1], or there are
+/// fewer than 8 bins (one interval's four coefficients and as many bins again
+/// to measure the noise);
 /// [`PipelineError::FlightTimeGrid`] for the grid's refusals, including the
 /// first candidate's halving past the point cap; [`PipelineError::Fitting`] if
 /// the fitter refuses.
@@ -105,6 +110,7 @@ pub fn fit_open_beam(
     time_edges_us: &[f64],
     open_counts: &[f64],
     calibration: &Calibration,
+    open_live: Option<&[f64]>,
 ) -> Result<OpenBeamFit, PipelineError> {
     let grid = Arc::new(FlightTimeGrid::new(
         time_edges_us,
@@ -112,6 +118,7 @@ pub fn fit_open_beam(
         &calibration.pulse,
     )?);
     validate_counts("open-beam", open_counts, time_edges_us.len() - 1)?;
+    let live = validate_live("open-beam", open_live, time_edges_us.len() - 1)?;
 
     let coefficients = |intervals: usize| intervals + 3;
     let admits = |intervals: usize| 2 * coefficients(intervals) <= open_counts.len();
@@ -125,21 +132,23 @@ pub fn fit_open_beam(
         )));
     }
 
-    let (_, u_last) = grid.range_us();
     let u_first = time_edges_us[0] - calibration.t0_us;
+    let u_last = time_edges_us[time_edges_us.len() - 1] - calibration.t0_us;
     let per_unit_beam = grid.predict(&vec![1.0; grid.flight_times_us().len()])?;
-    let per_us = open_counts.iter().sum::<f64>() / per_unit_beam.iter().sum::<f64>();
+    let recorded: f64 = per_unit_beam.iter().zip(&live).map(|(c, l)| l * c).sum();
+    let per_us = open_counts.iter().sum::<f64>() / recorded;
     let mut ladder = vec![fit_beam(
         &grid,
         &BeamSpline::constant(u_first, u_last, per_us),
         open_counts,
+        &live,
     )?];
     while let Some(start) = ladder
         .last()
         .filter(|candidate| candidate.fit.converged && admits(2 * candidate.beam.intervals()))
         .map(|candidate| candidate.beam.refined())
     {
-        match fit_beam(&grid, &start, open_counts) {
+        match fit_beam(&grid, &start, open_counts, &live) {
             Ok(candidate) if candidate.fit.converged => ladder.push(candidate),
             Ok(_)
             | Err(PipelineError::FlightTimeGrid(FlightTimeGridError::TooManyPoints { .. })) => {
@@ -213,6 +222,30 @@ pub(crate) fn validate_counts(run: &str, counts: &[f64], bins: usize) -> Result<
     Ok(())
 }
 
+pub(crate) fn validate_live(
+    run: &str,
+    live: Option<&[f64]>,
+    bins: usize,
+) -> Result<Vec<f64>, PipelineError> {
+    let live = live.map_or_else(|| vec![1.0; bins], <[f64]>::to_vec);
+    if live.len() != bins {
+        return Err(PipelineError::ShapeMismatch(format!(
+            "{} {run} live fractions for {bins} time bins",
+            live.len()
+        )));
+    }
+    if let Some((bin, fraction)) = live
+        .iter()
+        .enumerate()
+        .find(|(_, l)| !(**l > 0.0 && **l <= 1.0))
+    {
+        return Err(PipelineError::InvalidParameter(format!(
+            "{run} live fractions must be in (0, 1], got {fraction} in bin {bin}"
+        )));
+    }
+    Ok(live)
+}
+
 const COUNTS_TO_MEASURE_NOISE: f64 = 1.0;
 
 pub(crate) fn overdispersion(observed: &[f64], fit: &GridFit) -> Option<f64> {
@@ -238,6 +271,7 @@ fn fit_beam(
     first_grid: &Arc<FlightTimeGrid>,
     start: &BeamSpline,
     open_counts: &[f64],
+    live: &[f64],
 ) -> Result<Candidate, PipelineError> {
     let mut parameters = ParameterSet::new(
         start
@@ -248,7 +282,10 @@ fn fit_beam(
             .collect(),
     );
     let fit = fit_on_halved_grids(first_grid, &mut parameters, open_counts, |grid| {
-        Ok(OpenBeamModel::new(grid, start))
+        Ok(Recorded {
+            model: OpenBeamModel::new(grid, start),
+            live,
+        })
     })?;
     Ok(Candidate {
         beam: start.with_coefficients(&fit.result.params),
@@ -299,6 +336,35 @@ pub(crate) fn fit_on_halved_grids<M: FitModel>(
                 halvings,
             });
         }
+    }
+}
+
+pub(crate) struct Recorded<'a, M> {
+    pub(crate) model: M,
+    pub(crate) live: &'a [f64],
+}
+
+impl<M: FitModel> FitModel for Recorded<'_, M> {
+    fn evaluate(&self, params: &[f64]) -> Result<Vec<f64>, FittingError> {
+        let counts = self.model.evaluate(params)?;
+        Ok(counts.iter().zip(self.live).map(|(c, l)| l * c).collect())
+    }
+
+    fn analytical_jacobian(
+        &self,
+        params: &[f64],
+        free_param_indices: &[usize],
+        y_current: &[f64],
+    ) -> Option<FlatMatrix> {
+        let mut jacobian = self
+            .model
+            .analytical_jacobian(params, free_param_indices, y_current)?;
+        for (row, l) in self.live.iter().enumerate() {
+            for col in 0..free_param_indices.len() {
+                *jacobian.get_mut(row, col) *= l;
+            }
+        }
+        Some(jacobian)
     }
 }
 
@@ -386,16 +452,23 @@ pub(crate) mod tests {
 
     use super::*;
 
+    pub(crate) const FLIGHT_PATH_M: f64 = 25.0;
+    pub(crate) const T0_US: f64 = 3.0;
+    pub(crate) const EDGES_US: std::ops::RangeInclusive<u32> = 350..=470;
+    pub(crate) const ALPHA: EnergyLaw = EnergyLaw::SqrtE { a0: 0.35, a1: 0.05 };
+    pub(crate) const BETA: EnergyLaw = EnergyLaw::Const(0.25);
+    pub(crate) const R: EnergyLaw = EnergyLaw::Const(0.15);
+
     pub(crate) fn grid(channel_fwhm_us: Option<f64>) -> Arc<FlightTimeGrid> {
         let pulse = IkedaCarpenter::new(
             IkedaCarpenterParams {
-                alpha: EnergyLaw::SqrtE { a0: 0.35, a1: 0.05 },
-                beta: EnergyLaw::Const(0.25),
-                r: EnergyLaw::Const(0.15),
+                alpha: ALPHA,
+                beta: BETA,
+                r: R,
                 burst_sigma_us: None,
                 channel_fwhm_us,
             },
-            25.0,
+            FLIGHT_PATH_M,
             &SynthesisGrid {
                 e_min_ev: 1.0,
                 e_max_ev: 200.0,
@@ -404,8 +477,8 @@ pub(crate) mod tests {
             },
         )
         .expect("valid IC model");
-        let edges: Vec<f64> = (350..=470).map(f64::from).collect();
-        Arc::new(FlightTimeGrid::new(&edges, 3.0, &Arc::new(pulse)).expect("grid"))
+        let edges: Vec<f64> = EDGES_US.map(f64::from).collect();
+        Arc::new(FlightTimeGrid::new(&edges, T0_US, &Arc::new(pulse)).expect("grid"))
     }
 
     #[test]

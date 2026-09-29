@@ -31,11 +31,10 @@ pub enum PipelineError {
     #[error("Flight-time grid: {0}")]
     FlightTimeGrid(FlightTimeGridError),
 
-    /// A bin holds counts the fitted model predicts almost none of, such as
-    /// background, which the model does not include.
+    /// The model predicts a bin negative or non-finite counts, or almost none
+    /// of the counts it holds.
     #[error(
-        "bin {bin} of the {run} run holds {counts} counts where the model predicts {predicted}; \
-         the model has no background"
+        "bin {bin} of the {run} run holds {counts} counts where the model predicts {predicted}"
     )]
     UnmodelledCounts {
         run: &'static str,
