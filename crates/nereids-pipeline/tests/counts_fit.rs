@@ -92,6 +92,19 @@ fn expected_at(
     sample: &[(ResonanceData, f64)],
     temperature_k: f64,
 ) -> (Vec<f64>, Vec<f64>) {
+    (
+        run(setup, 1.0, beam, &[], temperature_k),
+        run(setup, CHARGE_RATIO, beam, sample, temperature_k),
+    )
+}
+
+fn run(
+    setup: &Setup,
+    scale: f64,
+    beam: &dyn Fn(f64) -> f64,
+    sample: &[(ResonanceData, f64)],
+    temperature_k: f64,
+) -> Vec<f64> {
     let instrument = Instrument {
         time_edges_us: setup.edges.clone(),
         flight_path_m: FLIGHT_PATH_M,
@@ -113,20 +126,14 @@ fn expected_at(
             })
             .collect()
     };
-    let run = |scale: f64, transmission: &dyn Fn(&[f64]) -> Vec<f64>| {
-        instrument
-            .expected_counts(
-                &|e| scale * per_ev(e),
-                transmission,
-                setup.energy_range_ev,
-                setup.simulator_step_us,
-            )
-            .counts
-    };
-    (
-        run(1.0, &|es: &[f64]| vec![1.0; es.len()]),
-        run(CHARGE_RATIO, &transmission),
-    )
+    instrument
+        .expected_counts(
+            &|e| scale * per_ev(e),
+            &transmission,
+            setup.energy_range_ev,
+            setup.simulator_step_us,
+        )
+        .counts
 }
 
 fn with_background(
@@ -138,7 +145,7 @@ fn with_background(
 ) -> (Vec<f64>, Vec<f64>) {
     let (open, transmitted) = expected_at(setup, beam, sample, temperature_k);
     let scattered = |u: f64| a * beam(u) * (back_a + back_b * u / CLOCK + back_c * CLOCK / u);
-    let (_, scattered) = expected_at(setup, &scattered, &[], temperature_k);
+    let scattered = run(setup, CHARGE_RATIO, &scattered, &[], temperature_k);
     let sample = transmitted.iter().zip(&scattered).map(|(t, b)| a * t + b);
     (open, sample.collect())
 }
