@@ -1,3 +1,5 @@
+use std::cell::RefCell;
+use std::collections::HashMap;
 use std::sync::Arc;
 
 use nereids_endf::resonance::ResonanceData;
@@ -117,8 +119,7 @@ fn run(
     };
     let isotopes: Vec<ResonanceData> = sample.iter().map(|(data, _)| data.clone()).collect();
     let transmission = |energies: &[f64]| -> Vec<f64> {
-        let sigma = broadened_cross_sections(energies, &isotopes, temperature_k, None, None)
-            .expect("cross sections");
+        let sigma = cross_sections(energies, &isotopes, temperature_k);
         (0..energies.len())
             .map(|j| {
                 let depth: f64 = sample.iter().zip(&sigma).map(|((_, n), s)| n * s[j]).sum();
@@ -134,6 +135,21 @@ fn run(
             setup.simulator_step_us,
         )
         .counts
+}
+
+fn cross_sections(energies: &[f64], isotopes: &[ResonanceData], kelvin: f64) -> Vec<Vec<f64>> {
+    thread_local! {
+        static COMPUTED: RefCell<HashMap<String, Vec<Vec<f64>>>> = RefCell::default();
+    }
+    let grid = (energies.len(), energies.first(), energies.last());
+    let key = format!("{kelvin:?} {grid:?} {isotopes:?}");
+    COMPUTED.with_borrow_mut(|computed| {
+        let sigma = computed.entry(key).or_insert_with(|| {
+            broadened_cross_sections(energies, isotopes, kelvin, None, None)
+                .expect("cross sections")
+        });
+        sigma.clone()
+    })
 }
 
 fn with_background(
