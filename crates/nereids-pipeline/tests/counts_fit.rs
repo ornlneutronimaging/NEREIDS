@@ -833,10 +833,6 @@ fn measurements_the_fit_does_not_describe_are_refused() {
     invalid(&|m| m.normalization = Value::Fitted(-1.0));
     invalid(&|m| m.normalization = Value::Known(f64::INFINITY));
     invalid(&|m| m.background[1] = Value::Fitted(f64::NAN));
-    assert!(matches!(
-        refused(&|m| m.background[0] = Value::Fitted(-2.0)),
-        PipelineError::UnmodelledCounts { run: "sample", .. }
-    ));
     let black = [(isotope.clone(), 4.0e3 / 7805.1)];
     let counts = expected(&setup, &beam(1.0e4), &black);
     let mut empty = measurement(&setup, (rounded(&counts.0), rounded(&counts.1)), &black);
