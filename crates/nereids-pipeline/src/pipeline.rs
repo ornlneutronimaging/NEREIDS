@@ -1080,11 +1080,6 @@ impl UnifiedFitConfig {
     }
 }
 
-/// Refuse raw counts with an instrument resolution.
-///
-/// The detector broadens the open and sample arms separately, `R[Φ]` and
-/// `R[Φ·T]`; broadening the ratio, `R[T]`, is not that response, and this
-/// route has no separate-arm model.
 pub(crate) fn validate_counts_resolution_route(
     is_counts: bool,
     config: &UnifiedFitConfig,
@@ -1611,7 +1606,6 @@ fn fit_counts_joint_poisson(
 
     let mut params = ParameterSet::new(param_vec);
 
-    // ── Build pure transmission model ──
     let t_model: Box<dyn FitModel> = if let Some((t0_idx, ls_idx)) = energy_scale_indices {
         build_energy_scale_transmission_model(config, t0_idx, ls_idx, temperature_index)?
     } else {
@@ -1659,9 +1653,6 @@ fn fit_counts_joint_poisson(
         }
     }
 
-    // Box-stack the wrappers (same as the LM transmission path):
-    // inner physics → NormalizedTransmissionModel (if bg) →
-    // MultiplicativeBaselineModel (issue #635, OUTERMOST, if configured).
     let mut stacked: Box<dyn FitModel> = t_model;
     if let Some(bi) = bg_indices {
         stacked = Box::new(NormalizedTransmissionModel::new(
@@ -1686,7 +1677,6 @@ fn fit_counts_joint_poisson(
                 bli.b1,
                 bli.b2,
             )
-            // Scope the runtime positivity guard to the fit window (#514).
             .with_active_mask(active_mask.as_deref()),
         );
     }
@@ -5626,8 +5616,6 @@ mod tests {
         assert!(error.to_string().contains("Poisson"));
     }
 
-    /// Counts with an instrument resolution are refused before model
-    /// construction instead of falling back to the post-hoc shortcut R[T].
     #[test]
     fn counts_with_an_instrument_resolution_are_refused() {
         use nereids_physics::resolution::{
