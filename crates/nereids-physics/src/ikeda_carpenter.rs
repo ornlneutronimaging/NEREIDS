@@ -115,7 +115,8 @@
 //!
 //! The full instrument function folds the moderator with a proton-burst
 //! (Gaussian σ) and a chopper/channel (triangle, FWHM) term. Both are optional
-//! here (`None` ⇒ omitted).
+//! here (`None` ⇒ omitted). Detector-time bin probabilities take the triangle
+//! only and refuse a burst.
 //!
 //! **Provenance of the triangle (`channel_fwhm_us`).** SAMMY broadens for the
 //! accelerator burst either as a Gaussian of FWHM `DELTAG` (SAMMY Manual R8
@@ -223,16 +224,19 @@ const R_NEGLIGIBLE: f64 = 1e-9;
 /// `MAX_TAU_SAMPLES` by the margin sample count.
 const MAX_TAU_SAMPLES: usize = 8192;
 
-/// Taylor expansion of `h(u)/u³` where `h(u) = 1 − e^{−u}(1 + u + ½u²)`, for
-/// `|u|` small (the `α ≈ β` limit), where direct evaluation cancels
-/// catastrophically. As `u → 0`, `h(u)/u³ → 1/6`.
 #[inline]
 fn h_over_cube_taylor(u: f64) -> f64 {
-    // h(u)/u³ = 1/6 − u/8 + u²/20 − u³/72 + u⁴/336 + O(u⁵). Carrying the u⁴ term
-    // makes the bounded↔Taylor branch boundary (|u|=0.05) continuous to ~1e-11,
-    // below any tolerance that consumes the synthesized kernel.
-    let u2 = u * u;
-    1.0 / 6.0 - u / 8.0 + u2 / 20.0 - u2 * u / 72.0 + u2 * u2 / 336.0
+    let mut sum = 0.0;
+    let mut power = 0.5;
+    for n in 0..64_u32 {
+        let next = sum + power / f64::from(n + 3);
+        if next == sum {
+            break;
+        }
+        sum = next;
+        power *= -u / f64::from(n + 1);
+    }
+    sum
 }
 
 /// Ikeda–Carpenter moderator emission density `I(τ)`.
@@ -326,66 +330,51 @@ pub fn ic_cdf(alpha: f64, beta: f64, r: f64, tau: f64) -> f64 {
         return fast;
     }
 
-    (fast - r * prompt_minus_storage_cdf(alpha, beta, tau)).clamp(0.0, 1.0)
-}
-
-fn prompt_minus_storage_cdf(alpha: f64, beta: f64, tau: f64) -> f64 {
-    let at = alpha * tau;
+    // The storage CDF is the prompt CDF minus the positive survival
+    // correction below. Written this way, the α=β limit is Gamma(4, α).
     let u = (alpha - beta) * tau;
-    if u.abs() < 0.05 {
+    let correction = if u.abs() < 0.05 {
         at.powi(3) * (-beta * tau).exp() * h_over_cube_taylor(u)
     } else {
         // Bounded form: neither exponential can overflow even when β >> α.
         let bracket = (-beta * tau).exp() - (-alpha * tau).exp() * (1.0 + u + 0.5 * u * u);
         at.powi(3) * bracket / u.powi(3)
-    }
-}
-
-fn ic_tail_integrals(alpha: f64, beta: f64, r: f64, tau: f64) -> [f64; 3] {
-    let alpha = alpha.max(MIN_RATE);
-    let beta = beta.max(MIN_RATE);
-    let x = alpha * tau;
-    let e = (-x).exp();
-    let prompt = [
-        e * (1.0 + x + 0.5 * x * x),
-        e * (3.0 + 2.0 * x + 0.5 * x * x) / alpha,
-        e * (12.0 + 6.0 * x + x * x) / (2.0 * alpha * alpha),
-    ];
-    if r <= 0.0 {
-        return prompt;
-    }
-    let stored = prompt[0] + prompt_minus_storage_cdf(alpha, beta, tau);
-    let storage = [
-        stored,
-        stored / beta + prompt[1],
-        stored / (beta * beta) + prompt[1] / beta + prompt[2],
-    ];
-    [0, 1, 2].map(|k| (1.0 - r) * prompt[k] + r * storage[k])
-}
-
-/// Cumulative probability of the Ikeda–Carpenter delay plus an independent
-/// symmetric triangular delay of FWHM (and half-base) `h > 0` µs, at `x` µs:
-/// `[F₂(x + h) − 2F₂(x) + F₂(x − h)]/h²`, where `F₂″` is the pulse CDF and
-/// `F₂ = 0` before the pulse starts. Once the whole triangle lies after the
-/// start, `F₂` is a quadratic, whose second difference is exactly `h²`, less
-/// the tail integral `S₂`.
-fn ic_cdf_folded(alpha: f64, beta: f64, r: f64, h: f64, x: f64) -> f64 {
-    if x <= -h {
-        return 0.0;
-    }
-    let s2 = |t: f64| ic_tail_integrals(alpha, beta, r, t)[2];
-    if x >= h {
-        return (1.0 - (s2(x + h) - 2.0 * s2(x) + s2(x - h)) / (h * h)).clamp(0.0, 1.0);
-    }
-    let [_, mean, half_second_moment] = ic_tail_integrals(alpha, beta, r, 0.0);
-    let f2 = |t: f64| {
-        if t <= 0.0 {
-            0.0
-        } else {
-            0.5 * t * t - mean * t + half_second_moment - s2(t)
-        }
     };
-    ((f2(x + h) - 2.0 * f2(x) + f2(x - h)) / (h * h)).clamp(0.0, 1.0)
+    (fast - r * correction).clamp(0.0, 1.0)
+}
+
+const GAUSS_LEGENDRE_16: [(f64, f64); 8] = [
+    (0.095_012_509_837_637_44, 0.189_450_610_455_068_59),
+    (0.281_603_550_779_258_9, 0.182_603_415_044_923_6),
+    (0.458_016_777_657_227_37, 0.169_156_519_395_002_62),
+    (0.617_876_244_402_643_8, 0.149_595_988_816_576_65),
+    (0.755_404_408_355_003_1, 0.124_628_971_255_533_95),
+    (0.865_631_202_387_831_6, 0.095_158_511_682_493),
+    (0.944_575_023_073_232_6, 0.062_253_523_938_647_61),
+    (0.989_400_934_991_649_9, 0.027_152_459_411_754_055),
+];
+
+fn ic_cdf_folded(alpha: f64, beta: f64, r: f64, fwhm_us: f64, delay_us: f64) -> f64 {
+    let end = delay_us.min(fwhm_us);
+    let rate = alpha.max(beta).max(MIN_RATE);
+    let mut total = 0.0;
+    for (lo, hi) in [(-fwhm_us, end.min(0.0)), (0.0, end)] {
+        if hi <= lo {
+            continue;
+        }
+        let panels = ((hi - lo) * rate / 2.0).ceil().max(1.0);
+        let width = (hi - lo) / panels;
+        for j in 0..panels as usize {
+            let centre = lo + width * (j as f64 + 0.5);
+            for &(node, weight) in &GAUSS_LEGENDRE_16 {
+                for s in [centre - 0.5 * width * node, centre + 0.5 * width * node] {
+                    total += 0.5 * width * weight * (fwhm_us - s.abs()) / (fwhm_us * fwhm_us)
+                        * ic_cdf(alpha, beta, r, delay_us - s);
+                }
+            }
+        }
+    }
+    total.clamp(0.0, 1.0)
 }
 
 /// Gamma(3, rate=1) cumulative distribution at dimensionless time `x`.
@@ -507,7 +496,8 @@ pub struct IkedaCarpenterParams {
     pub beta: EnergyLaw,
     /// Storage mixing fraction `R(E)`, 0 ≤ R ≤ 1.
     pub r: EnergyLaw,
-    /// Optional proton-burst Gaussian standard deviation (µs).
+    /// Optional proton-burst Gaussian standard deviation (µs); refused in
+    /// detector time.
     pub burst_sigma_us: Option<f64>,
     /// Optional chopper/channel triangle FWHM (µs).
     pub channel_fwhm_us: Option<f64>,
@@ -783,9 +773,8 @@ impl IkedaCarpenter {
     fn triangle_fwhm_us(&self) -> Result<f64, ResolutionParseError> {
         if self.params.burst_sigma_us.unwrap_or(0.0) != 0.0 {
             return Err(ResolutionParseError::InvalidFormat(
-                "a Gaussian burst is not supported in detector time: beside the \
-                 proton-pulse triangle (channel_fwhm_us) it is a second constant-time \
-                 width the counts cannot tell apart"
+                "a Gaussian burst is not supported in detector time; model the proton \
+                 pulse with channel_fwhm_us"
                     .to_string(),
             ));
         }

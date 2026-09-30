@@ -882,7 +882,8 @@ impl PyEnergyLaw {
 /// `beta` keeps the original constant-rate API; the optional trailing
 /// `beta_law` overrides it with an energy-dependent rate. Optional
 /// `burst_sigma_us` (Gaussian) and `channel_fwhm_us` (triangle) fold in the
-/// proton-burst and chopper terms.
+/// proton-burst and chopper terms; detector-time bin probabilities refuse a
+/// burst.
 #[pyclass(name = "IkedaCarpenter", skip_from_py_object)]
 #[derive(Clone)]
 struct PyIkedaCarpenter {

@@ -322,29 +322,65 @@ fn symmetric_sns_pulse_fold_keeps_source_clock_and_preserves_missing_tail_mass()
 
 #[test]
 fn a_gaussian_burst_is_refused_in_detector_time() {
+    let nominal = TOF_FACTOR * 25.0 / 25.0_f64.sqrt();
+    for channel_fwhm_us in [None, Some(0.35)] {
+        let model = IkedaCarpenter::new(
+            IkedaCarpenterParams {
+                burst_sigma_us: Some(0.5),
+                channel_fwhm_us,
+                ..IkedaCarpenterParams::constant(2.0, 0.1, 0.0)
+            },
+            25.0,
+            &SynthesisGrid::new(1.0, 100.0),
+        )
+        .expect("the synthesized kernel still accepts a burst");
+        for err in [
+            model
+                .detector_bin_probabilities(25.0, &[nominal, nominal + 1.0], 0.0)
+                .expect_err("detector bins must refuse a burst")
+                .to_string(),
+            model
+                .delays_us(25.0)
+                .expect_err("delays must refuse a burst")
+                .to_string(),
+        ] {
+            assert!(err.contains("Gaussian burst"), "got: {err}");
+        }
+    }
+}
+
+#[test]
+fn a_folded_pulse_with_slow_storage_stays_a_probability() {
+    let (alpha, beta, r, fwhm) = (1.0_f64, 1.0e-9, 1.0e-9, 0.35);
+    let flight_path_m = 25.0_f64;
+    let true_energy_ev = 25.0_f64;
     let model = IkedaCarpenter::new(
         IkedaCarpenterParams {
-            burst_sigma_us: Some(0.5),
-            channel_fwhm_us: Some(0.35),
-            ..IkedaCarpenterParams::constant(2.0, 0.1, 0.0)
+            channel_fwhm_us: Some(fwhm),
+            ..IkedaCarpenterParams::constant(alpha, beta, r)
         },
-        25.0,
-        &SynthesisGrid::new(1.0, 100.0),
+        flight_path_m,
+        &SynthesisGrid::new(24.0, 26.0),
     )
-    .expect("the synthesized kernel still accepts a burst");
-    let nominal = TOF_FACTOR * 25.0 / 25.0_f64.sqrt();
-    for err in [
-        model
-            .detector_bin_probabilities(25.0, &[nominal, nominal + 1.0], 0.0)
-            .expect_err("detector bins must refuse a burst")
-            .to_string(),
-        model
-            .delays_us(25.0)
-            .expect_err("delays must refuse a burst")
-            .to_string(),
-    ] {
-        assert!(err.contains("Gaussian burst"), "got: {err}");
-    }
+    .expect("valid folded IC model");
+    let nominal = TOF_FACTOR * flight_path_m / true_energy_ev.sqrt();
+    let edges: Vec<f64> = (0..=21_000)
+        .map(|k| nominal - fwhm + 0.001 * f64::from(k))
+        .collect();
+    let bins = model
+        .detector_bin_probabilities(true_energy_ev, &edges, 0.0)
+        .expect("valid detector bins");
+    let total: f64 = bins.iter().sum();
+    assert!(total <= 1.0 + 1.0e-12, "bins sum to {total}");
+
+    let far = model
+        .detector_bin_probabilities(true_energy_ev, &[nominal - 1.0, nominal + 1.0e103], 0.0)
+        .expect("valid detector bins");
+    assert!(
+        (far[0] - 1.0).abs() < 1.0e-12,
+        "far window holds {}",
+        far[0]
+    );
 }
 
 #[test]
@@ -379,6 +415,70 @@ fn unequal_rate_storage_cdf_matches_pulse_quadrature() {
 }
 
 #[test]
+fn storage_cdf_matches_its_convolution_at_the_series_switch() {
+    for (alpha, beta, r, tau) in [
+        (0.3_f64, 0.29_f64, 0.5_f64, 4.999_f64),
+        (0.3, 0.29, 0.5, 5.001),
+        (0.1, 0.098, 1.0, 24.99),
+        (1.0, 0.995, 0.5, 8.0),
+    ] {
+        let stored = simpson(
+            |u| 0.5 * alpha.powi(3) * u * u * (-alpha * u).exp() * -(-beta * (tau - u)).exp_m1(),
+            0.0,
+            tau,
+            100_000,
+        );
+        let oracle = (1.0 - r) * gamma3_cdf(alpha * tau) + r * stored;
+        let cdf = ic_cdf(alpha, beta, r, tau);
+        assert!(
+            (cdf - oracle).abs() < 5.0e-12,
+            "ic_cdf({alpha}, {beta}, {r}, {tau}) = {cdf:.16e} vs convolution {oracle:.16e}"
+        );
+    }
+}
+
+#[test]
+fn a_fast_pulse_folds_across_many_panels() {
+    let (alpha, fwhm) = (200.0_f64, 0.35_f64);
+    let flight_path_m = 25.0_f64;
+    let true_energy_ev = 25.0_f64;
+    let nominal = TOF_FACTOR * flight_path_m / true_energy_ev.sqrt();
+    let delay_edges: Vec<f64> = (0..=17).map(|k| -fwhm + 0.05 * f64::from(k)).collect();
+    let detector_edges: Vec<f64> = delay_edges.iter().map(|d| nominal + d).collect();
+    let model = IkedaCarpenter::new(
+        IkedaCarpenterParams {
+            channel_fwhm_us: Some(fwhm),
+            ..IkedaCarpenterParams::constant(alpha, 0.1, 0.0)
+        },
+        flight_path_m,
+        &SynthesisGrid::new(24.0, 26.0),
+    )
+    .expect("valid folded IC model");
+    let got = model
+        .detector_bin_probabilities(true_energy_ev, &detector_edges, 0.0)
+        .expect("valid folded detector bins");
+    let triangle = |c: f64| (1.0 - c.abs() / fwhm) / fwhm;
+    for (bin, edge) in delay_edges.windows(2).enumerate() {
+        let want = simpson(
+            |c| {
+                triangle(c)
+                    * (gamma3_cdf(alpha * (edge[1] - c)) - gamma3_cdf(alpha * (edge[0] - c)))
+            },
+            -fwhm,
+            fwhm,
+            20_000,
+        );
+        assert!(
+            (got[bin] - want).abs() < 1.0e-10,
+            "bin [{}, {}] µs: folded {:.12e} vs integral {want:.12e}",
+            edge[0],
+            edge[1],
+            got[bin]
+        );
+    }
+}
+
+#[test]
 fn storage_with_channel_fold_preserves_missing_tail_mass() {
     let (alpha, beta, r) = (2.0, 0.25, 0.3);
     let fwhm = 0.7_f64; // triangle half-base = FWHM
@@ -400,12 +500,11 @@ fn storage_with_channel_fold_preserves_missing_tail_mass() {
     let nominal = TOF_FACTOR * flight_path_m / true_energy_ev.sqrt();
     // The window deliberately cuts the slow storage tail (β = 0.25 ⇒ mean
     // storage delay 4 µs) so real mass lies beyond the last edge.
-    let edges = [nominal - 1.0, nominal + 1.0, nominal + 3.0, nominal + 6.0];
-    let got: f64 = model
+    let delay_edges = [-1.0, -0.4, 0.0, 0.3, 1.0, 3.0, 6.0];
+    let edges: Vec<f64> = delay_edges.iter().map(|d| nominal + d).collect();
+    let got = model
         .detector_bin_probabilities(true_energy_ev, &edges, 0.0)
-        .expect("valid detector bins")
-        .iter()
-        .sum();
+        .expect("valid detector bins");
 
     let half_base = fwhm;
     let triangle = |c: f64| (1.0 - c.abs() / half_base) / half_base;
@@ -425,16 +524,21 @@ fn storage_with_channel_fold_preserves_missing_tail_mass() {
             600,
         )
     };
-    let oracle = window_mass(-1.0, 6.0);
+    for (bin, edge) in delay_edges.windows(2).enumerate() {
+        let oracle = window_mass(edge[0], edge[1]);
+        assert!(
+            (got[bin] - oracle).abs() < 1.0e-9,
+            "bin [{}, {}] µs: folded {:.12e} vs double-quadrature oracle {oracle:.12e}",
+            edge[0],
+            edge[1],
+            got[bin]
+        );
+    }
+    let total: f64 = got.iter().sum();
     assert!(
-        1.0 - oracle > 0.05,
-        "window must lose real storage-tail mass (oracle = {oracle:.6})"
+        1.0 - total > 0.05,
+        "the window must lose real storage-tail mass, got {total:.6}"
     );
-    assert!(
-        (got - oracle).abs() < 1.0e-9,
-        "folded storage window mass {got:.8} vs double-quadrature oracle {oracle:.8}"
-    );
-    assert!(got < 1.0, "finite window was silently renormalized to one");
 }
 
 #[test]
