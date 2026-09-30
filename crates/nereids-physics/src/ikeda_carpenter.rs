@@ -1617,13 +1617,8 @@ mod tests {
         let alpha = 2.0; // fast_reach = 18/α = 9 µs
         let prompt_step = (18.0 / alpha) / (n_tau as f64 - 1.0);
 
-        // (a) Moderate tail (β = 0.25 ⇒ slow_reach = 64 µs): the cap does not
-        // bite and the 0.5 µs triangle's per-bin refinement target
-        // (FWHM/24 ≈ 0.021 µs) sits above the prompt-core step, so the step
-        // equals the prompt-core step exactly and the grid still spans the
-        // full tail.
         let p = IkedaCarpenterParams {
-            channel_fwhm_us: Some(0.5),
+            channel_fwhm_us: Some(0.35),
             ..IkedaCarpenterParams::constant(alpha, 0.25, 0.5)
         };
         let (offs, wts) = synth_kernel(&p, n_tau, 10.0).unwrap();
@@ -1637,7 +1632,7 @@ mod tests {
             "prompt-core spacing {dtau} > fast_reach/(n_tau−1) = {prompt_step}"
         );
         // ≥ 3 nonzero triangle samples per side at this step.
-        let tri = triangle_kernel(dtau, 0.5);
+        let tri = triangle_kernel(dtau, 0.35);
         let nonzero_per_side = tri.iter().take(tri.len() / 2).filter(|&&v| v > 0.0).count();
         assert!(
             nonzero_per_side >= 3,

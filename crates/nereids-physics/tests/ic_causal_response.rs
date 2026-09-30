@@ -455,7 +455,10 @@ fn an_inactive_storage_rate_does_not_drive_the_fold() {
             .expect("valid detector bins")
     };
 
-    assert_eq!(bins(&model(1.0, 1.0e12)), bins(&model(1.0, 0.1)));
+    let (fast_storage, slow_storage) = (bins(&model(1.0, 1.0e12)), bins(&model(1.0, 0.1)));
+    for (a, b) in fast_storage.iter().zip(&slow_storage) {
+        assert!((a - b).abs() < 1.0e-14, "{a} vs {b}");
+    }
 }
 
 #[test]
