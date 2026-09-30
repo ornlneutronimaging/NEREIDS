@@ -311,7 +311,7 @@ fn symmetric_sns_pulse_fold_keeps_source_clock_and_preserves_missing_tail_mass()
     oracle *= step / 3.0;
     assert!(
         (total - oracle).abs() < 2.0e-7,
-        "sampled folded pulse has probability {total}, independent analytical integral gives {oracle}"
+        "folded pulse has probability {total}, independent analytical integral gives {oracle}"
     );
     assert!(
         oracle < 1.0,
@@ -400,10 +400,6 @@ fn unequal_rate_storage_cdf_matches_pulse_quadrature() {
         (1.0, 0.995, 0.5, 8.0),  // Taylor branch: u = 0.04
         (1.0, 0.995, 0.5, 1.0),  // Taylor branch: u = 0.005
     ];
-    // Tolerance: near the |u| = 0.05 Taylor-branch boundary the two
-    // implementations carry independent series truncation — measured against
-    // a 60-digit reference at (1, 0.995, 0.5, 8): ic_cdf 4.7e-12, the
-    // integrated pulse 1.4e-11 — so the comparison budget is their sum.
     for (alpha, beta, r, tau) in cases {
         let quad = simpson(|t| ic_pulse(alpha, beta, r, t), 0.0, tau, 100_000);
         let cdf = ic_cdf(alpha, beta, r, tau);
@@ -435,6 +431,31 @@ fn storage_cdf_matches_its_convolution_at_the_series_switch() {
             "ic_cdf({alpha}, {beta}, {r}, {tau}) = {cdf:.16e} vs convolution {oracle:.16e}"
         );
     }
+}
+
+#[test]
+fn an_inactive_storage_rate_does_not_drive_the_fold() {
+    let (fwhm, flight_path_m, true_energy_ev) = (0.35_f64, 25.0_f64, 25.0_f64);
+    let nominal = TOF_FACTOR * flight_path_m / true_energy_ev.sqrt();
+    let model = |alpha: f64, beta: f64| {
+        IkedaCarpenter::new(
+            IkedaCarpenterParams {
+                channel_fwhm_us: Some(fwhm),
+                ..IkedaCarpenterParams::constant(alpha, beta, 0.0)
+            },
+            flight_path_m,
+            &SynthesisGrid::new(24.0, 26.0),
+        )
+        .expect("valid folded IC model")
+    };
+    let delay_edges = [-fwhm, -0.2, 0.0, 0.2, fwhm, 10.0];
+    let edges: Vec<f64> = delay_edges.iter().map(|d| nominal + d).collect();
+    let bins = |m: &IkedaCarpenter| {
+        m.detector_bin_probabilities(true_energy_ev, &edges, 0.0)
+            .expect("valid detector bins")
+    };
+
+    assert_eq!(bins(&model(1.0, 1.0e12)), bins(&model(1.0, 0.1)));
 }
 
 #[test]
@@ -683,9 +704,7 @@ fn storage_cdf_matches_arbitrary_precision_convolution_reference() {
     // convolution: CDF = (1−r)·Γ₃(ατ) + r·∫₀^τ (α³s²e^{−αs}/2)·(1−e^{−β(τ−s)}) ds
     // via 40-digit decimal Simpson (40 000 intervals; quadrature error ≲ 1e-14).
     // They share no code with ic_cdf or ic_pulse, so a storage-term error
-    // common to both implementations cannot hide here. Tolerance covers the
-    // f64 implementations' Taylor truncation near the |u| = 0.05 boundary
-    // (measured 4.7e-12 at case 3 against a 60-digit closed-form check).
+    // common to both implementations cannot hide here.
     let pins: [(f64, f64, f64, f64, f64); 4] = [
         (1.7, 0.45, 0.35, 2.7, 0.665_083_699_251_977_2),
         (0.6, 2.4, 0.8, 3.0, 0.219_541_992_689_109_74),

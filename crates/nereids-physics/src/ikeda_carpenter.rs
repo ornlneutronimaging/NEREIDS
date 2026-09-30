@@ -175,12 +175,6 @@ const MIN_N_TAU: usize = 8;
 /// (strictly: `capped_step > FWHM/3`).
 const TRI_MIN_SAMPLES_PER_SIDE: f64 = 3.0;
 
-/// Reach of the sampled/folded Gaussian burst in standard deviations. At
-/// ±`GAUSS_REACH_SIGMAS`·σ = ±8σ the truncated two-sided Gaussian mass is
-/// erfc(8/√2) ≈ 1.2e-15, so the retained-mass bookkeeping in
-/// [`gaussian_kernel`] stays exact at f64 scale and no physically meaningful
-/// mass is discarded for any detector window. Also fixes the burst
-/// resolution floor `dtau ≤ σ` (≥ `GAUSS_REACH_SIGMAS` samples per side).
 const GAUSS_REACH_SIGMAS: f64 = 8.0;
 
 /// Prompt-tail reach in e-folds: the τ-grid spans `FAST_REACH_E_FOLDS / α`
@@ -356,22 +350,21 @@ const GAUSS_LEGENDRE_16: [(f64, f64); 8] = [
 
 fn ic_cdf_folded(alpha: f64, beta: f64, r: f64, fwhm_us: f64, delay_us: f64) -> f64 {
     let end = delay_us.min(fwhm_us);
-    let rate = alpha.max(beta).max(MIN_RATE);
+    let finest = 2.0 / alpha.max(MIN_RATE);
     let mut total = 0.0;
     for (lo, hi) in [(-fwhm_us, end.min(0.0)), (0.0, end)] {
-        if hi <= lo {
-            continue;
-        }
-        let panels = ((hi - lo) * rate / 2.0).ceil().max(1.0);
-        let width = (hi - lo) / panels;
-        for j in 0..panels as usize {
-            let centre = lo + width * (j as f64 + 0.5);
+        let (mut right, mut width) = (hi, finest);
+        while right > lo {
+            let left = (right - width).max(lo);
+            let (centre, half) = (0.5 * (left + right), 0.5 * (right - left));
             for &(node, weight) in &GAUSS_LEGENDRE_16 {
-                for s in [centre - 0.5 * width * node, centre + 0.5 * width * node] {
-                    total += 0.5 * width * weight * (fwhm_us - s.abs()) / (fwhm_us * fwhm_us)
+                for s in [centre - half * node, centre + half * node] {
+                    total += half * weight * (fwhm_us - s.abs()) / (fwhm_us * fwhm_us)
                         * ic_cdf(alpha, beta, r, delay_us - s);
                 }
             }
+            right = left;
+            width *= 2.0;
         }
     }
     total.clamp(0.0, 1.0)
@@ -893,10 +886,8 @@ impl IkedaCarpenter {
                 ic_cdf_folded(alpha, beta, r, h, x)
             }
         };
-        Ok(relative_edges
-            .windows(2)
-            .map(|edge| (cdf(edge[1]) - cdf(edge[0])).max(0.0))
-            .collect())
+        let cdfs: Vec<f64> = relative_edges.iter().map(|&x| cdf(x)).collect();
+        Ok(cdfs.windows(2).map(|w| (w[1] - w[0]).max(0.0)).collect())
     }
 
     fn validate_probe_energy(&self, energy_ev: f64) -> Result<(), ResolutionParseError> {
@@ -1093,34 +1084,20 @@ fn synth_source_pulse_density(
     let taus: Vec<f64> = (j_lo..=j_hi).map(|j| j as f64 * dtau).collect();
     let mut weights: Vec<f64> = taus.iter().map(|&t| ic_pulse(alpha, beta, r, t)).collect();
 
-    // Correct only the sampled quadrature error of the analytical moderator
-    // density. The target is its exact CDF at the finite grid endpoint, not
-    // one, so physical moderator probability beyond the grid is not moved
-    // back into the sampled support. This matters for the coarsest admitted
-    // n_tau values, where peak-normalization used to hide a large area error.
     let sampled_area = dtau
         * (0.5 * weights[0]
             + weights[1..weights.len() - 1].iter().sum::<f64>()
             + 0.5 * weights[weights.len() - 1]);
-    let moderator_mass = ic_cdf(alpha, beta, r, *taus.last().expect("non-empty tau grid"));
     if !sampled_area.is_finite() || sampled_area <= 0.0 {
         return Err(ResolutionParseError::InvalidFormat(format!(
             "Ikeda–Carpenter pulse at E = {energy_ev} eV has zero sampled area"
         )));
     }
-    let area_correction = moderator_mass / sampled_area;
-    for weight in &mut weights {
-        *weight *= area_correction;
-    }
 
     if let Some(sigma) = params.burst_sigma_us
         && sigma > 0.0
     {
-        let (kernel, retained_mass) = gaussian_kernel(dtau, sigma);
-        weights = convolve_same(&weights, &kernel);
-        for weight in &mut weights {
-            *weight *= retained_mass;
-        }
+        weights = convolve_same(&weights, &gaussian_kernel(dtau, sigma));
     }
     if let Some(fwhm) = params.channel_fwhm_us
         && fwhm > 0.0
@@ -1180,7 +1157,7 @@ fn argmax(xs: &[f64]) -> usize {
 
 /// Symmetric, unit-sum Gaussian kernel sampled on a `dtau`-spaced grid out to
 /// ±[`GAUSS_REACH_SIGMAS`]·σ.
-fn gaussian_kernel(dtau: f64, sigma: f64) -> (Vec<f64>, f64) {
+fn gaussian_kernel(dtau: f64, sigma: f64) -> Vec<f64> {
     let half = ((GAUSS_REACH_SIGMAS * sigma / dtau).ceil() as isize).max(1);
     let mut k: Vec<f64> = (-half..=half)
         .map(|j| {
@@ -1188,10 +1165,8 @@ fn gaussian_kernel(dtau: f64, sigma: f64) -> (Vec<f64>, f64) {
             (-0.5 * t * t).exp()
         })
         .collect();
-    let raw_sum: f64 = k.iter().sum();
-    let retained_mass = (raw_sum * dtau / (sigma * std::f64::consts::TAU.sqrt())).clamp(0.0, 1.0);
     normalize_sum(&mut k);
-    (k, retained_mass)
+    k
 }
 
 /// Symmetric, unit-sum triangle kernel of FWHM `fwhm` (half-base = FWHM;

@@ -1427,9 +1427,9 @@ impl ResolutionFunction {
     /// The tabulated and Ikeda–Carpenter variants are evaluated directly in
     /// detector time. In particular, the analytical IC variant does not pass
     /// through its legacy synthesized [`TabulatedResolution`] broadening
-    /// table. The older Gaussian energy-broadening model has no physical
-    /// detector-time probability law and is therefore rejected rather than
-    /// silently treated as one.
+    /// table, and it refuses a Gaussian burst. The older Gaussian
+    /// energy-broadening model has no physical detector-time probability law
+    /// and is therefore rejected rather than silently treated as one.
     ///
     /// `timing_offset_us` is convention-dependent and NOT transferable
     /// between variants: a mode-centred tabulated (UDR) kernel places its
