@@ -1090,7 +1090,7 @@ pub(crate) fn counts_resolution_overlay_unsupported(
     shows_counts && has_instrument_resolution
 }
 
-pub(crate) const COUNTS_RESOLUTION_OVERLAY_MESSAGE: &str = "Count fit overlay hidden: instrument resolution needs the exact separate-arm model \
+pub(crate) const COUNTS_RESOLUTION_OVERLAY_MESSAGE: &str = "Count fit overlay hidden: instrument resolution needs the separate-arm model \
      R[Phi] and R[Phi*T]. Multiplying c*OB by R[T] is not a physical count model, so \
      the transmission-only overlay cannot represent a resolved count fit.";
 

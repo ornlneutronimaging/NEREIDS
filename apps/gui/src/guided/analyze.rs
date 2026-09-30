@@ -2103,16 +2103,11 @@ fn build_fit_config(state: &AppState) -> Result<(UnifiedFitConfig, Range<usize>)
                 .to_string(),
         );
     }
-    // The exact separate-arm inputs (incident fluence weights, detector-time
-    // bin edges) are not a GUI-configurable surface, so surface the two
-    // remedies the GUI can actually express instead of the pipeline's
-    // exact_count_response message.
     if matches!(state.solver_method, SolverMethod::PoissonKL) && state.resolution_enabled {
         return Err(
-            "Count fits with instrument resolution need the exact separate-arm \
-             model, which the GUI does not configure yet: disable instrument \
-             resolution for count fits, or fit normalized transmission with \
-             Levenberg-Marquardt"
+            "Count fits with instrument resolution need the separate-arm model, \
+             which is not available: disable instrument resolution for count \
+             fits, or fit normalized transmission with Levenberg-Marquardt"
                 .to_string(),
         );
     }

@@ -2811,12 +2811,10 @@ class TestVenusMlbwRegression:
         )
 
     def test_counts_with_resolution_fails_before_fitting(self, venus_data):
-        """Resolved counts without the exact-response inputs fail closed.
+        """Resolved counts fail closed.
 
         Instrument response acts separately on the open and sample count
-        arms. The exact separate-arm route (Wave-1 PR-2b) needs incident
-        fluence weights and measured detector-time bin edges; a resolution
-        without them must be rejected rather than fall back to the
+        arms, so a resolution must be rejected rather than fall back to the
         scientifically wrong broadened-ratio count model R[T].
 
         The pre-Wave-1 counts-KL anchors were captured through the
@@ -3214,8 +3212,7 @@ class TestFixDensities:
         )
 
     def test_transmission_kl_rejected_regardless_of_scale_by_chi2(self, u238_data):
-        """The transmission Poisson-KL path was deleted with the exact-count
-        route: ``solver="kl"`` on normalized transmission is rejected before
+        """``solver="kl"`` on normalized transmission is rejected before
         any fit, with or without ``scale_by_chi2``."""
         energies = np.linspace(1.0, 30.0, 300)
         t_clean = np.asarray(nereids.forward_model(energies, [(u238_data, 8.0e-4)]))

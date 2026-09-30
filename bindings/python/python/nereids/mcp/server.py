@@ -35,11 +35,9 @@ _MANIFEST_NAMES = (
 )
 _COUNTS_RESOLUTION_UNSUPPORTED = (
     "counts input with instrument resolution is not available through the MCP "
-    "manifest: an exact count fit requires the separate-arm model R[Phi] and "
-    "R[Phi*T] built from incident fluence weights and measured detector-time "
-    "bin edges, which this manifest schema does not carry. Use the direct "
-    "Python fit_counts_spectrum_typed exact-count arguments, supply "
-    "pre-normalized transmission, or disable instrument resolution."
+    "manifest: a resolved count fit needs the separate-arm model R[Phi] and "
+    "R[Phi*T], which this fit does not have. Supply pre-normalized "
+    "transmission, or disable instrument resolution."
 )
 # The solver names `parse_solver_config` (bindings/python/src/lib.rs) actually
 # accepts. Validation MUST check against this set before the domain-specific
@@ -1251,12 +1249,9 @@ def _validate_workflow(manifest: dict[str, Any]) -> dict[str, Any]:
 
     # Mirror the run path's domain/solver routing branch by branch so a dry
     # run never approves a manifest the production pipeline rejects (or vice
-    # versa).  Raw counts always fit in the counts domain now — the legacy
-    # counts→transmission conversion was deleted with the exact-count route —
-    # and cross-domain solver requests are rejected on both run and validate.
-    # Raw count inputs with an active resolution still error through MCP: the
-    # exact separate-arm fit needs incident fluence weights and measured
-    # detector-time bin edges, which the manifest schema does not carry.
+    # versa).  Raw counts always fit in the counts domain, and cross-domain
+    # solver requests are rejected on both run and validate.  Raw count
+    # inputs with an active resolution error through MCP.
     counts_input = effective_kind in {
         "counts_npz",
         "counts",
