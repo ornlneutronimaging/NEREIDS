@@ -1118,155 +1118,6 @@ def apply_resolution(
     """Apply tabulated resolution broadening to a spectrum."""
     ...
 
-def two_arm_count_response(
-    true_energies_ev: NDArray[np.float64],
-    incident_fluence_weights: NDArray[np.float64],
-    transmission: NDArray[np.float64],
-    detector_time_edges_us: NDArray[np.float64],
-    resolution: TabulatedResolution | IkedaCarpenter,
-    timing_offset_us: float = 0.0,
-) -> tuple[NDArray[np.float64], NDArray[np.float64], float, float]:
-    """Predict open-beam and sample counts on detector-time bins.
-
-    ``incident_fluence_weights[j]`` is the incident flux density at true
-    energy ``j`` times detector efficiency times the caller's
-    energy-integration weight (the discrete form of the contract's
-    ``Phi * epsilon``). The validated response is applied to the open and
-    attenuated sample arms separately. Probability outside the supplied
-    acquisition window is not renormalized into that window; the last two
-    return values quantify the expected open-beam and sample counts lost
-    outside it.
-    """
-    ...
-
-class TwoArmBackgroundFitResult:
-    """Fitted amplitudes for independently measured count backgrounds."""
-
-    @property
-    def names(self) -> list[str]: ...
-    @property
-    def amplitudes(self) -> NDArray[np.float64]: ...
-    @property
-    def amplitude_uncertainties(self) -> NDArray[np.float64] | None:
-        """One-sigma uncertainties of the constrained fit, or ``None``.
-
-        ``None`` when withheld: the fit did not converge, the amplitudes
-        are not separately determined, or the free block of the expected
-        (Fisher) information matrix is singular. An individual entry is NaN
-        when its variance is non-positive, or when its template is
-        sensitive on a bin with zero expectation — the boundary of the
-        Poisson support, where the expected information diverges and no
-        regular estimate exists. A reported number is never zero.
-
-        Free amplitudes are conditioned on any partner held at its bound
-        (the information is restricted to the free set before inversion).
-        An amplitude on its own zero bound (see ``amplitude_at_bound``)
-        reports a one-sided curvature scale, not a symmetric interval.
-        """
-        ...
-
-    @property
-    def amplitude_at_bound(self) -> list[bool]:
-        """Whether each amplitude is held at zero by its non-negativity bound.
-
-        True means the data pull the amplitude negative and the constraint
-        holds it at zero: a one-sided limit rather than an interior estimate.
-        """
-        ...
-
-    @property
-    def amplitudes_identifiable(self) -> bool: ...
-    @property
-    def open_neutron_signal(self) -> NDArray[np.float64]: ...
-    @property
-    def open_background(self) -> NDArray[np.float64]: ...
-    @property
-    def open_total(self) -> NDArray[np.float64]: ...
-    @property
-    def open_window_loss(self) -> float: ...
-    @property
-    def sample_neutron_signal(self) -> NDArray[np.float64]: ...
-    @property
-    def sample_background(self) -> NDArray[np.float64]: ...
-    @property
-    def sample_total(self) -> NDArray[np.float64]: ...
-    @property
-    def sample_window_loss(self) -> float: ...
-    @property
-    def poisson_deviance(self) -> float: ...
-    @property
-    def deviance_per_dof(self) -> float: ...
-    @property
-    def n_informative(self) -> int:
-        """Bins that contribute to the deviance.
-
-        A concatenated open/sample bin counts when its observation, its
-        neutron signal, or at least one template is nonzero. Bins where all
-        three are exactly zero yield identically zero deviance for any
-        amplitude vector and are excluded from the degrees of freedom behind
-        ``deviance_per_dof``.
-        """
-        ...
-    @property
-    def converged(self) -> bool: ...
-    @property
-    def iterations(self) -> int: ...
-
-def fit_two_arm_background_templates(
-    observed_open_counts: NDArray[np.float64],
-    observed_sample_counts: NDArray[np.float64],
-    open_neutron_signal: NDArray[np.float64],
-    sample_neutron_signal: NDArray[np.float64],
-    open_exposure_scale: float,
-    sample_exposure_scale: float,
-    template_names: list[str],
-    open_background_templates: NDArray[np.float64],
-    sample_background_templates: NDArray[np.float64],
-    initial_amplitudes: NDArray[np.float64],
-    open_window_loss: float,
-    sample_window_loss: float,
-    max_iter: int = 200,
-    tol: float = 1e-8,
-) -> TwoArmBackgroundFitResult:
-    """Fit non-negative amplitudes for measured detector-bin backgrounds.
-
-    Each row of the two template matrices is one named component, already
-    expressed in the detector bins of the corresponding complete acquisition.
-    Only amplitudes are fitted: the neutron signal and every template shape
-    stay fixed, and the background is added after the instrument response
-    rather than broadened a second time.
-
-    ``open_exposure_scale`` and ``sample_exposure_scale`` convert the common
-    reference neutron signal into expected counts for each acquisition, so a
-    run-normalization factor cannot be absorbed as background.
-
-    ``open_window_loss`` and ``sample_window_loss`` are required: pass the
-    two loss values returned by ``two_arm_count_response`` for the same
-    reference signal. They are the acquisition-window loss disclosure the
-    result carries forward (exposure-scaled), so defaulting them would
-    silently report "no loss".
-
-    The exposure scales apply to the neutron signal and its window losses
-    only. Templates are never multiplied by them: supply each arm's
-    template already expressed in that arm's own exposure.
-
-    ``max_iter`` bounds every joint Fisher-scoring iteration, including the
-    short post-convergence polish that resolves the active set, so the
-    reported ``iterations`` never exceeds it; ``tol`` is the scale-free KKT
-    gradient tolerance that declares convergence. Both are validated under
-    these names (``max_iter`` at least 1, ``tol`` finite and positive).
-
-    Raises ``ValueError`` for malformed inputs: shape mismatch, negative or
-    non-finite counts, window losses, exposure scales, ``tol`` or
-    ``max_iter``, duplicate or empty template names, a template that is
-    zero in both arms, or too few informative bins for the template rank.
-    Raises ``RuntimeError`` for model-evaluation failures during the fit,
-    such as a fitted amplitude that cannot be represented in the supplied
-    template units (overflow or underflow) or an expectation that
-    overflows.
-    """
-    ...
-
 def load_tiff_stack(
     path: str,
     pixel_policy: str = "reject",
@@ -1974,12 +1825,8 @@ def spatial_map_typed(
         energy_scale_flight_path_m: Nominal flight path (m) for the
             energy-scale model (default 25.0).
         resolution: Optional resolution function.  Rejected when fitting
-            count cubes: a resolved count fit needs the exact separate-arm
-            model, which the single-spectrum ``fit_counts_spectrum_typed``
-            provides via ``incident_fluence_weights`` /
-            ``detector_time_edges_us``; spatial count mapping stays
-            fail-closed until that fixed matrix is cached per map. Fit
-            pre-normalized transmission cubes when resolution is required.
+            count cubes; fit pre-normalized transmission cubes when
+            resolution is required.
         scale_by_chi2: When ``True``, inflate the covariance-only
             uncertainties (incl. ``temperature_uncertainty_map``) by
             ``sqrt(chi2/dof)`` at the converged point, turning the inverse-Fisher
@@ -2098,10 +1945,7 @@ def fit_counts_spectrum_typed(
     energy_scale_flight_path_m: float = 25.0,
     detector_background: NDArray[np.float64] | None = None,
     c: float = 1.0,
-    resolution: TabulatedResolution | IkedaCarpenter | None = None,
-    incident_fluence_weights: NDArray[np.float64] | None = None,
-    detector_time_edges_us: NDArray[np.float64] | None = None,
-    timing_offset_us: float = 0.0,
+    resolution: TabulatedResolution | None = None,
     flight_path_m: float | None = None,
     delta_t_us: float | None = None,
     delta_l_m: float | None = None,
@@ -2163,21 +2007,8 @@ def fit_counts_spectrum_typed(
             1.0 assumes the caller has already PC-normalized the flux.
             For raw VENUS-style counts, set this to the actual ratio
             (typically ~5–6).  Used by the counts-KL dispatch.
-        resolution: Exact detector-time response for resolved raw-count
-            fitting: a ``TabulatedResolution`` or ``IkedaCarpenter``, supplied
-            together with ``incident_fluence_weights`` and
-            ``detector_time_edges_us``.  A resolution without those inputs
-            fails closed (the physical model needs the exact separate-arm
-            model, never the R[T] shortcut).
-        incident_fluence_weights: Incident fluence integrated over each point
-            of the true-energy quadrature, with detector efficiency folded in
-            (the contract's ``F_j = w_j*eps*Phi``).  Required together with
-            ``detector_time_edges_us``.
-        detector_time_edges_us: Actual measured detector-time bin edges in
-            ascending microseconds; length must be one greater than the
-            sample/open count arrays.
-        timing_offset_us: Fixed detector-clock offset applied by the response
-            (default 0.0; only meaningful with the exact-response inputs).
+        resolution: Rejected: count fits with an instrument resolution are
+            not supported by this function.
         groups: List of IsotopeGroup objects (mutually exclusive with isotopes).
         initial_densities: Initial density guesses when using groups.
         fix_densities: Freeze all densities at their initial values and fit
@@ -2258,9 +2089,6 @@ def compute_model_jacobian(
     Research-oriented function for Fisher-based regularisation studies.
 
     Any active instrument resolution (Gaussian parameters or
-    ``resolution=``) is rejected: this counts-space helper does not implement
-    the exact two-arm detector operator, so it fails closed (the physical
-    model needs the exact separate-arm model); use the single-spectrum count
-    fitter for resolved counts.
+    ``resolution=``) is rejected.
     """
     ...
