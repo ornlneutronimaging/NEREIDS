@@ -451,7 +451,7 @@ class IkedaCarpenter:
         """Probability in each detector-time bin for one true energy.
 
         The probabilities are not renormalized when the supplied time window
-        omits part of the pulse.
+        omits part of the pulse. A Gaussian burst is refused with ValueError.
         """
         ...
 

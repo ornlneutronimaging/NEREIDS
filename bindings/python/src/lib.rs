@@ -988,7 +988,8 @@ impl PyIkedaCarpenter {
 
     /// Probability that a neutron at one true energy is recorded in each
     /// adjacent detector-time bin. The result is not renormalized when the
-    /// supplied time window omits part of the pulse.
+    /// supplied time window omits part of the pulse. A Gaussian burst is
+    /// refused.
     fn detector_bin_probabilities(
         &self,
         true_energy_ev: f64,
