@@ -32,9 +32,6 @@ use crate::parameters::{FitParameter, ParameterSet};
 pub struct PoissonConfig {
     /// Maximum number of steps.
     pub max_iter: usize,
-    /// Convergence tolerance of the count-background solver; [`poisson_fit`]
-    /// stops on the Newton decrement instead.
-    pub tol_param: f64,
     /// Whether to compute the covariance and error bars after convergence.
     pub compute_covariance: bool,
 }
@@ -43,7 +40,6 @@ impl Default for PoissonConfig {
     fn default() -> Self {
         Self {
             max_iter: 200,
-            tol_param: 1e-8,
             compute_covariance: true,
         }
     }

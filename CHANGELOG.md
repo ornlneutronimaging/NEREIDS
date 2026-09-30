@@ -7,22 +7,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
 
 ## [Unreleased]
 
-### Added
-
-- **Exact separate-arm response for resolved count fitting.** A count fit
-  with an active instrument resolution now evaluates the physical detector
-  equation — the open and sample arms broadened separately,
-  `T_eff,i = Σ_j F_j T_j R_ij / Σ_j F_j R_ij` — instead of failing closed.
-  `fit_counts_spectrum_typed` gains `incident_fluence_weights`,
-  `detector_time_edges_us` and `timing_offset_us`, and accepts a
-  `TabulatedResolution` or `IkedaCarpenter` detector-time response; the
-  true-energy quadrature and the measured detector-time bins are distinct
-  axes. New public Rust surface: `ExactCountResponseConfig`,
-  `DetectorBinResponseMatrix` and `ExactTwoArmRatioModel`. Spatial mapping
-  and the research Fisher helper stay fail-closed for resolved counts.
-
 ### Changed (breaking)
 
+- **Raw counts with an instrument resolution are refused.**
+  `fit_counts_spectrum_typed`, `spatial_map_typed` on count cubes and
+  `compute_model_jacobian` reject an active resolution instead of
+  broadening the transmission ratio, which is not the detector's response:
+  the open and sample arms are broadened separately.
 - **`poisson_fit` takes counts and an analytical Jacobian.** It minimizes
   half the Poisson deviance by projected Levenberg–Marquardt steps in the
   Fisher metric and reports `converged` when its Newton decrement is below
@@ -33,7 +24,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
   `uncertainties` holds `None` for a parameter on a bound or along a
   direction the data do not determine, and `on_bound` is new.
   `PoissonConfig` loses `fd_step`, `step_size`, `armijo_c`, `backtrack`,
-  `gauss_newton_lambda` and `lbfgs_history`.
+  `gauss_newton_lambda`, `lbfgs_history` and `tol_param`.
 - **Removed the two cross-domain fit routes.** Normalized transmission with
   a Poisson/KL solver is rejected (a fractional ratio is not Poisson count
   data, and the supplied uncertainty would be ignored), and raw
@@ -49,7 +40,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
   model — identically zero deviance for any transmission — so they no longer
   count as degrees of freedom. Reported goodness-of-fit and the opt-in
   `scale_by_chi2` σ inflation change for any fit whose window contains empty
-  bins (routine on the exact detector-time route); fully occupied fits,
+  bins; fully occupied fits,
   including the VENUS regression anchors, are unaffected.
 
 - **Removed URR (LRU=2) and R-Matrix Limited (LRF=7) cross-section

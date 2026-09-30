@@ -10,9 +10,10 @@
 use std::fmt;
 use std::sync::Arc;
 
-use crate::counts_response::{CountsResponseError, DetectorBinResponseMatrix};
+use rayon::prelude::*;
+
 use crate::ikeda_carpenter::{EnergyLaw, IkedaCarpenter};
-use crate::resolution::{ResolutionFunction, ResolutionParseError, TOF_FACTOR};
+use crate::resolution::{ResolutionParseError, TOF_FACTOR};
 
 /// Largest number of grid points a window may need.
 pub const MAX_POINTS: usize = 100_000;
@@ -37,8 +38,6 @@ pub enum FlightTimeGridError {
     OutsideCalibration { low_ev: f64, high_ev: f64 },
     /// A grid at `step_us` would need more than [`MAX_POINTS`] points.
     TooManyPoints { step_us: f64 },
-    /// The bin probabilities could not be built.
-    Response(CountsResponseError),
     /// `found` values were given for a grid of `expected` points.
     ValuesLength { expected: usize, found: usize },
 }
@@ -69,7 +68,6 @@ impl fmt::Display for FlightTimeGridError {
                 f,
                 "a step of {step_us} µs needs more than {MAX_POINTS} grid points"
             ),
-            Self::Response(e) => write!(f, "bin probabilities: {e}"),
             Self::ValuesLength { expected, found } => write!(
                 f,
                 "{found} values were given for a grid of {expected} points"
@@ -96,7 +94,9 @@ pub struct FlightTimeGrid {
     range_us: (f64, f64),
     step_us: f64,
     flight_times_us: Vec<f64>,
-    response: DetectorBinResponseMatrix,
+    row_offsets: Vec<usize>,
+    bins: Vec<usize>,
+    probabilities: Vec<f64>,
 }
 
 impl FlightTimeGrid {
@@ -194,13 +194,28 @@ impl FlightTimeGrid {
             .iter()
             .map(|u| (clock / u).powi(2))
             .collect();
-        let response = DetectorBinResponseMatrix::new(
-            &energies,
-            time_edges_us,
-            t0_us,
-            &ResolutionFunction::IkedaCarpenter(Arc::clone(pulse)),
-        )
-        .map_err(FlightTimeGridError::Response)?;
+        let rows: Vec<Result<Vec<(usize, f64)>, ResolutionParseError>> = energies
+            .par_iter()
+            .map(|&energy| {
+                let row = pulse.detector_bin_probabilities(energy, time_edges_us, t0_us)?;
+                debug_assert!(row.iter().all(|p| p.is_finite() && *p >= 0.0));
+                Ok(row
+                    .into_iter()
+                    .enumerate()
+                    .filter(|&(_, p)| p > 0.0)
+                    .collect())
+            })
+            .collect();
+        let mut row_offsets = vec![0];
+        let mut bins = Vec::new();
+        let mut probabilities = Vec::new();
+        for row in rows {
+            for (k, p) in row? {
+                bins.push(k);
+                probabilities.push(p);
+            }
+            row_offsets.push(probabilities.len());
+        }
         Ok(Self {
             time_edges_us: time_edges_us.to_vec(),
             t0_us,
@@ -208,7 +223,9 @@ impl FlightTimeGrid {
             range_us,
             step_us,
             flight_times_us,
-            response,
+            row_offsets,
+            bins,
+            probabilities,
         })
     }
 
@@ -272,9 +289,12 @@ impl FlightTimeGrid {
                 found: values.len(),
             });
         }
-        let mut counts = vec![0.0; self.response.n_detector_bins()];
-        for (j, &v) in values.iter().enumerate() {
-            for (k, p) in self.response.row_entries(j) {
+        let mut counts = vec![0.0; self.time_edges_us.len() - 1];
+        for (&v, row) in values.iter().zip(self.row_offsets.windows(2)) {
+            for (&k, &p) in self.bins[row[0]..row[1]]
+                .iter()
+                .zip(&self.probabilities[row[0]..row[1]])
+            {
                 counts[k] += self.step_us * v * p;
             }
         }

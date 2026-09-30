@@ -152,9 +152,8 @@ For synthetic demo data, resolution can be disabled:
 For real instrument data, use Gaussian resolution parameters or a tabulated
 resolution file. Synthetic data often does not need an instrument resolution
 file; real experiments normally do.
-The exception is count inputs: raw counts always fit in the counts domain (the legacy counts-to-transmission conversion was removed), and a count input with an active resolution is rejected through MCP —
-the exact separate-arm count fit needs incident fluence weights and measured detector-time bin edges, which the manifest schema does not carry.
-Use the direct Python `fit_counts_spectrum_typed` exact-count arguments when resolution is required, supply pre-normalized transmission, or disable resolution for count inputs.
+The exception is count inputs: raw counts always fit in the counts domain, and a count input with an active resolution is rejected.
+Supply pre-normalized transmission, or disable resolution for count inputs.
 Cross-domain solver requests are also rejected on both validate and run: counts with `solver: "lm"`, and transmission with a Poisson/KL solver name.
 
 ## Supported Workflow Inputs

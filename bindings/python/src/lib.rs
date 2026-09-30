@@ -56,7 +56,6 @@ use nereids_fitting::resolution_calib::{
 };
 use nereids_io::normalization::{self as norm, NormalizationParams};
 use nereids_io::tof::BeamlineParams;
-use nereids_physics::counts_response;
 use nereids_physics::doppler::{self, DopplerParams};
 use nereids_physics::ikeda_carpenter::{
     EnergyLaw, IkedaCarpenter, IkedaCarpenterParams, SynthesisGrid,
@@ -2360,23 +2359,6 @@ fn require_non_empty_energy_grid(e: &[f64]) -> PyResult<()> {
     validate_energy_grid(e)
 }
 
-/// Extract a detector-time response that has exact bin probabilities.
-///
-/// Accepts a `TabulatedResolution` or `IkedaCarpenter` Python object and
-/// rejects anything else with a `TypeError`; unlike [`build_resolution`],
-/// it never returns `None` and performs no Gaussian-parameter handling.
-fn extract_detector_time_resolution(resolution: &Bound<'_, PyAny>) -> PyResult<ResolutionFunction> {
-    if let Ok(tabulated) = resolution.extract::<PyRef<'_, PyTabulatedResolution>>() {
-        Ok(ResolutionFunction::Tabulated(Arc::clone(&tabulated.inner)))
-    } else if let Ok(ic) = resolution.extract::<PyRef<'_, PyIkedaCarpenter>>() {
-        Ok(ResolutionFunction::IkedaCarpenter(Arc::clone(&ic.inner)))
-    } else {
-        Err(pyo3::exceptions::PyTypeError::new_err(
-            "resolution must be a TabulatedResolution or IkedaCarpenter",
-        ))
-    }
-}
-
 /// Build a `ResolutionFunction` from Python arguments.
 ///
 /// Validates mutual exclusivity (Gaussian vs. tabulated) and completeness
@@ -2656,357 +2638,6 @@ fn py_apply_resolution<'py>(
     let result = py.detach(move || resolution::apply_resolution(&e_owned, &s_owned, &res_fn));
     let result = result.map_err(|e| pyo3::exceptions::PyValueError::new_err(format!("{}", e)))?;
     Ok(PyArray1::from_vec(py, result))
-}
-
-/// Predict separate open-beam and sample counts on actual detector-time bins.
-///
-/// ``incident_fluence_weights[j]`` is the incident flux density at true energy
-/// ``j`` times detector efficiency times the caller's energy-integration
-/// weight (the discrete form of the contract's Phi*epsilon; pipeline-map
-/// R5·7). The response is applied to the open and attenuated sample arms
-/// separately; this function never broadens a transmission ratio. The last
-/// two returned values are the expected open-beam and sample counts falling
-/// outside the supplied acquisition window — reported, never renormalized
-/// into the window.
-#[pyfunction]
-#[pyo3(name = "two_arm_count_response", signature = (
-    true_energies_ev,
-    incident_fluence_weights,
-    transmission,
-    detector_time_edges_us,
-    resolution,
-    timing_offset_us = 0.0,
-))]
-fn py_two_arm_count_response<'py>(
-    py: Python<'py>,
-    true_energies_ev: PyReadonlyArray1<f64>,
-    incident_fluence_weights: PyReadonlyArray1<f64>,
-    transmission: PyReadonlyArray1<f64>,
-    detector_time_edges_us: PyReadonlyArray1<f64>,
-    resolution: &Bound<'_, PyAny>,
-    timing_offset_us: f64,
-) -> PyResult<(
-    Bound<'py, PyArray1<f64>>,
-    Bound<'py, PyArray1<f64>>,
-    f64,
-    f64,
-)> {
-    let response = extract_detector_time_resolution(resolution)?;
-
-    let energies = true_energies_ev.as_slice()?.to_vec();
-    let fluence = incident_fluence_weights.as_slice()?.to_vec();
-    let transmission = transmission.as_slice()?.to_vec();
-    let detector_edges = detector_time_edges_us.as_slice()?.to_vec();
-    let result = py.detach(move || {
-        counts_response::two_arm_count_response(
-            &energies,
-            &fluence,
-            &transmission,
-            &detector_edges,
-            timing_offset_us,
-            &response,
-        )
-    });
-    let result = result.map_err(|error| {
-        pyo3::exceptions::PyValueError::new_err(format!("two-arm count response: {error}"))
-    })?;
-    Ok((
-        PyArray1::from_vec(py, result.open_beam),
-        PyArray1::from_vec(py, result.sample),
-        result.open_beam_window_loss,
-        result.sample_window_loss,
-    ))
-}
-
-/// Python result for a fixed-signal, measured-template count-background fit.
-#[pyclass(name = "TwoArmBackgroundFitResult")]
-struct PyTwoArmBackgroundFitResult {
-    names: Vec<String>,
-    amplitudes: Vec<f64>,
-    amplitude_uncertainties: Option<Vec<f64>>,
-    amplitude_at_bound: Vec<bool>,
-    amplitudes_identifiable: bool,
-    open_neutron_signal: Vec<f64>,
-    open_background: Vec<f64>,
-    open_total: Vec<f64>,
-    open_window_loss: f64,
-    sample_neutron_signal: Vec<f64>,
-    sample_background: Vec<f64>,
-    sample_total: Vec<f64>,
-    sample_window_loss: f64,
-    poisson_deviance: f64,
-    deviance_per_dof: f64,
-    n_informative: usize,
-    converged: bool,
-    iterations: usize,
-}
-
-#[pymethods]
-impl PyTwoArmBackgroundFitResult {
-    #[getter]
-    fn names(&self) -> Vec<String> {
-        self.names.clone()
-    }
-
-    #[getter]
-    fn amplitudes<'py>(&self, py: Python<'py>) -> Bound<'py, PyArray1<f64>> {
-        PyArray1::from_vec(py, self.amplitudes.clone())
-    }
-
-    /// One-sigma amplitude uncertainties from the expected (Fisher)
-    /// information of the constrained objective, or `None` when withheld.
-    ///
-    /// `None` (absent, not a sentinel) when the fit did not converge, the
-    /// amplitudes are not separately determined, or the free block of the
-    /// information matrix is singular. An individual entry is NaN when its
-    /// variance is non-positive or its template is sensitive on a bin with
-    /// zero expectation, where the expected information diverges. Free
-    /// amplitudes are conditioned on any partner held at its bound; an
-    /// amplitude on its own zero bound (see `amplitude_at_bound`) reports a
-    /// one-sided curvature scale, not a symmetric interval.
-    #[getter]
-    fn amplitude_uncertainties<'py>(&self, py: Python<'py>) -> Option<Bound<'py, PyArray1<f64>>> {
-        self.amplitude_uncertainties
-            .as_ref()
-            .map(|values| PyArray1::from_vec(py, values.clone()))
-    }
-
-    /// Whether each amplitude is held at zero by its non-negativity bound
-    /// with the gradient still pushing it negative — a one-sided limit rather
-    /// than an interior estimate.
-    #[getter]
-    fn amplitude_at_bound(&self) -> Vec<bool> {
-        self.amplitude_at_bound.clone()
-    }
-
-    #[getter]
-    fn amplitudes_identifiable(&self) -> bool {
-        self.amplitudes_identifiable
-    }
-
-    #[getter]
-    fn open_neutron_signal<'py>(&self, py: Python<'py>) -> Bound<'py, PyArray1<f64>> {
-        PyArray1::from_vec(py, self.open_neutron_signal.clone())
-    }
-
-    #[getter]
-    fn open_background<'py>(&self, py: Python<'py>) -> Bound<'py, PyArray1<f64>> {
-        PyArray1::from_vec(py, self.open_background.clone())
-    }
-
-    #[getter]
-    fn open_total<'py>(&self, py: Python<'py>) -> Bound<'py, PyArray1<f64>> {
-        PyArray1::from_vec(py, self.open_total.clone())
-    }
-
-    /// Expected open-beam neutron counts lost outside the acquisition window,
-    /// after exposure scaling (pipeline-map R5·7: disclosed, not renormalized).
-    #[getter]
-    fn open_window_loss(&self) -> f64 {
-        self.open_window_loss
-    }
-
-    #[getter]
-    fn sample_neutron_signal<'py>(&self, py: Python<'py>) -> Bound<'py, PyArray1<f64>> {
-        PyArray1::from_vec(py, self.sample_neutron_signal.clone())
-    }
-
-    #[getter]
-    fn sample_background<'py>(&self, py: Python<'py>) -> Bound<'py, PyArray1<f64>> {
-        PyArray1::from_vec(py, self.sample_background.clone())
-    }
-
-    #[getter]
-    fn sample_total<'py>(&self, py: Python<'py>) -> Bound<'py, PyArray1<f64>> {
-        PyArray1::from_vec(py, self.sample_total.clone())
-    }
-
-    /// Expected sample counts lost outside the acquisition window, after
-    /// exposure scaling.
-    #[getter]
-    fn sample_window_loss(&self) -> f64 {
-        self.sample_window_loss
-    }
-
-    #[getter]
-    fn poisson_deviance(&self) -> f64 {
-        self.poisson_deviance
-    }
-
-    #[getter]
-    fn deviance_per_dof(&self) -> f64 {
-        self.deviance_per_dof
-    }
-
-    /// Concatenated bins able to discriminate between amplitude vectors.
-    ///
-    /// Bins with no observation, no neutron signal, and no template capacity
-    /// yield identically zero deviance for any amplitude, so they are excluded
-    /// from the degrees of freedom behind `deviance_per_dof`.
-    #[getter]
-    fn n_informative(&self) -> usize {
-        self.n_informative
-    }
-
-    #[getter]
-    fn converged(&self) -> bool {
-        self.converged
-    }
-
-    #[getter]
-    fn iterations(&self) -> usize {
-        self.iterations
-    }
-}
-
-/// Fit non-negative amplitudes for independently measured count backgrounds.
-///
-/// Each row of the two template matrices is one named component. Templates
-/// must already be normalized into the detector bins of the corresponding
-/// complete acquisition. Only amplitudes are fitted; shapes and neutron
-/// signals remain fixed. The two required exposure scales convert the common
-/// reference signal into expected counts for each complete acquisition.
-#[pyfunction]
-#[pyo3(name = "fit_two_arm_background_templates", signature = (
-    observed_open_counts,
-    observed_sample_counts,
-    open_neutron_signal,
-    sample_neutron_signal,
-    open_exposure_scale,
-    sample_exposure_scale,
-    template_names,
-    open_background_templates,
-    sample_background_templates,
-    initial_amplitudes,
-    open_window_loss,
-    sample_window_loss,
-    max_iter = 200,
-    tol = 1.0e-8,
-))]
-#[allow(clippy::too_many_arguments)]
-fn py_fit_two_arm_background_templates<'py>(
-    py: Python<'py>,
-    observed_open_counts: PyReadonlyArray1<'py, f64>,
-    observed_sample_counts: PyReadonlyArray1<'py, f64>,
-    open_neutron_signal: PyReadonlyArray1<'py, f64>,
-    sample_neutron_signal: PyReadonlyArray1<'py, f64>,
-    open_exposure_scale: f64,
-    sample_exposure_scale: f64,
-    template_names: Vec<String>,
-    open_background_templates: PyReadonlyArray2<'py, f64>,
-    sample_background_templates: PyReadonlyArray2<'py, f64>,
-    initial_amplitudes: PyReadonlyArray1<'py, f64>,
-    open_window_loss: f64,
-    sample_window_loss: f64,
-    max_iter: i64,
-    tol: f64,
-) -> PyResult<PyTwoArmBackgroundFitResult> {
-    use nereids_fitting::count_background::{
-        TwoArmBackgroundTemplate, fit_two_arm_background_templates as rust_fit_background,
-    };
-    use nereids_fitting::poisson::PoissonConfig;
-    use nereids_physics::counts_response::TwoArmCounts;
-
-    let open_template_array = open_background_templates.as_array();
-    let sample_template_array = sample_background_templates.as_array();
-    let open_shape = open_template_array.shape();
-    let sample_shape = sample_template_array.shape();
-    if open_shape != sample_shape {
-        return Err(pyo3::exceptions::PyValueError::new_err(format!(
-            "open_background_templates shape {open_shape:?} must match sample_background_templates shape {sample_shape:?}"
-        )));
-    }
-    if template_names.len() != open_shape[0] {
-        return Err(pyo3::exceptions::PyValueError::new_err(format!(
-            "template_names length ({}) must match template rows ({})",
-            template_names.len(),
-            open_shape[0]
-        )));
-    }
-    let initial = initial_amplitudes.as_slice()?.to_vec();
-    if initial.len() != open_shape[0] {
-        return Err(pyo3::exceptions::PyValueError::new_err(format!(
-            "initial_amplitudes length ({}) must match template rows ({})",
-            initial.len(),
-            open_shape[0]
-        )));
-    }
-
-    let templates: Vec<TwoArmBackgroundTemplate> = template_names
-        .into_iter()
-        .zip(open_template_array.outer_iter())
-        .zip(sample_template_array.outer_iter())
-        .map(|((name, open_beam), sample)| TwoArmBackgroundTemplate {
-            name,
-            open_beam: open_beam.to_vec(),
-            sample: sample.to_vec(),
-        })
-        .collect();
-    let observed_open = observed_open_counts.as_slice()?.to_vec();
-    let observed_sample = observed_sample_counts.as_slice()?.to_vec();
-    let signal = TwoArmCounts {
-        open_beam: open_neutron_signal.as_slice()?.to_vec(),
-        sample: sample_neutron_signal.as_slice()?.to_vec(),
-        open_beam_window_loss: open_window_loss,
-        sample_window_loss,
-    };
-    // Validated here under the Python parameter names, so the message a
-    // caller sees matches the signature they wrote against (the Rust layer
-    // re-checks under its own field names).
-    if !tol.is_finite() || tol <= 0.0 {
-        return Err(pyo3::exceptions::PyValueError::new_err(format!(
-            "tol must be finite and > 0, got {tol}"
-        )));
-    }
-    if max_iter < 1 {
-        return Err(pyo3::exceptions::PyValueError::new_err(format!(
-            "max_iter must be at least 1, got {max_iter}"
-        )));
-    }
-    let config = PoissonConfig {
-        max_iter: max_iter as usize,
-        tol_param: tol,
-        ..PoissonConfig::default()
-    };
-    let result = py.detach(move || {
-        rust_fit_background(
-            &observed_open,
-            &observed_sample,
-            signal,
-            open_exposure_scale,
-            sample_exposure_scale,
-            &templates,
-            &initial,
-            &config,
-        )
-    });
-    let result = result.map_err(|error| match error {
-        nereids_fitting::error::FittingError::EvaluationFailed(_) => {
-            pyo3::exceptions::PyRuntimeError::new_err(error.to_string())
-        }
-        _ => pyo3::exceptions::PyValueError::new_err(error.to_string()),
-    })?;
-
-    Ok(PyTwoArmBackgroundFitResult {
-        names: result.names,
-        amplitudes: result.amplitudes,
-        amplitude_uncertainties: result.amplitude_uncertainties,
-        amplitude_at_bound: result.amplitude_at_bound,
-        amplitudes_identifiable: result.amplitudes_identifiable,
-        open_neutron_signal: result.prediction.open_beam.neutron_signal,
-        open_background: result.prediction.open_beam.background,
-        open_total: result.prediction.open_beam.total,
-        open_window_loss: result.prediction.open_beam.window_loss,
-        sample_neutron_signal: result.prediction.sample.neutron_signal,
-        sample_background: result.prediction.sample.background,
-        sample_total: result.prediction.sample.total,
-        sample_window_loss: result.prediction.sample.window_loss,
-        poisson_deviance: result.poisson_deviance,
-        deviance_per_dof: result.deviance_per_dof,
-        n_informative: result.n_informative,
-        converged: result.converged,
-        iterations: result.iterations,
-    })
 }
 
 /// Parse a Python-facing pixel-value policy string.
@@ -4923,7 +4554,6 @@ fn nereids(m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_class::<PyJointFitResult>()?;
     m.add_class::<PySpatialResult>()?;
     m.add_class::<PyTraceDetectabilityReport>()?;
-    m.add_class::<PyTwoArmBackgroundFitResult>()?;
     m.add_function(wrap_pyfunction!(cross_sections, m)?)?;
     m.add_function(wrap_pyfunction!(forward_model, m)?)?;
     m.add_function(wrap_pyfunction!(calibrate_resolution, m)?)?;
@@ -4940,8 +4570,6 @@ fn nereids(m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_function(wrap_pyfunction!(width_from_fwhm, m)?)?;
     m.add_function(wrap_pyfunction!(load_resolution, m)?)?;
     m.add_function(wrap_pyfunction!(py_apply_resolution, m)?)?;
-    m.add_function(wrap_pyfunction!(py_two_arm_count_response, m)?)?;
-    m.add_function(wrap_pyfunction!(py_fit_two_arm_background_templates, m)?)?;
     m.add_function(wrap_pyfunction!(load_tiff_stack, m)?)?;
     m.add_function(wrap_pyfunction!(load_tiff_folder, m)?)?;
     m.add_function(wrap_pyfunction!(read_tof_sidecar, m)?)?;
@@ -5494,11 +5122,7 @@ fn spatial_result_to_py(
 ///     energy_scale_flight_path_m: Nominal flight path (m) for the
 ///         energy-scale model. Must match the grid used to compute `energies`.
 ///     resolution: Optional resolution function.  Rejected when fitting
-///         count cubes: a resolved count fit needs the exact separate-arm
-///         model, which the single-spectrum ``fit_counts_spectrum_typed``
-///         provides via ``incident_fluence_weights`` /
-///         ``detector_time_edges_us``; spatial count mapping stays fail-closed
-///         until that fixed matrix is cached per map.
+///         count cubes.
 ///     groups: list of IsotopeGroup objects (mutually exclusive with isotopes).
 ///     fit_anorm: Whether Anorm is free when ``background=True`` (default
 ///         True).  Must be False to combine ``background=True`` with
@@ -5921,20 +5545,8 @@ fn py_spatial_map_typed<'py>(
 ///         the counts-KL dispatch). "lm" is rejected for raw counts.
 ///     background: Enable transmission-lift background inside the counts fit.
 ///     detector_background: Optional detector/counts background reference.
-///     resolution: Exact detector-time response for resolved raw-count
-///         fitting: a TabulatedResolution or IkedaCarpenter, supplied
-///         together with ``incident_fluence_weights`` and
-///         ``detector_time_edges_us``.  A resolution without those inputs
-///         fails closed (the physical model needs the exact separate-arm
-///         model, never the R[T] shortcut).
-///     incident_fluence_weights: Incident fluence integrated over each point
-///         of the true-energy quadrature, with detector efficiency folded in
-///         (the contract's ``F_j = w_j*eps*Phi``). Required with
-///         detector_time_edges_us.
-///     detector_time_edges_us: Actual measured detector-time bin edges. Its
-///         length must be one greater than the sample/open count arrays.
-///     timing_offset_us: Fixed detector-clock offset applied by the response
-///         (default 0.0; only meaningful with the exact-response inputs).
+///     resolution: Rejected: count fits with an instrument resolution are
+///         not supported by this function.
 ///     groups: list of IsotopeGroup objects (mutually exclusive with isotopes).
 ///     initial_densities: Initial density guesses when using groups (default 0.001 each).
 ///     enable_polish: Override the Nelder-Mead polish phase on the
@@ -5988,9 +5600,6 @@ fn py_spatial_map_typed<'py>(
     detector_background = None,
     c = 1.0,
     resolution = None,
-    incident_fluence_weights = None,
-    detector_time_edges_us = None,
-    timing_offset_us = 0.0,
     flight_path_m = None,
     delta_t_us = None,
     delta_l_m = None,
@@ -6035,10 +5644,7 @@ fn py_fit_counts_spectrum_typed<'py>(
     energy_scale_flight_path_m: f64,
     detector_background: Option<PyReadonlyArray1<'py, f64>>,
     c: f64,
-    resolution: Option<&Bound<'py, PyAny>>,
-    incident_fluence_weights: Option<PyReadonlyArray1<'py, f64>>,
-    detector_time_edges_us: Option<PyReadonlyArray1<'py, f64>>,
-    timing_offset_us: f64,
+    resolution: Option<PyTabulatedResolution>,
     flight_path_m: Option<f64>,
     delta_t_us: Option<f64>,
     delta_l_m: Option<f64>,
@@ -6089,51 +5695,11 @@ fn py_fit_counts_spectrum_typed<'py>(
             ob_slice.len(),
         )));
     }
-    let exact_source = incident_fluence_weights
-        .map(|values| values.as_slice().map(<[f64]>::to_vec))
-        .transpose()?;
-    let exact_edges = detector_time_edges_us
-        .map(|values| values.as_slice().map(<[f64]>::to_vec))
-        .transpose()?;
-    let exact_requested = exact_source.is_some() || exact_edges.is_some();
-    if exact_source.is_some() != exact_edges.is_some() {
-        return Err(pyo3::exceptions::PyValueError::new_err(
-            "incident_fluence_weights and detector_time_edges_us must be supplied together",
-        ));
-    }
-    if !exact_requested && timing_offset_us != 0.0 {
-        return Err(pyo3::exceptions::PyValueError::new_err(
-            "timing_offset_us requires incident_fluence_weights and detector_time_edges_us",
-        ));
-    }
-    if !exact_requested && sample_slice.len() != e_slice.len() {
+    if sample_slice.len() != e_slice.len() {
         return Err(pyo3::exceptions::PyValueError::new_err(format!(
             "sample_counts length ({}) must match energies length ({})",
             sample_slice.len(),
             e_slice.len(),
-        )));
-    }
-    if let Some(source) = exact_source.as_ref()
-        && source.len() != e_slice.len()
-    {
-        return Err(pyo3::exceptions::PyValueError::new_err(format!(
-            "incident_fluence_weights length ({}) must match the true-energy grid length ({})",
-            source.len(),
-            e_slice.len(),
-        )));
-    }
-    if let Some(edges) = exact_edges.as_ref()
-        && edges.len() != sample_slice.len() + 1
-    {
-        return Err(pyo3::exceptions::PyValueError::new_err(format!(
-            "detector_time_edges_us length ({}) must be one greater than the measured count-bin length ({})",
-            edges.len(),
-            sample_slice.len(),
-        )));
-    }
-    if exact_requested && !timing_offset_us.is_finite() {
-        return Err(pyo3::exceptions::PyValueError::new_err(format!(
-            "timing_offset_us must be finite, got {timing_offset_us}",
         )));
     }
     require_non_empty_energy_grid(e_slice)?;
@@ -6179,17 +5745,7 @@ fn py_fit_counts_spectrum_typed<'py>(
         None
     };
     let energies_vec = e_slice.to_vec();
-    let has_gaussian = flight_path_m.is_some() || delta_t_us.is_some() || delta_l_m.is_some();
-    if has_gaussian && resolution.is_some() {
-        return Err(pyo3::exceptions::PyValueError::new_err(
-            "Cannot specify both Gaussian resolution parameters and resolution",
-        ));
-    }
-    let res_fn = if let Some(response) = resolution {
-        Some(extract_detector_time_resolution(response)?)
-    } else {
-        build_resolution(flight_path_m, delta_t_us, delta_l_m, None, None)?
-    };
+    let res_fn = build_resolution(flight_path_m, delta_t_us, delta_l_m, resolution, None)?;
 
     let mut config = if let Some(isotopes) = isotopes {
         let iso_names: Vec<String> = isotopes
@@ -6232,22 +5788,6 @@ fn py_fit_counts_spectrum_typed<'py>(
     };
 
     config = config.with_solver(parse_solver_config(solver, true, max_iter)?);
-    if let (Some(incident_fluence_weights), Some(detector_time_edges_us)) =
-        (exact_source, exact_edges)
-    {
-        if config.resolution().is_none() {
-            return Err(pyo3::exceptions::PyValueError::new_err(
-                "exact resolved counts require resolution=TabulatedResolution or IkedaCarpenter",
-            ));
-        }
-        config = config.with_exact_count_response(
-            nereids_pipeline::pipeline::ExactCountResponseConfig {
-                incident_fluence_weights,
-                detector_time_edges_us,
-                timing_offset_us,
-            },
-        );
-    }
     // Issue #638: χ²-scaled uncertainties (no-op on the LM transmission path).
     config = config.with_scale_by_chi2(scale_by_chi2);
     if fit_temperature {
@@ -6458,10 +5998,8 @@ impl PyModelJacobianResult {
 ///     fit_temperature: If True, include temperature as a free parameter
 ///         in the Jacobian.
 ///     flight_path_m, delta_t_us, delta_l_m: Gaussian resolution parameters.
-///         Rejected: this counts-space helper does not implement the exact
-///         two-arm detector operator, so it fails closed for any active
-///         resolution (the physical model needs the exact separate-arm
-///         model); use the single-spectrum count fitter for resolved counts.
+///         Rejected: this counts-space helper does not support an active
+///         resolution.
 ///     resolution: Tabulated resolution object.  Rejected, same as the
 ///         Gaussian parameters above.
 ///     detector_background: Detector background B(E) for counts background model.

@@ -844,10 +844,10 @@ class TestManifestWorkflowTools:
         assert not any("counts input" in error for error in validation["errors"])
 
     def test_validation_rejects_counts_transmission_route_requests(self, tmp_path):
-        # The legacy counts->transmission conversion was deleted with the
-        # exact-count route (Wave-1 PR-2b): a counts manifest asking for the
-        # transmission domain (explicitly, or implicitly via solver=lm) must
-        # be rejected by validation exactly as the run path rejects it.
+        # There is no counts->transmission conversion: a counts manifest
+        # asking for the transmission domain (explicitly, or implicitly via
+        # solver=lm) must be rejected by validation exactly as the run path
+        # rejects it.
         np.savez(
             tmp_path / "counts.npz",
             energies_ev=np.linspace(1.0, 30.0, 20),

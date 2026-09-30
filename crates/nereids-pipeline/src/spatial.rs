@@ -331,34 +331,7 @@ fn validate_spatial_fit_preflight(
     // `UnifiedFitConfig` but takes the 1D `InputData`; inline the
     // resolution here so we do not have to materialise a 1D stub.
     let is_counts = input.is_counts();
-    if config.exact_count_response().is_some() {
-        return Err(PipelineError::InvalidParameter(
-            "exact resolved counts are currently supported by the single-spectrum \
-             count fitter only; spatial mapping would rebuild the detector matrix \
-             for every pixel and is disabled until that fixed matrix is cached once"
-                .into(),
-        ));
-    }
-    // Counts + resolution: intercept BEFORE the shared validator, whose
-    // remedy ("provide ... through exact_count_response") is unreachable
-    // here — the gate directly above rejects any exact config on the spatial
-    // path. Sending a caller to a config this same function refuses is the
-    // misdirected-remedy pattern; name the spatial-actionable options.
-    if is_counts && config.resolution().is_some() {
-        return Err(PipelineError::InvalidParameter(
-            "spatial_map_typed: resolved count mapping needs the exact separate-arm \
-             model R[Phi] and R[Phi*T], which is currently available on the \
-             single-spectrum count fitter only: fit pre-normalized transmission \
-             cubes with resolution, aggregate to a spectrum and use \
-             fit_counts_spectrum_typed with exact_count_response, or disable \
-             instrument resolution for this count map"
-                .into(),
-        ));
-    }
-    // Hoist the remaining scientifically unsupported combinations so they
-    // become one actionable boundary error, not an all-NaN map after every
-    // per-pixel error is swallowed by the rayon loop.
-    validate_counts_resolution_route(is_counts, input.shape().0, config)?;
+    validate_counts_resolution_route(is_counts, config)?;
     let is_kl = matches!(config.solver(), SolverConfig::PoissonKL(_))
         || (matches!(config.solver(), SolverConfig::Auto) && is_counts);
 
@@ -3650,7 +3623,7 @@ mod tests {
     /// the fact that every pixel tried to use R[T] instead of the physical
     /// separate-arm response R[Phi*T] / R[Phi].
     #[test]
-    fn spatial_counts_resolution_requires_exact_count_response() {
+    fn spatial_counts_with_an_instrument_resolution_are_refused() {
         use nereids_physics::resolution::{ResolutionFunction, ResolutionParams};
 
         let rd = u238_single_resonance();
