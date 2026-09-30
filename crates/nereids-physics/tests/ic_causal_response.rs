@@ -311,7 +311,7 @@ fn symmetric_sns_pulse_fold_keeps_source_clock_and_preserves_missing_tail_mass()
     oracle *= step / 3.0;
     assert!(
         (total - oracle).abs() < 2.0e-7,
-        "sampled folded pulse has probability {total}, independent analytical integral gives {oracle}"
+        "folded pulse has probability {total}, independent analytical integral gives {oracle}"
     );
     assert!(
         oracle < 1.0,
@@ -321,105 +321,65 @@ fn symmetric_sns_pulse_fold_keeps_source_clock_and_preserves_missing_tail_mass()
 }
 
 #[test]
-fn gaussian_fold_preserves_finite_window_tail_mass() {
-    let alpha = 100.0_f64;
-    let sigma = 1.0_f64;
+fn a_gaussian_burst_is_refused_in_detector_time() {
+    let nominal = TOF_FACTOR * 25.0 / 25.0_f64.sqrt();
+    for channel_fwhm_us in [None, Some(0.35)] {
+        let model = IkedaCarpenter::new(
+            IkedaCarpenterParams {
+                burst_sigma_us: Some(0.5),
+                channel_fwhm_us,
+                ..IkedaCarpenterParams::constant(2.0, 0.1, 0.0)
+            },
+            25.0,
+            &SynthesisGrid::new(1.0, 100.0),
+        )
+        .expect("the synthesized kernel still accepts a burst");
+        for err in [
+            model
+                .detector_bin_probabilities(25.0, &[nominal, nominal + 1.0], 0.0)
+                .expect_err("detector bins must refuse a burst")
+                .to_string(),
+            model
+                .delays_us(25.0)
+                .expect_err("delays must refuse a burst")
+                .to_string(),
+        ] {
+            assert!(err.contains("Gaussian burst"), "got: {err}");
+        }
+    }
+}
+
+#[test]
+fn a_folded_pulse_with_slow_storage_stays_a_probability() {
+    let (alpha, beta, r, fwhm) = (1.0_f64, 1.0e-9, 1.0e-9, 0.35);
     let flight_path_m = 25.0_f64;
     let true_energy_ev = 25.0_f64;
-    let params = IkedaCarpenterParams {
-        burst_sigma_us: Some(sigma),
-        ..IkedaCarpenterParams::constant(alpha, 1.0, 0.0)
-    };
     let model = IkedaCarpenter::new(
-        params,
-        flight_path_m,
-        &SynthesisGrid {
-            e_min_ev: 24.0,
-            e_max_ev: 26.0,
-            n_energies: 2,
-            n_tau: 8,
+        IkedaCarpenterParams {
+            channel_fwhm_us: Some(fwhm),
+            ..IkedaCarpenterParams::constant(alpha, beta, r)
         },
+        flight_path_m,
+        &SynthesisGrid::new(24.0, 26.0),
     )
-    .expect("valid Gaussian-folded IC model");
-    let (delays, _) = model
-        .source_pulse_at(true_energy_ev)
-        .expect("valid folded source pulse");
-    let lower = delays[0];
-    let upper = delays[delays.len() - 1];
-    let nominal_arrival = TOF_FACTOR * flight_path_m / true_energy_ev.sqrt();
+    .expect("valid folded IC model");
+    let nominal = TOF_FACTOR * flight_path_m / true_energy_ev.sqrt();
+    let edges: Vec<f64> = (0..=21_000)
+        .map(|k| nominal - fwhm + 0.001 * f64::from(k))
+        .collect();
+    let bins = model
+        .detector_bin_probabilities(true_energy_ev, &edges, 0.0)
+        .expect("valid detector bins");
+    let total: f64 = bins.iter().sum();
+    assert!(total <= 1.0 + 1.0e-12, "bins sum to {total}");
 
-    // Independent oracle: integrate the exact Gamma(3) moderator CDF over a
-    // standard normal variable. This does not use the sampled convolution or
-    // detector-bin integrator under test.
-    let normal_density = |delay: f64| {
-        (-0.5 * (delay / sigma).powi(2)).exp() / (sigma * std::f64::consts::TAU.sqrt())
-    };
-    let moderator_cdf = |delay: f64| gamma3_cdf(alpha * delay);
-    let window_oracle = |lo: f64, hi: f64| {
-        simpson(
-            |gaussian_delay: f64| {
-                normal_density(gaussian_delay)
-                    * (moderator_cdf(hi - gaussian_delay) - moderator_cdf(lo - gaussian_delay))
-            },
-            -10.0 * sigma,
-            10.0 * sigma,
-            100_000,
-        )
-    };
-    let window_sum = |lo: f64, hi: f64| -> f64 {
-        model
-            .detector_bin_probabilities(
-                true_energy_ev,
-                &[nominal_arrival + lo, nominal_arrival + hi],
-                0.0,
-            )
-            .expect("valid folded detector window")
-            .iter()
-            .sum()
-    };
-
-    // Broad window covering the whole sampled support: with the ±8σ reach the
-    // truncated Gaussian mass is ~1e-15, so a broad window must no longer be
-    // undercounted by the truncation bookkeeping.
-    let got_broad = window_sum(lower, upper);
-    let oracle_broad = window_oracle(lower, upper);
+    let far = model
+        .detector_bin_probabilities(true_energy_ev, &[nominal - 1.0, nominal + 1.0e103], 0.0)
+        .expect("valid detector bins");
     assert!(
-        (got_broad - oracle_broad).abs() < 2.0e-5,
-        "sampled Gaussian-folded probability {got_broad} disagrees with independent integral {oracle_broad}"
-    );
-    assert!(
-        1.0 - got_broad < 1.0e-6,
-        "broad window undercounted: kernel-truncation bookkeeping discarded {:.3e}",
-        1.0 - got_broad
-    );
-    assert!(
-        got_broad < 1.0,
-        "finite window was silently renormalized to one"
-    );
-
-    // Deliberately cut window: the upper edge sits on a sampled grid point
-    // near +2σ, so real fold mass lies beyond it. Both the oracle and the
-    // sampled path must SEE that loss — a renormalizing implementation would
-    // report ~1 (comparison is loose because the n_tau = 8 grid is
-    // deliberately coarse; the broad-window comparison above is the tight one).
-    let cut = delays
-        .iter()
-        .copied()
-        .min_by(|a, b| (a - 2.0 * sigma).abs().total_cmp(&(b - 2.0 * sigma).abs()))
-        .expect("non-empty sampled support");
-    let got_cut = window_sum(lower, cut);
-    let oracle_cut = window_oracle(lower, cut);
-    assert!(
-        1.0 - oracle_cut > 1.0e-2,
-        "cut-window oracle must expose real missing mass (got {oracle_cut})"
-    );
-    assert!(
-        1.0 - got_cut > 1.0e-2,
-        "cut window silently renormalized: reported {got_cut}"
-    );
-    assert!(
-        got_cut < got_broad,
-        "cutting the window must reduce the reported mass"
+        (far[0] - 1.0).abs() < 1.0e-12,
+        "far window holds {}",
+        far[0]
     );
 }
 
@@ -440,10 +400,6 @@ fn unequal_rate_storage_cdf_matches_pulse_quadrature() {
         (1.0, 0.995, 0.5, 8.0),  // Taylor branch: u = 0.04
         (1.0, 0.995, 0.5, 1.0),  // Taylor branch: u = 0.005
     ];
-    // Tolerance: near the |u| = 0.05 Taylor-branch boundary the two
-    // implementations carry independent series truncation — measured against
-    // a 60-digit reference at (1, 0.995, 0.5, 8): ic_cdf 4.7e-12, the
-    // integrated pulse 1.4e-11 — so the comparison budget is their sum.
     for (alpha, beta, r, tau) in cases {
         let quad = simpson(|t| ic_pulse(alpha, beta, r, t), 0.0, tau, 100_000);
         let cdf = ic_cdf(alpha, beta, r, tau);
@@ -455,11 +411,99 @@ fn unequal_rate_storage_cdf_matches_pulse_quadrature() {
 }
 
 #[test]
+fn storage_cdf_matches_its_convolution_at_the_series_switch() {
+    for (alpha, beta, r, tau) in [
+        (0.3_f64, 0.29_f64, 0.5_f64, 4.999_f64),
+        (0.3, 0.29, 0.5, 5.001),
+        (0.1, 0.098, 1.0, 24.99),
+        (1.0, 0.995, 0.5, 8.0),
+    ] {
+        let stored = simpson(
+            |u| 0.5 * alpha.powi(3) * u * u * (-alpha * u).exp() * -(-beta * (tau - u)).exp_m1(),
+            0.0,
+            tau,
+            100_000,
+        );
+        let oracle = (1.0 - r) * gamma3_cdf(alpha * tau) + r * stored;
+        let cdf = ic_cdf(alpha, beta, r, tau);
+        assert!(
+            (cdf - oracle).abs() < 5.0e-12,
+            "ic_cdf({alpha}, {beta}, {r}, {tau}) = {cdf:.16e} vs convolution {oracle:.16e}"
+        );
+    }
+}
+
+#[test]
+fn an_inactive_storage_rate_does_not_drive_the_fold() {
+    let (fwhm, flight_path_m, true_energy_ev) = (0.35_f64, 25.0_f64, 25.0_f64);
+    let nominal = TOF_FACTOR * flight_path_m / true_energy_ev.sqrt();
+    let model = |alpha: f64, beta: f64| {
+        IkedaCarpenter::new(
+            IkedaCarpenterParams {
+                channel_fwhm_us: Some(fwhm),
+                ..IkedaCarpenterParams::constant(alpha, beta, 0.0)
+            },
+            flight_path_m,
+            &SynthesisGrid::new(24.0, 26.0),
+        )
+        .expect("valid folded IC model")
+    };
+    let delay_edges = [-fwhm, -0.2, 0.0, 0.2, fwhm, 10.0];
+    let edges: Vec<f64> = delay_edges.iter().map(|d| nominal + d).collect();
+    let bins = |m: &IkedaCarpenter| {
+        m.detector_bin_probabilities(true_energy_ev, &edges, 0.0)
+            .expect("valid detector bins")
+    };
+
+    let (fast_storage, slow_storage) = (bins(&model(1.0, 1.0e12)), bins(&model(1.0, 0.1)));
+    for (a, b) in fast_storage.iter().zip(&slow_storage) {
+        assert!((a - b).abs() < 1.0e-14, "{a} vs {b}");
+    }
+}
+
+#[test]
+fn a_fast_pulse_folds_across_many_panels() {
+    let (alpha, fwhm) = (200.0_f64, 0.35_f64);
+    let flight_path_m = 25.0_f64;
+    let true_energy_ev = 25.0_f64;
+    let nominal = TOF_FACTOR * flight_path_m / true_energy_ev.sqrt();
+    let delay_edges: Vec<f64> = (0..=17).map(|k| -fwhm + 0.05 * f64::from(k)).collect();
+    let detector_edges: Vec<f64> = delay_edges.iter().map(|d| nominal + d).collect();
+    let model = IkedaCarpenter::new(
+        IkedaCarpenterParams {
+            channel_fwhm_us: Some(fwhm),
+            ..IkedaCarpenterParams::constant(alpha, 0.1, 0.0)
+        },
+        flight_path_m,
+        &SynthesisGrid::new(24.0, 26.0),
+    )
+    .expect("valid folded IC model");
+    let got = model
+        .detector_bin_probabilities(true_energy_ev, &detector_edges, 0.0)
+        .expect("valid folded detector bins");
+    let triangle = |c: f64| (1.0 - c.abs() / fwhm) / fwhm;
+    for (bin, edge) in delay_edges.windows(2).enumerate() {
+        let want = simpson(
+            |c| {
+                triangle(c)
+                    * (gamma3_cdf(alpha * (edge[1] - c)) - gamma3_cdf(alpha * (edge[0] - c)))
+            },
+            -fwhm,
+            fwhm,
+            20_000,
+        );
+        assert!(
+            (got[bin] - want).abs() < 1.0e-10,
+            "bin [{}, {}] µs: folded {:.12e} vs integral {want:.12e}",
+            edge[0],
+            edge[1],
+            got[bin]
+        );
+    }
+}
+
+#[test]
 fn storage_with_channel_fold_preserves_missing_tail_mass() {
-    // The sampled fold path with storage active (r > 0 AND a channel fold):
-    // the oracle is a double quadrature — the triangle channel density folded
-    // with the pulse-density integral — sharing only `ic_pulse` with the code
-    // under test (whose CDF equivalence the quadrature test above pins).
     let (alpha, beta, r) = (2.0, 0.25, 0.3);
     let fwhm = 0.7_f64; // triangle half-base = FWHM
     let flight_path_m = 25.0_f64;
@@ -480,12 +524,11 @@ fn storage_with_channel_fold_preserves_missing_tail_mass() {
     let nominal = TOF_FACTOR * flight_path_m / true_energy_ev.sqrt();
     // The window deliberately cuts the slow storage tail (β = 0.25 ⇒ mean
     // storage delay 4 µs) so real mass lies beyond the last edge.
-    let edges = [nominal - 1.0, nominal + 1.0, nominal + 3.0, nominal + 6.0];
-    let got: f64 = model
+    let delay_edges = [-1.0, -0.4, 0.0, 0.3, 1.0, 3.0, 6.0];
+    let edges: Vec<f64> = delay_edges.iter().map(|d| nominal + d).collect();
+    let got = model
         .detector_bin_probabilities(true_energy_ev, &edges, 0.0)
-        .expect("valid detector bins")
-        .iter()
-        .sum();
+        .expect("valid detector bins");
 
     let half_base = fwhm;
     let triangle = |c: f64| (1.0 - c.abs() / half_base) / half_base;
@@ -505,16 +548,21 @@ fn storage_with_channel_fold_preserves_missing_tail_mass() {
             600,
         )
     };
-    let oracle = window_mass(-1.0, 6.0);
+    for (bin, edge) in delay_edges.windows(2).enumerate() {
+        let oracle = window_mass(edge[0], edge[1]);
+        assert!(
+            (got[bin] - oracle).abs() < 1.0e-9,
+            "bin [{}, {}] µs: folded {:.12e} vs double-quadrature oracle {oracle:.12e}",
+            edge[0],
+            edge[1],
+            got[bin]
+        );
+    }
+    let total: f64 = got.iter().sum();
     assert!(
-        1.0 - oracle > 0.05,
-        "window must lose real storage-tail mass (oracle = {oracle:.6})"
+        1.0 - total > 0.05,
+        "the window must lose real storage-tail mass, got {total:.6}"
     );
-    assert!(
-        (got - oracle).abs() < 5.0e-5,
-        "folded storage window mass {got:.8} vs double-quadrature oracle {oracle:.8}"
-    );
-    assert!(got < 1.0, "finite window was silently renormalized to one");
 }
 
 #[test]
@@ -598,62 +646,25 @@ fn singular_inverse_lambda_laws_are_rejected() {
 }
 
 #[test]
-fn coarse_folded_grid_meets_per_bin_accuracy_bound() {
-    // The review reproduction: α = 1 µs⁻¹, R = 0, triangle FWHM = 10 µs,
-    // E = 25 eV. At n_tau = 8 the sampled step (2.57 µs) mis-assigned up to
-    // 8.5e-3 of probability per bin (a leading-edge bin returned exactly 0
-    // against a true 1.8e-3) while conserving the total. The detector-bin
-    // gate now REJECTS that grid loudly; an n_tau meeting the FWHM/24
-    // per-bin floor is accepted and EVERY bin — including the leading edge
-    // below the coarse grid's sampled support — must match the analytic
-    // Γ₃⊗triangle oracle within the documented ~1e-4 bound.
+fn folded_bins_match_the_triangle_fold_integral() {
     let (alpha, fwhm) = (1.0_f64, 10.0_f64);
     let flight_path_m = 25.0_f64;
     let true_energy_ev = 25.0_f64;
     let nominal = TOF_FACTOR * flight_path_m / true_energy_ev.sqrt();
     let delay_edges: Vec<f64> = (0..=13).map(|k| -10.0 + 3.0 * k as f64).collect();
     let detector_edges: Vec<f64> = delay_edges.iter().map(|d| nominal + d).collect();
-    let grid_with = |n_tau: usize| SynthesisGrid {
-        e_min_ev: 24.0,
-        e_max_ev: 26.0,
-        n_energies: 2,
-        n_tau,
-    };
-    let params = IkedaCarpenterParams {
-        channel_fwhm_us: Some(fwhm),
-        ..IkedaCarpenterParams::constant(alpha, 0.1, 0.0)
-    };
-
-    // (i) The reproduction grid AUTO-REFINES: n_tau = 8 only anchors the
-    // prompt step; the fold refinement targets FWHM/24, the cap affords it,
-    // and the detector-bin gate passes — the coarse-grid mis-assignment is
-    // gone by construction, verified per bin below.
-    let model = IkedaCarpenter::new(params.clone(), flight_path_m, &grid_with(8))
-        .expect("bin-eager refinement admits the coarse anchor");
-    let got = model
-        .detector_bin_probabilities(true_energy_ev, &detector_edges, 0.0)
-        .expect("valid folded detector bins");
-
-    // (ii) A cap-limited configuration (long storage tail forces the step
-    // above the per-bin target, though synthesis stays valid for the
-    // moment-level consumers) fails closed at the detector-bin gate.
-    let cap_limited = IkedaCarpenter::new(
+    let model = IkedaCarpenter::new(
         IkedaCarpenterParams {
-            channel_fwhm_us: Some(0.35),
-            ..IkedaCarpenterParams::constant(2.0, 0.02, 0.5)
+            channel_fwhm_us: Some(fwhm),
+            ..IkedaCarpenterParams::constant(alpha, 0.1, 0.0)
         },
         flight_path_m,
         &SynthesisGrid::new(24.0, 26.0),
     )
-    .expect("moment-level synthesis admits the cap-limited tail");
-    let err = cap_limited
-        .detector_bin_probabilities(true_energy_ev, &[nominal, nominal + 1.0], 0.0)
-        .expect_err("a cap-limited sampled step must be rejected for per-bin use")
-        .to_string();
-    assert!(
-        err.contains("per-bin accuracy floor"),
-        "rejection must name the per-bin floor, got: {err}"
-    );
+    .expect("valid folded IC model");
+    let got = model
+        .detector_bin_probabilities(true_energy_ev, &detector_edges, 0.0)
+        .expect("valid folded detector bins");
 
     let triangle = |c: f64| {
         if c.abs() >= fwhm {
@@ -674,8 +685,8 @@ fn coarse_folded_grid_meets_per_bin_accuracy_bound() {
     for (bin, edge) in delay_edges.windows(2).enumerate() {
         let want = bin_oracle(edge[0], edge[1]);
         assert!(
-            (got[bin] - want).abs() < 5.0e-4,
-            "bin {bin} [{}, {}] µs: sampled fold {:.6e} vs analytic oracle {want:.6e}",
+            (got[bin] - want).abs() < 1.0e-10,
+            "bin {bin} [{}, {}] µs: folded {:.12e} vs integral {want:.12e}",
             edge[0],
             edge[1],
             got[bin]
@@ -686,84 +697,7 @@ fn coarse_folded_grid_meets_per_bin_accuracy_bound() {
     }
     assert!(
         leading_edge_mass > 5.0e-4,
-        "leading-edge bins below the old sampled support must carry their \
-         real mass, got {leading_edge_mass:.3e}"
-    );
-}
-
-#[test]
-fn coarse_gaussian_burst_meets_per_bin_accuracy_bound() {
-    // The round-4 sibling of the triangle case: a burst-only fold at a
-    // coarse anchor (σ = 2 µs, n_tau = 8) used to be admitted with
-    // dtau = σ and mis-assigned up to 1.46e-2 per bin while conserving the
-    // total. The bin-eager refinement now targets σ/12, and every bin must
-    // match the analytic Gaussian⊗Γ₃-CDF oracle within the documented
-    // ~1e-4 bound; a cap-limited burst grid fails closed at the gate.
-    let (alpha, sigma) = (1.0_f64, 2.0_f64);
-    let flight_path_m = 25.0_f64;
-    let true_energy_ev = 25.0_f64;
-    let nominal = TOF_FACTOR * flight_path_m / true_energy_ev.sqrt();
-    let model = IkedaCarpenter::new(
-        IkedaCarpenterParams {
-            burst_sigma_us: Some(sigma),
-            ..IkedaCarpenterParams::constant(alpha, 0.1, 0.0)
-        },
-        flight_path_m,
-        &SynthesisGrid {
-            e_min_ev: 24.0,
-            e_max_ev: 26.0,
-            n_energies: 2,
-            n_tau: 8,
-        },
-    )
-    .expect("bin-eager refinement admits the coarse burst anchor");
-
-    let delay_edges: Vec<f64> = (0..=10).map(|k| -6.0 + 2.5 * k as f64).collect();
-    let detector_edges: Vec<f64> = delay_edges.iter().map(|d| nominal + d).collect();
-    let got = model
-        .detector_bin_probabilities(true_energy_ev, &detector_edges, 0.0)
-        .expect("valid burst detector bins");
-
-    let normal_density =
-        |c: f64| (-0.5 * (c / sigma).powi(2)).exp() / (sigma * std::f64::consts::TAU.sqrt());
-    let bin_oracle = |lo: f64, hi: f64| {
-        simpson(
-            |c| normal_density(c) * (gamma3_cdf(alpha * (hi - c)) - gamma3_cdf(alpha * (lo - c))),
-            -10.0 * sigma,
-            10.0 * sigma,
-            50_000,
-        )
-    };
-    for (bin, edge) in delay_edges.windows(2).enumerate() {
-        let want = bin_oracle(edge[0], edge[1]);
-        assert!(
-            (got[bin] - want).abs() < 5.0e-4,
-            "bin {bin} [{}, {}] µs: sampled burst {:.6e} vs analytic oracle {want:.6e}",
-            edge[0],
-            edge[1],
-            got[bin]
-        );
-    }
-
-    // Cap-limited burst (long storage tail forces the step above σ/12
-    // though synthesis stays valid at the moment level): fail closed,
-    // naming the Gaussian floor.
-    let cap_limited = IkedaCarpenter::new(
-        IkedaCarpenterParams {
-            burst_sigma_us: Some(0.5),
-            ..IkedaCarpenterParams::constant(2.0, 0.02, 0.5)
-        },
-        flight_path_m,
-        &SynthesisGrid::new(24.0, 26.0),
-    )
-    .expect("moment-level synthesis admits the cap-limited burst tail");
-    let err = cap_limited
-        .detector_bin_probabilities(true_energy_ev, &[nominal, nominal + 1.0], 0.0)
-        .expect_err("a cap-limited burst step must be rejected for per-bin use")
-        .to_string();
-    assert!(
-        err.contains("per-bin accuracy floor") && err.contains("Gaussian burst"),
-        "rejection must name the Gaussian per-bin floor, got: {err}"
+        "leading-edge bins must carry their mass, got {leading_edge_mass:.3e}"
     );
 }
 
@@ -773,9 +707,7 @@ fn storage_cdf_matches_arbitrary_precision_convolution_reference() {
     // convolution: CDF = (1−r)·Γ₃(ατ) + r·∫₀^τ (α³s²e^{−αs}/2)·(1−e^{−β(τ−s)}) ds
     // via 40-digit decimal Simpson (40 000 intervals; quadrature error ≲ 1e-14).
     // They share no code with ic_cdf or ic_pulse, so a storage-term error
-    // common to both implementations cannot hide here. Tolerance covers the
-    // f64 implementations' Taylor truncation near the |u| = 0.05 boundary
-    // (measured 4.7e-12 at case 3 against a 60-digit closed-form check).
+    // common to both implementations cannot hide here.
     let pins: [(f64, f64, f64, f64, f64); 4] = [
         (1.7, 0.45, 0.35, 2.7, 0.665_083_699_251_977_2),
         (0.6, 2.4, 0.8, 3.0, 0.219_541_992_689_109_74),

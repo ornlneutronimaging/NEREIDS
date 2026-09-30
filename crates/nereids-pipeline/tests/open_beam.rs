@@ -417,9 +417,9 @@ fn counting_every_neutron_seven_times_scales_the_overdispersion_not_the_error_ba
 #[test]
 fn a_dip_the_candidates_can_follow_is_followed() {
     let c = EnergyLaw::Const;
-    let burst = pulse(c(0.565), c(0.25), c(0.15), Some(2.0), None);
+    let folded = pulse(c(0.565), c(0.25), c(0.15), None, Some(5.0));
     let pulse = &pulses()[0].1;
-    for (ic, centre_us, fwhm_us) in [(pulse, 407.0, 40.0), (&burst, 380.0, 30.0)] {
+    for (ic, centre_us, fwhm_us) in [(pulse, 407.0, 40.0), (&folded, 380.0, 30.0)] {
         let expected = simulated(ic, &dipped(centre_us, fwhm_us));
         let rounded: Vec<f64> = expected.iter().map(|mu| mu.round()).collect();
         let noiseless = fit_open_beam(&edges(), &rounded, &calibration(ic)).expect("fit");

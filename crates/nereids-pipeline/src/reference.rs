@@ -39,9 +39,9 @@ impl Instrument {
     /// arrive from before the first time edge to after the last, the step is
     /// not finite and positive, `transmission` returns a different number of
     /// values than it was given energies or one outside `[0, 1]`, `beam`
-    /// returns a negative or non-finite value, the resolution is Gaussian, or
-    /// the resolution rejects the flight path, the time edges, `t0_us` or an
-    /// energy.
+    /// returns a negative or non-finite value, the resolution is Gaussian or an
+    /// Ikeda–Carpenter pulse with a Gaussian burst, or the resolution rejects
+    /// the flight path, the time edges, `t0_us` or an energy.
     pub fn expected_counts(
         &self,
         beam: &dyn Fn(f64) -> f64,

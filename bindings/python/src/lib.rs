@@ -882,7 +882,8 @@ impl PyEnergyLaw {
 /// `beta` keeps the original constant-rate API; the optional trailing
 /// `beta_law` overrides it with an energy-dependent rate. Optional
 /// `burst_sigma_us` (Gaussian) and `channel_fwhm_us` (triangle) fold in the
-/// proton-burst and chopper terms.
+/// proton-burst and chopper terms; detector-time bin probabilities refuse a
+/// burst.
 #[pyclass(name = "IkedaCarpenter", skip_from_py_object)]
 #[derive(Clone)]
 struct PyIkedaCarpenter {
@@ -988,7 +989,8 @@ impl PyIkedaCarpenter {
 
     /// Probability that a neutron at one true energy is recorded in each
     /// adjacent detector-time bin. The result is not renormalized when the
-    /// supplied time window omits part of the pulse.
+    /// supplied time window omits part of the pulse. A Gaussian burst is
+    /// refused.
     fn detector_bin_probabilities(
         &self,
         true_energy_ev: f64,

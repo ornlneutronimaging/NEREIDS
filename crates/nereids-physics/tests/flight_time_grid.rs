@@ -97,7 +97,7 @@ fn folded() -> Vec<(&'static str, Arc<IkedaCarpenter>)> {
                 EnergyLaw::SqrtE { a0: 0.35, a1: 0.05 },
                 EnergyLaw::SqrtE { a0: 0.02, a1: 0.2 },
                 EnergyLaw::Const(0.15),
-                Some(0.5),
+                None,
                 Some(2.0),
             ),
         ),
@@ -247,14 +247,14 @@ fn a_neutron_arrives_between_its_delays_but_for_a_negligible_chance() {
             ),
             false,
         ),
-        (pulse(c(0.565), c(0.25), c(0.15), Some(1.0), None), true),
+        (pulse(c(0.565), c(0.25), c(0.15), None, Some(1.0)), true),
         (pulse(c(0.565), c(0.25), c(0.0), None, Some(2.0)), true),
         (
             pulse(
                 sqrt_e(0.35, 0.05),
                 sqrt_e(0.02, 0.2),
                 c(0.15),
-                Some(0.5),
+                None,
                 Some(2.0),
             ),
             true,
@@ -278,7 +278,7 @@ fn a_neutron_arrives_between_its_delays_but_for_a_negligible_chance() {
             );
             assert!(after <= NEGLIGIBLE_ARRIVAL_PROBABILITY, "{w} {e}: {after}");
             assert_eq!(chance([first - 1.0e4, 0.0]) > 0.0, *folded, "{w} {e}");
-            assert_eq!(after == 0.0, *folded, "{w} {e}");
+            assert!(after > 0.0, "{w} {e}");
         }
     }
 }

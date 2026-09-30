@@ -74,7 +74,7 @@ fn pulses() -> Vec<(&'static str, Arc<IkedaCarpenter>)> {
         ),
         (
             "folded with laws",
-            pulse(s(0.35, 0.05), s(0.02, 0.2), c(0.15), Some(0.5), Some(2.0)),
+            pulse(s(0.35, 0.05), s(0.02, 0.2), c(0.15), None, Some(2.0)),
         ),
     ]
 }

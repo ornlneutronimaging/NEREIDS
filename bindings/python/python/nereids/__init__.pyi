@@ -415,7 +415,8 @@ class IkedaCarpenter:
         beta_law: EnergyLaw | None = None,
     ) -> None:
         """When ``beta_law`` is supplied it overrides the scalar ``beta``
-        (which is still required positionally but otherwise ignored)."""
+        (which is still required positionally but otherwise ignored).
+        ``detector_bin_probabilities`` refuses a nonzero ``burst_sigma_us``."""
         ...
     def as_tabulated(self) -> TabulatedResolution:
         """The synthesized tabulated kernel (usable as a resolution file)."""
@@ -451,7 +452,7 @@ class IkedaCarpenter:
         """Probability in each detector-time bin for one true energy.
 
         The probabilities are not renormalized when the supplied time window
-        omits part of the pulse.
+        omits part of the pulse. A Gaussian burst is refused with ValueError.
         """
         ...
 
