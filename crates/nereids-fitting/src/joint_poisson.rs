@@ -136,9 +136,7 @@ impl<'a> JointPoissonObjective<'a> {
     /// contributes exactly zero deviance for every parameter value — so
     /// counting it as a degree of freedom deflates `deviance_per_dof`
     /// (and the opt-in `scale_by_chi2` σ inflation) by the empty-bin
-    /// fraction.  The exact detector-time route makes wide acquisition
-    /// windows with many empty bins routine, so deviance-per-dof
-    /// reporting must use THIS count.
+    /// fraction, so deviance-per-dof reporting must use THIS count.
     pub fn n_informative(&self) -> usize {
         self.o
             .iter()
@@ -1191,8 +1189,7 @@ pub fn joint_poisson_fit(
     // matching the dof denominator below: a zero-total bin contributes
     // identically zero deviance AND zero Fisher curvature, so it carries no
     // rank. Keying this guard on `n_active` instead would let a wholly
-    // empty acquisition — every bin zero, routine to hit by mis-specifying
-    // the detector window on the exact route — run to completion and report
+    // empty acquisition — every bin zero — run to completion and report
     // `gn_converged = true` at the untouched initial guess with a NaN
     // deviance, i.e. a success-shaped result from a fit that saw no data.
     let n_informative_initial = objective.n_informative();
@@ -1284,10 +1281,9 @@ pub fn joint_poisson_fit(
     // (`O_i + S_i == 0`) are additionally excluded: they are degenerate
     // under the conditional-binomial model (identically zero deviance for
     // any T), so counting them deflates D/dof and the opt-in
-    // `scale_by_chi2` σ inflation by the empty-bin fraction — routine on
-    // the exact detector-time route, whose acquisition windows legitimately
-    // contain unoccupied bins.  Fits with no informative surplus
-    // (`n_informative <= n_free`) report `deviance_per_dof = NaN` (0/0),
+    // `scale_by_chi2` σ inflation by the empty-bin fraction.  Fits with no
+    // informative surplus (`n_informative <= n_free`) report
+    // `deviance_per_dof = NaN` (0/0),
     // matching the zero-dof handling in `lm.rs`'s reduced-chi-squared
     // computation (cite the behaviour, not a line number that drifts).
     let n_active = objective.n_active();
@@ -2290,8 +2286,7 @@ mod tests {
     /// A bin with `O_i + S_i == 0` contributes identically zero deviance for
     /// every parameter value, so counting it as a degree of freedom deflates
     /// `deviance_per_dof` (and the opt-in `scale_by_chi2` σ inflation) by the
-    /// empty-bin fraction — routine on the exact detector-time route, whose
-    /// acquisition windows legitimately contain unoccupied bins.
+    /// empty-bin fraction.
     ///
     /// This test is deliberately DISCRIMINATING: padding a fit with empty
     /// bins must leave `deviance` AND `deviance_per_dof` unchanged while
@@ -2389,8 +2384,7 @@ mod tests {
     /// Every bin is degenerate (zero deviance, zero Fisher curvature), so
     /// the deviance-based convergence test would otherwise see `D == 0` at
     /// the untouched initial guess and declare success — a success-shaped
-    /// result from a fit that saw no data. Easy to hit on the exact
-    /// detector-time route by mis-specifying the acquisition window.
+    /// result from a fit that saw no data.
     #[test]
     fn all_empty_acquisition_does_not_report_convergence() {
         let n_bins = 32_usize;

@@ -40,7 +40,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
   model — identically zero deviance for any transmission — so they no longer
   count as degrees of freedom. Reported goodness-of-fit and the opt-in
   `scale_by_chi2` σ inflation change for any fit whose window contains empty
-  bins (routine on the exact detector-time route); fully occupied fits,
+  bins; fully occupied fits,
   including the VENUS regression anchors, are unaffected.
 
 - **Removed URR (LRU=2) and R-Matrix Limited (LRF=7) cross-section

@@ -34,10 +34,10 @@ _MANIFEST_NAMES = (
     "analysis.json",
 )
 _COUNTS_RESOLUTION_UNSUPPORTED = (
-    "counts input with instrument resolution is not available through the MCP "
-    "manifest: a resolved count fit needs the separate-arm model R[Phi] and "
-    "R[Phi*T], which this fit does not have. Supply pre-normalized "
-    "transmission, or disable instrument resolution."
+    "counts input with instrument resolution is not available: a resolved "
+    "count fit needs the separate-arm model R[Phi] and R[Phi*T], which this "
+    "fit does not have. Supply pre-normalized transmission, or disable "
+    "instrument resolution."
 )
 # The solver names `parse_solver_config` (bindings/python/src/lib.rs) actually
 # accepts. Validation MUST check against this set before the domain-specific

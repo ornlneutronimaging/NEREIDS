@@ -1088,7 +1088,8 @@ pub(crate) fn validate_counts_resolution_route(
         return Err(PipelineError::InvalidParameter(
             "counts input with an instrument resolution is not supported: it needs \
              the separate-arm model R[Phi] and R[Phi*T], which this fit does not \
-             have, and the R[T] shortcut is not used"
+             have, and the R[T] shortcut is not used; disable the instrument \
+             resolution, or fit pre-normalized transmission"
                 .into(),
         ));
     }
