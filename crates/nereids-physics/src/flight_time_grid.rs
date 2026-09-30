@@ -94,7 +94,9 @@ pub struct FlightTimeGrid {
     range_us: (f64, f64),
     step_us: f64,
     flight_times_us: Vec<f64>,
-    bin_probabilities: Vec<Vec<(usize, f64)>>,
+    row_offsets: Vec<usize>,
+    bins: Vec<usize>,
+    probabilities: Vec<f64>,
 }
 
 impl FlightTimeGrid {
@@ -204,7 +206,16 @@ impl FlightTimeGrid {
                     .collect())
             })
             .collect();
-        let bin_probabilities = rows.into_iter().collect::<Result<_, _>>()?;
+        let mut row_offsets = vec![0];
+        let mut bins = Vec::new();
+        let mut probabilities = Vec::new();
+        for row in rows {
+            for (k, p) in row? {
+                bins.push(k);
+                probabilities.push(p);
+            }
+            row_offsets.push(probabilities.len());
+        }
         Ok(Self {
             time_edges_us: time_edges_us.to_vec(),
             t0_us,
@@ -212,7 +223,9 @@ impl FlightTimeGrid {
             range_us,
             step_us,
             flight_times_us,
-            bin_probabilities,
+            row_offsets,
+            bins,
+            probabilities,
         })
     }
 
@@ -277,8 +290,11 @@ impl FlightTimeGrid {
             });
         }
         let mut counts = vec![0.0; self.time_edges_us.len() - 1];
-        for (&v, row) in values.iter().zip(&self.bin_probabilities) {
-            for &(k, p) in row {
+        for (&v, row) in values.iter().zip(self.row_offsets.windows(2)) {
+            for (&k, &p) in self.bins[row[0]..row[1]]
+                .iter()
+                .zip(&self.probabilities[row[0]..row[1]])
+            {
                 counts[k] += self.step_us * v * p;
             }
         }
