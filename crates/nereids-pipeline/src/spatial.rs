@@ -331,9 +331,6 @@ fn validate_spatial_fit_preflight(
     // `UnifiedFitConfig` but takes the 1D `InputData`; inline the
     // resolution here so we do not have to materialise a 1D stub.
     let is_counts = input.is_counts();
-    // Hoist the scientifically unsupported combinations so they become one
-    // actionable boundary error, not an all-NaN map after every per-pixel
-    // error is swallowed by the rayon loop.
     validate_counts_resolution_route(is_counts, config)?;
     let is_kl = matches!(config.solver(), SolverConfig::PoissonKL(_))
         || (matches!(config.solver(), SolverConfig::Auto) && is_counts);

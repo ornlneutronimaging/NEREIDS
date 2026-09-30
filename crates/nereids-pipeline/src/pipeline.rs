@@ -3269,18 +3269,12 @@ pub struct SpectrumFitResult {
     /// `None` for the LM transmission path (which populates
     /// `reduced_chi_squared` with Pearson χ² / (n−k) instead).
     pub deviance_per_dof: Option<f64>,
-    /// Fitted multiplicative-baseline coefficients `[b0, b1, b2]` (issue
-    /// #635) for
-    ///
-    /// ```text
-    /// B(E) = b0 + b1·ln(E/E_ref) + b2·ln²(E/E_ref)
-    /// ```
-    ///
-    /// The baseline is applied OUTERMOST:
-    /// `y(E) = B(E)·[Anorm·T + additive background]`.
-    /// `None` when no multiplicative baseline was configured (values that
-    /// were configured but frozen via `fit_b0/b1/b2 = false` still report
-    /// `Some` — they are part of the model that produced the fit).
+    /// Coefficients `[b0, b1, b2]` of the multiplicative baseline
+    /// `B(E) = b0 + b1·ln(E/E_ref) + b2·ln²(E/E_ref)`, which multiplies the
+    /// whole model, `y(E) = B(E)·[Anorm·T + additive background]`, with
+    /// `E_ref` = [`Self::baseline_e_ref_ev`].
+    /// `None` when no baseline was configured; `Some` when it was, even with
+    /// every coefficient held fixed.
     pub baseline: Option<[f64; 3]>,
     /// Reference energy `E_ref` (eV) the baseline's `ln(E/E_ref)` basis was
     /// centered on — the geometric midpoint `√(E_min·E_max)` of the fit
