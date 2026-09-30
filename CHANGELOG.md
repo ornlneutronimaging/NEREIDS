@@ -24,7 +24,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
   `uncertainties` holds `None` for a parameter on a bound or along a
   direction the data do not determine, and `on_bound` is new.
   `PoissonConfig` loses `fd_step`, `step_size`, `armijo_c`, `backtrack`,
-  `gauss_newton_lambda` and `lbfgs_history`.
+  `gauss_newton_lambda`, `lbfgs_history` and `tol_param`.
 - **Removed the two cross-domain fit routes.** Normalized transmission with
   a Poisson/KL solver is rejected (a fractional ratio is not Poisson count
   data, and the supplied uncertainty would be ignored), and raw
