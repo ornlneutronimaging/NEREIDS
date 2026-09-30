@@ -7,22 +7,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
 
 ## [Unreleased]
 
-### Added
-
-- **Exact separate-arm response for resolved count fitting.** A count fit
-  with an active instrument resolution now evaluates the physical detector
-  equation — the open and sample arms broadened separately,
-  `T_eff,i = Σ_j F_j T_j R_ij / Σ_j F_j R_ij` — instead of failing closed.
-  `fit_counts_spectrum_typed` gains `incident_fluence_weights`,
-  `detector_time_edges_us` and `timing_offset_us`, and accepts a
-  `TabulatedResolution` or `IkedaCarpenter` detector-time response; the
-  true-energy quadrature and the measured detector-time bins are distinct
-  axes. New public Rust surface: `ExactCountResponseConfig`,
-  `DetectorBinResponseMatrix` and `ExactTwoArmRatioModel`. Spatial mapping
-  and the research Fisher helper stay fail-closed for resolved counts.
-
 ### Changed (breaking)
 
+- **Raw counts with an instrument resolution are refused.**
+  `fit_counts_spectrum_typed`, `spatial_map_typed` on count cubes and
+  `compute_model_jacobian` reject an active resolution instead of
+  broadening the transmission ratio, which is not the detector's response:
+  the open and sample arms are broadened separately.
 - **`poisson_fit` takes counts and an analytical Jacobian.** It minimizes
   half the Poisson deviance by projected Levenberg–Marquardt steps in the
   Fisher metric and reports `converged` when its Newton decrement is below

@@ -17,9 +17,7 @@
 //! - Fitting: `fit/` module, `fitAPI/`, manual Sec. IV
 
 pub mod active_mask;
-pub mod count_background;
 pub mod error;
-pub mod exact_count_model;
 pub mod forward_model;
 pub mod joint_poisson;
 pub mod joint_resolution;
