@@ -1,23 +1,14 @@
 //! Poisson-likelihood fitting of counts.
 //!
-//! Minimizes half the Poisson deviance
+//! Minimizes half the Poisson deviance plus a Gaussian prior on each measured
+//! parameter,
 //!
 //! ```text
-//! D(θ) = Σᵢ [μᵢ(θ) − yᵢ + yᵢ ln(yᵢ / μᵢ(θ))]
+//! D(θ) = Σᵢ [μᵢ(θ) − yᵢ + yᵢ ln(yᵢ / μᵢ(θ))] + ½ Σₚ ((θₚ − mₚ)/sₚ)²
 //! ```
 //!
 //! within box bounds, by projected Levenberg–Marquardt steps in the Fisher
 //! metric, for models with an analytical Jacobian.
-//!
-//! **Scope note.** The production pipeline does not apply this single-arm
-//! objective to normalized transmission. Raw open/sample counts use the
-//! joint-Poisson conditional-binomial-deviance solver in
-//! [`crate::joint_poisson`]. This module remains available to the
-//! `evaluate_jacobian_and_fisher` Fisher-information helper (via
-//! [`CountsModel`], [`CountsBackgroundScaleModel`] and
-//! [`TransmissionKLBackgroundModel`], all three of which that helper still
-//! constructs) and to spatial-regularization research drivers; it is not a
-//! public transmission fitting route.
 
 use faer::dyn_stack::{MemBuffer, MemStack};
 use faer::linalg::svd::{ComputeSvdVectors, svd, svd_scratch};
@@ -45,10 +36,21 @@ impl Default for PoissonConfig {
     }
 }
 
+/// A Gaussian prior on one free parameter: a measurement `mean ± sd` of it
+/// made elsewhere.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct Prior {
+    /// Index of the parameter in the [`ParameterSet`].
+    pub parameter: usize,
+    pub mean: f64,
+    pub sd: f64,
+}
+
 /// Result of [`poisson_fit`].
 #[derive(Debug, Clone)]
 pub struct PoissonResult {
-    /// Half the Poisson deviance at `params`.
+    /// Half the Poisson deviance of the counts at `params`, without the
+    /// priors.
     pub deviance: f64,
     /// Number of steps taken.
     pub iterations: usize,
@@ -69,6 +71,11 @@ pub struct PoissonResult {
     pub uncertainties: Option<Vec<Option<f64>>>,
     /// Whether each free parameter ended on one of its bounds.
     pub on_bound: Vec<bool>,
+    /// Each count's leverage: the diagonal of the hat matrix of the free
+    /// parameters off their bounds.  The leverages sum to the number of those
+    /// parameters less the share their priors determine.  `None` when
+    /// `covariance` is or cannot be computed.
+    pub leverage: Option<Vec<f64>>,
 }
 
 const NEWTON_DECREMENT_TOL: f64 = 1e-6;
@@ -122,6 +129,14 @@ fn deviance(y_obs: &[f64], y_model: &[f64]) -> f64 {
         .sum()
 }
 
+fn objective(y_obs: &[f64], y_model: &[f64], priors: &[Prior], params: &ParameterSet) -> f64 {
+    deviance(y_obs, y_model)
+        + priors
+            .iter()
+            .map(|p| 0.5 * ((params.params[p.parameter].value - p.mean) / p.sd).powi(2))
+            .sum::<f64>()
+}
+
 struct Linearization {
     weighted: FlatMatrix,
     residual: Vec<f64>,
@@ -133,6 +148,7 @@ fn linearize(
     model: &dyn FitModel,
     params: &ParameterSet,
     free: &[usize],
+    priors: &[Prior],
     y_obs: &[f64],
     y_model: &[f64],
 ) -> Result<Linearization, FittingError> {
@@ -168,12 +184,23 @@ fn linearize(
             }
         }
     }
-    let residual: Vec<f64> = y_obs
+    let mut residual: Vec<f64> = y_obs
         .iter()
         .zip(y_model)
         .zip(&root)
         .map(|((&obs, &mean), &r)| if r > 0.0 { (mean - obs) / r } else { 0.0 })
         .collect();
+    let counts = weighted.nrows;
+    weighted.nrows += priors.len();
+    weighted.data.resize(weighted.nrows * weighted.ncols, 0.0);
+    for (row, prior) in priors.iter().enumerate() {
+        let col = free
+            .iter()
+            .position(|&index| index == prior.parameter)
+            .expect("priors are on free parameters");
+        *weighted.get_mut(counts + row, col) = 1.0 / prior.sd;
+        residual.push((params.params[prior.parameter].value - prior.mean) / prior.sd);
+    }
     let gradient = zero_slope
         .iter()
         .enumerate()
@@ -303,6 +330,12 @@ impl Decomposition {
         direction
     }
 
+    fn leverage(&self, counts: usize) -> Vec<f64> {
+        (0..counts)
+            .map(|row| self.spanned().map(|k| self.left[(row, k)].powi(2)).sum())
+            .collect()
+    }
+
     fn error_bars(&self, n_free: usize) -> (FlatMatrix, Vec<Option<f64>>) {
         let n = self.columns.len();
         let determined: Vec<bool> = self
@@ -358,7 +391,8 @@ fn held_by_bound(param: &FitParameter, gradient: f64) -> bool {
 }
 
 /// Fit `params` to the counts `y_obs` by minimizing half the Poisson
-/// deviance within the parameter bounds.
+/// deviance plus `½((θₚ − mean)/sd)²` for each of the `priors`, within the
+/// parameter bounds.
 ///
 /// The model must provide an analytical Jacobian at every point the fit
 /// visits.  A trial predicting a negative count, or zero where something was
@@ -374,7 +408,7 @@ fn held_by_bound(param: &FitParameter, gradient: f64) -> bool {
 ///
 /// The fit has converged when the Newton decrement `½ gᵀF⁺g` over the
 /// parameters not held by a bound (on it, gradient pointing out),
-/// `F = Jᵀ diag(1/μ) J` the expected information, is below 1e-6: the
+/// `F = Jᵀ diag(1/μ) J + Σₚ eₚeₚᵀ/sdₚ²` the expected information, is below 1e-6: the
 /// quadratic model built from `F` predicts less than 1e-6 of further
 /// decrease.  Where the deviance is quadratic near the minimum this puts the
 /// fit within about 0.0014 standard errors of it, and within 0.01 where the
@@ -395,14 +429,17 @@ fn held_by_bound(param: &FitParameter, gradient: f64) -> bool {
 /// `FittingError::EmptyData` if `y_obs` is empty;
 /// `FittingError::InvalidConfig` if an observation is negative or not
 /// finite, a parameter value is not finite, a free parameter's bounds are
-/// inverted, NaN or admit no finite value, or the model returns no
-/// analytical Jacobian;
+/// inverted, NaN or admit no finite value, a prior is not on a free
+/// parameter, two priors are on one parameter, a prior's mean is not finite
+/// or its sd not finite and positive, or the model returns no analytical
+/// Jacobian;
 /// `FittingError::LengthMismatch` if the prediction or the Jacobian does not
 /// match `y_obs` and the free parameters; the model's error if it fails at
 /// the start.
 pub fn poisson_fit(
     model: &dyn FitModel,
     y_obs: &[f64],
+    priors: &[Prior],
     params: &mut ParameterSet,
     config: &PoissonConfig,
 ) -> Result<PoissonResult, FittingError> {
@@ -432,6 +469,20 @@ pub fn poisson_fit(
             p.name, p.value, p.lower, p.upper
         )));
     }
+    if let Some((i, prior)) = priors.iter().enumerate().find(|(i, p)| {
+        params
+            .params
+            .get(p.parameter)
+            .is_none_or(|param| param.fixed)
+            || priors[..*i].iter().any(|q| q.parameter == p.parameter)
+            || !p.mean.is_finite()
+            || !(p.sd.is_finite() && p.sd > 0.0)
+    }) {
+        return Err(FittingError::InvalidConfig(format!(
+            "prior {i} must be on a free parameter without another prior, with a finite mean \
+             and a finite positive sd; got {prior:?}"
+        )));
+    }
     params.set_free_values(&params.free_values());
     let mut y_model = model.evaluate(&params.all_values())?;
     if y_model.len() != y_obs.len() {
@@ -442,12 +493,12 @@ pub fn poisson_fit(
         });
     }
     let free = params.free_indices();
-    let mut value = deviance(y_obs, &y_model);
+    let mut value = objective(y_obs, &y_model, priors, params);
     let mut iterations = 0;
     let mut at_minimum = None;
     let mut damping = INITIAL_DAMPING;
     while value.is_finite() {
-        let linear = linearize(model, params, &free, y_obs, &y_model)?;
+        let linear = linearize(model, params, &free, priors, y_obs, &y_model)?;
         if !linear
             .weighted
             .data
@@ -481,7 +532,7 @@ pub fn poisson_fit(
                 .ok()
                 .filter(|trial| trial.len() == y_obs.len())
             {
-                let trial_value = deviance(y_obs, &trial_model);
+                let trial_value = objective(y_obs, &trial_model, priors, params);
                 if trial_value < value {
                     damping /= DAMPING_FACTOR;
                     accepted = Some((trial_model, trial_value));
@@ -503,25 +554,28 @@ pub fn poisson_fit(
         .iter()
         .map(|&idx| on_bound(&params.params[idx]))
         .collect();
-    let (covariance, uncertainties) = match &at_minimum {
+    let (covariance, uncertainties, leverage) = match &at_minimum {
         Some(linear) if config.compute_covariance => {
             let interior: Vec<usize> = (0..free.len()).filter(|&j| !bounded[j]).collect();
-            let (covariance, errors) = Decomposition::new(&linear.weighted, &interior).map_or_else(
+            let decomposition = Decomposition::new(&linear.weighted, &interior);
+            let (covariance, errors) = decomposition.as_ref().map_or_else(
                 || withheld(free.len()),
                 |decomposition| decomposition.error_bars(free.len()),
             );
-            (Some(covariance), Some(errors))
+            let leverage = decomposition.map(|decomposition| decomposition.leverage(y_obs.len()));
+            (Some(covariance), Some(errors), leverage)
         }
-        _ => (None, None),
+        _ => (None, None, None),
     };
     Ok(PoissonResult {
-        deviance: value,
+        deviance: deviance(y_obs, &y_model),
         iterations,
         converged: at_minimum.is_some(),
         params: params.all_values(),
         covariance,
         uncertainties,
         on_bound: bounded,
+        leverage,
     })
 }
 
@@ -1305,7 +1359,7 @@ mod tests {
             max_iter,
             ..PoissonConfig::default()
         };
-        poisson_fit(model, observed, &mut params, &config).unwrap()
+        poisson_fit(model, observed, &[], &mut params, &config).unwrap()
     }
 
     #[test]
@@ -1334,6 +1388,7 @@ mod tests {
             poisson_fit(
                 model,
                 observed,
+                &[],
                 &mut decay_params(50.0, 1.0, f64::INFINITY),
                 &PoissonConfig::default(),
             )
@@ -1391,8 +1446,14 @@ mod tests {
         let model = decay(1.0);
         let observed = model.evaluate(&[100.0, 1.5]).unwrap();
         let mut params = decay_params(100.0, 1.5, 80.0);
-        let result =
-            poisson_fit(&model, &observed, &mut params, &PoissonConfig::default()).unwrap();
+        let result = poisson_fit(
+            &model,
+            &observed,
+            &[],
+            &mut params,
+            &PoissonConfig::default(),
+        )
+        .unwrap();
         assert!(result.converged && result.params[0] == 80.0, "{result:?}");
         assert_eq!(result.on_bound, vec![true, false]);
     }
@@ -1453,7 +1514,14 @@ mod tests {
             FitParameter::unbounded("theta", 0.0),
             FitParameter::unbounded("weak", 0.0),
         ]);
-        poisson_fit(&model, &observed, &mut params, &PoissonConfig::default()).unwrap()
+        poisson_fit(
+            &model,
+            &observed,
+            &[],
+            &mut params,
+            &PoissonConfig::default(),
+        )
+        .unwrap()
     }
 
     #[test]
@@ -1495,14 +1563,123 @@ mod tests {
         }
     }
 
+    struct Proportional {
+        a: Vec<f64>,
+    }
+
+    impl FitModel for Proportional {
+        fn evaluate(&self, params: &[f64]) -> Result<Vec<f64>, FittingError> {
+            Ok(self.a.iter().map(|a| a * params[0]).collect())
+        }
+
+        fn analytical_jacobian(
+            &self,
+            _params: &[f64],
+            free_param_indices: &[usize],
+            _y_current: &[f64],
+        ) -> Option<FlatMatrix> {
+            let mut jacobian = FlatMatrix::zeros(self.a.len(), free_param_indices.len());
+            jacobian.data.copy_from_slice(&self.a);
+            Some(jacobian)
+        }
+    }
+
+    #[test]
+    fn a_prior_moves_the_fit_to_the_maximum_of_the_posterior() {
+        let model = Proportional {
+            a: vec![1.0, 2.0, 3.0, 4.0],
+        };
+        let observed = [3.0, 5.0, 9.0, 12.0];
+        let (a_sum, y_sum): (f64, f64) = (10.0, 29.0);
+        let (mean, sd) = (2.0, 0.3);
+        let fit = |priors: &[Prior]| {
+            let mut params = ParameterSet::new(vec![FitParameter::non_negative("theta", 1.0)]);
+            poisson_fit(
+                &model,
+                &observed,
+                priors,
+                &mut params,
+                &PoissonConfig::default(),
+            )
+            .unwrap()
+        };
+        let result = fit(&[Prior {
+            parameter: 0,
+            mean,
+            sd,
+        }]);
+        assert!(result.converged);
+        let theta = result.params[0];
+        let b = a_sum - mean / sd.powi(2);
+        let root = sd.powi(2) * 0.5 * (-b + (b * b + 4.0 * y_sum / sd.powi(2)).sqrt());
+        let variance = 1.0 / (a_sum / theta + 1.0 / sd.powi(2));
+        assert!(
+            (theta - root).abs() <= 2e-3 * variance.sqrt(),
+            "{theta} vs {root}"
+        );
+        let covariance = result.covariance.expect("covariance").get(0, 0);
+        assert!((covariance / variance - 1.0).abs() <= 1e-12, "{covariance}");
+        let deviance: f64 = observed
+            .iter()
+            .zip(&model.a)
+            .map(|(y, a)| a * theta - y + y * (y / (a * theta)).ln())
+            .sum();
+        assert!((result.deviance / deviance - 1.0).abs() <= 1e-12);
+        let leverage = result.leverage.expect("leverage");
+        for (h, a) in leverage.iter().zip(&model.a) {
+            assert!((h / (a / theta * variance) - 1.0).abs() <= 1e-12, "{h}");
+        }
+        let unmeasured = fit(&[]).leverage.expect("leverage");
+        assert!((unmeasured.iter().sum::<f64>() - 1.0).abs() <= 1e-12);
+    }
+
+    #[test]
+    fn priors_that_are_not_measurements_of_one_free_parameter_are_refused() {
+        let model = decay(1.0);
+        let observed = model.evaluate(&[100.0, 1.5]).unwrap();
+        let fit = |priors: &[Prior], fixed: bool| {
+            let mut params = decay_params(50.0, 1.0, f64::INFINITY);
+            params.params[1].fixed = fixed;
+            poisson_fit(
+                &model,
+                &observed,
+                priors,
+                &mut params,
+                &PoissonConfig::default(),
+            )
+        };
+        let prior = |parameter, mean, sd| Prior {
+            parameter,
+            mean,
+            sd,
+        };
+        assert!(fit(&[prior(1, 1.5, 0.1)], false).is_ok());
+        for priors in [
+            vec![prior(2, 1.5, 0.1)],
+            vec![prior(1, 1.5, 0.1), prior(1, 1.4, 0.1)],
+            vec![prior(1, f64::NAN, 0.1)],
+            vec![prior(1, 1.5, 0.0)],
+            vec![prior(1, 1.5, f64::INFINITY)],
+        ] {
+            assert!(fit(&priors, false).is_err(), "{priors:?}");
+        }
+        assert!(fit(&[prior(1, 1.5, 0.1)], true).is_err());
+    }
+
     #[test]
     fn predictions_stay_positive_where_nothing_was_counted() {
         let model = Line {
             x: vec![1.0, 2.0, 3.0],
         };
         let mut params = ParameterSet::new(vec![FitParameter::unbounded("a", 0.0)]);
-        let result =
-            poisson_fit(&model, &[0.0; 3], &mut params, &PoissonConfig::default()).unwrap();
+        let result = poisson_fit(
+            &model,
+            &[0.0; 3],
+            &[],
+            &mut params,
+            &PoissonConfig::default(),
+        )
+        .unwrap();
         let predicted = model.evaluate(&result.params).unwrap();
         assert!(predicted.iter().all(|&mean| mean > 0.0), "{result:?}");
     }
@@ -1530,6 +1707,7 @@ mod tests {
         let result = poisson_fit(
             &WrongShape,
             &[1.0; 3],
+            &[],
             &mut params,
             &PoissonConfig::default(),
         );
@@ -1560,7 +1738,13 @@ mod tests {
                 },
                 FitParameter::non_negative("b", 1.0),
             ]);
-            let result = poisson_fit(&model, &observed, &mut params, &PoissonConfig::default());
+            let result = poisson_fit(
+                &model,
+                &observed,
+                &[],
+                &mut params,
+                &PoissonConfig::default(),
+            );
             assert!(
                 matches!(result, Err(FittingError::InvalidConfig(_))),
                 "{lower}, {upper}"
@@ -1599,6 +1783,7 @@ mod tests {
         let result = poisson_fit(
             &Additive,
             &[0.0, 0.0],
+            &[],
             &mut params,
             &PoissonConfig::default(),
         )
@@ -1652,6 +1837,7 @@ mod tests {
         let result = poisson_fit(
             &model,
             &[0.0, 3.0],
+            &[],
             &mut bounded(0.0, 1.5),
             &PoissonConfig::default(),
         )
@@ -1717,7 +1903,8 @@ mod tests {
                     .iter()
                     .map(|y: &f64| (1.0 - y).powi(2))
                     .sum::<f64>();
-            let result = poisson_fit(&model, &observed, &mut two_free(), &at_the_start()).unwrap();
+            let result =
+                poisson_fit(&model, &observed, &[], &mut two_free(), &at_the_start()).unwrap();
             assert_eq!(
                 result.converged,
                 decrement < NEWTON_DECREMENT_TOL,
@@ -1755,7 +1942,8 @@ mod tests {
                 offset: offset.clone(),
                 jacobian: jacobian.clone(),
             };
-            let result = poisson_fit(&model, &observed, &mut two_free(), &at_the_start()).unwrap();
+            let result =
+                poisson_fit(&model, &observed, &[], &mut two_free(), &at_the_start()).unwrap();
             assert_eq!(
                 result.converged,
                 decrement < NEWTON_DECREMENT_TOL,
@@ -1790,6 +1978,7 @@ mod tests {
         let result = poisson_fit(
             &model,
             &vec![level; bins],
+            &[],
             &mut params,
             &PoissonConfig::default(),
         )
@@ -1849,6 +2038,7 @@ mod tests {
         let result = poisson_fit(
             &SilentZeroBin,
             &[0.0],
+            &[],
             &mut params,
             &PoissonConfig::default(),
         )
@@ -1881,7 +2071,8 @@ mod tests {
     #[test]
     fn damping_recovers_after_many_accepted_steps_to_reach_the_minimum() {
         let mut params = ParameterSet::new(vec![FitParameter::unbounded("x", 0.0)]);
-        let result = poisson_fit(&Wall, &[0.0], &mut params, &PoissonConfig::default()).unwrap();
+        let result =
+            poisson_fit(&Wall, &[0.0], &[], &mut params, &PoissonConfig::default()).unwrap();
         assert!((result.params[0] - 80.5).abs() < 1e-3, "{result:?}");
     }
 
@@ -1894,7 +2085,13 @@ mod tests {
                 FitParameter::non_negative("a", a),
                 FitParameter::fixed("b", b),
             ]);
-            let result = poisson_fit(&model, &observed, &mut params, &PoissonConfig::default());
+            let result = poisson_fit(
+                &model,
+                &observed,
+                &[],
+                &mut params,
+                &PoissonConfig::default(),
+            );
             assert!(
                 matches!(result, Err(FittingError::InvalidConfig(_))),
                 "{a}, {b}"
@@ -1929,6 +2126,7 @@ mod tests {
         let result = poisson_fit(
             &Shrinking,
             &[3.0; 3],
+            &[],
             &mut params,
             &PoissonConfig::default(),
         )

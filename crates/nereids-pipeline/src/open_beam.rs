@@ -314,7 +314,7 @@ pub(crate) fn fit_on_halved_grids<M: FitModel>(
     loop {
         let finer = Arc::new(grid.halved()?);
         let fine = model_on(&finer)?;
-        let result = poisson_fit(&fine, observed, parameters, &PoissonConfig::default())?;
+        let result = poisson_fit(&fine, observed, &[], parameters, &PoissonConfig::default())?;
         let converged = result.converged && result.params.iter().all(|p| p.is_finite());
         let predicted = fine.evaluate(&result.params)?;
         let spread: f64 = predicted
