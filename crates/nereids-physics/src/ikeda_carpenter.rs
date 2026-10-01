@@ -220,10 +220,15 @@ const MAX_TAU_SAMPLES: usize = 8192;
 
 #[inline]
 fn h_over_cube_taylor(u: f64) -> f64 {
+    exponential_tail_series(u, 3)
+}
+
+#[inline]
+fn exponential_tail_series(u: f64, shift: u32) -> f64 {
     let mut sum = 0.0;
     let mut power = 0.5;
     for n in 0..64_u32 {
-        let next = sum + power / f64::from(n + 3);
+        let next = sum + power / f64::from(n + shift);
         if next == sum {
             break;
         }
@@ -337,6 +342,48 @@ pub fn ic_cdf(alpha: f64, beta: f64, r: f64, tau: f64) -> f64 {
     (fast - r * correction).clamp(0.0, 1.0)
 }
 
+fn ic_cdf_slopes(alpha: f64, beta: f64, r: f64, tau: f64) -> [f64; 3] {
+    if !alpha.is_finite() || !beta.is_finite() || !r.is_finite() {
+        return [f64::NAN; 3];
+    }
+    if tau.is_nan() || tau <= 0.0 || tau == f64::INFINITY {
+        return [0.0; 3];
+    }
+    let alpha = alpha.max(MIN_RATE);
+    let beta = beta.max(MIN_RATE);
+    let at = alpha * tau;
+    let fast = 0.5 * tau * at * at * (-at).exp();
+    const CDF_TAIL_LIMIT: f64 = 1.0e100;
+    if at >= CDF_TAIL_LIMIT {
+        let storage = (-beta * tau).exp();
+        return [0.0, r * tau * storage, -storage];
+    }
+    if beta * tau >= CDF_TAIL_LIMIT {
+        return [fast, 0.0, 0.0];
+    }
+    let u = (alpha - beta) * tau;
+    let (correction, slope) = if u.abs() < 0.05 {
+        let storage = (-beta * tau).exp();
+        (
+            at.powi(3) * storage * h_over_cube_taylor(u),
+            -tau * storage * exponential_tail_series(u, 4),
+        )
+    } else {
+        let prompt = (-alpha * tau).exp();
+        let bracket = (-beta * tau).exp() - prompt * (1.0 + u + 0.5 * u * u);
+        (
+            at.powi(3) * bracket / u.powi(3),
+            tau * (prompt / (2.0 * u) - 3.0 * bracket / u.powi(4)),
+        )
+    };
+    let moved = at.powi(3) * slope;
+    [
+        fast - r * (3.0 * correction / alpha + moved),
+        r * (tau * correction + moved),
+        -correction,
+    ]
+}
+
 const GAUSS_LEGENDRE_16: [(f64, f64); 8] = [
     (0.095_012_509_837_637_44, 0.189_450_610_455_068_59),
     (0.281_603_550_779_258_9, 0.182_603_415_044_923_6),
@@ -348,30 +395,49 @@ const GAUSS_LEGENDRE_16: [(f64, f64); 8] = [
     (0.989_400_934_991_649_9, 0.027_152_459_411_754_055),
 ];
 
-fn triangle_fold(alpha: f64, fwhm_us: f64, delay_us: f64, g: impl Fn(f64) -> f64) -> f64 {
+fn fold_nodes(alpha: f64, fwhm_us: f64, delay_us: f64, mut node: impl FnMut(f64, f64)) {
     let end = delay_us.min(fwhm_us);
     let finest = 2.0 / alpha.max(MIN_RATE);
-    let mut total = 0.0;
     for (lo, hi) in [(-fwhm_us, end.min(0.0)), (0.0, end)] {
         let (mut right, mut width) = (hi, finest);
         while right > lo {
             let left = (right - width).max(lo);
             let (centre, half) = (0.5 * (left + right), 0.5 * (right - left));
-            for &(node, weight) in &GAUSS_LEGENDRE_16 {
-                for s in [centre - half * node, centre + half * node] {
-                    total +=
-                        half * weight * (fwhm_us - s.abs()) / (fwhm_us * fwhm_us) * g(delay_us - s);
+            for &(position, weight) in &GAUSS_LEGENDRE_16 {
+                for s in [centre - half * position, centre + half * position] {
+                    node(s, half * weight);
                 }
             }
             right = left;
             width *= 2.0;
         }
     }
+}
+
+fn triangle_fold(alpha: f64, fwhm_us: f64, delay_us: f64, g: impl Fn(f64) -> f64) -> f64 {
+    let mut total = 0.0;
+    fold_nodes(alpha, fwhm_us, delay_us, |s, weight| {
+        total += weight * (fwhm_us - s.abs()) / (fwhm_us * fwhm_us) * g(delay_us - s);
+    });
     total
 }
 
 fn ic_cdf_folded(alpha: f64, beta: f64, r: f64, fwhm_us: f64, delay_us: f64) -> f64 {
     triangle_fold(alpha, fwhm_us, delay_us, |x| ic_cdf(alpha, beta, r, x)).clamp(0.0, 1.0)
+}
+
+fn ic_cdf_folded_slopes(alpha: f64, beta: f64, r: f64, fwhm_us: f64, delay_us: f64) -> [f64; 4] {
+    let mut slopes = [0.0; 4];
+    fold_nodes(alpha, fwhm_us, delay_us, |s, weight| {
+        let x = delay_us - s;
+        let triangle = weight * (fwhm_us - s.abs()) / (fwhm_us * fwhm_us);
+        for (slope, value) in slopes.iter_mut().zip(ic_cdf_slopes(alpha, beta, r, x)) {
+            *slope += triangle * value;
+        }
+        slopes[3] +=
+            weight * (2.0 * s.abs() - fwhm_us) / fwhm_us.powi(3) * ic_cdf(alpha, beta, r, x);
+    });
+    slopes
 }
 
 /// Gamma(3, rate=1) cumulative distribution at dimensionless time `x`.
@@ -598,6 +664,39 @@ impl IkedaCarpenterParams {
             .map(|edge| density(edge - arrival_us))
             .collect();
         Ok(densities.windows(2).map(|w| w[0] - w[1]).collect())
+    }
+
+    /// The derivatives of each of [`Self::bin_probabilities_at`] with
+    /// respect to `α`, `β`, `R` and the triangle's FWHM `h`, each evaluated at
+    /// `true_energy_ev`: `[∂P/∂α, ∂P/∂β, ∂P/∂R, ∂P/∂h]`, one value per bin.
+    /// `∂P/∂h` is 0 at `h = 0`, where the folded probabilities are even in
+    /// `h`.
+    ///
+    /// # Errors
+    /// As [`Self::bin_probabilities_at`].
+    pub fn bin_pulse_slopes_at(
+        &self,
+        true_energy_ev: f64,
+        arrival_us: f64,
+        detector_time_edges_us: &[f64],
+    ) -> Result<[Vec<f64>; 4], ResolutionParseError> {
+        let (alpha, beta, r, h) =
+            self.at_arrival(true_energy_ev, arrival_us, detector_time_edges_us)?;
+        let slopes = |x: f64| {
+            if h == 0.0 {
+                let [a, b, c] = ic_cdf_slopes(alpha, beta, r, x);
+                [a, b, c, 0.0]
+            } else {
+                ic_cdf_folded_slopes(alpha, beta, r, h, x)
+            }
+        };
+        let at_edges: Vec<[f64; 4]> = detector_time_edges_us
+            .iter()
+            .map(|edge| slopes(edge - arrival_us))
+            .collect();
+        Ok(std::array::from_fn(|n| {
+            at_edges.windows(2).map(|w| w[1][n] - w[0][n]).collect()
+        }))
     }
 
     fn at_arrival(

@@ -104,28 +104,24 @@ pub struct Rows {
 }
 
 impl Rows {
-    fn new(
-        step_us: f64,
-        bins: usize,
-        rows: Vec<Result<Vec<(usize, f64)>, ResolutionParseError>>,
-    ) -> Result<Self, FlightTimeGridError> {
+    fn new<'a>(step_us: f64, bins: usize, rows: impl Iterator<Item = &'a [(usize, f64)]>) -> Self {
         let mut row_offsets = vec![0];
         let mut columns = Vec::new();
         let mut values = Vec::new();
         for row in rows {
-            for (k, v) in row? {
+            for &(k, v) in row {
                 columns.push(k);
                 values.push(v);
             }
             row_offsets.push(values.len());
         }
-        Ok(Self {
+        Self {
             step_us,
             bins,
             row_offsets,
             columns,
             values,
-        })
+        }
     }
 
     /// `step · Σ_j v_j R_k(j)` for each bin `k`, with `values[j]` the value
@@ -310,7 +306,7 @@ impl FlightTimeGrid {
             range_us,
             step_us,
             flight_times_us,
-            rows: Rows::new(step_us, 0, Vec::new())?,
+            rows: Rows::new(step_us, 0, std::iter::empty()),
         };
         grid.rows = grid.rows_at(t0_us, flight_path_m, pulse.params())?;
         Ok(grid)
@@ -347,9 +343,10 @@ impl FlightTimeGrid {
         flight_path_m: f64,
         params: &IkedaCarpenterParams,
     ) -> Result<Rows, FlightTimeGridError> {
-        self.rows_with(t0_us, flight_path_m, |energy, arrival| {
-            params.bin_probabilities_at(energy, arrival, &self.time_edges_us)
-        })
+        let [rows] = self.rows_with(t0_us, flight_path_m, |energy, arrival| {
+            Ok([params.bin_probabilities_at(energy, arrival, &self.time_edges_us)?])
+        })?;
+        Ok(rows)
     }
 
     /// The derivative of [`Self::rows_at`]'s probabilities with respect to
@@ -363,17 +360,36 @@ impl FlightTimeGrid {
         flight_path_m: f64,
         params: &IkedaCarpenterParams,
     ) -> Result<Rows, FlightTimeGridError> {
-        self.rows_with(t0_us, flight_path_m, |energy, arrival| {
-            params.bin_arrival_slopes_at(energy, arrival, &self.time_edges_us)
-        })
+        let [rows] = self.rows_with(t0_us, flight_path_m, |energy, arrival| {
+            Ok([params.bin_arrival_slopes_at(energy, arrival, &self.time_edges_us)?])
+        })?;
+        Ok(rows)
     }
 
-    fn rows_with(
+    /// The derivatives of [`Self::rows_at`]'s probabilities with respect to
+    /// `α`, `β`, `R` and the triangle's FWHM, each at its point's energy, with
+    /// the same step: [`IkedaCarpenterParams::bin_pulse_slopes_at`] for every
+    /// point.
+    ///
+    /// # Errors
+    /// As [`Self::rows_at`].
+    pub fn pulse_slopes_at(
         &self,
         t0_us: f64,
         flight_path_m: f64,
-        row: impl Fn(f64, f64) -> Result<Vec<f64>, ResolutionParseError> + Sync,
-    ) -> Result<Rows, FlightTimeGridError> {
+        params: &IkedaCarpenterParams,
+    ) -> Result<[Rows; 4], FlightTimeGridError> {
+        self.rows_with(t0_us, flight_path_m, |energy, arrival| {
+            params.bin_pulse_slopes_at(energy, arrival, &self.time_edges_us)
+        })
+    }
+
+    fn rows_with<const N: usize>(
+        &self,
+        t0_us: f64,
+        flight_path_m: f64,
+        row: impl Fn(f64, f64) -> Result<[Vec<f64>; N], ResolutionParseError> + Sync,
+    ) -> Result<[Rows; N], FlightTimeGridError> {
         if !t0_us.is_finite() {
             return Err(FlightTimeGridError::InvalidTimingOffset(t0_us));
         }
@@ -382,18 +398,29 @@ impl FlightTimeGrid {
         }
         let scale = flight_path_m / self.flight_path_m;
         let clock = TOF_FACTOR * self.flight_path_m;
-        let rows: Vec<Result<Vec<(usize, f64)>, ResolutionParseError>> = self
+        let points: Vec<[Vec<(usize, f64)>; N]> = self
             .energies_ev()
             .par_iter()
             .map(|&energy| {
-                Ok(row(energy, t0_us + scale * (clock / energy.sqrt()))?
-                    .into_iter()
-                    .enumerate()
-                    .filter(|&(_, v)| v != 0.0)
-                    .collect())
+                Ok(
+                    row(energy, t0_us + scale * (clock / energy.sqrt()))?.map(|values| {
+                        values
+                            .into_iter()
+                            .enumerate()
+                            .filter(|&(_, v)| v != 0.0)
+                            .collect()
+                    }),
+                )
             })
-            .collect();
-        Rows::new(self.step_us * scale, self.time_edges_us.len() - 1, rows)
+            .collect::<Result<_, ResolutionParseError>>()?;
+        let bins = self.time_edges_us.len() - 1;
+        Ok(std::array::from_fn(|n| {
+            Rows::new(
+                self.step_us * scale,
+                bins,
+                points.iter().map(|point| point[n].as_slice()),
+            )
+        }))
     }
 
     /// The probabilities at the grid's own timing offset, flight path and

@@ -839,3 +839,107 @@ fn arrival_slopes_are_the_derivative_of_the_bin_probabilities() {
         }
     }
 }
+
+fn constant_pulse(alpha: f64, beta: f64, r: f64, fwhm_us: f64) -> IkedaCarpenterParams {
+    IkedaCarpenterParams {
+        channel_fwhm_us: Some(fwhm_us),
+        ..IkedaCarpenterParams::constant(alpha, beta, r)
+    }
+}
+
+#[test]
+fn pulse_slopes_are_the_derivatives_of_the_bin_probabilities() {
+    let true_energy_ev = 25.0_f64;
+    let arrival_us = 365.0;
+    let edges: Vec<f64> = [-1.0, -0.3, 0.0, 0.2, 0.7, 1.5, 3.0, 6.0, 12.0, 30.0, 1.0e4]
+        .iter()
+        .map(|delay| arrival_us + delay)
+        .collect();
+    let bins = |pulse: [f64; 4]| {
+        constant_pulse(pulse[0], pulse[1], pulse[2], pulse[3])
+            .bin_probabilities_at(true_energy_ev, arrival_us, &edges)
+            .expect("bins")
+    };
+    let slopes = |pulse: [f64; 4]| {
+        constant_pulse(pulse[0], pulse[1], pulse[2], pulse[3])
+            .bin_pulse_slopes_at(true_energy_ev, arrival_us, &edges)
+            .expect("slopes")
+    };
+    let largest = |values: &[f64]| values.iter().fold(0.0_f64, |m, v| m.max(v.abs()));
+    let just_above_the_series_switch = (0.81, 0.8);
+    for (alpha, beta) in [
+        (1.7, 0.25),
+        (0.3, 1.2),
+        (0.8, 0.8),
+        just_above_the_series_switch,
+    ] {
+        let fwhm_slope_resolved = (alpha, beta) != just_above_the_series_switch;
+        for fwhm_us in [0.0, 0.35] {
+            let pulse = [alpha, beta, 0.3, fwhm_us];
+            let analytic = slopes(pulse);
+            let parameters = if fwhm_us > 0.0 && fwhm_slope_resolved {
+                4
+            } else {
+                3
+            };
+            for (n, analytic) in analytic.iter().enumerate().take(parameters) {
+                let step = 1e-4 * pulse[n];
+                let (mut up, mut down) = (pulse, pulse);
+                up[n] += step;
+                down[n] -= step;
+                let (up, down) = (bins(up), bins(down));
+                for (k, slope) in analytic.iter().enumerate() {
+                    let central = (up[k] - down[k]) / (2.0 * step);
+                    assert!(
+                        (slope - central).abs() <= 1e-7 * largest(analytic),
+                        "α {alpha} β {beta} h {fwhm_us} parameter {n} bin {k}: {slope} vs {central}"
+                    );
+                }
+            }
+        }
+    }
+
+    let unfolded = [1.7, 0.25, 0.3, 0.0];
+    assert!(slopes(unfolded)[3].iter().all(|&s| s == 0.0));
+    let one_sided = |step: f64| -> Vec<f64> {
+        let mut folded = unfolded;
+        folded[3] = step;
+        bins(folded)
+            .iter()
+            .zip(bins(unfolded))
+            .map(|(a, b)| (a - b) / step)
+            .collect()
+    };
+    let (coarse, fine) = (largest(&one_sided(1e-2)), largest(&one_sided(5e-3)));
+    assert!(fine <= 0.6 * coarse, "{fine} vs {coarse}");
+
+    let unstored = [1.7, 0.25, 0.0, 0.35];
+    let analytic = &slopes(unstored)[2];
+    let mut stored = unstored;
+    stored[2] = 1e-6;
+    for (k, (a, b)) in bins(stored).iter().zip(bins(unstored)).enumerate() {
+        let one_sided = (a - b) / 1e-6;
+        assert!(
+            (analytic[k] - one_sided).abs() <= 1e-7 * largest(analytic),
+            "R = 0 bin {k}: {} vs {one_sided}",
+            analytic[k]
+        );
+    }
+
+    let (alpha, beta) = (0.85, 0.8);
+    let at = |tau: f64| {
+        constant_pulse(alpha, beta, 0.3, 0.0)
+            .bin_pulse_slopes_at(true_energy_ev, 0.0, &[0.0, tau])
+            .expect("slopes")
+    };
+    let switch_us = 0.05 / (alpha - beta);
+    let (below, above) = (at(switch_us * (1.0 - 1e-12)), at(switch_us * (1.0 + 1e-12)));
+    for n in 0..3 {
+        assert!(
+            (below[n][0] - above[n][0]).abs() <= 1e-9 * above[n][0].abs(),
+            "parameter {n}: {} vs {}",
+            below[n][0],
+            above[n][0]
+        );
+    }
+}
