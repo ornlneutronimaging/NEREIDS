@@ -10,7 +10,6 @@ use nereids_pipeline::reference::Instrument;
 
 const FLIGHT_PATH_M: f64 = 25.0;
 const T0_US: f64 = 3.0;
-const CLOCK: f64 = TOF_FACTOR * FLIGHT_PATH_M;
 const E_MIN_EV: f64 = 1.0;
 const E_MAX_EV: f64 = 200.0;
 const COUNTS_PER_US: f64 = 1.0e4;
@@ -84,15 +83,6 @@ fn beam_per_us(u: f64) -> f64 {
     COUNTS_PER_US * (0.5 * x - 2.0 * x * x).exp()
 }
 
-fn counts(grid: &FlightTimeGrid) -> Vec<f64> {
-    let beam: Vec<f64> = grid
-        .flight_times_us()
-        .iter()
-        .map(|&u| beam_per_us(u))
-        .collect();
-    grid.predict(&beam).expect("one value per grid point")
-}
-
 fn spread(counts: &[f64], expected: &[f64]) -> f64 {
     counts
         .iter()
@@ -101,16 +91,22 @@ fn spread(counts: &[f64], expected: &[f64]) -> f64 {
         .sum()
 }
 
-fn simulated(pulse: &Arc<IkedaCarpenter>, step_us: f64) -> Vec<f64> {
+fn simulated(
+    pulse: &Arc<IkedaCarpenter>,
+    step_us: f64,
+    t0_us: f64,
+    flight_path_m: f64,
+) -> Vec<f64> {
+    let clock = TOF_FACTOR * flight_path_m;
     let expected = Instrument {
         time_edges_us: edges(),
-        flight_path_m: FLIGHT_PATH_M,
-        t0_us: T0_US,
+        flight_path_m,
+        t0_us,
         resolution: ResolutionFunction::IkedaCarpenter(Arc::clone(pulse)),
     }
     .expected_counts(
         &|e| {
-            let u = CLOCK / e.sqrt();
+            let u = clock / e.sqrt();
             beam_per_us(u) * u / (2.0 * e)
         },
         &|es| vec![1.0; es.len()],
@@ -127,21 +123,44 @@ fn simulated(pulse: &Arc<IkedaCarpenter>, step_us: f64) -> Vec<f64> {
 }
 
 #[test]
-fn the_grid_a_halving_accepts_matches_the_simulator() {
+fn the_grid_a_halving_accepts_matches_the_simulator_at_a_later_t0_and_longer_path() {
+    let (t0_us, flight_path_m) = (T0_US + 0.05, FLIGHT_PATH_M + 0.05);
+    let stretch = flight_path_m / FLIGHT_PATH_M;
     for (name, pulse) in pulses() {
-        let expected = simulated(&pulse, SIMULATOR_STEP_US);
-        let simulator_spread = spread(&simulated(&pulse, 2.0 * SIMULATOR_STEP_US), &expected);
+        let expected = simulated(&pulse, SIMULATOR_STEP_US, t0_us, flight_path_m);
+        let simulator_spread = spread(
+            &simulated(&pulse, 2.0 * SIMULATOR_STEP_US, t0_us, flight_path_m),
+            &expected,
+        );
         assert!(simulator_spread <= BOUND / 100.0, "{name}");
-        let grid = FlightTimeGrid::new(&edges(), T0_US, FLIGHT_PATH_M, &pulse).expect(name);
-        let predicted: Vec<Vec<f64>> =
-            successors(Some(grid), |g| Some(g.halved().expect("halved grid")))
-                .take(MAX_HALVINGS + 1)
-                .map(|g| counts(&g))
-                .collect();
-        let accepted = 1 + predicted
+        let grids: Vec<FlightTimeGrid> = successors(
+            Some(FlightTimeGrid::new(&edges(), T0_US, FLIGHT_PATH_M, &pulse).expect(name)),
+            |g| Some(g.halved().expect("halved grid")),
+        )
+        .take(MAX_HALVINGS + 1)
+        .collect();
+        let beam = |grid: &FlightTimeGrid, stretch: f64| -> Vec<f64> {
+            grid.flight_times_us()
+                .iter()
+                .map(|&u| beam_per_us(stretch * u))
+                .collect()
+        };
+        let at_build: Vec<Vec<f64>> = grids
+            .iter()
+            .map(|grid| {
+                grid.predict(&beam(grid, 1.0))
+                    .expect("one value per grid point")
+            })
+            .collect();
+        let accepted = &grids[1 + at_build
             .windows(2)
             .position(|pair| spread(&pair[0], &pair[1]) <= BOUND)
-            .expect(name);
-        assert!(spread(&predicted[accepted], &expected) <= BOUND, "{name}");
+            .expect(name)];
+        let predicted = accepted
+            .rows_at(t0_us, flight_path_m)
+            .expect("rows")
+            .predict(&beam(accepted, stretch))
+            .expect("one value per grid point");
+        assert!(spread(&predicted, &expected) <= BOUND, "{name}");
     }
 }

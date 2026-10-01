@@ -98,6 +98,35 @@ impl BeamSpline {
         ]
     }
 
+    /// `(index, weight)` pairs with `d ln φ/du = Σ weight · coefficients[index]`
+    /// at `u_us > 0`, in 1/µs; the derivative of [`Self::basis`].
+    #[must_use]
+    pub fn basis_slope(&self, u_us: f64) -> [(usize, f64); 5] {
+        let n = self.intervals();
+        let h = (self.x_high - self.x_low) / n as f64;
+        let ds_du = 1.0 / (h * u_us);
+        let s = (u_us.ln() - self.x_low) / h;
+        if s < 0.0 {
+            let curvature_slope = s / (2.0 * n as f64);
+            return [
+                (0, (-0.5 + curvature_slope) * ds_du),
+                (1, 0.0),
+                (2, (0.5 - curvature_slope) * ds_du),
+                (n, -curvature_slope * ds_du),
+                (n + 2, curvature_slope * ds_du),
+            ];
+        }
+        let first = (s.floor() as usize).min(n - 1);
+        let t = s - first as f64;
+        [
+            (first, -(1.0 - t).powi(2) / 2.0 * ds_du),
+            (first + 1, (3.0 * t * t - 4.0 * t) / 2.0 * ds_du),
+            (first + 2, (-3.0 * t * t + 2.0 * t + 1.0) / 2.0 * ds_du),
+            (first + 3, t * t / 2.0 * ds_du),
+            (first, 0.0),
+        ]
+    }
+
     /// The beam per µs at flight time `u_us > 0`.
     #[must_use]
     pub fn per_us(&self, u_us: f64) -> f64 {
@@ -123,6 +152,24 @@ mod tests {
 
     fn ln_beam(spline: &BeamSpline, u: f64) -> f64 {
         spline.per_us(u).ln()
+    }
+
+    #[test]
+    fn the_basis_slope_is_the_derivative_of_ln_beam() {
+        let spline = wavy();
+        for u in [250.0, 279.0, 300.0, 333.3, 400.0, 469.0, 500.0] {
+            let h = 1e-4;
+            let central = (ln_beam(&spline, u + h) - ln_beam(&spline, u - h)) / (2.0 * h);
+            let slope: f64 = spline
+                .basis_slope(u)
+                .iter()
+                .map(|&(i, w)| w * spline.coefficients()[i])
+                .sum();
+            assert!(
+                (slope - central).abs() <= 1e-8 * central.abs().max(1e-3),
+                "{u}: {slope} vs {central}"
+            );
+        }
     }
 
     #[test]

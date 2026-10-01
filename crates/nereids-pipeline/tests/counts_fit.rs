@@ -36,6 +36,8 @@ struct Setup {
     pulse: Arc<IkedaCarpenter>,
     energy_range_ev: (f64, f64),
     simulator_step_us: f64,
+    t0_us: f64,
+    flight_path_m: f64,
 }
 
 fn pulse(r: f64, e_max_ev: f64) -> Arc<IkedaCarpenter> {
@@ -66,6 +68,8 @@ fn standard() -> Setup {
         pulse: pulse(0.15, 200.0),
         energy_range_ev: (10.0, 50.0),
         simulator_step_us: 1.0 / 32.0,
+        t0_us: T0_US,
+        flight_path_m: FLIGHT_PATH_M,
     }
 }
 
@@ -109,12 +113,13 @@ fn run(
 ) -> Vec<f64> {
     let instrument = Instrument {
         time_edges_us: setup.edges.clone(),
-        flight_path_m: FLIGHT_PATH_M,
-        t0_us: T0_US,
+        flight_path_m: setup.flight_path_m,
+        t0_us: setup.t0_us,
         resolution: ResolutionFunction::IkedaCarpenter(Arc::clone(&setup.pulse)),
     };
+    let clock = TOF_FACTOR * setup.flight_path_m;
     let per_ev = |e: f64| {
-        let u = CLOCK / e.sqrt();
+        let u = clock / e.sqrt();
         beam(u) * u / (2.0 * e)
     };
     let isotopes: Vec<ResonanceData> = sample.iter().map(|(data, _)| data.clone()).collect();
@@ -191,7 +196,8 @@ fn recorded(
 
 fn calibration(setup: &Setup) -> Calibration {
     Calibration {
-        t0_us: T0_US,
+        t0_us: Value::Known(setup.t0_us),
+        flight_path_m: Value::Known(setup.flight_path_m),
         pulse: Arc::clone(&setup.pulse),
     }
 }
@@ -991,6 +997,8 @@ fn kev_window() -> Setup {
         pulse: pulse(0.0, 3000.0),
         energy_range_ev: (300.0, 3000.0),
         simulator_step_us: 1.0 / 128.0,
+        t0_us: T0_US,
+        flight_path_m: FLIGHT_PATH_M,
     }
 }
 
@@ -1497,5 +1505,46 @@ mod error_bar_pulls {
             )
         };
         check(&ensemble.draws_from_truth());
+    }
+}
+
+#[test]
+fn the_timing_offset_and_flight_path_are_recovered_from_starts_on_either_side() {
+    let setup = Setup {
+        edges: (170..=280).map(|t| 2.0 * f64::from(t)).collect(),
+        energy_range_ev: (5.0, 60.0),
+        t0_us: T0_US + 0.02,
+        flight_path_m: FLIGHT_PATH_M + 0.002,
+        ..standard()
+    };
+    let sample = [(
+        synthetic_isotope_multi(72, 180, &[(12.0, 0.01, 0.06), (24.0, 0.01, 0.06)]),
+        THIN,
+    )];
+    let (open, transmitted) = expected(&setup, &beam(1.0e6), &sample);
+    let counts = (rounded(&open), rounded(&transmitted));
+    let (t0_offset, path_offset) = (0.05, 0.003);
+    for sign in [1.0, -1.0] {
+        let calibration = Calibration {
+            t0_us: Value::Fitted(setup.t0_us + sign * t0_offset),
+            flight_path_m: Value::Fitted(setup.flight_path_m + sign * path_offset),
+            ..calibration(&setup)
+        };
+        let fit =
+            fit_counts(&measurement(&setup, counts.clone(), &sample), &calibration).expect("fit");
+        assert!(fit.converged, "{sign}");
+        for (i, (estimate, truth, offset)) in [
+            (fit.densities[0], THIN, f64::INFINITY),
+            (fit.t0_us, setup.t0_us, t0_offset),
+            (fit.flight_path_m, setup.flight_path_m, path_offset),
+        ]
+        .into_iter()
+        .enumerate()
+        {
+            let sd = error_bar(&fit, i);
+            assert!(sd < offset, "{sign} {i}: {sd} vs {offset}");
+            let pull = (estimate - truth) / sd;
+            assert!(pull.abs() <= BOUND.sqrt(), "{sign} {i}: {pull}");
+        }
     }
 }

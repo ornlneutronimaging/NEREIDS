@@ -6,6 +6,7 @@ use nereids_physics::ikeda_carpenter::{
 };
 use nereids_physics::resolution::{ResolutionFunction, TOF_FACTOR};
 use nereids_pipeline::beam::BeamSpline;
+use nereids_pipeline::counts_fit::Value;
 use nereids_pipeline::error::PipelineError;
 use nereids_pipeline::open_beam::{self, BOUND, Calibration, OpenBeamFit};
 use nereids_pipeline::reference::Instrument;
@@ -167,7 +168,8 @@ fn richest_coefficients(bins: usize) -> usize {
 
 fn calibration(pulse: &Arc<IkedaCarpenter>) -> Calibration {
     Calibration {
-        t0_us: T0_US,
+        t0_us: Value::Known(T0_US),
+        flight_path_m: Value::Known(FLIGHT_PATH_M),
         pulse: Arc::clone(pulse),
     }
 }
