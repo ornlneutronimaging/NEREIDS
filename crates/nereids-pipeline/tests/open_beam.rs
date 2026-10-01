@@ -180,6 +180,7 @@ fn known(pulse: &IkedaCarpenter) -> Pulse {
         fwhm_squared_us2: Value::Known(params.channel_fwhm_us.unwrap_or(0.0).powi(2)),
         energy_span_ev: detector.energy_span_ev(),
         n_tau: detector.n_tau(),
+        prior: None,
     }
 }
 

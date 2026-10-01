@@ -1,6 +1,6 @@
 use std::cell::RefCell;
 use std::collections::HashMap;
-use std::sync::Arc;
+use std::sync::{Arc, LazyLock};
 
 use nereids_endf::resonance::ResonanceData;
 use nereids_endf::resonance::test_support::{synthetic_isotope, synthetic_isotope_multi};
@@ -17,6 +17,7 @@ use nereids_pipeline::counts_fit::{
 };
 use nereids_pipeline::error::PipelineError;
 use nereids_pipeline::open_beam::{BOUND, Calibration, Pulse, fit_open_beam};
+use nereids_pipeline::pulse_calibration::PulseCalibration;
 use nereids_pipeline::reference::Instrument;
 use rand::SeedableRng;
 use rand_chacha::ChaCha12Rng;
@@ -211,6 +212,7 @@ fn known(pulse: &IkedaCarpenter) -> Pulse {
         fwhm_squared_us2: Value::Known(params.channel_fwhm_us.unwrap_or(0.0).powi(2)),
         energy_span_ev: detector.energy_span_ev(),
         n_tau: detector.n_tau(),
+        prior: None,
     }
 }
 
@@ -1759,9 +1761,9 @@ fn calibration_measurement(setup: &Setup, counts: (Vec<f64>, Vec<f64>)) -> Measu
     m
 }
 
-fn calibrated(m: &Measurement, truth: &[f64], sign: f64, fwhm_start_us: Option<f64>) -> CountsFit {
+fn calibration_start(truth: &[f64], sign: f64, fwhm_start_us: Option<f64>) -> Calibration {
     let start = |value: f64, offset: f64| Value::Fitted(value + sign * offset);
-    let calibration = Calibration {
+    Calibration {
         t0_us: start(T0_US, 0.05),
         flight_path_m: start(FLIGHT_PATH_M, 0.003),
         pulse: Pulse {
@@ -1775,8 +1777,11 @@ fn calibrated(m: &Measurement, truth: &[f64], sign: f64, fwhm_start_us: Option<f
                 .map_or(Value::Known(truth[5].powi(2)), |h| Value::Fitted(h * h)),
             ..known(&venus_pulse(truth))
         },
-    };
-    fit_counts(m, &calibration).expect("fit")
+    }
+}
+
+fn calibrated(m: &Measurement, truth: &[f64], sign: f64, fwhm_start_us: Option<f64>) -> CountsFit {
+    fit_counts(m, &calibration_start(truth, sign, fwhm_start_us)).expect("fit")
 }
 
 fn calibration_estimates(fit: &CountsFit) -> [f64; 9] {
@@ -1821,8 +1826,7 @@ fn assert_recovered(fit: &CountsFit, pulse: &[f64], fitted: usize, case: &str) {
     }
 }
 
-#[test]
-fn the_pulse_is_calibrated_on_one_foil() {
+static ONE_FOIL: LazyLock<(CountsFit, PulseCalibration)> = LazyLock::new(|| {
     let setup = calibration_foil(&CALIBRATION_PULSE, T0_US, FLIGHT_PATH_M);
     let counts = expected(
         &setup,
@@ -1830,8 +1834,74 @@ fn the_pulse_is_calibrated_on_one_foil() {
         &calibration_sample(CALIBRATION_DENSITY),
     );
     let m = calibration_measurement(&setup, (rounded(&counts.0), rounded(&counts.1)));
-    let fit = calibrated(&m, &CALIBRATION_PULSE, 1.0, None);
-    assert_recovered(&fit, &CALIBRATION_PULSE, 8, "start above the truth");
+    let calibration = calibration_start(&CALIBRATION_PULSE, 1.0, None);
+    let fit = fit_counts(&m, &calibration).expect("fit");
+    let pulse = PulseCalibration::new(&calibration, &m, &fit).expect("calibration");
+    (fit, pulse)
+});
+
+#[test]
+fn the_pulse_is_calibrated_on_one_foil() {
+    assert_recovered(&ONE_FOIL.0, &CALIBRATION_PULSE, 8, "start above the truth");
+}
+
+const EXPERIMENT_K: f64 = 1500.0;
+
+fn experiment(pulse: &[f64]) -> CountsFit {
+    let setup = calibration_foil(pulse, T0_US + 0.03, FLIGHT_PATH_M + 0.002);
+    let sample = calibration_sample(CALIBRATION_DENSITY);
+    let counts = expected_at(&setup, &beam(CALIBRATION_LEVEL), &sample, EXPERIMENT_K);
+    let m = fitted_from(
+        measurement(&setup, (rounded(&counts.0), rounded(&counts.1)), &sample),
+        1200.0,
+    );
+    fit_counts(&m, &ONE_FOIL.1.calibration()).expect("fit")
+}
+
+#[test]
+fn an_experiment_fits_the_calibrated_pulse_and_tests_it() {
+    let mut shifted = CALIBRATION_PULSE;
+    shifted[4] += 0.02;
+    let (same, other) = rayon::join(|| experiment(&CALIBRATION_PULSE), || experiment(&shifted));
+    assert!(same.converged && other.converged);
+    let truth = [
+        CALIBRATION_DENSITY,
+        EXPERIMENT_K,
+        T0_US + 0.03,
+        FLIGHT_PATH_M + 0.002,
+    ];
+    let estimates = [
+        same.densities[0],
+        same.temperature_k,
+        same.t0_us,
+        same.flight_path_m,
+    ];
+    for (i, (estimate, truth)) in estimates.iter().zip(truth).enumerate() {
+        let pull = (estimate - truth) / error_bar(&same, i);
+        assert!(pull.abs() <= BOUND.sqrt(), "{i}: {pull}");
+    }
+    let p = |fit: &CountsFit| fit.pulse_consistency.expect("consistency").p;
+    assert!(p(&same) > 0.01 && p(&other) < 0.01, "{same:?} {other:?}");
+}
+
+#[test]
+fn a_sample_or_pulse_the_calibration_does_not_cover_is_refused() {
+    let setup = calibration_foil(&CALIBRATION_PULSE, T0_US, FLIGHT_PATH_M);
+    let bins = setup.edges.len() - 1;
+    let flat = (vec![100.0; bins], vec![100.0; bins]);
+    let refusal = |sample: &[(ResonanceData, f64)], calibration: &Calibration| match fit_counts(
+        &measurement(&setup, flat.clone(), sample),
+        calibration,
+    ) {
+        Err(PipelineError::InvalidParameter(message)) => message,
+        other => panic!("{other:?}"),
+    };
+    let calibrated = ONE_FOIL.1.calibration();
+    let wider = [(hafnium_like(55.0), CALIBRATION_DENSITY)];
+    assert!(refusal(&wider, &calibrated).contains("55 eV, outside the 10–50 eV"));
+    let mut known = calibrated;
+    known.pulse.r = Value::Known(0.2);
+    assert!(refusal(&calibration_sample(CALIBRATION_DENSITY), &known).contains("covers R"));
 }
 
 mod pulse_calibration {

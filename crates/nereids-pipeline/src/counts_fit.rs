@@ -13,6 +13,7 @@ use nereids_fitting::error::FittingError;
 use nereids_fitting::lm::{FitModel, FlatMatrix};
 use nereids_fitting::parameters::{FitParameter, ParameterSet};
 use nereids_fitting::poisson::Prior;
+use nereids_fitting::statistics::{Consistency, consistency};
 use nereids_physics::continuous_doppler::{SUPPORT_X, broaden_with_derivative};
 use nereids_physics::doppler::DopplerParams;
 use nereids_physics::flight_time_grid::{FlightTimeGrid, Rows};
@@ -28,6 +29,7 @@ use crate::open_beam::{
     overdispersion, validate_counts, validate_live, weights_of,
 };
 use crate::pipeline::TEMPERATURE_BOUNDS_K;
+use crate::pulse_calibration::lines_in_window;
 
 /// A count in a bin predicted fewer counts than this has a chance below it
 /// under the model.
@@ -156,7 +158,8 @@ pub struct CountsFit {
     /// flight path, `α₀`, `α₁`, `β₀`, `β₁`, `R` and `h²`, in that order: the
     /// inverse of the information at the
     /// fit, each run's expected information over its overdispersion plus
-    /// `1/sd²` for each measured quantity.  The row and column of a quantity
+    /// `1/sd²` for each measured quantity and `C⁻¹` over the pulse numbers a
+    /// calibration's [`Pulse::prior`](crate::open_beam::Pulse::prior) covers.  The row and column of a quantity
     /// on one of its bounds, or that neither the counts nor a measurement
     /// determine, are NaN, and the other entries are conditional on every
     /// quantity that ended on a bound being held there; every entry is NaN
@@ -202,6 +205,15 @@ pub struct CountsFit {
     /// the counts' information on the quantity vanishes beside the
     /// measurement's.  `None` when `covariance` is.
     pub measured_pulls: Option<Vec<f64>>,
+    /// Whether the counts accept the pulse's calibration on the numbers it
+    /// covers, by [`consistency`] with the fitted numbers and their
+    /// covariance.  The counts' information is divided by each run's
+    /// overdispersion, so the test weakens as the overdispersion grows; a
+    /// calibration fitted to the same open-beam run is not independent of
+    /// the fit, which the test does not account for.  `None` without a
+    /// calibration, when `covariance` is `None` or withheld, or when
+    /// [`consistency`] gives none.
+    pub pulse_consistency: Option<Consistency>,
     /// Step, in µs, of the fit's grid.
     pub step_us: f64,
     /// Number of points of that grid.
@@ -263,7 +275,9 @@ pub struct CountsFit {
 ///
 /// The fit minimizes each run's half Poisson deviance over its
 /// overdispersion, plus `½((x − value)/sd)²` for each [`Value::Measured`]
-/// quantity `x`.  The open-beam run is weighted with the open-beam fit's
+/// quantity `x`, and `½(θ − m)ᵀC⁻¹(θ − m)` over the pulse numbers `θ` a
+/// calibration's [`Pulse::prior`](crate::open_beam::Pulse::prior) covers,
+/// with `m` and `C` their calibrated values and covariance.  The open-beam run is weighted with the open-beam fit's
 /// overdispersion, and the sample run first with the same.  The fit is
 /// repeated from its answer while the sample run's overdispersion, measured on
 /// the bins the first fit predicts at least one count, changes by more than
@@ -293,7 +307,11 @@ pub struct CountsFit {
 /// ratio is not finite and positive, a known, starting or measured value is
 /// not finite and in its quantity's range, a measured value's sd is not finite
 /// and positive, bounds are not `lower < upper` in that range
-/// with the start between them, there are no isotopes, an isotope is listed
+/// with the start between them, the pulse's calibration covers a number that
+/// is not fitted or is measured, the sample has a resonance between the
+/// energies of its last and first time edges, at the starting `t0` and flight
+/// path, outside the energies of the calibration foil's resonances, there
+/// are no isotopes, an isotope is listed
 /// twice, an isotope's resonance data are not finite, or the energies its
 /// broadened cross section reads on the grid at the starting `t0`, flight path
 /// and pulse, or at the fitted ones of any pass that rebuilds it, at the known
@@ -327,15 +345,7 @@ pub fn fit_counts(
         temperature_k,
     } = measurement;
     let invalid = |message: String| Err(PipelineError::InvalidParameter(message));
-    let measured: Vec<(usize, f64, f64)> = isotopes
-        .iter()
-        .map(|(_, density)| density)
-        .chain([temperature_k, normalization])
-        .chain(background)
-        .chain([&calibration.t0_us, &calibration.flight_path_m])
-        .chain(&calibration.pulse.alpha)
-        .chain(&calibration.pulse.beta)
-        .chain([&calibration.pulse.r, &calibration.pulse.fwhm_squared_us2])
+    let measured: Vec<(usize, f64, f64)> = quantities(measurement, calibration)
         .enumerate()
         .filter_map(|(offset, value)| match *value {
             Value::Measured { value, sd } => Some((offset, value, sd)),
@@ -400,6 +410,28 @@ pub fn fit_counts(
         );
     }
     let instrument = calibration.instrument()?;
+    let pulse = &calibration.pulse;
+    let numbers = [
+        pulse.alpha[0],
+        pulse.alpha[1],
+        pulse.beta[0],
+        pulse.beta[1],
+        pulse.r,
+        pulse.fwhm_squared_us2,
+    ];
+    if let Some(&number) = pulse
+        .prior
+        .iter()
+        .flat_map(|prior| &prior.numbers)
+        .find(|&&n| !matches!(numbers[n], Value::Fitted(_) | Value::Within { .. }))
+    {
+        return invalid(format!(
+            "the pulse's calibration covers {}, which must be fitted, without a measurement; \
+             got {:?}",
+            ["α₀", "α₁", "β₀", "β₁", "R", "h²"][number],
+            numbers[number]
+        ));
+    }
     let start: Vec<f64> = instrument.iter().map(|parameter| parameter.value).collect();
     let beam_origin_us = start[0];
     let mut base = FlightTimeGrid::new(
@@ -413,6 +445,18 @@ pub fn fit_counts(
     validate_counts("sample", sample_counts, bins)?;
     let open_live = validate_live("open-beam", open_live.as_deref(), bins)?;
     let sample_live = validate_live("sample", sample_live.as_deref(), bins)?;
+    if let Some(prior) = &pulse.prior {
+        let (low, high) = prior.line_span_ev;
+        if let Some(line) = lines_in_window(isotopes, time_edges_us, start[0], start[1])
+            .into_iter()
+            .find(|e| !(low..=high).contains(e))
+        {
+            return invalid(format!(
+                "the sample has a resonance at {line} eV, outside the {low}–{high} eV of the \
+                 resonances the pulse was calibrated on"
+            ));
+        }
+    }
 
     let in_span = |grid: &FlightTimeGrid| -> Result<Vec<Vec<f64>>, PipelineError> {
         let energies = grid.energies_ev();
@@ -492,9 +536,20 @@ pub fn fit_counts(
     let resonances: Arc<[ResonanceData]> = isotopes.iter().map(|(data, _)| data.clone()).collect();
     let observed: Vec<f64> = open_counts.iter().chain(sample_counts).copied().collect();
     let live: Vec<f64> = open_live.into_iter().chain(sample_live).collect();
+    let covered: Vec<usize> = pulse
+        .prior
+        .iter()
+        .flat_map(|prior| prior.numbers.iter().map(|n| layout.pulse + n))
+        .collect();
+    let pulse_prior = pulse
+        .prior
+        .as_ref()
+        .map(|prior| Prior::correlated(&covered, &prior.mean, &prior.covariance))
+        .transpose()?;
     let priors: Vec<Prior> = measured
         .iter()
         .map(|&(offset, mean, sd)| Prior::measured(layout.densities + offset, mean, sd))
+        .chain(pulse_prior.clone())
         .collect();
     let mut first = first_grid(
         &base,
@@ -616,15 +671,40 @@ pub fn fit_counts(
             block
         });
     let params = &fit.result.params;
+    let on_bound: Vec<bool> = sample_quantities
+        .iter()
+        .map(|&p| fit.result.on_bound[p])
+        .collect();
+    let position = |parameter: usize| {
+        sample_quantities
+            .iter()
+            .position(|&p| free[p] == parameter)
+            .expect("a measured or calibrated quantity is fitted")
+    };
+    let pulse_consistency = match (&pulse_prior, &covariance) {
+        (Some(prior), Some(block)) => {
+            let at: Vec<usize> = covered
+                .iter()
+                .map(|&parameter| position(parameter))
+                .collect();
+            let mut posterior = FlatMatrix::zeros(at.len(), at.len());
+            for (a, &i) in at.iter().enumerate() {
+                for (b, &j) in at.iter().enumerate() {
+                    *posterior.get_mut(a, b) = block.get(i, j);
+                }
+            }
+            let estimate: Vec<f64> = covered.iter().map(|&parameter| params[parameter]).collect();
+            let held: Vec<bool> = at.iter().map(|&a| on_bound[a]).collect();
+            consistency(prior, &estimate, &held, &posterior)?
+        }
+        _ => None,
+    };
     let measured_pulls = covariance.as_ref().map(|block| {
         measured
             .iter()
             .map(|&(offset, mean, sd)| {
                 let parameter = layout.densities + offset;
-                let a = sample_quantities
-                    .iter()
-                    .position(|&p| free[p] == parameter)
-                    .expect("a measured quantity is fitted");
+                let a = position(parameter);
                 (params[parameter] - mean) / (sd * sd - block.get(a, a)).sqrt()
             })
             .collect()
@@ -641,20 +721,34 @@ pub fn fit_counts(
         r: params[layout.pulse + 4],
         fwhm_squared_us2: params[layout.pulse + 5],
         covariance,
-        on_bound: sample_quantities
-            .iter()
-            .map(|&p| fit.result.on_bound[p])
-            .collect(),
+        on_bound,
         beam: open.beam.with_coefficients(&params[..layout.densities]),
         beam_at_limit: open.at_limit,
         deviance: fit.result.deviance,
         converged,
         overdispersion,
         measured_pulls,
+        pulse_consistency,
         step_us: fit.step_us,
         points: fit.points,
         halvings: rule_halvings + fit.halvings,
     })
+}
+
+pub(crate) fn quantities<'a>(
+    measurement: &'a Measurement,
+    calibration: &'a Calibration,
+) -> impl Iterator<Item = &'a Value> {
+    measurement
+        .isotopes
+        .iter()
+        .map(|(_, density)| density)
+        .chain([&measurement.temperature_k, &measurement.normalization])
+        .chain(&measurement.background)
+        .chain([&calibration.t0_us, &calibration.flight_path_m])
+        .chain(&calibration.pulse.alpha)
+        .chain(&calibration.pulse.beta)
+        .chain([&calibration.pulse.r, &calibration.pulse.fwhm_squared_us2])
 }
 
 fn finite(isotope: &ResonanceData) -> bool {

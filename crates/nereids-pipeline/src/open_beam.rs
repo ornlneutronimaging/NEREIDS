@@ -13,6 +13,7 @@ use nereids_physics::ikeda_carpenter::{DetectorPulse, EnergyLaw, IkedaCarpenterP
 use crate::beam::BeamSpline;
 use crate::counts_fit::Value;
 use crate::error::PipelineError;
+use crate::pulse_calibration::PulsePrior;
 
 /// Largest `Σ_k (μ_fine − μ_coarse)² / μ_fine`, over bins predicted non-empty,
 /// by which halving the grid may change the predicted counts for the finer
@@ -75,6 +76,11 @@ pub struct Pulse {
     /// Samples across the prompt core that find the pulse's rise, which sets
     /// the grid's first step; at least 8.
     pub n_tau: usize,
+    /// A calibration of some of the numbers, from
+    /// [`PulseCalibration::calibration`](crate::pulse_calibration::PulseCalibration::calibration),
+    /// that [`fit_counts`](crate::counts_fit::fit_counts) fits them with;
+    /// [`fit_open_beam`] uses their starting values.
+    pub prior: Option<PulsePrior>,
 }
 
 impl Pulse {
