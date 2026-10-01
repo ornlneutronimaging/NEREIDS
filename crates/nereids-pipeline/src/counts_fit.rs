@@ -22,8 +22,8 @@ use rayon::prelude::*;
 use crate::beam::BeamSpline;
 use crate::error::PipelineError;
 use crate::open_beam::{
-    Calibration, OpenBeamModel, Recorded, fit_on_halved_grids, fit_open_beam, overdispersion,
-    validate_counts, validate_live,
+    Calibration, OpenBeamModel, Recorded, counted, fit_on_halved_grids, fit_open_beam,
+    overdispersion, validate_counts, validate_live,
 };
 use crate::pipeline::TEMPERATURE_BOUNDS_K;
 
@@ -159,23 +159,27 @@ pub struct CountsFit {
     /// Whether the open-beam fit chose its richest beam; see
     /// [`OpenBeamFit::at_limit`](crate::open_beam::OpenBeamFit::at_limit).
     pub beam_at_limit: bool,
-    /// Each run's half Poisson deviance over its overdispersion, summed over
-    /// both runs at the fit.
+    /// Each run's half Poisson deviance over the overdispersion it was
+    /// weighted with, summed over both runs at the fit.
     pub deviance: f64,
-    /// Whether the fitter converged and both overdispersions settled.
+    /// Whether the fitter converged, the sample run's overdispersion settled
+    /// and the grid met its rule at the fitted temperature.
     pub converged: bool,
     /// Variance of the counts of the open-beam run, then of the sample run,
-    /// over their Poisson variance, at least 1, measured on the bins predicted
-    /// at least one count; each run's counts are weighted by its inverse in
-    /// the fit.  `None` for a run when the fit did not converge or the run
-    /// has less than one degree of freedom left, and that run is weighted
-    /// with 1.
+    /// over their Poisson variance; each run's counts are weighted by its
+    /// inverse in the fit.  The open-beam run's is the open-beam fit's
+    /// [`OpenBeamFit::overdispersion`](crate::open_beam::OpenBeamFit::overdispersion);
+    /// the sample run's is measured the same way at this fit, on the bins the
+    /// first fit predicts at least one count.  `None` for a run when its fit
+    /// did not converge or its counts leave less than one degree of freedom,
+    /// and that run is weighted with 1.
     pub overdispersion: [Option<f64>; 2],
     /// For each measured quantity, in the covariance's order, its fitted value
     /// less its measurement over the standard deviation of that difference,
     /// `√(sd² − variance)`: near 0 ± 1 when the counts agree with the
-    /// measurement.  NaN for a quantity on a bound.  `None` when `covariance`
-    /// is.
+    /// measurement.  NaN for a quantity on a bound or the counts do not
+    /// inform, and for every quantity when a fitted temperature ends at 1 K
+    /// or 5000 K.  `None` when `covariance` is.
     pub measured_pulls: Option<Vec<f64>>,
     /// Step, in µs, of the fit's grid.
     pub step_us: f64,
@@ -222,9 +226,11 @@ pub struct CountsFit {
 ///
 /// The fit minimizes each run's half Poisson deviance over its
 /// overdispersion, plus `½((x − value)/sd)²` for each [`Value::Measured`]
-/// quantity `x`.  The first fit weights both runs with 1.  The fit is repeated
-/// from its answer while either run's overdispersion changes by more than 1%,
-/// or the coarser grid of the accepted pair is wider than the rule at the
+/// quantity `x`.  The open-beam run is weighted with the open-beam fit's
+/// overdispersion, and the sample run first with the same.  The fit is
+/// repeated from its answer while the sample run's overdispersion, measured on
+/// the bins the first fit predicts at least one count, changes by more than
+/// 1%, or the coarser grid of the accepted pair is wider than the rule at the
 /// fitted temperature; the next first grid is the finer of that pair's coarser
 /// grid and the rule's grid at the fitted temperature.  After twenty fits it
 /// is reported unconverged.
@@ -429,7 +435,8 @@ pub fn fit_counts(
         })
         .collect();
     let mut first = first_grid(parameters.params[layout.temperature].value)?;
-    let mut weights = [1.0; 2];
+    let mut weights = [open.overdispersion.unwrap_or(1.0); 2];
+    let mut noise_bins = None;
     let mut passes = 0;
     let (fit, rule_halvings, overdispersion, settled) = loop {
         passes += 1;
@@ -448,15 +455,12 @@ pub fn fit_counts(
             },
         )?;
         let fitted_k = fit.result.params[layout.temperature];
-        let measured =
-            [0, 1].map(|run| overdispersion(&observed, &fit, run * bins..(run + 1) * bins));
-        let settled = measured
-            .iter()
-            .zip(&weights)
-            .all(|(m, w)| (m.unwrap_or(1.0) / w - 1.0).abs() <= SETTLED_OVERDISPERSION);
+        let noise_bins = noise_bins.get_or_insert_with(|| counted(&fit, bins..2 * bins));
+        let sample = overdispersion(&observed, &fit, noise_bins);
+        let settled = (sample.unwrap_or(1.0) / weights[1] - 1.0).abs() <= SETTLED_OVERDISPERSION;
         let resolved = 2.0 * fit.step_us <= 0.5 * narrowest_us(fitted_k)?;
         if !fit.converged || (settled && resolved) || passes == MOST_PASSES {
-            let weighted = [0, 1].map(|run| measured[run].map(|_| weights[run]));
+            let weighted = [open.overdispersion, sample.map(|_| weights[1])];
             break (fit, first.1, weighted, settled && resolved);
         }
         let resumed = (Arc::clone(&fit.coarse), first.1 + fit.halvings - 1);
@@ -464,7 +468,7 @@ pub fn fit_counts(
             .into_iter()
             .min_by(|a, b| a.0.step_us().total_cmp(&b.0.step_us()))
             .expect("two grids");
-        weights = measured.map(|m| m.unwrap_or(1.0));
+        weights[1] = sample.unwrap_or(1.0);
     };
     let converged = fit.converged && settled;
 

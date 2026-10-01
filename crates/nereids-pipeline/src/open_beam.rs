@@ -44,12 +44,15 @@ pub struct OpenBeamFit {
     /// fit did not converge.
     pub covariance: Option<FlatMatrix>,
     /// Variance of the counts over their Poisson variance, at least 1: the
-    /// richest fitted beam's Pearson χ² per degree of freedom over the bins
-    /// predicted at least one count, for independent bins.  Beam structure
+    /// richest fitted beam's Pearson χ² over the bins predicted at least one
+    /// count, per degree of freedom (each bin's one less its leverage), divided
+    /// by one plus the mean of `(y − μ)/μ` over those bins (D. Fletcher,
+    /// Biometrika 99, 230–237, 2012), for independent bins.  Beam structure
     /// finer than every candidate is counted in it as noise; such a beam is
     /// not supported and is fitted smooth, which shows as an overdispersion
     /// far above the detector's.  `None` when the fit did not converge or
-    /// those bins do not outnumber the coefficients.
+    /// those bins leave less than one degree of freedom after the
+    /// coefficients' leverage.
     pub overdispersion: Option<f64>,
     /// Whether the chosen beam is the richest fitted; the counts may then hold
     /// structure finer than its intervals, whose misfit `overdispersion`
@@ -159,7 +162,11 @@ pub fn fit_open_beam(
     }
 
     let richest = &ladder[ladder.len() - 1].fit;
-    let overdispersion = overdispersion(open_counts, richest, 0..open_counts.len());
+    let overdispersion = overdispersion(
+        open_counts,
+        richest,
+        &counted(richest, 0..open_counts.len()),
+    );
     let scale = overdispersion.unwrap_or(1.0);
     let criterion = |candidate: &Candidate| {
         2.0 * candidate.fit.result.deviance / scale
@@ -248,19 +255,28 @@ pub(crate) fn validate_live(
 
 const COUNTS_TO_MEASURE_NOISE: f64 = 1.0;
 
-pub(crate) fn overdispersion(
-    observed: &[f64],
-    fit: &GridFit,
-    bins: std::ops::Range<usize>,
-) -> Option<f64> {
+pub(crate) fn counted(fit: &GridFit, bins: std::ops::Range<usize>) -> Vec<usize> {
+    bins.filter(|&k| fit.predicted[k] >= COUNTS_TO_MEASURE_NOISE)
+        .collect()
+}
+
+pub(crate) fn overdispersion(observed: &[f64], fit: &GridFit, counted: &[usize]) -> Option<f64> {
     let leverage = fit.result.leverage.as_ref().filter(|_| fit.converged)?;
-    let (pearson, freedom) = bins
-        .filter(|&k| fit.predicted[k] >= COUNTS_TO_MEASURE_NOISE)
-        .fold((0.0, 0.0), |(sum, freedom), k| {
-            let (y, mu) = (observed[k], fit.predicted[k]);
-            (sum + (y - mu).powi(2) / mu, freedom + 1.0 - leverage[k])
-        });
-    (freedom >= 1.0).then(|| (pearson / freedom).max(1.0))
+    let (pearson, skew, freedom) =
+        counted
+            .iter()
+            .fold((0.0, 0.0, 0.0), |(pearson, skew, freedom), &k| {
+                let (y, mu) = (observed[k], fit.predicted[k]);
+                (
+                    pearson + (y - mu).powi(2) / mu,
+                    skew + (y - mu) / mu,
+                    freedom + 1.0 - leverage[k],
+                )
+            });
+    let fletcher = 1.0 + skew / counted.len() as f64;
+    (freedom >= 1.0)
+        .then(|| (pearson / freedom / fletcher).clamp(1.0, f64::INFINITY))
+        .filter(|phi| phi.is_finite())
 }
 
 struct Candidate {

@@ -400,7 +400,7 @@ fn held_by_bound(param: &FitParameter, gradient: f64) -> bool {
 /// to the gradient and nothing to the information.  Each step is the
 /// Levenberg–Marquardt step `(F + λI)⁻¹g` in coordinates scaled to unit
 /// Fisher information, projected onto the box;
-/// `λ` is divided by 10 after a step that lowers the deviance, and
+/// `λ` is divided by 10 after a step that lowers the objective, and
 /// multiplied by 10, to at least its starting 1e-3, before retrying one that
 /// does not (D. W. Marquardt, J. Soc. Indust. Appl. Math. 11, 431–441,
 /// 1963).  A free parameter on its bound whose gradient points out of the
@@ -420,7 +420,7 @@ fn held_by_bound(param: &FitParameter, gradient: f64) -> bool {
 /// errors.  A minimum where a bin's prediction reaches zero inside the box is
 /// reported unconverged.
 ///
-/// It stops unconverged when no step lowers the deviance, when the Jacobian
+/// It stops unconverged when no step lowers the objective, when the Jacobian
 /// is not finite, when the start predicts a negative count or zero where
 /// something was counted, or after `config.max_iter` steps.  A trial whose
 /// prediction has a different length from `y_obs` is rejected.

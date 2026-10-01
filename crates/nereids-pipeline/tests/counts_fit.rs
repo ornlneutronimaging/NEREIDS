@@ -651,17 +651,27 @@ fn covariance_against_information(temperature: Value, noisy: bool) {
     m.background[0] = Value::Fitted(TERMS[1]);
     m.background[1] = Value::Fitted(TERMS[2]);
     m.background[2] = Value::Known(TERMS[3]);
-    let density_sd = 2e-3 * truth[0].1;
-    if noisy {
+    let fitted_temperature = matches!(temperature, Value::Fitted(_));
+    let first_term = truth.len() + usize::from(fitted_temperature);
+    let measured: Vec<(usize, f64, f64)> = if noisy {
         m.sample_counts = draw(&m.sample_counts, 500, 7.0);
-        m.isotopes[0].1 = Value::Measured {
-            value: truth[0].1,
-            sd: density_sd,
-        };
+        vec![
+            (0, truth[0].1, 0.05 * truth[0].1),
+            (first_term, TERMS[0], 0.01 * TERMS[0]),
+            (first_term + 1, TERMS[1], 0.2 * TERMS[1]),
+        ]
+    } else {
+        Vec::new()
+    };
+    for (&(_, value, sd), slot) in measured.iter().zip([
+        &mut m.isotopes[0].1,
+        &mut m.normalization,
+        &mut m.background[0],
+    ]) {
+        *slot = Value::Measured { value, sd };
     }
     let fit = fit_counts(&m, &calibration(&setup)).expect("fit");
-    let fitted_temperature = matches!(temperature, Value::Fitted(_));
-    let quantities = truth.len() + usize::from(fitted_temperature) + 3;
+    let quantities = first_term + 3;
     let (low, high) = FlightTimeGrid::new(&setup.edges, T0_US, &setup.pulse)
         .expect("grid")
         .range_us();
@@ -679,18 +689,19 @@ fn covariance_against_information(temperature: Value, noisy: bool) {
     };
     let mut terms = [fit.normalization; 4];
     terms[1..].copy_from_slice(&fit.background);
-    let first_term = truth.len() + usize::from(fitted_temperature);
-    let estimates = fit
+    let estimates: Vec<f64> = fit
         .densities
         .iter()
         .chain(fitted_temperature.then_some(&fit.temperature_k))
-        .chain(&terms[..3]);
+        .chain(&terms[..3])
+        .copied()
+        .collect();
     let truths = truth
         .iter()
         .map(|(_, n)| n)
         .chain(fitted_temperature.then_some(&TEMPERATURE_K))
         .chain(&TERMS[..3]);
-    for (i, (x, truth)) in estimates.zip(truths).enumerate().filter(|_| !noisy) {
+    for (i, (x, truth)) in estimates.iter().zip(truths).enumerate().filter(|_| !noisy) {
         let pull = (x - truth) / error_bar(&fit, i);
         assert!(pull.abs() <= BOUND.sqrt(), "{i}: {pull}");
     }
@@ -769,8 +780,15 @@ fn covariance_against_information(temperature: Value, noisy: bool) {
                 .collect()
         })
         .collect();
-    if noisy {
-        information[coefficients][coefficients] += density_sd.powi(-2);
+    let counts_only = inverse(information.clone());
+    for &(q, _, sd) in &measured {
+        let p = coefficients + q;
+        let ratio = counts_only[p][p] / (sd * sd);
+        assert!(
+            (0.1..=10.0).contains(&ratio),
+            "{q}: the counts' variance is {ratio} times the measurement's"
+        );
+        information[p][p] += sd.powi(-2);
     }
     let oracle = inverse(information);
     let covariance = fit.covariance.expect("covariance");
@@ -786,6 +804,16 @@ fn covariance_against_information(temperature: Value, noisy: bool) {
                 covariance.get(i, j)
             );
         }
+    }
+    let pulls = fit.measured_pulls.expect("measured pulls");
+    assert_eq!(pulls.len(), measured.len());
+    for (&(q, value, sd), pull) in measured.iter().zip(pulls) {
+        let variance = oracle[coefficients + q][coefficients + q];
+        let expected = (estimates[q] - value) / (sd * sd - variance).sqrt();
+        assert!(
+            (pull - expected).abs() <= 1e-2 * (1.0 + expected.abs()),
+            "{q}: {pull} vs {expected}"
+        );
     }
 }
 
@@ -831,6 +859,9 @@ fn measurements_the_fit_does_not_describe_are_refused() {
     invalid(&|m| m.normalization = Value::Known(0.0));
     invalid(&|m| m.normalization = Value::Known(f64::INFINITY));
     invalid(&|m| m.background[1] = Value::Fitted(f64::NAN));
+    for sd in [0.0, -1.0, f64::NAN, f64::INFINITY] {
+        invalid(&|m| m.temperature_k = Value::Measured { value: 300.0, sd });
+    }
     let black = [(isotope.clone(), 4.0e3 / 7805.1)];
     let counts = expected(&setup, &beam(1.0e4), &black);
     let mut empty = measurement(&setup, (rounded(&counts.0), rounded(&counts.1)), &black);
