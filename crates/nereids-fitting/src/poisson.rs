@@ -1,10 +1,10 @@
 //! Poisson-likelihood fitting of counts.
 //!
-//! Minimizes half the Poisson deviance plus a Gaussian prior on each measured
-//! parameter,
+//! Minimizes half the Poisson deviance plus a Gaussian prior on each block
+//! `θₚ` of measured parameters,
 //!
 //! ```text
-//! D(θ) = Σᵢ [μᵢ(θ) − yᵢ + yᵢ ln(yᵢ / μᵢ(θ))] + ½ Σₚ ((θₚ − mₚ)/sₚ)²
+//! D(θ) = Σᵢ [μᵢ(θ) − yᵢ + yᵢ ln(yᵢ / μᵢ(θ))] + ½ Σₚ (θₚ − mₚ)ᵀ Cₚ⁻¹ (θₚ − mₚ)
 //! ```
 //!
 //! within box bounds, by projected Levenberg–Marquardt steps in the Fisher
@@ -12,7 +12,7 @@
 
 use faer::dyn_stack::{MemBuffer, MemStack};
 use faer::linalg::svd::{ComputeSvdVectors, svd, svd_scratch};
-use faer::{Mat, Par};
+use faer::{Mat, Par, Side};
 
 use crate::error::FittingError;
 use crate::lm::{FitModel, FlatMatrix};
@@ -36,14 +36,148 @@ impl Default for PoissonConfig {
     }
 }
 
-/// A Gaussian prior on one free parameter: a measurement `mean ± sd` of it
-/// made elsewhere.
-#[derive(Debug, Clone, Copy, PartialEq)]
+/// A Gaussian prior on free parameters: a measurement of them made
+/// elsewhere, with mean `m` and covariance `C = LLᵀ`.
+#[derive(Debug, Clone, PartialEq)]
 pub struct Prior {
-    /// Index of the parameter in the [`ParameterSet`].
-    pub parameter: usize,
-    pub mean: f64,
-    pub sd: f64,
+    pub(crate) parameters: Vec<usize>,
+    pub(crate) mean: Vec<f64>,
+    pub(crate) factor: Vec<f64>,
+}
+
+impl Prior {
+    /// A measurement `mean ± sd` of the parameter at index `parameter` in the
+    /// [`ParameterSet`].
+    pub fn measured(parameter: usize, mean: f64, sd: f64) -> Self {
+        Self {
+            parameters: vec![parameter],
+            mean: vec![mean],
+            factor: vec![sd],
+        }
+    }
+
+    /// A joint measurement of the parameters at `parameters` in the
+    /// [`ParameterSet`], with `mean` and `covariance` in that order.
+    ///
+    /// # Errors
+    /// `FittingError::LengthMismatch` if `mean` or `covariance` does not
+    /// match `parameters`; `FittingError::InvalidConfig` if `parameters` is
+    /// empty, or `covariance` is not finite, not symmetric to a relative
+    /// 1e-12, or not positive definite with the condition number of its
+    /// correlation matrix at most 1e10.
+    pub fn correlated(
+        parameters: &[usize],
+        mean: &[f64],
+        covariance: &FlatMatrix,
+    ) -> Result<Self, FittingError> {
+        let k = parameters.len();
+        if k == 0 {
+            return Err(FittingError::InvalidConfig(
+                "a prior needs at least one parameter".into(),
+            ));
+        }
+        for (actual, field) in [
+            (mean.len(), "prior mean"),
+            (covariance.nrows, "prior covariance rows"),
+            (covariance.ncols, "prior covariance columns"),
+        ] {
+            if actual != k {
+                return Err(FittingError::LengthMismatch {
+                    expected: k,
+                    actual,
+                    field,
+                });
+            }
+        }
+        let sd: Vec<f64> = (0..k).map(|i| covariance.get(i, i).sqrt()).collect();
+        let symmetric = (0..k).all(|i| {
+            (0..i).all(|j| {
+                let (upper, lower) = (covariance.get(j, i), covariance.get(i, j));
+                (upper - lower).abs() <= 1e-12 * upper.abs().max(lower.abs())
+            })
+        });
+        if !(covariance.data.iter().all(|c| c.is_finite())
+            && sd.iter().all(|&s| s > 0.0)
+            && symmetric)
+        {
+            return Err(FittingError::InvalidConfig(format!(
+                "a prior covariance must be finite and symmetric with a positive diagonal; \
+                 got {covariance:?}"
+            )));
+        }
+        let correlation = Mat::from_fn(k, k, |i, j| {
+            if i == j {
+                1.0
+            } else {
+                covariance.get(i, j) / sd[i] / sd[j]
+            }
+        });
+        let eigenvalues = correlation
+            .self_adjoint_eigenvalues(Side::Lower)
+            .map_err(|e| FittingError::EvaluationFailed(format!("{e:?}")))?;
+        let (smallest, largest) = (eigenvalues[0], eigenvalues[k - 1]);
+        if !(smallest > 0.0 && largest <= MAX_PRIOR_CONDITION * smallest) {
+            return Err(FittingError::InvalidConfig(format!(
+                "a prior covariance must be positive definite with a correlation condition \
+                 number within {MAX_PRIOR_CONDITION:e}; its correlation eigenvalues are \
+                 {eigenvalues:?}"
+            )));
+        }
+        let mut factor = vec![0.0; k * k];
+        for i in 0..k {
+            for j in 0..=i {
+                let dot: f64 = (0..j).map(|l| factor[i * k + l] * factor[j * k + l]).sum();
+                factor[i * k + j] = if i == j {
+                    (correlation[(i, i)] - dot).sqrt()
+                } else {
+                    (correlation[(i, j)] - dot) / factor[j * k + j]
+                };
+            }
+        }
+        for i in 0..k {
+            for j in 0..=i {
+                factor[i * k + j] *= sd[i];
+            }
+        }
+        Ok(Self {
+            parameters: parameters.to_vec(),
+            mean: mean.to_vec(),
+            factor,
+        })
+    }
+
+    pub(crate) fn whiten(&self, v: &mut [f64]) {
+        let k = self.parameters.len();
+        for i in 0..k {
+            let dot: f64 = (0..i).map(|j| self.factor[i * k + j] * v[j]).sum();
+            v[i] = (v[i] - dot) / self.factor[i * k + i];
+        }
+    }
+
+    fn residual(&self, values: &[f64]) -> Vec<f64> {
+        let mut difference: Vec<f64> = self
+            .parameters
+            .iter()
+            .zip(&self.mean)
+            .map(|(&p, m)| values[p] - m)
+            .collect();
+        self.whiten(&mut difference);
+        difference
+    }
+
+    fn inverse_factor(&self) -> Vec<f64> {
+        let k = self.parameters.len();
+        let mut inverse = vec![0.0; k * k];
+        for j in 0..k {
+            let mut column = vec![0.0; k];
+            column[j] = 1.0;
+            self.whiten(&mut column);
+            for (i, c) in column.iter().enumerate() {
+                inverse[i * k + j] = *c;
+            }
+        }
+        inverse
+    }
 }
 
 /// Result of [`poisson_fit`].
@@ -79,9 +213,11 @@ pub struct PoissonResult {
     pub leverage: Option<Vec<f64>>,
 }
 
-const NEWTON_DECREMENT_TOL: f64 = 1e-6;
+pub(crate) const NEWTON_DECREMENT_TOL: f64 = 1e-6;
 
 const DEGENERATE_EIGENVALUE: f64 = 1e-12;
+
+const MAX_PRIOR_CONDITION: f64 = 1e-2 / DEGENERATE_EIGENVALUE;
 
 const MAX_REJECTIONS: usize = 60;
 
@@ -131,10 +267,11 @@ fn deviance(y_obs: &[f64], y_model: &[f64]) -> f64 {
 }
 
 fn objective(y_obs: &[f64], y_model: &[f64], priors: &[Prior], params: &ParameterSet) -> f64 {
+    let values = params.all_values();
     deviance(y_obs, y_model)
         + priors
             .iter()
-            .map(|p| 0.5 * ((params.params[p.parameter].value - p.mean) / p.sd).powi(2))
+            .map(|p| 0.5 * p.residual(&values).iter().map(|w| w.powi(2)).sum::<f64>())
             .sum::<f64>()
 }
 
@@ -191,16 +328,24 @@ fn linearize(
         .zip(&root)
         .map(|((&obs, &mean), &r)| if r > 0.0 { (mean - obs) / r } else { 0.0 })
         .collect();
-    let counts = weighted.nrows;
-    weighted.nrows += priors.len();
+    let mut row = weighted.nrows;
+    weighted.nrows += priors.iter().map(|p| p.parameters.len()).sum::<usize>();
     weighted.data.resize(weighted.nrows * weighted.ncols, 0.0);
-    for (row, prior) in priors.iter().enumerate() {
-        let col = free
-            .iter()
-            .position(|&index| index == prior.parameter)
-            .expect("priors are on free parameters");
-        *weighted.get_mut(counts + row, col) = 1.0 / prior.sd;
-        residual.push((params.params[prior.parameter].value - prior.mean) / prior.sd);
+    let values = params.all_values();
+    for prior in priors {
+        let k = prior.parameters.len();
+        let inverse = prior.inverse_factor();
+        for (i, w) in prior.residual(&values).into_iter().enumerate() {
+            for (j, parameter) in prior.parameters.iter().enumerate().take(i + 1) {
+                let col = free
+                    .iter()
+                    .position(|index| index == parameter)
+                    .expect("priors are on free parameters");
+                *weighted.get_mut(row, col) = inverse[i * k + j];
+            }
+            residual.push(w);
+            row += 1;
+        }
     }
     let gradient = zero_slope
         .iter()
@@ -392,8 +537,8 @@ fn held_by_bound(param: &FitParameter, gradient: f64) -> bool {
 }
 
 /// Fit `params` to the counts `y_obs` by minimizing half the Poisson
-/// deviance plus `½((θₚ − mean)/sd)²` for each of the `priors`, within the
-/// parameter bounds.
+/// deviance plus `½(θₚ − mₚ)ᵀCₚ⁻¹(θₚ − mₚ)` for each of the `priors`, within
+/// the parameter bounds.
 ///
 /// The model must provide an analytical Jacobian at every point the fit
 /// visits.  A trial predicting a negative count, or zero where something was
@@ -409,7 +554,8 @@ fn held_by_bound(param: &FitParameter, gradient: f64) -> bool {
 ///
 /// The fit has converged when the Newton decrement `½ gᵀF⁺g` over the
 /// parameters not held by a bound (on it, gradient pointing out),
-/// `F = Jᵀ diag(1/μ) J + Σₚ eₚeₚᵀ/sdₚ²` the expected information, is below 1e-6: the
+/// `F = Jᵀ diag(1/μ) J + Σₚ Cₚ⁻¹` the expected information, each `Cₚ⁻¹` on
+/// its prior's parameters, is below 1e-6: the
 /// quadratic model built from `F` predicts less than 1e-6 of further
 /// decrease.  Where the deviance is quadratic near the minimum this puts the
 /// fit within about 0.0014 standard errors of it, and within 0.01 where the
@@ -430,10 +576,10 @@ fn held_by_bound(param: &FitParameter, gradient: f64) -> bool {
 /// `FittingError::EmptyData` if `y_obs` is empty;
 /// `FittingError::InvalidConfig` if an observation is negative or not
 /// finite, a parameter value is not finite, a free parameter's bounds are
-/// inverted, NaN or admit no finite value, a prior is not on a free
-/// parameter, two priors are on one parameter, a prior's mean is not finite
-/// or its sd not finite and positive, or the model returns no analytical
-/// Jacobian;
+/// inverted, NaN or admit no finite value, a prior is not on free
+/// parameters, two priors are on one parameter, a prior's mean is not finite
+/// or a measured sd not finite and positive, or the model returns no
+/// analytical Jacobian;
 /// `FittingError::LengthMismatch` if the prediction or the Jacobian does not
 /// match `y_obs` and the free parameters; the model's error if it fails at
 /// the start.
@@ -470,17 +616,17 @@ pub fn poisson_fit(
             p.name, p.value, p.lower, p.upper
         )));
     }
-    if let Some((i, prior)) = priors.iter().enumerate().find(|(i, p)| {
-        params
-            .params
-            .get(p.parameter)
-            .is_none_or(|param| param.fixed)
-            || priors[..*i].iter().any(|q| q.parameter == p.parameter)
-            || !p.mean.is_finite()
-            || !(p.sd.is_finite() && p.sd > 0.0)
+    let covered: Vec<usize> = priors.iter().flat_map(|p| p.parameters.clone()).collect();
+    if let Some((i, prior)) = priors.iter().enumerate().find(|(_, p)| {
+        p.parameters.iter().any(|&parameter| {
+            params.params.get(parameter).is_none_or(|param| param.fixed)
+                || covered.iter().filter(|&&c| c == parameter).count() > 1
+        }) || !p.mean.iter().all(|m| m.is_finite())
+            || !p.factor.iter().all(|f| f.is_finite())
+            || !(0..p.parameters.len()).all(|j| p.factor[j * p.parameters.len() + j] > 0.0)
     }) {
         return Err(FittingError::InvalidConfig(format!(
-            "prior {i} must be on a free parameter without another prior, with a finite mean \
+            "prior {i} must be on free parameters without another prior, with a finite mean \
              and a finite positive sd; got {prior:?}"
         )));
     }
@@ -1604,11 +1750,7 @@ mod tests {
             )
             .unwrap()
         };
-        let result = fit(&[Prior {
-            parameter: 0,
-            mean,
-            sd,
-        }]);
+        let result = fit(&[Prior::measured(0, mean, sd)]);
         assert!(result.converged);
         let theta = result.params[0];
         let b = a_sum - mean / sd.powi(2);
@@ -1649,11 +1791,7 @@ mod tests {
                 &PoissonConfig::default(),
             )
         };
-        let prior = |parameter, mean, sd| Prior {
-            parameter,
-            mean,
-            sd,
-        };
+        let prior = Prior::measured;
         assert!(fit(&[prior(1, 1.5, 0.1)], false).is_ok());
         for priors in [
             vec![prior(2, 1.5, 0.1)],
@@ -1661,10 +1799,204 @@ mod tests {
             vec![prior(1, f64::NAN, 0.1)],
             vec![prior(1, 1.5, 0.0)],
             vec![prior(1, 1.5, f64::INFINITY)],
+            vec![block(&[0, 1]), prior(1, 1.5, 0.1)],
+            vec![block(&[1, 1])],
         ] {
             assert!(fit(&priors, false).is_err(), "{priors:?}");
         }
         assert!(fit(&[prior(1, 1.5, 0.1)], true).is_err());
+        assert!(fit(&[block(&[0, 1])], false).is_ok());
+    }
+
+    fn two_by_two(data: [f64; 4]) -> FlatMatrix {
+        FlatMatrix {
+            data: data.to_vec(),
+            nrows: 2,
+            ncols: 2,
+        }
+    }
+
+    fn block(parameters: &[usize]) -> Prior {
+        Prior::correlated(
+            parameters,
+            &[100.0, 1.5],
+            &two_by_two([1.0, 0.0, 0.0, 0.01]),
+        )
+        .unwrap()
+    }
+
+    #[test]
+    fn covariances_that_are_not_symmetric_and_well_conditioned_are_refused() {
+        let correlated = |data| Prior::correlated(&[0, 1], &[0.0, 0.0], &two_by_two(data));
+        let scaled = |rho: f64| correlated([1.0, rho * 1e3, rho * 1e3, 1e6]);
+        assert!(scaled(1.0 - 1e-9).is_ok());
+        for result in [
+            scaled(1.0 - 1e-11),
+            scaled(1.0 + 1e-9),
+            correlated([1.0, 0.5, 0.5 + 1e-10, 1.0]),
+            correlated([1.0, f64::NAN, f64::NAN, 1.0]),
+            correlated([0.0, 0.0, 0.0, 1.0]),
+            Prior::correlated(&[0, 1], &[0.0], &two_by_two([1.0, 0.0, 0.0, 1.0])),
+            Prior::correlated(&[], &[], &FlatMatrix::zeros(0, 0)),
+        ] {
+            assert!(result.is_err(), "{result:?}");
+        }
+    }
+
+    #[test]
+    fn a_measured_prior_divides_by_its_sd() {
+        for (value, mean, sd) in [
+            (1.234_567, 0.987_654_3, 0.031_4),
+            (1e-7, -3.3e5, 7.0e3),
+            (2.0, 2.0, 0.3),
+        ] {
+            let prior = Prior::measured(0, mean, sd);
+            assert_eq!(
+                prior.residual(&[value])[0].to_bits(),
+                ((value - mean) / sd).to_bits()
+            );
+            assert_eq!(prior.inverse_factor()[0].to_bits(), (1.0 / sd).to_bits());
+        }
+    }
+
+    struct Mixture;
+
+    const MIXTURE: [[f64; 2]; 5] = [[1.0, 5.0], [2.0, 3.0], [3.0, 2.0], [4.0, 1.0], [5.0, 0.5]];
+
+    const MIXTURE_COUNTS: [f64; 5] = [21.0, 20.0, 15.0, 18.0, 16.0];
+
+    impl FitModel for Mixture {
+        fn evaluate(&self, params: &[f64]) -> Result<Vec<f64>, FittingError> {
+            Ok(MIXTURE
+                .iter()
+                .map(|a| a[0] * params[0] + a[1] * params[1])
+                .collect())
+        }
+
+        fn analytical_jacobian(
+            &self,
+            _params: &[f64],
+            free_param_indices: &[usize],
+            _y_current: &[f64],
+        ) -> Option<FlatMatrix> {
+            let mut jacobian = FlatMatrix::zeros(MIXTURE.len(), free_param_indices.len());
+            for (row, a) in MIXTURE.iter().enumerate() {
+                for (col, &index) in free_param_indices.iter().enumerate() {
+                    *jacobian.get_mut(row, col) = a[index];
+                }
+            }
+            Some(jacobian)
+        }
+    }
+
+    fn fit_mixture(priors: &[Prior]) -> PoissonResult {
+        let mut params = ParameterSet::new(vec![
+            FitParameter::non_negative("x", 1.0),
+            FitParameter::non_negative("y", 1.0),
+        ]);
+        poisson_fit(
+            &Mixture,
+            &MIXTURE_COUNTS,
+            priors,
+            &mut params,
+            &PoissonConfig::default(),
+        )
+        .unwrap()
+    }
+
+    fn inverse(m: [[f64; 2]; 2]) -> [[f64; 2]; 2] {
+        let det = m[0][0] * m[1][1] - m[0][1] * m[1][0];
+        [
+            [m[1][1] / det, -m[0][1] / det],
+            [-m[1][0] / det, m[0][0] / det],
+        ]
+    }
+
+    #[test]
+    fn a_correlated_prior_adds_its_inverse_covariance_to_the_information() {
+        let (mean, c) = ([3.0, 4.0], [[0.25, 0.15], [0.15, 0.36]]);
+        let prior = Prior::correlated(&[0, 1], &mean, &two_by_two(c.concat().try_into().unwrap()));
+        let result = fit_mixture(&[prior.unwrap()]);
+        assert!(result.converged);
+        let precision = inverse(c);
+        let information = |theta: [f64; 2], observed: bool| {
+            let mut information = precision;
+            for (a, y) in MIXTURE.iter().zip(MIXTURE_COUNTS) {
+                let mu = a[0] * theta[0] + a[1] * theta[1];
+                let weight = if observed { y / mu.powi(2) } else { 1.0 / mu };
+                for k in 0..2 {
+                    for l in 0..2 {
+                        information[k][l] += weight * a[k] * a[l];
+                    }
+                }
+            }
+            information
+        };
+        let mut mode = mean;
+        for _ in 0..50 {
+            let gradient: Vec<f64> = (0..2)
+                .map(|k| {
+                    (0..2)
+                        .map(|l| precision[k][l] * (mode[l] - mean[l]))
+                        .sum::<f64>()
+                        + MIXTURE
+                            .iter()
+                            .zip(MIXTURE_COUNTS)
+                            .map(|(a, y)| a[k] * (1.0 - y / (a[0] * mode[0] + a[1] * mode[1])))
+                            .sum::<f64>()
+                })
+                .collect();
+            let step = inverse(information(mode, true));
+            for k in 0..2 {
+                mode[k] -= (0..2).map(|l| step[k][l] * gradient[l]).sum::<f64>();
+            }
+        }
+        let fitted = [result.params[0], result.params[1]];
+        let expected = information(fitted, false);
+        let shift: Vec<f64> = (0..2).map(|k| fitted[k] - mode[k]).collect();
+        let distance = (0..2)
+            .flat_map(|k| (0..2).map(move |l| (k, l)))
+            .map(|(k, l)| shift[k] * expected[k][l] * shift[l])
+            .sum::<f64>()
+            .sqrt();
+        assert!(distance <= 2e-3, "{fitted:?} vs {mode:?}");
+        let covariance = inverse(expected);
+        let reported = result.covariance.expect("covariance");
+        for k in 0..2 {
+            for l in 0..2 {
+                let scale = (covariance[k][k] * covariance[l][l]).sqrt();
+                assert!(
+                    (reported.get(k, l) - covariance[k][l]).abs() <= 1e-12 * scale,
+                    "{k}{l}: {} vs {}",
+                    reported.get(k, l),
+                    covariance[k][l]
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn a_correlated_prior_with_a_diagonal_covariance_is_two_measured_priors() {
+        let (mean, sd) = ([3.0, 4.0], [0.5, 0.6]);
+        let diagonal = two_by_two([sd[0] * sd[0], 0.0, 0.0, sd[1] * sd[1]]);
+        let bits = |result: PoissonResult| -> Vec<u64> {
+            result
+                .params
+                .iter()
+                .chain(&result.covariance.expect("covariance").data)
+                .chain([&result.deviance])
+                .map(|v| v.to_bits())
+                .collect()
+        };
+        assert_eq!(
+            bits(fit_mixture(&[
+                Prior::correlated(&[0, 1], &mean, &diagonal).unwrap()
+            ])),
+            bits(fit_mixture(&[
+                Prior::measured(0, mean[0], sd[0]),
+                Prior::measured(1, mean[1], sd[1]),
+            ]))
+        );
     }
 
     #[test]

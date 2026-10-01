@@ -32,6 +32,7 @@ nereids-pipeline = { version = "0.3.0", path = "crates/nereids-pipeline" }
 thiserror = "2"
 ndarray = "0.17"
 faer = { version = "0.24", default-features = false, features = ["std", "linalg"] }
+libm = "0.2"
 num-complex = "0.4"
 rayon = "1"
 serde = { version = "1", features = ["derive"] }

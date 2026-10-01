@@ -10,6 +10,7 @@ categories = ["science"]
 
 [dependencies]
 faer = { workspace = true }
+libm = { workspace = true }
 nereids-core = { workspace = true }
 nereids-endf = { workspace = true }
 nereids-physics = { workspace = true }

@@ -494,11 +494,7 @@ pub fn fit_counts(
     let live: Vec<f64> = open_live.into_iter().chain(sample_live).collect();
     let priors: Vec<Prior> = measured
         .iter()
-        .map(|&(offset, mean, sd)| Prior {
-            parameter: layout.densities + offset,
-            mean,
-            sd,
-        })
+        .map(|&(offset, mean, sd)| Prior::measured(layout.densities + offset, mean, sd))
         .collect();
     let mut first = first_grid(
         &base,
