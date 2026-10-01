@@ -232,7 +232,9 @@ pub struct CountsFit {
 /// The grid is built at a `t0₀` and `L₀`, at first the starting ones.  Grid
 /// point `i` keeps its energy and arrives at `t0 + (L/L₀)·u_i`, with `u_i`
 /// its flight time at `t0₀` and `L₀`, standing for `(L/L₀)·w` of flight time;
-/// the beam is a function of the arrival time less the starting `t0`.
+/// the beam is a function of the arrival time less the starting `t0`.  This
+/// is SAMMY's energy scale: its `Tzero` is `t0`, and its `Elzero` times its
+/// flight path is `L` (`dat/mdat0.f90`, `Mtzero`).
 ///
 /// The grid's first step is at most half the narrowest Doppler full width at
 /// half maximum, in flight time, of any resonance inside its energy span, at
@@ -249,8 +251,8 @@ pub struct CountsFit {
 /// repeated from its answer while the sample run's overdispersion, measured on
 /// the bins the first fit predicts at least one count, changes by more than
 /// 1%, the coarser grid of the accepted pair is wider than the rule at the
-/// fitted temperature, or its flight times miss, by more than one step at
-/// either end, those the fitted `t0` and `L` need.  The next first grid is the
+/// fitted temperature, or its flight times miss some that the fitted `t0` and
+/// `L` need.  The next first grid is the
 /// finer of that pair's coarser grid and the rule's grid at the fitted
 /// temperature, or, when the flight times miss, the rule's grid of a grid
 /// built at the fitted `t0` and `L`.  After twenty fits it is reported
@@ -276,8 +278,10 @@ pub struct CountsFit {
 /// and positive, bounds are not `lower < upper` in that range
 /// with the start between them, there are no isotopes, an isotope is listed
 /// twice, an isotope's resonance data are not finite, or the energies its
-/// broadened cross section reads, at the known temperature or at the upper
-/// bound of a fitted one, down to zero for a window within the thermal
+/// broadened cross section reads on the grid at the starting `t0` and flight
+/// path, or at the fitted ones of any pass that rebuilds it, at the known
+/// temperature or at the upper bound of a fitted one, down to zero for a
+/// window within the thermal
 /// spread of zero energy, are not inside a single one of its evaluated
 /// (SLBW, MLBW or Reich–Moore) resolved ranges;
 /// [`PipelineError::UnmodelledCounts`] if at the fit, converged or not, a bin
@@ -285,7 +289,8 @@ pub struct CountsFit {
 /// [`NEGLIGIBLE_PREDICTION`]: starting or known values the fitter cannot
 /// leave;
 /// everything [`fit_open_beam`] refuses; [`PipelineError::FlightTimeGrid`]
-/// for the grid's refusals, including more points than it allows;
+/// for the grid's refusals at the starting `t0` and flight path or the fitted
+/// ones of any pass, including more points than it allows;
 /// [`PipelineError::Fitting`] if the fitter fails, or the cross sections
 /// fail at the start; a failure at a trial temperature is a rejected step.
 pub fn fit_counts(
@@ -795,12 +800,9 @@ impl TwoRunModel {
             .is_some_and(|s| key(s.t0_us, s.flight_path_m) == key(t0_us, flight_path_m));
         if !current {
             let grid = &self.grid;
-            let rows = if key(t0_us, flight_path_m) == key(grid.t0_us(), grid.flight_path_m()) {
-                grid.rows().clone()
-            } else {
-                grid.rows_at(t0_us, flight_path_m)
-                    .map_err(|e| FittingError::EvaluationFailed(e.to_string()))?
-            };
+            let rows = grid
+                .rows_at(t0_us, flight_path_m)
+                .map_err(|e| FittingError::EvaluationFailed(e.to_string()))?;
             let (shift, stretch) = (
                 t0_us - self.beam_origin_us,
                 flight_path_m / grid.flight_path_m(),

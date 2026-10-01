@@ -173,9 +173,10 @@ pub struct FlightTimeGrid {
 impl FlightTimeGrid {
     /// The grid for bins `time_edges_us` (µs) with timing offset `t0_us` and
     /// flight path `flight_path_m`; the pulse's own flight path is not used.
-    /// The step, half the pulse's shorter rise at the two ends of the range,
-    /// is a starting step: the counts are converged once [`Self::halved`] no
-    /// longer changes them.
+    /// The step, half the pulse's shorter rise at the two ends of the flight
+    /// times whose neutrons can reach the bins, is a starting step: the counts
+    /// are converged once [`Self::halved`] no longer changes them.  The grid
+    /// extends one step beyond those flight times at each end.
     ///
     /// # Errors
     /// See [`FlightTimeGridError`].
@@ -197,27 +198,26 @@ impl FlightTimeGrid {
             .rise_us(energy(u_lo))?
             .min(pulse.rise_us(energy(u_hi))?);
         let intervals = ((u_hi - u_lo) / (0.5 * rise)).ceil();
+        let step_us = (u_hi - u_lo) / intervals;
         Self::build(
             time_edges_us,
             (t0_us, flight_path_m),
             pulse,
-            (u_lo, u_hi),
-            intervals as usize,
+            (u_lo - step_us, u_hi + step_us),
+            intervals as usize + 2,
         )
     }
 
     /// Whether the grid's points, arriving as [`Self::rows_at`] places them,
     /// cover every flight time whose neutrons can reach the bins when the
-    /// timing offset is `t0_us` and the flight path `flight_path_m`, to within
-    /// one step at each end.
+    /// timing offset is `t0_us` and the flight path `flight_path_m`.
     ///
     /// # Errors
     /// As [`Self::new`] for that timing offset and flight path.
     pub fn covers(&self, t0_us: f64, flight_path_m: f64) -> Result<bool, FlightTimeGridError> {
         let (u_lo, u_hi) = range_us(&self.time_edges_us, t0_us, flight_path_m, &self.pulse)?;
         let scale = self.flight_path_m / flight_path_m;
-        Ok(u_lo * scale >= self.range_us.0 - self.step_us
-            && u_hi * scale <= self.range_us.1 + self.step_us)
+        Ok(u_lo * scale >= self.range_us.0 && u_hi * scale <= self.range_us.1)
     }
 }
 
@@ -379,12 +379,6 @@ impl FlightTimeGrid {
             })
             .collect();
         Rows::new(self.step_us * scale, self.time_edges_us.len() - 1, rows)
-    }
-
-    /// The probabilities at the grid's own timing offset and flight path.
-    #[must_use]
-    pub fn rows(&self) -> &Rows {
-        &self.rows
     }
 
     /// The timing offset in µs the grid was built at.

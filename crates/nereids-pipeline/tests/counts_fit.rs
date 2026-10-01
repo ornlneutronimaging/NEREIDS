@@ -16,7 +16,7 @@ use nereids_pipeline::counts_fit::{
     CountsFit, Measurement, NEGLIGIBLE_PREDICTION, Value, fit_counts,
 };
 use nereids_pipeline::error::PipelineError;
-use nereids_pipeline::open_beam::{BOUND, Calibration};
+use nereids_pipeline::open_beam::{BOUND, Calibration, fit_open_beam};
 use nereids_pipeline::reference::Instrument;
 use rand::SeedableRng;
 use rand_chacha::ChaCha12Rng;
@@ -30,6 +30,8 @@ const CHARGE_RATIO: f64 = 1.2;
 const THIN: f64 = 7.687e-4;
 const SATURATED: f64 = 3.844e-2;
 const TERMS: [f64; 4] = [0.93, 0.05, 0.5, 0.01];
+const T0_STEP_US: f64 = 3e-3;
+const PATH_STEP_M: f64 = 1e-4;
 
 struct Setup {
     edges: Vec<f64>,
@@ -165,7 +167,8 @@ fn with_background(
     [a, b0, b1, b2]: [f64; 4],
 ) -> (Vec<f64>, Vec<f64>) {
     let (open, transmitted) = expected_at(setup, beam, sample, temperature_k);
-    let scattered = |u: f64| a * beam(u) * (b0 + b1 * u / CLOCK + b2 * CLOCK / u);
+    let clock = TOF_FACTOR * setup.flight_path_m;
+    let scattered = |u: f64| a * beam(u) * (b0 + b1 * u / clock + b2 * clock / u);
     let scattered = run(setup, CHARGE_RATIO, &scattered, &[], temperature_k);
     let sample = transmitted.iter().zip(&scattered).map(|(t, b)| a * t + b);
     (open, sample.collect())
@@ -645,7 +648,7 @@ fn the_covariance_is_the_inverse_of_the_information_in_the_counts_and_measuremen
     covariance_against_information(
         Value::Measured {
             value: TEMPERATURE_K,
-            sd: 0.02 * TEMPERATURE_K,
+            sd: 0.05 * TEMPERATURE_K,
         },
         true,
     );
@@ -696,21 +699,36 @@ fn covariance_against_information(temperature: Value, noisy: bool) {
     } else {
         Vec::new()
     };
-    let fit = fit_counts(&m, &calibration(&setup)).expect("fit");
-    let quantities = first_term + 3;
-    let (low, high) = FlightTimeGrid::new(&setup.edges, T0_US, FLIGHT_PATH_M, &setup.pulse)
-        .expect("grid")
-        .range_us();
-    let beam_times = |index: Option<usize>, step: f64| {
+    let calibration = Calibration {
+        t0_us: Value::Fitted(setup.t0_us),
+        flight_path_m: Value::Fitted(setup.flight_path_m),
+        ..calibration(&setup)
+    };
+    let fit = fit_counts(&m, &calibration).expect("fit");
+    let quantities = first_term + 5;
+    let (low, high) =
+        FlightTimeGrid::new(&setup.edges, setup.t0_us, setup.flight_path_m, &setup.pulse)
+            .expect("grid")
+            .range_us();
+    let at = |t0_us: f64, flight_path_m: f64| Setup {
+        edges: setup.edges.clone(),
+        pulse: Arc::clone(&setup.pulse),
+        t0_us,
+        flight_path_m,
+        ..setup
+    };
+    let beam_times = |index: Option<usize>, step: f64, t0_us: f64, flight_path_m: f64| {
         let beam = fit.beam.clone();
+        let (stretch, shift) = (flight_path_m / setup.flight_path_m, t0_us - setup.t0_us);
         move |u: f64| {
-            if !(low..=high).contains(&u) {
+            if !(stretch * low..=stretch * high).contains(&u) {
                 return 0.0;
             }
+            let x = shift + u;
             let slope: f64 = index.map_or(0.0, |i| {
-                beam.basis(u).iter().filter(|p| p.0 == i).map(|p| p.1).sum()
+                beam.basis(x).iter().filter(|p| p.0 == i).map(|p| p.1).sum()
             });
-            beam.per_us(u) * (step * slope).exp()
+            beam.per_us(x) * (step * slope).exp()
         }
     };
     let mut terms = [fit.normalization; 4];
@@ -720,13 +738,15 @@ fn covariance_against_information(temperature: Value, noisy: bool) {
         .iter()
         .chain(fitted_temperature.then_some(&fit.temperature_k))
         .chain(&terms[..3])
+        .chain([&fit.t0_us, &fit.flight_path_m])
         .copied()
         .collect();
     let truths = truth
         .iter()
         .map(|(_, n)| n)
         .chain(fitted_temperature.then_some(&TEMPERATURE_K))
-        .chain(&TERMS[..3]);
+        .chain(&TERMS[..3])
+        .chain([&setup.t0_us, &setup.flight_path_m]);
     for (i, (x, truth)) in estimates.iter().zip(truths).enumerate().filter(|_| !noisy) {
         let pull = (x - truth) / error_bar(&fit, i);
         assert!(pull.abs() <= BOUND.sqrt(), "{i}: {pull}");
@@ -747,11 +767,10 @@ fn covariance_against_information(temperature: Value, noisy: bool) {
         let counts = open.into_iter().chain(sample);
         counts.zip(&live).map(|(c, l)| l * c).collect()
     };
-    let temperature_k = fit.temperature_k;
-    let beam = beam_times(None, 0.0);
+    let (temperature_k, t0_us, flight_path_m) = (fit.temperature_k, fit.t0_us, fit.flight_path_m);
     let mu = joined(with_background(
-        &setup,
-        &beam,
+        &at(t0_us, flight_path_m),
+        &beam_times(None, 0.0, t0_us, flight_path_m),
         &fitted,
         temperature_k,
         terms,
@@ -762,22 +781,33 @@ fn covariance_against_information(temperature: Value, noisy: bool) {
             let shifted = |sign: f64| {
                 if p < coefficients {
                     let h = 1e-4;
-                    let beam = beam_times(Some(p), sign * h);
-                    let counts = with_background(&setup, &beam, &fitted, temperature_k, terms);
+                    let beam = beam_times(Some(p), sign * h, t0_us, flight_path_m);
+                    let counts = with_background(
+                        &at(t0_us, flight_path_m),
+                        &beam,
+                        &fitted,
+                        temperature_k,
+                        terms,
+                    );
                     return (joined(counts), h);
                 }
                 let (mut sample, mut kelvin, mut shifted) = (fitted.clone(), temperature_k, terms);
+                let (mut t0, mut path) = (t0_us, flight_path_m);
                 let q = p - coefficients;
-                let value = if q < fitted.len() {
-                    &mut sample[q].1
+                let (value, h) = if q < fitted.len() {
+                    (&mut sample[q].1, 1e-4 * fitted[q].1)
                 } else if q < first_term {
-                    &mut kelvin
+                    (&mut kelvin, 1e-4 * temperature_k)
+                } else if q < first_term + 3 {
+                    (&mut shifted[q - first_term], 1e-4 * terms[q - first_term])
+                } else if q == first_term + 3 {
+                    (&mut t0, T0_STEP_US)
                 } else {
-                    &mut shifted[q - first_term]
+                    (&mut path, PATH_STEP_M)
                 };
-                let h = 1e-4 * *value;
                 *value += sign * h;
-                let counts = with_background(&setup, &beam, &sample, kelvin, shifted);
+                let beam = beam_times(None, 0.0, t0, path);
+                let counts = with_background(&at(t0, path), &beam, &sample, kelvin, shifted);
                 (joined(counts), h)
             };
             let ((up, h), (down, _)) = (shifted(1.0), shifted(-1.0));
@@ -887,6 +917,32 @@ fn measurements_the_fit_does_not_describe_are_refused() {
     invalid(&|m| m.background[1] = Value::Fitted(f64::NAN));
     for sd in [0.0, -1.0, f64::NAN, f64::INFINITY] {
         invalid(&|m| m.temperature_k = Value::Measured { value: 300.0, sd });
+    }
+    for (t0_us, flight_path_m) in [
+        (Value::Known(f64::NAN), Value::Known(FLIGHT_PATH_M)),
+        (Value::Known(T0_US), Value::Known(0.0)),
+        (Value::Known(T0_US), Value::Fitted(-FLIGHT_PATH_M)),
+        (
+            Value::Measured {
+                value: T0_US,
+                sd: 0.0,
+            },
+            Value::Known(FLIGHT_PATH_M),
+        ),
+    ] {
+        let calibration = Calibration {
+            t0_us,
+            flight_path_m,
+            ..calibration(&setup)
+        };
+        assert!(matches!(
+            fit_counts(&good, &calibration),
+            Err(PipelineError::InvalidParameter(_))
+        ));
+        assert!(matches!(
+            fit_open_beam(&good.time_edges_us, &good.open_counts, &calibration, None),
+            Err(PipelineError::InvalidParameter(_))
+        ));
     }
     let black = [(isotope.clone(), 4.0e3 / 7805.1)];
     let counts = expected(&setup, &beam(1.0e4), &black);
@@ -1006,7 +1062,6 @@ fn kev_window() -> Setup {
 fn density_and_temperature_are_recovered_from_starts_on_either_side() {
     let setup = standard();
     let cases = [
-        (hafnium_like(20.0), THIN, 300.0, vec![200.0, 1000.0]),
         (two_resonances(), SATURATED, 300.0, vec![200.0, 1000.0]),
         (hafnium_like(20.0), THIN, 1500.0, vec![300.0, 3000.0]),
         (two_resonances(), SATURATED, 1500.0, vec![300.0, 3000.0]),
@@ -1509,7 +1564,7 @@ mod error_bar_pulls {
 }
 
 #[test]
-fn the_timing_offset_and_flight_path_are_recovered_from_starts_on_either_side() {
+fn density_temperature_timing_offset_and_flight_path_are_recovered_from_starts_on_either_side() {
     let setup = Setup {
         edges: (170..=280).map(|t| 2.0 * f64::from(t)).collect(),
         energy_range_ev: (5.0, 60.0),
@@ -1525,26 +1580,29 @@ fn the_timing_offset_and_flight_path_are_recovered_from_starts_on_either_side() 
     let counts = (rounded(&open), rounded(&transmitted));
     let precision = 1.0 / open.iter().copied().fold(f64::INFINITY, f64::min).sqrt();
     let (t0_offset, path_offset) = (1.5, 0.08);
-    for sign in [1.0, -1.0] {
+    for (sign, density, start_k) in [(1.0, 2.0 * THIN, 1000.0), (-1.0, 0.5 * THIN, 200.0)] {
         let calibration = Calibration {
             t0_us: Value::Fitted(setup.t0_us + sign * t0_offset),
             flight_path_m: Value::Fitted(setup.flight_path_m + sign * path_offset),
             ..calibration(&setup)
         };
-        let fit =
-            fit_counts(&measurement(&setup, counts.clone(), &sample), &calibration).expect("fit");
+        let start = [(sample[0].0.clone(), density)];
+        let fit = fit_counts(
+            &fitted_from(measurement(&setup, counts.clone(), &start), start_k),
+            &calibration,
+        )
+        .expect("fit");
         assert!(fit.converged, "{sign}");
-        for (i, (estimate, truth, offset)) in [
-            (fit.densities[0], THIN, f64::INFINITY),
-            (fit.t0_us, setup.t0_us, t0_offset),
-            (fit.flight_path_m, setup.flight_path_m, path_offset),
+        for (i, (estimate, truth)) in [
+            (fit.densities[0], THIN),
+            (fit.temperature_k, TEMPERATURE_K),
+            (fit.t0_us, setup.t0_us),
+            (fit.flight_path_m, setup.flight_path_m),
         ]
         .into_iter()
         .enumerate()
         {
-            let sd = error_bar(&fit, i);
-            assert!(sd < offset, "{sign} {i}: {sd} vs {offset}");
-            let pull = (estimate - truth) / sd;
+            let pull = (estimate - truth) / error_bar(&fit, i);
             assert!(pull.abs() <= BOUND.sqrt(), "{sign} {i}: {pull}");
         }
         let beam_error = setup

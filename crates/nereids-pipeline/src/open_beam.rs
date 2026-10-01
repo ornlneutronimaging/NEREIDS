@@ -122,9 +122,12 @@ pub struct OpenBeamFit {
 /// [`PipelineError::ShapeMismatch`] unless there is one count, and one live
 /// fraction when given, per bin;
 /// [`PipelineError::InvalidParameter`] if a count is not a whole non-negative
-/// number, every count is zero, a live fraction is not in (0, 1], or there are
+/// number, every count is zero, a live fraction is not in (0, 1], there are
 /// fewer than 8 bins (one interval's four coefficients and as many bins again
-/// to measure the noise);
+/// to measure the noise), the calibration's known, starting or measured `t0`
+/// is not finite or its flight path not finite and positive, a measured one's
+/// sd is not finite and positive, or bounds are not `lower < upper` in that
+/// range with the start between them;
 /// [`PipelineError::FlightTimeGrid`] for the grid's refusals, including the
 /// first candidate's halving past the point cap; [`PipelineError::Fitting`] if
 /// the fitter refuses.

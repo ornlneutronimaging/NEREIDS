@@ -141,9 +141,9 @@ fn no_flight_time_outside_the_range_reaches_a_bin() {
 }
 
 fn assert_tight(name: &str, pulse: &Arc<IkedaCarpenter>, edges: &[f64], t0_us: f64) {
-    let (u_lo, u_hi) = FlightTimeGrid::new(edges, t0_us, FLIGHT_PATH_M, pulse)
-        .expect(name)
-        .range_us();
+    let grid = FlightTimeGrid::new(edges, t0_us, FLIGHT_PATH_M, pulse).expect(name);
+    let (start, end) = grid.range_us();
+    let (u_lo, u_hi) = (start + grid.step_us(), end - grid.step_us());
     let (first, last) = (edges[0], edges[edges.len() - 1]);
     let after_first = |u: f64| probability_in(pulse, u, &[first, first + 1.0e7], t0_us);
     let before_last = |u: f64| probability_in(pulse, u, &[last - 1.0e7, last], t0_us);
@@ -196,6 +196,21 @@ fn invalid_windows_and_unaffordable_grids_are_refused() {
         FlightTimeGrid::new(&edges(), f64::NAN, FLIGHT_PATH_M, constant),
         Err(FlightTimeGridError::InvalidTimingOffset(_))
     ));
+    let grid = FlightTimeGrid::new(&edges(), T0_US, FLIGHT_PATH_M, constant).expect("grid");
+    for flight_path_m in [0.0, -FLIGHT_PATH_M, f64::NAN] {
+        assert!(matches!(
+            FlightTimeGrid::new(&edges(), T0_US, flight_path_m, constant),
+            Err(FlightTimeGridError::InvalidFlightPath(_))
+        ));
+        assert!(matches!(
+            grid.covers(T0_US, flight_path_m),
+            Err(FlightTimeGridError::InvalidFlightPath(_))
+        ));
+        assert!(matches!(
+            grid.rows_at(T0_US, flight_path_m),
+            Err(FlightTimeGridError::InvalidFlightPath(_))
+        ));
+    }
     assert!(matches!(
         FlightTimeGrid::new(&[350.0, 349.0], T0_US, FLIGHT_PATH_M, constant),
         Err(FlightTimeGridError::InvalidTimeEdges)
