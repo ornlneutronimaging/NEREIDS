@@ -15,7 +15,9 @@ const E_MAX_EV: f64 = 200.0;
 const COUNTS_PER_US: f64 = 1.0e4;
 const BOUND: f64 = 0.01;
 const MAX_HALVINGS: usize = 6;
-const SIMULATOR_STEP_US: f64 = 1.0 / 32.0;
+const SIMULATOR_STEP_US: f64 = 1.0 / 16.0;
+const PATH_PER_SHIFT_M_PER_US: f64 = 0.05;
+const FARTHEST_SHIFT_US: f64 = 100.0;
 
 fn edges() -> Vec<f64> {
     (350..=470).map(f64::from).collect()
@@ -123,16 +125,8 @@ fn simulated(
 }
 
 #[test]
-fn the_grid_a_halving_accepts_matches_the_simulator_at_a_later_t0_and_longer_path() {
-    let (t0_us, flight_path_m) = (T0_US + 0.05, FLIGHT_PATH_M + 0.05);
-    let stretch = flight_path_m / FLIGHT_PATH_M;
-    for (name, pulse) in pulses() {
-        let expected = simulated(&pulse, SIMULATOR_STEP_US, t0_us, flight_path_m);
-        let simulator_spread = spread(
-            &simulated(&pulse, 2.0 * SIMULATOR_STEP_US, t0_us, flight_path_m),
-            &expected,
-        );
-        assert!(simulator_spread <= BOUND / 100.0, "{name}");
+fn the_grid_a_halving_accepts_matches_the_simulator_as_far_as_it_covers() {
+    for ((name, pulse), sign) in pulses().into_iter().zip([1.0, -1.0].into_iter().cycle()) {
         let grids: Vec<FlightTimeGrid> = successors(
             Some(FlightTimeGrid::new(&edges(), T0_US, FLIGHT_PATH_M, &pulse).expect(name)),
             |g| Some(g.halved().expect("halved grid")),
@@ -156,11 +150,41 @@ fn the_grid_a_halving_accepts_matches_the_simulator_at_a_later_t0_and_longer_pat
             .windows(2)
             .position(|pair| spread(&pair[0], &pair[1]) <= BOUND)
             .expect(name)];
+        let at = |shift_us: f64| {
+            (
+                T0_US + sign * shift_us,
+                FLIGHT_PATH_M + sign * PATH_PER_SHIFT_M_PER_US * shift_us,
+            )
+        };
+        let covers = |shift_us: f64| {
+            let (t0_us, flight_path_m) = at(shift_us);
+            accepted.covers(t0_us, flight_path_m).expect("covers")
+        };
+        let (mut inside, mut outside) = (0.0, FARTHEST_SHIFT_US);
+        for _ in 0..40 {
+            let middle = 0.5 * (inside + outside);
+            if covers(middle) {
+                inside = middle;
+            } else {
+                outside = middle;
+            }
+        }
+        let (t0_us, flight_path_m) = at(inside);
+        let expected = simulated(&pulse, SIMULATOR_STEP_US, t0_us, flight_path_m);
+        let simulator_spread = spread(
+            &simulated(&pulse, 2.0 * SIMULATOR_STEP_US, t0_us, flight_path_m),
+            &expected,
+        );
+        assert!(simulator_spread <= BOUND / 100.0, "{name}");
         let predicted = accepted
             .rows_at(t0_us, flight_path_m)
             .expect("rows")
-            .predict(&beam(accepted, stretch))
+            .predict(&beam(accepted, flight_path_m / FLIGHT_PATH_M))
             .expect("one value per grid point");
-        assert!(spread(&predicted, &expected) <= BOUND, "{name}");
+        let spread = spread(&predicted, &expected);
+        assert!(
+            spread <= BOUND,
+            "{name} at {t0_us} µs, {flight_path_m} m: {spread}"
+        );
     }
 }

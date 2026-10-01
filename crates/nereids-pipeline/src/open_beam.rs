@@ -31,6 +31,20 @@ pub struct Calibration {
     pub pulse: Arc<IkedaCarpenter>,
 }
 
+impl Calibration {
+    pub(crate) fn energy_scale(&self) -> Result<(FitParameter, FitParameter), PipelineError> {
+        Ok((
+            self.t0_us
+                .parameter("t0", f64::NEG_INFINITY..=f64::INFINITY, "any real number")?,
+            self.flight_path_m.parameter(
+                "flight path",
+                f64::MIN_POSITIVE..=f64::INFINITY,
+                "positive",
+            )?,
+        ))
+    }
+}
+
 /// The fitted open beam.
 #[derive(Debug, Clone)]
 pub struct OpenBeamFit {
@@ -120,11 +134,12 @@ pub fn fit_open_beam(
     calibration: &Calibration,
     open_live: Option<&[f64]>,
 ) -> Result<OpenBeamFit, PipelineError> {
-    let t0_us = calibration.t0_us.start();
+    let (t0, flight_path) = calibration.energy_scale()?;
+    let t0_us = t0.value;
     let grid = Arc::new(FlightTimeGrid::new(
         time_edges_us,
         t0_us,
-        calibration.flight_path_m.start(),
+        flight_path.value,
         &calibration.pulse,
     )?);
     validate_counts("open-beam", open_counts, time_edges_us.len() - 1)?;
@@ -318,6 +333,7 @@ fn fit_beam(
                 live,
             })
         },
+        |_, _| Ok(true),
     )?;
     Ok(Candidate {
         beam: start.with_coefficients(&fit.result.params),
@@ -342,6 +358,7 @@ pub(crate) fn fit_on_halved_grids<M: FitModel>(
     dispersion: &[f64],
     priors: &[Prior],
     model_on: impl Fn(&Arc<FlightTimeGrid>) -> Result<M, PipelineError>,
+    holds: impl Fn(&FlightTimeGrid, &[f64]) -> Result<bool, PipelineError>,
 ) -> Result<GridFit, PipelineError> {
     let dispersed: Vec<f64> = observed
         .iter()
@@ -375,7 +392,7 @@ pub(crate) fn fit_on_halved_grids<M: FitModel>(
         let coarse_grid = std::mem::replace(&mut grid, finer);
         coarse = fine;
         halvings += 1;
-        if spread <= BOUND || !converged {
+        if spread <= BOUND || !converged || !holds(&coarse_grid, &result.params)? {
             return Ok(GridFit {
                 result,
                 converged,

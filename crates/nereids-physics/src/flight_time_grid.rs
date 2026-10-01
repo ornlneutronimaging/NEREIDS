@@ -108,13 +108,13 @@ impl Rows {
     fn new(
         step_us: f64,
         bins: usize,
-        rows: Vec<Result<Vec<f64>, ResolutionParseError>>,
+        rows: Vec<Result<Vec<(usize, f64)>, ResolutionParseError>>,
     ) -> Result<Self, FlightTimeGridError> {
         let mut row_offsets = vec![0];
         let mut columns = Vec::new();
         let mut values = Vec::new();
         for row in rows {
-            for (k, v) in row?.into_iter().enumerate().filter(|&(_, v)| v != 0.0) {
+            for (k, v) in row? {
                 columns.push(k);
                 values.push(v);
             }
@@ -191,53 +191,8 @@ impl FlightTimeGrid {
         {
             return Err(FlightTimeGridError::InvalidTimeEdges);
         }
-        if !t0_us.is_finite() {
-            return Err(FlightTimeGridError::InvalidTimingOffset(t0_us));
-        }
-        if !(flight_path_m.is_finite() && flight_path_m > 0.0) {
-            return Err(FlightTimeGridError::InvalidFlightPath(flight_path_m));
-        }
-        let references = pulse.ref_energies();
-        let (e_min, e_max) = (references[0], references[references.len() - 1]);
-        let params = pulse.params();
-        let change = |law: &EnergyLaw| law.eval(e_max) - law.eval(e_min);
-        for (parameter, lengthens) in [
-            ("α", change(&params.alpha) < 0.0),
-            (
-                "β",
-                change(&params.beta) < 0.0 && params.r.eval(e_min) > 0.0,
-            ),
-            ("R", change(&params.r) > 0.0),
-        ] {
-            if lengthens {
-                return Err(FlightTimeGridError::LengthensWithEnergy { parameter });
-            }
-        }
-        let clock = TOF_FACTOR * flight_path_m;
-        let energy = |u: f64| (clock / u).powi(2);
-        let first_edge = time_edges_us[0] - t0_us;
-        let last_edge = time_edges_us[time_edges_us.len() - 1] - t0_us;
-        let latest = |u: f64| {
-            pulse
-                .delays_us(energy(u))
-                .map(|(_, last)| u + last - first_edge)
-        };
-        let earliest = |u: f64| {
-            pulse
-                .delays_us(energy(u))
-                .map(|(first, _)| u + first - last_edge)
-        };
-        let (fastest, slowest) = (clock / e_max.sqrt(), clock / e_min.sqrt());
-        let (Some(u_lo), Some(u_hi)) = (
-            crossing(&latest, fastest, slowest)?,
-            crossing(&earliest, fastest, slowest)?,
-        ) else {
-            return Err(FlightTimeGridError::OutsideCalibration {
-                low_ev: e_min,
-                high_ev: e_max,
-            });
-        };
-
+        let (u_lo, u_hi) = range_us(time_edges_us, t0_us, flight_path_m, pulse)?;
+        let energy = |u: f64| (TOF_FACTOR * flight_path_m / u).powi(2);
         let rise = pulse
             .rise_us(energy(u_lo))?
             .min(pulse.rise_us(energy(u_hi))?);
@@ -251,6 +206,77 @@ impl FlightTimeGrid {
         )
     }
 
+    /// Whether the grid's points, arriving as [`Self::rows_at`] places them,
+    /// cover every flight time whose neutrons can reach the bins when the
+    /// timing offset is `t0_us` and the flight path `flight_path_m`, to within
+    /// one step at each end.
+    ///
+    /// # Errors
+    /// As [`Self::new`] for that timing offset and flight path.
+    pub fn covers(&self, t0_us: f64, flight_path_m: f64) -> Result<bool, FlightTimeGridError> {
+        let (u_lo, u_hi) = range_us(&self.time_edges_us, t0_us, flight_path_m, &self.pulse)?;
+        let scale = self.flight_path_m / flight_path_m;
+        Ok(u_lo * scale >= self.range_us.0 - self.step_us
+            && u_hi * scale <= self.range_us.1 + self.step_us)
+    }
+}
+
+fn range_us(
+    time_edges_us: &[f64],
+    t0_us: f64,
+    flight_path_m: f64,
+    pulse: &Arc<IkedaCarpenter>,
+) -> Result<(f64, f64), FlightTimeGridError> {
+    if !t0_us.is_finite() {
+        return Err(FlightTimeGridError::InvalidTimingOffset(t0_us));
+    }
+    if !(flight_path_m.is_finite() && flight_path_m > 0.0) {
+        return Err(FlightTimeGridError::InvalidFlightPath(flight_path_m));
+    }
+    let references = pulse.ref_energies();
+    let (e_min, e_max) = (references[0], references[references.len() - 1]);
+    let params = pulse.params();
+    let change = |law: &EnergyLaw| law.eval(e_max) - law.eval(e_min);
+    for (parameter, lengthens) in [
+        ("α", change(&params.alpha) < 0.0),
+        (
+            "β",
+            change(&params.beta) < 0.0 && params.r.eval(e_min) > 0.0,
+        ),
+        ("R", change(&params.r) > 0.0),
+    ] {
+        if lengthens {
+            return Err(FlightTimeGridError::LengthensWithEnergy { parameter });
+        }
+    }
+    let clock = TOF_FACTOR * flight_path_m;
+    let energy = |u: f64| (clock / u).powi(2);
+    let first_edge = time_edges_us[0] - t0_us;
+    let last_edge = time_edges_us[time_edges_us.len() - 1] - t0_us;
+    let latest = |u: f64| {
+        pulse
+            .delays_us(energy(u))
+            .map(|(_, last)| u + last - first_edge)
+    };
+    let earliest = |u: f64| {
+        pulse
+            .delays_us(energy(u))
+            .map(|(first, _)| u + first - last_edge)
+    };
+    let (fastest, slowest) = (clock / e_max.sqrt(), clock / e_min.sqrt());
+    let (Some(u_lo), Some(u_hi)) = (
+        crossing(&latest, fastest, slowest)?,
+        crossing(&earliest, fastest, slowest)?,
+    ) else {
+        return Err(FlightTimeGridError::OutsideCalibration {
+            low_ev: e_min,
+            high_ev: e_max,
+        });
+    };
+    Ok((u_lo, u_hi))
+}
+
+impl FlightTimeGrid {
     fn build(
         time_edges_us: &[f64],
         (t0_us, flight_path_m): (f64, f64),
@@ -295,10 +321,15 @@ impl FlightTimeGrid {
 
     /// The probability that each grid point's neutrons are counted in each
     /// bin when the timing offset is `t0_us` and the flight path
-    /// `flight_path_m`, with the step each point then stands for.
+    /// `flight_path_m`, with the step each point then stands for.  Neutrons
+    /// from flight times the grid does not [cover](Self::covers) there are not
+    /// counted.
     ///
     /// # Errors
-    /// [`FlightTimeGridError::Pulse`] if the pulse cannot be evaluated there.
+    /// [`FlightTimeGridError::InvalidTimingOffset`] or
+    /// [`FlightTimeGridError::InvalidFlightPath`] unless `t0_us` is finite and
+    /// `flight_path_m` finite and positive; [`FlightTimeGridError::Pulse`] if
+    /// the pulse cannot be evaluated there.
     pub fn rows_at(&self, t0_us: f64, flight_path_m: f64) -> Result<Rows, FlightTimeGridError> {
         self.rows_with(t0_us, flight_path_m, |energy, arrival| {
             self.pulse
@@ -328,12 +359,24 @@ impl FlightTimeGrid {
         flight_path_m: f64,
         row: impl Fn(f64, f64) -> Result<Vec<f64>, ResolutionParseError> + Sync,
     ) -> Result<Rows, FlightTimeGridError> {
+        if !t0_us.is_finite() {
+            return Err(FlightTimeGridError::InvalidTimingOffset(t0_us));
+        }
+        if !(flight_path_m.is_finite() && flight_path_m > 0.0) {
+            return Err(FlightTimeGridError::InvalidFlightPath(flight_path_m));
+        }
         let scale = flight_path_m / self.flight_path_m;
         let clock = TOF_FACTOR * self.flight_path_m;
-        let rows: Vec<Result<Vec<f64>, ResolutionParseError>> = self
+        let rows: Vec<Result<Vec<(usize, f64)>, ResolutionParseError>> = self
             .energies_ev()
             .par_iter()
-            .map(|&energy| row(energy, t0_us + scale * (clock / energy.sqrt())))
+            .map(|&energy| {
+                Ok(row(energy, t0_us + scale * (clock / energy.sqrt()))?
+                    .into_iter()
+                    .enumerate()
+                    .filter(|&(_, v)| v != 0.0)
+                    .collect())
+            })
             .collect();
         Rows::new(self.step_us * scale, self.time_edges_us.len() - 1, rows)
     }
@@ -356,13 +399,14 @@ impl FlightTimeGrid {
         self.flight_path_m
     }
 
-    /// `(u_lo, u_hi)`, the flight-time range in µs.
+    /// `(u_lo, u_hi)`, the flight-time range in µs at the timing offset and
+    /// flight path the grid was built at.
     #[must_use]
     pub fn range_us(&self) -> (f64, f64) {
         self.range_us
     }
 
-    /// The grid step in µs.
+    /// The grid step in µs at the flight path the grid was built at.
     #[must_use]
     pub fn step_us(&self) -> f64 {
         self.step_us

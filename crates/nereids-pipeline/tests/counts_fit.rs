@@ -1523,7 +1523,8 @@ fn the_timing_offset_and_flight_path_are_recovered_from_starts_on_either_side() 
     )];
     let (open, transmitted) = expected(&setup, &beam(1.0e6), &sample);
     let counts = (rounded(&open), rounded(&transmitted));
-    let (t0_offset, path_offset) = (0.05, 0.003);
+    let precision = 1.0 / open.iter().copied().fold(f64::INFINITY, f64::min).sqrt();
+    let (t0_offset, path_offset) = (1.5, 0.08);
     for sign in [1.0, -1.0] {
         let calibration = Calibration {
             t0_us: Value::Fitted(setup.t0_us + sign * t0_offset),
@@ -1546,5 +1547,19 @@ fn the_timing_offset_and_flight_path_are_recovered_from_starts_on_either_side() 
             let pull = (estimate - truth) / sd;
             assert!(pull.abs() <= BOUND.sqrt(), "{sign} {i}: {pull}");
         }
+        let beam_error = setup
+            .edges
+            .iter()
+            .map(|&t| {
+                (fit.beam.per_us(t - (setup.t0_us + sign * t0_offset))
+                    / beam(1.0e6)(t - setup.t0_us)
+                    - 1.0)
+                    .abs()
+            })
+            .fold(0.0, f64::max);
+        assert!(
+            beam_error <= precision,
+            "{sign}: {beam_error} vs {precision}"
+        );
     }
 }

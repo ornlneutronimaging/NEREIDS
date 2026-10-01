@@ -1,6 +1,7 @@
-//! The areal densities of a sample's isotopes, its temperature, and the
-//! sample run's normalization and background, fitted to the counts of an
-//! open-beam run and a sample run recorded in the same time bins.
+//! The areal densities of a sample's isotopes, its temperature, the sample
+//! run's normalization and background, and the timing offset and flight path,
+//! fitted to the counts of an open-beam run and a sample run recorded in the
+//! same time bins.
 
 use std::borrow::Cow;
 use std::cell::RefCell;
@@ -48,14 +49,7 @@ pub enum Value {
 }
 
 impl Value {
-    pub(crate) fn start(self) -> f64 {
-        match self {
-            Self::Known(v) | Self::Fitted(v) | Self::Measured { value: v, .. } => v,
-            Self::Within { start, .. } => start,
-        }
-    }
-
-    fn parameter(
+    pub(crate) fn parameter(
         self,
         name: impl Into<Cow<'static, str>>,
         range: RangeInclusive<f64>,
@@ -129,7 +123,8 @@ pub struct Measurement {
     pub temperature_k: Value,
 }
 
-/// The fitted densities, temperature, normalization and background.
+/// The fitted densities, temperature, normalization, background, timing offset
+/// and flight path.
 #[derive(Debug, Clone)]
 pub struct CountsFit {
     /// Areal density of each isotope in atoms/barn, in the order given: the
@@ -148,18 +143,19 @@ pub struct CountsFit {
     pub flight_path_m: f64,
     /// Covariance of the fitted quantities among the densities, in the order
     /// given, the temperature, the normalization, `b0`, `b1`, `b2`, `t0` and
-    /// the flight path, in that order: the inverse of the information at the fit, each run's
-    /// expected information over its overdispersion plus `1/sd²` for each
-    /// measured quantity.  The row and column of a quantity on one of its
-    /// bounds, or that neither the counts nor a measurement determine, are
-    /// NaN, and the other entries are
-    /// conditional on every quantity that ended on a bound being held there;
-    /// every entry is NaN when a fitted temperature ends at 1 K or 5000 K.
-    /// `None` when the fit did not converge.
+    /// the flight path, in that order: the inverse of the information at the
+    /// fit, each run's expected information over its overdispersion plus
+    /// `1/sd²` for each measured quantity.  The row and column of a quantity
+    /// on one of its bounds, or that neither the counts nor a measurement
+    /// determine, are NaN, and the other entries are conditional on every
+    /// quantity that ended on a bound being held there; every entry is NaN
+    /// when a fitted temperature ends at 1 K or 5000 K.  `None` when the fit
+    /// did not converge.
     ///
-    /// The error bars take the pulse passed to [`fit_counts`] as exact.  They are not reliable where the counts barely determine a
-    /// fitted temperature or barely separate it from a density, as at few
-    /// counts or for a thin sample at modest counts.
+    /// The error bars take the pulse, and every known quantity, as exact.
+    /// They are not reliable where the counts barely determine a fitted
+    /// temperature or barely separate it from a density, as at few counts or
+    /// for a thin sample at modest counts.
     pub covariance: Option<FlatMatrix>,
     /// Whether each fitted quantity, in the covariance's order, ended on one
     /// of its bounds.
@@ -173,8 +169,9 @@ pub struct CountsFit {
     /// Each run's half Poisson deviance over the overdispersion it was
     /// weighted with, summed over both runs at the fit.
     pub deviance: f64,
-    /// Whether the fitter converged, the sample run's overdispersion settled
-    /// and the grid met its rule at the fitted temperature.
+    /// Whether the fitter converged, the sample run's overdispersion settled,
+    /// the grid met its rule at the fitted temperature and its flight times
+    /// cover the fitted `t0` and flight path.
     pub converged: bool,
     /// Variance of the counts of the open-beam run, then of the sample run,
     /// over their Poisson variance: the value each run's counts are divided by
@@ -200,12 +197,14 @@ pub struct CountsFit {
     pub points: usize,
     /// How many times the grid of
     /// [`FlightTimeGrid::new`](nereids_physics::flight_time_grid::FlightTimeGrid::new)
-    /// was halved to reach it.
+    /// was halved to reach it; that grid is built at the starting `t0` and
+    /// flight path, or at fitted ones when the fit rebuilt it.
     pub halvings: usize,
 }
 
 /// Fit the areal densities, temperature, normalization and background terms
-/// of `measurement` that are not known to the raw counts of both runs.  On a
+/// of `measurement`, and the timing offset and flight path of `calibration`,
+/// that are not known, to the raw counts of both runs.  On a
 /// uniform grid of flight times `u_i`, energies `E_i` and step `w`, the counts
 /// in bin `k` are
 ///
@@ -230,10 +229,10 @@ pub struct CountsFit {
 /// starting from the open-beam fit.
 ///
 /// The [`Calibration`]'s `t0` and flight path `L` are fitted unless known.
-/// Grid point `i` keeps its energy and arrives at `t0 + (L/L₀)·u_i`, with
-/// `L₀` the starting flight path and `u_i` the point's flight time at the
-/// starting `t0` and `L₀`, standing for `(L/L₀)·w` of flight time; the beam
-/// is a function of the arrival time less the starting `t0`.
+/// The grid is built at a `t0₀` and `L₀`, at first the starting ones.  Grid
+/// point `i` keeps its energy and arrives at `t0 + (L/L₀)·u_i`, with `u_i`
+/// its flight time at `t0₀` and `L₀`, standing for `(L/L₀)·w` of flight time;
+/// the beam is a function of the arrival time less the starting `t0`.
 ///
 /// The grid's first step is at most half the narrowest Doppler full width at
 /// half maximum, in flight time, of any resonance inside its energy span, at
@@ -249,10 +248,13 @@ pub struct CountsFit {
 /// overdispersion, and the sample run first with the same.  The fit is
 /// repeated from its answer while the sample run's overdispersion, measured on
 /// the bins the first fit predicts at least one count, changes by more than
-/// 1%, or the coarser grid of the accepted pair is wider than the rule at the
-/// fitted temperature; the next first grid is the finer of that pair's coarser
-/// grid and the rule's grid at the fitted temperature.  After twenty fits it
-/// is reported unconverged.
+/// 1%, the coarser grid of the accepted pair is wider than the rule at the
+/// fitted temperature, or its flight times miss, by more than one step at
+/// either end, those the fitted `t0` and `L` need.  The next first grid is the
+/// finer of that pair's coarser grid and the rule's grid at the fitted
+/// temperature, or, when the flight times miss, the rule's grid of a grid
+/// built at the fitted `t0` and `L`.  After twenty fits it is reported
+/// unconverged.
 ///
 /// The fitter finds a local minimum.  A thin sample hotter than about
 /// 1,500 K fitted from room temperature can end in a false one, reported
@@ -372,16 +374,9 @@ pub fn fit_counts(
                 .map_err(|e| PipelineError::InvalidParameter(e.to_string()))?,
         );
     }
-    let t0 =
-        calibration
-            .t0_us
-            .parameter("t0", f64::NEG_INFINITY..=f64::INFINITY, "any real number")?;
-    let flight_path = calibration.flight_path_m.parameter(
-        "flight path",
-        f64::MIN_POSITIVE..=f64::INFINITY,
-        "positive",
-    )?;
-    let grid = FlightTimeGrid::new(
+    let (t0, flight_path) = calibration.energy_scale()?;
+    let beam_origin_us = t0.value;
+    let mut base = FlightTimeGrid::new(
         time_edges_us,
         t0.value,
         flight_path.value,
@@ -393,37 +388,44 @@ pub fn fit_counts(
     let open_live = validate_live("open-beam", open_live.as_deref(), bins)?;
     let sample_live = validate_live("sample", sample_live.as_deref(), bins)?;
 
-    let energies = grid.energies_ev();
-    let span_ev = (energies[energies.len() - 1], energies[0]);
-    let mut resonances_in_span = Vec::with_capacity(isotopes.len());
-    for ((isotope, _), doppler) in isotopes.iter().zip(&dopplers) {
-        let read = (
-            (span_ev.0.sqrt() - SUPPORT_X * doppler.u())
-                .max(0.0)
-                .powi(2),
-            (span_ev.1.sqrt() + SUPPORT_X * doppler.u()).powi(2),
-        );
-        if !isotope.ranges.iter().any(|range| {
-            range.is_evaluable() && range.energy_low <= read.0 && read.1 <= range.energy_high
-        }) {
-            return invalid(format!(
-                "the Doppler-broadened cross section of {} reads {:.6e}–{:.6e} eV, which no \
-                 single one of its evaluated (SLBW, MLBW or Reich–Moore) resolved ranges holds",
-                isotope.isotope, read.0, read.1
-            ));
+    let in_span = |grid: &FlightTimeGrid| -> Result<Vec<Vec<f64>>, PipelineError> {
+        let energies = grid.energies_ev();
+        let span_ev = (energies[energies.len() - 1], energies[0]);
+        let mut resonances_in_span = Vec::with_capacity(isotopes.len());
+        for ((isotope, _), doppler) in isotopes.iter().zip(&dopplers) {
+            let read = (
+                (span_ev.0.sqrt() - SUPPORT_X * doppler.u())
+                    .max(0.0)
+                    .powi(2),
+                (span_ev.1.sqrt() + SUPPORT_X * doppler.u()).powi(2),
+            );
+            if !isotope.ranges.iter().any(|range| {
+                range.is_evaluable() && range.energy_low <= read.0 && read.1 <= range.energy_high
+            }) {
+                return Err(PipelineError::InvalidParameter(format!(
+                    "the Doppler-broadened cross section of {} reads {:.6e}–{:.6e} eV, which no \
+                     single one of its evaluated (SLBW, MLBW or Reich–Moore) resolved ranges holds",
+                    isotope.isotope, read.0, read.1
+                )));
+            }
+            resonances_in_span.push(
+                resonance_center_energies(&[isotope])
+                    .into_iter()
+                    .filter(|e| (span_ev.0..=span_ev.1).contains(e))
+                    .collect::<Vec<f64>>(),
+            );
         }
-        resonances_in_span.push(
-            resonance_center_energies(&[isotope])
-                .into_iter()
-                .filter(|e| (span_ev.0..=span_ev.1).contains(e))
-                .collect::<Vec<f64>>(),
-        );
-    }
-    let clock = TOF_FACTOR * flight_path.value;
+        Ok(resonances_in_span)
+    };
+    let mut resonances_in_span = in_span(&base)?;
     let half_maximum = 2.0 * std::f64::consts::LN_2.sqrt();
-    let narrowest_us = |temperature_k: f64| -> Result<f64, PipelineError> {
+    let narrowest_us = |grid: &FlightTimeGrid,
+                        resonances_in_span: &[Vec<f64>],
+                        temperature_k: f64|
+     -> Result<f64, PipelineError> {
+        let clock = TOF_FACTOR * grid.flight_path_m();
         let mut narrowest = f64::INFINITY;
-        for ((isotope, _), energies) in isotopes.iter().zip(&resonances_in_span) {
+        for ((isotope, _), energies) in isotopes.iter().zip(resonances_in_span) {
             let doppler = DopplerParams::new(temperature_k, isotope.awr)
                 .map_err(|e| PipelineError::InvalidParameter(e.to_string()))?;
             for &energy in energies {
@@ -433,8 +435,11 @@ pub fn fit_counts(
         }
         Ok(narrowest)
     };
-    let first_grid = |temperature_k: f64| -> Result<(Arc<FlightTimeGrid>, usize), PipelineError> {
-        let rule_us = 0.5 * narrowest_us(temperature_k)?;
+    let first_grid = |grid: &FlightTimeGrid,
+                      resonances_in_span: &[Vec<f64>],
+                      temperature_k: f64|
+     -> Result<(Arc<FlightTimeGrid>, usize), PipelineError> {
+        let rule_us = 0.5 * narrowest_us(grid, resonances_in_span, temperature_k)?;
         let mut first = grid.clone();
         let mut halvings = 0;
         while first.step_us() > rule_us {
@@ -469,7 +474,11 @@ pub fn fit_counts(
             sd,
         })
         .collect();
-    let mut first = first_grid(parameters.params[layout.temperature].value)?;
+    let mut first = first_grid(
+        &base,
+        &resonances_in_span,
+        parameters.params[layout.temperature].value,
+    )?;
     let mut weights = [open.overdispersion.unwrap_or(1.0); 2];
     let mut sample_measured = false;
     let mut noise_bins = None;
@@ -485,29 +494,53 @@ pub fn fit_counts(
             &priors,
             |grid| {
                 Ok(Recorded {
-                    model: TwoRunModel::new(grid, &open.beam, &resonances, *charge_ratio),
+                    model: TwoRunModel::new(
+                        grid,
+                        &open.beam,
+                        &resonances,
+                        *charge_ratio,
+                        beam_origin_us,
+                    ),
                     live: &live,
                 })
             },
+            |grid, params| Ok(grid.covers(params[layout.t0], params[layout.flight_path])?),
         )?;
-        let fitted_k = fit.result.params[layout.temperature];
+        let fitted = |index: usize| fit.result.params[index];
+        let fitted_k = fitted(layout.temperature);
         let noise_bins = noise_bins.get_or_insert_with(|| counted(&fit, bins..2 * bins));
         let sample = overdispersion(&observed, &fit, noise_bins);
         let next = sample.unwrap_or(weights[0]);
         let settled = (next / weights[1] - 1.0).abs() <= SETTLED_OVERDISPERSION;
-        let resolved = 2.0 * fit.step_us <= 0.5 * narrowest_us(fitted_k)?;
-        if !fit.converged || (settled && resolved) || passes == MOST_PASSES {
+        let resolved =
+            2.0 * fit.step_us <= 0.5 * narrowest_us(&base, &resonances_in_span, fitted_k)?;
+        let covered = fit.converged
+            && fit
+                .coarse
+                .covers(fitted(layout.t0), fitted(layout.flight_path))?;
+        if !fit.converged || (settled && resolved && covered) || passes == MOST_PASSES {
             let weighted = [
                 open.overdispersion,
                 (sample_measured || (settled && sample.is_some())).then_some(weights[1]),
             ];
-            break (fit, first.1, weighted, settled && resolved);
+            break (fit, first.1, weighted, settled && resolved && covered);
         }
-        let resumed = (Arc::clone(&fit.coarse), first.1 + fit.halvings - 1);
-        first = [first_grid(fitted_k)?, resumed]
-            .into_iter()
-            .min_by(|a, b| a.0.step_us().total_cmp(&b.0.step_us()))
-            .expect("two grids");
+        if covered {
+            let resumed = (Arc::clone(&fit.coarse), first.1 + fit.halvings - 1);
+            first = [first_grid(&base, &resonances_in_span, fitted_k)?, resumed]
+                .into_iter()
+                .min_by(|a, b| a.0.step_us().total_cmp(&b.0.step_us()))
+                .expect("two grids");
+        } else {
+            base = FlightTimeGrid::new(
+                time_edges_us,
+                fitted(layout.t0),
+                fitted(layout.flight_path),
+                &calibration.pulse,
+            )?;
+            resonances_in_span = in_span(&base)?;
+            first = first_grid(&base, &resonances_in_span, fitted_k)?;
+        }
         weights[1] = next;
         sample_measured = sample.is_some();
     };
@@ -651,6 +684,7 @@ impl Layout {
 struct TwoRunModel {
     grid: Arc<FlightTimeGrid>,
     spline: BeamSpline,
+    beam_origin_us: f64,
     isotopes: Arc<[ResonanceData]>,
     energies: Vec<f64>,
     shapes: [Vec<f64>; 3],
@@ -692,6 +726,7 @@ impl TwoRunModel {
         beam: &BeamSpline,
         isotopes: &Arc<[ResonanceData]>,
         charge_ratio: f64,
+        beam_origin_us: f64,
     ) -> Self {
         let mut energies = grid.energies_ev();
         let shapes = [
@@ -703,6 +738,7 @@ impl TwoRunModel {
         Self {
             grid: Arc::clone(grid),
             spline: beam.clone(),
+            beam_origin_us,
             isotopes: Arc::clone(isotopes),
             energies,
             shapes,
@@ -765,7 +801,10 @@ impl TwoRunModel {
                 grid.rows_at(t0_us, flight_path_m)
                     .map_err(|e| FittingError::EvaluationFailed(e.to_string()))?
             };
-            let (shift, stretch) = (t0_us - grid.t0_us(), flight_path_m / grid.flight_path_m());
+            let (shift, stretch) = (
+                t0_us - self.beam_origin_us,
+                flight_path_m / grid.flight_path_m(),
+            );
             let abscissae: Vec<f64> = grid
                 .flight_times_us()
                 .iter()
@@ -972,7 +1011,7 @@ mod tests {
             .chain([3.0e-4, 5.0e-4, 300.0, 0.93, 0.05, 0.5, -0.01])
             .chain([T0_US + 0.05, FLIGHT_PATH_M + 0.003])
             .collect();
-        let model = TwoRunModel::new(grid, &beam, &isotopes, 1.2);
+        let model = TwoRunModel::new(grid, &beam, &isotopes, 1.2, T0_US);
         let live: Vec<f64> = (0..model.evaluate(&params).expect("counts").len())
             .map(|k| 0.9 + 0.1 * (0.3 * k as f64).sin())
             .collect();
@@ -1028,7 +1067,7 @@ mod tests {
             synthetic_isotope(74, 182, 20.3, 0.01, 0.06),
         ]);
         let (charge_ratio, normalization) = (1.2, 0.93);
-        let model = TwoRunModel::new(&grid, &beam, &isotopes, charge_ratio);
+        let model = TwoRunModel::new(&grid, &beam, &isotopes, charge_ratio, T0_US);
         let counts = |background: [f64; 3]| {
             let params: Vec<f64> = beam
                 .coefficients()
