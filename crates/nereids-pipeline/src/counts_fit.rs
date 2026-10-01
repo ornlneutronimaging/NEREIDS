@@ -11,6 +11,7 @@ use nereids_endf::resonance::ResonanceData;
 use nereids_fitting::error::FittingError;
 use nereids_fitting::lm::{FitModel, FlatMatrix};
 use nereids_fitting::parameters::{FitParameter, ParameterSet};
+use nereids_fitting::poisson::Prior;
 use nereids_physics::continuous_doppler::{SUPPORT_X, broaden_with_derivative};
 use nereids_physics::doppler::DopplerParams;
 use nereids_physics::flight_time_grid::FlightTimeGrid;
@@ -30,14 +31,20 @@ use crate::pipeline::TEMPERATURE_BOUNDS_K;
 /// under the model.
 pub const NEGLIGIBLE_PREDICTION: f64 = 1e-10;
 
+const SETTLED_OVERDISPERSION: f64 = 0.01;
+
+const MOST_PASSES: usize = 20;
+
 /// A quantity the fit holds at a known value, fits from a starting value
-/// over the quantity's range, or fits from `start` within `lower..=upper`
-/// inside that range.
+/// over the quantity's range, fits from `start` within `lower..=upper` inside
+/// that range, or fits over the range from a `value` measured elsewhere with
+/// standard deviation `sd`, a Gaussian prior on it.
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub enum Value {
     Known(f64),
     Fitted(f64),
     Within { start: f64, lower: f64, upper: f64 },
+    Measured { value: f64, sd: f64 },
 }
 
 impl Value {
@@ -49,7 +56,9 @@ impl Value {
     ) -> Result<FitParameter, PipelineError> {
         let name = name.into();
         let (value, lower, upper) = match self {
-            Self::Known(v) | Self::Fitted(v) => (v, *range.start(), *range.end()),
+            Self::Known(v) | Self::Fitted(v) | Self::Measured { value: v, .. } => {
+                (v, *range.start(), *range.end())
+            }
             Self::Within {
                 start,
                 lower,
@@ -60,12 +69,16 @@ impl Value {
             && range.contains(&lower)
             && lower < upper
             && range.contains(&upper)
-            && (lower..=upper).contains(&value))
+            && (lower..=upper).contains(&value)
+            && !matches!(self, Self::Measured { sd, .. } if !(sd.is_finite() && sd > 0.0)))
         {
             return Err(PipelineError::InvalidParameter(match self {
                 Self::Within { .. } => format!(
                     "{name} must be {allowed}, with bounds lower < upper and a finite start \
                      between them; got {self:?}"
+                ),
+                Self::Measured { .. } => format!(
+                    "{name} must be finite and {allowed}, with a finite positive sd; got {self:?}"
                 ),
                 _ => format!("{name} must be finite and {allowed}; got {self:?}"),
             }));
@@ -102,8 +115,8 @@ pub struct Measurement {
     /// `b0` (dimensionless), `b1` in √eV and `b2` in 1/√eV of the background
     /// `b(E) = b0 + b1/√E + b2·√E`, each any real number.
     pub background: [Value; 3],
-    /// Each isotope in the sample with its areal density in atoms/barn, known
-    /// or fitted, at least 0.
+    /// Each isotope in the sample with its areal density in atoms/barn, known,
+    /// fitted or measured, at least 0.
     pub isotopes: Vec<(ResonanceData, Value)>,
     /// The sample's temperature in K, within 1–5000 K.
     pub temperature_k: Value,
@@ -124,9 +137,9 @@ pub struct CountsFit {
     pub background: [f64; 3],
     /// Covariance of the fitted quantities among the densities, in the order
     /// given, the temperature, the normalization, `b0`, `b1` and `b2`, in
-    /// that order: the inverse of the expected information at the fit,
-    /// scaled by `overdispersion`, or at the Poisson scale when that is
-    /// `None`.  The row and column of a quantity on one of its bounds, or
+    /// that order: the inverse of the information at the fit, each run's
+    /// expected information over its overdispersion plus `1/sd²` for each
+    /// measured quantity.  The row and column of a quantity on one of its bounds, or
     /// that the counts do not determine, are NaN, and the other entries are
     /// conditional on every quantity that ended on a bound being held there;
     /// every entry is NaN when a fitted temperature ends at 1 K or 5000 K.
@@ -146,15 +159,24 @@ pub struct CountsFit {
     /// Whether the open-beam fit chose its richest beam; see
     /// [`OpenBeamFit::at_limit`](crate::open_beam::OpenBeamFit::at_limit).
     pub beam_at_limit: bool,
-    /// Half the Poisson deviance of both runs at the fit.
+    /// Each run's half Poisson deviance over its overdispersion, summed over
+    /// both runs at the fit.
     pub deviance: f64,
-    /// Whether the fitter converged.
+    /// Whether the fitter converged and both overdispersions settled.
     pub converged: bool,
-    /// Variance of the counts of both runs over their Poisson variance, at
-    /// least 1, measured on the bins predicted at least one count.  `None`
-    /// when the fit did not converge or those bins do not outnumber the
-    /// fitted parameters.
-    pub overdispersion: Option<f64>,
+    /// Variance of the counts of the open-beam run, then of the sample run,
+    /// over their Poisson variance, at least 1, measured on the bins predicted
+    /// at least one count; each run's counts are weighted by its inverse in
+    /// the fit.  `None` for a run when the fit did not converge or the run
+    /// has less than one degree of freedom left, and that run is weighted
+    /// with 1.
+    pub overdispersion: [Option<f64>; 2],
+    /// For each measured quantity, in the covariance's order, its fitted value
+    /// less its measurement over the standard deviation of that difference,
+    /// `√(sd² − variance)`: near 0 ± 1 when the counts agree with the
+    /// measurement.  NaN for a quantity on a bound.  `None` when `covariance`
+    /// is.
+    pub measured_pulls: Option<Vec<f64>>,
     /// Step, in µs, of the fit's grid.
     pub step_us: f64,
     /// Number of points of that grid.
@@ -193,13 +215,19 @@ pub struct CountsFit {
 /// The grid's first step is at most half the narrowest Doppler full width at
 /// half maximum, in flight time, of any resonance inside its energy span, at
 /// the starting temperature; it is then halved until the counts of both runs
-/// meet [`BOUND`](crate::open_beam::BOUND).  When the coarser grid of that
-/// accepted pair is wider than the rule at the fitted temperature, the fit is
-/// repeated from its answer on a first grid built at the fitted temperature.
-/// The step is uniform, so a wide window whose span holds a narrow resonance
-/// at high energy, or a low fitted temperature, can exceed the grid's point
-/// cap; a temperature the counts barely determine can run to 1 K and refuse
-/// the fit that way.
+/// meet [`BOUND`](crate::open_beam::BOUND).  The step is uniform, so a wide
+/// window whose span holds a narrow resonance at high energy, or a low fitted
+/// temperature, can exceed the grid's point cap; a temperature the counts
+/// barely determine can run to 1 K and refuse the fit that way.
+///
+/// The fit minimizes each run's half Poisson deviance over its
+/// overdispersion, plus `½((x − value)/sd)²` for each [`Value::Measured`]
+/// quantity `x`.  The first fit weights both runs with 1.  The fit is repeated
+/// from its answer while either run's overdispersion changes by more than 1%,
+/// or the coarser grid of the accepted pair is wider than the rule at the
+/// fitted temperature; the next first grid is the finer of that pair's coarser
+/// grid and the rule's grid at the fitted temperature.  After twenty fits it
+/// is reported unconverged.
 ///
 /// The fitter finds a local minimum.  A thin sample hotter than about
 /// 1,500 K fitted from room temperature can end in a false one, reported
@@ -209,16 +237,16 @@ pub struct CountsFit {
 /// unconverged; with `b1` and `b2` known, `b0` bounded below by 0 ends on
 /// that bound, converged.
 ///
-/// The overdispersion scales the covariance; it assumes both runs share it
-/// and their bins are independent.
+/// The covariance assumes each run's bins are independent.
 ///
 /// # Errors
 /// [`PipelineError::ShapeMismatch`] unless each run has one count, and one
 /// live fraction when given, per bin;
 /// [`PipelineError::InvalidParameter`] if a count is not a whole non-negative
 /// number, a run has no counts, a live fraction is not in (0, 1], the charge
-/// ratio is not finite and positive, a known or starting value is not finite
-/// and in its quantity's range, bounds are not `lower < upper` in that range
+/// ratio is not finite and positive, a known, starting or measured value is
+/// not finite and in its quantity's range, a measured value's sd is not finite
+/// and positive, bounds are not `lower < upper` in that range
 /// with the start between them, there are no isotopes, an isotope is listed
 /// twice, an isotope's resonance data are not finite, or the energies its
 /// broadened cross section reads, at the known temperature or at the upper
@@ -250,6 +278,17 @@ pub fn fit_counts(
         temperature_k,
     } = measurement;
     let invalid = |message: String| Err(PipelineError::InvalidParameter(message));
+    let measured: Vec<(usize, f64, f64)> = isotopes
+        .iter()
+        .map(|(_, density)| density)
+        .chain([temperature_k, normalization])
+        .chain(background)
+        .enumerate()
+        .filter_map(|(offset, value)| match *value {
+            Value::Measured { value, sd } => Some((offset, value, sd)),
+            _ => None,
+        })
+        .collect();
     if !(charge_ratio.is_finite() && *charge_ratio > 0.0) {
         return invalid(format!(
             "the charge ratio must be finite and positive, got {charge_ratio}"
@@ -381,21 +420,53 @@ pub fn fit_counts(
     let resonances: Arc<[ResonanceData]> = isotopes.iter().map(|(data, _)| data.clone()).collect();
     let observed: Vec<f64> = open_counts.iter().chain(sample_counts).copied().collect();
     let live: Vec<f64> = open_live.into_iter().chain(sample_live).collect();
-    let mut rule_k = parameters.params[layout.temperature].value;
-    let (fit, rule_halvings) = loop {
-        let (first, rule_halvings) = first_grid(rule_k)?;
-        let fit = fit_on_halved_grids(&first, &mut parameters, &observed, |grid| {
-            Ok(Recorded {
-                model: TwoRunModel::new(grid, &open.beam, &resonances, *charge_ratio),
-                live: &live,
-            })
-        })?;
+    let priors: Vec<Prior> = measured
+        .iter()
+        .map(|&(offset, mean, sd)| Prior {
+            parameter: layout.densities + offset,
+            mean,
+            sd,
+        })
+        .collect();
+    let mut first = first_grid(parameters.params[layout.temperature].value)?;
+    let mut weights = [1.0; 2];
+    let mut passes = 0;
+    let (fit, rule_halvings, overdispersion, settled) = loop {
+        passes += 1;
+        let dispersion: Vec<f64> = (0..observed.len()).map(|k| weights[k / bins]).collect();
+        let fit = fit_on_halved_grids(
+            &first.0,
+            &mut parameters,
+            &observed,
+            &dispersion,
+            &priors,
+            |grid| {
+                Ok(Recorded {
+                    model: TwoRunModel::new(grid, &open.beam, &resonances, *charge_ratio),
+                    live: &live,
+                })
+            },
+        )?;
         let fitted_k = fit.result.params[layout.temperature];
-        if !fit.converged || 2.0 * fit.step_us <= 0.5 * narrowest_us(fitted_k)? {
-            break (fit, rule_halvings);
+        let measured =
+            [0, 1].map(|run| overdispersion(&observed, &fit, run * bins..(run + 1) * bins));
+        let settled = measured
+            .iter()
+            .zip(&weights)
+            .all(|(m, w)| (m.unwrap_or(1.0) / w - 1.0).abs() <= SETTLED_OVERDISPERSION);
+        let resolved = 2.0 * fit.step_us <= 0.5 * narrowest_us(fitted_k)?;
+        if !fit.converged || (settled && resolved) || passes == MOST_PASSES {
+            let weighted = [0, 1].map(|run| measured[run].map(|_| weights[run]));
+            break (fit, first.1, weighted, settled && resolved);
         }
-        rule_k = fitted_k;
+        let resumed = (Arc::clone(&fit.coarse), first.1 + fit.halvings - 1);
+        first = [first_grid(fitted_k)?, resumed]
+            .into_iter()
+            .min_by(|a, b| a.0.step_us().total_cmp(&b.0.step_us()))
+            .expect("two grids");
+        weights = measured.map(|m| m.unwrap_or(1.0));
     };
+    let converged = fit.converged && settled;
 
     if let Some((k, (&counts, &predicted))) =
         observed
@@ -415,15 +486,9 @@ pub fn fit_counts(
         });
     }
 
-    let overdispersion = overdispersion(&observed, &fit);
     let free = parameters.free_indices();
     let on_edge = free.contains(&layout.temperature)
         && [t_low, t_high].contains(&fit.result.params[layout.temperature]);
-    let scale = if on_edge {
-        f64::NAN
-    } else {
-        overdispersion.unwrap_or(1.0)
-    };
     let sample_quantities: Vec<usize> = (0..free.len())
         .filter(|&p| free[p] >= layout.densities)
         .collect();
@@ -431,18 +496,31 @@ pub fn fit_counts(
         .result
         .covariance
         .as_ref()
-        .filter(|_| fit.converged)
+        .filter(|_| converged)
         .map(|full| {
             let size = sample_quantities.len();
             let mut block = FlatMatrix::zeros(size, size);
             for (a, &p) in sample_quantities.iter().enumerate() {
                 for (b, &q) in sample_quantities.iter().enumerate() {
-                    *block.get_mut(a, b) = scale * full.get(p, q);
+                    *block.get_mut(a, b) = if on_edge { f64::NAN } else { full.get(p, q) };
                 }
             }
             block
         });
     let params = &fit.result.params;
+    let measured_pulls = covariance.as_ref().map(|block| {
+        measured
+            .iter()
+            .map(|&(offset, mean, sd)| {
+                let parameter = layout.densities + offset;
+                let a = sample_quantities
+                    .iter()
+                    .position(|&p| free[p] == parameter)
+                    .expect("a measured quantity is fitted");
+                (params[parameter] - mean) / (sd * sd - block.get(a, a)).sqrt()
+            })
+            .collect()
+    });
     Ok(CountsFit {
         densities: params[layout.densities..layout.temperature].to_vec(),
         temperature_k: params[layout.temperature],
@@ -456,8 +534,9 @@ pub fn fit_counts(
         beam: open.beam.with_coefficients(&params[..layout.densities]),
         beam_at_limit: open.at_limit,
         deviance: fit.result.deviance,
-        converged: fit.converged,
+        converged,
         overdispersion,
+        measured_pulls,
         step_us: fit.step_us,
         points: fit.points,
         halvings: rule_halvings + fit.halvings,

@@ -6,7 +6,7 @@ use std::sync::Arc;
 use nereids_fitting::error::FittingError;
 use nereids_fitting::lm::{FitModel, FlatMatrix};
 use nereids_fitting::parameters::{FitParameter, ParameterSet};
-use nereids_fitting::poisson::{PoissonConfig, PoissonResult, poisson_fit};
+use nereids_fitting::poisson::{PoissonConfig, PoissonResult, Prior, poisson_fit};
 use nereids_physics::flight_time_grid::{FlightTimeGrid, FlightTimeGridError};
 use nereids_physics::ikeda_carpenter::IkedaCarpenter;
 
@@ -159,7 +159,7 @@ pub fn fit_open_beam(
     }
 
     let richest = &ladder[ladder.len() - 1].fit;
-    let overdispersion = overdispersion(open_counts, richest);
+    let overdispersion = overdispersion(open_counts, richest, 0..open_counts.len());
     let scale = overdispersion.unwrap_or(1.0);
     let criterion = |candidate: &Candidate| {
         2.0 * candidate.fit.result.deviance / scale
@@ -248,18 +248,19 @@ pub(crate) fn validate_live(
 
 const COUNTS_TO_MEASURE_NOISE: f64 = 1.0;
 
-pub(crate) fn overdispersion(observed: &[f64], fit: &GridFit) -> Option<f64> {
-    let (pearson, bins) = observed
-        .iter()
-        .zip(&fit.predicted)
-        .filter(|(_, mu)| **mu >= COUNTS_TO_MEASURE_NOISE)
-        .fold((0.0, 0_usize), |(sum, bins), (y, mu)| {
-            (sum + (y - mu).powi(2) / mu, bins + 1)
+pub(crate) fn overdispersion(
+    observed: &[f64],
+    fit: &GridFit,
+    bins: std::ops::Range<usize>,
+) -> Option<f64> {
+    let leverage = fit.result.leverage.as_ref().filter(|_| fit.converged)?;
+    let (pearson, freedom) = bins
+        .filter(|&k| fit.predicted[k] >= COUNTS_TO_MEASURE_NOISE)
+        .fold((0.0, 0.0), |(sum, freedom), k| {
+            let (y, mu) = (observed[k], fit.predicted[k]);
+            (sum + (y - mu).powi(2) / mu, freedom + 1.0 - leverage[k])
         });
-    let parameters = fit.result.on_bound.iter().filter(|&&on| !on).count();
-    let freedom = bins.checked_sub(parameters).filter(|&f| f > 0)?;
-    fit.converged
-        .then(|| (pearson / freedom as f64).clamp(1.0, f64::INFINITY))
+    (freedom >= 1.0).then(|| (pearson / freedom).max(1.0))
 }
 
 struct Candidate {
@@ -281,12 +282,20 @@ fn fit_beam(
             .map(|(i, &c)| FitParameter::unbounded(format!("beam {i}"), c))
             .collect(),
     );
-    let fit = fit_on_halved_grids(first_grid, &mut parameters, open_counts, |grid| {
-        Ok(Recorded {
-            model: OpenBeamModel::new(grid, start),
-            live,
-        })
-    })?;
+    let dispersion = vec![1.0; open_counts.len()];
+    let fit = fit_on_halved_grids(
+        first_grid,
+        &mut parameters,
+        open_counts,
+        &dispersion,
+        &[],
+        |grid| {
+            Ok(Recorded {
+                model: OpenBeamModel::new(grid, start),
+                live,
+            })
+        },
+    )?;
     Ok(Candidate {
         beam: start.with_coefficients(&fit.result.params),
         fit,
@@ -297,6 +306,7 @@ pub(crate) struct GridFit {
     pub(crate) result: PoissonResult,
     pub(crate) converged: bool,
     pub(crate) predicted: Vec<f64>,
+    pub(crate) coarse: Arc<FlightTimeGrid>,
     pub(crate) step_us: f64,
     pub(crate) points: usize,
     pub(crate) halvings: usize,
@@ -306,15 +316,31 @@ pub(crate) fn fit_on_halved_grids<M: FitModel>(
     first_grid: &Arc<FlightTimeGrid>,
     parameters: &mut ParameterSet,
     observed: &[f64],
+    dispersion: &[f64],
+    priors: &[Prior],
     model_on: impl Fn(&Arc<FlightTimeGrid>) -> Result<M, PipelineError>,
 ) -> Result<GridFit, PipelineError> {
+    let dispersed: Vec<f64> = observed
+        .iter()
+        .zip(dispersion)
+        .map(|(y, d)| y / d)
+        .collect();
     let mut grid = Arc::clone(first_grid);
     let mut coarse = model_on(&grid)?;
     let mut halvings = 0;
     loop {
         let finer = Arc::new(grid.halved()?);
         let fine = model_on(&finer)?;
-        let result = poisson_fit(&fine, observed, &[], parameters, &PoissonConfig::default())?;
+        let result = poisson_fit(
+            &Dispersed {
+                model: &fine,
+                dispersion,
+            },
+            &dispersed,
+            priors,
+            parameters,
+            &PoissonConfig::default(),
+        )?;
         let converged = result.converged && result.params.iter().all(|p| p.is_finite());
         let predicted = fine.evaluate(&result.params)?;
         let spread: f64 = predicted
@@ -323,7 +349,7 @@ pub(crate) fn fit_on_halved_grids<M: FitModel>(
             .filter(|(fine, _)| **fine > 0.0)
             .map(|(fine, coarse)| (fine - coarse).powi(2) / fine)
             .sum();
-        grid = finer;
+        let coarse_grid = std::mem::replace(&mut grid, finer);
         coarse = fine;
         halvings += 1;
         if spread <= BOUND || !converged {
@@ -331,11 +357,45 @@ pub(crate) fn fit_on_halved_grids<M: FitModel>(
                 result,
                 converged,
                 predicted,
+                coarse: coarse_grid,
                 step_us: grid.step_us(),
                 points: grid.flight_times_us().len(),
                 halvings,
             });
         }
+    }
+}
+
+struct Dispersed<'a, M> {
+    model: &'a M,
+    dispersion: &'a [f64],
+}
+
+impl<M: FitModel> FitModel for Dispersed<'_, M> {
+    fn evaluate(&self, params: &[f64]) -> Result<Vec<f64>, FittingError> {
+        let counts = self.model.evaluate(params)?;
+        Ok(counts
+            .iter()
+            .zip(self.dispersion)
+            .map(|(c, d)| c / d)
+            .collect())
+    }
+
+    fn analytical_jacobian(
+        &self,
+        params: &[f64],
+        free_param_indices: &[usize],
+        y_current: &[f64],
+    ) -> Option<FlatMatrix> {
+        let mut jacobian = self
+            .model
+            .analytical_jacobian(params, free_param_indices, y_current)?;
+        for (row, d) in self.dispersion.iter().enumerate() {
+            for col in 0..free_param_indices.len() {
+                *jacobian.get_mut(row, col) /= d;
+            }
+        }
+        Some(jacobian)
     }
 }
 
