@@ -220,10 +220,15 @@ const MAX_TAU_SAMPLES: usize = 8192;
 
 #[inline]
 fn h_over_cube_taylor(u: f64) -> f64 {
+    exponential_tail_series(u, 3)
+}
+
+#[inline]
+fn exponential_tail_series(u: f64, shift: u32) -> f64 {
     let mut sum = 0.0;
     let mut power = 0.5;
     for n in 0..64_u32 {
-        let next = sum + power / f64::from(n + 3);
+        let next = sum + power / f64::from(n + shift);
         if next == sum {
             break;
         }
@@ -259,10 +264,14 @@ pub fn ic_pulse(alpha: f64, beta: f64, r: f64, tau: f64) -> f64 {
     if r <= 0.0 {
         return fast;
     }
+    (1.0 - r) * fast + r * storage_density(alpha, beta, tau)
+}
+
+fn storage_density(alpha: f64, beta: f64, tau: f64) -> f64 {
     // slow/storage term = β(α/γ)³[e^{−βτ} − e^{−ατ}(1+u+½u²)], u = γτ = (α−β)τ.
     let u = (alpha - beta) * tau;
     let coeff = beta * alpha.powi(3) * tau.powi(3);
-    let slow = if u.abs() < 0.05 {
+    if u.abs() < 0.05 {
         // α ≈ β: bracket/u³ → e^{−βτ}·h(u)/u³ (Taylor); avoids 0/0 cancellation.
         coeff * (-beta * tau).exp() * h_over_cube_taylor(u)
     } else {
@@ -270,8 +279,22 @@ pub fn ic_pulse(alpha: f64, beta: f64, r: f64, tau: f64) -> f64 {
         // overflow (the old `e^{−βτ}·h(u)` factored an `e^{|u|}` → 0·∞ = NaN).
         let bracket = (-beta * tau).exp() - (-alpha * tau).exp() * (1.0 + u + 0.5 * u * u);
         coeff * bracket / (u * u * u)
-    };
-    (1.0 - r) * fast + r * slow
+    }
+}
+
+fn ic_pulse_slope(alpha: f64, beta: f64, r: f64, tau: f64) -> f64 {
+    if !tau.is_finite() || tau < 0.0 {
+        return 0.0;
+    }
+    let alpha = alpha.max(MIN_RATE);
+    let beta = beta.max(MIN_RATE);
+    let at = alpha * tau;
+    let prompt = 0.5 * alpha * at * at * (-at).exp();
+    let prompt_slope = 0.5 * alpha * alpha * at * (2.0 - at) * (-at).exp();
+    if r <= 0.0 {
+        return prompt_slope;
+    }
+    (1.0 - r) * prompt_slope + r * beta * (prompt - storage_density(alpha, beta, tau))
 }
 
 /// Cumulative probability of the Ikeda–Carpenter moderator pulse.
@@ -337,6 +360,48 @@ pub fn ic_cdf(alpha: f64, beta: f64, r: f64, tau: f64) -> f64 {
     (fast - r * correction).clamp(0.0, 1.0)
 }
 
+fn ic_cdf_slopes(alpha: f64, beta: f64, r: f64, tau: f64) -> [f64; 3] {
+    if !alpha.is_finite() || !beta.is_finite() || !r.is_finite() {
+        return [f64::NAN; 3];
+    }
+    if tau.is_nan() || tau <= 0.0 || tau == f64::INFINITY {
+        return [0.0; 3];
+    }
+    let alpha = alpha.max(MIN_RATE);
+    let beta = beta.max(MIN_RATE);
+    let at = alpha * tau;
+    let fast = 0.5 * tau * at * at * (-at).exp();
+    const CDF_TAIL_LIMIT: f64 = 1.0e100;
+    if at >= CDF_TAIL_LIMIT {
+        let storage = (-beta * tau).exp();
+        return [0.0, r * tau * storage, -storage];
+    }
+    if beta * tau >= CDF_TAIL_LIMIT {
+        return [fast, 0.0, 0.0];
+    }
+    let u = (alpha - beta) * tau;
+    let (correction, slope) = if u.abs() < 0.05 {
+        let storage = (-beta * tau).exp();
+        (
+            at.powi(3) * storage * h_over_cube_taylor(u),
+            -tau * storage * exponential_tail_series(u, 4),
+        )
+    } else {
+        let prompt = (-alpha * tau).exp();
+        let bracket = (-beta * tau).exp() - prompt * (1.0 + u + 0.5 * u * u);
+        (
+            at.powi(3) * bracket / u.powi(3),
+            tau * (prompt / (2.0 * u) - 3.0 * bracket / u.powi(4)),
+        )
+    };
+    let moved = at.powi(3) * slope;
+    [
+        fast - r * (3.0 * correction / alpha + moved),
+        r * (tau * correction + moved),
+        -correction,
+    ]
+}
+
 const GAUSS_LEGENDRE_16: [(f64, f64); 8] = [
     (0.095_012_509_837_637_44, 0.189_450_610_455_068_59),
     (0.281_603_550_779_258_9, 0.182_603_415_044_923_6),
@@ -348,30 +413,50 @@ const GAUSS_LEGENDRE_16: [(f64, f64); 8] = [
     (0.989_400_934_991_649_9, 0.027_152_459_411_754_055),
 ];
 
-fn triangle_fold(alpha: f64, fwhm_us: f64, delay_us: f64, g: impl Fn(f64) -> f64) -> f64 {
+fn fold_nodes(alpha: f64, fwhm_us: f64, delay_us: f64, mut node: impl FnMut(f64, f64)) {
     let end = delay_us.min(fwhm_us);
     let finest = 2.0 / alpha.max(MIN_RATE);
-    let mut total = 0.0;
     for (lo, hi) in [(-fwhm_us, end.min(0.0)), (0.0, end)] {
         let (mut right, mut width) = (hi, finest);
         while right > lo {
             let left = (right - width).max(lo);
             let (centre, half) = (0.5 * (left + right), 0.5 * (right - left));
-            for &(node, weight) in &GAUSS_LEGENDRE_16 {
-                for s in [centre - half * node, centre + half * node] {
-                    total +=
-                        half * weight * (fwhm_us - s.abs()) / (fwhm_us * fwhm_us) * g(delay_us - s);
+            for &(position, weight) in &GAUSS_LEGENDRE_16 {
+                for s in [centre - half * position, centre + half * position] {
+                    node(s, half * weight);
                 }
             }
             right = left;
             width *= 2.0;
         }
     }
+}
+
+fn triangle_fold(alpha: f64, fwhm_us: f64, delay_us: f64, g: impl Fn(f64) -> f64) -> f64 {
+    let mut total = 0.0;
+    fold_nodes(alpha, fwhm_us, delay_us, |s, weight| {
+        total += weight * (fwhm_us - s.abs()) / (fwhm_us * fwhm_us) * g(delay_us - s);
+    });
     total
 }
 
 fn ic_cdf_folded(alpha: f64, beta: f64, r: f64, fwhm_us: f64, delay_us: f64) -> f64 {
     triangle_fold(alpha, fwhm_us, delay_us, |x| ic_cdf(alpha, beta, r, x)).clamp(0.0, 1.0)
+}
+
+fn ic_cdf_folded_slopes(alpha: f64, beta: f64, r: f64, fwhm_us: f64, delay_us: f64) -> [f64; 4] {
+    let mut slopes = [0.0; 4];
+    fold_nodes(alpha, fwhm_us, delay_us, |s, weight| {
+        let x = delay_us - s;
+        let t = (s / fwhm_us).abs();
+        let triangle = weight * (1.0 - t) / fwhm_us;
+        for (slope, value) in slopes.iter_mut().zip(ic_cdf_slopes(alpha, beta, r, x)) {
+            *slope += triangle * value;
+        }
+        let moment = (1.0 / 6.0 - 0.5 * t * t + t.powi(3) / 3.0) / (2.0 * fwhm_us);
+        slopes[3] += weight * moment * ic_pulse_slope(alpha, beta, r, x);
+    });
+    slopes
 }
 
 /// Gamma(3, rate=1) cumulative distribution at dimensionless time `x`.
@@ -485,11 +570,12 @@ fn inverse_lambda_denom(a0: f64, a1: f64, e: f64) -> f64 {
 }
 
 /// Parameters of the Ikeda–Carpenter resolution model.
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, PartialEq)]
 pub struct IkedaCarpenterParams {
-    /// Fast (slowing-down) rate `α(E)`, 1/µs. Must evaluate to > 0.
+    /// Fast (slowing-down) rate `α(E)`, 1/µs. Must evaluate to at least
+    /// 1e-9.
     pub alpha: EnergyLaw,
-    /// Slow (storage) rate `β(E)`, 1/µs. Must evaluate to > 0.
+    /// Slow (storage) rate `β(E)`, 1/µs. Must evaluate to at least 1e-9.
     pub beta: EnergyLaw,
     /// Storage mixing fraction `R(E)`, 0 ≤ R ≤ 1.
     pub r: EnergyLaw,
@@ -512,6 +598,198 @@ impl IkedaCarpenterParams {
             burst_sigma_us: None,
             channel_fwhm_us: None,
         }
+    }
+
+    fn triangle_fwhm_us(&self) -> Result<f64, ResolutionParseError> {
+        if self.burst_sigma_us.unwrap_or(0.0) != 0.0 {
+            return Err(ResolutionParseError::InvalidFormat(
+                "a Gaussian burst is not supported in detector time; model the proton \
+                 pulse with channel_fwhm_us"
+                    .to_string(),
+            ));
+        }
+        let fwhm_us = self.channel_fwhm_us.unwrap_or(0.0);
+        if !(fwhm_us.is_finite() && fwhm_us >= 0.0) {
+            return Err(ResolutionParseError::InvalidFormat(format!(
+                "the triangle's FWHM must be finite and 0 or more, got {fwhm_us} µs"
+            )));
+        }
+        Ok(fwhm_us)
+    }
+
+    /// The first and last delay, in µs after the nominal arrival, of a
+    /// neutron of `energy_ev`, outside which [`IkedaCarpenter::detector_bin_probabilities`]
+    /// gives it less than [`NEGLIGIBLE_ARRIVAL_PROBABILITY`] chance of
+    /// arriving: the triangle's half-base before 0, and after the delay where
+    /// `1 − ic_cdf` falls to that chance.
+    ///
+    /// # Errors
+    /// [`ResolutionParseError::InvalidFormat`] when `energy_ev` is not
+    /// positive and finite, a law is singular or out of range there, or the
+    /// pulse has a Gaussian burst.
+    pub fn delays_us(&self, energy_ev: f64) -> Result<(f64, f64), ResolutionParseError> {
+        self.validate_probe_energy(energy_ev)?;
+        let h = self.triangle_fwhm_us()?;
+        let alpha = self.alpha.eval(energy_ev);
+        let beta = self.beta.eval(energy_ev);
+        let r = self.r.eval(energy_ev);
+        Ok((-h, tail_delay(alpha, beta, r) + h))
+    }
+
+    /// Probability that a neutron of `true_energy_ev` whose nominal arrival,
+    /// before the pulse's delay, is `arrival_us` is recorded in each bin of
+    /// `detector_time_edges_us`; as [`IkedaCarpenter::detector_bin_probabilities`].
+    ///
+    /// # Errors
+    /// As [`IkedaCarpenter::detector_bin_probabilities`], with `arrival_us` finite.
+    pub fn bin_probabilities_at(
+        &self,
+        true_energy_ev: f64,
+        arrival_us: f64,
+        detector_time_edges_us: &[f64],
+    ) -> Result<Vec<f64>, ResolutionParseError> {
+        let (alpha, beta, r, h) =
+            self.at_arrival(true_energy_ev, arrival_us, detector_time_edges_us)?;
+        let cdf = |x: f64| {
+            if h == 0.0 {
+                ic_cdf(alpha, beta, r, x)
+            } else {
+                ic_cdf_folded(alpha, beta, r, h, x)
+            }
+        };
+        let cdfs: Vec<f64> = detector_time_edges_us
+            .iter()
+            .map(|edge| cdf(edge - arrival_us))
+            .collect();
+        Ok(cdfs.windows(2).map(|w| (w[1] - w[0]).max(0.0)).collect())
+    }
+
+    /// The derivative of each of [`Self::bin_probabilities_at`] with respect
+    /// to `arrival_us`, per µs: the pulse density, folded with the triangle,
+    /// at the bin's lower edge minus that at its upper edge.
+    ///
+    /// # Errors
+    /// As [`Self::bin_probabilities_at`].
+    pub fn bin_arrival_slopes_at(
+        &self,
+        true_energy_ev: f64,
+        arrival_us: f64,
+        detector_time_edges_us: &[f64],
+    ) -> Result<Vec<f64>, ResolutionParseError> {
+        let (alpha, beta, r, h) =
+            self.at_arrival(true_energy_ev, arrival_us, detector_time_edges_us)?;
+        let density = |x: f64| {
+            if h == 0.0 {
+                ic_pulse(alpha, beta, r, x)
+            } else {
+                triangle_fold(alpha, h, x, |tau| ic_pulse(alpha, beta, r, tau))
+            }
+        };
+        let densities: Vec<f64> = detector_time_edges_us
+            .iter()
+            .map(|edge| density(edge - arrival_us))
+            .collect();
+        Ok(densities.windows(2).map(|w| w[0] - w[1]).collect())
+    }
+
+    /// The derivatives of each of [`Self::bin_probabilities_at`] with
+    /// respect to `α`, `β`, `R` and the square of the triangle's FWHM `h`,
+    /// each evaluated at `true_energy_ev`: `[∂P/∂α, ∂P/∂β, ∂P/∂R, ∂P/∂h²]`,
+    /// one value per bin.  The probabilities are even in `h` and smooth in
+    /// `h²`, so `∂P/∂h²` is finite and generally not 0 at `h = 0`.
+    ///
+    /// # Errors
+    /// As [`Self::bin_probabilities_at`].
+    pub fn bin_pulse_slopes_at(
+        &self,
+        true_energy_ev: f64,
+        arrival_us: f64,
+        detector_time_edges_us: &[f64],
+    ) -> Result<[Vec<f64>; 4], ResolutionParseError> {
+        let (alpha, beta, r, h) =
+            self.at_arrival(true_energy_ev, arrival_us, detector_time_edges_us)?;
+        let slopes = |x: f64| {
+            if h == 0.0 {
+                let [a, b, c] = ic_cdf_slopes(alpha, beta, r, x);
+                [a, b, c, ic_pulse_slope(alpha, beta, r, x) / 12.0]
+            } else {
+                ic_cdf_folded_slopes(alpha, beta, r, h, x)
+            }
+        };
+        let at_edges: Vec<[f64; 4]> = detector_time_edges_us
+            .iter()
+            .map(|edge| slopes(edge - arrival_us))
+            .collect();
+        Ok(std::array::from_fn(|n| {
+            at_edges.windows(2).map(|w| w[1][n] - w[0][n]).collect()
+        }))
+    }
+
+    fn at_arrival(
+        &self,
+        true_energy_ev: f64,
+        arrival_us: f64,
+        detector_time_edges_us: &[f64],
+    ) -> Result<(f64, f64, f64, f64), ResolutionParseError> {
+        self.validate_probe_energy(true_energy_ev)?;
+        if !arrival_us.is_finite() {
+            return Err(ResolutionParseError::InvalidFormat(format!(
+                "the nominal arrival must be finite, got {arrival_us} µs"
+            )));
+        }
+        if detector_time_edges_us.len() < 2
+            || detector_time_edges_us.iter().any(|x| !x.is_finite())
+            || detector_time_edges_us.windows(2).any(|w| w[0] >= w[1])
+        {
+            return Err(ResolutionParseError::InvalidFormat(
+                "detector time edges must contain at least two finite, strictly increasing values"
+                    .to_string(),
+            ));
+        }
+        Ok((
+            self.alpha.eval(true_energy_ev),
+            self.beta.eval(true_energy_ev),
+            self.r.eval(true_energy_ev),
+            self.triangle_fwhm_us()?,
+        ))
+    }
+
+    fn validate_probe_energy(&self, energy_ev: f64) -> Result<(), ResolutionParseError> {
+        if !energy_ev.is_finite() || energy_ev <= 0.0 {
+            return Err(ResolutionParseError::InvalidFormat(format!(
+                "true energy must be positive and finite, got {energy_ev}"
+            )));
+        }
+        for (name, law) in [("alpha", &self.alpha), ("beta", &self.beta), ("R", &self.r)] {
+            if law.is_singular_at(energy_ev) {
+                return Err(ResolutionParseError::InvalidFormat(format!(
+                    "Ikeda–Carpenter {name}({energy_ev}) law is singular (an \
+                     InverseLambda denominator within ±{MIN_RATE} of zero, \
+                     or an ExpMilliEv κ in [−{MIN_RATE}, 0])"
+                )));
+            }
+        }
+        let alpha = self.alpha.eval(energy_ev);
+        let beta = self.beta.eval(energy_ev);
+        let r = self.r.eval(energy_ev);
+        if !alpha.is_finite() || alpha < MIN_RATE {
+            return Err(ResolutionParseError::InvalidFormat(format!(
+                "Ikeda–Carpenter alpha({energy_ev}) must be finite and at least {MIN_RATE} \
+                 µs⁻¹, got {alpha}"
+            )));
+        }
+        if !beta.is_finite() || beta < MIN_RATE {
+            return Err(ResolutionParseError::InvalidFormat(format!(
+                "Ikeda–Carpenter beta({energy_ev}) must be finite and at least {MIN_RATE} \
+                 µs⁻¹, got {beta}"
+            )));
+        }
+        if !r.is_finite() || !(0.0..=1.0).contains(&r) {
+            return Err(ResolutionParseError::InvalidFormat(format!(
+                "Ikeda–Carpenter R({energy_ev}) must be in [0, 1], got {r}"
+            )));
+        }
+        Ok(())
     }
 }
 
@@ -575,7 +853,8 @@ impl IkedaCarpenter {
     /// # Errors
     /// Returns [`ResolutionParseError::InvalidFormat`] for a non-positive
     /// flight path, a degenerate grid (`n_energies < 2`, `n_tau < 8`,
-    /// `e_min ≤ 0`, `e_max ≤ e_min`), a non-positive `β(E)`, a parameter/grid
+    /// `e_min ≤ 0`, `e_max ≤ e_min`), an `α(E)` or `β(E)` below 1e-9 µs⁻¹ at a
+    /// reference energy, a parameter/grid
     /// combination whose τ-grid cannot resolve the prompt core and requested
     /// folds within the `MAX_TAU_SAMPLES` cap at some reference energy (see
     /// `tau_geometry` — remedy: larger `β`, `R = 0`, or a wider/disabled
@@ -634,15 +913,12 @@ impl IkedaCarpenter {
                 )));
             }
         }
-        // Reject parameter laws that yield a non-positive fast rate α(E): the
-        // pulse would otherwise degenerate (synthesis clamps α to a tiny floor,
-        // producing a meaningless near-flat kernel rather than failing loudly).
         if let Some(&bad) = ref_energies.iter().find(|&&e| {
             let a = params.alpha.eval(e);
-            !a.is_finite() || a <= 0.0
+            !a.is_finite() || a < MIN_RATE
         }) {
             return Err(ResolutionParseError::InvalidFormat(format!(
-                "Ikeda–Carpenter α(E) must be > 0, but α({bad}) = {} is not",
+                "Ikeda–Carpenter α(E) must be at least {MIN_RATE} µs⁻¹, but α({bad}) = {} is not",
                 params.alpha.eval(bad)
             )));
         }
@@ -651,10 +927,10 @@ impl IkedaCarpenter {
         // into a different pulse.
         if let Some(&bad) = ref_energies.iter().find(|&&e| {
             let beta = params.beta.eval(e);
-            !beta.is_finite() || beta <= 0.0
+            !beta.is_finite() || beta < MIN_RATE
         }) {
             return Err(ResolutionParseError::InvalidFormat(format!(
-                "Ikeda–Carpenter β(E) must be > 0, but β({bad}) = {} is not",
+                "Ikeda–Carpenter β(E) must be at least {MIN_RATE} µs⁻¹, but β({bad}) = {} is not",
                 params.beta.eval(bad)
             )));
         }
@@ -749,6 +1025,20 @@ impl IkedaCarpenter {
         &self.ref_energies
     }
 
+    /// The pulse as the counts path reads it, over the energies the table was
+    /// synthesized on.
+    #[must_use]
+    pub fn detector_pulse(&self) -> DetectorPulse {
+        DetectorPulse {
+            params: self.params.clone(),
+            energy_span_ev: (
+                self.ref_energies[0],
+                self.ref_energies[self.ref_energies.len() - 1],
+            ),
+            n_tau: self.n_tau,
+        }
+    }
+
     /// Evaluate the (burst/channel-folded) IC kernel at one energy.
     ///
     /// Returns ascending TOF-offsets (µs, 0 = pulse start) and peak-normalized
@@ -763,49 +1053,8 @@ impl IkedaCarpenter {
     /// *reference* energy, but a probe outside `[e_min, e_max]` can still leave
     /// the physical or resolvable region.
     pub fn kernel_at(&self, energy_ev: f64) -> Result<(Vec<f64>, Vec<f64>), ResolutionParseError> {
-        self.validate_probe_energy(energy_ev)?;
+        self.params.validate_probe_energy(energy_ev)?;
         synth_kernel(&self.params, self.n_tau, energy_ev)
-    }
-
-    fn triangle_fwhm_us(&self) -> Result<f64, ResolutionParseError> {
-        if self.params.burst_sigma_us.unwrap_or(0.0) != 0.0 {
-            return Err(ResolutionParseError::InvalidFormat(
-                "a Gaussian burst is not supported in detector time; model the proton \
-                 pulse with channel_fwhm_us"
-                    .to_string(),
-            ));
-        }
-        Ok(self.params.channel_fwhm_us.unwrap_or(0.0))
-    }
-
-    /// The first and last delay, in µs after the nominal arrival, of a
-    /// neutron of `energy_ev`, outside which [`Self::detector_bin_probabilities`]
-    /// gives it less than [`NEGLIGIBLE_ARRIVAL_PROBABILITY`] chance of
-    /// arriving: the triangle's half-base before 0, and after the delay where
-    /// `1 − ic_cdf` falls to that chance.
-    ///
-    /// # Errors
-    /// [`ResolutionParseError::InvalidFormat`] when `energy_ev` is not
-    /// positive and finite, a law is singular or out of range there, or the
-    /// pulse has a Gaussian burst.
-    pub fn delays_us(&self, energy_ev: f64) -> Result<(f64, f64), ResolutionParseError> {
-        self.validate_probe_energy(energy_ev)?;
-        let h = self.triangle_fwhm_us()?;
-        let alpha = self.params.alpha.eval(energy_ev);
-        let beta = self.params.beta.eval(energy_ev);
-        let r = self.params.r.eval(energy_ev);
-        Ok((-h, tail_delay(alpha, beta, r) + h))
-    }
-
-    /// The time in µs from the first sample of the pulse at `energy_ev` to
-    /// its peak.
-    ///
-    /// # Errors
-    /// As [`Self::source_pulse_at`].
-    pub fn rise_us(&self, energy_ev: f64) -> Result<f64, ResolutionParseError> {
-        self.validate_probe_energy(energy_ev)?;
-        let (times, densities) = synth_source_pulse_density(&self.params, self.n_tau, energy_ev)?;
-        Ok(times[argmax(&densities)] - times[0])
     }
 
     /// Evaluate the physical source pulse at one true neutron energy.
@@ -825,7 +1074,7 @@ impl IkedaCarpenter {
         &self,
         energy_ev: f64,
     ) -> Result<(Vec<f64>, Vec<f64>), ResolutionParseError> {
-        self.validate_probe_energy(energy_ev)?;
+        self.params.validate_probe_energy(energy_ev)?;
         synth_source_pulse(&self.params, self.n_tau, energy_ev)
     }
 
@@ -861,136 +1110,89 @@ impl IkedaCarpenter {
                 "timing_offset_us must be finite, got {timing_offset_us}"
             )));
         }
-        self.bin_probabilities_at(
+        self.params.bin_probabilities_at(
             true_energy_ev,
             timing_offset_us + TOF_FACTOR * self.flight_path_m / true_energy_ev.sqrt(),
             detector_time_edges_us,
         )
     }
+}
 
-    /// Probability that a neutron of `true_energy_ev` whose nominal arrival,
-    /// before the pulse's delay, is `arrival_us` is recorded in each bin of
-    /// `detector_time_edges_us`; as [`Self::detector_bin_probabilities`].
+/// An Ikeda–Carpenter pulse in detector time: its laws, the energies they hold
+/// over, and the number of samples across its prompt core used to find its
+/// rise.
+#[derive(Debug, Clone)]
+pub struct DetectorPulse {
+    params: IkedaCarpenterParams,
+    energy_span_ev: (f64, f64),
+    n_tau: usize,
+}
+
+impl DetectorPulse {
+    /// The pulse with laws `params` over `energy_span_ev`, its rise found on
+    /// `n_tau` samples across the prompt core.
     ///
     /// # Errors
-    /// As [`Self::detector_bin_probabilities`], with `arrival_us` finite.
-    pub fn bin_probabilities_at(
-        &self,
-        true_energy_ev: f64,
-        arrival_us: f64,
-        detector_time_edges_us: &[f64],
-    ) -> Result<Vec<f64>, ResolutionParseError> {
-        let (alpha, beta, r, h) =
-            self.at_arrival(true_energy_ev, arrival_us, detector_time_edges_us)?;
-        let cdf = |x: f64| {
-            if h == 0.0 {
-                ic_cdf(alpha, beta, r, x)
-            } else {
-                ic_cdf_folded(alpha, beta, r, h, x)
-            }
-        };
-        let cdfs: Vec<f64> = detector_time_edges_us
-            .iter()
-            .map(|edge| cdf(edge - arrival_us))
-            .collect();
-        Ok(cdfs.windows(2).map(|w| (w[1] - w[0]).max(0.0)).collect())
+    /// [`ResolutionParseError::InvalidFormat`] unless `0 < low < high` are
+    /// finite, `n_tau` is at least 8, the triangle's FWHM is finite and 0 or
+    /// more, the pulse has no Gaussian burst, and the laws are valid at both
+    /// ends of the span: `α` and `β` finite and at least 1e-9 µs⁻¹, `R`
+    /// within 0–1.
+    pub fn new(
+        params: IkedaCarpenterParams,
+        energy_span_ev: (f64, f64),
+        n_tau: usize,
+    ) -> Result<Self, ResolutionParseError> {
+        params.triangle_fwhm_us()?;
+        let (low, high) = energy_span_ev;
+        if !(low.is_finite() && high.is_finite() && 0.0 < low && low < high) {
+            return Err(ResolutionParseError::InvalidFormat(format!(
+                "the energy span must satisfy 0 < low < high, got {energy_span_ev:?}"
+            )));
+        }
+        params.validate_probe_energy(low)?;
+        params.validate_probe_energy(high)?;
+        if n_tau < MIN_N_TAU {
+            return Err(ResolutionParseError::InvalidFormat(format!(
+                "n_tau must be >= {MIN_N_TAU}, got {n_tau}"
+            )));
+        }
+        Ok(Self {
+            params,
+            energy_span_ev,
+            n_tau,
+        })
     }
 
-    /// The derivative of each of [`Self::bin_probabilities_at`] with respect
-    /// to `arrival_us`, per µs: the pulse density, folded with the triangle,
-    /// at the bin's lower edge minus that at its upper edge.
+    /// The pulse's laws.
+    #[must_use]
+    pub fn params(&self) -> &IkedaCarpenterParams {
+        &self.params
+    }
+
+    /// `(low, high)`, the energies in eV the laws hold over.
+    #[must_use]
+    pub fn energy_span_ev(&self) -> (f64, f64) {
+        self.energy_span_ev
+    }
+
+    /// The samples across the prompt core used to find the pulse's rise.
+    #[must_use]
+    pub fn n_tau(&self) -> usize {
+        self.n_tau
+    }
+
+    /// The time in µs from the first sample of the pulse at `energy_ev` to
+    /// its peak.
     ///
     /// # Errors
-    /// As [`Self::bin_probabilities_at`].
-    pub fn bin_arrival_slopes_at(
-        &self,
-        true_energy_ev: f64,
-        arrival_us: f64,
-        detector_time_edges_us: &[f64],
-    ) -> Result<Vec<f64>, ResolutionParseError> {
-        let (alpha, beta, r, h) =
-            self.at_arrival(true_energy_ev, arrival_us, detector_time_edges_us)?;
-        let density = |x: f64| {
-            if h == 0.0 {
-                ic_pulse(alpha, beta, r, x)
-            } else {
-                triangle_fold(alpha, h, x, |tau| ic_pulse(alpha, beta, r, tau))
-            }
-        };
-        let densities: Vec<f64> = detector_time_edges_us
-            .iter()
-            .map(|edge| density(edge - arrival_us))
-            .collect();
-        Ok(densities.windows(2).map(|w| w[0] - w[1]).collect())
-    }
-
-    fn at_arrival(
-        &self,
-        true_energy_ev: f64,
-        arrival_us: f64,
-        detector_time_edges_us: &[f64],
-    ) -> Result<(f64, f64, f64, f64), ResolutionParseError> {
-        self.validate_probe_energy(true_energy_ev)?;
-        if !arrival_us.is_finite() {
-            return Err(ResolutionParseError::InvalidFormat(format!(
-                "the nominal arrival must be finite, got {arrival_us} µs"
-            )));
-        }
-        if detector_time_edges_us.len() < 2
-            || detector_time_edges_us.iter().any(|x| !x.is_finite())
-            || detector_time_edges_us.windows(2).any(|w| w[0] >= w[1])
-        {
-            return Err(ResolutionParseError::InvalidFormat(
-                "detector time edges must contain at least two finite, strictly increasing values"
-                    .to_string(),
-            ));
-        }
-        Ok((
-            self.params.alpha.eval(true_energy_ev),
-            self.params.beta.eval(true_energy_ev),
-            self.params.r.eval(true_energy_ev),
-            self.triangle_fwhm_us()?,
-        ))
-    }
-
-    fn validate_probe_energy(&self, energy_ev: f64) -> Result<(), ResolutionParseError> {
-        if !energy_ev.is_finite() || energy_ev <= 0.0 {
-            return Err(ResolutionParseError::InvalidFormat(format!(
-                "true energy must be positive and finite, got {energy_ev}"
-            )));
-        }
-        for (name, law) in [
-            ("alpha", &self.params.alpha),
-            ("beta", &self.params.beta),
-            ("R", &self.params.r),
-        ] {
-            if law.is_singular_at(energy_ev) {
-                return Err(ResolutionParseError::InvalidFormat(format!(
-                    "Ikeda–Carpenter {name}({energy_ev}) law is singular (an \
-                     InverseLambda denominator within ±{MIN_RATE} of zero, \
-                     or an ExpMilliEv κ in [−{MIN_RATE}, 0])"
-                )));
-            }
-        }
-        let alpha = self.params.alpha.eval(energy_ev);
-        let beta = self.params.beta.eval(energy_ev);
-        let r = self.params.r.eval(energy_ev);
-        if !alpha.is_finite() || alpha <= 0.0 {
-            return Err(ResolutionParseError::InvalidFormat(format!(
-                "Ikeda–Carpenter alpha({energy_ev}) must be positive and finite, got {alpha}"
-            )));
-        }
-        if !beta.is_finite() || beta <= 0.0 {
-            return Err(ResolutionParseError::InvalidFormat(format!(
-                "Ikeda–Carpenter beta({energy_ev}) must be positive and finite, got {beta}"
-            )));
-        }
-        if !r.is_finite() || !(0.0..=1.0).contains(&r) {
-            return Err(ResolutionParseError::InvalidFormat(format!(
-                "Ikeda–Carpenter R({energy_ev}) must be in [0, 1], got {r}"
-            )));
-        }
-        Ok(())
+    /// [`ResolutionParseError::InvalidFormat`] when `energy_ev` is not
+    /// positive and finite, a law is singular or out of range there, or the
+    /// pulse has a Gaussian burst.
+    pub fn rise_us(&self, energy_ev: f64) -> Result<f64, ResolutionParseError> {
+        self.params.validate_probe_energy(energy_ev)?;
+        self.params.triangle_fwhm_us()?;
+        sampled_rise_us(&self.params, self.n_tau, energy_ev)
     }
 }
 
@@ -1014,6 +1216,30 @@ fn tail_delay(alpha: f64, beta: f64, r: f64) -> f64 {
         }
     }
     high
+}
+
+fn requested_step(params: &IkedaCarpenterParams, n_tau: usize, alpha: f64) -> (f64, f64, String) {
+    let fast_reach = FAST_REACH_E_FOLDS / alpha;
+    let mut dtau_req = fast_reach / (n_tau as f64 - 1.0);
+    let mut floor = fast_reach / (MIN_N_TAU as f64 - 1.0);
+    let mut fold_desc = String::new();
+    if let Some(fwhm) = params.channel_fwhm_us
+        && fwhm > 0.0
+    {
+        let tri_floor = fwhm / TRI_MIN_SAMPLES_PER_SIDE;
+        dtau_req = dtau_req.min(tri_floor);
+        floor = floor.min(tri_floor);
+        fold_desc.push_str(&format!(", channel triangle FWHM = {fwhm} µs"));
+    }
+    if let Some(sigma) = params.burst_sigma_us
+        && sigma > 0.0
+    {
+        dtau_req = dtau_req.min(sigma);
+        floor = floor.min(sigma);
+        fold_desc.push_str(&format!(", burst σ = {sigma} µs"));
+    }
+
+    (dtau_req, floor, fold_desc)
 }
 
 /// τ-grid geometry for one kernel: `(dtau, tau_max, margin)`, or a
@@ -1045,30 +1271,8 @@ fn tau_geometry(
     beta: f64,
     r: f64,
 ) -> Result<(f64, f64, f64), String> {
-    let fast_reach = FAST_REACH_E_FOLDS / alpha;
     let tau_max = tau_reach(alpha, beta, r);
-
-    // Requested step and resolution floor. `floor ≥ dtau_req` always: the
-    // prompt terms satisfy MIN_N_TAU ≤ n_tau (validated by `new`) and the
-    // fold terms are common to both.
-    let mut dtau_req = fast_reach / (n_tau as f64 - 1.0);
-    let mut floor = fast_reach / (MIN_N_TAU as f64 - 1.0);
-    let mut fold_desc = String::new();
-    if let Some(fwhm) = params.channel_fwhm_us
-        && fwhm > 0.0
-    {
-        let tri_floor = fwhm / TRI_MIN_SAMPLES_PER_SIDE;
-        dtau_req = dtau_req.min(tri_floor);
-        floor = floor.min(tri_floor);
-        fold_desc.push_str(&format!(", channel triangle FWHM = {fwhm} µs"));
-    }
-    if let Some(sigma) = params.burst_sigma_us
-        && sigma > 0.0
-    {
-        dtau_req = dtau_req.min(sigma);
-        floor = floor.min(sigma);
-        fold_desc.push_str(&format!(", burst σ = {sigma} µs"));
-    }
+    let (dtau_req, floor, fold_desc) = requested_step(params, n_tau, alpha);
 
     let capped_step = tau_max / (MAX_TAU_SAMPLES as f64 - 1.0);
     if capped_step > floor {
@@ -1131,16 +1335,43 @@ fn synth_source_pulse_density(
     let beta = params.beta.eval(energy_ev).max(MIN_RATE);
     let r = params.r.eval(energy_ev).clamp(0.0, 1.0);
 
-    let (dtau, tau_max, margin) = tau_geometry(params, n_tau, alpha, beta, r).map_err(|msg| {
+    let geometry = tau_geometry(params, n_tau, alpha, beta, r).map_err(|msg| {
         ResolutionParseError::InvalidFormat(format!(
             "Ikeda–Carpenter kernel at E = {energy_ev} eV: {msg}"
         ))
     })?;
+    sampled_density(params, (alpha, beta, r), geometry, energy_ev)
+}
 
+fn sampled_rise_us(
+    params: &IkedaCarpenterParams,
+    n_tau: usize,
+    energy_ev: f64,
+) -> Result<f64, ResolutionParseError> {
+    let alpha = params.alpha.eval(energy_ev).max(MIN_RATE);
+    let beta = params.beta.eval(energy_ev).max(MIN_RATE);
+    let r = params.r.eval(energy_ev).clamp(0.0, 1.0);
+    let fast_reach = FAST_REACH_E_FOLDS / alpha;
+    let margin = margin_of(params);
+    let (dtau_req, _, _) = requested_step(params, n_tau, alpha);
+    let dtau = dtau_req.max((fast_reach + 2.0 * margin) / (MAX_TAU_SAMPLES as f64 - 1.0));
+    let (times, densities) = sampled_density(
+        params,
+        (alpha, beta, r),
+        (dtau, fast_reach, margin),
+        energy_ev,
+    )?;
+    Ok(times[argmax(&densities)] - times[0])
+}
+
+fn sampled_density(
+    params: &IkedaCarpenterParams,
+    (alpha, beta, r): (f64, f64, f64),
+    (dtau, tau_max, margin): (f64, f64, f64),
+    energy_ev: f64,
+) -> Result<(Vec<f64>, Vec<f64>), ResolutionParseError> {
     // Extend the grid to slightly negative τ so a symmetric burst/channel can
     // spread the leading edge correctly (the moderator pulse itself is 0 there).
-    // Widths are validated finite and >= 0 by `IkedaCarpenter::new`, so they are
-    // used directly (no `.abs()` masking of a sign error).
     let j_lo: isize = -((margin / dtau).ceil() as isize);
     let j_hi: isize = ((tau_max + margin) / dtau).ceil() as isize;
 

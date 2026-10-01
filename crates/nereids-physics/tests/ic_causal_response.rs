@@ -1,5 +1,5 @@
 use nereids_physics::ikeda_carpenter::{
-    EnergyLaw, IkedaCarpenter, IkedaCarpenterParams, SynthesisGrid, ic_cdf, ic_pulse,
+    DetectorPulse, EnergyLaw, IkedaCarpenter, IkedaCarpenterParams, SynthesisGrid, ic_cdf, ic_pulse,
 };
 use nereids_physics::resolution::TOF_FACTOR;
 
@@ -340,6 +340,7 @@ fn a_gaussian_burst_is_refused_in_detector_time() {
                 .expect_err("detector bins must refuse a burst")
                 .to_string(),
             model
+                .params()
                 .delays_us(25.0)
                 .expect_err("delays must refuse a burst")
                 .to_string(),
@@ -818,10 +819,12 @@ fn arrival_slopes_are_the_derivative_of_the_bin_probabilities() {
         .expect("valid IC model");
         let bins = |arrival: f64| {
             model
+                .params()
                 .bin_probabilities_at(true_energy_ev, arrival, &edges)
                 .expect("bins")
         };
         let slopes = model
+            .params()
             .bin_arrival_slopes_at(true_energy_ev, arrival_us, &edges)
             .expect("slopes");
         let h = 1e-4;
@@ -834,5 +837,159 @@ fn arrival_slopes_are_the_derivative_of_the_bin_probabilities() {
                 "{channel_fwhm_us:?} bin {k}: {slope} vs {central}"
             );
         }
+    }
+}
+
+fn constant_pulse(alpha: f64, beta: f64, r: f64, fwhm_us: f64) -> IkedaCarpenterParams {
+    IkedaCarpenterParams {
+        channel_fwhm_us: Some(fwhm_us),
+        ..IkedaCarpenterParams::constant(alpha, beta, r)
+    }
+}
+
+#[test]
+fn pulse_slopes_are_the_derivatives_of_the_bin_probabilities() {
+    let true_energy_ev = 25.0_f64;
+    let arrival_us = 365.0;
+    let edges: Vec<f64> = [-1.0, -0.3, 0.0, 0.2, 0.7, 1.5, 3.0, 6.0, 12.0, 30.0, 1.0e4]
+        .iter()
+        .map(|delay| arrival_us + delay)
+        .collect();
+    let laws = |pulse: [f64; 4]| constant_pulse(pulse[0], pulse[1], pulse[2], pulse[3].sqrt());
+    let bins = |pulse: [f64; 4]| {
+        laws(pulse)
+            .bin_probabilities_at(true_energy_ev, arrival_us, &edges)
+            .expect("bins")
+    };
+    let slopes = |pulse: [f64; 4]| {
+        laws(pulse)
+            .bin_pulse_slopes_at(true_energy_ev, arrival_us, &edges)
+            .expect("slopes")
+    };
+    let largest = |values: &[f64]| values.iter().fold(0.0_f64, |m, v| m.max(v.abs()));
+    for (alpha, beta) in [(1.7, 0.25), (0.3, 1.2), (0.8, 0.8), (0.81, 0.8)] {
+        for fwhm_squared in [0.0, 0.35 * 0.35] {
+            let pulse = [alpha, beta, 0.3, fwhm_squared];
+            let analytic = slopes(pulse);
+            let parameters = if fwhm_squared > 0.0 { 4 } else { 3 };
+            for (n, analytic) in analytic.iter().enumerate().take(parameters) {
+                let step = if n == 3 { 1e-3 } else { 1e-4 } * pulse[n];
+                let (mut up, mut down) = (pulse, pulse);
+                up[n] += step;
+                down[n] -= step;
+                let (up, down) = (bins(up), bins(down));
+                for (k, slope) in analytic.iter().enumerate() {
+                    let central = (up[k] - down[k]) / (2.0 * step);
+                    assert!(
+                        (slope - central).abs() <= 1e-7 * largest(analytic),
+                        "α {alpha} β {beta} h² {fwhm_squared} parameter {n} bin {k}: {slope} vs {central}"
+                    );
+                }
+            }
+        }
+    }
+
+    for r in [0.0, 0.3] {
+        let unfolded = [1.7, 0.25, r, 0.0];
+        let analytic = &slopes(unfolded)[3];
+        let mut folded = unfolded;
+        folded[3] = 1e-6;
+        let away_from_the_onset = |k: usize| {
+            [edges[k], edges[k + 1]]
+                .iter()
+                .all(|edge| (edge - arrival_us).abs() > 0.01)
+        };
+        for (k, (a, b)) in bins(folded).iter().zip(bins(unfolded)).enumerate() {
+            let one_sided = (a - b) / 1e-6;
+            assert!(
+                !away_from_the_onset(k)
+                    || (analytic[k] - one_sided).abs() <= 1e-6 * largest(analytic),
+                "R {r}, h² = 0, bin {k}: {} vs {one_sided}",
+                analytic[k]
+            );
+        }
+    }
+
+    let unstored = [1.7, 0.25, 0.0, 0.35 * 0.35];
+    let analytic = &slopes(unstored)[2];
+    let mut stored = unstored;
+    stored[2] = 1e-6;
+    for (k, (a, b)) in bins(stored).iter().zip(bins(unstored)).enumerate() {
+        let one_sided = (a - b) / 1e-6;
+        assert!(
+            (analytic[k] - one_sided).abs() <= 1e-7 * largest(analytic),
+            "R = 0 bin {k}: {} vs {one_sided}",
+            analytic[k]
+        );
+    }
+
+    let (alpha, beta) = (0.85, 0.8);
+    let at = |fwhm_us: f64, tau: f64| {
+        constant_pulse(alpha, beta, 0.3, fwhm_us)
+            .bin_pulse_slopes_at(true_energy_ev, 0.0, &[0.5 * tau, tau])
+            .expect("slopes")
+    };
+    let switch_us = 0.05 / (alpha - beta);
+    let (below, above) = (
+        at(0.0, switch_us * (1.0 - 1e-12)),
+        at(0.0, switch_us * (1.0 + 1e-12)),
+    );
+    for n in 0..3 {
+        assert!(
+            (below[n][0] - above[n][0]).abs() <= 1e-9 * above[n][0].abs(),
+            "parameter {n}: {} vs {}",
+            below[n][0],
+            above[n][0]
+        );
+    }
+    let unfolded = at(0.0, 2.0);
+    for fwhm_us in [1e-5, 1e-110] {
+        let narrow = at(fwhm_us, 2.0);
+        assert!(
+            (unfolded[3][0] - narrow[3][0]).abs() <= 1e-8 * unfolded[3][0].abs(),
+            "{fwhm_us}: {} vs {}",
+            unfolded[3][0],
+            narrow[3][0]
+        );
+    }
+}
+
+#[test]
+fn invalid_triangles_and_vanishing_rates_are_refused_in_detector_time() {
+    let edges = [360.0, 361.0, 362.0];
+    for fwhm_us in [-0.35, f64::NAN, f64::INFINITY] {
+        let pulse = constant_pulse(1.7, 0.25, 0.3, fwhm_us);
+        assert!(pulse.bin_probabilities_at(25.0, 359.0, &edges).is_err());
+        assert!(DetectorPulse::new(pulse, (1.0, 100.0), 64).is_err());
+    }
+    for (alpha, beta) in [(5e-10, 0.25), (1.7, 5e-10)] {
+        let pulse = constant_pulse(alpha, beta, 0.3, 0.0);
+        assert!(pulse.bin_pulse_slopes_at(25.0, 359.0, &edges).is_err());
+        assert!(DetectorPulse::new(pulse, (1.0, 100.0), 64).is_err());
+    }
+}
+
+#[test]
+fn a_narrow_triangle_on_a_long_storage_tail_moves_the_rise_by_at_most_its_width() {
+    let n_tau = 256;
+    let alpha = 1.7;
+    let prompt_step_us = 18.0 / alpha / (n_tau as f64 - 1.0);
+    let rise = |fwhm_us: f64| {
+        DetectorPulse::new(
+            constant_pulse(alpha, 0.02, 0.15, fwhm_us),
+            (1.0, 100.0),
+            n_tau,
+        )
+        .expect("pulse")
+        .rise_us(25.0)
+        .expect("rise")
+    };
+    let unfolded = rise(0.0);
+    for fwhm_us in [0.01, 0.1] {
+        let folded = rise(fwhm_us);
+        assert!(
+            (folded - unfolded).abs() <= fwhm_us + prompt_step_us,
+            "{fwhm_us}: {folded} vs {unfolded}"
+        );
     }
 }

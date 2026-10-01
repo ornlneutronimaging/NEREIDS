@@ -5,18 +5,17 @@
 //! `E = (TOF_FACTOR·L/u)²` and arrives at `t0 + u + delay`, the delay drawn
 //! from the Ikeda–Carpenter pulse at `E`.  The grid spans every flight time
 //! whose neutrons reach the bins with more than [`NEGLIGIBLE_ARRIVAL_PROBABILITY`](crate::ikeda_carpenter::NEGLIGIBLE_ARRIVAL_PROBABILITY) chance, and refuses
-//! a window that neutrons from outside the pulse's synthesis grid can reach.
+//! a window that neutrons from outside the pulse's energy span can reach.
 //!
 //! Its points keep their energies at any other `t0'` and `L'`: point `j`,
 //! of flight time `u_j` at the grid's own `t0` and `L`, then arrives at
 //! `t0' + (L'/L)·u_j` and stands for `(L'/L)` times the step.
 
 use std::fmt;
-use std::sync::Arc;
 
 use rayon::prelude::*;
 
-use crate::ikeda_carpenter::{EnergyLaw, IkedaCarpenter};
+use crate::ikeda_carpenter::{DetectorPulse, EnergyLaw, IkedaCarpenterParams};
 use crate::resolution::{ResolutionParseError, TOF_FACTOR};
 
 /// Largest number of grid points a window may need.
@@ -39,8 +38,8 @@ pub enum FlightTimeGridError {
     LengthensWithEnergy { parameter: &'static str },
     /// The pulse cannot be evaluated.
     Pulse(ResolutionParseError),
-    /// Neutrons with energies outside the pulse's synthesis grid,
-    /// `low_ev` to `high_ev`, can reach the window.
+    /// Neutrons with energies outside the pulse's energy span, `low_ev` to
+    /// `high_ev`, can reach the window.
     OutsideCalibration { low_ev: f64, high_ev: f64 },
     /// A grid at `step_us` would need more than [`MAX_POINTS`] points.
     TooManyPoints { step_us: f64 },
@@ -70,7 +69,7 @@ impl fmt::Display for FlightTimeGridError {
             Self::Pulse(e) => write!(f, "pulse: {e}"),
             Self::OutsideCalibration { low_ev, high_ev } => write!(
                 f,
-                "neutrons from outside the pulse's synthesis grid, {low_ev} to \
+                "neutrons from outside the pulse's energy span, {low_ev} to \
                  {high_ev} eV, can reach the window"
             ),
             Self::TooManyPoints { step_us } => write!(
@@ -105,28 +104,24 @@ pub struct Rows {
 }
 
 impl Rows {
-    fn new(
-        step_us: f64,
-        bins: usize,
-        rows: Vec<Result<Vec<(usize, f64)>, ResolutionParseError>>,
-    ) -> Result<Self, FlightTimeGridError> {
+    fn new<'a>(step_us: f64, bins: usize, rows: impl Iterator<Item = &'a [(usize, f64)]>) -> Self {
         let mut row_offsets = vec![0];
         let mut columns = Vec::new();
         let mut values = Vec::new();
         for row in rows {
-            for (k, v) in row? {
+            for &(k, v) in row {
                 columns.push(k);
                 values.push(v);
             }
             row_offsets.push(values.len());
         }
-        Ok(Self {
+        Self {
             step_us,
             bins,
             row_offsets,
             columns,
             values,
-        })
+        }
     }
 
     /// `step · Σ_j v_j R_k(j)` for each bin `k`, with `values[j]` the value
@@ -163,7 +158,7 @@ pub struct FlightTimeGrid {
     time_edges_us: Vec<f64>,
     t0_us: f64,
     flight_path_m: f64,
-    pulse: Arc<IkedaCarpenter>,
+    pulse: DetectorPulse,
     range_us: (f64, f64),
     step_us: f64,
     flight_times_us: Vec<f64>,
@@ -171,9 +166,8 @@ pub struct FlightTimeGrid {
 }
 
 impl FlightTimeGrid {
-    /// The grid for bins `time_edges_us` (µs) with timing offset `t0_us` and
-    /// flight path `flight_path_m`; the pulse's own flight path is not used.
-    /// The step, half the pulse's shorter rise at the two ends of the flight
+    /// The grid for bins `time_edges_us` (µs) with timing offset `t0_us`,
+    /// flight path `flight_path_m` and `pulse`.  The step, half the pulse's shorter rise at the two ends of the flight
     /// times whose neutrons can reach the bins, is a starting step: the counts
     /// are converged once [`Self::halved`] no longer changes them.  The grid
     /// extends one step beyond those flight times at each end.
@@ -184,7 +178,7 @@ impl FlightTimeGrid {
         time_edges_us: &[f64],
         t0_us: f64,
         flight_path_m: f64,
-        pulse: &Arc<IkedaCarpenter>,
+        pulse: &DetectorPulse,
     ) -> Result<Self, FlightTimeGridError> {
         if time_edges_us.len() < 2
             || !time_edges_us.iter().all(|t| t.is_finite())
@@ -192,7 +186,12 @@ impl FlightTimeGrid {
         {
             return Err(FlightTimeGridError::InvalidTimeEdges);
         }
-        let (u_lo, u_hi) = range_us(time_edges_us, t0_us, flight_path_m, pulse)?;
+        let (u_lo, u_hi) = range_us(
+            time_edges_us,
+            (t0_us, flight_path_m),
+            pulse.params(),
+            pulse.energy_span_ev(),
+        )?;
         let energy = |u: f64| (TOF_FACTOR * flight_path_m / u).powi(2);
         let rise = pulse
             .rise_us(energy(u_lo))?
@@ -210,12 +209,23 @@ impl FlightTimeGrid {
 
     /// Whether the grid's points, arriving as [`Self::rows_at`] places them,
     /// cover every flight time whose neutrons can reach the bins when the
-    /// timing offset is `t0_us` and the flight path `flight_path_m`.
+    /// timing offset is `t0_us`, the flight path `flight_path_m` and the
+    /// pulse's laws `params`.
     ///
     /// # Errors
-    /// As [`Self::new`] for that timing offset and flight path.
-    pub fn covers(&self, t0_us: f64, flight_path_m: f64) -> Result<bool, FlightTimeGridError> {
-        let (u_lo, u_hi) = range_us(&self.time_edges_us, t0_us, flight_path_m, &self.pulse)?;
+    /// As [`Self::new`] for that timing offset, flight path and pulse.
+    pub fn covers(
+        &self,
+        t0_us: f64,
+        flight_path_m: f64,
+        params: &IkedaCarpenterParams,
+    ) -> Result<bool, FlightTimeGridError> {
+        let (u_lo, u_hi) = range_us(
+            &self.time_edges_us,
+            (t0_us, flight_path_m),
+            params,
+            self.pulse.energy_span_ev(),
+        )?;
         let scale = self.flight_path_m / flight_path_m;
         Ok(u_lo * scale >= self.range_us.0 && u_hi * scale <= self.range_us.1)
     }
@@ -223,9 +233,9 @@ impl FlightTimeGrid {
 
 fn range_us(
     time_edges_us: &[f64],
-    t0_us: f64,
-    flight_path_m: f64,
-    pulse: &Arc<IkedaCarpenter>,
+    (t0_us, flight_path_m): (f64, f64),
+    params: &IkedaCarpenterParams,
+    (e_min, e_max): (f64, f64),
 ) -> Result<(f64, f64), FlightTimeGridError> {
     if !t0_us.is_finite() {
         return Err(FlightTimeGridError::InvalidTimingOffset(t0_us));
@@ -233,9 +243,6 @@ fn range_us(
     if !(flight_path_m.is_finite() && flight_path_m > 0.0) {
         return Err(FlightTimeGridError::InvalidFlightPath(flight_path_m));
     }
-    let references = pulse.ref_energies();
-    let (e_min, e_max) = (references[0], references[references.len() - 1]);
-    let params = pulse.params();
     let change = |law: &EnergyLaw| law.eval(e_max) - law.eval(e_min);
     for (parameter, lengthens) in [
         ("α", change(&params.alpha) < 0.0),
@@ -254,12 +261,12 @@ fn range_us(
     let first_edge = time_edges_us[0] - t0_us;
     let last_edge = time_edges_us[time_edges_us.len() - 1] - t0_us;
     let latest = |u: f64| {
-        pulse
+        params
             .delays_us(energy(u))
             .map(|(_, last)| u + last - first_edge)
     };
     let earliest = |u: f64| {
-        pulse
+        params
             .delays_us(energy(u))
             .map(|(first, _)| u + first - last_edge)
     };
@@ -280,7 +287,7 @@ impl FlightTimeGrid {
     fn build(
         time_edges_us: &[f64],
         (t0_us, flight_path_m): (f64, f64),
-        pulse: &Arc<IkedaCarpenter>,
+        pulse: &DetectorPulse,
         range_us: (f64, f64),
         intervals: usize,
     ) -> Result<Self, FlightTimeGridError> {
@@ -295,13 +302,13 @@ impl FlightTimeGrid {
             time_edges_us: time_edges_us.to_vec(),
             t0_us,
             flight_path_m,
-            pulse: Arc::clone(pulse),
+            pulse: pulse.clone(),
             range_us,
             step_us,
             flight_times_us,
-            rows: Rows::new(step_us, 0, Vec::new())?,
+            rows: Rows::new(step_us, 0, std::iter::empty()),
         };
-        grid.rows = grid.rows_at(t0_us, flight_path_m)?;
+        grid.rows = grid.rows_at(t0_us, flight_path_m, pulse.params())?;
         Ok(grid)
     }
 
@@ -320,21 +327,26 @@ impl FlightTimeGrid {
     }
 
     /// The probability that each grid point's neutrons are counted in each
-    /// bin when the timing offset is `t0_us` and the flight path
-    /// `flight_path_m`, with the step each point then stands for.  Neutrons
-    /// from flight times the grid does not [cover](Self::covers) there are not
-    /// counted.
+    /// bin when the timing offset is `t0_us`, the flight path `flight_path_m`
+    /// and the pulse's laws `params`, with the step each point then stands
+    /// for.  Neutrons from flight times the grid does not
+    /// [cover](Self::covers) there are not counted.
     ///
     /// # Errors
     /// [`FlightTimeGridError::InvalidTimingOffset`] or
     /// [`FlightTimeGridError::InvalidFlightPath`] unless `t0_us` is finite and
     /// `flight_path_m` finite and positive; [`FlightTimeGridError::Pulse`] if
     /// the pulse cannot be evaluated there.
-    pub fn rows_at(&self, t0_us: f64, flight_path_m: f64) -> Result<Rows, FlightTimeGridError> {
-        self.rows_with(t0_us, flight_path_m, |energy, arrival| {
-            self.pulse
-                .bin_probabilities_at(energy, arrival, &self.time_edges_us)
-        })
+    pub fn rows_at(
+        &self,
+        t0_us: f64,
+        flight_path_m: f64,
+        params: &IkedaCarpenterParams,
+    ) -> Result<Rows, FlightTimeGridError> {
+        let [rows] = self.rows_with(t0_us, flight_path_m, |energy, arrival| {
+            Ok([params.bin_probabilities_at(energy, arrival, &self.time_edges_us)?])
+        })?;
+        Ok(rows)
     }
 
     /// The derivative of [`Self::rows_at`]'s probabilities with respect to
@@ -346,19 +358,39 @@ impl FlightTimeGrid {
         &self,
         t0_us: f64,
         flight_path_m: f64,
+        params: &IkedaCarpenterParams,
     ) -> Result<Rows, FlightTimeGridError> {
-        self.rows_with(t0_us, flight_path_m, |energy, arrival| {
-            self.pulse
-                .bin_arrival_slopes_at(energy, arrival, &self.time_edges_us)
-        })
+        let [rows] = self.rows_with(t0_us, flight_path_m, |energy, arrival| {
+            Ok([params.bin_arrival_slopes_at(energy, arrival, &self.time_edges_us)?])
+        })?;
+        Ok(rows)
     }
 
-    fn rows_with(
+    /// The derivatives of [`Self::rows_at`]'s probabilities with respect to
+    /// `α`, `β`, `R` and the square of the triangle's FWHM, each at its point's
+    /// energy, with
+    /// the same step: [`IkedaCarpenterParams::bin_pulse_slopes_at`] for every
+    /// point.
+    ///
+    /// # Errors
+    /// As [`Self::rows_at`].
+    pub fn pulse_slopes_at(
         &self,
         t0_us: f64,
         flight_path_m: f64,
-        row: impl Fn(f64, f64) -> Result<Vec<f64>, ResolutionParseError> + Sync,
-    ) -> Result<Rows, FlightTimeGridError> {
+        params: &IkedaCarpenterParams,
+    ) -> Result<[Rows; 4], FlightTimeGridError> {
+        self.rows_with(t0_us, flight_path_m, |energy, arrival| {
+            params.bin_pulse_slopes_at(energy, arrival, &self.time_edges_us)
+        })
+    }
+
+    fn rows_with<const N: usize>(
+        &self,
+        t0_us: f64,
+        flight_path_m: f64,
+        row: impl Fn(f64, f64) -> Result<[Vec<f64>; N], ResolutionParseError> + Sync,
+    ) -> Result<[Rows; N], FlightTimeGridError> {
         if !t0_us.is_finite() {
             return Err(FlightTimeGridError::InvalidTimingOffset(t0_us));
         }
@@ -367,24 +399,42 @@ impl FlightTimeGrid {
         }
         let scale = flight_path_m / self.flight_path_m;
         let clock = TOF_FACTOR * self.flight_path_m;
-        let rows: Vec<Result<Vec<(usize, f64)>, ResolutionParseError>> = self
+        let points: Vec<[Vec<(usize, f64)>; N]> = self
             .energies_ev()
             .par_iter()
             .map(|&energy| {
-                Ok(row(energy, t0_us + scale * (clock / energy.sqrt()))?
-                    .into_iter()
-                    .enumerate()
-                    .filter(|&(_, v)| v != 0.0)
-                    .collect())
+                Ok(
+                    row(energy, t0_us + scale * (clock / energy.sqrt()))?.map(|values| {
+                        values
+                            .into_iter()
+                            .enumerate()
+                            .filter(|&(_, v)| v != 0.0)
+                            .collect()
+                    }),
+                )
             })
-            .collect();
-        Rows::new(self.step_us * scale, self.time_edges_us.len() - 1, rows)
+            .collect::<Result<_, ResolutionParseError>>()?;
+        let bins = self.time_edges_us.len() - 1;
+        Ok(std::array::from_fn(|n| {
+            Rows::new(
+                self.step_us * scale,
+                bins,
+                points.iter().map(|point| point[n].as_slice()),
+            )
+        }))
     }
 
-    /// The probabilities at the grid's own timing offset and flight path.
+    /// The probabilities at the grid's own timing offset, flight path and
+    /// pulse.
     #[must_use]
     pub fn rows(&self) -> &Rows {
         &self.rows
+    }
+
+    /// The pulse the grid was built at.
+    #[must_use]
+    pub fn pulse(&self) -> &DetectorPulse {
+        &self.pulse
     }
 
     /// The timing offset in µs the grid was built at.

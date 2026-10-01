@@ -8,7 +8,7 @@ use nereids_fitting::lm::{FitModel, FlatMatrix};
 use nereids_fitting::parameters::{FitParameter, ParameterSet};
 use nereids_fitting::poisson::{PoissonConfig, PoissonResult, Prior, poisson_fit};
 use nereids_physics::flight_time_grid::{FlightTimeGrid, FlightTimeGridError};
-use nereids_physics::ikeda_carpenter::IkedaCarpenter;
+use nereids_physics::ikeda_carpenter::{DetectorPulse, EnergyLaw, IkedaCarpenterParams};
 
 use crate::beam::BeamSpline;
 use crate::counts_fit::Value;
@@ -20,20 +20,23 @@ use crate::error::PipelineError;
 pub const BOUND: f64 = 0.01;
 
 /// A neutron of flight time `u` over the flight path `flight_path_m` (m)
-/// arrives at `t0_us + u` (µs) plus a delay drawn from `pulse`; the pulse's
-/// own flight path is not used.  [`fit_counts`](crate::counts_fit::fit_counts)
-/// fits `t0_us` and `flight_path_m` unless they are known; [`fit_open_beam`]
-/// uses their starting values.
+/// arrives at `t0_us + u` (µs) plus a delay drawn from `pulse`.
+/// [`fit_counts`](crate::counts_fit::fit_counts) fits `t0_us`,
+/// `flight_path_m` and the pulse's numbers unless they are known;
+/// [`fit_open_beam`] uses their starting values.
 #[derive(Debug, Clone)]
 pub struct Calibration {
     pub t0_us: Value,
     pub flight_path_m: Value,
-    pub pulse: Arc<IkedaCarpenter>,
+    pub pulse: Pulse,
 }
 
 impl Calibration {
-    pub(crate) fn energy_scale(&self) -> Result<(FitParameter, FitParameter), PipelineError> {
-        Ok((
+    pub(crate) fn instrument(&self) -> Result<Vec<FitParameter>, PipelineError> {
+        let rate = |name: &'static str, value: &Value| {
+            value.parameter(name, 0.0..=f64::INFINITY, "0 or more")
+        };
+        Ok(vec![
             self.t0_us
                 .parameter("t0", f64::NEG_INFINITY..=f64::INFINITY, "any real number")?,
             self.flight_path_m.parameter(
@@ -41,7 +44,59 @@ impl Calibration {
                 f64::MIN_POSITIVE..=f64::INFINITY,
                 "positive",
             )?,
-        ))
+            rate("α₀", &self.pulse.alpha[0])?,
+            rate("α₁", &self.pulse.alpha[1])?,
+            rate("β₀", &self.pulse.beta[0])?,
+            rate("β₁", &self.pulse.beta[1])?,
+            self.pulse.r.parameter("R", 0.0..=1.0, "within 0–1")?,
+            rate("the triangle's squared FWHM", &self.pulse.fwhm_squared_us2)?,
+        ])
+    }
+}
+
+/// The Ikeda–Carpenter pulse with `α = α₀√E + α₁` and `β = β₀√E + β₁` in
+/// 1/µs, `E` in eV, a storage fraction `R` constant over `energy_span_ev`, and
+/// the proton pulse's triangle of FWHM `h` in µs, given by `h²`, in which the
+/// counts are smooth down to `h = 0`.  `α` and `β` must be at least 1e-9 µs⁻¹
+/// across the span, `β` even where `R` is 0.
+#[derive(Debug, Clone)]
+pub struct Pulse {
+    /// `[α₀, α₁]`, in 1/(µs·√eV) and 1/µs, each 0 or more.
+    pub alpha: [Value; 2],
+    /// `[β₀, β₁]`, in 1/(µs·√eV) and 1/µs, each 0 or more.
+    pub beta: [Value; 2],
+    /// `R`, within 0–1.
+    pub r: Value,
+    /// `h²` in µs², 0 or more.
+    pub fwhm_squared_us2: Value,
+    /// `(low, high)`, the energies in eV the laws hold over; a window that
+    /// neutrons from outside them can reach is refused.
+    pub energy_span_ev: (f64, f64),
+    /// Samples across the prompt core that find the pulse's rise, which sets
+    /// the grid's first step; at least 8.
+    pub n_tau: usize,
+}
+
+impl Pulse {
+    pub(crate) fn at(&self, numbers: &[f64]) -> Result<DetectorPulse, PipelineError> {
+        DetectorPulse::new(laws(numbers), self.energy_span_ev, self.n_tau)
+            .map_err(|e| PipelineError::InvalidParameter(e.to_string()))
+    }
+}
+
+pub(crate) fn laws(numbers: &[f64]) -> IkedaCarpenterParams {
+    IkedaCarpenterParams {
+        alpha: EnergyLaw::SqrtE {
+            a0: numbers[0],
+            a1: numbers[1],
+        },
+        beta: EnergyLaw::SqrtE {
+            a0: numbers[2],
+            a1: numbers[3],
+        },
+        r: EnergyLaw::Const(numbers[4]),
+        burst_sigma_us: None,
+        channel_fwhm_us: Some(numbers[5].sqrt()),
     }
 }
 
@@ -124,10 +179,12 @@ pub struct OpenBeamFit {
 /// [`PipelineError::InvalidParameter`] if a count is not a whole non-negative
 /// number, every count is zero, a live fraction is not in (0, 1], there are
 /// fewer than 8 bins (one interval's four coefficients and as many bins again
-/// to measure the noise), the calibration's known, starting or measured `t0`
-/// is not finite or its flight path not finite and positive, a measured one's
-/// sd is not finite and positive, or bounds are not `lower < upper` in that
-/// range with the start between them;
+/// to measure the noise), a known, starting or measured value of the
+/// calibration is not finite and in its quantity's range, a measured one's sd
+/// is not finite and positive, bounds are not `lower < upper` in that range
+/// with the start between them, the pulse's energy span is not `0 < low <
+/// high`, its `n_tau` is below 8, or its starting `α` or `β` is below 1e-9
+/// µs⁻¹ at an end of the span;
 /// [`PipelineError::FlightTimeGrid`] for the grid's refusals, including the
 /// first candidate's halving past the point cap; [`PipelineError::Fitting`] if
 /// the fitter refuses.
@@ -137,13 +194,17 @@ pub fn fit_open_beam(
     calibration: &Calibration,
     open_live: Option<&[f64]>,
 ) -> Result<OpenBeamFit, PipelineError> {
-    let (t0, flight_path) = calibration.energy_scale()?;
-    let t0_us = t0.value;
+    let start: Vec<f64> = calibration
+        .instrument()?
+        .iter()
+        .map(|parameter| parameter.value)
+        .collect();
+    let t0_us = start[0];
     let grid = Arc::new(FlightTimeGrid::new(
         time_edges_us,
         t0_us,
-        flight_path.value,
-        &calibration.pulse,
+        start[1],
+        &calibration.pulse.at(&start[2..])?,
     )?);
     validate_counts("open-beam", open_counts, time_edges_us.len() - 1)?;
     let live = validate_live("open-beam", open_live, time_edges_us.len() - 1)?;
@@ -556,7 +617,7 @@ impl FitModel for OpenBeamModel {
 
 #[cfg(test)]
 pub(crate) mod tests {
-    use nereids_physics::ikeda_carpenter::{EnergyLaw, IkedaCarpenterParams, SynthesisGrid};
+    use nereids_physics::ikeda_carpenter::{IkedaCarpenter, SynthesisGrid};
 
     use super::*;
 
@@ -586,7 +647,10 @@ pub(crate) mod tests {
         )
         .expect("valid IC model");
         let edges: Vec<f64> = EDGES_US.map(f64::from).collect();
-        Arc::new(FlightTimeGrid::new(&edges, T0_US, FLIGHT_PATH_M, &Arc::new(pulse)).expect("grid"))
+        Arc::new(
+            FlightTimeGrid::new(&edges, T0_US, FLIGHT_PATH_M, &pulse.detector_pulse())
+                .expect("grid"),
+        )
     }
 
     #[test]
