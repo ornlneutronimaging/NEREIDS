@@ -74,8 +74,8 @@ pub struct PoissonResult {
     /// Each count's leverage: the diagonal of the hat matrix of the free
     /// parameters off their bounds.  The leverages sum to the number of
     /// directions in those parameters the counts and priors determine, less
-    /// the share the priors take.  `None` when `covariance` is or cannot be
-    /// computed.
+    /// the share the priors take.  `None` when `covariance` is `None` or its
+    /// decomposition fails.
     pub leverage: Option<Vec<f64>>,
 }
 

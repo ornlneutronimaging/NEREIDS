@@ -635,7 +635,13 @@ fn inverse(mut a: Vec<Vec<f64>>) -> Vec<Vec<f64>> {
 #[test]
 fn the_covariance_is_the_inverse_of_the_information_in_the_counts_and_measurements() {
     covariance_against_information(Value::Known(TEMPERATURE_K), false);
-    covariance_against_information(Value::Fitted(1000.0), true);
+    covariance_against_information(
+        Value::Measured {
+            value: TEMPERATURE_K,
+            sd: 0.02 * TEMPERATURE_K,
+        },
+        true,
+    );
 }
 
 fn covariance_against_information(temperature: Value, noisy: bool) {
@@ -651,25 +657,38 @@ fn covariance_against_information(temperature: Value, noisy: bool) {
     m.background[0] = Value::Fitted(TERMS[1]);
     m.background[1] = Value::Fitted(TERMS[2]);
     m.background[2] = Value::Known(TERMS[3]);
-    let fitted_temperature = matches!(temperature, Value::Fitted(_));
+    let fitted_temperature = !matches!(temperature, Value::Known(_));
     let first_term = truth.len() + usize::from(fitted_temperature);
     let measured: Vec<(usize, f64, f64)> = if noisy {
         m.sample_counts = draw(&m.sample_counts, 500, 7.0);
-        vec![
-            (0, truth[0].1, 0.05 * truth[0].1),
-            (first_term, TERMS[0], 0.01 * TERMS[0]),
-            (first_term + 1, TERMS[1], 0.2 * TERMS[1]),
-        ]
+        let (density_sd, a_sd, b0_sd) = (0.05 * truth[0].1, 0.01 * TERMS[0], 0.2 * TERMS[1]);
+        m.isotopes[0].1 = Value::Measured {
+            value: truth[0].1,
+            sd: density_sd,
+        };
+        m.normalization = Value::Measured {
+            value: TERMS[0],
+            sd: a_sd,
+        };
+        m.background[0] = Value::Measured {
+            value: TERMS[1],
+            sd: b0_sd,
+        };
+        let temperature = match temperature {
+            Value::Measured { value, sd } => Some((truth.len(), value, sd)),
+            _ => None,
+        };
+        [(0, truth[0].1, density_sd)]
+            .into_iter()
+            .chain(temperature)
+            .chain([
+                (first_term, TERMS[0], a_sd),
+                (first_term + 1, TERMS[1], b0_sd),
+            ])
+            .collect()
     } else {
         Vec::new()
     };
-    for (&(_, value, sd), slot) in measured.iter().zip([
-        &mut m.isotopes[0].1,
-        &mut m.normalization,
-        &mut m.background[0],
-    ]) {
-        *slot = Value::Measured { value, sd };
-    }
     let fit = fit_counts(&m, &calibration(&setup)).expect("fit");
     let quantities = first_term + 3;
     let (low, high) = FlightTimeGrid::new(&setup.edges, T0_US, &setup.pulse)
