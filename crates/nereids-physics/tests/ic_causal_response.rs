@@ -797,3 +797,42 @@ fn cdf_far_tail_values_are_exact_not_nan() {
     let overflow_prompt = ic_cdf(1.0e155, 1.0, 0.0, 1.0);
     assert_eq!(overflow_prompt, 1.0, "Γ₃ far tail must saturate at 1");
 }
+
+#[test]
+fn arrival_slopes_are_the_derivative_of_the_bin_probabilities() {
+    let true_energy_ev = 25.0_f64;
+    let arrival_us = 365.0;
+    let edges: Vec<f64> = [-1.0, -0.3, 0.0, 0.2, 0.7, 1.5, 3.0, 6.0, 12.0, 30.0]
+        .iter()
+        .map(|delay| arrival_us + delay)
+        .collect();
+    for channel_fwhm_us in [None, Some(0.35)] {
+        let model = IkedaCarpenter::new(
+            IkedaCarpenterParams {
+                channel_fwhm_us,
+                ..IkedaCarpenterParams::constant(1.7, 0.25, 0.3)
+            },
+            25.0,
+            &SynthesisGrid::new(20.0, 30.0),
+        )
+        .expect("valid IC model");
+        let bins = |arrival: f64| {
+            model
+                .bin_probabilities_at(true_energy_ev, arrival, &edges)
+                .expect("bins")
+        };
+        let slopes = model
+            .bin_arrival_slopes_at(true_energy_ev, arrival_us, &edges)
+            .expect("slopes");
+        let h = 1e-4;
+        let (up, down) = (bins(arrival_us + h), bins(arrival_us - h));
+        let largest = slopes.iter().fold(0.0_f64, |m, s| m.max(s.abs()));
+        for (k, slope) in slopes.iter().enumerate() {
+            let central = (up[k] - down[k]) / (2.0 * h);
+            assert!(
+                (slope - central).abs() <= 1e-7 * largest,
+                "{channel_fwhm_us:?} bin {k}: {slope} vs {central}"
+            );
+        }
+    }
+}

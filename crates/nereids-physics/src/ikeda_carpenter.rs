@@ -348,7 +348,7 @@ const GAUSS_LEGENDRE_16: [(f64, f64); 8] = [
     (0.989_400_934_991_649_9, 0.027_152_459_411_754_055),
 ];
 
-fn ic_cdf_folded(alpha: f64, beta: f64, r: f64, fwhm_us: f64, delay_us: f64) -> f64 {
+fn triangle_fold(alpha: f64, fwhm_us: f64, delay_us: f64, g: impl Fn(f64) -> f64) -> f64 {
     let end = delay_us.min(fwhm_us);
     let finest = 2.0 / alpha.max(MIN_RATE);
     let mut total = 0.0;
@@ -359,15 +359,19 @@ fn ic_cdf_folded(alpha: f64, beta: f64, r: f64, fwhm_us: f64, delay_us: f64) -> 
             let (centre, half) = (0.5 * (left + right), 0.5 * (right - left));
             for &(node, weight) in &GAUSS_LEGENDRE_16 {
                 for s in [centre - half * node, centre + half * node] {
-                    total += half * weight * (fwhm_us - s.abs()) / (fwhm_us * fwhm_us)
-                        * ic_cdf(alpha, beta, r, delay_us - s);
+                    total +=
+                        half * weight * (fwhm_us - s.abs()) / (fwhm_us * fwhm_us) * g(delay_us - s);
                 }
             }
             right = left;
             width *= 2.0;
         }
     }
-    total.clamp(0.0, 1.0)
+    total
+}
+
+fn ic_cdf_folded(alpha: f64, beta: f64, r: f64, fwhm_us: f64, delay_us: f64) -> f64 {
+    triangle_fold(alpha, fwhm_us, delay_us, |x| ic_cdf(alpha, beta, r, x)).clamp(0.0, 1.0)
 }
 
 /// Gamma(3, rate=1) cumulative distribution at dimensionless time `x`.
@@ -852,10 +856,84 @@ impl IkedaCarpenter {
         detector_time_edges_us: &[f64],
         timing_offset_us: f64,
     ) -> Result<Vec<f64>, ResolutionParseError> {
-        self.validate_probe_energy(true_energy_ev)?;
         if !timing_offset_us.is_finite() {
             return Err(ResolutionParseError::InvalidFormat(format!(
                 "timing_offset_us must be finite, got {timing_offset_us}"
+            )));
+        }
+        self.bin_probabilities_at(
+            true_energy_ev,
+            timing_offset_us + TOF_FACTOR * self.flight_path_m / true_energy_ev.sqrt(),
+            detector_time_edges_us,
+        )
+    }
+
+    /// Probability that a neutron of `true_energy_ev` whose nominal arrival,
+    /// before the pulse's delay, is `arrival_us` is recorded in each bin of
+    /// `detector_time_edges_us`; as [`Self::detector_bin_probabilities`].
+    ///
+    /// # Errors
+    /// As [`Self::detector_bin_probabilities`], with `arrival_us` finite.
+    pub fn bin_probabilities_at(
+        &self,
+        true_energy_ev: f64,
+        arrival_us: f64,
+        detector_time_edges_us: &[f64],
+    ) -> Result<Vec<f64>, ResolutionParseError> {
+        let (alpha, beta, r, h) =
+            self.at_arrival(true_energy_ev, arrival_us, detector_time_edges_us)?;
+        let cdf = |x: f64| {
+            if h == 0.0 {
+                ic_cdf(alpha, beta, r, x)
+            } else {
+                ic_cdf_folded(alpha, beta, r, h, x)
+            }
+        };
+        let cdfs: Vec<f64> = detector_time_edges_us
+            .iter()
+            .map(|edge| cdf(edge - arrival_us))
+            .collect();
+        Ok(cdfs.windows(2).map(|w| (w[1] - w[0]).max(0.0)).collect())
+    }
+
+    /// The derivative of each of [`Self::bin_probabilities_at`] with respect
+    /// to `arrival_us`, per µs: the pulse density, folded with the triangle,
+    /// at the bin's lower edge minus that at its upper edge.
+    ///
+    /// # Errors
+    /// As [`Self::bin_probabilities_at`].
+    pub fn bin_arrival_slopes_at(
+        &self,
+        true_energy_ev: f64,
+        arrival_us: f64,
+        detector_time_edges_us: &[f64],
+    ) -> Result<Vec<f64>, ResolutionParseError> {
+        let (alpha, beta, r, h) =
+            self.at_arrival(true_energy_ev, arrival_us, detector_time_edges_us)?;
+        let density = |x: f64| {
+            if h == 0.0 {
+                ic_pulse(alpha, beta, r, x)
+            } else {
+                triangle_fold(alpha, h, x, |tau| ic_pulse(alpha, beta, r, tau))
+            }
+        };
+        let densities: Vec<f64> = detector_time_edges_us
+            .iter()
+            .map(|edge| density(edge - arrival_us))
+            .collect();
+        Ok(densities.windows(2).map(|w| w[0] - w[1]).collect())
+    }
+
+    fn at_arrival(
+        &self,
+        true_energy_ev: f64,
+        arrival_us: f64,
+        detector_time_edges_us: &[f64],
+    ) -> Result<(f64, f64, f64, f64), ResolutionParseError> {
+        self.validate_probe_energy(true_energy_ev)?;
+        if !arrival_us.is_finite() {
+            return Err(ResolutionParseError::InvalidFormat(format!(
+                "the nominal arrival must be finite, got {arrival_us} µs"
             )));
         }
         if detector_time_edges_us.len() < 2
@@ -867,27 +945,12 @@ impl IkedaCarpenter {
                     .to_string(),
             ));
         }
-
-        let h = self.triangle_fwhm_us()?;
-        let nominal_arrival =
-            timing_offset_us + TOF_FACTOR * self.flight_path_m / true_energy_ev.sqrt();
-        let relative_edges: Vec<f64> = detector_time_edges_us
-            .iter()
-            .map(|edge| edge - nominal_arrival)
-            .collect();
-
-        let alpha = self.params.alpha.eval(true_energy_ev);
-        let beta = self.params.beta.eval(true_energy_ev);
-        let r = self.params.r.eval(true_energy_ev);
-        let cdf = |x: f64| {
-            if h == 0.0 {
-                ic_cdf(alpha, beta, r, x)
-            } else {
-                ic_cdf_folded(alpha, beta, r, h, x)
-            }
-        };
-        let cdfs: Vec<f64> = relative_edges.iter().map(|&x| cdf(x)).collect();
-        Ok(cdfs.windows(2).map(|w| (w[1] - w[0]).max(0.0)).collect())
+        Ok((
+            self.params.alpha.eval(true_energy_ev),
+            self.params.beta.eval(true_energy_ev),
+            self.params.r.eval(true_energy_ev),
+            self.triangle_fwhm_us()?,
+        ))
     }
 
     fn validate_probe_energy(&self, energy_ev: f64) -> Result<(), ResolutionParseError> {

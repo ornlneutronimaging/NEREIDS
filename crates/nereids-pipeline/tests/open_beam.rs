@@ -6,6 +6,7 @@ use nereids_physics::ikeda_carpenter::{
 };
 use nereids_physics::resolution::{ResolutionFunction, TOF_FACTOR};
 use nereids_pipeline::beam::BeamSpline;
+use nereids_pipeline::counts_fit::Value;
 use nereids_pipeline::error::PipelineError;
 use nereids_pipeline::open_beam::{self, BOUND, Calibration, OpenBeamFit};
 use nereids_pipeline::reference::Instrument;
@@ -146,7 +147,7 @@ fn distance(fitted: &[f64], truth: &[f64], expected: &[f64]) -> f64 {
 }
 
 fn grid_range(pulse: &Arc<IkedaCarpenter>) -> (f64, f64) {
-    FlightTimeGrid::new(&edges(), T0_US, pulse)
+    FlightTimeGrid::new(&edges(), T0_US, FLIGHT_PATH_M, pulse)
         .expect("grid")
         .range_us()
 }
@@ -167,7 +168,8 @@ fn richest_coefficients(bins: usize) -> usize {
 
 fn calibration(pulse: &Arc<IkedaCarpenter>) -> Calibration {
     Calibration {
-        t0_us: T0_US,
+        t0_us: Value::Known(T0_US),
+        flight_path_m: Value::Known(FLIGHT_PATH_M),
         pulse: Arc::clone(pulse),
     }
 }
@@ -228,7 +230,7 @@ fn the_fit_is_on_the_finer_grid_of_the_first_pair_halving_leaves_unchanged() {
         let fit = fit_open_beam(&edges(), &counts, &calibration(pulse)).expect("fit");
         let beam = |u: f64| fit.beam.per_us(u);
         let chain: Vec<FlightTimeGrid> = std::iter::successors(
-            Some(FlightTimeGrid::new(&edges(), T0_US, pulse).expect("grid")),
+            Some(FlightTimeGrid::new(&edges(), T0_US, FLIGHT_PATH_M, pulse).expect("grid")),
             |g| g.halved().ok(),
         )
         .collect();
