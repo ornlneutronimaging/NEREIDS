@@ -118,6 +118,7 @@ pub fn fit_open_beam(
     let grid = Arc::new(FlightTimeGrid::new(
         time_edges_us,
         calibration.t0_us,
+        calibration.pulse.flight_path_m(),
         &calibration.pulse,
     )?);
     validate_counts("open-beam", open_counts, time_edges_us.len() - 1)?;
@@ -554,7 +555,7 @@ pub(crate) mod tests {
         )
         .expect("valid IC model");
         let edges: Vec<f64> = EDGES_US.map(f64::from).collect();
-        Arc::new(FlightTimeGrid::new(&edges, T0_US, &Arc::new(pulse)).expect("grid"))
+        Arc::new(FlightTimeGrid::new(&edges, T0_US, FLIGHT_PATH_M, &Arc::new(pulse)).expect("grid"))
     }
 
     #[test]

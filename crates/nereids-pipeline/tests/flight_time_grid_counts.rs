@@ -132,7 +132,7 @@ fn the_grid_a_halving_accepts_matches_the_simulator() {
         let expected = simulated(&pulse, SIMULATOR_STEP_US);
         let simulator_spread = spread(&simulated(&pulse, 2.0 * SIMULATOR_STEP_US), &expected);
         assert!(simulator_spread <= BOUND / 100.0, "{name}");
-        let grid = FlightTimeGrid::new(&edges(), T0_US, &pulse).expect(name);
+        let grid = FlightTimeGrid::new(&edges(), T0_US, FLIGHT_PATH_M, &pulse).expect(name);
         let predicted: Vec<Vec<f64>> =
             successors(Some(grid), |g| Some(g.halved().expect("halved grid")))
                 .take(MAX_HALVINGS + 1)

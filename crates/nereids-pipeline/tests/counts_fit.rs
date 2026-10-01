@@ -308,7 +308,7 @@ fn densities_normalization_and_background_are_recovered_and_follow_a_density_on_
 
 fn chain(setup: &Setup) -> Vec<FlightTimeGrid> {
     std::iter::successors(
-        Some(FlightTimeGrid::new(&setup.edges, T0_US, &setup.pulse).expect("grid")),
+        Some(FlightTimeGrid::new(&setup.edges, T0_US, FLIGHT_PATH_M, &setup.pulse).expect("grid")),
         |g| g.halved().ok(),
     )
     .collect()
@@ -419,7 +419,8 @@ fn distance(fitted: &[f64], simulated: &[f64]) -> f64 {
 #[test]
 fn a_resonance_between_the_first_grid_s_points_is_resolved() {
     let setup = kev_window();
-    let first = FlightTimeGrid::new(&setup.edges, T0_US, &setup.pulse).expect("grid");
+    let first =
+        FlightTimeGrid::new(&setup.edges, T0_US, FLIGHT_PATH_M, &setup.pulse).expect("grid");
     let j = first
         .flight_times_us()
         .iter()
@@ -691,7 +692,7 @@ fn covariance_against_information(temperature: Value, noisy: bool) {
     };
     let fit = fit_counts(&m, &calibration(&setup)).expect("fit");
     let quantities = first_term + 3;
-    let (low, high) = FlightTimeGrid::new(&setup.edges, T0_US, &setup.pulse)
+    let (low, high) = FlightTimeGrid::new(&setup.edges, T0_US, FLIGHT_PATH_M, &setup.pulse)
         .expect("grid")
         .range_us();
     let beam_times = |index: Option<usize>, step: f64| {
@@ -926,7 +927,7 @@ fn measurements_the_fit_does_not_describe_are_refused() {
     invalid(&|m| m.isotopes[0].0.ranges[0].target_spin = f64::NAN);
     invalid(&|m| m.isotopes[0].0.ranges[0].energy_high = 20.0);
 
-    let top_ev = FlightTimeGrid::new(&setup.edges, T0_US, &setup.pulse)
+    let top_ev = FlightTimeGrid::new(&setup.edges, T0_US, FLIGHT_PATH_M, &setup.pulse)
         .expect("grid")
         .energies_ev()[0];
     let reach = |temperature_k: f64| {
@@ -1039,7 +1040,8 @@ fn kev_beam(level: f64) -> impl Fn(f64) -> f64 {
 }
 
 fn kev_resonance_ev(setup: &Setup, offset: f64) -> f64 {
-    let first = FlightTimeGrid::new(&setup.edges, T0_US, &setup.pulse).expect("grid");
+    let first =
+        FlightTimeGrid::new(&setup.edges, T0_US, FLIGHT_PATH_M, &setup.pulse).expect("grid");
     let j = first
         .flight_times_us()
         .iter()

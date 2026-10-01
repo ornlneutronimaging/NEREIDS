@@ -355,7 +355,12 @@ pub fn fit_counts(
                 .map_err(|e| PipelineError::InvalidParameter(e.to_string()))?,
         );
     }
-    let grid = FlightTimeGrid::new(time_edges_us, calibration.t0_us, &calibration.pulse)?;
+    let grid = FlightTimeGrid::new(
+        time_edges_us,
+        calibration.t0_us,
+        calibration.pulse.flight_path_m(),
+        &calibration.pulse,
+    )?;
     let bins = time_edges_us.len() - 1;
     validate_counts("open-beam", open_counts, bins)?;
     validate_counts("sample", sample_counts, bins)?;
