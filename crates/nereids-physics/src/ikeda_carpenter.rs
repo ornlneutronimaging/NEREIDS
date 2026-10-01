@@ -551,7 +551,7 @@ fn inverse_lambda_denom(a0: f64, a1: f64, e: f64) -> f64 {
 }
 
 /// Parameters of the Ikeda–Carpenter resolution model.
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, PartialEq)]
 pub struct IkedaCarpenterParams {
     /// Fast (slowing-down) rate `α(E)`, 1/µs. Must evaluate to > 0.
     pub alpha: EnergyLaw,

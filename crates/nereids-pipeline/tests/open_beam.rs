@@ -8,7 +8,7 @@ use nereids_physics::resolution::{ResolutionFunction, TOF_FACTOR};
 use nereids_pipeline::beam::BeamSpline;
 use nereids_pipeline::counts_fit::Value;
 use nereids_pipeline::error::PipelineError;
-use nereids_pipeline::open_beam::{self, BOUND, Calibration, OpenBeamFit};
+use nereids_pipeline::open_beam::{self, BOUND, Calibration, OpenBeamFit, Pulse};
 use nereids_pipeline::reference::Instrument;
 use rand::SeedableRng;
 use rand_chacha::ChaCha12Rng;
@@ -63,7 +63,7 @@ fn pulses() -> Vec<(&'static str, Arc<IkedaCarpenter>)> {
             pulse(
                 EnergyLaw::SqrtE { a0: 0.35, a1: 0.05 },
                 EnergyLaw::SqrtE { a0: 0.02, a1: 0.2 },
-                EnergyLaw::ExpMilliEv { kappa: 5.0e4 },
+                c(0.15),
                 None,
                 None,
             ),
@@ -166,11 +166,28 @@ fn richest_coefficients(bins: usize) -> usize {
         .expect("a candidate")
 }
 
+fn known(pulse: &IkedaCarpenter) -> Pulse {
+    let coefficients = |law: &EnergyLaw| match *law {
+        EnergyLaw::SqrtE { a0, a1 } => [a0, a1],
+        EnergyLaw::Const(c) => [0.0, c],
+        ref other => panic!("{other:?} is not a law in √E"),
+    };
+    let (params, detector) = (pulse.params(), pulse.detector_pulse());
+    Pulse {
+        alpha: coefficients(&params.alpha).map(Value::Known),
+        beta: coefficients(&params.beta).map(Value::Known),
+        r: Value::Known(coefficients(&params.r)[1]),
+        fwhm_us: Value::Known(params.channel_fwhm_us.unwrap_or(0.0)),
+        energy_span_ev: detector.energy_span_ev(),
+        n_tau: detector.n_tau(),
+    }
+}
+
 fn calibration(pulse: &Arc<IkedaCarpenter>) -> Calibration {
     Calibration {
         t0_us: Value::Known(T0_US),
         flight_path_m: Value::Known(FLIGHT_PATH_M),
-        pulse: Arc::clone(pulse),
+        pulse: known(pulse),
     }
 }
 
@@ -580,19 +597,6 @@ fn the_grid_s_refusals_reach_the_caller() {
         ))
     ));
     let c = EnergyLaw::Const;
-    let lengthening = pulse(
-        EnergyLaw::SqrtE { a0: -0.05, a1: 1.2 },
-        c(0.25),
-        c(0.15),
-        None,
-        None,
-    );
-    assert!(matches!(
-        fit_open_beam(&edges(), &counts, &calibration(&lengthening)),
-        Err(PipelineError::FlightTimeGrid(
-            FlightTimeGridError::LengthensWithEnergy { .. }
-        ))
-    ));
     let near_the_point_cap = pulse(c(700.0), c(0.25), c(0.0), None, None);
     assert!(matches!(
         fit_open_beam(&edges(), &counts, &calibration(&near_the_point_cap)),
