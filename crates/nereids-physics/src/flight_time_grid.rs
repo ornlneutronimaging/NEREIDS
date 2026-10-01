@@ -381,6 +381,12 @@ impl FlightTimeGrid {
         Rows::new(self.step_us * scale, self.time_edges_us.len() - 1, rows)
     }
 
+    /// The probabilities at the grid's own timing offset and flight path.
+    #[must_use]
+    pub fn rows(&self) -> &Rows {
+        &self.rows
+    }
+
     /// The timing offset in µs the grid was built at.
     #[must_use]
     pub fn t0_us(&self) -> f64 {

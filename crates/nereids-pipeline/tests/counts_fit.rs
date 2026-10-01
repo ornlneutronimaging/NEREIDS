@@ -1062,6 +1062,7 @@ fn kev_window() -> Setup {
 fn density_and_temperature_are_recovered_from_starts_on_either_side() {
     let setup = standard();
     let cases = [
+        (hafnium_like(20.0), THIN, 300.0, vec![200.0, 1000.0]),
         (two_resonances(), SATURATED, 300.0, vec![200.0, 1000.0]),
         (hafnium_like(20.0), THIN, 1500.0, vec![300.0, 3000.0]),
         (two_resonances(), SATURATED, 1500.0, vec![300.0, 3000.0]),

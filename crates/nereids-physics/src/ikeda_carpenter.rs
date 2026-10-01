@@ -898,7 +898,7 @@ impl IkedaCarpenter {
 
     /// The derivative of each of [`Self::bin_probabilities_at`] with respect
     /// to `arrival_us`, per µs: the pulse density, folded with the triangle,
-    /// at the bin's lower edge less that at its upper edge.
+    /// at the bin's lower edge minus that at its upper edge.
     ///
     /// # Errors
     /// As [`Self::bin_probabilities_at`].

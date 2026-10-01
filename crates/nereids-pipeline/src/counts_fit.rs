@@ -720,6 +720,30 @@ struct Scale {
     basis_slope: Vec<[(usize, f64); 5]>,
 }
 
+impl Scale {
+    fn new(
+        (t0_us, flight_path_m): (f64, f64),
+        rows: Rows,
+        grid: &FlightTimeGrid,
+        spline: &BeamSpline,
+        beam_origin_us: f64,
+    ) -> Self {
+        let (shift, stretch) = (t0_us - beam_origin_us, flight_path_m / grid.flight_path_m());
+        let abscissae: Vec<f64> = grid
+            .flight_times_us()
+            .iter()
+            .map(|u| shift + stretch * u)
+            .collect();
+        Self {
+            t0_us,
+            flight_path_m,
+            rows,
+            basis: abscissae.iter().map(|&a| spline.basis(a)).collect(),
+            basis_slope: abscissae.iter().map(|&a| spline.basis_slope(a)).collect(),
+        }
+    }
+}
+
 fn predicted(rows: &Rows, values: &[f64]) -> Result<Vec<f64>, FittingError> {
     rows.predict(values)
         .map_err(|e| FittingError::EvaluationFailed(e.to_string()))
@@ -750,7 +774,13 @@ impl TwoRunModel {
             charge_ratio,
             layout: Layout::new(beam.coefficients().len(), isotopes.len()),
             cross_sections: RefCell::new(None),
-            scale: RefCell::new(None),
+            scale: RefCell::new(Some(Scale::new(
+                (grid.t0_us(), grid.flight_path_m()),
+                grid.rows().clone(),
+                grid,
+                beam,
+                beam_origin_us,
+            ))),
         }
     }
 
@@ -799,29 +829,17 @@ impl TwoRunModel {
             .as_ref()
             .is_some_and(|s| key(s.t0_us, s.flight_path_m) == key(t0_us, flight_path_m));
         if !current {
-            let grid = &self.grid;
-            let rows = grid
+            let rows = self
+                .grid
                 .rows_at(t0_us, flight_path_m)
                 .map_err(|e| FittingError::EvaluationFailed(e.to_string()))?;
-            let (shift, stretch) = (
-                t0_us - self.beam_origin_us,
-                flight_path_m / grid.flight_path_m(),
-            );
-            let abscissae: Vec<f64> = grid
-                .flight_times_us()
-                .iter()
-                .map(|u| shift + stretch * u)
-                .collect();
-            *self.scale.borrow_mut() = Some(Scale {
-                t0_us,
-                flight_path_m,
+            *self.scale.borrow_mut() = Some(Scale::new(
+                (t0_us, flight_path_m),
                 rows,
-                basis: abscissae.iter().map(|&a| self.spline.basis(a)).collect(),
-                basis_slope: abscissae
-                    .iter()
-                    .map(|&a| self.spline.basis_slope(a))
-                    .collect(),
-            });
+                &self.grid,
+                &self.spline,
+                self.beam_origin_us,
+            ));
         }
         Ok(std::cell::Ref::map(self.scale.borrow(), |s| {
             s.as_ref().expect("computed above")
