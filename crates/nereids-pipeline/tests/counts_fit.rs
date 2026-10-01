@@ -969,6 +969,11 @@ fn measurements_the_fit_does_not_describe_are_refused() {
         (
             Value::Known(T0_US),
             Value::Known(FLIGHT_PATH_M),
+            pulse(&|p| p.fwhm_us = Value::Fitted(0.0)),
+        ),
+        (
+            Value::Known(T0_US),
+            Value::Known(FLIGHT_PATH_M),
             pulse(&|p| p.energy_span_ev = (0.0, 200.0)),
         ),
     ] {

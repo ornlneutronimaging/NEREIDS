@@ -36,6 +36,12 @@ impl Calibration {
         let rate = |name: &'static str, value: &Value| {
             value.parameter(name, 0.0..=f64::INFINITY, "0 or more")
         };
+        let fwhm_us = rate("the triangle's FWHM", &self.pulse.fwhm_us)?;
+        if !fwhm_us.fixed && fwhm_us.value == 0.0 {
+            return Err(PipelineError::InvalidParameter(
+                "a fitted triangle FWHM must start above 0, where the counts are even in it".into(),
+            ));
+        }
         Ok(vec![
             self.t0_us
                 .parameter("t0", f64::NEG_INFINITY..=f64::INFINITY, "any real number")?,
@@ -49,7 +55,7 @@ impl Calibration {
             rate("β₀", &self.pulse.beta[0])?,
             rate("β₁", &self.pulse.beta[1])?,
             self.pulse.r.parameter("R", 0.0..=1.0, "within 0–1")?,
-            rate("the triangle's FWHM", &self.pulse.fwhm_us)?,
+            fwhm_us,
         ])
     }
 }
@@ -65,8 +71,8 @@ pub struct Pulse {
     pub beta: [Value; 2],
     /// `R`, within 0–1.
     pub r: Value,
-    /// `h` in µs, 0 or more.  The counts are even in `h`, so a fitted `h` that
-    /// starts at 0 stays there.
+    /// `h` in µs, 0 or more; a fitted one starts above 0, where the counts are
+    /// even in `h`.
     pub fwhm_us: Value,
     /// `(low, high)`, the energies in eV the laws hold over; a window that
     /// neutrons from outside them can reach is refused.
@@ -181,8 +187,8 @@ pub struct OpenBeamFit {
 /// to measure the noise), a known, starting or measured value of the
 /// calibration is not finite and in its quantity's range, a measured one's sd
 /// is not finite and positive, bounds are not `lower < upper` in that range
-/// with the start between them, or the pulse's energy span is not `0 < low <
-/// high` or its `n_tau` is below 8;
+/// with the start between them, a fitted triangle FWHM starts at 0, or the
+/// pulse's energy span is not `0 < low < high` or its `n_tau` is below 8;
 /// [`PipelineError::FlightTimeGrid`] for the grid's refusals, including the
 /// first candidate's halving past the point cap; [`PipelineError::Fitting`] if
 /// the fitter refuses.

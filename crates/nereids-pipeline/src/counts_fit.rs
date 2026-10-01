@@ -294,8 +294,8 @@ pub struct CountsFit {
 /// and positive, bounds are not `lower < upper` in that range
 /// with the start between them, there are no isotopes, an isotope is listed
 /// twice, an isotope's resonance data are not finite, or the energies its
-/// broadened cross section reads on the grid at the starting `t0` and flight
-/// path, or at the fitted ones of any pass that rebuilds it, at the known
+/// broadened cross section reads on the grid at the starting `t0`, flight path
+/// and pulse, or at the fitted ones of any pass that rebuilds it, at the known
 /// temperature or at the upper bound of a fitted one, down to zero for a
 /// window within the thermal
 /// spread of zero energy, are not inside a single one of its evaluated
@@ -305,8 +305,8 @@ pub struct CountsFit {
 /// [`NEGLIGIBLE_PREDICTION`]: starting or known values the fitter cannot
 /// leave;
 /// everything [`fit_open_beam`] refuses; [`PipelineError::FlightTimeGrid`]
-/// for the grid's refusals at the starting `t0` and flight path or the fitted
-/// ones of any pass, including more points than it allows;
+/// for the grid's refusals at the starting `t0`, flight path and pulse or the
+/// fitted ones of any pass, including more points than it allows;
 /// [`PipelineError::Fitting`] if the fitter fails, or the cross sections
 /// fail at the start; a failure at a trial temperature is a rejected step.
 pub fn fit_counts(

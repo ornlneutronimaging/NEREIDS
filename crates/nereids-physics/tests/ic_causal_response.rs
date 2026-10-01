@@ -1,5 +1,5 @@
 use nereids_physics::ikeda_carpenter::{
-    EnergyLaw, IkedaCarpenter, IkedaCarpenterParams, SynthesisGrid, ic_cdf, ic_pulse,
+    DetectorPulse, EnergyLaw, IkedaCarpenter, IkedaCarpenterParams, SynthesisGrid, ic_cdf, ic_pulse,
 };
 use nereids_physics::resolution::TOF_FACTOR;
 
@@ -940,6 +940,48 @@ fn pulse_slopes_are_the_derivatives_of_the_bin_probabilities() {
             "parameter {n}: {} vs {}",
             below[n][0],
             above[n][0]
+        );
+    }
+}
+
+#[test]
+fn invalid_triangles_and_vanishing_rates_are_refused_in_detector_time() {
+    let edges = [360.0, 361.0, 362.0];
+    for fwhm_us in [-0.35, f64::NAN, f64::INFINITY] {
+        let pulse = constant_pulse(1.7, 0.25, 0.3, fwhm_us);
+        assert!(pulse.bin_probabilities_at(25.0, 359.0, &edges).is_err());
+        assert!(DetectorPulse::new(pulse, (1.0, 100.0), 64).is_err());
+    }
+    for (alpha, beta) in [(5e-10, 0.25), (1.7, 5e-10)] {
+        assert!(
+            constant_pulse(alpha, beta, 0.3, 0.0)
+                .bin_pulse_slopes_at(25.0, 359.0, &edges)
+                .is_err()
+        );
+    }
+}
+
+#[test]
+fn a_narrow_triangle_on_a_long_storage_tail_moves_the_rise_by_at_most_its_width() {
+    let n_tau = 256;
+    let alpha = 1.7;
+    let prompt_step_us = 18.0 / alpha / (n_tau as f64 - 1.0);
+    let rise = |fwhm_us: f64| {
+        DetectorPulse::new(
+            constant_pulse(alpha, 0.02, 0.15, fwhm_us),
+            (1.0, 100.0),
+            n_tau,
+        )
+        .expect("pulse")
+        .rise_us(25.0)
+        .expect("rise")
+    };
+    let unfolded = rise(0.0);
+    for fwhm_us in [0.01, 0.1] {
+        let folded = rise(fwhm_us);
+        assert!(
+            (folded - unfolded).abs() <= fwhm_us + prompt_step_us,
+            "{fwhm_us}: {folded} vs {unfolded}"
         );
     }
 }

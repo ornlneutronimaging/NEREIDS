@@ -588,7 +588,13 @@ impl IkedaCarpenterParams {
                     .to_string(),
             ));
         }
-        Ok(self.channel_fwhm_us.unwrap_or(0.0))
+        let fwhm_us = self.channel_fwhm_us.unwrap_or(0.0);
+        if !(fwhm_us.is_finite() && fwhm_us >= 0.0) {
+            return Err(ResolutionParseError::InvalidFormat(format!(
+                "the triangle's FWHM must be finite and 0 or more, got {fwhm_us} µs"
+            )));
+        }
+        Ok(fwhm_us)
     }
 
     /// The first and last delay, in µs after the nominal arrival, of a
@@ -746,14 +752,16 @@ impl IkedaCarpenterParams {
         let alpha = self.alpha.eval(energy_ev);
         let beta = self.beta.eval(energy_ev);
         let r = self.r.eval(energy_ev);
-        if !alpha.is_finite() || alpha <= 0.0 {
+        if !alpha.is_finite() || alpha < MIN_RATE {
             return Err(ResolutionParseError::InvalidFormat(format!(
-                "Ikeda–Carpenter alpha({energy_ev}) must be positive and finite, got {alpha}"
+                "Ikeda–Carpenter alpha({energy_ev}) must be finite and at least {MIN_RATE} \
+                 µs⁻¹, got {alpha}"
             )));
         }
-        if !beta.is_finite() || beta <= 0.0 {
+        if !beta.is_finite() || beta < MIN_RATE {
             return Err(ResolutionParseError::InvalidFormat(format!(
-                "Ikeda–Carpenter beta({energy_ev}) must be positive and finite, got {beta}"
+                "Ikeda–Carpenter beta({energy_ev}) must be finite and at least {MIN_RATE} \
+                 µs⁻¹, got {beta}"
             )));
         }
         if !r.is_finite() || !(0.0..=1.0).contains(&r) {
@@ -1108,12 +1116,14 @@ impl DetectorPulse {
     ///
     /// # Errors
     /// [`ResolutionParseError::InvalidFormat`] unless `0 < low < high` are
-    /// finite and `n_tau` is at least 8.
+    /// finite, `n_tau` is at least 8, the triangle's FWHM is finite and 0 or
+    /// more, and the pulse has no Gaussian burst.
     pub fn new(
         params: IkedaCarpenterParams,
         energy_span_ev: (f64, f64),
         n_tau: usize,
     ) -> Result<Self, ResolutionParseError> {
+        params.triangle_fwhm_us()?;
         let (low, high) = energy_span_ev;
         if !(low.is_finite() && high.is_finite() && 0.0 < low && low < high) {
             return Err(ResolutionParseError::InvalidFormat(format!(
@@ -1154,11 +1164,11 @@ impl DetectorPulse {
     /// its peak.
     ///
     /// # Errors
-    /// As [`IkedaCarpenter::source_pulse_at`].
+    /// [`ResolutionParseError::InvalidFormat`] when `energy_ev` is not
+    /// positive and finite, or a law is singular or out of range there.
     pub fn rise_us(&self, energy_ev: f64) -> Result<f64, ResolutionParseError> {
         self.params.validate_probe_energy(energy_ev)?;
-        let (times, densities) = synth_source_pulse_density(&self.params, self.n_tau, energy_ev)?;
-        Ok(times[argmax(&densities)] - times[0])
+        sampled_rise_us(&self.params, self.n_tau, energy_ev)
     }
 }
 
@@ -1182,6 +1192,30 @@ fn tail_delay(alpha: f64, beta: f64, r: f64) -> f64 {
         }
     }
     high
+}
+
+fn requested_step(params: &IkedaCarpenterParams, n_tau: usize, alpha: f64) -> (f64, f64, String) {
+    let fast_reach = FAST_REACH_E_FOLDS / alpha;
+    let mut dtau_req = fast_reach / (n_tau as f64 - 1.0);
+    let mut floor = fast_reach / (MIN_N_TAU as f64 - 1.0);
+    let mut fold_desc = String::new();
+    if let Some(fwhm) = params.channel_fwhm_us
+        && fwhm > 0.0
+    {
+        let tri_floor = fwhm / TRI_MIN_SAMPLES_PER_SIDE;
+        dtau_req = dtau_req.min(tri_floor);
+        floor = floor.min(tri_floor);
+        fold_desc.push_str(&format!(", channel triangle FWHM = {fwhm} µs"));
+    }
+    if let Some(sigma) = params.burst_sigma_us
+        && sigma > 0.0
+    {
+        dtau_req = dtau_req.min(sigma);
+        floor = floor.min(sigma);
+        fold_desc.push_str(&format!(", burst σ = {sigma} µs"));
+    }
+
+    (dtau_req, floor, fold_desc)
 }
 
 /// τ-grid geometry for one kernel: `(dtau, tau_max, margin)`, or a
@@ -1213,30 +1247,8 @@ fn tau_geometry(
     beta: f64,
     r: f64,
 ) -> Result<(f64, f64, f64), String> {
-    let fast_reach = FAST_REACH_E_FOLDS / alpha;
     let tau_max = tau_reach(alpha, beta, r);
-
-    // Requested step and resolution floor. `floor ≥ dtau_req` always: the
-    // prompt terms satisfy MIN_N_TAU ≤ n_tau (validated by `new`) and the
-    // fold terms are common to both.
-    let mut dtau_req = fast_reach / (n_tau as f64 - 1.0);
-    let mut floor = fast_reach / (MIN_N_TAU as f64 - 1.0);
-    let mut fold_desc = String::new();
-    if let Some(fwhm) = params.channel_fwhm_us
-        && fwhm > 0.0
-    {
-        let tri_floor = fwhm / TRI_MIN_SAMPLES_PER_SIDE;
-        dtau_req = dtau_req.min(tri_floor);
-        floor = floor.min(tri_floor);
-        fold_desc.push_str(&format!(", channel triangle FWHM = {fwhm} µs"));
-    }
-    if let Some(sigma) = params.burst_sigma_us
-        && sigma > 0.0
-    {
-        dtau_req = dtau_req.min(sigma);
-        floor = floor.min(sigma);
-        fold_desc.push_str(&format!(", burst σ = {sigma} µs"));
-    }
+    let (dtau_req, floor, fold_desc) = requested_step(params, n_tau, alpha);
 
     let capped_step = tau_max / (MAX_TAU_SAMPLES as f64 - 1.0);
     if capped_step > floor {
@@ -1299,12 +1311,41 @@ fn synth_source_pulse_density(
     let beta = params.beta.eval(energy_ev).max(MIN_RATE);
     let r = params.r.eval(energy_ev).clamp(0.0, 1.0);
 
-    let (dtau, tau_max, margin) = tau_geometry(params, n_tau, alpha, beta, r).map_err(|msg| {
+    let geometry = tau_geometry(params, n_tau, alpha, beta, r).map_err(|msg| {
         ResolutionParseError::InvalidFormat(format!(
             "Ikeda–Carpenter kernel at E = {energy_ev} eV: {msg}"
         ))
     })?;
+    sampled_density(params, (alpha, beta, r), geometry, energy_ev)
+}
 
+fn sampled_rise_us(
+    params: &IkedaCarpenterParams,
+    n_tau: usize,
+    energy_ev: f64,
+) -> Result<f64, ResolutionParseError> {
+    let alpha = params.alpha.eval(energy_ev).max(MIN_RATE);
+    let beta = params.beta.eval(energy_ev).max(MIN_RATE);
+    let r = params.r.eval(energy_ev).clamp(0.0, 1.0);
+    let fast_reach = FAST_REACH_E_FOLDS / alpha;
+    let margin = margin_of(params);
+    let (dtau_req, _, _) = requested_step(params, n_tau, alpha);
+    let dtau = dtau_req.max((fast_reach + 2.0 * margin) / (MAX_TAU_SAMPLES as f64 - 1.0));
+    let (times, densities) = sampled_density(
+        params,
+        (alpha, beta, r),
+        (dtau, fast_reach, margin),
+        energy_ev,
+    )?;
+    Ok(times[argmax(&densities)] - times[0])
+}
+
+fn sampled_density(
+    params: &IkedaCarpenterParams,
+    (alpha, beta, r): (f64, f64, f64),
+    (dtau, tau_max, margin): (f64, f64, f64),
+    energy_ev: f64,
+) -> Result<(Vec<f64>, Vec<f64>), ResolutionParseError> {
     // Extend the grid to slightly negative τ so a symmetric burst/channel can
     // spread the leading edge correctly (the moderator pulse itself is 0 there).
     // Widths are validated finite and >= 0 by `IkedaCarpenter::new`, so they are
