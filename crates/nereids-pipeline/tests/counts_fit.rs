@@ -969,6 +969,14 @@ fn measurements_the_fit_does_not_describe_are_refused() {
         (
             Value::Known(T0_US),
             Value::Known(FLIGHT_PATH_M),
+            pulse(&|p| {
+                p.beta = [Value::Known(0.0); 2];
+                p.r = Value::Known(0.0);
+            }),
+        ),
+        (
+            Value::Known(T0_US),
+            Value::Known(FLIGHT_PATH_M),
             pulse(&|p| p.energy_span_ev = (0.0, 200.0)),
         ),
     ] {
@@ -1834,24 +1842,69 @@ mod pulse_calibration {
     #[test]
     #[ignore = "slow; runs nightly"]
     fn a_calibration_from_below_converges_with_the_information_as_its_covariance() {
-        let p = CALIBRATION_PULSE;
+        let mut p = CALIBRATION_PULSE;
+        p[5] = 0.35;
+        let b0 = 0.05;
         let setup = calibration_foil(&p, T0_US, FLIGHT_PATH_M);
-        let counts = expected(
+        let counts = with_background(
             &setup,
             &beam(CALIBRATION_LEVEL),
             &calibration_sample(CALIBRATION_DENSITY),
+            TEMPERATURE_K,
+            [1.0, b0, 0.0, 0.0],
         );
-        let m = calibration_measurement(&setup, (rounded(&counts.0), rounded(&counts.1)));
-        let fit = calibrated(&m, &p, -1.0, None);
-        assert_recovered(&fit, &p, 8, "start below the truth");
+        let mut m = calibration_measurement(&setup, (rounded(&counts.0), rounded(&counts.1)));
+        m.background[0] = Value::Fitted(b0);
+        let fit = calibrated(&m, &p, -1.0, Some(p[5] - 0.1));
+        assert!(fit.converged);
+        let fitted = [
+            fit.densities[0],
+            fit.temperature_k,
+            fit.background[0],
+            fit.t0_us,
+            fit.flight_path_m,
+            fit.alpha[0],
+            fit.alpha[1],
+            fit.beta[0],
+            fit.r,
+            fit.fwhm_squared_us2,
+        ];
+        let truth = [
+            CALIBRATION_DENSITY,
+            TEMPERATURE_K,
+            b0,
+            T0_US,
+            FLIGHT_PATH_M,
+            p[0],
+            p[1],
+            p[2],
+            p[4],
+            p[5] * p[5],
+        ];
+        for (i, (estimate, truth)) in fitted.iter().zip(truth).enumerate() {
+            let pull = (estimate - truth) / error_bar(&fit, i);
+            assert!(pull.abs() <= BOUND.sqrt(), "{i}: {pull}");
+        }
 
         let beam_origin_us = T0_US - 0.05;
-        let fitted: [f64; 8] = calibration_estimates(&fit)[..8]
-            .try_into()
-            .expect("eight quantities");
-        let counts_at = |quantities: [f64; 8], coefficient: Option<(usize, f64)>| -> Vec<f64> {
-            let [density, temperature_k, t0_us, flight_path_m, a0, a1, b0, r] = quantities;
-            let at = calibration_foil(&[a0, a1, b0, p[3], r, p[5]], t0_us, flight_path_m);
+        let counts_at = |quantities: [f64; 10], coefficient: Option<(usize, f64)>| -> Vec<f64> {
+            let [
+                density,
+                temperature_k,
+                b0,
+                t0_us,
+                flight_path_m,
+                a0,
+                a1,
+                beta0,
+                r,
+                fwhm_squared,
+            ] = quantities;
+            let at = calibration_foil(
+                &[a0, a1, beta0, p[3], r, fwhm_squared.sqrt()],
+                t0_us,
+                flight_path_m,
+            );
             let beam = |u: f64| {
                 let x = t0_us + u - beam_origin_us;
                 let slope: f64 = coefficient.map_or(0.0, |(i, step)| {
@@ -1865,9 +1918,14 @@ mod pulse_calibration {
                 });
                 fit.beam.per_us(x) * slope.exp()
             };
-            let (open, transmitted) =
-                expected_at(&at, &beam, &calibration_sample(density), temperature_k);
-            open.into_iter().chain(transmitted).collect()
+            let (open, sample) = with_background(
+                &at,
+                &beam,
+                &calibration_sample(density),
+                temperature_k,
+                [1.0, b0, 0.0, 0.0],
+            );
+            open.into_iter().chain(sample).collect()
         };
         let mu = counts_at(fitted, None);
         let coefficients = fit.beam.coefficients().len();
@@ -1881,8 +1939,8 @@ mod pulse_calibration {
                     }
                     let q = c - coefficients;
                     let step = match q {
-                        2 => T0_STEP_US,
-                        3 => PATH_STEP_M,
+                        3 => T0_STEP_US,
+                        4 => PATH_STEP_M,
                         _ => 1e-4 * fitted[q],
                     };
                     let mut quantities = fitted;

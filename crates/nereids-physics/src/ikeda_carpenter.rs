@@ -448,12 +448,12 @@ fn ic_cdf_folded_slopes(alpha: f64, beta: f64, r: f64, fwhm_us: f64, delay_us: f
     let mut slopes = [0.0; 4];
     fold_nodes(alpha, fwhm_us, delay_us, |s, weight| {
         let x = delay_us - s;
-        let triangle = weight * (fwhm_us - s.abs()) / (fwhm_us * fwhm_us);
+        let t = (s / fwhm_us).abs();
+        let triangle = weight * (1.0 - t) / fwhm_us;
         for (slope, value) in slopes.iter_mut().zip(ic_cdf_slopes(alpha, beta, r, x)) {
             *slope += triangle * value;
         }
-        let moment = (fwhm_us.powi(3) / 6.0 - 0.5 * fwhm_us * s * s + s.abs().powi(3) / 3.0)
-            / (2.0 * fwhm_us.powi(4));
+        let moment = (1.0 / 6.0 - 0.5 * t * t + t.powi(3) / 3.0) / (2.0 * fwhm_us);
         slopes[3] += weight * moment * ic_pulse_slope(alpha, beta, r, x);
     });
     slopes
@@ -853,7 +853,8 @@ impl IkedaCarpenter {
     /// # Errors
     /// Returns [`ResolutionParseError::InvalidFormat`] for a non-positive
     /// flight path, a degenerate grid (`n_energies < 2`, `n_tau < 8`,
-    /// `e_min ≤ 0`, `e_max ≤ e_min`), a non-positive `β(E)`, a parameter/grid
+    /// `e_min ≤ 0`, `e_max ≤ e_min`), an `α(E)` or `β(E)` below 1e-9 µs⁻¹ at a
+    /// reference energy, a parameter/grid
     /// combination whose τ-grid cannot resolve the prompt core and requested
     /// folds within the `MAX_TAU_SAMPLES` cap at some reference energy (see
     /// `tau_geometry` — remedy: larger `β`, `R = 0`, or a wider/disabled
@@ -912,9 +913,6 @@ impl IkedaCarpenter {
                 )));
             }
         }
-        // Reject parameter laws that yield a non-positive fast rate α(E): the
-        // pulse would otherwise degenerate (synthesis clamps α to a tiny floor,
-        // producing a meaningless near-flat kernel rather than failing loudly).
         if let Some(&bad) = ref_energies.iter().find(|&&e| {
             let a = params.alpha.eval(e);
             !a.is_finite() || a < MIN_RATE
@@ -1137,7 +1135,9 @@ impl DetectorPulse {
     /// # Errors
     /// [`ResolutionParseError::InvalidFormat`] unless `0 < low < high` are
     /// finite, `n_tau` is at least 8, the triangle's FWHM is finite and 0 or
-    /// more, and the pulse has no Gaussian burst.
+    /// more, the pulse has no Gaussian burst, and the laws are valid at both
+    /// ends of the span: `α` and `β` finite and at least 1e-9 µs⁻¹, `R`
+    /// within 0–1.
     pub fn new(
         params: IkedaCarpenterParams,
         energy_span_ev: (f64, f64),
@@ -1150,6 +1150,8 @@ impl DetectorPulse {
                 "the energy span must satisfy 0 < low < high, got {energy_span_ev:?}"
             )));
         }
+        params.validate_probe_energy(low)?;
+        params.validate_probe_energy(high)?;
         if n_tau < MIN_N_TAU {
             return Err(ResolutionParseError::InvalidFormat(format!(
                 "n_tau must be >= {MIN_N_TAU}, got {n_tau}"

@@ -55,9 +55,10 @@ impl Calibration {
 }
 
 /// The Ikeda–Carpenter pulse with `α = α₀√E + α₁` and `β = β₀√E + β₁` in
-/// 1/µs, `E` in eV, a constant storage fraction `R`, and the proton pulse's
-/// triangle of FWHM `h` in µs, given by `h²`, in which the counts are smooth
-/// down to `h = 0`.
+/// 1/µs, `E` in eV, a storage fraction `R` constant over `energy_span_ev`, and
+/// the proton pulse's triangle of FWHM `h` in µs, given by `h²`, in which the
+/// counts are smooth down to `h = 0`.  `α` and `β` must be at least 1e-9 µs⁻¹
+/// across the span, `β` even where `R` is 0.
 #[derive(Debug, Clone)]
 pub struct Pulse {
     /// `[α₀, α₁]`, in 1/(µs·√eV) and 1/µs, each 0 or more.
@@ -181,8 +182,9 @@ pub struct OpenBeamFit {
 /// to measure the noise), a known, starting or measured value of the
 /// calibration is not finite and in its quantity's range, a measured one's sd
 /// is not finite and positive, bounds are not `lower < upper` in that range
-/// with the start between them, or the pulse's energy span is not `0 < low <
-/// high` or its `n_tau` is below 8;
+/// with the start between them, the pulse's energy span is not `0 < low <
+/// high`, its `n_tau` is below 8, or its starting `α` or `β` is below 1e-9
+/// µs⁻¹ at an end of the span;
 /// [`PipelineError::FlightTimeGrid`] for the grid's refusals, including the
 /// first candidate's halving past the point cap; [`PipelineError::Fitting`] if
 /// the fitter refuses.

@@ -942,13 +942,16 @@ fn pulse_slopes_are_the_derivatives_of_the_bin_probabilities() {
             above[n][0]
         );
     }
-    let (unfolded, narrow) = (at(0.0, 2.0), at(1e-5, 2.0));
-    assert!(
-        (unfolded[3][0] - narrow[3][0]).abs() <= 1e-8 * unfolded[3][0].abs(),
-        "{} vs {}",
-        unfolded[3][0],
-        narrow[3][0]
-    );
+    let unfolded = at(0.0, 2.0);
+    for fwhm_us in [1e-5, 1e-110] {
+        let narrow = at(fwhm_us, 2.0);
+        assert!(
+            (unfolded[3][0] - narrow[3][0]).abs() <= 1e-8 * unfolded[3][0].abs(),
+            "{fwhm_us}: {} vs {}",
+            unfolded[3][0],
+            narrow[3][0]
+        );
+    }
 }
 
 #[test]
@@ -960,11 +963,9 @@ fn invalid_triangles_and_vanishing_rates_are_refused_in_detector_time() {
         assert!(DetectorPulse::new(pulse, (1.0, 100.0), 64).is_err());
     }
     for (alpha, beta) in [(5e-10, 0.25), (1.7, 5e-10)] {
-        assert!(
-            constant_pulse(alpha, beta, 0.3, 0.0)
-                .bin_pulse_slopes_at(25.0, 359.0, &edges)
-                .is_err()
-        );
+        let pulse = constant_pulse(alpha, beta, 0.3, 0.0);
+        assert!(pulse.bin_pulse_slopes_at(25.0, 359.0, &edges).is_err());
+        assert!(DetectorPulse::new(pulse, (1.0, 100.0), 64).is_err());
     }
 }
 
