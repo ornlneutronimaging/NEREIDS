@@ -150,13 +150,13 @@ fn cross_sections(energies: &[f64], isotopes: &[ResonanceData], kelvin: f64) -> 
     }
     let grid = (energies.len(), energies.first(), energies.last());
     let key = format!("{kelvin:?} {grid:?} {isotopes:?}");
-    COMPUTED.with_borrow_mut(|computed| {
-        let sigma = computed.entry(key).or_insert_with(|| {
-            broadened_cross_sections(energies, isotopes, kelvin, None, None)
-                .expect("cross sections")
-        });
-        sigma.clone()
-    })
+    if let Some(sigma) = COMPUTED.with_borrow(|computed| computed.get(&key).cloned()) {
+        return sigma;
+    }
+    let sigma =
+        broadened_cross_sections(energies, isotopes, kelvin, None, None).expect("cross sections");
+    COMPUTED.with_borrow_mut(|computed| computed.insert(key, sigma.clone()));
+    sigma
 }
 
 fn with_background(
@@ -208,7 +208,7 @@ fn known(pulse: &IkedaCarpenter) -> Pulse {
         alpha: coefficients(&params.alpha).map(Value::Known),
         beta: coefficients(&params.beta).map(Value::Known),
         r: Value::Known(coefficients(&params.r)[1]),
-        fwhm_us: Value::Known(params.channel_fwhm_us.unwrap_or(0.0)),
+        fwhm_squared_us2: Value::Known(params.channel_fwhm_us.unwrap_or(0.0).powi(2)),
         energy_span_ev: detector.energy_span_ev(),
         n_tau: detector.n_tau(),
     }
@@ -964,12 +964,7 @@ fn measurements_the_fit_does_not_describe_are_refused() {
         (
             Value::Known(T0_US),
             Value::Known(FLIGHT_PATH_M),
-            pulse(&|p| p.fwhm_us = Value::Known(f64::NAN)),
-        ),
-        (
-            Value::Known(T0_US),
-            Value::Known(FLIGHT_PATH_M),
-            pulse(&|p| p.fwhm_us = Value::Fitted(0.0)),
+            pulse(&|p| p.fwhm_squared_us2 = Value::Known(f64::NAN)),
         ),
         (
             Value::Known(T0_US),
@@ -1756,7 +1751,7 @@ fn calibration_measurement(setup: &Setup, counts: (Vec<f64>, Vec<f64>)) -> Measu
     m
 }
 
-fn calibrated(m: &Measurement, truth: &[f64], sign: f64, fitted_fwhm: bool) -> CountsFit {
+fn calibrated(m: &Measurement, truth: &[f64], sign: f64, fwhm_start_us: Option<f64>) -> CountsFit {
     let start = |value: f64, offset: f64| Value::Fitted(value + sign * offset);
     let calibration = Calibration {
         t0_us: start(T0_US, 0.05),
@@ -1768,11 +1763,8 @@ fn calibrated(m: &Measurement, truth: &[f64], sign: f64, fitted_fwhm: bool) -> C
             ],
             beta: [start(truth[2], 0.2 * truth[2]), Value::Known(truth[3])],
             r: start(truth[4], 0.05),
-            fwhm_us: if fitted_fwhm {
-                start(truth[5], 0.1)
-            } else {
-                Value::Known(truth[5])
-            },
+            fwhm_squared_us2: fwhm_start_us
+                .map_or(Value::Known(truth[5].powi(2)), |h| Value::Fitted(h * h)),
             ..known(&venus_pulse(truth))
         },
     };
@@ -1789,7 +1781,7 @@ fn calibration_estimates(fit: &CountsFit) -> [f64; 9] {
         fit.alpha[1],
         fit.beta[0],
         fit.r,
-        fit.fwhm_us,
+        fit.fwhm_squared_us2,
     ]
 }
 
@@ -1803,7 +1795,7 @@ fn calibration_truth(pulse: &[f64]) -> [f64; 9] {
         pulse[1],
         pulse[2],
         pulse[4],
-        pulse[5],
+        pulse[5].powi(2),
     ]
 }
 
@@ -1830,7 +1822,7 @@ fn the_pulse_is_calibrated_on_one_foil() {
         &calibration_sample(CALIBRATION_DENSITY),
     );
     let m = calibration_measurement(&setup, (rounded(&counts.0), rounded(&counts.1)));
-    let fit = calibrated(&m, &CALIBRATION_PULSE, 1.0, false);
+    let fit = calibrated(&m, &CALIBRATION_PULSE, 1.0, None);
     assert_recovered(&fit, &CALIBRATION_PULSE, 8, "start above the truth");
 }
 
@@ -1850,7 +1842,7 @@ mod pulse_calibration {
             &calibration_sample(CALIBRATION_DENSITY),
         );
         let m = calibration_measurement(&setup, (rounded(&counts.0), rounded(&counts.1)));
-        let fit = calibrated(&m, &p, -1.0, false);
+        let fit = calibrated(&m, &p, -1.0, None);
         assert_recovered(&fit, &p, 8, "start below the truth");
 
         let beam_origin_us = T0_US - 0.05;
@@ -1954,9 +1946,9 @@ mod pulse_calibration {
             &calibration_sample(CALIBRATION_DENSITY),
         );
         let m = calibration_measurement(&setup, (rounded(&counts.0), rounded(&counts.1)));
-        for sign in [1.0, -1.0] {
-            let fit = calibrated(&m, &p, sign, true);
-            assert_recovered(&fit, &p, 9, &format!("start {sign}"));
+        for (sign, fwhm_start_us) in [(1.0, p[5] + 0.1), (-1.0, p[5] - 0.1), (1.0, 0.0)] {
+            let fit = calibrated(&m, &p, sign, Some(fwhm_start_us));
+            assert_recovered(&fit, &p, 9, &format!("start {sign}, h {fwhm_start_us}"));
         }
     }
 
@@ -1976,7 +1968,7 @@ mod pulse_calibration {
             .into_par_iter()
             .map(|seed| {
                 let m = calibration_measurement(&setup, draws(&expected, 70_000 + seed, [1.0; 2]));
-                calibrated(&m, &p, if seed % 2 == 0 { 1.0 } else { -1.0 }, false)
+                calibrated(&m, &p, if seed % 2 == 0 { 1.0 } else { -1.0 }, None)
             })
             .filter(|fit| fit.converged)
             .collect();

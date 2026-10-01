@@ -367,7 +367,8 @@ impl FlightTimeGrid {
     }
 
     /// The derivatives of [`Self::rows_at`]'s probabilities with respect to
-    /// `α`, `β`, `R` and the triangle's FWHM, each at its point's energy, with
+    /// `α`, `β`, `R` and the square of the triangle's FWHM, each at its point's
+    /// energy, with
     /// the same step: [`IkedaCarpenterParams::bin_pulse_slopes_at`] for every
     /// point.
     ///

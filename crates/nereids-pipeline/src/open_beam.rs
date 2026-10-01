@@ -36,12 +36,6 @@ impl Calibration {
         let rate = |name: &'static str, value: &Value| {
             value.parameter(name, 0.0..=f64::INFINITY, "0 or more")
         };
-        let fwhm_us = rate("the triangle's FWHM", &self.pulse.fwhm_us)?;
-        if !fwhm_us.fixed && fwhm_us.value == 0.0 {
-            return Err(PipelineError::InvalidParameter(
-                "a fitted triangle FWHM must start above 0, where the counts are even in it".into(),
-            ));
-        }
         Ok(vec![
             self.t0_us
                 .parameter("t0", f64::NEG_INFINITY..=f64::INFINITY, "any real number")?,
@@ -55,14 +49,15 @@ impl Calibration {
             rate("β₀", &self.pulse.beta[0])?,
             rate("β₁", &self.pulse.beta[1])?,
             self.pulse.r.parameter("R", 0.0..=1.0, "within 0–1")?,
-            fwhm_us,
+            rate("the triangle's squared FWHM", &self.pulse.fwhm_squared_us2)?,
         ])
     }
 }
 
 /// The Ikeda–Carpenter pulse with `α = α₀√E + α₁` and `β = β₀√E + β₁` in
 /// 1/µs, `E` in eV, a constant storage fraction `R`, and the proton pulse's
-/// triangle of FWHM `h` in µs.
+/// triangle of FWHM `h` in µs, given by `h²`, in which the counts are smooth
+/// down to `h = 0`.
 #[derive(Debug, Clone)]
 pub struct Pulse {
     /// `[α₀, α₁]`, in 1/(µs·√eV) and 1/µs, each 0 or more.
@@ -71,9 +66,8 @@ pub struct Pulse {
     pub beta: [Value; 2],
     /// `R`, within 0–1.
     pub r: Value,
-    /// `h` in µs, 0 or more; a fitted one starts above 0, where the counts are
-    /// even in `h`.
-    pub fwhm_us: Value,
+    /// `h²` in µs², 0 or more.
+    pub fwhm_squared_us2: Value,
     /// `(low, high)`, the energies in eV the laws hold over; a window that
     /// neutrons from outside them can reach is refused.
     pub energy_span_ev: (f64, f64),
@@ -101,7 +95,7 @@ pub(crate) fn laws(numbers: &[f64]) -> IkedaCarpenterParams {
         },
         r: EnergyLaw::Const(numbers[4]),
         burst_sigma_us: None,
-        channel_fwhm_us: Some(numbers[5]),
+        channel_fwhm_us: Some(numbers[5].sqrt()),
     }
 }
 
@@ -187,8 +181,8 @@ pub struct OpenBeamFit {
 /// to measure the noise), a known, starting or measured value of the
 /// calibration is not finite and in its quantity's range, a measured one's sd
 /// is not finite and positive, bounds are not `lower < upper` in that range
-/// with the start between them, a fitted triangle FWHM starts at 0, or the
-/// pulse's energy span is not `0 < low < high` or its `n_tau` is below 8;
+/// with the start between them, or the pulse's energy span is not `0 < low <
+/// high` or its `n_tau` is below 8;
 /// [`PipelineError::FlightTimeGrid`] for the grid's refusals, including the
 /// first candidate's halving past the point cap; [`PipelineError::Fitting`] if
 /// the fitter refuses.

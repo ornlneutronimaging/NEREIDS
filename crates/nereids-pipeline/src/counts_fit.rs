@@ -148,11 +148,12 @@ pub struct CountsFit {
     pub beta: [f64; 2],
     /// The pulse's `R`: the known one, or the fitted one.
     pub r: f64,
-    /// The pulse's triangle FWHM `h` in µs: the known one, or the fitted one.
-    pub fwhm_us: f64,
+    /// The square of the pulse's triangle FWHM, `h²` in µs²: the known one, or
+    /// the fitted one.
+    pub fwhm_squared_us2: f64,
     /// Covariance of the fitted quantities among the densities, in the order
     /// given, the temperature, the normalization, `b0`, `b1`, `b2`, `t0`, the
-    /// flight path, `α₀`, `α₁`, `β₀`, `β₁`, `R` and `h`, in that order: the
+    /// flight path, `α₀`, `α₁`, `β₀`, `β₁`, `R` and `h²`, in that order: the
     /// inverse of the information at the
     /// fit, each run's expected information over its overdispersion plus
     /// `1/sd²` for each measured quantity.  The row and column of a quantity
@@ -334,7 +335,7 @@ pub fn fit_counts(
         .chain([&calibration.t0_us, &calibration.flight_path_m])
         .chain(&calibration.pulse.alpha)
         .chain(&calibration.pulse.beta)
-        .chain([&calibration.pulse.r, &calibration.pulse.fwhm_us])
+        .chain([&calibration.pulse.r, &calibration.pulse.fwhm_squared_us2])
         .enumerate()
         .filter_map(|(offset, value)| match *value {
             Value::Measured { value, sd } => Some((offset, value, sd)),
@@ -642,7 +643,7 @@ pub fn fit_counts(
         alpha: [params[layout.pulse], params[layout.pulse + 1]],
         beta: [params[layout.pulse + 2], params[layout.pulse + 3]],
         r: params[layout.pulse + 4],
-        fwhm_us: params[layout.pulse + 5],
+        fwhm_squared_us2: params[layout.pulse + 5],
         covariance,
         on_bound: sample_quantities
             .iter()

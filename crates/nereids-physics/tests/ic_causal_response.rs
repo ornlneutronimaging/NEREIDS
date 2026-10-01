@@ -855,35 +855,25 @@ fn pulse_slopes_are_the_derivatives_of_the_bin_probabilities() {
         .iter()
         .map(|delay| arrival_us + delay)
         .collect();
+    let laws = |pulse: [f64; 4]| constant_pulse(pulse[0], pulse[1], pulse[2], pulse[3].sqrt());
     let bins = |pulse: [f64; 4]| {
-        constant_pulse(pulse[0], pulse[1], pulse[2], pulse[3])
+        laws(pulse)
             .bin_probabilities_at(true_energy_ev, arrival_us, &edges)
             .expect("bins")
     };
     let slopes = |pulse: [f64; 4]| {
-        constant_pulse(pulse[0], pulse[1], pulse[2], pulse[3])
+        laws(pulse)
             .bin_pulse_slopes_at(true_energy_ev, arrival_us, &edges)
             .expect("slopes")
     };
     let largest = |values: &[f64]| values.iter().fold(0.0_f64, |m, v| m.max(v.abs()));
-    let just_above_the_series_switch = (0.81, 0.8);
-    for (alpha, beta) in [
-        (1.7, 0.25),
-        (0.3, 1.2),
-        (0.8, 0.8),
-        just_above_the_series_switch,
-    ] {
-        let fwhm_slope_resolved = (alpha, beta) != just_above_the_series_switch;
-        for fwhm_us in [0.0, 0.35] {
-            let pulse = [alpha, beta, 0.3, fwhm_us];
+    for (alpha, beta) in [(1.7, 0.25), (0.3, 1.2), (0.8, 0.8), (0.81, 0.8)] {
+        for fwhm_squared in [0.0, 0.35 * 0.35] {
+            let pulse = [alpha, beta, 0.3, fwhm_squared];
             let analytic = slopes(pulse);
-            let parameters = if fwhm_us > 0.0 && fwhm_slope_resolved {
-                4
-            } else {
-                3
-            };
+            let parameters = if fwhm_squared > 0.0 { 4 } else { 3 };
             for (n, analytic) in analytic.iter().enumerate().take(parameters) {
-                let step = 1e-4 * pulse[n];
+                let step = if n == 3 { 1e-3 } else { 1e-4 } * pulse[n];
                 let (mut up, mut down) = (pulse, pulse);
                 up[n] += step;
                 down[n] -= step;
@@ -892,28 +882,35 @@ fn pulse_slopes_are_the_derivatives_of_the_bin_probabilities() {
                     let central = (up[k] - down[k]) / (2.0 * step);
                     assert!(
                         (slope - central).abs() <= 1e-7 * largest(analytic),
-                        "α {alpha} β {beta} h {fwhm_us} parameter {n} bin {k}: {slope} vs {central}"
+                        "α {alpha} β {beta} h² {fwhm_squared} parameter {n} bin {k}: {slope} vs {central}"
                     );
                 }
             }
         }
     }
 
-    let unfolded = [1.7, 0.25, 0.3, 0.0];
-    assert!(slopes(unfolded)[3].iter().all(|&s| s == 0.0));
-    let one_sided = |step: f64| -> Vec<f64> {
+    for r in [0.0, 0.3] {
+        let unfolded = [1.7, 0.25, r, 0.0];
+        let analytic = &slopes(unfolded)[3];
         let mut folded = unfolded;
-        folded[3] = step;
-        bins(folded)
-            .iter()
-            .zip(bins(unfolded))
-            .map(|(a, b)| (a - b) / step)
-            .collect()
-    };
-    let (coarse, fine) = (largest(&one_sided(1e-2)), largest(&one_sided(5e-3)));
-    assert!(fine <= 0.6 * coarse, "{fine} vs {coarse}");
+        folded[3] = 1e-6;
+        let away_from_the_onset = |k: usize| {
+            [edges[k], edges[k + 1]]
+                .iter()
+                .all(|edge| (edge - arrival_us).abs() > 0.01)
+        };
+        for (k, (a, b)) in bins(folded).iter().zip(bins(unfolded)).enumerate() {
+            let one_sided = (a - b) / 1e-6;
+            assert!(
+                !away_from_the_onset(k)
+                    || (analytic[k] - one_sided).abs() <= 1e-6 * largest(analytic),
+                "R {r}, h² = 0, bin {k}: {} vs {one_sided}",
+                analytic[k]
+            );
+        }
+    }
 
-    let unstored = [1.7, 0.25, 0.0, 0.35];
+    let unstored = [1.7, 0.25, 0.0, 0.35 * 0.35];
     let analytic = &slopes(unstored)[2];
     let mut stored = unstored;
     stored[2] = 1e-6;
@@ -927,13 +924,16 @@ fn pulse_slopes_are_the_derivatives_of_the_bin_probabilities() {
     }
 
     let (alpha, beta) = (0.85, 0.8);
-    let at = |tau: f64| {
-        constant_pulse(alpha, beta, 0.3, 0.0)
-            .bin_pulse_slopes_at(true_energy_ev, 0.0, &[0.0, tau])
+    let at = |fwhm_us: f64, tau: f64| {
+        constant_pulse(alpha, beta, 0.3, fwhm_us)
+            .bin_pulse_slopes_at(true_energy_ev, 0.0, &[0.5 * tau, tau])
             .expect("slopes")
     };
     let switch_us = 0.05 / (alpha - beta);
-    let (below, above) = (at(switch_us * (1.0 - 1e-12)), at(switch_us * (1.0 + 1e-12)));
+    let (below, above) = (
+        at(0.0, switch_us * (1.0 - 1e-12)),
+        at(0.0, switch_us * (1.0 + 1e-12)),
+    );
     for n in 0..3 {
         assert!(
             (below[n][0] - above[n][0]).abs() <= 1e-9 * above[n][0].abs(),
@@ -942,6 +942,13 @@ fn pulse_slopes_are_the_derivatives_of_the_bin_probabilities() {
             above[n][0]
         );
     }
+    let (unfolded, narrow) = (at(0.0, 2.0), at(1e-5, 2.0));
+    assert!(
+        (unfolded[3][0] - narrow[3][0]).abs() <= 1e-8 * unfolded[3][0].abs(),
+        "{} vs {}",
+        unfolded[3][0],
+        narrow[3][0]
+    );
 }
 
 #[test]

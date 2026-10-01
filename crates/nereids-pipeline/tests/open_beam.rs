@@ -177,7 +177,7 @@ fn known(pulse: &IkedaCarpenter) -> Pulse {
         alpha: coefficients(&params.alpha).map(Value::Known),
         beta: coefficients(&params.beta).map(Value::Known),
         r: Value::Known(coefficients(&params.r)[1]),
-        fwhm_us: Value::Known(params.channel_fwhm_us.unwrap_or(0.0)),
+        fwhm_squared_us2: Value::Known(params.channel_fwhm_us.unwrap_or(0.0).powi(2)),
         energy_span_ev: detector.energy_span_ev(),
         n_tau: detector.n_tau(),
     }

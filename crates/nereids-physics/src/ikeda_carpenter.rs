@@ -264,10 +264,14 @@ pub fn ic_pulse(alpha: f64, beta: f64, r: f64, tau: f64) -> f64 {
     if r <= 0.0 {
         return fast;
     }
+    (1.0 - r) * fast + r * storage_density(alpha, beta, tau)
+}
+
+fn storage_density(alpha: f64, beta: f64, tau: f64) -> f64 {
     // slow/storage term = β(α/γ)³[e^{−βτ} − e^{−ατ}(1+u+½u²)], u = γτ = (α−β)τ.
     let u = (alpha - beta) * tau;
     let coeff = beta * alpha.powi(3) * tau.powi(3);
-    let slow = if u.abs() < 0.05 {
+    if u.abs() < 0.05 {
         // α ≈ β: bracket/u³ → e^{−βτ}·h(u)/u³ (Taylor); avoids 0/0 cancellation.
         coeff * (-beta * tau).exp() * h_over_cube_taylor(u)
     } else {
@@ -275,8 +279,22 @@ pub fn ic_pulse(alpha: f64, beta: f64, r: f64, tau: f64) -> f64 {
         // overflow (the old `e^{−βτ}·h(u)` factored an `e^{|u|}` → 0·∞ = NaN).
         let bracket = (-beta * tau).exp() - (-alpha * tau).exp() * (1.0 + u + 0.5 * u * u);
         coeff * bracket / (u * u * u)
-    };
-    (1.0 - r) * fast + r * slow
+    }
+}
+
+fn ic_pulse_slope(alpha: f64, beta: f64, r: f64, tau: f64) -> f64 {
+    if !tau.is_finite() || tau < 0.0 {
+        return 0.0;
+    }
+    let alpha = alpha.max(MIN_RATE);
+    let beta = beta.max(MIN_RATE);
+    let at = alpha * tau;
+    let prompt = 0.5 * alpha * at * at * (-at).exp();
+    let prompt_slope = 0.5 * alpha * alpha * at * (2.0 - at) * (-at).exp();
+    if r <= 0.0 {
+        return prompt_slope;
+    }
+    (1.0 - r) * prompt_slope + r * beta * (prompt - storage_density(alpha, beta, tau))
 }
 
 /// Cumulative probability of the Ikeda–Carpenter moderator pulse.
@@ -434,8 +452,9 @@ fn ic_cdf_folded_slopes(alpha: f64, beta: f64, r: f64, fwhm_us: f64, delay_us: f
         for (slope, value) in slopes.iter_mut().zip(ic_cdf_slopes(alpha, beta, r, x)) {
             *slope += triangle * value;
         }
-        slopes[3] +=
-            weight * (2.0 * s.abs() - fwhm_us) / fwhm_us.powi(3) * ic_cdf(alpha, beta, r, x);
+        let moment = (fwhm_us.powi(3) / 6.0 - 0.5 * fwhm_us * s * s + s.abs().powi(3) / 3.0)
+            / (2.0 * fwhm_us.powi(4));
+        slopes[3] += weight * moment * ic_pulse_slope(alpha, beta, r, x);
     });
     slopes
 }
@@ -553,9 +572,10 @@ fn inverse_lambda_denom(a0: f64, a1: f64, e: f64) -> f64 {
 /// Parameters of the Ikeda–Carpenter resolution model.
 #[derive(Debug, Clone, PartialEq)]
 pub struct IkedaCarpenterParams {
-    /// Fast (slowing-down) rate `α(E)`, 1/µs. Must evaluate to > 0.
+    /// Fast (slowing-down) rate `α(E)`, 1/µs. Must evaluate to at least
+    /// 1e-9.
     pub alpha: EnergyLaw,
-    /// Slow (storage) rate `β(E)`, 1/µs. Must evaluate to > 0.
+    /// Slow (storage) rate `β(E)`, 1/µs. Must evaluate to at least 1e-9.
     pub beta: EnergyLaw,
     /// Storage mixing fraction `R(E)`, 0 ≤ R ≤ 1.
     pub r: EnergyLaw,
@@ -673,10 +693,10 @@ impl IkedaCarpenterParams {
     }
 
     /// The derivatives of each of [`Self::bin_probabilities_at`] with
-    /// respect to `α`, `β`, `R` and the triangle's FWHM `h`, each evaluated at
-    /// `true_energy_ev`: `[∂P/∂α, ∂P/∂β, ∂P/∂R, ∂P/∂h]`, one value per bin.
-    /// `∂P/∂h` is 0 at `h = 0`, where the folded probabilities are even in
-    /// `h`.
+    /// respect to `α`, `β`, `R` and the square of the triangle's FWHM `h`,
+    /// each evaluated at `true_energy_ev`: `[∂P/∂α, ∂P/∂β, ∂P/∂R, ∂P/∂h²]`,
+    /// one value per bin.  The probabilities are even in `h` and smooth in
+    /// `h²`, so `∂P/∂h²` is finite and generally not 0 at `h = 0`.
     ///
     /// # Errors
     /// As [`Self::bin_probabilities_at`].
@@ -691,7 +711,7 @@ impl IkedaCarpenterParams {
         let slopes = |x: f64| {
             if h == 0.0 {
                 let [a, b, c] = ic_cdf_slopes(alpha, beta, r, x);
-                [a, b, c, 0.0]
+                [a, b, c, ic_pulse_slope(alpha, beta, r, x) / 12.0]
             } else {
                 ic_cdf_folded_slopes(alpha, beta, r, h, x)
             }
@@ -897,10 +917,10 @@ impl IkedaCarpenter {
         // producing a meaningless near-flat kernel rather than failing loudly).
         if let Some(&bad) = ref_energies.iter().find(|&&e| {
             let a = params.alpha.eval(e);
-            !a.is_finite() || a <= 0.0
+            !a.is_finite() || a < MIN_RATE
         }) {
             return Err(ResolutionParseError::InvalidFormat(format!(
-                "Ikeda–Carpenter α(E) must be > 0, but α({bad}) = {} is not",
+                "Ikeda–Carpenter α(E) must be at least {MIN_RATE} µs⁻¹, but α({bad}) = {} is not",
                 params.alpha.eval(bad)
             )));
         }
@@ -909,10 +929,10 @@ impl IkedaCarpenter {
         // into a different pulse.
         if let Some(&bad) = ref_energies.iter().find(|&&e| {
             let beta = params.beta.eval(e);
-            !beta.is_finite() || beta <= 0.0
+            !beta.is_finite() || beta < MIN_RATE
         }) {
             return Err(ResolutionParseError::InvalidFormat(format!(
-                "Ikeda–Carpenter β(E) must be > 0, but β({bad}) = {} is not",
+                "Ikeda–Carpenter β(E) must be at least {MIN_RATE} µs⁻¹, but β({bad}) = {} is not",
                 params.beta.eval(bad)
             )));
         }
@@ -1165,9 +1185,11 @@ impl DetectorPulse {
     ///
     /// # Errors
     /// [`ResolutionParseError::InvalidFormat`] when `energy_ev` is not
-    /// positive and finite, or a law is singular or out of range there.
+    /// positive and finite, a law is singular or out of range there, or the
+    /// pulse has a Gaussian burst.
     pub fn rise_us(&self, energy_ev: f64) -> Result<f64, ResolutionParseError> {
         self.params.validate_probe_energy(energy_ev)?;
+        self.params.triangle_fwhm_us()?;
         sampled_rise_us(&self.params, self.n_tau, energy_ev)
     }
 }
@@ -1348,8 +1370,6 @@ fn sampled_density(
 ) -> Result<(Vec<f64>, Vec<f64>), ResolutionParseError> {
     // Extend the grid to slightly negative τ so a symmetric burst/channel can
     // spread the leading edge correctly (the moderator pulse itself is 0 there).
-    // Widths are validated finite and >= 0 by `IkedaCarpenter::new`, so they are
-    // used directly (no `.abs()` masking of a sign error).
     let j_lo: isize = -((margin / dtau).ceil() as isize);
     let j_hi: isize = ((tau_max + margin) / dtau).ceil() as isize;
 
