@@ -20,7 +20,7 @@ use nereids_pipeline::open_beam::{BOUND, Calibration};
 use nereids_pipeline::reference::Instrument;
 use rand::SeedableRng;
 use rand_chacha::ChaCha12Rng;
-use rand_distr::{Distribution, Poisson};
+use rand_distr::{Distribution, Normal, Poisson};
 
 const FLIGHT_PATH_M: f64 = 25.0;
 const T0_US: f64 = 3.0;
@@ -248,7 +248,11 @@ fn densities_normalization_and_background_are_recovered_and_follow_a_density_on_
             m.background = [Value::Fitted(b0), Value::Fitted(b1), b2];
             let fit = fit_counts(&m, &calibration(&setup)).expect("fit");
             assert!(fit.converged, "{truth} from {density:?}");
-            assert_eq!(fit.overdispersion, Some(1.0), "{truth} from {density:?}");
+            assert_eq!(
+                fit.overdispersion,
+                [Some(1.0); 2],
+                "{truth} from {density:?}"
+            );
             fit
         };
         let estimates = |fit: &CountsFit| {
@@ -467,21 +471,21 @@ fn draw(expected: &[f64], seed: u64, counts_per_neutron: f64) -> Vec<f64> {
 fn draws(
     expected: &(Vec<f64>, Vec<f64>),
     seed: u64,
-    counts_per_neutron: f64,
+    counts_per_neutron: [f64; 2],
 ) -> (Vec<f64>, Vec<f64>) {
     (
-        draw(&expected.0, seed, counts_per_neutron),
-        draw(&expected.1, seed + 1_000_000, counts_per_neutron),
+        draw(&expected.0, seed, counts_per_neutron[0]),
+        draw(&expected.1, seed + 1_000_000, counts_per_neutron[1]),
     )
 }
 
 #[test]
-fn the_overdispersion_is_the_variance_of_both_runs_over_the_poisson_variance() {
+fn each_run_s_overdispersion_is_its_variance_over_its_poisson_variance() {
     let setup = standard();
     let isotope = hafnium_like(20.0);
     let sample = [(isotope, THIN)];
     let expected = expected(&setup, &beam(1.0e6), &sample);
-    let counts_per_neutron = 7.0;
+    let counts_per_neutron = [3.0, 7.0];
     let fits: Vec<CountsFit> = (100..110)
         .map(|seed| {
             fit_counts(
@@ -491,46 +495,21 @@ fn the_overdispersion_is_the_variance_of_both_runs_over_the_poisson_variance() {
             .expect("fit")
         })
         .collect();
-    let mut ratios = Vec::new();
-    for fit in &fits {
-        assert!(fit.converged);
-        ratios.push(fit.overdispersion.expect("measured") / counts_per_neutron);
-        let pull = (fit.densities[0] - THIN) / error_bar(fit, 0);
-        assert!(pull.abs() <= 4.0, "{pull}");
-    }
-    let freedom = (2 * expected.0.len() - fits[0].beam.coefficients().len() - 1) as f64;
-    let mean = ratios.iter().sum::<f64>() / ratios.len() as f64;
-    let bound = 3.0 * (2.0 / freedom).sqrt() / (ratios.len() as f64).sqrt();
-    assert!((mean - 1.0).abs() <= bound, "{mean} vs 1 ± {bound}");
-}
-
-#[test]
-fn counting_every_neutron_seven_times_scales_the_overdispersion_not_the_error_bars() {
-    let setup = standard();
-    let sample = [(hafnium_like(20.0), SATURATED)];
-    let once = draws(&expected(&setup, &beam(1.0e6), &sample), 300, 3.0);
-    let seven = (
-        once.0.iter().map(|c| 7.0 * c).collect(),
-        once.1.iter().map(|c| 7.0 * c).collect(),
-    );
-    let fit = |counts| {
-        fit_counts(
-            &fitted_from(measurement(&setup, counts, &sample), TEMPERATURE_K),
-            &calibration(&setup),
-        )
-        .expect("fit")
-    };
-    let (a, b) = (fit(once), fit(seven));
-    let ratio = b.overdispersion.expect("measured") / a.overdispersion.expect("measured");
-    assert!((ratio / 7.0 - 1.0).abs() <= 1e-3, "{ratio}");
-    assert!((b.densities[0] / a.densities[0] - 1.0).abs() <= 1e-6);
-    assert!((b.temperature_k / a.temperature_k - 1.0).abs() <= 1e-6);
-    let (a, b) = (
-        a.covariance.expect("covariance"),
-        b.covariance.expect("covariance"),
-    );
-    for (x, y) in a.data.iter().zip(&b.data) {
-        assert!((y - x).abs() <= 1e-3 * x.abs(), "{x} vs {y}");
+    let freedom = (expected.0.len() - fits[0].beam.coefficients().len() - 1) as f64;
+    let bound = 3.0 * (2.0 / freedom).sqrt() / (fits.len() as f64).sqrt();
+    for (run, per_neutron) in counts_per_neutron.iter().enumerate() {
+        let mut ratios = Vec::new();
+        for fit in &fits {
+            assert!(fit.converged);
+            ratios.push(fit.overdispersion[run].expect("measured") / per_neutron);
+            let pull = (fit.densities[0] - THIN) / error_bar(fit, 0);
+            assert!(pull.abs() <= 4.0, "{pull}");
+        }
+        let mean = ratios.iter().sum::<f64>() / ratios.len() as f64;
+        assert!(
+            (mean - 1.0).abs() <= bound,
+            "run {run}: {mean} vs 1 ± {bound}"
+        );
     }
 }
 
@@ -564,7 +543,7 @@ fn black_bins_refuse_counts_hold_a_bounded_background_at_zero_and_rare_ones_leav
         other => panic!("{other:?}"),
     }
 
-    let counts = draws(&expected, 401, 1.0);
+    let counts = draws(&expected, 401, [1.0; 2]);
     let mut m = fitted_from(measurement(&setup, counts, &sample), TEMPERATURE_K);
     m.background[0] = Value::Within {
         start: 1e-3,
@@ -578,20 +557,22 @@ fn black_bins_refuse_counts_hold_a_bounded_background_at_zero_and_rare_ones_leav
     assert!(error_bar(&fit, 0).is_finite() && error_bar(&fit, 1).is_finite());
 
     let counts_per_neutron = 7.0;
-    let (open, mut counts) = draws(&expected, 400, counts_per_neutron);
+    let (open, mut counts) = draws(&expected, 400, [counts_per_neutron; 2]);
     counts[rare] = 1.0;
     let fit = fit_counts(
         &measurement(&setup, (open, counts), &sample),
         &calibration(&setup),
     )
     .expect("fit");
-    let ratio = fit.overdispersion.expect("measured") / counts_per_neutron;
-    let measured = expected.0.len() + expected.1.iter().filter(|&&mu| mu >= 1.0).count();
-    let freedom = (measured - fit.beam.coefficients().len() - 1) as f64;
-    assert!(
-        (ratio - 1.0).abs() <= 3.0 * (2.0 / freedom).sqrt(),
-        "{ratio}"
-    );
+    let parameters = fit.beam.coefficients().len() + 1;
+    for (run, expected) in [&expected.0, &expected.1].into_iter().enumerate() {
+        let ratio = fit.overdispersion[run].expect("measured") / counts_per_neutron;
+        let freedom = (expected.iter().filter(|&&mu| mu >= 1.0).count() - parameters) as f64;
+        assert!(
+            (ratio - 1.0).abs() <= 3.0 * (2.0 / freedom).sqrt(),
+            "{run}: {ratio}"
+        );
+    }
 }
 
 #[test]
@@ -604,7 +585,7 @@ fn an_absent_isotope_is_fitted_on_its_bound() {
             .map(|seed| {
                 let mut m = measurement(
                     &setup,
-                    draws(&expected, seed, 1.0),
+                    draws(&expected, seed, [1.0; 2]),
                     &[(isotope.clone(), THIN)],
                 );
                 m.temperature_k = temperature_k;
@@ -652,12 +633,18 @@ fn inverse(mut a: Vec<Vec<f64>>) -> Vec<Vec<f64>> {
 }
 
 #[test]
-fn the_covariance_is_the_inverse_of_the_information_in_the_counts() {
-    covariance_against_information(Value::Known(TEMPERATURE_K));
-    covariance_against_information(Value::Fitted(1000.0));
+fn the_covariance_is_the_inverse_of_the_information_in_the_counts_and_measurements() {
+    covariance_against_information(Value::Known(TEMPERATURE_K), false);
+    covariance_against_information(
+        Value::Measured {
+            value: TEMPERATURE_K,
+            sd: 0.02 * TEMPERATURE_K,
+        },
+        true,
+    );
 }
 
-fn covariance_against_information(temperature: Value) {
+fn covariance_against_information(temperature: Value, noisy: bool) {
     let setup = standard();
     let truth = [
         (hafnium_like(20.0), 3.0 / 7805.1),
@@ -670,9 +657,40 @@ fn covariance_against_information(temperature: Value) {
     m.background[0] = Value::Fitted(TERMS[1]);
     m.background[1] = Value::Fitted(TERMS[2]);
     m.background[2] = Value::Known(TERMS[3]);
+    let fitted_temperature = !matches!(temperature, Value::Known(_));
+    let first_term = truth.len() + usize::from(fitted_temperature);
+    let measured: Vec<(usize, f64, f64)> = if noisy {
+        m.sample_counts = draw(&m.sample_counts, 500, 7.0);
+        let (density_sd, a_sd, b0_sd) = (0.05 * truth[0].1, 0.01 * TERMS[0], 0.2 * TERMS[1]);
+        m.isotopes[0].1 = Value::Measured {
+            value: truth[0].1,
+            sd: density_sd,
+        };
+        m.normalization = Value::Measured {
+            value: TERMS[0],
+            sd: a_sd,
+        };
+        m.background[0] = Value::Measured {
+            value: TERMS[1],
+            sd: b0_sd,
+        };
+        let temperature = match temperature {
+            Value::Measured { value, sd } => Some((truth.len(), value, sd)),
+            _ => None,
+        };
+        [(0, truth[0].1, density_sd)]
+            .into_iter()
+            .chain(temperature)
+            .chain([
+                (first_term, TERMS[0], a_sd),
+                (first_term + 1, TERMS[1], b0_sd),
+            ])
+            .collect()
+    } else {
+        Vec::new()
+    };
     let fit = fit_counts(&m, &calibration(&setup)).expect("fit");
-    let fitted_temperature = matches!(temperature, Value::Fitted(_));
-    let quantities = truth.len() + usize::from(fitted_temperature) + 3;
+    let quantities = first_term + 3;
     let (low, high) = FlightTimeGrid::new(&setup.edges, T0_US, &setup.pulse)
         .expect("grid")
         .range_us();
@@ -688,20 +706,23 @@ fn covariance_against_information(temperature: Value) {
             beam.per_us(u) * (step * slope).exp()
         }
     };
-    for (i, (_, n)) in truth.iter().enumerate() {
-        let pull = (fit.densities[i] - n) / error_bar(&fit, i);
-        assert!(pull.abs() <= BOUND.sqrt(), "{i}: {pull}");
-    }
-    if fitted_temperature {
-        let pull = (fit.temperature_k - TEMPERATURE_K) / error_bar(&fit, truth.len());
-        assert!(pull.abs() <= BOUND.sqrt(), "temperature: {pull}");
-    }
     let mut terms = [fit.normalization; 4];
     terms[1..].copy_from_slice(&fit.background);
-    let first_term = truth.len() + usize::from(fitted_temperature);
-    for i in 0..3 {
-        let pull = (terms[i] - TERMS[i]) / error_bar(&fit, first_term + i);
-        assert!(pull.abs() <= BOUND.sqrt(), "term {i}: {pull}");
+    let estimates: Vec<f64> = fit
+        .densities
+        .iter()
+        .chain(fitted_temperature.then_some(&fit.temperature_k))
+        .chain(&terms[..3])
+        .copied()
+        .collect();
+    let truths = truth
+        .iter()
+        .map(|(_, n)| n)
+        .chain(fitted_temperature.then_some(&TEMPERATURE_K))
+        .chain(&TERMS[..3]);
+    for (i, (x, truth)) in estimates.iter().zip(truths).enumerate().filter(|_| !noisy) {
+        let pull = (x - truth) / error_bar(&fit, i);
+        assert!(pull.abs() <= BOUND.sqrt(), "{i}: {pull}");
     }
     let fitted: Vec<(ResonanceData, f64)> = truth
         .iter()
@@ -759,7 +780,9 @@ fn covariance_against_information(temperature: Value) {
                 .collect()
         })
         .collect();
-    let information: Vec<Vec<f64>> = columns
+    let bins = mu.len() / 2;
+    let overdispersion = fit.overdispersion.map(|phi| phi.expect("measured"));
+    let mut information: Vec<Vec<f64>> = columns
         .iter()
         .map(|a| {
             columns
@@ -768,13 +791,24 @@ fn covariance_against_information(temperature: Value) {
                     a.iter()
                         .zip(b)
                         .zip(&mu)
-                        .filter(|(_, m)| **m > 0.0)
-                        .map(|((x, y), m)| x * y / m)
+                        .enumerate()
+                        .filter(|(_, (_, m))| **m > 0.0)
+                        .map(|(k, ((x, y), m))| x * y / (m * overdispersion[k / bins]))
                         .sum()
                 })
                 .collect()
         })
         .collect();
+    let counts_only = inverse(information.clone());
+    for &(q, _, sd) in &measured {
+        let p = coefficients + q;
+        let ratio = counts_only[p][p] / (sd * sd);
+        assert!(
+            (0.1..=10.0).contains(&ratio),
+            "{q}: the counts' variance is {ratio} times the measurement's"
+        );
+        information[p][p] += sd.powi(-2);
+    }
     let oracle = inverse(information);
     let covariance = fit.covariance.expect("covariance");
     for i in 0..quantities {
@@ -789,6 +823,16 @@ fn covariance_against_information(temperature: Value) {
                 covariance.get(i, j)
             );
         }
+    }
+    let pulls = fit.measured_pulls.expect("measured pulls");
+    assert_eq!(pulls.len(), measured.len());
+    for (&(q, value, sd), pull) in measured.iter().zip(pulls) {
+        let variance = oracle[coefficients + q][coefficients + q];
+        let expected = (estimates[q] - value) / (sd * sd - variance).sqrt();
+        assert!(
+            (pull - expected).abs() <= 1e-2 * (1.0 + expected.abs()),
+            "{q}: {pull} vs {expected}"
+        );
     }
 }
 
@@ -834,6 +878,9 @@ fn measurements_the_fit_does_not_describe_are_refused() {
     invalid(&|m| m.normalization = Value::Known(0.0));
     invalid(&|m| m.normalization = Value::Known(f64::INFINITY));
     invalid(&|m| m.background[1] = Value::Fitted(f64::NAN));
+    for sd in [0.0, -1.0, f64::NAN, f64::INFINITY] {
+        invalid(&|m| m.temperature_k = Value::Measured { value: 300.0, sd });
+    }
     let black = [(isotope.clone(), 4.0e3 / 7805.1)];
     let counts = expected(&setup, &beam(1.0e4), &black);
     let mut empty = measurement(&setup, (rounded(&counts.0), rounded(&counts.1)), &black);
@@ -970,7 +1017,7 @@ fn density_and_temperature_are_recovered_from_starts_on_either_side() {
                 .expect("fit");
                 let case = format!("{density} at {truth_k} K from {start}, {start_k} K");
                 assert!(fit.converged, "{case}");
-                assert_eq!(fit.overdispersion, Some(1.0), "{case}");
+                assert_eq!(fit.overdispersion, [Some(1.0); 2], "{case}");
                 let pulls = [
                     (fit.densities[0] - density) / error_bar(&fit, 0),
                     (fit.temperature_k - truth_k) / error_bar(&fit, 1),
@@ -1128,7 +1175,7 @@ fn a_false_minimum_shows_as_an_overdispersion_far_above_one() {
     .expect("fit");
     assert!(fit.converged);
     assert!(fit.temperature_k < 500.0, "{}", fit.temperature_k);
-    let overdispersion = fit.overdispersion.expect("measured");
+    let overdispersion = fit.overdispersion[1].expect("measured");
     assert!(overdispersion > 100.0, "{overdispersion}");
 }
 
@@ -1146,8 +1193,9 @@ mod error_bar_pulls {
         temperature_k: Value,
         terms: Option<[f64; 4]>,
         level: f64,
-        counts_per_neutron: f64,
+        counts_per_neutron: [f64; 2],
         open_run_fraction: f64,
+        measured_density_sd: Option<f64>,
         seeds: std::ops::Range<u64>,
     }
 
@@ -1155,7 +1203,7 @@ mod error_bar_pulls {
         pulls: Vec<f64>,
         estimates: Vec<f64>,
         reported_correlation: Option<f64>,
-        overdispersion: f64,
+        overdispersion: [f64; 2],
         deviance: f64,
     }
 
@@ -1186,6 +1234,13 @@ mod error_bar_pulls {
                 m.normalization = Value::Fitted(a);
                 m.background = [Value::Fitted(b0), Value::Fitted(b1), Value::Known(b2)];
             }
+            if let Some(sd) = self.measured_density_sd {
+                let mut rng = ChaCha12Rng::seed_from_u64(seed + 2_000_000);
+                let value = Normal::new(self.sample.1, sd)
+                    .expect("positive sd")
+                    .sample(&mut rng);
+                m.isotopes[0].1 = Value::Measured { value, sd };
+            }
             m
         }
 
@@ -1208,12 +1263,13 @@ mod error_bar_pulls {
                 estimates.extend([fit.normalization, fit.background[0], fit.background[1]]);
                 truths.extend(&terms[..3]);
             }
-            let pulls: Vec<f64> = estimates
+            let mut pulls: Vec<f64> = estimates
                 .iter()
                 .zip(&truths)
                 .enumerate()
                 .map(|(i, (x, truth))| (x - truth) / covariance.get(i, i).sqrt())
                 .collect();
+            pulls.extend(fit.measured_pulls.as_ref()?);
             let reported_correlation = (estimates.len() >= 2).then(|| {
                 covariance.get(0, 1) / (covariance.get(0, 0) * covariance.get(1, 1)).sqrt()
             });
@@ -1221,7 +1277,7 @@ mod error_bar_pulls {
                 pulls,
                 estimates,
                 reported_correlation,
-                overdispersion: fit.overdispersion?,
+                overdispersion: [fit.overdispersion[0]?, fit.overdispersion[1]?],
                 deviance: fit.deviance,
             })
         }
@@ -1286,20 +1342,25 @@ mod error_bar_pulls {
         kept
     }
 
-    fn overdispersion_matches(kept: &[&Draw], counts_per_neutron: f64) {
-        let ratios: Vec<f64> = kept
-            .iter()
-            .map(|d| d.overdispersion / counts_per_neutron)
-            .collect();
-        let (mean, sd) = moments(&ratios);
-        let band = Z * sd / (ratios.len() as f64).sqrt();
-        assert!((mean - 1.0).abs() <= band, "overdispersion {mean} ± {band}");
+    fn overdispersion_matches(kept: &[&Draw], counts_per_neutron: [f64; 2]) {
+        for (run, per_neutron) in counts_per_neutron.iter().enumerate() {
+            let ratios: Vec<f64> = kept
+                .iter()
+                .map(|d| d.overdispersion[run] / per_neutron)
+                .collect();
+            let (mean, sd) = moments(&ratios);
+            let band = Z * sd / (ratios.len() as f64).sqrt();
+            assert!(
+                (mean - 1.0).abs() <= band,
+                "run {run}: overdispersion {mean} ± {band}"
+            );
+        }
     }
 
     fn saturated(
         temperature_k: Value,
         level: f64,
-        counts_per_neutron: f64,
+        counts_per_neutron: [f64; 2],
         open_run_fraction: f64,
         seeds: std::ops::Range<u64>,
     ) -> Ensemble {
@@ -1311,6 +1372,7 @@ mod error_bar_pulls {
             level,
             counts_per_neutron,
             open_run_fraction,
+            measured_density_sd: None,
             seeds,
         }
     }
@@ -1324,8 +1386,9 @@ mod error_bar_pulls {
             temperature_k: Value::Fitted(TEMPERATURE_K),
             terms: None,
             level: 1.0e5,
-            counts_per_neutron: 1.0,
+            counts_per_neutron: [1.0; 2],
             open_run_fraction: 1.0,
+            measured_density_sd: None,
             seeds: 10_000..10_400,
         };
         let expected = ensemble.expected();
@@ -1348,17 +1411,33 @@ mod error_bar_pulls {
 
     #[test]
     #[ignore = "slow; runs nightly"]
-    fn compound_counts_scale_the_error_bars_by_the_overdispersion() {
-        let ensemble = saturated(
+    fn a_measured_density_and_each_run_s_overdispersion_set_the_error_bars() {
+        let counts_per_neutron = [3.0, 7.0];
+        let mut ensemble = saturated(
             Value::Fitted(TEMPERATURE_K),
             1.0e4,
-            7.0,
+            counts_per_neutron,
             1.0,
             20_000..20_400,
         );
-        let draws = ensemble.draws_from_truth();
+        let expected = ensemble.expected();
+        let noiseless = fit_counts(
+            &fitted_from(
+                measurement(
+                    &ensemble.setup,
+                    (rounded(&expected.0), rounded(&expected.1)),
+                    std::slice::from_ref(&ensemble.sample),
+                ),
+                TEMPERATURE_K,
+            ),
+            &calibration(&ensemble.setup),
+        )
+        .expect("fit");
+        ensemble.measured_density_sd =
+            Some(error_bar(&noiseless, 0) * counts_per_neutron[1].sqrt());
+        let draws = ensemble.draws(&expected, (ensemble.sample.1, ensemble.temperature_k));
         let kept = check(&draws);
-        overdispersion_matches(&kept, 7.0);
+        overdispersion_matches(&kept, counts_per_neutron);
     }
 
     #[test]
@@ -1367,7 +1446,7 @@ mod error_bar_pulls {
         let ensemble = saturated(
             Value::Fitted(TEMPERATURE_K),
             1.0e4,
-            1.0,
+            [1.0; 2],
             0.1,
             30_000..30_400,
         );
@@ -1377,17 +1456,29 @@ mod error_bar_pulls {
     #[test]
     #[ignore = "slow; runs nightly"]
     fn a_few_counts_per_bin_with_empty_bins_give_their_error_bars() {
-        let ensemble = saturated(Value::Known(TEMPERATURE_K), 3.0, 1.0, 1.0, 40_000..40_400);
+        let ensemble = saturated(
+            Value::Known(TEMPERATURE_K),
+            3.0,
+            [1.0; 2],
+            1.0,
+            40_000..40_400,
+        );
         check(&ensemble.draws_from_truth());
     }
 
     #[test]
     #[ignore = "slow; runs nightly"]
     fn the_overdispersion_measures_compound_counts_at_a_few_counts_per_bin() {
-        let ensemble = saturated(Value::Known(TEMPERATURE_K), 3.0, 7.0, 1.0, 50_000..50_400);
+        let ensemble = saturated(
+            Value::Known(TEMPERATURE_K),
+            3.0,
+            [7.0; 2],
+            1.0,
+            50_000..50_400,
+        );
         let draws = ensemble.draws_from_truth();
         let kept = check(&draws);
-        overdispersion_matches(&kept, 7.0);
+        overdispersion_matches(&kept, [7.0; 2]);
     }
 
     #[test]
@@ -1398,7 +1489,7 @@ mod error_bar_pulls {
             ..saturated(
                 Value::Fitted(TEMPERATURE_K),
                 1.0e4,
-                1.0,
+                [1.0; 2],
                 1.0,
                 60_000..60_400,
             )

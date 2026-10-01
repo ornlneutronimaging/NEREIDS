@@ -197,6 +197,7 @@ fn fit(model: &Model, case: &Case, values: &[f64], fixed: bool) -> PoissonResult
     poisson_fit(
         model,
         &case.observed,
+        &[],
         &mut params,
         &PoissonConfig::default(),
     )
