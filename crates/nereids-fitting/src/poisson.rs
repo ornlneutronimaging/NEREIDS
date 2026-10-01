@@ -72,9 +72,10 @@ pub struct PoissonResult {
     /// Whether each free parameter ended on one of its bounds.
     pub on_bound: Vec<bool>,
     /// Each count's leverage: the diagonal of the hat matrix of the free
-    /// parameters off their bounds.  The leverages sum to the number of those
-    /// parameters less the share their priors determine.  `None` when
-    /// `covariance` is or cannot be computed.
+    /// parameters off their bounds.  The leverages sum to the number of
+    /// directions in those parameters the counts and priors determine, less
+    /// the share the priors take.  `None` when `covariance` is or cannot be
+    /// computed.
     pub leverage: Option<Vec<f64>>,
 }
 

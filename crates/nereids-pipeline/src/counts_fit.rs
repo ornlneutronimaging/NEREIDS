@@ -139,8 +139,9 @@ pub struct CountsFit {
     /// given, the temperature, the normalization, `b0`, `b1` and `b2`, in
     /// that order: the inverse of the information at the fit, each run's
     /// expected information over its overdispersion plus `1/sd²` for each
-    /// measured quantity.  The row and column of a quantity on one of its bounds, or
-    /// that the counts do not determine, are NaN, and the other entries are
+    /// measured quantity.  The row and column of a quantity on one of its
+    /// bounds, or that neither the counts nor a measurement determine, are
+    /// NaN, and the other entries are
     /// conditional on every quantity that ended on a bound being held there;
     /// every entry is NaN when a fitted temperature ends at 1 K or 5000 K.
     /// `None` when the fit did not converge.
@@ -166,20 +167,22 @@ pub struct CountsFit {
     /// and the grid met its rule at the fitted temperature.
     pub converged: bool,
     /// Variance of the counts of the open-beam run, then of the sample run,
-    /// over their Poisson variance; each run's counts are weighted by its
-    /// inverse in the fit.  The open-beam run's is the open-beam fit's
+    /// over their Poisson variance: the value each run's counts are divided by
+    /// in the returned fit.  The open-beam run's is the open-beam fit's
     /// [`OpenBeamFit::overdispersion`](crate::open_beam::OpenBeamFit::overdispersion);
-    /// the sample run's is measured the same way at this fit, on the bins the
-    /// first fit predicts at least one count.  `None` for a run when its fit
-    /// did not converge or its counts leave less than one degree of freedom,
-    /// and that run is weighted with 1.
+    /// the sample run's is measured the same way, on the bins the first fit
+    /// predicts at least one count, by the previous fit, and within 1% by the
+    /// returned one when `converged`.  `None` when the run's counts have not
+    /// measured it; the open-beam run is then weighted with 1, and the sample
+    /// run as the open-beam run.
     pub overdispersion: [Option<f64>; 2],
     /// For each measured quantity, in the covariance's order, its fitted value
     /// less its measurement over the standard deviation of that difference,
     /// `√(sd² − variance)`: near 0 ± 1 when the counts agree with the
-    /// measurement.  NaN for a quantity on a bound or the counts do not
-    /// inform, and for every quantity when a fitted temperature ends at 1 K
-    /// or 5000 K.  `None` when `covariance` is.
+    /// measurement.  NaN for a quantity on a bound, and for every quantity
+    /// when a fitted temperature ends at 1 K or 5000 K; it loses precision as
+    /// the counts' information on the quantity vanishes beside the
+    /// measurement's.  `None` when `covariance` is.
     pub measured_pulls: Option<Vec<f64>>,
     /// Step, in µs, of the fit's grid.
     pub step_us: f64,
@@ -436,6 +439,7 @@ pub fn fit_counts(
         .collect();
     let mut first = first_grid(parameters.params[layout.temperature].value)?;
     let mut weights = [open.overdispersion.unwrap_or(1.0); 2];
+    let mut sample_measured = false;
     let mut noise_bins = None;
     let mut passes = 0;
     let (fit, rule_halvings, overdispersion, settled) = loop {
@@ -457,10 +461,14 @@ pub fn fit_counts(
         let fitted_k = fit.result.params[layout.temperature];
         let noise_bins = noise_bins.get_or_insert_with(|| counted(&fit, bins..2 * bins));
         let sample = overdispersion(&observed, &fit, noise_bins);
-        let settled = (sample.unwrap_or(1.0) / weights[1] - 1.0).abs() <= SETTLED_OVERDISPERSION;
+        let next = sample.unwrap_or(weights[0]);
+        let settled = (next / weights[1] - 1.0).abs() <= SETTLED_OVERDISPERSION;
         let resolved = 2.0 * fit.step_us <= 0.5 * narrowest_us(fitted_k)?;
         if !fit.converged || (settled && resolved) || passes == MOST_PASSES {
-            let weighted = [open.overdispersion, sample.map(|_| weights[1])];
+            let weighted = [
+                open.overdispersion,
+                (sample_measured || (settled && sample.is_some())).then_some(weights[1]),
+            ];
             break (fit, first.1, weighted, settled && resolved);
         }
         let resumed = (Arc::clone(&fit.coarse), first.1 + fit.halvings - 1);
@@ -468,7 +476,8 @@ pub fn fit_counts(
             .into_iter()
             .min_by(|a, b| a.0.step_us().total_cmp(&b.0.step_us()))
             .expect("two grids");
-        weights[1] = sample.unwrap_or(1.0);
+        weights[1] = next;
+        sample_measured = sample.is_some();
     };
     let converged = fit.converged && settled;
 
