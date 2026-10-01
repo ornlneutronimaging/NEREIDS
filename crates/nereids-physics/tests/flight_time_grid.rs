@@ -131,7 +131,8 @@ fn largest_outside(pulse: &IkedaCarpenter, grid: &FlightTimeGrid) -> f64 {
 #[test]
 fn no_flight_time_outside_the_range_reaches_a_bin() {
     for (name, pulse) in unfolded().into_iter().chain(folded()) {
-        let grid = FlightTimeGrid::new(&edges(), T0_US, FLIGHT_PATH_M, &pulse).expect(name);
+        let grid = FlightTimeGrid::new(&edges(), T0_US, FLIGHT_PATH_M, &pulse.detector_pulse())
+            .expect(name);
         let largest = largest_outside(&pulse, &grid);
         assert!(
             largest < NEGLIGIBLE_ARRIVAL_PROBABILITY,
@@ -141,7 +142,8 @@ fn no_flight_time_outside_the_range_reaches_a_bin() {
 }
 
 fn assert_tight(name: &str, pulse: &Arc<IkedaCarpenter>, edges: &[f64], t0_us: f64) {
-    let grid = FlightTimeGrid::new(edges, t0_us, FLIGHT_PATH_M, pulse).expect(name);
+    let grid =
+        FlightTimeGrid::new(edges, t0_us, FLIGHT_PATH_M, &pulse.detector_pulse()).expect(name);
     let (start, end) = grid.range_us();
     let (u_lo, u_hi) = (start + grid.step_us(), end - grid.step_us());
     let (first, last) = (edges[0], edges[edges.len() - 1]);
@@ -183,7 +185,7 @@ fn windows_the_synthesis_grid_does_not_cover_are_refused() {
         (edges(), 350.0, constant),
     ] {
         assert!(matches!(
-            FlightTimeGrid::new(&edges, t0, FLIGHT_PATH_M, pulse),
+            FlightTimeGrid::new(&edges, t0, FLIGHT_PATH_M, &pulse.detector_pulse()),
             Err(FlightTimeGridError::OutsideCalibration { .. })
         ));
     }
@@ -193,26 +195,37 @@ fn windows_the_synthesis_grid_does_not_cover_are_refused() {
 fn invalid_windows_and_unaffordable_grids_are_refused() {
     let constant = &unfolded()[0].1;
     assert!(matches!(
-        FlightTimeGrid::new(&edges(), f64::NAN, FLIGHT_PATH_M, constant),
+        FlightTimeGrid::new(
+            &edges(),
+            f64::NAN,
+            FLIGHT_PATH_M,
+            &constant.detector_pulse()
+        ),
         Err(FlightTimeGridError::InvalidTimingOffset(_))
     ));
-    let grid = FlightTimeGrid::new(&edges(), T0_US, FLIGHT_PATH_M, constant).expect("grid");
+    let grid = FlightTimeGrid::new(&edges(), T0_US, FLIGHT_PATH_M, &constant.detector_pulse())
+        .expect("grid");
     for flight_path_m in [0.0, -FLIGHT_PATH_M, f64::NAN] {
         assert!(matches!(
-            FlightTimeGrid::new(&edges(), T0_US, flight_path_m, constant),
+            FlightTimeGrid::new(&edges(), T0_US, flight_path_m, &constant.detector_pulse()),
             Err(FlightTimeGridError::InvalidFlightPath(_))
         ));
         assert!(matches!(
-            grid.covers(T0_US, flight_path_m),
+            grid.covers(T0_US, flight_path_m, constant.params()),
             Err(FlightTimeGridError::InvalidFlightPath(_))
         ));
         assert!(matches!(
-            grid.rows_at(T0_US, flight_path_m),
+            grid.rows_at(T0_US, flight_path_m, constant.params()),
             Err(FlightTimeGridError::InvalidFlightPath(_))
         ));
     }
     assert!(matches!(
-        FlightTimeGrid::new(&[350.0, 349.0], T0_US, FLIGHT_PATH_M, constant),
+        FlightTimeGrid::new(
+            &[350.0, 349.0],
+            T0_US,
+            FLIGHT_PATH_M,
+            &constant.detector_pulse()
+        ),
         Err(FlightTimeGridError::InvalidTimeEdges)
     ));
     let sharp = |alpha: f64| {
@@ -225,16 +238,27 @@ fn invalid_windows_and_unaffordable_grids_are_refused() {
         )
     };
     assert!(matches!(
-        FlightTimeGrid::new(&edges(), T0_US, FLIGHT_PATH_M, &sharp(2000.0)),
+        FlightTimeGrid::new(
+            &edges(),
+            T0_US,
+            FLIGHT_PATH_M,
+            &sharp(2000.0).detector_pulse()
+        ),
         Err(FlightTimeGridError::TooManyPoints { .. })
     ));
-    let grid = FlightTimeGrid::new(&edges(), T0_US, FLIGHT_PATH_M, constant).expect("grid");
+    let grid = FlightTimeGrid::new(&edges(), T0_US, FLIGHT_PATH_M, &constant.detector_pulse())
+        .expect("grid");
     assert!(matches!(
         grid.predict(&[1.0]),
         Err(FlightTimeGridError::ValuesLength { found: 1, .. })
     ));
-    let near_cap =
-        FlightTimeGrid::new(&edges(), T0_US, FLIGHT_PATH_M, &sharp(700.0)).expect("near the cap");
+    let near_cap = FlightTimeGrid::new(
+        &edges(),
+        T0_US,
+        FLIGHT_PATH_M,
+        &sharp(700.0).detector_pulse(),
+    )
+    .expect("near the cap");
     assert!(matches!(
         near_cap.halved(),
         Err(FlightTimeGridError::TooManyPoints { .. })
@@ -279,7 +303,7 @@ fn a_neutron_arrives_between_its_delays_but_for_a_negligible_chance() {
     for (w, (pulse, folded)) in witnesses.iter().enumerate() {
         for k in 0..=60 {
             let e = E_MIN_EV * (E_MAX_EV / E_MIN_EV).powf(f64::from(k) / 60.0);
-            let (first, last) = pulse.delays_us(e).expect("delays");
+            let (first, last) = pulse.params().delays_us(e).expect("delays");
             let nominal = -TOF_FACTOR * FLIGHT_PATH_M / e.sqrt();
             let chance = |edges: [f64; 2]| -> f64 {
                 pulse
@@ -313,13 +337,19 @@ fn pulses_whose_arrival_can_fall_with_flight_time_are_refused() {
             pulse(c(0.565), c(0.002), sqrt_e(0.07, 0.0), None, None),
         ),
     ] {
-        let latest = |u: f64| u + pulse.delays_us((CLOCK / u).powi(2)).expect("delays").1;
+        let latest = |u: f64| {
+            u + pulse
+                .params()
+                .delays_us((CLOCK / u).powi(2))
+                .expect("delays")
+                .1
+        };
         let fastest = CLOCK / E_MAX_EV.sqrt();
         let falls = (0..1000)
             .map(|i| fastest + 0.5 * f64::from(i))
             .any(|u| latest(u + 0.5) < latest(u));
         assert!(falls, "{parameter}");
-        match FlightTimeGrid::new(&edges(), T0_US, FLIGHT_PATH_M, &pulse) {
+        match FlightTimeGrid::new(&edges(), T0_US, FLIGHT_PATH_M, &pulse.detector_pulse()) {
             Err(FlightTimeGridError::LengthensWithEnergy { parameter: found }) => {
                 assert_eq!(found, parameter);
             }
@@ -340,5 +370,5 @@ fn a_falling_beta_without_storage_is_accepted() {
         None,
         None,
     );
-    assert!(FlightTimeGrid::new(&edges(), T0_US, FLIGHT_PATH_M, &pulse).is_ok());
+    assert!(FlightTimeGrid::new(&edges(), T0_US, FLIGHT_PATH_M, &pulse.detector_pulse()).is_ok());
 }

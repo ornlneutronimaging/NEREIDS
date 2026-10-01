@@ -128,7 +128,10 @@ fn simulated(
 fn the_grid_a_halving_accepts_matches_the_simulator_as_far_as_it_covers() {
     for ((name, pulse), sign) in pulses().into_iter().zip([1.0, -1.0].into_iter().cycle()) {
         let grids: Vec<FlightTimeGrid> = successors(
-            Some(FlightTimeGrid::new(&edges(), T0_US, FLIGHT_PATH_M, &pulse).expect(name)),
+            Some(
+                FlightTimeGrid::new(&edges(), T0_US, FLIGHT_PATH_M, &pulse.detector_pulse())
+                    .expect(name),
+            ),
             |g| Some(g.halved().expect("halved grid")),
         )
         .take(MAX_HALVINGS + 1)
@@ -158,7 +161,9 @@ fn the_grid_a_halving_accepts_matches_the_simulator_as_far_as_it_covers() {
         };
         let covers = |shift_us: f64| {
             let (t0_us, flight_path_m) = at(shift_us);
-            accepted.covers(t0_us, flight_path_m).expect("covers")
+            accepted
+                .covers(t0_us, flight_path_m, pulse.params())
+                .expect("covers")
         };
         let (mut inside, mut outside) = (0.0, FARTHEST_SHIFT_US);
         for _ in 0..40 {
@@ -177,7 +182,7 @@ fn the_grid_a_halving_accepts_matches_the_simulator_as_far_as_it_covers() {
         );
         assert!(simulator_spread <= BOUND / 100.0, "{name}");
         let predicted = accepted
-            .rows_at(t0_us, flight_path_m)
+            .rows_at(t0_us, flight_path_m, pulse.params())
             .expect("rows")
             .predict(&beam(accepted, flight_path_m / FLIGHT_PATH_M))
             .expect("one value per grid point");

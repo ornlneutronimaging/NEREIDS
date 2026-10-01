@@ -340,6 +340,7 @@ fn a_gaussian_burst_is_refused_in_detector_time() {
                 .expect_err("detector bins must refuse a burst")
                 .to_string(),
             model
+                .params()
                 .delays_us(25.0)
                 .expect_err("delays must refuse a burst")
                 .to_string(),
@@ -818,10 +819,12 @@ fn arrival_slopes_are_the_derivative_of_the_bin_probabilities() {
         .expect("valid IC model");
         let bins = |arrival: f64| {
             model
+                .params()
                 .bin_probabilities_at(true_energy_ev, arrival, &edges)
                 .expect("bins")
         };
         let slopes = model
+            .params()
             .bin_arrival_slopes_at(true_energy_ev, arrival_us, &edges)
             .expect("slopes");
         let h = 1e-4;

@@ -381,12 +381,8 @@ pub fn fit_counts(
     }
     let (t0, flight_path) = calibration.energy_scale()?;
     let beam_origin_us = t0.value;
-    let mut base = FlightTimeGrid::new(
-        time_edges_us,
-        t0.value,
-        flight_path.value,
-        &calibration.pulse,
-    )?;
+    let pulse = calibration.pulse.detector_pulse();
+    let mut base = FlightTimeGrid::new(time_edges_us, t0.value, flight_path.value, &pulse)?;
     let bins = time_edges_us.len() - 1;
     validate_counts("open-beam", open_counts, bins)?;
     validate_counts("sample", sample_counts, bins)?;
@@ -509,7 +505,13 @@ pub fn fit_counts(
                     live: &live,
                 })
             },
-            |grid, params| Ok(grid.covers(params[layout.t0], params[layout.flight_path])?),
+            |grid, params| {
+                Ok(grid.covers(
+                    params[layout.t0],
+                    params[layout.flight_path],
+                    grid.pulse().params(),
+                )?)
+            },
         )?;
         let fitted = |index: usize| fit.result.params[index];
         let fitted_k = fitted(layout.temperature);
@@ -520,9 +522,11 @@ pub fn fit_counts(
         let resolved =
             2.0 * fit.step_us <= 0.5 * narrowest_us(&base, &resonances_in_span, fitted_k)?;
         let covered = fit.converged
-            && fit
-                .coarse
-                .covers(fitted(layout.t0), fitted(layout.flight_path))?;
+            && fit.coarse.covers(
+                fitted(layout.t0),
+                fitted(layout.flight_path),
+                pulse.params(),
+            )?;
         if !fit.converged || (settled && resolved && covered) || passes == MOST_PASSES {
             let weighted = [
                 open.overdispersion,
@@ -541,7 +545,7 @@ pub fn fit_counts(
                 time_edges_us,
                 fitted(layout.t0),
                 fitted(layout.flight_path),
-                &calibration.pulse,
+                &pulse,
             )?;
             resonances_in_span = in_span(&base)?;
             first = first_grid(&base, &resonances_in_span, fitted_k)?;
@@ -831,7 +835,7 @@ impl TwoRunModel {
         if !current {
             let rows = self
                 .grid
-                .rows_at(t0_us, flight_path_m)
+                .rows_at(t0_us, flight_path_m, self.grid.pulse().params())
                 .map_err(|e| FittingError::EvaluationFailed(e.to_string()))?;
             *self.scale.borrow_mut() = Some(Scale::new(
                 (t0_us, flight_path_m),
@@ -958,7 +962,11 @@ impl FitModel for TwoRunModel {
                 )
             } else {
                 if arrival.is_none() {
-                    arrival = Some(self.grid.arrival_slopes_at(t0_us, flight_path_m).ok()?);
+                    arrival = Some(
+                        self.grid
+                            .arrival_slopes_at(t0_us, flight_path_m, self.grid.pulse().params())
+                            .ok()?,
+                    );
                 }
                 let arrival = arrival.as_ref()?;
                 let log_beam_slope = combined(&scale.basis_slope, &params[..layout.densities]);
