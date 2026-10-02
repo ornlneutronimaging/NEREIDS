@@ -1693,7 +1693,7 @@ const CALIBRATION_LINES: [(f64, f64, f64); 3] =
     [(10.0, 0.05, 0.06), (25.0, 0.005, 0.06), (50.0, 0.01, 0.06)];
 const CALIBRATION_DENSITY: f64 = 2.0e-3;
 const CALIBRATION_LEVEL: f64 = 2.0e6;
-const DENSITY_SD: f64 = 0.01 * CALIBRATION_DENSITY;
+const DENSITY_RELATIVE_SD: f64 = 0.01;
 const TEMPERATURE_SD_K: f64 = 10.0;
 
 fn venus_pulse(numbers: &[f64]) -> Arc<IkedaCarpenter> {
@@ -1767,7 +1767,7 @@ fn foil_measurement(
     let mut m = measurement(setup, counts, sample);
     m.isotopes[0].1 = Value::Measured {
         value: sample[0].1,
-        sd: 0.01 * sample[0].1,
+        sd: DENSITY_RELATIVE_SD * sample[0].1,
     };
     m.temperature_k = Value::Measured {
         value: TEMPERATURE_K,
@@ -2036,7 +2036,8 @@ mod pulse_calibration {
         };
         let coefficients = fit.beam.coefficients().len();
         let mut information = information(&fit, &fitted, 3, counts_at);
-        information[coefficients][coefficients] += DENSITY_SD.powi(-2);
+        information[coefficients][coefficients] +=
+            (DENSITY_RELATIVE_SD * CALIBRATION_DENSITY).powi(-2);
         information[coefficients + 1][coefficients + 1] += TEMPERATURE_SD_K.powi(-2);
         assert_covariance(&fit, &inverse(information));
     }
@@ -2566,13 +2567,17 @@ mod pulse_calibration {
         let mut shifted = CALIBRATION_PULSE;
         shifted[4] += 0.02;
         let (same, other) = rayon::join(|| calibrate(&CALIBRATION_PULSE), || calibrate(&shifted));
-        let mut a = ONE_FOIL.0.clone();
+        let a = &ONE_FOIL.0;
         let failing = a.transfer(&other).expect("transfer");
         assert!(failing.agreement().p < 0.01, "{:?}", failing.agreement());
-        assert!(a.record_transfer(&other).is_err());
-        let transfer = a.record_transfer(&same).expect("recorded");
+        assert!(a.clone().record_transfer(&other).is_err());
+        let transfer = a.transfer(&same).expect("transfer");
         assert!(transfer.agreement().p > 0.01, "{:?}", transfer.agreement());
-        let text = a.to_json();
+        let text = a
+            .clone()
+            .record_transfer(&same)
+            .expect("recorded")
+            .to_json();
         assert_eq!(
             PulseCalibration::from_json(&text).expect("file").to_json(),
             text

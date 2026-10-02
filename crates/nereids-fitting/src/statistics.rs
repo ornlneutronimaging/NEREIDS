@@ -20,9 +20,28 @@ pub struct Consistency {
     pub p: f64,
 }
 
-/// `P(χ²_dof ≥ q)` for `q` of 0 or more and `dof` of 1 or more, summed in
-/// `dof / 2` terms.
-pub fn chi_squared_survival(q: f64, dof: usize) -> f64 {
+impl Consistency {
+    /// The test of `q` against `χ²` with `dof` degrees of freedom.
+    ///
+    /// # Errors
+    /// `FittingError::InvalidConfig` if `q` is negative or not a number, or
+    /// `dof` is 0.
+    pub fn new(q: f64, dof: usize) -> Result<Self, FittingError> {
+        if q.is_nan() || q < 0.0 || dof == 0 {
+            return Err(FittingError::InvalidConfig(format!(
+                "a χ² test has a statistic of 0 or more on 1 or more degrees of freedom; got \
+                 {q} on {dof}"
+            )));
+        }
+        Ok(Self {
+            q,
+            dof,
+            p: chi_squared_survival(q, dof),
+        })
+    }
+}
+
+fn chi_squared_survival(q: f64, dof: usize) -> f64 {
     if q == f64::INFINITY {
         return 0.0;
     }
@@ -67,8 +86,8 @@ pub fn chi_squared_survival(q: f64, dof: usize) -> f64 {
 /// `estimate` is not finite, the prior's mean is not finite or a measured sd
 /// not finite and positive, or `posterior` over the rest is not symmetric to
 /// 1e-12 of `√(Σᵢᵢ Σⱼⱼ)` or not within the prior there, with some `rᵢ` below
-/// `−8e-4` or above `1 + 8e-4`; `FittingError::EvaluationFailed` if a
-/// decomposition fails.
+/// `−8e-4` or above `1 + 8e-4`, or `q` is not a number, as on overflow;
+/// `FittingError::EvaluationFailed` if a decomposition fails.
 pub fn consistency(
     prior: &Prior,
     estimate: &[f64],
@@ -157,11 +176,7 @@ pub fn consistency(
             dof += 1;
         }
     }
-    Ok((dof > 0).then(|| Consistency {
-        q,
-        dof,
-        p: chi_squared_survival(q, dof),
-    }))
+    (dof > 0).then(|| Consistency::new(q, dof)).transpose()
 }
 
 /// The agreement of two independent estimates `a` and `b` of the same
@@ -172,8 +187,9 @@ pub fn consistency(
 ///
 /// # Errors
 /// `FittingError::InvalidConfig` if `a` and `b` are over different
-/// parameters, or either has a mean that is not finite or a measured sd not
-/// finite and positive; `FittingError::EvaluationFailed` if `C_a + C_b` is
+/// parameters, either has a mean that is not finite or a measured sd not
+/// finite and positive, or `q` is not a number, as when the difference of
+/// the means overflows; `FittingError::EvaluationFailed` if `C_a + C_b` is
 /// not positive definite in floating point.
 pub fn agreement(a: &Prior, b: &Prior) -> Result<Consistency, FittingError> {
     if a.parameters != b.parameters || !a.is_valid() || !b.is_valid() {
@@ -196,12 +212,7 @@ pub fn agreement(a: &Prior, b: &Prior) -> Result<Consistency, FittingError> {
     }
     let mut d: Vec<f64> = a.mean.iter().zip(&b.mean).map(|(x, y)| x - y).collect();
     joint.whiten(&mut d);
-    let q = d.iter().map(|w| w * w).sum();
-    Ok(Consistency {
-        q,
-        dof: k,
-        p: chi_squared_survival(q, k),
-    })
+    Consistency::new(d.iter().map(|w| w * w).sum(), k)
 }
 
 #[cfg(test)]
@@ -412,6 +423,12 @@ mod tests {
         let invalid = Prior::measured(3, 0.0, -1.0);
         let one = Prior::measured(3, 0.0, 1.0);
         assert!(agreement(&invalid, &one).is_err());
+        let far =
+            |mean| Prior::correlated(&[3, 7], &[mean, 0.0], &two_by_two([1.0, 0.0, 0.0, 1.0]));
+        assert!(agreement(&far(f64::MAX).unwrap(), &far(-f64::MAX).unwrap()).is_err());
+        for (q, dof) in [(-1.0, 2), (f64::NAN, 2), (1.0, 0)] {
+            assert!(Consistency::new(q, dof).is_err(), "{q} {dof}");
+        }
     }
 
     #[test]

@@ -1,6 +1,7 @@
 //! The beam, in neutrons per µs of flight time, fitted to the open-beam counts
 //! it produces through the instrument pulse.
 
+use std::ops::RangeInclusive;
 use std::sync::Arc;
 
 use nereids_fitting::error::FittingError;
@@ -22,6 +23,11 @@ pub const BOUND: f64 = 0.01;
 
 pub(crate) const PULSE_NUMBERS: [&str; 6] = ["α₀", "α₁", "β₀", "β₁", "R", "h²"];
 
+const RATE: (RangeInclusive<f64>, &str) = (0.0..=f64::INFINITY, "0 or more");
+
+pub(crate) const PULSE_RANGES: [(RangeInclusive<f64>, &str); 6] =
+    [RATE, RATE, RATE, RATE, (0.0..=1.0, "within 0–1"), RATE];
+
 /// A neutron of flight time `u` over the flight path `flight_path_m` (m)
 /// arrives at `t0_us + u` (µs) plus a delay drawn from `pulse`.
 /// [`fit_counts`](crate::counts_fit::fit_counts) fits `t0_us`,
@@ -36,10 +42,16 @@ pub struct Calibration {
 
 impl Calibration {
     pub(crate) fn instrument(&self) -> Result<Vec<FitParameter>, PipelineError> {
-        let rate = |name: &'static str, value: &Value| {
-            value.parameter(name, 0.0..=f64::INFINITY, "0 or more")
-        };
-        Ok(vec![
+        let pulse = &self.pulse;
+        let numbers = [
+            pulse.alpha[0],
+            pulse.alpha[1],
+            pulse.beta[0],
+            pulse.beta[1],
+            pulse.r,
+            pulse.fwhm_squared_us2,
+        ];
+        let mut parameters = vec![
             self.t0_us
                 .parameter("t0", f64::NEG_INFINITY..=f64::INFINITY, "any real number")?,
             self.flight_path_m.parameter(
@@ -47,13 +59,13 @@ impl Calibration {
                 f64::MIN_POSITIVE..=f64::INFINITY,
                 "positive",
             )?,
-            rate("α₀", &self.pulse.alpha[0])?,
-            rate("α₁", &self.pulse.alpha[1])?,
-            rate("β₀", &self.pulse.beta[0])?,
-            rate("β₁", &self.pulse.beta[1])?,
-            self.pulse.r.parameter("R", 0.0..=1.0, "within 0–1")?,
-            rate("the triangle's squared FWHM", &self.pulse.fwhm_squared_us2)?,
-        ])
+        ];
+        for ((name, value), (range, allowed)) in
+            PULSE_NUMBERS.into_iter().zip(numbers).zip(PULSE_RANGES)
+        {
+            parameters.push(value.parameter(name, range, allowed)?);
+        }
+        Ok(parameters)
     }
 }
 
