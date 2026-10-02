@@ -175,11 +175,17 @@ impl Prior {
     /// over the rest in this prior's order.
     ///
     /// # Errors
-    /// `FittingError::InvalidConfig` if a held parameter is not one of this
-    /// prior's, is held twice, or has a value that is not finite, or every
+    /// `FittingError::InvalidConfig` if this prior's mean is not finite or a
+    /// measured sd not finite and positive, a held parameter is not one of
+    /// this prior's, is held twice, or has a value that is not finite, or every
     /// parameter is held; `FittingError::EvaluationFailed` if a decomposition
     /// fails.
     pub fn conditioned(&self, held: &[(usize, f64)]) -> Result<Prior, FittingError> {
+        if !self.is_valid() {
+            return Err(FittingError::InvalidConfig(format!(
+                "a prior with a finite mean and finite positive sds is conditioned; got {self:?}"
+            )));
+        }
         let k = self.parameters.len();
         let positions: Option<Vec<usize>> = held
             .iter()

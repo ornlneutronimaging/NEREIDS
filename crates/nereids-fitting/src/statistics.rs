@@ -20,7 +20,8 @@ pub struct Consistency {
     pub p: f64,
 }
 
-/// `P(χ²_dof ≥ q)` for `q` of 0 or more.
+/// `P(χ²_dof ≥ q)` for `q` of 0 or more and `dof` of 1 or more, summed in
+/// `dof / 2` terms.
 pub fn chi_squared_survival(q: f64, dof: usize) -> f64 {
     if q == f64::INFINITY {
         return 0.0;
@@ -172,7 +173,8 @@ pub fn consistency(
 /// # Errors
 /// `FittingError::InvalidConfig` if `a` and `b` are over different
 /// parameters, or either has a mean that is not finite or a measured sd not
-/// finite and positive.
+/// finite and positive; `FittingError::EvaluationFailed` if `C_a + C_b` is
+/// not positive definite in floating point.
 pub fn agreement(a: &Prior, b: &Prior) -> Result<Consistency, FittingError> {
     if a.parameters != b.parameters || !a.is_valid() || !b.is_valid() {
         return Err(FittingError::InvalidConfig(format!(
@@ -187,6 +189,11 @@ pub fn agreement(a: &Prior, b: &Prior) -> Result<Consistency, FittingError> {
         }
     }
     let joint = Prior::factored(&a.parameters, &b.mean, &sum);
+    if !joint.is_valid() {
+        return Err(FittingError::EvaluationFailed(format!(
+            "the sum of the two covariances is not positive definite: {sum:?}"
+        )));
+    }
     let mut d: Vec<f64> = a.mean.iter().zip(&b.mean).map(|(x, y)| x - y).collect();
     joint.whiten(&mut d);
     let q = d.iter().map(|w| w * w).sum();
@@ -424,6 +431,7 @@ mod tests {
         for (i, j, expected) in [(0, 0, 3.2), (0, 1, -0.2), (1, 1, 4.2)] {
             assert!((conditioned.covariance(i, j) - expected).abs() <= 1e-13);
         }
+        assert!(Prior::measured(4, 0.0, -1.0).conditioned(&[]).is_err());
         for held in [
             vec![(9, 1.0)],
             vec![(4, 1.0), (5, 1.0), (6, 1.0)],
