@@ -18,7 +18,7 @@ use nereids_pipeline::counts_fit::{
 };
 use nereids_pipeline::error::PipelineError;
 use nereids_pipeline::open_beam::{BOUND, Calibration, Pulse, fit_open_beam};
-use nereids_pipeline::pulse_calibration::PulseCalibration;
+use nereids_pipeline::pulse_calibration::{PulseCalibration, Runs};
 use nereids_pipeline::reference::Instrument;
 use rand::SeedableRng;
 use rand_chacha::ChaCha12Rng;
@@ -1828,7 +1828,14 @@ fn assert_recovered(fit: &CountsFit, pulse: &[f64], fitted: usize, case: &str) {
     }
 }
 
-static ONE_FOIL: LazyLock<PulseCalibration> = LazyLock::new(|| {
+fn foil_runs() -> Runs {
+    Runs {
+        open: "open".into(),
+        sample: "foil".into(),
+    }
+}
+
+static ONE_FOIL: LazyLock<(PulseCalibration, CountsFit)> = LazyLock::new(|| {
     let setup = calibration_foil(&CALIBRATION_PULSE, T0_US, FLIGHT_PATH_M);
     let counts = expected(
         &setup,
@@ -1836,18 +1843,28 @@ static ONE_FOIL: LazyLock<PulseCalibration> = LazyLock::new(|| {
         &calibration_sample(CALIBRATION_DENSITY),
     );
     let m = calibration_measurement(&setup, (rounded(&counts.0), rounded(&counts.1)));
-    PulseCalibration::new(&m, &calibration_start(&CALIBRATION_PULSE, 1.0, None))
-        .expect("calibration")
+    PulseCalibration::new(
+        &m,
+        &calibration_start(&CALIBRATION_PULSE, 1.0, None),
+        foil_runs(),
+    )
+    .expect("calibration")
 });
 
 #[test]
-fn the_pulse_is_calibrated_on_one_foil() {
-    assert_recovered(
-        ONE_FOIL.fit(),
-        &CALIBRATION_PULSE,
-        8,
-        "start above the truth",
+fn a_calibrated_pulse_reads_back_from_its_file_bit_for_bit() {
+    let text = ONE_FOIL.0.to_json();
+    let read = PulseCalibration::from_json(&text).expect("file");
+    assert_eq!(read.to_json(), text);
+    assert_eq!(
+        format!("{:?}", read.calibration()),
+        format!("{:?}", ONE_FOIL.0.calibration())
     );
+}
+
+#[test]
+fn the_pulse_is_calibrated_on_one_foil() {
+    assert_recovered(&ONE_FOIL.1, &CALIBRATION_PULSE, 8, "start above the truth");
 }
 
 const EXPERIMENT_K: f64 = 1500.0;
@@ -1889,7 +1906,7 @@ fn experiment(pulse: &[f64]) -> CountsFit {
     experiment_with(
         pulse,
         (rounded(&counts.0), rounded(&counts.1)),
-        &ONE_FOIL.calibration(),
+        &ONE_FOIL.0.calibration(),
     )
 }
 
@@ -1915,7 +1932,7 @@ fn a_sample_or_pulse_the_calibration_does_not_cover_is_refused() {
         Err(PipelineError::InvalidParameter(message)) => message,
         other => panic!("{other:?}"),
     };
-    let calibrated = ONE_FOIL.calibration();
+    let calibrated = ONE_FOIL.0.calibration();
     let wider = [(hafnium_like(55.0), CALIBRATION_DENSITY)];
     assert!(refusal(&wider, &calibrated).contains("55 eV, outside the 10–50 eV"));
     let mut known = calibrated;
@@ -2175,10 +2192,7 @@ mod pulse_calibration {
     }
 
     fn calibration_block() -> Vec<Vec<f64>> {
-        block(
-            ONE_FOIL.fit().covariance.as_ref().expect("covariance"),
-            4..8,
-        )
+        block(ONE_FOIL.1.covariance.as_ref().expect("covariance"), 4..8)
     }
 
     fn experiment_information(fit: &CountsFit) -> Vec<Vec<f64>> {
@@ -2193,7 +2207,7 @@ mod pulse_calibration {
             numbers[2],
             numbers[3],
         ];
-        let beam_origin_us = ONE_FOIL.fit().t0_us;
+        let beam_origin_us = ONE_FOIL.1.t0_us;
         let counts_at = |quantities: &[f64], coefficient: Option<(usize, f64)>| -> Vec<f64> {
             let [
                 density,
@@ -2224,10 +2238,10 @@ mod pulse_calibration {
         shifted[4] += 0.02;
         let counts = experiment_counts(&shifted);
         let counts = (rounded(&counts.0), rounded(&counts.1));
-        let mut unmeasured = ONE_FOIL.calibration();
+        let mut unmeasured = ONE_FOIL.0.calibration();
         unmeasured.pulse.prior = None;
         let (measured, alone) = rayon::join(
-            || experiment_with(&shifted, counts.clone(), &ONE_FOIL.calibration()),
+            || experiment_with(&shifted, counts.clone(), &ONE_FOIL.0.calibration()),
             || experiment_with(&shifted, counts.clone(), &unmeasured),
         );
         assert!(measured.converged && alone.converged);
@@ -2251,7 +2265,7 @@ mod pulse_calibration {
         let weight = inverse(sum);
         let difference: Vec<f64> = calibrated_numbers(&alone)
             .iter()
-            .zip(calibrated_numbers(ONE_FOIL.fit()))
+            .zip(calibrated_numbers(&ONE_FOIL.1))
             .map(|(x, c)| x - c)
             .collect();
         let expected: f64 = (0..4)
@@ -2297,7 +2311,8 @@ mod pulse_calibration {
                     calibration_measurement(&foil, draws(&foil_counts, 80_000 + seed, [1.0; 2]));
                 let sign = if seed % 2 == 0 { 1.0 } else { -1.0 };
                 let calibration = calibration_start(&p, sign, Some(p[5] + 0.05 * sign));
-                let calibrated = PulseCalibration::new(&m, &calibration).ok()?;
+                let (calibrated, fit) =
+                    PulseCalibration::new(&m, &calibration, foil_runs()).ok()?;
                 let experiment = calibrated.calibration();
                 let pulse = &experiment.pulse;
                 [
@@ -2311,11 +2326,8 @@ mod pulse_calibration {
                 .all(|number| matches!(number, Value::Fitted(_)))
                 .then_some(())?;
                 let drawn = draws(&counts, 90_000 + seed, [1.0; 2]);
-                Some((
-                    experiment_with(&p, drawn, &experiment),
-                    calibrated.fit().overdispersion,
-                ))
-                .filter(|(fit, _)| fit.converged)
+                Some((experiment_with(&p, drawn, &experiment), fit.overdispersion))
+                    .filter(|(fit, _)| fit.converged)
             })
             .collect();
         assert!(fits.len() >= 398, "{} converged", fits.len());
@@ -2419,7 +2431,8 @@ mod pulse_calibration {
                     let sign = if seed % 2 == 0 { 1.0 } else { -1.0 };
                     let mut calibration = calibration_start(&p, sign, Some(p[5] + 0.05 * sign));
                     calibration.pulse.alpha[0] = Value::Fitted(0.05);
-                    let calibrated = PulseCalibration::new(&m, &calibration).ok()?;
+                    let (calibrated, _) =
+                        PulseCalibration::new(&m, &calibration, foil_runs()).ok()?;
                     let experiment = calibrated.calibration();
                     let held = matches!(experiment.pulse.alpha[0], Value::Known(_));
                     let drawn = draws(&counts, 91_000 + seeds + seed, [1.0; 2]);
@@ -2480,7 +2493,7 @@ mod pulse_calibration {
             measurement(&setup, (rounded(&counts.0), rounded(&counts.1)), &sample),
             EXPERIMENT_K,
         );
-        match fit_counts(&m, &ONE_FOIL.calibration()) {
+        match fit_counts(&m, &ONE_FOIL.0.calibration()) {
             Err(PipelineError::InvalidParameter(message)) => {
                 assert!(message.contains("outside the"), "{message}")
             }
