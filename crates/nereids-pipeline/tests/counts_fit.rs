@@ -1313,7 +1313,7 @@ mod error_bar_pulls {
 
     use super::*;
 
-    const Z: f64 = 3.5;
+    pub(super) const Z: f64 = 3.5;
     const MOST_FAILED: usize = 2;
 
     struct Ensemble {
@@ -2348,10 +2348,12 @@ mod pulse_calibration {
                 })
                 .collect();
             let (mean, sd) = super::error_bar_pulls::moments(&pulls);
-            let covered =
-                pulls.iter().filter(|pull| pull.abs() <= 1.0).count() as f64 / pulls.len() as f64;
+            let m = pulls.len() as f64;
+            let covered = pulls.iter().filter(|pull| pull.abs() <= 1.0).count() as f64 / m;
             assert!(
-                (0.9..=1.1).contains(&sd) && (0.61..=0.75).contains(&covered),
+                mean.abs() <= super::error_bar_pulls::Z / m.sqrt()
+                    && (0.9..=1.1).contains(&sd)
+                    && (0.61..=0.75).contains(&covered),
                 "{i}: mean {mean}, sd {sd}, within one sd {covered}"
             );
         }
@@ -2395,66 +2397,93 @@ mod pulse_calibration {
     #[test]
     #[ignore = "slow; runs nightly"]
     fn experiments_calibrated_with_a_moderation_rate_at_its_bound_keep_density_and_temperature() {
-        let mut p = CALIBRATION_PULSE;
-        p[0] = 0.0;
-        p[5] = 0.35;
-        let foil = calibration_foil(&p, T0_US, FLIGHT_PATH_M);
-        let foil_counts = expected(
-            &foil,
-            &beam(CALIBRATION_LEVEL),
-            &calibration_sample(CALIBRATION_DENSITY),
-        );
-        let counts = experiment_counts(&p);
-        let fits: Vec<(CountsFit, bool)> = (0..400_u64)
-            .into_par_iter()
-            .filter_map(|seed| {
-                let m =
-                    calibration_measurement(&foil, draws(&foil_counts, 81_000 + seed, [1.0; 2]));
-                let sign = if seed % 2 == 0 { 1.0 } else { -1.0 };
-                let mut calibration = calibration_start(&p, sign, Some(p[5] + 0.05 * sign));
-                calibration.pulse.alpha[0] = Value::Fitted(0.05);
-                let calibrated = PulseCalibration::new(&m, &calibration).ok()?;
-                let experiment = calibrated.calibration();
-                let held = matches!(experiment.pulse.alpha[0], Value::Known(_));
-                let drawn = draws(&counts, 91_000 + seed, [1.0; 2]);
-                Some((experiment_with(&p, drawn, &experiment), held))
-                    .filter(|(fit, _)| fit.converged)
-            })
-            .collect();
-        assert!(fits.len() >= 398, "{} converged", fits.len());
-        let n = fits.len() as f64;
-        let held = fits.iter().filter(|(_, held)| *held).count();
-        let bounded = fits
-            .iter()
-            .filter(|(fit, held)| !held && fit.on_bound[4])
-            .count();
-        assert!(
-            held > 0 && bounded > 0,
-            "{held} held, {bounded} on the bound"
-        );
-        for (i, truth) in [(0, CALIBRATION_DENSITY), (1, EXPERIMENT_K)] {
-            let pulls: Vec<f64> = fits
-                .iter()
-                .map(|(fit, _)| {
-                    let estimate = [fit.densities[0], fit.temperature_k][i];
-                    (estimate - truth) / error_bar(fit, i)
+        let mut bounded = 0;
+        for (case, alpha0) in [0.0, 5e-4].into_iter().enumerate() {
+            let mut p = CALIBRATION_PULSE;
+            p[0] = alpha0;
+            p[5] = 0.35;
+            let foil = calibration_foil(&p, T0_US, FLIGHT_PATH_M);
+            let foil_counts = expected(
+                &foil,
+                &beam(CALIBRATION_LEVEL),
+                &calibration_sample(CALIBRATION_DENSITY),
+            );
+            let counts = experiment_counts(&p);
+            let seeds = 1_000 * case as u64;
+            let fits: Vec<(CountsFit, bool)> = (0..400_u64)
+                .into_par_iter()
+                .filter_map(|seed| {
+                    let drawn = draws(&foil_counts, 81_000 + seeds + seed, [1.0; 2]);
+                    let m = calibration_measurement(&foil, drawn);
+                    let sign = if seed % 2 == 0 { 1.0 } else { -1.0 };
+                    let mut calibration = calibration_start(&p, sign, Some(p[5] + 0.05 * sign));
+                    calibration.pulse.alpha[0] = Value::Fitted(0.05);
+                    let calibrated = PulseCalibration::new(&m, &calibration).ok()?;
+                    let experiment = calibrated.calibration();
+                    let held = matches!(experiment.pulse.alpha[0], Value::Known(_));
+                    let drawn = draws(&counts, 91_000 + seeds + seed, [1.0; 2]);
+                    Some((experiment_with(&p, drawn, &experiment), held))
+                        .filter(|(fit, _)| fit.converged)
                 })
                 .collect();
-            let (mean, sd) = super::error_bar_pulls::moments(&pulls);
-            let covered = pulls.iter().filter(|pull| pull.abs() <= 1.0).count() as f64 / n;
+            assert!(fits.len() >= 398, "{alpha0}: {} converged", fits.len());
+            let n = fits.len() as f64;
+            let held = fits.iter().filter(|(_, held)| *held).count();
+            assert!(held > 0, "{alpha0}: none held");
+            bounded += fits
+                .iter()
+                .filter(|(fit, held)| !held && fit.on_bound[4])
+                .count();
+            for (i, truth) in [(0, CALIBRATION_DENSITY), (1, EXPERIMENT_K)] {
+                let pulls: Vec<f64> = fits
+                    .iter()
+                    .map(|(fit, _)| {
+                        let estimate = [fit.densities[0], fit.temperature_k][i];
+                        (estimate - truth) / error_bar(fit, i)
+                    })
+                    .collect();
+                let (mean, sd) = super::error_bar_pulls::moments(&pulls);
+                let covered = pulls.iter().filter(|pull| pull.abs() <= 1.0).count() as f64 / n;
+                assert!(
+                    mean.abs() <= super::error_bar_pulls::Z / n.sqrt()
+                        && (0.9..=1.1).contains(&sd)
+                        && (0.61..=0.75).contains(&covered),
+                    "{alpha0} {i}: mean {mean}, sd {sd}, within one sd {covered}"
+                );
+            }
+            let rejected = fits
+                .iter()
+                .filter(|(fit, _)| fit.pulse_consistency.expect("consistency").p < 0.05)
+                .count() as f64
+                / n;
             assert!(
-                (0.9..=1.1).contains(&sd) && (0.61..=0.75).contains(&covered),
-                "{i}: mean {mean}, sd {sd}, within one sd {covered}"
+                rejected <= 0.05 + 3.0 * (0.05 * 0.95 / n).sqrt(),
+                "{alpha0}: {rejected} rejected at a reported 0.05"
             );
         }
-        let rejected = fits
-            .iter()
-            .filter(|(fit, _)| fit.pulse_consistency.expect("consistency").p < 0.05)
-            .count() as f64
-            / n;
-        assert!(
-            rejected <= 0.05 + 3.0 * (0.05 * 0.95 / n).sqrt(),
-            "{rejected} rejected at a reported 0.05"
+        assert!(bounded > 0, "no experiment ended on the bound");
+    }
+
+    #[test]
+    #[ignore = "slow; runs nightly"]
+    fn a_line_the_fitted_flight_path_brings_into_the_window_is_refused() {
+        let flight_path_m = FLIGHT_PATH_M + 0.2;
+        let setup = experiment_foil(&CALIBRATION_PULSE, T0_US + 0.03, flight_path_m);
+        let high_ev =
+            (CLOCK * flight_path_m / FLIGHT_PATH_M / (setup.edges[0] - T0_US - 0.03)).powi(2);
+        let line_ev = 0.5 * (high_ev + (CLOCK / (setup.edges[0] - T0_US)).powi(2));
+        let mut sample = calibration_sample(CALIBRATION_DENSITY).to_vec();
+        sample.push((synthetic_isotope(74, 184, line_ev, 0.01, 0.06), 1e-3));
+        let counts = expected_at(&setup, &beam(CALIBRATION_LEVEL), &sample, EXPERIMENT_K);
+        let m = fitted_from(
+            measurement(&setup, (rounded(&counts.0), rounded(&counts.1)), &sample),
+            EXPERIMENT_K,
         );
+        match fit_counts(&m, &ONE_FOIL.calibration()) {
+            Err(PipelineError::InvalidParameter(message)) => {
+                assert!(message.contains("outside the"), "{message}")
+            }
+            other => panic!("{line_ev} eV: {other:?}"),
+        }
     }
 }

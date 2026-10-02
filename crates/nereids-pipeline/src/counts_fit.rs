@@ -313,9 +313,10 @@ pub struct CountsFit {
 /// with the start between them, the pulse's calibration covers a number that
 /// is not fitted or is measured, an isotope of the sample not known to be
 /// absent has a resonance between the energies of its last and first time
-/// edges, at the starting `t0` and flight path, outside the energies of the
-/// calibration foil's resonances, there are no isotopes, an isotope is listed
-/// twice, an isotope's resonance data are not finite, or the energies its
+/// edges, at the starting `t0` and flight path or the fitted ones, outside the
+/// energies of the calibration foil's resonances, there are no isotopes, an
+/// isotope is listed twice, an isotope's resonance data are not finite, or the
+/// energies its
 /// broadened cross section reads on the grid at the starting `t0`, flight path
 /// and pulse, or at the fitted ones of any pass that rebuilds it, at the known
 /// temperature or at the upper bound of a fitted one, down to zero for a
@@ -448,15 +449,20 @@ pub fn fit_counts(
     validate_counts("sample", sample_counts, bins)?;
     let open_live = validate_live("open-beam", open_live.as_deref(), bins)?;
     let sample_live = validate_live("sample", sample_live.as_deref(), bins)?;
-    if let Some(prior) = &pulse.prior
-        && let Some(line) = prior.uncalibrated_line(isotopes, time_edges_us, start[0], start[1])
-    {
-        let (low, high) = prior.line_span_ev;
-        return invalid(format!(
-            "the sample has a resonance at {line} eV, outside the {low}–{high} eV of the \
-             resonances the pulse was calibrated on"
-        ));
-    }
+    let calibrated_lines = |t0_us: f64, flight_path_m: f64| -> Result<(), PipelineError> {
+        match pulse.prior.as_ref().and_then(|prior| {
+            prior
+                .uncalibrated_line(isotopes, time_edges_us, t0_us, flight_path_m)
+                .map(|line| (prior.line_span_ev, line))
+        }) {
+            Some(((low, high), line)) => Err(PipelineError::InvalidParameter(format!(
+                "the sample has a resonance at {line} eV, outside the {low}–{high} eV of the \
+                 resonances the pulse was calibrated on"
+            ))),
+            None => Ok(()),
+        }
+    };
+    calibrated_lines(start[0], start[1])?;
 
     let in_span = |grid: &FlightTimeGrid| -> Result<Vec<Vec<f64>>, PipelineError> {
         let energies = grid.energies_ev();
@@ -536,7 +542,7 @@ pub fn fit_counts(
     let resonances: Arc<[ResonanceData]> = isotopes.iter().map(|(data, _)| data.clone()).collect();
     let observed: Vec<f64> = open_counts.iter().chain(sample_counts).copied().collect();
     let live: Vec<f64> = open_live.into_iter().chain(sample_live).collect();
-    let covered: Vec<usize> = pulse
+    let calibrated_parameters: Vec<usize> = pulse
         .prior
         .iter()
         .flat_map(|prior| prior.numbers.iter().map(|n| layout.pulse + n))
@@ -544,7 +550,7 @@ pub fn fit_counts(
     let pulse_prior = pulse
         .prior
         .as_ref()
-        .map(|prior| Prior::correlated(&covered, &prior.mean, &prior.covariance))
+        .map(|prior| Prior::correlated(&calibrated_parameters, &prior.mean, &prior.covariance))
         .transpose()?;
     let priors: Vec<Prior> = measured
         .iter()
@@ -630,6 +636,10 @@ pub fn fit_counts(
         sample_measured = sample.is_some();
     };
     let converged = fit.converged && settled;
+    calibrated_lines(
+        fit.result.params[layout.t0],
+        fit.result.params[layout.flight_path],
+    )?;
 
     if let Some((k, (&counts, &predicted))) =
         observed
@@ -683,7 +693,7 @@ pub fn fit_counts(
     };
     let pulse_consistency = match (&pulse_prior, &covariance) {
         (Some(prior), Some(block)) => {
-            let at: Vec<usize> = covered
+            let at: Vec<usize> = calibrated_parameters
                 .iter()
                 .map(|&parameter| position(parameter))
                 .collect();
@@ -693,7 +703,10 @@ pub fn fit_counts(
                     *posterior.get_mut(a, b) = block.get(i, j);
                 }
             }
-            let estimate: Vec<f64> = covered.iter().map(|&parameter| params[parameter]).collect();
+            let estimate: Vec<f64> = calibrated_parameters
+                .iter()
+                .map(|&parameter| params[parameter])
+                .collect();
             let held: Vec<bool> = at.iter().map(|&a| on_bound[a]).collect();
             consistency(prior, &estimate, &held, &posterior)?
         }

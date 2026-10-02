@@ -69,9 +69,9 @@ impl PulseCalibration {
     /// if the fit did not converge, a pulse number it fitted ended off its
     /// bounds without a finite positive variance, as when the counts do not
     /// determine it or a fitted temperature ended at 1 K or 5000 K, or some
-    /// pulse number is resolved and the foil has no resonance between the
-    /// energies of its last and first time edges at the fitted `t0` and
-    /// flight path; [`PipelineError::Fitting`] if the resolved numbers'
+    /// pulse number is resolved and no isotope of the foil fitted or known to
+    /// a positive density has a resonance between the energies of its last and
+    /// first time edges at the fitted `t0` and flight path; [`PipelineError::Fitting`] if the resolved numbers'
     /// covariance is refused by [`Prior::correlated`].
     pub fn new(
         measurement: &Measurement,
