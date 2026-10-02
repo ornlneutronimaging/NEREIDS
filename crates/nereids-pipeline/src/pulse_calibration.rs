@@ -77,14 +77,41 @@ enum Status {
 #[serde(deny_unknown_fields)]
 struct Stated {
     value: f64,
+    #[serde(deserialize_with = "Option::deserialize")]
     sd: Option<f64>,
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 struct FoilIsotope {
+    #[serde(with = "nuclide")]
     isotope: Isotope,
     density: Stated,
+}
+
+mod nuclide {
+    use nereids_core::types::Isotope;
+    use serde::{Deserialize, Deserializer, Serialize, Serializer};
+
+    #[derive(Serialize, Deserialize)]
+    #[serde(deny_unknown_fields)]
+    struct Nuclide {
+        z: u32,
+        a: u32,
+    }
+
+    pub(super) fn serialize<S: Serializer>(isotope: &Isotope, s: S) -> Result<S::Ok, S::Error> {
+        Nuclide {
+            z: isotope.z(),
+            a: isotope.a(),
+        }
+        .serialize(s)
+    }
+
+    pub(super) fn deserialize<'de, D: Deserializer<'de>>(d: D) -> Result<Isotope, D::Error> {
+        let nuclide = Nuclide::deserialize(d)?;
+        Isotope::new(nuclide.z, nuclide.a).map_err(serde::de::Error::custom)
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -329,7 +356,7 @@ impl PulseCalibration {
             sample_overdispersion: self.sample_overdispersion,
             transfer: UNCHECKED.into(),
         };
-        serde_json::to_string_pretty(&file).expect("a calibration file has only finite numbers")
+        serde_json::to_string_pretty(&file).expect("these field types always serialize")
     }
 
     /// The calibration a file from [`Self::to_json`] holds.
@@ -340,9 +367,10 @@ impl PulseCalibration {
     /// field missing or unknown, the pulse numbers' names or units not in their
     /// order, the rank not the number of resolved numbers, the line span
     /// missing while a pulse number was fitted, present when none was, or not
-    /// `0 < low ≤ high`, a run identifier empty or both the same, the
-    /// overdispersion below 1, the foil without isotopes or not as
-    /// [`Self::new`] takes it, or a value outside its quantity's range or one
+    /// `low ≤ high` within the energy span, a run identifier empty or both the
+    /// same, the overdispersion below 1, the foil without isotopes, with one
+    /// listed twice, or not as [`Self::new`] takes it, or a value outside its
+    /// quantity's range or one
     /// [`DetectorPulse::new`](nereids_physics::ikeda_carpenter::DetectorPulse::new)
     /// refuses; [`PipelineError::Fitting`] if [`Prior::correlated`] refuses
     /// the covariance.
@@ -389,15 +417,16 @@ impl PulseCalibration {
             ));
         }
         let fitted = status.iter().any(|&s| s != Status::Known);
+        let (first, last) = file.energy_span_ev;
         let span_holds = match file.line_span_ev {
-            Some((low, high)) => fitted && low.is_finite() && 0.0 < low && low <= high,
+            Some((low, high)) => fitted && first <= low && low <= high && high <= last,
             None => !fitted,
         };
         if !span_holds {
             return invalid(format!(
-                "the line span is present, with 0 < low ≤ high, exactly when a pulse number was \
-                 fitted; got {:?}",
-                file.line_span_ev
+                "the line span is present, within the energy span {:?}, exactly when a pulse \
+                 number was fitted; got {:?}",
+                file.energy_span_ev, file.line_span_ev
             ));
         }
         let runs = Runs {
@@ -466,9 +495,11 @@ struct File {
     flight_path_m: f64,
     energy_span_ev: (f64, f64),
     n_tau: usize,
+    #[serde(deserialize_with = "Option::deserialize")]
     line_span_ev: Option<(f64, f64)>,
     foil: Foil,
     runs: FileRuns,
+    #[serde(deserialize_with = "Option::deserialize")]
     sample_overdispersion: Option<f64>,
     transfer: String,
 }
@@ -540,16 +571,21 @@ fn check_foil(foil: &Foil) -> Result<(), PipelineError> {
         },
         None => Value::Known(stated.value),
     };
-    if foil.isotopes.is_empty()
-        || foil
-            .isotopes
+    let isotopes = &foil.isotopes;
+    if isotopes.is_empty()
+        || isotopes
             .iter()
             .any(|isotope| isotope.density.sd.is_none() && isotope.density.value != 0.0)
+        || (0..isotopes.len()).any(|i| {
+            isotopes[..i]
+                .iter()
+                .any(|other| other.isotope == isotopes[i].isotope)
+        })
         || foil.temperature_k.sd.is_none()
     {
         return Err(PipelineError::InvalidParameter(format!(
-            "a calibration foil has isotopes, each measured or known to be absent, and a \
-             measured temperature; got {foil:?}"
+            "a calibration foil has distinct isotopes, each measured or known to be absent, and \
+             a measured temperature; got {foil:?}"
         )));
     }
     for isotope in &foil.isotopes {
@@ -870,7 +906,7 @@ mod tests {
     fn files_that_are_not_such_a_calibration_are_refused() {
         let original: serde_json::Value = serde_json::from_str(&file()).unwrap();
         type Edit = (&'static str, fn(&mut serde_json::Value));
-        let edits: [Edit; 13] = [
+        let edits: [Edit; 20] = [
             ("version", |v| v["format_version"] = 2.into()),
             ("model", |v| v["pulse_model"] = "Gaussian".into()),
             ("transfer", |v| v["transfer"] = "checked".into()),
@@ -894,6 +930,29 @@ mod tests {
             ("negative rate", |v| {
                 v["numbers"][0]["value"] = (-0.01).into()
             }),
+            ("missing key", |v| {
+                v.as_object_mut().unwrap().remove("sample_overdispersion");
+            }),
+            ("nuclide key", |v| {
+                v["foil"]["isotopes"][0]["isotope"]["n"] = 1.into();
+            }),
+            ("same isotope", |v| {
+                let isotope = v["foil"]["isotopes"][0].clone();
+                v["foil"]["isotopes"].as_array_mut().unwrap().push(isotope);
+            }),
+            ("temperature sd", |v| {
+                v["foil"]["temperature_k"]["sd"] = serde_json::Value::Null;
+            }),
+            ("span beyond the pulse", |v| {
+                v["line_span_ev"] = serde_json::json!([10.0, 300.0]);
+            }),
+            ("singular covariance", |v| {
+                let c = &v["covariance"];
+                let r = (c[0][0].as_f64().unwrap() * c[1][1].as_f64().unwrap()).sqrt();
+                v["covariance"][0][1] = r.into();
+                v["covariance"][1][0] = r.into();
+            }),
+            ("n_tau", |v| v["n_tau"] = 4.into()),
         ];
         for (what, edit) in edits {
             let mut value = original.clone();
@@ -925,6 +984,128 @@ mod tests {
             open: "foil-1".into(),
             sample: "foil-1".into(),
         };
-        assert!(PulseCalibration::new(&measurement(None), &c, same).is_err());
+        match PulseCalibration::new(&measurement(None), &c, same) {
+            Err(PipelineError::InvalidParameter(message)) => {
+                assert!(
+                    message.contains("different, non-empty identifiers"),
+                    "{message}"
+                )
+            }
+            other => panic!("{other:?}"),
+        }
+    }
+
+    const VERSION_1: &str = r#"{
+  "format_version": 1,
+  "pulse_model": "Ikeda–Carpenter pulse with α = α₀√E + α₁ and β = β₀√E + β₁ in 1/µs, E in eV, a storage fraction R constant over the energy span, folded with the proton pulse's triangle of FWHM h",
+  "numbers": [
+    {
+      "name": "alpha0",
+      "unit": "1/(µs·√eV)",
+      "value": 0.5,
+      "status": "known"
+    },
+    {
+      "name": "alpha1",
+      "unit": "1/µs",
+      "value": 1.1,
+      "status": "resolved"
+    },
+    {
+      "name": "beta0",
+      "unit": "1/(µs·√eV)",
+      "value": 0.0,
+      "status": "on_bound"
+    },
+    {
+      "name": "beta1",
+      "unit": "1/µs",
+      "value": 0.01,
+      "status": "known"
+    },
+    {
+      "name": "r",
+      "unit": "1",
+      "value": 0.012537345881063615,
+      "status": "resolved"
+    },
+    {
+      "name": "fwhm_squared",
+      "unit": "µs²",
+      "value": 0.12,
+      "status": "resolved"
+    }
+  ],
+  "covariance": [
+    [
+      0.05,
+      0.01,
+      -0.005
+    ],
+    [
+      0.01,
+      0.07,
+      0.02
+    ],
+    [
+      -0.005,
+      0.02,
+      0.08
+    ]
+  ],
+  "rank": 3,
+  "t0_us": 3.0,
+  "flight_path_m": 25.0,
+  "energy_span_ev": [
+    1.0,
+    200.0
+  ],
+  "n_tau": 256,
+  "line_span_ev": [
+    10.0,
+    50.0
+  ],
+  "foil": {
+    "isotopes": [
+      {
+        "isotope": {
+          "z": 73,
+          "a": 181
+        },
+        "density": {
+          "value": 0.002,
+          "sd": 0.00002
+        }
+      },
+      {
+        "isotope": {
+          "z": 74,
+          "a": 184
+        },
+        "density": {
+          "value": 0.0,
+          "sd": null
+        }
+      }
+    ],
+    "temperature_k": {
+      "value": 300.0,
+      "sd": 10.0
+    }
+  },
+  "runs": {
+    "open": "open-1",
+    "sample": "foil-1"
+  },
+  "sample_overdispersion": 1.5,
+  "transfer": "unchecked"
+}"#;
+
+    #[test]
+    fn the_file_is_format_version_1_byte_for_byte() {
+        let original = original();
+        assert_eq!(original.to_json(), VERSION_1);
+        let read = PulseCalibration::from_json(VERSION_1).unwrap();
+        assert_eq!(format!("{read:?}"), format!("{original:?}"));
     }
 }
