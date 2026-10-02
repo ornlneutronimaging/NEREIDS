@@ -1,15 +1,18 @@
 //! A pulse calibrated on a foil, carried to experiments as a correlated
 //! prior on the pulse numbers the foil resolved.
 
+use nereids_core::types::Isotope;
 use nereids_endf::resonance::ResonanceData;
 use nereids_fitting::lm::FlatMatrix;
 use nereids_fitting::poisson::Prior;
 use nereids_physics::resolution::TOF_FACTOR;
 use nereids_physics::transmission::resonance_center_energies;
+use serde::{Deserialize, Serialize};
 
 use crate::counts_fit::{CountsFit, Measurement, Value, fit_counts, quantities};
 use crate::error::PipelineError;
 use crate::open_beam::{Calibration, PULSE_NUMBERS, Pulse};
+use crate::pipeline::TEMPERATURE_BOUNDS_K;
 
 /// The pulse numbers a calibration resolved, as indices into
 /// `(α₀, α₁, β₀, β₁, R, h²)`, with their fitted values and covariance.
@@ -39,7 +42,60 @@ impl Pulse {
     }
 }
 
-/// A pulse calibrated on a foil by [`fit_counts`].
+const FORMAT_VERSION: u32 = 1;
+
+const PULSE_MODEL: &str = "Ikeda–Carpenter pulse with α = α₀√E + α₁ and β = β₀√E + β₁ in 1/µs, \
+     E in eV, a storage fraction R constant over the energy span, folded with the proton \
+     pulse's triangle of FWHM h";
+
+const NUMBERS: [(&str, &str); 6] = [
+    ("alpha0", "1/(µs·√eV)"),
+    ("alpha1", "1/µs"),
+    ("beta0", "1/(µs·√eV)"),
+    ("beta1", "1/µs"),
+    ("r", "1"),
+    ("fwhm_squared", "µs²"),
+];
+
+/// The identifiers of a calibration foil's open-beam and sample runs, which
+/// must be different and not empty.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Runs {
+    pub open: String,
+    pub sample: String,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+enum Status {
+    Resolved,
+    OnBound,
+    Known,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct Stated {
+    value: f64,
+    sd: Option<f64>,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct FoilIsotope {
+    isotope: Isotope,
+    density: Stated,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct Foil {
+    isotopes: Vec<FoilIsotope>,
+    temperature_k: Stated,
+}
+
+/// A pulse calibrated on a foil by [`fit_counts`], as its calibration file
+/// holds it.
 ///
 /// A pulse number the calibration fitted is resolved, unless it ended on a
 /// bound, where it is held at its fitted value; a number known in the
@@ -53,44 +109,55 @@ impl Pulse {
 /// those on the densities and the temperature are.
 #[derive(Debug, Clone)]
 pub struct PulseCalibration {
-    fit: CountsFit,
+    numbers: [f64; 6],
+    status: [Status; 6],
+    prior: Option<PulsePrior>,
+    t0_us: f64,
+    flight_path_m: f64,
     energy_span_ev: (f64, f64),
     n_tau: usize,
     line_span_ev: Option<(f64, f64)>,
-    prior: Option<PulsePrior>,
+    foil: Foil,
+    runs: Runs,
+    sample_overdispersion: Option<f64>,
 }
 
 impl PulseCalibration {
     /// The pulse calibrated by fitting the counts of a foil, `measurement`,
-    /// with `calibration`.
+    /// recorded in `runs`, with `calibration`, and that fit.  Each isotope of
+    /// the foil not known to be absent (`Value::Known(0.0)`) has a measured
+    /// density, and the foil's effective temperature is measured.
     ///
     /// # Errors
-    /// Everything [`fit_counts`] refuses; [`PipelineError::InvalidParameter`]
-    /// if the fit did not converge, a pulse number it fitted ended off its
-    /// bounds without a finite positive variance, as when the counts do not
-    /// determine it or a fitted temperature ended at 1 K or 5000 K, or the fit
-    /// fitted a pulse number and no isotope of the foil fitted or known to a
-    /// positive density has a resonance between the energies of its last and
-    /// first time edges at the fitted `t0` and flight path;
-    /// [`PipelineError::Fitting`] if the resolved numbers' covariance is
-    /// refused by [`Prior::correlated`].
+    /// [`PipelineError::InvalidParameter`] if a density or the temperature of
+    /// the foil is not measured, as above, or a run identifier is empty or
+    /// both are the same; everything [`fit_counts`] refuses;
+    /// [`PipelineError::InvalidParameter`] if the fit did not converge, a pulse
+    /// number it fitted ended off its bounds without a finite positive
+    /// variance, as when the counts do not determine it or a fitted
+    /// temperature ended at 1 K or 5000 K, or the fit fitted a pulse number and
+    /// no isotope of the foil fitted or known to a positive density has a
+    /// resonance between the energies of its last and first time edges at the
+    /// fitted `t0` and flight path; [`PipelineError::Fitting`] if the resolved
+    /// numbers' covariance is refused by [`Prior::correlated`].
     pub fn new(
         measurement: &Measurement,
         calibration: &Calibration,
-    ) -> Result<Self, PipelineError> {
+        runs: Runs,
+    ) -> Result<(Self, CountsFit), PipelineError> {
+        let foil = foil(measurement)?;
+        check_runs(&runs)?;
         let fit = fit_counts(measurement, calibration)?;
-        Self::from_fit(measurement, calibration, fit)
-    }
-
-    /// The fit of the foil's counts.
-    pub fn fit(&self) -> &CountsFit {
-        &self.fit
+        let pulse = Self::from_fit(measurement, calibration, foil, runs, &fit)?;
+        Ok((pulse, fit))
     }
 
     fn from_fit(
         measurement: &Measurement,
         calibration: &Calibration,
-        fit: CountsFit,
+        foil: Foil,
+        runs: Runs,
+        fit: &CountsFit,
     ) -> Result<Self, PipelineError> {
         let invalid = |message: String| Err(PipelineError::InvalidParameter(message));
         let Some(covariance) = fit.covariance.as_ref().filter(|_| fit.converged) else {
@@ -100,11 +167,16 @@ impl PulseCalibration {
             .map(|value| !matches!(value, Value::Known(_)))
             .collect();
         let first_number = fitted.len() - 6;
+        let mut status = [Status::Known; 6];
         let mut resolved = Vec::with_capacity(6);
         for (number, name) in PULSE_NUMBERS.into_iter().enumerate() {
             let quantity = first_number + number;
             let i = fitted[..quantity].iter().filter(|&&f| f).count();
-            if !fitted[quantity] || fit.on_bound[i] {
+            if !fitted[quantity] {
+                continue;
+            }
+            if fit.on_bound[i] {
+                status[number] = Status::OnBound;
                 continue;
             }
             let variance = covariance.get(i, i);
@@ -114,6 +186,7 @@ impl PulseCalibration {
                      {variance}"
                 ));
             }
+            status[number] = Status::Resolved;
             resolved.push((number, i));
         }
         let numbers = [
@@ -174,11 +247,17 @@ impl PulseCalibration {
             })
         };
         Ok(Self {
-            fit,
+            numbers,
+            status,
+            prior,
+            t0_us: fit.t0_us,
+            flight_path_m: fit.flight_path_m,
             energy_span_ev: calibration.pulse.energy_span_ev,
             n_tau: calibration.pulse.n_tau,
             line_span_ev,
-            prior,
+            foil,
+            runs,
+            sample_overdispersion: fit.overdispersion[1],
         })
     }
 
@@ -186,29 +265,13 @@ impl PulseCalibration {
     /// the calibrated ones, the resolved pulse numbers fitted from theirs with
     /// their covariance as a prior, and the others known.
     pub fn calibration(&self) -> Calibration {
-        let fit = &self.fit;
-        let numbers = [
-            fit.alpha[0],
-            fit.alpha[1],
-            fit.beta[0],
-            fit.beta[1],
-            fit.r,
-            fit.fwhm_squared_us2,
-        ];
-        let value = |number: usize| {
-            let resolved = self
-                .prior
-                .as_ref()
-                .is_some_and(|prior| prior.numbers.contains(&number));
-            if resolved {
-                Value::Fitted(numbers[number])
-            } else {
-                Value::Known(numbers[number])
-            }
+        let value = |number: usize| match self.status[number] {
+            Status::Resolved => Value::Fitted(self.numbers[number]),
+            Status::OnBound | Status::Known => Value::Known(self.numbers[number]),
         };
         Calibration {
-            t0_us: Value::Fitted(fit.t0_us),
-            flight_path_m: Value::Fitted(fit.flight_path_m),
+            t0_us: Value::Fitted(self.t0_us),
+            flight_path_m: Value::Fitted(self.flight_path_m),
             pulse: Pulse {
                 alpha: [value(0), value(1)],
                 beta: [value(2), value(3)],
@@ -221,6 +284,284 @@ impl PulseCalibration {
             },
         }
     }
+
+    /// The calibration file: JSON of format version 1 that names the pulse
+    /// model and, in the order `α₀, α₁, β₀, β₁, R, h²`, each pulse number with
+    /// its unit, value and status (resolved, on a bound or known), then the
+    /// resolved numbers' covariance and rank, `t0` and the flight path, the
+    /// pulse's energy span and `n_tau`, the line span, the foil's isotopes and
+    /// effective temperature with their stated uncertainties, the runs, the
+    /// sample run's overdispersion, and the transfer between foils as
+    /// unchecked.
+    pub fn to_json(&self) -> String {
+        let covariance = self.prior.as_ref().map_or_else(Vec::new, |prior| {
+            let k = prior.numbers.len();
+            (0..k)
+                .map(|a| (0..k).map(|b| prior.covariance.get(a, b)).collect())
+                .collect()
+        });
+        let file = File {
+            format_version: FORMAT_VERSION,
+            pulse_model: PULSE_MODEL.into(),
+            numbers: NUMBERS
+                .iter()
+                .zip(self.numbers)
+                .zip(self.status)
+                .map(|((&(name, unit), value), status)| Number {
+                    name: name.into(),
+                    unit: unit.into(),
+                    value,
+                    status,
+                })
+                .collect(),
+            rank: covariance.len(),
+            covariance,
+            t0_us: self.t0_us,
+            flight_path_m: self.flight_path_m,
+            energy_span_ev: self.energy_span_ev,
+            n_tau: self.n_tau,
+            line_span_ev: self.line_span_ev,
+            foil: self.foil.clone(),
+            runs: FileRuns {
+                open: self.runs.open.clone(),
+                sample: self.runs.sample.clone(),
+            },
+            sample_overdispersion: self.sample_overdispersion,
+            transfer: UNCHECKED.into(),
+        };
+        serde_json::to_string_pretty(&file).expect("a calibration file has only finite numbers")
+    }
+
+    /// The calibration a file from [`Self::to_json`] holds.
+    ///
+    /// # Errors
+    /// [`PipelineError::InvalidParameter`] if `text` is not such a file: not
+    /// format version 1 of this pulse model with the transfer unchecked, a
+    /// field missing or unknown, the pulse numbers' names or units not in their
+    /// order, the rank not the number of resolved numbers, the line span
+    /// missing while a pulse number was fitted, present when none was, or not
+    /// `0 < low ≤ high`, a run identifier empty or both the same, the
+    /// overdispersion below 1, the foil without isotopes or not as
+    /// [`Self::new`] takes it, or a value outside its quantity's range or one
+    /// [`DetectorPulse::new`](nereids_physics::ikeda_carpenter::DetectorPulse::new)
+    /// refuses; [`PipelineError::Fitting`] if [`Prior::correlated`] refuses
+    /// the covariance.
+    pub fn from_json(text: &str) -> Result<Self, PipelineError> {
+        let invalid = |message: String| Err(PipelineError::InvalidParameter(message));
+        let file: File = match serde_json::from_str(text) {
+            Ok(file) => file,
+            Err(e) => return invalid(format!("not a pulse calibration file: {e}")),
+        };
+        if file.format_version != FORMAT_VERSION
+            || file.pulse_model != PULSE_MODEL
+            || file.transfer != UNCHECKED
+        {
+            return invalid(format!(
+                "a pulse calibration file of format version {FORMAT_VERSION}, the pulse model \
+                 {PULSE_MODEL:?} and the transfer {UNCHECKED:?} is read; got version {}, the \
+                 model {:?} and the transfer {:?}",
+                file.format_version, file.pulse_model, file.transfer
+            ));
+        }
+        if file.numbers.len() != NUMBERS.len()
+            || NUMBERS
+                .iter()
+                .zip(&file.numbers)
+                .any(|(&(name, unit), number)| number.name != name || number.unit != unit)
+        {
+            return invalid(format!(
+                "the pulse numbers are (name, unit) {NUMBERS:?}, in that order"
+            ));
+        }
+        let numbers: [f64; 6] = std::array::from_fn(|n| file.numbers[n].value);
+        let status: [Status; 6] = std::array::from_fn(|n| file.numbers[n].status);
+        let resolved: Vec<usize> = (0..6).filter(|&n| status[n] == Status::Resolved).collect();
+        let k = resolved.len();
+        if file.rank != k
+            || file.covariance.len() != k
+            || file.covariance.iter().any(|row| row.len() != k)
+        {
+            return invalid(format!(
+                "the covariance is {k}×{k}, of rank {k}, over the {k} resolved numbers; got rank \
+                 {} and {} rows",
+                file.rank,
+                file.covariance.len()
+            ));
+        }
+        let fitted = status.iter().any(|&s| s != Status::Known);
+        let span_holds = match file.line_span_ev {
+            Some((low, high)) => fitted && low.is_finite() && 0.0 < low && low <= high,
+            None => !fitted,
+        };
+        if !span_holds {
+            return invalid(format!(
+                "the line span is present, with 0 < low ≤ high, exactly when a pulse number was \
+                 fitted; got {:?}",
+                file.line_span_ev
+            ));
+        }
+        let runs = Runs {
+            open: file.runs.open,
+            sample: file.runs.sample,
+        };
+        check_runs(&runs)?;
+        if file
+            .sample_overdispersion
+            .is_some_and(|phi| !(phi.is_finite() && phi >= 1.0))
+        {
+            return invalid(format!(
+                "the overdispersion is 1 or more; got {:?}",
+                file.sample_overdispersion
+            ));
+        }
+        check_foil(&file.foil)?;
+        let prior = if resolved.is_empty() {
+            None
+        } else {
+            let mut covariance = FlatMatrix::zeros(k, k);
+            for (a, row) in file.covariance.iter().enumerate() {
+                for (b, &entry) in row.iter().enumerate() {
+                    *covariance.get_mut(a, b) = entry;
+                }
+            }
+            let mean: Vec<f64> = resolved.iter().map(|&number| numbers[number]).collect();
+            Prior::correlated(&resolved, &mean, &covariance)?;
+            Some(PulsePrior {
+                numbers: resolved,
+                mean,
+                covariance,
+            })
+        };
+        let pulse = Self {
+            numbers,
+            status,
+            prior,
+            t0_us: file.t0_us,
+            flight_path_m: file.flight_path_m,
+            energy_span_ev: file.energy_span_ev,
+            n_tau: file.n_tau,
+            line_span_ev: file.line_span_ev,
+            foil: file.foil,
+            runs,
+            sample_overdispersion: file.sample_overdispersion,
+        };
+        let experiment = pulse.calibration();
+        experiment.instrument()?;
+        experiment.pulse.at(&numbers)?;
+        Ok(pulse)
+    }
+}
+
+const UNCHECKED: &str = "unchecked";
+
+#[derive(Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct File {
+    format_version: u32,
+    pulse_model: String,
+    numbers: Vec<Number>,
+    covariance: Vec<Vec<f64>>,
+    rank: usize,
+    t0_us: f64,
+    flight_path_m: f64,
+    energy_span_ev: (f64, f64),
+    n_tau: usize,
+    line_span_ev: Option<(f64, f64)>,
+    foil: Foil,
+    runs: FileRuns,
+    sample_overdispersion: Option<f64>,
+    transfer: String,
+}
+
+#[derive(Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct Number {
+    name: String,
+    unit: String,
+    value: f64,
+    status: Status,
+}
+
+#[derive(Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct FileRuns {
+    open: String,
+    sample: String,
+}
+
+fn check_runs(runs: &Runs) -> Result<(), PipelineError> {
+    if runs.open.is_empty() || runs.sample.is_empty() || runs.open == runs.sample {
+        return Err(PipelineError::InvalidParameter(format!(
+            "a calibration's open-beam and sample runs have different, non-empty identifiers; \
+             got {runs:?}"
+        )));
+    }
+    Ok(())
+}
+
+fn foil(measurement: &Measurement) -> Result<Foil, PipelineError> {
+    let unmeasured = |what: &str, value: &Value| {
+        Err(PipelineError::InvalidParameter(format!(
+            "a calibration foil's {what} is measured, with its stated uncertainty; got {value:?}"
+        )))
+    };
+    let mut isotopes = Vec::with_capacity(measurement.isotopes.len());
+    for (data, density) in &measurement.isotopes {
+        let density = match *density {
+            Value::Measured { value, sd } => Stated {
+                value,
+                sd: Some(sd),
+            },
+            Value::Known(value) if value == 0.0 => Stated { value, sd: None },
+            other => return unmeasured(&format!("density of {}", data.isotope), &other),
+        };
+        isotopes.push(FoilIsotope {
+            isotope: data.isotope,
+            density,
+        });
+    }
+    let Value::Measured { value, sd } = measurement.temperature_k else {
+        return unmeasured("temperature", &measurement.temperature_k);
+    };
+    Ok(Foil {
+        isotopes,
+        temperature_k: Stated {
+            value,
+            sd: Some(sd),
+        },
+    })
+}
+
+fn check_foil(foil: &Foil) -> Result<(), PipelineError> {
+    let value = |stated: Stated| match stated.sd {
+        Some(sd) => Value::Measured {
+            value: stated.value,
+            sd,
+        },
+        None => Value::Known(stated.value),
+    };
+    if foil.isotopes.is_empty()
+        || foil
+            .isotopes
+            .iter()
+            .any(|isotope| isotope.density.sd.is_none() && isotope.density.value != 0.0)
+        || foil.temperature_k.sd.is_none()
+    {
+        return Err(PipelineError::InvalidParameter(format!(
+            "a calibration foil has isotopes, each measured or known to be absent, and a \
+             measured temperature; got {foil:?}"
+        )));
+    }
+    for isotope in &foil.isotopes {
+        value(isotope.density).parameter("density", 0.0..=f64::INFINITY, "0 or more")?;
+    }
+    let (low, high) = TEMPERATURE_BOUNDS_K;
+    value(foil.temperature_k).parameter(
+        "temperature",
+        low..=high,
+        &format!("within {low}–{high} K"),
+    )?;
+    Ok(())
 }
 
 fn lines_in_window<'a>(
@@ -248,7 +589,10 @@ mod tests {
         let lines = [(10.0, 0.05, 0.06), (25.0, 0.005, 0.06), (50.0, 0.01, 0.06)];
         let foil = (
             synthetic_isotope_multi(73, 181, &lines),
-            Value::Fitted(2e-3),
+            Value::Measured {
+                value: 2e-3,
+                sd: 2e-5,
+            },
         );
         let impurity = absent.map(|energy| {
             (
@@ -268,8 +612,26 @@ mod tests {
             normalization: Value::Known(1.0),
             background: [Value::Known(0.0); 3],
             isotopes: std::iter::once(foil).chain(impurity).collect(),
-            temperature_k: Value::Fitted(300.0),
+            temperature_k: Value::Measured {
+                value: 300.0,
+                sd: 10.0,
+            },
         }
+    }
+
+    fn runs() -> Runs {
+        Runs {
+            open: "open-1".into(),
+            sample: "foil-1".into(),
+        }
+    }
+
+    fn calibrated(
+        m: &Measurement,
+        c: &Calibration,
+        fit: CountsFit,
+    ) -> Result<PulseCalibration, PipelineError> {
+        PulseCalibration::from_fit(m, c, foil(m)?, runs(), &fit)
     }
 
     fn calibration(beta1: Value) -> Calibration {
@@ -337,10 +699,8 @@ mod tests {
             densities: vec![2e-3, 0.0],
             ..fit(8, &[5])
         };
-        let calibrated = PulseCalibration::from_fit(&m, &c, with_impurity)
-            .unwrap()
-            .calibration();
-        let pulse = &calibrated.pulse;
+        let experiment = calibrated(&m, &c, with_impurity).unwrap().calibration();
+        let pulse = &experiment.pulse;
         assert_eq!(pulse.alpha, [Value::Known(0.5), Value::Fitted(1.1)]);
         assert_eq!(pulse.beta, [Value::Known(0.0), Value::Known(0.01)]);
         assert_eq!(
@@ -348,7 +708,7 @@ mod tests {
             [Value::Fitted(0.21), Value::Fitted(0.12)]
         );
         assert_eq!(
-            [calibrated.t0_us, calibrated.flight_path_m],
+            [experiment.t0_us, experiment.flight_path_m],
             [Value::Fitted(3.0), Value::Fitted(25.0)]
         );
         let prior = pulse.prior.as_ref().expect("prior");
@@ -393,7 +753,7 @@ mod tests {
                 },
             ),
         ] {
-            assert!(PulseCalibration::from_fit(&m, &calibration(beta1), refused).is_err());
+            assert!(calibrated(&m, &calibration(beta1), refused).is_err());
         }
     }
 
@@ -403,7 +763,7 @@ mod tests {
         let mut beyond = measurement(None);
         beyond.isotopes[0].0 = synthetic_isotope(73, 181, 100.0, 0.05, 0.06);
         assert!(matches!(
-            PulseCalibration::from_fit(&beyond, &c, fit(8, &[5])),
+            calibrated(&beyond, &c, fit(8, &[5])),
             Err(PipelineError::InvalidParameter(_))
         ));
         let mut singular = fit(8, &[5]);
@@ -412,7 +772,7 @@ mod tests {
         *covariance.get_mut(4, 6) = (a * b).sqrt();
         *covariance.get_mut(6, 4) = (a * b).sqrt();
         assert!(matches!(
-            PulseCalibration::from_fit(&measurement(None), &c, singular),
+            calibrated(&measurement(None), &c, singular),
             Err(PipelineError::Fitting(_))
         ));
     }
@@ -438,7 +798,7 @@ mod tests {
             beta: [0.08, 0.01],
             ..fit(8, &[4, 5, 6, 7])
         };
-        let held = PulseCalibration::from_fit(&measurement(None), &c, on_bounds)
+        let held = calibrated(&measurement(None), &c, on_bounds)
             .unwrap()
             .calibration();
         assert!(held.pulse.prior.is_none());
@@ -458,9 +818,113 @@ mod tests {
         pulse.beta[0] = Value::Known(0.08);
         pulse.r = Value::Known(0.2);
         pulse.fwhm_squared_us2 = Value::Known(0.1);
-        let unfitted = PulseCalibration::from_fit(&measurement(None), &known, fit(4, &[]))
+        let unfitted = calibrated(&measurement(None), &known, fit(4, &[]))
             .unwrap()
             .calibration();
         assert_eq!(unfitted.pulse.line_span_ev, None);
+    }
+
+    fn original() -> PulseCalibration {
+        let fit = CountsFit {
+            r: 0.012_537_345_881_063_615,
+            overdispersion: [Some(1.25), Some(1.5)],
+            ..fit(8, &[5])
+        };
+        calibrated(
+            &measurement(Some(55.0)),
+            &calibration(Value::Known(0.01)),
+            fit,
+        )
+        .unwrap()
+    }
+
+    fn file() -> String {
+        original().to_json()
+    }
+
+    #[test]
+    fn a_calibration_reads_back_from_its_file_bit_for_bit() {
+        let original = original();
+        let text = original.to_json();
+        let read = PulseCalibration::from_json(&text).unwrap();
+        assert_eq!(format!("{read:?}"), format!("{original:?}"));
+        assert_eq!(read.to_json(), text);
+        assert_eq!(
+            read.numbers[4].to_bits(),
+            0.012_537_345_881_063_615_f64.to_bits()
+        );
+        for expected in [
+            "\"format_version\": 1",
+            "\"name\": \"alpha0\"",
+            "\"unit\": \"1/(µs·√eV)\"",
+            "\"status\": \"on_bound\"",
+            "\"rank\": 3",
+            "\"sample_overdispersion\": 1.5",
+            "\"transfer\": \"unchecked\"",
+        ] {
+            assert!(text.contains(expected), "{expected} in {text}");
+        }
+    }
+
+    #[test]
+    fn files_that_are_not_such_a_calibration_are_refused() {
+        let original: serde_json::Value = serde_json::from_str(&file()).unwrap();
+        type Edit = (&'static str, fn(&mut serde_json::Value));
+        let edits: [Edit; 13] = [
+            ("version", |v| v["format_version"] = 2.into()),
+            ("model", |v| v["pulse_model"] = "Gaussian".into()),
+            ("transfer", |v| v["transfer"] = "checked".into()),
+            ("unknown field", |v| v["comment"] = "added".into()),
+            ("name", |v| v["numbers"][1]["name"] = "alpha2".into()),
+            ("unit", |v| v["numbers"][2]["unit"] = "1/µs".into()),
+            ("rank", |v| v["rank"] = 2.into()),
+            ("row", |v| {
+                v["covariance"].as_array_mut().unwrap().pop();
+            }),
+            ("span missing", |v| {
+                v["line_span_ev"] = serde_json::Value::Null
+            }),
+            ("span reversed", |v| {
+                v["line_span_ev"] = serde_json::json!([50.0, 10.0])
+            }),
+            ("runs", |v| v["runs"]["sample"] = "open-1".into()),
+            ("overdispersion", |v| {
+                v["sample_overdispersion"] = 0.5.into()
+            }),
+            ("negative rate", |v| {
+                v["numbers"][0]["value"] = (-0.01).into()
+            }),
+        ];
+        for (what, edit) in edits {
+            let mut value = original.clone();
+            edit(&mut value);
+            assert!(
+                PulseCalibration::from_json(&value.to_string()).is_err(),
+                "{what}"
+            );
+        }
+        assert!(PulseCalibration::from_json(&original.to_string()).is_ok());
+    }
+
+    #[test]
+    fn a_foil_whose_density_or_temperature_is_not_measured_is_refused() {
+        let c = calibration(Value::Known(0.01));
+        let mut fitted = measurement(None);
+        fitted.isotopes[0].1 = Value::Fitted(2e-3);
+        let mut warm = measurement(None);
+        warm.temperature_k = Value::Fitted(300.0);
+        for m in [fitted, warm] {
+            match PulseCalibration::new(&m, &c, runs()) {
+                Err(PipelineError::InvalidParameter(message)) => {
+                    assert!(message.contains("is measured"), "{message}")
+                }
+                other => panic!("{other:?}"),
+            }
+        }
+        let same = Runs {
+            open: "foil-1".into(),
+            sample: "foil-1".into(),
+        };
+        assert!(PulseCalibration::new(&measurement(None), &c, same).is_err());
     }
 }
