@@ -14,7 +14,11 @@ use crate::open_beam::{Calibration, PULSE_NUMBERS, Pulse};
 /// The pulse numbers a calibration resolved, as indices into
 /// `(α₀, α₁, β₀, β₁, R, h²)`, with their fitted values and covariance, and
 /// the energies in eV of the lowest and highest resonance in the calibration
-/// foil's window of its isotopes with a positive density.
+/// foil's window of its isotopes with a positive density.  A window holds the
+/// resonances between the energies of its last and first time edges, for the
+/// span and for an experiment's check against it; a resonance outside them,
+/// whose neutrons reach the window only through the pulse's delay, is in
+/// neither.
 #[derive(Debug, Clone)]
 pub struct PulsePrior {
     pub(crate) numbers: Vec<usize>,
