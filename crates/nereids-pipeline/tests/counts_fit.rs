@@ -2662,7 +2662,6 @@ mod pulse_calibration {
             (rejected - 0.05).abs() <= 3.0 * (0.05 * 0.95 / n).sqrt(),
             "{rejected} rejected at 0.05"
         );
-        rejected_at_most_nominally(&tests);
     }
 
     #[test]

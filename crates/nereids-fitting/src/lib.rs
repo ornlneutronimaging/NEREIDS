@@ -11,7 +11,7 @@
 //! - [`nelder_mead`] — Bounded Nelder-Mead polish optimizer
 //! - [`parameters`] — Fit parameter types, bounds, constraints
 //! - [`poisson`] — Poisson-likelihood optimizer for low-count data
-//! - [`statistics`] — Consistency of a fit with its prior
+//! - [`statistics`] — Consistency of a fit with its prior, and agreement between two estimates
 //! - [`transmission_model`] — Transmission forward model adapter for fitting
 //!
 //! ## SAMMY Reference

@@ -86,7 +86,8 @@ fn chi_squared_survival(q: f64, dof: usize) -> f64 {
 /// `estimate` is not finite, the prior's mean is not finite or a measured sd
 /// not finite and positive, or `posterior` over the rest is not symmetric to
 /// 1e-12 of `√(Σᵢᵢ Σⱼⱼ)` or not within the prior there, with some `rᵢ` below
-/// `−8e-4` or above `1 + 8e-4`, or `q` is not a number, as on overflow;
+/// `−8e-4` or above `1 + 8e-4`, or `q` is not a number, as overflow in
+/// whitening can give;
 /// `FittingError::EvaluationFailed` if a decomposition fails.
 pub fn consistency(
     prior: &Prior,
@@ -188,8 +189,8 @@ pub fn consistency(
 /// # Errors
 /// `FittingError::InvalidConfig` if `a` and `b` are over different
 /// parameters, either has a mean that is not finite or a measured sd not
-/// finite and positive, or `q` is not a number, as when the difference of
-/// the means overflows; `FittingError::EvaluationFailed` if `C_a + C_b` is
+/// finite and positive, or `q` is not a number, as overflow in whitening can
+/// give; `FittingError::EvaluationFailed` if `C_a + C_b` is
 /// not positive definite in floating point.
 pub fn agreement(a: &Prior, b: &Prior) -> Result<Consistency, FittingError> {
     if a.parameters != b.parameters || !a.is_valid() || !b.is_valid() {

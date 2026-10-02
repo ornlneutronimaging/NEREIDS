@@ -414,8 +414,8 @@ impl PulseCalibration {
     ///
     /// # Errors
     /// Those of [`Self::transfer`]; [`PipelineError::InvalidParameter`] if `p`
-    /// is 0.01 or less: the pulse does not transfer, and the calibration,
-    /// consumed, cannot be written.
+    /// is 0.01 or less: the pulse does not transfer, and the calibration is
+    /// consumed, since it is not to be written.
     pub fn record_transfer(mut self, other: &PulseCalibration) -> Result<Self, PipelineError> {
         let record = self.transfer(other)?.record;
         if record.p <= TRANSFER_P {
@@ -797,7 +797,9 @@ fn check_record(
     });
     if other.foil == provenance.foil
         || other.sample == provenance.sample
-        || record.sample_overdispersion.is_some_and(|phi| phi < 1.0)
+        || record
+            .sample_overdispersion
+            .is_some_and(|phi| !(phi.is_finite() && phi >= 1.0))
         || !statistic
         || !bounds
     {
