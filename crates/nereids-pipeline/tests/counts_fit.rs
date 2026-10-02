@@ -5,6 +5,7 @@ use std::sync::{Arc, LazyLock};
 use nereids_endf::resonance::ResonanceData;
 use nereids_endf::resonance::test_support::{synthetic_isotope, synthetic_isotope_multi};
 use nereids_fitting::lm::FlatMatrix;
+use nereids_fitting::statistics::Consistency;
 use nereids_physics::continuous_doppler::SUPPORT_X;
 use nereids_physics::doppler::DopplerParams;
 use nereids_physics::flight_time_grid::FlightTimeGrid;
@@ -18,7 +19,7 @@ use nereids_pipeline::counts_fit::{
 };
 use nereids_pipeline::error::PipelineError;
 use nereids_pipeline::open_beam::{BOUND, Calibration, Pulse, fit_open_beam};
-use nereids_pipeline::pulse_calibration::{PulseCalibration, Runs};
+use nereids_pipeline::pulse_calibration::{Provenance, PulseCalibration};
 use nereids_pipeline::reference::Instrument;
 use rand::SeedableRng;
 use rand_chacha::ChaCha12Rng;
@@ -1692,7 +1693,7 @@ const CALIBRATION_LINES: [(f64, f64, f64); 3] =
     [(10.0, 0.05, 0.06), (25.0, 0.005, 0.06), (50.0, 0.01, 0.06)];
 const CALIBRATION_DENSITY: f64 = 2.0e-3;
 const CALIBRATION_LEVEL: f64 = 2.0e6;
-const DENSITY_SD: f64 = 0.01 * CALIBRATION_DENSITY;
+const DENSITY_RELATIVE_SD: f64 = 0.01;
 const TEMPERATURE_SD_K: f64 = 10.0;
 
 fn venus_pulse(numbers: &[f64]) -> Arc<IkedaCarpenter> {
@@ -1724,7 +1725,11 @@ fn venus_pulse(numbers: &[f64]) -> Arc<IkedaCarpenter> {
 }
 
 fn calibration_foil(pulse: &[f64], t0_us: f64, flight_path_m: f64) -> Setup {
-    let lines_us: Vec<f64> = CALIBRATION_LINES
+    foil_window(&CALIBRATION_LINES, pulse, t0_us, flight_path_m)
+}
+
+fn foil_window(lines: &[(f64, f64, f64)], pulse: &[f64], t0_us: f64, flight_path_m: f64) -> Setup {
+    let lines_us: Vec<f64> = lines
         .iter()
         .map(|&(energy, _, _)| T0_US + CLOCK / energy.sqrt())
         .collect();
@@ -1751,10 +1756,18 @@ fn calibration_sample(density: f64) -> [(ResonanceData, f64); 1] {
 }
 
 fn calibration_measurement(setup: &Setup, counts: (Vec<f64>, Vec<f64>)) -> Measurement {
-    let mut m = measurement(setup, counts, &calibration_sample(CALIBRATION_DENSITY));
+    foil_measurement(setup, counts, &calibration_sample(CALIBRATION_DENSITY))
+}
+
+fn foil_measurement(
+    setup: &Setup,
+    counts: (Vec<f64>, Vec<f64>),
+    sample: &[(ResonanceData, f64)],
+) -> Measurement {
+    let mut m = measurement(setup, counts, sample);
     m.isotopes[0].1 = Value::Measured {
-        value: CALIBRATION_DENSITY,
-        sd: DENSITY_SD,
+        value: sample[0].1,
+        sd: DENSITY_RELATIVE_SD * sample[0].1,
     };
     m.temperature_k = Value::Measured {
         value: TEMPERATURE_K,
@@ -1828,10 +1841,11 @@ fn assert_recovered(fit: &CountsFit, pulse: &[f64], fitted: usize, case: &str) {
     }
 }
 
-fn foil_runs() -> Runs {
-    Runs {
-        open: "open".into(),
-        sample: "foil".into(),
+fn foil_provenance() -> Provenance {
+    Provenance {
+        foil: "foil-a".into(),
+        open: "open-a".into(),
+        sample: "sample-a".into(),
     }
 }
 
@@ -1846,7 +1860,7 @@ static ONE_FOIL: LazyLock<(PulseCalibration, CountsFit)> = LazyLock::new(|| {
     PulseCalibration::new(
         &m,
         &calibration_start(&CALIBRATION_PULSE, 1.0, None),
-        foil_runs(),
+        foil_provenance(),
     )
     .expect("calibration")
 });
@@ -2022,7 +2036,8 @@ mod pulse_calibration {
         };
         let coefficients = fit.beam.coefficients().len();
         let mut information = information(&fit, &fitted, 3, counts_at);
-        information[coefficients][coefficients] += DENSITY_SD.powi(-2);
+        information[coefficients][coefficients] +=
+            (DENSITY_RELATIVE_SD * CALIBRATION_DENSITY).powi(-2);
         information[coefficients + 1][coefficients + 1] += TEMPERATURE_SD_K.powi(-2);
         assert_covariance(&fit, &inverse(information));
     }
@@ -2312,7 +2327,7 @@ mod pulse_calibration {
                 let sign = if seed % 2 == 0 { 1.0 } else { -1.0 };
                 let calibration = calibration_start(&p, sign, Some(p[5] + 0.05 * sign));
                 let (calibrated, fit) =
-                    PulseCalibration::new(&m, &calibration, foil_runs()).ok()?;
+                    PulseCalibration::new(&m, &calibration, foil_provenance()).ok()?;
                 let experiment = calibrated.calibration();
                 let pulse = &experiment.pulse;
                 [
@@ -2432,7 +2447,7 @@ mod pulse_calibration {
                     let mut calibration = calibration_start(&p, sign, Some(p[5] + 0.05 * sign));
                     calibration.pulse.alpha[0] = Value::Fitted(0.05);
                     let (calibrated, _) =
-                        PulseCalibration::new(&m, &calibration, foil_runs()).ok()?;
+                        PulseCalibration::new(&m, &calibration, foil_provenance()).ok()?;
                     let experiment = calibrated.calibration();
                     let held = matches!(experiment.pulse.alpha[0], Value::Known(_));
                     let drawn = draws(&counts, 91_000 + seeds + seed, [1.0; 2]);
@@ -2499,5 +2514,170 @@ mod pulse_calibration {
             }
             other => panic!("{line_ev} eV: {other:?}"),
         }
+    }
+
+    const SECOND_LINES: [(f64, f64, f64); 3] =
+        [(15.0, 0.03, 0.06), (30.0, 0.006, 0.06), (45.0, 0.01, 0.06)];
+    const SECOND_DENSITY: f64 = 3.0e-3;
+
+    fn second_sample() -> [(ResonanceData, f64); 1] {
+        [(
+            synthetic_isotope_multi(74, 184, &SECOND_LINES),
+            SECOND_DENSITY,
+        )]
+    }
+
+    fn second_provenance() -> Provenance {
+        Provenance {
+            foil: "foil-b".into(),
+            open: "open-b".into(),
+            sample: "sample-b".into(),
+        }
+    }
+
+    fn second_calibration(
+        pulse: &[f64],
+        counts: (Vec<f64>, Vec<f64>),
+        start: &Calibration,
+    ) -> Option<(PulseCalibration, CountsFit)> {
+        let setup = foil_window(&SECOND_LINES, pulse, T0_US, FLIGHT_PATH_M);
+        PulseCalibration::new(
+            &foil_measurement(&setup, counts, &second_sample()),
+            start,
+            second_provenance(),
+        )
+        .ok()
+    }
+
+    fn second_counts(pulse: &[f64]) -> (Vec<f64>, Vec<f64>) {
+        let setup = foil_window(&SECOND_LINES, pulse, T0_US, FLIGHT_PATH_M);
+        expected(&setup, &beam(CALIBRATION_LEVEL), &second_sample())
+    }
+
+    #[test]
+    #[ignore = "slow; runs nightly"]
+    fn a_pulse_calibrated_on_one_foil_transfers_to_another_only_if_the_pulse_is_the_same() {
+        let start = calibration_start(&CALIBRATION_PULSE, 1.0, None);
+        let calibrate = |pulse: &[f64]| {
+            let counts = second_counts(pulse);
+            second_calibration(pulse, (rounded(&counts.0), rounded(&counts.1)), &start)
+                .expect("calibration")
+                .0
+        };
+        let mut shifted = CALIBRATION_PULSE;
+        shifted[4] += 0.02;
+        let (same, other) = rayon::join(|| calibrate(&CALIBRATION_PULSE), || calibrate(&shifted));
+        let a = &ONE_FOIL.0;
+        let failing = a.transfer(&other).expect("transfer");
+        assert!(failing.agreement().p < 0.01, "{:?}", failing.agreement());
+        assert!(a.clone().record_transfer(&other).is_err());
+        let transfer = a.transfer(&same).expect("transfer");
+        assert!(transfer.agreement().p > 0.01, "{:?}", transfer.agreement());
+        let text = a
+            .clone()
+            .record_transfer(&same)
+            .expect("recorded")
+            .to_json();
+        assert_eq!(
+            PulseCalibration::from_json(&text).expect("file").to_json(),
+            text
+        );
+    }
+
+    fn transfer_replicas(pulse: &[f64; 6], seeds: u64) -> Vec<(Consistency, f64, bool)> {
+        let first = calibration_foil(pulse, T0_US, FLIGHT_PATH_M);
+        let first_counts = expected(
+            &first,
+            &beam(CALIBRATION_LEVEL),
+            &calibration_sample(CALIBRATION_DENSITY),
+        );
+        let second_counts = second_counts(pulse);
+        (0..400_u64)
+            .into_par_iter()
+            .filter_map(|seed| {
+                let sign = if seed % 2 == 0 { 1.0 } else { -1.0 };
+                let mut start = calibration_start(pulse, sign, Some(pulse[5] + 0.05 * sign));
+                start.pulse.alpha[0] = Value::Fitted(pulse[0] + 0.05);
+                let m =
+                    calibration_measurement(&first, draws(&first_counts, seeds + seed, [1.0; 2]));
+                let (a, a_fit) = PulseCalibration::new(&m, &start, foil_provenance()).ok()?;
+                let drawn = draws(&second_counts, seeds + 500 + seed, [1.0; 2]);
+                let (b, b_fit) = second_calibration(pulse, drawn, &start)?;
+                let transfer = a.transfer(&b).ok()?;
+                let weights: Vec<f64> = a_fit
+                    .overdispersion
+                    .iter()
+                    .chain(&b_fit.overdispersion)
+                    .map(|phi| phi.unwrap_or(1.0))
+                    .collect();
+                let held = |c: &PulseCalibration| {
+                    matches!(c.calibration().pulse.alpha[0], Value::Known(_))
+                };
+                Some((
+                    transfer.agreement(),
+                    weights.iter().sum::<f64>() / weights.len() as f64,
+                    held(&a) != held(&b),
+                ))
+            })
+            .collect()
+    }
+
+    fn chi_squared_on_average<'a>(tests: impl Iterator<Item = &'a (Consistency, f64, bool)>) {
+        let (q, dof) = tests.fold((0.0, 0.0), |(q, dof), (t, phi, _)| {
+            (q + t.q * phi, dof + t.dof as f64)
+        });
+        assert!(
+            (q - dof).abs() <= 3.0 * (2.0 * dof).sqrt(),
+            "d2 {q} summed over {dof} degrees of freedom"
+        );
+    }
+
+    fn rejected_at_most_nominally(tests: &[(Consistency, f64, bool)]) {
+        let n = tests.len() as f64;
+        let rejected = tests.iter().filter(|(t, _, _)| t.p < 0.05).count() as f64 / n;
+        assert!(
+            rejected <= 0.05 + 3.0 * (0.05 * 0.95 / n).sqrt(),
+            "{rejected} rejected at a reported 0.05"
+        );
+    }
+
+    #[test]
+    #[ignore = "slow; runs nightly"]
+    fn two_foils_on_the_same_pulse_agree_as_chi_squared_says() {
+        let mut p = CALIBRATION_PULSE;
+        p[5] = 0.35;
+        let tests = transfer_replicas(&p, 100_000);
+        assert!(tests.len() >= 398, "{} transferred", tests.len());
+        chi_squared_on_average(tests.iter());
+        let n = tests.len() as f64;
+        let rejected = tests
+            .iter()
+            .filter(|(t, phi, _)| {
+                assert_eq!(t.dof, 5);
+                t.q * phi > CHI_SQUARED_5_AT_0_05
+            })
+            .count() as f64
+            / n;
+        assert!(
+            (rejected - 0.05).abs() <= 3.0 * (0.05 * 0.95 / n).sqrt(),
+            "{rejected} rejected at 0.05"
+        );
+    }
+
+    #[test]
+    #[ignore = "slow; runs nightly"]
+    fn two_foils_with_a_moderation_rate_near_its_bound_reject_no_more_than_nominally() {
+        let mut p = CALIBRATION_PULSE;
+        p[0] = 5e-4;
+        p[5] = 0.35;
+        let tests = transfer_replicas(&p, 200_000);
+        assert!(tests.len() >= 390, "{} transferred", tests.len());
+        let conditioned: Vec<_> = tests.iter().filter(|(_, _, one_held)| *one_held).collect();
+        assert!(
+            !conditioned.is_empty(),
+            "no foil held alpha0 while the other resolved it"
+        );
+        chi_squared_on_average(conditioned.into_iter());
+        rejected_at_most_nominally(&tests);
     }
 }

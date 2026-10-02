@@ -5,13 +5,14 @@ use nereids_core::types::Isotope;
 use nereids_endf::resonance::ResonanceData;
 use nereids_fitting::lm::FlatMatrix;
 use nereids_fitting::poisson::Prior;
+use nereids_fitting::statistics::{Consistency, agreement};
 use nereids_physics::resolution::TOF_FACTOR;
 use nereids_physics::transmission::resonance_center_energies;
 use serde::{Deserialize, Serialize};
 
 use crate::counts_fit::{CountsFit, Measurement, Value, fit_counts, quantities};
 use crate::error::PipelineError;
-use crate::open_beam::{Calibration, PULSE_NUMBERS, Pulse};
+use crate::open_beam::{Calibration, PULSE_NUMBERS, PULSE_RANGES, Pulse};
 use crate::pipeline::TEMPERATURE_BOUNDS_K;
 
 /// The pulse numbers a calibration resolved, as indices into
@@ -57,10 +58,12 @@ const NUMBERS: [(&str, &str); 6] = [
     ("fwhm_squared", "µs²"),
 ];
 
-/// The identifiers of a calibration foil's open-beam and sample runs, which
-/// must be different and not empty.
+/// Where a calibration's counts came from: the identifiers of the physical
+/// foil and of its open-beam and sample runs, none empty and the two runs
+/// different.
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub struct Runs {
+pub struct Provenance {
+    pub foil: String,
     pub open: String,
     pub sample: String,
 }
@@ -145,20 +148,24 @@ pub struct PulseCalibration {
     n_tau: usize,
     line_span_ev: Option<(f64, f64)>,
     foil: Foil,
-    runs: Runs,
+    provenance: Provenance,
     sample_overdispersion: Option<f64>,
+    transfer: Option<TransferRecord>,
 }
 
 impl PulseCalibration {
     /// The pulse calibrated by fitting the counts of a foil, `measurement`,
-    /// recorded in `runs`, with `calibration`, and that fit.  Each isotope of
+    /// from `provenance`, with `calibration`, and that fit.  Each isotope of
     /// the foil not known to be absent (`Value::Known(0.0)`) has a measured
     /// density, and the foil's effective temperature is measured.
     ///
     /// # Errors
     /// [`PipelineError::InvalidParameter`] if a density or the temperature of
-    /// the foil is not measured, as above, or a run identifier is empty or
-    /// both are the same; everything [`fit_counts`] refuses;
+    /// the foil is not measured, as above, an identifier of `provenance` is
+    /// empty or its runs are the same, or `calibration`'s pulse carries a
+    /// prior or a measured number, since a calibration foil is calibrated
+    /// alone; everything
+    /// [`fit_counts`] refuses;
     /// [`PipelineError::InvalidParameter`] if the fit did not converge, a pulse
     /// number it fitted ended off its bounds without a finite positive
     /// variance, as when the counts do not determine it or a fitted
@@ -170,12 +177,25 @@ impl PulseCalibration {
     pub fn new(
         measurement: &Measurement,
         calibration: &Calibration,
-        runs: Runs,
+        provenance: Provenance,
     ) -> Result<(Self, CountsFit), PipelineError> {
         let foil = foil(measurement)?;
-        check_runs(&runs)?;
+        check_provenance(&provenance)?;
+        let pulse = &calibration.pulse;
+        let measured = [pulse.r, pulse.fwhm_squared_us2]
+            .iter()
+            .chain(&pulse.alpha)
+            .chain(&pulse.beta)
+            .any(|value| matches!(value, Value::Measured { .. }));
+        if pulse.prior.is_some() || measured {
+            return Err(PipelineError::InvalidParameter(
+                "a calibration foil is calibrated alone, with no pulse prior or measured pulse \
+                 number"
+                    .into(),
+            ));
+        }
         let fit = fit_counts(measurement, calibration)?;
-        let pulse = Self::from_fit(measurement, calibration, foil, runs, &fit)?;
+        let pulse = Self::from_fit(measurement, calibration, foil, provenance, &fit)?;
         Ok((pulse, fit))
     }
 
@@ -183,7 +203,7 @@ impl PulseCalibration {
         measurement: &Measurement,
         calibration: &Calibration,
         foil: Foil,
-        runs: Runs,
+        provenance: Provenance,
         fit: &CountsFit,
     ) -> Result<Self, PipelineError> {
         let invalid = |message: String| Err(PipelineError::InvalidParameter(message));
@@ -283,9 +303,129 @@ impl PulseCalibration {
             n_tau: calibration.pulse.n_tau,
             line_span_ev,
             foil,
-            runs,
+            provenance,
             sample_overdispersion: fit.overdispersion[1],
+            transfer: None,
         })
+    }
+
+    /// The agreement of this calibration's pulse with `other`'s, a physically
+    /// different foil calibrated alone: `d² = dᵀ(C_a + C_b)⁻¹d` over the pulse
+    /// numbers both resolve, with `d` the difference of their values and
+    /// `C_a`, `C_b` their covariances, against `χ²` with as many degrees of
+    /// freedom.  A number one foil holds on a bound and the other resolves is
+    /// held for both: the other's numbers are conditioned on it at the bound,
+    /// `d²` leaves out its own difference, and the result keeps the other's
+    /// value and sd for it.
+    ///
+    /// `d²` follows `χ²` when both foils see the same pulse and every held
+    /// bound is the truth.  Each run's information is divided by its
+    /// overdispersion, which is at least 1, so with Poisson counts the test is
+    /// conservative, and it weakens as the overdispersion grows.  Two foils
+    /// that share an open-beam run, or whose stated temperatures share an
+    /// error, are not independent, which the test does not account for.
+    ///
+    /// # Errors
+    /// [`PipelineError::InvalidParameter`] if the two calibrations name the
+    /// same foil, as the same foil re-measured tests only repeatability,
+    /// share a run other than the open-beam run, know different pulse numbers
+    /// or know one at
+    /// different values, hold one on different bounds, or resolve no number
+    /// in common;
+    /// [`PipelineError::Fitting`] if a decomposition fails.
+    pub fn transfer(&self, other: &PulseCalibration) -> Result<Transfer, PipelineError> {
+        let invalid = |message: String| Err(PipelineError::InvalidParameter(message));
+        if !separate(&self.provenance, &other.provenance) {
+            return invalid(format!(
+                "a transfer is to a physically different foil that shares no run but the \
+                 open-beam run; got {:?} and {:?}",
+                self.provenance, other.provenance
+            ));
+        }
+        for (n, name) in PULSE_NUMBERS.into_iter().enumerate() {
+            let (a, b) = (self.status[n], other.status[n]);
+            let known = a == Status::Known || b == Status::Known;
+            let held = known || (a == Status::OnBound && b == Status::OnBound);
+            if held && (a != b || self.numbers[n] != other.numbers[n]) {
+                return invalid(format!(
+                    "the two calibrations hold {name} differently, {a:?} at {} and {b:?} at {}, \
+                     so they describe different pulse models",
+                    self.numbers[n], other.numbers[n]
+                ));
+            }
+        }
+        let resolved =
+            |n: usize| self.status[n] == Status::Resolved && other.status[n] == Status::Resolved;
+        if !(0..6).any(resolved) {
+            return invalid("the two calibrations resolve no pulse number in common".into());
+        }
+        let estimate = |this: &Self, that: &Self| -> Result<Prior, PipelineError> {
+            let prior = this
+                .prior
+                .as_ref()
+                .expect("a calibration that resolves a number has its prior");
+            let held: Vec<(usize, f64)> = (0..6)
+                .filter(|&n| {
+                    this.status[n] == Status::Resolved && that.status[n] == Status::OnBound
+                })
+                .map(|n| (n, that.numbers[n]))
+                .collect();
+            Ok(
+                Prior::correlated(&prior.numbers, &prior.mean, &prior.covariance)?
+                    .conditioned(&held)?,
+            )
+        };
+        let result = agreement(&estimate(self, other)?, &estimate(other, self)?)?;
+        let bounds = (0..6)
+            .filter_map(|n| {
+                let (held_by, holder, resolver) = match (self.status[n], other.status[n]) {
+                    (Status::OnBound, Status::Resolved) => (Holder::This, self, other),
+                    (Status::Resolved, Status::OnBound) => (Holder::Other, other, self),
+                    _ => return None,
+                };
+                let prior = resolver.prior.as_ref()?;
+                let k = prior.numbers.iter().position(|&m| m == n)?;
+                Some(BoundNumber {
+                    name: NUMBERS[n].0.into(),
+                    held_by,
+                    bound: holder.numbers[n],
+                    value: resolver.numbers[n],
+                    sd: prior.covariance.get(k, k).sqrt(),
+                })
+            })
+            .collect();
+        Ok(Transfer {
+            record: TransferRecord {
+                foil: other.foil.clone(),
+                provenance: FileProvenance::from(&other.provenance),
+                sample_overdispersion: other.sample_overdispersion,
+                d2: result.q,
+                dof: result.dof,
+                p: result.p,
+                bounds,
+            },
+        })
+    }
+
+    /// This calibration with its [`Self::transfer`] to `other` recorded, in
+    /// place of "transfer unchecked" or an earlier transfer, when its `p` is
+    /// above 0.01.
+    ///
+    /// # Errors
+    /// Those of [`Self::transfer`]; [`PipelineError::InvalidParameter`] if `p`
+    /// is 0.01 or less: the pulse does not transfer, and the calibration is
+    /// consumed, since it is not to be written.
+    pub fn record_transfer(mut self, other: &PulseCalibration) -> Result<Self, PipelineError> {
+        let record = self.transfer(other)?.record;
+        if record.p <= TRANSFER_P {
+            return Err(PipelineError::InvalidParameter(format!(
+                "the pulse does not transfer: d² = {} on {} degrees of freedom gives p = {}, at \
+                 most {TRANSFER_P}; the calibration is not written",
+                record.d2, record.dof, record.p
+            )));
+        }
+        self.transfer = Some(record);
+        Ok(self)
     }
 
     /// The calibration of an experiment: `t0` and the flight path fitted from
@@ -317,9 +457,11 @@ impl PulseCalibration {
     /// its unit, value and status (resolved, on a bound or known), then the
     /// resolved numbers' covariance and rank, `t0` and the flight path, the
     /// pulse's energy span and `n_tau`, the line span, the foil's isotopes and
-    /// effective temperature with their stated uncertainties, the runs, the
-    /// sample run's overdispersion, and the transfer between foils as
-    /// unchecked.
+    /// effective temperature with their stated uncertainties, the foil and run
+    /// identifiers, the sample run's overdispersion, and the transfer to
+    /// another foil: `"unchecked"`, or the other foil and its identifiers, its
+    /// sample run's overdispersion, `d2`, `dof`, `p` and each number one foil
+    /// held on a bound with the other's value and sd.
     pub fn to_json(&self) -> String {
         let covariance = self.prior.as_ref().map_or_else(Vec::new, |prior| {
             let k = prior.numbers.len();
@@ -349,12 +491,12 @@ impl PulseCalibration {
             n_tau: self.n_tau,
             line_span_ev: self.line_span_ev,
             foil: self.foil.clone(),
-            runs: FileRuns {
-                open: self.runs.open.clone(),
-                sample: self.runs.sample.clone(),
-            },
+            provenance: FileProvenance::from(&self.provenance),
             sample_overdispersion: self.sample_overdispersion,
-            transfer: UNCHECKED.into(),
+            transfer: self.transfer.clone().map_or(
+                FileTransfer::Unchecked(Unchecked::Unchecked),
+                FileTransfer::Checked,
+            ),
         };
         serde_json::to_string_pretty(&file).expect("these field types always serialize")
     }
@@ -363,32 +505,35 @@ impl PulseCalibration {
     ///
     /// # Errors
     /// [`PipelineError::InvalidParameter`] if `text` is not such a file: not
-    /// format version 1 of this pulse model with the transfer unchecked, a
-    /// field missing or unknown, the pulse numbers' names or units not in their
-    /// order, the rank not the number of resolved numbers, the line span
-    /// missing while a pulse number was fitted, present when none was, or not
-    /// `low ≤ high` within the energy span, a run identifier empty or both the
-    /// same, the overdispersion below 1, the foil without isotopes, with one
-    /// listed twice, or not as [`Self::new`] takes it, or a value outside its
-    /// quantity's range or one
+    /// format version 1 of this pulse model, a field missing or unknown, the
+    /// pulse numbers' names or units not in their order, the rank not the
+    /// number of resolved numbers, the line span missing while a pulse number
+    /// was fitted, present when none was, or not `low ≤ high` within the
+    /// energy span, a provenance [`Self::new`] refuses, the overdispersion
+    /// below 1, the foil without isotopes, with one listed twice, or not as
+    /// [`Self::new`] takes it, a value outside its quantity's range or one
     /// [`DetectorPulse::new`](nereids_physics::ikeda_carpenter::DetectorPulse::new)
-    /// refuses; [`PipelineError::Fitting`] if [`Prior::correlated`] refuses
-    /// the covariance.
+    /// refuses, or a recorded transfer [`Self::record_transfer`] could not
+    /// have written: to this calibration's foil or sharing a run other than
+    /// the open-beam run, with a
+    /// provenance or foil [`Self::new`] refuses, an overdispersion below 1,
+    /// degrees of freedom not the number of pulse numbers both foils resolve,
+    /// `d2` negative, `p` not within a relative 1e-12 of the χ² survival of
+    /// `d2` or 0.01 or less, or a bound named twice, not a pulse number, not
+    /// as this calibration holds or resolves it, or with the other foil's
+    /// number outside its range; [`PipelineError::Fitting`]
+    /// if [`Prior::correlated`] refuses the covariance.
     pub fn from_json(text: &str) -> Result<Self, PipelineError> {
         let invalid = |message: String| Err(PipelineError::InvalidParameter(message));
         let file: File = match serde_json::from_str(text) {
             Ok(file) => file,
             Err(e) => return invalid(format!("not a pulse calibration file: {e}")),
         };
-        if file.format_version != FORMAT_VERSION
-            || file.pulse_model != PULSE_MODEL
-            || file.transfer != UNCHECKED
-        {
+        if file.format_version != FORMAT_VERSION || file.pulse_model != PULSE_MODEL {
             return invalid(format!(
-                "a pulse calibration file of format version {FORMAT_VERSION}, the pulse model \
-                 {PULSE_MODEL:?} and the transfer {UNCHECKED:?} is read; got version {}, the \
-                 model {:?} and the transfer {:?}",
-                file.format_version, file.pulse_model, file.transfer
+                "a pulse calibration file of format version {FORMAT_VERSION} and the pulse model \
+                 {PULSE_MODEL:?} is read; got version {} and the model {:?}",
+                file.format_version, file.pulse_model
             ));
         }
         if file.numbers.len() != NUMBERS.len()
@@ -429,11 +574,8 @@ impl PulseCalibration {
                 file.energy_span_ev, file.line_span_ev
             ));
         }
-        let runs = Runs {
-            open: file.runs.open,
-            sample: file.runs.sample,
-        };
-        check_runs(&runs)?;
+        let provenance = Provenance::from(file.provenance);
+        check_provenance(&provenance)?;
         if file
             .sample_overdispersion
             .is_some_and(|phi| !(phi.is_finite() && phi >= 1.0))
@@ -461,6 +603,13 @@ impl PulseCalibration {
                 covariance,
             })
         };
+        let transfer = match file.transfer {
+            FileTransfer::Unchecked(_) => None,
+            FileTransfer::Checked(record) => {
+                check_record(&record, &provenance, &status, &numbers, prior.as_ref())?;
+                Some(record)
+            }
+        };
         let pulse = Self {
             numbers,
             status,
@@ -471,8 +620,9 @@ impl PulseCalibration {
             n_tau: file.n_tau,
             line_span_ev: file.line_span_ev,
             foil: file.foil,
-            runs,
+            provenance,
             sample_overdispersion: file.sample_overdispersion,
+            transfer,
         };
         let experiment = pulse.calibration();
         experiment.instrument()?;
@@ -481,7 +631,68 @@ impl PulseCalibration {
     }
 }
 
-const UNCHECKED: &str = "unchecked";
+const TRANSFER_P: f64 = 0.01;
+
+/// The transfer of a pulse calibration to another, physically different foil
+/// calibrated alone, from [`PulseCalibration::transfer`].
+#[derive(Debug, Clone, PartialEq)]
+pub struct Transfer {
+    record: TransferRecord,
+}
+
+impl Transfer {
+    /// `d²`, its degrees of freedom and `p`.
+    pub fn agreement(&self) -> Consistency {
+        Consistency {
+            q: self.record.d2,
+            dof: self.record.dof,
+            p: self.record.p,
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(untagged)]
+enum FileTransfer {
+    Unchecked(Unchecked),
+    Checked(TransferRecord),
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+enum Unchecked {
+    Unchecked,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+enum Holder {
+    This,
+    Other,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct BoundNumber {
+    name: String,
+    held_by: Holder,
+    bound: f64,
+    value: f64,
+    sd: f64,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct TransferRecord {
+    foil: Foil,
+    provenance: FileProvenance,
+    #[serde(deserialize_with = "Option::deserialize")]
+    sample_overdispersion: Option<f64>,
+    d2: f64,
+    dof: usize,
+    p: f64,
+    bounds: Vec<BoundNumber>,
+}
 
 #[derive(Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -498,10 +709,10 @@ struct File {
     #[serde(deserialize_with = "Option::deserialize")]
     line_span_ev: Option<(f64, f64)>,
     foil: Foil,
-    runs: FileRuns,
+    provenance: FileProvenance,
     #[serde(deserialize_with = "Option::deserialize")]
     sample_overdispersion: Option<f64>,
-    transfer: String,
+    transfer: FileTransfer,
 }
 
 #[derive(Serialize, Deserialize)]
@@ -513,18 +724,107 @@ struct Number {
     status: Status,
 }
 
-#[derive(Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
-struct FileRuns {
+struct FileProvenance {
+    foil: String,
     open: String,
     sample: String,
 }
 
-fn check_runs(runs: &Runs) -> Result<(), PipelineError> {
-    if runs.open.is_empty() || runs.sample.is_empty() || runs.open == runs.sample {
+impl From<&Provenance> for FileProvenance {
+    fn from(provenance: &Provenance) -> Self {
+        Self {
+            foil: provenance.foil.clone(),
+            open: provenance.open.clone(),
+            sample: provenance.sample.clone(),
+        }
+    }
+}
+
+impl From<FileProvenance> for Provenance {
+    fn from(file: FileProvenance) -> Self {
+        Self {
+            foil: file.foil,
+            open: file.open,
+            sample: file.sample,
+        }
+    }
+}
+
+fn check_record(
+    record: &TransferRecord,
+    provenance: &Provenance,
+    status: &[Status; 6],
+    numbers: &[f64; 6],
+    prior: Option<&PulsePrior>,
+) -> Result<(), PipelineError> {
+    let other = Provenance::from(record.provenance.clone());
+    check_provenance(&other)?;
+    check_foil(&record.foil)?;
+    let rank = prior.map_or(0, |prior| prior.numbers.len());
+    let held_there = record
+        .bounds
+        .iter()
+        .filter(|bound| bound.held_by == Holder::Other)
+        .count();
+    let statistic = rank.checked_sub(held_there) == Some(record.dof)
+        && Consistency::new(record.d2, record.dof)
+            .is_ok_and(|test| (record.p / test.p - 1.0).abs() <= 1e-12)
+        && record.p > TRANSFER_P;
+    let sd = |n: usize| {
+        prior.and_then(|prior| {
+            let k = prior.numbers.iter().position(|&m| m == n)?;
+            Some(prior.covariance.get(k, k).sqrt())
+        })
+    };
+    let mut named = Vec::with_capacity(record.bounds.len());
+    let bounds = record.bounds.iter().all(|bound| {
+        let Some(n) = NUMBERS.iter().position(|&(name, _)| name == bound.name) else {
+            return false;
+        };
+        let once = !named.contains(&n);
+        named.push(n);
+        let range = &PULSE_RANGES[n].0;
+        let in_range = range.contains(&bound.bound) && range.contains(&bound.value);
+        let as_here = match bound.held_by {
+            Holder::This => {
+                status[n] == Status::OnBound && bound.bound == numbers[n] && bound.sd > 0.0
+            }
+            Holder::Other => bound.value == numbers[n] && Some(bound.sd) == sd(n),
+        };
+        once && in_range && as_here
+    });
+    if !separate(provenance, &other)
+        || record
+            .sample_overdispersion
+            .is_some_and(|phi| !(phi.is_finite() && phi >= 1.0))
+        || !statistic
+        || !bounds
+    {
         return Err(PipelineError::InvalidParameter(format!(
-            "a calibration's open-beam and sample runs have different, non-empty identifiers; \
-             got {runs:?}"
+            "a recorded transfer is to another foil sharing no run but the open-beam run, on as \
+             many degrees of freedom as numbers both foils resolve, with d² of 0 or more, p its \
+             χ² survival and above {TRANSFER_P}, and each bound once as this calibration holds \
+             or resolves it; got {record:?}"
+        )));
+    }
+    Ok(())
+}
+
+fn separate(a: &Provenance, b: &Provenance) -> bool {
+    a.foil != b.foil && a.sample != b.sample && a.sample != b.open && a.open != b.sample
+}
+
+fn check_provenance(provenance: &Provenance) -> Result<(), PipelineError> {
+    if provenance.foil.is_empty()
+        || provenance.open.is_empty()
+        || provenance.sample.is_empty()
+        || provenance.open == provenance.sample
+    {
+        return Err(PipelineError::InvalidParameter(format!(
+            "a calibration names its foil and its open-beam and sample runs, the two runs \
+             different; got {provenance:?}"
         )));
     }
     Ok(())
@@ -621,6 +921,8 @@ mod tests {
     use super::*;
     use crate::beam::BeamSpline;
 
+    type Edit = (&'static str, fn(&mut serde_json::Value));
+
     fn measurement(absent: Option<f64>) -> Measurement {
         let lines = [(10.0, 0.05, 0.06), (25.0, 0.005, 0.06), (50.0, 0.01, 0.06)];
         let foil = (
@@ -655,10 +957,11 @@ mod tests {
         }
     }
 
-    fn runs() -> Runs {
-        Runs {
+    fn provenance() -> Provenance {
+        Provenance {
+            foil: "foil-a".into(),
             open: "open-1".into(),
-            sample: "foil-1".into(),
+            sample: "sample-1".into(),
         }
     }
 
@@ -667,7 +970,7 @@ mod tests {
         c: &Calibration,
         fit: CountsFit,
     ) -> Result<PulseCalibration, PipelineError> {
-        PulseCalibration::from_fit(m, c, foil(m)?, runs(), &fit)
+        PulseCalibration::from_fit(m, c, foil(m)?, provenance(), &fit)
     }
 
     fn calibration(beta1: Value) -> Calibration {
@@ -905,7 +1208,6 @@ mod tests {
     #[test]
     fn files_that_are_not_such_a_calibration_are_refused() {
         let original: serde_json::Value = serde_json::from_str(&file()).unwrap();
-        type Edit = (&'static str, fn(&mut serde_json::Value));
         let edits: [Edit; 20] = [
             ("version", |v| v["format_version"] = 2.into()),
             ("model", |v| v["pulse_model"] = "Gaussian".into()),
@@ -923,7 +1225,7 @@ mod tests {
             ("span reversed", |v| {
                 v["line_span_ev"] = serde_json::json!([50.0, 10.0])
             }),
-            ("runs", |v| v["runs"]["sample"] = "open-1".into()),
+            ("runs", |v| v["provenance"]["sample"] = "open-1".into()),
             ("overdispersion", |v| {
                 v["sample_overdispersion"] = 0.5.into()
             }),
@@ -973,25 +1275,38 @@ mod tests {
         let mut warm = measurement(None);
         warm.temperature_k = Value::Fitted(300.0);
         for m in [fitted, warm] {
-            match PulseCalibration::new(&m, &c, runs()) {
+            match PulseCalibration::new(&m, &c, provenance()) {
                 Err(PipelineError::InvalidParameter(message)) => {
                     assert!(message.contains("is measured"), "{message}")
                 }
                 other => panic!("{other:?}"),
             }
         }
-        let same = Runs {
-            open: "foil-1".into(),
-            sample: "foil-1".into(),
+        let same = Provenance {
+            open: "sample-1".into(),
+            ..provenance()
         };
-        match PulseCalibration::new(&measurement(None), &c, same) {
-            Err(PipelineError::InvalidParameter(message)) => {
-                assert!(
-                    message.contains("different, non-empty identifiers"),
-                    "{message}"
-                )
+        let unnamed = Provenance {
+            foil: String::new(),
+            ..provenance()
+        };
+        let mut measured = c.clone();
+        measured.pulse.r = Value::Measured {
+            value: 0.2,
+            sd: 0.01,
+        };
+        for (c, provenance, refusal) in [
+            (&c, same, "names its foil"),
+            (&c, unnamed, "names its foil"),
+            (&original().calibration(), provenance(), "calibrated alone"),
+            (&measured, provenance(), "calibrated alone"),
+        ] {
+            match PulseCalibration::new(&measurement(None), c, provenance) {
+                Err(PipelineError::InvalidParameter(message)) => {
+                    assert!(message.contains(refusal), "{message}")
+                }
+                other => panic!("{other:?}"),
             }
-            other => panic!("{other:?}"),
         }
     }
 
@@ -1093,9 +1408,10 @@ mod tests {
       "sd": 10.0
     }
   },
-  "runs": {
+  "provenance": {
+    "foil": "foil-a",
     "open": "open-1",
-    "sample": "foil-1"
+    "sample": "sample-1"
   },
   "sample_overdispersion": 1.5,
   "transfer": "unchecked"
@@ -1107,5 +1423,236 @@ mod tests {
         assert_eq!(original.to_json(), VERSION_1);
         let read = PulseCalibration::from_json(VERSION_1).unwrap();
         assert_eq!(format!("{read:?}"), format!("{original:?}"));
+    }
+
+    fn other_foil(density: f64) -> Measurement {
+        let mut m = measurement(None);
+        m.isotopes[0].1 = Value::Measured {
+            value: density,
+            sd: 0.01 * density,
+        };
+        m
+    }
+
+    fn other_provenance() -> Provenance {
+        Provenance {
+            foil: "foil-b".into(),
+            open: "open-2".into(),
+            sample: "sample-2".into(),
+        }
+    }
+
+    fn other(alpha1: f64, alpha0: f64, bounded: &[usize]) -> PulseCalibration {
+        let m = other_foil(3e-3);
+        let mut fit = CountsFit {
+            alpha: [alpha0, alpha1],
+            beta: [0.004, 0.01],
+            r: 0.205,
+            fwhm_squared_us2: 0.11,
+            ..fit(8, bounded)
+        };
+        let covariance = fit.covariance.as_mut().expect("covariance");
+        for (i, j, c) in [(4, 5, 0.02), (5, 6, 0.015)] {
+            *covariance.get_mut(i, j) = c;
+            *covariance.get_mut(j, i) = c;
+        }
+        let c = calibration(Value::Known(0.01));
+        PulseCalibration::from_fit(&m, &c, foil(&m).unwrap(), other_provenance(), &fit).unwrap()
+    }
+
+    fn inverse3(m: [[f64; 3]; 3]) -> [[f64; 3]; 3] {
+        let cofactor = |i: usize, j: usize| {
+            let (r, c) = ([(i + 1) % 3, (i + 2) % 3], [(j + 1) % 3, (j + 2) % 3]);
+            m[r[0]][c[0]] * m[r[1]][c[1]] - m[r[0]][c[1]] * m[r[1]][c[0]]
+        };
+        let determinant: f64 = (0..3).map(|j| m[0][j] * cofactor(0, j)).sum();
+        std::array::from_fn(|i| std::array::from_fn(|j| cofactor(j, i) / determinant))
+    }
+
+    #[test]
+    fn a_transfer_compares_the_numbers_both_foils_resolve_given_the_bounds_either_holds() {
+        let a = original();
+        let b = other(1.15, 0.5, &[]);
+        let transfer = a.transfer(&b).unwrap();
+        let (beta0, b_beta0, var_beta0) = (0.0, 0.004, 0.06);
+        let cross = [0.02, 0.015, 0.0];
+        let mean_b = [1.15, 0.205, 0.11];
+        let mean_a = [1.1, 0.012_537_345_881_063_615, 0.12];
+        let c_a = [
+            [0.05, 0.01, -0.005],
+            [0.01, 0.07, 0.02],
+            [-0.005, 0.02, 0.08],
+        ];
+        let c_b = c_a;
+        let conditioned: [f64; 3] =
+            std::array::from_fn(|i| mean_b[i] + cross[i] * (beta0 - b_beta0) / var_beta0);
+        let sum: [[f64; 3]; 3] = std::array::from_fn(|i| {
+            std::array::from_fn(|j| c_a[i][j] + c_b[i][j] - cross[i] * cross[j] / var_beta0)
+        });
+        let weight = inverse3(sum);
+        let d: [f64; 3] = std::array::from_fn(|i| mean_a[i] - conditioned[i]);
+        let q: f64 = (0..3)
+            .flat_map(|i| (0..3).map(move |j| (i, j)))
+            .map(|(i, j)| d[i] * weight[i][j] * d[j])
+            .sum();
+        let result = transfer.agreement();
+        assert_eq!(result.dof, 3);
+        assert!((result.q / q - 1.0).abs() <= 1e-12, "{} vs {q}", result.q);
+        assert_eq!(result, Consistency::new(result.q, 3).unwrap());
+        let bound = |held_by| BoundNumber {
+            name: "beta0".into(),
+            held_by,
+            bound: 0.0,
+            value: 0.004,
+            sd: var_beta0.sqrt(),
+        };
+        assert_eq!(transfer.record.bounds, [bound(Holder::This)]);
+        let mirror = b.transfer(&a).unwrap();
+        assert!((mirror.agreement().q / q - 1.0).abs() <= 1e-12);
+        assert_eq!(mirror.record.bounds, [bound(Holder::Other)]);
+    }
+
+    #[test]
+    fn a_transfer_needs_another_foil_with_the_same_pulse_model() {
+        let a = original();
+        let mut same_foil = other(1.15, 0.5, &[]);
+        same_foil.provenance.foil = "foil-a".into();
+        let mut shared = other(1.15, 0.5, &[]);
+        shared.provenance.sample = "sample-1".into();
+        let mut open_as_sample = other(1.15, 0.5, &[]);
+        open_as_sample.provenance.sample = "open-1".into();
+        let mut sample_as_open = other(1.15, 0.5, &[]);
+        sample_as_open.provenance.open = "sample-1".into();
+        let mut disjoint = other(1.15, 0.5, &[4, 5, 6, 7]);
+        disjoint.numbers[2] = 0.0;
+        for (b, refusal) in [
+            (same_foil, "physically different foil"),
+            (shared, "physically different foil"),
+            (open_as_sample, "physically different foil"),
+            (sample_as_open, "physically different foil"),
+            (other(1.15, 0.6, &[]), "different pulse models"),
+            (disjoint, "resolve no pulse number in common"),
+        ] {
+            match a.transfer(&b) {
+                Err(PipelineError::InvalidParameter(message)) => {
+                    assert!(message.contains(refusal), "{message}")
+                }
+                other => panic!("{other:?}"),
+            }
+        }
+    }
+
+    #[test]
+    fn only_a_transfer_that_passes_is_recorded_and_read_back() {
+        let failing = other(3.0, 0.5, &[]);
+        assert!(original().transfer(&failing).unwrap().agreement().p <= 0.01);
+        match original().record_transfer(&failing) {
+            Err(PipelineError::InvalidParameter(message)) => {
+                assert!(message.contains("does not transfer"), "{message}")
+            }
+            other => panic!("{other:?}"),
+        }
+
+        let b = other(1.15, 0.5, &[]);
+        let a = original().record_transfer(&b).unwrap();
+        assert_eq!(a.transfer, Some(original().transfer(&b).unwrap().record));
+        let b = b.record_transfer(&original()).unwrap();
+        let held_here: [Edit; 4] = [
+            ("held by the other", |v| {
+                v["transfer"]["bounds"][0]["held_by"] = "other".into();
+            }),
+            ("not this bound", |v| {
+                v["transfer"]["bounds"][0]["bound"] = 0.001.into();
+            }),
+            ("sd not positive", |v| {
+                v["transfer"]["bounds"][0]["sd"] = 0.0.into();
+            }),
+            ("other value out of range", |v| {
+                v["transfer"]["bounds"][0]["value"] = (-0.004).into();
+            }),
+        ];
+        let held_there: [Edit; 4] = [
+            ("held by this", |v| {
+                let bound = &mut v["transfer"]["bounds"][0];
+                bound["held_by"] = "this".into();
+                bound["bound"] = bound["value"].clone();
+                let d2 = v["transfer"]["d2"].as_f64().unwrap();
+                v["transfer"]["dof"] = 4.into();
+                v["transfer"]["p"] = Consistency::new(d2, 4).unwrap().p.into();
+            }),
+            ("not this value", |v| {
+                v["transfer"]["bounds"][0]["value"] = 0.005.into();
+            }),
+            ("not this sd", |v| {
+                v["transfer"]["bounds"][0]["sd"] = 0.2.into();
+            }),
+            ("other bound out of range", |v| {
+                v["transfer"]["bounds"][0]["bound"] = (-1.0).into();
+            }),
+        ];
+        for (c, held) in [(a, &held_here[..]), (b, &held_there[..])] {
+            refuses_edited_records(&c, held);
+        }
+    }
+
+    fn refuses_edited_records(c: &PulseCalibration, held: &[Edit]) {
+        let text = c.to_json();
+        let read = PulseCalibration::from_json(&text).unwrap();
+        assert_eq!(format!("{read:?}"), format!("{c:?}"));
+        assert_eq!(read.to_json(), text);
+
+        let original: serde_json::Value = serde_json::from_str(&text).unwrap();
+        let mut rounded = original.clone();
+        let p = rounded["transfer"]["p"].as_f64().unwrap();
+        rounded["transfer"]["p"] = (p * (1.0 + 1e-13)).into();
+        assert!(PulseCalibration::from_json(&rounded.to_string()).is_ok());
+        let edits: [Edit; 12] = [
+            ("p not its d2's", |v| v["transfer"]["p"] = 0.5.into()),
+            ("failed", |v| {
+                v["transfer"]["d2"] = 50.0.into();
+                v["transfer"]["p"] = Consistency::new(50.0, 3).unwrap().p.into();
+            }),
+            ("dof not the numbers both resolve", |v| {
+                let d2 = v["transfer"]["d2"].as_f64().unwrap();
+                v["transfer"]["dof"] = 4.into();
+                v["transfer"]["p"] = Consistency::new(d2, 4).unwrap().p.into();
+            }),
+            ("same foil", |v| {
+                v["transfer"]["provenance"]["foil"] = v["provenance"]["foil"].clone();
+            }),
+            ("same sample run", |v| {
+                v["transfer"]["provenance"]["sample"] = v["provenance"]["sample"].clone();
+            }),
+            ("this open run as the other's sample", |v| {
+                v["transfer"]["provenance"]["sample"] = v["provenance"]["open"].clone();
+            }),
+            ("this sample run as the other's open", |v| {
+                v["transfer"]["provenance"]["open"] = v["provenance"]["sample"].clone();
+            }),
+            ("bound name", |v| {
+                v["transfer"]["bounds"][0]["name"] = "gamma".into();
+            }),
+            ("bound twice", |v| {
+                let bound = v["transfer"]["bounds"][0].clone();
+                v["transfer"]["bounds"].as_array_mut().unwrap().push(bound);
+            }),
+            ("other overdispersion", |v| {
+                v["transfer"]["sample_overdispersion"] = 0.5.into();
+            }),
+            ("other runs the same", |v| {
+                v["transfer"]["provenance"]["open"] = v["transfer"]["provenance"]["sample"].clone();
+            }),
+            ("other foil", |v| {
+                v["transfer"]["foil"]["isotopes"] = serde_json::json!([]);
+            }),
+        ];
+        for (what, edit) in edits.iter().chain(held) {
+            let mut value = original.clone();
+            edit(&mut value);
+            assert!(
+                PulseCalibration::from_json(&value.to_string()).is_err(),
+                "{what}"
+            );
+        }
     }
 }
