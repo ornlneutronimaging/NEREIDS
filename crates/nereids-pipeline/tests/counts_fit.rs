@@ -1848,8 +1848,14 @@ fn the_pulse_is_calibrated_on_one_foil() {
 
 const EXPERIMENT_K: f64 = 1500.0;
 
+fn experiment_foil(pulse: &[f64], t0_us: f64, flight_path_m: f64) -> Setup {
+    let mut setup = calibration_foil(pulse, t0_us, flight_path_m);
+    setup.edges.retain(|&t| t <= 400.0);
+    setup
+}
+
 fn experiment_setup(pulse: &[f64]) -> Setup {
-    calibration_foil(pulse, T0_US + 0.03, FLIGHT_PATH_M + 0.002)
+    experiment_foil(pulse, T0_US + 0.03, FLIGHT_PATH_M + 0.002)
 }
 
 fn experiment_counts(pulse: &[f64]) -> (Vec<f64>, Vec<f64>) {
@@ -1869,7 +1875,7 @@ fn experiment_with(
     let sample = calibration_sample(CALIBRATION_DENSITY);
     let m = fitted_from(
         measurement(&experiment_setup(pulse), counts, &sample),
-        1200.0,
+        EXPERIMENT_K,
     );
     fit_counts(&m, calibration).expect("fit")
 }
@@ -1884,29 +1890,13 @@ fn experiment(pulse: &[f64]) -> CountsFit {
 }
 
 #[test]
-fn an_experiment_fits_the_calibrated_pulse_and_tests_it() {
+fn an_experiment_made_with_another_pulse_rejects_the_calibration() {
     let mut shifted = CALIBRATION_PULSE;
-    shifted[4] += 0.02;
-    let (same, other) = rayon::join(|| experiment(&CALIBRATION_PULSE), || experiment(&shifted));
-    assert!(same.converged && other.converged);
-    let truth = [
-        CALIBRATION_DENSITY,
-        EXPERIMENT_K,
-        T0_US + 0.03,
-        FLIGHT_PATH_M + 0.002,
-    ];
-    let estimates = [
-        same.densities[0],
-        same.temperature_k,
-        same.t0_us,
-        same.flight_path_m,
-    ];
-    for (i, (estimate, truth)) in estimates.iter().zip(truth).enumerate() {
-        let pull = (estimate - truth) / error_bar(&same, i);
-        assert!(pull.abs() <= BOUND.sqrt(), "{i}: {pull}");
-    }
-    let p = |fit: &CountsFit| fit.pulse_consistency.expect("consistency").p;
-    assert!(p(&same) > 0.01 && p(&other) < 0.01, "{same:?} {other:?}");
+    shifted[4] += 0.01;
+    let fit = experiment(&shifted);
+    assert!(fit.converged);
+    let consistency = fit.pulse_consistency.expect("consistency");
+    assert!(consistency.p < 0.01, "{consistency:?}");
 }
 
 #[test]
@@ -2167,6 +2157,8 @@ mod pulse_calibration {
         }
     }
 
+    const CHI_SQUARED_5_AT_0_05: f64 = 11.070_497_693_516_351;
+
     fn calibrated_numbers(fit: &CountsFit) -> [f64; 4] {
         [fit.alpha[0], fit.alpha[1], fit.beta[0], fit.r]
     }
@@ -2206,7 +2198,7 @@ mod pulse_calibration {
                 beta0,
                 r,
             ] = quantities.try_into().expect("eight quantities");
-            let at = calibration_foil(&[a0, a1, beta0, 0.0, r, 0.0], t0_us, flight_path_m);
+            let at = experiment_foil(&[a0, a1, beta0, 0.0, r, 0.0], t0_us, flight_path_m);
             let (open, sample) = expected_at(
                 &at,
                 &fitted_beam(fit, beam_origin_us, t0_us, coefficient),
@@ -2291,7 +2283,7 @@ mod pulse_calibration {
             &calibration_sample(CALIBRATION_DENSITY),
         );
         let counts = experiment_counts(&p);
-        let fits: Vec<CountsFit> = (0..400_u64)
+        let fits: Vec<(CountsFit, [Option<f64>; 2])> = (0..400_u64)
             .into_par_iter()
             .filter_map(|seed| {
                 let m =
@@ -2314,7 +2306,11 @@ mod pulse_calibration {
                 .all(|number| matches!(number, Value::Fitted(_)))
                 .then_some(())?;
                 let drawn = draws(&counts, 90_000 + seed, [1.0; 2]);
-                Some(experiment_with(&p, drawn, &experiment)).filter(|fit| fit.converged)
+                Some((
+                    experiment_with(&p, drawn, &experiment),
+                    calibrated.overdispersion,
+                ))
+                .filter(|(fit, _)| fit.converged)
             })
             .collect();
         assert!(fits.len() >= 398, "{} converged", fits.len());
@@ -2329,7 +2325,7 @@ mod pulse_calibration {
         for (i, truth) in truth {
             let pulls: Vec<f64> = fits
                 .iter()
-                .map(|fit| {
+                .map(|(fit, _)| {
                     let estimate = [
                         fit.densities[0],
                         fit.temperature_k,
@@ -2352,18 +2348,31 @@ mod pulse_calibration {
                 "{i}: mean {mean}, sd {sd}, within one sd {covered}"
             );
         }
-        let tests: Vec<_> = fits
+        let weighted: Vec<f64> = fits
             .iter()
-            .map(|fit| fit.pulse_consistency.expect("consistency"))
+            .map(|(fit, calibration)| {
+                let consistency = fit.pulse_consistency.expect("consistency");
+                assert_eq!(consistency.dof, 5);
+                let weights: Vec<f64> = fit
+                    .overdispersion
+                    .iter()
+                    .chain(calibration)
+                    .map(|phi| phi.unwrap_or(1.0))
+                    .collect();
+                consistency.q * weights.iter().sum::<f64>() / weights.len() as f64
+            })
             .collect();
-        let n = tests.len() as f64;
-        let dof = tests.iter().map(|t| t.dof as f64).sum::<f64>() / n;
-        let q = tests.iter().map(|t| t.q).sum::<f64>() / n;
-        let rejected = tests.iter().filter(|t| t.p < 0.05).count() as f64 / n;
+        let n = weighted.len() as f64;
+        let q = weighted.iter().sum::<f64>() / n;
+        let rejected = weighted
+            .iter()
+            .filter(|&&q| q > CHI_SQUARED_5_AT_0_05)
+            .count() as f64
+            / n;
         assert!(
-            (q - dof).abs() <= 3.0 * (2.0 * dof / n).sqrt()
+            (q - 5.0).abs() <= 3.0 * (10.0 / n).sqrt()
                 && (rejected - 0.05).abs() <= 3.0 * (0.05 * 0.95 / n).sqrt(),
-            "mean q {q} on {dof} degrees of freedom, {rejected} rejected at 0.05"
+            "mean q {q} on 5 degrees of freedom, {rejected} rejected at 0.05"
         );
     }
 }
