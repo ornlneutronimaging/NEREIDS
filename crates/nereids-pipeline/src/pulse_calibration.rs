@@ -12,22 +12,15 @@ use crate::error::PipelineError;
 use crate::open_beam::{Calibration, PULSE_NUMBERS, Pulse};
 
 /// The pulse numbers a calibration resolved, as indices into
-/// `(α₀, α₁, β₀, β₁, R, h²)`, with their fitted values and covariance, and
-/// the energies in eV of the lowest and highest resonance in the calibration
-/// foil's window of its isotopes with a positive density.  A window holds the
-/// resonances between the energies of its last and first time edges, for the
-/// span and for an experiment's check against it; a resonance outside them,
-/// whose neutrons reach the window only through the pulse's delay, is in
-/// neither.
+/// `(α₀, α₁, β₀, β₁, R, h²)`, with their fitted values and covariance.
 #[derive(Debug, Clone)]
 pub struct PulsePrior {
     pub(crate) numbers: Vec<usize>,
     pub(crate) mean: Vec<f64>,
     pub(crate) covariance: FlatMatrix,
-    pub(crate) line_span_ev: (f64, f64),
 }
 
-impl PulsePrior {
+impl Pulse {
     pub(crate) fn uncalibrated_line(
         &self,
         isotopes: &[(ResonanceData, Value)],
@@ -35,11 +28,11 @@ impl PulsePrior {
         t0_us: f64,
         flight_path_m: f64,
     ) -> Option<f64> {
+        let (low, high) = self.line_span_ev?;
         let present = isotopes
             .iter()
             .filter(|(_, density)| *density != Value::Known(0.0))
             .map(|(isotope, _)| isotope);
-        let (low, high) = self.line_span_ev;
         lines_in_window(present, time_edges_us, t0_us, flight_path_m)
             .into_iter()
             .find(|e| !(low..=high).contains(e))
@@ -52,15 +45,18 @@ impl PulsePrior {
 /// bound, where it is held at its fitted value; a number known in the
 /// calibration stays known.  The resolved numbers keep the fit's covariance of
 /// them, which is conditional on every quantity that ended on a bound being
-/// held there.  When the calibration holds a number on its bound, or resolves
-/// one near it, an experiment's error bars on `t0`, the flight path and the
-/// pulse numbers are not standard errors; those on the densities and the
-/// temperature are.
+/// held there.  When the calibration fitted a pulse number, resolved or held,
+/// an experiment's pulse carries the foil's
+/// [`line_span_ev`](Pulse::line_span_ev).  When the calibration holds a
+/// number on its bound, or resolves one near it, an experiment's error bars
+/// on `t0`, the flight path and the pulse numbers are not standard errors;
+/// those on the densities and the temperature are.
 #[derive(Debug, Clone)]
 pub struct PulseCalibration {
     fit: CountsFit,
     energy_span_ev: (f64, f64),
     n_tau: usize,
+    line_span_ev: Option<(f64, f64)>,
     prior: Option<PulsePrior>,
 }
 
@@ -72,11 +68,12 @@ impl PulseCalibration {
     /// Everything [`fit_counts`] refuses; [`PipelineError::InvalidParameter`]
     /// if the fit did not converge, a pulse number it fitted ended off its
     /// bounds without a finite positive variance, as when the counts do not
-    /// determine it or a fitted temperature ended at 1 K or 5000 K, or some
-    /// pulse number is resolved and no isotope of the foil fitted or known to
-    /// a positive density has a resonance between the energies of its last and
-    /// first time edges at the fitted `t0` and flight path; [`PipelineError::Fitting`] if the resolved numbers'
-    /// covariance is refused by [`Prior::correlated`].
+    /// determine it or a fitted temperature ended at 1 K or 5000 K, or the fit
+    /// fitted a pulse number and no isotope of the foil fitted or known to a
+    /// positive density has a resonance between the energies of its last and
+    /// first time edges at the fitted `t0` and flight path;
+    /// [`PipelineError::Fitting`] if the resolved numbers' covariance is
+    /// refused by [`Prior::correlated`].
     pub fn new(
         measurement: &Measurement,
         calibration: &Calibration,
@@ -127,9 +124,7 @@ impl PulseCalibration {
             fit.r,
             fit.fwhm_squared_us2,
         ];
-        let prior = if resolved.is_empty() {
-            None
-        } else {
+        let line_span_ev = if fitted[first_number..].contains(&true) {
             let present = measurement
                 .isotopes
                 .iter()
@@ -149,11 +144,19 @@ impl PulseCalibration {
                         .into(),
                 );
             }
-            let line_span_ev = lines
-                .iter()
-                .fold((f64::INFINITY, f64::NEG_INFINITY), |(low, high), &e| {
-                    (low.min(e), high.max(e))
-                });
+            Some(
+                lines
+                    .iter()
+                    .fold((f64::INFINITY, f64::NEG_INFINITY), |(low, high), &e| {
+                        (low.min(e), high.max(e))
+                    }),
+            )
+        } else {
+            None
+        };
+        let prior = if resolved.is_empty() {
+            None
+        } else {
             let n = resolved.len();
             let mut block = FlatMatrix::zeros(n, n);
             for (a, &(_, i)) in resolved.iter().enumerate() {
@@ -168,13 +171,13 @@ impl PulseCalibration {
                 numbers: covered,
                 mean,
                 covariance: block,
-                line_span_ev,
             })
         };
         Ok(Self {
             fit,
             energy_span_ev: calibration.pulse.energy_span_ev,
             n_tau: calibration.pulse.n_tau,
+            line_span_ev,
             prior,
         })
     }
@@ -213,6 +216,7 @@ impl PulseCalibration {
                 fwhm_squared_us2: value(5),
                 energy_span_ev: self.energy_span_ev,
                 n_tau: self.n_tau,
+                line_span_ev: self.line_span_ev,
                 prior: self.prior.clone(),
             },
         }
@@ -279,23 +283,27 @@ mod tests {
                 fwhm_squared_us2: Value::Fitted(0.1),
                 energy_span_ev: (1.0, 200.0),
                 n_tau: 256,
+                line_span_ev: None,
                 prior: None,
             },
         }
     }
 
-    fn fit(free: usize, bounded: usize) -> CountsFit {
+    fn fit(free: usize, bounded: &[usize]) -> CountsFit {
         let mut covariance = FlatMatrix::zeros(free, free);
         for i in 0..free {
             *covariance.get_mut(i, i) = 0.01 * (i + 1) as f64;
         }
         let (r, h) = (free - 2, free - 1);
-        for (i, j, c) in [(4, r, 0.01), (4, h, -0.005), (r, h, 0.02), (2, 4, 0.003)] {
+        let pairs = [(4, r, 0.01), (4, h, -0.005), (r, h, 0.02), (2, 4, 0.003)];
+        for (i, j, c) in pairs.into_iter().filter(|&(i, j, _)| i.max(j) < free) {
             *covariance.get_mut(i, j) = c;
             *covariance.get_mut(j, i) = c;
         }
         let mut on_bound = vec![false; free];
-        on_bound[bounded] = true;
+        for &i in bounded {
+            on_bound[i] = true;
+        }
         CountsFit {
             densities: vec![2e-3],
             temperature_k: 300.0,
@@ -327,7 +335,7 @@ mod tests {
         let (m, c) = (measurement(Some(55.0)), calibration(Value::Known(0.01)));
         let with_impurity = CountsFit {
             densities: vec![2e-3, 0.0],
-            ..fit(8, 5)
+            ..fit(8, &[5])
         };
         let calibrated = PulseCalibration::from_fit(&m, &c, with_impurity)
             .unwrap()
@@ -346,16 +354,16 @@ mod tests {
         let prior = pulse.prior.as_ref().expect("prior");
         assert_eq!(prior.numbers, [1, 4, 5]);
         assert_eq!(prior.mean, [1.1, 0.21, 0.12]);
-        let covariance = fit(8, 5).covariance.expect("covariance");
+        let covariance = fit(8, &[5]).covariance.expect("covariance");
         for (a, i) in [4, 6, 7].into_iter().enumerate() {
             for (b, j) in [4, 6, 7].into_iter().enumerate() {
                 assert_eq!(prior.covariance.get(a, b), covariance.get(i, j));
             }
         }
-        assert_eq!(prior.line_span_ev, (10.0, 50.0));
+        assert_eq!(pulse.line_span_ev, Some((10.0, 50.0)));
 
-        let mut undetermined = fit(9, 5);
-        let mut withheld = fit(8, 5);
+        let mut undetermined = fit(9, &[5]);
+        let mut withheld = fit(8, &[5]);
         let covariance = undetermined.covariance.as_mut().expect("covariance");
         for i in 0..9 {
             *covariance.get_mut(6, i) = f64::NAN;
@@ -374,14 +382,14 @@ mod tests {
                 Value::Known(0.01),
                 CountsFit {
                     converged: false,
-                    ..fit(8, 5)
+                    ..fit(8, &[5])
                 },
             ),
             (
                 Value::Known(0.01),
                 CountsFit {
                     covariance: None,
-                    ..fit(8, 5)
+                    ..fit(8, &[5])
                 },
             ),
         ] {
@@ -395,10 +403,10 @@ mod tests {
         let mut beyond = measurement(None);
         beyond.isotopes[0].0 = synthetic_isotope(73, 181, 100.0, 0.05, 0.06);
         assert!(matches!(
-            PulseCalibration::from_fit(&beyond, &c, fit(8, 5)),
+            PulseCalibration::from_fit(&beyond, &c, fit(8, &[5])),
             Err(PipelineError::InvalidParameter(_))
         ));
-        let mut singular = fit(8, 5);
+        let mut singular = fit(8, &[5]);
         let covariance = singular.covariance.as_mut().expect("covariance");
         let (a, b) = (covariance.get(4, 4), covariance.get(6, 6));
         *covariance.get_mut(4, 6) = (a * b).sqrt();
@@ -411,17 +419,48 @@ mod tests {
 
     #[test]
     fn only_isotopes_that_may_be_present_must_lie_within_the_calibrated_lines() {
-        let prior = PulsePrior {
-            numbers: vec![1],
-            mean: vec![1.0],
-            covariance: FlatMatrix::zeros(1, 1),
-            line_span_ev: (10.0, 50.0),
+        let pulse = Pulse {
+            line_span_ev: Some((10.0, 50.0)),
+            ..calibration(Value::Known(0.01)).pulse
         };
         let mut m = measurement(Some(55.0));
         let line =
-            |m: &Measurement| prior.uncalibrated_line(&m.isotopes, &m.time_edges_us, 3.0, 25.0);
+            |m: &Measurement| pulse.uncalibrated_line(&m.isotopes, &m.time_edges_us, 3.0, 25.0);
         assert_eq!(line(&m), None);
         m.isotopes[1].1 = Value::Fitted(1e-4);
         assert_eq!(line(&m), Some(55.0));
+    }
+
+    #[test]
+    fn a_calibration_with_every_fitted_number_on_a_bound_still_bounds_the_lines() {
+        let c = calibration(Value::Known(0.01));
+        let on_bounds = CountsFit {
+            beta: [0.08, 0.01],
+            ..fit(8, &[4, 5, 6, 7])
+        };
+        let held = PulseCalibration::from_fit(&measurement(None), &c, on_bounds)
+            .unwrap()
+            .calibration();
+        assert!(held.pulse.prior.is_none());
+        assert_eq!(held.pulse.line_span_ev, Some((10.0, 50.0)));
+        let mut wider = measurement(Some(55.0));
+        wider.isotopes[1].1 = Value::Fitted(1e-4);
+        match fit_counts(&wider, &held) {
+            Err(PipelineError::InvalidParameter(message)) => {
+                assert!(message.contains("55 eV, outside the"), "{message}")
+            }
+            other => panic!("{other:?}"),
+        }
+
+        let mut known = c;
+        let pulse = &mut known.pulse;
+        pulse.alpha[1] = Value::Known(1.0);
+        pulse.beta[0] = Value::Known(0.08);
+        pulse.r = Value::Known(0.2);
+        pulse.fwhm_squared_us2 = Value::Known(0.1);
+        let unfitted = PulseCalibration::from_fit(&measurement(None), &known, fit(4, &[]))
+            .unwrap()
+            .calibration();
+        assert_eq!(unfitted.pulse.line_span_ev, None);
     }
 }

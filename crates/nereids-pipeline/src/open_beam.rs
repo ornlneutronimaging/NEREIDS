@@ -78,6 +78,14 @@ pub struct Pulse {
     /// Samples across the prompt core that find the pulse's rise, which sets
     /// the grid's first step; at least 8.
     pub n_tau: usize,
+    /// `(low, high)`, the energies in eV of the lowest and highest resonance
+    /// a calibration measured the pulse on.
+    /// [`fit_counts`](crate::counts_fit::fit_counts) refuses a sample with a
+    /// resonance outside them, of an isotope not known to be absent, between
+    /// the energies of its last and first time edges; a resonance outside
+    /// those energies, whose neutrons reach the window only through the
+    /// pulse's delay, is not checked.  `None` checks nothing.
+    pub line_span_ev: Option<(f64, f64)>,
     /// A calibration of some of the numbers, from
     /// [`PulseCalibration::calibration`](crate::pulse_calibration::PulseCalibration::calibration),
     /// that [`fit_counts`](crate::counts_fit::fit_counts) fits them with;

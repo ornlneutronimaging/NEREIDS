@@ -314,7 +314,7 @@ pub struct CountsFit {
 /// is not fitted or is measured, an isotope of the sample not known to be
 /// absent has a resonance between the energies of its last and first time
 /// edges, at the starting `t0` and flight path or a converged fit's, outside the
-/// energies of the calibration foil's resonances, there are no isotopes, an
+/// pulse's [`line_span_ev`](crate::open_beam::Pulse::line_span_ev), there are no isotopes, an
 /// isotope is listed twice, an isotope's resonance data are not finite, or the
 /// energies its
 /// broadened cross section reads on the grid at the starting `t0`, flight path
@@ -450,11 +450,12 @@ pub fn fit_counts(
     let open_live = validate_live("open-beam", open_live.as_deref(), bins)?;
     let sample_live = validate_live("sample", sample_live.as_deref(), bins)?;
     let calibrated_lines = |t0_us: f64, flight_path_m: f64| -> Result<(), PipelineError> {
-        match pulse.prior.as_ref().and_then(|prior| {
-            prior
-                .uncalibrated_line(isotopes, time_edges_us, t0_us, flight_path_m)
-                .map(|line| (prior.line_span_ev, line))
-        }) {
+        match pulse.line_span_ev.zip(pulse.uncalibrated_line(
+            isotopes,
+            time_edges_us,
+            t0_us,
+            flight_path_m,
+        )) {
             Some(((low, high), line)) => Err(PipelineError::InvalidParameter(format!(
                 "the sample has a resonance at {line} eV, outside the {low}–{high} eV of the \
                  resonances the pulse was calibrated on"
