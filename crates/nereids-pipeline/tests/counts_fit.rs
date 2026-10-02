@@ -4,6 +4,7 @@ use std::sync::{Arc, LazyLock};
 
 use nereids_endf::resonance::ResonanceData;
 use nereids_endf::resonance::test_support::{synthetic_isotope, synthetic_isotope_multi};
+use nereids_fitting::lm::FlatMatrix;
 use nereids_physics::continuous_doppler::SUPPORT_X;
 use nereids_physics::doppler::DopplerParams;
 use nereids_physics::flight_time_grid::FlightTimeGrid;
@@ -1847,15 +1848,39 @@ fn the_pulse_is_calibrated_on_one_foil() {
 
 const EXPERIMENT_K: f64 = 1500.0;
 
-fn experiment(pulse: &[f64]) -> CountsFit {
-    let setup = calibration_foil(pulse, T0_US + 0.03, FLIGHT_PATH_M + 0.002);
+fn experiment_setup(pulse: &[f64]) -> Setup {
+    calibration_foil(pulse, T0_US + 0.03, FLIGHT_PATH_M + 0.002)
+}
+
+fn experiment_counts(pulse: &[f64]) -> (Vec<f64>, Vec<f64>) {
+    expected_at(
+        &experiment_setup(pulse),
+        &beam(CALIBRATION_LEVEL),
+        &calibration_sample(CALIBRATION_DENSITY),
+        EXPERIMENT_K,
+    )
+}
+
+fn experiment_with(
+    pulse: &[f64],
+    counts: (Vec<f64>, Vec<f64>),
+    calibration: &Calibration,
+) -> CountsFit {
     let sample = calibration_sample(CALIBRATION_DENSITY);
-    let counts = expected_at(&setup, &beam(CALIBRATION_LEVEL), &sample, EXPERIMENT_K);
     let m = fitted_from(
-        measurement(&setup, (rounded(&counts.0), rounded(&counts.1)), &sample),
+        measurement(&experiment_setup(pulse), counts, &sample),
         1200.0,
     );
-    fit_counts(&m, &ONE_FOIL.1.calibration()).expect("fit")
+    fit_counts(&m, calibration).expect("fit")
+}
+
+fn experiment(pulse: &[f64]) -> CountsFit {
+    let counts = experiment_counts(pulse);
+    experiment_with(
+        pulse,
+        (rounded(&counts.0), rounded(&counts.1)),
+        &ONE_FOIL.1.calibration(),
+    )
 }
 
 #[test]
@@ -1957,7 +1982,7 @@ mod pulse_calibration {
         }
 
         let beam_origin_us = T0_US - 0.05;
-        let counts_at = |quantities: [f64; 10], coefficient: Option<(usize, f64)>| -> Vec<f64> {
+        let counts_at = |quantities: &[f64], coefficient: Option<(usize, f64)>| -> Vec<f64> {
             let [
                 density,
                 temperature_k,
@@ -1969,34 +1994,55 @@ mod pulse_calibration {
                 beta0,
                 r,
                 fwhm_squared,
-            ] = quantities;
+            ] = quantities.try_into().expect("ten quantities");
             let at = calibration_foil(
                 &[a0, a1, beta0, p[3], r, fwhm_squared.sqrt()],
                 t0_us,
                 flight_path_m,
             );
-            let beam = |u: f64| {
-                let x = t0_us + u - beam_origin_us;
-                let slope: f64 = coefficient.map_or(0.0, |(i, step)| {
-                    step * fit
-                        .beam
-                        .basis(x)
-                        .iter()
-                        .filter(|w| w.0 == i)
-                        .map(|w| w.1)
-                        .sum::<f64>()
-                });
-                fit.beam.per_us(x) * slope.exp()
-            };
             let (open, sample) = with_background(
                 &at,
-                &beam,
+                &fitted_beam(&fit, beam_origin_us, t0_us, coefficient),
                 &calibration_sample(density),
                 temperature_k,
                 [1.0, b0, 0.0, 0.0],
             );
             open.into_iter().chain(sample).collect()
         };
+        let coefficients = fit.beam.coefficients().len();
+        let mut information = information(&fit, &fitted, 3, counts_at);
+        information[coefficients][coefficients] += DENSITY_SD.powi(-2);
+        information[coefficients + 1][coefficients + 1] += TEMPERATURE_SD_K.powi(-2);
+        assert_covariance(&fit, &inverse(information));
+    }
+
+    fn fitted_beam(
+        fit: &CountsFit,
+        beam_origin_us: f64,
+        t0_us: f64,
+        coefficient: Option<(usize, f64)>,
+    ) -> impl Fn(f64) -> f64 + '_ {
+        move |u: f64| {
+            let x = t0_us + u - beam_origin_us;
+            let slope: f64 = coefficient.map_or(0.0, |(i, step)| {
+                step * fit
+                    .beam
+                    .basis(x)
+                    .iter()
+                    .filter(|w| w.0 == i)
+                    .map(|w| w.1)
+                    .sum::<f64>()
+            });
+            fit.beam.per_us(x) * slope.exp()
+        }
+    }
+
+    fn information(
+        fit: &CountsFit,
+        fitted: &[f64],
+        t0_at: usize,
+        counts_at: impl Fn(&[f64], Option<(usize, f64)>) -> Vec<f64> + Sync,
+    ) -> Vec<Vec<f64>> {
         let mu = counts_at(fitted, None);
         let coefficients = fit.beam.coefficients().len();
         let columns: Vec<Vec<f64>> = (0..coefficients + fitted.len())
@@ -2009,13 +2055,13 @@ mod pulse_calibration {
                     }
                     let q = c - coefficients;
                     let step = match q {
-                        3 => T0_STEP_US,
-                        4 => PATH_STEP_M,
+                        _ if q == t0_at => T0_STEP_US,
+                        _ if q == t0_at + 1 => PATH_STEP_M,
                         _ => 1e-4 * fitted[q],
                     };
-                    let mut quantities = fitted;
+                    let mut quantities = fitted.to_vec();
                     quantities[q] += sign * step;
-                    (counts_at(quantities, None), step)
+                    (counts_at(&quantities, None), step)
                 };
                 let ((up, step), (down, _)) = (shifted(1.0), shifted(-1.0));
                 up.iter()
@@ -2026,7 +2072,7 @@ mod pulse_calibration {
             .collect();
         let bins = mu.len() / 2;
         let overdispersion = fit.overdispersion.map(|phi| phi.unwrap_or(1.0));
-        let mut information: Vec<Vec<f64>> = columns
+        columns
             .iter()
             .map(|a| {
                 columns
@@ -2042,13 +2088,15 @@ mod pulse_calibration {
                     })
                     .collect()
             })
-            .collect();
-        information[coefficients][coefficients] += DENSITY_SD.powi(-2);
-        information[coefficients + 1][coefficients + 1] += TEMPERATURE_SD_K.powi(-2);
-        let oracle = inverse(information);
+            .collect()
+    }
+
+    fn assert_covariance(fit: &CountsFit, oracle: &[Vec<f64>]) {
+        let coefficients = fit.beam.coefficients().len();
         let covariance = fit.covariance.as_ref().expect("covariance");
-        for i in 0..fitted.len() {
-            for j in 0..fitted.len() {
+        let fitted = oracle.len() - coefficients;
+        for i in 0..fitted {
+            for j in 0..fitted {
                 let expected = oracle[coefficients + i][coefficients + j];
                 let scale = (oracle[coefficients + i][coefficients + i]
                     * oracle[coefficients + j][coefficients + j])
@@ -2117,5 +2165,205 @@ mod pulse_calibration {
                 "{i}: mean {mean}, sd {sd}, within one sd {covered}"
             );
         }
+    }
+
+    fn calibrated_numbers(fit: &CountsFit) -> [f64; 4] {
+        [fit.alpha[0], fit.alpha[1], fit.beta[0], fit.r]
+    }
+
+    fn block(covariance: &FlatMatrix, indices: std::ops::Range<usize>) -> Vec<Vec<f64>> {
+        indices
+            .clone()
+            .map(|i| indices.clone().map(|j| covariance.get(i, j)).collect())
+            .collect()
+    }
+
+    fn calibration_block() -> Vec<Vec<f64>> {
+        block(ONE_FOIL.0.covariance.as_ref().expect("covariance"), 4..8)
+    }
+
+    fn experiment_information(fit: &CountsFit) -> Vec<Vec<f64>> {
+        let numbers = calibrated_numbers(fit);
+        let fitted = [
+            fit.densities[0],
+            fit.temperature_k,
+            fit.t0_us,
+            fit.flight_path_m,
+            numbers[0],
+            numbers[1],
+            numbers[2],
+            numbers[3],
+        ];
+        let beam_origin_us = ONE_FOIL.0.t0_us;
+        let counts_at = |quantities: &[f64], coefficient: Option<(usize, f64)>| -> Vec<f64> {
+            let [
+                density,
+                temperature_k,
+                t0_us,
+                flight_path_m,
+                a0,
+                a1,
+                beta0,
+                r,
+            ] = quantities.try_into().expect("eight quantities");
+            let at = calibration_foil(&[a0, a1, beta0, 0.0, r, 0.0], t0_us, flight_path_m);
+            let (open, sample) = expected_at(
+                &at,
+                &fitted_beam(fit, beam_origin_us, t0_us, coefficient),
+                &calibration_sample(density),
+                temperature_k,
+            );
+            open.into_iter().chain(sample).collect()
+        };
+        information(fit, &fitted, 2, counts_at)
+    }
+
+    #[test]
+    #[ignore = "slow; runs nightly"]
+    fn the_statistic_compares_the_calibrated_pulse_with_the_experiment_s_own() {
+        let mut shifted = CALIBRATION_PULSE;
+        shifted[4] += 0.02;
+        let counts = experiment_counts(&shifted);
+        let counts = (rounded(&counts.0), rounded(&counts.1));
+        let mut unmeasured = ONE_FOIL.1.calibration();
+        unmeasured.pulse.prior = None;
+        let (measured, alone) = rayon::join(
+            || experiment_with(&shifted, counts.clone(), &ONE_FOIL.1.calibration()),
+            || experiment_with(&shifted, counts.clone(), &unmeasured),
+        );
+        assert!(measured.converged && alone.converged);
+        let weighted = CountsFit {
+            overdispersion: measured.overdispersion,
+            ..alone.clone()
+        };
+        let coefficients = alone.beam.coefficients().len();
+        let own = inverse(experiment_information(&weighted));
+        let start = coefficients + 4;
+        let sum: Vec<Vec<f64>> = calibration_block()
+            .iter()
+            .enumerate()
+            .map(|(i, row)| {
+                row.iter()
+                    .enumerate()
+                    .map(|(j, c)| c + own[start + i][start + j])
+                    .collect()
+            })
+            .collect();
+        let weight = inverse(sum);
+        let difference: Vec<f64> = calibrated_numbers(&alone)
+            .iter()
+            .zip(calibrated_numbers(&ONE_FOIL.0))
+            .map(|(x, c)| x - c)
+            .collect();
+        let expected: f64 = (0..4)
+            .flat_map(|i| (0..4).map(move |j| (i, j)))
+            .map(|(i, j)| difference[i] * weight[i][j] * difference[j])
+            .sum();
+        let q = measured.pulse_consistency.expect("consistency").q;
+        assert!((q / expected - 1.0).abs() <= 0.05, "{q} vs {expected}");
+    }
+
+    #[test]
+    #[ignore = "slow; runs nightly"]
+    fn an_experiment_s_covariance_adds_the_calibration_s_inverse_to_its_information() {
+        let fit = experiment(&CALIBRATION_PULSE);
+        assert!(fit.converged);
+        let coefficients = fit.beam.coefficients().len();
+        let mut information = experiment_information(&fit);
+        let precision = inverse(calibration_block());
+        for (a, row) in precision.iter().enumerate() {
+            for (b, p) in row.iter().enumerate() {
+                information[coefficients + 4 + a][coefficients + 4 + b] += p;
+            }
+        }
+        assert_covariance(&fit, &inverse(information));
+    }
+
+    #[test]
+    #[ignore = "slow; runs nightly"]
+    fn calibrated_experiments_have_error_bars_that_are_their_scatter() {
+        let mut p = CALIBRATION_PULSE;
+        p[5] = 0.35;
+        let foil = calibration_foil(&p, T0_US, FLIGHT_PATH_M);
+        let foil_counts = expected(
+            &foil,
+            &beam(CALIBRATION_LEVEL),
+            &calibration_sample(CALIBRATION_DENSITY),
+        );
+        let counts = experiment_counts(&p);
+        let fits: Vec<CountsFit> = (0..400_u64)
+            .into_par_iter()
+            .filter_map(|seed| {
+                let m =
+                    calibration_measurement(&foil, draws(&foil_counts, 80_000 + seed, [1.0; 2]));
+                let sign = if seed % 2 == 0 { 1.0 } else { -1.0 };
+                let calibration = calibration_start(&p, sign, Some(p[5] + 0.05 * sign));
+                let calibrated = fit_counts(&m, &calibration).ok()?;
+                let experiment = PulseCalibration::new(&calibration, &m, &calibrated)
+                    .ok()?
+                    .calibration();
+                let pulse = &experiment.pulse;
+                [
+                    pulse.alpha[0],
+                    pulse.alpha[1],
+                    pulse.beta[0],
+                    pulse.r,
+                    pulse.fwhm_squared_us2,
+                ]
+                .iter()
+                .all(|number| matches!(number, Value::Fitted(_)))
+                .then_some(())?;
+                let drawn = draws(&counts, 90_000 + seed, [1.0; 2]);
+                Some(experiment_with(&p, drawn, &experiment)).filter(|fit| fit.converged)
+            })
+            .collect();
+        assert!(fits.len() >= 398, "{} converged", fits.len());
+        let truth = [
+            (1, EXPERIMENT_K),
+            (2, T0_US + 0.03),
+            (3, FLIGHT_PATH_M + 0.002),
+            (5, p[1]),
+            (7, p[4]),
+            (8, p[5] * p[5]),
+        ];
+        for (i, truth) in truth {
+            let pulls: Vec<f64> = fits
+                .iter()
+                .map(|fit| {
+                    let estimate = [
+                        fit.densities[0],
+                        fit.temperature_k,
+                        fit.t0_us,
+                        fit.flight_path_m,
+                        fit.alpha[0],
+                        fit.alpha[1],
+                        fit.beta[0],
+                        fit.r,
+                        fit.fwhm_squared_us2,
+                    ][i];
+                    (estimate - truth) / error_bar(fit, i)
+                })
+                .collect();
+            let (mean, sd) = super::error_bar_pulls::moments(&pulls);
+            let covered =
+                pulls.iter().filter(|pull| pull.abs() <= 1.0).count() as f64 / pulls.len() as f64;
+            assert!(
+                (0.9..=1.1).contains(&sd) && (0.61..=0.75).contains(&covered),
+                "{i}: mean {mean}, sd {sd}, within one sd {covered}"
+            );
+        }
+        let tests: Vec<_> = fits
+            .iter()
+            .map(|fit| fit.pulse_consistency.expect("consistency"))
+            .collect();
+        let n = tests.len() as f64;
+        let dof = tests.iter().map(|t| t.dof as f64).sum::<f64>() / n;
+        let q = tests.iter().map(|t| t.q).sum::<f64>() / n;
+        let rejected = tests.iter().filter(|t| t.p < 0.05).count() as f64 / n;
+        assert!(
+            (q - dof).abs() <= 3.0 * (2.0 * dof / n).sqrt()
+                && (rejected - 0.05).abs() <= 3.0 * (0.05 * 0.95 / n).sqrt(),
+            "mean q {q} on {dof} degrees of freedom, {rejected} rejected at 0.05"
+        );
     }
 }
