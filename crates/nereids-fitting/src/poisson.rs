@@ -14,6 +14,7 @@
 //! eq. `bayes-eq-m-prime`).
 
 use faer::dyn_stack::{MemBuffer, MemStack};
+use faer::linalg::solvers::Solve;
 use faer::linalg::svd::{ComputeSvdVectors, svd, svd_scratch};
 use faer::{Mat, Par, Side};
 
@@ -166,6 +167,90 @@ impl Prior {
             mean: mean.to_vec(),
             factor,
         }
+    }
+
+    /// The prior on the rest of its parameters given those in `held`, each a
+    /// parameter index in the [`ParameterSet`] with its value: mean
+    /// `m_R + C_RH C_HH⁻¹(θ_H − m_H)` and covariance `C_RR − C_RH C_HH⁻¹ C_HR`,
+    /// over the rest in this prior's order.
+    ///
+    /// # Errors
+    /// `FittingError::InvalidConfig` if a held parameter is not one of this
+    /// prior's, is held twice, or has a value that is not finite, or every
+    /// parameter is held; `FittingError::EvaluationFailed` if a decomposition
+    /// fails.
+    pub fn conditioned(&self, held: &[(usize, f64)]) -> Result<Prior, FittingError> {
+        let k = self.parameters.len();
+        let positions: Option<Vec<usize>> = held
+            .iter()
+            .map(|(parameter, _)| self.parameters.iter().position(|p| p == parameter))
+            .collect();
+        let rest: Vec<usize> = (0..k)
+            .filter(|i| positions.as_ref().is_some_and(|held| !held.contains(i)))
+            .collect();
+        let Some(held_at) = positions.filter(|held_at| {
+            rest.len() + held_at.len() == k
+                && !rest.is_empty()
+                && held.iter().all(|(_, value)| value.is_finite())
+        }) else {
+            return Err(FittingError::InvalidConfig(format!(
+                "a prior is conditioned on some of its own parameters, each once at a finite \
+                 value, leaving at least one; got {held:?} for {:?}",
+                self.parameters
+            )));
+        };
+        let held_values: Vec<f64> = held.iter().map(|(_, value)| *value).collect();
+        let block = |rows: &[usize], columns: &[usize]| {
+            Mat::from_fn(rows.len(), columns.len(), |a, b| {
+                self.covariance(rows[a], columns[b])
+            })
+        };
+        let cross = block(&held_at, &rest);
+        let shift = Mat::from_fn(held_at.len(), 1, |a, _| {
+            held_values[a] - self.mean[held_at[a]]
+        });
+        let held_block = block(&held_at, &held_at)
+            .llt(Side::Lower)
+            .map_err(|e| FittingError::EvaluationFailed(format!("{e:?}")))?;
+        let gain = held_block.solve(&cross);
+        let along = held_block.solve(&shift);
+        let n = rest.len();
+        let mean: Vec<f64> = (0..n)
+            .map(|b| {
+                self.mean[rest[b]]
+                    + (0..held_at.len())
+                        .map(|a| cross[(a, b)] * along[(a, 0)])
+                        .sum::<f64>()
+            })
+            .collect();
+        let mut remaining = FlatMatrix::zeros(n, n);
+        for b in 0..n {
+            for c in 0..n {
+                let removed = |b: usize, c: usize| -> f64 {
+                    (0..held_at.len())
+                        .map(|a| cross[(a, b)] * gain[(a, c)])
+                        .sum()
+                };
+                *remaining.get_mut(b, c) =
+                    self.covariance(rest[b], rest[c]) - 0.5 * (removed(b, c) + removed(c, b));
+            }
+        }
+        let parameters: Vec<usize> = rest.iter().map(|&i| self.parameters[i]).collect();
+        let conditioned = Prior::factored(&parameters, &mean, &remaining);
+        if conditioned.is_valid() {
+            Ok(conditioned)
+        } else {
+            Err(FittingError::EvaluationFailed(format!(
+                "the conditioned prior is not positive definite: {remaining:?}"
+            )))
+        }
+    }
+
+    pub(crate) fn covariance(&self, i: usize, j: usize) -> f64 {
+        let k = self.parameters.len();
+        (0..=i.min(j))
+            .map(|l| self.factor[i * k + l] * self.factor[j * k + l])
+            .sum()
     }
 
     pub(crate) fn is_valid(&self) -> bool {

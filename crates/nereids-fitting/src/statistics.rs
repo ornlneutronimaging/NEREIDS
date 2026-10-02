@@ -1,8 +1,8 @@
-//! Consistency of a fit with its prior.
+//! Consistency of a fit with its prior, and agreement between two
+//! estimates.
 
 use std::f64::consts::PI;
 
-use faer::linalg::solvers::Solve;
 use faer::{Mat, Side};
 
 use crate::error::FittingError;
@@ -11,9 +11,8 @@ use crate::poisson::{NEWTON_DECREMENT_TOL, Prior, symmetric};
 
 const TERM_SHIFT: f64 = 0.1;
 
-/// Whether counts accept a prior: the statistic `q`, its degrees of freedom
-/// `dof`, and the probability `p` of a `q` at least as large if the prior is
-/// right.
+/// A χ² test: the statistic `q`, its degrees of freedom `dof`, and the
+/// probability `p` of a `q` at least as large under the hypothesis tested.
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub struct Consistency {
     pub q: f64,
@@ -21,7 +20,8 @@ pub struct Consistency {
     pub p: f64,
 }
 
-pub(crate) fn chi_squared_survival(q: f64, dof: usize) -> f64 {
+/// `P(χ²_dof ≥ q)` for `q` of 0 or more.
+pub fn chi_squared_survival(q: f64, dof: usize) -> f64 {
     if q == f64::INFINITY {
         return 0.0;
     }
@@ -107,7 +107,11 @@ pub fn consistency(
             "a posterior covariance must be symmetric; got {posterior:?}"
         )));
     }
-    let prior = conditioned(prior, estimate, &rest)?;
+    let held: Vec<(usize, f64)> = (0..k)
+        .filter(|&i| on_bound[i])
+        .map(|i| (prior.parameters[i], estimate[i]))
+        .collect();
+    let prior = prior.conditioned(&held)?;
     let mut z: Vec<f64> = rest
         .iter()
         .zip(&prior.mean)
@@ -159,57 +163,38 @@ pub fn consistency(
     }))
 }
 
-fn conditioned(prior: &Prior, estimate: &[f64], rest: &[usize]) -> Result<Prior, FittingError> {
-    let k = prior.parameters.len();
-    let held: Vec<usize> = (0..k).filter(|i| !rest.contains(i)).collect();
-    let covariance = |i: usize, j: usize| -> f64 {
-        (0..=i.min(j))
-            .map(|l| prior.factor[i * k + l] * prior.factor[j * k + l])
-            .sum()
-    };
-    let block = |rows: &[usize], columns: &[usize]| {
-        Mat::from_fn(rows.len(), columns.len(), |a, b| {
-            covariance(rows[a], columns[b])
-        })
-    };
-    let cross = block(&held, rest);
-    let shift = Mat::from_fn(held.len(), 1, |a, _| {
-        estimate[held[a]] - prior.mean[held[a]]
-    });
-    let held_block = block(&held, &held)
-        .llt(Side::Lower)
-        .map_err(|e| FittingError::EvaluationFailed(format!("{e:?}")))?;
-    let gain = held_block.solve(&cross);
-    let along = held_block.solve(&shift);
-    let n = rest.len();
-    let mean: Vec<f64> = (0..n)
-        .map(|b| {
-            prior.mean[rest[b]]
-                + (0..held.len())
-                    .map(|a| cross[(a, b)] * along[(a, 0)])
-                    .sum::<f64>()
-        })
-        .collect();
-    let mut remaining = FlatMatrix::zeros(n, n);
-    for b in 0..n {
-        for c in 0..n {
-            let removed = |b: usize, c: usize| -> f64 {
-                (0..held.len()).map(|a| cross[(a, b)] * gain[(a, c)]).sum()
-            };
-            *remaining.get_mut(b, c) =
-                covariance(rest[b], rest[c]) - 0.5 * (removed(b, c) + removed(c, b));
+/// The agreement of two independent estimates `a` and `b` of the same
+/// parameters, each a mean with its covariance:
+/// `q = dᵀ(C_a + C_b)⁻¹d`, with `d` the difference of the means, follows `χ²`
+/// with as many degrees of freedom as parameters when both estimate the same
+/// values.
+///
+/// # Errors
+/// `FittingError::InvalidConfig` if `a` and `b` are over different
+/// parameters, or either has a mean that is not finite or a measured sd not
+/// finite and positive.
+pub fn agreement(a: &Prior, b: &Prior) -> Result<Consistency, FittingError> {
+    if a.parameters != b.parameters || !a.is_valid() || !b.is_valid() {
+        return Err(FittingError::InvalidConfig(format!(
+            "two valid estimates of the same parameters are compared; got {a:?} and {b:?}"
+        )));
+    }
+    let k = a.parameters.len();
+    let mut sum = FlatMatrix::zeros(k, k);
+    for i in 0..k {
+        for j in 0..k {
+            *sum.get_mut(i, j) = a.covariance(i, j) + b.covariance(i, j);
         }
     }
-    let parameters: Vec<usize> = rest.iter().map(|&i| prior.parameters[i]).collect();
-    let conditioned = Prior::factored(&parameters, &mean, &remaining);
-    if conditioned.is_valid() {
-        Ok(conditioned)
-    } else {
-        Err(FittingError::EvaluationFailed(format!(
-            "the prior conditioned on the parameters on a bound is not positive definite: \
-             {remaining:?}"
-        )))
-    }
+    let joint = Prior::factored(&a.parameters, &b.mean, &sum);
+    let mut d: Vec<f64> = a.mean.iter().zip(&b.mean).map(|(x, y)| x - y).collect();
+    joint.whiten(&mut d);
+    let q = d.iter().map(|w| w * w).sum();
+    Ok(Consistency {
+        q,
+        dof: k,
+        p: chi_squared_survival(q, k),
+    })
 }
 
 #[cfg(test)]
@@ -399,5 +384,53 @@ mod tests {
                 .unwrap()
                 .is_none()
         );
+    }
+
+    #[test]
+    fn two_estimates_agree_by_their_difference_over_the_sum_of_their_covariances() {
+        let a = Prior::correlated(&[3, 7], &[1.0, 2.0], &two_by_two([4.0, 1.0, 1.0, 2.0])).unwrap();
+        let b =
+            Prior::correlated(&[3, 7], &[2.0, 0.5], &two_by_two([1.0, -0.5, -0.5, 3.0])).unwrap();
+        let (sum, d) = ([5.0, 0.5, 0.5, 5.0], [-1.0, 1.5]);
+        let determinant = sum[0] * sum[3] - sum[1] * sum[2];
+        let q = (d[0] * d[0] * sum[3] - 2.0 * d[0] * d[1] * sum[1] + d[1] * d[1] * sum[0])
+            / determinant;
+        let result = agreement(&a, &b).unwrap();
+        assert_eq!(result.dof, 2);
+        assert!((result.q / q - 1.0).abs() <= 1e-14, "{} vs {q}", result.q);
+        assert!((result.p / (-q / 2.0).exp() - 1.0).abs() <= 1e-14);
+        let other =
+            Prior::correlated(&[3, 8], &[2.0, 0.5], &two_by_two([1.0, 0.0, 0.0, 3.0])).unwrap();
+        assert!(agreement(&a, &other).is_err());
+        let invalid = Prior::measured(3, 0.0, -1.0);
+        let one = Prior::measured(3, 0.0, 1.0);
+        assert!(agreement(&invalid, &one).is_err());
+    }
+
+    #[test]
+    fn a_prior_is_conditioned_only_on_some_of_its_own_parameters() {
+        let covariance = FlatMatrix {
+            data: vec![4.0, 2.0, 1.0, 2.0, 5.0, 3.0, 1.0, 3.0, 6.0],
+            nrows: 3,
+            ncols: 3,
+        };
+        let prior = Prior::correlated(&[4, 5, 6], &[1.0, 2.0, 3.0], &covariance).unwrap();
+        let conditioned = prior.conditioned(&[(5, 2.5)]).unwrap();
+        assert_eq!(conditioned.parameters, [4, 6]);
+        assert!(
+            (conditioned.mean[0] - 1.2).abs() <= 1e-14
+                && (conditioned.mean[1] - 3.3).abs() <= 1e-14
+        );
+        for (i, j, expected) in [(0, 0, 3.2), (0, 1, -0.2), (1, 1, 4.2)] {
+            assert!((conditioned.covariance(i, j) - expected).abs() <= 1e-13);
+        }
+        for held in [
+            vec![(9, 1.0)],
+            vec![(4, 1.0), (5, 1.0), (6, 1.0)],
+            vec![(5, 1.0), (5, 2.0)],
+            vec![(5, f64::NAN)],
+        ] {
+            assert!(prior.conditioned(&held).is_err(), "{held:?}");
+        }
     }
 }
