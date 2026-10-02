@@ -14,6 +14,7 @@
 //! - [`error`] — Pipeline error types
 //! - [`open_beam`] — The beam fitted to the open-beam counts (fit_open_beam)
 //! - [`pipeline`] — Single-spectrum analysis pipeline (fit_spectrum_typed)
+//! - [`pulse_calibration`] — A pulse calibrated on a foil, as a prior for experiments
 //! - [`spatial`] — Per-pixel parallel mapping with rayon (spatial_map_typed)
 
 pub mod beam;
@@ -24,6 +25,7 @@ pub mod error;
 pub mod joint_fit;
 pub mod open_beam;
 pub mod pipeline;
+pub mod pulse_calibration;
 /// Expected detector counts from the counts measurement equation, for tests.
 #[cfg(feature = "test-support")]
 pub mod reference;
