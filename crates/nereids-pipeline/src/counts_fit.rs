@@ -25,8 +25,8 @@ use rayon::prelude::*;
 use crate::beam::BeamSpline;
 use crate::error::PipelineError;
 use crate::open_beam::{
-    Calibration, Recorded, combined, counted, fit_on_halved_grids, fit_open_beam, laws,
-    overdispersion, validate_counts, validate_live, weights_of,
+    Calibration, PULSE_NUMBERS, Recorded, combined, counted, fit_on_halved_grids, fit_open_beam,
+    laws, overdispersion, validate_counts, validate_live, weights_of,
 };
 use crate::pipeline::TEMPERATURE_BOUNDS_K;
 use crate::pulse_calibration::lines_in_window;
@@ -208,9 +208,13 @@ pub struct CountsFit {
     /// Whether the counts accept the pulse's calibration on the numbers it
     /// covers, by [`consistency`] with the fitted numbers and their
     /// covariance.  The counts' information is divided by each run's
-    /// overdispersion, so the test weakens as the overdispersion grows; a
-    /// calibration fitted to the same open-beam run is not independent of
-    /// the fit, which the test does not account for.  `None` without a
+    /// overdispersion, so the test weakens as the overdispersion grows.  The
+    /// overdispersion is at least 1, so with Poisson counts its estimate
+    /// inflates the covariances the test uses, and `p` rejects a right
+    /// calibration less often than its value says, the more so the fewer bins
+    /// each run counts.  A calibration fitted to the same open-beam run is not
+    /// independent of the fit, which the test does not account for.  `None`
+    /// without a
     /// calibration, when `covariance` is `None` or withheld, or when
     /// [`consistency`] gives none.
     pub pulse_consistency: Option<Consistency>,
@@ -326,8 +330,9 @@ pub struct CountsFit {
 /// everything [`fit_open_beam`] refuses; [`PipelineError::FlightTimeGrid`]
 /// for the grid's refusals at the starting `t0`, flight path and pulse or the
 /// fitted ones of any pass, including more points than it allows;
-/// [`PipelineError::Fitting`] if the fitter fails, or the cross sections
-/// fail at the start; a failure at a trial temperature is a rejected step.
+/// [`PipelineError::Fitting`] if the fitter fails, the cross sections fail at
+/// the start, or a decomposition of the pulse's consistency test fails; a
+/// failure at a trial temperature is a rejected step.
 pub fn fit_counts(
     measurement: &Measurement,
     calibration: &Calibration,
@@ -428,8 +433,7 @@ pub fn fit_counts(
         return invalid(format!(
             "the pulse's calibration covers {}, which must be fitted, without a measurement; \
              got {:?}",
-            ["α₀", "α₁", "β₀", "β₁", "R", "h²"][number],
-            numbers[number]
+            PULSE_NUMBERS[number], numbers[number]
         ));
     }
     let start: Vec<f64> = instrument.iter().map(|parameter| parameter.value).collect();

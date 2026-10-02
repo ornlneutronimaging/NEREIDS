@@ -20,6 +20,8 @@ use crate::pulse_calibration::PulsePrior;
 /// grid to be accepted.
 pub const BOUND: f64 = 0.01;
 
+pub(crate) const PULSE_NUMBERS: [&str; 6] = ["α₀", "α₁", "β₀", "β₁", "R", "h²"];
+
 /// A neutron of flight time `u` over the flight path `flight_path_m` (m)
 /// arrives at `t0_us + u` (µs) plus a delay drawn from `pulse`.
 /// [`fit_counts`](crate::counts_fit::fit_counts) fits `t0_us`,

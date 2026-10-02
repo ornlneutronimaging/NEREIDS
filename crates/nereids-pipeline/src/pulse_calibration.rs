@@ -7,9 +7,9 @@ use nereids_fitting::poisson::Prior;
 use nereids_physics::resolution::TOF_FACTOR;
 use nereids_physics::transmission::resonance_center_energies;
 
-use crate::counts_fit::{CountsFit, Measurement, Value, quantities};
+use crate::counts_fit::{CountsFit, Measurement, Value, fit_counts, quantities};
 use crate::error::PipelineError;
-use crate::open_beam::{Calibration, Pulse};
+use crate::open_beam::{Calibration, PULSE_NUMBERS, Pulse};
 
 /// The pulse numbers a calibration resolved, as indices into
 /// `(α₀, α₁, β₀, β₁, R, h²)`, with their fitted values and covariance, and
@@ -23,68 +23,76 @@ pub struct PulsePrior {
     pub(crate) line_span_ev: (f64, f64),
 }
 
-/// A pulse calibrated on a foil by [`fit_counts`](crate::counts_fit::fit_counts).
+/// A pulse calibrated on a foil by [`fit_counts`].
 ///
-/// A pulse number is resolved when the calibration fitted it, it did not end
-/// on a bound, and its variance is finite and positive; the others are held at
-/// their fitted values.  The resolved numbers keep the fit's covariance of
+/// A pulse number the calibration fitted is resolved, unless it ended on a
+/// bound, where it is held at its fitted value; a number known in the
+/// calibration stays known.  The resolved numbers keep the fit's covariance of
 /// them, which is conditional on every quantity that ended on a bound being
-/// held there.  A number the counts do not determine has no variance and is
-/// held.
+/// held there.
 #[derive(Debug, Clone)]
 pub struct PulseCalibration {
-    t0_us: f64,
-    flight_path_m: f64,
-    numbers: [f64; 6],
+    fit: CountsFit,
     energy_span_ev: (f64, f64),
     n_tau: usize,
     prior: Option<PulsePrior>,
 }
 
 impl PulseCalibration {
-    /// The calibration given by `fit`, the result of
-    /// [`fit_counts`](crate::counts_fit::fit_counts) on `measurement` with
-    /// `calibration`.
+    /// The pulse calibrated by fitting the counts of a foil, `measurement`,
+    /// with `calibration`.
     ///
     /// # Errors
-    /// [`PipelineError::InvalidParameter`] if `fit` did not converge, has no
-    /// covariance, or does not have the quantities `measurement` and
-    /// `calibration` fit, or if some pulse number is resolved and the foil
-    /// has no resonance between the energies of its last and first time
-    /// edges at the fitted `t0` and flight path; [`PipelineError::Fitting`]
-    /// if the resolved numbers' covariance is refused by
-    /// [`Prior::correlated`].
+    /// Everything [`fit_counts`] refuses; [`PipelineError::InvalidParameter`]
+    /// if the fit did not converge, a pulse number it fitted ended off its
+    /// bounds without a finite positive variance, as when the counts do not
+    /// determine it or a fitted temperature ended at 1 K or 5000 K, or some
+    /// pulse number is resolved and the foil has no resonance between the
+    /// energies of its last and first time edges at the fitted `t0` and
+    /// flight path; [`PipelineError::Fitting`] if the resolved numbers'
+    /// covariance is refused by [`Prior::correlated`].
     pub fn new(
-        calibration: &Calibration,
         measurement: &Measurement,
-        fit: &CountsFit,
+        calibration: &Calibration,
     ) -> Result<Self, PipelineError> {
-        let invalid = |message: &str| Err(PipelineError::InvalidParameter(message.into()));
+        let fit = fit_counts(measurement, calibration)?;
+        Self::from_fit(measurement, calibration, fit)
+    }
+
+    /// The fit of the foil's counts.
+    pub fn fit(&self) -> &CountsFit {
+        &self.fit
+    }
+
+    fn from_fit(
+        measurement: &Measurement,
+        calibration: &Calibration,
+        fit: CountsFit,
+    ) -> Result<Self, PipelineError> {
+        let invalid = |message: String| Err(PipelineError::InvalidParameter(message));
         let Some(covariance) = fit.covariance.as_ref().filter(|_| fit.converged) else {
-            return invalid("a pulse calibration needs a converged fit with a covariance");
+            return invalid("a pulse calibration needs a converged fit".into());
         };
         let fitted: Vec<bool> = quantities(measurement, calibration)
             .map(|value| !matches!(value, Value::Known(_)))
             .collect();
-        let free = fitted.iter().filter(|&&f| f).count();
-        if covariance.nrows != free
-            || fit.on_bound.len() != free
-            || fit.densities.len() != measurement.isotopes.len()
-        {
-            return invalid(
-                "the fit does not have the quantities of this measurement and calibration",
-            );
-        }
         let first_number = fitted.len() - 6;
-        let resolved: Vec<(usize, usize)> = (0..6)
-            .filter_map(|number| {
-                let quantity = first_number + number;
-                let i = fitted[..quantity].iter().filter(|&&f| f).count();
-                let determined = |variance: f64| variance.is_finite() && variance > 0.0;
-                (fitted[quantity] && !fit.on_bound[i] && determined(covariance.get(i, i)))
-                    .then_some((number, i))
-            })
-            .collect();
+        let mut resolved = Vec::with_capacity(6);
+        for (number, name) in PULSE_NUMBERS.into_iter().enumerate() {
+            let quantity = first_number + number;
+            let i = fitted[..quantity].iter().filter(|&&f| f).count();
+            if !fitted[quantity] || fit.on_bound[i] {
+                continue;
+            }
+            let variance = covariance.get(i, i);
+            if !(variance.is_finite() && variance > 0.0) {
+                return invalid(format!(
+                    "the calibration fitted {name} without determining it: its variance is \
+                     {variance}"
+                ));
+            }
+            resolved.push((number, i));
+        }
         let numbers = [
             fit.alpha[0],
             fit.alpha[1],
@@ -105,7 +113,8 @@ impl PulseCalibration {
             if lines.is_empty() {
                 return invalid(
                     "the calibration foil has no resonance in its window to bound the energies \
-                     its pulse holds over",
+                     its pulse holds over"
+                        .into(),
                 );
             }
             let line_span_ev = lines
@@ -131,9 +140,7 @@ impl PulseCalibration {
             })
         };
         Ok(Self {
-            t0_us: fit.t0_us,
-            flight_path_m: fit.flight_path_m,
-            numbers,
+            fit,
             energy_span_ev: calibration.pulse.energy_span_ev,
             n_tau: calibration.pulse.n_tau,
             prior,
@@ -144,20 +151,29 @@ impl PulseCalibration {
     /// the calibrated ones, the resolved pulse numbers fitted from theirs with
     /// their covariance as a prior, and the others known.
     pub fn calibration(&self) -> Calibration {
+        let fit = &self.fit;
+        let numbers = [
+            fit.alpha[0],
+            fit.alpha[1],
+            fit.beta[0],
+            fit.beta[1],
+            fit.r,
+            fit.fwhm_squared_us2,
+        ];
         let value = |number: usize| {
             let resolved = self
                 .prior
                 .as_ref()
                 .is_some_and(|prior| prior.numbers.contains(&number));
             if resolved {
-                Value::Fitted(self.numbers[number])
+                Value::Fitted(numbers[number])
             } else {
-                Value::Known(self.numbers[number])
+                Value::Known(numbers[number])
             }
         };
         Calibration {
-            t0_us: Value::Fitted(self.t0_us),
-            flight_path_m: Value::Fitted(self.flight_path_m),
+            t0_us: Value::Fitted(fit.t0_us),
+            flight_path_m: Value::Fitted(fit.flight_path_m),
             pulse: Pulse {
                 alpha: [value(0), value(1)],
                 beta: [value(2), value(3)],
@@ -214,13 +230,13 @@ mod tests {
         }
     }
 
-    fn calibration() -> Calibration {
+    fn calibration(beta1: Value) -> Calibration {
         Calibration {
             t0_us: Value::Fitted(3.0),
             flight_path_m: Value::Fitted(25.0),
             pulse: Pulse {
                 alpha: [Value::Known(0.5), Value::Fitted(1.0)],
-                beta: [Value::Fitted(0.08), Value::Fitted(0.01)],
+                beta: [Value::Fitted(0.08), beta1],
                 r: Value::Fitted(0.2),
                 fwhm_squared_us2: Value::Fitted(0.1),
                 energy_span_ev: (1.0, 200.0),
@@ -230,22 +246,18 @@ mod tests {
         }
     }
 
-    fn fit() -> CountsFit {
-        let n = 9;
-        let mut covariance = FlatMatrix::zeros(n, n);
-        for i in 0..n {
+    fn fit(free: usize, bounded: usize) -> CountsFit {
+        let mut covariance = FlatMatrix::zeros(free, free);
+        for i in 0..free {
             *covariance.get_mut(i, i) = 0.01 * (i + 1) as f64;
         }
-        for (i, j, c) in [(4, 7, 0.01), (4, 8, -0.005), (7, 8, 0.02), (2, 4, 0.003)] {
+        let (r, h) = (free - 2, free - 1);
+        for (i, j, c) in [(4, r, 0.01), (4, h, -0.005), (r, h, 0.02), (2, 4, 0.003)] {
             *covariance.get_mut(i, j) = c;
             *covariance.get_mut(j, i) = c;
         }
-        for i in 0..n {
-            *covariance.get_mut(6, i) = f64::NAN;
-            *covariance.get_mut(i, 6) = f64::NAN;
-        }
-        let mut on_bound = vec![false; n];
-        on_bound[5] = true;
+        let mut on_bound = vec![false; free];
+        on_bound[bounded] = true;
         CountsFit {
             densities: vec![2e-3],
             temperature_k: 300.0,
@@ -273,9 +285,11 @@ mod tests {
     }
 
     #[test]
-    fn a_calibration_holds_the_numbers_it_did_not_resolve() {
-        let (m, c) = (measurement(), calibration());
-        let calibrated = PulseCalibration::new(&c, &m, &fit()).unwrap().calibration();
+    fn a_calibration_holds_numbers_on_a_bound_and_refuses_undetermined_ones() {
+        let (m, c) = (measurement(), calibration(Value::Known(0.01)));
+        let calibrated = PulseCalibration::from_fit(&m, &c, fit(8, 5))
+            .unwrap()
+            .calibration();
         let pulse = &calibrated.pulse;
         assert_eq!(pulse.alpha, [Value::Known(0.5), Value::Fitted(1.1)]);
         assert_eq!(pulse.beta, [Value::Known(0.0), Value::Known(0.01)]);
@@ -290,24 +304,46 @@ mod tests {
         let prior = pulse.prior.as_ref().expect("prior");
         assert_eq!(prior.numbers, [1, 4, 5]);
         assert_eq!(prior.mean, [1.1, 0.21, 0.12]);
-        let covariance = fit().covariance.expect("covariance");
-        for (a, i) in [4, 7, 8].into_iter().enumerate() {
-            for (b, j) in [4, 7, 8].into_iter().enumerate() {
+        let covariance = fit(8, 5).covariance.expect("covariance");
+        for (a, i) in [4, 6, 7].into_iter().enumerate() {
+            for (b, j) in [4, 6, 7].into_iter().enumerate() {
                 assert_eq!(prior.covariance.get(a, b), covariance.get(i, j));
             }
         }
         assert_eq!(prior.line_span_ev, (10.0, 50.0));
-        for unfinished in [
-            CountsFit {
-                converged: false,
-                ..fit()
-            },
-            CountsFit {
-                covariance: None,
-                ..fit()
-            },
+
+        let mut undetermined = fit(9, 5);
+        let mut withheld = fit(8, 5);
+        let covariance = undetermined.covariance.as_mut().expect("covariance");
+        for i in 0..9 {
+            *covariance.get_mut(6, i) = f64::NAN;
+            *covariance.get_mut(i, 6) = f64::NAN;
+        }
+        withheld
+            .covariance
+            .as_mut()
+            .expect("covariance")
+            .data
+            .fill(f64::NAN);
+        for (beta1, refused) in [
+            (Value::Fitted(0.01), undetermined),
+            (Value::Known(0.01), withheld),
+            (
+                Value::Known(0.01),
+                CountsFit {
+                    converged: false,
+                    ..fit(8, 5)
+                },
+            ),
+            (
+                Value::Known(0.01),
+                CountsFit {
+                    covariance: None,
+                    ..fit(8, 5)
+                },
+            ),
         ] {
-            assert!(PulseCalibration::new(&c, &m, &unfinished).is_err());
+            assert!(PulseCalibration::from_fit(&m, &calibration(beta1), refused).is_err());
         }
     }
 }

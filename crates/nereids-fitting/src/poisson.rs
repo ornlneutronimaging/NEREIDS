@@ -76,14 +76,15 @@ impl Prior {
                 "a prior needs at least one parameter".into(),
             ));
         }
-        for (actual, field) in [
-            (mean.len(), "prior mean"),
-            (covariance.nrows, "prior covariance rows"),
-            (covariance.ncols, "prior covariance columns"),
+        for (expected, actual, field) in [
+            (k, mean.len(), "prior mean"),
+            (k, covariance.nrows, "prior covariance rows"),
+            (k, covariance.ncols, "prior covariance columns"),
+            (k * k, covariance.data.len(), "prior covariance entries"),
         ] {
-            if actual != k {
+            if actual != expected {
                 return Err(FittingError::LengthMismatch {
-                    expected: k,
+                    expected,
                     actual,
                     field,
                 });
@@ -123,14 +124,27 @@ impl Prior {
                  {eigenvalues:?}"
             )));
         }
+        Ok(Self::factored(parameters, mean, covariance))
+    }
+
+    pub(crate) fn factored(parameters: &[usize], mean: &[f64], covariance: &FlatMatrix) -> Self {
+        let k = parameters.len();
+        let sd: Vec<f64> = (0..k).map(|i| covariance.get(i, i).sqrt()).collect();
+        let correlation = |i: usize, j: usize| {
+            if i == j {
+                1.0
+            } else {
+                covariance.get(i, j) / sd[i] / sd[j]
+            }
+        };
         let mut factor = vec![0.0; k * k];
         for i in 0..k {
             for j in 0..=i {
                 let dot: f64 = (0..j).map(|l| factor[i * k + l] * factor[j * k + l]).sum();
                 factor[i * k + j] = if i == j {
-                    (correlation[(i, i)] - dot).sqrt()
+                    (correlation(i, i) - dot).sqrt()
                 } else {
-                    (correlation[(i, j)] - dot) / factor[j * k + j]
+                    (correlation(i, j) - dot) / factor[j * k + j]
                 };
             }
         }
@@ -139,11 +153,18 @@ impl Prior {
                 factor[i * k + j] *= sd[i];
             }
         }
-        Ok(Self {
+        Self {
             parameters: parameters.to_vec(),
             mean: mean.to_vec(),
             factor,
-        })
+        }
+    }
+
+    pub(crate) fn is_valid(&self) -> bool {
+        let k = self.parameters.len();
+        self.mean.iter().all(|m| m.is_finite())
+            && self.factor.iter().all(|f| f.is_finite())
+            && (0..k).all(|j| self.factor[j * k + j] > 0.0)
     }
 
     pub(crate) fn whiten(&self, v: &mut [f64]) {
@@ -621,9 +642,7 @@ pub fn poisson_fit(
         p.parameters.iter().any(|&parameter| {
             params.params.get(parameter).is_none_or(|param| param.fixed)
                 || covered.iter().filter(|&&c| c == parameter).count() > 1
-        }) || !p.mean.iter().all(|m| m.is_finite())
-            || !p.factor.iter().all(|f| f.is_finite())
-            || !(0..p.parameters.len()).all(|j| p.factor[j * p.parameters.len() + j] > 0.0)
+        }) || !p.is_valid()
     }) {
         return Err(FittingError::InvalidConfig(format!(
             "prior {i} must be on free parameters without another prior, with a finite mean \
@@ -1837,6 +1856,15 @@ mod tests {
             correlated([1.0, f64::NAN, f64::NAN, 1.0]),
             correlated([0.0, 0.0, 0.0, 1.0]),
             Prior::correlated(&[0, 1], &[0.0], &two_by_two([1.0, 0.0, 0.0, 1.0])),
+            Prior::correlated(
+                &[0, 1],
+                &[0.0, 0.0],
+                &FlatMatrix {
+                    data: vec![1.0, 0.0, 0.0],
+                    nrows: 2,
+                    ncols: 2,
+                },
+            ),
             Prior::correlated(&[], &[], &FlatMatrix::zeros(0, 0)),
         ] {
             assert!(result.is_err(), "{result:?}");

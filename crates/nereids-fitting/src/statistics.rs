@@ -23,18 +23,18 @@ pub struct Consistency {
 
 pub(crate) fn chi_squared_survival(q: f64, dof: usize) -> f64 {
     let x = q / 2.0;
-    let (mut sum, mut term, offset) = if dof.is_multiple_of(2) {
-        (0.0, (-x).exp(), 1.0)
+    let (mut sum, mut log_term, offset) = if dof.is_multiple_of(2) {
+        (0.0, -x, 1.0)
     } else {
         (
             libm::erfc(x.sqrt()),
-            2.0 * (-x).exp() * (x / PI).sqrt(),
+            std::f64::consts::LN_2 - x + 0.5 * (x / PI).ln(),
             1.5,
         )
     };
     for n in 0..dof / 2 {
-        sum += term;
-        term *= x / (n as f64 + offset);
+        sum += log_term.exp();
+        log_term += x.ln() - (n as f64 + offset).ln();
     }
     sum
 }
@@ -59,8 +59,9 @@ pub(crate) fn chi_squared_survival(q: f64, dof: usize) -> f64 {
 ///
 /// # Errors
 /// `FittingError::LengthMismatch` if `estimate`, `on_bound` or `posterior`
-/// does not match the prior's parameters; [`Prior::correlated`]'s errors for
-/// the conditioned prior; `FittingError::EvaluationFailed` if a
+/// does not match the prior's parameters; `FittingError::InvalidConfig` if
+/// `estimate` is not finite or the prior's mean is not finite or a measured
+/// sd not finite and positive; `FittingError::EvaluationFailed` if a
 /// decomposition fails.
 pub fn consistency(
     prior: &Prior,
@@ -69,30 +70,34 @@ pub fn consistency(
     posterior: &FlatMatrix,
 ) -> Result<Option<Consistency>, FittingError> {
     let k = prior.parameters.len();
-    for (actual, field) in [
-        (estimate.len(), "estimate"),
-        (on_bound.len(), "on_bound"),
-        (posterior.nrows, "posterior rows"),
-        (posterior.ncols, "posterior columns"),
+    for (expected, actual, field) in [
+        (k, estimate.len(), "estimate"),
+        (k, on_bound.len(), "on_bound"),
+        (k, posterior.nrows, "posterior rows"),
+        (k, posterior.ncols, "posterior columns"),
+        (k * k, posterior.data.len(), "posterior entries"),
     ] {
-        if actual != k {
+        if actual != expected {
             return Err(FittingError::LengthMismatch {
-                expected: k,
+                expected,
                 actual,
                 field,
             });
         }
     }
+    if !(prior.is_valid() && estimate.iter().all(|x| x.is_finite())) {
+        return Err(FittingError::InvalidConfig(format!(
+            "the consistency of a prior needs a finite mean, finite positive sds and \
+             finite estimates; got {prior:?} and {estimate:?}"
+        )));
+    }
     let rest: Vec<usize> = (0..k).filter(|&i| !on_bound[i]).collect();
-    if rest.is_empty() {
+    let n = rest.len();
+    let posterior = Mat::from_fn(n, n, |a, b| posterior.get(rest[a], rest[b]));
+    if n == 0 || !(0..n).all(|a| (0..n).all(|b| posterior[(a, b)].is_finite())) {
         return Ok(None);
     }
     let prior = conditioned(prior, estimate, &rest)?;
-    let n = rest.len();
-    let posterior = Mat::from_fn(n, n, |a, b| posterior.get(rest[a], rest[b]));
-    if !(0..n).all(|a| (0..n).all(|b| posterior[(a, b)].is_finite())) {
-        return Ok(None);
-    }
     let mut z: Vec<f64> = rest
         .iter()
         .zip(&prior.mean)
@@ -178,7 +183,15 @@ fn conditioned(prior: &Prior, estimate: &[f64], rest: &[usize]) -> Result<Prior,
         }
     }
     let parameters: Vec<usize> = rest.iter().map(|&i| prior.parameters[i]).collect();
-    Prior::correlated(&parameters, &mean, &remaining)
+    let conditioned = Prior::factored(&parameters, &mean, &remaining);
+    if conditioned.is_valid() {
+        Ok(conditioned)
+    } else {
+        Err(FittingError::EvaluationFailed(format!(
+            "the prior conditioned on the parameters on a bound is not positive definite: \
+             {remaining:?}"
+        )))
+    }
 }
 
 #[cfg(test)]
@@ -200,6 +213,14 @@ mod tests {
         ] {
             let survival = chi_squared_survival(q, dof);
             assert!((survival / p - 1.0).abs() <= 1e-13, "{dof} {q}: {survival}");
+        }
+        for (dof, q, p) in [
+            (1500, 1500.0, 0.495_144_193_335_767_9),
+            (1501, 1501.0, 0.495_145_811_152_950_14),
+            (1500, 1700.0, 2.217_079_970_428_596_7e-4),
+        ] {
+            let survival = chi_squared_survival(q, dof);
+            assert!((survival / p - 1.0).abs() <= 1e-10, "{dof} {q}: {survival}");
         }
         for dof in 1..=6 {
             assert_eq!(chi_squared_survival(0.0, dof), 1.0);
@@ -281,6 +302,18 @@ mod tests {
                 .is_none()
         );
         assert!(consistency(&prior, &estimate[..1], &[false; 2], &posterior([0.5, 0.25])).is_err());
+        let mut truncated = posterior([0.5, 0.25]);
+        truncated.data.pop();
+        assert!(consistency(&prior, &estimate, &[false; 2], &truncated).is_err());
+        let nan = [estimate[0], f64::NAN];
+        assert!(consistency(&prior, &nan, &[false; 2], &posterior([0.5, 0.25])).is_err());
+        let negative = Prior::measured(0, 0.0, -1.0);
+        let unit = FlatMatrix {
+            data: vec![0.5],
+            nrows: 1,
+            ncols: 1,
+        };
+        assert!(consistency(&negative, &[1.0], &[false], &unit).is_err());
     }
 
     #[test]
