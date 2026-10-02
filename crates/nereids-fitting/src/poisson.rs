@@ -67,7 +67,7 @@ impl Prior {
     /// `FittingError::LengthMismatch` if `mean` or `covariance` does not
     /// match `parameters`; `FittingError::InvalidConfig` if `parameters` is
     /// empty or lists a parameter twice, `mean` is not finite, or `covariance`
-    /// is not finite, not symmetric to a relative 1e-12, or not positive
+    /// is not finite, not symmetric to 1e-12 of `√(Cᵢᵢ Cⱼⱼ)`, or not positive
     /// definite with the condition number of its correlation matrix at most
     /// 1e10; `FittingError::EvaluationFailed` if the eigendecomposition of
     /// that matrix fails.
@@ -212,8 +212,8 @@ impl Prior {
 pub(crate) fn symmetric(k: usize, entry: impl Fn(usize, usize) -> f64) -> bool {
     (0..k).all(|i| {
         (0..i).all(|j| {
-            let (upper, lower) = (entry(j, i), entry(i, j));
-            (upper - lower).abs() <= 1e-12 * upper.abs().max(lower.abs())
+            let scale = (entry(i, i) * entry(j, j)).abs().sqrt();
+            (entry(j, i) - entry(i, j)).abs() <= 1e-12 * scale
         })
     })
 }
@@ -1866,10 +1866,12 @@ mod tests {
         let correlated = |data| Prior::correlated(&[0, 1], &[0.0, 0.0], &two_by_two(data));
         let scaled = |rho: f64| correlated([1.0, rho * 1e3, rho * 1e3, 1e6]);
         assert!(scaled(1.0 - 1e-9).is_ok());
+        assert!(correlated([1.0, 1e-6, 1e-6 + 1e-17, 1.0]).is_ok());
         for result in [
             scaled(1.0 - 1e-11),
             scaled(1.0 + 1e-9),
             correlated([1.0, 0.5, 0.5 + 1e-10, 1.0]),
+            correlated([1.0, 1e-6, 1e-6 + 1e-11, 1.0]),
             correlated([1.0, f64::NAN, f64::NAN, 1.0]),
             correlated([0.0, 0.0, 0.0, 1.0]),
             Prior::correlated(&[0, 1], &[0.0], &two_by_two([1.0, 0.0, 0.0, 1.0])),

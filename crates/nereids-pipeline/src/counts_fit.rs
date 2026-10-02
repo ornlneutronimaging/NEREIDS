@@ -313,7 +313,7 @@ pub struct CountsFit {
 /// with the start between them, the pulse's calibration covers a number that
 /// is not fitted or is measured, an isotope of the sample not known to be
 /// absent has a resonance between the energies of its last and first time
-/// edges, at the starting `t0` and flight path or the fitted ones, outside the
+/// edges, at the starting `t0` and flight path or a converged fit's, outside the
 /// energies of the calibration foil's resonances, there are no isotopes, an
 /// isotope is listed twice, an isotope's resonance data are not finite, or the
 /// energies its
@@ -636,10 +636,12 @@ pub fn fit_counts(
         sample_measured = sample.is_some();
     };
     let converged = fit.converged && settled;
-    calibrated_lines(
-        fit.result.params[layout.t0],
-        fit.result.params[layout.flight_path],
-    )?;
+    if converged {
+        calibrated_lines(
+            fit.result.params[layout.t0],
+            fit.result.params[layout.flight_path],
+        )?;
+    }
 
     if let Some((k, (&counts, &predicted))) =
         observed
