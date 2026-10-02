@@ -7,7 +7,7 @@ use faer::{Mat, Side};
 
 use crate::error::FittingError;
 use crate::lm::FlatMatrix;
-use crate::poisson::{NEWTON_DECREMENT_TOL, Prior};
+use crate::poisson::{NEWTON_DECREMENT_TOL, Prior, symmetric};
 
 const TERM_SHIFT: f64 = 0.1;
 
@@ -22,6 +22,9 @@ pub struct Consistency {
 }
 
 pub(crate) fn chi_squared_survival(q: f64, dof: usize) -> f64 {
+    if q == f64::INFINITY {
+        return 0.0;
+    }
     let x = q / 2.0;
     let (mut sum, mut log_term, offset) = if dof.is_multiple_of(2) {
         (0.0, -x, 1.0)
@@ -60,8 +63,10 @@ pub(crate) fn chi_squared_survival(q: f64, dof: usize) -> f64 {
 /// # Errors
 /// `FittingError::LengthMismatch` if `estimate`, `on_bound` or `posterior`
 /// does not match the prior's parameters; `FittingError::InvalidConfig` if
-/// `estimate` is not finite or the prior's mean is not finite or a measured
-/// sd not finite and positive; `FittingError::EvaluationFailed` if a
+/// `estimate` is not finite, the prior's mean is not finite or a measured sd
+/// not finite and positive, or `posterior` over the rest is not symmetric to a
+/// relative 1e-12 or not within the prior there, with some `rᵢ` below
+/// `−8e-4` or above `1 + 8e-4`; `FittingError::EvaluationFailed` if a
 /// decomposition fails.
 pub fn consistency(
     prior: &Prior,
@@ -97,6 +102,11 @@ pub fn consistency(
     if n == 0 || !(0..n).all(|a| (0..n).all(|b| posterior[(a, b)].is_finite())) {
         return Ok(None);
     }
+    if !symmetric(n, |a, b| posterior[(a, b)]) {
+        return Err(FittingError::InvalidConfig(format!(
+            "a posterior covariance must be symmetric; got {posterior:?}"
+        )));
+    }
     let prior = conditioned(prior, estimate, &rest)?;
     let mut z: Vec<f64> = rest
         .iter()
@@ -125,9 +135,17 @@ pub fn consistency(
         .self_adjoint_eigen(Side::Lower)
         .map_err(|e| FittingError::EvaluationFailed(format!("{e:?}")))?;
     let floor = (2.0 * (2.0 * NEWTON_DECREMENT_TOL).sqrt() / TERM_SHIFT).powi(2);
+    let shares = eigen.S().column_vector();
+    if (0..n).any(|d| !(-floor..=1.0 + floor).contains(&shares[d])) {
+        return Err(FittingError::InvalidConfig(format!(
+            "a posterior covariance must lie within the prior's; the shares of the prior's \
+             variance it removes are {:?}",
+            (0..n).map(|d| shares[d]).collect::<Vec<f64>>()
+        )));
+    }
     let (mut q, mut dof) = (0.0, 0);
     for d in 0..n {
-        let share = eigen.S().column_vector()[d];
+        let share = shares[d];
         if share >= floor {
             let projection: f64 = (0..n).map(|a| eigen.U()[(a, d)] * z[a]).sum();
             q += projection.powi(2) / share;
@@ -225,6 +243,15 @@ mod tests {
         for dof in 1..=6 {
             assert_eq!(chi_squared_survival(0.0, dof), 1.0);
             assert_eq!(chi_squared_survival(2000.0, dof), 0.0);
+            assert_eq!(chi_squared_survival(f64::INFINITY, dof), 0.0);
+        }
+    }
+
+    fn two_by_two(data: [f64; 4]) -> FlatMatrix {
+        FlatMatrix {
+            data: data.to_vec(),
+            nrows: 2,
+            ncols: 2,
         }
     }
 
@@ -314,6 +341,25 @@ mod tests {
             ncols: 1,
         };
         assert!(consistency(&negative, &[1.0], &[false], &unit).is_err());
+        let identity =
+            Prior::correlated(&[0, 1], &[0.0, 0.0], &two_by_two([1.0, 0.0, 0.0, 1.0])).unwrap();
+        for impossible in [
+            [0.5, 5.0, -5.0, 0.5],
+            [1.5, 0.0, 0.0, 0.5],
+            [-1.0, 0.0, 0.0, 0.5],
+        ] {
+            let result = consistency(&identity, &[2.0, 1.0], &[false; 2], &two_by_two(impossible));
+            assert!(result.is_err(), "{impossible:?}: {result:?}");
+        }
+        let far = consistency(
+            &identity,
+            &[1e155, 1e155],
+            &[false; 2],
+            &two_by_two([0.5, 0.0, 0.0, 0.5]),
+        )
+        .unwrap()
+        .unwrap();
+        assert_eq!((far.q, far.p), (f64::INFINITY, 0.0));
     }
 
     #[test]

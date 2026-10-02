@@ -2391,4 +2391,70 @@ mod pulse_calibration {
             "mean q {q} on 5 degrees of freedom, {rejected} rejected at 0.05"
         );
     }
+
+    #[test]
+    #[ignore = "slow; runs nightly"]
+    fn experiments_calibrated_with_a_moderation_rate_at_its_bound_keep_density_and_temperature() {
+        let mut p = CALIBRATION_PULSE;
+        p[0] = 0.0;
+        p[5] = 0.35;
+        let foil = calibration_foil(&p, T0_US, FLIGHT_PATH_M);
+        let foil_counts = expected(
+            &foil,
+            &beam(CALIBRATION_LEVEL),
+            &calibration_sample(CALIBRATION_DENSITY),
+        );
+        let counts = experiment_counts(&p);
+        let fits: Vec<(CountsFit, bool)> = (0..400_u64)
+            .into_par_iter()
+            .filter_map(|seed| {
+                let m =
+                    calibration_measurement(&foil, draws(&foil_counts, 81_000 + seed, [1.0; 2]));
+                let sign = if seed % 2 == 0 { 1.0 } else { -1.0 };
+                let mut calibration = calibration_start(&p, sign, Some(p[5] + 0.05 * sign));
+                calibration.pulse.alpha[0] = Value::Fitted(0.05);
+                let calibrated = PulseCalibration::new(&m, &calibration).ok()?;
+                let experiment = calibrated.calibration();
+                let held = matches!(experiment.pulse.alpha[0], Value::Known(_));
+                let drawn = draws(&counts, 91_000 + seed, [1.0; 2]);
+                Some((experiment_with(&p, drawn, &experiment), held))
+                    .filter(|(fit, _)| fit.converged)
+            })
+            .collect();
+        assert!(fits.len() >= 398, "{} converged", fits.len());
+        let n = fits.len() as f64;
+        let held = fits.iter().filter(|(_, held)| *held).count();
+        let bounded = fits
+            .iter()
+            .filter(|(fit, held)| !held && fit.on_bound[4])
+            .count();
+        assert!(
+            held > 0 && bounded > 0,
+            "{held} held, {bounded} on the bound"
+        );
+        for (i, truth) in [(0, CALIBRATION_DENSITY), (1, EXPERIMENT_K)] {
+            let pulls: Vec<f64> = fits
+                .iter()
+                .map(|(fit, _)| {
+                    let estimate = [fit.densities[0], fit.temperature_k][i];
+                    (estimate - truth) / error_bar(fit, i)
+                })
+                .collect();
+            let (mean, sd) = super::error_bar_pulls::moments(&pulls);
+            let covered = pulls.iter().filter(|pull| pull.abs() <= 1.0).count() as f64 / n;
+            assert!(
+                (0.9..=1.1).contains(&sd) && (0.61..=0.75).contains(&covered),
+                "{i}: mean {mean}, sd {sd}, within one sd {covered}"
+            );
+        }
+        let rejected = fits
+            .iter()
+            .filter(|(fit, _)| fit.pulse_consistency.expect("consistency").p < 0.05)
+            .count() as f64
+            / n;
+        assert!(
+            rejected <= 0.05 + 3.0 * (0.05 * 0.95 / n).sqrt(),
+            "{rejected} rejected at a reported 0.05"
+        );
+    }
 }

@@ -8,7 +8,10 @@
 //! ```
 //!
 //! within box bounds, by projected Levenberg–Marquardt steps in the Fisher
-//! metric, for models with an analytical Jacobian.
+//! metric, for models with an analytical Jacobian.  A prior adds `Cₚ⁻¹` to the
+//! information, as SAMMY's Bayes update `M′⁻¹ = M⁻¹ + GᵀV⁻¹G` adds the data to
+//! a prior covariance `M` (SAMMY manual, `docs/tex/fitting-procedure.tex`,
+//! eq. `bayes-eq-m-prime`).
 
 use faer::dyn_stack::{MemBuffer, MemStack};
 use faer::linalg::svd::{ComputeSvdVectors, svd, svd_scratch};
@@ -47,7 +50,8 @@ pub struct Prior {
 
 impl Prior {
     /// A measurement `mean ± sd` of the parameter at index `parameter` in the
-    /// [`ParameterSet`].
+    /// [`ParameterSet`]; [`poisson_fit`] refuses a mean that is not finite or
+    /// an sd that is not finite and positive.
     pub fn measured(parameter: usize, mean: f64, sd: f64) -> Self {
         Self {
             parameters: vec![parameter],
@@ -62,9 +66,11 @@ impl Prior {
     /// # Errors
     /// `FittingError::LengthMismatch` if `mean` or `covariance` does not
     /// match `parameters`; `FittingError::InvalidConfig` if `parameters` is
-    /// empty, or `covariance` is not finite, not symmetric to a relative
-    /// 1e-12, or not positive definite with the condition number of its
-    /// correlation matrix at most 1e10.
+    /// empty or lists a parameter twice, `mean` is not finite, or `covariance`
+    /// is not finite, not symmetric to a relative 1e-12, or not positive
+    /// definite with the condition number of its correlation matrix at most
+    /// 1e10; `FittingError::EvaluationFailed` if the eigendecomposition of
+    /// that matrix fails.
     pub fn correlated(
         parameters: &[usize],
         mean: &[f64],
@@ -90,16 +96,18 @@ impl Prior {
                 });
             }
         }
+        if !mean.iter().all(|m| m.is_finite())
+            || (0..k).any(|i| parameters[..i].contains(&parameters[i]))
+        {
+            return Err(FittingError::InvalidConfig(format!(
+                "a prior needs distinct parameters and a finite mean; got {parameters:?} and \
+                 {mean:?}"
+            )));
+        }
         let sd: Vec<f64> = (0..k).map(|i| covariance.get(i, i).sqrt()).collect();
-        let symmetric = (0..k).all(|i| {
-            (0..i).all(|j| {
-                let (upper, lower) = (covariance.get(j, i), covariance.get(i, j));
-                (upper - lower).abs() <= 1e-12 * upper.abs().max(lower.abs())
-            })
-        });
         if !(covariance.data.iter().all(|c| c.is_finite())
             && sd.iter().all(|&s| s > 0.0)
-            && symmetric)
+            && symmetric(k, |i, j| covariance.get(i, j)))
         {
             return Err(FittingError::InvalidConfig(format!(
                 "a prior covariance must be finite and symmetric with a positive diagonal; \
@@ -199,6 +207,15 @@ impl Prior {
         }
         inverse
     }
+}
+
+pub(crate) fn symmetric(k: usize, entry: impl Fn(usize, usize) -> f64) -> bool {
+    (0..k).all(|i| {
+        (0..i).all(|j| {
+            let (upper, lower) = (entry(j, i), entry(i, j));
+            (upper - lower).abs() <= 1e-12 * upper.abs().max(lower.abs())
+        })
+    })
 }
 
 /// Result of [`poisson_fit`].
@@ -646,7 +663,8 @@ pub fn poisson_fit(
     }) {
         return Err(FittingError::InvalidConfig(format!(
             "prior {i} must be on free parameters without another prior, with a finite mean \
-             and a finite positive sd; got {prior:?}"
+             and finite positive sds; got parameters {:?} with mean {:?}",
+            prior.parameters, prior.mean
         )));
     }
     params.set_free_values(&params.free_values());
@@ -1819,7 +1837,6 @@ mod tests {
             vec![prior(1, 1.5, 0.0)],
             vec![prior(1, 1.5, f64::INFINITY)],
             vec![block(&[0, 1]), prior(1, 1.5, 0.1)],
-            vec![block(&[1, 1])],
         ] {
             assert!(fit(&priors, false).is_err(), "{priors:?}");
         }
@@ -1866,6 +1883,8 @@ mod tests {
                 },
             ),
             Prior::correlated(&[], &[], &FlatMatrix::zeros(0, 0)),
+            Prior::correlated(&[0, 1], &[f64::NAN, 0.0], &two_by_two([1.0, 0.0, 0.0, 1.0])),
+            Prior::correlated(&[1, 1], &[0.0, 0.0], &two_by_two([1.0, 0.0, 0.0, 1.0])),
         ] {
             assert!(result.is_err(), "{result:?}");
         }

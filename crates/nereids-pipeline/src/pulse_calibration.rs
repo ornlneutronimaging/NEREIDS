@@ -13,8 +13,8 @@ use crate::open_beam::{Calibration, PULSE_NUMBERS, Pulse};
 
 /// The pulse numbers a calibration resolved, as indices into
 /// `(α₀, α₁, β₀, β₁, R, h²)`, with their fitted values and covariance, and
-/// the energies in eV of the calibration foil's lowest and highest resonance
-/// in its window.
+/// the energies in eV of the lowest and highest resonance in the calibration
+/// foil's window of its isotopes with a positive density.
 #[derive(Debug, Clone)]
 pub struct PulsePrior {
     pub(crate) numbers: Vec<usize>,
@@ -23,13 +23,35 @@ pub struct PulsePrior {
     pub(crate) line_span_ev: (f64, f64),
 }
 
+impl PulsePrior {
+    pub(crate) fn uncalibrated_line(
+        &self,
+        isotopes: &[(ResonanceData, Value)],
+        time_edges_us: &[f64],
+        t0_us: f64,
+        flight_path_m: f64,
+    ) -> Option<f64> {
+        let present = isotopes
+            .iter()
+            .filter(|(_, density)| *density != Value::Known(0.0))
+            .map(|(isotope, _)| isotope);
+        let (low, high) = self.line_span_ev;
+        lines_in_window(present, time_edges_us, t0_us, flight_path_m)
+            .into_iter()
+            .find(|e| !(low..=high).contains(e))
+    }
+}
+
 /// A pulse calibrated on a foil by [`fit_counts`].
 ///
 /// A pulse number the calibration fitted is resolved, unless it ended on a
 /// bound, where it is held at its fitted value; a number known in the
 /// calibration stays known.  The resolved numbers keep the fit's covariance of
 /// them, which is conditional on every quantity that ended on a bound being
-/// held there.
+/// held there.  When the calibration holds a number on its bound, or resolves
+/// one near it, an experiment's error bars on `t0`, the flight path and the
+/// pulse numbers are not standard errors; those on the densities and the
+/// temperature are.
 #[derive(Debug, Clone)]
 pub struct PulseCalibration {
     fit: CountsFit,
@@ -104,8 +126,14 @@ impl PulseCalibration {
         let prior = if resolved.is_empty() {
             None
         } else {
+            let present = measurement
+                .isotopes
+                .iter()
+                .zip(&fit.densities)
+                .filter(|(_, density)| **density > 0.0)
+                .map(|((isotope, _), _)| isotope);
             let lines = lines_in_window(
-                &measurement.isotopes,
+                present,
                 &measurement.time_edges_us,
                 fit.t0_us,
                 fit.flight_path_m,
@@ -187,8 +215,8 @@ impl PulseCalibration {
     }
 }
 
-pub(crate) fn lines_in_window(
-    isotopes: &[(ResonanceData, Value)],
+fn lines_in_window<'a>(
+    isotopes: impl Iterator<Item = &'a ResonanceData>,
     time_edges_us: &[f64],
     t0_us: f64,
     flight_path_m: f64,
@@ -196,21 +224,30 @@ pub(crate) fn lines_in_window(
     let energy = |t: f64| (TOF_FACTOR * flight_path_m / (t - t0_us).max(0.0)).powi(2);
     let window = energy(time_edges_us[time_edges_us.len() - 1])..=energy(time_edges_us[0]);
     isotopes
-        .iter()
-        .flat_map(|(isotope, _)| resonance_center_energies(&[isotope]))
+        .flat_map(|isotope| resonance_center_energies(&[isotope]))
         .filter(|e| window.contains(e))
         .collect()
 }
 
 #[cfg(test)]
 mod tests {
-    use nereids_endf::resonance::test_support::synthetic_isotope_multi;
+    use nereids_endf::resonance::test_support::{synthetic_isotope, synthetic_isotope_multi};
 
     use super::*;
     use crate::beam::BeamSpline;
 
-    fn measurement() -> Measurement {
+    fn measurement(absent: Option<f64>) -> Measurement {
         let lines = [(10.0, 0.05, 0.06), (25.0, 0.005, 0.06), (50.0, 0.01, 0.06)];
+        let foil = (
+            synthetic_isotope_multi(73, 181, &lines),
+            Value::Fitted(2e-3),
+        );
+        let impurity = absent.map(|energy| {
+            (
+                synthetic_isotope(74, 184, energy, 0.01, 0.06),
+                Value::Known(0.0),
+            )
+        });
         let edges: Vec<f64> = (0..=45).map(|i| 240.0 + 8.0 * f64::from(i)).collect();
         let bins = edges.len() - 1;
         Measurement {
@@ -222,10 +259,7 @@ mod tests {
             charge_ratio: 1.0,
             normalization: Value::Known(1.0),
             background: [Value::Known(0.0); 3],
-            isotopes: vec![(
-                synthetic_isotope_multi(73, 181, &lines),
-                Value::Fitted(2e-3),
-            )],
+            isotopes: std::iter::once(foil).chain(impurity).collect(),
             temperature_k: Value::Fitted(300.0),
         }
     }
@@ -286,8 +320,12 @@ mod tests {
 
     #[test]
     fn a_calibration_holds_numbers_on_a_bound_and_refuses_undetermined_ones() {
-        let (m, c) = (measurement(), calibration(Value::Known(0.01)));
-        let calibrated = PulseCalibration::from_fit(&m, &c, fit(8, 5))
+        let (m, c) = (measurement(Some(55.0)), calibration(Value::Known(0.01)));
+        let with_impurity = CountsFit {
+            densities: vec![2e-3, 0.0],
+            ..fit(8, 5)
+        };
+        let calibrated = PulseCalibration::from_fit(&m, &c, with_impurity)
             .unwrap()
             .calibration();
         let pulse = &calibrated.pulse;
@@ -345,5 +383,41 @@ mod tests {
         ] {
             assert!(PulseCalibration::from_fit(&m, &calibration(beta1), refused).is_err());
         }
+    }
+
+    #[test]
+    fn a_calibration_without_lines_or_with_a_singular_block_is_refused() {
+        let c = calibration(Value::Known(0.01));
+        let mut beyond = measurement(None);
+        beyond.isotopes[0].0 = synthetic_isotope(73, 181, 100.0, 0.05, 0.06);
+        assert!(matches!(
+            PulseCalibration::from_fit(&beyond, &c, fit(8, 5)),
+            Err(PipelineError::InvalidParameter(_))
+        ));
+        let mut singular = fit(8, 5);
+        let covariance = singular.covariance.as_mut().expect("covariance");
+        let (a, b) = (covariance.get(4, 4), covariance.get(6, 6));
+        *covariance.get_mut(4, 6) = (a * b).sqrt();
+        *covariance.get_mut(6, 4) = (a * b).sqrt();
+        assert!(matches!(
+            PulseCalibration::from_fit(&measurement(None), &c, singular),
+            Err(PipelineError::Fitting(_))
+        ));
+    }
+
+    #[test]
+    fn only_isotopes_that_may_be_present_must_lie_within_the_calibrated_lines() {
+        let prior = PulsePrior {
+            numbers: vec![1],
+            mean: vec![1.0],
+            covariance: FlatMatrix::zeros(1, 1),
+            line_span_ev: (10.0, 50.0),
+        };
+        let mut m = measurement(Some(55.0));
+        let line =
+            |m: &Measurement| prior.uncalibrated_line(&m.isotopes, &m.time_edges_us, 3.0, 25.0);
+        assert_eq!(line(&m), None);
+        m.isotopes[1].1 = Value::Fitted(1e-4);
+        assert_eq!(line(&m), Some(55.0));
     }
 }

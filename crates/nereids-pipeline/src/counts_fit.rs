@@ -29,7 +29,6 @@ use crate::open_beam::{
     laws, overdispersion, validate_counts, validate_live, weights_of,
 };
 use crate::pipeline::TEMPERATURE_BOUNDS_K;
-use crate::pulse_calibration::lines_in_window;
 
 /// A count in a bin predicted fewer counts than this has a chance below it
 /// under the model.
@@ -156,15 +155,15 @@ pub struct CountsFit {
     /// Covariance of the fitted quantities among the densities, in the order
     /// given, the temperature, the normalization, `b0`, `b1`, `b2`, `t0`, the
     /// flight path, `α₀`, `α₁`, `β₀`, `β₁`, `R` and `h²`, in that order: the
-    /// inverse of the information at the
-    /// fit, each run's expected information over its overdispersion plus
-    /// `1/sd²` for each measured quantity and `C⁻¹` over the pulse numbers a
-    /// calibration's [`Pulse::prior`](crate::open_beam::Pulse::prior) covers.  The row and column of a quantity
-    /// on one of its bounds, or that neither the counts nor a measurement
-    /// determine, are NaN, and the other entries are conditional on every
-    /// quantity that ended on a bound being held there; every entry is NaN
-    /// when a fitted temperature ends at 1 K or 5000 K.  `None` when the fit
-    /// did not converge.
+    /// inverse of the information at the fit, each run's expected information
+    /// over its overdispersion plus `1/sd²` for each measured quantity and
+    /// `C⁻¹` over the pulse numbers a calibration's
+    /// [`Pulse::prior`](crate::open_beam::Pulse::prior) covers.  The row and
+    /// column of a quantity on one of its bounds, or that neither the counts
+    /// nor a measurement determine, are NaN, and the other entries are
+    /// conditional on every quantity that ended on a bound being held there;
+    /// every entry is NaN when a fitted temperature ends at 1 K or 5000 K.
+    /// `None` when the fit did not converge.
     ///
     /// The error bars take every known quantity as exact.
     /// They are not reliable where the counts barely determine a fitted
@@ -214,8 +213,7 @@ pub struct CountsFit {
     /// calibration less often than its value says, the more so the fewer bins
     /// each run counts.  A calibration fitted to the same open-beam run is not
     /// independent of the fit, which the test does not account for.  `None`
-    /// without a
-    /// calibration, when `covariance` is `None` or withheld, or when
+    /// without a calibration, when `covariance` is `None` or withheld, or when
     /// [`consistency`] gives none.
     pub pulse_consistency: Option<Consistency>,
     /// Step, in µs, of the fit's grid.
@@ -281,8 +279,9 @@ pub struct CountsFit {
 /// overdispersion, plus `½((x − value)/sd)²` for each [`Value::Measured`]
 /// quantity `x`, and `½(θ − m)ᵀC⁻¹(θ − m)` over the pulse numbers `θ` a
 /// calibration's [`Pulse::prior`](crate::open_beam::Pulse::prior) covers,
-/// with `m` and `C` their calibrated values and covariance.  The open-beam run is weighted with the open-beam fit's
-/// overdispersion, and the sample run first with the same.  The fit is
+/// with `m` and `C` their calibrated values and covariance.  The open-beam
+/// run is weighted with the open-beam fit's overdispersion, and the sample
+/// run first with the same.  The fit is
 /// repeated from its answer while the sample run's overdispersion, measured on
 /// the bins the first fit predicts at least one count, changes by more than
 /// 1%, the coarser grid of the accepted pair is wider than the rule at the
@@ -312,10 +311,10 @@ pub struct CountsFit {
 /// not finite and in its quantity's range, a measured value's sd is not finite
 /// and positive, bounds are not `lower < upper` in that range
 /// with the start between them, the pulse's calibration covers a number that
-/// is not fitted or is measured, the sample has a resonance between the
-/// energies of its last and first time edges, at the starting `t0` and flight
-/// path, outside the energies of the calibration foil's resonances, there
-/// are no isotopes, an isotope is listed
+/// is not fitted or is measured, an isotope of the sample not known to be
+/// absent has a resonance between the energies of its last and first time
+/// edges, at the starting `t0` and flight path, outside the energies of the
+/// calibration foil's resonances, there are no isotopes, an isotope is listed
 /// twice, an isotope's resonance data are not finite, or the energies its
 /// broadened cross section reads on the grid at the starting `t0`, flight path
 /// and pulse, or at the fitted ones of any pass that rebuilds it, at the known
@@ -449,17 +448,14 @@ pub fn fit_counts(
     validate_counts("sample", sample_counts, bins)?;
     let open_live = validate_live("open-beam", open_live.as_deref(), bins)?;
     let sample_live = validate_live("sample", sample_live.as_deref(), bins)?;
-    if let Some(prior) = &pulse.prior {
+    if let Some(prior) = &pulse.prior
+        && let Some(line) = prior.uncalibrated_line(isotopes, time_edges_us, start[0], start[1])
+    {
         let (low, high) = prior.line_span_ev;
-        if let Some(line) = lines_in_window(isotopes, time_edges_us, start[0], start[1])
-            .into_iter()
-            .find(|e| !(low..=high).contains(e))
-        {
-            return invalid(format!(
-                "the sample has a resonance at {line} eV, outside the {low}–{high} eV of the \
-                 resonances the pulse was calibrated on"
-            ));
-        }
+        return invalid(format!(
+            "the sample has a resonance at {line} eV, outside the {low}–{high} eV of the \
+             resonances the pulse was calibrated on"
+        ));
     }
 
     let in_span = |grid: &FlightTimeGrid| -> Result<Vec<Vec<f64>>, PipelineError> {
