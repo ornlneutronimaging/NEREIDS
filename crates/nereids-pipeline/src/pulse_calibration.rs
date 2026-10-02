@@ -328,18 +328,17 @@ impl PulseCalibration {
     /// # Errors
     /// [`PipelineError::InvalidParameter`] if the two calibrations name the
     /// same foil, as the same foil re-measured tests only repeatability,
-    /// share a sample run, know different pulse numbers or know one at
+    /// share a run other than the open-beam run, know different pulse numbers
+    /// or know one at
     /// different values, hold one on different bounds, or resolve no number
     /// in common;
     /// [`PipelineError::Fitting`] if a decomposition fails.
     pub fn transfer(&self, other: &PulseCalibration) -> Result<Transfer, PipelineError> {
         let invalid = |message: String| Err(PipelineError::InvalidParameter(message));
-        if self.provenance.foil == other.provenance.foil
-            || self.provenance.sample == other.provenance.sample
-        {
+        if !separate(&self.provenance, &other.provenance) {
             return invalid(format!(
-                "a transfer is to a physically different foil with its own sample run; got {:?} \
-                 and {:?}",
+                "a transfer is to a physically different foil that shares no run but the \
+                 open-beam run; got {:?} and {:?}",
                 self.provenance, other.provenance
             ));
         }
@@ -515,7 +514,8 @@ impl PulseCalibration {
     /// [`Self::new`] takes it, a value outside its quantity's range or one
     /// [`DetectorPulse::new`](nereids_physics::ikeda_carpenter::DetectorPulse::new)
     /// refuses, or a recorded transfer [`Self::record_transfer`] could not
-    /// have written: to this calibration's foil or sample run, with a
+    /// have written: to this calibration's foil or sharing a run other than
+    /// the open-beam run, with a
     /// provenance or foil [`Self::new`] refuses, an overdispersion below 1,
     /// degrees of freedom not the number of pulse numbers both foils resolve,
     /// `d2` negative, `p` not within a relative 1e-12 of the χ² survival of
@@ -795,8 +795,7 @@ fn check_record(
         };
         once && in_range && as_here
     });
-    if other.foil == provenance.foil
-        || other.sample == provenance.sample
+    if !separate(provenance, &other)
         || record
             .sample_overdispersion
             .is_some_and(|phi| !(phi.is_finite() && phi >= 1.0))
@@ -804,13 +803,17 @@ fn check_record(
         || !bounds
     {
         return Err(PipelineError::InvalidParameter(format!(
-            "a recorded transfer is to another foil with its own sample run, on as many degrees \
-             of freedom as numbers both foils resolve, with d² of 0 or more, p its χ² survival \
-             and above {TRANSFER_P}, and each bound once as this calibration holds or resolves \
-             it; got {record:?}"
+            "a recorded transfer is to another foil sharing no run but the open-beam run, on as \
+             many degrees of freedom as numbers both foils resolve, with d² of 0 or more, p its \
+             χ² survival and above {TRANSFER_P}, and each bound once as this calibration holds \
+             or resolves it; got {record:?}"
         )));
     }
     Ok(())
+}
+
+fn separate(a: &Provenance, b: &Provenance) -> bool {
+    a.foil != b.foil && a.sample != b.sample && a.sample != b.open && a.open != b.sample
 }
 
 fn check_provenance(provenance: &Provenance) -> Result<(), PipelineError> {
@@ -1516,11 +1519,17 @@ mod tests {
         same_foil.provenance.foil = "foil-a".into();
         let mut shared = other(1.15, 0.5, &[]);
         shared.provenance.sample = "sample-1".into();
+        let mut open_as_sample = other(1.15, 0.5, &[]);
+        open_as_sample.provenance.sample = "open-1".into();
+        let mut sample_as_open = other(1.15, 0.5, &[]);
+        sample_as_open.provenance.open = "sample-1".into();
         let mut disjoint = other(1.15, 0.5, &[4, 5, 6, 7]);
         disjoint.numbers[2] = 0.0;
         for (b, refusal) in [
             (same_foil, "physically different foil"),
             (shared, "physically different foil"),
+            (open_as_sample, "physically different foil"),
+            (sample_as_open, "physically different foil"),
             (other(1.15, 0.6, &[]), "different pulse models"),
             (disjoint, "resolve no pulse number in common"),
         ] {
@@ -1597,7 +1606,7 @@ mod tests {
         let p = rounded["transfer"]["p"].as_f64().unwrap();
         rounded["transfer"]["p"] = (p * (1.0 + 1e-13)).into();
         assert!(PulseCalibration::from_json(&rounded.to_string()).is_ok());
-        let edits: [Edit; 10] = [
+        let edits: [Edit; 12] = [
             ("p not its d2's", |v| v["transfer"]["p"] = 0.5.into()),
             ("failed", |v| {
                 v["transfer"]["d2"] = 50.0.into();
@@ -1613,6 +1622,12 @@ mod tests {
             }),
             ("same sample run", |v| {
                 v["transfer"]["provenance"]["sample"] = v["provenance"]["sample"].clone();
+            }),
+            ("this open run as the other's sample", |v| {
+                v["transfer"]["provenance"]["sample"] = v["provenance"]["open"].clone();
+            }),
+            ("this sample run as the other's open", |v| {
+                v["transfer"]["provenance"]["open"] = v["provenance"]["sample"].clone();
             }),
             ("bound name", |v| {
                 v["transfer"]["bounds"][0]["name"] = "gamma".into();
