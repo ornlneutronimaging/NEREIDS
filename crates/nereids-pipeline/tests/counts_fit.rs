@@ -2395,6 +2395,11 @@ mod pulse_calibration {
                 "{i}: mean {mean}, sd {sd}, within one sd {covered}"
             );
         }
+        let pairs: Vec<_> = fits.iter().map(|(fit, phi)| (fit, *phi)).collect();
+        pulse_consistencies_follow_chi_squared(&pairs);
+    }
+
+    fn pulse_consistencies_follow_chi_squared(fits: &[(&CountsFit, [Option<f64>; 2])]) {
         let weighted: Vec<f64> = fits
             .iter()
             .map(|(fit, calibration)| {
@@ -2448,7 +2453,7 @@ mod pulse_calibration {
             );
             let counts = experiment_counts(&p);
             let seeds = 1_000 * case as u64;
-            let fits: Vec<(CountsFit, bool)> = (0..400_u64)
+            let fits: Vec<(CountsFit, [Option<f64>; 2], bool)> = (0..400_u64)
                 .into_par_iter()
                 .filter_map(|seed| {
                     let drawn = draws(&foil_counts, 81_000 + seeds + seed, [1.0; 2]);
@@ -2461,20 +2466,21 @@ mod pulse_calibration {
                     let drawn = draws(&counts, 91_000 + seeds + seed, [1.0; 2]);
                     Some((
                         experiment_with(&p, drawn, &calibrated.calibration()),
+                        calibration_fit.overdispersion,
                         calibration_fit.on_bound[4],
                     ))
-                    .filter(|(fit, _)| fit.converged)
+                    .filter(|(fit, _, _)| fit.converged)
                 })
                 .collect();
             assert!(fits.len() >= 398, "{alpha0}: {} converged", fits.len());
             let n = fits.len() as f64;
-            let held = fits.iter().filter(|(_, held)| *held).count();
+            let held = fits.iter().filter(|(_, _, held)| *held).count();
             assert!(held > 0, "{alpha0}: no calibration ended on the bound");
-            bounded += fits.iter().filter(|(fit, _)| fit.on_bound[4]).count();
+            bounded += fits.iter().filter(|(fit, _, _)| fit.on_bound[4]).count();
             for (i, truth) in [(0, CALIBRATION_DENSITY), (1, EXPERIMENT_K)] {
                 let pulls: Vec<f64> = fits
                     .iter()
-                    .map(|(fit, _)| {
+                    .map(|(fit, _, _)| {
                         let estimate = [fit.densities[0], fit.temperature_k][i];
                         (estimate - truth) / error_bar(fit, i)
                     })
@@ -2488,15 +2494,8 @@ mod pulse_calibration {
                     "{alpha0} {i}: mean {mean}, sd {sd}, within one sd {covered}"
                 );
             }
-            let rejected = fits
-                .iter()
-                .filter(|(fit, _)| fit.pulse_consistency.expect("consistency").p < 0.05)
-                .count() as f64
-                / n;
-            assert!(
-                rejected <= 0.05 + 3.0 * (0.05 * 0.95 / n).sqrt(),
-                "{alpha0}: {rejected} rejected at a reported 0.05"
-            );
+            let pairs: Vec<_> = fits.iter().map(|(fit, phi, _)| (fit, *phi)).collect();
+            pulse_consistencies_follow_chi_squared(&pairs);
         }
         assert!(bounded > 0, "no experiment ended on the bound");
     }

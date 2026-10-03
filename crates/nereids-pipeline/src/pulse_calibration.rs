@@ -131,7 +131,9 @@ struct Foil {
 /// the prior; a number known in the calibration stays known.  The prior is
 /// the calibration's [`CountsFit::unbounded`] Gaussian in the fitted numbers,
 /// marginal over the other quantities, so a number that ended on a bound
-/// keeps its uncertainty and the experiment fit applies the bound.  When the
+/// keeps its uncertainty and the experiment fit applies the bound.  A box on
+/// another quantity of the calibration foil does not reach the prior, which
+/// it could only narrow.  When the
 /// calibration fitted a pulse number, an experiment's pulse carries the
 /// foil's [`line_span_ev`](Pulse::line_span_ev).
 #[derive(Debug, Clone)]
@@ -918,7 +920,7 @@ mod tests {
         }
     }
 
-    fn fit(free: usize, bounded: &[usize]) -> CountsFit {
+    fn fit(free: usize) -> CountsFit {
         let mut covariance = FlatMatrix::zeros(free, free);
         for i in 0..free {
             *covariance.get_mut(i, i) = 0.01 * (i + 1) as f64;
@@ -928,10 +930,6 @@ mod tests {
         for (i, j, c) in pairs.into_iter().filter(|&(i, j, _)| i.max(j) < free) {
             *covariance.get_mut(i, j) = c;
             *covariance.get_mut(j, i) = c;
-        }
-        let mut on_bound = vec![false; free];
-        for &i in bounded {
-            on_bound[i] = true;
         }
         let unbounded = Unbounded {
             mean: (0..free).map(|i| -0.002 * (i + 1) as f64).collect(),
@@ -953,7 +951,7 @@ mod tests {
             fwhm_squared_us2: 0.12,
             covariance: Some(covariance),
             unbounded: Some(unbounded),
-            on_bound,
+            on_bound: vec![false; free],
             beam: BeamSpline::constant(200.0, 600.0, 1.0),
             beam_at_limit: false,
             deviance: 0.0,
@@ -972,7 +970,7 @@ mod tests {
         let (m, c) = (measurement(Some(55.0)), calibration(Value::Known(0.01)));
         let with_impurity = CountsFit {
             densities: vec![2e-3, 0.0],
-            ..fit(8, &[5])
+            ..fit(8)
         };
         let experiment = calibrated(&m, &c, with_impurity).unwrap().calibration();
         let pulse = &experiment.pulse;
@@ -988,7 +986,7 @@ mod tests {
         );
         let prior = pulse.prior.as_ref().expect("prior");
         assert_eq!(prior.numbers, [1, 2, 4, 5]);
-        let unbounded = fit(8, &[5]).unbounded.expect("unbounded");
+        let unbounded = fit(8).unbounded.expect("unbounded");
         let at = [4, 5, 6, 7];
         assert_eq!(prior.mean, at.map(|i| unbounded.mean[i]));
         for (a, i) in at.into_iter().enumerate() {
@@ -998,8 +996,8 @@ mod tests {
         }
         assert_eq!(pulse.line_span_ev, Some((10.0, 50.0)));
 
-        let mut undetermined = fit(8, &[5]);
-        let mut withheld = fit(8, &[5]);
+        let mut undetermined = fit(8);
+        let mut withheld = fit(8);
         let covariance = &mut undetermined
             .unbounded
             .as_mut()
@@ -1022,14 +1020,14 @@ mod tests {
             (
                 CountsFit {
                     converged: false,
-                    ..fit(8, &[5])
+                    ..fit(8)
                 },
                 "converged fit",
             ),
             (
                 CountsFit {
                     unbounded: None,
-                    ..fit(8, &[5])
+                    ..fit(8)
                 },
                 "no Gaussian without its bounds",
             ),
@@ -1049,10 +1047,10 @@ mod tests {
         let mut beyond = measurement(None);
         beyond.isotopes[0].0 = synthetic_isotope(73, 181, 100.0, 0.05, 0.06);
         assert!(matches!(
-            calibrated(&beyond, &c, fit(8, &[5])),
+            calibrated(&beyond, &c, fit(8)),
             Err(PipelineError::InvalidParameter(_))
         ));
-        let mut singular = fit(8, &[5]);
+        let mut singular = fit(8);
         let covariance = &mut singular.unbounded.as_mut().expect("unbounded").covariance;
         let (a, b) = (covariance.get(4, 4), covariance.get(6, 6));
         *covariance.get_mut(4, 6) = (a * b).sqrt();
@@ -1078,23 +1076,19 @@ mod tests {
     }
 
     #[test]
-    fn a_calibration_with_every_fitted_number_on_a_bound_still_bounds_the_lines() {
+    fn a_calibration_carries_its_line_span_exactly_when_it_fits_a_number() {
         let c = calibration(Value::Known(0.01));
-        let on_bounds = CountsFit {
+        let moderated = CountsFit {
             beta: [0.08, 0.01],
-            ..fit(8, &[4, 5, 6, 7])
+            ..fit(8)
         };
-        let held = calibrated(&measurement(None), &c, on_bounds)
+        let fitted = calibrated(&measurement(None), &c, moderated)
             .unwrap()
             .calibration();
-        assert_eq!(
-            held.pulse.prior.as_ref().expect("prior").numbers,
-            [1, 2, 4, 5]
-        );
-        assert_eq!(held.pulse.line_span_ev, Some((10.0, 50.0)));
+        assert_eq!(fitted.pulse.line_span_ev, Some((10.0, 50.0)));
         let mut wider = measurement(Some(55.0));
         wider.isotopes[1].1 = Value::Fitted(1e-4);
-        match fit_counts(&wider, &held) {
+        match fit_counts(&wider, &fitted) {
             Err(PipelineError::InvalidParameter(message)) => {
                 assert!(message.contains("55 eV, outside the"), "{message}")
             }
@@ -1107,7 +1101,7 @@ mod tests {
         pulse.beta[0] = Value::Known(0.08);
         pulse.r = Value::Known(0.2);
         pulse.fwhm_squared_us2 = Value::Known(0.1);
-        let unfitted = calibrated(&measurement(None), &known, fit(4, &[]))
+        let unfitted = calibrated(&measurement(None), &known, fit(4))
             .unwrap()
             .calibration();
         assert_eq!(unfitted.pulse.line_span_ev, None);
@@ -1117,7 +1111,7 @@ mod tests {
         let fit = CountsFit {
             r: 0.012_537_345_881_063_615,
             overdispersion: [Some(1.25), Some(1.5)],
-            ..fit(8, &[5])
+            ..fit(8)
         };
         calibrated(
             &measurement(Some(55.0)),
@@ -1224,7 +1218,7 @@ mod tests {
         pulse.beta[0] = Value::Known(0.0);
         pulse.r = Value::Known(0.21);
         pulse.fwhm_squared_us2 = Value::Known(0.12);
-        let unfitted = calibrated(&measurement(None), &known, fit(4, &[])).unwrap();
+        let unfitted = calibrated(&measurement(None), &known, fit(4)).unwrap();
         let mut stray: serde_json::Value = serde_json::from_str(&unfitted.to_json()).unwrap();
         assert!(PulseCalibration::from_json(&stray.to_string()).is_ok());
         stray["mean"] = serde_json::json!([1.0]);
@@ -1442,7 +1436,7 @@ mod tests {
             beta: [0.004, 0.01],
             r: 0.205,
             fwhm_squared_us2: 0.11,
-            ..fit(8, &[])
+            ..fit(8)
         };
         let unbounded = fit.unbounded.as_mut().expect("unbounded");
         unbounded.mean[4] += alpha1 - 1.1;
@@ -1519,7 +1513,7 @@ mod tests {
         pulse.alpha[1] = Value::Known(1.1);
         pulse.beta[0] = Value::Known(0.0);
         pulse.fwhm_squared_us2 = Value::Known(0.12);
-        let unfitted = calibrated(&measurement(None), &known, fit(4, &[])).unwrap();
+        let unfitted = calibrated(&measurement(None), &known, fit(4)).unwrap();
         for (a, b, refusal) in [
             (&a, same_foil, "physically different foil"),
             (&a, shared, "physically different foil"),
@@ -1528,12 +1522,12 @@ mod tests {
             (&a, other(1.15, 0.6), "different pulse models"),
             (
                 &a,
-                calibrated_other(&known_r, fit(7, &[])),
+                calibrated_other(&known_r, fit(7)),
                 "different pulse models",
             ),
             (
                 &unfitted,
-                calibrated_other(&known, fit(4, &[])),
+                calibrated_other(&known, fit(4)),
                 "fit no pulse number",
             ),
         ] {

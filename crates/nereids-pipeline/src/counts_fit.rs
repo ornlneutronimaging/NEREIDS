@@ -210,15 +210,15 @@ pub struct CountsFit {
     /// measurement's.  `None` when `covariance` is.
     pub measured_pulls: Option<Vec<f64>>,
     /// Whether the counts accept the pulse's calibration on the numbers it
-    /// covers, by [`consistency`] with the fitted numbers and their
-    /// covariance.  The counts' information is divided by each run's
+    /// covers, by [`consistency`] with the fit's numbers and covariance
+    /// without their bounds ([`Self::unbounded`]).  The counts' information is divided by each run's
     /// overdispersion, so the test weakens as the overdispersion grows.  The
     /// overdispersion is at least 1, so with Poisson counts its estimate
     /// inflates the covariances the test uses, and `p` rejects a right
     /// calibration less often than its value says, the more so the fewer bins
     /// each run counts.  A calibration fitted to the same open-beam run is not
     /// independent of the fit, which the test does not account for.  `None`
-    /// without a calibration, when `covariance` is `None` or withheld, or when
+    /// without a calibration, when `unbounded` is `None` or withheld, or when
     /// [`consistency`] gives none.
     pub pulse_consistency: Option<Consistency>,
     /// Step, in µs, of the fit's grid.
@@ -713,8 +713,8 @@ pub fn fit_counts(
             .position(|&p| free[p] == parameter)
             .expect("a measured or calibrated quantity is fitted")
     };
-    let pulse_consistency = match (&pulse_prior, &covariance) {
-        (Some(prior), Some(block)) => {
+    let pulse_consistency = match (&pulse_prior, &unbounded) {
+        (Some(prior), Some(unbounded)) => {
             let at: Vec<usize> = calibrated_parameters
                 .iter()
                 .map(|&parameter| position(parameter))
@@ -722,15 +722,11 @@ pub fn fit_counts(
             let mut posterior = FlatMatrix::zeros(at.len(), at.len());
             for (a, &i) in at.iter().enumerate() {
                 for (b, &j) in at.iter().enumerate() {
-                    *posterior.get_mut(a, b) = block.get(i, j);
+                    *posterior.get_mut(a, b) = unbounded.covariance.get(i, j);
                 }
             }
-            let estimate: Vec<f64> = calibrated_parameters
-                .iter()
-                .map(|&parameter| params[parameter])
-                .collect();
-            let held: Vec<bool> = at.iter().map(|&a| on_bound[a]).collect();
-            consistency(prior, &estimate, &held, &posterior)?
+            let estimate: Vec<f64> = at.iter().map(|&i| unbounded.mean[i]).collect();
+            consistency(prior, &estimate, &posterior)?
         }
         _ => None,
     };
