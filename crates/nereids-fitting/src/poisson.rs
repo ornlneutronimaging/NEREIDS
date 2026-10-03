@@ -14,7 +14,6 @@
 //! eq. `bayes-eq-m-prime`).
 
 use faer::dyn_stack::{MemBuffer, MemStack};
-use faer::linalg::solvers::Solve;
 use faer::linalg::svd::{ComputeSvdVectors, svd, svd_scratch};
 use faer::{Mat, Par, Side};
 
@@ -169,89 +168,6 @@ impl Prior {
         }
     }
 
-    /// The prior on the rest of its parameters given those in `held`, each a
-    /// parameter index in the [`ParameterSet`] with its value: mean
-    /// `m_R + C_RH C_HH⁻¹(θ_H − m_H)` and covariance `C_RR − C_RH C_HH⁻¹ C_HR`,
-    /// over the rest in this prior's order.
-    ///
-    /// # Errors
-    /// `FittingError::InvalidConfig` if this prior's mean is not finite or a
-    /// measured sd not finite and positive, a held parameter is not one of
-    /// this prior's, is held twice, or has a value that is not finite, or every
-    /// parameter is held; `FittingError::EvaluationFailed` if a decomposition
-    /// fails.
-    pub fn conditioned(&self, held: &[(usize, f64)]) -> Result<Prior, FittingError> {
-        if !self.is_valid() {
-            return Err(FittingError::InvalidConfig(format!(
-                "a prior with a finite mean and finite positive sds is conditioned; got {self:?}"
-            )));
-        }
-        let k = self.parameters.len();
-        let positions: Option<Vec<usize>> = held
-            .iter()
-            .map(|(parameter, _)| self.parameters.iter().position(|p| p == parameter))
-            .collect();
-        let rest: Vec<usize> = (0..k)
-            .filter(|i| positions.as_ref().is_some_and(|held| !held.contains(i)))
-            .collect();
-        let Some(held_at) = positions.filter(|held_at| {
-            rest.len() + held_at.len() == k
-                && !rest.is_empty()
-                && held.iter().all(|(_, value)| value.is_finite())
-        }) else {
-            return Err(FittingError::InvalidConfig(format!(
-                "a prior is conditioned on some of its own parameters, each once at a finite \
-                 value, leaving at least one; got {held:?} for {:?}",
-                self.parameters
-            )));
-        };
-        let held_values: Vec<f64> = held.iter().map(|(_, value)| *value).collect();
-        let block = |rows: &[usize], columns: &[usize]| {
-            Mat::from_fn(rows.len(), columns.len(), |a, b| {
-                self.covariance(rows[a], columns[b])
-            })
-        };
-        let cross = block(&held_at, &rest);
-        let shift = Mat::from_fn(held_at.len(), 1, |a, _| {
-            held_values[a] - self.mean[held_at[a]]
-        });
-        let held_block = block(&held_at, &held_at)
-            .llt(Side::Lower)
-            .map_err(|e| FittingError::EvaluationFailed(format!("{e:?}")))?;
-        let gain = held_block.solve(&cross);
-        let along = held_block.solve(&shift);
-        let n = rest.len();
-        let mean: Vec<f64> = (0..n)
-            .map(|b| {
-                self.mean[rest[b]]
-                    + (0..held_at.len())
-                        .map(|a| cross[(a, b)] * along[(a, 0)])
-                        .sum::<f64>()
-            })
-            .collect();
-        let mut remaining = FlatMatrix::zeros(n, n);
-        for b in 0..n {
-            for c in 0..n {
-                let removed = |b: usize, c: usize| -> f64 {
-                    (0..held_at.len())
-                        .map(|a| cross[(a, b)] * gain[(a, c)])
-                        .sum()
-                };
-                *remaining.get_mut(b, c) =
-                    self.covariance(rest[b], rest[c]) - 0.5 * (removed(b, c) + removed(c, b));
-            }
-        }
-        let parameters: Vec<usize> = rest.iter().map(|&i| self.parameters[i]).collect();
-        let conditioned = Prior::factored(&parameters, &mean, &remaining);
-        if conditioned.is_valid() {
-            Ok(conditioned)
-        } else {
-            Err(FittingError::EvaluationFailed(format!(
-                "the conditioned prior is not positive definite: {remaining:?}"
-            )))
-        }
-    }
-
     pub(crate) fn covariance(&self, i: usize, j: usize) -> f64 {
         let k = self.parameters.len();
         (0..=i.min(j))
@@ -340,6 +256,25 @@ pub struct PoissonResult {
     /// the share the priors take.  `None` when `covariance` is `None` or its
     /// decomposition fails.
     pub leverage: Option<Vec<f64>>,
+    /// The free parameters' Gaussian without their bounds; see [`Unbounded`].
+    /// `None` when `covariance` is, when the decomposition over every free
+    /// parameter fails, or when a bin predicted zero adds slope to the
+    /// gradient of a parameter on a bound.
+    pub unbounded: Option<Unbounded>,
+}
+
+/// The expected-information (Fisher scoring) expansion of the objective at
+/// the fit over every free parameter, bounds left out: covariance `F⁻¹`, `F`
+/// the expected information of all free parameters, and mean `θ̂ − F⁻¹g`, `g`
+/// the objective's gradient at the fit, which the convergence test makes
+/// negligible off the bounds.  Both are taken over the directions the counts
+/// and priors determine; the mean and the rows and columns of a parameter
+/// with a component along a direction they do not determine are NaN.  With
+/// none on a bound the covariance is [`PoissonResult::covariance`].
+#[derive(Debug, Clone)]
+pub struct Unbounded {
+    pub mean: Vec<f64>,
+    pub covariance: FlatMatrix,
 }
 
 pub(crate) const NEWTON_DECREMENT_TOL: f64 = 1e-6;
@@ -593,9 +528,23 @@ impl Decomposition {
             .sum::<f64>()
     }
 
-    fn step(&self, linear: &Linearization, n_free: usize, damping: f64) -> Vec<f64> {
+    fn is_determined(&self, k: usize) -> bool {
+        self.singular[k].powi(2) >= DEGENERATE_EIGENVALUE
+    }
+
+    fn determined(&self) -> impl Iterator<Item = usize> + '_ {
+        (0..self.singular.len()).filter(|&k| self.is_determined(k))
+    }
+
+    fn step(
+        &self,
+        directions: impl Iterator<Item = usize>,
+        linear: &Linearization,
+        n_free: usize,
+        damping: f64,
+    ) -> Vec<f64> {
         let mut direction = vec![0.0; n_free];
-        for k in self.spanned() {
+        for k in directions {
             let s = self.singular[k];
             let coefficient = self.along(k, linear) * s / (s * s + damping);
             for (i, &col) in self.columns.iter().enumerate() {
@@ -613,11 +562,7 @@ impl Decomposition {
 
     fn error_bars(&self, n_free: usize) -> (FlatMatrix, Vec<Option<f64>>) {
         let n = self.columns.len();
-        let determined: Vec<bool> = self
-            .singular
-            .iter()
-            .map(|s| s * s >= DEGENERATE_EIGENVALUE)
-            .collect();
+        let determined: Vec<bool> = (0..n).map(|k| self.is_determined(k)).collect();
         let largest = self.singular.iter().fold(0.0_f64, |m, &s| m.max(s));
         let resolved: Vec<bool> = (0..n)
             .map(|i| {
@@ -799,7 +744,8 @@ pub fn poisson_fit(
         let start = params.free_values();
         let mut accepted = None;
         for _ in 0..MAX_REJECTIONS {
-            let direction = decomposition.step(&linear, free.len(), damping);
+            let direction =
+                decomposition.step(decomposition.spanned(), &linear, free.len(), damping);
             let unprojected: Vec<f64> = start.iter().zip(&direction).map(|(x, d)| x - d).collect();
             params.set_free_values(&unprojected);
             if let Some(trial_model) = model
@@ -829,7 +775,7 @@ pub fn poisson_fit(
         .iter()
         .map(|&idx| on_bound(&params.params[idx]))
         .collect();
-    let (covariance, uncertainties, leverage) = match &at_minimum {
+    let (covariance, uncertainties, leverage, unbounded) = match &at_minimum {
         Some(linear) if config.compute_covariance => {
             let interior: Vec<usize> = (0..free.len()).filter(|&j| !bounded[j]).collect();
             let decomposition = Decomposition::new(&linear.weighted, &interior);
@@ -837,10 +783,13 @@ pub fn poisson_fit(
                 || withheld(free.len()),
                 |decomposition| decomposition.error_bars(free.len()),
             );
-            let leverage = decomposition.map(|decomposition| decomposition.leverage(y_obs.len()));
-            (Some(covariance), Some(errors), leverage)
+            let leverage = decomposition
+                .as_ref()
+                .map(|decomposition| decomposition.leverage(y_obs.len()));
+            let unbounded = unbounded(linear, &params.free_values(), &bounded);
+            (Some(covariance), Some(errors), leverage, unbounded)
         }
-        _ => (None, None, None),
+        _ => (None, None, None, None),
     };
     Ok(PoissonResult {
         deviance: deviance(y_obs, &y_model),
@@ -851,7 +800,28 @@ pub fn poisson_fit(
         uncertainties,
         on_bound: bounded,
         leverage,
+        unbounded,
     })
+}
+
+fn unbounded(linear: &Linearization, fitted: &[f64], bounded: &[bool]) -> Option<Unbounded> {
+    if (0..fitted.len()).any(|j| bounded[j] && linear.zero_slope[j] != 0.0) {
+        return None;
+    }
+    let columns: Vec<usize> = (0..fitted.len()).collect();
+    let decomposition = Decomposition::new(&linear.weighted, &columns)?;
+    let step = decomposition.step(decomposition.determined(), linear, fitted.len(), 0.0);
+    let covariance = decomposition.error_bars(fitted.len()).0;
+    let mean = (0..fitted.len())
+        .map(|i| {
+            if covariance.get(i, i).is_nan() {
+                f64::NAN
+            } else {
+                fitted[i] - step[i]
+            }
+        })
+        .collect();
+    Some(Unbounded { mean, covariance })
 }
 
 /// Fixed-flux counts-domain forward model: `Y_model = flux × T_model(θ) + background`.
@@ -2113,6 +2083,139 @@ mod tests {
                 );
             }
         }
+        let unbounded = result.unbounded.expect("unbounded");
+        assert_eq!(unbounded.covariance.data, reported.data);
+        for k in 0..2 {
+            assert!((unbounded.mean[k] - fitted[k]).abs() <= 2e-3 * covariance[k][k].sqrt());
+        }
+    }
+
+    const FAR_COUNTS: [f64; 5] = [9743.0, 20046.0, 30110.0, 39769.0, 49761.0];
+
+    fn fit_far(params: Vec<FitParameter>, priors: &[Prior]) -> PoissonResult {
+        let mut params = ParameterSet::new(params);
+        poisson_fit(
+            &Mixture,
+            &FAR_COUNTS,
+            priors,
+            &mut params,
+            &PoissonConfig::default(),
+        )
+        .unwrap()
+    }
+
+    #[test]
+    fn the_unbounded_gaussian_is_one_newton_step_past_the_bounds() {
+        let (x, y) = (
+            FitParameter::non_negative("x", 9000.0),
+            FitParameter::non_negative("y", 1.0),
+        );
+        let capped = FitParameter {
+            upper: 9000.0,
+            ..x.clone()
+        };
+        let cases = [
+            (vec![x.clone(), y.clone()], None, 1),
+            (vec![capped, FitParameter::unbounded("y", 1.0)], None, 0),
+            (vec![x, y], Some((10.0, 20.0)), 1),
+        ];
+        for (params, prior, held) in cases {
+            let priors: Vec<Prior> = prior
+                .iter()
+                .map(|&(mean, sd)| Prior::measured(1, mean, sd))
+                .collect();
+            let result = fit_far(params, &priors);
+            assert!(result.converged && result.on_bound[held] && !result.on_bound[1 - held]);
+            let theta = [result.params[0], result.params[1]];
+            let (mut information, mut gradient) = ([[0.0; 2]; 2], [0.0; 2]);
+            for (a, n) in MIXTURE.iter().zip(FAR_COUNTS) {
+                let mu = a[0] * theta[0] + a[1] * theta[1];
+                for k in 0..2 {
+                    gradient[k] += a[k] * (1.0 - n / mu);
+                    for l in 0..2 {
+                        information[k][l] += a[k] * a[l] / mu;
+                    }
+                }
+            }
+            if let Some((mean, sd)) = prior {
+                information[1][1] += sd.powi(-2);
+                gradient[1] += (theta[1] - mean) / sd.powi(2);
+            }
+            let covariance = inverse(information);
+            let unbounded = result.unbounded.expect("unbounded");
+            for k in 0..2 {
+                let mean = theta[k] - (0..2).map(|l| covariance[k][l] * gradient[l]).sum::<f64>();
+                let sd = covariance[k][k].sqrt();
+                assert!(
+                    (unbounded.mean[k] - mean).abs() <= 1e-12 * sd,
+                    "{held} {k}: {} vs {mean}",
+                    unbounded.mean[k]
+                );
+                for (l, expected) in covariance[k].iter().enumerate() {
+                    let scale = sd * covariance[l][l].sqrt();
+                    assert!((unbounded.covariance.get(k, l) - expected).abs() <= 1e-12 * scale);
+                }
+            }
+        }
+    }
+
+    struct Unused;
+
+    impl FitModel for Unused {
+        fn evaluate(&self, params: &[f64]) -> Result<Vec<f64>, FittingError> {
+            Ok(vec![params[0]])
+        }
+
+        fn analytical_jacobian(
+            &self,
+            _params: &[f64],
+            free_param_indices: &[usize],
+            _y_current: &[f64],
+        ) -> Option<FlatMatrix> {
+            let mut jacobian = FlatMatrix::zeros(1, free_param_indices.len());
+            for (col, &index) in free_param_indices.iter().enumerate() {
+                *jacobian.get_mut(0, col) = f64::from(u8::from(index == 0));
+            }
+            Some(jacobian)
+        }
+    }
+
+    #[test]
+    fn a_parameter_on_a_bound_the_counts_do_not_determine_leaves_the_others_their_gaussian() {
+        let mut params = ParameterSet::new(vec![
+            FitParameter::unbounded("x", 90.0),
+            FitParameter::non_negative("y", 0.0),
+        ]);
+        let result = poisson_fit(
+            &Unused,
+            &[100.0],
+            &[],
+            &mut params,
+            &PoissonConfig::default(),
+        )
+        .unwrap();
+        assert!(result.converged && result.on_bound == [false, true]);
+        let unbounded = result.unbounded.expect("unbounded");
+        let variance = unbounded.covariance.get(0, 0);
+        assert!((variance / result.params[0] - 1.0).abs() <= 1e-12);
+        assert!((unbounded.mean[0] - 100.0).abs() <= 2e-3 * variance.sqrt());
+        assert!(unbounded.covariance.get(1, 1).is_nan() && unbounded.mean[1].is_nan());
+    }
+
+    #[test]
+    fn the_unbounded_gaussian_is_the_fit_without_its_bound_to_second_order() {
+        let x = FitParameter::non_negative("x", 9000.0);
+        let bounded = fit_far(vec![x.clone(), FitParameter::non_negative("y", 1.0)], &[]);
+        let free = fit_far(vec![x, FitParameter::unbounded("y", 1.0)], &[]);
+        let covariance = free.covariance.expect("covariance");
+        assert!(bounded.on_bound[1] && !free.on_bound[1]);
+        assert!(free.params[1] <= -1.5 * covariance.get(1, 1).sqrt());
+        let unbounded = bounded.unbounded.expect("unbounded");
+        for k in 0..2 {
+            let variance = covariance.get(k, k);
+            assert!((unbounded.mean[k] - free.params[k]).abs() <= 0.05 * variance.sqrt());
+            assert!((unbounded.covariance.get(k, k) / variance - 1.0).abs() <= 0.05);
+        }
     }
 
     #[test]
@@ -2262,7 +2365,10 @@ mod tests {
         )
         .unwrap();
         assert!(
-            result.converged && result.params[0] == 0.0 && result.on_bound == vec![true],
+            result.converged
+                && result.params[0] == 0.0
+                && result.on_bound == vec![true]
+                && result.unbounded.is_none(),
             "{result:?}"
         );
     }

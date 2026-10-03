@@ -12,7 +12,7 @@ use nereids_endf::resonance::ResonanceData;
 use nereids_fitting::error::FittingError;
 use nereids_fitting::lm::{FitModel, FlatMatrix};
 use nereids_fitting::parameters::{FitParameter, ParameterSet};
-use nereids_fitting::poisson::Prior;
+use nereids_fitting::poisson::{Prior, Unbounded};
 use nereids_fitting::statistics::{Consistency, consistency};
 use nereids_physics::continuous_doppler::{SUPPORT_X, broaden_with_derivative};
 use nereids_physics::doppler::DopplerParams;
@@ -170,6 +170,11 @@ pub struct CountsFit {
     /// temperature or barely separate it from a density, as at few counts or
     /// for a thin sample at modest counts.
     pub covariance: Option<FlatMatrix>,
+    /// The fitted quantities' Gaussian without their bounds, in the
+    /// covariance's order (see [`Unbounded`]), NaN where `covariance` is at a
+    /// temperature edge.  `None` when `covariance` is, or when the fitter
+    /// reports none.
+    pub unbounded: Option<Unbounded>,
     /// Whether each fitted quantity, in the covariance's order, ended on one
     /// of its bounds.
     pub on_bound: Vec<bool>,
@@ -196,24 +201,27 @@ pub struct CountsFit {
     /// measured it; the open-beam run is then weighted with 1, and the sample
     /// run as the open-beam run.
     pub overdispersion: [Option<f64>; 2],
-    /// For each measured quantity, in the covariance's order, its fitted value
-    /// less its measurement over the standard deviation of that difference,
-    /// `√(sd² − variance)`: near 0 ± 1 when the counts agree with the
-    /// measurement.  NaN for a quantity on a bound, and for every quantity
-    /// when a fitted temperature ends at 1 K or 5000 K; it loses precision as
-    /// the counts' information on the quantity vanishes beside the
-    /// measurement's.  `None` when `covariance` is.
+    /// For each measured quantity, in the covariance's order, its value
+    /// without the fit's bounds ([`Self::unbounded`]) less its measurement
+    /// over the standard deviation of that difference, `√(sd² − variance)`,
+    /// the variance also without the bounds: near 0 ± 1 when the counts agree
+    /// with the measurement.  NaN for a quantity the counts and measurements
+    /// do not determine, and for every quantity when a fitted temperature ends
+    /// at 1 K or 5000 K; it loses precision as the counts' information on the
+    /// quantity vanishes beside the measurement's.  `None` when `unbounded`
+    /// is.
     pub measured_pulls: Option<Vec<f64>>,
     /// Whether the counts accept the pulse's calibration on the numbers it
-    /// covers, by [`consistency`] with the fitted numbers and their
-    /// covariance.  The counts' information is divided by each run's
-    /// overdispersion, so the test weakens as the overdispersion grows.  The
+    /// covers, by [`consistency`] with the fit's numbers and covariance
+    /// without their bounds ([`Self::unbounded`]).  The counts' information is
+    /// divided by each run's overdispersion, so the test weakens as the
+    /// overdispersion grows.  The
     /// overdispersion is at least 1, so with Poisson counts its estimate
     /// inflates the covariances the test uses, and `p` rejects a right
     /// calibration less often than its value says, the more so the fewer bins
     /// each run counts.  A calibration fitted to the same open-beam run is not
     /// independent of the fit, which the test does not account for.  `None`
-    /// without a calibration, when `covariance` is `None` or withheld, or when
+    /// without a calibration, when `unbounded` is `None` or withheld, or when
     /// [`consistency`] gives none.
     pub pulse_consistency: Option<Consistency>,
     /// Step, in µs, of the fit's grid.
@@ -279,9 +287,9 @@ pub struct CountsFit {
 /// overdispersion, plus `½((x − value)/sd)²` for each [`Value::Measured`]
 /// quantity `x`, and `½(θ − m)ᵀC⁻¹(θ − m)` over the pulse numbers `θ` a
 /// calibration's [`Pulse::prior`](crate::open_beam::Pulse::prior) covers,
-/// with `m` and `C` their calibrated values and covariance.  The open-beam
-/// run is weighted with the open-beam fit's overdispersion, and the sample
-/// run first with the same.  The fit is
+/// with `m` and `C` that prior's mean, which may lie past a number's bound,
+/// and covariance.  The open-beam run is weighted with the open-beam fit's
+/// overdispersion, and the sample run first with the same.  The fit is
 /// repeated from its answer while the sample run's overdispersion, measured on
 /// the bins the first fit predicts at least one count, changes by more than
 /// 1%, the coarser grid of the accepted pair is wider than the rule at the
@@ -668,20 +676,33 @@ pub fn fit_counts(
     let sample_quantities: Vec<usize> = (0..free.len())
         .filter(|&p| free[p] >= layout.densities)
         .collect();
+    let block = |full: &FlatMatrix| {
+        let size = sample_quantities.len();
+        let mut block = FlatMatrix::zeros(size, size);
+        for (a, &p) in sample_quantities.iter().enumerate() {
+            for (b, &q) in sample_quantities.iter().enumerate() {
+                *block.get_mut(a, b) = if on_edge { f64::NAN } else { full.get(p, q) };
+            }
+        }
+        block
+    };
     let covariance = fit
         .result
         .covariance
         .as_ref()
         .filter(|_| converged)
-        .map(|full| {
-            let size = sample_quantities.len();
-            let mut block = FlatMatrix::zeros(size, size);
-            for (a, &p) in sample_quantities.iter().enumerate() {
-                for (b, &q) in sample_quantities.iter().enumerate() {
-                    *block.get_mut(a, b) = if on_edge { f64::NAN } else { full.get(p, q) };
-                }
-            }
-            block
+        .map(block);
+    let unbounded = fit
+        .result
+        .unbounded
+        .as_ref()
+        .filter(|_| converged)
+        .map(|full| Unbounded {
+            mean: sample_quantities
+                .iter()
+                .map(|&p| if on_edge { f64::NAN } else { full.mean[p] })
+                .collect(),
+            covariance: block(&full.covariance),
         });
     let params = &fit.result.params;
     let on_bound: Vec<bool> = sample_quantities
@@ -694,8 +715,8 @@ pub fn fit_counts(
             .position(|&p| free[p] == parameter)
             .expect("a measured or calibrated quantity is fitted")
     };
-    let pulse_consistency = match (&pulse_prior, &covariance) {
-        (Some(prior), Some(block)) => {
+    let pulse_consistency = match (&pulse_prior, &unbounded) {
+        (Some(prior), Some(unbounded)) => {
             let at: Vec<usize> = calibrated_parameters
                 .iter()
                 .map(|&parameter| position(parameter))
@@ -703,25 +724,20 @@ pub fn fit_counts(
             let mut posterior = FlatMatrix::zeros(at.len(), at.len());
             for (a, &i) in at.iter().enumerate() {
                 for (b, &j) in at.iter().enumerate() {
-                    *posterior.get_mut(a, b) = block.get(i, j);
+                    *posterior.get_mut(a, b) = unbounded.covariance.get(i, j);
                 }
             }
-            let estimate: Vec<f64> = calibrated_parameters
-                .iter()
-                .map(|&parameter| params[parameter])
-                .collect();
-            let held: Vec<bool> = at.iter().map(|&a| on_bound[a]).collect();
-            consistency(prior, &estimate, &held, &posterior)?
+            let estimate: Vec<f64> = at.iter().map(|&i| unbounded.mean[i]).collect();
+            consistency(prior, &estimate, &posterior)?
         }
         _ => None,
     };
-    let measured_pulls = covariance.as_ref().map(|block| {
+    let measured_pulls = unbounded.as_ref().map(|unbounded| {
         measured
             .iter()
             .map(|&(offset, mean, sd)| {
-                let parameter = layout.densities + offset;
-                let a = position(parameter);
-                (params[parameter] - mean) / (sd * sd - block.get(a, a)).sqrt()
+                let a = position(layout.densities + offset);
+                (unbounded.mean[a] - mean) / (sd * sd - unbounded.covariance.get(a, a)).sqrt()
             })
             .collect()
     });
@@ -737,6 +753,7 @@ pub fn fit_counts(
         r: params[layout.pulse + 4],
         fwhm_squared_us2: params[layout.pulse + 5],
         covariance,
+        unbounded,
         on_bound,
         beam: open.beam.with_coefficients(&params[..layout.densities]),
         beam_at_limit: open.at_limit,

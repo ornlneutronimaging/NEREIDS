@@ -63,45 +63,38 @@ fn chi_squared_survival(q: f64, dof: usize) -> f64 {
 }
 
 /// The consistency of the fitted values `estimate` of a `prior`'s
-/// parameters with it, in the prior's order, given which ended `on_bound`
-/// and the fit's covariance `posterior` of them, conditional on those.
+/// parameters with it, in the prior's order, given the fit's covariance
+/// `posterior` of them.
 ///
-/// A parameter on a bound is held there: the rest have the prior
-/// conditioned on it, with mean `m_R + C_RB C_BB⁻¹(θ_B − m_B)` and
-/// covariance `C_RR − C_RB C_BB⁻¹ C_BR`, and the rows and columns of
-/// `posterior` of a held parameter are not read.  With `C = LLᵀ` the rest's
-/// prior covariance, `z = L⁻¹(estimate − mean)` and
-/// `I − L⁻¹·posterior·L⁻ᵀ = Σᵢ rᵢuᵢuᵢᵀ` over the rest, `rᵢ` is the share of
-/// the prior's variance along `uᵢ` that the counts remove, and
-/// `q = Σᵢ (uᵢᵀz)²/rᵢ` over the `dof` directions with `rᵢ ≥ 8e-4`.  If the
-/// prior and the counts' model are right, `q` follows `χ²` with `dof`
+/// With `C = LLᵀ` the prior covariance, `z = L⁻¹(estimate − mean)` and
+/// `I − L⁻¹·posterior·L⁻ᵀ = Σᵢ rᵢuᵢuᵢᵀ`, `rᵢ` is the share of the prior's
+/// variance along `uᵢ` that the counts remove, and `q = Σᵢ (uᵢᵀz)²/rᵢ` over
+/// the `dof` directions with `rᵢ ≥ 8e-4`.  If the prior and the counts' model
+/// are right and `estimate` and `posterior` are the fit's without its bounds
+/// ([`Unbounded`](crate::poisson::Unbounded)), `q` follows `χ²` with `dof`
 /// degrees of freedom, and `p = P(χ²_dof ≥ q)`.
 ///
-/// `None` when every parameter is on a bound, `posterior` is not finite
-/// over the rest, or no direction has `rᵢ ≥ 8e-4`.
+/// `None` when `posterior` is not finite or no direction has `rᵢ ≥ 8e-4`.
 ///
 /// # Errors
-/// `FittingError::LengthMismatch` if `estimate`, `on_bound` or `posterior`
-/// does not match the prior's parameters; `FittingError::InvalidConfig` if
-/// `estimate` is not finite, the prior's mean is not finite or a measured sd
-/// not finite and positive, or `posterior` over the rest is not symmetric to
-/// 1e-12 of `√(Σᵢᵢ Σⱼⱼ)` or not within the prior there, with some `rᵢ` below
-/// `−8e-4` or above `1 + 8e-4`, or `q` is not a number, as overflow in
-/// whitening can give;
-/// `FittingError::EvaluationFailed` if a decomposition fails.
+/// `FittingError::LengthMismatch` if `estimate` or `posterior` does not
+/// match the prior's parameters; `FittingError::InvalidConfig` if the prior's
+/// mean is not finite or a measured sd not finite and positive, `estimate` is
+/// not finite while `posterior` is, or `posterior` is not symmetric to 1e-12
+/// of `√(Σᵢᵢ Σⱼⱼ)` or not within the prior, with some `rᵢ` below `−8e-4` or
+/// above `1 + 8e-4`, or `q` is not a number, as overflow in whitening can
+/// give; `FittingError::EvaluationFailed` if a decomposition fails.
 pub fn consistency(
     prior: &Prior,
     estimate: &[f64],
-    on_bound: &[bool],
     posterior: &FlatMatrix,
 ) -> Result<Option<Consistency>, FittingError> {
-    let k = prior.parameters.len();
+    let n = prior.parameters.len();
     for (expected, actual, field) in [
-        (k, estimate.len(), "estimate"),
-        (k, on_bound.len(), "on_bound"),
-        (k, posterior.nrows, "posterior rows"),
-        (k, posterior.ncols, "posterior columns"),
-        (k * k, posterior.data.len(), "posterior entries"),
+        (n, estimate.len(), "estimate"),
+        (n, posterior.nrows, "posterior rows"),
+        (n, posterior.ncols, "posterior columns"),
+        (n * n, posterior.data.len(), "posterior entries"),
     ] {
         if actual != expected {
             return Err(FittingError::LengthMismatch {
@@ -111,32 +104,30 @@ pub fn consistency(
             });
         }
     }
-    if !(prior.is_valid() && estimate.iter().all(|x| x.is_finite())) {
+    if !prior.is_valid() {
         return Err(FittingError::InvalidConfig(format!(
-            "the consistency of a prior needs a finite mean, finite positive sds and \
-             finite estimates; got {prior:?} and {estimate:?}"
+            "the consistency of a prior needs a finite mean and finite positive sds; got \
+             {prior:?}"
         )));
     }
-    let rest: Vec<usize> = (0..k).filter(|&i| !on_bound[i]).collect();
-    let n = rest.len();
-    let posterior = Mat::from_fn(n, n, |a, b| posterior.get(rest[a], rest[b]));
-    if n == 0 || !(0..n).all(|a| (0..n).all(|b| posterior[(a, b)].is_finite())) {
+    let posterior = Mat::from_fn(n, n, |a, b| posterior.get(a, b));
+    if !(0..n).all(|a| (0..n).all(|b| posterior[(a, b)].is_finite())) {
         return Ok(None);
+    }
+    if !estimate.iter().all(|x| x.is_finite()) {
+        return Err(FittingError::InvalidConfig(format!(
+            "the consistency of a prior needs finite estimates; got {estimate:?}"
+        )));
     }
     if !symmetric(n, |a, b| posterior[(a, b)]) {
         return Err(FittingError::InvalidConfig(format!(
             "a posterior covariance must be symmetric; got {posterior:?}"
         )));
     }
-    let held: Vec<(usize, f64)> = (0..k)
-        .filter(|&i| on_bound[i])
-        .map(|i| (prior.parameters[i], estimate[i]))
-        .collect();
-    let prior = prior.conditioned(&held)?;
-    let mut z: Vec<f64> = rest
+    let mut z: Vec<f64> = estimate
         .iter()
         .zip(&prior.mean)
-        .map(|(&i, m)| estimate[i] - m)
+        .map(|(x, m)| x - m)
         .collect();
     prior.whiten(&mut z);
     let half: Vec<Vec<f64>> = (0..n)
@@ -306,7 +297,7 @@ mod tests {
             }
         };
         let along_first = c * z[0] + s * z[1];
-        let both = consistency(&prior, &estimate, &[false; 2], &posterior([0.5, 0.25]))
+        let both = consistency(&prior, &estimate, &posterior([0.5, 0.25]))
             .unwrap()
             .unwrap();
         let along_second = -s * z[0] + c * z[1];
@@ -314,37 +305,43 @@ mod tests {
         assert_eq!(both.dof, 2);
         assert!((both.q / q - 1.0).abs() <= 1e-12, "{} vs {q}", both.q);
         assert!((both.p / (-q / 2.0).exp() - 1.0).abs() <= 1e-12);
-        let one = consistency(&prior, &estimate, &[false; 2], &posterior([0.5, 1e-4]))
+        let one = consistency(&prior, &estimate, &posterior([0.5, 1e-4]))
             .unwrap()
             .unwrap();
         assert_eq!(one.dof, 1);
         let q = along_first.powi(2) / 0.5;
         assert!((one.q / q - 1.0).abs() <= 1e-12, "{} vs {q}", one.q);
         assert!(
-            consistency(&prior, &estimate, &[false; 2], &posterior([1e-4, 1e-4]))
+            consistency(&prior, &estimate, &posterior([1e-4, 1e-4]))
                 .unwrap()
                 .is_none()
         );
         let mut undetermined = posterior([0.5, 0.25]);
         undetermined.data[3] = f64::NAN;
         assert!(
-            consistency(&prior, &estimate, &[false; 2], &undetermined)
+            consistency(&prior, &estimate, &undetermined)
                 .unwrap()
                 .is_none()
         );
-        assert!(consistency(&prior, &estimate[..1], &[false; 2], &posterior([0.5, 0.25])).is_err());
+        assert!(consistency(&prior, &estimate[..1], &posterior([0.5, 0.25])).is_err());
         let mut truncated = posterior([0.5, 0.25]);
         truncated.data.pop();
-        assert!(consistency(&prior, &estimate, &[false; 2], &truncated).is_err());
+        assert!(consistency(&prior, &estimate, &truncated).is_err());
         let nan = [estimate[0], f64::NAN];
-        assert!(consistency(&prior, &nan, &[false; 2], &posterior([0.5, 0.25])).is_err());
+        assert!(consistency(&prior, &nan, &posterior([0.5, 0.25])).is_err());
+        assert!(consistency(&prior, &nan, &undetermined).unwrap().is_none());
         let negative = Prior::measured(0, 0.0, -1.0);
         let unit = FlatMatrix {
             data: vec![0.5],
             nrows: 1,
             ncols: 1,
         };
-        assert!(consistency(&negative, &[1.0], &[false], &unit).is_err());
+        assert!(consistency(&negative, &[1.0], &unit).is_err());
+        let unknown = FlatMatrix {
+            data: vec![f64::NAN],
+            ..unit
+        };
+        assert!(consistency(&negative, &[1.0], &unknown).is_err());
         let identity =
             Prior::correlated(&[0, 1], &[0.0, 0.0], &two_by_two([1.0, 0.0, 0.0, 1.0])).unwrap();
         for impossible in [
@@ -352,57 +349,17 @@ mod tests {
             [1.5, 0.0, 0.0, 0.5],
             [-1.0, 0.0, 0.0, 0.5],
         ] {
-            let result = consistency(&identity, &[2.0, 1.0], &[false; 2], &two_by_two(impossible));
+            let result = consistency(&identity, &[2.0, 1.0], &two_by_two(impossible));
             assert!(result.is_err(), "{impossible:?}: {result:?}");
         }
         let far = consistency(
             &identity,
             &[1e155, 1e155],
-            &[false; 2],
             &two_by_two([0.5, 0.0, 0.0, 0.5]),
         )
         .unwrap()
         .unwrap();
         assert_eq!((far.q, far.p), (f64::INFINITY, 0.0));
-    }
-
-    #[test]
-    fn a_parameter_on_a_bound_conditions_the_prior_on_the_rest() {
-        let covariance = FlatMatrix {
-            data: vec![4.0, 2.0, 1.0, 2.0, 5.0, 3.0, 1.0, 3.0, 6.0],
-            nrows: 3,
-            ncols: 3,
-        };
-        let prior = Prior::correlated(&[0, 1, 2], &[1.0, 2.0, 3.0], &covariance).unwrap();
-        let (mean, remaining) = ([1.2, 3.3], [[3.2, -0.2], [-0.2, 4.2]]);
-        let estimate = [2.0, 2.5, 2.0];
-        let mut posterior = FlatMatrix::zeros(3, 3);
-        posterior.data.fill(f64::NAN);
-        for (a, i) in [0, 2].into_iter().enumerate() {
-            for (b, j) in [0, 2].into_iter().enumerate() {
-                *posterior.get_mut(i, j) = 0.5 * remaining[a][b];
-            }
-        }
-        let d = [estimate[0] - mean[0], estimate[2] - mean[1]];
-        let determinant = remaining[0][0] * remaining[1][1] - remaining[0][1] * remaining[1][0];
-        let mahalanobis = (d[0] * d[0] * remaining[1][1] - 2.0 * d[0] * d[1] * remaining[0][1]
-            + d[1] * d[1] * remaining[0][0])
-            / determinant;
-        let result = consistency(&prior, &estimate, &[false, true, false], &posterior)
-            .unwrap()
-            .unwrap();
-        assert_eq!(result.dof, 2);
-        assert!(
-            (result.q / (2.0 * mahalanobis) - 1.0).abs() <= 1e-12,
-            "{} vs {}",
-            result.q,
-            2.0 * mahalanobis
-        );
-        assert!(
-            consistency(&prior, &estimate, &[true; 3], &posterior)
-                .unwrap()
-                .is_none()
-        );
     }
 
     #[test]
@@ -429,34 +386,6 @@ mod tests {
         assert!(agreement(&far(f64::MAX).unwrap(), &far(-f64::MAX).unwrap()).is_err());
         for (q, dof) in [(-1.0, 2), (f64::NAN, 2), (1.0, 0)] {
             assert!(Consistency::new(q, dof).is_err(), "{q} {dof}");
-        }
-    }
-
-    #[test]
-    fn a_prior_is_conditioned_only_on_some_of_its_own_parameters() {
-        let covariance = FlatMatrix {
-            data: vec![4.0, 2.0, 1.0, 2.0, 5.0, 3.0, 1.0, 3.0, 6.0],
-            nrows: 3,
-            ncols: 3,
-        };
-        let prior = Prior::correlated(&[4, 5, 6], &[1.0, 2.0, 3.0], &covariance).unwrap();
-        let conditioned = prior.conditioned(&[(5, 2.5)]).unwrap();
-        assert_eq!(conditioned.parameters, [4, 6]);
-        assert!(
-            (conditioned.mean[0] - 1.2).abs() <= 1e-14
-                && (conditioned.mean[1] - 3.3).abs() <= 1e-14
-        );
-        for (i, j, expected) in [(0, 0, 3.2), (0, 1, -0.2), (1, 1, 4.2)] {
-            assert!((conditioned.covariance(i, j) - expected).abs() <= 1e-13);
-        }
-        assert!(Prior::measured(4, 0.0, -1.0).conditioned(&[]).is_err());
-        for held in [
-            vec![(9, 1.0)],
-            vec![(4, 1.0), (5, 1.0), (6, 1.0)],
-            vec![(5, 1.0), (5, 2.0)],
-            vec![(5, f64::NAN)],
-        ] {
-            assert!(prior.conditioned(&held).is_err(), "{held:?}");
         }
     }
 }
