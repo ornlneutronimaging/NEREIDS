@@ -285,21 +285,6 @@ fn densities_normalization_and_background_are_recovered_and_follow_a_density_on_
                 [Some(1.0); 2],
                 "{truth} from {density:?}"
             );
-            let observed = [&m.open_counts, &m.sample_counts];
-            let deviance: f64 = observed
-                .iter()
-                .zip(&fit.predicted)
-                .flat_map(|(y, mu)| y.iter().zip(mu))
-                .map(|(&y, &mu)| {
-                    let d = (y - mu) / mu;
-                    mu * ((1.0 + d) * d.ln_1p() - d)
-                })
-                .sum();
-            assert!(
-                (deviance / fit.deviance - 1.0).abs() <= 1e-9,
-                "{deviance} vs {}",
-                fit.deviance
-            );
             fit
         };
         let estimates = |fit: &CountsFit| {
@@ -449,21 +434,14 @@ fn the_fit_is_on_the_finer_grid_of_the_first_pair_both_runs_leave_unchanged() {
     assert_eq!(fit.points, grids[accepted].flight_times_us().len());
     assert_eq!(fit.step_us, grids[accepted].step_us());
     let rebuilt = predicted(&grids[accepted], &beam, &fitted);
-    let (open, sample) = rebuilt.split_at(counts.0.len());
-    assert_eq!(fit.predicted, [open.to_vec(), sample.to_vec()]);
-    let deviance: f64 = rebuilt
-        .iter()
-        .zip(&observed)
-        .map(|(&mu, &y)| {
-            let d = (y - mu) / mu;
-            mu * d * d * (0.5 - d / 6.0 + d * d / 12.0)
-        })
-        .sum();
-    assert!(
-        (fit.deviance - deviance).abs() <= 1e-2 * deviance,
-        "{} vs {deviance}",
-        fit.deviance
-    );
+    for (run, rebuilt) in fit.predicted.iter().zip(rebuilt.chunks(counts.0.len())) {
+        assert_eq!(run.len(), rebuilt.len());
+        assert!(
+            run.iter()
+                .zip(rebuilt)
+                .all(|(f, r)| (f - r).abs() <= 1e-12 * r)
+        );
+    }
 }
 
 fn distance(fitted: &[f64], simulated: &[f64]) -> f64 {
@@ -774,6 +752,28 @@ fn covariance_against_information(temperature: Value, noisy: bool) {
         Vec::new()
     };
     let fit = fit_counts(&m, &calibration(&setup)).expect("fit");
+    let overdispersion = fit.overdispersion.map(|phi| phi.expect("measured"));
+    let deviance: f64 = [&m.open_counts, &m.sample_counts]
+        .iter()
+        .zip(&fit.predicted)
+        .zip(overdispersion)
+        .map(|((y, mu), phi)| {
+            let half: f64 = y
+                .iter()
+                .zip(mu)
+                .map(|(&y, &mu)| {
+                    let d = (y - mu) / mu;
+                    mu * ((1.0 + d) * d.ln_1p() - d)
+                })
+                .sum();
+            half / phi
+        })
+        .sum();
+    assert!(
+        (deviance / fit.deviance - 1.0).abs() <= 1e-9,
+        "{deviance} vs {}",
+        fit.deviance
+    );
     let quantities = first_term + 3;
     let (low, high) = FlightTimeGrid::new(
         &setup.edges,
@@ -870,7 +870,6 @@ fn covariance_against_information(temperature: Value, noisy: bool) {
         })
         .collect();
     let bins = mu.len() / 2;
-    let overdispersion = fit.overdispersion.map(|phi| phi.expect("measured"));
     let mut information: Vec<Vec<f64>> = columns
         .iter()
         .map(|a| {
