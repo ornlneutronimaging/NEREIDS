@@ -162,12 +162,12 @@ impl PulseCalibration {
     /// [`PipelineError::InvalidParameter`] if a density or the temperature of
     /// the foil is not measured, as above, an identifier of `provenance` is
     /// empty or its runs are the same, or `calibration`'s pulse carries a
-    /// prior or a pulse number measured or boxed within part of its range,
-    /// since a calibration foil is calibrated alone over the numbers' physical
-    /// ranges; everything
+    /// prior or a pulse number measured or boxed, since a calibration foil is
+    /// calibrated alone over the numbers' physical ranges; everything
     /// [`fit_counts`] refuses;
-    /// [`PipelineError::InvalidParameter`] if the fit did not converge or
-    /// gives no [`CountsFit::unbounded`] Gaussian, a pulse
+    /// [`PipelineError::InvalidParameter`] if the fit did not converge, or
+    /// fitted a pulse number and gives no [`CountsFit::unbounded`] Gaussian, a
+    /// pulse
     /// number it fitted has no finite positive variance without its bounds,
     /// as when the counts do not determine it, a number that ended on a bound
     /// carries no information, or a fitted temperature ended at 1 K or 5000 K,
@@ -212,13 +212,6 @@ impl PulseCalibration {
         if !fit.converged {
             return invalid("a pulse calibration needs a converged fit".into());
         }
-        let Some(unbounded) = fit.unbounded.as_ref() else {
-            return invalid(
-                "the calibration's fit gives no Gaussian without its bounds, as when a bin \
-                 predicted zero pulls a quantity on its bound"
-                    .into(),
-            );
-        };
         let fitted: Vec<bool> = quantities(measurement, calibration)
             .map(|value| !matches!(value, Value::Known(_)))
             .collect();
@@ -231,6 +224,13 @@ impl PulseCalibration {
             if !fitted[quantity] {
                 continue;
             }
+            let Some(unbounded) = fit.unbounded.as_ref() else {
+                return invalid(
+                    "the calibration's fit gives no Gaussian without its bounds, as when a bin \
+                     predicted zero pulls a quantity on its bound"
+                        .into(),
+                );
+            };
             let variance = unbounded.covariance.get(i, i);
             if !(variance.is_finite() && variance > 0.0) {
                 return invalid(format!(
@@ -279,9 +279,8 @@ impl PulseCalibration {
         } else {
             None
         };
-        let prior = if covered.is_empty() {
-            None
-        } else {
+        let prior = if let Some(unbounded) = fit.unbounded.as_ref().filter(|_| !covered.is_empty())
+        {
             let n = covered.len();
             let covariance = &unbounded.covariance;
             let mut block = FlatMatrix::zeros(n, n);
@@ -298,6 +297,8 @@ impl PulseCalibration {
                 mean,
                 covariance: block,
             })
+        } else {
+            None
         };
         Ok(Self {
             numbers,
@@ -1101,7 +1102,11 @@ mod tests {
         pulse.beta[0] = Value::Known(0.08);
         pulse.r = Value::Known(0.2);
         pulse.fwhm_squared_us2 = Value::Known(0.1);
-        let unfitted = calibrated(&measurement(None), &known, fit(4))
+        let without = CountsFit {
+            unbounded: None,
+            ..fit(4)
+        };
+        let unfitted = calibrated(&measurement(None), &known, without)
             .unwrap()
             .calibration();
         assert_eq!(unfitted.pulse.line_span_ev, None);

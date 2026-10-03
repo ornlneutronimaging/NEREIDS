@@ -2591,7 +2591,7 @@ mod pulse_calibration {
         );
     }
 
-    fn transfer_replicas(pulse: &[f64; 6], seeds: u64) -> Vec<(Consistency, f64)> {
+    fn transfer_replicas(pulse: &[f64; 6], seeds: u64) -> Vec<(Consistency, f64, bool)> {
         let first = calibration_foil(pulse, T0_US, FLIGHT_PATH_M);
         let first_counts = expected(
             &first,
@@ -2620,17 +2620,18 @@ mod pulse_calibration {
                 Some((
                     transfer.agreement(),
                     weights.iter().sum::<f64>() / weights.len() as f64,
+                    a_fit.on_bound[4] || b_fit.on_bound[4],
                 ))
             })
             .collect()
     }
 
-    fn agree_as_chi_squared(tests: &[(Consistency, f64)]) {
+    fn agree_as_chi_squared(tests: &[(Consistency, f64, bool)]) {
         assert!(tests.len() >= 398, "{} transferred", tests.len());
         let n = tests.len() as f64;
         let weighted: Vec<f64> = tests
             .iter()
-            .map(|(t, phi)| {
+            .map(|(t, phi, _)| {
                 assert_eq!(t.dof, 5);
                 t.q * phi
             })
@@ -2663,6 +2664,11 @@ mod pulse_calibration {
         let mut p = CALIBRATION_PULSE;
         p[0] = 5e-4;
         p[5] = 0.35;
-        agree_as_chi_squared(&transfer_replicas(&p, 200_000));
+        let tests = transfer_replicas(&p, 200_000);
+        assert!(
+            tests.iter().any(|(_, _, bounded)| *bounded),
+            "no calibration ended alpha0 on its bound"
+        );
+        agree_as_chi_squared(&tests);
     }
 }

@@ -786,12 +786,7 @@ pub fn poisson_fit(
             let leverage = decomposition
                 .as_ref()
                 .map(|decomposition| decomposition.leverage(y_obs.len()));
-            let unbounded = unbounded(
-                linear,
-                &params.free_values(),
-                &bounded,
-                decomposition.as_ref(),
-            );
+            let unbounded = unbounded(linear, &params.free_values(), &bounded);
             (Some(covariance), Some(errors), leverage, unbounded)
         }
         _ => (None, None, None, None),
@@ -809,23 +804,12 @@ pub fn poisson_fit(
     })
 }
 
-fn unbounded(
-    linear: &Linearization,
-    fitted: &[f64],
-    bounded: &[bool],
-    interior: Option<&Decomposition>,
-) -> Option<Unbounded> {
+fn unbounded(linear: &Linearization, fitted: &[f64], bounded: &[bool]) -> Option<Unbounded> {
     if (0..fitted.len()).any(|j| bounded[j] && linear.zero_slope[j] != 0.0) {
         return None;
     }
-    let every;
-    let decomposition = if bounded.contains(&true) {
-        let columns: Vec<usize> = (0..fitted.len()).collect();
-        every = Decomposition::new(&linear.weighted, &columns)?;
-        &every
-    } else {
-        interior?
-    };
+    let columns: Vec<usize> = (0..fitted.len()).collect();
+    let decomposition = Decomposition::new(&linear.weighted, &columns)?;
     let step = decomposition.step(decomposition.determined(), linear, fitted.len(), 0.0);
     let covariance = decomposition.error_bars(fitted.len()).0;
     let mean = (0..fitted.len())

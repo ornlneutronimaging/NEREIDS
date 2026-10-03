@@ -80,7 +80,7 @@ fn chi_squared_survival(q: f64, dof: usize) -> f64 {
 /// `FittingError::LengthMismatch` if `estimate` or `posterior` does not
 /// match the prior's parameters; `FittingError::InvalidConfig` if the prior's
 /// mean is not finite or a measured sd not finite and positive, `estimate` is
-/// not finite where `posterior` is, or `posterior` is not symmetric to 1e-12
+/// not finite while `posterior` is, or `posterior` is not symmetric to 1e-12
 /// of `√(Σᵢᵢ Σⱼⱼ)` or not within the prior, with some `rᵢ` below `−8e-4` or
 /// above `1 + 8e-4`, or `q` is not a number, as overflow in whitening can
 /// give; `FittingError::EvaluationFailed` if a decomposition fails.
@@ -104,14 +104,19 @@ pub fn consistency(
             });
         }
     }
+    if !prior.is_valid() {
+        return Err(FittingError::InvalidConfig(format!(
+            "the consistency of a prior needs a finite mean and finite positive sds; got \
+             {prior:?}"
+        )));
+    }
     let posterior = Mat::from_fn(n, n, |a, b| posterior.get(a, b));
     if !(0..n).all(|a| (0..n).all(|b| posterior[(a, b)].is_finite())) {
         return Ok(None);
     }
-    if !(prior.is_valid() && estimate.iter().all(|x| x.is_finite())) {
+    if !estimate.iter().all(|x| x.is_finite()) {
         return Err(FittingError::InvalidConfig(format!(
-            "the consistency of a prior needs a finite mean, finite positive sds and \
-             finite estimates; got {prior:?} and {estimate:?}"
+            "the consistency of a prior needs finite estimates; got {estimate:?}"
         )));
     }
     if !symmetric(n, |a, b| posterior[(a, b)]) {
@@ -332,6 +337,11 @@ mod tests {
             ncols: 1,
         };
         assert!(consistency(&negative, &[1.0], &unit).is_err());
+        let unknown = FlatMatrix {
+            data: vec![f64::NAN],
+            ..unit
+        };
+        assert!(consistency(&negative, &[1.0], &unknown).is_err());
         let identity =
             Prior::correlated(&[0, 1], &[0.0, 0.0], &two_by_two([1.0, 0.0, 0.0, 1.0])).unwrap();
         for impossible in [
