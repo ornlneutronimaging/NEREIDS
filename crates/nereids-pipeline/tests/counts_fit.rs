@@ -285,6 +285,21 @@ fn densities_normalization_and_background_are_recovered_and_follow_a_density_on_
                 [Some(1.0); 2],
                 "{truth} from {density:?}"
             );
+            let observed = [&m.open_counts, &m.sample_counts];
+            let deviance: f64 = observed
+                .iter()
+                .zip(&fit.predicted)
+                .flat_map(|(y, mu)| y.iter().zip(mu))
+                .map(|(&y, &mu)| {
+                    let d = (y - mu) / mu;
+                    mu * ((1.0 + d) * d.ln_1p() - d)
+                })
+                .sum();
+            assert!(
+                (deviance / fit.deviance - 1.0).abs() <= 1e-9,
+                "{deviance} vs {}",
+                fit.deviance
+            );
             fit
         };
         let estimates = |fit: &CountsFit| {
@@ -433,7 +448,10 @@ fn the_fit_is_on_the_finer_grid_of_the_first_pair_both_runs_leave_unchanged() {
     assert_eq!(fit.halvings, accepted);
     assert_eq!(fit.points, grids[accepted].flight_times_us().len());
     assert_eq!(fit.step_us, grids[accepted].step_us());
-    let deviance: f64 = predicted(&grids[accepted], &beam, &fitted)
+    let rebuilt = predicted(&grids[accepted], &beam, &fitted);
+    let (open, sample) = rebuilt.split_at(counts.0.len());
+    assert_eq!(fit.predicted, [open.to_vec(), sample.to_vec()]);
+    let deviance: f64 = rebuilt
         .iter()
         .zip(&observed)
         .map(|(&mu, &y)| {
@@ -1689,6 +1707,9 @@ fn density_temperature_timing_offset_and_flight_path_are_recovered_from_starts_o
         )
         .expect("fit");
         assert!(fit.converged, "{sign}");
+        let simulated =
+            distance(&fit.predicted[0], &open) + distance(&fit.predicted[1], &transmitted);
+        assert!(simulated <= BOUND, "{sign}: {simulated}");
         for (i, (estimate, truth)) in [
             (fit.densities[0], THIN),
             (fit.temperature_k, TEMPERATURE_K),
