@@ -269,8 +269,8 @@ pub struct PoissonResult {
 /// the objective's gradient at the fit, which the convergence test makes
 /// negligible off the bounds.  Both are taken over the directions the counts
 /// and priors determine; the mean and the rows and columns of a parameter
-/// with a component along any other are NaN.  With none on a bound the
-/// covariance is [`PoissonResult::covariance`].
+/// with a component along a direction they do not determine are NaN.  With
+/// none on a bound the covariance is [`PoissonResult::covariance`].
 #[derive(Debug, Clone)]
 pub struct Unbounded {
     pub mean: Vec<f64>,
