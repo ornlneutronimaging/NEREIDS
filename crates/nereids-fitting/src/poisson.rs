@@ -180,7 +180,7 @@ impl Prior {
     /// this prior's, is held twice, or has a value that is not finite, or every
     /// parameter is held; `FittingError::EvaluationFailed` if a decomposition
     /// fails.
-    pub fn conditioned(&self, held: &[(usize, f64)]) -> Result<Prior, FittingError> {
+    pub(crate) fn conditioned(&self, held: &[(usize, f64)]) -> Result<Prior, FittingError> {
         if !self.is_valid() {
             return Err(FittingError::InvalidConfig(format!(
                 "a prior with a finite mean and finite positive sds is conditioned; got {self:?}"
@@ -340,6 +340,23 @@ pub struct PoissonResult {
     /// the share the priors take.  `None` when `covariance` is `None` or its
     /// decomposition fails.
     pub leverage: Option<Vec<f64>>,
+    /// The free parameters' Gaussian without their bounds; see [`Unbounded`].
+    /// `None` when `covariance` is, or when a bin predicted zero adds slope to
+    /// the gradient of a parameter on a bound.
+    pub unbounded: Option<Unbounded>,
+}
+
+/// The quadratic expansion of the objective at the fit over every free
+/// parameter, bounds left out: covariance `F⁻¹`, `F` the expected information
+/// of all free parameters, and mean `θ̂ − F⁻¹g`, `g` the objective's gradient
+/// on the parameters that ended on a bound.  With none on a bound they are the
+/// fitted values and [`PoissonResult::covariance`].  The rows and columns of a
+/// parameter the counts and priors do not determine are NaN, as are its mean
+/// and the means its covariance reaches.
+#[derive(Debug, Clone)]
+pub struct Unbounded {
+    pub mean: Vec<f64>,
+    pub covariance: FlatMatrix,
 }
 
 pub(crate) const NEWTON_DECREMENT_TOL: f64 = 1e-6;
@@ -829,7 +846,7 @@ pub fn poisson_fit(
         .iter()
         .map(|&idx| on_bound(&params.params[idx]))
         .collect();
-    let (covariance, uncertainties, leverage) = match &at_minimum {
+    let (covariance, uncertainties, leverage, unbounded) = match &at_minimum {
         Some(linear) if config.compute_covariance => {
             let interior: Vec<usize> = (0..free.len()).filter(|&j| !bounded[j]).collect();
             let decomposition = Decomposition::new(&linear.weighted, &interior);
@@ -838,9 +855,10 @@ pub fn poisson_fit(
                 |decomposition| decomposition.error_bars(free.len()),
             );
             let leverage = decomposition.map(|decomposition| decomposition.leverage(y_obs.len()));
-            (Some(covariance), Some(errors), leverage)
+            let unbounded = unbounded(linear, &params.free_values(), &bounded, &covariance);
+            (Some(covariance), Some(errors), leverage, unbounded)
         }
-        _ => (None, None, None),
+        _ => (None, None, None, None),
     };
     Ok(PoissonResult {
         deviance: deviance(y_obs, &y_model),
@@ -851,7 +869,40 @@ pub fn poisson_fit(
         uncertainties,
         on_bound: bounded,
         leverage,
+        unbounded,
     })
+}
+
+fn unbounded(
+    linear: &Linearization,
+    fitted: &[f64],
+    bounded: &[bool],
+    covariance: &FlatMatrix,
+) -> Option<Unbounded> {
+    let held: Vec<usize> = (0..fitted.len()).filter(|&j| bounded[j]).collect();
+    if held.iter().any(|&j| linear.zero_slope[j] != 0.0) {
+        return None;
+    }
+    let covariance = if held.is_empty() {
+        covariance.clone()
+    } else {
+        let every: Vec<usize> = (0..fitted.len()).collect();
+        Decomposition::new(&linear.weighted, &every).map_or_else(
+            || withheld(fitted.len()).0,
+            |decomposition| decomposition.error_bars(fitted.len()).0,
+        )
+    };
+    let mean = fitted
+        .iter()
+        .enumerate()
+        .map(|(i, x)| {
+            x - held
+                .iter()
+                .map(|&j| covariance.get(i, j) * linear.gradient[j])
+                .sum::<f64>()
+        })
+        .collect();
+    Some(Unbounded { mean, covariance })
 }
 
 /// Fixed-flux counts-domain forward model: `Y_model = flux × T_model(θ) + background`.
@@ -2113,6 +2164,94 @@ mod tests {
                 );
             }
         }
+        let unbounded = result.unbounded.expect("unbounded");
+        assert_eq!(unbounded.mean, fitted);
+        assert_eq!(unbounded.covariance.data, reported.data);
+    }
+
+    const FAR_COUNTS: [f64; 5] = [9743.0, 20046.0, 30110.0, 39769.0, 49761.0];
+
+    fn fit_far(params: Vec<FitParameter>, priors: &[Prior]) -> PoissonResult {
+        let mut params = ParameterSet::new(params);
+        poisson_fit(
+            &Mixture,
+            &FAR_COUNTS,
+            priors,
+            &mut params,
+            &PoissonConfig::default(),
+        )
+        .unwrap()
+    }
+
+    #[test]
+    fn the_unbounded_gaussian_is_one_newton_step_past_the_bounds() {
+        let (x, y) = (
+            FitParameter::non_negative("x", 9000.0),
+            FitParameter::non_negative("y", 1.0),
+        );
+        let capped = FitParameter {
+            upper: 9000.0,
+            ..x.clone()
+        };
+        let cases = [
+            (vec![x.clone(), y.clone()], None, 1),
+            (vec![capped, FitParameter::unbounded("y", 1.0)], None, 0),
+            (vec![x, y], Some((10.0, 20.0)), 1),
+        ];
+        for (params, prior, held) in cases {
+            let priors: Vec<Prior> = prior
+                .iter()
+                .map(|&(mean, sd)| Prior::measured(1, mean, sd))
+                .collect();
+            let result = fit_far(params, &priors);
+            assert!(result.converged && result.on_bound[held] && !result.on_bound[1 - held]);
+            let theta = [result.params[0], result.params[1]];
+            let (mut information, mut gradient) = ([[0.0; 2]; 2], [0.0; 2]);
+            for (a, n) in MIXTURE.iter().zip(FAR_COUNTS) {
+                let mu = a[0] * theta[0] + a[1] * theta[1];
+                for k in 0..2 {
+                    gradient[k] += a[k] * (1.0 - n / mu);
+                    for l in 0..2 {
+                        information[k][l] += a[k] * a[l] / mu;
+                    }
+                }
+            }
+            if let Some((mean, sd)) = prior {
+                information[1][1] += sd.powi(-2);
+                gradient[1] += (theta[1] - mean) / sd.powi(2);
+            }
+            let covariance = inverse(information);
+            let unbounded = result.unbounded.expect("unbounded");
+            for k in 0..2 {
+                let mean = theta[k] - covariance[k][held] * gradient[held];
+                let sd = covariance[k][k].sqrt();
+                assert!(
+                    (unbounded.mean[k] - mean).abs() <= 1e-12 * sd,
+                    "{held} {k}: {} vs {mean}",
+                    unbounded.mean[k]
+                );
+                for (l, expected) in covariance[k].iter().enumerate() {
+                    let scale = sd * covariance[l][l].sqrt();
+                    assert!((unbounded.covariance.get(k, l) - expected).abs() <= 1e-12 * scale);
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn the_unbounded_gaussian_is_the_fit_without_its_bound_to_second_order() {
+        let x = FitParameter::non_negative("x", 9000.0);
+        let bounded = fit_far(vec![x.clone(), FitParameter::non_negative("y", 1.0)], &[]);
+        let free = fit_far(vec![x, FitParameter::unbounded("y", 1.0)], &[]);
+        let covariance = free.covariance.expect("covariance");
+        assert!(bounded.on_bound[1] && !free.on_bound[1]);
+        assert!(free.params[1] <= -1.5 * covariance.get(1, 1).sqrt());
+        let unbounded = bounded.unbounded.expect("unbounded");
+        for k in 0..2 {
+            let variance = covariance.get(k, k);
+            assert!((unbounded.mean[k] - free.params[k]).abs() <= 0.05 * variance.sqrt());
+            assert!((unbounded.covariance.get(k, k) / variance - 1.0).abs() <= 0.05);
+        }
     }
 
     #[test]
@@ -2262,7 +2401,10 @@ mod tests {
         )
         .unwrap();
         assert!(
-            result.converged && result.params[0] == 0.0 && result.on_bound == vec![true],
+            result.converged
+                && result.params[0] == 0.0
+                && result.on_bound == vec![true]
+                && result.unbounded.is_none(),
             "{result:?}"
         );
     }

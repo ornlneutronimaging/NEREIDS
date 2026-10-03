@@ -2178,17 +2178,31 @@ mod pulse_calibration {
         let bounded = fits.iter().filter(|fit| fit.on_bound[4]).count() as f64 / fits.len() as f64;
         let spread = 0.5 / (fits.len() as f64).sqrt();
         assert!((bounded - 0.5).abs() <= 3.5 * spread, "{bounded}");
-        for i in [2, 3, 5, 6, 7] {
-            let pulls: Vec<f64> = fits
-                .iter()
-                .map(|fit| (calibration_estimates(fit)[i] - truth[i]) / error_bar(fit, i))
-                .collect();
+        let unbounded = |fit: &CountsFit, i: usize| {
+            let unbounded = fit.unbounded.as_ref().expect("unbounded");
+            (unbounded.mean[i] - truth[i]) / unbounded.covariance.get(i, i).sqrt()
+        };
+        let held = |fit: &CountsFit, i: usize| {
+            (calibration_estimates(fit)[i] - truth[i]) / error_bar(fit, i)
+        };
+        let cases = [2, 3, 5, 6, 7]
+            .map(|i| (i, &held as &dyn Fn(&CountsFit, usize) -> f64, "held"))
+            .into_iter()
+            .chain((2..8).map(|i| {
+                (
+                    i,
+                    &unbounded as &dyn Fn(&CountsFit, usize) -> f64,
+                    "unbounded",
+                )
+            }));
+        for (i, pull, what) in cases {
+            let pulls: Vec<f64> = fits.iter().map(|fit| pull(fit, i)).collect();
             let (mean, sd) = super::error_bar_pulls::moments(&pulls);
             let covered =
                 pulls.iter().filter(|pull| pull.abs() <= 1.0).count() as f64 / pulls.len() as f64;
             assert!(
                 (0.9..=1.1).contains(&sd) && (0.61..=0.75).contains(&covered),
-                "{i}: mean {mean}, sd {sd}, within one sd {covered}"
+                "{what} {i}: mean {mean}, sd {sd}, within one sd {covered}"
             );
         }
     }
@@ -2329,17 +2343,6 @@ mod pulse_calibration {
                 let (calibrated, fit) =
                     PulseCalibration::new(&m, &calibration, foil_provenance()).ok()?;
                 let experiment = calibrated.calibration();
-                let pulse = &experiment.pulse;
-                [
-                    pulse.alpha[0],
-                    pulse.alpha[1],
-                    pulse.beta[0],
-                    pulse.r,
-                    pulse.fwhm_squared_us2,
-                ]
-                .iter()
-                .all(|number| matches!(number, Value::Fitted(_)))
-                .then_some(())?;
                 let drawn = draws(&counts, 90_000 + seed, [1.0; 2]);
                 Some((experiment_with(&p, drawn, &experiment), fit.overdispersion))
                     .filter(|(fit, _)| fit.converged)
@@ -2446,23 +2449,21 @@ mod pulse_calibration {
                     let sign = if seed % 2 == 0 { 1.0 } else { -1.0 };
                     let mut calibration = calibration_start(&p, sign, Some(p[5] + 0.05 * sign));
                     calibration.pulse.alpha[0] = Value::Fitted(0.05);
-                    let (calibrated, _) =
+                    let (calibrated, calibration_fit) =
                         PulseCalibration::new(&m, &calibration, foil_provenance()).ok()?;
-                    let experiment = calibrated.calibration();
-                    let held = matches!(experiment.pulse.alpha[0], Value::Known(_));
                     let drawn = draws(&counts, 91_000 + seeds + seed, [1.0; 2]);
-                    Some((experiment_with(&p, drawn, &experiment), held))
-                        .filter(|(fit, _)| fit.converged)
+                    Some((
+                        experiment_with(&p, drawn, &calibrated.calibration()),
+                        calibration_fit.on_bound[4],
+                    ))
+                    .filter(|(fit, _)| fit.converged)
                 })
                 .collect();
             assert!(fits.len() >= 398, "{alpha0}: {} converged", fits.len());
             let n = fits.len() as f64;
             let held = fits.iter().filter(|(_, held)| *held).count();
-            assert!(held > 0, "{alpha0}: none held");
-            bounded += fits
-                .iter()
-                .filter(|(fit, held)| !held && fit.on_bound[4])
-                .count();
+            assert!(held > 0, "{alpha0}: no calibration ended on the bound");
+            bounded += fits.iter().filter(|(fit, _)| fit.on_bound[4]).count();
             for (i, truth) in [(0, CALIBRATION_DENSITY), (1, EXPERIMENT_K)] {
                 let pulls: Vec<f64> = fits
                     .iter()
@@ -2584,7 +2585,7 @@ mod pulse_calibration {
         );
     }
 
-    fn transfer_replicas(pulse: &[f64; 6], seeds: u64) -> Vec<(Consistency, f64, bool)> {
+    fn transfer_replicas(pulse: &[f64; 6], seeds: u64) -> Vec<(Consistency, f64)> {
         let first = calibration_foil(pulse, T0_US, FLIGHT_PATH_M);
         let first_counts = expected(
             &first,
@@ -2610,34 +2611,35 @@ mod pulse_calibration {
                     .chain(&b_fit.overdispersion)
                     .map(|phi| phi.unwrap_or(1.0))
                     .collect();
-                let held = |c: &PulseCalibration| {
-                    matches!(c.calibration().pulse.alpha[0], Value::Known(_))
-                };
                 Some((
                     transfer.agreement(),
                     weights.iter().sum::<f64>() / weights.len() as f64,
-                    held(&a) != held(&b),
                 ))
             })
             .collect()
     }
 
-    fn chi_squared_on_average<'a>(tests: impl Iterator<Item = &'a (Consistency, f64, bool)>) {
-        let (q, dof) = tests.fold((0.0, 0.0), |(q, dof), (t, phi, _)| {
-            (q + t.q * phi, dof + t.dof as f64)
-        });
-        assert!(
-            (q - dof).abs() <= 3.0 * (2.0 * dof).sqrt(),
-            "d2 {q} summed over {dof} degrees of freedom"
-        );
-    }
-
-    fn rejected_at_most_nominally(tests: &[(Consistency, f64, bool)]) {
+    fn agree_as_chi_squared(tests: &[(Consistency, f64)]) {
+        assert!(tests.len() >= 398, "{} transferred", tests.len());
         let n = tests.len() as f64;
-        let rejected = tests.iter().filter(|(t, _, _)| t.p < 0.05).count() as f64 / n;
+        let weighted: Vec<f64> = tests
+            .iter()
+            .map(|(t, phi)| {
+                assert_eq!(t.dof, 5);
+                t.q * phi
+            })
+            .collect();
+        let q = weighted.iter().sum::<f64>();
+        let rejected = weighted
+            .iter()
+            .filter(|&&q| q > CHI_SQUARED_5_AT_0_05)
+            .count() as f64
+            / n;
         assert!(
-            rejected <= 0.05 + 3.0 * (0.05 * 0.95 / n).sqrt(),
-            "{rejected} rejected at a reported 0.05"
+            (q - 5.0 * n).abs() <= 3.0 * (10.0 * n).sqrt()
+                && (rejected - 0.05).abs() <= 3.0 * (0.05 * 0.95 / n).sqrt(),
+            "d2 {q} summed over {} degrees of freedom, {rejected} rejected at 0.05",
+            5.0 * n
         );
     }
 
@@ -2646,38 +2648,15 @@ mod pulse_calibration {
     fn two_foils_on_the_same_pulse_agree_as_chi_squared_says() {
         let mut p = CALIBRATION_PULSE;
         p[5] = 0.35;
-        let tests = transfer_replicas(&p, 100_000);
-        assert!(tests.len() >= 398, "{} transferred", tests.len());
-        chi_squared_on_average(tests.iter());
-        let n = tests.len() as f64;
-        let rejected = tests
-            .iter()
-            .filter(|(t, phi, _)| {
-                assert_eq!(t.dof, 5);
-                t.q * phi > CHI_SQUARED_5_AT_0_05
-            })
-            .count() as f64
-            / n;
-        assert!(
-            (rejected - 0.05).abs() <= 3.0 * (0.05 * 0.95 / n).sqrt(),
-            "{rejected} rejected at 0.05"
-        );
+        agree_as_chi_squared(&transfer_replicas(&p, 100_000));
     }
 
     #[test]
     #[ignore = "slow; runs nightly"]
-    fn two_foils_with_a_moderation_rate_near_its_bound_reject_no_more_than_nominally() {
+    fn two_foils_with_a_moderation_rate_near_its_bound_agree_as_chi_squared_says() {
         let mut p = CALIBRATION_PULSE;
         p[0] = 5e-4;
         p[5] = 0.35;
-        let tests = transfer_replicas(&p, 200_000);
-        assert!(tests.len() >= 390, "{} transferred", tests.len());
-        let conditioned: Vec<_> = tests.iter().filter(|(_, _, one_held)| *one_held).collect();
-        assert!(
-            !conditioned.is_empty(),
-            "no foil held alpha0 while the other resolved it"
-        );
-        chi_squared_on_average(conditioned.into_iter());
-        rejected_at_most_nominally(&tests);
+        agree_as_chi_squared(&transfer_replicas(&p, 200_000));
     }
 }

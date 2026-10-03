@@ -12,7 +12,7 @@ use nereids_endf::resonance::ResonanceData;
 use nereids_fitting::error::FittingError;
 use nereids_fitting::lm::{FitModel, FlatMatrix};
 use nereids_fitting::parameters::{FitParameter, ParameterSet};
-use nereids_fitting::poisson::Prior;
+use nereids_fitting::poisson::{Prior, Unbounded};
 use nereids_fitting::statistics::{Consistency, consistency};
 use nereids_physics::continuous_doppler::{SUPPORT_X, broaden_with_derivative};
 use nereids_physics::doppler::DopplerParams;
@@ -170,6 +170,11 @@ pub struct CountsFit {
     /// temperature or barely separate it from a density, as at few counts or
     /// for a thin sample at modest counts.
     pub covariance: Option<FlatMatrix>,
+    /// The fitted quantities' Gaussian without their bounds, in the
+    /// covariance's order (see [`Unbounded`]), its covariance NaN where
+    /// `covariance` is at a temperature edge.  `None` when `covariance` is,
+    /// or when the fitter reports none.
+    pub unbounded: Option<Unbounded>,
     /// Whether each fitted quantity, in the covariance's order, ended on one
     /// of its bounds.
     pub on_bound: Vec<bool>,
@@ -668,20 +673,30 @@ pub fn fit_counts(
     let sample_quantities: Vec<usize> = (0..free.len())
         .filter(|&p| free[p] >= layout.densities)
         .collect();
+    let block = |full: &FlatMatrix| {
+        let size = sample_quantities.len();
+        let mut block = FlatMatrix::zeros(size, size);
+        for (a, &p) in sample_quantities.iter().enumerate() {
+            for (b, &q) in sample_quantities.iter().enumerate() {
+                *block.get_mut(a, b) = if on_edge { f64::NAN } else { full.get(p, q) };
+            }
+        }
+        block
+    };
     let covariance = fit
         .result
         .covariance
         .as_ref()
         .filter(|_| converged)
-        .map(|full| {
-            let size = sample_quantities.len();
-            let mut block = FlatMatrix::zeros(size, size);
-            for (a, &p) in sample_quantities.iter().enumerate() {
-                for (b, &q) in sample_quantities.iter().enumerate() {
-                    *block.get_mut(a, b) = if on_edge { f64::NAN } else { full.get(p, q) };
-                }
-            }
-            block
+        .map(block);
+    let unbounded = fit
+        .result
+        .unbounded
+        .as_ref()
+        .filter(|_| converged)
+        .map(|full| Unbounded {
+            mean: sample_quantities.iter().map(|&p| full.mean[p]).collect(),
+            covariance: block(&full.covariance),
         });
     let params = &fit.result.params;
     let on_bound: Vec<bool> = sample_quantities
@@ -737,6 +752,7 @@ pub fn fit_counts(
         r: params[layout.pulse + 4],
         fwhm_squared_us2: params[layout.pulse + 5],
         covariance,
+        unbounded,
         on_bound,
         beam: open.beam.with_coefficients(&params[..layout.densities]),
         beam_at_limit: open.at_limit,
