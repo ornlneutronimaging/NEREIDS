@@ -187,6 +187,10 @@ pub struct CountsFit {
     /// Each run's half Poisson deviance over the overdispersion it was
     /// weighted with, summed over both runs at the fit.
     pub deviance: f64,
+    /// The open-beam and sample counts the fit predicts in each bin at its
+    /// answer, live fractions included, on the grid it accepted: the counts
+    /// `deviance` compares with the measured ones.
+    pub predicted: [Vec<f64>; 2],
     /// Whether the fitter converged, the sample run's overdispersion settled,
     /// the grid met its rule at the fitted temperature and its flight times
     /// cover the fitted `t0`, flight path and pulse.
@@ -758,6 +762,10 @@ pub fn fit_counts(
         beam: open.beam.with_coefficients(&params[..layout.densities]),
         beam_at_limit: open.at_limit,
         deviance: fit.result.deviance,
+        predicted: [
+            fit.predicted[..bins].to_vec(),
+            fit.predicted[bins..].to_vec(),
+        ],
         converged,
         overdispersion,
         measured_pulls,

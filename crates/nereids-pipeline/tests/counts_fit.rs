@@ -433,19 +433,15 @@ fn the_fit_is_on_the_finer_grid_of_the_first_pair_both_runs_leave_unchanged() {
     assert_eq!(fit.halvings, accepted);
     assert_eq!(fit.points, grids[accepted].flight_times_us().len());
     assert_eq!(fit.step_us, grids[accepted].step_us());
-    let deviance: f64 = predicted(&grids[accepted], &beam, &fitted)
-        .iter()
-        .zip(&observed)
-        .map(|(&mu, &y)| {
-            let d = (y - mu) / mu;
-            mu * d * d * (0.5 - d / 6.0 + d * d / 12.0)
-        })
-        .sum();
-    assert!(
-        (fit.deviance - deviance).abs() <= 1e-2 * deviance,
-        "{} vs {deviance}",
-        fit.deviance
-    );
+    let rebuilt = predicted(&grids[accepted], &beam, &fitted);
+    for (run, rebuilt) in fit.predicted.iter().zip(rebuilt.chunks(counts.0.len())) {
+        assert_eq!(run.len(), rebuilt.len());
+        assert!(
+            run.iter()
+                .zip(rebuilt)
+                .all(|(f, r)| (f - r).abs() <= 1e-12 * r)
+        );
+    }
 }
 
 fn distance(fitted: &[f64], simulated: &[f64]) -> f64 {
@@ -756,6 +752,28 @@ fn covariance_against_information(temperature: Value, noisy: bool) {
         Vec::new()
     };
     let fit = fit_counts(&m, &calibration(&setup)).expect("fit");
+    let overdispersion = fit.overdispersion.map(|phi| phi.expect("measured"));
+    let deviance: f64 = [&m.open_counts, &m.sample_counts]
+        .iter()
+        .zip(&fit.predicted)
+        .zip(overdispersion)
+        .map(|((y, mu), phi)| {
+            let half: f64 = y
+                .iter()
+                .zip(mu)
+                .map(|(&y, &mu)| {
+                    let d = (y - mu) / mu;
+                    mu * ((1.0 + d) * d.ln_1p() - d)
+                })
+                .sum();
+            half / phi
+        })
+        .sum();
+    assert!(
+        (deviance / fit.deviance - 1.0).abs() <= 1e-9,
+        "{deviance} vs {}",
+        fit.deviance
+    );
     let quantities = first_term + 3;
     let (low, high) = FlightTimeGrid::new(
         &setup.edges,
@@ -852,7 +870,6 @@ fn covariance_against_information(temperature: Value, noisy: bool) {
         })
         .collect();
     let bins = mu.len() / 2;
-    let overdispersion = fit.overdispersion.map(|phi| phi.expect("measured"));
     let mut information: Vec<Vec<f64>> = columns
         .iter()
         .map(|a| {
@@ -1689,6 +1706,9 @@ fn density_temperature_timing_offset_and_flight_path_are_recovered_from_starts_o
         )
         .expect("fit");
         assert!(fit.converged, "{sign}");
+        let simulated =
+            distance(&fit.predicted[0], &open) + distance(&fit.predicted[1], &transmitted);
+        assert!(simulated <= BOUND, "{sign}: {simulated}");
         for (i, (estimate, truth)) in [
             (fit.densities[0], THIN),
             (fit.temperature_k, TEMPERATURE_K),

@@ -959,6 +959,7 @@ mod tests {
             beam: BeamSpline::constant(200.0, 600.0, 1.0),
             beam_at_limit: false,
             deviance: 0.0,
+            predicted: [Vec::new(), Vec::new()],
             converged: true,
             overdispersion: [None; 2],
             measured_pulls: None,
