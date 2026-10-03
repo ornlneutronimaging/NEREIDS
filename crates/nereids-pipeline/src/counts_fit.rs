@@ -171,9 +171,9 @@ pub struct CountsFit {
     /// for a thin sample at modest counts.
     pub covariance: Option<FlatMatrix>,
     /// The fitted quantities' Gaussian without their bounds, in the
-    /// covariance's order (see [`Unbounded`]), its covariance NaN where
-    /// `covariance` is at a temperature edge.  `None` when `covariance` is,
-    /// or when the fitter reports none.
+    /// covariance's order (see [`Unbounded`]), NaN where `covariance` is at a
+    /// temperature edge.  `None` when `covariance` is, or when the fitter
+    /// reports none.
     pub unbounded: Option<Unbounded>,
     /// Whether each fitted quantity, in the covariance's order, ended on one
     /// of its bounds.
@@ -284,7 +284,8 @@ pub struct CountsFit {
 /// overdispersion, plus `½((x − value)/sd)²` for each [`Value::Measured`]
 /// quantity `x`, and `½(θ − m)ᵀC⁻¹(θ − m)` over the pulse numbers `θ` a
 /// calibration's [`Pulse::prior`](crate::open_beam::Pulse::prior) covers,
-/// with `m` and `C` their calibrated values and covariance.  The open-beam
+/// with `m` and `C` that prior's mean, which may lie past a number's bound,
+/// and covariance.  The open-beam
 /// run is weighted with the open-beam fit's overdispersion, and the sample
 /// run first with the same.  The fit is
 /// repeated from its answer while the sample run's overdispersion, measured on
@@ -695,7 +696,10 @@ pub fn fit_counts(
         .as_ref()
         .filter(|_| converged)
         .map(|full| Unbounded {
-            mean: sample_quantities.iter().map(|&p| full.mean[p]).collect(),
+            mean: sample_quantities
+                .iter()
+                .map(|&p| if on_edge { f64::NAN } else { full.mean[p] })
+                .collect(),
             covariance: block(&full.covariance),
         });
     let params = &fit.result.params;

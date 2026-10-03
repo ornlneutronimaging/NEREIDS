@@ -341,18 +341,19 @@ pub struct PoissonResult {
     /// decomposition fails.
     pub leverage: Option<Vec<f64>>,
     /// The free parameters' Gaussian without their bounds; see [`Unbounded`].
-    /// `None` when `covariance` is, or when a bin predicted zero adds slope to
-    /// the gradient of a parameter on a bound.
+    /// `None` when `covariance` is, when its decomposition fails, or when a
+    /// bin predicted zero adds slope to the gradient of a parameter on a
+    /// bound.
     pub unbounded: Option<Unbounded>,
 }
 
 /// The quadratic expansion of the objective at the fit over every free
 /// parameter, bounds left out: covariance `F⁻¹`, `F` the expected information
 /// of all free parameters, and mean `θ̂ − F⁻¹g`, `g` the objective's gradient
-/// on the parameters that ended on a bound.  With none on a bound they are the
-/// fitted values and [`PoissonResult::covariance`].  The rows and columns of a
-/// parameter the counts and priors do not determine are NaN, as are its mean
-/// and the means its covariance reaches.
+/// at the fit, which the convergence test makes negligible off the bounds.
+/// Both are taken over the directions the counts and priors determine; the
+/// rows and columns of a parameter with a component along any other are NaN.
+/// With none on a bound the covariance is [`PoissonResult::covariance`].
 #[derive(Debug, Clone)]
 pub struct Unbounded {
     pub mean: Vec<f64>,
@@ -610,9 +611,19 @@ impl Decomposition {
             .sum::<f64>()
     }
 
-    fn step(&self, linear: &Linearization, n_free: usize, damping: f64) -> Vec<f64> {
+    fn determined(&self) -> impl Iterator<Item = usize> + '_ {
+        (0..self.singular.len()).filter(|&k| self.singular[k].powi(2) >= DEGENERATE_EIGENVALUE)
+    }
+
+    fn step(
+        &self,
+        directions: impl Iterator<Item = usize>,
+        linear: &Linearization,
+        n_free: usize,
+        damping: f64,
+    ) -> Vec<f64> {
         let mut direction = vec![0.0; n_free];
-        for k in self.spanned() {
+        for k in directions {
             let s = self.singular[k];
             let coefficient = self.along(k, linear) * s / (s * s + damping);
             for (i, &col) in self.columns.iter().enumerate() {
@@ -816,7 +827,8 @@ pub fn poisson_fit(
         let start = params.free_values();
         let mut accepted = None;
         for _ in 0..MAX_REJECTIONS {
-            let direction = decomposition.step(&linear, free.len(), damping);
+            let direction =
+                decomposition.step(decomposition.spanned(), &linear, free.len(), damping);
             let unprojected: Vec<f64> = start.iter().zip(&direction).map(|(x, d)| x - d).collect();
             params.set_free_values(&unprojected);
             if let Some(trial_model) = model
@@ -854,8 +866,15 @@ pub fn poisson_fit(
                 || withheld(free.len()),
                 |decomposition| decomposition.error_bars(free.len()),
             );
-            let leverage = decomposition.map(|decomposition| decomposition.leverage(y_obs.len()));
-            let unbounded = unbounded(linear, &params.free_values(), &bounded, &covariance);
+            let leverage = decomposition
+                .as_ref()
+                .map(|decomposition| decomposition.leverage(y_obs.len()));
+            let unbounded = unbounded(
+                linear,
+                &params.free_values(),
+                &bounded,
+                decomposition.as_ref(),
+            );
             (Some(covariance), Some(errors), leverage, unbounded)
         }
         _ => (None, None, None, None),
@@ -877,32 +896,24 @@ fn unbounded(
     linear: &Linearization,
     fitted: &[f64],
     bounded: &[bool],
-    covariance: &FlatMatrix,
+    interior: Option<&Decomposition>,
 ) -> Option<Unbounded> {
-    let held: Vec<usize> = (0..fitted.len()).filter(|&j| bounded[j]).collect();
-    if held.iter().any(|&j| linear.zero_slope[j] != 0.0) {
+    if (0..fitted.len()).any(|j| bounded[j] && linear.zero_slope[j] != 0.0) {
         return None;
     }
-    let covariance = if held.is_empty() {
-        covariance.clone()
+    let every;
+    let decomposition = if bounded.contains(&true) {
+        let columns: Vec<usize> = (0..fitted.len()).collect();
+        every = Decomposition::new(&linear.weighted, &columns)?;
+        &every
     } else {
-        let every: Vec<usize> = (0..fitted.len()).collect();
-        Decomposition::new(&linear.weighted, &every).map_or_else(
-            || withheld(fitted.len()).0,
-            |decomposition| decomposition.error_bars(fitted.len()).0,
-        )
+        interior?
     };
-    let mean = fitted
-        .iter()
-        .enumerate()
-        .map(|(i, x)| {
-            x - held
-                .iter()
-                .map(|&j| covariance.get(i, j) * linear.gradient[j])
-                .sum::<f64>()
-        })
-        .collect();
-    Some(Unbounded { mean, covariance })
+    let step = decomposition.step(decomposition.determined(), linear, fitted.len(), 0.0);
+    Some(Unbounded {
+        mean: fitted.iter().zip(step).map(|(x, d)| x - d).collect(),
+        covariance: decomposition.error_bars(fitted.len()).0,
+    })
 }
 
 /// Fixed-flux counts-domain forward model: `Y_model = flux × T_model(θ) + background`.
@@ -2165,8 +2176,10 @@ mod tests {
             }
         }
         let unbounded = result.unbounded.expect("unbounded");
-        assert_eq!(unbounded.mean, fitted);
         assert_eq!(unbounded.covariance.data, reported.data);
+        for k in 0..2 {
+            assert!((unbounded.mean[k] - fitted[k]).abs() <= 2e-3 * covariance[k][k].sqrt());
+        }
     }
 
     const FAR_COUNTS: [f64; 5] = [9743.0, 20046.0, 30110.0, 39769.0, 49761.0];
@@ -2223,7 +2236,7 @@ mod tests {
             let covariance = inverse(information);
             let unbounded = result.unbounded.expect("unbounded");
             for k in 0..2 {
-                let mean = theta[k] - covariance[k][held] * gradient[held];
+                let mean = theta[k] - (0..2).map(|l| covariance[k][l] * gradient[l]).sum::<f64>();
                 let sd = covariance[k][k].sqrt();
                 assert!(
                     (unbounded.mean[k] - mean).abs() <= 1e-12 * sd,
@@ -2236,6 +2249,49 @@ mod tests {
                 }
             }
         }
+    }
+
+    struct Unused;
+
+    impl FitModel for Unused {
+        fn evaluate(&self, params: &[f64]) -> Result<Vec<f64>, FittingError> {
+            Ok(vec![params[0]])
+        }
+
+        fn analytical_jacobian(
+            &self,
+            _params: &[f64],
+            free_param_indices: &[usize],
+            _y_current: &[f64],
+        ) -> Option<FlatMatrix> {
+            let mut jacobian = FlatMatrix::zeros(1, free_param_indices.len());
+            for (col, &index) in free_param_indices.iter().enumerate() {
+                *jacobian.get_mut(0, col) = f64::from(u8::from(index == 0));
+            }
+            Some(jacobian)
+        }
+    }
+
+    #[test]
+    fn a_parameter_on_a_bound_the_counts_do_not_determine_leaves_the_others_their_gaussian() {
+        let mut params = ParameterSet::new(vec![
+            FitParameter::unbounded("x", 90.0),
+            FitParameter::non_negative("y", 0.0),
+        ]);
+        let result = poisson_fit(
+            &Unused,
+            &[100.0],
+            &[],
+            &mut params,
+            &PoissonConfig::default(),
+        )
+        .unwrap();
+        assert!(result.converged && result.on_bound == [false, true]);
+        let unbounded = result.unbounded.expect("unbounded");
+        let variance = unbounded.covariance.get(0, 0);
+        assert!((variance / result.params[0] - 1.0).abs() <= 1e-12);
+        assert!((unbounded.mean[0] - 100.0).abs() <= 2e-3 * variance.sqrt());
+        assert!(unbounded.covariance.get(1, 1).is_nan());
     }
 
     #[test]

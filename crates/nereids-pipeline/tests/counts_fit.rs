@@ -1197,7 +1197,16 @@ fn edge_fit(
     .expect("fit");
     assert!(fit.converged, "{truth_k} K");
     let covariance = fit.covariance.as_ref().expect("covariance");
-    assert!(covariance.data.iter().all(|v| v.is_nan()), "{truth_k} K");
+    let unbounded = fit.unbounded.as_ref().expect("unbounded");
+    assert!(
+        covariance
+            .data
+            .iter()
+            .chain(&unbounded.covariance.data)
+            .chain(&unbounded.mean)
+            .all(|v| v.is_nan()),
+        "{truth_k} K"
+    );
     fit
 }
 
@@ -2185,24 +2194,19 @@ mod pulse_calibration {
         let held = |fit: &CountsFit, i: usize| {
             (calibration_estimates(fit)[i] - truth[i]) / error_bar(fit, i)
         };
+        let centred = super::error_bar_pulls::Z / (fits.len() as f64).sqrt();
         let cases = [2, 3, 5, 6, 7]
-            .map(|i| (i, &held as &dyn Fn(&CountsFit, usize) -> f64, "held"))
+            .map(|i| (i, &held as &dyn Fn(&CountsFit, usize) -> f64, f64::INFINITY))
             .into_iter()
-            .chain((2..8).map(|i| {
-                (
-                    i,
-                    &unbounded as &dyn Fn(&CountsFit, usize) -> f64,
-                    "unbounded",
-                )
-            }));
-        for (i, pull, what) in cases {
+            .chain((2..8).map(|i| (i, &unbounded as &dyn Fn(&CountsFit, usize) -> f64, centred)));
+        for (i, pull, bias) in cases {
             let pulls: Vec<f64> = fits.iter().map(|fit| pull(fit, i)).collect();
             let (mean, sd) = super::error_bar_pulls::moments(&pulls);
             let covered =
                 pulls.iter().filter(|pull| pull.abs() <= 1.0).count() as f64 / pulls.len() as f64;
             assert!(
-                (0.9..=1.1).contains(&sd) && (0.61..=0.75).contains(&covered),
-                "{what} {i}: mean {mean}, sd {sd}, within one sd {covered}"
+                mean.abs() <= bias && (0.9..=1.1).contains(&sd) && (0.61..=0.75).contains(&covered),
+                "{i}: mean {mean} within {bias}, sd {sd}, within one sd {covered}"
             );
         }
     }
@@ -2221,7 +2225,10 @@ mod pulse_calibration {
     }
 
     fn calibration_block() -> Vec<Vec<f64>> {
-        block(ONE_FOIL.1.covariance.as_ref().expect("covariance"), 4..8)
+        block(
+            &ONE_FOIL.1.unbounded.as_ref().expect("unbounded").covariance,
+            4..8,
+        )
     }
 
     fn experiment_information(fit: &CountsFit) -> Vec<Vec<f64>> {
@@ -2294,7 +2301,7 @@ mod pulse_calibration {
         let weight = inverse(sum);
         let difference: Vec<f64> = calibrated_numbers(&alone)
             .iter()
-            .zip(calibrated_numbers(&ONE_FOIL.1))
+            .zip(&ONE_FOIL.1.unbounded.as_ref().expect("unbounded").mean[4..8])
             .map(|(x, c)| x - c)
             .collect();
         let expected: f64 = (0..4)

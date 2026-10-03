@@ -160,10 +160,12 @@ impl PulseCalibration {
     /// [`PipelineError::InvalidParameter`] if a density or the temperature of
     /// the foil is not measured, as above, an identifier of `provenance` is
     /// empty or its runs are the same, or `calibration`'s pulse carries a
-    /// prior or a measured number, since a calibration foil is calibrated
-    /// alone; everything
+    /// prior or a pulse number measured or boxed within part of its range,
+    /// since a calibration foil is calibrated alone over the numbers' physical
+    /// ranges; everything
     /// [`fit_counts`] refuses;
-    /// [`PipelineError::InvalidParameter`] if the fit did not converge, a pulse
+    /// [`PipelineError::InvalidParameter`] if the fit did not converge or
+    /// gives no [`CountsFit::unbounded`] Gaussian, a pulse
     /// number it fitted has no finite positive variance without its bounds,
     /// as when the counts do not determine it, a number that ended on a bound
     /// carries no information, or a fitted temperature ended at 1 K or 5000 K,
@@ -184,11 +186,11 @@ impl PulseCalibration {
             .iter()
             .chain(&pulse.alpha)
             .chain(&pulse.beta)
-            .any(|value| matches!(value, Value::Measured { .. }));
+            .any(|value| matches!(value, Value::Measured { .. } | Value::Within { .. }));
         if pulse.prior.is_some() || measured {
             return Err(PipelineError::InvalidParameter(
-                "a calibration foil is calibrated alone, with no pulse prior or measured pulse \
-                 number"
+                "a calibration foil is calibrated alone, its pulse numbers fitted over their \
+                 physical ranges or known, with no pulse prior"
                     .into(),
             ));
         }
@@ -205,8 +207,15 @@ impl PulseCalibration {
         fit: &CountsFit,
     ) -> Result<Self, PipelineError> {
         let invalid = |message: String| Err(PipelineError::InvalidParameter(message));
-        let Some(unbounded) = fit.unbounded.as_ref().filter(|_| fit.converged) else {
+        if !fit.converged {
             return invalid("a pulse calibration needs a converged fit".into());
+        }
+        let Some(unbounded) = fit.unbounded.as_ref() else {
+            return invalid(
+                "the calibration's fit gives no Gaussian without its bounds, as when a bin \
+                 predicted zero pulls a quantity on its bound"
+                    .into(),
+            );
         };
         let fitted: Vec<bool> = quantities(measurement, calibration)
             .map(|value| !matches!(value, Value::Known(_)))
@@ -463,8 +472,8 @@ impl PulseCalibration {
     /// # Errors
     /// [`PipelineError::InvalidParameter`] if `text` is not such a file: not
     /// format version 2 of this pulse model, a field missing or unknown, the
-    /// pulse numbers' names or units not in their order, the covariance or the
-    /// rank not over the fitted numbers, the line span
+    /// pulse numbers' names or units not in their order, the mean, the
+    /// covariance or the rank not over the fitted numbers, the line span
     /// missing while a pulse number
     /// was fitted, present when none was, or not `low ≤ high` within the
     /// energy span, a provenance [`Self::new`] refuses, the overdispersion
@@ -481,17 +490,21 @@ impl PulseCalibration {
     /// mean or the covariance.
     pub fn from_json(text: &str) -> Result<Self, PipelineError> {
         let invalid = |message: String| Err(PipelineError::InvalidParameter(message));
+        let header: Header = match serde_json::from_str(text) {
+            Ok(header) => header,
+            Err(e) => return invalid(format!("not a pulse calibration file: {e}")),
+        };
+        if header.format_version != FORMAT_VERSION || header.pulse_model != PULSE_MODEL {
+            return invalid(format!(
+                "a pulse calibration file of format version {FORMAT_VERSION} and the pulse model \
+                 {PULSE_MODEL:?} is read; got version {} and the model {:?}",
+                header.format_version, header.pulse_model
+            ));
+        }
         let file: File = match serde_json::from_str(text) {
             Ok(file) => file,
             Err(e) => return invalid(format!("not a pulse calibration file: {e}")),
         };
-        if file.format_version != FORMAT_VERSION || file.pulse_model != PULSE_MODEL {
-            return invalid(format!(
-                "a pulse calibration file of format version {FORMAT_VERSION} and the pulse model \
-                 {PULSE_MODEL:?} is read; got version {} and the model {:?}",
-                file.format_version, file.pulse_model
-            ));
-        }
         if file.numbers.len() != NUMBERS.len()
             || NUMBERS
                 .iter()
@@ -507,13 +520,15 @@ impl PulseCalibration {
         let covered: Vec<usize> = (0..6).filter(|&n| status[n] == Status::Fitted).collect();
         let k = covered.len();
         if file.rank != k
+            || file.mean.len() != k
             || file.covariance.len() != k
             || file.covariance.iter().any(|row| row.len() != k)
         {
             return invalid(format!(
-                "the covariance is {k}×{k}, of rank {k}, over the {k} fitted numbers; got rank {} \
-                 and {} rows",
+                "the mean has {k} entries and the covariance is {k}×{k}, of rank {k}, over the {k} \
+                 fitted numbers; got rank {}, {} entries and {} rows",
                 file.rank,
+                file.mean.len(),
                 file.covariance.len()
             ));
         }
@@ -629,6 +644,12 @@ struct TransferRecord {
     d2: f64,
     dof: usize,
     p: f64,
+}
+
+#[derive(Deserialize)]
+struct Header {
+    format_version: u32,
+    pulse_model: String,
 }
 
 #[derive(Serialize, Deserialize)]
@@ -995,19 +1016,30 @@ mod tests {
             .covariance
             .data
             .fill(f64::NAN);
-        for refused in [
-            undetermined,
-            withheld,
-            CountsFit {
-                converged: false,
-                ..fit(8, &[5])
-            },
-            CountsFit {
-                unbounded: None,
-                ..fit(8, &[5])
-            },
+        for (refused, refusal) in [
+            (undetermined, "without determining it"),
+            (withheld, "without determining it"),
+            (
+                CountsFit {
+                    converged: false,
+                    ..fit(8, &[5])
+                },
+                "converged fit",
+            ),
+            (
+                CountsFit {
+                    unbounded: None,
+                    ..fit(8, &[5])
+                },
+                "no Gaussian without its bounds",
+            ),
         ] {
-            assert!(calibrated(&m, &c, refused).is_err());
+            match calibrated(&m, &c, refused) {
+                Err(PipelineError::InvalidParameter(message)) => {
+                    assert!(message.contains(refusal), "{message}")
+                }
+                other => panic!("{other:?}"),
+            }
         }
     }
 
@@ -1186,6 +1218,24 @@ mod tests {
             );
         }
         assert!(PulseCalibration::from_json(&original.to_string()).is_ok());
+        let mut known = calibration(Value::Known(0.01));
+        let pulse = &mut known.pulse;
+        pulse.alpha[1] = Value::Known(1.1);
+        pulse.beta[0] = Value::Known(0.0);
+        pulse.r = Value::Known(0.21);
+        pulse.fwhm_squared_us2 = Value::Known(0.12);
+        let unfitted = calibrated(&measurement(None), &known, fit(4, &[])).unwrap();
+        let mut stray: serde_json::Value = serde_json::from_str(&unfitted.to_json()).unwrap();
+        assert!(PulseCalibration::from_json(&stray.to_string()).is_ok());
+        stray["mean"] = serde_json::json!([1.0]);
+        assert!(PulseCalibration::from_json(&stray.to_string()).is_err());
+        match PulseCalibration::from_json(r#"{"format_version": 1, "pulse_model": "", "runs": {}}"#)
+        {
+            Err(PipelineError::InvalidParameter(message)) => {
+                assert!(message.contains("got version 1"), "{message}")
+            }
+            other => panic!("{other:?}"),
+        }
     }
 
     #[test]
@@ -1216,11 +1266,18 @@ mod tests {
             value: 0.2,
             sd: 0.01,
         };
+        let mut boxed = c.clone();
+        boxed.pulse.r = Value::Within {
+            start: 0.2,
+            lower: 0.15,
+            upper: 0.25,
+        };
         for (c, provenance, refusal) in [
             (&c, same, "names its foil"),
             (&c, unnamed, "names its foil"),
             (&original().calibration(), provenance(), "calibrated alone"),
             (&measured, provenance(), "calibrated alone"),
+            (&boxed, provenance(), "calibrated alone"),
         ] {
             match PulseCalibration::new(&measurement(None), c, provenance) {
                 Err(PipelineError::InvalidParameter(message)) => {
