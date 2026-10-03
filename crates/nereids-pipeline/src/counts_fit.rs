@@ -201,18 +201,21 @@ pub struct CountsFit {
     /// measured it; the open-beam run is then weighted with 1, and the sample
     /// run as the open-beam run.
     pub overdispersion: [Option<f64>; 2],
-    /// For each measured quantity, in the covariance's order, its fitted value
-    /// less its measurement over the standard deviation of that difference,
-    /// `√(sd² − variance)`: near 0 ± 1 when the counts agree with the
-    /// measurement.  NaN for a quantity on a bound, and for every quantity
-    /// when a fitted temperature ends at 1 K or 5000 K; it loses precision as
-    /// the counts' information on the quantity vanishes beside the
-    /// measurement's.  `None` when `covariance` is.
+    /// For each measured quantity, in the covariance's order, its value
+    /// without the fit's bounds ([`Self::unbounded`]) less its measurement
+    /// over the standard deviation of that difference, `√(sd² − variance)`,
+    /// the variance also without the bounds: near 0 ± 1 when the counts agree
+    /// with the measurement.  NaN for a quantity the counts and measurements
+    /// do not determine, and for every quantity when a fitted temperature ends
+    /// at 1 K or 5000 K; it loses precision as the counts' information on the
+    /// quantity vanishes beside the measurement's.  `None` when `unbounded`
+    /// is.
     pub measured_pulls: Option<Vec<f64>>,
     /// Whether the counts accept the pulse's calibration on the numbers it
     /// covers, by [`consistency`] with the fit's numbers and covariance
-    /// without their bounds ([`Self::unbounded`]).  The counts' information is divided by each run's
-    /// overdispersion, so the test weakens as the overdispersion grows.  The
+    /// without their bounds ([`Self::unbounded`]).  The counts' information is
+    /// divided by each run's overdispersion, so the test weakens as the
+    /// overdispersion grows.  The
     /// overdispersion is at least 1, so with Poisson counts its estimate
     /// inflates the covariances the test uses, and `p` rejects a right
     /// calibration less often than its value says, the more so the fewer bins
@@ -285,9 +288,8 @@ pub struct CountsFit {
 /// quantity `x`, and `½(θ − m)ᵀC⁻¹(θ − m)` over the pulse numbers `θ` a
 /// calibration's [`Pulse::prior`](crate::open_beam::Pulse::prior) covers,
 /// with `m` and `C` that prior's mean, which may lie past a number's bound,
-/// and covariance.  The open-beam
-/// run is weighted with the open-beam fit's overdispersion, and the sample
-/// run first with the same.  The fit is
+/// and covariance.  The open-beam run is weighted with the open-beam fit's
+/// overdispersion, and the sample run first with the same.  The fit is
 /// repeated from its answer while the sample run's overdispersion, measured on
 /// the bins the first fit predicts at least one count, changes by more than
 /// 1%, the coarser grid of the accepted pair is wider than the rule at the
@@ -730,13 +732,12 @@ pub fn fit_counts(
         }
         _ => None,
     };
-    let measured_pulls = covariance.as_ref().map(|block| {
+    let measured_pulls = unbounded.as_ref().map(|unbounded| {
         measured
             .iter()
             .map(|&(offset, mean, sd)| {
-                let parameter = layout.densities + offset;
-                let a = position(parameter);
-                (params[parameter] - mean) / (sd * sd - block.get(a, a)).sqrt()
+                let a = position(layout.densities + offset);
+                (unbounded.mean[a] - mean) / (sd * sd - unbounded.covariance.get(a, a)).sqrt()
             })
             .collect()
     });

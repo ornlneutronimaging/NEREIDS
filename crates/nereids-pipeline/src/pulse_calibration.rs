@@ -131,11 +131,14 @@ struct Foil {
 /// the prior; a number known in the calibration stays known.  The prior is
 /// the calibration's [`CountsFit::unbounded`] Gaussian in the fitted numbers,
 /// marginal over the other quantities, so a number that ended on a bound
-/// keeps its uncertainty and the experiment fit applies the bound.  A box on
-/// another quantity of the calibration foil does not reach the prior, which
-/// it could only narrow.  When the
+/// keeps its uncertainty and the experiment fit applies the bound.  The
+/// bounds of the calibration foil's other quantities do not reach the prior
+/// either: its mean and covariance are those without them.  When the
 /// calibration fitted a pulse number, an experiment's pulse carries the
-/// foil's [`line_span_ev`](Pulse::line_span_ev).
+/// foil's [`line_span_ev`](Pulse::line_span_ev).  When an experiment ends a
+/// calibrated pulse number on its bound, or near it, its error bars on `t0`,
+/// the flight path and the pulse numbers are not standard errors; those on
+/// the densities and the temperature are.
 #[derive(Debug, Clone)]
 pub struct PulseCalibration {
     numbers: [f64; 6],
@@ -167,10 +170,10 @@ impl PulseCalibration {
     /// [`fit_counts`] refuses;
     /// [`PipelineError::InvalidParameter`] if the fit did not converge, or
     /// fitted a pulse number and gives no [`CountsFit::unbounded`] Gaussian, a
-    /// pulse
-    /// number it fitted has no finite positive variance without its bounds,
-    /// as when the counts do not determine it, a number that ended on a bound
-    /// carries no information, or a fitted temperature ended at 1 K or 5000 K,
+    /// pulse number it fitted has no finite positive variance without its
+    /// bounds, as when the counts do not determine it, a number that ended on
+    /// a bound carries no information, or a fitted temperature ended at 1 K or
+    /// 5000 K,
     /// or the fit fitted a pulse number and no isotope of the foil fitted or
     /// known to a positive density has a resonance between the energies of its
     /// last and first time edges at the fitted `t0` and flight path;

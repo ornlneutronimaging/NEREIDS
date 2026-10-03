@@ -257,9 +257,9 @@ pub struct PoissonResult {
     /// decomposition fails.
     pub leverage: Option<Vec<f64>>,
     /// The free parameters' Gaussian without their bounds; see [`Unbounded`].
-    /// `None` when `covariance` is, when its decomposition fails, or when a
-    /// bin predicted zero adds slope to the gradient of a parameter on a
-    /// bound.
+    /// `None` when `covariance` is, when the decomposition over every free
+    /// parameter fails, or when a bin predicted zero adds slope to the
+    /// gradient of a parameter on a bound.
     pub unbounded: Option<Unbounded>,
 }
 

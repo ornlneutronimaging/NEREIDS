@@ -5,7 +5,8 @@ use std::sync::{Arc, LazyLock};
 use nereids_endf::resonance::ResonanceData;
 use nereids_endf::resonance::test_support::{synthetic_isotope, synthetic_isotope_multi};
 use nereids_fitting::lm::FlatMatrix;
-use nereids_fitting::statistics::Consistency;
+use nereids_fitting::poisson::{Prior, Unbounded};
+use nereids_fitting::statistics::{self, Consistency};
 use nereids_physics::continuous_doppler::SUPPORT_X;
 use nereids_physics::doppler::DopplerParams;
 use nereids_physics::flight_time_grid::FlightTimeGrid;
@@ -647,6 +648,26 @@ fn an_absent_isotope_is_fitted_on_its_bound() {
                 "{temperature_k:?}"
             );
         }
+    }
+    let measured: Vec<CountsFit> = (500..503)
+        .map(|seed| {
+            let mut m = measurement(
+                &setup,
+                draws(&expected, seed, [1.0; 2]),
+                &[(isotope.clone(), THIN)],
+            );
+            m.isotopes[0].1 = Value::Measured {
+                value: 0.0,
+                sd: THIN,
+            };
+            fit_counts(&m, &calibration(&setup)).expect("fit")
+        })
+        .filter(|fit| fit.densities[0] == 0.0)
+        .collect();
+    assert!(!measured.is_empty());
+    for fit in measured {
+        let pulls = fit.measured_pulls.expect("measured pulls");
+        assert!(pulls.iter().all(|pull| pull.is_finite()), "{pulls:?}");
     }
 }
 
@@ -1941,6 +1962,25 @@ fn an_experiment_made_with_another_pulse_rejects_the_calibration() {
     assert!(fit.converged);
     let consistency = fit.pulse_consistency.expect("consistency");
     assert!(consistency.p < 0.01, "{consistency:?}");
+    let block = |unbounded: &Unbounded| {
+        let mut covariance = FlatMatrix::zeros(4, 4);
+        for i in 0..4 {
+            for j in 0..4 {
+                *covariance.get_mut(i, j) = unbounded.covariance.get(4 + i, 4 + j);
+            }
+        }
+        (unbounded.mean[4..8].to_vec(), covariance)
+    };
+    let (mean, covariance) = block(ONE_FOIL.1.unbounded.as_ref().expect("unbounded"));
+    let prior = Prior::correlated(&[0, 1, 2, 3], &mean, &covariance).expect("prior");
+    let (estimate, posterior) = block(fit.unbounded.as_ref().expect("unbounded"));
+    let expected = statistics::consistency(&prior, &estimate, &posterior)
+        .expect("consistency")
+        .expect("statistic");
+    assert!(
+        (consistency.q / expected.q - 1.0).abs() <= 1e-9,
+        "{consistency:?} vs {expected:?}"
+    );
 }
 
 #[test]
