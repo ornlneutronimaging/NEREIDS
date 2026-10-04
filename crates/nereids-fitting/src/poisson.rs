@@ -294,7 +294,7 @@ const WITHIN_ONE_STANDARD_ERROR: f64 = 0.5;
 
 const NEWTON_FRACTIONS: [f64; 3] = [1.0, 0.5, 0.25];
 
-const CURVATURE_PROBE: f64 = 1e-3;
+const CURVATURE_PROBE: f64 = 1e-6;
 
 /// `obs·ln(obs/mean) + mean − obs`, by C. Loader's `bd0` ("Fast and
 /// accurate computation of binomial probabilities", 2000): a series in
@@ -2853,7 +2853,8 @@ mod tests {
 
     struct BentRate {
         x: Vec<f64>,
-        lowest_rate: f64,
+        bound: f64,
+        below: std::cell::Cell<usize>,
     }
 
     impl BentRate {
@@ -2864,8 +2865,8 @@ mod tests {
 
     impl FitModel for BentRate {
         fn evaluate(&self, params: &[f64]) -> Result<Vec<f64>, FittingError> {
-            if params[1] < self.lowest_rate {
-                return Err(FittingError::InvalidConfig("below the lowest rate".into()));
+            if params[1] < self.bound {
+                self.below.set(self.below.get() + 1);
             }
             Ok(self
                 .x
@@ -2895,7 +2896,8 @@ mod tests {
     fn the_curvature_beside_a_bound_is_measured_without_leaving_the_bounds() {
         let model = BentRate {
             x: (0..20).map(|i| 0.1 * f64::from(i)).collect(),
-            lowest_rate: 0.5,
+            bound: 0.5,
+            below: std::cell::Cell::new(0),
         };
         let observed: Vec<f64> = model
             .x
@@ -2951,6 +2953,57 @@ mod tests {
             );
         }
         assert_eq!(params.free_values(), at);
+        assert_eq!(model.below.get(), 0);
+    }
+
+    struct Faint;
+
+    impl Faint {
+        fn mean(x: f64) -> f64 {
+            1e-4 * (1e-5 * x + 3.7e-9 * x * x).exp()
+        }
+    }
+
+    impl FitModel for Faint {
+        fn evaluate(&self, params: &[f64]) -> Result<Vec<f64>, FittingError> {
+            Ok(vec![Self::mean(params[0])])
+        }
+
+        fn analytical_jacobian(
+            &self,
+            params: &[f64],
+            free_param_indices: &[usize],
+            _y_current: &[f64],
+        ) -> Option<FlatMatrix> {
+            let x = params[0];
+            let mut jacobian = FlatMatrix::zeros(1, free_param_indices.len());
+            *jacobian.get_mut(0, 0) = Self::mean(x) * (1e-5 + 7.4e-9 * x);
+            Some(jacobian)
+        }
+    }
+
+    #[test]
+    fn the_curvature_probe_along_a_faintly_determined_direction_finds_its_curvature() {
+        let mut params = ParameterSet::new(vec![FitParameter::unbounded("x", 0.0)]);
+        let free = params.free_indices();
+        let mean = Faint.evaluate(&[0.0]).unwrap();
+        let gradient = linearize(&Faint, &params, &free, &[], &[0.0], &mean)
+            .unwrap()
+            .gradient;
+        let information = mean[0] * 1e-10;
+        let step = CURVATURE_PROBE / information.sqrt();
+        let product = curvature_product(
+            &Faint,
+            &mut params,
+            &free,
+            &[],
+            &[0.0],
+            (&[0.0], &gradient),
+            &[step],
+        )
+        .expect("measured");
+        let ratio = product[0] / (information * step);
+        assert!((ratio / 75.0 - 1.0).abs() <= 1e-3, "{ratio}");
     }
 
     struct Opposed;
@@ -3075,7 +3128,7 @@ mod tests {
                 mean * (1.0 - 0.02 * p2 - 0.02 * p4)
             })
             .collect();
-        for measured in [None, Some((0.13, 0.5))] {
+        for measured in [None, Some((0.63, 0.1))] {
             let priors: Vec<Prior> = measured
                 .map(|(mean, sd)| Prior::measured(1, mean, sd))
                 .into_iter()
