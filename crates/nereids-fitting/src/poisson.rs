@@ -8,10 +8,11 @@
 //! ```
 //!
 //! within box bounds, by projected Levenberg–Marquardt steps in the Fisher
-//! metric, for models with an analytical Jacobian.  A prior adds `Cₚ⁻¹` to the
-//! information, as SAMMY's Bayes update `M′⁻¹ = M⁻¹ + GᵀV⁻¹G` adds the data to
-//! a prior covariance `M` (SAMMY manual, `docs/tex/fitting-procedure.tex`,
-//! eq. `bayes-eq-m-prime`).
+//! metric, and Newton steps where the Fisher information understates the
+//! deviance's curvature, for models with an analytical Jacobian.  A prior adds
+//! `Cₚ⁻¹` to the information, as SAMMY's Bayes update `M′⁻¹ = M⁻¹ + GᵀV⁻¹G`
+//! adds the data to a prior covariance `M` (SAMMY manual,
+//! `docs/tex/fitting-procedure.tex`, eq. `bayes-eq-m-prime`).
 
 use faer::dyn_stack::{MemBuffer, MemStack};
 use faer::linalg::svd::{ComputeSvdVectors, svd, svd_scratch};
@@ -288,6 +289,10 @@ const MAX_REJECTIONS: usize = 60;
 const INITIAL_DAMPING: f64 = 1e-3;
 
 const DAMPING_FACTOR: f64 = 10.0;
+
+const NEWTON_FRACTIONS: [f64; 3] = [1.0, 0.5, 0.25];
+
+const CURVATURE_PROBE: f64 = 1e-3;
 
 /// `obs·ln(obs/mean) + mean − obs`, by C. Loader's `bd0` ("Fast and
 /// accurate computation of binomial probabilities", 2000): a series in
@@ -623,8 +628,15 @@ fn held_by_bound(param: &FitParameter, gradient: f64) -> bool {
 /// `λ` is divided by 10 after a step that lowers the objective, and
 /// multiplied by 10, to at least its starting 1e-3, before retrying one that
 /// does not (D. W. Marquardt, J. Soc. Indust. Appl. Math. 11, 431–441,
-/// 1963).  A free parameter on its bound whose gradient points out of the
-/// box is held there for the step and left out of the convergence test.
+/// 1963).  When the first step from a point does not lower the objective,
+/// the Newton step with the objective's own curvature is tried, whole, halved
+/// and quartered, before the damped steps resume: counts that scatter about a
+/// model curved in a direction they barely determine curve the deviance there
+/// more than `F` does.  The Newton step solves `Hδ = g` by conjugate
+/// gradients preconditioned by `F`, each product with `H` a central
+/// difference of the gradient.  A free parameter on its bound whose gradient
+/// points out of the box is held there for the step and left out of the
+/// convergence test.
 ///
 /// The fit has converged when the Newton decrement `½ gᵀF⁺g` over the
 /// parameters not held by a bound (on it, gradient pointing out),
@@ -743,9 +755,17 @@ pub fn poisson_fit(
         }
         let start = params.free_values();
         let mut accepted = None;
-        for _ in 0..MAX_REJECTIONS {
-            let direction =
-                decomposition.step(decomposition.spanned(), &linear, free.len(), damping);
+        let mut newton = None;
+        let mut fractions = NEWTON_FRACTIONS.iter();
+        for rejection in 0..MAX_REJECTIONS {
+            if rejection == 1 {
+                newton = newton_step(model, params, &free, priors, y_obs, &linear, &decomposition);
+            }
+            let fraction = newton.as_ref().and(fractions.next());
+            let direction = match (&newton, fraction) {
+                (Some(step), Some(f)) => step.iter().map(|s| s * f).collect(),
+                _ => decomposition.step(decomposition.spanned(), &linear, free.len(), damping),
+            };
             let unprojected: Vec<f64> = start.iter().zip(&direction).map(|(x, d)| x - d).collect();
             params.set_free_values(&unprojected);
             if let Some(trial_model) = model
@@ -761,7 +781,9 @@ pub fn poisson_fit(
                 }
             }
             params.set_free_values(&start);
-            damping = (damping * DAMPING_FACTOR).max(INITIAL_DAMPING);
+            if fraction.is_none() {
+                damping = (damping * DAMPING_FACTOR).max(INITIAL_DAMPING);
+            }
         }
         let Some((trial_model, trial_value)) = accepted else {
             break;
@@ -802,6 +824,182 @@ pub fn poisson_fit(
         leverage,
         unbounded,
     })
+}
+
+fn gradient_at(
+    model: &dyn FitModel,
+    params: &mut ParameterSet,
+    free: &[usize],
+    priors: &[Prior],
+    y_obs: &[f64],
+    x: &[f64],
+) -> Option<Vec<f64>> {
+    for (&index, &value) in free.iter().zip(x) {
+        params.params[index].value = value;
+    }
+    let y_model = model
+        .evaluate(&params.all_values())
+        .ok()
+        .filter(|m| m.len() == y_obs.len() && m.iter().all(|v| v.is_finite()))?;
+    let gradient = linearize(model, params, free, priors, y_obs, &y_model)
+        .ok()?
+        .gradient;
+    gradient.iter().all(|g| g.is_finite()).then_some(gradient)
+}
+
+fn curvature_product(
+    model: &dyn FitModel,
+    params: &mut ParameterSet,
+    free: &[usize],
+    priors: &[Prior],
+    y_obs: &[f64],
+    at: (&[f64], &[f64]),
+    step: &[f64],
+) -> Option<Vec<f64>> {
+    let (x0, gradient0) = at;
+    let room = |sign: f64| {
+        free.iter()
+            .zip(x0)
+            .zip(step)
+            .map(|((&index, &x), &s)| {
+                let parameter = &params.params[index];
+                match sign * s {
+                    s if s > 0.0 => (parameter.upper - x) / s,
+                    s if s < 0.0 => (parameter.lower - x) / s,
+                    _ => f64::INFINITY,
+                }
+            })
+            .fold(f64::INFINITY, f64::min)
+    };
+    let (forward, backward) = (room(1.0), room(-1.0));
+    let mut gradient = |t: f64| {
+        let x: Vec<f64> = x0.iter().zip(step).map(|(x, s)| x + t * s).collect();
+        gradient_at(model, params, free, priors, y_obs, &x)
+    };
+    let product = if forward >= 1.0 && backward >= 1.0 {
+        gradient(1.0).zip(gradient(-1.0)).map(|(up, down)| {
+            up.iter()
+                .zip(&down)
+                .map(|(a, b)| 0.5 * (a - b))
+                .collect::<Vec<f64>>()
+        })
+    } else {
+        [(1.0, forward), (-1.0, backward)]
+            .into_iter()
+            .filter(|&(_, space)| space >= 2.0)
+            .find_map(|(sign, _)| {
+                let near = gradient(sign)?;
+                let far = gradient(sign * 2.0)?;
+                Some(
+                    (0..near.len())
+                        .map(|i| 0.5 * sign * (4.0 * near[i] - 3.0 * gradient0[i] - far[i]))
+                        .collect(),
+                )
+            })
+    };
+    params.set_free_values(x0);
+    product
+}
+
+/// The step to subtract that solves `H δ = g` on the directions `dec`
+/// determines, `H` the objective's own curvature, by conjugate gradients
+/// preconditioned by the expected information `F` (J. Nocedal & S. J.
+/// Wright, *Numerical Optimization*, 2nd ed., 2006, algorithm 7.1), each
+/// product `Hu` from [`curvature_product`] over a step of [`CURVATURE_PROBE`]
+/// in `F`'s norm.  It stops at a direction of non-positive curvature, or
+/// when the residual's size in `F⁻¹` falls to `min(½, ‖g‖)` of the
+/// gradient's, which makes the steps converge quadratically.  `None` when
+/// the first direction has non-positive curvature, or a product cannot be
+/// formed within the bounds.
+fn newton_step(
+    model: &dyn FitModel,
+    params: &mut ParameterSet,
+    free: &[usize],
+    priors: &[Prior],
+    y_obs: &[f64],
+    linear: &Linearization,
+    dec: &Decomposition,
+) -> Option<Vec<f64>> {
+    let directions: Vec<(Vec<f64>, f64)> = dec
+        .determined()
+        .map(|k| {
+            let mut d = vec![0.0; free.len()];
+            for (i, &col) in dec.columns.iter().enumerate() {
+                d[col] = dec.unscale(i, dec.right[k][i]);
+            }
+            (d, dec.singular[k].powi(2))
+        })
+        .collect();
+    let dot = |a: &[f64], b: &[f64]| a.iter().zip(b).map(|(x, y)| x * y).sum::<f64>();
+    let raw = |c: &[f64]| -> Vec<f64> {
+        (0..free.len())
+            .map(|j| directions.iter().zip(c).map(|((d, _), ck)| d[j] * ck).sum())
+            .collect()
+    };
+    let x0 = params.free_values();
+    let mut curvature = |c: &[f64]| -> Option<Vec<f64>> {
+        let norm = directions
+            .iter()
+            .zip(c)
+            .map(|((_, s2), ck)| ck * ck * s2)
+            .sum::<f64>()
+            .sqrt();
+        let h = CURVATURE_PROBE / norm;
+        let step: Vec<f64> = raw(c).iter().map(|v| h * v).collect();
+        let product = curvature_product(
+            model,
+            params,
+            free,
+            priors,
+            y_obs,
+            (&x0, &linear.gradient),
+            &step,
+        )?;
+        Some(
+            directions
+                .iter()
+                .map(|(d, _)| dot(d, &product) / h)
+                .collect(),
+        )
+    };
+    let n = directions.len();
+    let mut c = vec![0.0; n];
+    let mut r: Vec<f64> = directions
+        .iter()
+        .map(|(d, _)| -dot(d, &linear.gradient))
+        .collect();
+    let mut z: Vec<f64> = r
+        .iter()
+        .zip(&directions)
+        .map(|(ri, (_, s2))| ri / s2)
+        .collect();
+    let mut p = z.clone();
+    let mut rz = dot(&r, &z);
+    let target = rz * rz.min(0.25);
+    for _ in 0..n {
+        let q = curvature(&p)?;
+        let along = dot(&p, &q);
+        if along <= 0.0 || !along.is_finite() {
+            break;
+        }
+        let alpha = rz / along;
+        for i in 0..n {
+            c[i] += alpha * p[i];
+            r[i] -= alpha * q[i];
+            z[i] = r[i] / directions[i].1;
+        }
+        let next = dot(&r, &z);
+        if next <= target {
+            break;
+        }
+        for i in 0..n {
+            p[i] = z[i] + next / rz * p[i];
+        }
+        rz = next;
+    }
+    c.iter()
+        .any(|v| *v != 0.0)
+        .then(|| raw(&c).iter().map(|v| -v).collect())
 }
 
 fn unbounded(linear: &Linearization, fitted: &[f64], bounded: &[bool]) -> Option<Unbounded> {
@@ -2644,6 +2842,241 @@ mod tests {
             let mut jacobian = FlatMatrix::zeros(1, free_param_indices.len());
             jacobian.data[0] = mean * (2.0 * (x - 80.0).max(0.0) - 1.0);
             Some(jacobian)
+        }
+    }
+
+    struct LogLinear {
+        x: Vec<f64>,
+        lowest_rate: f64,
+    }
+
+    impl FitModel for LogLinear {
+        fn evaluate(&self, params: &[f64]) -> Result<Vec<f64>, FittingError> {
+            if params[1] < self.lowest_rate {
+                return Err(FittingError::InvalidConfig("below the lowest rate".into()));
+            }
+            Ok(self
+                .x
+                .iter()
+                .map(|&x| (params[0] + params[1] * x).exp())
+                .collect())
+        }
+
+        fn analytical_jacobian(
+            &self,
+            params: &[f64],
+            free_param_indices: &[usize],
+            _y_current: &[f64],
+        ) -> Option<FlatMatrix> {
+            let mut jacobian = FlatMatrix::zeros(self.x.len(), free_param_indices.len());
+            for (row, &x) in self.x.iter().enumerate() {
+                let mean = (params[0] + params[1] * x).exp();
+                for (col, &index) in free_param_indices.iter().enumerate() {
+                    *jacobian.get_mut(row, col) = mean * [1.0, x][index];
+                }
+            }
+            Some(jacobian)
+        }
+    }
+
+    #[test]
+    fn the_curvature_beside_a_bound_is_measured_without_leaving_the_bounds() {
+        let model = LogLinear {
+            x: (0..20).map(|i| 0.1 * f64::from(i)).collect(),
+            lowest_rate: 0.5,
+        };
+        let observed: Vec<f64> = model
+            .x
+            .iter()
+            .map(|&x| (2.0 + 0.7 * x).exp() * (1.0 + 0.1 * (x - 1.0).powi(2)))
+            .collect();
+        let at = [2.1, 0.5 + 1e-12];
+        let mut params = ParameterSet::new(vec![
+            FitParameter::unbounded("level", at[0]),
+            FitParameter {
+                name: "rate".into(),
+                value: at[1],
+                lower: 0.5,
+                upper: f64::INFINITY,
+                fixed: false,
+            },
+        ]);
+        let free = params.free_indices();
+        let mean = model.evaluate(&at).unwrap();
+        let gradient = linearize(&model, &params, &free, &[], &observed, &mean)
+            .unwrap()
+            .gradient;
+        let step = [1e-4, -1e-4];
+        let product = curvature_product(
+            &model,
+            &mut params,
+            &free,
+            &[],
+            &observed,
+            (&at, &gradient),
+            &step,
+        )
+        .expect("measured on the side within the bounds");
+        let exact: Vec<f64> = (0..2)
+            .map(|j| {
+                model
+                    .x
+                    .iter()
+                    .zip(&mean)
+                    .map(|(&x, m)| {
+                        let row = [1.0, x];
+                        m * row[j] * (row[0] * step[0] + row[1] * step[1])
+                    })
+                    .sum()
+            })
+            .collect();
+        for (measured, exact) in product.iter().zip(&exact) {
+            assert!(
+                (measured / exact - 1.0).abs() <= 1e-6,
+                "{product:?} vs {exact:?}"
+            );
+        }
+        assert_eq!(params.free_values(), at);
+    }
+
+    struct CurvedValley {
+        x: Vec<f64>,
+    }
+
+    impl CurvedValley {
+        fn exponent(params: &[f64], x: f64) -> (f64, [f64; 5]) {
+            let p2 = 0.5 * (3.0 * x * x - 1.0);
+            let p3 = 0.5 * (5.0 * x.powi(3) - 3.0 * x);
+            let p4 = (35.0 * x.powi(4) - 30.0 * x * x + 3.0) / 8.0;
+            let p5 = (63.0 * x.powi(5) - 70.0 * x.powi(3) + 15.0 * x) / 8.0;
+            let [a, b, c, d, e] = [params[0], params[1], params[2], params[3], params[4]];
+            let bend = 5.0 * (b - c);
+            let exponent = a
+                + b * x
+                + c * (x + 0.1 * p3)
+                + d * (x + 0.003 * p5)
+                + 0.5 * bend * (b - c) * p2
+                + e * p4;
+            let slopes = [
+                1.0,
+                x + bend * p2,
+                x + 0.1 * p3 - bend * p2,
+                x + 0.003 * p5,
+                p4,
+            ];
+            (exponent, slopes)
+        }
+    }
+
+    impl FitModel for CurvedValley {
+        fn evaluate(&self, params: &[f64]) -> Result<Vec<f64>, FittingError> {
+            if params[4] < 0.0 {
+                return Err(FittingError::InvalidConfig("e is 0 or more".into()));
+            }
+            Ok(self
+                .x
+                .iter()
+                .map(|&x| 1.0e4 * Self::exponent(params, x).0.exp())
+                .collect())
+        }
+
+        fn analytical_jacobian(
+            &self,
+            params: &[f64],
+            free_param_indices: &[usize],
+            _y_current: &[f64],
+        ) -> Option<FlatMatrix> {
+            let mut jacobian = FlatMatrix::zeros(self.x.len(), free_param_indices.len());
+            for (row, &x) in self.x.iter().enumerate() {
+                let (exponent, slopes) = Self::exponent(params, x);
+                let mean = 1.0e4 * exponent.exp();
+                for (col, &index) in free_param_indices.iter().enumerate() {
+                    *jacobian.get_mut(row, col) = mean * slopes[index];
+                }
+            }
+            Some(jacobian)
+        }
+    }
+
+    #[test]
+    fn counts_that_scatter_along_the_model_s_curvature_are_fitted_to_the_minimum() {
+        let model = CurvedValley {
+            x: (0..81).map(|i| -1.0 + f64::from(i) / 40.0).collect(),
+        };
+        let observed: Vec<f64> = model
+            .evaluate(&[0.0, 0.3, 0.3, 0.3, 0.0])
+            .unwrap()
+            .iter()
+            .zip(&model.x)
+            .map(|(mean, &x)| {
+                let p2 = 0.5 * (3.0 * x * x - 1.0);
+                let p4 = (35.0 * x.powi(4) - 30.0 * x * x + 3.0) / 8.0;
+                mean * (1.0 - 0.02 * p2 - 0.02 * p4)
+            })
+            .collect();
+        let mut params = ParameterSet::new(vec![
+            FitParameter::unbounded("a", 0.1),
+            FitParameter::unbounded("b", 0.2),
+            FitParameter::unbounded("c", 0.5),
+            FitParameter::unbounded("d", 0.1),
+            FitParameter::non_negative("e", 0.05),
+        ]);
+        let result = poisson_fit(
+            &model,
+            &observed,
+            &[],
+            &mut params,
+            &PoissonConfig::default(),
+        )
+        .unwrap();
+        assert!(result.converged, "{result:?}");
+        assert_eq!(result.on_bound, [false, false, false, false, true]);
+        let at = |shifts: &[(usize, f64)]| {
+            let mut x = result.params.clone();
+            for &(j, t) in shifts {
+                x[j] += t;
+            }
+            deviance(&observed, &model.evaluate(&x).unwrap())
+        };
+        assert!(at(&[(4, 1e-6)]) > at(&[]));
+        let sd: Vec<f64> = (0..4)
+            .map(|j| result.uncertainties.as_ref().unwrap()[j].unwrap())
+            .collect();
+        let h: Vec<f64> = sd.iter().map(|s| 1e-4 * s).collect();
+        let mut newton: Vec<Vec<f64>> = (0..4)
+            .map(|j| {
+                let mut row: Vec<f64> = (0..4)
+                    .map(|k| {
+                        (at(&[(j, h[j]), (k, h[k])])
+                            - at(&[(j, h[j]), (k, -h[k])])
+                            - at(&[(j, -h[j]), (k, h[k])])
+                            + at(&[(j, -h[j]), (k, -h[k])]))
+                            / (4.0 * h[j] * h[k])
+                    })
+                    .collect();
+                row.push(-(at(&[(j, h[j])]) - at(&[(j, -h[j])])) / (2.0 * h[j]));
+                row
+            })
+            .collect();
+        for pivot in 0..4 {
+            let lead = newton[pivot].clone();
+            for row in newton.iter_mut().skip(pivot + 1) {
+                let factor = row[pivot] / lead[pivot];
+                for (value, above) in row.iter_mut().zip(&lead).skip(pivot) {
+                    *value -= factor * above;
+                }
+            }
+        }
+        let mut offset = [0.0; 4];
+        for row in (0..4).rev() {
+            let rest: f64 = (row + 1..4).map(|col| newton[row][col] * offset[col]).sum();
+            offset[row] = (newton[row][4] - rest) / newton[row][row];
+        }
+        for j in 0..4 {
+            assert!(
+                (offset[j] / sd[j]).abs() <= 1e-2,
+                "{j}: {offset:?} vs {sd:?}"
+            );
         }
     }
 
