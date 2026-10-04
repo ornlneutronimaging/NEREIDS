@@ -633,9 +633,10 @@ fn held_by_bound(param: &FitParameter, gradient: f64) -> bool {
 /// 1963).  When the first step from a point within about one standard error
 /// of the minimum (Newton decrement at most ½) does not lower the objective,
 /// the Newton step with the objective's own curvature is tried, whole, halved
-/// and quartered, each projected onto the box, before the damped steps
-/// resume: counts that scatter about a model curved in a direction they
-/// barely determine curve the deviance there more than `F` does.  The Newton step
+/// and quartered along its projection onto the box (D. P. Bertsekas, SIAM J.
+/// Control Optim. 20, 221–246, 1982), before the damped steps resume: counts
+/// that scatter about a model curved in a direction they barely determine
+/// curve the deviance there more than `F` does.  The Newton step
 /// solves `Hδ = g` by conjugate gradients preconditioned by `F`, each product
 /// with `H` a one-sided second-order difference of the gradient taken within
 /// the bounds.  A free parameter on its bound whose gradient points out of
@@ -785,9 +786,7 @@ pub fn poisson_fit(
                 }
             }
             params.set_free_values(&start);
-            if fraction.is_none() {
-                damping = (damping * DAMPING_FACTOR).max(INITIAL_DAMPING);
-            }
+            damping = (damping * DAMPING_FACTOR).max(INITIAL_DAMPING);
         }
         let Some((trial_model, trial_value)) = accepted else {
             break;
@@ -896,15 +895,16 @@ fn curvature_product(
 }
 
 /// The step to subtract that solves `H δ = g` on the directions `dec`
-/// determines, `H` the objective's own curvature, by conjugate gradients
+/// determines, `H` the objective's own curvature: conjugate gradients
 /// preconditioned by the expected information `F` (J. Nocedal & S. J.
-/// Wright, *Numerical Optimization*, 2nd ed., 2006, algorithm 7.1), each
+/// Wright, *Numerical Optimization*, 2nd ed., 2006, algorithm 5.3), each
 /// product `Hu` from [`curvature_product`] over a step of [`CURVATURE_PROBE`]
-/// in `F`'s norm.  It stops at a direction of non-positive curvature, or
-/// when the residual's size in `F⁻¹` falls to `min(½, ‖g‖)` of the
-/// gradient's, which makes the steps converge quadratically.  `None` when
-/// the first direction has non-positive curvature, or a product cannot be
-/// formed within the bounds.
+/// in `F`'s norm, stopped at a direction of non-positive curvature or when
+/// the residual's size in `F⁻¹` falls to `min(½, ‖g‖)` of the gradient's
+/// (the forcing of their theorem 7.2).  `None` when the gradient has no
+/// component on those directions, the first direction has non-positive
+/// curvature, or a product cannot be formed because its probe would leave
+/// the bounds or the model cannot be evaluated there.
 fn newton_step(
     model: &dyn FitModel,
     params: &mut ParameterSet,
@@ -2842,12 +2842,18 @@ mod tests {
         }
     }
 
-    struct LogLinear {
+    struct BentRate {
         x: Vec<f64>,
         lowest_rate: f64,
     }
 
-    impl FitModel for LogLinear {
+    impl BentRate {
+        fn exponent(params: &[f64], x: f64) -> f64 {
+            params[0] + params[1] * x + 0.25 * (params[1] * x).powi(2)
+        }
+    }
+
+    impl FitModel for BentRate {
         fn evaluate(&self, params: &[f64]) -> Result<Vec<f64>, FittingError> {
             if params[1] < self.lowest_rate {
                 return Err(FittingError::InvalidConfig("below the lowest rate".into()));
@@ -2855,7 +2861,7 @@ mod tests {
             Ok(self
                 .x
                 .iter()
-                .map(|&x| (params[0] + params[1] * x).exp())
+                .map(|&x| Self::exponent(params, x).exp())
                 .collect())
         }
 
@@ -2867,9 +2873,9 @@ mod tests {
         ) -> Option<FlatMatrix> {
             let mut jacobian = FlatMatrix::zeros(self.x.len(), free_param_indices.len());
             for (row, &x) in self.x.iter().enumerate() {
-                let mean = (params[0] + params[1] * x).exp();
+                let mean = Self::exponent(params, x).exp();
                 for (col, &index) in free_param_indices.iter().enumerate() {
-                    *jacobian.get_mut(row, col) = mean * [1.0, x][index];
+                    *jacobian.get_mut(row, col) = mean * [1.0, x + 0.5 * params[1] * x * x][index];
                 }
             }
             Some(jacobian)
@@ -2878,7 +2884,7 @@ mod tests {
 
     #[test]
     fn the_curvature_beside_a_bound_is_measured_without_leaving_the_bounds() {
-        let model = LogLinear {
+        let model = BentRate {
             x: (0..20).map(|i| 0.1 * f64::from(i)).collect(),
             lowest_rate: 0.5,
         };
@@ -2920,9 +2926,11 @@ mod tests {
                     .x
                     .iter()
                     .zip(&mean)
-                    .map(|(&x, m)| {
-                        let row = [1.0, x];
-                        m * row[j] * (row[0] * step[0] + row[1] * step[1])
+                    .zip(&observed)
+                    .map(|((&x, m), y)| {
+                        let row = [1.0, x + 0.5 * at[1] * x * x];
+                        let bend = [0.0, (m - y) * 0.5 * x * x * step[1]];
+                        m * row[j] * (row[0] * step[0] + row[1] * step[1]) + bend[j]
                     })
                     .sum()
             })
