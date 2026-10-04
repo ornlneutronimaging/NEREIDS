@@ -323,12 +323,16 @@ fn half_deviance(obs: f64, mean: f64) -> f64 {
     }
 }
 
+fn admits(obs: f64, mean: f64) -> bool {
+    mean > 0.0 || (mean == 0.0 && obs == 0.0)
+}
+
 fn deviance(y_obs: &[f64], y_model: &[f64]) -> f64 {
     y_obs
         .iter()
         .zip(y_model)
         .map(|(&obs, &mean)| {
-            if mean > 0.0 || (mean == 0.0 && obs == 0.0) {
+            if admits(obs, mean) {
                 half_deviance(obs, mean)
             } else {
                 f64::INFINITY
@@ -840,10 +844,12 @@ fn gradient_at(
     for (&index, &value) in free.iter().zip(x) {
         params.params[index].value = value;
     }
-    let y_model = model
-        .evaluate(&params.all_values())
-        .ok()
-        .filter(|m| m.len() == y_obs.len() && m.iter().all(|v| v.is_finite()))?;
+    let y_model = model.evaluate(&params.all_values()).ok().filter(|m| {
+        m.len() == y_obs.len()
+            && m.iter()
+                .zip(y_obs)
+                .all(|(&mean, &obs)| mean.is_finite() && admits(obs, mean))
+    })?;
     let gradient = linearize(model, params, free, priors, y_obs, &y_model)
         .ok()?
         .gradient;
@@ -874,12 +880,15 @@ fn curvature_product(
             })
             .fold(f64::INFINITY, f64::min)
     };
-    let side = [1.0, -1.0].into_iter().find(|&sign| room(sign) >= 2.0);
+    let sides: Vec<f64> = [1.0, -1.0]
+        .into_iter()
+        .filter(|&sign| room(sign) >= 2.0)
+        .collect();
     let mut gradient = |t: f64| {
         let x: Vec<f64> = x0.iter().zip(step).map(|(x, s)| x + t * s).collect();
         gradient_at(model, params, free, priors, y_obs, &x)
     };
-    let product = side.and_then(|sign| {
+    let product = sides.into_iter().find_map(|sign| {
         let near = gradient(sign)?;
         let far = gradient(2.0 * sign)?;
         Some(
@@ -2944,6 +2953,53 @@ mod tests {
         assert_eq!(params.free_values(), at);
     }
 
+    struct Opposed;
+
+    impl FitModel for Opposed {
+        fn evaluate(&self, params: &[f64]) -> Result<Vec<f64>, FittingError> {
+            Ok(vec![1e-8 + params[0], 1e-8 - params[0]])
+        }
+
+        fn analytical_jacobian(
+            &self,
+            _params: &[f64],
+            free_param_indices: &[usize],
+            _y_current: &[f64],
+        ) -> Option<FlatMatrix> {
+            let mut jacobian = FlatMatrix::zeros(2, free_param_indices.len());
+            *jacobian.get_mut(0, 0) = 1.0;
+            *jacobian.get_mut(1, 0) = -1.0;
+            Some(jacobian)
+        }
+    }
+
+    #[test]
+    fn a_curvature_probe_that_predicts_no_counts_where_some_were_counted_gives_no_product() {
+        let observed = [1.0, 1.0];
+        let product_at = |x: f64, step: f64| {
+            let mut params = ParameterSet::new(vec![FitParameter::unbounded("x", x)]);
+            let free = params.free_indices();
+            let mean = Opposed.evaluate(&[x]).unwrap();
+            let gradient = linearize(&Opposed, &params, &free, &[], &observed, &mean)
+                .unwrap()
+                .gradient;
+            curvature_product(
+                &Opposed,
+                &mut params,
+                &free,
+                &[],
+                &observed,
+                (&[x], &gradient),
+                &[step],
+            )
+        };
+        assert_eq!(product_at(1e-13, 1e-8), None);
+        assert!(product_at(0.5e-8, 0.3e-8).is_some_and(|p| p[0] > 0.0));
+        let product = product_at(0.0, 1e-11).expect("both sides predict counts");
+        let exact = 2.0 / 1e-16 * 1e-11;
+        assert!((product[0] / exact - 1.0).abs() <= 1e-4, "{product:?}");
+    }
+
     struct CurvedValley {
         x: Vec<f64>,
     }
@@ -3019,69 +3075,79 @@ mod tests {
                 mean * (1.0 - 0.02 * p2 - 0.02 * p4)
             })
             .collect();
-        let mut params = ParameterSet::new(vec![
-            FitParameter::unbounded("a", 0.1),
-            FitParameter::unbounded("b", 0.2),
-            FitParameter::unbounded("c", 0.5),
-            FitParameter::unbounded("d", 0.1),
-            FitParameter::non_negative("e", 0.05),
-        ]);
-        let result = poisson_fit(
-            &model,
-            &observed,
-            &[],
-            &mut params,
-            &PoissonConfig::default(),
-        )
-        .unwrap();
-        assert!(result.converged && result.iterations <= 12, "{result:?}");
-        assert_eq!(result.on_bound, [false, false, false, false, true]);
-        let at = |shifts: &[(usize, f64)]| {
-            let mut x = result.params.clone();
-            for &(j, t) in shifts {
-                x[j] += t;
-            }
-            deviance(&observed, &model.evaluate(&x).unwrap())
-        };
-        assert!(at(&[(4, 1e-6)]) > at(&[]));
-        let sd: Vec<f64> = (0..4)
-            .map(|j| result.uncertainties.as_ref().unwrap()[j].unwrap())
-            .collect();
-        let h: Vec<f64> = sd.iter().map(|s| 1e-4 * s).collect();
-        let mut newton: Vec<Vec<f64>> = (0..4)
-            .map(|j| {
-                let mut row: Vec<f64> = (0..4)
-                    .map(|k| {
-                        (at(&[(j, h[j]), (k, h[k])])
-                            - at(&[(j, h[j]), (k, -h[k])])
-                            - at(&[(j, -h[j]), (k, h[k])])
-                            + at(&[(j, -h[j]), (k, -h[k])]))
-                            / (4.0 * h[j] * h[k])
-                    })
-                    .collect();
-                row.push(-(at(&[(j, h[j])]) - at(&[(j, -h[j])])) / (2.0 * h[j]));
-                row
-            })
-            .collect();
-        for pivot in 0..4 {
-            let lead = newton[pivot].clone();
-            for row in newton.iter_mut().skip(pivot + 1) {
-                let factor = row[pivot] / lead[pivot];
-                for (value, above) in row.iter_mut().zip(&lead).skip(pivot) {
-                    *value -= factor * above;
+        for measured in [None, Some((0.13, 0.5))] {
+            let priors: Vec<Prior> = measured
+                .map(|(mean, sd)| Prior::measured(1, mean, sd))
+                .into_iter()
+                .collect();
+            let mut params = ParameterSet::new(vec![
+                FitParameter::unbounded("a", 0.1),
+                FitParameter::unbounded("b", 0.2),
+                FitParameter::unbounded("c", 0.5),
+                FitParameter::unbounded("d", 0.1),
+                FitParameter::non_negative("e", 0.05),
+            ]);
+            let result = poisson_fit(
+                &model,
+                &observed,
+                &priors,
+                &mut params,
+                &PoissonConfig::default(),
+            )
+            .unwrap();
+            assert!(
+                result.converged && result.iterations <= 12,
+                "{measured:?}: {result:?}"
+            );
+            assert_eq!(result.on_bound, [false, false, false, false, true]);
+            let at = |shifts: &[(usize, f64)]| {
+                let mut x = result.params.clone();
+                for &(j, t) in shifts {
+                    x[j] += t;
+                }
+                deviance(&observed, &model.evaluate(&x).unwrap())
+                    + measured.map_or(0.0, |(mean, sd)| 0.5 * ((x[1] - mean) / sd).powi(2))
+            };
+            assert!(at(&[(4, 1e-6)]) > at(&[]));
+            let sd: Vec<f64> = (0..4)
+                .map(|j| result.uncertainties.as_ref().unwrap()[j].unwrap())
+                .collect();
+            let h: Vec<f64> = sd.iter().map(|s| 1e-4 * s).collect();
+            let mut newton: Vec<Vec<f64>> = (0..4)
+                .map(|j| {
+                    let mut row: Vec<f64> = (0..4)
+                        .map(|k| {
+                            (at(&[(j, h[j]), (k, h[k])])
+                                - at(&[(j, h[j]), (k, -h[k])])
+                                - at(&[(j, -h[j]), (k, h[k])])
+                                + at(&[(j, -h[j]), (k, -h[k])]))
+                                / (4.0 * h[j] * h[k])
+                        })
+                        .collect();
+                    row.push(-(at(&[(j, h[j])]) - at(&[(j, -h[j])])) / (2.0 * h[j]));
+                    row
+                })
+                .collect();
+            for pivot in 0..4 {
+                let lead = newton[pivot].clone();
+                for row in newton.iter_mut().skip(pivot + 1) {
+                    let factor = row[pivot] / lead[pivot];
+                    for (value, above) in row.iter_mut().zip(&lead).skip(pivot) {
+                        *value -= factor * above;
+                    }
                 }
             }
-        }
-        let mut offset = [0.0; 4];
-        for row in (0..4).rev() {
-            let rest: f64 = (row + 1..4).map(|col| newton[row][col] * offset[col]).sum();
-            offset[row] = (newton[row][4] - rest) / newton[row][row];
-        }
-        for j in 0..4 {
-            assert!(
-                (offset[j] / sd[j]).abs() <= 1e-2,
-                "{j}: {offset:?} vs {sd:?}"
-            );
+            let mut offset = [0.0; 4];
+            for row in (0..4).rev() {
+                let rest: f64 = (row + 1..4).map(|col| newton[row][col] * offset[col]).sum();
+                offset[row] = (newton[row][4] - rest) / newton[row][row];
+            }
+            for j in 0..4 {
+                assert!(
+                    (offset[j] / sd[j]).abs() <= 1e-2,
+                    "{measured:?} {j}: {offset:?} vs {sd:?}"
+                );
+            }
         }
     }
 
