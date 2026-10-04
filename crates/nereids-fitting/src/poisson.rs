@@ -290,6 +290,8 @@ const INITIAL_DAMPING: f64 = 1e-3;
 
 const DAMPING_FACTOR: f64 = 10.0;
 
+const WITHIN_ONE_STANDARD_ERROR: f64 = 0.5;
+
 const NEWTON_FRACTIONS: [f64; 3] = [1.0, 0.5, 0.25];
 
 const CURVATURE_PROBE: f64 = 1e-3;
@@ -628,15 +630,16 @@ fn held_by_bound(param: &FitParameter, gradient: f64) -> bool {
 /// `λ` is divided by 10 after a step that lowers the objective, and
 /// multiplied by 10, to at least its starting 1e-3, before retrying one that
 /// does not (D. W. Marquardt, J. Soc. Indust. Appl. Math. 11, 431–441,
-/// 1963).  When the first step from a point does not lower the objective,
+/// 1963).  When the first step from a point within about one standard error
+/// of the minimum (Newton decrement at most ½) does not lower the objective,
 /// the Newton step with the objective's own curvature is tried, whole, halved
-/// and quartered, before the damped steps resume: counts that scatter about a
-/// model curved in a direction they barely determine curve the deviance there
-/// more than `F` does.  The Newton step solves `Hδ = g` by conjugate
-/// gradients preconditioned by `F`, each product with `H` a central
-/// difference of the gradient.  A free parameter on its bound whose gradient
-/// points out of the box is held there for the step and left out of the
-/// convergence test.
+/// and quartered, each projected onto the box, before the damped steps
+/// resume: counts that scatter about a model curved in a direction they
+/// barely determine curve the deviance there more than `F` does.  The Newton step
+/// solves `Hδ = g` by conjugate gradients preconditioned by `F`, each product
+/// with `H` a one-sided second-order difference of the gradient taken within
+/// the bounds.  A free parameter on its bound whose gradient points out of
+/// the box is held there for the step and left out of the convergence test.
 ///
 /// The fit has converged when the Newton decrement `½ gᵀF⁺g` over the
 /// parameters not held by a bound (on it, gradient pointing out),
@@ -746,7 +749,8 @@ pub fn poisson_fit(
         let Some(decomposition) = Decomposition::new(&linear.weighted, &movable) else {
             break;
         };
-        if decomposition.newton_decrement(&linear) < NEWTON_DECREMENT_TOL {
+        let decrement = decomposition.newton_decrement(&linear);
+        if decrement < NEWTON_DECREMENT_TOL {
             at_minimum = Some(linear);
             break;
         }
@@ -758,10 +762,10 @@ pub fn poisson_fit(
         let mut newton = None;
         let mut fractions = NEWTON_FRACTIONS.iter();
         for rejection in 0..MAX_REJECTIONS {
-            if rejection == 1 {
+            if rejection == 1 && decrement <= WITHIN_ONE_STANDARD_ERROR {
                 newton = newton_step(model, params, &free, priors, y_obs, &linear, &decomposition);
             }
-            let fraction = newton.as_ref().and(fractions.next());
+            let fraction = newton.as_ref().and_then(|_| fractions.next());
             let direction = match (&newton, fraction) {
                 (Some(step), Some(f)) => step.iter().map(|s| s * f).collect(),
                 _ => decomposition.step(decomposition.spanned(), &linear, free.len(), damping),
@@ -871,32 +875,22 @@ fn curvature_product(
             })
             .fold(f64::INFINITY, f64::min)
     };
-    let (forward, backward) = (room(1.0), room(-1.0));
+    let side = [1.0, -1.0].into_iter().find(|&sign| room(sign) >= 2.0);
     let mut gradient = |t: f64| {
         let x: Vec<f64> = x0.iter().zip(step).map(|(x, s)| x + t * s).collect();
         gradient_at(model, params, free, priors, y_obs, &x)
     };
-    let product = if forward >= 1.0 && backward >= 1.0 {
-        gradient(1.0).zip(gradient(-1.0)).map(|(up, down)| {
-            up.iter()
-                .zip(&down)
-                .map(|(a, b)| 0.5 * (a - b))
-                .collect::<Vec<f64>>()
-        })
-    } else {
-        [(1.0, forward), (-1.0, backward)]
-            .into_iter()
-            .filter(|&(_, space)| space >= 2.0)
-            .find_map(|(sign, _)| {
-                let near = gradient(sign)?;
-                let far = gradient(sign * 2.0)?;
-                Some(
-                    (0..near.len())
-                        .map(|i| 0.5 * sign * (4.0 * near[i] - 3.0 * gradient0[i] - far[i]))
-                        .collect(),
-                )
-            })
-    };
+    let product = side.and_then(|sign| {
+        let near = gradient(sign)?;
+        let far = gradient(2.0 * sign)?;
+        Some(
+            near.iter()
+                .zip(&far)
+                .zip(gradient0)
+                .map(|((n, f), g)| 0.5 * sign * (4.0 * n - 3.0 * g - f))
+                .collect(),
+        )
+    });
     params.set_free_values(x0);
     product
 }
@@ -975,6 +969,9 @@ fn newton_step(
         .collect();
     let mut p = z.clone();
     let mut rz = dot(&r, &z);
+    if rz <= 0.0 || !rz.is_finite() {
+        return None;
+    }
     let target = rz * rz.min(0.25);
     for _ in 0..n {
         let q = curvature(&p)?;
@@ -2976,7 +2973,7 @@ mod tests {
             Ok(self
                 .x
                 .iter()
-                .map(|&x| 1.0e4 * Self::exponent(params, x).0.exp())
+                .map(|&x| 100.0 * Self::exponent(params, x).0.exp())
                 .collect())
         }
 
@@ -2989,7 +2986,7 @@ mod tests {
             let mut jacobian = FlatMatrix::zeros(self.x.len(), free_param_indices.len());
             for (row, &x) in self.x.iter().enumerate() {
                 let (exponent, slopes) = Self::exponent(params, x);
-                let mean = 1.0e4 * exponent.exp();
+                let mean = 100.0 * exponent.exp();
                 for (col, &index) in free_param_indices.iter().enumerate() {
                     *jacobian.get_mut(row, col) = mean * slopes[index];
                 }
@@ -3029,7 +3026,7 @@ mod tests {
             &PoissonConfig::default(),
         )
         .unwrap();
-        assert!(result.converged, "{result:?}");
+        assert!(result.converged && result.iterations <= 12, "{result:?}");
         assert_eq!(result.on_bound, [false, false, false, false, true]);
         let at = |shifts: &[(usize, f64)]| {
             let mut x = result.params.clone();
