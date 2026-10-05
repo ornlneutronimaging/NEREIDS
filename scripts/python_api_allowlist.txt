@@ -18,8 +18,8 @@ NexusMetadata
 
 # ---------------------------------------------------------------------------
 # Low-level physics building blocks — covered by the auto-generated pdoc
-# reference (/python/) and partially by docs/guide/src/physics.md, but with
-# no dedicated section in the curated python-api.md narrative yet.
+# reference (/python/), with no dedicated section in the curated
+# python-api.md narrative yet.
 # ---------------------------------------------------------------------------
 cross_sections
 beer_lambert
@@ -87,10 +87,9 @@ IkedaCarpenter
 # ---------------------------------------------------------------------------
 # Instrument-resolution calibration (epic #394).  calibrate_resolution() fits
 # the resolution parameters of a model family to a known-(rho,T) calibrant;
-# ResolutionCalibration is its result.  Covered by docs/guide (resolution
-# models / calibration section) + the example notebook; the pdoc reference
-# covers the signatures.  Move OUT of the allowlist if a dedicated
-# python-api.md narrative heading is added.
+# ResolutionCalibration is its result.  The pdoc reference covers them.
+# Move OUT of the allowlist if a dedicated python-api.md narrative heading
+# is added.
 # ---------------------------------------------------------------------------
 calibrate_resolution
 ResolutionCalibration
@@ -100,9 +99,7 @@ ResolutionCalibration
 # against one shared resolution so the reported temperature uncertainty
 # carries the degeneracy that pinning a calibrated resolution drops;
 # JointFitResult is its result.  Same disposition as calibrate_resolution
-# above: covered by docs/guide (resolution calibration section), signatures by
-# the pdoc reference.  Move OUT of the allowlist if a dedicated python-api.md
-# narrative heading is added.
+# above.
 # ---------------------------------------------------------------------------
 fit_with_calibrant
 JointFitResult
