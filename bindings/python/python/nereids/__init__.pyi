@@ -542,7 +542,7 @@ class ResolutionCalibration:
         ...
 
     def as_tabulated(self) -> TabulatedResolution | None:
-        """The calibrated resolution as a kernel to pin into a fit
+        """The calibrated resolution as a kernel for the fitters' ``resolution=``
         (``udr_corr`` / ``ic``); ``None`` for the Gaussian family."""
         ...
 
@@ -966,38 +966,41 @@ def calibrate_resolution(
 ) -> ResolutionCalibration:
     """Calibrate instrument-resolution parameters against a known-(rho,T) calibrant.
 
-    Fits the resolution parameters of ``family`` (``"gaussian"`` | ``"udr_corr"``
-    | ``"ic"``) while holding the calibrant density (in ``isotopes``/``groups``)
-    and ``temperature_k`` fixed. ``base_udr`` is required for ``"udr_corr"``.
-    Pin the returned resolution into a sample fit via ``.as_tabulated()`` (or
-    ``.gaussian_params()`` for the Gaussian family).
+    Fits the resolution parameters of ``family`` while holding the calibrant's
+    density (the values in ``isotopes``/``groups``) and ``temperature_k`` fixed.
 
-    The ``"ic"`` family fits the full bounded moderator shape:
-    ``alpha(E) = a0*sqrt(E) + a1`` (positive by construction), free bounded
-    ``beta`` and storage fraction ``r``, folded with the SNS PSR channel
-    triangle of FWHM ``psr_fwhm_ns`` (default 350 ns, the VENUS FTS header
-    value; 0 disables; applies to "ic" only — tabulated/UDR kernels already
-    carry the fold). ``psr_fwhm_ns`` is NANOSECONDS: nonzero values above
-    10_000 ns (10 us) raise ``ValueError`` as a us-as-ns unit slip (kernel
-    synthesis cost is quadratic in the fold width, so e.g. 350 meaning us
-    would hang for hours). ``fit_psr=True`` ("ic" only) also fits the PSR FWHM as a
-    5th parameter (box-bounded 0.05-1 us), started at ``psr_fwhm_ns`` clamped
-    into that box: an out-of-box start (legal as a pin up to 10 us) starts at
-    the nearer box edge with a stderr warning, and a fit that stays there
-    reports ``psr_fwhm_us:lower`` / ``:upper`` in ``bounds_hit``.
-    ``psr_fwhm_ns`` must then be > 0 (a zero start contradicts "0 disables"
-    and raises ``ValueError``). ``psr_fwhm_ns`` / ``fit_psr`` sit at the END of the
-    signature so pre-existing positional calls keep their meaning. Degenerate
-    directions are reported via ``bounds_hit``.
+    Args:
+        energies, data, uncertainty: calibrant transmission spectrum.
+        family: ``"gaussian"`` | ``"udr_corr"`` | ``"ic"``. ``"ic"`` fits
+            ``alpha(E) = a0*sqrt(E) + a1``, ``beta`` and the storage fraction
+            ``r``, folded with the SNS PSR channel triangle.
+        isotopes / groups: known calibrant composition + density (exactly one).
+        temperature_k: known calibrant temperature.
+        base_udr: base UDR kernel (required for ``family="udr_corr"``).
+        fit_background: also fit anorm + linear baseline (default anorm only).
+        restarts: optimizer restarts (keep the best).
+        fit_t0, fit_l_scale: also fit the energy scale ``(t0, L_scale)``; by
+            default they are held at ``t0_center_us`` / ``l_scale_center``.
+        t0_center_us, l_scale_center: prior means, or the held values
+            (default 0.0, 1.0).
+        t0_prior_us, l_scale_prior: Gaussian prior sigma (``None`` = flat/bounded
+            only).
+        psr_fwhm_ns: PSR channel-triangle FWHM in ns, folded into the ``"ic"``
+            kernel only (default 350; ``0`` disables). Values above 10_000 ns
+            raise ``ValueError``.
+        fit_psr: also fit the PSR FWHM (``"ic"`` only), bounded to 0.05-1 us and
+            started at ``psr_fwhm_ns`` clamped into that range, with a warning
+            on stderr when clamped; ``psr_fwhm_ns`` must then be > 0, else
+            ``ValueError``.
+        intervals: also compute ``.intervals``, the one-sigma range of each
+            fitted parameter, at several times the cost of the calibration.
 
-    By default position is PINNED (``fit_t0=fit_l_scale=False``): a pure
-    shape/width fit on the already energy-calibrated grid. Set ``fit_t0`` /
-    ``fit_l_scale`` to also fit the SHARED SAMMY energy-scale ``(t0, L_scale)``
-    under a Gaussian metrology prior (``t0_prior_us`` / ``l_scale_prior``, centered
-    at ``t0_center_us`` / ``l_scale_center``) — for joint energy-scale or cross-
-    family identifiability work. Do NOT fit position with a flat prior in
-    production: the asymmetric-kernel lag is the same ``1/sqrt(E)`` basis as
-    ``L_scale``, so a free ``L_scale`` absorbs the lag and corrupts the width.
+    Returns:
+        ResolutionCalibration with the fitted params, data chi2/dof, the fitted
+        (or held) ``position_t0_us`` / ``position_l_scale`` / ``prior_penalty``,
+        the parameters left at a bound in ``bounds_hit``, and the calibrated
+        resolution (``.as_tabulated()`` / ``.gaussian_params()``).
+        ``.intervals`` is populated only when ``intervals=True``.
     """
     ...
 
