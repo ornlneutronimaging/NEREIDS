@@ -16,6 +16,10 @@ import nereids
 
 from _fixtures import _make_single_resonance
 
+_CACHE_FOLLOWS_HOME = pytest.mark.skipif(
+    os.name == "nt", reason="the ENDF cache on Windows ignores HOME and XDG_CACHE_HOME"
+)
+
 
 # ---------------------------------------------------------------------------
 # Helpers / fixtures
@@ -369,19 +373,48 @@ class TestResonanceData:
         assert data.target_spin == 2.5
         assert data.scattering_radius == pytest.approx(9.6931)
 
-    @pytest.mark.skipif(
-        os.name == "nt", reason="the ENDF cache on Windows ignores HOME and XDG_CACHE_HOME"
-    )
-    def test_unreachable_download_raises_connection_error(self, tmp_path, monkeypatch):
-        """A download through an unreachable proxy into an empty cache raises ``ConnectionError``."""
+    @staticmethod
+    def _fe56_cache_files(tmp_path, monkeypatch):
+        """The Fe-56 ENDF/B-VIII.1 cache file under ``tmp_path`` as HOME, on macOS and on Linux."""
         monkeypatch.setenv("HOME", str(tmp_path))
         monkeypatch.setenv("XDG_CACHE_HOME", str(tmp_path))
+        return [
+            tmp_path / root / "nereids" / "endf" / "ENDF-B-VIII.1" / "Fe-56.endf"
+            for root in ("Library/Caches", ".")
+        ]
+
+    @_CACHE_FOLLOWS_HOME
+    def test_unreachable_download_raises_connection_error(self, tmp_path, monkeypatch):
+        """A download through an unreachable proxy into an empty cache raises ``ConnectionError``."""
+        self._fe56_cache_files(tmp_path, monkeypatch)
         for name in ("HTTPS_PROXY", "https_proxy"):
             monkeypatch.setenv(name, "http://127.0.0.1:9")
         for name in ("NO_PROXY", "no_proxy"):
             monkeypatch.delenv(name, raising=False)
         with pytest.raises(ConnectionError):
             nereids.load_endf(26, 56)
+
+    @_CACHE_FOLLOWS_HOME
+    def test_unreadable_cache_file_raises_os_error_naming_it(self, tmp_path, monkeypatch):
+        """A cache file that cannot be read raises an ``OSError`` naming it, not ``ConnectionError``."""
+        for cached in self._fe56_cache_files(tmp_path, monkeypatch):
+            cached.mkdir(parents=True)
+        with pytest.raises(OSError, match="Fe-56.endf") as raised:
+            nereids.load_endf(26, 56)
+        assert not isinstance(raised.value, ConnectionError)
+
+    @_CACHE_FOLLOWS_HOME
+    def test_group_refuses_cached_file_for_another_isotope(self, tmp_path, monkeypatch):
+        """A group member whose cached file holds another isotope raises ``ValueError``."""
+        root = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+        with open(os.path.join(root, "crates/nereids-endf/tests/data/u238_ex027.endf"), "rb") as f:
+            u238 = f.read()
+        for cached in self._fe56_cache_files(tmp_path, monkeypatch):
+            cached.parent.mkdir(parents=True)
+            cached.write_bytes(u238)
+        group = nereids.IsotopeGroup.custom("fe56", [(26, 56, 1.0)])
+        with pytest.raises(ValueError, match="requested Z=26 A=56 but file contains Z=92 A=238"):
+            group.load_endf()
 
 
 # ===========================================================================

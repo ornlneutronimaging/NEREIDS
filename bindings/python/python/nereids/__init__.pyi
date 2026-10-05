@@ -739,8 +739,9 @@ class IsotopeGroup:
             library: ENDF library name (default "endf8.1").
 
         Raises:
-            The errors of ``load_endf``, with the failing member's Z and A in
-            the message.
+            ConnectionError, OSError, RuntimeError, ValueError: as
+                ``load_endf``, with the failing member's Z and A at the start
+                of the message.
         """
         ...
 
@@ -1037,13 +1038,15 @@ def load_endf(
     parsed-but-not-evaluated spans.
 
     Raises:
-        ConnectionError: no download site could be reached, one answered with
-            an HTTP error, or one refused the download.
-        OSError: the local cache could not be read or written.
-        RuntimeError: any other retrieval failure, such as an isotope absent
-            from the library.
-        ValueError: the file does not parse or has no evaluable resolved
-            (LRF=1/2/3) range.
+        ConnectionError: no download site could be reached, or one answered
+            with an HTTP error other than 404 or refused the download.
+        OSError: the cache file named in the message could not be read or
+            written.
+        RuntimeError: the isotope is absent from the library (HTTP 404), or
+            the download is not a valid archive.
+        ValueError: an unknown library, an invalid isotope or MAT, a file for
+            another isotope, or ENDF text that does not parse or has no
+            evaluable resolved (LRF=1/2/3) range.
     """
     ...
 

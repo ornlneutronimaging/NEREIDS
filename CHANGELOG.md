@@ -9,12 +9,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
 
 ### Changed (breaking)
 
-- **A failed ENDF download raises `ConnectionError`.** `load_endf` and
-  `IsotopeGroup.load_endf` raise `ConnectionError` (an `OSError`) instead of
-  `RuntimeError` when no download site can be reached, one answers with an
-  HTTP error, or one refuses the download, and the matching `OSError` when
-  the local cache cannot be read or written. Scripts catching `RuntimeError`
-  for these must catch `OSError` instead.
+- **A failed ENDF download raises `ConnectionError`.**
+  `load_endf` and `IsotopeGroup.load_endf` raise `ConnectionError` (an `OSError`) instead of `RuntimeError` when no download site can be reached, or one answers with an HTTP error other than 404 or refuses the download.
+  A cache file that cannot be read or written raises the matching `OSError`, naming the file.
+  `IsotopeGroup.load_endf` refuses a cached file that holds another isotope, as `load_endf` does.
+  Scripts catching `RuntimeError` for these must catch `OSError` instead.
 - **Raw counts with an instrument resolution are refused.**
   `fit_counts_spectrum_typed`, `spatial_map_typed` on count cubes and
   `compute_model_jacobian` reject an active resolution instead of

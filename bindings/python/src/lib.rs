@@ -243,20 +243,34 @@ fn load_and_parse_endf(
     mat_num: u32,
     prefix: &str,
 ) -> PyResult<ResonanceData> {
-    let (_path, contents) = EndfRetriever::new()
-        .get_endf_file(isotope, lib, mat_num)
-        .map_err(|e| match e {
-            EndfRetrievalError::Io(io) => {
-                PyErr::from(std::io::Error::new(io.kind(), format!("{prefix}{io}")))
-            }
-            e if e.is_unreachable() => {
-                pyo3::exceptions::PyConnectionError::new_err(format!("{prefix}{e}"))
-            }
-            e => pyo3::exceptions::PyRuntimeError::new_err(format!("{prefix}{e}")),
-        })?;
-    parse_endf_file2(&contents).map_err(|e| {
+    let retriever = EndfRetriever::new();
+    let (_path, contents) =
+        retriever
+            .get_endf_file(isotope, lib, mat_num)
+            .map_err(|e| match e {
+                EndfRetrievalError::Io(io) => {
+                    let path = retriever.cache_file_path(isotope, lib);
+                    let message = format!("{prefix}{}: {io}", path.display());
+                    PyErr::from(std::io::Error::new(io.kind(), message))
+                }
+                e if e.is_unavailable() => {
+                    pyo3::exceptions::PyConnectionError::new_err(format!("{prefix}{e}"))
+                }
+                e => pyo3::exceptions::PyRuntimeError::new_err(format!("{prefix}{e}")),
+            })?;
+    let data = parse_endf_file2(&contents).map_err(|e| {
         pyo3::exceptions::PyValueError::new_err(format!("{prefix}ENDF parse error: {e}"))
-    })
+    })?;
+    if data.isotope != *isotope {
+        return Err(pyo3::exceptions::PyValueError::new_err(format!(
+            "{prefix}ENDF data mismatch: requested Z={} A={} but file contains Z={} A={}",
+            isotope.z(),
+            isotope.a(),
+            data.isotope.z(),
+            data.isotope.a()
+        )));
+    }
+    Ok(data)
 }
 
 /// Emit a Python ``UserWarning`` when parsed ENDF data contains
@@ -368,8 +382,8 @@ impl PyIsotopeGroup {
     ///     library: ENDF library name (default "endf8.1").
     ///
     /// Raises:
-    ///     The errors of ``load_endf``, with the failing member's Z and A in
-    ///     the message.
+    ///     ConnectionError, OSError, RuntimeError, ValueError: as ``load_endf``,
+    ///         with the failing member's Z and A at the start of the message.
     #[pyo3(signature = (library=None))]
     fn load_endf(&mut self, py: Python<'_>, library: Option<&str>) -> PyResult<()> {
         let lib = parse_library_name(library.unwrap_or("endf8.1"))?;
@@ -2074,12 +2088,15 @@ fn energy_to_tof(energy_ev: f64, flight_path_m: f64) -> PyResult<f64> {
 ///     ResonanceData parsed from the ENDF file.
 ///
 /// Raises:
-///     ConnectionError: no download site could be reached, one answered with
-///         an HTTP error, or one refused the download.
-///     OSError: the local cache could not be read or written.
-///     RuntimeError: any other retrieval failure, such as an isotope absent
-///         from the library.
-///     ValueError: the file does not parse or has no evaluable resolved range.
+///     ConnectionError: no download site could be reached, or one answered
+///         with an HTTP error other than 404 or refused the download.
+///     OSError: the cache file named in the message could not be read or
+///         written.
+///     RuntimeError: the isotope is absent from the library (HTTP 404), or the
+///         download is not a valid archive.
+///     ValueError: an unknown library, an invalid isotope or MAT, a file for
+///         another isotope, or ENDF text that does not parse or has no
+///         evaluable resolved range.
 #[pyfunction]
 #[pyo3(signature = (z, a, library="endf8.1", mat=None))]
 fn load_endf(
@@ -2107,17 +2124,6 @@ fn load_endf(
     // Release the GIL for the network I/O (download / cache lookup) and
     // ENDF file parsing.  All types captured by the closure are Send.
     let data = py.detach(move || load_and_parse_endf(&isotope, lib, mat_num, ""))?;
-
-    // Validate that the parsed ENDF data matches the requested isotope.
-    if data.isotope.z() != z || data.isotope.a() != a {
-        return Err(pyo3::exceptions::PyValueError::new_err(format!(
-            "ENDF data mismatch: requested Z={} A={} but file contains Z={} A={}",
-            z,
-            a,
-            data.isotope.z(),
-            data.isotope.a()
-        )));
-    }
 
     warn_unevaluated_ranges(py, &data, &format!("ENDF Z={z} A={a}"))?;
 
