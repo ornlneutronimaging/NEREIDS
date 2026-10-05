@@ -1108,8 +1108,7 @@ impl TabulatedResolution {
     /// The returned vector has one entry per adjacent edge pair and is not
     /// renormalized to the supplied window.  Probability outside the measured
     /// window remains outside it; the quantified acquisition-window loss at
-    /// this energy is one minus the sum of the returned vector (the
-    /// pipeline-map contract's R5·7 window-loss disclosure).
+    /// this energy is one minus the sum of the returned vector.
     ///
     /// # Errors
     /// Returns [`ResolutionParseError::InvalidFormat`] unless the true energy

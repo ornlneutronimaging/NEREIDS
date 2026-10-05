@@ -75,7 +75,7 @@ Density maps, chi² maps, convergence maps              [output]
 
 All physics modules implement the exact formalisms from the SAMMY Fortran code,
 with no ad-hoc approximations. Every module references specific SAMMY source
-files and equation numbers. See the [Physics Reference](./physics.md) for
+files and equation numbers. See the [API documentation](api/nereids_physics/) for
 details.
 
 ### Workspace Architecture

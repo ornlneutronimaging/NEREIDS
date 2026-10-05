@@ -44,11 +44,8 @@ Key formalisms from SAMMY:
 - Reich-Moore R-matrix (LRF=3)
 - Breit-Wigner, single- and multi-level (LRF=1/2)
 - Free Gas Model Doppler broadening
-- Gaussian + exponential resolution broadening
 
-R-Matrix Limited (LRF=7) and Unresolved Resonance Region (LRU=2) ranges are
-parsed-and-skipped, not evaluated: they contribute zero cross-section, and a
-file containing only such ranges is rejected at load time.
+The [Pipeline Map](./interactive-pipeline-map.md) describes the physics NEREIDS implements and where the code does not yet follow it.
 
 ## Next Steps
 
