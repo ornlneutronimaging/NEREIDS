@@ -369,6 +369,9 @@ class TestResonanceData:
         assert data.target_spin == 2.5
         assert data.scattering_radius == pytest.approx(9.6931)
 
+    @pytest.mark.skipif(
+        os.name == "nt", reason="the ENDF cache on Windows ignores HOME and XDG_CACHE_HOME"
+    )
     def test_unreachable_download_raises_connection_error(self, tmp_path, monkeypatch):
         """A download through an unreachable proxy into an empty cache raises ``ConnectionError``."""
         monkeypatch.setenv("HOME", str(tmp_path))

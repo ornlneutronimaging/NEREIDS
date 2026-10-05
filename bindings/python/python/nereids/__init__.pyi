@@ -735,11 +735,12 @@ class IsotopeGroup:
     def load_endf(self, library: str | None = None) -> None:
         """Fetch ENDF data for all members.
 
-        Raises ``ConnectionError`` when the IAEA site cannot be reached or
-        refuses the download.
-
         Args:
             library: ENDF library name (default "endf8.1").
+
+        Raises:
+            The errors of ``load_endf``, with the failing member's Z and A in
+            the message.
         """
         ...
 
@@ -1029,15 +1030,20 @@ def load_endf(
     library: str = "endf8.1",
     mat: int | None = None,
 ) -> ResonanceData:
-    """Load ENDF resonance data for an isotope from the IAEA database.
+    """Load ENDF resonance data for an isotope, downloading the evaluation on
+    first use and caching it in the user's cache directory.
 
-    Raises ``ConnectionError`` when the IAEA site cannot be reached or refuses
-    the download.
-
-    Raises ``ValueError`` when the evaluation has no evaluable resolved
-    (LRF=1/2/3) range — loading it would yield zero cross-section
-    everywhere. Mixed evaluations load with a ``UserWarning`` naming the
+    Mixed evaluations load with a ``UserWarning`` naming the
     parsed-but-not-evaluated spans.
+
+    Raises:
+        ConnectionError: no download site could be reached, one answered with
+            an HTTP error, or one refused the download.
+        OSError: the local cache could not be read or written.
+        RuntimeError: any other retrieval failure, such as an isotope absent
+            from the library.
+        ValueError: the file does not parse or has no evaluable resolved
+            (LRF=1/2/3) range.
     """
     ...
 
