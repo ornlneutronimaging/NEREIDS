@@ -369,6 +369,17 @@ class TestResonanceData:
         assert data.target_spin == 2.5
         assert data.scattering_radius == pytest.approx(9.6931)
 
+    def test_unreachable_download_raises_connection_error(self, tmp_path, monkeypatch):
+        """A download through an unreachable proxy into an empty cache raises ``ConnectionError``."""
+        monkeypatch.setenv("HOME", str(tmp_path))
+        monkeypatch.setenv("XDG_CACHE_HOME", str(tmp_path))
+        for name in ("HTTPS_PROXY", "https_proxy"):
+            monkeypatch.setenv(name, "http://127.0.0.1:9")
+        for name in ("NO_PROXY", "no_proxy"):
+            monkeypatch.delenv(name, raising=False)
+        with pytest.raises(ConnectionError):
+            nereids.load_endf(26, 56)
+
 
 # ===========================================================================
 # Cross-sections

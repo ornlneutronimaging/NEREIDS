@@ -735,6 +735,9 @@ class IsotopeGroup:
     def load_endf(self, library: str | None = None) -> None:
         """Fetch ENDF data for all members.
 
+        Raises ``ConnectionError`` when the IAEA site cannot be reached or
+        refuses the download.
+
         Args:
             library: ENDF library name (default "endf8.1").
         """
@@ -1027,6 +1030,9 @@ def load_endf(
     mat: int | None = None,
 ) -> ResonanceData:
     """Load ENDF resonance data for an isotope from the IAEA database.
+
+    Raises ``ConnectionError`` when the IAEA site cannot be reached or refuses
+    the download.
 
     Raises ``ValueError`` when the evaluation has no evaluable resolved
     (LRF=1/2/3) range — loading it would yield zero cross-section

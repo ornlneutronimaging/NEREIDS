@@ -37,23 +37,11 @@ from _fixtures import _synthetic_u238_data, _synthetic_u238_entry
 
 
 def _load_endf_or_skip(**kwargs):
-    """Call the load_endf tool, skipping (not failing) on network errors.
-
-    Several tests fetch live evaluations from the IAEA service on a cold
-    cache; an infrastructure outage must surface as an explicit skip in CI,
-    not a PR-gate failure. Parse-level errors (ValueError) still propagate --
-    they are what the tests assert on.
-    """
+    """Call the load_endf tool, skipping the test when the IAEA site cannot be reached."""
     try:
         return load_endf(**kwargs)
-    except OSError as exc:  # cache-file I/O failure, not a parse verdict
+    except ConnectionError as exc:
         pytest.skip(f"IAEA ENDF service unreachable: {exc}")
-    except RuntimeError as exc:
-        # The PyO3 binding maps retrieval (download) failures to RuntimeError;
-        # only network-shaped messages skip -- other RuntimeErrors propagate.
-        if "Network error" in str(exc) or "Failed to fetch" in str(exc):
-            pytest.skip(f"IAEA ENDF service unreachable: {exc}")
-        raise
 
 
 @pytest.fixture(autouse=True)

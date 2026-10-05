@@ -49,7 +49,7 @@ use nereids_endf::parser::parse_endf_file2;
 use nereids_endf::resonance::{
     LGroup, Resonance, ResonanceData, ResonanceFormalism, ResonanceRange,
 };
-use nereids_endf::retrieval::{EndfLibrary, EndfRetriever, mat_number};
+use nereids_endf::retrieval::{EndfLibrary, EndfRetrievalError, EndfRetriever, mat_number};
 use nereids_fitting::resolution_calib::{
     CalibrationConfig, DEFAULT_PSR_FWHM_NS, NS_TO_US, PSR_FWHM_PIN_CEILING_US, ResolutionFamily,
     UDR_S0_MAX, UDR_S0_MIN, calibrate_resolution as rust_calibrate_resolution,
@@ -246,13 +246,26 @@ fn load_and_parse_endf(
     isotope: &Isotope,
     lib: EndfLibrary,
     mat_num: u32,
-) -> Result<ResonanceData, (bool, String)> {
+) -> Result<ResonanceData, (fn(String) -> PyErr, String)> {
     let retriever = EndfRetriever::new();
     let (_path, contents) = retriever
         .get_endf_file(isotope, lib, mat_num)
-        .map_err(|e| (false, format!("{}", e)))?;
-    let data =
-        parse_endf_file2(&contents).map_err(|e| (true, format!("ENDF parse error: {}", e)))?;
+        .map_err(|e| {
+            let raise: fn(String) -> PyErr = match &e {
+                EndfRetrievalError::NetworkError(_)
+                | EndfRetrievalError::RemoteAccessBlocked { .. } => {
+                    pyo3::exceptions::PyConnectionError::new_err
+                }
+                _ => pyo3::exceptions::PyRuntimeError::new_err,
+            };
+            (raise, e.to_string())
+        })?;
+    let data = parse_endf_file2(&contents).map_err(|e| {
+        (
+            pyo3::exceptions::PyValueError::new_err::<String> as fn(String) -> PyErr,
+            format!("ENDF parse error: {}", e),
+        )
+    })?;
     Ok(data)
 }
 
@@ -385,7 +398,7 @@ impl PyIsotopeGroup {
             .collect::<PyResult<Vec<_>>>()?;
 
         // Release the GIL for the network I/O + parsing.
-        let results: Vec<Result<ResonanceData, (bool, String)>> = py.detach(move || {
+        let results: Vec<_> = py.detach(move || {
             members
                 .iter()
                 .map(|(iso, mat)| load_and_parse_endf(iso, lib, *mat))
@@ -398,14 +411,9 @@ impl PyIsotopeGroup {
             .into_iter()
             .enumerate()
             .map(|(i, result)| {
-                result.map(|d| Arc::new(d)).map_err(|(is_parse, msg)| {
+                result.map(|d| Arc::new(d)).map_err(|(raise, msg)| {
                     let member = &self.inner.members()[i];
-                    let prefix = format!("Z={} A={}: ", member.0.z(), member.0.a());
-                    if is_parse {
-                        pyo3::exceptions::PyValueError::new_err(prefix + &msg)
-                    } else {
-                        pyo3::exceptions::PyRuntimeError::new_err(prefix + &msg)
-                    }
+                    raise(format!("Z={} A={}: {msg}", member.0.z(), member.0.a()))
                 })
             })
             .collect::<PyResult<Vec<_>>>()?;
@@ -2101,19 +2109,9 @@ fn load_endf(
 
     // Release the GIL for the network I/O (download / cache lookup) and
     // ENDF file parsing.  All types captured by the closure are Send.
-    //
-    // We tag errors so we can map retrieval failures → PyRuntimeError and
-    // parse failures → PyValueError (preserving the pre-GIL-release contract).
-    let result: Result<ResonanceData, (bool, String)> =
-        py.detach(move || load_and_parse_endf(&isotope, lib, mat_num));
-
-    let data = result.map_err(|(is_parse, msg)| {
-        if is_parse {
-            pyo3::exceptions::PyValueError::new_err(msg)
-        } else {
-            pyo3::exceptions::PyRuntimeError::new_err(msg)
-        }
-    })?;
+    let data = py
+        .detach(move || load_and_parse_endf(&isotope, lib, mat_num))
+        .map_err(|(raise, msg)| raise(msg))?;
 
     // Validate that the parsed ENDF data matches the requested isotope.
     if data.isotope.z() != z || data.isotope.a() != a {
