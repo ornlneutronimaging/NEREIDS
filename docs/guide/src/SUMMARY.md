@@ -7,7 +7,6 @@
 - [Quickstart: Python](./quickstart-python.md)
 - [Python API Reference](./python-api.md)
 - [Data I/O and NeXus/TOF](./data-io.md)
-- [Instrument Resolution & Calibration](./resolution-calibration.md)
 - [MCP Server](./mcp-server.md)
 - [GUI Walkthrough](./gui-walkthrough.md)
 - [Notebook Status](./notebooks.md)
