@@ -614,7 +614,7 @@
     <div class="stagepanel" data-stage="6" hidden>
       <div class="step">
         <div class="step-top"><span class="step-no">6</span><span class="step-name">Observation model</span><span class="step-eq"><math><mi>S</mi><mo>=</mo><mi>Φε</mi><mi>T</mi><mo>+</mo><msub><mi>B</mi><mi>s</mi></msub><mo>,</mo><mspace width="0.4em"/><mi>O</mi><mo>=</mo><mi>Φε</mi><mo>+</mo><msub><mi>B</mi><mi>o</mi></msub></math></span></div>
-        <p class="step-body">Transmission domain: ratio (S/Q_s)/(O/Q_o). Counts domain (VENUS target): Poisson, flux Φ(E) inside the model. Sample and open-beam backgrounds differ (B_s ≠ B_o — the sample adds scatter and gammas). Beam-borne background, neutrons that reach the detector another way, leaves the moderator in the same pulse as the transmitted beam, so it passes through the kernel and scales with the beam: in the sample run the kernel acts on Φ·ε·(T + b), with b(E) = b₀ + b₁/√E + b₂·√E in transmission units (SAMMY&#8217;s background shapes). The open run&#8217;s beam-borne background cannot be told from Φ·ε and is part of it. Counts that bypass the pulse, such as gammas, need a term of their own when a case has them. Exposures differ (Q_s ≠ Q_o), and Q are noisy monitor observations, not exact divisors: the sample run is scaled by c_q, the measured ratio of the two runs&#8217; proton charges, times a normalization a fitted to the counts, within the monitor&#8217;s stated uncertainty when one is given. Dead time and pile-up must be corrected before the Poisson likelihood is valid at all: each run&#8217;s predicted counts in a bin are multiplied by the fraction of arriving neutrons its detector records there. Not yet in the code: the counts fit currently takes those live fractions as given; NEREIDS&#8217;s own count-loss correction is not implemented.</p>
+        <p class="step-body">Transmission domain: ratio (S/Q_s)/(O/Q_o). Counts domain (VENUS target): Poisson, flux Φ(E) inside the model. Sample and open-beam backgrounds differ (B_s ≠ B_o — the sample adds scatter and gammas). Beam-borne background, neutrons that reach the detector another way, leaves the moderator in the same pulse as the transmitted beam, so it passes through the kernel and scales with the beam: in the sample run the kernel acts on Φ·ε·(T + b), with b(E) = b₀ + b₁/√E + b₂·√E in transmission units (SAMMY&#8217;s background shapes). SAMMY adds its background B(E) after resolution broadening and does not scale it by the normalization, and it has a fourth shape, BackD·exp(−BackF/√E); for a background and beam smooth on the kernel&#8217;s scale the two agree, with Anorm = a and B = a·b. The open run&#8217;s beam-borne background cannot be told from Φ·ε and is part of it. Counts that bypass the pulse, such as gammas, need a term of their own when a case has them. Exposures differ (Q_s ≠ Q_o), and Q are noisy monitor observations, not exact divisors: the sample run is scaled by c_q, the measured ratio of the two runs&#8217; proton charges, times a normalization a fitted to the counts, within the monitor&#8217;s stated uncertainty when one is given. Dead time and pile-up must be corrected before the Poisson likelihood is valid at all: each run&#8217;s predicted counts in a bin are multiplied by the fraction of arriving neutrons its detector records there. Not yet in the code: the counts fit currently takes those live fractions as given; NEREIDS&#8217;s own count-loss correction is not implemented.</p>
         <p class="parline">parameters: normalization a on the measured charge ratio c_q · sample-run background b₀, b₁, b₂ · beam Φ·ε(E) · live fractions ℓ of each run and bin</p>
       </div>
     </div>
@@ -1074,7 +1074,7 @@
       <div class="scntip" id="scntip" role="tooltip" hidden></div>
       <div class="ctl" id="ctl-board" style="left:7.5%; top:53.4%; width:36.5%">
         <div id="freerows"></div>
-        <div class="phead" id="priorhead" tabindex="0" data-tip="These parameters are also in the joint fit, held by tight priors from the calibration posterior (with its L–t₀ correlation). Their uncertainty is counted in the answer — never hard-pinned.">tight priors ← calibration posterior</div>
+        <div class="phead" id="priorhead" tabindex="0" data-tip="These parameters are also in the joint fit, held by tight priors: θ_res from the calibration posterior, and in this demo L and t₀ too, with their correlation, where the physics fits them from the sample&#8217;s dips. Their uncertainty is counted in the answer — never hard-pinned.">tight priors ← calibration posterior</div>
         <div id="priorrows"></div>
         <div class="fitrow"><button type="button" id="btn-fit">fit this pixel</button><button type="button" id="btn-map">fit every pixel</button><span class="chi" id="v-chi"></span><span class="ihint" tabindex="0" data-tip="Demo reductions: seven fixed Ta-181 lines as independent area-conserving Gaussian profiles (no interference or Lorentzian wings — the real σ is collision-matrix-coherent, stage 1); n·d in units of peak optical depth at the 4.3 eV line at the 295 K reference (real deliverable: atoms/barn); K(t|E) rendered as a constant-relative-width blur (θ_res = ΔE/E); multiplicative 3.5% Gaussian noise with model-variance (Pearson) weights standing in for the Poisson counts likelihood; 13×9 pixel grid (VENUS is 512×512); one frame for in-situ.">i</span></div>
       </div>
@@ -2221,15 +2221,15 @@
         prior: "n·d, T (foil) · nuclear data",
         sample: "reference foil — n·d, T known", fitBtn: "fit the foil", map: false },
       density: { free: ["nd"], pair: ["nd", "T"],
-        bring: "known isotope + temperature", solve: "n·d per pixel · L, t<sub>0</sub>", get: "n·d map + σ + residuals",
+        bring: "known isotope + temperature", solve: "n·d per pixel · L, t<sub>0</sub> (held by prior in this demo)", get: "n·d map + σ + residuals",
         prior: "θ_res ← calibration · T",
         sample: "sample (n·d, T)", fitBtn: "fit this pixel", map: true },
       temperature: { free: ["T"], pair: ["nd", "T"],
-        bring: "known areal density", solve: "T_eff per pixel · L, t<sub>0</sub>", get: "T map + σ + residuals",
+        bring: "known areal density", solve: "T_eff per pixel · L, t<sub>0</sub> (held by prior in this demo)", get: "T map + σ + residuals",
         prior: "θ_res ← calibration · n·d",
         sample: "sample (n·d, T)", fitBtn: "fit this pixel", map: true },
       insitu: { free: ["nd", "T"], pair: ["nd", "T"],
-        bring: "a time series, neither known", solve: "n·d + T (this frame) · L, t<sub>0</sub>", get: "n·d & T trajectories + joint σ",
+        bring: "a time series, neither known", solve: "n·d + T (this frame) · L, t<sub>0</sub> (held by prior in this demo)", get: "n·d & T trajectories + joint σ",
         prior: "θ_res ← calibration",
         sample: "sample (n·d, T)", fitBtn: "fit this pixel", map: true }
     };
@@ -2492,7 +2492,7 @@
       priorHead.textContent = MODE === "calibration" ? "tight priors — the foil assay" : "tight priors ← calibration posterior";
       priorHead.setAttribute("data-tip", MODE === "calibration"
         ? "The foil's n·d and T are tightly known (assay + measurement), so the data's freedom goes to the instrument parameters. Still jointly fitted — never hard-pinned."
-        : "Also in the joint fit, held by tight priors from the calibration posterior (with its L–t₀ correlation). Their uncertainty is counted in the answer — never hard-pinned.");
+        : "Also in the joint fit, held by tight priors: θ_res from the calibration posterior, and in this demo L and t₀ too, with their correlation, where the physics fits them from the sample’s dips. Their uncertainty is counted in the answer — never hard-pinned.");
       btnFit.textContent = md.fitBtn;
       btnMap.style.display = md.map ? "" : "none";
     }
