@@ -447,6 +447,17 @@ impl EndfRetrievalError {
     pub fn is_remote_access_blocked(&self) -> bool {
         matches!(self, Self::RemoteAccessBlocked { .. })
     }
+
+    pub fn is_unavailable(&self) -> bool {
+        match self {
+            Self::NetworkError(_) | Self::RemoteAccessBlocked { .. } => true,
+            Self::NotInLibrary { .. }
+            | Self::IsotopeMismatch { .. }
+            | Self::Parse(_)
+            | Self::Io(_)
+            | Self::UnknownIsotope(_) => false,
+        }
+    }
 }
 
 #[derive(Debug)]
@@ -680,6 +691,14 @@ mod tests {
             message: "blocked".into(),
         };
         assert!(err.is_remote_access_blocked());
+        assert!(err.is_unavailable());
+        assert!(EndfRetrievalError::NetworkError("refused".into()).is_unavailable());
+        let absent = EndfRetrievalError::NotInLibrary {
+            isotope: "Fe-56".into(),
+            library: "endf8.1".into(),
+        };
+        assert!(!absent.is_unavailable());
+        assert!(!EndfRetrievalError::Io(std::io::Error::other("disk")).is_unavailable());
     }
 
     /// Issue #523: the polite User-Agent must carry the live package version

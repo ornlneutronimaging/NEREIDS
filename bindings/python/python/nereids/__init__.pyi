@@ -737,6 +737,11 @@ class IsotopeGroup:
 
         Args:
             library: ENDF library name (default "endf8.1").
+
+        Raises:
+            ConnectionError, OSError, RuntimeError, ValueError: as
+                ``load_endf``; an error loading a member starts with that
+                member's Z and A.
         """
         ...
 
@@ -1026,12 +1031,22 @@ def load_endf(
     library: str = "endf8.1",
     mat: int | None = None,
 ) -> ResonanceData:
-    """Load ENDF resonance data for an isotope from the IAEA database.
+    """Load ENDF resonance data for an isotope, downloading the evaluation on
+    first use and caching it in the user's cache directory.
 
-    Raises ``ValueError`` when the evaluation has no evaluable resolved
-    (LRF=1/2/3) range — loading it would yield zero cross-section
-    everywhere. Mixed evaluations load with a ``UserWarning`` naming the
+    Mixed evaluations load with a ``UserWarning`` naming the
     parsed-but-not-evaluated spans.
+
+    Raises:
+        ConnectionError: no download site could be reached, or one answered
+            with an HTTP error other than 404 or refused the download.
+        OSError: the cache file named in the message could not be read or
+            written.
+        RuntimeError: the isotope is absent from the library (HTTP 404), or
+            the download is not a valid archive.
+        ValueError: an unknown library, an invalid isotope or MAT, a file for
+            another isotope, or ENDF text that does not parse or has no
+            evaluable resolved (LRF=1/2/3) range.
     """
     ...
 

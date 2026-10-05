@@ -49,7 +49,7 @@ use nereids_endf::parser::parse_endf_file2;
 use nereids_endf::resonance::{
     LGroup, Resonance, ResonanceData, ResonanceFormalism, ResonanceRange,
 };
-use nereids_endf::retrieval::{EndfLibrary, EndfRetriever, mat_number};
+use nereids_endf::retrieval::{EndfLibrary, EndfRetrievalError, EndfRetriever, mat_number};
 use nereids_fitting::resolution_calib::{
     CalibrationConfig, DEFAULT_PSR_FWHM_NS, NS_TO_US, PSR_FWHM_PIN_CEILING_US, ResolutionFamily,
     UDR_S0_MAX, UDR_S0_MIN, calibrate_resolution as rust_calibrate_resolution,
@@ -237,22 +237,39 @@ fn parse_library_name(library: &str) -> PyResult<EndfLibrary> {
     }
 }
 
-/// Load and parse ENDF resonance data for a single isotope.
-///
-/// This helper encapsulates the retrieval + parse logic shared between
-/// `load_endf` and `PyIsotopeGroup.load_endf`. It does NOT hold the GIL
-/// and must be called from a `py.detach()` / `py.allow_threads()` closure.
 fn load_and_parse_endf(
     isotope: &Isotope,
     lib: EndfLibrary,
     mat_num: u32,
-) -> Result<ResonanceData, (bool, String)> {
+    prefix: &str,
+) -> PyResult<ResonanceData> {
     let retriever = EndfRetriever::new();
-    let (_path, contents) = retriever
-        .get_endf_file(isotope, lib, mat_num)
-        .map_err(|e| (false, format!("{}", e)))?;
-    let data =
-        parse_endf_file2(&contents).map_err(|e| (true, format!("ENDF parse error: {}", e)))?;
+    let (_path, contents) =
+        retriever
+            .get_endf_file(isotope, lib, mat_num)
+            .map_err(|e| match e {
+                EndfRetrievalError::Io(io) => {
+                    let path = retriever.cache_file_path(isotope, lib);
+                    let message = format!("{prefix}{}: {io}", path.display());
+                    PyErr::from(std::io::Error::new(io.kind(), message))
+                }
+                e if e.is_unavailable() => {
+                    pyo3::exceptions::PyConnectionError::new_err(format!("{prefix}{e}"))
+                }
+                e => pyo3::exceptions::PyRuntimeError::new_err(format!("{prefix}{e}")),
+            })?;
+    let data = parse_endf_file2(&contents).map_err(|e| {
+        pyo3::exceptions::PyValueError::new_err(format!("{prefix}ENDF parse error: {e}"))
+    })?;
+    if data.isotope != *isotope {
+        return Err(pyo3::exceptions::PyValueError::new_err(format!(
+            "{prefix}ENDF data mismatch: requested Z={} A={} but file contains Z={} A={}",
+            isotope.z(),
+            isotope.a(),
+            data.isotope.z(),
+            data.isotope.a()
+        )));
+    }
     Ok(data)
 }
 
@@ -363,6 +380,10 @@ impl PyIsotopeGroup {
     ///
     /// Args:
     ///     library: ENDF library name (default "endf8.1").
+    ///
+    /// Raises:
+    ///     ConnectionError, OSError, RuntimeError, ValueError: as ``load_endf``;
+    ///         an error loading a member starts with that member's Z and A.
     #[pyo3(signature = (library=None))]
     fn load_endf(&mut self, py: Python<'_>, library: Option<&str>) -> PyResult<()> {
         let lib = parse_library_name(library.unwrap_or("endf8.1"))?;
@@ -385,10 +406,13 @@ impl PyIsotopeGroup {
             .collect::<PyResult<Vec<_>>>()?;
 
         // Release the GIL for the network I/O + parsing.
-        let results: Vec<Result<ResonanceData, (bool, String)>> = py.detach(move || {
+        let results: Vec<PyResult<ResonanceData>> = py.detach(move || {
             members
                 .iter()
-                .map(|(iso, mat)| load_and_parse_endf(iso, lib, *mat))
+                .map(|(iso, mat)| {
+                    let prefix = format!("Z={} A={}: ", iso.z(), iso.a());
+                    load_and_parse_endf(iso, lib, *mat, &prefix)
+                })
                 .collect()
         });
 
@@ -396,18 +420,7 @@ impl PyIsotopeGroup {
         // modifying self.resonance_data (atomic update).
         let staged: Vec<Arc<ResonanceData>> = results
             .into_iter()
-            .enumerate()
-            .map(|(i, result)| {
-                result.map(|d| Arc::new(d)).map_err(|(is_parse, msg)| {
-                    let member = &self.inner.members()[i];
-                    let prefix = format!("Z={} A={}: ", member.0.z(), member.0.a());
-                    if is_parse {
-                        pyo3::exceptions::PyValueError::new_err(prefix + &msg)
-                    } else {
-                        pyo3::exceptions::PyRuntimeError::new_err(prefix + &msg)
-                    }
-                })
-            })
+            .map(|result| result.map(Arc::new))
             .collect::<PyResult<Vec<_>>>()?;
         // Warn about skipped ranges BEFORE mutating self: a caller that
         // escalates warnings to exceptions (warnings.simplefilter("error"))
@@ -2060,21 +2073,30 @@ fn energy_to_tof(energy_ev: f64, flight_path_m: f64) -> PyResult<f64> {
     ))
 }
 
-/// Load ENDF resonance data for an isotope from the IAEA database.
-///
-/// Downloads and parses the ENDF file, caching it locally at
-/// ``~/.cache/nereids/endf/`` for subsequent calls.
+/// Load ENDF resonance data for an isotope, downloading the evaluation on
+/// first use and caching it in the user's cache directory.
 ///
 /// Args:
 ///     z: Atomic number (e.g. 92 for uranium).
 ///     a: Mass number (e.g. 238).
 ///     library: ENDF library name. One of "endf8.0", "endf8.1" (default),
 ///              "jeff3.3", "jendl5", "tendl2023", "cendl3.2".
-///     mat: ENDF MAT (material) number. If None, looks up from built-in table
-///          (~40 common isotopes). Provide explicitly for uncommon isotopes.
+///     mat: ENDF MAT (material) number. If None, looked up from the built-in
+///          table; required for an isotope the table lacks.
 ///
 /// Returns:
 ///     ResonanceData parsed from the ENDF file.
+///
+/// Raises:
+///     ConnectionError: no download site could be reached, or one answered
+///         with an HTTP error other than 404 or refused the download.
+///     OSError: the cache file named in the message could not be read or
+///         written.
+///     RuntimeError: the isotope is absent from the library (HTTP 404), or the
+///         download is not a valid archive.
+///     ValueError: an unknown library, an invalid isotope or MAT, a file for
+///         another isotope, or ENDF text that does not parse or has no
+///         evaluable resolved range.
 #[pyfunction]
 #[pyo3(signature = (z, a, library="endf8.1", mat=None))]
 fn load_endf(
@@ -2101,30 +2123,7 @@ fn load_endf(
 
     // Release the GIL for the network I/O (download / cache lookup) and
     // ENDF file parsing.  All types captured by the closure are Send.
-    //
-    // We tag errors so we can map retrieval failures → PyRuntimeError and
-    // parse failures → PyValueError (preserving the pre-GIL-release contract).
-    let result: Result<ResonanceData, (bool, String)> =
-        py.detach(move || load_and_parse_endf(&isotope, lib, mat_num));
-
-    let data = result.map_err(|(is_parse, msg)| {
-        if is_parse {
-            pyo3::exceptions::PyValueError::new_err(msg)
-        } else {
-            pyo3::exceptions::PyRuntimeError::new_err(msg)
-        }
-    })?;
-
-    // Validate that the parsed ENDF data matches the requested isotope.
-    if data.isotope.z() != z || data.isotope.a() != a {
-        return Err(pyo3::exceptions::PyValueError::new_err(format!(
-            "ENDF data mismatch: requested Z={} A={} but file contains Z={} A={}",
-            z,
-            a,
-            data.isotope.z(),
-            data.isotope.a()
-        )));
-    }
+    let data = py.detach(move || load_and_parse_endf(&isotope, lib, mat_num, ""))?;
 
     warn_unevaluated_ranges(py, &data, &format!("ENDF Z={z} A={a}"))?;
 
