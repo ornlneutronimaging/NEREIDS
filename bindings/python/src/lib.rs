@@ -382,8 +382,8 @@ impl PyIsotopeGroup {
     ///     library: ENDF library name (default "endf8.1").
     ///
     /// Raises:
-    ///     ConnectionError, OSError, RuntimeError, ValueError: as ``load_endf``,
-    ///         with the failing member's Z and A at the start of the message.
+    ///     ConnectionError, OSError, RuntimeError, ValueError: as ``load_endf``;
+    ///         an error loading a member starts with that member's Z and A.
     #[pyo3(signature = (library=None))]
     fn load_endf(&mut self, py: Python<'_>, library: Option<&str>) -> PyResult<()> {
         let lib = parse_library_name(library.unwrap_or("endf8.1"))?;

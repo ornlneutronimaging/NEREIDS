@@ -740,8 +740,8 @@ class IsotopeGroup:
 
         Raises:
             ConnectionError, OSError, RuntimeError, ValueError: as
-                ``load_endf``, with the failing member's Z and A at the start
-                of the message.
+                ``load_endf``; an error loading a member starts with that
+                member's Z and A.
         """
         ...
 
