@@ -2,14 +2,15 @@
 """Fail when a change adds a public name without changing the pipeline map.
 
 Public names are what rustdoc documents for the library crates under
-``crates/``: each module and item by its path, with the inherent methods,
-fields, variants and trait items on the item's page, and each module's
-re-exports; and the public ``def`` / ``class`` names of the Python stub with
-each class's public methods.  A name is added when the base commit does not
-have it.
+``crates/``: each module by its path and each item by its path and kind, with
+the inherent methods, fields, variants and trait items on the item's page by
+their kind, and each module's re-exports, globs included; and the public
+``def`` / ``class`` names of the Python stub with each class's public methods.
+A name is added when the base commit does not have it.
 
 Usage: ``python3 scripts/check_public_surface.py BASE`` compares the merge base
-of BASE and HEAD with HEAD.  When a crate or stub file differs and the map does
+of BASE and HEAD with HEAD.  When a Rust source, a ``Cargo.toml``,
+``Cargo.lock`` or ``rust-toolchain.toml``, or the stub differs and the map does
 not, it builds the docs of HEAD and then of the base in this checkout, checking
 out the base and then the original commit again, so tracked files must have no
 uncommitted changes; ``target/doc`` then holds the base's docs.  The base is
@@ -38,14 +39,18 @@ MAP = "docs/guide/src/pipeline-map.html"
 STUB = "bindings/python/python/nereids/__init__.pyi"
 DOC = ("cargo", "doc", "--workspace", "--no-deps", "--exclude", "nereids-python")
 ITEM_PAGE = re.compile(
-    r"(?:struct|enum|union|trait|traitalias|fn|type|constant|static|macro|derive|attr)"
-    r"\.(\w+)\.html"
+    r"(struct|enum|union|trait|traitalias|fn|type|constant|static|macro|derive|attr)"
+    r"\.\w+\.html"
 )
 MEMBER = re.compile(
-    r'id="(?:method|tymethod|structfield|variant|associatedconstant|associatedtype)'
-    r'\.([\w.]+?)(?:-\d+)?"'
+    r'id="((?:method|tymethod|structfield|variant|associatedconstant|associatedtype)'
+    r'\.[\w.]+?)(?:-\d+)?"'
 )
-REEXPORT = re.compile(r'id="reexport\.(\w+)"')
+VARIANT_FIELDS_HEADING = re.compile(r"variant\.\w+\.fields")
+REEXPORT = re.compile(r'id="(reexport\.\w+)"')
+GLOB = re.compile(r"pub use ([\w:]+)::\*;")
+TAG = re.compile(r"<[^>]*>")
+BUILD_INPUTS = ("Cargo.toml", "Cargo.lock", "rust-toolchain.toml")
 TRAIT_IMPLS = re.compile(r'id="(?:trait|synthetic|blanket)-implementations"')
 REDIRECT = 'http-equiv="refresh"'
 
@@ -63,19 +68,20 @@ def doc_names(doc_dir: Path, crates: list[str]) -> set[str]:
                 continue
             rel = page.relative_to(root)
             module = (crate, *rel.parts[:-1])
-            item = ITEM_PAGE.fullmatch(rel.name)
-            if item:
-                path = "::".join((*module, item.group(1)))
+            if ITEM_PAGE.fullmatch(rel.name):
+                path = "::".join((*module, rel.name.removesuffix(".html")))
                 names.add(path)
                 own = TRAIT_IMPLS.split(text, maxsplit=1)[0]
                 names |= {
                     f"{path}::{member}"
                     for member in MEMBER.findall(own)
-                    if not member.endswith(".fields")
+                    if not VARIANT_FIELDS_HEADING.fullmatch(member)
                 }
             elif rel.name == "index.html":
                 names.add("::".join(module))
                 names |= {"::".join((*module, name)) for name in REEXPORT.findall(text)}
+                globs = GLOB.findall(TAG.sub("", text))
+                names |= {"::".join((*module, f"reexport.{glob}::*")) for glob in globs}
     return names
 
 
@@ -127,8 +133,10 @@ def main(argv: list[str]) -> int:
     try:
         base = run("git", "merge-base", argv[1], "HEAD").strip()
         changed = set(run("git", "diff", "--name-only", base, "HEAD").split())
-        if MAP in changed or not any(p.startswith("crates/") or p == STUB for p in changed):
-            print("check_public_surface: the map changed, or no crate or stub file did")
+        if MAP in changed or not any(
+            p.endswith(".rs") or Path(p).name in BUILD_INPUTS or p == STUB for p in changed
+        ):
+            print("check_public_surface: the map changed, or no Rust, Cargo or stub file did")
             return 0
         dirty = run("git", "status", "--porcelain", "--untracked-files=no")
         if dirty.strip():

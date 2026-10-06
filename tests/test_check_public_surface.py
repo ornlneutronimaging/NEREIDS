@@ -19,16 +19,28 @@ mod hidden {
 }
 pub use hidden::moved;
 pub use m::E as Renamed;
+pub use globbed::*;
+
+pub mod globbed {
+    pub fn g() {}
+}
+
+pub mod util {}
+pub fn util() {}
 
 pub mod m {
     #[derive(Clone)]
     pub struct S {
         pub x: f64,
+        pub fixed: bool,
         y: f64,
     }
     impl S {
         pub fn len(&self) -> f64 {
             self.y
+        }
+        pub fn fixed(&self) -> bool {
+            self.fixed
         }
     }
     impl S {
@@ -38,7 +50,7 @@ pub mod m {
     }
     pub enum E {
         A,
-        B { inner: f64 },
+        B { inner: f64, fields: u8 },
     }
     pub trait T {
         fn predict(&self) -> f64;
@@ -50,43 +62,51 @@ pub mod m {
         }
     }
 }
-
-pub mod empty {}
 """
 
 
-def write_crate(root: Path, name: str, lib: str) -> None:
+def write_crate(root: Path, name: str, lib: str, extra: str = "") -> None:
     (root / "src").mkdir(parents=True, exist_ok=True)
-    (root / "Cargo.toml").write_text(f'[package]\nname = "{name}"\nversion = "0.1.0"\nedition = "2021"\n')
+    (root / "Cargo.toml").write_text(
+        f'[package]\nname = "{name}"\nversion = "0.1.0"\nedition = "2021"\n{extra}'
+    )
     (root / "src" / "lib.rs").write_text(lib)
 
 
 @needs_cargo
 def test_doc_names_read_the_public_surface_from_rustdoc(tmp_path):
-    """Redirects, trait implementations and private fields are not public names."""
+    """Kinds keep same-named items apart; redirects and trait implementations are not names."""
     write_crate(tmp_path / "probe", "probe", LIB)
     subprocess.run(
         ["cargo", "doc", "--no-deps", "--quiet", "--target-dir", str(tmp_path / "target")],
         cwd=tmp_path / "probe",
         check=True,
     )
+    s, e, t = "probe::m::struct.S", "probe::m::enum.E", "probe::m::trait.T"
     assert surface.doc_names(tmp_path / "target" / "doc", ["probe"]) == {
         "probe",
-        "probe::moved",
-        "probe::Renamed",
-        "probe::empty",
+        "probe::fn.moved",
+        "probe::reexport.Renamed",
+        "probe::reexport.globbed::*",
+        "probe::globbed",
+        "probe::globbed::fn.g",
+        "probe::util",
+        "probe::fn.util",
         "probe::m",
-        "probe::m::S",
-        "probe::m::S::x",
-        "probe::m::S::len",
-        "probe::m::S::width",
-        "probe::m::E",
-        "probe::m::E::A",
-        "probe::m::E::B",
-        "probe::m::E::B.field.inner",
-        "probe::m::T",
-        "probe::m::T::predict",
-        "probe::m::T::provided",
+        s,
+        f"{s}::structfield.x",
+        f"{s}::structfield.fixed",
+        f"{s}::method.len",
+        f"{s}::method.fixed",
+        f"{s}::method.width",
+        e,
+        f"{e}::variant.A",
+        f"{e}::variant.B",
+        f"{e}::variant.B.field.inner",
+        f"{e}::variant.B.field.fields",
+        t,
+        f"{t}::tymethod.predict",
+        f"{t}::method.provided",
     }
 
 
@@ -102,11 +122,19 @@ def test_an_added_name_fails_until_the_map_changes():
 
 
 @needs_cargo
-def test_main_checks_out_the_base_and_restores_the_branch(tmp_path, monkeypatch):
-    """Exit 1 for a new name, 0 once the map changes, 2 for a bad base; HEAD is restored."""
+def test_main_compares_the_base_and_restores_the_checkout(tmp_path, monkeypatch):
     repo = tmp_path / "repo"
-    write_crate(repo / "crates" / "c", "c", "pub fn a() {}\n")
-    (repo / "Cargo.toml").write_text('[workspace]\nmembers = ["crates/c"]\nresolver = "2"\n')
+    lib = repo / "crates" / "c" / "src" / "lib.rs"
+    app = repo / "apps" / "app" / "Cargo.toml"
+    write_crate(
+        repo / "crates" / "c",
+        "c",
+        'pub fn a() {}\n#[cfg(feature = "extra")]\npub fn extra() {}\n',
+        "[features]\nextra = []\n",
+    )
+    write_crate(repo / "apps" / "app", "app", "", '[dependencies]\nc = { path = "../../crates/c" }\n')
+    (repo / "Cargo.toml").write_text('[workspace]\nmembers = ["crates/c", "apps/app"]\nresolver = "2"\n')
+    (repo / ".gitignore").write_text("target/\nCargo.lock\n")
     for rel, text in ((surface.MAP, "map\n"), (surface.STUB, "def f(): ...\n")):
         (repo / rel).parent.mkdir(parents=True, exist_ok=True)
         (repo / rel).write_text(text)
@@ -117,19 +145,36 @@ def test_main_checks_out_the_base_and_restores_the_branch(tmp_path, monkeypatch)
             cwd=repo, check=True, capture_output=True, text=True,
         ).stdout.strip()
 
+    def commit(path, old, new):
+        path.write_text(path.read_text().replace(old, new))
+        git("commit", "-q", "-am", f"edit {path.name}")
+
+    def check_and_restore(base):
+        head = git("rev-parse", "HEAD")
+        code = surface.main(["check", base])
+        assert git("rev-parse", "HEAD") == head and git("symbolic-ref", "--short", "HEAD") == "main"
+        return code
+
     git("init", "-q", "-b", "main")
-    (repo / ".gitignore").write_text("target/\nCargo.lock\n")
     git("add", "-A")
     git("commit", "-q", "-m", "base")
-    (repo / "crates" / "c" / "src" / "lib.rs").write_text("pub fn a() {}\npub fn b() {}\n")
-    git("commit", "-q", "-am", "add b")
-    head = git("rev-parse", "HEAD")
     monkeypatch.setattr(surface, "REPO_ROOT", repo)
     monkeypatch.setenv("CARGO_TARGET_DIR", str(tmp_path / "target"))
 
-    assert surface.main(["check", "HEAD~1"]) == 1
-    assert git("rev-parse", "HEAD") == head and git("symbolic-ref", "--short", "HEAD") == "main"
-    assert surface.main(["check", "no-such-revision"]) == 2
-    (repo / surface.MAP).write_text("map, changed\n")
-    git("commit", "-q", "-am", "change the map")
-    assert surface.main(["check", "HEAD~2"]) == 0
+    commit(lib, "pub fn a() {}", "pub fn a() {}\npub fn b() {}")
+    assert check_and_restore("HEAD~1") == 1
+    commit(lib, "pub fn a() {}", "pub fn a() {\n    let _ = 1;\n}")
+    assert check_and_restore("HEAD~1") == 0
+    commit(lib, "pub fn b", "/// See [missing].\npub fn b")
+    commit(lib, "/// See [missing].\n", "")
+    monkeypatch.setenv("RUSTDOCFLAGS", "-D warnings")
+    assert check_and_restore("HEAD~1") == 0
+    monkeypatch.delenv("RUSTDOCFLAGS")
+    commit(app, 'path = "../../crates/c" }', 'path = "../../crates/c", features = ["extra"] }')
+    assert check_and_restore("HEAD~1") == 1
+    commit(lib, "pub fn b() {}", "pub fn b() {}\npub fn broken( {}")
+    commit(lib, "\npub fn broken( {}", "")
+    assert check_and_restore("HEAD~1") == 2
+    assert check_and_restore("no-such-revision") == 2
+    commit(repo / surface.MAP, "map", "map, changed")
+    assert check_and_restore("HEAD~3") == 0
