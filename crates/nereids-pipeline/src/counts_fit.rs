@@ -299,11 +299,11 @@ pub struct RegionFit {
 /// own beam, from its own open-beam counts, with the intervals its
 /// [`fit_open_beam`] chooses, fitted with the rest to both runs; and its own
 /// background, which depends on what surrounds its pixels.  A region without
-/// a material counts `a·(1 + b_r)` of its beam in the sample run, so it pins
-/// the normalization when its background is known, as zero in the
-/// open-region normalization of imaging, and nothing about it when its
-/// background is fitted.  The regions must be separate pixels: the
-/// covariance takes every bin as independent.
+/// a material counts `c_q·a·(1 + b_r)` of its beam in the sample run, so it
+/// pins the normalization when its `b0` is known, as zero in the open-region
+/// normalization of imaging, and nothing about it when its `b0` is fitted.
+/// The regions must be separate pixels: the covariance takes every bin as
+/// independent.
 ///
 /// The [`Calibration`]'s `t0` and flight path `L` are fitted unless known.
 /// The grid is built at a `t0₀` and `L₀`, at first the starting ones.  Grid

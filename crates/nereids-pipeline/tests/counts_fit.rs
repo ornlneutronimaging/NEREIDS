@@ -388,12 +388,9 @@ fn an_empty_area_with_a_known_background_adds_its_counts_information_on_the_norm
         with_background(&setup, &beam(2.0e6), &[], TEMPERATURE_K, terms[2]),
     ];
     let region = |r: usize, material: Option<Material>, background: [Value; 3]| Region {
-        open_counts: rounded(&counts[r].0),
-        sample_counts: rounded(&counts[r].1),
-        open_live: None,
-        sample_live: None,
         background,
         material,
+        ..recorded(&setup, counts[r].clone(), &[]).regions.remove(0)
     };
     let regions = [
         region(
@@ -422,7 +419,14 @@ fn an_empty_area_with_a_known_background_adds_its_counts_information_on_the_norm
             }),
             [Value::Fitted(0.02), Value::Known(0.0), Value::Known(0.0)],
         ),
-        region(2, None, [Value::Known(0.0); 3]),
+        Region {
+            open_counts: rounded(&counts[2].0),
+            sample_counts: rounded(&counts[2].1),
+            open_live: None,
+            sample_live: None,
+            background: [Value::Known(0.0); 3],
+            material: None,
+        },
     ];
     let fit = |regions: &[Region]| {
         let m = Measurement {
@@ -679,6 +683,18 @@ fn each_run_s_overdispersion_is_its_variance_over_its_poisson_variance() {
     let sample = [(isotope, THIN)];
     let expected = [1.0e6, 2.0e6].map(|level| expected(&setup, &beam(level), &sample));
     let counts_per_neutron = [[3.0, 7.0], [5.0, 2.0]];
+    let live = recorded(&setup, expected[1].clone(), &sample)
+        .regions
+        .remove(0);
+    let (open_live, sample_live) = (
+        live.open_live.expect("live"),
+        live.sample_live.expect("live"),
+    );
+    let times = |mu: &[f64], live: &[f64]| mu.iter().zip(live).map(|(c, l)| c * l).collect();
+    let thinned = (
+        times(&expected[1].0, &open_live),
+        times(&expected[1].1, &sample_live),
+    );
     let fits: Vec<CountsFit> = (100..110)
         .map(|seed| {
             let mut m = measurement(
@@ -686,13 +702,24 @@ fn each_run_s_overdispersion_is_its_variance_over_its_poisson_variance() {
                 draws(&expected[0], seed, counts_per_neutron[0]),
                 &sample,
             );
-            let second = measurement(
+            let mut second = measurement(
                 &setup,
-                draws(&expected[1], seed + 500, counts_per_neutron[1]),
+                draws(&thinned, seed + 500, counts_per_neutron[1]),
                 &sample,
             );
+            second.regions[0].open_live = Some(open_live.clone());
+            second.regions[0].sample_live = Some(sample_live.clone());
             m.regions.extend(second.regions);
-            fit_counts(&m, &calibration(&setup)).expect("fit")
+            let fit = fit_counts(&m, &calibration(&setup)).expect("fit");
+            let open = fit_open_beam(
+                &setup.edges,
+                &m.regions[1].open_counts,
+                &calibration(&setup),
+                Some(&open_live),
+            )
+            .expect("open-beam fit");
+            assert_eq!(fit.regions[1].overdispersion[0], open.overdispersion);
+            fit
         })
         .collect();
     for (r, per_run) in counts_per_neutron.iter().enumerate() {
@@ -731,11 +758,11 @@ fn black_bins_refuse_counts_hold_a_bounded_background_at_zero_and_rare_ones_leav
     assert!((1e-8..1e-4).contains(&expected.1[rare]));
 
     let (open, mut counts) = (rounded(&expected.0), rounded(&expected.1));
+    let mut m = measurement(&setup, (open.clone(), counts.clone()), &sample);
     counts[dark] = 1.0;
-    match fit_counts(
-        &measurement(&setup, (open, counts), &sample),
-        &calibration(&setup),
-    ) {
+    m.regions
+        .extend(measurement(&setup, (open, counts), &sample).regions);
+    match fit_counts(&m, &calibration(&setup)) {
         Err(PipelineError::UnmodelledCounts {
             region,
             run,
@@ -743,7 +770,7 @@ fn black_bins_refuse_counts_hold_a_bounded_background_at_zero_and_rare_ones_leav
             counts,
             predicted,
         }) => {
-            assert_eq!((region, run, bin, counts), (0, "sample", dark, 1.0));
+            assert_eq!((region, run, bin, counts), (1, "sample", dark, 1.0));
             assert!(predicted < NEGLIGIBLE_PREDICTION, "{predicted}");
         }
         other => panic!("{other:?}"),
@@ -1235,6 +1262,8 @@ fn measurements_the_fit_does_not_describe_are_refused() {
         other => panic!("{other:?}"),
     }
     invalid(&|m| m.material_mut().isotopes.clear());
+    invalid(&|m| m.regions.clear());
+    invalid(&|m| m.regions[0].material = None);
     invalid(&|m| {
         m.material_mut()
             .isotopes
@@ -1885,6 +1914,7 @@ fn density_temperature_timing_offset_and_flight_path_are_recovered_from_starts_o
     )];
     let (open, transmitted) = expected(&setup, &beam(1.0e6), &sample);
     let counts = (rounded(&open), rounded(&transmitted));
+    let empty = expected(&setup, &beam(2.0e6), &[]);
     let precision = 1.0 / open.iter().copied().fold(f64::INFINITY, f64::min).sqrt();
     let (t0_offset, path_offset) = (1.5, 0.08);
     for (sign, density, start_k) in [(1.0, 2.0 * THIN, 1000.0), (-1.0, 0.5 * THIN, 200.0)] {
@@ -1894,14 +1924,24 @@ fn density_temperature_timing_offset_and_flight_path_are_recovered_from_starts_o
             ..calibration(&setup)
         };
         let start = [(sample[0].0.clone(), density)];
-        let fit = fit_counts(
-            &fitted_from(measurement(&setup, counts.clone(), &start), start_k),
-            &calibration,
-        )
-        .expect("fit");
+        let mut m = fitted_from(measurement(&setup, counts.clone(), &start), start_k);
+        m.regions.push(Region {
+            open_counts: rounded(&empty.0),
+            sample_counts: rounded(&empty.1),
+            open_live: None,
+            sample_live: None,
+            background: [Value::Known(0.0); 3],
+            material: None,
+        });
+        let fit = fit_counts(&m, &calibration).expect("fit");
         assert!(fit.converged, "{sign}");
-        let simulated = distance(&fit.regions[0].predicted[0], &open)
-            + distance(&fit.regions[0].predicted[1], &transmitted);
+        let simulated = [(&open, &transmitted), (&empty.0, &empty.1)]
+            .iter()
+            .zip(&fit.regions)
+            .map(|((o, s), region)| {
+                distance(&region.predicted[0], o) + distance(&region.predicted[1], s)
+            })
+            .sum::<f64>();
         assert!(simulated <= BOUND, "{sign}: {simulated}");
         for (i, (estimate, truth)) in [
             (fit.regions[0].densities[0], THIN),
@@ -1915,16 +1955,16 @@ fn density_temperature_timing_offset_and_flight_path_are_recovered_from_starts_o
             let pull = (estimate - truth) / error_bar(&fit, i);
             assert!(pull.abs() <= BOUND.sqrt(), "{sign} {i}: {pull}");
         }
-        let beam_error = setup
-            .edges
+        let beam_error = [1.0e6, 2.0e6]
             .iter()
-            .map(|&t| {
-                (fit.regions[0]
-                    .beam
-                    .per_us(t - (setup.t0_us + sign * t0_offset))
-                    / beam(1.0e6)(t - setup.t0_us)
-                    - 1.0)
-                    .abs()
+            .zip(&fit.regions)
+            .flat_map(|(&level, region)| {
+                setup.edges.iter().map(move |&t| {
+                    (region.beam.per_us(t - (setup.t0_us + sign * t0_offset))
+                        / beam(level)(t - setup.t0_us)
+                        - 1.0)
+                        .abs()
+                })
             })
             .fold(0.0, f64::max);
         assert!(

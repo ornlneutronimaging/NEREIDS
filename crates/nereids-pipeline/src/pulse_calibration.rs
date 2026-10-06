@@ -1285,6 +1285,18 @@ mod tests {
                 other => panic!("{other:?}"),
             }
         }
+        let mut two = measurement(None);
+        two.regions.push(two.regions[0].clone());
+        let mut empty = measurement(None);
+        empty.regions[0].material = None;
+        for m in [two, empty] {
+            match PulseCalibration::new(&m, &c, provenance()) {
+                Err(PipelineError::InvalidParameter(message)) => {
+                    assert!(message.contains("the foil alone"), "{message}")
+                }
+                other => panic!("{other:?}"),
+            }
+        }
         let same = Provenance {
             open: "sample-1".into(),
             ..provenance()
