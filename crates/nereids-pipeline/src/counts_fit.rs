@@ -426,7 +426,7 @@ pub fn fit_counts(
             }
             if !finite(isotope) {
                 return invalid(format!(
-                    "the resonance data of {} are not finite",
+                    "the resonance data of {} in region {r} are not finite",
                     isotope.isotope
                 ));
             }
@@ -463,8 +463,9 @@ pub fn fit_counts(
                 .isotopes
                 .iter()
                 .map(|(isotope, _)| {
-                    DopplerParams::new(reach_k, isotope.awr)
-                        .map_err(|e| PipelineError::InvalidParameter(e.to_string()))
+                    DopplerParams::new(reach_k, isotope.awr).map_err(|e| {
+                        in_region(region, PipelineError::InvalidParameter(e.to_string()))
+                    })
                 })
                 .collect::<Result<Vec<_>, _>>()?;
             Ok(Lines {
