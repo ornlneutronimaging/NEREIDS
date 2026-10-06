@@ -207,6 +207,49 @@ pub fn agreement(a: &Prior, b: &Prior) -> Result<Consistency, FittingError> {
     Consistency::new(d.iter().map(|w| w * w).sum(), k)
 }
 
+/// The part of `covariance` that the quantities at `shared` carry,
+/// `C_·s C_ss⁻¹ C_s·`: the whole covariance between two quantities that
+/// depend on each other only through those at `shared`.  A row of NaN in
+/// `covariance` is a row of NaN in it.
+///
+/// `None` when the covariance of the quantities at `shared` is not finite and
+/// positive definite.
+///
+/// # Panics
+/// If an index in `shared` is not a row of `covariance`.
+pub fn common_mode(covariance: &FlatMatrix, shared: &[usize]) -> Option<FlatMatrix> {
+    let k = shared.len();
+    let mut block = FlatMatrix::zeros(k, k);
+    for (a, &i) in shared.iter().enumerate() {
+        for (b, &j) in shared.iter().enumerate() {
+            *block.get_mut(a, b) = covariance.get(i, j);
+        }
+    }
+    let factor = Prior::factored(shared, &vec![0.0; k], &block);
+    if !factor.is_valid() {
+        return None;
+    }
+    let n = covariance.nrows;
+    let whitened: Vec<Vec<f64>> = (0..n)
+        .map(|i| {
+            let mut row: Vec<f64> = shared.iter().map(|&s| covariance.get(i, s)).collect();
+            factor.whiten(&mut row);
+            row
+        })
+        .collect();
+    let mut common = FlatMatrix::zeros(n, n);
+    for i in 0..n {
+        for j in 0..n {
+            *common.get_mut(i, j) = whitened[i]
+                .iter()
+                .zip(&whitened[j])
+                .map(|(x, y)| x * y)
+                .sum();
+        }
+    }
+    Some(common)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
