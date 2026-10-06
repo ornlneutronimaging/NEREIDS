@@ -8,8 +8,8 @@
 //! ## Modules
 //! - [`beam`] — The beam before the sample, per µs of flight time
 //! - [`calibration`] — Energy calibration for TOF neutron instruments (t0 + flight-path scale)
-//! - [`counts_fit`] — Densities, temperature, normalization and background fitted to the
-//!   open-beam and sample counts (fit_counts)
+//! - [`counts_fit`] — Densities, temperatures and backgrounds of one or more regions, and the
+//!   normalization they share, fitted to the open-beam and sample counts (fit_counts)
 //! - [`detectability`] — Trace-detectability analysis (pre-experiment SNR check)
 //! - [`error`] — Pipeline error types
 //! - [`open_beam`] — The beam fitted to the open-beam counts (fit_open_beam)

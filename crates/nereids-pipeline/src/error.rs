@@ -34,9 +34,11 @@ pub enum PipelineError {
     /// The model predicts a bin negative or non-finite counts, or almost none
     /// of the counts it holds.
     #[error(
-        "bin {bin} of the {run} run holds {counts} counts where the model predicts {predicted}"
+        "bin {bin} of the {run} run in region {region} holds {counts} counts where the model \
+         predicts {predicted}"
     )]
     UnmodelledCounts {
+        region: usize,
         run: &'static str,
         bin: usize,
         counts: f64,

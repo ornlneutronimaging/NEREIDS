@@ -10,7 +10,7 @@ use nereids_physics::resolution::TOF_FACTOR;
 use nereids_physics::transmission::resonance_center_energies;
 use serde::{Deserialize, Serialize};
 
-use crate::counts_fit::{CountsFit, Measurement, Value, fit_counts, quantities};
+use crate::counts_fit::{CountsFit, Material, Measurement, Region, Value, fit_counts, quantities};
 use crate::error::PipelineError;
 use crate::open_beam::{Calibration, PULSE_NUMBERS, Pulse};
 use crate::pipeline::TEMPERATURE_BOUNDS_K;
@@ -157,13 +157,15 @@ pub struct PulseCalibration {
 
 impl PulseCalibration {
     /// The pulse calibrated by fitting the counts of a foil, `measurement`,
-    /// from `provenance`, with `calibration`, and that fit.  Each isotope of
-    /// the foil not known to be absent (`Value::Known(0.0)`) has a measured
-    /// density, and the foil's effective temperature is measured.
+    /// from `provenance`, with `calibration`, and that fit.  The measurement
+    /// is the foil alone, one region holding it.  Each isotope of the foil
+    /// not known to be absent (`Value::Known(0.0)`) has a measured density,
+    /// and the foil's effective temperature is measured.
     ///
     /// # Errors
-    /// [`PipelineError::InvalidParameter`] if a density or the temperature of
-    /// the foil is not measured, as above, an identifier of `provenance` is
+    /// [`PipelineError::InvalidParameter`] if the measurement is not one
+    /// region holding a material, a density or the temperature of the foil is
+    /// not measured, as above, an identifier of `provenance` is
     /// empty or its runs are the same, or `calibration`'s pulse carries a
     /// prior or a pulse number measured or boxed, since a calibration foil is
     /// calibrated alone over the numbers' physical ranges; everything
@@ -253,10 +255,10 @@ impl PulseCalibration {
             fit.fwhm_squared_us2,
         ];
         let line_span_ev = if fitted[first_number..].contains(&true) {
-            let present = measurement
+            let present = foil_material(measurement)?
                 .isotopes
                 .iter()
-                .zip(&fit.densities)
+                .zip(&fit.regions[0].densities)
                 .filter(|(_, density)| **density > 0.0)
                 .map(|((isotope, _), _)| isotope);
             let lines = lines_in_window(
@@ -314,7 +316,7 @@ impl PulseCalibration {
             line_span_ev,
             foil,
             provenance,
-            sample_overdispersion: fit.overdispersion[1],
+            sample_overdispersion: fit.regions[0].overdispersion[1],
             transfer: None,
         })
     }
@@ -762,14 +764,30 @@ fn check_provenance(provenance: &Provenance) -> Result<(), PipelineError> {
     Ok(())
 }
 
+fn foil_material(measurement: &Measurement) -> Result<&Material, PipelineError> {
+    let [
+        Region {
+            material: Some(material),
+            ..
+        },
+    ] = measurement.regions.as_slice()
+    else {
+        return Err(PipelineError::InvalidParameter(
+            "a pulse calibration fits the foil alone, as one region holding it".into(),
+        ));
+    };
+    Ok(material)
+}
+
 fn foil(measurement: &Measurement) -> Result<Foil, PipelineError> {
+    let material = foil_material(measurement)?;
     let unmeasured = |what: &str, value: &Value| {
         Err(PipelineError::InvalidParameter(format!(
             "a calibration foil's {what} is measured, with its stated uncertainty; got {value:?}"
         )))
     };
-    let mut isotopes = Vec::with_capacity(measurement.isotopes.len());
-    for (data, density) in &measurement.isotopes {
+    let mut isotopes = Vec::with_capacity(material.isotopes.len());
+    for (data, density) in &material.isotopes {
         let density = match *density {
             Value::Measured { value, sd } => Stated {
                 value,
@@ -783,8 +801,8 @@ fn foil(measurement: &Measurement) -> Result<Foil, PipelineError> {
             density,
         });
     }
-    let Value::Measured { value, sd } = measurement.temperature_k else {
-        return unmeasured("temperature", &measurement.temperature_k);
+    let Value::Measured { value, sd } = material.temperature_k else {
+        return unmeasured("temperature", &material.temperature_k);
     };
     Ok(Foil {
         isotopes,
@@ -854,6 +872,7 @@ mod tests {
 
     use super::*;
     use crate::beam::BeamSpline;
+    use crate::counts_fit::RegionFit;
 
     type Edit = (&'static str, fn(&mut serde_json::Value));
 
@@ -876,19 +895,27 @@ mod tests {
         let bins = edges.len() - 1;
         Measurement {
             time_edges_us: edges,
-            open_counts: vec![100.0; bins],
-            sample_counts: vec![100.0; bins],
-            open_live: None,
-            sample_live: None,
             charge_ratio: 1.0,
             normalization: Value::Known(1.0),
-            background: [Value::Known(0.0); 3],
-            isotopes: std::iter::once(foil).chain(impurity).collect(),
-            temperature_k: Value::Measured {
-                value: 300.0,
-                sd: 10.0,
-            },
+            regions: vec![Region {
+                open_counts: vec![100.0; bins],
+                sample_counts: vec![100.0; bins],
+                open_live: None,
+                sample_live: None,
+                background: [Value::Known(0.0); 3],
+                material: Some(Material {
+                    isotopes: std::iter::once(foil).chain(impurity).collect(),
+                    temperature_k: Value::Measured {
+                        value: 300.0,
+                        sd: 10.0,
+                    },
+                }),
+            }],
         }
+    }
+
+    fn material(m: &mut Measurement) -> &mut Material {
+        m.regions[0].material.as_mut().expect("the foil")
     }
 
     fn provenance() -> Provenance {
@@ -943,10 +970,16 @@ mod tests {
             },
         };
         CountsFit {
-            densities: vec![2e-3],
-            temperature_k: 300.0,
+            regions: vec![RegionFit {
+                densities: vec![2e-3],
+                temperature_k: Some(300.0),
+                background: [0.0; 3],
+                beam: BeamSpline::constant(200.0, 600.0, 1.0),
+                beam_at_limit: false,
+                predicted: [Vec::new(), Vec::new()],
+                overdispersion: [None; 2],
+            }],
             normalization: 1.0,
-            background: [0.0; 3],
             t0_us: 3.0,
             flight_path_m: 25.0,
             alpha: [0.5, 1.1],
@@ -956,12 +989,8 @@ mod tests {
             covariance: Some(covariance),
             unbounded: Some(unbounded),
             on_bound: vec![false; free],
-            beam: BeamSpline::constant(200.0, 600.0, 1.0),
-            beam_at_limit: false,
             deviance: 0.0,
-            predicted: [Vec::new(), Vec::new()],
             converged: true,
-            overdispersion: [None; 2],
             measured_pulls: None,
             pulse_consistency: None,
             step_us: 0.1,
@@ -973,10 +1002,8 @@ mod tests {
     #[test]
     fn a_calibration_keeps_every_fitted_number_with_its_unbounded_uncertainty() {
         let (m, c) = (measurement(Some(55.0)), calibration(Value::Known(0.01)));
-        let with_impurity = CountsFit {
-            densities: vec![2e-3, 0.0],
-            ..fit(8)
-        };
+        let mut with_impurity = fit(8);
+        with_impurity.regions[0].densities = vec![2e-3, 0.0];
         let experiment = calibrated(&m, &c, with_impurity).unwrap().calibration();
         let pulse = &experiment.pulse;
         assert_eq!(pulse.alpha, [Value::Known(0.5), Value::Fitted(1.1)]);
@@ -1050,7 +1077,7 @@ mod tests {
     fn a_calibration_without_lines_or_with_a_singular_block_is_refused() {
         let c = calibration(Value::Known(0.01));
         let mut beyond = measurement(None);
-        beyond.isotopes[0].0 = synthetic_isotope(73, 181, 100.0, 0.05, 0.06);
+        material(&mut beyond).isotopes[0].0 = synthetic_isotope(73, 181, 100.0, 0.05, 0.06);
         assert!(matches!(
             calibrated(&beyond, &c, fit(8)),
             Err(PipelineError::InvalidParameter(_))
@@ -1073,10 +1100,12 @@ mod tests {
             ..calibration(Value::Known(0.01)).pulse
         };
         let mut m = measurement(Some(55.0));
-        let line =
-            |m: &Measurement| pulse.uncalibrated_line(&m.isotopes, &m.time_edges_us, 3.0, 25.0);
+        let line = |m: &Measurement| {
+            let isotopes = &foil_material(m).expect("the foil").isotopes;
+            pulse.uncalibrated_line(isotopes, &m.time_edges_us, 3.0, 25.0)
+        };
         assert_eq!(line(&m), None);
-        m.isotopes[1].1 = Value::Fitted(1e-4);
+        material(&mut m).isotopes[1].1 = Value::Fitted(1e-4);
         assert_eq!(line(&m), Some(55.0));
     }
 
@@ -1092,7 +1121,7 @@ mod tests {
             .calibration();
         assert_eq!(fitted.pulse.line_span_ev, Some((10.0, 50.0)));
         let mut wider = measurement(Some(55.0));
-        wider.isotopes[1].1 = Value::Fitted(1e-4);
+        material(&mut wider).isotopes[1].1 = Value::Fitted(1e-4);
         match fit_counts(&wider, &fitted) {
             Err(PipelineError::InvalidParameter(message)) => {
                 assert!(message.contains("55 eV, outside the"), "{message}")
@@ -1117,11 +1146,11 @@ mod tests {
     }
 
     fn original() -> PulseCalibration {
-        let fit = CountsFit {
+        let mut fit = CountsFit {
             r: 0.012_537_345_881_063_615,
-            overdispersion: [Some(1.25), Some(1.5)],
             ..fit(8)
         };
+        fit.regions[0].overdispersion = [Some(1.25), Some(1.5)];
         calibrated(
             &measurement(Some(55.0)),
             &calibration(Value::Known(0.01)),
@@ -1245,13 +1274,25 @@ mod tests {
     fn a_foil_whose_density_or_temperature_is_not_measured_is_refused() {
         let c = calibration(Value::Known(0.01));
         let mut fitted = measurement(None);
-        fitted.isotopes[0].1 = Value::Fitted(2e-3);
+        material(&mut fitted).isotopes[0].1 = Value::Fitted(2e-3);
         let mut warm = measurement(None);
-        warm.temperature_k = Value::Fitted(300.0);
+        material(&mut warm).temperature_k = Value::Fitted(300.0);
         for m in [fitted, warm] {
             match PulseCalibration::new(&m, &c, provenance()) {
                 Err(PipelineError::InvalidParameter(message)) => {
                     assert!(message.contains("is measured"), "{message}")
+                }
+                other => panic!("{other:?}"),
+            }
+        }
+        let mut two = measurement(None);
+        two.regions.push(two.regions[0].clone());
+        let mut empty = measurement(None);
+        empty.regions[0].material = None;
+        for m in [two, empty] {
+            match PulseCalibration::new(&m, &c, provenance()) {
+                Err(PipelineError::InvalidParameter(message)) => {
+                    assert!(message.contains("the foil alone"), "{message}")
                 }
                 other => panic!("{other:?}"),
             }
@@ -1423,7 +1464,7 @@ mod tests {
 
     fn other_foil(density: f64) -> Measurement {
         let mut m = measurement(None);
-        m.isotopes[0].1 = Value::Measured {
+        material(&mut m).isotopes[0].1 = Value::Measured {
             value: density,
             sd: 0.01 * density,
         };
