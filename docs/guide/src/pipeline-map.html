@@ -1706,7 +1706,7 @@
         </div>
         <div class="card" style="--cc:var(--api-c)">
           <p class="ch"><span class="cname">Enforcement</span></p>
-          <p class="cline"><span class="clab">oracle / target</span>the acceptance suite runs in CI. Not yet in the code: CI currently runs the tests, and the slow ensembles nightly, but checks neither this contract nor the ratchet.</p>
+          <p class="cline"><span class="clab">oracle / target</span>the acceptance suite runs in CI. CI runs the tests, and the slow ensembles nightly, and fails a pull request that adds a public name — a module, item, method, field, variant or trait item that rustdoc documents for a crate, or a Python stub definition — without changing this page. Not yet in the code: any change to this page passes that check, and a public item behind a cargo feature no workspace member enables, such as the test-support modules, a new trait implementation on an existing type, a changed signature of an existing name, a contract change without a test change, and a widened budget or tolerance are not checked.</p>
           <p class="cline" style="margin-top:.35rem"><span class="clab">budget &amp; rule</span>a contract change without a corresponding test change fails; a public-surface addition without a contract change fails; <b>a test change that widens any budget or tolerance without a contract change fails</b> — every acceptance budget and tolerance is contract material (the ratchet clause generalizes to all rows)</p>
         </div>
       </div>

@@ -35,15 +35,20 @@ DOC_PATH = REPO_ROOT / "docs" / "guide" / "src" / "python-api.md"
 ALLOWLIST_PATH = REPO_ROOT / "scripts" / "python_api_allowlist.txt"
 
 
+def public_definitions(body: list[ast.stmt]) -> list[ast.stmt]:
+    """The ``def`` / ``class`` nodes of a module or class body not prefixed with ``_``."""
+    return [
+        node
+        for node in body
+        if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef))
+        and not node.name.startswith("_")
+    ]
+
+
 def collect_stub_symbols(stub_path: Path) -> set[str]:
     """Return public top-level ``def`` / ``class`` names from the stub."""
     tree = ast.parse(stub_path.read_text(encoding="utf-8"), filename=str(stub_path))
-    names: set[str] = set()
-    for node in tree.body:
-        if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef)):
-            if not node.name.startswith("_"):
-                names.add(node.name)
-    return names
+    return {node.name for node in public_definitions(tree.body)}
 
 
 def collect_documented_symbols(doc_path: Path, candidates: set[str]) -> set[str]:
