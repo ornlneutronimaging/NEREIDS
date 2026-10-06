@@ -12,9 +12,10 @@ Usage: ``python3 scripts/check_public_surface.py BASE`` compares the merge base
 of BASE and HEAD with HEAD.  When a Rust source, a ``Cargo.toml``,
 ``Cargo.lock`` or ``rust-toolchain.toml``, or the stub differs and the map does
 not, it builds the docs of HEAD and then of the base in this checkout, checking
-out the base and then the original commit again, so tracked files must have no
-uncommitted changes; ``target/doc`` then holds the base's docs.  The base is
-built with lints capped at warnings.
+out the base and then the original branch or commit again, so tracked files
+must have no uncommitted changes; ``target/doc`` then holds the base's docs.
+The base is built with lints capped at warnings.  If tracked files change while
+the base is checked out, it stops there and says how to return.
 
 Exit codes:
   0 - no name added, or the map changed too.
@@ -51,12 +52,15 @@ REEXPORT = re.compile(r'id="(reexport\.\w+)"')
 GLOB = re.compile(r"pub use ([\w:]+)::\*;")
 TAG = re.compile(r"<[^>]*>")
 BUILD_INPUTS = ("Cargo.toml", "Cargo.lock", "rust-toolchain.toml")
-TRAIT_IMPLS = re.compile(r'id="(?:trait|synthetic|blanket)-implementations"')
+NOT_OWN = re.compile(
+    r'id="(?:(?:trait|synthetic|blanket)-implementations|foreign-impls|implementors)"'
+)
 REDIRECT = 'http-equiv="refresh"'
 
 
 def doc_names(doc_dir: Path, crates: list[str]) -> set[str]:
-    """``crate::module::Item`` and ``crate::module::Item::member`` for every documented name."""
+    """``crate::module``, ``crate::module::kind.Item``, ``crate::module::kind.Item::kind.member``
+    and ``crate::module::reexport.Name`` for every documented name."""
     names: set[str] = set()
     for crate in crates:
         root = doc_dir / crate
@@ -71,7 +75,7 @@ def doc_names(doc_dir: Path, crates: list[str]) -> set[str]:
             if ITEM_PAGE.fullmatch(rel.name):
                 path = "::".join((*module, rel.name.removesuffix(".html")))
                 names.add(path)
-                own = TRAIT_IMPLS.split(text, maxsplit=1)[0]
+                own = NOT_OWN.split(text, maxsplit=1)[0]
                 names |= {
                     f"{path}::{member}"
                     for member in MEMBER.findall(own)
@@ -80,7 +84,8 @@ def doc_names(doc_dir: Path, crates: list[str]) -> set[str]:
             elif rel.name == "index.html":
                 names.add("::".join(module))
                 names |= {"::".join((*module, name)) for name in REEXPORT.findall(text)}
-                globs = GLOB.findall(TAG.sub("", text))
+                reexports = text.partition('id="reexports"')[2].partition("<h2")[0]
+                globs = GLOB.findall(TAG.sub("", reexports))
                 names |= {"::".join((*module, f"reexport.{glob}::*")) for glob in globs}
     return names
 
@@ -154,7 +159,13 @@ def main(argv: list[str]) -> int:
         try:
             before = checked_out_names(capped)
         finally:
-            run("git", "checkout", "--quiet", "--force", original)
+            edited = run("git", "status", "--porcelain", "--untracked-files=no")
+            if edited.strip():
+                raise RuntimeError(
+                    f"tracked files changed while the base {base[:12]} was checked out, "
+                    f"so the checkout stays there:\n{edited}return with: git checkout {original}"
+                )
+            run("git", "checkout", "--quiet", original)
         added = violations(before, after, changed)
     except Exception as exc:
         detail = getattr(exc, "stderr", None) or exc

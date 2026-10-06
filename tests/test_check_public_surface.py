@@ -14,6 +14,9 @@ import check_public_surface as surface  # noqa: E402
 needs_cargo = pytest.mark.skipif(shutil.which("cargo") is None, reason="needs cargo")
 
 LIB = """\
+//! ```
+//! pub use std::*;
+//! ```
 mod hidden {
     pub fn moved() {}
 }
@@ -61,6 +64,11 @@ pub mod m {
             0.0
         }
     }
+    impl T for f64 {
+        fn predict(&self) -> f64 {
+            *self
+        }
+    }
 }
 """
 
@@ -75,7 +83,7 @@ def write_crate(root: Path, name: str, lib: str, extra: str = "") -> None:
 
 @needs_cargo
 def test_doc_names_read_the_public_surface_from_rustdoc(tmp_path):
-    """Kinds keep same-named items apart; redirects and trait implementations are not names."""
+    """Kinds keep same-named items apart; redirects, trait implementations and doc examples are not names."""
     write_crate(tmp_path / "probe", "probe", LIB)
     subprocess.run(
         ["cargo", "doc", "--no-deps", "--quiet", "--target-dir", str(tmp_path / "target")],
@@ -178,3 +186,23 @@ def test_main_compares_the_base_and_restores_the_checkout(tmp_path, monkeypatch)
     assert check_and_restore("no-such-revision") == 2
     commit(repo / surface.MAP, "map", "map, changed")
     assert check_and_restore("HEAD~3") == 0
+    commit(repo / surface.STUB, "def f(): ...", "def f(): ...\ndef g(): ...")
+    assert check_and_restore("HEAD~1") == 1
+    lib.write_text(lib.read_text() + "// uncommitted\n")
+    assert check_and_restore("HEAD~1") == 2
+    assert lib.read_text().endswith("// uncommitted\n")
+    git("checkout", "--", "crates/c/src/lib.rs")
+
+    commit(lib, "pub fn a()", "pub fn z() {}\npub fn a()")
+    base = git("rev-parse", "HEAD~1")
+    real = surface.checked_out_names
+
+    def edit_during_base(rustdocflags=None):
+        if rustdocflags is not None:
+            (repo / surface.MAP).write_text("edited during the run\n")
+        return real(rustdocflags)
+
+    monkeypatch.setattr(surface, "checked_out_names", edit_during_base)
+    assert surface.main(["check", "HEAD~1"]) == 2
+    assert (repo / surface.MAP).read_text() == "edited during the run\n"
+    assert git("rev-parse", "HEAD") == base
