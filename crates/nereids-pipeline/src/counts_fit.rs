@@ -443,7 +443,7 @@ pub fn fit_counts(
         .collect::<Result<Vec<FitParameter>, PipelineError>>()?;
     let measured: Vec<(usize, f64, f64)> = quantities(measurement, calibration)
         .enumerate()
-        .filter_map(|(offset, value)| match *value {
+        .filter_map(|(offset, (_, value))| match *value {
             Value::Measured { value, sd } => Some((offset, value, sd)),
             _ => None,
         })
@@ -920,16 +920,28 @@ pub fn fit_counts(
 pub(crate) fn quantities<'a>(
     measurement: &'a Measurement,
     calibration: &'a Calibration,
-) -> impl Iterator<Item = &'a Value> {
+) -> impl Iterator<Item = (Role, &'a Value)> {
     let shape = shape(measurement);
     let pulse = &calibration.pulse;
+    let numbers = [
+        &pulse.alpha[0],
+        &pulse.alpha[1],
+        &pulse.beta[0],
+        &pulse.beta[1],
+        &pulse.r,
+        &pulse.fwhm_squared_us2,
+    ];
     roles(&vec![0; shape.len()], &shape)
         .into_iter()
-        .filter_map(move |role| Some(quantity(measurement, role)?.0))
-        .chain([&calibration.t0_us, &calibration.flight_path_m])
-        .chain(&pulse.alpha)
-        .chain(&pulse.beta)
-        .chain([&pulse.r, &pulse.fwhm_squared_us2])
+        .filter_map(move |role| {
+            let value = match role {
+                Role::T0 => &calibration.t0_us,
+                Role::FlightPath => &calibration.flight_path_m,
+                Role::Pulse(number) => numbers[number],
+                _ => quantity(measurement, role)?.0,
+            };
+            Some((role, value))
+        })
 }
 
 fn shape(measurement: &Measurement) -> Vec<Option<usize>> {
@@ -941,7 +953,7 @@ fn shape(measurement: &Measurement) -> Vec<Option<usize>> {
 }
 
 #[derive(Clone, Copy, Debug, PartialEq)]
-enum Role {
+pub(crate) enum Role {
     Beam { region: usize, coefficient: usize },
     Density { region: usize, isotope: usize },
     Temperature { region: usize },

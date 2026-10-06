@@ -326,11 +326,7 @@ pub(crate) fn validate_counts(run: &str, counts: &[f64], bins: usize) -> Result<
             counts.len()
         )));
     }
-    if let Some((bin, count)) = counts
-        .iter()
-        .enumerate()
-        .find(|(_, c)| !(c.is_finite() && **c >= 0.0 && c.fract() == 0.0))
-    {
+    if let Some((bin, count)) = counts.iter().enumerate().find(|(_, c)| !whole(**c)) {
         return Err(PipelineError::InvalidParameter(format!(
             "{run} counts must be whole non-negative numbers, got {count} in bin {bin}"
         )));
@@ -341,6 +337,10 @@ pub(crate) fn validate_counts(run: &str, counts: &[f64], bins: usize) -> Result<
         )));
     }
     Ok(())
+}
+
+pub(crate) fn whole(count: f64) -> bool {
+    count.is_finite() && count >= 0.0 && count.fract() == 0.0
 }
 
 pub(crate) fn validate_live(
