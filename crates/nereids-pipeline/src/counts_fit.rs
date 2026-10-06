@@ -1,11 +1,12 @@
-//! The areal densities of a sample's isotopes, its temperature, the sample
-//! run's normalization and background, the timing offset, the flight path and
-//! the pulse's numbers, fitted to the counts of an open-beam run and a sample
-//! run recorded in the same time bins.
+//! The areal densities and temperatures of the materials in one or more
+//! regions of the detector, each region's background, the sample run's
+//! normalization, the timing offset, the flight path and the pulse's numbers,
+//! fitted to the counts of an open-beam run and a sample run recorded in the
+//! same time bins.
 
 use std::borrow::Cow;
 use std::cell::RefCell;
-use std::ops::RangeInclusive;
+use std::ops::{Range, RangeInclusive};
 use std::sync::Arc;
 
 use nereids_endf::resonance::ResonanceData;
@@ -25,8 +26,8 @@ use rayon::prelude::*;
 use crate::beam::BeamSpline;
 use crate::error::PipelineError;
 use crate::open_beam::{
-    Calibration, PULSE_NUMBERS, Recorded, combined, counted, fit_on_halved_grids, fit_open_beam,
-    laws, overdispersion, validate_counts, validate_live, weights_of,
+    Calibration, OpenBeamFit, PULSE_NUMBERS, Recorded, combined, counted, fit_on_halved_grids,
+    fit_open_beam, laws, overdispersion, validate_counts, validate_live, weights_of,
 };
 use crate::pipeline::TEMPERATURE_BOUNDS_K;
 
@@ -96,11 +97,25 @@ impl Value {
     }
 }
 
-/// An open-beam run and a sample run recorded in the same time bins.
+/// An open-beam run and a sample run recorded in the same time bins, read in
+/// one or more regions of the detector.
 #[derive(Debug, Clone)]
 pub struct Measurement {
     /// Time-bin edges in µs.
     pub time_edges_us: Vec<f64>,
+    /// `c_q`, the sample run's proton charge over the open-beam run's.
+    pub charge_ratio: f64,
+    /// `a`, the normalization of the sample run, positive, the same in every
+    /// region.
+    pub normalization: Value,
+    /// The regions, separate sets of pixels timed by one clock.
+    pub regions: Vec<Region>,
+}
+
+/// The counts of a set of pixels in both runs, its background and the
+/// material the beam crosses there.
+#[derive(Debug, Clone)]
+pub struct Region {
     /// Raw counts of the open-beam run, one per bin.
     pub open_counts: Vec<f64>,
     /// Raw counts of the sample run, one per bin.
@@ -111,34 +126,32 @@ pub struct Measurement {
     /// The fraction of the sample run's neutrons arriving in each bin that the
     /// detector records, in (0, 1]; `None` records every one.
     pub sample_live: Option<Vec<f64>>,
-    /// `c_q`, the sample run's proton charge over the open-beam run's.
-    pub charge_ratio: f64,
-    /// `a`, the normalization of the sample run, positive.
-    pub normalization: Value,
     /// `b0` (dimensionless), `b1` in √eV and `b2` in 1/√eV of the background
     /// `b(E) = b0 + b1/√E + b2·√E`, each any real number.
     pub background: [Value; 3],
-    /// Each isotope in the sample with its areal density in atoms/barn, known,
-    /// fitted or measured, at least 0.
+    /// The material the beam crosses in the region; `None` for nothing, which
+    /// transmits every neutron.
+    pub material: Option<Material>,
+}
+
+/// A material's isotopes and temperature.
+#[derive(Debug, Clone)]
+pub struct Material {
+    /// Each isotope with its areal density in atoms/barn, known, fitted or
+    /// measured, at least 0.
     pub isotopes: Vec<(ResonanceData, Value)>,
-    /// The sample's temperature in K, within 1–5000 K.
+    /// The temperature in K, within 1–5000 K.
     pub temperature_k: Value,
 }
 
-/// The fitted densities, temperature, normalization, background, timing
-/// offset, flight path and pulse numbers.
+/// The fitted quantities of every region, and the normalization, timing
+/// offset, flight path and pulse numbers the regions share.
 #[derive(Debug, Clone)]
 pub struct CountsFit {
-    /// Areal density of each isotope in atoms/barn, in the order given: the
-    /// known one, or the fitted one.
-    pub densities: Vec<f64>,
-    /// The sample's temperature in K: the known one, or the fitted one.
-    pub temperature_k: f64,
+    /// Each region's fitted quantities and counts, in the order given.
+    pub regions: Vec<RegionFit>,
     /// The normalization `a`: the known one, or the fitted one.
     pub normalization: f64,
-    /// `b0` (dimensionless), `b1` in √eV and `b2` in 1/√eV, each the known or
-    /// the fitted one.
-    pub background: [f64; 3],
     /// The timing offset `t0` in µs: the known one, or the fitted one.
     pub t0_us: f64,
     /// The flight path in m: the known one, or the fitted one.
@@ -152,18 +165,19 @@ pub struct CountsFit {
     /// The square of the pulse's triangle FWHM, `h²` in µs²: the known one, or
     /// the fitted one.
     pub fwhm_squared_us2: f64,
-    /// Covariance of the fitted quantities among the densities, in the order
-    /// given, the temperature, the normalization, `b0`, `b1`, `b2`, `t0`, the
-    /// flight path, `α₀`, `α₁`, `β₀`, `β₁`, `R` and `h²`, in that order: the
-    /// inverse of the information at the fit, each run's expected information
-    /// over its overdispersion plus `1/sd²` for each measured quantity and
-    /// `C⁻¹` over the pulse numbers a calibration's
+    /// Covariance of the fitted quantities among, in this order, each region's
+    /// densities, in the order given, and temperature, region by region; the
+    /// normalization; each region's `b0`, `b1` and `b2`, region by region;
+    /// `t0`; the flight path; `α₀`, `α₁`, `β₀`, `β₁`, `R` and `h²`: the inverse
+    /// of the information at the fit, each run's expected information over its
+    /// overdispersion plus `1/sd²` for each measured quantity and `C⁻¹` over
+    /// the pulse numbers a calibration's
     /// [`Pulse::prior`](crate::open_beam::Pulse::prior) covers.  The row and
     /// column of a quantity on one of its bounds, or that neither the counts
     /// nor a measurement determine, are NaN, and the other entries are
     /// conditional on every quantity that ended on a bound being held there;
-    /// every entry is NaN when a fitted temperature ends at 1 K or 5000 K.
-    /// `None` when the fit did not converge.
+    /// every entry is NaN when the fitted temperature of any region ends at
+    /// 1 K or 5000 K.  `None` when the fit did not converge.
     ///
     /// The error bars take every known quantity as exact.
     /// They are not reliable where the counts barely determine a fitted
@@ -178,33 +192,13 @@ pub struct CountsFit {
     /// Whether each fitted quantity, in the covariance's order, ended on one
     /// of its bounds.
     pub on_bound: Vec<bool>,
-    /// The beam per µs, as a function of the arrival time less the starting
-    /// `t0`, fitted to both runs, with the intervals the open-beam fit chose.
-    pub beam: BeamSpline,
-    /// Whether the open-beam fit chose its richest beam; see
-    /// [`OpenBeamFit::at_limit`](crate::open_beam::OpenBeamFit::at_limit).
-    pub beam_at_limit: bool,
     /// Each run's half Poisson deviance over the overdispersion it was
-    /// weighted with, summed over both runs at the fit.
+    /// weighted with, summed over both runs of every region at the fit.
     pub deviance: f64,
-    /// The open-beam and sample counts the fit predicts in each bin at its
-    /// answer, live fractions included, on the grid it accepted: the counts
-    /// `deviance` compares with the measured ones.
-    pub predicted: [Vec<f64>; 2],
-    /// Whether the fitter converged, the sample run's overdispersion settled,
-    /// the grid met its rule at the fitted temperature and its flight times
-    /// cover the fitted `t0`, flight path and pulse.
+    /// Whether the fitter converged, every sample run's overdispersion
+    /// settled, the grid met its rule at the fitted temperatures and its
+    /// flight times cover the fitted `t0`, flight path and pulse.
     pub converged: bool,
-    /// Variance of the counts of the open-beam run, then of the sample run,
-    /// over their Poisson variance: the value each run's counts are divided by
-    /// in the returned fit.  The open-beam run's is the open-beam fit's
-    /// [`OpenBeamFit::overdispersion`](crate::open_beam::OpenBeamFit::overdispersion);
-    /// the sample run's is measured the same way, on the bins the first fit
-    /// predicts at least one count, by the previous fit, and within 1% by the
-    /// returned one when `converged`.  `None` when the run's counts have not
-    /// measured it; the open-beam run is then weighted with 1, and the sample
-    /// run as the open-beam run.
-    pub overdispersion: [Option<f64>; 2],
     /// For each measured quantity, in the covariance's order, its value
     /// without the fit's bounds ([`Self::unbounded`]) less its measurement
     /// over the standard deviation of that difference, `√(sd² − variance)`,
@@ -239,68 +233,116 @@ pub struct CountsFit {
     pub halvings: usize,
 }
 
-/// Fit the areal densities, temperature, normalization and background terms
-/// of `measurement`, and the timing offset, flight path and pulse numbers of
-/// `calibration`, that are not known, to the raw counts of both runs.  On a
-/// uniform grid of flight times `u_i`, energies `E_i` and step `w`, the counts
-/// in bin `k` are
+/// One region's fitted quantities and counts.
+#[derive(Debug, Clone)]
+pub struct RegionFit {
+    /// Areal density of each isotope of the region's material in atoms/barn,
+    /// in the order given: the known one, or the fitted one; empty without a
+    /// material.
+    pub densities: Vec<f64>,
+    /// The material's temperature in K: the known one, or the fitted one;
+    /// `None` without a material.
+    pub temperature_k: Option<f64>,
+    /// `b0` (dimensionless), `b1` in √eV and `b2` in 1/√eV, each the known or
+    /// the fitted one.
+    pub background: [f64; 3],
+    /// The region's beam per µs, as a function of the arrival time less the
+    /// starting `t0`, fitted to both runs, with the intervals the region's
+    /// open-beam fit chose.
+    pub beam: BeamSpline,
+    /// Whether the region's open-beam fit chose its richest beam; see
+    /// [`OpenBeamFit::at_limit`].
+    pub beam_at_limit: bool,
+    /// The open-beam and sample counts the fit predicts in each bin at its
+    /// answer, live fractions included, on the grid it accepted: the counts
+    /// [`CountsFit::deviance`] compares with the measured ones.
+    pub predicted: [Vec<f64>; 2],
+    /// Variance of the counts of the open-beam run, then of the sample run,
+    /// over their Poisson variance: the value each run's counts are divided by
+    /// in the returned fit.  The open-beam run's is the region's open-beam
+    /// fit's [`OpenBeamFit::overdispersion`]; the sample run's is measured the
+    /// same way, on the bins the first fit predicts at least one count, by the
+    /// previous fit, and within 1% by the returned one when the fit converged.
+    /// `None` when the run's counts have not measured it; the open-beam run is
+    /// then weighted with 1, and the sample run as the open-beam run.
+    pub overdispersion: [Option<f64>; 2],
+}
+
+/// Fit the areal densities and temperatures of the regions' materials, each
+/// region's background terms, the normalization, and the timing offset,
+/// flight path and pulse numbers of `calibration`, that are not known, to the
+/// raw counts of both runs in every region.  On a uniform grid of flight
+/// times `u_i`, energies `E_i` and step `w`, the counts of region `r` in bin
+/// `k` are
 ///
 /// ```text
-/// O_k  = ℓ^O_k · w Σ_i φ_i P_ki
-/// S_k  = ℓ^S_k · c_q · a · w Σ_i φ_i [T_i + b(E_i)] P_ki
-/// T_i  = exp(−Σ_m n_m σ_m(E_i))
-/// b(E) = b0 + b1/√E + b2·√E
+/// O_rk   = ℓ^O_rk · w Σ_i φ_ri P_ki
+/// S_rk   = ℓ^S_rk · c_q · a · w Σ_i φ_ri [T_ri + b_r(E_i)] P_ki
+/// T_ri   = exp(−Σ_m n_rm σ_m(E_i; T_r)), or 1 without a material
+/// b_r(E) = b0_r + b1_r/√E + b2_r·√E
 /// ```
 ///
-/// with `φ_i` the beam per µs, `P_ki` the chance of a neutron at `u_i`
-/// arriving in bin `k`, `n_m` and `σ_m` each isotope's density and
-/// Doppler-broadened total cross section, `c_q` the charge ratio, `a` the
-/// normalization and `ℓ^O_k`, `ℓ^S_k` each run's live fraction.  The
-/// background is beam neutrons that reach the detector another way, so it
-/// passes through the pulse and scales with the normalization; SAMMY's
-/// `BackA`, `BackB`, `BackC` (`cro/mnrm1.f90`) are `a·b0`, `a·b1`, `a·b2`, to
-/// within the background's change over the pulse's delay.  SAMMY's
-/// `BackD·exp(−BackF/√E)` term, and counts that bypass the pulse, such as
-/// gammas, are not modelled.  The beam `φ` has the intervals
-/// [`fit_open_beam`] chooses and is fitted with the rest to both runs,
-/// starting from the open-beam fit.
+/// with `φ_r` the region's beam per µs, `P_ki` the chance of a neutron at
+/// `u_i` arriving in bin `k`, `n_rm` and `σ_m` each isotope's density and
+/// total cross section Doppler-broadened at the material's temperature `T_r`,
+/// `c_q` the charge ratio, `a` the normalization and `ℓ^O_rk`, `ℓ^S_rk` each
+/// run's live fraction.  The background is beam neutrons that reach the
+/// detector another way, so it passes through the pulse and scales with the
+/// normalization; SAMMY's `BackA`, `BackB`, `BackC` (`cro/mnrm1.f90`) are
+/// `a·b0`, `a·b1`, `a·b2`, to within the background's change over the pulse's
+/// delay.  SAMMY's `BackD·exp(−BackF/√E)` term, and counts that bypass the
+/// pulse, such as gammas, are not modelled.
+///
+/// The regions share the normalization, the run pair's scale; and `t0`, the
+/// flight path and the pulse, which one clock, flight path and moderator set
+/// for every pixel, and with them the grid and `P_ki`.  Each region has its
+/// own beam, from its own open-beam counts, with the intervals its
+/// [`fit_open_beam`] chooses, fitted with the rest to both runs; and its own
+/// background, which depends on what surrounds its pixels.  A region without
+/// a material counts `a·(1 + b_r)` of its beam in the sample run, so it pins
+/// the normalization when its background is known, as zero in the
+/// open-region normalization of imaging, and nothing about it when its
+/// background is fitted.  The regions must be separate pixels: the
+/// covariance takes every bin as independent.
 ///
 /// The [`Calibration`]'s `t0` and flight path `L` are fitted unless known.
 /// The grid is built at a `t0₀` and `L₀`, at first the starting ones.  Grid
 /// point `i` keeps its energy and arrives at `t0 + (L/L₀)·u_i`, with `u_i`
 /// its flight time at `t0₀` and `L₀`, standing for `(L/L₀)·w` of flight time;
-/// the beam is a function of the arrival time less the starting `t0`.  This
+/// the beams are functions of the arrival time less the starting `t0`.  This
 /// is SAMMY's energy scale: its `Tzero` is `t0`, and its `Elzero` times its
 /// flight path is `L` (`dat/mdat0.f90`, `Mtzero`).
 ///
 /// The pulse's numbers are fitted unless known, each point's `P_ki` taken at
 /// the pulse's laws at its energy `E_i`.  A trial pulse whose `α` or `β` is 0
 /// at some energy is outside the model and rejected; a fit driven there ends
-/// unconverged.  The open-beam fit that starts the beam and weights the open
-/// run uses the starting pulse.
+/// unconverged.  The open-beam fits that start the beams and weight the
+/// open-beam runs use the starting pulse.
 ///
 /// The grid's first step is at most half the narrowest Doppler full width at
-/// half maximum, in flight time, of any resonance inside its energy span, at
-/// the starting temperature; it is then halved until the counts of both runs
-/// meet [`BOUND`](crate::open_beam::BOUND).  The step is uniform, so a wide
-/// window whose span holds a narrow resonance at high energy, or a low fitted
-/// temperature, can exceed the grid's point cap; a temperature the counts
-/// barely determine can run to 1 K and refuse the fit that way.
+/// half maximum, in flight time, of any resonance of any region inside its
+/// energy span, at that region's starting temperature; it is then halved
+/// until the counts of every run of every region, together, meet
+/// [`BOUND`](crate::open_beam::BOUND).  The step is uniform and shared, so a
+/// wide window whose span holds a narrow resonance at high energy, or a low
+/// fitted temperature in any region, can exceed the grid's point cap; a
+/// temperature a region's counts barely determine can run to 1 K and refuse
+/// the fit that way.
 ///
 /// The fit minimizes each run's half Poisson deviance over its
 /// overdispersion, plus `½((x − value)/sd)²` for each [`Value::Measured`]
 /// quantity `x`, and `½(θ − m)ᵀC⁻¹(θ − m)` over the pulse numbers `θ` a
 /// calibration's [`Pulse::prior`](crate::open_beam::Pulse::prior) covers,
 /// with `m` and `C` that prior's mean, which may lie past a number's bound,
-/// and covariance.  The open-beam run is weighted with the open-beam fit's
-/// overdispersion, and the sample run first with the same.  The fit is
-/// repeated from its answer while the sample run's overdispersion, measured on
-/// the bins the first fit predicts at least one count, changes by more than
-/// 1%, the coarser grid of the accepted pair is wider than the rule at the
-/// fitted temperature, or its flight times miss some that the fitted `t0`,
-/// `L` and pulse need.  The next first grid is the
+/// and covariance.  Each region's open-beam run is weighted with its
+/// open-beam fit's overdispersion, and its sample run first with the same.
+/// The fit is repeated from its answer while any sample run's
+/// overdispersion, measured on the bins the first fit predicts at least one
+/// count, changes by more than 1%, the coarser grid of the accepted pair is
+/// wider than the rule at the fitted temperatures, or its flight times miss
+/// some that the fitted `t0`, `L` and pulse need.  The next first grid is the
 /// finer of that pair's coarser grid and the rule's grid at the fitted
-/// temperature, or, when the flight times miss, the rule's grid of a grid
+/// temperatures, or, when the flight times miss, the rule's grid of a grid
 /// built at the fitted `t0`, `L` and pulse.  After twenty fits it is reported
 /// unconverged.
 ///
@@ -312,56 +354,93 @@ pub struct CountsFit {
 /// unconverged; with `b1` and `b2` known, `b0` bounded below by 0 ends on
 /// that bound, converged.
 ///
-/// The covariance assumes each run's bins are independent.
-///
 /// # Errors
-/// [`PipelineError::ShapeMismatch`] unless each run has one count, and one
-/// live fraction when given, per bin;
+/// [`PipelineError::ShapeMismatch`] unless each run of each region has one
+/// count, and one live fraction when given, per bin;
 /// [`PipelineError::InvalidParameter`] if a count is not a whole non-negative
 /// number, a run has no counts, a live fraction is not in (0, 1], the charge
 /// ratio is not finite and positive, a known, starting or measured value is
 /// not finite and in its quantity's range, a measured value's sd is not finite
 /// and positive, bounds are not `lower < upper` in that range
 /// with the start between them, the pulse's calibration covers a number that
-/// is not fitted or is measured, an isotope of the sample not known to be
-/// absent has a resonance between the energies of its last and first time
-/// edges, at the starting `t0` and flight path or a converged fit's, outside the
-/// pulse's [`line_span_ev`](crate::open_beam::Pulse::line_span_ev), there are no isotopes, an
-/// isotope is listed twice, an isotope's resonance data are not finite, or the
-/// energies its
-/// broadened cross section reads on the grid at the starting `t0`, flight path
-/// and pulse, or at the fitted ones of any pass that rebuilds it, at the known
-/// temperature or at the upper bound of a fitted one, down to zero for a
-/// window within the thermal
-/// spread of zero energy, are not inside a single one of its evaluated
-/// (SLBW, MLBW or Reich–Moore) resolved ranges;
+/// is not fitted or is measured, no region holds a material, a material has
+/// no isotopes or lists one twice, an isotope's resonance data are not
+/// finite, an isotope not known to be absent has a resonance between the
+/// energies of the last and first time edges, at the starting `t0` and flight
+/// path or a converged fit's, outside the pulse's
+/// [`line_span_ev`](crate::open_beam::Pulse::line_span_ev), or the energies
+/// its broadened cross section reads on the grid at the starting `t0`, flight
+/// path and pulse, or at the fitted ones of any pass that rebuilds it, at the
+/// region's known temperature or at the upper bound of a fitted one, down to
+/// zero for a window within the thermal spread of zero energy, are not inside
+/// a single one of its evaluated (SLBW, MLBW or Reich–Moore) resolved ranges;
 /// [`PipelineError::UnmodelledCounts`] if at the fit, converged or not, a bin
 /// is predicted negative or non-finite counts, or holds counts predicted below
 /// [`NEGLIGIBLE_PREDICTION`]: starting or known values the fitter cannot
 /// leave;
-/// everything [`fit_open_beam`] refuses; [`PipelineError::FlightTimeGrid`]
-/// for the grid's refusals at the starting `t0`, flight path and pulse or the
-/// fitted ones of any pass, including more points than it allows;
-/// [`PipelineError::Fitting`] if the fitter fails, the cross sections fail at
-/// the start, or a decomposition of the pulse's consistency test fails; a
-/// failure at a trial temperature is a rejected step.
+/// everything [`fit_open_beam`] refuses for any region;
+/// [`PipelineError::FlightTimeGrid`] for the grid's refusals at the starting
+/// `t0`, flight path and pulse or the fitted ones of any pass, including more
+/// points than it allows; [`PipelineError::Fitting`] if the fitter fails, the
+/// cross sections fail at the start, or a decomposition of the pulse's
+/// consistency test fails; a failure at a trial temperature is a rejected
+/// step.
 pub fn fit_counts(
     measurement: &Measurement,
     calibration: &Calibration,
 ) -> Result<CountsFit, PipelineError> {
     let Measurement {
         time_edges_us,
-        open_counts,
-        sample_counts,
-        open_live,
-        sample_live,
         charge_ratio,
-        normalization,
-        background,
-        isotopes,
-        temperature_k,
+        regions,
+        ..
     } = measurement;
     let invalid = |message: String| Err(PipelineError::InvalidParameter(message));
+    let materials = || {
+        regions
+            .iter()
+            .enumerate()
+            .filter_map(|(r, region)| Some((r, region.material.as_ref()?)))
+    };
+    if materials().next().is_none() {
+        return invalid("no region of the measurement holds a material to fit".into());
+    }
+    if !(charge_ratio.is_finite() && *charge_ratio > 0.0) {
+        return invalid(format!(
+            "the charge ratio must be finite and positive, got {charge_ratio}"
+        ));
+    }
+    for (r, material) in materials() {
+        if material.isotopes.is_empty() {
+            return invalid(format!("the material of region {r} has no isotopes"));
+        }
+        for (i, (isotope, _)) in material.isotopes.iter().enumerate() {
+            if material.isotopes[..i]
+                .iter()
+                .any(|(other, _)| other.za == isotope.za)
+            {
+                return invalid(format!(
+                    "{} is listed twice in region {r}; its densities cannot be told apart",
+                    isotope.isotope
+                ));
+            }
+            if !finite(isotope) {
+                return invalid(format!(
+                    "the resonance data of {} are not finite",
+                    isotope.isotope
+                ));
+            }
+        }
+    }
+    let shape = shape(measurement);
+    let quantity_roles = roles(&vec![0; regions.len()], &shape);
+    let sample_parameters = quantity_roles
+        .iter()
+        .filter_map(|&role| {
+            let (value, name, range, allowed) = quantity(measurement, role)?;
+            Some(value.parameter(name, range, &allowed))
+        })
+        .collect::<Result<Vec<FitParameter>, PipelineError>>()?;
     let measured: Vec<(usize, f64, f64)> = quantities(measurement, calibration)
         .enumerate()
         .filter_map(|(offset, value)| match *value {
@@ -369,63 +448,32 @@ pub fn fit_counts(
             _ => None,
         })
         .collect();
-    if !(charge_ratio.is_finite() && *charge_ratio > 0.0) {
-        return invalid(format!(
-            "the charge ratio must be finite and positive, got {charge_ratio}"
-        ));
-    }
-    let normalization = normalization.parameter(
-        "normalization",
-        f64::MIN_POSITIVE..=f64::INFINITY,
-        "positive",
-    )?;
-    let background = ["b0", "b1", "b2"]
-        .into_iter()
-        .zip(background)
-        .map(|(name, term)| term.parameter(name, f64::NEG_INFINITY..=f64::INFINITY, "of any sign"))
-        .collect::<Result<Vec<FitParameter>, PipelineError>>()?;
-    if isotopes.is_empty() {
-        return invalid("the sample has no isotopes".into());
-    }
-    let (t_low, t_high) = TEMPERATURE_BOUNDS_K;
-    let temperature = temperature_k.parameter(
-        "temperature",
-        t_low..=t_high,
-        &format!("within {t_low}–{t_high} K"),
-    )?;
-    let reach_k = if temperature.fixed {
-        temperature.value
-    } else {
-        temperature.upper
-    };
-    let mut dopplers = Vec::with_capacity(isotopes.len());
-    let mut densities = Vec::with_capacity(isotopes.len());
-    for (i, (isotope, density)) in isotopes.iter().enumerate() {
-        if isotopes[..i]
-            .iter()
-            .any(|(other, _)| other.za == isotope.za)
-        {
-            return invalid(format!(
-                "{} is listed twice; its densities cannot be told apart",
-                isotope.isotope
-            ));
-        }
-        densities.push(density.parameter(
-            format!("density of {}", isotope.isotope),
-            0.0..=f64::INFINITY,
-            "0 or more",
-        )?);
-        if !finite(isotope) {
-            return invalid(format!(
-                "the resonance data of {} are not finite",
-                isotope.isotope
-            ));
-        }
-        dopplers.push(
-            DopplerParams::new(reach_k, isotope.awr)
-                .map_err(|e| PipelineError::InvalidParameter(e.to_string()))?,
-        );
-    }
+    let lines: Vec<Lines<'_>> = materials()
+        .map(|(region, material)| {
+            let temperature = &sample_parameters[quantity_roles
+                .iter()
+                .position(|&role| role == Role::Temperature { region })
+                .expect("a material has a temperature")];
+            let reach_k = if temperature.fixed {
+                temperature.value
+            } else {
+                temperature.upper
+            };
+            let dopplers = material
+                .isotopes
+                .iter()
+                .map(|(isotope, _)| {
+                    DopplerParams::new(reach_k, isotope.awr)
+                        .map_err(|e| PipelineError::InvalidParameter(e.to_string()))
+                })
+                .collect::<Result<Vec<_>, _>>()?;
+            Ok(Lines {
+                region,
+                isotopes: &material.isotopes,
+                dopplers,
+            })
+        })
+        .collect::<Result<_, PipelineError>>()?;
     let instrument = calibration.instrument()?;
     let pulse = &calibration.pulse;
     let numbers = [
@@ -457,104 +505,121 @@ pub fn fit_counts(
         &calibration.pulse.at(&start[2..])?,
     )?;
     let bins = time_edges_us.len() - 1;
-    validate_counts("open-beam", open_counts, bins)?;
-    validate_counts("sample", sample_counts, bins)?;
-    let open_live = validate_live("open-beam", open_live.as_deref(), bins)?;
-    let sample_live = validate_live("sample", sample_live.as_deref(), bins)?;
+    let mut live = Vec::with_capacity(2 * regions.len() * bins);
+    for (r, region) in regions.iter().enumerate() {
+        let checked = || -> Result<[Vec<f64>; 2], PipelineError> {
+            validate_counts("open-beam", &region.open_counts, bins)?;
+            validate_counts("sample", &region.sample_counts, bins)?;
+            Ok([
+                validate_live("open-beam", region.open_live.as_deref(), bins)?,
+                validate_live("sample", region.sample_live.as_deref(), bins)?,
+            ])
+        };
+        live.extend(checked().map_err(|e| in_region(r, e))?.concat());
+    }
     let calibrated_lines = |t0_us: f64, flight_path_m: f64| -> Result<(), PipelineError> {
-        match pulse.line_span_ev.zip(pulse.uncalibrated_line(
-            isotopes,
-            time_edges_us,
-            t0_us,
-            flight_path_m,
-        )) {
-            Some(((low, high), line)) => Err(PipelineError::InvalidParameter(format!(
-                "the sample has a resonance at {line} eV, outside the {low}–{high} eV of the \
-                 resonances the pulse was calibrated on"
-            ))),
-            None => Ok(()),
+        for lines in &lines {
+            if let Some(((low, high), line)) = pulse.line_span_ev.zip(pulse.uncalibrated_line(
+                lines.isotopes,
+                time_edges_us,
+                t0_us,
+                flight_path_m,
+            )) {
+                return Err(PipelineError::InvalidParameter(format!(
+                    "region {} has a resonance at {line} eV, outside the {low}–{high} eV of the \
+                     resonances the pulse was calibrated on",
+                    lines.region
+                )));
+            }
         }
+        Ok(())
     };
     calibrated_lines(start[0], start[1])?;
 
-    let in_span = |grid: &FlightTimeGrid| -> Result<Vec<Vec<f64>>, PipelineError> {
+    let in_span = |grid: &FlightTimeGrid| -> Result<Vec<Vec<Vec<f64>>>, PipelineError> {
         let energies = grid.energies_ev();
         let span_ev = (energies[energies.len() - 1], energies[0]);
-        let mut resonances_in_span = Vec::with_capacity(isotopes.len());
-        for ((isotope, _), doppler) in isotopes.iter().zip(&dopplers) {
-            let read = (
-                (span_ev.0.sqrt() - SUPPORT_X * doppler.u())
-                    .max(0.0)
-                    .powi(2),
-                (span_ev.1.sqrt() + SUPPORT_X * doppler.u()).powi(2),
-            );
-            if !isotope.ranges.iter().any(|range| {
-                range.is_evaluable() && range.energy_low <= read.0 && read.1 <= range.energy_high
-            }) {
-                return Err(PipelineError::InvalidParameter(format!(
-                    "the Doppler-broadened cross section of {} reads {:.6e}–{:.6e} eV, which no \
-                     single one of its evaluated (SLBW, MLBW or Reich–Moore) resolved ranges holds",
-                    isotope.isotope, read.0, read.1
-                )));
-            }
-            resonances_in_span.push(
-                resonance_center_energies(&[isotope])
-                    .into_iter()
-                    .filter(|e| (span_ev.0..=span_ev.1).contains(e))
-                    .collect::<Vec<f64>>(),
-            );
-        }
-        Ok(resonances_in_span)
+        lines
+            .iter()
+            .map(|lines| {
+                lines
+                    .isotopes
+                    .iter()
+                    .zip(&lines.dopplers)
+                    .map(|((isotope, _), doppler)| {
+                        let read = (
+                            (span_ev.0.sqrt() - SUPPORT_X * doppler.u())
+                                .max(0.0)
+                                .powi(2),
+                            (span_ev.1.sqrt() + SUPPORT_X * doppler.u()).powi(2),
+                        );
+                        if !isotope.ranges.iter().any(|range| {
+                            range.is_evaluable()
+                                && range.energy_low <= read.0
+                                && read.1 <= range.energy_high
+                        }) {
+                            return Err(PipelineError::InvalidParameter(format!(
+                                "the Doppler-broadened cross section of {} in region {} reads \
+                                 {:.6e}–{:.6e} eV, which no single one of its evaluated (SLBW, \
+                                 MLBW or Reich–Moore) resolved ranges holds",
+                                isotope.isotope, lines.region, read.0, read.1
+                            )));
+                        }
+                        Ok(resonance_center_energies(&[isotope])
+                            .into_iter()
+                            .filter(|e| (span_ev.0..=span_ev.1).contains(e))
+                            .collect())
+                    })
+                    .collect()
+            })
+            .collect()
     };
     let mut resonances_in_span = in_span(&base)?;
-    let half_maximum = 2.0 * std::f64::consts::LN_2.sqrt();
-    let narrowest_us = |grid: &FlightTimeGrid,
-                        resonances_in_span: &[Vec<f64>],
-                        temperature_k: f64|
-     -> Result<f64, PipelineError> {
-        let clock = TOF_FACTOR * grid.flight_path_m();
-        let mut narrowest = f64::INFINITY;
-        for ((isotope, _), energies) in isotopes.iter().zip(resonances_in_span) {
-            let doppler = DopplerParams::new(temperature_k, isotope.awr)
-                .map_err(|e| PipelineError::InvalidParameter(e.to_string()))?;
-            for &energy in energies {
-                let width_ev = half_maximum * doppler.doppler_width(energy);
-                narrowest = narrowest.min(clock / energy.sqrt() * width_ev / (2.0 * energy));
-            }
-        }
-        Ok(narrowest)
-    };
-    let first_grid = |grid: &FlightTimeGrid,
-                      resonances_in_span: &[Vec<f64>],
-                      temperature_k: f64|
-     -> Result<(Arc<FlightTimeGrid>, usize), PipelineError> {
-        let rule_us = 0.5 * narrowest_us(grid, resonances_in_span, temperature_k)?;
-        let mut first = grid.clone();
-        let mut halvings = 0;
-        while first.step_us() > rule_us {
-            first = first.halved()?;
-            halvings += 1;
-        }
-        Ok((Arc::new(first), halvings))
-    };
 
-    let open = fit_open_beam(time_edges_us, open_counts, calibration, Some(&open_live))?;
-    let layout = Layout::new(open.beam.coefficients().len(), isotopes.len());
+    let opens = regions
+        .iter()
+        .enumerate()
+        .map(|(r, region)| {
+            fit_open_beam(
+                time_edges_us,
+                &region.open_counts,
+                calibration,
+                Some(&live[2 * r * bins..(2 * r + 1) * bins]),
+            )
+            .map_err(|e| in_region(r, e))
+        })
+        .collect::<Result<Vec<OpenBeamFit>, PipelineError>>()?;
+    let beams: Vec<BeamSpline> = opens.iter().map(|open| open.beam.clone()).collect();
+    let sizes: Vec<usize> = beams.iter().map(|beam| beam.coefficients().len()).collect();
+    let layout = Arc::new(Layout::new(roles(&sizes, &shape), regions.len()));
     let mut parameters = ParameterSet::new(
-        open.beam
-            .coefficients()
+        beams
             .iter()
             .enumerate()
-            .map(|(i, &c)| FitParameter::unbounded(format!("beam {i}"), c))
-            .chain(densities)
-            .chain([temperature, normalization])
-            .chain(background)
+            .flat_map(|(r, beam)| {
+                beam.coefficients().iter().enumerate().map(move |(i, &c)| {
+                    FitParameter::unbounded(format!("beam {i} of region {r}"), c)
+                })
+            })
+            .chain(sample_parameters)
             .chain(instrument)
             .collect(),
     );
-    let resonances: Arc<[ResonanceData]> = isotopes.iter().map(|(data, _)| data.clone()).collect();
-    let observed: Vec<f64> = open_counts.iter().chain(sample_counts).copied().collect();
-    let live: Vec<f64> = open_live.into_iter().chain(sample_live).collect();
+    let resonances: Vec<Arc<[ResonanceData]>> = regions
+        .iter()
+        .map(|region| {
+            region
+                .material
+                .iter()
+                .flat_map(|material| material.isotopes.iter().map(|(data, _)| data.clone()))
+                .collect()
+        })
+        .collect();
+    let observed: Vec<f64> = regions
+        .iter()
+        .flat_map(|region| region.open_counts.iter().chain(&region.sample_counts))
+        .copied()
+        .collect();
     let calibrated_parameters: Vec<usize> = pulse
         .prior
         .iter()
@@ -567,19 +632,54 @@ pub fn fit_counts(
         .transpose()?;
     let priors: Vec<Prior> = measured
         .iter()
-        .map(|&(offset, mean, sd)| Prior::measured(layout.densities + offset, mean, sd))
+        .map(|&(offset, mean, sd)| Prior::measured(layout.quantities + offset, mean, sd))
         .chain(pulse_prior.clone())
         .collect();
-    let mut first = first_grid(
-        &base,
-        &resonances_in_span,
-        parameters.params[layout.temperature].value,
-    )?;
-    let mut weights = [open.overdispersion.unwrap_or(1.0); 2];
-    let mut sample_measured = false;
-    let mut noise_bins = None;
+    let half_maximum = 2.0 * std::f64::consts::LN_2.sqrt();
+    let narrowest_us = |grid: &FlightTimeGrid,
+                        resonances_in_span: &[Vec<Vec<f64>>],
+                        params: &[f64]|
+     -> Result<f64, PipelineError> {
+        let clock = TOF_FACTOR * grid.flight_path_m();
+        let mut narrowest = f64::INFINITY;
+        for (lines, energies) in lines.iter().zip(resonances_in_span) {
+            let temperature_k = params[layout.regions[lines.region]
+                .temperature
+                .expect("a material has a temperature")];
+            for ((isotope, _), energies) in lines.isotopes.iter().zip(energies) {
+                let doppler = DopplerParams::new(temperature_k, isotope.awr)
+                    .map_err(|e| PipelineError::InvalidParameter(e.to_string()))?;
+                for &energy in energies {
+                    let width_ev = half_maximum * doppler.doppler_width(energy);
+                    narrowest = narrowest.min(clock / energy.sqrt() * width_ev / (2.0 * energy));
+                }
+            }
+        }
+        Ok(narrowest)
+    };
+    let first_grid = |grid: &FlightTimeGrid,
+                      resonances_in_span: &[Vec<Vec<f64>>],
+                      params: &[f64]|
+     -> Result<(Arc<FlightTimeGrid>, usize), PipelineError> {
+        let rule_us = 0.5 * narrowest_us(grid, resonances_in_span, params)?;
+        let mut first = grid.clone();
+        let mut halvings = 0;
+        while first.step_us() > rule_us {
+            first = first.halved()?;
+            halvings += 1;
+        }
+        Ok((Arc::new(first), halvings))
+    };
+    let starting: Vec<f64> = parameters.params.iter().map(|p| p.value).collect();
+    let mut first = first_grid(&base, &resonances_in_span, &starting)?;
+    let mut weights: Vec<f64> = opens
+        .iter()
+        .flat_map(|open| [open.overdispersion.unwrap_or(1.0); 2])
+        .collect();
+    let mut sample_measured = vec![false; regions.len()];
+    let mut noise_bins: Option<Vec<Vec<usize>>> = None;
     let mut passes = 0;
-    let (fit, rule_halvings, overdispersion, settled) = loop {
+    let (fit, rule_halvings, overdispersions, settled) = loop {
         passes += 1;
         let dispersion: Vec<f64> = (0..observed.len()).map(|k| weights[k / bins]).collect();
         let fit = fit_on_halved_grids(
@@ -590,12 +690,13 @@ pub fn fit_counts(
             &priors,
             |grid| {
                 Ok(Recorded {
-                    model: TwoRunModel::new(
+                    model: RegionsModel::new(
                         grid,
-                        &open.beam,
+                        &beams,
                         &resonances,
                         *charge_ratio,
                         beam_origin_us,
+                        &layout,
                     ),
                     live: &live,
                 })
@@ -609,13 +710,28 @@ pub fn fit_counts(
             },
         )?;
         let fitted = |index: usize| fit.result.params[index];
-        let fitted_k = fitted(layout.temperature);
-        let noise_bins = noise_bins.get_or_insert_with(|| counted(&fit, bins..2 * bins));
-        let sample = overdispersion(&observed, &fit, noise_bins);
-        let next = sample.unwrap_or(weights[0]);
-        let settled = (next / weights[1] - 1.0).abs() <= SETTLED_OVERDISPERSION;
-        let resolved =
-            2.0 * fit.step_us <= 0.5 * narrowest_us(&base, &resonances_in_span, fitted_k)?;
+        let noise_bins = noise_bins.get_or_insert_with(|| {
+            (0..regions.len())
+                .map(|r| counted(&fit, (2 * r + 1) * bins..(2 * r + 2) * bins))
+                .collect()
+        });
+        let samples: Vec<Option<f64>> = noise_bins
+            .iter()
+            .map(|counted| overdispersion(&observed, &fit, counted))
+            .collect();
+        let next: Vec<f64> = samples
+            .iter()
+            .enumerate()
+            .map(|(r, sample)| sample.unwrap_or(weights[2 * r]))
+            .collect();
+        let each_settled: Vec<bool> = next
+            .iter()
+            .enumerate()
+            .map(|(r, next)| (next / weights[2 * r + 1] - 1.0).abs() <= SETTLED_OVERDISPERSION)
+            .collect();
+        let settled = each_settled.iter().all(|&s| s);
+        let resolved = 2.0 * fit.step_us
+            <= 0.5 * narrowest_us(&base, &resonances_in_span, &fit.result.params)?;
         let covered = fit.converged
             && fit.coarse.covers(
                 fitted(layout.t0),
@@ -623,18 +739,26 @@ pub fn fit_counts(
                 &laws(&fit.result.params[layout.pulse..]),
             )?;
         if !fit.converged || (settled && resolved && covered) || passes == MOST_PASSES {
-            let weighted = [
-                open.overdispersion,
-                (sample_measured || (settled && sample.is_some())).then_some(weights[1]),
-            ];
+            let weighted: Vec<[Option<f64>; 2]> = (0..regions.len())
+                .map(|r| {
+                    [
+                        opens[r].overdispersion,
+                        (sample_measured[r] || (each_settled[r] && samples[r].is_some()))
+                            .then_some(weights[2 * r + 1]),
+                    ]
+                })
+                .collect();
             break (fit, first.1, weighted, settled && resolved && covered);
         }
         if covered {
             let resumed = (Arc::clone(&fit.coarse), first.1 + fit.halvings - 1);
-            first = [first_grid(&base, &resonances_in_span, fitted_k)?, resumed]
-                .into_iter()
-                .min_by(|a, b| a.0.step_us().total_cmp(&b.0.step_us()))
-                .expect("two grids");
+            first = [
+                first_grid(&base, &resonances_in_span, &fit.result.params)?,
+                resumed,
+            ]
+            .into_iter()
+            .min_by(|a, b| a.0.step_us().total_cmp(&b.0.step_us()))
+            .expect("two grids");
         } else {
             base = FlightTimeGrid::new(
                 time_edges_us,
@@ -643,10 +767,12 @@ pub fn fit_counts(
                 &calibration.pulse.at(&fit.result.params[layout.pulse..])?,
             )?;
             resonances_in_span = in_span(&base)?;
-            first = first_grid(&base, &resonances_in_span, fitted_k)?;
+            first = first_grid(&base, &resonances_in_span, &fit.result.params)?;
         }
-        weights[1] = next;
-        sample_measured = sample.is_some();
+        for (r, sample) in samples.iter().enumerate() {
+            weights[2 * r + 1] = next[r];
+            sample_measured[r] = sample.is_some();
+        }
     };
     let converged = fit.converged && settled;
     if converged {
@@ -665,20 +791,24 @@ pub fn fit_counts(
                 !mu.is_finite() || **mu < 0.0 || (**y > 0.0 && **mu < NEGLIGIBLE_PREDICTION)
             })
     {
-        let run = if k < bins { "open-beam" } else { "sample" };
         return Err(PipelineError::UnmodelledCounts {
-            run,
+            region: k / (2 * bins),
+            run: ["open-beam", "sample"][(k / bins) % 2],
             bin: k % bins,
             counts,
             predicted,
         });
     }
 
+    let (t_low, t_high) = TEMPERATURE_BOUNDS_K;
     let free = parameters.free_indices();
-    let on_edge = free.contains(&layout.temperature)
-        && [t_low, t_high].contains(&fit.result.params[layout.temperature]);
+    let on_edge = layout
+        .regions
+        .iter()
+        .filter_map(|region| region.temperature)
+        .any(|t| free.contains(&t) && [t_low, t_high].contains(&fit.result.params[t]));
     let sample_quantities: Vec<usize> = (0..free.len())
-        .filter(|&p| free[p] >= layout.densities)
+        .filter(|&p| free[p] >= layout.quantities)
         .collect();
     let block = |full: &FlatMatrix| {
         let size = sample_quantities.len();
@@ -740,16 +870,33 @@ pub fn fit_counts(
         measured
             .iter()
             .map(|&(offset, mean, sd)| {
-                let a = position(layout.densities + offset);
+                let a = position(layout.quantities + offset);
                 (unbounded.mean[a] - mean) / (sd * sd - unbounded.covariance.get(a, a)).sqrt()
             })
             .collect()
     });
+    let region_fits = layout
+        .regions
+        .iter()
+        .zip(&opens)
+        .zip(overdispersions)
+        .enumerate()
+        .map(|(r, ((place, open), overdispersion))| RegionFit {
+            densities: params[place.densities.clone()].to_vec(),
+            temperature_k: place.temperature.map(|t| params[t]),
+            background: [0, 1, 2].map(|i| params[place.background + i]),
+            beam: open.beam.with_coefficients(&params[place.beam.clone()]),
+            beam_at_limit: open.at_limit,
+            predicted: [
+                fit.predicted[2 * r * bins..(2 * r + 1) * bins].to_vec(),
+                fit.predicted[(2 * r + 1) * bins..(2 * r + 2) * bins].to_vec(),
+            ],
+            overdispersion,
+        })
+        .collect();
     Ok(CountsFit {
-        densities: params[layout.densities..layout.temperature].to_vec(),
-        temperature_k: params[layout.temperature],
+        regions: region_fits,
         normalization: params[layout.normalization],
-        background: [0, 1, 2].map(|i| params[layout.background + i]),
         t0_us: params[layout.t0],
         flight_path_m: params[layout.flight_path],
         alpha: [params[layout.pulse], params[layout.pulse + 1]],
@@ -759,15 +906,8 @@ pub fn fit_counts(
         covariance,
         unbounded,
         on_bound,
-        beam: open.beam.with_coefficients(&params[..layout.densities]),
-        beam_at_limit: open.at_limit,
         deviance: fit.result.deviance,
-        predicted: [
-            fit.predicted[..bins].to_vec(),
-            fit.predicted[bins..].to_vec(),
-        ],
         converged,
-        overdispersion,
         measured_pulls,
         pulse_consistency,
         step_us: fit.step_us,
@@ -780,16 +920,117 @@ pub(crate) fn quantities<'a>(
     measurement: &'a Measurement,
     calibration: &'a Calibration,
 ) -> impl Iterator<Item = &'a Value> {
-    measurement
-        .isotopes
-        .iter()
-        .map(|(_, density)| density)
-        .chain([&measurement.temperature_k, &measurement.normalization])
-        .chain(&measurement.background)
+    let shape = shape(measurement);
+    let pulse = &calibration.pulse;
+    roles(&vec![0; shape.len()], &shape)
+        .into_iter()
+        .filter_map(move |role| Some(quantity(measurement, role)?.0))
         .chain([&calibration.t0_us, &calibration.flight_path_m])
-        .chain(&calibration.pulse.alpha)
-        .chain(&calibration.pulse.beta)
-        .chain([&calibration.pulse.r, &calibration.pulse.fwhm_squared_us2])
+        .chain(&pulse.alpha)
+        .chain(&pulse.beta)
+        .chain([&pulse.r, &pulse.fwhm_squared_us2])
+}
+
+fn shape(measurement: &Measurement) -> Vec<Option<usize>> {
+    measurement
+        .regions
+        .iter()
+        .map(|region| region.material.as_ref().map(|m| m.isotopes.len()))
+        .collect()
+}
+
+#[derive(Clone, Copy, Debug, PartialEq)]
+enum Role {
+    Beam { region: usize, coefficient: usize },
+    Density { region: usize, isotope: usize },
+    Temperature { region: usize },
+    Normalization,
+    Background { region: usize, term: usize },
+    T0,
+    FlightPath,
+    Pulse(usize),
+}
+
+fn roles(beams: &[usize], isotopes: &[Option<usize>]) -> Vec<Role> {
+    let beam = beams.iter().enumerate().flat_map(|(region, &n)| {
+        (0..n).map(move |coefficient| Role::Beam {
+            region,
+            coefficient,
+        })
+    });
+    let materials = isotopes
+        .iter()
+        .enumerate()
+        .filter_map(|(region, n)| Some((region, (*n)?)))
+        .flat_map(|(region, n)| {
+            (0..n)
+                .map(move |isotope| Role::Density { region, isotope })
+                .chain([Role::Temperature { region }])
+        });
+    let backgrounds = (0..isotopes.len())
+        .flat_map(|region| (0..3).map(move |term| Role::Background { region, term }));
+    beam.chain(materials)
+        .chain([Role::Normalization])
+        .chain(backgrounds)
+        .chain([Role::T0, Role::FlightPath])
+        .chain((0..6).map(Role::Pulse))
+        .collect()
+}
+
+fn material(measurement: &Measurement, region: usize) -> &Material {
+    measurement.regions[region]
+        .material
+        .as_ref()
+        .expect("a density or temperature names a region with a material")
+}
+
+fn quantity(
+    measurement: &Measurement,
+    role: Role,
+) -> Option<(&Value, String, RangeInclusive<f64>, String)> {
+    let (t_low, t_high) = TEMPERATURE_BOUNDS_K;
+    Some(match role {
+        Role::Density { region, isotope } => {
+            let (data, density) = &material(measurement, region).isotopes[isotope];
+            (
+                density,
+                format!("density of {} in region {region}", data.isotope),
+                0.0..=f64::INFINITY,
+                "0 or more".into(),
+            )
+        }
+        Role::Temperature { region } => (
+            &material(measurement, region).temperature_k,
+            format!("temperature of region {region}"),
+            t_low..=t_high,
+            format!("within {t_low}–{t_high} K"),
+        ),
+        Role::Normalization => (
+            &measurement.normalization,
+            "normalization".into(),
+            f64::MIN_POSITIVE..=f64::INFINITY,
+            "positive".into(),
+        ),
+        Role::Background { region, term } => (
+            &measurement.regions[region].background[term],
+            format!("b{term} of region {region}"),
+            f64::NEG_INFINITY..=f64::INFINITY,
+            "of any sign".into(),
+        ),
+        Role::Beam { .. } | Role::T0 | Role::FlightPath | Role::Pulse(_) => return None,
+    })
+}
+
+fn in_region(region: usize, error: PipelineError) -> PipelineError {
+    match error {
+        PipelineError::InvalidParameter(message) => {
+            PipelineError::InvalidParameter(format!("region {region}: {message}"))
+        }
+        PipelineError::ShapeMismatch(message) => {
+            PipelineError::ShapeMismatch(format!("region {region}: {message}"))
+        }
+        other => other,
+    }
 }
 
 fn finite(isotope: &ResonanceData) -> bool {
@@ -826,43 +1067,86 @@ fn finite(isotope: &ResonanceData) -> bool {
         })
 }
 
-#[derive(Clone, Copy)]
+struct Lines<'a> {
+    region: usize,
+    isotopes: &'a [(ResonanceData, Value)],
+    dopplers: Vec<DopplerParams>,
+}
+
 struct Layout {
-    densities: usize,
-    temperature: usize,
+    roles: Vec<Role>,
+    regions: Vec<Place>,
+    quantities: usize,
     normalization: usize,
-    background: usize,
     t0: usize,
     flight_path: usize,
     pulse: usize,
 }
 
+struct Place {
+    beam: Range<usize>,
+    densities: Range<usize>,
+    temperature: Option<usize>,
+    background: usize,
+}
+
 impl Layout {
-    fn new(beam_coefficients: usize, isotopes: usize) -> Self {
-        let temperature = beam_coefficients + isotopes;
+    fn new(roles: Vec<Role>, regions: usize) -> Self {
+        let at = |wanted: Role| {
+            roles
+                .iter()
+                .position(|&role| role == wanted)
+                .expect("every region has a background and the instrument its numbers")
+        };
+        let span = |of: &dyn Fn(Role) -> bool| {
+            let first = roles.iter().position(|&role| of(role));
+            let last = roles.iter().rposition(|&role| of(role));
+            first
+                .zip(last)
+                .map_or(0..0, |(first, last)| first..last + 1)
+        };
+        let places = (0..regions)
+            .map(|r| Place {
+                beam: span(&|role| matches!(role, Role::Beam { region, .. } if region == r)),
+                densities: span(
+                    &|role| matches!(role, Role::Density { region, .. } if region == r),
+                ),
+                temperature: roles
+                    .iter()
+                    .position(|&role| role == Role::Temperature { region: r }),
+                background: at(Role::Background { region: r, term: 0 }),
+            })
+            .collect();
         Self {
-            densities: beam_coefficients,
-            temperature,
-            normalization: temperature + 1,
-            background: temperature + 2,
-            t0: temperature + 5,
-            flight_path: temperature + 6,
-            pulse: temperature + 7,
+            quantities: roles
+                .iter()
+                .position(|role| !matches!(role, Role::Beam { .. }))
+                .expect("the instrument's numbers follow the beams"),
+            normalization: at(Role::Normalization),
+            t0: at(Role::T0),
+            flight_path: at(Role::FlightPath),
+            pulse: at(Role::Pulse(0)),
+            regions: places,
+            roles,
         }
     }
 }
 
-struct TwoRunModel {
+struct RegionsModel {
     grid: Arc<FlightTimeGrid>,
-    spline: BeamSpline,
+    splines: Vec<BeamSpline>,
     beam_origin_us: f64,
-    isotopes: Arc<[ResonanceData]>,
+    absorbers: Vec<Absorber>,
     energies: Vec<f64>,
     shapes: [Vec<f64>; 3],
     charge_ratio: f64,
-    layout: Layout,
-    cross_sections: RefCell<Option<CrossSections>>,
+    layout: Arc<Layout>,
     scale: RefCell<Option<Scale>>,
+}
+
+struct Absorber {
+    isotopes: Arc<[ResonanceData]>,
+    cross_sections: RefCell<Option<CrossSections>>,
 }
 
 struct Beams {
@@ -883,8 +1167,8 @@ struct Scale {
     flight_path_m: f64,
     pulse: IkedaCarpenterParams,
     rows: Rows,
-    basis: Vec<[(usize, f64); 5]>,
-    basis_slope: Vec<[(usize, f64); 5]>,
+    basis: Vec<Vec<[(usize, f64); 5]>>,
+    basis_slope: Vec<Vec<[(usize, f64); 5]>>,
 }
 
 impl Scale {
@@ -893,7 +1177,7 @@ impl Scale {
         pulse: IkedaCarpenterParams,
         rows: Rows,
         grid: &FlightTimeGrid,
-        spline: &BeamSpline,
+        splines: &[BeamSpline],
         beam_origin_us: f64,
     ) -> Self {
         let (shift, stretch) = (t0_us - beam_origin_us, flight_path_m / grid.flight_path_m());
@@ -907,8 +1191,14 @@ impl Scale {
             flight_path_m,
             pulse,
             rows,
-            basis: abscissae.iter().map(|&a| spline.basis(a)).collect(),
-            basis_slope: abscissae.iter().map(|&a| spline.basis_slope(a)).collect(),
+            basis: splines
+                .iter()
+                .map(|spline| abscissae.iter().map(|&a| spline.basis(a)).collect())
+                .collect(),
+            basis_slope: splines
+                .iter()
+                .map(|spline| abscissae.iter().map(|&a| spline.basis_slope(a)).collect())
+                .collect(),
         }
     }
 }
@@ -918,13 +1208,14 @@ fn predicted(rows: &Rows, values: &[f64]) -> Result<Vec<f64>, FittingError> {
         .map_err(|e| FittingError::EvaluationFailed(e.to_string()))
 }
 
-impl TwoRunModel {
+impl RegionsModel {
     fn new(
         grid: &Arc<FlightTimeGrid>,
-        beam: &BeamSpline,
-        isotopes: &Arc<[ResonanceData]>,
+        beams: &[BeamSpline],
+        isotopes: &[Arc<[ResonanceData]>],
         charge_ratio: f64,
         beam_origin_us: f64,
+        layout: &Arc<Layout>,
     ) -> Self {
         let mut energies = grid.energies_ev();
         let shapes = [
@@ -935,34 +1226,44 @@ impl TwoRunModel {
         energies.reverse();
         Self {
             grid: Arc::clone(grid),
-            spline: beam.clone(),
+            splines: beams.to_vec(),
             beam_origin_us,
-            isotopes: Arc::clone(isotopes),
+            absorbers: isotopes
+                .iter()
+                .map(|isotopes| Absorber {
+                    isotopes: Arc::clone(isotopes),
+                    cross_sections: RefCell::new(None),
+                })
+                .collect(),
             energies,
             shapes,
             charge_ratio,
-            layout: Layout::new(beam.coefficients().len(), isotopes.len()),
-            cross_sections: RefCell::new(None),
+            layout: Arc::clone(layout),
             scale: RefCell::new(Some(Scale::new(
                 (grid.t0_us(), grid.flight_path_m()),
                 grid.pulse().params().clone(),
                 grid.rows().clone(),
                 grid,
-                beam,
+                beams,
                 beam_origin_us,
             ))),
         }
     }
 
-    fn at(&self, temperature_k: f64) -> Result<std::cell::Ref<'_, CrossSections>, FittingError> {
-        let current = self
+    fn at(
+        &self,
+        region: usize,
+        temperature_k: f64,
+    ) -> Result<std::cell::Ref<'_, CrossSections>, FittingError> {
+        let absorber = &self.absorbers[region];
+        let current = absorber
             .cross_sections
             .borrow()
             .as_ref()
             .is_some_and(|c| c.temperature_k.to_bits() == temperature_k.to_bits());
         if !current {
             let energies = &self.energies;
-            let (values, slopes) = self
+            let (values, slopes) = absorber
                 .isotopes
                 .par_iter()
                 .map(|isotope| {
@@ -976,13 +1277,13 @@ impl TwoRunModel {
                 .collect::<Result<Vec<_>, FittingError>>()?
                 .into_iter()
                 .unzip();
-            *self.cross_sections.borrow_mut() = Some(CrossSections {
+            *absorber.cross_sections.borrow_mut() = Some(CrossSections {
                 temperature_k,
                 values,
                 slopes,
             });
         }
-        Ok(std::cell::Ref::map(self.cross_sections.borrow(), |c| {
+        Ok(std::cell::Ref::map(absorber.cross_sections.borrow(), |c| {
             c.as_ref().expect("computed above")
         }))
     }
@@ -1004,7 +1305,7 @@ impl TwoRunModel {
                 pulse,
                 rows,
                 &self.grid,
-                &self.spline,
+                &self.splines,
                 self.beam_origin_us,
             ));
         }
@@ -1013,32 +1314,32 @@ impl TwoRunModel {
         }))
     }
 
-    fn beams(&self, params: &[f64], scale: &Scale) -> Result<Beams, FittingError> {
-        let layout = self.layout;
-        let densities = &params[layout.densities..layout.temperature];
-        let sigma = self.at(params[layout.temperature])?;
-        let open: Vec<f64> = combined(&scale.basis, &params[..layout.densities])
+    fn beams(&self, params: &[f64], scale: &Scale, region: usize) -> Result<Beams, FittingError> {
+        let place = &self.layout.regions[region];
+        let densities = &params[place.densities.clone()];
+        let sigma = place
+            .temperature
+            .map(|t| self.at(region, params[t]))
+            .transpose()?;
+        let open: Vec<f64> = combined(&scale.basis[region], &params[place.beam.clone()])
             .into_iter()
             .map(f64::exp)
             .collect();
         let normalized: Vec<f64> = open
             .iter()
-            .map(|phi| self.charge_ratio * params[layout.normalization] * phi)
+            .map(|phi| self.charge_ratio * params[self.layout.normalization] * phi)
             .collect();
+        let terms = &params[place.background..place.background + 3];
         let (transmitted, sample) = normalized
             .iter()
             .enumerate()
             .map(|(j, beam)| {
-                let depth: f64 = densities
+                let depth: f64 = sigma
                     .iter()
-                    .zip(&sigma.values)
+                    .flat_map(|sigma| densities.iter().zip(&sigma.values))
                     .map(|(n, sigma)| n * sigma[j])
                     .sum();
-                let background: f64 = params[layout.background..layout.t0]
-                    .iter()
-                    .zip(&self.shapes)
-                    .map(|(b, g)| b * g[j])
-                    .sum();
+                let background: f64 = terms.iter().zip(&self.shapes).map(|(b, g)| b * g[j]).sum();
                 (beam * (-depth).exp(), beam * ((-depth).exp() + background))
             })
             .unzip();
@@ -1051,12 +1352,15 @@ impl TwoRunModel {
     }
 }
 
-impl FitModel for TwoRunModel {
+impl FitModel for RegionsModel {
     fn evaluate(&self, params: &[f64]) -> Result<Vec<f64>, FittingError> {
         let scale = self.scale(params)?;
-        let Beams { open, sample, .. } = self.beams(params, &scale)?;
-        let mut counts = predicted(&scale.rows, &open)?;
-        counts.extend(predicted(&scale.rows, &sample)?);
+        let mut counts = Vec::new();
+        for region in 0..self.absorbers.len() {
+            let Beams { open, sample, .. } = self.beams(params, &scale, region)?;
+            counts.extend(predicted(&scale.rows, &open)?);
+            counts.extend(predicted(&scale.rows, &sample)?);
+        }
         Ok(counts)
     }
 
@@ -1066,23 +1370,23 @@ impl FitModel for TwoRunModel {
         free_param_indices: &[usize],
         y_current: &[f64],
     ) -> Option<FlatMatrix> {
-        let layout = self.layout;
+        let layout = &*self.layout;
         let (t0_us, flight_path_m) = (params[layout.t0], params[layout.flight_path]);
         let scale = self.scale(params).ok()?;
-        let Beams {
-            open,
-            normalized,
-            transmitted,
-            sample,
-        } = self.beams(params, &scale).ok()?;
-        let sigma = self.at(params[layout.temperature]).ok()?;
+        let regions = self.absorbers.len();
+        let beams: Vec<Beams> = (0..regions)
+            .map(|region| self.beams(params, &scale, region))
+            .collect::<Result<_, _>>()
+            .ok()?;
+        let bins = y_current.len() / (2 * regions);
+        let (open_rows, sample_rows) = (|r: usize| 2 * r * bins, |r: usize| (2 * r + 1) * bins);
         let counts = |values: &[f64]| predicted(&scale.rows, values).ok();
         let times = |beam: &[f64], slope: &[f64]| -> Vec<f64> {
             beam.iter().zip(slope).map(|(b, s)| b * s).collect()
         };
         let mut arrival: Option<Rows> = None;
         let mut pulse_slopes: Option<[Rows; 4]> = None;
-        let ones = vec![1.0; open.len()];
+        let ones = vec![1.0; self.energies.len()];
         let root_energy = &self.shapes[2];
         let pulse_columns: [(usize, &[f64]); 6] = [
             (0, root_energy),
@@ -1094,106 +1398,129 @@ impl FitModel for TwoRunModel {
         ];
         let mut jacobian = FlatMatrix::zeros(y_current.len(), free_param_indices.len());
         for (col, &index) in free_param_indices.iter().enumerate() {
-            let (open_column, sample_column) = if index < layout.densities {
-                let slope = weights_of(&scale.basis, index);
-                (
-                    counts(&times(&open, &slope))?,
-                    counts(&times(&sample, &slope))?,
-                )
-            } else if index < layout.temperature {
-                let values = &sigma.values[index - layout.densities];
-                let slope: Vec<f64> = values.iter().map(|s| -s).collect();
-                (
-                    vec![0.0; y_current.len() / 2],
-                    counts(&times(&transmitted, &slope))?,
-                )
-            } else if index == layout.temperature {
-                let broadening: Vec<f64> = (0..open.len())
-                    .map(|j| {
-                        -params[layout.densities..layout.temperature]
-                            .iter()
-                            .zip(&sigma.slopes)
-                            .map(|(n, slope)| n * slope[j])
-                            .sum::<f64>()
-                    })
-                    .collect();
-                (
-                    vec![0.0; y_current.len() / 2],
-                    counts(&times(&transmitted, &broadening))?,
-                )
-            } else if index == layout.normalization {
-                let slope = vec![1.0 / params[index]; open.len()];
-                (
-                    vec![0.0; y_current.len() / 2],
-                    counts(&times(&sample, &slope))?,
-                )
-            } else if index < layout.t0 {
-                let shape = &self.shapes[index - layout.background];
-                (
-                    vec![0.0; y_current.len() / 2],
-                    counts(&times(&normalized, shape))?,
-                )
-            } else if index >= layout.pulse {
-                if pulse_slopes.is_none() {
-                    pulse_slopes = Some(
-                        self.grid
-                            .pulse_slopes_at(t0_us, flight_path_m, &scale.pulse)
-                            .ok()?,
-                    );
+            let blocks: Vec<(usize, Vec<f64>)> = match layout.roles[index] {
+                Role::Beam {
+                    region,
+                    coefficient,
+                } => {
+                    let slope = weights_of(&scale.basis[region], coefficient);
+                    let Beams { open, sample, .. } = &beams[region];
+                    vec![
+                        (open_rows(region), counts(&times(open, &slope))?),
+                        (sample_rows(region), counts(&times(sample, &slope))?),
+                    ]
                 }
-                let (law, weight) = pulse_columns[index - layout.pulse];
-                let rows = &pulse_slopes.as_ref()?[law];
-                (
-                    predicted(rows, &times(&open, weight)).ok()?,
-                    predicted(rows, &times(&sample, weight)).ok()?,
-                )
-            } else {
-                if arrival.is_none() {
-                    arrival = Some(
-                        self.grid
-                            .arrival_slopes_at(t0_us, flight_path_m, &scale.pulse)
-                            .ok()?,
-                    );
+                Role::Density { region, isotope } => {
+                    let sigma = self
+                        .at(region, params[layout.regions[region].temperature?])
+                        .ok()?;
+                    let slope: Vec<f64> = sigma.values[isotope].iter().map(|s| -s).collect();
+                    vec![(
+                        sample_rows(region),
+                        counts(&times(&beams[region].transmitted, &slope))?,
+                    )]
                 }
-                let arrival = arrival.as_ref()?;
-                let log_beam_slope = combined(&scale.basis_slope, &params[..layout.densities]);
-                let moved = |beam: &[f64], reach: &[f64]| -> Option<Vec<f64>> {
-                    let reached = times(beam, reach);
-                    let beam_part = counts(&times(&reached, &log_beam_slope))?;
-                    let pulse_part = predicted(arrival, &reached).ok()?;
-                    Some(
-                        beam_part
-                            .iter()
-                            .zip(&pulse_part)
-                            .map(|(b, p)| b + p)
-                            .collect(),
-                    )
-                };
-                if index == layout.t0 {
-                    let reach = vec![1.0; open.len()];
-                    (moved(&open, &reach)?, moved(&sample, &reach)?)
-                } else {
-                    let reach: Vec<f64> = self
-                        .grid
-                        .flight_times_us()
-                        .iter()
-                        .map(|u| u / self.grid.flight_path_m())
-                        .collect();
-                    let stretched = |beam: &[f64]| -> Option<Vec<f64>> {
-                        let weight = counts(beam)?;
-                        Some(
-                            moved(beam, &reach)?
+                Role::Temperature { region } => {
+                    let place = &layout.regions[region];
+                    let sigma = self.at(region, params[index]).ok()?;
+                    let densities = &params[place.densities.clone()];
+                    let broadening: Vec<f64> = (0..self.energies.len())
+                        .map(|j| {
+                            -densities
                                 .iter()
-                                .zip(&weight)
-                                .map(|(m, x)| m + x / flight_path_m)
+                                .zip(&sigma.slopes)
+                                .map(|(n, slope)| n * slope[j])
+                                .sum::<f64>()
+                        })
+                        .collect();
+                    vec![(
+                        sample_rows(region),
+                        counts(&times(&beams[region].transmitted, &broadening))?,
+                    )]
+                }
+                Role::Normalization => {
+                    let slope = vec![1.0 / params[index]; self.energies.len()];
+                    (0..regions)
+                        .map(|r| Some((sample_rows(r), counts(&times(&beams[r].sample, &slope))?)))
+                        .collect::<Option<_>>()?
+                }
+                Role::Background { region, term } => vec![(
+                    sample_rows(region),
+                    counts(&times(&beams[region].normalized, &self.shapes[term]))?,
+                )],
+                Role::Pulse(number) => {
+                    if pulse_slopes.is_none() {
+                        pulse_slopes = Some(
+                            self.grid
+                                .pulse_slopes_at(t0_us, flight_path_m, &scale.pulse)
+                                .ok()?,
+                        );
+                    }
+                    let (law, weight) = pulse_columns[number];
+                    let rows = &pulse_slopes.as_ref()?[law];
+                    (0..regions)
+                        .flat_map(|r| {
+                            [
+                                (open_rows(r), &beams[r].open),
+                                (sample_rows(r), &beams[r].sample),
+                            ]
+                        })
+                        .map(|(row, beam)| Some((row, predicted(rows, &times(beam, weight)).ok()?)))
+                        .collect::<Option<_>>()?
+                }
+                Role::T0 | Role::FlightPath => {
+                    if arrival.is_none() {
+                        arrival = Some(
+                            self.grid
+                                .arrival_slopes_at(t0_us, flight_path_m, &scale.pulse)
+                                .ok()?,
+                        );
+                    }
+                    let arrival = arrival.as_ref()?;
+                    let (reach, per_metre): (Vec<f64>, Option<f64>) = match layout.roles[index] {
+                        Role::FlightPath => (
+                            self.grid
+                                .flight_times_us()
+                                .iter()
+                                .map(|u| u / self.grid.flight_path_m())
                                 .collect(),
-                        )
+                            Some(flight_path_m),
+                        ),
+                        _ => (ones.clone(), None),
                     };
-                    (stretched(&open)?, stretched(&sample)?)
+                    let mut blocks = Vec::with_capacity(2 * regions);
+                    for r in 0..regions {
+                        let log_beam_slope = combined(
+                            &scale.basis_slope[r],
+                            &params[layout.regions[r].beam.clone()],
+                        );
+                        for (row, beam) in [
+                            (open_rows(r), &beams[r].open),
+                            (sample_rows(r), &beams[r].sample),
+                        ] {
+                            let reached = times(beam, &reach);
+                            let beam_part = counts(&times(&reached, &log_beam_slope))?;
+                            let pulse_part = predicted(arrival, &reached).ok()?;
+                            let mut column: Vec<f64> = beam_part
+                                .iter()
+                                .zip(&pulse_part)
+                                .map(|(b, p)| b + p)
+                                .collect();
+                            if let Some(flight_path_m) = per_metre {
+                                for (c, x) in column.iter_mut().zip(counts(beam)?) {
+                                    *c += x / flight_path_m;
+                                }
+                            }
+                            blocks.push((row, column));
+                        }
+                    }
+                    blocks
                 }
             };
-            for (row, value) in open_column.into_iter().chain(sample_column).enumerate() {
-                *jacobian.get_mut(row, col) = value;
+            for (row, column) in blocks {
+                for (offset, value) in column.into_iter().enumerate() {
+                    *jacobian.get_mut(row + offset, col) = value;
+                }
             }
         }
         Some(jacobian)
@@ -1208,7 +1535,7 @@ mod tests {
     use crate::open_beam::tests::{ALPHA, BETA, EDGES_US, FLIGHT_PATH_M, R, T0_US, grid};
 
     #[test]
-    fn the_jacobian_is_the_slope_of_both_runs_counts() {
+    fn the_jacobian_is_the_slope_of_every_region_s_counts() {
         for channel_fwhm_us in [None, Some(0.35)] {
             jacobian_against_central_differences(&grid(channel_fwhm_us));
         }
@@ -1216,25 +1543,50 @@ mod tests {
 
     fn jacobian_against_central_differences(grid: &Arc<FlightTimeGrid>) {
         let (_, u_hi) = grid.range_us();
-        let beam = BeamSpline::constant(347.0, u_hi, 1.0e4).refined().refined();
-        let isotopes: Arc<[ResonanceData]> = Arc::new([
-            synthetic_isotope(72, 180, 20.0, 0.01, 0.06),
-            synthetic_isotope(74, 182, 20.3, 0.01, 0.06),
-        ]);
-        let params: Vec<f64> = (0..beam.coefficients().len())
-            .map(|i| 9.0 + 0.3 * (i as f64).sin())
-            .chain([3.0e-4, 5.0e-4, 300.0, 0.93, 0.05, 0.5, -0.01])
-            .chain([T0_US + 0.05, FLIGHT_PATH_M + 0.003])
-            .chain([0.37, 0.06, 0.01, 0.24, 0.16, 0.3])
+        let coarse = BeamSpline::constant(347.0, u_hi, 1.0e4);
+        let beams = [coarse.refined().refined(), coarse.clone(), coarse.refined()];
+        let isotopes: [Arc<[ResonanceData]>; 3] = [
+            Arc::new([
+                synthetic_isotope(72, 180, 20.0, 0.01, 0.06),
+                synthetic_isotope(74, 182, 20.3, 0.01, 0.06),
+            ]),
+            Arc::new([]),
+            Arc::new([synthetic_isotope(74, 184, 20.6, 0.01, 0.06)]),
+        ];
+        let sizes: Vec<usize> = beams.iter().map(|b| b.coefficients().len()).collect();
+        let layout = Arc::new(Layout::new(roles(&sizes, &[Some(2), None, Some(1)]), 3));
+        let params: Vec<f64> = layout
+            .roles
+            .iter()
+            .enumerate()
+            .map(|(i, role)| match *role {
+                Role::Beam { .. } => 9.0 + 0.3 * (i as f64).sin(),
+                Role::Density { region, isotope } => {
+                    [[3.0e-4, 5.0e-4], [0.0; 2], [4.0e-4, 0.0]][region][isotope]
+                }
+                Role::Temperature { region } => [300.0, 0.0, 250.0][region],
+                Role::Normalization => 0.93,
+                Role::Background { region, term } => {
+                    [[0.05, 0.5, -0.01], [0.02, 0.1, 0.003], [0.04, -0.2, 0.005]][region][term]
+                }
+                Role::T0 => T0_US + 0.05,
+                Role::FlightPath => FLIGHT_PATH_M + 0.003,
+                Role::Pulse(n) => [0.37, 0.06, 0.01, 0.24, 0.16, 0.3][n],
+            })
             .collect();
-        let model = TwoRunModel::new(grid, &beam, &isotopes, 1.2, T0_US);
+        let model = RegionsModel::new(grid, &beams, &isotopes, 1.2, T0_US, &layout);
         let live: Vec<f64> = (0..model.evaluate(&params).expect("counts").len())
             .map(|k| 0.9 + 0.1 * (0.3 * k as f64).sin())
             .collect();
         let model = Recorded { model, live: &live };
-        let layout = model.model.layout;
         let mut elsewhere = params.clone();
-        elsewhere[layout.temperature] = 250.0;
+        for t in layout
+            .regions
+            .iter()
+            .filter_map(|region| region.temperature)
+        {
+            elsewhere[t] -= 50.0;
+        }
         elsewhere[layout.t0] = T0_US - 0.05;
         elsewhere[layout.flight_path] = FLIGHT_PATH_M - 0.003;
         elsewhere[layout.pulse + 4] = 0.2;
@@ -1284,7 +1636,18 @@ mod tests {
             synthetic_isotope(74, 182, 20.3, 0.01, 0.06),
         ]);
         let (charge_ratio, normalization) = (1.2, 0.93);
-        let model = TwoRunModel::new(&grid, &beam, &isotopes, charge_ratio, T0_US);
+        let layout = Arc::new(Layout::new(
+            roles(&[beam.coefficients().len()], &[Some(2)]),
+            1,
+        ));
+        let model = RegionsModel::new(
+            &grid,
+            std::slice::from_ref(&beam),
+            &[isotopes],
+            charge_ratio,
+            T0_US,
+            &layout,
+        );
         let counts = |background: [f64; 3]| {
             let params: Vec<f64> = beam
                 .coefficients()
