@@ -108,12 +108,19 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          fetch-depth: 2
       - uses: dtolnay/rust-toolchain@7e38f4b43b4db5c8dd498af069a4f6196df1d067 # master
         with:
           toolchain: "1.96.1" # keep in sync with rust-toolchain.toml
       - uses: Swatinem/rust-cache@f0d9c3887740aee45f6153b24b3a6b815192ec16 # v2
       - name: Build docs
         run: cargo doc --workspace --no-deps --exclude nereids-python
+        env:
+          RUSTDOCFLAGS: -D warnings
+      - name: Public surface comes with a map change
+        if: github.event_name == 'pull_request'
+        run: python3 scripts/check_public_surface.py HEAD^1
         env:
           RUSTDOCFLAGS: -D warnings
 
@@ -126,15 +133,10 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
-        with:
-          fetch-depth: 2
       - uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97 # v7.0.0
         with:
           python-version: "3.10"
       - run: python scripts/check_python_api_drift.py
-      - name: Public surface comes with a map change
-        if: github.event_name == 'pull_request'
-        run: python scripts/check_public_surface.py HEAD^1
 
   # ── Python bindings ────────────────────────────────────────────────
   python:

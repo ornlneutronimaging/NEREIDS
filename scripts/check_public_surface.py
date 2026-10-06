@@ -1,14 +1,16 @@
 #!/usr/bin/env python3
 """Fail when a change adds a public name without changing the pipeline map.
 
-Public names are the ``pub`` items of the crates under ``crates/*/src``, with
-a method named by the type of its ``impl`` block, the ``pub`` fields of a
-``pub struct`` and the variants of a ``pub enum``; and the public ``def`` /
+Public names are what rustdoc documents for the crates under ``crates/``: each
+item by its module path, with the inherent methods, fields, variants and trait
+items on its page, and each module's re-exports; and the public ``def`` /
 ``class`` names of the Python stub with each class's public methods.  A name
-is added when no file of its crate, or the stub, has it at the base commit.
+is added when the base commit does not have it.
 
-Usage: ``python scripts/check_public_surface.py BASE`` compares the merge base
-of BASE and HEAD with HEAD.
+Usage: ``python3 scripts/check_public_surface.py BASE`` compares the merge base
+of BASE and HEAD with HEAD.  When a crate or stub file differs it builds the
+docs of both in this checkout, checking out the base and then the original
+commit again, so tracked files must have no uncommitted changes.
 
 Exit codes:
   0 - no name added, or the map changed too.
@@ -19,6 +21,7 @@ Exit codes:
 from __future__ import annotations
 
 import ast
+import json
 import re
 import subprocess
 import sys
@@ -29,65 +32,36 @@ from check_python_api_drift import public_definitions
 REPO_ROOT = Path(__file__).resolve().parent.parent
 MAP = "docs/guide/src/pipeline-map.html"
 STUB = "bindings/python/python/nereids/__init__.pyi"
-ITEM = re.compile(
-    r'^(\s*)pub\s+(?:(?:unsafe|async|const|extern\s+"[^"]*")\s+)*'
-    r"(?:fn|struct|enum|trait|type|const|static|union)\s+([A-Za-z_]\w*)"
+DOC = ("cargo", "doc", "--workspace", "--no-deps", "--exclude", "nereids-python")
+ITEM_PAGE = re.compile(
+    r"(?:struct|enum|union|trait|traitalias|fn|type|constant|static|macro|derive|attr)"
+    r"\.(\w+)\.html"
 )
-BLOCK = re.compile(r"^\s*pub\s+(struct|enum)\s+([A-Za-z_]\w*)[^;(]*\{\s*$")
-FIELD = re.compile(r"^\s*pub\s+([a-z_]\w*)\s*:")
-VARIANT = re.compile(r"^\s*([A-Z]\w*)\s*(?:[({,=]|$)")
+MEMBER = re.compile(
+    r'id="(?:method|tymethod|structfield|variant|associatedconstant|associatedtype)'
+    r'\.([\w.]+?)(?:-\d+)?"'
+)
+REEXPORT = re.compile(r'id="reexport\.(\w+)"')
+TRAIT_IMPLS = re.compile(r'id="(?:trait|synthetic|blanket)-implementations"')
 
 
-def impl_type(line: str) -> str | None:
-    """The type an ``impl`` line implements on, or None for any other line."""
-    rest = line.strip()
-    if not re.match(r"impl\b", rest):
-        return None
-    rest = rest[4:]
-    if rest.startswith("<"):
-        depth = 0
-        for i, c in enumerate(rest):
-            depth += (c == "<") - (c == ">")
-            if depth == 0:
-                rest = rest[i + 1 :]
-                break
-    rest = rest.split(" for ", 1)[-1]
-    match = re.match(r"\s*(?:[\w]+::)*(\w+)", rest)
-    return match.group(1) if match else None
-
-
-def rust_names(files: dict[str, str]) -> set[str]:
-    """``crate::name``, ``crate::Type::member`` and ``crate::Struct.field`` names."""
+def doc_names(doc_dir: Path, crates: list[str]) -> set[str]:
+    """``crate::module::Item`` and ``crate::module::Item::member`` for every documented name."""
     names: set[str] = set()
-    for path, text in files.items():
-        crate = path.split("/")[1]
-        blocks: list[tuple[int, str, str]] = []
-        for line in text.splitlines():
-            indent = len(line) - len(line.lstrip())
-            if blocks and line.rstrip() == " " * blocks[-1][0] + "}":
-                blocks.pop()
-                continue
-            item = ITEM.match(line)
+    for crate in crates:
+        root = doc_dir / crate
+        for page in root.rglob("*.html"):
+            rel = page.relative_to(root)
+            module = (crate, *rel.parts[:-1])
+            text = page.read_text(encoding="utf-8", errors="replace")
+            item = ITEM_PAGE.fullmatch(rel.name)
             if item:
-                owners = [name for i, name, kind in blocks if kind == "impl" and i < indent]
-                prefix = f"{owners[-1]}::" if owners else ""
-                names.add(f"{crate}::{prefix}{item.group(2)}")
-                block = BLOCK.match(line)
-                if block:
-                    blocks.append((indent, block.group(2), block.group(1)))
-                continue
-            owner = impl_type(line)
-            if owner:
-                blocks.append((indent, owner, "impl"))
-                continue
-            if blocks and indent > blocks[-1][0]:
-                outer, name, kind = blocks[-1]
-                field = FIELD.match(line) if kind == "struct" else None
-                variant = VARIANT.match(line) if kind == "enum" and indent == outer + 4 else None
-                if field:
-                    names.add(f"{crate}::{name}.{field.group(1)}")
-                elif variant:
-                    names.add(f"{crate}::{name}::{variant.group(1)}")
+                path = "::".join((*module, item.group(1)))
+                names.add(path)
+                own = TRAIT_IMPLS.split(text, maxsplit=1)[0]
+                names |= {f"{path}::{member}" for member in MEMBER.findall(own)}
+            elif rel.name == "index.html":
+                names |= {"::".join((*module, name)) for name in REEXPORT.findall(text)}
     return names
 
 
@@ -106,21 +80,23 @@ def violations(base: set[str], head: set[str], changed: set[str]) -> list[str]:
     return [] if MAP in changed else sorted(head - base)
 
 
-def git(*args: str) -> str:
-    return subprocess.run(
-        ["git", *args], cwd=REPO_ROOT, check=True, capture_output=True, text=True
-    ).stdout
+def run(*args: str) -> str:
+    return subprocess.run(args, cwd=REPO_ROOT, check=True, capture_output=True, text=True).stdout
 
 
-def surface(rev: str) -> set[str]:
-    paths = git("ls-tree", "-r", "--name-only", rev, "--", "crates").split()
-    sources = {
-        p: git("show", f"{rev}:{p}")
-        for p in paths
-        if re.fullmatch(r"crates/[^/]+/src/.+\.rs", p)
-    }
-    stub = stub_names(git("show", f"{rev}:{STUB}"))
-    return rust_names(sources) | {f"nereids.{n}" for n in stub}
+def checked_out_names() -> set[str]:
+    """Build the docs of the checked-out commit and return its public names."""
+    run(*DOC)
+    target = Path(json.loads(run("cargo", "metadata", "--format-version", "1", "--no-deps"))[
+        "target_directory"
+    ])
+    crates = sorted(
+        p.name.replace("-", "_")
+        for p in (REPO_ROOT / "crates").iterdir()
+        if (p / "src" / "lib.rs").exists()
+    )
+    stub = stub_names((REPO_ROOT / STUB).read_text(encoding="utf-8"))
+    return doc_names(target / "doc", crates) | {f"nereids.{name}" for name in stub}
 
 
 def main(argv: list[str]) -> int:
@@ -128,11 +104,27 @@ def main(argv: list[str]) -> int:
         print(__doc__, file=sys.stderr)
         return 2
     try:
-        base = git("merge-base", argv[1], "HEAD").strip()
-        changed = set(git("diff", "--name-only", base, "HEAD").split())
-        added = violations(surface(base), surface("HEAD"), changed)
-    except subprocess.CalledProcessError as exc:
-        print(f"check_public_surface: {exc.stderr.strip() or exc}", file=sys.stderr)
+        base = run("git", "merge-base", argv[1], "HEAD").strip()
+        changed = set(run("git", "diff", "--name-only", base, "HEAD").split())
+        if not any(path.startswith("crates/") or path == STUB for path in changed):
+            print("check_public_surface: no crate or stub file changed")
+            return 0
+        if run("git", "status", "--porcelain", "--untracked-files=no").strip():
+            raise RuntimeError("tracked files have uncommitted changes; commit them first")
+        branch = subprocess.run(
+            ("git", "symbolic-ref", "--quiet", "--short", "HEAD"),
+            cwd=REPO_ROOT, capture_output=True, text=True,
+        ).stdout.strip()
+        original = branch or run("git", "rev-parse", "HEAD").strip()
+        run("git", "checkout", "--quiet", "--detach", base)
+        try:
+            before = checked_out_names()
+        finally:
+            run("git", "checkout", "--quiet", original)
+        added = violations(before, checked_out_names(), changed)
+    except Exception as exc:
+        detail = getattr(exc, "stderr", None) or exc
+        print(f"check_public_surface: {str(detail).strip()}", file=sys.stderr)
         return 2
     if added:
         print(f"New public names with {MAP} unchanged;")
