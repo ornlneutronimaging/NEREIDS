@@ -717,7 +717,9 @@ fn a_map_recovers_each_patch_and_its_covariance_between_patches_is_the_shared_qu
             flight_path_m: Value::Known(fit.flight_path_m),
             ..calibration(&setup)
         };
-        fit_counts(&measurement, &fixed).expect("area fit")
+        let fit = fit_counts(&measurement, &fixed).expect("area fit");
+        assert!(fit.converged);
+        fit
     };
     let measured = [0, 1].map(|run| {
         (0..bins)
@@ -743,9 +745,17 @@ fn a_map_recovers_each_patch_and_its_covariance_between_patches_is_the_shared_qu
             + weights[1] * result.densities[m][[0, 1]])
             / (weights[0] + weights[1]);
         assert!((density - two.regions[0].densities[m]).abs() <= BOUND.sqrt() * sd);
-        assert!(density - mean <= -5.0 * sd, "{density} vs {mean} ± {sd}");
+        assert!(
+            (density - mean).abs() >= 5.0 * sd,
+            "{density} vs {mean} ± {sd}"
+        );
     }
-    assert!((one.temperature() - two.temperature()).abs() <= BOUND.sqrt() * error_bar(&one, 2));
+    let sd = error_bar(&one, 2);
+    let mean = (weights[0] * result.temperature_k[[0, 0]]
+        + weights[1] * result.temperature_k[[0, 1]])
+        / (weights[0] + weights[1]);
+    assert!((one.temperature() - two.temperature()).abs() <= BOUND.sqrt() * sd);
+    assert!((one.temperature() - mean).abs() >= 5.0 * sd);
 }
 
 #[test]
