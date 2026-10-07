@@ -2,11 +2,11 @@ use std::cell::RefCell;
 use std::collections::HashMap;
 use std::sync::{Arc, LazyLock};
 
-use ndarray::{Array2, Array3, Axis, s};
+use ndarray::{Array2, Array3, s};
 use nereids_endf::resonance::ResonanceData;
 use nereids_endf::resonance::test_support::{synthetic_isotope, synthetic_isotope_multi};
 use nereids_fitting::lm::FlatMatrix;
-use nereids_fitting::poisson::{Prior, Unbounded, half_deviance};
+use nereids_fitting::poisson::{Prior, Unbounded};
 use nereids_fitting::statistics::{self, Consistency};
 use nereids_physics::continuous_doppler::SUPPORT_X;
 use nereids_physics::doppler::DopplerParams;
@@ -505,7 +505,7 @@ fn a_map_recovers_each_patch_and_its_covariance_between_patches_is_the_shared_qu
         ([THIN, THIN], 300.0, 0.05, 1.0e6),
         ([1.5 * THIN, 0.0], 450.0, 0.05, 1.0e6),
         ([SATURATED, THIN], 300.0, 0.0, 2.0e4),
-        ([THIN, 2.0 * THIN], 600.0, 0.05, 1.0e6),
+        ([THIN, 2.0 * THIN], 2500.0, 0.05, 1.0e6),
     ];
     let unit: Vec<(Vec<f64>, Vec<f64>)> = truths
         .iter()
@@ -532,7 +532,7 @@ fn a_map_recovers_each_patch_and_its_covariance_between_patches_is_the_shared_qu
         .collect();
     let (hot, broken) = ((0, 2), (1, 7));
     let cube = |run: usize| {
-        Array3::from_shape_fn((bins, 3, 8), |(k, y, x)| {
+        Array3::from_shape_fn((bins, 3, 10), |(k, y, x)| {
             let (open, sample) = &unit[if y == 2 { 4 } else { x / 2 }];
             let level = [1.0, 1.3, 0.8, 1.1][2 * (y % 2) + x % 2];
             let count = (live[k] * level * [open, sample][run][k]).round();
@@ -544,9 +544,9 @@ fn a_map_recovers_each_patch_and_its_covariance_between_patches_is_the_shared_qu
         })
     };
     let counts = [cube(0), cube(1)];
-    let excluded = Array2::from_shape_fn((3, 8), |pixel| pixel == hot || pixel == broken);
-    let behind = Array2::from_shape_fn((3, 8), |(y, _)| y < 2);
-    let empty = Array2::from_shape_fn((3, 8), |(y, _)| y == 2);
+    let excluded = Array2::from_shape_fn((3, 10), |pixel| pixel == hot || pixel == broken);
+    let behind = Array2::from_shape_fn((3, 10), |(y, x)| y < 2 && x < 9);
+    let empty = Array2::from_shape_fn((3, 10), |(y, _)| y == 2);
     let map = MapMeasurement {
         time_edges_us: setup.edges.clone(),
         charge_ratio: CHARGE_RATIO,
@@ -584,19 +584,26 @@ fn a_map_recovers_each_patch_and_its_covariance_between_patches_is_the_shared_qu
     let result = fit_map(&map, &calibration(&setup)).expect("map");
     let fit = &result.fit;
     assert!(fit.converged);
-    let sample_row = |i: usize| i == 0;
+    let kinds = [
+        Patch::Sample,
+        Patch::Sample,
+        Patch::Sample,
+        Patch::Sample,
+        Patch::Mixed,
+    ];
     assert_eq!(
         result.patches,
-        Array2::from_shape_fn((2, 4), |(i, _)| if sample_row(i) {
-            Patch::Sample
+        Array2::from_shape_fn((2, 5), |(i, j)| if i == 0 {
+            kinds[j]
         } else {
             Patch::Outside
         })
     );
     assert_eq!(
         result.trusted,
-        Array2::from_shape_fn((2, 4), |(i, _)| sample_row(i))
+        Array2::from_shape_fn((2, 5), |(i, j)| i == 0 && j < 3)
     );
+    assert!(result.densities[0][[0, 4]].is_nan());
 
     let covariance = result.covariance.as_ref().expect("covariance");
     let a = covariance.nrows - 1;
@@ -607,48 +614,64 @@ fn a_map_recovers_each_patch_and_its_covariance_between_patches_is_the_shared_qu
         for (m, n) in densities.into_iter().enumerate() {
             let (density, error) = (result.densities[m][[0, j]], result.density_sd[m][[0, j]]);
             assert_eq!(error.to_bits(), sd(per_patch * j + m));
-            if n > 0.0 {
-                pulls.push((density - n) / error);
-            } else {
+            if n == 0.0 {
                 assert_eq!(density, 0.0);
+            } else if j < 3 {
+                pulls.push((density - n) / error);
             }
         }
         let error = result.temperature_sd_k[[0, j]];
         assert_eq!(error.to_bits(), sd(per_patch * j + 2));
-        pulls.push((result.temperature_k[[0, j]] - t) / error);
+        if j < 3 {
+            pulls.push((result.temperature_k[[0, j]] - t) / error);
+        }
     }
     assert!(pulls.iter().all(|p| p.abs() <= BOUND.sqrt()), "{pulls:?}");
+    assert_eq!(result.temperature_k[[0, 3]], 2000.0);
 
-    let phi = |r: usize, run: usize| fit.regions[r].overdispersion[run].expect("measured");
-    let mut deviance = 0.0;
-    for (run, (residuals, run_counts)) in result.residuals.iter().zip(&counts).enumerate() {
-        for j in 0..4 {
-            let squares: f64 = residuals.slice(s![.., 0, j]).iter().map(|d| d * d).sum();
-            deviance += squares / (2.0 * phi(j, run));
+    let term = |y: f64, mu: f64| {
+        if y == 0.0 {
+            mu
+        } else {
+            y * (y / mu).ln() + mu - y
         }
-        let empty_counts = run_counts.index_axis(Axis(1), 2).sum_axis(Axis(1));
-        let empty_deviance: f64 = empty_counts
+    };
+    let phi = |r: usize, run: usize| fit.regions[r].overdispersion[run].expect("measured");
+    let (mut deviance, mut zeros) = (0.0, 0);
+    for (run, residuals) in result.residuals.iter().enumerate() {
+        for (j, region) in fit.regions[..4].iter().enumerate() {
+            for (k, &mu) in region.predicted[run].iter().enumerate() {
+                let y: f64 = (0..2)
+                    .flat_map(|y| (2 * j..2 * j + 2).map(move |x| (y, x)))
+                    .filter(|&pixel| !excluded[pixel])
+                    .map(|(y, x)| counts[run][[k, y, x]])
+                    .sum();
+                let d = residuals[[k, 0, j]];
+                let expected = 2.0 * term(y, mu);
+                assert!(
+                    (d * d - expected).abs() <= 1e-12 * (y + mu) && d * (y - mu) >= 0.0,
+                    "{run} {j} {k}: {d} for {y} counts, {mu} predicted"
+                );
+                deviance += d * d / (2.0 * phi(j, run));
+                zeros += usize::from(y == 0.0);
+            }
+        }
+        let empty_deviance: f64 = fit.regions[4].predicted[run]
             .iter()
-            .zip(&fit.regions[4].predicted[run])
-            .map(|(&y, &mu)| half_deviance(y, mu))
+            .enumerate()
+            .map(|(k, &mu)| term(counts[run].slice(s![k, 2, ..]).sum(), mu))
             .sum();
         deviance += empty_deviance / phi(4, run);
     }
+    assert!(zeros > 0);
     assert!(
         (deviance - fit.deviance).abs() <= 1e-9 * fit.deviance,
         "{deviance} vs {}",
         fit.deviance
     );
-    let black: Vec<usize> = (0..bins)
-        .filter(|&k| counts[1].slice(s![k, 0..2, 4..6]).sum() == 0.0)
-        .collect();
-    assert!(!black.is_empty());
-    for k in black {
-        let mu = fit.regions[2].predicted[1][k];
-        assert_eq!(result.residuals[1][[k, 0, 2]], -(2.0 * mu).sqrt());
-    }
 
     let common = result.common_mode.as_ref().expect("common mode");
+    assert!(common.get(0, 0) < covariance.get(0, 0));
     for p in 0..a {
         for q in (0..a).filter(|q| q / per_patch != p / per_patch) {
             let (c, m) = (covariance.get(p, q), common.get(p, q));
