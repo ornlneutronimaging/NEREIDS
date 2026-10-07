@@ -277,7 +277,9 @@ pub struct Unbounded {
     pub covariance: FlatMatrix,
 }
 
-pub(crate) const NEWTON_DECREMENT_TOL: f64 = 1e-6;
+/// The expected-information Newton decrement below which [`poisson_fit`]
+/// reports a minimum.
+pub const NEWTON_DECREMENT_TOL: f64 = 1e-6;
 
 const DEGENERATE_EIGENVALUE: f64 = 1e-12;
 
