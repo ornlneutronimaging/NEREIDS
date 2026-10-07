@@ -28,8 +28,9 @@ use rayon::prelude::*;
 use crate::beam::BeamSpline;
 use crate::error::PipelineError;
 use crate::open_beam::{
-    Calibration, PULSE_NUMBERS, Recorded, combined, counted, fit_on_halved_grids, fit_open_beam,
-    laws, overdispersion, validate_counts, validate_live, weights_of,
+    Calibration, OpenBeamFit, PULSE_NUMBERS, Pulse, Recorded, combined, counted,
+    fit_on_halved_grids, fit_open_beam, laws, overdispersion, validate_counts, validate_live,
+    weights_of,
 };
 use crate::pipeline::TEMPERATURE_BOUNDS_K;
 
@@ -416,11 +417,30 @@ pub(crate) struct BeamStart {
     pub(crate) at_limit: bool,
 }
 
-pub(crate) fn fit_counts_answer(
-    measurement: &Measurement,
+impl From<OpenBeamFit> for BeamStart {
+    fn from(open: OpenBeamFit) -> Self {
+        Self {
+            beam: open.beam,
+            overdispersion: open.overdispersion,
+            at_limit: open.at_limit,
+        }
+    }
+}
+
+pub(crate) struct Checked<'a> {
+    shape: Vec<Option<usize>>,
+    sample_parameters: Vec<FitParameter>,
+    measured: Vec<(usize, f64, f64)>,
+    lines: Vec<Lines<'a>>,
+    instrument: Vec<FitParameter>,
+    base: FlightTimeGrid,
+    resonances_in_span: Vec<Vec<Vec<f64>>>,
+}
+
+pub(crate) fn checked<'a>(
+    measurement: &'a Measurement,
     calibration: &Calibration,
-    starts: Option<&Starts>,
-) -> Result<(CountsFit, Answer), PipelineError> {
+) -> Result<Checked<'a>, PipelineError> {
     let Measurement {
         time_edges_us,
         charge_ratio,
@@ -505,16 +525,122 @@ pub(crate) fn fit_counts_answer(
         })
         .collect::<Result<_, PipelineError>>()?;
     let instrument = calibration.instrument()?;
-    let pulse = &calibration.pulse;
     validate_pulse_prior(calibration)?;
     let start: Vec<f64> = instrument.iter().map(|parameter| parameter.value).collect();
-    let beam_origin_us = starts.map_or(start[0], |starts| starts.origin_us);
-    let mut base = FlightTimeGrid::new(
+    let base = FlightTimeGrid::new(
         time_edges_us,
         start[0],
         start[1],
         &calibration.pulse.at(&start[2..])?,
     )?;
+    calibrated_lines(
+        &lines,
+        &calibration.pulse,
+        time_edges_us,
+        start[0],
+        start[1],
+    )?;
+    let resonances_in_span = in_span(&lines, &base)?;
+    Ok(Checked {
+        shape,
+        sample_parameters,
+        measured,
+        lines,
+        instrument,
+        base,
+        resonances_in_span,
+    })
+}
+
+fn calibrated_lines(
+    lines: &[Lines<'_>],
+    pulse: &Pulse,
+    time_edges_us: &[f64],
+    t0_us: f64,
+    flight_path_m: f64,
+) -> Result<(), PipelineError> {
+    for lines in lines {
+        if let Some(((low, high), line)) = pulse.line_span_ev.zip(pulse.uncalibrated_line(
+            lines.isotopes,
+            time_edges_us,
+            t0_us,
+            flight_path_m,
+        )) {
+            return Err(PipelineError::InvalidParameter(format!(
+                "region {} has a resonance at {line} eV, outside the {low}–{high} eV of the \
+                 resonances the pulse was calibrated on",
+                lines.region
+            )));
+        }
+    }
+    Ok(())
+}
+
+fn in_span(
+    lines: &[Lines<'_>],
+    grid: &FlightTimeGrid,
+) -> Result<Vec<Vec<Vec<f64>>>, PipelineError> {
+    let energies = grid.energies_ev();
+    let span_ev = (energies[energies.len() - 1], energies[0]);
+    lines
+        .iter()
+        .map(|lines| {
+            lines
+                .isotopes
+                .iter()
+                .zip(&lines.dopplers)
+                .map(|((isotope, _), doppler)| {
+                    let read = (
+                        (span_ev.0.sqrt() - SUPPORT_X * doppler.u())
+                            .max(0.0)
+                            .powi(2),
+                        (span_ev.1.sqrt() + SUPPORT_X * doppler.u()).powi(2),
+                    );
+                    if !isotope.ranges.iter().any(|range| {
+                        range.is_evaluable()
+                            && range.energy_low <= read.0
+                            && read.1 <= range.energy_high
+                    }) {
+                        return Err(PipelineError::InvalidParameter(format!(
+                            "the Doppler-broadened cross section of {} in region {} reads \
+                             {:.6e}–{:.6e} eV, which no single one of its evaluated (SLBW, \
+                             MLBW or Reich–Moore) resolved ranges holds",
+                            isotope.isotope, lines.region, read.0, read.1
+                        )));
+                    }
+                    Ok(resonance_center_energies(&[isotope])
+                        .into_iter()
+                        .filter(|e| (span_ev.0..=span_ev.1).contains(e))
+                        .collect())
+                })
+                .collect()
+        })
+        .collect()
+}
+
+pub(crate) fn fit_counts_answer(
+    measurement: &Measurement,
+    calibration: &Calibration,
+    starts: Option<&Starts>,
+) -> Result<(CountsFit, Answer), PipelineError> {
+    let Measurement {
+        time_edges_us,
+        charge_ratio,
+        regions,
+        ..
+    } = measurement;
+    let Checked {
+        shape,
+        sample_parameters,
+        measured,
+        lines,
+        instrument,
+        mut base,
+        mut resonances_in_span,
+    } = checked(measurement, calibration)?;
+    let pulse = &calibration.pulse;
+    let start: Vec<f64> = instrument.iter().map(|parameter| parameter.value).collect();
+    let beam_origin_us = starts.map_or(start[0], |starts| starts.origin_us);
     let bins = time_edges_us.len() - 1;
     let mut live = Vec::with_capacity(2 * regions.len() * bins);
     for (r, region) in regions.iter().enumerate() {
@@ -528,64 +654,6 @@ pub(crate) fn fit_counts_answer(
         };
         live.extend(checked().map_err(|e| in_region(r, e))?.concat());
     }
-    let calibrated_lines = |t0_us: f64, flight_path_m: f64| -> Result<(), PipelineError> {
-        for lines in &lines {
-            if let Some(((low, high), line)) = pulse.line_span_ev.zip(pulse.uncalibrated_line(
-                lines.isotopes,
-                time_edges_us,
-                t0_us,
-                flight_path_m,
-            )) {
-                return Err(PipelineError::InvalidParameter(format!(
-                    "region {} has a resonance at {line} eV, outside the {low}–{high} eV of the \
-                     resonances the pulse was calibrated on",
-                    lines.region
-                )));
-            }
-        }
-        Ok(())
-    };
-    calibrated_lines(start[0], start[1])?;
-
-    let in_span = |grid: &FlightTimeGrid| -> Result<Vec<Vec<Vec<f64>>>, PipelineError> {
-        let energies = grid.energies_ev();
-        let span_ev = (energies[energies.len() - 1], energies[0]);
-        lines
-            .iter()
-            .map(|lines| {
-                lines
-                    .isotopes
-                    .iter()
-                    .zip(&lines.dopplers)
-                    .map(|((isotope, _), doppler)| {
-                        let read = (
-                            (span_ev.0.sqrt() - SUPPORT_X * doppler.u())
-                                .max(0.0)
-                                .powi(2),
-                            (span_ev.1.sqrt() + SUPPORT_X * doppler.u()).powi(2),
-                        );
-                        if !isotope.ranges.iter().any(|range| {
-                            range.is_evaluable()
-                                && range.energy_low <= read.0
-                                && read.1 <= range.energy_high
-                        }) {
-                            return Err(PipelineError::InvalidParameter(format!(
-                                "the Doppler-broadened cross section of {} in region {} reads \
-                                 {:.6e}–{:.6e} eV, which no single one of its evaluated (SLBW, \
-                                 MLBW or Reich–Moore) resolved ranges holds",
-                                isotope.isotope, lines.region, read.0, read.1
-                            )));
-                        }
-                        Ok(resonance_center_energies(&[isotope])
-                            .into_iter()
-                            .filter(|e| (span_ev.0..=span_ev.1).contains(e))
-                            .collect())
-                    })
-                    .collect()
-            })
-            .collect()
-    };
-    let mut resonances_in_span = in_span(&base)?;
 
     let opens: Vec<BeamStart> = match starts {
         Some(starts) => starts.beams.clone(),
@@ -600,11 +668,7 @@ pub(crate) fn fit_counts_answer(
                     Some(&live[2 * r * bins..(2 * r + 1) * bins]),
                 )
                 .map_err(|e| in_region(r, e))?;
-                Ok(BeamStart {
-                    beam: open.beam,
-                    overdispersion: open.overdispersion,
-                    at_limit: open.at_limit,
-                })
+                Ok(BeamStart::from(open))
             })
             .collect::<Result<_, PipelineError>>()?,
     };
@@ -792,7 +856,7 @@ pub(crate) fn fit_counts_answer(
                 fitted(layout.flight_path),
                 &calibration.pulse.at(&fit.result.params[layout.pulse..])?,
             )?;
-            resonances_in_span = in_span(&base)?;
+            resonances_in_span = in_span(&lines, &base)?;
             first = first_grid(&base, &resonances_in_span, &fit.result.params)?;
         }
         for (r, sample) in samples.iter().enumerate() {
@@ -803,6 +867,9 @@ pub(crate) fn fit_counts_answer(
     let converged = fit.converged && settled;
     if converged {
         calibrated_lines(
+            &lines,
+            pulse,
+            time_edges_us,
             fit.result.params[layout.t0],
             fit.result.params[layout.flight_path],
         )?;
@@ -920,15 +987,18 @@ pub(crate) fn fit_counts_answer(
             overdispersion,
         })
         .collect();
-    let mut held = vec![true; params.len()];
+    let mut fitted = vec![false; params.len()];
+    let mut at_bound = vec![false; params.len()];
     for (&index, &bound) in free.iter().zip(&fit.result.on_bound) {
-        held[index] = bound;
+        fitted[index] = true;
+        at_bound[index] = bound;
     }
     let answer = Answer {
         grid: Arc::clone(&fit.fine),
         dispersion: (0..observed.len()).map(|k| weights[k / bins]).collect(),
         params: params.clone(),
-        held,
+        fitted,
+        at_bound,
         beams,
         resonances,
         charge_ratio: *charge_ratio,
@@ -971,13 +1041,15 @@ pub(crate) struct Answer {
     observed: Vec<f64>,
     dispersion: Vec<f64>,
     params: Vec<f64>,
-    held: Vec<bool>,
+    fitted: Vec<bool>,
+    at_bound: Vec<bool>,
 }
 
 pub(crate) struct RegionTerms {
     pub(crate) quantities: Vec<Role>,
     pub(crate) gradient: Vec<f64>,
     pub(crate) information: FlatMatrix,
+    pub(crate) unbounded: Option<(FlatMatrix, Vec<f64>)>,
     pub(crate) sensitivity: FlatMatrix,
     pub(crate) covariance: FlatMatrix,
     pub(crate) slopes: FlatMatrix,
@@ -991,18 +1063,19 @@ impl Answer {
         shared: &[Role],
     ) -> Result<RegionTerms, PipelineError> {
         let roles = &self.layout.roles;
-        let fitted = |of: &dyn Fn(Role) -> bool| -> Vec<usize> {
-            (0..roles.len())
-                .filter(|&i| !self.held[i] && of(roles[i]))
-                .collect()
-        };
-        let own = fitted(&|role| match role {
-            Role::Beam { region: r, .. }
-            | Role::Density { region: r, .. }
-            | Role::Temperature { region: r }
-            | Role::Background { region: r, .. } => r == region,
-            _ => false,
-        });
+        let own: Vec<usize> = (0..roles.len())
+            .filter(|&i| {
+                self.fitted[i]
+                    && matches!(
+                        roles[i],
+                        Role::Beam { region: r, .. }
+                            | Role::Density { region: r, .. }
+                            | Role::Temperature { region: r }
+                            | Role::Background { region: r, .. }
+                            if r == region
+                    )
+            })
+            .collect();
         let shared: Vec<usize> = shared
             .iter()
             .map(|&role| {
@@ -1058,8 +1131,13 @@ impl Answer {
             }
         }
         let (o, s) = (own.len(), shared.len());
-        let scale: Vec<f64> = (0..o).map(|a| full[(a, a)].sqrt()).collect();
-        let factor = Mat::from_fn(o, o, |a, b| full[(a, b)] / (scale[a] * scale[b]))
+        let profile = |set: Vec<usize>| -> Result<Profile, PipelineError> {
+            let determined: Vec<usize> = set.into_iter().filter(|&a| full[(a, a)] > 0.0).collect();
+            let d = determined.len();
+            let scale: Vec<f64> = determined.iter().map(|&a| full[(a, a)].sqrt()).collect();
+            let factor = Mat::from_fn(d, d, |i, j| {
+                full[(determined[i], determined[j])] / (scale[i] * scale[j])
+            })
             .llt(Side::Lower)
             .map_err(|e| {
                 PipelineError::Fitting(FittingError::EvaluationFailed(format!(
@@ -1067,27 +1145,61 @@ impl Answer {
                      beam: {e:?}"
                 )))
             })?;
-        let coupling = Mat::from_fn(o, s, |a, j| full[(a, o + j)] / scale[a]);
-        let solved = factor.solve(&coupling);
-        let inverse = factor.inverse();
-        let moved = |a: usize, j: usize| -solved[(a, j)] / scale[a];
-        let quantities: Vec<usize> = (0..o)
-            .filter(|&a| !matches!(roles[own[a]], Role::Beam { .. }))
-            .collect();
-        let mut information = FlatMatrix::zeros(s, s);
-        for i in 0..s {
-            for j in 0..s {
-                *information.get_mut(i, j) = full[(o + i, o + j)]
-                    - (0..o)
-                        .map(|a| coupling[(a, i)] * solved[(a, j)])
-                        .sum::<f64>();
+            let coupling = Mat::from_fn(d, s, |i, j| full[(determined[i], o + j)] / scale[i]);
+            let solved = factor.solve(&coupling);
+            let mut information = FlatMatrix::zeros(s, s);
+            for i in 0..s {
+                for j in 0..s {
+                    *information.get_mut(i, j) = full[(o + i, o + j)]
+                        - (0..d)
+                            .map(|a| coupling[(a, i)] * solved[(a, j)])
+                            .sum::<f64>();
+                }
             }
-        }
+            let mut moved = FlatMatrix::zeros(d, s);
+            for i in 0..d {
+                for j in 0..s {
+                    *moved.get_mut(i, j) = -solved[(i, j)] / scale[i];
+                }
+            }
+            let profiled = (0..s)
+                .map(|j| {
+                    gradient[o + j]
+                        + (0..d)
+                            .map(|i| moved.get(i, j) * gradient[determined[i]])
+                            .sum::<f64>()
+                })
+                .collect();
+            Ok(Profile {
+                inverse: factor.inverse(),
+                determined,
+                scale,
+                moved,
+                information,
+                gradient: profiled,
+            })
+        };
+        let bounded = profile((0..o).filter(|&a| !self.at_bound[own[a]]).collect())?;
+        let unbounded = profile((0..o).collect())
+            .ok()
+            .map(|profile| (profile.information, profile.gradient));
+        let Profile {
+            determined,
+            scale,
+            moved,
+            inverse,
+            information,
+            gradient,
+        } = bounded;
+        let d = determined.len();
+        let quantities: Vec<usize> = (0..d)
+            .filter(|&i| !matches!(roles[own[determined[i]]], Role::Beam { .. }))
+            .collect();
         let mut sensitivity = FlatMatrix::zeros(quantities.len(), s);
         let mut covariance = FlatMatrix::zeros(quantities.len(), quantities.len());
         for (row, &a) in quantities.iter().enumerate() {
             for j in 0..s {
-                *sensitivity.get_mut(row, j) = moved(a, j);
+                *sensitivity.get_mut(row, j) = moved.get(a, j);
             }
             for (col, &b) in quantities.iter().enumerate() {
                 *covariance.get_mut(row, col) = inverse[(a, b)] / (scale[a] * scale[b]);
@@ -1097,21 +1209,34 @@ impl Answer {
         for (row, k) in rows.enumerate() {
             for j in 0..s {
                 *slopes.get_mut(row, j) = jacobian.get(k, o + j)
-                    + (0..o)
-                        .map(|a| jacobian.get(k, a) * moved(a, j))
+                    + (0..d)
+                        .map(|i| jacobian.get(k, determined[i]) * moved.get(i, j))
                         .sum::<f64>();
             }
         }
         Ok(RegionTerms {
-            quantities: quantities.iter().map(|&a| roles[own[a]]).collect(),
-            gradient: gradient[o..].to_vec(),
+            quantities: quantities
+                .iter()
+                .map(|&i| roles[own[determined[i]]])
+                .collect(),
+            gradient,
             information,
+            unbounded,
             sensitivity,
             covariance,
             slopes,
             weights,
         })
     }
+}
+
+struct Profile {
+    determined: Vec<usize>,
+    scale: Vec<f64>,
+    moved: FlatMatrix,
+    inverse: Mat<f64>,
+    information: FlatMatrix,
+    gradient: Vec<f64>,
 }
 
 pub(crate) const SHARED: [Role; 9] = [
@@ -1298,7 +1423,7 @@ pub(crate) fn labelled(label: &str, error: PipelineError) -> PipelineError {
         PipelineError::ShapeMismatch(message) => {
             PipelineError::ShapeMismatch(format!("{label}: {message}"))
         }
-        other => PipelineError::InvalidParameter(format!("{label}: {other}")),
+        other => other,
     }
 }
 
@@ -2100,6 +2225,27 @@ mod tests {
             .map(|(i, j)| 0.5 * gradient[i] * joint[(i, j)] * gradient[j])
             .sum();
         assert!(decrement <= 1e-6, "{decrement}");
+        let mut nudged = answer;
+        let roles = nudged.layout.roles.clone();
+        for (i, &role) in roles.iter().enumerate() {
+            if matches!(
+                role,
+                Role::Density { region: 0, .. } | Role::Temperature { region: 0 }
+            ) {
+                nudged.params[i] += covariance.get(at(role), at(role)).sqrt();
+            }
+        }
+        let nudged_terms: Vec<RegionTerms> = (0..3)
+            .map(|r| nudged.region_terms(r, &shared).expect("terms"))
+            .collect();
+        let gradient: Vec<f64> = (0..k)
+            .map(|i| nudged_terms.iter().map(|t| t.gradient[i]).sum())
+            .collect();
+        let decrement: f64 = (0..k)
+            .flat_map(|i| (0..k).map(move |j| (i, j)))
+            .map(|(i, j)| 0.5 * gradient[i] * joint[(i, j)] * gradient[j])
+            .sum();
+        assert!(decrement <= 1e-2, "{decrement}");
     }
 
     #[test]
@@ -2182,7 +2328,7 @@ mod tests {
                 line_span_ev: None,
                 prior: Some(crate::pulse_calibration::PulsePrior {
                     numbers: vec![0, 1],
-                    mean: vec![0.35, 0.05],
+                    mean: vec![0.36, 0.05],
                     covariance: FlatMatrix {
                         data: vec![1.0e-4, -2.0e-5, -2.0e-5, 1.0e-5],
                         nrows: 2,
@@ -2264,6 +2410,16 @@ mod tests {
                 / covariance.get(at(own[0]), at(own[0])).sqrt(),
         ];
         assert!(gaps.iter().all(|g| g.abs() <= 0.01), "{gaps:?}");
+        let [Some(map_test), Some(joint_test)] =
+            [result.pulse_consistency, joint.pulse_consistency]
+        else {
+            panic!("a pulse consistency");
+        };
+        assert_eq!(map_test.dof, joint_test.dof);
+        assert!(
+            (map_test.q - joint_test.q).abs() <= 1e-3 * joint_test.q,
+            "{map_test:?} vs {joint_test:?}"
+        );
     }
 
     #[test]

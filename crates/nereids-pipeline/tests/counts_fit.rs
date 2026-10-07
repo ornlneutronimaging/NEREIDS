@@ -747,6 +747,14 @@ fn a_map_recovers_each_patch_and_its_covariance_between_patches_is_the_shared_qu
     let joint_covariance = joint.covariance.as_ref().expect("covariance");
     let joint_sd = |i: usize| joint_covariance.get(i, i).sqrt();
     let (normalization, flight_path) = (12, 18);
+    let [Some(map_pulls), Some(joint_pulls)] = [&result.measured_pulls, &joint.measured_pulls]
+    else {
+        panic!("measured pulls");
+    };
+    assert!(
+        (map_pulls[0] - joint_pulls[0]).abs() <= 1e-3,
+        "{map_pulls:?} vs {joint_pulls:?}"
+    );
     let mut gaps = vec![
         (result.normalization - joint.normalization) / joint_sd(normalization),
         (result.flight_path_m - joint.flight_path_m) / joint_sd(flight_path),
@@ -883,13 +891,10 @@ fn maps_the_fit_does_not_describe_are_refused() {
             }
             other => panic!("{other:?}"),
         };
-    refused(
-        &base,
-        "patch (0, 0): region 0: the open-beam run has no counts",
-    );
+    refused(&base, "patch (0, 0): the open-beam run has no counts");
     let mut map = base.clone();
     map.sample = six.view();
-    refused(&map, "region 0: the open-beam run has no counts");
+    refused(&map, "patch (0, 0): the open-beam run has no counts");
     map.sample_counts = broken.view();
     refused(&map, "got NaN in bin 3 of pixel (0, 1)");
     map.sample = none.view();
@@ -3535,16 +3540,13 @@ mod maps {
     }
 
     #[test]
-    fn a_template_no_patch_can_fit_refuses_the_map_while_the_empty_pixels_fit() {
+    fn a_template_fit_counts_refuses_refuses_the_map_before_any_patch_is_fitted() {
         let truths = [([THIN, THIN], 300.0)];
         let tiled = tiled(&truths, |_, _| 0, (1, 1));
         let map = tiled.map(Value::Fitted(0.5), [Value::Known(0.0); 3]);
         match fit_map(&map, &tiled.calibration()) {
             Err(PipelineError::InvalidParameter(message)) => {
-                assert!(
-                    message.starts_with("patch (0, 0): temperature"),
-                    "{message}"
-                )
+                assert!(message.starts_with("temperature"), "{message}")
             }
             other => panic!("{other:?}"),
         }
@@ -3558,6 +3560,54 @@ mod maps {
         let result = fit_map(&map, &tiled.calibration()).expect("map");
         assert!(result.converged);
         assert!(result.failed[[0, 0]].is_none(), "{:?}", result.failed);
+    }
+
+    #[test]
+    fn a_patch_whose_counts_say_nothing_of_its_temperature_is_fitted() {
+        let truths = [([THIN, THIN], 300.0), ([0.0, 0.0], 300.0)];
+        let mut tiled = tiled(&truths, |_, j| j, (1, 2));
+        tiled.counts[1]
+            .slice_mut(s![.., 0..2, 2..4])
+            .mapv_inplace(|count| (1.1 * count).round());
+        let mut map = tiled.map(Value::Fitted(400.0), [Value::Known(0.0); 3]);
+        map.normalization = Value::Fitted(TERMS[0]);
+        map.background = [Value::Known(0.05), Value::Known(0.0), Value::Known(0.0)];
+        for (_, density) in &mut map.material.isotopes {
+            *density = Value::Fitted(0.0);
+        }
+        let result = fit_map(&map, &tiled.calibration()).expect("map");
+        assert!(result.converged);
+        assert!(result.failed[[0, 1]].is_none(), "{:?}", result.failed);
+        assert!((0..2).all(|m| result.densities[m][[0, 1]] == 0.0));
+        assert!(result.temperature_sd_k[[0, 1]].is_nan());
+    }
+
+    #[test]
+    fn a_map_started_at_its_answer_counts_the_shared_leverage() {
+        let truths = [([THIN, THIN], 300.0), ([1.5 * THIN, 0.5 * THIN], 450.0)];
+        let mut tiled = tiled(&truths, |_, j| j, (1, 2));
+        for (run, counts) in tiled.counts.iter_mut().enumerate() {
+            for (k, count) in counts.iter_mut().enumerate() {
+                *count = (*count + 3.0 * count.sqrt() * (1.7 * (k + run) as f64).sin())
+                    .round()
+                    .max(0.0);
+            }
+        }
+        let map = tiled.map(Value::Fitted(400.0), [Value::Known(0.0); 3]);
+        let first = fit_map(&map, &tiled.calibration()).expect("map");
+        let mut again = map.clone();
+        again.normalization = Value::Fitted(first.normalization);
+        let calibration = Calibration {
+            t0_us: Value::Fitted(first.t0_us),
+            flight_path_m: Value::Fitted(first.flight_path_m),
+            ..tiled.calibration()
+        };
+        let second = fit_map(&again, &calibration).expect("map");
+        assert_eq!(second.steps, 0);
+        for patch in [[0, 0], [0, 1]] {
+            let [phi, refitted] = [&first, &second].map(|map| map.overdispersion[1][patch]);
+            assert!((refitted / phi - 1.0).abs() <= 1e-4, "{refitted} vs {phi}");
+        }
     }
 
     #[test]
