@@ -9,13 +9,12 @@ use std::cell::RefCell;
 use std::ops::{Range, RangeInclusive};
 use std::sync::Arc;
 
-use faer::linalg::solvers::{DenseSolveCore, Solve};
-use faer::{Mat, Side};
+use faer::Mat;
 use nereids_endf::resonance::ResonanceData;
 use nereids_fitting::error::FittingError;
 use nereids_fitting::lm::{FitModel, FlatMatrix};
 use nereids_fitting::parameters::{FitParameter, ParameterSet};
-use nereids_fitting::poisson::{Prior, Unbounded};
+use nereids_fitting::poisson::{Prior, Unbounded, determined_inverse};
 use nereids_fitting::statistics::{Consistency, consistency};
 use nereids_physics::continuous_doppler::{SUPPORT_X, broaden_with_derivative};
 use nereids_physics::doppler::DopplerParams;
@@ -28,7 +27,7 @@ use rayon::prelude::*;
 use crate::beam::BeamSpline;
 use crate::error::PipelineError;
 use crate::open_beam::{
-    Calibration, OpenBeamFit, PULSE_NUMBERS, Pulse, Recorded, combined, counted,
+    BOUND, Calibration, OpenBeamFit, PULSE_NUMBERS, Pulse, Recorded, combined, counted,
     fit_on_halved_grids, fit_open_beam, laws, overdispersion, validate_counts, validate_live,
     weights_of,
 };
@@ -326,7 +325,7 @@ pub struct RegionFit {
 /// half maximum, in flight time, of any resonance of any region inside its
 /// energy span, at that region's starting temperature; it is then halved
 /// until the counts of every run of every region, together, meet
-/// [`BOUND`](crate::open_beam::BOUND).  The step is uniform and shared, so a
+/// [`BOUND`].  The step is uniform and shared, so a
 /// wide window whose span holds a narrow resonance at high energy, or a low
 /// fitted temperature in any region, can exceed the grid's point cap; a
 /// temperature a region's counts barely determine can run to 1 K and refuse
@@ -408,6 +407,7 @@ pub(crate) struct Starts {
     pub(crate) beams: Vec<BeamStart>,
     pub(crate) origin_us: f64,
     pub(crate) shared_leverage: Option<Vec<f64>>,
+    pub(crate) bound: f64,
 }
 
 #[derive(Debug, Clone)]
@@ -642,6 +642,16 @@ pub(crate) fn fit_counts_answer(
     let start: Vec<f64> = instrument.iter().map(|parameter| parameter.value).collect();
     let beam_origin_us = starts.map_or(start[0], |starts| starts.origin_us);
     let bins = time_edges_us.len() - 1;
+    if let Some(starts) = starts {
+        assert_eq!(starts.beams.len(), regions.len(), "one beam per region");
+        if let Some(leverage) = &starts.shared_leverage {
+            assert_eq!(
+                leverage.len(),
+                2 * regions.len() * bins,
+                "one leverage per bin"
+            );
+        }
+    }
     let mut live = Vec::with_capacity(2 * regions.len() * bins);
     for (r, region) in regions.iter().enumerate() {
         let checked = || -> Result<[Vec<f64>; 2], PipelineError> {
@@ -784,12 +794,13 @@ pub(crate) fn fit_counts_answer(
                     live: &live,
                 })
             },
-            |grid, params| {
-                Ok(grid.covers(
-                    params[layout.t0],
-                    params[layout.flight_path],
-                    &laws(&params[layout.pulse..]),
-                )?)
+            |spread, grid, params| {
+                Ok(spread <= starts.map_or(BOUND, |starts| starts.bound)
+                    || !grid.covers(
+                        params[layout.t0],
+                        params[layout.flight_path],
+                        &laws(&params[layout.pulse..]),
+                    )?)
             },
         )?;
         let fitted = |index: usize| fit.result.params[index];
@@ -1131,49 +1142,45 @@ impl Answer {
             }
         }
         let (o, s) = (own.len(), shared.len());
+        let counted = rows.len();
         let profile = |set: Vec<usize>| -> Result<Profile, PipelineError> {
-            let determined: Vec<usize> = set.into_iter().filter(|&a| full[(a, a)] > 0.0).collect();
-            let d = determined.len();
-            let scale: Vec<f64> = determined.iter().map(|&a| full[(a, a)].sqrt()).collect();
-            let factor = Mat::from_fn(d, d, |i, j| {
-                full[(determined[i], determined[j])] / (scale[i] * scale[j])
-            })
-            .llt(Side::Lower)
-            .map_err(|e| {
-                PipelineError::Fitting(FittingError::EvaluationFailed(format!(
-                    "the counts of region {region} do not determine its fitted quantities and \
-                     beam: {e:?}"
-                )))
-            })?;
-            let coupling = Mat::from_fn(d, s, |i, j| full[(determined[i], o + j)] / scale[i]);
-            let solved = factor.solve(&coupling);
+            let m = set.len();
+            let mut block = FlatMatrix::zeros(m, m);
+            for (a, &i) in set.iter().enumerate() {
+                for (b, &j) in set.iter().enumerate() {
+                    *block.get_mut(a, b) = full[(i, j)];
+                }
+            }
+            let (inverse, resolved) = determined_inverse(&block, counted)?;
+            let mut moved = FlatMatrix::zeros(m, s);
+            for a in 0..m {
+                for j in 0..s {
+                    *moved.get_mut(a, j) = -(0..m)
+                        .map(|b| inverse.get(a, b) * full[(set[b], o + j)])
+                        .sum::<f64>();
+                }
+            }
             let mut information = FlatMatrix::zeros(s, s);
             for i in 0..s {
                 for j in 0..s {
                     *information.get_mut(i, j) = full[(o + i, o + j)]
-                        - (0..d)
-                            .map(|a| coupling[(a, i)] * solved[(a, j)])
+                        + (0..m)
+                            .map(|a| full[(o + i, set[a])] * moved.get(a, j))
                             .sum::<f64>();
-                }
-            }
-            let mut moved = FlatMatrix::zeros(d, s);
-            for i in 0..d {
-                for j in 0..s {
-                    *moved.get_mut(i, j) = -solved[(i, j)] / scale[i];
                 }
             }
             let profiled = (0..s)
                 .map(|j| {
                     gradient[o + j]
-                        + (0..d)
-                            .map(|i| moved.get(i, j) * gradient[determined[i]])
+                        + (0..m)
+                            .map(|a| moved.get(a, j) * gradient[set[a]])
                             .sum::<f64>()
                 })
                 .collect();
             Ok(Profile {
-                inverse: factor.inverse(),
-                determined,
-                scale,
+                set,
+                inverse,
+                resolved,
                 moved,
                 information,
                 gradient: profiled,
@@ -1184,41 +1191,45 @@ impl Answer {
             .ok()
             .map(|profile| (profile.information, profile.gradient));
         let Profile {
-            determined,
-            scale,
-            moved,
+            set,
             inverse,
+            resolved,
+            moved,
             information,
             gradient,
         } = bounded;
-        let d = determined.len();
-        let quantities: Vec<usize> = (0..d)
-            .filter(|&i| !matches!(roles[own[determined[i]]], Role::Beam { .. }))
+        let quantities: Vec<usize> = (0..set.len())
+            .filter(|&a| !matches!(roles[own[set[a]]], Role::Beam { .. }))
             .collect();
         let mut sensitivity = FlatMatrix::zeros(quantities.len(), s);
         let mut covariance = FlatMatrix::zeros(quantities.len(), quantities.len());
         for (row, &a) in quantities.iter().enumerate() {
             for j in 0..s {
-                *sensitivity.get_mut(row, j) = moved.get(a, j);
+                *sensitivity.get_mut(row, j) = if resolved[a] {
+                    moved.get(a, j)
+                } else {
+                    f64::NAN
+                };
             }
             for (col, &b) in quantities.iter().enumerate() {
-                *covariance.get_mut(row, col) = inverse[(a, b)] / (scale[a] * scale[b]);
+                *covariance.get_mut(row, col) = if resolved[a] && resolved[b] {
+                    inverse.get(a, b)
+                } else {
+                    f64::NAN
+                };
             }
         }
-        let mut slopes = FlatMatrix::zeros(rows.len(), s);
+        let mut slopes = FlatMatrix::zeros(counted, s);
         for (row, k) in rows.enumerate() {
             for j in 0..s {
                 *slopes.get_mut(row, j) = jacobian.get(k, o + j)
-                    + (0..d)
-                        .map(|i| jacobian.get(k, determined[i]) * moved.get(i, j))
+                    + (0..set.len())
+                        .map(|a| jacobian.get(k, set[a]) * moved.get(a, j))
                         .sum::<f64>();
             }
         }
         Ok(RegionTerms {
-            quantities: quantities
-                .iter()
-                .map(|&i| roles[own[determined[i]]])
-                .collect(),
+            quantities: quantities.iter().map(|&a| roles[own[set[a]]]).collect(),
             gradient,
             information,
             unbounded,
@@ -1231,10 +1242,10 @@ impl Answer {
 }
 
 struct Profile {
-    determined: Vec<usize>,
-    scale: Vec<f64>,
+    set: Vec<usize>,
+    inverse: FlatMatrix,
+    resolved: Vec<bool>,
     moved: FlatMatrix,
-    inverse: Mat<f64>,
     information: FlatMatrix,
     gradient: Vec<f64>,
 }
@@ -1925,6 +1936,9 @@ impl FitModel for RegionsModel {
 mod tests {
     use nereids_endf::resonance::test_support::synthetic_isotope;
 
+    use faer::Side;
+    use faer::linalg::solvers::DenseSolveCore;
+
     use super::*;
     use crate::open_beam::Pulse;
     use crate::open_beam::tests::{ALPHA, BETA, EDGES_US, FLIGHT_PATH_M, R, T0_US, grid};
@@ -2208,6 +2222,7 @@ mod tests {
                 at_limit: joined.beam_at_limit,
             }],
             origin_us: answer.beam_origin_us,
+            bound: BOUND,
             shared_leverage: Some(leverage[0].clone()),
         };
         let (region, _) = fit_counts_answer(&alone, &held, Some(&starts)).expect("fit");

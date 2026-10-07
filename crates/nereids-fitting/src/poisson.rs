@@ -600,6 +600,60 @@ impl Decomposition {
     }
 }
 
+/// The inverse of the expected information `information` of `rows` counts
+/// over the directions it determines, as [`poisson_fit`] inverts it: a
+/// parameter with no information has a zero row and column, and an
+/// eigen-direction of the information scaled to a unit diagonal whose
+/// eigenvalue is below 1e-12 is left out.  `resolved[i]` is whether
+/// parameter `i` has information and, beyond rounding, no component along a
+/// direction left out.
+///
+/// # Errors
+/// [`FittingError::EvaluationFailed`] if the eigendecomposition fails.
+pub fn determined_inverse(
+    information: &FlatMatrix,
+    rows: usize,
+) -> Result<(FlatMatrix, Vec<bool>), FittingError> {
+    let n = information.nrows;
+    let kept: Vec<usize> = (0..n).filter(|&i| information.get(i, i) > 0.0).collect();
+    let k = kept.len();
+    let scale: Vec<f64> = kept.iter().map(|&i| information.get(i, i).sqrt()).collect();
+    let eigen = Mat::from_fn(k, k, |a, b| {
+        information.get(kept[a], kept[b]) / (scale[a] * scale[b])
+    })
+    .self_adjoint_eigen(Side::Lower)
+    .map_err(|e| FittingError::EvaluationFailed(format!("{e:?}")))?;
+    let (values, vectors) = (eigen.S().column_vector(), eigen.U());
+    let determined: Vec<usize> = (0..k)
+        .filter(|&d| values[d] >= DEGENERATE_EIGENVALUE)
+        .collect();
+    let largest = (0..k)
+        .map(|d| values[d].max(0.0).sqrt())
+        .fold(0.0, f64::max);
+    let mut inverse = FlatMatrix::zeros(n, n);
+    let mut resolved = vec![false; n];
+    for a in 0..k {
+        for b in 0..k {
+            *inverse.get_mut(kept[a], kept[b]) = determined
+                .iter()
+                .map(|&d| vectors[(a, d)] * vectors[(b, d)] / values[d])
+                .sum::<f64>()
+                / (scale[a] * scale[b]);
+        }
+        let sensitivity: f64 = determined
+            .iter()
+            .map(|&d| vectors[(a, d)].abs() / values[d].sqrt())
+            .sum();
+        let rounding = f64::EPSILON * rows.max(k) as f64 * largest * sensitivity;
+        resolved[kept[a]] = (0..k)
+            .filter(|&d| values[d] < DEGENERATE_EIGENVALUE)
+            .map(|d| vectors[(a, d)].powi(2))
+            .sum::<f64>()
+            <= rounding.powi(2);
+    }
+    Ok((inverse, resolved))
+}
+
 fn withheld(n_free: usize) -> (FlatMatrix, Vec<Option<f64>>) {
     let mut covariance = FlatMatrix::zeros(n_free, n_free);
     covariance.data.fill(f64::NAN);

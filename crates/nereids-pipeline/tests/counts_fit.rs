@@ -3433,22 +3433,32 @@ mod maps {
     fn tiled(
         truths: &[([f64; 2], f64)],
         pick: impl Fn(usize, usize) -> usize,
+        shape: (usize, usize),
+    ) -> Tiled {
+        let isotopes = [
+            hafnium_like(20.0),
+            synthetic_isotope(74, 182, 24.0, 0.01, 0.06),
+        ];
+        tiled_from(isotopes, 0.05, truths, pick, shape)
+    }
+
+    fn tiled_from(
+        isotopes: [ResonanceData; 2],
+        b0: f64,
+        truths: &[([f64; 2], f64)],
+        pick: impl Fn(usize, usize) -> usize,
         (rows, cols): (usize, usize),
     ) -> Tiled {
         let setup = Setup {
             pulse: pulse(0.0, 200.0),
             ..standard()
         };
-        let isotopes = [
-            hafnium_like(20.0),
-            synthetic_isotope(74, 182, 24.0, 0.01, 0.06),
-        ];
         let unit: Vec<(Vec<f64>, Vec<f64>)> = truths
             .iter()
             .map(|&(densities, t)| {
                 let sample: Vec<(ResonanceData, f64)> =
                     isotopes.iter().cloned().zip(densities).collect();
-                with_background(&setup, &beam(1.0e6), &sample, t, [TERMS[0], 0.05, 0.0, 0.0])
+                with_background(&setup, &beam(1.0e6), &sample, t, [TERMS[0], b0, 0.0, 0.0])
             })
             .chain([with_background(
                 &setup,
@@ -3608,6 +3618,80 @@ mod maps {
             let [phi, refitted] = [&first, &second].map(|map| map.overdispersion[1][patch]);
             assert!((refitted / phi - 1.0).abs() <= 1e-4, "{refitted} vs {phi}");
         }
+    }
+
+    #[test]
+    #[ignore = "slow; runs nightly"]
+    fn a_map_of_sixteen_alike_patches_is_the_joint_fit_on_the_shared_quantities() {
+        let side = 4;
+        let truths = [([THIN, THIN], 300.0)];
+        let tiled = tiled(&truths, |_, _| 0, (side, side));
+        let map = tiled.map(Value::Fitted(400.0), [Value::Known(0.0); 3]);
+        let calibration = tiled.calibration();
+        let result = fit_map(&map, &calibration).expect("map");
+        let summed = |run: usize, ys: std::ops::Range<usize>, xs: std::ops::Range<usize>| {
+            let counts = &tiled.counts[run];
+            (0..counts.dim().0)
+                .map(|k| {
+                    ys.clone()
+                        .flat_map(|y| xs.clone().map(move |x| (y, x)))
+                        .map(|(y, x)| counts[[k, y, x]])
+                        .sum::<f64>()
+                })
+                .collect::<Vec<f64>>()
+        };
+        let mut regions: Vec<Region> = (0..side)
+            .flat_map(|i| (0..side).map(move |j| (i, j)))
+            .map(|(i, j)| Region {
+                open_counts: summed(0, 2 * i..2 * i + 2, 2 * j..2 * j + 2),
+                sample_counts: summed(1, 2 * i..2 * i + 2, 2 * j..2 * j + 2),
+                open_live: None,
+                sample_live: None,
+                background: map.background,
+                material: Some(map.material.clone()),
+            })
+            .collect();
+        regions.push(Region {
+            open_counts: summed(0, 2 * side..2 * side + 1, 0..2 * side),
+            sample_counts: summed(1, 2 * side..2 * side + 1, 0..2 * side),
+            open_live: None,
+            sample_live: None,
+            background: map.empty_background,
+            material: None,
+        });
+        let joint = fit_counts(
+            &Measurement {
+                time_edges_us: map.time_edges_us.clone(),
+                charge_ratio: map.charge_ratio,
+                normalization: map.normalization,
+                regions,
+            },
+            &calibration,
+        )
+        .expect("joint");
+        assert!(result.converged && joint.converged);
+        let shared = result.shared_covariance.as_ref().expect("covariance");
+        let gaps = [
+            (result.t0_us - joint.t0_us) / shared.get(1, 1).sqrt(),
+            (result.flight_path_m - joint.flight_path_m) / shared.get(2, 2).sqrt(),
+        ];
+        assert!(gaps.iter().all(|g| g.abs() <= 2.5e-4), "{gaps:?}");
+    }
+
+    #[test]
+    fn densities_the_counts_cannot_tell_apart_are_left_undetermined() {
+        let first = hafnium_like(20.0);
+        let mut twin = first.clone();
+        twin.za += 1;
+        let truths = [([THIN, THIN], 300.0)];
+        let tiled = tiled_from([first, twin], 0.05, &truths, |_, _| 0, (1, 1));
+        let mut map = tiled.map(Value::Fitted(400.0), [Value::Known(0.0); 3]);
+        map.normalization = Value::Fitted(TERMS[0]);
+        let result = fit_map(&map, &tiled.calibration()).expect("map");
+        assert!(result.converged);
+        assert!(result.failed[[0, 0]].is_none(), "{:?}", result.failed);
+        assert!((0..2).all(|m| result.density_sd[m][[0, 0]].is_nan()));
+        assert!(result.temperature_sd_k[[0, 0]].is_finite());
     }
 
     #[test]

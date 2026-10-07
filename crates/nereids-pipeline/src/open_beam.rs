@@ -431,7 +431,7 @@ fn fit_beam(
                 live,
             })
         },
-        |_, _| Ok(true),
+        |spread, _, _| Ok(spread <= BOUND),
     )?;
     Ok(Candidate {
         beam: start.with_coefficients(&fit.result.params),
@@ -457,7 +457,7 @@ pub(crate) fn fit_on_halved_grids<M: FitModel>(
     dispersion: &[f64],
     priors: &[Prior],
     model_on: impl Fn(&Arc<FlightTimeGrid>) -> Result<M, PipelineError>,
-    holds: impl Fn(&FlightTimeGrid, &[f64]) -> Result<bool, PipelineError>,
+    done: impl Fn(f64, &FlightTimeGrid, &[f64]) -> Result<bool, PipelineError>,
 ) -> Result<GridFit, PipelineError> {
     let dispersed: Vec<f64> = observed
         .iter()
@@ -491,7 +491,7 @@ pub(crate) fn fit_on_halved_grids<M: FitModel>(
         let coarse_grid = std::mem::replace(&mut grid, finer);
         coarse = fine;
         halvings += 1;
-        if spread <= BOUND || !converged || !holds(&coarse_grid, &result.params)? {
+        if !converged || done(spread, &coarse_grid, &result.params)? {
             return Ok(GridFit {
                 result,
                 converged,
