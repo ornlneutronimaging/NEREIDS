@@ -292,6 +292,8 @@ const DAMPING_FACTOR: f64 = 10.0;
 /// `obs·ln(obs/mean) + mean − obs`, by C. Loader's `bd0` ("Fast and
 /// accurate computation of binomial probabilities", 2000): a series in
 /// `v = (obs − mean)/(obs + mean)` when `|obs − mean| < 0.1 (obs + mean)`.
+/// For `obs ≥ 0` and `mean > 0`; 0 when both are 0, and +∞ when only `mean`
+/// is.
 pub fn half_deviance(obs: f64, mean: f64) -> f64 {
     let half_sum = obs / 2.0 + mean / 2.0;
     let difference = obs - mean;
