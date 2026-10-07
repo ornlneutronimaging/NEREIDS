@@ -280,7 +280,7 @@ pub fn fit_open_beam(
         open_counts,
         richest,
         &counted(richest, 0..open_counts.len()),
-        None,
+        0.0,
     );
     let scale = overdispersion.unwrap_or(1.0);
     let criterion = |candidate: &Candidate| {
@@ -368,7 +368,7 @@ pub(crate) fn validate_live(
     Ok(live)
 }
 
-const COUNTS_TO_MEASURE_NOISE: f64 = 1.0;
+pub(crate) const COUNTS_TO_MEASURE_NOISE: f64 = 1.0;
 
 pub(crate) fn counted(fit: &GridFit, bins: std::ops::Range<usize>) -> Vec<usize> {
     bins.filter(|&k| fit.predicted[k] >= COUNTS_TO_MEASURE_NOISE)
@@ -379,7 +379,7 @@ pub(crate) fn overdispersion(
     observed: &[f64],
     fit: &GridFit,
     counted: &[usize],
-    shared_leverage: Option<&[f64]>,
+    shared_leverage: f64,
 ) -> Option<f64> {
     let leverage = fit.result.leverage.as_ref().filter(|_| fit.converged)?;
     let (pearson, skew, freedom) =
@@ -390,10 +390,11 @@ pub(crate) fn overdispersion(
                 (
                     pearson + (y - mu).powi(2) / mu,
                     skew + (y - mu) / mu,
-                    freedom + 1.0 - leverage[k] - shared_leverage.map_or(0.0, |extra| extra[k]),
+                    freedom + 1.0 - leverage[k],
                 )
             });
     let fletcher = 1.0 + skew / counted.len() as f64;
+    let freedom = freedom - shared_leverage;
     (freedom >= 1.0)
         .then(|| (pearson / freedom / fletcher).clamp(1.0, f64::INFINITY))
         .filter(|phi| phi.is_finite())

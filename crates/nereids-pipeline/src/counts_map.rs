@@ -6,7 +6,9 @@ use faer::{Mat, Side};
 use ndarray::{Array2, Array3, ArrayView2, ArrayView3, s};
 use nereids_fitting::error::FittingError;
 use nereids_fitting::lm::FlatMatrix;
-use nereids_fitting::poisson::{NEWTON_DECREMENT_TOL, Prior, determined_inverse, half_deviance};
+use nereids_fitting::poisson::{
+    InformationInverse, NEWTON_DECREMENT_TOL, Prior, half_deviance, information_inverse,
+};
 use nereids_fitting::statistics::{Consistency, consistency};
 use rayon::prelude::*;
 
@@ -152,7 +154,8 @@ pub struct CountsMap {
     /// out or not fitted.
     pub failed: Array2<Option<String>>,
     /// The empty pixels' fit; `None` when every one is excluded, or when their
-    /// fit fails after the start, which ends the map unconverged.
+    /// refit at the map's shared values fails, which ends the map
+    /// unconverged.
     pub empty: Option<RegionFit>,
     /// Each isotope's areal density in atoms/barn, in the material's order:
     /// the known one, or the fitted one; NaN where the patch has no fit.
@@ -253,14 +256,22 @@ impl CountsMap {
         let free: Vec<usize> = (0..shared.nrows)
             .filter(|&i| shared.get(i, i).is_finite())
             .collect();
+        let undetermined = |patch: (usize, usize), i: usize| {
+            self.covariance[patch]
+                .as_ref()
+                .is_none_or(|covariance| covariance.get(i, i).is_nan())
+        };
         let mut cross = FlatMatrix::zeros(left.nrows, right.nrows);
         for i in 0..left.nrows {
             for j in 0..right.nrows {
-                *cross.get_mut(i, j) = free
-                    .iter()
-                    .flat_map(|&s| free.iter().map(move |&t| (s, t)))
-                    .map(|(s, t)| left.get(i, s) * shared.get(s, t) * right.get(j, t))
-                    .sum();
+                *cross.get_mut(i, j) = if undetermined(a, i) || undetermined(b, j) {
+                    f64::NAN
+                } else {
+                    free.iter()
+                        .flat_map(|&s| free.iter().map(move |&t| (s, t)))
+                        .map(|(s, t)| left.get(i, s) * shared.get(s, t) * right.get(j, t))
+                        .sum()
+                };
             }
         }
         Some(cross)
@@ -290,19 +301,23 @@ impl CountsMap {
 /// step that raises the regions' summed deviance plus the calibration's
 /// prior penalty, each run weighted with the overdispersion of the step
 /// before, or at which a fitted patch fails, is halved, up to ten times;
-/// twenty steps, a step that cannot fall, or a failure of the empty pixels
-/// after the start end the map unconverged.  The directions that the shared
-/// information, or a region's information on its own quantities, does not
-/// determine are left out as [`determined_inverse`] leaves them out, and a
-/// quantity along one has a NaN covariance.  Each of the map's regions holds
+/// twenty steps, a step that cannot fall, or a failure of the empty pixels at
+/// the smallest halving of a step or at their refit at the current values end
+/// the map unconverged.  The shared information and each region's
+/// information on its own quantities are inverted as [`information_inverse`]
+/// inverts them, the shared one scaled to its diagonal before the regions'
+/// own quantities are profiled out: the steps take every direction the
+/// information spans, and a quantity along a direction it does not
+/// determine, or moving with a shared quantity along one, has a NaN
+/// covariance.  Each of the map's regions holds
 /// its grid's spread to [`BOUND`] over the number of
 /// regions, so their summed spread is within the `BOUND` the joint fit holds
 /// it to.
 ///
 /// A patch whose fit fails, does not converge, or ends at a fitted
-/// temperature of 1 K or 5000 K, at the starting shared values or at the
-/// smallest halving of a step none of whose halvings is taken, adds nothing
-/// to the shared quantities; it is fitted again after every step taken and
+/// temperature of 1 K or 5000 K, at the starting shared values, at the
+/// smallest halving of a step none of whose halvings is taken, or at a refit
+/// at the current values, adds nothing to the shared quantities; it is fitted again after every step taken and
 /// adds to them again once it fits.  A patch left out at the end is
 /// [`CountsMap::failed`].
 ///
@@ -501,7 +516,7 @@ pub fn fit_map(
     let fit_region = |r: usize,
                       values: &[f64],
                       previous: Option<&RegionFit>,
-                      shared_leverage: Option<&Vec<f64>>|
+                      shared_leverage: Option<f64>|
      -> Swept {
         let held = held_at(values);
         let label = &labels[r];
@@ -527,7 +542,7 @@ pub fn fit_map(
         let starts = Starts {
             beams: vec![beam],
             origin_us,
-            shared_leverage: shared_leverage.cloned(),
+            shared_leverage: shared_leverage.map(|extra| vec![extra]),
             bound: BOUND / regions.len() as f64,
         };
         let (fit, answer) =
@@ -558,7 +573,7 @@ pub fn fit_map(
     };
     let sweep = |values: &[f64],
                  previous: &[Option<RegionFit>],
-                 leverage: &[Option<Vec<f64>>],
+                 leverage: &[Option<f64>],
                  failures: &[Option<String>],
                  failed: bool|
      -> Vec<Option<Swept>> {
@@ -566,7 +581,7 @@ pub fn fit_map(
             .into_par_iter()
             .map(|r| {
                 (failures[r].is_some() == failed)
-                    .then(|| fit_region(r, values, previous[r].as_ref(), leverage[r].as_ref()))
+                    .then(|| fit_region(r, values, previous[r].as_ref(), leverage[r]))
             })
             .collect()
     };
@@ -597,7 +612,7 @@ pub fn fit_map(
     };
 
     let mut failures: Vec<Option<String>> = vec![None; regions.len()];
-    let mut leverage: Vec<Option<Vec<f64>>> = vec![None; regions.len()];
+    let mut leverage: Vec<Option<f64>> = vec![None; regions.len()];
     let mut previous: Vec<Option<RegionFit>> = vec![None; regions.len()];
     let mut inner: Vec<Option<Inner>> = Vec::with_capacity(regions.len());
     let mut first_failure = None;
@@ -646,14 +661,15 @@ pub fn fit_map(
         ))
     };
     let counted = 2 * bins * regions.len();
-    let inverse_over = |total: &Mat<f64>, set: &[usize]| {
+    let inverse_over = |total: &Mat<f64>, diagonal: &[f64], set: &[usize]| {
         let mut block = FlatMatrix::zeros(set.len(), set.len());
         for (a, &i) in set.iter().enumerate() {
             for (b, &j) in set.iter().enumerate() {
                 *block.get_mut(a, b) = total[(i, j)];
             }
         }
-        determined_inverse(&block, counted)
+        let diagonal: Vec<f64> = set.iter().map(|&i| diagonal[i]).collect();
+        information_inverse(&block, &diagonal, counted)
     };
     let mut steps = 0;
     let mut converged = false;
@@ -667,9 +683,11 @@ pub fn fit_map(
         let (_, prior_slope) = penalty(&values);
         let mut gradient = prior_slope;
         let mut total = prior.clone();
+        let mut diagonal: Vec<f64> = (0..k).map(|a| prior[(a, a)]).collect();
         for terms in inner.iter().flatten().map(|inner| &inner.terms) {
             for a in 0..k {
                 gradient[a] += terms.gradient[a];
+                diagonal[a] += terms.diagonal[a];
                 for b in 0..k {
                     total[(a, b)] += terms.information.get(a, b);
                 }
@@ -682,22 +700,16 @@ pub fn fit_map(
                     || value == parameter.upper && gradient[a] < 0.0)
             })
             .collect();
-        let (covariance, _) = inverse_over(&total, &free)?;
+        let covariance = inverse_over(&total, &diagonal, &free)?.spanned;
         for (shared_leverage, inner) in leverage.iter_mut().zip(&inner) {
             if let Some(Inner { terms, .. }) = inner {
                 *shared_leverage = Some(
-                    terms
-                        .weights
-                        .iter()
-                        .enumerate()
-                        .map(|(row, w)| {
-                            let slope = |a: usize| terms.slopes.get(row, free[a]);
-                            w * (0..free.len())
-                                .flat_map(|a| (0..free.len()).map(move |b| (a, b)))
-                                .map(|(a, b)| slope(a) * covariance.get(a, b) * slope(b))
-                                .sum::<f64>()
+                    (0..free.len())
+                        .flat_map(|a| (0..free.len()).map(move |b| (a, b)))
+                        .map(|(a, b)| {
+                            terms.counted_information.get(free[a], free[b]) * covariance.get(a, b)
                         })
-                        .collect(),
+                        .sum(),
                 );
             }
         }
@@ -729,7 +741,7 @@ pub fn fit_map(
                         _ => unbounded = None,
                     }
                 }
-                break Some((total, unbounded));
+                break Some((total, diagonal, unbounded));
             }
             weighted = true;
             let swept = sweep(&values, &previous, &leverage, &failures, false);
@@ -800,37 +812,48 @@ pub fn fit_map(
             value != parameter.lower && value != parameter.upper
         })
         .collect();
-    let embedded = |set: &[usize], (inverse, resolved): (FlatMatrix, Vec<bool>)| {
+    let embedded = |set: &[usize], inverse: &InformationInverse| {
         let mut covariance = FlatMatrix::zeros(k, k);
         covariance.data.fill(f64::NAN);
         for (a, &i) in set.iter().enumerate() {
             for (b, &j) in set.iter().enumerate() {
-                if resolved[a] && resolved[b] {
-                    *covariance.get_mut(i, j) = inverse.get(a, b);
+                if inverse.resolved[a] && inverse.resolved[b] {
+                    *covariance.get_mut(i, j) = inverse.determined.get(a, b);
                 }
             }
         }
         covariance
     };
-    let shared_covariance = match &information {
-        Some((total, _)) => Some(embedded(&interior, inverse_over(total, &interior)?)),
+    let interior_inverse = match &information {
+        Some((total, diagonal, _)) => Some(inverse_over(total, diagonal, &interior)?),
         None => None,
     };
+    let shared_covariance = interior_inverse
+        .as_ref()
+        .map(|inverse| embedded(&interior, inverse));
+    let mut unresolved = vec![false; k];
+    if let Some(inverse) = &interior_inverse {
+        for (a, &i) in interior.iter().enumerate() {
+            unresolved[i] = !inverse.resolved[a];
+        }
+    }
     let every: Vec<usize> = (0..k).collect();
     let unbounded = match &information {
-        Some((_, Some((total, gradient)))) => {
-            let (inverse, resolved) = inverse_over(total, &every)?;
+        Some((_, diagonal, Some((total, gradient)))) => {
+            let inverse = inverse_over(total, diagonal, &every)?;
             let mean: Vec<f64> = (0..k)
                 .map(|a| {
-                    if resolved[a] {
+                    if inverse.resolved[a] {
                         values[fitted[a]]
-                            - (0..k).map(|b| inverse.get(a, b) * gradient[b]).sum::<f64>()
+                            - (0..k)
+                                .map(|b| inverse.determined.get(a, b) * gradient[b])
+                                .sum::<f64>()
                     } else {
                         f64::NAN
                     }
                 })
                 .collect();
-            Some((mean, embedded(&every, (inverse, resolved))))
+            Some((mean, embedded(&every, &inverse)))
         }
         _ => None,
     };
@@ -914,11 +937,14 @@ pub fn fit_map(
                 *slopes.get_mut(a, s) = row.map_or(f64::NAN, |i| terms.sensitivity.get(i, s));
             }
         }
+        let coupled =
+            |i: usize| (0..k).any(|s| unresolved[s] && terms.sensitivity.get(i, s) != 0.0);
         let marginal = shared_covariance.as_ref().map(|shared| {
             let mut marginal = FlatMatrix::zeros(q, q);
             for (a, row_a) in rows_of.iter().enumerate() {
                 for (b, row_b) in rows_of.iter().enumerate() {
                     *marginal.get_mut(a, b) = match (row_a, row_b) {
+                        (Some(i), Some(j)) if coupled(*i) || coupled(*j) => f64::NAN,
                         (Some(i), Some(j)) => {
                             terms.covariance.get(*i, *j)
                                 + (0..k)

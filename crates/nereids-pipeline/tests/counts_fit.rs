@@ -1,5 +1,6 @@
 use std::cell::RefCell;
 use std::collections::HashMap;
+use std::ops::Range;
 use std::sync::{Arc, LazyLock};
 
 use ndarray::{Array2, Array3, s};
@@ -3527,6 +3528,55 @@ mod maps {
                 ..calibration(&self.setup)
             }
         }
+
+        fn summed(&self, run: usize, ys: Range<usize>, xs: Range<usize>) -> Vec<f64> {
+            (0..self.counts[run].dim().0)
+                .map(|k| {
+                    ys.clone()
+                        .flat_map(|y| xs.clone().map(move |x| (y, x)))
+                        .map(|(y, x)| self.counts[run][[k, y, x]])
+                        .sum()
+                })
+                .collect()
+        }
+
+        fn region(&self, map: &MapMeasurement<'_>, (i, j): (usize, usize)) -> Region {
+            let (ys, xs) = (2 * i..2 * i + 2, 2 * j..2 * j + 2);
+            Region {
+                open_counts: self.summed(0, ys.clone(), xs.clone()),
+                sample_counts: self.summed(1, ys, xs),
+                open_live: None,
+                sample_live: None,
+                background: map.background,
+                material: Some(map.material.clone()),
+            }
+        }
+
+        fn joint(&self, map: &MapMeasurement<'_>, calibration: &Calibration) -> CountsFit {
+            let (_, height, width) = self.counts[0].dim();
+            let regions = (0..height / 2)
+                .flat_map(|i| (0..width / 2).map(move |j| (i, j)))
+                .map(|patch| self.region(map, patch))
+                .chain(map.empty.iter().any(|&e| e).then(|| Region {
+                    open_counts: self.summed(0, height - 1..height, 0..width),
+                    sample_counts: self.summed(1, height - 1..height, 0..width),
+                    open_live: None,
+                    sample_live: None,
+                    background: map.empty_background,
+                    material: None,
+                }))
+                .collect();
+            fit_counts(
+                &Measurement {
+                    time_edges_us: map.time_edges_us.clone(),
+                    charge_ratio: map.charge_ratio,
+                    normalization: map.normalization,
+                    regions,
+                },
+                calibration,
+            )
+            .expect("joint fit")
+        }
     }
 
     fn pulls(
@@ -3550,7 +3600,7 @@ mod maps {
     }
 
     #[test]
-    fn a_template_fit_counts_refuses_refuses_the_map_before_any_patch_is_fitted() {
+    fn a_template_fit_counts_would_refuse_is_refused_before_any_patch_is_fitted() {
         let truths = [([THIN, THIN], 300.0)];
         let tiled = tiled(&truths, |_, _| 0, (1, 1));
         let map = tiled.map(Value::Fitted(0.5), [Value::Known(0.0); 3]);
@@ -3593,7 +3643,7 @@ mod maps {
     }
 
     #[test]
-    fn a_map_started_at_its_answer_counts_the_shared_leverage() {
+    fn a_map_of_scattered_counts_has_the_joint_fits_overdispersion() {
         let truths = [([THIN, THIN], 300.0), ([1.5 * THIN, 0.5 * THIN], 450.0)];
         let mut tiled = tiled(&truths, |_, j| j, (1, 2));
         for (run, counts) in tiled.counts.iter_mut().enumerate() {
@@ -3603,20 +3653,22 @@ mod maps {
                     .max(0.0);
             }
         }
-        let map = tiled.map(Value::Fitted(400.0), [Value::Known(0.0); 3]);
-        let first = fit_map(&map, &tiled.calibration()).expect("map");
-        let mut again = map.clone();
-        again.normalization = Value::Fitted(first.normalization);
+        let mut map = tiled.map(Value::Fitted(400.0), [Value::Known(0.0); 3]);
+        let joint = tiled.joint(&map, &tiled.calibration());
+        map.normalization = Value::Fitted(joint.normalization);
         let calibration = Calibration {
-            t0_us: Value::Fitted(first.t0_us),
-            flight_path_m: Value::Fitted(first.flight_path_m),
+            t0_us: Value::Fitted(joint.t0_us),
+            flight_path_m: Value::Fitted(joint.flight_path_m),
             ..tiled.calibration()
         };
-        let second = fit_map(&again, &calibration).expect("map");
-        assert_eq!(second.steps, 0);
-        for patch in [[0, 0], [0, 1]] {
-            let [phi, refitted] = [&first, &second].map(|map| map.overdispersion[1][patch]);
-            assert!((refitted / phi - 1.0).abs() <= 1e-4, "{refitted} vs {phi}");
+        let result = fit_map(&map, &calibration).expect("map");
+        assert_eq!(result.steps, 0);
+        for (j, region) in joint.regions[..2].iter().enumerate() {
+            let [phi, expected] = [
+                result.overdispersion[1][[0, j]],
+                region.overdispersion[1].unwrap(),
+            ];
+            assert!((phi / expected - 1.0).abs() <= 2e-4, "{phi} vs {expected}");
         }
     }
 
@@ -3629,46 +3681,7 @@ mod maps {
         let map = tiled.map(Value::Fitted(400.0), [Value::Known(0.0); 3]);
         let calibration = tiled.calibration();
         let result = fit_map(&map, &calibration).expect("map");
-        let summed = |run: usize, ys: std::ops::Range<usize>, xs: std::ops::Range<usize>| {
-            let counts = &tiled.counts[run];
-            (0..counts.dim().0)
-                .map(|k| {
-                    ys.clone()
-                        .flat_map(|y| xs.clone().map(move |x| (y, x)))
-                        .map(|(y, x)| counts[[k, y, x]])
-                        .sum::<f64>()
-                })
-                .collect::<Vec<f64>>()
-        };
-        let mut regions: Vec<Region> = (0..side)
-            .flat_map(|i| (0..side).map(move |j| (i, j)))
-            .map(|(i, j)| Region {
-                open_counts: summed(0, 2 * i..2 * i + 2, 2 * j..2 * j + 2),
-                sample_counts: summed(1, 2 * i..2 * i + 2, 2 * j..2 * j + 2),
-                open_live: None,
-                sample_live: None,
-                background: map.background,
-                material: Some(map.material.clone()),
-            })
-            .collect();
-        regions.push(Region {
-            open_counts: summed(0, 2 * side..2 * side + 1, 0..2 * side),
-            sample_counts: summed(1, 2 * side..2 * side + 1, 0..2 * side),
-            open_live: None,
-            sample_live: None,
-            background: map.empty_background,
-            material: None,
-        });
-        let joint = fit_counts(
-            &Measurement {
-                time_edges_us: map.time_edges_us.clone(),
-                charge_ratio: map.charge_ratio,
-                normalization: map.normalization,
-                regions,
-            },
-            &calibration,
-        )
-        .expect("joint");
+        let joint = tiled.joint(&map, &calibration);
         assert!(result.converged && joint.converged);
         let shared = result.shared_covariance.as_ref().expect("covariance");
         let gaps = [
@@ -3676,6 +3689,29 @@ mod maps {
             (result.flight_path_m - joint.flight_path_m) / shared.get(2, 2).sqrt(),
         ];
         assert!(gaps.iter().all(|g| g.abs() <= 2.5e-4), "{gaps:?}");
+    }
+
+    #[test]
+    fn a_quantity_moving_with_an_undetermined_shared_one_is_undetermined() {
+        let truths = [([0.0, 0.0], 300.0)];
+        let tiled = tiled(&truths, |_, _| 0, (1, 2));
+        let none = Array2::from_elem(tiled.empty.dim(), false);
+        let mut map = tiled.map(Value::Known(300.0), [Value::Known(0.0); 3]);
+        for (_, density) in &mut map.material.isotopes {
+            *density = Value::Known(0.0);
+        }
+        map.empty = none.view();
+        let joint = tiled.joint(&map, &tiled.calibration());
+        let result = fit_map(&map, &tiled.calibration()).expect("map");
+        let joint_covariance = joint.covariance.as_ref().expect("covariance");
+        assert!((0..3).all(|i| joint_covariance.get(i, i).is_nan()));
+        assert!(result.converged);
+        let shared = result.shared_covariance.as_ref().expect("covariance");
+        assert!(shared.get(0, 0).is_nan());
+        for patch in [[0, 0], [0, 1]] {
+            let covariance = result.covariance[patch].as_ref().expect("covariance");
+            assert!(covariance.get(0, 0).is_nan(), "{covariance:?}");
+        }
     }
 
     #[test]
@@ -3701,6 +3737,20 @@ mod maps {
         let tiled = tiled(&truths, |_, j| j, (1, 2));
         let mut map = tiled.map(Value::Fitted(400.0), [Value::Known(0.0); 3]);
         map.normalization = Value::Fitted(0.8 * TERMS[0]);
+        let alone = fit_counts(
+            &Measurement {
+                time_edges_us: map.time_edges_us.clone(),
+                charge_ratio: map.charge_ratio,
+                normalization: Value::Known(0.8 * TERMS[0]),
+                regions: vec![tiled.region(&map, (0, 0))],
+            },
+            &Calibration {
+                t0_us: Value::Known(T0_US),
+                flight_path_m: Value::Known(FLIGHT_PATH_M),
+                ..tiled.calibration()
+            },
+        );
+        assert!(alone.map_or(true, |fit| !fit.converged));
         let result = fit_map(&map, &tiled.calibration()).expect("map");
         assert!(result.converged);
         assert!(result.failed[[0, 0]].is_none(), "{:?}", result.failed);

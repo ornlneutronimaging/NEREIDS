@@ -14,7 +14,7 @@ use nereids_endf::resonance::ResonanceData;
 use nereids_fitting::error::FittingError;
 use nereids_fitting::lm::{FitModel, FlatMatrix};
 use nereids_fitting::parameters::{FitParameter, ParameterSet};
-use nereids_fitting::poisson::{Prior, Unbounded, determined_inverse};
+use nereids_fitting::poisson::{Prior, Unbounded, information_inverse};
 use nereids_fitting::statistics::{Consistency, consistency};
 use nereids_physics::continuous_doppler::{SUPPORT_X, broaden_with_derivative};
 use nereids_physics::doppler::DopplerParams;
@@ -27,9 +27,9 @@ use rayon::prelude::*;
 use crate::beam::BeamSpline;
 use crate::error::PipelineError;
 use crate::open_beam::{
-    BOUND, Calibration, OpenBeamFit, PULSE_NUMBERS, Pulse, Recorded, combined, counted,
-    fit_on_halved_grids, fit_open_beam, laws, overdispersion, validate_counts, validate_live,
-    weights_of,
+    BOUND, COUNTS_TO_MEASURE_NOISE, Calibration, OpenBeamFit, PULSE_NUMBERS, Pulse, Recorded,
+    combined, counted, fit_on_halved_grids, fit_open_beam, laws, overdispersion, validate_counts,
+    validate_live, weights_of,
 };
 use crate::pipeline::TEMPERATURE_BOUNDS_K;
 
@@ -645,11 +645,7 @@ pub(crate) fn fit_counts_answer(
     if let Some(starts) = starts {
         assert_eq!(starts.beams.len(), regions.len(), "one beam per region");
         if let Some(leverage) = &starts.shared_leverage {
-            assert_eq!(
-                leverage.len(),
-                2 * regions.len() * bins,
-                "one leverage per bin"
-            );
+            assert_eq!(leverage.len(), regions.len(), "one leverage per region");
         }
     }
     let mut live = Vec::with_capacity(2 * regions.len() * bins);
@@ -811,12 +807,15 @@ pub(crate) fn fit_counts_answer(
         });
         let samples: Vec<Option<f64>> = noise_bins
             .iter()
-            .map(|counted| {
+            .enumerate()
+            .map(|(r, counted)| {
                 overdispersion(
                     &observed,
                     &fit,
                     counted,
-                    starts.and_then(|starts| starts.shared_leverage.as_deref()),
+                    starts
+                        .and_then(|starts| starts.shared_leverage.as_ref())
+                        .map_or(0.0, |extra| extra[r]),
                 )
             })
             .collect();
@@ -1060,11 +1059,11 @@ pub(crate) struct RegionTerms {
     pub(crate) quantities: Vec<Role>,
     pub(crate) gradient: Vec<f64>,
     pub(crate) information: FlatMatrix,
+    pub(crate) diagonal: Vec<f64>,
     pub(crate) unbounded: Option<(FlatMatrix, Vec<f64>)>,
     pub(crate) sensitivity: FlatMatrix,
     pub(crate) covariance: FlatMatrix,
-    pub(crate) slopes: FlatMatrix,
-    pub(crate) weights: Vec<f64>,
+    pub(crate) counted_information: FlatMatrix,
 }
 
 impl Answer {
@@ -1117,28 +1116,27 @@ impl Answer {
         let mut gradient = vec![0.0; n];
         let bins = self.observed.len() / (2 * self.layout.regions.len());
         let rows = 2 * region * bins..2 * (region + 1) * bins;
-        let mut weights = Vec::with_capacity(rows.len());
-        for (((k, &mu), &dispersion), &observed) in rows
+        let mut weights = vec![0.0; rows.len()];
+        for ((((k, &mu), &dispersion), &observed), weight) in rows
             .clone()
             .zip(&predicted[rows.clone()])
             .zip(&self.dispersion[rows.clone()])
             .zip(&self.observed[rows.clone()])
+            .zip(weights.iter_mut())
         {
             if mu > 0.0 {
-                let weight = 1.0 / (mu * dispersion);
+                *weight = 1.0 / (mu * dispersion);
                 for a in 0..n {
                     let slope = jacobian.get(k, a);
-                    gradient[a] += weight * slope * (mu - observed);
+                    gradient[a] += *weight * slope * (mu - observed);
                     for b in 0..n {
-                        full[(a, b)] += weight * slope * jacobian.get(k, b);
+                        full[(a, b)] += *weight * slope * jacobian.get(k, b);
                     }
                 }
-                weights.push(weight);
             } else {
                 for (a, g) in gradient.iter_mut().enumerate() {
                     *g += jacobian.get(k, a) / dispersion;
                 }
-                weights.push(0.0);
             }
         }
         let (o, s) = (own.len(), shared.len());
@@ -1151,25 +1149,29 @@ impl Answer {
                     *block.get_mut(a, b) = full[(i, j)];
                 }
             }
-            let (inverse, resolved) = determined_inverse(&block, counted)?;
+            let diagonal: Vec<f64> = set.iter().map(|&i| full[(i, i)]).collect();
+            let inverse = information_inverse(&block, &diagonal, counted)?;
             let mut moved = FlatMatrix::zeros(m, s);
             for a in 0..m {
                 for j in 0..s {
                     *moved.get_mut(a, j) = -(0..m)
-                        .map(|b| inverse.get(a, b) * full[(set[b], o + j)])
+                        .map(|b| inverse.spanned.get(a, b) * full[(set[b], o + j)])
                         .sum::<f64>();
                 }
             }
+            let profiled = |i: usize, j: usize| {
+                full[(o + i, o + j)]
+                    + (0..m)
+                        .map(|a| full[(o + i, set[a])] * moved.get(a, j))
+                        .sum::<f64>()
+            };
             let mut information = FlatMatrix::zeros(s, s);
             for i in 0..s {
                 for j in 0..s {
-                    *information.get_mut(i, j) = full[(o + i, o + j)]
-                        + (0..m)
-                            .map(|a| full[(o + i, set[a])] * moved.get(a, j))
-                            .sum::<f64>();
+                    *information.get_mut(i, j) = 0.5 * (profiled(i, j) + profiled(j, i));
                 }
             }
-            let profiled = (0..s)
+            let slope = (0..s)
                 .map(|j| {
                     gradient[o + j]
                         + (0..m)
@@ -1179,11 +1181,11 @@ impl Answer {
                 .collect();
             Ok(Profile {
                 set,
-                inverse,
-                resolved,
+                inverse: inverse.determined,
+                resolved: inverse.resolved,
                 moved,
                 information,
-                gradient: profiled,
+                gradient: slope,
             })
         };
         let bounded = profile((0..o).filter(|&a| !self.at_bound[own[a]]).collect())?;
@@ -1219,24 +1221,35 @@ impl Answer {
                 };
             }
         }
-        let mut slopes = FlatMatrix::zeros(counted, s);
-        for (row, k) in rows.enumerate() {
-            for j in 0..s {
-                *slopes.get_mut(row, j) = jacobian.get(k, o + j)
-                    + (0..set.len())
-                        .map(|a| jacobian.get(k, set[a]) * moved.get(a, j))
-                        .sum::<f64>();
+        let mut counted_information = FlatMatrix::zeros(s, s);
+        let sample = rows.start + counted / 2..rows.end;
+        for (k, &weight) in sample.clone().zip(&weights[counted / 2..]) {
+            if predicted[k] < COUNTS_TO_MEASURE_NOISE {
+                continue;
+            }
+            let slope: Vec<f64> = (0..s)
+                .map(|j| {
+                    jacobian.get(k, o + j)
+                        + (0..set.len())
+                            .map(|a| jacobian.get(k, set[a]) * moved.get(a, j))
+                            .sum::<f64>()
+                })
+                .collect();
+            for i in 0..s {
+                for j in 0..s {
+                    *counted_information.get_mut(i, j) += weight * slope[i] * slope[j];
+                }
             }
         }
         Ok(RegionTerms {
             quantities: quantities.iter().map(|&a| roles[own[set[a]]]).collect(),
             gradient,
             information,
+            diagonal: (0..s).map(|j| full[(o + j, o + j)]).collect(),
             unbounded,
             sensitivity,
             covariance,
-            slopes,
-            weights,
+            counted_information,
         })
     }
 }
@@ -2174,28 +2187,10 @@ mod tests {
                 }
             }
         }
-        let leverage: Vec<Vec<f64>> = terms
-            .iter()
-            .map(|t| {
-                t.weights
-                    .iter()
-                    .enumerate()
-                    .map(|(row, w)| {
-                        w * (0..k)
-                            .flat_map(|i| (0..k).map(move |j| (i, j)))
-                            .map(|(i, j)| {
-                                t.slopes.get(row, i) * joint[(i, j)] * t.slopes.get(row, j)
-                            })
-                            .sum::<f64>()
-                    })
-                    .collect()
-            })
-            .collect();
-        let shared_leverage: f64 = leverage.iter().flatten().sum();
-        assert!(
-            (shared_leverage - k as f64).abs() <= 1e-8,
-            "{shared_leverage}"
-        );
+        let leverage: f64 = (0..k)
+            .flat_map(|i| (0..k).map(move |j| (i, j)))
+            .map(|(i, j)| terms[0].counted_information.get(i, j) * joint[(i, j)])
+            .sum();
         let value = |role: Role| {
             answer.params[answer
                 .layout
@@ -2223,7 +2218,7 @@ mod tests {
             }],
             origin_us: answer.beam_origin_us,
             bound: BOUND,
-            shared_leverage: Some(leverage[0].clone()),
+            shared_leverage: Some(vec![leverage]),
         };
         let (region, _) = fit_counts_answer(&alone, &held, Some(&starts)).expect("fit");
         let [Some(phi), Some(expected)] =
