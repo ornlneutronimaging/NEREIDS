@@ -7,6 +7,7 @@ use ndarray::{Array2, Array3, ArrayView2, ArrayView3, s};
 use nereids_fitting::error::FittingError;
 use nereids_fitting::lm::FlatMatrix;
 use nereids_fitting::poisson::{NEWTON_DECREMENT_TOL, Prior, half_deviance};
+use nereids_physics::flight_time_grid::FlightTimeGrid;
 use rayon::prelude::*;
 
 use crate::counts_fit::{
@@ -14,7 +15,7 @@ use crate::counts_fit::{
     fit_counts_answer, labelled, shared_parameters,
 };
 use crate::error::PipelineError;
-use crate::open_beam::{Calibration, PULSE_NUMBERS, Pulse, whole};
+use crate::open_beam::{Calibration, PULSE_NUMBERS, Pulse, validate_live, whole};
 use crate::pipeline::TEMPERATURE_BOUNDS_K;
 
 const MOST_STEPS: usize = 20;
@@ -142,18 +143,18 @@ pub struct CountsMap {
     /// Each [`Patch::Sample`]'s fit, the shared quantities held at the map's
     /// answer; `None` where the patch is not fitted or [`Self::failed`].
     pub fits: Array2<Option<RegionFit>>,
-    /// Whether the fit of a [`Patch::Sample`] failed, did not converge, or
-    /// ended at a temperature of 1 K or 5000 K: the patch adds nothing to the
-    /// shared quantities.
-    pub failed: Array2<bool>,
+    /// Why the fit of a [`Patch::Sample`] left out of the shared quantities at
+    /// the end failed: an error, no convergence, or a fitted temperature at
+    /// 1 K or 5000 K.  `None` where the patch is not left out or not fitted.
+    pub failed: Array2<Option<String>>,
     /// The empty pixels' fit; `None` when every one is excluded.
     pub empty: Option<RegionFit>,
     /// Each isotope's areal density in atoms/barn, in the material's order:
     /// the known one, or the fitted one; NaN where the patch has no fit.
     pub densities: Vec<Array2<f64>>,
     /// Standard deviation of each density, from [`Self::covariance`]; NaN
-    /// where the density is known or held on a bound, or the patch has no
-    /// fit.
+    /// where the density is known or held on a bound, the patch has no fit,
+    /// or the map did not converge.
     pub density_sd: Vec<Array2<f64>>,
     /// The temperature in K: the known one, or the fitted one; NaN where the
     /// patch has no fit.
@@ -217,17 +218,21 @@ pub struct CountsMap {
     /// Whether the Newton decrement of the shared quantities fell below
     /// [`NEWTON_DECREMENT_TOL`].
     pub converged: bool,
-    /// Newton steps taken on the shared quantities.
+    /// Newton steps taken on the shared quantities, a last one that could not
+    /// fall included.
     pub steps: usize,
 }
 
 impl CountsMap {
-    /// The covariance of patch `a`'s [`Self::quantities`] with patch `b`'s,
-    /// which only the shared quantities carry, `G_a C_ss G_bᵀ` over those not
-    /// held on a bound; `None` where either patch has no
-    /// [`Self::sensitivity`] or the map no [`Self::shared_covariance`].
+    /// The covariance of patch `a`'s [`Self::quantities`] with a different
+    /// patch `b`'s, which only the shared quantities carry, `G_a C_ss G_bᵀ` over
+    /// those not held on a bound; for `a` = `b`, the part of
+    /// [`Self::covariance`] they carry.  `None` where either patch is outside
+    /// the grid or has no [`Self::sensitivity`], or the map has no
+    /// [`Self::shared_covariance`].
     pub fn cross_covariance(&self, a: (usize, usize), b: (usize, usize)) -> Option<FlatMatrix> {
-        let (left, right) = (self.sensitivity[a].as_ref()?, self.sensitivity[b].as_ref()?);
+        let left = self.sensitivity.get(a)?.as_ref()?;
+        let right = self.sensitivity.get(b)?.as_ref()?;
         let shared = self.shared_covariance.as_ref()?;
         let free: Vec<usize> = (0..shared.nrows)
             .filter(|&i| shared.get(i, i).is_finite())
@@ -263,19 +268,27 @@ impl CountsMap {
 /// to their bounds, with one on a bound its slope pushes out of held there.
 /// The steps stop when their Newton decrement falls below
 /// [`NEWTON_DECREMENT_TOL`].  A step that raises the regions' summed
-/// deviance, each run weighted with the overdispersion of the step before,
-/// is halved, up to ten times; twenty steps, or a step that cannot fall,
-/// end the map unconverged.  From its second fit on, a region keeps the beam
-/// intervals of its first and starts from its last answer.  A region's own
-/// grid meets its own rule, so the answer agrees with the joint fit to the
-/// grids' [`BOUND`](crate::open_beam::BOUND).
+/// deviance plus the calibration's prior penalty, each run weighted with the
+/// overdispersion of the step before, or at which a fitted patch fails, is
+/// halved, up to ten times; twenty steps, shared information that is not
+/// positive definite, or a step that cannot fall end the map unconverged.
+/// From its second fit on, a region keeps the beam intervals of its first,
+/// starts from its last answer, and counts in its sample run's
+/// overdispersion the leverage the shared quantities have on its bins, as
+/// the joint fit does.  A region's own grid meets its own rule, so the
+/// answer agrees with the joint fit to the grids'
+/// [`BOUND`](crate::open_beam::BOUND).
 ///
-/// A patch whose fit at the starting shared values fails, does not converge,
-/// or ends at a temperature of 1 K or 5000 K is [`CountsMap::failed`] and adds
-/// nothing to the shared quantities; a step at which a patch that fitted
-/// before fails is halved like one that raises the deviance.  A patch has one density per isotope and one temperature:
-/// where its pixels differ, these are the uniform fit of the patch's summed
-/// counts, which differs from the pixels' beam-weighted means.
+/// A patch whose fit fails, does not converge, or ends at a fitted
+/// temperature of 1 K or 5000 K, at the starting shared values or at the
+/// smallest halving of a step none of whose halvings is taken, adds nothing
+/// to the shared quantities; it is fitted again after every step taken and
+/// adds to them again once it fits.  A patch left out at the end is
+/// [`CountsMap::failed`].
+///
+/// A patch has one density per isotope and one temperature: where its
+/// pixels differ, these are the uniform fit of the patch's summed counts,
+/// which differs from the pixels' beam-weighted means.
 ///
 /// # Errors
 /// Everything [`MapMeasurement::patches`] refuses;
@@ -286,11 +299,13 @@ impl CountsMap {
 /// [`Value::Measured`], a count of a pixel summed into a region is not a
 /// whole non-negative number, or no patch is fitted; a shared quantity's
 /// value, bounds or measurement, or the pulse's calibration, that
-/// [`fit_counts`](crate::counts_fit::fit_counts) refuses.  When no patch's
-/// fit converges at the starting shared values, the first failing patch's
-/// error, whatever its kind, or [`PipelineError::InvalidParameter`] if none
-/// failed with one; when the empty pixels' fit fails or does not converge,
-/// its error or [`PipelineError::InvalidParameter`].
+/// [`fit_counts`](crate::counts_fit::fit_counts) refuses;
+/// [`PipelineError::ShapeMismatch`] or [`PipelineError::InvalidParameter`] for
+/// live fractions `fit_counts` refuses; [`PipelineError::FlightTimeGrid`] if
+/// the grid refuses the time edges at the starting shared values.
+/// [`PipelineError::InvalidParameter`] naming the first failing patch and its
+/// error when no patch fits at the starting shared values, naming the empty
+/// pixels when their fit fails, and when every patch fails at a later step.
 pub fn fit_map(
     map: &MapMeasurement<'_>,
     calibration: &Calibration,
@@ -414,13 +429,28 @@ pub fn fit_map(
 
     let mut values: Vec<f64> = parameters.iter().map(|(_, p)| p.value).collect();
     let origin_us = values[1];
+    let bins = map.open_counts.dim().0;
+    validate_live("open-beam", map.open_live.as_deref(), bins)?;
+    validate_live("sample", map.sample_live.as_deref(), bins)?;
+    FlightTimeGrid::new(
+        &map.time_edges_us,
+        origin_us,
+        values[2],
+        &calibration.pulse.at(&values[3..])?,
+    )?;
     let (t_low, t_high) = TEMPERATURE_BOUNDS_K;
+    let fitted_temperature = !matches!(material.temperature_k, Value::Known(_));
     let labels: Vec<String> = fitted_patches
         .iter()
         .map(|patch| format!("patch {patch:?}"))
         .chain((!empty.is_empty()).then(|| "the empty pixels".to_string()))
         .collect();
-    let sweep = |values: &[f64], previous: &[Option<RegionFit>]| -> Vec<Swept> {
+    let patch_count = fitted_patches.len();
+    let fit_region = |r: usize,
+                      values: &[f64],
+                      previous: Option<&RegionFit>,
+                      shared_leverage: Option<&Vec<f64>>|
+     -> Swept {
         let known = |i: usize| Value::Known(values[i]);
         let held = Calibration {
             t0_us: known(1),
@@ -434,59 +464,56 @@ pub fn fit_map(
                 ..calibration.pulse.clone()
             },
         };
-        regions
-            .par_iter()
-            .zip(previous)
-            .zip(&labels)
-            .map(|((region, previous), label)| {
-                let one = measurement(known(0), vec![restarted(region, previous.as_ref())]);
-                let starts = previous.as_ref().map(|fit| Starts {
-                    beams: vec![BeamStart {
-                        beam: fit.beam.clone(),
-                        overdispersion: fit.overdispersion[0],
-                        at_limit: fit.beam_at_limit,
-                    }],
-                    origin_us,
-                });
-                let (fit, answer) = fit_counts_answer(&one, &held, starts.as_ref())
-                    .map_err(|e| labelled(label, e))?;
-                let terms = answer
-                    .region_terms(0, &roles)
-                    .map_err(|e| labelled(label, e))?;
-                let region_fit = fit.regions.into_iter().next().expect("one region");
-                let edge = region_fit
-                    .temperature_k
-                    .is_some_and(|t| t == t_low || t == t_high);
-                Ok((fit.converged && !edge).then_some(Inner {
-                    fit: region_fit,
-                    deviance: fit.deviance,
-                    terms,
-                }))
+        let one = measurement(known(0), vec![restarted(&regions[r], previous)]);
+        let starts = previous.map(|fit| Starts {
+            beams: vec![BeamStart {
+                beam: fit.beam.clone(),
+                overdispersion: fit.overdispersion[0],
+                at_limit: fit.beam_at_limit,
+            }],
+            origin_us,
+            shared_leverage: shared_leverage.cloned(),
+        });
+        let label = &labels[r];
+        let (fit, answer) =
+            fit_counts_answer(&one, &held, starts.as_ref()).map_err(|e| labelled(label, e))?;
+        let region_fit = fit.regions.into_iter().next().expect("one region");
+        let edge = fitted_temperature
+            && region_fit
+                .temperature_k
+                .is_some_and(|t| t == t_low || t == t_high);
+        if edge {
+            return Err(PipelineError::InvalidParameter(format!(
+                "{label}: its temperature ended at {t_low} K or {t_high} K"
+            )));
+        }
+        if !fit.converged {
+            return Err(PipelineError::InvalidParameter(format!(
+                "{label}: its fit did not converge"
+            )));
+        }
+        let terms = answer
+            .region_terms(0, &roles)
+            .map_err(|e| labelled(label, e))?;
+        Ok(Inner {
+            fit: region_fit,
+            deviance: fit.deviance,
+            terms,
+        })
+    };
+    let sweep = |values: &[f64],
+                 previous: &[Option<RegionFit>],
+                 leverage: &[Option<Vec<f64>>],
+                 failures: &[Option<String>],
+                 failed: bool|
+     -> Vec<Option<Swept>> {
+        (0..regions.len())
+            .into_par_iter()
+            .map(|r| {
+                (failures[r].is_some() == failed)
+                    .then(|| fit_region(r, values, previous[r].as_ref(), leverage[r].as_ref()))
             })
             .collect()
-    };
-    let survivors = |mut swept: Vec<Swept>| -> Result<Vec<Option<Inner>>, PipelineError> {
-        let empty = swept
-            .split_off(fitted_patches.len())
-            .into_iter()
-            .map(|one| {
-                one?.ok_or_else(|| {
-                    PipelineError::InvalidParameter(
-                        "the fit of the empty pixels did not converge".into(),
-                    )
-                })
-            })
-            .collect::<Result<Vec<Inner>, PipelineError>>()?;
-        if swept.iter().all(|one| !matches!(one, Ok(Some(_)))) {
-            return Err(swept.into_iter().find_map(Result::err).unwrap_or_else(|| {
-                PipelineError::InvalidParameter("the fit of no patch of the map converged".into())
-            }));
-        }
-        Ok(swept
-            .into_iter()
-            .map(|one| one.ok().flatten())
-            .chain(empty.into_iter().map(Some))
-            .collect())
     };
     let objective = |inner: &[Option<Inner>], weights: &[Option<Inner>]| -> f64 {
         inner
@@ -514,8 +541,28 @@ pub fn fit_map(
             .sum()
     };
 
+    let mut failures: Vec<Option<String>> = vec![None; regions.len()];
+    let mut leverage: Vec<Option<Vec<f64>>> = vec![None; regions.len()];
     let mut previous: Vec<Option<RegionFit>> = vec![None; regions.len()];
-    let mut inner = survivors(sweep(&values, &previous))?;
+    let mut inner: Vec<Option<Inner>> = Vec::with_capacity(regions.len());
+    let mut first_failure = None;
+    for (r, swept) in sweep(&values, &previous, &leverage, &failures, false)
+        .into_iter()
+        .enumerate()
+    {
+        match swept.expect("every region is fitted at the start") {
+            Ok(one) => inner.push(Some(one)),
+            Err(error) if r >= patch_count => return Err(error),
+            Err(error) => {
+                failures[r] = Some(error.to_string());
+                first_failure.get_or_insert(error);
+                inner.push(None);
+            }
+        }
+    }
+    if inner[..patch_count].iter().all(Option::is_none) {
+        return Err(first_failure.expect("a patch failed"));
+    }
     let mut steps = 0;
     let mut converged = false;
     let information = loop {
@@ -547,6 +594,25 @@ pub fn fit_map(
         else {
             break None;
         };
+        let covariance = factor.inverse();
+        for (shared_leverage, inner) in leverage.iter_mut().zip(&inner) {
+            if let Some(Inner { terms, .. }) = inner {
+                *shared_leverage = Some(
+                    terms
+                        .weights
+                        .iter()
+                        .enumerate()
+                        .map(|(row, w)| {
+                            let slope = |a: usize| terms.slopes.get(row, free[a]);
+                            w * (0..free.len())
+                                .flat_map(|a| (0..free.len()).map(move |b| (a, b)))
+                                .map(|(a, b)| slope(a) * covariance[(a, b)] * slope(b))
+                                .sum::<f64>()
+                        })
+                        .collect(),
+                );
+            }
+        }
         let step = factor.solve(Mat::from_fn(free.len(), 1, |a, _| -gradient[free[a]]));
         let decrement: f64 = -0.5
             * (0..free.len())
@@ -554,13 +620,14 @@ pub fn fit_map(
                 .sum::<f64>();
         if decrement < NEWTON_DECREMENT_TOL {
             converged = true;
-            break Some((free, factor.inverse()));
+            break Some((free, covariance));
         }
         if steps == MOST_STEPS {
             break None;
         }
         steps += 1;
         let before = objective(&inner, &inner) + penalty(&values).0;
+        let mut lost: Vec<(usize, String)> = Vec::new();
         let accepted = (0..=MOST_HALVINGS).find_map(|halving| {
             let mut trial = values.clone();
             for (a, &f) in free.iter().enumerate() {
@@ -568,18 +635,49 @@ pub fn fit_map(
                 trial[fitted[f]] = (values[fitted[f]] + step[(a, 0)] / f64::powi(2.0, halving))
                     .clamp(parameter.lower, parameter.upper);
             }
-            let candidate = survivors(sweep(&trial, &previous)).ok()?;
-            let kept = inner
+            let swept = sweep(&trial, &previous, &leverage, &failures, false);
+            lost = swept
                 .iter()
-                .zip(&candidate)
-                .all(|(base, trial)| base.is_none() || trial.is_some());
-            (kept && objective(&candidate, &inner) + penalty(&trial).0 <= before)
+                .enumerate()
+                .filter_map(|(r, one)| match one {
+                    Some(Err(error)) => Some((r, error.to_string())),
+                    _ => None,
+                })
+                .collect();
+            if !lost.is_empty() {
+                return None;
+            }
+            let candidate: Vec<Option<Inner>> = swept
+                .into_iter()
+                .map(|one| one.and_then(Result::ok))
+                .collect();
+            (objective(&candidate, &inner) + penalty(&trial).0 <= before)
                 .then_some((trial, candidate))
         });
         match accepted {
             Some((trial, candidate)) => {
                 values = trial;
                 inner = candidate;
+                let retried = sweep(&values, &previous, &leverage, &failures, true);
+                for (r, retried) in retried.into_iter().enumerate() {
+                    match retried {
+                        Some(Ok(one)) => {
+                            failures[r] = None;
+                            inner[r] = Some(one);
+                        }
+                        Some(Err(error)) => failures[r] = Some(error.to_string()),
+                        None => {}
+                    }
+                }
+            }
+            None if !lost.is_empty() && lost.iter().all(|&(r, _)| r < patch_count) => {
+                for (r, reason) in lost {
+                    failures[r] = Some(reason);
+                    inner[r] = None;
+                }
+                if inner[..patch_count].iter().all(Option::is_none) {
+                    return invalid("the fit of no patch of the map converged".into());
+                }
             }
             None => break None,
         }
@@ -621,7 +719,6 @@ pub fn fit_map(
     let q = template.len();
 
     let (rows, cols) = patches.dim();
-    let bins = map.open_counts.dim().0;
     let blank = Array2::from_elem((rows, cols), f64::NAN);
     let isotopes = material.isotopes.len();
     let mut densities = vec![blank.clone(); isotopes];
@@ -630,7 +727,7 @@ pub fn fit_map(
     let mut temperature_sd_k = blank.clone();
     let mut overdispersion = [blank.clone(), blank];
     let mut trusted = Array2::from_elem((rows, cols), false);
-    let mut failed = Array2::from_elem((rows, cols), false);
+    let mut failed = Array2::from_elem((rows, cols), None);
     let mut fits = Array2::from_elem((rows, cols), None);
     let mut covariance = Array2::from_elem((rows, cols), None);
     let mut sensitivity = Array2::from_elem((rows, cols), None);
@@ -640,7 +737,7 @@ pub fn fit_map(
     ];
     for (r, &patch) in fitted_patches.iter().enumerate() {
         let Some(Inner { fit, terms, .. }) = &inner[r] else {
-            failed[patch] = true;
+            failed[patch] = failures[r].clone();
             continue;
         };
         let rows_of: Vec<Option<usize>> = template
@@ -754,7 +851,7 @@ pub fn fit_map(
     })
 }
 
-type Swept = Result<Option<Inner>, PipelineError>;
+type Swept = Result<Inner, PipelineError>;
 
 struct Inner {
     fit: RegionFit,

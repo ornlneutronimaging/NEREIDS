@@ -280,6 +280,7 @@ pub fn fit_open_beam(
         open_counts,
         richest,
         &counted(richest, 0..open_counts.len()),
+        None,
     );
     let scale = overdispersion.unwrap_or(1.0);
     let criterion = |candidate: &Candidate| {
@@ -374,7 +375,12 @@ pub(crate) fn counted(fit: &GridFit, bins: std::ops::Range<usize>) -> Vec<usize>
         .collect()
 }
 
-pub(crate) fn overdispersion(observed: &[f64], fit: &GridFit, counted: &[usize]) -> Option<f64> {
+pub(crate) fn overdispersion(
+    observed: &[f64],
+    fit: &GridFit,
+    counted: &[usize],
+    shared_leverage: Option<&[f64]>,
+) -> Option<f64> {
     let leverage = fit.result.leverage.as_ref().filter(|_| fit.converged)?;
     let (pearson, skew, freedom) =
         counted
@@ -384,7 +390,7 @@ pub(crate) fn overdispersion(observed: &[f64], fit: &GridFit, counted: &[usize])
                 (
                     pearson + (y - mu).powi(2) / mu,
                     skew + (y - mu) / mu,
-                    freedom + 1.0 - leverage[k],
+                    freedom + 1.0 - leverage[k] - shared_leverage.map_or(0.0, |extra| extra[k]),
                 )
             });
     let fletcher = 1.0 + skew / counted.len() as f64;
@@ -438,6 +444,7 @@ pub(crate) struct GridFit {
     pub(crate) converged: bool,
     pub(crate) predicted: Vec<f64>,
     pub(crate) coarse: Arc<FlightTimeGrid>,
+    pub(crate) fine: Arc<FlightTimeGrid>,
     pub(crate) step_us: f64,
     pub(crate) points: usize,
     pub(crate) halvings: usize,
@@ -490,6 +497,7 @@ pub(crate) fn fit_on_halved_grids<M: FitModel>(
                 converged,
                 predicted,
                 coarse: coarse_grid,
+                fine: Arc::clone(&grid),
                 step_us: grid.step_us(),
                 points: grid.flight_times_us().len(),
                 halvings,

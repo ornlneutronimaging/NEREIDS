@@ -406,6 +406,7 @@ pub fn fit_counts(
 pub(crate) struct Starts {
     pub(crate) beams: Vec<BeamStart>,
     pub(crate) origin_us: f64,
+    pub(crate) shared_leverage: Option<Vec<f64>>,
 }
 
 #[derive(Debug, Clone)]
@@ -735,7 +736,14 @@ pub(crate) fn fit_counts_answer(
         });
         let samples: Vec<Option<f64>> = noise_bins
             .iter()
-            .map(|counted| overdispersion(&observed, &fit, counted))
+            .map(|counted| {
+                overdispersion(
+                    &observed,
+                    &fit,
+                    counted,
+                    starts.and_then(|starts| starts.shared_leverage.as_deref()),
+                )
+            })
             .collect();
         let next: Vec<f64> = samples
             .iter()
@@ -917,7 +925,7 @@ pub(crate) fn fit_counts_answer(
         held[index] = bound;
     }
     let answer = Answer {
-        grid: Arc::new(fit.coarse.halved()?),
+        grid: Arc::clone(&fit.fine),
         dispersion: (0..observed.len()).map(|k| weights[k / bins]).collect(),
         params: params.clone(),
         held,
@@ -972,6 +980,8 @@ pub(crate) struct RegionTerms {
     pub(crate) information: FlatMatrix,
     pub(crate) sensitivity: FlatMatrix,
     pub(crate) covariance: FlatMatrix,
+    pub(crate) slopes: FlatMatrix,
+    pub(crate) weights: Vec<f64>,
 }
 
 impl Answer {
@@ -1023,11 +1033,12 @@ impl Answer {
         let mut gradient = vec![0.0; n];
         let bins = self.observed.len() / (2 * self.layout.regions.len());
         let rows = 2 * region * bins..2 * (region + 1) * bins;
+        let mut weights = Vec::with_capacity(rows.len());
         for (((k, &mu), &dispersion), &observed) in rows
             .clone()
             .zip(&predicted[rows.clone()])
             .zip(&self.dispersion[rows.clone()])
-            .zip(&self.observed[rows])
+            .zip(&self.observed[rows.clone()])
         {
             if mu > 0.0 {
                 let weight = 1.0 / (mu * dispersion);
@@ -1038,10 +1049,12 @@ impl Answer {
                         full[(a, b)] += weight * slope * jacobian.get(k, b);
                     }
                 }
+                weights.push(weight);
             } else {
                 for (a, g) in gradient.iter_mut().enumerate() {
                     *g += jacobian.get(k, a) / dispersion;
                 }
+                weights.push(0.0);
             }
         }
         let (o, s) = (own.len(), shared.len());
@@ -1057,6 +1070,7 @@ impl Answer {
         let coupling = Mat::from_fn(o, s, |a, j| full[(a, o + j)] / scale[a]);
         let solved = factor.solve(&coupling);
         let inverse = factor.inverse();
+        let moved = |a: usize, j: usize| -solved[(a, j)] / scale[a];
         let quantities: Vec<usize> = (0..o)
             .filter(|&a| !matches!(roles[own[a]], Role::Beam { .. }))
             .collect();
@@ -1073,10 +1087,19 @@ impl Answer {
         let mut covariance = FlatMatrix::zeros(quantities.len(), quantities.len());
         for (row, &a) in quantities.iter().enumerate() {
             for j in 0..s {
-                *sensitivity.get_mut(row, j) = -solved[(a, j)] / scale[a];
+                *sensitivity.get_mut(row, j) = moved(a, j);
             }
             for (col, &b) in quantities.iter().enumerate() {
                 *covariance.get_mut(row, col) = inverse[(a, b)] / (scale[a] * scale[b]);
+            }
+        }
+        let mut slopes = FlatMatrix::zeros(rows.len(), s);
+        for (row, k) in rows.enumerate() {
+            for j in 0..s {
+                *slopes.get_mut(row, j) = jacobian.get(k, o + j)
+                    + (0..o)
+                        .map(|a| jacobian.get(k, a) * moved(a, j))
+                        .sum::<f64>();
             }
         }
         Ok(RegionTerms {
@@ -1085,6 +1108,8 @@ impl Answer {
             information,
             sensitivity,
             covariance,
+            slopes,
+            weights,
         })
     }
 }
@@ -1273,7 +1298,7 @@ pub(crate) fn labelled(label: &str, error: PipelineError) -> PipelineError {
         PipelineError::ShapeMismatch(message) => {
             PipelineError::ShapeMismatch(format!("{label}: {message}"))
         }
-        other => other,
+        other => PipelineError::InvalidParameter(format!("{label}: {other}")),
     }
 }
 
@@ -2010,6 +2035,63 @@ mod tests {
                 }
             }
         }
+        let leverage: Vec<Vec<f64>> = terms
+            .iter()
+            .map(|t| {
+                t.weights
+                    .iter()
+                    .enumerate()
+                    .map(|(row, w)| {
+                        w * (0..k)
+                            .flat_map(|i| (0..k).map(move |j| (i, j)))
+                            .map(|(i, j)| {
+                                t.slopes.get(row, i) * joint[(i, j)] * t.slopes.get(row, j)
+                            })
+                            .sum::<f64>()
+                    })
+                    .collect()
+            })
+            .collect();
+        let shared_leverage: f64 = leverage.iter().flatten().sum();
+        assert!(
+            (shared_leverage - k as f64).abs() <= 1e-8,
+            "{shared_leverage}"
+        );
+        let value = |role: Role| {
+            answer.params[answer
+                .layout
+                .roles
+                .iter()
+                .position(|&r| r == role)
+                .expect("a shared role")]
+        };
+        let alone = Measurement {
+            normalization: Value::Known(value(Role::Normalization)),
+            regions: vec![measurement.regions[0].clone()],
+            ..measurement.clone()
+        };
+        let held = Calibration {
+            t0_us: Value::Known(value(Role::T0)),
+            flight_path_m: Value::Known(value(Role::FlightPath)),
+            ..calibration.clone()
+        };
+        let joined = &fit.regions[0];
+        let starts = Starts {
+            beams: vec![BeamStart {
+                beam: joined.beam.clone(),
+                overdispersion: joined.overdispersion[0],
+                at_limit: joined.beam_at_limit,
+            }],
+            origin_us: answer.beam_origin_us,
+            shared_leverage: Some(leverage[0].clone()),
+        };
+        let (region, _) = fit_counts_answer(&alone, &held, Some(&starts)).expect("fit");
+        let [Some(phi), Some(expected)] =
+            [&region.regions[0], joined].map(|fit| fit.overdispersion[1])
+        else {
+            panic!("a sample overdispersion");
+        };
+        assert!((phi / expected - 1.0).abs() <= 1e-4, "{phi} vs {expected}");
         let gradient: Vec<f64> = (0..k)
             .map(|i| terms.iter().map(|t| t.gradient[i]).sum())
             .collect();

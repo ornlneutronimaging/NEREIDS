@@ -616,9 +616,16 @@ fn a_map_recovers_each_patch_and_its_covariance_between_patches_is_the_shared_qu
         result.trusted,
         Array2::from_shape_fn((2, 6), |(i, j)| i == 0 && j < 3)
     );
-    assert_eq!(
-        result.failed,
-        Array2::from_shape_fn((2, 6), |patch| patch == (0, 5))
+    assert!(
+        result
+            .failed
+            .indexed_iter()
+            .all(|(patch, reason)| reason.is_some() == (patch == (0, 5)))
+    );
+    assert!(
+        result.failed[[0, 5]]
+            .as_deref()
+            .is_some_and(|reason| reason.contains("has no counts"))
     );
     assert!(result.densities[0][[0, 4]].is_nan());
     assert_eq!(result.shared, ["normalization", "t0", "flight path"]);
@@ -911,6 +918,12 @@ fn maps_the_fit_does_not_describe_are_refused() {
         sd: 0.1,
     };
     refused(&measured_empty, "empty pixels is not supported");
+    let mut short_live = base.clone();
+    short_live.sample_live = Some(vec![1.0; 2]);
+    assert!(matches!(
+        fit_map(&short_live, &calibration(&setup)),
+        Err(PipelineError::ShapeMismatch(message)) if message.starts_with("2 sample live")
+    ));
     let mut measured = base.clone();
     measured.background[0] = Value::Measured {
         value: 0.0,
@@ -3535,6 +3548,32 @@ mod maps {
             }
             other => panic!("{other:?}"),
         }
+    }
+
+    #[test]
+    fn a_patch_at_a_known_5000_k_is_fitted() {
+        let truths = [([THIN, THIN], 5000.0)];
+        let tiled = tiled(&truths, |_, _| 0, (1, 1));
+        let map = tiled.map(Value::Known(5000.0), [Value::Known(0.0); 3]);
+        let result = fit_map(&map, &tiled.calibration()).expect("map");
+        assert!(result.converged);
+        assert!(result.failed[[0, 0]].is_none(), "{:?}", result.failed);
+    }
+
+    #[test]
+    #[ignore = "slow; runs nightly"]
+    fn a_patch_failing_at_the_start_rejoins_and_one_failing_on_the_way_is_left_out() {
+        let truths = [([THIN, THIN], 300.0), ([THIN, THIN], 5100.0)];
+        let tiled = tiled(&truths, |_, j| j, (1, 2));
+        let mut map = tiled.map(Value::Fitted(400.0), [Value::Known(0.0); 3]);
+        map.normalization = Value::Fitted(0.8 * TERMS[0]);
+        let result = fit_map(&map, &tiled.calibration()).expect("map");
+        assert!(result.converged);
+        assert!(result.failed[[0, 0]].is_none(), "{:?}", result.failed);
+        let reason = result.failed[[0, 1]].as_deref().expect("failed");
+        assert!(reason.contains("ended at 1 K or 5000 K"), "{reason}");
+        let pull = (result.temperature_k[[0, 0]] - 300.0) / result.temperature_sd_k[[0, 0]];
+        assert!(pull.abs() <= 0.01, "{pull}");
     }
 
     #[test]
