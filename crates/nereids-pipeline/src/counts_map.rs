@@ -197,12 +197,8 @@ pub struct CountsMap {
 /// pixels pin the normalization when their `b0` is known.
 ///
 /// A patch has one density per isotope and one temperature: where its
-/// pixels' optical depths `τ` differ, their summed transmission `⟨e^−τ⟩`,
-/// weighted by each pixel's beam, exceeds `e^−⟨τ⟩` by about `Var(τ)/2` of
-/// it.  At a known temperature the fitted optical depth is then below the
-/// pixels' beam-weighted mean; with the temperature fitted, the densities
-/// and the temperature both move, in directions set by how the pixels
-/// differ.
+/// pixels differ, these are the uniform fit of the patch's summed counts,
+/// which differs from the pixels' beam-weighted means.
 /// A temperature that a patch's counts barely determine can run to 1 K or
 /// 5000 K, which blanks every entry of the covariance; give it within bounds.
 /// A patch the model does not describe, such as one whose temperature lies
