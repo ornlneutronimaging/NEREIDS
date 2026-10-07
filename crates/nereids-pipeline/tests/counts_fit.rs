@@ -2,6 +2,7 @@ use std::cell::RefCell;
 use std::collections::HashMap;
 use std::sync::{Arc, LazyLock};
 
+use ndarray::{Array2, Array3, s};
 use nereids_endf::resonance::ResonanceData;
 use nereids_endf::resonance::test_support::{synthetic_isotope, synthetic_isotope_multi};
 use nereids_fitting::lm::FlatMatrix;
@@ -18,6 +19,7 @@ use nereids_physics::transmission::broadened_cross_sections;
 use nereids_pipeline::counts_fit::{
     CountsFit, Material, Measurement, NEGLIGIBLE_PREDICTION, Region, Value, fit_counts,
 };
+use nereids_pipeline::counts_map::{MapMeasurement, Patch, fit_map};
 use nereids_pipeline::error::PipelineError;
 use nereids_pipeline::open_beam::{BOUND, Calibration, Pulse, fit_open_beam};
 use nereids_pipeline::pulse_calibration::{Provenance, PulseCalibration};
@@ -487,6 +489,286 @@ fn an_empty_area_with_a_known_background_adds_its_counts_information_on_the_norm
         (gained - added).abs() <= 1e-2 * added,
         "{gained} vs {added}"
     );
+}
+
+#[test]
+fn a_map_recovers_each_patch_and_its_covariance_between_patches_is_the_shared_quantities() {
+    let setup = Setup {
+        pulse: pulse(0.0, 200.0),
+        ..standard()
+    };
+    let isotopes = [
+        hafnium_like(20.0),
+        synthetic_isotope(74, 182, 24.0, 0.01, 0.06),
+    ];
+    let truths = [
+        ([THIN, THIN], 300.0, 0.05, 1.0e6),
+        ([1.5 * THIN, 0.0], 450.0, 0.05, 1.0e6),
+        ([SATURATED, THIN], 300.0, 0.0, 2.0e4),
+        ([THIN, 2.0 * THIN], 2500.0, 0.05, 1.0e6),
+    ];
+    let unit: Vec<(Vec<f64>, Vec<f64>)> = truths
+        .iter()
+        .map(|&(densities, t, b0, level)| {
+            let sample: Vec<(ResonanceData, f64)> =
+                isotopes.iter().cloned().zip(densities).collect();
+            let terms = [TERMS[0], b0, 0.0, 0.0];
+            with_background(&setup, &beam(level), &sample, t, terms)
+        })
+        .chain([with_background(
+            &setup,
+            &beam(1.0e6),
+            &[],
+            TEMPERATURE_K,
+            [TERMS[0], 0.0, 0.0, 0.0],
+        )])
+        .collect();
+    let bins = setup.edges.len() - 1;
+    let most = unit[4].0.iter().fold(0.0_f64, |m, &c| m.max(c));
+    let live: Vec<f64> = unit[4]
+        .0
+        .iter()
+        .map(|c| 1.0 / (1.0 + 0.25 * c / most))
+        .collect();
+    let (hot, broken) = ((0, 2), (1, 7));
+    let cube = |run: usize| {
+        Array3::from_shape_fn((bins, 3, 10), |(k, y, x)| {
+            let (open, sample) = &unit[if y == 2 { 4 } else { x / 2 }];
+            let level = [1.0, 1.3, 0.8, 1.1][2 * (y % 2) + x % 2];
+            let count = (live[k] * level * [open, sample][run][k]).round();
+            match (y, x) {
+                pixel if pixel == hot => 100.0 * count,
+                pixel if pixel == broken => f64::NAN,
+                _ => count,
+            }
+        })
+    };
+    let counts = [cube(0), cube(1)];
+    let excluded = Array2::from_shape_fn((3, 10), |pixel| pixel == hot || pixel == broken);
+    let behind = Array2::from_shape_fn((3, 10), |(y, x)| y < 2 && x < 9);
+    let empty = Array2::from_shape_fn((3, 10), |(y, _)| y == 2);
+    let map = MapMeasurement {
+        time_edges_us: setup.edges.clone(),
+        charge_ratio: CHARGE_RATIO,
+        normalization: Value::Fitted(1.0),
+        open_counts: counts[0].view(),
+        sample_counts: counts[1].view(),
+        open_live: Some(live.clone()),
+        sample_live: Some(live),
+        excluded: excluded.view(),
+        sample: behind.view(),
+        empty: empty.view(),
+        binning: 2,
+        material: Material {
+            isotopes: isotopes
+                .iter()
+                .map(|data| (data.clone(), Value::Fitted(THIN)))
+                .collect(),
+            temperature_k: Value::Within {
+                start: 400.0,
+                lower: 100.0,
+                upper: 2000.0,
+            },
+        },
+        background: [
+            Value::Within {
+                start: 0.02,
+                lower: 0.0,
+                upper: f64::INFINITY,
+            },
+            Value::Known(0.0),
+            Value::Known(0.0),
+        ],
+        empty_background: [Value::Known(0.0); 3],
+    };
+    let mut shared = calibration(&setup);
+    shared.t0_us = Value::Within {
+        start: T0_US,
+        lower: T0_US,
+        upper: T0_US + 1.0,
+    };
+    shared.flight_path_m = Value::Fitted(FLIGHT_PATH_M);
+    let result = fit_map(&map, &shared).expect("map");
+    let fit = &result.fit;
+    assert!(fit.converged);
+    let kinds = [
+        Patch::Sample,
+        Patch::Sample,
+        Patch::Sample,
+        Patch::Sample,
+        Patch::Mixed,
+    ];
+    assert_eq!(
+        result.patches,
+        Array2::from_shape_fn((2, 5), |(i, j)| if i == 0 {
+            kinds[j]
+        } else {
+            Patch::Outside
+        })
+    );
+    assert_eq!(
+        result.trusted,
+        Array2::from_shape_fn((2, 5), |(i, j)| i == 0 && j < 3)
+    );
+    assert!(result.densities[0][[0, 4]].is_nan());
+
+    let covariance = result.covariance.as_ref().expect("covariance");
+    let a = covariance.nrows - 3;
+    let per_patch = a / 4;
+    let sd = |q: usize| covariance.get(q, q).sqrt().to_bits();
+    assert_eq!(fit.t0_us, T0_US);
+    assert!(f64::from_bits(sd(a + 1)).is_nan());
+    let mut pulls = vec![
+        (fit.normalization - TERMS[0]) / f64::from_bits(sd(a)),
+        (fit.flight_path_m - FLIGHT_PATH_M) / f64::from_bits(sd(a + 2)),
+    ];
+    for (j, &(densities, t, _, _)) in truths.iter().enumerate() {
+        for (m, n) in densities.into_iter().enumerate() {
+            let (density, error) = (result.densities[m][[0, j]], result.density_sd[m][[0, j]]);
+            assert_eq!(error.to_bits(), sd(per_patch * j + m));
+            if n == 0.0 {
+                assert_eq!(density, 0.0);
+            } else if j < 3 {
+                pulls.push((density - n) / error);
+            }
+        }
+        let error = result.temperature_sd_k[[0, j]];
+        assert_eq!(error.to_bits(), sd(per_patch * j + 2));
+        if j < 3 {
+            pulls.push((result.temperature_k[[0, j]] - t) / error);
+        }
+    }
+    assert!(pulls.iter().all(|p| p.abs() <= BOUND.sqrt()), "{pulls:?}");
+    assert_eq!(result.temperature_k[[0, 3]], 2000.0);
+
+    let term = |y: f64, mu: f64| {
+        if y == 0.0 {
+            mu
+        } else {
+            y * (y / mu).ln() + mu - y
+        }
+    };
+    let phi = |r: usize, run: usize| fit.regions[r].overdispersion[run].expect("measured");
+    for (run, map) in result.overdispersion.iter().enumerate() {
+        assert!((0..4).all(|j| map[[0, j]] == phi(j, run)));
+    }
+    let (mut deviance, mut zeros) = (0.0, 0);
+    for (run, residuals) in result.residuals.iter().enumerate() {
+        for (j, region) in fit.regions[..4].iter().enumerate() {
+            for (k, &mu) in region.predicted[run].iter().enumerate() {
+                let y: f64 = (0..2)
+                    .flat_map(|y| (2 * j..2 * j + 2).map(move |x| (y, x)))
+                    .filter(|&pixel| !excluded[pixel])
+                    .map(|(y, x)| counts[run][[k, y, x]])
+                    .sum();
+                let d = residuals[[k, 0, j]];
+                let expected = 2.0 * term(y, mu);
+                assert!(
+                    (d * d - expected).abs() <= 1e-12 * (y + mu) && d * (y - mu) >= 0.0,
+                    "{run} {j} {k}: {d} for {y} counts, {mu} predicted"
+                );
+                deviance += d * d / (2.0 * phi(j, run));
+                zeros += usize::from(y == 0.0);
+            }
+        }
+        let empty_deviance: f64 = fit.regions[4].predicted[run]
+            .iter()
+            .enumerate()
+            .map(|(k, &mu)| term(counts[run].slice(s![k, 2, ..]).sum(), mu))
+            .sum();
+        deviance += empty_deviance / phi(4, run);
+    }
+    assert!(zeros > 0);
+    assert!(
+        (deviance - fit.deviance).abs() <= 1e-9 * fit.deviance,
+        "{deviance} vs {}",
+        fit.deviance
+    );
+
+    let common = result.common_mode.as_ref().expect("common mode");
+    assert!(common.get(0, 0) < covariance.get(0, 0));
+    for p in 0..a {
+        for q in (0..a).filter(|q| q / per_patch != p / per_patch) {
+            let (c, m) = (covariance.get(p, q), common.get(p, q));
+            let scale = (covariance.get(p, p) * covariance.get(q, q)).sqrt();
+            assert!(
+                c.is_nan() && m.is_nan() || (c - m).abs() <= 1e-6 * scale,
+                "{p} {q}: {c} vs {m}"
+            );
+        }
+    }
+}
+
+#[test]
+fn maps_the_dense_fit_does_not_describe_are_refused() {
+    let setup = standard();
+    let edges: Vec<f64> = (0..=577).map(|k| 350.0 + 0.2 * f64::from(k)).collect();
+    let counts = Array3::zeros((577, 1, 7));
+    let mut broken = counts.clone();
+    broken[[3, 0, 1]] = f64::NAN;
+    let none = Array2::from_elem((1, 7), false);
+    let all = Array2::from_elem((1, 7), true);
+    let six = Array2::from_shape_fn((1, 7), |(_, x)| x < 6);
+    let base = MapMeasurement {
+        time_edges_us: edges,
+        charge_ratio: CHARGE_RATIO,
+        normalization: Value::Fitted(1.0),
+        open_counts: counts.view(),
+        sample_counts: counts.view(),
+        open_live: None,
+        sample_live: None,
+        excluded: none.view(),
+        sample: all.view(),
+        empty: none.view(),
+        binning: 1,
+        material: Material {
+            isotopes: vec![(hafnium_like(20.0), Value::Fitted(THIN))],
+            temperature_k: Value::Known(TEMPERATURE_K),
+        },
+        background: [Value::Known(0.0); 3],
+        empty_background: [Value::Known(0.0); 3],
+    };
+    let refused =
+        |map: &MapMeasurement<'_>, expected: &str| match fit_map(map, &calibration(&setup)) {
+            Err(
+                PipelineError::InvalidParameter(message) | PipelineError::ShapeMismatch(message),
+            ) => {
+                assert!(message.contains(expected), "{message}")
+            }
+            other => panic!("{other:?}"),
+        };
+    refused(&base, "Jacobian");
+    let mut map = base.clone();
+    map.sample = six.view();
+    refused(&map, "region 0: the open-beam run has no counts");
+    map.sample_counts = broken.view();
+    refused(&map, "got NaN in bin 3 of pixel (0, 1)");
+    map.sample = none.view();
+    refused(&map, "no patch");
+    map.sample = six.view();
+    map.empty = all.view();
+    refused(&map, "both behind the sample and empty");
+    map.binning = 0;
+    refused(&map, "at least one pixel");
+    map.empty = all.slice(s![.., 1..]);
+    refused(&map, "the empty mask has shape");
+    map.sample_counts = counts.slice(s![1.., .., ..]);
+    refused(&map, "sample counts of shape");
+    let no_bins = Array3::zeros((0, 1, 7));
+    let mut map = base.clone();
+    map.time_edges_us.clear();
+    map.open_counts = no_bins.view();
+    map.sample_counts = no_bins.view();
+    assert!(matches!(
+        fit_map(&map, &calibration(&setup)),
+        Err(PipelineError::FlightTimeGrid(_))
+    ));
+    let mut measured = base.clone();
+    measured.background[0] = Value::Measured {
+        value: 0.0,
+        sd: 0.1,
+    };
+    refused(&measured, "once per patch");
 }
 
 fn chain(setup: &Setup) -> Vec<FlightTimeGrid> {

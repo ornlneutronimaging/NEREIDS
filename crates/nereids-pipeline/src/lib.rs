@@ -10,6 +10,8 @@
 //! - [`calibration`] — Energy calibration for TOF neutron instruments (t0 + flight-path scale)
 //! - [`counts_fit`] — Densities, temperatures and backgrounds of one or more regions, and the
 //!   normalization they share, fitted to the open-beam and sample counts (fit_counts)
+//! - [`counts_map`] — Densities and temperatures of patches of pixels, fitted as one counts fit
+//!   (fit_map)
 //! - [`detectability`] — Trace-detectability analysis (pre-experiment SNR check)
 //! - [`error`] — Pipeline error types
 //! - [`open_beam`] — The beam fitted to the open-beam counts (fit_open_beam)
@@ -20,6 +22,7 @@
 pub mod beam;
 pub mod calibration;
 pub mod counts_fit;
+pub mod counts_map;
 pub mod detectability;
 pub mod error;
 pub mod joint_fit;

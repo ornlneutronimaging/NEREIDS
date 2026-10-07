@@ -218,7 +218,7 @@ impl PulseCalibration {
             return invalid("a pulse calibration needs a converged fit".into());
         }
         let fitted: Vec<bool> = quantities(measurement, calibration)
-            .map(|value| !matches!(value, Value::Known(_)))
+            .map(|(_, value)| !matches!(value, Value::Known(_)))
             .collect();
         let first_number = fitted.len() - 6;
         let mut status = [Status::Known; 6];

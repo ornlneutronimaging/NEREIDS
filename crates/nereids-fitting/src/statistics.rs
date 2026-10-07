@@ -207,9 +207,165 @@ pub fn agreement(a: &Prior, b: &Prior) -> Result<Consistency, FittingError> {
     Consistency::new(d.iter().map(|w| w * w).sum(), k)
 }
 
+/// The part of `covariance` that the quantities at `shared` carry,
+/// `C_·s C_ss⁻¹ C_s·`: the whole covariance between two quantities that
+/// depend on each other only through those at `shared`.  Entry `(i, j)` is
+/// NaN where row `i` or `j` of `covariance` is NaN at a column of `shared`;
+/// every entry is 0 when `shared` is empty.
+///
+/// `None` when the covariance of the quantities at `shared` is not finite or
+/// not positive definite.
+///
+/// # Errors
+/// `FittingError::LengthMismatch` unless `covariance` is square with one entry
+/// per row and column; `FittingError::InvalidConfig` if an index in `shared`
+/// is not a row of `covariance`, or the covariance of the quantities at
+/// `shared` is not symmetric to 1e-12 of `√(Cᵢᵢ Cⱼⱼ)`.
+pub fn common_mode(
+    covariance: &FlatMatrix,
+    shared: &[usize],
+) -> Result<Option<FlatMatrix>, FittingError> {
+    let n = covariance.nrows;
+    for (expected, actual, field) in [
+        (n, covariance.ncols, "covariance columns"),
+        (n * n, covariance.data.len(), "covariance entries"),
+    ] {
+        if actual != expected {
+            return Err(FittingError::LengthMismatch {
+                expected,
+                actual,
+                field,
+            });
+        }
+    }
+    if let Some(i) = shared.iter().find(|&&i| i >= n) {
+        return Err(FittingError::InvalidConfig(format!(
+            "a shared quantity is a row of the {n}×{n} covariance; got {i}"
+        )));
+    }
+    let k = shared.len();
+    let mut block = FlatMatrix::zeros(k, k);
+    for (a, &i) in shared.iter().enumerate() {
+        for (b, &j) in shared.iter().enumerate() {
+            *block.get_mut(a, b) = covariance.get(i, j);
+        }
+    }
+    if !block.data.iter().all(|c| c.is_finite()) {
+        return Ok(None);
+    }
+    if !symmetric(k, |a, b| block.get(a, b)) {
+        return Err(FittingError::InvalidConfig(format!(
+            "the shared quantities' covariance must be symmetric; got {block:?}"
+        )));
+    }
+    let factor = Prior::factored(shared, &vec![0.0; k], &block);
+    if !factor.is_valid() {
+        return Ok(None);
+    }
+    let whitened: Vec<Vec<f64>> = (0..n)
+        .map(|i| {
+            let mut row: Vec<f64> = shared.iter().map(|&s| covariance.get(i, s)).collect();
+            factor.whiten(&mut row);
+            row
+        })
+        .collect();
+    let mut common = FlatMatrix::zeros(n, n);
+    for i in 0..n {
+        for j in 0..n {
+            *common.get_mut(i, j) = whitened[i]
+                .iter()
+                .zip(&whitened[j])
+                .map(|(x, y)| x * y)
+                .sum();
+        }
+    }
+    Ok(Some(common))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn the_common_mode_is_the_covariance_the_shared_quantities_carry() {
+        let loadings = [[1.0, -0.5], [0.3, 2.0], [-1.2, 0.7]];
+        let shared = [[2.0, 0.6], [0.6, 0.5]];
+        let own = [0.4, 1.1, 0.25];
+        let loaded =
+            |i: usize, c: usize| -> f64 { (0..2).map(|d| loadings[i][d] * shared[d][c]).sum() };
+        let carried = |i: usize, j: usize| -> f64 {
+            match (i < 3, j < 3) {
+                (true, true) => (0..2).map(|c| loaded(i, c) * loadings[j][c]).sum(),
+                (true, false) => loaded(i, j - 3),
+                (false, true) => loaded(j, i - 3),
+                (false, false) => shared[i - 3][j - 3],
+            }
+        };
+        let mut covariance = FlatMatrix::zeros(5, 5);
+        for i in 0..5 {
+            for j in 0..5 {
+                *covariance.get_mut(i, j) = carried(i, j);
+            }
+        }
+        for (i, variance) in own.iter().enumerate() {
+            *covariance.get_mut(i, i) += variance;
+        }
+        for c in 0..5 {
+            *covariance.get_mut(1, c) = f64::NAN;
+            *covariance.get_mut(c, 1) = f64::NAN;
+        }
+        let common = common_mode(&covariance, &[3, 4])
+            .expect("valid")
+            .expect("positive definite");
+        for i in 0..5 {
+            for j in 0..5 {
+                let (actual, expected) = (common.get(i, j), carried(i, j));
+                if i == 1 || j == 1 {
+                    assert!(actual.is_nan(), "{i} {j}: {actual}");
+                } else {
+                    assert!(
+                        (actual - expected).abs() <= 1e-12,
+                        "{i} {j}: {actual} vs {expected}"
+                    );
+                }
+            }
+        }
+        let none = common_mode(&covariance, &[])
+            .expect("valid")
+            .expect("empty");
+        assert!(none.data.iter().all(|&c| c == 0.0));
+        let blank = FlatMatrix {
+            data: vec![f64::NAN; 25],
+            nrows: 5,
+            ncols: 5,
+        };
+        assert!(matches!(common_mode(&blank, &[3, 4]), Ok(None)));
+        let singular = FlatMatrix {
+            data: vec![1.0, 2.0, 2.0, 4.0],
+            nrows: 2,
+            ncols: 2,
+        };
+        assert!(matches!(common_mode(&singular, &[0, 1]), Ok(None)));
+        let mut asymmetric = covariance.clone();
+        *asymmetric.get_mut(3, 4) += 1e-6;
+        assert!(matches!(
+            common_mode(&asymmetric, &[3, 4]),
+            Err(FittingError::InvalidConfig(_))
+        ));
+        assert!(matches!(
+            common_mode(&covariance, &[5]),
+            Err(FittingError::InvalidConfig(_))
+        ));
+        let wide = FlatMatrix {
+            data: vec![1.0, 0.0],
+            nrows: 1,
+            ncols: 2,
+        };
+        assert!(matches!(
+            common_mode(&wide, &[0]),
+            Err(FittingError::LengthMismatch { .. })
+        ));
+    }
 
     #[test]
     fn the_chi_squared_survival_matches_scipy() {
