@@ -554,7 +554,7 @@ fn a_map_recovers_each_patch_and_its_covariance_between_patches_is_the_shared_qu
         open_counts: counts[0].view(),
         sample_counts: counts[1].view(),
         open_live: Some(live.clone()),
-        sample_live: Some(live),
+        sample_live: Some(live.clone()),
         excluded: excluded.view(),
         sample: behind.view(),
         empty: empty.view(),
@@ -697,6 +697,55 @@ fn a_map_recovers_each_patch_and_its_covariance_between_patches_is_the_shared_qu
             );
         }
     }
+
+    let area = |[open_counts, sample_counts]: [Vec<f64>; 2]| {
+        let measurement = Measurement {
+            time_edges_us: setup.edges.clone(),
+            charge_ratio: CHARGE_RATIO,
+            normalization: Value::Known(fit.normalization),
+            regions: vec![Region {
+                open_counts,
+                sample_counts,
+                open_live: Some(live.clone()),
+                sample_live: Some(live.clone()),
+                background: map.background,
+                material: Some(map.material.clone()),
+            }],
+        };
+        let fixed = Calibration {
+            t0_us: Value::Known(fit.t0_us),
+            flight_path_m: Value::Known(fit.flight_path_m),
+            ..calibration(&setup)
+        };
+        fit_counts(&measurement, &fixed).expect("area fit")
+    };
+    let measured = [0, 1].map(|run| {
+        (0..bins)
+            .map(|k| {
+                (0..2)
+                    .flat_map(|y| (0..4).map(move |x| (y, x)))
+                    .filter(|&pixel| !excluded[pixel])
+                    .map(|(y, x)| counts[run][[k, y, x]])
+                    .sum()
+            })
+            .collect::<Vec<f64>>()
+    });
+    let predicted = [0, 1].map(|run| {
+        (0..bins)
+            .map(|k| (fit.regions[0].predicted[run][k] + fit.regions[1].predicted[run][k]).round())
+            .collect::<Vec<f64>>()
+    });
+    let (one, two) = (area(measured), area(predicted));
+    let weights = [0, 1].map(|j| fit.regions[j].predicted[0].iter().sum::<f64>());
+    for m in 0..2 {
+        let (density, sd) = (one.regions[0].densities[m], error_bar(&one, m));
+        let mean = (weights[0] * result.densities[m][[0, 0]]
+            + weights[1] * result.densities[m][[0, 1]])
+            / (weights[0] + weights[1]);
+        assert!((density - two.regions[0].densities[m]).abs() <= BOUND.sqrt() * sd);
+        assert!(density - mean <= -5.0 * sd, "{density} vs {mean} ± {sd}");
+    }
+    assert!((one.temperature() - two.temperature()).abs() <= BOUND.sqrt() * error_bar(&one, 2));
 }
 
 #[test]
