@@ -581,7 +581,14 @@ fn a_map_recovers_each_patch_and_its_covariance_between_patches_is_the_shared_qu
         ],
         empty_background: [Value::Known(0.0); 3],
     };
-    let result = fit_map(&map, &calibration(&setup)).expect("map");
+    let mut shared = calibration(&setup);
+    shared.t0_us = Value::Within {
+        start: T0_US,
+        lower: T0_US,
+        upper: T0_US + 1.0,
+    };
+    shared.flight_path_m = Value::Fitted(FLIGHT_PATH_M);
+    let result = fit_map(&map, &shared).expect("map");
     let fit = &result.fit;
     assert!(fit.converged);
     let kinds = [
@@ -606,10 +613,15 @@ fn a_map_recovers_each_patch_and_its_covariance_between_patches_is_the_shared_qu
     assert!(result.densities[0][[0, 4]].is_nan());
 
     let covariance = result.covariance.as_ref().expect("covariance");
-    let a = covariance.nrows - 1;
+    let a = covariance.nrows - 3;
     let per_patch = a / 4;
     let sd = |q: usize| covariance.get(q, q).sqrt().to_bits();
-    let mut pulls = vec![(fit.normalization - TERMS[0]) / f64::from_bits(sd(a))];
+    assert_eq!(fit.t0_us, T0_US);
+    assert!(f64::from_bits(sd(a + 1)).is_nan());
+    let mut pulls = vec![
+        (fit.normalization - TERMS[0]) / f64::from_bits(sd(a)),
+        (fit.flight_path_m - FLIGHT_PATH_M) / f64::from_bits(sd(a + 2)),
+    ];
     for (j, &(densities, t, _, _)) in truths.iter().enumerate() {
         for (m, n) in densities.into_iter().enumerate() {
             let (density, error) = (result.densities[m][[0, j]], result.density_sd[m][[0, j]]);
@@ -637,6 +649,9 @@ fn a_map_recovers_each_patch_and_its_covariance_between_patches_is_the_shared_qu
         }
     };
     let phi = |r: usize, run: usize| fit.regions[r].overdispersion[run].expect("measured");
+    for (run, map) in result.overdispersion.iter().enumerate() {
+        assert!((0..4).all(|j| map[[0, j]] == phi(j, run)));
+    }
     let (mut deviance, mut zeros) = (0.0, 0);
     for (run, residuals) in result.residuals.iter().enumerate() {
         for (j, region) in fit.regions[..4].iter().enumerate() {
@@ -739,6 +754,15 @@ fn maps_the_dense_fit_does_not_describe_are_refused() {
     refused(&map, "the empty mask has shape");
     map.sample_counts = counts.slice(s![1.., .., ..]);
     refused(&map, "sample counts of shape");
+    let no_bins = Array3::zeros((0, 1, 7));
+    let mut map = base.clone();
+    map.time_edges_us.clear();
+    map.open_counts = no_bins.view();
+    map.sample_counts = no_bins.view();
+    assert!(matches!(
+        fit_map(&map, &calibration(&setup)),
+        Err(PipelineError::FlightTimeGrid(_))
+    ));
     let mut measured = base.clone();
     measured.background[0] = Value::Measured {
         value: 0.0,
