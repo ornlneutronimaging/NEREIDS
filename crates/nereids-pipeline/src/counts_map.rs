@@ -197,11 +197,14 @@ pub struct CountsMap {
 /// pixels pin the normalization when their `b0` is known.
 ///
 /// A patch has one density per isotope and one temperature: where its
-/// pixels' optical depths `τ` differ, their summed transmission `⟨e^−τ⟩`
-/// exceeds `e^−⟨τ⟩` by about `Var(τ)/2` of it, and the fitted densities are
-/// below the pixels' mean.  A temperature that a patch's counts barely
-/// determine can run to 1 K or 5000 K, which blanks every entry of the
-/// covariance; give it within bounds.
+/// pixels' optical depths `τ` differ, their summed transmission `⟨e^−τ⟩`,
+/// weighted by each pixel's beam, exceeds `e^−⟨τ⟩` by about `Var(τ)/2` of
+/// it, and the fitted optical depth is below the pixels' beam-weighted mean.
+/// A temperature that a patch's counts barely determine can run to 1 K or
+/// 5000 K, which blanks every entry of the covariance; give it within bounds.
+/// A patch the model does not describe, such as one whose temperature lies
+/// outside its bounds, pulls the shared quantities and can leave the whole
+/// fit unconverged.
 ///
 /// # Errors
 /// Everything [`MapMeasurement::patches`] refuses;
