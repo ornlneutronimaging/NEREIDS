@@ -58,6 +58,68 @@ pub struct MapMeasurement<'a> {
     pub empty_background: [Value; 3],
 }
 
+impl MapMeasurement<'_> {
+    /// Each patch's kind, in (patch row, patch column); patch `(i, j)` holds
+    /// the pixels from `(i·binning, j·binning)` up to the next patch or the
+    /// image's edge.
+    ///
+    /// # Errors
+    /// [`PipelineError::ShapeMismatch`] unless both runs' counts have one time
+    /// bin per pair of edges and the same rows and columns as the three
+    /// masks; [`PipelineError::InvalidParameter`] if `binning` is 0.
+    pub fn patches(&self) -> Result<Array2<Patch>, PipelineError> {
+        let bins = self.time_edges_us.len().saturating_sub(1);
+        let (time_bins, height, width) = self.open_counts.dim();
+        if self.sample_counts.dim() != self.open_counts.dim() || time_bins != bins {
+            return Err(PipelineError::ShapeMismatch(format!(
+                "open-beam counts of shape {:?} and sample counts of shape {:?} for {bins} \
+                 time bins",
+                self.open_counts.dim(),
+                self.sample_counts.dim()
+            )));
+        }
+        for (name, mask) in [
+            ("excluded", self.excluded),
+            ("sample", self.sample),
+            ("empty", self.empty),
+        ] {
+            if mask.dim() != (height, width) {
+                return Err(PipelineError::ShapeMismatch(format!(
+                    "the {name} mask has shape {:?} for {height}×{width} pixels",
+                    mask.dim()
+                )));
+            }
+        }
+        let b = self.binning;
+        if b == 0 {
+            return Err(PipelineError::InvalidParameter(
+                "a patch is at least one pixel wide".into(),
+            ));
+        }
+        Ok(Array2::from_shape_fn(
+            (height.div_ceil(b), width.div_ceil(b)),
+            |patch| {
+                let pixels = self.pixels(patch);
+                let behind = pixels.iter().filter(|&&pixel| self.sample[pixel]).count();
+                match (behind, pixels.len() - behind) {
+                    (0, _) => Patch::Outside,
+                    (_, 0) => Patch::Sample,
+                    _ => Patch::Mixed,
+                }
+            },
+        ))
+    }
+
+    fn pixels(&self, (i, j): (usize, usize)) -> Vec<(usize, usize)> {
+        let (height, width) = self.excluded.dim();
+        let b = self.binning;
+        (i * b..height.min((i + 1) * b))
+            .flat_map(|y| (j * b..width.min((j + 1) * b)).map(move |x| (y, x)))
+            .filter(|&pixel| !self.excluded[pixel])
+            .collect()
+    }
+}
+
 /// What the pixels of a patch that are not excluded lie behind.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Patch {
@@ -72,9 +134,7 @@ pub enum Patch {
 /// The fitted map, one value per patch.
 #[derive(Debug, Clone)]
 pub struct CountsMap {
-    /// Each patch's kind, in (patch row, patch column); patch `(i, j)` holds
-    /// the pixels from `(i·binning, j·binning)` up to the next patch or the
-    /// image's edge.
+    /// Each patch's kind, as [`MapMeasurement::patches`].
     pub patches: Array2<Patch>,
     /// Each isotope's areal density in atoms/barn, in the material's order:
     /// the known one, or the fitted one; NaN where the patch is not fitted.
@@ -112,12 +172,14 @@ pub struct CountsMap {
     /// The part of [`Self::covariance`] the shared quantities carry, those of
     /// the normalization, `t0`, flight path and pulse that are fitted and not
     /// on a bound, by [`common_mode`]: between quantities of two patches, or of
-    /// a patch and the empty pixels, it is their whole covariance.  `None`
-    /// when `covariance` is, or when that of the shared quantities is not
-    /// finite and positive definite.
+    /// a patch and the empty pixels, it is their whole covariance; zero when
+    /// no shared quantity is fitted off its bounds.  `None` when `covariance`
+    /// is, or when that of the shared quantities is not finite and positive
+    /// definite.
     pub common_mode: Option<FlatMatrix>,
-    /// The fit, whose region `r` is the `r`-th fitted patch row by row, and
-    /// whose last region is the empty pixels when any is not excluded.
+    /// The fit, whose region `r` is the `r`-th [`Patch::Sample`] of
+    /// [`MapMeasurement::patches`] row by row, and whose last region is the
+    /// empty pixels when any is not excluded.
     pub fit: CountsFit,
 }
 
@@ -141,46 +203,22 @@ pub struct CountsMap {
 /// covariance; give it within bounds.
 ///
 /// # Errors
-/// [`PipelineError::ShapeMismatch`] unless both runs' counts have one time
-/// bin per pair of edges and the same rows and columns as the three masks;
-/// [`PipelineError::InvalidParameter`] if `binning` is 0, a pixel is both
-/// behind the sample and empty, a density, the temperature or a background
+/// Everything [`MapMeasurement::patches`] refuses;
+/// [`PipelineError::InvalidParameter`] if a pixel is both behind the sample
+/// and empty, a density, the temperature or a background
 /// term of the sample's patches is [`Value::Measured`], which would count its
 /// measurement once per patch, a count of a pixel summed into a region is
 /// not a whole non-negative number, no patch is fitted, or the fit's
 /// Jacobian may hold more than [`MAX_MAP_SIZE`] entries; everything
-/// [`fit_counts`] refuses, with region `r` as in [`CountsMap::fit`].
+/// [`fit_counts`] refuses, with region `r` as in [`CountsMap::fit`];
+/// [`PipelineError::Fitting`] if [`common_mode`] refuses the fit's
+/// covariance.
 pub fn fit_map(
     map: &MapMeasurement<'_>,
     calibration: &Calibration,
 ) -> Result<CountsMap, PipelineError> {
     let invalid = |message: String| Err(PipelineError::InvalidParameter(message));
-    let bins = map.time_edges_us.len().saturating_sub(1);
-    let (time_bins, height, width) = map.open_counts.dim();
-    if map.sample_counts.dim() != map.open_counts.dim() || time_bins != bins {
-        return Err(PipelineError::ShapeMismatch(format!(
-            "open-beam counts of shape {:?} and sample counts of shape {:?} for {bins} time \
-             bins",
-            map.open_counts.dim(),
-            map.sample_counts.dim()
-        )));
-    }
-    for (name, mask) in [
-        ("excluded", map.excluded),
-        ("sample", map.sample),
-        ("empty", map.empty),
-    ] {
-        if mask.dim() != (height, width) {
-            return Err(PipelineError::ShapeMismatch(format!(
-                "the {name} mask has shape {:?} for {height}×{width} pixels",
-                mask.dim()
-            )));
-        }
-    }
-    let b = map.binning;
-    if b == 0 {
-        return invalid("a patch is at least one pixel wide".into());
-    }
+    let patches = map.patches()?;
     if map.sample.iter().zip(&map.empty).any(|(&s, &e)| s && e) {
         return invalid("a pixel is both behind the sample and empty".into());
     }
@@ -199,12 +237,41 @@ pub fn fit_map(
                 .into(),
         );
     }
+    let fitted_patches: Vec<(usize, usize)> = patches
+        .indexed_iter()
+        .filter(|&(_, &kind)| kind == Patch::Sample)
+        .map(|(patch, _)| patch)
+        .collect();
+    if fitted_patches.is_empty() {
+        let b = map.binning;
+        return invalid(format!(
+            "no patch of {b}×{b} pixels has all its pixels not excluded behind the sample"
+        ));
+    }
+    let empty: Vec<(usize, usize)> = map
+        .empty
+        .indexed_iter()
+        .filter(|&(pixel, &e)| e && !map.excluded[pixel])
+        .map(|(pixel, _)| pixel)
+        .collect();
 
-    let rows = height.div_ceil(b);
-    let cols = width.div_ceil(b);
-    let mut patches = Array2::from_elem((rows, cols), Patch::Outside);
-    let mut regions = Vec::new();
-    let mut fitted_patches = Vec::new();
+    let bins = map.time_edges_us.len() - 1;
+    let region_count = fitted_patches.len() + usize::from(!empty.is_empty());
+    let jacobian_rows = 2 * bins * region_count;
+    let jacobian_cols = region_count * (bins / 2)
+        + fitted_patches.len() * (material.isotopes.len() + 4)
+        + 3 * usize::from(!empty.is_empty())
+        + 9;
+    if jacobian_rows.saturating_mul(jacobian_cols) > MAX_MAP_SIZE {
+        return invalid(format!(
+            "{} patches and {} empty pixels in {bins} time bins may need a {jacobian_rows}×\
+             {jacobian_cols} Jacobian, more than the dense fit's {MAX_MAP_SIZE} entries; use \
+             fewer patches or fewer time bins",
+            fitted_patches.len(),
+            empty.len()
+        ));
+    }
+
     let region = |pixels: &[(usize, usize)], background, material| {
         let [open_counts, sample_counts] = summed(map, pixels)?;
         Ok::<_, PipelineError>(Region {
@@ -216,50 +283,12 @@ pub fn fit_map(
             material,
         })
     };
-    for ((i, j), kind) in patches.indexed_iter_mut() {
-        let pixels: Vec<(usize, usize)> = (i * b..height.min((i + 1) * b))
-            .flat_map(|y| (j * b..width.min((j + 1) * b)).map(move |x| (y, x)))
-            .filter(|&pixel| !map.excluded[pixel])
-            .collect();
-        let behind = pixels.iter().filter(|&&pixel| map.sample[pixel]).count();
-        *kind = match (behind, pixels.len() - behind) {
-            (0, _) => Patch::Outside,
-            (_, 0) => Patch::Sample,
-            _ => Patch::Mixed,
-        };
-        if *kind == Patch::Sample {
-            regions.push(region(&pixels, map.background, Some(material.clone()))?);
-            fitted_patches.push((i, j));
-        }
-    }
-    if fitted_patches.is_empty() {
-        return invalid(format!(
-            "no patch of {b}×{b} pixels has all its pixels not excluded behind the sample"
-        ));
-    }
-    let empty: Vec<(usize, usize)> = map
-        .empty
-        .indexed_iter()
-        .filter(|&(pixel, &e)| e && !map.excluded[pixel])
-        .map(|(pixel, _)| pixel)
-        .collect();
+    let mut regions = fitted_patches
+        .iter()
+        .map(|&patch| region(&map.pixels(patch), map.background, Some(material.clone())))
+        .collect::<Result<Vec<Region>, PipelineError>>()?;
     if !empty.is_empty() {
         regions.push(region(&empty, map.empty_background, None)?);
-    }
-
-    let jacobian_rows = 2 * bins * regions.len();
-    let jacobian_cols = regions.len() * (bins / 2)
-        + fitted_patches.len() * (material.isotopes.len() + 4)
-        + 3 * usize::from(!empty.is_empty())
-        + 9;
-    if jacobian_rows * jacobian_cols > MAX_MAP_SIZE {
-        return invalid(format!(
-            "{} patches and {} empty pixels in {bins} time bins may need a {jacobian_rows}×\
-             {jacobian_cols} Jacobian, more than the dense fit's {MAX_MAP_SIZE} entries; use \
-             fewer patches or fewer time bins",
-            fitted_patches.len(),
-            empty.len()
-        ));
     }
 
     let measurement = Measurement {
@@ -298,19 +327,20 @@ pub fn fit_map(
         }
         reordered
     });
-    let common = covariance.as_ref().and_then(|c| {
-        let carriers: Vec<usize> = (0..order.len())
-            .filter(|&a| {
-                let q = order[a];
-                !fit.on_bound[q]
-                    && matches!(
-                        fitted[q],
-                        Role::Normalization | Role::T0 | Role::FlightPath | Role::Pulse(_)
-                    )
-            })
-            .collect();
-        common_mode(c, &carriers)
-    });
+    let carriers: Vec<usize> = (0..order.len())
+        .filter(|&a| {
+            let q = order[a];
+            !fit.on_bound[q]
+                && matches!(
+                    fitted[q],
+                    Role::Normalization | Role::T0 | Role::FlightPath | Role::Pulse(_)
+                )
+        })
+        .collect();
+    let common = match &covariance {
+        Some(c) => common_mode(c, &carriers)?,
+        None => None,
+    };
 
     let sd = |q: usize| {
         fit.covariance
@@ -318,6 +348,7 @@ pub fn fit_map(
             .map_or(f64::NAN, |c| c.get(q, q).sqrt())
     };
     let sd_of = |role: Role| fitted.iter().position(|&r| r == role).map_or(f64::NAN, sd);
+    let (rows, cols) = patches.dim();
     let blank = Array2::from_elem((rows, cols), f64::NAN);
     let isotopes = material.isotopes.len();
     let mut densities = vec![blank.clone(); isotopes];
