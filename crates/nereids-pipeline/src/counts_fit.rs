@@ -2021,6 +2021,170 @@ mod tests {
     }
 
     #[test]
+    fn a_map_under_a_pulse_calibration_is_the_joint_fit() {
+        let grid = Arc::new(grid(None).halved().expect("grid").halved().expect("grid"));
+        let (_, u_hi) = grid.range_us();
+        let beam = BeamSpline::constant(347.0, u_hi, 1.0e4).refined();
+        let beams = [beam.clone(), beam];
+        let hafnium = synthetic_isotope(72, 180, 20.0, 0.01, 0.06);
+        let isotopes: Vec<Arc<[ResonanceData]>> = vec![Arc::new([hafnium.clone()]), Arc::new([])];
+        let sizes: Vec<usize> = beams.iter().map(|b| b.coefficients().len()).collect();
+        let layout = Arc::new(Layout::new(roles(&sizes, &[Some(1), None]), 2));
+        let truth: Vec<f64> = layout
+            .roles
+            .iter()
+            .map(|role| match *role {
+                Role::Beam {
+                    region,
+                    coefficient,
+                } => beams[region].coefficients()[coefficient],
+                Role::Density { .. } => 5.0e-4,
+                Role::Temperature { .. } => 300.0,
+                Role::Normalization => 0.93,
+                Role::Background { region, term } => [[0.05, 0.0, 0.0], [0.0; 3]][region][term],
+                Role::T0 => T0_US,
+                Role::FlightPath => FLIGHT_PATH_M,
+                Role::Pulse(n) => [0.35, 0.05, 0.0, 0.25, 0.15, 0.0][n],
+            })
+            .collect();
+        let counts: Vec<f64> = RegionsModel::new(&grid, &beams, &isotopes, 1.2, T0_US, &layout)
+            .evaluate(&truth)
+            .expect("counts")
+            .iter()
+            .map(|c| c.round())
+            .collect();
+        let bins = counts.len() / 4;
+        let run =
+            |r: usize, run: usize| counts[(2 * r + run) * bins..(2 * r + run + 1) * bins].to_vec();
+        let cube = |which: usize| {
+            ndarray::Array3::from_shape_fn((bins, 2, 1), |(k, y, _)| run(y, which)[k])
+        };
+        let (open, sample) = (cube(0), cube(1));
+        let sample_pixel = ndarray::Array2::from_shape_fn((2, 1), |(y, _)| y == 0);
+        let empty_pixel = ndarray::Array2::from_shape_fn((2, 1), |(y, _)| y == 1);
+        let none = ndarray::Array2::from_elem((2, 1), false);
+        let material = Material {
+            isotopes: vec![(hafnium, Value::Fitted(3.0e-4))],
+            temperature_k: Value::Fitted(350.0),
+        };
+        let background = [Value::Fitted(0.02), Value::Known(0.0), Value::Known(0.0)];
+        let map = crate::counts_map::MapMeasurement {
+            time_edges_us: EDGES_US.map(f64::from).collect(),
+            charge_ratio: 1.2,
+            normalization: Value::Fitted(1.0),
+            open_counts: open.view(),
+            sample_counts: sample.view(),
+            open_live: None,
+            sample_live: None,
+            excluded: none.view(),
+            sample: sample_pixel.view(),
+            empty: empty_pixel.view(),
+            binning: 1,
+            material: material.clone(),
+            background,
+            empty_background: [Value::Known(0.0); 3],
+        };
+        let calibration = Calibration {
+            t0_us: Value::Measured {
+                value: T0_US,
+                sd: 0.01,
+            },
+            flight_path_m: Value::Fitted(FLIGHT_PATH_M),
+            pulse: Pulse {
+                alpha: [Value::Fitted(0.35), Value::Fitted(0.05)],
+                beta: [Value::Known(0.0), Value::Known(0.25)],
+                r: Value::Known(0.15),
+                fwhm_squared_us2: Value::Known(0.0),
+                energy_span_ev: (1.0, 200.0),
+                n_tau: 256,
+                line_span_ev: None,
+                prior: Some(crate::pulse_calibration::PulsePrior {
+                    numbers: vec![0, 1],
+                    mean: vec![0.35, 0.05],
+                    covariance: FlatMatrix {
+                        data: vec![1.0e-4, -2.0e-5, -2.0e-5, 1.0e-5],
+                        nrows: 2,
+                        ncols: 2,
+                    },
+                }),
+            },
+        };
+        let result = crate::counts_map::fit_map(&map, &calibration).expect("map");
+        assert!(result.converged);
+        let region = |r: usize, material: Option<Material>, background| Region {
+            open_counts: run(r, 0),
+            sample_counts: run(r, 1),
+            open_live: None,
+            sample_live: None,
+            background,
+            material,
+        };
+        let measurement = Measurement {
+            time_edges_us: map.time_edges_us.clone(),
+            charge_ratio: 1.2,
+            normalization: map.normalization,
+            regions: vec![
+                region(0, Some(material), background),
+                region(1, None, [Value::Known(0.0); 3]),
+            ],
+        };
+        let joint = fit_counts(&measurement, &calibration).expect("joint fit");
+        assert!(joint.converged);
+        let covariance = joint.covariance.as_ref().expect("covariance");
+        let fitted: Vec<Role> = quantities(&measurement, &calibration)
+            .filter(|(_, value)| !matches!(value, Value::Known(_)))
+            .map(|(role, _)| role)
+            .collect();
+        let at = |role: Role| fitted.iter().position(|&r| r == role).expect("fitted");
+        let close = |actual: f64, a: Role, b: Role| {
+            let (i, j) = (at(a), at(b));
+            let scale = (covariance.get(i, i) * covariance.get(j, j)).sqrt();
+            assert!(
+                (actual - covariance.get(i, j)).abs() <= 1e-3 * scale,
+                "{a:?} {b:?}: {actual} vs {}",
+                covariance.get(i, j)
+            );
+        };
+        let shared = [
+            Role::Normalization,
+            Role::T0,
+            Role::FlightPath,
+            Role::Pulse(0),
+            Role::Pulse(1),
+        ];
+        let map_shared = result.shared_covariance.as_ref().expect("covariance");
+        for (s, &a) in shared.iter().enumerate() {
+            for (t, &b) in shared.iter().enumerate() {
+                close(map_shared.get(s, t), a, b);
+            }
+        }
+        let own = [
+            Role::Density {
+                region: 0,
+                isotope: 0,
+            },
+            Role::Temperature { region: 0 },
+            Role::Background { region: 0, term: 0 },
+        ];
+        let patch = result.covariance[[0, 0]].as_ref().expect("covariance");
+        for (s, &a) in own.iter().enumerate() {
+            for (t, &b) in own.iter().enumerate() {
+                close(patch.get(s, t), a, b);
+            }
+        }
+        let gaps = [
+            (result.alpha[0] - joint.alpha[0])
+                / covariance
+                    .get(at(Role::Pulse(0)), at(Role::Pulse(0)))
+                    .sqrt(),
+            (result.t0_us - joint.t0_us) / covariance.get(at(Role::T0), at(Role::T0)).sqrt(),
+            (result.densities[0][[0, 0]] - joint.regions[0].densities[0])
+                / covariance.get(at(own[0]), at(own[0])).sqrt(),
+        ];
+        assert!(gaps.iter().all(|g| g.abs() <= 0.01), "{gaps:?}");
+    }
+
+    #[test]
     fn the_background_lags_sammy_s_by_the_pulse_s_mean_delay() {
         let grid = grid(None);
         let (_, u_hi) = grid.range_us();

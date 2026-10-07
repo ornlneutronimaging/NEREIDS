@@ -627,10 +627,7 @@ fn a_map_recovers_each_patch_and_its_covariance_between_patches_is_the_shared_qu
     let shared_sd = |s: usize| shared_covariance.get(s, s).sqrt();
     assert_eq!(result.t0_us, T0_US);
     assert!(shared_sd(1).is_nan());
-    let mut pulls = vec![
-        (result.normalization - TERMS[0]) / shared_sd(0),
-        (result.flight_path_m - FLIGHT_PATH_M) / shared_sd(2),
-    ];
+    let mut pulls = vec![(result.flight_path_m - FLIGHT_PATH_M) / shared_sd(2)];
     let fits: Vec<&RegionFit> = (0..4)
         .map(|j| result.fits[[0, j]].as_ref().expect("a fit"))
         .collect();
@@ -767,19 +764,17 @@ fn a_map_recovers_each_patch_and_its_covariance_between_patches_is_the_shared_qu
             ratios.push(result.temperature_sd_k[[0, j]] / error);
         }
     }
-    assert!(gaps.iter().all(|g| g.abs() <= BOUND.sqrt()), "{gaps:?}");
-    assert!(ratios.iter().all(|r| (r - 1.0).abs() <= 0.01), "{ratios:?}");
+    assert!(gaps.iter().all(|g| g.abs() <= 0.01), "{gaps:?}");
+    assert!(ratios.iter().all(|r| (r - 1.0).abs() <= 1e-3), "{ratios:?}");
     let cross = result
         .cross_covariance((0, 0), (0, 1))
         .expect("cross covariance");
     for (a, b) in [(0, 0), (1, 0), (2, 2), (0, 2)] {
-        let (i, j) = (a, 3 + b);
-        let scale = (joint_covariance.get(i, i) * joint_covariance.get(j, j)).sqrt();
+        let joint = joint_covariance.get(a, 3 + b);
         assert!(
-            (cross.get(a, b) - joint_covariance.get(i, j)).abs() <= 0.01 * scale,
-            "{a} {b}: {} vs {}",
-            cross.get(a, b),
-            joint_covariance.get(i, j)
+            (cross.get(a, b) - joint).abs() <= 1e-4 * joint.abs(),
+            "{a} {b}: {} vs {joint}",
+            cross.get(a, b)
         );
     }
 
@@ -910,6 +905,12 @@ fn maps_the_fit_does_not_describe_are_refused() {
         fit_map(&map, &calibration(&setup)),
         Err(PipelineError::FlightTimeGrid(_))
     ));
+    let mut measured_empty = base.clone();
+    measured_empty.empty_background[0] = Value::Measured {
+        value: 0.0,
+        sd: 0.1,
+    };
+    refused(&measured_empty, "empty pixels is not supported");
     let mut measured = base.clone();
     measured.background[0] = Value::Measured {
         value: 0.0,
@@ -3518,6 +3519,22 @@ mod maps {
             pulls.push((result.temperature_k[patch] - t) / result.temperature_sd_k[patch]);
         }
         pulls
+    }
+
+    #[test]
+    fn a_template_no_patch_can_fit_refuses_the_map_while_the_empty_pixels_fit() {
+        let truths = [([THIN, THIN], 300.0)];
+        let tiled = tiled(&truths, |_, _| 0, (1, 1));
+        let map = tiled.map(Value::Fitted(0.5), [Value::Known(0.0); 3]);
+        match fit_map(&map, &tiled.calibration()) {
+            Err(PipelineError::InvalidParameter(message)) => {
+                assert!(
+                    message.starts_with("patch (0, 0): temperature"),
+                    "{message}"
+                )
+            }
+            other => panic!("{other:?}"),
+        }
     }
 
     #[test]
