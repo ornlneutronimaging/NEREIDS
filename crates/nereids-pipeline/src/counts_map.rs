@@ -146,8 +146,7 @@ pub struct CountsMap {
     /// ended at a temperature of 1 K or 5000 K: the patch adds nothing to the
     /// shared quantities.
     pub failed: Array2<bool>,
-    /// The empty pixels' fit; `None` when every one is excluded, or its fit
-    /// failed.
+    /// The empty pixels' fit; `None` when every one is excluded.
     pub empty: Option<RegionFit>,
     /// Each isotope's areal density in atoms/barn, in the material's order:
     /// the known one, or the fitted one; NaN where the patch has no fit.
@@ -271,9 +270,10 @@ impl CountsMap {
 /// grid meets its own rule, so the answer agrees with the joint fit to the
 /// grids' [`BOUND`](crate::open_beam::BOUND).
 ///
-/// A patch whose fit fails, does not converge, or ends at a temperature of
-/// 1 K or 5000 K is [`CountsMap::failed`] and adds nothing to the shared
-/// quantities.  A patch has one density per isotope and one temperature:
+/// A patch whose fit at the starting shared values fails, does not converge,
+/// or ends at a temperature of 1 K or 5000 K is [`CountsMap::failed`] and adds
+/// nothing to the shared quantities; a step at which a patch that fitted
+/// before fails is halved like one that raises the deviance.  A patch has one density per isotope and one temperature:
 /// where its pixels differ, these are the uniform fit of the patch's summed
 /// counts, which differs from the pixels' beam-weighted means.
 ///
@@ -282,11 +282,15 @@ impl CountsMap {
 /// [`PipelineError::InvalidParameter`] if a pixel is both behind the sample
 /// and empty, a density, the temperature or a background term of the
 /// sample's patches is [`Value::Measured`], which would count its
-/// measurement once per patch, a count of a pixel summed into a region is
-/// not a whole non-negative number, no patch is fitted, or every region's
-/// fit fails; a shared quantity's value, bounds or measurement, or the
-/// pulse's calibration, that [`fit_counts`](crate::counts_fit::fit_counts)
-/// refuses.
+/// measurement once per patch, a term of the empty pixels' background is
+/// [`Value::Measured`], a count of a pixel summed into a region is not a
+/// whole non-negative number, or no patch is fitted; a shared quantity's
+/// value, bounds or measurement, or the pulse's calibration, that
+/// [`fit_counts`](crate::counts_fit::fit_counts) refuses.  When no patch's
+/// fit converges at the starting shared values, the first failing patch's
+/// error, whatever its kind, or [`PipelineError::InvalidParameter`] if none
+/// failed with one; when the empty pixels' fit fails or does not converge,
+/// its error or [`PipelineError::InvalidParameter`].
 pub fn fit_map(
     map: &MapMeasurement<'_>,
     calibration: &Calibration,
@@ -308,6 +312,17 @@ pub fn fit_map(
         return invalid(
             "a measured density, temperature or background of the sample's patches would count \
              its measurement once per patch; give it known, fitted or within bounds"
+                .into(),
+        );
+    }
+    if map
+        .empty_background
+        .iter()
+        .any(|value| matches!(value, Value::Measured { .. }))
+    {
+        return invalid(
+            "a measured background of the empty pixels is not supported by the map's region by \
+             region fit; give it known, fitted or within bounds"
                 .into(),
         );
     }
@@ -450,13 +465,28 @@ pub fn fit_map(
             })
             .collect()
     };
-    let survivors = |swept: Vec<Swept>| -> Result<Vec<Option<Inner>>, PipelineError> {
+    let survivors = |mut swept: Vec<Swept>| -> Result<Vec<Option<Inner>>, PipelineError> {
+        let empty = swept
+            .split_off(fitted_patches.len())
+            .into_iter()
+            .map(|one| {
+                one?.ok_or_else(|| {
+                    PipelineError::InvalidParameter(
+                        "the fit of the empty pixels did not converge".into(),
+                    )
+                })
+            })
+            .collect::<Result<Vec<Inner>, PipelineError>>()?;
         if swept.iter().all(|one| !matches!(one, Ok(Some(_)))) {
             return Err(swept.into_iter().find_map(Result::err).unwrap_or_else(|| {
-                PipelineError::InvalidParameter("the fit of no region of the map converged".into())
+                PipelineError::InvalidParameter("the fit of no patch of the map converged".into())
             }));
         }
-        Ok(swept.into_iter().map(|one| one.ok().flatten()).collect())
+        Ok(swept
+            .into_iter()
+            .map(|one| one.ok().flatten())
+            .chain(empty.into_iter().map(Some))
+            .collect())
     };
     let objective = |inner: &[Option<Inner>], weights: &[Option<Inner>]| -> f64 {
         inner
