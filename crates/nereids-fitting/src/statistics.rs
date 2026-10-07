@@ -340,6 +340,12 @@ mod tests {
             ncols: 5,
         };
         assert!(matches!(common_mode(&blank, &[3, 4]), Ok(None)));
+        let singular = FlatMatrix {
+            data: vec![1.0, 2.0, 2.0, 4.0],
+            nrows: 2,
+            ncols: 2,
+        };
+        assert!(matches!(common_mode(&singular, &[0, 1]), Ok(None)));
         let mut asymmetric = covariance.clone();
         *asymmetric.get_mut(3, 4) += 1e-6;
         assert!(matches!(

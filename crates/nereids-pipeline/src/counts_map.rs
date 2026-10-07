@@ -160,8 +160,9 @@ pub struct CountsMap {
     /// residual `sign(y − μ)·√(2(y·ln(y/μ) + μ − y))` of each patch's counts
     /// `y` and the fit's predicted counts `μ` in each bin, in (time bin, patch
     /// row, patch column): `−√(2μ)` where `y` is 0, NaN where the patch is not
-    /// fitted.  Its squares over twice each run's overdispersion, summed with
-    /// the empty pixels' alike, are [`CountsFit::deviance`].
+    /// fitted.  Its squares over twice the overdispersion each run was
+    /// weighted with ([`RegionFit::overdispersion`](crate::counts_fit::RegionFit::overdispersion)),
+    /// summed with the empty pixels' alike, are [`CountsFit::deviance`].
     pub residuals: [Array3<f64>; 2],
     /// [`CountsFit::covariance`] in this order: each fitted patch, row by
     /// row, with its fitted densities, in the material's order, its
@@ -255,7 +256,7 @@ pub fn fit_map(
         .map(|(pixel, _)| pixel)
         .collect();
 
-    let bins = map.time_edges_us.len() - 1;
+    let bins = map.open_counts.dim().0;
     let region_count = fitted_patches.len() + usize::from(!empty.is_empty());
     let jacobian_rows = 2 * bins * region_count;
     let jacobian_cols = region_count * (bins / 2)
@@ -265,8 +266,8 @@ pub fn fit_map(
     if jacobian_rows.saturating_mul(jacobian_cols) > MAX_MAP_SIZE {
         return invalid(format!(
             "{} patches and {} empty pixels in {bins} time bins may need a {jacobian_rows}×\
-             {jacobian_cols} Jacobian, more than the dense fit's {MAX_MAP_SIZE} entries; use \
-             fewer patches or fewer time bins",
+             {jacobian_cols} Jacobian, more than the {MAX_MAP_SIZE} entries fit_map allows; \
+             use fewer patches or fewer time bins",
             fitted_patches.len(),
             empty.len()
         ));
