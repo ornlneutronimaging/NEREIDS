@@ -143,7 +143,8 @@ pub enum Patch {
 
 /// The fitted map, one value per patch.
 #[derive(Debug, Clone)]
-pub struct CountsMap {
+pub struct CountsMap<'a> {
+    measurement: MapMeasurement<'a>,
     /// Each patch's kind, as [`MapMeasurement::patches`].
     pub patches: Array2<Patch>,
     /// Each [`Patch::Sample`]'s fit, the shared quantities held at the map's
@@ -248,46 +249,28 @@ pub struct CountsMap {
     pub steps: usize,
 }
 
-impl CountsMap {
+impl CountsMap<'_> {
     /// For the open-beam run, then the sample run, the signed deviance
     /// residual `sign(y − μ)·√(2(y·ln(y/μ) + μ − y))` of each patch's counts
-    /// `y` in `map`, the measurement this map was fitted to, and its fit's
-    /// predicted counts `μ` in each bin, for the patch rows `rows`, in (time
-    /// bin, patch row from `rows.start`, patch column): `−√(2μ)` where `y` is
-    /// 0, NaN where the patch has no fit.  Its squares over twice the
-    /// overdispersion each run was weighted with, summed over every patch row
-    /// with the empty pixels' alike, are [`Self::deviance`].
+    /// `y` in the measurement the map was fitted to and its fit's predicted
+    /// counts `μ` in each bin, for the patch rows `rows`, in (time bin, patch
+    /// row from `rows.start`, patch column): `−√(2μ)` where `y` is 0, NaN
+    /// where the patch has no fit.  Its squares over twice the overdispersion
+    /// each run was weighted with, summed over every patch row with the empty
+    /// pixels' alike, are [`Self::deviance`].
     ///
     /// # Errors
-    /// Everything [`MapMeasurement::patches`] refuses;
-    /// [`PipelineError::ShapeMismatch`] if `map` has other patches or time
-    /// bins than this map; [`PipelineError::InvalidParameter`] if `rows` ends
-    /// past the last patch row.
-    pub fn residuals(
-        &self,
-        map: &MapMeasurement<'_>,
-        rows: Range<usize>,
-    ) -> Result<[Array3<f64>; 2], PipelineError> {
-        let bins = map.open_counts.dim().0;
-        if map.patches()? != self.patches
-            || self
-                .fits
-                .iter()
-                .flatten()
-                .any(|fit| fit.predicted.iter().any(|run| run.len() != bins))
-        {
-            return Err(PipelineError::ShapeMismatch(format!(
-                "a measurement of {bins} time bins in patches of {} pixels is not the one this \
-                 map was fitted to",
-                map.binning
-            )));
-        }
+    /// [`PipelineError::InvalidParameter`] if `rows` ends past the last patch
+    /// row.
+    pub fn residuals(&self, rows: Range<usize>) -> Result<[Array3<f64>; 2], PipelineError> {
         let (height, width) = self.patches.dim();
         if rows.end > height {
             return Err(PipelineError::InvalidParameter(format!(
                 "patch rows {rows:?} end past the map's {height}"
             )));
         }
+        let map = &self.measurement;
+        let bins = map.open_counts.dim().0;
         let mut residuals = [
             Array3::from_elem((bins, rows.len(), width), f64::NAN),
             Array3::from_elem((bins, rows.len(), width), f64::NAN),
@@ -297,7 +280,8 @@ impl CountsMap {
                 let Some(fit) = &self.fits[[i, j]] else {
                     continue;
                 };
-                let counts = summed(map, &map.pixels((i, j)))?;
+                let counts =
+                    summed(map, &map.pixels((i, j))).expect("the fit summed this patch's counts");
                 for (run, block) in residuals.iter_mut().enumerate() {
                     for (k, (&y, &mu)) in counts[run].iter().zip(&fit.predicted[run]).enumerate() {
                         block[[k, i - rows.start, j]] =
@@ -413,10 +397,10 @@ impl CountsMap {
 /// error when no patch fits at the starting shared values, or naming the
 /// empty pixels when their fit fails there; [`PipelineError::InvalidParameter`]
 /// with the last patch's reason when every patch is left out later.
-pub fn fit_map(
-    map: &MapMeasurement<'_>,
+pub fn fit_map<'a>(
+    map: &MapMeasurement<'a>,
     calibration: &Calibration,
-) -> Result<CountsMap, PipelineError> {
+) -> Result<CountsMap<'a>, PipelineError> {
     let invalid = |message: String| Err(PipelineError::InvalidParameter(message));
     let patches = map.patches()?;
     if map.sample.iter().zip(&map.empty).any(|(&s, &e)| s && e) {
@@ -1093,6 +1077,7 @@ pub fn fit_map(
     }
 
     Ok(CountsMap {
+        measurement: map.clone(),
         patches,
         fits,
         failed,
