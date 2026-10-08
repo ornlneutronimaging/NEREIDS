@@ -3,7 +3,7 @@
 
 use faer::linalg::solvers::DenseSolveCore;
 use faer::{Mat, Side};
-use ndarray::{Array2, Array3, ArrayView2, ArrayView3, s};
+use ndarray::{Array2, ArrayView2, ArrayView3, s};
 use nereids_fitting::error::FittingError;
 use nereids_fitting::lm::FlatMatrix;
 use nereids_fitting::poisson::{
@@ -141,7 +141,8 @@ pub enum Patch {
 
 /// The fitted map, one value per patch.
 #[derive(Debug, Clone)]
-pub struct CountsMap {
+pub struct CountsMap<'a> {
+    measurement: MapMeasurement<'a>,
     /// Each patch's kind, as [`MapMeasurement::patches`].
     pub patches: Array2<Patch>,
     /// Each [`Patch::Sample`]'s fit, the shared quantities held at the map's
@@ -177,13 +178,6 @@ pub struct CountsMap {
     /// fitted densities and its fitted temperature has a finite standard
     /// deviation or, for a density, is 0.
     pub trusted: Array2<bool>,
-    /// For the open-beam run, then the sample run, the signed deviance
-    /// residual `sign(y − μ)·√(2(y·ln(y/μ) + μ − y))` of each patch's counts
-    /// `y` and its fit's predicted counts `μ` in each bin, in (time bin, patch
-    /// row, patch column): `−√(2μ)` where `y` is 0, NaN where the patch has no
-    /// fit.  Its squares over twice the overdispersion each run was weighted
-    /// with, summed with the empty pixels' alike, are [`Self::deviance`].
-    pub residuals: [Array3<f64>; 2],
     /// The normalization `a`: the known one, or the fitted one.
     pub normalization: f64,
     /// The timing offset `t0` in µs: the known one, or the fitted one.
@@ -253,7 +247,40 @@ pub struct CountsMap {
     pub steps: usize,
 }
 
-impl CountsMap {
+impl CountsMap<'_> {
+    /// For each patch row in turn, for the open-beam run, then the sample
+    /// run, the signed deviance residual `sign(y − μ)·√(2(y·ln(y/μ) + μ − y))`
+    /// of each patch's counts `y` in the measurement the map was fitted to and
+    /// its fit's predicted counts `μ` in each bin, in (time bin, patch
+    /// column): `−√(2μ)` where `y` is 0, NaN where the patch has no fit.
+    /// Their squares over twice the overdispersion each run was weighted
+    /// with, summed over every patch row with the empty pixels' alike, are
+    /// [`Self::deviance`].
+    pub fn residual_rows(&self) -> impl Iterator<Item = [Array2<f64>; 2]> + '_ {
+        let map = &self.measurement;
+        let bins = map.open_counts.dim().0;
+        let width = self.patches.ncols();
+        (0..self.patches.nrows()).map(move |i| {
+            let mut row = [
+                Array2::from_elem((bins, width), f64::NAN),
+                Array2::from_elem((bins, width), f64::NAN),
+            ];
+            for j in 0..width {
+                let Some(fit) = &self.fits[[i, j]] else {
+                    continue;
+                };
+                let counts =
+                    summed(map, &map.pixels((i, j))).expect("the fit summed this patch's counts");
+                for (run, residuals) in row.iter_mut().enumerate() {
+                    for (k, (&y, &mu)) in counts[run].iter().zip(&fit.predicted[run]).enumerate() {
+                        residuals[[k, j]] = (2.0 * half_deviance(y, mu)).sqrt().copysign(y - mu);
+                    }
+                }
+            }
+            row
+        })
+    }
+
     /// The covariance of patch `a`'s [`Self::quantities`] with a different
     /// patch `b`'s, which only the shared quantities carry, `G_a C_ss G_bᵀ` over
     /// those not held on a bound; for `a` = `b`, the part of
@@ -335,9 +362,9 @@ impl CountsMap {
 /// which differs from the pixels' beam-weighted means.
 ///
 /// The map holds, for each patch, its summed counts and its fits at the
-/// current and the trial shared values, besides the residual cube, so its
-/// memory is up to several times that of the counts it is given; each
-/// region's grid gets finer as the number of regions grows.
+/// current and the trial shared values, so its memory is up to several
+/// times that of the counts it is given; each region's grid gets finer as
+/// the number of regions grows.
 ///
 /// # Errors
 /// Everything [`MapMeasurement::patches`] refuses;
@@ -358,10 +385,10 @@ impl CountsMap {
 /// error when no patch fits at the starting shared values, or naming the
 /// empty pixels when their fit fails there; [`PipelineError::InvalidParameter`]
 /// with the last patch's reason when every patch is left out later.
-pub fn fit_map(
-    map: &MapMeasurement<'_>,
+pub fn fit_map<'a>(
+    map: &MapMeasurement<'a>,
     calibration: &Calibration,
-) -> Result<CountsMap, PipelineError> {
+) -> Result<CountsMap<'a>, PipelineError> {
     let invalid = |message: String| Err(PipelineError::InvalidParameter(message));
     let patches = map.patches()?;
     if map.sample.iter().zip(&map.empty).any(|(&s, &e)| s && e) {
@@ -972,10 +999,6 @@ pub fn fit_map(
     let mut fits = Array2::from_elem((rows, cols), None);
     let mut covariance = Array2::from_elem((rows, cols), None);
     let mut sensitivity = Array2::from_elem((rows, cols), None);
-    let mut residuals = [
-        Array3::from_elem((bins, rows, cols), f64::NAN),
-        Array3::from_elem((bins, rows, cols), f64::NAN),
-    ];
     for (r, &patch) in fitted_patches.iter().enumerate() {
         let Some(Inner { fit, terms, .. }) = &inner[r] else {
             failed[patch] = failures[r].clone();
@@ -1025,13 +1048,8 @@ pub fn fit_map(
         }
         temperature_k[patch] = fit.temperature_k.unwrap_or(f64::NAN);
         temperature_sd_k[patch] = sd(Role::Temperature { region: 0 });
-        let counts = [&regions[r].open_counts, &regions[r].sample_counts];
-        for run in 0..2 {
-            overdispersion[run][patch] = fit.overdispersion[run].unwrap_or(f64::NAN);
-            for (k, (&y, &mu)) in counts[run].iter().zip(&fit.predicted[run]).enumerate() {
-                residuals[run][[k, patch.0, patch.1]] =
-                    (2.0 * half_deviance(y, mu)).sqrt().copysign(y - mu);
-            }
+        for (run, phi) in overdispersion.iter_mut().zip(fit.overdispersion) {
+            run[patch] = phi.unwrap_or(f64::NAN);
         }
         trusted[patch] = converged
             && template.iter().all(|&(role, _)| match role {
@@ -1047,6 +1065,7 @@ pub fn fit_map(
     }
 
     Ok(CountsMap {
+        measurement: map.clone(),
         patches,
         fits,
         failed,
@@ -1059,7 +1078,6 @@ pub fn fit_map(
         temperature_sd_k,
         overdispersion,
         trusted,
-        residuals,
         normalization: values[0],
         t0_us: values[1],
         flight_path_m: values[2],
