@@ -672,8 +672,26 @@ fn a_map_recovers_each_patch_and_its_covariance_between_patches_is_the_shared_qu
     for (run, map) in result.overdispersion.iter().enumerate() {
         assert!((0..4).all(|j| map[[0, j]] == phi(fits[j], run)));
     }
+    let blocks = (0..2)
+        .map(|i| result.residuals(&map, i..i + 1).expect("residuals"))
+        .collect::<Vec<_>>();
+    assert!(blocks[1].iter().all(|run| run.iter().all(|d| d.is_nan())));
+    assert!(matches!(
+        result.residuals(
+            &MapMeasurement {
+                binning: 3,
+                ..map.clone()
+            },
+            0..1
+        ),
+        Err(PipelineError::ShapeMismatch(_))
+    ));
+    assert!(matches!(
+        result.residuals(&map, 1..3),
+        Err(PipelineError::InvalidParameter(_))
+    ));
     let (mut deviance, mut zeros) = (0.0, 0);
-    for (run, residuals) in result.residuals.iter().enumerate() {
+    for (run, residuals) in blocks[0].iter().enumerate() {
         for (j, fit) in fits.iter().enumerate() {
             for (k, &mu) in fit.predicted[run].iter().enumerate() {
                 let y: f64 = (0..2)
@@ -3730,13 +3748,33 @@ mod maps {
     #[test]
     fn a_map_with_every_shared_quantity_known_fits_its_patches() {
         let truths = [([THIN, THIN], 300.0)];
-        let tiled = tiled(&truths, |_, _| 0, (1, 1));
+        let tiled = tiled(&truths, |_, _| 0, (2, 1));
         let mut map = tiled.map(Value::Fitted(400.0), [Value::Known(0.0); 3]);
         map.normalization = Value::Known(TERMS[0]);
         let result = fit_map(&map, &calibration(&tiled.setup)).expect("map");
         assert!(result.converged && result.shared.is_empty());
         let pull = (result.temperature_k[[0, 0]] - 300.0) / result.temperature_sd_k[[0, 0]];
         assert!(pull.abs() <= 0.01, "{pull}");
+
+        let term = |y: f64, mu: f64| {
+            if y == 0.0 {
+                mu
+            } else {
+                y * (y / mu).ln() + mu - y
+            }
+        };
+        let fit = result.fits[[1, 0]].as_ref().expect("a fit");
+        let block = result.residuals(&map, 1..2).expect("residuals");
+        for (run, residuals) in block.iter().enumerate() {
+            let counts = tiled.summed(run, 2..4, 0..2);
+            for (k, (&y, &mu)) in counts.iter().zip(&fit.predicted[run]).enumerate() {
+                let d = residuals[[k, 0, 0]];
+                assert!(
+                    (d * d - 2.0 * term(y, mu)).abs() <= 1e-12 * (y + mu) && d * (y - mu) >= 0.0,
+                    "{run} {k}: {d} for {y} counts, {mu} predicted"
+                );
+            }
+        }
     }
 
     #[test]

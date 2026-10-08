@@ -1,6 +1,8 @@
 //! Maps of a material's areal densities and temperature over the detector,
 //! fitted as one counts fit whose regions are patches of pixels.
 
+use std::ops::Range;
+
 use faer::linalg::solvers::DenseSolveCore;
 use faer::{Mat, Side};
 use ndarray::{Array2, Array3, ArrayView2, ArrayView3, s};
@@ -177,13 +179,6 @@ pub struct CountsMap {
     /// fitted densities and its fitted temperature has a finite standard
     /// deviation or, for a density, is 0.
     pub trusted: Array2<bool>,
-    /// For the open-beam run, then the sample run, the signed deviance
-    /// residual `sign(y − μ)·√(2(y·ln(y/μ) + μ − y))` of each patch's counts
-    /// `y` and its fit's predicted counts `μ` in each bin, in (time bin, patch
-    /// row, patch column): `−√(2μ)` where `y` is 0, NaN where the patch has no
-    /// fit.  Its squares over twice the overdispersion each run was weighted
-    /// with, summed with the empty pixels' alike, are [`Self::deviance`].
-    pub residuals: [Array3<f64>; 2],
     /// The normalization `a`: the known one, or the fitted one.
     pub normalization: f64,
     /// The timing offset `t0` in µs: the known one, or the fitted one.
@@ -254,6 +249,66 @@ pub struct CountsMap {
 }
 
 impl CountsMap {
+    /// For the open-beam run, then the sample run, the signed deviance
+    /// residual `sign(y − μ)·√(2(y·ln(y/μ) + μ − y))` of each patch's counts
+    /// `y` in `map`, the measurement this map was fitted to, and its fit's
+    /// predicted counts `μ` in each bin, for the patch rows `rows`, in (time
+    /// bin, patch row from `rows.start`, patch column): `−√(2μ)` where `y` is
+    /// 0, NaN where the patch has no fit.  Its squares over twice the
+    /// overdispersion each run was weighted with, summed over every patch row
+    /// with the empty pixels' alike, are [`Self::deviance`].
+    ///
+    /// # Errors
+    /// Everything [`MapMeasurement::patches`] refuses;
+    /// [`PipelineError::ShapeMismatch`] if `map` has other patches or time
+    /// bins than this map; [`PipelineError::InvalidParameter`] if `rows` ends
+    /// past the last patch row.
+    pub fn residuals(
+        &self,
+        map: &MapMeasurement<'_>,
+        rows: Range<usize>,
+    ) -> Result<[Array3<f64>; 2], PipelineError> {
+        let bins = map.open_counts.dim().0;
+        if map.patches()? != self.patches
+            || self
+                .fits
+                .iter()
+                .flatten()
+                .any(|fit| fit.predicted.iter().any(|run| run.len() != bins))
+        {
+            return Err(PipelineError::ShapeMismatch(format!(
+                "a measurement of {bins} time bins in patches of {} pixels is not the one this \
+                 map was fitted to",
+                map.binning
+            )));
+        }
+        let (height, width) = self.patches.dim();
+        if rows.end > height {
+            return Err(PipelineError::InvalidParameter(format!(
+                "patch rows {rows:?} end past the map's {height}"
+            )));
+        }
+        let mut residuals = [
+            Array3::from_elem((bins, rows.len(), width), f64::NAN),
+            Array3::from_elem((bins, rows.len(), width), f64::NAN),
+        ];
+        for i in rows.clone() {
+            for j in 0..width {
+                let Some(fit) = &self.fits[[i, j]] else {
+                    continue;
+                };
+                let counts = summed(map, &map.pixels((i, j)))?;
+                for (run, block) in residuals.iter_mut().enumerate() {
+                    for (k, (&y, &mu)) in counts[run].iter().zip(&fit.predicted[run]).enumerate() {
+                        block[[k, i - rows.start, j]] =
+                            (2.0 * half_deviance(y, mu)).sqrt().copysign(y - mu);
+                    }
+                }
+            }
+        }
+        Ok(residuals)
+    }
+
     /// The covariance of patch `a`'s [`Self::quantities`] with a different
     /// patch `b`'s, which only the shared quantities carry, `G_a C_ss G_bᵀ` over
     /// those not held on a bound; for `a` = `b`, the part of
@@ -335,7 +390,7 @@ impl CountsMap {
 /// which differs from the pixels' beam-weighted means.
 ///
 /// The map holds, for each patch, its summed counts and its fits at the
-/// current and the trial shared values, besides the residual cube, so its
+/// current and the trial shared values, so its
 /// memory is up to several times that of the counts it is given; each
 /// region's grid gets finer as the number of regions grows.
 ///
@@ -972,10 +1027,6 @@ pub fn fit_map(
     let mut fits = Array2::from_elem((rows, cols), None);
     let mut covariance = Array2::from_elem((rows, cols), None);
     let mut sensitivity = Array2::from_elem((rows, cols), None);
-    let mut residuals = [
-        Array3::from_elem((bins, rows, cols), f64::NAN),
-        Array3::from_elem((bins, rows, cols), f64::NAN),
-    ];
     for (r, &patch) in fitted_patches.iter().enumerate() {
         let Some(Inner { fit, terms, .. }) = &inner[r] else {
             failed[patch] = failures[r].clone();
@@ -1025,13 +1076,8 @@ pub fn fit_map(
         }
         temperature_k[patch] = fit.temperature_k.unwrap_or(f64::NAN);
         temperature_sd_k[patch] = sd(Role::Temperature { region: 0 });
-        let counts = [&regions[r].open_counts, &regions[r].sample_counts];
-        for run in 0..2 {
-            overdispersion[run][patch] = fit.overdispersion[run].unwrap_or(f64::NAN);
-            for (k, (&y, &mu)) in counts[run].iter().zip(&fit.predicted[run]).enumerate() {
-                residuals[run][[k, patch.0, patch.1]] =
-                    (2.0 * half_deviance(y, mu)).sqrt().copysign(y - mu);
-            }
+        for (run, phi) in overdispersion.iter_mut().zip(fit.overdispersion) {
+            run[patch] = phi.unwrap_or(f64::NAN);
         }
         trusted[patch] = converged
             && template.iter().all(|&(role, _)| match role {
@@ -1059,7 +1105,6 @@ pub fn fit_map(
         temperature_sd_k,
         overdispersion,
         trusted,
-        residuals,
         normalization: values[0],
         t0_us: values[1],
         flight_path_m: values[2],
