@@ -600,13 +600,15 @@ impl Decomposition {
     }
 }
 
-/// The inverses of the expected information `information` of `rows` counts
-/// that [`poisson_fit`] uses.  In the information scaled to a unit
+/// The inverses of the expected information `information` of `rows` counts,
+/// split as [`poisson_fit`] splits its directions into those its steps take
+/// and those its covariance keeps.  In the information scaled to a unit
 /// `diagonal`, its own or, for an information with other parameters profiled
 /// out, the one it had before, `spanned` keeps every eigen-direction whose
-/// eigenvalue is above the eigendecomposition's rounding, as its steps do, and
-/// `determined` keeps those of them whose eigenvalue is at least 1e-12, as its
-/// covariance does.  A parameter with no information has a zero row and
+/// eigenvalue is above the eigendecomposition's rounding, `ε·max(rows, n)`
+/// times the largest, and `determined` keeps those of them whose eigenvalue is
+/// also at least 1e-12; where that rounding exceeds 1e-12, it is the cutoff
+/// of both.  A parameter with no information has a zero row and
 /// column in both.  `resolved[i]` is whether parameter `i` has information
 /// and, beyond rounding, no component along a direction `determined` leaves
 /// out; `undetermined` holds those directions, in the parameters' units.

@@ -210,6 +210,7 @@ pub struct CountsMap {
     /// are conditional on one on a bound held there.  `None` when the map did
     /// not converge.
     pub shared_covariance: Option<FlatMatrix>,
+    propagated: Option<FlatMatrix>,
     /// For each measured one of [`Self::shared`], in that order, its value
     /// without the bounds less its measurement over `√(sd² − variance)`, the
     /// variance also without the bounds, as
@@ -233,7 +234,8 @@ pub struct CountsMap {
     pub covariance: Array2<Option<FlatMatrix>>,
     /// Each patch's change of [`Self::quantities`] per unit change of each of
     /// [`Self::shared`] at fixed counts, `−F_oo⁻¹ F_os` of its information;
-    /// the row of a quantity held on a bound is NaN.  `None` where the patch
+    /// the row of a quantity held on a bound or not determined by the counts
+    /// is NaN.  `None` where the patch
     /// has no fit.
     pub sensitivity: Array2<Option<FlatMatrix>>,
     /// Each fit's half Poisson deviance over the overdispersion it weighted
@@ -260,10 +262,8 @@ impl CountsMap {
     pub fn cross_covariance(&self, a: (usize, usize), b: (usize, usize)) -> Option<FlatMatrix> {
         let left = self.sensitivity.get(a)?.as_ref()?;
         let right = self.sensitivity.get(b)?.as_ref()?;
-        let shared = self.shared_covariance.as_ref()?;
-        let free: Vec<usize> = (0..shared.nrows)
-            .filter(|&i| shared.get(i, i).is_finite())
-            .collect();
+        let shared = self.propagated.as_ref()?;
+        let k = shared.nrows;
         let undetermined = |patch: (usize, usize), i: usize| {
             self.covariance[patch]
                 .as_ref()
@@ -275,8 +275,8 @@ impl CountsMap {
                 *cross.get_mut(i, j) = if undetermined(a, i) || undetermined(b, j) {
                     f64::NAN
                 } else {
-                    free.iter()
-                        .flat_map(|&s| free.iter().map(move |&t| (s, t)))
+                    (0..k)
+                        .flat_map(|s| (0..k).map(move |t| (s, t)))
                         .map(|(s, t)| left.get(i, s) * shared.get(s, t) * right.get(j, t))
                         .sum()
                 };
@@ -299,28 +299,28 @@ impl CountsMap {
 /// found region by region.  With the shared quantities held, each region is
 /// fitted alone, in parallel, and gives its information and slope on them
 /// with its own quantities and beam profiled out; their sum, with the
-/// calibration's prior, sets a Newton step on the shared quantities, clamped
+/// calibration's prior and each measured shared quantity's, sets a Newton
+/// step on the shared quantities, clamped
 /// to their bounds, with one on a bound its slope pushes out of held there.
 /// From its second fit on, a region keeps the beam intervals of its first,
 /// starts from its last answer, and counts in its sample run's
 /// overdispersion the leverage the shared quantities have on its bins, as
 /// the joint fit does.  The steps stop when their Newton decrement falls
 /// below [`NEWTON_DECREMENT_TOL`] at fits that counted that leverage.  A
-/// step that raises the regions' summed deviance plus the calibration's
-/// prior penalty, each run weighted with the overdispersion of the step
+/// step that raises the regions' summed deviance plus those priors'
+/// penalty, each run weighted with the overdispersion of the step
 /// before, or at which a fitted patch fails, is halved, up to ten times;
 /// twenty steps, a step that cannot fall, or a failure of the empty pixels at
 /// the smallest halving of a step or at their refit at the current values end
 /// the map unconverged.  The shared information and each region's
 /// information on its own quantities are inverted as [`information_inverse`]
 /// inverts them, the shared one scaled to its diagonal before the regions'
-/// own quantities are profiled out: the steps take every direction the
-/// information spans, and a quantity along a direction it does not
-/// determine, or moving with a shared quantity along one, has a NaN
-/// covariance.  Each of the map's regions holds
-/// its grid's spread to [`BOUND`] over the number of
-/// regions, so their summed spread is within the `BOUND` the joint fit holds
-/// it to.
+/// own quantities are profiled out, with the rounding of one region's bins:
+/// the steps take every direction the information spans, and a quantity
+/// along a direction it does not determine, or moving along one through the
+/// shared quantities, has a NaN covariance.  Each of the map's regions holds
+/// its grid's spread to its share of the map's counts times [`BOUND`], so
+/// their summed spread is within the `BOUND` the joint fit holds it to.
 ///
 /// A patch whose fit fails, does not converge, or ends at a fitted
 /// temperature of 1 K or 5000 K, at the starting shared values, at the
@@ -526,6 +526,13 @@ pub fn fit_map(
         }
     };
     let starting = held_at(&values);
+    let counted_in =
+        |region: &Region| -> f64 { region.open_counts.iter().chain(&region.sample_counts).sum() };
+    let all_counts: f64 = regions.iter().map(counted_in).sum();
+    let budgets: Vec<f64> = regions
+        .iter()
+        .map(|region| BOUND * counted_in(region) / all_counts)
+        .collect();
     let fit_region = |r: usize,
                       values: &[f64],
                       previous: Option<&RegionFit>,
@@ -556,7 +563,7 @@ pub fn fit_map(
             beams: vec![beam],
             origin_us,
             shared_leverage: shared_leverage.map(|extra| vec![extra]),
-            bound: BOUND / regions.len() as f64,
+            bound: budgets[r],
         };
         let (fit, answer) =
             fit_counts_answer(&one, &held, Some(&starts)).map_err(|e| named(label, e))?;
@@ -741,21 +748,18 @@ pub fn fit_map(
         if decrement < NEWTON_DECREMENT_TOL {
             if weighted {
                 converged = true;
-                let mut unbounded = Some((prior.clone(), penalty(&values).1));
-                for terms in inner.iter().flatten().map(|inner| &inner.terms) {
-                    match (&mut unbounded, &terms.unbounded) {
-                        (Some((total, gradient)), Some((information, slope))) => {
-                            for a in 0..k {
-                                gradient[a] += slope[a];
-                                for b in 0..k {
-                                    total[(a, b)] += information.get(a, b);
-                                }
-                            }
+                let (mut unbounded, mut slope) = (prior.clone(), penalty(&values).1);
+                for (information, region_slope) in
+                    inner.iter().flatten().map(|inner| &inner.terms.unbounded)
+                {
+                    for a in 0..k {
+                        slope[a] += region_slope[a];
+                        for b in 0..k {
+                            unbounded[(a, b)] += information.get(a, b);
                         }
-                        _ => unbounded = None,
                     }
                 }
-                break Some((total, diagonal, unbounded));
+                break Some((total, diagonal, (unbounded, slope)));
             }
             weighted = true;
             let swept = sweep(&values, &previous, &leverage, &failures, false);
@@ -814,12 +818,17 @@ pub fn fit_map(
                     failures[r] = Some(format!("{reason} (at a halved step not taken)"));
                     inner[r] = None;
                 }
+                weighted = false;
                 if inner[..patch_count].iter().all(Option::is_none) {
                     return none_left(&failures);
                 }
             }
             None => {
-                unconverged = Some(lost.into_iter().next().map_or_else(
+                let empty_first = lost
+                    .iter()
+                    .position(|&(r, _)| r >= patch_count)
+                    .unwrap_or(0);
+                unconverged = Some(lost.into_iter().nth(empty_first).map_or_else(
                     || "no halving of a Newton step lowered the objective".to_string(),
                     |(_, reason)| reason,
                 ));
@@ -853,6 +862,9 @@ pub fn fit_map(
     let shared_covariance = interior_inverse
         .as_ref()
         .map(|inverse| embedded(&interior, inverse));
+    let propagated = interior_inverse
+        .as_ref()
+        .map(|inverse| propagated(k, &interior, inverse));
     let null: Vec<Vec<f64>> = interior_inverse
         .iter()
         .flat_map(|inverse| &inverse.undetermined)
@@ -866,7 +878,7 @@ pub fn fit_map(
         .collect();
     let every: Vec<usize> = (0..k).collect();
     let unbounded = match &information {
-        Some((_, diagonal, Some((total, gradient)))) => {
+        Some((_, diagonal, (total, gradient))) => {
             let inverse = inverse_over(total, diagonal, &every)?;
             let mean: Vec<f64> = (0..k)
                 .map(|a| {
@@ -964,25 +976,18 @@ pub fn fit_map(
                 *slopes.get_mut(a, s) = row.map_or(f64::NAN, |i| terms.sensitivity.get(i, s));
             }
         }
-        let coupled = |i: usize| moves_along(|s| terms.sensitivity.get(i, s), &null);
-        let marginal = shared_covariance.as_ref().map(|shared| {
+        let marginal = propagated.as_ref().map(|shared| {
             let mut marginal = FlatMatrix::zeros(q, q);
             for (a, row_a) in rows_of.iter().enumerate() {
                 for (b, row_b) in rows_of.iter().enumerate() {
                     *marginal.get_mut(a, b) = match (row_a, row_b) {
-                        (Some(i), Some(j)) if coupled(*i) || coupled(*j) => f64::NAN,
-                        (Some(i), Some(j)) => {
-                            terms.covariance.get(*i, *j)
-                                + (0..k)
-                                    .flat_map(|s| (0..k).map(move |t| (s, t)))
-                                    .filter(|&(s, t)| shared.get(s, t).is_finite())
-                                    .map(|(s, t)| {
-                                        terms.sensitivity.get(*i, s)
-                                            * shared.get(s, t)
-                                            * terms.sensitivity.get(*j, t)
-                                    })
-                                    .sum::<f64>()
-                        }
+                        (Some(i), Some(j)) => marginal_entry(
+                            &terms.covariance,
+                            &terms.sensitivity,
+                            shared,
+                            &null,
+                            (*i, *j),
+                        ),
                         _ => f64::NAN,
                     };
                 }
@@ -1058,6 +1063,7 @@ pub fn fit_map(
             })
             .collect(),
         shared_covariance,
+        propagated,
         measured_pulls,
         pulse_consistency,
         quantities: template.into_iter().map(|(_, name)| name).collect(),
@@ -1076,6 +1082,35 @@ struct Inner {
     fit: RegionFit,
     deviance: f64,
     terms: RegionTerms,
+}
+
+fn propagated(k: usize, interior: &[usize], inverse: &InformationInverse) -> FlatMatrix {
+    let mut propagated = FlatMatrix::zeros(k, k);
+    for (a, &i) in interior.iter().enumerate() {
+        for (b, &j) in interior.iter().enumerate() {
+            *propagated.get_mut(i, j) = inverse.determined.get(a, b);
+        }
+    }
+    propagated
+}
+
+fn marginal_entry(
+    covariance: &FlatMatrix,
+    sensitivity: &FlatMatrix,
+    shared: &FlatMatrix,
+    null: &[Vec<f64>],
+    (i, j): (usize, usize),
+) -> f64 {
+    let coupled = |i: usize| moves_along(|s| sensitivity.get(i, s), null);
+    if coupled(i) || coupled(j) {
+        return f64::NAN;
+    }
+    let k = shared.nrows;
+    covariance.get(i, j)
+        + (0..k)
+            .flat_map(|s| (0..k).map(move |t| (s, t)))
+            .map(|(s, t)| sensitivity.get(i, s) * shared.get(s, t) * sensitivity.get(j, t))
+            .sum::<f64>()
 }
 
 fn moves_along(sensitivity: impl Fn(usize) -> f64, null: &[Vec<f64>]) -> bool {
@@ -1172,6 +1207,67 @@ fn summed(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_patch_quantity_has_the_joint_fits_variance_under_an_oblique_shared_degeneracy() {
+        let own = [1.0, 2.0, 0.0, 1.0, 3.0];
+        let first = [1.0, 0.0, 1.0, 2.0, 1.0];
+        for (column, resolved) in [(own, true), (first, false)] {
+            let jacobian: Vec<[f64; 3]> = (0..5)
+                .map(|row| [column[row], first[row], 2.0 * first[row]])
+                .collect();
+            let information =
+                |a: usize, b: usize| -> f64 { jacobian.iter().map(|row| row[a] * row[b]).sum() };
+            let joint = FlatMatrix {
+                data: (0..9).map(|e| information(e / 3, e % 3)).collect(),
+                nrows: 3,
+                ncols: 3,
+            };
+            let diagonal: Vec<f64> = (0..3).map(|a| information(a, a)).collect();
+            let oracle = information_inverse(&joint, &diagonal, 5).unwrap();
+            let sensitivity = FlatMatrix {
+                data: (1..3)
+                    .map(|s| -information(0, s) / information(0, 0))
+                    .collect(),
+                nrows: 1,
+                ncols: 2,
+            };
+            let profiled = FlatMatrix {
+                data: (0..4)
+                    .map(|e| {
+                        let (s, t) = (1 + e / 2, 1 + e % 2);
+                        information(s, t)
+                            - information(s, 0) * information(0, t) / information(0, 0)
+                    })
+                    .collect(),
+                nrows: 2,
+                ncols: 2,
+            };
+            let shared = information_inverse(&profiled, &diagonal[1..], 5).unwrap();
+            let own_covariance = FlatMatrix {
+                data: vec![1.0 / information(0, 0)],
+                nrows: 1,
+                ncols: 1,
+            };
+            let variance = marginal_entry(
+                &own_covariance,
+                &sensitivity,
+                &propagated(2, &[0, 1], &shared),
+                &shared.undetermined,
+                (0, 0),
+            );
+            assert_eq!(oracle.resolved[0], resolved);
+            if resolved {
+                let expected = oracle.determined.get(0, 0);
+                assert!(
+                    (variance / expected - 1.0).abs() <= 1e-9,
+                    "{variance} vs {expected}"
+                );
+            } else {
+                assert!(variance.is_nan(), "{variance}");
+            }
+        }
+    }
 
     #[test]
     fn a_quantity_moves_along_a_null_direction_unless_its_slopes_cancel_on_it() {

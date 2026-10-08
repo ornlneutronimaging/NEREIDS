@@ -1060,7 +1060,7 @@ pub(crate) struct RegionTerms {
     pub(crate) gradient: Vec<f64>,
     pub(crate) information: FlatMatrix,
     pub(crate) diagonal: Vec<f64>,
-    pub(crate) unbounded: Option<(FlatMatrix, Vec<f64>)>,
+    pub(crate) unbounded: (FlatMatrix, Vec<f64>),
     pub(crate) sensitivity: FlatMatrix,
     pub(crate) covariance: FlatMatrix,
     pub(crate) counted_information: FlatMatrix,
@@ -1189,9 +1189,7 @@ impl Answer {
             })
         };
         let bounded = profile((0..o).filter(|&a| !self.at_bound[own[a]]).collect())?;
-        let unbounded = profile((0..o).collect())
-            .ok()
-            .map(|profile| (profile.information, profile.gradient));
+        let unbounded = profile((0..o).collect())?;
         let Profile {
             set,
             inverse,
@@ -1246,7 +1244,7 @@ impl Answer {
             gradient,
             information,
             diagonal: (0..s).map(|j| full[(o + j, o + j)]).collect(),
-            unbounded,
+            unbounded: (unbounded.information, unbounded.gradient),
             sensitivity,
             covariance,
             counted_information,
