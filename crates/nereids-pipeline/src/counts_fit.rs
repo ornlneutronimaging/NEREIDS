@@ -9,11 +9,12 @@ use std::cell::RefCell;
 use std::ops::{Range, RangeInclusive};
 use std::sync::Arc;
 
+use faer::Mat;
 use nereids_endf::resonance::ResonanceData;
 use nereids_fitting::error::FittingError;
 use nereids_fitting::lm::{FitModel, FlatMatrix};
 use nereids_fitting::parameters::{FitParameter, ParameterSet};
-use nereids_fitting::poisson::{Prior, Unbounded};
+use nereids_fitting::poisson::{Prior, Unbounded, information_inverse};
 use nereids_fitting::statistics::{Consistency, consistency};
 use nereids_physics::continuous_doppler::{SUPPORT_X, broaden_with_derivative};
 use nereids_physics::doppler::DopplerParams;
@@ -26,8 +27,9 @@ use rayon::prelude::*;
 use crate::beam::BeamSpline;
 use crate::error::PipelineError;
 use crate::open_beam::{
-    Calibration, OpenBeamFit, PULSE_NUMBERS, Recorded, combined, counted, fit_on_halved_grids,
-    fit_open_beam, laws, overdispersion, validate_counts, validate_live, weights_of,
+    BOUND, COUNTS_TO_MEASURE_NOISE, Calibration, OpenBeamFit, PULSE_NUMBERS, Pulse, Recorded,
+    combined, counted, fit_on_halved_grids, fit_open_beam, laws, overdispersion, validate_counts,
+    validate_live, weights_of,
 };
 use crate::pipeline::TEMPERATURE_BOUNDS_K;
 
@@ -251,7 +253,7 @@ pub struct RegionFit {
     /// open-beam fit chose.
     pub beam: BeamSpline,
     /// Whether the region's open-beam fit chose its richest beam; see
-    /// [`OpenBeamFit::at_limit`].
+    /// [`OpenBeamFit::at_limit`](crate::open_beam::OpenBeamFit::at_limit).
     pub beam_at_limit: bool,
     /// The open-beam and sample counts the fit predicts in each bin at its
     /// answer, live fractions included, on the grid it accepted: the counts
@@ -260,7 +262,7 @@ pub struct RegionFit {
     /// Variance of the counts of the open-beam run, then of the sample run,
     /// over their Poisson variance: the value each run's counts are divided by
     /// in the returned fit.  The open-beam run's is the region's open-beam
-    /// fit's [`OpenBeamFit::overdispersion`]; the sample run's is measured the
+    /// fit's [`OpenBeamFit::overdispersion`](crate::open_beam::OpenBeamFit::overdispersion); the sample run's is measured the
     /// same way, on the bins the first fit predicts at least one count, by the
     /// previous fit, and within 1% by the returned one when the fit converged.
     /// `None` when the run's counts have not measured it; the open-beam run is
@@ -323,7 +325,7 @@ pub struct RegionFit {
 /// half maximum, in flight time, of any resonance of any region inside its
 /// energy span, at that region's starting temperature; it is then halved
 /// until the counts of every run of every region, together, meet
-/// [`BOUND`](crate::open_beam::BOUND).  The step is uniform and shared, so a
+/// [`BOUND`].  The step is uniform and shared, so a
 /// wide window whose span holds a narrow resonance at high energy, or a low
 /// fitted temperature in any region, can exceed the grid's point cap; a
 /// temperature a region's counts barely determine can run to 1 K and refuse
@@ -389,6 +391,56 @@ pub fn fit_counts(
     measurement: &Measurement,
     calibration: &Calibration,
 ) -> Result<CountsFit, PipelineError> {
+    if measurement
+        .regions
+        .iter()
+        .all(|region| region.material.is_none())
+    {
+        return Err(PipelineError::InvalidParameter(
+            "no region of the measurement holds a material to fit".into(),
+        ));
+    }
+    fit_counts_answer(measurement, calibration, None).map(|(fit, _)| fit)
+}
+
+pub(crate) struct Starts {
+    pub(crate) beams: Vec<BeamStart>,
+    pub(crate) origin_us: f64,
+    pub(crate) shared_leverage: Option<Vec<f64>>,
+    pub(crate) bound: f64,
+}
+
+#[derive(Debug, Clone)]
+pub(crate) struct BeamStart {
+    pub(crate) beam: BeamSpline,
+    pub(crate) overdispersion: Option<f64>,
+    pub(crate) at_limit: bool,
+}
+
+impl From<OpenBeamFit> for BeamStart {
+    fn from(open: OpenBeamFit) -> Self {
+        Self {
+            beam: open.beam,
+            overdispersion: open.overdispersion,
+            at_limit: open.at_limit,
+        }
+    }
+}
+
+pub(crate) struct Checked<'a> {
+    shape: Vec<Option<usize>>,
+    sample_parameters: Vec<FitParameter>,
+    measured: Vec<(usize, f64, f64)>,
+    lines: Vec<Lines<'a>>,
+    instrument: Vec<FitParameter>,
+    base: FlightTimeGrid,
+    resonances_in_span: Vec<Vec<Vec<f64>>>,
+}
+
+pub(crate) fn checked<'a>(
+    measurement: &'a Measurement,
+    calibration: &Calibration,
+) -> Result<Checked<'a>, PipelineError> {
     let Measurement {
         time_edges_us,
         charge_ratio,
@@ -402,9 +454,6 @@ pub fn fit_counts(
             .enumerate()
             .filter_map(|(r, region)| Some((r, region.material.as_ref()?)))
     };
-    if materials().next().is_none() {
-        return invalid("no region of the measurement holds a material to fit".into());
-    }
     if !(charge_ratio.is_finite() && *charge_ratio > 0.0) {
         return invalid(format!(
             "the charge ratio must be finite and positive, got {charge_ratio}"
@@ -476,36 +525,129 @@ pub fn fit_counts(
         })
         .collect::<Result<_, PipelineError>>()?;
     let instrument = calibration.instrument()?;
-    let pulse = &calibration.pulse;
-    let numbers = [
-        pulse.alpha[0],
-        pulse.alpha[1],
-        pulse.beta[0],
-        pulse.beta[1],
-        pulse.r,
-        pulse.fwhm_squared_us2,
-    ];
-    if let Some(&number) = pulse
-        .prior
-        .iter()
-        .flat_map(|prior| &prior.numbers)
-        .find(|&&n| !matches!(numbers[n], Value::Fitted(_) | Value::Within { .. }))
-    {
-        return invalid(format!(
-            "the pulse's calibration covers {}, which must be fitted, without a measurement; \
-             got {:?}",
-            PULSE_NUMBERS[number], numbers[number]
-        ));
-    }
+    validate_pulse_prior(calibration)?;
     let start: Vec<f64> = instrument.iter().map(|parameter| parameter.value).collect();
-    let beam_origin_us = start[0];
-    let mut base = FlightTimeGrid::new(
+    let base = FlightTimeGrid::new(
         time_edges_us,
         start[0],
         start[1],
         &calibration.pulse.at(&start[2..])?,
     )?;
+    calibrated_lines(
+        &lines,
+        &calibration.pulse,
+        time_edges_us,
+        start[0],
+        start[1],
+    )?;
+    let resonances_in_span = in_span(&lines, &base)?;
+    Ok(Checked {
+        shape,
+        sample_parameters,
+        measured,
+        lines,
+        instrument,
+        base,
+        resonances_in_span,
+    })
+}
+
+fn calibrated_lines(
+    lines: &[Lines<'_>],
+    pulse: &Pulse,
+    time_edges_us: &[f64],
+    t0_us: f64,
+    flight_path_m: f64,
+) -> Result<(), PipelineError> {
+    for lines in lines {
+        if let Some(((low, high), line)) = pulse.line_span_ev.zip(pulse.uncalibrated_line(
+            lines.isotopes,
+            time_edges_us,
+            t0_us,
+            flight_path_m,
+        )) {
+            return Err(PipelineError::InvalidParameter(format!(
+                "region {} has a resonance at {line} eV, outside the {low}–{high} eV of the \
+                 resonances the pulse was calibrated on",
+                lines.region
+            )));
+        }
+    }
+    Ok(())
+}
+
+fn in_span(
+    lines: &[Lines<'_>],
+    grid: &FlightTimeGrid,
+) -> Result<Vec<Vec<Vec<f64>>>, PipelineError> {
+    let energies = grid.energies_ev();
+    let span_ev = (energies[energies.len() - 1], energies[0]);
+    lines
+        .iter()
+        .map(|lines| {
+            lines
+                .isotopes
+                .iter()
+                .zip(&lines.dopplers)
+                .map(|((isotope, _), doppler)| {
+                    let read = (
+                        (span_ev.0.sqrt() - SUPPORT_X * doppler.u())
+                            .max(0.0)
+                            .powi(2),
+                        (span_ev.1.sqrt() + SUPPORT_X * doppler.u()).powi(2),
+                    );
+                    if !isotope.ranges.iter().any(|range| {
+                        range.is_evaluable()
+                            && range.energy_low <= read.0
+                            && read.1 <= range.energy_high
+                    }) {
+                        return Err(PipelineError::InvalidParameter(format!(
+                            "the Doppler-broadened cross section of {} in region {} reads \
+                             {:.6e}–{:.6e} eV, which no single one of its evaluated (SLBW, \
+                             MLBW or Reich–Moore) resolved ranges holds",
+                            isotope.isotope, lines.region, read.0, read.1
+                        )));
+                    }
+                    Ok(resonance_center_energies(&[isotope])
+                        .into_iter()
+                        .filter(|e| (span_ev.0..=span_ev.1).contains(e))
+                        .collect())
+                })
+                .collect()
+        })
+        .collect()
+}
+
+pub(crate) fn fit_counts_answer(
+    measurement: &Measurement,
+    calibration: &Calibration,
+    starts: Option<&Starts>,
+) -> Result<(CountsFit, Answer), PipelineError> {
+    let Measurement {
+        time_edges_us,
+        charge_ratio,
+        regions,
+        ..
+    } = measurement;
+    let Checked {
+        shape,
+        sample_parameters,
+        measured,
+        lines,
+        instrument,
+        mut base,
+        mut resonances_in_span,
+    } = checked(measurement, calibration)?;
+    let pulse = &calibration.pulse;
+    let start: Vec<f64> = instrument.iter().map(|parameter| parameter.value).collect();
+    let beam_origin_us = starts.map_or(start[0], |starts| starts.origin_us);
     let bins = time_edges_us.len() - 1;
+    if let Some(starts) = starts {
+        assert_eq!(starts.beams.len(), regions.len(), "one beam per region");
+        if let Some(leverage) = &starts.shared_leverage {
+            assert_eq!(leverage.len(), regions.len(), "one leverage per region");
+        }
+    }
     let mut live = Vec::with_capacity(2 * regions.len() * bins);
     for (r, region) in regions.iter().enumerate() {
         let checked = || -> Result<[Vec<f64>; 2], PipelineError> {
@@ -518,78 +660,24 @@ pub fn fit_counts(
         };
         live.extend(checked().map_err(|e| in_region(r, e))?.concat());
     }
-    let calibrated_lines = |t0_us: f64, flight_path_m: f64| -> Result<(), PipelineError> {
-        for lines in &lines {
-            if let Some(((low, high), line)) = pulse.line_span_ev.zip(pulse.uncalibrated_line(
-                lines.isotopes,
-                time_edges_us,
-                t0_us,
-                flight_path_m,
-            )) {
-                return Err(PipelineError::InvalidParameter(format!(
-                    "region {} has a resonance at {line} eV, outside the {low}–{high} eV of the \
-                     resonances the pulse was calibrated on",
-                    lines.region
-                )));
-            }
-        }
-        Ok(())
-    };
-    calibrated_lines(start[0], start[1])?;
 
-    let in_span = |grid: &FlightTimeGrid| -> Result<Vec<Vec<Vec<f64>>>, PipelineError> {
-        let energies = grid.energies_ev();
-        let span_ev = (energies[energies.len() - 1], energies[0]);
-        lines
+    let opens: Vec<BeamStart> = match starts {
+        Some(starts) => starts.beams.clone(),
+        None => regions
             .iter()
-            .map(|lines| {
-                lines
-                    .isotopes
-                    .iter()
-                    .zip(&lines.dopplers)
-                    .map(|((isotope, _), doppler)| {
-                        let read = (
-                            (span_ev.0.sqrt() - SUPPORT_X * doppler.u())
-                                .max(0.0)
-                                .powi(2),
-                            (span_ev.1.sqrt() + SUPPORT_X * doppler.u()).powi(2),
-                        );
-                        if !isotope.ranges.iter().any(|range| {
-                            range.is_evaluable()
-                                && range.energy_low <= read.0
-                                && read.1 <= range.energy_high
-                        }) {
-                            return Err(PipelineError::InvalidParameter(format!(
-                                "the Doppler-broadened cross section of {} in region {} reads \
-                                 {:.6e}–{:.6e} eV, which no single one of its evaluated (SLBW, \
-                                 MLBW or Reich–Moore) resolved ranges holds",
-                                isotope.isotope, lines.region, read.0, read.1
-                            )));
-                        }
-                        Ok(resonance_center_energies(&[isotope])
-                            .into_iter()
-                            .filter(|e| (span_ev.0..=span_ev.1).contains(e))
-                            .collect())
-                    })
-                    .collect()
+            .enumerate()
+            .map(|(r, region)| {
+                let open = fit_open_beam(
+                    time_edges_us,
+                    &region.open_counts,
+                    calibration,
+                    Some(&live[2 * r * bins..(2 * r + 1) * bins]),
+                )
+                .map_err(|e| in_region(r, e))?;
+                Ok(BeamStart::from(open))
             })
-            .collect()
+            .collect::<Result<_, PipelineError>>()?,
     };
-    let mut resonances_in_span = in_span(&base)?;
-
-    let opens = regions
-        .iter()
-        .enumerate()
-        .map(|(r, region)| {
-            fit_open_beam(
-                time_edges_us,
-                &region.open_counts,
-                calibration,
-                Some(&live[2 * r * bins..(2 * r + 1) * bins]),
-            )
-            .map_err(|e| in_region(r, e))
-        })
-        .collect::<Result<Vec<OpenBeamFit>, PipelineError>>()?;
     let beams: Vec<BeamSpline> = opens.iter().map(|open| open.beam.clone()).collect();
     let sizes: Vec<usize> = beams.iter().map(|beam| beam.coefficients().len()).collect();
     let layout = Arc::new(Layout::new(roles(&sizes, &shape), regions.len()));
@@ -702,12 +790,13 @@ pub fn fit_counts(
                     live: &live,
                 })
             },
-            |grid, params| {
-                Ok(grid.covers(
-                    params[layout.t0],
-                    params[layout.flight_path],
-                    &laws(&params[layout.pulse..]),
-                )?)
+            |spread, grid, params| {
+                Ok(spread <= starts.map_or(BOUND, |starts| starts.bound)
+                    || !grid.covers(
+                        params[layout.t0],
+                        params[layout.flight_path],
+                        &laws(&params[layout.pulse..]),
+                    )?)
             },
         )?;
         let fitted = |index: usize| fit.result.params[index];
@@ -718,7 +807,17 @@ pub fn fit_counts(
         });
         let samples: Vec<Option<f64>> = noise_bins
             .iter()
-            .map(|counted| overdispersion(&observed, &fit, counted))
+            .enumerate()
+            .map(|(r, counted)| {
+                overdispersion(
+                    &observed,
+                    &fit,
+                    counted,
+                    starts
+                        .and_then(|starts| starts.shared_leverage.as_ref())
+                        .map_or(0.0, |extra| extra[r]),
+                )
+            })
             .collect();
         let next: Vec<f64> = samples
             .iter()
@@ -767,7 +866,7 @@ pub fn fit_counts(
                 fitted(layout.flight_path),
                 &calibration.pulse.at(&fit.result.params[layout.pulse..])?,
             )?;
-            resonances_in_span = in_span(&base)?;
+            resonances_in_span = in_span(&lines, &base)?;
             first = first_grid(&base, &resonances_in_span, &fit.result.params)?;
         }
         for (r, sample) in samples.iter().enumerate() {
@@ -778,6 +877,9 @@ pub fn fit_counts(
     let converged = fit.converged && settled;
     if converged {
         calibrated_lines(
+            &lines,
+            pulse,
+            time_edges_us,
             fit.result.params[layout.t0],
             fit.result.params[layout.flight_path],
         )?;
@@ -895,7 +997,27 @@ pub fn fit_counts(
             overdispersion,
         })
         .collect();
-    Ok(CountsFit {
+    let mut fitted = vec![false; params.len()];
+    let mut at_bound = vec![false; params.len()];
+    for (&index, &bound) in free.iter().zip(&fit.result.on_bound) {
+        fitted[index] = true;
+        at_bound[index] = bound;
+    }
+    let answer = Answer {
+        grid: Arc::clone(&fit.fine),
+        dispersion: (0..observed.len()).map(|k| weights[k / bins]).collect(),
+        params: params.clone(),
+        fitted,
+        at_bound,
+        beams,
+        resonances,
+        charge_ratio: *charge_ratio,
+        beam_origin_us,
+        layout: Arc::clone(&layout),
+        live,
+        observed,
+    };
+    let fit = CountsFit {
         regions: region_fits,
         normalization: params[layout.normalization],
         t0_us: params[layout.t0],
@@ -914,7 +1036,284 @@ pub fn fit_counts(
         step_us: fit.step_us,
         points: fit.points,
         halvings: rule_halvings + fit.halvings,
-    })
+    };
+    Ok((fit, answer))
+}
+
+pub(crate) struct Answer {
+    grid: Arc<FlightTimeGrid>,
+    beams: Vec<BeamSpline>,
+    resonances: Vec<Arc<[ResonanceData]>>,
+    charge_ratio: f64,
+    beam_origin_us: f64,
+    layout: Arc<Layout>,
+    live: Vec<f64>,
+    observed: Vec<f64>,
+    dispersion: Vec<f64>,
+    params: Vec<f64>,
+    fitted: Vec<bool>,
+    at_bound: Vec<bool>,
+}
+
+pub(crate) struct RegionTerms {
+    pub(crate) quantities: Vec<Role>,
+    pub(crate) gradient: Vec<f64>,
+    pub(crate) information: FlatMatrix,
+    pub(crate) diagonal: Vec<f64>,
+    pub(crate) unbounded: Option<(FlatMatrix, Vec<f64>)>,
+    pub(crate) sensitivity: FlatMatrix,
+    pub(crate) covariance: FlatMatrix,
+    pub(crate) counted_information: FlatMatrix,
+}
+
+impl Answer {
+    pub(crate) fn region_terms(
+        &self,
+        region: usize,
+        shared: &[Role],
+    ) -> Result<RegionTerms, PipelineError> {
+        let roles = &self.layout.roles;
+        let own: Vec<usize> = (0..roles.len())
+            .filter(|&i| {
+                self.fitted[i]
+                    && matches!(
+                        roles[i],
+                        Role::Beam { region: r, .. }
+                            | Role::Density { region: r, .. }
+                            | Role::Temperature { region: r }
+                            | Role::Background { region: r, .. }
+                            if r == region
+                    )
+            })
+            .collect();
+        let shared: Vec<usize> = shared
+            .iter()
+            .map(|&role| {
+                roles
+                    .iter()
+                    .position(|&r| r == role)
+                    .expect("a shared role is in the layout")
+            })
+            .collect();
+        let columns: Vec<usize> = own.iter().chain(&shared).copied().collect();
+        let model = Recorded {
+            model: RegionsModel::new(
+                &self.grid,
+                &self.beams,
+                &self.resonances,
+                self.charge_ratio,
+                self.beam_origin_us,
+                &self.layout,
+            ),
+            live: &self.live,
+        };
+        let predicted = model.evaluate(&self.params)?;
+        let jacobian = model
+            .analytical_jacobian(&self.params, &columns, &predicted)
+            .expect("the counts model has an analytical Jacobian");
+        let n = columns.len();
+        let mut full = Mat::<f64>::zeros(n, n);
+        let mut gradient = vec![0.0; n];
+        let bins = self.observed.len() / (2 * self.layout.regions.len());
+        let rows = 2 * region * bins..2 * (region + 1) * bins;
+        let mut weights = vec![0.0; rows.len()];
+        for ((((k, &mu), &dispersion), &observed), weight) in rows
+            .clone()
+            .zip(&predicted[rows.clone()])
+            .zip(&self.dispersion[rows.clone()])
+            .zip(&self.observed[rows.clone()])
+            .zip(weights.iter_mut())
+        {
+            if mu > 0.0 {
+                *weight = 1.0 / (mu * dispersion);
+                for a in 0..n {
+                    let slope = jacobian.get(k, a);
+                    gradient[a] += *weight * slope * (mu - observed);
+                    for b in 0..n {
+                        full[(a, b)] += *weight * slope * jacobian.get(k, b);
+                    }
+                }
+            } else {
+                for (a, g) in gradient.iter_mut().enumerate() {
+                    *g += jacobian.get(k, a) / dispersion;
+                }
+            }
+        }
+        let (o, s) = (own.len(), shared.len());
+        let counted = rows.len();
+        let profile = |set: Vec<usize>| -> Result<Profile, PipelineError> {
+            let m = set.len();
+            let mut block = FlatMatrix::zeros(m, m);
+            for (a, &i) in set.iter().enumerate() {
+                for (b, &j) in set.iter().enumerate() {
+                    *block.get_mut(a, b) = full[(i, j)];
+                }
+            }
+            let diagonal: Vec<f64> = set.iter().map(|&i| full[(i, i)]).collect();
+            let inverse = information_inverse(&block, &diagonal, counted)?;
+            let mut moved = FlatMatrix::zeros(m, s);
+            for a in 0..m {
+                for j in 0..s {
+                    *moved.get_mut(a, j) = -(0..m)
+                        .map(|b| inverse.spanned.get(a, b) * full[(set[b], o + j)])
+                        .sum::<f64>();
+                }
+            }
+            let profiled = |i: usize, j: usize| {
+                full[(o + i, o + j)]
+                    + (0..m)
+                        .map(|a| full[(o + i, set[a])] * moved.get(a, j))
+                        .sum::<f64>()
+            };
+            let mut information = FlatMatrix::zeros(s, s);
+            for i in 0..s {
+                for j in 0..s {
+                    *information.get_mut(i, j) = 0.5 * (profiled(i, j) + profiled(j, i));
+                }
+            }
+            let slope = (0..s)
+                .map(|j| {
+                    gradient[o + j]
+                        + (0..m)
+                            .map(|a| moved.get(a, j) * gradient[set[a]])
+                            .sum::<f64>()
+                })
+                .collect();
+            Ok(Profile {
+                set,
+                inverse: inverse.determined,
+                resolved: inverse.resolved,
+                moved,
+                information,
+                gradient: slope,
+            })
+        };
+        let bounded = profile((0..o).filter(|&a| !self.at_bound[own[a]]).collect())?;
+        let unbounded = profile((0..o).collect())?;
+        let Profile {
+            set,
+            inverse,
+            resolved,
+            moved,
+            information,
+            gradient,
+        } = bounded;
+        let quantities: Vec<usize> = (0..set.len())
+            .filter(|&a| !matches!(roles[own[set[a]]], Role::Beam { .. }))
+            .collect();
+        let mut sensitivity = FlatMatrix::zeros(quantities.len(), s);
+        let mut covariance = FlatMatrix::zeros(quantities.len(), quantities.len());
+        for (row, &a) in quantities.iter().enumerate() {
+            for j in 0..s {
+                *sensitivity.get_mut(row, j) = if resolved[a] {
+                    moved.get(a, j)
+                } else {
+                    f64::NAN
+                };
+            }
+            for (col, &b) in quantities.iter().enumerate() {
+                *covariance.get_mut(row, col) = if resolved[a] && resolved[b] {
+                    inverse.get(a, b)
+                } else {
+                    f64::NAN
+                };
+            }
+        }
+        let mut counted_information = FlatMatrix::zeros(s, s);
+        let sample = rows.start + counted / 2..rows.end;
+        for (k, &weight) in sample.clone().zip(&weights[counted / 2..]) {
+            if predicted[k] < COUNTS_TO_MEASURE_NOISE {
+                continue;
+            }
+            let slope: Vec<f64> = (0..s)
+                .map(|j| {
+                    jacobian.get(k, o + j)
+                        + (0..set.len())
+                            .map(|a| jacobian.get(k, set[a]) * moved.get(a, j))
+                            .sum::<f64>()
+                })
+                .collect();
+            for i in 0..s {
+                for j in 0..s {
+                    *counted_information.get_mut(i, j) += weight * slope[i] * slope[j];
+                }
+            }
+        }
+        Ok(RegionTerms {
+            quantities: quantities.iter().map(|&a| roles[own[set[a]]]).collect(),
+            gradient,
+            information,
+            diagonal: (0..s).map(|j| full[(o + j, o + j)]).collect(),
+            unbounded: Some((unbounded.information, unbounded.gradient)),
+            sensitivity,
+            covariance,
+            counted_information,
+        })
+    }
+}
+
+struct Profile {
+    set: Vec<usize>,
+    inverse: FlatMatrix,
+    resolved: Vec<bool>,
+    moved: FlatMatrix,
+    information: FlatMatrix,
+    gradient: Vec<f64>,
+}
+
+pub(crate) const SHARED: [Role; 9] = [
+    Role::Normalization,
+    Role::T0,
+    Role::FlightPath,
+    Role::Pulse(0),
+    Role::Pulse(1),
+    Role::Pulse(2),
+    Role::Pulse(3),
+    Role::Pulse(4),
+    Role::Pulse(5),
+];
+
+pub(crate) fn shared_parameters(
+    measurement: &Measurement,
+    calibration: &Calibration,
+) -> Result<Vec<(Value, FitParameter)>, PipelineError> {
+    validate_pulse_prior(calibration)?;
+    let (value, name, range, allowed) =
+        quantity(measurement, Role::Normalization).expect("the normalization is a quantity");
+    let values = quantities(measurement, calibration)
+        .filter(|(role, _)| SHARED.contains(role))
+        .map(|(_, value)| *value);
+    Ok(values
+        .zip(
+            std::iter::once(value.parameter(name, range, &allowed)?)
+                .chain(calibration.instrument()?),
+        )
+        .collect())
+}
+
+fn validate_pulse_prior(calibration: &Calibration) -> Result<(), PipelineError> {
+    let pulse = &calibration.pulse;
+    let numbers = [
+        pulse.alpha[0],
+        pulse.alpha[1],
+        pulse.beta[0],
+        pulse.beta[1],
+        pulse.r,
+        pulse.fwhm_squared_us2,
+    ];
+    match pulse
+        .prior
+        .iter()
+        .flat_map(|prior| &prior.numbers)
+        .find(|&&n| !matches!(numbers[n], Value::Fitted(_) | Value::Within { .. }))
+    {
+        Some(&number) => Err(PipelineError::InvalidParameter(format!(
+            "the pulse's calibration covers {}, which must be fitted, without a measurement; \
+             got {:?}",
+            PULSE_NUMBERS[number], numbers[number]
+        ))),
+        None => Ok(()),
+    }
 }
 
 pub(crate) fn quantities<'a>(
@@ -1035,12 +1434,16 @@ fn quantity(
 }
 
 fn in_region(region: usize, error: PipelineError) -> PipelineError {
+    labelled(&format!("region {region}"), error)
+}
+
+pub(crate) fn labelled(label: &str, error: PipelineError) -> PipelineError {
     match error {
         PipelineError::InvalidParameter(message) => {
-            PipelineError::InvalidParameter(format!("region {region}: {message}"))
+            PipelineError::InvalidParameter(format!("{label}: {message}"))
         }
         PipelineError::ShapeMismatch(message) => {
-            PipelineError::ShapeMismatch(format!("region {region}: {message}"))
+            PipelineError::ShapeMismatch(format!("{label}: {message}"))
         }
         other => other,
     }
@@ -1544,7 +1947,11 @@ impl FitModel for RegionsModel {
 mod tests {
     use nereids_endf::resonance::test_support::synthetic_isotope;
 
+    use faer::Side;
+    use faer::linalg::solvers::DenseSolveCore;
+
     use super::*;
+    use crate::open_beam::Pulse;
     use crate::open_beam::tests::{ALPHA, BETA, EDGES_US, FLIGHT_PATH_M, R, T0_US, grid};
 
     #[test]
@@ -1636,6 +2043,391 @@ mod tests {
                 );
             }
         }
+    }
+
+    #[test]
+    fn each_region_s_terms_rebuild_the_joint_covariance() {
+        let grid = Arc::new(grid(None).halved().expect("grid").halved().expect("grid"));
+        let (_, u_hi) = grid.range_us();
+        let beam = BeamSpline::constant(347.0, u_hi, 1.0e4).refined();
+        let beams = [beam.clone(), beam.clone(), beam];
+        let materials = [
+            Some(synthetic_isotope(72, 180, 20.0, 0.01, 0.06)),
+            Some(synthetic_isotope(74, 182, 24.0, 0.01, 0.06)),
+            None,
+        ];
+        let isotopes: Vec<Arc<[ResonanceData]>> = materials
+            .iter()
+            .map(|m| m.iter().cloned().collect())
+            .collect();
+        let shape: Vec<Option<usize>> = materials.iter().map(|m| m.as_ref().map(|_| 1)).collect();
+        let sizes: Vec<usize> = beams.iter().map(|b| b.coefficients().len()).collect();
+        let layout = Arc::new(Layout::new(roles(&sizes, &shape), 3));
+        let truth: Vec<f64> = layout
+            .roles
+            .iter()
+            .map(|role| match *role {
+                Role::Beam {
+                    region,
+                    coefficient,
+                } => beams[region].coefficients()[coefficient],
+                Role::Density { region, .. } => [5.0e-4, 4.0e-4, 0.0][region],
+                Role::Temperature { .. } => 300.0,
+                Role::Normalization => 0.93,
+                Role::Background { region, term } => {
+                    [[0.05, 0.0, 0.0], [0.05, 0.0, 0.0], [0.0; 3]][region][term]
+                }
+                Role::T0 => T0_US,
+                Role::FlightPath => FLIGHT_PATH_M,
+                Role::Pulse(n) => [0.35, 0.05, 0.0, 0.25, 0.15, 0.0][n],
+            })
+            .collect();
+        let model = RegionsModel::new(&grid, &beams, &isotopes, 1.2, T0_US, &layout);
+        let bins = model.evaluate(&truth).expect("counts").len() / 6;
+        let live: Vec<f64> = (0..6 * bins)
+            .map(|k| 0.9 + 0.1 * (0.3 * k as f64).sin())
+            .collect();
+        let counts: Vec<f64> = Recorded { model, live: &live }
+            .evaluate(&truth)
+            .expect("counts")
+            .iter()
+            .enumerate()
+            .map(|(k, mu)| (mu + 3.0 * mu.sqrt() * (1.7 * k as f64).sin()).round())
+            .collect();
+        let measurement = Measurement {
+            time_edges_us: EDGES_US.map(f64::from).collect(),
+            charge_ratio: 1.2,
+            normalization: Value::Fitted(1.0),
+            regions: materials
+                .into_iter()
+                .enumerate()
+                .map(|(r, material)| Region {
+                    open_counts: counts[2 * r * bins..(2 * r + 1) * bins].to_vec(),
+                    sample_counts: counts[(2 * r + 1) * bins..(2 * r + 2) * bins].to_vec(),
+                    open_live: Some(live[2 * r * bins..(2 * r + 1) * bins].to_vec()),
+                    sample_live: Some(live[(2 * r + 1) * bins..(2 * r + 2) * bins].to_vec()),
+                    background: match material {
+                        Some(_) => [Value::Fitted(0.02), Value::Known(0.0), Value::Known(0.0)],
+                        None => [Value::Known(0.0); 3],
+                    },
+                    material: material.map(|data| Material {
+                        isotopes: vec![(data, Value::Fitted(3.0e-4))],
+                        temperature_k: Value::Fitted(350.0),
+                    }),
+                })
+                .collect(),
+        };
+        let calibration = Calibration {
+            t0_us: Value::Fitted(T0_US),
+            flight_path_m: Value::Fitted(FLIGHT_PATH_M),
+            pulse: Pulse {
+                alpha: [Value::Known(0.35), Value::Known(0.05)],
+                beta: [Value::Known(0.0), Value::Known(0.25)],
+                r: Value::Known(0.15),
+                fwhm_squared_us2: Value::Known(0.0),
+                energy_span_ev: (1.0, 200.0),
+                n_tau: 256,
+                line_span_ev: None,
+                prior: None,
+            },
+        };
+        let (fit, answer) = fit_counts_answer(&measurement, &calibration, None).expect("fit");
+        assert!(fit.converged);
+        let covariance = fit.covariance.as_ref().expect("covariance");
+        let fitted: Vec<Role> = quantities(&measurement, &calibration)
+            .filter(|(_, value)| !matches!(value, Value::Known(_)))
+            .map(|(role, _)| role)
+            .collect();
+        let at = |role: Role| fitted.iter().position(|&r| r == role).expect("fitted");
+        let close = |actual: f64, a: Role, b: Role| {
+            let (i, j) = (at(a), at(b));
+            let expected = covariance.get(i, j);
+            let scale = (covariance.get(i, i) * covariance.get(j, j)).sqrt();
+            assert!(
+                (actual - expected).abs() <= 1e-8 * scale,
+                "{a:?} {b:?}: {actual} vs {expected}"
+            );
+        };
+        let shared = [Role::Normalization, Role::T0, Role::FlightPath];
+        let terms: Vec<RegionTerms> = (0..3)
+            .map(|r| answer.region_terms(r, &shared).expect("terms"))
+            .collect();
+        let k = shared.len();
+        let joint = Mat::from_fn(k, k, |i, j| {
+            terms.iter().map(|t| t.information.get(i, j)).sum::<f64>()
+        })
+        .llt(Side::Lower)
+        .expect("positive definite")
+        .inverse();
+        for i in 0..k {
+            for j in 0..k {
+                close(joint[(i, j)], shared[i], shared[j]);
+            }
+        }
+        let carried = |t: &RegionTerms, a: usize, j: usize| {
+            (0..k)
+                .map(|i| t.sensitivity.get(a, i) * joint[(i, j)])
+                .sum::<f64>()
+        };
+        for (p, tp) in terms.iter().enumerate() {
+            for (a, &ra) in tp.quantities.iter().enumerate() {
+                for (j, &rs) in shared.iter().enumerate() {
+                    close(carried(tp, a, j), ra, rs);
+                }
+                for (q, tq) in terms.iter().enumerate() {
+                    for (b, &rb) in tq.quantities.iter().enumerate() {
+                        let common: f64 = (0..k)
+                            .map(|j| carried(tp, a, j) * tq.sensitivity.get(b, j))
+                            .sum();
+                        let own = if p == q { tp.covariance.get(a, b) } else { 0.0 };
+                        close(own + common, ra, rb);
+                    }
+                }
+            }
+        }
+        let leverage: f64 = (0..k)
+            .flat_map(|i| (0..k).map(move |j| (i, j)))
+            .map(|(i, j)| terms[0].counted_information.get(i, j) * joint[(i, j)])
+            .sum();
+        let value = |role: Role| {
+            answer.params[answer
+                .layout
+                .roles
+                .iter()
+                .position(|&r| r == role)
+                .expect("a shared role")]
+        };
+        let alone = Measurement {
+            normalization: Value::Known(value(Role::Normalization)),
+            regions: vec![measurement.regions[0].clone()],
+            ..measurement.clone()
+        };
+        let held = Calibration {
+            t0_us: Value::Known(value(Role::T0)),
+            flight_path_m: Value::Known(value(Role::FlightPath)),
+            ..calibration.clone()
+        };
+        let joined = &fit.regions[0];
+        let starts = Starts {
+            beams: vec![BeamStart {
+                beam: joined.beam.clone(),
+                overdispersion: joined.overdispersion[0],
+                at_limit: joined.beam_at_limit,
+            }],
+            origin_us: answer.beam_origin_us,
+            bound: BOUND,
+            shared_leverage: Some(vec![leverage]),
+        };
+        let (region, _) = fit_counts_answer(&alone, &held, Some(&starts)).expect("fit");
+        let [Some(phi), Some(expected)] =
+            [&region.regions[0], joined].map(|fit| fit.overdispersion[1])
+        else {
+            panic!("a sample overdispersion");
+        };
+        assert!((phi / expected - 1.0).abs() <= 1e-4, "{phi} vs {expected}");
+        let gradient: Vec<f64> = (0..k)
+            .map(|i| terms.iter().map(|t| t.gradient[i]).sum())
+            .collect();
+        let decrement: f64 = (0..k)
+            .flat_map(|i| (0..k).map(move |j| (i, j)))
+            .map(|(i, j)| 0.5 * gradient[i] * joint[(i, j)] * gradient[j])
+            .sum();
+        assert!(decrement <= 1e-6, "{decrement}");
+        let mut nudged = answer;
+        let roles = nudged.layout.roles.clone();
+        for (i, &role) in roles.iter().enumerate() {
+            if matches!(
+                role,
+                Role::Density { region: 0, .. } | Role::Temperature { region: 0 }
+            ) {
+                nudged.params[i] += covariance.get(at(role), at(role)).sqrt();
+            }
+        }
+        let nudged_terms: Vec<RegionTerms> = (0..3)
+            .map(|r| nudged.region_terms(r, &shared).expect("terms"))
+            .collect();
+        let gradient: Vec<f64> = (0..k)
+            .map(|i| nudged_terms.iter().map(|t| t.gradient[i]).sum())
+            .collect();
+        let decrement: f64 = (0..k)
+            .flat_map(|i| (0..k).map(move |j| (i, j)))
+            .map(|(i, j)| 0.5 * gradient[i] * joint[(i, j)] * gradient[j])
+            .sum();
+        assert!(decrement <= 1e-2, "{decrement}");
+    }
+
+    #[test]
+    fn a_map_under_a_pulse_calibration_is_the_joint_fit() {
+        let grid = Arc::new(grid(None).halved().expect("grid").halved().expect("grid"));
+        let (_, u_hi) = grid.range_us();
+        let beam = BeamSpline::constant(347.0, u_hi, 1.0e4).refined();
+        let beams = [beam.clone(), beam];
+        let hafnium = synthetic_isotope(72, 180, 20.0, 0.01, 0.06);
+        let isotopes: Vec<Arc<[ResonanceData]>> = vec![Arc::new([hafnium.clone()]), Arc::new([])];
+        let sizes: Vec<usize> = beams.iter().map(|b| b.coefficients().len()).collect();
+        let layout = Arc::new(Layout::new(roles(&sizes, &[Some(1), None]), 2));
+        let truth: Vec<f64> = layout
+            .roles
+            .iter()
+            .map(|role| match *role {
+                Role::Beam {
+                    region,
+                    coefficient,
+                } => beams[region].coefficients()[coefficient],
+                Role::Density { .. } => 5.0e-4,
+                Role::Temperature { .. } => 300.0,
+                Role::Normalization => 0.93,
+                Role::Background { region, term } => [[0.05, 0.0, 0.0], [0.0; 3]][region][term],
+                Role::T0 => T0_US,
+                Role::FlightPath => FLIGHT_PATH_M,
+                Role::Pulse(n) => [0.35, 0.05, 0.0, 0.25, 0.15, 0.0][n],
+            })
+            .collect();
+        let counts: Vec<f64> = RegionsModel::new(&grid, &beams, &isotopes, 1.2, T0_US, &layout)
+            .evaluate(&truth)
+            .expect("counts")
+            .iter()
+            .map(|c| c.round())
+            .collect();
+        let bins = counts.len() / 4;
+        let run =
+            |r: usize, run: usize| counts[(2 * r + run) * bins..(2 * r + run + 1) * bins].to_vec();
+        let cube = |which: usize| {
+            ndarray::Array3::from_shape_fn((bins, 2, 1), |(k, y, _)| run(y, which)[k])
+        };
+        let (open, sample) = (cube(0), cube(1));
+        let sample_pixel = ndarray::Array2::from_shape_fn((2, 1), |(y, _)| y == 0);
+        let empty_pixel = ndarray::Array2::from_shape_fn((2, 1), |(y, _)| y == 1);
+        let none = ndarray::Array2::from_elem((2, 1), false);
+        let material = Material {
+            isotopes: vec![(hafnium, Value::Fitted(3.0e-4))],
+            temperature_k: Value::Fitted(350.0),
+        };
+        let background = [Value::Fitted(0.02), Value::Known(0.0), Value::Known(0.0)];
+        let map = crate::counts_map::MapMeasurement {
+            time_edges_us: EDGES_US.map(f64::from).collect(),
+            charge_ratio: 1.2,
+            normalization: Value::Fitted(1.0),
+            open_counts: open.view(),
+            sample_counts: sample.view(),
+            open_live: None,
+            sample_live: None,
+            excluded: none.view(),
+            sample: sample_pixel.view(),
+            empty: empty_pixel.view(),
+            binning: 1,
+            material: material.clone(),
+            background,
+            empty_background: [Value::Known(0.0); 3],
+        };
+        let calibration = Calibration {
+            t0_us: Value::Measured {
+                value: T0_US,
+                sd: 0.01,
+            },
+            flight_path_m: Value::Fitted(FLIGHT_PATH_M),
+            pulse: Pulse {
+                alpha: [Value::Fitted(0.35), Value::Fitted(0.05)],
+                beta: [Value::Known(0.0), Value::Known(0.25)],
+                r: Value::Known(0.15),
+                fwhm_squared_us2: Value::Known(0.0),
+                energy_span_ev: (1.0, 200.0),
+                n_tau: 256,
+                line_span_ev: None,
+                prior: Some(crate::pulse_calibration::PulsePrior {
+                    numbers: vec![0, 1],
+                    mean: vec![0.36, 0.05],
+                    covariance: FlatMatrix {
+                        data: vec![1.0e-4, -2.0e-5, -2.0e-5, 1.0e-5],
+                        nrows: 2,
+                        ncols: 2,
+                    },
+                }),
+            },
+        };
+        let result = crate::counts_map::fit_map(&map, &calibration).expect("map");
+        assert!(result.converged);
+        let region = |r: usize, material: Option<Material>, background| Region {
+            open_counts: run(r, 0),
+            sample_counts: run(r, 1),
+            open_live: None,
+            sample_live: None,
+            background,
+            material,
+        };
+        let measurement = Measurement {
+            time_edges_us: map.time_edges_us.clone(),
+            charge_ratio: 1.2,
+            normalization: map.normalization,
+            regions: vec![
+                region(0, Some(material), background),
+                region(1, None, [Value::Known(0.0); 3]),
+            ],
+        };
+        let joint = fit_counts(&measurement, &calibration).expect("joint fit");
+        assert!(joint.converged);
+        let covariance = joint.covariance.as_ref().expect("covariance");
+        let fitted: Vec<Role> = quantities(&measurement, &calibration)
+            .filter(|(_, value)| !matches!(value, Value::Known(_)))
+            .map(|(role, _)| role)
+            .collect();
+        let at = |role: Role| fitted.iter().position(|&r| r == role).expect("fitted");
+        let close = |actual: f64, a: Role, b: Role| {
+            let (i, j) = (at(a), at(b));
+            let scale = (covariance.get(i, i) * covariance.get(j, j)).sqrt();
+            assert!(
+                (actual - covariance.get(i, j)).abs() <= 1e-3 * scale,
+                "{a:?} {b:?}: {actual} vs {}",
+                covariance.get(i, j)
+            );
+        };
+        let shared = [
+            Role::Normalization,
+            Role::T0,
+            Role::FlightPath,
+            Role::Pulse(0),
+            Role::Pulse(1),
+        ];
+        let map_shared = result.shared_covariance.as_ref().expect("covariance");
+        for (s, &a) in shared.iter().enumerate() {
+            for (t, &b) in shared.iter().enumerate() {
+                close(map_shared.get(s, t), a, b);
+            }
+        }
+        let own = [
+            Role::Density {
+                region: 0,
+                isotope: 0,
+            },
+            Role::Temperature { region: 0 },
+            Role::Background { region: 0, term: 0 },
+        ];
+        let patch = result.covariance[[0, 0]].as_ref().expect("covariance");
+        for (s, &a) in own.iter().enumerate() {
+            for (t, &b) in own.iter().enumerate() {
+                close(patch.get(s, t), a, b);
+            }
+        }
+        let gaps = [
+            (result.alpha[0] - joint.alpha[0])
+                / covariance
+                    .get(at(Role::Pulse(0)), at(Role::Pulse(0)))
+                    .sqrt(),
+            (result.t0_us - joint.t0_us) / covariance.get(at(Role::T0), at(Role::T0)).sqrt(),
+            (result.densities[0][[0, 0]] - joint.regions[0].densities[0])
+                / covariance.get(at(own[0]), at(own[0])).sqrt(),
+        ];
+        assert!(gaps.iter().all(|g| g.abs() <= 0.01), "{gaps:?}");
+        let [Some(map_test), Some(joint_test)] =
+            [result.pulse_consistency, joint.pulse_consistency]
+        else {
+            panic!("a pulse consistency");
+        };
+        assert_eq!(map_test.dof, joint_test.dof);
+        assert!(
+            (map_test.q - joint_test.q).abs() <= 1e-3 * joint_test.q,
+            "{map_test:?} vs {joint_test:?}"
+        );
     }
 
     #[test]

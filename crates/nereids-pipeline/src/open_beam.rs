@@ -280,6 +280,7 @@ pub fn fit_open_beam(
         open_counts,
         richest,
         &counted(richest, 0..open_counts.len()),
+        0.0,
     );
     let scale = overdispersion.unwrap_or(1.0);
     let criterion = |candidate: &Candidate| {
@@ -367,14 +368,19 @@ pub(crate) fn validate_live(
     Ok(live)
 }
 
-const COUNTS_TO_MEASURE_NOISE: f64 = 1.0;
+pub(crate) const COUNTS_TO_MEASURE_NOISE: f64 = 1.0;
 
 pub(crate) fn counted(fit: &GridFit, bins: std::ops::Range<usize>) -> Vec<usize> {
     bins.filter(|&k| fit.predicted[k] >= COUNTS_TO_MEASURE_NOISE)
         .collect()
 }
 
-pub(crate) fn overdispersion(observed: &[f64], fit: &GridFit, counted: &[usize]) -> Option<f64> {
+pub(crate) fn overdispersion(
+    observed: &[f64],
+    fit: &GridFit,
+    counted: &[usize],
+    shared_leverage: f64,
+) -> Option<f64> {
     let leverage = fit.result.leverage.as_ref().filter(|_| fit.converged)?;
     let (pearson, skew, freedom) =
         counted
@@ -388,6 +394,7 @@ pub(crate) fn overdispersion(observed: &[f64], fit: &GridFit, counted: &[usize])
                 )
             });
     let fletcher = 1.0 + skew / counted.len() as f64;
+    let freedom = freedom - shared_leverage;
     (freedom >= 1.0)
         .then(|| (pearson / freedom / fletcher).clamp(1.0, f64::INFINITY))
         .filter(|phi| phi.is_finite())
@@ -425,7 +432,7 @@ fn fit_beam(
                 live,
             })
         },
-        |_, _| Ok(true),
+        |spread, _, _| Ok(spread <= BOUND),
     )?;
     Ok(Candidate {
         beam: start.with_coefficients(&fit.result.params),
@@ -438,6 +445,7 @@ pub(crate) struct GridFit {
     pub(crate) converged: bool,
     pub(crate) predicted: Vec<f64>,
     pub(crate) coarse: Arc<FlightTimeGrid>,
+    pub(crate) fine: Arc<FlightTimeGrid>,
     pub(crate) step_us: f64,
     pub(crate) points: usize,
     pub(crate) halvings: usize,
@@ -450,7 +458,7 @@ pub(crate) fn fit_on_halved_grids<M: FitModel>(
     dispersion: &[f64],
     priors: &[Prior],
     model_on: impl Fn(&Arc<FlightTimeGrid>) -> Result<M, PipelineError>,
-    holds: impl Fn(&FlightTimeGrid, &[f64]) -> Result<bool, PipelineError>,
+    done: impl Fn(f64, &FlightTimeGrid, &[f64]) -> Result<bool, PipelineError>,
 ) -> Result<GridFit, PipelineError> {
     let dispersed: Vec<f64> = observed
         .iter()
@@ -484,12 +492,13 @@ pub(crate) fn fit_on_halved_grids<M: FitModel>(
         let coarse_grid = std::mem::replace(&mut grid, finer);
         coarse = fine;
         halvings += 1;
-        if spread <= BOUND || !converged || !holds(&coarse_grid, &result.params)? {
+        if !converged || done(spread, &coarse_grid, &result.params)? {
             return Ok(GridFit {
                 result,
                 converged,
                 predicted,
                 coarse: coarse_grid,
+                fine: Arc::clone(&grid),
                 step_us: grid.step_us(),
                 points: grid.flight_times_us().len(),
                 halvings,

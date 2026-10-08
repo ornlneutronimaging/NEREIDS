@@ -277,7 +277,9 @@ pub struct Unbounded {
     pub covariance: FlatMatrix,
 }
 
-pub(crate) const NEWTON_DECREMENT_TOL: f64 = 1e-6;
+/// The expected-information Newton decrement below which [`poisson_fit`]
+/// reports a minimum.
+pub const NEWTON_DECREMENT_TOL: f64 = 1e-6;
 
 const DEGENERATE_EIGENVALUE: f64 = 1e-12;
 
@@ -596,6 +598,130 @@ impl Decomposition {
         }
         (covariance, errors)
     }
+}
+
+/// The inverses of the expected information `information` of `rows` counts,
+/// split as [`poisson_fit`] splits its directions into those its steps take
+/// and those its covariance keeps.  In the information scaled to a unit
+/// `diagonal`, its own or, for an information with other parameters profiled
+/// out, the one it had before, `spanned` keeps every eigen-direction whose
+/// eigenvalue is above the eigendecomposition's rounding, `ε·max(rows, k)`
+/// times the largest, `k` the number of parameters with information, and `determined` keeps those of them whose eigenvalue is
+/// also at least 1e-12; where that rounding exceeds 1e-12, it is the cutoff
+/// of both.  A parameter with no information has a zero row and
+/// column in both.  `resolved[i]` is whether parameter `i` has information
+/// and, beyond rounding, no component along a direction `determined` leaves
+/// out; `undetermined` holds those directions, in the parameters' units.
+#[derive(Debug, Clone)]
+pub struct InformationInverse {
+    pub spanned: FlatMatrix,
+    pub determined: FlatMatrix,
+    pub resolved: Vec<bool>,
+    pub undetermined: Vec<Vec<f64>>,
+}
+
+/// [`InformationInverse`] of `information`, the expected information of
+/// `rows` counts, scaled to `diagonal`.
+///
+/// # Errors
+/// [`FittingError::InvalidConfig`] if `information` is not square, does not
+/// hold its entries, has an entry that is not finite, or is not symmetric to
+/// 1e-12 of `√(dᵢdⱼ)`, or if `diagonal` is not one finite non-negative entry
+/// per row, zero only on a row of zeros; [`FittingError::EvaluationFailed`] if its eigendecomposition
+/// fails.
+pub fn information_inverse(
+    information: &FlatMatrix,
+    diagonal: &[f64],
+    rows: usize,
+) -> Result<InformationInverse, FittingError> {
+    let n = information.nrows;
+    if information.ncols != n
+        || information.data.len() != n * n
+        || !information.data.iter().all(|x| x.is_finite())
+        || diagonal.len() != n
+        || !diagonal.iter().all(|d| d.is_finite() && *d >= 0.0)
+        || (0..n).any(|i| diagonal[i] == 0.0 && (0..n).any(|j| information.get(i, j) != 0.0))
+        || !(0..n).all(|i| {
+            (0..i).all(|j| {
+                (information.get(i, j) - information.get(j, i)).abs()
+                    <= 1e-12 * (diagonal[i] * diagonal[j]).sqrt()
+            })
+        })
+    {
+        return Err(FittingError::InvalidConfig(format!(
+            "an expected information is a finite symmetric square matrix with a finite \
+             non-negative diagonal to scale it by; got {} by {} with {} entries and {} \
+             diagonal entries",
+            information.nrows,
+            information.ncols,
+            information.data.len(),
+            diagonal.len()
+        )));
+    }
+    let kept: Vec<usize> = (0..n).filter(|&i| diagonal[i] > 0.0).collect();
+    let k = kept.len();
+    if k == 0 {
+        return Ok(InformationInverse {
+            spanned: FlatMatrix::zeros(n, n),
+            determined: FlatMatrix::zeros(n, n),
+            resolved: vec![false; n],
+            undetermined: Vec::new(),
+        });
+    }
+    let scale: Vec<f64> = kept.iter().map(|&i| diagonal[i].sqrt()).collect();
+    let eigen = Mat::from_fn(k, k, |a, b| {
+        information.get(kept[a], kept[b]) / (scale[a] * scale[b])
+    })
+    .self_adjoint_eigen(Side::Lower)
+    .map_err(|e| FittingError::EvaluationFailed(format!("{e:?}")))?;
+    let (values, vectors) = (eigen.S().column_vector(), eigen.U());
+    let singular: Vec<f64> = (0..k).map(|d| values[d].max(0.0).sqrt()).collect();
+    let largest = singular.iter().fold(0.0_f64, |m, &s| m.max(s));
+    let rank_floor = f64::EPSILON * rows.max(k) as f64 * largest.powi(2);
+    let inverse = |keep: &dyn Fn(usize) -> bool| {
+        let mut inverse = FlatMatrix::zeros(n, n);
+        for a in 0..k {
+            for b in 0..k {
+                *inverse.get_mut(kept[a], kept[b]) = (0..k)
+                    .filter(|&d| keep(d))
+                    .map(|d| vectors[(a, d)] * vectors[(b, d)] / values[d])
+                    .sum::<f64>()
+                    / (scale[a] * scale[b]);
+            }
+        }
+        inverse
+    };
+    let is_spanned = |d: usize| values[d] > rank_floor;
+    let is_determined = |d: usize| is_spanned(d) && values[d] >= DEGENERATE_EIGENVALUE;
+    let mut resolved = vec![false; n];
+    for a in 0..k {
+        let sensitivity: f64 = (0..k)
+            .filter(|&d| is_determined(d))
+            .map(|d| vectors[(a, d)].abs() / singular[d])
+            .sum();
+        let rounding = f64::EPSILON * rows.max(k) as f64 * largest * sensitivity;
+        resolved[kept[a]] = (0..k)
+            .filter(|&d| !is_determined(d))
+            .map(|d| vectors[(a, d)].powi(2))
+            .sum::<f64>()
+            <= rounding.powi(2);
+    }
+    let undetermined = (0..k)
+        .filter(|&d| !is_determined(d))
+        .map(|d| {
+            let mut direction = vec![0.0; n];
+            for a in 0..k {
+                direction[kept[a]] = vectors[(a, d)] / scale[a];
+            }
+            direction
+        })
+        .collect();
+    Ok(InformationInverse {
+        spanned: inverse(&is_spanned),
+        determined: inverse(&is_determined),
+        resolved,
+        undetermined,
+    })
 }
 
 fn withheld(n_free: usize) -> (FlatMatrix, Vec<Option<f64>>) {
@@ -2490,6 +2616,88 @@ mod tests {
                 result.converged,
                 decrement < NEWTON_DECREMENT_TOL,
                 "{decrement:e}: {result:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn the_information_inverse_is_poisson_fits_covariance() {
+        for weak in [0.0, 1.0e-6] {
+            let jacobian = vec![
+                vec![1.0, 1.0 + weak, 0.0],
+                vec![2.0, 2.0, 1.0],
+                vec![1.0, 1.0, 3.0],
+                vec![3.0, 3.0 - weak, 1.0],
+            ];
+            let model = Affine {
+                offset: vec![5.0; 4],
+                jacobian: jacobian.clone(),
+            };
+            let mut parameters = ParameterSet::new(
+                ["a", "b", "c"]
+                    .map(|name| FitParameter::unbounded(name, 0.0))
+                    .to_vec(),
+            );
+            let result =
+                poisson_fit(&model, &[5.0; 4], &[], &mut parameters, &at_the_start()).unwrap();
+            let covariance = result.covariance.expect("covariance");
+            let information = FlatMatrix {
+                data: (0..9)
+                    .map(|e| {
+                        jacobian
+                            .iter()
+                            .map(|row| row[e / 3] * row[e % 3] / 5.0)
+                            .sum()
+                    })
+                    .collect(),
+                nrows: 3,
+                ncols: 3,
+            };
+            let diagonal: Vec<f64> = (0..3).map(|i| information.get(i, i)).collect();
+            let inverse = information_inverse(&information, &diagonal, 4).unwrap();
+            for i in 0..3 {
+                assert_eq!(
+                    inverse.resolved[i],
+                    !covariance.get(i, i).is_nan(),
+                    "{weak}: {i}"
+                );
+                for j in (0..3).filter(|&j| inverse.resolved[i] && inverse.resolved[j]) {
+                    let (got, expected) = (inverse.determined.get(i, j), covariance.get(i, j));
+                    assert!(
+                        (got - expected).abs() <= 1e-9 * expected.abs().max(1.0),
+                        "{weak}: {got} vs {expected}"
+                    );
+                }
+            }
+            assert_eq!(inverse.spanned.get(0, 0) > 1e12, weak > 0.0, "{weak}");
+        }
+    }
+
+    #[test]
+    fn an_information_with_nothing_determined_inverts_to_zero() {
+        let inverse = information_inverse(&FlatMatrix::zeros(2, 2), &[0.0; 2], 4).unwrap();
+        assert!(inverse.spanned.data.iter().all(|&x| x == 0.0));
+        assert!(inverse.determined.data.iter().all(|&x| x == 0.0));
+        assert_eq!(inverse.resolved, [false; 2]);
+        let empty = information_inverse(&FlatMatrix::zeros(0, 0), &[], 4).unwrap();
+        assert!(empty.resolved.is_empty());
+    }
+
+    #[test]
+    fn a_direction_the_steps_leave_out_has_no_error_bar() {
+        let weak = 2.0e-12;
+        let information = FlatMatrix {
+            data: vec![1.0, 1.0 - weak, 1.0 - weak, 1.0],
+            nrows: 2,
+            ncols: 2,
+        };
+        for (rows, determined) in [(4, true), (100_000, false)] {
+            let inverse = information_inverse(&information, &[1.0; 2], rows).unwrap();
+            assert_eq!(inverse.resolved, [determined; 2], "{rows}");
+            assert_eq!(
+                inverse.undetermined.len(),
+                usize::from(!determined),
+                "{rows}"
             );
         }
     }

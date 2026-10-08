@@ -13,6 +13,7 @@ nereids-core = { workspace = true }
 nereids-endf = { workspace = true }
 nereids-physics = { workspace = true }
 nereids-fitting = { workspace = true }
+faer = { workspace = true }
 ndarray = { workspace = true }
 rayon = { workspace = true }
 serde = { workspace = true }
