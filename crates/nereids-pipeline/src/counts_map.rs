@@ -260,13 +260,13 @@ impl CountsMap<'_> {
     /// pixels' alike, are [`Self::deviance`].
     ///
     /// # Errors
-    /// [`PipelineError::InvalidParameter`] if `rows` ends past the last patch
-    /// row.
+    /// [`PipelineError::InvalidParameter`] if `rows` is not an increasing
+    /// range within the map's patch rows.
     pub fn residuals(&self, rows: Range<usize>) -> Result<[Array3<f64>; 2], PipelineError> {
         let (height, width) = self.patches.dim();
-        if rows.end > height {
+        if !(rows.start <= rows.end && rows.end <= height) {
             return Err(PipelineError::InvalidParameter(format!(
-                "patch rows {rows:?} end past the map's {height}"
+                "patch rows {rows:?} are not within the map's {height}"
             )));
         }
         let map = &self.measurement;
@@ -374,9 +374,9 @@ impl CountsMap<'_> {
 /// which differs from the pixels' beam-weighted means.
 ///
 /// The map holds, for each patch, its summed counts and its fits at the
-/// current and the trial shared values, so its
-/// memory is up to several times that of the counts it is given; each
-/// region's grid gets finer as the number of regions grows.
+/// current and the trial shared values, so its memory is up to several
+/// times that of the counts it is given; each region's grid gets finer as
+/// the number of regions grows.
 ///
 /// # Errors
 /// Everything [`MapMeasurement::patches`] refuses;

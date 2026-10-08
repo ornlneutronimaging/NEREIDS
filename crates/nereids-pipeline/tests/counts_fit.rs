@@ -676,10 +676,12 @@ fn a_map_recovers_each_patch_and_its_covariance_between_patches_is_the_shared_qu
         .map(|i| result.residuals(i..i + 1).expect("residuals"))
         .collect::<Vec<_>>();
     assert!(blocks[1].iter().all(|run| run.iter().all(|d| d.is_nan())));
-    assert!(matches!(
-        result.residuals(1..3),
-        Err(PipelineError::InvalidParameter(_))
-    ));
+    for rows in [1..3, Range { start: 2, end: 1 }] {
+        assert!(matches!(
+            result.residuals(rows),
+            Err(PipelineError::InvalidParameter(_))
+        ));
+    }
     let (mut deviance, mut zeros) = (0.0, 0);
     for (run, residuals) in blocks[0].iter().enumerate() {
         for (j, fit) in fits.iter().enumerate() {
