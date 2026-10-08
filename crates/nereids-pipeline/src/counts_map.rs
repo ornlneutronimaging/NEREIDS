@@ -1,11 +1,9 @@
 //! Maps of a material's areal densities and temperature over the detector,
 //! fitted as one counts fit whose regions are patches of pixels.
 
-use std::ops::Range;
-
 use faer::linalg::solvers::DenseSolveCore;
 use faer::{Mat, Side};
-use ndarray::{Array2, Array3, ArrayView2, ArrayView3, s};
+use ndarray::{Array2, ArrayView2, ArrayView3, s};
 use nereids_fitting::error::FittingError;
 use nereids_fitting::lm::FlatMatrix;
 use nereids_fitting::poisson::{
@@ -250,47 +248,37 @@ pub struct CountsMap<'a> {
 }
 
 impl CountsMap<'_> {
-    /// For the open-beam run, then the sample run, the signed deviance
-    /// residual `sign(y − μ)·√(2(y·ln(y/μ) + μ − y))` of each patch's counts
-    /// `y` in the measurement the map was fitted to and its fit's predicted
-    /// counts `μ` in each bin, for the patch rows `rows`, in (time bin, patch
-    /// row from `rows.start`, patch column): `−√(2μ)` where `y` is 0, NaN
-    /// where the patch has no fit.  Its squares over twice the overdispersion
-    /// each run was weighted with, summed over every patch row with the empty
-    /// pixels' alike, are [`Self::deviance`].
-    ///
-    /// # Errors
-    /// [`PipelineError::InvalidParameter`] if `rows` is not an increasing
-    /// range within the map's patch rows.
-    pub fn residuals(&self, rows: Range<usize>) -> Result<[Array3<f64>; 2], PipelineError> {
-        let (height, width) = self.patches.dim();
-        if !(rows.start <= rows.end && rows.end <= height) {
-            return Err(PipelineError::InvalidParameter(format!(
-                "patch rows {rows:?} are not within the map's {height}"
-            )));
-        }
+    /// For each patch row in turn, for the open-beam run, then the sample
+    /// run, the signed deviance residual `sign(y − μ)·√(2(y·ln(y/μ) + μ − y))`
+    /// of each patch's counts `y` in the measurement the map was fitted to and
+    /// its fit's predicted counts `μ` in each bin, in (time bin, patch
+    /// column): `−√(2μ)` where `y` is 0, NaN where the patch has no fit.
+    /// Their squares over twice the overdispersion each run was weighted
+    /// with, summed over every patch row with the empty pixels' alike, are
+    /// [`Self::deviance`].
+    pub fn residual_rows(&self) -> impl Iterator<Item = [Array2<f64>; 2]> + '_ {
         let map = &self.measurement;
         let bins = map.open_counts.dim().0;
-        let mut residuals = [
-            Array3::from_elem((bins, rows.len(), width), f64::NAN),
-            Array3::from_elem((bins, rows.len(), width), f64::NAN),
-        ];
-        for i in rows.clone() {
+        let width = self.patches.ncols();
+        (0..self.patches.nrows()).map(move |i| {
+            let mut row = [
+                Array2::from_elem((bins, width), f64::NAN),
+                Array2::from_elem((bins, width), f64::NAN),
+            ];
             for j in 0..width {
                 let Some(fit) = &self.fits[[i, j]] else {
                     continue;
                 };
                 let counts =
                     summed(map, &map.pixels((i, j))).expect("the fit summed this patch's counts");
-                for (run, block) in residuals.iter_mut().enumerate() {
+                for (run, residuals) in row.iter_mut().enumerate() {
                     for (k, (&y, &mu)) in counts[run].iter().zip(&fit.predicted[run]).enumerate() {
-                        block[[k, i - rows.start, j]] =
-                            (2.0 * half_deviance(y, mu)).sqrt().copysign(y - mu);
+                        residuals[[k, j]] = (2.0 * half_deviance(y, mu)).sqrt().copysign(y - mu);
                     }
                 }
             }
-        }
-        Ok(residuals)
+            row
+        })
     }
 
     /// The covariance of patch `a`'s [`Self::quantities`] with a different
