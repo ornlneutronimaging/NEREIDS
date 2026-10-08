@@ -215,13 +215,14 @@ pub struct CountsMap {
     /// without the bounds less its measurement over `√(sd² − variance)`, the
     /// variance also without the bounds, as
     /// [`CountsFit::measured_pulls`](crate::counts_fit::CountsFit::measured_pulls).
-    /// `None` when the map did not converge.
+    /// `None` when the map did not converge, or when the fit of a patch or of
+    /// the empty pixels gives no Gaussian without its bounds.
     pub measured_pulls: Option<Vec<f64>>,
     /// Whether the counts accept the pulse's calibration, as
     /// [`CountsFit::pulse_consistency`](crate::counts_fit::CountsFit::pulse_consistency),
     /// from [`Self::shared`] and the quantities of every patch not
-    /// [`Self::failed`], without their bounds.  `None` without a calibration, when the map did not converge,
-    /// or when [`consistency`] gives none.
+    /// [`Self::failed`], without their bounds.  `None` without a calibration,
+    /// when [`Self::measured_pulls`] is, or when [`consistency`] gives none.
     pub pulse_consistency: Option<Consistency>,
     /// A patch's fitted quantities: each fitted density, in the material's
     /// order, the temperature if fitted, and each fitted background term.
@@ -582,9 +583,12 @@ pub fn fit_map(
                 "{label}: its fit did not converge"
             )));
         }
-        let terms = answer
+        let mut terms = answer
             .region_terms(0, &roles)
             .map_err(|e| named(label, e))?;
+        if fit.unbounded.is_none() {
+            terms.unbounded = None;
+        }
         Ok(Inner {
             fit: region_fit,
             deviance: fit.deviance,
@@ -721,19 +725,27 @@ pub fn fit_map(
                     || value == parameter.upper && gradient[a] < 0.0)
             })
             .collect();
-        let covariance = inverse_over(&total, &diagonal, &free)?.spanned;
+        let off_bounds: Vec<usize> = (0..k)
+            .filter(|&a| {
+                let (value, parameter) = (values[fitted[a]], &parameters[fitted[a]].1);
+                value != parameter.lower && value != parameter.upper
+            })
+            .collect();
+        let spread = inverse_over(&total, &diagonal, &off_bounds)?.spanned;
         for (shared_leverage, inner) in leverage.iter_mut().zip(&inner) {
             if let Some(Inner { terms, .. }) = inner {
                 *shared_leverage = Some(
-                    (0..free.len())
-                        .flat_map(|a| (0..free.len()).map(move |b| (a, b)))
+                    (0..off_bounds.len())
+                        .flat_map(|a| (0..off_bounds.len()).map(move |b| (a, b)))
                         .map(|(a, b)| {
-                            terms.counted_information.get(free[a], free[b]) * covariance.get(a, b)
+                            terms.counted_information.get(off_bounds[a], off_bounds[b])
+                                * spread.get(a, b)
                         })
                         .sum(),
                 );
             }
         }
+        let covariance = inverse_over(&total, &diagonal, &free)?.spanned;
         let step: Vec<f64> = (0..free.len())
             .map(|a| {
                 -(0..free.len())
@@ -748,18 +760,21 @@ pub fn fit_map(
         if decrement < NEWTON_DECREMENT_TOL {
             if weighted {
                 converged = true;
-                let (mut unbounded, mut slope) = (prior.clone(), penalty(&values).1);
-                for (information, region_slope) in
-                    inner.iter().flatten().map(|inner| &inner.terms.unbounded)
-                {
-                    for a in 0..k {
-                        slope[a] += region_slope[a];
-                        for b in 0..k {
-                            unbounded[(a, b)] += information.get(a, b);
+                let mut unbounded = Some((prior.clone(), penalty(&values).1));
+                for terms in inner.iter().flatten().map(|inner| &inner.terms) {
+                    match (&mut unbounded, &terms.unbounded) {
+                        (Some((total, slope)), Some((information, region_slope))) => {
+                            for a in 0..k {
+                                slope[a] += region_slope[a];
+                                for b in 0..k {
+                                    total[(a, b)] += information.get(a, b);
+                                }
+                            }
                         }
+                        _ => unbounded = None,
                     }
                 }
-                break Some((total, diagonal, (unbounded, slope)));
+                break Some((total, diagonal, unbounded));
             }
             weighted = true;
             let swept = sweep(&values, &previous, &leverage, &failures, false);
@@ -878,7 +893,7 @@ pub fn fit_map(
         .collect();
     let every: Vec<usize> = (0..k).collect();
     let unbounded = match &information {
-        Some((_, diagonal, (total, gradient))) => {
+        Some((_, diagonal, Some((total, gradient)))) => {
             let inverse = inverse_over(total, diagonal, &every)?;
             let mean: Vec<f64> = (0..k)
                 .map(|a| {

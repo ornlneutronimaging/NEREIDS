@@ -605,8 +605,8 @@ impl Decomposition {
 /// and those its covariance keeps.  In the information scaled to a unit
 /// `diagonal`, its own or, for an information with other parameters profiled
 /// out, the one it had before, `spanned` keeps every eigen-direction whose
-/// eigenvalue is above the eigendecomposition's rounding, `ε·max(rows, n)`
-/// times the largest, and `determined` keeps those of them whose eigenvalue is
+/// eigenvalue is above the eigendecomposition's rounding, `ε·max(rows, k)`
+/// times the largest, `k` the number of parameters with information, and `determined` keeps those of them whose eigenvalue is
 /// also at least 1e-12; where that rounding exceeds 1e-12, it is the cutoff
 /// of both.  A parameter with no information has a zero row and
 /// column in both.  `resolved[i]` is whether parameter `i` has information
@@ -627,7 +627,7 @@ pub struct InformationInverse {
 /// [`FittingError::InvalidConfig`] if `information` is not square, does not
 /// hold its entries, has an entry that is not finite, or is not symmetric to
 /// 1e-12 of `√(dᵢdⱼ)`, or if `diagonal` is not one finite non-negative entry
-/// per row; [`FittingError::EvaluationFailed`] if its eigendecomposition
+/// per row, zero only on a row of zeros; [`FittingError::EvaluationFailed`] if its eigendecomposition
 /// fails.
 pub fn information_inverse(
     information: &FlatMatrix,
@@ -640,6 +640,7 @@ pub fn information_inverse(
         || !information.data.iter().all(|x| x.is_finite())
         || diagonal.len() != n
         || !diagonal.iter().all(|d| d.is_finite() && *d >= 0.0)
+        || (0..n).any(|i| diagonal[i] == 0.0 && (0..n).any(|j| information.get(i, j) != 0.0))
         || !(0..n).all(|i| {
             (0..i).all(|j| {
                 (information.get(i, j) - information.get(j, i)).abs()

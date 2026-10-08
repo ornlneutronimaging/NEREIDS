@@ -3684,11 +3684,24 @@ mod maps {
         let joint = tiled.joint(&map, &calibration);
         assert!(result.converged && joint.converged);
         let shared = result.shared_covariance.as_ref().expect("covariance");
+        let joint_covariance = joint.covariance.as_ref().expect("covariance");
+        let n = side * side;
+        assert_eq!(joint_covariance.nrows, 4 * n + 3);
+        let joint_sd = |s: usize| {
+            let at = [3 * n, 4 * n + 1, 4 * n + 2][s];
+            joint_covariance.get(at, at).sqrt()
+        };
         let gaps = [
-            (result.t0_us - joint.t0_us) / shared.get(1, 1).sqrt(),
-            (result.flight_path_m - joint.flight_path_m) / shared.get(2, 2).sqrt(),
+            (result.normalization - joint.normalization) / joint_sd(0),
+            (result.t0_us - joint.t0_us) / joint_sd(1),
+            (result.flight_path_m - joint.flight_path_m) / joint_sd(2),
         ];
-        assert!(gaps.iter().all(|g| g.abs() <= 2.5e-4), "{gaps:?}");
+        let ratios: Vec<f64> = (0..3)
+            .map(|s| shared.get(s, s).sqrt() / joint_sd(s))
+            .collect();
+        assert!(gaps[0].abs() <= 0.01, "{gaps:?}");
+        assert!(gaps[1..].iter().all(|g| g.abs() <= 2.5e-4), "{gaps:?}");
+        assert!(ratios.iter().all(|r| (r - 1.0).abs() <= 1e-3), "{ratios:?}");
     }
 
     #[test]
