@@ -605,16 +605,17 @@ impl Decomposition {
 /// `diagonal`, its own or, for an information with other parameters profiled
 /// out, the one it had before, `spanned` keeps every eigen-direction whose
 /// eigenvalue is above the eigendecomposition's rounding, as its steps do, and
-/// `determined` keeps those whose eigenvalue is at least 1e-12, as its
+/// `determined` keeps those of them whose eigenvalue is at least 1e-12, as its
 /// covariance does.  A parameter with no information has a zero row and
 /// column in both.  `resolved[i]` is whether parameter `i` has information
 /// and, beyond rounding, no component along a direction `determined` leaves
-/// out.
+/// out; `undetermined` holds those directions, in the parameters' units.
 #[derive(Debug, Clone)]
 pub struct InformationInverse {
     pub spanned: FlatMatrix,
     pub determined: FlatMatrix,
     pub resolved: Vec<bool>,
+    pub undetermined: Vec<Vec<f64>>,
 }
 
 /// [`InformationInverse`] of `information`, the expected information of
@@ -656,6 +657,14 @@ pub fn information_inverse(
     }
     let kept: Vec<usize> = (0..n).filter(|&i| diagonal[i] > 0.0).collect();
     let k = kept.len();
+    if k == 0 {
+        return Ok(InformationInverse {
+            spanned: FlatMatrix::zeros(n, n),
+            determined: FlatMatrix::zeros(n, n),
+            resolved: vec![false; n],
+            undetermined: Vec::new(),
+        });
+    }
     let scale: Vec<f64> = kept.iter().map(|&i| diagonal[i].sqrt()).collect();
     let eigen = Mat::from_fn(k, k, |a, b| {
         information.get(kept[a], kept[b]) / (scale[a] * scale[b])
@@ -679,7 +688,8 @@ pub fn information_inverse(
         }
         inverse
     };
-    let is_determined = |d: usize| values[d] >= DEGENERATE_EIGENVALUE;
+    let is_spanned = |d: usize| values[d] > rank_floor;
+    let is_determined = |d: usize| is_spanned(d) && values[d] >= DEGENERATE_EIGENVALUE;
     let mut resolved = vec![false; n];
     for a in 0..k {
         let sensitivity: f64 = (0..k)
@@ -693,10 +703,21 @@ pub fn information_inverse(
             .sum::<f64>()
             <= rounding.powi(2);
     }
+    let undetermined = (0..k)
+        .filter(|&d| !is_determined(d))
+        .map(|d| {
+            let mut direction = vec![0.0; n];
+            for a in 0..k {
+                direction[kept[a]] = vectors[(a, d)] / scale[a];
+            }
+            direction
+        })
+        .collect();
     Ok(InformationInverse {
-        spanned: inverse(&|d| values[d] > rank_floor),
+        spanned: inverse(&is_spanned),
         determined: inverse(&is_determined),
         resolved,
+        undetermined,
     })
 }
 
@@ -2646,6 +2667,35 @@ mod tests {
                 }
             }
             assert_eq!(inverse.spanned.get(0, 0) > 1e12, weak > 0.0, "{weak}");
+        }
+    }
+
+    #[test]
+    fn an_information_with_nothing_determined_inverts_to_zero() {
+        let inverse = information_inverse(&FlatMatrix::zeros(2, 2), &[0.0; 2], 4).unwrap();
+        assert!(inverse.spanned.data.iter().all(|&x| x == 0.0));
+        assert!(inverse.determined.data.iter().all(|&x| x == 0.0));
+        assert_eq!(inverse.resolved, [false; 2]);
+        let empty = information_inverse(&FlatMatrix::zeros(0, 0), &[], 4).unwrap();
+        assert!(empty.resolved.is_empty());
+    }
+
+    #[test]
+    fn a_direction_the_steps_leave_out_has_no_error_bar() {
+        let weak = 2.0e-12;
+        let information = FlatMatrix {
+            data: vec![1.0, 1.0 - weak, 1.0 - weak, 1.0],
+            nrows: 2,
+            ncols: 2,
+        };
+        for (rows, determined) in [(4, true), (100_000, false)] {
+            let inverse = information_inverse(&information, &[1.0; 2], rows).unwrap();
+            assert_eq!(inverse.resolved, [determined; 2], "{rows}");
+            assert_eq!(
+                inverse.undetermined.len(),
+                usize::from(!determined),
+                "{rows}"
+            );
         }
     }
 

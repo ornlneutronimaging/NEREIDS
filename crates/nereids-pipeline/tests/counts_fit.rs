@@ -3715,6 +3715,18 @@ mod maps {
     }
 
     #[test]
+    fn a_map_with_every_shared_quantity_known_fits_its_patches() {
+        let truths = [([THIN, THIN], 300.0)];
+        let tiled = tiled(&truths, |_, _| 0, (1, 1));
+        let mut map = tiled.map(Value::Fitted(400.0), [Value::Known(0.0); 3]);
+        map.normalization = Value::Known(TERMS[0]);
+        let result = fit_map(&map, &calibration(&tiled.setup)).expect("map");
+        assert!(result.converged && result.shared.is_empty());
+        let pull = (result.temperature_k[[0, 0]] - 300.0) / result.temperature_sd_k[[0, 0]];
+        assert!(pull.abs() <= 0.01, "{pull}");
+    }
+
+    #[test]
     fn densities_the_counts_cannot_tell_apart_are_left_undetermined() {
         let first = hafnium_like(20.0);
         let mut twin = first.clone();

@@ -161,8 +161,9 @@ pub struct CountsMap {
     /// the known one, or the fitted one; NaN where the patch has no fit.
     pub densities: Vec<Array2<f64>>,
     /// Standard deviation of each density, from [`Self::covariance`]; NaN
-    /// where the density is known or held on a bound, the patch has no fit,
-    /// or the map did not converge.
+    /// where the density is known, held on a bound or not determined by the
+    /// counts, alone or through a shared quantity, where the patch has no fit,
+    /// or where the map did not converge.
     pub density_sd: Vec<Array2<f64>>,
     /// The temperature in K: the known one, or the fitted one; NaN where the
     /// patch has no fit.
@@ -203,9 +204,11 @@ pub struct CountsMap {
     pub shared: Vec<&'static str>,
     /// Covariance of [`Self::shared`]: the inverse of the information on them
     /// of every patch that did not fail and of the empty pixels, each with
-    /// its own quantities and beam profiled out, plus the calibration's
-    /// prior.  The row and column of one on a bound are NaN, and the rest are
-    /// conditional on it held there.  `None` when the map did not converge.
+    /// its own quantities and beam profiled out, plus `1/sd²` for each measured
+    /// shared quantity and the pulse calibration's prior.  The row and column
+    /// of one on a bound or not determined by the counts are NaN, and the rest
+    /// are conditional on one on a bound held there.  `None` when the map did
+    /// not converge.
     pub shared_covariance: Option<FlatMatrix>,
     /// For each measured one of [`Self::shared`], in that order, its value
     /// without the bounds less its measurement over `√(sd² − variance)`, the
@@ -224,7 +227,8 @@ pub struct CountsMap {
     pub quantities: Vec<String>,
     /// Each patch's covariance of [`Self::quantities`], the shared
     /// quantities' uncertainty included; the row and column of one held on a
-    /// bound are NaN.  `None` where the patch has no fit or the map has no
+    /// bound, or not determined by the counts, alone or through a shared
+    /// quantity, are NaN.  `None` where the patch has no fit or the map has no
     /// shared covariance.
     pub covariance: Array2<Option<FlatMatrix>>,
     /// Each patch's change of [`Self::quantities`] per unit change of each of
@@ -238,6 +242,10 @@ pub struct CountsMap {
     /// Whether the Newton decrement of the shared quantities fell below
     /// [`NEWTON_DECREMENT_TOL`].
     pub converged: bool,
+    /// Why the map did not converge: the empty pixels' failure, the step
+    /// limit, or a step none of whose halvings lowered the objective.  `None`
+    /// when it converged.
+    pub unconverged: Option<String>,
     /// Newton steps tried on the shared quantities, those not taken included.
     pub steps: usize,
 }
@@ -324,6 +332,11 @@ impl CountsMap {
 /// A patch has one density per isotope and one temperature: where its
 /// pixels differ, these are the uniform fit of the patch's summed counts,
 /// which differs from the pixels' beam-weighted means.
+///
+/// The map holds, for each patch, its summed counts and its fits at the
+/// current and the trial shared values, besides the residual cube, so its
+/// memory is up to several times that of the counts it is given; each
+/// region's grid gets finer as the number of regions grows.
 ///
 /// # Errors
 /// Everything [`MapMeasurement::patches`] refuses;
@@ -660,7 +673,7 @@ pub fn fit_map(
             reason.map_or("", String::as_str)
         ))
     };
-    let counted = 2 * bins * regions.len();
+    let counted = 2 * bins;
     let inverse_over = |total: &Mat<f64>, diagonal: &[f64], set: &[usize]| {
         let mut block = FlatMatrix::zeros(set.len(), set.len());
         for (a, &i) in set.iter().enumerate() {
@@ -673,6 +686,7 @@ pub fn fit_map(
     };
     let mut steps = 0;
     let mut converged = false;
+    let mut unconverged = None;
     let mut weighted = false;
     let information = loop {
         for (kept, inner) in previous.iter_mut().zip(&inner) {
@@ -746,7 +760,8 @@ pub fn fit_map(
             weighted = true;
             let swept = sweep(&values, &previous, &leverage, &failures, false);
             absorb(swept, &mut inner, &mut failures);
-            if failures[patch_count..].iter().any(Option::is_some) {
+            if let Some(reason) = failures[patch_count..].iter().flatten().next() {
+                unconverged = Some(reason.clone());
                 break None;
             }
             if inner[..patch_count].iter().all(Option::is_none) {
@@ -755,6 +770,7 @@ pub fn fit_map(
             continue;
         }
         if steps == MOST_STEPS {
+            unconverged = Some(format!("{MOST_STEPS} Newton steps did not converge"));
             break None;
         }
         steps += 1;
@@ -802,7 +818,13 @@ pub fn fit_map(
                     return none_left(&failures);
                 }
             }
-            None => break None,
+            None => {
+                unconverged = Some(lost.into_iter().next().map_or_else(
+                    || "no halving of a Newton step lowered the objective".to_string(),
+                    |(_, reason)| reason,
+                ));
+                break None;
+            }
         }
     };
 
@@ -831,12 +853,17 @@ pub fn fit_map(
     let shared_covariance = interior_inverse
         .as_ref()
         .map(|inverse| embedded(&interior, inverse));
-    let mut unresolved = vec![false; k];
-    if let Some(inverse) = &interior_inverse {
-        for (a, &i) in interior.iter().enumerate() {
-            unresolved[i] = !inverse.resolved[a];
-        }
-    }
+    let null: Vec<Vec<f64>> = interior_inverse
+        .iter()
+        .flat_map(|inverse| &inverse.undetermined)
+        .map(|direction| {
+            let mut along = vec![0.0; k];
+            for (a, &i) in interior.iter().enumerate() {
+                along[i] = direction[a];
+            }
+            along
+        })
+        .collect();
     let every: Vec<usize> = (0..k).collect();
     let unbounded = match &information {
         Some((_, diagonal, Some((total, gradient)))) => {
@@ -937,8 +964,7 @@ pub fn fit_map(
                 *slopes.get_mut(a, s) = row.map_or(f64::NAN, |i| terms.sensitivity.get(i, s));
             }
         }
-        let coupled =
-            |i: usize| (0..k).any(|s| unresolved[s] && terms.sensitivity.get(i, s) != 0.0);
+        let coupled = |i: usize| moves_along(|s| terms.sensitivity.get(i, s), &null);
         let marginal = shared_covariance.as_ref().map(|shared| {
             let mut marginal = FlatMatrix::zeros(q, q);
             for (a, row_a) in rows_of.iter().enumerate() {
@@ -1039,6 +1065,7 @@ pub fn fit_map(
         sensitivity,
         deviance: inner.iter().flatten().map(|i| i.deviance).sum(),
         converged,
+        unconverged,
         steps,
     })
 }
@@ -1049,6 +1076,18 @@ struct Inner {
     fit: RegionFit,
     deviance: f64,
     terms: RegionTerms,
+}
+
+fn moves_along(sensitivity: impl Fn(usize) -> f64, null: &[Vec<f64>]) -> bool {
+    null.iter().any(|direction| {
+        let terms: Vec<f64> = direction
+            .iter()
+            .enumerate()
+            .map(|(s, &v)| sensitivity(s) * v)
+            .collect();
+        let magnitude: f64 = terms.iter().map(|t| t.abs()).sum();
+        terms.iter().sum::<f64>().abs() > f64::EPSILON.sqrt() * magnitude
+    })
 }
 
 fn named(label: &str, error: PipelineError) -> PipelineError {
@@ -1128,4 +1167,17 @@ fn summed(
         }
     }
     Ok(sums)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn a_quantity_moves_along_a_null_direction_unless_its_slopes_cancel_on_it() {
+        let null = vec![vec![1.0, -2.0]];
+        assert!(moves_along(|s| [1.0, 0.0][s], &null));
+        assert!(!moves_along(|s| [2.0, 1.0][s], &null));
+        assert!(!moves_along(|_| 0.0, &null));
+    }
 }
