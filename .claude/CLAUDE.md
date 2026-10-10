@@ -19,6 +19,16 @@ how.** A plan that cannot name one is drift; stop and re-aim.
 
 Full pipeline map: `docs/guide/src/pipeline-map.html`.
 
+## Critical path first
+
+Until a room-temperature foil of known thickness reads its effective temperature within its uncertainty on real VENUS counts, the critical path is completing the counts model: every piece the pipeline map lists as not yet in the code is modelled, bounded or measured.
+
+- The critical path comes first, but every other roadmap item is still owed: it is worked on when a critical-path item waits on people, data or compute, or when the user schedules it, and nothing leaves the roadmap without the user's decision.
+- Every plan's first line names the roadmap item it closes and whether it is on the critical path.
+- The foil reading its temperature is a milestone, not the finish line.
+- When evidence changes the roadmap, I propose the new order before continuing; a stale plan is never a reason to keep going.
+- After two failed steps in a row I stop and bring the whole candidate list.
+
 ## Pre-Commit Checklist (mandatory before every commit)
 
 Always run these three commands and fix all output before committing:
