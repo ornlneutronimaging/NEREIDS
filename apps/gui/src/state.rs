@@ -1651,7 +1651,7 @@ impl Default for AppState {
 
             isotope_entries: Vec::new(),
             isotope_groups: Vec::new(),
-            endf_library: EndfLibrary::EndfB8_0,
+            endf_library: EndfLibrary::EndfB8_1,
 
             resolution_enabled: false,
             resolution_mode: ResolutionMode::default(),
@@ -1731,7 +1731,7 @@ impl Default for AppState {
             map_display_isotope: 0,
 
             fm_isotope_entries: Vec::new(),
-            fm_endf_library: EndfLibrary::EndfB8_0,
+            fm_endf_library: EndfLibrary::EndfB8_1,
             pending_fm_endf: None,
             is_fetching_fm_endf: false,
             fm_temperature_k: 296.0,
@@ -1752,7 +1752,7 @@ impl Default for AppState {
             detect_results: Vec::new(),
             pending_detect_endf: None,
             is_fetching_detect_endf: false,
-            detect_endf_library: EndfLibrary::EndfB8_0,
+            detect_endf_library: EndfLibrary::EndfB8_1,
             detect_temperature_k: 296.0,
             detect_resolution_enabled: false,
             detect_resolution_mode: ResolutionMode::default(),
