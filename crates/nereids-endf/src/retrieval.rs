@@ -30,28 +30,46 @@ const IAEA_MIN_REQUEST_INTERVAL: Duration = Duration::from_secs(3);
 
 static LAST_IAEA_REQUEST: OnceLock<Mutex<Option<Instant>>> = OnceLock::new();
 
-/// ENDF evaluated nuclear data libraries.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+/// ENDF evaluated nuclear data libraries, serialized by name.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub enum EndfLibrary {
-    /// ENDF/B-VIII.0 (default, well-tested).
+    /// ENDF/B-VIII.0 (previous release).
+    #[serde(rename = "ENDF/B-VIII.0")]
     EndfB8_0,
     /// ENDF/B-VIII.1 (latest release, Aug 2024).
+    #[serde(rename = "ENDF/B-VIII.1")]
     EndfB8_1,
     /// JEFF-3.3 (European library).
+    #[serde(rename = "JEFF-3.3")]
     Jeff3_3,
     /// JENDL-5 (Japanese library).
+    #[serde(rename = "JENDL-5")]
     Jendl5,
     /// TENDL-2023 (TALYS-based, 2,300 ground-state isotopes including activation
     /// products and transuranics not covered by the major evaluated libraries).
+    #[serde(rename = "TENDL-2023")]
     Tendl2023,
     /// CENDL-3.2 (Chinese library, 258 ground-state isotopes plus free neutron;
     /// Z=1–98 with no Br evaluations — no MAT entry for Br-79 / Br-81, so
     /// `mat_number(.., EndfLibrary::Cendl3_2)` returns `None` for Br before any
     /// retrieval call).
+    #[serde(rename = "CENDL-3.2")]
     Cendl3_2,
 }
 
 impl EndfLibrary {
+    /// The energy windows, in eV, that counts fits and maps using this
+    /// library's evaluation of `isotope` leave out, because its resonance
+    /// energies there disagree with measured transmission.  The resonances'
+    /// wings and the instrument's pulse carry part of a window's counts outside
+    /// it, where at high counts per bin they raise the fit's overdispersion.
+    pub fn excluded_windows_ev(self, isotope: &Isotope) -> &'static [(f64, f64)] {
+        match (self, isotope.z(), isotope.a()) {
+            (Self::EndfB8_1, 73, 181) => &[(13.6, 14.2)],
+            _ => &[],
+        }
+    }
+
     /// URL path component for this library.
     fn url_path(&self) -> &'static str {
         match self {

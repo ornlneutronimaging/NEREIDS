@@ -11,6 +11,7 @@ use std::sync::Arc;
 
 use faer::Mat;
 use nereids_endf::resonance::ResonanceData;
+use nereids_endf::retrieval::EndfLibrary;
 use nereids_fitting::error::FittingError;
 use nereids_fitting::lm::{FitModel, FlatMatrix};
 use nereids_fitting::parameters::{FitParameter, ParameterSet};
@@ -144,6 +145,12 @@ pub struct Material {
     pub isotopes: Vec<(ResonanceData, Value)>,
     /// The temperature in K, within 1–5000 K.
     pub temperature_k: Value,
+    /// The library the isotopes' resonance data were read from.  The fit
+    /// leaves out the sample run's bins that overlap the span between the mean
+    /// arrival times, `t0 + L·TOF_FACTOR/√E + 3/α + R/β`, of the two ends of
+    /// each window [`EndfLibrary::excluded_windows_ev`] gives for an isotope
+    /// not known to be absent, at the fitted `t0`, flight path `L` and pulse.
+    pub library: EndfLibrary,
 }
 
 /// The fitted quantities of every region, and the normalization, timing
@@ -195,11 +202,13 @@ pub struct CountsFit {
     /// of its bounds.
     pub on_bound: Vec<bool>,
     /// Each run's half Poisson deviance over the overdispersion it was
-    /// weighted with, summed over both runs of every region at the fit.
+    /// weighted with, summed over both runs of every region at the fit, outside
+    /// the sample runs' [`RegionFit::excluded_bins`].
     pub deviance: f64,
     /// Whether the fitter converged, every sample run's overdispersion
-    /// settled, the grid met its rule at the fitted temperatures and its
-    /// flight times cover the fitted `t0`, flight path and pulse.
+    /// settled, the grid met its rule at the fitted temperatures, its flight
+    /// times cover the fitted `t0`, flight path and pulse, and the bins left
+    /// out at those are the ones the fit left out.
     pub converged: bool,
     /// For each measured quantity, in the covariance's order, its value
     /// without the fit's bounds ([`Self::unbounded`]) less its measurement
@@ -263,11 +272,16 @@ pub struct RegionFit {
     /// over their Poisson variance: the value each run's counts are divided by
     /// in the returned fit.  The open-beam run's is the region's open-beam
     /// fit's [`OpenBeamFit::overdispersion`](crate::open_beam::OpenBeamFit::overdispersion); the sample run's is measured the
-    /// same way, on the bins the first fit predicts at least one count, by the
+    /// same way, on the bins outside `excluded_bins` the first fit predicts at
+    /// least one count, by the
     /// previous fit, and within 1% by the returned one when the fit converged.
     /// `None` when the run's counts have not measured it; the open-beam run is
     /// then weighted with 1, and the sample run as the open-beam run.
     pub overdispersion: [Option<f64>; 2],
+    /// Indices, ascending, of the sample run's bins its material's
+    /// [`Material::library`] leaves out: they add nothing to the deviance, the
+    /// information or the sample run's overdispersion.
+    pub excluded_bins: Vec<usize>,
 }
 
 /// Fit the areal densities and temperatures of the regions' materials, each
@@ -339,10 +353,12 @@ pub struct RegionFit {
 /// and covariance.  Each region's open-beam run is weighted with its
 /// open-beam fit's overdispersion, and its sample run first with the same.
 /// The fit is repeated from its answer while any sample run's
-/// overdispersion, measured on the bins the first fit predicts at least one
-/// count, changes by more than 1%, the coarser grid of the accepted pair is
-/// wider than the rule at the fitted temperatures, or its flight times miss
-/// some that the fitted `t0`, `L` and pulse need.  The next first grid is the
+/// overdispersion, measured on the bins outside those left out that the first
+/// fit predicts at least one count, changes by more than 1%, the coarser grid of the accepted pair is
+/// wider than the rule at the fitted temperatures, its flight times miss
+/// some that the fitted `t0`, `L` and pulse need, or the bins left out at
+/// those differ from the ones it left out, which for the first fit are those
+/// at the starting ones.  The next first grid is the
 /// finer of that pair's coarser grid and the rule's grid at the fitted
 /// temperatures, or, when the flight times miss, the rule's grid of a grid
 /// built at the fitted `t0`, `L` and pulse.  After twenty fits it is reported
@@ -377,8 +393,8 @@ pub struct RegionFit {
 /// zero for a window within the thermal spread of zero energy, are not inside
 /// a single one of its evaluated (SLBW, MLBW or Reich–Moore) resolved ranges;
 /// [`PipelineError::UnmodelledCounts`] if at the fit, converged or not, a bin
-/// is predicted negative or non-finite counts, or holds counts predicted below
-/// [`NEGLIGIBLE_PREDICTION`]: starting or known values the fitter cannot
+/// is predicted negative or non-finite counts, or, outside the bins left
+/// out, holds counts predicted below [`NEGLIGIBLE_PREDICTION`]: starting or known values the fitter cannot
 /// leave;
 /// everything [`fit_open_beam`] refuses for any region;
 /// [`PipelineError::FlightTimeGrid`] for the grid's refusals at the starting
@@ -408,6 +424,7 @@ pub(crate) struct Starts {
     pub(crate) origin_us: f64,
     pub(crate) shared_leverage: Option<Vec<f64>>,
     pub(crate) bound: f64,
+    pub(crate) excluded: Vec<Vec<usize>>,
 }
 
 #[derive(Debug, Clone)]
@@ -552,6 +569,37 @@ pub(crate) fn checked<'a>(
     })
 }
 
+pub(crate) fn excluded_bins(
+    time_edges_us: &[f64],
+    material: Option<&Material>,
+    numbers: &[f64],
+) -> Vec<usize> {
+    let laws = laws(&numbers[2..]);
+    let arrival_us = |energy: f64| {
+        numbers[0]
+            + TOF_FACTOR * numbers[1] / energy.sqrt()
+            + 3.0 / laws.alpha.eval(energy)
+            + laws.r.eval(energy) / laws.beta.eval(energy)
+    };
+    let spans: Vec<(f64, f64)> = material
+        .into_iter()
+        .flat_map(|m| {
+            m.isotopes
+                .iter()
+                .filter(|(_, density)| *density != Value::Known(0.0))
+                .flat_map(|(data, _)| m.library.excluded_windows_ev(&data.isotope))
+        })
+        .map(|&(low, high)| (arrival_us(high), arrival_us(low)))
+        .collect();
+    (0..time_edges_us.len() - 1)
+        .filter(|&k| {
+            spans
+                .iter()
+                .any(|&(first, last)| time_edges_us[k] < last && first < time_edges_us[k + 1])
+        })
+        .collect()
+}
+
 fn calibrated_lines(
     lines: &[Lines<'_>],
     pulse: &Pulse,
@@ -648,6 +696,24 @@ pub(crate) fn fit_counts_answer(
             assert_eq!(leverage.len(), regions.len(), "one leverage per region");
         }
     }
+    let excluded_at = |numbers: &[f64]| -> Vec<Vec<usize>> {
+        regions
+            .iter()
+            .map(|region| excluded_bins(time_edges_us, region.material.as_ref(), numbers))
+            .collect()
+    };
+    let dispersion_of = |excluded: &[Vec<usize>], weights: &[f64]| -> Vec<f64> {
+        let mut dispersion: Vec<f64> = (0..2 * regions.len() * bins)
+            .map(|k| weights[k / bins])
+            .collect();
+        for (r, out) in excluded.iter().enumerate() {
+            for &k in out {
+                dispersion[(2 * r + 1) * bins + k] = f64::INFINITY;
+            }
+        }
+        dispersion
+    };
+    let mut excluded = starts.map_or_else(|| excluded_at(&start), |s| s.excluded.clone());
     let mut live = Vec::with_capacity(2 * regions.len() * bins);
     for (r, region) in regions.iter().enumerate() {
         let checked = || -> Result<[Vec<f64>; 2], PipelineError> {
@@ -770,7 +836,7 @@ pub(crate) fn fit_counts_answer(
     let mut passes = 0;
     let (fit, rule_halvings, overdispersions, settled) = loop {
         passes += 1;
-        let dispersion: Vec<f64> = (0..observed.len()).map(|k| weights[k / bins]).collect();
+        let dispersion = dispersion_of(&excluded, &weights);
         let fit = fit_on_halved_grids(
             &first.0,
             &mut parameters,
@@ -809,10 +875,15 @@ pub(crate) fn fit_counts_answer(
             .iter()
             .enumerate()
             .map(|(r, counted)| {
+                let weighted: Vec<usize> = counted
+                    .iter()
+                    .copied()
+                    .filter(|&k| dispersion[k].is_finite())
+                    .collect();
                 overdispersion(
                     &observed,
                     &fit,
-                    counted,
+                    &weighted,
                     starts
                         .and_then(|starts| starts.shared_leverage.as_ref())
                         .map_or(0.0, |extra| extra[r]),
@@ -829,7 +900,18 @@ pub(crate) fn fit_counts_answer(
             .enumerate()
             .map(|(r, next)| (next / weights[2 * r + 1] - 1.0).abs() <= SETTLED_OVERDISPERSION)
             .collect();
-        let settled = each_settled.iter().all(|&s| s);
+        let at_fit = starts.map_or_else(
+            || {
+                excluded_at(
+                    &[fitted(layout.t0), fitted(layout.flight_path)]
+                        .into_iter()
+                        .chain(fit.result.params[layout.pulse..].iter().copied())
+                        .collect::<Vec<f64>>(),
+                )
+            },
+            |s| s.excluded.clone(),
+        );
+        let settled = each_settled.iter().all(|&s| s) && at_fit == excluded;
         let resolved = 2.0 * fit.step_us
             <= 0.5 * narrowest_us(&base, &resonances_in_span, &fit.result.params)?;
         let covered = fit.converged
@@ -873,7 +955,9 @@ pub(crate) fn fit_counts_answer(
             weights[2 * r + 1] = next[r];
             sample_measured[r] = sample.is_some();
         }
+        excluded = at_fit;
     };
+    let dispersion = dispersion_of(&excluded, &weights);
     let converged = fit.converged && settled;
     if converged {
         calibrated_lines(
@@ -890,8 +974,10 @@ pub(crate) fn fit_counts_answer(
             .iter()
             .zip(&fit.predicted)
             .enumerate()
-            .find(|(_, (y, mu))| {
-                !mu.is_finite() || **mu < 0.0 || (**y > 0.0 && **mu < NEGLIGIBLE_PREDICTION)
+            .find(|(k, (y, mu))| {
+                !mu.is_finite()
+                    || **mu < 0.0
+                    || (dispersion[*k].is_finite() && **y > 0.0 && **mu < NEGLIGIBLE_PREDICTION)
             })
     {
         return Err(PipelineError::UnmodelledCounts {
@@ -995,6 +1081,7 @@ pub(crate) fn fit_counts_answer(
                 fit.predicted[(2 * r + 1) * bins..(2 * r + 2) * bins].to_vec(),
             ],
             overdispersion,
+            excluded_bins: excluded[r].clone(),
         })
         .collect();
     let mut fitted = vec![false; params.len()];
@@ -1005,7 +1092,7 @@ pub(crate) fn fit_counts_answer(
     }
     let answer = Answer {
         grid: Arc::clone(&fit.fine),
-        dispersion: (0..observed.len()).map(|k| weights[k / bins]).collect(),
+        dispersion,
         params: params.clone(),
         fitted,
         at_bound,
@@ -2111,6 +2198,7 @@ mod tests {
                         None => [Value::Known(0.0); 3],
                     },
                     material: material.map(|data| Material {
+                        library: EndfLibrary::EndfB8_0,
                         isotopes: vec![(data, Value::Fitted(3.0e-4))],
                         temperature_k: Value::Fitted(350.0),
                     }),
@@ -2209,6 +2297,7 @@ mod tests {
         };
         let joined = &fit.regions[0];
         let starts = Starts {
+            excluded: vec![joined.excluded_bins.clone()],
             beams: vec![BeamStart {
                 beam: joined.beam.clone(),
                 overdispersion: joined.overdispersion[0],
@@ -2300,6 +2389,7 @@ mod tests {
         let empty_pixel = ndarray::Array2::from_shape_fn((2, 1), |(y, _)| y == 1);
         let none = ndarray::Array2::from_elem((2, 1), false);
         let material = Material {
+            library: EndfLibrary::EndfB8_0,
             isotopes: vec![(hafnium, Value::Fitted(3.0e-4))],
             temperature_k: Value::Fitted(350.0),
         };
@@ -2487,5 +2577,21 @@ mod tests {
                 "{k}: {residual} vs {tolerance}"
             );
         }
+    }
+
+    #[test]
+    fn an_isotope_known_to_be_absent_leaves_no_window() {
+        let edges: Vec<f64> = (380..=530).map(f64::from).collect();
+        let numbers = [3.0, 25.0, 0.5, 1.0, 0.08, 0.0, 0.2, 0.0];
+        let bins = |density| {
+            let material = Material {
+                isotopes: vec![(synthetic_isotope(73, 181, 13.9, 0.01, 0.06), density)],
+                temperature_k: Value::Known(300.0),
+                library: EndfLibrary::EndfB8_1,
+            };
+            excluded_bins(&edges, Some(&material), &numbers)
+        };
+        assert!(bins(Value::Known(0.0)).is_empty());
+        assert!(!bins(Value::Known(1e-6)).is_empty());
     }
 }
