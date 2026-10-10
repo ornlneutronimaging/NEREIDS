@@ -9,6 +9,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
 
 ### Changed (breaking)
 
+- **The GUI defaults to ENDF/B-VIII.1.**
+  A new GUI session, and its Forward Model and Detectability tools, load ENDF/B-VIII.1, the library the Python API already defaults to, so cross sections, and the densities and temperatures fitted with them, can differ from 0.3.0's; a saved project keeps its library.
+  ENDF/B-VIII.1 gives Si-28, Si-29, Si-30, Rh-103 and O-18 only in forms NEREIDS does not evaluate (R-Matrix Limited, unresolved, or a scattering radius alone), and V-51 and Sr-88 in an R-Matrix Limited form whose particle pair (PNT=-1) the parser refuses, so these natural isotopes, which load from ENDF/B-VIII.0, are refused under the new default.
+  For others its resolved range ends lower, and NEREIDS gives no cross section above that end: Hf-177 and Hf-179 at 250 eV instead of 510 eV, Hf-180 at 2.5 keV instead of 5.0 keV, Te-122 at 11 keV instead of 20 keV, Nd-148 at 8.15 keV instead of 9.99 keV, Kr-84 at 20 keV and Er-168 at 9.96 keV where ENDF/B-VIII.0 resolves their whole range, and Hf-178, Ba-134, Ba-137, Ag-109, Tb-159 and Dy-160 by 6.25% or less.
+  The GUI's and Python's fits use all of it, Ta-181 at 13.6–14.2 eV included, which the counts fits, not yet released, leave out.
+
 - **A failed ENDF download raises `ConnectionError`.**
   `load_endf` and `IsotopeGroup.load_endf` raise `ConnectionError` (an `OSError`) instead of `RuntimeError` when no download site can be reached, or one answers with an HTTP error other than 404 or refuses the download.
   A cache file that cannot be read or written raises the matching `OSError`, naming the file.

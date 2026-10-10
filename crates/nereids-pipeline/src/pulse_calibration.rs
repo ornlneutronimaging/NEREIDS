@@ -3,6 +3,7 @@
 
 use nereids_core::types::Isotope;
 use nereids_endf::resonance::ResonanceData;
+use nereids_endf::retrieval::EndfLibrary;
 use nereids_fitting::lm::FlatMatrix;
 use nereids_fitting::poisson::Prior;
 use nereids_fitting::statistics::{Consistency, agreement};
@@ -44,7 +45,7 @@ impl Pulse {
     }
 }
 
-const FORMAT_VERSION: u32 = 2;
+const FORMAT_VERSION: u32 = 3;
 
 const PULSE_MODEL: &str = "Ikeda–Carpenter pulse with α = α₀√E + α₁ and β = β₀√E + β₁ in 1/µs, \
      E in eV, a storage fraction R constant over the energy span, folded with the proton \
@@ -122,6 +123,7 @@ mod nuclide {
 struct Foil {
     isotopes: Vec<FoilIsotope>,
     temperature_k: Stated,
+    library: EndfLibrary,
 }
 
 /// A pulse calibrated on a foil by [`fit_counts`], as its calibration file
@@ -421,13 +423,13 @@ impl PulseCalibration {
         }
     }
 
-    /// The calibration file: JSON of format version 2 that names the pulse
+    /// The calibration file: JSON of format version 3 that names the pulse
     /// model and, in the order `α₀, α₁, β₀, β₁, R, h²`, each pulse number with
     /// its unit, value and status (fitted or known), then the prior over the
     /// fitted numbers: its mean, which may lie past a number's bound, its
     /// covariance and rank; then `t0` and the flight path, the pulse's energy
     /// span and `n_tau`, the line span, the foil's isotopes and effective
-    /// temperature with their stated uncertainties, the foil and run
+    /// temperature with their stated uncertainties and its library, the foil and run
     /// identifiers, the sample run's overdispersion, and the transfer to
     /// another foil: `"unchecked"`, or the other foil and its identifiers, its
     /// sample run's overdispersion, `d2`, `dof` and `p`.
@@ -479,7 +481,7 @@ impl PulseCalibration {
     ///
     /// # Errors
     /// [`PipelineError::InvalidParameter`] if `text` is not such a file: not
-    /// format version 2 of this pulse model, a field missing or unknown, the
+    /// format version 3 of this pulse model, a field missing or unknown, the
     /// pulse numbers' names or units not in their order, the mean, the
     /// covariance or the rank not over the fitted numbers, the line span
     /// missing while a pulse number
@@ -810,6 +812,7 @@ fn foil(measurement: &Measurement) -> Result<Foil, PipelineError> {
             value,
             sd: Some(sd),
         },
+        library: material.library,
     })
 }
 
@@ -904,6 +907,7 @@ mod tests {
                 sample_live: None,
                 background: [Value::Known(0.0); 3],
                 material: Some(Material {
+                    library: EndfLibrary::EndfB8_0,
                     isotopes: std::iter::once(foil).chain(impurity).collect(),
                     temperature_k: Value::Measured {
                         value: 300.0,
@@ -971,6 +975,7 @@ mod tests {
         };
         CountsFit {
             regions: vec![RegionFit {
+                excluded_bins: Vec::new(),
                 densities: vec![2e-3],
                 temperature_k: Some(300.0),
                 background: [0.0; 3],
@@ -1175,7 +1180,7 @@ mod tests {
             0.012_537_345_881_063_615_f64.to_bits()
         );
         for expected in [
-            "\"format_version\": 2",
+            "\"format_version\": 3",
             "\"name\": \"alpha0\"",
             "\"unit\": \"1/(µs·√eV)\"",
             "\"status\": \"fitted\"",
@@ -1190,7 +1195,7 @@ mod tests {
     #[test]
     fn files_that_are_not_such_a_calibration_are_refused() {
         let original: serde_json::Value = serde_json::from_str(&file()).unwrap();
-        let edits: [Edit; 21] = [
+        let edits: [Edit; 22] = [
             ("version", |v| v["format_version"] = 1.into()),
             ("mean", |v| {
                 v["mean"].as_array_mut().unwrap().pop();
@@ -1226,6 +1231,9 @@ mod tests {
             ("same isotope", |v| {
                 let isotope = v["foil"]["isotopes"][0].clone();
                 v["foil"]["isotopes"].as_array_mut().unwrap().push(isotope);
+            }),
+            ("unknown library", |v| {
+                v["foil"]["library"] = "ENDF/B-IX".into()
             }),
             ("temperature sd", |v| {
                 v["foil"]["temperature_k"]["sd"] = serde_json::Value::Null;
@@ -1332,8 +1340,8 @@ mod tests {
         }
     }
 
-    const VERSION_2: &str = r#"{
-  "format_version": 2,
+    const VERSION_3: &str = r#"{
+  "format_version": 3,
   "pulse_model": "Ikeda–Carpenter pulse with α = α₀√E + α₁ and β = β₀√E + β₁ in 1/µs, E in eV, a storage fraction R constant over the energy span, folded with the proton pulse's triangle of FWHM h",
   "numbers": [
     {
@@ -1443,7 +1451,8 @@ mod tests {
     "temperature_k": {
       "value": 300.0,
       "sd": 10.0
-    }
+    },
+    "library": "ENDF/B-VIII.0"
   },
   "provenance": {
     "foil": "foil-a",
@@ -1455,10 +1464,10 @@ mod tests {
 }"#;
 
     #[test]
-    fn the_file_is_format_version_2_byte_for_byte() {
+    fn the_file_is_format_version_3_byte_for_byte() {
         let original = original();
-        assert_eq!(original.to_json(), VERSION_2);
-        let read = PulseCalibration::from_json(VERSION_2).unwrap();
+        assert_eq!(original.to_json(), VERSION_3);
+        let read = PulseCalibration::from_json(VERSION_3).unwrap();
         assert_eq!(format!("{read:?}"), format!("{original:?}"));
     }
 

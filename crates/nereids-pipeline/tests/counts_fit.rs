@@ -6,6 +6,7 @@ use std::sync::{Arc, LazyLock};
 use ndarray::{Array2, Array3, s};
 use nereids_endf::resonance::ResonanceData;
 use nereids_endf::resonance::test_support::{synthetic_isotope, synthetic_isotope_multi};
+use nereids_endf::retrieval::EndfLibrary;
 use nereids_fitting::lm::FlatMatrix;
 use nereids_fitting::poisson::{Prior, Unbounded};
 use nereids_fitting::statistics::{self, Consistency};
@@ -13,7 +14,7 @@ use nereids_physics::continuous_doppler::SUPPORT_X;
 use nereids_physics::doppler::DopplerParams;
 use nereids_physics::flight_time_grid::FlightTimeGrid;
 use nereids_physics::ikeda_carpenter::{
-    EnergyLaw, IkedaCarpenter, IkedaCarpenterParams, SynthesisGrid,
+    EnergyLaw, IkedaCarpenter, IkedaCarpenterParams, SynthesisGrid, ic_pulse,
 };
 use nereids_physics::resolution::{ResolutionFunction, TOF_FACTOR};
 use nereids_physics::transmission::broadened_cross_sections;
@@ -247,6 +248,7 @@ fn measurement(
             sample_live: None,
             background: [Value::Known(0.0); 3],
             material: Some(Material {
+                library: EndfLibrary::EndfB8_0,
                 isotopes: isotopes
                     .iter()
                     .map(|(d, n)| (d.clone(), Value::Fitted(*n)))
@@ -399,6 +401,7 @@ fn an_empty_area_with_a_known_background_adds_its_counts_information_on_the_norm
         region(
             0,
             Some(Material {
+                library: EndfLibrary::EndfB8_0,
                 isotopes: vec![(hot, Value::Fitted(0.5 * THIN))],
                 temperature_k: Value::Fitted(1000.0),
             }),
@@ -411,6 +414,7 @@ fn an_empty_area_with_a_known_background_adds_its_counts_information_on_the_norm
         region(
             1,
             Some(Material {
+                library: EndfLibrary::EndfB8_0,
                 isotopes: vec![(
                     other,
                     Value::Measured {
@@ -567,6 +571,7 @@ fn a_map_recovers_each_patch_and_its_covariance_between_patches_is_the_shared_qu
         empty: empty.view(),
         binning: 2,
         material: Material {
+            library: EndfLibrary::EndfB8_0,
             isotopes: isotopes
                 .iter()
                 .map(|data| (data.clone(), Value::Fitted(THIN)))
@@ -880,6 +885,7 @@ fn maps_the_fit_does_not_describe_are_refused() {
         empty: none.view(),
         binning: 1,
         material: Material {
+            library: EndfLibrary::EndfB8_0,
             isotopes: vec![(hafnium_like(20.0), Value::Fitted(THIN))],
             temperature_k: Value::Known(TEMPERATURE_K),
         },
@@ -2023,6 +2029,127 @@ fn a_false_minimum_shows_as_an_overdispersion_far_above_one() {
     assert!(fit.temperature() < 500.0, "{}", fit.temperature());
     let overdispersion = fit.regions[0].overdispersion[1].expect("measured");
     assert!(overdispersion > 100.0, "{overdispersion}");
+}
+
+fn reaching_the_window(setup: Setup) -> Setup {
+    Setup {
+        edges: (380..=530).map(f64::from).collect(),
+        ..setup
+    }
+}
+
+fn bins_reached(setup: &Setup, t0_us: f64, flight_path_m: f64) -> Vec<usize> {
+    let laws = setup.pulse.params();
+    let arrival_us = |e: f64| {
+        let (alpha, beta, r) = (laws.alpha.eval(e), laws.beta.eval(e), laws.r.eval(e));
+        let (step, n) = (1e-3, (60e3 / alpha.min(beta)) as usize);
+        let mean_delay: f64 = (0..=n)
+            .map(|i| i as f64 * step * ic_pulse(alpha, beta, r, i as f64 * step))
+            .sum::<f64>()
+            * step;
+        t0_us + TOF_FACTOR * flight_path_m / e.sqrt() + mean_delay
+    };
+    let (first, last) = (arrival_us(14.2), arrival_us(13.6));
+    let edges = &setup.edges;
+    (0..edges.len() - 1)
+        .filter(|&k| edges[k] < last && first < edges[k + 1])
+        .collect()
+}
+
+#[test]
+fn its_library_s_window_leaves_a_misplaced_line_out_of_the_fit_from_any_start() {
+    let setup = reaching_the_window(Setup {
+        pulse: venus_pulse(&CALIBRATION_PULSE),
+        ..standard()
+    });
+    let tantalum = |at| synthetic_isotope_multi(73, 181, &[(at, 0.003, 0.06), (20.0, 0.01, 0.06)]);
+    let counts = expected(&setup, &beam(1.0e4), &[(tantalum(13.95), THIN)]);
+    let fit = |library, t0_us, sample: &[f64]| {
+        let model = [(tantalum(13.915), THIN)];
+        let mut m = fitted_from(
+            measurement(&setup, (rounded(&counts.0), sample.to_vec()), &model),
+            280.0,
+        );
+        m.material_mut().library = library;
+        let calibration = Calibration {
+            t0_us: Value::Fitted(t0_us),
+            ..calibration(&setup)
+        };
+        let fit = fit_counts(&m, &calibration).expect("fit");
+        assert!(fit.converged);
+        fit
+    };
+    let sample = rounded(&counts.1);
+    let left_out = fit(EndfLibrary::EndfB8_1, T0_US, &sample);
+    let region = &left_out.regions[0];
+    let bins = bins_reached(&setup, left_out.t0_us, left_out.flight_path_m);
+    assert!(!bins.is_empty());
+    assert_eq!(region.excluded_bins, bins);
+    assert_eq!(region.overdispersion[1], Some(1.0));
+    let n = (region.densities[0] - THIN) / error_bar(&left_out, 0);
+    let t = (left_out.temperature() - TEMPERATURE_K) / error_bar(&left_out, 1);
+    assert!(n.abs() <= 1.0 && t.abs() <= 1.0, "{n} sd, {t} sd");
+    let kept = fit(EndfLibrary::EndfB8_0, T0_US, &sample);
+    assert!(kept.regions[0].excluded_bins.is_empty());
+    assert!(kept.regions[0].overdispersion[1].expect("measured") >= 10.0);
+
+    let mut altered = sample.clone();
+    for &k in &bins {
+        altered[k] = 3.0 * altered[k] + 7.0;
+    }
+    let refitted = fit(EndfLibrary::EndfB8_1, T0_US, &altered);
+    let again = &refitted.regions[0];
+    assert_eq!(
+        (&again.densities, again.temperature_k, again.overdispersion),
+        (
+            &region.densities,
+            region.temperature_k,
+            region.overdispersion
+        )
+    );
+    assert_eq!(
+        (refitted.deviance, format!("{:?}", refitted.covariance)),
+        (left_out.deviance, format!("{:?}", left_out.covariance))
+    );
+    for offset in [-2.0, 2.0] {
+        let off = fit(EndfLibrary::EndfB8_1, T0_US + offset, &sample);
+        assert_eq!(off.regions[0].excluded_bins, bins);
+        let moved = (off.temperature() - left_out.temperature()) / error_bar(&left_out, 1);
+        assert!(moved.abs() <= 0.05, "{offset} µs: {moved} sd");
+    }
+}
+
+#[test]
+fn a_black_line_inside_its_library_s_window_adds_nothing_and_predicts_no_negative_counts() {
+    let setup = reaching_the_window(Setup {
+        pulse: pulse(0.0, 200.0),
+        ..standard()
+    });
+    let line = synthetic_isotope(73, 181, 13.9, 0.01, 0.06);
+    let black = [(line.clone(), 0.5)];
+    let expected_black = expected(&setup, &beam(1.0e4), &black);
+    let dark = bins_reached(&setup, T0_US, FLIGHT_PATH_M)
+        .into_iter()
+        .find(|&k| expected_black.1[k] < NEGLIGIBLE_PREDICTION)
+        .expect("a dark bin in the window");
+    let mut counts = rounded(&expected_black.1);
+    counts[dark] = 1.0;
+    let mut m = measurement(&setup, (rounded(&expected_black.0), counts), &black);
+    assert!(matches!(
+        fit_counts(&m, &calibration(&setup)),
+        Err(PipelineError::UnmodelledCounts { .. })
+    ));
+    m.material_mut().library = EndfLibrary::EndfB8_1;
+    let fit = fit_counts(&m, &calibration(&setup)).expect("the window holds the dark bin");
+    assert!(fit.regions[0].excluded_bins.contains(&dark));
+
+    let thin = [(line, 0.01)];
+    let counts = draws(&expected(&setup, &beam(1.0e4), &thin), 0, [1.0, 1.0]);
+    let mut drawn = measurement(&setup, counts, &thin);
+    drawn.regions[0].background[0] = Value::Fitted(0.0);
+    drawn.material_mut().library = EndfLibrary::EndfB8_1;
+    let fit = fit_counts(&drawn, &calibration(&setup)).expect("no negative prediction");
+    assert!(!fit.regions[0].excluded_bins.is_empty());
 }
 
 mod error_bar_pulls {
@@ -3443,20 +3570,24 @@ mod maps {
             hafnium_like(20.0),
             synthetic_isotope(74, 182, 24.0, 0.01, 0.06),
         ];
-        tiled_from(isotopes, 0.05, truths, pick, shape)
+        tiled_from(map_setup(), isotopes, 0.05, truths, pick, shape)
+    }
+
+    fn map_setup() -> Setup {
+        Setup {
+            pulse: pulse(0.0, 200.0),
+            ..standard()
+        }
     }
 
     fn tiled_from(
+        setup: Setup,
         isotopes: [ResonanceData; 2],
         b0: f64,
         truths: &[([f64; 2], f64)],
         pick: impl Fn(usize, usize) -> usize,
         (rows, cols): (usize, usize),
     ) -> Tiled {
-        let setup = Setup {
-            pulse: pulse(0.0, 200.0),
-            ..standard()
-        };
         let unit: Vec<(Vec<f64>, Vec<f64>)> = truths
             .iter()
             .map(|&(densities, t)| {
@@ -3512,6 +3643,7 @@ mod maps {
                 empty: self.empty.view(),
                 binning: 2,
                 material: Material {
+                    library: EndfLibrary::EndfB8_0,
                     isotopes: self
                         .isotopes
                         .iter()
@@ -3646,6 +3778,48 @@ mod maps {
     }
 
     #[test]
+    fn a_map_leaves_out_its_window_bins_at_its_shared_values_and_reaches_the_joint_fit() {
+        let tantalum =
+            |at| synthetic_isotope_multi(73, 181, &[(17.0, 0.01, 0.06), (at, 0.001, 0.06)]);
+        let tiled = tiled_from(
+            reaching_the_window(map_setup()),
+            [
+                tantalum(13.95),
+                synthetic_isotope(74, 182, 24.0, 0.01, 0.06),
+            ],
+            0.05,
+            &[([THIN, THIN], 300.0)],
+            |_, _| 0,
+            (1, 2),
+        );
+        let mut map = tiled.map(Value::Fitted(400.0), [Value::Known(0.0); 3]);
+        map.material.isotopes[0].0 = tantalum(13.915);
+        map.material.library = EndfLibrary::EndfB8_1;
+        let joint = tiled.joint(&map, &tiled.calibration());
+        assert!(joint.converged);
+        map.normalization = Value::Fitted(0.97 * joint.normalization);
+        let result = fit_map(&map, &tiled.calibration()).expect("map");
+        assert!(result.converged, "{:?}", result.unconverged);
+        let bins = bins_reached(&tiled.setup, result.t0_us, result.flight_path_m);
+        assert!(!bins.is_empty());
+        for j in 0..2 {
+            assert_eq!(joint.regions[j].excluded_bins, bins);
+            let patch = result.fits[[0, j]].as_ref().expect("a fit");
+            assert_eq!(patch.excluded_bins, bins);
+        }
+        let sd = joint
+            .covariance
+            .as_ref()
+            .expect("covariance")
+            .get(6, 6)
+            .sqrt();
+        let gap = (result.normalization - joint.normalization) / sd;
+        assert!(gap.abs() <= 0.05, "{gap}");
+        let deviance = result.deviance / joint.deviance - 1.0;
+        assert!(deviance.abs() <= 1e-3, "{deviance}");
+    }
+
+    #[test]
     fn a_map_of_scattered_counts_has_the_joint_fits_overdispersion() {
         let truths = [([THIN, THIN], 300.0), ([1.5 * THIN, 0.5 * THIN], 450.0)];
         let mut tiled = tiled(&truths, |_, j| j, (1, 2));
@@ -3770,7 +3944,7 @@ mod maps {
         let mut twin = first.clone();
         twin.za += 1;
         let truths = [([THIN, THIN], 300.0)];
-        let tiled = tiled_from([first, twin], 0.05, &truths, |_, _| 0, (1, 1));
+        let tiled = tiled_from(map_setup(), [first, twin], 0.05, &truths, |_, _| 0, (1, 1));
         let mut map = tiled.map(Value::Fitted(400.0), [Value::Known(0.0); 3]);
         map.normalization = Value::Fitted(TERMS[0]);
         let result = fit_map(&map, &tiled.calibration()).expect("map");

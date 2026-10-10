@@ -31,8 +31,8 @@ pub enum PipelineError {
     #[error("Flight-time grid: {0}")]
     FlightTimeGrid(FlightTimeGridError),
 
-    /// The model predicts a bin negative or non-finite counts, or almost none
-    /// of the counts it holds.
+    /// The model predicts a bin negative or non-finite counts, or, in a bin it
+    /// does not leave out, almost none of the counts it holds.
     #[error(
         "bin {bin} of the {run} run in region {region} holds {counts} counts where the model \
          predicts {predicted}"

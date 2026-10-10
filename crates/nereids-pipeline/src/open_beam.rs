@@ -91,7 +91,8 @@ pub struct Pulse {
     /// the grid's first step; at least 8.
     pub n_tau: usize,
     /// `(low, high)`, the energies in eV of the lowest and highest resonance
-    /// a calibration measured the pulse on.
+    /// between a calibration foil's time edges, those in a window its library
+    /// leaves out included.
     /// [`fit_counts`](crate::counts_fit::fit_counts) refuses a sample with a
     /// resonance outside them, of an isotope not known to be absent, between
     /// the energies of its last and first time edges; a resonance outside
@@ -518,7 +519,7 @@ impl<M: FitModel> FitModel for Dispersed<'_, M> {
         Ok(counts
             .iter()
             .zip(self.dispersion)
-            .map(|(c, d)| c / d)
+            .map(|(&c, d)| if c < 0.0 { c } else { c / d })
             .collect())
     }
 

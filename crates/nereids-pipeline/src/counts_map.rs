@@ -1,6 +1,8 @@
 //! Maps of a material's areal densities and temperature over the detector,
 //! fitted as one counts fit whose regions are patches of pixels.
 
+use std::sync::RwLock;
+
 use faer::linalg::solvers::DenseSolveCore;
 use faer::{Mat, Side};
 use ndarray::{Array2, ArrayView2, ArrayView3, s};
@@ -14,7 +16,7 @@ use rayon::prelude::*;
 
 use crate::counts_fit::{
     BeamStart, Material, Measurement, Region, RegionFit, RegionTerms, Role, SHARED, Starts, Value,
-    checked, fit_counts_answer, labelled, shared_parameters,
+    checked, excluded_bins, fit_counts_answer, labelled, shared_parameters,
 };
 use crate::error::PipelineError;
 use crate::open_beam::{
@@ -234,10 +236,12 @@ pub struct CountsMap<'a> {
     /// has no fit.
     pub sensitivity: Array2<Option<FlatMatrix>>,
     /// Each fit's half Poisson deviance over the overdispersion it weighted
-    /// each run with, summed over the patches with a fit and the empty pixels.
+    /// each run with, summed over the patches with a fit and the empty pixels,
+    /// outside the sample runs' [`RegionFit::excluded_bins`].
     pub deviance: f64,
     /// Whether the Newton decrement of the shared quantities fell below
-    /// [`NEWTON_DECREMENT_TOL`].
+    /// [`NEWTON_DECREMENT_TOL`] at an answer whose window bins are those the
+    /// patches left out.
     pub converged: bool,
     /// Why the map did not converge: the empty pixels' failure, the step
     /// limit, or a step none of whose halvings lowered the objective.  `None`
@@ -254,8 +258,8 @@ impl CountsMap<'_> {
     /// its fit's predicted counts `μ` in each bin, in (time bin, patch
     /// column): `−√(2μ)` where `y` is 0, NaN where the patch has no fit.
     /// Their squares over twice the overdispersion each run was weighted
-    /// with, summed over every patch row with the empty pixels' alike, are
-    /// [`Self::deviance`].
+    /// with, summed outside the sample runs' [`RegionFit::excluded_bins`] over
+    /// every patch row with the empty pixels' alike, are [`Self::deviance`].
     pub fn residual_rows(&self) -> impl Iterator<Item = [Array2<f64>; 2]> + '_ {
         let map = &self.measurement;
         let bins = map.open_counts.dim().0;
@@ -325,7 +329,9 @@ impl CountsMap<'_> {
 ///
 /// The fit is the joint one of [`fit_counts`](crate::counts_fit::fit_counts),
 /// found region by region.  With the shared quantities held, each region is
-/// fitted alone, in parallel, and gives its information and slope on them
+/// fitted alone, in parallel, leaving out the bins of its material's windows
+/// at the shared values the steps last stopped at, first the map's starting
+/// ones, and gives its information and slope on them
 /// with its own quantities and beam profiled out; their sum, with the
 /// calibration's prior and each measured shared quantity's, sets a Newton
 /// step on the shared quantities, clamped
@@ -334,7 +340,9 @@ impl CountsMap<'_> {
 /// starts from its last answer, and counts in its sample run's
 /// overdispersion the leverage the shared quantities have on its bins, as
 /// the joint fit does.  The steps stop when their Newton decrement falls
-/// below [`NEWTON_DECREMENT_TOL`] at fits that counted that leverage.  A
+/// below [`NEWTON_DECREMENT_TOL`] at fits that counted that leverage and left
+/// out the window bins of the values they stop at; refitting the regions
+/// with new window bins counts as a step.  A
 /// step that raises the regions' summed deviance plus those priors'
 /// penalty, each run weighted with the overdispersion of the step
 /// before, or at which a fitted patch fails, is halved, up to ten times;
@@ -554,6 +562,15 @@ pub fn fit_map<'a>(
         }
     };
     let starting = held_at(&values);
+    let excluded_at = |values: &[f64]| -> Vec<Vec<usize>> {
+        regions
+            .iter()
+            .map(|region| {
+                excluded_bins(&map.time_edges_us, region.material.as_ref(), &values[1..9])
+            })
+            .collect()
+    };
+    let excluded = RwLock::new(excluded_at(&values));
     let counted_in =
         |region: &Region| -> f64 { region.open_counts.iter().chain(&region.sample_counts).sum() };
     let all_counts: f64 = regions.iter().map(counted_in).sum();
@@ -592,6 +609,7 @@ pub fn fit_map<'a>(
             origin_us,
             shared_leverage: shared_leverage.map(|extra| vec![extra]),
             bound: budgets[r],
+            excluded: vec![excluded.read().expect("the bin lists")[r].clone()],
         };
         let (fit, answer) =
             fit_counts_answer(&one, &held, Some(&starts)).map_err(|e| named(label, e))?;
@@ -653,7 +671,9 @@ pub fn fit_map<'a>(
                         counts
                             .iter()
                             .zip(predicted)
-                            .map(|(&y, &mu)| half_deviance(y, mu))
+                            .enumerate()
+                            .filter(|(k, _)| run == 0 || !inner.fit.excluded_bins.contains(k))
+                            .map(|(_, (&y, &mu))| half_deviance(y, mu))
                             .sum::<f64>()
                             / weight(&weights.fit, run)
                     })
@@ -785,7 +805,17 @@ pub fn fit_map<'a>(
                 .map(|a| gradient[free[a]] * step[a])
                 .sum::<f64>();
         if decrement < NEWTON_DECREMENT_TOL {
-            if weighted {
+            let at_answer = excluded_at(&values);
+            if weighted && at_answer != *excluded.read().expect("the bin lists") {
+                if steps == MOST_STEPS {
+                    unconverged = Some(format!("{MOST_STEPS} Newton steps did not converge"));
+                    break None;
+                }
+                steps += 1;
+                *excluded.write().expect("the bin lists") = at_answer;
+                let retried = sweep(&values, &previous, &leverage, &failures, true);
+                absorb(retried, &mut inner, &mut failures);
+            } else if weighted {
                 converged = true;
                 let mut unbounded = Some((prior.clone(), penalty(&values).1));
                 for terms in inner.iter().flatten().map(|inner| &inner.terms) {
