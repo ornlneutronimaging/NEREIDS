@@ -813,6 +813,8 @@ pub fn fit_map<'a>(
                 }
                 steps += 1;
                 *excluded.write().expect("the bin lists") = at_answer;
+                let retried = sweep(&values, &previous, &leverage, &failures, true);
+                absorb(retried, &mut inner, &mut failures);
             } else if weighted {
                 converged = true;
                 let mut unbounded = Some((prior.clone(), penalty(&values).1));
