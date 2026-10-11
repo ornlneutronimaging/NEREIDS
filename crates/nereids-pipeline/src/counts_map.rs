@@ -380,7 +380,8 @@ impl CountsMap<'_> {
 /// and empty, a density, the temperature or a background term of the
 /// sample's patches is [`Value::Measured`], which would count its
 /// measurement once per patch, a term of the empty pixels' background is
-/// [`Value::Measured`], a count of a pixel summed into a region is not a
+/// [`Value::Measured`], the material carries resonance covariances, which a
+/// map does not yet carry, a count of a pixel summed into a region is not a
 /// whole non-negative number, or no patch is fitted; every refusal of
 /// [`fit_counts`](crate::counts_fit::fit_counts) for the material, the
 /// backgrounds, the shared quantities and the pulse's calibration;
@@ -416,6 +417,9 @@ pub fn fit_map<'a>(
              its measurement once per patch; give it known, fitted or within bounds"
                 .into(),
         );
+    }
+    if !material.covariances.is_empty() {
+        return invalid("a map does not yet carry the resonance parameters' covariance".into());
     }
     if map
         .empty_background

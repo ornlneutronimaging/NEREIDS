@@ -317,6 +317,23 @@ pub struct Resonance {
     pub gfb: f64,
 }
 
+/// The covariance of the energy, neutron width and capture width, in that
+/// order, of each listed resonance of one evaluation: the block of its File 32
+/// (LCOMP=1) over those parameters.
+#[derive(Clone, PartialEq)]
+pub struct ResonanceCovariance {
+    pub resonances: Vec<[usize; 3]>,
+    /// The covariance over the `3 · resonances.len()` parameters, row by row,
+    /// in eV².
+    pub covariance: std::sync::Arc<[f64]>,
+}
+
+impl std::fmt::Debug for ResonanceCovariance {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "ResonanceCovariance({:?})", self.resonances)
+    }
+}
+
 // ─── R-External (Background R-Matrix) ─────────────────────────────────────────
 
 /// R-external (background R-matrix) parameters for a single spin group channel.

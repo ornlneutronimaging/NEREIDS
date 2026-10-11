@@ -4,8 +4,8 @@ use std::ops::Range;
 use std::sync::{Arc, LazyLock};
 
 use ndarray::{Array2, Array3, s};
-use nereids_endf::resonance::ResonanceData;
 use nereids_endf::resonance::test_support::{synthetic_isotope, synthetic_isotope_multi};
+use nereids_endf::resonance::{ResonanceCovariance, ResonanceData};
 use nereids_endf::retrieval::EndfLibrary;
 use nereids_fitting::lm::FlatMatrix;
 use nereids_fitting::poisson::{Prior, Unbounded};
@@ -248,6 +248,7 @@ fn measurement(
             sample_live: None,
             background: [Value::Known(0.0); 3],
             material: Some(Material {
+                covariances: Vec::new(),
                 library: EndfLibrary::EndfB8_0,
                 isotopes: isotopes
                     .iter()
@@ -356,6 +357,16 @@ fn densities_normalization_and_background_are_recovered_and_follow_a_density_on_
         assert_eq!(bounded.regions[0].densities[0], upper, "{truth}");
         assert!(bounded.on_bound[0], "{truth}");
         assert!(!bounded.on_bound[1..].contains(&true), "{truth}");
+        let mut carrying = recorded(&setup, counts.clone(), &sample);
+        carrying.material_mut().isotopes[0].1 = density;
+        carrying.material_mut().covariances = vec![(0, synthetic_covariance(&isotope, 0.01))];
+        carrying.normalization = Value::Fitted(1.0);
+        carrying.regions[0].background = [Value::Fitted(0.02), Value::Fitted(0.2), b2];
+        let carried = fit_counts(&carrying, &calibration(&setup)).expect("fit");
+        let carried = carried.covariance.expect("covariance");
+        for i in 0..free.on_bound.len() {
+            assert_eq!(carried.get(i, i).is_nan(), i == 0, "{truth} {i}");
+        }
         let covariance = free.covariance.as_ref().expect("covariance");
         let (x, x_free) = (estimates(&bounded), estimates(free));
         for i in 1..free.on_bound.len() {
@@ -401,6 +412,7 @@ fn an_empty_area_with_a_known_background_adds_its_counts_information_on_the_norm
         region(
             0,
             Some(Material {
+                covariances: Vec::new(),
                 library: EndfLibrary::EndfB8_0,
                 isotopes: vec![(hot, Value::Fitted(0.5 * THIN))],
                 temperature_k: Value::Fitted(1000.0),
@@ -414,6 +426,7 @@ fn an_empty_area_with_a_known_background_adds_its_counts_information_on_the_norm
         region(
             1,
             Some(Material {
+                covariances: Vec::new(),
                 library: EndfLibrary::EndfB8_0,
                 isotopes: vec![(
                     other,
@@ -571,6 +584,7 @@ fn a_map_recovers_each_patch_and_its_covariance_between_patches_is_the_shared_qu
         empty: empty.view(),
         binning: 2,
         material: Material {
+            covariances: Vec::new(),
             library: EndfLibrary::EndfB8_0,
             isotopes: isotopes
                 .iter()
@@ -885,6 +899,7 @@ fn maps_the_fit_does_not_describe_are_refused() {
         empty: none.view(),
         binning: 1,
         material: Material {
+            covariances: Vec::new(),
             library: EndfLibrary::EndfB8_0,
             isotopes: vec![(hafnium_like(20.0), Value::Fitted(THIN))],
             temperature_k: Value::Known(TEMPERATURE_K),
@@ -933,6 +948,9 @@ fn maps_the_fit_does_not_describe_are_refused() {
         sd: 0.1,
     };
     refused(&measured_empty, "empty pixels is not supported");
+    let mut carrying = base.clone();
+    carrying.material.covariances = vec![(0, synthetic_covariance(&hafnium_like(20.0), 0.01))];
+    refused(&carrying, "does not yet carry");
     let mut short_live = base.clone();
     short_live.sample_live = Some(vec![1.0; 2]);
     assert!(matches!(
@@ -1388,6 +1406,10 @@ fn covariance_against_information(temperature: Value, noisy: bool) {
             value: TERMS[1],
             sd: b0_sd,
         };
+        m.material_mut().covariances = vec![
+            (0, synthetic_covariance(&truth[0].0, 0.01)),
+            (1, synthetic_covariance(&truth[1].0, 0.0)),
+        ];
         let temperature = match temperature {
             Value::Measured { value, sd } => Some((truth.len(), value, sd)),
             _ => None,
@@ -1551,7 +1573,80 @@ fn covariance_against_information(temperature: Value, noisy: bool) {
         );
         information[p][p] += sd.powi(-2);
     }
-    let oracle = inverse(information);
+    let conditional = inverse(information);
+    let mut oracle = conditional.clone();
+    let carried = m.material_mut().covariances.clone();
+    let listed: Vec<(usize, usize)> = carried
+        .iter()
+        .flat_map(|&(i, _)| (0..3).map(move |q| (i, q)))
+        .collect();
+    let cross: Vec<Vec<f64>> = listed
+        .iter()
+        .map(|&(i, q)| {
+            let shifted = |sign: f64| {
+                let mut sample = fitted.clone();
+                let r = &mut sample[i].0.ranges[0].l_groups[0].resonances[0];
+                let value = match q {
+                    0 => &mut r.energy,
+                    1 => &mut r.gn,
+                    _ => &mut r.gg,
+                };
+                let h = 1e-4 * *value;
+                *value += sign * h;
+                (
+                    joined(with_background(
+                        &setup,
+                        &beam,
+                        &sample,
+                        temperature_k,
+                        terms,
+                    )),
+                    h,
+                )
+            };
+            let ((up, h), (down, _)) = (shifted(1.0), shifted(-1.0));
+            let slope: Vec<f64> = up
+                .iter()
+                .zip(&down)
+                .map(|(a, b)| (a - b) / (2.0 * h))
+                .collect();
+            columns
+                .iter()
+                .map(|column| {
+                    (0..mu.len())
+                        .filter(|&k| mu[k] > 0.0)
+                        .map(|k| column[k] * slope[k] / (mu[k] * overdispersion[k / bins]))
+                        .sum()
+                })
+                .collect()
+        })
+        .collect();
+    let prior = |a: usize, b: usize| {
+        let ((i, p), (j, q)) = (listed[a], listed[b]);
+        let block = &carried.iter().find(|(k, _)| *k == i).expect("listed").1;
+        if i == j {
+            block.covariance[3 * p + q]
+        } else {
+            0.0
+        }
+    };
+    let n = oracle.len();
+    let sensitivity: Vec<Vec<f64>> = (0..n)
+        .map(|i| {
+            cross
+                .iter()
+                .map(|c| -(0..n).map(|j| oracle[i][j] * c[j]).sum::<f64>())
+                .collect()
+        })
+        .collect();
+    for i in 0..n {
+        for j in 0..n {
+            oracle[i][j] += (0..listed.len())
+                .flat_map(|a| (0..listed.len()).map(move |b| (a, b)))
+                .map(|(a, b)| sensitivity[i][a] * prior(a, b) * sensitivity[j][b])
+                .sum::<f64>();
+        }
+    }
     let covariance = fit.covariance.expect("covariance");
     for i in 0..quantities {
         for j in 0..quantities {
@@ -1569,12 +1664,25 @@ fn covariance_against_information(temperature: Value, noisy: bool) {
     let pulls = fit.measured_pulls.expect("measured pulls");
     assert_eq!(pulls.len(), measured.len());
     for (&(q, value, sd), pull) in measured.iter().zip(pulls) {
-        let variance = oracle[coefficients + q][coefficients + q];
+        let p = coefficients + q;
+        let variance = 2.0 * conditional[p][p] - oracle[p][p];
         let expected = (estimates[q] - value) / (sd * sd - variance).sqrt();
         assert!(
             (pull - expected).abs() <= 1e-2 * (1.0 + expected.abs()),
             "{q}: {pull} vs {expected}"
         );
+    }
+}
+
+fn synthetic_covariance(data: &ResonanceData, energy_sd: f64) -> ResonanceCovariance {
+    let r = &data.ranges[0].l_groups[0].resonances[0];
+    let sd = [energy_sd, 0.05 * r.gn, 0.05 * r.gg];
+    let correlation = [[1.0, 0.2, 0.0], [0.2, 1.0, -0.7], [0.0, -0.7, 1.0]];
+    ResonanceCovariance {
+        resonances: vec![[0, 0, 0]],
+        covariance: (0..9)
+            .map(|k| sd[k / 3] * correlation[k / 3][k % 3] * sd[k % 3])
+            .collect(),
     }
 }
 
@@ -1623,6 +1731,59 @@ fn measurements_the_fit_does_not_describe_are_refused() {
     for sd in [0.0, -1.0, f64::NAN, f64::INFINITY] {
         invalid(&|m| m.material_mut().temperature_k = Value::Measured { value: 300.0, sd });
     }
+    let covariance = synthetic_covariance(&isotope, 0.01);
+    let listing = |resonances: Vec<[usize; 3]>, covariance: &[f64]| {
+        let covariance = covariance.into();
+        vec![(
+            0,
+            ResonanceCovariance {
+                resonances,
+                covariance,
+            },
+        )]
+    };
+    let one = |covariance: &[f64]| listing(vec![[0, 0, 0]], covariance);
+    let mut asymmetric = covariance.covariance.to_vec();
+    asymmetric[1] *= 0.5;
+    for listed in [
+        vec![(1, covariance.clone())],
+        vec![(0, covariance.clone()), (0, covariance.clone())],
+        listing(vec![[0, 0, 1]], &covariance.covariance),
+        one(&covariance.covariance[..8]),
+        listing(Vec::new(), &[]),
+        listing(vec![[0, 0, 0]; 2], &[0.0; 36]),
+        one(&asymmetric),
+        one(&[0.0, 1e-8, 0.0, 1e-8, 1e-6, 0.0, 0.0, 0.0, 1e-8]),
+        one(&[1e-2, 0.0, 0.0, 0.0, 1e-18, -3e-18, 0.0, -3e-18, 1e-18]),
+        one(&[1e308, 1e308, 0.0, 0.0, 1e308, 0.0, 0.0, 0.0, 1e308]),
+        one(&[1e308, 1.5e308, 0.0, 1.5e308, 1e308, 0.0, 0.0, 0.0, 1e308]),
+    ] {
+        invalid(&|m| m.material_mut().covariances = listed.clone());
+    }
+    invalid(&|m| {
+        m.material_mut().covariances = vec![(0, covariance.clone())];
+        m.regions.push(m.regions[0].clone());
+    });
+    invalid(&|m| {
+        m.regions.push(m.regions[0].clone());
+        m.material_mut().covariances = vec![(0, covariance.clone())];
+    });
+    let mut trace = good.clone();
+    (trace.regions[0].open_counts, trace.regions[0].sample_counts) = draws(&counts, 0, [1.0; 2]);
+    let tungsten = synthetic_isotope(74, 182, 24.0, 0.01, 0.06);
+    let measured = Value::Measured {
+        value: 0.0,
+        sd: 0.2 * THIN,
+    };
+    trace.material_mut().isotopes.push((tungsten, measured));
+    trace.material_mut().covariances = vec![(0, covariance.clone())];
+    let fit = fit_counts(&trace, &calibration(&setup)).expect("fit");
+    assert!(fit.on_bound[1], "{:?}", fit.on_bound);
+    assert!(fit.measured_pulls.expect("pulls")[0].is_finite());
+    let mut overlapping = covariance.covariance.to_vec();
+    overlapping[5] *= 1.6;
+    overlapping[7] *= 1.6;
+    invalid(&|m| m.material_mut().covariances = one(&overlapping));
     let pulse = |change: &dyn Fn(&mut Pulse)| {
         let mut pulse = calibration(&setup).pulse;
         change(&mut pulse);
@@ -3643,6 +3804,7 @@ mod maps {
                 empty: self.empty.view(),
                 binning: 2,
                 material: Material {
+                    covariances: Vec::new(),
                     library: EndfLibrary::EndfB8_0,
                     isotopes: self
                         .isotopes
