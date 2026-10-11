@@ -1388,6 +1388,7 @@ fn covariance_against_information(temperature: Value, noisy: bool) {
     let truth = [(hafnium_like(20.0), 3.0 / 7805.1), (tantalum, 1.5 / 7805.1)];
     let counts = with_background(&setup, &beam(1.0e6), &truth, TEMPERATURE_K, TERMS);
     let mut m = recorded(&setup, counts, &truth);
+    m.material_mut().library = EndfLibrary::EndfB8_1;
     m.material_mut().temperature_k = temperature;
     m.normalization = Value::Fitted(TERMS[0]);
     m.regions[0].background[0] = Value::Fitted(TERMS[1]);
@@ -1664,6 +1665,7 @@ fn covariance_against_information(temperature: Value, noisy: bool) {
                 .sum::<f64>();
         }
     }
+    const TOLERANCE: f64 = 1e-4;
     let tantalum = coefficients + 1;
     let across: f64 = (0..listed.len())
         .flat_map(|a| (0..listed.len()).map(move |b| (a, b)))
@@ -1673,7 +1675,7 @@ fn covariance_against_information(temperature: Value, noisy: bool) {
         .map(|(a, b)| sensitivity[tantalum][a] * prior(a, b) * sensitivity[tantalum][b])
         .sum();
     assert!(
-        !noisy || across.abs() > 1e-2 * oracle[tantalum][tantalum],
+        !noisy || across.abs() > 10.0 * TOLERANCE * oracle[tantalum][tantalum],
         "{across} vs {}",
         oracle[tantalum][tantalum]
     );
@@ -1685,7 +1687,7 @@ fn covariance_against_information(temperature: Value, noisy: bool) {
                 * oracle[coefficients + j][coefficients + j])
                 .sqrt();
             assert!(
-                (covariance.get(i, j) - expected).abs() <= 1e-2 * scale,
+                (covariance.get(i, j) - expected).abs() <= TOLERANCE * scale,
                 "{temperature:?} {i}, {j}: {} vs {expected}",
                 covariance.get(i, j)
             );

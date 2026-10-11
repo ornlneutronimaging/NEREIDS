@@ -386,8 +386,9 @@ const FILE32_ENERGY_TOLERANCE: f64 = 1e-5;
 /// of the isotope `data` holds, or not of its resolved Reich–Moore ranges in
 /// the general form (LCOMP=1) over each resonance's energy, neutron width and
 /// capture width (MPAR=3), or that gives a scattering-radius covariance
-/// (NRO≠0 or ISR≠0) or long-range sections, holds a number that is not
-/// finite or records past its last range, or lists a resonance in the window
+/// (NRO≠0 or ISR≠0) or long-range sections, or an unresolved range other
+/// than a last one of LRF=1, holds a number that is not finite or records
+/// past its last range, or lists a resonance in the window
 /// that matches no Reich–Moore resonance of `data`, more than one, or one its
 /// block already lists.  The record errors of [`parse_endf_file2`].
 ///
@@ -432,12 +433,12 @@ pub fn parse_resonance_covariance(
             data.za, head.c1, head.n1
         )));
     }
-    let ranges = parse_cont(&lines, pos)?.n1;
+    let ranges = checked_count(parse_cont(&lines, pos)?.n1, "NER")?;
     let (mut resonances, mut entries, mut unresolved) = (Vec::new(), Vec::new(), false);
-    for _ in 0..checked_count(ranges, "NER")? {
+    for r in 0..ranges {
         let range = parse_cont(&lines, pos)?;
-        if range.l1 == 2 {
-            unresolved = true;
+        unresolved = range.l1 == 2 && range.l2 == 1 && r + 1 == ranges;
+        if unresolved {
             break;
         }
         let (form, sections) = (parse_cont(&lines, pos)?, parse_cont(&lines, pos)?);
@@ -451,7 +452,7 @@ pub fn parse_resonance_covariance(
             return Err(EndfParseError::UnsupportedFormat(format!(
                 "File 32 is read for one isotope's resolved Reich-Moore ranges in the \
                  general form, without a scattering-radius covariance or long-range \
-                 sections; got LRU={}, LRF={}, NRO={}, LCOMP={}, ISR={}, NLRS={}",
+                 sections, followed by at most one unresolved range (LRF=1); got LRU={}, LRF={}, NRO={}, LCOMP={}, ISR={}, NLRS={}",
                 range.l1, range.l2, range.n1, form.l2, form.n2, sections.n2
             )));
         }
@@ -2883,7 +2884,9 @@ mod tests {
         for refused in [
             edited(10, 0, "7.318200+4"),
             edited(10, 4, "2"),
-            edit(&edited(10, 4, "2"), 12, 2, "2"),
+            edit(&edit(&edited(10, 4, "2"), 12, 2, "2"), 12, 3, "1"),
+            edited(12, 2, "2"),
+            edit(&edit(&edited(11, 4, "2"), 12, 2, "2"), 12, 3, "1"),
             edited(11, 4, "0"),
             edited(12, 2, "0"),
             edited(12, 3, "2"),
@@ -2905,20 +2908,12 @@ mod tests {
             );
         }
         let all = read(&text).unwrap().expect("listed");
-        let unresolved = format!(
-            "{}{:>11}{:>11}{:>11}{:>11}{:>11}{:>11}732832151    0\n",
-            edited(11, 4, "2"),
-            "2.554000+3",
-            "1.000000+5",
-            2,
-            2,
-            0,
-            0
-        );
+        let unresolved =
+            " 2.554000+3 1.000000+5          2          1          0          0732832151";
         for accepted in [
             edited(17, 0, "2.031171+1"),
             edited(17, 2, "1.065878-3"),
-            unresolved,
+            edited(11, 4, "2") + unresolved,
         ] {
             assert_eq!(read(&accepted).unwrap().as_ref(), Some(&all));
         }
@@ -2938,29 +2933,56 @@ mod tests {
             [[0, 0, 0], [0, 0, 1], [0, 1, 0], [0, 1, 1]]
         );
         assert_eq!(regrouped.covariance, all.covariance);
-        let multilevel = parse_endf_file2(&edited(3, 3, "2")).unwrap();
-        let other = parse_resonance_covariance(&text, &multilevel, 0.0..=100.0);
-        assert!(matches!(other, Err(EndfParseError::UnsupportedFormat(_))));
-        let doublet = edited(8, 0, "2.031170+1");
-        let twins = parse_endf_file2(&doublet).unwrap();
-        let ambiguous = parse_resonance_covariance(&doublet, &twins, 15.0..=21.0);
-        assert!(matches!(
-            ambiguous,
-            Err(EndfParseError::UnsupportedFormat(_))
-        ));
+        let (doublet, multilevel) = (edited(8, 0, "2.031170+1"), edited(3, 3, "2"));
+        for (file, file2, window) in [
+            (&text, &multilevel, 0.0..=100.0),
+            (&doublet, &doublet, 15.0..=21.0),
+        ] {
+            let refused =
+                parse_resonance_covariance(file, &parse_endf_file2(file2).unwrap(), window);
+            assert!(matches!(refused, Err(EndfParseError::UnsupportedFormat(_))));
+        }
         for window in [f64::NAN..=1.0, 30.0..=14.0] {
             let refused = parse_resonance_covariance(&text, &data, window);
             assert!(matches!(refused, Err(EndfParseError::InvalidNumber(_))));
         }
-        assert!(read(&edited(12, 2, "2")).unwrap().is_none());
         let file2: String = text.lines().take(9).map(|l| format!("{l}\n")).collect();
-        assert!(read(&file2).unwrap().is_none());
-        let repeated: String = text.lines().skip(14).map(|l| format!("{l}\n")).collect();
-        let twice = read(&(edited(14, 4, "2") + &repeated))
-            .unwrap()
-            .expect("listed");
-        assert_eq!(twice.resonances, all.resonances);
-        let doubled: Vec<f64> = all.covariance.iter().map(|c| 2.0 * c).collect();
-        assert_eq!(*twice.covariance, *doubled);
+        for empty in [file2, edit(&edited(12, 2, "2"), 12, 3, "1")] {
+            assert!(read(&empty).unwrap().is_none());
+        }
+        let field = |v: f64| format!("{:>11}", format!("{v:e}").replace('e', ""));
+        let members = [[0, 1], [1, 2]];
+        let block = |rows: &[usize; 2]| {
+            let at = |p: usize| 3 * rows[p / 3] + p % 3;
+            let packed = (0..6).flat_map(|p| (p..6).map(move |q| (p, q)));
+            let values: Vec<String> = packed
+                .map(|(p, q)| field(all.covariance[12 * at(p) + at(q)]))
+                .collect();
+            let head = "        0.0        0.0          3          0         33          2".into();
+            let table = rows
+                .iter()
+                .map(|&r| text.lines().nth(15 + r).unwrap()[..66].to_string());
+            let body = values.chunks(6).map(|c| c.concat()).collect::<Vec<_>>();
+            std::iter::once(head)
+                .chain(table)
+                .chain(body)
+                .map(|l| format!("{l:<66}732832151    0\n"))
+                .collect::<String>()
+        };
+        let sections: String = edited(14, 4, "2")
+            .lines()
+            .take(14)
+            .map(|l| format!("{l}\n"))
+            .collect();
+        let overlapping = sections + &members.iter().map(block).collect::<String>();
+        let summed = read(&overlapping).unwrap().expect("listed");
+        assert_eq!(summed.resonances, all.resonances[..3]);
+        for (a, b) in (0..9).flat_map(|a| (0..9).map(move |b| (a, b))) {
+            let shared = members
+                .iter()
+                .filter(|m| m.contains(&(a / 3)) && m.contains(&(b / 3)));
+            let expected = shared.count() as f64 * all.covariance[12 * a + b];
+            assert_eq!(summed.covariance[9 * a + b], expected, "{a}, {b}");
+        }
     }
 }
