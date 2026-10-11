@@ -381,17 +381,19 @@ const FILE32_ENERGY_TOLERANCE: f64 = 1e-5;
 /// File 32 or it lists no resonance in the window.
 ///
 /// # Errors
-/// [`EndfParseError::InvalidNumber`] for a window that does not run from a
-/// lower to a higher energy.  [`EndfParseError::UnsupportedFormat`] for a
-/// File 32 that is not one isotope's resolved Reich–Moore ranges in the
-/// general form (LCOMP=1) over each resonance's energy, neutron width and
+/// [`EndfParseError::InvalidNumber`] for an empty window or one with a NaN
+/// bound.  [`EndfParseError::UnsupportedFormat`] for a File 32 that is not
+/// of the isotope `data` holds, or not of its resolved Reich–Moore ranges in
+/// the general form (LCOMP=1) over each resonance's energy, neutron width and
 /// capture width (MPAR=3), or that gives a scattering-radius covariance
-/// (NRO≠0 or ISR≠0) or long-range sections, or that lists a resonance in the
-/// window matching no resonance of `data`, or more than one.  The record
-/// errors of [`parse_endf_file2`].
+/// (NRO≠0 or ISR≠0) or long-range sections, holds a number that is not
+/// finite or records past its last range, or lists a resonance in the window
+/// that matches no Reich–Moore resonance of `data`, more than one, or one its
+/// block already lists.  The record errors of [`parse_endf_file2`].
 ///
-/// Reference: ENDF-6 Formats Manual, File 32 (LCOMP=1); SAMMY
-/// `sammy/src/new/mnew9.f` (`Covrdd_Lcomp_1`).
+/// Reference: ENDF-6 Formats Manual (ENDF-102, 2023), §32.2.2.2 for the
+/// layout and §32.3 for the correspondence with File 2 and the summing of a
+/// resonance listed in several blocks.
 pub fn parse_resonance_covariance(
     endf_text: &str,
     data: &ResonanceData,
@@ -410,6 +412,7 @@ pub fn parse_resonance_covariance(
         .ranges
         .iter()
         .enumerate()
+        .filter(|(_, range)| range.formalism == ResonanceFormalism::ReichMoore)
         .flat_map(|(a, range)| {
             range
                 .l_groups
@@ -422,17 +425,23 @@ pub fn parse_resonance_covariance(
         })
         .collect();
     let pos = &mut 0;
-    let isotopes = parse_cont(&lines, pos)?.n1;
+    let head = parse_cont(&lines, pos)?;
+    if head.c1 != f64::from(data.za) || head.n1 != 1 {
+        return Err(EndfParseError::UnsupportedFormat(format!(
+            "File 32 is read for the one isotope `data` holds, ZA={}; got ZA={}, NIS={}",
+            data.za, head.c1, head.n1
+        )));
+    }
     let ranges = parse_cont(&lines, pos)?.n1;
-    let (mut resonances, mut entries) = (Vec::new(), Vec::new());
+    let (mut resonances, mut entries, mut unresolved) = (Vec::new(), Vec::new(), false);
     for _ in 0..checked_count(ranges, "NER")? {
         let range = parse_cont(&lines, pos)?;
         if range.l1 == 2 {
+            unresolved = true;
             break;
         }
         let (form, sections) = (parse_cont(&lines, pos)?, parse_cont(&lines, pos)?);
-        if isotopes != 1
-            || range.l1 != 1
+        if range.l1 != 1
             || range.l2 != 3
             || range.n1 != 0
             || form.l2 != 1
@@ -442,8 +451,7 @@ pub fn parse_resonance_covariance(
             return Err(EndfParseError::UnsupportedFormat(format!(
                 "File 32 is read for one isotope's resolved Reich-Moore ranges in the \
                  general form, without a scattering-radius covariance or long-range \
-                 sections; got NIS={isotopes}, LRU={}, LRF={}, NRO={}, LCOMP={}, ISR={}, \
-                 NLRS={}",
+                 sections; got LRU={}, LRF={}, NRO={}, LCOMP={}, ISR={}, NLRS={}",
                 range.l1, range.l2, range.n1, form.l2, form.n2, sections.n2
             )));
         }
@@ -460,6 +468,11 @@ pub fn parse_resonance_covariance(
                 )));
             }
             let values = parse_list_values(&lines, pos, length)?;
+            if !values.iter().all(|v| v.is_finite()) {
+                return Err(EndfParseError::UnsupportedFormat(
+                    "File 32 holds a number that is not finite".into(),
+                ));
+            }
             let (table, packed) = values.split_at(6 * count);
             let mut slots = Vec::new();
             for k in (0..count).filter(|&k| window_ev.contains(&table[6 * k])) {
@@ -468,11 +481,17 @@ pub fn parse_resonance_covariance(
                     r.j == spin
                         && (r.energy - energy).abs() <= FILE32_ENERGY_TOLERANCE * r.energy.abs()
                 });
-                let (Some(&(at, _)), None) = (same.next(), same.next()) else {
+                let found = match (same.next(), same.next()) {
+                    (Some(&(at, _)), None) => Some(at),
+                    _ => None,
+                };
+                let Some(at) = found.filter(|at| slots.iter().all(|&(_, s)| resonances[s] != *at))
+                else {
                     return Err(EndfParseError::UnsupportedFormat(format!(
-                        "File 32 lists a resonance at {energy} eV of spin {spin} that matches \
-                         no File 2 resonance of that spin to a relative \
-                         {FILE32_ENERGY_TOLERANCE:e} in energy, or more than one"
+                        "File 32 lists a resonance at {energy} eV of spin {spin} that matches no \
+                         Reich-Moore resonance of File 2 of that spin to a relative \
+                         {FILE32_ENERGY_TOLERANCE:e} in energy, more than one, or one its block \
+                         already lists"
                     )));
                 };
                 if !resonances.contains(&at) {
@@ -489,6 +508,11 @@ pub fn parse_resonance_covariance(
                 }
             }
         }
+    }
+    if !unresolved && *pos != lines.len() {
+        return Err(EndfParseError::UnsupportedFormat(
+            "File 32 holds records past its last range".into(),
+        ));
     }
     let n = 3 * resonances.len();
     if n == 0 {
@@ -2848,39 +2872,75 @@ mod tests {
         let text = file32_fixture();
         let data = parse_endf_file2(&text).unwrap();
         let read = |text: &str| parse_resonance_covariance(text, &data, 0.0..=100.0);
-        let edited = |line: usize, field: usize, value: &str| {
-            let edit = |(k, l): (usize, &str)| match k + 1 == line {
+        let edit = |text: &str, line: usize, field: usize, value: &str| {
+            let change = |(k, l): (usize, &str)| match k + 1 == line {
                 true => format!("{}{value:>11}{}\n", &l[..11 * field], &l[11 * field + 11..]),
                 false => format!("{l}\n"),
             };
-            text.lines().enumerate().map(edit).collect::<String>()
+            text.lines().enumerate().map(change).collect::<String>()
         };
-        for (line, field, value) in [
-            (10, 4, "2"),
-            (12, 2, "0"),
-            (12, 3, "2"),
-            (12, 4, "1"),
-            (13, 3, "2"),
-            (13, 5, "1"),
-            (14, 5, "1"),
-            (15, 2, "2"),
-            (15, 4, "101"),
-            (17, 0, "2.031200+1"),
-            (17, 1, "4.000000+0"),
+        let edited = |line: usize, field: usize, value: &str| edit(&text, line, field, value);
+        for refused in [
+            edited(10, 0, "7.318200+4"),
+            edited(10, 4, "2"),
+            edit(&edited(10, 4, "2"), 12, 2, "2"),
+            edited(11, 4, "0"),
+            edited(12, 2, "0"),
+            edited(12, 3, "2"),
+            edited(12, 4, "1"),
+            edited(13, 3, "2"),
+            edited(13, 5, "1"),
+            edited(14, 5, "1"),
+            edited(15, 2, "2"),
+            edited(15, 4, "101"),
+            edited(16, 0, "nan"),
+            edited(17, 0, "1.034682+1"),
+            edited(17, 0, "2.031200+1"),
+            edited(17, 1, "4.000000+0"),
         ] {
-            let refused = read(&edited(line, field, value));
+            let refused = read(&refused);
             assert!(
                 matches!(refused, Err(EndfParseError::UnsupportedFormat(_))),
-                "{line}, {field}: {refused:?}"
+                "{refused:?}"
             );
         }
         let all = read(&text).unwrap().expect("listed");
-        for (line, field, value) in [(17, 0, "2.031171+1"), (17, 2, "1.065878-3")] {
-            assert_eq!(
-                read(&edited(line, field, value)).unwrap().as_ref(),
-                Some(&all)
-            );
+        let unresolved = format!(
+            "{}{:>11}{:>11}{:>11}{:>11}{:>11}{:>11}732832151    0\n",
+            edited(11, 4, "2"),
+            "2.554000+3",
+            "1.000000+5",
+            2,
+            2,
+            0,
+            0
+        );
+        for accepted in [
+            edited(17, 0, "2.031171+1"),
+            edited(17, 2, "1.065878-3"),
+            unresolved,
+        ] {
+            assert_eq!(read(&accepted).unwrap().as_ref(), Some(&all));
         }
+        let mut grouped: Vec<String> = edit(&edit(&edited(4, 4, "2"), 5, 4, "12"), 5, 5, "2")
+            .lines()
+            .map(String::from)
+            .collect();
+        let group =
+            " 1.793936+2 7.860000-1          1          0         12          27328 2151    0";
+        grouped.insert(7, group.to_string());
+        let grouped = grouped.join("\n");
+        let split = parse_endf_file2(&grouped).unwrap();
+        let regrouped = parse_resonance_covariance(&grouped, &split, 0.0..=100.0).unwrap();
+        let regrouped = regrouped.expect("listed");
+        assert_eq!(
+            regrouped.resonances,
+            [[0, 0, 0], [0, 0, 1], [0, 1, 0], [0, 1, 1]]
+        );
+        assert_eq!(regrouped.covariance, all.covariance);
+        let multilevel = parse_endf_file2(&edited(3, 3, "2")).unwrap();
+        let other = parse_resonance_covariance(&text, &multilevel, 0.0..=100.0);
+        assert!(matches!(other, Err(EndfParseError::UnsupportedFormat(_))));
         let doublet = edited(8, 0, "2.031170+1");
         let twins = parse_endf_file2(&doublet).unwrap();
         let ambiguous = parse_resonance_covariance(&doublet, &twins, 15.0..=21.0);
