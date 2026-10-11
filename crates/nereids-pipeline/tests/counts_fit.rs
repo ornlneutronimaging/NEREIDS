@@ -1410,12 +1410,23 @@ fn covariance_against_information(temperature: Value, noisy: bool) {
             value: TERMS[1],
             sd: b0_sd,
         };
-        let tantalum =
-            parse_resonance_covariance(&text, &truth[1].0, 22.0..=24.0).expect("File 32");
-        m.material_mut().covariances = vec![
-            (0, synthetic_covariance(&truth[0].0, 0.0)),
-            (1, tantalum.expect("listed")),
-        ];
+        let mut tantalum = parse_resonance_covariance(&text, &truth[1].0, 22.0..=24.0)
+            .expect("File 32")
+            .expect("listed");
+        let widths = |p: usize| {
+            [1, 4]
+                .contains(&p)
+                .then(|| 6.0 * tantalum.covariance[7 * p].sqrt())
+        };
+        let coupled: Vec<f64> = (0..36)
+            .map(|k| {
+                tantalum.covariance[k]
+                    + widths(k / 6).zip(widths(k % 6)).map_or(0.0, |(a, b)| a * b)
+            })
+            .collect();
+        tantalum.covariance = coupled.into();
+        m.material_mut().covariances =
+            vec![(0, synthetic_covariance(&truth[0].0, 0.0)), (1, tantalum)];
         let temperature = match temperature {
             Value::Measured { value, sd } => Some((truth.len(), value, sd)),
             _ => None,
@@ -1653,6 +1664,19 @@ fn covariance_against_information(temperature: Value, noisy: bool) {
                 .sum::<f64>();
         }
     }
+    let tantalum = coefficients + 1;
+    let across: f64 = (0..listed.len())
+        .flat_map(|a| (0..listed.len()).map(move |b| (a, b)))
+        .filter(|&(a, b)| {
+            listed[a].0 == 1 && listed[b].0 == 1 && listed[a].2 / 3 != listed[b].2 / 3
+        })
+        .map(|(a, b)| sensitivity[tantalum][a] * prior(a, b) * sensitivity[tantalum][b])
+        .sum();
+    assert!(
+        !noisy || across.abs() > 1e-2 * oracle[tantalum][tantalum],
+        "{across} vs {}",
+        oracle[tantalum][tantalum]
+    );
     let covariance = fit.covariance.expect("covariance");
     for i in 0..quantities {
         for j in 0..quantities {
