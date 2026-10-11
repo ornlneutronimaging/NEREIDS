@@ -44,18 +44,7 @@ const ENDF_RADIUS_TO_FM: f64 = 10.0;
 /// # Returns
 /// `ResonanceData` containing all parsed resonance parameters.
 pub fn parse_endf_file2(endf_text: &str) -> Result<ResonanceData, EndfParseError> {
-    // Extract MF=2, MT=151 lines (resonance parameters).
-    let lines: Vec<&str> = endf_text
-        .lines()
-        .filter(|line| {
-            if line.len() < 75 {
-                return false;
-            }
-            let mf = line[70..72].trim();
-            let mt = line[72..75].trim();
-            mf == "2" && mt == "151"
-        })
-        .collect();
+    let lines = section_151(endf_text, "2");
 
     if lines.is_empty() {
         return Err(EndfParseError::MissingSection(
@@ -380,6 +369,136 @@ pub fn parse_endf_file2(endf_text: &str) -> Result<ResonanceData, EndfParseError
     }
 
     Ok(data)
+}
+
+fn section_151<'a>(endf_text: &'a str, mf: &str) -> Vec<&'a str> {
+    endf_text
+        .lines()
+        .filter(|line| line.len() >= 75 && line[70..72].trim() == mf && &line[72..75] == "151")
+        .collect()
+}
+
+/// The covariance, from File 32 (MT=151), of the energy, neutron width and
+/// capture width of each resonance of `data` whose energy lies in
+/// `window_ev`.  Resonances outside the window are left out, and resonances
+/// in different ranges or short-range sections are uncorrelated, as File 32
+/// gives them.  `None` when the text has no File 32 or it lists no resonance
+/// in the window.
+///
+/// # Errors
+/// [`EndfParseError::UnsupportedFormat`] for a File 32 that is not one
+/// isotope's resolved Reich–Moore ranges in the general form (LCOMP=1) over
+/// each resonance's energy, neutron width and capture width (MPAR=3), or that
+/// gives a scattering-radius covariance (NRO≠0 or ISR≠0) or long-range
+/// sections, or that lists a resonance in the window with an energy, spin and
+/// widths `data` does not have; the record errors of [`parse_endf_file2`].
+///
+/// Reference: ENDF-6 Formats Manual, File 32 (LCOMP=1); SAMMY
+/// `sammy/src/new/mnew9.f` (`Covrdd_Lcomp_1`).
+pub fn parse_resonance_covariance(
+    endf_text: &str,
+    data: &ResonanceData,
+    window_ev: std::ops::RangeInclusive<f64>,
+) -> Result<Option<ResonanceCovariance>, EndfParseError> {
+    let lines = section_151(endf_text, "32");
+    if lines.is_empty() {
+        return Ok(None);
+    }
+    let known: Vec<([usize; 3], [f64; 4])> = data
+        .ranges
+        .iter()
+        .enumerate()
+        .flat_map(|(a, range)| {
+            range
+                .l_groups
+                .iter()
+                .enumerate()
+                .flat_map(move |(b, group)| {
+                    let resonances = group.resonances.iter().enumerate();
+                    resonances.map(move |(c, r)| ([a, b, c], [r.energy, r.j, r.gn, r.gg]))
+                })
+        })
+        .collect();
+    let pos = &mut 0;
+    let isotopes = parse_cont(&lines, pos)?.n1;
+    let ranges = parse_cont(&lines, pos)?.n1;
+    let (mut resonances, mut entries) = (Vec::new(), Vec::new());
+    for _ in 0..checked_count(ranges, "NER")? {
+        let range = parse_cont(&lines, pos)?;
+        if range.l1 == 2 {
+            break;
+        }
+        let (form, sections) = (parse_cont(&lines, pos)?, parse_cont(&lines, pos)?);
+        if isotopes != 1
+            || range.l1 != 1
+            || range.l2 != 3
+            || range.n1 != 0
+            || form.l2 != 1
+            || form.n2 != 0
+            || sections.n2 != 0
+        {
+            return Err(EndfParseError::UnsupportedFormat(format!(
+                "File 32 is read for one isotope's resolved Reich-Moore ranges in the \
+                 general form, without a scattering-radius covariance or long-range \
+                 sections; got NIS={isotopes}, LRU={}, LRF={}, NRO={}, LCOMP={}, ISR={}, \
+                 NLRS={}",
+                range.l1, range.l2, range.n1, form.l2, form.n2, sections.n2
+            )));
+        }
+        for _ in 0..checked_count(sections.n1, "NSRS")? {
+            let list = parse_cont(&lines, pos)?;
+            let count = checked_count(list.n2, "NRB")?;
+            let n = 3 * count;
+            let length = 6 * count + n * (n + 1) / 2;
+            if list.l1 != 3 || usize::try_from(list.n1) != Ok(length) {
+                return Err(EndfParseError::UnsupportedFormat(format!(
+                    "File 32 is read over each resonance's energy, neutron width and capture \
+                     width (MPAR=3, NPL=6*NRB+NVS); got MPAR={}, NPL={}, NRB={count}",
+                    list.l1, list.n1
+                )));
+            }
+            let values = parse_list_values(&lines, pos, length)?;
+            let (table, packed) = values.split_at(6 * count);
+            let kept = (0..count)
+                .filter(|&k| window_ev.contains(&table[6 * k]))
+                .map(|k| {
+                    let row = &table[6 * k..6 * k + 4];
+                    let found = known.iter().find(|(_, values)| values[..] == *row);
+                    found.map(|&(at, _)| (k, at)).ok_or_else(|| {
+                        EndfParseError::UnsupportedFormat(format!(
+                            "File 32 lists a resonance at {} eV whose spin and widths File 2 \
+                             does not have",
+                            row[0]
+                        ))
+                    })
+                })
+                .collect::<Result<Vec<_>, _>>()?;
+            let base = 3 * resonances.len();
+            let parameter = |x: usize| 3 * kept[x / 3].0 + x % 3;
+            for x in 0..3 * kept.len() {
+                for y in 0..3 * kept.len() {
+                    let (u, v) = (
+                        parameter(x).min(parameter(y)),
+                        parameter(x).max(parameter(y)),
+                    );
+                    entries.push((base + x, base + y, packed[u * n - u * (u + 1) / 2 + v]));
+                }
+            }
+            resonances.extend(kept.into_iter().map(|(_, at)| at));
+        }
+    }
+    let n = 3 * resonances.len();
+    if n == 0 {
+        return Ok(None);
+    }
+    let mut covariance = vec![0.0; n * n];
+    for (x, y, value) in entries {
+        covariance[x * n + y] = value;
+    }
+    Ok(Some(ResonanceCovariance {
+        resonances,
+        covariance: covariance.into(),
+    }))
 }
 
 /// Shared context for ENDF range parsers.
@@ -1001,7 +1120,7 @@ fn parse_list_values(
     pos: &mut usize,
     n_values: usize,
 ) -> Result<Vec<f64>, EndfParseError> {
-    let mut values = Vec::with_capacity(n_values);
+    let mut values = Vec::with_capacity(n_values.min(6 * lines.len().saturating_sub(*pos)));
     let n_lines = n_values.div_ceil(6);
 
     for _ in 0..n_lines {
@@ -2695,6 +2814,80 @@ mod tests {
                 );
             }
             other => panic!("expected UnsupportedFormat for NRS=0/NX!=1, got {other:?}"),
+        }
+    }
+
+    fn file32_fixture() -> String {
+        let path = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("../../tests/data/endf/Ta-181-file32.endf");
+        std::fs::read_to_string(&path).unwrap_or_else(|e| panic!("{path:?}: {e}"))
+    }
+
+    #[test]
+    fn test_file32_covariance_of_the_resonances_in_a_window() {
+        let text = file32_fixture();
+        let data = parse_endf_file2(&text).unwrap();
+        let read = |window| parse_resonance_covariance(&text, &data, window).unwrap();
+        let all = read(0.0..=100.0).expect("listed");
+        assert_eq!(all.resonances, [[0, 0, 0], [0, 0, 1], [0, 0, 2], [0, 0, 3]]);
+        assert_eq!(all.covariance[0], 1.229472e-6);
+        let window = read(14.0..=30.0).expect("listed");
+        assert_eq!(window.resonances, [[0, 0, 1], [0, 0, 2], [0, 0, 3]]);
+        let at = |x: usize, y: usize| window.covariance[9 * x + y];
+        for (x, y, expected) in [
+            (0, 0, 1.558071e-6),
+            (1, 2, -1.216048e-9),
+            (0, 3, 6.691704e-9),
+            (2, 7, 4.216599e-9),
+            (5, 6, 8.726475e-9),
+            (8, 8, 1.540406e-6),
+        ] {
+            assert_eq!((at(x, y), at(y, x)), (expected, expected), "{x}, {y}");
+        }
+        assert!(read(100.0..=200.0).is_none());
+    }
+
+    #[test]
+    fn test_file32_forms_not_read_are_refused() {
+        let text = file32_fixture();
+        let data = parse_endf_file2(&text).unwrap();
+        let read = |text: &str| parse_resonance_covariance(text, &data, 0.0..=100.0);
+        let edited = |line: usize, field: usize, value: &str| {
+            let edit = |(k, l): (usize, &str)| match k + 1 == line {
+                true => format!("{}{value:>11}{}\n", &l[..11 * field], &l[11 * field + 11..]),
+                false => format!("{l}\n"),
+            };
+            text.lines().enumerate().map(edit).collect::<String>()
+        };
+        for (line, field, value) in [
+            (10, 4, "2"),
+            (12, 2, "0"),
+            (12, 3, "2"),
+            (12, 4, "1"),
+            (13, 3, "2"),
+            (13, 5, "1"),
+            (14, 5, "1"),
+            (15, 2, "2"),
+            (15, 4, "101"),
+            (17, 2, "1.065878-3"),
+        ] {
+            let refused = read(&edited(line, field, value));
+            assert!(
+                matches!(refused, Err(EndfParseError::UnsupportedFormat(_))),
+                "{line}, {field}: {refused:?}"
+            );
+        }
+        assert!(read(&edited(12, 2, "2")).unwrap().is_none());
+        let file2: String = text.lines().take(9).map(|l| format!("{l}\n")).collect();
+        assert!(read(&file2).unwrap().is_none());
+        let repeated: String = text.lines().skip(14).map(|l| format!("{l}\n")).collect();
+        let twice = read(&(edited(14, 4, "2") + &repeated))
+            .unwrap()
+            .expect("listed");
+        for (x, y) in (0..12).flat_map(|x| (0..12).map(move |y| (x, y))) {
+            let block = twice.covariance[24 * x + y];
+            assert_eq!(twice.covariance[24 * (12 + x) + 12 + y], block);
+            assert_eq!(twice.covariance[24 * x + 12 + y], 0.0);
         }
     }
 }
