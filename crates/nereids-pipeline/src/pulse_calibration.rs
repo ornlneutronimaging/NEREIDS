@@ -162,7 +162,8 @@ impl PulseCalibration {
     /// from `provenance`, with `calibration`, and that fit.  The measurement
     /// is the foil alone, one region holding it.  Each isotope of the foil
     /// not known to be absent (`Value::Known(0.0)`) has a measured density,
-    /// and the foil's effective temperature is measured.
+    /// and the foil's effective temperature is measured.  The prior over the
+    /// pulse numbers takes the resonance parameters as exact.
     ///
     /// # Errors
     /// [`PipelineError::InvalidParameter`] if the measurement is not one
@@ -907,6 +908,7 @@ mod tests {
                 sample_live: None,
                 background: [Value::Known(0.0); 3],
                 material: Some(Material {
+                    covariances: Vec::new(),
                     library: EndfLibrary::EndfB8_0,
                     isotopes: std::iter::once(foil).chain(impurity).collect(),
                     temperature_k: Value::Measured {

@@ -9,15 +9,15 @@ use std::cell::RefCell;
 use std::ops::{Range, RangeInclusive};
 use std::sync::Arc;
 
-use faer::Mat;
-use nereids_endf::resonance::ResonanceData;
+use faer::{Mat, Side};
+use nereids_endf::resonance::{ResonanceCovariance, ResonanceData};
 use nereids_endf::retrieval::EndfLibrary;
 use nereids_fitting::error::FittingError;
 use nereids_fitting::lm::{FitModel, FlatMatrix};
 use nereids_fitting::parameters::{FitParameter, ParameterSet};
 use nereids_fitting::poisson::{Prior, Unbounded, information_inverse};
 use nereids_fitting::statistics::{Consistency, consistency};
-use nereids_physics::continuous_doppler::{SUPPORT_X, broaden_with_derivative};
+use nereids_physics::continuous_doppler::{SUPPORT_X, broaden, broaden_with_derivative};
 use nereids_physics::doppler::DopplerParams;
 use nereids_physics::flight_time_grid::{FlightTimeGrid, Rows};
 use nereids_physics::ikeda_carpenter::IkedaCarpenterParams;
@@ -151,6 +151,10 @@ pub struct Material {
     /// each window [`EndfLibrary::excluded_windows_ev`] gives for an isotope
     /// not known to be absent, at the fitted `t0`, flight path `L` and pulse.
     pub library: EndfLibrary,
+    /// The covariance of the resonance parameters of the isotopes listed, each
+    /// with its index in `isotopes`, which [`CountsFit::covariance`] carries;
+    /// an isotope not listed has its resonance parameters taken as exact.
+    pub covariances: Vec<(usize, ResonanceCovariance)>,
 }
 
 /// The fitted quantities of every region, and the normalization, timing
@@ -188,14 +192,21 @@ pub struct CountsFit {
     /// every entry is NaN when the fitted temperature of any region ends at
     /// 1 K or 5000 K.  `None` when the fit did not converge.
     ///
-    /// The error bars take every known quantity as exact.
+    /// Each covariance in a material's [`Material::covariances`] adds `S M Sᵀ`,
+    /// first order in the resonance parameters it lists, so valid while a
+    /// standard deviation of each moves the fit little: `M` that covariance,
+    /// `S = −C Jᵀ W c`, `C` this covariance without the term, `J` and `c` the
+    /// counts' slopes with respect to the fitted quantities and to those
+    /// parameters, the latter by central differences at a tenth of each
+    /// standard deviation, and `W` the counts' weights.  Every other known
+    /// quantity is taken as exact.
     /// They are not reliable where the counts barely determine a fitted
     /// temperature or barely separate it from a density, as at few counts or
     /// for a thin sample at modest counts.
     pub covariance: Option<FlatMatrix>,
     /// The fitted quantities' Gaussian without their bounds, in the
-    /// covariance's order (see [`Unbounded`]), NaN where `covariance` is at a
-    /// temperature edge.  `None` when `covariance` is, or when the fitter
+    /// covariance's order (see [`Unbounded`]), with the resonance parameters
+    /// taken as exact, NaN where `covariance` is at a temperature edge.  `None` when `covariance` is, or when the fitter
     /// reports none.
     pub unbounded: Option<Unbounded>,
     /// Whether each fitted quantity, in the covariance's order, ended on one
@@ -212,8 +223,9 @@ pub struct CountsFit {
     pub converged: bool,
     /// For each measured quantity, in the covariance's order, its value
     /// without the fit's bounds ([`Self::unbounded`]) less its measurement
-    /// over the standard deviation of that difference, `√(sd² − variance)`,
-    /// the variance also without the bounds: near 0 ± 1 when the counts agree
+    /// over the standard deviation of that difference, `√(sd² − variance + N)`,
+    /// the variance also without the bounds and `N` the term resonance
+    /// covariances add to it: near 0 ± 1 when the counts agree
     /// with the measurement.  NaN for a quantity the counts and measurements
     /// do not determine, and for every quantity when a fitted temperature ends
     /// at 1 K or 5000 K; it loses precision as the counts' information on the
@@ -396,11 +408,17 @@ pub struct RegionFit {
 /// is predicted negative or non-finite counts, or, outside the bins left
 /// out, holds counts predicted below [`NEGLIGIBLE_PREDICTION`]: starting or known values the fitter cannot
 /// leave;
+/// [`PipelineError::InvalidParameter`] if a material's covariance names no
+/// isotope of it, or one twice, lists no resonance, one twice or one the
+/// isotope does not have, or is not a finite symmetric positive
+/// semi-definite matrix over their energies and widths, or if it is given for
+/// an isotope another region also holds or with a pulse calibration's prior;
 /// everything [`fit_open_beam`] refuses for any region;
 /// [`PipelineError::FlightTimeGrid`] for the grid's refusals at the starting
 /// `t0`, flight path and pulse or the fitted ones of any pass, including more
 /// points than it allows; [`PipelineError::Fitting`] if the fitter fails, the
-/// cross sections fail at the start, or a decomposition of the pulse's
+/// cross sections fail at the start or, for a listed resonance parameter
+/// shifted, at the fit, or a decomposition of the pulse's
 /// consistency test fails; a failure at a trial temperature is a rejected
 /// step.
 pub fn fit_counts(
@@ -497,6 +515,75 @@ pub(crate) fn checked<'a>(
                 ));
             }
         }
+        for (k, (i, covariance)) in material.covariances.iter().enumerate() {
+            let n = 3 * covariance.resonances.len();
+            let listed = &covariance.resonances;
+            let placed = material.isotopes.get(*i).is_some_and(|(data, _)| {
+                !listed.is_empty()
+                    && listed.iter().enumerate().all(|(x, &[a, b, c])| {
+                        !listed[..x].contains(&[a, b, c])
+                            && data
+                                .ranges
+                                .get(a)
+                                .and_then(|range| range.l_groups.get(b))
+                                .is_some_and(|group| c < group.resonances.len())
+                    })
+            });
+            let matrix = &covariance.covariance;
+            let symmetric = matrix.len() == n * n
+                && (0..n).all(|p| {
+                    (0..n).all(|q| {
+                        let scale = (matrix[p * n + p] * matrix[q * n + q]).abs().sqrt();
+                        matrix[p * n + q].is_finite()
+                            && (matrix[p * n + q] - matrix[q * n + p]).abs() <= 1e-12 * scale
+                            && (p == q || scale > 0.0 || matrix[p * n + q] == 0.0)
+                    })
+                });
+            let semidefinite = placed
+                && symmetric
+                && Mat::<f64>::from_fn(n, n, |p, q| {
+                    let scale = (matrix[p * n + p] * matrix[q * n + q]).sqrt();
+                    if scale > 0.0 {
+                        matrix[p * n + q] / scale
+                    } else {
+                        matrix[p * n + q]
+                    }
+                })
+                .self_adjoint_eigenvalues(Side::Lower)
+                .is_ok_and(|e| e[0] >= -f64::EPSILON * n as f64 * e[n - 1].max(1.0));
+            if material.covariances[..k].iter().any(|(j, _)| j == i) || !semidefinite {
+                return invalid(format!(
+                    "covariance {k} of region {r} must name an isotope of its material once and \
+                     distinct resonances it has, with a finite symmetric positive semi-definite \
+                     matrix over their energies and widths"
+                ));
+            }
+        }
+    }
+    let carried: Vec<(usize, u32)> = materials()
+        .flat_map(|(r, m)| {
+            m.covariances
+                .iter()
+                .map(move |(i, _)| (r, m.isotopes[*i].0.za))
+        })
+        .collect();
+    if materials().any(|(s, m)| {
+        m.isotopes
+            .iter()
+            .any(|(d, _)| carried.iter().any(|&(r, za)| r != s && za == d.za))
+    }) {
+        return invalid(
+            "a resonance covariance is carried for an isotope another region also holds, whose \
+             counts it would leave out"
+                .into(),
+        );
+    }
+    if calibration.pulse.prior.is_some() && materials().any(|(_, m)| !m.covariances.is_empty()) {
+        return invalid(
+            "a pulse calibration's prior records no sensitivity to the resonance parameters, so a \
+             fit under it cannot carry their covariance"
+                .into(),
+        );
     }
     let shape = shape(measurement);
     let quantity_roles = roles(&vec![0; regions.len()], &shape);
@@ -598,6 +685,128 @@ pub(crate) fn excluded_bins(
                 .any(|&(first, last)| time_edges_us[k] < last && first < time_edges_us[k + 1])
         })
         .collect()
+}
+
+type Slopes = (Vec<Vec<f64>>, FlatMatrix);
+
+fn nuclear_slopes(
+    regions: &[Region],
+    model: &Recorded<'_, RegionsModel>,
+    dispersion: &[f64],
+    parameters: &ParameterSet,
+) -> Result<Option<Slopes>, PipelineError> {
+    let (params, free) = (parameters.all_values(), parameters.free_indices());
+    let mu = model.evaluate(&params)?;
+    let jacobian = model
+        .analytical_jacobian(&params, &free, &mu)
+        .expect("the counts model has an analytical Jacobian");
+    let energies = &model.model.energies;
+    let bins = mu.len() / (2 * regions.len());
+    let mut picked: Vec<(&ResonanceCovariance, usize, Vec<f64>)> = Vec::new();
+    for (r, material) in regions
+        .iter()
+        .enumerate()
+        .filter_map(|(r, region)| Some((r, region.material.as_ref()?)))
+    {
+        let place = &model.model.layout.regions[r];
+        let temperature = params[place.temperature.expect("a material")];
+        let scale = model.model.scale(&params)?;
+        let transmitted = model.model.beams(&params, &scale, r)?.transmitted;
+        for (i, covariance) in &material.covariances {
+            let density = params[place.densities.start + i];
+            let data = &material.isotopes[*i].0;
+            let n = 3 * covariance.resonances.len();
+            for p in (0..n).filter(|p| covariance.covariance[p * n + p] > 0.0) {
+                let [a, b, c] = covariance.resonances[p / 3];
+                let h = 0.1 * covariance.covariance[p * n + p].sqrt();
+                let shifted = |by: f64| {
+                    let mut copy = data.clone();
+                    let resonance = &mut copy.ranges[a].l_groups[b].resonances[c];
+                    *[&mut resonance.energy, &mut resonance.gn, &mut resonance.gg][p % 3] += by;
+                    broaden(energies, &copy, temperature).map_err(|e| {
+                        PipelineError::Fitting(FittingError::EvaluationFailed(e.to_string()))
+                    })
+                };
+                let (up, down) = (shifted(h)?, shifted(-h)?);
+                let absorbed: Vec<f64> = up
+                    .iter()
+                    .zip(&down)
+                    .rev()
+                    .zip(&transmitted)
+                    .map(|((u, d), t)| -density * t * (u - d) / (2.0 * h))
+                    .collect();
+                let folded = predicted(&scale.rows, &absorbed)?;
+                let rows = (2 * r + 1) * bins..(2 * r + 2) * bins;
+                let cross = (0..free.len())
+                    .map(|j| {
+                        rows.clone()
+                            .zip(&folded)
+                            .filter(|(k, _)| mu[*k] > 0.0)
+                            .map(|(k, c)| {
+                                jacobian.get(k, j) * c * model.live[k] / (mu[k] * dispersion[k])
+                            })
+                            .sum()
+                    })
+                    .collect();
+                picked.push((covariance, p, cross));
+            }
+        }
+    }
+    let width = picked.len();
+    if width == 0 {
+        return Ok(None);
+    }
+    let mut prior = FlatMatrix::zeros(width, width);
+    for (a, (first, p, _)) in picked.iter().enumerate() {
+        for (b, (second, q, _)) in picked.iter().enumerate() {
+            if std::ptr::eq(*first, *second) {
+                *prior.get_mut(a, b) = first.covariance[p * 3 * first.resonances.len() + q];
+            }
+        }
+    }
+    Ok(Some((
+        picked.into_iter().map(|(_, _, cross)| cross).collect(),
+        prior,
+    )))
+}
+
+fn sandwich(conditional: &FlatMatrix, slopes: &Slopes) -> FlatMatrix {
+    let (crosses, prior) = slopes;
+    let (free, width) = (conditional.nrows, crosses.len());
+    let resolved: Vec<bool> = (0..free)
+        .map(|i| conditional.get(i, i).is_finite())
+        .collect();
+    let sensitivity: Vec<Vec<f64>> = (0..free)
+        .map(|i| {
+            crosses
+                .iter()
+                .map(|cross| {
+                    if !resolved[i] {
+                        return f64::NAN;
+                    }
+                    -(0..free)
+                        .filter(|&j| resolved[j])
+                        .map(|j| conditional.get(i, j) * cross[j])
+                        .sum::<f64>()
+                })
+                .collect()
+        })
+        .collect();
+    let weighted: Vec<Vec<f64>> = sensitivity
+        .iter()
+        .map(|sx| {
+            (0..width)
+                .map(|b| (0..width).map(|a| sx[a] * prior.get(a, b)).sum())
+                .collect()
+        })
+        .collect();
+    let mut term = FlatMatrix::zeros(free, free);
+    for (x, wx) in weighted.iter().enumerate() {
+        for (y, sy) in sensitivity.iter().enumerate() {
+            *term.get_mut(x, y) = wx.iter().zip(sy).map(|(w, s)| w * s).sum();
+        }
+    }
+    term
 }
 
 fn calibrated_lines(
@@ -989,6 +1198,32 @@ pub(crate) fn fit_counts_answer(
         });
     }
 
+    let carried = regions.iter().any(|region| {
+        region
+            .material
+            .as_ref()
+            .is_some_and(|m| !m.covariances.is_empty())
+    });
+    let slopes = match &fit.result.covariance {
+        Some(_) if converged && carried => {
+            let model = Recorded {
+                model: RegionsModel::new(
+                    &fit.fine,
+                    &beams,
+                    &resonances,
+                    *charge_ratio,
+                    beam_origin_us,
+                    &layout,
+                ),
+                live: &live,
+            };
+            nuclear_slopes(regions, &model, &dispersion, &parameters)?
+        }
+        _ => None,
+    };
+    let carried_with = |c: Option<&FlatMatrix>| Some(sandwich(c?, slopes.as_ref()?));
+    let nuclear = carried_with(fit.result.covariance.as_ref());
+    let unbounded_nuclear = carried_with(fit.result.unbounded.as_ref().map(|u| &u.covariance));
     let (t_low, t_high) = TEMPERATURE_BOUNDS_K;
     let free = parameters.free_indices();
     let on_edge = layout
@@ -1014,7 +1249,17 @@ pub(crate) fn fit_counts_answer(
         .covariance
         .as_ref()
         .filter(|_| converged)
-        .map(block);
+        .map(|conditional| {
+            let mut full = conditional.clone();
+            for (entry, added) in full
+                .data
+                .iter_mut()
+                .zip(nuclear.iter().flat_map(|n| &n.data))
+            {
+                *entry += added;
+            }
+            block(&full)
+        });
     let unbounded = fit
         .result
         .unbounded
@@ -1060,7 +1305,10 @@ pub(crate) fn fit_counts_answer(
             .iter()
             .map(|&(offset, mean, sd)| {
                 let a = position(layout.quantities + offset);
-                (unbounded.mean[a] - mean) / (sd * sd - unbounded.covariance.get(a, a)).sqrt()
+                let p = sample_quantities[a];
+                let nuclear = unbounded_nuclear.as_ref().map_or(0.0, |n| n.get(p, p));
+                (unbounded.mean[a] - mean)
+                    / (sd * sd - unbounded.covariance.get(a, a) + nuclear).sqrt()
             })
             .collect()
     });
@@ -2198,6 +2446,7 @@ mod tests {
                         None => [Value::Known(0.0); 3],
                     },
                     material: material.map(|data| Material {
+                        covariances: Vec::new(),
                         library: EndfLibrary::EndfB8_0,
                         isotopes: vec![(data, Value::Fitted(3.0e-4))],
                         temperature_k: Value::Fitted(350.0),
@@ -2389,6 +2638,7 @@ mod tests {
         let empty_pixel = ndarray::Array2::from_shape_fn((2, 1), |(y, _)| y == 1);
         let none = ndarray::Array2::from_elem((2, 1), false);
         let material = Material {
+            covariances: Vec::new(),
             library: EndfLibrary::EndfB8_0,
             isotopes: vec![(hafnium, Value::Fitted(3.0e-4))],
             temperature_k: Value::Fitted(350.0),
@@ -2456,6 +2706,22 @@ mod tests {
         };
         let joint = fit_counts(&measurement, &calibration).expect("joint fit");
         assert!(joint.converged);
+        let mut carrying = measurement.clone();
+        carrying.regions[0]
+            .material
+            .as_mut()
+            .expect("a material")
+            .covariances = vec![(
+            0,
+            ResonanceCovariance {
+                resonances: vec![[0, 0, 0]],
+                covariance: [1e-6, 0.0, 0.0, 0.0, 1e-10, 0.0, 0.0, 0.0, 1e-8].into(),
+            },
+        )];
+        assert!(matches!(
+            fit_counts(&carrying, &calibration),
+            Err(PipelineError::InvalidParameter(_))
+        ));
         let covariance = joint.covariance.as_ref().expect("covariance");
         let fitted: Vec<Role> = quantities(&measurement, &calibration)
             .filter(|(_, value)| !matches!(value, Value::Known(_)))
@@ -2585,6 +2851,7 @@ mod tests {
         let numbers = [3.0, 25.0, 0.5, 1.0, 0.08, 0.0, 0.2, 0.0];
         let bins = |density| {
             let material = Material {
+                covariances: Vec::new(),
                 isotopes: vec![(synthetic_isotope(73, 181, 13.9, 0.01, 0.06), density)],
                 temperature_k: Value::Known(300.0),
                 library: EndfLibrary::EndfB8_1,
