@@ -530,10 +530,11 @@ pub(crate) fn checked<'a>(
                     })
             });
             let matrix = &covariance.covariance;
+            let sd = |p: usize| matrix[p * n + p].abs().sqrt();
             let symmetric = matrix.len() == n * n
                 && (0..n).all(|p| {
                     (0..n).all(|q| {
-                        let scale = (matrix[p * n + p] * matrix[q * n + q]).abs().sqrt();
+                        let scale = sd(p) * sd(q);
                         matrix[p * n + q].is_finite()
                             && (matrix[p * n + q] - matrix[q * n + p]).abs() <= 1e-12 * scale
                             && (p == q || scale > 0.0 || matrix[p * n + q] == 0.0)
@@ -542,7 +543,7 @@ pub(crate) fn checked<'a>(
             let semidefinite = placed
                 && symmetric
                 && Mat::<f64>::from_fn(n, n, |p, q| {
-                    let scale = (matrix[p * n + p] * matrix[q * n + q]).sqrt();
+                    let scale = sd(p) * sd(q);
                     if scale > 0.0 {
                         matrix[p * n + q] / scale
                     } else {
@@ -1198,28 +1199,25 @@ pub(crate) fn fit_counts_answer(
         });
     }
 
-    let carried = regions.iter().any(|region| {
-        region
-            .material
-            .as_ref()
-            .is_some_and(|m| !m.covariances.is_empty())
-    });
-    let slopes = match &fit.result.covariance {
-        Some(_) if converged && carried => {
-            let model = Recorded {
-                model: RegionsModel::new(
-                    &fit.fine,
-                    &beams,
-                    &resonances,
-                    *charge_ratio,
-                    beam_origin_us,
-                    &layout,
-                ),
-                live: &live,
-            };
-            nuclear_slopes(regions, &model, &dispersion, &parameters)?
-        }
-        _ => None,
+    let carried = regions
+        .iter()
+        .flat_map(|region| &region.material)
+        .any(|m| !m.covariances.is_empty());
+    let slopes = if converged && carried && fit.result.covariance.is_some() {
+        let model = Recorded {
+            model: RegionsModel::new(
+                &fit.fine,
+                &beams,
+                &resonances,
+                *charge_ratio,
+                beam_origin_us,
+                &layout,
+            ),
+            live: &live,
+        };
+        nuclear_slopes(regions, &model, &dispersion, &parameters)?
+    } else {
+        None
     };
     let carried_with = |c: Option<&FlatMatrix>| Some(sandwich(c?, slopes.as_ref()?));
     let nuclear = carried_with(fit.result.covariance.as_ref());

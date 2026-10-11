@@ -1755,6 +1755,8 @@ fn measurements_the_fit_does_not_describe_are_refused() {
         one(&asymmetric),
         one(&[0.0, 1e-8, 0.0, 1e-8, 1e-6, 0.0, 0.0, 0.0, 1e-8]),
         one(&[1e-2, 0.0, 0.0, 0.0, 1e-18, -3e-18, 0.0, -3e-18, 1e-18]),
+        one(&[1e308, 1e308, 0.0, 0.0, 1e308, 0.0, 0.0, 0.0, 1e308]),
+        one(&[1e308, 1.5e308, 0.0, 1.5e308, 1e308, 0.0, 0.0, 0.0, 1e308]),
     ] {
         invalid(&|m| m.material_mut().covariances = listed.clone());
     }
