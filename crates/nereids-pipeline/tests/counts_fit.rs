@@ -317,30 +317,36 @@ fn time_background(edges: &[f64], [c, a, tau]: [f64; 3]) -> Vec<f64> {
 fn the_time_background_is_in_both_runs_of_every_region_by_its_pixels_and_gamma_transmission() {
     let setup = standard();
     let numbers = [2000.0, 30000.0, 10.0];
-    let per_pixel = time_background(&setup.edges, numbers);
     let (a, pixels, gammas) = (0.93, [4.0, 9.0], [0.8, 0.6]);
     let lines: Vec<(ResonanceData, f64)> = [(72, 180, 16.0), (74, 182, 20.0), (76, 186, 25.0)]
         .map(|(z, n, e)| (synthetic_isotope(z, n, e, 0.01, 0.06), SATURATED))
         .to_vec();
-    let runs: Vec<[(Vec<f64>, Vec<f64>); 2]> = (0..2)
-        .map(|r| {
-            let sample = if r == 0 { lines.as_slice() } else { &[] };
-            let (open, transmitted) = expected(&setup, &beam([1.0e6, 2.0e6][r]), sample);
-            let term = |scale: f64| per_pixel.iter().map(move |g| scale * pixels[r] * g);
-            let open: Vec<f64> = open.iter().zip(term(1.0)).map(|(o, g)| o + g).collect();
-            let sample: Vec<f64> = transmitted
-                .iter()
-                .zip(term(CHARGE_RATIO * a * gammas[r]))
-                .map(|(t, g)| a * t + g)
-                .collect();
-            [open, sample].map(|mu| {
-                let most = mu.iter().fold(0.0_f64, |m, &c| m.max(c));
-                let live: Vec<f64> = mu.iter().map(|c| 1.0 / (1.0 + 0.25 * c / most)).collect();
-                (mu.iter().zip(&live).map(|(c, l)| l * c).collect(), live)
+    let simulated = |numbers: [f64; 3]| -> Vec<[(Vec<f64>, Vec<f64>); 2]> {
+        let per_pixel = time_background(&setup.edges, numbers);
+        (0..2)
+            .map(|r| {
+                let sample = if r == 0 { lines.as_slice() } else { &[] };
+                let (open, transmitted) = expected(&setup, &beam([1.0e6, 2.0e6][r]), sample);
+                let term = |scale: f64| per_pixel.iter().map(move |g| scale * pixels[r] * g);
+                let open: Vec<f64> = open.iter().zip(term(1.0)).map(|(o, g)| o + g).collect();
+                let sample: Vec<f64> = transmitted
+                    .iter()
+                    .zip(term(CHARGE_RATIO * a * gammas[r]))
+                    .map(|(t, g)| a * t + g)
+                    .collect();
+                [open, sample].map(|mu| {
+                    let most = mu.iter().fold(0.0_f64, |m, &c| m.max(c));
+                    let live: Vec<f64> = mu.iter().map(|c| 1.0 / (1.0 + 0.25 * c / most)).collect();
+                    (mu.iter().zip(&live).map(|(c, l)| l * c).collect(), live)
+                })
             })
-        })
-        .collect();
-    let measurement = |numbers: [Value; 3], gamma: Value, sample: fn(f64) -> Value| Measurement {
+            .collect()
+    };
+    let runs = simulated(numbers);
+    let measurement = |runs: &[[(Vec<f64>, Vec<f64>); 2]],
+                       numbers: [Value; 3],
+                       gamma: Value,
+                       sample: fn(f64) -> Value| Measurement {
         time_edges_us: setup.edges.clone(),
         charge_ratio: CHARGE_RATIO,
         normalization: Value::Known(a),
@@ -368,6 +374,7 @@ fn the_time_background_is_in_both_runs_of_every_region_by_its_pixels_and_gamma_t
             .collect(),
     };
     let known = measurement(
+        &runs,
         numbers.map(Value::Known),
         Value::Known(gammas[0]),
         Value::Known,
@@ -384,6 +391,7 @@ fn the_time_background_is_in_both_runs_of_every_region_by_its_pixels_and_gamma_t
     }
 
     let free = measurement(
+        &runs,
         std::array::from_fn(|i| Value::Fitted([0.5, 2.0, 0.7][i] * numbers[i])),
         Value::Fitted(0.5),
         |x| Value::Fitted(1.1 * x),
@@ -410,12 +418,58 @@ fn the_time_background_is_in_both_runs_of_every_region_by_its_pixels_and_gamma_t
         assert!(pull.abs() <= BOUND.sqrt(), "{i}: {x} vs {t}, pull {pull}");
     }
 
+    let no_tail = simulated([numbers[0], 0.0, numbers[2]]);
+    let fits = [
+        [numbers[0], 0.0, numbers[2]],
+        [numbers[0], 10.0 * numbers[1], 40.0],
+    ]
+    .map(|start| {
+        let m = measurement(
+            &no_tail,
+            start.map(Value::Fitted),
+            Value::Known(gammas[0]),
+            |x| Value::Fitted(1.1 * x),
+        );
+        let fit = fit_counts(&m, &calibration(&setup)).expect("fit");
+        assert!(fit.converged);
+        for region in &fit.regions {
+            assert_eq!(region.beam.intervals(), 1);
+            assert_eq!(region.overdispersion[0], Some(1.0));
+        }
+        (0..4).map(|i| error_bar(&fit, i)).collect::<Vec<f64>>()
+    });
+    for (near, far) in fits[0].iter().zip(&fits[1]) {
+        assert!((far / near - 1.0).abs() <= 1e-2, "{fits:?}");
+    }
+
     let mut empty = known.clone();
     empty.regions[1].pixels = 0.0;
-    assert!(matches!(
-        fit_counts(&empty, &calibration(&setup)),
-        Err(PipelineError::InvalidParameter(_))
-    ));
+    let refused = [
+        [-1.0, 0.0, 1.0],
+        [0.0, -1.0, 1.0],
+        [0.0, 0.0, 0.0],
+        [f64::NAN, 0.0, 1.0],
+    ]
+    .map(|bad| {
+        measurement(
+            &runs,
+            bad.map(Value::Known),
+            Value::Known(1.0),
+            Value::Known,
+        )
+    });
+    let outside = measurement(
+        &runs,
+        numbers.map(Value::Known),
+        Value::Known(1.5),
+        Value::Known,
+    );
+    for m in refused.iter().chain([&empty, &outside]) {
+        assert!(matches!(
+            fit_counts(m, &calibration(&setup)),
+            Err(PipelineError::InvalidParameter(_))
+        ));
+    }
 }
 
 #[test]

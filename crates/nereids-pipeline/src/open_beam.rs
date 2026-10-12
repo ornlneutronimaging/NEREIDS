@@ -227,6 +227,24 @@ pub fn fit_open_beam(
     open_live: Option<&[f64]>,
     known: Option<&[f64]>,
 ) -> Result<OpenBeamFit, PipelineError> {
+    open_beam_with_intervals(
+        time_edges_us,
+        open_counts,
+        calibration,
+        open_live,
+        known,
+        None,
+    )
+}
+
+pub(crate) fn open_beam_with_intervals(
+    time_edges_us: &[f64],
+    open_counts: &[f64],
+    calibration: &Calibration,
+    open_live: Option<&[f64]>,
+    known: Option<&[f64]>,
+    intervals: Option<usize>,
+) -> Result<OpenBeamFit, PipelineError> {
     let start: Vec<f64> = calibration
         .instrument()?
         .iter()
@@ -305,6 +323,9 @@ pub fn fit_open_beam(
                     if q < best.1 { (i, q) } else { best }
                 },
             );
+    let chosen = intervals
+        .and_then(|k| ladder.iter().position(|c| c.beam.intervals() == k))
+        .unwrap_or(chosen);
     let at_limit = chosen + 1 == ladder.len();
     let Candidate { beam, fit } = ladder.swap_remove(chosen);
     Ok(OpenBeamFit {

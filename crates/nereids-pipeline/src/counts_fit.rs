@@ -9,7 +9,6 @@ use std::cell::RefCell;
 use std::ops::{Range, RangeInclusive};
 use std::sync::Arc;
 
-use faer::linalg::solvers::DenseSolveCore;
 use faer::{Mat, Side};
 use nereids_endf::resonance::{ResonanceCovariance, ResonanceData};
 use nereids_endf::retrieval::EndfLibrary;
@@ -30,8 +29,8 @@ use crate::beam::BeamSpline;
 use crate::error::PipelineError;
 use crate::open_beam::{
     BOUND, COUNTS_TO_MEASURE_NOISE, Calibration, OpenBeamFit, PULSE_NUMBERS, Pulse, Recorded,
-    combined, counted, fit_on_halved_grids, fit_open_beam, laws, overdispersion, validate_counts,
-    validate_live, weights_of,
+    combined, counted, fit_on_halved_grids, laws, open_beam_with_intervals, overdispersion,
+    validate_counts, validate_live, weights_of,
 };
 use crate::pipeline::TEMPERATURE_BOUNDS_K;
 
@@ -358,7 +357,8 @@ pub struct RegionFit {
 /// flight path and the pulse, which one clock, flight path and moderator set
 /// for every pixel, and with them the grid and `P_ki`.  Each region has its
 /// own beam, from its own open-beam counts, with the intervals its
-/// [`fit_open_beam`] chooses, fitted with the rest to both runs; and its own
+/// [`fit_open_beam`](crate::open_beam::fit_open_beam) chooses, fitted with
+/// the rest to both runs; and its own
 /// background, which depends on what surrounds its pixels.  A region without
 /// a material counts `c_q·a·(1 + b_r)` of its beam in the sample run, so it
 /// pins the normalization when its `b0` is known, as zero in the open-region
@@ -379,9 +379,11 @@ pub struct RegionFit {
 /// at some energy is outside the model and rejected; a fit driven there ends
 /// unconverged.  The open-beam fits that start the beams and weight the
 /// open-beam runs use the starting pulse and, at first, the time background's
-/// starting numbers; the fit is repeated with them at its fitted numbers, at
-/// most twenty fits in all, until the fitted numbers move from those by
-/// `Δᵀ C⁻¹ Δ` at most [`BOUND`], `C` their covariance at the fit.
+/// starting numbers; the fit is repeated with them at its fitted numbers, up
+/// to twenty times, until the fitted numbers change the counts they took as
+/// known by `Σ_r Σ_k (ΔO_rk)²/O_rk` at most [`BOUND`] over every region's
+/// open-beam bins, and from the third time on each region keeps the beam
+/// intervals its second open-beam fit chose.
 ///
 /// The grid's first step is at most half the narrowest Doppler full width at
 /// half maximum, in flight time, of any resonance of any region inside its
@@ -450,7 +452,8 @@ pub struct RegionFit {
 /// isotope does not have, or is not a finite symmetric positive
 /// semi-definite matrix over their energies and widths, or if it is given for
 /// an isotope another region also holds or with a pulse calibration's prior;
-/// everything [`fit_open_beam`] refuses for any region;
+/// everything [`fit_open_beam`](crate::open_beam::fit_open_beam) refuses for
+/// any region;
 /// [`PipelineError::FlightTimeGrid`] for the grid's refusals at the starting
 /// `t0`, flight path and pulse or the fitted ones of any pass, including more
 /// points than it allows; [`PipelineError::Fitting`] if the fitter fails, the
@@ -471,39 +474,30 @@ pub fn fit_counts(
             "no region of the measurement holds a material to fit".into(),
         ));
     }
-    let fitted: Vec<Role> = quantities(measurement, calibration)
-        .filter(|(_, value)| !matches!(value, Value::Known(_)))
-        .map(|(role, _)| role)
-        .collect();
+    let bins = starts_and_widths_us(&measurement.time_edges_us);
     let mut open = starting_time_background(measurement)?;
+    let mut intervals: Option<Vec<usize>> = None;
     for passes in 1.. {
-        let (mut fit, _) =
-            fit_counts_answer(measurement, calibration, BeamStarts::OpenFitsAt(open))?;
-        let moved: Vec<(usize, f64)> = (0..3)
-            .filter_map(|i| {
-                let at = fitted.iter().position(|&r| r == Role::TimeBackground(i))?;
-                Some((at, fit.time_background[i] - open[i]))
-            })
-            .filter(|&(at, _)| {
-                fit.covariance
-                    .as_ref()
-                    .is_some_and(|c| c.get(at, at).is_finite())
-            })
-            .collect();
-        let shift = fit.covariance.as_ref().map_or(0.0, |covariance| {
-            let block = Mat::from_fn(moved.len(), moved.len(), |a, b| {
-                covariance.get(moved[a].0, moved[b].0)
-            });
-            block.llt(Side::Lower).map_or(f64::INFINITY, |llt| {
-                let inverse = llt.inverse();
-                (0..moved.len())
-                    .flat_map(|a| (0..moved.len()).map(move |b| (a, b)))
-                    .map(|(a, b)| moved[a].1 * inverse[(a, b)] * moved[b].1)
-                    .sum()
-            })
-        });
-        if !fit.converged || shift <= BOUND || passes == MOST_PASSES {
-            if shift > BOUND {
+        let (mut fit, _) = fit_counts_answer(
+            measurement,
+            calibration,
+            BeamStarts::OpenFitsAt(open, intervals.clone()),
+        )?;
+        let (used, _) = time_counts_per_pixel(&bins, open);
+        let (now, _) = time_counts_per_pixel(&bins, fit.time_background);
+        let mut spread = 0.0;
+        for (r, region) in fit.regions.iter().zip(&measurement.regions) {
+            for (k, &mu) in r.predicted[0]
+                .iter()
+                .enumerate()
+                .filter(|(_, mu)| **mu > 0.0)
+            {
+                let live = region.open_live.as_ref().map_or(1.0, |live| live[k]);
+                spread += (live * region.pixels * (now[k] - used[k])).powi(2) / mu;
+            }
+        }
+        if !fit.converged || spread <= BOUND || passes == MOST_PASSES {
+            if spread > BOUND {
                 fit.converged = false;
                 fit.covariance = None;
                 fit.unbounded = None;
@@ -511,6 +505,10 @@ pub fn fit_counts(
                 fit.pulse_consistency = None;
             }
             return Ok(fit);
+        }
+        if passes >= 2 {
+            intervals
+                .get_or_insert_with(|| fit.regions.iter().map(|r| r.beam.intervals()).collect());
         }
         open = fit.time_background;
     }
@@ -980,7 +978,7 @@ fn in_span(
 
 pub(crate) enum BeamStarts<'a> {
     Given(&'a Starts),
-    OpenFitsAt([f64; 3]),
+    OpenFitsAt([f64; 3], Option<Vec<usize>>),
 }
 
 pub(crate) fn fit_counts_answer(
@@ -990,7 +988,7 @@ pub(crate) fn fit_counts_answer(
 ) -> Result<(CountsFit, Answer), PipelineError> {
     let starts = match beam_starts {
         BeamStarts::Given(starts) => Some(starts),
-        BeamStarts::OpenFitsAt(_) => None,
+        BeamStarts::OpenFitsAt(..) => None,
     };
     let Measurement {
         time_edges_us,
@@ -1050,19 +1048,20 @@ pub(crate) fn fit_counts_answer(
 
     let opens: Vec<BeamStart> = match beam_starts {
         BeamStarts::Given(starts) => starts.beams.clone(),
-        BeamStarts::OpenFitsAt(numbers) => regions
+        BeamStarts::OpenFitsAt(numbers, ref intervals) => regions
             .iter()
             .enumerate()
             .map(|(r, region)| {
                 let (per_pixel, _) =
                     time_counts_per_pixel(&starts_and_widths_us(time_edges_us), numbers);
                 let known: Vec<f64> = per_pixel.iter().map(|g| region.pixels * g).collect();
-                let open = fit_open_beam(
+                let open = open_beam_with_intervals(
                     time_edges_us,
                     &region.open_counts,
                     calibration,
                     Some(&live[2 * r * bins..(2 * r + 1) * bins]),
                     Some(&known),
+                    intervals.as_ref().map(|chosen| chosen[r]),
                 )
                 .map_err(|e| in_region(r, e))?;
                 Ok(BeamStart::from(open))
@@ -2720,9 +2719,12 @@ mod tests {
             },
         };
         let open = starting_time_background(&measurement).expect("numbers");
-        let (fit, answer) =
-            fit_counts_answer(&measurement, &calibration, BeamStarts::OpenFitsAt(open))
-                .expect("fit");
+        let (fit, answer) = fit_counts_answer(
+            &measurement,
+            &calibration,
+            BeamStarts::OpenFitsAt(open, None),
+        )
+        .expect("fit");
         assert!(fit.converged);
         let covariance = fit.covariance.as_ref().expect("covariance");
         let fitted: Vec<Role> = quantities(&measurement, &calibration)
