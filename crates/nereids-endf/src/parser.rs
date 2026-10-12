@@ -367,17 +367,14 @@ fn section_151<'a>(endf_text: &'a str, mf: &str) -> Vec<&'a str> {
         .collect()
 }
 
-/// The relative tolerance within which a resonance's File 32 energy agrees
-/// with its File 2 energy (ENDF-6 Formats Manual, File 32: correspondence
-/// between Files 2 and 32).
-const FILE32_ENERGY_TOLERANCE: f64 = 1e-5;
+const FILE32_TOLERANCE: f64 = 1e-5;
 
 /// The covariance, from File 32 (MT=151), of the energy, neutron width and
-/// capture width of each resonance File 32 lists with an energy in
-/// `window_ev`, each the resonance of `data` of the same spin whose energy
-/// agrees to a relative 1e-5.  A resonance listed in several short-range
-/// sections has their contributions summed; resonances File 32 does not list,
-/// or lists outside the window, are left out.  `None` when the text has no
+/// capture width of each resonance of `data` with an energy in `window_ev`
+/// that File 32 lists with the same spin and an energy and widths that agree
+/// to a relative 1e-5.  A resonance listed in several short-range
+/// sections has their contributions summed; resonances outside the window,
+/// or that File 32 does not list, are left out.  `None` when the text has no
 /// File 32 or it lists no resonance in the window.
 ///
 /// # Errors
@@ -425,6 +422,11 @@ pub fn parse_resonance_covariance(
                 })
         })
         .collect();
+    let agree = |a: [f64; 3], b: [f64; 3]| {
+        a.iter()
+            .zip(b)
+            .all(|(a, b)| (a - b).abs() <= FILE32_TOLERANCE * a.abs())
+    };
     let pos = &mut 0;
     let head = parse_cont(&lines, pos)?;
     if head.c1 != f64::from(data.za) || head.n1 != 1 {
@@ -434,11 +436,15 @@ pub fn parse_resonance_covariance(
         )));
     }
     let ranges = checked_count(parse_cont(&lines, pos)?.n1, "NER")?;
-    let (mut resonances, mut entries, mut unresolved) = (Vec::new(), Vec::new(), false);
+    let (mut resonances, mut entries) = (Vec::new(), Vec::new());
     for r in 0..ranges {
         let range = parse_cont(&lines, pos)?;
-        unresolved = range.l1 == 2 && range.l2 == 1 && r + 1 == ranges;
-        if unresolved {
+        if range.l1 == 2 && range.l2 == 1 && r + 1 == ranges {
+            let groups = checked_count(parse_cont(&lines, pos)?.n1, "NLS")?;
+            for _ in 0..=groups {
+                let list = parse_cont(&lines, pos)?;
+                parse_list_values(&lines, pos, checked_count(list.n1, "NPL")?)?;
+            }
             break;
         }
         let (form, sections) = (parse_cont(&lines, pos)?, parse_cont(&lines, pos)?);
@@ -452,7 +458,8 @@ pub fn parse_resonance_covariance(
             return Err(EndfParseError::UnsupportedFormat(format!(
                 "File 32 is read for one isotope's resolved Reich-Moore ranges in the \
                  general form, without a scattering-radius covariance or long-range \
-                 sections, followed by at most one unresolved range (LRF=1); got LRU={}, LRF={}, NRO={}, LCOMP={}, ISR={}, NLRS={}",
+                 sections, followed by at most one unresolved range (LRF=1); got LRU={}, \
+                 LRF={}, NRO={}, LCOMP={}, ISR={}, NLRS={}",
                 range.l1, range.l2, range.n1, form.l2, form.n2, sections.n2
             )));
         }
@@ -476,23 +483,26 @@ pub fn parse_resonance_covariance(
             }
             let (table, packed) = values.split_at(6 * count);
             let mut slots = Vec::new();
-            for k in (0..count).filter(|&k| window_ev.contains(&table[6 * k])) {
-                let (energy, spin) = (table[6 * k], table[6 * k + 1]);
+            for (k, row) in table.chunks(6).enumerate() {
+                let (energy, spin) = (row[0], row[1]);
                 let mut same = known.iter().filter(|(_, r)| {
-                    r.j == spin
-                        && (r.energy - energy).abs() <= FILE32_ENERGY_TOLERANCE * r.energy.abs()
+                    r.j == spin && agree([r.energy, r.gn, r.gg], [row[0], row[2], row[3]])
                 });
                 let found = match (same.next(), same.next()) {
-                    (Some(&(at, _)), None) => Some(at),
+                    (Some(&(at, r)), None) => Some((at, r.energy)),
                     _ => None,
                 };
+                if !window_ev.contains(&found.map_or(energy, |(_, e)| e)) {
+                    continue;
+                }
+                let found = found.map(|(at, _)| at);
                 let Some(at) = found.filter(|at| slots.iter().all(|&(_, s)| resonances[s] != *at))
                 else {
                     return Err(EndfParseError::UnsupportedFormat(format!(
                         "File 32 lists a resonance at {energy} eV of spin {spin} that matches no \
                          Reich-Moore resonance of File 2 of that spin to a relative \
-                         {FILE32_ENERGY_TOLERANCE:e} in energy, more than one, or one its block \
-                         already lists"
+                         {FILE32_TOLERANCE:e} in energy and widths, more than one, or one its \
+                         block already lists"
                     )));
                 };
                 if !resonances.contains(&at) {
@@ -510,7 +520,7 @@ pub fn parse_resonance_covariance(
             }
         }
     }
-    if !unresolved && *pos != lines.len() {
+    if *pos != lines.len() {
         return Err(EndfParseError::UnsupportedFormat(
             "File 32 holds records past its last range".into(),
         ));
@@ -2881,12 +2891,34 @@ mod tests {
             text.lines().enumerate().map(change).collect::<String>()
         };
         let edited = |line: usize, field: usize, value: &str| edit(&text, line, field, value);
+        let edits = |changes: &[(usize, usize, &str)]| {
+            changes
+                .iter()
+                .fold(text.clone(), |text, &(l, f, v)| edit(&text, l, f, v))
+        };
+        let unresolved =
+            " 2.554000+3 1.000000+5          2          1          0          0732832151
+ 3.500000+0 7.860000-1          0          0          1          0732832151
+ 1.793936+2 0.000000+0          0          0          6          1732832151
+ 1.000000+0 3.000000+0 1.000000-3 6.000000-2 0.000000+0 0.000000+0732832151
+ 0.000000+0 0.000000+0          1          0          1          1732832151
+ 1.000000-2                                                       732832151
+";
+        let head = |text: &str, n| text.split_inclusive('\n').take(n).collect::<String>();
+        let only = head(&text, 11) + unresolved;
         for refused in [
+            edit(&only, 11, 4, "2"),
+            edit(&only, 12, 3, "2"),
+            edits(&[
+                (17, 0, "1.034682+1"),
+                (17, 2, "4.816293-3"),
+                (17, 3, "6.164143-2"),
+            ]),
             edited(10, 0, "7.318200+4"),
             edited(10, 4, "2"),
-            edit(&edit(&edited(10, 4, "2"), 12, 2, "2"), 12, 3, "1"),
+            edits(&[(10, 4, "2"), (12, 2, "2"), (12, 3, "1")]),
             edited(12, 2, "2"),
-            edit(&edit(&edited(11, 4, "2"), 12, 2, "2"), 12, 3, "1"),
+            edits(&[(11, 4, "2"), (12, 2, "2"), (12, 3, "1")]),
             edited(11, 4, "0"),
             edited(12, 2, "0"),
             edited(12, 3, "2"),
@@ -2897,9 +2929,10 @@ mod tests {
             edited(15, 2, "2"),
             edited(15, 4, "101"),
             edited(16, 0, "nan"),
-            edited(17, 0, "1.034682+1"),
             edited(17, 0, "2.031200+1"),
             edited(17, 1, "4.000000+0"),
+            edited(17, 2, "1.066000-3"),
+            edited(11, 4, "2") + unresolved + &unresolved[..76],
         ] {
             let refused = read(&refused);
             assert!(
@@ -2908,8 +2941,6 @@ mod tests {
             );
         }
         let all = read(&text).unwrap().expect("listed");
-        let unresolved =
-            " 2.554000+3 1.000000+5          2          1          0          0732832151";
         for accepted in [
             edited(17, 0, "2.031171+1"),
             edited(17, 2, "1.065878-3"),
@@ -2917,7 +2948,13 @@ mod tests {
         ] {
             assert_eq!(read(&accepted).unwrap().as_ref(), Some(&all));
         }
-        let mut grouped: Vec<String> = edit(&edit(&edited(4, 4, "2"), 5, 4, "12"), 5, 5, "2")
+        assert!(read(&(edited(11, 4, "2") + &unresolved[..380])).is_err());
+        let edge = parse_resonance_covariance(&edited(17, 0, "2.031171+1"), &data, 0.0..=20.3117);
+        assert_eq!(
+            edge.unwrap().expect("listed").resonances,
+            all.resonances[..2]
+        );
+        let mut grouped: Vec<String> = edits(&[(4, 4, "2"), (5, 4, "12"), (5, 5, "2")])
             .lines()
             .map(String::from)
             .collect();
@@ -2928,40 +2965,40 @@ mod tests {
         let split = parse_endf_file2(&grouped).unwrap();
         let regrouped = parse_resonance_covariance(&grouped, &split, 0.0..=100.0).unwrap();
         let regrouped = regrouped.expect("listed");
-        assert_eq!(
-            regrouped.resonances,
-            [[0, 0, 0], [0, 0, 1], [0, 1, 0], [0, 1, 1]]
-        );
+        let indices = [[0, 0, 0], [0, 0, 1], [0, 1, 0], [0, 1, 1]];
+        assert_eq!(regrouped.resonances, indices);
         assert_eq!(regrouped.covariance, all.covariance);
-        let (doublet, multilevel) = (edited(8, 0, "2.031170+1"), edited(3, 3, "2"));
+        let doublet = edits(&[
+            (8, 0, "2.031170+1"),
+            (8, 2, "1.065877-3"),
+            (8, 3, "6.370451-2"),
+        ]);
+        let mut multilevel = data.clone();
+        multilevel.ranges[0].formalism = ResonanceFormalism::MLBW;
         for (file, file2, window) in [
-            (&text, &multilevel, 0.0..=100.0),
-            (&doublet, &doublet, 15.0..=21.0),
+            (&text, multilevel, 0.0..=100.0),
+            (&doublet, parse_endf_file2(&doublet).unwrap(), 15.0..=21.0),
         ] {
-            let refused =
-                parse_resonance_covariance(file, &parse_endf_file2(file2).unwrap(), window);
+            let refused = parse_resonance_covariance(file, &file2, window);
             assert!(matches!(refused, Err(EndfParseError::UnsupportedFormat(_))));
         }
         for window in [f64::NAN..=1.0, 30.0..=14.0] {
             let refused = parse_resonance_covariance(&text, &data, window);
             assert!(matches!(refused, Err(EndfParseError::InvalidNumber(_))));
         }
-        let file2: String = text.lines().take(9).map(|l| format!("{l}\n")).collect();
-        for empty in [file2, edit(&edited(12, 2, "2"), 12, 3, "1")] {
+        for empty in [head(&text, 9), only] {
             assert!(read(&empty).unwrap().is_none());
         }
         let field = |v: f64| format!("{:>11}", format!("{v:e}").replace('e', ""));
         let members = [[0, 1], [1, 2]];
-        let block = |rows: &[usize; 2]| {
+        let block = |rows: [usize; 2]| {
             let at = |p: usize| 3 * rows[p / 3] + p % 3;
             let packed = (0..6).flat_map(|p| (p..6).map(move |q| (p, q)));
             let values: Vec<String> = packed
                 .map(|(p, q)| field(all.covariance[12 * at(p) + at(q)]))
                 .collect();
             let head = "        0.0        0.0          3          0         33          2".into();
-            let table = rows
-                .iter()
-                .map(|&r| text.lines().nth(15 + r).unwrap()[..66].to_string());
+            let table = rows.map(|r| text.lines().nth(15 + r).unwrap()[..66].to_string());
             let body = values.chunks(6).map(|c| c.concat()).collect::<Vec<_>>();
             std::iter::once(head)
                 .chain(table)
@@ -2969,12 +3006,8 @@ mod tests {
                 .map(|l| format!("{l:<66}732832151    0\n"))
                 .collect::<String>()
         };
-        let sections: String = edited(14, 4, "2")
-            .lines()
-            .take(14)
-            .map(|l| format!("{l}\n"))
-            .collect();
-        let overlapping = sections + &members.iter().map(block).collect::<String>();
+        let sections = head(&edited(14, 4, "2"), 14);
+        let overlapping = sections + &members.map(block).concat();
         let summed = read(&overlapping).unwrap().expect("listed");
         assert_eq!(summed.resonances, all.resonances[..3]);
         for (a, b) in (0..9).flat_map(|a| (0..9).map(move |b| (a, b))) {
