@@ -321,12 +321,14 @@ fn the_time_background_is_in_both_runs_of_every_region_by_its_pixels_and_gamma_t
     let lines: Vec<(ResonanceData, f64)> = [(72, 180, 16.0), (74, 182, 20.0), (76, 186, 25.0)]
         .map(|(z, n, e)| (synthetic_isotope(z, n, e, 0.01, 0.06), SATURATED))
         .to_vec();
-    let simulated = |numbers: [f64; 3]| -> Vec<[(Vec<f64>, Vec<f64>); 2]> {
+    let simulated = |numbers: [f64; 3], dip: f64| -> Vec<[(Vec<f64>, Vec<f64>); 2]> {
         let per_pixel = time_background(&setup.edges, numbers);
         (0..2)
             .map(|r| {
                 let sample = if r == 0 { lines.as_slice() } else { &[] };
-                let (open, transmitted) = expected(&setup, &beam([1.0e6, 2.0e6][r]), sample);
+                let smooth = beam([1.0e6, 2.0e6][r]);
+                let shape = |u: f64| smooth(u) * (1.0 - dip * (-(u - 407.0).powi(2) / 578.0).exp());
+                let (open, transmitted) = expected(&setup, &shape, sample);
                 let term = |scale: f64| per_pixel.iter().map(move |g| scale * pixels[r] * g);
                 let open: Vec<f64> = open.iter().zip(term(1.0)).map(|(o, g)| o + g).collect();
                 let sample: Vec<f64> = transmitted
@@ -342,7 +344,7 @@ fn the_time_background_is_in_both_runs_of_every_region_by_its_pixels_and_gamma_t
             })
             .collect()
     };
-    let runs = simulated(numbers);
+    let runs = simulated(numbers, 0.0);
     let measurement = |runs: &[[(Vec<f64>, Vec<f64>); 2]],
                        numbers: [Value; 3],
                        gamma: Value,
@@ -398,39 +400,42 @@ fn the_time_background_is_in_both_runs_of_every_region_by_its_pixels_and_gamma_t
         }
     }
 
-    let free = measurement(
-        &runs,
-        std::array::from_fn(|i| Value::Fitted([0.5, 2.0, 0.7][i] * numbers[i])),
-        Value::Fitted(0.5),
-        |x| Value::Fitted(1.1 * x),
-    );
-    let fit = fit_counts(&free, &calibration(&setup)).expect("fit");
-    assert!(fit.converged);
-    for region in &fit.regions {
-        assert_eq!(region.beam.intervals(), 1);
-        assert_eq!(region.overdispersion[0], Some(1.0));
-    }
-    let sample = &fit.regions[0];
-    let estimates = sample.densities.iter().chain(&sample.temperature_k).chain(
-        [
-            &fit.normalization,
-            &sample.background[0],
-            &sample.gamma_transmission,
-        ]
-        .into_iter()
-        .chain(&fit.time_background),
-    );
-    let truths = lines
-        .iter()
-        .map(|(_, n)| *n)
-        .chain([TEMPERATURE_K, a, 0.0, gammas[0]])
-        .chain(numbers);
-    for (i, (x, t)) in estimates.zip(truths).enumerate() {
-        let pull = (x - t) / error_bar(&fit, i);
-        assert!(pull.abs() <= BOUND.sqrt(), "{i}: {x} vs {t}, pull {pull}");
+    let dipped = simulated(numbers, 0.6);
+    for (runs, dip, within) in [(&runs, false, BOUND.sqrt()), (&dipped, true, 1.0)] {
+        let free = measurement(
+            runs,
+            std::array::from_fn(|i| Value::Fitted([0.5, 2.0, 0.7][i] * numbers[i])),
+            Value::Fitted(0.5),
+            |x| Value::Fitted(1.1 * x),
+        );
+        let fit = fit_counts(&free, &calibration(&setup)).expect("fit");
+        assert!(fit.converged);
+        for region in &fit.regions {
+            assert_eq!(region.beam.intervals() > 1, dip);
+            assert_eq!(region.overdispersion[0], Some(1.0));
+        }
+        let sample = &fit.regions[0];
+        let estimates = sample.densities.iter().chain(&sample.temperature_k).chain(
+            [
+                &fit.normalization,
+                &sample.background[0],
+                &sample.gamma_transmission,
+            ]
+            .into_iter()
+            .chain(&fit.time_background),
+        );
+        let truths = lines
+            .iter()
+            .map(|(_, n)| *n)
+            .chain([TEMPERATURE_K, a, 0.0, gammas[0]])
+            .chain(numbers);
+        for (i, (x, t)) in estimates.zip(truths).enumerate() {
+            let pull = (x - t) / error_bar(&fit, i);
+            assert!(pull.abs() <= within, "{dip} {i}: {x} vs {t}, pull {pull}");
+        }
     }
 
-    let no_tail = simulated([numbers[0], 0.0, numbers[2]]);
+    let no_tail = simulated([numbers[0], 0.0, numbers[2]], 0.0);
     let fits = [
         [numbers[0], 0.0, numbers[2]],
         [numbers[0], 10.0 * numbers[1], 40.0],
