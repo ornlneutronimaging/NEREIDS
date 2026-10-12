@@ -876,7 +876,7 @@ mod tests {
 
     use super::*;
     use crate::beam::BeamSpline;
-    use crate::counts_fit::RegionFit;
+    use crate::counts_fit::{NO_TIME_BACKGROUND, RegionFit};
 
     type Edit = (&'static str, fn(&mut serde_json::Value));
 
@@ -901,12 +901,15 @@ mod tests {
             time_edges_us: edges,
             charge_ratio: 1.0,
             normalization: Value::Known(1.0),
+            time_background: NO_TIME_BACKGROUND,
             regions: vec![Region {
                 open_counts: vec![100.0; bins],
                 sample_counts: vec![100.0; bins],
                 open_live: None,
                 sample_live: None,
                 background: [Value::Known(0.0); 3],
+                pixels: 1.0,
+                gamma_transmission: Value::Known(1.0),
                 material: Some(Material {
                     covariances: Vec::new(),
                     library: EndfLibrary::EndfB8_0,
@@ -981,6 +984,7 @@ mod tests {
                 densities: vec![2e-3],
                 temperature_k: Some(300.0),
                 background: [0.0; 3],
+                gamma_transmission: 1.0,
                 beam: BeamSpline::constant(200.0, 600.0, 1.0),
                 beam_at_limit: false,
                 predicted: [Vec::new(), Vec::new()],
@@ -993,6 +997,7 @@ mod tests {
             beta: [0.0, 0.01],
             r: 0.21,
             fwhm_squared_us2: 0.12,
+            time_background: [0.0, 0.0, 1.0],
             covariance: Some(covariance),
             unbounded: Some(unbounded),
             on_bound: vec![false; free],

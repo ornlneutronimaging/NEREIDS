@@ -172,7 +172,9 @@ pub struct OpenBeamFit {
 
 /// Fit the beam to the raw open-beam counts `open_counts` of the time bins
 /// `time_edges_us` (µs), each bin recording the fraction `open_live` of the
-/// neutrons arriving in it, or every one when that is `None`.  `ln φ`, the
+/// counts arriving in it, or every one when that is `None`.  `known` gives,
+/// per bin, the counts that arrive without the beam, before the live fraction,
+/// or none when that is `None`.  `ln φ`, the
 /// logarithm of the beam, is a cubic spline in `ln u` with knots from the
 /// first edge's flight time to the last edge's; outside them the beam is the
 /// spline's continuation, which reaches the bins only through the pulse's
@@ -204,9 +206,11 @@ pub struct OpenBeamFit {
 ///
 /// # Errors
 /// [`PipelineError::ShapeMismatch`] unless there is one count, and one live
-/// fraction when given, per bin;
+/// fraction and one known count when given, per bin;
 /// [`PipelineError::InvalidParameter`] if a count is not a whole non-negative
-/// number, every count is zero, a live fraction is not in (0, 1], there are
+/// number, every count is zero, a live fraction is not in (0, 1], a known
+/// count is not finite and 0 or more, the known counts recorded are at least
+/// the counts, there are
 /// fewer than 8 bins (one interval's four coefficients and as many bins again
 /// to measure the noise), a known, starting or measured value of the
 /// calibration is not finite and in its quantity's range, a measured one's sd
@@ -222,6 +226,7 @@ pub fn fit_open_beam(
     open_counts: &[f64],
     calibration: &Calibration,
     open_live: Option<&[f64]>,
+    known: Option<&[f64]>,
 ) -> Result<OpenBeamFit, PipelineError> {
     let start: Vec<f64> = calibration
         .instrument()?
@@ -237,6 +242,7 @@ pub fn fit_open_beam(
     )?);
     validate_counts("open-beam", open_counts, time_edges_us.len() - 1)?;
     let live = validate_live("open-beam", open_live, time_edges_us.len() - 1)?;
+    let known = validate_known(known, time_edges_us.len() - 1)?;
 
     let coefficients = |intervals: usize| intervals + 3;
     let admits = |intervals: usize| 2 * coefficients(intervals) <= open_counts.len();
@@ -254,19 +260,29 @@ pub fn fit_open_beam(
     let u_last = time_edges_us[time_edges_us.len() - 1] - t0_us;
     let per_unit_beam = grid.predict(&vec![1.0; grid.flight_times_us().len()])?;
     let recorded: f64 = per_unit_beam.iter().zip(&live).map(|(c, l)| l * c).sum();
-    let per_us = open_counts.iter().sum::<f64>() / recorded;
+    let beam_counts =
+        open_counts.iter().sum::<f64>() - known.iter().zip(&live).map(|(g, l)| l * g).sum::<f64>();
+    if beam_counts <= 0.0 {
+        return Err(PipelineError::InvalidParameter(format!(
+            "the open-beam run records {} counts, no more than the {} known counts it records",
+            open_counts.iter().sum::<f64>(),
+            open_counts.iter().sum::<f64>() - beam_counts
+        )));
+    }
+    let per_us = beam_counts / recorded;
     let mut ladder = vec![fit_beam(
         &grid,
         &BeamSpline::constant(u_first, u_last, per_us),
         open_counts,
         &live,
+        &known,
     )?];
     while let Some(start) = ladder
         .last()
         .filter(|candidate| candidate.fit.converged && admits(2 * candidate.beam.intervals()))
         .map(|candidate| candidate.beam.refined())
     {
-        match fit_beam(&grid, &start, open_counts, &live) {
+        match fit_beam(&grid, &start, open_counts, &live, &known) {
             Ok(candidate) if candidate.fit.converged => ladder.push(candidate),
             Ok(_)
             | Err(PipelineError::FlightTimeGrid(FlightTimeGridError::TooManyPoints { .. })) => {
@@ -369,6 +385,26 @@ pub(crate) fn validate_live(
     Ok(live)
 }
 
+fn validate_known(known: Option<&[f64]>, bins: usize) -> Result<Vec<f64>, PipelineError> {
+    let known = known.map_or_else(|| vec![0.0; bins], <[f64]>::to_vec);
+    if known.len() != bins {
+        return Err(PipelineError::ShapeMismatch(format!(
+            "{} known open-beam counts for {bins} time bins",
+            known.len()
+        )));
+    }
+    if let Some((bin, count)) = known
+        .iter()
+        .enumerate()
+        .find(|(_, g)| !(g.is_finite() && **g >= 0.0))
+    {
+        return Err(PipelineError::InvalidParameter(format!(
+            "known open-beam counts must be finite and 0 or more, got {count} in bin {bin}"
+        )));
+    }
+    Ok(known)
+}
+
 pub(crate) const COUNTS_TO_MEASURE_NOISE: f64 = 1.0;
 
 pub(crate) fn counted(fit: &GridFit, bins: std::ops::Range<usize>) -> Vec<usize> {
@@ -411,6 +447,7 @@ fn fit_beam(
     start: &BeamSpline,
     open_counts: &[f64],
     live: &[f64],
+    known: &[f64],
 ) -> Result<Candidate, PipelineError> {
     let mut parameters = ParameterSet::new(
         start
@@ -429,7 +466,7 @@ fn fit_beam(
         &[],
         |grid| {
             Ok(Recorded {
-                model: OpenBeamModel::new(grid, start),
+                model: OpenBeamModel::new(grid, start, known),
                 live,
             })
         },
@@ -593,10 +630,11 @@ pub(crate) fn weights_of(basis: &[[(usize, f64); 5]], index: usize) -> Vec<f64> 
 pub(crate) struct OpenBeamModel {
     grid: Arc<FlightTimeGrid>,
     basis: Vec<[(usize, f64); 5]>,
+    known: Vec<f64>,
 }
 
 impl OpenBeamModel {
-    pub(crate) fn new(grid: &Arc<FlightTimeGrid>, beam: &BeamSpline) -> Self {
+    pub(crate) fn new(grid: &Arc<FlightTimeGrid>, beam: &BeamSpline, known: &[f64]) -> Self {
         Self {
             grid: Arc::clone(grid),
             basis: grid
@@ -604,6 +642,7 @@ impl OpenBeamModel {
                 .iter()
                 .map(|&u| beam.basis(u))
                 .collect(),
+            known: known.to_vec(),
         }
     }
 
@@ -627,7 +666,11 @@ impl OpenBeamModel {
 
 impl FitModel for OpenBeamModel {
     fn evaluate(&self, params: &[f64]) -> Result<Vec<f64>, FittingError> {
-        self.counts(&self.beam(params))
+        let mut counts = self.counts(&self.beam(params))?;
+        for (c, g) in counts.iter_mut().zip(&self.known) {
+            *c += g;
+        }
+        Ok(counts)
     }
 
     fn analytical_jacobian(
@@ -700,7 +743,7 @@ pub(crate) mod tests {
                 BeamSpline::constant(347.0, u_hi, 1.0e4),
                 BeamSpline::constant(347.0, u_hi, 1.0e4).refined().refined(),
             ] {
-                let model = OpenBeamModel::new(&grid, &beam);
+                let model = OpenBeamModel::new(&grid, &beam, &[]);
                 let coefficients: Vec<f64> = (0..beam.coefficients().len())
                     .map(|i| 9.0 + 0.3 * (i as f64).sin())
                     .collect();

@@ -15,8 +15,8 @@ use nereids_fitting::statistics::{Consistency, consistency};
 use rayon::prelude::*;
 
 use crate::counts_fit::{
-    BeamStart, Material, Measurement, Region, RegionFit, RegionTerms, Role, SHARED, Starts, Value,
-    checked, excluded_bins, fit_counts_answer, labelled, shared_parameters,
+    BeamStart, Material, Measurement, NO_TIME_BACKGROUND, Region, RegionFit, RegionTerms, Role,
+    SHARED, Starts, Value, checked, excluded_bins, fit_counts_answer, labelled, shared_parameters,
 };
 use crate::error::PipelineError;
 use crate::open_beam::{
@@ -325,7 +325,8 @@ impl CountsMap<'_> {
 /// one flight path, one moderator, and a detector efficiency that changes
 /// between the runs alike in every pixel.  A region's counts are the sums
 /// over its pixels; each has its own beam and background.  The empty pixels
-/// pin the normalization when their `b0` is known.
+/// pin the normalization when their `b0` is known.  The map has no time
+/// background ([`NO_TIME_BACKGROUND`](crate::counts_fit::NO_TIME_BACKGROUND)).
 ///
 /// The fit is the joint one of [`fit_counts`](crate::counts_fit::fit_counts),
 /// found region by region.  With the shared quantities held, each region is
@@ -457,6 +458,8 @@ pub fn fit_map<'a>(
             open_live: map.open_live.clone(),
             sample_live: map.sample_live.clone(),
             background,
+            pixels: pixels.len() as f64,
+            gamma_transmission: Value::Known(1.0),
             material,
         })
     };
@@ -471,6 +474,7 @@ pub fn fit_map<'a>(
         time_edges_us: map.time_edges_us.clone(),
         charge_ratio: map.charge_ratio,
         normalization,
+        time_background: NO_TIME_BACKGROUND,
         regions,
     };
 
@@ -480,6 +484,8 @@ pub fn fit_map<'a>(
         open_live: None,
         sample_live: None,
         background,
+        pixels: 1.0,
+        gamma_transmission: Value::Known(1.0),
         material,
     };
     checked(
@@ -604,6 +610,7 @@ pub fn fit_map<'a>(
                 &regions[r].open_counts,
                 &starting,
                 regions[r].open_live.as_deref(),
+                None,
             )
             .map_err(|e| named(label, e))?
             .into(),
