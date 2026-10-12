@@ -17,6 +17,7 @@ use rayon::prelude::*;
 use crate::counts_fit::{
     BeamStart, Material, Measurement, NO_TIME_BACKGROUND, Region, RegionFit, RegionTerms, Role,
     SHARED, Starts, Value, checked, excluded_bins, fit_counts_answer, labelled, shared_parameters,
+    starting_time_background,
 };
 use crate::error::PipelineError;
 use crate::open_beam::{
@@ -623,7 +624,8 @@ pub fn fit_map<'a>(
             excluded: vec![excluded.read().expect("the bin lists")[r].clone()],
         };
         let (fit, answer) =
-            fit_counts_answer(&one, &held, Some(&starts)).map_err(|e| named(label, e))?;
+            fit_counts_answer(&one, &held, Some(&starts), starting_time_background(&one)?)
+                .map_err(|e| named(label, e))?;
         let region_fit = fit.regions.into_iter().next().expect("one region");
         let edge = fitted_temperature
             && region_fit

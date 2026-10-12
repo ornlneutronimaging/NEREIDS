@@ -209,8 +209,7 @@ pub struct OpenBeamFit {
 /// fraction and one known count when given, per bin;
 /// [`PipelineError::InvalidParameter`] if a count is not a whole non-negative
 /// number, every count is zero, a live fraction is not in (0, 1], a known
-/// count is not finite and 0 or more, the known counts recorded are at least
-/// the counts, there are
+/// count is not finite and 0 or more, there are
 /// fewer than 8 bins (one interval's four coefficients and as many bins again
 /// to measure the noise), a known, starting or measured value of the
 /// calibration is not finite and in its quantity's range, a measured one's sd
@@ -260,16 +259,7 @@ pub fn fit_open_beam(
     let u_last = time_edges_us[time_edges_us.len() - 1] - t0_us;
     let per_unit_beam = grid.predict(&vec![1.0; grid.flight_times_us().len()])?;
     let recorded: f64 = per_unit_beam.iter().zip(&live).map(|(c, l)| l * c).sum();
-    let beam_counts =
-        open_counts.iter().sum::<f64>() - known.iter().zip(&live).map(|(g, l)| l * g).sum::<f64>();
-    if beam_counts <= 0.0 {
-        return Err(PipelineError::InvalidParameter(format!(
-            "the open-beam run records {} counts, no more than the {} known counts it records",
-            open_counts.iter().sum::<f64>(),
-            open_counts.iter().sum::<f64>() - beam_counts
-        )));
-    }
-    let per_us = beam_counts / recorded;
+    let per_us = open_counts.iter().sum::<f64>() / recorded;
     let mut ladder = vec![fit_beam(
         &grid,
         &BeamSpline::constant(u_first, u_last, per_us),

@@ -1,7 +1,7 @@
 //! The areal densities and temperatures of the materials in one or more
-//! regions of the detector, each region's background, the sample run's
-//! normalization, the timing offset, the flight path and the pulse's numbers,
-//! fitted to the counts of an open-beam run and a sample run recorded in the
+//! regions of the detector, each region's background and gamma transmission,
+//! the sample run's normalization, the time background, the timing offset,
+//! the flight path and the pulse's numbers, fitted to the counts of an open-beam run and a sample run recorded in the
 //! same time bins.
 
 use std::borrow::Cow;
@@ -172,8 +172,8 @@ pub struct Material {
     pub covariances: Vec<(usize, ResonanceCovariance)>,
 }
 
-/// The fitted quantities of every region, and the normalization, timing
-/// offset, flight path and pulse numbers the regions share.
+/// The fitted quantities of every region, and the normalization, time
+/// background, timing offset, flight path and pulse numbers the regions share.
 #[derive(Debug, Clone)]
 pub struct CountsFit {
     /// Each region's fitted quantities and counts, in the order given.
@@ -234,8 +234,8 @@ pub struct CountsFit {
     /// weighted with, summed over both runs of every region at the fit, outside
     /// the sample runs' [`RegionFit::excluded_bins`].
     pub deviance: f64,
-    /// Whether the fitter converged, every sample run's overdispersion
-    /// settled, the grid met its rule at the fitted temperatures, its flight
+    /// Whether the fitter converged, the open-beam fits' time background
+    /// settled at the fitted one, every sample run's overdispersion settled, the grid met its rule at the fitted temperatures, its flight
     /// times cover the fitted `t0`, flight path and pulse, and the bins left
     /// out at those are the ones the fit left out.
     pub converged: bool,
@@ -317,8 +317,9 @@ pub struct RegionFit {
 }
 
 /// Fit the areal densities and temperatures of the regions' materials, each
-/// region's background terms, the normalization, and the timing offset,
-/// flight path and pulse numbers of `calibration`, that are not known, to the
+/// region's background terms and gamma transmission, the normalization, the
+/// time background, and the timing offset, flight path and pulse numbers of
+/// `calibration`, that are not known, to the
 /// raw counts of both runs in every region.  On a uniform grid of flight
 /// times `u_i`, energies `E_i` and step `w`, the counts of region `r` in bin
 /// `k` are
@@ -340,15 +341,17 @@ pub struct RegionFit {
 /// normalization; SAMMY's `BackA`, `BackB`, `BackC` (`cro/mnrm1.f90`) are
 /// `a·b0`, `a·b1`, `a·b2`, to within the background's change over the pulse's
 /// delay.  SAMMY's `BackD·exp(−BackF/√E)` term is not modelled.  The time
-/// background `G` is counts, such as the prompt gammas of each proton pulse and
-/// room background, that reach the detector without passing through the
-/// moderator pulse, at the time `t` of the edges' clock, `t₁` the first edge:
-/// it is not folded with the pulse, and the sample run scales it with `c_q·a`,
-/// which correct the charge ratio and an efficiency change alike in every
-/// pixel, and the fraction `γ_r` the region's material passes, `p_r` the
-/// region's pixels.  In the ratio it fills each dip by `g(1 − T)`, `g` its
-/// share of the open-beam counts; SAMMY's backgrounds in time (`Bgfrpi`) are
-/// added to the transmission instead.
+/// background `G` is counts that follow the proton charge but reach the
+/// detector without passing through the moderator pulse, such as the prompt
+/// gammas of each proton pulse and their tail, at the time `t` of the edges'
+/// clock, `t₁` the first edge: it is not folded with the pulse, and the sample
+/// run scales it with `c_q·a`, which correct the charge ratio and an
+/// efficiency change alike in every pixel, and the fraction `γ_r` the
+/// region's material passes, `p_r` the region's pixels.  Counts that follow
+/// the run time instead, such as room background, are not modelled.  In the
+/// ratio it fills each dip by `g·(γ_r − T)`, `g` its share of the open-beam
+/// counts; SAMMY's backgrounds in time (`Bgfrpi`) are added to the
+/// transmission instead.
 ///
 /// The regions share the normalization, the run pair's scale; and `t0`, the
 /// flight path and the pulse, which one clock, flight path and moderator set
@@ -374,8 +377,10 @@ pub struct RegionFit {
 /// the pulse's laws at its energy `E_i`.  A trial pulse whose `α` or `β` is 0
 /// at some energy is outside the model and rejected; a fit driven there ends
 /// unconverged.  The open-beam fits that start the beams and weight the
-/// open-beam runs use the starting pulse and the time background at its
-/// starting numbers.
+/// open-beam runs use the starting pulse and, at first, the time background's
+/// starting numbers; the fit is repeated with them at its fitted numbers,
+/// up to twenty times, until those change each region's open-beam counts by
+/// `Σ_k (ΔO_rk)²/O_rk` at most [`BOUND`], summed over the regions.
 ///
 /// The grid's first step is at most half the narrowest Doppler full width at
 /// half maximum, in flight time, of any resonance of any region inside its
@@ -420,8 +425,7 @@ pub struct RegionFit {
 /// [`PipelineError::InvalidParameter`] if a count is not a whole non-negative
 /// number, a run has no counts, a live fraction is not in (0, 1], the charge
 /// ratio is not finite and positive, a region's pixels are not finite and
-/// positive, the time background's `τ` is fitted while its `A` is known 0, a
-/// known, starting or measured value is
+/// positive, a known, starting or measured value is
 /// not finite and in its quantity's range, a measured value's sd is not finite
 /// and positive, bounds are not `lower < upper` in that range
 /// with the start between them, the pulse's calibration covers a number that
@@ -466,7 +470,42 @@ pub fn fit_counts(
             "no region of the measurement holds a material to fit".into(),
         ));
     }
-    fit_counts_answer(measurement, calibration, None).map(|(fit, _)| fit)
+    let bins = starts_and_widths_us(&measurement.time_edges_us);
+    let mut open = starting_time_background(measurement)?;
+    for passes in 1.. {
+        let (mut fit, _) = fit_counts_answer(measurement, calibration, None, open)?;
+        let (used, _) = time_counts_per_pixel(&bins, open);
+        let (now, _) = time_counts_per_pixel(&bins, fit.time_background);
+        let mut spread = 0.0;
+        for (r, region) in fit.regions.iter().zip(&measurement.regions) {
+            for (k, &mu) in r.predicted[0]
+                .iter()
+                .enumerate()
+                .filter(|(_, mu)| **mu > 0.0)
+            {
+                let live = region.open_live.as_ref().map_or(1.0, |live| live[k]);
+                spread += (live * region.pixels * (now[k] - used[k])).powi(2) / mu;
+            }
+        }
+        if !fit.converged || spread <= BOUND || passes == MOST_PASSES {
+            fit.converged &= spread <= BOUND;
+            return Ok(fit);
+        }
+        open = fit.time_background;
+    }
+    unreachable!("the passes end at MOST_PASSES")
+}
+
+pub(crate) fn starting_time_background(
+    measurement: &Measurement,
+) -> Result<[f64; 3], PipelineError> {
+    let mut numbers = [0.0; 3];
+    for (term, number) in numbers.iter_mut().enumerate() {
+        let (value, name, range, allowed) =
+            quantity(measurement, Role::TimeBackground(term)).expect("a quantity");
+        *number = value.parameter(name, range, &allowed)?.value;
+    }
+    Ok(numbers)
 }
 
 pub(crate) struct Starts {
@@ -535,13 +574,6 @@ pub(crate) fn checked<'a>(
             "the pixels of region {r} must be finite and positive, got {}",
             region.pixels
         ));
-    }
-    if measurement.time_background[1] == Value::Known(0.0)
-        && !matches!(measurement.time_background[2], Value::Known(_))
-    {
-        return invalid(
-            "the time background's τ cannot be fitted while its A is known to be 0".into(),
-        );
     }
     for (r, material) in materials() {
         if material.isotopes.is_empty() {
@@ -929,6 +961,7 @@ pub(crate) fn fit_counts_answer(
     measurement: &Measurement,
     calibration: &Calibration,
     starts: Option<&Starts>,
+    open_time_background: [f64; 3],
 ) -> Result<(CountsFit, Answer), PipelineError> {
     let Measurement {
         time_edges_us,
@@ -986,13 +1019,8 @@ pub(crate) fn fit_counts_answer(
         live.extend(checked().map_err(|e| in_region(r, e))?.concat());
     }
 
-    let mut time_start = [0.0; 3];
-    for (term, number) in time_start.iter_mut().enumerate() {
-        let (value, name, range, allowed) =
-            quantity(measurement, Role::TimeBackground(term)).expect("a quantity");
-        *number = value.parameter(name, range, &allowed)?.value;
-    }
-    let (per_pixel, _) = time_counts_per_pixel(&starts_and_widths_us(time_edges_us), time_start);
+    let (per_pixel, _) =
+        time_counts_per_pixel(&starts_and_widths_us(time_edges_us), open_time_background);
     let opens: Vec<BeamStart> = match starts {
         Some(starts) => starts.beams.clone(),
         None => regions
@@ -2066,12 +2094,12 @@ fn time_counts_per_pixel(
     let mut slopes: [Vec<f64>; 3] = std::array::from_fn(|_| Vec::with_capacity(bins));
     for &(start, width) in starts_and_widths_us {
         let decay = (-start / tau).exp();
+        let after = (-(start + width) / tau).exp();
         let fraction = -(-width / tau).exp_m1();
         counts.push(c * width + a * tau * decay * fraction);
         slopes[0].push(width);
         slopes[1].push(tau * decay * fraction);
-        slopes[2]
-            .push(a * decay * (fraction + (start * fraction - width * (1.0 - fraction)) / tau));
+        slopes[2].push(a * (decay * fraction + (decay * start * fraction - after * width) / tau));
     }
     (counts, slopes)
 }
@@ -2470,6 +2498,9 @@ mod tests {
         for channel_fwhm_us in [None, Some(0.35)] {
             jacobian_against_central_differences(&grid(channel_fwhm_us));
         }
+        let bins = starts_and_widths_us(&[350.0, 351.0, 400.0, 470.0]);
+        let (_, slopes) = time_counts_per_pixel(&bins, [1.0, 2.0, f64::MIN_POSITIVE]);
+        assert!(slopes.iter().flatten().all(|s| s.is_finite()), "{slopes:?}");
     }
 
     fn jacobian_against_central_differences(grid: &Arc<FlightTimeGrid>) {
@@ -2654,7 +2685,8 @@ mod tests {
                 prior: None,
             },
         };
-        let (fit, answer) = fit_counts_answer(&measurement, &calibration, None).expect("fit");
+        let open = starting_time_background(&measurement).expect("numbers");
+        let (fit, answer) = fit_counts_answer(&measurement, &calibration, None, open).expect("fit");
         assert!(fit.converged);
         let covariance = fit.covariance.as_ref().expect("covariance");
         let fitted: Vec<Role> = quantities(&measurement, &calibration)
@@ -2742,7 +2774,8 @@ mod tests {
             bound: BOUND,
             shared_leverage: Some(vec![leverage]),
         };
-        let (region, _) = fit_counts_answer(&alone, &held, Some(&starts)).expect("fit");
+        let open = starting_time_background(&alone).expect("numbers");
+        let (region, _) = fit_counts_answer(&alone, &held, Some(&starts), open).expect("fit");
         let [Some(phi), Some(expected)] =
             [&region.regions[0], joined].map(|fit| fit.overdispersion[1])
         else {

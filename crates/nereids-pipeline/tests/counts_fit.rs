@@ -382,24 +382,25 @@ fn the_time_background_is_in_both_runs_of_every_region_by_its_pixels_and_gamma_t
         }
     }
 
-    let starts = [
-        Value::Fitted(0.5 * numbers[0]),
-        Value::Fitted(2.0 * numbers[1]),
-    ];
     let free = measurement(
-        [starts[0], starts[1], Value::Known(numbers[2])],
+        std::array::from_fn(|i| Value::Fitted([0.5, 2.0, 0.7][i] * numbers[i])),
         Value::Fitted(0.5),
     );
     let fit = fit_counts(&free, &calibration(&setup)).expect("fit");
     assert!(fit.converged);
+    for region in &fit.regions {
+        assert_eq!(region.beam.intervals(), 1);
+        assert_eq!(region.overdispersion[0], Some(1.0));
+    }
     let estimates = [
         fit.regions[0].gamma_transmission,
         fit.time_background[0],
         fit.time_background[1],
+        fit.time_background[2],
     ];
     for (i, (x, t)) in estimates
         .iter()
-        .zip([gammas[0], numbers[0], numbers[1]])
+        .zip([gammas[0], numbers[0], numbers[1], numbers[2]])
         .enumerate()
     {
         let pull = (x - t) / error_bar(&fit, i);
@@ -408,20 +409,10 @@ fn the_time_background_is_in_both_runs_of_every_region_by_its_pixels_and_gamma_t
 
     let mut empty = known.clone();
     empty.regions[1].pixels = 0.0;
-    let undetermined = measurement(
-        [
-            Value::Known(numbers[0]),
-            Value::Known(0.0),
-            Value::Fitted(10.0),
-        ],
-        Value::Known(gammas[0]),
-    );
-    for refused in [empty, undetermined] {
-        assert!(matches!(
-            fit_counts(&refused, &calibration(&setup)),
-            Err(PipelineError::InvalidParameter(_))
-        ));
-    }
+    assert!(matches!(
+        fit_counts(&empty, &calibration(&setup)),
+        Err(PipelineError::InvalidParameter(_))
+    ));
 }
 
 #[test]

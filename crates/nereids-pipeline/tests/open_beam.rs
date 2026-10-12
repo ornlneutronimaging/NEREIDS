@@ -351,6 +351,21 @@ fn counts_that_are_not_an_open_beam_are_refused() {
         live(1.0, counts.len() - 1),
         Err(PipelineError::ShapeMismatch(_))
     ));
+    let known = |count: f64, bins: usize| {
+        let mut known = vec![0.0; bins];
+        known[5] = count;
+        open_beam::fit_open_beam(&edges(), &counts, &calibration(pulse), None, Some(&known))
+    };
+    assert!(matches!(
+        known(0.0, counts.len() - 1),
+        Err(PipelineError::ShapeMismatch(_))
+    ));
+    for count in [-1.0, f64::NAN] {
+        assert!(matches!(
+            known(count, counts.len()),
+            Err(PipelineError::InvalidParameter(_))
+        ));
+    }
     for fraction in [0.0, 1.5, f64::NAN] {
         assert!(matches!(
             live(fraction, counts.len()),
