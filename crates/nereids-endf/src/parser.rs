@@ -428,14 +428,14 @@ pub fn parse_resonance_covariance(
             .all(|(a, b)| (a - b).abs() <= FILE32_TOLERANCE * a.abs())
     };
     let pos = &mut 0;
-    let head = parse_cont(&lines, pos)?;
-    if head.c1 != f64::from(data.za) || head.n1 != 1 {
+    let (head, isotope) = (parse_cont(&lines, pos)?, parse_cont(&lines, pos)?);
+    if [head.c1, isotope.c1] != [f64::from(data.za); 2] || head.n1 != 1 {
         return Err(EndfParseError::UnsupportedFormat(format!(
-            "File 32 is read for the one isotope `data` holds, ZA={}; got ZA={}, NIS={}",
-            data.za, head.c1, head.n1
+            "File 32 is read for the one isotope `data` holds, ZA={}; got ZA={}, ZAI={}, NIS={}",
+            data.za, head.c1, isotope.c1, head.n1
         )));
     }
-    let ranges = checked_count(parse_cont(&lines, pos)?.n1, "NER")?;
+    let ranges = checked_count(isotope.n1, "NER")?;
     let (mut resonances, mut entries) = (Vec::new(), Vec::new());
     for r in 0..ranges {
         let range = parse_cont(&lines, pos)?;
@@ -2915,6 +2915,7 @@ mod tests {
                 (17, 3, "6.164143-2"),
             ]),
             edited(10, 0, "7.318200+4"),
+            edited(11, 0, "7.318200+4"),
             edited(10, 4, "2"),
             edits(&[(10, 4, "2"), (12, 2, "2"), (12, 3, "1")]),
             edited(12, 2, "2"),
