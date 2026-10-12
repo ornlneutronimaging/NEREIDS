@@ -323,9 +323,17 @@ pub(crate) fn open_beam_with_intervals(
                     if q < best.1 { (i, q) } else { best }
                 },
             );
-    let chosen = intervals
-        .and_then(|k| ladder.iter().position(|c| c.beam.intervals() == k))
-        .unwrap_or(chosen);
+    let chosen = match intervals {
+        None => chosen,
+        Some(k) => ladder
+            .iter()
+            .position(|candidate| candidate.beam.intervals() == k)
+            .ok_or_else(|| {
+                FittingError::EvaluationFailed(format!(
+                    "the open-beam fit does not converge with {k} intervals"
+                ))
+            })?,
+    };
     let at_limit = chosen + 1 == ladder.len();
     let Candidate { beam, fit } = ladder.swap_remove(chosen);
     Ok(OpenBeamFit {

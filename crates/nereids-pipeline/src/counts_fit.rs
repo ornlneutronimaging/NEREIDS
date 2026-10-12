@@ -193,7 +193,8 @@ pub struct CountsFit {
     /// The square of the pulse's triangle FWHM, `h²` in µs²: the known one, or
     /// the fitted one.
     pub fwhm_squared_us2: f64,
-    /// The time background's `[C, A, τ]`, each the known or the fitted one.
+    /// The time background's `[C, A, τ]`, each the known or the fitted one; a
+    /// fitted `τ` is undetermined when `A` ends at 0.
     pub time_background: [f64; 3],
     /// Covariance of the fitted quantities among, in this order, each region's
     /// densities, in the order given, and temperature, region by region; the
@@ -456,8 +457,9 @@ pub struct RegionFit {
 /// any region;
 /// [`PipelineError::FlightTimeGrid`] for the grid's refusals at the starting
 /// `t0`, flight path and pulse or the fitted ones of any pass, including more
-/// points than it allows; [`PipelineError::Fitting`] if the fitter fails, the
-/// cross sections fail at the start or, for a listed resonance parameter
+/// points than it allows; [`PipelineError::Fitting`] if the fitter fails, a
+/// region's open-beam fit does not converge with the beam intervals it keeps,
+/// the cross sections fail at the start or, for a listed resonance parameter
 /// shifted, at the fit, or a decomposition of the pulse's
 /// consistency test fails; a failure at a trial temperature is a rejected
 /// step.
@@ -474,6 +476,14 @@ pub fn fit_counts(
             "no region of the measurement holds a material to fit".into(),
         ));
     }
+    fit_settled(measurement, calibration, MOST_PASSES)
+}
+
+fn fit_settled(
+    measurement: &Measurement,
+    calibration: &Calibration,
+    most_passes: usize,
+) -> Result<CountsFit, PipelineError> {
     let bins = starts_and_widths_us(&measurement.time_edges_us);
     let mut open = starting_time_background(measurement)?;
     let mut intervals: Option<Vec<usize>> = None;
@@ -496,7 +506,7 @@ pub fn fit_counts(
                 spread += (live * region.pixels * (now[k] - used[k])).powi(2) / mu;
             }
         }
-        if !fit.converged || spread <= BOUND || passes == MOST_PASSES {
+        if !fit.converged || spread <= BOUND || passes == most_passes {
             if spread > BOUND {
                 fit.converged = false;
                 fit.covariance = None;
@@ -512,7 +522,7 @@ pub fn fit_counts(
         }
         open = fit.time_background;
     }
-    unreachable!("the passes end at MOST_PASSES")
+    unreachable!("the passes end at most_passes")
 }
 
 pub(crate) fn starting_time_background(
@@ -2849,6 +2859,18 @@ mod tests {
             .map(|(i, j)| 0.5 * gradient[i] * joint[(i, j)] * gradient[j])
             .sum();
         assert!(decrement <= 1e-2, "{decrement}");
+
+        let drifting = Measurement {
+            time_background: [Value::Fitted(50.0), Value::Known(0.0), Value::Known(1.0)],
+            ..measurement
+        };
+        for (most_passes, settled) in [(1, false), (2, true)] {
+            let fit = fit_settled(&drifting, &calibration, most_passes).expect("fit");
+            assert_eq!(fit.converged, settled);
+            assert_eq!(fit.covariance.is_some(), settled);
+            assert_eq!(fit.unbounded.is_some(), settled);
+            assert_eq!(fit.measured_pulls.is_some(), settled);
+        }
     }
 
     #[test]

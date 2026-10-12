@@ -349,7 +349,7 @@ fn the_time_background_is_in_both_runs_of_every_region_by_its_pixels_and_gamma_t
                        sample: fn(f64) -> Value| Measurement {
         time_edges_us: setup.edges.clone(),
         charge_ratio: CHARGE_RATIO,
-        normalization: Value::Known(a),
+        normalization: sample(a),
         time_background: numbers,
         regions: (0..2)
             .map(|r| Region {
@@ -357,7 +357,15 @@ fn the_time_background_is_in_both_runs_of_every_region_by_its_pixels_and_gamma_t
                 sample_counts: rounded(&runs[r][1].0),
                 open_live: Some(runs[r][0].1.clone()),
                 sample_live: Some(runs[r][1].1.clone()),
-                background: [Value::Known(0.0); 3],
+                background: [
+                    if r == 0 {
+                        sample(0.0)
+                    } else {
+                        Value::Known(0.0)
+                    },
+                    Value::Known(0.0),
+                    Value::Known(0.0),
+                ],
                 pixels: pixels[r],
                 gamma_transmission: if r == 0 {
                     gamma
@@ -404,14 +412,18 @@ fn the_time_background_is_in_both_runs_of_every_region_by_its_pixels_and_gamma_t
     }
     let sample = &fit.regions[0];
     let estimates = sample.densities.iter().chain(&sample.temperature_k).chain(
-        [&sample.gamma_transmission]
-            .into_iter()
-            .chain(&fit.time_background),
+        [
+            &fit.normalization,
+            &sample.background[0],
+            &sample.gamma_transmission,
+        ]
+        .into_iter()
+        .chain(&fit.time_background),
     );
     let truths = lines
         .iter()
         .map(|(_, n)| *n)
-        .chain([TEMPERATURE_K, gammas[0]])
+        .chain([TEMPERATURE_K, a, 0.0, gammas[0]])
         .chain(numbers);
     for (i, (x, t)) in estimates.zip(truths).enumerate() {
         let pull = (x - t) / error_bar(&fit, i);
@@ -436,35 +448,41 @@ fn the_time_background_is_in_both_runs_of_every_region_by_its_pixels_and_gamma_t
             assert_eq!(region.beam.intervals(), 1);
             assert_eq!(region.overdispersion[0], Some(1.0));
         }
-        (0..4).map(|i| error_bar(&fit, i)).collect::<Vec<f64>>()
+        let sample = &fit.regions[0];
+        let values: Vec<f64> = sample
+            .densities
+            .iter()
+            .chain(&sample.temperature_k)
+            .copied()
+            .collect();
+        (
+            values,
+            (0..4).map(|i| error_bar(&fit, i)).collect::<Vec<f64>>(),
+        )
     });
-    for (near, far) in fits[0].iter().zip(&fits[1]) {
-        assert!((far / near - 1.0).abs() <= 1e-2, "{fits:?}");
+    let [(near, sd), (far, _)] = &fits;
+    for (i, (x, y)) in near.iter().zip(far).enumerate() {
+        assert!((x - y).abs() <= BOUND.sqrt() * sd[i], "{i}: {x} vs {y}");
     }
 
     let mut empty = known.clone();
     empty.regions[1].pixels = 0.0;
     let refused = [
-        [-1.0, 0.0, 1.0],
-        [0.0, -1.0, 1.0],
-        [0.0, 0.0, 0.0],
-        [f64::NAN, 0.0, 1.0],
+        ([-1.0, 0.0, 1.0], 1.0),
+        ([0.0, -1.0, 1.0], 1.0),
+        ([0.0, 0.0, 0.0], 1.0),
+        ([f64::NAN, 0.0, 1.0], 1.0),
+        (numbers, 1.5),
     ]
-    .map(|bad| {
+    .map(|(bad, gamma)| {
         measurement(
             &runs,
             bad.map(Value::Known),
-            Value::Known(1.0),
+            Value::Known(gamma),
             Value::Known,
         )
     });
-    let outside = measurement(
-        &runs,
-        numbers.map(Value::Known),
-        Value::Known(1.5),
-        Value::Known,
-    );
-    for m in refused.iter().chain([&empty, &outside]) {
+    for m in refused.iter().chain([&empty]) {
         assert!(matches!(
             fit_counts(m, &calibration(&setup)),
             Err(PipelineError::InvalidParameter(_))
