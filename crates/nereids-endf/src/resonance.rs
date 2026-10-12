@@ -318,8 +318,8 @@ pub struct Resonance {
 }
 
 /// The covariance of the energy, neutron width and capture width, in that
-/// order, of each listed resonance of one evaluation: the block of its File 32
-/// (LCOMP=1) over those parameters.
+/// order, of each listed resonance of one evaluation: its File 32 (LCOMP=1)
+/// covariance, summed over the blocks that list it, over those parameters.
 #[derive(Clone, PartialEq)]
 pub struct ResonanceCovariance {
     pub resonances: Vec<[usize; 3]>,

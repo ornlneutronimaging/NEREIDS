@@ -4,6 +4,7 @@ use std::ops::Range;
 use std::sync::{Arc, LazyLock};
 
 use ndarray::{Array2, Array3, s};
+use nereids_endf::parser::{parse_endf_file2, parse_resonance_covariance};
 use nereids_endf::resonance::test_support::{synthetic_isotope, synthetic_isotope_multi};
 use nereids_endf::resonance::{ResonanceCovariance, ResonanceData};
 use nereids_endf::retrieval::EndfLibrary;
@@ -1378,12 +1379,16 @@ fn the_covariance_is_the_inverse_of_the_information_in_the_counts_and_measuremen
 
 fn covariance_against_information(temperature: Value, noisy: bool) {
     let setup = standard();
-    let truth = [
-        (hafnium_like(20.0), 3.0 / 7805.1),
-        (synthetic_isotope(74, 182, 20.3, 0.01, 0.06), 1.5 / 7805.1),
-    ];
+    let text = std::fs::read_to_string(
+        std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("../../tests/data/endf/Ta-181-file32.endf"),
+    )
+    .expect("fixture");
+    let tantalum = parse_endf_file2(&text).expect("File 2");
+    let truth = [(hafnium_like(20.0), 3.0 / 7805.1), (tantalum, 1.5 / 7805.1)];
     let counts = with_background(&setup, &beam(1.0e6), &truth, TEMPERATURE_K, TERMS);
     let mut m = recorded(&setup, counts, &truth);
+    m.material_mut().library = EndfLibrary::EndfB8_1;
     m.material_mut().temperature_k = temperature;
     m.normalization = Value::Fitted(TERMS[0]);
     m.regions[0].background[0] = Value::Fitted(TERMS[1]);
@@ -1406,10 +1411,23 @@ fn covariance_against_information(temperature: Value, noisy: bool) {
             value: TERMS[1],
             sd: b0_sd,
         };
-        m.material_mut().covariances = vec![
-            (0, synthetic_covariance(&truth[0].0, 0.01)),
-            (1, synthetic_covariance(&truth[1].0, 0.0)),
-        ];
+        let mut tantalum = parse_resonance_covariance(&text, &truth[1].0, 22.0..=24.0)
+            .expect("File 32")
+            .expect("listed");
+        let widths = |p: usize| {
+            [1, 4]
+                .contains(&p)
+                .then(|| 6.0 * tantalum.covariance[7 * p].sqrt())
+        };
+        let coupled: Vec<f64> = (0..36)
+            .map(|k| {
+                tantalum.covariance[k]
+                    + widths(k / 6).zip(widths(k % 6)).map_or(0.0, |(a, b)| a * b)
+            })
+            .collect();
+        tantalum.covariance = coupled.into();
+        m.material_mut().covariances =
+            vec![(0, synthetic_covariance(&truth[0].0, 0.0)), (1, tantalum)];
         let temperature = match temperature {
             Value::Measured { value, sd } => Some((truth.len(), value, sd)),
             _ => None,
@@ -1576,17 +1594,18 @@ fn covariance_against_information(temperature: Value, noisy: bool) {
     let conditional = inverse(information);
     let mut oracle = conditional.clone();
     let carried = m.material_mut().covariances.clone();
-    let listed: Vec<(usize, usize)> = carried
+    let listed: Vec<(usize, &ResonanceCovariance, usize)> = carried
         .iter()
-        .flat_map(|&(i, _)| (0..3).map(move |q| (i, q)))
+        .flat_map(|(i, c)| (0..3 * c.resonances.len()).map(move |q| (*i, c, q)))
         .collect();
     let cross: Vec<Vec<f64>> = listed
         .iter()
-        .map(|&(i, q)| {
+        .map(|&(i, block, q)| {
             let shifted = |sign: f64| {
                 let mut sample = fitted.clone();
-                let r = &mut sample[i].0.ranges[0].l_groups[0].resonances[0];
-                let value = match q {
+                let [a, b, c] = block.resonances[q / 3];
+                let r = &mut sample[i].0.ranges[a].l_groups[b].resonances[c];
+                let value = match q % 3 {
                     0 => &mut r.energy,
                     1 => &mut r.gn,
                     _ => &mut r.gg,
@@ -1622,10 +1641,9 @@ fn covariance_against_information(temperature: Value, noisy: bool) {
         })
         .collect();
     let prior = |a: usize, b: usize| {
-        let ((i, p), (j, q)) = (listed[a], listed[b]);
-        let block = &carried.iter().find(|(k, _)| *k == i).expect("listed").1;
+        let ((i, block, p), (j, _, q)) = (listed[a], listed[b]);
         if i == j {
-            block.covariance[3 * p + q]
+            block.covariance[3 * block.resonances.len() * p + q]
         } else {
             0.0
         }
@@ -1647,6 +1665,20 @@ fn covariance_against_information(temperature: Value, noisy: bool) {
                 .sum::<f64>();
         }
     }
+    const TOLERANCE: f64 = 1e-4;
+    let tantalum = coefficients + 1;
+    let across: f64 = (0..listed.len())
+        .flat_map(|a| (0..listed.len()).map(move |b| (a, b)))
+        .filter(|&(a, b)| {
+            listed[a].0 == 1 && listed[b].0 == 1 && listed[a].2 / 3 != listed[b].2 / 3
+        })
+        .map(|(a, b)| sensitivity[tantalum][a] * prior(a, b) * sensitivity[tantalum][b])
+        .sum();
+    assert!(
+        !noisy || across.abs() > 10.0 * TOLERANCE * oracle[tantalum][tantalum],
+        "{across} vs {}",
+        oracle[tantalum][tantalum]
+    );
     let covariance = fit.covariance.expect("covariance");
     for i in 0..quantities {
         for j in 0..quantities {
@@ -1655,7 +1687,7 @@ fn covariance_against_information(temperature: Value, noisy: bool) {
                 * oracle[coefficients + j][coefficients + j])
                 .sqrt();
             assert!(
-                (covariance.get(i, j) - expected).abs() <= 1e-2 * scale,
+                (covariance.get(i, j) - expected).abs() <= TOLERANCE * scale,
                 "{temperature:?} {i}, {j}: {} vs {expected}",
                 covariance.get(i, j)
             );
