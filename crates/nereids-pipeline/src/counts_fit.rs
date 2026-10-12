@@ -1,8 +1,8 @@
 //! The areal densities and temperatures of the materials in one or more
 //! regions of the detector, each region's background and gamma transmission,
 //! the sample run's normalization, the time background, the timing offset,
-//! the flight path and the pulse's numbers, fitted to the counts of an open-beam run and a sample run recorded in the
-//! same time bins.
+//! the flight path and the pulse's numbers, fitted to the counts of an
+//! open-beam run and a sample run recorded in the same time bins.
 
 use std::borrow::Cow;
 use std::cell::RefCell;
@@ -144,8 +144,8 @@ pub struct Region {
     pub background: [Value; 3],
     /// The region's area in pixels, finite and positive.
     pub pixels: f64,
-    /// The fraction of the time background the region's material passes in the
-    /// sample run, within 0–1.
+    /// The fraction of the time background that reaches the region's pixels in
+    /// the sample run through what is in front of them, within 0–1.
     pub gamma_transmission: Value,
     /// The material the beam crosses in the region; `None` for nothing, which
     /// transmits every neutron.
@@ -199,8 +199,8 @@ pub struct CountsFit {
     /// densities, in the order given, and temperature, region by region; the
     /// normalization; each region's `b0`, `b1` and `b2`, region by region;
     /// each region's gamma transmission, region by region; the time
-    /// background's `C`, `A` and `τ`; `t0`; the flight path; `α₀`, `α₁`, `β₀`, `β₁`, `R` and `h²`: the inverse
-    /// of the information at the fit, each run's expected information over its
+    /// background's `C`, `A` and `τ`; `t0`; the flight path; `α₀`, `α₁`,
+    /// `β₀`, `β₁`, `R` and `h²`: the inverse of the information at the fit, each run's expected information over its
     /// overdispersion plus `1/sd²` for each measured quantity and `C⁻¹` over
     /// the pulse numbers a calibration's
     /// [`Pulse::prior`](crate::open_beam::Pulse::prior) covers.  The row and
@@ -235,8 +235,8 @@ pub struct CountsFit {
     /// the sample runs' [`RegionFit::excluded_bins`].
     pub deviance: f64,
     /// Whether the fitter converged, the open-beam fits' time background
-    /// settled at the fitted one, every sample run's overdispersion settled, the grid met its rule at the fitted temperatures, its flight
-    /// times cover the fitted `t0`, flight path and pulse, and the bins left
+    /// settled at the fitted one, every sample run's overdispersion settled,
+    /// the grid met its rule at the fitted temperatures, its flight times cover the fitted `t0`, flight path and pulse, and the bins left
     /// out at those are the ones the fit left out.
     pub converged: bool,
     /// For each measured quantity, in the covariance's order, its value
@@ -346,12 +346,12 @@ pub struct RegionFit {
 /// gammas of each proton pulse and their tail, at the time `t` of the edges'
 /// clock, `t₁` the first edge: it is not folded with the pulse, and the sample
 /// run scales it with `c_q·a`, which correct the charge ratio and an
-/// efficiency change alike in every pixel, and the fraction `γ_r` the
-/// region's material passes, `p_r` the region's pixels.  Counts that follow
-/// the run time instead, such as room background, are not modelled.  In the
-/// ratio it fills each dip by `g·(γ_r − T)`, `g` its share of the open-beam
-/// counts; SAMMY's backgrounds in time (`Bgfrpi`) are added to the
-/// transmission instead.
+/// efficiency change alike in every pixel, and the fraction `γ_r` that reaches
+/// the region's pixels, `p_r` the region's pixels.  Counts that follow
+/// the run time instead, such as room background, are not modelled.  It turns
+/// the ratio `R` of the neutrons alone into `R + g·(γ_r − R)`, `g` its share of
+/// the open-beam counts; SAMMY's backgrounds in time (`Bgfrpi`) are added to
+/// the transmission instead.
 ///
 /// The regions share the normalization, the run pair's scale; and `t0`, the
 /// flight path and the pulse, which one clock, flight path and moderator set
@@ -473,7 +473,8 @@ pub fn fit_counts(
     let bins = starts_and_widths_us(&measurement.time_edges_us);
     let mut open = starting_time_background(measurement)?;
     for passes in 1.. {
-        let (mut fit, _) = fit_counts_answer(measurement, calibration, None, open)?;
+        let (mut fit, _) =
+            fit_counts_answer(measurement, calibration, BeamStarts::OpenFitsAt(open))?;
         let (used, _) = time_counts_per_pixel(&bins, open);
         let (now, _) = time_counts_per_pixel(&bins, fit.time_background);
         let mut spread = 0.0;
@@ -488,7 +489,13 @@ pub fn fit_counts(
             }
         }
         if !fit.converged || spread <= BOUND || passes == MOST_PASSES {
-            fit.converged &= spread <= BOUND;
+            if spread > BOUND {
+                fit.converged = false;
+                fit.covariance = None;
+                fit.unbounded = None;
+                fit.measured_pulls = None;
+                fit.pulse_consistency = None;
+            }
             return Ok(fit);
         }
         open = fit.time_background;
@@ -957,12 +964,20 @@ fn in_span(
         .collect()
 }
 
+pub(crate) enum BeamStarts<'a> {
+    Given(&'a Starts),
+    OpenFitsAt([f64; 3]),
+}
+
 pub(crate) fn fit_counts_answer(
     measurement: &Measurement,
     calibration: &Calibration,
-    starts: Option<&Starts>,
-    open_time_background: [f64; 3],
+    beam_starts: BeamStarts<'_>,
 ) -> Result<(CountsFit, Answer), PipelineError> {
+    let starts = match beam_starts {
+        BeamStarts::Given(starts) => Some(starts),
+        BeamStarts::OpenFitsAt(_) => None,
+    };
     let Measurement {
         time_edges_us,
         charge_ratio,
@@ -1019,14 +1034,14 @@ pub(crate) fn fit_counts_answer(
         live.extend(checked().map_err(|e| in_region(r, e))?.concat());
     }
 
-    let (per_pixel, _) =
-        time_counts_per_pixel(&starts_and_widths_us(time_edges_us), open_time_background);
-    let opens: Vec<BeamStart> = match starts {
-        Some(starts) => starts.beams.clone(),
-        None => regions
+    let opens: Vec<BeamStart> = match beam_starts {
+        BeamStarts::Given(starts) => starts.beams.clone(),
+        BeamStarts::OpenFitsAt(numbers) => regions
             .iter()
             .enumerate()
             .map(|(r, region)| {
+                let (per_pixel, _) =
+                    time_counts_per_pixel(&starts_and_widths_us(time_edges_us), numbers);
                 let known: Vec<f64> = per_pixel.iter().map(|g| region.pixels * g).collect();
                 let open = fit_open_beam(
                     time_edges_us,
@@ -2096,9 +2111,10 @@ fn time_counts_per_pixel(
         let decay = (-start / tau).exp();
         let after = (-(start + width) / tau).exp();
         let fraction = -(-width / tau).exp_m1();
-        counts.push(c * width + a * tau * decay * fraction);
+        let integral = decay * (tau * fraction);
+        counts.push(c * width + a * integral);
         slopes[0].push(width);
-        slopes[1].push(tau * decay * fraction);
+        slopes[1].push(integral);
         slopes[2].push(a * (decay * fraction + (decay * start * fraction - after * width) / tau));
     }
     (counts, slopes)
@@ -2501,6 +2517,10 @@ mod tests {
         let bins = starts_and_widths_us(&[350.0, 351.0, 400.0, 470.0]);
         let (_, slopes) = time_counts_per_pixel(&bins, [1.0, 2.0, f64::MIN_POSITIVE]);
         assert!(slopes.iter().flatten().all(|s| s.is_finite()), "{slopes:?}");
+        let (counts, _) = time_counts_per_pixel(&bins, [1.0, 2.0, f64::MAX]);
+        for (count, (_, width)) in counts.iter().zip(&bins) {
+            assert!((count / (3.0 * width) - 1.0).abs() <= 1e-12, "{counts:?}");
+        }
     }
 
     fn jacobian_against_central_differences(grid: &Arc<FlightTimeGrid>) {
@@ -2686,7 +2706,9 @@ mod tests {
             },
         };
         let open = starting_time_background(&measurement).expect("numbers");
-        let (fit, answer) = fit_counts_answer(&measurement, &calibration, None, open).expect("fit");
+        let (fit, answer) =
+            fit_counts_answer(&measurement, &calibration, BeamStarts::OpenFitsAt(open))
+                .expect("fit");
         assert!(fit.converged);
         let covariance = fit.covariance.as_ref().expect("covariance");
         let fitted: Vec<Role> = quantities(&measurement, &calibration)
@@ -2774,8 +2796,8 @@ mod tests {
             bound: BOUND,
             shared_leverage: Some(vec![leverage]),
         };
-        let open = starting_time_background(&alone).expect("numbers");
-        let (region, _) = fit_counts_answer(&alone, &held, Some(&starts), open).expect("fit");
+        let (region, _) =
+            fit_counts_answer(&alone, &held, BeamStarts::Given(&starts)).expect("fit");
         let [Some(phi), Some(expected)] =
             [&region.regions[0], joined].map(|fit| fit.overdispersion[1])
         else {

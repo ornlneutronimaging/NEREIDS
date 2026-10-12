@@ -340,7 +340,7 @@ fn the_time_background_is_in_both_runs_of_every_region_by_its_pixels_and_gamma_t
             })
         })
         .collect();
-    let measurement = |numbers: [Value; 3], gamma: Value| Measurement {
+    let measurement = |numbers: [Value; 3], gamma: Value, sample: fn(f64) -> Value| Measurement {
         time_edges_us: setup.edges.clone(),
         charge_ratio: CHARGE_RATIO,
         normalization: Value::Known(a),
@@ -361,16 +361,17 @@ fn the_time_background_is_in_both_runs_of_every_region_by_its_pixels_and_gamma_t
                 material: (r == 0).then(|| Material {
                     covariances: Vec::new(),
                     library: EndfLibrary::EndfB8_0,
-                    isotopes: lines
-                        .iter()
-                        .map(|(d, n)| (d.clone(), Value::Known(*n)))
-                        .collect(),
-                    temperature_k: Value::Known(TEMPERATURE_K),
+                    isotopes: lines.iter().map(|(d, n)| (d.clone(), sample(*n))).collect(),
+                    temperature_k: sample(TEMPERATURE_K),
                 }),
             })
             .collect(),
     };
-    let known = measurement(numbers.map(Value::Known), Value::Known(gammas[0]));
+    let known = measurement(
+        numbers.map(Value::Known),
+        Value::Known(gammas[0]),
+        Value::Known,
+    );
     let fit = fit_counts(&known, &calibration(&setup)).expect("fit");
     assert!(fit.converged);
     for (r, region) in fit.regions.iter().enumerate() {
@@ -385,6 +386,7 @@ fn the_time_background_is_in_both_runs_of_every_region_by_its_pixels_and_gamma_t
     let free = measurement(
         std::array::from_fn(|i| Value::Fitted([0.5, 2.0, 0.7][i] * numbers[i])),
         Value::Fitted(0.5),
+        |x| Value::Fitted(1.1 * x),
     );
     let fit = fit_counts(&free, &calibration(&setup)).expect("fit");
     assert!(fit.converged);
@@ -392,17 +394,18 @@ fn the_time_background_is_in_both_runs_of_every_region_by_its_pixels_and_gamma_t
         assert_eq!(region.beam.intervals(), 1);
         assert_eq!(region.overdispersion[0], Some(1.0));
     }
-    let estimates = [
-        fit.regions[0].gamma_transmission,
-        fit.time_background[0],
-        fit.time_background[1],
-        fit.time_background[2],
-    ];
-    for (i, (x, t)) in estimates
+    let sample = &fit.regions[0];
+    let estimates = sample.densities.iter().chain(&sample.temperature_k).chain(
+        [&sample.gamma_transmission]
+            .into_iter()
+            .chain(&fit.time_background),
+    );
+    let truths = lines
         .iter()
-        .zip([gammas[0], numbers[0], numbers[1], numbers[2]])
-        .enumerate()
-    {
+        .map(|(_, n)| *n)
+        .chain([TEMPERATURE_K, gammas[0]])
+        .chain(numbers);
+    for (i, (x, t)) in estimates.zip(truths).enumerate() {
         let pull = (x - t) / error_bar(&fit, i);
         assert!(pull.abs() <= BOUND.sqrt(), "{i}: {x} vs {t}, pull {pull}");
     }
