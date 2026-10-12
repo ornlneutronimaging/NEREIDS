@@ -9,6 +9,7 @@ use std::cell::RefCell;
 use std::ops::{Range, RangeInclusive};
 use std::sync::Arc;
 
+use faer::linalg::solvers::DenseSolveCore;
 use faer::{Mat, Side};
 use nereids_endf::resonance::{ResonanceCovariance, ResonanceData};
 use nereids_endf::retrieval::EndfLibrary;
@@ -378,9 +379,9 @@ pub struct RegionFit {
 /// at some energy is outside the model and rejected; a fit driven there ends
 /// unconverged.  The open-beam fits that start the beams and weight the
 /// open-beam runs use the starting pulse and, at first, the time background's
-/// starting numbers; the fit is repeated with them at its fitted numbers,
-/// up to twenty times, until those change each region's open-beam counts by
-/// `Σ_k (ΔO_rk)²/O_rk` at most [`BOUND`], summed over the regions.
+/// starting numbers; the fit is repeated with them at its fitted numbers, at
+/// most twenty fits in all, until the fitted numbers move from those by
+/// `Δᵀ C⁻¹ Δ` at most [`BOUND`], `C` their covariance at the fit.
 ///
 /// The grid's first step is at most half the narrowest Doppler full width at
 /// half maximum, in flight time, of any resonance of any region inside its
@@ -470,26 +471,39 @@ pub fn fit_counts(
             "no region of the measurement holds a material to fit".into(),
         ));
     }
-    let bins = starts_and_widths_us(&measurement.time_edges_us);
+    let fitted: Vec<Role> = quantities(measurement, calibration)
+        .filter(|(_, value)| !matches!(value, Value::Known(_)))
+        .map(|(role, _)| role)
+        .collect();
     let mut open = starting_time_background(measurement)?;
     for passes in 1.. {
         let (mut fit, _) =
             fit_counts_answer(measurement, calibration, BeamStarts::OpenFitsAt(open))?;
-        let (used, _) = time_counts_per_pixel(&bins, open);
-        let (now, _) = time_counts_per_pixel(&bins, fit.time_background);
-        let mut spread = 0.0;
-        for (r, region) in fit.regions.iter().zip(&measurement.regions) {
-            for (k, &mu) in r.predicted[0]
-                .iter()
-                .enumerate()
-                .filter(|(_, mu)| **mu > 0.0)
-            {
-                let live = region.open_live.as_ref().map_or(1.0, |live| live[k]);
-                spread += (live * region.pixels * (now[k] - used[k])).powi(2) / mu;
-            }
-        }
-        if !fit.converged || spread <= BOUND || passes == MOST_PASSES {
-            if spread > BOUND {
+        let moved: Vec<(usize, f64)> = (0..3)
+            .filter_map(|i| {
+                let at = fitted.iter().position(|&r| r == Role::TimeBackground(i))?;
+                Some((at, fit.time_background[i] - open[i]))
+            })
+            .filter(|&(at, _)| {
+                fit.covariance
+                    .as_ref()
+                    .is_some_and(|c| c.get(at, at).is_finite())
+            })
+            .collect();
+        let shift = fit.covariance.as_ref().map_or(0.0, |covariance| {
+            let block = Mat::from_fn(moved.len(), moved.len(), |a, b| {
+                covariance.get(moved[a].0, moved[b].0)
+            });
+            block.llt(Side::Lower).map_or(f64::INFINITY, |llt| {
+                let inverse = llt.inverse();
+                (0..moved.len())
+                    .flat_map(|a| (0..moved.len()).map(move |b| (a, b)))
+                    .map(|(a, b)| moved[a].1 * inverse[(a, b)] * moved[b].1)
+                    .sum()
+            })
+        });
+        if !fit.converged || shift <= BOUND || passes == MOST_PASSES {
+            if shift > BOUND {
                 fit.converged = false;
                 fit.covariance = None;
                 fit.unbounded = None;
