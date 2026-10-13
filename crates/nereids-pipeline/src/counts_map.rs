@@ -327,7 +327,7 @@ impl CountsMap<'_> {
 /// between the runs alike in every pixel.  A region's counts are the sums
 /// over its pixels; each has its own beam and background.  The empty pixels
 /// pin the normalization when their `b0` is known.  The map has no time
-/// background ([`NO_TIME_BACKGROUND`](crate::counts_fit::NO_TIME_BACKGROUND)).
+/// background ([`NO_TIME_BACKGROUND`]).
 ///
 /// The fit is the joint one of [`fit_counts`](crate::counts_fit::fit_counts),
 /// found region by region.  With the shared quantities held, each region is
