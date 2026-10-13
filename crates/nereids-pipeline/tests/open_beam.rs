@@ -198,7 +198,7 @@ fn fit_open_beam(
     counts: &[f64],
     calibration: &Calibration,
 ) -> Result<OpenBeamFit, PipelineError> {
-    open_beam::fit_open_beam(edges, counts, calibration, None)
+    open_beam::fit_open_beam(edges, counts, calibration, None, None)
 }
 
 fn bin_centres() -> Vec<f64> {
@@ -216,8 +216,16 @@ fn predicted(grid: &FlightTimeGrid, beam: &dyn Fn(f64) -> f64) -> Vec<f64> {
 #[test]
 fn the_fitted_beam_is_the_beam_before_the_blur() {
     let beam = true_beam(1.0e6);
+    let known: Vec<f64> = bin_centres()
+        .iter()
+        .map(|u| 2.0e4 + 6.0e4 * (-(u - bin_centres()[0]) / 40.0).exp())
+        .collect();
     for (name, pulse) in pulses() {
-        let expected = simulated(&pulse, &beam);
+        let expected: Vec<f64> = simulated(&pulse, &beam)
+            .iter()
+            .zip(&known)
+            .map(|(mu, g)| mu + g)
+            .collect();
         let most = expected.iter().fold(0.0_f64, |m, &mu| m.max(mu));
         let live: Vec<f64> = expected
             .iter()
@@ -228,8 +236,14 @@ fn the_fitted_beam_is_the_beam_before_the_blur() {
             .zip(&live)
             .map(|(mu, l)| (l * mu).round())
             .collect();
-        let fit = open_beam::fit_open_beam(&edges(), &counts, &calibration(&pulse), Some(&live))
-            .expect(name);
+        let fit = open_beam::fit_open_beam(
+            &edges(),
+            &counts,
+            &calibration(&pulse),
+            Some(&live),
+            Some(&known),
+        )
+        .expect(name);
         assert!(fit.converged, "{name}");
         assert_eq!(fit.beam.intervals(), 1, "{name}");
         assert_eq!(fit.overdispersion, Some(1.0), "{name}");
@@ -331,12 +345,27 @@ fn counts_that_are_not_an_open_beam_are_refused() {
     let live = |fraction: f64, bins: usize| {
         let mut live = vec![1.0; bins];
         live[5] = fraction;
-        open_beam::fit_open_beam(&edges(), &counts, &calibration(pulse), Some(&live))
+        open_beam::fit_open_beam(&edges(), &counts, &calibration(pulse), Some(&live), None)
     };
     assert!(matches!(
         live(1.0, counts.len() - 1),
         Err(PipelineError::ShapeMismatch(_))
     ));
+    let known = |count: f64, bins: usize| {
+        let mut known = vec![0.0; bins];
+        known[5] = count;
+        open_beam::fit_open_beam(&edges(), &counts, &calibration(pulse), None, Some(&known))
+    };
+    assert!(matches!(
+        known(0.0, counts.len() - 1),
+        Err(PipelineError::ShapeMismatch(_))
+    ));
+    for count in [-1.0, f64::NAN] {
+        assert!(matches!(
+            known(count, counts.len()),
+            Err(PipelineError::InvalidParameter(_))
+        ));
+    }
     for fraction in [0.0, 1.5, f64::NAN] {
         assert!(matches!(
             live(fraction, counts.len()),

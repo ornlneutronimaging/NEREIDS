@@ -20,7 +20,8 @@ use nereids_physics::ikeda_carpenter::{
 use nereids_physics::resolution::{ResolutionFunction, TOF_FACTOR};
 use nereids_physics::transmission::broadened_cross_sections;
 use nereids_pipeline::counts_fit::{
-    CountsFit, Material, Measurement, NEGLIGIBLE_PREDICTION, Region, RegionFit, Value, fit_counts,
+    CountsFit, Material, Measurement, NEGLIGIBLE_PREDICTION, NO_TIME_BACKGROUND, Region, RegionFit,
+    Value, fit_counts,
 };
 use nereids_pipeline::counts_map::{CountsMap, MapMeasurement, Patch, fit_map};
 use nereids_pipeline::error::PipelineError;
@@ -242,12 +243,15 @@ fn measurement(
         time_edges_us: setup.edges.clone(),
         charge_ratio: CHARGE_RATIO,
         normalization: Value::Known(1.0),
+        time_background: NO_TIME_BACKGROUND,
         regions: vec![Region {
             open_counts: open,
             sample_counts: sample,
             open_live: None,
             sample_live: None,
             background: [Value::Known(0.0); 3],
+            pixels: 1.0,
+            gamma_transmission: Value::Known(1.0),
             material: Some(Material {
                 covariances: Vec::new(),
                 library: EndfLibrary::EndfB8_0,
@@ -292,6 +296,203 @@ fn error_bar(fit: &CountsFit, i: usize) -> f64 {
         .expect("covariance")
         .get(i, i)
         .sqrt()
+}
+
+fn time_background(edges: &[f64], [c, a, tau]: [f64; 3]) -> Vec<f64> {
+    let rate = |t: f64| c + a * (-(t - edges[0]) / tau).exp();
+    let steps = 64;
+    edges
+        .windows(2)
+        .map(|w| {
+            let h = (w[1] - w[0]) / f64::from(steps);
+            (0..steps)
+                .map(|i| w[0] + h * f64::from(i))
+                .map(|t| h / 6.0 * (rate(t) + 4.0 * rate(t + 0.5 * h) + rate(t + h)))
+                .sum()
+        })
+        .collect()
+}
+
+#[test]
+fn the_time_background_is_in_both_runs_of_every_region_by_its_pixels_and_gamma_transmission() {
+    let setup = standard();
+    let numbers = [2000.0, 30000.0, 10.0];
+    let (a, pixels, gammas) = (0.93, [4.0, 9.0], [0.8, 0.6]);
+    let lines: Vec<(ResonanceData, f64)> = [(72, 180, 16.0), (74, 182, 20.0), (76, 186, 25.0)]
+        .map(|(z, n, e)| (synthetic_isotope(z, n, e, 0.01, 0.06), SATURATED))
+        .to_vec();
+    let simulated = |numbers: [f64; 3], dip: f64| -> Vec<[(Vec<f64>, Vec<f64>); 2]> {
+        let per_pixel = time_background(&setup.edges, numbers);
+        (0..2)
+            .map(|r| {
+                let sample = if r == 0 { lines.as_slice() } else { &[] };
+                let smooth = beam([1.0e6, 2.0e6][r]);
+                let shape = |u: f64| smooth(u) * (1.0 - dip * (-(u - 407.0).powi(2) / 578.0).exp());
+                let (open, transmitted) = expected(&setup, &shape, sample);
+                let term = |scale: f64| per_pixel.iter().map(move |g| scale * pixels[r] * g);
+                let open: Vec<f64> = open.iter().zip(term(1.0)).map(|(o, g)| o + g).collect();
+                let sample: Vec<f64> = transmitted
+                    .iter()
+                    .zip(term(CHARGE_RATIO * a * gammas[r]))
+                    .map(|(t, g)| a * t + g)
+                    .collect();
+                [open, sample].map(|mu| {
+                    let most = mu.iter().fold(0.0_f64, |m, &c| m.max(c));
+                    let live: Vec<f64> = mu.iter().map(|c| 1.0 / (1.0 + 0.25 * c / most)).collect();
+                    (mu.iter().zip(&live).map(|(c, l)| l * c).collect(), live)
+                })
+            })
+            .collect()
+    };
+    let runs = simulated(numbers, 0.0);
+    let measurement = |runs: &[[(Vec<f64>, Vec<f64>); 2]],
+                       numbers: [Value; 3],
+                       gamma: Value,
+                       sample: fn(f64) -> Value| Measurement {
+        time_edges_us: setup.edges.clone(),
+        charge_ratio: CHARGE_RATIO,
+        normalization: sample(a),
+        time_background: numbers,
+        regions: (0..2)
+            .map(|r| Region {
+                open_counts: rounded(&runs[r][0].0),
+                sample_counts: rounded(&runs[r][1].0),
+                open_live: Some(runs[r][0].1.clone()),
+                sample_live: Some(runs[r][1].1.clone()),
+                background: [
+                    if r == 0 {
+                        sample(0.0)
+                    } else {
+                        Value::Known(0.0)
+                    },
+                    Value::Known(0.0),
+                    Value::Known(0.0),
+                ],
+                pixels: pixels[r],
+                gamma_transmission: if r == 0 {
+                    gamma
+                } else {
+                    Value::Known(gammas[1])
+                },
+                material: (r == 0).then(|| Material {
+                    covariances: Vec::new(),
+                    library: EndfLibrary::EndfB8_0,
+                    isotopes: lines.iter().map(|(d, n)| (d.clone(), sample(*n))).collect(),
+                    temperature_k: sample(TEMPERATURE_K),
+                }),
+            })
+            .collect(),
+    };
+    let known = measurement(
+        &runs,
+        numbers.map(Value::Known),
+        Value::Known(gammas[0]),
+        Value::Known,
+    );
+    let fit = fit_counts(&known, &calibration(&setup)).expect("fit");
+    assert!(fit.converged);
+    for (r, region) in fit.regions.iter().enumerate() {
+        assert_eq!(region.beam.intervals(), 1, "region {r}");
+        assert_eq!(region.overdispersion[0], Some(1.0), "region {r}");
+        for (run, (mu, _)) in region.predicted.iter().zip(&runs[r]) {
+            let spread: f64 = run.iter().zip(mu).map(|(p, m)| (p - m).powi(2) / m).sum();
+            assert!(spread <= BOUND, "region {r}: {spread}");
+        }
+    }
+
+    let dipped = simulated(numbers, 0.6);
+    for (runs, dip, within) in [(&runs, false, BOUND.sqrt()), (&dipped, true, 1.0)] {
+        let free = measurement(
+            runs,
+            std::array::from_fn(|i| Value::Fitted([0.5, 2.0, 0.7][i] * numbers[i])),
+            Value::Fitted(0.5),
+            |x| Value::Fitted(1.1 * x),
+        );
+        let fit = fit_counts(&free, &calibration(&setup)).expect("fit");
+        assert!(fit.converged);
+        for region in &fit.regions {
+            assert_eq!(region.beam.intervals() > 1, dip);
+            assert_eq!(region.overdispersion[0], Some(1.0));
+        }
+        let sample = &fit.regions[0];
+        let estimates = sample.densities.iter().chain(&sample.temperature_k).chain(
+            [
+                &fit.normalization,
+                &sample.background[0],
+                &sample.gamma_transmission,
+            ]
+            .into_iter()
+            .chain(&fit.time_background),
+        );
+        let truths = lines
+            .iter()
+            .map(|(_, n)| *n)
+            .chain([TEMPERATURE_K, a, 0.0, gammas[0]])
+            .chain(numbers);
+        for (i, (x, t)) in estimates.zip(truths).enumerate() {
+            let pull = (x - t) / error_bar(&fit, i);
+            assert!(pull.abs() <= within, "{dip} {i}: {x} vs {t}, pull {pull}");
+        }
+    }
+
+    let no_tail = simulated([numbers[0], 0.0, numbers[2]], 0.0);
+    let fits = [
+        [numbers[0], 0.0, numbers[2]],
+        [numbers[0], 10.0 * numbers[1], 40.0],
+    ]
+    .map(|start| {
+        let m = measurement(
+            &no_tail,
+            start.map(Value::Fitted),
+            Value::Known(gammas[0]),
+            |x| Value::Fitted(1.1 * x),
+        );
+        let fit = fit_counts(&m, &calibration(&setup)).expect("fit");
+        assert!(fit.converged);
+        for region in &fit.regions {
+            assert_eq!(region.beam.intervals(), 1);
+            assert_eq!(region.overdispersion[0], Some(1.0));
+        }
+        let sample = &fit.regions[0];
+        let values: Vec<f64> = sample
+            .densities
+            .iter()
+            .chain(&sample.temperature_k)
+            .copied()
+            .collect();
+        (
+            values,
+            (0..4).map(|i| error_bar(&fit, i)).collect::<Vec<f64>>(),
+        )
+    });
+    let [(near, sd), (far, _)] = &fits;
+    for (i, (x, y)) in near.iter().zip(far).enumerate() {
+        assert!((x - y).abs() <= BOUND.sqrt() * sd[i], "{i}: {x} vs {y}");
+    }
+
+    let mut empty = known.clone();
+    empty.regions[1].pixels = 0.0;
+    let refused = [
+        ([-1.0, 0.0, 1.0], 1.0),
+        ([0.0, -1.0, 1.0], 1.0),
+        ([0.0, 0.0, 0.0], 1.0),
+        ([f64::NAN, 0.0, 1.0], 1.0),
+        (numbers, 1.5),
+    ]
+    .map(|(bad, gamma)| {
+        measurement(
+            &runs,
+            bad.map(Value::Known),
+            Value::Known(gamma),
+            Value::Known,
+        )
+    });
+    for m in refused.iter().chain([&empty]) {
+        assert!(matches!(
+            fit_counts(m, &calibration(&setup)),
+            Err(PipelineError::InvalidParameter(_))
+        ));
+    }
 }
 
 #[test]
@@ -446,6 +647,8 @@ fn an_empty_area_with_a_known_background_adds_its_counts_information_on_the_norm
             open_live: None,
             sample_live: None,
             background: [Value::Known(0.0); 3],
+            pixels: 1.0,
+            gamma_transmission: Value::Known(1.0),
             material: None,
         },
     ];
@@ -454,6 +657,7 @@ fn an_empty_area_with_a_known_background_adds_its_counts_information_on_the_norm
             time_edges_us: setup.edges.clone(),
             charge_ratio: CHARGE_RATIO,
             normalization: Value::Fitted(1.0),
+            time_background: NO_TIME_BACKGROUND,
             regions: regions.to_vec(),
         };
         let fit = fit_counts(&m, &calibration(&setup)).expect("fit");
@@ -746,6 +950,8 @@ fn a_map_recovers_each_patch_and_its_covariance_between_patches_is_the_shared_qu
             open_live: map.open_live.clone(),
             sample_live: map.sample_live.clone(),
             background,
+            pixels: 1.0,
+            gamma_transmission: Value::Known(1.0),
             material,
         };
     let joint = fit_counts(
@@ -753,6 +959,7 @@ fn a_map_recovers_each_patch_and_its_covariance_between_patches_is_the_shared_qu
             time_edges_us: setup.edges.clone(),
             charge_ratio: CHARGE_RATIO,
             normalization: map.normalization,
+            time_background: NO_TIME_BACKGROUND,
             regions: (0..4)
                 .map(|j| {
                     region(
@@ -822,12 +1029,15 @@ fn a_map_recovers_each_patch_and_its_covariance_between_patches_is_the_shared_qu
             time_edges_us: setup.edges.clone(),
             charge_ratio: CHARGE_RATIO,
             normalization: Value::Known(result.normalization),
+            time_background: NO_TIME_BACKGROUND,
             regions: vec![Region {
                 open_counts,
                 sample_counts,
                 open_live: Some(live.clone()),
                 sample_live: Some(live.clone()),
                 background: map.background,
+                pixels: 1.0,
+                gamma_transmission: Value::Known(1.0),
                 material: Some(map.material.clone()),
             }],
         };
@@ -1193,6 +1403,7 @@ fn each_run_s_overdispersion_is_its_variance_over_its_poisson_variance() {
                 &m.regions[1].open_counts,
                 &calibration(&setup),
                 Some(&open_live),
+                None,
             )
             .expect("open-beam fit");
             assert_eq!(fit.regions[1].overdispersion[0], open.overdispersion);
@@ -1884,6 +2095,7 @@ fn measurements_the_fit_does_not_describe_are_refused() {
                 &good.time_edges_us,
                 &good.regions[0].open_counts,
                 &calibration,
+                None,
                 None
             ),
             Err(PipelineError::InvalidParameter(_))
@@ -2703,6 +2915,8 @@ fn density_temperature_timing_offset_and_flight_path_are_recovered_from_starts_o
             open_live: None,
             sample_live: None,
             background: [Value::Known(0.0); 3],
+            pixels: 1.0,
+            gamma_transmission: Value::Known(1.0),
             material: None,
         });
         let fit = fit_counts(&m, &calibration).expect("fit");
@@ -3877,6 +4091,8 @@ mod maps {
                 open_live: None,
                 sample_live: None,
                 background: map.background,
+                pixels: 1.0,
+                gamma_transmission: Value::Known(1.0),
                 material: Some(map.material.clone()),
             }
         }
@@ -3892,6 +4108,8 @@ mod maps {
                     open_live: None,
                     sample_live: None,
                     background: map.empty_background,
+                    pixels: 1.0,
+                    gamma_transmission: Value::Known(1.0),
                     material: None,
                 }))
                 .collect();
@@ -3900,6 +4118,7 @@ mod maps {
                     time_edges_us: map.time_edges_us.clone(),
                     charge_ratio: map.charge_ratio,
                     normalization: map.normalization,
+                    time_background: NO_TIME_BACKGROUND,
                     regions,
                 },
                 calibration,
@@ -4160,6 +4379,7 @@ mod maps {
                 time_edges_us: map.time_edges_us.clone(),
                 charge_ratio: map.charge_ratio,
                 normalization: Value::Known(0.8 * TERMS[0]),
+                time_background: NO_TIME_BACKGROUND,
                 regions: vec![tiled.region(&map, (0, 0))],
             },
             &Calibration {

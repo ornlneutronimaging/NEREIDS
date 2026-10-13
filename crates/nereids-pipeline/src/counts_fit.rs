@@ -1,8 +1,8 @@
 //! The areal densities and temperatures of the materials in one or more
-//! regions of the detector, each region's background, the sample run's
-//! normalization, the timing offset, the flight path and the pulse's numbers,
-//! fitted to the counts of an open-beam run and a sample run recorded in the
-//! same time bins.
+//! regions of the detector, each region's background and gamma transmission,
+//! the sample run's normalization, the time background, the timing offset,
+//! the flight path and the pulse's numbers, fitted to the counts of an
+//! open-beam run and a sample run recorded in the same time bins.
 
 use std::borrow::Cow;
 use std::cell::RefCell;
@@ -29,8 +29,8 @@ use crate::beam::BeamSpline;
 use crate::error::PipelineError;
 use crate::open_beam::{
     BOUND, COUNTS_TO_MEASURE_NOISE, Calibration, OpenBeamFit, PULSE_NUMBERS, Pulse, Recorded,
-    combined, counted, fit_on_halved_grids, fit_open_beam, laws, overdispersion, validate_counts,
-    validate_live, weights_of,
+    combined, counted, fit_on_halved_grids, laws, open_beam_with_intervals, overdispersion,
+    validate_counts, validate_live, weights_of,
 };
 use crate::pipeline::TEMPERATURE_BOUNDS_K;
 
@@ -111,9 +111,19 @@ pub struct Measurement {
     /// `a`, the normalization of the sample run, positive, the same in every
     /// region.
     pub normalization: Value,
+    /// `[C, A, τ]` of the time background `C + A·exp(−(t − t₁)/τ)`, the counts
+    /// per µs and per pixel at the open-beam run's proton charge that reach the
+    /// detector without passing through the moderator pulse, at time `t` of the
+    /// time edges' clock, `t₁` the first edge: `C` and `A` 0 or more, `τ` in µs
+    /// positive.  [`NO_TIME_BACKGROUND`] gives none.
+    pub time_background: [Value; 3],
     /// The regions, separate sets of pixels timed by one clock.
     pub regions: Vec<Region>,
 }
+
+/// A [`Measurement::time_background`] of no counts.
+pub const NO_TIME_BACKGROUND: [Value; 3] =
+    [Value::Known(0.0), Value::Known(0.0), Value::Known(1.0)];
 
 /// The counts of a set of pixels in both runs, its background and the
 /// material the beam crosses there.
@@ -123,15 +133,20 @@ pub struct Region {
     pub open_counts: Vec<f64>,
     /// Raw counts of the sample run, one per bin.
     pub sample_counts: Vec<f64>,
-    /// The fraction of the open-beam run's neutrons arriving in each bin that
+    /// The fraction of the open-beam run's counts arriving in each bin that
     /// the detector records, in (0, 1]; `None` records every one.
     pub open_live: Option<Vec<f64>>,
-    /// The fraction of the sample run's neutrons arriving in each bin that the
+    /// The fraction of the sample run's counts arriving in each bin that the
     /// detector records, in (0, 1]; `None` records every one.
     pub sample_live: Option<Vec<f64>>,
     /// `b0` (dimensionless), `b1` in √eV and `b2` in 1/√eV of the background
     /// `b(E) = b0 + b1/√E + b2·√E`, each any real number.
     pub background: [Value; 3],
+    /// The region's area in pixels, finite and positive.
+    pub pixels: f64,
+    /// The fraction of the time background that reaches the region's pixels in
+    /// the sample run through what is in front of them, within 0–1.
+    pub gamma_transmission: Value,
     /// The material the beam crosses in the region; `None` for nothing, which
     /// transmits every neutron.
     pub material: Option<Material>,
@@ -157,8 +172,8 @@ pub struct Material {
     pub covariances: Vec<(usize, ResonanceCovariance)>,
 }
 
-/// The fitted quantities of every region, and the normalization, timing
-/// offset, flight path and pulse numbers the regions share.
+/// The fitted quantities of every region, and the normalization, time
+/// background, timing offset, flight path and pulse numbers the regions share.
 #[derive(Debug, Clone)]
 pub struct CountsFit {
     /// Each region's fitted quantities and counts, in the order given.
@@ -178,11 +193,15 @@ pub struct CountsFit {
     /// The square of the pulse's triangle FWHM, `h²` in µs²: the known one, or
     /// the fitted one.
     pub fwhm_squared_us2: f64,
+    /// The time background's `[C, A, τ]`, each the known or the fitted one; a
+    /// fitted `τ` is undetermined when `A` ends at 0.
+    pub time_background: [f64; 3],
     /// Covariance of the fitted quantities among, in this order, each region's
     /// densities, in the order given, and temperature, region by region; the
     /// normalization; each region's `b0`, `b1` and `b2`, region by region;
-    /// `t0`; the flight path; `α₀`, `α₁`, `β₀`, `β₁`, `R` and `h²`: the inverse
-    /// of the information at the fit, each run's expected information over its
+    /// each region's gamma transmission, region by region; the time
+    /// background's `C`, `A` and `τ`; `t0`; the flight path; `α₀`, `α₁`,
+    /// `β₀`, `β₁`, `R` and `h²`: the inverse of the information at the fit, each run's expected information over its
     /// overdispersion plus `1/sd²` for each measured quantity and `C⁻¹` over
     /// the pulse numbers a calibration's
     /// [`Pulse::prior`](crate::open_beam::Pulse::prior) covers.  The row and
@@ -216,9 +235,9 @@ pub struct CountsFit {
     /// weighted with, summed over both runs of every region at the fit, outside
     /// the sample runs' [`RegionFit::excluded_bins`].
     pub deviance: f64,
-    /// Whether the fitter converged, every sample run's overdispersion
-    /// settled, the grid met its rule at the fitted temperatures, its flight
-    /// times cover the fitted `t0`, flight path and pulse, and the bins left
+    /// Whether the fitter converged, the open-beam fits' time background
+    /// settled at the fitted one, every sample run's overdispersion settled,
+    /// the grid met its rule at the fitted temperatures, its flight times cover the fitted `t0`, flight path and pulse, and the bins left
     /// out at those are the ones the fit left out.
     pub converged: bool,
     /// For each measured quantity, in the covariance's order, its value
@@ -269,6 +288,8 @@ pub struct RegionFit {
     /// `b0` (dimensionless), `b1` in √eV and `b2` in 1/√eV, each the known or
     /// the fitted one.
     pub background: [f64; 3],
+    /// The gamma transmission: the known one, or the fitted one.
+    pub gamma_transmission: f64,
     /// The region's beam per µs, as a function of the arrival time less the
     /// starting `t0`, fitted to both runs, with the intervals the region's
     /// open-beam fit chose.
@@ -297,17 +318,19 @@ pub struct RegionFit {
 }
 
 /// Fit the areal densities and temperatures of the regions' materials, each
-/// region's background terms, the normalization, and the timing offset,
-/// flight path and pulse numbers of `calibration`, that are not known, to the
+/// region's background terms and gamma transmission, the normalization, the
+/// time background, and the timing offset, flight path and pulse numbers of
+/// `calibration`, that are not known, to the
 /// raw counts of both runs in every region.  On a uniform grid of flight
 /// times `u_i`, energies `E_i` and step `w`, the counts of region `r` in bin
 /// `k` are
 ///
 /// ```text
-/// O_rk   = ℓ^O_rk · w Σ_i φ_ri P_ki
-/// S_rk   = ℓ^S_rk · c_q · a · w Σ_i φ_ri [T_ri + b_r(E_i)] P_ki
+/// O_rk   = ℓ^O_rk · [w Σ_i φ_ri P_ki + p_r G_k]
+/// S_rk   = ℓ^S_rk · c_q · a · [w Σ_i φ_ri [T_ri + b_r(E_i)] P_ki + γ_r p_r G_k]
 /// T_ri   = exp(−Σ_m n_rm σ_m(E_i; T_r)), or 1 without a material
 /// b_r(E) = b0_r + b1_r/√E + b2_r·√E
+/// G_k    = ∫ over bin k of (C + A·exp(−(t − t₁)/τ)) dt
 /// ```
 ///
 /// with `φ_r` the region's beam per µs, `P_ki` the chance of a neutron at
@@ -318,14 +341,25 @@ pub struct RegionFit {
 /// detector another way, so it passes through the pulse and scales with the
 /// normalization; SAMMY's `BackA`, `BackB`, `BackC` (`cro/mnrm1.f90`) are
 /// `a·b0`, `a·b1`, `a·b2`, to within the background's change over the pulse's
-/// delay.  SAMMY's `BackD·exp(−BackF/√E)` term, and counts that bypass the
-/// pulse, such as gammas, are not modelled.
+/// delay.  SAMMY's `BackD·exp(−BackF/√E)` term is not modelled.  The time
+/// background `G` is counts that follow the proton charge but reach the
+/// detector without passing through the moderator pulse, such as the prompt
+/// gammas of each proton pulse and their tail, at the time `t` of the edges'
+/// clock, `t₁` the first edge: it is not folded with the pulse, and the sample
+/// run scales it with `c_q·a`, which correct the charge ratio and an
+/// efficiency change alike in every pixel, and the fraction `γ_r` that reaches
+/// the region's pixels, `p_r` the region's pixels.  Counts that follow
+/// the run time instead, such as room background, are not modelled.  It turns
+/// the ratio `R` of the neutrons alone into `R + g·(γ_r − R)`, `g` its share of
+/// the open-beam counts; SAMMY's backgrounds in time (`Bgfrpi`) are added to
+/// the transmission instead.
 ///
 /// The regions share the normalization, the run pair's scale; and `t0`, the
 /// flight path and the pulse, which one clock, flight path and moderator set
 /// for every pixel, and with them the grid and `P_ki`.  Each region has its
 /// own beam, from its own open-beam counts, with the intervals its
-/// [`fit_open_beam`] chooses, fitted with the rest to both runs; and its own
+/// [`fit_open_beam`](crate::open_beam::fit_open_beam) chooses, fitted with
+/// the rest to both runs; and its own
 /// background, which depends on what surrounds its pixels.  A region without
 /// a material counts `c_q·a·(1 + b_r)` of its beam in the sample run, so it
 /// pins the normalization when its `b0` is known, as zero in the open-region
@@ -345,7 +379,12 @@ pub struct RegionFit {
 /// the pulse's laws at its energy `E_i`.  A trial pulse whose `α` or `β` is 0
 /// at some energy is outside the model and rejected; a fit driven there ends
 /// unconverged.  The open-beam fits that start the beams and weight the
-/// open-beam runs use the starting pulse.
+/// open-beam runs use the starting pulse and, at first, the time background's
+/// starting numbers; the fit is repeated with them at its fitted numbers, up
+/// to twenty times, until the fitted numbers change the counts they took as
+/// known by `Σ_r Σ_k (ΔO_rk)²/O_rk` at most [`BOUND`] over every region's
+/// open-beam bins, and from the third time on each region keeps the beam
+/// intervals its second open-beam fit chose.
 ///
 /// The grid's first step is at most half the narrowest Doppler full width at
 /// half maximum, in flight time, of any resonance of any region inside its
@@ -389,7 +428,8 @@ pub struct RegionFit {
 /// count, and one live fraction when given, per bin;
 /// [`PipelineError::InvalidParameter`] if a count is not a whole non-negative
 /// number, a run has no counts, a live fraction is not in (0, 1], the charge
-/// ratio is not finite and positive, a known, starting or measured value is
+/// ratio is not finite and positive, a region's pixels are not finite and
+/// positive, a known, starting or measured value is
 /// not finite and in its quantity's range, a measured value's sd is not finite
 /// and positive, bounds are not `lower < upper` in that range
 /// with the start between them, the pulse's calibration covers a number that
@@ -413,11 +453,13 @@ pub struct RegionFit {
 /// isotope does not have, or is not a finite symmetric positive
 /// semi-definite matrix over their energies and widths, or if it is given for
 /// an isotope another region also holds or with a pulse calibration's prior;
-/// everything [`fit_open_beam`] refuses for any region;
+/// everything [`fit_open_beam`](crate::open_beam::fit_open_beam) refuses for
+/// any region;
 /// [`PipelineError::FlightTimeGrid`] for the grid's refusals at the starting
 /// `t0`, flight path and pulse or the fitted ones of any pass, including more
-/// points than it allows; [`PipelineError::Fitting`] if the fitter fails, the
-/// cross sections fail at the start or, for a listed resonance parameter
+/// points than it allows; [`PipelineError::Fitting`] if the fitter fails, a
+/// region's open-beam fit does not converge with the beam intervals it keeps,
+/// the cross sections fail at the start or, for a listed resonance parameter
 /// shifted, at the fit, or a decomposition of the pulse's
 /// consistency test fails; a failure at a trial temperature is a rejected
 /// step.
@@ -434,7 +476,65 @@ pub fn fit_counts(
             "no region of the measurement holds a material to fit".into(),
         ));
     }
-    fit_counts_answer(measurement, calibration, None).map(|(fit, _)| fit)
+    fit_settled(measurement, calibration, MOST_PASSES)
+}
+
+fn fit_settled(
+    measurement: &Measurement,
+    calibration: &Calibration,
+    most_passes: usize,
+) -> Result<CountsFit, PipelineError> {
+    let bins = starts_and_widths_us(&measurement.time_edges_us);
+    let mut open = starting_time_background(measurement)?;
+    let mut intervals: Option<Vec<usize>> = None;
+    for passes in 1.. {
+        let (mut fit, _) = fit_counts_answer(
+            measurement,
+            calibration,
+            BeamStarts::OpenFitsAt(open, intervals.clone()),
+        )?;
+        let (used, _) = time_counts_per_pixel(&bins, open);
+        let (now, _) = time_counts_per_pixel(&bins, fit.time_background);
+        let mut spread = 0.0;
+        for (r, region) in fit.regions.iter().zip(&measurement.regions) {
+            for (k, &mu) in r.predicted[0]
+                .iter()
+                .enumerate()
+                .filter(|(_, mu)| **mu > 0.0)
+            {
+                let live = region.open_live.as_ref().map_or(1.0, |live| live[k]);
+                spread += (live * region.pixels * (now[k] - used[k])).powi(2) / mu;
+            }
+        }
+        if !fit.converged || spread <= BOUND || passes == most_passes {
+            if spread > BOUND {
+                fit.converged = false;
+                fit.covariance = None;
+                fit.unbounded = None;
+                fit.measured_pulls = None;
+                fit.pulse_consistency = None;
+            }
+            return Ok(fit);
+        }
+        if passes >= 2 {
+            intervals
+                .get_or_insert_with(|| fit.regions.iter().map(|r| r.beam.intervals()).collect());
+        }
+        open = fit.time_background;
+    }
+    unreachable!("the passes end at most_passes")
+}
+
+pub(crate) fn starting_time_background(
+    measurement: &Measurement,
+) -> Result<[f64; 3], PipelineError> {
+    let mut numbers = [0.0; 3];
+    for (term, number) in numbers.iter_mut().enumerate() {
+        let (value, name, range, allowed) =
+            quantity(measurement, Role::TimeBackground(term)).expect("a quantity");
+        *number = value.parameter(name, range, &allowed)?.value;
+    }
+    Ok(numbers)
 }
 
 pub(crate) struct Starts {
@@ -492,6 +592,16 @@ pub(crate) fn checked<'a>(
     if !(charge_ratio.is_finite() && *charge_ratio > 0.0) {
         return invalid(format!(
             "the charge ratio must be finite and positive, got {charge_ratio}"
+        ));
+    }
+    if let Some((r, region)) = regions
+        .iter()
+        .enumerate()
+        .find(|(_, region)| !(region.pixels.is_finite() && region.pixels > 0.0))
+    {
+        return invalid(format!(
+            "the pixels of region {r} must be finite and positive, got {}",
+            region.pixels
         ));
     }
     for (r, material) in materials() {
@@ -876,11 +986,20 @@ fn in_span(
         .collect()
 }
 
+pub(crate) enum BeamStarts<'a> {
+    Given(&'a Starts),
+    OpenFitsAt([f64; 3], Option<Vec<usize>>),
+}
+
 pub(crate) fn fit_counts_answer(
     measurement: &Measurement,
     calibration: &Calibration,
-    starts: Option<&Starts>,
+    beam_starts: BeamStarts<'_>,
 ) -> Result<(CountsFit, Answer), PipelineError> {
+    let starts = match beam_starts {
+        BeamStarts::Given(starts) => Some(starts),
+        BeamStarts::OpenFitsAt(..) => None,
+    };
     let Measurement {
         time_edges_us,
         charge_ratio,
@@ -937,17 +1056,22 @@ pub(crate) fn fit_counts_answer(
         live.extend(checked().map_err(|e| in_region(r, e))?.concat());
     }
 
-    let opens: Vec<BeamStart> = match starts {
-        Some(starts) => starts.beams.clone(),
-        None => regions
+    let opens: Vec<BeamStart> = match beam_starts {
+        BeamStarts::Given(starts) => starts.beams.clone(),
+        BeamStarts::OpenFitsAt(numbers, ref intervals) => regions
             .iter()
             .enumerate()
             .map(|(r, region)| {
-                let open = fit_open_beam(
+                let (per_pixel, _) =
+                    time_counts_per_pixel(&starts_and_widths_us(time_edges_us), numbers);
+                let known: Vec<f64> = per_pixel.iter().map(|g| region.pixels * g).collect();
+                let open = open_beam_with_intervals(
                     time_edges_us,
                     &region.open_counts,
                     calibration,
                     Some(&live[2 * r * bins..(2 * r + 1) * bins]),
+                    Some(&known),
+                    intervals.as_ref().map(|chosen| chosen[r]),
                 )
                 .map_err(|e| in_region(r, e))?;
                 Ok(BeamStart::from(open))
@@ -956,7 +1080,8 @@ pub(crate) fn fit_counts_answer(
     };
     let beams: Vec<BeamSpline> = opens.iter().map(|open| open.beam.clone()).collect();
     let sizes: Vec<usize> = beams.iter().map(|beam| beam.coefficients().len()).collect();
-    let layout = Arc::new(Layout::new(roles(&sizes, &shape), regions.len()));
+    let pixels: Vec<f64> = regions.iter().map(|region| region.pixels).collect();
+    let layout = Arc::new(Layout::new(roles(&sizes, &shape), &pixels));
     let mut parameters = ParameterSet::new(
         beams
             .iter()
@@ -1320,6 +1445,7 @@ pub(crate) fn fit_counts_answer(
             densities: params[place.densities.clone()].to_vec(),
             temperature_k: place.temperature.map(|t| params[t]),
             background: [0, 1, 2].map(|i| params[place.background + i]),
+            gamma_transmission: params[place.gamma],
             beam: open.beam.with_coefficients(&params[place.beam.clone()]),
             beam_at_limit: open.at_limit,
             predicted: [
@@ -1359,6 +1485,7 @@ pub(crate) fn fit_counts_answer(
         beta: [params[layout.pulse + 2], params[layout.pulse + 3]],
         r: params[layout.pulse + 4],
         fwhm_squared_us2: params[layout.pulse + 5],
+        time_background: [0, 1, 2].map(|i| params[layout.time_background + i]),
         covariance,
         unbounded,
         on_bound,
@@ -1415,6 +1542,7 @@ impl Answer {
                             | Role::Density { region: r, .. }
                             | Role::Temperature { region: r }
                             | Role::Background { region: r, .. }
+                            | Role::GammaTransmission { region: r }
                             if r == region
                     )
             })
@@ -1691,6 +1819,8 @@ pub(crate) enum Role {
     Temperature { region: usize },
     Normalization,
     Background { region: usize, term: usize },
+    GammaTransmission { region: usize },
+    TimeBackground(usize),
     T0,
     FlightPath,
     Pulse(usize),
@@ -1714,9 +1844,12 @@ fn roles(beams: &[usize], isotopes: &[Option<usize>]) -> Vec<Role> {
         });
     let backgrounds = (0..isotopes.len())
         .flat_map(|region| (0..3).map(move |term| Role::Background { region, term }));
+    let gammas = (0..isotopes.len()).map(|region| Role::GammaTransmission { region });
     beam.chain(materials)
         .chain([Role::Normalization])
         .chain(backgrounds)
+        .chain(gammas)
+        .chain((0..3).map(Role::TimeBackground))
         .chain([Role::T0, Role::FlightPath])
         .chain((0..6).map(Role::Pulse))
         .collect()
@@ -1762,6 +1895,25 @@ fn quantity(
             f64::NEG_INFINITY..=f64::INFINITY,
             "of any sign".into(),
         ),
+        Role::GammaTransmission { region } => (
+            &measurement.regions[region].gamma_transmission,
+            format!("gamma transmission of region {region}"),
+            0.0..=1.0,
+            "within 0–1".into(),
+        ),
+        Role::TimeBackground(term) => {
+            let (name, low, allowed) = [
+                ("C", 0.0, "0 or more"),
+                ("A", 0.0, "0 or more"),
+                ("τ", f64::MIN_POSITIVE, "positive"),
+            ][term];
+            (
+                &measurement.time_background[term],
+                format!("time background {name}"),
+                low..=f64::INFINITY,
+                allowed.into(),
+            )
+        }
         Role::Beam { .. } | Role::T0 | Role::FlightPath | Role::Pulse(_) => return None,
     })
 }
@@ -1827,6 +1979,7 @@ struct Layout {
     regions: Vec<Place>,
     quantities: usize,
     normalization: usize,
+    time_background: usize,
     t0: usize,
     flight_path: usize,
     pulse: usize,
@@ -1837,10 +1990,12 @@ struct Place {
     densities: Range<usize>,
     temperature: Option<usize>,
     background: usize,
+    gamma: usize,
+    pixels: f64,
 }
 
 impl Layout {
-    fn new(roles: Vec<Role>, regions: usize) -> Self {
+    fn new(roles: Vec<Role>, pixels: &[f64]) -> Self {
         let at = |wanted: Role| {
             roles
                 .iter()
@@ -1854,7 +2009,7 @@ impl Layout {
                 .zip(last)
                 .map_or(0..0, |(first, last)| first..last + 1)
         };
-        let places = (0..regions)
+        let places = (0..pixels.len())
             .map(|r| Place {
                 beam: span(&|role| matches!(role, Role::Beam { region, .. } if region == r)),
                 densities: span(
@@ -1864,6 +2019,8 @@ impl Layout {
                     .iter()
                     .position(|&role| role == Role::Temperature { region: r }),
                 background: at(Role::Background { region: r, term: 0 }),
+                gamma: at(Role::GammaTransmission { region: r }),
+                pixels: pixels[r],
             })
             .collect();
         Self {
@@ -1872,6 +2029,7 @@ impl Layout {
                 .position(|role| !matches!(role, Role::Beam { .. }))
                 .expect("the instrument's numbers follow the beams"),
             normalization: at(Role::Normalization),
+            time_background: at(Role::TimeBackground(0)),
             t0: at(Role::T0),
             flight_path: at(Role::FlightPath),
             pulse: at(Role::Pulse(0)),
@@ -1883,6 +2041,7 @@ impl Layout {
 
 struct RegionsModel {
     grid: Arc<FlightTimeGrid>,
+    bins: Vec<(f64, f64)>,
     splines: Vec<BeamSpline>,
     beam_origin_us: f64,
     absorbers: Vec<Absorber>,
@@ -1957,6 +2116,33 @@ fn predicted(rows: &Rows, values: &[f64]) -> Result<Vec<f64>, FittingError> {
         .map_err(|e| FittingError::EvaluationFailed(e.to_string()))
 }
 
+fn starts_and_widths_us(time_edges_us: &[f64]) -> Vec<(f64, f64)> {
+    time_edges_us
+        .windows(2)
+        .map(|edges| (edges[0] - time_edges_us[0], edges[1] - edges[0]))
+        .collect()
+}
+
+fn time_counts_per_pixel(
+    starts_and_widths_us: &[(f64, f64)],
+    [c, a, tau]: [f64; 3],
+) -> (Vec<f64>, [Vec<f64>; 3]) {
+    let bins = starts_and_widths_us.len();
+    let mut counts = Vec::with_capacity(bins);
+    let mut slopes: [Vec<f64>; 3] = std::array::from_fn(|_| Vec::with_capacity(bins));
+    for &(start, width) in starts_and_widths_us {
+        let decay = (-start / tau).exp();
+        let after = (-(start + width) / tau).exp();
+        let fraction = -(-width / tau).exp_m1();
+        let integral = decay * (tau * fraction);
+        counts.push(c * width + a * integral);
+        slopes[0].push(width);
+        slopes[1].push(integral);
+        slopes[2].push(a * (decay * fraction + (decay * start * fraction - after * width) / tau));
+    }
+    (counts, slopes)
+}
+
 impl RegionsModel {
     fn new(
         grid: &Arc<FlightTimeGrid>,
@@ -1975,6 +2161,7 @@ impl RegionsModel {
         energies.reverse();
         Self {
             grid: Arc::clone(grid),
+            bins: starts_and_widths_us(grid.time_edges_us()),
             splines: beams.to_vec(),
             beam_origin_us,
             absorbers: isotopes
@@ -2099,16 +2286,39 @@ impl RegionsModel {
             sample,
         })
     }
+
+    fn time_background(&self, params: &[f64]) -> (Vec<f64>, [Vec<f64>; 3]) {
+        let at = self.layout.time_background;
+        time_counts_per_pixel(&self.bins, [params[at], params[at + 1], params[at + 2]])
+    }
+
+    fn sample_time_scale(&self, params: &[f64], region: usize) -> f64 {
+        let place = &self.layout.regions[region];
+        self.charge_ratio * params[self.layout.normalization] * params[place.gamma] * place.pixels
+    }
 }
 
 impl FitModel for RegionsModel {
     fn evaluate(&self, params: &[f64]) -> Result<Vec<f64>, FittingError> {
         let scale = self.scale(params)?;
+        let (background, _) = self.time_background(params);
         let mut counts = Vec::new();
         for region in 0..self.absorbers.len() {
             let Beams { open, sample, .. } = self.beams(params, &scale, region)?;
-            counts.extend(predicted(&scale.rows, &open)?);
-            counts.extend(predicted(&scale.rows, &sample)?);
+            let pixels = self.layout.regions[region].pixels;
+            let sample_scale = self.sample_time_scale(params, region);
+            counts.extend(
+                predicted(&scale.rows, &open)?
+                    .iter()
+                    .zip(&background)
+                    .map(|(c, g)| c + pixels * g),
+            );
+            counts.extend(
+                predicted(&scale.rows, &sample)?
+                    .iter()
+                    .zip(&background)
+                    .map(|(c, g)| c + sample_scale * g),
+            );
         }
         Ok(counts)
     }
@@ -2145,6 +2355,10 @@ impl FitModel for RegionsModel {
             (2, &ones),
             (3, &ones),
         ];
+        let (background, background_slopes) = self.time_background(params);
+        let scaled = |factor: f64, values: &[f64]| -> Vec<f64> {
+            values.iter().map(|v| factor * v).collect()
+        };
         let mut jacobian = FlatMatrix::zeros(y_current.len(), free_param_indices.len());
         for (col, &index) in free_param_indices.iter().enumerate() {
             let blocks: Vec<(usize, Vec<f64>)> = match layout.roles[index] {
@@ -2190,13 +2404,44 @@ impl FitModel for RegionsModel {
                 Role::Normalization => {
                     let slope = vec![1.0 / params[index]; self.energies.len()];
                     (0..regions)
-                        .map(|r| Some((sample_rows(r), counts(&times(&beams[r].sample, &slope))?)))
+                        .map(|r| {
+                            let place = &layout.regions[r];
+                            let gamma = self.charge_ratio * params[place.gamma] * place.pixels;
+                            let beam = counts(&times(&beams[r].sample, &slope))?;
+                            let column = beam
+                                .iter()
+                                .zip(&background)
+                                .map(|(b, g)| b + gamma * g)
+                                .collect();
+                            Some((sample_rows(r), column))
+                        })
                         .collect::<Option<_>>()?
                 }
                 Role::Background { region, term } => vec![(
                     sample_rows(region),
                     counts(&times(&beams[region].normalized, &self.shapes[term]))?,
                 )],
+                Role::GammaTransmission { region } => vec![(
+                    sample_rows(region),
+                    scaled(
+                        self.charge_ratio
+                            * params[layout.normalization]
+                            * layout.regions[region].pixels,
+                        &background,
+                    ),
+                )],
+                Role::TimeBackground(term) => (0..regions)
+                    .flat_map(|r| {
+                        let slope = &background_slopes[term];
+                        [
+                            (open_rows(r), scaled(layout.regions[r].pixels, slope)),
+                            (
+                                sample_rows(r),
+                                scaled(self.sample_time_scale(params, r), slope),
+                            ),
+                        ]
+                    })
+                    .collect(),
                 Role::Pulse(number) => {
                     if pulse_slopes.is_none() {
                         pulse_slopes = Some(
@@ -2292,6 +2537,13 @@ mod tests {
         for channel_fwhm_us in [None, Some(0.35)] {
             jacobian_against_central_differences(&grid(channel_fwhm_us));
         }
+        let bins = starts_and_widths_us(&[350.0, 351.0, 400.0, 470.0]);
+        let (_, slopes) = time_counts_per_pixel(&bins, [1.0, 2.0, f64::MIN_POSITIVE]);
+        assert!(slopes.iter().flatten().all(|s| s.is_finite()), "{slopes:?}");
+        let (counts, _) = time_counts_per_pixel(&bins, [1.0, 2.0, f64::MAX]);
+        for (count, (_, width)) in counts.iter().zip(&bins) {
+            assert!((count / (3.0 * width) - 1.0).abs() <= 1e-12, "{counts:?}");
+        }
     }
 
     fn jacobian_against_central_differences(grid: &Arc<FlightTimeGrid>) {
@@ -2307,7 +2559,10 @@ mod tests {
             Arc::new([synthetic_isotope(74, 184, 20.6, 0.01, 0.06)]),
         ];
         let sizes: Vec<usize> = beams.iter().map(|b| b.coefficients().len()).collect();
-        let layout = Arc::new(Layout::new(roles(&sizes, &[Some(2), None, Some(1)]), 3));
+        let layout = Arc::new(Layout::new(
+            roles(&sizes, &[Some(2), None, Some(1)]),
+            &[4.0, 9.0, 2.0],
+        ));
         let params: Vec<f64> = layout
             .roles
             .iter()
@@ -2322,6 +2577,8 @@ mod tests {
                 Role::Background { region, term } => {
                     [[0.05, 0.5, -0.01], [0.02, 0.1, 0.003], [0.04, -0.2, 0.005]][region][term]
                 }
+                Role::GammaTransmission { region } => [0.8, 1.0, 0.6][region],
+                Role::TimeBackground(term) => [50.0, 300.0, 40.0][term],
                 Role::T0 => T0_US + 0.05,
                 Role::FlightPath => FLIGHT_PATH_M + 0.003,
                 Role::Pulse(n) => [0.37, 0.06, 0.01, 0.24, 0.16, 0.3][n],
@@ -2395,7 +2652,7 @@ mod tests {
             .collect();
         let shape: Vec<Option<usize>> = materials.iter().map(|m| m.as_ref().map(|_| 1)).collect();
         let sizes: Vec<usize> = beams.iter().map(|b| b.coefficients().len()).collect();
-        let layout = Arc::new(Layout::new(roles(&sizes, &shape), 3));
+        let layout = Arc::new(Layout::new(roles(&sizes, &shape), &[1.0; 3]));
         let truth: Vec<f64> = layout
             .roles
             .iter()
@@ -2410,6 +2667,8 @@ mod tests {
                 Role::Background { region, term } => {
                     [[0.05, 0.0, 0.0], [0.05, 0.0, 0.0], [0.0; 3]][region][term]
                 }
+                Role::GammaTransmission { .. } => 1.0,
+                Role::TimeBackground(term) => [0.0, 0.0, 1.0][term],
                 Role::T0 => T0_US,
                 Role::FlightPath => FLIGHT_PATH_M,
                 Role::Pulse(n) => [0.35, 0.05, 0.0, 0.25, 0.15, 0.0][n],
@@ -2431,6 +2690,7 @@ mod tests {
             time_edges_us: EDGES_US.map(f64::from).collect(),
             charge_ratio: 1.2,
             normalization: Value::Fitted(1.0),
+            time_background: NO_TIME_BACKGROUND,
             regions: materials
                 .into_iter()
                 .enumerate()
@@ -2443,6 +2703,8 @@ mod tests {
                         Some(_) => [Value::Fitted(0.02), Value::Known(0.0), Value::Known(0.0)],
                         None => [Value::Known(0.0); 3],
                     },
+                    pixels: 1.0,
+                    gamma_transmission: Value::Known(1.0),
                     material: material.map(|data| Material {
                         covariances: Vec::new(),
                         library: EndfLibrary::EndfB8_0,
@@ -2466,7 +2728,13 @@ mod tests {
                 prior: None,
             },
         };
-        let (fit, answer) = fit_counts_answer(&measurement, &calibration, None).expect("fit");
+        let open = starting_time_background(&measurement).expect("numbers");
+        let (fit, answer) = fit_counts_answer(
+            &measurement,
+            &calibration,
+            BeamStarts::OpenFitsAt(open, None),
+        )
+        .expect("fit");
         assert!(fit.converged);
         let covariance = fit.covariance.as_ref().expect("covariance");
         let fitted: Vec<Role> = quantities(&measurement, &calibration)
@@ -2554,7 +2822,8 @@ mod tests {
             bound: BOUND,
             shared_leverage: Some(vec![leverage]),
         };
-        let (region, _) = fit_counts_answer(&alone, &held, Some(&starts)).expect("fit");
+        let (region, _) =
+            fit_counts_answer(&alone, &held, BeamStarts::Given(&starts)).expect("fit");
         let [Some(phi), Some(expected)] =
             [&region.regions[0], joined].map(|fit| fit.overdispersion[1])
         else {
@@ -2590,6 +2859,18 @@ mod tests {
             .map(|(i, j)| 0.5 * gradient[i] * joint[(i, j)] * gradient[j])
             .sum();
         assert!(decrement <= 1e-2, "{decrement}");
+
+        let drifting = Measurement {
+            time_background: [Value::Fitted(50.0), Value::Known(0.0), Value::Known(1.0)],
+            ..measurement
+        };
+        for (most_passes, settled) in [(1, false), (2, true)] {
+            let fit = fit_settled(&drifting, &calibration, most_passes).expect("fit");
+            assert_eq!(fit.converged, settled);
+            assert_eq!(fit.covariance.is_some(), settled);
+            assert_eq!(fit.unbounded.is_some(), settled);
+            assert_eq!(fit.measured_pulls.is_some(), settled);
+        }
     }
 
     #[test]
@@ -2601,7 +2882,7 @@ mod tests {
         let hafnium = synthetic_isotope(72, 180, 20.0, 0.01, 0.06);
         let isotopes: Vec<Arc<[ResonanceData]>> = vec![Arc::new([hafnium.clone()]), Arc::new([])];
         let sizes: Vec<usize> = beams.iter().map(|b| b.coefficients().len()).collect();
-        let layout = Arc::new(Layout::new(roles(&sizes, &[Some(1), None]), 2));
+        let layout = Arc::new(Layout::new(roles(&sizes, &[Some(1), None]), &[1.0; 2]));
         let truth: Vec<f64> = layout
             .roles
             .iter()
@@ -2614,6 +2895,8 @@ mod tests {
                 Role::Temperature { .. } => 300.0,
                 Role::Normalization => 0.93,
                 Role::Background { region, term } => [[0.05, 0.0, 0.0], [0.0; 3]][region][term],
+                Role::GammaTransmission { .. } => 1.0,
+                Role::TimeBackground(term) => [0.0, 0.0, 1.0][term],
                 Role::T0 => T0_US,
                 Role::FlightPath => FLIGHT_PATH_M,
                 Role::Pulse(n) => [0.35, 0.05, 0.0, 0.25, 0.15, 0.0][n],
@@ -2691,12 +2974,15 @@ mod tests {
             open_live: None,
             sample_live: None,
             background,
+            pixels: 1.0,
+            gamma_transmission: Value::Known(1.0),
             material,
         };
         let measurement = Measurement {
             time_edges_us: map.time_edges_us.clone(),
             charge_ratio: 1.2,
             normalization: map.normalization,
+            time_background: NO_TIME_BACKGROUND,
             regions: vec![
                 region(0, Some(material), background),
                 region(1, None, [Value::Known(0.0); 3]),
@@ -2797,7 +3083,7 @@ mod tests {
         let (charge_ratio, normalization) = (1.2, 0.93);
         let layout = Arc::new(Layout::new(
             roles(&[beam.coefficients().len()], &[Some(2)]),
-            1,
+            &[1.0],
         ));
         let model = RegionsModel::new(
             &grid,
@@ -2814,6 +3100,7 @@ mod tests {
                 .copied()
                 .chain([3.0e-4, 5.0e-4, 300.0, normalization])
                 .chain(background)
+                .chain([1.0, 0.0, 0.0, 1.0])
                 .chain([T0_US, FLIGHT_PATH_M])
                 .chain([0.35, 0.05, 0.0, 0.25, 0.15, 0.0])
                 .collect();

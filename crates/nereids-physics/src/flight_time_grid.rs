@@ -468,6 +468,12 @@ impl FlightTimeGrid {
         &self.flight_times_us
     }
 
+    /// The time-bin edges in µs, ascending.
+    #[must_use]
+    pub fn time_edges_us(&self) -> &[f64] {
+        &self.time_edges_us
+    }
+
     /// The energy, in eV, of each grid point, descending.
     #[must_use]
     pub fn energies_ev(&self) -> Vec<f64> {
