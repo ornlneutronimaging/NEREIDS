@@ -27,7 +27,7 @@
 //!   final zenity leg failed (see `FileDialogs::apply_native_outcome`),
 //!   or when the user clicks the escape hatch. Works in every environment
 //!   (containers, root, no D-Bus, `ssh -X`) with zero system
-//!   dependencies — the environments of issue #526.
+//!   dependencies — the environments of.
 
 use std::path::PathBuf;
 
@@ -53,17 +53,11 @@ pub enum DialogIntent {
     /// "Save As" target for the current project (save modal). Carries
     /// the data mode chosen in the modal at request time.
     SaveProjectAs { mode: SaveDataMode },
-    /// Export directory for spatial-map results (Studio dock).
-    ExportDirectory,
-    /// Save one result tile as a colormapped PNG (tile toolbelt).
-    SaveTilePng { tile_idx: usize, label: String },
-    /// Install a local ENDF file into the cache (Configure step, #523).
+    /// Install a local ENDF file into the cache (Configure step).
     /// Carries the library selected when the picker was opened; the
     /// isotope-in-selection check stays on current state.
     InstallLocalEndf { library: EndfLibrary },
-    /// Sample TIFF stack — file or folder (Load step). Also used for the
-    /// pre-normalized transmission stack, which lands in the same
-    /// `sample_path` field with the same invalidation set.
+    /// Sample TIFF stack — file or folder (Load step).
     TiffSample,
     /// Open-beam TIFF stack — file or folder (Load step).
     TiffOpenBeam,
@@ -81,17 +75,6 @@ pub enum DialogIntent {
         mode: InputMode,
         event_params: nereids_io::nexus::EventBinningParams,
     },
-    /// Tabulated instrument-resolution file for one of the three
-    /// resolution cards.
-    ResolutionFile(ResolutionTarget),
-}
-
-/// Which of the three resolution cards asked for a tabulated file.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub enum ResolutionTarget {
-    Configure,
-    ForwardModel,
-    Detectability,
 }
 
 /// Backend-neutral dialog options (mirror of the rfd builder calls in use).
@@ -774,7 +757,7 @@ fn spawn_portal_canary(ctx: Option<egui::Context>) -> std::sync::mpsc::Receiver<
 /// Route a completed pick to its consumer. Called once per frame from
 /// `NereidsApp::update`, after all panels have run, so results are
 /// applied exactly once regardless of which panel opened the dialog —
-/// even if that panel is no longer visible.
+/// even if that panel is hidden.
 pub fn dispatch_results(state: &mut AppState) {
     let Some((intent, path)) = state.file_dialogs.take_any() else {
         return;
@@ -783,10 +766,6 @@ pub fn dispatch_results(state: &mut AppState) {
         DialogIntent::OpenProject => crate::project::load_project_from_path(state, &path),
         DialogIntent::SaveProjectAs { mode } => {
             crate::project::on_save_project_picked(state, path, mode);
-        }
-        DialogIntent::ExportDirectory => state.export_directory = Some(path),
-        DialogIntent::SaveTilePng { tile_idx, label } => {
-            crate::guided::result_widgets::save_tile_png(state, tile_idx, &label, &path);
         }
         DialogIntent::InstallLocalEndf { library } => {
             crate::guided::configure::install_local_endf(state, &path, library);
@@ -798,78 +777,26 @@ pub fn dispatch_results(state: &mut AppState) {
         DialogIntent::Hdf5OpenBeam { mode, event_params } => {
             crate::guided::load::on_hdf5_ob_picked(state, path, mode, &event_params);
         }
-        DialogIntent::ResolutionFile(target) => on_resolution_file_picked(state, target, path),
-    }
-}
-
-/// Apply a picked tabulated-resolution file to the card identified by
-/// `target`, mirroring the invalidation each card performs for its
-/// other (non-file) changes.
-///
-/// Pick-wins semantics: the resolving file replaces the whole mode. On
-/// the Linux native tier the dialog can resolve seconds later, so the
-/// user may have switched the card to Gaussian and tuned it meanwhile —
-/// the replacement is then announced in the status bar instead of
-/// silently discarding those edits.
-fn on_resolution_file_picked(state: &mut AppState, target: ResolutionTarget, path: PathBuf) {
-    use crate::state::ResolutionMode;
-
-    let flight_path_m = state.beamline.flight_path_m;
-    let (mode, invalidate): (&mut ResolutionMode, fn(&mut AppState)) = match target {
-        ResolutionTarget::Configure => (&mut state.resolution_mode, |s| {
-            // Mirror configure.rs's resolution-change invalidation: the
-            // analysis outputs and any in-flight spatial worker belong to
-            // the previous resolution setting.
-            s.invalidate_analysis_outputs();
-        }),
-        ResolutionTarget::ForwardModel => (&mut state.fm_resolution_mode, |s| {
-            s.fm_spectrum = None;
-            s.fm_per_isotope_spectra.clear();
-        }),
-        ResolutionTarget::Detectability => (&mut state.detect_resolution_mode, |s| {
-            s.detect_results.clear();
-        }),
-    };
-    let replaced_gaussian = matches!(mode, ResolutionMode::Gaussian { .. });
-    if crate::widgets::design::apply_resolution_file(mode, path, flight_path_m) {
-        invalidate(state);
-        if replaced_gaussian {
-            state.status_message =
-                "Tabulated resolution selected — replaced the Gaussian settings edited \
-                 while the dialog was open"
-                    .into();
-        }
     }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::state::ResolutionMode;
 
     #[test]
     fn take_any_is_consume_once() {
         let mut dialogs = FileDialogs::default();
-        dialogs.inject(DialogIntent::ExportDirectory, PathBuf::from("/tmp/x"));
+        dialogs.inject(DialogIntent::OpenProject, PathBuf::from("/tmp/x"));
         assert!(dialogs.take_any().is_some());
         assert!(dialogs.take_any().is_none());
-    }
-
-    #[test]
-    fn dispatch_export_directory_sets_state() {
-        let mut state = AppState::default();
-        state
-            .file_dialogs
-            .inject(DialogIntent::ExportDirectory, PathBuf::from("/tmp/exports"));
-        dispatch_results(&mut state);
-        assert_eq!(state.export_directory, Some(PathBuf::from("/tmp/exports")));
     }
 
     #[test]
     fn dispatch_without_pending_is_noop() {
         let mut state = AppState::default();
         dispatch_results(&mut state);
-        assert!(state.export_directory.is_none());
+        assert!(state.sample_path.is_none());
     }
 
     #[test]
@@ -885,8 +812,6 @@ mod tests {
         assert_eq!(state.sample_path, Some(PathBuf::from("/data/sample.tif")));
         assert!(!state.load_error);
         assert!(state.sample_data.is_none());
-        assert!(state.normalized.is_none());
-        assert!(state.spatial_result.is_none());
     }
 
     #[test]
@@ -903,149 +828,6 @@ mod tests {
         assert!(state.spectrum_values.is_none());
         assert!(state.energies.is_none());
         assert!(!state.load_error);
-    }
-
-    #[test]
-    fn dispatch_resolution_file_bad_file_sets_error() {
-        let mut state = AppState::default();
-        // An empty temp file cannot parse as a tabulated resolution.
-        let tmp = tempfile::NamedTempFile::new().expect("tempfile");
-        state.file_dialogs.inject(
-            DialogIntent::ResolutionFile(ResolutionTarget::Configure),
-            tmp.path().to_path_buf(),
-        );
-        dispatch_results(&mut state);
-        match &state.resolution_mode {
-            ResolutionMode::Tabulated { data, error, path } => {
-                assert!(data.is_none());
-                assert!(error.is_some(), "empty file must produce a parse error");
-                assert_eq!(path, tmp.path());
-            }
-            other => panic!("expected Tabulated, got {other:?}"),
-        }
-    }
-
-    /// Minimal fitted result for SaveTilePng dispatch tests: one 2x2
-    /// density map per label, plus an optional temperature map.
-    fn spatial_result_with(
-        labels: &[&str],
-        with_temperature: bool,
-    ) -> nereids_pipeline::spatial::SpatialResult {
-        let map = || ndarray::Array2::from_shape_fn((2, 2), |(y, x)| (y * 2 + x) as f64);
-        nereids_pipeline::spatial::SpatialResult {
-            density_maps: labels.iter().map(|_| map()).collect(),
-            uncertainty_maps: labels.iter().map(|_| map()).collect(),
-            chi_squared_map: map(),
-            deviance_per_dof_map: None,
-            converged_map: ndarray::Array2::from_elem((2, 2), true),
-            temperature_map: with_temperature.then(map),
-            temperature_uncertainty_map: None,
-            isotope_labels: labels.iter().map(|s| s.to_string()).collect(),
-            anorm_map: None,
-            background_maps: None,
-            back_d_map: None,
-            back_f_map: None,
-            t0_us_map: None,
-            l_scale_map: None,
-            energy_scale_flight_path_m: None,
-            baseline_global: None,
-            baseline_e_ref_ev: None,
-            baseline_maps: None,
-            warnings: Vec::new(),
-            n_converged: 4,
-            n_total: 4,
-            n_failed: 0,
-        }
-    }
-
-    fn dispatch_save_tile_png(state: &mut AppState, tile_idx: usize, label: &str, path: PathBuf) {
-        state.file_dialogs.inject(
-            DialogIntent::SaveTilePng {
-                tile_idx,
-                label: label.to_string(),
-            },
-            path,
-        );
-        dispatch_results(state);
-    }
-
-    #[test]
-    fn dispatch_save_tile_png_without_result_errors() {
-        let mut state = AppState::default();
-        dispatch_save_tile_png(
-            &mut state,
-            0,
-            "Fe56",
-            PathBuf::from("/tmp/never-written.png"),
-        );
-        assert_eq!(state.status_message, "PNG save error: no results available");
-    }
-
-    #[test]
-    fn dispatch_save_tile_png_refuses_stale_label() {
-        // The dialog can resolve frames after it was opened; if the
-        // results were replaced meanwhile, the carried label no longer
-        // names the tile at that index and nothing must be written.
-        let mut state = AppState {
-            spatial_result: Some(spatial_result_with(&["Fe56"], false)),
-            ..Default::default()
-        };
-        let dir = tempfile::tempdir().expect("tempdir");
-        let path = dir.path().join("stale.png");
-        dispatch_save_tile_png(&mut state, 0, "Gd157", path.clone());
-        assert!(
-            state.status_message.starts_with("PNG not saved:"),
-            "expected refusal, got {:?}",
-            state.status_message
-        );
-        assert!(!path.exists(), "stale-label save must not write a file");
-    }
-
-    #[test]
-    fn dispatch_save_tile_png_saves_matching_density_tile() {
-        let mut state = AppState {
-            spatial_result: Some(spatial_result_with(&["Fe56"], false)),
-            ..Default::default()
-        };
-        let dir = tempfile::tempdir().expect("tempdir");
-        let path = dir.path().join("Fe56.png");
-        dispatch_save_tile_png(&mut state, 0, "Fe56", path.clone());
-        assert!(
-            state.status_message.starts_with("Saved PNG:"),
-            "expected success, got {:?}",
-            state.status_message
-        );
-        assert!(path.exists());
-    }
-
-    #[test]
-    fn dispatch_save_tile_png_maps_tiles_like_studio() {
-        // Index mapping mirror of the Studio analysis column:
-        // 0..n_density = isotopes, n_density = temperature (if present),
-        // anything past that does not exist — even with a temperature
-        // map available.
-        let mut state = AppState {
-            spatial_result: Some(spatial_result_with(&["Fe56"], true)),
-            ..Default::default()
-        };
-        let dir = tempfile::tempdir().expect("tempdir");
-
-        let temp_path = dir.path().join("temperature.png");
-        dispatch_save_tile_png(&mut state, 1, "temperature", temp_path.clone());
-        assert!(
-            state.status_message.starts_with("Saved PNG:"),
-            "expected temperature tile at n_density to save, got {:?}",
-            state.status_message
-        );
-        assert!(temp_path.exists());
-
-        let ghost_path = dir.path().join("ghost.png");
-        dispatch_save_tile_png(&mut state, 2, "temperature", ghost_path.clone());
-        assert_eq!(
-            state.status_message,
-            "PNG save error: tile 2 no longer exists"
-        );
-        assert!(!ghost_path.exists());
     }
 
     #[cfg(target_os = "linux")]
@@ -1071,7 +853,7 @@ mod tests {
         // any in-flight request keeps waiting on its worker.
         let mut dialogs = FileDialogs::default();
         dialogs.linux.tier = Some(LinuxTier::Native);
-        dialogs.linux.active_native = Some(native_request(DialogIntent::ExportDirectory));
+        dialogs.linux.active_native = Some(native_request(DialogIntent::OpenProject));
         dialogs.apply_canary_verdict(CanaryVerdict::Broken("no backend".into()), true);
         assert!(dialogs.linux.tier == Some(LinuxTier::Native));
         assert!(dialogs.warning.is_none());
@@ -1087,7 +869,7 @@ mod tests {
         // the built-in browser so the user's click still lands.
         let mut dialogs = FileDialogs::default();
         dialogs.linux.tier = Some(LinuxTier::Native);
-        dialogs.linux.active_native = Some(native_request(DialogIntent::ExportDirectory));
+        dialogs.linux.active_native = Some(native_request(DialogIntent::OpenProject));
         dialogs.apply_canary_verdict(CanaryVerdict::Broken("no backend".into()), false);
         assert!(dialogs.linux.tier == Some(LinuxTier::InApp));
         assert!(
@@ -1147,13 +929,13 @@ mod tests {
         let mut dialogs = FileDialogs::default();
         dialogs.linux.tier = Some(LinuxTier::Native);
         dialogs.apply_native_outcome(
-            native_request(DialogIntent::ExportDirectory),
+            native_request(DialogIntent::OpenProject),
             Some(PathBuf::from("/tmp/picked")),
             Some("Failed to connect to session bus: org.freedesktop.DBus.Error.NoServer".into()),
         );
         assert_eq!(
             dialogs.take_any(),
-            Some((DialogIntent::ExportDirectory, PathBuf::from("/tmp/picked")))
+            Some((DialogIntent::OpenProject, PathBuf::from("/tmp/picked")))
         );
         assert!(dialogs.linux.tier == Some(LinuxTier::Native));
         assert!(dialogs.take_warning().is_none());
@@ -1221,7 +1003,7 @@ mod tests {
         let mut dialogs = FileDialogs::default();
         dialogs.linux.tier = Some(LinuxTier::Native);
         dialogs.linux.active_native = Some(native_request(DialogIntent::OpenProject));
-        dialogs.pending = Some((DialogIntent::ExportDirectory, PathBuf::from("/tmp/x")));
+        dialogs.pending = Some((DialogIntent::OpenProject, PathBuf::from("/tmp/x")));
         dialogs.pick_file(DialogIntent::TiffSample, DialogOptions::default());
         let req = dialogs
             .linux
@@ -1232,7 +1014,7 @@ mod tests {
         assert!(req.overlay_forced, "refusal must force the overlay");
         assert_eq!(
             dialogs.take_any(),
-            Some((DialogIntent::ExportDirectory, PathBuf::from("/tmp/x")))
+            Some((DialogIntent::OpenProject, PathBuf::from("/tmp/x")))
         );
     }
 

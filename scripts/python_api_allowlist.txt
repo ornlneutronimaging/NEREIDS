@@ -1,105 +1,41 @@
 # Symbols exported by bindings/python/python/nereids/__init__.pyi but not
-# narratively documented in docs/guide/src/python-api.md.  Each entry should
-# be revisited at release time — prefer moving entries OUT of this file by
-# documenting them, rather than letting it grow unboundedly.
+# narratively documented in docs/guide/src/python-api.md.  Prefer moving an
+# entry out of this file by documenting the symbol.
 #
-# Format: one symbol per line; `#` starts a comment line; blank lines OK.
-# An entry being in this file means the drift gate
-# (scripts/check_python_api_drift.py) will not fail when the symbol is
-# absent from python-api.md.  See issue #533 for the rationale.
+# Format: one symbol per line; " #" starts a comment line; blank lines OK.
+# An entry in this file means scripts/check_python_api_drift.py will not fail
+# when the symbol is absent from python-api.md.
 
 # ---------------------------------------------------------------------------
-# Documented narratively in docs/guide/src/data-io.md instead
-# (TIFF/NeXus loaders, normalization, NeXus probe metadata).
+# Documented narratively in docs/guide/src/data-io.md instead.
 # ---------------------------------------------------------------------------
 probe_nexus
-normalize
 NexusMetadata
 
 # ---------------------------------------------------------------------------
-# Low-level physics building blocks — covered by the auto-generated pdoc
-# reference (/python/), with no dedicated section in the curated
-# python-api.md narrative yet.
+# Low-level physics building blocks covered by the auto-generated pdoc
+# reference, with no dedicated section in python-api.md.
 # ---------------------------------------------------------------------------
 cross_sections
 beer_lambert
 doppler_broaden
-resolution_broaden
 apply_resolution
 precompute_cross_sections
-# ---------------------------------------------------------------------------
-# Tabulated resolution helper class returned by load_resolution(...); the
-# load_resolution function IS referenced from python-api.md but the result
-# class itself has no narrative section.
-# ---------------------------------------------------------------------------
-TabulatedResolution
 
 # ---------------------------------------------------------------------------
-# Energy-axis calibration API (calibrate_energy + CalibrationResult); no
-# dedicated narrative section yet — pdoc reference covers the signature.
-# ---------------------------------------------------------------------------
-calibrate_energy
-CalibrationResult
-
-# ---------------------------------------------------------------------------
-# Trace-detectability API — used in quickstart-python.md but not given a
-# dedicated section in the curated python-api.md narrative.
-# ---------------------------------------------------------------------------
-trace_detectability
-trace_detectability_survey
-TraceDetectabilityReport
-
-# ---------------------------------------------------------------------------
-# Isotope-group helpers — referenced indirectly via `groups=[...]` rows in
-# the fitting tables but the IsotopeGroup class itself has no section yet.
+# Isotope-group helper; used through the fitting arguments.
 # ---------------------------------------------------------------------------
 IsotopeGroup
 
 # ---------------------------------------------------------------------------
-# Research-only Jacobian/Fisher evaluator (research follow-up work); no
-# narrative section yet — pdoc reference covers the signature.
-# ---------------------------------------------------------------------------
-compute_model_jacobian
-ModelJacobianResult
-
-# ---------------------------------------------------------------------------
-# Typed-API counts+nuisance constructor (issue #555 M5).  ``from_counts``
-# and ``from_transmission`` are exercised in the curated narrative; the
-# nuisance variant is the explicit-background sibling and follows the
-# same shape, so it's covered by the surrounding section without a
-# dedicated heading.  Move OUT of the allowlist once
-# ``docs/guide/src/python-api.md`` gains an explicit "Counts with
-# explicit background" subsection.
-# ---------------------------------------------------------------------------
-from_counts_with_nuisance
-
-# ---------------------------------------------------------------------------
-# Ikeda-Carpenter analytical resolution model + its EnergyLaw parameter
-# helper (epic #394 resolution cross-validation).  Research-stage API used
-# to adjudicate the VENUS resolution (Gaussian vs tabulated-UDR vs IC); not
-# yet part of the curated user narrative.  Move OUT of the allowlist once
-# the resolution cross-validation feature/paper lands and
-# docs/guide/src/python-api.md gains a "Resolution models" section.
+# Ikeda-Carpenter analytical resolution model and its EnergyLaw parameter
+# helper; covered by the pdoc reference.
 # ---------------------------------------------------------------------------
 EnergyLaw
 IkedaCarpenter
 
 # ---------------------------------------------------------------------------
-# Instrument-resolution calibration (epic #394).  calibrate_resolution() fits
-# the resolution parameters of a model family to a known-(rho,T) calibrant;
-# ResolutionCalibration is its result.  The pdoc reference covers them.
-# Move OUT of the allowlist if a dedicated python-api.md narrative heading
-# is added.
+# Tabulated resolution helper class returned by load_resolution; covered by
+# the pdoc reference.
 # ---------------------------------------------------------------------------
-calibrate_resolution
-ResolutionCalibration
-
-# ---------------------------------------------------------------------------
-# Joint sample + calibrant fitting.  fit_with_calibrant() fits both spectra
-# against one shared resolution so the reported temperature uncertainty
-# carries the degeneracy that pinning a calibrated resolution drops;
-# JointFitResult is its result.  Same disposition as calibrate_resolution
-# above.
-# ---------------------------------------------------------------------------
-fit_with_calibrant
-JointFitResult
+TabulatedResolution

@@ -137,9 +137,7 @@ roll_changelog() {
         return
     fi
     local tmp
-    # Explicit path template (ends in X's): works identically on GNU and BSD
-    # mktemp. (Bare `mktemp` also works on both, but the template form is
-    # unambiguous and matches the pattern used elsewhere in .claude/skills.)
+    # Explicit path template (ends in X's): works identically on GNU and BSD mktemp.
     tmp="$(mktemp "${TMPDIR:-/tmp}/bump-version-changelog.XXXXXX")"
     if awk -v cur="$CURRENT_VERSION" -v new="$NEW_VERSION" -v date="$RELEASE_DATE" -v url="$REPO_URL" '
         /^## \[Unreleased\]$/ {

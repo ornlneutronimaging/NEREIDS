@@ -1,7 +1,7 @@
 # Data I/O and NeXus/TOF
 
-This page documents the Python-facing TIFF, NeXus, normalization, and TOF
-energy-grid behavior outside the MCP-specific workflow page.
+This page documents the Python-facing TIFF, NeXus and TOF behavior outside
+the MCP-specific workflow page.
 
 ## Axis Convention
 
@@ -11,9 +11,8 @@ NEREIDS uses the spectral axis first:
 (n_energy_or_tof, height, width)
 ```
 
-This applies to TIFF stacks, NeXus counts, normalized transmission cubes,
-uncertainty cubes, and the arrays passed to `from_counts(...)` and
-`from_transmission(...)`.
+This applies to TIFF stacks, NeXus counts, and the raw count arrays passed
+to the counts fit.
 
 For single spectra, use 1D arrays with shape `(n_energy,)`.
 
@@ -40,8 +39,8 @@ sorted lexicographically by filename. Use zero-padded names such as
 matches filenames, not full paths, and supports `*` and `?`.
 
 Note: load-time coverage/thickness masking is deliberately not part of the
-loaders — per the #646 masking policy, coverage and sample thickness are
-model concerns handled downstream, not I/O concerns.
+loaders. Coverage and sample thickness are model concerns handled downstream,
+not I/O concerns.
 
 ### Chunked VENUS folders
 
@@ -158,31 +157,12 @@ edges_us = nereids.read_tof_sidecar(
 energies = nereids.tof_to_energy_centers(edges_us, flight_path_m=25.0)
 ```
 
-## Normalization
+## Counts
 
-Raw sample and open-beam arrays can be normalized to transmission:
-
-```python
-transmission, uncertainty = nereids.normalize(
-    sample_counts,
-    open_beam_counts,
-    pc_sample=sample_proton_charge,
-    pc_ob=open_beam_proton_charge,
-)
-```
-
-The formula is:
-
-```text
-T = (C_sample / C_open_beam) * (PC_open_beam / PC_sample)
-```
-
-`sample_counts` and `open_beam_counts` must have identical shape. Optional
-`dark_current` is a 2D `(height, width)` array.
-
-For fitting raw counts directly, prefer `from_counts(...)` or
-`fit_counts_spectrum_typed(...)` so the counts-KL dispatch can use the
-counts-domain likelihood.
+The fit takes raw sample and open-beam counts directly and forms no
+transmission. Load both arms with the same shape and keep them on the TOF bin
+edges; pass them to the counts fit (`fit_counts` for one spectrum, `fit_map`
+for a map of pixel patches). See the [Python API](python-api.md).
 
 ## NeXus Histogram Loading
 
@@ -285,8 +265,8 @@ non-finite entries, decreasing timestamps) raises `ValueError`.
 
 NeXus loaders return counts in ascending TOF order. Neutron energy decreases
 as TOF increases, so direct TOF-bin conversion would be descending in energy.
-`tof_to_energy_centers(...)` returns ascending energy centers suitable for
-NEREIDS fitting:
+`tof_to_energy_centers(...)` returns ascending energy centers for display and
+forward-model checks; the counts fit itself works on TOF bin edges:
 
 ```python
 flight_path_m = sample.flight_path_m or 25.0
@@ -302,49 +282,26 @@ workflow reverses counts to the same ascending-energy order before fitting.
 For direct Python workflows, use this pattern:
 
 ```python
-energies = nereids.tof_to_energy_centers(sample.tof_edges_us, flight_path_m)
-
-# load_nexus_histogram returns ascending TOF. Reverse axis 0 to align with
-# ascending energy centers.
-sample_counts = sample.counts[::-1, :, :]
-open_beam_counts = open_beam.counts[::-1, :, :]
-
-data = nereids.from_counts(sample_counts, open_beam_counts)
-result = nereids.spatial_map_typed(data, energies, [u238], c=charge_ratio)
+# load_nexus_histogram returns counts on ascending TOF bin edges; the counts
+# fit consumes those edges and the counts directly.
+edges_us = sample.tof_edges_us
+sample_counts = sample.counts
+open_beam_counts = open_beam.counts
 ```
 
 If you construct an energy grid yourself, make sure the grid and every
 spectral array use the same order and that `energies.shape[0]` matches the
 first array dimension.
 
-## Counts vs Transmission Fitting
+## Fitting counts
 
-Use counts APIs when you have raw sample and open-beam counts:
-
-```python
-fit = nereids.fit_counts_spectrum_typed(
-    sample_counts_1d,
-    open_beam_counts_1d,
-    energies,
-    [(u238, 0.0005)],
-    c=charge_ratio,
-)
-```
-
-Use transmission APIs when your data is already normalized:
+Raw sample and open-beam counts go straight to the counts fit:
 
 ```python
-fit = nereids.fit_spectrum_typed(
-    transmission_1d,
-    uncertainty_1d,
-    energies,
-    [(u238, 0.0005)],
-)
+fit = nereids.fit_counts(measurement, calibration)      # one spectrum
+counts_map = nereids.fit_map(map_measurement, calibration)  # pixel patches
 ```
 
-For spatial maps, the same distinction is encoded by the input constructor:
-
-```python
-counts_data = nereids.from_counts(sample_counts_3d, open_beam_counts_3d)
-trans_data = nereids.from_transmission(transmission_3d, uncertainty_3d)
-```
+Build the `Measurement`/`MapMeasurement` from the TOF edges, the two count
+cubes and the material, and the `Calibration` from `t0`, the flight path and
+the pulse. See the [Python API](python-api.md) for the constructors.

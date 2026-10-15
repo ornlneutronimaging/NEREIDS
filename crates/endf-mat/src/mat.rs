@@ -3554,7 +3554,7 @@ mod tests {
     #[test]
     fn test_mat_number_cendl_br_absent() {
         // CENDL-3.2 has no Br entries (Be → Bi → Bk in element list). This is a
-        // material gap relative to the other four libraries; #515 (ENDF source
+        // material gap relative to the other four libraries; (ENDF source
         // comparison research) keeps Br comparison at 5 libraries.
         assert_eq!(mat_number_cendl(35, 79), None);
         assert_eq!(mat_number_cendl(35, 81), None);

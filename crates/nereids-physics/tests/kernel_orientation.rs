@@ -1,5 +1,5 @@
 //! Sign-pinning regression for the tabulated-kernel convolution
-//! orientation (issue #631).
+//! orientation.
 //!
 //! Kernels store their delayed-emission tail at POSITIVE TOF offsets
 //! (mode at 0). A delayed neutron measured at TOF `t` really flew

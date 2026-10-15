@@ -18,7 +18,7 @@ use crate::error::IoError;
 pub const PROJECT_SCHEMA_VERSION: &str = "1.0";
 
 /// Format version written to the `format_version` attribute of the
-/// `/intermediate/detected_dead_pixels` dataset (#646 review R4, P1-1).
+/// `/intermediate/detected_dead_pixels` dataset ( P1-1).
 ///
 /// The dataset carries the session-scoped *detected* dead/hot mask
 /// component (the declared component lives at
@@ -96,12 +96,9 @@ pub struct ProjectSnapshot {
     pub fit_temperature: bool,
     /// Fit residual energy-scale calibration (TZERO `t₀` + flight-path
     /// `L_scale`).  `Option` for backwards compatibility — projects
-    /// saved before this field was introduced load as `None` (= false).
     pub fit_energy_scale: Option<bool>,
     /// User-specified fit energy range `[min_eV, max_eV]` (SAMMY EMIN/EMAX
     /// equivalent — INPut-file card set 2, manual Table VI A.1).
-    /// `None` (default) = full grid.  Projects saved before this field
-    /// was introduced load as `None` via the HDF5 reader's missing-
     /// attribute handling — the bounds are stored as two scalar
     /// attributes (`fit_energy_range_min_ev` / `fit_energy_range_max_ev`)
     /// on `/config/solver`, not as a dataset.
@@ -146,26 +143,25 @@ pub struct ProjectSnapshot {
     // -- intermediate (always embedded) --
     pub normalized: Option<Array3<f64>>,
     /// D-1: Per-bin transmission uncertainty σ (same shape as normalized).
-    /// Previously missing from the snapshot, causing reloaded projects to
     /// lose uncertainty information (reconstructed as zeros).
     pub normalized_uncertainty: Option<Array3<f64>>,
     pub energies: Option<Vec<f64>>,
     /// D-20: Dead-pixel mask (true = dead). Same spatial dimensions as the
     /// transmission data (height × width). `None` when no mask is available.
     ///
-    /// Since #646 the GUI stores the **declared** mask component only here
+    /// Since the GUI stores the **declared** mask component only here
     /// (file-declared or project-declared — `AppState::file_dead_pixels`);
     /// the detected component travels separately in
     /// [`ProjectSnapshot::detected_dead_pixels`].  The dataset path
     /// (`/intermediate/dead_pixels`), dtype, and shape are unchanged, so no
-    /// format marker is needed.  Files written before #646 carried the
+    /// format marker is needed. Files written before carried the
     /// effective mask (declared ∪ detected at save time); the GUI promotes
     /// those to declared once on load.
     pub dead_pixels: Option<Array2<bool>>,
-    /// Detected dead/hot mask component active at save time (#646 review
-    /// R4, P1-1).  Same spatial dimensions as the transmission data;
-    /// `None` when no detection had run (or for files predating the
-    /// dataset — restore then falls back to the declared component alone).
+    /// Detected dead/hot mask component active at save time.  Same spatial
+    /// dimensions as the transmission data; `None` when no detection had run
+    /// (or for files predating the dataset — restore then falls back to the
+    /// declared component alone).
     ///
     /// Persisted as its own session-scoped dataset
     /// (`/intermediate/detected_dead_pixels`, u8, with a `format_version`
@@ -196,14 +192,14 @@ pub struct ProjectSnapshot {
     /// Stored as 3 separate Array2 maps (one per coefficient).
     pub background_maps: Option<[Array2<f64>; 3]>,
     /// Global multiplicative-baseline coefficients [b0, b1, b2] from the
-    /// spatial two-stage fit (issue #635).  `None` when no baseline was
+    /// spatial two-stage fit. `None` when no baseline was
     /// fitted or in per-pixel mode.
     pub baseline_global: Option<[f64; 3]>,
     /// Baseline reference energy E_ref (eV) of the centered ln(E/E_ref)
     /// basis — persisted so the overlay reconstructs B(E) with the exact
     /// reference the fit used.  `None` when no baseline was fitted.
     pub baseline_e_ref_ev: Option<f64>,
-    /// Per-pixel baseline coefficient maps [b0, b1, b2] (issue #635,
+    /// Per-pixel baseline coefficient maps [b0, b1, b2] (
     /// per-pixel mode).  Stored like `background_maps`.
     pub baseline_maps: Option<[Array2<f64>; 3]>,
 
@@ -222,7 +218,7 @@ pub struct ProjectSnapshot {
     /// Fitted background [BackA, BackB, BackC] from single-pixel fit.
     pub single_fit_background: Option<[f64; 3]>,
     /// Fitted multiplicative-baseline [b0, b1, b2] from single-pixel fit
-    /// (issue #635).  `None` when the baseline was not enabled.
+    ///. `None` when the baseline was not enabled.
     pub single_fit_baseline: Option<[f64; 3]>,
     /// Baseline reference energy E_ref (eV) for the single-pixel fit.
     pub single_fit_baseline_e_ref_ev: Option<f64>,
@@ -235,12 +231,12 @@ pub struct ProjectSnapshot {
     pub lm_background_enabled: Option<bool>,
     /// Whether KL background fitting (b0 + b1/sqrt(E)) is enabled.
     pub kl_background_enabled: Option<bool>,
-    /// Whether the bounded multiplicative baseline (#635) is enabled.
+    /// Whether the bounded multiplicative baseline is enabled.
     /// This flag SELECTS the fit model (attaches the baseline and holds
     /// Anorm fixed), so it must round-trip like every sibling solver
     /// flag — without it a reloaded project displays baseline results
     /// while a refit silently runs a different model.  `None` for
-    /// pre-#635 files; restore-side defaults to false.
+    /// pre- files; restore-side defaults to false.
     pub baseline_enabled: Option<bool>,
     /// Counts-KL proton-charge ratio `c = Q_s / Q_ob`.
     /// `None` for project files predating the field; restore-side
@@ -261,7 +257,6 @@ pub struct ProjectSnapshot {
     ///
     /// Populated only by [`load_project`]; never written back. Legacy project
     /// files (saved before the RML/URR removal) serialized `rml`/`urr`
-    /// payloads that the current [`ResonanceData`] struct no longer declares;
     /// serde silently ignores those unknown fields, leaving a placeholder
     /// range with no evaluable content. Restoring such an entry would mark the
     /// isotope loaded yet contribute zero cross-section to every fit, so the
@@ -677,7 +672,7 @@ fn write_config(file: &hdf5::File, snap: &ProjectSnapshot) -> Result<(), IoError
         write_bool_attr(&solver, "fit_energy_scale", fes)?;
     }
     if let Some((fr_min, fr_max)) = snap.fit_energy_range {
-        // SAMMY EMIN/EMAX-equivalent fit-energy-range bounds (#514).
+        // SAMMY EMIN/EMAX-equivalent fit-energy-range bounds.
         // Stored as two scalar attributes so HDF5 introspection tools
         // can read the values directly without parsing a packed tuple.
         write_f64_attr(&solver, "fit_energy_range_min_ev", fr_min)?;
@@ -889,7 +884,7 @@ fn write_intermediate(file: &hdf5::File, snap: &ProjectSnapshot) -> Result<(), I
         }
     }
 
-    // #646 R4 P1-1: Persist the DETECTED mask component as its own
+    // R4 P1-1: Persist the DETECTED mask component as its own
     // session-scoped, versioned dataset (u8, 0 = live, 1 = excluded) —
     // see the field rustdoc on `ProjectSnapshot::detected_dead_pixels`.
     if let Some(ref det) = snap.detected_dead_pixels {
@@ -1043,7 +1038,7 @@ fn write_results(file: &hdf5::File, snap: &ProjectSnapshot) -> Result<(), IoErro
         }
     }
 
-    // Issue #635: multiplicative-baseline outputs.  The overlay rebuilds
+    // multiplicative-baseline outputs. The overlay rebuilds
     // B(E) from these on project load — dropping them would silently render
     // a different scientific model than the one that was fitted.
     if let Some(bl) = snap.baseline_global {
@@ -1427,7 +1422,7 @@ fn read_config(file: &hdf5::File, snap: &mut ProjectSnapshot) -> Result<(), IoEr
     snap.temperature_k = read_f64_attr(&solver, "temperature_k")?;
     snap.fit_temperature = read_bool_attr(&solver, "fit_temperature")?;
     snap.fit_energy_scale = read_bool_attr(&solver, "fit_energy_scale").ok();
-    // SAMMY EMIN/EMAX-equivalent fit-energy-range bounds (#514).  Both
+    // SAMMY EMIN/EMAX-equivalent fit-energy-range bounds. Both
     // attributes must be present to populate the field; older project
     // files load as `None` (= full-grid fit, the prior default).
     snap.fit_energy_range = match (
@@ -1654,7 +1649,7 @@ fn read_intermediate(file: &hdf5::File, snap: &mut ProjectSnapshot) -> Result<()
         }
     }
 
-    // #646 R4 P1-1: Load the detected mask component (u8 → bool).  The
+    // R4 P1-1: Load the detected mask component (u8 → bool). The
     // dataset is versioned; a missing or unrecognized `format_version`
     // leaves the field `None`, as does a dataset whose rank is not 2 —
     // the same shape gate as the declared-mask reader above
@@ -1855,7 +1850,6 @@ fn read_results(file: &hdf5::File, snap: &mut ProjectSnapshot) -> Result<(), IoE
     }
 
     // D-11/D-21: Background maps.  FAIL CLOSED on a partial or malformed
-    // group (review R3): save_project writes all three datasets atomically,
     // so a group that exists with a missing or mis-shaped member is a
     // truncated / corrupted file — silently loading it as "no background"
     // would display a different scientific model than the one fitted.
@@ -1894,12 +1888,11 @@ fn read_results(file: &hdf5::File, snap: &mut ProjectSnapshot) -> Result<(), IoE
         ]);
     }
 
-    // Issue #635: multiplicative-baseline outputs.  FAIL CLOSED on
-    // present-but-malformed data (review R3): the GUI overlay rebuilds
+    // multiplicative-baseline outputs. FAIL CLOSED on
     // B(E) from these fields, so silently dropping a truncated baseline
     // would render a different scientific model than the one fitted —
     // the exact silent-model-change class the persistence fix closed.
-    // ABSENCE stays legal (pre-#635 files, baseline-off fits).
+    // ABSENCE stays legal (pre- files, baseline-off fits).
     if let Ok(ds) = results.dataset("baseline_global") {
         let data: Vec<f64> = ds
             .read_raw()
@@ -2600,7 +2593,7 @@ mod tests {
         assert!((en[2] - 3.0).abs() < 1e-10);
     }
 
-    /// #646 R4 P1-1: the declared and detected mask components round-trip
+    /// The declared and detected mask components round-trip
     /// as independent datasets — neither leaks into the other.
     #[test]
     fn test_roundtrip_detected_dead_pixels_independent_of_declared() {
@@ -2620,7 +2613,7 @@ mod tests {
         assert_eq!(loaded.detected_dead_pixels.unwrap(), detected);
     }
 
-    /// #646 R4 P1-1 backward compat: a file written without the detected
+    /// Backward compat: a file written without the detected
     /// dataset (any pre-R4 file, or a session with no detection) loads
     /// with `detected_dead_pixels = None` — the declared-only fallback.
     #[test]
@@ -2638,7 +2631,7 @@ mod tests {
         assert!(loaded.detected_dead_pixels.is_none());
     }
 
-    /// #646 R4 P1-1 forward compat: a detected dataset whose
+    /// Forward compat: a detected dataset whose
     /// `format_version` is unrecognized is ignored (declared-only
     /// restore), never misread under the current format's semantics.
     #[test]
@@ -2724,7 +2717,6 @@ mod tests {
 
         // A legacy project (saved before the RML/URR removal) persisted an
         // LRF=7 isotope whose ResonanceData JSON carried `rml`/`urr` payloads
-        // the current struct no longer declares. serde silently ignores those
         // unknown fields, so the entry deserializes as a placeholder range
         // with empty l_groups — non-evaluable. Prove that (a) serde tolerates
         // the legacy keys and (b) the loader drops the entry rather than
@@ -3139,7 +3131,7 @@ mod tests {
         assert_eq!(loaded.single_fit_labels, Some(expected_labels));
     }
 
-    /// Issue #635 (review R1 P1): baseline outputs must survive
+    /// (P1): baseline outputs must survive
     /// save/load — the GUI overlay rebuilds B(E) from them, so dropping
     /// them silently renders a different scientific model on reload.
     #[test]
@@ -3174,7 +3166,7 @@ mod tests {
         assert_eq!(loaded.single_fit_baseline, Some([1.019, -0.029, 0.011]));
         assert!((loaded.single_fit_baseline_e_ref_ev.unwrap() - 3.3166247903554).abs() < 1e-12);
 
-        // Absence round-trips as None (pre-#635 files and baseline-off fits).
+        // Absence round-trips as None (pre- files and baseline-off fits).
         let path2 = dir.path().join("no_baseline.nrd.h5");
         let snap2 = minimal_snapshot();
         save_project(&path2, &snap2).unwrap();
@@ -3190,7 +3182,6 @@ mod tests {
         );
     }
 
-    /// Review R3: present-but-malformed baseline data must FAIL CLOSED —
     /// a truncated project file silently loading as "no baseline" would
     /// display a different scientific model than the one fitted.  The
     /// corrupted fixtures here are built by hand with the hdf5 API (NOT by

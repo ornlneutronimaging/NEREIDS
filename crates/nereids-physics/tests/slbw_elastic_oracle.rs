@@ -7,7 +7,7 @@
 //! numerically invisible at the low-ρ (s-wave, thermal-eV) energies the
 //! `samtry` cases sample.
 //!
-//! Issue #549: SLBW elastic Γ_tot·sin²φ interference sign error.
+//! SLBW elastic Γ_tot·sin²φ interference sign error.
 //!
 //! ## SAMMY reference
 //! - `mlb/mmlb3.f90:56` — `Elastc_Mlb` SLBW branch:

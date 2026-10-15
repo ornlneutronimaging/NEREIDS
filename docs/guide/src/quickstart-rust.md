@@ -1,46 +1,29 @@
 # Quickstart: Rust
 
-This example loads ENDF resonance data for U-238, computes a theoretical
-transmission spectrum, and fits it to recover the areal density.
-
-The snippets below are spliced from
-[`crates/nereids-fitting/examples/quickstart.rs`](https://github.com/ornlneutronimaging/NEREIDS/blob/main/crates/nereids-fitting/examples/quickstart.rs)
-so the rendered page cannot drift out of sync with the live crate APIs:
-the example is compile-checked by `cargo check --workspace --examples` in
-CI. Run the full example locally with
-`cargo run --example quickstart -p nereids-fitting` (first run requires
-network access to fetch ENDF/B-VIII.1).
-
-## Setup
+Add the crates you need:
 
 ```toml
-# Cargo.toml
 [dependencies]
-nereids-core = "0.1"
-nereids-endf = "0.1"
-nereids-physics = "0.1"
-nereids-fitting = "0.1"
+nereids-core = "0.3"
+nereids-endf = "0.3"
+nereids-physics = "0.3"
+nereids-pipeline = "0.3"
 ```
 
-## Load ENDF Data
+The fitting entry point is `nereids_pipeline::counts_fit::fit_counts`. It takes
 
-```rust,no_run
-{{#include ../../../crates/nereids-fitting/examples/quickstart.rs:setup}}
-```
+- a `Measurement`: raw open-beam and sample counts on the same time-of-flight
+  bin edges, the sample run's proton-charge ratio, a normalization, a time
+  background, and one or more regions, each with its background, pixel count,
+  gamma transmission and material;
+- a `Calibration`: `t0`, the flight path and the Ikeda-Carpenter pulse.
 
-## Compute a Forward Model
+It returns a `CountsFit` carrying the fitted areal densities, temperatures,
+backgrounds, timing, pulse numbers and covariance, plus the deviance and a
+convergence flag. `nereids_pipeline::counts_map::fit_map` fits patches of
+pixels as one counts fit.
 
-```rust,no_run
-{{#include ../../../crates/nereids-fitting/examples/quickstart.rs:forward}}
-```
-
-## Fit a Measured Spectrum
-
-```rust,no_run
-{{#include ../../../crates/nereids-fitting/examples/quickstart.rs:fit}}
-```
-
-## Next Steps
-
-- See the [API Reference](api/nereids_pipeline/) for the full API
-- Explore the [Python quickstart](./quickstart-python.md) for a NumPy-based workflow
+Inputs come from `nereids_endf` (resonance data), `nereids_io` (raw counts)
+and `nereids_pipeline::open_beam::fit_open_beam` (the incident beam fitted to
+the open-beam counts). The `counts_fit` integration tests under
+`crates/nereids-pipeline/tests/` are a worked end-to-end example.

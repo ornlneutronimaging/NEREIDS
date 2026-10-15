@@ -5,31 +5,19 @@
 //! Prototype reference: `.prototypes/D_hybrid_v4.html` CSS §Cards & Forms,
 //! §Tabs, §Badges, §Content Area, §Toolbar, §Drop Zones.
 
-use crate::state::{
-    AppState, EndfFetchResult, EndfStatus, FetchTarget, GuidedStep, ResolutionMode, SpectrumAxis,
-};
+use crate::state::{EndfFetchResult, EndfStatus, SpectrumAxis};
 use crate::theme::{ThemeColors, semantic};
 use egui::{Color32, CornerRadius, Margin, Rect, Response, RichText, Sense, Shadow, Stroke, Ui};
-use egui_plot::{Line, PlotPoints, VLine};
+use egui_plot::VLine;
 use nereids_core::types::Isotope;
 use nereids_endf::retrieval::EndfLibrary;
 use nereids_io::spectrum::{SpectrumUnit, SpectrumValueKind};
-use nereids_physics::resolution::{ResolutionFunction, ResolutionParams, TabulatedResolution};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, mpsc};
 
 /// Semi-transparent red used for resonance energy dip markers on spectrum plots.
 /// Values are manually premultiplied: RGBA(180, 80, 80, 50) → (35, 15, 15, 50).
 pub const RESONANCE_DIP_COLOR: Color32 = Color32::from_rgba_premultiplied(35, 15, 15, 50);
-
-/// Hover text for the Gaussian Δt / ΔL fields.
-///
-/// These are the only place a user types a resolution width into the
-/// application, so they are where the convention has to be stated: a 1σ
-/// metrology number entered here unconverted gives a kernel √2 too narrow.
-const WIDTH_CONVENTION_HINT: &str = "W-parameter, the width in exp(-x²/W²) — not a standard \
-     deviation. σ = W/√2 and FWHM = 1.6651·W. This is SAMMY's convention, shared with the Doppler \
-     width. Multiply a measured 1σ value by √2 before entering it here.";
 
 // ── Content Header ──────────────────────────────────────────────
 
@@ -578,166 +566,6 @@ pub fn nav_buttons(
     action
 }
 
-// ── Resolution Card ────────────────────────────────────────────
-
-/// Result from the resolution card widget.
-pub struct ResolutionCardResult {
-    pub changed: bool,
-}
-
-/// Shared resolution broadening card: Gaussian parametric or tabulated file.
-///
-/// Used identically in Configure, Forward Model, and Detectability —
-/// `target` tells the dialog dispatcher which card's state a picked
-/// resolution file belongs to. `changed` covers the inline edits only;
-/// file picks resolve through `file_dialog::dispatch_results`, which
-/// applies the same per-card invalidation as the callers.
-pub fn resolution_card(
-    ui: &mut Ui,
-    enabled: &mut bool,
-    mode: &mut ResolutionMode,
-    flight_path_m: f64,
-    dialogs: &mut crate::file_dialog::FileDialogs,
-    target: crate::file_dialog::ResolutionTarget,
-) -> ResolutionCardResult {
-    let mut changed = false;
-
-    card_with_header(ui, "Instrument Resolution", None, |ui| {
-        let prev_enabled = *enabled;
-        ui.checkbox(enabled, "Enable broadening");
-        if *enabled != prev_enabled {
-            changed = true;
-        }
-
-        if !*enabled {
-            return;
-        }
-
-        // Mode selector: Gaussian vs Tabulated
-        let is_gaussian = matches!(mode, ResolutionMode::Gaussian { .. });
-        ui.horizontal(|ui| {
-            if ui.radio(is_gaussian, "Gaussian (parametric)").clicked() && !is_gaussian {
-                *mode = ResolutionMode::default();
-                changed = true;
-            }
-            if ui.radio(!is_gaussian, "From file").clicked() && is_gaussian {
-                *mode = ResolutionMode::Tabulated {
-                    path: std::path::PathBuf::new(),
-                    data: None,
-                    error: None,
-                };
-                changed = true;
-            }
-        });
-
-        ui.add_space(4.0);
-
-        match mode {
-            ResolutionMode::Gaussian {
-                delta_t_us,
-                delta_l_m,
-            } => {
-                ui.horizontal(|ui| {
-                    ui.label(format!("Flight path: {flight_path_m:.2} m"));
-                    ui.label("(from Beamline)");
-                });
-                let prev_dt = *delta_t_us;
-                let prev_dl = *delta_l_m;
-                ui.horizontal(|ui| {
-                    ui.label("\u{0394}t (\u{03bc}s):");
-                    ui.add(
-                        egui::DragValue::new(delta_t_us)
-                            .speed(0.1)
-                            .range(0.0..=100.0),
-                    )
-                    .on_hover_text(WIDTH_CONVENTION_HINT);
-                    ui.label("\u{0394}L (m):");
-                    ui.add(
-                        egui::DragValue::new(delta_l_m)
-                            .speed(0.001)
-                            .range(0.0..=1.0),
-                    )
-                    .on_hover_text(WIDTH_CONVENTION_HINT);
-                });
-                if *delta_t_us != prev_dt || *delta_l_m != prev_dl {
-                    changed = true;
-                }
-            }
-            ResolutionMode::Tabulated { path, data, error } => {
-                ui.horizontal(|ui| {
-                    if ui.button("Load resolution file\u{2026}").clicked() {
-                        dialogs.pick_file(
-                            crate::file_dialog::DialogIntent::ResolutionFile(target),
-                            crate::file_dialog::DialogOptions {
-                                filters: vec![("Resolution", &["txt", "dat"])],
-                                ..Default::default()
-                            },
-                        );
-                    }
-                    if let Some(name) = path.file_name() {
-                        ui.label(
-                            RichText::new(name.to_string_lossy().to_string())
-                                .monospace()
-                                .size(11.0),
-                        );
-                    }
-                });
-                // Show summary if loaded, or error if parse failed
-                if let Some(tab) = data {
-                    let n = tab.ref_energies().len();
-                    let e_min = tab.ref_energies().first().copied().unwrap_or(0.0);
-                    let e_max = tab.ref_energies().last().copied().unwrap_or(0.0);
-                    ui.label(
-                        RichText::new(format!(
-                            "{n} reference energies, {e_min:.4}\u{2013}{e_max:.1} eV"
-                        ))
-                        .size(11.0)
-                        .color(crate::theme::semantic::GREEN),
-                    );
-                } else if let Some(err) = error {
-                    ui.colored_label(crate::theme::semantic::RED, format!("Parse error: {err}"));
-                } else if !path.as_os_str().is_empty() {
-                    ui.colored_label(
-                        crate::theme::semantic::RED,
-                        "File not loaded \u{2014} select a valid resolution file",
-                    );
-                }
-            }
-        }
-    });
-
-    ResolutionCardResult { changed }
-}
-
-/// Apply a picked tabulated-resolution file to `mode` (dispatch handler
-/// for `DialogIntent::ResolutionFile`). Overwrites `mode` with a fresh
-/// `Tabulated` variant so a pick that resolves on a later frame wins
-/// even if the user toggled the radio in between. Returns `true` when
-/// the mode changed (always — parse failures are recorded in `error`,
-/// matching the previous inline behaviour).
-pub fn apply_resolution_file(
-    mode: &mut ResolutionMode,
-    file: std::path::PathBuf,
-    flight_path_m: f64,
-) -> bool {
-    let (data, error) = match file.to_str() {
-        Some(path_str) => match TabulatedResolution::from_file(path_str, flight_path_m) {
-            Ok(tab) => (Some(Arc::new(tab)), None),
-            Err(e) => (None, Some(format!("{e}"))),
-        },
-        None => (
-            None,
-            Some("File path is not valid UTF-8; please choose a different file".into()),
-        ),
-    };
-    *mode = ResolutionMode::Tabulated {
-        path: file,
-        data,
-        error,
-    };
-    true
-}
-
 // ── ENDF Library Name ──────────────────────────────────────────
 
 /// Map an `EndfLibrary` variant to its display name.
@@ -752,30 +580,12 @@ pub fn library_name(lib: EndfLibrary) -> &'static str {
     }
 }
 
-// ── Teleport Pill ──────────────────────────────────────────────
-
-/// Accent-filled pill button that navigates to another guided step.
-pub fn teleport_pill(ui: &mut Ui, label: &str, target: GuidedStep, state: &mut AppState) {
-    let accent = ThemeColors::from_ctx(ui.ctx()).accent;
-    let btn = egui::Button::new(RichText::new(label).small().color(Color32::WHITE))
-        .fill(accent)
-        .corner_radius(12.0);
-    if ui.add(btn).clicked() {
-        state.status_message = String::new();
-        state.guided_step = target;
-    }
-}
-
 // ── Shared Helpers ─────────────────────────────────────────────────
 
 /// Work item for the ENDF fetch worker.
-///
-/// `target` identifies which list the result should be routed to:
-/// Configure, ForwardModel, DetectMatrix, or DetectTrace.
 pub(crate) struct EndfWorkItem {
     pub z: u32,
     pub a: u32,
-    pub target: FetchTarget,
     pub isotope: Isotope,
     pub symbol: String,
     pub library: EndfLibrary,
@@ -802,7 +612,6 @@ pub(crate) fn endf_fetch_worker(
             let _ = tx.send(EndfFetchResult {
                 z: item.z,
                 a: item.a,
-                target: item.target,
                 symbol: item.symbol.clone(),
                 result: Err(format!(
                     "No MAT number for {} — isotope not in ENDF database",
@@ -830,7 +639,6 @@ pub(crate) fn endf_fetch_worker(
                     let _ = tx.send(EndfFetchResult {
                         z: item.z,
                         a: item.a,
-                        target: item.target,
                         symbol: item.symbol.clone(),
                         result: Err(msg.clone()),
                     });
@@ -841,7 +649,6 @@ pub(crate) fn endf_fetch_worker(
                         let _ = tx.send(EndfFetchResult {
                             z: skipped.z,
                             a: skipped.a,
-                            target: skipped.target,
                             symbol: skipped.symbol.clone(),
                             result: Err(format!(
                                 "Skipped {} because the upstream ENDF server blocked this batch; retry later.",
@@ -860,38 +667,9 @@ pub(crate) fn endf_fetch_worker(
         let _ = tx.send(EndfFetchResult {
             z: item.z,
             a: item.a,
-            target: item.target,
             symbol: item.symbol.clone(),
             result,
         });
-    }
-}
-
-/// Build an `Option<ResolutionFunction>` from the current resolution settings.
-///
-/// Returns `Ok(None)` if resolution is disabled, `Ok(Some(..))` on success,
-/// or `Err(msg)` if parameters are invalid or a file isn't loaded.
-pub(crate) fn build_resolution_function(
-    enabled: bool,
-    mode: &ResolutionMode,
-    flight_path_m: f64,
-) -> Result<Option<ResolutionFunction>, String> {
-    if !enabled {
-        return Ok(None);
-    }
-    match mode {
-        ResolutionMode::Gaussian {
-            delta_t_us,
-            delta_l_m,
-        } => {
-            let params = ResolutionParams::new(flight_path_m, *delta_t_us, *delta_l_m, 0.0)
-                .map_err(|e| format!("Invalid resolution parameters: {e}"))?;
-            Ok(Some(ResolutionFunction::Gaussian(params)))
-        }
-        ResolutionMode::Tabulated {
-            data: Some(tab), ..
-        } => Ok(Some(ResolutionFunction::Tabulated(Arc::clone(tab)))),
-        ResolutionMode::Tabulated { data: None, .. } => Err("Resolution file not loaded".into()),
     }
 }
 
@@ -1020,233 +798,4 @@ pub(crate) fn draw_resonance_dips(
     }
 }
 
-/// Convert a resonance energy (eV) into the spectrum's active x-axis units.
-///
-/// Mirrors the energy→TOF transform in [`build_spectrum_x_axis`] **including
-/// the fallback branch**: when the TOF axis is selected but `flight_path_m`
-/// is invalid (zero, negative, or non-finite), `build_spectrum_x_axis` falls
-/// back to plotting energy values whenever the input data is in `EnergyEv`
-/// units (and silently relabels the axis). To keep tick positions aligned
-/// with the actual rendered x-axis in that fallback case, this helper does
-/// the same — returns `Some(energy_ev)` when the TOF conversion is undefined
-/// AND the spectrum input is energy-valued.
-///
-/// Returns `None` only when no axis position can be derived: TOF axis with
-/// invalid `flight_path_m` AND spectrum input is already in TOF units (in
-/// which case the spectrum cannot be aligned with energy-input resonances
-/// without a flight path).
-pub(crate) fn resonance_energy_to_axis(
-    energy_ev: f64,
-    axis: SpectrumAxis,
-    spectrum_unit: SpectrumUnit,
-    flight_path_m: f64,
-    delay_us: f64,
-) -> Option<f64> {
-    match axis {
-        SpectrumAxis::EnergyEv => Some(energy_ev),
-        SpectrumAxis::TofMicroseconds => {
-            let can_convert = energy_ev > 0.0 && flight_path_m.is_finite() && flight_path_m > 0.0;
-            if can_convert {
-                Some(nereids_core::constants::energy_to_tof(energy_ev, flight_path_m) + delay_us)
-            } else if matches!(spectrum_unit, SpectrumUnit::EnergyEv) {
-                // Mirror `build_spectrum_x_axis` fallback: when TOF
-                // conversion is unavailable but input is energy-valued,
-                // the spectrum falls back to plotting energy. Strips
-                // need to do the same to stay aligned.
-                Some(energy_ev)
-            } else {
-                None
-            }
-        }
-    }
-}
-
-/// Parameters for building a fit overlay line.
-pub(crate) struct FitLineParams<'a> {
-    pub result: &'a nereids_pipeline::pipeline::SpectrumFitResult,
-    pub resonance_data: &'a [nereids_endf::resonance::ResonanceData],
-    pub density_indices: &'a [usize],
-    pub density_ratios: &'a [f64],
-    pub energies: &'a [f64],
-    pub temperature_k: f64,
-    pub x_values: &'a [f64],
-    pub n_plot: usize,
-    /// Instrument resolution for the fit overlay.
-    /// When `Some`, the overlay applies resolution after Beer-Lambert.
-    pub instrument: Option<std::sync::Arc<nereids_physics::transmission::InstrumentParams>>,
-    /// Optional per-bin multiplier applied to the fitted transmission
-    /// before plotting.  Use this to scale T_fit to expected sample
-    /// counts in counts-mode display: `multiplier[i] = c · OB[i, y, x]`.
-    /// Length must be ≥ `n_plot`; ignored when `None`.
-    pub y_multiplier: Option<&'a [f64]>,
-}
-
-/// Counts and instrument resolution cannot share the transmission-only fit
-/// overlay until the detector response has separate open/sample arms.
-pub(crate) fn counts_resolution_overlay_unsupported(
-    shows_counts: bool,
-    has_instrument_resolution: bool,
-) -> bool {
-    shows_counts && has_instrument_resolution
-}
-
-pub(crate) const COUNTS_RESOLUTION_OVERLAY_MESSAGE: &str = "Count fit overlay hidden: instrument resolution needs the separate-arm model \
-     R[Phi] and R[Phi*T]. Multiplying c*OB by R[T] is not a physical count model, so \
-     the transmission-only overlay cannot represent a resolved count fit.";
-
-/// Build a fit overlay line from a `SpectrumFitResult`.
-///
-/// Returns `None` if the fit didn't converge, no resonance data is provided,
-/// or model construction fails.
-///
-/// `resonance_data` should contain data for ALL fitted entities
-/// (individual isotopes + group members). `density_indices` and `density_ratios`
-/// map each resonance data entry to a density parameter index and its abundance ratio.
-pub(crate) fn build_fit_line(p: &FitLineParams<'_>) -> Option<Line<'static>> {
-    if counts_resolution_overlay_unsupported(p.y_multiplier.is_some(), p.instrument.is_some()) {
-        return None;
-    }
-    if !p.result.converged {
-        return None;
-    }
-    if p.resonance_data.is_empty() {
-        return None;
-    }
-    let resonance_data: Vec<_> = p.resonance_data.to_vec();
-    let overlay_temp = p.result.temperature_k.unwrap_or(p.temperature_k);
-    let model = nereids_fitting::transmission_model::TransmissionFitModel::new(
-        p.energies.to_vec(),
-        resonance_data,
-        overlay_temp,
-        p.instrument.clone(),
-        (p.density_indices.to_vec(), p.density_ratios.to_vec()),
-        None,
-        None,
-    )
-    .ok()?;
-
-    use nereids_fitting::lm::FitModel;
-    let fitted_t = model.evaluate(&p.result.densities).ok()?;
-    let n_fit = p.n_plot.min(fitted_t.len()).min(p.x_values.len());
-    // Apply the fitted Anorm + SAMMY 6-term background polynomial so the
-    // overlay matches the actual forward model the solver fitted, not just
-    // bare Beer-Lambert transmission.
-    //
-    //   y = Anorm · T(E) + BackA + BackB/√E + BackC·√E + BackD·exp(-BackF/√E)
-    //
-    // Then `y_multiplier` (= c·OB[i] in counts mode) scales the result to
-    // the displayed y-axis.  When bg fit was absent, the pipeline emits
-    // `anorm = 1.0` and `background = [0, 0, 0]` (the joint-Poisson
-    // convention — see `fit_counts_joint_poisson`'s background readout
-    // fallback in pipeline.rs), so this reduces to bare T·multiplier — i.e.
-    // identical to the pre-fix overlay for fits without background.
-    let fit_points: PlotPoints = (0..n_fit)
-        .filter(|&i| p.x_values[i].is_finite())
-        .map(|i| {
-            let e = p.energies.get(i).copied().unwrap_or(f64::NAN);
-            let bg_poly = if e > 0.0 && e.is_finite() {
-                let sqrt_e = e.sqrt();
-                // `back_d` / `back_f` are `Option<f64>`: `None` means
-                // "exponential tail not fit" (counts-KL path, LM with
-                // `fit_back_d=false`, or a project reload that dropped
-                // the unpersisted maps).  Drop the tail term entirely
-                // in that case.  SAMMY pairs BackD/BackF, so
-                // `(Some, Some)` is the only arm that fires in
-                // practice.
-                let exp_tail = match (p.result.back_d, p.result.back_f) {
-                    (Some(bd), Some(bf)) => bd * (-bf / sqrt_e).exp(),
-                    _ => 0.0,
-                };
-                p.result.background[0]
-                    + p.result.background[1] / sqrt_e
-                    + p.result.background[2] * sqrt_e
-                    + exp_tail
-            } else {
-                // Non-positive or non-finite energy: skip the polynomial.
-                // BackB/√E and BackD·exp(-BackF/√E) blow up at E ≤ 0, and
-                // the spectrum already filters non-finite x via build_spectrum_x_axis.
-                0.0
-            };
-            let y_corrected = p.result.anorm * fitted_t[i] + bg_poly;
-            // Issue #635: the multiplicative baseline is OUTERMOST —
-            // y = B(E)·[Anorm·T + additive background] — reconstructed with
-            // the EXACT E_ref the fit used (stored on the result).  `None`
-            // (baseline not fit, or a reload that dropped it) leaves the
-            // overlay unchanged.
-            let y_corrected = match (p.result.baseline, p.result.baseline_e_ref_ev) {
-                (Some(b), Some(e_ref)) if e > 0.0 && e.is_finite() && e_ref > 0.0 => {
-                    let z = (e / e_ref).ln();
-                    (b[0] + b[1] * z + b[2] * z * z) * y_corrected
-                }
-                _ => y_corrected,
-            };
-            let y = match p.y_multiplier {
-                Some(m) if i < m.len() => m[i] * y_corrected,
-                _ => y_corrected,
-            };
-            [p.x_values[i], y]
-        })
-        .collect();
-    Some(
-        Line::new("Fit", fit_points)
-            .width(1.25_f32)
-            .color(egui::Color32::from_rgba_unmultiplied(0, 122, 255, 170)),
-    )
-}
-
 // ── Resonance Data Collection ──────────────────────────────────
-
-/// Collect all resonance data and density mapping from enabled isotopes + groups.
-///
-/// Order matches `build_fit_config()`: individuals first, then group members.
-/// Returns:
-/// - `all_rd`: flat list of ResonanceData (one per individual isotope + one per group member)
-/// - `density_indices`: maps each rd to a density parameter index
-/// - `density_ratios`: abundance ratio for each rd (1.0 for individuals)
-pub(crate) fn collect_all_resonance_data_with_mapping(
-    state: &AppState,
-) -> (
-    Vec<nereids_endf::resonance::ResonanceData>,
-    Vec<usize>,
-    Vec<f64>,
-) {
-    let mut all_rd = Vec::new();
-    let mut indices = Vec::new();
-    let mut ratios = Vec::new();
-    let mut density_idx = 0usize;
-
-    for e in &state.isotope_entries {
-        if e.enabled && e.resonance_data.is_some() {
-            all_rd.push(e.resonance_data.clone().unwrap());
-            indices.push(density_idx);
-            ratios.push(1.0);
-            density_idx += 1;
-        }
-    }
-    for g in &state.isotope_groups {
-        if g.enabled && g.overall_status() == EndfStatus::Loaded {
-            for m in &g.members {
-                if let Some(rd) = &m.resonance_data {
-                    all_rd.push(rd.clone());
-                    indices.push(density_idx);
-                    ratios.push(m.ratio);
-                }
-            }
-            density_idx += 1;
-        }
-    }
-    (all_rd, indices, ratios)
-}
-
-#[cfg(test)]
-mod tests {
-    use super::counts_resolution_overlay_unsupported;
-
-    #[test]
-    fn count_overlay_is_suppressed_only_with_active_resolution() {
-        assert!(counts_resolution_overlay_unsupported(true, true));
-        assert!(!counts_resolution_overlay_unsupported(true, false));
-        assert!(!counts_resolution_overlay_unsupported(false, true));
-        assert!(!counts_resolution_overlay_unsupported(false, false));
-    }
-}

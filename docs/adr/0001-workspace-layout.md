@@ -13,10 +13,7 @@ SAMMY code via PLEIADES (Python/LANL). We need an architecture that:
 - Separates concerns cleanly (physics, I/O, fitting, orchestration)
 - Allows independent testing and validation of each physics module
 - Supports three delivery targets: Rust library, PyO3 Python bindings, egui GUI
-- Is maintainable by AI agents with clear module boundaries and documentation
-
-A previous attempt (Codex) failed due to lack of structure, ad-hoc approximations,
-temp file litter, and monolithic commits.
+- Keeps clear module boundaries and documents physics in-code
 
 ## Decision
 
@@ -27,9 +24,9 @@ and one GUI application crate:
 nereids-core       Core types, physical constants, error types, traits
 nereids-endf       ENDF file retrieval, caching, resonance parameter parsing
 nereids-physics    Cross-section (Reich-Moore), broadening, transmission model
-nereids-io         TIFF/NeXus data loading, VENUS normalization
-nereids-fitting    Optimization (LM least-squares, Poisson/KL)
-nereids-pipeline   End-to-end orchestration, spatial mapping, sparsity handling
+nereids-io         TIFF/NeXus data loading, pixel masks
+nereids-fitting    Poisson/KL counts optimization
+nereids-pipeline   Counts-domain fitting (one region or a map of patches)
 nereids-python     PyO3 thin wrapper (bindings/python)
 nereids-gui        egui desktop application (apps/gui)
 ```

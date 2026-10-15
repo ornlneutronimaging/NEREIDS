@@ -3,7 +3,7 @@
 //! Parses SAMMY `.par` (resonance parameters), `.inp` (input configuration),
 //! and `.plt` (plot reference output) files from the `samtry/` test suite.
 //! These parsers are intentionally minimal — they cover the subset of SAMMY's
-//! format needed for Phase 1 transmission validation (issue #292).
+//! format needed for Phase 1 transmission validation.
 //!
 //! ## SAMMY Reference
 //! - SAMMY Manual, Section 2 (input file format)

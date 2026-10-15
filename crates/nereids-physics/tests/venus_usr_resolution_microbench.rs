@@ -158,7 +158,7 @@ fn test_plan_reuse_bench() {
 /// 3471-bin production grid × 100 spectra.  Exercised manually to
 /// decide whether the CSR compile + CSR matvec beats the plan's
 /// two-pointer walk at the no-SIMD-no-unsafe baseline promised in
-/// #473.
+///.
 #[test]
 fn resolution_matrix_apply_microbench() {
     let tab = common::synthetic_venus_usr_tab();

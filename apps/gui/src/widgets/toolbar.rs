@@ -39,7 +39,7 @@ pub fn toolbar(ui: &mut egui::Ui, state: &mut AppState) {
                 ui.selectable_value(&mut state.ui_mode, UiMode::Guided, "Guided");
                 ui.selectable_value(&mut state.ui_mode, UiMode::Studio, "Studio");
 
-                // Help menu (log folder + log path) — issue #524
+                // Help menu (log folder + log path) —
                 help_menu(&ctx, ui);
 
                 // Trailing controls right-aligned
@@ -64,9 +64,8 @@ pub fn toolbar(ui: &mut egui::Ui, state: &mut AppState) {
                         state.ui_mode = UiMode::Guided;
                     }
 
-                    // Save button — visible when spatial results exist
-                    let has_results = state.spatial_result.is_some();
-                    if has_results {
+                    // Save button — visible once data is loaded
+                    if state.sample_data.is_some() {
                         if state.is_saving {
                             ui.add_enabled(false, egui::Button::new("\u{1F4BE} Saving..."));
                         } else if design::btn_primary(ui, "\u{1F4BE} Save").clicked() {
@@ -80,20 +79,7 @@ pub fn toolbar(ui: &mut egui::Ui, state: &mut AppState) {
                     }
 
                     // Progress indicator
-                    if state.is_fitting {
-                        if let Some(ref fp) = state.fitting_progress {
-                            let frac = fp.fraction();
-                            let done = fp.done();
-                            let total = fp.total();
-                            design::progress_mini(
-                                ui,
-                                frac,
-                                &format!("{:.0}% \u{2014} {done}/{total}", frac * 100.0),
-                            );
-                        } else {
-                            design::progress_mini(ui, 0.0, "Fitting...");
-                        }
-                    } else if state.is_fetching_endf {
+                    if state.is_fetching_endf {
                         design::progress_mini(ui, 0.0, "Fetching ENDF...");
                     } else if state.is_saving {
                         design::progress_mini(ui, 0.0, "Saving...");
@@ -104,7 +90,7 @@ pub fn toolbar(ui: &mut egui::Ui, state: &mut AppState) {
 }
 
 /// Help dropdown: reveal the log folder or copy the active log file path.
-/// Added for issue #524 (file-based logging for user troubleshooting).
+/// File-based logging for user troubleshooting.
 fn help_menu(ctx: &egui::Context, ui: &mut egui::Ui) {
     ui.menu_button("Help", |ui| {
         if ui.button("Open log folder").clicked() {

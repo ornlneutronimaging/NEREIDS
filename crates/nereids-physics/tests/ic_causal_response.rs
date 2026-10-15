@@ -780,7 +780,6 @@ fn singular_exp_milli_ev_r_law_is_rejected() {
 
 #[test]
 fn cdf_far_tail_values_are_exact_not_nan() {
-    // Far-tail regression: at³ / u³ overflow used to produce inf·0 = NaN,
     // which detector-bin differencing then silently converted to zero mass.
     let deep_prompt = ic_cdf(1.0, 1.0e-6, 0.5, 1.0e103);
     assert_eq!(deep_prompt, 1.0, "deep prompt tail must saturate at 1");

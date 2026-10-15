@@ -11,10 +11,10 @@ use nereids_physics::resolution::TOF_FACTOR;
 use nereids_physics::transmission::resonance_center_energies;
 use serde::{Deserialize, Serialize};
 
+use crate::counts_fit::TEMPERATURE_BOUNDS_K;
 use crate::counts_fit::{CountsFit, Material, Measurement, Region, Value, fit_counts, quantities};
 use crate::error::PipelineError;
 use crate::open_beam::{Calibration, PULSE_NUMBERS, Pulse};
-use crate::pipeline::TEMPERATURE_BOUNDS_K;
 
 /// The pulse numbers a calibration fitted, as indices into
 /// `(α₀, α₁, β₀, β₁, R, h²)`, with the mean and covariance of its likelihood

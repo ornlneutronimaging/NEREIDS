@@ -1,12 +1,10 @@
 //! Rebin step: optional energy rebinning by integer factor.
 //!
-//! - **Counts data** (TiffPair, HDF5): sum adjacent bins (conserves counts).
-//! - **Transmission data** (TransmissionTiff): average adjacent bins
-//!   (assumes uniform I₀ — this is an approximation).
+//! Counts data (TiffPair, HDF5): sum adjacent bins (conserves counts).
 
 use std::sync::Arc;
 
-use crate::state::{AppState, InputMode};
+use crate::state::AppState;
 use crate::theme::ThemeColors;
 use crate::widgets::design;
 use nereids_io::spectrum::SpectrumValueKind;
@@ -19,7 +17,6 @@ pub fn rebin_step(ui: &mut egui::Ui, state: &mut AppState) {
         "Optionally coarsen the energy binning (this step can be skipped)",
     );
 
-    let is_transmission = state.input_mode == InputMode::TransmissionTiff;
     let n_bins = current_bin_count(state);
 
     design::card_with_header(ui, "Rebinning", None, |ui| {
@@ -35,19 +32,6 @@ pub fn rebin_step(ui: &mut egui::Ui, state: &mut AppState) {
         let n = n_bins.unwrap();
 
         ui.add_space(4.0);
-
-        // Transmission warning
-        if is_transmission {
-            ui.label(
-                egui::RichText::new(
-                    "\u{26a0} Transmission data: rebinning uses bin-averaging \
-                     (assumes uniform I\u{2080}). This is an approximation.",
-                )
-                .size(11.0)
-                .color(tc.fg3),
-            );
-            ui.add_space(4.0);
-        }
 
         if state.rebin_applied {
             // Show applied state
@@ -110,7 +94,7 @@ pub fn rebin_step(ui: &mut egui::Ui, state: &mut AppState) {
             let can_apply = state.rebin_factor > 1 && state.sample_data.is_some();
             ui.add_enabled_ui(can_apply, |ui| {
                 if ui.button("Apply Rebinning").clicked() {
-                    apply_rebin(state, is_transmission);
+                    apply_rebin(state);
                 }
             });
         }
@@ -139,7 +123,7 @@ fn current_bin_count(state: &AppState) -> Option<usize> {
     })
 }
 
-pub(crate) fn apply_rebin(state: &mut AppState, is_transmission: bool) {
+pub(crate) fn apply_rebin(state: &mut AppState) {
     let factor = state.rebin_factor;
 
     // Cancel any in-flight fitting tasks before mutating data arrays
@@ -162,13 +146,9 @@ pub(crate) fn apply_rebin(state: &mut AppState, is_transmission: bool) {
         }
     }
 
-    // Rebin sample_data
+    // Rebin sample_data (counts)
     if let Some(ref data) = state.sample_data {
-        let rebinned = if is_transmission {
-            nereids_io::rebin::rebin_transmission(data, factor)
-        } else {
-            nereids_io::rebin::rebin_counts(data, factor)
-        };
+        let rebinned = nereids_io::rebin::rebin_counts(data, factor);
         state.sample_data = Some(Arc::new(rebinned));
     }
 
@@ -195,12 +175,6 @@ pub(crate) fn apply_rebin(state: &mut AppState, is_transmission: bool) {
 
     state.rebin_applied = true;
     state.energies = None;
-    // Rebinning invalidates the normalized data, forcing re-normalization
-    // from the rebinned counts.  This ensures uncertainty is recomputed
-    // from the rebinned counts rather than becoming stale.
-    state.normalized = None;
-    state.spatial_result = None;
-    state.pixel_fit_result = None;
     state.status_message = format!("Rebinned by factor {factor}");
     state.log_provenance(
         crate::state::ProvenanceEventKind::ConfigChanged,

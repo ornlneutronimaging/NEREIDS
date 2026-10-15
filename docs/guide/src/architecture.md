@@ -35,8 +35,8 @@ application, and Python bindings.
 | [`nereids-endf`](api/nereids_endf/) | ENDF file retrieval from IAEA, local caching, File 2 resonance parameter parsing |
 | [`nereids-physics`](api/nereids_physics/) | Cross-section calculation (Reich-Moore, SLBW, MLBW), Doppler/resolution broadening, Beer-Lambert transmission |
 | [`nereids-io`](api/nereids_io/) | TIFF stack and NeXus/HDF5 loading, TOF-to-energy conversion, normalization, export |
-| [`nereids-fitting`](api/nereids_fitting/) | Levenberg-Marquardt and Poisson KL divergence optimizers, transmission fit model |
-| [`nereids-pipeline`](api/nereids_pipeline/) | Single-spectrum fitting, per-pixel spatial mapping (rayon), trace detectability |
+| [`nereids-fitting`](api/nereids_fitting/) | Poisson/KL counts optimizer |
+| [`nereids-pipeline`](api/nereids_pipeline/) | Counts-domain fitting: one region or a map of pixel patches |
 | `nereids-python` | PyO3 Python bindings (not published to crates.io) |
 | `nereids-gui` | egui desktop application (not published to crates.io) |
 
@@ -45,28 +45,19 @@ application, and Python bindings.
 The standard analysis pipeline processes data through these stages:
 
 ```text
-Raw TOF data (TIFF/NeXus)
+Raw TOF counts (TIFF/NeXus), sample and open beam
     │
     ▼
-Normalization (sample / open_beam → transmission)     [nereids-io]
+ENDF data (resonance parameters)                       [nereids-endf]
     │
     ▼
-Energy conversion (TOF bin edges → energy centers)    [nereids-io]
+Forward model (cross-sections → Doppler → pulse → counts) [nereids-physics]
     │
     ▼
-ENDF data (fetch resonance parameters from IAEA)      [nereids-endf]
+Counts fit (Poisson/KL on the two count arms)          [nereids-fitting, nereids-pipeline]
     │
     ▼
-Forward model (cross-sections → broadening → T(E))    [nereids-physics]
-    │
-    ▼
-Fitting (minimize |T_measured - T_model|)              [nereids-fitting]
-    │
-    ▼
-Spatial mapping (fit each pixel in parallel)           [nereids-pipeline]
-    │
-    ▼
-Density maps, chi² maps, convergence maps              [output]
+Density and temperature, one region or a map of patches [output]
 ```
 
 ## Key Design Decisions
@@ -87,21 +78,18 @@ dependencies. Higher-level crates compose lower-level ones.
 See [ADR 0001](https://github.com/ornlneutronimaging/NEREIDS/blob/main/docs/adr/0001-workspace-layout.md)
 for the full rationale.
 
-### Parallel Spatial Mapping
+### Parallel counts mapping
 
-Per-pixel fitting uses [rayon](https://docs.rs/rayon) for data parallelism.
-The outer pixel loop runs on a dedicated thread pool to avoid deadlocking
-with inner parallel operations (cross-section calculation, broadening).
+`fit_map` fits patches of pixels as one counts fit and propagates the
+cross-patch covariance.
 
 ### Python Bindings and MCP
 
-The Python bindings expose a high-level API (`load_endf`, `load_endf_file`,
-`forward_model`, `fit_spectrum_typed`, `fit_counts_spectrum_typed`,
-`spatial_map_typed`) that maps directly to the Rust pipeline. Typed input
-constructors (`from_transmission`, `from_counts`) select the fitting dispatch
-for spatial maps. TIFF/NeXus I/O helpers (`load_tiff_stack`,
-`load_tiff_folder`, `probe_nexus`, `load_nexus_histogram`,
-`load_nexus_events`, `tof_to_energy_centers`) expose the same spectral-axis
+The Python bindings expose the counts fit (`fit_counts`) and counts map
+(`fit_map`) directly, plus ENDF loading, forward-model and TOF helpers
+(`load_endf`, `forward_model`, `tof_to_energy_centers`). TIFF/NeXus I/O
+helpers (`load_tiff_stack`, `load_tiff_folder`, `probe_nexus`,
+`load_nexus_histogram`, `load_nexus_events`) expose the same spectral-axis
 conventions as `nereids-io`. NumPy arrays are zero-copy where possible via the
 `numpy` crate integration.
 

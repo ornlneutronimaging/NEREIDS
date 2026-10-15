@@ -52,7 +52,7 @@ use crate::slbw;
 // Pre-computing them once (outside the energy loop) eliminates redundant
 // `penetrability(l, rho_r)` and `group_by_j()` calls per energy point.
 //
-// Issue #87: "Perf: Pre-cache J-groups and per-resonance quantities"
+// "Perf: Pre-cache J-groups and per-resonance quantities"
 
 /// Per-resonance invariants for the single-channel (non-fissile) Reich-Moore path.
 ///
@@ -121,7 +121,6 @@ type PrecomputedJGroup3ch = PrecomputedJGroup<PrecomputedResonance3ch>;
 /// so the penetrability must be evaluated at the resonance energy
 /// using the channel radius AP(E_r) — not the incident-energy AP(E).
 ///
-/// This function is the core quantity that Issue #87 caches: previously
 /// it was recomputed for every resonance at every energy point.
 ///
 /// When E_r ≈ 0, the penetrability is zero (matching SLBW behavior in
@@ -401,7 +400,7 @@ pub fn cross_sections_at_energy(data: &ResonanceData, energy_ev: f64) -> CrossSe
 /// This avoids redundant `group_by_j` + `penetrability(l, rho_r)` calls
 /// that the per-point API (`cross_sections_at_energy`) would repeat.
 ///
-/// Issue #87: the precompute is hoisted above the energy loop so that
+/// the precompute is hoisted above the energy loop so that
 /// `precompute_jgroups_*` runs O(ranges) times total, not O(ranges × energies).
 ///
 /// # Arguments
@@ -611,7 +610,7 @@ struct PrecomputedRangeData<'a> {
 /// distinct variants (instead of a single variant with a formalism
 /// tag) is deliberate: it makes the "pick the right evaluator" step a
 /// `match` arm that the compiler checks exhaustively, which is what
-/// prevents the #465 class of bug (MLBW being silently routed through
+/// prevents the class of bug (MLBW being silently routed through
 /// the SLBW evaluator) from reappearing.
 enum PrecomputedRangeKind<'a> {
     /// Reich-Moore (LRF=3): precomputed J-groups per L-group.
@@ -629,7 +628,7 @@ enum PrecomputedRangeKind<'a> {
     /// Multi-Level Breit-Wigner (LRF=2): coherent-sum elastic, same
     /// capture/fission as SLBW.  Uses the same precomputed-J-group
     /// layout as SLBW but dispatches to `mlbw_evaluate_with_cached_jgroups`
-    /// (see issue #465 for why this MUST be a distinct variant).
+    /// (see for why this MUST be a distinct variant).
     Mlbw {
         range: &'a ResonanceRange,
         l_groups: Vec<PrecomputedSlbwLGroupData>,
@@ -881,7 +880,7 @@ fn evaluate_precomputed_range(
         PrecomputedRangeKind::Mlbw { range, l_groups } => {
             // MLBW uses the SAME precomputed J-groups as SLBW but a
             // different evaluator (coherent-sum elastic).  Routing MLBW
-            // through `slbw_evaluate_with_cached_jgroups` was the #465 bug.
+            // through `slbw_evaluate_with_cached_jgroups` was the bug.
             let pi_over_k2 = channel::pi_over_k_squared_barns(energy_ev, awr);
             let mut total = 0.0;
             let mut elastic = 0.0;
@@ -1156,7 +1155,7 @@ fn reich_moore_spin_group_precomputed(
     //   γ²_n = Γ_n / (2 · P_l(ρ_n))
     // where ρ_n = k(E_n)·a, evaluated at the resonance energy.
     //
-    // Issue #87: γ²_n is now pre-computed in PrecomputedResonanceSingle.
+    // γ²_n is now pre-computed in PrecomputedResonanceSingle.
     //
     // Reference: SAMMY `rml/mrml03.f` Betset (lines 240-276)
     let mut r_real = 0.0;
@@ -1495,7 +1494,6 @@ fn invert_3x3(m: [[Complex64; 3]; 3]) -> Option<[[Complex64; 3]; 3]> {
 }
 
 // J-group assembly is now done inline via the `precompute_jgroups_*` functions
-// (Issue #87).  The old `group_by_j` import is no longer needed.
 
 #[cfg(test)]
 mod tests {
@@ -2187,12 +2185,12 @@ mod tests {
         );
     }
 
-    // ─── Issue #465: batch vs per-point equivalence across formalisms ────────
+    // ─── batch vs per-point equivalence across formalisms ────────
     //
     // These tests lock the contract that `cross_sections_on_grid` must
     // produce element-wise bit-exact output matching
     // `cross_sections_at_energy` on the same grid.  Two paths diverging
-    // silently is the class of bug that #465 exposed — the batch path was
+    // silently is the class of bug that exposed — the batch path was
     // routing MLBW ranges through the SLBW incoherent-sum evaluator,
     // producing up to 55 % relative error on real Hf isotopes — so this
     // harness must cover every formalism that has a distinct evaluator.
@@ -2203,7 +2201,7 @@ mod tests {
     // against ENDF-B-VIII.1 data committed under `tests/data/endf/`.
 
     /// Synthetic MLBW fixture: the batch API and per-point API MUST agree
-    /// bit-exactly.  This is the root cause of #465 — the batch
+    /// bit-exactly. This is the root cause of — the batch
     /// dispatcher lumped MLBW into the SLBW evaluator (incoherent sum)
     /// while the per-point dispatcher correctly routed through the
     /// coherent-sum MLBW evaluator.  Both paths now share
@@ -2256,7 +2254,7 @@ mod tests {
     }
 
     /// Real-world anchor: ENDF-B-VIII.1 Hf-177 is MLBW (LRF=2) with 180
-    /// resonances.  Locks the #465 production symptom (up to 55 %
+    /// resonances. Locks the production symptom (up to 55 %
     /// relative divergence on the VENUS analysis grid).
     ///
     /// The ENDF file is committed under `tests/data/endf/Hf-177.endf`

@@ -5,15 +5,12 @@ use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
 use nereids_endf::resonance::ResonanceData;
-use nereids_io::normalization::NormalizedData;
 use nereids_io::project::{EmbeddedData, PROJECT_SCHEMA_VERSION, ProjectSnapshot};
 use nereids_io::spectrum::{SpectrumUnit, SpectrumValueKind};
-use nereids_pipeline::spatial::SpatialResult;
 
 use crate::state::{
-    AnalysisMode, AppState, DataType, EndfStatus, FitFeedback, FittingType, GroupMemberState,
-    GuidedStep, InputMode, IsotopeEntry, IsotopeGroupEntry, ProvenanceEvent, ProvenanceEventKind,
-    ResolutionMode, RoiSelection, SaveDataMode, SolverMethod, UiMode,
+    AppState, DataType, EndfStatus, FittingType, GroupMemberState, InputMode, IsotopeEntry,
+    IsotopeGroupEntry, ProvenanceEvent, ProvenanceEventKind, RoiSelection, SaveDataMode, UiMode,
 };
 use crate::widgets::design::library_name;
 
@@ -34,38 +31,14 @@ pub fn snapshot_from_state(state: &AppState) -> ProjectSnapshot {
     let data_type = match state.data_type {
         Some(DataType::Events) => "events",
         Some(DataType::PreNormalized) => "pre_normalized",
-        Some(DataType::Transmission) => "transmission",
         None => "unknown",
     };
-    let solver_method = match state.solver_method {
-        SolverMethod::LevenbergMarquardt => "lm",
-        SolverMethod::PoissonKL => "poisson_kl",
-    };
+    let solver_method = "poisson_kl";
 
-    let (resolution_kind, delta_t_us, delta_l_m, tabulated_path) = match &state.resolution_mode {
-        ResolutionMode::Gaussian {
-            delta_t_us: dt,
-            delta_l_m: dl,
-        } => {
-            if state.resolution_enabled {
-                ("gaussian", Some(*dt), Some(*dl), None)
-            } else {
-                ("none", None, None, None)
-            }
-        }
-        ResolutionMode::Tabulated { path, .. } => {
-            if state.resolution_enabled {
-                (
-                    "tabulated",
-                    None,
-                    None,
-                    Some(path.to_string_lossy().into_owned()),
-                )
-            } else {
-                ("none", None, None, None)
-            }
-        }
-    };
+    let resolution_kind = "none";
+    let delta_t_us: Option<f64> = None;
+    let delta_l_m: Option<f64> = None;
+    let tabulated_path: Option<String> = None;
 
     let rois: Vec<[u64; 4]> = state
         .rois
@@ -141,105 +114,38 @@ pub fn snapshot_from_state(state: &AppState) -> ProjectSnapshot {
         }
     }
 
-    // Normalized data (transmission + uncertainty arrays)
-    let normalized = state.normalized.as_ref().map(|nd| nd.transmission.clone());
-    let normalized_uncertainty = state.normalized.as_ref().map(|nd| nd.uncertainty.clone());
-
-    // Results from spatial mapping (D-11/D-21: include anorm + background)
-    let (
-        density_maps,
-        uncertainty_maps,
-        chi_squared_map,
-        converged_map,
-        temperature_map,
-        temperature_uncertainty_map,
-        n_converged,
-        n_total,
-        n_failed,
-        result_isotope_labels,
-        anorm_map,
-        background_maps,
-        baseline_global,
-        baseline_e_ref_ev,
-        baseline_maps,
-    ) = if let Some(ref sr) = state.spatial_result {
-        (
-            Some(sr.density_maps.clone()),
-            Some(sr.uncertainty_maps.clone()),
-            Some(sr.chi_squared_map.clone()),
-            Some(sr.converged_map.clone()),
-            sr.temperature_map.clone(),
-            sr.temperature_uncertainty_map.clone(),
-            Some(sr.n_converged),
-            Some(sr.n_total),
-            Some(sr.n_failed),
-            Some(sr.isotope_labels.clone()),
-            sr.anorm_map.clone(),
-            sr.background_maps.clone(),
-            // #635: the overlay rebuilds B(E) from these on reload —
-            // dropping them would silently change the displayed model.
-            sr.baseline_global,
-            sr.baseline_e_ref_ev,
-            sr.baseline_maps.clone(),
-        )
-    } else {
-        (
-            None, None, None, None, None, None, None, None, None, None, None, None, None, None,
-            None,
-        )
-    };
-
-    // Single-pixel fit results
-    let (
-        single_fit_densities,
-        single_fit_uncertainties,
-        single_fit_chi_squared,
-        single_fit_temperature,
-        single_fit_temperature_unc,
-        single_fit_converged,
-        single_fit_iterations,
-        single_fit_pixel,
-        single_fit_labels,
-        single_fit_anorm,
-        single_fit_background,
-        single_fit_baseline,
-        single_fit_baseline_e_ref_ev,
-    ) = if let Some(ref pfr) = state.pixel_fit_result {
-        // Prefer labels from FitFeedback (captured at fit time) to avoid
-        // desync if isotope_entries are modified after the fit.
-        // Only trust feedback when its length matches the result (a failed
-        // fit may leave stale feedback with a different isotope count).
-        let labels: Vec<String> = match state.last_fit_feedback.as_ref() {
-            Some(fb) if fb.densities.len() == pfr.densities.len() && !fb.densities.is_empty() => {
-                fb.densities.iter().map(|(s, _)| s.clone()).collect()
-            }
-            _ => state
-                .isotope_entries
-                .iter()
-                .filter(|e| e.enabled && e.resonance_data.is_some())
-                .map(|e| e.symbol.clone())
-                .collect(),
-        };
-        (
-            Some(pfr.densities.clone()),
-            pfr.uncertainties.clone(),
-            Some(pfr.reduced_chi_squared),
-            pfr.temperature_k,
-            pfr.temperature_k_unc,
-            Some(pfr.converged),
-            Some(pfr.iterations),
-            state.selected_pixel,
-            Some(labels),
-            Some(pfr.anorm),
-            Some(pfr.background),
-            pfr.baseline,
-            pfr.baseline_e_ref_ev,
-        )
-    } else {
-        (
-            None, None, None, None, None, None, None, None, None, None, None, None, None,
-        )
-    };
+    // Results are not produced while the counts engine is re-pointed; the
+    // snapshot keeps its result fields for schema compatibility.
+    let normalized: Option<ndarray::Array3<f64>> = None;
+    let normalized_uncertainty: Option<ndarray::Array3<f64>> = None;
+    let density_maps: Option<Vec<ndarray::Array2<f64>>> = None;
+    let uncertainty_maps: Option<Vec<ndarray::Array2<f64>>> = None;
+    let chi_squared_map: Option<ndarray::Array2<f64>> = None;
+    let converged_map: Option<ndarray::Array2<bool>> = None;
+    let temperature_map: Option<ndarray::Array2<f64>> = None;
+    let temperature_uncertainty_map: Option<ndarray::Array2<f64>> = None;
+    let n_converged: Option<usize> = None;
+    let n_total: Option<usize> = None;
+    let n_failed: Option<usize> = None;
+    let result_isotope_labels: Option<Vec<String>> = None;
+    let anorm_map: Option<ndarray::Array2<f64>> = None;
+    let background_maps: Option<[ndarray::Array2<f64>; 3]> = None;
+    let baseline_global: Option<[f64; 3]> = None;
+    let baseline_e_ref_ev: Option<f64> = None;
+    let baseline_maps: Option<[ndarray::Array2<f64>; 3]> = None;
+    let single_fit_densities: Option<Vec<f64>> = None;
+    let single_fit_uncertainties: Option<Vec<f64>> = None;
+    let single_fit_chi_squared: Option<f64> = None;
+    let single_fit_temperature: Option<f64> = None;
+    let single_fit_temperature_unc: Option<f64> = None;
+    let single_fit_converged: Option<bool> = None;
+    let single_fit_iterations: Option<usize> = None;
+    let single_fit_pixel: Option<(usize, usize)> = None;
+    let single_fit_labels: Option<Vec<String>> = None;
+    let single_fit_anorm: Option<f64> = None;
+    let single_fit_background: Option<[f64; 3]> = None;
+    let single_fit_baseline: Option<[f64; 3]> = None;
+    let single_fit_baseline_e_ref_ev: Option<f64> = None;
 
     // Provenance log
     let provenance: Vec<(String, String, String)> = state
@@ -287,39 +193,30 @@ pub fn snapshot_from_state(state: &AppState) -> ProjectSnapshot {
         isotope_group_enabled,
         input_mode: match state.input_mode {
             InputMode::TiffPair => "tiff_pair",
-            InputMode::TransmissionTiff => "transmission_tiff",
             InputMode::Hdf5Histogram => "hdf5_histogram",
             InputMode::Hdf5Event => "hdf5_event",
         }
         .into(),
-        analysis_mode: match state.analysis_mode {
-            AnalysisMode::FullSpatialMap => "full_spatial",
-            AnalysisMode::RoiSingleSpectrum => "roi_single",
-            AnalysisMode::SpatialBinning(_) => "spatial_binning",
-        }
-        .into(),
-        spatial_binning_factor: match state.analysis_mode {
-            AnalysisMode::SpatialBinning(n) => Some(n),
-            _ => None,
-        },
+        analysis_mode: "full_spatial".into(),
+        spatial_binning_factor: None,
         event_n_bins: state.event_n_bins as u32,
         event_tof_min_us: state.event_tof_min_us,
         event_tof_max_us: state.event_tof_max_us,
         event_height: state.event_height as u32,
         event_width: state.event_width as u32,
         solver_method: solver_method.into(),
-        max_iter: state.lm_config.max_iter.min(u32::MAX as usize) as u32,
+        max_iter: 200,
         temperature_k: state.temperature_k,
-        fit_temperature: state.fit_temperature,
-        fit_energy_scale: Some(state.fit_energy_scale),
+        fit_temperature: false,
+        fit_energy_scale: Some(false),
         fit_energy_range: state.fit_energy_range,
         uncertainty_is_estimated: Some(state.uncertainty_is_estimated),
-        lm_background_enabled: Some(state.lm_background_enabled),
+        lm_background_enabled: Some(false),
         baseline_enabled: Some(state.baseline_enabled),
         kl_background_enabled: Some(state.kl_background_enabled),
         kl_c_ratio: Some(state.kl_c_ratio),
         kl_enable_polish_override: Some(state.kl_enable_polish_override),
-        resolution_enabled: state.resolution_enabled,
+        resolution_enabled: false,
         resolution_kind: resolution_kind.into(),
         delta_t_us,
         delta_l_m,
@@ -357,8 +254,8 @@ pub fn snapshot_from_state(state: &AppState) -> ProjectSnapshot {
         normalized,
         normalized_uncertainty,
         energies: state.energies.clone(),
-        // Persist the two mask components SEPARATELY (#646 review R3 F3 +
-        // R4 P1-1).  `/intermediate/dead_pixels` carries the DECLARED
+        // Persist the two mask components SEPARATELY:
+        // `/intermediate/dead_pixels` carries the DECLARED
         // component only: persisting the effective mask (declared ∪
         // detected) there would let the restore-side declared-promotion
         // bake each session's detections into the next session's declared
@@ -780,7 +677,7 @@ fn state_from_snapshot(snap: ProjectSnapshot, state: &mut AppState, path: &Path)
     // cancel_pending_tasks deliberately leaves save state alone (save cannot be
     // cancelled safely). Since we are replacing the entire session, clear save
     // tracking explicitly — the background thread will still finish its HDF5
-    // write, and we no longer care about the result for this session, but we
+    // write; the result does not matter for this session, but we
     // still keep the JoinHandle so shutdown code can join the thread safely.
     state.is_saving = false;
     state.pending_save = None;
@@ -789,23 +686,14 @@ fn state_from_snapshot(snap: ProjectSnapshot, state: &mut AppState, path: &Path)
     // The handle will be joined in on_exit() before the process terminates.
 
     // 1. Clear derived state
-    state.spatial_result = None;
-    state.pixel_fit_result = None;
-    state.last_fit_feedback = None;
-    state.normalized = None;
     state.energies = None;
     state.preview_image = None;
-    state.tile_display.clear();
-    state.residuals_cache = None;
     state.sample_data = None;
     state.open_beam_data = None;
     state.spectrum_values = None;
     state.dead_pixels = None;
     state.file_dead_pixels = None;
     state.detected_dead_pixels = None;
-    state.fm_spectrum = None;
-    state.fm_per_isotope_spectra.clear();
-    state.detect_results.clear();
     state.load_error = false;
     state.show_save_modal = false;
     state.save_data_mode = SaveDataMode::default();
@@ -819,7 +707,6 @@ fn state_from_snapshot(snap: ProjectSnapshot, state: &mut AppState, path: &Path)
     state.data_type = match snap.data_type.as_str() {
         "events" => Some(DataType::Events),
         "pre_normalized" => Some(DataType::PreNormalized),
-        "transmission" => Some(DataType::Transmission),
         _ => None,
     };
 
@@ -833,31 +720,13 @@ fn state_from_snapshot(snap: ProjectSnapshot, state: &mut AppState, path: &Path)
             ("events", true) => InputMode::Hdf5Event,
             ("events", false) => InputMode::TiffPair,
             ("pre_normalized", _) => InputMode::TiffPair,
-            ("transmission", _) => InputMode::TransmissionTiff,
             _ => InputMode::TiffPair,
         }
     } else {
         match snap.input_mode.as_str() {
-            "transmission_tiff" => InputMode::TransmissionTiff,
             "hdf5_histogram" => InputMode::Hdf5Histogram,
             "hdf5_event" => InputMode::Hdf5Event,
             _ => InputMode::TiffPair,
-        }
-    };
-
-    // 4b. Restore analysis mode — for old files without analysis_mode,
-    // derive from fitting_type so single-spectrum projects don't become maps.
-    state.analysis_mode = match snap.analysis_mode.as_str() {
-        "roi_single" => AnalysisMode::RoiSingleSpectrum,
-        "spatial_binning" => AnalysisMode::SpatialBinning(snap.spatial_binning_factor.unwrap_or(2)),
-        "full_spatial" => AnalysisMode::FullSpatialMap,
-        _ => {
-            // Legacy fallback: single → RoiSingleSpectrum, spatial → FullSpatialMap
-            if snap.fitting_type == "single" {
-                AnalysisMode::RoiSingleSpectrum
-            } else {
-                AnalysisMode::FullSpatialMap
-            }
         }
     };
 
@@ -1010,48 +879,14 @@ fn state_from_snapshot(snap: ProjectSnapshot, state: &mut AppState, path: &Path)
         });
     }
 
-    // 9. Restore solver
-    state.solver_method = match snap.solver_method.as_str() {
-        "poisson_kl" => SolverMethod::PoissonKL,
-        _ => SolverMethod::LevenbergMarquardt,
-    };
-    state.lm_config.max_iter = snap.max_iter as usize;
+    // 9. Restore solver-independent configuration
     state.temperature_k = snap.temperature_k;
-    state.fit_temperature = snap.fit_temperature;
-    state.fit_energy_scale = snap.fit_energy_scale.unwrap_or(false);
     state.fit_energy_range = snap.fit_energy_range;
     state.uncertainty_is_estimated = snap.uncertainty_is_estimated.unwrap_or(false);
-    state.lm_background_enabled = snap.lm_background_enabled.unwrap_or(false);
-    // #635: the flag that selects the baseline model must round-trip —
-    // without it a reloaded project shows baseline results while a refit
-    // silently runs Anorm-free with no baseline.  Pre-#635 files: false.
     state.baseline_enabled = snap.baseline_enabled.unwrap_or(false);
     state.kl_background_enabled = snap.kl_background_enabled.unwrap_or(false);
     state.kl_c_ratio = snap.kl_c_ratio.unwrap_or(1.0);
     state.kl_enable_polish_override = snap.kl_enable_polish_override.unwrap_or(None);
-
-    // 10. Restore resolution
-    state.resolution_enabled = snap.resolution_enabled;
-    state.resolution_mode = match snap.resolution_kind.as_str() {
-        "tabulated" => {
-            if let Some(p) = snap.tabulated_path {
-                ResolutionMode::Tabulated {
-                    path: PathBuf::from(p),
-                    data: None,
-                    error: None,
-                }
-            } else {
-                ResolutionMode::Gaussian {
-                    delta_t_us: snap.delta_t_us.unwrap_or(0.0),
-                    delta_l_m: snap.delta_l_m.unwrap_or(0.0),
-                }
-            }
-        }
-        _ => ResolutionMode::Gaussian {
-            delta_t_us: snap.delta_t_us.unwrap_or(0.0),
-            delta_l_m: snap.delta_l_m.unwrap_or(0.0),
-        },
-    };
 
     // 11. Restore ROIs
     state.rois = snap
@@ -1065,7 +900,6 @@ fn state_from_snapshot(snap: ProjectSnapshot, state: &mut AppState, path: &Path)
         })
         .collect();
     state.selected_roi = None;
-    state.fitting_rois = state.rois.clone();
 
     // 12. Restore spectrum unit/kind
     state.spectrum_unit = match snap.spectrum_unit.as_str() {
@@ -1135,26 +969,13 @@ fn state_from_snapshot(snap: ProjectSnapshot, state: &mut AppState, path: &Path)
         state.last_save_mode = SaveDataMode::Linked;
     }
 
-    // 15. Restore intermediate data (D-1: uncertainty now persisted)
-    if let Some(transmission) = snap.normalized {
-        let shape = transmission.raw_dim();
-        // Use saved uncertainty if available, otherwise fallback to zeros
-        // (backward compat with old project files that didn't save uncertainty).
-        let uncertainty = snap
-            .normalized_uncertainty
-            .unwrap_or_else(|| ndarray::Array3::zeros(shape));
-        state.normalized = Some(Arc::new(NormalizedData {
-            transmission,
-            uncertainty,
-        }));
-    }
     state.energies = snap.energies;
 
-    // 15b. Restore the dead-pixel mask components (D-20, #646).  NEW
+    // 15b. Restore the dead-pixel mask components.
     // project files persist the DECLARED component at
     // `/intermediate/dead_pixels` (snapshot_from_state writes
     // state.file_dead_pixels) and the DETECTED component at
-    // `/intermediate/detected_dead_pixels` (#646 R4, P1-1); the effective
+    // `/intermediate/detected_dead_pixels`; the effective
     // mask is rebuilt here as declared ∪ persisted-detected via the same
     // single-site helper every normalization uses — a restored project
     // may carry embedded normalized data WITHOUT raw stacks, where
@@ -1166,11 +987,11 @@ fn state_from_snapshot(snap: ProjectSnapshot, state: &mut AppState, path: &Path)
     // that never recorded the split.  Either way, the next normalization
     // recomputes the effective mask from scratch as declared ∪
     // freshly-detected (AppState::set_detected_dead_pixels), so
-    // save→load→save cycles cannot grow either component (#646 review R3
-    // F3, R4 P1-1).  If the linked HDF5 is reloaded, the load site
+    // save→load→save cycles cannot grow either component.  If the linked
+    // HDF5 is reloaded, the load site
     // overwrites the declared mask with the file's own.
     //
-    // Geometry validation (#646 F3): both components now come from a
+    // Geometry validation: both components now come from a
     // FILE, so a hand-corrupted project can carry a mask whose geometry
     // does not match the data it will be applied to.  The refit consumes
     // the effective mask against the restored normalized transmission
@@ -1188,10 +1009,7 @@ fn state_from_snapshot(snap: ProjectSnapshot, state: &mut AppState, path: &Path)
     // and drops an inapplicable declared mask via the setter's returned
     // notice.
     let mut mask_notices: Vec<String> = Vec::new();
-    let expected_dims = state.normalized.as_ref().map(|n| {
-        let s = n.transmission.shape();
-        (s[1], s[2])
-    });
+    let expected_dims: Option<(usize, usize)> = None;
     let mut declared = snap.dead_pixels;
     let mut detected = snap.detected_dead_pixels;
     if let Some(dims) = expected_dims {
@@ -1222,7 +1040,7 @@ fn state_from_snapshot(snap: ProjectSnapshot, state: &mut AppState, path: &Path)
     }
     state.file_dead_pixels = declared;
     // The setter RETURNS a declared-mask-drop notice instead of logging
-    // it (#646 F1): step 17 below replaces the provenance log wholesale
+    // it: step 17 below replaces the provenance log wholesale
     // with the snapshot's, which would erase an entry appended here.
     // Deferred — with the geometry notices above — to steps 20/22,
     // exactly like the drift warning (15c).
@@ -1230,30 +1048,28 @@ fn state_from_snapshot(snap: ProjectSnapshot, state: &mut AppState, path: &Path)
         mask_notices.push(notice);
     }
 
-    // 15c. Detection-drift check (#646 R4, P1-1): when the raw stacks WERE
+    // 15c. Detection-drift check: when the raw stacks WERE
     // restored (embedded save), re-run the same detection normalization
-    // would run and WARN if it no longer reproduces the persisted detected
+    // would run and WARN if it does not reproduce the persisted detected
     // component — hidden state drift becomes observable instead of being
     // silently replaced (or silently trusted).  The persisted component
     // stays active either way; re-normalizing adopts the fresh detection
-    // explicitly.  Mode gating mirrors the three normalization call sites:
-    // TransmissionTiff never detects; the TIFF pair detects over
-    // sample ∪ OB (skip when the OB stack was not restored — recomputing
-    // on the sample alone would warn spuriously); the HDF5 modes detect
-    // over whatever is present.
+    // explicitly.  Mode gating: the TIFF pair detects over sample ∪ OB
+    // (skip when the OB stack was not restored — recomputing on the sample
+    // alone would warn spuriously); the HDF5 modes detect over whatever is
+    // present.
     let detected_drift: Option<String> = match (&state.detected_dead_pixels, &state.sample_data) {
         (Some(persisted), Some(sample)) => {
             let ob = state.open_beam_data.as_deref();
             let stacks = match state.input_mode {
-                InputMode::TransmissionTiff => None,
                 InputMode::TiffPair => ob.map(|o| (sample.as_ref(), Some(o))),
                 InputMode::Hdf5Histogram | InputMode::Hdf5Event => Some((sample.as_ref(), ob)),
             };
             stacks.and_then(|(s, o)| {
-                match nereids_io::normalization::detect_bad_pixels(
+                match nereids_io::pixels::detect_bad_pixels(
                     s,
                     o,
-                    Some(nereids_io::normalization::HOT_PIXEL_K_MAD),
+                    Some(nereids_io::pixels::HOT_PIXEL_K_MAD),
                 ) {
                     Ok(fresh) if fresh.dim() == persisted.dim() => {
                         let n_diff = fresh
@@ -1289,138 +1105,6 @@ fn state_from_snapshot(snap: ProjectSnapshot, state: &mut AppState, path: &Path)
     // provenance log with the snapshot's, which would drop an entry
     // appended here.)
 
-    // 16. Restore results
-    if let Some(density_maps) = snap.density_maps {
-        let n_maps = density_maps.len();
-        let uncertainty_maps = snap.uncertainty_maps.unwrap_or_else(|| {
-            density_maps
-                .iter()
-                .map(|m| ndarray::Array2::zeros(m.raw_dim()))
-                .collect()
-        });
-        let chi_squared_map = snap
-            .chi_squared_map
-            .unwrap_or_else(|| ndarray::Array2::zeros((1, 1)));
-        let converged_map = snap
-            .converged_map
-            .unwrap_or_else(|| ndarray::Array2::from_elem((1, 1), false));
-        let result = SpatialResult {
-            density_maps,
-            uncertainty_maps,
-            chi_squared_map,
-            // Project-file restores predate the D/dof map; leave None until
-            // we decide whether to persist it (low priority — the map is
-            // reproducible by re-running spatial_map_typed).
-            deviance_per_dof_map: None,
-            converged_map,
-            temperature_map: snap.temperature_map,
-            temperature_uncertainty_map: snap.temperature_uncertainty_map,
-            isotope_labels: snap.result_isotope_labels.unwrap_or_else(|| {
-                // Fallback for project files created before labels were stored
-                // in SpatialResult — derive from the restored isotope entries.
-                state
-                    .isotope_entries
-                    .iter()
-                    .filter(|e| e.enabled && e.resonance_data.is_some())
-                    .map(|e| e.symbol.clone())
-                    .collect()
-            }),
-            // D-11/D-21: Now persisted; None for old project files.
-            anorm_map: snap.anorm_map,
-            background_maps: snap.background_maps,
-            // Per-pixel BackD/BackF maps are not yet persisted in
-            // project files (same precedent as the TZERO maps below).
-            // Re-running `spatial_map_typed` regenerates them.
-            back_d_map: None,
-            back_f_map: None,
-            // TZERO maps are not yet persisted in project files — None on
-            // restore.  Re-running spatial_map_typed regenerates them.
-            t0_us_map: None,
-            l_scale_map: None,
-            // Snapshots don't persist the energy-scale flight path yet; the
-            // overlay accessor treats `None` as "energy scale not fitted".
-            energy_scale_flight_path_m: None,
-            // #635: baseline outputs are persisted so the overlay rebuilds
-            // B(E) exactly as fitted.  Warnings are config-time diagnostics
-            // and regenerate on refit — not persisted.
-            baseline_global: snap.baseline_global,
-            baseline_e_ref_ev: snap.baseline_e_ref_ev,
-            baseline_maps: snap.baseline_maps.clone(),
-            warnings: Vec::new(),
-            n_converged: snap.n_converged.unwrap_or(0),
-            n_total: snap.n_total.unwrap_or(0),
-            n_failed: snap.n_failed.unwrap_or(0),
-        };
-        state.init_tile_display(n_maps);
-        state.spatial_result = Some(result);
-    }
-
-    // 16b. Restore single-pixel fit results
-    if let Some(densities) = snap.single_fit_densities {
-        let uncertainties = snap.single_fit_uncertainties;
-        let result = nereids_pipeline::pipeline::SpectrumFitResult {
-            densities,
-            uncertainties,
-            reduced_chi_squared: snap.single_fit_chi_squared.unwrap_or(f64::NAN),
-            converged: snap.single_fit_converged.unwrap_or(false),
-            iterations: snap.single_fit_iterations.unwrap_or(0),
-            temperature_k: snap.single_fit_temperature,
-            temperature_k_unc: snap.single_fit_temperature_unc,
-            anorm: snap.single_fit_anorm.unwrap_or(1.0),
-            background: snap.single_fit_background.unwrap_or([0.0, 0.0, 0.0]),
-            // `back_d` / `back_f` are `Option<f64>` (`None` =
-            // exponential tail not fit).  The single-pixel snapshot
-            // fields don't yet persist these, so `None` on reload is
-            // the correct "not fit" signal — the curve renderer drops
-            // the exponential term, no misleading 0.0 sentinel.
-            back_d: None,
-            back_f: None,
-            t0_us: None,
-            l_scale: None,
-            energy_scale_flight_path_m: None,
-            deviance_per_dof: None,
-            // #635: restore the fitted baseline so the overlay applies the
-            // same B(E) the fit used.  Pre-#635 project files read as None.
-            baseline: snap.single_fit_baseline,
-            baseline_e_ref_ev: snap.single_fit_baseline_e_ref_ev,
-            warnings: Vec::new(),
-        };
-        // Rebuild FitFeedback from the restored result
-        if let Some(ref labels) = snap.single_fit_labels {
-            let fb_densities: Vec<(String, f64)> = labels
-                .iter()
-                .zip(result.densities.iter())
-                .map(|(s, &d)| (s.clone(), d))
-                .collect();
-            let chi2_suffix = if state.uncertainty_is_estimated {
-                " (approx.)"
-            } else {
-                ""
-            };
-            let summary = if result.converged {
-                format!(
-                    "Converged, chi2_r = {:.4}{}",
-                    result.reduced_chi_squared, chi2_suffix
-                )
-            } else {
-                "Did not converge".to_string()
-            };
-            state.last_fit_feedback = Some(FitFeedback {
-                success: result.converged,
-                summary,
-                densities: fb_densities,
-                temperature_k: result.temperature_k,
-                // Warnings are config-time diagnostics; the restored result
-                // carries none (they are not persisted — re-fitting
-                // regenerates them).
-                warnings: result.warnings.clone(),
-            });
-        }
-        state.selected_pixel = snap.single_fit_pixel;
-        state.pixel_fit_result = Some(result);
-        state.fit_result_gen += 1;
-    }
-
     // 17. Restore provenance
     state.provenance_log = snap
         .provenance
@@ -1448,12 +1132,7 @@ fn state_from_snapshot(snap: ProjectSnapshot, state: &mut AppState, path: &Path)
     state.project_file_path = Some(path.to_path_buf());
 
     // 19. Auto-navigate
-    if state.spatial_result.is_some() {
-        state.ui_mode = UiMode::Studio;
-    } else if state.normalized.is_some() {
-        state.ui_mode = UiMode::Guided;
-        state.guided_step = GuidedStep::Analyze;
-    } else if !state.pipeline.is_empty() {
+    if !state.pipeline.is_empty() {
         state.ui_mode = UiMode::Guided;
         state.guided_step = state.pipeline[0].step;
     }
@@ -1476,9 +1155,8 @@ fn state_from_snapshot(snap: ProjectSnapshot, state: &mut AppState, path: &Path)
     }
     state.status_message = status;
 
-    // 21. Clear stale wizard session cache and dirty tracking
+    // 21. Clear stale wizard session cache
     state.cached_session = None;
-    state.clear_dirty();
 
     // 22. Log provenance (mask-drop and drift entries after step 17's
     // wholesale replacement of the provenance log — see 15b/15c)
@@ -1565,14 +1243,10 @@ mod tests {
         state.dead_pixels.clone()
     }
 
-    /// #646 review R3 F3 + R4 P1-1: project SAVE persists the mask as two
+    /// Project SAVE persists the mask as two
     /// SEPARATE components (declared at `/intermediate/dead_pixels`,
     /// detected at `/intermediate/detected_dead_pixels`), so a
-    /// save→load→save cycle must not grow EITHER component.  Before the
-    /// R3 fix the snapshot carried the EFFECTIVE mask (declared ∪
-    /// detected) at the declared path and the restore-side
-    /// declared-promotion baked each session's detections into the next
-    /// session's declared component — monotonic growth.
+    /// save→load→save cycle must not grow EITHER component.
     #[test]
     fn test_snapshot_persists_split_mask_components_no_growth_across_cycles() {
         let mut declared = Array2::from_elem((3, 3), false);
@@ -1636,7 +1310,7 @@ mod tests {
         assert_eq!(snap2.detected_dead_pixels.as_ref().unwrap(), &detected);
     }
 
-    /// #646 R4 P1-1 acceptance (b): save→restore→refit WITHOUT raw stacks
+    /// Acceptance (b): save→restore→refit WITHOUT raw stacks
     /// — the exact scenario the detected-component persistence exists
     /// for.  Normalization (and thus detection) cannot re-run, so the
     /// refit's active mask must still equal the at-save mask, through the
@@ -1669,7 +1343,7 @@ mod tests {
 
         // Scenario precondition: no raw stacks after restore.
         assert!(restored.sample_data.is_none());
-        // The refit's active mask equals the at-save mask (before P1-1 the
+        // The refit's active mask equals the at-save mask (before the
         // detected component was lost and this was declared-only).
         assert_eq!(refit_active_mask(&restored).unwrap(), at_save_mask);
         // No drift check without raw stacks: nothing to recompute from.
@@ -1682,7 +1356,7 @@ mod tests {
         );
     }
 
-    /// #646 R4 P1-1 acceptance (a): save→restore→refit WITH raw stacks
+    /// Acceptance (a): save→restore→refit WITH raw stacks
     /// embedded.  The persisted detected component still restores the
     /// at-save active mask, and — since the recomputed detection agrees
     /// with the persisted one — no drift warning is raised.
@@ -1693,10 +1367,10 @@ mod tests {
         // test_detect_hot_pixels_uniform_image_poisson_floor_path).
         let mut sample = Array3::from_elem((1, 3, 3), 100.0);
         sample[[0, 1, 1]] = 65535.0;
-        let detected = nereids_io::normalization::detect_bad_pixels(
+        let detected = nereids_io::pixels::detect_bad_pixels(
             &sample,
             None,
-            Some(nereids_io::normalization::HOT_PIXEL_K_MAD),
+            Some(nereids_io::pixels::HOT_PIXEL_K_MAD),
         )
         .unwrap();
         assert!(detected[[1, 1]], "fixture must detect the railed pixel");
@@ -1739,7 +1413,7 @@ mod tests {
         );
     }
 
-    /// #646 R4 P1-1: when raw stacks are present on restore and the
+    /// When raw stacks are present on restore and the
     /// recomputed detection DISAGREES with the persisted detected
     /// component, the persisted mask stays active (never silently
     /// replaced) and the drift is surfaced in both the status message and
@@ -1800,7 +1474,7 @@ mod tests {
         );
     }
 
-    /// #646 F1 acceptance: a mismatched declared/detected pair on restore
+    /// A mismatched declared/detected pair on restore
     /// must stay observable THROUGH step 17's wholesale replacement of
     /// the session provenance log with the snapshot's — the erasure the
     /// direct-call setter test (state.rs) cannot see.  End-to-end through
@@ -1818,8 +1492,8 @@ mod tests {
         detected[[0, 0]] = true;
         snap.detected_dead_pixels = Some(detected.clone());
         // The snapshot carries its own provenance history — step 17
-        // replaces the session log with exactly this, which used to
-        // erase the drop entry the setter appended at step 15b.
+        // replaces the session log with exactly this, which would
+        // otherwise erase the drop entry the setter appended at step 15b.
         snap.provenance = vec![(
             "2026-07-04 00:00:00 UTC".into(),
             "ProjectSaved".into(),
@@ -1861,106 +1535,6 @@ mod tests {
                 && restored.status_message.contains("(2, 2)"),
             "status must surface the drop: {}",
             restored.status_message
-        );
-    }
-
-    /// #646 F3: a hand-corrupted persisted DETECTED component of the
-    /// wrong geometry must not become the effective mask — with restored
-    /// ROIs the analyze-side ROI∪mask merge (`ndarray::Zip`,
-    /// guided/analyze.rs) panics on the shape mismatch.  With normalized
-    /// data restored the geometry is known at step 15b, so the component
-    /// is dropped and the drop surfaced in status + provenance.
-    #[test]
-    fn test_restore_drops_wrong_geometry_detected_component_with_notice() {
-        let mut declared = Array2::from_elem((3, 3), false);
-        declared[[0, 0]] = true;
-
-        let mut snap = snapshot_from_state(&AppState::default());
-        snap.normalized = Some(Array3::from_elem((1, 3, 3), 0.5));
-        snap.dead_pixels = Some(declared.clone());
-        // Corrupt: detected component from a different geometry.
-        snap.detected_dead_pixels = Some(Array2::from_elem((2, 2), true));
-
-        let dir = tempfile::tempdir().unwrap();
-        let path = dir.path().join("wrong_geom_detected.nrd.h5");
-        save_project(&path, &snap).unwrap();
-
-        let mut restored = AppState::default();
-        state_from_snapshot(load_project(&path).unwrap(), &mut restored, &path);
-
-        // The wrong-geometry detected component is dropped; the declared
-        // component (which matches the data) is kept and becomes the
-        // effective mask.
-        assert!(restored.detected_dead_pixels.is_none());
-        assert_eq!(restored.file_dead_pixels.as_ref().unwrap(), &declared);
-        assert_eq!(refit_active_mask(&restored).unwrap(), declared);
-        // Mask-geometry invariant that makes the analyze ROI-merge panic
-        // unreachable: the effective mask matches the restored
-        // transmission's spatial dims.
-        let t = &restored.normalized.as_ref().unwrap().transmission;
-        let dims = (t.shape()[1], t.shape()[2]);
-        assert_eq!(restored.dead_pixels.as_ref().unwrap().dim(), dims);
-        // Drive the same ROI∪mask merge analyze performs (Zip panics on
-        // shape mismatch) — must not panic now that geometry is enforced.
-        let mut roi_mask = Array2::from_elem(dims, true);
-        if let Some(ref dp) = restored.dead_pixels {
-            ndarray::Zip::from(&mut roi_mask)
-                .and(dp)
-                .for_each(|m, &d| *m = *m || d);
-        }
-        // Drop surfaced in status + final provenance, never silent.
-        assert!(
-            restored.status_message.contains("WARNING")
-                && restored.status_message.contains("detected mask"),
-            "status must surface the drop: {}",
-            restored.status_message
-        );
-        assert!(
-            restored
-                .provenance_log
-                .iter()
-                .any(|e| e.message.contains("detected mask") && e.message.contains("dropped")),
-            "provenance must record the drop"
-        );
-    }
-
-    /// #646 F3: BOTH persisted components wrong against the restored
-    /// data geometry — both are dropped (effective mask absent, not
-    /// wrong), each drop gets its own notice, and the setter's own
-    /// mismatch arm never double-fires (it receives an already-validated
-    /// pair).
-    #[test]
-    fn test_restore_drops_both_wrong_geometry_mask_components() {
-        let mut snap = snapshot_from_state(&AppState::default());
-        snap.normalized = Some(Array3::from_elem((1, 3, 3), 0.5));
-        snap.dead_pixels = Some(Array2::from_elem((4, 4), true));
-        snap.detected_dead_pixels = Some(Array2::from_elem((2, 2), true));
-
-        let dir = tempfile::tempdir().unwrap();
-        let path = dir.path().join("both_wrong_geom.nrd.h5");
-        save_project(&path, &snap).unwrap();
-
-        let mut restored = AppState::default();
-        state_from_snapshot(load_project(&path).unwrap(), &mut restored, &path);
-
-        assert!(restored.file_dead_pixels.is_none());
-        assert!(restored.detected_dead_pixels.is_none());
-        assert!(restored.dead_pixels.is_none());
-        // One notice per dropped component, both in status and provenance.
-        assert!(
-            restored.status_message.contains("declared mask")
-                && restored.status_message.contains("detected mask"),
-            "status must surface both drops: {}",
-            restored.status_message
-        );
-        assert_eq!(
-            restored
-                .provenance_log
-                .iter()
-                .filter(|e| e.message.contains("Pixel-mask restore:"))
-                .count(),
-            2,
-            "one provenance entry per dropped component"
         );
     }
 }

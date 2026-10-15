@@ -2,12 +2,10 @@
 //!
 //! Renders a standard 18-column periodic table as a grid of colored buttons.
 //! When an element is selected, its natural isotopes are shown as clickable
-//! chips that add the isotope to the appropriate target list (Configure,
-//! Forward Model, or Detectability).
+//! chips that add the isotope to the Configure list.
 
 use crate::state::{
-    AppState, DetectTraceEntry, EndfStatus, GroupMemberState, IsotopeEntry, IsotopeGroupEntry,
-    PeriodicTableTarget,
+    AppState, EndfStatus, GroupMemberState, IsotopeEntry, IsotopeGroupEntry, PeriodicTableTarget,
 };
 use egui::{Color32, CornerRadius};
 use nereids_core::types::Isotope;
@@ -558,30 +556,17 @@ pub fn periodic_table_modal(ctx: &egui::Context, state: &mut AppState) {
                 if !state.periodic_table_selected_isotopes.is_empty() {
                     ui.add_space(4.0);
                     ui.horizontal(|ui| {
-                        let is_ppm =
-                            state.periodic_table_target == PeriodicTableTarget::DetectTrace;
-                        let label = if is_ppm {
-                            "Conc. (ppm):"
-                        } else {
-                            "Density (at/barn):"
-                        };
-                        ui.label(label);
+                        ui.label("Density (at/barn):");
                         ui.add(
                             egui::DragValue::new(&mut state.periodic_table_density)
-                                .speed(if is_ppm { 10.0 } else { 0.0001 })
-                                .range(if is_ppm { 0.1..=1e6 } else { 1e-6..=1.0 })
-                                .max_decimals(if is_ppm { 1 } else { 6 }),
+                                .speed(0.0001)
+                                .range(1e-6..=1.0)
+                                .max_decimals(6),
                         );
 
                         // Disable library changes while a fetch is in progress
                         // to prevent stale results from overwriting new entries.
-                        let fetching = match state.periodic_table_target {
-                            PeriodicTableTarget::Configure
-                            | PeriodicTableTarget::ConfigureGroup => state.is_fetching_endf,
-                            PeriodicTableTarget::ForwardModel => state.is_fetching_fm_endf,
-                            PeriodicTableTarget::DetectMatrix
-                            | PeriodicTableTarget::DetectTrace => state.is_fetching_detect_endf,
-                        };
+                        let fetching = state.is_fetching_endf;
                         // Snapshot the library before the combobox so we can detect
                         // a user-driven library change and prune already-selected
                         // isotopes that aren't in the new library's coverage.
@@ -699,49 +684,18 @@ fn add_selected_isotopes(state: &mut AppState) {
     // If the user selected a different library, existing resonance data
     // must be re-fetched (same pattern as the main library ComboBox).
     if let Some(lib) = state.periodic_table_library {
-        let target_lib = match state.periodic_table_target {
-            PeriodicTableTarget::Configure | PeriodicTableTarget::ConfigureGroup => {
-                &mut state.endf_library
-            }
-            PeriodicTableTarget::ForwardModel => &mut state.fm_endf_library,
-            PeriodicTableTarget::DetectMatrix | PeriodicTableTarget::DetectTrace => {
-                &mut state.detect_endf_library
-            }
-        };
+        let target_lib = &mut state.endf_library;
         if *target_lib != lib {
             *target_lib = lib;
             // Clear existing resonance data so they get re-fetched with the new library
-            match state.periodic_table_target {
-                PeriodicTableTarget::Configure | PeriodicTableTarget::ConfigureGroup => {
-                    for e in &mut state.isotope_entries {
-                        e.resonance_data = None;
-                        e.endf_status = EndfStatus::Pending;
-                    }
-                    for g in &mut state.isotope_groups {
-                        for m in &mut g.members {
-                            m.resonance_data = None;
-                            m.endf_status = EndfStatus::Pending;
-                        }
-                    }
-                }
-                PeriodicTableTarget::ForwardModel => {
-                    for e in &mut state.fm_isotope_entries {
-                        e.resonance_data = None;
-                        e.endf_status = EndfStatus::Pending;
-                    }
-                    state.fm_spectrum = None;
-                    state.fm_per_isotope_spectra.clear();
-                }
-                PeriodicTableTarget::DetectMatrix | PeriodicTableTarget::DetectTrace => {
-                    for e in &mut state.detect_matrix_entries {
-                        e.resonance_data = None;
-                        e.endf_status = EndfStatus::Pending;
-                    }
-                    for e in &mut state.detect_trace_entries {
-                        e.resonance_data = None;
-                        e.endf_status = EndfStatus::Pending;
-                    }
-                    state.detect_results.clear();
+            for e in &mut state.isotope_entries {
+                e.resonance_data = None;
+                e.endf_status = EndfStatus::Pending;
+            }
+            for g in &mut state.isotope_groups {
+                for m in &mut g.members {
+                    m.resonance_data = None;
+                    m.endf_status = EndfStatus::Pending;
                 }
             }
         }
@@ -776,85 +730,15 @@ fn add_selected_isotopes(state: &mut AppState) {
                     enabled: true,
                     endf_status: EndfStatus::Pending,
                 });
-                state.spatial_result = None;
-                state.pixel_fit_result = None;
             }
             // ConfigureGroup uses add_element_group(), not add_selected_isotopes()
             PeriodicTableTarget::ConfigureGroup => continue,
-            PeriodicTableTarget::ForwardModel => {
-                if state
-                    .fm_isotope_entries
-                    .iter()
-                    .any(|e| e.z == *z && e.a == *a)
-                {
-                    skipped_dup += 1;
-                    continue; // already present
-                }
-                state.fm_isotope_entries.push(IsotopeEntry {
-                    z: *z,
-                    a: *a,
-                    symbol,
-                    initial_density: density,
-                    resonance_data: None,
-                    enabled: true,
-                    endf_status: EndfStatus::Pending,
-                });
-                state.fm_spectrum = None;
-                state.fm_per_isotope_spectra.clear();
-            }
-            PeriodicTableTarget::DetectMatrix => {
-                if state
-                    .detect_matrix_entries
-                    .iter()
-                    .any(|e| e.z == *z && e.a == *a)
-                {
-                    skipped_dup += 1;
-                    continue; // already present
-                }
-                state.detect_matrix_entries.push(IsotopeEntry {
-                    z: *z,
-                    a: *a,
-                    symbol,
-                    initial_density: density,
-                    resonance_data: None,
-                    enabled: true,
-                    endf_status: EndfStatus::Pending,
-                });
-                state.detect_results.clear();
-            }
-            PeriodicTableTarget::DetectTrace => {
-                if state
-                    .detect_trace_entries
-                    .iter()
-                    .any(|e| e.z == *z && e.a == *a)
-                {
-                    skipped_dup += 1;
-                    continue; // already present
-                }
-                state.detect_trace_entries.push(DetectTraceEntry {
-                    z: *z,
-                    a: *a,
-                    symbol,
-                    concentration_ppm: density,
-                    resonance_data: None,
-                    endf_status: EndfStatus::Pending,
-                });
-                state.detect_results.clear();
-            }
         }
         added += 1;
     }
 
     // Provide user feedback about what was added.
-    let is_fetching = match state.periodic_table_target {
-        PeriodicTableTarget::Configure | PeriodicTableTarget::ConfigureGroup => {
-            state.is_fetching_endf
-        }
-        PeriodicTableTarget::ForwardModel => state.is_fetching_fm_endf,
-        PeriodicTableTarget::DetectMatrix | PeriodicTableTarget::DetectTrace => {
-            state.is_fetching_detect_endf
-        }
-    };
+    let is_fetching = state.is_fetching_endf;
     // Build status message from scratch (don't append to stale old message).
     let mut msg = String::new();
     if added > 0 && is_fetching {
@@ -895,10 +779,6 @@ fn add_selected_isotopes(state: &mut AppState) {
 fn target_library(state: &AppState) -> EndfLibrary {
     match state.periodic_table_target {
         PeriodicTableTarget::Configure | PeriodicTableTarget::ConfigureGroup => state.endf_library,
-        PeriodicTableTarget::ForwardModel => state.fm_endf_library,
-        PeriodicTableTarget::DetectMatrix | PeriodicTableTarget::DetectTrace => {
-            state.detect_endf_library
-        }
     }
 }
 
@@ -1000,8 +880,6 @@ fn add_element_group(state: &mut AppState, z: u32) {
         initial_density: state.periodic_table_density,
         enabled: true,
     });
-    state.spatial_result = None;
-    state.pixel_fit_result = None;
     state.status_message = format!("Added {sym} group ({n} isotopes)");
     close_modal(state);
 }

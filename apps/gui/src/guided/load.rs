@@ -11,16 +11,10 @@ use crate::theme::ThemeColors;
 use crate::widgets::design;
 use ndarray::Axis;
 
-const INPUT_MODE_LABELS: [&str; 4] = [
-    "TIFF Pair + Spectrum",
-    "Transmission TIFF",
-    "HDF5 Histogram",
-    "HDF5 Event",
-];
+const INPUT_MODE_LABELS: [&str; 3] = ["TIFF Pair + Spectrum", "HDF5 Histogram", "HDF5 Event"];
 
-const INPUT_MODES: [InputMode; 4] = [
+const INPUT_MODES: [InputMode; 3] = [
     InputMode::TiffPair,
-    InputMode::TransmissionTiff,
     InputMode::Hdf5Histogram,
     InputMode::Hdf5Event,
 ];
@@ -47,7 +41,6 @@ pub fn load_step(ui: &mut egui::Ui, state: &mut AppState) {
 
     match state.input_mode {
         InputMode::TiffPair => tiff_pair_tab(ui, state),
-        InputMode::TransmissionTiff => transmission_tiff_tab(ui, state),
         InputMode::Hdf5Histogram => hdf5_histogram_tab(ui, state),
         InputMode::Hdf5Event => hdf5_event_tab(ui, state),
     }
@@ -80,9 +73,6 @@ fn has_required_data(state: &AppState) -> bool {
             state.sample_data.is_some()
                 && state.open_beam_data.is_some()
                 && state.spectrum_values.is_some()
-        }
-        InputMode::TransmissionTiff => {
-            state.sample_data.is_some() && state.spectrum_values.is_some()
         }
         InputMode::Hdf5Histogram => state.sample_data.is_some() && state.spectrum_values.is_some(),
         InputMode::Hdf5Event => {
@@ -129,45 +119,6 @@ fn tiff_pair_tab(ui: &mut egui::Ui, state: &mut AppState) {
     // Auto-load when all files are selected
     let can_load = state.sample_path.is_some()
         && state.open_beam_path.is_some()
-        && state.spectrum_path.is_some()
-        && state.sample_data.is_none()
-        && !state.load_error;
-    if can_load {
-        load_all_data(state);
-    }
-
-    load_status_ui(ui, state);
-    show_loaded_info(ui, state);
-}
-
-// ── Transmission TIFF tab ──────────────────────────────────────
-
-/// Transmission TIFF tab: pre-normalized TIFF + Spectrum.
-fn transmission_tiff_tab(ui: &mut egui::Ui, state: &mut AppState) {
-    design::card(ui, |ui| {
-        ui.label(
-            egui::RichText::new("Load pre-normalized transmission TIFF stack with TOF spectrum.")
-                .size(10.0)
-                .color(ThemeColors::from_ctx(ui.ctx()).fg3),
-        );
-        ui.add_space(8.0);
-
-        // Same destination + invalidation as the raw sample stack, so the
-        // pick shares DialogIntent::TiffSample.
-        tiff_drop_zone(
-            ui,
-            &mut state.file_dialogs,
-            DialogIntent::TiffSample,
-            "Transmission",
-            &state.sample_path,
-        );
-
-        ui.add_space(8.0);
-        spectrum_section(ui, state);
-    });
-
-    // Auto-load when all files are selected
-    let can_load = state.sample_path.is_some()
         && state.spectrum_path.is_some()
         && state.sample_data.is_none()
         && !state.load_error;
@@ -564,7 +515,7 @@ fn load_hdf5_histogram(state: &mut AppState) {
 
     state.invalidate_results();
 
-    // Issue #430: explicit opt-in to the legacy sum-over-angles
+    // Explicit opt-in to the legacy sum-over-angles
     // behaviour on the sample-data load.  The status banner below
     // tells the user how many angles were combined.
     match nereids_io::nexus::load_nexus_histogram_with_mode(
@@ -574,11 +525,10 @@ fn load_hdf5_histogram(state: &mut AppState) {
         Ok(data) => {
             let shape = data.counts.shape();
             state.preview_image = Some(data.counts.sum_axis(ndarray::Axis(0)));
-            // D-5: Report rotation angle count when angles were collapsed.
+            // Report the rotation angle count when angles were collapsed.
             let angle_note = if data.n_rotation_angles > 1 {
                 format!(
-                    " ({} rotation angles summed — multi-angle analysis not yet supported, \
-                     see #430)",
+                    " ({} rotation angles summed — multi-angle analysis not yet supported)",
                     data.n_rotation_angles
                 )
             } else {
@@ -614,7 +564,7 @@ fn load_hdf5_histogram(state: &mut AppState) {
                 }
             }
 
-            // Declared-mask provenance (#646): the file-declared mask gets
+            // Declared-mask provenance: the file-declared mask gets
             // its own field (assigned unconditionally — a file without a
             // mask must not inherit a previous file's), and the effective
             // mask starts as exactly that.  Every normalization recomputes
@@ -704,22 +654,8 @@ fn tiff_load_suffix(info: &nereids_io::tiff_stack::TiffLoadInfo) -> String {
 fn load_all_data(state: &mut AppState) {
     state.invalidate_results();
 
-    // Pre-normalized transmission stacks legitimately contain small
-    // negative values (noise around zero), so they bypass the raw-counts
-    // pixel guard; raw counts keep the strict default.  Chunk summing is
-    // likewise counts semantics: element-wise summing k per-chunk
-    // *transmission* stacks yields values near k (e.g. ~2.0 for 2 chunks),
-    // which is physically meaningless — so TransmissionTiff mode also
-    // disables it, exactly mirroring the pixel-policy switch.
-    let options = if state.input_mode == InputMode::TransmissionTiff {
-        nereids_io::tiff_stack::TiffFolderOptions {
-            pixel_policy: nereids_io::tiff_stack::PixelValuePolicy::Allow,
-            sum_chunks: false,
-        }
-    } else {
-        // Raw counts: Reject bad pixels, sum DAQ chunks (the defaults).
-        nereids_io::tiff_stack::TiffFolderOptions::default()
-    };
+    // Raw counts: reject bad pixels, sum DAQ chunks (the defaults).
+    let options = nereids_io::tiff_stack::TiffFolderOptions::default();
 
     // Load sample TIFF (auto-detect file vs directory)
     if let Some(ref path) = state.sample_path {
@@ -901,19 +837,14 @@ fn load_all_data(state: &mut AppState) {
 // picker resolves. Each mirrors the invalidation set the corresponding
 // inline block used before the picks were routed through the facade.
 
-/// Sample TIFF stack picked (raw pair tab), or pre-normalized
-/// transmission stack picked — both land in `sample_path` with the same
-/// downstream invalidation.
+/// Sample TIFF stack picked.
 pub(crate) fn on_tiff_sample_picked(state: &mut AppState, path: std::path::PathBuf) {
     state.sample_path = Some(path);
     state.sample_data = None;
-    state.normalized = None;
     state.dead_pixels = None;
     state.file_dead_pixels = None;
     state.detected_dead_pixels = None;
     state.energies = None;
-    state.pixel_fit_result = None;
-    state.spatial_result = None;
     state.load_error = false;
 }
 
@@ -921,13 +852,10 @@ pub(crate) fn on_tiff_sample_picked(state: &mut AppState, path: std::path::PathB
 pub(crate) fn on_tiff_open_beam_picked(state: &mut AppState, path: std::path::PathBuf) {
     state.open_beam_path = Some(path);
     state.open_beam_data = None;
-    state.normalized = None;
     state.dead_pixels = None;
     state.file_dead_pixels = None;
     state.detected_dead_pixels = None;
     state.energies = None;
-    state.pixel_fit_result = None;
-    state.spatial_result = None;
     state.load_error = false;
 }
 
@@ -938,7 +866,6 @@ pub(crate) fn on_spectrum_picked(state: &mut AppState, path: std::path::PathBuf)
     state.sample_data = None;
     state.open_beam_data = None;
     state.energies = None;
-    state.normalized = None;
     state.load_error = false;
 }
 
@@ -997,12 +924,12 @@ pub(crate) fn on_hdf5_ob_picked(
         nereids_io::nexus::load_nexus_events(&path, event_params)
             .map(|d| (d.counts, d.tof_edges_us, d.n_rotation_angles))
     } else {
-        // Issue #430: the loader refuses multi-angle files by
+        // The loader refuses multi-angle files by
         // default to prevent silent sum-over-angles.  The GUI
         // makes the explicit opt-in to preserve existing
         // single-volume analysis behaviour on OB input.
         //
-        // Issue #462: surface the rotation-angle count to the
+        // Surface the rotation-angle count to the
         // user via the status banner, mirroring the sample-load
         // path.  `data.n_rotation_angles` is carried through the
         // tuple so the success arm can build the same `angle_note`
@@ -1015,7 +942,7 @@ pub(crate) fn on_hdf5_ob_picked(
     };
     match ob_result {
         Ok((ob_counts, ob_tof_edges, n_rotation_angles)) => {
-            // P1-7: Validate shape matches sample
+            // Validate that the shape matches the sample
             if let Some(ref sample) = state.sample_data
                 && sample.shape() != ob_counts.shape()
             {
@@ -1068,13 +995,12 @@ pub(crate) fn on_hdf5_ob_picked(
             // mode (`has_required_data`) — using the narrow
             // variant keeps Continue enabled.
             state.invalidate_fit_results();
-            // #462: mirror the sample-load rotation-angle note
+            // Mirror the sample-load rotation-angle note
             // so OB and sample banners use identical wording
             // when angles were collapsed.
             let angle_note = if n_rotation_angles > 1 {
                 format!(
-                    " ({} rotation angles summed — multi-angle analysis not yet supported, \
-                     see #430)",
+                    " ({} rotation angles summed — multi-angle analysis not yet supported)",
                     n_rotation_angles
                 )
             } else {
@@ -1085,7 +1011,7 @@ pub(crate) fn on_hdf5_ob_picked(
         Err(e) => {
             state.status_message = format!("Open beam load failed: {e}");
             state.hdf5_ob_path = None;
-            // P1-8: Clear data on failure
+            // Clear data on failure
             state.open_beam_data = None;
         }
     }

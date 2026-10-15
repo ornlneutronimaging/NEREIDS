@@ -62,21 +62,6 @@ pub fn memory_breakdown(state: &AppState) -> Vec<(&'static str, u64)> {
         let s = data.shape();
         items.push(("Open beam", (s[0] * s[1] * s[2] * 8) as u64));
     }
-    if let Some(ref norm) = state.normalized {
-        let s = norm.transmission.shape();
-        // transmission + uncertainty = 2 arrays
-        items.push(("Normalized", (s[0] * s[1] * s[2] * 8 * 2) as u64));
-    }
-    if let Some(ref result) = state.spatial_result {
-        for map in &result.density_maps {
-            let s = map.shape();
-            items.push(("Density map", (s[0] * s[1] * 8) as u64));
-        }
-        let s = result.converged_map.shape();
-        items.push(("Convergence", (s[0] * s[1]) as u64)); // bool = 1 byte
-        let s = result.chi_squared_map.shape();
-        items.push(("Chi² map", (s[0] * s[1] * 8) as u64));
-    }
     if let Some(ref e) = state.energies {
         items.push(("Energy grid", (e.len() * 8) as u64));
     }

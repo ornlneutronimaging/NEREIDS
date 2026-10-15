@@ -1,8 +1,6 @@
 //! Decision wizard: Q1 (fitting type), Q2 (data format), Confirm (pipeline).
 
-use crate::state::{
-    AnalysisMode, AppState, DataType, FittingType, GuidedStep, InputMode, PipelineEntry,
-};
+use crate::state::{AppState, DataType, FittingType, GuidedStep, InputMode, PipelineEntry};
 use crate::theme::ThemeColors;
 use crate::widgets::design;
 use egui::{Color32, CornerRadius, Margin, RichText, Stroke};
@@ -85,7 +83,6 @@ fn wizard_q1(ui: &mut egui::Ui, state: &mut AppState) {
         selected_spatial,
     ) {
         state.fitting_type = Some(FittingType::Spatial);
-        state.analysis_mode = AnalysisMode::FullSpatialMap;
         state.wizard_step = 1;
     }
 
@@ -100,7 +97,6 @@ fn wizard_q1(ui: &mut egui::Ui, state: &mut AppState) {
         selected_single,
     ) {
         state.fitting_type = Some(FittingType::Single);
-        state.analysis_mode = AnalysisMode::RoiSingleSpectrum;
         state.wizard_step = 1;
     }
 
@@ -150,21 +146,6 @@ fn wizard_q2(ui: &mut egui::Ui, state: &mut AppState) {
         state.wizard_step = 2;
     }
 
-    // Transmission
-    let selected_trans = state.data_type == Some(DataType::Transmission);
-    if wizard_option_card(
-        ui,
-        "Transmission (Already Normalized)",
-        "Pre-computed T(E) = I/I\u{2080}. Supports HDF5 histogram or \
-         TIFF stack + spectrum file. Skips normalization entirely.",
-        None,
-        selected_trans,
-    ) {
-        state.data_type = Some(DataType::Transmission);
-        state.input_mode = InputMode::TransmissionTiff;
-        state.wizard_step = 2;
-    }
-
     ui.add_space(12.0);
     if ui.button("\u{2190} Back").clicked() {
         state.wizard_step = 0;
@@ -187,7 +168,6 @@ fn wizard_confirm(ui: &mut egui::Ui, state: &mut AppState) {
     let data_label = match dt {
         DataType::Events => "Events",
         DataType::PreNormalized => "Pre-norm Histogram",
-        DataType::Transmission => "Transmission",
     };
 
     let tc = ThemeColors::from_ctx(ui.ctx());
@@ -394,17 +374,6 @@ fn limitations_for(fitting: FittingType, data: DataType) -> Vec<&'static str> {
             "Division is nonlinear: mean(a/b) \u{2260} mean(a)/mean(b).",
             "Optional spatial rebin before accumulation for better statistics.",
             "ROI pixels accumulated into one high-statistics spectrum.",
-        ],
-        (FittingType::Spatial, DataType::Transmission) => vec![
-            "Data is already normalized \u{2014} skips normalization step entirely.",
-            "Optional spatial rebin (requires I\u{2080} estimate to approximate counts).",
-            "ROI crops the result region (each pixel fitted independently).",
-        ],
-        (FittingType::Single, DataType::Transmission) => vec![
-            "Transmission data: to accumulate correctly, needs I\u{2080} estimate.",
-            "Optional spatial rebin via counts approximation (T \u{00D7} I\u{2080} \u{2192} sum \u{2192} \u{00F7} I\u{2080}).",
-            "Approximates counts as T \u{00D7} I\u{2080}_est, sums, then re-normalizes.",
-            "ROI determines which pixels are accumulated into the single spectrum.",
         ],
     }
 }

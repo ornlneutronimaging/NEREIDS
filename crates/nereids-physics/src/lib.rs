@@ -1,27 +1,25 @@
 //! # nereids-physics
 //!
-//! Cross-section calculation, Doppler/resolution broadening, and transmission
-//! forward model for neutron resonance imaging.
+//! Cross-section calculation, Doppler/resolution broadening, and the
+//! Beer-Lambert transmission forward model for neutron resonance imaging.
 //!
 //! ## Modules
-//! - [`auxiliary_grid`] — Auxiliary energy-grid construction for resolution broadening
-//! - [`channel`] — Wave number, ρ parameter, statistical weight calculations
-//! - [`continuous_doppler`] — Tier-1 Doppler: the free-gas kernel integrated over the resonance equation
-//! - [`doppler`] — Free Gas Model Doppler broadening
-//! - [`penetrability`] — Hard-sphere penetrability, shift, and phase shift functions
-//! - [`reich_moore`] — Reich-Moore R-matrix cross-section formalism
-//! - [`resolution`] — Instrument resolution broadening (Gaussian convolution)
-//! - [`slbw`] — Breit-Wigner formalisms, single- and multi-level (LRF=1/2)
-//! - [`surrogate`] — Forward-model surrogates for multi-isotope accelerated fits
-//! - [`transmission`] — Beer-Lambert transmission forward model
+//! - [`auxiliary_grid`] - auxiliary energy grid for resolution broadening
+//! - [`channel`] - wave number, rho parameter, statistical weights
+//! - [`continuous_doppler`] - the free-gas kernel integrated over the resonance equation
+//! - [`doppler`] - free-gas-model Doppler broadening
+//! - [`penetrability`] - hard-sphere penetrability, shift and phase shift
+//! - [`reich_moore`] - Reich-Moore R-matrix cross-section formalism
+//! - [`resolution`] - instrument resolution broadening
+//! - [`slbw`] - single- and multi-level Breit-Wigner (LRF=1/2)
+//! - [`transmission`] - Beer-Lambert transmission forward model
 //!
 //! ## SAMMY Reference
 //! - Cross-sections: `rml/` (Reich-Moore), `mlb/` (SLBW/MLBW), manual Sec. II
 //! - Penetrability: `rml/mrml07.f` (Pgh, Sinsix, Pf)
 //! - Doppler: `fgm/` module (Dopfgm), manual Sec. III.B.1
 //! - Resolution: `convolution/` module, manual Sec. III.C
-//! - Transmission: `cro/`, `xxx/` modules, manual Sec. II; transmission
-//!   experiments Sec. III.E.1
+//! - Transmission: `cro/`, `xxx/` modules, manual Sec. II
 
 pub mod auxiliary_grid;
 pub mod channel;
@@ -33,5 +31,4 @@ pub mod penetrability;
 pub mod reich_moore;
 pub mod resolution;
 pub mod slbw;
-pub mod surrogate;
 pub mod transmission;

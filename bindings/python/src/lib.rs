@@ -1,40 +1,3 @@
-//! # nereids-python
-//!
-//! PyO3 Python bindings for the NEREIDS neutron resonance imaging library.
-//!
-//! Provides a Pythonic API for:
-//! - Computing theoretical transmission spectra (`forward_model`)
-//! - Spatial mapping across imaging data (`spatial_map_typed`)
-//! - Trace-detectability analysis (`trace_detectability`)
-//! - Energy calibration (`calibrate_energy`)
-//!
-//! ## Typed Input Data API
-//!
-//! Use `from_counts()`, `from_counts_with_nuisance()`, or `from_transmission()`
-//! to create typed input data,
-//! then pass to `spatial_map_typed()` for per-pixel fitting:
-//!
-//! - **Counts** → Poisson KL (statistically optimal for raw detector counts)
-//!   — LM is rejected for counts; the ratio conversion loses count statistics
-//! - **Transmission** → LM only; a count likelihood is not valid for ratios
-//!
-//! ## Usage
-//! ```python
-//! import nereids
-//! import numpy as np
-//!
-//! # Load ENDF data for U-238
-//! isotope = nereids.load_endf(92, 238)
-//!
-//! # Compute transmission spectrum
-//! energies = np.linspace(1.0, 30.0, 1000)
-//! transmission = nereids.forward_model(energies, [(isotope, 0.001)], temperature_k=293.6)
-//!
-//! # Spatial mapping with typed API
-//! data = nereids.from_transmission(transmission_3d, uncertainty_3d)
-//! result = nereids.spatial_map_typed(data, energies, [isotope])
-//! ```
-
 use std::sync::Arc;
 
 use numpy::{
@@ -50,11 +13,7 @@ use nereids_endf::resonance::{
     LGroup, Resonance, ResonanceData, ResonanceFormalism, ResonanceRange,
 };
 use nereids_endf::retrieval::{EndfLibrary, EndfRetrievalError, EndfRetriever, mat_number};
-use nereids_fitting::resolution_calib::{
-    CalibrationConfig, DEFAULT_PSR_FWHM_NS, NS_TO_US, PSR_FWHM_PIN_CEILING_US, ResolutionFamily,
-    UDR_S0_MAX, UDR_S0_MIN, calibrate_resolution as rust_calibrate_resolution,
-};
-use nereids_io::normalization::{self as norm, NormalizationParams};
+use nereids_fitting::lm::FlatMatrix;
 use nereids_io::tof::BeamlineParams;
 use nereids_physics::doppler::{self, DopplerParams};
 use nereids_physics::ikeda_carpenter::{
@@ -64,11 +23,12 @@ use nereids_physics::resolution::{
     self, ResolutionFunction, ResolutionParams, TabulatedResolution,
 };
 use nereids_physics::transmission::{self, InstrumentParams, SampleParams};
-use nereids_pipeline::detectability;
-
-// PyO3 needs a literal here to expose the real default through
-// `inspect.signature`; keep that public literal locked to the core default.
-const _: () = assert!(DEFAULT_PSR_FWHM_NS == 350.0);
+use nereids_pipeline::counts_fit::{
+    CountsFit, Material, Measurement, NO_TIME_BACKGROUND, Region, RegionFit, Value,
+};
+use nereids_pipeline::counts_map::{CountsMap, MapMeasurement, Patch};
+use nereids_pipeline::error::PipelineError;
+use nereids_pipeline::open_beam::{Calibration, Pulse};
 
 /// Python wrapper for ENDF resonance data.
 ///
@@ -503,257 +463,6 @@ impl PyIsotopeGroup {
     }
 }
 
-/// Result of fitting a spectrum.
-#[pyclass(name = "FitResult")]
-struct PyFitResult {
-    densities: Vec<f64>,
-    /// `None` when covariance computation was skipped.
-    uncertainties: Option<Vec<f64>>,
-    reduced_chi_squared: f64,
-    converged: bool,
-    iterations: usize,
-    /// Fitted temperature in Kelvin (only meaningful when `fit_temperature=True`).
-    temperature_k: Option<f64>,
-    /// 1-sigma uncertainty on fitted temperature (K).
-    temperature_k_unc: Option<f64>,
-    /// Fitted normalization / signal-scale parameter.
-    /// Transmission LM uses `Anorm`; counts background scaling uses `alpha_1`.
-    anorm: f64,
-    /// Fitted background parameter triplet.
-    /// Transmission LM uses `[BackA, BackB, BackC]`.
-    /// Counts KL background uses `[b0, b1, alpha_2]`.
-    background: [f64; 3],
-    /// Fitted exponential background amplitude (SAMMY BackD).
-    /// `None` whenever the polynomial background model was not active
-    /// — i.e. either ``background=False`` (the bg model is never
-    /// attached, so the inner Rust ``FitResult.back_d`` is the
-    /// sentinel `0.0`) or ``background=True`` with ``fit_back_d=False``
-    /// (bg model attached but BackD was held at its initial value).
-    /// We surface that as `None` at the Python boundary so MCP
-    /// consumers can distinguish "fit was active and recovered 0.0"
-    /// from "exponential background never engaged" — mirroring the
-    /// `t0_us` / `l_scale` convention.
-    back_d: Option<f64>,
-    /// Fitted exponential background decay constant (SAMMY BackF).
-    /// `None` when ``background=False`` OR ``fit_back_f=False``;
-    /// see `back_d` for the full rationale.
-    back_f: Option<f64>,
-    /// Fitted TOF offset in microseconds (SAMMY TZERO t₀).
-    /// None when energy-scale fitting is not enabled.
-    t0_us: Option<f64>,
-    /// Fitted flight-path scale factor (SAMMY TZERO L₀, dimensionless).
-    /// None when energy-scale fitting is not enabled.
-    l_scale: Option<f64>,
-    /// Nominal flight path (m) the energy-scale fit was configured with;
-    /// consumed by `corrected_energies` so the transform is reproduced with
-    /// the SAME flight path the fit used (issue #634).
-    energy_scale_flight_path_m: Option<f64>,
-    /// Conditional binomial deviance / (n − k).  `Some(...)` only for the
-    /// counts-KL dispatch (`solver="kl"` on counts input).
-    deviance_per_dof: Option<f64>,
-    /// Fitted multiplicative-baseline coefficients `[b0, b1, b2]` (issue
-    /// #635); `None` when ``baseline=False``.
-    baseline: Option<[f64; 3]>,
-    /// Reference energy E_ref (eV) of the baseline's centered ln(E/E_ref)
-    /// basis; `None` when ``baseline=False``.
-    baseline_e_ref_ev: Option<f64>,
-    /// Structured fit-configuration warnings (e.g. the degenerate
-    /// free-Anorm + free-temperature + free-density trio).
-    warnings: Vec<String>,
-}
-
-#[pymethods]
-impl PyFitResult {
-    /// Fitted areal densities (atoms/barn).
-    #[getter]
-    fn densities<'py>(&self, py: Python<'py>) -> Bound<'py, PyArray1<f64>> {
-        PyArray1::from_vec(py, self.densities.clone())
-    }
-
-    /// Uncertainties on fitted densities.
-    ///
-    /// Returns NaN-filled array when covariance computation was skipped.
-    /// Uncertainty values are NaN when covariance is not available.
-    #[getter]
-    fn uncertainties<'py>(&self, py: Python<'py>) -> Bound<'py, PyArray1<f64>> {
-        let unc = self
-            .uncertainties
-            .clone()
-            .unwrap_or_else(|| vec![f64::NAN; self.densities.len()]);
-        PyArray1::from_vec(py, unc)
-    }
-
-    /// Reduced chi-squared of the fit.
-    #[getter]
-    fn reduced_chi_squared(&self) -> f64 {
-        self.reduced_chi_squared
-    }
-
-    /// Whether the fit converged.
-    #[getter]
-    fn converged(&self) -> bool {
-        self.converged
-    }
-
-    /// Number of iterations.
-    #[getter]
-    fn iterations(&self) -> usize {
-        self.iterations
-    }
-
-    /// Fitted sample temperature in Kelvin (``None`` when ``fit_temperature=False``).
-    #[getter]
-    fn temperature_k(&self) -> Option<f64> {
-        self.temperature_k
-    }
-
-    /// 1-sigma uncertainty on fitted temperature in Kelvin (``None`` when
-    /// ``fit_temperature=False``).
-    ///
-    /// For the raw-count joint-Poisson path this is a
-    /// **covariance-only lower bound**: it is `sqrt` of the temperature diagonal
-    /// of the inverse Fisher matrix and omits baseline/model noise, so on real
-    /// data it can underestimate the observed per-superpixel scatter by ~3–4×.
-    /// Pass ``scale_by_chi2=True`` for a `sqrt(D/dof)`-inflated estimate: σ is
-    /// scaled by `sqrt` of the deviance-per-dof this result reports. No-op on
-    /// the already-χ²-scaled LM transmission path.
-    #[getter]
-    fn temperature_k_unc(&self) -> Option<f64> {
-        self.temperature_k_unc
-    }
-
-    /// Fitted normalization / signal-scale parameter.
-    #[getter]
-    fn anorm(&self) -> f64 {
-        self.anorm
-    }
-
-    /// Fitted background parameter triplet.
-    #[getter]
-    fn background(&self) -> [f64; 3] {
-        self.background
-    }
-
-    /// Fitted exponential background amplitude (SAMMY BackD).
-    /// `None` when ``background=False`` OR ``fit_back_d=False``.
-    #[getter]
-    fn back_d(&self) -> Option<f64> {
-        self.back_d
-    }
-
-    /// Fitted exponential background decay constant (SAMMY BackF).
-    /// `None` when ``background=False`` OR ``fit_back_f=False``.
-    #[getter]
-    fn back_f(&self) -> Option<f64> {
-        self.back_f
-    }
-
-    /// Fitted TOF offset in microseconds (SAMMY TZERO t₀).
-    /// None when energy-scale fitting is not enabled.
-    #[getter]
-    fn t0_us(&self) -> Option<f64> {
-        self.t0_us
-    }
-
-    /// Fitted flight-path scale factor (SAMMY TZERO L₀).
-    /// None when energy-scale fitting is not enabled.
-    #[getter]
-    fn l_scale(&self) -> Option<f64> {
-        self.l_scale
-    }
-
-    /// Map a nominal energy grid through the fitted ``(t0_us, l_scale)`` energy
-    /// scale to the corrected (calibrated) energies the fit evaluated the
-    /// physics on (issue #634). Reuses the exact SAMMY-convention transform
-    /// (``dat/mdat0.f90:189``, −t0 sign) with the SAME flight path the fit
-    /// was configured with (stored on the result), so the corrected axis is
-    /// never re-derived by hand (a +t0 slip caused a silent +400 K
-    /// temperature bias in the field) and a mismatched caller-supplied
-    /// flight path cannot silently skew the t₀ term.
-    ///
-    /// Returns ``None`` when energy-scale fitting was not enabled. Raises
-    /// ``ValueError`` on an invalid nominal grid (non-finite / non-positive /
-    /// non-ascending — the binding's standard energy-grid validation) or a
-    /// degenerate calibration (a ``t0`` past the shortest flight time).
-    #[pyo3(signature = (nominal_energies))]
-    fn corrected_energies<'py>(
-        &self,
-        py: Python<'py>,
-        nominal_energies: PyReadonlyArray1<'py, f64>,
-    ) -> PyResult<Option<Bound<'py, PyArray1<f64>>>> {
-        match (self.t0_us, self.l_scale, self.energy_scale_flight_path_m) {
-            (Some(t0), Some(l_scale), Some(flight_path_m)) => {
-                let e = nominal_energies.as_slice()?;
-                require_non_empty_energy_grid(e)?;
-                validate_energy_grid(e)?;
-                let corr = nereids_fitting::resolution_calib::corrected_energy_grid(
-                    e,
-                    t0,
-                    l_scale,
-                    flight_path_m,
-                )
-                .map_err(|err| pyo3::exceptions::PyValueError::new_err(err.to_string()))?;
-                Ok(Some(PyArray1::from_vec(py, corr)))
-            }
-            _ => Ok(None),
-        }
-    }
-
-    /// Conditional binomial deviance divided by (n − k) from the counts-KL
-    /// dispatch (joint-Poisson profile-deviance fitter).
-    ///
-    /// Primary goodness-of-fit statistic for ``solver="kl"`` on counts
-    /// data — replaces the fixed-flux Pearson χ² that scaled with ``c``.
-    /// Returns ``None`` for LM transmission fits, which populate
-    /// ``reduced_chi_squared`` with Pearson χ² / (n − k).
-    #[getter]
-    fn deviance_per_dof(&self) -> Option<f64> {
-        self.deviance_per_dof
-    }
-
-    /// Fitted multiplicative-baseline coefficients ``[b0, b1, b2]`` for
-    /// ``B(E) = b0 + b1·ln(E/E_ref) + b2·ln²(E/E_ref)`` applied OUTERMOST
-    /// (issue #635).  ``None`` when ``baseline=False``.  Coefficients that
-    /// were configured but frozen (``fit_b0=False`` …) still report their
-    /// values — they are part of the model that produced the fit.
-    #[getter]
-    fn baseline(&self) -> Option<[f64; 3]> {
-        self.baseline
-    }
-
-    /// Reference energy E_ref (eV) the baseline's ``ln(E/E_ref)`` basis was
-    /// centered on — the geometric midpoint ``sqrt(E_min·E_max)`` of the fit
-    /// grid, stored so ``B(E)`` can be reconstructed with the EXACT
-    /// reference the fit used.  ``None`` when ``baseline=False``.
-    #[getter]
-    fn baseline_e_ref_ev(&self) -> Option<f64> {
-        self.baseline_e_ref_ev
-    }
-
-    /// Structured fit-configuration warnings.  Currently flags the
-    /// degenerate normalization trio (free ``Anorm`` + free temperature +
-    /// ≥1 free density), which on real VENUS data ran to T = 4471 K with
-    /// χ²/ν = 932 and no diagnostic.  Empty list when nothing is flagged.
-    #[getter]
-    fn warnings(&self) -> Vec<String> {
-        self.warnings.clone()
-    }
-
-    fn __repr__(&self) -> String {
-        if let Some(t) = self.temperature_k {
-            format!(
-                "FitResult(converged={}, chi2_red={:.4}, densities={:?}, temperature_k={:.1})",
-                self.converged, self.reduced_chi_squared, self.densities, t
-            )
-        } else {
-            format!(
-                "FitResult(converged={}, chi2_red={:.4}, densities={:?})",
-                self.converged, self.reduced_chi_squared, self.densities
-            )
-        }
-    }
-}
-
 /// Python wrapper for tabulated resolution function.
 ///
 /// Uses `Arc` internally so that `.clone()` in `py.detach()` closures is O(1).
@@ -884,8 +593,8 @@ impl PyEnergyLaw {
 /// Analytical Ikeda–Carpenter instrument-resolution model.
 ///
 /// Synthesizes a dense tabulated kernel at construction; pass
-/// [`IkedaCarpenter.as_tabulated`] anywhere a loaded resolution file is accepted
-/// (`forward_model`, `fit_spectrum_typed`, `calibrate_resolution`). Note that
+/// [`IkedaCarpenter.as_tabulated`] anywhere a loaded resolution file is
+/// accepted (`forward_model`). Note that
 /// `precompute_cross_sections` does NOT take a resolution — broadening is applied
 /// after Beer–Lambert, not on the cross-sections. The synthesized kernel rides
 /// the *same* broadening path as a Monte-Carlo file, so the IC-vs-tabulated
@@ -919,7 +628,6 @@ impl PyIkedaCarpenter {
         channel_fwhm_us = None,
         beta_law = None,
     ))]
-    #[allow(clippy::too_many_arguments)]
     fn new(
         flight_path_m: f64,
         e_min_ev: f64,
@@ -1035,245 +743,6 @@ impl PyIkedaCarpenter {
             e.first().copied().unwrap_or(0.0),
             e.last().copied().unwrap_or(0.0),
             self.inner.flight_path_m(),
-        )
-    }
-}
-
-/// Result of spatial (per-pixel) mapping.
-///
-/// Numpy arrays are constructed once and cached; property access returns
-/// cheap references (refcount bump) rather than copying data.
-#[pyclass(name = "SpatialResult")]
-struct PySpatialResult {
-    density_maps: Vec<Py<PyArray2<f64>>>,
-    uncertainty_maps: Vec<Py<PyArray2<f64>>>,
-    chi_squared_map: Py<PyArray2<f64>>,
-    /// Counts-KL conditional binomial deviance / (n − k) per pixel.
-    /// None for transmission-only and LM-only runs.
-    deviance_per_dof_map: Option<Py<PyArray2<f64>>>,
-    converged_map: Py<PyArray2<bool>>,
-    n_converged: usize,
-    n_total: usize,
-    n_failed: usize,
-    isotope_names: Vec<String>,
-    shape: (usize, usize),
-    /// Per-pixel fitted temperature (None when fit_temperature=False).
-    temperature_map: Option<Py<PyArray2<f64>>>,
-    /// Per-pixel temperature uncertainty (None when fit_temperature=False).
-    temperature_uncertainty_map: Option<Py<PyArray2<f64>>>,
-    /// Per-pixel normalization / signal-scale map (None when background=False).
-    anorm_map: Option<Py<PyArray2<f64>>>,
-    /// Per-pixel background parameter maps (None when background=False).
-    background_maps: Option<[Py<PyArray2<f64>>; 3]>,
-    /// Per-pixel SAMMY BackD exponential-amplitude map
-    /// (None unless ``background=True`` AND ``fit_back_d=True``).
-    back_d_map: Option<Py<PyArray2<f64>>>,
-    /// Per-pixel SAMMY BackF exponential-decay-constant map
-    /// (None unless ``background=True`` AND ``fit_back_f=True``).
-    back_f_map: Option<Py<PyArray2<f64>>>,
-    /// Per-pixel fitted TZERO t0 (µs) map (None when fit_energy_scale=False).
-    t0_us_map: Option<Py<PyArray2<f64>>>,
-    /// Per-pixel fitted TZERO L_scale map (None when fit_energy_scale=False).
-    l_scale_map: Option<Py<PyArray2<f64>>>,
-    /// Global multiplicative-baseline coefficients (issue #635);
-    /// None when baseline=False or baseline_global=False.
-    baseline_global: Option<[f64; 3]>,
-    /// Baseline reference energy E_ref (eV); None when baseline=False.
-    baseline_e_ref_ev: Option<f64>,
-    /// Per-pixel baseline coefficient maps; None unless baseline=True with
-    /// baseline_global=False.
-    baseline_maps: Option<[Py<PyArray2<f64>>; 3]>,
-    /// Structured fit-configuration warnings.
-    warnings: Vec<String>,
-}
-
-#[pymethods]
-impl PySpatialResult {
-    /// Density maps as a list of 2D numpy arrays, one per isotope.
-    #[getter]
-    fn density_maps<'py>(&self, py: Python<'py>) -> Vec<Bound<'py, PyArray2<f64>>> {
-        self.density_maps
-            .iter()
-            .map(|m| m.bind(py).clone())
-            .collect()
-    }
-
-    /// Uncertainty maps as a list of 2D numpy arrays.
-    #[getter]
-    fn uncertainty_maps<'py>(&self, py: Python<'py>) -> Vec<Bound<'py, PyArray2<f64>>> {
-        self.uncertainty_maps
-            .iter()
-            .map(|m| m.bind(py).clone())
-            .collect()
-    }
-
-    /// Reduced chi-squared map.
-    #[getter]
-    fn chi_squared_map<'py>(&self, py: Python<'py>) -> Bound<'py, PyArray2<f64>> {
-        self.chi_squared_map.bind(py).clone()
-    }
-
-    /// Counts-KL conditional binomial deviance per degree of freedom.
-    ///
-    /// Primary goodness-of-fit for ``solver="kl"`` on counts data
-    /// (replaces the fixed-flux Pearson that scaled
-    /// with ``c``).  Returns ``None`` for LM transmission fits, which
-    /// populate ``chi_squared_map`` with Pearson χ² / (n − k) instead.
-    #[getter]
-    fn deviance_per_dof_map<'py>(&self, py: Python<'py>) -> Option<Bound<'py, PyArray2<f64>>> {
-        self.deviance_per_dof_map
-            .as_ref()
-            .map(|m| m.bind(py).clone())
-    }
-
-    /// Convergence map (True = converged).
-    #[getter]
-    fn converged_map<'py>(&self, py: Python<'py>) -> Bound<'py, PyArray2<bool>> {
-        self.converged_map.bind(py).clone()
-    }
-
-    /// Number of converged pixels.
-    #[getter]
-    fn n_converged(&self) -> usize {
-        self.n_converged
-    }
-
-    /// Total number of fitted pixels.
-    #[getter]
-    fn n_total(&self) -> usize {
-        self.n_total
-    }
-
-    /// Number of pixels where the fitter returned a hard error (NaN density).
-    #[getter]
-    fn n_failed(&self) -> usize {
-        self.n_failed
-    }
-
-    /// Isotope names.
-    #[getter]
-    fn isotope_names(&self) -> Vec<String> {
-        self.isotope_names.clone()
-    }
-
-    /// Per-pixel fitted temperature map (None when fit_temperature=False).
-    #[getter]
-    fn temperature_map<'py>(&self, py: Python<'py>) -> Option<Bound<'py, PyArray2<f64>>> {
-        self.temperature_map.as_ref().map(|m| m.bind(py).clone())
-    }
-
-    /// Per-pixel temperature uncertainty map (None when fit_temperature=False).
-    /// Entries are NaN where uncertainty was unavailable for that pixel.
-    ///
-    /// For the raw-count joint-Poisson path each σ_T
-    /// is a **covariance-only lower bound** (`sqrt` of the temperature diagonal
-    /// of the inverse Fisher matrix): it omits baseline/model noise and on real
-    /// data can underestimate the observed per-superpixel scatter by ~3–4×.
-    /// Pass ``scale_by_chi2=True`` to ``spatial_map*`` for a `sqrt(D/dof)`-
-    /// inflated estimate: σ is scaled by `sqrt` of the deviance-per-dof each
-    /// pixel's result reports. No-op on the already-χ²-scaled LM transmission
-    /// path.
-    #[getter]
-    fn temperature_uncertainty_map<'py>(
-        &self,
-        py: Python<'py>,
-    ) -> Option<Bound<'py, PyArray2<f64>>> {
-        self.temperature_uncertainty_map
-            .as_ref()
-            .map(|m| m.bind(py).clone())
-    }
-
-    /// Per-pixel normalization factor Anorm (None when background fitting was disabled).
-    #[getter]
-    fn anorm_map<'py>(&self, py: Python<'py>) -> Option<Bound<'py, PyArray2<f64>>> {
-        self.anorm_map.as_ref().map(|m| m.bind(py).clone())
-    }
-
-    /// Per-pixel background parameter maps
-    /// (transmission LM: `[BackA, BackB, BackC]`; counts KL: `[b0, b1, alpha_2]`).
-    #[getter]
-    fn background_maps<'py>(&self, py: Python<'py>) -> Option<Vec<Bound<'py, PyArray2<f64>>>> {
-        self.background_maps
-            .as_ref()
-            .map(|maps| maps.iter().map(|m| m.bind(py).clone()).collect())
-    }
-
-    /// Per-pixel SAMMY exponential background amplitude (``BackD``) map.
-    /// ``None`` whenever the LM transmission background was not active
-    /// (``background=False``) OR the exponential tail was not fit
-    /// (``fit_back_d=False``).  Counts-KL runs are always ``None``
-    /// because the joint-Poisson dispatch never fits ``BackD``/``BackF``.
-    /// Mirrors the per-spectrum ``FitResult.back_d`` convention from
-    /// issue #537.
-    #[getter]
-    fn back_d_map<'py>(&self, py: Python<'py>) -> Option<Bound<'py, PyArray2<f64>>> {
-        self.back_d_map.as_ref().map(|m| m.bind(py).clone())
-    }
-
-    /// Per-pixel SAMMY exponential background decay constant (``BackF``) map.
-    /// ``None`` under the same conditions as :py:attr:`back_d_map`.
-    #[getter]
-    fn back_f_map<'py>(&self, py: Python<'py>) -> Option<Bound<'py, PyArray2<f64>>> {
-        self.back_f_map.as_ref().map(|m| m.bind(py).clone())
-    }
-
-    /// Per-pixel SAMMY TZERO offset t0 (µs) map.
-    /// `None` when the run did not fit energy scale.
-    #[getter]
-    fn t0_us_map<'py>(&self, py: Python<'py>) -> Option<Bound<'py, PyArray2<f64>>> {
-        self.t0_us_map.as_ref().map(|m| m.bind(py).clone())
-    }
-
-    /// Per-pixel SAMMY TZERO flight-path scale factor map.
-    /// `None` when the run did not fit energy scale.
-    #[getter]
-    fn l_scale_map<'py>(&self, py: Python<'py>) -> Option<Bound<'py, PyArray2<f64>>> {
-        self.l_scale_map.as_ref().map(|m| m.bind(py).clone())
-    }
-
-    /// Global multiplicative-baseline coefficients ``[b0, b1, b2]``
-    /// (issue #635): the stage-1 fit on the aggregated mean spectrum that
-    /// every pixel then used frozen.  ``None`` when ``baseline=False`` or
-    /// in per-pixel mode (``baseline_global=False`` — see
-    /// :py:attr:`baseline_maps`).
-    #[getter]
-    fn baseline_global(&self) -> Option<[f64; 3]> {
-        self.baseline_global
-    }
-
-    /// Baseline reference energy E_ref (eV) of the centered ``ln(E/E_ref)``
-    /// basis — reconstruct ``B(E)`` with exactly this reference.
-    /// ``None`` when ``baseline=False``.
-    #[getter]
-    fn baseline_e_ref_ev(&self) -> Option<f64> {
-        self.baseline_e_ref_ev
-    }
-
-    /// Per-pixel baseline coefficient maps ``[b0, b1, b2]``.  ``None``
-    /// unless ``baseline=True`` with ``baseline_global=False``.
-    /// NaN at pixels that did not converge.
-    #[getter]
-    fn baseline_maps<'py>(&self, py: Python<'py>) -> Option<Vec<Bound<'py, PyArray2<f64>>>> {
-        self.baseline_maps
-            .as_ref()
-            .map(|maps| maps.iter().map(|m| m.bind(py).clone()).collect())
-    }
-
-    /// Structured fit-configuration warnings (also printed once to stderr
-    /// by the spatial engine).  Empty list when nothing is flagged.
-    #[getter]
-    fn warnings(&self) -> Vec<String> {
-        self.warnings.clone()
-    }
-
-    fn __repr__(&self) -> String {
-        format!(
-            "SpatialResult(shape={}x{}, isotopes={}, converged={}/{})",
-            self.shape.0,
-            self.shape.1,
-            self.isotope_names.len(),
-            self.n_converged,
-            self.n_total,
         )
     }
 }
@@ -1433,582 +902,6 @@ fn forward_model<'py>(
     let t = py.detach(move || transmission::forward_model(&e_owned, &sample, instrument.as_ref()));
     let t = t.map_err(|e| pyo3::exceptions::PyValueError::new_err(e.to_string()))?;
     Ok(PyArray1::from_vec(py, t))
-}
-
-/// Result of an instrument-resolution calibration ([`calibrate_resolution`]).
-#[pyclass(name = "ResolutionCalibration", skip_from_py_object)]
-struct PyResolutionCalibration {
-    inner: nereids_fitting::resolution_calib::CalibrationResult,
-}
-
-#[pymethods]
-impl PyResolutionCalibration {
-    /// Family label (`"gaussian"` | `"udr_corr"` | `"ic"`).
-    #[getter]
-    fn family(&self) -> String {
-        self.inner.family.clone()
-    }
-
-    /// Raw fitted parameter vector (optimizer space).
-    #[getter]
-    fn theta(&self) -> Vec<f64> {
-        self.inner.theta.clone()
-    }
-
-    /// χ²/dof of the calibration fit.
-    #[getter]
-    fn chi2(&self) -> f64 {
-        self.inner.chi2_dof
-    }
-
-    /// Whether the optimizer self-converged.
-    #[getter]
-    fn converged(&self) -> bool {
-        self.inner.converged
-    }
-
-    /// Optimizer iterations.
-    #[getter]
-    fn iterations(&self) -> usize {
-        self.inner.iterations
-    }
-
-    /// Fitted (or pinned) SAMMY energy-scale TOF zero ``t0`` (µs). Equals
-    /// ``t0_center_us`` when ``fit_t0=False`` (the default — position pinned).
-    /// When fit, this is a SHARED energy-scale parameter under a metrology prior,
-    /// not a per-family nuisance (the asymmetric-kernel lag is confounded with
-    /// flight-path ``L_scale``).
-    #[getter]
-    fn position_t0_us(&self) -> f64 {
-        self.inner.position_t0_us
-    }
-
-    /// Fitted (or pinned) flight-path scale ``L_scale``. Equals ``l_scale_center``
-    /// when ``fit_l_scale=False`` (the default).
-    #[getter]
-    fn position_l_scale(&self) -> f64 {
-        self.inner.position_l_scale
-    }
-
-    /// Gaussian-prior penalty on the fitted ``(t0, L_scale)`` at the solution
-    /// (0 when position is pinned or has no prior). ``objective = chi2_data +
-    /// prior_penalty``; a large value flags a family that needed a big position
-    /// move (e.g. ΔL/L ≫ the metrology σ) to fit.
-    #[getter]
-    fn prior_penalty(&self) -> f64 {
-        self.inner.prior_penalty
-    }
-
-    /// Decoded, human-readable fitted parameters.
-    ///
-    /// For ``family="ic"`` (#642) the keys are ``a0``/``a1`` (α(E) = a0·√E +
-    /// a1, positive by construction), ``beta``, ``r`` and ``psr_fwhm_us`` —
-    /// decoded from the calibrated resolution itself (the raw ``theta`` is
-    /// ln/box-encoded optimizer space).
-    fn params<'py>(&self, py: Python<'py>) -> PyResult<Bound<'py, pyo3::types::PyDict>> {
-        let d = pyo3::types::PyDict::new(py);
-        match self.inner.family.as_str() {
-            "udr_corr" => {
-                // Decode against the SAME clamp bounds the Rust optimizer used
-                // (resolution_calib::UDR_S0_MIN/MAX), not duplicated literals.
-                let s0 = self.inner.theta[0].exp().clamp(UDR_S0_MIN, UDR_S0_MAX);
-                d.set_item("s0", s0)?;
-                d.set_item("p", self.inner.theta[1])?;
-            }
-            "gaussian" => {
-                d.set_item("delta_t_us", self.inner.theta[0].abs())?;
-                d.set_item("delta_l_m", self.inner.theta[1].abs())?;
-            }
-            _ => {
-                // IC: decode off the calibrated resolution — the single source
-                // of truth (never re-derive from the encoded theta by hand).
-                // The a0/a1 keys keep their pre-#642 meaning for back-compat.
-                if let ResolutionFunction::IkedaCarpenter(ic) = &self.inner.resolution {
-                    let p = ic.params();
-                    if let EnergyLaw::SqrtE { a0, a1 } = &p.alpha {
-                        d.set_item("a0", *a0)?;
-                        d.set_item("a1", *a1)?;
-                    }
-                    if let EnergyLaw::Const(beta) = p.beta {
-                        d.set_item("beta", beta)?;
-                    }
-                    if let EnergyLaw::Const(r) = &p.r {
-                        d.set_item("r", *r)?;
-                    }
-                    d.set_item("psr_fwhm_us", p.channel_fwhm_us.unwrap_or(0.0))?;
-                }
-            }
-        }
-        Ok(d)
-    }
-
-    /// Number of outer-loop free parameters: resolution θ plus any fitted
-    /// position coordinates (4–5 for ``"ic"``, 2 for the other families).
-    #[getter]
-    fn n_free_params(&self) -> usize {
-        self.inner.n_free_params
-    }
-
-    /// Coordinates pinned at a box bound at the solution, as
-    /// ``"name:lower"`` / ``"name:upper"`` strings (empty = interior
-    /// solution). E.g. ``"r:lower"`` flags the β↔R ridge: the calibrant shows
-    /// no storage tail, so the reported β carries no information.
-    #[getter]
-    fn bounds_hit(&self) -> Vec<String> {
-        self.inner.bounds_hit.clone()
-    }
-
-    /// The calibrated resolution as a [`TabulatedResolution`] — pass to
-    /// `resolution=` in the fitters. `None` for the Gaussian family (use
-    /// [`Self::gaussian_params`] there).
-    fn as_tabulated(&self) -> Option<PyTabulatedResolution> {
-        match &self.inner.resolution {
-            ResolutionFunction::Tabulated(t) => Some(PyTabulatedResolution { inner: t.clone() }),
-            ResolutionFunction::IkedaCarpenter(ic) => Some(PyTabulatedResolution {
-                inner: Arc::new(ic.tabulated().clone()),
-            }),
-            ResolutionFunction::Gaussian(_) => None,
-        }
-    }
-
-    /// `(delta_t_us, delta_l_m)` for the Gaussian family; `None` otherwise.
-    fn gaussian_params(&self) -> Option<(f64, f64)> {
-        match &self.inner.resolution {
-            ResolutionFunction::Gaussian(p) => Some((p.delta_t_us(), p.delta_l_m())),
-            _ => None,
-        }
-    }
-
-    /// One-sigma `(lower, upper)` range of each fitted parameter, in the same
-    /// order and raw optimizer space as `theta`.
-    ///
-    /// Each bound is where the objective, minimized over the other
-    /// parameters, rises by one above its floor, so the two sides differ when
-    /// the surface is asymmetric. A bound equal to the parameter's box edge
-    /// means the data does not constrain that side.
-    ///
-    /// `None` unless `calibrate_resolution(..., intervals=True)` asked for
-    /// them, or when the run never self-converged.
-    #[getter]
-    fn intervals(&self) -> Option<Vec<(f64, f64)>> {
-        self.inner.intervals.clone()
-    }
-
-    fn __repr__(&self) -> String {
-        format!(
-            "ResolutionCalibration(family={}, chi2/dof={:.4}, converged={}, n_free_params={}, bounds_hit={:?})",
-            self.inner.family,
-            self.inner.chi2_dof,
-            self.inner.converged,
-            self.inner.n_free_params,
-            self.inner.bounds_hit
-        )
-    }
-}
-
-/// Result of a joint sample + calibrant fit.
-#[pyclass(name = "JointFitResult")]
-struct PyJointFitResult {
-    inner: nereids_pipeline::joint_fit::JointFitResult,
-}
-
-#[pymethods]
-impl PyJointFitResult {
-    /// Fitted areal densities (atoms/barn), one per sample isotope.
-    #[getter]
-    fn densities(&self) -> Vec<f64> {
-        self.inner.densities.clone()
-    }
-
-    /// One-sigma uncertainty on each density.
-    #[getter]
-    fn density_uncertainties(&self) -> Option<Vec<f64>> {
-        self.inner.density_uncertainties.clone()
-    }
-
-    /// Fitted temperature (K); ``None`` when it was held fixed.
-    #[getter]
-    fn temperature_k(&self) -> Option<f64> {
-        self.inner.temperature_k
-    }
-
-    /// One-sigma uncertainty on the fitted temperature.
-    ///
-    /// Larger than the pinned route's, and correctly so: the calibrant that
-    /// constrains the resolution is in the same objective, so the
-    /// temperature's degeneracy with the resolution is carried rather than
-    /// dropped.
-    #[getter]
-    fn temperature_k_unc(&self) -> Option<f64> {
-        self.inner.temperature_k_unc
-    }
-
-    /// Fitted shared timing width (µs), the W-parameter in ``exp(-x^2/W^2)``.
-    #[getter]
-    fn delta_t_us(&self) -> f64 {
-        self.inner.delta_t_us
-    }
-
-    /// Fitted shared flight-path width (m), same convention.
-    #[getter]
-    fn delta_l_m(&self) -> f64 {
-        self.inner.delta_l_m
-    }
-
-    /// Reduced chi-squared over both spectra together.
-    #[getter]
-    fn reduced_chi_squared(&self) -> f64 {
-        self.inner.reduced_chi_squared
-    }
-
-    #[getter]
-    fn converged(&self) -> bool {
-        self.inner.converged
-    }
-
-    #[getter]
-    fn iterations(&self) -> usize {
-        self.inner.iterations
-    }
-
-    fn __repr__(&self) -> String {
-        let temperature = self
-            .inner
-            .temperature_k
-            .map_or_else(|| "None".to_string(), |t| format!("{t:.3}"));
-        format!(
-            "JointFitResult(densities={:?}, temperature_k={temperature}, \
-             delta_t_us={:.5}, delta_l_m={:.5}, chi2/dof={:.4}, converged={})",
-            self.inner.densities,
-            self.inner.delta_t_us,
-            self.inner.delta_l_m,
-            self.inner.reduced_chi_squared,
-            self.inner.converged
-        )
-    }
-}
-
-/// Fit a sample and the calibrant that measured its resolution together.
-///
-/// The usual route calibrates the resolution on a known sample, pins it, and
-/// fits the unknown one. That reports the temperature as more certain than it
-/// is: resolution width and temperature broaden the line the same way, and
-/// pinning discards the uncertainty that belongs to their degeneracy.
-///
-/// Here both spectra are fitted at once against ONE shared Gaussian
-/// resolution, so the calibrant's residuals sit in the same objective as the
-/// sample's and the reported ``temperature_k_unc`` already contains what the
-/// calibrant failed to pin down.
-///
-/// Args:
-///     transmission, uncertainty, energies: the sample spectrum.
-///     isotopes: list of (ResonanceData, initial_density) for the sample.
-///     calibrant_transmission, calibrant_uncertainty, calibrant_energies:
-///         the known spectrum. Its own grid, so it need not match the
-///         sample's.
-///     calibrant_isotopes: list of (ResonanceData, KNOWN density). Fixed
-///         during the fit -- that is what makes it a calibrant.
-///     calibrant_temperature_k: the calibrant's known temperature.
-///     temperature_k: sample temperature; the start value when fitted.
-///     fit_temperature: whether the sample temperature is free.
-///     flight_path_m: flight path (m), shared by both spectra.
-///     delta_t_us, delta_l_m: starting widths for the shared resolution. A
-///         standalone ``calibrate_resolution`` result is the natural seed.
-///
-/// Returns:
-///     JointFitResult with the sample densities and temperature, the fitted
-///     shared widths, and the uncertainties.
-#[pyfunction]
-#[pyo3(signature = (
-    transmission, uncertainty, energies, isotopes,
-    calibrant_transmission, calibrant_uncertainty, calibrant_energies,
-    calibrant_isotopes, calibrant_temperature_k, *,
-    temperature_k = 293.6, fit_temperature = true,
-    flight_path_m = 25.0, delta_t_us = 1.0, delta_l_m = 0.0
-))]
-#[allow(clippy::too_many_arguments)]
-fn fit_with_calibrant(
-    py: Python<'_>,
-    transmission: PyReadonlyArray1<f64>,
-    uncertainty: PyReadonlyArray1<f64>,
-    energies: PyReadonlyArray1<f64>,
-    isotopes: Vec<(PyResonanceData, f64)>,
-    calibrant_transmission: PyReadonlyArray1<f64>,
-    calibrant_uncertainty: PyReadonlyArray1<f64>,
-    calibrant_energies: PyReadonlyArray1<f64>,
-    calibrant_isotopes: Vec<(PyResonanceData, f64)>,
-    calibrant_temperature_k: f64,
-    temperature_k: f64,
-    fit_temperature: bool,
-    flight_path_m: f64,
-    delta_t_us: f64,
-    delta_l_m: f64,
-) -> PyResult<PyJointFitResult> {
-    let sample = nereids_pipeline::joint_fit::SampleSpectrum {
-        energies: energies.as_slice()?.to_vec(),
-        transmission: transmission.as_slice()?.to_vec(),
-        uncertainty: uncertainty.as_slice()?.to_vec(),
-        isotopes: isotopes
-            .iter()
-            .map(|(i, n)| ((*i.inner).clone(), *n))
-            .collect(),
-        temperature_k,
-        fit_temperature,
-    };
-    let calibrant = nereids_pipeline::joint_fit::CalibrantSpectrum {
-        energies: calibrant_energies.as_slice()?.to_vec(),
-        transmission: calibrant_transmission.as_slice()?.to_vec(),
-        uncertainty: calibrant_uncertainty.as_slice()?.to_vec(),
-        isotopes: calibrant_isotopes
-            .iter()
-            .map(|(i, n)| ((*i.inner).clone(), *n))
-            .collect(),
-        temperature_k: calibrant_temperature_k,
-    };
-    let inner = py
-        .detach(move || {
-            nereids_pipeline::joint_fit::fit_with_calibrant(
-                &sample,
-                &calibrant,
-                flight_path_m,
-                delta_t_us,
-                delta_l_m,
-            )
-        })
-        .map_err(|e| pyo3::exceptions::PyValueError::new_err(e.to_string()))?;
-    Ok(PyJointFitResult { inner })
-}
-
-/// Calibrate instrument-resolution parameters against a known-(ρ,T) calibrant.
-///
-/// Fits the resolution parameters of `family` while holding the calibrant's
-/// density (the values in `isotopes`/`groups`) and `temperature_k` FIXED.
-///
-/// Args:
-///     energies, data, uncertainty: calibrant transmission spectrum.
-///     family: ``"gaussian"`` | ``"udr_corr"`` | ``"ic"``. ``"ic"`` fits
-///         ``α(E) = a0·√E + a1``, ``beta`` and the storage fraction ``r``,
-///         folded with the SNS PSR channel triangle.
-///     isotopes / groups: known calibrant composition + density (exactly one).
-///     temperature_k: known calibrant temperature.
-///     base_udr: base UDR kernel (required for ``family="udr_corr"``).
-///     fit_background: also fit anorm + linear baseline (default anorm only).
-///     restarts: optimizer restarts (keep the best).
-///     fit_t0, fit_l_scale: also fit the energy scale ``(t0, L_scale)``; by
-///         default they are held at ``t0_center_us`` / ``l_scale_center``.
-///     t0_center_us, l_scale_center: prior means, or the held values
-///         (default 0.0, 1.0).
-///     t0_prior_us, l_scale_prior: Gaussian prior σ (``None`` = flat/bounded only).
-///     psr_fwhm_ns: PSR channel-triangle FWHM in ns, folded into the ``"ic"``
-///         kernel only (default 350; ``0`` disables). Values above 10_000 ns
-///         raise ``ValueError``.
-///     fit_psr: also fit the PSR FWHM (``"ic"`` only), bounded to 0.05–1 µs and
-///         started at ``psr_fwhm_ns`` clamped into that range, with a warning on
-///         stderr when clamped; ``psr_fwhm_ns`` must then be > 0, else
-///         ``ValueError``.
-///     intervals: also compute ``.intervals``, the one-sigma range of each
-///         fitted parameter, at several times the cost of the calibration.
-///
-/// Returns:
-///     ResolutionCalibration with the fitted params, data χ²/dof, the fitted (or
-///     held) ``position_t0_us`` / ``position_l_scale`` / ``prior_penalty``, the
-///     parameters left at a bound in ``bounds_hit``, and the calibrated
-///     resolution (``.as_tabulated()`` / ``.gaussian_params()``).
-///     ``.intervals`` is populated only when ``intervals=True``.
-// `psr_fwhm_ns` / `fit_psr` sit at the END of the signature (after every
-// parameter that predates them): inserting them mid-signature would silently
-// shift the meaning of existing ≥ 14-positional-argument calls (review #645
-// F7). Keep any future additions at the end for the same reason.
-#[pyfunction]
-#[pyo3(signature = (
-    energies, data, uncertainty, family, isotopes=None, groups=None,
-    temperature_k=293.6, base_udr=None, flight_path_m=25.0, fit_background=false,
-    restarts=1, ic_n_energies=64, ic_n_tau=500,
-    fit_t0=false, fit_l_scale=false, t0_center_us=0.0, l_scale_center=1.0,
-    t0_prior_us=None, l_scale_prior=None,
-    psr_fwhm_ns=350.0, fit_psr=false, intervals=false
-))]
-#[allow(clippy::too_many_arguments)]
-fn calibrate_resolution(
-    py: Python<'_>,
-    energies: PyReadonlyArray1<f64>,
-    data: PyReadonlyArray1<f64>,
-    uncertainty: PyReadonlyArray1<f64>,
-    family: &str,
-    isotopes: Option<Vec<(PyResonanceData, f64)>>,
-    groups: Option<Vec<(PyIsotopeGroup, f64)>>,
-    temperature_k: f64,
-    base_udr: Option<PyTabulatedResolution>,
-    flight_path_m: f64,
-    fit_background: bool,
-    restarts: usize,
-    ic_n_energies: usize,
-    ic_n_tau: usize,
-    fit_t0: bool,
-    fit_l_scale: bool,
-    t0_center_us: f64,
-    l_scale_center: f64,
-    t0_prior_us: Option<f64>,
-    l_scale_prior: Option<f64>,
-    psr_fwhm_ns: f64,
-    fit_psr: bool,
-    intervals: bool,
-) -> PyResult<PyResolutionCalibration> {
-    if isotopes.is_some() == groups.is_some() {
-        return Err(pyo3::exceptions::PyValueError::new_err(
-            "Provide exactly one of 'isotopes' or 'groups'.",
-        ));
-    }
-    let e = energies.as_slice()?;
-    // Reject an empty grid up front with a precise message (validate_energy_grid
-    // tolerates empty; the Rust calibrator would otherwise reject it later as a
-    // generic EmptyData). Matches the other non-empty entry points.
-    require_non_empty_energy_grid(e)?;
-    let d = data.as_slice()?;
-    let u = uncertainty.as_slice()?;
-    if d.len() != e.len() || u.len() != e.len() {
-        return Err(pyo3::exceptions::PyValueError::new_err(
-            "energies, data, uncertainty must have equal length",
-        ));
-    }
-
-    let sample_isotopes: Vec<(ResonanceData, f64)> = if let Some(isotopes) = isotopes {
-        isotopes
-            .into_iter()
-            .map(|(rd, thick)| (Arc::unwrap_or_clone(rd.inner), thick))
-            .collect()
-    } else {
-        let groups = groups.unwrap();
-        let mut expanded = Vec::new();
-        for (group, group_density) in &groups {
-            if !group.is_loaded() {
-                return Err(pyo3::exceptions::PyValueError::new_err(format!(
-                    "IsotopeGroup '{}' has not been fully loaded. Call load_endf() first.",
-                    group.inner.name(),
-                )));
-            }
-            for (i, (_iso, ratio)) in group.inner.members().iter().enumerate() {
-                let rd = Arc::unwrap_or_clone(group.resonance_data[i].clone().unwrap());
-                expanded.push((rd, group_density * ratio));
-            }
-        }
-        expanded
-    };
-    // Validate the calibrant composition: at least one isotope with a finite,
-    // positive areal density (otherwise the calibrant has no resonances to fit
-    // the resolution against, and the optimization is degenerate).
-    if sample_isotopes.is_empty() {
-        return Err(pyo3::exceptions::PyValueError::new_err(
-            "calibrant has no isotopes/groups; provide a known composition with densities > 0",
-        ));
-    }
-    if !sample_isotopes
-        .iter()
-        .any(|(_, d)| d.is_finite() && *d > 0.0)
-    {
-        return Err(pyo3::exceptions::PyValueError::new_err(
-            "calibrant densities must include at least one finite, positive value",
-        ));
-    }
-    let sample = SampleParams::new(temperature_k, sample_isotopes)
-        .map_err(|e| pyo3::exceptions::PyValueError::new_err(e.to_string()))?;
-
-    let fam = match family {
-        "gaussian" => ResolutionFamily::Gaussian,
-        "ic" => ResolutionFamily::IkedaCarpenter { fit_psr },
-        "udr_corr" => {
-            let base = base_udr.ok_or_else(|| {
-                pyo3::exceptions::PyValueError::new_err(
-                    "family='udr_corr' requires base_udr (a TabulatedResolution).",
-                )
-            })?;
-            ResolutionFamily::UdrCorr { base: base.inner }
-        }
-        other => {
-            return Err(pyo3::exceptions::PyValueError::new_err(format!(
-                "unknown family '{other}'; expected 'gaussian', 'udr_corr', or 'ic'"
-            )));
-        }
-    };
-
-    // fit_psr appends the PSR-FWHM fit coordinate, which only the IC family
-    // carries — reject the flag on other families instead of silently ignoring it.
-    if fit_psr && !matches!(fam, ResolutionFamily::IkedaCarpenter { .. }) {
-        return Err(pyo3::exceptions::PyValueError::new_err(format!(
-            "fit_psr=True requires family='ic', got family='{family}'"
-        )));
-    }
-    // For family='ic' these size the kernel-synthesis grid; validate up front so an
-    // out-of-range value gives a precise error instead of the generic "no finite-χ²
-    // resolution" (every IkedaCarpenter::new eval would otherwise fail). They are
-    // inert for the gaussian/udr_corr families.
-    if matches!(fam, ResolutionFamily::IkedaCarpenter { .. }) {
-        if ic_n_energies < 2 {
-            return Err(pyo3::exceptions::PyValueError::new_err(format!(
-                "ic_n_energies must be >= 2 for family='ic', got {ic_n_energies}"
-            )));
-        }
-        if ic_n_tau < 8 {
-            return Err(pyo3::exceptions::PyValueError::new_err(format!(
-                "ic_n_tau must be >= 8 for family='ic', got {ic_n_tau}"
-            )));
-        }
-        // PSR triangle FWHM: finite and >= 0 ns (0 disables the fold). Also
-        // enforced by the Rust calibrator; rejected here with the precise
-        // Python-facing message.
-        if !psr_fwhm_ns.is_finite() || psr_fwhm_ns < 0.0 {
-            return Err(pyo3::exceptions::PyValueError::new_err(format!(
-                "psr_fwhm_ns must be finite and >= 0 (0 disables the PSR fold), got {psr_fwhm_ns}"
-            )));
-        }
-        // Sanity ceiling (mirrors the Rust calibrator; see
-        // PSR_FWHM_PIN_CEILING_US): psr_fwhm_ns is NANOSECONDS and kernel-
-        // synthesis cost is quadratic in the fold width, so a µs-as-ns unit
-        // slip (350 meaning µs) would hang the calibration for hours behind
-        // a fictitious fold. Reject with the precise Python-facing message.
-        if psr_fwhm_ns * NS_TO_US > PSR_FWHM_PIN_CEILING_US {
-            return Err(pyo3::exceptions::PyValueError::new_err(format!(
-                "psr_fwhm_ns={psr_fwhm_ns} ns (= {} us) exceeds the {PSR_FWHM_PIN_CEILING_US} \
-                 us sanity ceiling: psr_fwhm_ns is in NANOSECONDS (the SNS/VENUS FTS \
-                 convention is 350 ns) and kernel-synthesis cost grows quadratically with \
-                 the fold width, so a us-as-ns unit slip would hang the calibration. Pass \
-                 the width in ns, or 0 to disable the PSR fold",
-                psr_fwhm_ns * NS_TO_US
-            )));
-        }
-        // fit_psr fits the PSR FWHM from the psr_fwhm_ns starting value, but 0
-        // means "no fold" — a zero start would be silently clamped into the
-        // [0.05, 1] us fit box, contradicting the documented "0 disables".
-        // Also enforced by the Rust calibrator.
-        if fit_psr && psr_fwhm_ns == 0.0 {
-            return Err(pyo3::exceptions::PyValueError::new_err(
-                "fit_psr=True requires a positive psr_fwhm_ns starting value (psr_fwhm_ns=0 \
-                 disables the PSR fold; use fit_psr=False to calibrate without one)",
-            ));
-        }
-    }
-
-    let cfg = CalibrationConfig {
-        flight_path_m,
-        fit_background,
-        restarts,
-        ic_n_energies,
-        ic_n_tau,
-        psr_fwhm_ns,
-        fit_t0,
-        fit_l_scale,
-        position_t0_center_us: t0_center_us,
-        position_l_scale_center: l_scale_center,
-        position_t0_prior_us: t0_prior_us,
-        position_l_scale_prior: l_scale_prior,
-        intervals,
-        ..Default::default()
-    };
-    let (e_owned, d_owned, u_owned) = (e.to_vec(), d.to_vec(), u.to_vec());
-    let result = py
-        .detach(move || rust_calibrate_resolution(fam, &e_owned, &d_owned, &u_owned, &sample, &cfg))
-        .map_err(|e| pyo3::exceptions::PyValueError::new_err(e.to_string()))?;
-    Ok(PyResolutionCalibration { inner: result })
 }
 
 /// Convert time-of-flight (μs) to energy (eV).
@@ -2995,70 +1888,6 @@ fn read_tof_sidecar<'py>(
     Ok(PyArray1::from_vec(py, edges))
 }
 
-/// Normalize raw sample and open-beam data to transmission.
-///
-/// Computes T = (C_sample / C_ob) × (PC_ob / PC_sample) with Poisson
-/// uncertainty propagation.
-///
-/// Args:
-///     sample: 3D numpy array of raw sample counts (n_tof, height, width).
-///     open_beam: 3D numpy array of open-beam counts (same shape).
-///     pc_sample: Proton charge for the sample measurement.
-///     pc_ob: Proton charge for the open-beam measurement.
-///     dark_current: Optional 2D numpy array (height, width) to subtract.
-///
-/// Returns:
-///     Tuple of (transmission, uncertainty) as 3D numpy arrays.
-#[pyfunction]
-#[pyo3(signature = (sample, open_beam, pc_sample, pc_ob, dark_current=None))]
-fn normalize<'py>(
-    py: Python<'py>,
-    sample: PyReadonlyArray3<f64>,
-    open_beam: PyReadonlyArray3<f64>,
-    pc_sample: f64,
-    pc_ob: f64,
-    dark_current: Option<PyReadonlyArray2<f64>>,
-) -> PyResult<(Bound<'py, PyArray3<f64>>, Bound<'py, PyArray3<f64>>)> {
-    // Validate shapes using cheap PyReadonly views before cloning
-    let s_shape = sample.shape();
-    let ob_shape = open_beam.shape();
-    if s_shape != ob_shape {
-        return Err(pyo3::exceptions::PyValueError::new_err(format!(
-            "sample shape {:?} must match open_beam shape {:?}",
-            s_shape, ob_shape,
-        )));
-    }
-
-    if let Some(ref dc_arr) = dark_current {
-        let dc_shape = dc_arr.shape();
-        if dc_shape[0] != s_shape[1] || dc_shape[1] != s_shape[2] {
-            return Err(pyo3::exceptions::PyValueError::new_err(format!(
-                "dark_current shape ({}, {}) must match spatial dimensions ({}, {}) of sample",
-                dc_shape[0], dc_shape[1], s_shape[1], s_shape[2],
-            )));
-        }
-    }
-
-    // Clone arrays only after all validation passes
-    let s = sample.as_array().to_owned();
-    let ob = open_beam.as_array().to_owned();
-    let dc = dark_current.map(|d| d.as_array().to_owned());
-
-    let params = NormalizationParams {
-        proton_charge_sample: pc_sample,
-        proton_charge_ob: pc_ob,
-    };
-
-    // Release the GIL for the normalization computation.
-    let result = py.detach(move || norm::normalize(&s, &ob, &params, dc.as_ref()));
-    let result = result.map_err(|e| pyo3::exceptions::PyValueError::new_err(format!("{}", e)))?;
-
-    Ok((
-        PyArray3::from_owned_array(py, result.transmission),
-        PyArray3::from_owned_array(py, result.uncertainty),
-    ))
-}
-
 /// Convert TOF bin edges to energy bin centers.
 ///
 /// Returns the geometric mean of adjacent energy bin edges (ascending order).
@@ -3165,285 +1994,6 @@ fn py_natural_isotopes(z: u32) -> Vec<((u32, u32), f64)> {
         .collect()
 }
 
-/// Result of a trace-detectability analysis.
-///
-/// Returned by ``trace_detectability()`` and ``trace_detectability_survey()``.
-/// Contains the peak SNR, the energy at which peak contrast occurs, and the
-/// full |ΔT| spectrum for plotting.
-#[pyclass(name = "TraceDetectabilityReport")]
-struct PyTraceDetectabilityReport {
-    inner: detectability::TraceDetectabilityReport,
-}
-
-#[pymethods]
-impl PyTraceDetectabilityReport {
-    /// Peak |ΔT| per ppm concentration at the most sensitive energy.
-    #[getter]
-    fn peak_delta_t_per_ppm(&self) -> f64 {
-        self.inner.peak_delta_t_per_ppm
-    }
-
-    /// Energy at which peak contrast occurs (eV).
-    #[getter]
-    fn peak_energy_ev(&self) -> f64 {
-        self.inner.peak_energy_ev
-    }
-
-    /// Estimated peak SNR at the given concentration and I₀.
-    #[getter]
-    fn peak_snr(&self) -> f64 {
-        self.inner.peak_snr
-    }
-
-    /// Whether the combination is detectable (SNR > threshold).
-    #[getter]
-    fn detectable(&self) -> bool {
-        self.inner.detectable
-    }
-
-    /// Energy-resolved |ΔT| spectrum for the given concentration.
-    #[getter]
-    fn delta_t_spectrum<'py>(&self, py: Python<'py>) -> Bound<'py, PyArray1<f64>> {
-        PyArray1::from_vec(py, self.inner.delta_t_spectrum.clone())
-    }
-
-    /// Energies used (eV).
-    #[getter]
-    fn energies<'py>(&self, py: Python<'py>) -> Bound<'py, PyArray1<f64>> {
-        PyArray1::from_vec(py, self.inner.energies.clone())
-    }
-
-    /// Fraction of energy bins where the matrix baseline is opaque (T < 1e-15).
-    #[getter]
-    fn opaque_fraction(&self) -> f64 {
-        self.inner.opaque_fraction
-    }
-
-    fn __repr__(&self) -> String {
-        format!(
-            "TraceDetectabilityReport(detectable={}, peak_snr={:.2}, peak_energy_ev={:.2}, opaque_fraction={:.2})",
-            self.inner.detectable,
-            self.inner.peak_snr,
-            self.inner.peak_energy_ev,
-            self.inner.opaque_fraction,
-        )
-    }
-}
-
-/// Compute trace-detectability for a matrix + trace isotope pair.
-///
-/// Determines whether a trace isotope is detectable at a given concentration
-/// (in ppm) within a matrix, by computing the peak spectral SNR over the
-/// supplied energy window.
-///
-/// Resolution broadening can be applied via either Gaussian parameters
-/// (``flight_path_m``, ``delta_t_us``, ``delta_l_m``) or a tabulated
-/// resolution function (``resolution``). Providing both is an error.
-///
-/// Args:
-///     matrix: ResonanceData for the matrix isotope.
-///     matrix_density: Matrix areal density in atoms/barn.
-///     trace: ResonanceData for the trace isotope.
-///     trace_ppm: Trace concentration in ppm by atom.
-///     energies: Energy grid in eV (1D numpy array, sorted ascending).
-///     i0: Expected counts per energy bin (for Poisson noise estimate).
-///     temperature_k: Sample temperature in Kelvin (default 293.6).
-///     flight_path_m: Flight path for Gaussian resolution (optional).
-///     delta_t_us: Timing width for Gaussian resolution, W-parameter (optional).
-///     delta_l_m: Path length width for Gaussian resolution, W-parameter (optional).
-///     resolution: TabulatedResolution for tabulated broadening (optional).
-///     snr_threshold: Detection threshold in σ (default 3.0).
-///
-/// Returns:
-///     TraceDetectabilityReport with peak SNR, peak energy, and |ΔT| spectrum.
-#[pyfunction]
-#[pyo3(name = "trace_detectability", signature = (matrix, matrix_density, trace, trace_ppm, energies, i0, temperature_k=293.6, flight_path_m=None, delta_t_us=None, delta_l_m=None, resolution=None, delta_e_us=None, snr_threshold=3.0))]
-fn py_trace_detectability(
-    py: Python<'_>,
-    matrix: &PyResonanceData,
-    matrix_density: f64,
-    trace: &PyResonanceData,
-    trace_ppm: f64,
-    energies: PyReadonlyArray1<f64>,
-    i0: f64,
-    temperature_k: f64,
-    flight_path_m: Option<f64>,
-    delta_t_us: Option<f64>,
-    delta_l_m: Option<f64>,
-    resolution: Option<PyTabulatedResolution>,
-    delta_e_us: Option<f64>,
-    snr_threshold: f64,
-) -> PyResult<PyTraceDetectabilityReport> {
-    let e = energies.as_slice()?;
-    require_non_empty_energy_grid(e)?;
-
-    if matrix_density <= 0.0 || !matrix_density.is_finite() {
-        return Err(pyo3::exceptions::PyValueError::new_err(
-            "matrix_density must be finite and positive",
-        ));
-    }
-    if trace_ppm < 0.0 || !trace_ppm.is_finite() {
-        return Err(pyo3::exceptions::PyValueError::new_err(
-            "trace_ppm must be finite and non-negative",
-        ));
-    }
-    if i0 <= 0.0 || !i0.is_finite() {
-        return Err(pyo3::exceptions::PyValueError::new_err(
-            "i0 must be finite and positive",
-        ));
-    }
-    if !temperature_k.is_finite() || temperature_k < 0.0 {
-        return Err(pyo3::exceptions::PyValueError::new_err(
-            "temperature_k must be finite and non-negative",
-        ));
-    }
-    if snr_threshold < 0.0 || !snr_threshold.is_finite() {
-        return Err(pyo3::exceptions::PyValueError::new_err(
-            "snr_threshold must be finite and non-negative",
-        ));
-    }
-
-    let res_fn = build_resolution(flight_path_m, delta_t_us, delta_l_m, resolution, delta_e_us)?;
-
-    // Clone data to owned types so we can release the GIL.
-    let e_owned = e.to_vec();
-    let matrix_data = matrix.inner.clone();
-    let trace_data = trace.inner.clone();
-
-    // Release the GIL for the detectability computation.
-    // Wrap single matrix in a vec — Rust API supports multi-matrix but Python
-    // API preserves backward compatibility with a single matrix argument.
-    let report = py.detach(move || {
-        let matrix_isotopes = vec![(Arc::unwrap_or_clone(matrix_data), matrix_density)];
-        let config = detectability::TraceDetectabilityConfig {
-            matrix_isotopes: &matrix_isotopes,
-            energies: &e_owned,
-            i0,
-            temperature_k,
-            resolution: res_fn.as_ref(),
-            snr_threshold,
-        };
-        detectability::trace_detectability(&config, &trace_data, trace_ppm)
-            .map_err(|e| format!("trace_detectability failed: {e}"))
-    });
-    let report = report.map_err(|e| pyo3::exceptions::PyValueError::new_err(e))?;
-
-    Ok(PyTraceDetectabilityReport { inner: report })
-}
-
-/// Survey multiple trace candidates against a single matrix.
-///
-/// Parallelises over candidates with rayon. Returns a list of
-/// ``(isotope_name, TraceDetectabilityReport)`` tuples sorted by
-/// ``peak_snr`` descending.
-///
-/// Resolution broadening can be applied via either Gaussian parameters
-/// (``flight_path_m``, ``delta_t_us``, ``delta_l_m``) or a tabulated
-/// resolution function (``resolution``). Providing both is an error.
-///
-/// Args:
-///     matrix: ResonanceData for the matrix isotope.
-///     matrix_density: Matrix areal density in atoms/barn.
-///     trace_candidates: List of ResonanceData for candidate trace isotopes.
-///     trace_ppm: Trace concentration in ppm by atom.
-///     energies: Energy grid in eV (1D numpy array, sorted ascending).
-///     i0: Expected counts per energy bin (for Poisson noise estimate).
-///     temperature_k: Sample temperature in Kelvin (default 293.6).
-///     flight_path_m: Flight path for Gaussian resolution (optional).
-///     delta_t_us: Timing width for Gaussian resolution, W-parameter (optional).
-///     delta_l_m: Path length width for Gaussian resolution, W-parameter (optional).
-///     resolution: TabulatedResolution for tabulated broadening (optional).
-///     snr_threshold: Detection threshold in σ (default 3.0).
-///
-/// Returns:
-///     List of (isotope_name, TraceDetectabilityReport) sorted by peak_snr descending.
-#[pyfunction]
-#[pyo3(name = "trace_detectability_survey", signature = (matrix, matrix_density, trace_candidates, trace_ppm, energies, i0, temperature_k=293.6, flight_path_m=None, delta_t_us=None, delta_l_m=None, resolution=None, delta_e_us=None, snr_threshold=3.0))]
-fn py_trace_detectability_survey(
-    py: Python<'_>,
-    matrix: &PyResonanceData,
-    matrix_density: f64,
-    trace_candidates: Vec<PyResonanceData>,
-    trace_ppm: f64,
-    energies: PyReadonlyArray1<f64>,
-    i0: f64,
-    temperature_k: f64,
-    flight_path_m: Option<f64>,
-    delta_t_us: Option<f64>,
-    delta_l_m: Option<f64>,
-    resolution: Option<PyTabulatedResolution>,
-    delta_e_us: Option<f64>,
-    snr_threshold: f64,
-) -> PyResult<Vec<(String, PyTraceDetectabilityReport)>> {
-    let e = energies.as_slice()?;
-    require_non_empty_energy_grid(e)?;
-
-    if matrix_density <= 0.0 || !matrix_density.is_finite() {
-        return Err(pyo3::exceptions::PyValueError::new_err(
-            "matrix_density must be finite and positive",
-        ));
-    }
-    if trace_ppm < 0.0 || !trace_ppm.is_finite() {
-        return Err(pyo3::exceptions::PyValueError::new_err(
-            "trace_ppm must be finite and non-negative",
-        ));
-    }
-    if i0 <= 0.0 || !i0.is_finite() {
-        return Err(pyo3::exceptions::PyValueError::new_err(
-            "i0 must be finite and positive",
-        ));
-    }
-    if !temperature_k.is_finite() || temperature_k < 0.0 {
-        return Err(pyo3::exceptions::PyValueError::new_err(
-            "temperature_k must be finite and non-negative",
-        ));
-    }
-    if snr_threshold < 0.0 || !snr_threshold.is_finite() {
-        return Err(pyo3::exceptions::PyValueError::new_err(
-            "snr_threshold must be finite and non-negative",
-        ));
-    }
-    if trace_candidates.is_empty() {
-        return Err(pyo3::exceptions::PyValueError::new_err(
-            "trace_candidates must not be empty",
-        ));
-    }
-
-    let res_fn = build_resolution(flight_path_m, delta_t_us, delta_l_m, resolution, delta_e_us)?;
-
-    let candidates: Vec<ResonanceData> = trace_candidates
-        .into_iter()
-        .map(|d| Arc::unwrap_or_clone(d.inner))
-        .collect();
-
-    // Clone data to owned types so we can release the GIL.
-    let e_owned = e.to_vec();
-    let matrix_data = matrix.inner.clone();
-
-    // Release the GIL for the parallelised detectability survey.
-    // Wrap single matrix in a vec — Rust API supports multi-matrix but Python
-    // API preserves backward compatibility with a single matrix argument.
-    let results = py.detach(move || {
-        let matrix_isotopes = vec![(Arc::unwrap_or_clone(matrix_data), matrix_density)];
-        let config = detectability::TraceDetectabilityConfig {
-            matrix_isotopes: &matrix_isotopes,
-            energies: &e_owned,
-            i0,
-            temperature_k,
-            resolution: res_fn.as_ref(),
-            snr_threshold,
-        };
-        detectability::trace_detectability_survey(&config, &candidates, trace_ppm)
-            .map_err(|e| format!("trace_detectability_survey failed: {e}"))
-    });
-    let results = results.map_err(|e| pyo3::exceptions::PyValueError::new_err(e))?;
-
-    Ok(results
-        .into_iter()
-        .map(|(name, report)| (name, PyTraceDetectabilityReport { inner: report }))
-        .collect())
-}
-
 /// Precompute Doppler- and resolution-broadened total cross-sections.
 ///
 /// Returns one broadened total cross-section array per isotope.  This is the
@@ -3495,7 +2045,7 @@ fn precompute_cross_sections<'py>(
         ));
     }
 
-    // Issue #442: resolution-broadened cross-sections are not physically
+    // resolution-broadened cross-sections are not physically
     // meaningful for transmission fitting.  Resolution broadening must be
     // applied after Beer-Lambert on the total transmission, which depends
     // on per-pixel densities and cannot be precomputed as broadened σ.
@@ -3535,8 +2085,8 @@ fn precompute_cross_sections<'py>(
 /// Detect dead pixels in a 3D image stack.
 ///
 /// A pixel is marked as "dead" when all its counts across the spectral/TOF
-/// axis are exactly zero.  The returned mask can be passed directly to
-/// ``spatial_map_typed(dead_pixels=...)``.
+/// axis are exactly zero.  The returned mask can be passed as the
+/// ``excluded`` mask of a ``MapMeasurement``.
 ///
 /// Pixel masks are a **pipeline-integrity screen only** — they exclude
 /// pixels whose data stream is broken (dead, hot/railed), never low-count
@@ -3559,7 +2109,7 @@ fn detect_dead_pixels<'py>(
     data: PyReadonlyArray3<f64>,
 ) -> PyResult<Bound<'py, PyArray2<bool>>> {
     let arr = data.as_array().to_owned();
-    let mask = py.detach(move || norm::detect_dead_pixels(&arr));
+    let mask = py.detach(move || nereids_io::pixels::detect_dead_pixels(&arr));
     Ok(PyArray2::from_owned_array(py, mask))
 }
 
@@ -3631,14 +2181,14 @@ fn detect_dead_pixels<'py>(
 ///         has zero frames (``shape[0] == 0``), or ``k_mad`` is not finite
 ///         and positive.
 #[pyfunction]
-#[pyo3(signature = (data, k_mad = norm::HOT_PIXEL_K_MAD))]
+#[pyo3(signature = (data, k_mad = nereids_io::pixels::HOT_PIXEL_K_MAD))]
 fn detect_hot_pixels<'py>(
     py: Python<'py>,
     data: PyReadonlyArray3<f64>,
     k_mad: f64,
 ) -> PyResult<Bound<'py, PyArray2<bool>>> {
     let arr = data.as_array().to_owned();
-    let mask = py.detach(move || norm::detect_hot_pixels(&arr, k_mad));
+    let mask = py.detach(move || nereids_io::pixels::detect_hot_pixels(&arr, k_mad));
     let mask = mask.map_err(|e| pyo3::exceptions::PyValueError::new_err(format!("{}", e)))?;
     Ok(PyArray2::from_owned_array(py, mask))
 }
@@ -3675,7 +2225,7 @@ fn detect_dead_pixels_chunked<'py>(
 ) -> PyResult<Bound<'py, PyArray2<bool>>> {
     // Copy to owned arrays before releasing the GIL.
     let owned: Vec<_> = chunks.iter().map(|c| c.as_array().to_owned()).collect();
-    let mask = py.detach(move || norm::detect_dead_pixels_chunked(&owned));
+    let mask = py.detach(move || nereids_io::pixels::detect_dead_pixels_chunked(&owned));
     let mask = mask.map_err(|e| pyo3::exceptions::PyValueError::new_err(format!("{}", e)))?;
     Ok(PyArray2::from_owned_array(py, mask))
 }
@@ -3710,7 +2260,7 @@ fn detect_dead_pixels_chunked<'py>(
 ///         or has zero frames (``shape[0] == 0``), the spatial dimensions
 ///         differ, or ``hot_k_mad`` is not finite and positive.
 #[pyfunction]
-#[pyo3(signature = (sample, open_beam = None, hot_k_mad = Some(norm::HOT_PIXEL_K_MAD)))]
+#[pyo3(signature = (sample, open_beam = None, hot_k_mad = Some(nereids_io::pixels::HOT_PIXEL_K_MAD)))]
 fn detect_bad_pixels<'py>(
     py: Python<'py>,
     sample: PyReadonlyArray3<f64>,
@@ -3719,149 +2269,9 @@ fn detect_bad_pixels<'py>(
 ) -> PyResult<Bound<'py, PyArray2<bool>>> {
     let s = sample.as_array().to_owned();
     let ob = open_beam.map(|o| o.as_array().to_owned());
-    let mask = py.detach(move || norm::detect_bad_pixels(&s, ob.as_ref(), hot_k_mad));
+    let mask = py.detach(move || nereids_io::pixels::detect_bad_pixels(&s, ob.as_ref(), hot_k_mad));
     let mask = mask.map_err(|e| pyo3::exceptions::PyValueError::new_err(format!("{}", e)))?;
     Ok(PyArray2::from_owned_array(py, mask))
-}
-
-/// Result of energy calibration.
-#[pyclass(name = "CalibrationResult")]
-#[derive(Debug)]
-struct PyCalibrationResult {
-    /// Fitted flight path length in metres.
-    flight_path_m: f64,
-    /// Fitted TOF delay in microseconds.
-    t0_us: f64,
-    /// Fitted total areal density in atoms/barn.
-    total_density: f64,
-    /// Reduced chi-squared at the best parameters.
-    reduced_chi_squared: f64,
-    /// Corrected energy grid.
-    energies_corrected: Py<PyArray1<f64>>,
-}
-
-#[pymethods]
-impl PyCalibrationResult {
-    #[getter]
-    fn flight_path_m(&self) -> f64 {
-        self.flight_path_m
-    }
-    #[getter]
-    fn t0_us(&self) -> f64 {
-        self.t0_us
-    }
-    #[getter]
-    fn total_density(&self) -> f64 {
-        self.total_density
-    }
-    #[getter]
-    fn reduced_chi_squared(&self) -> f64 {
-        self.reduced_chi_squared
-    }
-    #[getter]
-    fn energies_corrected<'py>(&self, py: Python<'py>) -> Bound<'py, PyArray1<f64>> {
-        self.energies_corrected.bind(py).clone()
-    }
-    fn __repr__(&self) -> String {
-        format!(
-            "CalibrationResult(L={:.4}m, t0={:.2}µs, n={:.2e}, chi2r={:.4})",
-            self.flight_path_m, self.t0_us, self.total_density, self.reduced_chi_squared
-        )
-    }
-}
-
-/// Calibrate the energy axis by fitting flight path and TOF delay.
-///
-/// Finds the (L, t₀, n_total) that best align the ENDF resonance model
-/// with measured transmission data from a known-composition reference sample.
-///
-/// Args:
-///     energies_nominal: 1D ascending energy grid (eV) computed with assumed L.
-///     transmission: 1D measured transmission values.
-///     uncertainty: 1D per-bin uncertainty.
-///     isotopes: List of ResonanceData for the reference sample.
-///     abundances: Natural abundance fractions (same length as isotopes).
-///     assumed_flight_path_m: Flight path used to compute energies_nominal.
-///     temperature_k: Sample temperature in Kelvin (default 293.6).
-///
-/// Returns:
-///     CalibrationResult with fitted (L, t₀, n_total) and corrected energies.
-#[pyfunction]
-#[pyo3(name = "calibrate_energy", signature = (energies_nominal, transmission, uncertainty, isotopes, abundances, assumed_flight_path_m, temperature_k=293.6, resolution=None))]
-fn py_calibrate_energy(
-    py: Python<'_>,
-    energies_nominal: PyReadonlyArray1<f64>,
-    transmission: PyReadonlyArray1<f64>,
-    uncertainty: PyReadonlyArray1<f64>,
-    isotopes: Vec<PyResonanceData>,
-    abundances: Vec<f64>,
-    assumed_flight_path_m: f64,
-    temperature_k: f64,
-    resolution: Option<PyTabulatedResolution>,
-) -> PyResult<PyCalibrationResult> {
-    // Copy NumPy slices to owned `Vec<f64>` *before* `py.detach` so the
-    // closure does not hold borrows into NumPy-owned memory across the GIL
-    // release.  rust-numpy only guards borrows while the GIL is held;
-    // once detached another Python thread could mutate/reallocate the
-    // arrays and the inner Rust slices would dangle.  Every other
-    // `py.detach` site in this file follows the same `.as_slice()?.to_vec()`
-    // pattern — `calibrate_energy` was the lone outlier.
-    let e_owned = energies_nominal.as_slice()?.to_vec();
-    let t_owned = transmission.as_slice()?.to_vec();
-    let s_owned = uncertainty.as_slice()?.to_vec();
-
-    // Validate the nominal energy grid up front so malformed energies
-    // surface as ValueError rather than a release-mode `PanicException`
-    // from the per-point `assert!(energy_ev.is_finite() && energy_ev > 0.0)`
-    // guards inside `transmission::forward_model` → SLBW / Reich-Moore
-    // leaves.  Calibration requires at least one data point to fit
-    // (L, t₀, n_total), so an empty grid is also rejected.
-    require_non_empty_energy_grid(&e_owned)?;
-    if t_owned.len() != e_owned.len() {
-        return Err(pyo3::exceptions::PyValueError::new_err(format!(
-            "transmission length ({}) must match energies_nominal length ({})",
-            t_owned.len(),
-            e_owned.len(),
-        )));
-    }
-    if s_owned.len() != e_owned.len() {
-        return Err(pyo3::exceptions::PyValueError::new_err(format!(
-            "uncertainty length ({}) must match energies_nominal length ({})",
-            s_owned.len(),
-            e_owned.len(),
-        )));
-    }
-
-    let res_data: Vec<nereids_endf::resonance::ResonanceData> = isotopes
-        .into_iter()
-        .map(|d| Arc::unwrap_or_clone(d.inner))
-        .collect();
-
-    let instrument = resolution.map(|r| nereids_physics::transmission::InstrumentParams {
-        resolution: nereids_physics::resolution::ResolutionFunction::Tabulated(r.inner.clone()),
-    });
-
-    let result = py.detach(move || {
-        nereids_pipeline::calibration::calibrate_energy(
-            &e_owned,
-            &t_owned,
-            &s_owned,
-            &res_data,
-            &abundances,
-            assumed_flight_path_m,
-            temperature_k,
-            instrument.as_ref(),
-        )
-    });
-    let result = result.map_err(|e| pyo3::exceptions::PyValueError::new_err(e.to_string()))?;
-
-    Ok(PyCalibrationResult {
-        flight_path_m: result.flight_path_m,
-        t0_us: result.t0_us,
-        total_density: result.total_density,
-        reduced_chi_squared: result.reduced_chi_squared,
-        energies_corrected: PyArray1::from_vec(py, result.energies_corrected).unbind(),
-    })
 }
 
 // ── NeXus I/O Bindings ──────────────────────────────────────────────────
@@ -4133,7 +2543,7 @@ fn run_health(
 /// transposes the caller-selected single-angle slice to
 /// `(tof, y, x)`.
 ///
-/// **Issue #430**: by default this function refuses multi-angle files
+/// By default this function refuses multi-angle files
 /// (more than one rotation angle) because silently summing them
 /// destroys projection-resolved information on import.  Callers with
 /// a multi-angle file must choose a policy via `multi_angle_mode`.
@@ -4274,7 +2684,7 @@ impl PyRunLog {
     }
 }
 
-/// Read a DASlogs PV from a NeXus file as a transition log (issue #637).
+/// Read a DASlogs PV from a NeXus file as a transition log.
 ///
 /// SNS/HFIR DASlogs are **transition logs**, not uniformly-sampled time
 /// series: `values[i]` takes effect at `times[i]` and persists until the
@@ -4309,7 +2719,7 @@ fn read_run_log(py: Python<'_>, path: &str, pv: &str) -> PyResult<PyRunLog> {
 }
 
 /// Derive run-time intervals where a transition-log PV satisfies
-/// `min_value <= value <= max_value` (issue #637).
+/// `min_value <= value <= max_value`.
 ///
 /// Uses the correct step-function semantics: `values[i]` holds on
 /// `[times[i], times[i+1])` and the last value holds to `duration_s`.
@@ -4349,7 +2759,7 @@ fn intervals_where(
         .map_err(map_io_error)
 }
 
-/// Intersect two interval lists (issue #637).
+/// Intersect two interval lists.
 ///
 /// Composes conditions across PVs, e.g. `pause == 0` AND
 /// `beam_power > 1.5 MW`.  Inputs are lists of (t_start, t_end) tuples;
@@ -4447,12 +2857,12 @@ impl PyBankSpectrum {
 }
 
 /// Load one NXevent_data bank (e.g. a beam monitor) as a 1-D TOF spectrum,
-/// optionally keeping only pulses inside wall-clock intervals (issue #637).
+/// optionally keeping only pulses inside wall-clock intervals.
 ///
 /// Reads `/entry/<bank>/{event_time_offset, event_index, event_time_zero}`
 /// (the facility NeXus convention).  The `units` attributes on
 /// `event_time_offset` AND `event_time_zero` are required — NXevent_data
-/// specifies no defaults, and refusing to guess closes the #554
+/// specifies no defaults, and refusing to guess closes the
 /// silent-rescale class.
 /// A bank with zero events loads to an all-zero spectrum with correct
 /// pulse statistics — it never errors (on VENUS every imaging-detector
@@ -4529,22 +2939,1292 @@ fn nexus_data_to_py(py: Python<'_>, data: nereids_io::nexus::NexusHistogramData)
     }
 }
 
+// ── Counts-domain fitting (Engine C) ─────────────────────────────────────
+
+/// Map a pipeline error to a Python ValueError.
+fn counts_error(error: PipelineError) -> PyErr {
+    pyo3::exceptions::PyValueError::new_err(error.to_string())
+}
+
+/// A [C, A, tau] triple of PyValues.
+fn value_trio(values: Vec<PyValue>) -> PyResult<[Value; 3]> {
+    let [a, b, c] = values.as_slice() else {
+        return Err(pyo3::exceptions::PyValueError::new_err(
+            "expected exactly three values",
+        ));
+    };
+    Ok([a.inner, b.inner, c.inner])
+}
+
+/// A covariance matrix as a 2D numpy array.
+fn matrix_to_py<'py>(py: Python<'py>, matrix: &FlatMatrix) -> Bound<'py, PyArray2<f64>> {
+    PyArray2::from_owned_array(
+        py,
+        ndarray::Array2::from_shape_fn((matrix.nrows, matrix.ncols), |(row, column)| {
+            matrix.get(row, column)
+        }),
+    )
+}
+
+/// A quantity the fit holds at a known value, fits from a starting value over
+/// the quantity's range, fits from start within lower..=upper, or fits under a
+/// Gaussian prior N(value, sd^2).
+#[pyclass(name = "Value", from_py_object)]
+#[derive(Clone, Copy)]
+struct PyValue {
+    inner: Value,
+}
+
+#[pymethods]
+impl PyValue {
+    /// Hold the quantity at value.
+    #[staticmethod]
+    fn known(value: f64) -> Self {
+        Self {
+            inner: Value::Known(value),
+        }
+    }
+
+    /// Fit the quantity from start over its full range.
+    #[staticmethod]
+    fn fitted(start: f64) -> Self {
+        Self {
+            inner: Value::Fitted(start),
+        }
+    }
+
+    /// Fit the quantity from start within lower..=upper.
+    #[staticmethod]
+    fn within(start: f64, lower: f64, upper: f64) -> Self {
+        Self {
+            inner: Value::Within {
+                start,
+                lower,
+                upper,
+            },
+        }
+    }
+
+    /// Fit the quantity with the Gaussian prior N(value, sd^2).
+    #[staticmethod]
+    fn measured(value: f64, sd: f64) -> Self {
+        Self {
+            inner: Value::Measured { value, sd },
+        }
+    }
+
+    /// "known" | "fitted" | "within" | "measured".
+    #[getter]
+    fn kind(&self) -> &'static str {
+        match self.inner {
+            Value::Known(_) => "known",
+            Value::Fitted(_) => "fitted",
+            Value::Within { .. } => "within",
+            Value::Measured { .. } => "measured",
+        }
+    }
+
+    /// The held, starting or measured value; None for within.
+    #[getter]
+    fn value(&self) -> Option<f64> {
+        match self.inner {
+            Value::Known(v) | Value::Fitted(v) | Value::Measured { value: v, .. } => Some(v),
+            Value::Within { .. } => None,
+        }
+    }
+
+    /// The starting value.
+    #[getter]
+    fn start(&self) -> Option<f64> {
+        match self.inner {
+            Value::Within { start, .. } => Some(start),
+            _ => self.value(),
+        }
+    }
+
+    /// The lower bound of a within value.
+    #[getter]
+    fn lower(&self) -> Option<f64> {
+        match self.inner {
+            Value::Within { lower, .. } => Some(lower),
+            _ => None,
+        }
+    }
+
+    /// The upper bound of a within value.
+    #[getter]
+    fn upper(&self) -> Option<f64> {
+        match self.inner {
+            Value::Within { upper, .. } => Some(upper),
+            _ => None,
+        }
+    }
+
+    /// The standard deviation of a measured value.
+    #[getter]
+    fn sd(&self) -> Option<f64> {
+        match self.inner {
+            Value::Measured { sd, .. } => Some(sd),
+            _ => None,
+        }
+    }
+
+    fn __repr__(&self) -> String {
+        format!("Value({:?})", self.inner)
+    }
+}
+
+/// A material's isotopes, each with an areal density in atoms/barn, and its
+/// temperature in K.
+#[pyclass(name = "Material", from_py_object)]
+#[derive(Clone)]
+struct PyMaterial {
+    inner: Material,
+}
+
+#[pymethods]
+impl PyMaterial {
+    /// library names the ENDF library the isotopes' resonance data were read
+    /// from, e.g. "endf8.1".
+    #[new]
+    #[pyo3(signature = (isotopes, temperature_k, library="endf8.1"))]
+    fn new(
+        isotopes: Vec<(PyResonanceData, PyValue)>,
+        temperature_k: PyValue,
+        library: &str,
+    ) -> PyResult<Self> {
+        Ok(Self {
+            inner: Material {
+                isotopes: isotopes
+                    .into_iter()
+                    .map(|(data, density)| ((*data.inner).clone(), density.inner))
+                    .collect(),
+                temperature_k: temperature_k.inner,
+                library: parse_library_name(library)?,
+                covariances: Vec::new(),
+            },
+        })
+    }
+
+    /// Each isotope with its areal density in atoms/barn.
+    #[getter]
+    fn isotopes(&self) -> Vec<(PyResonanceData, PyValue)> {
+        self.inner
+            .isotopes
+            .iter()
+            .map(|(data, density)| {
+                (
+                    PyResonanceData {
+                        inner: Arc::new(data.clone()),
+                    },
+                    PyValue { inner: *density },
+                )
+            })
+            .collect()
+    }
+
+    /// The temperature in K.
+    #[getter]
+    fn temperature_k(&self) -> PyValue {
+        PyValue {
+            inner: self.inner.temperature_k,
+        }
+    }
+
+    fn __repr__(&self) -> String {
+        format!(
+            "Material(isotopes={}, temperature_k={:?})",
+            self.inner.isotopes.len(),
+            self.inner.temperature_k
+        )
+    }
+}
+
+/// The counts of a set of pixels in the open-beam and sample runs, its
+/// background, and the material the beam crosses there.
+#[pyclass(name = "Region", from_py_object)]
+#[derive(Clone)]
+struct PyRegion {
+    inner: Region,
+}
+
+#[pymethods]
+impl PyRegion {
+    /// background is [b0, b1, b2] of b(E) = b0 + b1/sqrt(E) + b2*sqrt(E);
+    /// pixels is the region's area in pixels, finite and positive.
+    #[new]
+    #[pyo3(signature = (open_counts, sample_counts, pixels, background, gamma_transmission, material=None, open_live=None, sample_live=None))]
+    fn new(
+        open_counts: Vec<f64>,
+        sample_counts: Vec<f64>,
+        pixels: f64,
+        background: Vec<PyValue>,
+        gamma_transmission: PyValue,
+        material: Option<PyMaterial>,
+        open_live: Option<Vec<f64>>,
+        sample_live: Option<Vec<f64>>,
+    ) -> PyResult<Self> {
+        Ok(Self {
+            inner: Region {
+                open_counts,
+                sample_counts,
+                open_live,
+                sample_live,
+                background: value_trio(background)?,
+                pixels,
+                gamma_transmission: gamma_transmission.inner,
+                material: material.map(|material| material.inner),
+            },
+        })
+    }
+
+    /// Raw counts of the open-beam run, one per bin.
+    #[getter]
+    fn open_counts(&self) -> Vec<f64> {
+        self.inner.open_counts.clone()
+    }
+
+    /// Raw counts of the sample run, one per bin.
+    #[getter]
+    fn sample_counts(&self) -> Vec<f64> {
+        self.inner.sample_counts.clone()
+    }
+
+    /// The open-beam run's live fractions, in (0, 1], or None.
+    #[getter]
+    fn open_live(&self) -> Option<Vec<f64>> {
+        self.inner.open_live.clone()
+    }
+
+    /// The sample run's live fractions, in (0, 1], or None.
+    #[getter]
+    fn sample_live(&self) -> Option<Vec<f64>> {
+        self.inner.sample_live.clone()
+    }
+
+    /// The region's background terms [b0, b1, b2].
+    #[getter]
+    fn background(&self) -> Vec<PyValue> {
+        self.inner
+            .background
+            .iter()
+            .map(|value| PyValue { inner: *value })
+            .collect()
+    }
+
+    /// The region's area in pixels.
+    #[getter]
+    fn pixels(&self) -> f64 {
+        self.inner.pixels
+    }
+
+    /// The fraction of the time background that reaches the region's pixels in
+    /// the sample run, within 0-1.
+    #[getter]
+    fn gamma_transmission(&self) -> PyValue {
+        PyValue {
+            inner: self.inner.gamma_transmission,
+        }
+    }
+
+    /// The material the beam crosses, or None.
+    #[getter]
+    fn material(&self) -> Option<PyMaterial> {
+        self.inner
+            .material
+            .clone()
+            .map(|inner| PyMaterial { inner })
+    }
+
+    fn __repr__(&self) -> String {
+        format!(
+            "Region(pixels={}, bins={}, material={})",
+            self.inner.pixels,
+            self.inner.open_counts.len(),
+            self.inner.material.is_some()
+        )
+    }
+}
+
+/// An open-beam run and a sample run recorded in the same time bins, read in
+/// one or more regions of the detector.
+#[pyclass(name = "Measurement", from_py_object)]
+#[derive(Clone)]
+struct PyMeasurement {
+    inner: Measurement,
+}
+
+#[pymethods]
+impl PyMeasurement {
+    /// time_edges_us are the time-bin edges in microseconds; charge_ratio is
+    /// the sample run's proton charge over the open-beam run's.
+    #[new]
+    #[pyo3(signature = (time_edges_us, charge_ratio, normalization, regions, time_background=None))]
+    fn new(
+        time_edges_us: Vec<f64>,
+        charge_ratio: f64,
+        normalization: PyValue,
+        regions: Vec<PyRegion>,
+        time_background: Option<Vec<PyValue>>,
+    ) -> PyResult<Self> {
+        let time_background = match time_background {
+            Some(values) => value_trio(values)?,
+            None => NO_TIME_BACKGROUND,
+        };
+        Ok(Self {
+            inner: Measurement {
+                time_edges_us,
+                charge_ratio,
+                normalization: normalization.inner,
+                time_background,
+                regions: regions.into_iter().map(|region| region.inner).collect(),
+            },
+        })
+    }
+
+    /// Time-bin edges in microseconds.
+    #[getter]
+    fn time_edges_us(&self) -> Vec<f64> {
+        self.inner.time_edges_us.clone()
+    }
+
+    /// The sample run's proton charge over the open-beam run's.
+    #[getter]
+    fn charge_ratio(&self) -> f64 {
+        self.inner.charge_ratio
+    }
+
+    /// The sample run's normalization a.
+    #[getter]
+    fn normalization(&self) -> PyValue {
+        PyValue {
+            inner: self.inner.normalization,
+        }
+    }
+
+    /// The time background's [C, A, tau].
+    #[getter]
+    fn time_background(&self) -> Vec<PyValue> {
+        self.inner
+            .time_background
+            .iter()
+            .map(|value| PyValue { inner: *value })
+            .collect()
+    }
+
+    /// The regions, in the order given.
+    #[getter]
+    fn regions(&self) -> Vec<PyRegion> {
+        self.inner
+            .regions
+            .iter()
+            .map(|inner| PyRegion {
+                inner: inner.clone(),
+            })
+            .collect()
+    }
+
+    fn __repr__(&self) -> String {
+        format!(
+            "Measurement(bins={}, regions={})",
+            self.inner.time_edges_us.len().saturating_sub(1),
+            self.inner.regions.len()
+        )
+    }
+}
+
+/// The Ikeda-Carpenter pulse with alpha = alpha0*sqrt(E) + alpha1 and
+/// beta = beta0*sqrt(E) + beta1 in 1/microsecond, E in eV, a storage fraction
+/// R constant over energy_span_ev, and the proton pulse's triangle of FWHM h
+/// in microseconds, given by h^2.
+#[pyclass(name = "Pulse", from_py_object)]
+#[derive(Clone)]
+struct PyPulse {
+    inner: Pulse,
+}
+
+#[pymethods]
+impl PyPulse {
+    /// energy_span_ev is (low, high) in eV; n_tau is the number of samples
+    /// across the prompt core (at least 8).  line_span_ev gives the (low, high)
+    /// energies in eV of a calibration foil's resonances, or None to check
+    /// nothing.
+    #[new]
+    #[pyo3(signature = (alpha0, alpha1, beta0, beta1, r, fwhm_squared_us2, energy_span_ev, n_tau=600, line_span_ev=None))]
+    fn new(
+        alpha0: PyValue,
+        alpha1: PyValue,
+        beta0: PyValue,
+        beta1: PyValue,
+        r: PyValue,
+        fwhm_squared_us2: PyValue,
+        energy_span_ev: (f64, f64),
+        n_tau: usize,
+        line_span_ev: Option<(f64, f64)>,
+    ) -> Self {
+        Self {
+            inner: Pulse {
+                alpha: [alpha0.inner, alpha1.inner],
+                beta: [beta0.inner, beta1.inner],
+                r: r.inner,
+                fwhm_squared_us2: fwhm_squared_us2.inner,
+                energy_span_ev,
+                n_tau,
+                line_span_ev,
+                prior: None,
+            },
+        }
+    }
+
+    /// [alpha0, alpha1], in 1/(microsecond*sqrt(eV)) and 1/microsecond.
+    #[getter]
+    fn alpha(&self) -> Vec<PyValue> {
+        self.inner
+            .alpha
+            .iter()
+            .map(|value| PyValue { inner: *value })
+            .collect()
+    }
+
+    /// [beta0, beta1], in 1/(microsecond*sqrt(eV)) and 1/microsecond.
+    #[getter]
+    fn beta(&self) -> Vec<PyValue> {
+        self.inner
+            .beta
+            .iter()
+            .map(|value| PyValue { inner: *value })
+            .collect()
+    }
+
+    /// The storage fraction R.
+    #[getter]
+    fn r(&self) -> PyValue {
+        PyValue {
+            inner: self.inner.r,
+        }
+    }
+
+    /// h^2 in microseconds squared.
+    #[getter]
+    fn fwhm_squared_us2(&self) -> PyValue {
+        PyValue {
+            inner: self.inner.fwhm_squared_us2,
+        }
+    }
+
+    /// The (low, high) energies in eV the laws hold over.
+    #[getter]
+    fn energy_span_ev(&self) -> (f64, f64) {
+        self.inner.energy_span_ev
+    }
+
+    /// Samples across the prompt core.
+    #[getter]
+    fn n_tau(&self) -> usize {
+        self.inner.n_tau
+    }
+
+    fn __repr__(&self) -> String {
+        format!(
+            "Pulse(energy_span_ev={:?}, n_tau={})",
+            self.inner.energy_span_ev, self.inner.n_tau
+        )
+    }
+}
+
+/// A neutron of flight time u over flight_path_m (m) arrives at t0_us + u
+/// (microseconds) plus a delay drawn from pulse.
+#[pyclass(name = "Calibration", from_py_object)]
+#[derive(Clone)]
+struct PyCalibration {
+    inner: Calibration,
+}
+
+#[pymethods]
+impl PyCalibration {
+    #[new]
+    fn new(t0_us: PyValue, flight_path_m: PyValue, pulse: PyPulse) -> Self {
+        Self {
+            inner: Calibration {
+                t0_us: t0_us.inner,
+                flight_path_m: flight_path_m.inner,
+                pulse: pulse.inner,
+            },
+        }
+    }
+
+    /// The timing offset t0 in microseconds.
+    #[getter]
+    fn t0_us(&self) -> PyValue {
+        PyValue {
+            inner: self.inner.t0_us,
+        }
+    }
+
+    /// The flight path in m.
+    #[getter]
+    fn flight_path_m(&self) -> PyValue {
+        PyValue {
+            inner: self.inner.flight_path_m,
+        }
+    }
+
+    /// The pulse.
+    #[getter]
+    fn pulse(&self) -> PyPulse {
+        PyPulse {
+            inner: self.inner.pulse.clone(),
+        }
+    }
+
+    fn __repr__(&self) -> String {
+        format!(
+            "Calibration(t0_us={:?}, flight_path_m={:?})",
+            self.inner.t0_us, self.inner.flight_path_m
+        )
+    }
+}
+
+/// One region's fitted quantities and counts.
+#[pyclass(name = "RegionFit", from_py_object)]
+#[derive(Clone)]
+struct PyRegionFit {
+    densities: Vec<f64>,
+    temperature_k: Option<f64>,
+    background: [f64; 3],
+    gamma_transmission: f64,
+    beam_at_limit: bool,
+    predicted_open: Vec<f64>,
+    predicted_sample: Vec<f64>,
+    overdispersion: [Option<f64>; 2],
+    excluded_bins: Vec<usize>,
+}
+
+impl PyRegionFit {
+    fn wrap(region: &RegionFit) -> Self {
+        Self {
+            densities: region.densities.clone(),
+            temperature_k: region.temperature_k,
+            background: region.background,
+            gamma_transmission: region.gamma_transmission,
+            beam_at_limit: region.beam_at_limit,
+            predicted_open: region.predicted[0].clone(),
+            predicted_sample: region.predicted[1].clone(),
+            overdispersion: region.overdispersion,
+            excluded_bins: region.excluded_bins.clone(),
+        }
+    }
+}
+
+#[pymethods]
+impl PyRegionFit {
+    /// Areal density of each isotope of the region's material in atoms/barn.
+    #[getter]
+    fn densities(&self) -> Vec<f64> {
+        self.densities.clone()
+    }
+
+    /// The material's temperature in K, or None without a material.
+    #[getter]
+    fn temperature_k(&self) -> Option<f64> {
+        self.temperature_k
+    }
+
+    /// [b0, b1, b2].
+    #[getter]
+    fn background(&self) -> [f64; 3] {
+        self.background
+    }
+
+    /// The gamma transmission.
+    #[getter]
+    fn gamma_transmission(&self) -> f64 {
+        self.gamma_transmission
+    }
+
+    /// Whether the region's open-beam fit chose its richest beam.
+    #[getter]
+    fn beam_at_limit(&self) -> bool {
+        self.beam_at_limit
+    }
+
+    /// The counts the fit predicts in the open-beam run, one per bin.
+    #[getter]
+    fn predicted_open<'py>(&self, py: Python<'py>) -> Bound<'py, PyArray1<f64>> {
+        PyArray1::from_vec(py, self.predicted_open.clone())
+    }
+
+    /// The counts the fit predicts in the sample run, one per bin.
+    #[getter]
+    fn predicted_sample<'py>(&self, py: Python<'py>) -> Bound<'py, PyArray1<f64>> {
+        PyArray1::from_vec(py, self.predicted_sample.clone())
+    }
+
+    /// [open-beam, sample] overdispersion, each None when unmeasured.
+    #[getter]
+    fn overdispersion(&self) -> Vec<Option<f64>> {
+        self.overdispersion.to_vec()
+    }
+
+    /// Indices of the sample run's bins the material's library leaves out.
+    #[getter]
+    fn excluded_bins(&self) -> Vec<usize> {
+        self.excluded_bins.clone()
+    }
+
+    fn __repr__(&self) -> String {
+        format!(
+            "RegionFit(densities={:?}, temperature_k={:?})",
+            self.densities, self.temperature_k
+        )
+    }
+}
+
+/// The fitted quantities of every region, and the normalization, time
+/// background, timing offset, flight path and pulse numbers the regions share.
+#[pyclass(name = "CountsFit", from_py_object)]
+#[derive(Clone)]
+struct PyCountsFit {
+    inner: CountsFit,
+}
+
+#[pymethods]
+impl PyCountsFit {
+    /// Each region's fitted quantities and counts, in the order given.
+    #[getter]
+    fn regions(&self) -> Vec<PyRegionFit> {
+        self.inner.regions.iter().map(PyRegionFit::wrap).collect()
+    }
+
+    /// The normalization a.
+    #[getter]
+    fn normalization(&self) -> f64 {
+        self.inner.normalization
+    }
+
+    /// The timing offset t0 in microseconds.
+    #[getter]
+    fn t0_us(&self) -> f64 {
+        self.inner.t0_us
+    }
+
+    /// The flight path in m.
+    #[getter]
+    fn flight_path_m(&self) -> f64 {
+        self.inner.flight_path_m
+    }
+
+    /// The pulse's [alpha0, alpha1].
+    #[getter]
+    fn alpha(&self) -> [f64; 2] {
+        self.inner.alpha
+    }
+
+    /// The pulse's [beta0, beta1].
+    #[getter]
+    fn beta(&self) -> [f64; 2] {
+        self.inner.beta
+    }
+
+    /// The pulse's R.
+    #[getter]
+    fn r(&self) -> f64 {
+        self.inner.r
+    }
+
+    /// The square of the pulse's triangle FWHM, h^2 in microseconds squared.
+    #[getter]
+    fn fwhm_squared_us2(&self) -> f64 {
+        self.inner.fwhm_squared_us2
+    }
+
+    /// The time background's [C, A, tau].
+    #[getter]
+    fn time_background(&self) -> [f64; 3] {
+        self.inner.time_background
+    }
+
+    /// Covariance of the fitted quantities, or None when the fit did not
+    /// converge.
+    #[getter]
+    fn covariance<'py>(&self, py: Python<'py>) -> Option<Bound<'py, PyArray2<f64>>> {
+        self.inner
+            .covariance
+            .as_ref()
+            .map(|covariance| matrix_to_py(py, covariance))
+    }
+
+    /// The mean of the fitted quantities' Gaussian without their bounds.
+    #[getter]
+    fn unbounded_mean(&self) -> Option<Vec<f64>> {
+        self.inner
+            .unbounded
+            .as_ref()
+            .map(|unbounded| unbounded.mean.clone())
+    }
+
+    /// The covariance of the fitted quantities without their bounds.
+    #[getter]
+    fn unbounded_covariance<'py>(&self, py: Python<'py>) -> Option<Bound<'py, PyArray2<f64>>> {
+        self.inner
+            .unbounded
+            .as_ref()
+            .map(|unbounded| matrix_to_py(py, &unbounded.covariance))
+    }
+
+    /// Whether each fitted quantity, in the covariance's order, ended on one
+    /// of its bounds.
+    #[getter]
+    fn on_bound(&self) -> Vec<bool> {
+        self.inner.on_bound.clone()
+    }
+
+    /// Each run's half Poisson deviance over its overdispersion, summed over
+    /// both runs of every region.
+    #[getter]
+    fn deviance(&self) -> f64 {
+        self.inner.deviance
+    }
+
+    /// Whether the fit converged.
+    #[getter]
+    fn converged(&self) -> bool {
+        self.inner.converged
+    }
+
+    /// For each measured quantity, its pull; None when the fitter reports none.
+    #[getter]
+    fn measured_pulls(&self) -> Option<Vec<f64>> {
+        self.inner.measured_pulls.clone()
+    }
+
+    /// The pulse calibration's consistency test as (q, dof, p), or None.
+    #[getter]
+    fn pulse_consistency(&self) -> Option<(f64, usize, f64)> {
+        self.inner
+            .pulse_consistency
+            .map(|consistency| (consistency.q, consistency.dof, consistency.p))
+    }
+
+    /// Step, in microseconds, of the fit's grid.
+    #[getter]
+    fn step_us(&self) -> f64 {
+        self.inner.step_us
+    }
+
+    /// Number of points of that grid.
+    #[getter]
+    fn points(&self) -> usize {
+        self.inner.points
+    }
+
+    /// How many times the grid was halved to reach its final step.
+    #[getter]
+    fn halvings(&self) -> usize {
+        self.inner.halvings
+    }
+
+    fn __repr__(&self) -> String {
+        format!(
+            "CountsFit(regions={}, deviance={:.6}, converged={})",
+            self.inner.regions.len(),
+            self.inner.deviance,
+            self.inner.converged
+        )
+    }
+}
+
+/// What the pixels of a patch that are not excluded lie behind.
+#[pyclass(name = "Patch", from_py_object)]
+#[derive(Clone, Copy)]
+struct PyPatch {
+    kind: Patch,
+}
+
+#[pymethods]
+impl PyPatch {
+    /// "sample" | "mixed" | "outside".
+    #[getter]
+    fn kind(&self) -> &'static str {
+        match self.kind {
+            Patch::Sample => "sample",
+            Patch::Mixed => "mixed",
+            Patch::Outside => "outside",
+        }
+    }
+
+    fn __repr__(&self) -> String {
+        match self.kind {
+            Patch::Sample => "Patch(sample)".to_string(),
+            Patch::Mixed => "Patch(mixed)".to_string(),
+            Patch::Outside => "Patch(outside)".to_string(),
+        }
+    }
+}
+
+#[derive(Clone)]
+struct MapData {
+    time_edges_us: Vec<f64>,
+    charge_ratio: f64,
+    normalization: Value,
+    open_counts: ndarray::Array3<f64>,
+    sample_counts: ndarray::Array3<f64>,
+    open_live: Option<Vec<f64>>,
+    sample_live: Option<Vec<f64>>,
+    excluded: ndarray::Array2<bool>,
+    sample: ndarray::Array2<bool>,
+    empty: ndarray::Array2<bool>,
+    binning: usize,
+    material: Material,
+    background: [Value; 3],
+    empty_background: [Value; 3],
+}
+
+impl MapData {
+    fn measurement(&self) -> MapMeasurement<'_> {
+        MapMeasurement {
+            time_edges_us: self.time_edges_us.clone(),
+            charge_ratio: self.charge_ratio,
+            normalization: self.normalization,
+            open_counts: self.open_counts.view(),
+            sample_counts: self.sample_counts.view(),
+            open_live: self.open_live.clone(),
+            sample_live: self.sample_live.clone(),
+            excluded: self.excluded.view(),
+            sample: self.sample.view(),
+            empty: self.empty.view(),
+            binning: self.binning,
+            material: self.material.clone(),
+            background: self.background,
+            empty_background: self.empty_background,
+        }
+    }
+}
+
+/// The counts of every pixel of an open-beam run and a sample run recorded in
+/// the same time bins, which pixels to fit, and the material behind the sample.
+#[pyclass(name = "MapMeasurement", from_py_object)]
+#[derive(Clone)]
+struct PyMapMeasurement {
+    inner: MapData,
+}
+
+#[pymethods]
+impl PyMapMeasurement {
+    /// open_counts and sample_counts have shape (time bin, row, column);
+    /// excluded, sample and empty have shape (row, column).
+    #[new]
+    #[pyo3(signature = (time_edges_us, open_counts, sample_counts, excluded, sample, empty, material, charge_ratio, normalization, background, binning=1, empty_background=None, open_live=None, sample_live=None))]
+    fn new(
+        time_edges_us: Vec<f64>,
+        open_counts: PyReadonlyArray3<f64>,
+        sample_counts: PyReadonlyArray3<f64>,
+        excluded: PyReadonlyArray2<bool>,
+        sample: PyReadonlyArray2<bool>,
+        empty: PyReadonlyArray2<bool>,
+        material: PyMaterial,
+        charge_ratio: f64,
+        normalization: PyValue,
+        background: Vec<PyValue>,
+        binning: usize,
+        empty_background: Option<Vec<PyValue>>,
+        open_live: Option<Vec<f64>>,
+        sample_live: Option<Vec<f64>>,
+    ) -> PyResult<Self> {
+        let empty_background = match empty_background {
+            Some(values) => value_trio(values)?,
+            None => [Value::Known(0.0); 3],
+        };
+        Ok(Self {
+            inner: MapData {
+                time_edges_us,
+                charge_ratio,
+                normalization: normalization.inner,
+                open_counts: open_counts.as_array().to_owned(),
+                sample_counts: sample_counts.as_array().to_owned(),
+                open_live,
+                sample_live,
+                excluded: excluded.as_array().to_owned(),
+                sample: sample.as_array().to_owned(),
+                empty: empty.as_array().to_owned(),
+                binning,
+                material: material.inner,
+                background: value_trio(background)?,
+                empty_background,
+            },
+        })
+    }
+
+    /// Each patch's kind, in (patch row, patch column).
+    fn patches(&self) -> PyResult<Vec<Vec<PyPatch>>> {
+        let measurement = self.inner.measurement();
+        let patches = measurement.patches().map_err(counts_error)?;
+        Ok(patch_rows(&patches))
+    }
+
+    /// Time-bin edges in microseconds.
+    #[getter]
+    fn time_edges_us(&self) -> Vec<f64> {
+        self.inner.time_edges_us.clone()
+    }
+
+    /// The sample run's proton charge over the open-beam run's.
+    #[getter]
+    fn charge_ratio(&self) -> f64 {
+        self.inner.charge_ratio
+    }
+
+    /// The side of a square patch, in pixels.
+    #[getter]
+    fn binning(&self) -> usize {
+        self.inner.binning
+    }
+
+    fn __repr__(&self) -> String {
+        let (bins, height, width) = self.inner.open_counts.dim();
+        format!(
+            "MapMeasurement(bins={bins}, pixels={height}x{width}, binning={})",
+            self.inner.binning
+        )
+    }
+}
+
+fn patch_rows(patches: &ndarray::Array2<Patch>) -> Vec<Vec<PyPatch>> {
+    patches
+        .outer_iter()
+        .map(|row| row.iter().map(|&kind| PyPatch { kind }).collect())
+        .collect()
+}
+
+/// The fitted map, one value per patch.
+#[pyclass(name = "CountsMap", from_py_object)]
+#[derive(Clone)]
+struct PyCountsMap {
+    patches: ndarray::Array2<Patch>,
+    fits: ndarray::Array2<Option<RegionFit>>,
+    failed: ndarray::Array2<Option<String>>,
+    empty: Option<RegionFit>,
+    densities: Vec<ndarray::Array2<f64>>,
+    density_sd: Vec<ndarray::Array2<f64>>,
+    temperature_k: ndarray::Array2<f64>,
+    temperature_sd_k: ndarray::Array2<f64>,
+    overdispersion: [ndarray::Array2<f64>; 2],
+    trusted: ndarray::Array2<bool>,
+    normalization: f64,
+    t0_us: f64,
+    flight_path_m: f64,
+    alpha: [f64; 2],
+    beta: [f64; 2],
+    r: f64,
+    fwhm_squared_us2: f64,
+    shared: Vec<String>,
+    shared_covariance: Option<FlatMatrix>,
+    measured_pulls: Option<Vec<f64>>,
+    pulse_consistency: Option<(f64, usize, f64)>,
+    deviance: f64,
+    converged: bool,
+    unconverged: Option<String>,
+    steps: usize,
+}
+
+impl PyCountsMap {
+    fn wrap(map: &CountsMap<'_>) -> Self {
+        Self {
+            patches: map.patches.clone(),
+            fits: map.fits.clone(),
+            failed: map.failed.clone(),
+            empty: map.empty.clone(),
+            densities: map.densities.clone(),
+            density_sd: map.density_sd.clone(),
+            temperature_k: map.temperature_k.clone(),
+            temperature_sd_k: map.temperature_sd_k.clone(),
+            overdispersion: map.overdispersion.clone(),
+            trusted: map.trusted.clone(),
+            normalization: map.normalization,
+            t0_us: map.t0_us,
+            flight_path_m: map.flight_path_m,
+            alpha: map.alpha,
+            beta: map.beta,
+            r: map.r,
+            fwhm_squared_us2: map.fwhm_squared_us2,
+            shared: map.shared.iter().map(|name| name.to_string()).collect(),
+            shared_covariance: map.shared_covariance.clone(),
+            measured_pulls: map.measured_pulls.clone(),
+            pulse_consistency: map
+                .pulse_consistency
+                .map(|consistency| (consistency.q, consistency.dof, consistency.p)),
+            deviance: map.deviance,
+            converged: map.converged,
+            unconverged: map.unconverged.clone(),
+            steps: map.steps,
+        }
+    }
+}
+
+#[pymethods]
+impl PyCountsMap {
+    /// Each patch's kind, in (patch row, patch column).
+    #[getter]
+    fn patches(&self) -> Vec<Vec<PyPatch>> {
+        patch_rows(&self.patches)
+    }
+
+    /// Each fitted patch's fit, in (patch row, patch column).
+    #[getter]
+    fn fits(&self) -> Vec<Vec<Option<PyRegionFit>>> {
+        self.fits
+            .outer_iter()
+            .map(|row| {
+                row.iter()
+                    .map(|fit| fit.as_ref().map(PyRegionFit::wrap))
+                    .collect()
+            })
+            .collect()
+    }
+
+    /// Why a patch left out of the shared quantities failed, or None.
+    #[getter]
+    fn failed(&self) -> Vec<Vec<Option<String>>> {
+        self.failed
+            .outer_iter()
+            .map(|row| row.iter().cloned().collect())
+            .collect()
+    }
+
+    /// The empty pixels' fit, or None.
+    #[getter]
+    fn empty(&self) -> Option<PyRegionFit> {
+        self.empty.as_ref().map(PyRegionFit::wrap)
+    }
+
+    /// Each isotope's areal density in atoms/barn, one map per isotope.
+    #[getter]
+    fn densities<'py>(&self, py: Python<'py>) -> Vec<Bound<'py, PyArray2<f64>>> {
+        self.densities
+            .iter()
+            .map(|density| PyArray2::from_owned_array(py, density.clone()))
+            .collect()
+    }
+
+    /// Standard deviation of each density, one map per isotope.
+    #[getter]
+    fn density_sd<'py>(&self, py: Python<'py>) -> Vec<Bound<'py, PyArray2<f64>>> {
+        self.density_sd
+            .iter()
+            .map(|sd| PyArray2::from_owned_array(py, sd.clone()))
+            .collect()
+    }
+
+    /// The temperature in K.
+    #[getter]
+    fn temperature_k<'py>(&self, py: Python<'py>) -> Bound<'py, PyArray2<f64>> {
+        PyArray2::from_owned_array(py, self.temperature_k.clone())
+    }
+
+    /// Standard deviation of the temperature in K.
+    #[getter]
+    fn temperature_sd_k<'py>(&self, py: Python<'py>) -> Bound<'py, PyArray2<f64>> {
+        PyArray2::from_owned_array(py, self.temperature_sd_k.clone())
+    }
+
+    /// [open-beam, sample] overdispersion maps.
+    #[getter]
+    fn overdispersion<'py>(&self, py: Python<'py>) -> Vec<Bound<'py, PyArray2<f64>>> {
+        self.overdispersion
+            .iter()
+            .map(|map| PyArray2::from_owned_array(py, map.clone()))
+            .collect()
+    }
+
+    /// Numerical convergence and uncertainty status, not physical validation.
+    #[getter]
+    fn trusted<'py>(&self, py: Python<'py>) -> Bound<'py, PyArray2<bool>> {
+        PyArray2::from_owned_array(py, self.trusted.clone())
+    }
+
+    /// The normalization a.
+    #[getter]
+    fn normalization(&self) -> f64 {
+        self.normalization
+    }
+
+    /// The timing offset t0 in microseconds.
+    #[getter]
+    fn t0_us(&self) -> f64 {
+        self.t0_us
+    }
+
+    /// The flight path in m.
+    #[getter]
+    fn flight_path_m(&self) -> f64 {
+        self.flight_path_m
+    }
+
+    /// The pulse's [alpha0, alpha1].
+    #[getter]
+    fn alpha(&self) -> [f64; 2] {
+        self.alpha
+    }
+
+    /// The pulse's [beta0, beta1].
+    #[getter]
+    fn beta(&self) -> [f64; 2] {
+        self.beta
+    }
+
+    /// The pulse's R.
+    #[getter]
+    fn r(&self) -> f64 {
+        self.r
+    }
+
+    /// The square of the pulse's triangle FWHM, h^2 in microseconds squared.
+    #[getter]
+    fn fwhm_squared_us2(&self) -> f64 {
+        self.fwhm_squared_us2
+    }
+
+    /// The fitted shared quantities, in order.
+    #[getter]
+    fn shared(&self) -> Vec<String> {
+        self.shared.clone()
+    }
+
+    /// Covariance of the shared quantities, or None.
+    #[getter]
+    fn shared_covariance<'py>(&self, py: Python<'py>) -> Option<Bound<'py, PyArray2<f64>>> {
+        self.shared_covariance
+            .as_ref()
+            .map(|covariance| matrix_to_py(py, covariance))
+    }
+
+    /// For each measured shared quantity, its pull.
+    #[getter]
+    fn measured_pulls(&self) -> Option<Vec<f64>> {
+        self.measured_pulls.clone()
+    }
+
+    /// The pulse calibration's consistency test as (q, dof, p), or None.
+    #[getter]
+    fn pulse_consistency(&self) -> Option<(f64, usize, f64)> {
+        self.pulse_consistency
+    }
+
+    /// Each fit's half Poisson deviance over its overdispersion.
+    #[getter]
+    fn deviance(&self) -> f64 {
+        self.deviance
+    }
+
+    /// Whether the map converged.
+    #[getter]
+    fn converged(&self) -> bool {
+        self.converged
+    }
+
+    /// Why the map did not converge, or None.
+    #[getter]
+    fn unconverged(&self) -> Option<String> {
+        self.unconverged.clone()
+    }
+
+    /// Newton steps tried on the shared quantities.
+    #[getter]
+    fn steps(&self) -> usize {
+        self.steps
+    }
+
+    /// The number of fitted patches.
+    #[getter]
+    fn n_fitted(&self) -> usize {
+        self.fits.iter().filter(|fit| fit.is_some()).count()
+    }
+
+    fn __repr__(&self) -> String {
+        format!(
+            "CountsMap(patches={}x{}, fitted={}, converged={})",
+            self.patches.nrows(),
+            self.patches.ncols(),
+            self.n_fitted(),
+            self.converged
+        )
+    }
+}
+
+/// Fit the areal densities and temperatures of the measurement's regions to
+/// the raw counts of both runs.
+#[pyfunction]
+fn fit_counts(
+    py: Python<'_>,
+    measurement: PyRef<'_, PyMeasurement>,
+    calibration: PyRef<'_, PyCalibration>,
+) -> PyResult<PyCountsFit> {
+    let measurement = measurement.inner.clone();
+    let calibration = calibration.inner.clone();
+    let fit = py
+        .detach(move || nereids_pipeline::counts_fit::fit_counts(&measurement, &calibration))
+        .map_err(counts_error)?;
+    Ok(PyCountsFit { inner: fit })
+}
+
+/// Fit a material over patches of the map's pixels to the raw counts of both
+/// runs.
+#[pyfunction]
+fn fit_map(
+    py: Python<'_>,
+    map: PyRef<'_, PyMapMeasurement>,
+    calibration: PyRef<'_, PyCalibration>,
+) -> PyResult<PyCountsMap> {
+    let data = map.inner.clone();
+    let calibration = calibration.inner.clone();
+    py.detach(move || {
+        let measurement = data.measurement();
+        nereids_pipeline::counts_map::fit_map(&measurement, &calibration)
+            .map(|fit| PyCountsMap::wrap(&fit))
+    })
+    .map_err(counts_error)
+}
+
 /// NEREIDS Python module.
 #[pymodule]
 fn nereids(m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_class::<PyResonanceData>()?;
-    m.add_class::<PyFitResult>()?;
+    m.add_class::<PyIsotopeGroup>()?;
     m.add_class::<PyTabulatedResolution>()?;
     m.add_class::<PyEnergyLaw>()?;
     m.add_class::<PyIkedaCarpenter>()?;
-    m.add_class::<PyResolutionCalibration>()?;
-    m.add_class::<PyJointFitResult>()?;
-    m.add_class::<PySpatialResult>()?;
-    m.add_class::<PyTraceDetectabilityReport>()?;
+    m.add_class::<PyNexusMetadata>()?;
+    m.add_class::<PyNexusData>()?;
+    m.add_class::<PyRunHealth>()?;
+    m.add_class::<PyRunLog>()?;
+    m.add_class::<PyBankSpectrum>()?;
+    m.add_class::<PyValue>()?;
+    m.add_class::<PyMaterial>()?;
+    m.add_class::<PyRegion>()?;
+    m.add_class::<PyMeasurement>()?;
+    m.add_class::<PyPulse>()?;
+    m.add_class::<PyCalibration>()?;
+    m.add_class::<PyRegionFit>()?;
+    m.add_class::<PyCountsFit>()?;
+    m.add_class::<PyPatch>()?;
+    m.add_class::<PyMapMeasurement>()?;
+    m.add_class::<PyCountsMap>()?;
+    m.add(
+        "NO_TIME_BACKGROUND",
+        (
+            PyValue {
+                inner: NO_TIME_BACKGROUND[0],
+            },
+            PyValue {
+                inner: NO_TIME_BACKGROUND[1],
+            },
+            PyValue {
+                inner: NO_TIME_BACKGROUND[2],
+            },
+        ),
+    )?;
     m.add_function(wrap_pyfunction!(cross_sections, m)?)?;
     m.add_function(wrap_pyfunction!(forward_model, m)?)?;
-    m.add_function(wrap_pyfunction!(calibrate_resolution, m)?)?;
-    m.add_function(wrap_pyfunction!(fit_with_calibrant, m)?)?;
     m.add_function(wrap_pyfunction!(tof_to_energy, m)?)?;
     m.add_function(wrap_pyfunction!(energy_to_tof, m)?)?;
     m.add_function(wrap_pyfunction!(load_endf, m)?)?;
@@ -4560,2060 +4240,26 @@ fn nereids(m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_function(wrap_pyfunction!(load_tiff_stack, m)?)?;
     m.add_function(wrap_pyfunction!(load_tiff_folder, m)?)?;
     m.add_function(wrap_pyfunction!(read_tof_sidecar, m)?)?;
-    m.add_class::<PyNexusMetadata>()?;
-    m.add_class::<PyNexusData>()?;
-    m.add_class::<PyRunHealth>()?;
     m.add_function(wrap_pyfunction!(probe_nexus, m)?)?;
     m.add_function(wrap_pyfunction!(run_health, m)?)?;
     m.add_function(wrap_pyfunction!(load_nexus_histogram, m)?)?;
     m.add_function(wrap_pyfunction!(load_nexus_events, m)?)?;
-    m.add_class::<PyRunLog>()?;
-    m.add_class::<PyBankSpectrum>()?;
     m.add_function(wrap_pyfunction!(read_run_log, m)?)?;
     m.add_function(wrap_pyfunction!(intervals_where, m)?)?;
     m.add_function(wrap_pyfunction!(intervals_intersect, m)?)?;
     m.add_function(wrap_pyfunction!(load_nexus_bank_spectrum, m)?)?;
-    m.add_function(wrap_pyfunction!(normalize, m)?)?;
     m.add_function(wrap_pyfunction!(tof_to_energy_centers, m)?)?;
     m.add_function(wrap_pyfunction!(py_element_symbol, m)?)?;
     m.add_function(wrap_pyfunction!(py_element_name, m)?)?;
     m.add_function(wrap_pyfunction!(py_parse_isotope_str, m)?)?;
     m.add_function(wrap_pyfunction!(py_natural_abundance, m)?)?;
     m.add_function(wrap_pyfunction!(py_natural_isotopes, m)?)?;
-    m.add_function(wrap_pyfunction!(py_trace_detectability, m)?)?;
-    m.add_function(wrap_pyfunction!(py_trace_detectability_survey, m)?)?;
     m.add_function(wrap_pyfunction!(precompute_cross_sections, m)?)?;
     m.add_function(wrap_pyfunction!(detect_dead_pixels, m)?)?;
     m.add_function(wrap_pyfunction!(detect_hot_pixels, m)?)?;
     m.add_function(wrap_pyfunction!(detect_dead_pixels_chunked, m)?)?;
     m.add_function(wrap_pyfunction!(detect_bad_pixels, m)?)?;
-    m.add_function(wrap_pyfunction!(py_calibrate_energy, m)?)?;
-    m.add_class::<PyCalibrationResult>()?;
-    // Phase 5: Typed API
-    m.add_class::<PyInputData>()?;
-    m.add_class::<PyIsotopeGroup>()?;
-    m.add_function(wrap_pyfunction!(py_from_counts, m)?)?;
-    m.add_function(wrap_pyfunction!(py_from_counts_with_nuisance, m)?)?;
-    m.add_function(wrap_pyfunction!(py_from_transmission, m)?)?;
-    m.add_function(wrap_pyfunction!(py_spatial_map_typed, m)?)?;
-    m.add_function(wrap_pyfunction!(py_fit_spectrum_typed, m)?)?;
-    m.add_function(wrap_pyfunction!(py_fit_counts_spectrum_typed, m)?)?;
-    m.add_class::<PyModelJacobianResult>()?;
-    m.add_function(wrap_pyfunction!(py_compute_model_jacobian, m)?)?;
+    m.add_function(wrap_pyfunction!(fit_counts, m)?)?;
+    m.add_function(wrap_pyfunction!(fit_map, m)?)?;
     Ok(())
-}
-
-// ── Phase 5: Typed Python API ────────────────────────────────────────────
-
-use nereids_pipeline::pipeline::UnifiedFitConfig;
-use nereids_pipeline::spatial::{InputData3D, spatial_map_typed};
-
-/// Opaque wrapper around InputData3D for Python.
-///
-/// Created via `from_counts()`, `from_counts_with_nuisance()`, or `from_transmission()`.
-/// Passed to `spatial_map_typed()`.
-#[pyclass(name = "InputData")]
-struct PyInputData {
-    /// We store owned 3D arrays (ndarray::Array3) so the data lives
-    /// as long as the Python object.
-    kind: String, // "counts" or "transmission"
-    data_a: ndarray::Array3<f64>,
-    data_b: ndarray::Array3<f64>,
-    data_c: Option<ndarray::Array3<f64>>,
-}
-
-#[pymethods]
-impl PyInputData {
-    fn __repr__(&self) -> String {
-        let s = self.data_a.shape();
-        format!(
-            "InputData(kind={}, shape=({}, {}, {}))",
-            self.kind, s[0], s[1], s[2]
-        )
-    }
-
-    #[getter]
-    fn kind(&self) -> &str {
-        &self.kind
-    }
-
-    #[getter]
-    fn shape(&self) -> (usize, usize, usize) {
-        let s = self.data_a.shape();
-        (s[0], s[1], s[2])
-    }
-}
-
-/// Create InputData from raw detector counts and open beam.
-///
-/// The fitting engine will use Poisson KL by default (statistically
-/// optimal for count data).
-///
-/// **Note:** Both arrays must have dtype `np.float64`. Neutron event histograms
-/// are naturally `int64`; call `.astype(np.float64)` before passing them here.
-///
-/// Args:
-///     sample_counts: 3D float64 array (n_energies, height, width) of sample counts.
-///     open_beam_counts: 3D float64 array (n_energies, height, width) of open beam counts.
-///
-/// Returns:
-///     InputData object to pass to spatial_map_typed().
-#[pyfunction]
-#[pyo3(name = "from_counts")]
-fn py_from_counts<'py>(
-    sample_counts: PyReadonlyArray3<'py, f64>,
-    open_beam_counts: PyReadonlyArray3<'py, f64>,
-) -> PyResult<PyInputData> {
-    let sample = sample_counts.as_array().to_owned();
-    let ob = open_beam_counts.as_array().to_owned();
-    if sample.shape() != ob.shape() {
-        return Err(pyo3::exceptions::PyValueError::new_err(format!(
-            "sample shape {:?} != open_beam shape {:?}",
-            sample.shape(),
-            ob.shape()
-        )));
-    }
-    if sample.shape()[0] == 0 {
-        return Err(pyo3::exceptions::PyValueError::new_err(
-            "spectral axis (dimension 0) must have at least 1 element",
-        ));
-    }
-    Ok(PyInputData {
-        kind: "counts".into(),
-        data_a: sample,
-        data_b: ob,
-        data_c: None,
-    })
-}
-
-/// Legacy raw-count nuisance wrapper retained for compatibility.
-///
-/// Production fitting rejects a nonzero ``background`` because this legacy
-/// array is not connected to the physical two-arm likelihood. New code should
-/// use ``from_counts`` and treat detector background as a separate measured
-/// term.
-#[pyfunction]
-#[pyo3(name = "from_counts_with_nuisance")]
-fn py_from_counts_with_nuisance<'py>(
-    sample_counts: PyReadonlyArray3<'py, f64>,
-    flux: PyReadonlyArray3<'py, f64>,
-    background: PyReadonlyArray3<'py, f64>,
-) -> PyResult<PyInputData> {
-    let sample = sample_counts.as_array().to_owned();
-    let flux_arr = flux.as_array().to_owned();
-    let background_arr = background.as_array().to_owned();
-    if sample.shape() != flux_arr.shape() {
-        return Err(pyo3::exceptions::PyValueError::new_err(format!(
-            "sample shape {:?} != flux shape {:?}",
-            sample.shape(),
-            flux_arr.shape()
-        )));
-    }
-    if sample.shape() != background_arr.shape() {
-        return Err(pyo3::exceptions::PyValueError::new_err(format!(
-            "sample shape {:?} != background shape {:?}",
-            sample.shape(),
-            background_arr.shape()
-        )));
-    }
-    if sample.shape()[0] == 0 {
-        return Err(pyo3::exceptions::PyValueError::new_err(
-            "spectral axis (dimension 0) must have at least 1 element",
-        ));
-    }
-    Ok(PyInputData {
-        kind: "counts_with_nuisance".into(),
-        data_a: sample,
-        data_b: flux_arr,
-        data_c: Some(background_arr),
-    })
-}
-
-/// Create InputData from normalized transmission and uncertainty.
-///
-/// The fitting engine uses LM. A Poisson/KL count likelihood is rejected for
-/// normalized transmission because the separate count arms are no longer
-/// available.
-///
-/// **Note:** Both arrays must have dtype `np.float64`. Call `.astype(np.float64)`
-/// if your arrays are a different type.
-///
-/// Args:
-///     transmission: 3D float64 array (n_energies, height, width) of transmission values.
-///     uncertainty: 3D float64 array (n_energies, height, width) of uncertainties.
-///
-/// Returns:
-///     InputData object to pass to spatial_map_typed().
-#[pyfunction]
-#[pyo3(name = "from_transmission")]
-fn py_from_transmission<'py>(
-    transmission: PyReadonlyArray3<'py, f64>,
-    uncertainty: PyReadonlyArray3<'py, f64>,
-) -> PyResult<PyInputData> {
-    let t = transmission.as_array().to_owned();
-    let u = uncertainty.as_array().to_owned();
-    if t.shape() != u.shape() {
-        return Err(pyo3::exceptions::PyValueError::new_err(format!(
-            "transmission shape {:?} != uncertainty shape {:?}",
-            t.shape(),
-            u.shape()
-        )));
-    }
-    if t.shape()[0] == 0 {
-        return Err(pyo3::exceptions::PyValueError::new_err(
-            "spectral axis (dimension 0) must have at least 1 element",
-        ));
-    }
-    Ok(PyInputData {
-        kind: "transmission".into(),
-        data_a: t,
-        data_b: u,
-        data_c: None,
-    })
-}
-
-/// Parse a solver string into SolverConfig, resolving "auto" eagerly.
-fn parse_solver_config(
-    solver: &str,
-    is_counts: bool,
-    max_iter: usize,
-) -> PyResult<nereids_pipeline::pipeline::SolverConfig> {
-    match solver {
-        "auto" => {
-            if is_counts {
-                Ok(nereids_pipeline::pipeline::SolverConfig::PoissonKL(
-                    nereids_fitting::poisson::PoissonConfig {
-                        max_iter,
-                        ..Default::default()
-                    },
-                ))
-            } else {
-                Ok(
-                    nereids_pipeline::pipeline::SolverConfig::LevenbergMarquardt(
-                        nereids_fitting::lm::LmConfig {
-                            max_iter,
-                            ..Default::default()
-                        },
-                    ),
-                )
-            }
-        }
-        "lm" if is_counts => Err(pyo3::exceptions::PyValueError::new_err(
-            "raw sample/open-beam counts cannot use solver='lm': dividing the \
-             count arms into transmission loses count statistics; use \
-             solver='auto' or solver='kl'",
-        )),
-        "lm" => Ok(
-            nereids_pipeline::pipeline::SolverConfig::LevenbergMarquardt(
-                nereids_fitting::lm::LmConfig {
-                    max_iter,
-                    ..Default::default()
-                },
-            ),
-        ),
-        // Counts-KL dispatch.  "kl" is the canonical name;  "poisson" and
-        // "joint_poisson" are compatibility aliases that resolve to the
-        // same path — the joint-Poisson / conditional-binomial-deviance
-        // implementation IS the KL solver.  No runtime deprecation
-        // warning is emitted; the aliases simply accept the older name
-        // strings so existing user scripts keep working.
-        "kl" | "poisson" | "joint_poisson" if !is_counts => {
-            Err(pyo3::exceptions::PyValueError::new_err(
-                "normalized transmission cannot use a Poisson/KL count \
-                 likelihood because the separate open/sample count arms are \
-                 unavailable; use solver='auto' or solver='lm'",
-            ))
-        }
-        "kl" | "poisson" | "joint_poisson" => {
-            Ok(nereids_pipeline::pipeline::SolverConfig::PoissonKL(
-                nereids_fitting::poisson::PoissonConfig {
-                    max_iter,
-                    ..Default::default()
-                },
-            ))
-        }
-        other => Err(pyo3::exceptions::PyValueError::new_err(format!(
-            "Unknown solver: '{other}'. Use 'auto', 'lm', or 'kl'."
-        ))),
-    }
-}
-
-/// Validate the SAMMY TZERO kwargs before they reach
-/// `UnifiedFitConfig::with_energy_scale`.  Shared across
-/// `py_spatial_map_typed`, `py_fit_spectrum_typed`, and
-/// `py_fit_counts_spectrum_typed`.
-///
-/// Issue #458: without these checks, NaN /
-/// Inf / non-positive values flowed into
-/// `EnergyScaleTransmissionModel::corrected_energies`, which divides
-/// by TOF values derived from `flight_path_m`.  Garbage inputs yielded
-/// NaN grids and confusing `PyRuntimeError`s from the solver rather
-/// than an actionable `PyValueError` at the binding boundary.
-fn validate_energy_scale_params(
-    t0_init_us: f64,
-    l_scale_init: f64,
-    energy_scale_flight_path_m: f64,
-) -> PyResult<()> {
-    if !t0_init_us.is_finite() {
-        return Err(pyo3::exceptions::PyValueError::new_err(format!(
-            "t0_init_us must be finite when fit_energy_scale=True, got {t0_init_us}"
-        )));
-    }
-    if !l_scale_init.is_finite() || l_scale_init <= 0.0 {
-        // Must be positive: l_scale is a multiplicative flight-path scale, and a
-        // non-positive value drives the corrected energies to 0 / non-finite,
-        // which the true-σ energy-scale model (issue #608) cannot evaluate
-        // (reich_moore requires positive energy).  Mirrors the flight_path check
-        // below.
-        return Err(pyo3::exceptions::PyValueError::new_err(format!(
-            "l_scale_init must be finite and positive when fit_energy_scale=True, \
-             got {l_scale_init}"
-        )));
-    }
-    if !energy_scale_flight_path_m.is_finite() || energy_scale_flight_path_m <= 0.0 {
-        return Err(pyo3::exceptions::PyValueError::new_err(format!(
-            "energy_scale_flight_path_m must be finite and positive when \
-             fit_energy_scale=True, got {energy_scale_flight_path_m}"
-        )));
-    }
-    Ok(())
-}
-
-/// Parse the optional `tzero_jacobian` Python kwarg into the Rust
-/// `EnergyScaleJacobianMethod` enum.
-///
-/// Recognised values (case-insensitive):
-/// - `"fd2"`, `"finite-difference"`, `"finite_difference"` → FiniteDifference.
-/// - `"partial-gal"`, `"partial_gal"`                      → PartialGal.
-///
-/// The legacy `"chain"` / `"frozen-r"` FrozenResolutionChainRule method was
-/// removed in #608 (it interpolated a precomputed σ on the data grid,
-/// incompatible with the true-σ aux-grid `evaluate`); use `"partial-gal"`.
-///
-/// `None` returns `Ok(None)`, deferring to the Rust model's
-/// `EnergyScaleJacobianMethod::from_env`: the `NEREIDS_TZERO_JACOBIAN`
-/// env var when set, otherwise `PartialGal` (default since issue #489).
-fn parse_tzero_jacobian(
-    s: Option<&str>,
-) -> PyResult<Option<nereids_fitting::transmission_model::EnergyScaleJacobianMethod>> {
-    use nereids_fitting::transmission_model::EnergyScaleJacobianMethod;
-    let Some(name) = s else {
-        return Ok(None);
-    };
-    let m = if name.eq_ignore_ascii_case("fd2")
-        || name.eq_ignore_ascii_case("finite-difference")
-        || name.eq_ignore_ascii_case("finite_difference")
-    {
-        EnergyScaleJacobianMethod::FiniteDifference
-    } else if name.eq_ignore_ascii_case("partial-gal") || name.eq_ignore_ascii_case("partial_gal") {
-        EnergyScaleJacobianMethod::PartialGal
-    } else {
-        return Err(pyo3::exceptions::PyValueError::new_err(format!(
-            "tzero_jacobian must be one of: \
-             \"fd2\", \"finite-difference\", \"finite_difference\"; \
-             \"partial-gal\", \"partial_gal\"; got {name:?}"
-        )));
-    };
-    Ok(Some(m))
-}
-
-/// Build `UnifiedFitConfig` from groups, returning the config and the number of
-/// density parameters (one per group) for initial_densities default.
-fn build_config_from_groups(
-    groups: &[PyIsotopeGroup],
-    energies_vec: Vec<f64>,
-    temperature_k: f64,
-    res_fn: Option<ResolutionFunction>,
-    initial_densities: Option<Vec<f64>>,
-) -> PyResult<UnifiedFitConfig> {
-    if groups.is_empty() {
-        return Err(pyo3::exceptions::PyValueError::new_err(
-            "groups must not be empty",
-        ));
-    }
-    // Validate all groups are loaded
-    for g in groups {
-        if !g.is_loaded() {
-            return Err(pyo3::exceptions::PyValueError::new_err(format!(
-                "IsotopeGroup '{}' has not been fully loaded. Call load_endf() first.",
-                g.inner.name(),
-            )));
-        }
-    }
-
-    let n_groups = groups.len();
-    let init_densities = initial_densities.unwrap_or_else(|| vec![0.001; n_groups]);
-
-    // Build the groups slice for with_groups: &[(&IsotopeGroup, &[ResonanceData])]
-    let group_rd: Vec<Vec<ResonanceData>> = groups
-        .iter()
-        .map(|g| {
-            g.resonance_data
-                .iter()
-                .map(|d| Arc::unwrap_or_clone(d.clone().unwrap()))
-                .collect()
-        })
-        .collect();
-
-    let group_pairs: Vec<(&IsotopeGroup, &[ResonanceData])> = groups
-        .iter()
-        .zip(group_rd.iter())
-        .map(|(g, rd)| (&g.inner, rd.as_slice()))
-        .collect();
-
-    // Create a placeholder config first (with_groups requires a valid base config)
-    // We use the first member's data as placeholder — with_groups replaces everything.
-    let first_rd = Arc::unwrap_or_clone(groups[0].resonance_data[0].clone().unwrap());
-    let placeholder_name = groups[0].inner.name().to_string();
-    let base_config = UnifiedFitConfig::new(
-        energies_vec,
-        vec![first_rd],
-        vec![placeholder_name],
-        temperature_k,
-        res_fn,
-        vec![0.001],
-    )
-    .map_err(|e| pyo3::exceptions::PyValueError::new_err(e.to_string()))?;
-
-    let config = base_config
-        .with_groups(&group_pairs, init_densities)
-        .map_err(|e| pyo3::exceptions::PyValueError::new_err(e.to_string()))?;
-
-    Ok(config)
-}
-
-/// Convert a pipeline `SpatialResult` to the Python `PySpatialResult`.
-fn spatial_result_to_py(
-    py: Python<'_>,
-    result: &nereids_pipeline::spatial::SpatialResult,
-) -> PySpatialResult {
-    let density_maps: Vec<Py<PyArray2<f64>>> = result
-        .density_maps
-        .iter()
-        .map(|m| PyArray2::from_array(py, m).into())
-        .collect();
-    let uncertainty_maps: Vec<Py<PyArray2<f64>>> = result
-        .uncertainty_maps
-        .iter()
-        .map(|m| PyArray2::from_array(py, m).into())
-        .collect();
-    let shape = (
-        result.converged_map.shape()[0],
-        result.converged_map.shape()[1],
-    );
-    let anorm_map = result
-        .anorm_map
-        .as_ref()
-        .map(|m| PyArray2::from_array(py, m).into());
-    let background_maps = result.background_maps.as_ref().map(|maps| {
-        [
-            PyArray2::from_array(py, &maps[0]).into(),
-            PyArray2::from_array(py, &maps[1]).into(),
-            PyArray2::from_array(py, &maps[2]).into(),
-        ]
-    });
-    let back_d_map = result
-        .back_d_map
-        .as_ref()
-        .map(|m| PyArray2::from_array(py, m).into());
-    let back_f_map = result
-        .back_f_map
-        .as_ref()
-        .map(|m| PyArray2::from_array(py, m).into());
-    let temperature_map = result
-        .temperature_map
-        .as_ref()
-        .map(|m| PyArray2::from_array(py, m).into());
-    let temperature_uncertainty_map = result
-        .temperature_uncertainty_map
-        .as_ref()
-        .map(|m| PyArray2::from_array(py, m).into());
-    let deviance_per_dof_map = result
-        .deviance_per_dof_map
-        .as_ref()
-        .map(|m| PyArray2::from_array(py, m).into());
-    let t0_us_map = result
-        .t0_us_map
-        .as_ref()
-        .map(|m| PyArray2::from_array(py, m).into());
-    let l_scale_map = result
-        .l_scale_map
-        .as_ref()
-        .map(|m| PyArray2::from_array(py, m).into());
-    let baseline_maps = result.baseline_maps.as_ref().map(|maps| {
-        [
-            PyArray2::from_array(py, &maps[0]).into(),
-            PyArray2::from_array(py, &maps[1]).into(),
-            PyArray2::from_array(py, &maps[2]).into(),
-        ]
-    });
-
-    PySpatialResult {
-        density_maps,
-        uncertainty_maps,
-        chi_squared_map: PyArray2::from_array(py, &result.chi_squared_map).into(),
-        deviance_per_dof_map,
-        converged_map: PyArray2::from_array(py, &result.converged_map).into(),
-        n_converged: result.n_converged,
-        n_total: result.n_total,
-        n_failed: result.n_failed,
-        isotope_names: result.isotope_labels.clone(),
-        shape,
-        temperature_map,
-        temperature_uncertainty_map,
-        anorm_map,
-        background_maps,
-        back_d_map,
-        back_f_map,
-        t0_us_map,
-        l_scale_map,
-        baseline_global: result.baseline_global,
-        baseline_e_ref_ev: result.baseline_e_ref_ev,
-        baseline_maps,
-        warnings: result.warnings.clone(),
-    }
-}
-
-/// Spatial mapping using the typed input data API.
-///
-/// Dispatches per-pixel fitting based on the InputData type:
-///   - from_counts → Poisson KL on raw counts (statistically optimal)
-///   - from_transmission → LM; Poisson/KL is rejected for ratios
-///
-/// Either `isotopes` or `groups` must be provided, but not both.
-/// When `groups` is provided, each group maps to one fitted density parameter.
-///
-/// Always returns SpatialResult.
-///
-/// Args:
-///     data: InputData from `from_counts()` or `from_transmission()`.
-///         `from_counts_with_nuisance()` is compatibility-only and rejects a
-///         nonzero background in production fitting.
-///     energies: 1D energy grid in eV (ascending).
-///     isotopes: list of ResonanceData objects (mutually exclusive with groups).
-///     temperature_k: Sample temperature in Kelvin (default 293.6).
-///     fit_temperature: Whether to fit temperature per pixel (default False).
-///     initial_densities: Initial density guesses (default 0.001 each).
-///     dead_pixels: Optional 2D boolean dead pixel mask.
-///     max_iter: Maximum iterations per pixel (default 200).
-///     solver: "auto" (default), "lm" (transmission only), or "kl"
-///         (counts only) — cross-domain combinations are rejected.
-///     background: Enable transmission-background fitting.
-///         For transmission data this uses the transmission-domain background model.
-///         For counts data this enables the same transmission background inside the
-///         count-domain KL/LM pipelines.
-///     fit_energy_scale: Fit per-pixel SAMMY TZERO calibration (t0, L_scale).
-///         Required for real VENUS counts data to match SAMMY chi2 performance.
-///     t0_init_us: Initial TOF offset in microseconds (default 0.0).
-///     l_scale_init: Initial flight-path scale factor (default 1.0).
-///     energy_scale_flight_path_m: Nominal flight path (m) for the
-///         energy-scale model. Must match the grid used to compute `energies`.
-///     resolution: Optional resolution function.  Rejected when fitting
-///         count cubes.
-///     groups: list of IsotopeGroup objects (mutually exclusive with isotopes).
-///     fit_anorm: Whether Anorm is free when ``background=True`` (default
-///         True).  Must be False to combine ``background=True`` with
-///         ``baseline=True`` (b0 and Anorm are degenerate normalizations).
-///     baseline: Enable the bounded multiplicative baseline
-///         ``B(E) = b0 + b1·ln(E/E_ref) + b2·ln²(E/E_ref)`` applied
-///         OUTERMOST (issue #635).  E_ref is the geometric midpoint of the
-///         energy grid and is reported as ``FitResult.baseline_e_ref_ev``.
-///     fit_b0, fit_b1, fit_b2: Per-coefficient fit flags (default True).
-///         All-False freezes the baseline at its inits.
-///     b0_init, b1_init, b2_init: Initial coefficients (default 1, 0, 0 —
-///         the identity baseline).
-///     b0_bounds, b1_bounds, b2_bounds: Optional (lower, upper) optimizer
-///         boxes; defaults (0.9, 1.1) / (−0.05, 0.05) / (−0.05, 0.05).
-///         The boxes bound the coefficients (tilt/curvature per ln-E
-///         unit), not the evaluated B(E); dip protection comes from the
-///         quadratic's smoothness, and B(E) > 0 is enforced pointwise.
-///     baseline_global: With ``baseline=True``: True (default) fits the
-///         baseline ONCE on the aggregated mean spectrum and freezes it for
-///         every pixel (stage-1 non-convergence is a hard error); False
-///         fits a baseline per pixel and populates ``baseline_maps``.
-///     scale_by_chi2: When True, inflate the covariance-only uncertainties
-///         (incl. ``temperature_uncertainty_map``) by ``sqrt(chi2/dof)`` at
-///         convergence — the inverse-Fisher lower bound becomes a
-///         goodness-of-fit-scaled estimate, scaled by the deviance-per-dof each
-///         pixel's result reports on the counts joint-Poisson path. No-op on
-///         the already-chi2-scaled LM transmission path.
-///         Default False (issue #638).
-///
-/// Returns:
-///     SpatialResult with density_maps, chi_squared_map, converged_map, etc.
-#[pyfunction]
-#[pyo3(name = "spatial_map_typed", signature = (
-    data, energies, isotopes=None, *,
-    temperature_k = 293.6,
-    fit_temperature = false,
-    initial_densities = None,
-    fix_densities = false,
-    density_free = None,
-    dead_pixels = None,
-    max_iter = 200,
-    solver = "auto",
-    background = false,
-    fit_back_d = false,
-    fit_back_f = false,
-    back_d_init = 0.01,
-    back_f_init = 1.0,
-    c = 1.0,
-    enable_polish = None,
-    fit_energy_scale = false,
-    t0_init_us = 0.0,
-    l_scale_init = 1.0,
-    energy_scale_flight_path_m = 25.0,
-    resolution = None,
-    flight_path_m = None,
-    delta_t_us = None,
-    delta_l_m = None,
-    groups = None,
-    tzero_jacobian = None,
-    fit_energy_range = None,
-    fit_anorm = true,
-    baseline = false,
-    fit_b0 = true,
-    fit_b1 = true,
-    fit_b2 = true,
-    b0_init = 1.0,
-    b1_init = 0.0,
-    b2_init = 0.0,
-    b0_bounds = None,
-    b1_bounds = None,
-    b2_bounds = None,
-    baseline_global = true,
-    scale_by_chi2 = false,
-))]
-#[allow(clippy::too_many_arguments)]
-fn py_spatial_map_typed<'py>(
-    py: Python<'py>,
-    data: &PyInputData,
-    energies: PyReadonlyArray1<'py, f64>,
-    isotopes: Option<Vec<PyResonanceData>>,
-    temperature_k: f64,
-    fit_temperature: bool,
-    initial_densities: Option<Vec<f64>>,
-    fix_densities: bool,
-    density_free: Option<Vec<bool>>,
-    dead_pixels: Option<PyReadonlyArray2<'py, bool>>,
-    max_iter: usize,
-    solver: &str,
-    background: bool,
-    fit_back_d: bool,
-    fit_back_f: bool,
-    back_d_init: f64,
-    back_f_init: f64,
-    c: f64,
-    enable_polish: Option<bool>,
-    fit_energy_scale: bool,
-    t0_init_us: f64,
-    l_scale_init: f64,
-    energy_scale_flight_path_m: f64,
-    resolution: Option<PyTabulatedResolution>,
-    flight_path_m: Option<f64>,
-    delta_t_us: Option<f64>,
-    delta_l_m: Option<f64>,
-    groups: Option<Vec<PyIsotopeGroup>>,
-    tzero_jacobian: Option<&str>,
-    fit_energy_range: Option<(f64, f64)>,
-    fit_anorm: bool,
-    baseline: bool,
-    fit_b0: bool,
-    fit_b1: bool,
-    fit_b2: bool,
-    b0_init: f64,
-    b1_init: f64,
-    b2_init: f64,
-    b0_bounds: Option<(f64, f64)>,
-    b1_bounds: Option<(f64, f64)>,
-    b2_bounds: Option<(f64, f64)>,
-    baseline_global: bool,
-    scale_by_chi2: bool,
-) -> PyResult<PySpatialResult> {
-    // Validate mutual exclusivity
-    let has_isotopes = isotopes.is_some();
-    let has_groups = groups.is_some();
-    if has_isotopes && has_groups {
-        return Err(pyo3::exceptions::PyValueError::new_err(
-            "Provide either 'isotopes' or 'groups', not both.",
-        ));
-    }
-    if !has_isotopes && !has_groups {
-        return Err(pyo3::exceptions::PyValueError::new_err(
-            "Must provide either 'isotopes' or 'groups'.",
-        ));
-    }
-
-    // ── Issue #458 V1-V3: input validation at the binding boundary ──
-
-    // V1: proton-charge ratio `c` is used by the counts-KL dispatch to
-    // relate sample to open-beam flux.  It is ignored on the
-    // transmission path, so we only validate it when the input is a
-    // counts variant — otherwise a user passing (say) `c=0.0` with
-    // transmission data would see a misleading error about a value
-    // that was never consulted.  Non-positive or non-finite values
-    // produce garbage fits deep in `joint_poisson_fit`; reject here
-    // with a clear message instead of letting a PyRuntimeError
-    // bubble up from the solver.
-    let is_counts_input = data.kind == "counts" || data.kind == "counts_with_nuisance";
-    if is_counts_input && (!c.is_finite() || c <= 0.0) {
-        return Err(pyo3::exceptions::PyValueError::new_err(format!(
-            "c (proton-charge ratio Q_s/Q_ob) must be positive and finite, got {c}",
-        )));
-    }
-
-    // V2: `initial_densities`, when supplied, must all be finite and
-    // non-negative.  NaN/Inf propagates through the solver and
-    // produces meaningless output; negative densities are non-physical
-    // (and LM's analytical Jacobian for exp(-n·σ) assumes n ≥ 0).
-    if let Some(ref init_d) = initial_densities {
-        for (i, &d) in init_d.iter().enumerate() {
-            if !d.is_finite() || d < 0.0 {
-                return Err(pyo3::exceptions::PyValueError::new_err(format!(
-                    "initial_densities[{i}] must be finite and non-negative, got {d}",
-                )));
-            }
-        }
-    }
-
-    // V3: shape validation against the input data cube.
-    let data_shape = data.data_a.shape();
-    let (data_n_e, data_h, data_w) = (data_shape[0], data_shape[1], data_shape[2]);
-    let e_slice = energies.as_slice()?;
-    let n_e_supplied = e_slice.len();
-    if n_e_supplied != data_n_e {
-        return Err(pyo3::exceptions::PyValueError::new_err(format!(
-            "energies length ({n_e_supplied}) != data spectral axis length ({data_n_e})",
-        )));
-    }
-    if let Some(ref dp) = dead_pixels {
-        let dp_shape = dp.as_array().shape().to_vec();
-        if dp_shape != [data_h, data_w] {
-            return Err(pyo3::exceptions::PyValueError::new_err(format!(
-                "dead_pixels shape {dp_shape:?} != data spatial dims ({data_h}, {data_w})",
-            )));
-        }
-    }
-
-    // Validate the energy grid up front so malformed energies surface as
-    // ValueError rather than a release-mode `PanicException` from the
-    // per-point `assert!(energy_ev.is_finite() && energy_ev > 0.0)`
-    // guards inside the rayon-parallelised pipeline precompute → SLBW /
-    // Reich-Moore leaves.  Empty grids are accepted and yield an empty
-    // result; per-pixel failures still degrade gracefully via
-    // `filter_map(Err(_) => None)`.
-    validate_energy_grid(e_slice)?;
-
-    let energies_vec = e_slice.to_vec();
-
-    // Build resolution
-    let res_fn = build_resolution(flight_path_m, delta_t_us, delta_l_m, resolution, None)?;
-
-    // Build config based on isotopes or groups
-    let mut config = if let Some(isotopes) = isotopes {
-        let n_iso = isotopes.len();
-        let iso_names: Vec<String> = isotopes
-            .iter()
-            .map(|i| {
-                let sym =
-                    nereids_core::elements::element_symbol(i.inner.isotope.z()).unwrap_or("?");
-                format!("{}-{}", sym, i.inner.isotope.a())
-            })
-            .collect();
-        let resonance_data: Vec<ResonanceData> = isotopes
-            .into_iter()
-            .map(|d| Arc::unwrap_or_clone(d.inner))
-            .collect();
-        let init_densities = initial_densities.unwrap_or_else(|| vec![0.001; n_iso]);
-
-        UnifiedFitConfig::new(
-            energies_vec,
-            resonance_data,
-            iso_names,
-            temperature_k,
-            res_fn,
-            init_densities,
-        )
-        .map_err(|e| pyo3::exceptions::PyValueError::new_err(e.to_string()))?
-    } else {
-        let groups = groups.unwrap();
-        if groups.is_empty() {
-            return Err(pyo3::exceptions::PyValueError::new_err(
-                "groups list must not be empty",
-            ));
-        }
-        build_config_from_groups(
-            &groups,
-            energies_vec,
-            temperature_k,
-            res_fn,
-            initial_densities,
-        )?
-    };
-
-    // Solver — resolve "auto" eagerly so max_iter is always propagated.
-    // Issue #458 B4: `data.kind` is one of `"counts"`, `"counts_with_nuisance"`,
-    // or the transmission string produced by `from_transmission()`.  Both
-    // counts variants should route `solver="auto"` to the counts-KL
-    // (joint-Poisson) dispatch — `data.kind == "counts"` alone misses
-    // `counts_with_nuisance`, which silently fell through to LM before.
-    // (`is_counts_input` computed earlier for V1 validation.)
-    let solver_config = parse_solver_config(solver, is_counts_input, max_iter)?;
-    config = config.with_solver(solver_config);
-
-    // Issue #638: χ²-scaled uncertainties (no-op on the LM transmission path).
-    config = config.with_scale_by_chi2(scale_by_chi2);
-
-    // Temperature fitting
-    if fit_temperature {
-        config = config.with_fit_temperature(true);
-    }
-
-    // Background
-    if background {
-        // Plumb `fit_back_d` / `fit_back_f` / `back_d_init` /
-        // `back_f_init` through to `BackgroundConfig` so the LM
-        // transmission per-pixel fit can actually fit the exponential
-        // tail.  Without this, the spatial pipeline would attach only
-        // the default config (both flags `false`) and the exposed
-        // `back_d_map` / `back_f_map` would never be `Some`.  Mirrors
-        // the single-spectrum `py_fit_spectrum_typed` wiring above.
-        let bg = nereids_pipeline::pipeline::BackgroundConfig {
-            fit_anorm,
-            fit_back_d,
-            fit_back_f,
-            back_d_init,
-            back_f_init,
-            ..nereids_pipeline::pipeline::BackgroundConfig::default()
-        };
-        config = config.with_transmission_background(bg);
-    } else if fit_back_d || fit_back_f {
-        // The exponential tail can only be fit when the background
-        // model is active.  Reject the silent-noop combination at the
-        // binding boundary so the user gets a clear error rather than
-        // a `back_d_map` / `back_f_map` of all None.
-        return Err(pyo3::exceptions::PyValueError::new_err(
-            "fit_back_d / fit_back_f require background=True: the \
-             exponential tail of the SAMMY background only exists when \
-             the polynomial background model is attached.",
-        ));
-    } else if !fit_anorm {
-        return Err(pyo3::exceptions::PyValueError::new_err(
-            "fit_anorm=False requires background=True: Anorm is a parameter \
-             of the SAMMY background model.",
-        ));
-    }
-
-    // Bounded multiplicative baseline (issue #635).  `baseline_global`
-    // selects the two-stage global mode (fit once on the aggregated mean
-    // spectrum, freeze per-pixel) vs per-pixel baseline maps.
-    config = apply_baseline(
-        config,
-        baseline,
-        fit_b0,
-        fit_b1,
-        fit_b2,
-        b0_init,
-        b1_init,
-        b2_init,
-        b0_bounds,
-        b1_bounds,
-        b2_bounds,
-        baseline_global,
-        background,
-        fit_anorm,
-    )?;
-    if c != 1.0 && (data.kind == "counts" || data.kind == "counts_with_nuisance") {
-        // Caller provided `c` (the proton-charge ratio) — attach a minimal
-        // CountsBackgroundConfig carrying just it for the counts-KL dispatch.
-        config =
-            config.with_counts_background(nereids_pipeline::pipeline::CountsBackgroundConfig {
-                c,
-                ..Default::default()
-            });
-    }
-
-    // Polish override.  None = auto-disable
-    // when n_pixels > 1 inside spatial_map_typed.
-    if let Some(v) = enable_polish {
-        config = config.with_counts_enable_polish(Some(v));
-    }
-
-    // Energy-scale calibration (SAMMY TZERO equivalent).  Required for
-    // real VENUS data — without it, sharp resonances are offset ~0.5 us
-    // in TOF and per-pixel chi2 explodes (observed on the VENUS Hf
-    // 120min NEREIDS↔SAMMY parity comparison).
-    if fit_energy_scale {
-        validate_energy_scale_params(t0_init_us, l_scale_init, energy_scale_flight_path_m)?;
-        config = config.with_energy_scale(t0_init_us, l_scale_init, energy_scale_flight_path_m);
-    }
-    let tzero_method = parse_tzero_jacobian(tzero_jacobian)?;
-    if tzero_method.is_some() {
-        config = config.with_tzero_jacobian_method(tzero_method);
-    }
-
-    // Build InputData3D from the PyInputData
-    let input = match data.kind.as_str() {
-        "counts" => InputData3D::Counts {
-            sample_counts: data.data_a.view(),
-            open_beam_counts: data.data_b.view(),
-        },
-        "counts_with_nuisance" => InputData3D::CountsWithNuisance {
-            sample_counts: data.data_a.view(),
-            flux: data.data_b.view(),
-            background: data
-                .data_c
-                .as_ref()
-                .expect("counts_with_nuisance requires background data")
-                .view(),
-        },
-        _ => InputData3D::Transmission {
-            transmission: data.data_a.view(),
-            uncertainty: data.data_b.view(),
-        },
-    };
-
-    // Dead pixels
-    let dead_arr = dead_pixels.map(|dp| dp.as_array().to_owned());
-
-    // SAMMY EMIN/EMAX-equivalent fit-energy-range (#514): mask residuals
-    // to bins inside [E_min, E_max] in both LM and joint-Poisson per-
-    // pixel cost paths.  The model is evaluated on the full grid so
-    // resolution broadening at the boundaries is correct.
-    // No Python-side data slicing required.
-    config = config
-        .with_fit_energy_range(fit_energy_range)
-        .map_err(|e| pyo3::exceptions::PyValueError::new_err(e.to_string()))?;
-
-    // Issue #633: freeze known densities across every pixel — per-pixel
-    // T-only (or T + energy-scale) fits with a calibration-foil density.
-    config = apply_density_freeze(config, fix_densities, density_free)?;
-
-    // GIL held during computation.  InputData3D borrows PyInputData arrays
-    // which are not Send, so we cannot use py.allow_threads().  The existing
-    // py_spatial_map has the same limitation.  Rayon still parallelizes the
-    // per-pixel fitting within the GIL.
-    // Map user-input configuration errors (unpaired
-    // `fit_back_d`/`fit_back_f`, non-finite/non-positive `back_*_init`,
-    // counts-KL + exponential tail) to `PyValueError`, matching the
-    // up-front `PyValueError` at the `background=False +
-    // fit_back_d=True` boundary above.  Other `PipelineError`
-    // variants stay as `PyRuntimeError` — they signal solver /
-    // numeric failures, not bad input.
-    let result =
-        spatial_map_typed(&input, &config, dead_arr.as_ref(), None, None).map_err(|e| {
-            let msg = e.to_string();
-            if matches!(
-                e,
-                nereids_pipeline::error::PipelineError::InvalidParameter(_)
-            ) {
-                pyo3::exceptions::PyValueError::new_err(msg)
-            } else {
-                pyo3::exceptions::PyRuntimeError::new_err(msg)
-            }
-        })?;
-
-    Ok(spatial_result_to_py(py, &result))
-}
-
-/// Fit a single raw-count spectrum using the typed input data API.
-///
-/// Either `isotopes` or `groups` must be provided, but not both.
-///
-/// Args:
-///     sample_counts: 1D sample counts spectrum.
-///     open_beam_counts: 1D open-beam counts reference.
-///     energies: 1D energy grid in eV (ascending).
-///     isotopes: list of (ResonanceData, initial_density) tuples (mutually exclusive with groups).
-///     temperature_k: Sample temperature in Kelvin (default 293.6).
-///     fit_temperature: Whether to fit temperature (default False).
-///     max_iter: Maximum iterations (default 200).
-///     solver: "auto" (default), "kl", "poisson", or "joint_poisson" (all
-///         the counts-KL dispatch). "lm" is rejected for raw counts.
-///     background: Enable transmission-lift background inside the counts fit.
-///     detector_background: Optional detector/counts background reference.
-///     resolution: Rejected: count fits with an instrument resolution are
-///         not supported by this function.
-///     groups: list of IsotopeGroup objects (mutually exclusive with isotopes).
-///     initial_densities: Initial density guesses when using groups (default 0.001 each).
-///     enable_polish: Override the Nelder-Mead polish phase on the
-///         counts-KL solver (default ``None`` → use the library default,
-///         which is ``False`` as of #486 because polish's absolute
-///         ``fatol = 1e-10`` is sub-f64-ULP on real-data deviance scales
-///         where ``D ≈ 10⁴``–``10⁵``, so polish hits ``max_iter = 5000``
-///         every fit at 70-260× wall cost for ≤ 0.35 Fisher σ parameter
-///         shift).  Pass ``True`` to opt in for clean / synthetic fits
-///         where ``D → 0`` is achievable and the polish tolerances are
-///         physically meaningful.  See ``JointPoissonFitConfig``
-///         ``enable_polish`` field doc for details.
-///
-///     fit_anorm: Whether Anorm is free when ``background=True`` (default
-///         True).  Must be False to combine ``background=True`` with
-///         ``baseline=True`` (b0 and Anorm are degenerate normalizations).
-///     baseline: Enable the bounded multiplicative baseline
-///         ``B(E) = b0 + b1·ln(E/E_ref) + b2·ln²(E/E_ref)`` applied
-///         OUTERMOST (issue #635).  E_ref is the geometric midpoint of the
-///         energy grid and is reported as ``FitResult.baseline_e_ref_ev``.
-///     fit_b0, fit_b1, fit_b2: Per-coefficient fit flags (default True).
-///         All-False freezes the baseline at its inits.
-///     b0_init, b1_init, b2_init: Initial coefficients (default 1, 0, 0 —
-///         the identity baseline).
-///     b0_bounds, b1_bounds, b2_bounds: Optional (lower, upper) optimizer
-///         boxes; defaults (0.9, 1.1) / (−0.05, 0.05) / (−0.05, 0.05).
-///         The boxes bound the coefficients (tilt/curvature per ln-E
-///         unit), not the evaluated B(E); dip protection comes from the
-///         quadratic's smoothness, and B(E) > 0 is enforced pointwise.
-///
-/// Returns:
-///     FitResult with densities, uncertainties, chi2, etc.
-///
-/// For pre-normalized transmission data, use `fit_spectrum_typed(...)`.
-#[pyfunction]
-#[pyo3(name = "fit_counts_spectrum_typed", signature = (
-    sample_counts, open_beam_counts, energies, isotopes=None, *,
-    temperature_k = 293.6,
-    fit_temperature = false,
-    max_iter = 200,
-    solver = "auto",
-    background = false,
-    fit_back_d = false,
-    fit_back_f = false,
-    back_d_init = 0.01,
-    back_f_init = 1.0,
-    fit_energy_scale = false,
-    t0_init_us = 0.0,
-    l_scale_init = 1.0,
-    energy_scale_flight_path_m = 25.0,
-    detector_background = None,
-    c = 1.0,
-    resolution = None,
-    flight_path_m = None,
-    delta_t_us = None,
-    delta_l_m = None,
-    groups = None,
-    initial_densities = None,
-    fix_densities = false,
-    density_free = None,
-    enable_polish = None,
-    tzero_jacobian = None,
-    fit_energy_range = None,
-    fit_anorm = true,
-    baseline = false,
-    fit_b0 = true,
-    fit_b1 = true,
-    fit_b2 = true,
-    b0_init = 1.0,
-    b1_init = 0.0,
-    b2_init = 0.0,
-    b0_bounds = None,
-    b1_bounds = None,
-    b2_bounds = None,
-    scale_by_chi2 = false,
-))]
-fn py_fit_counts_spectrum_typed<'py>(
-    py: Python<'py>,
-    sample_counts: PyReadonlyArray1<'py, f64>,
-    open_beam_counts: PyReadonlyArray1<'py, f64>,
-    energies: PyReadonlyArray1<'py, f64>,
-    isotopes: Option<Vec<(PyResonanceData, f64)>>,
-    temperature_k: f64,
-    fit_temperature: bool,
-    max_iter: usize,
-    solver: &str,
-    background: bool,
-    fit_back_d: bool,
-    fit_back_f: bool,
-    back_d_init: f64,
-    back_f_init: f64,
-    fit_energy_scale: bool,
-    t0_init_us: f64,
-    l_scale_init: f64,
-    energy_scale_flight_path_m: f64,
-    detector_background: Option<PyReadonlyArray1<'py, f64>>,
-    c: f64,
-    resolution: Option<PyTabulatedResolution>,
-    flight_path_m: Option<f64>,
-    delta_t_us: Option<f64>,
-    delta_l_m: Option<f64>,
-    groups: Option<Vec<PyIsotopeGroup>>,
-    initial_densities: Option<Vec<f64>>,
-    fix_densities: bool,
-    density_free: Option<Vec<bool>>,
-    enable_polish: Option<bool>,
-    tzero_jacobian: Option<&str>,
-    fit_energy_range: Option<(f64, f64)>,
-    fit_anorm: bool,
-    baseline: bool,
-    fit_b0: bool,
-    fit_b1: bool,
-    fit_b2: bool,
-    b0_init: f64,
-    b1_init: f64,
-    b2_init: f64,
-    b0_bounds: Option<(f64, f64)>,
-    b1_bounds: Option<(f64, f64)>,
-    b2_bounds: Option<(f64, f64)>,
-    scale_by_chi2: bool,
-) -> PyResult<PyFitResult> {
-    use nereids_pipeline::pipeline::{
-        CountsBackgroundConfig, InputData, UnifiedFitConfig, fit_spectrum_typed,
-    };
-
-    let has_isotopes = isotopes.is_some();
-    let has_groups = groups.is_some();
-    if has_isotopes && has_groups {
-        return Err(pyo3::exceptions::PyValueError::new_err(
-            "Provide either 'isotopes' or 'groups', not both.",
-        ));
-    }
-    if !has_isotopes && !has_groups {
-        return Err(pyo3::exceptions::PyValueError::new_err(
-            "Must provide either 'isotopes' or 'groups'.",
-        ));
-    }
-
-    let sample_slice = sample_counts.as_slice()?;
-    let ob_slice = open_beam_counts.as_slice()?;
-    let e_slice = energies.as_slice()?;
-    if sample_slice.len() != ob_slice.len() {
-        return Err(pyo3::exceptions::PyValueError::new_err(format!(
-            "sample_counts length ({}) must match open_beam_counts length ({})",
-            sample_slice.len(),
-            ob_slice.len(),
-        )));
-    }
-    if sample_slice.len() != e_slice.len() {
-        return Err(pyo3::exceptions::PyValueError::new_err(format!(
-            "sample_counts length ({}) must match energies length ({})",
-            sample_slice.len(),
-            e_slice.len(),
-        )));
-    }
-    require_non_empty_energy_grid(e_slice)?;
-
-    // Issue #458 V1: reject non-positive / non-finite `c` (Q_s / Q_ob).
-    if !c.is_finite() || c <= 0.0 {
-        return Err(pyo3::exceptions::PyValueError::new_err(format!(
-            "c (proton-charge ratio Q_s/Q_ob) must be positive and finite, got {c}",
-        )));
-    }
-    // Issue #458 V2: reject non-finite / negative initial densities —
-    // both in `initial_densities` kwarg and in `isotopes: list[(rd, d)]`.
-    if let Some(ref init_d) = initial_densities {
-        for (i, &d) in init_d.iter().enumerate() {
-            if !d.is_finite() || d < 0.0 {
-                return Err(pyo3::exceptions::PyValueError::new_err(format!(
-                    "initial_densities[{i}] must be finite and non-negative, got {d}",
-                )));
-            }
-        }
-    }
-    if let Some(ref iso) = isotopes {
-        for (i, (_, d)) in iso.iter().enumerate() {
-            if !d.is_finite() || *d < 0.0 {
-                return Err(pyo3::exceptions::PyValueError::new_err(format!(
-                    "isotopes[{i}] initial density must be finite and non-negative, got {d}",
-                )));
-            }
-        }
-    }
-
-    let detector_background_vec = if let Some(bg) = detector_background {
-        let bg_slice = bg.as_slice()?;
-        if bg_slice.len() != sample_slice.len() {
-            return Err(pyo3::exceptions::PyValueError::new_err(format!(
-                "detector_background length ({}) must match sample_counts length ({})",
-                bg_slice.len(),
-                sample_slice.len(),
-            )));
-        }
-        Some(bg_slice.to_vec())
-    } else {
-        None
-    };
-    let energies_vec = e_slice.to_vec();
-    let res_fn = build_resolution(flight_path_m, delta_t_us, delta_l_m, resolution, None)?;
-
-    let mut config = if let Some(isotopes) = isotopes {
-        let iso_names: Vec<String> = isotopes
-            .iter()
-            .map(|(d, _)| {
-                let sym =
-                    nereids_core::elements::element_symbol(d.inner.isotope.z()).unwrap_or("?");
-                format!("{}-{}", sym, d.inner.isotope.a())
-            })
-            .collect();
-        let init_densities: Vec<f64> = isotopes.iter().map(|(_, d)| *d).collect();
-        let resonance_data: Vec<ResonanceData> = isotopes
-            .into_iter()
-            .map(|(d, _)| Arc::unwrap_or_clone(d.inner))
-            .collect();
-
-        UnifiedFitConfig::new(
-            energies_vec,
-            resonance_data,
-            iso_names,
-            temperature_k,
-            res_fn,
-            init_densities,
-        )
-        .map_err(|e| pyo3::exceptions::PyValueError::new_err(e.to_string()))?
-    } else {
-        let groups = groups.unwrap();
-        if groups.is_empty() {
-            return Err(pyo3::exceptions::PyValueError::new_err(
-                "groups list must not be empty",
-            ));
-        }
-        build_config_from_groups(
-            &groups,
-            energies_vec,
-            temperature_k,
-            res_fn,
-            initial_densities,
-        )?
-    };
-
-    config = config.with_solver(parse_solver_config(solver, true, max_iter)?);
-    // Issue #638: χ²-scaled uncertainties (no-op on the LM transmission path).
-    config = config.with_scale_by_chi2(scale_by_chi2);
-    if fit_temperature {
-        config = config.with_fit_temperature(true);
-    }
-    if background {
-        let mut bg = nereids_pipeline::pipeline::BackgroundConfig::default();
-        bg.fit_anorm = fit_anorm;
-        bg.fit_back_d = fit_back_d;
-        bg.fit_back_f = fit_back_f;
-        bg.back_d_init = back_d_init;
-        bg.back_f_init = back_f_init;
-        config = config.with_transmission_background(bg);
-    } else if !fit_anorm {
-        return Err(pyo3::exceptions::PyValueError::new_err(
-            "fit_anorm=False requires background=True: Anorm is a parameter \
-             of the SAMMY background model.",
-        ));
-    }
-    // Bounded multiplicative baseline (issue #635).
-    config = apply_baseline(
-        config, baseline, fit_b0, fit_b1, fit_b2, b0_init, b1_init, b2_init, b0_bounds, b1_bounds,
-        b2_bounds, true, background, fit_anorm,
-    )?;
-    if fit_energy_scale {
-        validate_energy_scale_params(t0_init_us, l_scale_init, energy_scale_flight_path_m)?;
-        config = config.with_energy_scale(t0_init_us, l_scale_init, energy_scale_flight_path_m);
-    }
-    let tzero_method = parse_tzero_jacobian(tzero_jacobian)?;
-    if tzero_method.is_some() {
-        config = config.with_tzero_jacobian_method(tzero_method);
-    }
-    // Attach CountsBackgroundConfig whenever any of its fields deviates from
-    // the default — including c, which is the explicit proton-charge ratio
-    // consumed by the counts-KL (joint-Poisson) dispatch.
-    if c != 1.0 || solver == "kl" || solver == "poisson" || solver == "joint_poisson" {
-        config = config.with_counts_background(CountsBackgroundConfig {
-            c,
-            ..CountsBackgroundConfig::default()
-        });
-    }
-
-    let input = if let Some(bg) = detector_background_vec {
-        InputData::CountsWithNuisance {
-            sample_counts: sample_slice.to_vec(),
-            flux: ob_slice.to_vec(),
-            background: bg,
-        }
-    } else {
-        InputData::Counts {
-            sample_counts: sample_slice.to_vec(),
-            open_beam_counts: ob_slice.to_vec(),
-        }
-    };
-
-    // #486: counts-KL polish override.  Default `None` falls through to
-    // the Rust `JointPoissonFitConfig::default().enable_polish` (now
-    // `false`).  Pass `enable_polish=True` to opt back in for clean /
-    // synthetic fits where the polish tolerances are physically
-    // meaningful (see the field doc on `JointPoissonFitConfig::enable_polish`).
-    if let Some(v) = enable_polish {
-        config = config.with_counts_enable_polish(Some(v));
-    }
-
-    // SAMMY EMIN/EMAX-equivalent fit-energy-range (#514): mask residuals
-    // to bins inside [E_min, E_max]; the joint-Poisson cost path
-    // honours the mask in deviance / gradient / Fisher loops.  No
-    // Python-side data slicing required — the model is evaluated on
-    // the full grid so resolution broadening at the boundaries is
-    // correct.
-    config = config
-        .with_fit_energy_range(fit_energy_range)
-        .map_err(|e| pyo3::exceptions::PyValueError::new_err(e.to_string()))?;
-
-    // Issue #633: freeze known densities (calibration-foil thermometry).
-    config = apply_density_freeze(config, fix_densities, density_free)?;
-
-    let result = py.detach(move || fit_spectrum_typed(&input, &config));
-    // Config-class errors (InvalidParameter) surface as ValueError —
-    // matching py_spatial_map_typed, which established the convention for
-    // PipelineError at this boundary (review R2: identical invalid input,
-    // e.g. a baseline init outside its bounds, previously raised ValueError
-    // from the spatial API but RuntimeError here because the error variant
-    // was stringified inside py.detach).  Other variants stay RuntimeError —
-    // they signal solver / numeric failures, not bad input.
-    let result = result.map_err(|e| {
-        let msg = e.to_string();
-        if matches!(
-            e,
-            nereids_pipeline::error::PipelineError::InvalidParameter(_)
-        ) {
-            pyo3::exceptions::PyValueError::new_err(msg)
-        } else {
-            pyo3::exceptions::PyRuntimeError::new_err(msg)
-        }
-    })?;
-
-    Ok(PyFitResult {
-        densities: result.densities,
-        uncertainties: result.uncertainties,
-        reduced_chi_squared: result.reduced_chi_squared,
-        converged: result.converged,
-        iterations: result.iterations,
-        temperature_k: result.temperature_k,
-        temperature_k_unc: result.temperature_k_unc,
-        anorm: result.anorm,
-        background: result.background,
-        // BackD / BackF are only meaningful when the polynomial
-        // background model was actually attached.  `result.back_d` /
-        // `result.back_f` are `Option<f64>` (None when the inner
-        // Rust fit didn't fit the exponential tail).  The outer gate
-        // on `background && fit_back_d` is defensive — it ensures
-        // PyFitResult.back_d is None whenever the caller didn't
-        // request the tail, regardless of any future change to the
-        // inner Rust contract.
-        back_d: if background && fit_back_d {
-            result.back_d
-        } else {
-            None
-        },
-        back_f: if background && fit_back_f {
-            result.back_f
-        } else {
-            None
-        },
-        t0_us: result.t0_us,
-        l_scale: result.l_scale,
-        energy_scale_flight_path_m: result.energy_scale_flight_path_m,
-        deviance_per_dof: result.deviance_per_dof,
-        baseline: result.baseline,
-        baseline_e_ref_ev: result.baseline_e_ref_ev,
-        warnings: result.warnings,
-    })
-}
-
-// ── Research: exact Jacobian/Fisher at arbitrary parameters ──────────────
-
-/// Result of exact Jacobian/Fisher evaluation from the Rust engine.
-#[pyclass(name = "ModelJacobianResult")]
-struct PyModelJacobianResult {
-    jacobian_data: Vec<f64>,
-    jacobian_nrows: usize,
-    jacobian_ncols: usize,
-    fisher_data: Vec<f64>,
-    fisher_n: usize,
-    model_prediction: Vec<f64>,
-    param_names: Vec<String>,
-}
-
-#[pymethods]
-impl PyModelJacobianResult {
-    /// Analytical Jacobian J (n_energy × n_free_params), row-major.
-    #[getter]
-    fn jacobian<'py>(&self, py: Python<'py>) -> Bound<'py, PyArray2<f64>> {
-        let shape = [self.jacobian_nrows, self.jacobian_ncols];
-        let arr =
-            ndarray::Array2::from_shape_vec(shape, self.jacobian_data.clone()).expect("shape ok");
-        PyArray2::from_owned_array(py, arr)
-    }
-
-    /// Expected Poisson Fisher F = Jᵀ diag(1/μ) J (n_free × n_free).
-    #[getter]
-    fn fisher<'py>(&self, py: Python<'py>) -> Bound<'py, PyArray2<f64>> {
-        let shape = [self.fisher_n, self.fisher_n];
-        let arr =
-            ndarray::Array2::from_shape_vec(shape, self.fisher_data.clone()).expect("shape ok");
-        PyArray2::from_owned_array(py, arr)
-    }
-
-    /// Model prediction μ(E) at the evaluation point.
-    #[getter]
-    fn model_prediction<'py>(&self, py: Python<'py>) -> Bound<'py, PyArray1<f64>> {
-        numpy::PyArray1::from_vec(py, self.model_prediction.clone())
-    }
-
-    /// Names of free parameters in Jacobian column order.
-    #[getter]
-    fn param_names(&self) -> Vec<String> {
-        self.param_names.clone()
-    }
-
-    fn __repr__(&self) -> String {
-        format!(
-            "ModelJacobianResult(n_data={}, n_free={}, params={:?})",
-            self.jacobian_nrows, self.jacobian_ncols, self.param_names
-        )
-    }
-}
-
-/// Compute the exact analytical Jacobian and expected Fisher at given
-/// parameter values.
-///
-/// Uses the same model construction as ``fit_counts_spectrum_typed()`` but does
-/// **not** optimise — evaluates once at the provided densities/temperature and
-/// returns the exact Jacobian and Fisher from the Rust engine.
-///
-/// This is a research-oriented function for Fisher-based regularisation studies.
-///
-/// Either ``isotopes`` or ``groups`` must be provided, but not both.
-/// When ``groups`` is provided, each group maps to one density parameter
-/// (same semantics as ``fit_counts_spectrum_typed``).
-///
-/// Args:
-///     open_beam_counts: Incident flux Φ(E) (1D array, length n_energy).
-///     energies: Energy grid in eV (1D array, sorted ascending).
-///     isotopes: List of (ResonanceData, density_at_eval_point) tuples.
-///     temperature_k: Temperature at which to evaluate (default 293.6 K).
-///     fit_temperature: If True, include temperature as a free parameter
-///         in the Jacobian.
-///     flight_path_m, delta_t_us, delta_l_m: Gaussian resolution parameters.
-///         Rejected: this counts-space helper does not support an active
-///         resolution.
-///     resolution: Tabulated resolution object.  Rejected, same as the
-///         Gaussian parameters above.
-///     detector_background: Detector background B(E) for counts background model.
-///     fit_alpha_1: If True, include signal scale α₁ as free parameter.
-///     fit_alpha_2: If True, include background scale α₂ as free parameter.
-///     alpha_1: Signal scale evaluation value (default 1.0).
-///     alpha_2: Background scale evaluation value (default 1.0).
-///     groups: List of IsotopeGroup objects (mutually exclusive with isotopes).
-///     initial_densities: Initial/evaluation densities when using groups.
-///
-/// Returns:
-///     ModelJacobianResult with jacobian, fisher, model_prediction, param_names.
-#[pyfunction]
-#[pyo3(name = "compute_model_jacobian", signature = (
-    open_beam_counts, energies, isotopes=None, *,
-    temperature_k = 293.6,
-    fit_temperature = false,
-    flight_path_m = None,
-    delta_t_us = None,
-    delta_l_m = None,
-    resolution = None,
-    detector_background = None,
-    fit_alpha_1 = false,
-    fit_alpha_2 = false,
-    alpha_1 = 1.0,
-    alpha_2 = 1.0,
-    groups = None,
-    initial_densities = None,
-))]
-fn py_compute_model_jacobian<'py>(
-    py: Python<'py>,
-    open_beam_counts: PyReadonlyArray1<'py, f64>,
-    energies: PyReadonlyArray1<'py, f64>,
-    isotopes: Option<Vec<(PyResonanceData, f64)>>,
-    temperature_k: f64,
-    fit_temperature: bool,
-    flight_path_m: Option<f64>,
-    delta_t_us: Option<f64>,
-    delta_l_m: Option<f64>,
-    resolution: Option<PyTabulatedResolution>,
-    detector_background: Option<PyReadonlyArray1<'py, f64>>,
-    fit_alpha_1: bool,
-    fit_alpha_2: bool,
-    alpha_1: f64,
-    alpha_2: f64,
-    groups: Option<Vec<PyIsotopeGroup>>,
-    initial_densities: Option<Vec<f64>>,
-) -> PyResult<PyModelJacobianResult> {
-    use nereids_pipeline::pipeline::{CountsBackgroundConfig, evaluate_jacobian_and_fisher};
-
-    let has_isotopes = isotopes.is_some();
-    let has_groups = groups.is_some();
-    if has_isotopes && has_groups {
-        return Err(pyo3::exceptions::PyValueError::new_err(
-            "Provide either 'isotopes' or 'groups', not both.",
-        ));
-    }
-    if !has_isotopes && !has_groups {
-        return Err(pyo3::exceptions::PyValueError::new_err(
-            "Must provide either 'isotopes' or 'groups'.",
-        ));
-    }
-
-    let ob_slice = open_beam_counts.as_slice()?;
-    let e_slice = energies.as_slice()?;
-    require_non_empty_energy_grid(e_slice)?;
-
-    if ob_slice.len() != e_slice.len() {
-        return Err(pyo3::exceptions::PyValueError::new_err(format!(
-            "open_beam_counts length ({}) must match energies length ({})",
-            ob_slice.len(),
-            e_slice.len(),
-        )));
-    }
-
-    if fit_alpha_2 && detector_background.is_none() {
-        return Err(pyo3::exceptions::PyValueError::new_err(
-            "fit_alpha_2 requires detector_background to be provided",
-        ));
-    }
-
-    let det_bg_vec = if let Some(ref bg) = detector_background {
-        let bg_s = bg.as_slice()?;
-        if bg_s.len() != e_slice.len() {
-            return Err(pyo3::exceptions::PyValueError::new_err(format!(
-                "detector_background length ({}) must match energies length ({})",
-                bg_s.len(),
-                e_slice.len(),
-            )));
-        }
-        bg_s.to_vec()
-    } else {
-        vec![0.0; e_slice.len()]
-    };
-
-    let res_fn = build_resolution(flight_path_m, delta_t_us, delta_l_m, resolution, None)?;
-    let energies_vec = e_slice.to_vec();
-
-    let mut config = if let Some(isotopes) = isotopes {
-        let iso_names: Vec<String> = isotopes
-            .iter()
-            .map(|(d, _)| {
-                let sym =
-                    nereids_core::elements::element_symbol(d.inner.isotope.z()).unwrap_or("?");
-                format!("{}-{}", sym, d.inner.isotope.a())
-            })
-            .collect();
-        let init_densities: Vec<f64> = isotopes.iter().map(|(_, d)| *d).collect();
-        let resonance_data: Vec<ResonanceData> = isotopes
-            .into_iter()
-            .map(|(d, _)| Arc::unwrap_or_clone(d.inner))
-            .collect();
-
-        UnifiedFitConfig::new(
-            energies_vec,
-            resonance_data,
-            iso_names,
-            temperature_k,
-            res_fn,
-            init_densities,
-        )
-        .map_err(|e| pyo3::exceptions::PyValueError::new_err(e.to_string()))?
-    } else {
-        let groups = groups.unwrap();
-        if groups.is_empty() {
-            return Err(pyo3::exceptions::PyValueError::new_err(
-                "groups list must not be empty",
-            ));
-        }
-        build_config_from_groups(
-            &groups,
-            energies_vec,
-            temperature_k,
-            res_fn,
-            initial_densities,
-        )?
-    };
-
-    if fit_temperature {
-        config = config.with_fit_temperature(true);
-    }
-    if fit_alpha_1 || fit_alpha_2 || alpha_1 != 1.0 || alpha_2 != 1.0 {
-        config = config.with_counts_background(CountsBackgroundConfig {
-            alpha_1_init: alpha_1,
-            alpha_2_init: alpha_2,
-            fit_alpha_1,
-            fit_alpha_2,
-            c: 1.0,
-        });
-    }
-
-    let flux = ob_slice.to_vec();
-    let background = det_bg_vec;
-
-    let result = py.detach(move || evaluate_jacobian_and_fisher(&config, &flux, &background));
-    // InvalidParameter → ValueError, other variants → RuntimeError — the
-    // same PipelineError convention as the three fitters (review R2).
-    let result = result.map_err(|e| {
-        let msg = e.to_string();
-        if matches!(
-            e,
-            nereids_pipeline::error::PipelineError::InvalidParameter(_)
-        ) {
-            pyo3::exceptions::PyValueError::new_err(msg)
-        } else {
-            pyo3::exceptions::PyRuntimeError::new_err(msg)
-        }
-    })?;
-
-    Ok(PyModelJacobianResult {
-        jacobian_data: result.jacobian.data,
-        jacobian_nrows: result.jacobian.nrows,
-        jacobian_ncols: result.jacobian.ncols,
-        fisher_data: result.fisher.data,
-        fisher_n: result.fisher.nrows,
-        model_prediction: result.model_prediction,
-        param_names: result.param_names,
-    })
-}
-
-/// Apply the issue-#633 density freeze to a config: an explicit
-/// per-density `density_free` mask takes precedence; otherwise
-/// `fix_densities=true` freezes all densities. `density_free` and
-/// `fix_densities` are mutually exclusive — supplying both is an error
-/// (the mask is unambiguous, the bool would be redundant or conflicting).
-fn apply_density_freeze(
-    config: nereids_pipeline::pipeline::UnifiedFitConfig,
-    fix_densities: bool,
-    density_free: Option<Vec<bool>>,
-) -> PyResult<nereids_pipeline::pipeline::UnifiedFitConfig> {
-    match density_free {
-        Some(free) => {
-            if fix_densities {
-                return Err(pyo3::exceptions::PyValueError::new_err(
-                    "Provide either 'fix_densities' or 'density_free', not both.",
-                ));
-            }
-            config
-                .with_density_free(free)
-                .map_err(|e| pyo3::exceptions::PyValueError::new_err(e.to_string()))
-        }
-        None => Ok(config.with_fix_densities(fix_densities)),
-    }
-}
-
-/// Shared kwarg plumbing for the bounded multiplicative baseline (issue
-/// #635), mirroring `apply_density_freeze`.  Rejects silent-noop
-/// combinations (baseline sub-options without `baseline=True`) and the
-/// degenerate free-Anorm pairing at the binding boundary (ValueError with
-/// the fix) rather than letting the core rejection surface as a
-/// RuntimeError after config assembly.
-#[allow(clippy::too_many_arguments)]
-fn apply_baseline(
-    config: nereids_pipeline::pipeline::UnifiedFitConfig,
-    baseline: bool,
-    fit_b0: bool,
-    fit_b1: bool,
-    fit_b2: bool,
-    b0_init: f64,
-    b1_init: f64,
-    b2_init: f64,
-    b0_bounds: Option<(f64, f64)>,
-    b1_bounds: Option<(f64, f64)>,
-    b2_bounds: Option<(f64, f64)>,
-    baseline_global: bool,
-    background: bool,
-    fit_anorm: bool,
-) -> PyResult<nereids_pipeline::pipeline::UnifiedFitConfig> {
-    if !baseline {
-        let sub_options_at_default = fit_b0
-            && fit_b1
-            && fit_b2
-            && b0_init == 1.0
-            && b1_init == 0.0
-            && b2_init == 0.0
-            && b0_bounds.is_none()
-            && b1_bounds.is_none()
-            && b2_bounds.is_none()
-            && baseline_global;
-        if !sub_options_at_default {
-            return Err(pyo3::exceptions::PyValueError::new_err(
-                "baseline sub-options (fit_b0/fit_b1/fit_b2, b*_init, b*_bounds, \
-                 baseline_global) require baseline=True — without it they would \
-                 silently do nothing.",
-            ));
-        }
-        return Ok(config);
-    }
-    if background && fit_anorm {
-        return Err(pyo3::exceptions::PyValueError::new_err(
-            "baseline=True with background=True requires fit_anorm=False: the \
-             baseline's b0 and the SAMMY Anorm are degenerate normalizations \
-             (never free two of them). Pass fit_anorm=False to combine the \
-             additive ABC background with the multiplicative baseline.",
-        ));
-    }
-    let mut bl = nereids_pipeline::pipeline::MultiplicativeBaselineConfig {
-        b0_init,
-        b1_init,
-        b2_init,
-        fit_b0,
-        fit_b1,
-        fit_b2,
-        spatial_global: baseline_global,
-        ..Default::default()
-    };
-    if let Some(b) = b0_bounds {
-        bl.b0_bounds = b;
-    }
-    if let Some(b) = b1_bounds {
-        bl.b1_bounds = b;
-    }
-    if let Some(b) = b2_bounds {
-        bl.b2_bounds = b;
-    }
-    Ok(config.with_multiplicative_baseline(bl))
-}
-
-/// Fit a single pre-normalized transmission spectrum.
-///
-/// This function accepts **transmission** data only (T = sample/open-beam).
-/// For raw-count fitting, use `fit_counts_spectrum_typed(...)`.
-///
-/// Either `isotopes` or `groups` must be provided, but not both.
-///
-/// Args:
-///     transmission: 1D transmission spectrum (pre-normalized).
-///     uncertainty: 1D uncertainty (same length as transmission).
-///     energies: 1D energy grid in eV (ascending).
-///     isotopes: list of (ResonanceData, initial_density) tuples (mutually exclusive with groups).
-///     temperature_k: Sample temperature in Kelvin (default 293.6).
-///     fit_temperature: Whether to fit temperature (default False).
-///     max_iter: Maximum iterations (default 200).
-///     solver: "lm" (default) or "auto". Count-likelihood names are
-///         rejected for normalized transmission.
-///     background: Enable SAMMY transmission background.
-///     resolution: Optional resolution function.
-///     groups: list of IsotopeGroup objects (mutually exclusive with isotopes).
-///     initial_densities: Initial density guesses when using groups (default 0.001 each).
-///     fit_anorm: Whether Anorm is free when ``background=True`` (default
-///         True).  Must be False to combine ``background=True`` with
-///         ``baseline=True`` (b0 and Anorm are degenerate normalizations).
-///     baseline: Enable the bounded multiplicative baseline
-///         ``B(E) = b0 + b1·ln(E/E_ref) + b2·ln²(E/E_ref)`` applied
-///         OUTERMOST (issue #635).  E_ref is the geometric midpoint of the
-///         energy grid and is reported as ``FitResult.baseline_e_ref_ev``.
-///     fit_b0, fit_b1, fit_b2: Per-coefficient fit flags (default True).
-///         All-False freezes the baseline at its inits.
-///     b0_init, b1_init, b2_init: Initial coefficients (default 1, 0, 0 —
-///         the identity baseline).
-///     b0_bounds, b1_bounds, b2_bounds: Optional (lower, upper) optimizer
-///         boxes; defaults (0.9, 1.1) / (−0.05, 0.05) / (−0.05, 0.05).
-///         The boxes bound the coefficients (tilt/curvature per ln-E
-///         unit), not the evaluated B(E); dip protection comes from the
-///         quadratic's smoothness, and B(E) > 0 is enforced pointwise.
-///
-/// Returns:
-///     FitResult with densities, uncertainties, chi2, etc.
-#[pyfunction]
-#[pyo3(name = "fit_spectrum_typed", signature = (
-    transmission, uncertainty, energies, isotopes=None, *,
-    temperature_k = 293.6,
-    fit_temperature = false,
-    max_iter = 200,
-    solver = "lm",
-    background = false,
-    fit_back_d = false,
-    fit_back_f = false,
-    back_d_init = 0.01,
-    back_f_init = 1.0,
-    fit_energy_scale = false,
-    t0_init_us = 0.0,
-    l_scale_init = 1.0,
-    energy_scale_flight_path_m = 25.0,
-    resolution = None,
-    flight_path_m = None,
-    delta_t_us = None,
-    delta_l_m = None,
-    groups = None,
-    initial_densities = None,
-    fix_densities = false,
-    density_free = None,
-    tzero_jacobian = None,
-    fit_energy_range = None,
-    fit_anorm = true,
-    baseline = false,
-    fit_b0 = true,
-    fit_b1 = true,
-    fit_b2 = true,
-    b0_init = 1.0,
-    b1_init = 0.0,
-    b2_init = 0.0,
-    b0_bounds = None,
-    b1_bounds = None,
-    b2_bounds = None,
-    scale_by_chi2 = false,
-))]
-fn py_fit_spectrum_typed<'py>(
-    py: Python<'py>,
-    transmission: PyReadonlyArray1<'py, f64>,
-    uncertainty: PyReadonlyArray1<'py, f64>,
-    energies: PyReadonlyArray1<'py, f64>,
-    isotopes: Option<Vec<(PyResonanceData, f64)>>,
-    temperature_k: f64,
-    fit_temperature: bool,
-    max_iter: usize,
-    solver: &str,
-    background: bool,
-    fit_back_d: bool,
-    fit_back_f: bool,
-    back_d_init: f64,
-    back_f_init: f64,
-    fit_energy_scale: bool,
-    t0_init_us: f64,
-    l_scale_init: f64,
-    energy_scale_flight_path_m: f64,
-    resolution: Option<PyTabulatedResolution>,
-    flight_path_m: Option<f64>,
-    delta_t_us: Option<f64>,
-    delta_l_m: Option<f64>,
-    groups: Option<Vec<PyIsotopeGroup>>,
-    initial_densities: Option<Vec<f64>>,
-    fix_densities: bool,
-    density_free: Option<Vec<bool>>,
-    tzero_jacobian: Option<&str>,
-    fit_energy_range: Option<(f64, f64)>,
-    fit_anorm: bool,
-    baseline: bool,
-    fit_b0: bool,
-    fit_b1: bool,
-    fit_b2: bool,
-    b0_init: f64,
-    b1_init: f64,
-    b2_init: f64,
-    b0_bounds: Option<(f64, f64)>,
-    b1_bounds: Option<(f64, f64)>,
-    b2_bounds: Option<(f64, f64)>,
-    scale_by_chi2: bool,
-) -> PyResult<PyFitResult> {
-    use nereids_pipeline::pipeline::{InputData, fit_spectrum_typed};
-
-    // Validate mutual exclusivity
-    let has_isotopes = isotopes.is_some();
-    let has_groups = groups.is_some();
-    if has_isotopes && has_groups {
-        return Err(pyo3::exceptions::PyValueError::new_err(
-            "Provide either 'isotopes' or 'groups', not both.",
-        ));
-    }
-    if !has_isotopes && !has_groups {
-        return Err(pyo3::exceptions::PyValueError::new_err(
-            "Must provide either 'isotopes' or 'groups'.",
-        ));
-    }
-
-    let t_slice = transmission.as_slice()?;
-    let u_slice = uncertainty.as_slice()?;
-    let e_slice = energies.as_slice()?;
-
-    if t_slice.len() != u_slice.len() {
-        return Err(pyo3::exceptions::PyValueError::new_err(format!(
-            "transmission length ({}) must match uncertainty length ({})",
-            t_slice.len(),
-            u_slice.len(),
-        )));
-    }
-    if t_slice.len() != e_slice.len() {
-        return Err(pyo3::exceptions::PyValueError::new_err(format!(
-            "transmission length ({}) must match energies length ({})",
-            t_slice.len(),
-            e_slice.len(),
-        )));
-    }
-    require_non_empty_energy_grid(e_slice)?;
-
-    // Issue #458 V2: reject non-finite / negative initial densities.
-    if let Some(ref init_d) = initial_densities {
-        for (i, &d) in init_d.iter().enumerate() {
-            if !d.is_finite() || d < 0.0 {
-                return Err(pyo3::exceptions::PyValueError::new_err(format!(
-                    "initial_densities[{i}] must be finite and non-negative, got {d}",
-                )));
-            }
-        }
-    }
-    // Also validate embedded densities passed through `isotopes: list[(ResonanceData, float)]`.
-    if let Some(ref iso) = isotopes {
-        for (i, (_, d)) in iso.iter().enumerate() {
-            if !d.is_finite() || *d < 0.0 {
-                return Err(pyo3::exceptions::PyValueError::new_err(format!(
-                    "isotopes[{i}] initial density must be finite and non-negative, got {d}",
-                )));
-            }
-        }
-    }
-
-    let energies_vec = e_slice.to_vec();
-
-    // Build resolution
-    let res_fn = build_resolution(flight_path_m, delta_t_us, delta_l_m, resolution, None)?;
-
-    // Build config based on isotopes or groups
-    let mut config = if let Some(isotopes) = isotopes {
-        let iso_names: Vec<String> = isotopes
-            .iter()
-            .map(|(d, _)| {
-                let sym =
-                    nereids_core::elements::element_symbol(d.inner.isotope.z()).unwrap_or("?");
-                format!("{}-{}", sym, d.inner.isotope.a())
-            })
-            .collect();
-        let init_densities: Vec<f64> = isotopes.iter().map(|(_, d)| *d).collect();
-        let resonance_data: Vec<ResonanceData> = isotopes
-            .into_iter()
-            .map(|(d, _)| Arc::unwrap_or_clone(d.inner))
-            .collect();
-
-        UnifiedFitConfig::new(
-            energies_vec,
-            resonance_data,
-            iso_names,
-            temperature_k,
-            res_fn,
-            init_densities,
-        )
-        .map_err(|e| pyo3::exceptions::PyValueError::new_err(e.to_string()))?
-    } else {
-        let groups = groups.unwrap();
-        if groups.is_empty() {
-            return Err(pyo3::exceptions::PyValueError::new_err(
-                "groups list must not be empty",
-            ));
-        }
-        build_config_from_groups(
-            &groups,
-            energies_vec,
-            temperature_k,
-            res_fn,
-            initial_densities,
-        )?
-    };
-
-    // Solver — is_counts=false because this function only accepts transmission+uncertainty,
-    // so "auto" always resolves to LM (the signature default is "lm" to match).
-    let solver_config = parse_solver_config(solver, false, max_iter)?;
-    config = config.with_solver(solver_config);
-
-    // Issue #638: this function takes transmission input and therefore always
-    // uses LM. LM already scales its covariance by reduced chi-squared, so this
-    // compatibility flag is a no-op here.
-    config = config.with_scale_by_chi2(scale_by_chi2);
-
-    // Temperature fitting
-    if fit_temperature {
-        config = config.with_fit_temperature(true);
-    }
-
-    // Background
-    if background {
-        let mut bg = nereids_pipeline::pipeline::BackgroundConfig::default();
-        bg.fit_anorm = fit_anorm;
-        bg.fit_back_d = fit_back_d;
-        bg.fit_back_f = fit_back_f;
-        bg.back_d_init = back_d_init;
-        bg.back_f_init = back_f_init;
-        config = config.with_transmission_background(bg);
-    } else if !fit_anorm {
-        // Anorm only exists on the background model — reject the silent
-        // no-op rather than letting the kwarg vanish.
-        return Err(pyo3::exceptions::PyValueError::new_err(
-            "fit_anorm=False requires background=True: Anorm is a parameter \
-             of the SAMMY background model.",
-        ));
-    }
-
-    // Bounded multiplicative baseline (issue #635).
-    config = apply_baseline(
-        config, baseline, fit_b0, fit_b1, fit_b2, b0_init, b1_init, b2_init, b0_bounds, b1_bounds,
-        b2_bounds, true, background, fit_anorm,
-    )?;
-
-    // Energy-scale calibration (SAMMY TZERO equivalent)
-    if fit_energy_scale {
-        validate_energy_scale_params(t0_init_us, l_scale_init, energy_scale_flight_path_m)?;
-        config = config.with_energy_scale(t0_init_us, l_scale_init, energy_scale_flight_path_m);
-    }
-    let tzero_method = parse_tzero_jacobian(tzero_jacobian)?;
-    if tzero_method.is_some() {
-        config = config.with_tzero_jacobian_method(tzero_method);
-    }
-
-    // SAMMY EMIN/EMAX-equivalent fit-energy-range (#514): when set, the
-    // LM cost-function masks residuals to bins inside [E_min, E_max].
-    // The Python caller is expected to pass full grid + per-bin data
-    // and let the solver-side mask handle the restriction; the model
-    // is still evaluated on the full grid so resolution broadening at
-    // the boundaries remains correct (no caller-side margin slicing
-    // needed).
-    config = config
-        .with_fit_energy_range(fit_energy_range)
-        .map_err(|e| pyo3::exceptions::PyValueError::new_err(e.to_string()))?;
-
-    // Issue #633: freeze known densities (calibration-foil thermometry).
-    config = apply_density_freeze(config, fix_densities, density_free)?;
-
-    // Build 1D InputData
-    let input = InputData::Transmission {
-        transmission: t_slice.to_vec(),
-        uncertainty: u_slice.to_vec(),
-    };
-
-    // Release the GIL for the fit computation.
-    let result = py.detach(move || fit_spectrum_typed(&input, &config));
-
-    // Config-class errors (InvalidParameter) surface as ValueError —
-    // matching py_spatial_map_typed, which established the convention for
-    // PipelineError at this boundary (review R2: identical invalid input,
-    // e.g. a baseline init outside its bounds, previously raised ValueError
-    // from the spatial API but RuntimeError here because the error variant
-    // was stringified inside py.detach).  Other variants stay RuntimeError —
-    // they signal solver / numeric failures, not bad input.
-    let result = result.map_err(|e| {
-        let msg = e.to_string();
-        if matches!(
-            e,
-            nereids_pipeline::error::PipelineError::InvalidParameter(_)
-        ) {
-            pyo3::exceptions::PyValueError::new_err(msg)
-        } else {
-            pyo3::exceptions::PyRuntimeError::new_err(msg)
-        }
-    })?;
-
-    Ok(PyFitResult {
-        densities: result.densities,
-        uncertainties: result.uncertainties,
-        reduced_chi_squared: result.reduced_chi_squared,
-        converged: result.converged,
-        iterations: result.iterations,
-        temperature_k: result.temperature_k,
-        temperature_k_unc: result.temperature_k_unc,
-        anorm: result.anorm,
-        background: result.background,
-        // BackD / BackF are only meaningful when the polynomial
-        // background model was actually attached.  `result.back_d` /
-        // `result.back_f` are `Option<f64>` (None when the inner
-        // Rust fit didn't fit the exponential tail).  The outer gate
-        // on `background && fit_back_d` is defensive — it ensures
-        // PyFitResult.back_d is None whenever the caller didn't
-        // request the tail, regardless of any future change to the
-        // inner Rust contract.
-        back_d: if background && fit_back_d {
-            result.back_d
-        } else {
-            None
-        },
-        back_f: if background && fit_back_f {
-            result.back_f
-        } else {
-            None
-        },
-        t0_us: result.t0_us,
-        l_scale: result.l_scale,
-        energy_scale_flight_path_m: result.energy_scale_flight_path_m,
-        deviance_per_dof: result.deviance_per_dof,
-        baseline: result.baseline,
-        baseline_e_ref_ev: result.baseline_e_ref_ev,
-        warnings: result.warnings,
-    })
 }

@@ -34,35 +34,14 @@ _MANIFEST_NAMES = (
     "analysis.json",
 )
 _COUNTS_RESOLUTION_UNSUPPORTED = (
-    "counts input with instrument resolution is not available: a resolved "
-    "count fit needs the separate-arm model R[Phi] and R[Phi*T], which this "
-    "fit does not have. Supply pre-normalized transmission, or disable "
-    "instrument resolution."
+    "counts input with instrument resolution is not available: the counts fit "
+    "uses the Ikeda-Carpenter pulse, not a tabulated resolution. Remove the "
+    "resolution block."
 )
-# The solver names `parse_solver_config` (bindings/python/src/lib.rs) actually
-# accepts. Validation MUST check against this set before the domain-specific
-# rules: rejecting only the known cross-domain combinations let an unsupported
-# name ("typo", or the never-supported "poisson_kl") pass a dry run and then
-# fail at dispatch, breaking the validate/run parity this layer promises.
-_SUPPORTED_SOLVERS = ("auto", "lm", "kl", "poisson", "joint_poisson")
-# Count-likelihood names among those; rejected for normalized transmission.
-_COUNT_LIKELIHOOD_SOLVERS = frozenset({"kl", "poisson", "joint_poisson"})
-_UNSUPPORTED_SOLVER = (
-    "unsupported solver: {solver!r}; the fitting engine accepts "
-    + ", ".join(repr(name) for name in _SUPPORTED_SOLVERS)
-)
+
 _SAFE_KEY = re.compile(r"[^A-Za-z0-9_]+")
 
 
-def _requested_solver(fit_config: dict[str, Any]) -> str:
-    """Case-normalized solver name from a manifest fit block.
-
-    The manifest layer is case-insensitive (every routing check here
-    lowercases), so the normalized value is what must reach the binding too —
-    passing the raw string through would let `solver: "KL"` satisfy these
-    checks and then fail `parse_solver_config` as an unknown name.
-    """
-    return str(fit_config.get("solver", "auto")).lower()
 
 
 def _json_safe(value: Any) -> Any:
@@ -311,25 +290,6 @@ def _finite_float_or_none(value: Any) -> float | None:
     return scalar if math.isfinite(scalar) else None
 
 
-def _ascending_energy_grid(
-    energies: np.ndarray, *aligned: np.ndarray
-) -> tuple[np.ndarray, ...]:
-    """Ensure energies are strictly ascending, reversing aligned arrays if needed."""
-    grid = _validate_array("energies", energies, ndim=1)
-    arrays = tuple(np.ascontiguousarray(a) for a in aligned)
-    for arr in arrays:
-        if arr.shape[0] != grid.size:
-            raise ValueError(
-                "aligned data first dimension must match energies, "
-                f"got {arr.shape[0]} and {grid.size}"
-            )
-    diffs = np.diff(grid)
-    if np.all(diffs > 0):
-        return (grid, *arrays)
-    if np.all(diffs < 0):
-        reversed_arrays = tuple(np.ascontiguousarray(a[::-1, ...]) for a in arrays)
-        return (np.ascontiguousarray(grid[::-1]), *reversed_arrays)
-    raise ValueError("energies must be strictly monotonic")
 
 
 def _npz_arrays(path: Path) -> dict[str, np.ndarray]:
@@ -356,45 +316,6 @@ def _require_npz_keys(
         )
 
 
-def _load_energy_grid(
-    base: Path,
-    data_config: dict[str, Any],
-    arrays: dict[str, np.ndarray] | None,
-    n_expected: int | None = None,
-) -> np.ndarray:
-    """Load or synthesize an energy grid from manifest config and data arrays."""
-    grid_config = data_config.get("energy_grid") or data_config.get("energies") or {}
-    if isinstance(grid_config, str):
-        grid_config = {"path": grid_config}
-    if not isinstance(grid_config, dict):
-        raise ValueError("energy_grid/energies must be an object or path string")
-
-    key = (
-        grid_config.get("key")
-        or data_config.get("energy_key")
-        or data_config.get("energies_key")
-    )
-    if key and arrays is not None:
-        if key not in arrays:
-            raise ValueError(f"energy key {key!r} not found in data file")
-        return _validate_array("energies", arrays[key], ndim=1)
-
-    if arrays is not None and "energies_ev" in arrays:
-        return _validate_array("energies", arrays["energies_ev"], ndim=1)
-
-    path = _resolve_path(base, grid_config.get("path"))
-    if path is not None:
-        return _validate_array("energies", np.loadtxt(path), ndim=1)
-
-    start = grid_config.get("start_ev", data_config.get("energy_min_ev"))
-    stop = grid_config.get("stop_ev", data_config.get("energy_max_ev"))
-    n_points = grid_config.get("n_points", data_config.get("n_points", n_expected))
-    if start is None or stop is None or n_points is None:
-        raise ValueError(
-            "energy grid is required: provide energies_ev in the data file or "
-            "energy_grid with start_ev, stop_ev, and n_points"
-        )
-    return np.linspace(float(start), float(stop), int(n_points), dtype=np.float64)
 
 
 def _load_isotopes(
@@ -468,134 +389,153 @@ def _load_isotopes(
     return loaded, names
 
 
-def _resolution_kwargs(base: Path, config: dict[str, Any]) -> dict[str, Any]:
-    """Build NEREIDS resolution keyword arguments from manifest config."""
-    resolution_config = config.get("resolution") or {}
-    if not resolution_config:
-        return {}
-    if isinstance(resolution_config, str):
-        resolution_config = {"kind": resolution_config}
-    if not isinstance(resolution_config, dict):
-        raise ValueError("resolution must be an object")
+def _as_value(spec: Any, default_kind: str) -> nereids.Value:
+    """Build a Value from a manifest entry.
 
-    kind = _normalise_kind(resolution_config.get("kind", "none"), "none")
-    if kind in {"none", "disabled", "false"}:
-        return {}
-    if kind in {"gaussian", "sammy_gaussian"}:
-        return {
-            "flight_path_m": float(resolution_config["flight_path_m"]),
-            "delta_t_us": float(resolution_config["delta_t_us"]),
-            "delta_l_m": float(resolution_config["delta_l_m"]),
-        }
-    if kind in {"tabulated", "file", "resolution_file"}:
-        path = _resolve_path(base, resolution_config.get("path"))
-        if path is None:
-            raise ValueError("tabulated resolution requires a path")
-        flight_path_m = float(resolution_config["flight_path_m"])
-        return {"resolution": nereids.load_resolution(str(path), flight_path_m)}
-    raise ValueError(f"unknown resolution kind: {kind}")
+    A number is a known value.  A mapping takes 'kind' ("known", "fitted",
+    "within" or "measured") and the matching fields: 'value' for known and
+    fitted, 'value'/'lower'/'upper' for within, and 'value'/'sd' for measured.
+    """
+    if isinstance(spec, bool) or not isinstance(spec, (int, float, dict)):
+        raise ValueError("Value spec must be a number or an object")
+    if isinstance(spec, (int, float)):
+        return nereids.Value.known(float(spec))
+    kind = _normalise_kind(spec.get("kind", default_kind), default_kind)
+    value = spec.get("value")
+    if kind == "known":
+        return nereids.Value.known(float(value))
+    if kind == "fitted":
+        return nereids.Value.fitted(float(value))
+    if kind == "within":
+        return nereids.Value.within(
+            float(value), float(spec["lower"]), float(spec["upper"])
+        )
+    if kind == "measured":
+        return nereids.Value.measured(float(value), float(spec["sd"]))
+    raise ValueError(f"unknown Value kind: {kind}")
 
 
-def _fit_energy_range(value: Any) -> tuple[float, float] | None:
-    if value is None:
+def _value_or_number(spec: Any, default: float) -> nereids.Value:
+    if spec is None:
+        return nereids.Value.known(default)
+    return _as_value(spec, "known")
+
+
+def _background_values(spec: Any) -> list:
+    """A [b0, b1, b2] background, each a Value; absent means no background."""
+    if spec is None:
+        return [nereids.Value.known(0.0)] * 3
+    if isinstance(spec, dict):
+        missing = [key for key in ("b0", "b1", "b2") if key not in spec]
+        if missing:
+            raise ValueError(f"background is missing {', '.join(missing)}")
+        return [nereids.Value.known(float(spec[key])) for key in ("b0", "b1", "b2")]
+    if isinstance(spec, (list, tuple)) and len(spec) == 3:
+        return [_as_value(value, "known") for value in spec]
+    raise ValueError("background must be [b0, b1, b2] or an object with b0/b1/b2")
+
+
+def _time_background_values(spec: Any) -> list | None:
+    """The additive time background's [C, A, tau], or none."""
+    if spec is None:
         return None
-    if isinstance(value, dict):
-        value = (value.get("min_ev"), value.get("max_ev"))
-    if not isinstance(value, (list, tuple)) or len(value) != 2:
-        raise ValueError("fit_energy_range must be [min_ev, max_ev]")
-    return (float(value[0]), float(value[1]))
+    if not isinstance(spec, (list, tuple)) or len(spec) != 3:
+        raise ValueError("time_background must be [C, A, tau]")
+    return [_as_value(value, "known") for value in spec]
 
 
-# Fit keys removed together with the dead alpha_1/alpha_2 counts-fit
-# parameters. The fit config is whitelist-filtered, so without this check a
-# legacy manifest naming them would silently run with defaults instead.
-_REMOVED_FIT_KEYS = frozenset(
-    {"fit_alpha_1", "fit_alpha_2", "alpha_1_init", "alpha_2_init"}
-)
+def _temperature_value(fit_config: dict[str, Any]) -> nereids.Value:
+    """The material temperature; a number is fitted only with fit_temperature."""
+    spec = fit_config.get("temperature")
+    if spec is None:
+        spec = fit_config.get("temperature_k", 293.6)
+    if isinstance(spec, bool):
+        raise ValueError("temperature must be a number or an object")
+    if isinstance(spec, (int, float)):
+        if bool(fit_config.get("fit_temperature", False)):
+            return nereids.Value.fitted(float(spec))
+        return nereids.Value.known(float(spec))
+    return _as_value(spec, "fitted")
 
 
-def _reject_removed_fit_keys(fit_config: dict[str, Any]) -> None:
-    """Raise on fit-config keys that were removed from the API entirely."""
-    removed = sorted(_REMOVED_FIT_KEYS & fit_config.keys())
-    if removed:
+def _calibration(config: dict[str, Any], data_config: dict[str, Any]) -> nereids.Calibration:
+    """Build the timing offset, flight path and Ikeda-Carpenter pulse."""
+    block = config.get("calibration") or data_config.get("calibration") or {}
+    if not isinstance(block, dict):
+        raise ValueError("calibration must be an object")
+    pulse_config = block.get("pulse") or {}
+    if not isinstance(pulse_config, dict):
+        raise ValueError("calibration.pulse must be an object")
+    span = pulse_config.get("energy_span_ev")
+    if not isinstance(span, (list, tuple)) or len(span) != 2:
+        raise ValueError("calibration.pulse.energy_span_ev must be [low_ev, high_ev]")
+    line_span = pulse_config.get("line_span_ev")
+    pulse = nereids.Pulse(
+        alpha0=_value_or_number(pulse_config.get("alpha0"), 0.0),
+        alpha1=_value_or_number(pulse_config.get("alpha1"), 0.0),
+        beta0=_value_or_number(pulse_config.get("beta0"), 0.0),
+        beta1=_value_or_number(pulse_config.get("beta1"), 0.0),
+        r=_value_or_number(pulse_config.get("r"), 0.0),
+        fwhm_squared_us2=_value_or_number(pulse_config.get("fwhm_squared_us2"), 0.0),
+        energy_span_ev=(float(span[0]), float(span[1])),
+        n_tau=int(pulse_config.get("n_tau", 600)),
+        line_span_ev=None if line_span is None else (float(line_span[0]), float(line_span[1])),
+    )
+    return nereids.Calibration(
+        t0_us=_value_or_number(block.get("t0_us"), 0.0),
+        flight_path_m=_value_or_number(block.get("flight_path_m"), 25.0),
+        pulse=pulse,
+    )
+
+
+def _load_time_edges(
+    base: Path,
+    data_config: dict[str, Any],
+    arrays: dict[str, np.ndarray] | None,
+    n_bins: int,
+) -> np.ndarray:
+    """Original detector time-bin edges in microseconds, in the counts' order."""
+    key = str(data_config.get("time_edges_key", "time_edges_us"))
+    if arrays is None or key not in arrays:
+        raise ValueError(f"raw counts require original time_edges_us (NPZ key {key!r})")
+    edges = _validate_array("time_edges_us", arrays[key], ndim=1)
+    if edges.size != n_bins + 1:
         raise ValueError(
-            f"fit config uses removed key(s) {removed}: the alpha_1/alpha_2 "
-            "counts-fit parameters were removed and are no longer supported"
+            f"time_edges_us must have {n_bins + 1} edges for {n_bins} bins, got {edges.size}"
         )
+    if not np.all(np.diff(edges) > 0):
+        raise ValueError("time_edges_us must be strictly increasing in the counts' order")
+    return np.ascontiguousarray(edges, dtype=np.float64)
 
 
-def _single_fit_kwargs(
+def _material(
+    config: dict[str, Any],
+    frontmatter: dict[str, Any],
+    base: Path,
     fit_config: dict[str, Any],
-    resolution: dict[str, Any],
-    counts: bool,
-) -> dict[str, Any]:
-    _reject_removed_fit_keys(fit_config)
-    keys = {
-        "temperature_k",
-        "fit_temperature",
-        "max_iter",
-        "solver",
-        "background",
-        "fit_back_d",
-        "fit_back_f",
-        "back_d_init",
-        "back_f_init",
-        "fit_energy_scale",
-        "t0_init_us",
-        "l_scale_init",
-        "energy_scale_flight_path_m",
-        "tzero_jacobian",
+) -> tuple[nereids.Material, list[str], list[float]]:
+    """The fitted material and its isotope names and initial densities."""
+    entries = _get_isotope_entries(config, frontmatter)
+    default_library = str(config.get("library", "endf8.1"))
+    libraries = {
+        str(entry.get("library", default_library))
+        if isinstance(entry, dict) else default_library
+        for entry in entries
     }
-    if counts:
-        keys.update(
-            {
-                "enable_polish",
-            }
-        )
-    kwargs = {key: fit_config[key] for key in keys if key in fit_config}
-    if "solver" in kwargs:
-        # Hand the binding the SAME normalized name the routing checks used.
-        kwargs["solver"] = _requested_solver(fit_config)
-    if "fit_energy_range" in fit_config:
-        kwargs["fit_energy_range"] = _fit_energy_range(fit_config["fit_energy_range"])
-    kwargs.update(resolution)
-    return kwargs
+    if len(libraries) > 1:
+        raise ValueError("a counts material must use one ENDF library for every isotope")
+    library = next(iter(libraries), default_library)
+    isotopes, names = _load_isotopes(
+        entries, base, default_library=default_library
+    )
+    initial = [density for _, density in isotopes]
+    material = nereids.Material(
+        isotopes=[(data, nereids.Value.fitted(density)) for data, density in isotopes],
+        temperature_k=_temperature_value(fit_config),
+        library=library,
+    )
+    return material, names, initial
 
-
-def _spatial_fit_kwargs(
-    fit_config: dict[str, Any],
-    resolution: dict[str, Any],
-) -> dict[str, Any]:
-    _reject_removed_fit_keys(fit_config)
-    keys = {
-        "temperature_k",
-        "fit_temperature",
-        "max_iter",
-        "solver",
-        "background",
-        # Surface the SAMMY exponential background tail
-        # (`BackD` / `BackF`) at the MCP boundary so callers can request
-        # per-pixel `back_d_map` / `back_f_map`.
-        "fit_back_d",
-        "fit_back_f",
-        "back_d_init",
-        "back_f_init",
-        "c",
-        "enable_polish",
-        "fit_energy_scale",
-        "t0_init_us",
-        "l_scale_init",
-        "energy_scale_flight_path_m",
-        "tzero_jacobian",
-    }
-    kwargs = {key: fit_config[key] for key in keys if key in fit_config}
-    if "solver" in kwargs:
-        # Hand the binding the SAME normalized name the routing checks used.
-        kwargs["solver"] = _requested_solver(fit_config)
-    if "fit_energy_range" in fit_config:
-        kwargs["fit_energy_range"] = _fit_energy_range(fit_config["fit_energy_range"])
-    kwargs.update(resolution)
-    return kwargs
 
 
 def _safe_npz_key(name: str) -> str:
@@ -637,43 +577,42 @@ def _limit_pixels(
 
 
 def _fit_result_summary(result: Any, names: list[str]) -> dict[str, Any]:
-    densities = np.asarray(result.densities, dtype=float)
-    uncertainties = np.asarray(result.uncertainties, dtype=float)
+    region = result.regions[0] if result.regions else None
+    densities = np.asarray(region.densities if region is not None else [], dtype=float)
+    covariance = result.covariance
+    deviations = None
+    if covariance is not None and np.asarray(covariance).size:
+        deviations = np.sqrt(np.diag(np.asarray(covariance, dtype=float)))
     entries = []
-    for i, name in enumerate(names):
+    for index, name in enumerate(names):
         entries.append(
             {
                 "isotope": name,
-                "density_atoms_per_barn": _finite_float_or_none(densities[i]),
-                "uncertainty_atoms_per_barn": _finite_float_or_none(uncertainties[i])
-                if i < len(uncertainties)
+                "density_atoms_per_barn": _finite_float_or_none(densities[index])
+                if index < densities.size
+                else None,
+                "uncertainty_atoms_per_barn": _finite_float_or_none(deviations[index])
+                if deviations is not None and index < deviations.size
                 else None,
             }
         )
-    summary: dict[str, Any] = {
+    return {
         "density_fits": entries,
-        "reduced_chi_squared": _finite_float_or_none(result.reduced_chi_squared),
-        "deviance_per_dof": None
-        if getattr(result, "deviance_per_dof", None) is None
-        else _finite_float_or_none(result.deviance_per_dof),
+        "deviance": _finite_float_or_none(result.deviance),
         "converged": bool(result.converged),
-        "iterations": int(result.iterations),
+        "normalization": _finite_float_or_none(result.normalization),
+        "t0_us": _finite_float_or_none(result.t0_us),
+        "flight_path_m": _finite_float_or_none(result.flight_path_m),
         "temperature_k": None
-        if result.temperature_k is None
-        else _finite_float_or_none(result.temperature_k),
-        "anorm": _finite_float_or_none(result.anorm),
-        "background": [_finite_float_or_none(v) for v in result.background],
+        if region is None or region.temperature_k is None
+        else _finite_float_or_none(region.temperature_k),
+        "time_background": [_finite_float_or_none(v) for v in result.time_background],
+        "alpha": _json_safe(list(result.alpha)),
+        "beta": _json_safe(list(result.beta)),
+        "r": _finite_float_or_none(result.r),
+        "fwhm_squared_us2": _finite_float_or_none(result.fwhm_squared_us2),
     }
-    # Fitted TZERO (t0_us, l_scale) and exponential-background (back_d, back_f)
-    # parameters are populated on FitResult when the corresponding fit flags
-    # are set in the manifest's analysis.fit block. Emit them only when present
-    # so the schema stays backwards-compatible for fits that don't enable
-    # those flags (key absent rather than null, matching deviance_per_dof).
-    for attr in ("t0_us", "l_scale", "back_d", "back_f"):
-        value = getattr(result, attr, None)
-        if value is not None:
-            summary[attr] = _finite_float_or_none(value)
-    return summary
+
 
 
 def _process_single_spectrum(
@@ -688,148 +627,69 @@ def _process_single_spectrum(
     data_path = _resolve_path(base, data_config.get("path"))
     if data_path is None:
         raise ValueError("single_spectrum workflow requires data.path")
-
-    kind = _normalise_kind(data_config.get("kind"), "counts_npz")
-    arrays = _npz_arrays(data_path) if data_path.suffix == ".npz" else None
-    if arrays is None:
-        loaded = np.loadtxt(data_path, delimiter=data_config.get("delimiter", None))
-        if loaded.ndim != 2 or loaded.shape[1] < 2:
-            raise ValueError("spectrum text input must have at least two columns")
-        arrays = {
-            "energies_ev": loaded[:, int(data_config.get("energy_column", 0))],
-            "transmission": loaded[:, int(data_config.get("transmission_column", 1))],
-        }
-        if loaded.shape[1] > 2:
-            arrays["uncertainty"] = loaded[:, int(data_config.get("uncertainty_column", 2))]
-        kind = "transmission_npz"
-
-    entries = _get_isotope_entries(config, frontmatter)
-    isotopes, names = _load_isotopes(
-        entries, base, default_library=str(config.get("library", "endf8.1"))
+    if data_path.suffix != ".npz":
+        raise ValueError("single_spectrum counts data must be a .npz file")
+    arrays = _npz_arrays(data_path)
+    sample_key = data_config.get("sample_key", "sample_counts")
+    open_beam_key = data_config.get("open_beam_key", "open_beam_counts")
+    _require_npz_keys(
+        arrays, [sample_key, open_beam_key], context="single_spectrum counts data"
     )
-    resolution = _resolution_kwargs(base, config)
-    if kind in {"counts_npz", "counts"}:
-        sample_key = data_config.get("sample_key", "sample_counts")
-        open_beam_key = data_config.get("open_beam_key", "open_beam_counts")
-        _require_npz_keys(
-            arrays,
-            [sample_key, open_beam_key],
-            context="single_spectrum counts data",
-        )
-        sample = _validate_array("sample_counts", arrays[sample_key])
-        open_beam = _validate_array("open_beam_counts", arrays[open_beam_key])
-        _require_same_shape("sample_counts", sample, ("open_beam_counts", open_beam))
-        energies = _load_energy_grid(base, data_config, arrays, n_expected=sample.shape[0])
-        energies, sample, open_beam = _ascending_energy_grid(energies, sample, open_beam)
-        if sample.ndim == 3:
-            sample = np.ascontiguousarray(sample.sum(axis=(1, 2)))
-            open_beam = np.ascontiguousarray(open_beam.sum(axis=(1, 2)))
-        if sample.ndim != 1 or open_beam.ndim != 1:
-            raise ValueError("single_spectrum counts arrays must be 1D or 3D")
-        c = float(data_config.get("pc_ratio", arrays.get("pc_ratio", 1.0)))
-        fit_domain = str(fit_config.get("fit_domain", "counts")).lower()
-        if fit_domain != "counts":
-            raise ValueError(
-                "raw count input cannot be fit in the transmission domain: "
-                "the conversion discards open-beam count uncertainty; use "
-                "fit_domain='counts' with solver='auto' or solver='kl'"
-            )
-        requested_solver = _requested_solver(fit_config)
-        if requested_solver not in _SUPPORTED_SOLVERS:
-            raise ValueError(_UNSUPPORTED_SOLVER.format(solver=requested_solver))
-        if requested_solver == "lm":
-            raise ValueError(
-                "raw count input cannot use solver='lm': the least-squares "
-                "transmission engine would discard open-beam count uncertainty; "
-                "use solver='auto' or solver='kl'"
-            )
-        kwargs = _single_fit_kwargs(fit_config, resolution, counts=True)
-        kwargs["c"] = float(fit_config.get("c", c))
-        result = nereids.fit_counts_spectrum_typed(
-            sample_counts=sample,
-            open_beam_counts=open_beam,
-            energies=energies,
-            isotopes=isotopes,
-            **kwargs,
-        )
-        transmission = sample / np.maximum(kwargs["c"] * open_beam, 1.0)
-        uncertainty = transmission * np.sqrt(
-            1.0 / np.maximum(sample, 1.0) + 1.0 / np.maximum(open_beam, 1.0)
-        )
-    elif kind in {"transmission_npz", "transmission", "spectrum"}:
-        fit_domain = str(fit_config.get("fit_domain", "transmission")).lower()
-        if fit_domain != "transmission":
-            raise ValueError(
-                "normalized transmission input must use fit_domain='transmission' "
-                "with solver='auto' or solver='lm'"
-            )
-        requested_solver = _requested_solver(fit_config)
-        if requested_solver not in _SUPPORTED_SOLVERS:
-            raise ValueError(_UNSUPPORTED_SOLVER.format(solver=requested_solver))
-        if requested_solver in _COUNT_LIKELIHOOD_SOLVERS:
-            raise ValueError(
-                "normalized transmission input cannot use a Poisson/KL count "
-                "likelihood; use solver='auto' or solver='lm'"
-            )
-        trans_key = data_config.get("transmission_key", "transmission")
-        unc_key = data_config.get("uncertainty_key", "uncertainty")
-        _require_npz_keys(
-            arrays,
-            [trans_key],
-            context="single_spectrum transmission data",
-        )
-        transmission = _validate_array("transmission", arrays[trans_key])
-        if unc_key in arrays:
-            uncertainty = _validate_array("uncertainty", arrays[unc_key])
-        else:
-            uncertainty = np.full_like(
-                transmission, float(data_config.get("uncertainty", 0.01))
-            )
-        _require_same_shape("transmission", transmission, ("uncertainty", uncertainty))
-        energies = _load_energy_grid(base, data_config, arrays, n_expected=transmission.shape[0])
-        energies, transmission, uncertainty = _ascending_energy_grid(
-            energies, transmission, uncertainty
-        )
-        if transmission.ndim == 3:
-            transmission = np.ascontiguousarray(np.nanmean(transmission, axis=(1, 2)))
-            uncertainty = np.ascontiguousarray(
-                np.sqrt(np.nanmean(np.square(uncertainty), axis=(1, 2)))
-            )
-        if transmission.ndim != 1:
-            raise ValueError("single_spectrum transmission arrays must be 1D or 3D")
-        kwargs = _single_fit_kwargs(fit_config, resolution, counts=False)
-        result = nereids.fit_spectrum_typed(
-            transmission=transmission,
-            uncertainty=uncertainty,
-            energies=energies,
-            isotopes=isotopes,
-            **kwargs,
-        )
-    else:
-        raise ValueError(f"unsupported single_spectrum data kind: {kind}")
+    sample = _validate_array("sample_counts", arrays[sample_key])
+    open_beam = _validate_array("open_beam_counts", arrays[open_beam_key])
+    _require_same_shape("sample_counts", sample, ("open_beam_counts", open_beam))
+    pixels = float(data_config.get("pixels", 1.0))
+    if sample.ndim == 3:
+        pixels = float(data_config.get("pixels", sample.shape[1] * sample.shape[2]))
+        sample = np.ascontiguousarray(sample.sum(axis=(1, 2)))
+        open_beam = np.ascontiguousarray(open_beam.sum(axis=(1, 2)))
+    if sample.ndim != 1 or open_beam.ndim != 1:
+        raise ValueError("single_spectrum counts arrays must be 1D or 3D")
+    calibration = _calibration(config, data_config)
+    edges = _load_time_edges(base, data_config, arrays, sample.size)
+    material, names, _ = _material(config, frontmatter, base, fit_config)
+    charge_ratio = float(data_config.get("pc_ratio", arrays.get("pc_ratio", 1.0)))
+    region = nereids.Region(
+        open_counts=open_beam,
+        sample_counts=sample,
+        pixels=pixels,
+        background=_background_values(fit_config.get("background")),
+        gamma_transmission=_value_or_number(fit_config.get("gamma_transmission"), 1.0),
+        material=material,
+    )
+    measurement = nereids.Measurement(
+        time_edges_us=edges,
+        charge_ratio=charge_ratio,
+        normalization=_value_or_number(fit_config.get("normalization"), 1.0),
+        regions=[region],
+        time_background=_time_background_values(fit_config.get("time_background")),
+    )
+    result = nereids.fit_counts(measurement, calibration)
 
     output_dir.mkdir(parents=True, exist_ok=True)
     result_npz = output_dir / "nereids_spectrum_fit.npz"
+    fitted = result.regions[0].densities if result.regions else []
     np.savez_compressed(
         result_npz,
-        energies_ev=energies,
-        transmission=transmission,
-        uncertainty=uncertainty,
-        fitted_densities=np.asarray(result.densities),
-        density_uncertainties=np.asarray(result.uncertainties),
+        time_edges_us=edges,
+        sample_counts=sample,
+        open_beam_counts=open_beam,
+        fitted_densities=np.asarray(fitted, dtype=float),
         isotope_names=np.asarray(names),
     )
     summary = _fit_result_summary(result, names)
     summary.update(
         {
             "mode": "single_spectrum",
+            "input_kind": "counts",
             "data_path": str(data_path),
             "output_npz": str(result_npz),
-            "energy_range_ev": [float(energies[0]), float(energies[-1])],
-            "n_energy": int(energies.size),
+            "time_range_us": [float(edges[0]), float(edges[-1])],
+            "n_bins": int(sample.size),
         }
     )
     return summary
+
 
 
 def _process_density_map(
@@ -842,197 +702,115 @@ def _process_density_map(
     config = _workflow_config(manifest)
     data_config = _get_data_config(config)
     fit_config = _get_fit_config(config)
-    kind = _normalise_kind(data_config.get("kind"), "transmission_npz")
-
-    arrays: dict[str, np.ndarray] | None = None
+    kind = _normalise_kind(data_config.get("kind"), "counts_npz")
     path = _resolve_path(base, data_config.get("path"))
-    if path is not None and path.suffix == ".npz":
-        arrays = _npz_arrays(path)
+    arrays = _npz_arrays(path) if path is not None and path.suffix == ".npz" else None
+    crop: dict[str, Any] | None = None
 
-    if kind in {"transmission_npz", "transmission"}:
-        if arrays is None:
-            raise ValueError("transmission_npz data requires a .npz data.path")
-        trans_key = data_config.get("transmission_key", "transmission")
-        unc_key = data_config.get("uncertainty_key", "uncertainty")
-        _require_npz_keys(
-            arrays,
-            [trans_key],
-            context="density_map transmission data",
-        )
-        transmission = _validate_array("transmission", arrays[trans_key], ndim=3)
-        if unc_key in arrays:
-            uncertainty = _validate_array("uncertainty", arrays[unc_key], ndim=3)
-        else:
-            uncertainty = np.full_like(
-                transmission, float(data_config.get("uncertainty", 0.01))
-            )
-        _require_same_shape("transmission", transmission, ("uncertainty", uncertainty))
-        energies = _load_energy_grid(
-            base, data_config, arrays, n_expected=transmission.shape[0]
-        )
-        energies, transmission, uncertainty = _ascending_energy_grid(
-            energies, transmission, uncertainty
-        )
-        transmission = _apply_roi(transmission, data_config.get("roi") or config.get("roi"))
-        uncertainty = _apply_roi(uncertainty, data_config.get("roi") or config.get("roi"))
-        transmission, crop = _limit_pixels(transmission, max_pixels)
-        uncertainty = uncertainty[:, : transmission.shape[1], : transmission.shape[2]]
-        input_data = nereids.from_transmission(transmission, uncertainty)
-        input_kind = "transmission"
-        c = None
-    elif kind in {"transmission_tiff", "tiff"}:
-        if path is None:
-            raise ValueError("transmission_tiff data requires data.path")
-        # Pre-normalized transmission: noise around zero legitimately
-        # produces small negative values, so bypass the raw-counts
-        # pixel-value guard ("allow" rather than the default "reject").
-        transmission = _validate_array(
-            "transmission",
-            nereids.load_tiff_stack(str(path), pixel_policy="allow"),
-            ndim=3,
-        )
-        uncertainty_path = _resolve_path(base, data_config.get("uncertainty_path"))
-        if uncertainty_path is not None:
-            uncertainty = _validate_array(
-                "uncertainty",
-                nereids.load_tiff_stack(str(uncertainty_path), pixel_policy="allow"),
-                ndim=3,
-            )
-        else:
-            uncertainty = np.full_like(
-                transmission, float(data_config.get("uncertainty", 0.01))
-            )
-        _require_same_shape("transmission", transmission, ("uncertainty", uncertainty))
-        energies = _load_energy_grid(base, data_config, None, n_expected=transmission.shape[0])
-        energies, transmission, uncertainty = _ascending_energy_grid(
-            energies, transmission, uncertainty
-        )
-        transmission = _apply_roi(transmission, data_config.get("roi") or config.get("roi"))
-        uncertainty = _apply_roi(uncertainty, data_config.get("roi") or config.get("roi"))
-        transmission, crop = _limit_pixels(transmission, max_pixels)
-        uncertainty = uncertainty[:, : transmission.shape[1], : transmission.shape[2]]
-        input_data = nereids.from_transmission(transmission, uncertainty)
-        input_kind = "transmission"
-        c = None
-    elif kind in {"counts_npz", "counts"}:
+    if kind in {"counts_npz", "counts"}:
         if arrays is None:
             raise ValueError("counts_npz data requires a .npz data.path")
         sample_key = data_config.get("sample_key", "sample_counts")
         open_beam_key = data_config.get("open_beam_key", "open_beam_counts")
         _require_npz_keys(
-            arrays,
-            [sample_key, open_beam_key],
-            context="density_map counts data",
+            arrays, [sample_key, open_beam_key], context="density_map counts data"
         )
-        sample = _validate_array(
-            "sample_counts", arrays[sample_key], ndim=3
-        )
-        open_beam = _validate_array(
-            "open_beam_counts",
-            arrays[open_beam_key],
-            ndim=3,
-        )
+        sample = _validate_array("sample_counts", arrays[sample_key], ndim=3)
+        open_beam = _validate_array("open_beam_counts", arrays[open_beam_key], ndim=3)
         _require_same_shape("sample_counts", sample, ("open_beam_counts", open_beam))
-        energies = _load_energy_grid(base, data_config, arrays, n_expected=sample.shape[0])
-        energies, sample, open_beam = _ascending_energy_grid(energies, sample, open_beam)
-        sample = _apply_roi(sample, data_config.get("roi") or config.get("roi"))
-        open_beam = _apply_roi(open_beam, data_config.get("roi") or config.get("roi"))
+        roi = data_config.get("roi") or config.get("roi")
+        sample = _apply_roi(sample, roi)
+        open_beam = _apply_roi(open_beam, roi)
         sample, crop = _limit_pixels(sample, max_pixels)
         open_beam = open_beam[:, : sample.shape[1], : sample.shape[2]]
-        input_data = nereids.from_counts(sample, open_beam)
-        input_kind = "counts"
-        c = float(data_config.get("pc_ratio", arrays.get("pc_ratio", 1.0)))
+        edges = _load_time_edges(base, data_config, arrays, sample.shape[0])
     elif kind in {"nexus_histogram", "nexus"}:
         sample_path = _resolve_path(base, data_config.get("sample_path"))
         open_beam_path = _resolve_path(base, data_config.get("open_beam_path"))
         if sample_path is None or open_beam_path is None:
             raise ValueError("nexus data requires sample_path and open_beam_path")
         sample_data = nereids.load_nexus_histogram(str(sample_path))
-        ob_data = nereids.load_nexus_histogram(str(open_beam_path))
+        open_data = nereids.load_nexus_histogram(str(open_beam_path))
         sample = _validate_array("sample_counts", sample_data.counts, ndim=3)
-        open_beam = _validate_array("open_beam_counts", ob_data.counts, ndim=3)
+        open_beam = _validate_array("open_beam_counts", open_data.counts, ndim=3)
         _require_same_shape("sample_counts", sample, ("open_beam_counts", open_beam))
-        sample_tof_edges = _validate_array(
+        sample_edges = _validate_array(
             "sample_tof_edges_us", sample_data.tof_edges_us, ndim=1
         )
-        open_beam_tof_edges = _validate_array(
-            "open_beam_tof_edges_us", ob_data.tof_edges_us, ndim=1
+        open_edges = _validate_array(
+            "open_beam_tof_edges_us", open_data.tof_edges_us, ndim=1
         )
-        if (
-            sample_tof_edges.shape != open_beam_tof_edges.shape
-            or not np.allclose(sample_tof_edges, open_beam_tof_edges)
+        if sample_edges.shape != open_edges.shape or not np.allclose(
+            sample_edges, open_edges
         ):
             raise ValueError("nexus sample and open_beam TOF bin edges must match")
-        flight_path = float(
-            data_config.get(
-                "flight_path_m",
-                sample_data.flight_path_m or ob_data.flight_path_m or 25.0,
-            )
-        )
-        delay_us = float(data_config.get("delay_us", 0.0))
-        energies = np.asarray(
-            nereids.tof_to_energy_centers(sample_tof_edges, flight_path, delay_us),
-            dtype=np.float64,
-        )
-        # NeXus counts are loaded in TOF-bin order. The Python binding returns
-        # ascending energy centers, so reverse the counts to energy order first.
-        if np.all(np.diff(energies) > 0):
-            sample = np.ascontiguousarray(sample[::-1, ...])
-            open_beam = np.ascontiguousarray(open_beam[::-1, ...])
-        energies, sample, open_beam = _ascending_energy_grid(energies, sample, open_beam)
-        sample = _apply_roi(sample, data_config.get("roi") or config.get("roi"))
-        open_beam = _apply_roi(open_beam, data_config.get("roi") or config.get("roi"))
+        roi = data_config.get("roi") or config.get("roi")
+        sample = _apply_roi(sample, roi)
+        open_beam = _apply_roi(open_beam, roi)
         sample, crop = _limit_pixels(sample, max_pixels)
         open_beam = open_beam[:, : sample.shape[1], : sample.shape[2]]
-        input_data = nereids.from_counts(sample, open_beam)
-        input_kind = "counts"
-        c = float(data_config.get("pc_ratio", 1.0))
+        edges = np.ascontiguousarray(sample_edges, dtype=np.float64)
     else:
-        raise ValueError(f"unsupported density_map data kind: {kind}")
+        raise ValueError(
+            f"unsupported density_map data kind: {kind}; raw counts are required"
+        )
 
-    entries = _get_isotope_entries(config, frontmatter)
-    isotopes, names = _load_isotopes(
-        entries, base, default_library=str(config.get("library", "endf8.1"))
-    )
-    initial_densities = [density for _, density in isotopes]
-    isotope_data = [data for data, _ in isotopes]
-    kwargs = _spatial_fit_kwargs(fit_config, _resolution_kwargs(base, config))
-    requested_solver = _requested_solver(fit_config)
-    if requested_solver not in _SUPPORTED_SOLVERS:
-        raise ValueError(_UNSUPPORTED_SOLVER.format(solver=requested_solver))
-    if input_kind == "counts" and requested_solver == "lm":
+    if edges.size != sample.shape[0] + 1:
         raise ValueError(
-            "raw count maps cannot use solver='lm': use solver='auto' or "
-            "solver='kl' so the separate sample/open-beam arms are preserved"
+            f"time_edges_us must have {sample.shape[0] + 1} edges, got {edges.size}"
         )
-    if input_kind == "transmission" and requested_solver in _COUNT_LIKELIHOOD_SOLVERS:
-        raise ValueError(
-            "normalized transmission maps cannot use a Poisson/KL count "
-            "likelihood; use solver='auto' or solver='lm'"
-        )
-    if c is not None and "c" not in kwargs:
-        kwargs["c"] = c
-    result = nereids.spatial_map_typed(
-        input_data,
-        energies,
-        isotope_data,
-        initial_densities=initial_densities,
-        **kwargs,
+    height, width = sample.shape[1], sample.shape[2]
+    excluded_key = str(data_config.get("excluded_key", "excluded"))
+    sample_mask_key = str(data_config.get("sample_mask_key", "sample"))
+    empty_key = str(data_config.get("empty_key", "empty"))
+
+    def mask(key: str, default: np.ndarray) -> np.ndarray:
+        if arrays is None or key not in arrays:
+            return default
+        original = np.asarray(arrays[key], dtype=bool)
+        if original.shape != arrays[sample_key].shape[1:]:
+            raise ValueError("excluded/sample/empty masks must match the counts spatial shape")
+        selected = _apply_roi(original[np.newaxis], roi)[0]
+        return np.ascontiguousarray(selected[:height, :width])
+
+    excluded = mask(excluded_key, np.zeros((height, width), dtype=bool))
+    empty = mask(empty_key, np.zeros((height, width), dtype=bool))
+    behind = mask(sample_mask_key, ~empty)
+
+    charge_ratio = float(
+        data_config.get("pc_ratio", arrays.get("pc_ratio", 1.0) if arrays is not None else 1.0)
     )
+    material, names, _ = _material(config, frontmatter, base, fit_config)
+    calibration = _calibration(config, data_config)
+    map_measurement = nereids.MapMeasurement(
+        time_edges_us=edges,
+        open_counts=open_beam,
+        sample_counts=sample,
+        excluded=np.ascontiguousarray(excluded),
+        sample=np.ascontiguousarray(behind),
+        empty=np.ascontiguousarray(empty),
+        material=material,
+        charge_ratio=charge_ratio,
+        normalization=_value_or_number(fit_config.get("normalization"), 1.0),
+        background=_background_values(fit_config.get("background")),
+        binning=int(data_config.get("binning", 1)),
+        empty_background=_background_values(fit_config.get("empty_background")),
+    )
+    result = nereids.fit_map(map_measurement, calibration)
 
     output_dir.mkdir(parents=True, exist_ok=True)
     result_npz = output_dir / "nereids_density_map.npz"
+    patch_kinds = [[patch.kind for patch in row] for row in result.patches]
     arrays_to_save: dict[str, Any] = {
-        "energies_ev": energies,
-        "chi_squared_map": np.asarray(result.chi_squared_map),
-        "converged_map": np.asarray(result.converged_map),
+        "time_edges_us": edges,
+        "patch_kinds": np.asarray(patch_kinds, dtype=object),
+        "trusted": np.asarray(result.trusted),
+        "temperature_k": np.asarray(result.temperature_k),
         "isotope_names": np.asarray(names),
     }
-    if result.deviance_per_dof_map is not None:
-        arrays_to_save["deviance_per_dof_map"] = np.asarray(result.deviance_per_dof_map)
     density_stats = []
     for name, density_map, uncertainty_map in zip(
-        names, result.density_maps, result.uncertainty_maps
+        names, result.densities, result.density_sd
     ):
         key = _safe_npz_key(name)
         density_arr = np.asarray(density_map)
@@ -1046,74 +824,22 @@ def _process_density_map(
                 "uncertainty_atoms_per_barn": _array_stats(uncertainty_arr),
             }
         )
-
-    # SpatialResult exposes per-pixel anorm / background / back_d /
-    # back_f / t0 / l_scale maps whenever the spatial pipeline ran with
-    # the corresponding *feature* enabled (e.g. `background=True`
-    # materialises all three terms of `background_maps` — including
-    # NaN-per-pixel entries for terms that were not actually fit — and
-    # `fit_energy_scale=True` materialises both t0/L scale maps).  Save
-    # the raw arrays into the NPZ (so downstream consumers can
-    # reconstruct the model curve per-pixel) and surface aggregate
-    # stats in the JSON summary.  Per-pixel ``back_d_map`` / ``back_f_map``
-    # require ``background=True`` AND ``fit_back_d=True`` /
-    # ``fit_back_f=True`` — counts-KL runs always have them as ``None``
-    # because the joint-Poisson dispatch never fits the SAMMY
-    # exponential tail.
-    fit_param_stats: dict[str, Any] = {}
-    anorm_map = getattr(result, "anorm_map", None)
-    if anorm_map is not None:
-        anorm_arr = np.asarray(anorm_map)
-        arrays_to_save["anorm_map"] = anorm_arr
-        fit_param_stats["anorm"] = _array_stats(anorm_arr)
-    background_maps = getattr(result, "background_maps", None)
-    if background_maps is not None:
-        bm_stats = []
-        for term_idx, bm in enumerate(background_maps):
-            bm_arr = np.asarray(bm)
-            arrays_to_save[f"background_term_{term_idx}_map"] = bm_arr
-            bm_stats.append(_array_stats(bm_arr))
-        fit_param_stats["background"] = bm_stats
-    back_d_map = getattr(result, "back_d_map", None)
-    if back_d_map is not None:
-        back_d_arr = np.asarray(back_d_map)
-        arrays_to_save["back_d_map"] = back_d_arr
-        fit_param_stats["back_d"] = _array_stats(back_d_arr)
-    back_f_map = getattr(result, "back_f_map", None)
-    if back_f_map is not None:
-        back_f_arr = np.asarray(back_f_map)
-        arrays_to_save["back_f_map"] = back_f_arr
-        fit_param_stats["back_f"] = _array_stats(back_f_arr)
-    t0_us_map = getattr(result, "t0_us_map", None)
-    if t0_us_map is not None:
-        t0_arr = np.asarray(t0_us_map)
-        arrays_to_save["t0_us_map"] = t0_arr
-        fit_param_stats["t0_us"] = _array_stats(t0_arr)
-    l_scale_map = getattr(result, "l_scale_map", None)
-    if l_scale_map is not None:
-        l_arr = np.asarray(l_scale_map)
-        arrays_to_save["l_scale_map"] = l_arr
-        fit_param_stats["l_scale"] = _array_stats(l_arr)
-
     np.savez_compressed(result_npz, **arrays_to_save)
-
-    summary: dict[str, Any] = {
+    return {
         "mode": "density_map",
-        "input_kind": input_kind,
+        "input_kind": "counts",
         "data_path": None if path is None else str(path),
         "output_npz": str(result_npz),
-        "energy_range_ev": [float(energies[0]), float(energies[-1])],
-        "n_energy": int(energies.size),
-        "map_shape": list(np.asarray(result.converged_map).shape),
-        "n_converged": int(result.n_converged),
-        "n_total": int(result.n_total),
-        "n_failed": int(result.n_failed),
+        "time_range_us": [float(edges[0]), float(edges[-1])],
+        "n_bins": int(sample.shape[0]),
+        "map_shape": list(np.asarray(result.trusted).shape),
+        "n_fitted": int(result.n_fitted),
+        "converged": bool(result.converged),
+        "unconverged": result.unconverged,
         "density_maps": density_stats,
         "crop": crop,
     }
-    if fit_param_stats:
-        summary["fit_param_stats"] = fit_param_stats
-    return summary
+
 
 
 def _validate_workflow(manifest: dict[str, Any]) -> dict[str, Any]:
@@ -1121,6 +847,7 @@ def _validate_workflow(manifest: dict[str, Any]) -> dict[str, Any]:
     frontmatter = manifest["frontmatter"]
     config = _workflow_config(manifest)
     data_config = _get_data_config(config)
+    fit_config = _get_fit_config(config)
     errors: list[str] = []
     warnings: list[str] = []
 
@@ -1138,43 +865,30 @@ def _validate_workflow(manifest: dict[str, Any]) -> dict[str, Any]:
             "spectrum, density_map, or spatial_map"
         )
 
-    effective_kind = _normalise_kind(
-        data_config.get("kind"),
-        "counts_npz"
-        if mode in {"single_spectrum", "fit_spectrum", "spectrum"}
-        else "transmission_npz",
-    )
-    has_path = data_config.get("path") is not None and data_config.get("path") != ""
-    has_sample_path = (
-        data_config.get("sample_path") is not None and data_config.get("sample_path") != ""
-    )
-    has_open_beam_path = (
-        data_config.get("open_beam_path") is not None
-        and data_config.get("open_beam_path") != ""
-    )
+    effective_kind = _normalise_kind(data_config.get("kind"), "counts_npz")
+    if effective_kind not in {"counts_npz", "counts", "nexus_histogram", "nexus"}:
+        errors.append(
+            f"unsupported data kind: {effective_kind}; the fit is counts-only"
+        )
+
+    has_path = data_config.get("path") not in (None, "")
+    has_sample_path = data_config.get("sample_path") not in (None, "")
+    has_open_beam_path = data_config.get("open_beam_path") not in (None, "")
     if mode in {"single_spectrum", "fit_spectrum", "spectrum"} and not has_path:
         errors.append("single_spectrum workflow requires data.path")
     elif mode in {"density_map", "spatial_map"}:
         if effective_kind in {"nexus_histogram", "nexus"}:
             if not has_sample_path or not has_open_beam_path:
-                errors.append("nexus density_map workflow requires sample_path and open_beam_path")
-        elif effective_kind in {
-            "transmission_npz",
-            "transmission",
-            "transmission_tiff",
-            "tiff",
-            "counts_npz",
-            "counts",
-        }:
-            if not has_path:
-                errors.append(f"{effective_kind} density_map workflow requires data.path")
-        else:
-            errors.append(f"unsupported density_map data kind: {effective_kind}")
+                errors.append(
+                    "nexus density_map workflow requires sample_path and open_beam_path"
+                )
+        elif not has_path:
+            errors.append(f"{effective_kind} density_map workflow requires data.path")
 
     data_paths = []
-    for key in ("path", "sample_path", "open_beam_path", "uncertainty_path"):
+    for key in ("path", "sample_path", "open_beam_path"):
         value = data_config.get(key)
-        if value is None or value == "":
+        if value in (None, ""):
             continue
         path = _resolve_path(base, value)
         data_paths.append({"key": key, "path": str(path), "exists": path.exists()})
@@ -1200,6 +914,25 @@ def _validate_workflow(manifest: dict[str, Any]) -> dict[str, Any]:
         ):
             errors.append(f"isotope entry is missing isotope/z/a/endf_file: {entry}")
 
+    fit_domain = str(fit_config.get("fit_domain", "counts")).lower()
+    if fit_domain != "counts":
+        errors.append("the fit is counts-only: fit_domain must be 'counts'")
+    supported_fit = {
+        "fit_domain", "normalization", "background", "empty_background",
+        "temperature", "temperature_k", "fit_temperature",
+        "gamma_transmission", "time_background",
+    }
+    unsupported_fit = sorted(set(fit_config) - supported_fit)
+    if unsupported_fit:
+        errors.append(f"unsupported fit settings: {', '.join(unsupported_fit)}")
+
+    try:
+        _time_background_values(fit_config.get("time_background"))
+    except (KeyError, TypeError, ValueError) as exc:
+        errors.append(f"time background is invalid: {exc}")
+    if mode in {"density_map", "spatial_map"} and fit_config.get("time_background") is not None:
+        errors.append("the counts map does not support a time background; use single_spectrum")
+
     resolution = config.get("resolution")
     resolution_kind: str | None = None
     if isinstance(resolution, dict):
@@ -1207,115 +940,22 @@ def _validate_workflow(manifest: dict[str, Any]) -> dict[str, Any]:
     elif isinstance(resolution, str):
         resolution_kind = _normalise_kind(resolution, "none")
     elif resolution:
-        # A truthy malformed value (true/number/non-empty list) raises
-        # "resolution must be an object" at run time; erroring here keeps
-        # validate and run in agreement.  Falsy values (false/0/[]) fall
-        # through: the run path's `config.get("resolution") or {}` treats
-        # them as resolution-disabled.
         errors.append(
             "resolution must be an object or kind string, got "
             f"{type(resolution).__name__}"
         )
-    elif resolution is None and mode in {"density_map", "spatial_map"}:
-        warnings.append("no resolution configured; OK for synthetic/demo data")
-
-    # Mirror _resolution_kwargs' full contract, kind by kind, so validation
-    # never approves a resolution config the run path rejects (unknown kind,
-    # missing gaussian parameters, missing tabulated path/flight path).
-    if resolution_kind is not None:
-        if resolution_kind in {"none", "disabled", "false"}:
-            warnings.append("resolution disabled; appropriate for synthetic data")
-        elif resolution_kind in {"gaussian", "sammy_gaussian"}:
-            params = resolution if isinstance(resolution, dict) else {}
-            missing = [
-                key
-                for key in ("flight_path_m", "delta_t_us", "delta_l_m")
-                if key not in params
-            ]
-            if missing:
-                errors.append(
-                    "gaussian resolution requires flight_path_m, delta_t_us, "
-                    f"and delta_l_m: missing {', '.join(missing)}"
-                )
-        elif resolution_kind in {"tabulated", "file", "resolution_file"}:
-            params = resolution if isinstance(resolution, dict) else {}
-            path = _resolve_path(base, params.get("path"))
-            if path is None or not path.exists():
-                errors.append(f"resolution file does not exist: {path}")
-            if "flight_path_m" not in params:
-                errors.append("tabulated resolution requires flight_path_m")
-        else:
-            errors.append(f"unknown resolution kind: {resolution_kind}")
-
-    # Mirror the run path's domain/solver routing branch by branch so a dry
-    # run never approves a manifest the production pipeline rejects (or vice
-    # versa).  Raw counts always fit in the counts domain, and cross-domain
-    # solver requests are rejected on both run and validate.  Raw count
-    # inputs with an active resolution error through MCP.
-    counts_input = effective_kind in {
-        "counts_npz",
-        "counts",
-        "nexus_histogram",
-        "nexus",
-    }
-    fit_config = _get_fit_config(config)
-    solver = _requested_solver(fit_config)
-    # Unsupported names must fail validation, not sail through to dispatch:
-    # the domain rules below only describe combinations of REAL solvers.
-    if solver not in _SUPPORTED_SOLVERS:
-        errors.append(_UNSUPPORTED_SOLVER.format(solver=solver))
-    if mode in {"single_spectrum", "fit_spectrum", "spectrum"}:
-        # Byte-identical to the run path's routing check
-        # (`data_path.suffix == ".npz"` on the resolved path): `DATA.NPZ`
-        # or a symlink to a non-npz target is text-parsed there and must
-        # not be treated as a counts-domain npz here.
-        resolved_data_path = _resolve_path(base, data_config.get("path"))
-        is_npz = resolved_data_path is not None and resolved_data_path.suffix == ".npz"
-        counts_route = counts_input and is_npz
-        if counts_route:
-            fit_domain = str(fit_config.get("fit_domain", "counts")).lower()
-            if fit_domain != "counts":
-                errors.append(
-                    "raw count input cannot be fit in the transmission domain: "
-                    "the conversion discards open-beam count uncertainty; use "
-                    "fit_domain='counts' with solver='auto' or solver='kl'"
-                )
-            elif solver == "lm":
-                errors.append(
-                    "raw count input cannot use solver='lm': the least-squares "
-                    "transmission engine would discard open-beam count "
-                    "uncertainty; use solver='auto' or solver='kl'"
-                )
-        else:
-            fit_domain = str(fit_config.get("fit_domain", "transmission")).lower()
-            if fit_domain != "transmission":
-                errors.append(
-                    "normalized transmission input must use "
-                    "fit_domain='transmission' with solver='auto' or solver='lm'"
-                )
-            elif solver in _COUNT_LIKELIHOOD_SOLVERS:
-                errors.append(
-                    "normalized transmission input cannot use a Poisson/KL count "
-                    "likelihood; use solver='auto' or solver='lm'"
-                )
-        counts_domain_fit = counts_route
-    else:
-        if mode in {"density_map", "spatial_map"}:
-            if counts_input and solver == "lm":
-                errors.append(
-                    "raw count maps cannot use solver='lm': use solver='auto' or "
-                    "solver='kl' so the separate sample/open-beam arms are "
-                    "preserved"
-                )
-            if not counts_input and solver in _COUNT_LIKELIHOOD_SOLVERS:
-                errors.append(
-                    "normalized transmission maps cannot use a Poisson/KL count "
-                    "likelihood; use solver='auto' or solver='lm'"
-                )
-        counts_domain_fit = counts_input
-    resolution_active = resolution_kind not in {None, "none", "disabled", "false"}
-    if counts_domain_fit and resolution_active:
+    if resolution_kind not in {None, "none", "disabled", "false"}:
         errors.append(_COUNTS_RESOLUTION_UNSUPPORTED)
+
+    try:
+        _calibration(config, data_config)
+    except (KeyError, TypeError, ValueError) as exc:
+        errors.append(f"calibration is invalid: {exc}")
+
+    if effective_kind in {"counts_npz", "counts"} and has_path:
+        resolved = _resolve_path(base, data_config.get("path"))
+        if resolved is not None and resolved.suffix != ".npz":
+            errors.append("counts_npz data.path must be a .npz file")
 
     return {
         "valid": not errors,
@@ -1325,9 +965,11 @@ def _validate_workflow(manifest: dict[str, Any]) -> dict[str, Any]:
         "dataset_path": manifest["dataset_path"],
         "mode": mode or None,
         "data_kind": effective_kind,
+        "fit_domain": "counts",
         "data_paths": data_paths,
         "isotopes": _json_safe(entries),
     }
+
 
 
 def _isotope_key(z: int, a: int) -> str:
@@ -1567,91 +1209,6 @@ def forward_model(
     }
 
 
-@mcp.tool()
-def detect_isotopes(
-    matrix_isotope: str,
-    matrix_density: float,
-    trace_isotopes: list[str],
-    trace_ppm: float = 100.0,
-    energy_min: float = 1.0,
-    energy_max: float = 100.0,
-    n_points: int = 1000,
-    i0: float = 1e6,
-    temperature_k: float = 293.6,
-    snr_threshold: float = 3.0,
-) -> list[dict]:
-    """Analyze detectability of trace isotopes in a matrix.
-
-    Args:
-        matrix_isotope: Matrix isotope key (e.g., "Fe-56"). Must be loaded.
-        matrix_density: Matrix areal density in atoms/barn.
-        trace_isotopes: List of trace isotope keys. Must be loaded.
-        trace_ppm: Trace concentration in ppm.
-        energy_min: Minimum energy in eV.
-        energy_max: Maximum energy in eV.
-        n_points: Number of energy points.
-        i0: Neutron fluence (counts per bin).
-        temperature_k: Sample temperature in Kelvin.
-        snr_threshold: Minimum SNR for "detectable" verdict.
-
-    Returns:
-        List of dicts with keys: isotope, detectable, peak_snr, peak_energy_ev,
-        peak_delta_t_per_ppm, opaque_fraction.
-    """
-    _validate_energy_grid(energy_min, energy_max, n_points)
-    if not math.isfinite(matrix_density) or matrix_density <= 0:
-        raise ValueError(
-            f"matrix_density must be positive and finite, got {matrix_density}"
-        )
-    if not trace_isotopes:
-        raise ValueError("trace_isotopes must not be empty")
-    if not math.isfinite(trace_ppm) or trace_ppm < 0:
-        raise ValueError(f"trace_ppm must be non-negative and finite, got {trace_ppm}")
-    if not math.isfinite(i0) or i0 <= 0:
-        raise ValueError(f"i0 must be positive and finite, got {i0}")
-    if not math.isfinite(snr_threshold) or snr_threshold < 0:
-        raise ValueError(
-            f"snr_threshold must be non-negative and finite, got {snr_threshold}"
-        )
-    if not math.isfinite(temperature_k) or temperature_k < 0:
-        raise ValueError(
-            f"temperature_k must be non-negative and finite, got {temperature_k}"
-        )
-
-    matrix = _registry.get(matrix_isotope)
-    if matrix is None:
-        raise ValueError(f"Matrix isotope {matrix_isotope!r} not loaded.")
-
-    traces = []
-    for key in trace_isotopes:
-        data = _registry.get(key)
-        if data is None:
-            raise ValueError(f"Trace isotope {key!r} not loaded.")
-        traces.append(data)
-
-    energies = np.linspace(energy_min, energy_max, n_points)
-    results = nereids.trace_detectability_survey(
-        matrix,
-        matrix_density,
-        traces,
-        trace_ppm,
-        energies,
-        i0,
-        temperature_k=temperature_k,
-        snr_threshold=snr_threshold,
-    )
-    return [
-        {
-            "isotope": name,
-            "detectable": report.detectable,
-            "peak_snr": report.peak_snr,
-            "peak_energy_ev": report.peak_energy_ev,
-            "peak_delta_t_per_ppm": report.peak_delta_t_per_ppm,
-            "opaque_fraction": report.opaque_fraction,
-        }
-        for name, report in results
-    ]
-
 
 @mcp.tool()
 def extract_resonance_manifest(dataset_path: str) -> dict:
@@ -1718,13 +1275,14 @@ def process_resonance_dataset(
     the agent can call it when a user says "help me process the data here".
     Supported workflows:
 
-    - `single_spectrum`: fit one transmission/counts spectrum and estimate
-      isotope areal densities.
-    - `density_map` / `spatial_map`: fit every pixel in a 3D transmission or
-      counts cube and write density-map outputs.
+    - `single_spectrum`: fit one region's raw open-beam and sample counts to
+      its isotope areal densities and temperature.
+    - `density_map` / `spatial_map`: fit every patch of a raw counts cube and
+      write density-map outputs.
 
-    Supported inputs include `.npz` spectra/cubes, multi-frame TIFF
-    transmission stacks, and NeXus histogram sample/open-beam pairs.
+    Supported inputs are raw counts: a `.npz` cube of open-beam and sample
+    counts (with time-bin edges), or a NeXus histogram sample/open-beam pair.
+    The manifest must give a `calibration` block for the time bins.
 
     Args:
         dataset_path: Dataset directory or manifest path.

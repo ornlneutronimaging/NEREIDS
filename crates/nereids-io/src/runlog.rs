@@ -1,4 +1,4 @@
-//! DASlogs run-log reading and beam-state interval derivation (issue #637).
+//! DASlogs run-log reading and beam-state interval derivation.
 //!
 //! SNS/HFIR NeXus files record slow-control PVs under
 //! `/entry/DASlogs/<pv>/{time, value}`.  These are **transition logs**, not
@@ -52,7 +52,7 @@ pub struct RunLog {
     pub n_dropped_corrupt: usize,
 }
 
-/// Read a DASlogs PV as a transition log (issue #637).
+/// Read a DASlogs PV as a transition log.
 ///
 /// Reads `/entry/DASlogs/<pv>/time` and `/value` (numeric) and
 /// `/entry/duration`.  Times are seconds since run start (the same epoch
@@ -152,7 +152,7 @@ pub fn read_run_log(path: &Path, pv: &str) -> Result<RunLog, IoError> {
 
 /// Derive the run-time intervals on which a transition-log PV satisfies
 /// `min_value <= value <= max_value` (either bound optional), using the
-/// correct step-function semantics (issue #637): `values[i]` holds on
+/// correct step-function semantics: `values[i]` holds on
 /// `[times[i], times[i+1])`, the last value holds to `duration_s`.
 ///
 /// Time before the first transition entry is treated as **not** matching
@@ -215,7 +215,7 @@ pub fn intervals_where(
     // (event_time_zero) are float64: the final pulse of ~half of surveyed
     // real runs is time-stamped within one f32 ULP ABOVE the recorded
     // duration.  Pad the run end by one f32 ULP so the final segment does
-    // not spuriously exclude it (issue #637).
+    // not spuriously exclude it.
     let run_end = duration_s.max(((duration_s as f32).next_up()) as f64);
     let mut out: Vec<(f64, f64)> = Vec::new();
     for i in 0..times.len() {
@@ -296,7 +296,7 @@ pub(crate) fn normalize_intervals(raw: &[(f64, f64)]) -> Result<Vec<(f64, f64)>,
 mod tests {
     use super::*;
 
-    /// The motivating real-world case (issue #637): a `pause` transition log
+    /// The motivating real-world case: a `pause` transition log
     /// [0, 1, 0, 1, 0, 1, 0] whose entry-mean (0.43) wildly understates the
     /// time-weighted pause fraction (0.90).  `intervals_where(pause == 0)`
     /// must return the four short LIVE segments, not 57 % of the run.

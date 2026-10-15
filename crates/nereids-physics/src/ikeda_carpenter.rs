@@ -33,7 +33,6 @@
 //!   g₃(·;α) ⊛ β e^{−β·} (τ) = β (α/γ)³ [ e^{−βτ} − e^{−ατ}(1 + γτ + ½γ²τ²) ],  γ = α−β
 //! ```
 //!
-//! (re-derived and confirmed against the Codex independent derivation and the
 //! SAMMY-RPI χ²+double-exp moderator form). Both terms are individually
 //! unit-area, so `I` is unit-area for any α,β>0 and 0≤R≤1, with first moment
 //! `⟨τ⟩ = 3/α + R/β`. The asymmetry — sharp rise, long tail toward larger τ
@@ -1261,7 +1260,7 @@ fn requested_step(params: &IkedaCarpenterParams, n_tau: usize, alpha: f64) -> (f
 /// the prompt pulse entirely (probe: α = 250, β = 0.02, R = 0.1 loses the
 /// prompt's 0.9 weight share).
 ///
-/// Bit-identical to the pre-#642-review `max(fast_reach/(n_tau−1),
+/// Bit-identical to the pre--review `max(fast_reach/(n_tau−1),
 /// tau_max/(MAX_TAU_SAMPLES−1))` step whenever no fold is finer than the
 /// prompt design step and the capped step stays at or below the floor.
 fn tau_geometry(
@@ -1596,7 +1595,6 @@ mod tests {
 
     #[test]
     fn pulse_is_finite_for_beta_much_greater_than_alpha() {
-        // Regression: β ≫ α with storage active previously produced NaN (the
         // old e^{−βτ}·h(u) form factored an e^{|u|} that overflowed → 0·∞ = NaN).
         for &tau in &[0.0, 1.0, 50.0, 400.0, 1000.0] {
             let v = ic_pulse(0.05, 4.0, 0.5, tau);
@@ -2012,7 +2010,7 @@ mod tests {
 
     #[test]
     fn unresolvable_tau_grid_is_rejected_loudly() {
-        // Review #645 F1, probe 1: β = 0.005 ⇒ slow reach 16/β = 3200 µs ⇒
+        // Review F1, probe 1: β = 0.005 ⇒ slow reach 16/β = 3200 µs ⇒
         // capped step 3200/8191 ≈ 0.39 µs > the 0.35 µs triangle FWHM — the
         // sampled triangle would be the exact delta [0, 1, 0] and the
         // requested fold would silently vanish from the kernel. Must be a
@@ -2135,7 +2133,7 @@ mod tests {
 
     #[test]
     fn fold_variance_matches_analytic_oracle() {
-        // Independent analytic oracle for the fold convention (#645 F8): a
+        // Independent analytic oracle for the fold convention ( F8): a
         // convolution adds second central moments, so the sampled kernel's
         // variance must grow by EXACTLY the fold kernel's analytic variance —
         // FWHM²/6 for the symmetric channel triangle (half-base = FWHM),

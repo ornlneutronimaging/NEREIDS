@@ -13,11 +13,10 @@ elemental composition maps.
 
 The analysis pipeline:
 
-1. **Load** raw TOF imaging data (TIFF stacks, NeXus/HDF5, or pre-normalized transmission)
-2. **Normalize** sample and open-beam measurements to transmission
-3. **Configure** isotopes of interest using ENDF nuclear data
-4. **Fit** resonance models to measured transmission spectra
-5. **Map** fitted parameters (areal density, temperature) across each pixel
+1. **Load** raw TOF imaging data (TIFF stacks or NeXus/HDF5 counts)
+2. **Configure** isotopes of interest using ENDF nuclear data
+3. **Fit** the counts-domain resonance model to the sample and open-beam counts
+4. **Map** fitted parameters (areal density, temperature) across each pixel
 
 ## Interfaces
 

@@ -8,7 +8,7 @@
 //! - **Events**: per-neutron `(event_time_offset, x, y)` histogrammed into
 //!   a `(tof, y, x)` grid with user-specified binning parameters.
 //!
-//! ## Multi-angle handling (issue #430)
+//! ## Multi-angle handling
 //!
 //! Earlier revisions of this module silently summed multi-angle
 //! histograms into a single `(tof, y, x)` volume at load time — an
@@ -62,7 +62,7 @@
 //! attribute.  Any file
 //! that *does* set `units` is parsed strictly: an unrecognised value
 //! is rejected rather than silently mis-scaled.  This closes a
-//! 1000× silent-rescale bug on `units = "us"` (issue #554).
+//! 1000× silent-rescale bug on `units = "us"`.
 
 use std::path::Path;
 
@@ -152,7 +152,6 @@ pub(crate) fn read_string_attr(
     // UTF-8, while SNS/ADARA facility files write fixed-length ASCII
     // (e.g. the 35-byte ISO timestamp on `event_time_zero@offset`).
     // Dispatch on the stored type descriptor instead of assuming one
-    // (issue #637; previously only variable-length UTF-8 was readable).
     use hdf5::types::{FixedAscii, FixedUnicode, TypeDescriptor, VarLenAscii};
     let td = attr.dtype().and_then(|d| d.to_descriptor()).map_err(|e| {
         IoError::InvalidParameter(format!("Failed to inspect type of attribute {name:?}: {e}"))
@@ -320,7 +319,7 @@ pub fn probe_nexus(path: &Path) -> Result<NexusMetadata, IoError> {
 
 /// Policy for handling multi-angle NeXus histogram files.
 ///
-/// Issue #430: the loader must refuse to silently collapse the
+/// the loader must refuse to silently collapse the
 /// rotation-angle dimension.  Callers choose explicitly which
 /// projection (or combination of projections) they want.
 #[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
@@ -352,11 +351,11 @@ pub enum MultiAngleMode {
 /// If the file has more than one rotation angle (`n_rot > 1`), the
 /// call returns [`IoError::InvalidParameter`] pointing at
 /// [`load_nexus_histogram_with_mode`] — silent sum-over-angles
-/// was the pre-#430 behaviour and has been removed because it lost
+/// was the pre- behaviour and has been removed because it lost
 /// projection-resolved information without the caller's knowledge.
 ///
 /// Single-angle files (`n_rot == 1`) load normally and reach the same
-/// output as before #430.
+/// output as before.
 pub fn load_nexus_histogram(path: &Path) -> Result<NexusHistogramData, IoError> {
     load_nexus_histogram_with_mode(path, MultiAngleMode::Error)
 }
@@ -404,7 +403,6 @@ pub fn load_nexus_histogram_with_mode(
     // counts dataset: the check is purely metadata-driven and the
     // rejection paths should be cheap.  Reading the full u64 cube just
     // to error out is wasteful on production multi-angle NeXus files
-    // (easily multi-GB), and historically caused OOM-before-error on
     // the default "refuse" code path.
     let n_rot = shape[0];
     if n_rot == 0 {
@@ -548,10 +546,10 @@ pub struct EventBinningParams {
 ///
 /// Reads `/entry/neutrons/event_time_offset` (u64), `x` (f64), `y` (f64),
 /// rescales TOF to the canonical internal unit of microseconds based on
-/// the `event_time_offset` dataset's `units` attribute (issue #554), then
+/// the `event_time_offset` dataset's `units` attribute, then
 /// bins events into a `(n_bins, height, width)` histogram grid.
 ///
-/// # TOF units handling (issue #554)
+/// # TOF units handling
 ///
 /// The loader consults the NeXus `units` attribute on the
 /// `event_time_offset` dataset and rescales the raw `u64` channel
@@ -612,7 +610,7 @@ pub fn load_nexus_events(
         .map_err(|e| IoError::InvalidParameter(format!("Missing /entry/neutrons group: {e}")))?;
 
     // Read event arrays.  Open the dataset first so we can consult its
-    // `units` attribute (issue #554) before reading the data.
+    // `units` attribute before reading the data.
     let tof_ds = neutrons.dataset("event_time_offset").map_err(|e| {
         IoError::InvalidParameter(format!("Missing event_time_offset dataset: {e}"))
     })?;
@@ -661,7 +659,7 @@ pub fn load_nexus_events(
 
     for i in 0..tof_raw.len() {
         // Convert raw TOF to canonical µs via the units-attribute scale
-        // factor (issue #554).  For the default rustpix case (`units`
+        // factor. For the default rustpix case (`units`
         // absent → ns assumed), `tof_scale` is `1e-3`, recovering the
         // pre-fix expression `tof_raw[i] / 1000.0`.
         let tof_us = tof_raw[i] as f64 * tof_scale;
@@ -737,7 +735,7 @@ pub fn load_nexus_events(
 /// field" contract.  The previous implementation returned the raw
 /// values verbatim — a silent 1000× error for any file written with
 /// `units = "us"`, symmetric with the load-path bug closed by issue
-/// #554.
+///.
 fn probe_histogram_group(entry: &hdf5::Group) -> (bool, Option<[usize; 4]>, Option<Vec<f64>>) {
     let hist = match entry.group("histogram") {
         Ok(g) => g,
@@ -790,7 +788,7 @@ fn probe_event_group(entry: &hdf5::Group) -> (bool, Option<usize>) {
 }
 
 /// Read TOF axis from the histogram group, rescaling to µs based on
-/// the dataset's `units` attribute (see module docs / issue #554).
+/// the dataset's `units` attribute (see module docs / ).
 fn read_tof_axis(hist_group: &hdf5::Group) -> Result<Vec<f64>, IoError> {
     let tof_ds = hist_group.dataset("time_of_flight").map_err(|e| {
         IoError::InvalidParameter(format!(
@@ -1092,7 +1090,7 @@ mod tests {
         assert_eq!(data.n_rotation_angles, 1);
     }
 
-    /// Issue #430: default `load_nexus_histogram` must refuse multi-angle
+    /// default `load_nexus_histogram` must refuse multi-angle
     /// files rather than silently collapse the rotation dimension.
     #[test]
     fn test_load_nexus_histogram_multi_angle_errors_by_default() {
@@ -1116,8 +1114,8 @@ mod tests {
         );
     }
 
-    /// Issue #430: `MultiAngleMode::Sum` is the explicit opt-in for the
-    /// legacy auto-sum behaviour.  Recovers the pre-#430 output exactly.
+    /// `MultiAngleMode::Sum` is the explicit opt-in for the
+    /// legacy auto-sum behaviour. Recovers the pre- output exactly.
     #[test]
     fn test_load_nexus_histogram_multi_angle_sum_mode() {
         let dir = tempfile::tempdir().unwrap();
@@ -1136,7 +1134,7 @@ mod tests {
         assert_eq!(data.n_rotation_angles, 2);
     }
 
-    /// Issue #430: `MultiAngleMode::SelectAngle(i)` extracts a single
+    /// `MultiAngleMode::SelectAngle(i)` extracts a single
     /// projection by index, leaving the other angles' data unread.
     #[test]
     fn test_load_nexus_histogram_multi_angle_select_mode() {
@@ -1756,8 +1754,7 @@ mod tests {
     }
 
     // -----------------------------------------------------------------
-    // Issue #554 — NeXus `units` attribute on TOF datasets must be
-    // honoured.  A file written with `units = "us"` was previously
+    // — NeXus `units` attribute on TOF datasets must be
     // divided by 1000 silently, shifting the energy axis by 1000×.
     // -----------------------------------------------------------------
 
@@ -1901,7 +1898,7 @@ mod tests {
 
     /// Histogram path with `units = "us"` (NeXus-standard
     /// microseconds): values must be passed through unchanged, NOT
-    /// divided by 1000.  Pre-#554 this produced a 1000× too-small
+    /// divided by 1000. Pre- this produced a 1000× too-small
     /// energy axis silently.
     #[test]
     fn test_load_nexus_histogram_units_us_no_rescale() {
@@ -1982,7 +1979,7 @@ mod tests {
 
     /// Events path with `units = "us"`: the TOF binning must place
     /// events at the correct µs values, NOT divide them by 1000.
-    /// Pre-#554 a file written in µs would have all events land
+    /// Pre- a file written in µs would have all events land
     /// 1000× lower than the user-specified bins, leaving the
     /// histogram empty / all dropped by `tof_range`.
     #[test]
@@ -2066,10 +2063,10 @@ mod tests {
 }
 
 // ---------------------------------------------------------------------------
-// NXevent_data bank spectra with wall-clock interval filtering (issue #637)
+// NXevent_data bank spectra with wall-clock interval filtering
 // ---------------------------------------------------------------------------
 
-/// TOF binning parameters for a 1-D NXevent_data bank spectrum (issue #637).
+/// TOF binning parameters for a 1-D NXevent_data bank spectrum.
 ///
 /// NXevent_data banks (facility NeXus convention: `/entry/<bank>/` with
 /// `event_time_offset`, `event_index`, `event_time_zero`) have no per-event
@@ -2121,13 +2118,13 @@ pub struct BankSpectrum {
 
 /// Load one NXevent_data bank (e.g. a beam monitor) as a 1-D TOF spectrum,
 /// optionally keeping only pulses inside wall-clock `keep_intervals`
-/// (issue #637).
+///.
 ///
 /// Reads `/entry/<bank>/{event_time_offset, event_index, event_time_zero}`:
 ///
 /// - `event_time_offset` — TOF per event; its `units` attribute is
 ///   **required** on this path (facility files always write it; refusing to
-///   guess closes the #554 silent-rescale class).  Recognised values are
+///   guess closes the silent-rescale class). Recognised values are
 ///   the module-level table (ns/us/ms/s), scaled to canonical µs.
 /// - `event_index` — cumulative first-event index per pulse (validated
 ///   non-decreasing, last entry ≤ total events).  Events of pulse `p` are
@@ -2145,7 +2142,7 @@ pub struct BankSpectrum {
 /// the list may be unsorted/overlapping (it is normalised internally), but
 /// every pair must be finite with `t_end > t_start`.
 ///
-/// **Empty-bank grace (issue #637)**: a bank with zero events (the normal
+/// **Empty-bank grace **: a bank with zero events (the normal
 /// state of every imaging-detector bank on VENUS, where tpx1 is frame-mode)
 /// loads to an all-zero spectrum with correct pulse statistics — it never
 /// errors.
@@ -2190,7 +2187,7 @@ pub fn load_nexus_bank_spectrum(
     })?;
     // NXevent_data specifies only the unit CATEGORY (NX_TIME) with no
     // default, so a missing attribute is an error, not a guess — the same
-    // policy #554 established for event_time_offset.  Every surveyed SNS
+    // policy established for event_time_offset. Every surveyed SNS
     // file writes units="second" here.
     let etz_to_s = match read_string_attr(&etz_ds, "units")? {
         None => {
@@ -2268,7 +2265,7 @@ pub fn load_nexus_bank_spectrum(
     // Retention accounting must be exact: every event belongs to a pulse
     // slice or a drop counter.  A first index > 0 (events preceding the
     // first pulse) or events without any pulse record would vanish
-    // silently — fail loud instead (issue #637).
+    // silently — fail loud instead.
     match event_index.first() {
         Some(&first) if first != 0 => {
             return Err(IoError::InvalidParameter(format!(
@@ -2530,7 +2527,7 @@ mod bank_tests {
     #[test]
     fn fixed_length_ascii_attributes_read_correctly() {
         // SNS/ADARA facility files store attributes as FIXED-length ASCII
-        // (rustpix uses variable-length UTF-8) — both must read (issue #637).
+        // (rustpix uses variable-length UTF-8) — both must read.
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("fixed.h5");
         create_test_bank(&path, "m", &[0.0], &[vec![250.0, 750.0]], None, 1.0);

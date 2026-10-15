@@ -64,7 +64,6 @@
 //! `σ_el = g_J · π/k² · |1 − U_nn|²` with
 //! `U_nn = e^{−2iφ} · [1 + iΓ_n / (E_r − E − iΓ_tot/2)]`.
 //!
-//! Issue #549: prior to this commit the term had the wrong sign (`+` instead
 //! of `−`). The bias was numerically invisible in the existing `samtry`
 //! validation suite because all SLBW test cases are at ρ ≪ 1 where
 //! sin²φ ≈ ρ². The high-ρ regression test lives at
@@ -89,7 +88,7 @@ use crate::reich_moore::{CrossSections, PrecomputedJGroup, group_resonances_by_j
 //   - Γ_γ, Γ_f: capture and fission widths
 //   - E_r: resonance energy
 //
-// Issue #87: Pre-compute P_l(E_r) and J-groups once before the energy loop.
+// Pre-compute P_l(E_r) and J-groups once before the energy loop.
 
 /// Per-resonance invariants for SLBW, pre-computed once per resonance.
 pub(crate) struct PrecomputedSlbwResonance {
@@ -114,7 +113,7 @@ pub(crate) type PrecomputedSlbwJGroup = PrecomputedJGroup<PrecomputedSlbwResonan
 /// All quantities depend only on resonance parameters (not incident energy),
 /// so the result can be computed once and reused across all energy points.
 ///
-/// Uses the shared `group_resonances_by_j` helper (Issue #158) with an
+/// Uses the shared `group_resonances_by_j` helper with an
 /// SLBW-specific closure for per-resonance invariant construction.
 pub(crate) fn precompute_slbw_jgroups(
     resonances: &[nereids_endf::resonance::Resonance],
@@ -127,7 +126,7 @@ pub(crate) fn precompute_slbw_jgroups(
     group_resonances_by_j(resonances, target_spin, |res| {
         let e_r = res.energy;
 
-        // Pre-compute P_l(E_r) — this is the redundant computation Issue #87 eliminates.
+        // Pre-compute P_l(E_r) — this is the redundant computation eliminates.
         let p_at_er = if e_r.abs() > PIVOT_FLOOR {
             let radius_at_er = if l_group.apl > 0.0 {
                 l_group.apl
@@ -220,7 +219,7 @@ pub fn slbw_cross_sections_for_range(
     awr: f64,
     target_spin: f64,
 ) -> (f64, f64, f64, f64) {
-    // Defensive input validation at the public boundary (issue #558).
+    // Defensive input validation at the public boundary.
     // The leaf
     // `pi_over_k_squared_barns` retains its `debug_assert!`; this entry
     // guard makes the precondition genuinely enforced in release builds
@@ -331,7 +330,7 @@ pub(crate) fn slbw_evaluate_with_cached_jgroups(
             // double-count the wave-number factor (see module docstring).
             // Matches NJOY/RECONR `csslbw` `gne = gn*pe*rper` and SAMMY
             // `mlb/mmlb4.f90:88-100` after the reduced-amplitude substitution.
-            // P_l(E_r) is pre-computed in res.p_at_er (Issue #87).
+            // P_l(E_r) is pre-computed in res.p_at_er.
             let gamma_n = if e_r.abs() > PIVOT_FLOOR && res.p_at_er > PIVOT_FLOOR {
                 res.gn_abs * p_at_e / res.p_at_er
             } else {
@@ -387,8 +386,7 @@ pub(crate) fn slbw_evaluate_with_cached_jgroups(
 /// once per range and calls this evaluator at each energy; the
 /// single-energy entry point (`reich_moore::cross_sections_at_energy`)
 /// goes through the same precompute+evaluate pipeline.  Both callers
-/// share exactly this evaluator — which is what prevents the #465
-/// class of bug (the batch dispatcher previously routed MLBW ranges
+/// share exactly this evaluator — which is what prevents the
 /// through `slbw_evaluate_with_cached_jgroups`,
 /// silently computing SLBW's incoherent elastic sum instead of MLBW's
 /// coherent sum).
@@ -749,7 +747,7 @@ mod tests {
     // `validate_energy_grid`.  The entry assertion turns malformed energies
     // (zero, negative, NaN, infinity) into a loud panic at the public
     // boundary, rather than letting them propagate into `pi_over_k_squared`
-    // (whose `debug_assert!` is invisible in release builds).  See issue #558.
+    // (whose `debug_assert!` is invisible in release builds). See.
 
     #[test]
     #[should_panic(expected = "expected positive finite energy_ev")]

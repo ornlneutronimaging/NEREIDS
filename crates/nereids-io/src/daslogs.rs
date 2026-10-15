@@ -349,7 +349,7 @@ fn read_pv_series(
         )));
     }
 
-    // Drop corrupt device-reconnect records (issue #652, B12).  Real SNS
+    // Drop corrupt device-reconnect records (B12). Real SNS
     // files — furnace channels BL10:SE:ND1:* on runs 19383/19386/19392 —
     // contain reconnect entries with the exact signature `time == 0.0` AND
     // a subnormal uninitialized-memory value (~6.9e-310).  A subnormal is
@@ -606,7 +606,7 @@ mod tests {
         );
     }
 
-    /// Issue #652 (B12): corrupt device-reconnect records — `time = 0.0`
+    /// (B12): corrupt device-reconnect records — `time = 0.0`
     /// with a subnormal (~6.9e-310) value — are dropped, so `run_health`
     /// works on furnace-style PVs instead of ingesting the subnormal into
     /// its median or failing the ascending-time check.  Mirrors the real

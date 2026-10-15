@@ -61,23 +61,6 @@ fn collapsed_sidebar(
         ui.add_space(2.0);
     }
 
-    // Tools
-    if !state.pipeline.is_empty()
-        && !matches!(state.guided_step, GuidedStep::Landing | GuidedStep::Wizard)
-    {
-        ui.add_space(4.0);
-        ui.separator();
-        ui.add_space(4.0);
-
-        for &(tool_step, title, icon) in &[
-            (GuidedStep::ForwardModel, "Forward Model", "\u{21D2}"),
-            (GuidedStep::Detectability, "Detectability", "\u{2605}"),
-        ] {
-            collapsed_tool_badge(ui, tool_step, icon, title, state, colors);
-            ui.add_space(2.0);
-        }
-    }
-
     // History icon at bottom
     ui.with_layout(Layout::bottom_up(Align::Center), |ui| {
         if !state.provenance_log.is_empty() {
@@ -164,34 +147,6 @@ fn expanded_sidebar(ui: &mut egui::Ui, state: &mut AppState, colors: &ThemeColor
         let pipeline: Vec<PipelineEntry> = state.pipeline.clone();
         for entry in &pipeline {
             pipeline_step_row(ui, entry, state, colors);
-            ui.add_space(2.0);
-        }
-    }
-
-    // ── Tools section ─────
-    if !state.pipeline.is_empty() && !on_landing_or_wizard {
-        ui.add_space(12.0);
-        ui.separator();
-        ui.add_space(8.0);
-
-        ui.label(RichText::new("Tools").strong().size(13.0).color(colors.fg2));
-        ui.add_space(4.0);
-
-        for &(tool_step, title, subtitle, icon) in &[
-            (
-                GuidedStep::ForwardModel,
-                "Forward Model",
-                "Preview spectra",
-                "\u{21D2}",
-            ),
-            (
-                GuidedStep::Detectability,
-                "Detectability",
-                "Pre-experiment",
-                "\u{2605}",
-            ),
-        ] {
-            tool_row(ui, tool_step, title, subtitle, icon, state, colors);
             ui.add_space(2.0);
         }
     }
@@ -289,59 +244,6 @@ fn collapsed_step_badge(
     resp.on_hover_text(&tooltip);
 }
 
-/// Collapsed tool badge: icon-only circle with tooltip.
-fn collapsed_tool_badge(
-    ui: &mut egui::Ui,
-    step: GuidedStep,
-    icon: &str,
-    title: &str,
-    state: &mut AppState,
-    colors: &ThemeColors,
-) {
-    let is_active = state.guided_step == step;
-    let row_fill = if is_active {
-        colors.accent
-    } else {
-        Color32::TRANSPARENT
-    };
-
-    let resp = egui::Frame::NONE
-        .fill(row_fill)
-        .corner_radius(CornerRadius::same(7))
-        .inner_margin(Margin::symmetric(8, 6))
-        .show(ui, |ui| {
-            ui.with_layout(Layout::top_down(Align::Center), |ui| {
-                let (rect, _) = ui.allocate_exact_size(egui::vec2(20.0, 20.0), Sense::hover());
-                let badge_color = if is_active {
-                    Color32::from_white_alpha(60)
-                } else {
-                    colors.bg3
-                };
-                ui.painter().circle_filled(rect.center(), 10.0, badge_color);
-                let icon_color = if is_active {
-                    Color32::WHITE
-                } else {
-                    colors.fg2
-                };
-                ui.painter().text(
-                    rect.center(),
-                    egui::Align2::CENTER_CENTER,
-                    icon,
-                    egui::FontId::proportional(11.0),
-                    icon_color,
-                );
-            });
-        })
-        .response;
-
-    let resp = resp.interact(Sense::click());
-    if resp.clicked() {
-        state.guided_step = step;
-        state.status_message = String::new();
-    }
-    resp.on_hover_text(title);
-}
-
 fn step_icon(step: GuidedStep) -> &'static str {
     match step {
         GuidedStep::Configure => "\u{2699}",
@@ -352,8 +254,6 @@ fn step_icon(step: GuidedStep) -> &'static str {
         GuidedStep::Analyze => "\u{25CE}",
         GuidedStep::Results => "\u{25A3}",
         GuidedStep::Landing | GuidedStep::Wizard => "\u{25CB}",
-        GuidedStep::ForwardModel => "\u{21D2}",
-        GuidedStep::Detectability => "\u{2605}",
     }
 }
 
@@ -565,73 +465,6 @@ fn dimmed_pipeline_step_row(
         });
 }
 
-/// Render a tool row (Forward Model, Detectability) with icon and subtitle.
-fn tool_row(
-    ui: &mut egui::Ui,
-    step: GuidedStep,
-    title: &str,
-    subtitle: &str,
-    icon: &str,
-    state: &mut AppState,
-    colors: &ThemeColors,
-) {
-    let is_active = state.guided_step == step;
-    let row_fill = if is_active {
-        colors.accent
-    } else {
-        Color32::TRANSPARENT
-    };
-
-    let resp = egui::Frame::NONE
-        .fill(row_fill)
-        .corner_radius(CornerRadius::same(7))
-        .inner_margin(Margin::symmetric(10, 6))
-        .show(ui, |ui| {
-            ui.horizontal(|ui| {
-                ui.spacing_mut().item_spacing.x = 8.0;
-
-                // Icon badge (20×20)
-                let (rect, _) = ui.allocate_exact_size(egui::vec2(20.0, 20.0), Sense::hover());
-                let badge_color = if is_active {
-                    Color32::from_white_alpha(60)
-                } else {
-                    colors.bg3
-                };
-                ui.painter().circle_filled(rect.center(), 10.0, badge_color);
-                let icon_color = if is_active {
-                    Color32::WHITE
-                } else {
-                    colors.fg2
-                };
-                ui.painter().text(
-                    rect.center(),
-                    egui::Align2::CENTER_CENTER,
-                    icon,
-                    egui::FontId::proportional(11.0),
-                    icon_color,
-                );
-
-                // Title + subtitle
-                ui.vertical(|ui| {
-                    let title_color = if is_active { Color32::WHITE } else { colors.fg };
-                    ui.label(RichText::new(title).color(title_color).strong());
-                    let sub_color = if is_active {
-                        Color32::from_white_alpha(180)
-                    } else {
-                        colors.fg3
-                    };
-                    ui.label(RichText::new(subtitle).size(10.0).color(sub_color));
-                });
-            });
-        })
-        .response;
-
-    if resp.interact(Sense::click()).clicked() {
-        state.guided_step = step;
-        state.status_message = String::new();
-    }
-}
-
 /// Dynamic subtitle for each workflow step based on current state.
 fn step_subtitle(step: GuidedStep, state: &AppState) -> String {
     match step {
@@ -640,7 +473,6 @@ fn step_subtitle(step: GuidedStep, state: &AppState) -> String {
                 let shape = data.shape();
                 let mode = match state.input_mode {
                     InputMode::TiffPair => "TIFF pair",
-                    InputMode::TransmissionTiff => "Transmission",
                     InputMode::Hdf5Histogram => "HDF5 histogram",
                     InputMode::Hdf5Event => "HDF5 event",
                 };
@@ -664,28 +496,23 @@ fn step_subtitle(step: GuidedStep, state: &AppState) -> String {
             }
         }
         GuidedStep::Normalize => {
-            if let Some(ref norm) = state.normalized {
-                let bins = norm.transmission.shape()[0];
-                let px = norm.transmission.shape()[1] * norm.transmission.shape()[2];
-                format!("{bins} bins, {px} px")
+            if let Some(ref energies) = state.energies {
+                format!("{} energy bins", energies.len())
             } else {
                 "Pending".into()
             }
         }
         GuidedStep::Analyze => {
-            if let Some(ref sr) = state.spatial_result {
-                format!("{}/{}", sr.n_converged, sr.n_total)
-            } else if state.is_fitting {
-                "Running...".into()
+            if state.energies.is_some() {
+                "Ready".into()
             } else {
-                "Not started".into()
+                "Prepare data first".into()
             }
         }
-        GuidedStep::Results => "Maps & export".into(),
+        GuidedStep::Results => "Pending counts engine".into(),
         GuidedStep::Bin => "Event histogramming".into(),
         GuidedStep::Rebin => "Energy rebin".into(),
         GuidedStep::Landing | GuidedStep::Wizard => String::new(),
-        GuidedStep::ForwardModel | GuidedStep::Detectability => String::new(),
     }
 }
 
@@ -702,9 +529,6 @@ fn step_is_complete(step: GuidedStep, state: &AppState) -> bool {
                 state.sample_data.is_some()
                     && state.open_beam_data.is_some()
                     && state.spectrum_values.is_some()
-            }
-            InputMode::TransmissionTiff => {
-                state.sample_data.is_some() && state.spectrum_values.is_some()
             }
             InputMode::Hdf5Histogram => {
                 state.sample_data.is_some() && state.spectrum_values.is_some()
@@ -724,13 +548,12 @@ fn step_is_complete(step: GuidedStep, state: &AppState) -> bool {
                     .filter(|e| e.enabled)
                     .all(|e| e.resonance_data.is_some())
         }
-        GuidedStep::Normalize => state.normalized.is_some(),
-        GuidedStep::Analyze => state.pixel_fit_result.is_some() || state.spatial_result.is_some(),
-        GuidedStep::Results => state.pixel_fit_result.is_some() || state.spatial_result.is_some(),
+        GuidedStep::Normalize => state.energies.is_some(),
+        GuidedStep::Analyze => state.energies.is_some(),
+        GuidedStep::Results => false,
         GuidedStep::Bin => state.sample_data.is_some(),
         GuidedStep::Rebin => true, // optional, skip counts as done
         GuidedStep::Landing | GuidedStep::Wizard => false,
-        GuidedStep::ForwardModel | GuidedStep::Detectability => false,
     }
 }
 
@@ -744,7 +567,6 @@ fn pathway_label(state: &AppState) -> String {
     let data = match state.data_type {
         Some(crate::state::DataType::Events) => "Events",
         Some(crate::state::DataType::PreNormalized) => "Pre-norm",
-        Some(crate::state::DataType::Transmission) => "Transmission",
         None => "",
     };
     if data.is_empty() {

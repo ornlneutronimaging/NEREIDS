@@ -18,7 +18,7 @@ use std::time::{Duration, Instant};
 const IAEA_BASE_URL: &str = "https://www-nds.iaea.org/public/download-endf";
 const NNDC_ENDF_BASE_URL: &str = "https://www.nndc.bnl.gov/endf-data/ENDF";
 // Polite, identifiable UA: many nuclear-data servers either require a non-default
-// UA or treat default `reqwest` traffic as a bot (issue #523, IAEA returning
+// UA or treat default `reqwest` traffic as a bot (IAEA returning
 // HTTP 403 to v0.1.8 batch fetches). Version is derived from `CARGO_PKG_VERSION`
 // so it never drifts from `Cargo.toml`.
 const ENDF_USER_AGENT: &str = concat!(
@@ -175,7 +175,7 @@ impl EndfRetriever {
     /// Get the cache directory for a specific library.
     ///
     /// Public so the GUI can show users exactly where to drop a manually-
-    /// downloaded ENDF file when a fetch fails (issue #523).
+    /// downloaded ENDF file when a fetch fails.
     pub fn cache_dir(&self, library: EndfLibrary) -> PathBuf {
         self.cache_root.join(library.cache_dir_name())
     }
@@ -306,7 +306,7 @@ impl EndfRetriever {
     /// isotope declared by the file's MF=2 MT=151 HEAD record alongside the
     /// decoded text. The GUI uses this to dispatch a manual upload to the
     /// matching `IsotopeEntry` without re-reading or re-extracting the file
-    /// during install (issue #523, P2: avoid N-pass zip extraction).
+    /// during install (avoid N-pass zip extraction).
     pub fn peek_local_endf(source: &Path) -> Result<(Isotope, String), EndfRetrievalError> {
         let raw = fs::read(source)?;
         let endf_text = if looks_like_zip(source, &raw) {
@@ -352,7 +352,7 @@ impl EndfRetriever {
     /// cache without any network access.
     ///
     /// This is the GUI's manual-upload escape hatch for users on networks
-    /// where IAEA/NNDC is blocked (issue #523).
+    /// where IAEA/NNDC is blocked.
     pub fn install_local_endf(
         &self,
         isotope: &Isotope,
@@ -446,7 +446,7 @@ pub enum EndfRetrievalError {
     NotInLibrary { isotope: String, library: String },
 
     /// A user-supplied ENDF file did not describe the isotope it was being
-    /// installed against (issue #523, manual upload path).
+    /// installed against (manual upload path).
     #[error("ENDF file is for {found}, but expected {expected}")]
     IsotopeMismatch { expected: String, found: String },
 
@@ -719,7 +719,7 @@ mod tests {
         assert!(!EndfRetrievalError::Io(std::io::Error::other("disk")).is_unavailable());
     }
 
-    /// Issue #523: the polite User-Agent must carry the live package version
+    /// the polite User-Agent must carry the live package version
     /// and the contact metadata the IAEA acceptance criterion calls for.
     #[test]
     fn endf_user_agent_contains_version_and_contact() {

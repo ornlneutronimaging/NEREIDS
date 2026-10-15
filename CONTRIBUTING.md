@@ -65,6 +65,14 @@ cargo test --workspace --exclude nereids-python
 - Do not suppress clippy warnings with `#[allow(...)]` -- fix the underlying issue
 - Use `Result` for error handling in public APIs, not `unwrap()`/`expect()`/`assert!()`
 
+### Comments
+
+A comment says what the code does and why it has this shape, in the fewest
+words that do it. No history narration ("used to", "previously", "no longer"),
+no PR/issue/review references, no self-promotion or process talk, no meta
+comments, no restating the next line. Keep SAMMY/equation references, units,
+invariants and `# Safety`/`# Errors`/`# Panics`. See `AGENTS.md`.
+
 ### Python
 
 - Follow PEP 8
@@ -105,9 +113,9 @@ crates/
   nereids-core/       Shared types, constants, isotope registry
   nereids-endf/       ENDF file retrieval and resonance parsing
   nereids-physics/    Cross-section calculation and broadening
-  nereids-fitting/    LM and Poisson/KL optimizers
-  nereids-io/         TIFF/NeXus I/O, normalization
-  nereids-pipeline/   Spatial mapping orchestration
+  nereids-fitting/    Poisson/KL counts optimizer
+  nereids-io/         TIFF/NeXus I/O, pixel masks
+  nereids-pipeline/   Counts-domain fitting (one region or a map)
 bindings/python/      PyO3 Python bindings (excluded from workspace clippy/test)
 apps/gui/             egui desktop application
 examples/notebooks/   Jupyter tutorials (4 tiers)

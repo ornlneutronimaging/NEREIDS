@@ -3,19 +3,14 @@
 use ndarray::{Array2, Array3};
 use std::path::PathBuf;
 use std::sync::Arc;
-use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::mpsc;
 
 use nereids_endf::resonance::ResonanceData;
 use nereids_endf::retrieval::EndfLibrary;
-use nereids_fitting::lm::LmConfig;
 use nereids_io::nexus::{Hdf5TreeEntry, NexusMetadata};
-use nereids_io::normalization::NormalizedData;
 use nereids_io::spectrum::{SpectrumUnit, SpectrumValueKind};
 use nereids_io::tof::BeamlineParams;
-use nereids_pipeline::detectability::TraceDetectabilityReport;
-use nereids_pipeline::pipeline::SpectrumFitResult;
-use nereids_pipeline::spatial::SpatialResult;
 
 /// Lightweight session cache for persistence across app restarts.
 /// Only stores the subset of state needed to resume a previous pipeline.
@@ -24,7 +19,6 @@ pub struct SessionCache {
     pub fitting_type: Option<FittingType>,
     pub data_type: Option<DataType>,
     pub input_mode: InputMode,
-    pub analysis_mode: AnalysisMode,
     /// Beamline flight path (m).
     pub flight_path_m: f64,
     /// Beamline delay (μs).
@@ -39,16 +33,6 @@ pub struct SessionCache {
     pub isotopes: Vec<CachedIsotope>,
     /// ENDF library name (e.g. "ENDF/B-VIII.0").
     pub endf_library_name: String,
-    /// Solver method.
-    pub solver_method: CachedSolverMethod,
-    /// Resolution broadening: "gaussian" or "tabulated".
-    pub resolution_kind: String,
-    /// Gaussian Δt (μs), only used when resolution_kind == "gaussian".
-    pub resolution_delta_t_us: f64,
-    /// Gaussian ΔL (m), only used when resolution_kind == "gaussian".
-    pub resolution_delta_l_m: f64,
-    /// Tabulated resolution file path (if applicable).
-    pub resolution_path: Option<String>,
     /// Energy rebin factor (1 = no rebinning).
     #[serde(default = "default_rebin_factor")]
     pub rebin_factor: usize,
@@ -58,13 +42,10 @@ pub struct SessionCache {
     /// Whether the sidebar is collapsed (icon-only mode).
     #[serde(default)]
     pub sidebar_collapsed: bool,
-    /// LM background enabled (SAMMY 4-param).
-    #[serde(default, alias = "background_enabled")]
-    pub lm_background_enabled: bool,
     /// KL background enabled (b₀ + b₁/√E).
     #[serde(default)]
     pub kl_background_enabled: bool,
-    /// Bounded multiplicative baseline enabled (issue #635).
+    /// Bounded multiplicative baseline enabled ().
     #[serde(default)]
     pub baseline_enabled: bool,
     /// Counts-KL proton-charge ratio `c = Q_s / Q_ob`.
@@ -76,10 +57,6 @@ pub struct SessionCache {
     /// `Some(true/false)` forces polish on/off.
     #[serde(default)]
     pub kl_enable_polish_override: Option<bool>,
-    /// Fit energy-scale calibration (TZERO `t₀` + flight-path `L_scale`)
-    /// as free parameters.  Composes with `fit_temperature` (issue #634).
-    #[serde(default)]
-    pub fit_energy_scale: bool,
     /// Fit energy range restriction (SAMMY EMIN/EMAX equivalent).
     /// `None` (default) = full grid.
     #[serde(default)]
@@ -92,13 +69,6 @@ pub struct SessionCache {
 
 fn default_rebin_factor() -> usize {
     1
-}
-
-/// Serializable solver method for session cache.
-#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
-pub enum CachedSolverMethod {
-    LevenbergMarquardt,
-    PoissonKL,
 }
 
 /// Default for SessionCache::kl_c_ratio when a saved session predates the field.
@@ -145,7 +115,6 @@ impl SessionCache {
             fitting_type: state.fitting_type,
             data_type: state.data_type,
             input_mode: state.input_mode,
-            analysis_mode: state.analysis_mode,
             flight_path_m: state.beamline.flight_path_m,
             delay_us: state.beamline.delay_us,
             temperature_k: state.temperature_k,
@@ -163,35 +132,13 @@ impl SessionCache {
                 })
                 .collect(),
             endf_library_name: crate::widgets::design::library_name(state.endf_library).to_string(),
-            solver_method: match state.solver_method {
-                SolverMethod::LevenbergMarquardt => CachedSolverMethod::LevenbergMarquardt,
-                SolverMethod::PoissonKL => CachedSolverMethod::PoissonKL,
-            },
-            resolution_kind: match &state.resolution_mode {
-                ResolutionMode::Gaussian { .. } => "gaussian".to_string(),
-                ResolutionMode::Tabulated { .. } => "tabulated".to_string(),
-            },
-            resolution_delta_t_us: match &state.resolution_mode {
-                ResolutionMode::Gaussian { delta_t_us, .. } => *delta_t_us,
-                _ => 0.0,
-            },
-            resolution_delta_l_m: match &state.resolution_mode {
-                ResolutionMode::Gaussian { delta_l_m, .. } => *delta_l_m,
-                _ => 0.0,
-            },
-            resolution_path: match &state.resolution_mode {
-                ResolutionMode::Tabulated { path, .. } => Some(path.to_string_lossy().to_string()),
-                _ => None,
-            },
             rebin_factor: state.rebin_factor,
             rebin_applied: state.rebin_applied,
             sidebar_collapsed: state.sidebar_collapsed,
-            lm_background_enabled: state.lm_background_enabled,
             kl_background_enabled: state.kl_background_enabled,
             baseline_enabled: state.baseline_enabled,
             kl_c_ratio: state.kl_c_ratio,
             kl_enable_polish_override: state.kl_enable_polish_override,
-            fit_energy_scale: state.fit_energy_scale,
             fit_energy_range: state.fit_energy_range,
             isotope_groups: state
                 .isotope_groups
@@ -220,7 +167,6 @@ impl SessionCache {
         state.fitting_type = self.fitting_type;
         state.data_type = self.data_type;
         state.input_mode = self.input_mode;
-        state.analysis_mode = self.analysis_mode;
         state.beamline.flight_path_m = self.flight_path_m;
         state.beamline.delay_us = self.delay_us;
         state.temperature_k = self.temperature_k;
@@ -275,33 +221,6 @@ impl SessionCache {
             _ => nereids_endf::retrieval::EndfLibrary::EndfB8_0,
         };
 
-        // Restore solver method
-        state.solver_method = match self.solver_method {
-            CachedSolverMethod::LevenbergMarquardt => SolverMethod::LevenbergMarquardt,
-            CachedSolverMethod::PoissonKL => SolverMethod::PoissonKL,
-        };
-
-        // Restore resolution mode
-        state.resolution_mode = if self.resolution_kind == "tabulated" {
-            if let Some(ref p) = self.resolution_path {
-                ResolutionMode::Tabulated {
-                    path: PathBuf::from(p),
-                    data: None, // will need re-parse on first use
-                    error: None,
-                }
-            } else {
-                ResolutionMode::Gaussian {
-                    delta_t_us: self.resolution_delta_t_us,
-                    delta_l_m: self.resolution_delta_l_m,
-                }
-            }
-        } else {
-            ResolutionMode::Gaussian {
-                delta_t_us: self.resolution_delta_t_us,
-                delta_l_m: self.resolution_delta_l_m,
-            }
-        };
-
         // Restore rebin state
         state.rebin_factor = self.rebin_factor;
         state.rebin_applied = self.rebin_applied;
@@ -310,12 +229,10 @@ impl SessionCache {
         state.sidebar_collapsed = self.sidebar_collapsed;
 
         // Restore background normalization state
-        state.lm_background_enabled = self.lm_background_enabled;
         state.kl_background_enabled = self.kl_background_enabled;
         state.baseline_enabled = self.baseline_enabled;
         state.kl_c_ratio = self.kl_c_ratio;
         state.kl_enable_polish_override = self.kl_enable_polish_override;
-        state.fit_energy_scale = self.fit_energy_scale;
         state.fit_energy_range = self.fit_energy_range;
 
         // Rebuild pipeline
@@ -332,7 +249,6 @@ impl SessionCache {
         let data = match self.data_type {
             Some(DataType::Events) => "Events",
             Some(DataType::PreNormalized) => "Pre-norm",
-            Some(DataType::Transmission) => "Transmission",
             None => "Unknown",
         };
         let n_iso = self.isotopes.iter().filter(|i| i.enabled).count();
@@ -344,30 +260,14 @@ impl SessionCache {
     }
 }
 
-/// Which target list an ENDF fetch result belongs to.
-///
-/// Replaces the former `is_detect_matrix: bool` flag, giving each call-site
-/// a self-documenting label instead of an opaque boolean.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum FetchTarget {
-    Configure,
-    ForwardModel,
-    DetectMatrix,
-    DetectTrace,
-}
-
 /// Result of a background ENDF fetch for a single isotope.
 ///
 /// Uses `(z, a)` to identify which isotope entry the result belongs to,
 /// rather than positional index which is fragile if the list is mutated
 /// during a background fetch.
-///
-/// `target` distinguishes which list the result belongs to (Configure,
-/// ForwardModel, DetectMatrix, or DetectTrace).
 pub struct EndfFetchResult {
     pub z: u32,
     pub a: u32,
-    pub target: FetchTarget,
     pub symbol: String,
     pub result: Result<ResonanceData, String>,
 }
@@ -377,30 +277,10 @@ pub struct EndfFetchResult {
 pub enum InputMode {
     /// Sample TIFF stack + Open beam TIFF stack + Spectrum file.
     TiffPair,
-    /// Pre-normalized transmission TIFF + Spectrum file.
-    TransmissionTiff,
     /// HDF5/NeXus file with pre-histogrammed counts.
     Hdf5Histogram,
     /// HDF5/NeXus file with raw neutron events (histogrammed on load).
     Hdf5Event,
-}
-
-/// Analysis mode — determines how fitting operates in the Analyze step.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
-pub enum AnalysisMode {
-    /// Fit every pixel independently (full spatial map).
-    FullSpatialMap,
-    /// Average ROI into one spectrum, fit once.
-    RoiSingleSpectrum,
-    /// Bin NxN pixels, fit the binned map.
-    SpatialBinning(u8),
-}
-
-/// Solver method for fitting.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum SolverMethod {
-    LevenbergMarquardt,
-    PoissonKL,
 }
 
 /// Data source for the normalize-preview spectrum plot.
@@ -417,23 +297,6 @@ pub enum SpectrumDataSource {
 pub enum SpectrumAxis {
     EnergyEv,
     TofMicroseconds,
-}
-
-/// Prominent feedback from a fit operation, displayed in the Analyze controls.
-#[derive(Debug, Clone)]
-pub struct FitFeedback {
-    /// True if fit converged.
-    pub success: bool,
-    /// Summary line (e.g. "Pixel (3,5) converged, chi2_r = 1.23").
-    pub summary: String,
-    /// Per-isotope densities: (symbol, density_atoms_per_barn).
-    pub densities: Vec<(String, f64)>,
-    /// Fitted temperature (K), when temperature fitting was enabled.
-    pub temperature_k: Option<f64>,
-    /// Structured fit-configuration warnings from the pipeline (issue
-    /// #635 — e.g. the degenerate free-Anorm + free-T + free-density
-    /// trio).  Rendered as amber lines under the summary.
-    pub warnings: Vec<String>,
 }
 
 /// A single provenance event in the session audit trail.
@@ -494,55 +357,10 @@ fn days_to_civil(days: u64) -> (i32, u32, u32) {
     (y as i32, m as u32, d as u32)
 }
 
-/// Available colormaps for density map rendering.
+/// Colormap for image rendering.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Colormap {
     Viridis,
-    Inferno,
-    Plasma,
-    Grayscale,
-}
-
-impl Colormap {
-    pub const ALL: [Colormap; 4] = [
-        Colormap::Viridis,
-        Colormap::Inferno,
-        Colormap::Plasma,
-        Colormap::Grayscale,
-    ];
-
-    pub fn label(self) -> &'static str {
-        match self {
-            Self::Viridis => "Viridis",
-            Self::Inferno => "Inferno",
-            Self::Plasma => "Plasma",
-            Self::Grayscale => "Grayscale",
-        }
-    }
-}
-
-/// Export format for spatial mapping results.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum ExportFormat {
-    Tiff,
-    Hdf5,
-    Markdown,
-}
-
-impl ExportFormat {
-    pub const ALL: [ExportFormat; 3] = [
-        ExportFormat::Tiff,
-        ExportFormat::Hdf5,
-        ExportFormat::Markdown,
-    ];
-
-    pub fn label(self) -> &'static str {
-        match self {
-            Self::Tiff => "TIFF (f32)",
-            Self::Hdf5 => "HDF5",
-            Self::Markdown => "Markdown Report",
-        }
-    }
 }
 
 /// Data mode for project file save.
@@ -553,154 +371,11 @@ pub enum SaveDataMode {
     Embedded,
 }
 
-/// Per-tile display settings for density map rendering.
-#[derive(Debug, Clone)]
-pub struct TileDisplayState {
-    pub colormap: Colormap,
-    pub show_colorbar: bool,
-}
-
-impl Default for TileDisplayState {
-    fn default() -> Self {
-        Self {
-            colormap: Colormap::Viridis,
-            show_colorbar: false,
-        }
-    }
-}
-
 /// Target context for the periodic table modal.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum PeriodicTableTarget {
     Configure,
     ConfigureGroup,
-    ForwardModel,
-    DetectMatrix,
-    DetectTrace,
-}
-
-/// Resolution broadening mode: parametric Gaussian or tabulated from file.
-#[derive(Clone, Debug)]
-pub enum ResolutionMode {
-    /// Analytical Gaussian: Δt (μs) and ΔL (m).
-    Gaussian { delta_t_us: f64, delta_l_m: f64 },
-    /// Tabulated from a VENUS/FTS resolution file.
-    Tabulated {
-        path: PathBuf,
-        data: Option<Arc<nereids_physics::resolution::TabulatedResolution>>,
-        error: Option<String>,
-    },
-}
-
-impl PartialEq for ResolutionMode {
-    fn eq(&self, other: &Self) -> bool {
-        match (self, other) {
-            (
-                Self::Gaussian {
-                    delta_t_us: dt1,
-                    delta_l_m: dl1,
-                },
-                Self::Gaussian {
-                    delta_t_us: dt2,
-                    delta_l_m: dl2,
-                },
-            ) => dt1 == dt2 && dl1 == dl2,
-            (
-                Self::Tabulated {
-                    path: p1,
-                    data: d1,
-                    error: e1,
-                },
-                Self::Tabulated {
-                    path: p2,
-                    data: d2,
-                    error: e2,
-                },
-            ) => match (d1, d2) {
-                (Some(a), Some(b)) => Arc::ptr_eq(a, b),
-                (None, None) => p1 == p2 && e1 == e2,
-                _ => false,
-            },
-            _ => false,
-        }
-    }
-}
-
-impl Default for ResolutionMode {
-    fn default() -> Self {
-        Self::Gaussian {
-            delta_t_us: 1.0,
-            delta_l_m: 0.01,
-        }
-    }
-}
-
-/// A trace isotope entry for detectability analysis.
-pub struct DetectTraceEntry {
-    pub z: u32,
-    pub a: u32,
-    pub symbol: String,
-    pub concentration_ppm: f64,
-    pub resonance_data: Option<ResonanceData>,
-    pub endf_status: EndfStatus,
-}
-
-/// Progress state for spatial mapping.
-///
-/// Holds an `Arc<AtomicUsize>` shared with the background thread and the
-/// pixel total.  Display code reads the atomic directly each frame — no
-/// intermediate polling step, no sync issues.
-pub struct FittingProgress {
-    counter: Arc<AtomicUsize>,
-    total: usize,
-}
-
-impl FittingProgress {
-    pub fn new(total: usize) -> (Self, Arc<AtomicUsize>) {
-        let counter = Arc::new(AtomicUsize::new(0));
-        let handle = Arc::clone(&counter);
-        (Self { counter, total }, handle)
-    }
-
-    /// Current number of completed pixels (reads atomic).
-    pub fn done(&self) -> usize {
-        self.counter.load(std::sync::atomic::Ordering::Relaxed)
-    }
-
-    pub fn total(&self) -> usize {
-        self.total
-    }
-
-    pub fn fraction(&self) -> f32 {
-        self.done() as f32 / self.total.max(1) as f32
-    }
-}
-
-/// Cached residuals data for the Studio dock, avoiding per-frame model rebuild.
-#[derive(Clone, Debug)]
-pub struct CachedResiduals {
-    /// Generation counter of the `pixel_fit_result` that produced this cache.
-    pub fit_gen: u64,
-    /// Selected pixel at cache time.
-    pub pixel: (usize, usize),
-    /// Resolution enabled flag at cache time.
-    pub resolution_enabled: bool,
-    /// Resolution mode at cache time (compared via PartialEq).
-    pub resolution_mode: ResolutionMode,
-    /// Flight path at cache time (affects Gaussian resolution).
-    pub flight_path_m: f64,
-    /// Effective temperature used for the forward model overlay.
-    pub temperature_k: f64,
-    /// Reduced chi-squared (stored so display doesn't need to re-extract).
-    pub chi2_r: f64,
-    /// Residual points: (energy_ev, residual_value).
-    pub residuals: Vec<(f64, f64)>,
-    /// RMS of residuals.
-    pub rms: f64,
-    /// Maximum absolute residual.
-    pub max_abs: f64,
-    /// Number of finite residual points.
-    pub n_points: usize,
 }
 
 /// Main application state.
@@ -711,14 +386,13 @@ pub struct AppState {
     pub open_beam_path: Option<PathBuf>,
     pub sample_data: Option<Arc<Array3<f64>>>,
     pub open_beam_data: Option<Arc<Array3<f64>>>,
-    pub normalized: Option<Arc<NormalizedData>>,
     /// Effective pixel mask applied by the analysis:
     /// `file_dead_pixels ∪ latest detection`.  Recomputed FROM SCRATCH on
     /// every normalization via [`AppState::set_detected_dead_pixels`] —
     /// never unioned with its own previous value, so detections can not
-    /// accumulate across open-beam swaps / re-normalizations (#646).
+    /// accumulate across open-beam swaps / re-normalizations.
     pub dead_pixels: Option<Array2<bool>>,
-    /// Declared-mask provenance (#646): the pixel mask carried by an input
+    /// Declared-mask provenance: the pixel mask carried by an input
     /// artifact — the HDF5 file's dead-pixel dataset (set where the sample
     /// is loaded: `guided::load::load_hdf5_histogram`, `guided::bin`) or a saved
     /// project's `/intermediate/dead_pixels` (set on project restore).
@@ -729,7 +403,7 @@ pub struct AppState {
     /// ([`AppState::set_detected_dead_pixels`] is the single site that
     /// combines the two).
     pub file_dead_pixels: Option<Array2<bool>>,
-    /// Detected-mask component (#646 R4, P1-1): the dead ∪ hot mask from
+    /// Detected-mask component: the dead ∪ hot mask from
     /// the most recent detection run, exactly as
     /// [`AppState::set_detected_dead_pixels`] received it.  Kept separate
     /// from the effective mask so project SAVE can persist it as its own
@@ -762,26 +436,8 @@ pub struct AppState {
     pub isotope_groups: Vec<IsotopeGroupEntry>,
     pub endf_library: EndfLibrary,
 
-    // -- Instrument Resolution --
-    pub resolution_enabled: bool,
-    pub resolution_mode: ResolutionMode,
-
     // -- Fitting --
     pub temperature_k: f64,
-    pub lm_config: LmConfig,
-    pub solver_method: SolverMethod,
-    pub fit_temperature: bool,
-    /// Fit residual energy-scale calibration (TZERO `t₀` μs + flight-path
-    /// `L_scale`) as free parameters per SAMMY equivalent.  Composes with
-    /// `fit_temperature` since issue #634 — the energy-scale model carries
-    /// a fitted temperature column (joint thermometry).
-    ///
-    /// Initial values: `t₀ = 0.0` and `L_scale = 1.0` (identity seeds).
-    /// The configured Delay has already been subtracted when the energy
-    /// grid was built (`nereids-io::tof::tof_edges_to_energy`), so `t₀`
-    /// represents the residual offset on top of the corrected grid;
-    /// `L_scale` multiplies the nominal `flight_path_m`.
-    pub fit_energy_scale: bool,
     /// Restrict the fit to `[min_eV, max_eV]` (SAMMY EMIN/EMAX equivalent —
     /// INPut-file card set 2, manual Table VI A.1).
     /// `None` = full grid (default).  Both bounds must lie inside the
@@ -789,19 +445,14 @@ pub struct AppState {
     /// each boundary) is applied automatically in `build_fit_config`
     /// so resonances near the boundaries are correctly broadened.
     pub fit_energy_range: Option<(f64, f64)>,
-    pub show_advanced_solver: bool,
 
     // -- Uncertainty provenance --
-    /// True when per-bin uncertainty was estimated from transmission shape
-    /// (TransmissionTiff, HDF5 auto-prepare) rather than measured from
-    /// sample + open-beam counting statistics. When true, chi-squared
+    /// True when per-bin uncertainty was estimated rather than measured
+    /// from sample + open-beam counting statistics. When true, chi-squared
     /// values are approximate and should be displayed with a warning.
     pub uncertainty_is_estimated: bool,
 
     // -- Background normalization --
-    /// LM background: SAMMY 4-param model.
-    /// Model: Anorm * T_inner(E) + BackA + BackB/sqrt(E) + BackC*sqrt(E)
-    pub lm_background_enabled: bool,
     /// KL background: SAMMY 4-term wrapper (joint-Poisson compatible).
     /// Model: Anorm * T_inner(E) + BackA + BackB/sqrt(E) + BackC*sqrt(E)
     pub kl_background_enabled: bool,
@@ -810,13 +461,9 @@ pub struct AppState {
     /// upstream.  For raw-count VENUS data, set to the actual
     /// Q_sample/Q_open_beam ratio (typically ~5–6).
     pub kl_c_ratio: f64,
-    /// Override for Nelder-Mead polish on the counts-KL path.  `None`
-    /// lets `spatial_map_typed` auto-disable polish when n_pixels > 1
-    /// (measured ~17 min/pixel polish cost).  `Some(true)` forces
-    /// polish on even at spatial scale (research use only);
-    /// `Some(false)` forces off.
+    /// Retained project setting; the counts engine has no Nelder-Mead polish.
     pub kl_enable_polish_override: Option<bool>,
-    /// Bounded multiplicative baseline (issue #635):
+    /// Bounded multiplicative baseline ():
     /// B(E) = b0 + b1·ln(E/E_ref) + b2·ln²(E/E_ref), applied OUTERMOST.
     /// When combined with a background, Anorm is held fixed (b0/Anorm are
     /// degenerate normalizations) — `build_fit_config` wires that.
@@ -827,30 +474,8 @@ pub struct AppState {
     pub rois: Vec<RoiSelection>,
     pub selected_roi: Option<usize>,
 
-    /// Snapshot of ROIs at the time spatial_map was launched.
-    /// Used to render density overlays only on fitted pixels.
-    pub fitting_rois: Vec<RoiSelection>,
     /// Toggle: show provenance history popup window.
     pub show_history_window: bool,
-    /// Toggle: show the on-demand Analyze fit-details drawer.
-    pub show_analyze_fit_info: bool,
-    /// Toggle: show the Analyze isotope tick-strip picker popover.
-    pub show_isotope_track_picker: bool,
-    /// Per-`(z, a)` set of isotope tick strips the user has hidden via the
-    /// picker. Hidden tracks are still part of the fit; only the diagnostic
-    /// strip is suppressed so the visible track list stays focused when many
-    /// isotopes are loaded.
-    pub hidden_isotope_tracks: std::collections::HashSet<(u32, u32)>,
-
-    // -- Results --
-    pub pixel_fit_result: Option<SpectrumFitResult>,
-    /// Generation counter; incremented each time `pixel_fit_result` is replaced.
-    pub fit_result_gen: u64,
-    /// Cached residuals for the Studio dock (keyed by `fit_result_gen` + resolution config).
-    pub residuals_cache: Option<CachedResiduals>,
-    pub spatial_result: Option<SpatialResult>,
-    /// Prominent feedback from last fit attempt (pixel or ROI).
-    pub last_fit_feedback: Option<FitFeedback>,
 
     // -- Pipeline / wizard --
     pub fitting_type: Option<FittingType>,
@@ -866,7 +491,6 @@ pub struct AppState {
     pub last_applied_dark_mode: Option<bool>,
     /// Whether the guided-mode sidebar is collapsed (icon-only mode).
     pub sidebar_collapsed: bool,
-    pub active_tab: Tab,
     pub status_message: String,
     pub is_fitting: bool,
     pub is_fetching_endf: bool,
@@ -876,8 +500,8 @@ pub struct AppState {
     /// `crate::file_dialog::dispatch_results` each frame.
     pub file_dialogs: crate::file_dialog::FileDialogs,
     /// Dismissible banner shown when native file dialogs are unavailable
-    /// or failed (portal/zenity chain) — #526's silent failure made
-    /// visible. Set from the startup probe and the log-bridge latch.
+    /// or failed (portal/zenity chain). Set from the startup probe and
+    /// the log-bridge latch.
     pub native_dialog_warning: Option<String>,
 
     /// Prevents auto-load retry after a loading failure; cleared when file paths change.
@@ -904,7 +528,6 @@ pub struct AppState {
     pub event_width: usize,
 
     // -- Normalize preview --
-    pub analysis_mode: AnalysisMode,
     pub normalize_spectrum_source: SpectrumDataSource,
     pub normalize_spectrum_axis: SpectrumAxis,
     pub tof_slice_index: usize,
@@ -914,48 +537,23 @@ pub struct AppState {
     pub analyze_spectrum_axis: SpectrumAxis,
     pub analyze_tof_slice_index: usize,
 
+    // -- Counts fit --
+    /// The Ikeda-Carpenter pulse numbers used as the known calibration.
+    pub pulse: crate::counts::PulseParams,
+    /// Patch side of the counts map, in pixels.
+    pub map_binning: usize,
+    /// The last single counts fit.
+    pub pixel_fit: Option<crate::counts::PixelFitSummary>,
+    /// The last counts-map fit.
+    pub map_fit: Option<crate::counts::MapFitSummary>,
+
     // -- Background task receivers and cancellation --
-    pub pending_spatial: Option<mpsc::Receiver<Result<SpatialResult, String>>>,
-    /// Cancellation token owned by the current in-flight spatial run, if any.
-    /// Dedicated per run so an obsolete spatial worker can be stopped without
-    /// cancelling the unrelated ENDF / forward-model / detectability workers
-    /// that share `cancel_token`.
-    pub spatial_cancel_token: Option<Arc<AtomicBool>>,
     pub pending_endf: Option<mpsc::Receiver<EndfFetchResult>>,
+    pub pending_fit: Option<mpsc::Receiver<crate::counts::FitOutcome>>,
     pub cancel_token: Arc<AtomicBool>,
 
     // -- Preview image texture --
     pub preview_image: Option<Array2<f64>>,
-    pub map_display_isotope: usize,
-
-    // -- Forward Model tool --
-    pub fm_isotope_entries: Vec<IsotopeEntry>,
-    pub fm_endf_library: EndfLibrary,
-    pub pending_fm_endf: Option<mpsc::Receiver<EndfFetchResult>>,
-    pub is_fetching_fm_endf: bool,
-    pub fm_temperature_k: f64,
-    pub fm_spectrum_axis: SpectrumAxis,
-    pub fm_spectrum: Option<Vec<f64>>,
-    pub fm_per_isotope_spectra: Vec<(String, Vec<f64>)>,
-    pub fm_energies: Option<Vec<f64>>,
-    pub fm_resolution_enabled: bool,
-    pub fm_resolution_mode: ResolutionMode,
-
-    // -- Detectability tool --
-    pub detect_matrix_entries: Vec<IsotopeEntry>,
-    pub detect_trace_entries: Vec<DetectTraceEntry>,
-    pub detect_snr_threshold: f64,
-    pub detect_i0: f64,
-    pub detect_energy_min: f64,
-    pub detect_energy_max: f64,
-    pub detect_n_energy_points: usize,
-    pub detect_results: Vec<(String, TraceDetectabilityReport)>,
-    pub pending_detect_endf: Option<mpsc::Receiver<EndfFetchResult>>,
-    pub is_fetching_detect_endf: bool,
-    pub detect_endf_library: EndfLibrary,
-    pub detect_temperature_k: f64,
-    pub detect_resolution_enabled: bool,
-    pub detect_resolution_mode: ResolutionMode,
 
     // -- Isotope density editor --
     pub editing_isotope_density: Option<usize>,
@@ -973,34 +571,8 @@ pub struct AppState {
     // -- HDF5 tree browser --
     pub hdf5_tree: Option<Vec<Hdf5TreeEntry>>,
 
-    // -- Dirty tracking for Studio re-run --
-    /// When `Some`, indicates the earliest pipeline stage that needs re-running.
-    /// Set by parameter edits in Studio; cleared after a successful re-run.
-    pub dirty_from: Option<GuidedStep>,
-
-    // -- Studio mode --
-    pub studio_selected_tile: usize,
-    pub studio_doc_tab: StudioDocTab,
-    pub studio_dock_tab: usize,
-    pub studio_show_dock: bool,
-    pub studio_analysis_isotope: usize,
-    /// Symbol of the last-displayed isotope in Studio Analysis tab.
-    /// Used to detect when the isotope list changes under the selected index.
-    pub studio_analysis_prev_symbol: Option<String>,
-
-    // -- Progress --
-    pub fitting_progress: Option<FittingProgress>,
-
     // -- Provenance --
     pub provenance_log: Vec<ProvenanceEvent>,
-
-    // -- Per-tile display state (indexed same as density_maps + 1 for convergence) --
-    pub tile_display: Vec<TileDisplayState>,
-
-    // -- Export --
-    pub export_format: ExportFormat,
-    pub export_directory: Option<PathBuf>,
-    pub export_status: Option<String>,
 
     // -- Project file --
     /// Path of the last saved/loaded project file (.nrd.h5).
@@ -1042,28 +614,6 @@ pub struct IsotopeEntry {
     pub resonance_data: Option<ResonanceData>,
     pub enabled: bool,
     pub endf_status: EndfStatus,
-}
-
-impl IsotopeEntry {
-    /// Clone with `endf_status` normalized to match `resonance_data` presence.
-    ///
-    /// Used when copying entries between contexts (Configure → FM, Configure → Detect)
-    /// to avoid propagating stale `Fetching` or `Failed` statuses.
-    pub fn clone_with_normalized_status(&self) -> Self {
-        Self {
-            z: self.z,
-            a: self.a,
-            symbol: self.symbol.clone(),
-            initial_density: self.initial_density,
-            resonance_data: self.resonance_data.clone(),
-            enabled: self.enabled,
-            endf_status: if self.resonance_data.is_some() {
-                EndfStatus::Loaded
-            } else {
-                EndfStatus::Pending
-            },
-        }
-    }
 }
 
 /// A group of isotopes sharing one density parameter (e.g., all natural W).
@@ -1123,34 +673,11 @@ pub struct RoiSelection {
     pub x_end: usize,
 }
 
-impl RoiSelection {
-    /// Check whether pixel (y, x) falls inside this ROI rectangle.
-    pub fn contains(&self, y: usize, x: usize) -> bool {
-        y >= self.y_start && y < self.y_end && x >= self.x_start && x < self.x_end
-    }
-}
-
-/// Active tab in the main view area.
-#[derive(PartialEq, Eq, Clone, Copy)]
-pub enum Tab {
-    Spectrum,
-    Map,
-}
-
 /// Application UI mode.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum UiMode {
     Guided,
     Studio,
-}
-
-/// Document tab in Studio mode.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
-pub enum StudioDocTab {
-    #[default]
-    Analysis,
-    ForwardModel,
-    Detectability,
 }
 
 /// Fitting type chosen in the wizard (Q1).
@@ -1165,7 +692,6 @@ pub enum FittingType {
 pub enum DataType {
     Events,
     PreNormalized,
-    Transmission,
 }
 
 /// A single entry in the dynamic pipeline.
@@ -1192,15 +718,6 @@ pub enum GuidedStep {
     Normalize = 6,
     Analyze = 7,
     Results = 8,
-    ForwardModel = 9,
-    Detectability = 10,
-}
-
-impl GuidedStep {
-    /// Numeric stage index for ordering comparisons.
-    fn stage_order(self) -> u8 {
-        self as u8
-    }
 }
 
 impl GuidedStep {
@@ -1216,8 +733,6 @@ impl GuidedStep {
             Self::Normalize => "Normalize",
             Self::Analyze => "Analyze",
             Self::Results => "Results",
-            Self::ForwardModel => "Forward Model",
-            Self::Detectability => "Detectability",
         }
     }
 
@@ -1264,20 +779,6 @@ impl GuidedStep {
                 req(Self::Analyze),
                 req(Self::Results),
             ],
-            (FittingType::Spatial, DataType::Transmission) => vec![
-                req(Self::Configure),
-                req(Self::Load),
-                opt(Self::Rebin),
-                req(Self::Analyze),
-                req(Self::Results),
-            ],
-            (FittingType::Single, DataType::Transmission) => vec![
-                req(Self::Configure),
-                req(Self::Load),
-                opt(Self::Rebin),
-                req(Self::Analyze),
-                req(Self::Results),
-            ],
         }
     }
 }
@@ -1299,20 +800,10 @@ impl AppState {
         self.cancel_token.store(true, Ordering::Relaxed);
         // Replace with a fresh token for future tasks
         self.cancel_token = Arc::new(AtomicBool::new(false));
-        // The spatial worker listens on its own per-run token, not the
-        // shared one; stop it explicitly.
-        if let Some(token) = self.spatial_cancel_token.take() {
-            token.store(true, Ordering::Relaxed);
-        }
-        self.pending_spatial = None;
         self.pending_endf = None;
-        self.pending_fm_endf = None;
-        self.pending_detect_endf = None;
+        self.pending_fit = None;
         self.is_fitting = false;
-        self.fitting_progress = None;
         self.is_fetching_endf = false;
-        self.is_fetching_fm_endf = false;
-        self.is_fetching_detect_endf = false;
         // Note: is_saving / pending_save / save_join_handle are NOT cleared here.
         // Save cannot be safely cancelled — the background thread must finish its
         // HDF5 write. poll_pending_tasks handles cleanup when it completes.
@@ -1329,84 +820,20 @@ impl AppState {
                 }
             }
         }
-        for e in &mut self.fm_isotope_entries {
-            if e.endf_status == EndfStatus::Fetching {
-                e.endf_status = EndfStatus::Pending;
-            }
-        }
-        for e in &mut self.detect_matrix_entries {
-            if e.endf_status == EndfStatus::Fetching {
-                e.endf_status = EndfStatus::Pending;
-            }
-        }
-        for e in &mut self.detect_trace_entries {
-            if e.endf_status == EndfStatus::Fetching {
-                e.endf_status = EndfStatus::Pending;
-            }
-        }
-        // Clear stale FM spectrum caches
-        self.fm_spectrum = None;
-        self.fm_per_isotope_spectra.clear();
-        // Clear stale detectability results
-        self.detect_results.clear();
     }
 
-    /// Clear only fit / normalization-downstream state.  Use this when
-    /// something changes that invalidates the current normalization +
-    /// fit (e.g. open-beam swap) but leaves the source sample data,
-    /// spectrum values, energies, ROIs, and selection valid.
-    ///
-    /// Contrast with `invalidate_results`, which additionally nukes
-    /// the data layer (sample, spectrum, energies, preview, ROIs,
-    /// rebin state) and is appropriate when the **source** changes.
+    /// Drop pending background work that is downstream of a source or
+    /// configuration change.
     pub fn invalidate_fit_results(&mut self) {
         self.cancel_pending_tasks();
-        self.normalized = None;
-        self.clear_pixel_fit_output();
-        self.clear_spatial_fit_output();
     }
 
-    /// Clear the cached single-spectrum result before starting a new pixel or
-    /// ROI fit.  Input data, normalization, selection, and spatial-map results
-    /// remain valid and are deliberately preserved.
-    pub fn clear_pixel_fit_output(&mut self) {
-        self.pixel_fit_result = None;
-        self.residuals_cache = None;
-        self.last_fit_feedback = None;
-        self.show_analyze_fit_info = false;
-    }
-
-    /// Clear the cached map before starting a new spatial fit.  This prevents
-    /// Results and export actions from reusing an older map while the new run
-    /// is pending or after it fails.  An in-flight spatial worker is stopped
-    /// through its dedicated per-run token so its obsolete computation does
-    /// not keep burning CPU after the UI has dropped the receiver.
-    pub fn clear_spatial_fit_output(&mut self) {
-        if let Some(token) = self.spatial_cancel_token.take() {
-            token.store(true, Ordering::Relaxed);
-        }
-        self.pending_spatial = None;
-        self.is_fitting = false;
-        self.fitting_progress = None;
-        self.spatial_result = None;
-        self.residuals_cache = None;
-        self.fitting_rois.clear();
-        self.export_status = None;
-    }
-
-    /// Invalidate all fit outputs after a fit-control change while preserving
-    /// loaded inputs, normalization, energy grid, pixel selection, and ROIs.
-    /// Any in-flight spatial worker is cancelled through its dedicated
-    /// per-run token and its receiver detached, so an old-configuration
-    /// result can neither arrive nor keep computing.  The shared cancellation
-    /// token is deliberately left alone because it belongs to unrelated
-    /// ENDF, forward-model, and detectability workers.
+    /// Invalidate analysis outputs after a fit-control change.
     pub fn invalidate_analysis_outputs(&mut self) {
-        self.clear_pixel_fit_output();
-        self.clear_spatial_fit_output();
+        self.invalidate_fit_results();
     }
 
-    /// Recompute the effective pixel mask FROM SCRATCH (#646):
+    /// Recompute the effective pixel mask FROM SCRATCH:
     /// `dead_pixels = file/persisted-declared ∪ freshly detected`.
     ///
     /// The single site where normalization installs a detected mask — the
@@ -1428,9 +855,8 @@ impl AppState {
     /// different detector or ROI-cropped geometry than its own detected
     /// mask / embedded data.  A declared mask that cannot apply to the
     /// data is dropped for this recomputation (detected-only mask), and
-    /// the drop is RETURNED as a notice the caller must surface (#646
-    /// R4 F5; return-value design per review F1) — masking decisions
-    /// stay observable, never silent.
+    /// the drop is RETURNED as a notice the caller must surface — masking
+    /// decisions stay observable, never silent.
     ///
     /// The notice is returned rather than logged here because one
     /// caller — project restore (`project::state_from_snapshot`, step
@@ -1441,9 +867,9 @@ impl AppState {
     /// its own provenance/status surface (immediately at the
     /// normalization sites, deferred past the log replacement on
     /// restore).
-    #[must_use = "declared-mask-drop notice: surface it (provenance/status), never drop it (#646 F1)"]
+    #[must_use = "declared-mask-drop notice: surface it (provenance/status), never drop it"]
     pub fn set_detected_dead_pixels(&mut self, detected: Option<Array2<bool>>) -> Option<String> {
-        // Keep the raw detected component (#646 R4, P1-1): project SAVE
+        // Keep the raw detected component: project SAVE
         // persists it as /intermediate/detected_dead_pixels so a restore
         // without raw stacks can still rebuild the effective mask.
         self.detected_dead_pixels = detected.clone();
@@ -1481,14 +907,8 @@ impl AppState {
         self.selected_pixel = None;
         self.rois.clear();
         self.selected_roi = None;
-        self.pixel_fit_result = None;
-        self.residuals_cache = None;
-        self.spatial_result = None;
-        self.last_fit_feedback = None;
-        self.fitting_rois.clear();
         self.preview_image = None;
         self.energies = None;
-        self.normalized = None;
         self.dead_pixels = None;
         // The declared mask belongs to the invalidated data; every caller
         // of invalidate_results either replaces the sample or triggers a
@@ -1497,13 +917,9 @@ impl AppState {
         // The detected component belongs to the invalidated data too.
         self.detected_dead_pixels = None;
         self.spectrum_values = None;
-        self.tile_display.clear();
-        self.studio_selected_tile = 0;
-        self.export_status = None;
         self.rebin_applied = false;
         self.rebin_factor = 1;
         self.analyze_tof_slice_index = 0;
-        self.dirty_from = None;
     }
 
     /// Compute the bounding box of all ROIs, or `None` if no ROIs exist.
@@ -1527,23 +943,6 @@ impl AppState {
             x_start,
             x_end,
         })
-    }
-
-    /// Mark the pipeline as dirty from the given step.
-    ///
-    /// Uses min-semantics: if already dirty from an earlier step, keeps the
-    /// earlier one. Called by Studio parameter edits to track what needs
-    /// re-running.
-    pub fn mark_dirty(&mut self, step: GuidedStep) {
-        self.dirty_from = Some(match self.dirty_from {
-            Some(existing) if existing.stage_order() <= step.stage_order() => existing,
-            _ => step,
-        });
-    }
-
-    /// Clear dirty state after a successful pipeline re-run.
-    pub fn clear_dirty(&mut self) {
-        self.dirty_from = None;
     }
 
     /// Append a provenance event to the session audit trail.
@@ -1607,19 +1006,6 @@ impl AppState {
             self.pipeline = GuidedStep::pipeline(ft, dt);
         }
     }
-
-    /// Ensure `tile_display` has enough entries for the current result.
-    /// Call after spatial analysis completes.
-    pub fn init_tile_display(&mut self, n_density_maps: usize) {
-        // +1 for convergence, +1 for temperature map (if present)
-        let has_temp = self
-            .spatial_result
-            .as_ref()
-            .is_some_and(|r| r.temperature_map.is_some());
-        let needed = n_density_maps + 1 + has_temp as usize;
-        self.tile_display
-            .resize_with(needed, TileDisplayState::default);
-    }
 }
 
 impl Default for AppState {
@@ -1630,7 +1016,6 @@ impl Default for AppState {
             open_beam_path: None,
             sample_data: None,
             open_beam_data: None,
-            normalized: None,
             dead_pixels: None,
             file_dead_pixels: None,
             detected_dead_pixels: None,
@@ -1653,18 +1038,9 @@ impl Default for AppState {
             isotope_groups: Vec::new(),
             endf_library: EndfLibrary::EndfB8_1,
 
-            resolution_enabled: false,
-            resolution_mode: ResolutionMode::default(),
-
             temperature_k: 296.0,
-            lm_config: LmConfig::default(),
-            solver_method: SolverMethod::PoissonKL,
-            fit_temperature: false,
-            fit_energy_scale: false,
             fit_energy_range: None,
-            show_advanced_solver: false,
             uncertainty_is_estimated: false,
-            lm_background_enabled: false,
             kl_background_enabled: false,
             baseline_enabled: false,
             kl_c_ratio: 1.0,
@@ -1673,17 +1049,7 @@ impl Default for AppState {
             selected_pixel: None,
             rois: Vec::new(),
             selected_roi: None,
-            fitting_rois: Vec::new(),
             show_history_window: false,
-            show_analyze_fit_info: false,
-            show_isotope_track_picker: false,
-            hidden_isotope_tracks: std::collections::HashSet::new(),
-
-            pixel_fit_result: None,
-            fit_result_gen: 0,
-            residuals_cache: None,
-            spatial_result: None,
-            last_fit_feedback: None,
 
             fitting_type: None,
             data_type: None,
@@ -1695,7 +1061,6 @@ impl Default for AppState {
             theme_preference: ThemePreference::Auto,
             last_applied_dark_mode: None,
             sidebar_collapsed: false,
-            active_tab: Tab::Spectrum,
             status_message: "Ready".into(),
             is_fitting: false,
             is_fetching_endf: false,
@@ -1713,7 +1078,6 @@ impl Default for AppState {
             event_height: 512,
             event_width: 512,
 
-            analysis_mode: AnalysisMode::FullSpatialMap,
             normalize_spectrum_source: SpectrumDataSource::FullImage,
             normalize_spectrum_axis: SpectrumAxis::EnergyEv,
             tof_slice_index: 0,
@@ -1722,40 +1086,16 @@ impl Default for AppState {
             analyze_spectrum_axis: SpectrumAxis::EnergyEv,
             analyze_tof_slice_index: 0,
 
-            pending_spatial: None,
-            spatial_cancel_token: None,
+            pulse: crate::counts::PulseParams::default(),
+            map_binning: 4,
+            pixel_fit: None,
+            map_fit: None,
+
             pending_endf: None,
+            pending_fit: None,
             cancel_token: Arc::new(AtomicBool::new(false)),
 
             preview_image: None,
-            map_display_isotope: 0,
-
-            fm_isotope_entries: Vec::new(),
-            fm_endf_library: EndfLibrary::EndfB8_1,
-            pending_fm_endf: None,
-            is_fetching_fm_endf: false,
-            fm_temperature_k: 296.0,
-            fm_spectrum_axis: SpectrumAxis::EnergyEv,
-            fm_spectrum: None,
-            fm_per_isotope_spectra: Vec::new(),
-            fm_energies: None,
-            fm_resolution_enabled: false,
-            fm_resolution_mode: ResolutionMode::default(),
-
-            detect_matrix_entries: Vec::new(),
-            detect_trace_entries: Vec::new(),
-            detect_snr_threshold: 3.0,
-            detect_i0: 100_000.0,
-            detect_energy_min: 1.0,
-            detect_energy_max: 100.0,
-            detect_n_energy_points: 2000,
-            detect_results: Vec::new(),
-            pending_detect_endf: None,
-            is_fetching_detect_endf: false,
-            detect_endf_library: EndfLibrary::EndfB8_1,
-            detect_temperature_k: 296.0,
-            detect_resolution_enabled: false,
-            detect_resolution_mode: ResolutionMode::default(),
 
             editing_isotope_density: None,
 
@@ -1770,20 +1110,7 @@ impl Default for AppState {
 
             hdf5_tree: None,
 
-            dirty_from: None,
-            studio_selected_tile: 0,
-            studio_doc_tab: StudioDocTab::Analysis,
-            studio_dock_tab: 0,
-            studio_show_dock: true,
-            studio_analysis_isotope: 0,
-            studio_analysis_prev_symbol: None,
-            fitting_progress: None,
-
             provenance_log: Vec::new(),
-            tile_display: Vec::new(),
-            export_format: ExportFormat::Tiff,
-            export_directory: None,
-            export_status: None,
 
             project_file_path: None,
             show_save_modal: false,
@@ -1802,7 +1129,7 @@ impl Default for AppState {
 mod tests {
     use super::*;
 
-    /// The #646 accumulation pin: re-detection REPLACES the previous
+    /// Accumulation pin: re-detection REPLACES the previous
     /// detection instead of unioning with it — only the file-declared
     /// component persists across runs (e.g. open-beam swaps).
     #[test]
@@ -1873,8 +1200,8 @@ mod tests {
     /// different detector or ROI-cropped geometry): the inapplicable
     /// declared mask is dropped for the recomputation (detected-only
     /// mask) and the drop is RETURNED as a must-surface notice, never
-    /// silent (#646 R4 F5; return-value design F1).  The setter itself
-    /// no longer logs to provenance — project restore replaces the
+    /// silent.  The setter itself
+    /// does not log to provenance — project restore replaces the
     /// provenance log wholesale AFTER calling it (step 17), which would
     /// erase such an entry; see
     /// `test_restore_mismatched_mask_pair_drop_notice_survives_provenance_replacement`

@@ -324,7 +324,6 @@ mod tests {
 
     #[test]
     fn test_subset_group_rejects_duplicate_mass() {
-        // A repeated mass number used to be selected twice and its natural
         // abundance double-counted in the re-normalisation, silently
         // re-weighting the group. It must now be rejected.
         let err = IsotopeGroup::subset(63, &[151, 151]).unwrap_err();

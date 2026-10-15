@@ -167,162 +167,6 @@ class ResonanceData:
         """Orbital angular momentum values (L) present in the data."""
         ...
 
-class FitResult:
-    """Result of fitting a spectrum."""
-
-    @property
-    def densities(self) -> NDArray[np.float64]:
-        """Fitted areal densities (atoms/barn)."""
-        ...
-
-    @property
-    def uncertainties(self) -> NDArray[np.float64]:
-        """Uncertainties on fitted densities."""
-        ...
-
-    @property
-    def reduced_chi_squared(self) -> float:
-        """Reduced chi-squared of the fit."""
-        ...
-
-    @property
-    def converged(self) -> bool:
-        """Whether the fit converged."""
-        ...
-
-    @property
-    def iterations(self) -> int:
-        """Number of iterations."""
-        ...
-
-    @property
-    def temperature_k(self) -> float | None:
-        """Fitted sample temperature in Kelvin (None when fit_temperature=False)."""
-        ...
-
-    @property
-    def temperature_k_unc(self) -> float | None:
-        """1-sigma uncertainty on fitted temperature (None when fit_temperature=False).
-
-        For the raw-count joint-Poisson path this is a covariance-only lower
-        bound (sqrt of the temperature diagonal of the inverse Fisher matrix);
-        it omits baseline/model noise and on real data can underestimate the
-        observed per-superpixel scatter by ~3-4x. Pass ``scale_by_chi2=True``
-        for a sqrt(D/dof)-inflated estimate: sigma is scaled by sqrt of the
-        deviance-per-dof this result reports. No-op on the already-chi2-scaled
-        LM transmission path.
-        """
-        ...
-
-    @property
-    def anorm(self) -> float:
-        """Fitted normalization factor (1.0 if background not enabled)."""
-        ...
-
-    @property
-    def background(self) -> list[float]:
-        """Fitted background parameters (BackA, BackB, BackC)."""
-        ...
-
-    @property
-    def back_d(self) -> float | None:
-        """Fitted exponential background amplitude (SAMMY BackD), or None when ``background=False`` or ``fit_back_d=False``."""
-        ...
-
-    @property
-    def back_f(self) -> float | None:
-        """Fitted exponential background decay constant (SAMMY BackF), or None when ``background=False`` or ``fit_back_f=False``."""
-        ...
-
-    @property
-    def t0_us(self) -> float | None:
-        """Fitted TOF offset (SAMMY TZERO t0) in microseconds, or None."""
-        ...
-
-    @property
-    def l_scale(self) -> float | None:
-        """Fitted flight-path scale factor (SAMMY TZERO L0), or None."""
-        ...
-
-    def corrected_energies(
-        self, nominal_energies: NDArray[np.float64]
-    ) -> NDArray[np.float64] | None:
-        """Map a nominal energy grid through the fitted ``(t0_us, l_scale)``
-        energy scale to the corrected (calibrated) energies the fit used
-        (issue #634), using the exact SAMMY −t0 convention and the SAME
-        flight path the fit was configured with (stored on the result).
-
-        Returns ``None`` when energy-scale fitting was not enabled; raises
-        ``ValueError`` on an invalid nominal grid (non-finite, non-positive,
-        or non-ascending) or a degenerate calibration (t0 past the shortest
-        flight time).
-        """
-        ...
-
-    @property
-    def deviance_per_dof(self) -> float | None:
-        """Conditional binomial deviance / (n - k) from the counts-KL
-        dispatch (joint-Poisson profile-deviance fitter).
-
-        Primary goodness-of-fit for ``solver='kl'`` (or the
-        ``'poisson'`` / ``'joint_poisson'`` aliases) on counts data —
-        replaces the fixed-flux Pearson chi-squared
-        that scaled with ``c``. ``None`` for LM transmission fits, which
-        populate ``reduced_chi_squared`` with Pearson chi-squared / (n - k).
-        """
-        ...
-
-    @property
-    def baseline(self) -> list[float] | None:
-        """Fitted multiplicative-baseline coefficients ``[b0, b1, b2]`` (a
-        3-element list) for
-        ``B(E) = b0 + b1*ln(E/E_ref) + b2*ln^2(E/E_ref)`` applied outermost
-        (issue #635).  ``None`` when ``baseline=False``."""
-        ...
-
-    @property
-    def baseline_e_ref_ev(self) -> float | None:
-        """Reference energy E_ref (eV) of the baseline's centered
-        ``ln(E/E_ref)`` basis — the geometric midpoint sqrt(E_min*E_max) of
-        the fit grid; reconstruct ``B(E)`` with exactly this reference.
-        ``None`` when ``baseline=False``."""
-        ...
-
-    @property
-    def warnings(self) -> list[str]:
-        """Structured fit-configuration warnings (e.g. the degenerate
-        free-Anorm + free-temperature + free-density trio).  Empty list
-        when nothing is flagged."""
-        ...
-
-class CalibrationResult:
-    """Result of energy axis calibration."""
-
-    @property
-    def flight_path_m(self) -> float:
-        """Fitted flight path length in metres."""
-        ...
-
-    @property
-    def t0_us(self) -> float:
-        """Fitted TOF delay in microseconds."""
-        ...
-
-    @property
-    def total_density(self) -> float:
-        """Fitted total areal density in atoms/barn."""
-        ...
-
-    @property
-    def reduced_chi_squared(self) -> float:
-        """Reduced chi-squared at the best parameters."""
-        ...
-
-    @property
-    def energies_corrected(self) -> NDArray[np.float64]:
-        """Corrected energy grid (ascending, eV)."""
-        ...
-
 class TabulatedResolution:
     """Tabulated instrument resolution function."""
 
@@ -395,7 +239,7 @@ class IkedaCarpenter:
 
     Synthesizes a dense tabulated kernel at construction; pass
     :meth:`as_tabulated` anywhere a loaded resolution file is accepted
-    (``forward_model``, ``fit_spectrum_typed``, ``calibrate_resolution``).
+    (``forward_model``, ``fit_counts``, ``fit_counts``).
     Note ``precompute_cross_sections`` does NOT take a resolution -- broadening
     is applied after Beer-Lambert, not on the cross-sections.
     """
@@ -464,244 +308,6 @@ class IkedaCarpenter:
     @property
     def n_energies(self) -> int:
         """Number of synthesized reference energies."""
-        ...
-
-class ResolutionCalibration:
-    """Result of :func:`calibrate_resolution`."""
-
-    @property
-    def family(self) -> str:
-        """Resolution-model family (``"gaussian"`` | ``"udr_corr"`` | ``"ic"``)."""
-        ...
-
-    @property
-    def theta(self) -> list[float]:
-        """Raw fitted parameter vector (optimizer space)."""
-        ...
-
-    @property
-    def chi2(self) -> float:
-        """chi-squared per degree of freedom of the calibration fit."""
-        ...
-
-    @property
-    def converged(self) -> bool:
-        """Whether the optimizer self-converged."""
-        ...
-
-    @property
-    def iterations(self) -> int:
-        """Optimizer iterations."""
-        ...
-
-    @property
-    def position_t0_us(self) -> float:
-        """Fitted (or pinned) SAMMY energy-scale TOF zero t0 (us). Equals
-        t0_center_us when fit_t0=False (the default; position pinned). When fit, a
-        SHARED energy-scale parameter under a metrology prior, not a per-family
-        nuisance (the asymmetric-kernel lag is confounded with flight-path
-        L_scale)."""
-        ...
-
-    @property
-    def position_l_scale(self) -> float:
-        """Fitted (or pinned) flight-path scale L_scale. Equals l_scale_center when
-        fit_l_scale=False (the default)."""
-        ...
-
-    @property
-    def prior_penalty(self) -> float:
-        """Gaussian-prior penalty on the fitted (t0, L_scale) at the solution
-        (0 when position is pinned or has no prior). objective = chi2_data +
-        prior_penalty; a large value flags a family that needed a big position move
-        to fit."""
-        ...
-
-    @property
-    def n_free_params(self) -> int:
-        """Number of outer-loop free parameters: resolution theta plus any
-        fitted position coordinates (4-5 for family="ic", 2 for the other
-        families)."""
-        ...
-
-    @property
-    def bounds_hit(self) -> list[str]:
-        """Coordinates pinned at a box bound at the solution, as
-        "name:lower" / "name:upper" strings (empty list = interior solution).
-        E.g. "r:lower" flags the beta-R ridge: the calibrant shows no storage
-        tail, so the reported beta carries no information."""
-        ...
-
-    def params(self) -> dict[str, float]:
-        """Decoded, human-readable fitted parameters.
-
-        For family="ic" the keys are a0/a1 (alpha(E) = a0*sqrt(E) + a1,
-        positive by construction), beta, r and psr_fwhm_us — decoded from the
-        calibrated resolution itself (the raw theta is ln/box-encoded
-        optimizer space)."""
-        ...
-
-    def as_tabulated(self) -> TabulatedResolution | None:
-        """The calibrated resolution as a kernel for the fitters' ``resolution=``
-        (``udr_corr`` / ``ic``); ``None`` for the Gaussian family."""
-        ...
-
-    def gaussian_params(self) -> tuple[float, float] | None:
-        """``(delta_t_us, delta_l_m)`` for the Gaussian family; ``None`` otherwise."""
-        ...
-
-    @property
-    def intervals(self) -> list[tuple[float, float]] | None:
-        """One-sigma ``(lower, upper)`` range of each fitted parameter, in the
-        same order and raw optimizer space as ``theta``.
-
-        Each bound is where the objective, minimized over the other
-        parameters, rises by one above its floor, so the two sides differ when
-        the surface is asymmetric. A bound equal to the parameter's box edge
-        means the data does not constrain that side.
-
-        ``None`` unless ``calibrate_resolution(..., intervals=True)`` asked
-        for them, or when the run never self-converged."""
-        ...
-
-class SpatialResult:
-    """Result of per-pixel spatial mapping (LM fitter)."""
-
-    @property
-    def density_maps(self) -> list[NDArray[np.float64]]:
-        """Density maps as a list of 2D arrays, one per isotope."""
-        ...
-
-    @property
-    def uncertainty_maps(self) -> list[NDArray[np.float64]]:
-        """Uncertainty maps as a list of 2D arrays."""
-        ...
-
-    @property
-    def chi_squared_map(self) -> NDArray[np.float64]:
-        """Reduced chi-squared map.  For the counts-KL dispatch this mirrors
-        ``deviance_per_dof_map`` (back-compat)."""
-        ...
-
-    @property
-    def deviance_per_dof_map(self) -> NDArray[np.float64] | None:
-        """Counts-KL conditional binomial deviance / (n − k) per pixel.
-        ``None`` for LM-only runs and for transmission +
-        PoissonKL (those populate ``chi_squared_map`` with Pearson χ²/dof)."""
-        ...
-
-    @property
-    def converged_map(self) -> NDArray[np.bool_]:
-        """Convergence map (True = converged)."""
-        ...
-
-    @property
-    def n_converged(self) -> int:
-        """Number of converged pixels."""
-        ...
-
-    @property
-    def n_total(self) -> int:
-        """Total number of fitted pixels."""
-        ...
-
-    @property
-    def n_failed(self) -> int:
-        """Number of pixels where the fitter returned a hard error (NaN density)."""
-        ...
-
-    @property
-    def isotope_names(self) -> list[str]:
-        """Isotope names."""
-        ...
-
-    @property
-    def temperature_map(self) -> NDArray[np.float64] | None:
-        """Per-pixel fitted temperature map (None when fit_temperature=False)."""
-        ...
-
-    @property
-    def temperature_uncertainty_map(self) -> NDArray[np.float64] | None:
-        """Per-pixel temperature uncertainty map (None when fit_temperature=False).
-        Entries are NaN where uncertainty was unavailable for that pixel.
-
-        For the raw-count joint-Poisson path each sigma_T is a covariance-only
-        lower bound (sqrt of the temperature diagonal of the inverse Fisher
-        matrix); it omits baseline/model noise and on real data can
-        underestimate the observed per-superpixel scatter by ~3-4x. Pass
-        ``scale_by_chi2=True`` to ``spatial_map*`` for a sqrt(D/dof)-inflated
-        estimate: sigma is scaled by sqrt of the deviance-per-dof each pixel's
-        result reports. No-op on the already-chi2-scaled LM transmission
-        path."""
-        ...
-
-    @property
-    def anorm_map(self) -> NDArray[np.float64] | None:
-        """Per-pixel normalization factor Anorm (None when background=False)."""
-        ...
-
-    @property
-    def background_maps(self) -> list[NDArray[np.float64]] | None:
-        """Per-pixel background parameter maps [BackA, BackB, BackC] (None when background=False)."""
-        ...
-
-    @property
-    def back_d_map(self) -> NDArray[np.float64] | None:
-        """Per-pixel SAMMY exponential background amplitude (BackD) map.
-
-        ``None`` whenever the polynomial transmission background was
-        not active (``background=False``) OR the exponential tail was
-        not fit (``fit_back_d=False``).  For counts inputs the map is
-        always ``None`` — the joint-Poisson dispatch (counts-KL) never
-        fits BackD/BackF, and the spatial pipeline rejects counts +
-        ``fit_back_d=True`` up-front."""
-        ...
-
-    @property
-    def back_f_map(self) -> NDArray[np.float64] | None:
-        """Per-pixel SAMMY exponential background decay constant (BackF) map.
-
-        ``None`` under the same conditions as :py:attr:`back_d_map`."""
-        ...
-
-    @property
-    def t0_us_map(self) -> NDArray[np.float64] | None:
-        """Per-pixel SAMMY TZERO offset t0 (µs) map.
-        ``None`` when the run did not use ``fit_energy_scale=True``."""
-        ...
-
-    @property
-    def l_scale_map(self) -> NDArray[np.float64] | None:
-        """Per-pixel SAMMY TZERO flight-path scale factor map.
-        ``None`` when the run did not use ``fit_energy_scale=True``."""
-        ...
-
-    @property
-    def baseline_global(self) -> list[float] | None:
-        """Global multiplicative-baseline coefficients ``[b0, b1, b2]`` (a
-        3-element list; issue #635): fitted once on the aggregated mean spectrum, then
-        frozen for every pixel.  ``None`` when ``baseline=False`` or in
-        per-pixel mode (``baseline_global=False``)."""
-        ...
-
-    @property
-    def baseline_e_ref_ev(self) -> float | None:
-        """Baseline reference energy E_ref (eV); ``None`` when
-        ``baseline=False``."""
-        ...
-
-    @property
-    def baseline_maps(self) -> list[NDArray[np.float64]] | None:
-        """Per-pixel baseline coefficient maps ``[b0, b1, b2]``.  ``None``
-        unless ``baseline=True`` with ``baseline_global=False``.  NaN at
-        pixels that did not converge."""
-        ...
-
-    @property
-    def warnings(self) -> list[str]:
-        """Structured fit-configuration warnings (also printed once to
-        stderr by the spatial engine).  Empty list when nothing is
-        flagged."""
         ...
 
 class IsotopeGroup:
@@ -774,45 +380,6 @@ class IsotopeGroup:
         """
         ...
 
-
-class TraceDetectabilityReport:
-    """Result of a trace-detectability analysis."""
-
-    @property
-    def peak_delta_t_per_ppm(self) -> float:
-        """Peak |DeltaT| per ppm concentration at the most sensitive energy."""
-        ...
-
-    @property
-    def peak_energy_ev(self) -> float:
-        """Energy at which peak contrast occurs (eV)."""
-        ...
-
-    @property
-    def peak_snr(self) -> float:
-        """Estimated peak SNR at the given concentration and I0."""
-        ...
-
-    @property
-    def detectable(self) -> bool:
-        """Whether the combination is detectable (SNR > threshold)."""
-        ...
-
-    @property
-    def delta_t_spectrum(self) -> NDArray[np.float64]:
-        """Energy-resolved |DeltaT| spectrum for the given concentration."""
-        ...
-
-    @property
-    def energies(self) -> NDArray[np.float64]:
-        """Energies used (eV)."""
-        ...
-
-    @property
-    def opaque_fraction(self) -> float:
-        """Fraction of energy bins where matrix baseline is opaque (T < 1e-15)."""
-        ...
-
 # ---------------------------------------------------------------------------
 # Functions
 # ---------------------------------------------------------------------------
@@ -846,166 +413,6 @@ def forward_model(
     Either ``isotopes`` or ``groups`` must be provided, but not both.
     When ``groups`` is provided, each group is expanded into its members
     with effective densities = group_density * member_ratio.
-    """
-    ...
-
-class JointFitResult:
-    """Result of a joint sample + calibrant fit."""
-
-    @property
-    def densities(self) -> list[float]:
-        """Fitted areal densities (atoms/barn), one per sample isotope."""
-        ...
-
-    @property
-    def density_uncertainties(self) -> list[float] | None:
-        """One-sigma uncertainty on each density."""
-        ...
-
-    @property
-    def temperature_k(self) -> float | None:
-        """Fitted temperature (K); ``None`` when it was held fixed."""
-        ...
-
-    @property
-    def temperature_k_unc(self) -> float | None:
-        """One-sigma uncertainty on the fitted temperature.
-
-        Larger than the pinned route's, and correctly so: the calibrant that
-        constrains the resolution is in the same objective, so the
-        temperature's degeneracy with the resolution is carried rather than
-        dropped."""
-        ...
-
-    @property
-    def delta_t_us(self) -> float:
-        """Fitted shared timing width (µs), the W-parameter in ``exp(-x^2/W^2)``."""
-        ...
-
-    @property
-    def delta_l_m(self) -> float:
-        """Fitted shared flight-path width (m), same convention."""
-        ...
-
-    @property
-    def reduced_chi_squared(self) -> float:
-        """Reduced chi-squared over both spectra together."""
-        ...
-
-    @property
-    def converged(self) -> bool: ...
-
-    @property
-    def iterations(self) -> int: ...
-
-
-def fit_with_calibrant(
-    transmission: NDArray[np.float64],
-    uncertainty: NDArray[np.float64],
-    energies: NDArray[np.float64],
-    isotopes: list[tuple[ResonanceData, float]],
-    calibrant_transmission: NDArray[np.float64],
-    calibrant_uncertainty: NDArray[np.float64],
-    calibrant_energies: NDArray[np.float64],
-    calibrant_isotopes: list[tuple[ResonanceData, float]],
-    calibrant_temperature_k: float,
-    *,
-    temperature_k: float = 293.6,
-    fit_temperature: bool = True,
-    flight_path_m: float = 25.0,
-    delta_t_us: float = 1.0,
-    delta_l_m: float = 0.0,
-) -> JointFitResult:
-    """Fit a sample and the calibrant that measured its resolution together.
-
-    The usual route calibrates the resolution on a known sample, pins it, and
-    fits the unknown one. That reports the temperature as more certain than it
-    is: resolution width and temperature broaden the line the same way, and
-    pinning discards the uncertainty that belongs to their degeneracy.
-
-    Here both spectra are fitted at once against ONE shared Gaussian
-    resolution, so the calibrant's residuals sit in the same objective as the
-    sample's and the reported ``temperature_k_unc`` already contains what the
-    calibrant failed to pin down.
-
-    Args:
-        transmission, uncertainty, energies: the sample spectrum.
-        isotopes: list of ``(ResonanceData, initial_density)`` for the sample.
-        calibrant_transmission, calibrant_uncertainty, calibrant_energies:
-            the known spectrum, on its own grid.
-        calibrant_isotopes: list of ``(ResonanceData, KNOWN density)``, fixed
-            during the fit.
-        calibrant_temperature_k: the calibrant's known temperature.
-        temperature_k: sample temperature; the start value when fitted.
-        fit_temperature: whether the sample temperature is free.
-        flight_path_m: flight path (m), shared by both spectra.
-        delta_t_us, delta_l_m: starting widths for the shared resolution. A
-            standalone ``calibrate_resolution`` result is the natural seed.
-    """
-    ...
-
-
-def calibrate_resolution(
-    energies: NDArray[np.float64],
-    data: NDArray[np.float64],
-    uncertainty: NDArray[np.float64],
-    family: str,
-    isotopes: list[tuple[ResonanceData, float]] | None = None,
-    groups: list[tuple[IsotopeGroup, float]] | None = None,
-    temperature_k: float = 293.6,
-    base_udr: TabulatedResolution | None = None,
-    flight_path_m: float = 25.0,
-    fit_background: bool = False,
-    restarts: int = 1,
-    ic_n_energies: int = 64,
-    ic_n_tau: int = 500,
-    fit_t0: bool = False,
-    fit_l_scale: bool = False,
-    t0_center_us: float = 0.0,
-    l_scale_center: float = 1.0,
-    t0_prior_us: float | None = None,
-    l_scale_prior: float | None = None,
-    psr_fwhm_ns: float = 350.0,
-    fit_psr: bool = False,
-    intervals: bool = False,
-) -> ResolutionCalibration:
-    """Calibrate instrument-resolution parameters against a known-(rho,T) calibrant.
-
-    Fits the resolution parameters of ``family`` while holding the calibrant's
-    density (the values in ``isotopes``/``groups``) and ``temperature_k`` fixed.
-
-    Args:
-        energies, data, uncertainty: calibrant transmission spectrum.
-        family: ``"gaussian"`` | ``"udr_corr"`` | ``"ic"``. ``"ic"`` fits
-            ``alpha(E) = a0*sqrt(E) + a1``, ``beta`` and the storage fraction
-            ``r``, folded with the SNS PSR channel triangle.
-        isotopes / groups: known calibrant composition + density (exactly one).
-        temperature_k: known calibrant temperature.
-        base_udr: base UDR kernel (required for ``family="udr_corr"``).
-        fit_background: also fit anorm + linear baseline (default anorm only).
-        restarts: optimizer restarts (keep the best).
-        fit_t0, fit_l_scale: also fit the energy scale ``(t0, L_scale)``; by
-            default they are held at ``t0_center_us`` / ``l_scale_center``.
-        t0_center_us, l_scale_center: prior means, or the held values
-            (default 0.0, 1.0).
-        t0_prior_us, l_scale_prior: Gaussian prior sigma (``None`` = flat/bounded
-            only).
-        psr_fwhm_ns: PSR channel-triangle FWHM in ns, folded into the ``"ic"``
-            kernel only (default 350; ``0`` disables). Values above 10_000 ns
-            raise ``ValueError``.
-        fit_psr: also fit the PSR FWHM (``"ic"`` only), bounded to 0.05-1 us and
-            started at ``psr_fwhm_ns`` clamped into that range, with a warning
-            on stderr when clamped; ``psr_fwhm_ns`` must then be > 0, else
-            ``ValueError``.
-        intervals: also compute ``.intervals``, the one-sigma range of each
-            fitted parameter, at several times the cost of the calibration.
-
-    Returns:
-        ResolutionCalibration with the fitted params, data chi2/dof, the fitted
-        (or held) ``position_t0_us`` / ``position_l_scale`` / ``prior_penalty``,
-        the parameters left at a bound in ``bounds_hit``, and the calibrated
-        resolution (``.as_tabulated()`` / ``.gaussian_params()``).
-        ``.intervals`` is populated only when ``intervals=True``.
     """
     ...
 
@@ -1375,16 +782,6 @@ def load_nexus_bank_spectrum(
     """
     ...
 
-def normalize(
-    sample: NDArray[np.float64],
-    open_beam: NDArray[np.float64],
-    pc_sample: float,
-    pc_ob: float,
-    dark_current: NDArray[np.float64] | None = None,
-) -> tuple[NDArray[np.float64], NDArray[np.float64]]:
-    """Normalize raw sample and open-beam data to transmission."""
-    ...
-
 def tof_to_energy_centers(
     tof_edges: NDArray[np.float64],
     flight_path_m: float,
@@ -1411,42 +808,6 @@ def natural_abundance(z: int, a: int) -> float | None:
 
 def natural_isotopes(z: int) -> list[tuple[tuple[int, int], float]]:
     """Get all naturally occurring isotopes for an element."""
-    ...
-
-def trace_detectability(
-    matrix: ResonanceData,
-    matrix_density: float,
-    trace: ResonanceData,
-    trace_ppm: float,
-    energies: NDArray[np.float64],
-    i0: float,
-    temperature_k: float = 293.6,
-    flight_path_m: float | None = None,
-    delta_t_us: float | None = None,
-    delta_l_m: float | None = None,
-    resolution: TabulatedResolution | None = None,
-    delta_e_us: float | None = None,
-    snr_threshold: float = 3.0,
-) -> TraceDetectabilityReport:
-    """Compute trace-detectability for a matrix + trace isotope pair."""
-    ...
-
-def trace_detectability_survey(
-    matrix: ResonanceData,
-    matrix_density: float,
-    trace_candidates: list[ResonanceData],
-    trace_ppm: float,
-    energies: NDArray[np.float64],
-    i0: float,
-    temperature_k: float = 293.6,
-    flight_path_m: float | None = None,
-    delta_t_us: float | None = None,
-    delta_l_m: float | None = None,
-    resolution: TabulatedResolution | None = None,
-    delta_e_us: float | None = None,
-    snr_threshold: float = 3.0,
-) -> list[tuple[str, TraceDetectabilityReport]]:
-    """Survey multiple trace candidates against a single matrix."""
     ...
 
 def precompute_cross_sections(
@@ -1626,7 +987,7 @@ def detect_bad_pixels(
     ratio computed from it — so the masks of both stacks are unioned:
     ``dead(sample) | hot(sample) [| dead(open_beam) | hot(open_beam)]``.
     Frame counts may differ between the stacks; spatial dimensions must
-    agree.  The result can be passed to ``spatial_map_typed(dead_pixels=...)``.
+    agree.  The result can be passed to ``fit_map(dead_pixels=...)``.
 
     Both stacks must be RAW detected counts (unscaled) — see
     ``detect_hot_pixels()``: scaling distorts the Poisson floor of the hot
@@ -1658,456 +1019,346 @@ def detect_bad_pixels(
     """
     ...
 
-def calibrate_energy(
-    energies_nominal: NDArray[np.float64],
-    transmission: NDArray[np.float64],
-    uncertainty: NDArray[np.float64],
-    isotopes: list[ResonanceData],
-    abundances: list[float],
-    assumed_flight_path_m: float,
-    temperature_k: float = 293.6,
-    resolution: TabulatedResolution | None = None,
-) -> CalibrationResult:
-    """Calibrate the energy axis by fitting flight path and TOF delay.
-
-    Finds the (L, t0, n_total) that best align the ENDF resonance model
-    with measured transmission data from a known-composition reference.
-    """
-    ...
-
 
 # ---------------------------------------------------------------------------
-# Typed Input Data API (Phase 5)
+# Counts-domain fitting
 # ---------------------------------------------------------------------------
 
-class InputData:
-    """Opaque typed input data for spatial mapping.
+class Value:
+    """A quantity the fit holds known, fits from a start, fits within bounds,
+    or fits under a Gaussian prior."""
 
-    Created via ``from_counts()`` or ``from_transmission()``.
-    Passed to ``spatial_map_typed()``.
+    @staticmethod
+    def known(value: float) -> Value:
+        """Hold the quantity at the given value."""
+        ...
+    @staticmethod
+    def fitted(start: float) -> Value:
+        """Fit the quantity from the given start over its full range."""
+        ...
+    @staticmethod
+    def within(start: float, lower: float, upper: float) -> Value:
+        """Fit the quantity from start within lower..=upper."""
+        ...
+    @staticmethod
+    def measured(value: float, sd: float) -> Value:
+        """Fit the quantity under the Gaussian prior N(value, sd^2)."""
+        ...
+    @property
+    def kind(self) -> Literal["known", "fitted", "within", "measured"]: ...
+    @property
+    def value(self) -> float | None: ...
+    @property
+    def start(self) -> float | None: ...
+    @property
+    def lower(self) -> float | None: ...
+    @property
+    def upper(self) -> float | None: ...
+    @property
+    def sd(self) -> float | None: ...
+
+class Material:
+    """A material isotopes, each with an areal density in atoms/barn, and its
+    temperature in K.  The library names the ENDF library the isotopes were
+    read from."""
+
+    def __init__(
+        self,
+        isotopes: list[tuple[ResonanceData, Value]],
+        temperature_k: Value,
+        library: str = "endf8.1",
+    ) -> None: ...
+    @property
+    def isotopes(self) -> list[tuple[ResonanceData, Value]]: ...
+    @property
+    def temperature_k(self) -> Value: ...
+
+class Region:
+    """The counts of a set of pixels in both runs, its background and the
+    material the beam crosses there.
+
+    The background is [b0, b1, b2] of b(E) = b0 + b1/sqrt(E) + b2*sqrt(E);
+    pixels is the region area in pixels.
     """
+
+    def __init__(
+        self,
+        open_counts: NDArray[np.float64],
+        sample_counts: NDArray[np.float64],
+        pixels: float,
+        background: list[Value],
+        gamma_transmission: Value,
+        material: Material | None = None,
+        open_live: NDArray[np.float64] | None = None,
+        sample_live: NDArray[np.float64] | None = None,
+    ) -> None: ...
+    @property
+    def open_counts(self) -> NDArray[np.float64]: ...
+    @property
+    def sample_counts(self) -> NDArray[np.float64]: ...
+    @property
+    def open_live(self) -> NDArray[np.float64] | None: ...
+    @property
+    def sample_live(self) -> NDArray[np.float64] | None: ...
+    @property
+    def background(self) -> list[Value]: ...
+    @property
+    def pixels(self) -> float: ...
+    @property
+    def gamma_transmission(self) -> Value: ...
+    @property
+    def material(self) -> Material | None: ...
+
+class Measurement:
+    """An open-beam run and a sample run recorded in the same time bins.
+
+    time_edges_us are the time-bin edges in microseconds and charge_ratio is
+    the sample run proton charge over the open-beam run.  normalization is the
+    sample run normalization a.  time_background is [C, A, tau] or
+    NO_TIME_BACKGROUND.
+    """
+
+    def __init__(
+        self,
+        time_edges_us: NDArray[np.float64],
+        charge_ratio: float,
+        normalization: Value,
+        regions: list[Region],
+        time_background: list[Value] | None = None,
+    ) -> None: ...
+    @property
+    def time_edges_us(self) -> NDArray[np.float64]: ...
+    @property
+    def charge_ratio(self) -> float: ...
+    @property
+    def normalization(self) -> Value: ...
+    @property
+    def time_background(self) -> list[Value]: ...
+    @property
+    def regions(self) -> list[Region]: ...
+
+class Pulse:
+    """The Ikeda-Carpenter pulse: alpha = alpha0*sqrt(E) + alpha1 and
+    beta = beta0*sqrt(E) + beta1 in 1/microsecond, R constant over
+    energy_span_ev (eV), and triangle FWHM h with fwhm_squared_us2 equal to
+    h^2 in microseconds squared."""
+
+    def __init__(
+        self,
+        alpha0: Value,
+        alpha1: Value,
+        beta0: Value,
+        beta1: Value,
+        r: Value,
+        fwhm_squared_us2: Value,
+        energy_span_ev: tuple[float, float],
+        n_tau: int = 600,
+        line_span_ev: tuple[float, float] | None = None,
+    ) -> None: ...
+    @property
+    def alpha(self) -> list[Value]: ...
+    @property
+    def beta(self) -> list[Value]: ...
+    @property
+    def r(self) -> Value: ...
+    @property
+    def fwhm_squared_us2(self) -> Value: ...
+    @property
+    def energy_span_ev(self) -> tuple[float, float]: ...
+    @property
+    def n_tau(self) -> int: ...
+
+class Calibration:
+    """A neutron of flight time u over flight_path_m (m) arrives at
+    t0_us + u (microseconds) plus a delay drawn from pulse."""
+
+    def __init__(self, t0_us: Value, flight_path_m: Value, pulse: Pulse) -> None: ...
+    @property
+    def t0_us(self) -> Value: ...
+    @property
+    def flight_path_m(self) -> Value: ...
+    @property
+    def pulse(self) -> Pulse: ...
+
+class RegionFit:
+    """One region fitted quantities and counts."""
 
     @property
-    def kind(self) -> str:
-        """'counts' or 'transmission'."""
+    def densities(self) -> list[float]:
+        """Areal density of each isotope in atoms/barn."""
         ...
+    @property
+    def temperature_k(self) -> float | None: ...
+    @property
+    def background(self) -> list[float]: ...
+    @property
+    def gamma_transmission(self) -> float: ...
+    @property
+    def beam_at_limit(self) -> bool: ...
+    @property
+    def predicted_open(self) -> NDArray[np.float64]: ...
+    @property
+    def predicted_sample(self) -> NDArray[np.float64]: ...
+    @property
+    def overdispersion(self) -> list[float | None]: ...
+    @property
+    def excluded_bins(self) -> list[int]: ...
+
+class CountsFit:
+    """The fitted quantities of every region and the quantities they share."""
 
     @property
-    def shape(self) -> tuple[int, int, int]:
-        """(n_energies, height, width)."""
+    def regions(self) -> list[RegionFit]: ...
+    @property
+    def normalization(self) -> float: ...
+    @property
+    def t0_us(self) -> float: ...
+    @property
+    def flight_path_m(self) -> float: ...
+    @property
+    def alpha(self) -> list[float]: ...
+    @property
+    def beta(self) -> list[float]: ...
+    @property
+    def r(self) -> float: ...
+    @property
+    def fwhm_squared_us2(self) -> float: ...
+    @property
+    def time_background(self) -> list[float]: ...
+    @property
+    def covariance(self) -> NDArray[np.float64] | None: ...
+    @property
+    def unbounded_mean(self) -> list[float] | None: ...
+    @property
+    def unbounded_covariance(self) -> NDArray[np.float64] | None: ...
+    @property
+    def on_bound(self) -> list[bool]: ...
+    @property
+    def deviance(self) -> float:
+        """Each run half Poisson deviance over its overdispersion."""
         ...
+    @property
+    def converged(self) -> bool: ...
+    @property
+    def measured_pulls(self) -> list[float] | None: ...
+    @property
+    def pulse_consistency(self) -> tuple[float, int, float] | None: ...
+    @property
+    def step_us(self) -> float: ...
+    @property
+    def points(self) -> int: ...
+    @property
+    def halvings(self) -> int: ...
 
-
-def from_counts(
-    sample_counts: NDArray[np.float64],
-    open_beam_counts: NDArray[np.float64],
-) -> InputData:
-    """Create InputData from raw detector counts and open beam.
-
-    The fitting engine uses Poisson KL by default (statistically
-    optimal for count data).
-    """
-    ...
-
-
-def from_counts_with_nuisance(
-    sample_counts: NDArray[np.float64],
-    flux: NDArray[np.float64],
-    background: NDArray[np.float64],
-) -> InputData:
-    """Legacy raw-count nuisance wrapper retained for compatibility.
-
-    The production joint-Poisson fitter rejects a nonzero ``background``
-    because that spectrum is not connected to the physical two-arm likelihood.
-    New code should use ``from_counts`` for spatial fitting and treat detector
-    background as a separate measured term.
-
-    Args:
-        sample_counts: 3D float64 array (n_energies, height, width).
-        flux: 3D float64 array (n_energies, height, width) of open-beam flux.
-        background: 3D float64 array (n_energies, height, width) of
-            detector/counts background.
-
-    Returns:
-        InputData object to pass to ``spatial_map_typed()``.
-    """
-    ...
-
-
-def from_transmission(
-    transmission: NDArray[np.float64],
-    uncertainty: NDArray[np.float64],
-) -> InputData:
-    """Create InputData from normalized transmission and uncertainty.
-
-    The fitting engine uses LM. Poisson/KL is rejected because normalized
-    transmission no longer contains the separate open/sample count arms.
-    """
-    ...
-
-
-def spatial_map_typed(
-    data: InputData,
-    energies: NDArray[np.float64],
-    isotopes: list[ResonanceData] | None = None,
-    *,
-    temperature_k: float = 293.6,
-    fit_temperature: bool = False,
-    initial_densities: list[float] | None = None,
-    fix_densities: bool = False,
-    density_free: list[bool] | None = None,
-    dead_pixels: NDArray[np.bool_] | None = None,
-    max_iter: int = 200,
-    solver: str = "auto",
-    background: bool = False,
-    fit_back_d: bool = False,
-    fit_back_f: bool = False,
-    back_d_init: float = 0.01,
-    back_f_init: float = 1.0,
-    c: float = 1.0,
-    enable_polish: bool | None = None,
-    fit_energy_scale: bool = False,
-    t0_init_us: float = 0.0,
-    l_scale_init: float = 1.0,
-    energy_scale_flight_path_m: float = 25.0,
-    resolution: TabulatedResolution | None = None,
-    flight_path_m: float | None = None,
-    delta_t_us: float | None = None,
-    delta_l_m: float | None = None,
-    groups: list[IsotopeGroup] | None = None,
-    tzero_jacobian: str | None = None,
-    fit_energy_range: tuple[float, float] | None = None,
-    fit_anorm: bool = True,
-    baseline: bool = False,
-    fit_b0: bool = True,
-    fit_b1: bool = True,
-    fit_b2: bool = True,
-    b0_init: float = 1.0,
-    b1_init: float = 0.0,
-    b2_init: float = 0.0,
-    b0_bounds: tuple[float, float] | None = None,
-    b1_bounds: tuple[float, float] | None = None,
-    b2_bounds: tuple[float, float] | None = None,
-    baseline_global: bool = True,
-    scale_by_chi2: bool = False,
-) -> SpatialResult:
-    """Spatial mapping using the typed input data API.
-
-    Either ``isotopes`` or ``groups`` must be provided, but not both.
-    When ``groups`` is provided, each group maps to one fitted density parameter.
-
-    Dispatches per-pixel fitting based on InputData type:
-      - from_counts + solver="kl" / "auto"
-        -> counts-KL (joint-Poisson deviance) — the counts-path solver,
-        validated against synthetic counts benchmarks and locked by a
-        real-VENUS counts regression test on the committed aggregated-Hf
-        fixture.
-      - from_transmission + solver="lm" or "auto" -> LM.
-      - from_transmission + a Poisson/KL solver -> rejected, because a ratio is
-        not Poisson count data.
-
-    Args:
-        data: InputData from `from_counts()` or `from_transmission()`.
-            `from_counts_with_nuisance()` is compatibility-only and rejects a
-            nonzero background in production fitting.
-        fix_densities: Freeze all densities at their initial values across
-            every pixel (per-pixel temperature-only fits with a known
-            calibration-foil density — the fastest thermometry path).
-        density_free: Per-density free/fixed mask applied to every pixel
-            (``free[i] == False`` freezes density ``i``); length must equal
-            the number of density parameters. Mutually exclusive with
-            ``fix_densities``.
-        fit_back_d, fit_back_f: When ``background=True``, fit the
-            optional SAMMY exponential background tail
-            ``BackD * exp(-BackF / √E)``.  SAMMY pairs the two — fitting
-            only one is rejected.  Materialises
-            :py:attr:`SpatialResult.back_d_map` /
-            :py:attr:`SpatialResult.back_f_map` per-pixel.
-        back_d_init, back_f_init: Initial values for the exponential
-            tail.  Both must be strictly positive when their fit flags
-            are set (BackF's Jacobian column zeros out at BackD ≈ 0,
-            and BackD becomes a constant duplicate of BackA at
-            BackF ≈ 0).
-        c: Proton-charge ratio ``Q_s / Q_ob`` for the counts-KL dispatch.
-            Default 1.0 (assumes caller PC-normalized the flux already).
-            Ignored for transmission LM.
-        enable_polish: Override the Nelder-Mead polish flag.  ``None``
-            (default) = the dispatcher auto-disables polish when
-            ``n_pixels > 1`` (polish costs ~1000 s per pixel
-            on realistic data).  ``True`` forces polish on, ``False`` off.
-        fit_energy_scale: Fit per-pixel SAMMY TZERO calibration
-            (t0 and L_scale).  Required for real VENUS data to match SAMMY
-            chi-squared performance — without it, sharp resonances are
-            offset in TOF and per-pixel chi-squared explodes.
-        t0_init_us: Initial TOF offset in microseconds (default 0.0).
-        l_scale_init: Initial flight-path scale factor (default 1.0).
-        energy_scale_flight_path_m: Nominal flight path (m) for the
-            energy-scale model (default 25.0).
-        resolution: Optional resolution function.  Rejected when fitting
-            count cubes; fit pre-normalized transmission cubes when
-            resolution is required.
-        scale_by_chi2: When ``True``, inflate the covariance-only
-            uncertainties (incl. ``temperature_uncertainty_map``) by
-            ``sqrt(chi2/dof)`` at the converged point, turning the inverse-Fisher
-            lower bound into a goodness-of-fit-scaled estimate. Sigma is scaled
-            by sqrt of the deviance-per-dof each pixel's result reports on the
-            counts joint-Poisson path. No-op on the
-            already-chi2-scaled LM transmission path. Default ``False``
-            (issue #638).
-
-    Always returns SpatialResult.  For counts-KL runs,
-    ``SpatialResult.deviance_per_dof_map`` is populated as the primary GOF.
-    When ``fit_energy_scale=True``, per-pixel ``t0_us_map`` and
-    ``l_scale_map`` are populated on the returned SpatialResult.  When
-    ``background=True`` with ``fit_back_d=True`` / ``fit_back_f=True``,
-    per-pixel ``back_d_map`` / ``back_f_map`` are populated.
-    """
-    ...
-
-
-def fit_spectrum_typed(
-    transmission: NDArray[np.float64],
-    uncertainty: NDArray[np.float64],
-    energies: NDArray[np.float64],
-    isotopes: list[tuple[ResonanceData, float]] | None = None,
-    *,
-    temperature_k: float = 293.6,
-    fit_temperature: bool = False,
-    max_iter: int = 200,
-    solver: str = "lm",
-    background: bool = False,
-    fit_back_d: bool = False,
-    fit_back_f: bool = False,
-    back_d_init: float = 0.01,
-    back_f_init: float = 1.0,
-    fit_energy_scale: bool = False,
-    t0_init_us: float = 0.0,
-    l_scale_init: float = 1.0,
-    energy_scale_flight_path_m: float = 25.0,
-    resolution: TabulatedResolution | None = None,
-    flight_path_m: float | None = None,
-    delta_t_us: float | None = None,
-    delta_l_m: float | None = None,
-    groups: list[IsotopeGroup] | None = None,
-    initial_densities: list[float] | None = None,
-    fix_densities: bool = False,
-    density_free: list[bool] | None = None,
-    tzero_jacobian: str | None = None,
-    fit_energy_range: tuple[float, float] | None = None,
-    fit_anorm: bool = True,
-    baseline: bool = False,
-    fit_b0: bool = True,
-    fit_b1: bool = True,
-    fit_b2: bool = True,
-    b0_init: float = 1.0,
-    b1_init: float = 0.0,
-    b2_init: float = 0.0,
-    b0_bounds: tuple[float, float] | None = None,
-    b1_bounds: tuple[float, float] | None = None,
-    b2_bounds: tuple[float, float] | None = None,
-    scale_by_chi2: bool = False,
-) -> FitResult:
-    """Fit a single pre-normalized transmission spectrum.
-
-    This function accepts **transmission** data only (T = sample/open-beam).
-    For raw-count fitting, use ``fit_counts_spectrum_typed(...)``.
-
-    Either ``isotopes`` or ``groups`` must be provided, but not both.
-    When ``groups`` is provided, each group maps to one fitted density parameter.
-
-    Args:
-        transmission: 1D pre-normalized transmission spectrum.
-        uncertainty: 1D uncertainty (same length as transmission).
-        energies: 1D energy grid in eV (ascending).
-        isotopes: List of (ResonanceData, initial_density) tuples.
-        temperature_k: Sample temperature in Kelvin (default 293.6).
-        fit_temperature: Whether to fit temperature (default False).
-        max_iter: Maximum iterations (default 200).
-        solver: ``'lm'`` (default) or ``'auto'``. Count-likelihood names are
-            rejected for normalized transmission.
-        background: Enable SAMMY transmission background.
-        resolution: Optional resolution function.
-        groups: List of IsotopeGroup objects (mutually exclusive with isotopes).
-        initial_densities: Initial density guesses when using groups.
-        fix_densities: Freeze all densities at their initial values and fit
-            only the remaining free parameters (temperature / energy scale).
-            The standard resonance-thermometry workflow when the areal density
-            is known from a calibration foil.
-        density_free: Per-density free/fixed mask (``free[i] == False`` freezes
-            density ``i``); length must equal the number of density parameters.
-            Mutually exclusive with ``fix_densities``.
-        scale_by_chi2: Compatibility flag. LM already scales its covariance by
-            Gaussian ``reduced_chi_squared``, so this is a no-op for normalized
-            transmission. Default ``False``.
-    """
-    ...
-
-
-def fit_counts_spectrum_typed(
-    sample_counts: NDArray[np.float64],
-    open_beam_counts: NDArray[np.float64],
-    energies: NDArray[np.float64],
-    isotopes: list[tuple[ResonanceData, float]] | None = None,
-    *,
-    temperature_k: float = 293.6,
-    fit_temperature: bool = False,
-    max_iter: int = 200,
-    solver: str = "auto",
-    background: bool = False,
-    fit_back_d: bool = False,
-    fit_back_f: bool = False,
-    back_d_init: float = 0.01,
-    back_f_init: float = 1.0,
-    fit_energy_scale: bool = False,
-    t0_init_us: float = 0.0,
-    l_scale_init: float = 1.0,
-    energy_scale_flight_path_m: float = 25.0,
-    detector_background: NDArray[np.float64] | None = None,
-    c: float = 1.0,
-    resolution: TabulatedResolution | None = None,
-    flight_path_m: float | None = None,
-    delta_t_us: float | None = None,
-    delta_l_m: float | None = None,
-    groups: list[IsotopeGroup] | None = None,
-    initial_densities: list[float] | None = None,
-    fix_densities: bool = False,
-    density_free: list[bool] | None = None,
-    enable_polish: bool | None = None,
-    tzero_jacobian: str | None = None,
-    fit_energy_range: tuple[float, float] | None = None,
-    fit_anorm: bool = True,
-    baseline: bool = False,
-    fit_b0: bool = True,
-    fit_b1: bool = True,
-    fit_b2: bool = True,
-    b0_init: float = 1.0,
-    b1_init: float = 0.0,
-    b2_init: float = 0.0,
-    b0_bounds: tuple[float, float] | None = None,
-    b1_bounds: tuple[float, float] | None = None,
-    b2_bounds: tuple[float, float] | None = None,
-    scale_by_chi2: bool = False,
-) -> FitResult:
-    """Fit a single raw-count spectrum (sample + open-beam counts).
-
-    Dispatches to a counts-domain solver based on ``solver``:
-
-    - ``'auto'`` (default), ``'kl'``, ``'poisson'``, and ``'joint_poisson'``
-      all route to the **counts-KL dispatch**: the joint-Poisson profile
-      binomial-deviance fitter.  Uses the explicit proton-charge ratio
-      ``c = Q_s / Q_ob`` from the ``c`` kwarg and populates
-      ``FitResult.deviance_per_dof`` as the primary GOF.
-      ``'joint_poisson'`` is kept as a compatibility alias; prefer ``'kl'``
-      for new code.
-    - ``'lm'`` is rejected: dividing the count arms into transmission loses
-      count statistics.
-
-    For pre-normalized transmission data, use ``fit_spectrum_typed(...)``.
-
-    Either ``isotopes`` or ``groups`` must be provided, but not both.
-    When ``groups`` is provided, each group maps to one fitted density parameter.
-
-    Args:
-        sample_counts: 1D sample counts spectrum.
-        open_beam_counts: 1D open-beam counts reference.
-        energies: 1D energy grid in eV (ascending).
-        isotopes: List of (ResonanceData, initial_density) tuples.
-        temperature_k: Sample temperature in Kelvin (default 293.6).
-        fit_temperature: Whether to fit temperature (default False).
-        max_iter: Maximum iterations (default 200).
-        solver: ``'auto'`` (default), ``'kl'`` / ``'poisson'`` /
-            ``'joint_poisson'`` (all equivalent — counts-KL dispatch).
-            ``'lm'`` is rejected for raw counts.
-        background: Enable the SAMMY-style transmission-background
-            wrapper inside the counts-KL fit (A_n + B_A + B_B/√E + B_C√E).
-        detector_background: Reserved detector/counts background reference;
-            the counts-KL dispatch rejects non-zero values.
-        c: Proton-charge ratio ``Q_s / Q_ob``.  Default
-            1.0 assumes the caller has already PC-normalized the flux.
-            For raw VENUS-style counts, set this to the actual ratio
-            (typically ~5–6).  Used by the counts-KL dispatch.
-        resolution: Rejected: count fits with an instrument resolution are
-            not supported by this function.
-        groups: List of IsotopeGroup objects (mutually exclusive with isotopes).
-        initial_densities: Initial density guesses when using groups.
-        fix_densities: Freeze all densities at their initial values and fit
-            only the remaining free parameters (temperature / energy scale).
-            The standard resonance-thermometry workflow when the areal density
-            is known from a calibration foil.
-        density_free: Per-density free/fixed mask (``free[i] == False`` freezes
-            density ``i``); length must equal the number of density parameters.
-            Mutually exclusive with ``fix_densities``.
-        enable_polish: Override the Nelder-Mead polish flag for the
-            counts-KL solver.  ``None`` (default) falls through to the
-            library default — currently ``False`` (#486) because the
-            polish ``fatol = 1e-10`` is sub-ULP on real counts data
-            where ``D`` saturates at ``10⁴``-``10⁵`` and burns
-            ``max_iter = 5000`` for ≤ 0.35 Fisher σ parameter
-            movement.  Pass ``True`` to opt in for synthetic / clean
-            (``D ≈ 1``) regimes where the absolute tolerance is
-            physically meaningful; ``False`` to force off explicitly.
-        scale_by_chi2: When ``True``, inflate the covariance-only
-            uncertainties (incl. ``temperature_k_unc``) by ``sqrt(chi2/dof)``
-            at the converged point, turning the inverse-Fisher lower bound into
-            a goodness-of-fit-scaled estimate. Scales sigma by sqrt of the
-            counts joint-Poisson ``deviance_per_dof`` this result reports.
-            Default ``False`` (issue #638).
-    """
-    ...
-
-class ModelJacobianResult:
-    """Result of exact Jacobian/Fisher evaluation from the Rust engine."""
+class Patch:
+    """What the pixels of a patch that are not excluded lie behind."""
 
     @property
-    def jacobian(self) -> NDArray[np.float64]:
-        """Analytical Jacobian (n_energy × n_free_params), row-major."""
-        ...
+    def kind(self) -> Literal["sample", "mixed", "outside"]: ...
 
-    @property
-    def fisher(self) -> NDArray[np.float64]:
-        """Expected Poisson Fisher F = J^T diag(1/μ) J (n_free × n_free)."""
-        ...
+class MapMeasurement:
+    """The counts of every pixel of both runs, the masks, and the material.
 
-    @property
-    def model_prediction(self) -> NDArray[np.float64]:
-        """Model prediction μ(E) at the evaluation point."""
-        ...
-
-    @property
-    def param_names(self) -> list[str]:
-        """Names of free parameters in Jacobian column order."""
-        ...
-
-def compute_model_jacobian(
-    open_beam_counts: NDArray[np.float64],
-    energies: NDArray[np.float64],
-    isotopes: list[tuple[ResonanceData, float]] | None = None,
-    *,
-    temperature_k: float = 293.6,
-    fit_temperature: bool = False,
-    flight_path_m: float | None = None,
-    delta_t_us: float | None = None,
-    delta_l_m: float | None = None,
-    resolution: TabulatedResolution | None = None,
-    detector_background: NDArray[np.float64] | None = None,
-    fit_alpha_1: bool = False,
-    fit_alpha_2: bool = False,
-    alpha_1: float = 1.0,
-    alpha_2: float = 1.0,
-    groups: list[IsotopeGroup] | None = None,
-    initial_densities: list[float] | None = None,
-) -> ModelJacobianResult:
-    """Compute exact analytical Jacobian and expected Fisher.
-
-    Uses the same model construction as ``fit_counts_spectrum_typed()`` but
-    evaluates at the given parameter values without optimising.
-
-    Either ``isotopes`` or ``groups`` must be provided, but not both.
-    When ``groups`` is provided, each group maps to one density parameter.
-
-    Research-oriented function for Fisher-based regularisation studies.
-
-    Any active instrument resolution (Gaussian parameters or
-    ``resolution=``) is rejected.
+    open_counts and sample_counts have shape (time bin, row, column);
+    excluded, sample and empty have shape (row, column).
+    No additive time background is modeled; use fit_counts when it is needed.
     """
+
+    def __init__(
+        self,
+        time_edges_us: NDArray[np.float64],
+        open_counts: NDArray[np.float64],
+        sample_counts: NDArray[np.float64],
+        excluded: NDArray[np.bool_],
+        sample: NDArray[np.bool_],
+        empty: NDArray[np.bool_],
+        material: Material,
+        charge_ratio: float,
+        normalization: Value,
+        background: list[Value],
+        binning: int = 1,
+        empty_background: list[Value] | None = None,
+        open_live: NDArray[np.float64] | None = None,
+        sample_live: NDArray[np.float64] | None = None,
+    ) -> None: ...
+    def patches(self) -> list[list[Patch]]:
+        """Each patch kind, in (patch row, patch column)."""
+        ...
+    @property
+    def time_edges_us(self) -> list[float]: ...
+    @property
+    def charge_ratio(self) -> float: ...
+    @property
+    def binning(self) -> int: ...
+
+class CountsMap:
+    """The fitted map, one value per patch."""
+
+    @property
+    def patches(self) -> list[list[Patch]]: ...
+    @property
+    def fits(self) -> list[list[RegionFit | None]]: ...
+    @property
+    def failed(self) -> list[list[str | None]]: ...
+    @property
+    def empty(self) -> RegionFit | None: ...
+    @property
+    def densities(self) -> list[NDArray[np.float64]]: ...
+    @property
+    def density_sd(self) -> list[NDArray[np.float64]]: ...
+    @property
+    def temperature_k(self) -> NDArray[np.float64]: ...
+    @property
+    def temperature_sd_k(self) -> NDArray[np.float64]: ...
+    @property
+    def overdispersion(self) -> list[NDArray[np.float64]]: ...
+    @property
+    def trusted(self) -> NDArray[np.bool_]:
+        """Numerical convergence and uncertainty status, not physical validation."""
+        ...
+    @property
+    def normalization(self) -> float: ...
+    @property
+    def t0_us(self) -> float: ...
+    @property
+    def flight_path_m(self) -> float: ...
+    @property
+    def alpha(self) -> list[float]: ...
+    @property
+    def beta(self) -> list[float]: ...
+    @property
+    def r(self) -> float: ...
+    @property
+    def fwhm_squared_us2(self) -> float: ...
+    @property
+    def shared(self) -> list[str]: ...
+    @property
+    def shared_covariance(self) -> NDArray[np.float64] | None: ...
+    @property
+    def measured_pulls(self) -> list[float] | None: ...
+    @property
+    def pulse_consistency(self) -> tuple[float, int, float] | None: ...
+    @property
+    def deviance(self) -> float: ...
+    @property
+    def converged(self) -> bool: ...
+    @property
+    def unconverged(self) -> str | None: ...
+    @property
+    def steps(self) -> int: ...
+    @property
+    def n_fitted(self) -> int: ...
+
+NO_TIME_BACKGROUND: tuple[Value, Value, Value]
+"""No time background: Value.known(0.0), Value.known(0.0), Value.known(1.0)."""
+
+def fit_counts(measurement: Measurement, calibration: Calibration) -> CountsFit:
+    """Fit the regions densities and temperatures to the raw counts of both
+    runs, together with the normalization, time background, timing offset,
+    flight path and pulse numbers that are not known."""
+    ...
+
+def fit_map(map: MapMeasurement, calibration: Calibration) -> CountsMap:
+    """Fit a material over patches of the map pixels to the raw counts of
+    both runs."""
     ...

@@ -3,13 +3,10 @@
 pub mod analyze;
 pub mod bin;
 pub mod configure;
-pub mod detectability;
-pub mod forward_model;
 pub mod landing;
 pub mod load;
 pub mod normalize;
 pub mod rebin;
-pub mod result_widgets;
 pub mod results;
 pub mod sidebar;
 pub mod wizard;
@@ -28,7 +25,5 @@ pub fn guided_content(ui: &mut egui::Ui, state: &mut AppState) {
         GuidedStep::Normalize => normalize::normalize_step(ui, state),
         GuidedStep::Analyze => analyze::analyze_step(ui, state),
         GuidedStep::Results => results::results_step(ui, state),
-        GuidedStep::ForwardModel => forward_model::forward_model_step(ui, state),
-        GuidedStep::Detectability => detectability::detectability_step(ui, state),
     }
 }

@@ -10,13 +10,12 @@
 //! cannot vendor it under `tests/data/` to make CI exercise the real
 //! kernel.
 //!
-//! Previously, a `venus_usr_resolution_path` helper returned
 //! `Option<PathBuf>::None` whenever the gitignored file was absent
 //! (i.e., on every CI run and every fresh checkout), and the 13
 //! fixture-gated tests in this directory all early-returned via
 //! `let Some(path) = … else { return; };`. The net effect was that
 //! the SAMMY USR-format kernel path that the SoftwareX paper documents
-//! had **zero CI coverage**, as confirmed empirically when issue #557
+//! had **zero CI coverage**, as confirmed empirically when
 //! moved the fixture aside and saw all 13 tests still report
 //! `passed; 0 ignored`.
 //!
@@ -27,18 +26,16 @@
 //! production fixture uses. This exercises every stage of the
 //! production pipeline (`from_text` parser → `plan` + `apply` →
 //! `compile_to_matrix` + `apply_r`) on a kernel that is **non-trivially
-//! broadening** (verified by [`assert_kernel_broadens`] — see PR #544
+//! broadening** (verified by [`assert_kernel_broadens`] — see
 //! for the silent-no-op-regression-via-kernel-shrink failure mode this
 //! pre-check guards against).
 //!
-//! Tests that previously used the early-return idiom now unconditionally
 //! call [`synthetic_venus_usr_tab`] and assert real expectations on
 //! every `cargo test` run.
 
 use nereids_physics::resolution::{ResolutionPlan, TabulatedResolution};
 
 /// Flight path (m) the synthetic kernel is built for. Matches the
-/// `flight_path_m = 25.0` argument previously used with the real
 /// VENUS BL10 fixture so the test grids (7 – 200 eV uniform) sit at
 /// production-like TOF values.
 pub const SYNTHETIC_FLIGHT_PATH_M: f64 = 25.0;
@@ -152,7 +149,7 @@ pub fn synthetic_venus_usr_tab() -> TabulatedResolution {
         .expect("synthetic VENUS USR text must parse via from_text")
 }
 
-/// Pre-check (PR #544 pattern) that the synthetic kernel actually
+/// Pre-check (pattern) that the synthetic kernel actually
 /// broadens a probe spectrum. Guards against future tweaks to
 /// [`SYNTHETIC_HALF_WIDTH_US`] or the grid that would silently turn
 /// the kernel into a no-op (delta-kernel), which would let

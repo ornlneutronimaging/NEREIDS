@@ -1,35 +1,22 @@
 //! # nereids-pipeline
 //!
-//! End-to-end orchestration for neutron resonance imaging analysis.
-//!
-//! This crate ties together all NEREIDS components into a complete pipeline:
-//! data loading → normalization → forward model → fitting → spatial mapping.
+//! Counts-domain fitting: densities, temperatures and backgrounds of one or
+//! more regions, fitted to raw open-beam and sample counts.
 //!
 //! ## Modules
-//! - [`beam`] — The beam before the sample, per µs of flight time
-//! - [`calibration`] — Energy calibration for TOF neutron instruments (t0 + flight-path scale)
-//! - [`counts_fit`] — Densities, temperatures and backgrounds of one or more regions, and the
-//!   normalization they share, fitted to the open-beam and sample counts (fit_counts)
-//! - [`counts_map`] — Densities and temperatures of patches of pixels, fitted as one counts fit
-//!   (fit_map)
-//! - [`detectability`] — Trace-detectability analysis (pre-experiment SNR check)
-//! - [`error`] — Pipeline error types
-//! - [`open_beam`] — The beam fitted to the open-beam counts (fit_open_beam)
-//! - [`pipeline`] — Single-spectrum analysis pipeline (fit_spectrum_typed)
-//! - [`pulse_calibration`] — A pulse calibrated on a foil, as a prior for experiments
-//! - [`spatial`] — Per-pixel parallel mapping with rayon (spatial_map_typed)
+//! - [`beam`] - the beam before the sample, per µs of flight time
+//! - [`counts_fit`] - one region or more fitted to raw counts (`fit_counts`)
+//! - [`counts_map`] - patches of pixels fitted as one counts fit (`fit_map`)
+//! - [`error`] - pipeline error types
+//! - [`open_beam`] - the beam fitted to the open-beam counts (`fit_open_beam`)
+//! - [`pulse_calibration`] - a pulse calibrated on a foil, as a prior
 
 pub mod beam;
-pub mod calibration;
 pub mod counts_fit;
 pub mod counts_map;
-pub mod detectability;
 pub mod error;
-pub mod joint_fit;
 pub mod open_beam;
-pub mod pipeline;
 pub mod pulse_calibration;
 /// Expected detector counts from the counts measurement equation, for tests.
 #[cfg(feature = "test-support")]
 pub mod reference;
-pub mod spatial;
