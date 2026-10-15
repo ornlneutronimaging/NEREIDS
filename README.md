@@ -27,12 +27,9 @@ output spatially resolved isotopic composition maps.
 - **ENDF nuclear data** -- automatic retrieval and caching (ENDF/B-VIII.0
   and VIII.1 from NNDC with IAEA fallback; JEFF-3.3, JENDL-5, TENDL-2023,
   and CENDL-3.2 from IAEA)
-- **Spectrum fitting** -- Levenberg-Marquardt and Poisson/KL divergence
-  optimizers with analytical Jacobians
-- **Spatial mapping** -- parallel per-pixel fitting via rayon for 2D
-  isotopic density maps
-- **Detectability analysis** -- energy-window optimization for trace
-  element sensitivity
+- **Counts fitting** -- Poisson/KL divergence on raw open-beam and sample
+  counts on time-of-flight bin edges, with analytical Jacobians
+- **Counts mapping** -- parallel fitting of pixel patches as one counts fit
 - **Python bindings** -- full API via PyO3, pip-installable
 - **Desktop GUI** -- egui application with Guided and Studio modes
 
@@ -159,35 +156,53 @@ maturin develop --release -m bindings/python/Cargo.toml
 
 ## Quick Start (Python)
 
+The fit takes raw open-beam and sample counts on shared time-bin edges and a
+pulse calibration:
+
 ```python
 import numpy as np
 import nereids
 
-# Load ENDF resonance data
 u238 = nereids.load_endf(92, 238)
-fe56 = nereids.load_endf(26, 56)
 
-# Energy grid (1-200 eV covers the strong U-238 resonances)
-energies = np.linspace(1.0, 200.0, 5000)
-
-# Forward model: transmission through a mixed sample
-transmission = nereids.forward_model(
-    energies,
-    isotopes=[(u238, 0.005), (fe56, 0.01)],  # (data, areal density in at/barn)
-    temperature_k=293.6,
+region = nereids.Region(
+    open_counts=open_beam_counts,
+    sample_counts=sample_counts,
+    pixels=1.0,
+    background=[nereids.Value.known(0.0)] * 3,
+    gamma_transmission=nereids.Value.known(1.0),
+    material=nereids.Material(
+        isotopes=[(u238, nereids.Value.fitted(1e-5))],
+        temperature_k=nereids.Value.known(300.0),
+    ),
 )
-
-# Spatial mapping with typed API
-trans_3d = transmission[:, None, None] * np.ones((1, 4, 4))  # (n_e, ny, nx)
-sigma_3d = np.full_like(trans_3d, 0.01)
-data = nereids.from_transmission(trans_3d, sigma_3d)
-result = nereids.spatial_map_typed(data, energies, [u238, fe56])
-
-print(f"Converged: {result.n_converged}/{result.n_total} pixels")
+measurement = nereids.Measurement(
+    time_edges_us=edges,
+    charge_ratio=sample_charge / open_beam_charge,
+    normalization=nereids.Value.fitted(1.0),
+    regions=[region],
+)
+calibration = nereids.Calibration(
+    t0_us=nereids.Value.known(3.0),
+    flight_path_m=nereids.Value.known(25.0),
+    pulse=nereids.Pulse(
+        alpha0=nereids.Value.known(0.35),
+        alpha1=nereids.Value.known(0.05),
+        beta0=nereids.Value.known(0.25),
+        beta1=nereids.Value.known(0.0),
+        r=nereids.Value.known(0.15),
+        fwhm_squared_us2=nereids.Value.known(0.0),
+        energy_span_ev=(1.0, 200.0),
+    ),
+)
+fit = nereids.fit_counts(measurement, calibration)
+print(fit.regions[0].densities, fit.deviance, fit.converged)
 ```
 
-See the [examples/notebooks/](examples/notebooks/) directory for 18 tutorial
-notebooks covering foundations, building blocks, workflows, and applications.
+`nereids.fit_map` fits patches of a counts cube in one fit. Every fitted
+quantity is a `Value` (known, fitted, within bounds, or measured). See the
+[Python quickstart](docs/guide/src/quickstart-python.md) and the
+[examples/notebooks/](examples/notebooks/) directory.
 
 ## Architecture
 
@@ -202,11 +217,11 @@ nereids-endf          ENDF file retrieval, parsing, resonance data
     |
 nereids-physics       Cross-sections, broadening, transmission model
     |
-nereids-fitting       LM and Poisson/KL optimizers
+nereids-fitting       Poisson/KL counts optimizer
     |
-nereids-io            TIFF/NeXus I/O, TOF normalization, rebinning
+nereids-io            TIFF/NeXus I/O, TOF conversion, rebinning
     |
-nereids-pipeline      End-to-end orchestration, spatial mapping (rayon)
+nereids-pipeline      Counts-domain fitting: one region or a map of patches
     |
     +-- nereids-python    PyO3 Python bindings (bindings/python)
     +-- nereids-gui       egui desktop application (apps/gui)
@@ -218,9 +233,9 @@ nereids-pipeline      End-to-end orchestration, spatial mapping (rayon)
 | `nereids-core` | Core types, physical constants, traits |
 | `nereids-endf` | ENDF file retrieval, caching, resonance parameter parsing |
 | `nereids-physics` | Cross-section calculation, broadening, transmission model |
-| `nereids-io` | TIFF/NeXus data I/O, VENUS normalization |
-| `nereids-fitting` | Optimization engine (LM, Poisson/KL) |
-| `nereids-pipeline` | End-to-end orchestration and spatial mapping |
+| `nereids-io` | TIFF/NeXus data I/O, pixel masks |
+| `nereids-fitting` | Poisson/KL counts optimizer |
+| `nereids-pipeline` | Counts-domain fitting and pixel-patch mapping |
 | `nereids-python` | PyO3 Python bindings for Jupyter |
 | `nereids-gui` | egui desktop application |
 

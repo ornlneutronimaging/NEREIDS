@@ -1,8 +1,9 @@
 # NEREIDS Jupyter Notebooks
 
-Tutorials organized into four tiers of increasing complexity.
-Work through them in order, or jump to whichever tier matches your
-experience level.
+Tutorials for the count-domain API, organized by tier. They are tutorial
+examples, not the API contract: the contract is the Python type stubs, the
+Python and Rust tests, the mdBook guide and Rustdoc. Notebooks are not
+executed by CI.
 
 ## Prerequisites
 
@@ -10,76 +11,30 @@ experience level.
 pip install nereids jupyter matplotlib numpy
 ```
 
-Notebooks that load ENDF data (`load_endf()`) require an internet
-connection on the first run; files are cached locally afterwards.
-
-## Verification Status
-
-These notebooks are maintained as current tutorials, but they are not executed
-by the repository docs workflow or CI. The underlying APIs are covered by Rust
-and Python tests; notebook execution should be treated as a release-time smoke
-check.
-
-External requirements:
-
-- ENDF-loading notebooks may need network access on first run.
-- The application notebook uses reference data from the
-  `tests/data/pleiades_data/` submodule and Git LFS.
-- Notebooks that use plotting require `matplotlib`; TIFF examples require
-  `tifffile` when writing local synthetic stacks.
+Notebooks that call `load_endf()` need network access on first run; files are
+cached locally afterwards. Plotting needs `matplotlib`.
 
 ## Tier 1: Foundations
 
-Core physics validation -- understand what NEREIDS computes and verify
-it against analytical formulas and SAMMY reference values.
+Physics validation: understand what NEREIDS computes and check it against
+analytic formulas and SAMMY reference values.
 
 | # | Notebook | Description |
 |---|----------|-------------|
-| 1 | [Cross-Sections](foundations/01_cross_sections.ipynb) | Compute resonance cross-sections from known parameters, validate against SAMMY |
-| 2 | [SLBW Validation](foundations/02_slbw_validation.ipynb) | Compare Single-Level Breit-Wigner and Reich-Moore formalisms |
-| 3 | [Doppler Broadening](foundations/03_doppler_broadening.ipynb) | Validate Free Gas Model Doppler broadening across temperatures |
-| 4 | [Resolution Broadening](foundations/04_resolution_broadening.ipynb) | Validate instrument resolution broadening against SAMMY |
-| 6 | [Transmission Model](foundations/06_transmission_model.ipynb) | Full forward model: cross-sections through broadening to transmission |
+| 1 | [Cross-Sections](foundations/01_cross_sections.ipynb) | Resonance cross-sections from known parameters |
+| 2 | [SLBW Validation](foundations/02_slbw_validation.ipynb) | Single-level Breit-Wigner versus Reich-Moore |
+| 3 | [Doppler Broadening](foundations/03_doppler_broadening.ipynb) | Free-gas-model broadening across temperatures |
+| 4 | [Resolution Broadening](foundations/04_resolution_broadening.ipynb) | Instrument resolution broadening |
+| 6 | [Transmission Model](foundations/06_transmission_model.ipynb) | Cross-sections through broadening to transmission |
 
 ## Tier 2: Building Blocks
 
-Individual API features -- learn each piece before combining them.
+Individual API features.
 
 | # | Notebook | Description |
 |---|----------|-------------|
 | 1 | [ENDF Loading](building_blocks/01_endf_loading.ipynb) | Fetch and cache evaluated nuclear data from the IAEA |
-| 2 | [Element Utilities](building_blocks/02_element_utilities.ipynb) | Element/isotope lookup functions (symbol, name, Z, natural abundances) |
-| 3 | [Spectrum Fitting](building_blocks/03_spectrum_fitting.ipynb) | Levenberg-Marquardt fitting of a single transmission spectrum |
-| 4 | [Multi-Isotope Fitting](building_blocks/04_multi_isotope_fitting.ipynb) | Fit a mixed-sample spectrum to recover multiple isotope densities |
-| 5 | [Tabulated Resolution](building_blocks/05_custom_resolution.ipynb) | Load and apply tabulated instrument resolution kernels |
-| 6 | [TIFF I/O](building_blocks/06_tiff_io_normalization.ipynb) | Load TIFF stacks and normalize raw detector images |
+| 2 | [Element Utilities](building_blocks/02_element_utilities.ipynb) | Element and isotope lookup helpers |
 
-## Tier 3: Workflows
-
-End-to-end analysis recipes combining multiple building blocks.
-
-| # | Notebook | Description |
-|---|----------|-------------|
-| 1 | [Enrichment Analysis](workflows/01_enrichment_analysis.ipynb) | Determine uranium enrichment from spectral fingerprints |
-| 2 | [Trace Analysis](workflows/02_trace_analysis.ipynb) | Detect trace elements in a bulk matrix via energy-window optimization |
-| 3 | [Forward Model](workflows/03_forward_model_demo.ipynb) | Complete forward-modeling pipeline from ENDF data to synthetic spectra |
-| 4 | [Spatial Mapping (Synthetic)](workflows/04_spatial_mapping_synthetic.ipynb) | Per-pixel isotopic composition mapping on a synthetic phantom |
-| 5 | [Group Fitting](workflows/05_group_fitting.ipynb) | Constrained isotope group fitting — leverage natural abundance ratios |
-
-## Tier 4: Applications
-
-Full-scale demonstrations on reference datasets.
-
-| # | Notebook | Description |
-|---|----------|-------------|
-| 1 | [Spatial Mapping Demo](applications/01_spatial_mapping_demo.ipynb) | Complete NEREIDS pipeline on a reference dataset with real detector geometry |
-
-## Suggested Learning Path
-
-**New to NEREIDS:** Foundations 1-3, then Building Blocks 1 and 3, then
-Workflows 3 (forward model). This covers the core physics and the most
-common API pattern.
-
-**Ready for fitting:** Building Blocks 3-4, then Workflows 1-2.
-
-**Spatial imaging:** Workflows 4 and 5, then Applications 1.
+Counts-fitting, mapping and I/O tutorials will be re-added against
+`fit_counts` and `fit_map`.

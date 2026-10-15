@@ -4,8 +4,7 @@ The NEREIDS desktop application provides interactive neutron resonance imaging
 analysis with visual feedback at every step.
 
 The screenshots on this page cover the current guided workflow screens:
-landing, load, configure, analyze, results, studio, forward model,
-detectability, and periodic table. When workflow labels, solver controls, or
+landing, load, configure, analyze, results, studio, and periodic table. When workflow labels, solver controls, or
 project-file behavior changes, refresh these images together with this page.
 
 ## Launch
@@ -24,11 +23,7 @@ cargo run --release -p nereids-gui
 
 ## Landing Page
 
-The landing page presents three entry points:
-
-- **Load & Fit Data** -- open the wizard for single-spectrum or spatial-map fitting
-- **Forward Model** -- explore theoretical transmission spectra without loading data
-- **Detectability** -- estimate trace-isotope sensitivity before an experiment
+The landing page opens the counts fitting workflow.
 
 ![Landing page](images/landing.png)
 
@@ -37,9 +32,7 @@ The landing page presents three entry points:
 After selecting **Load & Fit Data**, a short wizard asks:
 
 1. **Fitting type**: Single spectrum or spatial map
-2. **Data format**: "Raw Events (HDF5/NeXus)", "Histogram, Pre-Normalization",
-   or "Transmission (Already Normalized)" — quoted as the wizard cards
-   label them
+2. **Data format**: "Raw Events (HDF5/NeXus)" or "Histogram, Pre-Normalization"
 
 The wizard configures a dynamic pipeline with only the steps relevant to your
 data format. Six distinct pipelines are available.
@@ -67,19 +60,17 @@ Select isotopes of interest from the periodic table. ENDF nuclear data is
 fetched automatically from IAEA servers and cached locally. Each isotope shows
 a status badge (Pending, Fetching, Loaded, Failed).
 
-Configure beamline parameters (flight path, timing resolution) and toggle
-instrument-resolution broadening. (The solver choice — Levenberg-Marquardt or
-Poisson KL divergence — is set on the Analyze step.)
+Configure beamline parameters (flight path, timing). The solver is the
+counts-domain Poisson/KL engine.
 
 ![Configure step](images/configure-step.png)
 
 ### Analyze
 
-Choose the solver (Levenberg-Marquardt, or Poisson KL divergence when both
-sample and open-beam count cubes are loaded — the count likelihood needs the
-separate arms), then run the fit. For spatial maps, a progress bar tracks per-pixel fitting with rayon
-parallelism. Click any pixel to inspect its individual fit. Fit feedback shows
-green (good fit) or red (failed) status.
+The solver is the counts-domain Poisson/KL engine, which needs both the sample
+and open-beam count cubes. Run the fit; for maps a progress bar tracks the
+patches and clicking a pixel shows its fit. Fit feedback shows green (good) or
+red (failed) status.
 
 Draw regions of interest (ROI) with Shift+drag. Multiple ROIs are supported
 with move, select, and delete operations.
@@ -131,7 +122,7 @@ detailed exploration.
 
 Studio provides a "Final Cut"-style workspace for exploring results:
 
-- **Document tabs**: switch between Analysis, Forward Model, and Detectability
+- **Document tabs**: Analysis
 - **Main viewer**: density map with colormap selection and colorbar
 - **Spectrum panel**: click any pixel to see its fitted spectrum
 - **Bottom dock**: Isotopes, Residuals, Provenance, and Export panels
@@ -140,22 +131,6 @@ Studio provides a "Final Cut"-style workspace for exploring results:
 ![Studio mode](images/studio.png)
 
 ## Tools
-
-### Forward Model
-
-Compute theoretical transmission spectra for arbitrary isotope mixtures.
-Adjust densities with sliders and see the spectrum update in real-time.
-Hero spectrum layout with per-isotope contribution lines.
-
-![Forward Model](images/forward-model.png)
-
-### Detectability
-
-Analyze whether a trace isotope is detectable in a given matrix material.
-Multi-matrix support with resolution broadening. Shows a delta-T spectrum
-and verdict badges (DETECTABLE / NOT DETECTABLE / OPAQUE MATRIX).
-
-![Detectability](images/detectability.png)
 
 ### Periodic Table
 

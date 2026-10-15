@@ -79,7 +79,7 @@ Before a release or a documentation-focused PR, verify:
   `bindings/python/python/nereids/__init__.pyi` stubs for public functions,
   arguments, array shapes, and result objects.
 - The [Data I/O and NeXus/TOF](./data-io.md) page matches current TIFF,
-  NeXus, normalization, and `tof_to_energy_centers(...)` behavior.
+  NeXus, and `tof_to_energy_centers(...)` behavior.
 - PyPI metadata in `pyproject.toml` lists current optional extras, including
   `mcp` and `gui`.
 - GUI installation docs cover both `pip install "nereids[gui]"` and the

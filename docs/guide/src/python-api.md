@@ -44,50 +44,100 @@ Important properties:
 | `has_unevaluated_ranges` | `bool` | True when the file carries parsed-but-not-evaluated spans (LRF=7 / URR / LRU=0); those spans contribute zero cross-section. |
 | `skipped_ranges` | `list[str]` | One description per parsed-but-not-evaluated span. |
 
-### `FitResult`
+### Counts Fit Objects
 
-Returned by `fit_spectrum_typed(...)` and `fit_counts_spectrum_typed(...)`.
+A counts fit is built from raw open-beam and sample counts binned on shared
+time-bin edges (microseconds), not an energy grid.
 
-| Property | Type | Meaning |
-|----------|------|---------|
-| `densities` | `NDArray[float64]` | Fitted areal densities in atoms/barn. |
-| `uncertainties` | `NDArray[float64]` | One-sigma density uncertainties; entries may be `NaN` when covariance is unavailable. |
-| `reduced_chi_squared` | `float` | Pearson chi-squared per degree of freedom for LM/transmission paths. |
-| `deviance_per_dof` | `float or None` | Primary goodness-of-fit for counts-KL fits. |
-| `converged` | `bool` | Whether the optimizer converged. |
-| `iterations` | `int` | Iteration count. |
-| `temperature_k` | `float or None` | Fitted temperature when `fit_temperature=True`. |
-| `t0_us`, `l_scale` | `float or None` | Fitted energy-scale parameters when `fit_energy_scale=True`. |
+| Object | Meaning |
+|--------|---------|
+| Value | One fitted quantity: known, fitted from a start, within bounds, or measured with a Gaussian prior. |
+| Material | Isotopes each with an areal density in atoms/barn, and a temperature in K. |
+| Region | Both runs' counts for one set of pixels, its background [b0, b1, b2], its area in pixels, the gamma transmission, and the material. |
+| Measurement | The time-bin edges, charge ratio, normalization, time background and regions of one fit. |
+| Pulse | Ikeda-Carpenter pulse parameters and the energy span they hold over. |
+| Calibration | Timing offset t0 (microseconds), flight path (m), and Pulse. |
+| RegionFit | One region's fitted densities, temperature, background, predicted counts and overdispersion. |
+| CountsFit | Every region's RegionFit plus the shared normalization, t0, flight path, pulse numbers, covariance and deviance. |
+| Patch | What a patch's non-excluded pixels lie behind: sample, mixed, or outside. |
+| MapMeasurement | A cube of both runs' counts, the sample/empty/excluded masks, the material and the patch side. |
+| CountsMap | Per-patch fits, densities, density standard deviations, temperature and shared covariance. |
 
-### `InputData`
+NO_TIME_BACKGROUND is a module tuple of three known Values, [0, 0, 1], that
+Measurement and MapMeasurement accept as the time background.
 
-Opaque typed 3D input for spatial mapping. Create it with:
+#### Value
 
-```python
-data = nereids.from_transmission(transmission, uncertainty)
-data = nereids.from_counts(sample_counts, open_beam_counts)
-```
+Value.known(value), Value.fitted(start), Value.within(start, lower, upper) and
+Value.measured(value, sd) build the four kinds. The kind property returns
+"known", "fitted", "within" or "measured"; value, start, lower, upper and sd
+return the matching fields (None where a kind has no such field).
 
-The spectral axis is always axis 0, so arrays have shape
-`(n_energy, height, width)`.
+#### Material
 
-### `SpatialResult`
+Material(isotopes, temperature_k, library="endf8.1") takes a list of
+(ResonanceData, Value) pairs, each density in atoms/barn, and a temperature
+Value in K.
 
-Returned by `spatial_map_typed(...)`.
+#### Region
 
-| Property | Type | Meaning |
-|----------|------|---------|
-| `density_maps` | `list[NDArray[float64]]` | One `(height, width)` density map per isotope or isotope group. |
-| `uncertainty_maps` | `list[NDArray[float64]]` | Per-pixel density uncertainty maps. |
-| `chi_squared_map` | `NDArray[float64]` | Per-pixel reduced chi-squared for LM/transmission paths. |
-| `deviance_per_dof_map` | `NDArray[float64] or None` | Primary GOF map for counts-KL spatial fits. |
-| `converged_map` | `NDArray[bool_]` | Per-pixel convergence flags. |
-| `n_converged`, `n_failed`, `n_total` | `int` | Pixel fit counts. |
-| `temperature_map` | `NDArray[float64] or None` | Fitted temperature map when enabled. |
-| `temperature_uncertainty_map` | `NDArray[float64] or None` | Per-pixel 1σ temperature uncertainty (K) when `fit_temperature=True`. **Covariance-only lower bound** on the raw-count joint-Poisson path: it captures only statistical curvature (inverse Fisher matrix), omits baseline/model noise, and on real data can underestimate the observed per-superpixel scatter by ~3–4×. Pass `scale_by_chi2=True` for a goodness-of-fit-scaled estimate: σ is multiplied by `sqrt` of the `deviance_per_dof` each pixel's result reports. This inflates σ for an under-fit pixel (D/dof > 1) and, less commonly, shrinks it for an over-fit one (D/dof < 1). The flag is a no-op on the already-χ²-scaled LM transmission path. |
-| `anorm_map`, `background_maps` | `NDArray[float64] / list[...] or None` | SAMMY `Anorm` and the polynomial background `[BackA, BackB, BackC]` per pixel when `background=True`. |
-| `back_d_map`, `back_f_map` | `NDArray[float64] or None` | SAMMY exponential background `BackD` / `BackF` per pixel when `background=True` and `fit_back_d=True` / `fit_back_f=True`. Counts-KL spatial runs always return `None` for both (the joint-Poisson dispatch never fits the exponential tail). |
-| `t0_us_map`, `l_scale_map` | `NDArray[float64] or None` | Energy-scale maps when enabled. |
+Region(open_counts, sample_counts, pixels, background, gamma_transmission,
+material=None, open_live=None, sample_live=None) holds one region. background
+is the three-term b(E) = b0 + b1/sqrt(E) + b2/sqrt(E) as three Values. The
+optional live fractions are per bin in (0, 1].
+
+#### Measurement
+
+Measurement(time_edges_us, charge_ratio, normalization, regions,
+time_background=None) holds one open-beam/sample run pair. time_edges_us are
+the shared time-bin edges in microseconds (length = bins + 1), charge_ratio is
+the sample run's proton charge over the open-beam run's, and normalization is
+the sample run's normalization a. time_background is [C, A, tau] or
+NO_TIME_BACKGROUND.
+
+#### Pulse
+
+Pulse(alpha0, alpha1, beta0, beta1, r, fwhm_squared_us2, energy_span_ev,
+n_tau=600, line_span_ev=None): the Ikeda-Carpenter laws
+alpha = alpha0*sqrt(E) + alpha1 and beta = beta0*sqrt(E) + beta1 in
+1/microsecond, R constant over energy_span_ev (eV), and the proton triangle
+with fwhm_squared_us2 equal to h^2 in microseconds squared. Each parameter is a
+Value so it can be held or fitted.
+
+#### Calibration
+
+Calibration(t0_us, flight_path_m, pulse) gives the timing offset in
+microseconds and the flight path in metres. Both are Values, known or fitted.
+
+#### RegionFit and CountsFit
+
+RegionFit.densities are the fitted areal densities in atoms/barn,
+temperature_k the temperature in K (None without a material), predicted_open
+and predicted_sample the counts per bin the fit predicts, overdispersion the
+[open-beam, sample] values (None when unmeasured), and excluded_bins the
+sample bins the material's library leaves out.
+
+CountsFit.regions holds one RegionFit per region. normalization, t0_us,
+flight_path_m, alpha, beta, r, fwhm_squared_us2 and time_background are the
+shared fitted values; covariance is the fitted-quantity covariance (None when
+the fit did not converge), unbounded_mean and unbounded_covariance the same
+Gaussian without the bounds, on_bound the bounds flags, deviance the half
+Poisson deviance over the overdispersion, and converged the fit status.
+measured_pulls and pulse_consistency are None when unavailable.
+
+#### Patch, MapMeasurement and CountsMap
+
+Patch.kind is "sample", "mixed" or "outside". MapMeasurement(time_edges_us,
+open_counts, sample_counts, excluded, sample, empty, material, charge_ratio,
+normalization, background, binning=1, empty_background=None, open_live=None,
+sample_live=None) holds the (time bin, row, column) counts and the (row,
+column) masks; its patches() method returns each patch's kind.
+
+CountsMap exposes the per-patch fits (fits, failed, empty), density maps
+densities and density_sd in atoms/barn, temperature_k and temperature_sd_k in
+K, the two overdispersion maps, trusted, and the shared normalization, t0_us,
+flight_path_m, alpha, beta, r, fwhm_squared_us2, shared, shared_covariance,
+deviance and converged. n_fitted counts the fitted patches.
 
 ### `NexusData`
 
@@ -175,153 +225,94 @@ resolution = nereids.resolution_broaden(
 `width_from_fwhm` is also the conversion SAMMY's `Deltag` needs, so a timing
 width read from a SAMMY `.inp` can be passed straight through it.
 
-## Single-Spectrum Fitting
+## Counts Fitting
 
-### Transmission Data
-
-```python
-result = nereids.fit_spectrum_typed(
-    transmission,
-    uncertainty,
-    energies,
-    [(u238, 0.0005)],
-    temperature_k=300.0,
-    solver="lm",
-)
-```
-
-Shape contract:
-
-- `transmission`, `uncertainty`, and `energies` are 1D arrays with the same
-  length.
-- `energies` is in eV and should be ascending.
-- `isotopes` supplies `(ResonanceData, initial_density)` pairs.
-
-Keyword arguments:
-
-| Option | Meaning |
-|--------|---------|
-| `temperature_k=293.6` | Sample temperature in kelvin. |
-| `fit_temperature=False` | Fit sample temperature in addition to densities. |
-| `max_iter=200` | Maximum optimizer iterations. |
-| `solver="lm"` | `"lm"` (default) or `"auto"`. The count-likelihood names (`"kl"`, `"poisson"`, `"joint_poisson"`) are rejected for normalized transmission — a ratio is not Poisson count data. |
-| `background=False` | Enable SAMMY-style transmission background parameters. |
-| `fit_back_d=False`, `fit_back_f=False` | Fit optional exponential background terms. |
-| `back_d_init=0.01`, `back_f_init=1.0` | Initial exponential background values. |
-| `fit_energy_scale=False` | Fit TOF energy-scale parameters `t0_us` and `l_scale`. |
-| `t0_init_us=0.0`, `l_scale_init=1.0` | Initial energy-scale values. |
-| `energy_scale_flight_path_m=25.0` | Nominal flight path for energy-scale fitting. |
-| `resolution=...` | Tabulated resolution from `load_resolution(...)`. **Mutually exclusive with the Gaussian parameters below** — pass either `resolution=` (tabulated) or the `flight_path_m`/`delta_t_us`/`delta_l_m` trio (Gaussian), never both. |
-| `flight_path_m=...`, `delta_t_us=...`, `delta_l_m=...` | Gaussian resolution parameters (mutually exclusive with `resolution=`). |
-| `fit_energy_range=(emin, emax)` | Restrict the cost function to an energy window. |
-| `groups=[...]` | Fit isotope groups instead of individual isotopes. |
-| `initial_densities=[...]` | Initial density guesses when fitting groups. |
-| `tzero_jacobian="..."` | Select the TZERO Jacobian implementation. |
-
-### Raw Counts
+fit_counts(measurement, calibration) fits the areal densities and temperatures
+of the regions' materials, each region's background terms and gamma
+transmission, the normalization, the time background, and the timing offset,
+flight path and pulse numbers that are not known, to the raw counts of both
+runs.
 
 ```python
-result = nereids.fit_counts_spectrum_typed(
-    sample_counts,
-    open_beam_counts,
-    energies,
-    [(u238, 0.0005)],
-    solver="auto",
-    c=1.0,
+import numpy as np
+import nereids
+
+u238 = nereids.load_endf(92, 238)
+edges = np.linspace(200.0, 400.0, 401)          # microseconds, bins + 1
+open_counts = np.array([...])                   # one per bin
+sample_counts = np.array([...])
+
+region = nereids.Region(
+    open_counts=open_counts,
+    sample_counts=sample_counts,
+    pixels=1.0,
+    background=[nereids.Value.known(0.0)] * 3,
+    gamma_transmission=nereids.Value.known(1.0),
+    material=nereids.Material(
+        isotopes=[(u238, nereids.Value.fitted(0.001))],
+        temperature_k=nereids.Value.fitted(293.6),
+    ),
 )
+measurement = nereids.Measurement(
+    time_edges_us=edges,
+    charge_ratio=1.0,
+    normalization=nereids.Value.fitted(1.0),
+    regions=[region],
+)
+pulse = nereids.Pulse(
+    alpha0=nereids.Value.known(0.35),
+    alpha1=nereids.Value.known(0.05),
+    beta0=nereids.Value.known(0.25),
+    beta1=nereids.Value.known(0.0),
+    r=nereids.Value.known(0.15),
+    fwhm_squared_us2=nereids.Value.known(0.0),
+    energy_span_ev=(1.0, 200.0),
+)
+calibration = nereids.Calibration(
+    t0_us=nereids.Value.known(3.0),
+    flight_path_m=nereids.Value.known(25.0),
+    pulse=pulse,
+)
+result = nereids.fit_counts(measurement, calibration)
+print(result.regions[0].densities, result.deviance, result.converged)
 ```
 
-`solver="auto"`, `"kl"`, `"poisson"`, and `"joint_poisson"` all route counts
-data to the counts-KL dispatch; `solver="lm"` is rejected because dividing the
-count arms into transmission loses count statistics. Use `c=Q_s / Q_ob` when
-sample and open-beam counts have different proton charge or dwell-time
-normalization. The primary GOF for this path is `FitResult.deviance_per_dof`.
+The measurement is keyed on time-bin edges in microseconds; convert to or from
+an energy axis with tof_to_energy and energy_to_tof when needed. Every Value is
+either held (known) or fitted, so a fit can free or fix each density,
+temperature, background term, normalization, t0, flight path and pulse number
+independently. The material's library controls which sample bins are left out
+of the likelihood. A tabulated instrument resolution is not part of this
+engine: the pulse is the moderator model.
 
-Counts fitting accepts the same temperature, background, and group options as
-transmission fitting.
+## Counts Mapping
 
-Counts specific options are:
-
-| Option | Meaning |
-|--------|---------|
-| `detector_background=...` | Reserved detector background spectrum; the counts-KL dispatch rejects non-zero values. |
-| `c=1.0` | Proton-charge ratio `Q_s / Q_ob`. |
-| `enable_polish=True/False/None` | Override counts-KL polish behavior; `None` uses the dispatcher default. |
-
-An active instrument resolution is rejected for raw counts.
-
-The counts-domain `alpha_1`/`alpha_2` nuisance parameters are not fit by
-`fit_counts_spectrum_typed` or `spatial_map_typed`. Only
-`compute_model_jacobian` retains the `alpha` parameters, as a research/UQ
-surface.
-
-## Spatial Mapping
-
-### Pre-Normalized Transmission Cubes
+fit_map(map, calibration) fits one material across patches of pixels as one
+counts fit, with the empty pixels pinning the normalization. Build the
+MapMeasurement from (time bin, row, column) open-beam and sample counts, the
+(row, column) excluded/sample/empty masks, the material, and the patch side.
 
 ```python
-data = nereids.from_transmission(transmission_3d, uncertainty_3d)
-result = nereids.spatial_map_typed(
-    data,
-    energies,
-    [u238],
-    initial_densities=[0.0005],
-    solver="auto",
+map_measurement = nereids.MapMeasurement(
+    time_edges_us=edges,
+    open_counts=open_cube,          # (n_bins, height, width)
+    sample_counts=sample_cube,      # (n_bins, height, width)
+    excluded=np.zeros((height, width), dtype=bool),
+    sample=np.ones((height, width), dtype=bool),
+    empty=np.zeros((height, width), dtype=bool),
+    material=material,
+    charge_ratio=1.0,
+    normalization=nereids.Value.fitted(1.0),
+    background=[nereids.Value.known(0.0)] * 3,
+    binning=1,
 )
+counts_map = nereids.fit_map(map_measurement, calibration)
+print(counts_map.densities[0].shape, counts_map.converged)
 ```
 
-For `from_transmission(...)` inputs both `solver="lm"` (default) and
-`solver="auto"` route to LM; a Poisson/KL count likelihood is rejected for
-normalized transmission because the separate open/sample count arms are no
-longer available. `density_maps[0]` is the fitted U-238 map.
-
-### Raw Count Cubes
-
-```python
-data = nereids.from_counts(sample_counts_3d, open_beam_counts_3d)
-result = nereids.spatial_map_typed(
-    data,
-    energies,
-    [u238],
-    initial_densities=[0.0005],
-    solver="auto",
-    c=1.0,
-)
-```
-
-`solver="auto"` uses counts-KL for `from_counts(...)` data and populates
-`deviance_per_dof_map`.
-
-Shape contract:
-
-- `sample_counts_3d`, `open_beam_counts_3d`, `transmission_3d`, and
-  `uncertainty_3d` use shape `(n_energy, height, width)`.
-- `energies.shape == (n_energy,)`.
-- `dead_pixels`, when supplied, uses shape `(height, width)` with `True`
-  marking pixels to skip.
-
-Keyword arguments:
-
-| Option | Meaning |
-|--------|---------|
-| `temperature_k=293.6`, `fit_temperature=False` | Fixed or fitted sample temperature. |
-| `initial_densities=[...]` | Initial density guesses. |
-| `dead_pixels=...` | `(height, width)` skip mask. |
-| `max_iter=200` | Maximum per-pixel optimizer iterations. |
-| `solver="auto"` | Dispatch from input type unless explicitly set. |
-| `background=False` | Enable SAMMY-style background for LM/transmission paths. |
-| `fit_back_d=False`, `fit_back_f=False` | Fit the SAMMY exponential background tail (`BackD * exp(-BackF / √E)`).  Requires `background=True`.  Per-pixel `back_d_map` / `back_f_map` are populated on the returned `SpatialResult` (issue #538). |
-| `back_d_init=0.01`, `back_f_init=1.0` | Initial values for the exponential tail. |
-| `c=1.0` | Proton-charge ratio for counts-KL spatial fitting. |
-| `enable_polish=True/False/None` | Override counts-KL polish behavior; `None` auto-disables polish for multi-pixel maps. |
-| `fit_energy_scale=False` | Fit per-pixel `t0_us` and `l_scale` maps. |
-| `t0_init_us=0.0`, `l_scale_init=1.0` | Initial energy-scale values. |
-| `energy_scale_flight_path_m=25.0` | Nominal flight path for energy-scale fitting. |
-| `resolution=...` | Tabulated resolution from `load_resolution(...)`. **Mutually exclusive with the Gaussian parameters below** — pass either `resolution=` (tabulated) or the `flight_path_m`/`delta_t_us`/`delta_l_m` trio (Gaussian), never both. **Rejected for count cubes** — fit pre-normalized transmission cubes instead. |
-| `flight_path_m=...`, `delta_t_us=...`, `delta_l_m=...` | Gaussian resolution parameters (mutually exclusive with `resolution=`; same count-cube rejection applies). |
-| `groups=[...]` | Fit isotope groups instead of individual isotopes. |
-| `tzero_jacobian="..."` | Select the TZERO Jacobian implementation. |
-| `fit_energy_range=(emin, emax)` | Restrict the cost function to an energy window. |
+CountsMap.densities holds one (patch row, patch column) map per isotope in
+atoms/barn; density_sd holds the matching standard deviations. Patches of kind
+"mixed" and "outside" are not fitted.
 
 ## Pixel Masks
 
@@ -332,7 +323,7 @@ handle them), and coverage/thickness inhomogeneity is a model concern, not a
 masking concern.  Downstream, a masked pixel is hard-excluded — never
 fitted, `NaN` in the result maps.  Masks are `(height, width)` boolean
 arrays, `True` = exclude, and feed directly into
-`spatial_map(dead_pixels=...)`.
+`the excluded mask of a MapMeasurement`.
 
 ```python
 # Recommended entry point: dead ∪ hot over sample AND open beam.
@@ -343,7 +334,7 @@ dead = nereids.detect_dead_pixels(sample)             # exactly zero in every TO
 hot  = nereids.detect_hot_pixels(sample, k_mad=6.0)   # railed/hot point defects
 gone = nereids.detect_dead_pixels_chunked([chunk_a, chunk_b])  # intermittent deadness
 
-result = nereids.spatial_map(cube, energies, isotopes, dead_pixels=mask)
+excluded = mask          # pass as MapMeasurement(excluded=...)
 ```
 
 ### `detect_bad_pixels(sample, open_beam=None, hot_k_mad=6.0)`
@@ -526,4 +517,4 @@ in the same PR.
 
 This page does not execute notebooks or compile-test Python snippets. The
 Rust quickstart on this site IS compile-tested by `cargo check --workspace
---examples` (see `crates/nereids-fitting/examples/quickstart.rs`).
+--examples` (see `crates/nereids-pipeline/src/counts_fit.rs`).

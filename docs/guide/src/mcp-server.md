@@ -76,9 +76,8 @@ Low-level physics tools operate on an in-memory isotope registry:
 - `load_endf(isotope, library="endf8.1")` loads resonance data such as
   `"U-238"` or `"Fe-56"` into the registry.
 - `get_resonance_parameters(isotope)` returns loaded resonance metadata.
-- `compute_cross_sections(...)`, `compute_transmission(...)`,
-  `forward_model(...)`, and `detect_isotopes(...)` run direct physics
-  calculations.
+- `compute_cross_sections(...)`, `compute_transmission(...)`, and
+  `forward_model(...)` run direct physics calculations.
 
 Workflow tools operate on a dataset directory or a manifest path:
 
@@ -104,19 +103,32 @@ delimiters. Pure JSON manifests must contain the frontmatter object directly.
 The workflow configuration may be placed under `analysis`, `workflow`, or
 `processing`; otherwise the root object is treated as the workflow.
 
-Minimal single-spectrum manifest:
+Minimal counts manifest:
 
 ```markdown
 ---
 {
-  "name": "u238-spectrum-demo",
+  "name": "u238-counts-demo",
   "tool": "nereids",
-  "physics": "neutron-resonance",
   "analysis": {
     "mode": "single_spectrum",
     "data": {
-      "kind": "transmission_npz",
-      "path": "spectrum.npz"
+      "kind": "counts_npz",
+      "path": "counts.npz",
+      "time_edges_key": "time_edges_us"
+    },
+    "calibration": {
+      "t0_us": 3.0,
+      "flight_path_m": 25.0,
+      "pulse": {
+        "alpha0": 0.35,
+        "alpha1": 0.05,
+        "beta0": 0.25,
+        "beta1": 0.0,
+        "r": 0.15,
+        "fwhm_squared_us2": 0.0,
+        "energy_span_ev": [1.0, 200.0]
+      }
     },
     "isotopes": [
       {
@@ -126,14 +138,10 @@ Minimal single-spectrum manifest:
       }
     ],
     "fit": {
-      "solver": "lm",
-      "max_iter": 100
-    },
-    "resolution": {
-      "kind": "gaussian",
-      "flight_path_m": 25.0,
-      "delta_t_us": 0.5,
-      "delta_l_m": 0.005
+      "fit_domain": "counts",
+      "normalization": 1.0,
+      "background": [0.0, 0.0, 0.0],
+      "temperature_k": 293.6
     },
     "output": {
       "directory": "output"
@@ -143,53 +151,37 @@ Minimal single-spectrum manifest:
 ---
 ```
 
-For synthetic demo data, resolution can be disabled:
-
-```json
-"resolution": {"kind": "none"}
-```
-
-For real instrument data, use Gaussian resolution parameters or a tabulated
-resolution file. Synthetic data often does not need an instrument resolution
-file; real experiments normally do.
-The exception is count inputs: raw counts always fit in the counts domain, and a count input with an active resolution is rejected.
-Supply pre-normalized transmission, or disable resolution for count inputs.
-Cross-domain solver requests are also rejected on both validate and run: counts with `solver: "lm"`, and transmission with a Poisson/KL solver name.
+The fit is always the counts domain: fit_domain must be "counts". An
+instrument resolution block is rejected, because the counts fit uses the
+Ikeda-Carpenter pulse in the calibration block, not a tabulated resolution.
+Each fitted quantity is a number (known) or an object with a kind
+("known", "fitted", "within" or "measured") and the matching fields, so a
+manifest can free or fix a density, the temperature, a background term, the
+normalization, t0, the flight path and each pulse number.
 
 ## Supported Workflow Inputs
 
-`single_spectrum` fits one spectrum. It supports:
+The fit is counts-only.
 
-- `counts_npz` or `counts`: a `.npz` file with `sample_counts`,
-  `open_beam_counts`, and `energies_ev` by default. Arrays may be 1D spectra
-  or 3D cubes; 3D cubes are summed over pixels before fitting one spectrum.
-- `transmission_npz`, `transmission`, or `spectrum`: a `.npz` or text file
-  with `transmission`, optional `uncertainty`, and an energy grid.
+single_spectrum fits one region. It supports:
 
-`density_map` and `spatial_map` fit every pixel in a 3D cube. They support:
+- counts_npz or counts: a .npz file with 1D or 3D sample_counts and
+  open_beam_counts, plus the time-bin edges. The edges come from time_edges_us
+  (or time_edges_key), or are converted from an energy grid through
+  energy_to_tof with the calibration's flight path.
+- nexus_histogram or nexus: sample and open-beam NeXus histogram files,
+  configured with sample_path and open_beam_path; the loader's TOF edges are
+  used directly.
 
-- `transmission_npz` or `transmission`: a `.npz` file with 3D
-  `transmission` and optional 3D `uncertainty` arrays.
-- `transmission_tiff` or `tiff`: a multi-frame TIFF transmission stack plus
-  an `energy_grid` entry.
-- `counts_npz` or `counts`: a `.npz` file with 3D `sample_counts` and
-  `open_beam_counts` arrays.
-- `nexus_histogram` or `nexus`: sample and open-beam NeXus histogram files,
-  configured with `sample_path` and `open_beam_path`.
+density_map and spatial_map fit every patch of a counts cube. They support
+counts_npz/counts and nexus_histogram/nexus with 3D counts. Optional .npz
+arrays excluded, sample and empty are (row, column) boolean masks; without
+them every pixel is treated as behind the sample. binning sets the patch side
+in pixels.
 
-Paired arrays must have matching shapes. The number of energy points must
-match the first axis of the data arrays. Energy grids must be strictly
-monotonic. See
-[Data I/O and NeXus/TOF](./data-io.md#tof-edges-to-energy-centers) for the
-energy-ordering contract (descending grids are reversed with the aligned
-arrays before fitting).
-
-For NeXus histogram inputs, MCP follows the conventions documented in
-[Data I/O and NeXus/TOF](./data-io.md). Briefly: NeXus loaders return counts
-in ascending TOF order; the workflow derives ascending energy centers with
-`tof_to_energy_centers(...)` and reverses counts along axis 0 to match before
-fitting. If the manifest does not specify `flight_path_m`, the loader metadata
-is used when available, with a 25 m fallback. `delay_us` defaults to 0.
+Paired arrays must have matching shapes, and the time-bin edge count must be
+one more than the first axis of the data arrays. For NeXus inputs the sample
+and open-beam TOF edges must match.
 
 Example NeXus density-map manifest:
 
@@ -204,24 +196,35 @@ Example NeXus density-map manifest:
       "kind": "nexus",
       "sample_path": "sample.nxs",
       "open_beam_path": "open_beam.nxs",
+      "binning": 4
+    },
+    "calibration": {
+      "t0_us": {"kind": "fitted", "value": 3.0},
       "flight_path_m": 25.0,
-      "delay_us": 0.0
+      "pulse": {
+        "alpha0": 0.35,
+        "alpha1": 0.05,
+        "beta0": 0.25,
+        "beta1": 0.0,
+        "r": 0.15,
+        "fwhm_squared_us2": 0.0,
+        "energy_span_ev": [1.0, 200.0]
+      }
     },
     "isotopes": [
       {"isotope": "U-238", "initial_density": 0.001}
     ],
     "fit": {
-      "solver": "kl",
-      "max_iter": 100
-    },
-    "resolution": {"kind": "none"}
+      "fit_domain": "counts",
+      "normalization": {"kind": "fitted", "value": 1.0},
+      "temperature_k": {"kind": "fitted", "value": 293.6}
+    }
   }
 }
 ---
 ```
 
-NeXus density maps fit raw count cubes in the counts domain, which rejects an active instrument resolution (see the resolution note above) — hence `"kind": "none"` here.
-Convert to pre-normalized transmission cubes when resolution broadening is required.
+An active instrument resolution is not part of this workflow.
 
 ## Result Files
 
