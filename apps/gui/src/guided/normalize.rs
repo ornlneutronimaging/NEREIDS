@@ -1,41 +1,35 @@
-//! Step 3: Normalize — transmission computation, preview, and analysis mode selection.
+//! Step 3: Prepare — energy grid, pixel-mask detection, and counts preview.
 
 use crate::state::{
-    AnalysisMode, AppState, EndfStatus, InputMode, ProvenanceEventKind, SpectrumAxis,
-    SpectrumDataSource,
+    AppState, EndfStatus, InputMode, ProvenanceEventKind, SpectrumAxis, SpectrumDataSource,
 };
 use crate::widgets::design::{self, NavAction};
 use crate::widgets::image_view::show_viridis_image;
 use egui_plot::{Line, Plot, PlotPoints, VLine};
-use ndarray::{Array3, Axis};
+use ndarray::Axis;
 use nereids_io::spectrum::{SpectrumUnit, SpectrumValueKind};
 use std::sync::Arc;
 
-/// Draw the Normalize step content.
-///
-/// No inner ScrollArea -- the guided content area in app.rs already wraps
-/// everything in a vertical ScrollArea, so nesting would clip content.
+/// Draw the Prepare step content.
 pub fn normalize_step(ui: &mut egui::Ui, state: &mut AppState) {
-    let subtitle = match state.input_mode {
-        InputMode::TiffPair => "Normalize raw data and preview transmission",
-        _ => "Preview transmission and select analysis mode",
-    };
-    design::content_header(ui, "Normalize", subtitle);
+    design::content_header(
+        ui,
+        "Prepare Counts",
+        "Build the energy grid from the spectrum file and detect bad pixels.",
+    );
 
-    let has_data = state.normalized.is_some() && state.energies.is_some();
+    if state.energies.is_none() && state.sample_data.is_some() && state.spectrum_values.is_some() {
+        prepare_counts(state);
+    }
 
-    // --- Normalization status + Analysis Mode (compact, full width) ---
-    normalization_controls_card(ui, state);
-
+    let has_data = state.energies.is_some();
     if has_data {
-        analysis_mode_card(ui, state);
-
-        if let (Some(norm), Some(energies)) = (&state.normalized, &state.energies) {
-            let shape = norm.transmission.shape();
+        if let (Some(sample), Some(energies)) = (&state.sample_data, &state.energies) {
+            let shape = sample.shape();
             let bins = format!("{}", shape[0]);
             let pixels = format!("{}", shape[1] * shape[2]);
-            let e_min = format!("{:.2}", energies.first().unwrap_or(&0.0));
-            let e_max = format!("{:.2}", energies.last().unwrap_or(&0.0));
+            let e_min = format!("{:.2}", energies.first().copied().unwrap_or(0.0));
+            let e_max = format!("{:.2}", energies.last().copied().unwrap_or(0.0));
             design::stat_row(
                 ui,
                 &[
@@ -46,178 +40,72 @@ pub fn normalize_step(ui: &mut egui::Ui, state: &mut AppState) {
                 ],
             );
         }
+    } else if state.sample_data.is_some() {
+        ui.label("Load a spectrum file to define the energy axis.");
+    } else {
+        ui.label("Load sample and open-beam counts first.");
     }
 
-    let can_continue = has_data;
     match design::nav_buttons(
         ui,
         Some("\u{2190} Back"),
         "Continue \u{2192}",
-        can_continue,
-        "Normalize data to continue",
+        has_data,
+        "Prepare data to continue",
     ) {
         NavAction::Back => state.nav_prev(),
         NavAction::Continue => state.nav_next(),
         NavAction::None => {}
     }
 
-    // --- Transmission preview (full width, tall) ---
     if has_data {
         ui.add_space(8.0);
-        transmission_preview_card(ui, state);
+        counts_preview_card(ui, state);
     }
 }
 
-// ---- Normalization Controls Card ----
-
-fn normalization_controls_card(ui: &mut egui::Ui, state: &mut AppState) {
-    design::card_with_header(ui, "Normalization", None, |ui| {
-        match state.input_mode {
-            InputMode::TransmissionTiff | InputMode::Hdf5Histogram | InputMode::Hdf5Event => {
-                if state.normalized.is_some() && state.energies.is_some() {
-                    let label = if state.open_beam_data.is_some() {
-                        "Normalized (sample/OB). Counts-domain fitting available."
-                    } else {
-                        match state.input_mode {
-                            InputMode::Hdf5Histogram => {
-                                "HDF5 histogram data ready (no OB — uniform weighting)."
-                            }
-                            InputMode::Hdf5Event => {
-                                "Histogrammed event data ready (no OB — uniform weighting)."
-                            }
-                            _ => "Transmission data ready (pre-normalized).",
-                        }
-                    };
-                    ui.label(label);
-                } else if state.sample_data.is_some() && state.spectrum_values.is_some() {
-                    // Auto-prepare: when OB is available, do proper normalization.
-                    // Otherwise, wrap as transmission with uniform uncertainty.
-                    if state.open_beam_data.is_some() {
-                        normalize_hdf5_with_ob(state);
-                    } else {
-                        prepare_transmission(state);
-                    }
-                    ui.label("Preparing data...");
-                } else {
-                    ui.label("Load data first (Step 1).");
-                }
-            }
-            InputMode::TiffPair => {
-                // Editable proton charge parameters
-                egui::Grid::new("norm_params")
-                    .num_columns(4)
-                    .spacing([8.0, 6.0])
-                    .show(ui, |ui| {
-                        ui.label("PC sample:");
-                        ui.add(
-                            egui::DragValue::new(&mut state.proton_charge_sample)
-                                .range(0.001..=1e6)
-                                .speed(0.01),
-                        );
-                        ui.label("PC open beam:");
-                        ui.add(
-                            egui::DragValue::new(&mut state.proton_charge_ob)
-                                .range(0.001..=1e6)
-                                .speed(0.01),
-                        );
-                        ui.end_row();
-                    });
-                ui.add_space(6.0);
-
-                let can_normalize = state.sample_data.is_some()
-                    && state.open_beam_data.is_some()
-                    && !state.is_fitting;
-                ui.add_enabled_ui(can_normalize, |ui| {
-                    if ui.button("Normalize").clicked() {
-                        normalize_data(state);
-                    }
-                });
-
-                if state.normalized.is_some() {
-                    ui.label("Transmission computed.");
-                    if let Some(ref dead) = state.dead_pixels {
-                        let n_dead = dead.iter().filter(|&&d| d).count();
-                        ui.label(format!("Masked pixels (dead/hot): {}", n_dead));
-                    }
-                } else if state.sample_data.is_some() && state.open_beam_data.is_some() {
-                    ui.label("Click Normalize to compute transmission.");
-                } else {
-                    ui.label("Load sample and open beam data first (Step 1).");
-                }
-            }
-        }
-    });
-}
-
-// ---- Transmission Preview Card ----
-
-fn transmission_preview_card(ui: &mut egui::Ui, state: &mut AppState) {
-    design::card_with_header(ui, "Transmission Preview", None, |ui| {
+fn counts_preview_card(ui: &mut egui::Ui, state: &mut AppState) {
+    design::card_with_header(ui, "Counts Preview", None, |ui| {
         let available_width = ui.available_width();
         let image_width = 220.0_f32.min(available_width * 0.35);
 
         ui.horizontal(|ui| {
-            // Left: image + TOF slicer
             ui.allocate_ui_with_layout(
                 egui::vec2(image_width, ui.available_height()),
                 egui::Layout::top_down(egui::Align::LEFT),
-                |ui| {
-                    preview_image_panel(ui, state);
-                },
+                |ui| preview_image_panel(ui, state),
             );
 
             ui.separator();
 
-            // Right: spectrum plot + controls
-            ui.vertical(|ui| {
-                preview_spectrum_panel(ui, state);
-            });
+            ui.vertical(|ui| preview_spectrum_panel(ui, state));
         });
     });
 }
 
 fn preview_image_panel(ui: &mut egui::Ui, state: &mut AppState) {
-    let norm = match state.normalized {
-        Some(ref n) => n,
-        None => return,
+    let Some(sample) = state.sample_data.as_ref() else {
+        return;
     };
-
-    let n_tof = norm.transmission.shape()[0];
+    let n_tof = sample.shape()[0];
     if n_tof == 0 {
         ui.label("(no data)");
         return;
     }
 
-    // Clamp TOF index
     if state.tof_slice_index >= n_tof {
         state.tof_slice_index = n_tof - 1;
     }
 
-    // Extract 2D slice at current TOF index
-    let slice = norm
-        .transmission
-        .index_axis(Axis(0), state.tof_slice_index)
-        .to_owned();
-    let _ = show_viridis_image(ui, &slice, "norm_preview_tex");
+    let slice = sample.index_axis(Axis(0), state.tof_slice_index).to_owned();
+    let _ = show_viridis_image(ui, &slice, "prepare_preview_tex");
 
-    // TOF slicer
     ui.add(
         egui::Slider::new(&mut state.tof_slice_index, 0..=n_tof.saturating_sub(1)).text("TOF bin"),
     );
 }
 
-/// Compute the spatially-averaged transmission spectrum (mean over y, x axes).
-///
-/// Returns `None` when either spatial dimension has length 0, which would cause
-/// `ndarray::mean_axis()` to return `None`.
-fn full_image_average(transmission: &Array3<f64>) -> Option<Vec<f64>> {
-    let avg_x = transmission.mean_axis(Axis(2))?;
-    let avg_xy = avg_x.mean_axis(Axis(1))?;
-    Some(avg_xy.to_vec())
-}
-
 fn preview_spectrum_panel(ui: &mut egui::Ui, state: &mut AppState) {
-    // Controls row
     ui.horizontal(|ui| {
         ui.label("Source:");
         ui.selectable_value(
@@ -248,72 +136,41 @@ fn preview_spectrum_panel(ui: &mut egui::Ui, state: &mut AppState) {
         ui.checkbox(&mut state.show_resonance_dips, "Resonance dips");
     });
 
-    let norm = match state.normalized {
-        Some(ref n) => n,
-        None => return,
+    let Some(sample) = state.sample_data.as_ref() else {
+        return;
     };
+    let n_tof = sample.shape()[0];
 
-    let n_tof = norm.transmission.shape()[0];
-
-    // Cache `full_image_average` in egui temp data, keyed by the transmission
-    // data pointer.  The transmission is in an Arc so the pointer is stable.
-    let full_avg_cache_id = egui::Id::new("norm_full_avg_cache");
-    let trans_ptr = norm.transmission.as_ptr() as usize;
-    let cached_full_avg: Option<(usize, Vec<f64>)> = ui.data(|d| d.get_temp(full_avg_cache_id));
-    let full_avg = if let Some((ptr, avg)) = cached_full_avg
-        && ptr == trans_ptr
-    {
-        Some(avg)
-    } else {
-        let avg = full_image_average(&norm.transmission);
-        if let Some(ref a) = avg {
-            ui.data_mut(|d| d.insert_temp(full_avg_cache_id, (trans_ptr, a.clone())));
-        }
-        avg
-    };
-
-    // Compute averaged spectrum based on data source
     let spectrum: Vec<f64> = match state.normalize_spectrum_source {
-        SpectrumDataSource::FullImage => match full_avg {
-            Some(ref avg) => avg.clone(),
-            None => {
-                ui.label("(empty spatial dimensions)");
-                return;
+        SpectrumDataSource::FullImage => {
+            match sample.mean_axis(Axis(2)).and_then(|a| a.mean_axis(Axis(1))) {
+                Some(a) => a.to_vec(),
+                None => {
+                    ui.label("(empty spatial dimensions)");
+                    return;
+                }
             }
-        },
+        }
         SpectrumDataSource::RoiAverage => {
             if let Some(roi) = state.bounding_roi() {
-                match nereids_io::normalization::average_roi(
-                    &norm.transmission,
+                match nereids_io::pixels::average_roi(
+                    sample,
                     roi.y_start..roi.y_end,
                     roi.x_start..roi.x_end,
                 ) {
-                    Ok(avg) => avg.to_vec(),
+                    Ok(a) => a.to_vec(),
                     Err(_) => {
                         ui.label("Invalid ROI \u{2014} using full image.");
-                        match full_avg {
-                            Some(ref avg) => avg.clone(),
-                            None => {
-                                ui.label("(empty spatial dimensions)");
-                                return;
-                            }
-                        }
+                        return;
                     }
                 }
             } else {
                 ui.label("No ROI set \u{2014} showing full image average.");
-                match full_avg {
-                    Some(ref avg) => avg.clone(),
-                    None => {
-                        ui.label("(empty spatial dimensions)");
-                        return;
-                    }
-                }
+                return;
             }
         }
     };
 
-    // Build x-axis values and label, respecting spectrum_unit and spectrum_kind.
     let Some((x_values, x_label)) = design::build_spectrum_x_axis(&design::SpectrumXAxisParams {
         axis: state.normalize_spectrum_axis,
         energies: state.energies.as_deref(),
@@ -333,21 +190,19 @@ fn preview_spectrum_panel(ui: &mut egui::Ui, state: &mut AppState) {
     }
 
     let points: PlotPoints = (0..n_plot).map(|i| [x_values[i], spectrum[i]]).collect();
-    let line = Line::new("Transmission", points);
+    let line = Line::new("Counts", points);
 
-    // TOF marker line
     let tof_marker_x = x_values
         .get(state.tof_slice_index.min(n_plot.saturating_sub(1)))
         .copied();
 
-    Plot::new("normalize_spectrum_plot")
+    Plot::new("prepare_spectrum_plot")
         .x_axis_label(x_label)
-        .y_axis_label("Transmission")
+        .y_axis_label("Counts")
         .legend(egui_plot::Legend::default())
         .show(ui, |plot_ui| {
             plot_ui.line(line);
 
-            // Current TOF position marker
             if let Some(x) = tof_marker_x {
                 plot_ui.vline(
                     VLine::new("TOF position", x)
@@ -356,429 +211,100 @@ fn preview_spectrum_panel(ui: &mut egui::Ui, state: &mut AppState) {
                 );
             }
 
-            // Resonance dip markers (energy axis only)
             if state.show_resonance_dips && state.normalize_spectrum_axis == SpectrumAxis::EnergyEv
             {
-                let mut all_rd: Vec<nereids_endf::resonance::ResonanceData> = state
-                    .isotope_entries
-                    .iter()
-                    .filter(|e| e.enabled && e.resonance_data.is_some())
-                    .filter_map(|e| e.resonance_data.clone())
-                    .collect();
-                for g in &state.isotope_groups {
-                    if g.enabled && g.overall_status() == EndfStatus::Loaded {
-                        for m in &g.members {
-                            if let Some(rd) = &m.resonance_data {
-                                all_rd.push(rd.clone());
-                            }
-                        }
-                    }
-                }
+                let all_rd = resonance_data(state);
                 design::draw_resonance_dips(plot_ui, &all_rd, &x_values);
             }
         });
 }
 
-// ---- Analysis Mode Card ----
-
-fn analysis_mode_card(ui: &mut egui::Ui, state: &mut AppState) {
-    design::card_with_header(ui, "Analysis Mode", None, |ui| {
-        ui.horizontal(|ui| {
-            // Full Spatial Map
-            let is_spatial = state.analysis_mode == AnalysisMode::FullSpatialMap;
-            if ui.radio(is_spatial, "Full Spatial Map").clicked() {
-                state.analysis_mode = AnalysisMode::FullSpatialMap;
-            }
-            ui.label(
-                egui::RichText::new("Fit every pixel independently.")
-                    .small()
-                    .weak(),
-            );
-
-            ui.add_space(16.0);
-
-            // ROI Single Spectrum
-            let is_roi = state.analysis_mode == AnalysisMode::RoiSingleSpectrum;
-            if ui.radio(is_roi, "ROI \u{2192} Single Spectrum").clicked() {
-                state.analysis_mode = AnalysisMode::RoiSingleSpectrum;
-            }
-            ui.label(egui::RichText::new("Average ROI, fit once.").small().weak());
-
-            ui.add_space(16.0);
-
-            // Spatial Binning
-            let is_binning = matches!(state.analysis_mode, AnalysisMode::SpatialBinning(_));
-            if ui.radio(is_binning, "Spatial Binning").clicked() && !is_binning {
-                state.analysis_mode = AnalysisMode::SpatialBinning(2);
-            }
-            if is_binning {
-                let mut bin_size = match state.analysis_mode {
-                    AnalysisMode::SpatialBinning(n) => n,
-                    _ => 2,
-                };
-                egui::ComboBox::from_id_salt("bin_size")
-                    .selected_text(format!("{}x{}", bin_size, bin_size))
-                    .width(50.0)
-                    .show_ui(ui, |ui| {
-                        for &n in &[2u8, 4, 8] {
-                            ui.selectable_value(&mut bin_size, n, format!("{}x{}", n, n));
-                        }
-                    });
-                state.analysis_mode = AnalysisMode::SpatialBinning(bin_size);
-            } else {
-                ui.label(egui::RichText::new("Bin NxN, fit map.").small().weak());
-            }
-        });
-    });
-}
-
-// ---- Normalization Logic (unchanged from Phase 2a) ----
-
-/// Standard normalization: sample + open beam → transmission.
-///
-/// Public within the crate so the pipeline executor can call it for TiffPair
-/// re-runs without going through the UI.
-pub(crate) fn normalize_data(state: &mut AppState) {
-    state.cancel_pending_tasks();
-    state.pixel_fit_result = None;
-    state.spatial_result = None;
-
-    // Clone Arcs (O(1)) so no field borrow is held across the
-    // set_detected_dead_pixels(&mut self) call below.
-    let sample = match state.sample_data {
-        Some(ref d) => Arc::clone(d),
-        None => return,
-    };
-    let open_beam = match state.open_beam_data {
-        Some(ref d) => Arc::clone(d),
-        None => return,
-    };
-
-    let params = nereids_io::normalization::NormalizationParams {
-        proton_charge_sample: state.proton_charge_sample,
-        proton_charge_ob: state.proton_charge_ob,
-    };
-
-    match nereids_io::normalization::normalize(&sample, &open_beam, &params, None) {
-        Ok(norm) => {
-            // Pipeline-integrity mask: dead ∪ hot over BOTH stacks — a pixel
-            // dead or railed only in the open-beam run still corrupts every
-            // transmission ratio computed from it (#643).  The effective
-            // mask is recomputed from scratch (declared ∪ detected) via the
-            // single AppState helper — see set_detected_dead_pixels (#646).
-            // TIFF stacks carry no declared mask, so this is normally the
-            // detected mask alone.
-            let (mask_notice, mask_err) = match nereids_io::normalization::detect_bad_pixels(
-                &sample,
-                Some(open_beam.as_ref()),
-                Some(nereids_io::normalization::HOT_PIXEL_K_MAD),
-            ) {
-                Ok(mask) => (state.set_detected_dead_pixels(Some(mask)), None),
-                // Unreachable in practice: normalize() above already validated
-                // both stacks finite/non-negative and shape-equal; fall back
-                // to the declared component rather than keep a stale
-                // detection if that invariant ever breaks.
-                Err(e) => (state.set_detected_dead_pixels(None), Some(e)),
-            };
-            // A declared-mask drop (geometry mismatch) is RETURNED by the
-            // setter, not logged inside it (#646 F1 — restore must defer
-            // it past its provenance replacement).  Here the provenance
-            // log is stable: surface it immediately.
-            if let Some(notice) = mask_notice {
-                state.log_provenance(ProvenanceEventKind::ConfigChanged, notice);
-            }
-
-            let n_tof = sample.shape()[0];
-            match compute_energies(state, n_tof) {
-                Ok(energies) => state.energies = Some(energies),
-                Err(e) => {
-                    state.normalized = None;
-                    state.energies = None;
-                    state.status_message = format!("Energy conversion: {}", e);
-                    return;
+fn resonance_data(state: &AppState) -> Vec<nereids_endf::resonance::ResonanceData> {
+    let mut all = Vec::new();
+    for e in &state.isotope_entries {
+        if e.enabled
+            && let Some(rd) = &e.resonance_data
+        {
+            all.push(rd.clone());
+        }
+    }
+    for g in &state.isotope_groups {
+        if g.enabled && g.overall_status() == EndfStatus::Loaded {
+            for m in &g.members {
+                if let Some(rd) = &m.resonance_data {
+                    all.push(rd.clone());
                 }
             }
-
-            state.normalized = Some(Arc::new(norm));
-            state.uncertainty_is_estimated = false; // real counting statistics
-            state.log_provenance(
-                ProvenanceEventKind::Normalized,
-                "Normalization complete (Method 2)",
-            );
-            // Compose the mask failure into the final status — a plain
-            // "Normalization complete" would silently swallow it.
-            state.status_message = match mask_err {
-                None => "Normalization complete".into(),
-                Some(e) => format!(
-                    "Normalization complete — pixel-mask detection failed \
-                     ({}), no pixel mask applied",
-                    e
-                ),
-            };
-        }
-        Err(e) => {
-            state.status_message = format!("Normalization error: {}", e);
         }
     }
+    all
 }
 
-/// Wrap the sample stack as transmission with uniform σ = 1 (no open beam).
-///
-/// Serves TransmissionTiff (pre-normalized transmission read from file)
-/// and the HDF5 modes (`Hdf5Histogram` / `Hdf5Event` — raw counts) when no
-/// open beam is loaded.  Called automatically when data is ready but not
-/// yet wrapped as `NormalizedData`.  Idempotent — does nothing if already
-/// prepared.
-pub(crate) fn prepare_transmission(state: &mut AppState) {
+/// Build the energy grid and pixel mask for the loaded counts.
+pub(crate) fn prepare_counts(state: &mut AppState) {
     state.cancel_pending_tasks();
-    state.pixel_fit_result = None;
-    state.spatial_result = None;
 
     let sample = match state.sample_data {
-        Some(ref d) => (**d).clone(),
-        None => return,
-    };
-
-    // Only clear dead pixels for TransmissionTiff (TIFFs carry no declared
-    // mask) — HDF5 modes keep the file-declared mask installed at load time.
-    if state.input_mode == InputMode::TransmissionTiff {
-        state.dead_pixels = None;
-        state.file_dead_pixels = None;
-        // No detection ever runs for TransmissionTiff (see below), so the
-        // component would otherwise stay stale from a previous mode.
-        state.detected_dead_pixels = None;
-    }
-
-    // Pipeline-integrity mask (#643, #646 review R3 F2): the HDF5 modes
-    // reach this path with RAW counts — histogram datasets are read
-    // verbatim, events are histogrammed at +1 per event (unweighted), and
-    // the optional rebin SUMS adjacent TOF bins — exactly the raw-counts
-    // precondition of detect_bad_pixels, applied to the sample stack alone
-    // (no open beam exists on this path).  TransmissionTiff data is a
-    // pre-normalized transmission RATIO, not raw counts: the hot screen's
-    // Poisson floor assumes Var[N] = N and would be silently distorted,
-    // and an all-zero "dead" test on ratios conflates opaque scene with a
-    // dead detector — so no detection runs for that mode.
-    let (mask_notice, mask_err) = match state.input_mode {
-        InputMode::Hdf5Histogram | InputMode::Hdf5Event => {
-            match nereids_io::normalization::detect_bad_pixels(
-                &sample,
-                None,
-                Some(nereids_io::normalization::HOT_PIXEL_K_MAD),
-            ) {
-                // Effective mask recomputed from scratch as
-                // declared ∪ detected — see set_detected_dead_pixels.
-                Ok(detected) => (state.set_detected_dead_pixels(Some(detected)), None),
-                // These stacks are not pre-validated by normalize():
-                // negative/non-finite HDF5 values are rejected by
-                // detect_bad_pixels.  Fall back to the file-declared mask
-                // alone (never a stale detection) and surface the failure
-                // in the final status.
-                Err(e) => (state.set_detected_dead_pixels(None), Some(e)),
-            }
-        }
-        _ => (None, None),
-    };
-    // Surface a declared-mask drop immediately (#646 F1) — see
-    // normalize_data above for why the setter returns it instead of
-    // logging.
-    if let Some(notice) = mask_notice {
-        state.log_provenance(ProvenanceEventKind::ConfigChanged, notice);
-    }
-
-    let n_tof = sample.shape()[0];
-    // Uniform uncertainty: σ = 1 for all bins.
-    //
-    // TransmissionTiff mode has no open-beam data, so true per-bin
-    // Poisson uncertainty is unknown. Using uniform weights ensures the
-    // fitter treats all bins equally — no fabricated weighting pattern
-    // that could bias fitted densities toward specific spectral features.
-    //
-    // Consequence: chi-squared values are not physically meaningful
-    // (they reflect residuals in transmission units, not statistical
-    // significance). The GUI marks them as "(approx.)" via
-    // `uncertainty_is_estimated`.
-    //
-    // For rigorous uncertainty-weighted fitting, provide sample +
-    // open-beam data via the TiffPair workflow.
-    let uncertainty = ndarray::Array3::from_elem(sample.raw_dim(), 1.0);
-
-    match compute_energies(state, n_tof) {
-        Ok(energies) => state.energies = Some(energies),
-        Err(e) => {
-            state.status_message = format!("Energy conversion: {}", e);
-            return;
-        }
-    }
-
-    state.normalized = Some(Arc::new(nereids_io::normalization::NormalizedData {
-        transmission: sample,
-        uncertainty,
-    }));
-    state.uncertainty_is_estimated = true;
-    state.log_provenance(
-        ProvenanceEventKind::Normalized,
-        "Transmission data prepared (uniform σ=1 — no open-beam data)",
-    );
-    // Compose the mask failure into the final status — a plain "ready"
-    // would silently swallow it (same rationale as normalize_data above).
-    state.status_message = match mask_err {
-        None => "Transmission ready (uniform weighting — chi² is approximate)".into(),
-        Some(e) => format!(
-            "Transmission ready (uniform weighting — chi² is approximate) — \
-             pixel-mask detection failed ({}), detected mask not applied",
-            e
-        ),
-    };
-}
-
-/// Normalize HDF5 counts with open beam: T = sample / open_beam.
-/// Uses real counting statistics for uncertainty.
-pub(crate) fn normalize_hdf5_with_ob(state: &mut AppState) {
-    state.cancel_pending_tasks();
-    state.pixel_fit_result = None;
-    state.spatial_result = None;
-
-    // Clone Arcs (O(1)) to avoid deep-cloning multi-GB arrays.
-    let sample_arc = match state.sample_data {
         Some(ref d) => Arc::clone(d),
         None => return,
     };
-    let ob_arc = match state.open_beam_data {
-        Some(ref d) => Arc::clone(d),
-        None => return,
-    };
+    let open_beam = state.open_beam_data.as_ref().map(Arc::clone);
 
-    if sample_arc.shape() != ob_arc.shape() {
-        state.status_message = format!(
-            "Shape mismatch: sample {:?} vs OB {:?}",
-            sample_arc.shape(),
-            ob_arc.shape()
-        );
-        // Clear OB to break the infinite retry loop — the caller checks
-        // `open_beam_data.is_some()` and will route to `prepare_transmission`.
-        state.open_beam_data = None;
-        state.hdf5_ob_path = None;
+    if state.input_mode == InputMode::TiffPair && open_beam.is_none() {
+        state.status_message = "Load an open-beam stack to prepare counts".into();
         return;
     }
 
-    let n_tof = sample_arc.shape()[0];
-
-    // Normalization: T = sample / OB
-    //
-    // Uncertainty uses the same absolute-error formula as the canonical
-    // nereids_io::normalization::normalize():
-    //
-    //   σ_T = (1/c_o) · √(c_s_eff + c_s²/c_o)
-    //
-    // where c_s_eff = max(c_s, 0.5) is a Bayesian floor (Jeffreys prior)
-    // ensuring σ > 0 even when sample counts are zero.  This prevents
-    // infinite LM weights at T=0 bins.  No proton charge correction is
-    // applied (HDF5 path does not carry proton charges; pc_ratio = 1.0).
-    //
-    // When OB ≤ 0: T=0, σ=∞ (invalid bin, effectively masked by solver).
-    let mut transmission = Array3::zeros(sample_arc.raw_dim());
-    let mut uncertainty = Array3::zeros(sample_arc.raw_dim());
-    ndarray::Zip::from(&mut transmission)
-        .and(&mut uncertainty)
-        .and(&*sample_arc)
-        .and(&*ob_arc)
-        .for_each(|t, u, &s, &ob| {
-            let c_s = s.max(0.0);
-            let c_o = ob.max(0.0);
-            if c_o > 0.0 {
-                *t = c_s / c_o;
-                // Absolute-error form: σ > 0 even at T=0 via Bayesian floor.
-                let c_s_eff = if c_s > 0.0 { c_s } else { 0.5 };
-                let abs_var = (1.0 / c_o).powi(2) * (c_s_eff + c_s * c_s / c_o);
-                *u = abs_var.sqrt();
-            } else {
-                *t = 0.0;
-                *u = f64::INFINITY;
-            }
-        });
-
-    // Pipeline-integrity mask: dead ∪ hot over BOTH stacks, same as the
-    // TIFF-pair path (#643).  HDF5 files may also carry their own declared
-    // mask (kept in state.file_dead_pixels since load time); the effective
-    // mask is recomputed FROM SCRATCH as declared ∪ freshly-detected via
-    // the single AppState helper — never unioned into the previous
-    // dead_pixels, which after an open-beam swap still holds the previous
-    // run's detection and would accumulate stale flags monotonically
-    // (#646).  See set_detected_dead_pixels for the full semantics.
-    let (mask_notice, mask_err) = match nereids_io::normalization::detect_bad_pixels(
-        &sample_arc,
-        Some(ob_arc.as_ref()),
-        Some(nereids_io::normalization::HOT_PIXEL_K_MAD),
-    ) {
-        Ok(detected) => (state.set_detected_dead_pixels(Some(detected)), None),
-        // Unlike the TIFF path, these stacks are not pre-validated by
-        // normalize(): negative/non-finite HDF5 values are clamped by the
-        // transmission loop above but rejected by detect_bad_pixels.  Fall
-        // back to the file-declared mask alone (never a stale detection)
-        // and surface the failure in the final status.
-        Err(e) => (state.set_detected_dead_pixels(None), Some(e)),
-    };
-    // Surface a declared-mask drop immediately (#646 F1) — see
-    // normalize_data above for why the setter returns it instead of
-    // logging.
-    if let Some(notice) = mask_notice {
-        state.log_provenance(ProvenanceEventKind::ConfigChanged, notice);
-    }
-
+    let n_tof = sample.shape()[0];
     match compute_energies(state, n_tof) {
         Ok(energies) => state.energies = Some(energies),
         Err(e) => {
-            state.status_message = format!("Energy conversion: {}", e);
+            state.energies = None;
+            state.status_message = format!("Energy conversion: {e}");
             return;
         }
     }
 
-    state.normalized = Some(Arc::new(nereids_io::normalization::NormalizedData {
-        transmission,
-        uncertainty,
-    }));
-    state.uncertainty_is_estimated = false; // real counting statistics
+    match nereids_io::pixels::detect_bad_pixels(
+        &sample,
+        open_beam.as_deref(),
+        Some(nereids_io::pixels::HOT_PIXEL_K_MAD),
+    ) {
+        Ok(mask) => {
+            if let Some(notice) = state.set_detected_dead_pixels(Some(mask)) {
+                state.log_provenance(ProvenanceEventKind::ConfigChanged, notice);
+            }
+        }
+        Err(e) => {
+            let _ = state.set_detected_dead_pixels(None);
+            state.status_message = format!("Pixel-mask detection failed: {e}");
+            return;
+        }
+    }
+
     state.log_provenance(
         ProvenanceEventKind::Normalized,
-        "HDF5 normalized with open beam (T = sample/OB)",
+        "Counts prepared (energy grid + pixel mask)",
     );
-    // Compose the mask failure into the final status so it is not
-    // silently overwritten (same rationale as normalize_data above).
-    state.status_message = match mask_err {
-        None => "Normalized with open beam — counts-domain fitting available".into(),
-        Some(e) => format!(
-            "Normalized with open beam — pixel-mask detection failed ({}), \
-             detected mask not applied",
-            e
-        ),
-    };
+    state.status_message = "Counts prepared — counts-KL fit engine re-point pending".into();
 }
 
 /// Compute energy bin centers from the spectrum file loaded in state.
-///
-/// Uses the spectrum file values and unit/kind settings from state.
-/// Returns an error if no spectrum file is loaded — a real instrument
-/// spectrum is required for meaningful energy calibration.  Silently
-/// fabricating a synthetic linear TOF axis would place resonance
-/// positions at wrong energies, producing unphysical fit results.
 fn compute_energies(state: &AppState, n_tof: usize) -> Result<Vec<f64>, String> {
     let values = state.spectrum_values.as_ref().ok_or_else(|| {
         "No spectrum file loaded — a spectrum file is required to define \
          the energy axis. Load a spectrum file in the Load step before \
-         proceeding to normalization."
+         proceeding."
             .to_string()
     })?;
 
     let energies = match (state.spectrum_unit, state.spectrum_kind) {
         (SpectrumUnit::TofMicroseconds, SpectrumValueKind::BinEdges) => {
-            // TOF edges → energy centers via geometric mean
             nereids_io::tof::tof_edges_to_energy_centers(values, &state.beamline)
                 .map(|a| a.to_vec())
-                .map_err(|e| format!("{}", e))?
+                .map_err(|e| format!("{e}"))?
         }
         (SpectrumUnit::TofMicroseconds, SpectrumValueKind::BinCenters) => {
-            // Convert each TOF center to energy directly
             if !state.beamline.flight_path_m.is_finite() || state.beamline.flight_path_m <= 0.0 {
                 return Err("Flight path must be positive and finite".into());
             }
@@ -788,8 +314,8 @@ fn compute_energies(state: &AppState, n_tof: usize) -> Result<Vec<f64>, String> 
                     let corrected = tof - state.beamline.delay_us;
                     if corrected <= 0.0 || !corrected.is_finite() {
                         return Err(format!(
-                            "TOF {:.2} \u{03bc}s - delay {:.2} \u{03bc}s = {:.2} \u{03bc}s is not positive",
-                            tof, state.beamline.delay_us, corrected
+                            "TOF {tof:.2} \u{03bc}s - delay {:.2} \u{03bc}s = {corrected:.2} \u{03bc}s is not positive",
+                            state.beamline.delay_us
                         ));
                     }
                     Ok(nereids_core::constants::tof_to_energy(
@@ -798,19 +324,16 @@ fn compute_energies(state: &AppState, n_tof: usize) -> Result<Vec<f64>, String> 
                     ))
                 })
                 .collect::<Result<Vec<f64>, String>>()?;
-            // TOF ascending → energy descending, so reverse
             energies.reverse();
             energies
         }
         (SpectrumUnit::EnergyEv, SpectrumValueKind::BinEdges) => {
-            // Energy edges → geometric mean centers
             if values.iter().any(|&v| v <= 0.0) {
                 return Err("Energy bin edges must be positive for geometric mean".into());
             }
             values.windows(2).map(|w| (w[0] * w[1]).sqrt()).collect()
         }
         (SpectrumUnit::EnergyEv, SpectrumValueKind::BinCenters) => {
-            // Direct: energy centers
             if values.iter().any(|&v| v <= 0.0) {
                 return Err("Energy bin centers must be positive".into());
             }

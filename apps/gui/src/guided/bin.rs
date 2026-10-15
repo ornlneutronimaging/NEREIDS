@@ -151,7 +151,7 @@ fn histogram_events(state: &mut AppState) {
                 }
             }
 
-            // Declared-mask provenance (#646) — same contract as the
+            // Declared-mask provenance — same contract as the
             // histogram load site (guided::load::load_hdf5_histogram): the
             // file-declared mask is assigned unconditionally to its own
             // field, and normalization recomputes the effective mask via

@@ -27,37 +27,19 @@ pub fn landing_step(ui: &mut egui::Ui, state: &mut AppState) {
         let avail = ui.available_width();
         let max_grid = 900.0_f32.min(avail);
 
-        let cards: [(GuidedStep, &str, &str, &str); 3] = [
-            (
-                GuidedStep::Wizard,
-                "\u{1F4C8}", // 📈
-                "Load & Fit Data",
-                "Import neutron transmission data and fit isotope \
-                 densities. Supports events, histograms, and \
-                 pre-normalized formats.",
-            ),
-            (
-                GuidedStep::ForwardModel,
-                "\u{21A6}", // ↦
-                "Forward Model",
-                "Explore theoretical transmission spectra for any combination \
-                 of isotopes and densities. No data required.",
-            ),
-            (
-                GuidedStep::Detectability,
-                "\u{2605}", // ★
-                "Detectability",
-                "Assess whether trace isotopes are detectable in a \
-                 given matrix before running an experiment. \
-                 Helps plan beamtime allocation.",
-            ),
-        ];
+        let cards: [(GuidedStep, &str, &str, &str); 1] = [(
+            GuidedStep::Wizard,
+            "\u{1F4C8}", // 📈
+            "Load & Fit Data",
+            "Import raw sample and open-beam counts and configure an \
+             isotope fit.",
+        )];
 
-        // Use a fixed-width sub-UI so columns divide evenly
+        // Use a fixed-width sub-UI so the card is centered.
         ui.allocate_ui(egui::vec2(max_grid, 0.0), |ui| {
-            ui.columns(3, |cols| {
-                for (i, (target, icon, title, desc)) in cards.iter().enumerate() {
-                    let clicked = landing_card(&mut cols[i], &tc, icon, title, desc);
+            ui.columns(1, |cols| {
+                for (target, icon, title, desc) in cards.iter() {
+                    let clicked = landing_card(&mut cols[0], &tc, icon, title, desc);
                     if clicked {
                         if *target == GuidedStep::Wizard {
                             state.wizard_step = 0;
@@ -87,7 +69,6 @@ pub fn landing_step(ui: &mut egui::Ui, state: &mut AppState) {
                 let data = match state.data_type {
                     Some(crate::state::DataType::Events) => "Events",
                     Some(crate::state::DataType::PreNormalized) => "Pre-norm",
-                    Some(crate::state::DataType::Transmission) => "Transmission",
                     None => "Unknown",
                 };
                 let n_iso = state

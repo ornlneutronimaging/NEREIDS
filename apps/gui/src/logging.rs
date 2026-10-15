@@ -1,6 +1,6 @@
 //! File-based tracing setup + log-path helpers for the desktop GUI.
 //!
-//! Logs land in a per-OS user data directory (issue #524):
+//! Logs land in a per-OS user data directory
 //! - macOS:   `~/Library/Application Support/NEREIDS/logs/`
 //! - Linux:   `~/.local/share/NEREIDS/logs/` (honours `$XDG_DATA_HOME`)
 //! - Windows: `%APPDATA%\NEREIDS\logs\`

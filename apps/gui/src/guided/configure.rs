@@ -1,6 +1,6 @@
 //! Step 2: Configuration — beamline parameters, isotope selection, ENDF fetch.
 
-use crate::state::{AppState, EndfStatus, FetchTarget, GuidedStep, PeriodicTableTarget};
+use crate::state::{AppState, EndfStatus, PeriodicTableTarget};
 use crate::widgets::design::{self, ChipAction, NavAction};
 use nereids_endf::retrieval::EndfLibrary;
 use std::sync::Arc;
@@ -8,19 +8,11 @@ use std::sync::mpsc;
 
 /// Draw the Configure step content.
 pub fn configure_step(ui: &mut egui::Ui, state: &mut AppState) {
-    // Content header with teleport pill
-    ui.horizontal(|ui| {
-        ui.vertical(|ui| {
-            design::content_header(
-                ui,
-                "Configure",
-                "Set beamline parameters and select isotopes",
-            );
-        });
-        ui.with_layout(egui::Layout::right_to_left(egui::Align::Min), |ui| {
-            design::teleport_pill(ui, "Forward Model →", GuidedStep::ForwardModel, state);
-        });
-    });
+    design::content_header(
+        ui,
+        "Configure",
+        "Set beamline parameters and select isotopes",
+    );
 
     // --- Beamline Parameters card ---
     design::card_with_header(ui, "Beamline Parameters", None, |ui| {
@@ -36,10 +28,7 @@ pub fn configure_step(ui: &mut egui::Ui, state: &mut AppState) {
                         .speed(0.1),
                 );
                 if state.beamline.flight_path_m != prev_flight_path {
-                    // Flight path parameterizes the resolution function and
-                    // the TOF→energy axis: treat it like the other
-                    // resolution-change paths and drop analysis outputs
-                    // (cancelling any in-flight spatial worker).
+                    // Flight path parameterizes the TOF→energy axis.
                     state.invalidate_analysis_outputs();
                 }
                 ui.label("Delay (μs):");
@@ -73,25 +62,6 @@ pub fn configure_step(ui: &mut egui::Ui, state: &mut AppState) {
                 ui.end_row();
             });
     });
-
-    // --- Instrument Resolution card ---
-    // File picks route through the dispatcher, which mirrors this
-    // invalidation (see `file_dialog::on_resolution_file_picked`).
-    let res = design::resolution_card(
-        ui,
-        &mut state.resolution_enabled,
-        &mut state.resolution_mode,
-        state.beamline.flight_path_m,
-        &mut state.file_dialogs,
-        crate::file_dialog::ResolutionTarget::Configure,
-    );
-    if res.changed {
-        // Full analysis invalidation, matching the solver-method path: a
-        // resolution change also obsoletes any in-flight spatial worker
-        // (cancelled via its dedicated token) and the ancillary outputs
-        // (feedback, export status, residuals, fitting ROIs).
-        state.invalidate_analysis_outputs();
-    }
 
     // --- Isotopes card ---
     // Custom header: title left, library ComboBox right
@@ -150,28 +120,17 @@ pub fn configure_step(ui: &mut egui::Ui, state: &mut AppState) {
                     m.endf_status = EndfStatus::Pending;
                 }
             }
-            state.spatial_result = None;
-            state.pixel_fit_result = None;
         }
 
         ui.add_space(8.0);
 
         // Isotope chips
-        let chip_result = isotope_chips_flow(ui, state);
-        if chip_result.changed {
-            state.spatial_result = None;
-            state.pixel_fit_result = None;
-        }
+        isotope_chips_flow(ui, state);
 
         ui.add_space(6.0);
 
-        // Add buttons (disabled during fetch). The local-install button also
-        // touches the shared on-disk cache, so it's gated on every ENDF fetch
-        // flag — not just Configure's — to keep manual writes from racing the
-        // Forward Model or Detectability workers reading/writing the same
-        // cache slot.
-        let any_fetch_active =
-            state.is_fetching_endf || state.is_fetching_fm_endf || state.is_fetching_detect_endf;
+        // The local-install button touches the shared on-disk ENDF cache.
+        let any_fetch_active = state.is_fetching_endf;
         ui.add_enabled_ui(!state.is_fetching_endf, |ui| {
             ui.horizontal(|ui| {
                 if ui.button("Add Isotope...").clicked() {
@@ -299,11 +258,7 @@ pub fn configure_step(ui: &mut egui::Ui, state: &mut AppState) {
 // Isotope chips flow
 // ---------------------------------------------------------------------------
 
-struct ChipFlowResult {
-    changed: bool,
-}
-
-fn isotope_chips_flow(ui: &mut egui::Ui, state: &mut AppState) -> ChipFlowResult {
+fn isotope_chips_flow(ui: &mut egui::Ui, state: &mut AppState) -> bool {
     let mut to_remove = None;
     let mut group_to_remove = None;
     let mut changed = false;
@@ -398,7 +353,7 @@ fn isotope_chips_flow(ui: &mut egui::Ui, state: &mut AppState) -> ChipFlowResult
         state.editing_isotope_density = Some(0);
     }
 
-    ChipFlowResult { changed }
+    changed
 }
 
 // ---------------------------------------------------------------------------
@@ -488,7 +443,6 @@ fn fetch_endf_data(state: &mut AppState) {
             work.push(design::EndfWorkItem {
                 z: entry.z,
                 a: entry.a,
-                target: FetchTarget::Configure,
                 isotope,
                 symbol: entry.symbol.clone(),
                 library: state.endf_library,
@@ -528,7 +482,6 @@ fn fetch_endf_data(state: &mut AppState) {
             work.push(design::EndfWorkItem {
                 z: group.z,
                 a: member.a,
-                target: FetchTarget::Configure,
                 isotope,
                 symbol: member.symbol.clone(),
                 library: state.endf_library,
@@ -632,7 +585,7 @@ fn mark_isotope_pending(state: &mut AppState, z: u32, a: u32) {
 
 /// Render the offline-fallback hint that lists the exact cache-file path for
 /// every Failed isotope under the active library, so users can `cp` a
-/// manually-downloaded ENDF straight into place (issue #523). Paths come from
+/// manually-downloaded ENDF straight into place (). Paths come from
 /// the free `default_cache_file_path` helper to avoid the per-frame
 /// `EndfRetriever::new()` cost that would otherwise build a reqwest client +
 /// TLS context just to read the cache layout.
@@ -694,7 +647,7 @@ fn install_local_endf_dialog(state: &mut AppState) {
     );
 }
 
-/// Manual ENDF upload escape hatch (issue #523): install a local
+/// Manual ENDF upload escape hatch (): install a local
 /// `.endf`/`.zip` into the cache for whichever already-added isotope it
 /// describes. The retriever's `peek_local_endf` reads, extracts, and
 /// parses the file exactly once to discover its (Z, A); we then look

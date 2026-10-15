@@ -2,8 +2,7 @@
 
 use crate::guided;
 use crate::state::{
-    AppState, EndfStatus, FetchTarget, GuidedStep, ProvenanceEventKind, SaveDataMode, SessionCache,
-    Tab, UiMode,
+    AppState, EndfStatus, GuidedStep, ProvenanceEventKind, SaveDataMode, SessionCache, UiMode,
 };
 use crate::studio;
 use crate::theme;
@@ -128,21 +127,16 @@ impl eframe::App for NereidsApp {
         // Keep repainting while background work is in progress.
         // Fitting also has a dedicated watcher thread that pokes via
         // ctx.request_repaint(), but we keep the timer as a fallback.
-        if self.state.is_fitting
-            || self.state.is_fetching_endf
-            || self.state.is_fetching_fm_endf
-            || self.state.is_fetching_detect_endf
-            || self.state.is_saving
-        {
+        if self.state.is_fitting || self.state.is_fetching_endf || self.state.is_saving {
             ctx.request_repaint_after(std::time::Duration::from_millis(100));
         }
 
         // Cmd+S / Ctrl+S — save project
-        if ctx.input(|i| i.modifiers.command && i.key_pressed(egui::Key::S)) {
-            let has_results = self.state.spatial_result.is_some();
-            if has_results && !self.state.is_saving {
-                crate::project::save_project_quick(&mut self.state);
-            }
+        if ctx.input(|i| i.modifiers.command && i.key_pressed(egui::Key::S))
+            && self.state.sample_data.is_some()
+            && !self.state.is_saving
+        {
+            crate::project::save_project_quick(&mut self.state);
         }
 
         // Cmd+O / Ctrl+O — open project. Gated on no dialog being open:
@@ -227,73 +221,6 @@ impl eframe::App for NereidsApp {
 
 /// Poll background task channels and apply results to state.
 fn poll_pending_tasks(state: &mut AppState) {
-    // Poll spatial map result
-    if let Some(ref rx) = state.pending_spatial {
-        match rx.try_recv() {
-            Ok(Ok(result)) => {
-                tracing::info!(
-                    converged = result.n_converged,
-                    total = result.n_total,
-                    warnings = result.warnings.len(),
-                    "spatial map completed"
-                );
-                // Surface pipeline warnings (#635, e.g. the degenerate
-                // normalization trio) in the status bar — the motivating
-                // silent failure (T -> 4471 K, chi2/nu 932) was a SPATIAL
-                // run, and the engine's stderr print never reaches desktop
-                // GUI users.  The full text renders with the spatial result
-                // (convergence summary panel).
-                state.status_message = if result.warnings.is_empty() {
-                    format!(
-                        "Spatial map: {}/{} converged",
-                        result.n_converged, result.n_total
-                    )
-                } else {
-                    format!(
-                        "Spatial map: {}/{} converged — \u{26A0} {} configuration warning(s), see Analyze panel",
-                        result.n_converged,
-                        result.n_total,
-                        result.warnings.len()
-                    )
-                };
-                state.log_provenance(
-                    ProvenanceEventKind::AnalysisRun,
-                    format!(
-                        "Spatial mapping: {}/{} converged",
-                        result.n_converged, result.n_total
-                    ),
-                );
-                state.init_tile_display(result.density_maps.len());
-                state.spatial_result = Some(result);
-                state.is_fitting = false;
-                state.fitting_progress = None;
-                state.residuals_cache = None;
-                state.active_tab = Tab::Map;
-                state.pending_spatial = None;
-                state.spatial_cancel_token = None;
-                // Pipeline re-run completed successfully — clear dirty state.
-                state.clear_dirty();
-            }
-            Ok(Err(err_msg)) => {
-                tracing::error!(error = %err_msg, "spatial map failed");
-                state.clear_spatial_fit_output();
-                state.status_message = format!("Spatial map error: {err_msg}");
-                state.is_fitting = false;
-                state.fitting_progress = None;
-                state.pending_spatial = None;
-            }
-            Err(std::sync::mpsc::TryRecvError::Disconnected) => {
-                tracing::error!("spatial map task disconnected without result");
-                state.clear_spatial_fit_output();
-                state.status_message = "Spatial map task failed".into();
-                state.is_fitting = false;
-                state.fitting_progress = None;
-                state.pending_spatial = None;
-            }
-            Err(std::sync::mpsc::TryRecvError::Empty) => {} // Still running
-        }
-    }
-
     // Poll ENDF fetch results (streamed one per isotope, matched by (z, a))
     if let Some(ref rx) = state.pending_endf {
         let mut disconnected = false;
@@ -315,8 +242,6 @@ fn poll_pending_tasks(state: &mut AppState) {
                                 entry.resonance_data = Some(data.clone());
                                 entry.endf_status = EndfStatus::Loaded;
                                 state.status_message = format!("Loaded {}", fetch.symbol);
-                                state.spatial_result = None;
-                                state.pixel_fit_result = None;
                             }
                             Err(msg) => {
                                 // Per-item failures stay at `debug` so a 20-isotope
@@ -340,8 +265,6 @@ fn poll_pending_tasks(state: &mut AppState) {
                                     member.resonance_data = Some(data.clone());
                                     member.endf_status = EndfStatus::Loaded;
                                     state.status_message = format!("Loaded {}", fetch.symbol);
-                                    state.spatial_result = None;
-                                    state.pixel_fit_result = None;
                                 }
                                 Err(msg) => {
                                     tracing::debug!(symbol = %fetch.symbol, error = %msg, "ENDF group-member fetch failed");
@@ -424,180 +347,6 @@ fn poll_pending_tasks(state: &mut AppState) {
         }
     }
 
-    // Poll Forward Model ENDF fetch results (matched by (z, a))
-    if let Some(ref rx) = state.pending_fm_endf {
-        let mut disconnected = false;
-        loop {
-            match rx.try_recv() {
-                Ok(fetch) => {
-                    if let Some(entry) = state
-                        .fm_isotope_entries
-                        .iter_mut()
-                        .find(|e| e.z == fetch.z && e.a == fetch.a)
-                    {
-                        match fetch.result {
-                            Ok(data) => {
-                                entry.resonance_data = Some(data);
-                                entry.endf_status = EndfStatus::Loaded;
-                                state.status_message = format!("FM: loaded {}", fetch.symbol);
-                                state.fm_spectrum = None;
-                                state.fm_per_isotope_spectra.clear();
-                            }
-                            Err(msg) => {
-                                tracing::debug!(symbol = %fetch.symbol, error = %msg, "FM ENDF fetch failed");
-                                entry.endf_status = EndfStatus::Failed;
-                                state.status_message = msg;
-                            }
-                        }
-                    }
-                }
-                Err(std::sync::mpsc::TryRecvError::Empty) => break,
-                Err(std::sync::mpsc::TryRecvError::Disconnected) => {
-                    disconnected = true;
-                    break;
-                }
-            }
-        }
-        if disconnected {
-            if !state
-                .fm_isotope_entries
-                .iter()
-                .any(|e| e.enabled && e.resonance_data.is_none())
-            {
-                state.status_message = "FM: all ENDF data loaded".into();
-            }
-            let failed_fm = state
-                .fm_isotope_entries
-                .iter()
-                .filter(|e| e.enabled && e.endf_status == EndfStatus::Failed)
-                .count();
-            if failed_fm > 0 {
-                tracing::warn!(
-                    failed = failed_fm,
-                    "ENDF batch (forward model) had failures"
-                );
-            }
-            tracing::info!("ENDF batch fetch finished (forward model)");
-            state.is_fetching_fm_endf = false;
-            state.pending_fm_endf = None;
-        }
-    }
-
-    // Poll Detectability ENDF fetch results (matched by (z, a) + FetchTarget)
-    if let Some(ref rx) = state.pending_detect_endf {
-        let mut disconnected = false;
-        loop {
-            match rx.try_recv() {
-                Ok(fetch) => match fetch.target {
-                    FetchTarget::DetectMatrix => {
-                        if let Some(entry) = state
-                            .detect_matrix_entries
-                            .iter_mut()
-                            .find(|e| e.z == fetch.z && e.a == fetch.a)
-                        {
-                            match fetch.result {
-                                Ok(data) => {
-                                    entry.resonance_data = Some(data);
-                                    entry.endf_status = EndfStatus::Loaded;
-                                    state.status_message =
-                                        format!("Detect: loaded matrix {}", fetch.symbol);
-                                }
-                                Err(msg) => {
-                                    tracing::debug!(symbol = %fetch.symbol, error = %msg, "Detect matrix ENDF fetch failed");
-                                    entry.endf_status = EndfStatus::Failed;
-                                    state.status_message = msg;
-                                }
-                            }
-                        }
-                    }
-                    FetchTarget::DetectTrace => {
-                        if let Some(entry) = state
-                            .detect_trace_entries
-                            .iter_mut()
-                            .find(|e| e.z == fetch.z && e.a == fetch.a)
-                        {
-                            match fetch.result {
-                                Ok(data) => {
-                                    entry.resonance_data = Some(data);
-                                    entry.endf_status = EndfStatus::Loaded;
-                                    state.status_message =
-                                        format!("Detect: loaded trace {}", fetch.symbol);
-                                }
-                                Err(msg) => {
-                                    tracing::debug!(symbol = %fetch.symbol, error = %msg, "Detect trace ENDF fetch failed");
-                                    entry.endf_status = EndfStatus::Failed;
-                                    state.status_message = msg;
-                                }
-                            }
-                        }
-                    }
-                    // Configure/ForwardModel results never appear on this channel
-                    _ => {}
-                },
-                Err(std::sync::mpsc::TryRecvError::Empty) => break,
-                Err(std::sync::mpsc::TryRecvError::Disconnected) => {
-                    disconnected = true;
-                    break;
-                }
-            }
-        }
-        if disconnected {
-            let total_traces = state.detect_trace_entries.len();
-            let loaded_traces = state
-                .detect_trace_entries
-                .iter()
-                .filter(|t| t.resonance_data.is_some())
-                .count();
-            let total_matrix = state.detect_matrix_entries.len();
-            let loaded_matrix = state
-                .detect_matrix_entries
-                .iter()
-                .filter(|m| m.resonance_data.is_some())
-                .count();
-
-            if loaded_matrix == total_matrix && loaded_traces == total_traces {
-                state.status_message = "Detect: all ENDF data loaded".into();
-            } else {
-                let mut parts = Vec::new();
-                if loaded_matrix < total_matrix {
-                    let unsupported = total_matrix - loaded_matrix;
-                    parts.push(format!(
-                        "{} of {} matrix isotopes loaded ({} not supported)",
-                        loaded_matrix, total_matrix, unsupported
-                    ));
-                }
-                if loaded_traces < total_traces {
-                    let unsupported = total_traces - loaded_traces;
-                    parts.push(format!(
-                        "{} of {} trace isotopes loaded ({} not supported)",
-                        loaded_traces, total_traces, unsupported
-                    ));
-                }
-                if !parts.is_empty() {
-                    state.status_message = format!("Detect: {}", parts.join("; "));
-                }
-            }
-            let failed_matrix = total_matrix.saturating_sub(loaded_matrix);
-            let failed_traces = total_traces.saturating_sub(loaded_traces);
-            if failed_matrix > 0 || failed_traces > 0 {
-                tracing::warn!(
-                    failed_matrix,
-                    failed_traces,
-                    "ENDF batch (detectability) had failures"
-                );
-            }
-            tracing::info!(
-                matrix_loaded = loaded_matrix,
-                matrix_total = total_matrix,
-                trace_loaded = loaded_traces,
-                trace_total = total_traces,
-                "ENDF batch fetch finished (detectability)"
-            );
-            state.is_fetching_detect_endf = false;
-            state.pending_detect_endf = None;
-        }
-    }
-
     // Poll project save result
     if let Some(ref rx) = state.pending_save {
         match rx.try_recv() {
@@ -635,67 +384,5 @@ fn poll_pending_tasks(state: &mut AppState) {
             }
             Err(std::sync::mpsc::TryRecvError::Empty) => {} // Still saving
         }
-    }
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-    use ndarray::Array2;
-    use nereids_pipeline::spatial::SpatialResult;
-    use std::sync::mpsc;
-
-    fn stale_spatial_result() -> SpatialResult {
-        let map = || Array2::from_elem((1, 1), 9.9);
-        SpatialResult {
-            density_maps: vec![map()],
-            uncertainty_maps: vec![map()],
-            chi_squared_map: map(),
-            deviance_per_dof_map: None,
-            converged_map: Array2::from_elem((1, 1), true),
-            temperature_map: None,
-            temperature_uncertainty_map: None,
-            isotope_labels: vec!["U-238".into()],
-            anorm_map: None,
-            background_maps: None,
-            back_d_map: None,
-            back_f_map: None,
-            t0_us_map: None,
-            l_scale_map: None,
-            energy_scale_flight_path_m: None,
-            baseline_global: None,
-            baseline_e_ref_ev: None,
-            baseline_maps: None,
-            warnings: Vec::new(),
-            n_converged: 1,
-            n_total: 1,
-            n_failed: 0,
-        }
-    }
-
-    #[test]
-    fn spatial_worker_error_clears_stale_map_and_export_state() {
-        let mut state = AppState {
-            spatial_result: Some(stale_spatial_result()),
-            export_status: Some("old export".into()),
-            is_fitting: true,
-            ..Default::default()
-        };
-        let (tx, rx) = mpsc::channel();
-        tx.send(Err("counts-resolution route rejected".into()))
-            .expect("test receiver is live");
-        state.pending_spatial = Some(rx);
-
-        poll_pending_tasks(&mut state);
-
-        assert!(state.spatial_result.is_none());
-        assert!(state.export_status.is_none());
-        assert!(state.pending_spatial.is_none());
-        assert!(!state.is_fitting);
-        assert!(
-            state
-                .status_message
-                .contains("counts-resolution route rejected")
-        );
     }
 }
