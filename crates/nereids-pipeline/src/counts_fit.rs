@@ -39,7 +39,7 @@ pub const NEGLIGIBLE_PREDICTION: f64 = 1e-10;
 
 const SETTLED_OVERDISPERSION: f64 = 0.01;
 
-const MOST_PASSES: usize = 20;
+pub(crate) const MOST_PASSES: usize = 20;
 
 /// The `(low, high)` temperature bounds in K that a fit with a free
 /// temperature uses.
@@ -1725,8 +1725,11 @@ struct Profile {
     gradient: Vec<f64>,
 }
 
-pub(crate) const SHARED: [Role; 9] = [
+pub(crate) const SHARED: [Role; 12] = [
     Role::Normalization,
+    Role::TimeBackground(0),
+    Role::TimeBackground(1),
+    Role::TimeBackground(2),
     Role::T0,
     Role::FlightPath,
     Role::Pulse(0),
@@ -1742,17 +1745,17 @@ pub(crate) fn shared_parameters(
     calibration: &Calibration,
 ) -> Result<Vec<(Value, FitParameter)>, PipelineError> {
     validate_pulse_prior(calibration)?;
-    let (value, name, range, allowed) =
-        quantity(measurement, Role::Normalization).expect("the normalization is a quantity");
+    let mut parameters = Vec::with_capacity(SHARED.len());
+    for &role in &SHARED[..4] {
+        let (value, name, range, allowed) =
+            quantity(measurement, role).expect("the measurement's shared quantity");
+        parameters.push(value.parameter(name, range, &allowed)?);
+    }
+    parameters.extend(calibration.instrument()?);
     let values = quantities(measurement, calibration)
         .filter(|(role, _)| SHARED.contains(role))
         .map(|(_, value)| *value);
-    Ok(values
-        .zip(
-            std::iter::once(value.parameter(name, range, &allowed)?)
-                .chain(calibration.instrument()?),
-        )
-        .collect())
+    Ok(values.zip(parameters).collect())
 }
 
 fn validate_pulse_prior(calibration: &Calibration) -> Result<(), PipelineError> {
@@ -2119,14 +2122,14 @@ fn predicted(rows: &Rows, values: &[f64]) -> Result<Vec<f64>, FittingError> {
         .map_err(|e| FittingError::EvaluationFailed(e.to_string()))
 }
 
-fn starts_and_widths_us(time_edges_us: &[f64]) -> Vec<(f64, f64)> {
+pub(crate) fn starts_and_widths_us(time_edges_us: &[f64]) -> Vec<(f64, f64)> {
     time_edges_us
         .windows(2)
         .map(|edges| (edges[0] - time_edges_us[0], edges[1] - edges[0]))
         .collect()
 }
 
-fn time_counts_per_pixel(
+pub(crate) fn time_counts_per_pixel(
     starts_and_widths_us: &[(f64, f64)],
     [c, a, tau]: [f64; 3],
 ) -> (Vec<f64>, [Vec<f64>; 3]) {
@@ -2932,6 +2935,7 @@ mod tests {
             time_edges_us: EDGES_US.map(f64::from).collect(),
             charge_ratio: 1.2,
             normalization: Value::Fitted(1.0),
+            time_background: NO_TIME_BACKGROUND,
             open_counts: open.view(),
             sample_counts: sample.view(),
             open_live: None,
@@ -2942,6 +2946,7 @@ mod tests {
             binning: 1,
             material: material.clone(),
             background,
+            gamma_transmission: Value::Known(1.0),
             empty_background: [Value::Known(0.0); 3],
         };
         let calibration = Calibration {

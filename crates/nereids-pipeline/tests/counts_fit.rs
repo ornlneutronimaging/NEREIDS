@@ -780,6 +780,7 @@ fn a_map_recovers_each_patch_and_its_covariance_between_patches_is_the_shared_qu
             value: TERMS[0],
             sd: 4.0e-5,
         },
+        time_background: NO_TIME_BACKGROUND,
         open_counts: counts[0].view(),
         sample_counts: counts[1].view(),
         open_live: Some(live.clone()),
@@ -810,6 +811,7 @@ fn a_map_recovers_each_patch_and_its_covariance_between_patches_is_the_shared_qu
             Value::Known(0.0),
             Value::Known(0.0),
         ],
+        gamma_transmission: Value::Known(1.0),
         empty_background: [Value::Known(0.0); 3],
     };
     let mut shared = calibration(&setup);
@@ -1088,6 +1090,173 @@ fn a_map_recovers_each_patch_and_its_covariance_between_patches_is_the_shared_qu
 }
 
 #[test]
+fn a_map_fits_the_time_background_its_patches_share_as_the_joint_fit_does() {
+    let setup = Setup {
+        pulse: pulse(0.0, 200.0),
+        ..standard()
+    };
+    let isotope = hafnium_like(20.0);
+    let (a, gamma, numbers) = (TERMS[0], 0.7, [1.25e4, 5.0e4, 10.0]);
+    let per_pixel = time_background(&setup.edges, numbers);
+    let (open, transmitted) = expected(&setup, &beam(2.5e5), &[(isotope.clone(), THIN)]);
+    let bins = setup.edges.len() - 1;
+    let cube = |run: usize| {
+        Array3::from_shape_fn((bins, 3, 4), |(k, y, _)| {
+            let g = per_pixel[k];
+            match (run, y) {
+                (0, _) => open[k] + g,
+                (_, 2) => a * CHARGE_RATIO * (open[k] + g),
+                _ => a * (transmitted[k] + CHARGE_RATIO * gamma * g),
+            }
+            .round()
+        })
+    };
+    let counts = [cube(0), cube(1)];
+    let none = Array2::from_elem((3, 4), false);
+    let behind = Array2::from_shape_fn((3, 4), |(y, _)| y < 2);
+    let empty = Array2::from_shape_fn((3, 4), |(y, _)| y == 2);
+    let material = Material {
+        covariances: Vec::new(),
+        library: EndfLibrary::EndfB8_0,
+        isotopes: vec![(isotope, Value::Fitted(THIN))],
+        temperature_k: Value::Fitted(330.0),
+    };
+    let start = std::array::from_fn(|i| Value::Fitted([0.5, 2.0, 0.7][i] * numbers[i]));
+    let map = MapMeasurement {
+        time_edges_us: setup.edges.clone(),
+        charge_ratio: CHARGE_RATIO,
+        normalization: Value::Fitted(0.94),
+        time_background: start,
+        open_counts: counts[0].view(),
+        sample_counts: counts[1].view(),
+        open_live: None,
+        sample_live: None,
+        excluded: none.view(),
+        sample: behind.view(),
+        empty: empty.view(),
+        binning: 2,
+        material: material.clone(),
+        background: [Value::Known(0.0); 3],
+        gamma_transmission: Value::Fitted(0.5),
+        empty_background: [Value::Known(0.0); 3],
+    };
+    let result = fit_map(&map, &calibration(&setup)).expect("map");
+    assert!(result.converged, "{:?}", result.unconverged);
+    assert_eq!(
+        result.shared,
+        [
+            "normalization",
+            "time background C",
+            "time background A",
+            "time background τ"
+        ]
+    );
+    let shared = result.shared_covariance.as_ref().expect("covariance");
+    let mut pulls: Vec<f64> = result
+        .time_background
+        .iter()
+        .zip(numbers)
+        .enumerate()
+        .map(|(i, (x, t))| (x - t) / shared.get(i + 1, i + 1).sqrt())
+        .collect();
+    for j in 0..2 {
+        pulls
+            .push((result.temperature_k[[0, j]] - TEMPERATURE_K) / result.temperature_sd_k[[0, j]]);
+        let fit = result.fits[[0, j]].as_ref().expect("a fit");
+        let covariance = result.covariance[[0, j]].as_ref().expect("covariance");
+        pulls.push((fit.gamma_transmission - gamma) / covariance.get(2, 2).sqrt());
+    }
+    assert!(pulls.iter().all(|p| p.abs() <= BOUND.sqrt()), "{pulls:?}");
+
+    let summed = |run: usize, rows: Range<usize>, xs: Range<usize>| -> Vec<f64> {
+        (0..bins)
+            .map(|k| counts[run].slice(s![k, rows.clone(), xs.clone()]).sum())
+            .collect()
+    };
+    let region = |rows: Range<usize>, xs: Range<usize>, material: Option<Material>| Region {
+        open_counts: summed(0, rows.clone(), xs.clone()),
+        sample_counts: summed(1, rows, xs),
+        open_live: None,
+        sample_live: None,
+        background: [Value::Known(0.0); 3],
+        pixels: 4.0,
+        gamma_transmission: if material.is_some() {
+            map.gamma_transmission
+        } else {
+            Value::Known(1.0)
+        },
+        material,
+    };
+    let joint = fit_counts(
+        &Measurement {
+            time_edges_us: setup.edges.clone(),
+            charge_ratio: CHARGE_RATIO,
+            normalization: map.normalization,
+            time_background: start,
+            regions: vec![
+                region(0..2, 0..2, Some(material.clone())),
+                region(0..2, 2..4, Some(material.clone())),
+                region(2..3, 0..4, None),
+            ],
+        },
+        &calibration(&setup),
+    )
+    .expect("joint fit");
+    assert!(joint.converged);
+    let joint_sd = |i: usize| error_bar(&joint, i);
+    let mut gaps: Vec<f64> = (0..3)
+        .map(|i| (result.time_background[i] - joint.time_background[i]) / joint_sd(7 + i))
+        .collect();
+    for j in 0..2 {
+        let temperature = joint.regions[j].temperature_k.expect("T");
+        gaps.push((result.temperature_k[[0, j]] - temperature) / joint_sd(2 * j + 1));
+    }
+    assert!(gaps.iter().all(|g| g.abs() <= 0.01), "{gaps:?}");
+    let mut ratios: Vec<f64> = (0..3)
+        .map(|i| shared.get(i + 1, i + 1).sqrt() / joint_sd(7 + i))
+        .collect();
+    for j in 0..2 {
+        ratios.push(result.temperature_sd_k[[0, j]] / joint_sd(2 * j + 1));
+        let fit = result.fits[[0, j]].as_ref().expect("a fit");
+        assert_eq!(fit.overdispersion, joint.regions[j].overdispersion);
+    }
+    assert!(ratios.iter().all(|r| (r - 1.0).abs() <= 1e-3), "{ratios:?}");
+
+    let held = MapMeasurement {
+        gamma_transmission: Value::Known(gamma),
+        ..map.clone()
+    };
+    let result = fit_map(&held, &calibration(&setup)).expect("map");
+    assert!(result.converged, "{:?}", result.unconverged);
+    let pulls: Vec<f64> = (0..2)
+        .map(|j| (result.temperature_k[[0, j]] - TEMPERATURE_K) / result.temperature_sd_k[[0, j]])
+        .collect();
+    assert!(pulls.iter().all(|p| p.abs() <= BOUND.sqrt()), "{pulls:?}");
+
+    let without = MapMeasurement {
+        time_background: NO_TIME_BACKGROUND,
+        gamma_transmission: Value::Known(1.0),
+        ..map.clone()
+    };
+    match fit_map(&without, &calibration(&setup)) {
+        Err(PipelineError::InvalidParameter(message)) => {
+            assert!(message.contains("temperature ended at"), "{message}");
+        }
+        Ok(biased) => {
+            for j in 0..2 {
+                let (t, sd) = (
+                    biased.temperature_k[[0, j]],
+                    biased.temperature_sd_k[[0, j]],
+                );
+                let recovered = (t - TEMPERATURE_K).abs() <= 5.0 * sd;
+                assert!(!recovered, "{t} ± {sd}");
+            }
+        }
+        Err(other) => panic!("{other:?}"),
+    }
+}
+
+#[test]
 fn maps_the_fit_does_not_describe_are_refused() {
     let setup = standard();
     let edges: Vec<f64> = (0..=577).map(|k| 350.0 + 0.2 * f64::from(k)).collect();
@@ -1101,6 +1270,7 @@ fn maps_the_fit_does_not_describe_are_refused() {
         time_edges_us: edges,
         charge_ratio: CHARGE_RATIO,
         normalization: Value::Fitted(1.0),
+        time_background: NO_TIME_BACKGROUND,
         open_counts: counts.view(),
         sample_counts: counts.view(),
         open_live: None,
@@ -1116,6 +1286,7 @@ fn maps_the_fit_does_not_describe_are_refused() {
             temperature_k: Value::Known(TEMPERATURE_K),
         },
         background: [Value::Known(0.0); 3],
+        gamma_transmission: Value::Known(1.0),
         empty_background: [Value::Known(0.0); 3],
     };
     let refused =
@@ -1142,6 +1313,10 @@ fn maps_the_fit_does_not_describe_are_refused() {
     refused(&map, "at least one pixel");
     map.empty = all.slice(s![.., 1..]);
     refused(&map, "the empty mask has shape");
+    let mut narrow = base.clone();
+    narrow.excluded = none.slice(s![.., 1..]);
+    narrow.empty = all.view();
+    refused(&narrow, "the excluded mask has shape");
     map.sample_counts = counts.slice(s![1.., .., ..]);
     refused(&map, "sample counts of shape");
     let no_bins = Array3::zeros((0, 1, 7));
@@ -4041,6 +4216,7 @@ mod maps {
                 time_edges_us: self.setup.edges.clone(),
                 charge_ratio: CHARGE_RATIO,
                 normalization: Value::Fitted(1.0),
+                time_background: NO_TIME_BACKGROUND,
                 open_counts: self.counts[0].view(),
                 sample_counts: self.counts[1].view(),
                 open_live: None,
@@ -4060,6 +4236,7 @@ mod maps {
                     temperature_k,
                 },
                 background: [Value::Fitted(0.02), Value::Known(0.0), Value::Known(0.0)],
+                gamma_transmission: Value::Known(1.0),
                 empty_background,
             }
         }

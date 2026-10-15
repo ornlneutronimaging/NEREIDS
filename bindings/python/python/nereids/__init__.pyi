@@ -1261,7 +1261,9 @@ class MapMeasurement:
 
     open_counts and sample_counts have shape (time bin, row, column);
     excluded, sample and empty have shape (row, column).
-    No additive time background is modeled; use fit_counts when it is needed.
+    time_background is [C, A, tau] per pixel, shared by every patch, or None
+    for none; gamma_transmission is that of every sample patch, or None for
+    known 1.
     """
 
     def __init__(
@@ -1280,6 +1282,8 @@ class MapMeasurement:
         empty_background: list[Value] | None = None,
         open_live: NDArray[np.float64] | None = None,
         sample_live: NDArray[np.float64] | None = None,
+        time_background: list[Value] | None = None,
+        gamma_transmission: Value | None = None,
     ) -> None: ...
     def patches(self) -> list[list[Patch]]:
         """Each patch kind, in (patch row, patch column)."""
@@ -1290,6 +1294,10 @@ class MapMeasurement:
     def charge_ratio(self) -> float: ...
     @property
     def binning(self) -> int: ...
+    @property
+    def time_background(self) -> list[Value]: ...
+    @property
+    def gamma_transmission(self) -> Value: ...
 
 class CountsMap:
     """The fitted map, one value per patch."""
@@ -1318,6 +1326,8 @@ class CountsMap:
         ...
     @property
     def normalization(self) -> float: ...
+    @property
+    def time_background(self) -> list[float]: ...
     @property
     def t0_us(self) -> float: ...
     @property
