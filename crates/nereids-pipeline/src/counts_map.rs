@@ -82,6 +82,10 @@ pub struct MapMeasurement<'a> {
     /// [`Region::capture_gammas`], known, fitted or within bounds; the empty
     /// pixels hold no sample and record none.
     pub capture_gammas: Value,
+    /// The in-scatter's `Ω` of every patch behind the sample, as
+    /// [`Region::in_scatter`], known, fitted or within bounds; the empty
+    /// pixels hold no sample and record none.
+    pub in_scatter: Value,
     /// `[b0, b1, b2, d, f]` of the background of the empty pixels.
     pub empty_background: [Value; 5],
 }
@@ -248,8 +252,8 @@ pub struct CountsMap<'a> {
     pub pulse_consistency: Option<Consistency>,
     /// A patch's fitted quantities: each fitted density, in the material's
     /// order, the temperature and the thickness variance if fitted, each fitted
-    /// background term, and the gamma transmission and capture gammas if
-    /// fitted.
+    /// background term, and the gamma transmission, capture gammas and
+    /// in-scatter if fitted.
     pub quantities: Vec<String>,
     /// Each patch's covariance of [`Self::quantities`], the shared
     /// quantities' uncertainty included; the row and column of one held on a
@@ -436,8 +440,8 @@ impl CountsMap<'_> {
 /// Everything [`MapMeasurement::patches`] refuses;
 /// [`PipelineError::InvalidParameter`] if a pixel is both behind the sample
 /// and empty, a density, the temperature, the thickness variance, a
-/// background term, the gamma transmission or the capture gammas of the
-/// sample's patches is [`Value::Measured`], which would
+/// background term, the gamma transmission, the capture gammas or the
+/// in-scatter of the sample's patches is [`Value::Measured`], which would
 /// count its measurement once per patch, a term of the empty pixels' background is
 /// [`Value::Measured`], the material carries resonance covariances, which a
 /// map does not yet carry, a count of a pixel summed into a region is not a
@@ -546,13 +550,17 @@ fn fit_map_from<'a>(
         .map(|(_, density)| density)
         .chain([&material.temperature_k, &material.thickness_variance])
         .chain(&map.background)
-        .chain([&map.gamma_transmission, &map.capture_gammas])
+        .chain([
+            &map.gamma_transmission,
+            &map.capture_gammas,
+            &map.in_scatter,
+        ])
         .any(|value| matches!(value, Value::Measured { .. }))
     {
         return invalid(
             "a measured density, temperature, thickness variance, background, gamma \
-             transmission or capture gammas of the sample's patches would count its measurement \
-             once per patch; give it known, fitted or within bounds"
+             transmission, capture gammas or in-scatter of the sample's patches would count its \
+             measurement once per patch; give it known, fitted or within bounds"
                 .into(),
         );
     }
@@ -603,6 +611,11 @@ fn fit_map_from<'a>(
                 } else {
                     Value::Known(0.0)
                 },
+                in_scatter: if material.is_some() {
+                    map.in_scatter
+                } else {
+                    Value::Known(0.0)
+                },
                 material,
             })
         };
@@ -644,6 +657,11 @@ fn fit_map_from<'a>(
         gamma_transmission,
         capture_gammas: if material.is_some() {
             map.capture_gammas
+        } else {
+            Value::Known(0.0)
+        },
+        in_scatter: if material.is_some() {
+            map.in_scatter
         } else {
             Value::Known(0.0)
         },
@@ -1261,6 +1279,10 @@ fn fit_map_from<'a>(
                 "capture gammas".to_string(),
             )
         }))
+        .chain(
+            (!matches!(map.in_scatter, Value::Known(_)))
+                .then(|| (Role::InScatter { region: 0 }, "in-scatter".to_string())),
+        )
         .collect();
     let q = template.len();
 
@@ -1482,6 +1504,7 @@ fn restarted(region: &Region, previous: Option<&RegionFit>) -> Region {
     }
     region.gamma_transmission = restart(region.gamma_transmission, fit.gamma_transmission);
     region.capture_gammas = restart(region.capture_gammas, fit.capture_gammas);
+    region.in_scatter = restart(region.in_scatter, fit.in_scatter);
     region
 }
 

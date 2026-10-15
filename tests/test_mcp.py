@@ -348,6 +348,7 @@ class TestCountsManifest:
             temperature_k=293.6,
             thickness_variance=0.04,
             capture_gammas=0.2,
+            in_scatter=0.6,
         )
         return SimpleNamespace(
             regions=[region],
@@ -418,6 +419,7 @@ class TestCountsManifest:
         assert result["results"]["converged"] is True
         assert result["results"]["thickness_variance"] == 0.04
         assert result["results"]["capture_gammas"] == 0.2
+        assert result["results"]["in_scatter"] == 0.6
 
     def test_single_spectrum_preserves_time_background(self, tmp_path, monkeypatch):
         self._counts_npz(tmp_path)
@@ -573,8 +575,18 @@ class TestCountsManifest:
             return SimpleNamespace(
                 patches=[[SimpleNamespace(kind="sample")] * width] * height,
                 fits=[
-                    [SimpleNamespace(thickness_variance=0.03, capture_gammas=0.1), None],
-                    [SimpleNamespace(thickness_variance=None, capture_gammas=0.0), None],
+                    [
+                        SimpleNamespace(
+                            thickness_variance=0.03, capture_gammas=0.1, in_scatter=0.5
+                        ),
+                        None,
+                    ],
+                    [
+                        SimpleNamespace(
+                            thickness_variance=None, capture_gammas=0.0, in_scatter=0.0
+                        ),
+                        None,
+                    ],
                 ],
                 failed=[[None] * width] * height,
                 empty=None,
@@ -617,4 +629,7 @@ class TestCountsManifest:
         )
         np.testing.assert_array_equal(
             saved["capture_gammas"], [[0.1, np.nan], [0.0, np.nan]]
+        )
+        np.testing.assert_array_equal(
+            saved["in_scatter"], [[0.5, np.nan], [0.0, np.nan]]
         )
