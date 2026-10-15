@@ -259,6 +259,7 @@ pub fn run_map_fit(request: &FitRequest) -> Result<MapFitSummary, String> {
         time_edges_us: request.time_edges_us.clone(),
         charge_ratio: request.charge_ratio,
         normalization: normalization(request),
+        time_background: NO_TIME_BACKGROUND,
         open_counts: request.open_counts.view(),
         sample_counts: request.sample_counts.view(),
         open_live: None,
@@ -269,6 +270,7 @@ pub fn run_map_fit(request: &FitRequest) -> Result<MapFitSummary, String> {
         binning: request.binning,
         material: material(request),
         background: background(request),
+        gamma_transmission: Value::Known(1.0),
         empty_background: [Value::Known(0.0); 3],
     };
     let fit = counts_map::fit_map(&map, &calibration(request)).map_err(|e| e.to_string())?;

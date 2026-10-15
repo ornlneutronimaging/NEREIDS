@@ -130,15 +130,16 @@ measured_pulls and pulse_consistency are None when unavailable.
 Patch.kind is "sample", "mixed" or "outside". MapMeasurement(time_edges_us,
 open_counts, sample_counts, excluded, sample, empty, material, charge_ratio,
 normalization, background, binning=1, empty_background=None, open_live=None,
-sample_live=None) holds the (time bin, row, column) counts and the (row,
-column) masks; its patches() method returns each patch's kind. The map has no
-additive time-background term. Use fit_counts with regions and an explicit
-time_background when this contribution is required.
+sample_live=None, time_background=None, gamma_transmission=None) holds the
+(time bin, row, column) counts and the (row, column) masks; its patches()
+method returns each patch's kind. time_background is [C, A, tau] per pixel,
+shared by every patch, or NO_TIME_BACKGROUND by default; gamma_transmission
+is that of every sample patch, known 1 by default, and the empty pixels take 1.
 
 CountsMap exposes the per-patch fits (fits, failed, empty), density maps
 densities and density_sd in atoms/barn, temperature_k and temperature_sd_k in
-K, the two overdispersion maps, trusted, and the shared normalization, t0_us,
-flight_path_m, alpha, beta, r, fwhm_squared_us2, shared, shared_covariance,
+K, the two overdispersion maps, trusted, and the shared normalization,
+time_background, t0_us, flight_path_m, alpha, beta, r, fwhm_squared_us2, shared, shared_covariance,
 deviance and converged. n_fitted counts the fitted patches.
 
 trusted records numerical convergence and uncertainty status only: fitted

@@ -7,6 +7,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
 
 ## [Unreleased]
 
+### Added
+
+- `fit_map` fits the time background `[C, A, tau]` per pixel as a quantity
+  shared by every patch, and each patch's gamma transmission.
+  `MapMeasurement` gains `time_background` and `gamma_transmission`;
+  MCP map workflows accept both.
+
 ### Changed (breaking)
 
 - Fitting uses raw open-beam and sample counts on time-of-flight bin edges.
@@ -32,16 +39,14 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
   Jacobian. It reports half Poisson deviance and withholds uncertainties
   for quantities on bounds or in undetermined directions.
 - MCP counts inputs require original, increasing time-bin edges.
-  Unsupported fit settings are rejected. A single-spectrum manifest can
-  supply an additive time background; map manifests cannot.
+  Unsupported fit settings are rejected.
 - PLEIADES test data are no longer a Git submodule. The local directory is
   ignored. The test suite does not require it.
 
 ### Limitations
 
-- The map has no additive time-background model. Its `trusted` array records
-  numerical status only. It does not validate the physical model or the
-  inferred temperature.
+- The map's `trusted` array records numerical status only. It does not
+  validate the physical model or the inferred temperature.
 - The GUI holds temperature and pulse numbers at their supplied values.
   Isotope-group members have separate fitted densities. Legacy project
   result fields remain readable but are not restored as counts-fit results.

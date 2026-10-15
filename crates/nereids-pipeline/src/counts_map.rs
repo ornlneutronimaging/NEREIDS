@@ -16,13 +16,13 @@ use rayon::prelude::*;
 
 use crate::counts_fit::TEMPERATURE_BOUNDS_K;
 use crate::counts_fit::{
-    BeamStart, BeamStarts, Material, Measurement, NO_TIME_BACKGROUND, Region, RegionFit,
-    RegionTerms, Role, SHARED, Starts, Value, checked, excluded_bins, fit_counts_answer, labelled,
-    shared_parameters,
+    BeamStart, BeamStarts, MOST_PASSES, Material, Measurement, Region, RegionFit, RegionTerms,
+    Role, SHARED, Starts, Value, checked, excluded_bins, fit_counts_answer, labelled,
+    shared_parameters, starting_time_background, starts_and_widths_us, time_counts_per_pixel,
 };
 use crate::error::PipelineError;
 use crate::open_beam::{
-    BOUND, Calibration, PULSE_NUMBERS, Pulse, fit_open_beam, validate_live, whole,
+    BOUND, Calibration, PULSE_NUMBERS, Pulse, open_beam_with_intervals, validate_live, whole,
 };
 
 const MOST_STEPS: usize = 20;
@@ -32,10 +32,6 @@ const MOST_HALVINGS: i32 = 10;
 /// The counts of every pixel of an open-beam run and a sample run recorded in
 /// the same time bins, which pixels to fit, and the material behind the
 /// sample.
-///
-/// The map models beam-borne scattering background only. It has no additive
-/// time background; use [`crate::counts_fit::fit_counts`] when that term is
-/// required.
 #[derive(Debug, Clone)]
 pub struct MapMeasurement<'a> {
     /// Time-bin edges in µs.
@@ -44,6 +40,11 @@ pub struct MapMeasurement<'a> {
     pub charge_ratio: f64,
     /// `a`, the normalization of the sample run, the same in every pixel.
     pub normalization: Value,
+    /// `[C, A, τ]` of the time background per pixel, as
+    /// [`Measurement::time_background`], the same in every pixel;
+    /// [`NO_TIME_BACKGROUND`](crate::counts_fit::NO_TIME_BACKGROUND) gives
+    /// none.
+    pub time_background: [Value; 3],
     /// Raw counts of the open-beam run, in (time bin, row, column).
     pub open_counts: ArrayView3<'a, f64>,
     /// Raw counts of the sample run, in (time bin, row, column).
@@ -69,6 +70,10 @@ pub struct MapMeasurement<'a> {
     /// `b0`, `b1` and `b2` of the background of every patch behind the
     /// sample, as [`Region::background`], known, fitted or within bounds.
     pub background: [Value; 3],
+    /// The fraction of the time background that reaches the pixels behind the
+    /// sample in the sample run, as [`Region::gamma_transmission`], known,
+    /// fitted or within bounds in every patch; the empty pixels take 1.
+    pub gamma_transmission: Value,
     /// `b0`, `b1` and `b2` of the background of the empty pixels.
     pub empty_background: [Value; 3],
 }
@@ -189,6 +194,8 @@ pub struct CountsMap<'a> {
     pub trusted: Array2<bool>,
     /// The normalization `a`: the known one, or the fitted one.
     pub normalization: f64,
+    /// The time background's `[C, A, τ]`, each the known or the fitted one.
+    pub time_background: [f64; 3],
     /// The timing offset `t0` in µs: the known one, or the fitted one.
     pub t0_us: f64,
     /// The flight path in m: the known one, or the fitted one.
@@ -202,8 +209,9 @@ pub struct CountsMap<'a> {
     /// The square of the pulse's triangle FWHM, `h²` in µs²: the known one, or
     /// the fitted one.
     pub fwhm_squared_us2: f64,
-    /// The fitted shared quantities, among the normalization, `t0`, flight
-    /// path, `α₀`, `α₁`, `β₀`, `β₁`, `R` and `h²`, in that order.
+    /// The fitted shared quantities, among the normalization, the time
+    /// background's `C`, `A` and `τ`, `t0`, flight path, `α₀`, `α₁`, `β₀`,
+    /// `β₁`, `R` and `h²`, in that order.
     pub shared: Vec<&'static str>,
     /// Covariance of [`Self::shared`]: the inverse of the information on them
     /// of every patch that did not fail and of the empty pixels, each with
@@ -228,7 +236,8 @@ pub struct CountsMap<'a> {
     /// when [`Self::measured_pulls`] is, or when [`consistency`] gives none.
     pub pulse_consistency: Option<Consistency>,
     /// A patch's fitted quantities: each fitted density, in the material's
-    /// order, the temperature if fitted, and each fitted background term.
+    /// order, the temperature if fitted, each fitted background term, and the
+    /// gamma transmission if fitted.
     pub quantities: Vec<String>,
     /// Each patch's covariance of [`Self::quantities`], the shared
     /// quantities' uncertainty included; the row and column of one held on a
@@ -292,6 +301,25 @@ impl CountsMap<'_> {
         })
     }
 
+    fn unsettled(mut self, reason: String) -> Self {
+        self.converged = false;
+        self.unconverged = Some(reason);
+        self.shared_covariance = None;
+        self.propagated = None;
+        self.measured_pulls = None;
+        self.pulse_consistency = None;
+        self.covariance.fill(None);
+        for sd in self
+            .density_sd
+            .iter_mut()
+            .chain([&mut self.temperature_sd_k])
+        {
+            sd.fill(f64::NAN);
+        }
+        self.trusted.fill(false);
+        self
+    }
+
     /// The covariance of patch `a`'s [`Self::quantities`] with a different
     /// patch `b`'s, which only the shared quantities carry, `G_a C_ss G_bᵀ` over
     /// those not held on a bound; for `a` = `b`, the part of
@@ -328,12 +356,22 @@ impl CountsMap<'_> {
 /// Fit `map.material` in each patch of `binning`×`binning` pixels whose
 /// pixels not excluded all lie behind the sample, and the empty pixels not
 /// excluded as one region with no material, as one counts fit whose regions
-/// share the normalization, `t0`, the flight path and the pulse: one clock,
-/// one flight path, one moderator, and a detector efficiency that changes
-/// between the runs alike in every pixel.  A region's counts are the sums
-/// over its pixels; each has its own beam and background.  The empty pixels
-/// pin the normalization when their `b0` is known.  The map has no time
-/// background ([`NO_TIME_BACKGROUND`]).
+/// share the normalization, the time background per pixel, `t0`, the flight
+/// path and the pulse: one clock, one flight path, one moderator, one proton
+/// beam, and a detector efficiency that changes between the runs alike in
+/// every pixel.  A region's counts are the sums over its pixels; each has its
+/// own beam, background and gamma transmission, and its time background is
+/// that per pixel times its pixels.  The empty pixels pin the normalization
+/// when their `b0` is known.
+///
+/// Each region's open-beam fit, which starts its beam and weights its
+/// open-beam run, takes the time background's starting numbers as known; the
+/// map is fitted again with them at its fitted numbers, up to twenty times,
+/// until those change the counts the open-beam fits took as known by
+/// `Σ_r Σ_k (ΔO_rk)²/O_rk` at most [`BOUND`] over every region's open-beam
+/// bins, as [`fit_counts`](crate::counts_fit::fit_counts) does; from the
+/// third time on each region keeps the beam intervals its second open-beam
+/// fit chose.  A map that has not settled after twenty is unconverged.
 ///
 /// The fit is the joint one of [`fit_counts`](crate::counts_fit::fit_counts),
 /// found region by region.  With the shared quantities held, each region is
@@ -385,9 +423,9 @@ impl CountsMap<'_> {
 /// # Errors
 /// Everything [`MapMeasurement::patches`] refuses;
 /// [`PipelineError::InvalidParameter`] if a pixel is both behind the sample
-/// and empty, a density, the temperature or a background term of the
-/// sample's patches is [`Value::Measured`], which would count its
-/// measurement once per patch, a term of the empty pixels' background is
+/// and empty, a density, the temperature, a background term or the gamma
+/// transmission of the sample's patches is [`Value::Measured`], which would
+/// count its measurement once per patch, a term of the empty pixels' background is
 /// [`Value::Measured`], the material carries resonance covariances, which a
 /// map does not yet carry, a count of a pixel summed into a region is not a
 /// whole non-negative number, or no patch is fitted; every refusal of
@@ -406,6 +444,75 @@ pub fn fit_map<'a>(
     map: &MapMeasurement<'a>,
     calibration: &Calibration,
 ) -> Result<CountsMap<'a>, PipelineError> {
+    let mut open = starting_time_background(&Measurement {
+        time_edges_us: Vec::new(),
+        charge_ratio: map.charge_ratio,
+        normalization: map.normalization,
+        time_background: map.time_background,
+        regions: Vec::new(),
+    })?;
+    let bins = starts_and_widths_us(&map.time_edges_us);
+    let empty_pixels = map
+        .empty
+        .indexed_iter()
+        .filter(|&(pixel, &e)| e && !map.excluded[pixel])
+        .count();
+    let mut intervals: Option<Vec<Option<usize>>> = None;
+    for passes in 1..=MOST_PASSES {
+        let result = fit_map_from(map, calibration, open, intervals.as_deref())?;
+        let (used, _) = time_counts_per_pixel(&bins, open);
+        let (now, _) = time_counts_per_pixel(&bins, result.time_background);
+        let regions = || {
+            result
+                .fits
+                .indexed_iter()
+                .filter_map(|(patch, fit)| Some((fit.as_ref()?, map.pixels(patch).len())))
+                .chain(result.empty.as_ref().map(|fit| (fit, empty_pixels)))
+        };
+        let mut spread = 0.0;
+        for (fit, pixels) in regions() {
+            for (k, &mu) in fit.predicted[0]
+                .iter()
+                .enumerate()
+                .filter(|(_, mu)| **mu > 0.0)
+            {
+                let live = map.open_live.as_ref().map_or(1.0, |live| live[k]);
+                spread += (live * pixels as f64 * (now[k] - used[k])).powi(2) / mu;
+            }
+        }
+        if !result.converged || spread <= BOUND {
+            return Ok(result);
+        }
+        if passes == MOST_PASSES {
+            return Ok(result.unsettled(format!(
+                "the open-beam fits' time background did not settle in {MOST_PASSES} fits"
+            )));
+        }
+        if passes >= 2 {
+            intervals.get_or_insert_with(|| {
+                result
+                    .patches
+                    .indexed_iter()
+                    .filter(|&(_, &kind)| kind == Patch::Sample)
+                    .map(|(patch, _)| result.fits[patch].as_ref().map(|f| f.beam.intervals()))
+                    .chain(
+                        (empty_pixels > 0)
+                            .then(|| result.empty.as_ref().map(|f| f.beam.intervals())),
+                    )
+                    .collect()
+            });
+        }
+        open = result.time_background;
+    }
+    unreachable!("the passes end at MOST_PASSES")
+}
+
+fn fit_map_from<'a>(
+    map: &MapMeasurement<'a>,
+    calibration: &Calibration,
+    open: [f64; 3],
+    intervals: Option<&[Option<usize>]>,
+) -> Result<CountsMap<'a>, PipelineError> {
     let invalid = |message: String| Err(PipelineError::InvalidParameter(message));
     let patches = map.patches()?;
     if map.sample.iter().zip(&map.empty).any(|(&s, &e)| s && e) {
@@ -418,11 +525,13 @@ pub fn fit_map<'a>(
         .map(|(_, density)| density)
         .chain([&material.temperature_k])
         .chain(&map.background)
+        .chain([&map.gamma_transmission])
         .any(|value| matches!(value, Value::Measured { .. }))
     {
         return invalid(
-            "a measured density, temperature or background of the sample's patches would count \
-             its measurement once per patch; give it known, fitted or within bounds"
+            "a measured density, temperature, background or gamma transmission of the sample's \
+             patches would count its measurement once per patch; give it known, fitted or \
+             within bounds"
                 .into(),
         );
     }
@@ -457,7 +566,7 @@ pub fn fit_map<'a>(
         .filter(|&(pixel, &e)| e && !map.excluded[pixel])
         .map(|(pixel, _)| pixel)
         .collect();
-    let region = |pixels: &[(usize, usize)], background, material| {
+    let region = |pixels: &[(usize, usize)], background, gamma_transmission, material| {
         let [open_counts, sample_counts] = summed(map, pixels)?;
         Ok::<_, PipelineError>(Region {
             open_counts,
@@ -466,45 +575,76 @@ pub fn fit_map<'a>(
             sample_live: map.sample_live.clone(),
             background,
             pixels: pixels.len() as f64,
-            gamma_transmission: Value::Known(1.0),
+            gamma_transmission,
             material,
         })
     };
     let mut regions = fitted_patches
         .iter()
-        .map(|&patch| region(&map.pixels(patch), map.background, Some(material.clone())))
+        .map(|&patch| {
+            region(
+                &map.pixels(patch),
+                map.background,
+                map.gamma_transmission,
+                Some(material.clone()),
+            )
+        })
         .collect::<Result<Vec<Region>, PipelineError>>()?;
     if !empty.is_empty() {
-        regions.push(region(&empty, map.empty_background, None)?);
+        regions.push(region(
+            &empty,
+            map.empty_background,
+            Value::Known(1.0),
+            None,
+        )?);
     }
-    let measurement = |normalization, regions| Measurement {
+    let measurement = |normalization, time_background, regions| Measurement {
         time_edges_us: map.time_edges_us.clone(),
         charge_ratio: map.charge_ratio,
         normalization,
-        time_background: NO_TIME_BACKGROUND,
+        time_background,
         regions,
     };
 
-    let template = |background, material| Region {
+    let template = |background, gamma_transmission, material| Region {
         open_counts: Vec::new(),
         sample_counts: Vec::new(),
         open_live: None,
         sample_live: None,
         background,
         pixels: 1.0,
-        gamma_transmission: Value::Known(1.0),
+        gamma_transmission,
         material,
     };
     checked(
         &measurement(
             map.normalization,
-            std::iter::once(template(map.background, Some(material.clone())))
-                .chain((!empty.is_empty()).then(|| template(map.empty_background, None)))
-                .collect(),
+            map.time_background,
+            std::iter::once(template(
+                map.background,
+                map.gamma_transmission,
+                Some(material.clone()),
+            ))
+            .chain(
+                (!empty.is_empty())
+                    .then(|| template(map.empty_background, Value::Known(1.0), None)),
+            )
+            .collect(),
         ),
         calibration,
     )?;
-    let parameters = shared_parameters(&measurement(map.normalization, vec![]), calibration)?;
+    let parameters = shared_parameters(
+        &measurement(map.normalization, map.time_background, vec![]),
+        calibration,
+    )?;
+    let at = |role: Role| {
+        SHARED
+            .iter()
+            .position(|&shared| shared == role)
+            .expect("a shared role")
+    };
+    let (time_background, t0) = (at(Role::TimeBackground(0)), at(Role::T0));
+    let instrument = t0..SHARED.len();
     let fitted: Vec<usize> = (0..SHARED.len())
         .filter(|&i| !parameters[i].1.fixed)
         .collect();
@@ -551,7 +691,8 @@ pub fn fit_map<'a>(
     };
 
     let mut values: Vec<f64> = parameters.iter().map(|(_, p)| p.value).collect();
-    let origin_us = values[1];
+    let origin_us = values[t0];
+    let open_per_pixel = time_counts_per_pixel(&starts_and_widths_us(&map.time_edges_us), open).0;
     let bins = map.open_counts.dim().0;
     validate_live("open-beam", map.open_live.as_deref(), bins)?;
     validate_live("sample", map.sample_live.as_deref(), bins)?;
@@ -564,15 +705,15 @@ pub fn fit_map<'a>(
         .collect();
     let patch_count = fitted_patches.len();
     let held_at = |values: &[f64]| {
-        let known = |i: usize| Value::Known(values[i]);
+        let known = |i: usize| Value::Known(values[t0 + i]);
         Calibration {
-            t0_us: known(1),
-            flight_path_m: known(2),
+            t0_us: known(0),
+            flight_path_m: known(1),
             pulse: Pulse {
-                alpha: [known(3), known(4)],
-                beta: [known(5), known(6)],
-                r: known(7),
-                fwhm_squared_us2: known(8),
+                alpha: [known(2), known(3)],
+                beta: [known(4), known(5)],
+                r: known(6),
+                fwhm_squared_us2: known(7),
                 prior: None,
                 ..calibration.pulse.clone()
             },
@@ -583,7 +724,11 @@ pub fn fit_map<'a>(
         regions
             .iter()
             .map(|region| {
-                excluded_bins(&map.time_edges_us, region.material.as_ref(), &values[1..9])
+                excluded_bins(
+                    &map.time_edges_us,
+                    region.material.as_ref(),
+                    &values[instrument.clone()],
+                )
             })
             .collect()
     };
@@ -603,7 +748,8 @@ pub fn fit_map<'a>(
         let held = held_at(values);
         let label = &labels[r];
         let one = measurement(
-            Value::Known(values[0]),
+            Value::Known(values[at(Role::Normalization)]),
+            std::array::from_fn(|i| Value::Known(values[time_background + i])),
             vec![restarted(&regions[r], previous)],
         );
         let beam = match previous {
@@ -612,15 +758,22 @@ pub fn fit_map<'a>(
                 overdispersion: fit.overdispersion[0],
                 at_limit: fit.beam_at_limit,
             },
-            None => fit_open_beam(
-                &map.time_edges_us,
-                &regions[r].open_counts,
-                &starting,
-                regions[r].open_live.as_deref(),
-                None,
-            )
-            .map_err(|e| named(label, e))?
-            .into(),
+            None => {
+                let known: Vec<f64> = open_per_pixel
+                    .iter()
+                    .map(|g| regions[r].pixels * g)
+                    .collect();
+                open_beam_with_intervals(
+                    &map.time_edges_us,
+                    &regions[r].open_counts,
+                    &starting,
+                    regions[r].open_live.as_deref(),
+                    Some(&known),
+                    intervals.and_then(|chosen| chosen[r]),
+                )
+                .map_err(|e| named(label, e))?
+                .into()
+            }
         };
         let starts = Starts {
             beams: vec![beam],
@@ -1031,6 +1184,14 @@ pub fn fit_map<'a>(
                 .filter(|(_, value)| !matches!(value, Value::Known(_)))
                 .map(|(term, _)| (Role::Background { region: 0, term }, format!("b{term}"))),
         )
+        .chain(
+            (!matches!(map.gamma_transmission, Value::Known(_))).then(|| {
+                (
+                    Role::GammaTransmission { region: 0 },
+                    "gamma transmission".to_string(),
+                )
+            }),
+        )
         .collect();
     let q = template.len();
 
@@ -1126,21 +1287,29 @@ pub fn fit_map<'a>(
         temperature_sd_k,
         overdispersion,
         trusted,
-        normalization: values[0],
-        t0_us: values[1],
-        flight_path_m: values[2],
-        alpha: [values[3], values[4]],
-        beta: [values[5], values[6]],
-        r: values[7],
-        fwhm_squared_us2: values[8],
+        normalization: values[at(Role::Normalization)],
+        time_background: std::array::from_fn(|i| values[time_background + i]),
+        t0_us: values[t0],
+        flight_path_m: values[t0 + 1],
+        alpha: [values[t0 + 2], values[t0 + 3]],
+        beta: [values[t0 + 4], values[t0 + 5]],
+        r: values[t0 + 6],
+        fwhm_squared_us2: values[t0 + 7],
         shared: fitted
             .iter()
             .map(|&i| {
-                ["normalization", "t0", "flight path"]
-                    .into_iter()
-                    .chain(PULSE_NUMBERS)
-                    .nth(i)
-                    .expect("a shared quantity")
+                [
+                    "normalization",
+                    "time background C",
+                    "time background A",
+                    "time background τ",
+                    "t0",
+                    "flight path",
+                ]
+                .into_iter()
+                .chain(PULSE_NUMBERS)
+                .nth(i)
+                .expect("a shared quantity")
             })
             .collect(),
         shared_covariance,
@@ -1237,6 +1406,7 @@ fn restarted(region: &Region, previous: Option<&RegionFit>) -> Region {
     for (term, &at) in region.background.iter_mut().zip(&fit.background) {
         *term = restart(*term, at);
     }
+    region.gamma_transmission = restart(region.gamma_transmission, fit.gamma_transmission);
     region
 }
 

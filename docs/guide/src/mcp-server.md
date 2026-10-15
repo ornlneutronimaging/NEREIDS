@@ -186,9 +186,9 @@ arrays excluded, sample and empty are (row, column) boolean masks; without
 them every pixel is treated as behind the sample. binning sets the patch side
 in pixels.
 
-Map workflows reject `fit.time_background`: the map engine does not support
-it. The map's `trusted` array reports numerical status, not physical or
-thermometry validation. Masks are cropped with the counts when an ROI or
+Map workflows take `fit.time_background` per pixel, shared by every patch,
+and `fit.gamma_transmission` for every sample patch. The map's `trusted`
+array reports numerical status, not physical or thermometry validation. Masks are cropped with the counts when an ROI or
 pixel limit is selected.
 
 Paired arrays must have matching shapes, and the time-bin edge count must be

@@ -3767,6 +3767,7 @@ struct MapData {
     time_edges_us: Vec<f64>,
     charge_ratio: f64,
     normalization: Value,
+    time_background: [Value; 3],
     open_counts: ndarray::Array3<f64>,
     sample_counts: ndarray::Array3<f64>,
     open_live: Option<Vec<f64>>,
@@ -3777,6 +3778,7 @@ struct MapData {
     binning: usize,
     material: Material,
     background: [Value; 3],
+    gamma_transmission: Value,
     empty_background: [Value; 3],
 }
 
@@ -3786,6 +3788,7 @@ impl MapData {
             time_edges_us: self.time_edges_us.clone(),
             charge_ratio: self.charge_ratio,
             normalization: self.normalization,
+            time_background: self.time_background,
             open_counts: self.open_counts.view(),
             sample_counts: self.sample_counts.view(),
             open_live: self.open_live.clone(),
@@ -3796,6 +3799,7 @@ impl MapData {
             binning: self.binning,
             material: self.material.clone(),
             background: self.background,
+            gamma_transmission: self.gamma_transmission,
             empty_background: self.empty_background,
         }
     }
@@ -3814,7 +3818,7 @@ impl PyMapMeasurement {
     /// open_counts and sample_counts have shape (time bin, row, column);
     /// excluded, sample and empty have shape (row, column).
     #[new]
-    #[pyo3(signature = (time_edges_us, open_counts, sample_counts, excluded, sample, empty, material, charge_ratio, normalization, background, binning=1, empty_background=None, open_live=None, sample_live=None))]
+    #[pyo3(signature = (time_edges_us, open_counts, sample_counts, excluded, sample, empty, material, charge_ratio, normalization, background, binning=1, empty_background=None, open_live=None, sample_live=None, time_background=None, gamma_transmission=None))]
     fn new(
         time_edges_us: Vec<f64>,
         open_counts: PyReadonlyArray3<f64>,
@@ -3830,16 +3834,23 @@ impl PyMapMeasurement {
         empty_background: Option<Vec<PyValue>>,
         open_live: Option<Vec<f64>>,
         sample_live: Option<Vec<f64>>,
+        time_background: Option<Vec<PyValue>>,
+        gamma_transmission: Option<PyValue>,
     ) -> PyResult<Self> {
         let empty_background = match empty_background {
             Some(values) => value_trio(values)?,
             None => [Value::Known(0.0); 3],
+        };
+        let time_background = match time_background {
+            Some(values) => value_trio(values)?,
+            None => NO_TIME_BACKGROUND,
         };
         Ok(Self {
             inner: MapData {
                 time_edges_us,
                 charge_ratio,
                 normalization: normalization.inner,
+                time_background,
                 open_counts: open_counts.as_array().to_owned(),
                 sample_counts: sample_counts.as_array().to_owned(),
                 open_live,
@@ -3850,6 +3861,8 @@ impl PyMapMeasurement {
                 binning,
                 material: material.inner,
                 background: value_trio(background)?,
+                gamma_transmission: gamma_transmission
+                    .map_or(Value::Known(1.0), |value| value.inner),
                 empty_background,
             },
         })
@@ -3878,6 +3891,24 @@ impl PyMapMeasurement {
     #[getter]
     fn binning(&self) -> usize {
         self.inner.binning
+    }
+
+    /// The time background's [C, A, tau] per pixel.
+    #[getter]
+    fn time_background(&self) -> Vec<PyValue> {
+        self.inner
+            .time_background
+            .iter()
+            .map(|&inner| PyValue { inner })
+            .collect()
+    }
+
+    /// The gamma transmission of every sample patch.
+    #[getter]
+    fn gamma_transmission(&self) -> PyValue {
+        PyValue {
+            inner: self.inner.gamma_transmission,
+        }
     }
 
     fn __repr__(&self) -> String {
@@ -3911,6 +3942,7 @@ struct PyCountsMap {
     overdispersion: [ndarray::Array2<f64>; 2],
     trusted: ndarray::Array2<bool>,
     normalization: f64,
+    time_background: [f64; 3],
     t0_us: f64,
     flight_path_m: f64,
     alpha: [f64; 2],
@@ -3941,6 +3973,7 @@ impl PyCountsMap {
             overdispersion: map.overdispersion.clone(),
             trusted: map.trusted.clone(),
             normalization: map.normalization,
+            time_background: map.time_background,
             t0_us: map.t0_us,
             flight_path_m: map.flight_path_m,
             alpha: map.alpha,
@@ -4046,6 +4079,12 @@ impl PyCountsMap {
     #[getter]
     fn normalization(&self) -> f64 {
         self.normalization
+    }
+
+    /// The time background's [C, A, tau].
+    #[getter]
+    fn time_background(&self) -> [f64; 3] {
+        self.time_background
     }
 
     /// The timing offset t0 in microseconds.

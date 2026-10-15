@@ -440,15 +440,32 @@ class TestCountsManifest:
         assert not result["success"]
         assert "time_edges_us" in str(result)
 
-    def test_map_rejects_unsupported_time_background(self, tmp_path):
-        self._counts_npz(tmp_path)
-        manifest = _write_json_frontmatter_manifest(
-            tmp_path,
-            self._analysis(mode="density_map", time_background=[10.0, 50.0, 25.0]),
+    def test_map_preserves_time_background(self, tmp_path, monkeypatch):
+        bins = 4
+        np.savez(
+            tmp_path / "cube.npz",
+            time_edges_us=np.linspace(200.0, 400.0, bins + 1),
+            open_beam_counts=np.full((bins, 2, 2), 100.0),
+            sample_counts=np.full((bins, 2, 2), 80.0),
         )
-        report = validate_resonance_dataset(str(manifest))
-        assert not report["valid"]
-        assert any("time background" in e for e in report["errors"])
+        analysis = self._analysis(
+            mode="density_map",
+            time_background=[10.0, 50.0, 25.0],
+            gamma_transmission=0.6,
+        )
+        analysis["data"] = {"kind": "counts_npz", "path": "cube.npz", "binning": 1}
+        manifest = _write_json_frontmatter_manifest(tmp_path, analysis)
+        captured = []
+
+        def fit(map_measurement, calibration):
+            captured.extend(v.value for v in map_measurement.time_background)
+            captured.append(map_measurement.gamma_transmission.value)
+            raise RuntimeError("measurement captured")
+
+        monkeypatch.setattr(nereids, "fit_map", fit)
+        assert validate_resonance_dataset(str(manifest))["valid"]
+        process_resonance_dataset(str(manifest))
+        assert captured == [10.0, 50.0, 25.0, 0.6]
 
     def test_unknown_fit_settings_are_rejected(self, tmp_path):
         self._counts_npz(tmp_path)
@@ -533,6 +550,7 @@ class TestCountsManifest:
                 overdispersion=[zeros, zeros],
                 trusted=np.ones((height, width), dtype=bool),
                 normalization=1.0,
+                time_background=[0.0, 0.0, 1.0],
                 t0_us=3.0,
                 flight_path_m=25.0,
                 alpha=[0.35, 0.05],

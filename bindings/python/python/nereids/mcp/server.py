@@ -795,6 +795,8 @@ def _process_density_map(
         background=_background_values(fit_config.get("background")),
         binning=int(data_config.get("binning", 1)),
         empty_background=_background_values(fit_config.get("empty_background")),
+        time_background=_time_background_values(fit_config.get("time_background")),
+        gamma_transmission=_value_or_number(fit_config.get("gamma_transmission"), 1.0),
     )
     result = nereids.fit_map(map_measurement, calibration)
 
@@ -834,6 +836,7 @@ def _process_density_map(
         "n_bins": int(sample.shape[0]),
         "map_shape": list(np.asarray(result.trusted).shape),
         "n_fitted": int(result.n_fitted),
+        "time_background": [_finite_float_or_none(v) for v in result.time_background],
         "converged": bool(result.converged),
         "unconverged": result.unconverged,
         "density_maps": density_stats,
@@ -930,8 +933,6 @@ def _validate_workflow(manifest: dict[str, Any]) -> dict[str, Any]:
         _time_background_values(fit_config.get("time_background"))
     except (KeyError, TypeError, ValueError) as exc:
         errors.append(f"time background is invalid: {exc}")
-    if mode in {"density_map", "spatial_map"} and fit_config.get("time_background") is not None:
-        errors.append("the counts map does not support a time background; use single_spectrum")
 
     resolution = config.get("resolution")
     resolution_kind: str | None = None
