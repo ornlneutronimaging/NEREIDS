@@ -265,6 +265,7 @@ fn measurement(
                     .map(|(d, n)| (d.clone(), Value::Fitted(*n)))
                     .collect(),
                 temperature_k: Value::Known(TEMPERATURE_K),
+                thickness_variance: Value::Known(0.0),
             }),
         }],
     }
@@ -385,6 +386,7 @@ fn the_time_background_is_in_both_runs_of_every_region_by_its_pixels_and_gamma_t
                     library: EndfLibrary::EndfB8_0,
                     isotopes: lines.iter().map(|(d, n)| (d.clone(), sample(*n))).collect(),
                     temperature_k: sample(TEMPERATURE_K),
+                    thickness_variance: Value::Known(0.0),
                 }),
             })
             .collect(),
@@ -624,6 +626,7 @@ fn an_empty_area_with_a_known_background_adds_its_counts_information_on_the_norm
                 library: EndfLibrary::EndfB8_0,
                 isotopes: vec![(hot, Value::Fitted(0.5 * THIN))],
                 temperature_k: Value::Fitted(1000.0),
+                thickness_variance: Value::Known(0.0),
             }),
             padded([
                 Value::Fitted(0.02),
@@ -644,6 +647,7 @@ fn an_empty_area_with_a_known_background_adds_its_counts_information_on_the_norm
                     },
                 )],
                 temperature_k: Value::Fitted(400.0),
+                thickness_variance: Value::Known(0.0),
             }),
             padded([Value::Fitted(0.02), Value::Known(0.0), Value::Known(0.0)]),
         ),
@@ -809,6 +813,7 @@ fn a_map_recovers_each_patch_and_its_covariance_between_patches_is_the_shared_qu
                 lower: 100.0,
                 upper: 2000.0,
             },
+            thickness_variance: Value::Known(0.0),
         },
         background: padded([
             Value::Within {
@@ -1130,6 +1135,7 @@ fn a_map_fits_the_time_background_its_patches_share_as_the_joint_fit_does() {
         library: EndfLibrary::EndfB8_0,
         isotopes: vec![(isotope, Value::Fitted(THIN))],
         temperature_k: Value::Fitted(330.0),
+        thickness_variance: Value::Known(0.0),
     };
     let start = std::array::from_fn(|i| Value::Fitted([0.5, 2.0, 0.7][i] * numbers[i]));
     let map = MapMeasurement {
@@ -1309,6 +1315,7 @@ fn the_room_background_follows_each_run_s_frames_apart_from_the_time_background(
         library: EndfLibrary::EndfB8_0,
         isotopes: vec![(isotope, Value::Fitted(THIN))],
         temperature_k: Value::Fitted(330.0),
+        thickness_variance: Value::Known(0.0),
     };
     let time = [Value::Fitted(0.7 * c), Value::Known(0.0), Value::Known(1.0)];
     let room_background = Some(RoomBackground {
@@ -1461,6 +1468,90 @@ fn sammy_s_exponential_background_is_recovered_through_the_pulse() {
 }
 
 #[test]
+fn an_uneven_thickness_is_recovered_with_the_mean_density() {
+    let setup = standard();
+    let isotope = hafnium_like(20.0);
+    let (density, variance): (f64, f64) = (SATURATED, 0.05);
+    let shape = 1.0 / variance;
+    let steps = 4000;
+    let top = 1.0 + 30.0 * variance.sqrt();
+    let h = top / f64::from(steps);
+    let weights: Vec<(f64, f64)> = (1..=steps)
+        .map(|i| {
+            let x = h * f64::from(i);
+            let log_density = (shape - 1.0) * x.ln() - x / variance;
+            (x, log_density)
+        })
+        .collect();
+    let peak = weights
+        .iter()
+        .map(|w| w.1)
+        .fold(f64::NEG_INFINITY, f64::max);
+    let total: f64 = weights.iter().map(|w| (w.1 - peak).exp()).sum();
+    let mixture = |energies: &[f64]| -> Vec<f64> {
+        let sigma = &cross_sections(energies, std::slice::from_ref(&isotope), TEMPERATURE_K)[0];
+        sigma
+            .iter()
+            .map(|s| {
+                weights
+                    .iter()
+                    .map(|&(x, w)| (w - peak).exp() * (-x * density * s).exp())
+                    .sum::<f64>()
+                    / total
+            })
+            .collect()
+    };
+    let instrument = Instrument {
+        time_edges_us: setup.edges.clone(),
+        flight_path_m: setup.flight_path_m,
+        t0_us: setup.t0_us,
+        resolution: ResolutionFunction::IkedaCarpenter(Arc::clone(&setup.pulse)),
+    };
+    let per_ev = |e: f64| {
+        let u = CLOCK / e.sqrt();
+        CHARGE_RATIO * beam(1.0e6)(u) * u / (2.0 * e)
+    };
+    let sample = instrument
+        .expected_counts(
+            &per_ev,
+            &mixture,
+            setup.energy_range_ev,
+            setup.simulator_step_us,
+        )
+        .counts;
+    let open = run(&setup, 1.0, &beam(1.0e6), &[], TEMPERATURE_K);
+    let counts = (rounded(&open), rounded(&sample));
+    let fit_with = |thickness_variance| {
+        let mut m = fitted_from(
+            measurement(&setup, counts.clone(), &[(isotope.clone(), density)]),
+            330.0,
+        );
+        m.material_mut().thickness_variance = thickness_variance;
+        fit_counts(&m, &calibration(&setup)).expect("fit")
+    };
+    let fit = fit_with(Value::Fitted(0.5 * variance));
+    assert!(fit.converged);
+    let region = &fit.regions[0];
+    let estimates = [
+        region.densities[0],
+        fit.temperature(),
+        region.thickness_variance.expect("v"),
+    ];
+    let truths = [density, TEMPERATURE_K, variance];
+    let pulls: Vec<f64> = (0..3)
+        .map(|i| (estimates[i] - truths[i]) / error_bar(&fit, i))
+        .collect();
+    assert!(pulls.iter().all(|p| p.abs() <= BOUND.sqrt()), "{pulls:?}");
+
+    let uniform = fit_with(Value::Known(0.0));
+    let misses = [
+        (uniform.regions[0].densities[0] - density) / error_bar(&uniform, 0),
+        (uniform.temperature() - TEMPERATURE_K) / error_bar(&uniform, 1),
+    ];
+    assert!(misses.iter().any(|m| m.abs() > 5.0), "{misses:?}");
+}
+
+#[test]
 fn maps_the_fit_does_not_describe_are_refused() {
     let setup = standard();
     let edges: Vec<f64> = (0..=577).map(|k| 350.0 + 0.2 * f64::from(k)).collect();
@@ -1489,6 +1580,7 @@ fn maps_the_fit_does_not_describe_are_refused() {
             library: EndfLibrary::EndfB8_0,
             isotopes: vec![(hafnium_like(20.0), Value::Fitted(THIN))],
             temperature_k: Value::Known(TEMPERATURE_K),
+            thickness_variance: Value::Known(0.0),
         },
         background: [Value::Known(0.0); 5],
         gamma_transmission: Value::Known(1.0),
@@ -4441,6 +4533,7 @@ mod maps {
                         .map(|data| (data.clone(), Value::Fitted(THIN)))
                         .collect(),
                     temperature_k,
+                    thickness_variance: Value::Known(0.0),
                 },
                 background: [
                     Value::Fitted(0.02),

@@ -552,6 +552,7 @@ def _material(
     material = nereids.Material(
         isotopes=[(data, nereids.Value.fitted(density)) for data, density in isotopes],
         temperature_k=_temperature_value(fit_config),
+        thickness_variance=_value_or_number(fit_config.get("thickness_variance"), 0.0),
         library=library,
     )
     return material, names, initial
@@ -596,6 +597,20 @@ def _limit_pixels(
     }
 
 
+def _patch_values(fits: list[list[Any]], name: str) -> np.ndarray:
+    """Each patch's fitted `name`, NaN where the patch has no fit or no value."""
+    return np.asarray(
+        [
+            [
+                np.nan if fit is None or getattr(fit, name) is None else float(getattr(fit, name))
+                for fit in row
+            ]
+            for row in fits
+        ],
+        dtype=float,
+    )
+
+
 def _fit_result_summary(result: Any, names: list[str]) -> dict[str, Any]:
     region = result.regions[0] if result.regions else None
     densities = np.asarray(region.densities if region is not None else [], dtype=float)
@@ -626,6 +641,9 @@ def _fit_result_summary(result: Any, names: list[str]) -> dict[str, Any]:
         "temperature_k": None
         if region is None or region.temperature_k is None
         else _finite_float_or_none(region.temperature_k),
+        "thickness_variance": None
+        if region is None or region.thickness_variance is None
+        else _finite_float_or_none(region.thickness_variance),
         "time_background": [_finite_float_or_none(v) for v in result.time_background],
         "room_background": _finite_float_or_none(result.room_background),
         "alpha": _json_safe(list(result.alpha)),
@@ -831,6 +849,7 @@ def _process_density_map(
         "patch_kinds": np.asarray(patch_kinds, dtype=object),
         "trusted": np.asarray(result.trusted),
         "temperature_k": np.asarray(result.temperature_k),
+        "thickness_variance": _patch_values(result.fits, "thickness_variance"),
         "isotope_names": np.asarray(names),
     }
     density_stats = []
@@ -948,6 +967,7 @@ def _validate_workflow(manifest: dict[str, Any]) -> dict[str, Any]:
         "fit_domain", "normalization", "background", "empty_background",
         "temperature", "temperature_k", "fit_temperature",
         "gamma_transmission", "time_background", "room_background",
+        "thickness_variance",
     }
     unsupported_fit = sorted(set(fit_config) - supported_fit)
     if unsupported_fit:

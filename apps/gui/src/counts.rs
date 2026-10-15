@@ -174,6 +174,7 @@ fn material(request: &FitRequest) -> Material {
         temperature_k: Value::Known(request.temperature_k),
         library: request.library,
         covariances: Vec::new(),
+        thickness_variance: Value::Known(0.0),
     }
 }
 
