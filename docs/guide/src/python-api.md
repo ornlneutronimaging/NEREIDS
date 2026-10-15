@@ -54,7 +54,8 @@ time-bin edges (microseconds), not an energy grid.
 | Value | One fitted quantity: known, fitted from a start, within bounds, or measured with a Gaussian prior. |
 | Material | Isotopes each with an areal density in atoms/barn, and a temperature in K. |
 | Region | Both runs' counts for one set of pixels, its background [b0, b1, b2], its area in pixels, the gamma transmission, and the material. |
-| Measurement | The time-bin edges, charge ratio, normalization, time background and regions of one fit. |
+| RoomBackground | Counts per microsecond per pixel per frame that follow each run's duration, and each run's frames. |
+| Measurement | The time-bin edges, charge ratio, normalization, time and room backgrounds and regions of one fit. |
 | Pulse | Ikeda-Carpenter pulse parameters and the energy span they hold over. |
 | Calibration | Timing offset t0 (microseconds), flight path (m), and Pulse. |
 | RegionFit | One region's fitted densities, temperature, background, predicted counts and overdispersion. |
@@ -89,11 +90,14 @@ optional live fractions are per bin in (0, 1].
 #### Measurement
 
 Measurement(time_edges_us, charge_ratio, normalization, regions,
-time_background=None) holds one open-beam/sample run pair. time_edges_us are
-the shared time-bin edges in microseconds (length = bins + 1), charge_ratio is
-the sample run's proton charge over the open-beam run's, and normalization is
-the sample run's normalization a. time_background is [C, A, tau] or
-NO_TIME_BACKGROUND.
+time_background=None, room_background=None) holds one open-beam/sample run
+pair. time_edges_us are the shared time-bin edges in microseconds (length =
+bins + 1), charge_ratio is the sample run's proton charge over the open-beam
+run's, and normalization is the sample run's normalization a. time_background
+is [C, A, tau] or NO_TIME_BACKGROUND. room_background is
+RoomBackground(rate, frames) or None: rate counts per microsecond per pixel
+per frame in both runs, not scaled by the charge ratio, the normalization or
+the gamma transmission, and frames the (open-beam, sample) frames.
 
 #### Pulse
 
@@ -118,8 +122,8 @@ and predicted_sample the counts per bin the fit predicts, overdispersion the
 sample bins the material's library leaves out.
 
 CountsFit.regions holds one RegionFit per region. normalization, t0_us,
-flight_path_m, alpha, beta, r, fwhm_squared_us2 and time_background are the
-shared fitted values; covariance is the fitted-quantity covariance (None when
+flight_path_m, alpha, beta, r, fwhm_squared_us2, time_background and
+room_background are the shared fitted values; covariance is the fitted-quantity covariance (None when
 the fit did not converge), unbounded_mean and unbounded_covariance the same
 Gaussian without the bounds, on_bound the bounds flags, deviance the half
 Poisson deviance over the overdispersion, and converged the fit status.
@@ -130,7 +134,8 @@ measured_pulls and pulse_consistency are None when unavailable.
 Patch.kind is "sample", "mixed" or "outside". MapMeasurement(time_edges_us,
 open_counts, sample_counts, excluded, sample, empty, material, charge_ratio,
 normalization, background, binning=1, empty_background=None, open_live=None,
-sample_live=None, time_background=None, gamma_transmission=None) holds the
+sample_live=None, time_background=None, gamma_transmission=None,
+room_background=None) holds the
 (time bin, row, column) counts and the (row, column) masks; its patches()
 method returns each patch's kind. time_background is [C, A, tau] per pixel,
 shared by every patch, or NO_TIME_BACKGROUND by default; gamma_transmission
@@ -139,7 +144,7 @@ is that of every sample patch, known 1 by default, and the empty pixels take 1.
 CountsMap exposes the per-patch fits (fits, failed, empty), density maps
 densities and density_sd in atoms/barn, temperature_k and temperature_sd_k in
 K, the two overdispersion maps, trusted, and the shared normalization,
-time_background, t0_us, flight_path_m, alpha, beta, r, fwhm_squared_us2, shared, shared_covariance,
+time_background, room_background, t0_us, flight_path_m, alpha, beta, r, fwhm_squared_us2, shared, shared_covariance,
 deviance and converged. n_fitted counts the fitted patches.
 
 trusted records numerical convergence and uncertainty status only: fitted

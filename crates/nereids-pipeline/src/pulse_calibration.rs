@@ -902,6 +902,7 @@ mod tests {
             charge_ratio: 1.0,
             normalization: Value::Known(1.0),
             time_background: NO_TIME_BACKGROUND,
+            room_background: None,
             regions: vec![Region {
                 open_counts: vec![100.0; bins],
                 sample_counts: vec![100.0; bins],
@@ -998,6 +999,7 @@ mod tests {
             r: 0.21,
             fwhm_squared_us2: 0.12,
             time_background: [0.0, 0.0, 1.0],
+            room_background: 0.0,
             covariance: Some(covariance),
             unbounded: Some(unbounded),
             on_bound: vec![false; free],

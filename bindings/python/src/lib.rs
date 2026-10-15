@@ -24,7 +24,7 @@ use nereids_physics::resolution::{
 };
 use nereids_physics::transmission::{self, InstrumentParams, SampleParams};
 use nereids_pipeline::counts_fit::{
-    CountsFit, Material, Measurement, NO_TIME_BACKGROUND, Region, RegionFit, Value,
+    CountsFit, Material, Measurement, NO_TIME_BACKGROUND, Region, RegionFit, RoomBackground, Value,
 };
 use nereids_pipeline::counts_map::{CountsMap, MapMeasurement, Patch};
 use nereids_pipeline::error::PipelineError;
@@ -3246,6 +3246,49 @@ impl PyRegion {
     }
 }
 
+/// Counts that follow each run's duration, not its proton charge: rate per
+/// microsecond per pixel per frame, and the frames of the open-beam run and
+/// the sample run.
+#[pyclass(name = "RoomBackground", from_py_object)]
+#[derive(Clone, Copy)]
+struct PyRoomBackground {
+    inner: RoomBackground,
+}
+
+#[pymethods]
+impl PyRoomBackground {
+    #[new]
+    fn new(rate: PyValue, frames: (f64, f64)) -> Self {
+        Self {
+            inner: RoomBackground {
+                rate: rate.inner,
+                frames: [frames.0, frames.1],
+            },
+        }
+    }
+
+    /// The rate per microsecond per pixel per frame.
+    #[getter]
+    fn rate(&self) -> PyValue {
+        PyValue {
+            inner: self.inner.rate,
+        }
+    }
+
+    /// The frames of the open-beam run and the sample run.
+    #[getter]
+    fn frames(&self) -> (f64, f64) {
+        (self.inner.frames[0], self.inner.frames[1])
+    }
+
+    fn __repr__(&self) -> String {
+        format!(
+            "RoomBackground(rate={:?}, frames={:?})",
+            self.inner.rate, self.inner.frames
+        )
+    }
+}
+
 /// An open-beam run and a sample run recorded in the same time bins, read in
 /// one or more regions of the detector.
 #[pyclass(name = "Measurement", from_py_object)]
@@ -3259,13 +3302,14 @@ impl PyMeasurement {
     /// time_edges_us are the time-bin edges in microseconds; charge_ratio is
     /// the sample run's proton charge over the open-beam run's.
     #[new]
-    #[pyo3(signature = (time_edges_us, charge_ratio, normalization, regions, time_background=None))]
+    #[pyo3(signature = (time_edges_us, charge_ratio, normalization, regions, time_background=None, room_background=None))]
     fn new(
         time_edges_us: Vec<f64>,
         charge_ratio: f64,
         normalization: PyValue,
         regions: Vec<PyRegion>,
         time_background: Option<Vec<PyValue>>,
+        room_background: Option<PyRoomBackground>,
     ) -> PyResult<Self> {
         let time_background = match time_background {
             Some(values) => value_trio(values)?,
@@ -3277,6 +3321,7 @@ impl PyMeasurement {
                 charge_ratio,
                 normalization: normalization.inner,
                 time_background,
+                room_background: room_background.map(|room| room.inner),
                 regions: regions.into_iter().map(|region| region.inner).collect(),
             },
         })
@@ -3310,6 +3355,14 @@ impl PyMeasurement {
             .iter()
             .map(|value| PyValue { inner: *value })
             .collect()
+    }
+
+    /// The room background, or None.
+    #[getter]
+    fn room_background(&self) -> Option<PyRoomBackground> {
+        self.inner
+            .room_background
+            .map(|inner| PyRoomBackground { inner })
     }
 
     /// The regions, in the order given.
@@ -3644,6 +3697,12 @@ impl PyCountsFit {
         self.inner.time_background
     }
 
+    /// The room background's rate, 0 without one.
+    #[getter]
+    fn room_background(&self) -> f64 {
+        self.inner.room_background
+    }
+
     /// Covariance of the fitted quantities, or None when the fit did not
     /// converge.
     #[getter]
@@ -3768,6 +3827,7 @@ struct MapData {
     charge_ratio: f64,
     normalization: Value,
     time_background: [Value; 3],
+    room_background: Option<RoomBackground>,
     open_counts: ndarray::Array3<f64>,
     sample_counts: ndarray::Array3<f64>,
     open_live: Option<Vec<f64>>,
@@ -3789,6 +3849,7 @@ impl MapData {
             charge_ratio: self.charge_ratio,
             normalization: self.normalization,
             time_background: self.time_background,
+            room_background: self.room_background,
             open_counts: self.open_counts.view(),
             sample_counts: self.sample_counts.view(),
             open_live: self.open_live.clone(),
@@ -3818,7 +3879,7 @@ impl PyMapMeasurement {
     /// open_counts and sample_counts have shape (time bin, row, column);
     /// excluded, sample and empty have shape (row, column).
     #[new]
-    #[pyo3(signature = (time_edges_us, open_counts, sample_counts, excluded, sample, empty, material, charge_ratio, normalization, background, binning=1, empty_background=None, open_live=None, sample_live=None, time_background=None, gamma_transmission=None))]
+    #[pyo3(signature = (time_edges_us, open_counts, sample_counts, excluded, sample, empty, material, charge_ratio, normalization, background, binning=1, empty_background=None, open_live=None, sample_live=None, time_background=None, gamma_transmission=None, room_background=None))]
     fn new(
         time_edges_us: Vec<f64>,
         open_counts: PyReadonlyArray3<f64>,
@@ -3836,6 +3897,7 @@ impl PyMapMeasurement {
         sample_live: Option<Vec<f64>>,
         time_background: Option<Vec<PyValue>>,
         gamma_transmission: Option<PyValue>,
+        room_background: Option<PyRoomBackground>,
     ) -> PyResult<Self> {
         let empty_background = match empty_background {
             Some(values) => value_trio(values)?,
@@ -3851,6 +3913,7 @@ impl PyMapMeasurement {
                 charge_ratio,
                 normalization: normalization.inner,
                 time_background,
+                room_background: room_background.map(|room| room.inner),
                 open_counts: open_counts.as_array().to_owned(),
                 sample_counts: sample_counts.as_array().to_owned(),
                 open_live,
@@ -3911,6 +3974,14 @@ impl PyMapMeasurement {
         }
     }
 
+    /// The room background, or None.
+    #[getter]
+    fn room_background(&self) -> Option<PyRoomBackground> {
+        self.inner
+            .room_background
+            .map(|inner| PyRoomBackground { inner })
+    }
+
     fn __repr__(&self) -> String {
         let (bins, height, width) = self.inner.open_counts.dim();
         format!(
@@ -3943,6 +4014,7 @@ struct PyCountsMap {
     trusted: ndarray::Array2<bool>,
     normalization: f64,
     time_background: [f64; 3],
+    room_background: f64,
     t0_us: f64,
     flight_path_m: f64,
     alpha: [f64; 2],
@@ -3974,6 +4046,7 @@ impl PyCountsMap {
             trusted: map.trusted.clone(),
             normalization: map.normalization,
             time_background: map.time_background,
+            room_background: map.room_background,
             t0_us: map.t0_us,
             flight_path_m: map.flight_path_m,
             alpha: map.alpha,
@@ -4085,6 +4158,12 @@ impl PyCountsMap {
     #[getter]
     fn time_background(&self) -> [f64; 3] {
         self.time_background
+    }
+
+    /// The room background's rate, 0 without one.
+    #[getter]
+    fn room_background(&self) -> f64 {
+        self.room_background
     }
 
     /// The timing offset t0 in microseconds.
@@ -4240,6 +4319,7 @@ fn nereids(m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_class::<PyValue>()?;
     m.add_class::<PyMaterial>()?;
     m.add_class::<PyRegion>()?;
+    m.add_class::<PyRoomBackground>()?;
     m.add_class::<PyMeasurement>()?;
     m.add_class::<PyPulse>()?;
     m.add_class::<PyCalibration>()?;

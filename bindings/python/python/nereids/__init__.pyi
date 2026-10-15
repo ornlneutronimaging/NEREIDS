@@ -1109,13 +1109,26 @@ class Region:
     @property
     def material(self) -> Material | None: ...
 
+class RoomBackground:
+    """Counts that follow each run's duration, not its proton charge.
+
+    rate is per microsecond per pixel per frame; frames are those of the
+    open-beam run and the sample run.
+    """
+
+    def __init__(self, rate: Value, frames: tuple[float, float]) -> None: ...
+    @property
+    def rate(self) -> Value: ...
+    @property
+    def frames(self) -> tuple[float, float]: ...
+
 class Measurement:
     """An open-beam run and a sample run recorded in the same time bins.
 
     time_edges_us are the time-bin edges in microseconds and charge_ratio is
     the sample run proton charge over the open-beam run.  normalization is the
     sample run normalization a.  time_background is [C, A, tau] or
-    NO_TIME_BACKGROUND.
+    NO_TIME_BACKGROUND; room_background is a RoomBackground or None.
     """
 
     def __init__(
@@ -1125,6 +1138,7 @@ class Measurement:
         normalization: Value,
         regions: list[Region],
         time_background: list[Value] | None = None,
+        room_background: RoomBackground | None = None,
     ) -> None: ...
     @property
     def time_edges_us(self) -> NDArray[np.float64]: ...
@@ -1134,6 +1148,8 @@ class Measurement:
     def normalization(self) -> Value: ...
     @property
     def time_background(self) -> list[Value]: ...
+    @property
+    def room_background(self) -> RoomBackground | None: ...
     @property
     def regions(self) -> list[Region]: ...
 
@@ -1226,6 +1242,8 @@ class CountsFit:
     @property
     def time_background(self) -> list[float]: ...
     @property
+    def room_background(self) -> float: ...
+    @property
     def covariance(self) -> NDArray[np.float64] | None: ...
     @property
     def unbounded_mean(self) -> list[float] | None: ...
@@ -1284,6 +1302,7 @@ class MapMeasurement:
         sample_live: NDArray[np.float64] | None = None,
         time_background: list[Value] | None = None,
         gamma_transmission: Value | None = None,
+        room_background: RoomBackground | None = None,
     ) -> None: ...
     def patches(self) -> list[list[Patch]]:
         """Each patch kind, in (patch row, patch column)."""
@@ -1298,6 +1317,8 @@ class MapMeasurement:
     def time_background(self) -> list[Value]: ...
     @property
     def gamma_transmission(self) -> Value: ...
+    @property
+    def room_background(self) -> RoomBackground | None: ...
 
 class CountsMap:
     """The fitted map, one value per patch."""
@@ -1328,6 +1349,8 @@ class CountsMap:
     def normalization(self) -> float: ...
     @property
     def time_background(self) -> list[float]: ...
+    @property
+    def room_background(self) -> float: ...
     @property
     def t0_us(self) -> float: ...
     @property

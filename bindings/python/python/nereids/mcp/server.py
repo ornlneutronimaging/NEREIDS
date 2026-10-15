@@ -444,6 +444,20 @@ def _time_background_values(spec: Any) -> list | None:
     return [_as_value(value, "known") for value in spec]
 
 
+def _room_background(spec: Any) -> Any:
+    """The room background {rate, frames: [open-beam, sample]}, or none."""
+    if spec is None:
+        return None
+    if not isinstance(spec, dict) or "rate" not in spec or "frames" not in spec:
+        raise ValueError("room_background must be an object with rate and frames")
+    frames = spec["frames"]
+    if not isinstance(frames, (list, tuple)) or len(frames) != 2:
+        raise ValueError("room_background frames must be [open-beam, sample]")
+    return nereids.RoomBackground(
+        _as_value(spec["rate"], "known"), (float(frames[0]), float(frames[1]))
+    )
+
+
 def _temperature_value(fit_config: dict[str, Any]) -> nereids.Value:
     """The material temperature; a number is fitted only with fit_temperature."""
     spec = fit_config.get("temperature")
@@ -607,6 +621,7 @@ def _fit_result_summary(result: Any, names: list[str]) -> dict[str, Any]:
         if region is None or region.temperature_k is None
         else _finite_float_or_none(region.temperature_k),
         "time_background": [_finite_float_or_none(v) for v in result.time_background],
+        "room_background": _finite_float_or_none(result.room_background),
         "alpha": _json_safe(list(result.alpha)),
         "beta": _json_safe(list(result.beta)),
         "r": _finite_float_or_none(result.r),
@@ -663,6 +678,7 @@ def _process_single_spectrum(
         normalization=_value_or_number(fit_config.get("normalization"), 1.0),
         regions=[region],
         time_background=_time_background_values(fit_config.get("time_background")),
+        room_background=_room_background(fit_config.get("room_background")),
     )
     result = nereids.fit_counts(measurement, calibration)
 
@@ -797,6 +813,7 @@ def _process_density_map(
         empty_background=_background_values(fit_config.get("empty_background")),
         time_background=_time_background_values(fit_config.get("time_background")),
         gamma_transmission=_value_or_number(fit_config.get("gamma_transmission"), 1.0),
+        room_background=_room_background(fit_config.get("room_background")),
     )
     result = nereids.fit_map(map_measurement, calibration)
 
@@ -837,6 +854,7 @@ def _process_density_map(
         "map_shape": list(np.asarray(result.trusted).shape),
         "n_fitted": int(result.n_fitted),
         "time_background": [_finite_float_or_none(v) for v in result.time_background],
+        "room_background": _finite_float_or_none(result.room_background),
         "converged": bool(result.converged),
         "unconverged": result.unconverged,
         "density_maps": density_stats,
@@ -923,7 +941,7 @@ def _validate_workflow(manifest: dict[str, Any]) -> dict[str, Any]:
     supported_fit = {
         "fit_domain", "normalization", "background", "empty_background",
         "temperature", "temperature_k", "fit_temperature",
-        "gamma_transmission", "time_background",
+        "gamma_transmission", "time_background", "room_background",
     }
     unsupported_fit = sorted(set(fit_config) - supported_fit)
     if unsupported_fit:
@@ -933,6 +951,10 @@ def _validate_workflow(manifest: dict[str, Any]) -> dict[str, Any]:
         _time_background_values(fit_config.get("time_background"))
     except (KeyError, TypeError, ValueError) as exc:
         errors.append(f"time background is invalid: {exc}")
+    try:
+        _room_background(fit_config.get("room_background"))
+    except (KeyError, TypeError, ValueError) as exc:
+        errors.append(f"room background is invalid: {exc}")
 
     resolution = config.get("resolution")
     resolution_kind: str | None = None

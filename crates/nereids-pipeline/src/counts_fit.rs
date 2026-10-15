@@ -120,6 +120,9 @@ pub struct Measurement {
     /// time edges' clock, `t₁` the first edge: `C` and `A` 0 or more, `τ` in µs
     /// positive.  [`NO_TIME_BACKGROUND`] gives none.
     pub time_background: [Value; 3],
+    /// Counts that follow each run's duration, not its proton charge; `None`
+    /// for none.
+    pub room_background: Option<RoomBackground>,
     /// The regions, separate sets of pixels timed by one clock.
     pub regions: Vec<Region>,
 }
@@ -127,6 +130,20 @@ pub struct Measurement {
 /// A [`Measurement::time_background`] of no counts.
 pub const NO_TIME_BACKGROUND: [Value; 3] =
     [Value::Known(0.0), Value::Known(0.0), Value::Known(1.0)];
+
+/// Counts that arrive at the same rate at every time of every frame, in
+/// both runs alike, whatever the proton charge and whatever is in front of
+/// the pixels, such as the detector's dark counts: `ρ` per µs per pixel per
+/// frame, `ρ · w_k · F` per pixel in a bin of width `w_k` of a run of `F`
+/// frames.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct RoomBackground {
+    /// `ρ`, 0 or more.
+    pub rate: Value,
+    /// The frames each run recorded, the open-beam run's then the sample
+    /// run's, finite and positive.
+    pub frames: [f64; 2],
+}
 
 /// The counts of a set of pixels in both runs, its background and the
 /// material the beam crosses there.
@@ -199,11 +216,15 @@ pub struct CountsFit {
     /// The time background's `[C, A, τ]`, each the known or the fitted one; a
     /// fitted `τ` is undetermined when `A` ends at 0.
     pub time_background: [f64; 3],
+    /// The room background's `ρ`: the known one, the fitted one, or 0 without
+    /// one.
+    pub room_background: f64,
     /// Covariance of the fitted quantities among, in this order, each region's
     /// densities, in the order given, and temperature, region by region; the
     /// normalization; each region's `b0`, `b1` and `b2`, region by region;
     /// each region's gamma transmission, region by region; the time
-    /// background's `C`, `A` and `τ`; `t0`; the flight path; `α₀`, `α₁`,
+    /// background's `C`, `A` and `τ`; the room background's `ρ`; `t0`; the
+    /// flight path; `α₀`, `α₁`,
     /// `β₀`, `β₁`, `R` and `h²`: the inverse of the information at the fit, each run's expected information over its
     /// overdispersion plus `1/sd²` for each measured quantity and `C⁻¹` over
     /// the pulse numbers a calibration's
@@ -329,8 +350,9 @@ pub struct RegionFit {
 /// `k` are
 ///
 /// ```text
-/// O_rk   = ℓ^O_rk · [w Σ_i φ_ri P_ki + p_r G_k]
-/// S_rk   = ℓ^S_rk · c_q · a · [w Σ_i φ_ri [T_ri + b_r(E_i)] P_ki + γ_r p_r G_k]
+/// O_rk   = ℓ^O_rk · [w Σ_i φ_ri P_ki + p_r G_k + p_r ρ F^O w_k]
+/// S_rk   = ℓ^S_rk · [c_q · a · (w Σ_i φ_ri [T_ri + b_r(E_i)] P_ki + γ_r p_r G_k)
+///                    + p_r ρ F^S w_k]
 /// T_ri   = exp(−Σ_m n_rm σ_m(E_i; T_r)), or 1 without a material
 /// b_r(E) = b0_r + b1_r/√E + b2_r·√E
 /// G_k    = ∫ over bin k of (C + A·exp(−(t − t₁)/τ)) dt
@@ -351,11 +373,15 @@ pub struct RegionFit {
 /// clock, `t₁` the first edge: it is not folded with the pulse, and the sample
 /// run scales it with `c_q·a`, which correct the charge ratio and an
 /// efficiency change alike in every pixel, and the fraction `γ_r` that reaches
-/// the region's pixels, `p_r` the region's pixels.  Counts that follow
-/// the run time instead, such as room background, are not modelled.  It turns
+/// the region's pixels, `p_r` the region's pixels.  It turns
 /// the ratio `R` of the neutrons alone into `R + g·(γ_r − R)`, `g` its share of
 /// the open-beam counts; SAMMY's backgrounds in time (`Bgfrpi`) are added to
-/// the transmission instead.
+/// the transmission instead.  The room background `ρ` ([`RoomBackground`])
+/// follows each run's duration instead, `F^O` and `F^S` its frames and `w_k`
+/// bin `k`'s width: it is neither folded with the pulse nor scaled by the
+/// charge ratio, the normalization or the gamma transmission, so it separates
+/// from the time background's `C` only where `c_q·a·γ_r` differs from
+/// `F^S/F^O`.
 ///
 /// The regions share the normalization, the run pair's scale; and `t0`, the
 /// flight path and the pulse, which one clock, flight path and moderator set
@@ -431,7 +457,8 @@ pub struct RegionFit {
 /// count, and one live fraction when given, per bin;
 /// [`PipelineError::InvalidParameter`] if a count is not a whole non-negative
 /// number, a run has no counts, a live fraction is not in (0, 1], the charge
-/// ratio is not finite and positive, a region's pixels are not finite and
+/// ratio or a room background's frames are not finite and positive, a
+/// region's pixels are not finite and
 /// positive, a known, starting or measured value is
 /// not finite and in its quantity's range, a measured value's sd is not finite
 /// and positive, bounds are not `lower < upper` in that range
@@ -488,7 +515,8 @@ fn fit_settled(
     most_passes: usize,
 ) -> Result<CountsFit, PipelineError> {
     let bins = starts_and_widths_us(&measurement.time_edges_us);
-    let mut open = starting_time_background(measurement)?;
+    let frames = open_frames(measurement.room_background.as_ref());
+    let mut open = starting_bypass(measurement)?;
     let mut intervals: Option<Vec<usize>> = None;
     for passes in 1.. {
         let (mut fit, _) = fit_counts_answer(
@@ -496,8 +524,12 @@ fn fit_settled(
             calibration,
             BeamStarts::OpenFitsAt(open, intervals.clone()),
         )?;
-        let (used, _) = time_counts_per_pixel(&bins, open);
-        let (now, _) = time_counts_per_pixel(&bins, fit.time_background);
+        let fitted = Bypass {
+            time: fit.time_background,
+            room: fit.room_background,
+        };
+        let used = open.open_counts_per_pixel(&bins, frames);
+        let now = fitted.open_counts_per_pixel(&bins, frames);
         let mut spread = 0.0;
         for (r, region) in fit.regions.iter().zip(&measurement.regions) {
             for (k, &mu) in r.predicted[0]
@@ -523,21 +555,49 @@ fn fit_settled(
             intervals
                 .get_or_insert_with(|| fit.regions.iter().map(|r| r.beam.intervals()).collect());
         }
-        open = fit.time_background;
+        open = fitted;
     }
     unreachable!("the passes end at most_passes")
 }
 
-pub(crate) fn starting_time_background(
-    measurement: &Measurement,
-) -> Result<[f64; 3], PipelineError> {
-    let mut numbers = [0.0; 3];
-    for (term, number) in numbers.iter_mut().enumerate() {
-        let (value, name, range, allowed) =
-            quantity(measurement, Role::TimeBackground(term)).expect("a quantity");
-        *number = value.parameter(name, range, &allowed)?.value;
+/// The time background's `[C, A, τ]` and the room background's `ρ`, which
+/// together give the counts per pixel of a run that bypass the pulse.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub(crate) struct Bypass {
+    pub(crate) time: [f64; 3],
+    pub(crate) room: f64,
+}
+
+impl Bypass {
+    /// The counts per pixel these numbers put in each bin of the open-beam run
+    /// of `frames` frames.
+    pub(crate) fn open_counts_per_pixel(&self, bins: &[(f64, f64)], frames: f64) -> Vec<f64> {
+        let (time, _) = time_counts_per_pixel(bins, self.time);
+        time.iter()
+            .zip(bins)
+            .map(|(g, (_, width))| g + self.room * frames * width)
+            .collect()
     }
-    Ok(numbers)
+}
+
+/// The open-beam run's frames, 0 without a room background.
+pub(crate) fn open_frames(room: Option<&RoomBackground>) -> f64 {
+    room.map_or(0.0, |room| room.frames[0])
+}
+
+pub(crate) fn starting_bypass(measurement: &Measurement) -> Result<Bypass, PipelineError> {
+    let start = |role| {
+        let (value, name, range, allowed) = quantity(measurement, role).expect("a quantity");
+        Ok::<f64, PipelineError>(value.parameter(name, range, &allowed)?.value)
+    };
+    Ok(Bypass {
+        time: [
+            start(Role::TimeBackground(0))?,
+            start(Role::TimeBackground(1))?,
+            start(Role::TimeBackground(2))?,
+        ],
+        room: start(Role::RoomBackground)?,
+    })
 }
 
 pub(crate) struct Starts {
@@ -595,6 +655,14 @@ pub(crate) fn checked<'a>(
     if !(charge_ratio.is_finite() && *charge_ratio > 0.0) {
         return invalid(format!(
             "the charge ratio must be finite and positive, got {charge_ratio}"
+        ));
+    }
+    if let Some(room) = &measurement.room_background
+        && !room.frames.iter().all(|f| f.is_finite() && *f > 0.0)
+    {
+        return invalid(format!(
+            "the room background's frames must be finite and positive, got {:?}",
+            room.frames
         ));
     }
     if let Some((r, region)) = regions
@@ -991,7 +1059,7 @@ fn in_span(
 
 pub(crate) enum BeamStarts<'a> {
     Given(&'a Starts),
-    OpenFitsAt([f64; 3], Option<Vec<usize>>),
+    OpenFitsAt(Bypass, Option<Vec<usize>>),
 }
 
 pub(crate) fn fit_counts_answer(
@@ -1021,6 +1089,9 @@ pub(crate) fn fit_counts_answer(
     let pulse = &calibration.pulse;
     let start: Vec<f64> = instrument.iter().map(|parameter| parameter.value).collect();
     let beam_origin_us = starts.map_or(start[0], |starts| starts.origin_us);
+    let frames = measurement
+        .room_background
+        .map_or([0.0; 2], |room| room.frames);
     let bins = time_edges_us.len() - 1;
     if let Some(starts) = starts {
         assert_eq!(starts.beams.len(), regions.len(), "one beam per region");
@@ -1065,8 +1136,10 @@ pub(crate) fn fit_counts_answer(
             .iter()
             .enumerate()
             .map(|(r, region)| {
-                let (per_pixel, _) =
-                    time_counts_per_pixel(&starts_and_widths_us(time_edges_us), numbers);
+                let per_pixel = numbers.open_counts_per_pixel(
+                    &starts_and_widths_us(time_edges_us),
+                    open_frames(measurement.room_background.as_ref()),
+                );
                 let known: Vec<f64> = per_pixel.iter().map(|g| region.pixels * g).collect();
                 let open = open_beam_with_intervals(
                     time_edges_us,
@@ -1187,7 +1260,7 @@ pub(crate) fn fit_counts_answer(
                         grid,
                         &beams,
                         &resonances,
-                        *charge_ratio,
+                        (*charge_ratio, frames),
                         beam_origin_us,
                         &layout,
                     ),
@@ -1337,7 +1410,7 @@ pub(crate) fn fit_counts_answer(
                 &fit.fine,
                 &beams,
                 &resonances,
-                *charge_ratio,
+                (*charge_ratio, frames),
                 beam_origin_us,
                 &layout,
             ),
@@ -1474,6 +1547,7 @@ pub(crate) fn fit_counts_answer(
         beams,
         resonances,
         charge_ratio: *charge_ratio,
+        frames,
         beam_origin_us,
         layout: Arc::clone(&layout),
         live,
@@ -1489,6 +1563,7 @@ pub(crate) fn fit_counts_answer(
         r: params[layout.pulse + 4],
         fwhm_squared_us2: params[layout.pulse + 5],
         time_background: [0, 1, 2].map(|i| params[layout.time_background + i]),
+        room_background: params[layout.room_background],
         covariance,
         unbounded,
         on_bound,
@@ -1508,6 +1583,7 @@ pub(crate) struct Answer {
     beams: Vec<BeamSpline>,
     resonances: Vec<Arc<[ResonanceData]>>,
     charge_ratio: f64,
+    frames: [f64; 2],
     beam_origin_us: f64,
     layout: Arc<Layout>,
     live: Vec<f64>,
@@ -1565,7 +1641,7 @@ impl Answer {
                 &self.grid,
                 &self.beams,
                 &self.resonances,
-                self.charge_ratio,
+                (self.charge_ratio, self.frames),
                 self.beam_origin_us,
                 &self.layout,
             ),
@@ -1725,11 +1801,12 @@ struct Profile {
     gradient: Vec<f64>,
 }
 
-pub(crate) const SHARED: [Role; 12] = [
+pub(crate) const SHARED: [Role; 13] = [
     Role::Normalization,
     Role::TimeBackground(0),
     Role::TimeBackground(1),
     Role::TimeBackground(2),
+    Role::RoomBackground,
     Role::T0,
     Role::FlightPath,
     Role::Pulse(0),
@@ -1746,9 +1823,10 @@ pub(crate) fn shared_parameters(
 ) -> Result<Vec<(Value, FitParameter)>, PipelineError> {
     validate_pulse_prior(calibration)?;
     let mut parameters = Vec::with_capacity(SHARED.len());
-    for &role in &SHARED[..4] {
-        let (value, name, range, allowed) =
-            quantity(measurement, role).expect("the measurement's shared quantity");
+    for (value, name, range, allowed) in SHARED
+        .iter()
+        .filter_map(|&role| quantity(measurement, role))
+    {
         parameters.push(value.parameter(name, range, &allowed)?);
     }
     parameters.extend(calibration.instrument()?);
@@ -1827,6 +1905,7 @@ pub(crate) enum Role {
     Background { region: usize, term: usize },
     GammaTransmission { region: usize },
     TimeBackground(usize),
+    RoomBackground,
     T0,
     FlightPath,
     Pulse(usize),
@@ -1856,7 +1935,7 @@ fn roles(beams: &[usize], isotopes: &[Option<usize>]) -> Vec<Role> {
         .chain(backgrounds)
         .chain(gammas)
         .chain((0..3).map(Role::TimeBackground))
-        .chain([Role::T0, Role::FlightPath])
+        .chain([Role::RoomBackground, Role::T0, Role::FlightPath])
         .chain((0..6).map(Role::Pulse))
         .collect()
 }
@@ -1920,6 +1999,15 @@ fn quantity(
                 allowed.into(),
             )
         }
+        Role::RoomBackground => (
+            measurement
+                .room_background
+                .as_ref()
+                .map_or(&Value::Known(0.0), |room| &room.rate),
+            "room background ρ".into(),
+            0.0..=f64::INFINITY,
+            "0 or more".into(),
+        ),
         Role::Beam { .. } | Role::T0 | Role::FlightPath | Role::Pulse(_) => return None,
     })
 }
@@ -1986,6 +2074,7 @@ struct Layout {
     quantities: usize,
     normalization: usize,
     time_background: usize,
+    room_background: usize,
     t0: usize,
     flight_path: usize,
     pulse: usize,
@@ -2036,6 +2125,7 @@ impl Layout {
                 .expect("the instrument's numbers follow the beams"),
             normalization: at(Role::Normalization),
             time_background: at(Role::TimeBackground(0)),
+            room_background: at(Role::RoomBackground),
             t0: at(Role::T0),
             flight_path: at(Role::FlightPath),
             pulse: at(Role::Pulse(0)),
@@ -2054,6 +2144,7 @@ struct RegionsModel {
     energies: Vec<f64>,
     shapes: [Vec<f64>; 3],
     charge_ratio: f64,
+    frames: [f64; 2],
     layout: Arc<Layout>,
     scale: RefCell<Option<Scale>>,
 }
@@ -2154,7 +2245,7 @@ impl RegionsModel {
         grid: &Arc<FlightTimeGrid>,
         beams: &[BeamSpline],
         isotopes: &[Arc<[ResonanceData]>],
-        charge_ratio: f64,
+        (charge_ratio, frames): (f64, [f64; 2]),
         beam_origin_us: f64,
         layout: &Arc<Layout>,
     ) -> Self {
@@ -2180,6 +2271,7 @@ impl RegionsModel {
             energies,
             shapes,
             charge_ratio,
+            frames,
             layout: Arc::clone(layout),
             scale: RefCell::new(Some(Scale::new(
                 (grid.t0_us(), grid.flight_path_m()),
@@ -2298,6 +2390,11 @@ impl RegionsModel {
         time_counts_per_pixel(&self.bins, [params[at], params[at + 1], params[at + 2]])
     }
 
+    fn room_per_pixel(&self) -> [Vec<f64>; 2] {
+        self.frames
+            .map(|frames| self.bins.iter().map(|(_, width)| frames * width).collect())
+    }
+
     fn sample_time_scale(&self, params: &[f64], region: usize) -> f64 {
         let place = &self.layout.regions[region];
         self.charge_ratio * params[self.layout.normalization] * params[place.gamma] * place.pixels
@@ -2308,6 +2405,8 @@ impl FitModel for RegionsModel {
     fn evaluate(&self, params: &[f64]) -> Result<Vec<f64>, FittingError> {
         let scale = self.scale(params)?;
         let (background, _) = self.time_background(params);
+        let [open_room, sample_room] = self.room_per_pixel();
+        let rate = params[self.layout.room_background];
         let mut counts = Vec::new();
         for region in 0..self.absorbers.len() {
             let Beams { open, sample, .. } = self.beams(params, &scale, region)?;
@@ -2317,13 +2416,15 @@ impl FitModel for RegionsModel {
                 predicted(&scale.rows, &open)?
                     .iter()
                     .zip(&background)
-                    .map(|(c, g)| c + pixels * g),
+                    .zip(&open_room)
+                    .map(|((c, g), f)| c + pixels * (g + rate * f)),
             );
             counts.extend(
                 predicted(&scale.rows, &sample)?
                     .iter()
                     .zip(&background)
-                    .map(|(c, g)| c + sample_scale * g),
+                    .zip(&sample_room)
+                    .map(|((c, g), f)| c + sample_scale * g + pixels * rate * f),
             );
         }
         Ok(counts)
@@ -2448,6 +2549,18 @@ impl FitModel for RegionsModel {
                         ]
                     })
                     .collect(),
+                Role::RoomBackground => {
+                    let [open_room, sample_room] = self.room_per_pixel();
+                    (0..regions)
+                        .flat_map(|r| {
+                            let pixels = layout.regions[r].pixels;
+                            [
+                                (open_rows(r), scaled(pixels, &open_room)),
+                                (sample_rows(r), scaled(pixels, &sample_room)),
+                            ]
+                        })
+                        .collect()
+                }
                 Role::Pulse(number) => {
                     if pulse_slopes.is_none() {
                         pulse_slopes = Some(
@@ -2585,12 +2698,20 @@ mod tests {
                 }
                 Role::GammaTransmission { region } => [0.8, 1.0, 0.6][region],
                 Role::TimeBackground(term) => [50.0, 300.0, 40.0][term],
+                Role::RoomBackground => 2.0e-3,
                 Role::T0 => T0_US + 0.05,
                 Role::FlightPath => FLIGHT_PATH_M + 0.003,
                 Role::Pulse(n) => [0.37, 0.06, 0.01, 0.24, 0.16, 0.3][n],
             })
             .collect();
-        let model = RegionsModel::new(grid, &beams, &isotopes, 1.2, T0_US, &layout);
+        let model = RegionsModel::new(
+            grid,
+            &beams,
+            &isotopes,
+            (1.2, [3.0e4, 2.5e4]),
+            T0_US,
+            &layout,
+        );
         let live: Vec<f64> = (0..model.evaluate(&params).expect("counts").len())
             .map(|k| 0.9 + 0.1 * (0.3 * k as f64).sin())
             .collect();
@@ -2675,12 +2796,13 @@ mod tests {
                 }
                 Role::GammaTransmission { .. } => 1.0,
                 Role::TimeBackground(term) => [0.0, 0.0, 1.0][term],
+                Role::RoomBackground => 0.0,
                 Role::T0 => T0_US,
                 Role::FlightPath => FLIGHT_PATH_M,
                 Role::Pulse(n) => [0.35, 0.05, 0.0, 0.25, 0.15, 0.0][n],
             })
             .collect();
-        let model = RegionsModel::new(&grid, &beams, &isotopes, 1.2, T0_US, &layout);
+        let model = RegionsModel::new(&grid, &beams, &isotopes, (1.2, [0.0; 2]), T0_US, &layout);
         let bins = model.evaluate(&truth).expect("counts").len() / 6;
         let live: Vec<f64> = (0..6 * bins)
             .map(|k| 0.9 + 0.1 * (0.3 * k as f64).sin())
@@ -2697,6 +2819,7 @@ mod tests {
             charge_ratio: 1.2,
             normalization: Value::Fitted(1.0),
             time_background: NO_TIME_BACKGROUND,
+            room_background: None,
             regions: materials
                 .into_iter()
                 .enumerate()
@@ -2734,7 +2857,7 @@ mod tests {
                 prior: None,
             },
         };
-        let open = starting_time_background(&measurement).expect("numbers");
+        let open = starting_bypass(&measurement).expect("numbers");
         let (fit, answer) = fit_counts_answer(
             &measurement,
             &calibration,
@@ -2868,6 +2991,7 @@ mod tests {
 
         let drifting = Measurement {
             time_background: [Value::Fitted(50.0), Value::Known(0.0), Value::Known(1.0)],
+            room_background: None,
             ..measurement
         };
         for (most_passes, settled) in [(1, false), (2, true)] {
@@ -2903,17 +3027,19 @@ mod tests {
                 Role::Background { region, term } => [[0.05, 0.0, 0.0], [0.0; 3]][region][term],
                 Role::GammaTransmission { .. } => 1.0,
                 Role::TimeBackground(term) => [0.0, 0.0, 1.0][term],
+                Role::RoomBackground => 0.0,
                 Role::T0 => T0_US,
                 Role::FlightPath => FLIGHT_PATH_M,
                 Role::Pulse(n) => [0.35, 0.05, 0.0, 0.25, 0.15, 0.0][n],
             })
             .collect();
-        let counts: Vec<f64> = RegionsModel::new(&grid, &beams, &isotopes, 1.2, T0_US, &layout)
-            .evaluate(&truth)
-            .expect("counts")
-            .iter()
-            .map(|c| c.round())
-            .collect();
+        let counts: Vec<f64> =
+            RegionsModel::new(&grid, &beams, &isotopes, (1.2, [0.0; 2]), T0_US, &layout)
+                .evaluate(&truth)
+                .expect("counts")
+                .iter()
+                .map(|c| c.round())
+                .collect();
         let bins = counts.len() / 4;
         let run =
             |r: usize, run: usize| counts[(2 * r + run) * bins..(2 * r + run + 1) * bins].to_vec();
@@ -2936,6 +3062,7 @@ mod tests {
             charge_ratio: 1.2,
             normalization: Value::Fitted(1.0),
             time_background: NO_TIME_BACKGROUND,
+            room_background: None,
             open_counts: open.view(),
             sample_counts: sample.view(),
             open_live: None,
@@ -2991,6 +3118,7 @@ mod tests {
             charge_ratio: 1.2,
             normalization: map.normalization,
             time_background: NO_TIME_BACKGROUND,
+            room_background: None,
             regions: vec![
                 region(0, Some(material), background),
                 region(1, None, [Value::Known(0.0); 3]),
@@ -3097,7 +3225,7 @@ mod tests {
             &grid,
             std::slice::from_ref(&beam),
             &[isotopes],
-            charge_ratio,
+            (charge_ratio, [0.0; 2]),
             T0_US,
             &layout,
         );
@@ -3108,7 +3236,7 @@ mod tests {
                 .copied()
                 .chain([3.0e-4, 5.0e-4, 300.0, normalization])
                 .chain(background)
-                .chain([1.0, 0.0, 0.0, 1.0])
+                .chain([1.0, 0.0, 0.0, 1.0, 0.0])
                 .chain([T0_US, FLIGHT_PATH_M])
                 .chain([0.35, 0.05, 0.0, 0.25, 0.15, 0.0])
                 .collect();

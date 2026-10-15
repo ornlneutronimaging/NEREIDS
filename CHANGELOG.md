@@ -13,6 +13,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
   shared by every patch, and each patch's gamma transmission.
   `MapMeasurement` gains `time_background` and `gamma_transmission`;
   MCP map workflows accept both.
+- `fit_counts` and `fit_map` model a room background: counts per microsecond
+  per pixel per frame in both runs, independent of proton charge and of the
+  sample. `RoomBackground(rate, frames)` gives it; results report
+  `room_background`.
 
 ### Changed (breaking)
 
