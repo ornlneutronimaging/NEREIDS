@@ -16,14 +16,9 @@ fastmcp = pytest.importorskip("fastmcp")
 
 import nereids
 from nereids.mcp.server import (
-    _fit_result_summary,
-    _json_safe,
     _registry,
-    _single_fit_kwargs,
-    _spatial_fit_kwargs,
     compute_cross_sections,
     compute_transmission,
-    detect_isotopes,
     extract_resonance_manifest,
     forward_model,
     get_resonance_parameters,
@@ -33,7 +28,7 @@ from nereids.mcp.server import (
     validate_resonance_dataset,
 )
 
-from _fixtures import _synthetic_u238_data, _synthetic_u238_entry
+from _fixtures import _synthetic_u238_entry
 
 
 def _load_endf_or_skip(**kwargs):
@@ -248,50 +243,6 @@ class TestForwardModel:
             )
 
 
-# ---------------------------------------------------------------------------
-# detect_isotopes
-# ---------------------------------------------------------------------------
-
-
-class TestDetectIsotopes:
-    # Ta-181 is a mixed evaluation (resolved MLBW LRF=2 + URR) that loads;
-    # W-182 (pure LRF=7 + URR) is now rejected at load, so it cannot be a trace.
-    def test_basic(self):
-        _load_endf_or_skip(isotope="Fe-56")
-        _load_endf_or_skip(isotope="Ta-181")
-        result = detect_isotopes(
-            matrix_isotope="Fe-56",
-            matrix_density=0.01,
-            trace_isotopes=["Ta-181"],
-            trace_ppm=1000.0,
-            energy_min=1.0, energy_max=100.0, n_points=200,
-            i0=1e6,
-        )
-        assert len(result) == 1
-        entry = result[0]
-        assert isinstance(entry["detectable"], bool)
-        assert isinstance(entry["peak_snr"], float)
-        assert isinstance(entry["peak_energy_ev"], float)
-        assert isinstance(entry["peak_delta_t_per_ppm"], float)
-        assert isinstance(entry["opaque_fraction"], float)
-
-    def test_matrix_not_loaded(self):
-        with pytest.raises(ValueError, match="not loaded"):
-            detect_isotopes(
-                matrix_isotope="Fe-56",
-                matrix_density=0.01,
-                trace_isotopes=["Ta-181"],
-            )
-
-    def test_trace_not_loaded(self):
-        _load_endf_or_skip(isotope="Fe-56")
-        with pytest.raises(ValueError, match="not loaded"):
-            detect_isotopes(
-                matrix_isotope="Fe-56",
-                matrix_density=0.01,
-                trace_isotopes=["Ta-181"],
-            )
-
 
 # ---------------------------------------------------------------------------
 # Input validation
@@ -319,46 +270,11 @@ class TestInputValidation:
         with pytest.raises(ValueError, match="thickness"):
             forward_model([{"isotope": "Fe-56"}])  # missing thickness
 
-    def test_detect_isotopes_empty_traces(self):
-        _load_endf_or_skip(isotope="Fe-56")
-        with pytest.raises(ValueError, match="empty"):
-            detect_isotopes("Fe-56", 0.01, [])
-
     def test_list_isotopes_invalid_z(self):
         with pytest.raises(ValueError, match="z must be"):
             list_isotopes(0)
 
 
-class TestRemovedFitKeys:
-    """The removed alpha_1/alpha_2 fit keys must raise, not silently no-op.
-
-    The fit config is whitelist-filtered, so without the explicit rejection a
-    legacy manifest passing these keys would run with defaults and report
-    success while ignoring the request.
-    """
-
-    REMOVED = ["fit_alpha_1", "fit_alpha_2", "alpha_1_init", "alpha_2_init"]
-
-    @pytest.mark.parametrize("key", REMOVED)
-    def test_single_fit_kwargs_rejects_removed_key(self, key):
-        with pytest.raises(ValueError, match="no longer supported"):
-            _single_fit_kwargs({key: 1.0}, {}, counts=True)
-
-    @pytest.mark.parametrize("key", REMOVED)
-    def test_spatial_fit_kwargs_rejects_removed_key(self, key):
-        with pytest.raises(ValueError, match="no longer supported"):
-            _spatial_fit_kwargs({key: 1.0}, {})
-
-    def test_error_names_every_offending_key(self):
-        config = {"fit_alpha_1": True, "alpha_2_init": 0.5, "max_iter": 10}
-        with pytest.raises(ValueError, match="alpha_2_init.*fit_alpha_1|fit_alpha_1.*alpha_2_init"):
-            _single_fit_kwargs(config, {}, counts=False)
-
-    def test_clean_config_still_accepted(self):
-        kwargs = _single_fit_kwargs({"max_iter": 10}, {}, counts=False)
-        assert kwargs == {"max_iter": 10}
-        kwargs = _spatial_fit_kwargs({"max_iter": 10}, {})
-        assert kwargs == {"max_iter": 10}
 
 
 # ---------------------------------------------------------------------------
@@ -385,1365 +301,165 @@ def _write_json_frontmatter_manifest(tmp_path, analysis):
     return path
 
 
-class TestManifestWorkflowTools:
-    def test_extract_and_validate_manifest(self, tmp_path):
-        np.savez(
-            tmp_path / "spectrum.npz",
-            energies_ev=np.linspace(1.0, 30.0, 20),
-            transmission=np.ones(20),
-            uncertainty=np.full(20, 0.01),
-        )
-        manifest_path = _write_json_frontmatter_manifest(
-            tmp_path,
-            {
-                "mode": "single_spectrum",
-                "data": {"kind": "transmission_npz", "path": "spectrum.npz"},
-                "isotopes": [_synthetic_u238_entry()],
-                "fit": {"solver": "lm", "max_iter": 5},
-                "resolution": {"kind": "none"},
-            },
-        )
+class TestCountsManifest:
+    """Routing oracle for the counts-only process_resonance_dataset workflow."""
 
-        extracted = extract_resonance_manifest(str(tmp_path))
-        assert extracted["manifest_path"] == str(manifest_path)
-        assert extracted["frontmatter"]["tool"] == "nereids"
-
-        validation = validate_resonance_dataset(str(tmp_path))
-        assert validation["valid"] is True
-        assert validation["mode"] == "single_spectrum"
-        assert validation["data_paths"][0]["exists"] is True
-
-    def test_process_single_spectrum_manifest(self, tmp_path):
-        energies = np.linspace(1.0, 30.0, 160)
-        true_density = 0.002
-        isotope = _synthetic_u238_data()
-        transmission = np.asarray(
-            nereids.forward_model(energies, [(isotope, true_density)])
-        )
-        np.savez(
-            tmp_path / "spectrum.npz",
-            energies_ev=energies,
-            transmission=transmission,
-            uncertainty=np.full_like(transmission, 0.005),
-        )
-        _write_json_frontmatter_manifest(
-            tmp_path,
-            {
-                "mode": "single_spectrum",
-                "data": {"kind": "transmission_npz", "path": "spectrum.npz"},
-                "isotopes": [_synthetic_u238_entry(initial_density=0.001)],
-                "fit": {"solver": "lm", "max_iter": 50},
-                "resolution": {"kind": "none"},
-                "output": {"directory": "output"},
-            },
-        )
-
-        result = process_resonance_dataset(str(tmp_path))
-
-        assert result["success"] is True
-        fit = result["results"]["density_fits"][0]
-        assert fit["isotope"] == "U-238"
-        assert fit["density_atoms_per_barn"] == pytest.approx(true_density, rel=0.15)
-        assert (tmp_path / "output" / "nereids_spectrum_fit.npz").exists()
-        assert (tmp_path / "output" / "nereids_mcp_result.json").exists()
-
-    def test_process_density_map_manifest(self, tmp_path):
-        energies = np.linspace(1.0, 30.0, 120)
-        true_density = 0.002
-        isotope = _synthetic_u238_data()
-        spectrum = np.asarray(
-            nereids.forward_model(energies, [(isotope, true_density)])
-        )
-        transmission = np.tile(spectrum[:, None, None], (1, 2, 3))
-        np.savez(
-            tmp_path / "density-map.npz",
-            energies_ev=energies,
-            transmission=transmission,
-            uncertainty=np.full_like(transmission, 0.005),
-        )
-        _write_json_frontmatter_manifest(
-            tmp_path,
-            {
-                "mode": "density_map",
-                "data": {"kind": "transmission_npz", "path": "density-map.npz"},
-                "isotopes": [_synthetic_u238_entry(initial_density=0.001)],
-                "fit": {"solver": "lm", "max_iter": 50},
-                "resolution": {"kind": "none"},
-                "output": {"directory": "output"},
-            },
-        )
-
-        result = process_resonance_dataset(str(tmp_path))
-
-        assert result["success"] is True
-        assert result["results"]["n_converged"] == 6
-        stats = result["results"]["density_maps"][0]["density_atoms_per_barn"]
-        assert stats["mean"] == pytest.approx(true_density, rel=0.15)
-        assert (tmp_path / "output" / "nereids_density_map.npz").exists()
-
-    def test_nexus_density_map_aligns_counts_with_ascending_energy(
-        self, tmp_path, monkeypatch
-    ):
-        sample_path = tmp_path / "sample.nxs"
-        open_beam_path = tmp_path / "open_beam.nxs"
-        sample_path.touch()
-        open_beam_path.touch()
-        captured = {}
-
-        def fake_load_nexus_histogram(path):
-            if path == str(sample_path):
-                counts = np.asarray([[[90.0]], [[40.0]], [[10.0]]])
-            else:
-                counts = np.asarray([[[100.0]], [[100.0]], [[100.0]]])
-            return SimpleNamespace(
-                counts=counts,
-                tof_edges_us=np.asarray([1.0, 2.0, 3.0, 4.0]),
-                flight_path_m=25.0,
-            )
-
-        def fake_from_counts(sample, open_beam):
-            captured["sample"] = np.asarray(sample).copy()
-            captured["open_beam"] = np.asarray(open_beam).copy()
-            return {"sample": sample, "open_beam": open_beam}
-
-        def fake_spatial_map_typed(
-            input_data, energies, isotope_data, initial_densities, **kwargs
-        ):
-            captured["energies"] = np.asarray(energies).copy()
-            return SimpleNamespace(
-                chi_squared_map=np.zeros((1, 1)),
-                converged_map=np.ones((1, 1), dtype=bool),
-                deviance_per_dof_map=None,
-                density_maps=[np.full((1, 1), 0.002)],
-                uncertainty_maps=[np.full((1, 1), 0.0001)],
-                n_converged=1,
-                n_total=1,
-                n_failed=0,
-            )
-
-        monkeypatch.setattr(nereids, "load_nexus_histogram", fake_load_nexus_histogram)
-        monkeypatch.setattr(
-            nereids,
-            "tof_to_energy_centers",
-            lambda edges, flight_path, delay_us=0.0: np.asarray([1.0, 4.0, 9.0]),
-        )
-        monkeypatch.setattr(nereids, "from_counts", fake_from_counts)
-        monkeypatch.setattr(nereids, "spatial_map_typed", fake_spatial_map_typed)
-
-        _write_json_frontmatter_manifest(
-            tmp_path,
-            {
-                "mode": "density_map",
-                "data": {
-                    "kind": "nexus",
-                    "sample_path": sample_path.name,
-                    "open_beam_path": open_beam_path.name,
-                },
-                "isotopes": [_synthetic_u238_entry(initial_density=0.001)],
-                "fit": {"solver": "kl", "max_iter": 5},
-                "resolution": {"kind": "none"},
-                "output": {"directory": "output"},
-            },
-        )
-
-        result = process_resonance_dataset(str(tmp_path))
-
-        assert result["success"] is True
-        np.testing.assert_allclose(captured["energies"], [1.0, 4.0, 9.0])
-        np.testing.assert_allclose(captured["sample"][:, 0, 0], [10.0, 40.0, 90.0])
-
-    def test_process_rejects_mismatched_counts_shapes(self, tmp_path):
-        np.savez(
-            tmp_path / "counts.npz",
-            energies_ev=np.linspace(1.0, 5.0, 5),
-            sample_counts=np.ones(5),
-            open_beam_counts=np.ones(6),
-        )
-        _write_json_frontmatter_manifest(
-            tmp_path,
-            {
-                "mode": "single_spectrum",
-                "data": {"kind": "counts_npz", "path": "counts.npz"},
-                "isotopes": [_synthetic_u238_entry()],
-                "fit": {"solver": "kl", "max_iter": 5},
-                "resolution": {"kind": "none"},
-            },
-        )
-
-        result = process_resonance_dataset(str(tmp_path))
-
-        assert result["success"] is False
-        assert "matching shapes" in result["error"]
-
-    def test_process_reports_missing_counts_npz_key(self, tmp_path):
-        np.savez(
-            tmp_path / "counts.npz",
-            energies_ev=np.linspace(1.0, 5.0, 5),
-            sample_counts=np.ones(5),
-        )
-        _write_json_frontmatter_manifest(
-            tmp_path,
-            {
-                "mode": "single_spectrum",
-                "data": {"kind": "counts_npz", "path": "counts.npz"},
-                "isotopes": [_synthetic_u238_entry()],
-                "fit": {"solver": "kl", "max_iter": 5},
-                "resolution": {"kind": "none"},
-            },
-        )
-
-        result = process_resonance_dataset(str(tmp_path))
-
-        assert result["success"] is False
-        assert "missing required key(s): open_beam_counts" in result["error"]
-        assert "Available keys: energies_ev, sample_counts" in result["error"]
-
-    def test_process_rejects_mismatched_density_uncertainty_shapes(self, tmp_path):
-        np.savez(
-            tmp_path / "density-map.npz",
-            energies_ev=np.linspace(1.0, 5.0, 5),
-            transmission=np.ones((5, 2, 2)),
-            uncertainty=np.ones((5, 2, 3)),
-        )
-        _write_json_frontmatter_manifest(
-            tmp_path,
-            {
-                "mode": "density_map",
-                "data": {"kind": "transmission_npz", "path": "density-map.npz"},
-                "isotopes": [_synthetic_u238_entry()],
-                "fit": {"solver": "lm", "max_iter": 5},
-                "resolution": {"kind": "none"},
-            },
-        )
-
-        result = process_resonance_dataset(str(tmp_path))
-
-        assert result["success"] is False
-        assert "matching shapes" in result["error"]
-
-    def test_process_reports_missing_density_npz_key(self, tmp_path):
-        np.savez(
-            tmp_path / "density-map.npz",
-            energies_ev=np.linspace(1.0, 5.0, 5),
-            sample_counts=np.ones((5, 2, 2)),
-        )
-        _write_json_frontmatter_manifest(
-            tmp_path,
-            {
-                "mode": "density_map",
-                "data": {"kind": "counts_npz", "path": "density-map.npz"},
-                "isotopes": [_synthetic_u238_entry()],
-                "fit": {"solver": "kl", "max_iter": 5},
-                "resolution": {"kind": "none"},
-            },
-        )
-
-        result = process_resonance_dataset(str(tmp_path))
-
-        assert result["success"] is False
-        assert "density_map counts data is missing required key(s)" in result["error"]
-        assert "open_beam_counts" in result["error"]
-
-    def test_process_reports_missing_density_transmission_key(self, tmp_path):
-        np.savez(
-            tmp_path / "density-map.npz",
-            energies_ev=np.linspace(1.0, 5.0, 5),
-            not_transmission=np.ones((5, 2, 2)),
-        )
-        _write_json_frontmatter_manifest(
-            tmp_path,
-            {
-                "mode": "density_map",
-                "data": {"kind": "transmission_npz", "path": "density-map.npz"},
-                "isotopes": [_synthetic_u238_entry()],
-                "fit": {"solver": "lm", "max_iter": 5},
-                "resolution": {"kind": "none"},
-            },
-        )
-
-        result = process_resonance_dataset(str(tmp_path))
-
-        assert result["success"] is False
-        assert "density_map transmission data is missing required key(s)" in result["error"]
-        assert "transmission" in result["error"]
-
-    def test_process_rejects_out_of_bounds_roi(self, tmp_path):
-        np.savez(
-            tmp_path / "density-map.npz",
-            energies_ev=np.linspace(1.0, 5.0, 5),
-            transmission=np.ones((5, 2, 2)),
-            uncertainty=np.ones((5, 2, 2)),
-        )
-        _write_json_frontmatter_manifest(
-            tmp_path,
-            {
-                "mode": "density_map",
-                "data": {
-                    "kind": "transmission_npz",
-                    "path": "density-map.npz",
-                    "roi": {"x0": 1, "y0": 0, "width": 2, "height": 1},
-                },
-                "isotopes": [_synthetic_u238_entry()],
-                "fit": {"solver": "lm", "max_iter": 5},
-                "resolution": {"kind": "none"},
-            },
-        )
-
-        result = process_resonance_dataset(str(tmp_path))
-
-        assert result["success"] is False
-        assert "exceeds cube bounds" in result["error"]
-
-    def test_process_rejects_mismatched_nexus_tof_edges(self, tmp_path, monkeypatch):
-        sample_path = tmp_path / "sample.nxs"
-        open_beam_path = tmp_path / "open_beam.nxs"
-        sample_path.touch()
-        open_beam_path.touch()
-
-        def fake_load_nexus_histogram(path):
-            tof_edges = (
-                np.asarray([1.0, 2.0, 3.0, 4.0])
-                if path == str(sample_path)
-                else np.asarray([1.0, 2.0, 3.2, 4.0])
-            )
-            return SimpleNamespace(
-                counts=np.ones((3, 1, 1)),
-                tof_edges_us=tof_edges,
-                flight_path_m=25.0,
-            )
-
-        monkeypatch.setattr(nereids, "load_nexus_histogram", fake_load_nexus_histogram)
-        _write_json_frontmatter_manifest(
-            tmp_path,
-            {
-                "mode": "density_map",
-                "data": {
-                    "kind": "nexus",
-                    "sample_path": sample_path.name,
-                    "open_beam_path": open_beam_path.name,
-                },
-                "isotopes": [_synthetic_u238_entry()],
-                "fit": {"solver": "kl", "max_iter": 5},
-                "resolution": {"kind": "none"},
-            },
-        )
-
-        result = process_resonance_dataset(str(tmp_path))
-
-        assert result["success"] is False
-        assert "TOF bin edges must match" in result["error"]
-
-    def test_validation_messages_match_allowed_values(self, tmp_path):
-        frontmatter = {
-            "name": "invalid-validation-demo",
-            "tool": "pleiades",
-            "analysis": {
-                "mode": "bad-mode",
-                "data": {"kind": "transmission_npz"},
-                "isotopes": [_synthetic_u238_entry()],
+    @staticmethod
+    def _calibration_block():
+        return {
+            "t0_us": 3.0,
+            "flight_path_m": 25.0,
+            "pulse": {
+                "alpha0": 0.35,
+                "alpha1": 0.05,
+                "beta0": 0.25,
+                "beta1": 0.0,
+                "r": 0.15,
+                "fwhm_squared_us2": 0.0,
+                "energy_span_ev": [1.0, 200.0],
             },
         }
-        (tmp_path / "manifest_intermediate.md").write_text(
-            "---\n" + json.dumps(frontmatter) + "\n---\n"
-        )
 
-        result = validate_resonance_dataset(str(tmp_path))
-
-        assert result["valid"] is False
-        assert any("'nereids-mcp'" in error for error in result["errors"])
-        assert any("spectrum" in error for error in result["errors"])
-
-    def test_dry_run_rejects_missing_required_data_path(self, tmp_path):
-        _write_json_frontmatter_manifest(
-            tmp_path,
-            {
-                "mode": "single_spectrum",
-                "data": {"kind": "transmission_npz"},
-                "isotopes": [_synthetic_u238_entry()],
-                "fit": {"solver": "lm", "max_iter": 5},
-                "resolution": {"kind": "none"},
-            },
-        )
-
-        result = process_resonance_dataset(str(tmp_path), dry_run=True)
-
-        assert result["success"] is False
-        assert "single_spectrum workflow requires data.path" in result["validation"]["errors"]
-
-    def test_validate_and_dry_run_reject_counts_with_active_resolution(self, tmp_path):
+    @staticmethod
+    def _counts_npz(tmp_path, bins=6):
+        edges = np.linspace(200.0, 400.0, bins + 1)
         np.savez(
             tmp_path / "counts.npz",
-            energies_ev=np.linspace(1.0, 30.0, 20),
-            sample_counts=np.full(20, 900.0),
-            open_beam_counts=np.full(20, 1000.0),
-        )
-        _write_json_frontmatter_manifest(
-            tmp_path,
-            {
-                "mode": "single_spectrum",
-                "data": {"kind": "counts_npz", "path": "counts.npz"},
-                "isotopes": [_synthetic_u238_entry()],
-                "fit": {"solver": "kl", "max_iter": 5},
-                "resolution": {
-                    "kind": "gaussian",
-                    "flight_path_m": 25.0,
-                    "delta_t_us": 1.0,
-                    "delta_l_m": 0.01,
-                },
-            },
+            time_edges_us=edges,
+            open_beam_counts=np.full(bins, 100.0),
+            sample_counts=np.full(bins, 80.0),
         )
 
-        validation = validate_resonance_dataset(str(tmp_path))
-        dry_run = process_resonance_dataset(str(tmp_path), dry_run=True)
+    def _analysis(self, mode="single_spectrum", **fit):
+        block = {
+            "mode": mode,
+            "data": {"kind": "counts_npz", "path": "counts.npz"},
+            "calibration": self._calibration_block(),
+            "isotopes": [_synthetic_u238_entry()],
+            "fit": {"fit_domain": "counts", "normalization": 1.0},
+        }
+        block["fit"].update(fit)
+        return block
 
-        assert validation["valid"] is False
-        assert dry_run["success"] is False
-        assert dry_run["validation"]["errors"] == validation["errors"]
-        message = "\n".join(validation["errors"])
-        assert "counts input with instrument resolution is not available" in message
-        assert "separate-arm model R[Phi] and R[Phi*T]" in message
-
-    def test_validation_allows_transmission_with_active_resolution(self, tmp_path):
-        np.savez(
-            tmp_path / "spectrum.npz",
-            energies_ev=np.linspace(1.0, 30.0, 20),
-            transmission=np.ones(20),
-            uncertainty=np.full(20, 0.01),
-        )
-        _write_json_frontmatter_manifest(
-            tmp_path,
-            {
-                "mode": "single_spectrum",
-                "data": {"kind": "transmission_npz", "path": "spectrum.npz"},
-                "isotopes": [_synthetic_u238_entry()],
-                "fit": {"solver": "lm", "max_iter": 5},
-                "resolution": {
-                    "kind": "gaussian",
-                    "flight_path_m": 25.0,
-                    "delta_t_us": 1.0,
-                    "delta_l_m": 0.01,
-                },
-            },
+    @staticmethod
+    def _fake_fit():
+        region = SimpleNamespace(densities=[0.001], temperature_k=293.6)
+        return SimpleNamespace(
+            regions=[region],
+            covariance=None,
+            deviance=1.0,
+            converged=True,
+            normalization=1.0,
+            t0_us=3.0,
+            flight_path_m=25.0,
+            time_background=[0.0, 0.0, 1.0],
+            alpha=[0.35, 0.05],
+            beta=[0.25, 0.0],
+            r=0.15,
+            fwhm_squared_us2=0.0,
         )
 
-        validation = validate_resonance_dataset(str(tmp_path))
+    def test_extract_and_validate_manifest(self, tmp_path):
+        self._counts_npz(tmp_path)
+        manifest = _write_json_frontmatter_manifest(tmp_path, self._analysis())
+        extracted = extract_resonance_manifest(str(manifest))
+        assert extracted["manifest_path"]
+        assert validate_resonance_dataset(str(manifest))["valid"] is True
 
-        assert validation["valid"] is True
-        assert not any("counts input" in error for error in validation["errors"])
-
-    def test_validation_rejects_counts_transmission_route_requests(self, tmp_path):
-        # There is no counts->transmission conversion: a counts manifest
-        # asking for the transmission domain (explicitly, or implicitly via
-        # solver=lm) must be rejected by validation exactly as the run path
-        # rejects it.
-        np.savez(
-            tmp_path / "counts.npz",
-            energies_ev=np.linspace(1.0, 30.0, 20),
-            sample_counts=np.full(20, 900.0),
-            open_beam_counts=np.full(20, 1000.0),
-        )
-        for fit, expected in (
-            ({"solver": "lm", "max_iter": 5}, "cannot use solver='lm'"),
-            (
-                {"solver": "kl", "fit_domain": "transmission", "max_iter": 5},
-                "cannot be fit in the transmission domain",
-            ),
-        ):
-            _write_json_frontmatter_manifest(
-                tmp_path,
-                {
-                    "mode": "single_spectrum",
-                    "data": {"kind": "counts_npz", "path": "counts.npz"},
-                    "isotopes": [_synthetic_u238_entry()],
-                    "fit": fit,
-                    "resolution": {"kind": "none"},
-                },
-            )
-
-            validation = validate_resonance_dataset(str(tmp_path))
-            run = process_resonance_dataset(str(tmp_path))
-
-            assert validation["valid"] is False, (fit, validation["errors"])
-            message = "\n".join(validation["errors"])
-            assert expected in message, (fit, validation["errors"])
-            # Validate and run must agree branch by branch: the run stops at
-            # its validation stage with the same errors.
-            assert run["success"] is False, fit
-            assert expected in "\n".join(run["validation"]["errors"]), (fit, run)
-
-    @pytest.mark.parametrize("solver", ["typo", "poisson_kl", "KL "])
-    def test_unsupported_solver_rejected_by_validate_and_run(
-        self, tmp_path, monkeypatch, solver
-    ):
-        """Validate/run parity for solver NAMES, not just domain combinations.
-
-        The domain rules describe combinations of real solvers, so a name the
-        binding does not accept (a typo, or `poisson_kl`, which was never a
-        supported alias) previously passed a dry run and failed later in
-        `parse_solver_config` — exactly the validate/run divergence this layer
-        exists to prevent.
-        """
-        np.savez(
-            tmp_path / "counts.npz",
-            energies_ev=np.linspace(1.0, 30.0, 20),
-            sample_counts=np.full(20, 900.0),
-            open_beam_counts=np.full(20, 1000.0),
-        )
-        fitter_called = False
-
-        def forbidden_count_fit(**_kwargs):
-            nonlocal fitter_called
-            fitter_called = True
-            raise AssertionError("an unsupported solver reached the fitter")
-
-        monkeypatch.setattr(nereids, "fit_counts_spectrum_typed", forbidden_count_fit)
-        _write_json_frontmatter_manifest(
-            tmp_path,
-            {
-                "mode": "single_spectrum",
-                "data": {"kind": "counts_npz", "path": "counts.npz"},
-                "isotopes": [_synthetic_u238_entry()],
-                "fit": {"solver": solver, "max_iter": 5},
-                "resolution": {"kind": "none"},
-            },
-        )
-
-        validation = validate_resonance_dataset(str(tmp_path))
-        run = process_resonance_dataset(str(tmp_path))
-
-        assert validation["valid"] is False, validation["errors"]
-        assert any("unsupported solver" in e for e in validation["errors"])
-        assert run["success"] is False
+    def test_counts_with_resolution_rejected(self, tmp_path):
+        self._counts_npz(tmp_path)
+        analysis = self._analysis()
+        analysis["resolution"] = {
+            "kind": "gaussian",
+            "flight_path_m": 25.0,
+            "delta_t_us": 1.0,
+            "delta_l_m": 0.0,
+        }
+        manifest = _write_json_frontmatter_manifest(tmp_path, analysis)
+        report = validate_resonance_dataset(str(manifest))
+        assert report["valid"] is False
         assert any(
-            "unsupported solver" in e for e in run["validation"]["errors"]
-        ), run
-        assert fitter_called is False
-
-    def test_solver_case_is_normalized_through_to_the_binding(
-        self, tmp_path, monkeypatch
-    ):
-        """The manifest layer is case-insensitive, so the binding must receive
-        the SAME normalized name the routing checks used — passing the raw
-        string through made `solver: "KL"` validate and then fail dispatch."""
-        np.savez(
-            tmp_path / "counts.npz",
-            energies_ev=np.linspace(1.0, 30.0, 20),
-            sample_counts=np.full(20, 900.0),
-            open_beam_counts=np.full(20, 1000.0),
-        )
-        seen = {}
-
-        def capture_fit(**kwargs):
-            seen.update(kwargs)
-            return SimpleNamespace(
-                densities=[0.001],
-                uncertainties=[0.0001],
-                converged=True,
-                chi_squared=1.0,
-                reduced_chi_squared=1.0,
-                iterations=3,
-                temperature_k=None,
-                temperature_k_unc=None,
-                deviance_per_dof=1.0,
-                anorm=1.0,
-                background=[0.0, 0.0, 0.0],
-                back_d=None,
-                back_f=None,
-                t0_us=None,
-                l_scale=None,
-                baseline=None,
-                baseline_e_ref_ev=None,
-            )
-
-        monkeypatch.setattr(nereids, "fit_counts_spectrum_typed", capture_fit)
-        _write_json_frontmatter_manifest(
-            tmp_path,
-            {
-                "mode": "single_spectrum",
-                "data": {"kind": "counts_npz", "path": "counts.npz"},
-                "isotopes": [_synthetic_u238_entry()],
-                "fit": {"solver": "KL", "max_iter": 5},
-                "resolution": {"kind": "none"},
-                "output": {"directory": "output"},
-            },
+            "counts input with instrument resolution" in error
+            for error in report["errors"]
         )
 
-        validation = validate_resonance_dataset(str(tmp_path))
-        result = process_resonance_dataset(str(tmp_path))
+    def test_transmission_kind_rejected(self, tmp_path):
+        self._counts_npz(tmp_path)
+        analysis = self._analysis()
+        analysis["data"]["kind"] = "transmission_npz"
+        manifest = _write_json_frontmatter_manifest(tmp_path, analysis)
+        assert validate_resonance_dataset(str(manifest))["valid"] is False
 
-        assert validation["valid"] is True, validation["errors"]
-        assert result["success"] is True, result.get("validation", result)
-        assert seen["solver"] == "kl", seen.get("solver")
+    def test_process_single_spectrum_routes_to_fit_counts(self, tmp_path, monkeypatch):
+        self._counts_npz(tmp_path)
+        manifest = _write_json_frontmatter_manifest(tmp_path, self._analysis())
+        calls = {}
 
-    @pytest.mark.parametrize(
-        "solver", ["auto", "lm", "kl", "poisson", "joint_poisson", "typo", "poisson_kl"]
-    )
-    @pytest.mark.parametrize("kind", ["counts_npz", "transmission_npz"])
-    def test_validate_and_run_agree_for_every_solver_and_domain(
-        self, tmp_path, monkeypatch, kind, solver
-    ):
-        """Exhaustive validate/run parity over the solver x domain matrix.
+        def fake_fit_counts(measurement, calibration):
+            calls["measurement"] = measurement
+            calls["calibration"] = calibration
+            return self._fake_fit()
 
-        Copilot found one cell where a dry run approved a manifest the run
-        path then refused (an unsupported solver name). Rather than pin that
-        single cell, enumerate the whole matrix: for EVERY combination the
-        validator's verdict must match what execution actually does. The
-        fitters are stubbed, so this tests routing, not numerics.
-        """
-        counts = kind == "counts_npz"
-        if counts:
-            np.savez(
-                tmp_path / "data.npz",
-                energies_ev=np.linspace(1.0, 30.0, 20),
-                sample_counts=np.full(20, 900.0),
-                open_beam_counts=np.full(20, 1000.0),
-            )
-        else:
-            np.savez(
-                tmp_path / "data.npz",
-                energies_ev=np.linspace(1.0, 30.0, 20),
-                transmission=np.full(20, 0.9),
-                uncertainty=np.full(20, 0.01),
-            )
-
-        def stub_fit(**_kwargs):
-            return SimpleNamespace(
-                densities=[0.001],
-                uncertainties=[0.0001],
-                converged=True,
-                chi_squared=1.0,
-                reduced_chi_squared=1.0,
-                iterations=3,
-                temperature_k=None,
-                temperature_k_unc=None,
-                deviance_per_dof=1.0,
-                anorm=1.0,
-                background=[0.0, 0.0, 0.0],
-                back_d=None,
-                back_f=None,
-                t0_us=None,
-                l_scale=None,
-                baseline=None,
-                baseline_e_ref_ev=None,
-            )
-
-        monkeypatch.setattr(nereids, "fit_counts_spectrum_typed", stub_fit)
-        monkeypatch.setattr(nereids, "fit_spectrum_typed", stub_fit)
-        _write_json_frontmatter_manifest(
-            tmp_path,
-            {
-                "mode": "single_spectrum",
-                "data": {"kind": kind, "path": "data.npz"},
-                "isotopes": [_synthetic_u238_entry()],
-                "fit": {"solver": solver, "max_iter": 5},
-                "resolution": {"kind": "none"},
-                "output": {"directory": "output"},
-            },
+        monkeypatch.setattr(nereids, "fit_counts", fake_fit_counts)
+        result = process_resonance_dataset(
+            str(manifest), output_dir=str(tmp_path / "out")
         )
+        assert result["success"] is True, result
+        assert isinstance(calls["measurement"], nereids.Measurement)
+        assert isinstance(calls["calibration"], nereids.Calibration)
+        assert calls["measurement"].charge_ratio == 1.0
+        assert result["results"]["mode"] == "single_spectrum"
+        assert result["results"]["converged"] is True
 
-        validation = validate_resonance_dataset(str(tmp_path))
-        run = process_resonance_dataset(str(tmp_path))
-
-        assert validation["valid"] == run["success"], (
-            f"validate/run disagree for kind={kind} solver={solver}: "
-            f"validate={validation['valid']} run={run['success']} "
-            f"errors={validation['errors']}"
-        )
-
-    def test_count_spectrum_rejects_lm_before_fit(self, tmp_path, monkeypatch):
-        np.savez(
-            tmp_path / "counts.npz",
-            energies_ev=np.linspace(1.0, 30.0, 20),
-            sample_counts=np.full(20, 900.0),
-            open_beam_counts=np.full(20, 1000.0),
-        )
-        fitter_called = False
-
-        def forbidden_count_fit(**_kwargs):
-            nonlocal fitter_called
-            fitter_called = True
-            raise AssertionError("invalid counts + LM route reached the fitter")
-
-        monkeypatch.setattr(nereids, "fit_counts_spectrum_typed", forbidden_count_fit)
-        _write_json_frontmatter_manifest(
-            tmp_path,
-            {
-                "mode": "single_spectrum",
-                "data": {"kind": "counts_npz", "path": "counts.npz"},
-                "isotopes": [_synthetic_u238_entry()],
-                "fit": {"solver": "lm", "max_iter": 5},
-                "resolution": {"kind": "none"},
-            },
-        )
-
-        result = process_resonance_dataset(str(tmp_path))
-
-        assert result["success"] is False
-        assert "raw count input cannot use solver='lm'" in "\n".join(
-            result["validation"]["errors"]
-        )
-        assert fitter_called is False
-
-    def test_transmission_spectrum_rejects_joint_poisson_before_fit(
-        self, tmp_path, monkeypatch
-    ):
-        np.savez(
-            tmp_path / "spectrum.npz",
-            energies_ev=np.linspace(1.0, 30.0, 20),
-            transmission=np.ones(20),
-            uncertainty=np.full(20, 0.01),
-        )
-        fitter_called = False
-
-        def forbidden_transmission_fit(**_kwargs):
-            nonlocal fitter_called
-            fitter_called = True
-            raise AssertionError(
-                "invalid transmission + joint Poisson route reached the fitter"
-            )
-
-        monkeypatch.setattr(nereids, "fit_spectrum_typed", forbidden_transmission_fit)
-        _write_json_frontmatter_manifest(
-            tmp_path,
-            {
-                "mode": "single_spectrum",
-                "data": {"kind": "transmission_npz", "path": "spectrum.npz"},
-                "isotopes": [_synthetic_u238_entry()],
-                "fit": {"solver": "joint_poisson", "max_iter": 5},
-                "resolution": {"kind": "none"},
-            },
-        )
-
-        result = process_resonance_dataset(str(tmp_path))
-
-        assert result["success"] is False
-        assert (
-            "normalized transmission input cannot use a Poisson/KL count likelihood"
-            in "\n".join(result["validation"]["errors"])
-        )
-        assert fitter_called is False
-
-    def test_process_runs_counts_manifest_in_counts_domain(self, tmp_path):
-        # End-to-end anchor for the validate-allows/run-succeeds pair: the
-        # dry-run consistency assertions elsewhere compare two invocations of
-        # the same validator, so only a real run can prove the hand-copied
-        # routing mirror agrees with what execution actually does.  The
-        # counts domain (resolution-free) is the one supported counts route
-        # through the manifest schema.
-        energies = np.linspace(1.0, 30.0, 160)
-        true_density = 0.002
-        isotope = _synthetic_u238_data()
-        transmission = np.asarray(
-            nereids.forward_model(energies, [(isotope, true_density)])
-        )
-        open_beam = np.full_like(transmission, 100000.0)
-        sample = transmission * open_beam
-        np.savez(
-            tmp_path / "counts.npz",
-            energies_ev=energies,
-            sample_counts=sample,
-            open_beam_counts=open_beam,
-        )
-        _write_json_frontmatter_manifest(
-            tmp_path,
-            {
-                "mode": "single_spectrum",
-                "data": {"kind": "counts_npz", "path": "counts.npz"},
-                "isotopes": [_synthetic_u238_entry(initial_density=0.001)],
-                "fit": {"solver": "kl", "max_iter": 200},
-                "resolution": {"kind": "none"},
-                "output": {"directory": "output"},
-            },
-        )
-
-        validation = validate_resonance_dataset(str(tmp_path))
-        result = process_resonance_dataset(str(tmp_path))
-
-        assert validation["valid"] is True, validation["errors"]
-        assert result["success"] is True, result.get("validation", result)
-        fit = result["results"]["density_fits"][0]
-        assert fit["isotope"] == "U-238"
-        assert fit["density_atoms_per_barn"] == pytest.approx(true_density, rel=0.15)
-
-    def test_validation_rejects_density_map_counts_with_resolution_any_solver(
-        self, tmp_path
-    ):
-        # density_map count cubes always fit in the counts domain
-        # (from_counts), regardless of solver — the rejection must not be
-        # narrowed by the single-spectrum fit-domain logic.
+    def test_process_density_map_routes_to_fit_map(self, tmp_path, monkeypatch):
+        bins, height, width = 4, 2, 2
         np.savez(
             tmp_path / "cube.npz",
-            energies_ev=np.linspace(1.0, 30.0, 5),
-            sample_counts=np.ones((5, 2, 2)),
-            open_beam_counts=np.ones((5, 2, 2)),
+            time_edges_us=np.linspace(200.0, 400.0, bins + 1),
+            open_beam_counts=np.full((bins, height, width), 100.0),
+            sample_counts=np.full((bins, height, width), 80.0),
         )
-        _write_json_frontmatter_manifest(
-            tmp_path,
-            {
-                "mode": "density_map",
-                "data": {"kind": "counts_npz", "path": "cube.npz"},
-                "isotopes": [_synthetic_u238_entry()],
-                "fit": {"solver": "lm", "max_iter": 5},
-                "resolution": {
-                    "kind": "gaussian",
-                    "flight_path_m": 25.0,
-                    "delta_t_us": 1.0,
-                    "delta_l_m": 0.01,
-                },
-            },
-        )
+        analysis = self._analysis(mode="density_map")
+        analysis["data"] = {"kind": "counts_npz", "path": "cube.npz", "binning": 1}
+        manifest = _write_json_frontmatter_manifest(tmp_path, analysis)
+        calls = {}
 
-        validation = validate_resonance_dataset(str(tmp_path))
-
-        assert validation["valid"] is False
-        assert any(
-            "counts input with instrument resolution is not available" in error
-            for error in validation["errors"]
-        )
-
-    def test_density_map_counts_rejects_lm_before_spatial_fit(
-        self, tmp_path, monkeypatch
-    ):
-        # A counts-cube manifest with solver='lm' used to reach counts+LM at
-        # spatial_map_typed; both run and validate now reject it before any
-        # fitter is invoked.
-        np.savez(
-            tmp_path / "cube.npz",
-            energies_ev=np.linspace(1.0, 30.0, 5),
-            sample_counts=np.ones((5, 2, 2)),
-            open_beam_counts=np.ones((5, 2, 2)),
-        )
-        fitter_called = False
-
-        def forbidden_spatial_fit(*_args, **_kwargs):
-            nonlocal fitter_called
-            fitter_called = True
-            raise AssertionError("invalid counts + LM route reached spatial_map_typed")
-
-        monkeypatch.setattr(nereids, "spatial_map_typed", forbidden_spatial_fit)
-        _write_json_frontmatter_manifest(
-            tmp_path,
-            {
-                "mode": "density_map",
-                "data": {"kind": "counts_npz", "path": "cube.npz"},
-                "isotopes": [_synthetic_u238_entry()],
-                "fit": {"solver": "lm", "max_iter": 5},
-                "resolution": {"kind": "none"},
-            },
-        )
-
-        validation = validate_resonance_dataset(str(tmp_path))
-        result = process_resonance_dataset(str(tmp_path))
-
-        assert validation["valid"] is False
-        assert any(
-            "raw count maps cannot use solver='lm'" in error
-            for error in validation["errors"]
-        )
-        assert result["success"] is False
-        assert "raw count maps cannot use solver='lm'" in "\n".join(
-            result["validation"]["errors"]
-        )
-        assert fitter_called is False
-
-    def test_validation_mirrors_resolution_kwargs_contract(self, tmp_path):
-        # _resolution_kwargs rejects unknown kinds and KeyErrors on gaussian
-        # dicts missing required parameters; validation must mirror both
-        # instead of approving a manifest the run path will refuse.
-        np.savez(
-            tmp_path / "spectrum.npz",
-            energies_ev=np.linspace(1.0, 30.0, 20),
-            transmission=np.ones(20),
-            uncertainty=np.full(20, 0.01),
-        )
-        cases = [
-            ({"kind": "gausian", "flight_path_m": 25.0}, "unknown resolution kind"),
-            (
-                {"kind": "gaussian", "flight_path_m": 25.0, "delta_t_us": 1.0},
-                "gaussian resolution requires",
-            ),
-            ({"kind": "tabulated", "path": "missing.txt"}, "does not exist"),
-        ]
-        for resolution, expected in cases:
-            _write_json_frontmatter_manifest(
-                tmp_path,
-                {
-                    "mode": "single_spectrum",
-                    "data": {"kind": "transmission_npz", "path": "spectrum.npz"},
-                    "isotopes": [_synthetic_u238_entry()],
-                    "fit": {"solver": "lm", "max_iter": 5},
-                    "resolution": resolution,
-                },
+        def fake_fit_map(map_measurement, calibration):
+            calls["map"] = map_measurement
+            zeros = np.zeros((height, width))
+            return SimpleNamespace(
+                patches=[[SimpleNamespace(kind="sample")] * width] * height,
+                fits=[[None] * width] * height,
+                failed=[[None] * width] * height,
+                empty=None,
+                densities=[zeros],
+                density_sd=[zeros],
+                temperature_k=zeros,
+                temperature_sd_k=zeros,
+                overdispersion=[zeros, zeros],
+                trusted=np.ones((height, width), dtype=bool),
+                normalization=1.0,
+                t0_us=3.0,
+                flight_path_m=25.0,
+                alpha=[0.35, 0.05],
+                beta=[0.25, 0.0],
+                r=0.15,
+                fwhm_squared_us2=0.0,
+                shared=[],
+                shared_covariance=None,
+                measured_pulls=None,
+                pulse_consistency=None,
+                deviance=1.0,
+                converged=True,
+                unconverged=None,
+                steps=1,
+                n_fitted=height * width,
             )
 
-            validation = validate_resonance_dataset(str(tmp_path))
-
-            assert validation["valid"] is False, (resolution, validation)
-            assert any(expected in error for error in validation["errors"]), (
-                resolution,
-                validation["errors"],
-            )
-
-    def test_validation_rejects_malformed_resolution_value(self, tmp_path):
-        # A bool/number/list resolution used to be treated as "inactive" and
-        # sail through validation, only to fail differently at run time.
-        np.savez(
-            tmp_path / "spectrum.npz",
-            energies_ev=np.linspace(1.0, 30.0, 20),
-            transmission=np.ones(20),
-            uncertainty=np.full(20, 0.01),
+        monkeypatch.setattr(nereids, "fit_map", fake_fit_map)
+        result = process_resonance_dataset(
+            str(manifest), output_dir=str(tmp_path / "out")
         )
-        _write_json_frontmatter_manifest(
-            tmp_path,
-            {
-                "mode": "single_spectrum",
-                "data": {"kind": "transmission_npz", "path": "spectrum.npz"},
-                "isotopes": [_synthetic_u238_entry()],
-                "fit": {"solver": "lm", "max_iter": 5},
-                "resolution": True,
-            },
-        )
-
-        validation = validate_resonance_dataset(str(tmp_path))
-
-        assert validation["valid"] is False
-        assert any(
-            "resolution must be an object or kind string" in error
-            for error in validation["errors"]
-        )
-
-        # Falsy values are NOT malformed: the run path's
-        # `config.get("resolution") or {}` treats them as disabled, so
-        # validation must accept them (validate/run agreement in the other
-        # direction).
-        _write_json_frontmatter_manifest(
-            tmp_path,
-            {
-                "mode": "single_spectrum",
-                "data": {"kind": "transmission_npz", "path": "spectrum.npz"},
-                "isotopes": [_synthetic_u238_entry()],
-                "fit": {"solver": "lm", "max_iter": 5},
-                "resolution": False,
-            },
-        )
-
-        validation = validate_resonance_dataset(str(tmp_path))
-
-        assert validation["valid"] is True, validation["errors"]
-
-    def test_fit_summary_is_strict_json_safe(self):
-        result = SimpleNamespace(
-            densities=np.asarray([np.nan]),
-            uncertainties=np.asarray([np.inf]),
-            reduced_chi_squared=np.nan,
-            deviance_per_dof=np.inf,
-            converged=False,
-            iterations=0,
-            temperature_k=np.nan,
-            anorm=np.inf,
-            background=[np.nan],
-        )
-
-        summary = _fit_result_summary(result, ["U-238"])
-
-        assert summary["density_fits"][0]["density_atoms_per_barn"] is None
-        assert summary["density_fits"][0]["uncertainty_atoms_per_barn"] is None
-        assert summary["reduced_chi_squared"] is None
-        assert summary["deviance_per_dof"] is None
-        json.dumps(_json_safe(summary), allow_nan=False)
-
-    def test_fit_summary_emits_energy_scale_and_background_fields(self):
-        """Issue #530: when the LM solver fits t0/L_scale/back_d/back_f,
-        those values must appear in the result summary.  Before the fix,
-        `_fit_result_summary` only emitted `anorm` and `background`;
-        the four extra scalars were silently dropped, making it
-        impossible to tell whether the manifest's fit flags were
-        exercised and impossible to reconstruct the model curve.
-        """
-        result = SimpleNamespace(
-            densities=np.asarray([0.001]),
-            uncertainties=np.asarray([1.0e-5]),
-            reduced_chi_squared=1.2,
-            deviance_per_dof=None,
-            converged=True,
-            iterations=17,
-            temperature_k=293.6,
-            anorm=0.99,
-            background=[0.01, -1e-4, 5e-7],
-            t0_us=0.4662,
-            l_scale=1.005273,
-            back_d=0.0796,
-            back_f=1.10e-4,
-        )
-
-        summary = _fit_result_summary(result, ["U-238"])
-
-        assert summary["t0_us"] == pytest.approx(0.4662)
-        assert summary["l_scale"] == pytest.approx(1.005273)
-        assert summary["back_d"] == pytest.approx(0.0796)
-        assert summary["back_f"] == pytest.approx(1.10e-4)
-        json.dumps(_json_safe(summary), allow_nan=False)
-
-    def test_fit_summary_omits_energy_scale_fields_when_unset(self):
-        """Backwards-compat: fits without the new flags emit a summary
-        with the four extra keys *absent* (not present-with-null), so
-        downstream consumers can keep using `"key" in summary` to
-        detect whether each flag was active.  Matches the existing
-        `deviance_per_dof` / `temperature_k` pattern.
-        """
-        result = SimpleNamespace(
-            densities=np.asarray([0.001]),
-            uncertainties=np.asarray([1.0e-5]),
-            reduced_chi_squared=1.2,
-            deviance_per_dof=None,
-            converged=True,
-            iterations=12,
-            temperature_k=293.6,
-            anorm=1.0,
-            background=[0.0, 0.0, 0.0],
-            t0_us=None,
-            l_scale=None,
-            back_d=None,
-            back_f=None,
-        )
-
-        summary = _fit_result_summary(result, ["U-238"])
-
-        assert "t0_us" not in summary
-        assert "l_scale" not in summary
-        assert "back_d" not in summary
-        assert "back_f" not in summary
-        # Existing keys must still be present.
-        assert "anorm" in summary
-        assert "background" in summary
-
-    def test_fit_summary_emits_energy_scale_via_real_fit(self):
-        """End-to-end variant of the SimpleNamespace gates above: drive a
-        real `nereids.fit_spectrum_typed` LM fit with `fit_energy_scale=True`
-        and confirm the new keys make it into the summary returned to MCP
-        callers.  Catches regressions where the binding stops populating
-        `result.t0_us` / `result.l_scale` on the actual `PyFitResult`.
-        """
-        energies = np.linspace(4.0, 30.0, 400)
-        isotope = _synthetic_u238_data()
-        t = np.asarray(nereids.forward_model(energies, [(isotope, 1.0e-3)]))
-        sigma = np.full_like(t, 0.005)
-
-        result = nereids.fit_spectrum_typed(
-            transmission=t,
-            uncertainty=sigma,
-            energies=energies,
-            isotopes=[(isotope, 1.0e-3)],
-            solver="lm",
-            temperature_k=293.6,
-            max_iter=100,
-            background=True,
-            fit_back_d=True,
-            fit_back_f=True,
-            fit_energy_scale=True,
-            t0_init_us=0.0,
-            l_scale_init=1.0,
-            energy_scale_flight_path_m=25.0,
-        )
-
-        summary = _fit_result_summary(result, ["U-238"])
-
-        for key in ("t0_us", "l_scale", "back_d", "back_f"):
-            assert key in summary, f"summary missing {key}: {sorted(summary)}"
-            value = summary[key]
-            assert isinstance(value, float) and np.isfinite(value), (
-                f"summary[{key!r}] not a finite float: {value!r}"
-            )
-        # Round-trip strict-JSON-safe so downstream MCP serialization
-        # cannot break on the new fields.
-        json.dumps(_json_safe(summary), allow_nan=False)
-
-    def test_fit_summary_omits_back_d_back_f_via_real_fit_when_disabled(self):
-        """Regression for the "omit-when-unset" contract on the *real*
-        `PyFitResult` (not just a SimpleNamespace stub).  Before the
-        Rust-side fix that changed `PyFitResult.back_d` / `back_f` to
-        `Option<f64>`, a real fit with `fit_back_d=False, fit_back_f=False`
-        produced `result.back_d == 0.0` (and ditto `back_f`), which the
-        summary's ``if value is not None`` gate would emit as
-        ``"back_d": 0.0`` — misleading consumers into thinking the
-        exponential background was enabled.  This test exercises the
-        real binding to lock that contract.
-        """
-        energies = np.linspace(4.0, 30.0, 200)
-        isotope = _synthetic_u238_data()
-        t = np.asarray(nereids.forward_model(energies, [(isotope, 1.0e-3)]))
-        sigma = np.full_like(t, 0.005)
-
-        result = nereids.fit_spectrum_typed(
-            transmission=t,
-            uncertainty=sigma,
-            energies=energies,
-            isotopes=[(isotope, 1.0e-3)],
-            solver="lm",
-            temperature_k=293.6,
-            max_iter=80,
-            # Note: background=True so the polynomial background runs,
-            # but fit_back_d / fit_back_f are deliberately false — only
-            # the exponential terms should be absent from the summary.
-            background=True,
-            fit_back_d=False,
-            fit_back_f=False,
-        )
-
-        # Real binding now returns None for unfit exponential terms.
-        assert result.back_d is None, (
-            f"PyFitResult.back_d should be None when fit_back_d=False, "
-            f"got {result.back_d!r}"
-        )
-        assert result.back_f is None, (
-            f"PyFitResult.back_f should be None when fit_back_f=False, "
-            f"got {result.back_f!r}"
-        )
-
-        summary = _fit_result_summary(result, ["U-238"])
-        assert "back_d" not in summary, (
-            f"summary should not carry back_d when fit_back_d=False, got "
-            f"{summary.get('back_d')!r}"
-        )
-        assert "back_f" not in summary, (
-            f"summary should not carry back_f when fit_back_f=False, got "
-            f"{summary.get('back_f')!r}"
-        )
-        # The polynomial background scalars must still be present.
-        assert "anorm" in summary
-        assert "background" in summary
-
-    def test_fit_summary_omits_back_d_back_f_when_background_disabled(self):
-        """``fit_back_d=True, fit_back_f=True`` with
-        ``background=False`` is a nonsensical-but-legal kwarg combination
-        — the ``if background { ... }`` block in
-        ``py_fit_spectrum_typed`` never attaches the bg model, so the
-        inner Rust ``FitResult.back_d`` / ``back_f`` are sentinel zeros.
-        Before this fix, the Python binding gated emission solely on
-        ``fit_back_d`` / ``fit_back_f``, so the summary would falsely
-        carry ``"back_d": 0.0`` and tell MCP consumers the exponential
-        tail was fitted.  Now the gate also requires ``background=True``.
-        """
-        energies = np.linspace(4.0, 30.0, 200)
-        isotope = _synthetic_u238_data()
-        t = np.asarray(nereids.forward_model(energies, [(isotope, 1.0e-3)]))
-        sigma = np.full_like(t, 0.005)
-
-        result = nereids.fit_spectrum_typed(
-            transmission=t,
-            uncertainty=sigma,
-            energies=energies,
-            isotopes=[(isotope, 1.0e-3)],
-            solver="lm",
-            temperature_k=293.6,
-            max_iter=80,
-            # The contradictory combination under test: per-term
-            # flags on, polynomial background OFF.  Should produce
-            # None on the binding regardless of fit_back_d / fit_back_f.
-            background=False,
-            fit_back_d=True,
-            fit_back_f=True,
-        )
-
-        assert result.back_d is None, (
-            f"PyFitResult.back_d should be None when background=False even "
-            f"if fit_back_d=True, got {result.back_d!r}"
-        )
-        assert result.back_f is None, (
-            f"PyFitResult.back_f should be None when background=False even "
-            f"if fit_back_f=True, got {result.back_f!r}"
-        )
-        summary = _fit_result_summary(result, ["U-238"])
-        assert "back_d" not in summary
-        assert "back_f" not in summary
-
-    def test_process_single_spectrum_manifest_emits_energy_scale_keys(self, tmp_path):
-        """Manifest-driven path: enabling `fit_energy_scale` / `fit_back_d`
-        / `fit_back_f` in the manifest's analysis.fit block must surface
-        the corresponding scalars in the `results` block of the JSON the
-        MCP server returns.  Closes the #530 acceptance criterion.
-        """
-        energies = np.linspace(4.0, 30.0, 200)
-        true_density = 1.0e-3
-        isotope = _synthetic_u238_data()
-        transmission = np.asarray(
-            nereids.forward_model(energies, [(isotope, true_density)])
-        )
-        np.savez(
-            tmp_path / "spectrum.npz",
-            energies_ev=energies,
-            transmission=transmission,
-            uncertainty=np.full_like(transmission, 0.005),
-        )
-        _write_json_frontmatter_manifest(
-            tmp_path,
-            {
-                "mode": "single_spectrum",
-                "data": {"kind": "transmission_npz", "path": "spectrum.npz"},
-                "isotopes": [_synthetic_u238_entry(initial_density=true_density)],
-                "fit": {
-                    "solver": "lm",
-                    "max_iter": 80,
-                    "background": True,
-                    "fit_back_d": True,
-                    "fit_back_f": True,
-                    "fit_energy_scale": True,
-                    "t0_init_us": 0.0,
-                    "l_scale_init": 1.0,
-                    "energy_scale_flight_path_m": 25.0,
-                },
-                "resolution": {"kind": "none"},
-                "output": {"directory": "output"},
-            },
-        )
-
-        result = process_resonance_dataset(str(tmp_path))
-
-        assert result["success"] is True
-        results_block = result["results"]
-        for key in ("t0_us", "l_scale", "back_d", "back_f"):
-            assert key in results_block, (
-                f"results block missing {key}: keys={sorted(results_block)}"
-            )
-            assert isinstance(results_block[key], float)
-            assert np.isfinite(results_block[key])
-
-    def test_process_density_map_manifest_emits_fit_param_stats(self, tmp_path):
-        """Spatial counterpart of #530: `_process_density_map` previously
-        emitted only `density_maps` — no `anorm` / `background` / `t0` /
-        `L_scale` info, even though `SpatialResult` exposes those as
-        per-pixel maps when `fit_energy_scale` is on.  Backwards-compat:
-        the key is absent when no energy-scale-related maps are populated.
-        """
-        energies = np.linspace(4.0, 30.0, 120)
-        true_density = 1.0e-3
-        isotope = _synthetic_u238_data()
-        spectrum = np.asarray(
-            nereids.forward_model(energies, [(isotope, true_density)])
-        )
-        # Tiny 2x2 cube so the test stays fast.
-        cube = np.tile(spectrum[:, None, None], (1, 2, 2))
-        np.savez(
-            tmp_path / "density-map.npz",
-            energies_ev=energies,
-            transmission=cube,
-            uncertainty=np.full_like(cube, 0.005),
-        )
-        _write_json_frontmatter_manifest(
-            tmp_path,
-            {
-                "mode": "density_map",
-                "data": {"kind": "transmission_npz", "path": "density-map.npz"},
-                "isotopes": [_synthetic_u238_entry(initial_density=true_density)],
-                "fit": {
-                    "solver": "lm",
-                    "max_iter": 80,
-                    "background": True,
-                    "fit_energy_scale": True,
-                    "t0_init_us": 0.0,
-                    "l_scale_init": 1.0,
-                    "energy_scale_flight_path_m": 25.0,
-                },
-                "resolution": {"kind": "none"},
-                "output": {"directory": "output"},
-            },
-        )
-
-        result = process_resonance_dataset(str(tmp_path))
-
-        assert result["success"] is True
-        stats = result["results"].get("fit_param_stats")
-        assert stats is not None, (
-            f"fit_param_stats absent when fit_energy_scale=True; "
-            f"keys={sorted(result['results'])}"
-        )
-        # Per-pixel anorm + 3-term background + t0/L_scale maps must all
-        # be summarised — the four scalars `SpatialResult` exposes.
-        # `back_d` / `back_f` are NOT in the spatial result type yet
-        # (per-pixel back_d_map / back_f_map are not exposed on
-        # SpatialResult); tracked as a follow-up.
-        for key in ("anorm", "background", "t0_us", "l_scale"):
-            assert key in stats, f"fit_param_stats missing {key}: {sorted(stats)}"
-        # The npz must carry the raw arrays so downstream consumers
-        # can reconstruct the model curve per pixel.  Re-run the spatial
-        # fit independently with the same inputs and assert the NPZ
-        # arrays bit-match `SpatialResult.{anorm_map, t0_us_map,
-        # l_scale_map}`: this defends against a future refactor that
-        # swaps the wrong array into `arrays_to_save` (the inner fit
-        # is deterministic on a fixed cube, so bit-equal is the right
-        # tolerance, not approx).
-        independent = nereids.spatial_map_typed(
-            nereids.from_transmission(
-                cube, np.full_like(cube, 0.005)
-            ),
-            energies,
-            [isotope],
-            initial_densities=[true_density],
-            solver="lm",
-            temperature_k=293.6,
-            max_iter=80,
-            background=True,
-            fit_energy_scale=True,
-            t0_init_us=0.0,
-            l_scale_init=1.0,
-            energy_scale_flight_path_m=25.0,
-        )
-        npz = np.load(tmp_path / "output" / "nereids_density_map.npz")
-        try:
-            for arr_key, attr in (
-                ("anorm_map", "anorm_map"),
-                ("t0_us_map", "t0_us_map"),
-                ("l_scale_map", "l_scale_map"),
-            ):
-                assert arr_key in npz.files, (
-                    f"density-map npz missing {arr_key}: {npz.files}"
-                )
-                expected = np.asarray(getattr(independent, attr))
-                np.testing.assert_array_equal(
-                    npz[arr_key],
-                    expected,
-                    err_msg=(
-                        f"NPZ {arr_key} does not match SpatialResult.{attr} — "
-                        f"the manifest-driven server may be writing the "
-                        f"wrong array under this key"
-                    ),
-                )
-        finally:
-            npz.close()
-
-    def test_process_density_map_manifest_omits_fit_param_stats_by_default(
-        self, tmp_path
-    ):
-        """When no fit-energy-scale / per-pixel background flags are
-        set, the spatial summary must NOT carry a `fit_param_stats`
-        key — matching the pre-fix schema for unrelated consumers.
-        """
-        energies = np.linspace(4.0, 30.0, 120)
-        true_density = 1.0e-3
-        isotope = _synthetic_u238_data()
-        spectrum = np.asarray(
-            nereids.forward_model(energies, [(isotope, true_density)])
-        )
-        cube = np.tile(spectrum[:, None, None], (1, 2, 2))
-        np.savez(
-            tmp_path / "density-map.npz",
-            energies_ev=energies,
-            transmission=cube,
-            uncertainty=np.full_like(cube, 0.005),
-        )
-        _write_json_frontmatter_manifest(
-            tmp_path,
-            {
-                "mode": "density_map",
-                "data": {"kind": "transmission_npz", "path": "density-map.npz"},
-                "isotopes": [_synthetic_u238_entry(initial_density=true_density)],
-                "fit": {"solver": "lm", "max_iter": 50},
-                "resolution": {"kind": "none"},
-                "output": {"directory": "output"},
-            },
-        )
-
-        result = process_resonance_dataset(str(tmp_path))
-
-        assert result["success"] is True
-        assert "fit_param_stats" not in result["results"]
+        assert result["success"] is True, result
+        assert isinstance(calls["map"], nereids.MapMeasurement)
+        assert result["results"]["n_fitted"] == height * width
