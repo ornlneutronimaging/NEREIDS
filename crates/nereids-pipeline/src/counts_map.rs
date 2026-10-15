@@ -16,8 +16,8 @@ use rayon::prelude::*;
 
 use crate::counts_fit::TEMPERATURE_BOUNDS_K;
 use crate::counts_fit::{
-    BeamStart, BeamStarts, Bypass, MOST_PASSES, Material, Measurement, Region, RegionFit,
-    RegionTerms, Role, RoomBackground, SHARED, Starts, Value, checked, excluded_bins,
+    BACKGROUND_TERMS, BeamStart, BeamStarts, Bypass, MOST_PASSES, Material, Measurement, Region,
+    RegionFit, RegionTerms, Role, RoomBackground, SHARED, Starts, Value, checked, excluded_bins,
     fit_counts_answer, labelled, open_frames, shared_parameters, starting_bypass,
     starts_and_widths_us,
 };
@@ -71,15 +71,15 @@ pub struct MapMeasurement<'a> {
     /// The material behind the sample: its isotopes' densities and its
     /// temperature, known, fitted or within bounds, in every patch.
     pub material: Material,
-    /// `b0`, `b1` and `b2` of the background of every patch behind the
+    /// `[b0, b1, b2, d, f]` of the background of every patch behind the
     /// sample, as [`Region::background`], known, fitted or within bounds.
-    pub background: [Value; 3],
+    pub background: [Value; 5],
     /// The fraction of the time background that reaches the pixels behind the
     /// sample in the sample run, as [`Region::gamma_transmission`], known,
     /// fitted or within bounds in every patch; the empty pixels take 1.
     pub gamma_transmission: Value,
-    /// `b0`, `b1` and `b2` of the background of the empty pixels.
-    pub empty_background: [Value; 3],
+    /// `[b0, b1, b2, d, f]` of the background of the empty pixels.
+    pub empty_background: [Value; 5],
 }
 
 impl MapMeasurement<'_> {
@@ -1215,7 +1215,12 @@ fn fit_map_from<'a>(
                 .iter()
                 .enumerate()
                 .filter(|(_, value)| !matches!(value, Value::Known(_)))
-                .map(|(term, _)| (Role::Background { region: 0, term }, format!("b{term}"))),
+                .map(|(term, _)| {
+                    (
+                        Role::Background { region: 0, term },
+                        BACKGROUND_TERMS[term].to_string(),
+                    )
+                }),
         )
         .chain(
             (!matches!(map.gamma_transmission, Value::Known(_))).then(|| {

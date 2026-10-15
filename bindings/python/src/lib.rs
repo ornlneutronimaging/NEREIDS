@@ -2947,6 +2947,23 @@ fn counts_error(error: PipelineError) -> PyErr {
 }
 
 /// A [C, A, tau] triple of PyValues.
+/// [b0, b1, b2] or [b0, b1, b2, d, f]; d and f are known 0 when absent.
+fn background_values(values: Vec<PyValue>) -> PyResult<[Value; 5]> {
+    match values.as_slice() {
+        [b0, b1, b2] => Ok([
+            b0.inner,
+            b1.inner,
+            b2.inner,
+            Value::Known(0.0),
+            Value::Known(0.0),
+        ]),
+        [b0, b1, b2, d, f] => Ok([b0.inner, b1.inner, b2.inner, d.inner, f.inner]),
+        _ => Err(pyo3::exceptions::PyValueError::new_err(
+            "expected [b0, b1, b2] or [b0, b1, b2, d, f]",
+        )),
+    }
+}
+
 fn value_trio(values: Vec<PyValue>) -> PyResult<[Value; 3]> {
     let [a, b, c] = values.as_slice() else {
         return Err(pyo3::exceptions::PyValueError::new_err(
@@ -3150,8 +3167,9 @@ struct PyRegion {
 
 #[pymethods]
 impl PyRegion {
-    /// background is [b0, b1, b2] of b(E) = b0 + b1/sqrt(E) + b2*sqrt(E);
-    /// pixels is the region's area in pixels, finite and positive.
+    /// background is [b0, b1, b2] or [b0, b1, b2, d, f] of
+    /// b(E) = b0 + b1/sqrt(E) + b2*sqrt(E) + d*exp(-f/sqrt(E)); pixels is the
+    /// region's area in pixels, finite and positive.
     #[new]
     #[pyo3(signature = (open_counts, sample_counts, pixels, background, gamma_transmission, material=None, open_live=None, sample_live=None))]
     fn new(
@@ -3170,7 +3188,7 @@ impl PyRegion {
                 sample_counts,
                 open_live,
                 sample_live,
-                background: value_trio(background)?,
+                background: background_values(background)?,
                 pixels,
                 gamma_transmission: gamma_transmission.inner,
                 material: material.map(|material| material.inner),
@@ -3202,7 +3220,7 @@ impl PyRegion {
         self.inner.sample_live.clone()
     }
 
-    /// The region's background terms [b0, b1, b2].
+    /// The region's background terms [b0, b1, b2, d, f].
     #[getter]
     fn background(&self) -> Vec<PyValue> {
         self.inner
@@ -3544,7 +3562,7 @@ impl PyCalibration {
 struct PyRegionFit {
     densities: Vec<f64>,
     temperature_k: Option<f64>,
-    background: [f64; 3],
+    background: [f64; 5],
     gamma_transmission: f64,
     beam_at_limit: bool,
     predicted_open: Vec<f64>,
@@ -3583,9 +3601,9 @@ impl PyRegionFit {
         self.temperature_k
     }
 
-    /// [b0, b1, b2].
+    /// [b0, b1, b2, d, f].
     #[getter]
-    fn background(&self) -> [f64; 3] {
+    fn background(&self) -> [f64; 5] {
         self.background
     }
 
@@ -3837,9 +3855,9 @@ struct MapData {
     empty: ndarray::Array2<bool>,
     binning: usize,
     material: Material,
-    background: [Value; 3],
+    background: [Value; 5],
     gamma_transmission: Value,
-    empty_background: [Value; 3],
+    empty_background: [Value; 5],
 }
 
 impl MapData {
@@ -3900,8 +3918,8 @@ impl PyMapMeasurement {
         room_background: Option<PyRoomBackground>,
     ) -> PyResult<Self> {
         let empty_background = match empty_background {
-            Some(values) => value_trio(values)?,
-            None => [Value::Known(0.0); 3],
+            Some(values) => background_values(values)?,
+            None => [Value::Known(0.0); 5],
         };
         let time_background = match time_background {
             Some(values) => value_trio(values)?,
@@ -3923,7 +3941,7 @@ impl PyMapMeasurement {
                 empty: empty.as_array().to_owned(),
                 binning,
                 material: material.inner,
-                background: value_trio(background)?,
+                background: background_values(background)?,
                 gamma_transmission: gamma_transmission
                     .map_or(Value::Known(1.0), |value| value.inner),
                 empty_background,

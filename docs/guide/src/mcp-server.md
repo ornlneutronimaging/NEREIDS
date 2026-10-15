@@ -178,7 +178,9 @@ single_spectrum fits one region. It supports:
 For a single spectrum, `fit.time_background` supplies `[C, A, tau]`, each a
 number or Value specification, and `fit.gamma_transmission` supplies the
 sample's gamma transmission. The additive time term enters after the pulse.
-It is distinct from the beam-borne `fit.background` scattering terms.
+It is distinct from the beam-borne `fit.background` scattering terms,
+`[b0, b1, b2]`, `[b0, b1, b2, d, f]` or an object with `b0`, `b1`, `b2` and
+optional `d`, `f`.
 `fit.room_background` supplies `{rate, frames}`: counts per microsecond per
 pixel per frame in both runs, and the `[open-beam, sample]` frames.
 

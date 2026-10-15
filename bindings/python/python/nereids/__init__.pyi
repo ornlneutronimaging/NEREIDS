@@ -1077,7 +1077,8 @@ class Region:
     """The counts of a set of pixels in both runs, its background and the
     material the beam crosses there.
 
-    The background is [b0, b1, b2] of b(E) = b0 + b1/sqrt(E) + b2*sqrt(E);
+    The background is [b0, b1, b2] or [b0, b1, b2, d, f] of
+    b(E) = b0 + b1/sqrt(E) + b2*sqrt(E) + d*exp(-f/sqrt(E));
     pixels is the region area in pixels.
     """
 

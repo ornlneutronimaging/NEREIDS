@@ -908,7 +908,7 @@ mod tests {
                 sample_counts: vec![100.0; bins],
                 open_live: None,
                 sample_live: None,
-                background: [Value::Known(0.0); 3],
+                background: [Value::Known(0.0); 5],
                 pixels: 1.0,
                 gamma_transmission: Value::Known(1.0),
                 material: Some(Material {
@@ -984,7 +984,7 @@ mod tests {
                 excluded_bins: Vec::new(),
                 densities: vec![2e-3],
                 temperature_k: Some(300.0),
-                background: [0.0; 3],
+                background: [0.0; 5],
                 gamma_transmission: 1.0,
                 beam: BeamSpline::constant(200.0, 600.0, 1.0),
                 beam_at_limit: false,

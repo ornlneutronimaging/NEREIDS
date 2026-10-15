@@ -422,17 +422,23 @@ def _value_or_number(spec: Any, default: float) -> nereids.Value:
 
 
 def _background_values(spec: Any) -> list:
-    """A [b0, b1, b2] background, each a Value; absent means no background."""
+    """A [b0, b1, b2, d, f] background, each a Value; absent means none."""
     if spec is None:
-        return [nereids.Value.known(0.0)] * 3
+        return [nereids.Value.known(0.0)] * 5
     if isinstance(spec, dict):
         missing = [key for key in ("b0", "b1", "b2") if key not in spec]
         if missing:
             raise ValueError(f"background is missing {', '.join(missing)}")
-        return [nereids.Value.known(float(spec[key])) for key in ("b0", "b1", "b2")]
-    if isinstance(spec, (list, tuple)) and len(spec) == 3:
-        return [_as_value(value, "known") for value in spec]
-    raise ValueError("background must be [b0, b1, b2] or an object with b0/b1/b2")
+        return [
+            _as_value(spec.get(key, 0.0), "known") for key in ("b0", "b1", "b2", "d", "f")
+        ]
+    if isinstance(spec, (list, tuple)) and len(spec) in (3, 5):
+        values = [_as_value(value, "known") for value in spec]
+        return values + [nereids.Value.known(0.0)] * (5 - len(values))
+    raise ValueError(
+        "background must be [b0, b1, b2], [b0, b1, b2, d, f] or an object with "
+        "b0/b1/b2 and optional d/f"
+    )
 
 
 def _time_background_values(spec: Any) -> list | None:
