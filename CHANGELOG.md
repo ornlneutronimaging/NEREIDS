@@ -9,77 +9,45 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
 
 ### Changed (breaking)
 
-- **The GUI defaults to ENDF/B-VIII.1.**
-  A new GUI session, and its Forward Model and Detectability tools, load ENDF/B-VIII.1, the library the Python API already defaults to, so cross sections, and the densities and temperatures fitted with them, can differ from 0.3.0's; a saved project keeps its library.
-  ENDF/B-VIII.1 gives Si-28, Si-29, Si-30, Rh-103 and O-18 only in forms NEREIDS does not evaluate (R-Matrix Limited, unresolved, or a scattering radius alone), and V-51 and Sr-88 in an R-Matrix Limited form whose particle pair (PNT=-1) the parser refuses, so these natural isotopes, which load from ENDF/B-VIII.0, are refused under the new default.
-  For others its resolved range ends lower, and NEREIDS gives no cross section above that end: Hf-177 and Hf-179 at 250 eV instead of 510 eV, Hf-180 at 2.5 keV instead of 5.0 keV, Te-122 at 11 keV instead of 20 keV, Nd-148 at 8.15 keV instead of 9.99 keV, Kr-84 at 20 keV and Er-168 at 9.96 keV where ENDF/B-VIII.0 resolves their whole range, and Hf-178, Ba-134, Ba-137, Ag-109, Tb-159 and Dy-160 by 6.25% or less.
-  The GUI's and Python's fits use all of it, Ta-181 at 13.6–14.2 eV included, which the counts fits, not yet released, leave out.
+- Fitting uses raw open-beam and sample counts on time-of-flight bin edges.
+  `fit_counts(Measurement, Calibration)` and `fit_map(MapMeasurement,
+  Calibration)` replace the typed-spectrum and spatial fitting APIs.
+  The detector pulse acts on each count arm. An energy-center array or a
+  transmission ratio cannot replace the original detector counts and edges.
+- Removed transmission-LM fitting, the alternate joint-Poisson fitter,
+  spatial regularization, legacy calibration and detectability interfaces,
+  and the examples that require them. The Python quickstart describes the
+  counts API. The GUI and MCP workflows call the same counts engine.
+- The GUI uses ENDF/B-VIII.1 by default. A saved project keeps its library.
+  The counts engine excludes the Ta-181 VIII.1 window at 13.6–14.2 eV and
+  reports excluded bins. Library choice can change fitted densities and
+  temperatures.
+- ENDF loading evaluates resolved LRF=1/2/3 ranges. URR, RML and
+  scattering-radius-only ranges are parsed but not evaluated. A source
+  with no supported range is rejected. Mixed sources report skipped ranges.
+  Source composition still omits File-3 contributions.
+- Failed ENDF downloads raise `ConnectionError`. Cache access errors raise
+  the matching `OSError`. A cached source for another isotope is rejected.
+- `poisson_fit` requires finite, non-negative counts and an analytical
+  Jacobian. It reports half Poisson deviance and withholds uncertainties
+  for quantities on bounds or in undetermined directions.
+- MCP counts inputs require original, increasing time-bin edges.
+  Unsupported fit settings are rejected. A single-spectrum manifest can
+  supply an additive time background; map manifests cannot.
+- PLEIADES test data are no longer a Git submodule. The local directory is
+  ignored. The test suite does not require it.
 
-- **A failed ENDF download raises `ConnectionError`.**
-  `load_endf` and `IsotopeGroup.load_endf` raise `ConnectionError` (an `OSError`) instead of `RuntimeError` when no download site can be reached, or one answers with an HTTP error other than 404 or refuses the download.
-  A cache file that cannot be read or written raises the matching `OSError`, naming the file.
-  `IsotopeGroup.load_endf` refuses a cached file that holds another isotope, as `load_endf` does.
-  Scripts catching `RuntimeError` for these must catch `OSError` instead.
-- **Raw counts with an instrument resolution are refused.**
-  `fit_counts_spectrum_typed`, `spatial_map_typed` on count cubes and
-  `compute_model_jacobian` reject an active resolution instead of
-  broadening the transmission ratio, which is not the detector's response:
-  the open and sample arms are broadened separately.
-- **`poisson_fit` takes counts and an analytical Jacobian.** It minimizes
-  half the Poisson deviance by projected Levenberg–Marquardt steps in the
-  Fisher metric and reports `converged` when its Newton decrement is below
-  1e-6, within about 0.0014 standard errors of a minimum inside the bounds
-  where the deviance is quadratic. Models without an analytical Jacobian,
-  observations that are not finite non-negative counts, and bounds that are
-  inverted, NaN or admit no finite value are refused. `PoissonResult.nll` is now `deviance`,
-  `uncertainties` holds `None` for a parameter on a bound or along a
-  direction the data do not determine, and `on_bound` is new.
-  `PoissonConfig` loses `fd_step`, `step_size`, `armijo_c`, `backtrack`,
-  `gauss_newton_lambda`, `lbfgs_history` and `tol_param`.
-- **Removed the two cross-domain fit routes.** Normalized transmission with
-  a Poisson/KL solver is rejected (a fractional ratio is not Poisson count
-  data, and the supplied uncertainty would be ignored), and raw
-  sample/open-beam counts with the LM least-squares engine is rejected
-  (dividing the arms loses open-beam uncertainty and count statistics).
-  This applies at every boundary: `fit_spectrum_typed`,
-  `spatial_map_typed`, the Python bindings, the MCP manifest (validate and
-  run alike, including the counts→transmission conversion, now deleted),
-  and the GUI solver picker. The internal helpers `counts_to_transmission`,
-  `fit_transmission_poisson` and `poisson_to_lm_result` are gone.
-- **`deviance_per_dof` now divides by informative bins.** Active bins with
-  no counts (`O_i + S_i == 0`) are degenerate under the conditional-binomial
-  model — identically zero deviance for any transmission — so they no longer
-  count as degrees of freedom. Reported goodness-of-fit and the opt-in
-  `scale_by_chi2` σ inflation change for any fit whose window contains empty
-  bins; fully occupied fits,
-  including the VENUS regression anchors, are unaffected.
+### Limitations
 
-- **Removed URR (LRU=2) and R-Matrix Limited (LRF=7) cross-section
-  evaluation.** The URR Hauser-Feshbach path lacked the ENDF
-  width-fluctuation correction (a systematically wrong average), and the
-  RML path's closed-channel treatment was incomplete (the Coulomb/SHF=1
-  closed-channel shift was unimplemented) and never validated against SAMMY.
-  Both range types are now parsed-and-skipped:
-  the parser consumes their records for cursor alignment (all structural
-  guards preserved) and tags them non-evaluable, so they contribute zero
-  cross-section. A file whose every range is non-evaluable (e.g. a pure
-  LRF=7 evaluation such as W-184) is rejected at load with an
-  `UnsupportedFormat` error naming each skipped range; mixed evaluations
-  (e.g. Ta-181, U-238) still load, with a Python `UserWarning` from
-  `load_endf`/`load_endf_file` listing the skipped spans, a
-  `ResonanceData.has_unevaluated_ranges` getter, and a GUI log warning.
-- **LRU=0 scattering-radius-only evaluations are rejected at load.** ENDF-6
-  §2.1 LRU=0 ranges (e.g. H-1) give a scattering radius but no resonance
-  parameters, so they contribute zero cross-section; NEREIDS previously loaded
-  them as zero-resonance data. They are now parsed-and-skipped placeholders,
-  and a file whose only range is LRU=0 is rejected with an `UnsupportedFormat`
-  error that names the LRU=0 span. Mixed files that also carry a resolved
-  LRF=1/2/3 range still load and use it.
-- **Removed the dead `alpha_1`/`alpha_2` counts-fit parameters** from the
-  Python API (`fit_alpha_1`, `fit_alpha_2`, `alpha_1_init`,
-  `alpha_2_init` kwargs). The MCP server now rejects manifests that still
-  pass any of these keys with an explicit error instead of silently
-  running with defaults.
+- The map has no additive time-background model. Its `trusted` array records
+  numerical status only. It does not validate the physical model or the
+  inferred temperature.
+- The GUI holds temperature and pulse numbers at their supplied values.
+  Isotope-group members have separate fitted densities. Legacy project
+  result fields remain readable but are not restored as counts-fit results.
+- Synthetic recovery tests do not establish experimental thermometry
+  accuracy. A measured sample requires a suitable nuclear source, pulse,
+  time background and calibration.
 
 ## [0.3.0] - 2026-07-07
 

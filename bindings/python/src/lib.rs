@@ -3815,7 +3815,6 @@ impl PyMapMeasurement {
     /// excluded, sample and empty have shape (row, column).
     #[new]
     #[pyo3(signature = (time_edges_us, open_counts, sample_counts, excluded, sample, empty, material, charge_ratio, normalization, background, binning=1, empty_background=None, open_live=None, sample_live=None))]
-    #[allow(clippy::too_many_arguments)]
     fn new(
         time_edges_us: Vec<f64>,
         open_counts: PyReadonlyArray3<f64>,
@@ -3834,7 +3833,7 @@ impl PyMapMeasurement {
     ) -> PyResult<Self> {
         let empty_background = match empty_background {
             Some(values) => value_trio(values)?,
-            None => NO_TIME_BACKGROUND,
+            None => [Value::Known(0.0); 3],
         };
         Ok(Self {
             inner: MapData {
@@ -4037,7 +4036,7 @@ impl PyCountsMap {
             .collect()
     }
 
-    /// Whether each patch is trusted.
+    /// Numerical convergence and uncertainty status, not physical validation.
     #[getter]
     fn trusted<'py>(&self, py: Python<'py>) -> Bound<'py, PyArray2<bool>> {
         PyArray2::from_owned_array(py, self.trusted.clone())

@@ -203,9 +203,13 @@ pub fn run_pixel_fit(request: &FitRequest) -> Result<PixelFitSummary, String> {
     if request.isotopes.is_empty() {
         return Err("select at least one isotope with loaded ENDF data".into());
     }
-    assert_live(&request.excluded, request.region)?;
     let (open_counts, pixels) = selection_counts(&request.open_counts, request.region)?;
     let (sample_counts, _) = selection_counts(&request.sample_counts, request.region)?;
+    let shape = request.open_counts.shape();
+    if request.excluded.dim() != (shape[1], shape[2]) {
+        return Err("the excluded-pixel mask does not match the image".into());
+    }
+    assert_live(&request.excluded, request.region)?;
     let region = Region {
         open_counts,
         sample_counts,

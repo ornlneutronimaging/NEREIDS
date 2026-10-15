@@ -500,7 +500,7 @@ fn fit_buttons(ui: &mut egui::Ui, state: &mut AppState) {
     if let Some(summary) = &state.map_fit {
         ui.add_space(4.0);
         ui.label(format!(
-            "Counts map: {} isotope(s), {}x{} px patches, deviance {:.4}, converged {}, trusted {} of {}",
+            "Counts map: {} isotope(s), {}x{} px patches, deviance {:.4}, converged {}, numerically accepted {} of {}",
             summary.labels.len(),
             summary.binning,
             summary.binning,

@@ -84,16 +84,15 @@ pub fn average_roi(
 /// validating entry point; this function performs no input validation of its
 /// own (backward compatibility: GUI, Python ABI, persisted masks).
 ///
-/// Precondition: `data` has been validated finite and non-negative (e.g. by
-/// [`normalize`]).  Under that invariant the exact `== 0.0` test is
+/// Precondition: `data` is finite and non-negative.
+/// Under that invariant the exact `== 0.0` test is
 /// intentional:
 ///
 /// - Counts are validated non-negative, and `0.0 × efficiency == 0.0` holds
 ///   exactly in IEEE 754, so a `<= 0.0` test would be dead code.
 /// - A NaN bin makes a pixel appear *alive* (`NaN == 0.0` is `false`).  This
 ///   is deliberate: corrupt input must be rejected upstream, never silently
-///   masked (house anti-masking rule — cf. the validation rationale comment
-///   in [`normalize`]).  [`detect_bad_pixels`] rejects such input up front.
+///   masked. [`detect_bad_pixels`] rejects such input up front.
 /// - An empty TOF axis (`shape[0] == 0`) makes the all-zero test vacuously
 ///   true for *every* pixel — the whole detector would be reported dead.
 ///   This non-validating function keeps that behaviour for backward

@@ -32,6 +32,10 @@ const MOST_HALVINGS: i32 = 10;
 /// The counts of every pixel of an open-beam run and a sample run recorded in
 /// the same time bins, which pixels to fit, and the material behind the
 /// sample.
+///
+/// The map models beam-borne scattering background only. It has no additive
+/// time background; use [`crate::counts_fit::fit_counts`] when that term is
+/// required.
 #[derive(Debug, Clone)]
 pub struct MapMeasurement<'a> {
     /// Time-bin edges in µs.
@@ -180,6 +184,8 @@ pub struct CountsMap<'a> {
     /// Whether the map converged, the patch did not fail, and each of its
     /// fitted densities and its fitted temperature has a finite standard
     /// deviation or, for a density, is 0.
+    /// This is numerical status, not validation of the physical model or of
+    /// the inferred temperature.
     pub trusted: Array2<bool>,
     /// The normalization `a`: the known one, or the fitted one.
     pub normalization: f64,

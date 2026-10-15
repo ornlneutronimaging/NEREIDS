@@ -58,7 +58,9 @@ pub fn results_step(ui: &mut egui::Ui, state: &mut AppState) {
                 ui.label("Converged");
                 ui.label(summary.converged.to_string());
                 ui.end_row();
-                ui.label("Trusted patches");
+                ui.label("Numerically accepted patches").on_hover_text(
+                    "Convergence and uncertainty status only. The map has no additive time background; this is not physical validation.",
+                );
                 ui.label(format!(
                     "{} of {}",
                     summary.trusted.iter().filter(|&&t| t).count(),

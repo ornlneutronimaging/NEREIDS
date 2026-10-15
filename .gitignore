@@ -59,6 +59,9 @@ _fts_*.txt
 .private/
 tmp/
 
+# Optional local PLEIADES fixtures; not a NEREIDS dependency.
+/tests/data/pleiades_data/
+
 # do not track manuscript folders
 .manuscripts/
 

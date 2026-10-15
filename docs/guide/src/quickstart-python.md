@@ -50,11 +50,11 @@ plt.show()
 
 ## Counts Fitting
 
-Build the measurement from raw counts on shared time-bin edges (microseconds)
-and fit the material:
+Use the original detector time-bin edges in microseconds. Do not reconstruct
+them from energy centers. Build the measurement and fit the material:
 
 ```python
-edges = np.linspace(200.0, 400.0, sample_counts_1d.size + 1)
+edges = np.asarray(time_edges_us, dtype=np.float64)
 
 region = nereids.Region(
     open_counts=open_beam_counts_1d,

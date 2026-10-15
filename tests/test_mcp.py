@@ -411,6 +411,100 @@ class TestCountsManifest:
         assert result["results"]["mode"] == "single_spectrum"
         assert result["results"]["converged"] is True
 
+    def test_single_spectrum_preserves_time_background(self, tmp_path, monkeypatch):
+        self._counts_npz(tmp_path)
+        manifest = _write_json_frontmatter_manifest(
+            tmp_path, self._analysis(time_background=[10.0, 50.0, 25.0])
+        )
+        captured = []
+
+        def fit(measurement, calibration):
+            captured.extend(v.value for v in measurement.time_background)
+            return self._fake_fit()
+
+        monkeypatch.setattr(nereids, "fit_counts", fit)
+        result = process_resonance_dataset(str(manifest))
+        assert result["success"], result
+        assert captured == [10.0, 50.0, 25.0]
+
+    def test_counts_require_original_time_bin_edges(self, tmp_path, monkeypatch):
+        np.savez(
+            tmp_path / "counts.npz",
+            energies_ev=np.linspace(5.0, 10.0, 6),
+            open_beam_counts=np.arange(100.0, 106.0),
+            sample_counts=np.arange(80.0, 86.0),
+        )
+        manifest = _write_json_frontmatter_manifest(tmp_path, self._analysis())
+        monkeypatch.setattr(nereids, "fit_counts", lambda *args: self._fake_fit())
+        result = process_resonance_dataset(str(manifest))
+        assert not result["success"]
+        assert "time_edges_us" in str(result)
+
+    def test_map_rejects_unsupported_time_background(self, tmp_path):
+        self._counts_npz(tmp_path)
+        manifest = _write_json_frontmatter_manifest(
+            tmp_path,
+            self._analysis(mode="density_map", time_background=[10.0, 50.0, 25.0]),
+        )
+        report = validate_resonance_dataset(str(manifest))
+        assert not report["valid"]
+        assert any("time background" in e for e in report["errors"])
+
+    def test_unknown_fit_settings_are_rejected(self, tmp_path):
+        self._counts_npz(tmp_path)
+        manifest = _write_json_frontmatter_manifest(
+            tmp_path, self._analysis(fix_densities=True, fit_alpha_1=True)
+        )
+        report = validate_resonance_dataset(str(manifest))
+        assert not report["valid"]
+        assert any("unsupported fit settings" in e for e in report["errors"])
+
+    def test_material_retains_the_isotope_library(self, tmp_path, monkeypatch):
+        from nereids.mcp.server import _material
+
+        config = self._analysis()
+        config["isotopes"][0]["library"] = "jendl5"
+        original = nereids.Material
+        libraries = []
+
+        def material(**kwargs):
+            libraries.append(kwargs["library"])
+            return original(**kwargs)
+
+        monkeypatch.setattr(nereids, "Material", material)
+        _material(config, {}, tmp_path, config["fit"])
+        assert libraries == ["jendl5"]
+
+    def test_mixed_library_material_is_rejected(self, tmp_path):
+        from nereids.mcp.server import _material
+
+        config = self._analysis()
+        entry = _synthetic_u238_entry()
+        entry["library"] = "jendl5"
+        config["isotopes"].append(entry)
+        with pytest.raises(ValueError, match="one ENDF library"):
+            _material(config, {}, tmp_path, config["fit"])
+
+    def test_map_masks_follow_the_counts_roi(self, tmp_path, monkeypatch):
+        counts = np.full((6, 2, 4), 100.0)
+        empty = np.array([[False, False, True, False]] * 2)
+        np.savez(
+            tmp_path / "counts.npz", time_edges_us=np.linspace(200.0, 400.0, 7),
+            open_beam_counts=counts, sample_counts=counts, empty=empty,
+        )
+        config = self._analysis(mode="density_map")
+        config["data"]["roi"] = {"x0": 1, "y0": 0, "width": 2, "height": 2}
+        manifest = _write_json_frontmatter_manifest(tmp_path, config)
+        captured = []
+
+        def fit(measurement, calibration):
+            captured.extend([[p.kind for p in row] for row in measurement.patches()])
+            raise RuntimeError("measurement captured")
+
+        monkeypatch.setattr(nereids, "fit_map", fit)
+        process_resonance_dataset(str(manifest))
+        assert captured == [["sample", "outside"], ["sample", "outside"]]
+
     def test_process_density_map_routes_to_fit_map(self, tmp_path, monkeypatch):
         bins, height, width = 4, 2, 2
         np.savez(

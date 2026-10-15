@@ -32,9 +32,9 @@ pip install "fastmcp>=3.0"
 python -m nereids.mcp
 ```
 
-In the repository Pixi environment, `fastmcp` is intentionally not a default
-dependency because it can conflict with conda metadata packages. Install it
-manually in the environment when MCP support is needed.
+In the repository, use `pixi run -e mcp test-mcp` to build and test the isolated
+MCP environment. `fastmcp` is kept out of the default environment because it
+can conflict with conda metadata packages.
 
 ### Behavior when `fastmcp` is not installed
 
@@ -156,8 +156,13 @@ instrument resolution block is rejected, because the counts fit uses the
 Ikeda-Carpenter pulse in the calibration block, not a tabulated resolution.
 Each fitted quantity is a number (known) or an object with a kind
 ("known", "fitted", "within" or "measured") and the matching fields, so a
-manifest can free or fix a density, the temperature, a background term, the
+manifest can free or fix the temperature, a background term, the
 normalization, t0, the flight path and each pulse number.
+Isotope densities are fitted from their `initial_density` values. All
+isotopes in a material must use the same ENDF library; its library also
+determines which resonance windows the fit excludes.
+Unsupported fit settings are rejected. Removed solver or parameter options
+cannot silently change the requested fit.
 
 ## Supported Workflow Inputs
 
@@ -166,18 +171,25 @@ The fit is counts-only.
 single_spectrum fits one region. It supports:
 
 - counts_npz or counts: a .npz file with 1D or 3D sample_counts and
-  open_beam_counts, plus the time-bin edges. The edges come from time_edges_us
-  (or time_edges_key), or are converted from an energy grid through
-  energy_to_tof with the calibration's flight path.
-- nexus_histogram or nexus: sample and open-beam NeXus histogram files,
-  configured with sample_path and open_beam_path; the loader's TOF edges are
-  used directly.
+  open_beam_counts, plus the original time-bin edges in microseconds. The
+  edges come from time_edges_us (or time_edges_key) and must increase in
+  the counts' order. Energy centers cannot reconstruct detector bin edges.
+
+For a single spectrum, `fit.time_background` supplies `[C, A, tau]`, each a
+number or Value specification, and `fit.gamma_transmission` supplies the
+sample's gamma transmission. The additive time term enters after the pulse.
+It is distinct from the beam-borne `fit.background` scattering terms.
 
 density_map and spatial_map fit every patch of a counts cube. They support
 counts_npz/counts and nexus_histogram/nexus with 3D counts. Optional .npz
 arrays excluded, sample and empty are (row, column) boolean masks; without
 them every pixel is treated as behind the sample. binning sets the patch side
 in pixels.
+
+Map workflows reject `fit.time_background`: the map engine does not support
+it. The map's `trusted` array reports numerical status, not physical or
+thermometry validation. Masks are cropped with the counts when an ROI or
+pixel limit is selected.
 
 Paired arrays must have matching shapes, and the time-bin edge count must be
 one more than the first axis of the data arrays. For NeXus inputs the sample

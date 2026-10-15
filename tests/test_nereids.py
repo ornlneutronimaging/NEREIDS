@@ -919,6 +919,30 @@ class TestCountsApi:
         assert all(patch.kind == "sample" for row in patches for patch in row)
         assert map_measurement.binning == 1
 
+    def test_default_empty_background_predicts_equal_empty_run_counts(self, u238_data):
+        counts = np.full((12, 1, 2), 100.0)
+        measurement = nereids.MapMeasurement(
+            time_edges_us=np.linspace(350.0, 440.0, 13),
+            open_counts=counts,
+            sample_counts=counts,
+            excluded=np.zeros((1, 2), dtype=bool),
+            sample=np.array([[True, False]]),
+            empty=np.array([[False, True]]),
+            material=nereids.Material(
+                isotopes=[(u238_data, nereids.Value.known(0.0))],
+                temperature_k=nereids.Value.known(300.0),
+            ),
+            charge_ratio=1.0,
+            normalization=nereids.Value.known(1.0),
+            background=[nereids.Value.known(0.0)] * 3,
+        )
+        result = nereids.fit_map(measurement, self._calibration())
+        assert result.empty is not None
+        np.testing.assert_allclose(
+            result.empty.predicted_sample, result.empty.predicted_open,
+            rtol=1e-12, atol=1e-10,
+        )
+
 
 
 

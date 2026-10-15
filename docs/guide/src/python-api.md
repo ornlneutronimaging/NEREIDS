@@ -131,13 +131,20 @@ Patch.kind is "sample", "mixed" or "outside". MapMeasurement(time_edges_us,
 open_counts, sample_counts, excluded, sample, empty, material, charge_ratio,
 normalization, background, binning=1, empty_background=None, open_live=None,
 sample_live=None) holds the (time bin, row, column) counts and the (row,
-column) masks; its patches() method returns each patch's kind.
+column) masks; its patches() method returns each patch's kind. The map has no
+additive time-background term. Use fit_counts with regions and an explicit
+time_background when this contribution is required.
 
 CountsMap exposes the per-patch fits (fits, failed, empty), density maps
 densities and density_sd in atoms/barn, temperature_k and temperature_sd_k in
 K, the two overdispersion maps, trusted, and the shared normalization, t0_us,
 flight_path_m, alpha, beta, r, fwhm_squared_us2, shared, shared_covariance,
 deviance and converged. n_fitted counts the fitted patches.
+
+trusted records numerical convergence and uncertainty status only: fitted
+densities and temperature must have finite standard deviations, except that
+a zero density is accepted without one. It does not establish that the
+physical model describes the data or that a temperature is accurate.
 
 ### `NexusData`
 

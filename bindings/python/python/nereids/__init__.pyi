@@ -1261,6 +1261,7 @@ class MapMeasurement:
 
     open_counts and sample_counts have shape (time bin, row, column);
     excluded, sample and empty have shape (row, column).
+    No additive time background is modeled; use fit_counts when it is needed.
     """
 
     def __init__(
@@ -1284,7 +1285,7 @@ class MapMeasurement:
         """Each patch kind, in (patch row, patch column)."""
         ...
     @property
-    def time_edges_us(self) -> NDArray[np.float64]: ...
+    def time_edges_us(self) -> list[float]: ...
     @property
     def charge_ratio(self) -> float: ...
     @property
@@ -1312,7 +1313,9 @@ class CountsMap:
     @property
     def overdispersion(self) -> list[NDArray[np.float64]]: ...
     @property
-    def trusted(self) -> NDArray[np.bool_]: ...
+    def trusted(self) -> NDArray[np.bool_]:
+        """Numerical convergence and uncertainty status, not physical validation."""
+        ...
     @property
     def normalization(self) -> float: ...
     @property

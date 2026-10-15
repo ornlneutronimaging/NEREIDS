@@ -734,11 +734,8 @@ pub fn broadened_cross_sections(
 /// **working grid** (the data grid extended by the kernel's reach, else the
 /// data grid) together with the [`WorkingGridLayout`].
 ///
-/// The counts-domain fit uses this to pre-store
-/// σ on the working grid so each per-pixel `PrecomputedTransmissionModel`
-/// applies Beer-Lambert + resolution on the working grid and extracts the data
-/// points last — matching [`forward_model`]. Resolution is NOT
-/// applied.
+/// Returns σ on the working grid before Beer-Lambert and resolution.
+/// Extract the data points after those operations, as in [`forward_model`].
 pub fn broadened_cross_sections_on_working_grid(
     energies: &[f64],
     resonance_data: &[ResonanceData],
@@ -1150,8 +1147,7 @@ pub fn broadened_cross_sections_with_analytical_derivative_from_base_on_working_
 ///
 /// Applies Doppler broadening and Beer-Lambert using cached base XS, then
 /// resolution broadening on the total transmission. This skips
-/// the expensive Reich-Moore calculation, making it suitable for use inside
-/// `TransmissionFitModel::evaluate()` when temperature is a free parameter.
+/// the expensive resonance calculation when temperature varies.
 ///
 /// The full pipeline runs on the **auxiliary extended grid** (boundary
 /// extension + resonance fine-structure points) so that Doppler AND resolution

@@ -290,25 +290,6 @@ def _finite_float_or_none(value: Any) -> float | None:
     return scalar if math.isfinite(scalar) else None
 
 
-def _ascending_energy_grid(
-    energies: np.ndarray, *aligned: np.ndarray
-) -> tuple[np.ndarray, ...]:
-    """Ensure energies are strictly ascending, reversing aligned arrays if needed."""
-    grid = _validate_array("energies", energies, ndim=1)
-    arrays = tuple(np.ascontiguousarray(a) for a in aligned)
-    for arr in arrays:
-        if arr.shape[0] != grid.size:
-            raise ValueError(
-                "aligned data first dimension must match energies, "
-                f"got {arr.shape[0]} and {grid.size}"
-            )
-    diffs = np.diff(grid)
-    if np.all(diffs > 0):
-        return (grid, *arrays)
-    if np.all(diffs < 0):
-        reversed_arrays = tuple(np.ascontiguousarray(a[::-1, ...]) for a in arrays)
-        return (np.ascontiguousarray(grid[::-1]), *reversed_arrays)
-    raise ValueError("energies must be strictly monotonic")
 
 
 def _npz_arrays(path: Path) -> dict[str, np.ndarray]:
@@ -335,45 +316,6 @@ def _require_npz_keys(
         )
 
 
-def _load_energy_grid(
-    base: Path,
-    data_config: dict[str, Any],
-    arrays: dict[str, np.ndarray] | None,
-    n_expected: int | None = None,
-) -> np.ndarray:
-    """Load or synthesize an energy grid from manifest config and data arrays."""
-    grid_config = data_config.get("energy_grid") or data_config.get("energies") or {}
-    if isinstance(grid_config, str):
-        grid_config = {"path": grid_config}
-    if not isinstance(grid_config, dict):
-        raise ValueError("energy_grid/energies must be an object or path string")
-
-    key = (
-        grid_config.get("key")
-        or data_config.get("energy_key")
-        or data_config.get("energies_key")
-    )
-    if key and arrays is not None:
-        if key not in arrays:
-            raise ValueError(f"energy key {key!r} not found in data file")
-        return _validate_array("energies", arrays[key], ndim=1)
-
-    if arrays is not None and "energies_ev" in arrays:
-        return _validate_array("energies", arrays["energies_ev"], ndim=1)
-
-    path = _resolve_path(base, grid_config.get("path"))
-    if path is not None:
-        return _validate_array("energies", np.loadtxt(path), ndim=1)
-
-    start = grid_config.get("start_ev", data_config.get("energy_min_ev"))
-    stop = grid_config.get("stop_ev", data_config.get("energy_max_ev"))
-    n_points = grid_config.get("n_points", data_config.get("n_points", n_expected))
-    if start is None or stop is None or n_points is None:
-        raise ValueError(
-            "energy grid is required: provide energies_ev in the data file or "
-            "energy_grid with start_ev, stop_ev, and n_points"
-        )
-    return np.linspace(float(start), float(stop), int(n_points), dtype=np.float64)
 
 
 def _load_isotopes(
@@ -493,6 +435,15 @@ def _background_values(spec: Any) -> list:
     raise ValueError("background must be [b0, b1, b2] or an object with b0/b1/b2")
 
 
+def _time_background_values(spec: Any) -> list | None:
+    """The additive time background's [C, A, tau], or none."""
+    if spec is None:
+        return None
+    if not isinstance(spec, (list, tuple)) or len(spec) != 3:
+        raise ValueError("time_background must be [C, A, tau]")
+    return [_as_value(value, "known") for value in spec]
+
+
 def _temperature_value(fit_config: dict[str, Any]) -> nereids.Value:
     """The material temperature; a number is fitted only with fit_temperature."""
     spec = fit_config.get("temperature")
@@ -543,33 +494,17 @@ def _load_time_edges(
     arrays: dict[str, np.ndarray] | None,
     n_bins: int,
 ) -> np.ndarray:
-    """Time-bin edges in microseconds, from the data or converted from energy."""
+    """Original detector time-bin edges in microseconds, in the counts' order."""
     key = str(data_config.get("time_edges_key", "time_edges_us"))
-    if arrays is not None and key in arrays:
-        edges = _validate_array("time_edges_us", arrays[key], ndim=1)
-    elif arrays is not None and "time_edges_us" in arrays:
-        edges = _validate_array("time_edges_us", arrays["time_edges_us"], ndim=1)
-    else:
-        energies = _load_energy_grid(base, data_config, arrays, n_expected=n_bins)
-        flight_path_m = float(data_config.get("flight_path_m", 25.0))
-        delay_us = float(data_config.get("delay_us", 0.0))
-        if energies.size == n_bins:
-            centers = 0.5 * (energies[:-1] + energies[1:])
-            edges_ev = np.empty(n_bins + 1, dtype=np.float64)
-            edges_ev[1:-1] = centers
-            edges_ev[0] = energies[0] - (centers[0] - energies[0])
-            edges_ev[-1] = energies[-1] + (energies[-1] - centers[-1])
-        else:
-            edges_ev = energies
-        edges = np.asarray(
-            [nereids.energy_to_tof(float(e), flight_path_m) for e in edges_ev],
-            dtype=np.float64,
-        )
-        edges = np.sort(edges) + delay_us
+    if arrays is None or key not in arrays:
+        raise ValueError(f"raw counts require original time_edges_us (NPZ key {key!r})")
+    edges = _validate_array("time_edges_us", arrays[key], ndim=1)
     if edges.size != n_bins + 1:
         raise ValueError(
             f"time_edges_us must have {n_bins + 1} edges for {n_bins} bins, got {edges.size}"
         )
+    if not np.all(np.diff(edges) > 0):
+        raise ValueError("time_edges_us must be strictly increasing in the counts' order")
     return np.ascontiguousarray(edges, dtype=np.float64)
 
 
@@ -581,14 +516,23 @@ def _material(
 ) -> tuple[nereids.Material, list[str], list[float]]:
     """The fitted material and its isotope names and initial densities."""
     entries = _get_isotope_entries(config, frontmatter)
+    default_library = str(config.get("library", "endf8.1"))
+    libraries = {
+        str(entry.get("library", default_library))
+        if isinstance(entry, dict) else default_library
+        for entry in entries
+    }
+    if len(libraries) > 1:
+        raise ValueError("a counts material must use one ENDF library for every isotope")
+    library = next(iter(libraries), default_library)
     isotopes, names = _load_isotopes(
-        entries, base, default_library=str(config.get("library", "endf8.1"))
+        entries, base, default_library=default_library
     )
     initial = [density for _, density in isotopes]
     material = nereids.Material(
         isotopes=[(data, nereids.Value.fitted(density)) for data, density in isotopes],
         temperature_k=_temperature_value(fit_config),
-        library=str(config.get("library", "endf8.1")),
+        library=library,
     )
     return material, names, initial
 
@@ -718,6 +662,7 @@ def _process_single_spectrum(
         charge_ratio=charge_ratio,
         normalization=_value_or_number(fit_config.get("normalization"), 1.0),
         regions=[region],
+        time_background=_time_background_values(fit_config.get("time_background")),
     )
     result = nereids.fit_counts(measurement, calibration)
 
@@ -818,23 +763,19 @@ def _process_density_map(
     excluded_key = str(data_config.get("excluded_key", "excluded"))
     sample_mask_key = str(data_config.get("sample_mask_key", "sample"))
     empty_key = str(data_config.get("empty_key", "empty"))
-    excluded = (
-        np.asarray(arrays[excluded_key], dtype=bool)
-        if arrays is not None and excluded_key in arrays
-        else np.zeros((height, width), dtype=bool)
-    )
-    behind = (
-        np.asarray(arrays[sample_mask_key], dtype=bool)
-        if arrays is not None and sample_mask_key in arrays
-        else np.ones((height, width), dtype=bool)
-    )
-    empty = (
-        np.asarray(arrays[empty_key], dtype=bool)
-        if arrays is not None and empty_key in arrays
-        else np.zeros((height, width), dtype=bool)
-    )
-    if excluded.shape != (height, width) or behind.shape != (height, width) or empty.shape != (height, width):
-        raise ValueError("excluded/sample/empty masks must match the counts spatial shape")
+
+    def mask(key: str, default: np.ndarray) -> np.ndarray:
+        if arrays is None or key not in arrays:
+            return default
+        original = np.asarray(arrays[key], dtype=bool)
+        if original.shape != arrays[sample_key].shape[1:]:
+            raise ValueError("excluded/sample/empty masks must match the counts spatial shape")
+        selected = _apply_roi(original[np.newaxis], roi)[0]
+        return np.ascontiguousarray(selected[:height, :width])
+
+    excluded = mask(excluded_key, np.zeros((height, width), dtype=bool))
+    empty = mask(empty_key, np.zeros((height, width), dtype=bool))
+    behind = mask(sample_mask_key, ~empty)
 
     charge_ratio = float(
         data_config.get("pc_ratio", arrays.get("pc_ratio", 1.0) if arrays is not None else 1.0)
@@ -976,6 +917,21 @@ def _validate_workflow(manifest: dict[str, Any]) -> dict[str, Any]:
     fit_domain = str(fit_config.get("fit_domain", "counts")).lower()
     if fit_domain != "counts":
         errors.append("the fit is counts-only: fit_domain must be 'counts'")
+    supported_fit = {
+        "fit_domain", "normalization", "background", "empty_background",
+        "temperature", "temperature_k", "fit_temperature",
+        "gamma_transmission", "time_background",
+    }
+    unsupported_fit = sorted(set(fit_config) - supported_fit)
+    if unsupported_fit:
+        errors.append(f"unsupported fit settings: {', '.join(unsupported_fit)}")
+
+    try:
+        _time_background_values(fit_config.get("time_background"))
+    except (KeyError, TypeError, ValueError) as exc:
+        errors.append(f"time background is invalid: {exc}")
+    if mode in {"density_map", "spatial_map"} and fit_config.get("time_background") is not None:
+        errors.append("the counts map does not support a time background; use single_spectrum")
 
     resolution = config.get("resolution")
     resolution_kind: str | None = None
