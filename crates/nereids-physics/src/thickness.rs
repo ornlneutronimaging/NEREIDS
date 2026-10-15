@@ -4,7 +4,7 @@
 //! A region's pixels see the areal density `x·n`, `x` distributed with mean 1
 //! and relative variance `v` over the beam that reaches them.  Their summed
 //! counts transmit the mean `⟨exp(−x·D)⟩`, `D = Σ n σ` the optical depth at the
-//! mean density, not `exp(−D)`.  For `x` Gamma distributed the mean is
+//! mean density.  For `x` Gamma distributed the mean is
 //!
 //! ```text
 //! T(D, v) = (1 + v·D)^(−1/v) = exp(−D · ln(1 + v·D)/(v·D))
