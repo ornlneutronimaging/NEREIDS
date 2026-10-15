@@ -1,15 +1,17 @@
-//! Step 4: Analyze — counts preview and ROI selection.
-//!
-//! The counts-KL fit engine is not yet wired into the GUI, so the fit action
-//! is disabled and this step presents the image/spectrum cockpit only.
+//! Step 4: Analyze — counts cockpit and the counts-domain fit.
 
+use std::sync::Arc;
+use std::sync::mpsc;
+
+use crate::counts::{self, FitOutcome, FitRequest, RegionRequest};
 use crate::state::{AppState, SpectrumAxis};
 use crate::widgets::design::{self, NavAction};
 use crate::widgets::image_view::{
     RoiEditorResult, apply_colormap, data_range, show_image_with_roi_editor,
 };
 use egui_plot::{Line, Plot, PlotPoints, VLine};
-use ndarray::Axis;
+use ndarray::{Array2, Axis};
+use nereids_io::spectrum::{SpectrumUnit, SpectrumValueKind};
 
 /// Draw the Analyze step content.
 pub fn analyze_step(ui: &mut egui::Ui, state: &mut AppState) {
@@ -41,10 +43,9 @@ pub fn analyze_step(ui: &mut egui::Ui, state: &mut AppState) {
 
     ui.add_space(8.0);
     ui.separator();
-    ui.add_enabled_ui(false, |ui| {
-        let _ = ui.button("Run counts fit");
-    });
-    ui.weak("Counts engine re-point pending \u{2014} the fit action is disabled.");
+    fit_controls(ui, state);
+    ui.add_space(4.0);
+    fit_buttons(ui, state);
 
     let can_continue = state.energies.is_some();
     match design::nav_buttons(
@@ -375,4 +376,280 @@ fn spectrum_panel(ui: &mut egui::Ui, state: &mut AppState) {
                 );
             }
         });
+}
+
+fn fit_ready(state: &AppState) -> bool {
+    state.sample_data.is_some()
+        && state.open_beam_data.is_some()
+        && state.spectrum_values.is_some()
+        && state.energies.is_some()
+        && (state
+            .isotope_entries
+            .iter()
+            .any(|e| e.enabled && e.resonance_data.is_some())
+            || state
+                .isotope_groups
+                .iter()
+                .any(|g| g.enabled && g.members.iter().any(|m| m.resonance_data.is_some())))
+}
+
+fn fit_controls(ui: &mut egui::Ui, state: &mut AppState) {
+    egui::CollapsingHeader::new("Counts fit settings")
+        .default_open(true)
+        .show(ui, |ui| {
+            egui::Grid::new("counts_fit_grid")
+                .num_columns(2)
+                .show(ui, |ui| {
+                    ui.label("Temperature (K)");
+                    ui.add(
+                        egui::DragValue::new(&mut state.temperature_k)
+                            .range(1.0..=5000.0)
+                            .speed(1.0),
+                    );
+                    ui.end_row();
+                    ui.label("Map patch (px)");
+                    ui.add(egui::DragValue::new(&mut state.map_binning).range(1..=64usize));
+                    ui.end_row();
+                    ui.label("Proton-charge ratio c");
+                    ui.add(egui::DragValue::new(&mut state.kl_c_ratio).speed(0.01));
+                    ui.end_row();
+                    ui.checkbox(&mut state.kl_background_enabled, "Fit beam background b(E)");
+                    ui.end_row();
+                });
+            egui::CollapsingHeader::new("Pulse")
+                .default_open(false)
+                .show(ui, |ui| {
+                    egui::Grid::new("pulse_grid").num_columns(2).show(ui, |ui| {
+                        ui.label("alpha0 (1/µs/√eV)");
+                        ui.add(egui::DragValue::new(&mut state.pulse.alpha0).speed(0.001));
+                        ui.end_row();
+                        ui.label("alpha1 (1/µs)");
+                        ui.add(egui::DragValue::new(&mut state.pulse.alpha1).speed(0.001));
+                        ui.end_row();
+                        ui.label("beta0 (1/µs/√eV)");
+                        ui.add(egui::DragValue::new(&mut state.pulse.beta0).speed(0.001));
+                        ui.end_row();
+                        ui.label("beta1 (1/µs)");
+                        ui.add(egui::DragValue::new(&mut state.pulse.beta1).speed(0.001));
+                        ui.end_row();
+                        ui.label("R");
+                        ui.add(
+                            egui::DragValue::new(&mut state.pulse.r)
+                                .range(0.0..=1.0)
+                                .speed(0.001),
+                        );
+                        ui.end_row();
+                        ui.label("FWHM (µs)");
+                        ui.add(
+                            egui::DragValue::new(&mut state.pulse.fwhm_us)
+                                .range(0.0..=100.0)
+                                .speed(0.01),
+                        );
+                        ui.end_row();
+                    });
+                });
+        });
+}
+
+fn fit_buttons(ui: &mut egui::Ui, state: &mut AppState) {
+    let ready = fit_ready(state);
+    ui.horizontal(|ui| {
+        if ui
+            .add_enabled(
+                ready && !state.is_fitting,
+                egui::Button::new("Run counts fit"),
+            )
+            .on_hover_text("Fit the selected pixel or ROI")
+            .clicked()
+            && let Err(message) = start_fit(state, false)
+        {
+            state.status_message = message;
+        }
+        if ui
+            .add_enabled(
+                ready && !state.is_fitting,
+                egui::Button::new("Run counts map"),
+            )
+            .on_hover_text("Fit every patch of the loaded cube")
+            .clicked()
+            && let Err(message) = start_fit(state, true)
+        {
+            state.status_message = message;
+        }
+        if state.is_fitting {
+            ui.spinner();
+        }
+        if !ready {
+            ui.weak("Load sample and open-beam counts, a TOF bin-edge spectrum and one isotope");
+        }
+    });
+    if let Some(summary) = &state.pixel_fit {
+        ui.add_space(4.0);
+        let densities = summary
+            .labels
+            .iter()
+            .zip(&summary.densities)
+            .map(|(label, density)| format!("{label} = {density:.6} at/barn"))
+            .collect::<Vec<_>>()
+            .join(", ");
+        ui.label(format!(
+            "Pixel/ROI fit: {densities}; T = {:.3} K; deviance {:.4}; converged {}",
+            summary.temperature_k, summary.deviance, summary.converged
+        ));
+    }
+    if let Some(summary) = &state.map_fit {
+        ui.add_space(4.0);
+        ui.label(format!(
+            "Counts map: {} isotope(s), {}x{} px patches, deviance {:.4}, converged {}, trusted {} of {}",
+            summary.labels.len(),
+            summary.binning,
+            summary.binning,
+            summary.deviance,
+            summary.converged,
+            summary.trusted.iter().filter(|&&t| t).count(),
+            summary.trusted.len(),
+        ));
+    }
+}
+
+fn build_request(state: &AppState) -> Result<FitRequest, String> {
+    let sample = state
+        .sample_data
+        .as_ref()
+        .ok_or("load sample counts first")?;
+    let open = state
+        .open_beam_data
+        .as_ref()
+        .ok_or("load open-beam counts first")?;
+    let edges = state
+        .spectrum_values
+        .as_ref()
+        .ok_or("load a TOF bin-edge spectrum")?;
+    if state.spectrum_unit != SpectrumUnit::TofMicroseconds
+        || state.spectrum_kind != SpectrumValueKind::BinEdges
+    {
+        return Err("the counts fit needs TOF bin edges".into());
+    }
+    let n_bins = sample.shape()[0];
+    if edges.len() != n_bins + 1 {
+        return Err(format!(
+            "the spectrum has {} edges for {n_bins} bins; a counts fit needs one edge per bin boundary",
+            edges.len()
+        ));
+    }
+    if open.shape() != sample.shape() {
+        return Err("sample and open-beam counts have different shapes".into());
+    }
+    let energies = state
+        .energies
+        .as_ref()
+        .ok_or("prepare the energy grid first")?;
+    let (e_min, e_max) = energies
+        .iter()
+        .fold((f64::INFINITY, f64::NEG_INFINITY), |(lo, hi), &e| {
+            (lo.min(e), hi.max(e))
+        });
+    if !(e_min.is_finite() && e_max.is_finite() && e_min < e_max) {
+        return Err("the energy grid is not usable".into());
+    }
+    let mut isotopes = Vec::new();
+    for entry in &state.isotope_entries {
+        if !entry.enabled {
+            continue;
+        }
+        let data = entry
+            .resonance_data
+            .clone()
+            .ok_or_else(|| format!("{} has no ENDF data", entry.symbol))?;
+        isotopes.push(counts::IsotopeInput {
+            label: entry.symbol.clone(),
+            data,
+            density: entry.initial_density.max(0.0),
+        });
+    }
+    for group in &state.isotope_groups {
+        if !group.enabled {
+            continue;
+        }
+        for member in &group.members {
+            let data = member
+                .resonance_data
+                .clone()
+                .ok_or_else(|| format!("{} has no ENDF data", member.symbol))?;
+            isotopes.push(counts::IsotopeInput {
+                label: format!("{} ({})", member.symbol, group.name),
+                data,
+                density: (group.initial_density * member.ratio).max(0.0),
+            });
+        }
+    }
+    if isotopes.is_empty() {
+        return Err("enable at least one isotope with loaded ENDF data".into());
+    }
+    let (height, width) = (sample.shape()[1], sample.shape()[2]);
+    let excluded = state
+        .dead_pixels
+        .clone()
+        .unwrap_or_else(|| Array2::from_elem((height, width), false));
+    let region = match state.selected_roi.and_then(|index| state.rois.get(index)) {
+        Some(roi) if roi.y_end > roi.y_start && roi.x_end > roi.x_start => RegionRequest::Roi {
+            y0: roi.y_start,
+            y1: roi.y_end,
+            x0: roi.x_start,
+            x1: roi.x_end,
+        },
+        _ => {
+            let (y, x) = state.selected_pixel.unwrap_or((height / 2, width / 2));
+            RegionRequest::Pixel { y, x }
+        }
+    };
+    let charge_ratio = if state.kl_c_ratio.is_finite() && state.kl_c_ratio > 0.0 {
+        state.kl_c_ratio
+    } else if state.proton_charge_ob > 0.0 {
+        state.proton_charge_sample / state.proton_charge_ob
+    } else {
+        1.0
+    };
+    Ok(FitRequest {
+        time_edges_us: edges.as_ref().clone(),
+        charge_ratio,
+        normalization_fitted: true,
+        background_fitted: state.kl_background_enabled,
+        isotopes,
+        temperature_k: state.temperature_k,
+        library: state.endf_library,
+        t0_us: state.beamline.delay_us,
+        flight_path_m: state.beamline.flight_path_m,
+        pulse: state.pulse,
+        energy_span_ev: (e_min, e_max),
+        sample_counts: Arc::clone(sample),
+        open_counts: Arc::clone(open),
+        excluded: Arc::new(excluded),
+        region,
+        binning: state.map_binning.max(1),
+    })
+}
+
+fn start_fit(state: &mut AppState, map: bool) -> Result<(), String> {
+    let request = build_request(state)?;
+    let (tx, rx) = mpsc::channel();
+    std::thread::spawn(move || {
+        let outcome = if map {
+            FitOutcome::Map(counts::run_map_fit(&request).map(Box::new))
+        } else {
+            FitOutcome::Pixel(counts::run_pixel_fit(&request))
+        };
+        let _ = tx.send(outcome);
+    });
+    state.pending_fit = Some(rx);
+    state.is_fitting = true;
+    state.status_message = if map {
+        "Fitting the counts map...".into()
+    } else {
+        "Fitting the counts...".into()
+    };
+    if let Some(ctx) = &state.egui_ctx {
+        ctx.request_repaint();
+    }
+    Ok(())
 }

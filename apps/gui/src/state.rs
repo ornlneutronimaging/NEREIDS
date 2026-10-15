@@ -541,8 +541,19 @@ pub struct AppState {
     pub analyze_spectrum_axis: SpectrumAxis,
     pub analyze_tof_slice_index: usize,
 
+    // -- Counts fit --
+    /// The Ikeda-Carpenter pulse numbers used as the known calibration.
+    pub pulse: crate::counts::PulseParams,
+    /// Patch side of the counts map, in pixels.
+    pub map_binning: usize,
+    /// The last single counts fit.
+    pub pixel_fit: Option<crate::counts::PixelFitSummary>,
+    /// The last counts-map fit.
+    pub map_fit: Option<crate::counts::MapFitSummary>,
+
     // -- Background task receivers and cancellation --
     pub pending_endf: Option<mpsc::Receiver<EndfFetchResult>>,
+    pub pending_fit: Option<mpsc::Receiver<crate::counts::FitOutcome>>,
     pub cancel_token: Arc<AtomicBool>,
 
     // -- Preview image texture --
@@ -794,6 +805,7 @@ impl AppState {
         // Replace with a fresh token for future tasks
         self.cancel_token = Arc::new(AtomicBool::new(false));
         self.pending_endf = None;
+        self.pending_fit = None;
         self.is_fitting = false;
         self.is_fetching_endf = false;
         // Note: is_saving / pending_save / save_join_handle are NOT cleared here.
@@ -1078,7 +1090,13 @@ impl Default for AppState {
             analyze_spectrum_axis: SpectrumAxis::EnergyEv,
             analyze_tof_slice_index: 0,
 
+            pulse: crate::counts::PulseParams::default(),
+            map_binning: 4,
+            pixel_fit: None,
+            map_fit: None,
+
             pending_endf: None,
+            pending_fit: None,
             cancel_token: Arc::new(AtomicBool::new(false)),
 
             preview_image: None,

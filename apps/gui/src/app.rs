@@ -221,6 +221,41 @@ impl eframe::App for NereidsApp {
 
 /// Poll background task channels and apply results to state.
 fn poll_pending_tasks(state: &mut AppState) {
+    // Poll the counts-fit worker.
+    if let Some(attempt) = state.pending_fit.as_ref().map(|rx| rx.try_recv()) {
+        match attempt {
+            Ok(crate::counts::FitOutcome::Pixel(result)) => {
+                state.pending_fit = None;
+                state.is_fitting = false;
+                match result {
+                    Ok(summary) => {
+                        state.pixel_fit = Some(summary);
+                        state.status_message = "Counts fit complete".into();
+                    }
+                    Err(message) => state.status_message = format!("Counts fit failed: {message}"),
+                }
+            }
+            Ok(crate::counts::FitOutcome::Map(result)) => {
+                state.pending_fit = None;
+                state.is_fitting = false;
+                match result {
+                    Ok(summary) => {
+                        state.map_fit = Some(*summary);
+                        state.status_message = "Counts map complete".into();
+                    }
+                    Err(message) => state.status_message = format!("Counts map failed: {message}"),
+                }
+            }
+            Err(std::sync::mpsc::TryRecvError::Empty) => {}
+            Err(std::sync::mpsc::TryRecvError::Disconnected) => {
+                state.pending_fit = None;
+                state.is_fitting = false;
+            }
+        }
+        if let Some(ctx) = &state.egui_ctx {
+            ctx.request_repaint();
+        }
+    }
     // Poll ENDF fetch results (streamed one per isotope, matched by (z, a))
     if let Some(ref rx) = state.pending_endf {
         let mut disconnected = false;
