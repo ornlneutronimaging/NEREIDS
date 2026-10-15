@@ -344,7 +344,10 @@ class TestCountsManifest:
     @staticmethod
     def _fake_fit():
         region = SimpleNamespace(
-            densities=[0.001], temperature_k=293.6, thickness_variance=0.04
+            densities=[0.001],
+            temperature_k=293.6,
+            thickness_variance=0.04,
+            capture_gammas=0.2,
         )
         return SimpleNamespace(
             regions=[region],
@@ -414,6 +417,7 @@ class TestCountsManifest:
         assert result["results"]["mode"] == "single_spectrum"
         assert result["results"]["converged"] is True
         assert result["results"]["thickness_variance"] == 0.04
+        assert result["results"]["capture_gammas"] == 0.2
 
     def test_single_spectrum_preserves_time_background(self, tmp_path, monkeypatch):
         self._counts_npz(tmp_path)
@@ -569,8 +573,8 @@ class TestCountsManifest:
             return SimpleNamespace(
                 patches=[[SimpleNamespace(kind="sample")] * width] * height,
                 fits=[
-                    [SimpleNamespace(thickness_variance=0.03), None],
-                    [SimpleNamespace(thickness_variance=None), None],
+                    [SimpleNamespace(thickness_variance=0.03, capture_gammas=0.1), None],
+                    [SimpleNamespace(thickness_variance=None, capture_gammas=0.0), None],
                 ],
                 failed=[[None] * width] * height,
                 empty=None,
@@ -610,4 +614,7 @@ class TestCountsManifest:
         saved = np.load(result["results"]["output_npz"], allow_pickle=True)
         np.testing.assert_array_equal(
             saved["thickness_variance"], [[0.03, np.nan], [np.nan, np.nan]]
+        )
+        np.testing.assert_array_equal(
+            saved["capture_gammas"], [[0.1, np.nan], [0.0, np.nan]]
         )

@@ -78,6 +78,10 @@ pub struct MapMeasurement<'a> {
     /// sample in the sample run, as [`Region::gamma_transmission`], known,
     /// fitted or within bounds in every patch; the empty pixels take 1.
     pub gamma_transmission: Value,
+    /// The capture gammas' `ε` of every patch behind the sample, as
+    /// [`Region::capture_gammas`], known, fitted or within bounds; the empty
+    /// pixels hold no sample and record none.
+    pub capture_gammas: Value,
     /// `[b0, b1, b2, d, f]` of the background of the empty pixels.
     pub empty_background: [Value; 5],
 }
@@ -244,7 +248,8 @@ pub struct CountsMap<'a> {
     pub pulse_consistency: Option<Consistency>,
     /// A patch's fitted quantities: each fitted density, in the material's
     /// order, the temperature and the thickness variance if fitted, each fitted
-    /// background term, and the gamma transmission if fitted.
+    /// background term, and the gamma transmission and capture gammas if
+    /// fitted.
     pub quantities: Vec<String>,
     /// Each patch's covariance of [`Self::quantities`], the shared
     /// quantities' uncertainty included; the row and column of one held on a
@@ -431,8 +436,8 @@ impl CountsMap<'_> {
 /// Everything [`MapMeasurement::patches`] refuses;
 /// [`PipelineError::InvalidParameter`] if a pixel is both behind the sample
 /// and empty, a density, the temperature, the thickness variance, a
-/// background term or the gamma transmission of the sample's patches is
-/// [`Value::Measured`], which would
+/// background term, the gamma transmission or the capture gammas of the
+/// sample's patches is [`Value::Measured`], which would
 /// count its measurement once per patch, a term of the empty pixels' background is
 /// [`Value::Measured`], the material carries resonance covariances, which a
 /// map does not yet carry, a count of a pixel summed into a region is not a
@@ -541,13 +546,13 @@ fn fit_map_from<'a>(
         .map(|(_, density)| density)
         .chain([&material.temperature_k, &material.thickness_variance])
         .chain(&map.background)
-        .chain([&map.gamma_transmission])
+        .chain([&map.gamma_transmission, &map.capture_gammas])
         .any(|value| matches!(value, Value::Measured { .. }))
     {
         return invalid(
-            "a measured density, temperature, thickness variance, background or gamma \
-             transmission of the sample's patches would count its measurement once per patch; \
-             give it known, fitted or within bounds"
+            "a measured density, temperature, thickness variance, background, gamma \
+             transmission or capture gammas of the sample's patches would count its measurement \
+             once per patch; give it known, fitted or within bounds"
                 .into(),
         );
     }
@@ -582,19 +587,25 @@ fn fit_map_from<'a>(
         .filter(|&(pixel, &e)| e && !map.excluded[pixel])
         .map(|(pixel, _)| pixel)
         .collect();
-    let region = |pixels: &[(usize, usize)], background, gamma_transmission, material| {
-        let [open_counts, sample_counts] = summed(map, pixels)?;
-        Ok::<_, PipelineError>(Region {
-            open_counts,
-            sample_counts,
-            open_live: map.open_live.clone(),
-            sample_live: map.sample_live.clone(),
-            background,
-            pixels: pixels.len() as f64,
-            gamma_transmission,
-            material,
-        })
-    };
+    let region =
+        |pixels: &[(usize, usize)], background, gamma_transmission, material: Option<Material>| {
+            let [open_counts, sample_counts] = summed(map, pixels)?;
+            Ok::<_, PipelineError>(Region {
+                open_counts,
+                sample_counts,
+                open_live: map.open_live.clone(),
+                sample_live: map.sample_live.clone(),
+                background,
+                pixels: pixels.len() as f64,
+                gamma_transmission,
+                capture_gammas: if material.is_some() {
+                    map.capture_gammas
+                } else {
+                    Value::Known(0.0)
+                },
+                material,
+            })
+        };
     let mut regions = fitted_patches
         .iter()
         .map(|&patch| {
@@ -623,7 +634,7 @@ fn fit_map_from<'a>(
         regions,
     };
 
-    let template = |background, gamma_transmission, material| Region {
+    let template = |background, gamma_transmission, material: Option<Material>| Region {
         open_counts: Vec::new(),
         sample_counts: Vec::new(),
         open_live: None,
@@ -631,6 +642,11 @@ fn fit_map_from<'a>(
         background,
         pixels: 1.0,
         gamma_transmission,
+        capture_gammas: if material.is_some() {
+            map.capture_gammas
+        } else {
+            Value::Known(0.0)
+        },
         material,
     };
     checked(
@@ -1239,6 +1255,12 @@ fn fit_map_from<'a>(
                 )
             }),
         )
+        .chain((!matches!(map.capture_gammas, Value::Known(_))).then(|| {
+            (
+                Role::CaptureGammas { region: 0 },
+                "capture gammas".to_string(),
+            )
+        }))
         .collect();
     let q = template.len();
 
@@ -1459,6 +1481,7 @@ fn restarted(region: &Region, previous: Option<&RegionFit>) -> Region {
         *term = restart(*term, at);
     }
     region.gamma_transmission = restart(region.gamma_transmission, fit.gamma_transmission);
+    region.capture_gammas = restart(region.capture_gammas, fit.capture_gammas);
     region
 }
 

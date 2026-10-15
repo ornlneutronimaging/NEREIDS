@@ -42,6 +42,33 @@ pub fn uneven_transmission(depth: f64, variance: f64) -> (f64, f64, f64) {
     (transmission, per_depth, per_variance)
 }
 
+/// `q = (1 − T)/D`, the fraction of the beam that interacts per unit optical
+/// depth, with `∂q/∂D` and `∂q/∂v`, at optical depth `depth` (`D`, 0 or more)
+/// and relative variance `variance` (`v`, 0 or more): `Σ n σ_x · q` is the
+/// chance that a neutron's first collision in the sample is of kind `x`.
+/// `q` is 1 at `D = 0`.
+#[must_use]
+pub fn interacting_per_depth(depth: f64, variance: f64) -> (f64, f64, f64) {
+    if depth < 1e-5 {
+        let (a, b) = (
+            1.0 + variance,
+            1.0 + 3.0 * variance + 2.0 * variance * variance,
+        );
+        return (
+            1.0 - a * depth / 2.0 + b * depth * depth / 6.0,
+            -a / 2.0 + b * depth / 3.0,
+            -depth / 2.0 + (3.0 + 4.0 * variance) * depth * depth / 6.0,
+        );
+    }
+    let (_, per_depth, per_variance) = uneven_transmission(depth, variance);
+    let absorbed = -(-depth * log_ratio(variance * depth)).exp_m1();
+    (
+        absorbed / depth,
+        (per_depth * depth - absorbed) / (depth * depth),
+        -per_variance / depth,
+    )
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -97,6 +124,39 @@ mod tests {
                 (t / oracle - 1.0).abs() <= 1e-6,
                 "D {depth} v {variance}: {t} vs {oracle}"
             );
+        }
+    }
+
+    #[test]
+    fn the_interacting_fraction_is_one_minus_t_over_d_with_its_slopes() {
+        for variance in [0.0, 0.05, 0.4] {
+            for depth in [0.0, 5e-6, 9.99e-6, 1.001e-5, 3e-3, 0.7, 12.0] {
+                let (q, per_depth, per_variance) = interacting_per_depth(depth, variance);
+                let (t, _, _) = uneven_transmission(depth, variance);
+                if depth > 0.0 {
+                    assert!(
+                        (q * depth - (1.0 - t)).abs() <= 1e-12 * (1.0 - t).max(1e-300) + 1e-15,
+                        "{depth} {variance}"
+                    );
+                } else {
+                    assert_eq!(q, 1.0);
+                }
+                let (hd, hv) = (1e-5 * depth.max(1e-2), 1e-4 * variance.max(1e-3));
+                let along_depth = (interacting_per_depth(depth + hd, variance).0
+                    - interacting_per_depth((depth - hd).max(0.0), variance).0)
+                    / (depth + hd - (depth - hd).max(0.0));
+                let along_variance = (interacting_per_depth(depth, variance + hv).0
+                    - interacting_per_depth(depth, (variance - hv).max(0.0)).0)
+                    / (variance + hv - (variance - hv).max(0.0));
+                assert!(
+                    (per_depth - along_depth).abs() <= 1e-6,
+                    "{depth} {variance}"
+                );
+                assert!(
+                    (per_variance - along_variance).abs() <= 1e-6,
+                    "{depth} {variance}"
+                );
+            }
         }
     }
 

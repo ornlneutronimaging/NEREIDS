@@ -17,12 +17,14 @@ use nereids_fitting::lm::{FitModel, FlatMatrix};
 use nereids_fitting::parameters::{FitParameter, ParameterSet};
 use nereids_fitting::poisson::{Prior, Unbounded, information_inverse};
 use nereids_fitting::statistics::{Consistency, consistency};
-use nereids_physics::continuous_doppler::{SUPPORT_X, broaden, broaden_with_derivative};
+use nereids_physics::continuous_doppler::{
+    Channel, QuadratureBudget, SUPPORT_X, broaden, broaden_with_budget,
+};
 use nereids_physics::doppler::DopplerParams;
 use nereids_physics::flight_time_grid::{FlightTimeGrid, Rows};
 use nereids_physics::ikeda_carpenter::IkedaCarpenterParams;
 use nereids_physics::resolution::TOF_FACTOR;
-use nereids_physics::thickness::uneven_transmission;
+use nereids_physics::thickness::{interacting_per_depth, uneven_transmission};
 use nereids_physics::transmission::resonance_center_energies;
 use rayon::prelude::*;
 
@@ -170,6 +172,12 @@ pub struct Region {
     /// The fraction of the time background that reaches the region's pixels in
     /// the sample run through what is in front of them, within 0–1.
     pub gamma_transmission: Value,
+    /// `ε`, the share of the neutrons captured in the region's sample whose
+    /// gammas its pixels record, 0 or more: the sample run gains
+    /// `c_q·a·ε·φ·(1 − T)·Σ_m n_m σ_γm/D`, the captures at the neutrons' first
+    /// collision, `σ_γm` each isotope's capture cross section broadened like
+    /// its total one, at the neutrons' flight times.
+    pub capture_gammas: Value,
     /// The material the beam crosses in the region; `None` for nothing, which
     /// transmits every neutron.
     pub material: Option<Material>,
@@ -327,6 +335,8 @@ pub struct RegionFit {
     pub background: [f64; 5],
     /// The gamma transmission: the known one, or the fitted one.
     pub gamma_transmission: f64,
+    /// The capture gammas' `ε`: the known one, or the fitted one.
+    pub capture_gammas: f64,
     /// The region's beam per µs, as a function of the arrival time less the
     /// starting `t0`, fitted to both runs, with the intervals the region's
     /// open-beam fit chose.
@@ -1170,7 +1180,11 @@ pub(crate) fn fit_counts_answer(
     let beams: Vec<BeamSpline> = opens.iter().map(|open| open.beam.clone()).collect();
     let sizes: Vec<usize> = beams.iter().map(|beam| beam.coefficients().len()).collect();
     let pixels: Vec<f64> = regions.iter().map(|region| region.pixels).collect();
-    let layout = Arc::new(Layout::new(roles(&sizes, &shape), &pixels));
+    let captures: Vec<bool> = regions
+        .iter()
+        .map(|region| region.material.is_some() && region.capture_gammas != Value::Known(0.0))
+        .collect();
+    let layout = Arc::new(Layout::new(roles(&sizes, &shape), &pixels, &captures));
     let mut parameters = ParameterSet::new(
         beams
             .iter()
@@ -1536,6 +1550,7 @@ pub(crate) fn fit_counts_answer(
             thickness_variance: place.thickness.map(|v| params[v]),
             background: std::array::from_fn(|i| params[place.background + i]),
             gamma_transmission: params[place.gamma],
+            capture_gammas: params[place.capture],
             beam: open.beam.with_coefficients(&params[place.beam.clone()]),
             beam_at_limit: open.at_limit,
             predicted: [
@@ -1637,6 +1652,7 @@ impl Answer {
                             | Role::ThicknessVariance { region: r }
                             | Role::Background { region: r, .. }
                             | Role::GammaTransmission { region: r }
+                            | Role::CaptureGammas { region: r }
                             if r == region
                     )
             })
@@ -1922,6 +1938,7 @@ pub(crate) enum Role {
     Normalization,
     Background { region: usize, term: usize },
     GammaTransmission { region: usize },
+    CaptureGammas { region: usize },
     TimeBackground(usize),
     RoomBackground,
     T0,
@@ -1951,10 +1968,12 @@ fn roles(beams: &[usize], isotopes: &[Option<usize>]) -> Vec<Role> {
     let backgrounds = (0..isotopes.len())
         .flat_map(|region| (0..5).map(move |term| Role::Background { region, term }));
     let gammas = (0..isotopes.len()).map(|region| Role::GammaTransmission { region });
+    let captures = (0..isotopes.len()).map(|region| Role::CaptureGammas { region });
     beam.chain(materials)
         .chain([Role::Normalization])
         .chain(backgrounds)
         .chain(gammas)
+        .chain(captures)
         .chain((0..3).map(Role::TimeBackground))
         .chain([Role::RoomBackground, Role::T0, Role::FlightPath])
         .chain((0..6).map(Role::Pulse))
@@ -2011,6 +2030,12 @@ fn quantity(
                 "of any sign"
             }
             .into(),
+        ),
+        Role::CaptureGammas { region } => (
+            &measurement.regions[region].capture_gammas,
+            format!("capture gammas of region {region}"),
+            0.0..=f64::INFINITY,
+            "0 or more".into(),
         ),
         Role::GammaTransmission { region } => (
             &measurement.regions[region].gamma_transmission,
@@ -2119,11 +2144,13 @@ struct Place {
     thickness: Option<usize>,
     background: usize,
     gamma: usize,
+    capture: usize,
+    capture_on: bool,
     pixels: f64,
 }
 
 impl Layout {
-    fn new(roles: Vec<Role>, pixels: &[f64]) -> Self {
+    fn new(roles: Vec<Role>, pixels: &[f64], captures: &[bool]) -> Self {
         let at = |wanted: Role| {
             roles
                 .iter()
@@ -2151,6 +2178,8 @@ impl Layout {
                     .position(|&role| role == Role::ThicknessVariance { region: r }),
                 background: at(Role::Background { region: r, term: 0 }),
                 gamma: at(Role::GammaTransmission { region: r }),
+                capture: at(Role::CaptureGammas { region: r }),
+                capture_on: captures[r],
                 pixels: pixels[r],
             })
             .collect();
@@ -2187,14 +2216,29 @@ struct RegionsModel {
 
 struct Absorber {
     isotopes: Arc<[ResonanceData]>,
-    cross_sections: RefCell<Option<CrossSections>>,
+    cross_sections: [RefCell<Option<CrossSections>>; 2],
 }
+
+const CHANNELS: [Channel; 2] = [Channel::Total, Channel::Capture];
+const TOTAL: usize = 0;
+const CAPTURE: usize = 1;
 
 struct Beams {
     open: Vec<f64>,
     normalized: Vec<f64>,
     sample: Vec<f64>,
     per_depth: Vec<f64>,
+    per_variance: Vec<f64>,
+    capture: Option<Captured>,
+}
+
+/// The capture gammas' counts per grid point before the pulse, as slopes:
+/// in `ε`, in the optical depth through the interacting fraction, per unit
+/// capture cross section, and in the thickness variance.
+struct Captured {
+    per_efficiency: Vec<f64>,
+    per_depth: Vec<f64>,
+    share: Vec<f64>,
     per_variance: Vec<f64>,
 }
 
@@ -2302,7 +2346,7 @@ impl RegionsModel {
                 .iter()
                 .map(|isotopes| Absorber {
                     isotopes: Arc::clone(isotopes),
-                    cross_sections: RefCell::new(None),
+                    cross_sections: [RefCell::new(None), RefCell::new(None)],
                 })
                 .collect(),
             energies,
@@ -2325,10 +2369,10 @@ impl RegionsModel {
         &self,
         region: usize,
         temperature_k: f64,
+        channel: usize,
     ) -> Result<std::cell::Ref<'_, CrossSections>, FittingError> {
         let absorber = &self.absorbers[region];
-        let current = absorber
-            .cross_sections
+        let current = absorber.cross_sections[channel]
             .borrow()
             .as_ref()
             .is_some_and(|c| c.temperature_k.to_bits() == temperature_k.to_bits());
@@ -2338,9 +2382,15 @@ impl RegionsModel {
                 .isotopes
                 .par_iter()
                 .map(|isotope| {
-                    let (mut sigma, mut slope) =
-                        broaden_with_derivative(energies, isotope, temperature_k)
-                            .map_err(|e| FittingError::EvaluationFailed(e.to_string()))?;
+                    let broadened = broaden_with_budget(
+                        energies,
+                        isotope,
+                        temperature_k,
+                        CHANNELS[channel],
+                        QuadratureBudget::default(),
+                    )
+                    .map_err(|e| FittingError::EvaluationFailed(e.to_string()))?;
+                    let (mut sigma, mut slope) = (broadened.values, broadened.derivatives);
                     sigma.reverse();
                     slope.reverse();
                     Ok((sigma, slope))
@@ -2348,15 +2398,16 @@ impl RegionsModel {
                 .collect::<Result<Vec<_>, FittingError>>()?
                 .into_iter()
                 .unzip();
-            *absorber.cross_sections.borrow_mut() = Some(CrossSections {
+            *absorber.cross_sections[channel].borrow_mut() = Some(CrossSections {
                 temperature_k,
                 values,
                 slopes,
             });
         }
-        Ok(std::cell::Ref::map(absorber.cross_sections.borrow(), |c| {
-            c.as_ref().expect("computed above")
-        }))
+        Ok(std::cell::Ref::map(
+            absorber.cross_sections[channel].borrow(),
+            |c| c.as_ref().expect("computed above"),
+        ))
     }
 
     fn scale(&self, params: &[f64]) -> Result<std::cell::Ref<'_, Scale>, FittingError> {
@@ -2390,7 +2441,7 @@ impl RegionsModel {
         let densities = &params[place.densities.clone()];
         let sigma = place
             .temperature
-            .map(|t| self.at(region, params[t]))
+            .map(|t| self.at(region, params[t], TOTAL))
             .transpose()?;
         let open: Vec<f64> = combined(&scale.basis[region], &params[place.beam.clone()])
             .into_iter()
@@ -2403,18 +2454,48 @@ impl RegionsModel {
         let terms = &params[place.background..place.background + 5];
         let exponential = self.exponential(terms[4]);
         let variance = place.thickness.map_or(0.0, |v| params[v]);
+        let capture_sigma = match place.temperature {
+            Some(t) if place.capture_on => Some(self.at(region, params[t], CAPTURE)?),
+            _ => None,
+        };
+        let efficiency = params[place.capture];
         let n = normalized.len();
         let (mut sample, mut per_depth, mut per_variance) = (
             Vec::with_capacity(n),
             Vec::with_capacity(n),
             Vec::with_capacity(n),
         );
+        let mut capture = capture_sigma.as_ref().map(|_| Captured {
+            per_efficiency: Vec::with_capacity(n),
+            per_depth: Vec::with_capacity(n),
+            share: Vec::with_capacity(n),
+            per_variance: Vec::with_capacity(n),
+        });
         for (j, beam) in normalized.iter().enumerate() {
             let depth: f64 = sigma
                 .iter()
                 .flat_map(|sigma| densities.iter().zip(&sigma.values))
                 .map(|(n, sigma)| n * sigma[j])
                 .sum();
+            let mut captured = 0.0;
+            if let (Some(capture), Some(capture_sigma)) = (capture.as_mut(), &capture_sigma) {
+                let absorbing: f64 = densities
+                    .iter()
+                    .zip(&capture_sigma.values)
+                    .map(|(n, sigma)| n * sigma[j])
+                    .sum();
+                let (fraction, along_depth, along_variance) =
+                    interacting_per_depth(depth, variance);
+                captured = efficiency * absorbing * fraction;
+                capture.per_efficiency.push(beam * absorbing * fraction);
+                capture
+                    .per_depth
+                    .push(beam * efficiency * absorbing * along_depth);
+                capture.share.push(beam * efficiency * fraction);
+                capture
+                    .per_variance
+                    .push(beam * efficiency * absorbing * along_variance);
+            }
             let background: f64 = terms
                 .iter()
                 .zip(&self.shapes)
@@ -2422,7 +2503,7 @@ impl RegionsModel {
                 .sum::<f64>()
                 + terms[3] * exponential[j];
             let (transmission, along_depth, along_variance) = uneven_transmission(depth, variance);
-            sample.push(beam * (transmission + background));
+            sample.push(beam * (transmission + background + captured));
             per_depth.push(beam * along_depth);
             per_variance.push(beam * along_variance);
         }
@@ -2432,6 +2513,7 @@ impl RegionsModel {
             sample,
             per_depth,
             per_variance,
+            capture,
         })
     }
 
@@ -2538,36 +2620,63 @@ impl FitModel for RegionsModel {
                     ]
                 }
                 Role::Density { region, isotope } => {
-                    let sigma = self
-                        .at(region, params[layout.regions[region].temperature?])
-                        .ok()?;
-                    let slope: Vec<f64> = sigma.values[isotope].iter().map(|s| -s).collect();
-                    vec![(
-                        sample_rows(region),
-                        counts(&times(&beams[region].per_depth, &slope))?,
-                    )]
+                    let temperature = params[layout.regions[region].temperature?];
+                    let sigma = self.at(region, temperature, TOTAL).ok()?;
+                    let total = &sigma.values[isotope];
+                    let mut column: Vec<f64> = beams[region]
+                        .per_depth
+                        .iter()
+                        .zip(total)
+                        .map(|(d, s)| -d * s)
+                        .collect();
+                    if let Some(capture) = &beams[region].capture {
+                        let captures = self.at(region, temperature, CAPTURE).ok()?;
+                        for (j, c) in column.iter_mut().enumerate() {
+                            *c += capture.per_depth[j] * total[j]
+                                + capture.share[j] * captures.values[isotope][j];
+                        }
+                    }
+                    vec![(sample_rows(region), counts(&column)?)]
                 }
                 Role::Temperature { region } => {
                     let place = &layout.regions[region];
-                    let sigma = self.at(region, params[index]).ok()?;
+                    let sigma = self.at(region, params[index], TOTAL).ok()?;
                     let densities = &params[place.densities.clone()];
-                    let broadening: Vec<f64> = (0..self.energies.len())
-                        .map(|j| {
-                            -densities
-                                .iter()
-                                .zip(&sigma.slopes)
-                                .map(|(n, slope)| n * slope[j])
-                                .sum::<f64>()
-                        })
+                    let along = |slopes: &[Vec<f64>], j: usize| -> f64 {
+                        densities
+                            .iter()
+                            .zip(slopes)
+                            .map(|(n, slope)| n * slope[j])
+                            .sum()
+                    };
+                    let mut column: Vec<f64> = (0..self.energies.len())
+                        .map(|j| -beams[region].per_depth[j] * along(&sigma.slopes, j))
                         .collect();
-                    vec![(
-                        sample_rows(region),
-                        counts(&times(&beams[region].per_depth, &broadening))?,
-                    )]
+                    if let Some(capture) = &beams[region].capture {
+                        let captures = self.at(region, params[index], CAPTURE).ok()?;
+                        for (j, c) in column.iter_mut().enumerate() {
+                            *c += capture.per_depth[j] * along(&sigma.slopes, j)
+                                + capture.share[j] * along(&captures.slopes, j);
+                        }
+                    }
+                    vec![(sample_rows(region), counts(&column)?)]
                 }
                 Role::ThicknessVariance { region } => {
-                    vec![(sample_rows(region), counts(&beams[region].per_variance)?)]
+                    let mut column = beams[region].per_variance.clone();
+                    if let Some(capture) = &beams[region].capture {
+                        for (c, v) in column.iter_mut().zip(&capture.per_variance) {
+                            *c += v;
+                        }
+                    }
+                    vec![(sample_rows(region), counts(&column)?)]
                 }
+                Role::CaptureGammas { region } => vec![(
+                    sample_rows(region),
+                    match &beams[region].capture {
+                        Some(capture) => counts(&capture.per_efficiency)?,
+                        None => vec![0.0; bins],
+                    },
+                )],
                 Role::Normalization => {
                     let slope = vec![1.0 / params[index]; self.energies.len()];
                     (0..regions)
@@ -2755,6 +2864,7 @@ mod tests {
         let layout = Arc::new(Layout::new(
             roles(&sizes, &[Some(2), None, Some(1)]),
             &[4.0, 9.0, 2.0],
+            &[true, false, true],
         ));
         let params: Vec<f64> = layout
             .roles
@@ -2774,6 +2884,7 @@ mod tests {
                     [0.04, -0.2, 0.005, 0.02, 6.0],
                 ][region][term],
                 Role::GammaTransmission { region } => [0.8, 1.0, 0.6][region],
+                Role::CaptureGammas { region } => [0.05, 0.03, 0.02][region],
                 Role::TimeBackground(term) => [50.0, 300.0, 40.0][term],
                 Role::RoomBackground => 2.0e-3,
                 Role::T0 => T0_US + 0.05,
@@ -2856,7 +2967,7 @@ mod tests {
             .collect();
         let shape: Vec<Option<usize>> = materials.iter().map(|m| m.as_ref().map(|_| 1)).collect();
         let sizes: Vec<usize> = beams.iter().map(|b| b.coefficients().len()).collect();
-        let layout = Arc::new(Layout::new(roles(&sizes, &shape), &[1.0; 3]));
+        let layout = Arc::new(Layout::new(roles(&sizes, &shape), &[1.0; 3], &[false; 3]));
         let truth: Vec<f64> = layout
             .roles
             .iter()
@@ -2875,6 +2986,7 @@ mod tests {
                     [0.0; 5],
                 ][region][term],
                 Role::GammaTransmission { .. } => 1.0,
+                Role::CaptureGammas { .. } => 0.0,
                 Role::TimeBackground(term) => [0.0, 0.0, 1.0][term],
                 Role::RoomBackground => 0.0,
                 Role::T0 => T0_US,
@@ -2920,6 +3032,7 @@ mod tests {
                     },
                     pixels: 1.0,
                     gamma_transmission: Value::Known(1.0),
+                    capture_gammas: Value::Known(0.0),
                     material: material.map(|data| Material {
                         covariances: Vec::new(),
                         library: EndfLibrary::EndfB8_0,
@@ -3099,7 +3212,11 @@ mod tests {
         let hafnium = synthetic_isotope(72, 180, 20.0, 0.01, 0.06);
         let isotopes: Vec<Arc<[ResonanceData]>> = vec![Arc::new([hafnium.clone()]), Arc::new([])];
         let sizes: Vec<usize> = beams.iter().map(|b| b.coefficients().len()).collect();
-        let layout = Arc::new(Layout::new(roles(&sizes, &[Some(1), None]), &[1.0; 2]));
+        let layout = Arc::new(Layout::new(
+            roles(&sizes, &[Some(1), None]),
+            &[1.0; 2],
+            &[false; 2],
+        ));
         let truth: Vec<f64> = layout
             .roles
             .iter()
@@ -3116,6 +3233,7 @@ mod tests {
                     [[0.05, 0.0, 0.0, 0.0, 0.0], [0.0; 5]][region][term]
                 }
                 Role::GammaTransmission { .. } => 1.0,
+                Role::CaptureGammas { .. } => 0.0,
                 Role::TimeBackground(term) => [0.0, 0.0, 1.0][term],
                 Role::RoomBackground => 0.0,
                 Role::T0 => T0_US,
@@ -3171,6 +3289,7 @@ mod tests {
             material: material.clone(),
             background,
             gamma_transmission: Value::Known(1.0),
+            capture_gammas: Value::Known(0.0),
             empty_background: [Value::Known(0.0); 5],
         };
         let calibration = Calibration {
@@ -3208,6 +3327,7 @@ mod tests {
             background,
             pixels: 1.0,
             gamma_transmission: Value::Known(1.0),
+            capture_gammas: Value::Known(0.0),
             material,
         };
         let measurement = Measurement {
@@ -3317,6 +3437,7 @@ mod tests {
         let layout = Arc::new(Layout::new(
             roles(&[beam.coefficients().len()], &[Some(2)]),
             &[1.0],
+            &[false],
         ));
         let model = RegionsModel::new(
             &grid,
@@ -3333,7 +3454,7 @@ mod tests {
                 .copied()
                 .chain([3.0e-4, 5.0e-4, 300.0, 0.0, normalization])
                 .chain(background)
-                .chain([1.0, 0.0, 0.0, 1.0, 0.0])
+                .chain([1.0, 0.0, 0.0, 0.0, 1.0, 0.0])
                 .chain([T0_US, FLIGHT_PATH_M])
                 .chain([0.35, 0.05, 0.0, 0.25, 0.15, 0.0])
                 .collect();

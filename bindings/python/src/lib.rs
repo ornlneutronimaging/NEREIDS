@@ -3182,7 +3182,7 @@ impl PyRegion {
     /// b(E) = b0 + b1/sqrt(E) + b2*sqrt(E) + d*exp(-f/sqrt(E)); pixels is the
     /// region's area in pixels, finite and positive.
     #[new]
-    #[pyo3(signature = (open_counts, sample_counts, pixels, background, gamma_transmission, material=None, open_live=None, sample_live=None))]
+    #[pyo3(signature = (open_counts, sample_counts, pixels, background, gamma_transmission, material=None, open_live=None, sample_live=None, capture_gammas=None))]
     fn new(
         open_counts: Vec<f64>,
         sample_counts: Vec<f64>,
@@ -3192,6 +3192,7 @@ impl PyRegion {
         material: Option<PyMaterial>,
         open_live: Option<Vec<f64>>,
         sample_live: Option<Vec<f64>>,
+        capture_gammas: Option<PyValue>,
     ) -> PyResult<Self> {
         Ok(Self {
             inner: Region {
@@ -3202,6 +3203,7 @@ impl PyRegion {
                 background: background_values(background)?,
                 pixels,
                 gamma_transmission: gamma_transmission.inner,
+                capture_gammas: capture_gammas.map_or(Value::Known(0.0), |value| value.inner),
                 material: material.map(|material| material.inner),
             },
         })
@@ -3253,6 +3255,14 @@ impl PyRegion {
     fn gamma_transmission(&self) -> PyValue {
         PyValue {
             inner: self.inner.gamma_transmission,
+        }
+    }
+
+    /// The share of captures whose gammas the region records.
+    #[getter]
+    fn capture_gammas(&self) -> PyValue {
+        PyValue {
+            inner: self.inner.capture_gammas,
         }
     }
 
@@ -3576,6 +3586,7 @@ struct PyRegionFit {
     thickness_variance: Option<f64>,
     background: [f64; 5],
     gamma_transmission: f64,
+    capture_gammas: f64,
     beam_at_limit: bool,
     predicted_open: Vec<f64>,
     predicted_sample: Vec<f64>,
@@ -3591,6 +3602,7 @@ impl PyRegionFit {
             thickness_variance: region.thickness_variance,
             background: region.background,
             gamma_transmission: region.gamma_transmission,
+            capture_gammas: region.capture_gammas,
             beam_at_limit: region.beam_at_limit,
             predicted_open: region.predicted[0].clone(),
             predicted_sample: region.predicted[1].clone(),
@@ -3630,6 +3642,12 @@ impl PyRegionFit {
     #[getter]
     fn gamma_transmission(&self) -> f64 {
         self.gamma_transmission
+    }
+
+    /// The share of captures whose gammas the region records.
+    #[getter]
+    fn capture_gammas(&self) -> f64 {
+        self.capture_gammas
     }
 
     /// Whether the region's open-beam fit chose its richest beam.
@@ -3876,6 +3894,7 @@ struct MapData {
     material: Material,
     background: [Value; 5],
     gamma_transmission: Value,
+    capture_gammas: Value,
     empty_background: [Value; 5],
 }
 
@@ -3898,6 +3917,7 @@ impl MapData {
             material: self.material.clone(),
             background: self.background,
             gamma_transmission: self.gamma_transmission,
+            capture_gammas: self.capture_gammas,
             empty_background: self.empty_background,
         }
     }
@@ -3916,7 +3936,7 @@ impl PyMapMeasurement {
     /// open_counts and sample_counts have shape (time bin, row, column);
     /// excluded, sample and empty have shape (row, column).
     #[new]
-    #[pyo3(signature = (time_edges_us, open_counts, sample_counts, excluded, sample, empty, material, charge_ratio, normalization, background, binning=1, empty_background=None, open_live=None, sample_live=None, time_background=None, gamma_transmission=None, room_background=None))]
+    #[pyo3(signature = (time_edges_us, open_counts, sample_counts, excluded, sample, empty, material, charge_ratio, normalization, background, binning=1, empty_background=None, open_live=None, sample_live=None, time_background=None, gamma_transmission=None, room_background=None, capture_gammas=None))]
     fn new(
         time_edges_us: Vec<f64>,
         open_counts: PyReadonlyArray3<f64>,
@@ -3935,6 +3955,7 @@ impl PyMapMeasurement {
         time_background: Option<Vec<PyValue>>,
         gamma_transmission: Option<PyValue>,
         room_background: Option<PyRoomBackground>,
+        capture_gammas: Option<PyValue>,
     ) -> PyResult<Self> {
         let empty_background = match empty_background {
             Some(values) => background_values(values)?,
@@ -3963,6 +3984,7 @@ impl PyMapMeasurement {
                 background: background_values(background)?,
                 gamma_transmission: gamma_transmission
                     .map_or(Value::Known(1.0), |value| value.inner),
+                capture_gammas: capture_gammas.map_or(Value::Known(0.0), |value| value.inner),
                 empty_background,
             },
         })
@@ -4008,6 +4030,14 @@ impl PyMapMeasurement {
     fn gamma_transmission(&self) -> PyValue {
         PyValue {
             inner: self.inner.gamma_transmission,
+        }
+    }
+
+    /// The capture gammas' share of every sample patch.
+    #[getter]
+    fn capture_gammas(&self) -> PyValue {
+        PyValue {
+            inner: self.inner.capture_gammas,
         }
     }
 

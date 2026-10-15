@@ -184,7 +184,8 @@ optional `d`, `f`.
 `fit.room_background` supplies `{rate, frames}`: counts per microsecond per
 pixel per frame in both runs, and the `[open-beam, sample]` frames.
 `fit.thickness_variance` supplies the relative variance of the sample's areal
-density over the pixels a fit sums.
+density over the pixels a fit sums, and `fit.capture_gammas` the share of the
+sample's captures whose gammas the detector records.
 
 density_map and spatial_map fit every patch of a counts cube. They support
 counts_npz/counts and nexus_histogram/nexus with 3D counts. Optional .npz
