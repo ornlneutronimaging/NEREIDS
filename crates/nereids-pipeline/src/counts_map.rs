@@ -16,9 +16,10 @@ use rayon::prelude::*;
 
 use crate::counts_fit::TEMPERATURE_BOUNDS_K;
 use crate::counts_fit::{
-    BeamStart, BeamStarts, MOST_PASSES, Material, Measurement, Region, RegionFit, RegionTerms,
-    Role, SHARED, Starts, Value, checked, excluded_bins, fit_counts_answer, labelled,
-    shared_parameters, starting_time_background, starts_and_widths_us, time_counts_per_pixel,
+    BeamStart, BeamStarts, Bypass, MOST_PASSES, Material, Measurement, Region, RegionFit,
+    RegionTerms, Role, RoomBackground, SHARED, Starts, Value, checked, excluded_bins,
+    fit_counts_answer, labelled, open_frames, shared_parameters, starting_bypass,
+    starts_and_widths_us,
 };
 use crate::error::PipelineError;
 use crate::open_beam::{
@@ -45,6 +46,9 @@ pub struct MapMeasurement<'a> {
     /// [`NO_TIME_BACKGROUND`](crate::counts_fit::NO_TIME_BACKGROUND) gives
     /// none.
     pub time_background: [Value; 3],
+    /// Counts that follow each run's duration, as
+    /// [`Measurement::room_background`], the same in every pixel.
+    pub room_background: Option<RoomBackground>,
     /// Raw counts of the open-beam run, in (time bin, row, column).
     pub open_counts: ArrayView3<'a, f64>,
     /// Raw counts of the sample run, in (time bin, row, column).
@@ -196,6 +200,9 @@ pub struct CountsMap<'a> {
     pub normalization: f64,
     /// The time background's `[C, A, τ]`, each the known or the fitted one.
     pub time_background: [f64; 3],
+    /// The room background's `ρ`: the known one, the fitted one, or 0 without
+    /// one.
+    pub room_background: f64,
     /// The timing offset `t0` in µs: the known one, or the fitted one.
     pub t0_us: f64,
     /// The flight path in m: the known one, or the fitted one.
@@ -210,8 +217,8 @@ pub struct CountsMap<'a> {
     /// the fitted one.
     pub fwhm_squared_us2: f64,
     /// The fitted shared quantities, among the normalization, the time
-    /// background's `C`, `A` and `τ`, `t0`, flight path, `α₀`, `α₁`, `β₀`,
-    /// `β₁`, `R` and `h²`, in that order.
+    /// background's `C`, `A` and `τ`, the room background's `ρ`, `t0`, flight
+    /// path, `α₀`, `α₁`, `β₀`, `β₁`, `R` and `h²`, in that order.
     pub shared: Vec<&'static str>,
     /// Covariance of [`Self::shared`]: the inverse of the information on them
     /// of every patch that did not fail and of the empty pixels, each with
@@ -356,17 +363,17 @@ impl CountsMap<'_> {
 /// Fit `map.material` in each patch of `binning`×`binning` pixels whose
 /// pixels not excluded all lie behind the sample, and the empty pixels not
 /// excluded as one region with no material, as one counts fit whose regions
-/// share the normalization, the time background per pixel, `t0`, the flight
-/// path and the pulse: one clock, one flight path, one moderator, one proton
+/// share the normalization, the time and room backgrounds per pixel, `t0`,
+/// the flight path and the pulse: one clock, one flight path, one moderator, one proton
 /// beam, and a detector efficiency that changes between the runs alike in
 /// every pixel.  A region's counts are the sums over its pixels; each has its
-/// own beam, background and gamma transmission, and its time background is
-/// that per pixel times its pixels.  The empty pixels pin the normalization
+/// own beam, background and gamma transmission, and its time and room
+/// backgrounds are those per pixel times its pixels.  The empty pixels pin the normalization
 /// when their `b0` is known.
 ///
 /// Each region's open-beam fit, which starts its beam and weights its
-/// open-beam run, takes the time background's starting numbers as known; the
-/// map is fitted again with them at its fitted numbers, up to twenty times,
+/// open-beam run, takes the time and room backgrounds' starting numbers as
+/// known; the map is fitted again with them at its fitted numbers, up to twenty times,
 /// until those change the counts the open-beam fits took as known by
 /// `Σ_r Σ_k (ΔO_rk)²/O_rk` at most [`BOUND`] over every region's open-beam
 /// bins, as [`fit_counts`](crate::counts_fit::fit_counts) does; from the
@@ -444,14 +451,16 @@ pub fn fit_map<'a>(
     map: &MapMeasurement<'a>,
     calibration: &Calibration,
 ) -> Result<CountsMap<'a>, PipelineError> {
-    let mut open = starting_time_background(&Measurement {
+    let mut open = starting_bypass(&Measurement {
         time_edges_us: Vec::new(),
         charge_ratio: map.charge_ratio,
         normalization: map.normalization,
         time_background: map.time_background,
+        room_background: map.room_background,
         regions: Vec::new(),
     })?;
     let bins = starts_and_widths_us(&map.time_edges_us);
+    let frames = open_frames(map.room_background.as_ref());
     let empty_pixels = map
         .empty
         .indexed_iter()
@@ -460,8 +469,12 @@ pub fn fit_map<'a>(
     let mut intervals: Option<Vec<Option<usize>>> = None;
     for passes in 1..=MOST_PASSES {
         let result = fit_map_from(map, calibration, open, intervals.as_deref())?;
-        let (used, _) = time_counts_per_pixel(&bins, open);
-        let (now, _) = time_counts_per_pixel(&bins, result.time_background);
+        let fitted = Bypass {
+            time: result.time_background,
+            room: result.room_background,
+        };
+        let used = open.open_counts_per_pixel(&bins, frames);
+        let now = fitted.open_counts_per_pixel(&bins, frames);
         let regions = || {
             result
                 .fits
@@ -485,7 +498,8 @@ pub fn fit_map<'a>(
         }
         if passes == MOST_PASSES {
             return Ok(result.unsettled(format!(
-                "the open-beam fits' time background did not settle in {MOST_PASSES} fits"
+                "the open-beam fits' time and room backgrounds did not settle in {MOST_PASSES} \
+                 fits"
             )));
         }
         if passes >= 2 {
@@ -502,7 +516,7 @@ pub fn fit_map<'a>(
                     .collect()
             });
         }
-        open = result.time_background;
+        open = fitted;
     }
     unreachable!("the passes end at MOST_PASSES")
 }
@@ -510,7 +524,7 @@ pub fn fit_map<'a>(
 fn fit_map_from<'a>(
     map: &MapMeasurement<'a>,
     calibration: &Calibration,
-    open: [f64; 3],
+    open: Bypass,
     intervals: Option<&[Option<usize>]>,
 ) -> Result<CountsMap<'a>, PipelineError> {
     let invalid = |message: String| Err(PipelineError::InvalidParameter(message));
@@ -598,11 +612,12 @@ fn fit_map_from<'a>(
             None,
         )?);
     }
-    let measurement = |normalization, time_background, regions| Measurement {
+    let measurement = |normalization, time_background, room_background, regions| Measurement {
         time_edges_us: map.time_edges_us.clone(),
         charge_ratio: map.charge_ratio,
         normalization,
         time_background,
+        room_background,
         regions,
     };
 
@@ -620,6 +635,7 @@ fn fit_map_from<'a>(
         &measurement(
             map.normalization,
             map.time_background,
+            map.room_background,
             std::iter::once(template(
                 map.background,
                 map.gamma_transmission,
@@ -634,7 +650,12 @@ fn fit_map_from<'a>(
         calibration,
     )?;
     let parameters = shared_parameters(
-        &measurement(map.normalization, map.time_background, vec![]),
+        &measurement(
+            map.normalization,
+            map.time_background,
+            map.room_background,
+            vec![],
+        ),
         calibration,
     )?;
     let at = |role: Role| {
@@ -643,7 +664,11 @@ fn fit_map_from<'a>(
             .position(|&shared| shared == role)
             .expect("a shared role")
     };
-    let (time_background, t0) = (at(Role::TimeBackground(0)), at(Role::T0));
+    let (time_background, room, t0) = (
+        at(Role::TimeBackground(0)),
+        at(Role::RoomBackground),
+        at(Role::T0),
+    );
     let instrument = t0..SHARED.len();
     let fitted: Vec<usize> = (0..SHARED.len())
         .filter(|&i| !parameters[i].1.fixed)
@@ -692,7 +717,10 @@ fn fit_map_from<'a>(
 
     let mut values: Vec<f64> = parameters.iter().map(|(_, p)| p.value).collect();
     let origin_us = values[t0];
-    let open_per_pixel = time_counts_per_pixel(&starts_and_widths_us(&map.time_edges_us), open).0;
+    let open_per_pixel = open.open_counts_per_pixel(
+        &starts_and_widths_us(&map.time_edges_us),
+        open_frames(map.room_background.as_ref()),
+    );
     let bins = map.open_counts.dim().0;
     validate_live("open-beam", map.open_live.as_deref(), bins)?;
     validate_live("sample", map.sample_live.as_deref(), bins)?;
@@ -750,6 +778,10 @@ fn fit_map_from<'a>(
         let one = measurement(
             Value::Known(values[at(Role::Normalization)]),
             std::array::from_fn(|i| Value::Known(values[time_background + i])),
+            map.room_background.map(|room_background| RoomBackground {
+                rate: Value::Known(values[room]),
+                ..room_background
+            }),
             vec![restarted(&regions[r], previous)],
         );
         let beam = match previous {
@@ -1289,6 +1321,7 @@ fn fit_map_from<'a>(
         trusted,
         normalization: values[at(Role::Normalization)],
         time_background: std::array::from_fn(|i| values[time_background + i]),
+        room_background: values[room],
         t0_us: values[t0],
         flight_path_m: values[t0 + 1],
         alpha: [values[t0 + 2], values[t0 + 3]],
@@ -1303,6 +1336,7 @@ fn fit_map_from<'a>(
                     "time background C",
                     "time background A",
                     "time background τ",
+                    "room background ρ",
                     "t0",
                     "flight path",
                 ]

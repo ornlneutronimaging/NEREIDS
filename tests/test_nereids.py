@@ -876,6 +876,17 @@ class TestCountsApi:
         assert measurement.charge_ratio == 1.0
         assert measurement.regions[0].pixels == 1.0
         assert measurement.regions[0].material.isotopes[0][0].z == u238_data.z
+        assert measurement.room_background is None
+        room = nereids.RoomBackground(nereids.Value.fitted(0.5), (3.0e4, 2.5e4))
+        measurement = nereids.Measurement(
+            time_edges_us=[1.0, 2.0, 3.0, 4.0, 5.0],
+            charge_ratio=1.0,
+            normalization=nereids.Value.fitted(1.0),
+            regions=[region],
+            room_background=room,
+        )
+        assert measurement.room_background.rate.value == 0.5
+        assert measurement.room_background.frames == (3.0e4, 2.5e4)
 
     def test_fit_counts_requires_a_material(self):
         measurement = nereids.Measurement(

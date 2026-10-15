@@ -21,7 +21,7 @@ use nereids_physics::resolution::{ResolutionFunction, TOF_FACTOR};
 use nereids_physics::transmission::broadened_cross_sections;
 use nereids_pipeline::counts_fit::{
     CountsFit, Material, Measurement, NEGLIGIBLE_PREDICTION, NO_TIME_BACKGROUND, Region, RegionFit,
-    Value, fit_counts,
+    RoomBackground, Value, fit_counts,
 };
 use nereids_pipeline::counts_map::{CountsMap, MapMeasurement, Patch, fit_map};
 use nereids_pipeline::error::PipelineError;
@@ -244,6 +244,7 @@ fn measurement(
         charge_ratio: CHARGE_RATIO,
         normalization: Value::Known(1.0),
         time_background: NO_TIME_BACKGROUND,
+        room_background: None,
         regions: vec![Region {
             open_counts: open,
             sample_counts: sample,
@@ -353,6 +354,7 @@ fn the_time_background_is_in_both_runs_of_every_region_by_its_pixels_and_gamma_t
         charge_ratio: CHARGE_RATIO,
         normalization: sample(a),
         time_background: numbers,
+        room_background: None,
         regions: (0..2)
             .map(|r| Region {
                 open_counts: rounded(&runs[r][0].0),
@@ -658,6 +660,7 @@ fn an_empty_area_with_a_known_background_adds_its_counts_information_on_the_norm
             charge_ratio: CHARGE_RATIO,
             normalization: Value::Fitted(1.0),
             time_background: NO_TIME_BACKGROUND,
+            room_background: None,
             regions: regions.to_vec(),
         };
         let fit = fit_counts(&m, &calibration(&setup)).expect("fit");
@@ -781,6 +784,7 @@ fn a_map_recovers_each_patch_and_its_covariance_between_patches_is_the_shared_qu
             sd: 4.0e-5,
         },
         time_background: NO_TIME_BACKGROUND,
+        room_background: None,
         open_counts: counts[0].view(),
         sample_counts: counts[1].view(),
         open_live: Some(live.clone()),
@@ -962,6 +966,7 @@ fn a_map_recovers_each_patch_and_its_covariance_between_patches_is_the_shared_qu
             charge_ratio: CHARGE_RATIO,
             normalization: map.normalization,
             time_background: NO_TIME_BACKGROUND,
+            room_background: None,
             regions: (0..4)
                 .map(|j| {
                     region(
@@ -1032,6 +1037,7 @@ fn a_map_recovers_each_patch_and_its_covariance_between_patches_is_the_shared_qu
             charge_ratio: CHARGE_RATIO,
             normalization: Value::Known(result.normalization),
             time_background: NO_TIME_BACKGROUND,
+            room_background: None,
             regions: vec![Region {
                 open_counts,
                 sample_counts,
@@ -1127,6 +1133,7 @@ fn a_map_fits_the_time_background_its_patches_share_as_the_joint_fit_does() {
         charge_ratio: CHARGE_RATIO,
         normalization: Value::Fitted(0.94),
         time_background: start,
+        room_background: None,
         open_counts: counts[0].view(),
         sample_counts: counts[1].view(),
         open_live: None,
@@ -1193,6 +1200,7 @@ fn a_map_fits_the_time_background_its_patches_share_as_the_joint_fit_does() {
             charge_ratio: CHARGE_RATIO,
             normalization: map.normalization,
             time_background: start,
+            room_background: None,
             regions: vec![
                 region(0..2, 0..2, Some(material.clone())),
                 region(0..2, 2..4, Some(material.clone())),
@@ -1235,6 +1243,7 @@ fn a_map_fits_the_time_background_its_patches_share_as_the_joint_fit_does() {
 
     let without = MapMeasurement {
         time_background: NO_TIME_BACKGROUND,
+        room_background: None,
         gamma_transmission: Value::Known(1.0),
         ..map.clone()
     };
@@ -1257,6 +1266,151 @@ fn a_map_fits_the_time_background_its_patches_share_as_the_joint_fit_does() {
 }
 
 #[test]
+fn the_room_background_follows_each_run_s_frames_apart_from_the_time_background() {
+    let setup = Setup {
+        pulse: pulse(0.0, 200.0),
+        ..standard()
+    };
+    let isotope = hafnium_like(20.0);
+    let (a, gamma, c, rate) = (TERMS[0], 0.6, 1.25e4, 1.0 / 3.0);
+    let frames = [3.0e4, 2.5e4];
+    let per_pixel = time_background(&setup.edges, [c, 0.0, 1.0]);
+    let room = |run: usize| -> Vec<f64> {
+        setup
+            .edges
+            .windows(2)
+            .map(|w| rate * frames[run] * (w[1] - w[0]))
+            .collect()
+    };
+    let rooms = [room(0), room(1)];
+    let (open, transmitted) = expected(&setup, &beam(2.5e5), &[(isotope.clone(), THIN)]);
+    let bins = setup.edges.len() - 1;
+    let cube = |run: usize| {
+        Array3::from_shape_fn((bins, 3, 4), |(k, y, _)| {
+            let (g, f) = (per_pixel[k], rooms[run][k]);
+            match (run, y) {
+                (0, _) => open[k] + g + f,
+                (_, 2) => a * CHARGE_RATIO * (open[k] + g) + f,
+                _ => a * (transmitted[k] + CHARGE_RATIO * gamma * g) + f,
+            }
+            .round()
+        })
+    };
+    let counts = [cube(0), cube(1)];
+    let none = Array2::from_elem((3, 4), false);
+    let behind = Array2::from_shape_fn((3, 4), |(y, _)| y < 2);
+    let empty = Array2::from_shape_fn((3, 4), |(y, _)| y == 2);
+    let material = Material {
+        covariances: Vec::new(),
+        library: EndfLibrary::EndfB8_0,
+        isotopes: vec![(isotope, Value::Fitted(THIN))],
+        temperature_k: Value::Fitted(330.0),
+    };
+    let time = [Value::Fitted(0.7 * c), Value::Known(0.0), Value::Known(1.0)];
+    let room_background = Some(RoomBackground {
+        rate: Value::Fitted(0.5 * rate),
+        frames,
+    });
+    let map = MapMeasurement {
+        time_edges_us: setup.edges.clone(),
+        charge_ratio: CHARGE_RATIO,
+        normalization: Value::Fitted(0.94),
+        time_background: time,
+        room_background,
+        open_counts: counts[0].view(),
+        sample_counts: counts[1].view(),
+        open_live: None,
+        sample_live: None,
+        excluded: none.view(),
+        sample: behind.view(),
+        empty: empty.view(),
+        binning: 2,
+        material: material.clone(),
+        background: [Value::Known(0.0); 3],
+        gamma_transmission: Value::Known(gamma),
+        empty_background: [Value::Known(0.0); 3],
+    };
+    let result = fit_map(&map, &calibration(&setup)).expect("map");
+    assert!(result.converged, "{:?}", result.unconverged);
+
+    let summed = |run: usize, rows: Range<usize>, xs: Range<usize>| -> Vec<f64> {
+        (0..bins)
+            .map(|k| counts[run].slice(s![k, rows.clone(), xs.clone()]).sum())
+            .collect()
+    };
+    let region = |rows: Range<usize>, xs: Range<usize>, material: Option<Material>| Region {
+        open_counts: summed(0, rows.clone(), xs.clone()),
+        sample_counts: summed(1, rows, xs),
+        open_live: None,
+        sample_live: None,
+        background: [Value::Known(0.0); 3],
+        pixels: 4.0,
+        gamma_transmission: Value::Known(if material.is_some() { gamma } else { 1.0 }),
+        material,
+    };
+    let joint = |room_background| {
+        fit_counts(
+            &Measurement {
+                time_edges_us: setup.edges.clone(),
+                charge_ratio: CHARGE_RATIO,
+                normalization: map.normalization,
+                time_background: time,
+                room_background,
+                regions: vec![
+                    region(0..2, 0..2, Some(material.clone())),
+                    region(0..2, 2..4, Some(material.clone())),
+                    region(2..3, 0..4, None),
+                ],
+            },
+            &calibration(&setup),
+        )
+    };
+    let fit = joint(room_background).expect("joint fit");
+    assert!(fit.converged);
+    assert_eq!(fit.covariance.as_ref().expect("covariance").nrows, 7);
+    let estimates = [
+        fit.regions[0].densities[0],
+        fit.temperature(),
+        fit.normalization,
+        fit.time_background[0],
+        fit.room_background,
+    ];
+    let truths = [THIN, TEMPERATURE_K, a, c, rate];
+    let at = [0, 1, 4, 5, 6];
+    let pulls: Vec<f64> = (0..5)
+        .map(|i| (estimates[i] - truths[i]) / error_bar(&fit, at[i]))
+        .collect();
+    assert!(pulls.iter().all(|p| p.abs() <= BOUND.sqrt()), "{pulls:?}");
+
+    let shared = result.shared_covariance.as_ref().expect("covariance");
+    let mut gaps = vec![
+        (result.room_background - fit.room_background) / error_bar(&fit, 6),
+        (result.time_background[0] - fit.time_background[0]) / error_bar(&fit, 5),
+    ];
+    let mut ratios = vec![
+        shared.get(2, 2).sqrt() / error_bar(&fit, 6),
+        shared.get(1, 1).sqrt() / error_bar(&fit, 5),
+    ];
+    for j in 0..2 {
+        let sd = error_bar(&fit, 2 * j + 1);
+        gaps.push((result.temperature_k[[0, j]] - fit.regions[j].temperature_k.expect("T")) / sd);
+        ratios.push(result.temperature_sd_k[[0, j]] / sd);
+    }
+    assert!(gaps.iter().all(|g| g.abs() <= 0.01), "{gaps:?}");
+    assert!(ratios.iter().all(|r| (r - 1.0).abs() <= 1e-3), "{ratios:?}");
+
+    match joint(None) {
+        Err(PipelineError::UnmodelledCounts { .. }) => {}
+        Ok(without) => {
+            let (t, sd) = (without.temperature(), error_bar(&without, 1));
+            let recovered = without.converged && (t - TEMPERATURE_K).abs() <= 5.0 * sd;
+            assert!(!recovered, "{t} ± {sd}");
+        }
+        Err(other) => panic!("{other:?}"),
+    }
+}
+
+#[test]
 fn maps_the_fit_does_not_describe_are_refused() {
     let setup = standard();
     let edges: Vec<f64> = (0..=577).map(|k| 350.0 + 0.2 * f64::from(k)).collect();
@@ -1271,6 +1425,7 @@ fn maps_the_fit_does_not_describe_are_refused() {
         charge_ratio: CHARGE_RATIO,
         normalization: Value::Fitted(1.0),
         time_background: NO_TIME_BACKGROUND,
+        room_background: None,
         open_counts: counts.view(),
         sample_counts: counts.view(),
         open_live: None,
@@ -4213,6 +4368,7 @@ mod maps {
                 charge_ratio: CHARGE_RATIO,
                 normalization: Value::Fitted(1.0),
                 time_background: NO_TIME_BACKGROUND,
+                room_background: None,
                 open_counts: self.counts[0].view(),
                 sample_counts: self.counts[1].view(),
                 open_live: None,
@@ -4292,6 +4448,7 @@ mod maps {
                     charge_ratio: map.charge_ratio,
                     normalization: map.normalization,
                     time_background: NO_TIME_BACKGROUND,
+                    room_background: None,
                     regions,
                 },
                 calibration,
@@ -4553,6 +4710,7 @@ mod maps {
                 charge_ratio: map.charge_ratio,
                 normalization: Value::Known(0.8 * TERMS[0]),
                 time_background: NO_TIME_BACKGROUND,
+                room_background: None,
                 regions: vec![tiled.region(&map, (0, 0))],
             },
             &Calibration {

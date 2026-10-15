@@ -353,6 +353,7 @@ class TestCountsManifest:
             t0_us=3.0,
             flight_path_m=25.0,
             time_background=[0.0, 0.0, 1.0],
+            room_background=0.0,
             alpha=[0.35, 0.05],
             beta=[0.25, 0.0],
             r=0.15,
@@ -426,6 +427,30 @@ class TestCountsManifest:
         result = process_resonance_dataset(str(manifest))
         assert result["success"], result
         assert captured == [10.0, 50.0, 25.0]
+
+    def test_room_background_reaches_the_counts_fit(self, tmp_path, monkeypatch):
+        room = {"rate": 0.5, "frames": [3.0e4, 2.5e4]}
+        self._counts_npz(tmp_path)
+        manifest = _write_json_frontmatter_manifest(
+            tmp_path, self._analysis(room_background=room)
+        )
+        captured = []
+
+        def fit(measurement, calibration):
+            captured.append(
+                (measurement.room_background.rate.value, measurement.room_background.frames)
+            )
+            return self._fake_fit()
+
+        monkeypatch.setattr(nereids, "fit_counts", fit)
+        assert process_resonance_dataset(str(manifest))["success"]
+        assert captured == [(0.5, (3.0e4, 2.5e4))]
+        bad = _write_json_frontmatter_manifest(
+            tmp_path, self._analysis(room_background={"rate": 0.5})
+        )
+        report = validate_resonance_dataset(str(bad))
+        assert not report["valid"]
+        assert any("room background" in e for e in report["errors"])
 
     def test_counts_require_original_time_bin_edges(self, tmp_path, monkeypatch):
         np.savez(
@@ -551,6 +576,7 @@ class TestCountsManifest:
                 trusted=np.ones((height, width), dtype=bool),
                 normalization=1.0,
                 time_background=[0.0, 0.0, 1.0],
+                room_background=0.0,
                 t0_us=3.0,
                 flight_path_m=25.0,
                 alpha=[0.35, 0.05],

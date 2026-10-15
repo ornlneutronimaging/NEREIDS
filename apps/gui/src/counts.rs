@@ -225,6 +225,7 @@ pub fn run_pixel_fit(request: &FitRequest) -> Result<PixelFitSummary, String> {
         charge_ratio: request.charge_ratio,
         normalization: normalization(request),
         time_background: NO_TIME_BACKGROUND,
+        room_background: None,
         regions: vec![region],
     };
     let fit =
@@ -260,6 +261,7 @@ pub fn run_map_fit(request: &FitRequest) -> Result<MapFitSummary, String> {
         charge_ratio: request.charge_ratio,
         normalization: normalization(request),
         time_background: NO_TIME_BACKGROUND,
+        room_background: None,
         open_counts: request.open_counts.view(),
         sample_counts: request.sample_counts.view(),
         open_live: None,

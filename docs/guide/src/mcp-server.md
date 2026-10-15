@@ -179,6 +179,8 @@ For a single spectrum, `fit.time_background` supplies `[C, A, tau]`, each a
 number or Value specification, and `fit.gamma_transmission` supplies the
 sample's gamma transmission. The additive time term enters after the pulse.
 It is distinct from the beam-borne `fit.background` scattering terms.
+`fit.room_background` supplies `{rate, frames}`: counts per microsecond per
+pixel per frame in both runs, and the `[open-beam, sample]` frames.
 
 density_map and spatial_map fit every patch of a counts cube. They support
 counts_npz/counts and nexus_histogram/nexus with 3D counts. Optional .npz
@@ -186,8 +188,9 @@ arrays excluded, sample and empty are (row, column) boolean masks; without
 them every pixel is treated as behind the sample. binning sets the patch side
 in pixels.
 
-Map workflows take `fit.time_background` per pixel, shared by every patch,
-and `fit.gamma_transmission` for every sample patch. The map's `trusted`
+Map workflows take `fit.time_background` and `fit.room_background` per
+pixel, shared by every patch, and `fit.gamma_transmission` for every sample
+patch. The map's `trusted`
 array reports numerical status, not physical or thermometry validation. Masks are cropped with the counts when an ROI or
 pixel limit is selected.
 
