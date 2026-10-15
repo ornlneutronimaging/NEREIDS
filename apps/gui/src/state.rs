@@ -461,11 +461,7 @@ pub struct AppState {
     /// upstream.  For raw-count VENUS data, set to the actual
     /// Q_sample/Q_open_beam ratio (typically ~5–6).
     pub kl_c_ratio: f64,
-    /// Override for Nelder-Mead polish on the counts-KL path.  `None`
-    /// lets `spatial_map_typed` auto-disable polish when n_pixels > 1
-    /// (measured ~17 min/pixel polish cost).  `Some(true)` forces
-    /// polish on even at spatial scale (research use only);
-    /// `Some(false)` forces off.
+    /// Retained project setting; the counts engine has no Nelder-Mead polish.
     pub kl_enable_polish_override: Option<bool>,
     /// Bounded multiplicative baseline ():
     /// B(E) = b0 + b1·ln(E/E_ref) + b2·ln²(E/E_ref), applied OUTERMOST.
