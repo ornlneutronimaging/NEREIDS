@@ -17,6 +17,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
   per pixel per frame in both runs, independent of proton charge and of the
   sample. `RoomBackground(rate, frames)` gives it; results report
   `room_background`.
+- The beam-borne background gains SAMMY's fourth shape:
+  `b(E) = b0 + b1/sqrt(E) + b2*sqrt(E) + d*exp(-f/sqrt(E))`. `background`
+  holds `[b0, b1, b2, d, f]`; Python and MCP also accept `[b0, b1, b2]`.
+- A material's `thickness_variance` `v`, the relative variance of its areal
+  density over the pixels a region sums, makes the region transmit
+  `(1 + v*D)**(-1/v)`; known 0 by default, it can be fitted with the density
+  and temperature.
 
 ### Changed (breaking)
 

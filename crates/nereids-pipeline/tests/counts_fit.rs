@@ -184,6 +184,10 @@ fn with_background(
     (open, sample.collect())
 }
 
+fn padded([b0, b1, b2]: [Value; 3]) -> [Value; 5] {
+    [b0, b1, b2, Value::Known(0.0), Value::Known(0.0)]
+}
+
 fn rounded(counts: &[f64]) -> Vec<f64> {
     counts.iter().map(|c| c.round()).collect()
 }
@@ -250,7 +254,7 @@ fn measurement(
             sample_counts: sample,
             open_live: None,
             sample_live: None,
-            background: [Value::Known(0.0); 3],
+            background: [Value::Known(0.0); 5],
             pixels: 1.0,
             gamma_transmission: Value::Known(1.0),
             material: Some(Material {
@@ -261,6 +265,7 @@ fn measurement(
                     .map(|(d, n)| (d.clone(), Value::Fitted(*n)))
                     .collect(),
                 temperature_k: Value::Known(TEMPERATURE_K),
+                thickness_variance: Value::Known(0.0),
             }),
         }],
     }
@@ -361,7 +366,7 @@ fn the_time_background_is_in_both_runs_of_every_region_by_its_pixels_and_gamma_t
                 sample_counts: rounded(&runs[r][1].0),
                 open_live: Some(runs[r][0].1.clone()),
                 sample_live: Some(runs[r][1].1.clone()),
-                background: [
+                background: padded([
                     if r == 0 {
                         sample(0.0)
                     } else {
@@ -369,7 +374,7 @@ fn the_time_background_is_in_both_runs_of_every_region_by_its_pixels_and_gamma_t
                     },
                     Value::Known(0.0),
                     Value::Known(0.0),
-                ],
+                ]),
                 pixels: pixels[r],
                 gamma_transmission: if r == 0 {
                     gamma
@@ -381,6 +386,7 @@ fn the_time_background_is_in_both_runs_of_every_region_by_its_pixels_and_gamma_t
                     library: EndfLibrary::EndfB8_0,
                     isotopes: lines.iter().map(|(d, n)| (d.clone(), sample(*n))).collect(),
                     temperature_k: sample(TEMPERATURE_K),
+                    thickness_variance: Value::Known(0.0),
                 }),
             })
             .collect(),
@@ -511,7 +517,7 @@ fn densities_normalization_and_background_are_recovered_and_follow_a_density_on_
             let mut m = recorded(&setup, counts.clone(), &sample);
             m.material_mut().isotopes[0].1 = density;
             m.normalization = Value::Fitted(a);
-            m.regions[0].background = [Value::Fitted(b0), Value::Fitted(b1), b2];
+            m.regions[0].background = padded([Value::Fitted(b0), Value::Fitted(b1), b2]);
             let fit = fit_counts(&m, &calibration(&setup)).expect("fit");
             assert!(fit.converged, "{truth} from {density:?}");
             assert_eq!(
@@ -565,7 +571,7 @@ fn densities_normalization_and_background_are_recovered_and_follow_a_density_on_
         carrying.material_mut().isotopes[0].1 = density;
         carrying.material_mut().covariances = vec![(0, synthetic_covariance(&isotope, 0.01))];
         carrying.normalization = Value::Fitted(1.0);
-        carrying.regions[0].background = [Value::Fitted(0.02), Value::Fitted(0.2), b2];
+        carrying.regions[0].background = padded([Value::Fitted(0.02), Value::Fitted(0.2), b2]);
         let carried = fit_counts(&carrying, &calibration(&setup)).expect("fit");
         let carried = carried.covariance.expect("covariance");
         for i in 0..free.on_bound.len() {
@@ -607,7 +613,7 @@ fn an_empty_area_with_a_known_background_adds_its_counts_information_on_the_norm
         ),
         with_background(&setup, &beam(2.0e6), &[], TEMPERATURE_K, terms[2]),
     ];
-    let region = |r: usize, material: Option<Material>, background: [Value; 3]| Region {
+    let region = |r: usize, material: Option<Material>, background: [Value; 5]| Region {
         background,
         material,
         ..recorded(&setup, counts[r].clone(), &[]).regions.remove(0)
@@ -620,12 +626,13 @@ fn an_empty_area_with_a_known_background_adds_its_counts_information_on_the_norm
                 library: EndfLibrary::EndfB8_0,
                 isotopes: vec![(hot, Value::Fitted(0.5 * THIN))],
                 temperature_k: Value::Fitted(1000.0),
+                thickness_variance: Value::Known(0.0),
             }),
-            [
+            padded([
                 Value::Fitted(0.02),
                 Value::Fitted(0.2),
                 Value::Known(TERMS[3]),
-            ],
+            ]),
         ),
         region(
             1,
@@ -640,15 +647,16 @@ fn an_empty_area_with_a_known_background_adds_its_counts_information_on_the_norm
                     },
                 )],
                 temperature_k: Value::Fitted(400.0),
+                thickness_variance: Value::Known(0.0),
             }),
-            [Value::Fitted(0.02), Value::Known(0.0), Value::Known(0.0)],
+            padded([Value::Fitted(0.02), Value::Known(0.0), Value::Known(0.0)]),
         ),
         Region {
             open_counts: rounded(&counts[2].0),
             sample_counts: rounded(&counts[2].1),
             open_live: None,
             sample_live: None,
-            background: [Value::Known(0.0); 3],
+            background: [Value::Known(0.0); 5],
             pixels: 1.0,
             gamma_transmission: Value::Known(1.0),
             material: None,
@@ -805,8 +813,9 @@ fn a_map_recovers_each_patch_and_its_covariance_between_patches_is_the_shared_qu
                 lower: 100.0,
                 upper: 2000.0,
             },
+            thickness_variance: Value::Known(0.0),
         },
-        background: [
+        background: padded([
             Value::Within {
                 start: 0.02,
                 lower: 0.0,
@@ -814,9 +823,9 @@ fn a_map_recovers_each_patch_and_its_covariance_between_patches_is_the_shared_qu
             },
             Value::Known(0.0),
             Value::Known(0.0),
-        ],
+        ]),
         gamma_transmission: Value::Known(1.0),
-        empty_background: [Value::Known(0.0); 3],
+        empty_background: [Value::Known(0.0); 5],
     };
     let mut shared = calibration(&setup);
     shared.t0_us = Value::Within {
@@ -1126,6 +1135,7 @@ fn a_map_fits_the_time_background_its_patches_share_as_the_joint_fit_does() {
         library: EndfLibrary::EndfB8_0,
         isotopes: vec![(isotope, Value::Fitted(THIN))],
         temperature_k: Value::Fitted(330.0),
+        thickness_variance: Value::Known(0.0),
     };
     let start = std::array::from_fn(|i| Value::Fitted([0.5, 2.0, 0.7][i] * numbers[i]));
     let map = MapMeasurement {
@@ -1143,9 +1153,9 @@ fn a_map_fits_the_time_background_its_patches_share_as_the_joint_fit_does() {
         empty: empty.view(),
         binning: 2,
         material: material.clone(),
-        background: [Value::Known(0.0); 3],
+        background: [Value::Known(0.0); 5],
         gamma_transmission: Value::Fitted(0.5),
-        empty_background: [Value::Known(0.0); 3],
+        empty_background: [Value::Known(0.0); 5],
     };
     let result = fit_map(&map, &calibration(&setup)).expect("map");
     assert!(result.converged, "{:?}", result.unconverged);
@@ -1185,7 +1195,7 @@ fn a_map_fits_the_time_background_its_patches_share_as_the_joint_fit_does() {
         sample_counts: summed(1, rows, xs),
         open_live: None,
         sample_live: None,
-        background: [Value::Known(0.0); 3],
+        background: [Value::Known(0.0); 5],
         pixels: 4.0,
         gamma_transmission: if material.is_some() {
             map.gamma_transmission
@@ -1305,6 +1315,7 @@ fn the_room_background_follows_each_run_s_frames_apart_from_the_time_background(
         library: EndfLibrary::EndfB8_0,
         isotopes: vec![(isotope, Value::Fitted(THIN))],
         temperature_k: Value::Fitted(330.0),
+        thickness_variance: Value::Known(0.0),
     };
     let time = [Value::Fitted(0.7 * c), Value::Known(0.0), Value::Known(1.0)];
     let room_background = Some(RoomBackground {
@@ -1326,9 +1337,9 @@ fn the_room_background_follows_each_run_s_frames_apart_from_the_time_background(
         empty: empty.view(),
         binning: 2,
         material: material.clone(),
-        background: [Value::Known(0.0); 3],
+        background: [Value::Known(0.0); 5],
         gamma_transmission: Value::Known(gamma),
-        empty_background: [Value::Known(0.0); 3],
+        empty_background: [Value::Known(0.0); 5],
     };
     let result = fit_map(&map, &calibration(&setup)).expect("map");
     assert!(result.converged, "{:?}", result.unconverged);
@@ -1343,7 +1354,7 @@ fn the_room_background_follows_each_run_s_frames_apart_from_the_time_background(
         sample_counts: summed(1, rows, xs),
         open_live: None,
         sample_live: None,
-        background: [Value::Known(0.0); 3],
+        background: [Value::Known(0.0); 5],
         pixels: 4.0,
         gamma_transmission: Value::Known(if material.is_some() { gamma } else { 1.0 }),
         material,
@@ -1411,6 +1422,136 @@ fn the_room_background_follows_each_run_s_frames_apart_from_the_time_background(
 }
 
 #[test]
+fn sammy_s_exponential_background_is_recovered_through_the_pulse() {
+    let setup = standard();
+    let isotope = hafnium_like(20.0);
+    let sample = [(isotope.clone(), THIN)];
+    let (a, d, f) = (TERMS[0], 4.0, 25.0);
+    let (open, transmitted) = expected(&setup, &beam(1.0e6), &sample);
+    let scattered = |u: f64| a * beam(1.0e6)(u) * d * (-f * u / CLOCK).exp();
+    let scattered = run(&setup, CHARGE_RATIO, &scattered, &[], TEMPERATURE_K);
+    let counts = (
+        rounded(&open),
+        transmitted
+            .iter()
+            .zip(&scattered)
+            .map(|(t, s)| (a * t + s).round())
+            .collect(),
+    );
+    let fit_with = |background: [Value; 5]| {
+        let mut m = fitted_from(measurement(&setup, counts.clone(), &sample), 330.0);
+        m.normalization = Value::Known(a);
+        m.regions[0].background = background;
+        fit_counts(&m, &calibration(&setup))
+    };
+    let free = [
+        Value::Known(0.0),
+        Value::Known(0.0),
+        Value::Known(0.0),
+        Value::Fitted(0.5 * d),
+        Value::Fitted(0.8 * f),
+    ];
+    let fit = fit_with(free).expect("fit");
+    assert!(fit.converged);
+    let region = &fit.regions[0];
+    let estimates = [
+        region.densities[0],
+        fit.temperature(),
+        region.background[3],
+        region.background[4],
+    ];
+    let truths = [THIN, TEMPERATURE_K, d, f];
+    let pulls: Vec<f64> = (0..4)
+        .map(|i| (estimates[i] - truths[i]) / error_bar(&fit, i))
+        .collect();
+    assert!(pulls.iter().all(|p| p.abs() <= BOUND.sqrt()), "{pulls:?}");
+}
+
+#[test]
+fn an_uneven_thickness_is_recovered_with_the_mean_density() {
+    let setup = standard();
+    let isotope = hafnium_like(20.0);
+    let (density, variance): (f64, f64) = (SATURATED, 0.05);
+    let shape = 1.0 / variance;
+    let steps = 4000;
+    let top = 1.0 + 30.0 * variance.sqrt();
+    let h = top / f64::from(steps);
+    let weights: Vec<(f64, f64)> = (1..=steps)
+        .map(|i| {
+            let x = h * f64::from(i);
+            let log_density = (shape - 1.0) * x.ln() - x / variance;
+            (x, log_density)
+        })
+        .collect();
+    let peak = weights
+        .iter()
+        .map(|w| w.1)
+        .fold(f64::NEG_INFINITY, f64::max);
+    let total: f64 = weights.iter().map(|w| (w.1 - peak).exp()).sum();
+    let mixture = |energies: &[f64]| -> Vec<f64> {
+        let sigma = &cross_sections(energies, std::slice::from_ref(&isotope), TEMPERATURE_K)[0];
+        sigma
+            .iter()
+            .map(|s| {
+                weights
+                    .iter()
+                    .map(|&(x, w)| (w - peak).exp() * (-x * density * s).exp())
+                    .sum::<f64>()
+                    / total
+            })
+            .collect()
+    };
+    let instrument = Instrument {
+        time_edges_us: setup.edges.clone(),
+        flight_path_m: setup.flight_path_m,
+        t0_us: setup.t0_us,
+        resolution: ResolutionFunction::IkedaCarpenter(Arc::clone(&setup.pulse)),
+    };
+    let per_ev = |e: f64| {
+        let u = CLOCK / e.sqrt();
+        CHARGE_RATIO * beam(1.0e6)(u) * u / (2.0 * e)
+    };
+    let sample = instrument
+        .expected_counts(
+            &per_ev,
+            &mixture,
+            setup.energy_range_ev,
+            setup.simulator_step_us,
+        )
+        .counts;
+    let open = run(&setup, 1.0, &beam(1.0e6), &[], TEMPERATURE_K);
+    let counts = (rounded(&open), rounded(&sample));
+    let fit_with = |thickness_variance| {
+        let mut m = fitted_from(
+            measurement(&setup, counts.clone(), &[(isotope.clone(), density)]),
+            330.0,
+        );
+        m.material_mut().thickness_variance = thickness_variance;
+        fit_counts(&m, &calibration(&setup)).expect("fit")
+    };
+    let fit = fit_with(Value::Fitted(0.5 * variance));
+    assert!(fit.converged);
+    let region = &fit.regions[0];
+    let estimates = [
+        region.densities[0],
+        fit.temperature(),
+        region.thickness_variance.expect("v"),
+    ];
+    let truths = [density, TEMPERATURE_K, variance];
+    let pulls: Vec<f64> = (0..3)
+        .map(|i| (estimates[i] - truths[i]) / error_bar(&fit, i))
+        .collect();
+    assert!(pulls.iter().all(|p| p.abs() <= BOUND.sqrt()), "{pulls:?}");
+
+    let uniform = fit_with(Value::Known(0.0));
+    let misses = [
+        (uniform.regions[0].densities[0] - density) / error_bar(&uniform, 0),
+        (uniform.temperature() - TEMPERATURE_K) / error_bar(&uniform, 1),
+    ];
+    assert!(misses.iter().any(|m| m.abs() > 5.0), "{misses:?}");
+}
+
+#[test]
 fn maps_the_fit_does_not_describe_are_refused() {
     let setup = standard();
     let edges: Vec<f64> = (0..=577).map(|k| 350.0 + 0.2 * f64::from(k)).collect();
@@ -1439,10 +1580,11 @@ fn maps_the_fit_does_not_describe_are_refused() {
             library: EndfLibrary::EndfB8_0,
             isotopes: vec![(hafnium_like(20.0), Value::Fitted(THIN))],
             temperature_k: Value::Known(TEMPERATURE_K),
+            thickness_variance: Value::Known(0.0),
         },
-        background: [Value::Known(0.0); 3],
+        background: [Value::Known(0.0); 5],
         gamma_transmission: Value::Known(1.0),
-        empty_background: [Value::Known(0.0); 3],
+        empty_background: [Value::Known(0.0); 5],
     };
     let refused =
         |map: &MapMeasurement<'_>, expected: &str| match fit_map(map, &calibration(&setup)) {
@@ -2031,7 +2173,7 @@ fn covariance_against_information(temperature: Value, noisy: bool) {
         }
     };
     let mut terms = [fit.normalization; 4];
-    terms[1..].copy_from_slice(&fit.regions[0].background);
+    terms[1..].copy_from_slice(&fit.regions[0].background[..3]);
     let estimates: Vec<f64> = fit.regions[0]
         .densities
         .iter()
@@ -2940,7 +3082,8 @@ mod error_bar_pulls {
             m.material_mut().temperature_k = start.1;
             if let Some([a, b0, b1, b2]) = self.terms {
                 m.normalization = Value::Fitted(a);
-                m.regions[0].background = [Value::Fitted(b0), Value::Fitted(b1), Value::Known(b2)];
+                m.regions[0].background =
+                    padded([Value::Fitted(b0), Value::Fitted(b1), Value::Known(b2)]);
             }
             if let Some(sd) = self.measured_density_sd {
                 let mut rng = ChaCha12Rng::seed_from_u64(seed + 2_000_000);
@@ -3244,7 +3387,7 @@ fn density_temperature_timing_offset_and_flight_path_are_recovered_from_starts_o
             sample_counts: rounded(&empty.1),
             open_live: None,
             sample_live: None,
-            background: [Value::Known(0.0); 3],
+            background: [Value::Known(0.0); 5],
             pixels: 1.0,
             gamma_transmission: Value::Known(1.0),
             material: None,
@@ -4366,7 +4509,7 @@ mod maps {
     }
 
     impl Tiled {
-        fn map(&self, temperature_k: Value, empty_background: [Value; 3]) -> MapMeasurement<'_> {
+        fn map(&self, temperature_k: Value, empty_background: [Value; 5]) -> MapMeasurement<'_> {
             MapMeasurement {
                 time_edges_us: self.setup.edges.clone(),
                 charge_ratio: CHARGE_RATIO,
@@ -4390,8 +4533,15 @@ mod maps {
                         .map(|data| (data.clone(), Value::Fitted(THIN)))
                         .collect(),
                     temperature_k,
+                    thickness_variance: Value::Known(0.0),
                 },
-                background: [Value::Fitted(0.02), Value::Known(0.0), Value::Known(0.0)],
+                background: [
+                    Value::Fitted(0.02),
+                    Value::Known(0.0),
+                    Value::Known(0.0),
+                    Value::Known(0.0),
+                    Value::Known(0.0),
+                ],
                 gamma_transmission: Value::Known(1.0),
                 empty_background,
             }
@@ -4485,7 +4635,7 @@ mod maps {
     fn a_template_fit_counts_would_refuse_is_refused_before_any_patch_is_fitted() {
         let truths = [([THIN, THIN], 300.0)];
         let tiled = tiled(&truths, |_, _| 0, (1, 1));
-        let map = tiled.map(Value::Fitted(0.5), [Value::Known(0.0); 3]);
+        let map = tiled.map(Value::Fitted(0.5), [Value::Known(0.0); 5]);
         match fit_map(&map, &tiled.calibration()) {
             Err(PipelineError::InvalidParameter(message)) => {
                 assert!(message.starts_with("temperature"), "{message}")
@@ -4498,7 +4648,7 @@ mod maps {
     fn a_patch_at_a_known_5000_k_is_fitted() {
         let truths = [([THIN, THIN], 5000.0)];
         let tiled = tiled(&truths, |_, _| 0, (1, 1));
-        let map = tiled.map(Value::Known(5000.0), [Value::Known(0.0); 3]);
+        let map = tiled.map(Value::Known(5000.0), [Value::Known(0.0); 5]);
         let result = fit_map(&map, &tiled.calibration()).expect("map");
         assert!(result.converged);
         assert!(result.failed[[0, 0]].is_none(), "{:?}", result.failed);
@@ -4511,9 +4661,9 @@ mod maps {
         tiled.counts[1]
             .slice_mut(s![.., 0..2, 2..4])
             .mapv_inplace(|count| (1.1 * count).round());
-        let mut map = tiled.map(Value::Fitted(400.0), [Value::Known(0.0); 3]);
+        let mut map = tiled.map(Value::Fitted(400.0), [Value::Known(0.0); 5]);
         map.normalization = Value::Fitted(TERMS[0]);
-        map.background = [Value::Known(0.05), Value::Known(0.0), Value::Known(0.0)];
+        map.background = padded([Value::Known(0.05), Value::Known(0.0), Value::Known(0.0)]);
         for (_, density) in &mut map.material.isotopes {
             *density = Value::Fitted(0.0);
         }
@@ -4539,7 +4689,7 @@ mod maps {
             |_, _| 0,
             (1, 2),
         );
-        let mut map = tiled.map(Value::Fitted(400.0), [Value::Known(0.0); 3]);
+        let mut map = tiled.map(Value::Fitted(400.0), [Value::Known(0.0); 5]);
         map.material.isotopes[0].0 = tantalum(13.915);
         map.material.library = EndfLibrary::EndfB8_1;
         let joint = tiled.joint(&map, &tiled.calibration());
@@ -4577,7 +4727,7 @@ mod maps {
                     .max(0.0);
             }
         }
-        let mut map = tiled.map(Value::Fitted(400.0), [Value::Known(0.0); 3]);
+        let mut map = tiled.map(Value::Fitted(400.0), [Value::Known(0.0); 5]);
         let joint = tiled.joint(&map, &tiled.calibration());
         map.normalization = Value::Fitted(joint.normalization);
         let calibration = Calibration {
@@ -4602,7 +4752,7 @@ mod maps {
         let side = 4;
         let truths = [([THIN, THIN], 300.0)];
         let tiled = tiled(&truths, |_, _| 0, (side, side));
-        let map = tiled.map(Value::Fitted(400.0), [Value::Known(0.0); 3]);
+        let map = tiled.map(Value::Fitted(400.0), [Value::Known(0.0); 5]);
         let calibration = tiled.calibration();
         let result = fit_map(&map, &calibration).expect("map");
         let joint = tiled.joint(&map, &calibration);
@@ -4633,7 +4783,7 @@ mod maps {
         let truths = [([0.0, 0.0], 300.0)];
         let tiled = tiled(&truths, |_, _| 0, (1, 2));
         let none = Array2::from_elem(tiled.empty.dim(), false);
-        let mut map = tiled.map(Value::Known(300.0), [Value::Known(0.0); 3]);
+        let mut map = tiled.map(Value::Known(300.0), [Value::Known(0.0); 5]);
         for (_, density) in &mut map.material.isotopes {
             *density = Value::Known(0.0);
         }
@@ -4655,7 +4805,7 @@ mod maps {
     fn a_map_with_every_shared_quantity_known_fits_its_patches() {
         let truths = [([THIN, THIN], 300.0), ([1.5 * THIN, 0.5 * THIN], 450.0)];
         let tiled = tiled(&truths, |i, _| i, (2, 1));
-        let mut map = tiled.map(Value::Fitted(400.0), [Value::Known(0.0); 3]);
+        let mut map = tiled.map(Value::Fitted(400.0), [Value::Known(0.0); 5]);
         map.normalization = Value::Known(TERMS[0]);
         let result = fit_map(&map, &calibration(&tiled.setup)).expect("map");
         assert!(result.converged && result.shared.is_empty());
@@ -4692,7 +4842,7 @@ mod maps {
         twin.za += 1;
         let truths = [([THIN, THIN], 300.0)];
         let tiled = tiled_from(map_setup(), [first, twin], 0.05, &truths, |_, _| 0, (1, 1));
-        let mut map = tiled.map(Value::Fitted(400.0), [Value::Known(0.0); 3]);
+        let mut map = tiled.map(Value::Fitted(400.0), [Value::Known(0.0); 5]);
         map.normalization = Value::Fitted(TERMS[0]);
         let result = fit_map(&map, &tiled.calibration()).expect("map");
         assert!(result.converged);
@@ -4706,7 +4856,7 @@ mod maps {
     fn a_patch_failing_at_the_start_rejoins_and_one_failing_on_the_way_is_left_out() {
         let truths = [([THIN, THIN], 300.0), ([THIN, THIN], 5100.0)];
         let tiled = tiled(&truths, |_, j| j, (1, 2));
-        let mut map = tiled.map(Value::Fitted(400.0), [Value::Known(0.0); 3]);
+        let mut map = tiled.map(Value::Fitted(400.0), [Value::Known(0.0); 5]);
         map.normalization = Value::Fitted(0.8 * TERMS[0]);
         let alone = fit_counts(
             &Measurement {
@@ -4744,7 +4894,7 @@ mod maps {
         ];
         let pick = |i: usize, j: usize| (i + j) % 4;
         let tiled = tiled(&truths, pick, (8, 8));
-        let map = tiled.map(Value::Fitted(400.0), [Value::Known(0.0); 3]);
+        let map = tiled.map(Value::Fitted(400.0), [Value::Known(0.0); 5]);
         let result = fit_map(&map, &tiled.calibration()).expect("map");
         assert!(result.converged);
         assert!(
@@ -4771,7 +4921,7 @@ mod maps {
         };
         let map = tiled.map(
             bounded,
-            [Value::Known(0.0), Value::Fitted(0.0), Value::Known(0.0)],
+            padded([Value::Known(0.0), Value::Fitted(0.0), Value::Known(0.0)]),
         );
         let result = fit_map(&map, &tiled.calibration()).expect("map");
         assert!(result.converged);

@@ -2947,6 +2947,23 @@ fn counts_error(error: PipelineError) -> PyErr {
 }
 
 /// A [C, A, tau] triple of PyValues.
+/// [b0, b1, b2] or [b0, b1, b2, d, f]; d and f are known 0 when absent.
+fn background_values(values: Vec<PyValue>) -> PyResult<[Value; 5]> {
+    match values.as_slice() {
+        [b0, b1, b2] => Ok([
+            b0.inner,
+            b1.inner,
+            b2.inner,
+            Value::Known(0.0),
+            Value::Known(0.0),
+        ]),
+        [b0, b1, b2, d, f] => Ok([b0.inner, b1.inner, b2.inner, d.inner, f.inner]),
+        _ => Err(pyo3::exceptions::PyValueError::new_err(
+            "expected [b0, b1, b2] or [b0, b1, b2, d, f]",
+        )),
+    }
+}
+
 fn value_trio(values: Vec<PyValue>) -> PyResult<[Value; 3]> {
     let [a, b, c] = values.as_slice() else {
         return Err(pyo3::exceptions::PyValueError::new_err(
@@ -3085,13 +3102,15 @@ struct PyMaterial {
 #[pymethods]
 impl PyMaterial {
     /// library names the ENDF library the isotopes' resonance data were read
-    /// from, e.g. "endf8.1".
+    /// from, e.g. "endf8.1"; thickness_variance is the relative variance of
+    /// the areal density over the region's pixels, known 0 by default.
     #[new]
-    #[pyo3(signature = (isotopes, temperature_k, library="endf8.1"))]
+    #[pyo3(signature = (isotopes, temperature_k, library="endf8.1", thickness_variance=None))]
     fn new(
         isotopes: Vec<(PyResonanceData, PyValue)>,
         temperature_k: PyValue,
         library: &str,
+        thickness_variance: Option<PyValue>,
     ) -> PyResult<Self> {
         Ok(Self {
             inner: Material {
@@ -3100,6 +3119,7 @@ impl PyMaterial {
                     .map(|(data, density)| ((*data.inner).clone(), density.inner))
                     .collect(),
                 temperature_k: temperature_k.inner,
+                thickness_variance: thickness_variance.map_or(Value::Known(0.0), |v| v.inner),
                 library: parse_library_name(library)?,
                 covariances: Vec::new(),
             },
@@ -3121,6 +3141,14 @@ impl PyMaterial {
                 )
             })
             .collect()
+    }
+
+    /// The relative variance of the areal density over the region's pixels.
+    #[getter]
+    fn thickness_variance(&self) -> PyValue {
+        PyValue {
+            inner: self.inner.thickness_variance,
+        }
     }
 
     /// The temperature in K.
@@ -3150,8 +3178,9 @@ struct PyRegion {
 
 #[pymethods]
 impl PyRegion {
-    /// background is [b0, b1, b2] of b(E) = b0 + b1/sqrt(E) + b2*sqrt(E);
-    /// pixels is the region's area in pixels, finite and positive.
+    /// background is [b0, b1, b2] or [b0, b1, b2, d, f] of
+    /// b(E) = b0 + b1/sqrt(E) + b2*sqrt(E) + d*exp(-f/sqrt(E)); pixels is the
+    /// region's area in pixels, finite and positive.
     #[new]
     #[pyo3(signature = (open_counts, sample_counts, pixels, background, gamma_transmission, material=None, open_live=None, sample_live=None))]
     fn new(
@@ -3170,7 +3199,7 @@ impl PyRegion {
                 sample_counts,
                 open_live,
                 sample_live,
-                background: value_trio(background)?,
+                background: background_values(background)?,
                 pixels,
                 gamma_transmission: gamma_transmission.inner,
                 material: material.map(|material| material.inner),
@@ -3202,7 +3231,7 @@ impl PyRegion {
         self.inner.sample_live.clone()
     }
 
-    /// The region's background terms [b0, b1, b2].
+    /// The region's background terms [b0, b1, b2, d, f].
     #[getter]
     fn background(&self) -> Vec<PyValue> {
         self.inner
@@ -3544,7 +3573,8 @@ impl PyCalibration {
 struct PyRegionFit {
     densities: Vec<f64>,
     temperature_k: Option<f64>,
-    background: [f64; 3],
+    thickness_variance: Option<f64>,
+    background: [f64; 5],
     gamma_transmission: f64,
     beam_at_limit: bool,
     predicted_open: Vec<f64>,
@@ -3558,6 +3588,7 @@ impl PyRegionFit {
         Self {
             densities: region.densities.clone(),
             temperature_k: region.temperature_k,
+            thickness_variance: region.thickness_variance,
             background: region.background,
             gamma_transmission: region.gamma_transmission,
             beam_at_limit: region.beam_at_limit,
@@ -3583,9 +3614,15 @@ impl PyRegionFit {
         self.temperature_k
     }
 
-    /// [b0, b1, b2].
+    /// The material's thickness variance, or None without a material.
     #[getter]
-    fn background(&self) -> [f64; 3] {
+    fn thickness_variance(&self) -> Option<f64> {
+        self.thickness_variance
+    }
+
+    /// [b0, b1, b2, d, f].
+    #[getter]
+    fn background(&self) -> [f64; 5] {
         self.background
     }
 
@@ -3837,9 +3874,9 @@ struct MapData {
     empty: ndarray::Array2<bool>,
     binning: usize,
     material: Material,
-    background: [Value; 3],
+    background: [Value; 5],
     gamma_transmission: Value,
-    empty_background: [Value; 3],
+    empty_background: [Value; 5],
 }
 
 impl MapData {
@@ -3900,8 +3937,8 @@ impl PyMapMeasurement {
         room_background: Option<PyRoomBackground>,
     ) -> PyResult<Self> {
         let empty_background = match empty_background {
-            Some(values) => value_trio(values)?,
-            None => [Value::Known(0.0); 3],
+            Some(values) => background_values(values)?,
+            None => [Value::Known(0.0); 5],
         };
         let time_background = match time_background {
             Some(values) => value_trio(values)?,
@@ -3923,7 +3960,7 @@ impl PyMapMeasurement {
                 empty: empty.as_array().to_owned(),
                 binning,
                 material: material.inner,
-                background: value_trio(background)?,
+                background: background_values(background)?,
                 gamma_transmission: gamma_transmission
                     .map_or(Value::Known(1.0), |value| value.inner),
                 empty_background,

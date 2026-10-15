@@ -53,7 +53,7 @@ time-bin edges (microseconds), not an energy grid.
 |--------|---------|
 | Value | One fitted quantity: known, fitted from a start, within bounds, or measured with a Gaussian prior. |
 | Material | Isotopes each with an areal density in atoms/barn, and a temperature in K. |
-| Region | Both runs' counts for one set of pixels, its background [b0, b1, b2], its area in pixels, the gamma transmission, and the material. |
+| Region | Both runs' counts for one set of pixels, its background [b0, b1, b2, d, f], its area in pixels, the gamma transmission, and the material. |
 | RoomBackground | Counts per microsecond per pixel per frame that follow each run's duration, and each run's frames. |
 | Measurement | The time-bin edges, charge ratio, normalization, time and room backgrounds and regions of one fit. |
 | Pulse | Ikeda-Carpenter pulse parameters and the energy span they hold over. |
@@ -76,16 +76,20 @@ return the matching fields (None where a kind has no such field).
 
 #### Material
 
-Material(isotopes, temperature_k, library="endf8.1") takes a list of
-(ResonanceData, Value) pairs, each density in atoms/barn, and a temperature
-Value in K.
+Material(isotopes, temperature_k, library="endf8.1", thickness_variance=None)
+takes a list of (ResonanceData, Value) pairs, each density in atoms/barn, a
+temperature Value in K, and the relative variance v of the areal density over
+the region's pixels, known 0 by default: the region transmits
+(1 + v*D)**(-1/v), the mean for a Gamma-distributed areal density, D the
+optical depth at the mean density.
 
 #### Region
 
 Region(open_counts, sample_counts, pixels, background, gamma_transmission,
 material=None, open_live=None, sample_live=None) holds one region. background
-is the three-term b(E) = b0 + b1/sqrt(E) + b2/sqrt(E) as three Values. The
-optional live fractions are per bin in (0, 1].
+is b(E) = b0 + b1/sqrt(E) + b2*sqrt(E) + d*exp(-f/sqrt(E)) as five Values
+[b0, b1, b2, d, f], f 0 or more; three Values [b0, b1, b2] hold d and f at 0.
+The optional live fractions are per bin in (0, 1].
 
 #### Measurement
 

@@ -1060,24 +1060,29 @@ class Value:
 class Material:
     """A material isotopes, each with an areal density in atoms/barn, and its
     temperature in K.  The library names the ENDF library the isotopes were
-    read from."""
+    read from; thickness_variance is the relative variance of the areal
+    density over the region's pixels, known 0 by default."""
 
     def __init__(
         self,
         isotopes: list[tuple[ResonanceData, Value]],
         temperature_k: Value,
         library: str = "endf8.1",
+        thickness_variance: Value | None = None,
     ) -> None: ...
     @property
     def isotopes(self) -> list[tuple[ResonanceData, Value]]: ...
     @property
     def temperature_k(self) -> Value: ...
+    @property
+    def thickness_variance(self) -> Value: ...
 
 class Region:
     """The counts of a set of pixels in both runs, its background and the
     material the beam crosses there.
 
-    The background is [b0, b1, b2] of b(E) = b0 + b1/sqrt(E) + b2*sqrt(E);
+    The background is [b0, b1, b2] or [b0, b1, b2, d, f] of
+    b(E) = b0 + b1/sqrt(E) + b2*sqrt(E) + d*exp(-f/sqrt(E));
     pixels is the region area in pixels.
     """
 
@@ -1205,6 +1210,8 @@ class RegionFit:
         ...
     @property
     def temperature_k(self) -> float | None: ...
+    @property
+    def thickness_variance(self) -> float | None: ...
     @property
     def background(self) -> list[float]: ...
     @property

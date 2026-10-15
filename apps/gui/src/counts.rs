@@ -174,6 +174,7 @@ fn material(request: &FitRequest) -> Material {
         temperature_k: Value::Known(request.temperature_k),
         library: request.library,
         covariances: Vec::new(),
+        thickness_variance: Value::Known(0.0),
     }
 }
 
@@ -185,13 +186,13 @@ fn normalization(request: &FitRequest) -> Value {
     }
 }
 
-fn background(request: &FitRequest) -> [Value; 3] {
+fn background(request: &FitRequest) -> [Value; 5] {
     let value = if request.background_fitted {
         Value::Fitted(0.0)
     } else {
         Value::Known(0.0)
     };
-    [value; 3]
+    [value, value, value, Value::Known(0.0), Value::Known(0.0)]
 }
 
 fn labels(request: &FitRequest) -> Vec<String> {
@@ -273,7 +274,7 @@ pub fn run_map_fit(request: &FitRequest) -> Result<MapFitSummary, String> {
         material: material(request),
         background: background(request),
         gamma_transmission: Value::Known(1.0),
-        empty_background: [Value::Known(0.0); 3],
+        empty_background: [Value::Known(0.0); 5],
     };
     let fit = counts_map::fit_map(&map, &calibration(request)).map_err(|e| e.to_string())?;
     Ok(MapFitSummary {
