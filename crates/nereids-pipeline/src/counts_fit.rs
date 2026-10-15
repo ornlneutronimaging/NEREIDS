@@ -185,8 +185,8 @@ pub struct Material {
     pub temperature_k: Value,
     /// `v`, the relative variance of the areal density over the region's
     /// pixels, weighted by the beam that reaches them, 0 or more: 0 for a
-    /// uniform sample.  The region transmits `(1 + v·D)^(−1/v)`, `D` the optical
-    /// depth at the mean density
+    /// uniform sample.  The region transmits `(1 + v·D)^(−1/v)`, the mean for a
+    /// Gamma-distributed areal density, `D` the optical depth at the mean density
     /// ([`uneven_transmission`](nereids_physics::thickness::uneven_transmission)).
     pub thickness_variance: Value,
     /// The library the isotopes' resonance data were read from.  The fit

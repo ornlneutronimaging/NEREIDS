@@ -10,9 +10,7 @@
 //! T(D, v) = (1 + v·D)^(−1/v) = exp(−D · ln(1 + v·D)/(v·D))
 //! ```
 //!
-//! exact for that distribution and, for any distribution of variance `v`, equal
-//! to `exp(−D + v·D²/2)` to second order in `v·D`.  At `v = 0` it is
-//! `exp(−D)`.
+//! exact for that distribution only.  At `v = 0` it is `exp(−D)`.
 
 /// `ln(1 + y)/y`, 1 at `y = 0`.
 fn log_ratio(y: f64) -> f64 {

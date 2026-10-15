@@ -80,7 +80,8 @@ Material(isotopes, temperature_k, library="endf8.1", thickness_variance=None)
 takes a list of (ResonanceData, Value) pairs, each density in atoms/barn, a
 temperature Value in K, and the relative variance v of the areal density over
 the region's pixels, known 0 by default: the region transmits
-(1 + v*D)**(-1/v), D the optical depth at the mean density.
+(1 + v*D)**(-1/v), the mean for a Gamma-distributed areal density, D the
+optical depth at the mean density.
 
 #### Region
 
