@@ -444,6 +444,7 @@ pub fn fit_map<'a>(
     map: &MapMeasurement<'a>,
     calibration: &Calibration,
 ) -> Result<CountsMap<'a>, PipelineError> {
+    map.patches()?;
     let mut open = starting_time_background(&Measurement {
         time_edges_us: Vec::new(),
         charge_ratio: map.charge_ratio,

@@ -1313,6 +1313,10 @@ fn maps_the_fit_does_not_describe_are_refused() {
     refused(&map, "at least one pixel");
     map.empty = all.slice(s![.., 1..]);
     refused(&map, "the empty mask has shape");
+    let mut narrow = base.clone();
+    narrow.excluded = none.slice(s![.., 1..]);
+    narrow.empty = all.view();
+    refused(&narrow, "the excluded mask has shape");
     map.sample_counts = counts.slice(s![1.., .., ..]);
     refused(&map, "sample counts of shape");
     let no_bins = Array3::zeros((0, 1, 7));
