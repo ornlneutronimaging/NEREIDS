@@ -887,6 +887,13 @@ class TestCountsApi:
         )
         assert measurement.room_background.rate.value == 0.5
         assert measurement.room_background.frames == (3.0e4, 2.5e4)
+        assert material.thickness_variance.value == 0.0
+        uneven = nereids.Material(
+            isotopes=[(u238_data, nereids.Value.fitted(0.001))],
+            temperature_k=nereids.Value.known(293.6),
+            thickness_variance=nereids.Value.fitted(0.05),
+        )
+        assert uneven.thickness_variance.value == 0.05
 
     def test_fit_counts_requires_a_material(self):
         measurement = nereids.Measurement(

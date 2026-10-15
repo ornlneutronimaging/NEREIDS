@@ -919,6 +919,7 @@ mod tests {
                         value: 300.0,
                         sd: 10.0,
                     },
+                    thickness_variance: Value::Known(0.0),
                 }),
             }],
         }
@@ -984,6 +985,7 @@ mod tests {
                 excluded_bins: Vec::new(),
                 densities: vec![2e-3],
                 temperature_k: Some(300.0),
+                thickness_variance: Some(0.0),
                 background: [0.0; 5],
                 gamma_transmission: 1.0,
                 beam: BeamSpline::constant(200.0, 600.0, 1.0),

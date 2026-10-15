@@ -22,6 +22,7 @@ use nereids_physics::doppler::DopplerParams;
 use nereids_physics::flight_time_grid::{FlightTimeGrid, Rows};
 use nereids_physics::ikeda_carpenter::IkedaCarpenterParams;
 use nereids_physics::resolution::TOF_FACTOR;
+use nereids_physics::thickness::uneven_transmission;
 use nereids_physics::transmission::resonance_center_energies;
 use rayon::prelude::*;
 
@@ -182,6 +183,12 @@ pub struct Material {
     pub isotopes: Vec<(ResonanceData, Value)>,
     /// The temperature in K, within 1–5000 K.
     pub temperature_k: Value,
+    /// `v`, the relative variance of the areal density over the region's
+    /// pixels, weighted by the beam that reaches them, 0 or more: 0 for a
+    /// uniform sample.  The region transmits `(1 + v·D)^(−1/v)`, `D` the optical
+    /// depth at the mean density
+    /// ([`uneven_transmission`](nereids_physics::thickness::uneven_transmission)).
+    pub thickness_variance: Value,
     /// The library the isotopes' resonance data were read from.  The fit
     /// leaves out the sample run's bins that overlap the span between the mean
     /// arrival times, `t0 + L·TOF_FACTOR/√E + 3/α + R/β`, of the two ends of
@@ -222,7 +229,8 @@ pub struct CountsFit {
     /// one.
     pub room_background: f64,
     /// Covariance of the fitted quantities among, in this order, each region's
-    /// densities, in the order given, and temperature, region by region; the
+    /// densities, in the order given, temperature and thickness variance,
+    /// region by region; the
     /// normalization; each region's `b0`, `b1`, `b2`, `d` and `f`, region by region;
     /// each region's gamma transmission, region by region; the time
     /// background's `C`, `A` and `τ`; the room background's `ρ`; `t0`; the
@@ -311,6 +319,9 @@ pub struct RegionFit {
     /// The material's temperature in K: the known one, or the fitted one;
     /// `None` without a material.
     pub temperature_k: Option<f64>,
+    /// The material's thickness variance `v`: the known one, or the fitted
+    /// one; `None` without a material.
+    pub thickness_variance: Option<f64>,
     /// `[b0, b1, b2, d, f]` of [`Region::background`], each the known or the
     /// fitted one.
     pub background: [f64; 5],
@@ -355,7 +366,7 @@ pub struct RegionFit {
 /// O_rk   = ℓ^O_rk · [w Σ_i φ_ri P_ki + p_r G_k + p_r ρ F^O w_k]
 /// S_rk   = ℓ^S_rk · [c_q · a · (w Σ_i φ_ri [T_ri + b_r(E_i)] P_ki + γ_r p_r G_k)
 ///                    + p_r ρ F^S w_k]
-/// T_ri   = exp(−Σ_m n_rm σ_m(E_i; T_r)), or 1 without a material
+/// T_ri   = (1 + v_r D_ri)^(−1/v_r), D_ri = Σ_m n_rm σ_m(E_i; T_r), or 1 without a material
 /// b_r(E) = b0_r + b1_r/√E + b2_r·√E + d_r·exp(−f_r/√E)
 /// G_k    = ∫ over bin k of (C + A·exp(−(t − t₁)/τ)) dt
 /// ```
@@ -895,7 +906,7 @@ fn nuclear_slopes(
         let place = &model.model.layout.regions[r];
         let temperature = params[place.temperature.expect("a material")];
         let scale = model.model.scale(&params)?;
-        let transmitted = model.model.beams(&params, &scale, r)?.transmitted;
+        let transmitted = model.model.beams(&params, &scale, r)?.per_depth;
         for (i, covariance) in &material.covariances {
             let density = params[place.densities.start + i];
             let data = &material.isotopes[*i].0;
@@ -1522,6 +1533,7 @@ pub(crate) fn fit_counts_answer(
         .map(|(r, ((place, open), overdispersion))| RegionFit {
             densities: params[place.densities.clone()].to_vec(),
             temperature_k: place.temperature.map(|t| params[t]),
+            thickness_variance: place.thickness.map(|v| params[v]),
             background: std::array::from_fn(|i| params[place.background + i]),
             gamma_transmission: params[place.gamma],
             beam: open.beam.with_coefficients(&params[place.beam.clone()]),
@@ -1622,6 +1634,7 @@ impl Answer {
                         Role::Beam { region: r, .. }
                             | Role::Density { region: r, .. }
                             | Role::Temperature { region: r }
+                            | Role::ThicknessVariance { region: r }
                             | Role::Background { region: r, .. }
                             | Role::GammaTransmission { region: r }
                             if r == region
@@ -1905,6 +1918,7 @@ pub(crate) enum Role {
     Beam { region: usize, coefficient: usize },
     Density { region: usize, isotope: usize },
     Temperature { region: usize },
+    ThicknessVariance { region: usize },
     Normalization,
     Background { region: usize, term: usize },
     GammaTransmission { region: usize },
@@ -1929,7 +1943,10 @@ fn roles(beams: &[usize], isotopes: &[Option<usize>]) -> Vec<Role> {
         .flat_map(|(region, n)| {
             (0..n)
                 .map(move |isotope| Role::Density { region, isotope })
-                .chain([Role::Temperature { region }])
+                .chain([
+                    Role::Temperature { region },
+                    Role::ThicknessVariance { region },
+                ])
         });
     let backgrounds = (0..isotopes.len())
         .flat_map(|region| (0..5).map(move |term| Role::Background { region, term }));
@@ -1971,6 +1988,12 @@ fn quantity(
             format!("temperature of region {region}"),
             t_low..=t_high,
             format!("within {t_low}–{t_high} K"),
+        ),
+        Role::ThicknessVariance { region } => (
+            &material(measurement, region).thickness_variance,
+            format!("thickness variance of region {region}"),
+            0.0..=f64::INFINITY,
+            "0 or more".into(),
         ),
         Role::Normalization => (
             &measurement.normalization,
@@ -2093,6 +2116,7 @@ struct Place {
     beam: Range<usize>,
     densities: Range<usize>,
     temperature: Option<usize>,
+    thickness: Option<usize>,
     background: usize,
     gamma: usize,
     pixels: f64,
@@ -2122,6 +2146,9 @@ impl Layout {
                 temperature: roles
                     .iter()
                     .position(|&role| role == Role::Temperature { region: r }),
+                thickness: roles
+                    .iter()
+                    .position(|&role| role == Role::ThicknessVariance { region: r }),
                 background: at(Role::Background { region: r, term: 0 }),
                 gamma: at(Role::GammaTransmission { region: r }),
                 pixels: pixels[r],
@@ -2166,8 +2193,9 @@ struct Absorber {
 struct Beams {
     open: Vec<f64>,
     normalized: Vec<f64>,
-    transmitted: Vec<f64>,
     sample: Vec<f64>,
+    per_depth: Vec<f64>,
+    per_variance: Vec<f64>,
 }
 
 struct CrossSections {
@@ -2374,29 +2402,36 @@ impl RegionsModel {
             .collect();
         let terms = &params[place.background..place.background + 5];
         let exponential = self.exponential(terms[4]);
-        let (transmitted, sample) = normalized
-            .iter()
-            .enumerate()
-            .map(|(j, beam)| {
-                let depth: f64 = sigma
-                    .iter()
-                    .flat_map(|sigma| densities.iter().zip(&sigma.values))
-                    .map(|(n, sigma)| n * sigma[j])
-                    .sum();
-                let background: f64 = terms
-                    .iter()
-                    .zip(&self.shapes)
-                    .map(|(b, g)| b * g[j])
-                    .sum::<f64>()
-                    + terms[3] * exponential[j];
-                (beam * (-depth).exp(), beam * ((-depth).exp() + background))
-            })
-            .unzip();
+        let variance = place.thickness.map_or(0.0, |v| params[v]);
+        let n = normalized.len();
+        let (mut sample, mut per_depth, mut per_variance) = (
+            Vec::with_capacity(n),
+            Vec::with_capacity(n),
+            Vec::with_capacity(n),
+        );
+        for (j, beam) in normalized.iter().enumerate() {
+            let depth: f64 = sigma
+                .iter()
+                .flat_map(|sigma| densities.iter().zip(&sigma.values))
+                .map(|(n, sigma)| n * sigma[j])
+                .sum();
+            let background: f64 = terms
+                .iter()
+                .zip(&self.shapes)
+                .map(|(b, g)| b * g[j])
+                .sum::<f64>()
+                + terms[3] * exponential[j];
+            let (transmission, along_depth, along_variance) = uneven_transmission(depth, variance);
+            sample.push(beam * (transmission + background));
+            per_depth.push(beam * along_depth);
+            per_variance.push(beam * along_variance);
+        }
         Ok(Beams {
             open,
             normalized,
-            transmitted,
             sample,
+            per_depth,
+            per_variance,
         })
     }
 
@@ -2509,7 +2544,7 @@ impl FitModel for RegionsModel {
                     let slope: Vec<f64> = sigma.values[isotope].iter().map(|s| -s).collect();
                     vec![(
                         sample_rows(region),
-                        counts(&times(&beams[region].transmitted, &slope))?,
+                        counts(&times(&beams[region].per_depth, &slope))?,
                     )]
                 }
                 Role::Temperature { region } => {
@@ -2527,8 +2562,11 @@ impl FitModel for RegionsModel {
                         .collect();
                     vec![(
                         sample_rows(region),
-                        counts(&times(&beams[region].transmitted, &broadening))?,
+                        counts(&times(&beams[region].per_depth, &broadening))?,
                     )]
+                }
+                Role::ThicknessVariance { region } => {
+                    vec![(sample_rows(region), counts(&beams[region].per_variance)?)]
                 }
                 Role::Normalization => {
                     let slope = vec![1.0 / params[index]; self.energies.len()];
@@ -2728,6 +2766,7 @@ mod tests {
                     [[3.0e-4, 5.0e-4], [0.0; 2], [4.0e-4, 0.0]][region][isotope]
                 }
                 Role::Temperature { region } => [300.0, 0.0, 250.0][region],
+                Role::ThicknessVariance { region } => [0.02, 0.0, 0.05][region],
                 Role::Normalization => 0.93,
                 Role::Background { region, term } => [
                     [0.05, 0.5, -0.01, 0.03, 4.0],
@@ -2828,6 +2867,7 @@ mod tests {
                 } => beams[region].coefficients()[coefficient],
                 Role::Density { region, .. } => [5.0e-4, 4.0e-4, 0.0][region],
                 Role::Temperature { .. } => 300.0,
+                Role::ThicknessVariance { .. } => 0.0,
                 Role::Normalization => 0.93,
                 Role::Background { region, term } => [
                     [0.05, 0.0, 0.0, 0.0, 0.0],
@@ -2885,6 +2925,7 @@ mod tests {
                         library: EndfLibrary::EndfB8_0,
                         isotopes: vec![(data, Value::Fitted(3.0e-4))],
                         temperature_k: Value::Fitted(350.0),
+                        thickness_variance: Value::Known(0.0),
                     }),
                 })
                 .collect(),
@@ -3069,6 +3110,7 @@ mod tests {
                 } => beams[region].coefficients()[coefficient],
                 Role::Density { .. } => 5.0e-4,
                 Role::Temperature { .. } => 300.0,
+                Role::ThicknessVariance { .. } => 0.0,
                 Role::Normalization => 0.93,
                 Role::Background { region, term } => {
                     [[0.05, 0.0, 0.0, 0.0, 0.0], [0.0; 5]][region][term]
@@ -3103,6 +3145,7 @@ mod tests {
             library: EndfLibrary::EndfB8_0,
             isotopes: vec![(hafnium, Value::Fitted(3.0e-4))],
             temperature_k: Value::Fitted(350.0),
+            thickness_variance: Value::Known(0.0),
         };
         let background = [
             Value::Fitted(0.02),
@@ -3288,7 +3331,7 @@ mod tests {
                 .coefficients()
                 .iter()
                 .copied()
-                .chain([3.0e-4, 5.0e-4, 300.0, normalization])
+                .chain([3.0e-4, 5.0e-4, 300.0, 0.0, normalization])
                 .chain(background)
                 .chain([1.0, 0.0, 0.0, 1.0, 0.0])
                 .chain([T0_US, FLIGHT_PATH_M])
@@ -3330,6 +3373,7 @@ mod tests {
                 isotopes: vec![(synthetic_isotope(73, 181, 13.9, 0.01, 0.06), density)],
                 temperature_k: Value::Known(300.0),
                 library: EndfLibrary::EndfB8_1,
+                thickness_variance: Value::Known(0.0),
             };
             excluded_bins(&edges, Some(&material), &numbers)
         };

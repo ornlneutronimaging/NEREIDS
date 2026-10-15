@@ -243,8 +243,8 @@ pub struct CountsMap<'a> {
     /// when [`Self::measured_pulls`] is, or when [`consistency`] gives none.
     pub pulse_consistency: Option<Consistency>,
     /// A patch's fitted quantities: each fitted density, in the material's
-    /// order, the temperature if fitted, each fitted background term, and the
-    /// gamma transmission if fitted.
+    /// order, the temperature and the thickness variance if fitted, each fitted
+    /// background term, and the gamma transmission if fitted.
     pub quantities: Vec<String>,
     /// Each patch's covariance of [`Self::quantities`], the shared
     /// quantities' uncertainty included; the row and column of one held on a
@@ -430,8 +430,9 @@ impl CountsMap<'_> {
 /// # Errors
 /// Everything [`MapMeasurement::patches`] refuses;
 /// [`PipelineError::InvalidParameter`] if a pixel is both behind the sample
-/// and empty, a density, the temperature, a background term or the gamma
-/// transmission of the sample's patches is [`Value::Measured`], which would
+/// and empty, a density, the temperature, the thickness variance, a
+/// background term or the gamma transmission of the sample's patches is
+/// [`Value::Measured`], which would
 /// count its measurement once per patch, a term of the empty pixels' background is
 /// [`Value::Measured`], the material carries resonance covariances, which a
 /// map does not yet carry, a count of a pixel summed into a region is not a
@@ -538,15 +539,15 @@ fn fit_map_from<'a>(
         .isotopes
         .iter()
         .map(|(_, density)| density)
-        .chain([&material.temperature_k])
+        .chain([&material.temperature_k, &material.thickness_variance])
         .chain(&map.background)
         .chain([&map.gamma_transmission])
         .any(|value| matches!(value, Value::Measured { .. }))
     {
         return invalid(
-            "a measured density, temperature, background or gamma transmission of the sample's \
-             patches would count its measurement once per patch; give it known, fitted or \
-             within bounds"
+            "a measured density, temperature, thickness variance, background or gamma \
+             transmission of the sample's patches would count its measurement once per patch; \
+             give it known, fitted or within bounds"
                 .into(),
         );
     }
@@ -1211,6 +1212,14 @@ fn fit_map_from<'a>(
                 .then(|| (Role::Temperature { region: 0 }, "temperature".to_string())),
         )
         .chain(
+            (!matches!(material.thickness_variance, Value::Known(_))).then(|| {
+                (
+                    Role::ThicknessVariance { region: 0 },
+                    "thickness variance".to_string(),
+                )
+            }),
+        )
+        .chain(
             map.background
                 .iter()
                 .enumerate()
@@ -1441,6 +1450,9 @@ fn restarted(region: &Region, previous: Option<&RegionFit>) -> Region {
         }
         if let Some(t) = fit.temperature_k {
             material.temperature_k = restart(material.temperature_k, t);
+        }
+        if let Some(v) = fit.thickness_variance {
+            material.thickness_variance = restart(material.thickness_variance, v);
         }
     }
     for (term, &at) in region.background.iter_mut().zip(&fit.background) {

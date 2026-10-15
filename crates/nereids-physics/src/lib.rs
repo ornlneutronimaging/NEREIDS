@@ -12,6 +12,7 @@
 //! - [`reich_moore`] - Reich-Moore R-matrix cross-section formalism
 //! - [`resolution`] - instrument resolution broadening
 //! - [`slbw`] - single- and multi-level Breit-Wigner (LRF=1/2)
+//! - [`thickness`] - transmission of a sample whose areal density varies
 //! - [`transmission`] - Beer-Lambert transmission forward model
 //!
 //! ## SAMMY Reference
@@ -31,4 +32,5 @@ pub mod penetrability;
 pub mod reich_moore;
 pub mod resolution;
 pub mod slbw;
+pub mod thickness;
 pub mod transmission;

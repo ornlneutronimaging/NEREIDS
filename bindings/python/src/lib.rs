@@ -3102,13 +3102,15 @@ struct PyMaterial {
 #[pymethods]
 impl PyMaterial {
     /// library names the ENDF library the isotopes' resonance data were read
-    /// from, e.g. "endf8.1".
+    /// from, e.g. "endf8.1"; thickness_variance is the relative variance of
+    /// the areal density over the region's pixels, known 0 by default.
     #[new]
-    #[pyo3(signature = (isotopes, temperature_k, library="endf8.1"))]
+    #[pyo3(signature = (isotopes, temperature_k, library="endf8.1", thickness_variance=None))]
     fn new(
         isotopes: Vec<(PyResonanceData, PyValue)>,
         temperature_k: PyValue,
         library: &str,
+        thickness_variance: Option<PyValue>,
     ) -> PyResult<Self> {
         Ok(Self {
             inner: Material {
@@ -3117,6 +3119,7 @@ impl PyMaterial {
                     .map(|(data, density)| ((*data.inner).clone(), density.inner))
                     .collect(),
                 temperature_k: temperature_k.inner,
+                thickness_variance: thickness_variance.map_or(Value::Known(0.0), |v| v.inner),
                 library: parse_library_name(library)?,
                 covariances: Vec::new(),
             },
@@ -3138,6 +3141,14 @@ impl PyMaterial {
                 )
             })
             .collect()
+    }
+
+    /// The relative variance of the areal density over the region's pixels.
+    #[getter]
+    fn thickness_variance(&self) -> PyValue {
+        PyValue {
+            inner: self.inner.thickness_variance,
+        }
     }
 
     /// The temperature in K.
@@ -3562,6 +3573,7 @@ impl PyCalibration {
 struct PyRegionFit {
     densities: Vec<f64>,
     temperature_k: Option<f64>,
+    thickness_variance: Option<f64>,
     background: [f64; 5],
     gamma_transmission: f64,
     beam_at_limit: bool,
@@ -3576,6 +3588,7 @@ impl PyRegionFit {
         Self {
             densities: region.densities.clone(),
             temperature_k: region.temperature_k,
+            thickness_variance: region.thickness_variance,
             background: region.background,
             gamma_transmission: region.gamma_transmission,
             beam_at_limit: region.beam_at_limit,
@@ -3599,6 +3612,12 @@ impl PyRegionFit {
     #[getter]
     fn temperature_k(&self) -> Option<f64> {
         self.temperature_k
+    }
+
+    /// The material's thickness variance, or None without a material.
+    #[getter]
+    fn thickness_variance(&self) -> Option<f64> {
+        self.thickness_variance
     }
 
     /// [b0, b1, b2, d, f].
