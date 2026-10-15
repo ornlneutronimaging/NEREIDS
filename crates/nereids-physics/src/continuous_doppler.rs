@@ -337,7 +337,6 @@ impl TargetContext<'_, '_> {
         // against the derivative's error too changes the panel set, and a
         // panel set that depends on what the caller asked for would make the
         // cross-section itself depend on it — measured at 2.9e-13 relative on
-        // 56 of 201 targets before this was removed.
         let derivative = value * (x * x - 0.5) / self.temperature_k;
         (value, derivative)
     }
@@ -1481,7 +1480,6 @@ mod tests {
     }
 
     /// The budget bounds the panels the BREAKPOINTS produce, not only the
-    /// ones refinement adds. Before this, a source wide enough to exceed
     /// the cap on its initial panels sailed past it, and if those panels
     /// converged the cap was never consulted at all.
     #[test]
@@ -1511,7 +1509,6 @@ mod tests {
     ///
     /// The integrand calls [`CrossSectionPlan::evaluate_one`], which
     /// dispatches SLBW, MLBW and Reich-Moore alike, so there is nothing for
-    /// the broadening to special-case. Reich-Moore used to be refused here,
     /// which is what made the choice of method a runtime decision.
     ///
     /// The results must also DIFFER between formalisms, or the test would

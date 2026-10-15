@@ -1,7 +1,6 @@
 //! Regression tests for the `doppler_broaden` energy-grid contract.
 //!
 //! `doppler_broaden` and `doppler_broaden_with_derivative` are public
-//! physics leaves that previously trusted their callers to supply a
 //! positive, finite, strictly ascending energy grid. A malformed grid
 //! would not panic but would silently propagate NaN through the FGM
 //! convolution kernel (because `NaN < FLOOR` is false, bypassing the

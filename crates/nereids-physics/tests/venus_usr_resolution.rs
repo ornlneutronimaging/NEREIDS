@@ -13,8 +13,8 @@
 //! up front so a future regression that collapses the synthetic
 //! kernel toward a delta — which would silently turn every
 //! equivalence test into a vacuous identity — fails loudly at the
-//! first test instead. See PR #544 for the silent-no-op-via-kernel-
-//! shrink failure mode this pre-check guards against, and issue #557
+//! first test instead. See for the silent-no-op-via-kernel
+//! shrink failure mode this pre-check guards against, and
 //! for the original CI-coverage gap that motivated the synthetic
 //! replacement.
 

@@ -58,7 +58,6 @@ fn build_aux_grid(
             // in resolution_broaden_presorted.  When C > 2.5 the PW-linear
             // Gaussian path is used, which benefits from intermediates.
             //
-            // Previously checked at a single midpoint, which could make the
             // wrong decision if the ratio crosses 2.5 within the energy range.
             // Now checks at 5 points (lo, 25%, mid, 75%, hi) and uses
             // intermediates if a MAJORITY of points have C > 2.5.
@@ -135,11 +134,11 @@ fn extract_resonance_widths(resonance_data: &[&ResonanceData]) -> Vec<(f64, f64)
 /// Distinct resonance center energies (eV) across every isotope and formalism,
 /// sorted ascending.
 ///
-/// Used by the energy-scale calibration peak-matching seed (issue #608): the
+/// Used by the energy-scale calibration peak-matching seed: the
 /// (t0, L_scale) calibration is recovered by matching measured transmission-dip
 /// positions to these known resonance energies via the linear TOF relation
 /// `tof_measured = t0 + L_scale · tof_nominal`, which seeds the LM into the
-/// global-minimum basin of the (sharply non-convex, post-#608) calibration χ²
+/// global-minimum basin of the (sharply non-convex, post-) calibration χ²
 /// surface — a basin too thin for a cold start or grid scan to find reliably.
 ///
 /// **Deduplicated**: two resonances at the same center energy
@@ -389,7 +388,7 @@ impl WorkingGridLayout {
 
 /// Working-grid Doppler-broadened cross-sections plus the data-grid map.
 ///
-/// Resolution broadening is **not** applied (issue #442: resolution is applied
+/// Resolution broadening is **not** applied (resolution is applied
 /// to the total transmission after Beer-Lambert).  The caller applies
 /// Beer-Lambert + resolution on [`WorkingGridLayout::energies`] and extracts
 /// the data points last via [`WorkingGridLayout::extract`].
@@ -406,7 +405,7 @@ pub struct WorkingGridXs {
 /// Like [`WorkingGridXs`] but additionally carries `∂σ/∂T` on the working
 /// grid so the analytical Jacobian can form `−T·Σᵢ nᵢ·rᵢ·∂σᵢ/∂T` on the
 /// working grid, resolution-broaden it there, and extract the data points
-/// last (issue #608).
+/// last.
 pub struct WorkingGridXsWithDerivative {
     /// Doppler-broadened σ per isotope, on the working grid.
     pub sigma: Vec<Vec<f64>>,
@@ -680,7 +679,7 @@ pub fn forward_model(
 ///
 /// Returns **Doppler-only** cross-sections.  Resolution broadening is NOT
 /// applied here because it must be applied after Beer-Lambert on the total
-/// transmission for physically correct results (issue #442).
+/// transmission for physically correct results.
 ///
 /// When `instrument` is `Some`, the auxiliary extended grid is still
 /// constructed for Doppler boundary accuracy, but the resolution
@@ -735,11 +734,11 @@ pub fn broadened_cross_sections(
 /// **working grid** (the data grid extended by the kernel's reach, else the
 /// data grid) together with the [`WorkingGridLayout`].
 ///
-/// The spatial production pipeline (`spatial_map_typed`) uses this to pre-store
+/// The counts-domain fit uses this to pre-store
 /// σ on the working grid so each per-pixel `PrecomputedTransmissionModel`
 /// applies Beer-Lambert + resolution on the working grid and extracts the data
-/// points last — matching [`forward_model`] (issue #608).  Resolution is NOT
-/// applied (issue #442).
+/// points last — matching [`forward_model`]. Resolution is NOT
+/// applied.
 pub fn broadened_cross_sections_on_working_grid(
     energies: &[f64],
     resonance_data: &[ResonanceData],
@@ -762,7 +761,7 @@ pub fn broadened_cross_sections_on_working_grid(
     let (work_energies, layout) = working_grid_layout(energies, ext_grid.as_ref());
 
     // Parallelize across isotopes — Doppler broadening for each isotope is
-    // independent.  Resolution is NOT applied here (issue #442: resolution
+    // independent. Resolution is NOT applied here (resolution
     // must be applied after Beer-Lambert on total transmission).  σ is returned
     // on the working grid WITHOUT extracting the data points.
     // Cancellation is checked per-isotope inside the parallel map.
@@ -952,7 +951,7 @@ pub fn unbroadened_cross_sections(
 /// cross-sections.
 ///
 /// Returns **Doppler-only** cross-sections.  Resolution broadening is NOT
-/// applied (issue #442: must be applied after Beer-Lambert on total T).
+/// applied (must be applied after Beer-Lambert on total T).
 ///
 /// Like [`broadened_cross_sections`] but skips the expensive Reich-Moore
 /// calculation (step 1). Use [`unbroadened_cross_sections`] to compute
@@ -967,7 +966,7 @@ pub fn broadened_cross_sections_from_base(
 ) -> Result<Vec<Vec<f64>>, TransmissionError> {
     // Delegate to the working-grid variant and extract the data points.
     // Doppler runs on the working (aux) grid for boundary accuracy; resolution
-    // is NOT applied here (issue #442).  Extracting the data points here keeps
+    // is NOT applied here. Extracting the data points here keeps
     // this function's contract (data-grid σ) unchanged.
     let WorkingGridXs { sigma, layout } = broadened_cross_sections_from_base_on_working_grid(
         energies,
@@ -985,8 +984,8 @@ pub fn broadened_cross_sections_from_base(
 ///
 /// This is the building block the LM fit's cached / precomputed paths use to
 /// apply resolution broadening on the working grid and extract the data points
-/// last — matching [`forward_model`] (issue #608).  Resolution is NOT applied
-/// (issue #442).
+/// last — matching [`forward_model`]. Resolution is NOT applied
+///.
 pub fn broadened_cross_sections_from_base_on_working_grid(
     energies: &[f64],
     base_xs: &[Vec<f64>],
@@ -1009,7 +1008,7 @@ pub fn broadened_cross_sections_from_base_on_working_grid(
     let is_data_point = data_point_mask(ext_grid.as_ref());
     let (work_energies, layout) = working_grid_layout(energies, ext_grid.as_ref());
 
-    // Resolution is NOT applied (issue #442).  Doppler broadening on the
+    // Resolution is NOT applied. Doppler broadening on the
     // working grid, returned WITHOUT extracting the data points.
     let sigma: Result<Vec<Vec<f64>>, TransmissionError> = base_xs
         .par_iter()
@@ -1044,7 +1043,7 @@ pub fn broadened_cross_sections_from_base_on_working_grid(
 /// temperature derivative from precomputed unbroadened cross-sections.
 ///
 /// Returns **Doppler-only** cross-sections and derivatives.  Resolution
-/// broadening is NOT applied (issue #442: must be applied after
+/// broadening is NOT applied (must be applied after
 /// Beer-Lambert on total T).
 ///
 /// Uses `doppler_broaden_with_derivative` for exact ∂σ/∂T in a single pass
@@ -1083,7 +1082,7 @@ pub fn broadened_cross_sections_with_analytical_derivative_from_base(
 ///
 /// The analytical Jacobian uses this so it can form `−T·Σᵢ nᵢ·rᵢ·∂σᵢ/∂T` on
 /// the working grid, resolution-broaden it there, and extract the data points
-/// last (issue #608).  Resolution is NOT applied (issue #442).
+/// last. Resolution is NOT applied.
 pub fn broadened_cross_sections_with_analytical_derivative_from_base_on_working_grid(
     energies: &[f64],
     base_xs: &[Vec<f64>],
@@ -1104,7 +1103,7 @@ pub fn broadened_cross_sections_with_analytical_derivative_from_base_on_working_
 
     // Per-isotope: Doppler broaden with analytical derivative on the WORKING
     // grid, returned WITHOUT extracting the data points.
-    // Resolution is NOT applied (issue #442).
+    // Resolution is NOT applied.
     type IsotopeXsDxs = Result<(Vec<f64>, Vec<f64>), TransmissionError>;
     let results: Vec<IsotopeXsDxs> = base_xs
         .par_iter()
@@ -1150,7 +1149,7 @@ pub fn broadened_cross_sections_with_analytical_derivative_from_base_on_working_
 /// Compute a transmission spectrum from precomputed unbroadened cross-sections.
 ///
 /// Applies Doppler broadening and Beer-Lambert using cached base XS, then
-/// resolution broadening on the total transmission (issue #442).  This skips
+/// resolution broadening on the total transmission. This skips
 /// the expensive Reich-Moore calculation, making it suitable for use inside
 /// `TransmissionFitModel::evaluate()` when temperature is a free parameter.
 ///
@@ -1159,7 +1158,6 @@ pub fn broadened_cross_sections_with_analytical_derivative_from_base_on_working_
 /// broadening have adequate quadrature support and correct boundary handling;
 /// the data-grid points are extracted LAST.  This mirrors the non-cached
 /// [`forward_model`] and [`broadened_cross_sections_for_transmission`] exactly
-/// — previously this cached path collapsed σ to the coarse data grid before
 /// resolution broadening, degrading the convolution near the grid edges and
 /// around narrow resonances.
 ///
@@ -1226,7 +1224,7 @@ pub fn forward_model_from_base_xs(
     };
 
     // Step 1: per-isotope Doppler-broadened σ on the WORKING (extended) grid.
-    // Resolution is NOT applied here (issue #442) — it goes on total T below.
+    // Resolution is NOT applied here — it goes on total T below.
     let doppler_xs: Result<Vec<Vec<f64>>, TransmissionError> = base_xs
         .par_iter()
         .zip(resonance_data.par_iter())
@@ -1282,7 +1280,7 @@ mod tests {
     use nereids_endf::resonance::test_support::u238_single_resonance;
     use nereids_endf::resonance::{LGroup, Resonance, ResonanceFormalism, ResonanceRange};
 
-    /// Issue #608 R2: the spatial pipeline builds the working-grid σ
+    /// The spatial pipeline builds the working-grid σ
     /// (`broadened_cross_sections_on_working_grid`) and the shared layout
     /// (`resolution_working_grid`) via SEPARATE calls — they must produce
     /// bit-identical layouts, or per-pixel σ and the shared layout would
@@ -1823,7 +1821,7 @@ mod tests {
         }
     }
 
-    /// Regression test for issue #442: resolution broadening must be applied
+    /// Regression test for resolution broadening must be applied
     /// to the total transmission T(E) AFTER Beer-Lambert, not to σ(E) before.
     ///
     /// This test constructs the expected result from first principles:
@@ -1923,7 +1921,7 @@ mod tests {
         );
     }
 
-    /// Issue #442 containment: `broadened_cross_sections()` must return
+    /// containment: `broadened_cross_sections` must return
     /// Doppler-only σ even when `instrument` is `Some`.  Resolution
     /// broadening must NOT be applied inside this function.
     #[test]
@@ -1990,7 +1988,7 @@ mod tests {
         );
     }
 
-    /// Issue #442 containment: `broadened_cross_sections_from_base()` must
+    /// containment: `broadened_cross_sections_from_base` must
     /// return Doppler-only σ even when `instrument` is `Some`.
     #[test]
     fn test_broadened_from_base_is_doppler_only_with_instrument() {
@@ -2047,9 +2045,9 @@ mod tests {
         );
     }
 
-    // ── Issue #442 Step 5: forward_model_from_base_xs resolution ordering ──
+    // ── forward_model_from_base_xs resolution ordering ──
 
-    /// Issue #442 Step 5: `forward_model_from_base_xs()` with resolution must
+    /// `forward_model_from_base_xs` with resolution must
     /// match `forward_model()` with resolution for the same sample.
     #[test]
     fn test_forward_model_from_base_xs_matches_forward_model_with_resolution() {
@@ -2118,7 +2116,7 @@ mod tests {
         );
     }
 
-    /// Issue #442 Step 5: `forward_model_from_base_xs()` without resolution
+    /// `forward_model_from_base_xs` without resolution
     /// must remain unchanged (matches existing no-resolution test).
     #[test]
     fn test_forward_model_from_base_xs_no_resolution_unchanged() {
@@ -2151,9 +2149,9 @@ mod tests {
         }
     }
 
-    // ── Issue #442 Step 7: derivative helper containment ───────────────────
+    // ── derivative helper containment ──────────────────────
 
-    /// Issue #442 Step 7: `broadened_cross_sections_with_analytical_derivative_from_base()`
+    /// `broadened_cross_sections_with_analytical_derivative_from_base`
     /// must return Doppler-only σ and Doppler-only ∂σ/∂T even when instrument
     /// is present.  Resolution broadening must NOT be applied inside.
     #[test]
@@ -2227,7 +2225,7 @@ mod tests {
         );
     }
 
-    /// Issue #442 Step 7: derivative helper without resolution must be
+    /// Derivative helper without resolution must be
     /// unchanged — same σ and ∂σ/∂T as before.
     #[test]
     fn test_derivative_helper_no_resolution_unchanged() {
@@ -2323,7 +2321,7 @@ mod tests {
         assert!(ok.is_ok(), "valid thickness should succeed: {ok:?}");
     }
 
-    /// Issue #608: the working-grid `*_from_base` path's
+    /// the working-grid `*_from_base` path's
     /// input validation — `validate_base_xs` shape errors and the unsorted-grid
     /// guard.  These error branches were untested (the temperature fit always
     /// supplies well-formed, sorted inputs).

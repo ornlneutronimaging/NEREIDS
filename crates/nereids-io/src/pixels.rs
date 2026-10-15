@@ -1,218 +1,16 @@
-//! Transmission normalization from raw neutron counts.
+//! Data-quality pixel masks and per-pixel spectrum extraction.
 //!
-//! Converts raw sample and open-beam (OB) neutron counts into a transmission
-//! spectrum, following the ORNL Method 2 approach used in PLEIADES.
+//! The boolean masks exclude pixels whose data stream is broken, so they are
+//! never fitted.  They are not a coverage or low-count filter: low-count
+//! pixels are alive and the counts likelihood handles them.
 //!
-//! ## Method 2 Normalization
-//!
-//! For each TOF bin and pixel:
-//!
-//!   T[tof, y, x] = (C_sample / C_ob) × (PC_ob / PC_sample)
-//!
-//! where:
-//! - C_sample = raw sample counts (dark-current subtracted)
-//! - C_ob = open-beam counts (dark-current subtracted)
-//! - PC_sample = proton charge for sample run
-//! - PC_ob = proton charge for open-beam run
-//!
-//! The proton charge ratio corrects for different beam exposures.
-//!
-//! ## Uncertainty
-//!
-//! Assuming Poisson counting statistics:
-//!
-//!   σ_T / T = √(1/C_sample + 1/C_ob)
-//!
-//! ## Pixel masks — pipeline integrity only
-//!
-//! The boolean masks produced by [`detect_dead_pixels`],
-//! [`detect_dead_pixels_chunked`], [`detect_hot_pixels`], and
-//! [`detect_bad_pixels`] exist for exactly one purpose: excluding pixels
-//! whose data stream is broken in a way that would corrupt the downstream
-//! pipeline.  Downstream, a mask is a hard exclude — masked pixels are never
-//! fitted and appear as NaN in every result map (`nereids-pipeline`'s
-//! `spatial_map_typed` skips them entirely; see
-//! `crates/nereids-pipeline/src/spatial.rs`).
-//!
-//! The masks are **not** a data-quality or coverage filter:
-//!
-//! - **Low-count pixels are alive and MUST be kept.**  KL-domain fitting
-//!   handles them correctly; a statistical low-count screen was measured to
-//!   reject 13% of an ROI essentially at random (IPTS-37432).
-//! - **Coverage / thickness inhomogeneity is a model concern** (free density
-//!   per region), never a masking concern.
-//! - Deadness/hotness is per-acquisition, so always union the sample and
-//!   open-beam masks — [`detect_bad_pixels`] does this.
-//!
-//! See issue #643 for the methodology discussion.
-//!
-//! ## PLEIADES Reference
-//! - `processing/normalization_ornl.py` — Method 2 implementation
+//! Deadness is per acquisition, so always union the sample and open-beam
+//! masks; [`detect_bad_pixels`] does this.
 
 use ndarray::{Array1, Array2, Array3, Axis, Zip};
 
 use crate::error::IoError;
 
-/// Parameters for transmission normalization.
-#[derive(Debug, Clone)]
-pub struct NormalizationParams {
-    /// Proton charge for the sample measurement.
-    pub proton_charge_sample: f64,
-    /// Proton charge for the open-beam measurement.
-    pub proton_charge_ob: f64,
-}
-
-/// Result of normalization: transmission and its uncertainty.
-#[derive(Debug)]
-pub struct NormalizedData {
-    /// Transmission values, shape (n_tof, height, width).
-    pub transmission: Array3<f64>,
-    /// Uncertainty on transmission, shape (n_tof, height, width).
-    pub uncertainty: Array3<f64>,
-}
-
-/// Normalize raw data to transmission using Method 2.
-///
-/// T = (C_sample / C_ob) × (PC_ob / PC_sample)
-///
-/// # Arguments
-/// * `sample` — Raw sample counts, shape (n_tof, height, width).
-/// * `open_beam` — Open-beam counts, shape (n_tof, height, width).
-/// * `params` — Normalization parameters (proton charges).
-/// * `dark_current` — Optional dark-current image to subtract, shape (height, width).
-///   If provided, it is subtracted from each TOF frame of both sample and OB.
-///
-/// # Returns
-/// Normalized transmission and uncertainty arrays.
-pub fn normalize(
-    sample: &Array3<f64>,
-    open_beam: &Array3<f64>,
-    params: &NormalizationParams,
-    dark_current: Option<&ndarray::Array2<f64>>,
-) -> Result<NormalizedData, IoError> {
-    if sample.shape() != open_beam.shape() {
-        return Err(IoError::ShapeMismatch(format!(
-            "Sample shape {:?} != open-beam shape {:?}",
-            sample.shape(),
-            open_beam.shape()
-        )));
-    }
-
-    if !(params.proton_charge_sample > 0.0
-        && params.proton_charge_sample.is_finite()
-        && params.proton_charge_ob > 0.0
-        && params.proton_charge_ob.is_finite())
-    {
-        return Err(IoError::InvalidParameter(
-            "Proton charges must be finite and positive".into(),
-        ));
-    }
-
-    if let Some(dc) = dark_current {
-        let dc_shape = dc.shape();
-        let s_shape = sample.shape();
-        if dc_shape[0] != s_shape[1] || dc_shape[1] != s_shape[2] {
-            return Err(IoError::ShapeMismatch(format!(
-                "dark_current shape {:?} != spatial dimensions ({}, {})",
-                dc_shape, s_shape[1], s_shape[2],
-            )));
-        }
-    }
-
-    // Reject non-finite / negative raw counts up front.  These are detector
-    // counts (and a dark-current estimate), so a NaN or a negative value
-    // signals an upstream loader / TOF-normalisation bug.  Validating here —
-    // rather than letting the per-bin `(x - dc).max(0.0)` clamp below absorb
-    // it — is the whole point of this guard: `NaN.max(0.0) == 0.0` would have
-    // silently turned a corrupt frame into a plausible "zero counts" bin,
-    // exactly the masking the sibling `nereids_fitting::joint_poisson`
-    // `validate_counts` exists to prevent.
-    validate_counts(sample, "sample")?;
-    validate_counts(open_beam, "open_beam")?;
-    if let Some(dc) = dark_current {
-        validate_counts(dc, "dark_current")?;
-    }
-
-    let shape = sample.shape();
-    let (n_tof, height, width) = (shape[0], shape[1], shape[2]);
-
-    let pc_ratio = params.proton_charge_ob / params.proton_charge_sample;
-
-    let mut transmission = Array3::<f64>::zeros((n_tof, height, width));
-    let mut uncertainty = Array3::<f64>::zeros((n_tof, height, width));
-
-    for t in 0..n_tof {
-        for y in 0..height {
-            for x in 0..width {
-                // Dark-current subtraction.  The DC noise contribution to
-                // the uncertainty is omitted — Var(DC) is not included in
-                // the error propagation below.  This is acceptable when DC
-                // is small relative to signal counts (typical for VENUS MCP
-                // detectors), but underestimates σ_T for very low-signal bins
-                // where DC is comparable to the sample or OB counts.
-                //
-                // Inputs are validated finite & non-negative above, so the
-                // subtraction is always finite here; the only way it can go
-                // negative is the legitimate `dc > counts` low-count noise
-                // case (the DC estimate overshoots the measured counts in a
-                // single bin).  Floor that physical edge at 0 — this is NOT
-                // masking bad input (a NaN / negative loader bug was already
-                // rejected), it is the Method-2 convention for a dark-frame
-                // estimate that exceeds the raw counts.
-                let dc = dark_current.map_or(0.0, |dc| dc[[y, x]]);
-                let c_s = (sample[[t, y, x]] - dc).max(0.0);
-                let c_o = (open_beam[[t, y, x]] - dc).max(0.0);
-
-                if c_o > 0.0 {
-                    let t_val = (c_s / c_o) * pc_ratio;
-                    transmission[[t, y, x]] = t_val;
-
-                    // Poisson uncertainty via absolute error propagation.
-                    //
-                    // σ_T = pc_ratio / c_o * √(c_s_eff + c_s² / c_o)
-                    //
-                    // where c_s_eff is the Bayesian floor (Jeffreys prior,
-                    // 0.5 counts) when c_s == 0.  This formula follows from
-                    // propagating Var(c_s)=c_s_eff and Var(c_o)=c_o through
-                    // T = (c_s / c_o) * pc_ratio.
-                    //
-                    // Unlike the relative-error form σ_T = T * √(1/c_s + 1/c_o),
-                    // this absolute form produces σ > 0 even when c_s == 0 (T == 0),
-                    // ensuring downstream weighted fits never see zero uncertainty.
-                    //
-                    // NOTE: c_o is always > 0 here (we are inside the if branch),
-                    // so the old `c_o_eff` dead-code branch is removed.
-                    let c_s_eff = if c_s > 0.0 { c_s } else { 0.5 };
-                    let abs_var_t = (pc_ratio / c_o).powi(2) * (c_s_eff + c_s * c_s / c_o);
-                    uncertainty[[t, y, x]] = abs_var_t.sqrt();
-                } else {
-                    // No open-beam counts: mark as invalid
-                    transmission[[t, y, x]] = 0.0;
-                    uncertainty[[t, y, x]] = f64::INFINITY;
-                }
-            }
-        }
-    }
-
-    Ok(NormalizedData {
-        transmission,
-        uncertainty,
-    })
-}
-
-/// Reject a raw-counts array that contains a non-finite or negative value.
-///
-/// Detector counts are non-negative by construction (zero is legitimate), so a
-/// NaN, ±∞, or negative entry signals an upstream loader / normalisation bug
-/// that must be surfaced rather than silently clamped.  Reports the first
-/// offending flat index and value.
-///
-/// The finite-&-non-negative invariant itself lives in
-/// [`nereids_core::validation::first_non_finite_or_negative`] so that the
-/// `nereids-fitting` joint-Poisson and this I/O loader enforce *identical*
-/// semantics (`NaN < 0.0` is `false`, so the check pairs `is_finite()` with
-/// the order comparison); this wrapper only maps the offending element onto
-/// the `IoError` message wording.
 fn validate_counts<D: ndarray::Dimension>(
     counts: &ndarray::ArrayBase<impl ndarray::Data<Elem = f64>, D>,
     field: &str,
@@ -833,151 +631,6 @@ pub fn detect_bad_pixels(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use ndarray::Array2;
-
-    #[test]
-    fn test_normalize_equal_charges() {
-        // Equal proton charges, PC ratio = 1
-        // C_s = 50, C_o = 100 → T = 0.5
-        let sample = Array3::from_elem((1, 1, 1), 50.0);
-        let ob = Array3::from_elem((1, 1, 1), 100.0);
-        let params = NormalizationParams {
-            proton_charge_sample: 1.0,
-            proton_charge_ob: 1.0,
-        };
-
-        let result = normalize(&sample, &ob, &params, None).unwrap();
-        assert!((result.transmission[[0, 0, 0]] - 0.5).abs() < 1e-10);
-
-        // Uncertainty: σ_T = T × √(1/50 + 1/100) = 0.5 × √(0.03) ≈ 0.0866
-        let expected_unc = 0.5 * (1.0 / 50.0 + 1.0 / 100.0_f64).sqrt();
-        assert!(
-            (result.uncertainty[[0, 0, 0]] - expected_unc).abs() < 1e-10,
-            "got {}, expected {}",
-            result.uncertainty[[0, 0, 0]],
-            expected_unc,
-        );
-    }
-
-    #[test]
-    fn test_normalize_proton_charge_correction() {
-        // PC_sample = 2, PC_ob = 1 → ratio = 0.5
-        // C_s = 100, C_o = 100 → T = 1.0 × 0.5 = 0.5
-        let sample = Array3::from_elem((1, 1, 1), 100.0);
-        let ob = Array3::from_elem((1, 1, 1), 100.0);
-        let params = NormalizationParams {
-            proton_charge_sample: 2.0,
-            proton_charge_ob: 1.0,
-        };
-
-        let result = normalize(&sample, &ob, &params, None).unwrap();
-        assert!((result.transmission[[0, 0, 0]] - 0.5).abs() < 1e-10);
-    }
-
-    #[test]
-    fn test_normalize_with_dark_current() {
-        // C_s_raw = 60, C_o_raw = 110, DC = 10
-        // C_s = 50, C_o = 100 → T = 0.5
-        let sample = Array3::from_elem((1, 1, 1), 60.0);
-        let ob = Array3::from_elem((1, 1, 1), 110.0);
-        let dc = Array2::from_elem((1, 1), 10.0);
-        let params = NormalizationParams {
-            proton_charge_sample: 1.0,
-            proton_charge_ob: 1.0,
-        };
-
-        let result = normalize(&sample, &ob, &params, Some(&dc)).unwrap();
-        assert!((result.transmission[[0, 0, 0]] - 0.5).abs() < 1e-10);
-    }
-
-    #[test]
-    fn test_normalize_zero_ob() {
-        // Zero open-beam counts → T = 0, uncertainty = INF
-        let sample = Array3::from_elem((1, 1, 1), 50.0);
-        let ob = Array3::from_elem((1, 1, 1), 0.0);
-        let params = NormalizationParams {
-            proton_charge_sample: 1.0,
-            proton_charge_ob: 1.0,
-        };
-
-        let result = normalize(&sample, &ob, &params, None).unwrap();
-        assert_eq!(result.transmission[[0, 0, 0]], 0.0);
-        assert!(result.uncertainty[[0, 0, 0]].is_infinite());
-    }
-
-    #[test]
-    fn test_normalize_shape_mismatch() {
-        let sample = Array3::from_elem((2, 3, 4), 1.0);
-        let ob = Array3::from_elem((2, 3, 5), 1.0);
-        let params = NormalizationParams {
-            proton_charge_sample: 1.0,
-            proton_charge_ob: 1.0,
-        };
-
-        let result = normalize(&sample, &ob, &params, None);
-        assert!(result.is_err());
-    }
-
-    #[test]
-    fn test_normalize_rejects_nan_sample() {
-        // A NaN in the sample frame used to be swallowed by
-        // `(NaN - 0).max(0.0) == 0.0`, silently producing T = 0 as if the
-        // bin had genuinely zero counts.  It must now be rejected up front.
-        let mut sample = Array3::from_elem((1, 1, 1), 50.0);
-        sample[[0, 0, 0]] = f64::NAN;
-        let ob = Array3::from_elem((1, 1, 1), 100.0);
-        let params = NormalizationParams {
-            proton_charge_sample: 1.0,
-            proton_charge_ob: 1.0,
-        };
-        let err = normalize(&sample, &ob, &params, None).unwrap_err();
-        assert!(
-            matches!(err, IoError::InvalidParameter(_)),
-            "expected InvalidParameter, got {err:?}"
-        );
-        assert!(err.to_string().contains("sample"));
-    }
-
-    #[test]
-    fn test_normalize_rejects_negative_sample() {
-        // Negative raw counts (loader bug) used to be clamped to 0.
-        let mut sample = Array3::from_elem((1, 1, 1), 50.0);
-        sample[[0, 0, 0]] = -5.0;
-        let ob = Array3::from_elem((1, 1, 1), 100.0);
-        let params = NormalizationParams {
-            proton_charge_sample: 1.0,
-            proton_charge_ob: 1.0,
-        };
-        let err = normalize(&sample, &ob, &params, None).unwrap_err();
-        assert!(err.to_string().contains("sample"));
-    }
-
-    #[test]
-    fn test_normalize_rejects_nan_open_beam() {
-        let sample = Array3::from_elem((1, 1, 1), 50.0);
-        let mut ob = Array3::from_elem((1, 1, 1), 100.0);
-        ob[[0, 0, 0]] = f64::INFINITY;
-        let params = NormalizationParams {
-            proton_charge_sample: 1.0,
-            proton_charge_ob: 1.0,
-        };
-        let err = normalize(&sample, &ob, &params, None).unwrap_err();
-        assert!(err.to_string().contains("open_beam"));
-    }
-
-    #[test]
-    fn test_normalize_rejects_negative_dark_current() {
-        let sample = Array3::from_elem((1, 1, 1), 60.0);
-        let ob = Array3::from_elem((1, 1, 1), 110.0);
-        let mut dc = Array2::from_elem((1, 1), 10.0);
-        dc[[0, 0]] = -1.0;
-        let params = NormalizationParams {
-            proton_charge_sample: 1.0,
-            proton_charge_ob: 1.0,
-        };
-        let err = normalize(&sample, &ob, &params, Some(&dc)).unwrap_err();
-        assert!(err.to_string().contains("dark_current"));
-    }
 
     #[test]
     fn test_extract_spectrum() {
@@ -1013,119 +666,6 @@ mod tests {
     }
 
     #[test]
-    fn test_normalize_zero_sample_counts() {
-        // Zero sample counts should produce finite (not NaN) uncertainty
-        // thanks to the Bayesian floor of 0.5.
-        let sample = Array3::from_elem((1, 1, 1), 0.0);
-        let ob = Array3::from_elem((1, 1, 1), 100.0);
-        let params = NormalizationParams {
-            proton_charge_sample: 1.0,
-            proton_charge_ob: 1.0,
-        };
-
-        let result = normalize(&sample, &ob, &params, None).unwrap();
-        assert_eq!(result.transmission[[0, 0, 0]], 0.0);
-        assert!(
-            result.uncertainty[[0, 0, 0]].is_finite(),
-            "uncertainty should be finite for zero sample counts, got {}",
-            result.uncertainty[[0, 0, 0]]
-        );
-        assert!(
-            result.uncertainty[[0, 0, 0]] > 0.0,
-            "uncertainty should be strictly positive for zero sample counts (Bayesian floor), got {}",
-            result.uncertainty[[0, 0, 0]]
-        );
-    }
-
-    #[test]
-    fn test_normalize_zero_open_beam() {
-        // Zero OB counts should produce infinite uncertainty (marking
-        // the pixel as invalid), and the uncertainty must not be NaN.
-        let sample = Array3::from_elem((1, 1, 1), 50.0);
-        let ob = Array3::from_elem((1, 1, 1), 0.0);
-        let params = NormalizationParams {
-            proton_charge_sample: 1.0,
-            proton_charge_ob: 1.0,
-        };
-
-        let result = normalize(&sample, &ob, &params, None).unwrap();
-        assert_eq!(result.transmission[[0, 0, 0]], 0.0);
-        assert!(
-            !result.uncertainty[[0, 0, 0]].is_nan(),
-            "uncertainty must not be NaN for zero OB counts"
-        );
-        assert!(
-            result.uncertainty[[0, 0, 0]].is_infinite(),
-            "uncertainty should be infinite for zero OB counts"
-        );
-    }
-
-    #[test]
-    fn test_normalize_dark_current_shape_mismatch() {
-        let sample = Array3::from_elem((2, 3, 4), 1.0);
-        let ob = Array3::from_elem((2, 3, 4), 1.0);
-        let dc = Array2::from_elem((2, 4), 0.0); // wrong shape
-        let params = NormalizationParams {
-            proton_charge_sample: 1.0,
-            proton_charge_ob: 1.0,
-        };
-
-        let result = normalize(&sample, &ob, &params, Some(&dc));
-        assert!(
-            result.is_err(),
-            "should reject mismatched dark_current shape"
-        );
-    }
-
-    /// Verify that σ > 0 for zero sample counts ensures finite LM weight.
-    /// This is the Bayesian floor guarantee: weight = 1/σ² must not be ∞.
-    #[test]
-    fn test_normalize_zero_sample_produces_finite_lm_weight() {
-        let sample = Array3::from_elem((5, 1, 1), 0.0);
-        let ob = Array3::from_elem((5, 1, 1), 500.0);
-        let params = NormalizationParams {
-            proton_charge_sample: 1.0,
-            proton_charge_ob: 1.0,
-        };
-
-        let result = normalize(&sample, &ob, &params, None).unwrap();
-        for t in 0..5 {
-            let sigma = result.uncertainty[[t, 0, 0]];
-            assert!(
-                sigma.is_finite() && sigma > 0.0,
-                "σ must be finite and positive at T=0, got {sigma}"
-            );
-            let weight = 1.0 / (sigma * sigma);
-            assert!(
-                weight.is_finite(),
-                "LM weight 1/σ² must be finite at T=0, got {weight}"
-            );
-        }
-    }
-
-    /// Verify uncertainty at low OB counts is finite and well-behaved.
-    #[test]
-    fn test_normalize_low_ob_counts() {
-        // OB = 2 counts: very low but nonzero
-        let sample = Array3::from_elem((1, 1, 1), 1.0);
-        let ob = Array3::from_elem((1, 1, 1), 2.0);
-        let params = NormalizationParams {
-            proton_charge_sample: 1.0,
-            proton_charge_ob: 1.0,
-        };
-
-        let result = normalize(&sample, &ob, &params, None).unwrap();
-        let sigma = result.uncertainty[[0, 0, 0]];
-        assert!(sigma.is_finite() && sigma > 0.0, "σ = {sigma}");
-        // σ should be large relative to T (very noisy at low counts)
-        let t = result.transmission[[0, 0, 0]];
-        assert!(
-            sigma > 0.1 * t,
-            "σ should be a significant fraction of T at low OB counts: σ={sigma}, T={t}"
-        );
-    }
-
-    #[test]
     fn test_detect_dead_pixels() {
         let mut data = Array3::<f64>::zeros((3, 2, 2));
         // Pixel (0,0) is dead (all zeros)
@@ -1144,7 +684,7 @@ mod tests {
 
     #[test]
     fn test_detect_dead_pixels_chunked_catches_intermittent() {
-        // ACCEPTANCE (#643): pixel (0, 1) is dead throughout chunk 0 but
+        // ACCEPTANCE: pixel (0, 1) is dead throughout chunk 0 but
         // alive in chunk 1 — intermittent deadness that corrupts the
         // combined spectrum.
         let mut chunk0 = Array3::from_elem((3, 2, 2), 5.0);
@@ -1172,7 +712,7 @@ mod tests {
 
     #[test]
     fn test_detect_dead_pixels_chunked_low_count_alive_not_flagged() {
-        // ACCEPTANCE (#643): a pixel with a single count per chunk is alive
+        // ACCEPTANCE: a pixel with a single count per chunk is alive
         // and must be kept — masks are pipeline-integrity only, never a
         // low-count screen.
         let mut chunk0 = Array3::from_elem((4, 2, 2), 5.0);
@@ -1234,7 +774,7 @@ mod tests {
 
     #[test]
     fn test_detect_hot_pixels_catches_railed() {
-        // ACCEPTANCE (#643): a railed pixel (65535 counts/bin) amid a
+        // ACCEPTANCE: a railed pixel (65535 counts/bin) amid a
         // realistic slightly varying background (~100/bin) is flagged;
         // its neighbors are not.
         let mut data = Array3::<f64>::zeros((4, 3, 3));
@@ -1263,7 +803,7 @@ mod tests {
 
     #[test]
     fn test_detect_hot_pixels_low_count_alive_not_flagged() {
-        // ACCEPTANCE (#643) — the 13%-rejection regression guard: a pixel
+        // ACCEPTANCE — the 13%-rejection regression guard: a pixel
         // with 1 total count amid ~300-count pixels is low-count-ALIVE and
         // must be kept.  The screen is upper-tail only.
         let mut data = Array3::from_elem((3, 3, 3), 100.0);
@@ -1309,7 +849,7 @@ mod tests {
     }
 
     /// Build the 8×8 single-TOF-bin two-moat fixture for the stage-1
-    /// robust-scale tests (#646 review R4, P1-2): two 3×3 all-dead moats
+    /// robust-scale tests ( P1-2): two 3×3 all-dead moats
     /// (rows 1–3 × cols 1–3 and rows 4–6 × cols 4–6) with a `probe` at
     /// (2,2) and a `control` at (5,5) in their centers, and the remaining
     /// 46 pixels filled row-major with `n_a` × `a` then (46 − n_a) × `b`.
@@ -1346,7 +886,7 @@ mod tests {
         data
     }
 
-    /// #646 review R4, P1-2 (1/3): the robust-MAD branch of the stage-1
+    /// P1-2 (1/3): the robust-MAD branch of the stage-1
     /// scale `sigma = max(MAD_TO_SIGMA·mad, exp(−med/2))` DECIDES an
     /// outcome.  Every earlier test drove sigma through the Poisson
     /// floor (uniform/quantized backgrounds → mad = 0), so a mutation of
@@ -1387,7 +927,7 @@ mod tests {
         assert_eq!(mask.iter().filter(|&&m| m).count(), 1);
     }
 
-    /// #646 review R4, P1-2 (2/3) — crossover pin, MAD term just ABOVE
+    /// P1-2 (2/3) — crossover pin, MAD term just ABOVE
     /// the Poisson floor: `max()` must pick the MAD branch.
     ///
     /// Fixture: 24 × A = 100/1.08, 22 × B = 108 (A·B = 10⁴ →
@@ -1418,7 +958,7 @@ mod tests {
         assert_eq!(mask.iter().filter(|&&m| m).count(), 1);
     }
 
-    /// #646 review R4, P1-2 (3/3) — crossover pin, MAD term just BELOW
+    /// P1-2 (3/3) — crossover pin, MAD term just BELOW
     /// the Poisson floor: `max()` must pick the floor.
     ///
     /// Fixture: 24 × A = 100/1.06, 22 × B = 106 (med = ln 100 =
@@ -1475,7 +1015,7 @@ mod tests {
 
     #[test]
     fn test_detect_hot_pixels_bimodal_bright_region_not_flagged() {
-        // THE PR-#646 P0 regression guard.  Dark-majority bimodal scene:
+        // THE PR- P0 regression guard. Dark-majority bimodal scene
         // 60 % of the FOV at 50 counts (sample), a contiguous 40 % bright
         // region at 5000 counts (open beam past the sample edge).  The dark
         // population holds the median (med = ln 50) and the MAD is 0 (both
@@ -1551,7 +1091,7 @@ mod tests {
 
     #[test]
     fn test_detect_hot_pixels_2x2_railed_cluster_fully_caught() {
-        // Fixpoint acceptance (#646 review R2, F1): a 2×2 railed cluster
+        // Fixpoint acceptance ( F1): a 2×2 railed cluster
         // has no interior — every pixel keeps 5 background neighbors of 8,
         // so the whole cluster is caught in the first pass.  Regression
         // guard for the smallest ≥2-px-wide cluster.
@@ -1579,7 +1119,7 @@ mod tests {
 
     #[test]
     fn test_detect_hot_pixels_3x3_railed_blob_fully_caught() {
-        // Fixpoint acceptance (#646 review R2, F1) — THE erosion proof.
+        // Fixpoint acceptance ( F1) — THE erosion proof.
         // A 3×3 railed blob: pass 1 flags only the 4 corners (5 background
         // neighbors each); the edge centers (3 bg + 5 railed) and the
         // interior (8 railed) are refuted by a single pass — the
@@ -1614,7 +1154,7 @@ mod tests {
 
     #[test]
     fn test_detect_hot_pixels_2px_wide_railed_column_fully_caught() {
-        // Fixpoint acceptance (#646 review R2, F1): the interior of a
+        // Fixpoint acceptance ( F1): the interior of a
         // 2-px-wide railed column (3 bg + 5 railed neighbors per interior
         // pixel) was invisible to the single pass — only the 4 end pixels
         // (5 bg neighbors each) flagged.  The fixpoint erodes the column
@@ -1646,7 +1186,7 @@ mod tests {
 
     #[test]
     fn test_detect_hot_pixels_edge_to_edge_2px_band_not_flagged_by_design() {
-        // Documented-limitation pin (#646 review R3, F1): an EDGE-TO-EDGE
+        // Documented-limitation pin ( F1): an EDGE-TO-EDGE
         // railed band ≥2 px wide (both ends off-detector) exposes no end
         // cap or convex corner, so the erosion has no seed — interior
         // band pixels keep 3 bg + 5 railed neighbors (median railed) and
@@ -1677,7 +1217,7 @@ mod tests {
 
     #[test]
     fn test_detect_hot_pixels_2px_band_one_end_on_detector_fully_caught() {
-        // Companion to the edge-to-edge pin (#646 review R3, F1): the
+        // Companion to the edge-to-edge pin ( F1): the
         // same 2-row railed band, but with ONE end cap inside the
         // detector.  The two cap pixels keep 5 bg + 3 railed neighbors
         // (median bg) and seed in pass 1; the fixpoint then erodes the
@@ -1707,7 +1247,7 @@ mod tests {
 
     #[test]
     fn test_detect_hot_pixels_full_railed_column_caught() {
-        // Regression (#646 review R2, F1 test 3): a full-height 1-px railed
+        // Regression ( F1 test 3): a full-height 1-px railed
         // column — every pixel keeps ≥4 background neighbors, so the whole
         // line is caught in pass 1, exactly as before the fixpoint.
         let mut data = Array3::from_elem((4, 7, 7), 100.0);
@@ -1730,7 +1270,7 @@ mod tests {
 
     #[test]
     fn test_detect_hot_pixels_large_psf_bright_region_not_eroded() {
-        // Fixpoint safety (#646 review R2, F1 test 5): a LARGE bright scene
+        // Fixpoint safety ( F1 test 5): a LARGE bright scene
         // region — 20×20 core at 100× background — with the ≥2-px PSF edge
         // blur that real VENUS scene features have (adjacent-pixel ratios
         // ≤5× through a 2-px transition ring: 100 → 400 → 2000 → 10000).
@@ -1766,7 +1306,7 @@ mod tests {
     #[test]
     fn test_detect_hot_pixels_hard_edged_bright_rectangle_corners_only() {
         // Pins the documented convex-corner caveat AND the fixpoint
-        // no-propagation property (#646 review R2).  A hard-edged (0-px
+        // no-propagation property. A hard-edged (0-px
         // transition) 20×20 region at 100× background: each sharp convex
         // corner pixel sees only 3 same-side neighbors (median falls on
         // the dark side) and flags — pre-existing single-pass behavior,
@@ -1797,7 +1337,7 @@ mod tests {
 
     #[test]
     fn test_detect_hot_pixels_1px_bright_line_flagged_by_design() {
-        // Width-1 limitation pin (#646 review R2, F3 — user-decided:
+        // Width-1 limitation pin ( F3 — user-decided
         // document + pin, no connected-component machinery).  A 1-px-wide
         // bright SCENE line at ≥10× local contrast is spatially
         // indistinguishable from a railed line and IS masked — the

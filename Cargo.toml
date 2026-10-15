@@ -44,75 +44,33 @@ tiff = "0.11"
 image = "0.25"
 pyo3 = { version = "0.29", features = ["extension-module"] }
 numpy = "0.29"
-# eframe 0.34 made `wgpu` the default renderer and moved `glow` to opt-in.
-# We render with glow (Renderer::Glow in main.rs) and DROP wgpu entirely
-# (default-features = false + explicit features): under glow, wgpu is dead
-# weight, its wgpu-hal Direct3D12 backend fails to build on Windows (a
-# windows-core 0.61/0.62 trait conflict), and it bloats the manylinux wheel.
-# This mirrors what eframe 0.33 shipped (glow, no wgpu).
-# CAVEAT (wheel): eframe pulls egui-winit/winit with default-features = false,
-# so the ONLY source of winit's wayland-dlopen is eframe's own default
-# `winit/default` entry — which default-features = false drops. eframe's
-# `wayland`/`x11` features map to winit/wayland|x11 (hard-link), NOT the dlopen
-# variant. libwayland must stay dlopen'ed (not linked) or the wheel re-vendors
-# it (see scripts/check_wheel_policy.sh), so wayland-dlopen is restored by a
-# direct Linux-only `winit` dep in apps/gui/Cargo.toml. Do NOT drop that winit
-# dep, and do NOT re-enable wgpu.
+# glow renderer, no wgpu (its D3D12 backend fails to build on Windows); do not
+# re-enable wgpu. libwayland must stay dlopen'ed: restore it with the direct
+# Linux-only winit dep in apps/gui/Cargo.toml; do not drop that dep.
 eframe = { version = "0.34", default-features = false, features = ["accesskit", "default_fonts", "glow", "persistence", "wayland", "x11"] }
 egui = "0.34"
 egui_extras = { version = "0.34", features = ["image", "svg"] }
 egui_plot = "0.35"
-# Native file dialogs. default-features = false retires the gtk3 backend
-# permanently: rfd's gtk3 feature pins gtk-sys's v3_24 feature
-# (gtk+-3.0 >= 3.24 at BUILD time), which forced the Linux wheel from
-# manylinux_2_28 (AlmaLinux 8: GTK 3.22, glibc 2.28 — the ORNL RHEL 8
-# floor) up to manylinux_2_34 AND made maturin vendor a fragile
-# 64-library GTK stack into the wheel (0.2.0 yank, 0.2.1 glibc bump).
-# The portal backend has no link-time C deps (dlopens libdbus, zenity
-# CLI fallback) and the GUI adds a pure-egui in-app fallback tier.
-# Do NOT re-enable "gtk3". Per-target features live in apps/gui/Cargo.toml.
-# EXACT-VERSION PIN: the GUI's dialog-failure classification is coupled
-# to rfd 0.17.2's log message wording and module paths — the zenity
-# end-of-chain discriminator in `FileDialogs::apply_native_outcome`
-# (apps/gui/src/file_dialog.rs) and the error latch
-# (apps/gui/src/logging.rs) match strings emitted from rfd's
-# src/backend/xdg_desktop_portal.rs and
-# src/backend/xdg_desktop_portal/portal/{mod.rs,libdbus.rs}. A
-# semver-compatible bump that rewords those messages would silently
-# disarm the classification while the tests (which mirror the strings
-# by hand) keep passing. Any bump must re-verify those emission sites
-# and update both classifiers AND their tests.
+# Portal backend only; do not re-enable "gtk3". EXACT-VERSION PIN: the GUI's
+# dialog-failure classification matches rfd 0.17.2's log wording; any bump must
+# re-verify FileDialogs::apply_native_outcome and logging.rs.
 rfd = { version = "=0.17.2", default-features = false }
-# Pure-egui in-app file browser (Linux fallback dialog tier). LOCKSTEP
-# with egui minors: 0.12 <-> egui 0.33, 0.13 <-> 0.34, 0.14 <-> 0.35 —
-# any egui/eframe bump MUST bump this together.
+# Pure-egui fallback dialog; LOCKSTEP with egui minors — bump together.
 egui-file-dialog = "0.13"
 hdf5 = { package = "hdf5-metno", version = "0.12", features = ["static", "zlib"] }
 rand = "0.10"
-# Stable-stream RNG for seeded test noise: StdRng's stream is documented
-# UNSTABLE across rand versions, so acceptance tests that pin a noise
-# realization must name a concrete algorithm (ChaCha12) instead.
 rand_chacha = "0.10"
 rand_distr = "0.6"
 microlp = "0.6"
 tracing = "0.1"
-# log-crate facade: bridged into tracing by apps/gui/src/logging.rs so
-# diagnostics from log-based deps (rfd, opener) reach the log files.
 log = "0.4"
 tracing-appender = "0.2"
 tracing-subscriber = { version = "0.3", default-features = false, features = ["fmt", "env-filter", "registry", "ansi"] }
-# NOTE: opener's default dbus-vendored feature statically links libdbus.
-# Never set default-features = false here — dynamic libdbus would break
-# the manylinux_2_28 container build and trigger wheel vendoring.
 opener = { version = "0.9", features = ["reveal"] }
 time = { version = "0.3", default-features = false, features = ["formatting", "macros"] }
 tempfile = "3"
 
-# Tests and dev builds default to opt-level 0.  The resonance kernels are
-# numeric inner loops, and unoptimized they dominate the test battery.
-# `profile.test` inherits `profile.dev`, and dependencies of test targets
-# build under `profile.dev`, so both are set.  `debug-assertions` is
-# untouched, and opt-level does not relax IEEE float semantics.
+# Optimize test/dev builds: the resonance kernels dominate the test battery.
 [profile.dev]
 opt-level = 2
 

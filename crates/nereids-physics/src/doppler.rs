@@ -1162,7 +1162,6 @@ mod tests {
     }
 
     /// The sampled tier applies that rule to its own window, so a genuine
-    /// negative survives and an all-negative window is zeroed. Before this,
     /// the tier hard-clamped every negative and disagreed with the
     /// continuous tier on the same isotope.
     #[test]
@@ -1284,7 +1283,6 @@ mod tests {
         // 9.9141 and Δ_D(10 eV) = √(4·kB·T·E/AWR) = 0.322961 eV, whose
         // FWHM 2√(ln2)·Δ_D = 0.537766 eV is SAMMY's reported 0.5378 to its
         // own four figures.  The amu figure gives 0.321571 and an FWHM of
-        // 0.535451, which does NOT match SAMMY — the gap was previously
         // explained away as a kB difference, but kB moves this by 5e-7.
         let data = nereids_endf::resonance::test_support::ex001_hydrogen_single_resonance();
         let params = DopplerParams::new(300.0, data.awr).unwrap();
@@ -2270,7 +2268,6 @@ mod tests {
     /// Sparse EDGE passthrough (SAMMY `fgm/mfgm1.f90`: "IF too few points,
     /// do not broaden"): when the Gaussian window is truncated by the end
     /// of the extended grid AND holds fewer than 3 nodes, the point is
-    /// returned unbroadened.  Before this guard the kernel chord-integrated
     /// across the gap at the edge: constant σ on a valid [1, 100] eV grid
     /// (AWR = 1, 300 K) returned 1.998 at the low edge (analytic
     /// full-kernel value 1.0129) — a silent +97% error.  INTERIOR

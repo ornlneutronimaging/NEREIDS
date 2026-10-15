@@ -114,7 +114,6 @@ pub fn parse_endf_file2(endf_text: &str) -> Result<ResonanceData, EndfParseError
                 // Unresolved resonance region (LRU=2): parsed and SKIPPED.
                 //
                 // NEREIDS does not compute URR average cross sections — the
-                // Hauser-Feshbach path was removed (it lacked the ENDF
                 // width-fluctuation correction, a systematically wrong average).
                 // We still consume the URR body to keep the line stream aligned
                 // so resolved ranges in the same evaluation remain accessible,
@@ -197,7 +196,7 @@ pub fn parse_endf_file2(endf_text: &str) -> Result<ResonanceData, EndfParseError
                     None
                 };
                 // CONT: SPI, AP, 0, 0, NLS=0, 0
-                // Validate NLS=0 (#123): a non-zero NLS in an LRU=0 range is
+                // Validate NLS=0: a non-zero NLS in an LRU=0 range is
                 // malformed and would cause the parser to look for L-groups that
                 // don't exist, misaligning the cursor for subsequent ranges.
                 let spi_cont = parse_cont(&lines, &mut pos)?;
@@ -592,7 +591,7 @@ fn parse_bw_range(
         let l_cont = parse_cont(ctx.lines, ctx.pos)?;
         let awr_l = l_cont.c1;
         let qx = l_cont.c2; // Q-value for competitive width (eV)
-        // Validate L is non-negative (#123): negative L1 wraps to a huge u32.
+        // Validate L is non-negative: negative L1 wraps to a huge u32.
         if l_cont.l1 < 0 {
             return Err(EndfParseError::UnsupportedFormat(format!(
                 "BW range: negative L={}",
@@ -604,7 +603,7 @@ fn parse_bw_range(
         let n1 = checked_count(l_cont.n1, "N1")?; // should be 6*NRS
         let nrs = checked_count(l_cont.n2, "NRS")?; // number of resonances
 
-        // Validate N1 == 6*NRS (#123): a mismatch means the record is malformed
+        // Validate N1 == 6*NRS: a mismatch means the record is malformed
         // and reading N1 values would over-/under-consume lines.
         if n1 != 6 * nrs {
             return Err(EndfParseError::UnsupportedFormat(format!(
@@ -709,7 +708,7 @@ fn parse_reich_moore_range(
         let l_cont = parse_cont(ctx.lines, ctx.pos)?;
         let awr_l = l_cont.c1;
         let apl = l_cont.c2 * ENDF_RADIUS_TO_FM; // L-dependent scattering radius
-        // Validate L is non-negative (#123): negative L1 wraps to a huge u32.
+        // Validate L is non-negative: negative L1 wraps to a huge u32.
         if l_cont.l1 < 0 {
             return Err(EndfParseError::UnsupportedFormat(format!(
                 "Reich-Moore range: negative L={}",
@@ -720,7 +719,7 @@ fn parse_reich_moore_range(
         let n1 = checked_count(l_cont.n1, "N1")?; // should be 6*NRS
         let nrs = checked_count(l_cont.n2, "NRS")?; // number of resonances
 
-        // Validate N1 == 6*NRS (#123): a mismatch means the record is malformed
+        // Validate N1 == 6*NRS: a mismatch means the record is malformed
         // and reading N1 values would over-/under-consume lines.
         if n1 != 6 * nrs {
             return Err(EndfParseError::UnsupportedFormat(format!(
@@ -786,7 +785,6 @@ fn parse_reich_moore_range(
 /// advancing the line cursor past the particle-pair, channel, and resonance
 /// LIST records so any following range/material stays aligned.
 ///
-/// NEREIDS does not evaluate LRF=7 cross sections — the RML physics was removed
 /// (its closed-channel treatment was incomplete: the Coulomb/SHF=1 closed-channel
 /// shift was unimplemented, and the evaluator was never validated against SAMMY)
 /// — so the parameters are discarded and the range is tagged
@@ -1753,7 +1751,7 @@ mod tests {
             .join("tests/data/endf/Ta-181.endf");
         // The fixture is committed to the repo, so a missing file is a
         // packaging/path regression that MUST fail CI — not a skip that would
-        // silently disable this #638 resonance-count guard.
+        // silently disable this resonance-count guard.
         let endf_text = std::fs::read_to_string(&endf_path).unwrap_or_else(|e| {
             panic!(
                 "vendored Ta-181 regression fixture must be present at \
@@ -1988,7 +1986,6 @@ mod tests {
     /// (structural guards applied, values discarded) and the range is
     /// stored as a non-evaluable placeholder.
     ///
-    /// We previously gated this assertion on a `../SAMMY/...t149a.endf`
     /// sibling checkout; on CI (and on any clean clone) the file was
     /// absent and the test silently reported `ok` after a `Skipping…`
     /// print. Vendoring the full tr149 ENDF would be heavy; instead we
@@ -2128,7 +2125,7 @@ mod tests {
     }
 
     // -----------------------------------------------------------------------
-    // Issue #123: robustness tests for malformed input validation
+    // robustness tests for malformed input validation
     // -----------------------------------------------------------------------
 
     /// `checked_count` rejects negative values.
@@ -2373,7 +2370,6 @@ mod tests {
     /// rejected with an error naming the offending LRF.
     ///
     /// ENDF-6 §2.2.2 restricts the unresolved region to LRF=1 or LRF=2. The
-    /// parser previously heuristically consumed such a body and dropped the
     /// span silently; it now hard-errors like the sibling malformed-record
     /// guards.
     #[test]

@@ -168,14 +168,12 @@ pub enum ResonanceFormalism {
     ReichMoore,
     /// R-Matrix Limited (LRF=7). General multi-channel formalism (W, Ta, Zr,
     /// etc. in ENDF/B-VIII.0). Parsed for cursor alignment but not evaluated:
-    /// the RML physics was removed because its closed-channel treatment was
     /// incomplete (the Coulomb/SHF=1 closed-channel shift was unimplemented)
     /// and the evaluator was never validated against SAMMY. Ranges tagged
     /// `RMatrixLimited` are non-evaluable and resolve to Skip.
     RMatrixLimited,
     /// Unresolved Resonance Region (LRU=2). Parsed for cursor alignment but not
     /// evaluated: NEREIDS does not compute URR average cross sections. The
-    /// Hauser-Feshbach path was removed because it lacked the ENDF
     /// width-fluctuation correction (a systematically wrong average). Ranges
     /// tagged `Unresolved` are non-evaluable and resolve to Skip.
     Unresolved,
@@ -866,8 +864,7 @@ mod tests {
 /// tests.  Gated on `#[cfg(any(test, feature = "test-support"))]`: visible to
 /// in-crate `#[cfg(test)] mod tests` AND to integration tests in sibling crates
 /// that enable the `test-support` feature in their `[dev-dependencies]`.  Never
-/// compiled into release builds.  Consolidates previously-scattered ad-hoc
-/// builders into one named API, mirroring PR #545's
+/// builders into one named API, mirroring
 /// `nereids_physics::resolution::test_support`.
 #[cfg(any(test, feature = "test-support"))]
 pub mod test_support {
@@ -958,7 +955,6 @@ pub mod test_support {
     // --- Public fixtures ---
 
     /// Canonical U-238 6.674 eV Reich-Moore single-resonance.  Byte-identical
-    /// anchor for the most common synthetic case; absorbs four previously-
     /// duplicated copies across pipeline / physics / fitting.
     pub fn u238_single_resonance() -> ResonanceData {
         u238_with_formalism(ResonanceFormalism::ReichMoore)
@@ -1012,7 +1008,7 @@ pub mod test_support {
     /// 36.68 eV), Reich-Moore.  Multiple dips at different energies break the
     /// (t0, L_scale) degeneracy that a single resonance leaves — a single dip
     /// cannot separate a TOF offset from a flight-path scale.  Used by the
-    /// energy-scale calibration and joint temperature-recovery tests (#634);
+    /// energy-scale calibration and joint temperature-recovery tests;
     /// analogous to (not numerically identical with) the Python
     /// `TestFitEnergyScaleRecovery` fixture.
     pub fn u238_three_resonances() -> ResonanceData {
@@ -1197,7 +1193,7 @@ pub mod test_support {
 
     /// Hf-177 MLBW: two s-waves at 2.386 and 5.89 eV in the same high-J group
     /// (J=4.0), target spin I=3.5.  Range `1e-5 .. 1e3` eV, AP=7.0, NAPS=0.
-    /// MLBW coherent-vs-incoherent dispatcher regression (PR #465 root cause).
+    /// MLBW coherent-vs-incoherent dispatcher regression (root cause).
     pub fn hf177_mlbw_two_resonances_high_j() -> ResonanceData {
         wrap(
             72,

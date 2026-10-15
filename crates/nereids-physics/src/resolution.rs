@@ -960,7 +960,6 @@ pub struct TabulatedResolution {
 /// (`tw = 0`, matching the broadener's `w <= 0` skip) and negative
 /// weights are rejected at construction, so the integration domains
 /// coincide exactly. The centroid pass is byte-identical to the
-/// accumulation `width_corrected` performed inline before this helper
 /// was factored out. Returns `(centroid, sigma)`; `sigma` is `0.0` for
 /// a single-point or zero-mass block — callers treat a non-positive or
 /// non-finite `sigma` as degenerate.
@@ -1816,7 +1815,7 @@ impl ResolutionPlan {
 ///
 /// Built from a [`ResolutionPlan`] via
 /// [`ResolutionPlan::compile_to_matrix`].  Exposed so downstream
-/// surrogates (see epic #472) can access the row-local entries
+/// surrogates (see ) can access the row-local entries
 /// `R_{i, j}` directly for LP / quadrature construction.
 ///
 /// Owns a copy of the target energy grid for the same reason
@@ -2659,7 +2658,7 @@ impl TabulatedResolution {
     ///    with `frac` linear in log E — exact for the physical
     ///    power-law width `σ_t ∝ E^p` (log σ linear in log E).
     /// 3. Both blocks' offsets are scaled about the mode (offset 0 —
-    ///    the anchoring convention; see the `#625` discussion in
+    ///    the anchoring convention; see the discussion in
     ///    `ikeda_carpenter`) by `σ_t/σ_b`, merged into one
     ///    strictly-ascending grid, and the weights blended pointwise:
     ///    `w = w_lo(x) + frac·(w_hi(x) − w_lo(x))`, each block's weight
@@ -4369,12 +4368,11 @@ Resolution file
     }
 
     // ---------------------------------------------------------------
-    // VENUS-like regression test moved to
     // `crates/nereids-physics/tests/venus_usr_resolution.rs`
     // (`test_broaden_presorted_bit_exact_on_venus_usr`) — see issue
-    // #497.  The integration test parses a synthetic SAMMY USR-format
+    //. The integration test parses a synthetic SAMMY USR-format
     // kernel via `common::synthetic_venus_usr_tab()` (the real VENUS
-    // BL10 fixture is not approved for public release; issue #557).
+    // BL10 fixture is not approved for public release; ).
     // ---------------------------------------------------------------
 
     #[test]
@@ -4705,13 +4703,12 @@ Resolution file
     }
 
     // ---------------------------------------------------------------
-    // VENUS-like microbenchmarks moved to
     // `crates/nereids-physics/tests/venus_usr_resolution_microbench.rs`
     // (`test_broaden_presorted_bench`, `test_plan_reuse_bench`,
-    // `resolution_matrix_apply_microbench`) — see issue #497.  They
+    // `resolution_matrix_apply_microbench`) — see. They
     // parse a synthetic SAMMY USR-format kernel via
     // `common::synthetic_venus_usr_tab()` (the real VENUS BL10
-    // fixture is not approved for public release; issue #557).
+    // fixture is not approved for public release; ).
     // ---------------------------------------------------------------
 
     // ---------- ResolutionMatrix (CSR compile) tests ----------
@@ -4726,7 +4723,7 @@ Resolution file
     // operator (synthetic SAMMY-format kernel) at realistic grid
     // sizes (512, 3471) live in
     // `crates/nereids-physics/tests/venus_usr_resolution.rs` — see
-    // issues #497 and #557.
+    // issues and.
 
     /// Hybrid abs+rel tolerance used across equivalence tests.  Guards
     /// against the `a ≈ 0` trap where `a.abs().max(1e-300)` produces
@@ -4874,7 +4871,6 @@ Resolution file
     }
 
     // ---------------------------------------------------------------
-    // End-to-end VENUS-like USR equivalence tests moved to
     // `crates/nereids-physics/tests/venus_usr_resolution.rs`
     // (`resolution_matrix_is_row_stochastic_on_venus_kernel`,
     //  `resolution_matrix_apply_equivalent_to_plan_apply_on_venus_kernel`,
@@ -4883,7 +4879,7 @@ Resolution file
     //  `resolution_matrix_csr_column_indices_sorted_per_row`,
     //  `resolution_matrix_grid_mismatch_detected`,
     //  `resolution_matrix_length_mismatch_detected`) — see issues
-    // #497 and #557.  They parse a synthetic SAMMY USR-format kernel
+    // and. They parse a synthetic SAMMY USR-format kernel
     // via `common::synthetic_venus_usr_tab()`.
     // ---------------------------------------------------------------
 
@@ -5159,7 +5155,7 @@ Resolution file
 
     // ------------------------------------------------------------------
     // TabulatedResolution::kernel_support_ev — used by SAMMY EMIN/EMAX
-    // -equivalent fit-energy-range margin computation (#514).
+    // -equivalent fit-energy-range margin computation.
     // ------------------------------------------------------------------
 
     /// `synthetic_tab_resolution` uses triangular kernels whose

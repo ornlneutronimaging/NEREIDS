@@ -149,13 +149,11 @@ mod tests {
     #[test]
     fn test_tof_to_energy_rejects_non_positive_and_non_finite() {
         let l = 25.0;
-        // Negative TOF used to return a *positive* energy (v² hides the
         // sign), masking an upstream sign/loader bug.
         assert!(
             tof_to_energy(-100.0, l).is_nan(),
             "negative TOF must be NaN"
         );
-        // Zero TOF used to return +∞.
         assert!(tof_to_energy(0.0, l).is_nan(), "zero TOF must be NaN");
         assert!(tof_to_energy(f64::NAN, l).is_nan(), "NaN TOF must stay NaN");
         assert!(
@@ -170,13 +168,11 @@ mod tests {
             tof_to_energy(100.0, f64::INFINITY).is_nan(),
             "Inf flight path must be NaN"
         );
-        // Zero flight path used to return a finite 0 energy (v = L/t = 0),
         // masking a bad detector geometry.
         assert!(
             tof_to_energy(100.0, 0.0).is_nan(),
             "zero flight path must be NaN"
         );
-        // Negative flight path used to return a *positive* energy (v² hides
         // the sign), the same trap as a negative TOF.
         assert!(
             tof_to_energy(100.0, -25.0).is_nan(),
@@ -190,7 +186,6 @@ mod tests {
     #[test]
     fn test_energy_to_tof_rejects_non_positive_and_non_finite() {
         let l = 25.0;
-        // Negative energy used to return NaN already (√ of negative), but
         // zero energy returned +∞ — both are now an explicit NaN contract.
         assert!(
             energy_to_tof(-1.0, l).is_nan(),
@@ -213,7 +208,6 @@ mod tests {
             energy_to_tof(10.0, f64::INFINITY).is_nan(),
             "Inf flight path must be NaN"
         );
-        // Zero / negative flight path used to return 0 / a *negative* TOF —
         // a physically impossible time.
         assert!(
             energy_to_tof(10.0, 0.0).is_nan(),

@@ -32,7 +32,6 @@ use crate::open_beam::{
     combined, counted, fit_on_halved_grids, laws, open_beam_with_intervals, overdispersion,
     validate_counts, validate_live, weights_of,
 };
-use crate::pipeline::TEMPERATURE_BOUNDS_K;
 
 /// A count in a bin predicted fewer counts than this has a chance below it
 /// under the model.
@@ -41,6 +40,10 @@ pub const NEGLIGIBLE_PREDICTION: f64 = 1e-10;
 const SETTLED_OVERDISPERSION: f64 = 0.01;
 
 const MOST_PASSES: usize = 20;
+
+/// The `(low, high)` temperature bounds in K that a fit with a free
+/// temperature uses.
+pub(crate) const TEMPERATURE_BOUNDS_K: (f64, f64) = (1.0, 5000.0);
 
 /// A quantity the fit holds at a known value, fits from a starting value
 /// over the quantity's range, fits from `start` within `lower..=upper` inside

@@ -1,5 +1,5 @@
 //! End-to-end width oracle for between-reference kernel interpolation
-//! (issue #632).
+//!.
 //!
 //! Symmetric Gaussian kernels (mode 0, so the convolution orientation
 //! does not contaminate the width measurement) at reference energies

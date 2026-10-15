@@ -1,4 +1,4 @@
-//! SAMMY `samtry` test suite validation (issue #321).
+//! SAMMY `samtry` test suite validation.
 //!
 //! Validates NEREIDS physics against SAMMY's canonical reference output from
 //! the `samtry/` test suite.  Each test case loads a SAMMY `.par` + `.inp` +
@@ -273,7 +273,7 @@ fn validate_broadened_cross_sections(
         )
         .unwrap()
     } else {
-        // broadened_cross_sections returns Doppler-only σ (issue #442).
+        // broadened_cross_sections returns Doppler-only σ.
         // For non-transmission observables (total XS, etc.), resolution on σ
         // IS the correct physics, so apply it explicitly here.
         let mut xs = transmission::broadened_cross_sections(
@@ -697,7 +697,7 @@ fn test_tr004_ni60_transmission() {
     );
 }
 
-// ─── Batch A: New cases (issue #321-A) ──────────────────────────────────────
+// ─── Batch A: New cases (-A) ──────────────────────────────────────
 
 /// tr015: Ni-58 transmission, 180-181 keV, Doppler+Gaussian (Deltae=0).
 ///
@@ -978,7 +978,7 @@ fn test_tr028_pu241_unbroadened() {
     );
 }
 
-// ─── Batch B: Multi-isotope support (issue #325-B) ──────────────────────────
+// ─── Batch B: Multi-isotope support (-B) ──────────────────────────
 
 /// Compare NEREIDS multi-isotope cross-sections against SAMMY reference.
 ///
@@ -1034,7 +1034,7 @@ fn validate_cross_sections_multi(
     } else {
         inp.temperature_k
     };
-    // broadened_cross_sections returns Doppler-only σ (issue #442).
+    // broadened_cross_sections returns Doppler-only σ.
     // For total cross-section observables, resolution on σ IS correct physics,
     // so apply it explicitly per-isotope here.
     let mut broadened = transmission::broadened_cross_sections(
@@ -1374,7 +1374,7 @@ fn test_tr024_natfe_broadened() {
     );
 }
 
-// ─── Batch C: Multi-channel fission (issue #326) ────────────────────────────
+// ─── Batch C: Multi-channel fission ────────────────────────────
 //
 // tr019 (U-235) and tr028 (Pu-241) both have 3 channels per spin group:
 // neutron entrance + 2 fission exit channels.  The 3-channel Reich-Moore
@@ -1453,7 +1453,7 @@ fn test_tr019_u235_broadened() {
     );
 }
 
-// ─── Batch D: Coverage expansion (issue #327) ───────────────────────────────
+// ─── Batch D: Coverage expansion ───────────────────────────────
 
 // ─── tr012: Ni-58, HEGA broadened, 180–181 keV ──────────────────────────────
 
@@ -1871,7 +1871,7 @@ fn test_tr041_ni58_broadened() {
     );
 }
 
-// ─── Batch E: NEW SPIN GROUP FORMAT (issue #328) ─────────────────────────────
+// ─── Batch E: NEW SPIN GROUP FORMAT ─────────────────────────────
 //
 // These cases use the `USE NEW SPIN GROUP FORMAT` keyword in their .inp files.
 // The column layout is identical to the old format for the spin group header
@@ -2126,7 +2126,7 @@ fn test_tr101_al27_unbroadened() {
     );
 }
 
-// ─── Batch F: Final coverage (issue #328) ────────────────────────────────────
+// ─── Batch F: Final coverage ────────────────────────────────────
 
 // ─── tr122: Fe-56 transmission, new spin group format, Doppler+Gauss+Exp ─────
 
@@ -2470,7 +2470,7 @@ fn test_tr005_am241_fission_broadened() {
     );
 }
 
-// ─── ENDF-direct validation helpers (issue #329) ────────────────────────────
+// ─── ENDF-direct validation helpers ────────────────────────────
 
 /// Load a samtry case that reads resonance data from an ENDF tape
 /// instead of a SAMMY .par file.
@@ -2564,7 +2564,7 @@ fn validate_unbroadened_with_resonance_data(
     }
 }
 
-// ─── tr050: Co-59 ENDF-direct transmission (issue #329) ─────────────────────
+// ─── tr050: Co-59 ENDF-direct transmission ─────────────────────
 
 #[test]
 fn test_tr050_co59_endf_parse() {
@@ -2620,7 +2620,7 @@ fn test_tr050_co59_endf_transmission() {
     );
 }
 
-// ─── tr129: Multi-isotope ENDF total XS (issue #329) ────────────────────────
+// ─── tr129: Multi-isotope ENDF total XS ────────────────────────
 
 #[test]
 fn test_tr129a_pu242_endf_total_xs() {
@@ -2700,7 +2700,6 @@ fn test_tr129e_pu240_lfw1_lrf1_urr_skipped() {
     // Each per-(L,J) record is a full LIST: a control line
     // [0.0, 0.0, L, MUF, NE+6=20, 0] followed by [D, AJ, AMUN, GNO, GG, 0]
     // and NE=14 fission widths.  Consuming the per-J control line is what
-    // keeps the line stream aligned; before that read was added this file
     // mis-parsed and tripped the "multiple materials" guard.
     //
     // This is a gold-standard NON-circular regression fixture: the bytes
@@ -2718,7 +2717,6 @@ fn test_tr129e_pu240_lfw1_lrf1_urr_skipped() {
     // appear as a non-resolved Unresolved range. That the whole tape parses
     // end-to-end — rather than tripping the multiple-materials guard on stray,
     // mis-consumed lines — is the regression guard for the Case-B skip's cursor
-    // advancement (before the per-J control-line read was added this file
     // mis-parsed, per the fixture note above).
     let urr_range = rd
         .ranges
@@ -2763,7 +2761,7 @@ fn test_tr129g_am241_endf_total_xs() {
     );
 }
 
-// ─── tr168: Fe-56 transmission with PUP (issue #329) ────────────────────────
+// ─── tr168: Fe-56 transmission with PUP ────────────────────────
 
 #[test]
 fn test_tr168a_fe56_parse() {

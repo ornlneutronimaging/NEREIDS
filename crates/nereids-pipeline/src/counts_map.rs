@@ -14,6 +14,7 @@ use nereids_fitting::poisson::{
 use nereids_fitting::statistics::{Consistency, consistency};
 use rayon::prelude::*;
 
+use crate::counts_fit::TEMPERATURE_BOUNDS_K;
 use crate::counts_fit::{
     BeamStart, BeamStarts, Material, Measurement, NO_TIME_BACKGROUND, Region, RegionFit,
     RegionTerms, Role, SHARED, Starts, Value, checked, excluded_bins, fit_counts_answer, labelled,
@@ -23,7 +24,6 @@ use crate::error::PipelineError;
 use crate::open_beam::{
     BOUND, Calibration, PULSE_NUMBERS, Pulse, fit_open_beam, validate_live, whole,
 };
-use crate::pipeline::TEMPERATURE_BOUNDS_K;
 
 const MOST_STEPS: usize = 20;
 

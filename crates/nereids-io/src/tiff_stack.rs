@@ -78,7 +78,7 @@
 //!
 //! For *corrupt readout pixels* in raw counts (e.g. a railed pixel stuck at
 //! a signed sentinel), the right tool is a per-acquisition mask from
-//! `nereids_io::normalization::detect_bad_pixels`, not a load-time clamp.
+//! `nereids_io::pixels::detect_bad_pixels`, not a load-time clamp.
 //!
 //! ## Data types
 //! - 16-bit unsigned integer (common for neutron detectors)
@@ -918,7 +918,7 @@ fn load_chunked_sum(
     let mut acc = load_frames_from_paths(&first_paths, pixel_policy, n_clipped_pixels)?;
     let (_, height, width) = acc.dim();
 
-    // Duplicate-chunk guard (issue #653).  On real VENUS data every observed
+    // Duplicate-chunk guard. On real VENUS data every observed
     // multi-chunk folder is a *duplicate write* of one
     // exposure, not sequential DAQ segments — summing them (the default)
     // silently doubles every count.  We fingerprint each chunk with an
@@ -1726,7 +1726,7 @@ mod tests {
         );
     }
 
-    /// Issue #653: two chunks with byte-identical content are a duplicate DAQ
+    /// two chunks with byte-identical content are a duplicate DAQ
     /// write, not sequential segments — the default summing path must refuse
     /// them (silently doubling every count is the exact real-VENUS failure),
     /// while `sum_chunks=false` still loads every frame for inspection.
