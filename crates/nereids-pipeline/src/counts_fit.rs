@@ -18,7 +18,7 @@ use nereids_fitting::parameters::{FitParameter, ParameterSet};
 use nereids_fitting::poisson::{Prior, Unbounded, information_inverse};
 use nereids_fitting::statistics::{Consistency, consistency};
 use nereids_physics::continuous_doppler::{
-    Channel, QuadratureBudget, SUPPORT_X, broaden, broaden_with_budget,
+    Channel, QuadratureBudget, SUPPORT_X, broaden_channel, broaden_with_budget,
 };
 use nereids_physics::doppler::DopplerParams;
 use nereids_physics::flight_time_grid::{FlightTimeGrid, Rows};
@@ -915,7 +915,6 @@ fn nuclear_slopes(
     let jacobian = model
         .analytical_jacobian(&params, &free, &mu)
         .expect("the counts model has an analytical Jacobian");
-    let energies = &model.model.energies;
     let bins = mu.len() / (2 * regions.len());
     let mut picked: Vec<(&ResonanceCovariance, usize, Vec<f64>)> = Vec::new();
     for (r, material) in regions
@@ -923,12 +922,7 @@ fn nuclear_slopes(
         .enumerate()
         .filter_map(|(r, region)| Some((r, region.material.as_ref()?)))
     {
-        let place = &model.model.layout.regions[r];
-        let temperature = params[place.temperature.expect("a material")];
-        let scale = model.model.scale(&params)?;
-        let transmitted = model.model.beams(&params, &scale, r)?.per_depth;
         for (i, covariance) in &material.covariances {
-            let density = params[place.densities.start + i];
             let data = &material.isotopes[*i].0;
             let n = 3 * covariance.resonances.len();
             for p in (0..n).filter(|p| covariance.covariance[p * n + p] > 0.0) {
@@ -938,19 +932,12 @@ fn nuclear_slopes(
                     let mut copy = data.clone();
                     let resonance = &mut copy.ranges[a].l_groups[b].resonances[c];
                     *[&mut resonance.energy, &mut resonance.gn, &mut resonance.gg][p % 3] += by;
-                    broaden(energies, &copy, temperature).map_err(|e| {
-                        PipelineError::Fitting(FittingError::EvaluationFailed(e.to_string()))
-                    })
+                    copy
                 };
-                let (up, down) = (shifted(h)?, shifted(-h)?);
-                let absorbed: Vec<f64> = up
-                    .iter()
-                    .zip(&down)
-                    .rev()
-                    .zip(&transmitted)
-                    .map(|((u, d), t)| -density * t * (u - d) / (2.0 * h))
-                    .collect();
-                let folded = predicted(&scale.rows, &absorbed)?;
+                let folded =
+                    model
+                        .model
+                        .resonance_slope(&params, r, *i, [&shifted(h), &shifted(-h)], h)?;
                 let rows = (2 * r + 1) * bins..(2 * r + 2) * bins;
                 let cross = (0..free.len())
                     .map(|j| {
@@ -2527,6 +2514,51 @@ impl RegionsModel {
         })
     }
 
+    /// The slope of region `region`'s sample counts per bin in one resonance
+    /// parameter of its isotope `isotope`, from the isotope's data with the
+    /// parameter moved by `+h` and by `−h`.
+    fn resonance_slope(
+        &self,
+        params: &[f64],
+        region: usize,
+        isotope: usize,
+        [up, down]: [&ResonanceData; 2],
+        h: f64,
+    ) -> Result<Vec<f64>, PipelineError> {
+        let place = &self.layout.regions[region];
+        let temperature = params[place.temperature.expect("a material")];
+        let density = params[place.densities.start + isotope];
+        let scale = self.scale(params)?;
+        let beams = self.beams(params, &scale, region)?;
+        let slope = |channel| -> Result<Vec<f64>, PipelineError> {
+            let sigma = |data| {
+                broaden_channel(&self.energies, data, temperature, channel).map_err(|e| {
+                    PipelineError::Fitting(FittingError::EvaluationFailed(e.to_string()))
+                })
+            };
+            let (up, down) = (sigma(up)?, sigma(down)?);
+            Ok(up
+                .iter()
+                .zip(&down)
+                .rev()
+                .map(|(u, d)| density * (u - d) / (2.0 * h))
+                .collect())
+        };
+        let total = slope(Channel::Total)?;
+        let mut column: Vec<f64> = total
+            .iter()
+            .zip(&beams.per_depth)
+            .map(|(s, t)| -t * s)
+            .collect();
+        if let Some(capture) = &beams.capture {
+            let captured = slope(Channel::Capture)?;
+            for (j, c) in column.iter_mut().enumerate() {
+                *c += capture.per_depth[j] * total[j] + capture.share[j] * captured[j];
+            }
+        }
+        Ok(predicted(&scale.rows, &column)?)
+    }
+
     fn time_background(&self, params: &[f64]) -> (Vec<f64>, [Vec<f64>; 3]) {
         let at = self.layout.time_background;
         time_counts_per_pixel(&self.bins, [params[at], params[at + 1], params[at + 2]])
@@ -2855,6 +2887,75 @@ mod tests {
         let (counts, _) = time_counts_per_pixel(&bins, [1.0, 2.0, f64::MAX]);
         for (count, (_, width)) in counts.iter().zip(&bins) {
             assert!((count / (3.0 * width) - 1.0).abs() <= 1e-12, "{counts:?}");
+        }
+    }
+
+    #[test]
+    fn a_resonance_slope_is_the_slope_of_the_sample_counts() {
+        let grid = grid(None);
+        let (_, u_hi) = grid.range_us();
+        let beams = [BeamSpline::constant(347.0, u_hi, 1.0e4)];
+        let layout = Arc::new(Layout::new(
+            roles(&[beams[0].coefficients().len()], &[Some(1)]),
+            &[4.0],
+            &[true],
+        ));
+        let params: Vec<f64> = layout
+            .roles
+            .iter()
+            .enumerate()
+            .map(|(i, role)| match *role {
+                Role::Beam { .. } => 9.0 + 0.3 * (i as f64).sin(),
+                Role::Density { .. } => 3.0e-4,
+                Role::Temperature { .. } => 300.0,
+                Role::ThicknessVariance { .. } => 0.02,
+                Role::Normalization => 0.93,
+                Role::Background { term, .. } => [0.05, 0.5, -0.01, 0.03, 4.0][term],
+                Role::GammaTransmission { .. } => 0.8,
+                Role::CaptureGammas { .. } => 0.05,
+                Role::TimeBackground(term) => [50.0, 300.0, 40.0][term],
+                Role::RoomBackground => 2.0e-3,
+                Role::T0 => T0_US + 0.05,
+                Role::FlightPath => FLIGHT_PATH_M + 0.003,
+                Role::Pulse(n) => [0.37, 0.06, 0.01, 0.24, 0.16, 0.3][n],
+            })
+            .collect();
+        let data = synthetic_isotope(72, 180, 20.0, 0.01, 0.06);
+        let model = |data: &ResonanceData| {
+            let isotopes: [Arc<[ResonanceData]>; 1] = [Arc::new([data.clone()])];
+            RegionsModel::new(
+                &grid,
+                &beams,
+                &isotopes,
+                (1.2, [3.0e4, 2.5e4]),
+                T0_US,
+                &layout,
+            )
+        };
+        let h = 1e-4 * data.ranges[0].l_groups[0].resonances[0].gg;
+        let moved = |by: f64| {
+            let mut copy = data.clone();
+            copy.ranges[0].l_groups[0].resonances[0].gg += by;
+            copy
+        };
+        let (up, down) = (moved(h), moved(-h));
+        let slope = model(&data)
+            .resonance_slope(&params, 0, 0, [&up, &down], h)
+            .expect("slope");
+        let counts = |data| model(data).evaluate(&params).expect("counts");
+        let differences: Vec<f64> = counts(&up)
+            .iter()
+            .zip(&counts(&down))
+            .map(|(u, d)| (u - d) / (2.0 * h))
+            .collect();
+        let column = differences.iter().fold(0.0_f64, |m, s| m.max(s.abs()));
+        let bins = slope.len();
+        for (k, &difference) in differences.iter().enumerate() {
+            let analytic = if k < bins { 0.0 } else { slope[k - bins] };
+            assert!(
+                (analytic - difference).abs() <= 1e-6 * column,
+                "{k}: {analytic} vs {difference}"
+            );
         }
     }
 
