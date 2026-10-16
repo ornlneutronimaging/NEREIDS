@@ -266,8 +266,8 @@ pub struct CountsFit {
     /// The square of the pulse's triangle FWHM, `h²` in µs²: the known one, or
     /// the fitted one.
     pub fwhm_squared_us2: f64,
-    /// The pulse's `R₁`: the known one, or the fitted one.
-    pub r1: f64,
+    /// The pulse's `R_high`, the known or the fitted one; `None` without one.
+    pub r_high: Option<f64>,
     /// The time background's `[C, A, τ]`, each the known or the fitted one; a
     /// fitted `τ` is undetermined when `A` ends at 0.
     pub time_background: [f64; 3],
@@ -285,7 +285,7 @@ pub struct CountsFit {
     /// region by region; the time background's `C`, `A` and `τ`; the room
     /// background's `ρ`; the spread's `h`; `t0`; the
     /// flight path; `α₀`, `α₁`,
-    /// `β₀`, `β₁`, `R`, `h²` and `R₁`: the inverse of the information at the fit, each run's expected information over its
+    /// `β₀`, `β₁`, `R`, `h²` and `R_high`: the inverse of the information at the fit, each run's expected information over its
     /// overdispersion plus `1/sd²` for each measured quantity and `C⁻¹` over
     /// the pulse numbers a calibration's
     /// [`Pulse::prior`](crate::open_beam::Pulse::prior) covers.  The row and
@@ -934,8 +934,9 @@ pub(crate) fn excluded_bins(
     time_edges_us: &[f64],
     material: Option<&Material>,
     numbers: &[f64],
+    storage_span: Option<(f64, f64)>,
 ) -> Vec<usize> {
-    let laws = laws(&numbers[2..]);
+    let laws = laws(&numbers[2..], storage_span);
     let arrival_us = |energy: f64| {
         numbers[0]
             + TOF_FACTOR * numbers[1] / energy.sqrt()
@@ -1224,7 +1225,14 @@ pub(crate) fn fit_counts_answer(
     let excluded_at = |numbers: &[f64]| -> Vec<Vec<usize>> {
         let own: Vec<Vec<usize>> = regions
             .iter()
-            .map(|region| excluded_bins(time_edges_us, region.material.as_ref(), numbers))
+            .map(|region| {
+                excluded_bins(
+                    time_edges_us,
+                    region.material.as_ref(),
+                    numbers,
+                    calibration.pulse.storage_span(),
+                )
+            })
             .collect();
         match &mixing {
             Some(shares) if spreading => shares
@@ -1303,7 +1311,9 @@ pub(crate) fn fit_counts_answer(
             [region.capture_gammas, region.in_scatter].map(|value| value != Value::Known(0.0))
         })
         .collect();
-    let layout = Arc::new(Layout::new(roles(&sizes, &shape), &pixels, &switches));
+    let mut layout = Layout::new(roles(&sizes, &shape), &pixels, &switches);
+    layout.storage_span = calibration.pulse.storage_span();
+    let layout = Arc::new(layout);
     let mut parameters = ParameterSet::new(
         beams
             .iter()
@@ -1419,7 +1429,7 @@ pub(crate) fn fit_counts_answer(
                     || !grid.covers(
                         params[layout.t0],
                         params[layout.flight_path],
-                        &laws(&params[layout.pulse..]),
+                        &laws(&params[layout.pulse..], layout.storage_span),
                     )?)
             },
         )?;
@@ -1476,7 +1486,7 @@ pub(crate) fn fit_counts_answer(
             && fit.coarse.covers(
                 fitted(layout.t0),
                 fitted(layout.flight_path),
-                &laws(&fit.result.params[layout.pulse..]),
+                &laws(&fit.result.params[layout.pulse..], layout.storage_span),
             )?;
         if !fit.converged || (settled && resolved && covered) || passes == MOST_PASSES {
             let weighted: Vec<[Option<f64>; 2]> = (0..regions.len())
@@ -1713,7 +1723,7 @@ pub(crate) fn fit_counts_answer(
         beta: [params[layout.pulse + 2], params[layout.pulse + 3]],
         r: params[layout.pulse + 4],
         fwhm_squared_us2: params[layout.pulse + 5],
-        r1: params[layout.pulse + 6],
+        r_high: calibration.pulse.r_high.map(|_| params[layout.pulse + 6]),
         time_background: [0, 1, 2].map(|i| params[layout.time_background + i]),
         room_background: params[layout.room_background],
         spread_share: params[layout.spread],
@@ -2319,6 +2329,7 @@ struct Layout {
     t0: usize,
     flight_path: usize,
     pulse: usize,
+    storage_span: Option<(f64, f64)>,
 }
 
 struct Place {
@@ -2383,6 +2394,7 @@ impl Layout {
             t0: at(Role::T0),
             flight_path: at(Role::FlightPath),
             pulse: at(Role::Pulse(0)),
+            storage_span: None,
             regions: places,
             roles,
         }
@@ -2621,7 +2633,7 @@ impl RegionsModel {
 
     fn scale(&self, params: &[f64]) -> Result<std::cell::Ref<'_, Scale>, FittingError> {
         let (t0_us, flight_path_m) = (params[self.layout.t0], params[self.layout.flight_path]);
-        let pulse = laws(&params[self.layout.pulse..]);
+        let pulse = laws(&params[self.layout.pulse..], self.layout.storage_span);
         let key = |t0: f64, l: f64| (t0.to_bits(), l.to_bits());
         let current = self.scale.borrow().as_ref().is_some_and(|s| {
             key(s.t0_us, s.flight_path_m) == key(t0_us, flight_path_m) && s.pulse == pulse
@@ -2945,14 +2957,23 @@ impl FitModel for RegionsModel {
         let mut pulse_slopes: Option<[Rows; 4]> = None;
         let ones = vec![1.0; self.energies.len()];
         let root_energy = &self.shapes[2];
+        let constant = || [ones.clone(), vec![0.0; ones.len()]];
+        let [low, high] = self.layout.storage_span.map_or_else(constant, |span| {
+            let [first, last] = [span.0, span.1].map(f64::sqrt);
+            let share: Vec<f64> = root_energy
+                .iter()
+                .map(|root| (root - first) / (last - first))
+                .collect();
+            [share.iter().map(|s| 1.0 - s).collect(), share]
+        });
         let pulse_columns: [(usize, &[f64]); 7] = [
             (0, root_energy),
             (0, &ones),
             (1, root_energy),
             (1, &ones),
-            (2, &ones),
+            (2, &low),
             (3, &ones),
-            (2, root_energy),
+            (2, &high),
         ];
         let (background, background_slopes) = self.time_background(params);
         let scaled = |factor: f64, values: &[f64]| -> Vec<f64> {
@@ -3405,11 +3426,13 @@ mod tests {
             Arc::new([synthetic_isotope(74, 184, 20.6, 0.01, 0.06)]),
         ];
         let sizes: Vec<usize> = beams.iter().map(|b| b.coefficients().len()).collect();
-        let layout = Arc::new(Layout::new(
+        let mut layout = Layout::new(
             roles(&sizes, &[Some(2), None, Some(1)]),
             &[4.0, 9.0, 2.0],
             &[[true, true], [false, false], [true, true]],
-        ));
+        );
+        layout.storage_span = Some(grid.pulse().energy_span_ev());
+        let layout = Arc::new(layout);
         let params: Vec<f64> = layout
             .roles
             .iter()
@@ -3435,7 +3458,7 @@ mod tests {
                 Role::SpreadShare => 0.15,
                 Role::T0 => T0_US + 0.05,
                 Role::FlightPath => FLIGHT_PATH_M + 0.003,
-                Role::Pulse(n) => [0.37, 0.06, 0.01, 0.24, 0.16, 0.3, 0.004][n],
+                Role::Pulse(n) => [0.37, 0.06, 0.01, 0.24, 0.16, 0.3, 0.25][n],
             })
             .collect();
         let model = RegionsModel::new(
@@ -3610,7 +3633,7 @@ mod tests {
                 beta: [Value::Known(0.0), Value::Known(0.25)],
                 r: Value::Known(0.15),
                 fwhm_squared_us2: Value::Known(0.0),
-                r1: Value::Known(0.0),
+                r_high: None,
                 energy_span_ev: (1.0, 200.0),
                 n_tau: 256,
                 line_span_ev: None,
@@ -3868,7 +3891,7 @@ mod tests {
                 beta: [Value::Known(0.0), Value::Known(0.25)],
                 r: Value::Known(0.15),
                 fwhm_squared_us2: Value::Known(0.0),
-                r1: Value::Known(0.0),
+                r_high: None,
                 energy_span_ev: (1.0, 200.0),
                 n_tau: 256,
                 line_span_ev: None,
@@ -4064,7 +4087,7 @@ mod tests {
                 library: EndfLibrary::EndfB8_1,
                 thickness_variance: Value::Known(0.0),
             };
-            excluded_bins(&edges, Some(&material), &numbers)
+            excluded_bins(&edges, Some(&material), &numbers, None)
         };
         assert!(bins(Value::Known(0.0)).is_empty());
         assert!(!bins(Value::Known(1e-6)).is_empty());

@@ -505,6 +505,13 @@ pub enum EnergyLaw {
     InverseLambda { a0: f64, a1: f64 },
     /// `exp(−E[meV]/kappa)` — storage fraction `R(E)`, → 0 in the eV regime.
     ExpMilliEv { kappa: f64 },
+    /// Linear in `√E` from `low` at `span_ev.0` to `high` at `span_ev.1` eV,
+    /// and between `low` and `high` at every energy.
+    SqrtEBetween {
+        low: f64,
+        high: f64,
+        span_ev: (f64, f64),
+    },
 }
 
 impl EnergyLaw {
@@ -530,6 +537,14 @@ impl EnergyLaw {
                 } else {
                     (-(e * 1000.0) / kappa).exp()
                 }
+            }
+            EnergyLaw::SqrtEBetween {
+                low,
+                high,
+                span_ev: (e_low, e_high),
+            } => {
+                let share = (e.sqrt() - e_low.sqrt()) / (e_high.sqrt() - e_low.sqrt());
+                (low + (high - low) * share).clamp(low.min(high), low.max(high))
             }
         }
     }

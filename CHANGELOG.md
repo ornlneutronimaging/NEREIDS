@@ -37,9 +37,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
   through the pulse: `G` integrates the slab escape over the outgoing
   energies and angles of elastic scattering, isotropic in the centre-of-mass
   frame.
-- The pulse's storage fraction is `R + R1*sqrt(E)`. `Pulse` gains `r1`, known
-  0 by default, which `fit_counts` and `fit_map` can fit; results report
-  `r1`. A pulse calibration needs `r1` known at 0.
+- The pulse's storage fraction can change with energy. `Pulse` gains `r_high`,
+  the storage fraction at the high end of `energy_span_ev`, linear in
+  `sqrt(E)` from `r` at its low end; `None`, the default, holds it at `r`.
+  `fit_counts` and `fit_map` can fit it; results report `r_high`. A pulse
+  calibration refuses it.
 
 ### Changed (breaking)
 

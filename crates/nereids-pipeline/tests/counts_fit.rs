@@ -223,7 +223,7 @@ fn known(pulse: &IkedaCarpenter) -> Pulse {
         beta: coefficients(&params.beta).map(Value::Known),
         r: Value::Known(coefficients(&params.r)[1]),
         fwhm_squared_us2: Value::Known(params.channel_fwhm_us.unwrap_or(0.0).powi(2)),
-        r1: Value::Known(0.0),
+        r_high: None,
         energy_span_ev: detector.energy_span_ev(),
         n_tau: detector.n_tau(),
         line_span_ev: None,
@@ -4172,13 +4172,13 @@ fn a_sample_or_pulse_the_calibration_does_not_cover_is_refused() {
 
 #[test]
 fn a_storage_fraction_rising_with_energy_is_recovered() {
-    let (r, r1) = (0.1, 0.02);
+    let (r, slope) = (0.1, 0.02);
     let mut setup = calibration_foil(&CALIBRATION_PULSE, T0_US, FLIGHT_PATH_M);
     let laws = setup.pulse.params().clone();
     setup.pulse = Arc::new(
         IkedaCarpenter::new(
             IkedaCarpenterParams {
-                r: EnergyLaw::SqrtE { a0: r1, a1: r },
+                r: EnergyLaw::SqrtE { a0: slope, a1: r },
                 ..laws
             },
             FLIGHT_PATH_M,
@@ -4197,27 +4197,50 @@ fn a_storage_fraction_rising_with_energy_is_recovered() {
         &calibration_sample(CALIBRATION_DENSITY),
     );
     let m = calibration_measurement(&setup, (rounded(&counts.0), rounded(&counts.1)));
-    let fit_with = |storage_slope| {
+    let span = calibration(&setup).pulse.energy_span_ev;
+    let truth = [span.0, span.1].map(|energy| r + slope * energy.sqrt());
+    let fit_with = |high| {
         let mut calibration = calibration(&setup);
         calibration.pulse.r = Value::Fitted(0.15);
-        calibration.pulse.r1 = storage_slope;
+        calibration.pulse.r_high = high;
         fit_counts(&m, &calibration).expect("fit")
     };
-    let fit = fit_with(Value::Fitted(0.0));
+    let fit = fit_with(Some(Value::Fitted(0.15)));
     assert!(fit.converged);
-    let pulls: Vec<f64> = [(fit.r, r), (fit.r1, r1)]
+    let pulls: Vec<f64> = [fit.r, fit.r_high.expect("R_high")]
         .iter()
+        .zip(truth)
         .enumerate()
-        .map(|(i, &(estimate, truth))| (estimate - truth) / error_bar(&fit, 2 + i))
+        .map(|(i, (estimate, truth))| (estimate - truth) / error_bar(&fit, 2 + i))
         .collect();
     assert!(pulls.iter().all(|p| p.abs() <= BOUND.sqrt()), "{pulls:?}");
-    let constant = fit_with(Value::Known(0.0));
+    let constant = fit_with(None);
     assert!(
         constant.deviance - fit.deviance >= 10.0,
         "{} vs {}",
         constant.deviance,
         fit.deviance
     );
+}
+
+#[test]
+fn a_storage_fraction_on_its_bound_converges_there() {
+    let mut pulse = CALIBRATION_PULSE;
+    pulse[4] = 0.0;
+    let setup = calibration_foil(&pulse, T0_US, FLIGHT_PATH_M);
+    let counts = expected(
+        &setup,
+        &beam(CALIBRATION_LEVEL),
+        &calibration_sample(CALIBRATION_DENSITY),
+    );
+    let m = calibration_measurement(&setup, (rounded(&counts.0), rounded(&counts.1)));
+    let mut calibration = calibration(&setup);
+    calibration.pulse.r = Value::Fitted(0.15);
+    calibration.pulse.r_high = Some(Value::Fitted(0.15));
+    let fit = fit_counts(&m, &calibration).expect("fit");
+    assert!(fit.converged);
+    let ends = [fit.r, fit.r_high.expect("R_high")];
+    assert!(ends.iter().all(|r| (0.0..1e-3).contains(r)), "{ends:?}");
 }
 
 mod pulse_calibration {

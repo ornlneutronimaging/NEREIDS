@@ -157,8 +157,10 @@ Ikeda-Carpenter pulse in the calibration block, not a tabulated resolution.
 Each fitted quantity is a number (known) or an object with a kind
 ("known", "fitted", "within" or "measured") and the matching fields, so a
 manifest can free or fix the temperature, a background term, the
-normalization, t0, the flight path and each pulse number. The pulse's "r1",
-the storage fraction's change with sqrt(E), is known 0 unless given.
+normalization, t0, the flight path and each pulse number. The pulse's
+"r_high" is the storage fraction at the high end of its energy span, linear in
+sqrt(E) from "r" at the low end; without it the storage fraction is "r"
+throughout.
 Isotope densities are fitted from their `initial_density` values. All
 isotopes in a material must use the same ENDF library; its library also
 determines which resonance windows the fit excludes.

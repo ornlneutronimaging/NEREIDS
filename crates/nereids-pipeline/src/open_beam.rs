@@ -21,13 +21,13 @@ use crate::pulse_calibration::PulsePrior;
 /// grid to be accepted.
 pub const BOUND: f64 = 0.01;
 
-pub(crate) const PULSE_NUMBERS: [&str; 7] = ["α₀", "α₁", "β₀", "β₁", "R", "h²", "R₁"];
+pub(crate) const PULSE_NUMBERS: [&str; 7] = ["α₀", "α₁", "β₀", "β₁", "R", "h²", "R_high"];
 
 const RATE: (RangeInclusive<f64>, &str) = (0.0..=f64::INFINITY, "0 or more");
 
-const ANY: (RangeInclusive<f64>, &str) = (f64::NEG_INFINITY..=f64::INFINITY, "any real number");
+const FRACTION: (RangeInclusive<f64>, &str) = (0.0..=1.0, "within 0–1");
 
-const STORAGE: usize = 4;
+const CONSTANT: Value = Value::Known(0.0);
 
 /// A neutron of flight time `u` over the flight path `flight_path_m` (m)
 /// arrives at `t0_us + u` (µs) plus a delay drawn from `pulse`.
@@ -44,10 +44,7 @@ pub struct Calibration {
 impl Calibration {
     pub(crate) fn instrument(&self) -> Result<Vec<FitParameter>, PipelineError> {
         let pulse = &self.pulse;
-        let mut ranges = [RATE, RATE, RATE, RATE, (0.0..=1.0, "within 0–1"), RATE, ANY];
-        if pulse.r1 != Value::Known(0.0) {
-            ranges[STORAGE] = ANY;
-        }
+        let ranges = [RATE, RATE, RATE, RATE, FRACTION, RATE, FRACTION];
         let mut parameters = vec![
             self.t0_us
                 .parameter("t0", f64::NEG_INFINITY..=f64::INFINITY, "any real number")?,
@@ -67,25 +64,25 @@ impl Calibration {
 }
 
 /// The Ikeda–Carpenter pulse with `α = α₀√E + α₁` and `β = β₀√E + β₁` in
-/// 1/µs, `E` in eV, a storage fraction `R + R₁√E` over `energy_span_ev`, and
-/// the proton pulse's triangle of FWHM `h` in µs, given by `h²`, in which the
-/// counts are smooth down to `h = 0`.  `α` and `β` must be at least 1e-9 µs⁻¹
-/// across the span, `β` even where the storage fraction is 0, and the storage
-/// fraction within 0–1.
+/// 1/µs, `E` in eV, a storage fraction `R` over `energy_span_ev`, or linear in
+/// `√E` from `R` at its low end to `R_high` at its high end, and the proton
+/// pulse's triangle of FWHM `h` in µs, given by `h²`, in which the counts are
+/// smooth down to `h = 0`.  `α` and `β` must be at least 1e-9 µs⁻¹ across the
+/// span, `β` even where the storage fraction is 0.
 #[derive(Debug, Clone)]
 pub struct Pulse {
     /// `[α₀, α₁]`, in 1/(µs·√eV) and 1/µs, each 0 or more.
     pub alpha: [Value; 2],
     /// `[β₀, β₁]`, in 1/(µs·√eV) and 1/µs, each 0 or more.
     pub beta: [Value; 2],
-    /// `R`, within 0–1 while [`Self::r1`] is known to be 0, any real number
-    /// otherwise.
+    /// `R`, within 0–1: the storage fraction, at the low end of
+    /// `energy_span_ev` when [`Self::r_high`] is given.
     pub r: Value,
     /// `h²` in µs², 0 or more.
     pub fwhm_squared_us2: Value,
-    /// `R₁` in 1/√eV, any real number; known 0 holds the storage fraction
-    /// constant.
-    pub r1: Value,
+    /// `R_high`, within 0–1: the storage fraction at the high end of
+    /// `energy_span_ev`, linear in `√E` from `R`.  `None` holds it at `R`.
+    pub r_high: Option<Value>,
     /// `(low, high)`, the energies in eV the laws hold over; a window that
     /// neutrons from outside them can reach is refused.
     pub energy_span_ev: (f64, f64),
@@ -109,7 +106,8 @@ pub struct Pulse {
 }
 
 impl Pulse {
-    /// `[α₀, α₁, β₀, β₁, R, h², R₁]`, in the order of the fit's pulse numbers.
+    /// `[α₀, α₁, β₀, β₁, R, h², R_high]`, in the order of the fit's pulse
+    /// numbers; `R_high` known 0 and unused without one.
     pub(crate) fn numbers(&self) -> [&Value; 7] {
         [
             &self.alpha[0],
@@ -118,17 +116,29 @@ impl Pulse {
             &self.beta[1],
             &self.r,
             &self.fwhm_squared_us2,
-            &self.r1,
+            self.r_high.as_ref().unwrap_or(&CONSTANT),
         ]
     }
 
+    /// The energies in eV the storage fraction changes over, `None` when it
+    /// is constant.
+    pub(crate) fn storage_span(&self) -> Option<(f64, f64)> {
+        self.r_high.map(|_| self.energy_span_ev)
+    }
+
     pub(crate) fn at(&self, numbers: &[f64]) -> Result<DetectorPulse, PipelineError> {
-        DetectorPulse::new(laws(numbers), self.energy_span_ev, self.n_tau)
-            .map_err(|e| PipelineError::InvalidParameter(e.to_string()))
+        DetectorPulse::new(
+            laws(numbers, self.storage_span()),
+            self.energy_span_ev,
+            self.n_tau,
+        )
+        .map_err(|e| PipelineError::InvalidParameter(e.to_string()))
     }
 }
 
-pub(crate) fn laws(numbers: &[f64]) -> IkedaCarpenterParams {
+/// The laws of pulse numbers `numbers`, the storage fraction linear in `√E`
+/// from `R` to `R_high` over `storage_span`, or `R` without it.
+pub(crate) fn laws(numbers: &[f64], storage_span: Option<(f64, f64)>) -> IkedaCarpenterParams {
     IkedaCarpenterParams {
         alpha: EnergyLaw::SqrtE {
             a0: numbers[0],
@@ -138,10 +148,13 @@ pub(crate) fn laws(numbers: &[f64]) -> IkedaCarpenterParams {
             a0: numbers[2],
             a1: numbers[3],
         },
-        r: EnergyLaw::SqrtE {
-            a0: numbers[6],
-            a1: numbers[4],
-        },
+        r: storage_span.map_or(EnergyLaw::Const(numbers[4]), |span_ev| {
+            EnergyLaw::SqrtEBetween {
+                low: numbers[4],
+                high: numbers[6],
+                span_ev,
+            }
+        }),
         burst_sigma_us: None,
         channel_fwhm_us: Some(numbers[5].sqrt()),
     }
