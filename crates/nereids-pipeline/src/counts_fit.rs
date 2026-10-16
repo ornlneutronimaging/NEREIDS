@@ -20,6 +20,7 @@ use nereids_fitting::statistics::{Consistency, consistency};
 use nereids_physics::continuous_doppler::{
     Channel, QuadratureBudget, SUPPORT_X, broaden_channel, broaden_with_budget,
 };
+use nereids_physics::detector_spread::region_shares;
 use nereids_physics::doppler::DopplerParams;
 use nereids_physics::flight_time_grid::{FlightTimeGrid, Rows};
 use nereids_physics::forward_scatter::{ForwardYield, forward_yield, lowest_exit_ratio};
@@ -127,6 +128,9 @@ pub struct Measurement {
     /// Counts that follow each run's duration, not its proton charge; `None`
     /// for none.
     pub room_background: Option<RoomBackground>,
+    /// Counts the detector records in another region than the one they
+    /// arrive in; `None` for none.
+    pub spread: Option<Spread>,
     /// The regions, separate sets of pixels timed by one clock.
     pub regions: Vec<Region>,
 }
@@ -147,6 +151,28 @@ pub struct RoomBackground {
     /// The frames each run recorded, the open-beam run's then the sample
     /// run's, finite and positive.
     pub frames: [f64; 2],
+}
+
+/// A share `h` of the counts arriving in each cell of a detector grid that
+/// the detector records elsewhere, spread by the radial kernel
+/// `Σ_c w_c·exp(−r/s_c)/(2π s_c²)`
+/// ([`transfer`](nereids_physics::detector_spread::transfer)): region `r`
+/// records `(1 − h)·μ_r + h·Σ_q F_rq·μ_q` of the counts `μ` arriving in the
+/// regions in each bin of both runs, `F_rq` the share of the spread counts
+/// arriving evenly over region `q`'s cells that lands in region `r`'s cells
+/// ([`region_shares`]).  Cells in no region neither send nor record counts.
+#[derive(Debug, Clone, PartialEq)]
+pub struct Spread {
+    /// `h`, within 0–1.
+    pub share: Value,
+    /// `(w_c, s_c)`: each term's weight, finite and positive, normalized by
+    /// their sum, and length in cells, finite and positive.
+    pub kernel: Vec<(f64, f64)>,
+    /// The grid's rows and columns.
+    pub grid: [usize; 2],
+    /// Each region's cells as `[row, column]`, in the order of
+    /// [`Measurement::regions`]; a cell is in one region at most.
+    pub cells: Vec<Vec<[usize; 2]>>,
 }
 
 /// The counts of a set of pixels in both runs, its background and the
@@ -244,12 +270,16 @@ pub struct CountsFit {
     /// The room background's `ρ`: the known one, the fitted one, or 0 without
     /// one.
     pub room_background: f64,
+    /// The spread's `h`: the known one, the fitted one, or 0 without one.
+    pub spread_share: f64,
     /// Covariance of the fitted quantities among, in this order, each region's
     /// densities, in the order given, temperature and thickness variance,
     /// region by region; the
     /// normalization; each region's `b0`, `b1`, `b2`, `d` and `f`, region by region;
-    /// each region's gamma transmission, region by region; the time
-    /// background's `C`, `A` and `τ`; the room background's `ρ`; `t0`; the
+    /// each region's gamma transmission, region by region; each region's
+    /// capture gammas' `ε`, region by region; each region's in-scatter's `Ω`,
+    /// region by region; the time background's `C`, `A` and `τ`; the room
+    /// background's `ρ`; the spread's `h`; `t0`; the
     /// flight path; `α₀`, `α₁`,
     /// `β₀`, `β₁`, `R` and `h²`: the inverse of the information at the fit, each run's expected information over its
     /// overdispersion plus `1/sd²` for each measured quantity and `C⁻¹` over
@@ -702,6 +732,9 @@ pub(crate) fn checked<'a>(
             room.frames
         ));
     }
+    if let Some(spread) = &measurement.spread {
+        spread_checked(spread, regions.len())?;
+    }
     if let Some((r, region)) = regions
         .iter()
         .enumerate()
@@ -929,7 +962,6 @@ fn nuclear_slopes(
     let jacobian = model
         .analytical_jacobian(&params, &free, &mu)
         .expect("the counts model has an analytical Jacobian");
-    let bins = mu.len() / (2 * regions.len());
     let mut picked: Vec<(&ResonanceCovariance, usize, Vec<f64>)> = Vec::new();
     for (r, material) in regions
         .iter()
@@ -948,15 +980,15 @@ fn nuclear_slopes(
                     *[&mut resonance.energy, &mut resonance.gn, &mut resonance.gg][p % 3] += by;
                     copy
                 };
-                let folded =
+                let slope =
                     model
                         .model
                         .resonance_slope(&params, r, *i, [&shifted(h), &shifted(-h)], h)?;
-                let rows = (2 * r + 1) * bins..(2 * r + 2) * bins;
                 let cross = (0..free.len())
                     .map(|j| {
-                        rows.clone()
-                            .zip(&folded)
+                        slope
+                            .iter()
+                            .enumerate()
                             .filter(|(k, _)| mu[*k] > 0.0)
                             .map(|(k, c)| {
                                 jacobian.get(k, j) * c * model.live[k] / (mu[k] * dispersion[k])
@@ -1147,6 +1179,10 @@ pub(crate) fn fit_counts_answer(
     let frames = measurement
         .room_background
         .map_or([0.0; 2], |room| room.frames);
+    let mixing = measurement
+        .spread
+        .as_ref()
+        .map(|spread| Arc::new(region_shares(&spread.kernel, spread.grid, &spread.cells)));
     let bins = time_edges_us.len() - 1;
     if let Some(starts) = starts {
         assert_eq!(starts.beams.len(), regions.len(), "one beam per region");
@@ -1324,7 +1360,8 @@ pub(crate) fn fit_counts_answer(
                         (*charge_ratio, frames),
                         beam_origin_us,
                         &layout,
-                    ),
+                    )
+                    .spread(mixing.clone()),
                     live: &live,
                 })
             },
@@ -1474,7 +1511,8 @@ pub(crate) fn fit_counts_answer(
                 (*charge_ratio, frames),
                 beam_origin_us,
                 &layout,
-            ),
+            )
+            .spread(mixing.clone()),
             live: &live,
         };
         nuclear_slopes(regions, &model, &dispersion, &parameters)?
@@ -1628,6 +1666,7 @@ pub(crate) fn fit_counts_answer(
         fwhm_squared_us2: params[layout.pulse + 5],
         time_background: [0, 1, 2].map(|i| params[layout.time_background + i]),
         room_background: params[layout.room_background],
+        spread_share: params[layout.spread],
         covariance,
         unbounded,
         on_bound,
@@ -1978,6 +2017,7 @@ pub(crate) enum Role {
     InScatter { region: usize },
     TimeBackground(usize),
     RoomBackground,
+    SpreadShare,
     T0,
     FlightPath,
     Pulse(usize),
@@ -2014,7 +2054,12 @@ fn roles(beams: &[usize], isotopes: &[Option<usize>]) -> Vec<Role> {
         .chain(captures)
         .chain(scatters)
         .chain((0..3).map(Role::TimeBackground))
-        .chain([Role::RoomBackground, Role::T0, Role::FlightPath])
+        .chain([
+            Role::RoomBackground,
+            Role::SpreadShare,
+            Role::T0,
+            Role::FlightPath,
+        ])
         .chain((0..6).map(Role::Pulse))
         .collect()
 }
@@ -2110,8 +2155,56 @@ fn quantity(
             0.0..=f64::INFINITY,
             "0 or more".into(),
         ),
+        Role::SpreadShare => (
+            measurement
+                .spread
+                .as_ref()
+                .map_or(&Value::Known(0.0), |spread| &spread.share),
+            "detector spread h".into(),
+            0.0..=1.0,
+            "within 0–1".into(),
+        ),
         Role::Beam { .. } | Role::T0 | Role::FlightPath | Role::Pulse(_) => return None,
     })
+}
+
+fn spread_checked(spread: &Spread, regions: usize) -> Result<(), PipelineError> {
+    let invalid = |message: String| Err(PipelineError::InvalidParameter(message));
+    let [rows, columns] = spread.grid;
+    if spread.kernel.is_empty()
+        || !spread
+            .kernel
+            .iter()
+            .all(|&(w, s)| w.is_finite() && w > 0.0 && s.is_finite() && s > 0.0)
+    {
+        return invalid(format!(
+            "the spread kernel needs terms of finite, positive weight and length, got {:?}",
+            spread.kernel
+        ));
+    }
+    if spread.cells.len() != regions {
+        return invalid(format!(
+            "the spread gives the cells of {} regions for {regions} regions",
+            spread.cells.len()
+        ));
+    }
+    let mut taken = vec![false; rows * columns];
+    for (r, cells) in spread.cells.iter().enumerate() {
+        if cells.is_empty() {
+            return invalid(format!("the spread gives region {r} no cells"));
+        }
+        for &[row, column] in cells {
+            if row >= rows || column >= columns {
+                return invalid(format!(
+                    "cell [{row}, {column}] of region {r} is off the {rows}×{columns} grid"
+                ));
+            }
+            if std::mem::replace(&mut taken[row * columns + column], true) {
+                return invalid(format!("cell [{row}, {column}] is in two regions"));
+            }
+        }
+    }
+    Ok(())
 }
 
 fn in_region(region: usize, error: PipelineError) -> PipelineError {
@@ -2178,6 +2271,7 @@ struct Layout {
     normalization: usize,
     time_background: usize,
     room_background: usize,
+    spread: usize,
     t0: usize,
     flight_path: usize,
     pulse: usize,
@@ -2241,6 +2335,7 @@ impl Layout {
             normalization: at(Role::Normalization),
             time_background: at(Role::TimeBackground(0)),
             room_background: at(Role::RoomBackground),
+            spread: at(Role::SpreadShare),
             t0: at(Role::T0),
             flight_path: at(Role::FlightPath),
             pulse: at(Role::Pulse(0)),
@@ -2263,6 +2358,7 @@ struct RegionsModel {
     frames: [f64; 2],
     layout: Arc<Layout>,
     scale: RefCell<Option<Scale>>,
+    mixing: Option<Arc<Vec<Vec<f64>>>>,
 }
 
 struct Absorber {
@@ -2424,7 +2520,14 @@ impl RegionsModel {
                 beams,
                 beam_origin_us,
             ))),
+            mixing: None,
         }
+    }
+
+    /// The model with the spread's shares `F_rq` between the regions.
+    fn spread(mut self, mixing: Option<Arc<Vec<Vec<f64>>>>) -> Self {
+        self.mixing = mixing;
+        self
     }
 
     fn at(
@@ -2617,9 +2720,9 @@ impl RegionsModel {
         })
     }
 
-    /// The slope of region `region`'s sample counts per bin in one resonance
-    /// parameter of its isotope `isotope`, from the isotope's data with the
-    /// parameter moved by `+h` and by `−h`.
+    /// The slope of the counts of every bin of both runs of every region, in
+    /// one resonance parameter of region `region`'s isotope `isotope`, from the
+    /// isotope's data with the parameter moved by `+h` and by `−h`.
     fn resonance_slope(
         &self,
         params: &[f64],
@@ -2676,7 +2779,14 @@ impl RegionsModel {
                 *c += beams.normalized[j] * params[place.scatter] * through;
             }
         }
-        Ok(predicted(&scale.rows, &column)?)
+        let folded = predicted(&scale.rows, &column)?;
+        let bins = folded.len();
+        let mut arriving = vec![0.0; 2 * bins * self.layout.regions.len()];
+        arriving[(2 * region + 1) * bins..(2 * region + 2) * bins].copy_from_slice(&folded);
+        Ok(match &self.mixing {
+            Some(shares) => mixed(shares, params[self.layout.spread], &arriving),
+            None => arriving,
+        })
     }
 
     fn time_background(&self, params: &[f64]) -> (Vec<f64>, [Vec<f64>; 3]) {
@@ -2702,8 +2812,8 @@ impl RegionsModel {
     }
 }
 
-impl FitModel for RegionsModel {
-    fn evaluate(&self, params: &[f64]) -> Result<Vec<f64>, FittingError> {
+impl RegionsModel {
+    fn arriving(&self, params: &[f64]) -> Result<Vec<f64>, FittingError> {
         let scale = self.scale(params)?;
         let (background, _) = self.time_background(params);
         let [open_room, sample_room] = self.room_per_pixel();
@@ -2729,6 +2839,34 @@ impl FitModel for RegionsModel {
             );
         }
         Ok(counts)
+    }
+}
+
+/// The counts each region records, `(1 − h)·μ_r + h·Σ_q F_rq·μ_q` in every
+/// bin of both runs, from the counts `μ` arriving in the regions' blocks in
+/// turn.
+fn mixed(shares: &[Vec<f64>], h: f64, arriving: &[f64]) -> Vec<f64> {
+    let block = arriving.len() / shares.len();
+    (0..arriving.len())
+        .map(|i| {
+            let (r, k) = (i / block, i % block);
+            (1.0 - h) * arriving[i]
+                + h * shares[r]
+                    .iter()
+                    .enumerate()
+                    .map(|(q, f)| f * arriving[q * block + k])
+                    .sum::<f64>()
+        })
+        .collect()
+}
+
+impl FitModel for RegionsModel {
+    fn evaluate(&self, params: &[f64]) -> Result<Vec<f64>, FittingError> {
+        let arriving = self.arriving(params)?;
+        Ok(match &self.mixing {
+            Some(shares) => mixed(shares, params[self.layout.spread], &arriving),
+            None => arriving,
+        })
     }
 
     fn analytical_jacobian(
@@ -2939,6 +3077,7 @@ impl FitModel for RegionsModel {
                         ]
                     })
                     .collect(),
+                Role::SpreadShare => vec![],
                 Role::RoomBackground => {
                     let [open_room, sample_room] = self.room_per_pixel();
                     (0..regions)
@@ -3026,7 +3165,29 @@ impl FitModel for RegionsModel {
                 }
             }
         }
-        Some(jacobian)
+        let Some(shares) = &self.mixing else {
+            return Some(jacobian);
+        };
+        let h = params[layout.spread];
+        let arriving = self.arriving(params).ok()?;
+        let along_share: Vec<f64> = mixed(shares, 1.0, &arriving)
+            .iter()
+            .zip(&arriving)
+            .map(|(m, a)| m - a)
+            .collect();
+        let mut recorded = FlatMatrix::zeros(y_current.len(), free_param_indices.len());
+        for (col, &index) in free_param_indices.iter().enumerate() {
+            let column = if layout.roles[index] == Role::SpreadShare {
+                along_share.clone()
+            } else {
+                let slope: Vec<f64> = (0..y_current.len()).map(|i| jacobian.get(i, col)).collect();
+                mixed(shares, h, &slope)
+            };
+            for (i, value) in column.into_iter().enumerate() {
+                *recorded.get_mut(i, col) = value;
+            }
+        }
+        Some(recorded)
     }
 }
 
@@ -3059,11 +3220,14 @@ mod tests {
     fn a_resonance_slope_is_the_slope_of_the_sample_counts() {
         let grid = grid(None);
         let (_, u_hi) = grid.range_us();
-        let beams = [BeamSpline::constant(347.0, u_hi, 1.0e4)];
+        let beams = [
+            BeamSpline::constant(347.0, u_hi, 1.0e4),
+            BeamSpline::constant(347.0, u_hi, 2.0e4),
+        ];
         let layout = Arc::new(Layout::new(
-            roles(&[beams[0].coefficients().len()], &[Some(1)]),
-            &[4.0],
-            &[[true; 2]],
+            roles(&[beams[0].coefficients().len(); 2], &[Some(1), None]),
+            &[4.0, 9.0],
+            &[[true; 2], [false; 2]],
         ));
         let params: Vec<f64> = layout
             .roles
@@ -3076,11 +3240,12 @@ mod tests {
                 Role::ThicknessVariance { .. } => 0.02,
                 Role::Normalization => 0.93,
                 Role::Background { term, .. } => [0.05, 0.5, -0.01, 0.03, 4.0][term],
-                Role::GammaTransmission { .. } => 0.8,
-                Role::CaptureGammas { .. } => 0.05,
-                Role::InScatter { .. } => 0.3,
+                Role::GammaTransmission { region } => [0.8, 1.0][region],
+                Role::CaptureGammas { region } => [0.05, 0.0][region],
+                Role::InScatter { region } => [0.3, 0.0][region],
                 Role::TimeBackground(term) => [50.0, 300.0, 40.0][term],
                 Role::RoomBackground => 2.0e-3,
+                Role::SpreadShare => 0.15,
                 Role::T0 => T0_US + 0.05,
                 Role::FlightPath => FLIGHT_PATH_M + 0.003,
                 Role::Pulse(n) => [0.37, 0.06, 0.01, 0.24, 0.16, 0.3][n],
@@ -3088,7 +3253,7 @@ mod tests {
             .collect();
         let data = synthetic_isotope(72, 180, 20.0, 0.01, 0.06);
         let model = |data: &ResonanceData| {
-            let isotopes: [Arc<[ResonanceData]>; 1] = [Arc::new([data.clone()])];
+            let isotopes: [Arc<[ResonanceData]>; 2] = [Arc::new([data.clone()]), Arc::new([])];
             RegionsModel::new(
                 &grid,
                 &beams,
@@ -3097,6 +3262,7 @@ mod tests {
                 T0_US,
                 &layout,
             )
+            .spread(Some(Arc::new(vec![vec![0.9, 0.1], vec![0.2, 0.8]])))
         };
         let h = 1e-4 * data.ranges[0].l_groups[0].resonances[0].gg;
         let moved = |by: f64| {
@@ -3115,9 +3281,7 @@ mod tests {
             .map(|(u, d)| (u - d) / (2.0 * h))
             .collect();
         let column = differences.iter().fold(0.0_f64, |m, s| m.max(s.abs()));
-        let bins = slope.len();
-        for (k, &difference) in differences.iter().enumerate() {
-            let analytic = if k < bins { 0.0 } else { slope[k - bins] };
+        for (k, (&analytic, &difference)) in slope.iter().zip(&differences).enumerate() {
             assert!(
                 (analytic - difference).abs() <= 1e-6 * column,
                 "{k}: {analytic} vs {difference}"
@@ -3165,6 +3329,7 @@ mod tests {
                 Role::InScatter { region } => [0.3, 0.2, 0.4][region],
                 Role::TimeBackground(term) => [50.0, 300.0, 40.0][term],
                 Role::RoomBackground => 2.0e-3,
+                Role::SpreadShare => 0.15,
                 Role::T0 => T0_US + 0.05,
                 Role::FlightPath => FLIGHT_PATH_M + 0.003,
                 Role::Pulse(n) => [0.37, 0.06, 0.01, 0.24, 0.16, 0.3][n],
@@ -3177,7 +3342,12 @@ mod tests {
             (1.2, [3.0e4, 2.5e4]),
             T0_US,
             &layout,
-        );
+        )
+        .spread(Some(Arc::new(vec![
+            vec![0.8, 0.1, 0.05],
+            vec![0.1, 0.7, 0.1],
+            vec![0.05, 0.15, 0.8],
+        ])));
         let live: Vec<f64> = (0..model.evaluate(&params).expect("counts").len())
             .map(|k| 0.9 + 0.1 * (0.3 * k as f64).sin())
             .collect();
@@ -3270,6 +3440,7 @@ mod tests {
                 Role::GammaTransmission { .. } => 1.0,
                 Role::CaptureGammas { .. } => 0.0,
                 Role::InScatter { .. } => 0.0,
+                Role::SpreadShare => 0.0,
                 Role::TimeBackground(term) => [0.0, 0.0, 1.0][term],
                 Role::RoomBackground => 0.0,
                 Role::T0 => T0_US,
@@ -3295,6 +3466,7 @@ mod tests {
             normalization: Value::Fitted(1.0),
             time_background: NO_TIME_BACKGROUND,
             room_background: None,
+            spread: None,
             regions: materials
                 .into_iter()
                 .enumerate()
@@ -3476,6 +3648,7 @@ mod tests {
         let drifting = Measurement {
             time_background: [Value::Fitted(50.0), Value::Known(0.0), Value::Known(1.0)],
             room_background: None,
+            spread: None,
             ..measurement
         };
         for (most_passes, settled) in [(1, false), (2, true)] {
@@ -3519,6 +3692,7 @@ mod tests {
                 Role::GammaTransmission { .. } => 1.0,
                 Role::CaptureGammas { .. } => 0.0,
                 Role::InScatter { .. } => 0.0,
+                Role::SpreadShare => 0.0,
                 Role::TimeBackground(term) => [0.0, 0.0, 1.0][term],
                 Role::RoomBackground => 0.0,
                 Role::T0 => T0_US,
@@ -3623,6 +3797,7 @@ mod tests {
             normalization: map.normalization,
             time_background: NO_TIME_BACKGROUND,
             room_background: None,
+            spread: None,
             regions: vec![
                 region(0, Some(material), background),
                 region(1, None, [Value::Known(0.0); 5]),
@@ -3741,7 +3916,7 @@ mod tests {
                 .copied()
                 .chain([3.0e-4, 5.0e-4, 300.0, 0.0, normalization])
                 .chain(background)
-                .chain([1.0, 0.0, 0.0, 0.0, 0.0, 1.0, 0.0])
+                .chain([1.0, 0.0, 0.0, 0.0, 0.0, 1.0, 0.0, 0.0])
                 .chain([T0_US, FLIGHT_PATH_M])
                 .chain([0.35, 0.05, 0.0, 0.25, 0.15, 0.0])
                 .collect();

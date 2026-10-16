@@ -1136,13 +1136,34 @@ class RoomBackground:
     @property
     def frames(self) -> tuple[float, float]: ...
 
+class Spread:
+    """Counts the detector records in another region than the one they arrive in.
+
+    share is h; kernel holds (weight, length in cells) terms of the radial
+    kernel sum(w*exp(-r/s)/(2*pi*s**2)); grid is (rows, columns); cells
+    holds each region's cells as (row, column), in the order of the regions.
+    """
+
+    def __init__(
+        self,
+        share: Value,
+        kernel: list[tuple[float, float]],
+        grid: tuple[int, int],
+        cells: list[list[tuple[int, int]]],
+    ) -> None: ...
+    @property
+    def share(self) -> Value: ...
+    @property
+    def kernel(self) -> list[tuple[float, float]]: ...
+
 class Measurement:
     """An open-beam run and a sample run recorded in the same time bins.
 
     time_edges_us are the time-bin edges in microseconds and charge_ratio is
     the sample run proton charge over the open-beam run.  normalization is the
     sample run normalization a.  time_background is [C, A, tau] or
-    NO_TIME_BACKGROUND; room_background is a RoomBackground or None.
+    NO_TIME_BACKGROUND; room_background is a RoomBackground or None; spread
+    is a Spread or None.
     """
 
     def __init__(
@@ -1153,6 +1174,7 @@ class Measurement:
         regions: list[Region],
         time_background: list[Value] | None = None,
         room_background: RoomBackground | None = None,
+        spread: Spread | None = None,
     ) -> None: ...
     @property
     def time_edges_us(self) -> NDArray[np.float64]: ...
@@ -1164,6 +1186,8 @@ class Measurement:
     def time_background(self) -> list[Value]: ...
     @property
     def room_background(self) -> RoomBackground | None: ...
+    @property
+    def spread(self) -> Spread | None: ...
     @property
     def regions(self) -> list[Region]: ...
 
@@ -1263,6 +1287,8 @@ class CountsFit:
     def time_background(self) -> list[float]: ...
     @property
     def room_background(self) -> float: ...
+    @property
+    def spread_share(self) -> float: ...
     @property
     def covariance(self) -> NDArray[np.float64] | None: ...
     @property

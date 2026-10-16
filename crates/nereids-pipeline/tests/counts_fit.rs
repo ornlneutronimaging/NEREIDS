@@ -21,7 +21,7 @@ use nereids_physics::resolution::{ResolutionFunction, TOF_FACTOR};
 use nereids_physics::transmission::broadened_cross_sections;
 use nereids_pipeline::counts_fit::{
     CountsFit, Material, Measurement, NEGLIGIBLE_PREDICTION, NO_TIME_BACKGROUND, Region, RegionFit,
-    RoomBackground, Value, fit_counts,
+    RoomBackground, Spread, Value, fit_counts,
 };
 use nereids_pipeline::counts_map::{CountsMap, MapMeasurement, Patch, fit_map};
 use nereids_pipeline::error::PipelineError;
@@ -249,6 +249,7 @@ fn measurement(
         normalization: Value::Known(1.0),
         time_background: NO_TIME_BACKGROUND,
         room_background: None,
+        spread: None,
         regions: vec![Region {
             open_counts: open,
             sample_counts: sample,
@@ -362,6 +363,7 @@ fn the_time_background_is_in_both_runs_of_every_region_by_its_pixels_and_gamma_t
         normalization: sample(a),
         time_background: numbers,
         room_background: None,
+        spread: None,
         regions: (0..2)
             .map(|r| Region {
                 open_counts: rounded(&runs[r][0].0),
@@ -675,6 +677,7 @@ fn an_empty_area_with_a_known_background_adds_its_counts_information_on_the_norm
             normalization: Value::Fitted(1.0),
             time_background: NO_TIME_BACKGROUND,
             room_background: None,
+            spread: None,
             regions: regions.to_vec(),
         };
         let fit = fit_counts(&m, &calibration(&setup)).expect("fit");
@@ -986,6 +989,7 @@ fn a_map_recovers_each_patch_and_its_covariance_between_patches_is_the_shared_qu
             normalization: map.normalization,
             time_background: NO_TIME_BACKGROUND,
             room_background: None,
+            spread: None,
             regions: (0..4)
                 .map(|j| {
                     region(
@@ -1057,6 +1061,7 @@ fn a_map_recovers_each_patch_and_its_covariance_between_patches_is_the_shared_qu
             normalization: Value::Known(result.normalization),
             time_background: NO_TIME_BACKGROUND,
             room_background: None,
+            spread: None,
             regions: vec![Region {
                 open_counts,
                 sample_counts,
@@ -1227,6 +1232,7 @@ fn a_map_fits_the_time_background_its_patches_share_as_the_joint_fit_does() {
             normalization: map.normalization,
             time_background: start,
             room_background: None,
+            spread: None,
             regions: vec![
                 region(0..2, 0..2, Some(material.clone())),
                 region(0..2, 2..4, Some(material.clone())),
@@ -1391,6 +1397,7 @@ fn the_room_background_follows_each_run_s_frames_apart_from_the_time_background(
                 normalization: map.normalization,
                 time_background: time,
                 room_background,
+                spread: None,
                 regions: vec![
                     region(0..2, 0..2, Some(material.clone())),
                     region(0..2, 2..4, Some(material.clone())),
@@ -1744,6 +1751,173 @@ fn in_scatter_is_recovered_with_the_density_and_temperature() {
 
     let without = fit_with(Value::Known(0.0));
     let (t, sd) = (without.temperature(), error_bar(&without, 1));
+    let recovered = without.converged && (t - TEMPERATURE_K).abs() <= 5.0 * sd;
+    assert!(!recovered, "{t} ± {sd}");
+}
+
+#[test]
+fn the_detector_spread_between_regions_is_recovered_with_the_density_and_temperature() {
+    let setup = standard();
+    let isotope = hafnium_like(20.0);
+    let (density, share) = (5.0e-3, 0.12);
+    let kernel = [(0.6, 1.0), (0.4, 2.5)];
+    let depth = |row: usize, column: usize| row.min(column).min(5 - row).min(5 - column);
+    let cells: Vec<Vec<[usize; 2]>> = (0..3)
+        .map(|region| {
+            (0..36)
+                .map(|i| [i / 6, i % 6])
+                .filter(|&[row, column]| 2 - depth(row, column).min(2) == region)
+                .collect()
+        })
+        .collect();
+    let materials = [Some(density), Some(SATURATED), None];
+    let arriving: Vec<[Vec<f64>; 2]> = cells
+        .iter()
+        .zip(materials)
+        .map(|(list, n)| {
+            let area = list.len() as f64;
+            let sample: Vec<(ResonanceData, f64)> =
+                n.map(|n| (isotope.clone(), n)).into_iter().collect();
+            [
+                run(&setup, area, &beam(1.0e5), &[], TEMPERATURE_K),
+                run(
+                    &setup,
+                    CHARGE_RATIO * area,
+                    &beam(1.0e5),
+                    &sample,
+                    TEMPERATURE_K,
+                ),
+            ]
+        })
+        .collect();
+    let steps = 16;
+    let points: Vec<f64> = (0..steps)
+        .map(|i| (f64::from(i) + 0.5) / f64::from(steps))
+        .collect();
+    let spread_density = |r: f64| -> f64 {
+        kernel
+            .iter()
+            .map(|&(w, s)| w * (-r / s).exp() / (2.0 * std::f64::consts::PI * s * s))
+            .sum()
+    };
+    let transfer = |dx: f64, dy: f64| -> f64 {
+        let mut sum = 0.0;
+        for x0 in &points {
+            for y0 in &points {
+                for x1 in &points {
+                    for y1 in &points {
+                        let (u, v) = (dx + x1 - x0, dy + y1 - y0);
+                        sum += spread_density((u * u + v * v).sqrt());
+                    }
+                }
+            }
+        }
+        sum / f64::from(steps).powi(4)
+    };
+    let table: Vec<f64> = (-5..=5)
+        .flat_map(|dy| (-5..=5).map(move |dx| (dx, dy)))
+        .map(|(dx, dy)| transfer(f64::from(dx), f64::from(dy)))
+        .collect();
+    let at = |dx: i64, dy: i64| table[((dy + 5) * 11 + dx + 5) as usize];
+    let shares: Vec<Vec<f64>> = (0..3)
+        .map(|r| {
+            (0..3)
+                .map(|q| {
+                    cells[q]
+                        .iter()
+                        .map(|&[qr, qc]| {
+                            cells[r]
+                                .iter()
+                                .map(|&[rr, rc]| at(rc as i64 - qc as i64, rr as i64 - qr as i64))
+                                .sum::<f64>()
+                        })
+                        .sum::<f64>()
+                        / cells[q].len() as f64
+                })
+                .collect()
+        })
+        .collect();
+    let recorded: Vec<[Vec<f64>; 2]> = (0..3)
+        .map(|r| {
+            [0, 1].map(|run| {
+                (0..arriving[r][run].len())
+                    .map(|k| {
+                        (1.0 - share) * arriving[r][run][k]
+                            + share
+                                * (0..3)
+                                    .map(|q| shares[r][q] * arriving[q][run][k])
+                                    .sum::<f64>()
+                    })
+                    .collect()
+            })
+        })
+        .collect();
+    let fit_with = |spread: Option<Spread>| {
+        let regions = (0..3)
+            .map(|r| Region {
+                open_counts: rounded(&recorded[r][0]),
+                sample_counts: rounded(&recorded[r][1]),
+                open_live: None,
+                sample_live: None,
+                background: [Value::Known(0.0); 5],
+                pixels: cells[r].len() as f64,
+                gamma_transmission: Value::Known(1.0),
+                capture_gammas: Value::Known(0.0),
+                in_scatter: Value::Known(0.0),
+                material: materials[r].map(|n| Material {
+                    covariances: Vec::new(),
+                    library: EndfLibrary::EndfB8_0,
+                    isotopes: vec![(
+                        isotope.clone(),
+                        if r == 0 {
+                            Value::Fitted(n)
+                        } else {
+                            Value::Known(n)
+                        },
+                    )],
+                    temperature_k: if r == 0 {
+                        Value::Fitted(330.0)
+                    } else {
+                        Value::Known(TEMPERATURE_K)
+                    },
+                    thickness_variance: Value::Known(0.0),
+                }),
+            })
+            .collect();
+        let measurement = Measurement {
+            time_edges_us: setup.edges.clone(),
+            charge_ratio: CHARGE_RATIO,
+            normalization: Value::Known(1.0),
+            time_background: NO_TIME_BACKGROUND,
+            room_background: None,
+            spread,
+            regions,
+        };
+        fit_counts(&measurement, &calibration(&setup)).expect("fit")
+    };
+    let fit = fit_with(Some(Spread {
+        share: Value::Fitted(0.05),
+        kernel: kernel.to_vec(),
+        grid: [6, 6],
+        cells: cells.clone(),
+    }));
+    assert!(fit.converged);
+    let estimates = [
+        fit.regions[0].densities[0],
+        fit.regions[0].temperature_k.expect("temperature"),
+        fit.spread_share,
+    ];
+    let truths = [density, TEMPERATURE_K, share];
+    let pulls: Vec<f64> = (0..3)
+        .map(|i| (estimates[i] - truths[i]) / error_bar(&fit, i))
+        .collect();
+    assert!(pulls.iter().all(|p| p.abs() <= BOUND.sqrt()), "{pulls:?}");
+
+    let without = fit_with(None);
+    let (t, sd) = (
+        without.regions[0].temperature_k.expect("temperature"),
+        error_bar(&without, 1),
+    );
     let recovered = without.converged && (t - TEMPERATURE_K).abs() <= 5.0 * sd;
     assert!(!recovered, "{t} ± {sd}");
 }
@@ -4839,6 +5013,7 @@ mod maps {
                     normalization: map.normalization,
                     time_background: NO_TIME_BACKGROUND,
                     room_background: None,
+                    spread: None,
                     regions,
                 },
                 calibration,
@@ -5101,6 +5276,7 @@ mod maps {
                 normalization: Value::Known(0.8 * TERMS[0]),
                 time_background: NO_TIME_BACKGROUND,
                 room_background: None,
+                spread: None,
                 regions: vec![tiled.region(&map, (0, 0))],
             },
             &Calibration {

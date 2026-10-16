@@ -27,6 +27,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
 - A region's `capture_gammas` `epsilon` adds the gammas of neutrons captured
   in its sample at their first collision, `c_q*a*epsilon*phi*(1 - T)*sum(n*sigma_gamma)/D`,
   through the pulse; the capture cross sections are broadened like the total.
+- A measurement's `spread` records a share `h` of the counts arriving in
+  each detector cell elsewhere, spread by a radial exponential kernel:
+  region `r` records `(1 - h)*mu_r + h*sum(F_rq*mu_q)`, `F_rq` from the
+  regions' cells. `h` can be fitted with the density and temperature in
+  `fit_counts`.
 - A region's `in_scatter` `Omega` adds the neutrons scattered once in its
   sample that leave through its back face, `c_q*a*Omega*phi*sum(n*sigma_s*G)`,
   through the pulse: `G` integrates the slab escape over the outgoing

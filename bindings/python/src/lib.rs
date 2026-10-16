@@ -24,7 +24,8 @@ use nereids_physics::resolution::{
 };
 use nereids_physics::transmission::{self, InstrumentParams, SampleParams};
 use nereids_pipeline::counts_fit::{
-    CountsFit, Material, Measurement, NO_TIME_BACKGROUND, Region, RegionFit, RoomBackground, Value,
+    CountsFit, Material, Measurement, NO_TIME_BACKGROUND, Region, RegionFit, RoomBackground,
+    Spread, Value,
 };
 use nereids_pipeline::counts_map::{CountsMap, MapMeasurement, Patch};
 use nereids_pipeline::error::PipelineError;
@@ -3338,6 +3339,52 @@ impl PyRoomBackground {
     }
 }
 
+/// Counts the detector records in another region than the one they arrive
+/// in: the share h, the kernel's (weight, length in cells) terms, the grid's
+/// rows and columns, and each region's cells as (row, column).
+#[pyclass(name = "Spread", from_py_object)]
+#[derive(Clone)]
+struct PySpread {
+    inner: Spread,
+}
+
+#[pymethods]
+impl PySpread {
+    #[new]
+    fn new(
+        share: PyValue,
+        kernel: Vec<(f64, f64)>,
+        grid: (usize, usize),
+        cells: Vec<Vec<(usize, usize)>>,
+    ) -> Self {
+        Self {
+            inner: Spread {
+                share: share.inner,
+                kernel,
+                grid: [grid.0, grid.1],
+                cells: cells
+                    .into_iter()
+                    .map(|list| list.into_iter().map(|(r, c)| [r, c]).collect())
+                    .collect(),
+            },
+        }
+    }
+
+    /// The share h of each cell's counts recorded elsewhere.
+    #[getter]
+    fn share(&self) -> PyValue {
+        PyValue {
+            inner: self.inner.share,
+        }
+    }
+
+    /// The kernel's (weight, length in cells) terms.
+    #[getter]
+    fn kernel(&self) -> Vec<(f64, f64)> {
+        self.inner.kernel.clone()
+    }
+}
+
 /// An open-beam run and a sample run recorded in the same time bins, read in
 /// one or more regions of the detector.
 #[pyclass(name = "Measurement", from_py_object)]
@@ -3351,7 +3398,7 @@ impl PyMeasurement {
     /// time_edges_us are the time-bin edges in microseconds; charge_ratio is
     /// the sample run's proton charge over the open-beam run's.
     #[new]
-    #[pyo3(signature = (time_edges_us, charge_ratio, normalization, regions, time_background=None, room_background=None))]
+    #[pyo3(signature = (time_edges_us, charge_ratio, normalization, regions, time_background=None, room_background=None, spread=None))]
     fn new(
         time_edges_us: Vec<f64>,
         charge_ratio: f64,
@@ -3359,6 +3406,7 @@ impl PyMeasurement {
         regions: Vec<PyRegion>,
         time_background: Option<Vec<PyValue>>,
         room_background: Option<PyRoomBackground>,
+        spread: Option<PySpread>,
     ) -> PyResult<Self> {
         let time_background = match time_background {
             Some(values) => value_trio(values)?,
@@ -3371,6 +3419,7 @@ impl PyMeasurement {
                 normalization: normalization.inner,
                 time_background,
                 room_background: room_background.map(|room| room.inner),
+                spread: spread.map(|spread| spread.inner),
                 regions: regions.into_iter().map(|region| region.inner).collect(),
             },
         })
@@ -3412,6 +3461,12 @@ impl PyMeasurement {
         self.inner
             .room_background
             .map(|inner| PyRoomBackground { inner })
+    }
+
+    /// The detector spread, or None.
+    #[getter]
+    fn spread(&self) -> Option<PySpread> {
+        self.inner.spread.clone().map(|inner| PySpread { inner })
     }
 
     /// The regions, in the order given.
@@ -3774,6 +3829,12 @@ impl PyCountsFit {
     #[getter]
     fn room_background(&self) -> f64 {
         self.inner.room_background
+    }
+
+    /// The detector spread's share h, 0 without one.
+    #[getter]
+    fn spread_share(&self) -> f64 {
+        self.inner.spread_share
     }
 
     /// Covariance of the fitted quantities, or None when the fit did not
@@ -4417,6 +4478,7 @@ fn nereids(m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_class::<PyMaterial>()?;
     m.add_class::<PyRegion>()?;
     m.add_class::<PyRoomBackground>()?;
+    m.add_class::<PySpread>()?;
     m.add_class::<PyMeasurement>()?;
     m.add_class::<PyPulse>()?;
     m.add_class::<PyCalibration>()?;
