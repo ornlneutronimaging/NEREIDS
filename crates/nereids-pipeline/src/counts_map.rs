@@ -852,7 +852,7 @@ fn fit_map_from<'a>(
             bound: budgets[r],
             excluded: vec![excluded.read().expect("the bin lists")[r].clone()],
         };
-        let (fit, answer) = fit_counts_answer(&one, &held, BeamStarts::Given(&starts))
+        let (fit, answer) = fit_counts_answer(&one, &held, BeamStarts::Given(&starts), None)
             .map_err(|e| named(label, e))?;
         let region_fit = fit.regions.into_iter().next().expect("one region");
         let edge = fitted_temperature

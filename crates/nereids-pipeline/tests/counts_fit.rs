@@ -2885,6 +2885,16 @@ fn measurements_the_fit_does_not_describe_are_refused() {
         other => panic!("{other}"),
     };
     assert!(message.contains("in-scatter of region 0"), "{message}");
+    for grid in [[usize::MAX / 2 + 1, 2], [0, 4], [1025, 1024]] {
+        invalid(&|m| {
+            m.spread = Some(Spread {
+                share: Value::Known(0.1),
+                kernel: vec![(1.0, 1.0)],
+                grid,
+                cells: vec![vec![[0, 0]]],
+            });
+        });
+    }
     let mut trace = good.clone();
     (trace.regions[0].open_counts, trace.regions[0].sample_counts) = draws(&counts, 0, [1.0; 2]);
     let tungsten = synthetic_isotope(74, 182, 24.0, 0.01, 0.06);
@@ -3333,6 +3343,43 @@ fn bins_reached(setup: &Setup, t0_us: f64, flight_path_m: f64) -> Vec<usize> {
     (0..edges.len() - 1)
         .filter(|&k| edges[k] < last && first < edges[k + 1])
         .collect()
+}
+
+#[test]
+fn a_spread_leaves_a_left_out_line_out_of_the_regions_it_reaches() {
+    let setup = reaching_the_window(Setup {
+        pulse: venus_pulse(&CALIBRATION_PULSE),
+        ..standard()
+    });
+    let tantalum = synthetic_isotope_multi(73, 181, &[(13.95, 0.003, 0.06), (20.0, 0.01, 0.06)]);
+    let counts = expected(&setup, &beam(1.0e4), &[(tantalum.clone(), THIN)]);
+    let open = expected(&setup, &beam(1.0e4), &[]);
+    let fit = |share| {
+        let mut m = measurement(
+            &setup,
+            (rounded(&counts.0), rounded(&counts.1)),
+            &[(tantalum.clone(), THIN)],
+        );
+        m.material_mut().library = EndfLibrary::EndfB8_1;
+        let mut empty = m.regions[0].clone();
+        empty.material = None;
+        (empty.open_counts, empty.sample_counts) = (rounded(&open.0), rounded(&open.1));
+        m.regions.push(empty);
+        m.spread = Some(Spread {
+            share,
+            kernel: vec![(1.0, 1.0)],
+            grid: [1, 2],
+            cells: vec![vec![[0, 0]], vec![[0, 1]]],
+        });
+        fit_counts(&m, &calibration(&setup)).expect("fit")
+    };
+    let spread = fit(Value::Known(0.02));
+    assert!(!spread.regions[0].excluded_bins.is_empty());
+    assert_eq!(
+        spread.regions[1].excluded_bins,
+        spread.regions[0].excluded_bins
+    );
+    assert!(fit(Value::Known(0.0)).regions[1].excluded_bins.is_empty());
 }
 
 #[test]

@@ -43,6 +43,8 @@ use crate::open_beam::{
 pub const NEGLIGIBLE_PREDICTION: f64 = 1e-10;
 
 const SETTLED_OVERDISPERSION: f64 = 0.01;
+/// The most cells a spread's grid holds.
+const MOST_SPREAD_CELLS: usize = 1 << 20;
 
 pub(crate) const MOST_PASSES: usize = 20;
 
@@ -168,7 +170,7 @@ pub struct Spread {
     /// `(w_c, s_c)`: each term's weight, finite and positive, normalized by
     /// their sum, and length in cells, finite and positive.
     pub kernel: Vec<(f64, f64)>,
-    /// The grid's rows and columns.
+    /// The grid's rows and columns, at most 2^20 cells in all.
     pub grid: [usize; 2],
     /// Each region's cells as `[row, column]`, in the order of
     /// [`Measurement::regions`]; a cell is in one region at most.
@@ -399,8 +401,10 @@ pub struct RegionFit {
     /// then weighted with 1, and the sample run as the open-beam run.
     pub overdispersion: [Option<f64>; 2],
     /// Indices, ascending, of the sample run's bins its material's
-    /// [`Material::library`] leaves out: they add nothing to the deviance, the
-    /// information or the sample run's overdispersion.
+    /// [`Material::library`] leaves out, and, under a spread whose share is not
+    /// known 0, those of every region that spreads counts into it: they add
+    /// nothing to the deviance, the information or the sample run's
+    /// overdispersion.
     pub excluded_bins: Vec<usize>,
 }
 
@@ -523,7 +527,10 @@ pub struct RegionFit {
 /// ratio or a room background's frames are not finite and positive, a
 /// region's pixels are not finite and
 /// positive, a region without a material has capture gammas or in-scatter
-/// other than known 0, a known, starting or measured value is
+/// other than known 0, a spread's kernel has a term whose weight or length is
+/// not finite and positive, its grid holds no cell or more than 2^20, it does
+/// not give each region one or more cells on the grid, or a cell is in two
+/// regions, a known, starting or measured value is
 /// not finite and in its quantity's range, a measured value's sd is not finite
 /// and positive, bounds are not `lower < upper` in that range
 /// with the start between them, the pulse's calibration covers a number that
@@ -542,7 +549,8 @@ pub struct RegionFit {
 /// grid's lowest energy and above the lowest energy a neutron scattered forward
 /// leaves with;
 /// [`PipelineError::UnmodelledCounts`] if at the fit, converged or not, a bin
-/// is predicted negative or non-finite counts, or, outside the bins left
+/// is predicted negative or non-finite counts, recorded or, under a spread,
+/// arriving, or, outside the bins left
 /// out, holds counts predicted below [`NEGLIGIBLE_PREDICTION`]: starting or known values the fitter cannot
 /// leave;
 /// [`PipelineError::InvalidParameter`] if a material's covariance names no
@@ -585,11 +593,13 @@ fn fit_settled(
     let frames = open_frames(measurement.room_background.as_ref());
     let mut open = starting_bypass(measurement)?;
     let mut intervals: Option<Vec<usize>> = None;
+    let shares = spread_shares(measurement)?;
     for passes in 1.. {
         let (mut fit, _) = fit_counts_answer(
             measurement,
             calibration,
             BeamStarts::OpenFitsAt(open, intervals.clone()),
+            shares.clone(),
         )?;
         let fitted = Bypass {
             time: fit.time_background,
@@ -1149,10 +1159,29 @@ pub(crate) enum BeamStarts<'a> {
     OpenFitsAt(Bypass, Option<Vec<usize>>),
 }
 
+/// The spread's shares `F_rq` between the measurement's regions, or `None`
+/// without a spread.
+pub(crate) fn spread_shares(
+    measurement: &Measurement,
+) -> Result<Option<Arc<Vec<Vec<f64>>>>, PipelineError> {
+    let Some(spread) = &measurement.spread else {
+        return Ok(None);
+    };
+    spread_checked(spread, measurement.regions.len())?;
+    Ok(Some(Arc::new(region_shares(
+        &spread.kernel,
+        spread.grid,
+        &spread.cells,
+    ))))
+}
+
+/// The fit of `measurement` from `beam_starts`, with the spread's shares
+/// `mixing` from [`spread_shares`].
 pub(crate) fn fit_counts_answer(
     measurement: &Measurement,
     calibration: &Calibration,
     beam_starts: BeamStarts<'_>,
+    mixing: Option<Arc<Vec<Vec<f64>>>>,
 ) -> Result<(CountsFit, Answer), PipelineError> {
     let starts = match beam_starts {
         BeamStarts::Given(starts) => Some(starts),
@@ -1179,10 +1208,10 @@ pub(crate) fn fit_counts_answer(
     let frames = measurement
         .room_background
         .map_or([0.0; 2], |room| room.frames);
-    let mixing = measurement
+    let spreading = measurement
         .spread
         .as_ref()
-        .map(|spread| Arc::new(region_shares(&spread.kernel, spread.grid, &spread.cells)));
+        .is_some_and(|spread| spread.share != Value::Known(0.0));
     let bins = time_edges_us.len() - 1;
     if let Some(starts) = starts {
         assert_eq!(starts.beams.len(), regions.len(), "one beam per region");
@@ -1191,10 +1220,28 @@ pub(crate) fn fit_counts_answer(
         }
     }
     let excluded_at = |numbers: &[f64]| -> Vec<Vec<usize>> {
-        regions
+        let own: Vec<Vec<usize>> = regions
             .iter()
             .map(|region| excluded_bins(time_edges_us, region.material.as_ref(), numbers))
-            .collect()
+            .collect();
+        match &mixing {
+            Some(shares) if spreading => shares
+                .iter()
+                .enumerate()
+                .map(|(r, from)| {
+                    let mut out: Vec<usize> = own
+                        .iter()
+                        .enumerate()
+                        .filter(|&(q, _)| q == r || from[q] > 0.0)
+                        .flat_map(|(_, out)| out.iter().copied())
+                        .collect();
+                    out.sort_unstable();
+                    out.dedup();
+                    out
+                })
+                .collect(),
+            _ => own,
+        }
     };
     let dispersion_of = |excluded: &[Vec<usize>], weights: &[f64]| -> Vec<f64> {
         let mut dispersion: Vec<f64> = (0..2 * regions.len() * bins)
@@ -2171,6 +2218,14 @@ fn quantity(
 fn spread_checked(spread: &Spread, regions: usize) -> Result<(), PipelineError> {
     let invalid = |message: String| Err(PipelineError::InvalidParameter(message));
     let [rows, columns] = spread.grid;
+    if !rows
+        .checked_mul(columns)
+        .is_some_and(|cells| (1..=MOST_SPREAD_CELLS).contains(&cells))
+    {
+        return invalid(format!(
+            "the spread's {rows}×{columns} grid must hold 1 to {MOST_SPREAD_CELLS} cells"
+        ));
+    }
     if spread.kernel.is_empty()
         || !spread
             .kernel
@@ -2861,12 +2916,20 @@ fn mixed(shares: &[Vec<f64>], h: f64, arriving: &[f64]) -> Vec<f64> {
 }
 
 impl FitModel for RegionsModel {
+    /// The counts each region records; under a spread, a bin whose arriving
+    /// counts are negative or not a number records them instead.
     fn evaluate(&self, params: &[f64]) -> Result<Vec<f64>, FittingError> {
         let arriving = self.arriving(params)?;
-        Ok(match &self.mixing {
-            Some(shares) => mixed(shares, params[self.layout.spread], &arriving),
-            None => arriving,
-        })
+        let Some(shares) = &self.mixing else {
+            return Ok(arriving);
+        };
+        let mut recorded = mixed(shares, params[self.layout.spread], &arriving);
+        for (recorded, &arrived) in recorded.iter_mut().zip(&arriving) {
+            if arrived.is_nan() || arrived < 0.0 {
+                *recorded = arrived;
+            }
+        }
+        Ok(recorded)
     }
 
     fn analytical_jacobian(
@@ -3217,6 +3280,56 @@ mod tests {
     }
 
     #[test]
+    fn under_a_spread_a_negative_arriving_count_is_recorded_as_it_arrives() {
+        let grid = grid(None);
+        let (_, u_hi) = grid.range_us();
+        let beams = [
+            BeamSpline::constant(347.0, u_hi, 1.0e5),
+            BeamSpline::constant(347.0, u_hi, 1.0e4),
+        ];
+        let layout = Arc::new(Layout::new(
+            roles(&[beams[0].coefficients().len(); 2], &[None, None]),
+            &[400.0, 1.0],
+            &[[false; 2]; 2],
+        ));
+        let params: Vec<f64> = layout
+            .roles
+            .iter()
+            .enumerate()
+            .map(|(i, role)| match *role {
+                Role::Beam { region, .. } => [12.0, 9.0][region] + 0.3 * (i as f64).sin(),
+                Role::Background { region, term } => {
+                    [[0.0; 5], [-1.5, 0.0, 0.0, 0.0, 4.0]][region][term]
+                }
+                Role::GammaTransmission { .. } => 1.0,
+                Role::Normalization => 0.93,
+                Role::TimeBackground(term) => [50.0, 300.0, 40.0][term],
+                Role::SpreadShare => 0.5,
+                Role::T0 => T0_US,
+                Role::FlightPath => FLIGHT_PATH_M,
+                Role::Pulse(n) => [0.37, 0.06, 0.01, 0.24, 0.16, 0.3][n],
+                _ => 0.0,
+            })
+            .collect();
+        let model = RegionsModel::new(
+            &grid,
+            &beams,
+            &[Arc::new([]), Arc::new([])],
+            (1.2, [3.0e4, 2.5e4]),
+            T0_US,
+            &layout,
+        )
+        .spread(Some(Arc::new(vec![vec![0.9, 0.1], vec![0.1, 0.9]])));
+        let arriving = model.arriving(&params).expect("arriving");
+        let recorded = model.evaluate(&params).expect("recorded");
+        let negative: Vec<usize> = (0..arriving.len()).filter(|&k| arriving[k] < 0.0).collect();
+        assert!(!negative.is_empty());
+        for k in negative {
+            assert_eq!(recorded[k], arriving[k], "{k}");
+        }
+    }
+
+    #[test]
     fn a_resonance_slope_is_the_slope_of_the_sample_counts() {
         let grid = grid(None);
         let (_, u_hi) = grid.range_us();
@@ -3518,6 +3631,7 @@ mod tests {
             &measurement,
             &calibration,
             BeamStarts::OpenFitsAt(open, None),
+            None,
         )
         .expect("fit");
         assert!(fit.converged);
@@ -3608,7 +3722,7 @@ mod tests {
             shared_leverage: Some(vec![leverage]),
         };
         let (region, _) =
-            fit_counts_answer(&alone, &held, BeamStarts::Given(&starts)).expect("fit");
+            fit_counts_answer(&alone, &held, BeamStarts::Given(&starts), None).expect("fit");
         let [Some(phi), Some(expected)] =
             [&region.regions[0], joined].map(|fit| fit.overdispersion[1])
         else {
