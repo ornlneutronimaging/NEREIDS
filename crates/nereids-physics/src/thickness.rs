@@ -49,7 +49,7 @@ pub fn uneven_transmission(depth: f64, variance: f64) -> (f64, f64, f64) {
 /// `q` is 1 at `D = 0`.
 #[must_use]
 pub fn interacting_per_depth(depth: f64, variance: f64) -> (f64, f64, f64) {
-    if depth < 1e-5 {
+    if depth < 1e-5 && variance * depth < 1e-5 {
         let (a, b) = (
             1.0 + variance,
             1.0 + 3.0 * variance + 2.0 * variance * variance,
@@ -157,6 +157,27 @@ mod tests {
                     "{depth} {variance}"
                 );
             }
+        }
+    }
+
+    #[test]
+    fn a_large_variance_over_a_small_depth_keeps_the_interacting_fraction() {
+        for (depth, variance) in [(5e-6, 1e6), (9e-6, 2e3)] {
+            let (q, per_depth, per_variance) = interacting_per_depth(depth, variance);
+            let exact = -(-(variance * depth).ln_1p() / variance).exp_m1() / depth;
+            assert!((q / exact - 1.0).abs() <= 1e-12, "{q} vs {exact}");
+            let (hd, hv) = (1e-6 * depth, 1e-6 * variance);
+            let along_depth = (interacting_per_depth(depth + hd, variance).0
+                - interacting_per_depth(depth - hd, variance).0)
+                / (2.0 * hd);
+            let along_variance = (interacting_per_depth(depth, variance + hv).0
+                - interacting_per_depth(depth, variance - hv).0)
+                / (2.0 * hv);
+            assert!((per_depth / along_depth - 1.0).abs() <= 1e-6, "{per_depth}");
+            assert!(
+                (per_variance / along_variance - 1.0).abs() <= 1e-6,
+                "{per_variance}"
+            );
         }
     }
 
