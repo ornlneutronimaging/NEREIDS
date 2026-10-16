@@ -42,6 +42,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
   `sqrt(E)` from `r` at its low end; `None`, the default, holds it at `r`.
   `fit_counts` and `fit_map` can fit it; results report `r_high`. A pulse
   calibration refuses it.
+- `Pulse` gains `detector_tail`, `(f, tau_D)`: the detector records a fraction
+  `f` of the counts late by an exponential delay of mean `tau_D` µs. `None`,
+  the default, records every count at its arrival. `fit_counts` and `fit_map`
+  can fit both; results report `detector_tail`. A pulse calibration refuses a
+  tail.
 
 ### Changed (breaking)
 

@@ -61,6 +61,7 @@ fn pulse(r: f64, e_max_ev: f64) -> Arc<IkedaCarpenter> {
                 r: EnergyLaw::Const(r),
                 burst_sigma_us: None,
                 channel_fwhm_us: None,
+                detector_tail: None,
             },
             FLIGHT_PATH_M,
             &SynthesisGrid {
@@ -224,6 +225,7 @@ fn known(pulse: &IkedaCarpenter) -> Pulse {
         r: Value::Known(coefficients(&params.r)[1]),
         fwhm_squared_us2: Value::Known(params.channel_fwhm_us.unwrap_or(0.0).powi(2)),
         r_high: None,
+        detector_tail: None,
         energy_span_ev: detector.energy_span_ev(),
         n_tau: detector.n_tau(),
         line_span_ev: None,
@@ -3908,6 +3910,7 @@ fn venus_pulse(numbers: &[f64]) -> Arc<IkedaCarpenter> {
                 r: EnergyLaw::Const(numbers[4]),
                 burst_sigma_us: None,
                 channel_fwhm_us: Some(numbers[5]),
+                detector_tail: None,
             },
             FLIGHT_PATH_M,
             &SynthesisGrid {
@@ -4241,6 +4244,58 @@ fn a_storage_fraction_on_its_bound_converges_there() {
     assert!(fit.converged);
     let ends = [fit.r, fit.r_high.expect("R_high")];
     assert!(ends.iter().all(|r| (0.0..1e-3).contains(r)), "{ends:?}");
+}
+
+#[test]
+fn a_detector_tail_is_recovered() {
+    let (f, decay_us) = (0.1, 1.5);
+    let mut on_time = CALIBRATION_PULSE;
+    on_time[4] = 0.0;
+    let [a0, a1, .., h] = on_time;
+    let late = [a0, a1, 0.0, 1.0 / decay_us, 1.0, h];
+    let at = |pulse: &[f64]| {
+        let setup = calibration_foil(pulse, T0_US, FLIGHT_PATH_M);
+        let counts = expected(
+            &setup,
+            &beam(CALIBRATION_LEVEL),
+            &calibration_sample(CALIBRATION_DENSITY),
+        );
+        (setup, counts)
+    };
+    let ((setup, prompt), (_, delayed)) = (at(&on_time), at(&late));
+    let mixed = |prompt: &[f64], delayed: &[f64]| -> Vec<f64> {
+        let counts: Vec<f64> = prompt
+            .iter()
+            .zip(delayed)
+            .map(|(p, d)| (1.0 - f) * p + f * d)
+            .collect();
+        rounded(&counts)
+    };
+    let m = calibration_measurement(
+        &setup,
+        (mixed(&prompt.0, &delayed.0), mixed(&prompt.1, &delayed.1)),
+    );
+    let fit_with = |tail| {
+        let mut calibration = calibration(&setup);
+        calibration.pulse.detector_tail = tail;
+        fit_counts(&m, &calibration).expect("fit")
+    };
+    let fit = fit_with(Some([Value::Fitted(0.05), Value::Fitted(3.0)]));
+    assert!(fit.converged);
+    let [f_fit, decay_fit] = fit.detector_tail.expect("a tail");
+    let pulls: Vec<f64> = [(f_fit, f), (decay_fit, decay_us)]
+        .iter()
+        .enumerate()
+        .map(|(i, &(estimate, truth))| (estimate - truth) / error_bar(&fit, 2 + i))
+        .collect();
+    assert!(pulls.iter().all(|p| p.abs() <= BOUND.sqrt()), "{pulls:?}");
+    let untailed = fit_with(None);
+    assert!(
+        untailed.deviance - fit.deviance >= 10.0,
+        "{} vs {}",
+        untailed.deviance,
+        fit.deviance
+    );
 }
 
 mod pulse_calibration {

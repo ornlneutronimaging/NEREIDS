@@ -38,6 +38,7 @@ fn pulse(
                 r,
                 burst_sigma_us,
                 channel_fwhm_us,
+                detector_tail: None,
             },
             FLIGHT_PATH_M,
             &SynthesisGrid {

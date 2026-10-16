@@ -906,8 +906,12 @@ class TestCountsApi:
             fwhm_squared_us2=pulse.fwhm_squared_us2,
             energy_span_ev=pulse.energy_span_ev,
             r_high=nereids.Value.fitted(0.3),
+            detector_tail=(nereids.Value.fitted(0.1), nereids.Value.known(1.5)),
         )
         assert (rising.r_high.kind, rising.r_high.value) == ("fitted", 0.3)
+        assert pulse.detector_tail is None
+        f, decay = rising.detector_tail
+        assert (f.kind, f.value, decay.kind, decay.value) == ("fitted", 0.1, "known", 1.5)
         assert region.in_scatter.value == 0.0
         assert measurement.spread is None
         spread = nereids.Spread(

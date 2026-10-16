@@ -95,6 +95,7 @@ fn energy_law_is_evaluated_at_true_energy() {
         r: EnergyLaw::Const(0.0),
         burst_sigma_us: None,
         channel_fwhm_us: None,
+        detector_tail: None,
     };
     let model = IkedaCarpenter::new(params, flight_path_m, &SynthesisGrid::new(1.0, 100.0))
         .expect("valid energy-dependent IC model");
@@ -123,6 +124,7 @@ fn moderator_rates_that_follow_neutron_speed_preserve_scaled_pulse_time() {
         r: EnergyLaw::Const(0.3),
         burst_sigma_us: None,
         channel_fwhm_us: None,
+        detector_tail: None,
     };
     let model = IkedaCarpenter::new(params, flight_path_m, &SynthesisGrid::new(1.0, 4.0))
         .expect("valid speed-scaled IC model");
@@ -151,6 +153,7 @@ fn probe_outside_synthesis_range_rejects_nonphysical_beta_law() {
             r: EnergyLaw::Const(0.3),
             burst_sigma_us: None,
             channel_fwhm_us: None,
+            detector_tail: None,
         },
         25.0,
         &SynthesisGrid::new(1.0, 2.0),
@@ -516,6 +519,7 @@ fn storage_with_channel_fold_preserves_missing_tail_mass() {
             r: EnergyLaw::Const(r),
             burst_sigma_us: None,
             channel_fwhm_us: Some(fwhm),
+            detector_tail: None,
         },
         flight_path_m,
         &SynthesisGrid::new(1.0, 100.0),
@@ -580,6 +584,7 @@ fn singular_inverse_lambda_laws_are_rejected() {
                 r: EnergyLaw::Const(0.0),
                 burst_sigma_us: None,
                 channel_fwhm_us: None,
+                detector_tail: None,
             },
         ),
         (
@@ -590,6 +595,7 @@ fn singular_inverse_lambda_laws_are_rejected() {
                 r: EnergyLaw::Const(0.5),
                 burst_sigma_us: None,
                 channel_fwhm_us: None,
+                detector_tail: None,
             },
         ),
         (
@@ -603,6 +609,7 @@ fn singular_inverse_lambda_laws_are_rejected() {
                 r: EnergyLaw::Const(0.5),
                 burst_sigma_us: None,
                 channel_fwhm_us: None,
+                detector_tail: None,
             },
         ),
     ] {
@@ -631,6 +638,7 @@ fn singular_inverse_lambda_laws_are_rejected() {
             r: EnergyLaw::Const(0.2),
             burst_sigma_us: None,
             channel_fwhm_us: None,
+            detector_tail: None,
         },
         25.0,
         &grid,
@@ -752,6 +760,7 @@ fn singular_exp_milli_ev_r_law_is_rejected() {
                 r: EnergyLaw::ExpMilliEv { kappa },
                 burst_sigma_us: None,
                 channel_fwhm_us: None,
+                detector_tail: None,
             },
             25.0,
             &SynthesisGrid::new(1.0, 100.0),
@@ -771,6 +780,7 @@ fn singular_exp_milli_ev_r_law_is_rejected() {
             r: EnergyLaw::ExpMilliEv { kappa: 5.0e-10 },
             burst_sigma_us: None,
             channel_fwhm_us: None,
+            detector_tail: None,
         },
         25.0,
         &SynthesisGrid::new(1.0, 100.0),

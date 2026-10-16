@@ -9,7 +9,9 @@ use nereids_fitting::lm::{FitModel, FlatMatrix};
 use nereids_fitting::parameters::{FitParameter, ParameterSet};
 use nereids_fitting::poisson::{PoissonConfig, PoissonResult, Prior, poisson_fit};
 use nereids_physics::flight_time_grid::{FlightTimeGrid, FlightTimeGridError};
-use nereids_physics::ikeda_carpenter::{DetectorPulse, EnergyLaw, IkedaCarpenterParams};
+use nereids_physics::ikeda_carpenter::{
+    DetectorPulse, DetectorTail, EnergyLaw, IkedaCarpenterParams,
+};
 
 use crate::beam::BeamSpline;
 use crate::counts_fit::Value;
@@ -21,7 +23,10 @@ use crate::pulse_calibration::PulsePrior;
 /// grid to be accepted.
 pub const BOUND: f64 = 0.01;
 
-pub(crate) const PULSE_NUMBERS: [&str; 7] = ["α₀", "α₁", "β₀", "β₁", "R", "h²", "R_high"];
+pub(crate) const PULSE_NUMBERS: [&str; 9] =
+    ["α₀", "α₁", "β₀", "β₁", "R", "h²", "R_high", "f", "τ_D"];
+
+const NO_TAIL: [Value; 2] = [Value::Known(0.0), Value::Known(1.0)];
 
 const RATE: (RangeInclusive<f64>, &str) = (0.0..=f64::INFINITY, "0 or more");
 
@@ -44,7 +49,17 @@ pub struct Calibration {
 impl Calibration {
     pub(crate) fn instrument(&self) -> Result<Vec<FitParameter>, PipelineError> {
         let pulse = &self.pulse;
-        let ranges = [RATE, RATE, RATE, RATE, FRACTION, RATE, FRACTION];
+        let ranges = [
+            RATE,
+            RATE,
+            RATE,
+            RATE,
+            FRACTION,
+            RATE,
+            FRACTION,
+            FRACTION,
+            (f64::MIN_POSITIVE..=1e9, "above 0 and at most 1e9"),
+        ];
         let mut parameters = vec![
             self.t0_us
                 .parameter("t0", f64::NEG_INFINITY..=f64::INFINITY, "any real number")?,
@@ -65,10 +80,11 @@ impl Calibration {
 
 /// The Ikeda–Carpenter pulse with `α = α₀√E + α₁` and `β = β₀√E + β₁` in
 /// 1/µs, `E` in eV, a storage fraction `R` over `energy_span_ev`, or linear in
-/// `√E` from `R` at its low end to `R_high` at its high end, and the proton
+/// `√E` from `R` at its low end to `R_high` at its high end, the proton
 /// pulse's triangle of FWHM `h` in µs, given by `h²`, in which the counts are
-/// smooth down to `h = 0`.  `α` and `β` must be at least 1e-9 µs⁻¹ across the
-/// span, `β` even where the storage fraction is 0.
+/// smooth down to `h = 0`, and an optional detector tail.  `α` and `β` must be
+/// at least 1e-9 µs⁻¹ across the span, `β` even where the storage fraction is
+/// 0.
 #[derive(Debug, Clone)]
 pub struct Pulse {
     /// `[α₀, α₁]`, in 1/(µs·√eV) and 1/µs, each 0 or more.
@@ -83,6 +99,11 @@ pub struct Pulse {
     /// `R_high`, within 0–1: the storage fraction at the high end of
     /// `energy_span_ev`, linear in `√E` from `R`.  `None` holds it at `R`.
     pub r_high: Option<Value>,
+    /// `[f, τ_D]`: the detector records a fraction `f` (0–1) of the counts
+    /// late by an exponential delay of mean `τ_D` µs (above 0 and at most
+    /// 1e9), and the rest at their arrival; the time background is recorded
+    /// as it arrives.  `None` records every count at its arrival.
+    pub detector_tail: Option<[Value; 2]>,
     /// `(low, high)`, the energies in eV the laws hold over; a window that
     /// neutrons from outside them can reach is refused.
     pub energy_span_ev: (f64, f64),
@@ -106,9 +127,11 @@ pub struct Pulse {
 }
 
 impl Pulse {
-    /// `[α₀, α₁, β₀, β₁, R, h², R_high]`, in the order of the fit's pulse
-    /// numbers; `R_high` known 0 and unused without one.
-    pub(crate) fn numbers(&self) -> [&Value; 7] {
+    /// `[α₀, α₁, β₀, β₁, R, h², R_high, f, τ_D]`, in the order of the fit's
+    /// pulse numbers; `R_high` known 0 and unused without one, and `f` known 0
+    /// without a detector tail.
+    pub(crate) fn numbers(&self) -> [&Value; 9] {
+        let [f, decay] = self.detector_tail.as_ref().unwrap_or(&NO_TAIL);
         [
             &self.alpha[0],
             &self.alpha[1],
@@ -117,6 +140,8 @@ impl Pulse {
             &self.r,
             &self.fwhm_squared_us2,
             self.r_high.as_ref().unwrap_or(&CONSTANT),
+            f,
+            decay,
         ]
     }
 
@@ -157,6 +182,10 @@ pub(crate) fn laws(numbers: &[f64], storage_span: Option<(f64, f64)>) -> IkedaCa
         }),
         burst_sigma_us: None,
         channel_fwhm_us: Some(numbers[5].sqrt()),
+        detector_tail: Some(DetectorTail {
+            fraction: numbers[7],
+            decay_us: numbers[8],
+        }),
     }
 }
 
@@ -767,6 +796,7 @@ pub(crate) mod tests {
                 r: R,
                 burst_sigma_us: None,
                 channel_fwhm_us,
+                detector_tail: None,
             },
             FLIGHT_PATH_M,
             &SynthesisGrid {

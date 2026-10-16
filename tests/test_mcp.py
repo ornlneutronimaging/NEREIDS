@@ -365,6 +365,7 @@ class TestCountsManifest:
             r=0.15,
             fwhm_squared_us2=0.0,
             r_high=0.3,
+            detector_tail=(0.1, 1.5),
         )
 
     def test_extract_and_validate_manifest(self, tmp_path):
@@ -400,7 +401,12 @@ class TestCountsManifest:
 
     def test_process_single_spectrum_routes_to_fit_counts(self, tmp_path, monkeypatch):
         self._counts_npz(tmp_path)
-        manifest = _write_json_frontmatter_manifest(tmp_path, self._analysis())
+        analysis = self._analysis()
+        analysis["calibration"]["pulse"]["detector_tail"] = [
+            0.1,
+            {"kind": "fitted", "value": 2.0},
+        ]
+        manifest = _write_json_frontmatter_manifest(tmp_path, analysis)
         calls = {}
 
         def fake_fit_counts(measurement, calibration):
@@ -423,6 +429,9 @@ class TestCountsManifest:
         assert result["results"]["in_scatter"] == 0.6
         assert result["results"]["r_high"] == 0.3
         assert calls["calibration"].pulse.r_high is None
+        f, decay = calls["calibration"].pulse.detector_tail
+        assert (f.kind, f.value, decay.kind, decay.value) == ("known", 0.1, "fitted", 2.0)
+        assert result["results"]["detector_tail"] == [0.1, 1.5]
 
     def test_single_spectrum_preserves_time_background(self, tmp_path, monkeypatch):
         self._counts_npz(tmp_path)

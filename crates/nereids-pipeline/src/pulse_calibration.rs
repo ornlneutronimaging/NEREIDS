@@ -172,8 +172,9 @@ impl PulseCalibration {
     /// empty or its runs are the same, or `calibration`'s pulse carries a
     /// prior or a pulse number measured or boxed, since a calibration foil is
     /// calibrated alone over the numbers' physical ranges, or the pulse has
-    /// an `R_high`, since the calibration records a storage fraction constant
-    /// in energy; everything [`fit_counts`] refuses;
+    /// an `R_high` or a detector tail, since the calibration records a storage
+    /// fraction constant in energy and no tail; everything [`fit_counts`]
+    /// refuses;
     /// [`PipelineError::InvalidParameter`] if the fit did not converge, or
     /// fitted a pulse number and gives no [`CountsFit::unbounded`] Gaussian, a
     /// pulse number it fitted has no finite positive variance without its
@@ -210,6 +211,11 @@ impl PulseCalibration {
                 "a pulse calibration records a storage fraction constant in energy, so the \
                  pulse has no R_high; got {high:?}"
             )));
+        }
+        if pulse.detector_tail.is_some() {
+            return Err(PipelineError::InvalidParameter(
+                "a pulse calibration records a pulse without a detector tail".into(),
+            ));
         }
         let fit = fit_counts(measurement, calibration)?;
         let pulse = Self::from_fit(measurement, calibration, foil, provenance, &fit)?;
@@ -424,6 +430,7 @@ impl PulseCalibration {
                 r: value(4),
                 fwhm_squared_us2: value(5),
                 r_high: None,
+                detector_tail: None,
                 energy_span_ev: self.energy_span_ev,
                 n_tau: self.n_tau,
                 line_span_ev: self.line_span_ev,
@@ -614,10 +621,12 @@ impl PulseCalibration {
             transfer,
         };
         let experiment = pulse.calibration();
-        experiment.instrument()?;
-        experiment
-            .pulse
-            .at(&numbers.iter().chain(&[0.0]).copied().collect::<Vec<f64>>())?;
+        let start: Vec<f64> = experiment
+            .instrument()?
+            .iter()
+            .map(|parameter| parameter.value)
+            .collect();
+        experiment.pulse.at(&start[2..])?;
         Ok(pulse)
     }
 }
@@ -968,6 +977,7 @@ mod tests {
                 r: Value::Fitted(0.2),
                 fwhm_squared_us2: Value::Fitted(0.1),
                 r_high: None,
+                detector_tail: None,
                 energy_span_ev: (1.0, 200.0),
                 n_tau: 256,
                 line_span_ev: None,
@@ -1017,6 +1027,7 @@ mod tests {
             r: 0.21,
             fwhm_squared_us2: 0.12,
             r_high: None,
+            detector_tail: None,
             time_background: [0.0, 0.0, 1.0],
             room_background: 0.0,
             spread_share: 0.0,
@@ -1355,6 +1366,8 @@ mod tests {
         };
         let mut rising = c.clone();
         rising.pulse.r_high = Some(Value::Fitted(0.3));
+        let mut tailed = c.clone();
+        tailed.pulse.detector_tail = Some([Value::Fitted(0.1), Value::Known(2.0)]);
         for (c, provenance, refusal) in [
             (&c, same, "names its foil"),
             (&c, unnamed, "names its foil"),
@@ -1362,6 +1375,7 @@ mod tests {
             (&measured, provenance(), "calibrated alone"),
             (&boxed, provenance(), "calibrated alone"),
             (&rising, provenance(), "no R_high"),
+            (&tailed, provenance(), "without a detector tail"),
         ] {
             match PulseCalibration::new(&measurement(None), c, provenance) {
                 Err(PipelineError::InvalidParameter(message)) => {

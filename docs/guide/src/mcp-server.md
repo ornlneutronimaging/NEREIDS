@@ -160,7 +160,9 @@ manifest can free or fix the temperature, a background term, the
 normalization, t0, the flight path and each pulse number. The pulse's
 "r_high" is the storage fraction at the high end of its energy span, linear in
 sqrt(E) from "r" at the low end; without it the storage fraction is "r"
-throughout.
+throughout. Its "detector_tail", [f, tau_D], records a fraction f of the counts
+late by an exponential delay of mean tau_D microseconds; without it no count is
+late.
 Isotope densities are fitted from their `initial_density` values. All
 isotopes in a material must use the same ENDF library; its library also
 determines which resonance windows the fit excludes.

@@ -660,6 +660,7 @@ impl PyIkedaCarpenter {
             r: r.inner,
             burst_sigma_us,
             channel_fwhm_us,
+            detector_tail: None,
         };
         let grid = SynthesisGrid {
             e_min_ev,
@@ -3493,8 +3494,10 @@ impl PyMeasurement {
 /// The Ikeda-Carpenter pulse with alpha = alpha0*sqrt(E) + alpha1 and
 /// beta = beta0*sqrt(E) + beta1 in 1/microsecond, E in eV, a storage fraction
 /// R over energy_span_ev, or linear in sqrt(E) from R at its low end to r_high
-/// at its high end, and the proton pulse's triangle of FWHM h in microseconds,
-/// given by h^2.
+/// at its high end, the proton pulse's triangle of FWHM h in microseconds,
+/// given by h^2, and an optional detector tail (f, tau_D): the detector
+/// records a fraction f of the counts late by an exponential delay of mean
+/// tau_D microseconds.
 #[pyclass(name = "Pulse", from_py_object)]
 #[derive(Clone)]
 struct PyPulse {
@@ -3506,9 +3509,9 @@ impl PyPulse {
     /// energy_span_ev is (low, high) in eV; n_tau is the number of samples
     /// across the prompt core (at least 8).  line_span_ev gives the (low, high)
     /// energies in eV of a calibration foil's resonances, or None to check
-    /// nothing.
+    /// nothing.  detector_tail is (f, tau_D), or None for no tail.
     #[new]
-    #[pyo3(signature = (alpha0, alpha1, beta0, beta1, r, fwhm_squared_us2, energy_span_ev, n_tau=600, line_span_ev=None, r_high=None))]
+    #[pyo3(signature = (alpha0, alpha1, beta0, beta1, r, fwhm_squared_us2, energy_span_ev, n_tau=600, line_span_ev=None, r_high=None, detector_tail=None))]
     fn new(
         alpha0: PyValue,
         alpha1: PyValue,
@@ -3520,6 +3523,7 @@ impl PyPulse {
         n_tau: usize,
         line_span_ev: Option<(f64, f64)>,
         r_high: Option<PyValue>,
+        detector_tail: Option<(PyValue, PyValue)>,
     ) -> Self {
         Self {
             inner: Pulse {
@@ -3528,6 +3532,7 @@ impl PyPulse {
                 r: r.inner,
                 fwhm_squared_us2: fwhm_squared_us2.inner,
                 r_high: r_high.map(|value| value.inner),
+                detector_tail: detector_tail.map(|(f, decay)| [f.inner, decay.inner]),
                 energy_span_ev,
                 n_tau,
                 line_span_ev,
@@ -3577,6 +3582,14 @@ impl PyPulse {
     #[getter]
     fn r_high(&self) -> Option<PyValue> {
         self.inner.r_high.map(|inner| PyValue { inner })
+    }
+
+    /// The detector tail's (f, tau_D), or None.
+    #[getter]
+    fn detector_tail(&self) -> Option<(PyValue, PyValue)> {
+        self.inner
+            .detector_tail
+            .map(|[f, decay]| (PyValue { inner: f }, PyValue { inner: decay }))
     }
 
     /// The (low, high) energies in eV the laws hold over.
@@ -3833,6 +3846,12 @@ impl PyCountsFit {
     #[getter]
     fn r_high(&self) -> Option<f64> {
         self.inner.r_high
+    }
+
+    /// The detector tail's (f, tau_D), or None without one.
+    #[getter]
+    fn detector_tail(&self) -> Option<(f64, f64)> {
+        self.inner.detector_tail.map(|[f, decay]| (f, decay))
     }
 
     /// The time background's [C, A, tau].
@@ -4196,6 +4215,7 @@ struct PyCountsMap {
     r: f64,
     fwhm_squared_us2: f64,
     r_high: Option<f64>,
+    detector_tail: Option<[f64; 2]>,
     shared: Vec<String>,
     shared_covariance: Option<FlatMatrix>,
     measured_pulls: Option<Vec<f64>>,
@@ -4229,6 +4249,7 @@ impl PyCountsMap {
             r: map.r,
             fwhm_squared_us2: map.fwhm_squared_us2,
             r_high: map.r_high,
+            detector_tail: map.detector_tail,
             shared: map.shared.iter().map(|name| name.to_string()).collect(),
             shared_covariance: map.shared_covariance.clone(),
             measured_pulls: map.measured_pulls.clone(),
@@ -4382,6 +4403,12 @@ impl PyCountsMap {
     #[getter]
     fn r_high(&self) -> Option<f64> {
         self.r_high
+    }
+
+    /// The detector tail's (f, tau_D), or None without one.
+    #[getter]
+    fn detector_tail(&self) -> Option<(f64, f64)> {
+        self.detector_tail.map(|[f, decay]| (f, decay))
     }
 
     /// The fitted shared quantities, in order.

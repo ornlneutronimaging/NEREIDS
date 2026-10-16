@@ -421,6 +421,15 @@ def _value_or_number(spec: Any, default: float) -> nereids.Value:
     return _as_value(spec, "known")
 
 
+def _detector_tail(spec: Any) -> tuple | None:
+    """A detector tail (f, tau_D), each a Value; absent means none."""
+    if spec is None:
+        return None
+    if isinstance(spec, (list, tuple)) and len(spec) == 2:
+        return tuple(_as_value(value, "known") for value in spec)
+    raise ValueError("calibration.pulse.detector_tail must be [f, tau_d_us]")
+
+
 def _background_values(spec: Any) -> list:
     """A [b0, b1, b2, d, f] background, each a Value; absent means none."""
     if spec is None:
@@ -500,6 +509,7 @@ def _calibration(config: dict[str, Any], data_config: dict[str, Any]) -> nereids
         r_high=None
         if pulse_config.get("r_high") is None
         else _as_value(pulse_config["r_high"], "known"),
+        detector_tail=_detector_tail(pulse_config.get("detector_tail")),
         energy_span_ev=(float(span[0]), float(span[1])),
         n_tau=int(pulse_config.get("n_tau", 600)),
         line_span_ev=None if line_span is None else (float(line_span[0]), float(line_span[1])),
@@ -660,6 +670,9 @@ def _fit_result_summary(result: Any, names: list[str]) -> dict[str, Any]:
         "r": _finite_float_or_none(result.r),
         "fwhm_squared_us2": _finite_float_or_none(result.fwhm_squared_us2),
         "r_high": None if result.r_high is None else _finite_float_or_none(result.r_high),
+        "detector_tail": None
+        if result.detector_tail is None
+        else [_finite_float_or_none(v) for v in result.detector_tail],
     }
 
 

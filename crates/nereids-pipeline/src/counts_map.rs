@@ -226,9 +226,13 @@ pub struct CountsMap<'a> {
     pub fwhm_squared_us2: f64,
     /// The pulse's `R_high`, the known or the fitted one; `None` without one.
     pub r_high: Option<f64>,
+    /// The detector tail's `[f, τ_D]`, each the known or the fitted one;
+    /// `None` without one.
+    pub detector_tail: Option<[f64; 2]>,
     /// The fitted shared quantities, among the normalization, the time
     /// background's `C`, `A` and `τ`, the room background's `ρ`, `t0`, flight
-    /// path, `α₀`, `α₁`, `β₀`, `β₁`, `R`, `h²` and `R_high`, in that order.
+    /// path, `α₀`, `α₁`, `β₀`, `β₁`, `R`, `h²`, `R_high`, `f` and `τ_D`, in that
+    /// order.
     pub shared: Vec<&'static str>,
     /// Covariance of [`Self::shared`]: the inverse of the information on them
     /// of every patch that did not fail and of the empty pixels, each with
@@ -783,6 +787,10 @@ fn fit_map_from<'a>(
                 r: known(6),
                 fwhm_squared_us2: known(7),
                 r_high: calibration.pulse.r_high.map(|_| known(8)),
+                detector_tail: calibration
+                    .pulse
+                    .detector_tail
+                    .map(|_| [known(9), known(10)]),
                 prior: None,
                 ..calibration.pulse.clone()
             },
@@ -1394,6 +1402,10 @@ fn fit_map_from<'a>(
         r: values[t0 + 6],
         fwhm_squared_us2: values[t0 + 7],
         r_high: calibration.pulse.r_high.map(|_| values[t0 + 8]),
+        detector_tail: calibration
+            .pulse
+            .detector_tail
+            .map(|_| [values[t0 + 9], values[t0 + 10]]),
         shared: fitted
             .iter()
             .map(|&i| {
