@@ -647,6 +647,9 @@ def _fit_result_summary(result: Any, names: list[str]) -> dict[str, Any]:
         "capture_gammas": None
         if region is None
         else _finite_float_or_none(region.capture_gammas),
+        "in_scatter": None
+        if region is None
+        else _finite_float_or_none(region.in_scatter),
         "time_background": [_finite_float_or_none(v) for v in result.time_background],
         "room_background": _finite_float_or_none(result.room_background),
         "alpha": _json_safe(list(result.alpha)),
@@ -698,6 +701,7 @@ def _process_single_spectrum(
         background=_background_values(fit_config.get("background")),
         gamma_transmission=_value_or_number(fit_config.get("gamma_transmission"), 1.0),
         capture_gammas=_value_or_number(fit_config.get("capture_gammas"), 0.0),
+        in_scatter=_value_or_number(fit_config.get("in_scatter"), 0.0),
         material=material,
     )
     measurement = nereids.Measurement(
@@ -843,6 +847,7 @@ def _process_density_map(
         gamma_transmission=_value_or_number(fit_config.get("gamma_transmission"), 1.0),
         room_background=_room_background(fit_config.get("room_background")),
         capture_gammas=_value_or_number(fit_config.get("capture_gammas"), 0.0),
+        in_scatter=_value_or_number(fit_config.get("in_scatter"), 0.0),
     )
     result = nereids.fit_map(map_measurement, calibration)
 
@@ -856,6 +861,7 @@ def _process_density_map(
         "temperature_k": np.asarray(result.temperature_k),
         "thickness_variance": _patch_values(result.fits, "thickness_variance"),
         "capture_gammas": _patch_values(result.fits, "capture_gammas"),
+        "in_scatter": _patch_values(result.fits, "in_scatter"),
         "isotope_names": np.asarray(names),
     }
     density_stats = []
@@ -973,7 +979,7 @@ def _validate_workflow(manifest: dict[str, Any]) -> dict[str, Any]:
         "fit_domain", "normalization", "background", "empty_background",
         "temperature", "temperature_k", "fit_temperature",
         "gamma_transmission", "time_background", "room_background",
-        "thickness_variance", "capture_gammas",
+        "thickness_variance", "capture_gammas", "in_scatter",
     }
     unsupported_fit = sorted(set(fit_config) - supported_fit)
     if unsupported_fit:

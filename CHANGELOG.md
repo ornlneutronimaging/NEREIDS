@@ -27,6 +27,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
 - A region's `capture_gammas` `epsilon` adds the gammas of neutrons captured
   in its sample at their first collision, `c_q*a*epsilon*phi*(1 - T)*sum(n*sigma_gamma)/D`,
   through the pulse; the capture cross sections are broadened like the total.
+- A region's `in_scatter` `Omega` adds the neutrons scattered once in its
+  sample that leave through its back face, `c_q*a*Omega*phi*sum(n*sigma_s*G)`,
+  through the pulse: `G` integrates the slab escape over the outgoing
+  energies and angles of elastic scattering, isotropic in the centre-of-mass
+  frame.
 
 ### Changed (breaking)
 

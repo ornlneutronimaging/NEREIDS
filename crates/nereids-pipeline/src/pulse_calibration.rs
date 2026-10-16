@@ -912,6 +912,7 @@ mod tests {
                 pixels: 1.0,
                 gamma_transmission: Value::Known(1.0),
                 capture_gammas: Value::Known(0.0),
+                in_scatter: Value::Known(0.0),
                 material: Some(Material {
                     covariances: Vec::new(),
                     library: EndfLibrary::EndfB8_0,
@@ -990,6 +991,7 @@ mod tests {
                 background: [0.0; 5],
                 gamma_transmission: 1.0,
                 capture_gammas: 0.0,
+                in_scatter: 0.0,
                 beam: BeamSpline::constant(200.0, 600.0, 1.0),
                 beam_at_limit: false,
                 predicted: [Vec::new(), Vec::new()],

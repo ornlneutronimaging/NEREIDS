@@ -895,6 +895,7 @@ class TestCountsApi:
         )
         assert uneven.thickness_variance.value == 0.05
         assert region.capture_gammas.value == 0.0
+        assert region.in_scatter.value == 0.0
 
     def test_fit_counts_requires_a_material(self):
         measurement = nereids.Measurement(

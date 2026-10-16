@@ -1084,7 +1084,9 @@ class Region:
     The background is [b0, b1, b2] or [b0, b1, b2, d, f] of
     b(E) = b0 + b1/sqrt(E) + b2*sqrt(E) + d*exp(-f/sqrt(E));
     pixels is the region area in pixels; capture_gammas is the share of the
-    sample's captures whose gammas the region records, known 0 by default.
+    sample's captures whose gammas the region records, and in_scatter the
+    share of its forward single scatters the region records, each known 0 by
+    default.
     """
 
     def __init__(
@@ -1098,9 +1100,12 @@ class Region:
         open_live: NDArray[np.float64] | None = None,
         sample_live: NDArray[np.float64] | None = None,
         capture_gammas: Value | None = None,
+        in_scatter: Value | None = None,
     ) -> None: ...
     @property
     def capture_gammas(self) -> Value: ...
+    @property
+    def in_scatter(self) -> Value: ...
     @property
     def open_counts(self) -> NDArray[np.float64]: ...
     @property
@@ -1219,6 +1224,8 @@ class RegionFit:
     @property
     def capture_gammas(self) -> float: ...
     @property
+    def in_scatter(self) -> float: ...
+    @property
     def background(self) -> list[float]: ...
     @property
     def gamma_transmission(self) -> float: ...
@@ -1317,6 +1324,7 @@ class MapMeasurement:
         gamma_transmission: Value | None = None,
         room_background: RoomBackground | None = None,
         capture_gammas: Value | None = None,
+        in_scatter: Value | None = None,
     ) -> None: ...
     def patches(self) -> list[list[Patch]]:
         """Each patch kind, in (patch row, patch column)."""
@@ -1335,6 +1343,8 @@ class MapMeasurement:
     def room_background(self) -> RoomBackground | None: ...
     @property
     def capture_gammas(self) -> Value: ...
+    @property
+    def in_scatter(self) -> Value: ...
 
 class CountsMap:
     """The fitted map, one value per patch."""

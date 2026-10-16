@@ -8,6 +8,7 @@
 //! - [`channel`] - wave number, rho parameter, statistical weights
 //! - [`continuous_doppler`] - the free-gas kernel integrated over the resonance equation
 //! - [`doppler`] - free-gas-model Doppler broadening
+//! - [`forward_scatter`] - neutrons scattered once in a slab that leave through its back face
 //! - [`penetrability`] - hard-sphere penetrability, shift and phase shift
 //! - [`reich_moore`] - Reich-Moore R-matrix cross-section formalism
 //! - [`resolution`] - instrument resolution broadening
@@ -27,6 +28,7 @@ pub mod channel;
 pub mod continuous_doppler;
 pub mod doppler;
 pub mod flight_time_grid;
+pub mod forward_scatter;
 pub mod ikeda_carpenter;
 pub mod penetrability;
 pub mod reich_moore;
