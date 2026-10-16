@@ -148,7 +148,8 @@ pub fn transfer(kernel: &[(f64, f64)], offset: [i64; 2]) -> f64 {
 /// region `q` that the detector records in the cells of region `r`, for the
 /// regions' cells `cells` as `[row, column]` on a grid of `grid` rows and
 /// columns.  Counts spread to cells in no region, or off the grid, are not
-/// recorded in any region.
+/// recorded in any region.  Each region's spread image is its cells convolved
+/// with `T`, by FFT on a grid padded so that no offset wraps.
 #[must_use]
 pub fn region_shares(
     kernel: &[(f64, f64)],
@@ -156,38 +157,103 @@ pub fn region_shares(
     cells: &[Vec<[usize; 2]>],
 ) -> Vec<Vec<f64>> {
     let [rows, columns] = grid;
-    let (reach_y, reach_x) = (rows as i64 - 1, columns as i64 - 1);
-    let width = (2 * reach_x + 1) as usize;
-    let table: Vec<f64> = (-reach_y..=reach_y)
-        .flat_map(|dy| (-reach_x..=reach_x).map(move |dx| [dx, dy]))
+    let padded = [
+        (2 * rows - 1).next_power_of_two(),
+        (2 * columns - 1).next_power_of_two(),
+    ];
+    let quadrant: Vec<f64> = (0..rows)
+        .flat_map(|dy| (0..columns).map(move |dx| [dx as i64, dy as i64]))
         .map(|offset| transfer(kernel, offset))
         .collect();
-    let at = |[dx, dy]: [i64; 2]| table[(dy + reach_y) as usize * width + (dx + reach_x) as usize];
-    let mut region_of = vec![None; rows * columns];
-    for (r, list) in cells.iter().enumerate() {
-        for &[row, column] in list {
-            region_of[row * columns + column] = Some(r);
+    let mut table = vec![[0.0; 2]; padded[0] * padded[1]];
+    for dy in 1 - rows as i64..rows as i64 {
+        for dx in 1 - columns as i64..columns as i64 {
+            let at = dy.rem_euclid(padded[0] as i64) as usize * padded[1]
+                + dx.rem_euclid(padded[1] as i64) as usize;
+            table[at][0] =
+                quadrant[dy.unsigned_abs() as usize * columns + dx.unsigned_abs() as usize];
         }
     }
+    fft2(&mut table, padded, false);
+    let scale = 1.0 / (padded[0] * padded[1]) as f64;
     let mut shares = vec![vec![0.0; cells.len()]; cells.len()];
     for (q, sources) in cells.iter().enumerate() {
+        let mut image = vec![[0.0; 2]; padded[0] * padded[1]];
         for &[row, column] in sources {
-            for (cell, region) in region_of.iter().enumerate() {
-                if let Some(r) = *region {
-                    let (target_row, target_column) = (cell / columns, cell % columns);
-                    shares[r][q] += at([
-                        target_column as i64 - column as i64,
-                        target_row as i64 - row as i64,
-                    ]);
-                }
-            }
+            image[row * padded[1] + column][0] = 1.0;
         }
+        fft2(&mut image, padded, false);
+        for (a, b) in image.iter_mut().zip(&table) {
+            *a = [a[0] * b[0] - a[1] * b[1], a[0] * b[1] + a[1] * b[0]];
+        }
+        fft2(&mut image, padded, true);
         let n = sources.len() as f64;
-        for row in &mut shares {
-            row[q] /= n;
+        for (r, targets) in cells.iter().enumerate() {
+            let landed: f64 = targets
+                .iter()
+                .map(|&[row, column]| image[row * padded[1] + column][0])
+                .sum();
+            shares[r][q] = (scale * landed / n).max(0.0);
         }
     }
     shares
+}
+
+/// The discrete Fourier transform of `data` in place, its length a power of
+/// 2, with `e^(+2πi·jk/n)` when `inverse` and without the `1/n`.
+fn fft(data: &mut [[f64; 2]], inverse: bool) {
+    let n = data.len();
+    let mut j = 0;
+    for i in 1..n {
+        let mut bit = n >> 1;
+        while j & bit != 0 {
+            j ^= bit;
+            bit >>= 1;
+        }
+        j |= bit;
+        if i < j {
+            data.swap(i, j);
+        }
+    }
+    let sign = if inverse { 1.0 } else { -1.0 };
+    let twiddles: Vec<[f64; 2]> = (0..n / 2)
+        .map(|k| {
+            let (sin, cos) = (sign * 2.0 * PI * k as f64 / n as f64).sin_cos();
+            [cos, sin]
+        })
+        .collect();
+    let mut len = 2;
+    while len <= n {
+        let stride = n / len;
+        for start in (0..n).step_by(len) {
+            for k in 0..len / 2 {
+                let [c, s] = twiddles[k * stride];
+                let [ar, ai] = data[start + k];
+                let [br, bi] = data[start + k + len / 2];
+                let (tr, ti) = (br * c - bi * s, br * s + bi * c);
+                data[start + k] = [ar + tr, ai + ti];
+                data[start + k + len / 2] = [ar - tr, ai - ti];
+            }
+        }
+        len <<= 1;
+    }
+}
+
+/// [`fft`] along both axes of `data`, `rows × columns` row by row.
+fn fft2(data: &mut [[f64; 2]], [rows, columns]: [usize; 2], inverse: bool) {
+    for row in data.chunks_mut(columns) {
+        fft(row, inverse);
+    }
+    let mut line = vec![[0.0; 2]; rows];
+    for column in 0..columns {
+        for (row, value) in line.iter_mut().enumerate() {
+            *value = data[row * columns + column];
+        }
+        fft(&mut line, inverse);
+        for (row, value) in line.iter().enumerate() {
+            data[row * columns + column] = *value;
+        }
+    }
 }
 
 #[cfg(test)]
@@ -219,6 +285,38 @@ mod tests {
                 assert!(
                     (t - oracle).abs() <= 1e-6 * oracle.max(1e-12),
                     "s {length}, {offset:?}: {t} vs {oracle}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn the_shares_are_the_sums_of_the_transfer_over_cell_pairs() {
+        let kernel = [(0.3, 0.4), (0.7, 2.0)];
+        let (rows, columns) = (7, 9);
+        let cells: Vec<Vec<[usize; 2]>> = vec![
+            vec![[0, 0], [0, 1], [1, 0]],
+            (2..5)
+                .flat_map(|row| (3..7).map(move |column| [row, column]))
+                .collect(),
+            vec![[6, 8], [5, 8], [6, 2]],
+        ];
+        let shares = region_shares(&kernel, [rows, columns], &cells);
+        for (r, targets) in cells.iter().enumerate() {
+            for (q, sources) in cells.iter().enumerate() {
+                let oracle = sources
+                    .iter()
+                    .flat_map(|&[sr, sc]| {
+                        targets.iter().map(move |&[tr, tc]| {
+                            transfer(&kernel, [tc as i64 - sc as i64, tr as i64 - sr as i64])
+                        })
+                    })
+                    .sum::<f64>()
+                    / sources.len() as f64;
+                assert!(
+                    (shares[r][q] - oracle).abs() <= 1e-13,
+                    "{r} {q}: {} vs {oracle}",
+                    shares[r][q]
                 );
             }
         }
