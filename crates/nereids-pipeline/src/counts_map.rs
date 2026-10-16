@@ -224,9 +224,11 @@ pub struct CountsMap<'a> {
     /// The square of the pulse's triangle FWHM, `h²` in µs²: the known one, or
     /// the fitted one.
     pub fwhm_squared_us2: f64,
+    /// The pulse's `R_high`, the known or the fitted one; `None` without one.
+    pub r_high: Option<f64>,
     /// The fitted shared quantities, among the normalization, the time
     /// background's `C`, `A` and `τ`, the room background's `ρ`, `t0`, flight
-    /// path, `α₀`, `α₁`, `β₀`, `β₁`, `R` and `h²`, in that order.
+    /// path, `α₀`, `α₁`, `β₀`, `β₁`, `R`, `h²` and `R_high`, in that order.
     pub shared: Vec<&'static str>,
     /// Covariance of [`Self::shared`]: the inverse of the information on them
     /// of every patch that did not fail and of the empty pixels, each with
@@ -780,6 +782,7 @@ fn fit_map_from<'a>(
                 beta: [known(4), known(5)],
                 r: known(6),
                 fwhm_squared_us2: known(7),
+                r_high: calibration.pulse.r_high.map(|_| known(8)),
                 prior: None,
                 ..calibration.pulse.clone()
             },
@@ -794,6 +797,7 @@ fn fit_map_from<'a>(
                     &map.time_edges_us,
                     region.material.as_ref(),
                     &values[instrument.clone()],
+                    calibration.pulse.storage_span(),
                 )
             })
             .collect()
@@ -1389,6 +1393,7 @@ fn fit_map_from<'a>(
         beta: [values[t0 + 4], values[t0 + 5]],
         r: values[t0 + 6],
         fwhm_squared_us2: values[t0 + 7],
+        r_high: calibration.pulse.r_high.map(|_| values[t0 + 8]),
         shared: fitted
             .iter()
             .map(|&i| {

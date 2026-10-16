@@ -332,10 +332,6 @@ fn pulses_whose_arrival_can_fall_with_flight_time_are_refused() {
             "β",
             pulse(c(0.565), sqrt_e(-0.02, 0.3), c(0.15), None, None),
         ),
-        (
-            "R",
-            pulse(c(0.565), c(0.002), sqrt_e(0.07, 0.0), None, None),
-        ),
     ] {
         let latest = |u: f64| {
             u + pulse
@@ -356,6 +352,21 @@ fn pulses_whose_arrival_can_fall_with_flight_time_are_refused() {
             other => panic!("{parameter}: {other:?}"),
         }
     }
+}
+
+#[test]
+fn a_storage_fraction_rising_with_energy_leaves_no_neutron_outside_the_range() {
+    let rising = pulse(
+        EnergyLaw::SqrtE { a0: 0.35, a1: 0.05 },
+        EnergyLaw::Const(0.1),
+        EnergyLaw::SqrtE { a0: 0.05, a1: 0.1 },
+        None,
+        Some(0.5),
+    );
+    let grid = FlightTimeGrid::new(&edges(), T0_US, FLIGHT_PATH_M, &rising.detector_pulse())
+        .expect("grid");
+    let largest = largest_outside(&rising, &grid);
+    assert!(largest < NEGLIGIBLE_ARRIVAL_PROBABILITY, "{largest}");
 }
 
 #[test]
