@@ -497,6 +497,7 @@ def _calibration(config: dict[str, Any], data_config: dict[str, Any]) -> nereids
         beta1=_value_or_number(pulse_config.get("beta1"), 0.0),
         r=_value_or_number(pulse_config.get("r"), 0.0),
         fwhm_squared_us2=_value_or_number(pulse_config.get("fwhm_squared_us2"), 0.0),
+        r1=_value_or_number(pulse_config.get("r1"), 0.0),
         energy_span_ev=(float(span[0]), float(span[1])),
         n_tau=int(pulse_config.get("n_tau", 600)),
         line_span_ev=None if line_span is None else (float(line_span[0]), float(line_span[1])),
@@ -656,6 +657,7 @@ def _fit_result_summary(result: Any, names: list[str]) -> dict[str, Any]:
         "beta": _json_safe(list(result.beta)),
         "r": _finite_float_or_none(result.r),
         "fwhm_squared_us2": _finite_float_or_none(result.fwhm_squared_us2),
+        "r1": _finite_float_or_none(result.r1),
     }
 
 

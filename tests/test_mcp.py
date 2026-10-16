@@ -364,6 +364,7 @@ class TestCountsManifest:
             beta=[0.25, 0.0],
             r=0.15,
             fwhm_squared_us2=0.0,
+            r1=0.03,
         )
 
     def test_extract_and_validate_manifest(self, tmp_path):
@@ -420,6 +421,8 @@ class TestCountsManifest:
         assert result["results"]["thickness_variance"] == 0.04
         assert result["results"]["capture_gammas"] == 0.2
         assert result["results"]["in_scatter"] == 0.6
+        assert result["results"]["r1"] == 0.03
+        assert calls["calibration"].pulse.r1.value == 0.0
 
     def test_single_spectrum_preserves_time_background(self, tmp_path, monkeypatch):
         self._counts_npz(tmp_path)

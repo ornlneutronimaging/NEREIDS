@@ -3492,8 +3492,8 @@ impl PyMeasurement {
 
 /// The Ikeda-Carpenter pulse with alpha = alpha0*sqrt(E) + alpha1 and
 /// beta = beta0*sqrt(E) + beta1 in 1/microsecond, E in eV, a storage fraction
-/// R constant over energy_span_ev, and the proton pulse's triangle of FWHM h
-/// in microseconds, given by h^2.
+/// R + R1*sqrt(E) over energy_span_ev, R1 known 0 unless given, and the proton
+/// pulse's triangle of FWHM h in microseconds, given by h^2.
 #[pyclass(name = "Pulse", from_py_object)]
 #[derive(Clone)]
 struct PyPulse {
@@ -3507,7 +3507,7 @@ impl PyPulse {
     /// energies in eV of a calibration foil's resonances, or None to check
     /// nothing.
     #[new]
-    #[pyo3(signature = (alpha0, alpha1, beta0, beta1, r, fwhm_squared_us2, energy_span_ev, n_tau=600, line_span_ev=None))]
+    #[pyo3(signature = (alpha0, alpha1, beta0, beta1, r, fwhm_squared_us2, energy_span_ev, n_tau=600, line_span_ev=None, r1=None))]
     fn new(
         alpha0: PyValue,
         alpha1: PyValue,
@@ -3518,6 +3518,7 @@ impl PyPulse {
         energy_span_ev: (f64, f64),
         n_tau: usize,
         line_span_ev: Option<(f64, f64)>,
+        r1: Option<PyValue>,
     ) -> Self {
         Self {
             inner: Pulse {
@@ -3525,6 +3526,7 @@ impl PyPulse {
                 beta: [beta0.inner, beta1.inner],
                 r: r.inner,
                 fwhm_squared_us2: fwhm_squared_us2.inner,
+                r1: r1.map_or(Value::Known(0.0), |value| value.inner),
                 energy_span_ev,
                 n_tau,
                 line_span_ev,
@@ -3566,6 +3568,14 @@ impl PyPulse {
     fn fwhm_squared_us2(&self) -> PyValue {
         PyValue {
             inner: self.inner.fwhm_squared_us2,
+        }
+    }
+
+    /// R1 in 1/sqrt(eV), the storage fraction's change with sqrt(E).
+    #[getter]
+    fn r1(&self) -> PyValue {
+        PyValue {
+            inner: self.inner.r1,
         }
     }
 
@@ -3817,6 +3827,12 @@ impl PyCountsFit {
     #[getter]
     fn fwhm_squared_us2(&self) -> f64 {
         self.inner.fwhm_squared_us2
+    }
+
+    /// The pulse's R1.
+    #[getter]
+    fn r1(&self) -> f64 {
+        self.inner.r1
     }
 
     /// The time background's [C, A, tau].
@@ -4179,6 +4195,7 @@ struct PyCountsMap {
     beta: [f64; 2],
     r: f64,
     fwhm_squared_us2: f64,
+    r1: f64,
     shared: Vec<String>,
     shared_covariance: Option<FlatMatrix>,
     measured_pulls: Option<Vec<f64>>,
@@ -4211,6 +4228,7 @@ impl PyCountsMap {
             beta: map.beta,
             r: map.r,
             fwhm_squared_us2: map.fwhm_squared_us2,
+            r1: map.r1,
             shared: map.shared.iter().map(|name| name.to_string()).collect(),
             shared_covariance: map.shared_covariance.clone(),
             measured_pulls: map.measured_pulls.clone(),
@@ -4358,6 +4376,12 @@ impl PyCountsMap {
     #[getter]
     fn fwhm_squared_us2(&self) -> f64 {
         self.fwhm_squared_us2
+    }
+
+    /// The pulse's R1.
+    #[getter]
+    fn r1(&self) -> f64 {
+        self.r1
     }
 
     /// The fitted shared quantities, in order.

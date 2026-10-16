@@ -223,6 +223,7 @@ fn known(pulse: &IkedaCarpenter) -> Pulse {
         beta: coefficients(&params.beta).map(Value::Known),
         r: Value::Known(coefficients(&params.r)[1]),
         fwhm_squared_us2: Value::Known(params.channel_fwhm_us.unwrap_or(0.0).powi(2)),
+        r1: Value::Known(0.0),
         energy_span_ev: detector.energy_span_ev(),
         n_tau: detector.n_tau(),
         line_span_ev: None,
@@ -4167,6 +4168,56 @@ fn a_sample_or_pulse_the_calibration_does_not_cover_is_refused() {
     let mut known = calibrated;
     known.pulse.r = Value::Known(0.2);
     assert!(refusal(&calibration_sample(CALIBRATION_DENSITY), &known).contains("covers R"));
+}
+
+#[test]
+fn a_storage_fraction_rising_with_energy_is_recovered() {
+    let (r, r1) = (0.1, 0.02);
+    let mut setup = calibration_foil(&CALIBRATION_PULSE, T0_US, FLIGHT_PATH_M);
+    let laws = setup.pulse.params().clone();
+    setup.pulse = Arc::new(
+        IkedaCarpenter::new(
+            IkedaCarpenterParams {
+                r: EnergyLaw::SqrtE { a0: r1, a1: r },
+                ..laws
+            },
+            FLIGHT_PATH_M,
+            &SynthesisGrid {
+                e_min_ev: 1.0,
+                e_max_ev: 200.0,
+                n_energies: 32,
+                n_tau: 256,
+            },
+        )
+        .expect("valid IC model"),
+    );
+    let counts = expected(
+        &setup,
+        &beam(CALIBRATION_LEVEL),
+        &calibration_sample(CALIBRATION_DENSITY),
+    );
+    let m = calibration_measurement(&setup, (rounded(&counts.0), rounded(&counts.1)));
+    let fit_with = |storage_slope| {
+        let mut calibration = calibration(&setup);
+        calibration.pulse.r = Value::Fitted(0.15);
+        calibration.pulse.r1 = storage_slope;
+        fit_counts(&m, &calibration).expect("fit")
+    };
+    let fit = fit_with(Value::Fitted(0.0));
+    assert!(fit.converged);
+    let pulls: Vec<f64> = [(fit.r, r), (fit.r1, r1)]
+        .iter()
+        .enumerate()
+        .map(|(i, &(estimate, truth))| (estimate - truth) / error_bar(&fit, 2 + i))
+        .collect();
+    assert!(pulls.iter().all(|p| p.abs() <= BOUND.sqrt()), "{pulls:?}");
+    let constant = fit_with(Value::Known(0.0));
+    assert!(
+        constant.deviance - fit.deviance >= 10.0,
+        "{} vs {}",
+        constant.deviance,
+        fit.deviance
+    );
 }
 
 mod pulse_calibration {

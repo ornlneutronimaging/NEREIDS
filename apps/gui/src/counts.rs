@@ -156,6 +156,7 @@ fn calibration(request: &FitRequest) -> Calibration {
             beta: [Value::Known(p.beta0), Value::Known(p.beta1)],
             r: Value::Known(p.r),
             fwhm_squared_us2: Value::Known(p.fwhm_us * p.fwhm_us),
+            r1: Value::Known(0.0),
             energy_span_ev: request.energy_span_ev,
             n_tau: 8,
             line_span_ev: None,

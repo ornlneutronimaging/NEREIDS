@@ -1193,9 +1193,10 @@ class Measurement:
 
 class Pulse:
     """The Ikeda-Carpenter pulse: alpha = alpha0*sqrt(E) + alpha1 and
-    beta = beta0*sqrt(E) + beta1 in 1/microsecond, R constant over
-    energy_span_ev (eV), and triangle FWHM h with fwhm_squared_us2 equal to
-    h^2 in microseconds squared."""
+    beta = beta0*sqrt(E) + beta1 in 1/microsecond, a storage fraction
+    R + R1*sqrt(E) over energy_span_ev (eV), R1 known 0 unless given, and
+    triangle FWHM h with fwhm_squared_us2 equal to h^2 in microseconds
+    squared."""
 
     def __init__(
         self,
@@ -1208,6 +1209,7 @@ class Pulse:
         energy_span_ev: tuple[float, float],
         n_tau: int = 600,
         line_span_ev: tuple[float, float] | None = None,
+        r1: Value | None = None,
     ) -> None: ...
     @property
     def alpha(self) -> list[Value]: ...
@@ -1217,6 +1219,8 @@ class Pulse:
     def r(self) -> Value: ...
     @property
     def fwhm_squared_us2(self) -> Value: ...
+    @property
+    def r1(self) -> Value: ...
     @property
     def energy_span_ev(self) -> tuple[float, float]: ...
     @property
@@ -1283,6 +1287,8 @@ class CountsFit:
     def r(self) -> float: ...
     @property
     def fwhm_squared_us2(self) -> float: ...
+    @property
+    def r1(self) -> float: ...
     @property
     def time_background(self) -> list[float]: ...
     @property
@@ -1415,6 +1421,8 @@ class CountsMap:
     def r(self) -> float: ...
     @property
     def fwhm_squared_us2(self) -> float: ...
+    @property
+    def r1(self) -> float: ...
     @property
     def shared(self) -> list[str]: ...
     @property

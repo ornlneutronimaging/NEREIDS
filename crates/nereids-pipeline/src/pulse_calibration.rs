@@ -171,8 +171,9 @@ impl PulseCalibration {
     /// not measured, as above, an identifier of `provenance` is
     /// empty or its runs are the same, or `calibration`'s pulse carries a
     /// prior or a pulse number measured or boxed, since a calibration foil is
-    /// calibrated alone over the numbers' physical ranges; everything
-    /// [`fit_counts`] refuses;
+    /// calibrated alone over the numbers' physical ranges, or `R₁` is not
+    /// known to be 0, since the calibration records a storage fraction
+    /// constant in energy; everything [`fit_counts`] refuses;
     /// [`PipelineError::InvalidParameter`] if the fit did not converge, or
     /// fitted a pulse number and gives no [`CountsFit::unbounded`] Gaussian, a
     /// pulse number it fitted has no finite positive variance without its
@@ -204,6 +205,13 @@ impl PulseCalibration {
                     .into(),
             ));
         }
+        if pulse.r1 != Value::Known(0.0) {
+            return Err(PipelineError::InvalidParameter(format!(
+                "a pulse calibration records a storage fraction constant in energy, so R₁ must \
+                 be known at 0; got {:?}",
+                pulse.r1
+            )));
+        }
         let fit = fit_counts(measurement, calibration)?;
         let pulse = Self::from_fit(measurement, calibration, foil, provenance, &fit)?;
         Ok((pulse, fit))
@@ -223,10 +231,10 @@ impl PulseCalibration {
         let fitted: Vec<bool> = quantities(measurement, calibration)
             .map(|(_, value)| !matches!(value, Value::Known(_)))
             .collect();
-        let first_number = fitted.len() - 6;
+        let first_number = fitted.len() - PULSE_NUMBERS.len();
         let mut status = [Status::Known; 6];
         let mut covered = Vec::with_capacity(6);
-        for (number, name) in PULSE_NUMBERS.into_iter().enumerate() {
+        for (number, name) in PULSE_NUMBERS.into_iter().take(NUMBERS.len()).enumerate() {
             let quantity = first_number + number;
             let i = fitted[..quantity].iter().filter(|&&f| f).count();
             if !fitted[quantity] {
@@ -352,7 +360,7 @@ impl PulseCalibration {
                 self.provenance, other.provenance
             ));
         }
-        for (n, name) in PULSE_NUMBERS.into_iter().enumerate() {
+        for (n, name) in PULSE_NUMBERS.into_iter().take(NUMBERS.len()).enumerate() {
             let (a, b) = (self.status[n], other.status[n]);
             if a != b || (a == Status::Known && self.numbers[n] != other.numbers[n]) {
                 return invalid(format!(
@@ -416,6 +424,7 @@ impl PulseCalibration {
                 beta: [value(2), value(3)],
                 r: value(4),
                 fwhm_squared_us2: value(5),
+                r1: Value::Known(0.0),
                 energy_span_ev: self.energy_span_ev,
                 n_tau: self.n_tau,
                 line_span_ev: self.line_span_ev,
@@ -607,7 +616,9 @@ impl PulseCalibration {
         };
         let experiment = pulse.calibration();
         experiment.instrument()?;
-        experiment.pulse.at(&numbers)?;
+        experiment
+            .pulse
+            .at(&numbers.iter().chain(&[0.0]).copied().collect::<Vec<f64>>())?;
         Ok(pulse)
     }
 }
@@ -957,6 +968,7 @@ mod tests {
                 beta: [Value::Fitted(0.08), beta1],
                 r: Value::Fitted(0.2),
                 fwhm_squared_us2: Value::Fitted(0.1),
+                r1: Value::Known(0.0),
                 energy_span_ev: (1.0, 200.0),
                 n_tau: 256,
                 line_span_ev: None,
@@ -1005,6 +1017,7 @@ mod tests {
             beta: [0.0, 0.01],
             r: 0.21,
             fwhm_squared_us2: 0.12,
+            r1: 0.0,
             time_background: [0.0, 0.0, 1.0],
             room_background: 0.0,
             spread_share: 0.0,
@@ -1341,12 +1354,15 @@ mod tests {
             lower: 0.15,
             upper: 0.25,
         };
+        let mut rising = c.clone();
+        rising.pulse.r1 = Value::Fitted(0.01);
         for (c, provenance, refusal) in [
             (&c, same, "names its foil"),
             (&c, unnamed, "names its foil"),
             (&original().calibration(), provenance(), "calibrated alone"),
             (&measured, provenance(), "calibrated alone"),
             (&boxed, provenance(), "calibrated alone"),
+            (&rising, provenance(), "R₁ must be known at 0"),
         ] {
             match PulseCalibration::new(&measurement(None), c, provenance) {
                 Err(PipelineError::InvalidParameter(message)) => {

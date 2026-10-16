@@ -31,10 +31,9 @@ pub enum FlightTimeGridError {
     /// The flight path is not finite and positive.
     InvalidFlightPath(f64),
     /// Not supported: the pulse's `parameter` law lengthens the pulse as
-    /// energy rises (α falling, β falling with a storage term, or R rising).
-    /// The range relies on
-    /// arrival times growing with flight time, which such a pulse does not
-    /// guarantee.
+    /// energy rises (α falling, or β falling with a storage term).  The range
+    /// relies on arrival times growing with flight time, which such a pulse
+    /// does not guarantee.
     LengthensWithEnergy { parameter: &'static str },
     /// The pulse cannot be evaluated.
     Pulse(ResolutionParseError),
@@ -63,8 +62,7 @@ impl fmt::Display for FlightTimeGridError {
             Self::LengthensWithEnergy { parameter } => write!(
                 f,
                 "unsupported pulse: its {parameter} law lengthens the pulse as energy rises; \
-                 the flight-time grid needs α and β that do not fall and R that does not \
-                 rise with energy"
+                 the flight-time grid needs α and β that do not fall with energy"
             ),
             Self::Pulse(e) => write!(f, "pulse: {e}"),
             Self::OutsideCalibration { low_ev, high_ev } => write!(
@@ -170,7 +168,10 @@ impl FlightTimeGrid {
     /// flight path `flight_path_m` and `pulse`.  The step, half the pulse's shorter rise at the two ends of the flight
     /// times whose neutrons can reach the bins, is a starting step: the counts
     /// are converged once [`Self::halved`] no longer changes them.  The grid
-    /// extends one step beyond those flight times at each end.
+    /// extends one step beyond those flight times at each end.  For a storage
+    /// fraction that rises with energy, the latest arrival that sets the
+    /// earliest flight time takes the fraction at its largest over the energy
+    /// span.
     ///
     /// # Errors
     /// See [`FlightTimeGridError`].
@@ -244,24 +245,29 @@ fn range_us(
         return Err(FlightTimeGridError::InvalidFlightPath(flight_path_m));
     }
     let change = |law: &EnergyLaw| law.eval(e_max) - law.eval(e_min);
+    let storage = params.r.eval(e_min).max(params.r.eval(e_max));
     for (parameter, lengthens) in [
         ("α", change(&params.alpha) < 0.0),
-        (
-            "β",
-            change(&params.beta) < 0.0 && params.r.eval(e_min) > 0.0,
-        ),
-        ("R", change(&params.r) > 0.0),
+        ("β", change(&params.beta) < 0.0 && storage > 0.0),
     ] {
         if lengthens {
             return Err(FlightTimeGridError::LengthensWithEnergy { parameter });
         }
     }
+    let longest = IkedaCarpenterParams {
+        r: if change(&params.r) > 0.0 {
+            EnergyLaw::Const(storage)
+        } else {
+            params.r.clone()
+        },
+        ..params.clone()
+    };
     let clock = TOF_FACTOR * flight_path_m;
     let energy = |u: f64| (clock / u).powi(2);
     let first_edge = time_edges_us[0] - t0_us;
     let last_edge = time_edges_us[time_edges_us.len() - 1] - t0_us;
     let latest = |u: f64| {
-        params
+        longest
             .delays_us(energy(u))
             .map(|(_, last)| u + last - first_edge)
     };

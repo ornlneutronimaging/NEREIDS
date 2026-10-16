@@ -895,6 +895,19 @@ class TestCountsApi:
         )
         assert uneven.thickness_variance.value == 0.05
         assert region.capture_gammas.value == 0.0
+        pulse = self._calibration().pulse
+        assert (pulse.r1.kind, pulse.r1.value) == ("known", 0.0)
+        rising = nereids.Pulse(
+            alpha0=pulse.alpha[0],
+            alpha1=pulse.alpha[1],
+            beta0=pulse.beta[0],
+            beta1=pulse.beta[1],
+            r=pulse.r,
+            fwhm_squared_us2=pulse.fwhm_squared_us2,
+            energy_span_ev=pulse.energy_span_ev,
+            r1=nereids.Value.fitted(0.01),
+        )
+        assert (rising.r1.kind, rising.r1.value) == ("fitted", 0.01)
         assert region.in_scatter.value == 0.0
         assert measurement.spread is None
         spread = nereids.Spread(

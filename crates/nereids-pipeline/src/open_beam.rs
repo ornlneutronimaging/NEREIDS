@@ -21,12 +21,13 @@ use crate::pulse_calibration::PulsePrior;
 /// grid to be accepted.
 pub const BOUND: f64 = 0.01;
 
-pub(crate) const PULSE_NUMBERS: [&str; 6] = ["α₀", "α₁", "β₀", "β₁", "R", "h²"];
+pub(crate) const PULSE_NUMBERS: [&str; 7] = ["α₀", "α₁", "β₀", "β₁", "R", "h²", "R₁"];
 
 const RATE: (RangeInclusive<f64>, &str) = (0.0..=f64::INFINITY, "0 or more");
 
-pub(crate) const PULSE_RANGES: [(RangeInclusive<f64>, &str); 6] =
-    [RATE, RATE, RATE, RATE, (0.0..=1.0, "within 0–1"), RATE];
+const ANY: (RangeInclusive<f64>, &str) = (f64::NEG_INFINITY..=f64::INFINITY, "any real number");
+
+const STORAGE: usize = 4;
 
 /// A neutron of flight time `u` over the flight path `flight_path_m` (m)
 /// arrives at `t0_us + u` (µs) plus a delay drawn from `pulse`.
@@ -43,14 +44,10 @@ pub struct Calibration {
 impl Calibration {
     pub(crate) fn instrument(&self) -> Result<Vec<FitParameter>, PipelineError> {
         let pulse = &self.pulse;
-        let numbers = [
-            pulse.alpha[0],
-            pulse.alpha[1],
-            pulse.beta[0],
-            pulse.beta[1],
-            pulse.r,
-            pulse.fwhm_squared_us2,
-        ];
+        let mut ranges = [RATE, RATE, RATE, RATE, (0.0..=1.0, "within 0–1"), RATE, ANY];
+        if pulse.r1 != Value::Known(0.0) {
+            ranges[STORAGE] = ANY;
+        }
         let mut parameters = vec![
             self.t0_us
                 .parameter("t0", f64::NEG_INFINITY..=f64::INFINITY, "any real number")?,
@@ -61,7 +58,7 @@ impl Calibration {
             )?,
         ];
         for ((name, value), (range, allowed)) in
-            PULSE_NUMBERS.into_iter().zip(numbers).zip(PULSE_RANGES)
+            PULSE_NUMBERS.into_iter().zip(pulse.numbers()).zip(ranges)
         {
             parameters.push(value.parameter(name, range, allowed)?);
         }
@@ -70,20 +67,25 @@ impl Calibration {
 }
 
 /// The Ikeda–Carpenter pulse with `α = α₀√E + α₁` and `β = β₀√E + β₁` in
-/// 1/µs, `E` in eV, a storage fraction `R` constant over `energy_span_ev`, and
+/// 1/µs, `E` in eV, a storage fraction `R + R₁√E` over `energy_span_ev`, and
 /// the proton pulse's triangle of FWHM `h` in µs, given by `h²`, in which the
 /// counts are smooth down to `h = 0`.  `α` and `β` must be at least 1e-9 µs⁻¹
-/// across the span, `β` even where `R` is 0.
+/// across the span, `β` even where the storage fraction is 0, and the storage
+/// fraction within 0–1.
 #[derive(Debug, Clone)]
 pub struct Pulse {
     /// `[α₀, α₁]`, in 1/(µs·√eV) and 1/µs, each 0 or more.
     pub alpha: [Value; 2],
     /// `[β₀, β₁]`, in 1/(µs·√eV) and 1/µs, each 0 or more.
     pub beta: [Value; 2],
-    /// `R`, within 0–1.
+    /// `R`, within 0–1 while [`Self::r1`] is known to be 0, any real number
+    /// otherwise.
     pub r: Value,
     /// `h²` in µs², 0 or more.
     pub fwhm_squared_us2: Value,
+    /// `R₁` in 1/√eV, any real number; known 0 holds the storage fraction
+    /// constant.
+    pub r1: Value,
     /// `(low, high)`, the energies in eV the laws hold over; a window that
     /// neutrons from outside them can reach is refused.
     pub energy_span_ev: (f64, f64),
@@ -107,6 +109,19 @@ pub struct Pulse {
 }
 
 impl Pulse {
+    /// `[α₀, α₁, β₀, β₁, R, h², R₁]`, in the order of the fit's pulse numbers.
+    pub(crate) fn numbers(&self) -> [&Value; 7] {
+        [
+            &self.alpha[0],
+            &self.alpha[1],
+            &self.beta[0],
+            &self.beta[1],
+            &self.r,
+            &self.fwhm_squared_us2,
+            &self.r1,
+        ]
+    }
+
     pub(crate) fn at(&self, numbers: &[f64]) -> Result<DetectorPulse, PipelineError> {
         DetectorPulse::new(laws(numbers), self.energy_span_ev, self.n_tau)
             .map_err(|e| PipelineError::InvalidParameter(e.to_string()))
@@ -123,7 +138,10 @@ pub(crate) fn laws(numbers: &[f64]) -> IkedaCarpenterParams {
             a0: numbers[2],
             a1: numbers[3],
         },
-        r: EnergyLaw::Const(numbers[4]),
+        r: EnergyLaw::SqrtE {
+            a0: numbers[6],
+            a1: numbers[4],
+        },
         burst_sigma_us: None,
         channel_fwhm_us: Some(numbers[5].sqrt()),
     }
