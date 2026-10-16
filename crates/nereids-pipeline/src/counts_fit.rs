@@ -482,7 +482,8 @@ pub struct RegionFit {
 /// number, a run has no counts, a live fraction is not in (0, 1], the charge
 /// ratio or a room background's frames are not finite and positive, a
 /// region's pixels are not finite and
-/// positive, a known, starting or measured value is
+/// positive, a region without a material has capture gammas other than known
+/// 0, a known, starting or measured value is
 /// not finite and in its quantity's range, a measured value's sd is not finite
 /// and positive, bounds are not `lower < upper` in that range
 /// with the start between them, the pulse's calibration covers a number that
@@ -696,6 +697,15 @@ pub(crate) fn checked<'a>(
         return invalid(format!(
             "the pixels of region {r} must be finite and positive, got {}",
             region.pixels
+        ));
+    }
+    if let Some(r) = regions
+        .iter()
+        .position(|region| region.material.is_none() && region.capture_gammas != Value::Known(0.0))
+    {
+        return invalid(format!(
+            "region {r} holds no material to capture neutrons, so its capture gammas must be \
+             known 0"
         ));
     }
     for (r, material) in materials() {
@@ -1182,7 +1192,7 @@ pub(crate) fn fit_counts_answer(
     let pixels: Vec<f64> = regions.iter().map(|region| region.pixels).collect();
     let captures: Vec<bool> = regions
         .iter()
-        .map(|region| region.material.is_some() && region.capture_gammas != Value::Known(0.0))
+        .map(|region| region.capture_gammas != Value::Known(0.0))
         .collect();
     let layout = Arc::new(Layout::new(roles(&sizes, &shape), &pixels, &captures));
     let mut parameters = ParameterSet::new(

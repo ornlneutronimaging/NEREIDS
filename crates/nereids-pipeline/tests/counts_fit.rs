@@ -2563,6 +2563,17 @@ fn measurements_the_fit_does_not_describe_are_refused() {
         m.regions.push(m.regions[0].clone());
         m.material_mut().covariances = vec![(0, covariance.clone())];
     });
+    for capture_gammas in [Value::Fitted(0.01), Value::Known(0.01)] {
+        let message = match refused(&|m| {
+            m.regions.push(m.regions[0].clone());
+            m.regions[1].material = None;
+            m.regions[1].capture_gammas = capture_gammas;
+        }) {
+            PipelineError::InvalidParameter(message) => message,
+            other => panic!("{other}"),
+        };
+        assert!(message.contains("capture gammas"), "{message}");
+    }
     let mut trace = good.clone();
     (trace.regions[0].open_counts, trace.regions[0].sample_counts) = draws(&counts, 0, [1.0; 2]);
     let tungsten = synthetic_isotope(74, 182, 24.0, 0.01, 0.06);
