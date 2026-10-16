@@ -7,6 +7,7 @@
 //! - [`auxiliary_grid`] - auxiliary energy grid for resolution broadening
 //! - [`channel`] - wave number, rho parameter, statistical weights
 //! - [`continuous_doppler`] - the free-gas kernel integrated over the resonance equation
+//! - [`detector_spread`] - counts the detector records away from where they arrive
 //! - [`doppler`] - free-gas-model Doppler broadening
 //! - [`forward_scatter`] - neutrons scattered once in a slab that leave through its back face
 //! - [`penetrability`] - hard-sphere penetrability, shift and phase shift
@@ -26,6 +27,7 @@
 pub mod auxiliary_grid;
 pub mod channel;
 pub mod continuous_doppler;
+pub mod detector_spread;
 pub mod doppler;
 pub mod flight_time_grid;
 pub mod forward_scatter;

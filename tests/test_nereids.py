@@ -896,6 +896,19 @@ class TestCountsApi:
         assert uneven.thickness_variance.value == 0.05
         assert region.capture_gammas.value == 0.0
         assert region.in_scatter.value == 0.0
+        assert measurement.spread is None
+        spread = nereids.Spread(
+            nereids.Value.fitted(0.1), [(1.0, 2.5)], (4, 4), [[(0, 0), (1, 1)]]
+        )
+        spread_measurement = nereids.Measurement(
+            time_edges_us=[1.0, 2.0, 3.0, 4.0, 5.0],
+            charge_ratio=1.0,
+            normalization=nereids.Value.fitted(1.0),
+            regions=[region],
+            spread=spread,
+        )
+        assert spread_measurement.spread.share.value == 0.1
+        assert spread_measurement.spread.kernel == [(1.0, 2.5)]
 
     def test_fit_counts_requires_a_material(self):
         measurement = nereids.Measurement(

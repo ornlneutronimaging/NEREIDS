@@ -55,6 +55,7 @@ time-bin edges (microseconds), not an energy grid.
 | Material | Isotopes each with an areal density in atoms/barn, and a temperature in K. |
 | Region | Both runs' counts for one set of pixels, its background [b0, b1, b2, d, f], its area in pixels, the gamma transmission, and the material. |
 | RoomBackground | Counts per microsecond per pixel per frame that follow each run's duration, and each run's frames. |
+| Spread | The share of each detector cell's counts recorded elsewhere, the spread kernel, and each region's cells. |
 | Measurement | The time-bin edges, charge ratio, normalization, time and room backgrounds and regions of one fit. |
 | Pulse | Ikeda-Carpenter pulse parameters and the energy span they hold over. |
 | Calibration | Timing offset t0 (microseconds), flight path (m), and Pulse. |
@@ -101,14 +102,19 @@ of single scatters leaving through the back face at the mean areal density.
 #### Measurement
 
 Measurement(time_edges_us, charge_ratio, normalization, regions,
-time_background=None, room_background=None) holds one open-beam/sample run
+time_background=None, room_background=None, spread=None) holds one open-beam/sample run
 pair. time_edges_us are the shared time-bin edges in microseconds (length =
 bins + 1), charge_ratio is the sample run's proton charge over the open-beam
 run's, and normalization is the sample run's normalization a. time_background
 is [C, A, tau] or NO_TIME_BACKGROUND. room_background is
 RoomBackground(rate, frames) or None: rate counts per microsecond per pixel
 per frame in both runs, not scaled by the charge ratio, the normalization or
-the gamma transmission, and frames the (open-beam, sample) frames.
+the gamma transmission, and frames the (open-beam, sample) frames. spread is
+Spread(share, kernel, grid, cells) or None: region r records
+(1 - h)*mu_r + h*sum(F_rq*mu_q) of the counts mu arriving in the regions,
+F_rq the share of region q's spread counts recorded in region r's cells, for
+the kernel's (weight, length in cells) terms
+sum(w*exp(-r/s)/(2*pi*s**2)) on a grid of (rows, columns) cells.
 
 #### Pulse
 

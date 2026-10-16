@@ -229,6 +229,7 @@ pub fn run_pixel_fit(request: &FitRequest) -> Result<PixelFitSummary, String> {
         normalization: normalization(request),
         time_background: NO_TIME_BACKGROUND,
         room_background: None,
+        spread: None,
         regions: vec![region],
     };
     let fit =
