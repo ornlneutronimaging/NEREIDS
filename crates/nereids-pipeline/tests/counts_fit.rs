@@ -2699,6 +2699,18 @@ fn measurements_the_fit_does_not_describe_are_refused() {
         };
         assert!(message.contains("in-scatter must be known 0"), "{message}");
     }
+    let lowest_ev = *chain(&setup)[0].energies_ev().last().expect("a grid");
+    let below = synthetic_isotope(74, 182, 0.995 * lowest_ev, 0.01, 0.06);
+    let message = match refused(&|m| {
+        m.regions[0].in_scatter = Value::Fitted(0.1);
+        m.material_mut()
+            .isotopes
+            .push((below.clone(), Value::Known(1e-4)));
+    }) {
+        PipelineError::InvalidParameter(message) => message,
+        other => panic!("{other}"),
+    };
+    assert!(message.contains("in-scatter of region 0"), "{message}");
     let mut trace = good.clone();
     (trace.regions[0].open_counts, trace.regions[0].sample_counts) = draws(&counts, 0, [1.0; 2]);
     let tungsten = synthetic_isotope(74, 182, 24.0, 0.01, 0.06);

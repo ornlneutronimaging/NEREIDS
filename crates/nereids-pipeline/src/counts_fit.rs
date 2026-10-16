@@ -22,7 +22,7 @@ use nereids_physics::continuous_doppler::{
 };
 use nereids_physics::doppler::DopplerParams;
 use nereids_physics::flight_time_grid::{FlightTimeGrid, Rows};
-use nereids_physics::forward_scatter::{ForwardYield, forward_yield};
+use nereids_physics::forward_scatter::{ForwardYield, forward_yield, lowest_exit_ratio};
 use nereids_physics::ikeda_carpenter::IkedaCarpenterParams;
 use nereids_physics::resolution::TOF_FACTOR;
 use nereids_physics::thickness::{interacting_per_depth, uneven_transmission};
@@ -507,7 +507,10 @@ pub struct RegionFit {
 /// path and pulse, or at the fitted ones of any pass that rebuilds it, at the
 /// region's known temperature or at the upper bound of a fitted one, down to
 /// zero for a window within the thermal spread of zero energy, are not inside
-/// a single one of its evaluated (SLBW, MLBW or Reich–Moore) resolved ranges;
+/// a single one of its evaluated (SLBW, MLBW or Reich–Moore) resolved ranges,
+/// or, in a region with in-scatter, an isotope has a resonance below that
+/// grid's lowest energy and above the lowest energy a neutron scattered forward
+/// leaves with;
 /// [`PipelineError::UnmodelledCounts`] if at the fit, converged or not, a bin
 /// is predicted negative or non-finite counts, or, outside the bins left
 /// out, holds counts predicted below [`NEGLIGIBLE_PREDICTION`]: starting or known values the fitter cannot
@@ -850,6 +853,7 @@ pub(crate) fn checked<'a>(
                 region,
                 isotopes: &material.isotopes,
                 dopplers,
+                scatters: measurement.regions[region].in_scatter != Value::Known(0.0),
             })
         })
         .collect::<Result<_, PipelineError>>()?;
@@ -1054,6 +1058,27 @@ fn in_span(
     lines
         .iter()
         .map(|lines| {
+            if lines.scatters {
+                let lowest = span_ev.0
+                    * lines
+                        .isotopes
+                        .iter()
+                        .map(|(isotope, _)| lowest_exit_ratio(isotope.awr))
+                        .fold(1.0, f64::min);
+                if let Some((isotope, e)) = lines.isotopes.iter().find_map(|(isotope, _)| {
+                    resonance_center_energies(&[isotope])
+                        .into_iter()
+                        .find(|e| (lowest..span_ev.0).contains(e))
+                        .map(|e| (isotope, e))
+                }) {
+                    return Err(PipelineError::InvalidParameter(format!(
+                        "the in-scatter of region {} leaves with energies down to {lowest:.6e} \
+                         eV, below the flight-time grid's lowest {:.6e} eV, and {} has a \
+                         resonance at {e:.6e} eV there",
+                        lines.region, span_ev.0, isotope.isotope
+                    )));
+                }
+            }
             lines
                 .isotopes
                 .iter()
@@ -2143,6 +2168,7 @@ struct Lines<'a> {
     region: usize,
     isotopes: &'a [(ResonanceData, Value)],
     dopplers: Vec<DopplerParams>,
+    scatters: bool,
 }
 
 struct Layout {
@@ -2510,14 +2536,22 @@ impl RegionsModel {
             _ => None,
         };
         let acceptance = params[place.scatter];
-        let mut scatter = elastic.as_ref().map(|_| Scattered {
-            per_acceptance: Vec::with_capacity(n),
-            shares: self.absorbers[region]
-                .isotopes
-                .iter()
-                .map(|isotope| forward_yield(&self.flight_energies, &depths, isotope.awr))
-                .collect(),
-        });
+        let mut scatter = elastic
+            .as_ref()
+            .map(|_| {
+                Ok::<_, FittingError>(Scattered {
+                    per_acceptance: Vec::with_capacity(n),
+                    shares: self.absorbers[region]
+                        .isotopes
+                        .iter()
+                        .map(|isotope| {
+                            forward_yield(&self.flight_energies, &depths, isotope.awr)
+                                .map_err(|e| FittingError::EvaluationFailed(e.to_string()))
+                        })
+                        .collect::<Result<_, _>>()?,
+                })
+            })
+            .transpose()?;
         let (mut sample, mut per_depth, mut per_variance) = (
             Vec::with_capacity(n),
             Vec::with_capacity(n),
