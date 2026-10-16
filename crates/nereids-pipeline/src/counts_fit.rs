@@ -183,9 +183,8 @@ pub struct Region {
     /// and leaving through its back face that its pixels record, 0 or more:
     /// the sample run gains `c_q·a·Ω·φ·Σ_m n_m σ_sm·G_m`, `σ_sm` each isotope's
     /// elastic cross section broadened like its total one and `G_m` its share
-    /// leaving through the back face
-    /// ([`forward_yield`](nereids_physics::forward_scatter::forward_yield)), at
-    /// the mean areal density and the neutrons' flight times.
+    /// leaving through the back face ([`forward_yield`]), at the mean areal
+    /// density and the neutrons' flight times.
     pub in_scatter: Value,
     /// The material the beam crosses in the region; `None` for nothing, which
     /// transmits every neutron.
