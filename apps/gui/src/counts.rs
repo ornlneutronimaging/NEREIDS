@@ -219,6 +219,7 @@ pub fn run_pixel_fit(request: &FitRequest) -> Result<PixelFitSummary, String> {
         background: background(request),
         pixels,
         gamma_transmission: Value::Known(1.0),
+        capture_gammas: Value::Known(0.0),
         material: Some(material(request)),
     };
     let measurement = Measurement {
@@ -274,6 +275,7 @@ pub fn run_map_fit(request: &FitRequest) -> Result<MapFitSummary, String> {
         material: material(request),
         background: background(request),
         gamma_transmission: Value::Known(1.0),
+        capture_gammas: Value::Known(0.0),
         empty_background: [Value::Known(0.0); 5],
     };
     let fit = counts_map::fit_map(&map, &calibration(request)).map_err(|e| e.to_string())?;

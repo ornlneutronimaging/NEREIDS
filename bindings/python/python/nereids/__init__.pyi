@@ -1083,7 +1083,8 @@ class Region:
 
     The background is [b0, b1, b2] or [b0, b1, b2, d, f] of
     b(E) = b0 + b1/sqrt(E) + b2*sqrt(E) + d*exp(-f/sqrt(E));
-    pixels is the region area in pixels.
+    pixels is the region area in pixels; capture_gammas is the share of the
+    sample's captures whose gammas the region records, known 0 by default.
     """
 
     def __init__(
@@ -1096,7 +1097,10 @@ class Region:
         material: Material | None = None,
         open_live: NDArray[np.float64] | None = None,
         sample_live: NDArray[np.float64] | None = None,
+        capture_gammas: Value | None = None,
     ) -> None: ...
+    @property
+    def capture_gammas(self) -> Value: ...
     @property
     def open_counts(self) -> NDArray[np.float64]: ...
     @property
@@ -1213,6 +1217,8 @@ class RegionFit:
     @property
     def thickness_variance(self) -> float | None: ...
     @property
+    def capture_gammas(self) -> float: ...
+    @property
     def background(self) -> list[float]: ...
     @property
     def gamma_transmission(self) -> float: ...
@@ -1310,6 +1316,7 @@ class MapMeasurement:
         time_background: list[Value] | None = None,
         gamma_transmission: Value | None = None,
         room_background: RoomBackground | None = None,
+        capture_gammas: Value | None = None,
     ) -> None: ...
     def patches(self) -> list[list[Patch]]:
         """Each patch kind, in (patch row, patch column)."""
@@ -1326,6 +1333,8 @@ class MapMeasurement:
     def gamma_transmission(self) -> Value: ...
     @property
     def room_background(self) -> RoomBackground | None: ...
+    @property
+    def capture_gammas(self) -> Value: ...
 
 class CountsMap:
     """The fitted map, one value per patch."""

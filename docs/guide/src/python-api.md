@@ -89,7 +89,9 @@ Region(open_counts, sample_counts, pixels, background, gamma_transmission,
 material=None, open_live=None, sample_live=None) holds one region. background
 is b(E) = b0 + b1/sqrt(E) + b2*sqrt(E) + d*exp(-f/sqrt(E)) as five Values
 [b0, b1, b2, d, f], f 0 or more; three Values [b0, b1, b2] hold d and f at 0.
-The optional live fractions are per bin in (0, 1].
+The optional live fractions are per bin in (0, 1]. capture_gammas is the share
+epsilon of the sample's captures whose gammas the region records, known 0 by
+default; the sample run gains c_q*a*epsilon*phi*(1 - T)*sum(n*sigma_gamma)/D.
 
 #### Measurement
 

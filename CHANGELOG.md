@@ -24,6 +24,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
   density over the pixels a region sums, makes the region transmit
   `(1 + v*D)**(-1/v)`; known 0 by default, it can be fitted with the density
   and temperature.
+- A region's `capture_gammas` `epsilon` adds the gammas of neutrons captured
+  in its sample at their first collision, `c_q*a*epsilon*phi*(1 - T)*sum(n*sigma_gamma)/D`,
+  through the pulse; the capture cross sections are broadened like the total.
 
 ### Changed (breaking)
 

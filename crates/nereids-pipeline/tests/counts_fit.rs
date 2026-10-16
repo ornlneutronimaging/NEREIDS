@@ -11,7 +11,7 @@ use nereids_endf::retrieval::EndfLibrary;
 use nereids_fitting::lm::FlatMatrix;
 use nereids_fitting::poisson::{Prior, Unbounded};
 use nereids_fitting::statistics::{self, Consistency};
-use nereids_physics::continuous_doppler::SUPPORT_X;
+use nereids_physics::continuous_doppler::{Channel, SUPPORT_X, broaden_channel};
 use nereids_physics::doppler::DopplerParams;
 use nereids_physics::flight_time_grid::FlightTimeGrid;
 use nereids_physics::ikeda_carpenter::{
@@ -257,6 +257,7 @@ fn measurement(
             background: [Value::Known(0.0); 5],
             pixels: 1.0,
             gamma_transmission: Value::Known(1.0),
+            capture_gammas: Value::Known(0.0),
             material: Some(Material {
                 covariances: Vec::new(),
                 library: EndfLibrary::EndfB8_0,
@@ -381,6 +382,7 @@ fn the_time_background_is_in_both_runs_of_every_region_by_its_pixels_and_gamma_t
                 } else {
                     Value::Known(gammas[1])
                 },
+                capture_gammas: Value::Known(0.0),
                 material: (r == 0).then(|| Material {
                     covariances: Vec::new(),
                     library: EndfLibrary::EndfB8_0,
@@ -659,6 +661,7 @@ fn an_empty_area_with_a_known_background_adds_its_counts_information_on_the_norm
             background: [Value::Known(0.0); 5],
             pixels: 1.0,
             gamma_transmission: Value::Known(1.0),
+            capture_gammas: Value::Known(0.0),
             material: None,
         },
     ];
@@ -825,6 +828,7 @@ fn a_map_recovers_each_patch_and_its_covariance_between_patches_is_the_shared_qu
             Value::Known(0.0),
         ]),
         gamma_transmission: Value::Known(1.0),
+        capture_gammas: Value::Known(0.0),
         empty_background: [Value::Known(0.0); 5],
     };
     let mut shared = calibration(&setup);
@@ -967,6 +971,7 @@ fn a_map_recovers_each_patch_and_its_covariance_between_patches_is_the_shared_qu
             background,
             pixels: 1.0,
             gamma_transmission: Value::Known(1.0),
+            capture_gammas: Value::Known(0.0),
             material,
         };
     let joint = fit_counts(
@@ -1055,6 +1060,7 @@ fn a_map_recovers_each_patch_and_its_covariance_between_patches_is_the_shared_qu
                 background: map.background,
                 pixels: 1.0,
                 gamma_transmission: Value::Known(1.0),
+                capture_gammas: Value::Known(0.0),
                 material: Some(map.material.clone()),
             }],
         };
@@ -1155,6 +1161,7 @@ fn a_map_fits_the_time_background_its_patches_share_as_the_joint_fit_does() {
         material: material.clone(),
         background: [Value::Known(0.0); 5],
         gamma_transmission: Value::Fitted(0.5),
+        capture_gammas: Value::Known(0.0),
         empty_background: [Value::Known(0.0); 5],
     };
     let result = fit_map(&map, &calibration(&setup)).expect("map");
@@ -1202,6 +1209,7 @@ fn a_map_fits_the_time_background_its_patches_share_as_the_joint_fit_does() {
         } else {
             Value::Known(1.0)
         },
+        capture_gammas: Value::Known(0.0),
         material,
     };
     let joint = fit_counts(
@@ -1242,6 +1250,7 @@ fn a_map_fits_the_time_background_its_patches_share_as_the_joint_fit_does() {
 
     let held = MapMeasurement {
         gamma_transmission: Value::Known(gamma),
+        capture_gammas: Value::Known(0.0),
         ..map.clone()
     };
     let result = fit_map(&held, &calibration(&setup)).expect("map");
@@ -1255,6 +1264,7 @@ fn a_map_fits_the_time_background_its_patches_share_as_the_joint_fit_does() {
         time_background: NO_TIME_BACKGROUND,
         room_background: None,
         gamma_transmission: Value::Known(1.0),
+        capture_gammas: Value::Known(0.0),
         ..map.clone()
     };
     match fit_map(&without, &calibration(&setup)) {
@@ -1339,6 +1349,7 @@ fn the_room_background_follows_each_run_s_frames_apart_from_the_time_background(
         material: material.clone(),
         background: [Value::Known(0.0); 5],
         gamma_transmission: Value::Known(gamma),
+        capture_gammas: Value::Known(0.0),
         empty_background: [Value::Known(0.0); 5],
     };
     let result = fit_map(&map, &calibration(&setup)).expect("map");
@@ -1357,6 +1368,7 @@ fn the_room_background_follows_each_run_s_frames_apart_from_the_time_background(
         background: [Value::Known(0.0); 5],
         pixels: 4.0,
         gamma_transmission: Value::Known(if material.is_some() { gamma } else { 1.0 }),
+        capture_gammas: Value::Known(0.0),
         material,
     };
     let joint = |room_background| {
@@ -1552,6 +1564,73 @@ fn an_uneven_thickness_is_recovered_with_the_mean_density() {
 }
 
 #[test]
+fn capture_gammas_are_recovered_with_the_density_and_temperature() {
+    let setup = standard();
+    let isotope = hafnium_like(20.0);
+    let (density, efficiency) = (SATURATED, 0.05);
+    let with_gammas = |energies: &[f64]| -> Vec<f64> {
+        let total = &cross_sections(energies, std::slice::from_ref(&isotope), TEMPERATURE_K)[0];
+        let capture = broaden_channel(energies, &isotope, TEMPERATURE_K, Channel::Capture)
+            .expect("capture cross section");
+        total
+            .iter()
+            .zip(&capture)
+            .map(|(t, c)| {
+                let transmission = (-density * t).exp();
+                transmission + efficiency * c / t * (1.0 - transmission)
+            })
+            .collect()
+    };
+    let instrument = Instrument {
+        time_edges_us: setup.edges.clone(),
+        flight_path_m: setup.flight_path_m,
+        t0_us: setup.t0_us,
+        resolution: ResolutionFunction::IkedaCarpenter(Arc::clone(&setup.pulse)),
+    };
+    let per_ev = |e: f64| {
+        let u = CLOCK / e.sqrt();
+        CHARGE_RATIO * beam(1.0e6)(u) * u / (2.0 * e)
+    };
+    let sample = instrument
+        .expected_counts(
+            &per_ev,
+            &with_gammas,
+            setup.energy_range_ev,
+            setup.simulator_step_us,
+        )
+        .counts;
+    let open = run(&setup, 1.0, &beam(1.0e6), &[], TEMPERATURE_K);
+    let counts = (rounded(&open), rounded(&sample));
+    let fit_with = |capture_gammas| {
+        let mut m = fitted_from(
+            measurement(&setup, counts.clone(), &[(isotope.clone(), density)]),
+            330.0,
+        );
+        m.regions[0].capture_gammas = capture_gammas;
+        fit_counts(&m, &calibration(&setup)).expect("fit")
+    };
+    let fit = fit_with(Value::Fitted(0.0));
+    assert!(fit.converged);
+    let region = &fit.regions[0];
+    let estimates = [
+        region.densities[0],
+        fit.temperature(),
+        region.capture_gammas,
+    ];
+    let truths = [density, TEMPERATURE_K, efficiency];
+    let at = [0, 1, 2];
+    let pulls: Vec<f64> = (0..3)
+        .map(|i| (estimates[i] - truths[i]) / error_bar(&fit, at[i]))
+        .collect();
+    assert!(pulls.iter().all(|p| p.abs() <= BOUND.sqrt()), "{pulls:?}");
+
+    let without = fit_with(Value::Known(0.0));
+    let (t, sd) = (without.temperature(), error_bar(&without, 1));
+    let recovered = without.converged && (t - TEMPERATURE_K).abs() <= 5.0 * sd;
+    assert!(!recovered, "{t} ± {sd}");
+}
+
+#[test]
 fn maps_the_fit_does_not_describe_are_refused() {
     let setup = standard();
     let edges: Vec<f64> = (0..=577).map(|k| 350.0 + 0.2 * f64::from(k)).collect();
@@ -1584,6 +1663,7 @@ fn maps_the_fit_does_not_describe_are_refused() {
         },
         background: [Value::Known(0.0); 5],
         gamma_transmission: Value::Known(1.0),
+        capture_gammas: Value::Known(0.0),
         empty_background: [Value::Known(0.0); 5],
     };
     let refused =
@@ -2483,6 +2563,17 @@ fn measurements_the_fit_does_not_describe_are_refused() {
         m.regions.push(m.regions[0].clone());
         m.material_mut().covariances = vec![(0, covariance.clone())];
     });
+    for capture_gammas in [Value::Fitted(0.01), Value::Known(0.01)] {
+        let message = match refused(&|m| {
+            m.regions.push(m.regions[0].clone());
+            m.regions[1].material = None;
+            m.regions[1].capture_gammas = capture_gammas;
+        }) {
+            PipelineError::InvalidParameter(message) => message,
+            other => panic!("{other}"),
+        };
+        assert!(message.contains("capture gammas"), "{message}");
+    }
     let mut trace = good.clone();
     (trace.regions[0].open_counts, trace.regions[0].sample_counts) = draws(&counts, 0, [1.0; 2]);
     let tungsten = synthetic_isotope(74, 182, 24.0, 0.01, 0.06);
@@ -3390,6 +3481,7 @@ fn density_temperature_timing_offset_and_flight_path_are_recovered_from_starts_o
             background: [Value::Known(0.0); 5],
             pixels: 1.0,
             gamma_transmission: Value::Known(1.0),
+            capture_gammas: Value::Known(0.0),
             material: None,
         });
         let fit = fit_counts(&m, &calibration).expect("fit");
@@ -4543,6 +4635,7 @@ mod maps {
                     Value::Known(0.0),
                 ],
                 gamma_transmission: Value::Known(1.0),
+                capture_gammas: Value::Known(0.0),
                 empty_background,
             }
         }
@@ -4576,6 +4669,7 @@ mod maps {
                 background: map.background,
                 pixels: 1.0,
                 gamma_transmission: Value::Known(1.0),
+                capture_gammas: Value::Known(0.0),
                 material: Some(map.material.clone()),
             }
         }
@@ -4593,6 +4687,7 @@ mod maps {
                     background: map.empty_background,
                     pixels: 1.0,
                     gamma_transmission: Value::Known(1.0),
+                    capture_gammas: Value::Known(0.0),
                     material: None,
                 }))
                 .collect();
