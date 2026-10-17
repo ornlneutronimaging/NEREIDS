@@ -9,6 +9,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
 
 ### Added
 
+- MCP single_spectrum results return each region's timing offset, background
+  terms, gamma transmission and overdispersions, and the fit's spread share;
+  density-map .npz files hold each patch's timing offset, gamma transmission
+  and background terms.
 - `fit_map` fits the time background `[C, A, tau]` per pixel as a quantity
   shared by every patch, and each patch's gamma transmission.
   `MapMeasurement` gains `time_background` and `gamma_transmission`;
