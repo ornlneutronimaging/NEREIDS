@@ -609,7 +609,7 @@ class TestCountsManifest:
                 temperature_k=zeros,
                 temperature_sd_k=zeros,
                 overdispersion=[zeros, zeros],
-                trusted=np.ones((height, width), dtype=bool),
+                identified=np.ones((height, width), dtype=bool),
                 normalization=1.0,
                 time_background=[0.0, 0.0, 1.0],
                 room_background=0.0,

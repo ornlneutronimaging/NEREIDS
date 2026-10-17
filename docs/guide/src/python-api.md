@@ -184,14 +184,14 @@ is that of every sample patch, known 1 by default, and the empty pixels take 1.
 
 CountsMap exposes the per-patch fits (fits, failed, empty), density maps
 densities and density_sd in atoms/barn, temperature_k and temperature_sd_k in
-K, the two overdispersion maps, trusted, and the shared normalization,
+K, the two overdispersion maps, identified, and the shared normalization,
 time_background, room_background, t0_us, flight_path_m, alpha, beta, r, fwhm_squared_us2, r_high, detector_tail, shared, shared_covariance,
 deviance and converged. n_fitted counts the fitted patches.
 
-trusted records numerical convergence and uncertainty status only: fitted
-densities and temperature must have finite standard deviations, except that
-a zero density is accepted without one. It does not establish that the
-physical model describes the data or that a temperature is accurate.
+identified is True where the map converged, the patch did not fail, and
+each fitted density and the fitted temperature has a finite standard
+deviation, or, for a density, is 0. Whether the model describes a patch's
+counts is its overdispersion; neither says whether the values are right.
 
 ### `NexusData`
 
