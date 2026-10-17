@@ -96,6 +96,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
 
 ### Fixed
 
+- A channel of an SLBW, MLBW or Reich–Moore L-group that holds no resonance
+  scatters as a hard sphere, `pi/k^2 * g_J * 4 sin^2(phi_l)`; its
+  potential scattering was left out.
 - An SLBW or MLBW range with a competitive width (LRX=1) is parsed but not
   evaluated, like an LRF=7 range: the width's energy dependence needs the l of
   the exit channel, which ENDF does not give. It was evaluated with the

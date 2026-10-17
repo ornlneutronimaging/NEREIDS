@@ -176,9 +176,69 @@ pub fn pi_over_k_squared_barns(energy_ev: f64, awr: f64) -> f64 {
     std::f64::consts::PI / k2 / 100.0
 }
 
+/// Σ g_J over the channels of orbital angular momentum `l` that no J-group
+/// of `present_j` holds.
+///
+/// A neutron (spin ½) on a target of spin I has channel spins
+/// s = |I − ½| and I + ½, and each s allows J = |l − s| … l + s, so a J can
+/// belong to two channels; over every channel Σ g_J = 2l + 1. A J-group holds
+/// one channel of its |J|. A channel no J-group holds scatters as a hard
+/// sphere, π/k²·g_J·4 sin²φ_l.
+pub(crate) fn uncovered_channel_weight(
+    l: u32,
+    target_spin: f64,
+    present_j: impl IntoIterator<Item = f64>,
+) -> f64 {
+    let twice_i = (2.0 * target_spin).round() as i64;
+    let twice_l = 2 * i64::from(l);
+    let mut open: Vec<i64> = [twice_i - 1, twice_i + 1]
+        .into_iter()
+        .filter(|&twice_s| twice_s >= 0)
+        .flat_map(|twice_s| ((twice_l - twice_s).abs()..=twice_l + twice_s).step_by(2))
+        .collect();
+    for j in present_j {
+        let twice_j = (2.0 * j.abs()).round() as i64;
+        if let Some(at) = open.iter().position(|&o| o == twice_j) {
+            open.swap_remove(at);
+        }
+    }
+    open.into_iter()
+        .map(|twice_j| statistical_weight(twice_j as f64 / 2.0, target_spin))
+        .sum()
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn every_channel_together_weighs_two_l_plus_one() {
+        for twice_i in 0..=9 {
+            let target_spin = f64::from(twice_i) / 2.0;
+            for l in 0..=3 {
+                let all = uncovered_channel_weight(l, target_spin, []);
+                assert!(
+                    (all - f64::from(2 * l + 1)).abs() < 1e-12,
+                    "I = {target_spin}, l = {l}: {all}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn a_j_group_holds_one_channel_of_its_j() {
+        // I = 1/2, l = 1: s = 0 gives J = 1; s = 1 gives J = 0, 1, 2.
+        let g = |j: f64| statistical_weight(j, 0.5);
+        assert_eq!(uncovered_channel_weight(1, 0.5, [1.0]), 3.0 - g(1.0));
+        assert_eq!(
+            uncovered_channel_weight(1, 0.5, [1.0, -1.0]),
+            g(0.0) + g(2.0)
+        );
+        assert_eq!(uncovered_channel_weight(1, 0.5, [0.0, 1.0, -1.0, 2.0]), 0.0);
+        // A J the channels do not allow holds none of them.
+        assert_eq!(uncovered_channel_weight(0, 3.5, [3.0, 4.0, 5.0]), 0.0);
+        assert_eq!(uncovered_channel_weight(0, 3.5, [5.0]), 1.0);
+    }
 
     #[test]
     fn test_wave_number_u238() {
