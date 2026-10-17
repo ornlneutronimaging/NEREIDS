@@ -3182,9 +3182,10 @@ struct PyRegion {
 impl PyRegion {
     /// background is [b0, b1, b2] or [b0, b1, b2, d, f] of
     /// b(E) = b0 + b1/sqrt(E) + b2*sqrt(E) + d*exp(-f/sqrt(E)); pixels is the
-    /// region's area in pixels, finite and positive.
+    /// region's area in pixels, finite and positive; timing_offset_us is how
+    /// much later than t0's clock the region's pixels record every count.
     #[new]
-    #[pyo3(signature = (open_counts, sample_counts, pixels, background, gamma_transmission, material=None, open_live=None, sample_live=None, capture_gammas=None, in_scatter=None))]
+    #[pyo3(signature = (open_counts, sample_counts, pixels, background, gamma_transmission, material=None, open_live=None, sample_live=None, capture_gammas=None, in_scatter=None, timing_offset_us=None))]
     fn new(
         open_counts: Vec<f64>,
         sample_counts: Vec<f64>,
@@ -3196,6 +3197,7 @@ impl PyRegion {
         sample_live: Option<Vec<f64>>,
         capture_gammas: Option<PyValue>,
         in_scatter: Option<PyValue>,
+        timing_offset_us: Option<PyValue>,
     ) -> PyResult<Self> {
         Ok(Self {
             inner: Region {
@@ -3208,6 +3210,7 @@ impl PyRegion {
                 gamma_transmission: gamma_transmission.inner,
                 capture_gammas: capture_gammas.map_or(Value::Known(0.0), |value| value.inner),
                 in_scatter: in_scatter.map_or(Value::Known(0.0), |value| value.inner),
+                timing_offset_us: timing_offset_us.map_or(Value::Known(0.0), |value| value.inner),
                 material: material.map(|material| material.inner),
             },
         })
@@ -3275,6 +3278,14 @@ impl PyRegion {
     fn in_scatter(&self) -> PyValue {
         PyValue {
             inner: self.inner.in_scatter,
+        }
+    }
+
+    /// How much later than t0's clock the region records every count, in µs.
+    #[getter]
+    fn timing_offset_us(&self) -> PyValue {
+        PyValue {
+            inner: self.inner.timing_offset_us,
         }
     }
 
@@ -3676,6 +3687,7 @@ struct PyRegionFit {
     gamma_transmission: f64,
     capture_gammas: f64,
     in_scatter: f64,
+    timing_offset_us: f64,
     beam_at_limit: bool,
     predicted_open: Vec<f64>,
     predicted_sample: Vec<f64>,
@@ -3693,6 +3705,7 @@ impl PyRegionFit {
             gamma_transmission: region.gamma_transmission,
             capture_gammas: region.capture_gammas,
             in_scatter: region.in_scatter,
+            timing_offset_us: region.timing_offset_us,
             beam_at_limit: region.beam_at_limit,
             predicted_open: region.predicted[0].clone(),
             predicted_sample: region.predicted[1].clone(),
@@ -3744,6 +3757,12 @@ impl PyRegionFit {
     #[getter]
     fn in_scatter(&self) -> f64 {
         self.in_scatter
+    }
+
+    /// How much later than t0's clock the region records every count, in µs.
+    #[getter]
+    fn timing_offset_us(&self) -> f64 {
+        self.timing_offset_us
     }
 
     /// Whether the region's open-beam fit chose its richest beam.

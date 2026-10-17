@@ -623,6 +623,7 @@ fn fit_map_from<'a>(
                 } else {
                     Value::Known(0.0)
                 },
+                timing_offset_us: Value::Known(0.0),
                 material,
             })
         };
@@ -673,6 +674,7 @@ fn fit_map_from<'a>(
         } else {
             Value::Known(0.0)
         },
+        timing_offset_us: Value::Known(0.0),
         material,
     };
     checked(

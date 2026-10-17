@@ -88,7 +88,7 @@ optical depth at the mean density.
 
 Region(open_counts, sample_counts, pixels, background, gamma_transmission,
 material=None, open_live=None, sample_live=None, capture_gammas=None,
-in_scatter=None) holds one region. background
+in_scatter=None, timing_offset_us=None) holds one region. background
 is b(E) = b0 + b1/sqrt(E) + b2*sqrt(E) + d*exp(-f/sqrt(E)) as five Values
 [b0, b1, b2, d, f], f 0 or more; three Values [b0, b1, b2] hold d and f at 0.
 The optional live fractions are per bin in (0, 1]. capture_gammas is the share
@@ -98,6 +98,11 @@ in_scatter is the share Omega of the neutrons scattered once in the sample and
 leaving through its back face that the region records, known 0 by default;
 the sample run gains c_q*a*Omega*phi*sum(n*sigma_s*G), G each isotope's share
 of single scatters leaving through the back face at the mean areal density.
+timing_offset_us is dt in microseconds, known 0 by default: the region's
+pixels record every count dt later than t0's clock, a neutron of flight time u
+at t0 + dt + u and the time background dt late.
+A fitted dt needs t0 or another region's dt known or measured, and a detector
+spread needs every region's dt known and the same.
 
 #### Measurement
 
@@ -139,8 +144,9 @@ microseconds and the flight path in metres. Both are Values, known or fitted.
 RegionFit.densities are the fitted areal densities in atoms/barn,
 temperature_k the temperature in K (None without a material), predicted_open
 and predicted_sample the counts per bin the fit predicts, overdispersion the
-[open-beam, sample] values (None when unmeasured), and excluded_bins the
-sample bins the material's library leaves out.
+[open-beam, sample] values (None when unmeasured), excluded_bins the
+sample bins the material's library leaves out, and timing_offset_us the
+region's timing offset in microseconds.
 
 CountsFit.regions holds one RegionFit per region. normalization, t0_us,
 flight_path_m, alpha, beta, r, fwhm_squared_us2, r_high and detector_tail (each

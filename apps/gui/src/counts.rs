@@ -223,6 +223,7 @@ pub fn run_pixel_fit(request: &FitRequest) -> Result<PixelFitSummary, String> {
         gamma_transmission: Value::Known(1.0),
         capture_gammas: Value::Known(0.0),
         in_scatter: Value::Known(0.0),
+        timing_offset_us: Value::Known(0.0),
         material: Some(material(request)),
     };
     let measurement = Measurement {

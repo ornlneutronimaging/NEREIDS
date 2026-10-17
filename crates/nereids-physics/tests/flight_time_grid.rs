@@ -163,6 +163,26 @@ fn assert_tight(name: &str, pulse: &Arc<IkedaCarpenter>, edges: &[f64], t0_us: f
 }
 
 #[test]
+fn a_grid_spanning_two_timing_offsets_covers_every_one_between() {
+    let (name, pulse) = &unfolded()[1];
+    let detector = pulse.detector_pulse();
+    let (first, last) = (T0_US - 2.0, T0_US + 5.0);
+    let spanning =
+        FlightTimeGrid::spanning(&edges(), (first, last), FLIGHT_PATH_M, &detector).expect(name);
+    let covers = |grid: &FlightTimeGrid, t0_us: f64| {
+        grid.covers(t0_us, FLIGHT_PATH_M, pulse.params())
+            .expect(name)
+    };
+    for t0_us in [first, T0_US, last] {
+        assert!(covers(&spanning, t0_us), "{t0_us}");
+    }
+    let [at_first, at_last] = [first, last]
+        .map(|t0_us| FlightTimeGrid::new(&edges(), t0_us, FLIGHT_PATH_M, &detector).expect(name));
+    assert!(!covers(&at_first, last) && !covers(&at_last, first));
+    assert_eq!(spanning.t0_us(), first);
+}
+
+#[test]
 fn an_unfolded_pulse_reaches_the_bins_just_inside_both_ends() {
     for (name, pulse) in unfolded() {
         assert_tight(name, &pulse, &edges(), T0_US);

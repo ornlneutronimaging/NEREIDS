@@ -47,6 +47,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
   the default, records every count at its arrival. `fit_counts` and `fit_map`
   can fit both; results report `detector_tail`. A pulse calibration refuses a
   tail.
+- A region's `timing_offset_us` `dt`: its pixels record every count `dt`
+  later than `t0`'s clock, a neutron of flight time `u` at `t0 + dt + u` and
+  the time background `dt` late. Known 0 by default; `fit_counts` can fit it
+  when `t0` or another region's offset is known or measured, and results
+  report it.
 
 ### Changed (breaking)
 

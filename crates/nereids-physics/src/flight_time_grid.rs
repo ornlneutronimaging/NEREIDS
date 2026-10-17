@@ -181,18 +181,37 @@ impl FlightTimeGrid {
         flight_path_m: f64,
         pulse: &DetectorPulse,
     ) -> Result<Self, FlightTimeGridError> {
+        Self::spanning(time_edges_us, (t0_us, t0_us), flight_path_m, pulse)
+    }
+
+    /// The grid of [`Self::new`] for every timing offset from `t0_us` to
+    /// `last_t0_us`: its flight times are those whose neutrons can reach the
+    /// bins at either, and [`Self::rows`] are at `t0_us`.
+    ///
+    /// # Errors
+    /// See [`FlightTimeGridError`].
+    pub fn spanning(
+        time_edges_us: &[f64],
+        (t0_us, last_t0_us): (f64, f64),
+        flight_path_m: f64,
+        pulse: &DetectorPulse,
+    ) -> Result<Self, FlightTimeGridError> {
         if time_edges_us.len() < 2
             || !time_edges_us.iter().all(|t| t.is_finite())
             || time_edges_us.windows(2).any(|w| w[0] >= w[1])
         {
             return Err(FlightTimeGridError::InvalidTimeEdges);
         }
-        let (u_lo, u_hi) = range_us(
-            time_edges_us,
-            (t0_us, flight_path_m),
-            pulse.params(),
-            pulse.energy_span_ev(),
-        )?;
+        let range = |t0_us: f64| {
+            range_us(
+                time_edges_us,
+                (t0_us, flight_path_m),
+                pulse.params(),
+                pulse.energy_span_ev(),
+            )
+        };
+        let ((first_lo, first_hi), (last_lo, last_hi)) = (range(t0_us)?, range(last_t0_us)?);
+        let (u_lo, u_hi) = (first_lo.min(last_lo), first_hi.max(last_hi));
         let energy = |u: f64| (TOF_FACTOR * flight_path_m / u).powi(2);
         let rise = pulse
             .rise_us(energy(u_lo))?
