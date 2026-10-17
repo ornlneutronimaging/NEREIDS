@@ -1515,6 +1515,26 @@ class CountsMap:
     @property
     def steps(self) -> int: ...
     @property
+    def quantities(self) -> list[str]:
+        """A patch's fitted quantities, the rows and columns of its covariance."""
+        ...
+    def covariance(self, patch: tuple[int, int]) -> NDArray[np.float64] | None:
+        """The covariance of patch (row, column)'s quantities, the shared
+        quantities' uncertainty included, or None where the patch has no fit or
+        the map has no shared covariance."""
+        ...
+    def sensitivity(self, patch: tuple[int, int]) -> NDArray[np.float64] | None:
+        """The change of patch (row, column)'s quantities per unit change of
+        each shared quantity, or None where the patch has no fit."""
+        ...
+    def cross_covariance(
+        self, a: tuple[int, int], b: tuple[int, int]
+    ) -> NDArray[np.float64] | None:
+        """The covariance of patch a's quantities with patch b's that the
+        shared quantities carry, or None where either patch has no sensitivity
+        or the map has no shared covariance."""
+        ...
+    @property
     def n_fitted(self) -> int: ...
 
 NO_TIME_BACKGROUND: tuple[Value, Value, Value]

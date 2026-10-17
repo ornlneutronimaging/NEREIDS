@@ -1026,6 +1026,66 @@ class TestCountsApi:
         assert all(patch.kind == "sample" for row in patches for patch in row)
         assert map_measurement.binning == 1
 
+    def test_map_patches_carry_their_joint_covariance(self, u238_data):
+        edges = np.linspace(350.0, 440.0, 31)
+        known = nereids.Value.known
+        flat = np.full(30, 1.0e4)
+        model = nereids.fit_counts(
+            nereids.Measurement(
+                time_edges_us=edges,
+                charge_ratio=1.0,
+                normalization=known(1.0),
+                regions=[
+                    nereids.Region(
+                        open_counts=flat,
+                        sample_counts=flat,
+                        pixels=1.0,
+                        background=[known(0.0)] * 3,
+                        gamma_transmission=known(1.0),
+                        material=nereids.Material(
+                            isotopes=[(u238_data, known(5e-4))],
+                            temperature_k=known(300.0),
+                        ),
+                    )
+                ],
+            ),
+            self._calibration(),
+        )
+        sample = np.round(np.asarray(model.regions[0].predicted_sample))
+        result = nereids.fit_map(
+            nereids.MapMeasurement(
+                time_edges_us=edges,
+                open_counts=np.repeat(flat[:, None, None], 2, axis=2),
+                sample_counts=np.repeat(sample[:, None, None], 2, axis=2),
+                excluded=np.zeros((1, 2), dtype=bool),
+                sample=np.ones((1, 2), dtype=bool),
+                empty=np.zeros((1, 2), dtype=bool),
+                material=nereids.Material(
+                    isotopes=[(u238_data, nereids.Value.fitted(4e-4))],
+                    temperature_k=known(300.0),
+                ),
+                charge_ratio=1.0,
+                normalization=nereids.Value.fitted(1.0),
+                background=[known(0.0)] * 3,
+            ),
+            self._calibration(),
+        )
+        assert result.converged
+        assert len(result.quantities) == 1
+        for j in range(2):
+            covariance = np.asarray(result.covariance((0, j)))
+            assert covariance.shape == (1, 1)
+            assert np.sqrt(covariance[0, 0]) == pytest.approx(
+                result.density_sd[0][0, j], rel=1e-12
+            )
+            assert np.asarray(result.sensitivity((0, j))).shape == (1, len(result.shared))
+        cross = np.asarray(result.cross_covariance((0, 0), (0, 1)))
+        np.testing.assert_allclose(
+            cross, np.asarray(result.cross_covariance((0, 1), (0, 0))).T, rtol=1e-12
+        )
+        assert cross[0, 0] > 0.0
+        assert result.covariance((5, 5)) is None
+
     def test_default_empty_background_predicts_equal_empty_run_counts(self, u238_data):
         counts = np.full((12, 1, 2), 100.0)
         measurement = nereids.MapMeasurement(

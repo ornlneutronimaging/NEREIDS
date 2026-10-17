@@ -28,7 +28,7 @@ use nereids_pipeline::counts_fit::{
     CountsFit, Material, Measurement, NO_TIME_BACKGROUND, Region, RegionFit, RoomBackground,
     Spread, Value,
 };
-use nereids_pipeline::counts_map::{CountsMap, MapMeasurement, Patch};
+use nereids_pipeline::counts_map::{CountsMap, MapMeasurement, Patch, PatchCovariances};
 use nereids_pipeline::error::PipelineError;
 use nereids_pipeline::open_beam::{Calibration, Pulse};
 use nereids_pipeline::pulse_calibration::PulseCalibration;
@@ -4424,6 +4424,8 @@ struct PyCountsMap {
     shared_covariance: Option<FlatMatrix>,
     measured_pulls: Option<Vec<f64>>,
     pulse_consistency: Option<(f64, usize, f64)>,
+    quantities: Vec<String>,
+    covariances: PatchCovariances,
     deviance: f64,
     converged: bool,
     unconverged: Option<String>,
@@ -4460,6 +4462,8 @@ impl PyCountsMap {
             pulse_consistency: map
                 .pulse_consistency
                 .map(|consistency| (consistency.q, consistency.dof, consistency.p)),
+            quantities: map.quantities.clone(),
+            covariances: map.covariances.clone(),
             deviance: map.deviance,
             converged: map.converged,
             unconverged: map.unconverged.clone(),
@@ -4665,6 +4669,48 @@ impl PyCountsMap {
     #[getter]
     fn steps(&self) -> usize {
         self.steps
+    }
+
+    /// A patch's fitted quantities, the rows and columns of its covariance.
+    #[getter]
+    fn quantities(&self) -> Vec<String> {
+        self.quantities.clone()
+    }
+
+    /// The covariance of patch (row, column)'s quantities, the shared
+    /// quantities' uncertainty included, or None where the patch has no fit or
+    /// the map has no shared covariance.
+    fn covariance<'py>(
+        &self,
+        py: Python<'py>,
+        patch: (usize, usize),
+    ) -> Option<Bound<'py, PyArray2<f64>>> {
+        let covariance = self.covariances.covariance.get(patch)?.as_ref()?;
+        Some(matrix_to_py(py, covariance))
+    }
+
+    /// The change of patch (row, column)'s quantities per unit change of each
+    /// shared quantity, or None where the patch has no fit.
+    fn sensitivity<'py>(
+        &self,
+        py: Python<'py>,
+        patch: (usize, usize),
+    ) -> Option<Bound<'py, PyArray2<f64>>> {
+        let sensitivity = self.covariances.sensitivity.get(patch)?.as_ref()?;
+        Some(matrix_to_py(py, sensitivity))
+    }
+
+    /// The covariance of patch a's quantities with patch b's that the shared
+    /// quantities carry, or None where either patch has no sensitivity or the
+    /// map has no shared covariance.
+    fn cross_covariance<'py>(
+        &self,
+        py: Python<'py>,
+        a: (usize, usize),
+        b: (usize, usize),
+    ) -> Option<Bound<'py, PyArray2<f64>>> {
+        let cross = self.covariances.cross_covariance(a, b)?;
+        Some(matrix_to_py(py, &cross))
     }
 
     /// The number of fitted patches.

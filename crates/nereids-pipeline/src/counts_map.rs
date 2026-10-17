@@ -185,7 +185,7 @@ pub struct CountsMap<'a> {
     /// Each isotope's areal density in atoms/barn, in the material's order:
     /// the known one, or the fitted one; NaN where the patch has no fit.
     pub densities: Vec<Array2<f64>>,
-    /// Standard deviation of each density, from [`Self::covariance`]; NaN
+    /// Standard deviation of each density, from [`PatchCovariances::covariance`]; NaN
     /// where the density is known, held on a bound or not determined by the
     /// counts, alone or through a shared quantity, where the patch has no fit,
     /// or where the map did not converge.
@@ -242,7 +242,6 @@ pub struct CountsMap<'a> {
     /// are conditional on one on a bound held there.  `None` when the map did
     /// not converge.
     pub shared_covariance: Option<FlatMatrix>,
-    propagated: Option<FlatMatrix>,
     /// For each measured one of [`Self::shared`], in that order, its value
     /// without the bounds less its measurement over `√(sd² − variance)`, the
     /// variance also without the bounds, as
@@ -261,18 +260,9 @@ pub struct CountsMap<'a> {
     /// background term, and the gamma transmission, capture gammas and
     /// in-scatter if fitted.
     pub quantities: Vec<String>,
-    /// Each patch's covariance of [`Self::quantities`], the shared
-    /// quantities' uncertainty included; the row and column of one held on a
-    /// bound, or not determined by the counts, alone or through a shared
-    /// quantity, are NaN.  `None` where the patch has no fit or the map has no
-    /// shared covariance.
-    pub covariance: Array2<Option<FlatMatrix>>,
-    /// Each patch's change of [`Self::quantities`] per unit change of each of
-    /// [`Self::shared`] at fixed counts, `−F_oo⁻¹ F_os` of its information;
-    /// the row of a quantity held on a bound or not determined by the counts
-    /// is NaN.  `None` where the patch
-    /// has no fit.
-    pub sensitivity: Array2<Option<FlatMatrix>>,
+    /// Each patch's covariance of [`Self::quantities`] and their joint
+    /// covariance across patches.
+    pub covariances: PatchCovariances,
     /// Each fit's half Poisson deviance over the overdispersion it weighted
     /// each run with, summed over the patches with a fit and the empty pixels,
     /// outside the sample runs' [`RegionFit::excluded_bins`].
@@ -327,10 +317,10 @@ impl CountsMap<'_> {
         self.converged = false;
         self.unconverged = Some(reason);
         self.shared_covariance = None;
-        self.propagated = None;
+        self.covariances.carried = None;
         self.measured_pulls = None;
         self.pulse_consistency = None;
-        self.covariance.fill(None);
+        self.covariances.covariance.fill(None);
         for sd in self
             .density_sd
             .iter_mut()
@@ -341,17 +331,38 @@ impl CountsMap<'_> {
         self.identified.fill(false);
         self
     }
+}
 
-    /// The covariance of patch `a`'s [`Self::quantities`] with a different
+/// Each patch's covariance of a map's [`CountsMap::quantities`], their
+/// change with the shared quantities, and the shared quantities' covariance
+/// that joins the patches.
+#[derive(Debug, Clone)]
+pub struct PatchCovariances {
+    /// Each patch's covariance of [`CountsMap::quantities`], the shared
+    /// quantities' uncertainty included; the row and column of one held on a
+    /// bound, or not determined by the counts, alone or through a shared
+    /// quantity, are NaN.  `None` where the patch has no fit or the map has no
+    /// shared covariance.
+    pub covariance: Array2<Option<FlatMatrix>>,
+    /// Each patch's change of [`CountsMap::quantities`] per unit change of each
+    /// of [`CountsMap::shared`] at fixed counts, `−F_oo⁻¹ F_os` of its
+    /// information; the row of a quantity held on a bound or not determined by
+    /// the counts is NaN.  `None` where the patch has no fit.
+    pub sensitivity: Array2<Option<FlatMatrix>>,
+    carried: Option<FlatMatrix>,
+}
+
+impl PatchCovariances {
+    /// The covariance of patch `a`'s [`CountsMap::quantities`] with a different
     /// patch `b`'s, which only the shared quantities carry, `G_a C_ss G_bᵀ` over
     /// those not held on a bound; for `a` = `b`, the part of
     /// [`Self::covariance`] they carry.  `None` where either patch is outside
     /// the grid or has no [`Self::sensitivity`], or the map has no
-    /// [`Self::shared_covariance`].
+    /// [`CountsMap::shared_covariance`].
     pub fn cross_covariance(&self, a: (usize, usize), b: (usize, usize)) -> Option<FlatMatrix> {
         let left = self.sensitivity.get(a)?.as_ref()?;
         let right = self.sensitivity.get(b)?.as_ref()?;
-        let shared = self.propagated.as_ref()?;
+        let shared = self.carried.as_ref()?;
         let k = shared.nrows;
         let undetermined = |patch: (usize, usize), i: usize| {
             self.covariance[patch]
@@ -1427,12 +1438,14 @@ fn fit_map_from<'a>(
             })
             .collect(),
         shared_covariance,
-        propagated,
         measured_pulls,
         pulse_consistency,
         quantities: template.into_iter().map(|(_, name)| name).collect(),
-        covariance,
-        sensitivity,
+        covariances: PatchCovariances {
+            covariance,
+            sensitivity,
+            carried: propagated,
+        },
         deviance: inner.iter().flatten().map(|i| i.deviance).sum(),
         converged,
         unconverged,

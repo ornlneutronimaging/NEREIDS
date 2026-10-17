@@ -4453,7 +4453,9 @@ mod tests {
             Role::Temperature { region: 0 },
             Role::Background { region: 0, term: 0 },
         ];
-        let patch = result.covariance[[0, 0]].as_ref().expect("covariance");
+        let patch = result.covariances.covariance[[0, 0]]
+            .as_ref()
+            .expect("covariance");
         for (s, &a) in own.iter().enumerate() {
             for (t, &b) in own.iter().enumerate() {
                 close(patch.get(s, t), a, b);

@@ -209,6 +209,14 @@ K, the two overdispersion maps, identified, and the shared normalization,
 time_background, room_background, t0_us, flight_path_m, alpha, beta, r, fwhm_squared_us2, r_high, detector_tail, shared, shared_covariance,
 deviance and converged. n_fitted counts the fitted patches.
 
+quantities names a patch's fitted quantities. covariance((row, column)) is
+that patch's covariance of them, the shared quantities' uncertainty included,
+and sensitivity((row, column)) their change per unit change of each shared
+quantity. cross_covariance(a, b) is the covariance of patch a's quantities
+with patch b's that the shared quantities carry. Each returns None where a
+patch has no fit; covariance and cross_covariance also return None where the
+map has no shared covariance.
+
 identified is True where the map converged, the patch did not fail, and
 each fitted density and the fitted temperature has a finite standard
 deviation, or, for a density, is 0. Whether the model describes a patch's

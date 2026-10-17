@@ -18,6 +18,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
   (`Calibration.from_pulse_calibration_file`), and a File 32 resonance
   covariance (`load_resonance_covariance`) that `Material(covariances=...)`
   carries into the fit's covariance.
+- Python's `CountsMap` gives each patch's `covariance` and `sensitivity` and
+  the `cross_covariance` of two patches, with the `quantities` they cover.
 - `fit_map` fits the time background `[C, A, tau]` per pixel as a quantity
   shared by every patch, and each patch's gamma transmission.
   `MapMeasurement` gains `time_background` and `gamma_transmission`;
@@ -109,6 +111,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
 - The map's `trusted` array is `identified`, in Rust, Python and the MCP
   map files: where the counts determine every fitted density and the fitted
   temperature of a converged patch.
+- `CountsMap`'s `covariance`, `sensitivity` and `cross_covariance` move to
+  its `covariances`, a `PatchCovariances` that owns them.
 
 ### Fixed
 
