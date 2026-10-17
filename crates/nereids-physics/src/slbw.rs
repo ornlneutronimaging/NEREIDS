@@ -176,7 +176,7 @@ pub fn slbw_cross_sections(data: &ResonanceData, energy_ev: f64) -> CrossSection
     // a shared boundary between two resolved ranges is a negligibly small
     // effect compared to the gap that half-open logic would introduce.
     for range in &data.ranges {
-        if !range.resolved || energy_ev < range.energy_low || energy_ev > range.energy_high {
+        if !range.is_evaluable() || energy_ev < range.energy_low || energy_ev > range.energy_high {
             continue;
         }
 
@@ -205,7 +205,8 @@ pub fn slbw_cross_sections(data: &ResonanceData, energy_ev: f64) -> CrossSection
 /// J-groups precomputed once per range, which is how we guarantee
 /// batch/per-point bit-exact equivalence.
 ///
-/// Returns `(total, elastic, capture, fission)` in barns.
+/// Returns `(total, elastic, capture, fission)` in barns; zero for a range
+/// that [`nereids_endf::resonance::ResonanceRange::is_evaluable`] rejects.
 ///
 /// # Panics
 /// Panics if `energy_ev` is not finite or is non-positive.  This is a
@@ -229,6 +230,9 @@ pub fn slbw_cross_sections_for_range(
         energy_ev.is_finite() && energy_ev > 0.0,
         "expected positive finite energy_ev, got {energy_ev}"
     );
+    if !range.is_evaluable() {
+        return (0.0, 0.0, 0.0, 0.0);
+    }
 
     let pi_over_k2 = channel::pi_over_k_squared_barns(energy_ev, awr);
 
@@ -504,6 +508,22 @@ pub(crate) fn mlbw_evaluate_with_cached_jgroups(
 mod tests {
     use super::*;
     use nereids_endf::resonance::{LGroup, Resonance, ResonanceFormalism, ResonanceRange};
+
+    #[test]
+    fn a_range_with_a_competitive_width_is_not_evaluated() {
+        let data = nereids_endf::parser::parse_endf_file2(include_str!(
+            "../../../tests/data/synthetic/mlbw_lrx1_plus_resolved_mixed.endf"
+        ))
+        .unwrap();
+        let xs = slbw_cross_sections(&data, 1000.0);
+        assert_eq!((xs.total, xs.capture), (0.0, 0.0));
+        let range = &data.ranges[1];
+        assert_eq!(
+            slbw_cross_sections_for_range(range, 1000.0, data.awr, range.target_spin),
+            (0.0, 0.0, 0.0, 0.0)
+        );
+        assert!(slbw_cross_sections(&data, 6.674).capture > 0.0);
+    }
 
     #[test]
     fn test_slbw_capture_peak() {
