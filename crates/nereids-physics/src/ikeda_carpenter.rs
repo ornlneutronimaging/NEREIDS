@@ -1486,9 +1486,9 @@ fn requested_step(params: &IkedaCarpenterParams, n_tau: usize, alpha: f64) -> (f
 /// the prompt pulse entirely (probe: α = 250, β = 0.02, R = 0.1 loses the
 /// prompt's 0.9 weight share).
 ///
-/// Bit-identical to the pre--review `max(fast_reach/(n_tau−1),
-/// tau_max/(MAX_TAU_SAMPLES−1))` step whenever no fold is finer than the
-/// prompt design step and the capped step stays at or below the floor.
+/// Equals `max(fast_reach/(n_tau−1), tau_max/(MAX_TAU_SAMPLES−1))` whenever
+/// no fold is finer than the prompt design step and the capped step stays at
+/// or below the floor.
 fn tau_geometry(
     params: &IkedaCarpenterParams,
     n_tau: usize,
@@ -2362,7 +2362,7 @@ mod tests {
 
     #[test]
     fn fold_variance_matches_analytic_oracle() {
-        // Independent analytic oracle for the fold convention ( F8): a
+        // Independent analytic oracle for the fold convention: a
         // convolution adds second central moments, so the sampled kernel's
         // variance must grow by EXACTLY the fold kernel's analytic variance —
         // FWHM²/6 for the symmetric channel triangle (half-base = FWHM),
