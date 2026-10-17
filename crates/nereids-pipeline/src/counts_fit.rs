@@ -18,13 +18,14 @@ use nereids_fitting::parameters::{FitParameter, ParameterSet};
 use nereids_fitting::poisson::{Prior, Unbounded, information_inverse};
 use nereids_fitting::statistics::{Consistency, consistency};
 use nereids_physics::continuous_doppler::{
-    Channel, QuadratureBudget, SUPPORT_X, broaden_channel, broaden_with_budget,
+    Channel, QuadratureBudget, SUPPORT_X, TierOneBroadening, broaden_with_budget,
 };
 use nereids_physics::detector_spread::region_shares;
 use nereids_physics::doppler::DopplerParams;
 use nereids_physics::flight_time_grid::{FlightTimeGrid, Rows};
 use nereids_physics::forward_scatter::{ForwardYield, forward_yield, lowest_exit_ratio};
 use nereids_physics::ikeda_carpenter::IkedaCarpenterParams;
+use nereids_physics::lattice_doppler::{PhononSpectrum, broaden_in_lattice};
 use nereids_physics::resolution::TOF_FACTOR;
 use nereids_physics::thickness::{interacting_per_depth, uneven_transmission};
 use nereids_physics::transmission::resonance_center_energies;
@@ -229,7 +230,8 @@ pub struct Material {
     /// Each isotope with its areal density in atoms/barn, known, fitted or
     /// measured, at least 0.
     pub isotopes: Vec<(ResonanceData, Value)>,
-    /// The temperature in K, within 1–5000 K.
+    /// The temperature in K, within 1–5000 K: the thermodynamic one with a
+    /// [`Self::lattice`], an effective one for the free gas.
     pub temperature_k: Value,
     /// `v`, the relative variance of the areal density over the region's
     /// pixels, weighted by the beam that reaches them, 0 or more: 0 for a
@@ -247,6 +249,10 @@ pub struct Material {
     /// with its index in `isotopes`, which [`CountsFit::covariance`] carries;
     /// an isotope not listed has its resonance parameters taken as exact.
     pub covariances: Vec<(usize, ResonanceCovariance)>,
+    /// The phonon density of states the material's nuclei vibrate with, which
+    /// broadens its cross sections by the harmonic lattice
+    /// ([`broaden_in_lattice`]); `None` broadens them by the free gas.
+    pub lattice: Option<PhononSpectrum>,
 }
 
 /// The fitted quantities of every region, and the normalization, time
@@ -945,6 +951,8 @@ pub(crate) fn checked<'a>(
                 region,
                 isotopes: &material.isotopes,
                 dopplers,
+                reach_k,
+                lattice: material.lattice.as_ref(),
                 scatters: measurement.regions[region].in_scatter != Value::Known(0.0),
             })
         })
@@ -1193,12 +1201,18 @@ fn in_span(
                 .iter()
                 .zip(&lines.dopplers)
                 .map(|((isotope, _), doppler)| {
-                    let read = (
-                        (span_ev.0.sqrt() - SUPPORT_X * doppler.u())
-                            .max(0.0)
-                            .powi(2),
-                        (span_ev.1.sqrt() + SUPPORT_X * doppler.u()).powi(2),
-                    );
+                    let read = match lines.lattice {
+                        Some(spectrum) => {
+                            let reach = |e: f64| spectrum.reach_ev(e, lines.reach_k, isotope.awr);
+                            (span_ev.0 - reach(span_ev.0), span_ev.1 + reach(span_ev.1))
+                        }
+                        None => (
+                            (span_ev.0.sqrt() - SUPPORT_X * doppler.u())
+                                .max(0.0)
+                                .powi(2),
+                            (span_ev.1.sqrt() + SUPPORT_X * doppler.u()).powi(2),
+                        ),
+                    };
                     if !isotope.ranges.iter().any(|range| {
                         range.is_evaluable()
                             && range.energy_low <= read.0
@@ -1395,6 +1409,10 @@ pub(crate) fn fit_counts_answer(
             .chain(instrument)
             .collect(),
     );
+    let lattices: Vec<Option<PhononSpectrum>> = regions
+        .iter()
+        .map(|region| region.material.as_ref().and_then(|m| m.lattice.clone()))
+        .collect();
     let resonances: Vec<Arc<[ResonanceData]>> = regions
         .iter()
         .map(|region| {
@@ -1437,7 +1455,10 @@ pub(crate) fn fit_counts_answer(
                 .temperature
                 .expect("a material has a temperature")];
             for ((isotope, _), energies) in lines.isotopes.iter().zip(energies) {
-                let doppler = DopplerParams::new(temperature_k, isotope.awr)
+                let effective_k = lines
+                    .lattice
+                    .map_or(temperature_k, |s| s.effective_temperature_k(temperature_k));
+                let doppler = DopplerParams::new(effective_k, isotope.awr)
                     .map_err(|e| PipelineError::InvalidParameter(e.to_string()))?;
                 for &energy in energies {
                     let width_ev = half_maximum * doppler.doppler_width(energy);
@@ -1494,6 +1515,7 @@ pub(crate) fn fit_counts_answer(
                         beam_origin_us,
                         &layout,
                     )
+                    .lattices(&lattices)
                     .spread(mixing.clone()),
                     live: &live,
                 })
@@ -1641,6 +1663,7 @@ pub(crate) fn fit_counts_answer(
                 beam_origin_us,
                 &layout,
             )
+            .lattices(&lattices)
             .spread(mixing.clone()),
             live: &live,
         };
@@ -1778,6 +1801,7 @@ pub(crate) fn fit_counts_answer(
         at_bound,
         beams,
         resonances,
+        lattices,
         charge_ratio: *charge_ratio,
         frames,
         beam_origin_us,
@@ -1820,6 +1844,7 @@ pub(crate) struct Answer {
     grid: Arc<FlightTimeGrid>,
     beams: Vec<BeamSpline>,
     resonances: Vec<Arc<[ResonanceData]>>,
+    lattices: Vec<Option<PhononSpectrum>>,
     charge_ratio: f64,
     frames: [f64; 2],
     beam_origin_us: f64,
@@ -1886,7 +1911,8 @@ impl Answer {
                 (self.charge_ratio, self.frames),
                 self.beam_origin_us,
                 &self.layout,
-            ),
+            )
+            .lattices(&self.lattices),
             live: &self.live,
         };
         let predicted = model.evaluate(&self.params)?;
@@ -2402,6 +2428,8 @@ struct Lines<'a> {
     region: usize,
     isotopes: &'a [(ResonanceData, Value)],
     dopplers: Vec<DopplerParams>,
+    reach_k: f64,
+    lattice: Option<&'a PhononSpectrum>,
     scatters: bool,
 }
 
@@ -2531,7 +2559,31 @@ impl Clocks {
 
 struct Absorber {
     isotopes: Arc<[ResonanceData]>,
+    lattice: Option<PhononSpectrum>,
     cross_sections: [RefCell<Option<CrossSections>>; 3],
+}
+
+/// `channel` of `isotope` at `energies` broadened at `temperature_k` by
+/// `lattice`, or by the free gas without one.
+fn broadened(
+    energies: &[f64],
+    isotope: &ResonanceData,
+    temperature_k: f64,
+    channel: Channel,
+    lattice: Option<&PhononSpectrum>,
+) -> Result<TierOneBroadening, String> {
+    match lattice {
+        Some(spectrum) => broaden_in_lattice(energies, isotope, temperature_k, spectrum, channel)
+            .map_err(|e| e.to_string()),
+        None => broaden_with_budget(
+            energies,
+            isotope,
+            temperature_k,
+            channel,
+            QuadratureBudget::default(),
+        )
+        .map_err(|e| e.to_string()),
+    }
 }
 
 const CHANNELS: [Channel; 3] = [Channel::Total, Channel::Capture, Channel::Elastic];
@@ -2675,6 +2727,7 @@ impl RegionsModel {
                 .iter()
                 .map(|isotopes| Absorber {
                     isotopes: Arc::clone(isotopes),
+                    lattice: None,
                     cross_sections: [RefCell::new(None), RefCell::new(None), RefCell::new(None)],
                 })
                 .collect(),
@@ -2700,6 +2753,15 @@ impl RegionsModel {
         }
     }
 
+    /// The model with each region's material broadened by its lattice, or by
+    /// the free gas without one.
+    fn lattices(mut self, lattices: &[Option<PhononSpectrum>]) -> Self {
+        for (absorber, lattice) in self.absorbers.iter_mut().zip(lattices) {
+            absorber.lattice = lattice.clone();
+        }
+        self
+    }
+
     /// The model with the spread's shares `F_rq` between the regions.
     fn spread(mut self, mixing: Option<Arc<Vec<Vec<f64>>>>) -> Self {
         self.mixing = mixing;
@@ -2719,18 +2781,14 @@ impl RegionsModel {
             .is_some_and(|c| c.temperature_k.to_bits() == temperature_k.to_bits());
         if !current {
             let energies = &self.energies;
+            let lattice = absorber.lattice.as_ref();
             let (values, slopes) = absorber
                 .isotopes
                 .par_iter()
                 .map(|isotope| {
-                    let broadened = broaden_with_budget(
-                        energies,
-                        isotope,
-                        temperature_k,
-                        CHANNELS[channel],
-                        QuadratureBudget::default(),
-                    )
-                    .map_err(|e| FittingError::EvaluationFailed(e.to_string()))?;
+                    let broadened =
+                        broadened(energies, isotope, temperature_k, CHANNELS[channel], lattice)
+                            .map_err(FittingError::EvaluationFailed)?;
                     let (mut sigma, mut slope) = (broadened.values, broadened.derivatives);
                     sigma.reverse();
                     slope.reverse();
@@ -2936,10 +2994,11 @@ impl RegionsModel {
         let scale = clocks.of(region);
         let beams = self.beams(params, &clocks, region)?;
         let slope = |channel| -> Result<Vec<f64>, PipelineError> {
+            let lattice = self.absorbers[region].lattice.as_ref();
             let sigma = |data| {
-                broaden_channel(&self.energies, data, temperature, channel).map_err(|e| {
-                    PipelineError::Fitting(FittingError::EvaluationFailed(e.to_string()))
-                })
+                broadened(&self.energies, data, temperature, channel, lattice)
+                    .map(|b| b.values)
+                    .map_err(|e| PipelineError::Fitting(FittingError::EvaluationFailed(e)))
             };
             let (up, down) = (sigma(up)?, sigma(down)?);
             Ok(up
@@ -3461,7 +3520,10 @@ mod tests {
     #[test]
     fn the_jacobian_is_the_slope_of_every_region_s_counts() {
         for channel_fwhm_us in [None, Some(0.35)] {
-            jacobian_against_central_differences(&grid(channel_fwhm_us));
+            let lattice = channel_fwhm_us
+                .is_none()
+                .then(|| PhononSpectrum::debye(240.0, 200).expect("Debye"));
+            jacobian_against_central_differences(&grid(channel_fwhm_us), lattice);
         }
         let bins = starts_and_widths_us(&[350.0, 351.0, 400.0, 470.0]);
         let (_, slopes) = time_counts_per_pixel(&bins, [1.0, 2.0, f64::MIN_POSITIVE]);
@@ -3642,7 +3704,10 @@ mod tests {
         }
     }
 
-    fn jacobian_against_central_differences(grid: &Arc<FlightTimeGrid>) {
+    fn jacobian_against_central_differences(
+        grid: &Arc<FlightTimeGrid>,
+        lattice: Option<PhononSpectrum>,
+    ) {
         let (_, u_hi) = grid.range_us();
         let coarse = BeamSpline::constant(347.0, u_hi, 1.0e4);
         let beams = [coarse.refined().refined(), coarse.clone(), coarse.refined()];
@@ -3699,6 +3764,7 @@ mod tests {
             T0_US,
             &layout,
         )
+        .lattices(&[lattice, None, None])
         .spread(Some(Arc::new(vec![
             vec![0.8, 0.1, 0.05],
             vec![0.1, 0.7, 0.1],
@@ -3853,6 +3919,7 @@ mod tests {
                         isotopes: vec![(data, Value::Fitted(3.0e-4))],
                         temperature_k: Value::Fitted(350.0),
                         thickness_variance: Value::Known(0.0),
+                        lattice: None,
                     }),
                 })
                 .collect(),
@@ -4085,6 +4152,7 @@ mod tests {
             isotopes: vec![(hafnium, Value::Fitted(3.0e-4))],
             temperature_k: Value::Fitted(350.0),
             thickness_variance: Value::Known(0.0),
+            lattice: None,
         };
         let background = [
             Value::Fitted(0.02),
@@ -4322,6 +4390,7 @@ mod tests {
                 temperature_k: Value::Known(300.0),
                 library: EndfLibrary::EndfB8_1,
                 thickness_variance: Value::Known(0.0),
+                lattice: None,
             };
             excluded_bins(&edges, Some(&material), &numbers, None)
         };

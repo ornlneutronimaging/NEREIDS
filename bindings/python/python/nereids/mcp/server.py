@@ -567,6 +567,9 @@ def _material(
         temperature_k=_temperature_value(fit_config),
         thickness_variance=_value_or_number(fit_config.get("thickness_variance"), 0.0),
         library=library,
+        lattice=None
+        if fit_config.get("debye_temperature_k") is None
+        else nereids.PhononSpectrum.debye(float(fit_config["debye_temperature_k"])),
     )
     return material, names, initial
 
@@ -996,7 +999,7 @@ def _validate_workflow(manifest: dict[str, Any]) -> dict[str, Any]:
         "fit_domain", "normalization", "background", "empty_background",
         "temperature", "temperature_k", "fit_temperature",
         "gamma_transmission", "time_background", "room_background",
-        "thickness_variance", "capture_gammas", "in_scatter",
+        "thickness_variance", "capture_gammas", "in_scatter", "debye_temperature_k",
     }
     unsupported_fit = sorted(set(fit_config) - supported_fit)
     if unsupported_fit:

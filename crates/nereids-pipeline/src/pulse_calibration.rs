@@ -217,6 +217,11 @@ impl PulseCalibration {
                 "a pulse calibration records a pulse without a detector tail".into(),
             ));
         }
+        if foil_material(measurement)?.lattice.is_some() {
+            return Err(PipelineError::InvalidParameter(
+                "a calibration foil is broadened by the free gas, without a lattice".into(),
+            ));
+        }
         let fit = fit_counts(measurement, calibration)?;
         let pulse = Self::from_fit(measurement, calibration, foil, provenance, &fit)?;
         Ok((pulse, fit))
@@ -943,6 +948,7 @@ mod tests {
                         sd: 10.0,
                     },
                     thickness_variance: Value::Known(0.0),
+                    lattice: None,
                 }),
             }],
         }
@@ -1391,6 +1397,16 @@ mod tests {
                 }
                 other => panic!("{other:?}"),
             }
+        }
+        let mut lattice = measurement(None);
+        material(&mut lattice).lattice = Some(
+            nereids_physics::lattice_doppler::PhononSpectrum::debye(240.0, 100).expect("Debye"),
+        );
+        match PulseCalibration::new(&lattice, &c, provenance()) {
+            Err(PipelineError::InvalidParameter(message)) => {
+                assert!(message.contains("without a lattice"), "{message}")
+            }
+            other => panic!("{other:?}"),
         }
     }
 

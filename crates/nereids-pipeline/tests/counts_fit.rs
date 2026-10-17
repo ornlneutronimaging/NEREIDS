@@ -17,6 +17,7 @@ use nereids_physics::flight_time_grid::FlightTimeGrid;
 use nereids_physics::ikeda_carpenter::{
     EnergyLaw, IkedaCarpenter, IkedaCarpenterParams, SynthesisGrid, ic_pulse,
 };
+use nereids_physics::lattice_doppler::{PhononSpectrum, broaden_in_lattice};
 use nereids_physics::resolution::{ResolutionFunction, TOF_FACTOR};
 use nereids_physics::transmission::broadened_cross_sections;
 use nereids_pipeline::counts_fit::{
@@ -124,6 +125,24 @@ fn run(
     sample: &[(ResonanceData, f64)],
     temperature_k: f64,
 ) -> Vec<f64> {
+    let isotopes: Vec<ResonanceData> = sample.iter().map(|(data, _)| data.clone()).collect();
+    run_through(setup, scale, beam, &|energies: &[f64]| {
+        let sigma = cross_sections(energies, &isotopes, temperature_k);
+        (0..energies.len())
+            .map(|j| {
+                let depth: f64 = sample.iter().zip(&sigma).map(|((_, n), s)| n * s[j]).sum();
+                (-depth).exp()
+            })
+            .collect()
+    })
+}
+
+fn run_through(
+    setup: &Setup,
+    scale: f64,
+    beam: &dyn Fn(f64) -> f64,
+    transmission: &dyn Fn(&[f64]) -> Vec<f64>,
+) -> Vec<f64> {
     let instrument = Instrument {
         time_edges_us: setup.edges.clone(),
         flight_path_m: setup.flight_path_m,
@@ -135,20 +154,10 @@ fn run(
         let u = clock / e.sqrt();
         beam(u) * u / (2.0 * e)
     };
-    let isotopes: Vec<ResonanceData> = sample.iter().map(|(data, _)| data.clone()).collect();
-    let transmission = |energies: &[f64]| -> Vec<f64> {
-        let sigma = cross_sections(energies, &isotopes, temperature_k);
-        (0..energies.len())
-            .map(|j| {
-                let depth: f64 = sample.iter().zip(&sigma).map(|((_, n), s)| n * s[j]).sum();
-                (-depth).exp()
-            })
-            .collect()
-    };
     instrument
         .expected_counts(
             &|e| scale * per_ev(e),
-            &transmission,
+            transmission,
             setup.energy_range_ev,
             setup.simulator_step_us,
         )
@@ -273,6 +282,7 @@ fn measurement(
                     .collect(),
                 temperature_k: Value::Known(TEMPERATURE_K),
                 thickness_variance: Value::Known(0.0),
+                lattice: None,
             }),
         }],
     }
@@ -398,6 +408,7 @@ fn the_time_background_is_in_both_runs_of_every_region_by_its_pixels_and_gamma_t
                     isotopes: lines.iter().map(|(d, n)| (d.clone(), sample(*n))).collect(),
                     temperature_k: sample(TEMPERATURE_K),
                     thickness_variance: Value::Known(0.0),
+                    lattice: None,
                 }),
             })
             .collect(),
@@ -638,6 +649,7 @@ fn an_empty_area_with_a_known_background_adds_its_counts_information_on_the_norm
                 isotopes: vec![(hot, Value::Fitted(0.5 * THIN))],
                 temperature_k: Value::Fitted(1000.0),
                 thickness_variance: Value::Known(0.0),
+                lattice: None,
             }),
             padded([
                 Value::Fitted(0.02),
@@ -659,6 +671,7 @@ fn an_empty_area_with_a_known_background_adds_its_counts_information_on_the_norm
                 )],
                 temperature_k: Value::Fitted(400.0),
                 thickness_variance: Value::Known(0.0),
+                lattice: None,
             }),
             padded([Value::Fitted(0.02), Value::Known(0.0), Value::Known(0.0)]),
         ),
@@ -829,6 +842,7 @@ fn a_map_recovers_each_patch_and_its_covariance_between_patches_is_the_shared_qu
                 upper: 2000.0,
             },
             thickness_variance: Value::Known(0.0),
+            lattice: None,
         },
         background: padded([
             Value::Within {
@@ -1161,6 +1175,7 @@ fn a_map_fits_the_time_background_its_patches_share_as_the_joint_fit_does() {
         isotopes: vec![(isotope, Value::Fitted(THIN))],
         temperature_k: Value::Fitted(330.0),
         thickness_variance: Value::Known(0.0),
+        lattice: None,
     };
     let start = std::array::from_fn(|i| Value::Fitted([0.5, 2.0, 0.7][i] * numbers[i]));
     let map = MapMeasurement {
@@ -1351,6 +1366,7 @@ fn the_room_background_follows_each_run_s_frames_apart_from_the_time_background(
         isotopes: vec![(isotope, Value::Fitted(THIN))],
         temperature_k: Value::Fitted(330.0),
         thickness_variance: Value::Known(0.0),
+        lattice: None,
     };
     let time = [Value::Fitted(0.7 * c), Value::Known(0.0), Value::Known(1.0)];
     let room_background = Some(RoomBackground {
@@ -1892,6 +1908,7 @@ fn the_detector_spread_between_regions_is_recovered_with_the_density_and_tempera
                         Value::Known(TEMPERATURE_K)
                     },
                     thickness_variance: Value::Known(0.0),
+                    lattice: None,
                 }),
             })
             .collect();
@@ -2032,6 +2049,53 @@ fn a_region_recording_early_meets_a_decaying_time_background_on_its_own_clock() 
 }
 
 #[test]
+fn a_crystal_s_temperature_is_read_through_its_lattice() {
+    let setup = standard();
+    let (isotope, density) = (hafnium_like(20.0), 5.0e-3);
+    let spectrum = PhononSpectrum::debye(240.0, 400).expect("Debye");
+    let open = run(&setup, 1.0, &beam(1.0e5), &[], TEMPERATURE_K);
+    let transmitted = run_through(&setup, CHARGE_RATIO, &beam(1.0e5), &|energies: &[f64]| {
+        let sigma =
+            broaden_in_lattice(energies, &isotope, TEMPERATURE_K, &spectrum, Channel::Total)
+                .expect("broadened");
+        sigma.values.iter().map(|s| (-density * s).exp()).collect()
+    });
+    let fit_with = |lattice: Option<PhononSpectrum>| {
+        let mut m = measurement(
+            &setup,
+            (rounded(&open), rounded(&transmitted)),
+            &[(isotope.clone(), density)],
+        );
+        m.material_mut().temperature_k = Value::Fitted(330.0);
+        m.material_mut().lattice = lattice;
+        fit_counts(&m, &calibration(&setup)).expect("fit")
+    };
+    let fit = fit_with(Some(spectrum.clone()));
+    assert!(fit.converged);
+    let pulls = [
+        (fit.regions[0].densities[0], density),
+        (fit.temperature(), TEMPERATURE_K),
+    ]
+    .iter()
+    .enumerate()
+    .map(|(i, (estimate, truth))| (estimate - truth) / error_bar(&fit, i))
+    .collect::<Vec<f64>>();
+    assert!(pulls.iter().all(|p| p.abs() <= BOUND.sqrt()), "{pulls:?}");
+    assert!(
+        (fit.temperature() - TEMPERATURE_K).abs() <= 0.1,
+        "{}",
+        fit.temperature()
+    );
+    let free = fit_with(None);
+    assert!(free.converged);
+    assert!(
+        (free.temperature() - TEMPERATURE_K).abs() > 1.0,
+        "{}",
+        free.temperature()
+    );
+}
+
+#[test]
 fn maps_the_fit_does_not_describe_are_refused() {
     let setup = standard();
     let edges: Vec<f64> = (0..=577).map(|k| 350.0 + 0.2 * f64::from(k)).collect();
@@ -2061,6 +2125,7 @@ fn maps_the_fit_does_not_describe_are_refused() {
             isotopes: vec![(hafnium_like(20.0), Value::Fitted(THIN))],
             temperature_k: Value::Known(TEMPERATURE_K),
             thickness_variance: Value::Known(0.0),
+            lattice: None,
         },
         background: [Value::Known(0.0); 5],
         gamma_transmission: Value::Known(1.0),
@@ -5221,6 +5286,7 @@ mod maps {
                         .collect(),
                     temperature_k,
                     thickness_variance: Value::Known(0.0),
+                    lattice: None,
                 },
                 background: [
                     Value::Fitted(0.02),

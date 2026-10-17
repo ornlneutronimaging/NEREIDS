@@ -888,6 +888,20 @@ class TestCountsApi:
         assert measurement.room_background.rate.value == 0.5
         assert measurement.room_background.frames == (3.0e4, 2.5e4)
         assert material.thickness_variance.value == 0.0
+        assert material.lattice is None
+        debye = nereids.PhononSpectrum.debye(240.0)
+        assert abs(debye.max_ev - 240.0 * 8.617333262e-5) < 1e-12
+        crystal = nereids.Material(
+            isotopes=[(u238_data, nereids.Value.fitted(0.001))],
+            temperature_k=nereids.Value.known(300.0),
+            lattice=debye,
+        )
+        assert crystal.lattice.effective_temperature_k(300.0) > 300.0
+        for kelvin in (-300.0, 0.0, float("nan"), float("inf")):
+            with pytest.raises(ValueError, match="finite and positive"):
+                debye.effective_temperature_k(kelvin)
+        with pytest.raises(ValueError, match="phonon spectrum"):
+            nereids.PhononSpectrum(1e-3, [1.0, 2.0])
         uneven = nereids.Material(
             isotopes=[(u238_data, nereids.Value.fitted(0.001))],
             temperature_k=nereids.Value.known(293.6),

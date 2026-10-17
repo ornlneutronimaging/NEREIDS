@@ -1057,11 +1057,25 @@ class Value:
     @property
     def sd(self) -> float | None: ...
 
+class PhononSpectrum:
+    """A crystal's phonon density of states in eV: values every step_ev from
+    0, the first 0, quadratic in the energy up to the first point and linear
+    between the others."""
+
+    def __init__(self, step_ev: float, density: list[float]) -> None: ...
+    @staticmethod
+    def debye(theta_k: float, points: int = 1000) -> PhononSpectrum: ...
+    @property
+    def max_ev(self) -> float: ...
+    def effective_temperature_k(self, temperature_k: float) -> float: ...
+
 class Material:
     """A material isotopes, each with an areal density in atoms/barn, and its
     temperature in K.  The library names the ENDF library the isotopes were
     read from; thickness_variance is the relative variance of the areal
-    density over the region's pixels, known 0 by default."""
+    density over the region's pixels, known 0 by default; lattice is the
+    PhononSpectrum the nuclei vibrate with, which makes temperature_k the
+    thermodynamic temperature, or None for the free gas."""
 
     def __init__(
         self,
@@ -1069,6 +1083,7 @@ class Material:
         temperature_k: Value,
         library: str = "endf8.1",
         thickness_variance: Value | None = None,
+        lattice: PhononSpectrum | None = None,
     ) -> None: ...
     @property
     def isotopes(self) -> list[tuple[ResonanceData, Value]]: ...
@@ -1076,6 +1091,8 @@ class Material:
     def temperature_k(self) -> Value: ...
     @property
     def thickness_variance(self) -> Value: ...
+    @property
+    def lattice(self) -> PhononSpectrum | None: ...
 
 class Region:
     """The counts of a set of pixels in both runs, its background and the

@@ -177,6 +177,7 @@ fn material(request: &FitRequest) -> Material {
         library: request.library,
         covariances: Vec::new(),
         thickness_variance: Value::Known(0.0),
+        lattice: None,
     }
 }
 
