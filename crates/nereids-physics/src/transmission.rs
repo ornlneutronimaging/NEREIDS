@@ -103,8 +103,8 @@ fn build_aux_grid(
 /// grid densification.
 ///
 /// For LRF=1/2/3 (BW and Reich-Moore): `gd = |Γn| + |Γγ| + |Γf1| + |Γf2|`,
-/// walked from each resolved range's `l_groups`. Non-evaluable ranges
-/// (LRF=7, LRU=2) carry empty `l_groups` and contribute no pairs.
+/// walked from the `l_groups` of each range that
+/// [`nereids_endf::resonance::ResonanceRange::is_evaluable`] accepts.
 ///
 /// SAMMY Ref: dat/mdat4.f90 Fspken — uses total width to define the region
 /// [E_res − gd, E_res + gd] for fine-structure point insertion.
@@ -112,12 +112,9 @@ fn extract_resonance_widths(resonance_data: &[&ResonanceData]) -> Vec<(f64, f64)
     let mut pairs = Vec::new();
     for rd in resonance_data {
         for range in &rd.ranges {
-            if !range.resolved {
+            if !range.is_evaluable() {
                 continue;
             }
-            // LRF=1/2/3: resonances grouped by L. LRF=7 (and LRU=2) ranges are
-            // parsed-and-skipped with empty l_groups and are not evaluated, so
-            // they contribute no resonance dips here.
             for lg in &range.l_groups {
                 for res in &lg.resonances {
                     let gd = res.gn.abs() + res.gg.abs() + res.gfa.abs() + res.gfb.abs();

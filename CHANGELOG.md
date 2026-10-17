@@ -94,6 +94,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
 - PLEIADES test data are no longer a Git submodule. The local directory is
   ignored. The test suite does not require it.
 
+### Fixed
+
+- An SLBW or MLBW range with a competitive width (LRX=1) is parsed but not
+  evaluated, like an LRF=7 range: the width's energy dependence needs the l of
+  the exit channel, which ENDF does not give. It was evaluated with the
+  competitive width left out of the total width.
+
 ### Limitations
 
 - The map's `trusted` array records numerical status only. It does not
