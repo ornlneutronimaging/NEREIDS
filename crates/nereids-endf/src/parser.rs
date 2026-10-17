@@ -329,7 +329,8 @@ pub fn parse_endf_file2(endf_text: &str) -> Result<ResonanceData, EndfParseError
         ));
     }
 
-    if let Some(lrp) = section(endf_text, "1", "451")
+    let mat = lines[0].get(66..70).unwrap_or("").trim();
+    if let Some(lrp) = section(endf_text, mat, "1", "451")
         .first()
         .map(|line| parse_endf_int(line, 2))
         .transpose()?
@@ -345,7 +346,7 @@ pub fn parse_endf_file2(endf_text: &str) -> Result<ResonanceData, EndfParseError
         isotope,
         za,
         awr,
-        smooth: parse_file3(endf_text)?,
+        smooth: parse_file3(endf_text, mat)?,
         ranges: all_ranges,
     };
 
@@ -377,27 +378,42 @@ pub fn parse_endf_file2(endf_text: &str) -> Result<ResonanceData, EndfParseError
 }
 
 fn section_151<'a>(endf_text: &'a str, mf: &str) -> Vec<&'a str> {
-    section(endf_text, mf, "151")
-}
-
-/// The lines of section `mt` of file `mf`.
-fn section<'a>(endf_text: &'a str, mf: &str, mt: &str) -> Vec<&'a str> {
     endf_text
         .lines()
-        .filter(|line| line.len() >= 75 && line[70..72].trim() == mf && line[72..75].trim() == mt)
+        .filter(|line| line.len() >= 75 && line[70..72].trim() == mf && &line[72..75] == "151")
         .collect()
 }
 
-/// File 3's cross sections of the reactions [`SmoothCrossSections`] holds,
-/// each the TAB1 record that follows its section's HEAD record.
-fn parse_file3(endf_text: &str) -> Result<SmoothCrossSections, EndfParseError> {
+/// The lines of section `mt` of file `mf` of material `mat`.
+fn section<'a>(endf_text: &'a str, mat: &str, mf: &str, mt: &str) -> Vec<&'a str> {
+    endf_text
+        .lines()
+        .filter(|line| {
+            line.len() >= 75
+                && line[66..70].trim() == mat
+                && line[70..72].trim() == mf
+                && line[72..75].trim() == mt
+        })
+        .collect()
+}
+
+/// File 3's cross sections of material `mat` for the reactions
+/// [`SmoothCrossSections`] holds, each the one TAB1 record that follows its
+/// section's HEAD record.
+fn parse_file3(endf_text: &str, mat: &str) -> Result<SmoothCrossSections, EndfParseError> {
     let table = |mt: &str| -> Result<Option<Tab1>, EndfParseError> {
-        let lines = section(endf_text, "3", mt);
+        let lines = section(endf_text, mat, "3", mt);
         if lines.is_empty() {
             return Ok(None);
         }
         let mut pos = 1;
-        parse_tab1_with(&lines, &mut pos, true).map(Some)
+        let table = parse_tab1_with(&lines, &mut pos, true)?;
+        if pos < lines.len() {
+            return Err(EndfParseError::UnsupportedFormat(format!(
+                "MF=3 MT={mt} of MAT {mat} holds records after its table"
+            )));
+        }
+        Ok(Some(table))
     };
     Ok(SmoothCrossSections {
         total: table("1")?,
@@ -1587,6 +1603,11 @@ fn parse_tab1_with(lines: &[&str], pos: &mut usize, jumps: bool) -> Result<Tab1,
     for i in 0..np {
         let x = data_raw[i * 2];
         let y = data_raw[i * 2 + 1];
+        if !(x.is_finite() && y.is_finite()) {
+            return Err(EndfParseError::UnsupportedFormat(format!(
+                "TAB1 point {i} ({x}, {y}) is not finite"
+            )));
+        }
         // x-values must be strictly increasing, or repeat once at a jump;
         // Tab1::evaluate() relies on this.
         let jump = jumps

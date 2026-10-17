@@ -83,7 +83,7 @@ impl Tab1 {
                 pts[0].1
             };
         }
-        if x <= pts[0].0 {
+        if x < pts[0].0 || (x == pts[0].0 && pts.get(1).is_none_or(|&(next, _)| next > x)) {
             return pts[0].1;
         }
         if x >= pts[pts.len() - 1].0 {
@@ -198,7 +198,6 @@ pub struct ResonanceData {
     pub awr: f64,
     /// File 3's smooth cross sections, added to those of the resonance
     /// parameters at every energy.
-    #[serde(default)]
     pub smooth: SmoothCrossSections,
     /// Energy ranges containing resonance parameters.
     pub ranges: Vec<ResonanceRange>,
@@ -638,6 +637,18 @@ mod tests {
         assert_eq!(table.evaluate(100.0), 15.0, "above high bound");
         assert_eq!(table.evaluate(2.0), 5.0, "at low bound");
         assert_eq!(table.evaluate(8.0), 15.0, "at high bound");
+    }
+
+    #[test]
+    fn a_repeated_energy_is_a_jump_to_its_second_value() {
+        let first = make_linlin_table(vec![(1.0, 0.0), (1.0, 5.0), (2.0, 7.0)]);
+        assert_eq!(first.evaluate(0.5), 0.0);
+        assert_eq!(first.evaluate(1.0), 5.0);
+        assert_eq!(first.evaluate(1.5), 6.0);
+        let inside = make_linlin_table(vec![(0.0, 0.0), (1.0, 1.0), (1.0, 5.0), (2.0, 7.0)]);
+        assert_eq!(inside.evaluate(0.5), 0.5);
+        assert_eq!(inside.evaluate(1.0), 5.0);
+        assert_eq!(inside.evaluate(1.5), 6.0);
     }
 
     /// Histogram interpolation (INT=1): y stays constant from left endpoint.

@@ -2048,7 +2048,13 @@ fn read_endf_cache_into(file: &hdf5::File, snap: &mut ProjectSnapshot) -> Result
         let json: VarLenUnicode = ds
             .read_scalar()
             .map_err(|e| hdf5_err(&format!("/endf_cache/{name}/resonance_data"), e))?;
-        let rd: ResonanceData = serde_json::from_str(json.as_str())
+        let value: serde_json::Value = serde_json::from_str(json.as_str())
+            .map_err(|e| hdf5_err(&format!("deserialize /endf_cache/{name}"), e))?;
+        if value.get("smooth").is_none() {
+            snap.endf_cache_dropped.push(name.clone());
+            continue;
+        }
+        let rd: ResonanceData = serde_json::from_value(value)
             .map_err(|e| hdf5_err(&format!("deserialize /endf_cache/{name}"), e))?;
         // Drop cached data that carries no evaluable range. Legacy project
         // files (saved before the RML/URR removal) serialized removed-physics
@@ -2809,6 +2815,35 @@ mod tests {
         assert_eq!(loaded.endf_cache[0].0, "U-238");
         assert!(loaded.endf_cache[0].1.has_evaluable_range());
         assert_eq!(loaded.endf_cache_dropped, vec!["Zr-90".to_string()]);
+    }
+
+    #[test]
+    fn a_cached_isotope_saved_without_file_3_is_fetched_again() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("before-file-3.nrd.h5");
+        let mut snap = minimal_snapshot();
+        snap.endf_cache = vec![(
+            "U-238".into(),
+            nereids_endf::resonance::test_support::u238_single_resonance(),
+        )];
+        save_project(&path, &snap).unwrap();
+        {
+            let file = hdf5::File::open_rw(&path).unwrap();
+            let group = file.group("endf_cache/U-238").unwrap();
+            let mut value = serde_json::to_value(&snap.endf_cache[0].1).unwrap();
+            value.as_object_mut().unwrap().remove("smooth");
+            let json: VarLenUnicode = value.to_string().parse().unwrap();
+            group.unlink("resonance_data").unwrap();
+            group
+                .new_dataset::<VarLenUnicode>()
+                .shape(())
+                .create("resonance_data")
+                .and_then(|ds| ds.write_scalar(&json))
+                .unwrap();
+        }
+        let loaded = load_project(&path).unwrap();
+        assert!(loaded.endf_cache.is_empty());
+        assert_eq!(loaded.endf_cache_dropped, vec!["U-238".to_string()]);
     }
 
     #[test]

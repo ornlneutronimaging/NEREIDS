@@ -28,11 +28,18 @@ fn number(field: &str) -> f64 {
     }
 }
 
-/// File 3's section `mt`, read field by field.
+const MAT: &str = "7328";
+
+/// File 3's section `mt` of material [`MAT`], read field by field.
 fn read(text: &str, mt: u32) -> Tab1 {
     let lines: Vec<&str> = text
         .lines()
-        .filter(|l| l.len() >= 75 && l[70..72].trim() == "3" && l[72..75].trim() == mt.to_string())
+        .filter(|l| {
+            l.len() >= 75
+                && l[66..70].trim() == MAT
+                && l[70..72].trim() == "3"
+                && l[72..75].trim() == mt.to_string()
+        })
         .collect();
     let fields =
         |l: &str| -> Vec<f64> { (0..6).map(|i| number(&l[11 * i..11 * i + 11])).collect() };
@@ -99,6 +106,49 @@ fn file_3_is_read_as_the_tape_holds_it_and_added_to_each_channel() {
         moved += usize::from(added != 0.0);
     }
     assert!(moved >= 3, "{moved}");
+}
+
+/// The tape with `edit` applied to the lines of File 3's section `mt`.
+fn edited(mt: &str, edit: impl Fn(&mut Vec<String>)) -> String {
+    let mut lines: Vec<String> = tape().lines().map(str::to_string).collect();
+    let in_section =
+        |l: &String| l.len() >= 75 && l[70..72].trim() == "3" && l[72..75].trim() == mt;
+    let first = lines.iter().position(in_section).expect("section");
+    let last = lines.iter().rposition(in_section).expect("section");
+    let mut section: Vec<String> = lines.drain(first..=last).collect();
+    edit(&mut section);
+    lines.splice(first..first, section);
+    lines.join("\n")
+}
+
+#[test]
+fn file_3_of_another_material_or_malformed_is_never_read() {
+    let other = edited("1", |section| {
+        let mut copy: Vec<String> = section
+            .iter()
+            .map(|l| format!("{}9999{}", &l[..66], &l[70..]))
+            .collect();
+        copy[3] = format!("{}{:>11}{}", &copy[3][..11], "1.0+3", &copy[3][22..]);
+        section.splice(0..0, copy);
+    });
+    let data = parse_endf_file2(&other).expect("tape");
+    assert_eq!(
+        data.smooth.total.expect("MT1").points,
+        read(&tape(), 1).points
+    );
+    let extra = edited("1", |section| {
+        let last = section[section.len() - 1].clone();
+        section.push(last);
+    });
+    let not_finite = edited("2", |section| {
+        section[3] = format!("{}{:>11}{}", &section[3][..11], "nan", &section[3][22..]);
+    });
+    for (text, expected) in [(extra, "after its table"), (not_finite, "not finite")] {
+        let Err(error) = parse_endf_file2(&text) else {
+            panic!("{expected}: read");
+        };
+        assert!(error.to_string().contains(expected), "{error}");
+    }
 }
 
 #[test]
