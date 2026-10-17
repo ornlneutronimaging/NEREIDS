@@ -901,7 +901,7 @@ def _process_density_map(
     arrays_to_save: dict[str, Any] = {
         "time_edges_us": edges,
         "patch_kinds": np.asarray(patch_kinds, dtype=object),
-        "trusted": np.asarray(result.trusted),
+        "identified": np.asarray(result.identified),
         "temperature_k": np.asarray(result.temperature_k),
         "thickness_variance": _patch_values(result.fits, "thickness_variance"),
         "capture_gammas": _patch_values(result.fits, "capture_gammas"),
@@ -935,7 +935,7 @@ def _process_density_map(
         "output_npz": str(result_npz),
         "time_range_us": [float(edges[0]), float(edges[-1])],
         "n_bins": int(sample.shape[0]),
-        "map_shape": list(np.asarray(result.trusted).shape),
+        "map_shape": list(np.asarray(result.identified).shape),
         "n_fitted": int(result.n_fitted),
         "time_background": [_finite_float_or_none(v) for v in result.time_background],
         "room_background": _finite_float_or_none(result.room_background),

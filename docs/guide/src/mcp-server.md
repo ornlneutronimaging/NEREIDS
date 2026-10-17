@@ -213,8 +213,10 @@ pixel, shared by every patch, and `fit.gamma_transmission` for every sample
 patch. The map's .npz holds each patch's densities, their standard
 deviations, temperature, thickness variance, capture gammas, in-scatter,
 timing offset, gamma transmission and background terms (on the last axis),
-NaN where a patch has no fit. The map's `trusted`
-array reports numerical status, not physical or thermometry validation. Masks are cropped with the counts when an ROI or
+NaN where a patch has no fit. The map's `identified`
+array marks the patches whose fitted densities, unless 0, and fitted
+temperature each have a finite standard deviation; it is not physical or
+thermometry validation. Masks are cropped with the counts when an ROI or
 pixel limit is selected.
 
 Paired arrays must have matching shapes, and the time-bin edge count must be

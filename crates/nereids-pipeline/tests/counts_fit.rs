@@ -884,7 +884,7 @@ fn a_map_recovers_each_patch_and_its_covariance_between_patches_is_the_shared_qu
         })
     );
     assert_eq!(
-        result.trusted,
+        result.identified,
         Array2::from_shape_fn((2, 6), |(i, j)| i == 0 && j < 3)
     );
     assert!(
@@ -5665,9 +5665,9 @@ mod maps {
         let result = fit_map(&map, &tiled.calibration()).expect("map");
         assert!(result.converged);
         assert!(
-            result.trusted.slice(s![..8, ..]).iter().all(|&t| t),
+            result.identified.slice(s![..8, ..]).iter().all(|&t| t),
             "{:?}",
-            result.trusted
+            result.identified
         );
         let at: Vec<((usize, usize), usize)> = (0..8)
             .flat_map(|i| (0..8).map(move |j| ((i, j), pick(i, j))))
@@ -5692,7 +5692,7 @@ mod maps {
         );
         let result = fit_map(&map, &tiled.calibration()).expect("map");
         assert!(result.converged);
-        assert_eq!(result.trusted.row(0).to_vec(), [true, false]);
+        assert_eq!(result.identified.row(0).to_vec(), [true, false]);
         assert_eq!(result.temperature_k[[0, 1]], 2000.0);
         let pulls = pulls(&result, &truths, &[((0, 0), 0)]);
         assert!(pulls.iter().all(|p| p.abs() <= 1.0), "{pulls:?}");

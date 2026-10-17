@@ -1471,8 +1471,10 @@ class CountsMap:
     @property
     def overdispersion(self) -> list[NDArray[np.float64]]: ...
     @property
-    def trusted(self) -> NDArray[np.bool_]:
-        """Numerical convergence and uncertainty status, not physical validation."""
+    def identified(self) -> NDArray[np.bool_]:
+        """Whether the map converged, the patch did not fail, and each fitted
+        density and the fitted temperature has a finite standard deviation or,
+        for a density, is 0."""
         ...
     @property
     def normalization(self) -> float: ...

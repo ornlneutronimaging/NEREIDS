@@ -198,12 +198,12 @@ pub struct CountsMap<'a> {
     /// Each patch's [`RegionFit::overdispersion`] of the open-beam run, then
     /// of the sample run; NaN where it is `None` or the patch has no fit.
     pub overdispersion: [Array2<f64>; 2],
-    /// Whether the map converged, the patch did not fail, and each of its
-    /// fitted densities and its fitted temperature has a finite standard
-    /// deviation or, for a density, is 0.
-    /// This is numerical status, not validation of the physical model or of
-    /// the inferred temperature.
-    pub trusted: Array2<bool>,
+    /// Whether the map converged, the patch did not fail, and the counts
+    /// determine each of its fitted densities and its fitted temperature: each
+    /// has a finite standard deviation or, for a density, is 0.  Whether the
+    /// model describes the patch's counts is its [`Self::overdispersion`];
+    /// neither says whether the values are right.
+    pub identified: Array2<bool>,
     /// The normalization `a`: the known one, or the fitted one.
     pub normalization: f64,
     /// The time background's `[C, A, τ]`, each the known or the fitted one.
@@ -338,7 +338,7 @@ impl CountsMap<'_> {
         {
             sd.fill(f64::NAN);
         }
-        self.trusted.fill(false);
+        self.identified.fill(false);
         self
     }
 
@@ -1310,7 +1310,7 @@ fn fit_map_from<'a>(
     let mut temperature_k = blank.clone();
     let mut temperature_sd_k = blank.clone();
     let mut overdispersion = [blank.clone(), blank];
-    let mut trusted = Array2::from_elem((rows, cols), false);
+    let mut identified = Array2::from_elem((rows, cols), false);
     let mut failed = Array2::from_elem((rows, cols), None);
     let mut fits = Array2::from_elem((rows, cols), None);
     let mut covariance = Array2::from_elem((rows, cols), None);
@@ -1367,7 +1367,7 @@ fn fit_map_from<'a>(
         for (run, phi) in overdispersion.iter_mut().zip(fit.overdispersion) {
             run[patch] = phi.unwrap_or(f64::NAN);
         }
-        trusted[patch] = converged
+        identified[patch] = converged
             && template.iter().all(|&(role, _)| match role {
                 Role::Density { isotope, .. } => {
                     sd(role).is_finite() || fit.densities[isotope] == 0.0
@@ -1393,7 +1393,7 @@ fn fit_map_from<'a>(
         temperature_k,
         temperature_sd_k,
         overdispersion,
-        trusted,
+        identified,
         normalization: values[at(Role::Normalization)],
         time_background: std::array::from_fn(|i| values[time_background + i]),
         room_background: values[room],

@@ -1044,6 +1044,8 @@ class TestCountsApi:
             background=[nereids.Value.known(0.0)] * 3,
         )
         result = nereids.fit_map(measurement, self._calibration())
+        identified = np.asarray(result.identified)
+        assert identified.shape == (1, 2) and identified.dtype == np.bool_
         assert result.empty is not None
         np.testing.assert_allclose(
             result.empty.predicted_sample, result.empty.predicted_open,

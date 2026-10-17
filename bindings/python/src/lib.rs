@@ -4408,7 +4408,7 @@ struct PyCountsMap {
     temperature_k: ndarray::Array2<f64>,
     temperature_sd_k: ndarray::Array2<f64>,
     overdispersion: [ndarray::Array2<f64>; 2],
-    trusted: ndarray::Array2<bool>,
+    identified: ndarray::Array2<bool>,
     normalization: f64,
     time_background: [f64; 3],
     room_background: f64,
@@ -4442,7 +4442,7 @@ impl PyCountsMap {
             temperature_k: map.temperature_k.clone(),
             temperature_sd_k: map.temperature_sd_k.clone(),
             overdispersion: map.overdispersion.clone(),
-            trusted: map.trusted.clone(),
+            identified: map.identified.clone(),
             normalization: map.normalization,
             time_background: map.time_background,
             room_background: map.room_background,
@@ -4543,10 +4543,12 @@ impl PyCountsMap {
             .collect()
     }
 
-    /// Numerical convergence and uncertainty status, not physical validation.
+    /// Whether the map converged, the patch did not fail, and each fitted
+    /// density and the fitted temperature has a finite standard deviation or,
+    /// for a density, is 0.
     #[getter]
-    fn trusted<'py>(&self, py: Python<'py>) -> Bound<'py, PyArray2<bool>> {
-        PyArray2::from_owned_array(py, self.trusted.clone())
+    fn identified<'py>(&self, py: Python<'py>) -> Bound<'py, PyArray2<bool>> {
+        PyArray2::from_owned_array(py, self.identified.clone())
     }
 
     /// The normalization a.
