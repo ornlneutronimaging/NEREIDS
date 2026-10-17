@@ -8,9 +8,9 @@ use pyo3::prelude::*;
 
 use nereids_core::elements;
 use nereids_core::types::{Isotope, IsotopeGroup};
-use nereids_endf::parser::parse_endf_file2;
+use nereids_endf::parser::{parse_endf_file2, parse_resonance_covariance};
 use nereids_endf::resonance::{
-    LGroup, Resonance, ResonanceData, ResonanceFormalism, ResonanceRange,
+    LGroup, Resonance, ResonanceCovariance, ResonanceData, ResonanceFormalism, ResonanceRange,
 };
 use nereids_endf::retrieval::{EndfLibrary, EndfRetrievalError, EndfRetriever, mat_number};
 use nereids_fitting::lm::FlatMatrix;
@@ -31,6 +31,7 @@ use nereids_pipeline::counts_fit::{
 use nereids_pipeline::counts_map::{CountsMap, MapMeasurement, Patch};
 use nereids_pipeline::error::PipelineError;
 use nereids_pipeline::open_beam::{Calibration, Pulse};
+use nereids_pipeline::pulse_calibration::PulseCalibration;
 
 /// Python wrapper for ENDF resonance data.
 ///
@@ -3140,6 +3141,84 @@ impl PyPhononSpectrum {
     }
 }
 
+/// The covariance of the energy, neutron width and capture width, in that
+/// order, of each listed resonance of one evaluation, from its File 32.
+#[pyclass(name = "ResonanceCovariance", from_py_object)]
+#[derive(Clone)]
+struct PyResonanceCovariance {
+    inner: ResonanceCovariance,
+}
+
+#[pymethods]
+impl PyResonanceCovariance {
+    /// Each listed resonance as (range, L-group, resonance) indices into the
+    /// ResonanceData it was read with.
+    #[getter]
+    fn resonances(&self) -> Vec<(usize, usize, usize)> {
+        self.inner
+            .resonances
+            .iter()
+            .map(|&[a, b, c]| (a, b, c))
+            .collect()
+    }
+
+    /// The covariance over the 3 * len(resonances) parameters, in eV**2.
+    #[getter]
+    fn covariance<'py>(&self, py: Python<'py>) -> Bound<'py, PyArray2<f64>> {
+        let n = 3 * self.inner.resonances.len();
+        let matrix = ndarray::Array2::from_shape_vec((n, n), self.inner.covariance.to_vec())
+            .expect("the covariance is square");
+        PyArray2::from_owned_array(py, matrix)
+    }
+
+    fn __repr__(&self) -> String {
+        format!(
+            "ResonanceCovariance(resonances={})",
+            self.inner.resonances.len()
+        )
+    }
+}
+
+/// The File 32 covariance of the Reich-Moore resonances of data between
+/// window_ev = (low, high) eV, read from the ENDF file at path, or, without
+/// one, from the library's evaluation of data's isotope as load_endf fetches
+/// it.  None when the evaluation has no File 32.
+///
+/// Raises:
+///     ValueError: an empty window, or a File 32 the counts fit cannot use
+///         (see the Rust parse_resonance_covariance).
+#[pyfunction]
+#[pyo3(signature = (data, window_ev, path=None, library="endf8.1", mat=None))]
+fn load_resonance_covariance(
+    py: Python<'_>,
+    data: PyResonanceData,
+    window_ev: (f64, f64),
+    path: Option<&str>,
+    library: &str,
+    mat: Option<u32>,
+) -> PyResult<Option<PyResonanceCovariance>> {
+    let text = match path {
+        Some(path) => std::fs::read_to_string(path)?,
+        None => {
+            let lib = parse_library_name(library)?;
+            let isotope = data.inner.isotope;
+            let mat_num = mat.or_else(|| mat_number(&isotope, lib)).ok_or_else(|| {
+                pyo3::exceptions::PyValueError::new_err(format!(
+                    "MAT number not found for Z={} A={}; provide mat= explicitly",
+                    isotope.z(),
+                    isotope.a()
+                ))
+            })?;
+            py.detach(move || EndfRetriever::new().get_endf_file(&isotope, lib, mat_num))
+                .map_err(|e| pyo3::exceptions::PyRuntimeError::new_err(e.to_string()))?
+                .1
+        }
+    };
+    parse_resonance_covariance(&text, &data.inner, window_ev.0..=window_ev.1)
+        .map(|covariance| covariance.map(|inner| PyResonanceCovariance { inner }))
+        .map_err(|e| pyo3::exceptions::PyValueError::new_err(e.to_string()))
+}
+
 /// A material's isotopes, each with an areal density in atoms/barn, and its
 /// temperature in K.
 #[pyclass(name = "Material", from_py_object)]
@@ -3153,15 +3232,18 @@ impl PyMaterial {
     /// library names the ENDF library the isotopes' resonance data were read
     /// from, e.g. "endf8.1"; thickness_variance is the relative variance of
     /// the areal density over the region's pixels, known 0 by default; lattice
-    /// is the PhononSpectrum the nuclei vibrate with, None for the free gas.
+    /// is the PhononSpectrum the nuclei vibrate with, None for the free gas;
+    /// covariances pairs an index into isotopes with that isotope's
+    /// ResonanceCovariance, which the fit's covariance carries.
     #[new]
-    #[pyo3(signature = (isotopes, temperature_k, library="endf8.1", thickness_variance=None, lattice=None))]
+    #[pyo3(signature = (isotopes, temperature_k, library="endf8.1", thickness_variance=None, lattice=None, covariances=Vec::new()))]
     fn new(
         isotopes: Vec<(PyResonanceData, PyValue)>,
         temperature_k: PyValue,
         library: &str,
         thickness_variance: Option<PyValue>,
         lattice: Option<PyPhononSpectrum>,
+        covariances: Vec<(usize, PyResonanceCovariance)>,
     ) -> PyResult<Self> {
         Ok(Self {
             inner: Material {
@@ -3173,9 +3255,29 @@ impl PyMaterial {
                 thickness_variance: thickness_variance.map_or(Value::Known(0.0), |v| v.inner),
                 lattice: lattice.map(|spectrum| spectrum.inner),
                 library: parse_library_name(library)?,
-                covariances: Vec::new(),
+                covariances: covariances
+                    .into_iter()
+                    .map(|(index, covariance)| (index, covariance.inner))
+                    .collect(),
             },
         })
+    }
+
+    /// Each isotope index with its ResonanceCovariance.
+    #[getter]
+    fn covariances(&self) -> Vec<(usize, PyResonanceCovariance)> {
+        self.inner
+            .covariances
+            .iter()
+            .map(|(index, inner)| {
+                (
+                    *index,
+                    PyResonanceCovariance {
+                        inner: inner.clone(),
+                    },
+                )
+            })
+            .collect()
     }
 
     /// Each isotope with its areal density in atoms/barn.
@@ -3611,6 +3713,12 @@ impl PyPulse {
         }
     }
 
+    /// Whether a pulse calibration's prior fits the pulse numbers.
+    #[getter]
+    fn has_prior(&self) -> bool {
+        self.inner.prior.is_some()
+    }
+
     /// [alpha0, alpha1], in 1/(microsecond*sqrt(eV)) and 1/microsecond.
     #[getter]
     fn alpha(&self) -> Vec<PyValue> {
@@ -3701,6 +3809,23 @@ impl PyCalibration {
                 pulse: pulse.inner,
             },
         }
+    }
+
+    /// The calibration of an experiment from a pulse calibration file: t0
+    /// and the flight path fitted from the calibrated ones, the fitted pulse
+    /// numbers fitted from theirs under the calibration's prior, and the
+    /// others known.
+    ///
+    /// Raises:
+    ///     ValueError: a file that is not a valid pulse calibration.
+    #[staticmethod]
+    fn from_pulse_calibration_file(path: &str) -> PyResult<Self> {
+        let text = std::fs::read_to_string(path)?;
+        PulseCalibration::from_json(&text)
+            .map(|calibration| Self {
+                inner: calibration.calibration(),
+            })
+            .map_err(counts_error)
     }
 
     /// The timing offset t0 in microseconds.
@@ -4637,6 +4762,8 @@ fn nereids(m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_function(wrap_pyfunction!(energy_to_tof, m)?)?;
     m.add_function(wrap_pyfunction!(load_endf, m)?)?;
     m.add_function(wrap_pyfunction!(load_endf_file, m)?)?;
+    m.add_function(wrap_pyfunction!(load_resonance_covariance, m)?)?;
+    m.add_class::<PyResonanceCovariance>()?;
     m.add_function(wrap_pyfunction!(create_resonance_data, m)?)?;
     m.add_function(wrap_pyfunction!(beer_lambert, m)?)?;
     m.add_function(wrap_pyfunction!(doppler_broaden, m)?)?;
