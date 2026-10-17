@@ -1,0 +1,112 @@
+{
+  "format_version": 3,
+  "pulse_model": "Ikeda–Carpenter pulse with α = α₀√E + α₁ and β = β₀√E + β₁ in 1/µs, E in eV, a storage fraction R constant over the energy span, folded with the proton pulse's triangle of FWHM h",
+  "numbers": [
+    {
+      "name": "alpha0",
+      "unit": "1/(µs·√eV)",
+      "value": 0.4999927878757253,
+      "status": "fitted"
+    },
+    {
+      "name": "alpha1",
+      "unit": "1/µs",
+      "value": 0.9999855621888818,
+      "status": "fitted"
+    },
+    {
+      "name": "beta0",
+      "unit": "1/(µs·√eV)",
+      "value": 0.07999972236359487,
+      "status": "fitted"
+    },
+    {
+      "name": "beta1",
+      "unit": "1/µs",
+      "value": 0.0,
+      "status": "known"
+    },
+    {
+      "name": "r",
+      "unit": "1",
+      "value": 0.19999705900786513,
+      "status": "fitted"
+    },
+    {
+      "name": "fwhm_squared",
+      "unit": "µs²",
+      "value": 0.0,
+      "status": "known"
+    }
+  ],
+  "mean": [
+    0.49999428839970383,
+    0.9999695945777791,
+    0.07999967083334969,
+    0.19999659801887487
+  ],
+  "covariance": [
+    [
+      0.000049038459234112645,
+      -0.00032861432929845533,
+      -1.8942878188741878e-7,
+      -3.6480212319506345e-6
+    ],
+    [
+      -0.00032861432929845533,
+      0.0025941577279905382,
+      4.016237250461986e-6,
+      0.00004708717973101458
+    ],
+    [
+      -1.8942878188741878e-7,
+      4.016237250461986e-6,
+      3.839230524189247e-8,
+      2.2481920434023468e-7
+    ],
+    [
+      -3.6480212319506345e-6,
+      0.00004708717973101458,
+      2.2481920434023468e-7,
+      1.8798212481603188e-6
+    ]
+  ],
+  "rank": 4,
+  "t0_us": 2.999997294656059,
+  "flight_path_m": 24.999999588837916,
+  "energy_span_ev": [
+    1.0,
+    199.99999999999991
+  ],
+  "n_tau": 256,
+  "line_span_ev": [
+    10.0,
+    50.0
+  ],
+  "foil": {
+    "isotopes": [
+      {
+        "isotope": {
+          "z": 73,
+          "a": 181
+        },
+        "density": {
+          "value": 0.002,
+          "sd": 0.00002
+        }
+      }
+    ],
+    "temperature_k": {
+      "value": 300.0,
+      "sd": 10.0
+    },
+    "library": "ENDF/B-VIII.0"
+  },
+  "provenance": {
+    "foil": "foil-a",
+    "open": "open-a",
+    "sample": "sample-a"
+  },
+  "sample_overdispersion": 1.0,
+  "transfer": "unchecked"
+}
