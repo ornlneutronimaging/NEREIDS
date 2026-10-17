@@ -13,19 +13,32 @@ permissions:
 
 jobs:
   slow-tests:
-    name: Slow tests (${{ matrix.os }})
+    name: Slow tests (${{ matrix.os }}, ${{ matrix.shard }})
     runs-on: ${{ matrix.os }}
     strategy:
       fail-fast: false
       matrix:
         os: [ubuntu-latest, macos-latest, windows-latest]
+        shard: [pulse-a, pulse-b, maps, rest]
+        include:
+          - shard: pulse-a
+            filter: "pulse_calibration::a pulse_calibration::two_foils"
+          - shard: pulse-b
+            filter: "pulse_calibration::calibrated pulse_calibration::experiments pulse_calibration::the"
+          - shard: maps
+            filter: "maps::"
+          - shard: rest
+            filter: >-
+              --skip pulse_calibration::a --skip pulse_calibration::two_foils
+              --skip pulse_calibration::calibrated --skip pulse_calibration::experiments
+              --skip pulse_calibration::the --skip maps::
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
       - uses: dtolnay/rust-toolchain@683b588c487a69d01f6c6ddf40f036ff682cc2c8 # master
         with:
           toolchain: "1.96.1" # keep in sync with rust-toolchain.toml
       - uses: Swatinem/rust-cache@f0d9c3887740aee45f6153b24b3a6b815192ec16 # v2
-      - run: cargo test --workspace --exclude nereids-python -- --ignored
+      - run: cargo test --workspace --exclude nereids-python -- --ignored ${{ matrix.filter }}
 
   coverage:
     name: Coverage
