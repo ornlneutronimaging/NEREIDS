@@ -75,14 +75,27 @@ Value.measured(value, sd) build the four kinds. The kind property returns
 "known", "fitted", "within" or "measured"; value, start, lower, upper and sd
 return the matching fields (None where a kind has no such field).
 
+#### PhononSpectrum
+
+PhononSpectrum(step_ev, density) is a crystal's phonon density of states:
+values every step_ev eV from 0, the first 0, quadratic in the energy up to the
+first point and linear between the others, scaled to unit area.
+PhononSpectrum.debye(theta_k, points=1000) is Debye's, 3*w**2/w_D**3 up to
+w_D = k*theta_k. max_ev is the highest phonon energy, and
+effective_temperature_k(temperature_k) the free gas's temperature whose
+broadening has the lattice's variance.
+
 #### Material
 
-Material(isotopes, temperature_k, library="endf8.1", thickness_variance=None)
-takes a list of (ResonanceData, Value) pairs, each density in atoms/barn, a
-temperature Value in K, and the relative variance v of the areal density over
-the region's pixels, known 0 by default: the region transmits
+Material(isotopes, temperature_k, library="endf8.1", thickness_variance=None,
+lattice=None) takes a list of (ResonanceData, Value) pairs, each density in
+atoms/barn, a temperature Value in K, and the relative variance v of the areal
+density over the region's pixels, known 0 by default: the region transmits
 (1 + v*D)**(-1/v), the mean for a Gamma-distributed areal density, D the
-optical depth at the mean density.
+optical depth at the mean density. lattice is the PhononSpectrum the nuclei
+vibrate with: the cross sections are broadened by the harmonic lattice and
+temperature_k is the thermodynamic temperature. None broadens by the free gas,
+for which a solid's temperature is its effective one.
 
 #### Region
 

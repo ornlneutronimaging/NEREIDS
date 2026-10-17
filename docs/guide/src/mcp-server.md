@@ -192,6 +192,10 @@ pixel per frame in both runs, and the `[open-beam, sample]` frames.
 density over the pixels a fit sums, `fit.capture_gammas` the share of the
 sample's captures whose gammas the detector records, and `fit.in_scatter` the
 share of the sample's forward single scatters the detector records.
+`fit.debye_temperature_k` broadens the sample's cross sections by a harmonic
+lattice with Debye's spectrum at that Debye temperature, and makes the fitted
+temperature the thermodynamic one; without it they are broadened by the free
+gas.
 
 density_map and spatial_map fit every patch of a counts cube. They support
 counts_npz/counts and nexus_histogram/nexus with 3D counts. Optional .npz

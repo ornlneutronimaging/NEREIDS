@@ -401,7 +401,7 @@ class TestCountsManifest:
 
     def test_process_single_spectrum_routes_to_fit_counts(self, tmp_path, monkeypatch):
         self._counts_npz(tmp_path)
-        analysis = self._analysis()
+        analysis = self._analysis(debye_temperature_k=240.0)
         analysis["calibration"]["pulse"]["detector_tail"] = [
             0.1,
             {"kind": "fitted", "value": 2.0},
@@ -422,6 +422,8 @@ class TestCountsManifest:
         assert isinstance(calls["measurement"], nereids.Measurement)
         assert isinstance(calls["calibration"], nereids.Calibration)
         assert calls["measurement"].charge_ratio == 1.0
+        lattice = calls["measurement"].regions[0].material.lattice
+        assert lattice.effective_temperature_k(300.0) > 300.0
         assert result["results"]["mode"] == "single_spectrum"
         assert result["results"]["converged"] is True
         assert result["results"]["thickness_variance"] == 0.04

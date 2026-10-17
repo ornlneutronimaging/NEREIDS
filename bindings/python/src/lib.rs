@@ -19,6 +19,7 @@ use nereids_physics::doppler::{self, DopplerParams};
 use nereids_physics::ikeda_carpenter::{
     EnergyLaw, IkedaCarpenter, IkedaCarpenterParams, SynthesisGrid,
 };
+use nereids_physics::lattice_doppler::PhononSpectrum;
 use nereids_physics::resolution::{
     self, ResolutionFunction, ResolutionParams, TabulatedResolution,
 };
@@ -3094,6 +3095,46 @@ impl PyValue {
     }
 }
 
+/// A crystal's phonon density of states in eV: values every step_ev from 0,
+/// the first 0, quadratic in the energy up to the first point and linear
+/// between the others.
+#[pyclass(name = "PhononSpectrum", from_py_object)]
+#[derive(Clone)]
+struct PyPhononSpectrum {
+    inner: PhononSpectrum,
+}
+
+#[pymethods]
+impl PyPhononSpectrum {
+    #[new]
+    fn new(step_ev: f64, density: Vec<f64>) -> PyResult<Self> {
+        PhononSpectrum::new(step_ev, density)
+            .map(|inner| Self { inner })
+            .map_err(|e| pyo3::exceptions::PyValueError::new_err(e.to_string()))
+    }
+
+    /// Debye's spectrum, 3*w**2/w_D**3 up to w_D = k*theta_k, on points values.
+    #[staticmethod]
+    #[pyo3(signature = (theta_k, points=1000))]
+    fn debye(theta_k: f64, points: usize) -> PyResult<Self> {
+        PhononSpectrum::debye(theta_k, points)
+            .map(|inner| Self { inner })
+            .map_err(|e| pyo3::exceptions::PyValueError::new_err(e.to_string()))
+    }
+
+    /// The highest phonon energy in eV.
+    #[getter]
+    fn max_ev(&self) -> f64 {
+        self.inner.max_ev()
+    }
+
+    /// The free gas's temperature whose broadening has the lattice's variance
+    /// at temperature_k.
+    fn effective_temperature_k(&self, temperature_k: f64) -> f64 {
+        self.inner.effective_temperature_k(temperature_k)
+    }
+}
+
 /// A material's isotopes, each with an areal density in atoms/barn, and its
 /// temperature in K.
 #[pyclass(name = "Material", from_py_object)]
@@ -3106,14 +3147,16 @@ struct PyMaterial {
 impl PyMaterial {
     /// library names the ENDF library the isotopes' resonance data were read
     /// from, e.g. "endf8.1"; thickness_variance is the relative variance of
-    /// the areal density over the region's pixels, known 0 by default.
+    /// the areal density over the region's pixels, known 0 by default; lattice
+    /// is the PhononSpectrum the nuclei vibrate with, None for the free gas.
     #[new]
-    #[pyo3(signature = (isotopes, temperature_k, library="endf8.1", thickness_variance=None))]
+    #[pyo3(signature = (isotopes, temperature_k, library="endf8.1", thickness_variance=None, lattice=None))]
     fn new(
         isotopes: Vec<(PyResonanceData, PyValue)>,
         temperature_k: PyValue,
         library: &str,
         thickness_variance: Option<PyValue>,
+        lattice: Option<PyPhononSpectrum>,
     ) -> PyResult<Self> {
         Ok(Self {
             inner: Material {
@@ -3123,6 +3166,7 @@ impl PyMaterial {
                     .collect(),
                 temperature_k: temperature_k.inner,
                 thickness_variance: thickness_variance.map_or(Value::Known(0.0), |v| v.inner),
+                lattice: lattice.map(|spectrum| spectrum.inner),
                 library: parse_library_name(library)?,
                 covariances: Vec::new(),
             },
@@ -3152,6 +3196,15 @@ impl PyMaterial {
         PyValue {
             inner: self.inner.thickness_variance,
         }
+    }
+
+    /// The phonon spectrum the nuclei vibrate with, or None for the free gas.
+    #[getter]
+    fn lattice(&self) -> Option<PyPhononSpectrum> {
+        self.inner
+            .lattice
+            .clone()
+            .map(|inner| PyPhononSpectrum { inner })
     }
 
     /// The temperature in K.
@@ -4546,6 +4599,7 @@ fn nereids(m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_class::<PyRunLog>()?;
     m.add_class::<PyBankSpectrum>()?;
     m.add_class::<PyValue>()?;
+    m.add_class::<PyPhononSpectrum>()?;
     m.add_class::<PyMaterial>()?;
     m.add_class::<PyRegion>()?;
     m.add_class::<PyRoomBackground>()?;
