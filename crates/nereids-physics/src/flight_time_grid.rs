@@ -391,6 +391,24 @@ impl FlightTimeGrid {
         })
     }
 
+    /// The derivatives of [`Self::rows_at`]'s probabilities with respect to
+    /// the detector tail's `f` and `τ_D`, with the same step:
+    /// [`IkedaCarpenterParams::bin_tail_slopes_at`] for every point.
+    ///
+    /// # Errors
+    /// As [`Self::rows_at`], and [`FlightTimeGridError::Pulse`] for a pulse
+    /// without a detector tail.
+    pub fn tail_slopes_at(
+        &self,
+        t0_us: f64,
+        flight_path_m: f64,
+        params: &IkedaCarpenterParams,
+    ) -> Result<[Rows; 2], FlightTimeGridError> {
+        self.rows_with(t0_us, flight_path_m, |energy, arrival| {
+            params.bin_tail_slopes_at(energy, arrival, &self.time_edges_us)
+        })
+    }
+
     fn rows_with<const N: usize>(
         &self,
         t0_us: f64,

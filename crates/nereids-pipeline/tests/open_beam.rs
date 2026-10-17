@@ -41,6 +41,7 @@ fn pulse(
                 r,
                 burst_sigma_us,
                 channel_fwhm_us,
+                detector_tail: None,
             },
             FLIGHT_PATH_M,
             &SynthesisGrid {
@@ -179,6 +180,7 @@ fn known(pulse: &IkedaCarpenter) -> Pulse {
         r: Value::Known(coefficients(&params.r)[1]),
         fwhm_squared_us2: Value::Known(params.channel_fwhm_us.unwrap_or(0.0).powi(2)),
         r_high: None,
+        detector_tail: None,
         energy_span_ev: detector.energy_span_ev(),
         n_tau: detector.n_tau(),
         line_span_ev: None,

@@ -268,6 +268,9 @@ pub struct CountsFit {
     pub fwhm_squared_us2: f64,
     /// The pulse's `R_high`, the known or the fitted one; `None` without one.
     pub r_high: Option<f64>,
+    /// The detector tail's `[f, τ_D]`, each the known or the fitted one;
+    /// `None` without one.
+    pub detector_tail: Option<[f64; 2]>,
     /// The time background's `[C, A, τ]`, each the known or the fitted one; a
     /// fitted `τ` is undetermined when `A` ends at 0.
     pub time_background: [f64; 3],
@@ -285,7 +288,7 @@ pub struct CountsFit {
     /// region by region; the time background's `C`, `A` and `τ`; the room
     /// background's `ρ`; the spread's `h`; `t0`; the
     /// flight path; `α₀`, `α₁`,
-    /// `β₀`, `β₁`, `R`, `h²` and `R_high`: the inverse of the information at the fit, each run's expected information over its
+    /// `β₀`, `β₁`, `R`, `h²`, `R_high`, `f` and `τ_D`: the inverse of the information at the fit, each run's expected information over its
     /// overdispersion plus `1/sd²` for each measured quantity and `C⁻¹` over
     /// the pulse numbers a calibration's
     /// [`Pulse::prior`](crate::open_beam::Pulse::prior) covers.  The row and
@@ -942,6 +945,9 @@ pub(crate) fn excluded_bins(
             + TOF_FACTOR * numbers[1] / energy.sqrt()
             + 3.0 / laws.alpha.eval(energy)
             + laws.r.eval(energy) / laws.beta.eval(energy)
+            + laws
+                .detector_tail
+                .map_or(0.0, |tail| tail.fraction * tail.decay_us)
     };
     let spans: Vec<(f64, f64)> = material
         .into_iter()
@@ -1724,6 +1730,10 @@ pub(crate) fn fit_counts_answer(
         r: params[layout.pulse + 4],
         fwhm_squared_us2: params[layout.pulse + 5],
         r_high: calibration.pulse.r_high.map(|_| params[layout.pulse + 6]),
+        detector_tail: calibration
+            .pulse
+            .detector_tail
+            .map(|_| [params[layout.pulse + 7], params[layout.pulse + 8]]),
         time_background: [0, 1, 2].map(|i| params[layout.time_background + i]),
         room_background: params[layout.room_background],
         spread_share: params[layout.spread],
@@ -1969,7 +1979,7 @@ struct Profile {
 
 pub(crate) const BACKGROUND_TERMS: [&str; 5] = ["b0", "b1", "b2", "d", "f"];
 
-pub(crate) const SHARED: [Role; 14] = [
+pub(crate) const SHARED: [Role; 16] = [
     Role::Normalization,
     Role::TimeBackground(0),
     Role::TimeBackground(1),
@@ -1984,6 +1994,8 @@ pub(crate) const SHARED: [Role; 14] = [
     Role::Pulse(4),
     Role::Pulse(5),
     Role::Pulse(6),
+    Role::Pulse(7),
+    Role::Pulse(8),
 ];
 
 pub(crate) fn shared_parameters(
@@ -2106,7 +2118,7 @@ fn roles(beams: &[usize], isotopes: &[Option<usize>]) -> Vec<Role> {
             Role::T0,
             Role::FlightPath,
         ])
-        .chain((0..7).map(Role::Pulse))
+        .chain((0..9).map(Role::Pulse))
         .collect()
 }
 
@@ -2955,6 +2967,7 @@ impl FitModel for RegionsModel {
         };
         let mut arrival: Option<Rows> = None;
         let mut pulse_slopes: Option<[Rows; 4]> = None;
+        let mut tail_slopes: Option<[Rows; 2]> = None;
         let ones = vec![1.0; self.energies.len()];
         let root_energy = &self.shapes[2];
         let constant = || [ones.clone(), vec![0.0; ones.len()]];
@@ -2966,7 +2979,7 @@ impl FitModel for RegionsModel {
                 .collect();
             [share.iter().map(|s| 1.0 - s).collect(), share]
         });
-        let pulse_columns: [(usize, &[f64]); 7] = [
+        let pulse_columns: [(usize, &[f64]); 9] = [
             (0, root_energy),
             (0, &ones),
             (1, root_energy),
@@ -2974,6 +2987,8 @@ impl FitModel for RegionsModel {
             (2, &low),
             (3, &ones),
             (2, &high),
+            (4, &ones),
+            (5, &ones),
         ];
         let (background, background_slopes) = self.time_background(params);
         let scaled = |factor: f64, values: &[f64]| -> Vec<f64> {
@@ -3165,15 +3180,26 @@ impl FitModel for RegionsModel {
                         .collect()
                 }
                 Role::Pulse(number) => {
-                    if pulse_slopes.is_none() {
-                        pulse_slopes = Some(
-                            self.grid
-                                .pulse_slopes_at(t0_us, flight_path_m, &scale.pulse)
-                                .ok()?,
-                        );
-                    }
                     let (law, weight) = pulse_columns[number];
-                    let rows = &pulse_slopes.as_ref()?[law];
+                    let rows = if law < 4 {
+                        if pulse_slopes.is_none() {
+                            pulse_slopes = Some(
+                                self.grid
+                                    .pulse_slopes_at(t0_us, flight_path_m, &scale.pulse)
+                                    .ok()?,
+                            );
+                        }
+                        &pulse_slopes.as_ref()?[law]
+                    } else {
+                        if tail_slopes.is_none() {
+                            tail_slopes = Some(
+                                self.grid
+                                    .tail_slopes_at(t0_us, flight_path_m, &scale.pulse)
+                                    .ok()?,
+                            );
+                        }
+                        &tail_slopes.as_ref()?[law - 4]
+                    };
                     (0..regions)
                         .flat_map(|r| {
                             [
@@ -3318,7 +3344,7 @@ mod tests {
                 Role::SpreadShare => 0.5,
                 Role::T0 => T0_US,
                 Role::FlightPath => FLIGHT_PATH_M,
-                Role::Pulse(n) => [0.37, 0.06, 0.01, 0.24, 0.16, 0.3, 0.0][n],
+                Role::Pulse(n) => [0.37, 0.06, 0.01, 0.24, 0.16, 0.3, 0.0, 0.0, 1.0][n],
                 _ => 0.0,
             })
             .collect();
@@ -3372,7 +3398,7 @@ mod tests {
                 Role::SpreadShare => 0.15,
                 Role::T0 => T0_US + 0.05,
                 Role::FlightPath => FLIGHT_PATH_M + 0.003,
-                Role::Pulse(n) => [0.37, 0.06, 0.01, 0.24, 0.16, 0.3, 0.0][n],
+                Role::Pulse(n) => [0.37, 0.06, 0.01, 0.24, 0.16, 0.3, 0.0, 0.0, 1.0][n],
             })
             .collect();
         let data = synthetic_isotope(72, 180, 20.0, 0.01, 0.06);
@@ -3458,7 +3484,7 @@ mod tests {
                 Role::SpreadShare => 0.15,
                 Role::T0 => T0_US + 0.05,
                 Role::FlightPath => FLIGHT_PATH_M + 0.003,
-                Role::Pulse(n) => [0.37, 0.06, 0.01, 0.24, 0.16, 0.3, 0.25][n],
+                Role::Pulse(n) => [0.37, 0.06, 0.01, 0.24, 0.16, 0.3, 0.25, 0.1, 1.5][n],
             })
             .collect();
         let model = RegionsModel::new(
@@ -3571,7 +3597,7 @@ mod tests {
                 Role::RoomBackground => 0.0,
                 Role::T0 => T0_US,
                 Role::FlightPath => FLIGHT_PATH_M,
-                Role::Pulse(n) => [0.35, 0.05, 0.0, 0.25, 0.15, 0.0, 0.0][n],
+                Role::Pulse(n) => [0.35, 0.05, 0.0, 0.25, 0.15, 0.0, 0.0, 0.0, 1.0][n],
             })
             .collect();
         let model = RegionsModel::new(&grid, &beams, &isotopes, (1.2, [0.0; 2]), T0_US, &layout);
@@ -3634,6 +3660,7 @@ mod tests {
                 r: Value::Known(0.15),
                 fwhm_squared_us2: Value::Known(0.0),
                 r_high: None,
+                detector_tail: None,
                 energy_span_ev: (1.0, 200.0),
                 n_tau: 256,
                 line_span_ev: None,
@@ -3825,7 +3852,7 @@ mod tests {
                 Role::RoomBackground => 0.0,
                 Role::T0 => T0_US,
                 Role::FlightPath => FLIGHT_PATH_M,
-                Role::Pulse(n) => [0.35, 0.05, 0.0, 0.25, 0.15, 0.0, 0.0][n],
+                Role::Pulse(n) => [0.35, 0.05, 0.0, 0.25, 0.15, 0.0, 0.0, 0.0, 1.0][n],
             })
             .collect();
         let counts: Vec<f64> =
@@ -3892,6 +3919,7 @@ mod tests {
                 r: Value::Known(0.15),
                 fwhm_squared_us2: Value::Known(0.0),
                 r_high: None,
+                detector_tail: None,
                 energy_span_ev: (1.0, 200.0),
                 n_tau: 256,
                 line_span_ev: None,
@@ -4047,7 +4075,7 @@ mod tests {
                 .chain(background)
                 .chain([1.0, 0.0, 0.0, 0.0, 0.0, 1.0, 0.0, 0.0])
                 .chain([T0_US, FLIGHT_PATH_M])
-                .chain([0.35, 0.05, 0.0, 0.25, 0.15, 0.0, 0.0])
+                .chain([0.35, 0.05, 0.0, 0.25, 0.15, 0.0, 0.0, 0.0, 1.0])
                 .collect();
             model.evaluate(&params).expect("counts")
         };
@@ -4078,7 +4106,7 @@ mod tests {
     #[test]
     fn an_isotope_known_to_be_absent_leaves_no_window() {
         let edges: Vec<f64> = (380..=530).map(f64::from).collect();
-        let numbers = [3.0, 25.0, 0.5, 1.0, 0.08, 0.0, 0.2, 0.0, 0.0];
+        let numbers = [3.0, 25.0, 0.5, 1.0, 0.08, 0.0, 0.2, 0.0, 0.0, 0.0, 1.0];
         let bins = |density| {
             let material = Material {
                 covariances: Vec::new(),

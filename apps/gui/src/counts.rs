@@ -157,6 +157,7 @@ fn calibration(request: &FitRequest) -> Calibration {
             r: Value::Known(p.r),
             fwhm_squared_us2: Value::Known(p.fwhm_us * p.fwhm_us),
             r_high: None,
+            detector_tail: None,
             energy_span_ev: request.energy_span_ev,
             n_tau: 8,
             line_span_ev: None,

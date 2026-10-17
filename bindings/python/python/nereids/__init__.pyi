@@ -1195,9 +1195,10 @@ class Pulse:
     """The Ikeda-Carpenter pulse: alpha = alpha0*sqrt(E) + alpha1 and
     beta = beta0*sqrt(E) + beta1 in 1/microsecond, a storage fraction
     R over energy_span_ev (eV), or linear in sqrt(E) from R at its low end to
-    r_high at its high end, and
-    triangle FWHM h with fwhm_squared_us2 equal to h^2 in microseconds
-    squared."""
+    r_high at its high end, triangle FWHM h with fwhm_squared_us2 equal to h^2
+    in microseconds squared, and an optional detector tail (f, tau_D): the detector records a
+    fraction f of the counts late by an exponential delay of mean tau_D
+    microseconds."""
 
     def __init__(
         self,
@@ -1211,6 +1212,7 @@ class Pulse:
         n_tau: int = 600,
         line_span_ev: tuple[float, float] | None = None,
         r_high: Value | None = None,
+        detector_tail: tuple[Value, Value] | None = None,
     ) -> None: ...
     @property
     def alpha(self) -> list[Value]: ...
@@ -1222,6 +1224,8 @@ class Pulse:
     def fwhm_squared_us2(self) -> Value: ...
     @property
     def r_high(self) -> Value | None: ...
+    @property
+    def detector_tail(self) -> tuple[Value, Value] | None: ...
     @property
     def energy_span_ev(self) -> tuple[float, float]: ...
     @property
@@ -1290,6 +1294,8 @@ class CountsFit:
     def fwhm_squared_us2(self) -> float: ...
     @property
     def r_high(self) -> float | None: ...
+    @property
+    def detector_tail(self) -> tuple[float, float] | None: ...
     @property
     def time_background(self) -> list[float]: ...
     @property
@@ -1424,6 +1430,8 @@ class CountsMap:
     def fwhm_squared_us2(self) -> float: ...
     @property
     def r_high(self) -> float | None: ...
+    @property
+    def detector_tail(self) -> tuple[float, float] | None: ...
     @property
     def shared(self) -> list[str]: ...
     @property

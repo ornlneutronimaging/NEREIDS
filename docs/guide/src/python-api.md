@@ -119,13 +119,15 @@ sum(w*exp(-r/s)/(2*pi*s**2)) on a grid of (rows, columns) cells.
 #### Pulse
 
 Pulse(alpha0, alpha1, beta0, beta1, r, fwhm_squared_us2, energy_span_ev,
-n_tau=600, line_span_ev=None, r_high=None): the Ikeda-Carpenter laws
+n_tau=600, line_span_ev=None, r_high=None, detector_tail=None): the Ikeda-Carpenter laws
 alpha = alpha0*sqrt(E) + alpha1 and beta = beta0*sqrt(E) + beta1 in
 1/microsecond, the storage fraction R over energy_span_ev (eV), or linear in
 sqrt(E) from R at its low end to r_high at its high end when r_high is given,
 and the proton triangle with fwhm_squared_us2 equal
-to h^2 in microseconds squared. Each parameter is a Value so it can be held or
-fitted.
+to h^2 in microseconds squared. detector_tail is (f, tau_D): the detector
+records a fraction f of the counts late by an exponential delay of mean tau_D
+microseconds; None records none late. Each parameter is a Value so it can be
+held or fitted.
 
 #### Calibration
 
@@ -141,8 +143,8 @@ and predicted_sample the counts per bin the fit predicts, overdispersion the
 sample bins the material's library leaves out.
 
 CountsFit.regions holds one RegionFit per region. normalization, t0_us,
-flight_path_m, alpha, beta, r, fwhm_squared_us2, r_high (None without one),
-time_background and
+flight_path_m, alpha, beta, r, fwhm_squared_us2, r_high and detector_tail (each
+None without one), time_background and
 room_background are the shared fitted values; covariance is the fitted-quantity covariance (None when
 the fit did not converge), unbounded_mean and unbounded_covariance the same
 Gaussian without the bounds, on_bound the bounds flags, deviance the half
@@ -164,7 +166,7 @@ is that of every sample patch, known 1 by default, and the empty pixels take 1.
 CountsMap exposes the per-patch fits (fits, failed, empty), density maps
 densities and density_sd in atoms/barn, temperature_k and temperature_sd_k in
 K, the two overdispersion maps, trusted, and the shared normalization,
-time_background, room_background, t0_us, flight_path_m, alpha, beta, r, fwhm_squared_us2, r_high, shared, shared_covariance,
+time_background, room_background, t0_us, flight_path_m, alpha, beta, r, fwhm_squared_us2, r_high, detector_tail, shared, shared_covariance,
 deviance and converged. n_fitted counts the fitted patches.
 
 trusted records numerical convergence and uncertainty status only: fitted

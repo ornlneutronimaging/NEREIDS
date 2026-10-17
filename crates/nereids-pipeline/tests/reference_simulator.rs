@@ -40,6 +40,7 @@ fn ikeda_carpenter() -> ResolutionFunction {
                 r: EnergyLaw::Const(IC_R),
                 burst_sigma_us: None,
                 channel_fwhm_us: None,
+                detector_tail: None,
             },
             FLIGHT_PATH_M,
             &SynthesisGrid {

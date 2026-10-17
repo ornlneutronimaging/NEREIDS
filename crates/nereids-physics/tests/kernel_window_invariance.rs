@@ -59,6 +59,7 @@ fn ikeda_carpenter(beta: f64, e_lo: f64, e_hi: f64) -> ResolutionFunction {
         r: EnergyLaw::Const(0.15),
         burst_sigma_us: None,
         channel_fwhm_us: Some(0.35),
+        detector_tail: None,
     };
     // References bracket the window so every data energy lies between two.
     ResolutionFunction::IkedaCarpenter(std::sync::Arc::new(
