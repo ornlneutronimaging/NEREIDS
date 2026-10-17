@@ -185,7 +185,7 @@ pub struct CountsMap<'a> {
     /// Each isotope's areal density in atoms/barn, in the material's order:
     /// the known one, or the fitted one; NaN where the patch has no fit.
     pub densities: Vec<Array2<f64>>,
-    /// Standard deviation of each density, from [`Self::covariance`]; NaN
+    /// Standard deviation of each density, from [`PatchCovariances::covariance`]; NaN
     /// where the density is known, held on a bound or not determined by the
     /// counts, alone or through a shared quantity, where the patch has no fit,
     /// or where the map did not converge.

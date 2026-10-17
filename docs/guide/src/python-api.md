@@ -193,7 +193,8 @@ that patch's covariance of them, the shared quantities' uncertainty included,
 and sensitivity((row, column)) their change per unit change of each shared
 quantity. cross_covariance(a, b) is the covariance of patch a's quantities
 with patch b's that the shared quantities carry. Each returns None where a
-patch has no fit or the map has no shared covariance.
+patch has no fit; covariance and cross_covariance also return None where the
+map has no shared covariance.
 
 trusted records numerical convergence and uncertainty status only: fitted
 densities and temperature must have finite standard deviations, except that
