@@ -353,9 +353,9 @@ pub fn parse_endf_file2(endf_text: &str) -> Result<ResonanceData, EndfParseError
     // Fail loudly when the evaluation carries NO evaluable content. A file
     // whose every range is a parse-and-skip placeholder (LRF=7, LRU=2, or an
     // LRU=0 scattering-radius-only stanza) would otherwise "load" with zero
-    // resonances, return zero cross-sections everywhere, and produce
-    // transmission ≡ 1 with no signal to the caller. Files with at least one
-    // evaluable range still load: parse-and-skip exists for real mixed tapes
+    // resonances and add no resonance cross section anywhere, with no signal
+    // to the caller. Files with at least one evaluable range still load:
+    // parse-and-skip exists for real mixed tapes
     // (e.g. Ta-181, U-238, Pu-240) whose resolved ranges remain fully usable.
     if !data.has_evaluable_range() {
         let detail = if data.ranges.is_empty() {
@@ -369,8 +369,8 @@ pub fn parse_endf_file2(endf_text: &str) -> Result<ResonanceData, EndfParseError
         };
         return Err(EndfParseError::UnsupportedFormat(format!(
             "No evaluable resonance ranges: NEREIDS evaluates resolved LRF=1/2/3 \
-             (SLBW/MLBW/Reich-Moore) only, and {detail}. Cross-sections would be \
-             identically zero (transmission = 1) over the full energy grid."
+             (SLBW/MLBW/Reich-Moore) only, and {detail}. No resonance would \
+             contribute a cross section anywhere on the energy grid."
         )));
     }
 

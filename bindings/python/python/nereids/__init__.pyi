@@ -130,9 +130,9 @@ class ResonanceData:
         """Whether the evaluation carries parsed-but-not-evaluated ranges.
 
         True when any range is a parse-and-skip placeholder (LRF=7 R-Matrix
-        Limited, LRU=2 URR, or LRU=0 scattering-radius-only). Those spans
-        contribute zero cross-section; a ``UserWarning`` listing them is
-        emitted at load time by :func:`load_endf` / :func:`load_endf_file`.
+        Limited, LRU=2 URR, or LRU=0 scattering-radius-only). Their
+        resonances contribute no cross section; a ``UserWarning`` listing them
+        is emitted at load time by :func:`load_endf` / :func:`load_endf_file`.
         """
         ...
 
