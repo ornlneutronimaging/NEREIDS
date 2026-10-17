@@ -545,7 +545,10 @@ fn extract_endf_from_zip(zip_bytes: &[u8]) -> Result<String, EndfRetrievalError>
         let mut file = archive
             .by_index(i)
             .map_err(|e| EndfRetrievalError::Parse(format!("Failed to read ZIP entry: {}", e)))?;
-        let name = file.name().to_lowercase();
+        let name = file
+            .name()
+            .map_err(|e| EndfRetrievalError::Parse(format!("Failed to read ZIP entry: {}", e)))?
+            .to_lowercase();
         if name.ends_with(".endf") || name.ends_with(".dat") || name.ends_with(".txt") {
             let mut contents = String::new();
             file.read_to_string(&mut contents).map_err(|e| {
