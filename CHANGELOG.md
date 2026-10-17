@@ -47,6 +47,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
   the default, records every count at its arrival. `fit_counts` and `fit_map`
   can fit both; results report `detector_tail`. A pulse calibration refuses a
   tail.
+- A counts-fit `Material` gains `lattice`, a `PhononSpectrum`: its cross
+  sections are broadened by the harmonic lattice and its temperature is the
+  thermodynamic one. Python gains `PhononSpectrum` and `Material(lattice=...)`;
+  MCP fits accept `fit.debye_temperature_k`. A pulse calibration refuses a
+  lattice.
 - `lattice_doppler::broaden_in_lattice` Doppler-broadens a cross section by
   nuclei bound in a harmonic crystal (Lamb's model, as SAMMY's crystal-lattice
   model), from a `PhononSpectrum` (tabulated, or Debye) at the thermodynamic
