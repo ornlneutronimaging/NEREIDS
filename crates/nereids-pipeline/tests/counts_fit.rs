@@ -910,7 +910,9 @@ fn a_map_recovers_each_patch_and_its_covariance_between_patches_is_the_shared_qu
         .map(|j| result.fits[[0, j]].as_ref().expect("a fit"))
         .collect();
     for (j, &(densities, t, _, _)) in truths.iter().enumerate() {
-        let patch = result.covariance[[0, j]].as_ref().expect("covariance");
+        let patch = result.covariances.covariance[[0, j]]
+            .as_ref()
+            .expect("covariance");
         let sd = |q: usize| patch.get(q, q).sqrt().to_bits();
         for (m, n) in densities.into_iter().enumerate() {
             let (density, error) = (result.densities[m][[0, j]], result.density_sd[m][[0, j]]);
@@ -1064,6 +1066,7 @@ fn a_map_recovers_each_patch_and_its_covariance_between_patches_is_the_shared_qu
     assert!(gaps.iter().all(|g| g.abs() <= 0.01), "{gaps:?}");
     assert!(ratios.iter().all(|r| (r - 1.0).abs() <= 1e-3), "{ratios:?}");
     let cross = result
+        .covariances
         .cross_covariance((0, 0), (0, 1))
         .expect("cross covariance");
     for (a, b) in [(0, 0), (1, 0), (2, 2), (0, 2)] {
@@ -1222,7 +1225,9 @@ fn a_map_fits_the_time_background_its_patches_share_as_the_joint_fit_does() {
         pulls
             .push((result.temperature_k[[0, j]] - TEMPERATURE_K) / result.temperature_sd_k[[0, j]]);
         let fit = result.fits[[0, j]].as_ref().expect("a fit");
-        let covariance = result.covariance[[0, j]].as_ref().expect("covariance");
+        let covariance = result.covariances.covariance[[0, j]]
+            .as_ref()
+            .expect("covariance");
         pulls.push((fit.gamma_transmission - gamma) / covariance.get(2, 2).sqrt());
     }
     assert!(pulls.iter().all(|p| p.abs() <= BOUND.sqrt()), "{pulls:?}");
@@ -5558,7 +5563,9 @@ mod maps {
         let shared = result.shared_covariance.as_ref().expect("covariance");
         assert!(shared.get(0, 0).is_nan());
         for patch in [[0, 0], [0, 1]] {
-            let covariance = result.covariance[patch].as_ref().expect("covariance");
+            let covariance = result.covariances.covariance[patch]
+                .as_ref()
+                .expect("covariance");
             assert!(covariance.get(0, 0).is_nan(), "{covariance:?}");
         }
     }
