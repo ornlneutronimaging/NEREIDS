@@ -116,6 +116,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
 
 ### Fixed
 
+- The SAMMY reader divides card 2's atomic weight and each isotopic mass,
+  given in amu, by the neutron mass; reads a card 5 that gives only the
+  temperature; and reads a TZERO line's `t0`, `L0` and flight path into
+  `SammyParFile::tzero`. Six SAMMY cases now agree to print precision, and
+  tr122 moves from 4.1% to 1.8%.
 - The Gaussian resolution with an exponential tail keeps its whole tail. The
   kernel lost its tail more than 5.01 Gaussian widths from its peak (60% of
   its area at `C = 0.05`), and `exerfc` lost its `exp(x^2)` factor below

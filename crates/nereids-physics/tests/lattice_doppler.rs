@@ -263,9 +263,9 @@ fn a_resonance_broadened_in_the_lattice_matches_sammy_s_crystal_lattice_model() 
     let dir = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../../tests/data/sammy-clm");
     let read = |name: &str| std::fs::read_to_string(dir.join(name)).expect(name);
     let inp = parse_sammy_inp(&read("clm.inp")).expect("inp");
-    let mut data = sammy_to_resonance_data(&inp, &parse_sammy_par(&read("u238.par")).expect("par"))
+    assert_eq!(inp.temperature_k, 293.16);
+    let data = sammy_to_resonance_data(&inp, &parse_sammy_par(&read("u238.par")).expect("par"))
         .expect("resonances");
-    data.awr = inp.awr / 1.008_664_915_78;
     let spectrum_file = read("taper.clm");
     let mut lines = spectrum_file
         .lines()
@@ -298,8 +298,14 @@ fn a_resonance_broadened_in_the_lattice_matches_sammy_s_crystal_lattice_model() 
         })
         .collect();
     let energies: Vec<f64> = answers.iter().map(|a| a[0]).collect();
-    let ours =
-        broaden_in_lattice(&energies, &data, 293.16, &spectrum, Channel::Total).expect("broadened");
+    let ours = broaden_in_lattice(
+        &energies,
+        &data,
+        inp.temperature_k,
+        &spectrum,
+        Channel::Total,
+    )
+    .expect("broadened");
     let plan = CrossSectionPlan::new(&data);
     for (k, &[energy, lattice, bare]) in answers.iter().enumerate() {
         let broadened = ours.values[k] / lattice - 1.0;
