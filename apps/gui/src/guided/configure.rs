@@ -585,7 +585,7 @@ fn mark_isotope_pending(state: &mut AppState, z: u32, a: u32) {
 
 /// Render the offline-fallback hint that lists the exact cache-file path for
 /// every Failed isotope under the active library, so users can `cp` a
-/// manually-downloaded ENDF straight into place (). Paths come from
+/// manually-downloaded ENDF straight into place. Paths come from
 /// the free `default_cache_file_path` helper to avoid the per-frame
 /// `EndfRetriever::new()` cost that would otherwise build a reqwest client +
 /// TLS context just to read the cache layout.
@@ -647,7 +647,7 @@ fn install_local_endf_dialog(state: &mut AppState) {
     );
 }
 
-/// Manual ENDF upload escape hatch (): install a local
+/// Manual ENDF upload: install a local
 /// `.endf`/`.zip` into the cache for whichever already-added isotope it
 /// describes. The retriever's `peek_local_endf` reads, extracts, and
 /// parses the file exactly once to discover its (Z, A); we then look

@@ -96,6 +96,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
 
 ### Fixed
 
+- The Gaussian resolution with an exponential tail keeps its whole tail. The
+  kernel lost its tail more than 5.01 Gaussian widths from its peak (60% of
+  its area at `C = 0.05`), and `exerfc` lost its `exp(x^2)` factor below
+  `x = -5.01`.
 - An SLBW or MLBW range with a competitive width (LRX=1) is parsed but not
   evaluated, like an LRF=7 range: the width's energy dependence needs the l of
   the exit channel, which ENDF does not give. It was evaluated with the
