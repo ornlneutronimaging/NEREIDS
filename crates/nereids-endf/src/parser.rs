@@ -685,7 +685,8 @@ fn parse_bw_range(
                 gg: values[base + 4],  // GG (gamma width)
                 gfa: values[base + 5], // GF (fission width)
                 gfb: 0.0,              // Not used in BW
-                                       // Note: values[base+2] is GT (total width) — derived, not stored
+                                       // GT (values[base+2]) is not stored: with LRX = 0 it is
+                                       // GN + GG + GF, and a range with LRX ≠ 0 is not evaluated.
             });
         }
 
@@ -2379,6 +2380,28 @@ mod tests {
                 .contains("LRF=2 (MLBW) resolved range with no resonances"),
             "skip_description must name the inert shape, got: {}",
             inert.skip_description()
+        );
+    }
+
+    /// An MLBW range with a competitive width (LRX=1) loads but is not
+    /// evaluated; the range before it still is.
+    #[test]
+    fn test_mlbw_lrx1_range_is_parsed_but_not_evaluated() {
+        const ENDF: &str =
+            include_str!("../../../tests/data/synthetic/mlbw_lrx1_plus_resolved_mixed.endf");
+
+        let data = parse_endf_file2(ENDF).expect("the LRX=0 range keeps the file loadable");
+        assert_eq!(data.ranges.len(), 2);
+        let competitive = &data.ranges[1].l_groups[0];
+        assert_eq!((competitive.lrx, competitive.qx), (1, -4.49e4));
+        assert!(data.ranges[0].is_evaluable());
+        assert_eq!(data.unevaluated_ranges().len(), 1);
+        assert!(
+            data.ranges[1]
+                .skip_description()
+                .contains("LRF=2 (MLBW) resolved range with a competitive width (LRX=1)"),
+            "got: {}",
+            data.ranges[1].skip_description()
         );
     }
 

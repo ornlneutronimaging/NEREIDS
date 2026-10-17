@@ -260,7 +260,7 @@ fn warn_unevaluated_ranges(py: Python<'_>, data: &ResonanceData, origin: &str) -
     let msg = format!(
         "{origin}: {} of {} resonance range(s) are parsed but NOT evaluated: {}. \
          These spans contribute zero cross-section (transmission = 1); NEREIDS \
-         evaluates resolved LRF=1/2/3 ranges only.",
+         evaluates resolved LRF=1/2/3 ranges without a competitive width only.",
         skipped.len(),
         data.ranges.len(),
         spans.join("; ")

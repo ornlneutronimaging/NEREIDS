@@ -219,7 +219,8 @@ names include `endf8.0`, `endf8.1`, `jeff3.3`, `jendl5`, `tendl2023`, and
 afterwards. `load_endf_file(...)` parses a local ENDF file and does not
 download data.
 
-Both loaders evaluate resolved LRF=1/2/3 ranges only. A file with **no**
+Both loaders evaluate resolved LRF=1/2/3 ranges only, and LRF=1/2 ranges only
+without a competitive width (LRX=0). A file with **no**
 evaluable range (for example a pure LRF=7 evaluation such as W-182) raises
 `ValueError` — loading it would yield zero cross-section everywhere. A mixed
 evaluation loads, emits a `UserWarning` naming the skipped spans, and flags
