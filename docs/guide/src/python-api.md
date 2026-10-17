@@ -99,6 +99,14 @@ for which a solid's temperature is its effective one. covariances pairs an
 index into isotopes with that isotope's ResonanceCovariance, which the fit's
 covariance carries.
 
+#### ResonanceCovariance
+
+ResonanceCovariance holds the covariance of the energy, neutron width and
+capture width, in that order, of each listed resonance of one evaluation.
+resonances lists them as (range, L-group, resonance) indices into the
+ResonanceData it was read with, and covariance is the matrix over the
+3 * len(resonances) parameters, in eV**2.
+
 load_resonance_covariance(data, window_ev, path=None, library="endf8.1",
 mat=None) reads the File 32 covariance of the energy, neutron width and
 capture width of data's Reich-Moore resonances between window_ev = (low, high)

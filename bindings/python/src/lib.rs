@@ -3166,13 +3166,9 @@ impl PyResonanceCovariance {
     #[getter]
     fn covariance<'py>(&self, py: Python<'py>) -> Bound<'py, PyArray2<f64>> {
         let n = 3 * self.inner.resonances.len();
-        let rows: Vec<Vec<f64>> = self
-            .inner
-            .covariance
-            .chunks(n)
-            .map(<[f64]>::to_vec)
-            .collect();
-        PyArray2::from_vec2(py, &rows).expect("the covariance is square")
+        let matrix = ndarray::Array2::from_shape_vec((n, n), self.inner.covariance.to_vec())
+            .expect("the covariance is square");
+        PyArray2::from_owned_array(py, matrix)
     }
 
     fn __repr__(&self) -> String {
