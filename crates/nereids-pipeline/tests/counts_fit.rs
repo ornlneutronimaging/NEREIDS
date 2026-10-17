@@ -3472,7 +3472,7 @@ fn the_grid_is_refined_when_the_fitted_temperature_narrows_the_resonance() {
 }
 
 #[test]
-fn a_false_minimum_shows_as_an_overdispersion_far_above_one() {
+fn a_hot_sample_fitted_from_room_temperature_reads_its_temperature() {
     let setup = standard();
     let isotope = hafnium_like(20.0);
     let counts = expected_at(&setup, &beam(1.0e6), &[(isotope.clone(), THIN)], 2000.0);
@@ -3489,9 +3489,13 @@ fn a_false_minimum_shows_as_an_overdispersion_far_above_one() {
     )
     .expect("fit");
     assert!(fit.converged);
-    assert!(fit.temperature() < 500.0, "{}", fit.temperature());
+    assert!(
+        (fit.temperature() - 2000.0).abs() < 1.0,
+        "{}",
+        fit.temperature()
+    );
     let overdispersion = fit.regions[0].overdispersion[1].expect("measured");
-    assert!(overdispersion > 100.0, "{overdispersion}");
+    assert!(overdispersion < 1.1, "{overdispersion}");
 }
 
 fn reaching_the_window(setup: Setup) -> Setup {

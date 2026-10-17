@@ -15,7 +15,9 @@ use nereids_endf::retrieval::EndfLibrary;
 use nereids_fitting::error::FittingError;
 use nereids_fitting::lm::{FitModel, FlatMatrix};
 use nereids_fitting::parameters::{FitParameter, ParameterSet};
-use nereids_fitting::poisson::{Prior, Unbounded, information_inverse};
+use nereids_fitting::poisson::{
+    NEWTON_DECREMENT_TOL, Prior, Unbounded, half_deviance, information_inverse,
+};
 use nereids_fitting::statistics::{Consistency, consistency};
 use nereids_physics::continuous_doppler::{
     Channel, QuadratureBudget, SUPPORT_X, TierOneBroadening, broaden_with_budget,
@@ -52,6 +54,9 @@ pub(crate) const MOST_PASSES: usize = 20;
 /// The `(low, high)` temperature bounds in K that a fit with a free
 /// temperature uses.
 pub(crate) const TEMPERATURE_BOUNDS_K: (f64, f64) = (1.0, 5000.0);
+
+/// The start in K of a fitted temperature's second fit.
+const SECOND_START_K: f64 = TEMPERATURE_BOUNDS_K.1 / 2.0;
 
 /// A quantity the fit holds at a known value, fits from a starting value
 /// over the quantity's range, fits from `start` within `lower..=upper` inside
@@ -529,9 +534,14 @@ pub struct RegionFit {
 /// built at the fitted `t0`, `L` and pulse.  After twenty fits it is reported
 /// unconverged.
 ///
-/// The fitter finds a local minimum.  A thin sample hotter than about
-/// 1,500 K fitted from room temperature can end in a false one, reported
-/// converged with an overdispersion far above 1.  Where a black resonance
+/// The fitter finds a local minimum.  Where a temperature is fitted, the fit
+/// is made from the given starts and again with each fitted temperature
+/// started at 2,500 K, or at the bound nearest it.  Of the two, a converged
+/// fit beats one that did not converge; otherwise the second is returned only
+/// when its half Poisson deviance of every run's counts, outside the sample
+/// bins either fit leaves out, is lower by more than
+/// [`NEWTON_DECREMENT_TOL`].  When one fit fails the other is returned, and
+/// when both fail the first's error.  Where a black resonance
 /// empties bins and the background is near zero, a fitted background with no
 /// lower bound can drive a black bin's prediction to zero, and the fit ends
 /// unconverged; with `b1` and `b2` known, `b0` bounded below by 0 ends on
@@ -599,7 +609,77 @@ pub fn fit_counts(
             "no region of the measurement holds a material to fit".into(),
         ));
     }
-    fit_settled(measurement, calibration, MOST_PASSES)
+    let first = fit_settled(measurement, calibration, MOST_PASSES);
+    let Some(started_hot) = started_hot(measurement) else {
+        return first;
+    };
+    match (first, fit_settled(&started_hot, calibration, MOST_PASSES)) {
+        (Ok(first), Ok(second)) => Ok(if better(measurement, &second, &first) {
+            second
+        } else {
+            first
+        }),
+        (Ok(fit), Err(_)) | (Err(_), Ok(fit)) => Ok(fit),
+        (Err(error), Err(_)) => Err(error),
+    }
+}
+
+/// `measurement` with each fitted temperature started at [`SECOND_START_K`],
+/// or at the bound nearest it; `None` when no start moves.
+fn started_hot(measurement: &Measurement) -> Option<Measurement> {
+    let mut hot = measurement.clone();
+    let mut moved = false;
+    for material in hot.regions.iter_mut().filter_map(|r| r.material.as_mut()) {
+        let start = match material.temperature_k {
+            Value::Fitted(_) => SECOND_START_K,
+            Value::Within { lower, upper, .. } => SECOND_START_K.max(lower).min(upper),
+            Value::Known(_) | Value::Measured { .. } => continue,
+        };
+        if let Value::Fitted(old) | Value::Within { start: old, .. } = &mut material.temperature_k {
+            moved |= *old != start;
+            *old = start;
+        }
+    }
+    moved.then_some(hot)
+}
+
+/// Whether `fit` beats `other` on `measurement`'s counts, as
+/// [`fit_counts`] chooses.
+fn better(measurement: &Measurement, fit: &CountsFit, other: &CountsFit) -> bool {
+    if fit.converged != other.converged {
+        return fit.converged;
+    }
+    counts_deviance(measurement, fit, other) + NEWTON_DECREMENT_TOL
+        < counts_deviance(measurement, other, fit)
+}
+
+/// The half Poisson deviance of every run's counts at `fit`, outside the
+/// sample bins `fit` or `other` leaves out.
+fn counts_deviance(measurement: &Measurement, fit: &CountsFit, other: &CountsFit) -> f64 {
+    let runs = measurement
+        .regions
+        .iter()
+        .zip(&fit.regions)
+        .zip(&other.regions);
+    runs.map(|((region, at), beside)| {
+        let kept = |k: &usize| {
+            at.excluded_bins.binary_search(k).is_err()
+                && beside.excluded_bins.binary_search(k).is_err()
+        };
+        let open: f64 = (region.open_counts.iter().zip(&at.predicted[0]))
+            .map(|(&y, &mu)| half_deviance(y, mu))
+            .sum();
+        let sample: f64 = (region
+            .sample_counts
+            .iter()
+            .zip(&at.predicted[1])
+            .enumerate())
+        .filter(|(k, _)| kept(k))
+        .map(|(_, (&y, &mu))| half_deviance(y, mu))
+        .sum();
+        open + sample
+    })
+    .sum()
 }
 
 fn fit_settled(
@@ -3516,6 +3596,71 @@ mod tests {
     use super::*;
     use crate::open_beam::Pulse;
     use crate::open_beam::tests::{ALPHA, BETA, EDGES_US, FLIGHT_PATH_M, R, T0_US, grid};
+
+    #[test]
+    fn a_fitted_temperature_starts_its_second_fit_hot_within_its_bounds() {
+        let region = |temperature_k| Region {
+            open_counts: Vec::new(),
+            sample_counts: Vec::new(),
+            open_live: None,
+            sample_live: None,
+            background: [Value::Known(0.0); 5],
+            pixels: 1.0,
+            gamma_transmission: Value::Known(1.0),
+            capture_gammas: Value::Known(0.0),
+            in_scatter: Value::Known(0.0),
+            timing_offset_us: Value::Known(0.0),
+            material: Some(Material {
+                covariances: Vec::new(),
+                library: EndfLibrary::EndfB8_0,
+                isotopes: vec![(
+                    synthetic_isotope(72, 180, 20.0, 0.01, 0.06),
+                    Value::Fitted(1e-4),
+                )],
+                temperature_k,
+                thickness_variance: Value::Known(0.0),
+                lattice: None,
+            }),
+        };
+        let started = |temperatures: &[Value]| {
+            let measurement = Measurement {
+                time_edges_us: Vec::new(),
+                charge_ratio: 1.0,
+                normalization: Value::Known(1.0),
+                time_background: NO_TIME_BACKGROUND,
+                room_background: None,
+                spread: None,
+                regions: temperatures.iter().map(|&t| region(t)).collect(),
+            };
+            started_hot(&measurement).map(|hot| {
+                hot.regions
+                    .iter()
+                    .map(|r| r.material.as_ref().expect("material").temperature_k)
+                    .collect::<Vec<_>>()
+            })
+        };
+        let within = |start| Value::Within {
+            start,
+            lower: 250.0,
+            upper: 400.0,
+        };
+        assert_eq!(
+            started(&[Value::Fitted(300.0), Value::Known(300.0), within(300.0)]),
+            Some(vec![
+                Value::Fitted(2500.0),
+                Value::Known(300.0),
+                within(400.0)
+            ])
+        );
+        let measured = Value::Measured {
+            value: 300.0,
+            sd: 3.0,
+        };
+        assert_eq!(
+            started(&[Value::Fitted(2500.0), within(400.0), measured]),
+            None
+        );
+    }
 
     #[test]
     fn the_jacobian_is_the_slope_of_every_region_s_counts() {
