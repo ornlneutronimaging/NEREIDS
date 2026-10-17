@@ -604,23 +604,27 @@ fn fit_settled(
     let bins = starts_and_widths_us(&measurement.time_edges_us);
     let frames = open_frames(measurement.room_background.as_ref());
     let mut open = starting_bypass(measurement)?;
+    let mut offsets = (0..measurement.regions.len())
+        .map(|region| starting(measurement, Role::TimingOffset { region }))
+        .collect::<Result<Vec<f64>, PipelineError>>()?;
     let mut intervals: Option<Vec<usize>> = None;
     let shares = spread_shares(measurement)?;
     for passes in 1.. {
         let (mut fit, _) = fit_counts_answer(
             measurement,
             calibration,
-            BeamStarts::OpenFitsAt(open, intervals.clone()),
+            BeamStarts::OpenFitsAt(open, intervals.clone(), offsets.clone()),
             shares.clone(),
         )?;
         let fitted = Bypass {
             time: fit.time_background,
             room: fit.room_background,
         };
-        let used = open.open_counts_per_pixel(&bins, frames);
-        let now = fitted.open_counts_per_pixel(&bins, frames);
+        let fitted_offsets: Vec<f64> = fit.regions.iter().map(|r| r.timing_offset_us).collect();
         let mut spread = 0.0;
-        for (r, region) in fit.regions.iter().zip(&measurement.regions) {
+        for (q, (r, region)) in fit.regions.iter().zip(&measurement.regions).enumerate() {
+            let used = open.open_counts_per_pixel(&late(&bins, offsets[q]), frames);
+            let now = fitted.open_counts_per_pixel(&late(&bins, fitted_offsets[q]), frames);
             for (k, &mu) in r.predicted[0]
                 .iter()
                 .enumerate()
@@ -645,6 +649,7 @@ fn fit_settled(
                 .get_or_insert_with(|| fit.regions.iter().map(|r| r.beam.intervals()).collect());
         }
         open = fitted;
+        offsets = fitted_offsets;
     }
     unreachable!("the passes end at most_passes")
 }
@@ -674,11 +679,21 @@ pub(crate) fn open_frames(room: Option<&RoomBackground>) -> f64 {
     room.map_or(0.0, |room| room.frames[0])
 }
 
+/// The starting value of the measurement's quantity `role`.
+fn starting(measurement: &Measurement, role: Role) -> Result<f64, PipelineError> {
+    let (value, name, range, allowed) = quantity(measurement, role).expect("a quantity");
+    Ok(value.parameter(name, range, &allowed)?.value)
+}
+
+/// `bins` recorded `late_us` late, their starts on the clock they arrive by.
+fn late(bins: &[(f64, f64)], late_us: f64) -> Vec<(f64, f64)> {
+    bins.iter()
+        .map(|&(start, width)| (start - late_us, width))
+        .collect()
+}
+
 pub(crate) fn starting_bypass(measurement: &Measurement) -> Result<Bypass, PipelineError> {
-    let start = |role| {
-        let (value, name, range, allowed) = quantity(measurement, role).expect("a quantity");
-        Ok::<f64, PipelineError>(value.parameter(name, range, &allowed)?.value)
-    };
+    let start = |role| starting(measurement, role);
     Ok(Bypass {
         time: [
             start(Role::TimeBackground(0))?,
@@ -1208,7 +1223,7 @@ fn in_span(
 
 pub(crate) enum BeamStarts<'a> {
     Given(&'a Starts),
-    OpenFitsAt(Bypass, Option<Vec<usize>>),
+    OpenFitsAt(Bypass, Option<Vec<usize>>, Vec<f64>),
 }
 
 /// The spread's shares `F_rq` between the measurement's regions, or `None`
@@ -1333,12 +1348,12 @@ pub(crate) fn fit_counts_answer(
 
     let opens: Vec<BeamStart> = match beam_starts {
         BeamStarts::Given(starts) => starts.beams.clone(),
-        BeamStarts::OpenFitsAt(numbers, ref intervals) => regions
+        BeamStarts::OpenFitsAt(numbers, ref intervals, ref offsets) => regions
             .iter()
             .enumerate()
             .map(|(r, region)| {
                 let per_pixel = numbers.open_counts_per_pixel(
-                    &starts_and_widths_us(time_edges_us),
+                    &late(&starts_and_widths_us(time_edges_us), offsets[r]),
                     open_frames(measurement.room_background.as_ref()),
                 );
                 let known: Vec<f64> = per_pixel.iter().map(|g| region.pixels * g).collect();
@@ -2499,10 +2514,13 @@ struct RegionsModel {
     mixing: Option<Arc<Vec<Vec<f64>>>>,
 }
 
-/// One [`Scale`] for each distinct `t0 + δt` of the regions.
+/// One [`Scale`] for each distinct `t0 + δt` of the regions, and each
+/// region's beam basis and its slope at the grid's points.
 struct Clocks {
     scales: Vec<Scale>,
     of_region: Vec<usize>,
+    basis: Vec<Vec<[(usize, f64); 5]>>,
+    basis_slope: Vec<Vec<[(usize, f64); 5]>>,
 }
 
 impl Clocks {
@@ -2559,38 +2577,42 @@ struct Scale {
     flight_path_m: f64,
     pulse: IkedaCarpenterParams,
     rows: Rows,
-    basis: Vec<Vec<[(usize, f64); 5]>>,
-    basis_slope: Vec<Vec<[(usize, f64); 5]>>,
 }
 
-impl Scale {
+impl Clocks {
+    /// The clocks `scales`, region `r` on `scales[of_region[r]]`, with each
+    /// region's beam `splines[r]` read at the arrival times of its own.
     fn new(
-        (t0_us, flight_path_m): (f64, f64),
-        pulse: IkedaCarpenterParams,
-        rows: Rows,
+        scales: Vec<Scale>,
+        of_region: Vec<usize>,
         grid: &FlightTimeGrid,
         splines: &[BeamSpline],
         beam_origin_us: f64,
     ) -> Self {
-        let (shift, stretch) = (t0_us - beam_origin_us, flight_path_m / grid.flight_path_m());
-        let abscissae: Vec<f64> = grid
-            .flight_times_us()
+        let (basis, basis_slope) = splines
             .iter()
-            .map(|u| shift + stretch * u)
-            .collect();
+            .zip(&of_region)
+            .map(|(spline, &group)| {
+                let scale = &scales[group];
+                let (shift, stretch) = (
+                    scale.t0_us - beam_origin_us,
+                    scale.flight_path_m / grid.flight_path_m(),
+                );
+                let abscissae: Vec<f64> = grid
+                    .flight_times_us()
+                    .iter()
+                    .map(|u| shift + stretch * u)
+                    .collect();
+                let basis: Vec<_> = abscissae.iter().map(|&a| spline.basis(a)).collect();
+                let slope: Vec<_> = abscissae.iter().map(|&a| spline.basis_slope(a)).collect();
+                (basis, slope)
+            })
+            .unzip();
         Self {
-            t0_us,
-            flight_path_m,
-            pulse,
-            rows,
-            basis: splines
-                .iter()
-                .map(|spline| abscissae.iter().map(|&a| spline.basis(a)).collect())
-                .collect(),
-            basis_slope: splines
-                .iter()
-                .map(|spline| abscissae.iter().map(|&a| spline.basis_slope(a)).collect())
-                .collect(),
+            scales,
+            of_region,
+            basis,
+            basis_slope,
         }
     }
 }
@@ -2662,17 +2684,18 @@ impl RegionsModel {
             charge_ratio,
             frames,
             layout: Arc::clone(layout),
-            clocks: RefCell::new(Some(Clocks {
-                scales: vec![Scale::new(
-                    (grid.t0_us(), grid.flight_path_m()),
-                    grid.pulse().params().clone(),
-                    grid.rows().clone(),
-                    grid,
-                    beams,
-                    beam_origin_us,
-                )],
-                of_region: vec![0; layout.regions.len()],
-            })),
+            clocks: RefCell::new(Some(Clocks::new(
+                vec![Scale {
+                    t0_us: grid.t0_us(),
+                    flight_path_m: grid.flight_path_m(),
+                    pulse: grid.pulse().params().clone(),
+                    rows: grid.rows().clone(),
+                }],
+                vec![0; layout.regions.len()],
+                grid,
+                beams,
+                beam_origin_us,
+            ))),
             mixing: None,
         }
     }
@@ -2756,30 +2779,34 @@ impl RegionsModel {
                     .rows_at(start, flight_path_m, &pulse)
                     .map_err(|e| FittingError::EvaluationFailed(e.to_string()))?;
                 of_region.push(scales.len());
-                scales.push(Scale::new(
-                    (start, flight_path_m),
-                    pulse.clone(),
+                scales.push(Scale {
+                    t0_us: start,
+                    flight_path_m,
+                    pulse: pulse.clone(),
                     rows,
-                    &self.grid,
-                    &self.splines,
-                    self.beam_origin_us,
-                ));
+                });
             }
-            *self.clocks.borrow_mut() = Some(Clocks { scales, of_region });
+            *self.clocks.borrow_mut() = Some(Clocks::new(
+                scales,
+                of_region,
+                &self.grid,
+                &self.splines,
+                self.beam_origin_us,
+            ));
         }
         Ok(std::cell::Ref::map(self.clocks.borrow(), |c| {
             c.as_ref().expect("computed above")
         }))
     }
 
-    fn beams(&self, params: &[f64], scale: &Scale, region: usize) -> Result<Beams, FittingError> {
+    fn beams(&self, params: &[f64], clocks: &Clocks, region: usize) -> Result<Beams, FittingError> {
         let place = &self.layout.regions[region];
         let densities = &params[place.densities.clone()];
         let sigma = place
             .temperature
             .map(|t| self.at(region, params[t], TOTAL))
             .transpose()?;
-        let open: Vec<f64> = combined(&scale.basis[region], &params[place.beam.clone()])
+        let open: Vec<f64> = combined(&clocks.basis[region], &params[place.beam.clone()])
             .into_iter()
             .map(f64::exp)
             .collect();
@@ -2907,7 +2934,7 @@ impl RegionsModel {
         let density = params[place.densities.start + isotope];
         let clocks = self.clocks(params)?;
         let scale = clocks.of(region);
-        let beams = self.beams(params, scale, region)?;
+        let beams = self.beams(params, &clocks, region)?;
         let slope = |channel| -> Result<Vec<f64>, PipelineError> {
             let sigma = |data| {
                 broaden_channel(&self.energies, data, temperature, channel).map_err(|e| {
@@ -2965,12 +2992,7 @@ impl RegionsModel {
     /// in `[C, A, τ]`.
     fn time_background(&self, params: &[f64], region: usize) -> (Vec<f64>, [Vec<f64>; 3]) {
         let at = self.layout.time_background;
-        let late = params[self.layout.regions[region].offset];
-        let bins: Vec<(f64, f64)> = self
-            .bins
-            .iter()
-            .map(|&(start, width)| (start - late, width))
-            .collect();
+        let bins = late(&self.bins, params[self.layout.regions[region].offset]);
         time_counts_per_pixel(&bins, [params[at], params[at + 1], params[at + 2]])
     }
 
@@ -3001,7 +3023,7 @@ impl RegionsModel {
         for region in 0..self.absorbers.len() {
             let scale = clocks.of(region);
             let (background, _) = self.time_background(params, region);
-            let Beams { open, sample, .. } = self.beams(params, scale, region)?;
+            let Beams { open, sample, .. } = self.beams(params, &clocks, region)?;
             let pixels = self.layout.regions[region].pixels;
             let sample_scale = self.sample_time_scale(params, region);
             counts.extend(
@@ -3069,7 +3091,7 @@ impl FitModel for RegionsModel {
         let clocks = self.clocks(params).ok()?;
         let regions = self.absorbers.len();
         let beams: Vec<Beams> = (0..regions)
-            .map(|region| self.beams(params, clocks.of(region), region))
+            .map(|region| self.beams(params, &clocks, region))
             .collect::<Result<_, _>>()
             .ok()?;
         let bins = y_current.len() / (2 * regions);
@@ -3117,7 +3139,7 @@ impl FitModel for RegionsModel {
                     region,
                     coefficient,
                 } => {
-                    let slope = weights_of(&clocks.of(region).basis[region], coefficient);
+                    let slope = weights_of(&clocks.basis[region], coefficient);
                     let Beams { open, sample, .. } = &beams[region];
                     vec![
                         (open_rows(region), counts(region, &times(open, &slope))?),
@@ -3358,7 +3380,7 @@ impl FitModel for RegionsModel {
                         }
                         let arrival = arrival[group].as_ref()?;
                         let log_beam_slope = combined(
-                            &scale.basis_slope[r],
+                            &clocks.basis_slope[r],
                             &params[layout.regions[r].beam.clone()],
                         );
                         for (row, beam, background) in [
@@ -3855,7 +3877,7 @@ mod tests {
         let (fit, answer) = fit_counts_answer(
             &measurement,
             &calibration,
-            BeamStarts::OpenFitsAt(open, None),
+            BeamStarts::OpenFitsAt(open, None, vec![0.0; measurement.regions.len()]),
             None,
         )
         .expect("fit");

@@ -1995,6 +1995,43 @@ fn a_region_recording_late_is_recovered_with_t0() {
 }
 
 #[test]
+fn a_region_recording_early_meets_a_decaying_time_background_on_its_own_clock() {
+    let early_us = -3.0;
+    let [c, a, tau] = [0.0, 1.0e6, 10.0];
+    let sample = [(hafnium_like(20.0), 5.0e-3)];
+    let region = |setup: &Setup, late_us: f64| {
+        let background = time_background(&setup.edges, [c, a * (late_us / tau).exp(), tau]);
+        let plus = |counts: &[f64], scale: f64| -> Vec<f64> {
+            let counts = counts.iter().zip(&background);
+            counts.map(|(n, g)| (n + scale * g).round()).collect()
+        };
+        let (open, transmitted) = expected(setup, &beam(1.0e5), &sample);
+        let runs = (plus(&open, 1.0), plus(&transmitted, CHARGE_RATIO));
+        measurement(setup, runs, &sample).regions.remove(0)
+    };
+    let (setup, early) = (
+        standard(),
+        Setup {
+            t0_us: T0_US + early_us,
+            ..standard()
+        },
+    );
+    let mut m = measurement(&setup, (Vec::new(), Vec::new()), &sample);
+    m.time_background = [c, a, tau].map(Value::Known);
+    m.regions = vec![region(&setup, 0.0), region(&early, early_us)];
+    m.regions[1].timing_offset_us = Value::Known(early_us);
+    let fit = fit_counts(&m, &calibration(&setup)).expect("fit");
+    assert!(fit.converged);
+    for region in &fit.regions {
+        assert_eq!(region.overdispersion[0], Some(1.0));
+    }
+    let pulls: Vec<f64> = (0..2)
+        .map(|r| (fit.regions[r].densities[0] - sample[0].1) / error_bar(&fit, r))
+        .collect();
+    assert!(pulls.iter().all(|p| p.abs() <= BOUND.sqrt()), "{pulls:?}");
+}
+
+#[test]
 fn maps_the_fit_does_not_describe_are_refused() {
     let setup = standard();
     let edges: Vec<f64> = (0..=577).map(|k| 350.0 + 0.2 * f64::from(k)).collect();
