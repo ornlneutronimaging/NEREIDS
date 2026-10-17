@@ -616,7 +616,9 @@ pub fn fit_counts(
         ));
     }
     let first = fit_settled(measurement, calibration, MOST_PASSES)?;
-    let Some(started_hot) = started_hot(measurement).filter(|_| rejected(measurement, &first))
+    let Some(started_hot) = rejected(measurement, &first)
+        .then(|| started_hot(measurement))
+        .flatten()
     else {
         return Ok(first);
     };
