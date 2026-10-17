@@ -2808,15 +2808,17 @@ fn test_tr168c_fe56_broadened() {
         "t168b.par",
         "rcc.plt",
     );
-    // Sub-case c: Doppler (329K) + resolution broadening.
+    // Sub-case c: Doppler (173.2 K) + resolution broadening, with the
+    // temperature and thickness of the BROADENING card.
     let result = validate_broadened_cross_sections(&inp, &par, &plt, 0.10);
     eprintln!(
         "tr168c: max_rel={:.6}, mean_rel={:.6}, n={}, worst@{:.4} keV",
         result.max_rel_error, result.mean_rel_error, result.n_points, result.worst_energy_kev
     );
+    // Measured: 1.7% mean.
     assert!(
-        result.mean_rel_error < 0.05,
-        "broadened mean {:.4} > 5%",
+        result.mean_rel_error < 0.02,
+        "broadened mean {:.4} > 2%",
         result.mean_rel_error
     );
 }
