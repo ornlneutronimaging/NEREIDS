@@ -72,6 +72,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
   Calibration)` replace the typed-spectrum and spatial fitting APIs.
   The detector pulse acts on each count arm. An energy-center array or a
   transmission ratio cannot replace the original detector counts and edges.
+- Removed `nereids_io::rebin::rebin_centers` and `rebin_transmission`. A
+  merged bin's position depends on the widths of the bins it merges, which
+  centres do not give, and a transmission mean is not the ratio of the
+  summed counts. The GUI rebins a spectrum of bin edges only.
 - Removed transmission-LM fitting, the alternate joint-Poisson fitter,
   spatial regularization, legacy calibration and detectability interfaces,
   and the examples that require them. The Python quickstart describes the

@@ -1,6 +1,8 @@
-//! Rebin step: optional energy rebinning by integer factor.
+//! Rebin step: optional rebinning of the TOF axis by an integer factor.
 //!
-//! Counts data (TiffPair, HDF5): sum adjacent bins (conserves counts).
+//! Counts data (TiffPair, HDF5): sum adjacent bins (conserves counts). A
+//! spectrum given as bin centres is not rebinned: a merged bin's position
+//! depends on the widths of the bins it merges, which centres do not give.
 
 use std::sync::Arc;
 
@@ -90,8 +92,17 @@ pub fn rebin_step(ui: &mut egui::Ui, state: &mut AppState) {
 
             ui.add_space(4.0);
 
+            let has_edges = state.spectrum_kind == SpectrumValueKind::BinEdges;
+            if !has_edges {
+                ui.label(
+                    egui::RichText::new("Rebinning needs a spectrum of bin edges.")
+                        .size(12.0)
+                        .color(tc.fg2),
+                );
+            }
+
             // Apply button
-            let can_apply = state.rebin_factor > 1 && state.sample_data.is_some();
+            let can_apply = state.rebin_factor > 1 && state.sample_data.is_some() && has_edges;
             ui.add_enabled_ui(can_apply, |ui| {
                 if ui.button("Apply Rebinning").clicked() {
                     apply_rebin(state);
@@ -129,6 +140,11 @@ pub(crate) fn apply_rebin(state: &mut AppState) {
     // Cancel any in-flight fitting tasks before mutating data arrays
     state.cancel_pending_tasks();
 
+    if state.spectrum_values.is_some() && state.spectrum_kind != SpectrumValueKind::BinEdges {
+        state.status_message = "Rebinning needs a spectrum of bin edges".to_string();
+        return;
+    }
+
     // Validate spectrum axis matches data axis-0
     if let (Some(data), Some(vals)) = (&state.sample_data, &state.spectrum_values) {
         let expected = if state.spectrum_kind == SpectrumValueKind::BinEdges {
@@ -160,11 +176,7 @@ pub(crate) fn apply_rebin(state: &mut AppState) {
 
     // Rebin spectrum axis
     if let Some(ref vals) = state.spectrum_values {
-        let new_vals = if state.spectrum_kind == SpectrumValueKind::BinEdges {
-            nereids_io::rebin::rebin_edges(vals, factor)
-        } else {
-            nereids_io::rebin::rebin_centers(vals, factor)
-        };
+        let new_vals = nereids_io::rebin::rebin_edges(vals, factor);
         state.spectrum_values = Some(Arc::new(new_vals));
     }
 
@@ -180,4 +192,41 @@ pub(crate) fn apply_rebin(state: &mut AppState) {
         crate::state::ProvenanceEventKind::ConfigChanged,
         format!("Rebinned by factor {factor}"),
     );
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn counts(n: usize) -> Option<Arc<ndarray::Array3<f64>>> {
+        Some(Arc::new(ndarray::Array3::from_shape_fn(
+            (n, 1, 1),
+            |(t, _, _)| t as f64,
+        )))
+    }
+
+    #[test]
+    fn a_spectrum_of_bin_centres_is_not_rebinned() {
+        let mut state = AppState {
+            sample_data: counts(4),
+            spectrum_values: Some(Arc::new(vec![1.0, 2.0, 4.0, 8.0])),
+            spectrum_kind: SpectrumValueKind::BinCenters,
+            rebin_factor: 2,
+            ..AppState::default()
+        };
+        apply_rebin(&mut state);
+        assert!(!state.rebin_applied);
+        assert_eq!(state.sample_data.as_ref().unwrap().shape(), &[4, 1, 1]);
+        assert_eq!(state.spectrum_values.as_ref().unwrap().len(), 4);
+
+        state.spectrum_values = Some(Arc::new(vec![1.0, 2.0, 4.0, 8.0, 16.0]));
+        state.spectrum_kind = SpectrumValueKind::BinEdges;
+        apply_rebin(&mut state);
+        assert!(state.rebin_applied);
+        assert_eq!(
+            state.spectrum_values.as_ref().unwrap().as_slice(),
+            &[1.0, 4.0, 16.0]
+        );
+        assert_eq!(state.sample_data.as_ref().unwrap()[[1, 0, 0]], 5.0);
+    }
 }
