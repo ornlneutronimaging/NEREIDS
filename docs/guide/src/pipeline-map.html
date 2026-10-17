@@ -1406,7 +1406,7 @@
       </ol>
     </div>
     <div class="trace step" data-tr="temperature" hidden>
-      <p class="step-body">The mirror of density: areal density is externally measured; T_eff runs free. In the code today: one counts fit of one open-beam and sample pair, in one or more regions, each density measured (a Gaussian prior) or known, the temperature, t₀ and L fitted, and the pulse fitted under its calibration&#8217;s prior. The steps below are not yet implemented; <span class="hnd">fit_map</span> maps patches of pixels.</p>
+      <p class="step-body">The mirror of density: areal density is externally measured; T_eff runs free. In the code today: one counts fit of one open-beam and sample pair, in one or more regions, each density measured (a Gaussian prior) or known, the temperature, t₀ and L fitted, and the pulse fitted under its calibration&#8217;s prior. The steps below are not yet implemented; <span class="hnd">fit_map</span> maps patches of pixels, with each patch&#8217;s covariance and its covariance with every other patch through the shared quantities, in Rust and Python.</p>
       <ol class="procsteps">
         <li><b>Ingest / Qualify</b> as for density; posterior by identity.</li>
         <li><span class="gstep g4">G4 gate</span> → <span class="hnd">GatedPosterior</span>.</li>

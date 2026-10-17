@@ -9,6 +9,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
 
 ### Added
 
+- Python's `CountsMap` gives each patch's `covariance` and `sensitivity` and
+  the `cross_covariance` of two patches, with the `quantities` they cover.
 - `fit_map` fits the time background `[C, A, tau]` per pixel as a quantity
   shared by every patch, and each patch's gamma transmission.
   `MapMeasurement` gains `time_background` and `gamma_transmission`;
@@ -93,6 +95,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
   Unsupported fit settings are rejected.
 - PLEIADES test data are no longer a Git submodule. The local directory is
   ignored. The test suite does not require it.
+- `CountsMap`'s `covariance`, `sensitivity` and `cross_covariance` move to
+  its `covariances`, a `PatchCovariances` that owns them.
 
 ### Limitations
 
