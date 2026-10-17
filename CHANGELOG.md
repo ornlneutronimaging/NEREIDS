@@ -94,6 +94,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
 - PLEIADES test data are no longer a Git submodule. The local directory is
   ignored. The test suite does not require it.
 
+### Fixed
+
+- The Gaussian resolution with an exponential tail keeps its whole tail. The
+  kernel lost its tail more than 5.01 Gaussian widths from its peak (60% of
+  its area at `C = 0.05`), and `exerfc` lost its `exp(x^2)` factor below
+  `x = -5.01`.
+
 ### Limitations
 
 - The map's `trusted` array records numerical status only. It does not
