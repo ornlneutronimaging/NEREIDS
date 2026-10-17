@@ -240,11 +240,12 @@ fn load_and_parse_endf(
 /// parse-and-skip placeholder ranges (LRF=7 R-Matrix Limited, LRU=2 URR, or
 /// LRU=0 scattering-radius-only).
 ///
-/// Those spans contribute exactly zero cross-section, so any physics computed
-/// over them reflects only the evaluation's other ranges. The parser already
-/// hard-errors when NO range is evaluable; this warning covers the mixed case
-/// (e.g. Ta-181, U-238), where the file loads but part of its declared energy
-/// coverage is silently inert without this signal. Callers can catch, filter,
+/// Those spans' resonances contribute no cross section, so any physics
+/// computed over them reflects only the evaluation's other ranges and its
+/// File 3 cross sections. The parser already hard-errors when NO range is
+/// evaluable; this warning covers the mixed case (e.g. Ta-181, U-238), where
+/// the file loads but part of its declared energy coverage is silently inert
+/// without this signal. Callers can catch, filter,
 /// or escalate it with the stdlib ``warnings`` module.
 ///
 /// ``stacklevel=1`` attributes the warning to the frame that invoked the
@@ -260,8 +261,8 @@ fn warn_unevaluated_ranges(py: Python<'_>, data: &ResonanceData, origin: &str) -
     let spans: Vec<String> = skipped.iter().map(|r| r.skip_description()).collect();
     let msg = format!(
         "{origin}: {} of {} resonance range(s) are parsed but NOT evaluated: {}. \
-         These spans contribute zero cross-section (transmission = 1); NEREIDS \
-         evaluates resolved LRF=1/2/3 ranges only.",
+         Their resonances contribute no cross section; NEREIDS \
+         evaluates resolved LRF=1/2/3 ranges without a competitive width only.",
         skipped.len(),
         data.ranges.len(),
         spans.join("; ")

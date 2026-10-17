@@ -1090,7 +1090,7 @@ mod tests {
 
     #[test]
     fn test_detect_hot_pixels_2x2_railed_cluster_fully_caught() {
-        // Fixpoint acceptance ( F1): a 2×2 railed cluster
+        // Fixpoint acceptance: a 2×2 railed cluster
         // has no interior — every pixel keeps 5 background neighbors of 8,
         // so the whole cluster is caught in the first pass.  Regression
         // guard for the smallest ≥2-px-wide cluster.
@@ -1118,7 +1118,7 @@ mod tests {
 
     #[test]
     fn test_detect_hot_pixels_3x3_railed_blob_fully_caught() {
-        // Fixpoint acceptance ( F1) — THE erosion proof.
+        // Fixpoint acceptance — THE erosion proof.
         // A 3×3 railed blob: pass 1 flags only the 4 corners (5 background
         // neighbors each); the edge centers (3 bg + 5 railed) and the
         // interior (8 railed) are refuted by a single pass — the
@@ -1153,7 +1153,7 @@ mod tests {
 
     #[test]
     fn test_detect_hot_pixels_2px_wide_railed_column_fully_caught() {
-        // Fixpoint acceptance ( F1): the interior of a
+        // Fixpoint acceptance: the interior of a
         // 2-px-wide railed column (3 bg + 5 railed neighbors per interior
         // pixel) was invisible to the single pass — only the 4 end pixels
         // (5 bg neighbors each) flagged.  The fixpoint erodes the column
@@ -1185,7 +1185,7 @@ mod tests {
 
     #[test]
     fn test_detect_hot_pixels_edge_to_edge_2px_band_not_flagged_by_design() {
-        // Documented-limitation pin ( F1): an EDGE-TO-EDGE
+        // Documented-limitation pin: an EDGE-TO-EDGE
         // railed band ≥2 px wide (both ends off-detector) exposes no end
         // cap or convex corner, so the erosion has no seed — interior
         // band pixels keep 3 bg + 5 railed neighbors (median railed) and
@@ -1216,7 +1216,7 @@ mod tests {
 
     #[test]
     fn test_detect_hot_pixels_2px_band_one_end_on_detector_fully_caught() {
-        // Companion to the edge-to-edge pin ( F1): the
+        // Companion to the edge-to-edge pin: the
         // same 2-row railed band, but with ONE end cap inside the
         // detector.  The two cap pixels keep 5 bg + 3 railed neighbors
         // (median bg) and seed in pass 1; the fixpoint then erodes the

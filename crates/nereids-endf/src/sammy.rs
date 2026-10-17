@@ -144,7 +144,8 @@ pub struct SammyInpConfig {
     pub energy_min_ev: f64,
     /// Upper energy bound for resonance range (eV).
     pub energy_max_ev: f64,
-    /// Sample temperature (K).
+    /// Sample temperature (K): Card 5, or the BROADENING card's when it
+    /// gives one.
     pub temperature_k: f64,
     /// Flight path length (m).
     pub flight_path_m: f64,
@@ -175,7 +176,8 @@ pub struct SammyInpConfig {
     pub broadening_delta_e: Option<f64>,
     /// Scattering radius (fm).
     pub scattering_radius_fm: f64,
-    /// Sample thickness (atoms/barn).
+    /// Sample thickness (atoms/barn): Card 6, or the BROADENING card's when
+    /// it gives one.
     pub thickness_atoms_barn: f64,
     /// Target nuclear spin I.  Determines the statistical weight
     /// g_J = (2J+1) / ((2I+1)(2s+1)).  Parsed from field 6 of the
@@ -940,26 +942,26 @@ pub fn parse_sammy_inp(content: &str) -> Result<SammyInpConfig, SammyParseError>
             //   Uuu(1-3) = channel_radius, Temp, thickness (broadenPars)
             //   Uuu(4-6) = Deltal, Deltag, Deltae (rslRes params 1-3)
             //
-            // Non-zero Uuu(4-6) override Card 5 values.
+            // A value replaces the Card 5 or Card 6 value when it is non-zero
+            // and its flag is not -2.
             idx += 1;
             if idx < lines.len() {
                 let brd_fields: Vec<&str> = lines[idx].split_whitespace().collect();
                 if brd_fields.len() >= 6 {
-                    if let Ok(v) = brd_fields[3].parse::<f64>()
-                        && v != 0.0
-                    {
-                        broadening_delta_l = Some(v);
+                    let given = |i: usize| {
+                        let v = brd_fields[i].parse::<f64>().ok().filter(|&v| v != 0.0)?;
+                        let flag = brd_fields.get(6 + i).and_then(|f| f.parse::<i32>().ok());
+                        (flag != Some(-2)).then_some(v)
+                    };
+                    if let Some(v) = given(1) {
+                        temperature_k = v;
                     }
-                    if let Ok(v) = brd_fields[4].parse::<f64>()
-                        && v != 0.0
-                    {
-                        broadening_delta_g = Some(v);
+                    if let Some(v) = given(2) {
+                        thickness_atoms_barn = v;
                     }
-                    if let Ok(v) = brd_fields[5].parse::<f64>()
-                        && v != 0.0
-                    {
-                        broadening_delta_e = Some(v);
-                    }
+                    broadening_delta_l = given(3);
+                    broadening_delta_g = given(4);
+                    broadening_delta_e = given(5);
                 }
             }
             // Only use the first BROADENING card (subsequent ones are for
@@ -1968,6 +1970,23 @@ EXPLICIT
         assert!((r2.gamma_gamma_ev - 0.6).abs() < 1e-6); // 600 meV → 0.6 eV
         assert!((r2.gamma_n_ev - 0.062).abs() < 1e-6); // 62 meV → 0.062 eV
         assert_eq!(r2.spin_group, 2);
+    }
+
+    #[test]
+    fn a_broadening_card_gives_temperature_and_thickness_unless_flagged_minus_two() {
+        let card = "6.00      329.00    0.2179    0.025     0.022     0.022      1 1 1 1 1 1";
+        let given = "6.00      173.20354 .017766765 .025     0.022     0.022      0 3 3 0 0 0";
+        let inp = parse_sammy_inp(&FE56_TR007_INP.replace(card, given)).unwrap();
+        assert_eq!(inp.temperature_k, 173.20354);
+        assert_eq!(inp.thickness_atoms_barn, 0.017766765);
+        assert_eq!(inp.broadening_delta_l, Some(0.025));
+
+        let held = "6.00      173.20354 .017766765 .025     0.022     0.022      0 -2 -2 -2 0 0";
+        let inp = parse_sammy_inp(&FE56_TR007_INP.replace(card, held)).unwrap();
+        assert_eq!(inp.temperature_k, 329.0);
+        assert_eq!(inp.thickness_atoms_barn, 0.2179);
+        assert_eq!(inp.broadening_delta_l, None);
+        assert_eq!(inp.broadening_delta_g, Some(0.022));
     }
 
     #[test]

@@ -540,12 +540,11 @@ fn compute_xcoef_weights(energies: &[f64]) -> Vec<f64> {
     weights
 }
 
-/// Compute erfc(x) using the existing `exerfc` function.
+/// Complementary error function erfc(x) = 1 − erf(x).
 ///
-/// erfc(x) = exp(-x²) · exerfc(x) / √π
-///
-/// For x < 0: erfc(-|x|) = 2 - erfc(|x|)
-fn erfc_from_exerfc(x: f64) -> f64 {
+/// erfc(x) = exp(-x²) · exerfc(x) / √π for x ≥ 0, and
+/// erfc(x) = 2 − erfc(−x) for x < 0.
+pub(crate) fn erfc(x: f64) -> f64 {
     const SQRT_PI: f64 = 1.772_453_850_905_516;
     if x >= 0.0 {
         (-x * x).exp() * exerfc(x) / SQRT_PI
@@ -561,8 +560,9 @@ fn erfc_from_exerfc(x: f64) -> f64 {
 ///
 /// SAMMY Ref: `fnc/exerfc.f90`.
 ///
-/// Uses rational approximation for |x| < 5.01 and asymptotic expansion
-/// (Abramowitz & Stegun 7.1.23) for |x| >= 5.01.
+/// Uses rational approximation for 0 < x ≤ 5.01 and asymptotic expansion
+/// (Abramowitz & Stegun 7.1.23) for x > 5.01. For x < 0 it uses
+/// erfc(x) = 2 − erfc(−x): exerfc(x) = 2√π·exp(x²) − exerfc(−x).
 pub(crate) fn exerfc(x: f64) -> f64 {
     const SQRT_PI: f64 = 1.772_453_850_905_516;
     const TWO_SQRT_PI: f64 = 3.544_907_701_811_032;
@@ -577,16 +577,7 @@ pub(crate) fn exerfc(x: f64) -> f64 {
     const A7: f64 = 3.403_018_23e-2;
 
     if x < 0.0 {
-        let xp = -x;
-        if xp > XMAX {
-            TWO_SQRT_PI - asympt(xp)
-        } else {
-            let a =
-                (A1 + xp * (A2 + xp * (A3 - xp * A4))) / (1.0 + xp * (A5 + xp * (A6 + xp * A7)));
-            let b = SQRT_PI + xp * (2.0 - a);
-            let a_rat = b / (xp * b + 1.0);
-            TWO_SQRT_PI * (x * x).exp() - a_rat
-        }
+        TWO_SQRT_PI * (x * x).exp() - exerfc(-x)
     } else if x > XMAX {
         asympt(x)
     } else if x > 0.0 {
@@ -630,59 +621,22 @@ fn asympt(x: f64) -> f64 {
 /// SAMMY Ref: `rsl/mrsl1.f90` lines 467-484 (Resbrd, Iesopr=3 path).
 ///
 /// When B >= 0: `Z = exp(-A²) · Exerfc(B)`
-/// When B < 0:  `Z = Xxerfc(B, A)` which is the same mathematical function
-///   computed with different numerical strategy for stability.
+/// When B < 0:  `Z = 2√π · exp(B² − A²) − exp(−A²) · Exerfc(−B)`, from
+///   erfc(B) = 2 − erfc(−B), with exp(B² − A²) taken as one exponential so
+///   that it does not underflow where exp(−A²) does.
+///
+/// SAMMY Ref: `fnc/xxerfc.f90`.
 fn gauss_exp_kernel(a: f64, b: f64) -> f64 {
+    const TWO_SQRT_PI: f64 = 3.544_907_701_811_032;
+    let exp_neg_a2 = (-a * a).exp();
     if b >= 0.0 {
-        let exp_neg_a2 = (-a * a).exp();
         if exp_neg_a2 == 0.0 {
             return 0.0;
         }
         exp_neg_a2 * exerfc(b)
     } else {
-        // Xxerfc(B, A): compute exp(-A² + B²) · erfc(-B) · √π
-        // Using the same rational approximation as exerfc but for negative B.
-        //
-        // SAMMY Ref: `fnc/xxerfc.f90`.
-        xxerfc(b, a)
+        TWO_SQRT_PI * (b * b - a * a).exp() - exp_neg_a2 * exerfc(-b)
     }
-}
-
-/// Compute exp(-xxx² + xx²) · erfc(-xx) · √π for xx assumed negative (B < 0).
-///
-/// SAMMY Ref: `fnc/xxerfc.f90`. Note: SAMMY says "Xx is assumed positive"
-/// but the caller passes B < 0 as Xx. The code handles this by immediately
-/// computing X = -Xx (which is positive).
-///
-/// When x = -xx exceeds XMAX, the rational approximation loses accuracy.
-/// We switch to `exp(-xxx²) · asympt(x)`, mirroring exerfc's large-argument
-/// path.
-fn xxerfc(xx: f64, xxx: f64) -> f64 {
-    const SQRT_PI: f64 = 1.772_453_850_905_516;
-    const XMAX: f64 = 5.01;
-    const A1: f64 = 8.584_076_57e-1;
-    const A2: f64 = 3.078_181_93e-1;
-    const A3: f64 = 6.383_238_91e-2;
-    const A4: f64 = 1.824_050_75e-4;
-    const A5: f64 = 6.509_742_65e-1;
-    const A6: f64 = 2.294_848_19e-1;
-    const A7: f64 = 3.403_018_23e-2;
-
-    let x = -xx; // x is positive (xx is B < 0)
-
-    // For large x, the rational approximation loses accuracy.
-    // exp(-xxx² + x²)·erfc(x)·√π = exp(-xxx²)·[exp(x²)·erfc(x)·√π]
-    //                              = exp(-xxx²)·asympt(x)
-    if x > XMAX {
-        return (-xxx * xxx).exp() * asympt(x);
-    }
-
-    let a_rat = (A1 + x * (A2 + x * (A3 - x * A4))) / (1.0 + x * (A5 + x * (A6 + x * A7)));
-    let b_int = SQRT_PI + x * (2.0 - a_rat);
-    let a_final = b_int / (x * b_int + 1.0);
-    // exp(-xxx² + x²) = exp(-A² + B²) since x = -B, xx = B
-    let exp_term = (-xxx * xxx + x * x).exp();
-    SQRT_PI * 2.0 * exp_term - a_final * (-xxx * xxx).exp()
 }
 
 /// Compute the energy shift for the Gaussian+exponential kernel peak.
@@ -880,8 +834,8 @@ pub(crate) fn resolution_broaden_presorted(
                 let a_j1 = (e_j1 - e) * inv_w;
 
                 // I₀ = erf(a_{j+1}) - erf(a_j) = erfc(a_j) - erfc(a_{j+1})
-                let erfc_aj = erfc_from_exerfc(a_j);
-                let erfc_aj1 = erfc_from_exerfc(a_j1);
+                let erfc_aj = erfc(a_j);
+                let erfc_aj1 = erfc(a_j1);
                 let i0 = erfc_aj - erfc_aj1;
 
                 if i0 < NEAR_ZERO_FLOOR {
@@ -3260,6 +3214,72 @@ mod tests {
             .sum::<f64>()
             / wsum;
         (c, var.sqrt())
+    }
+
+    const SQRT_PI: f64 = 1.772_453_850_905_516;
+
+    /// Largest relative difference from the independent erfc of `libm`.
+    fn worst(points: impl Iterator<Item = (f64, f64, f64)>) -> (f64, f64) {
+        points
+            .map(|(x, ours, want)| (x, (ours - want).abs() / want.abs()))
+            .fold((f64::NAN, 0.0), |w, p| if p.1 > w.1 { p } else { w })
+    }
+
+    #[test]
+    fn exerfc_and_erfc_match_an_independent_erfc_on_both_sides_of_zero() {
+        let xs = (-2600..=2600).map(|i| f64::from(i) * 0.01);
+        let (x, relative) = worst(xs.map(|x| {
+            let want = SQRT_PI * (x * x).exp() * libm::erfc(x);
+            (x, exerfc(x), want)
+        }));
+        assert!(relative < 2e-7, "exerfc({x}) is {relative:.2e} off");
+
+        let xs = (-2600..=2600).map(|i| f64::from(i) * 0.01);
+        let (x, relative) = worst(xs.map(|x| (x, erfc(x), libm::erfc(x))));
+        assert!(relative < 2e-7, "erfc({x}) is {relative:.2e} off");
+    }
+
+    /// Z(A, B) = √π·exp(B² − A²)·erfc(B) with B = A + C, so
+    /// B² − A² = 2BC − C². Below B = −5.01 the kernel is the exponential
+    /// tail 2√π·exp(2BC − C²).
+    #[test]
+    fn the_combined_kernel_matches_an_independent_erfc_down_its_tail() {
+        for c in [0.05, 0.1, 0.25, 1.0] {
+            let bs = (-6000..=2600).map(|i| f64::from(i) * 0.01);
+            let (b, relative) = worst(bs.map(|b| {
+                let want = SQRT_PI * (2.0 * b * c - c * c).exp() * libm::erfc(b);
+                (b, gauss_exp_kernel(b - c, b), want)
+            }));
+            assert!(
+                relative < 2e-7,
+                "C = {c}: Z at B = {b} is {relative:.2e} off"
+            );
+        }
+    }
+
+    /// ∫ Z dA = √π/C: integrate by parts with u = A + C,
+    /// ∫ e^{2Cu} erfc(u) du = e^{C²}/C.
+    #[test]
+    fn the_combined_kernel_keeps_its_whole_area() {
+        for c in [0.05, 0.1, 0.25] {
+            let step = 0.01;
+            let low = -50.0 / c;
+            let count = ((10.0 - low) / step) as usize;
+            let area: f64 = (0..=count)
+                .map(|i| {
+                    let a = low + step * i as f64;
+                    let end = if i == 0 || i == count { 0.5 } else { 1.0 };
+                    end * gauss_exp_kernel(a, a + c)
+                })
+                .sum::<f64>()
+                * step;
+            let want = SQRT_PI / c;
+            let relative = (area - want).abs() / want;
+            assert!(
+                relative < 1e-9,
+                "C = {c}: area {area:.9} against √π/C = {want:.9}, {relative:.2e} off"
+            );
+        }
     }
 
     #[test]
