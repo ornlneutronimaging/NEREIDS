@@ -667,8 +667,7 @@ enum PrecomputedRangeKind<'a> {
     },
     /// Multi-Level Breit-Wigner (LRF=2): coherent-sum elastic, same
     /// capture/fission as SLBW.  Uses the same precomputed-J-group
-    /// layout as SLBW but dispatches to `mlbw_evaluate_with_cached_jgroups`
-    /// (see for why this MUST be a distinct variant).
+    /// layout as SLBW but dispatches to `mlbw_evaluate_with_cached_jgroups`.
     Mlbw {
         range: &'a ResonanceRange,
         l_groups: Vec<PrecomputedSlbwLGroupData>,
@@ -933,8 +932,7 @@ fn evaluate_precomputed_range(
 
         PrecomputedRangeKind::Mlbw { range, l_groups } => {
             // MLBW uses the SAME precomputed J-groups as SLBW but a
-            // different evaluator (coherent-sum elastic).  Routing MLBW
-            // through `slbw_evaluate_with_cached_jgroups` was the bug.
+            // different evaluator (coherent-sum elastic).
             let pi_over_k2 = channel::pi_over_k_squared_barns(energy_ev, awr);
             let mut total = 0.0;
             let mut elastic = 0.0;
@@ -2334,11 +2332,8 @@ mod tests {
     //
     // These tests lock the contract that `cross_sections_on_grid` must
     // produce element-wise bit-exact output matching
-    // `cross_sections_at_energy` on the same grid.  Two paths diverging
-    // silently is the class of bug that exposed — the batch path was
-    // routing MLBW ranges through the SLBW incoherent-sum evaluator,
-    // producing up to 55 % relative error on real Hf isotopes — so this
-    // harness must cover every formalism that has a distinct evaluator.
+    // `cross_sections_at_energy` on the same grid, for every formalism
+    // that has a distinct evaluator.
     //
     // The synthetic MLBW test below uses the smallest configuration that
     // exercises the coherent-vs-incoherent divergence (a single J-group

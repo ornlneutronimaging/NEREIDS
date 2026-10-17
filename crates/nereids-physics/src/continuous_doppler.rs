@@ -1253,7 +1253,7 @@ mod tests {
 
             // Non-vacuity: at least 5% of the kernel must sit on the
             // reflected side, or this target proves nothing about it.
-            let reflected_mass = 0.5 * erfc_approximation(ratio);
+            let reflected_mass = 0.5 * crate::resolution::erfc(ratio);
             assert!(
                 reflected_mass > 0.05,
                 "√E/u = {ratio} leaves only {reflected_mass:.2e} reflected mass"
@@ -1269,17 +1269,6 @@ mod tests {
                  sampled reference {want:.6e} — {relative:.3e} relative"
             );
         }
-    }
-
-    /// Abramowitz & Stegun 7.1.26. Only used to state how much kernel mass a
-    /// test target puts on the reflected side, so ~1e-7 absolute is ample.
-    fn erfc_approximation(x: f64) -> f64 {
-        let t = 1.0 / (1.0 + 0.327_591_1 * x);
-        let poly = t
-            * (0.254_829_592
-                + t * (-0.284_496_736
-                    + t * (1.421_413_741 + t * (-1.453_152_027 + t * 1.061_405_429))));
-        poly * (-x * x).exp()
     }
 
     /// The value at one target does not depend on which grid asked for it.

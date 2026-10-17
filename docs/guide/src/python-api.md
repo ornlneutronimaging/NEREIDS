@@ -41,7 +41,7 @@ Important properties:
 | `target_spin` | `float` | Target spin from the first evaluable range (parse-and-skip placeholders are skipped). |
 | `scattering_radius` | `float` | Effective scattering radius in fm, from the first evaluable range. |
 | `l_values` | `list[int]` | Orbital angular momentum values present in the data. |
-| `has_unevaluated_ranges` | `bool` | True when the file carries parsed-but-not-evaluated spans (LRF=7 / URR / LRU=0); those spans contribute zero cross-section. |
+| `has_unevaluated_ranges` | `bool` | True when the file carries parsed-but-not-evaluated spans (LRF=7 / URR / LRU=0); their resonances contribute no cross section. |
 | `skipped_ranges` | `list[str]` | One description per parsed-but-not-evaluated span. |
 
 ### Counts Fit Objects
