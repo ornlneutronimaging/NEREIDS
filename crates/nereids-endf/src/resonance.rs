@@ -301,7 +301,9 @@ pub struct LGroup {
     #[serde(default)]
     pub qx: f64,
     /// Competitive width flag. LRX=0: no competitive width; LRX=1: competitive
-    /// reaction exists (width = GT - GN - GG - GF). Only used in BW formalisms.
+    /// reaction exists (width = GT - GN - GG - GF). A BW range with LRX ≠ 0 is
+    /// not evaluated: the width's energy dependence needs the l of the exit
+    /// channel (ENDF-6 Formats Manual §D.3.1), which the file does not give.
     /// Reference: ENDF-6 Formats Manual §2.2.1.1, L-value CONT record (L2 field).
     #[serde(default)]
     pub lrx: i32,
@@ -507,7 +509,8 @@ impl ResonanceRange {
     ///
     /// Evaluable means a resolved (LRU=1) range using one of the implemented
     /// formalisms — SLBW (LRF=1), MLBW (LRF=2), or Reich-Moore (LRF=3) — with
-    /// at least one resonance-bearing L-group. A resolved range whose L-groups
+    /// at least one resonance-bearing L-group and no competitive width
+    /// (LRX = 0 in every L-group). A resolved range whose L-groups
     /// are all empty evaluates to exactly zero in NEREIDS — an implementation
     /// property, not a physics statement: NEREIDS derives its J-groups (and
     /// with them the hard-sphere potential-scattering term) from the resonance
@@ -529,6 +532,7 @@ impl ResonanceRange {
                     | ResonanceFormalism::ReichMoore
             )
             && self.l_groups.iter().any(|lg| !lg.resonances.is_empty())
+            && self.l_groups.iter().all(|lg| lg.lrx == 0)
     }
 
     /// One-line diagnostic for a parse-and-skip placeholder range, e.g.
@@ -538,9 +542,10 @@ impl ResonanceRange {
     /// `UserWarning`, and the GUI load log so all three surfaces describe a
     /// skipped range identically. Only meaningful for ranges where
     /// [`Self::is_evaluable`] is `false`: the resolved-formalism arms label
-    /// the accepted-but-inert no-resonance shape (callers never pass an
-    /// evaluable range).
+    /// the accepted-but-inert shapes, no resonances or a competitive width
+    /// (callers never pass an evaluable range).
     pub fn skip_description(&self) -> String {
+        let competitive = self.l_groups.iter().any(|lg| lg.lrx != 0);
         let kind = match self.formalism {
             ResonanceFormalism::RMatrixLimited => "LRF=7 (R-Matrix Limited)",
             ResonanceFormalism::Unresolved => "LRU=2 (URR)",
@@ -548,7 +553,14 @@ impl ResonanceRange {
                 "LRU=0 (scattering-radius-only, no resonance parameters)"
             }
             // A resolved LRF=1/2/3 range reaches here only when it carries no
-            // resonances (every L-group empty) — accepted, warn-and-skip.
+            // resonances (every L-group empty) or a competitive width —
+            // accepted, warn-and-skip.
+            ResonanceFormalism::SLBW if competitive => {
+                "LRF=1 (SLBW) resolved range with a competitive width (LRX=1)"
+            }
+            ResonanceFormalism::MLBW if competitive => {
+                "LRF=2 (MLBW) resolved range with a competitive width (LRX=1)"
+            }
             ResonanceFormalism::SLBW => "LRF=1 (SLBW) resolved range with no resonances",
             ResonanceFormalism::MLBW => "LRF=2 (MLBW) resolved range with no resonances",
             ResonanceFormalism::ReichMoore => {
@@ -757,6 +769,11 @@ mod tests {
         assert!(
             range.is_evaluable(),
             "a resonance-bearing L-group is evaluable"
+        );
+        range.l_groups[0].lrx = 1;
+        assert!(
+            !range.is_evaluable(),
+            "a competitive width needs the exit channel's l, which ENDF does not give"
         );
     }
 
