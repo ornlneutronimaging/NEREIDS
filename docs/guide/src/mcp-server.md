@@ -196,6 +196,11 @@ share of the sample's forward single scatters the detector records.
 lattice with Debye's spectrum at that Debye temperature, and makes the fitted
 temperature the thermodynamic one; without it they are broadened by the free
 gas.
+The single_spectrum result returns every fitted quantity of the region:
+densities with their standard deviations, temperature, thickness variance,
+capture gammas, in-scatter, timing offset, background terms, gamma
+transmission and the two runs' overdispersions, and the fit's normalization,
+t0, flight path, pulse, time and room backgrounds and spread share.
 
 density_map and spatial_map fit every patch of a counts cube. They support
 counts_npz/counts and nexus_histogram/nexus with 3D counts. Optional .npz
@@ -205,7 +210,10 @@ in pixels.
 
 Map workflows take `fit.time_background` and `fit.room_background` per
 pixel, shared by every patch, and `fit.gamma_transmission` for every sample
-patch. The map's `trusted`
+patch. The map's .npz holds each patch's densities, their standard
+deviations, temperature, thickness variance, capture gammas, in-scatter,
+timing offset, gamma transmission and background terms (on the last axis),
+NaN where a patch has no fit. The map's `trusted`
 array reports numerical status, not physical or thermometry validation. Masks are cropped with the counts when an ROI or
 pixel limit is selected.
 
