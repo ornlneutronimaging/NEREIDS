@@ -58,13 +58,13 @@ pub fn results_step(ui: &mut egui::Ui, state: &mut AppState) {
                 ui.label("Converged");
                 ui.label(summary.converged.to_string());
                 ui.end_row();
-                ui.label("Numerically accepted patches").on_hover_text(
-                    "Convergence and uncertainty status only. The map has no additive time background; this is not physical validation.",
+                ui.label("Identified patches").on_hover_text(
+                    "Patches whose fitted densities, unless 0, and fitted temperature each have a finite uncertainty. The overdispersion says whether the model describes their counts.",
                 );
                 ui.label(format!(
                     "{} of {}",
-                    summary.trusted.iter().filter(|&&t| t).count(),
-                    summary.trusted.len()
+                    summary.identified.iter().filter(|&&t| t).count(),
+                    summary.identified.len()
                 ));
                 ui.end_row();
             });

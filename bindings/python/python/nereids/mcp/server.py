@@ -627,6 +627,17 @@ def _patch_values(fits: list[list[Any]], name: str) -> np.ndarray:
     )
 
 
+def _patch_background(fits: list[list[Any]]) -> np.ndarray:
+    """Each patch's fitted background terms on the last axis, NaN where the patch has no fit."""
+    width = max((len(fit.background) for row in fits for fit in row if fit is not None), default=0)
+    out = np.full((len(fits), len(fits[0]) if fits else 0, width), np.nan)
+    for i, row in enumerate(fits):
+        for j, fit in enumerate(row):
+            if fit is not None:
+                out[i, j, : len(fit.background)] = fit.background
+    return out
+
+
 def _fit_result_summary(result: Any, names: list[str]) -> dict[str, Any]:
     region = result.regions[0] if result.regions else None
     densities = np.asarray(region.densities if region is not None else [], dtype=float)
@@ -666,6 +677,19 @@ def _fit_result_summary(result: Any, names: list[str]) -> dict[str, Any]:
         "in_scatter": None
         if region is None
         else _finite_float_or_none(region.in_scatter),
+        "timing_offset_us": None
+        if region is None
+        else _finite_float_or_none(region.timing_offset_us),
+        "background": None
+        if region is None
+        else [_finite_float_or_none(v) for v in region.background],
+        "gamma_transmission": None
+        if region is None
+        else _finite_float_or_none(region.gamma_transmission),
+        "overdispersion": None
+        if region is None
+        else [None if v is None else _finite_float_or_none(v) for v in region.overdispersion],
+        "spread_share": _finite_float_or_none(result.spread_share),
         "time_background": [_finite_float_or_none(v) for v in result.time_background],
         "room_background": _finite_float_or_none(result.room_background),
         "alpha": _json_safe(list(result.alpha)),
@@ -877,11 +901,14 @@ def _process_density_map(
     arrays_to_save: dict[str, Any] = {
         "time_edges_us": edges,
         "patch_kinds": np.asarray(patch_kinds, dtype=object),
-        "trusted": np.asarray(result.trusted),
+        "identified": np.asarray(result.identified),
         "temperature_k": np.asarray(result.temperature_k),
         "thickness_variance": _patch_values(result.fits, "thickness_variance"),
         "capture_gammas": _patch_values(result.fits, "capture_gammas"),
         "in_scatter": _patch_values(result.fits, "in_scatter"),
+        "timing_offset_us": _patch_values(result.fits, "timing_offset_us"),
+        "gamma_transmission": _patch_values(result.fits, "gamma_transmission"),
+        "background": _patch_background(result.fits),
         "isotope_names": np.asarray(names),
     }
     density_stats = []
@@ -908,7 +935,7 @@ def _process_density_map(
         "output_npz": str(result_npz),
         "time_range_us": [float(edges[0]), float(edges[-1])],
         "n_bins": int(sample.shape[0]),
-        "map_shape": list(np.asarray(result.trusted).shape),
+        "map_shape": list(np.asarray(result.identified).shape),
         "n_fitted": int(result.n_fitted),
         "time_background": [_finite_float_or_none(v) for v in result.time_background],
         "room_background": _finite_float_or_none(result.room_background),

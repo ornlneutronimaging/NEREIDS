@@ -834,6 +834,39 @@ class TestCountsApi:
             ),
         )
 
+    def test_a_pulse_calibration_file_gives_a_calibration_with_its_prior(self):
+        root = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+        path = os.path.join(root, "tests/data/pulse_calibration/synthetic_foil.json")
+        calibration = nereids.Calibration.from_pulse_calibration_file(path)
+        assert calibration.pulse.has_prior
+        assert not self._calibration().pulse.has_prior
+        assert calibration.t0_us.kind == "fitted"
+        assert calibration.pulse.alpha[0].kind == "fitted"
+        assert calibration.pulse.beta[1].kind == "known"
+        with pytest.raises(ValueError):
+            nereids.Calibration.from_pulse_calibration_file(
+                os.path.join(root, "tests/data/endf/Ta-181-file32.endf")
+            )
+
+    def test_a_resonance_covariance_reaches_the_material(self):
+        root = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+        path = os.path.join(root, "tests/data/endf/Ta-181-file32.endf")
+        data = nereids.load_endf_file(path)
+        covariance = nereids.load_resonance_covariance(data, (22.0, 24.0), path=path)
+        assert covariance is not None
+        n = 3 * len(covariance.resonances)
+        assert n > 0 and covariance.covariance.shape == (n, n)
+        np.testing.assert_array_equal(covariance.covariance, covariance.covariance.T)
+        material = nereids.Material(
+            isotopes=[(data, nereids.Value.fitted(1e-4))],
+            temperature_k=nereids.Value.known(293.6),
+            covariances=[(0, covariance)],
+        )
+        [(index, carried)] = material.covariances
+        assert index == 0
+        np.testing.assert_array_equal(carried.covariance, covariance.covariance)
+        assert carried.resonances == covariance.resonances
+
     def test_value_kinds(self):
         known = nereids.Value.known(2.0)
         assert known.kind == "known" and known.value == 2.0
@@ -1071,6 +1104,8 @@ class TestCountsApi:
             background=[nereids.Value.known(0.0)] * 3,
         )
         result = nereids.fit_map(measurement, self._calibration())
+        identified = np.asarray(result.identified)
+        assert identified.shape == (1, 2) and identified.dtype == np.bool_
         assert result.empty is not None
         np.testing.assert_allclose(
             result.empty.predicted_sample, result.empty.predicted_open,
