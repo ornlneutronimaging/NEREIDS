@@ -1318,6 +1318,7 @@ fn test_tr024_natfe_parse() {
     assert_eq!(inp.spin_groups.len(), 11);
     assert!(!inp.no_broadening);
     assert_eq!(inp.isotope_symbol, "NatFE");
+    assert_eq!(sammy_to_resonance_data(&inp, &par).unwrap().za, 26056);
 
     // Verify broadening parameters.
     assert!(
@@ -1344,6 +1345,7 @@ fn test_tr024_natfe_parse() {
 
     // Group 1: Fe-56 (abundance=0.918, target_spin=0.0, 6 spin groups).
     assert!((multi[0].1 - 0.918).abs() < 1e-3, "Fe-56 abundance");
+    assert_eq!(multi[0].0.za, 26056);
 
     // Group 2: Fe-57 (abundance=0.058, target_spin=0.0, 3 spin groups).
     assert!((multi[1].1 - 0.058).abs() < 1e-3, "Fe-57 abundance");

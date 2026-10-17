@@ -1361,9 +1361,9 @@ pub fn sammy_to_resonance_data(
     // Infer Z and A from the isotope symbol (e.g. "60NI" → Z=28, A=60;
     // "FE56" → Z=26, A=56; "58NI" → Z=28, A=58; "NatFE" → Z=26, A=0).
     let (z, mut a) = parse_isotope_symbol(&inp.isotope_symbol)?;
-    // For natural-element symbols (A=0), approximate A from AWR.
+    // For natural-element symbols (A=0), approximate A from the mass in amu.
     if a == 0 {
-        a = inp.awr.round() as u32;
+        a = (inp.awr * NEUTRON_MASS_AMU).round() as u32;
     }
     let za = z * 1000 + a;
 
@@ -1611,9 +1611,9 @@ pub fn sammy_to_resonance_data_multi(
         } else {
             (card2_z, card2_a)
         };
-        // For natural-element symbols (A=0), approximate A from AWR.
+        // For natural-element symbols (A=0), approximate A from the mass in amu.
         if a == 0 {
-            a = isotope_awr.round() as u32;
+            a = (isotope_awr * NEUTRON_MASS_AMU).round() as u32;
         }
         let za = z * 1000 + a;
 
