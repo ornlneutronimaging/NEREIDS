@@ -1354,6 +1354,7 @@ pub fn sammy_to_resonance_data(
             .map_err(|e| SammyParseError::new(format!("invalid isotope: {e}")))?,
         za,
         awr: inp.awr,
+        smooth: Default::default(),
         ranges: vec![range],
     })
 }
@@ -1612,6 +1613,7 @@ pub fn sammy_to_resonance_data_multi(
                 .map_err(|e| SammyParseError::new(format!("invalid isotope: {e}")))?,
             za,
             awr: isotope_awr,
+            smooth: Default::default(),
             ranges: vec![range],
         };
 

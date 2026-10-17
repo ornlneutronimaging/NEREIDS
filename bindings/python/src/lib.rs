@@ -1169,6 +1169,7 @@ fn create_resonance_data(
             })?,
             za: z * 1000 + a,
             awr,
+            smooth: Default::default(),
             ranges: vec![ResonanceRange {
                 energy_low: 1e-5,
                 energy_high: 1e6,

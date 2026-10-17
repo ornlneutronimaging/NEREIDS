@@ -39,7 +39,9 @@
 use num_complex::Complex64;
 
 use nereids_core::constants::{DIVISION_FLOOR, LOG_FLOOR, PIVOT_FLOOR, QUANTUM_NUMBER_EPS};
-use nereids_endf::resonance::{ResonanceData, ResonanceFormalism, ResonanceRange, Tab1};
+use nereids_endf::resonance::{
+    ResonanceData, ResonanceFormalism, ResonanceRange, SmoothCrossSections, Tab1,
+};
 
 use crate::channel;
 use crate::penetrability;
@@ -312,6 +314,7 @@ pub struct CrossSections {
 /// calculator (SLBW, MLBW, Reich-Moore) based on the formalism stored in
 /// that range; non-evaluable ranges (LRF=7, LRU=2) resolve to `Skip` and
 /// contribute zero.  See the module-level table for the full dispatch map.
+/// Each channel adds File 3's cross section, [`ResonanceData::smooth`].
 ///
 /// Adjacent ranges that share a boundary energy use half-open intervals
 /// `[e_low, e_high)` so the boundary point is counted exactly once
@@ -384,11 +387,30 @@ pub fn cross_sections_at_energy(data: &ResonanceData, energy_ev: f64) -> CrossSe
         fission += f;
     }
 
+    with_smooth(
+        &data.smooth,
+        energy_ev,
+        CrossSections {
+            total,
+            elastic,
+            capture,
+            fission,
+        },
+    )
+}
+
+/// `resonances` plus each channel's File 3 cross section at `energy_ev`.
+fn with_smooth(
+    smooth: &SmoothCrossSections,
+    energy_ev: f64,
+    resonances: CrossSections,
+) -> CrossSections {
+    let at = |table: &Option<Tab1>| table.as_ref().map_or(0.0, |t| t.evaluate(energy_ev));
     CrossSections {
-        total,
-        elastic,
-        capture,
-        fission,
+        total: resonances.total + at(&smooth.total),
+        elastic: resonances.elastic + at(&smooth.elastic),
+        capture: resonances.capture + at(&smooth.capture),
+        fission: resonances.fission + at(&smooth.fission),
     }
 }
 
@@ -465,6 +487,7 @@ pub(crate) fn covers(low: f64, high: f64, half_open_upper: bool, energy_ev: f64)
 /// applied to one grid.
 pub struct CrossSectionPlan<'a> {
     awr: f64,
+    smooth: &'a SmoothCrossSections,
     precomputed: Vec<PrecomputedRangeData<'a>>,
 }
 
@@ -478,10 +501,15 @@ impl<'a> CrossSectionPlan<'a> {
             .enumerate()
             .map(|(range_idx, range)| precompute_range_data(range, range_idx, data, awr))
             .collect();
-        Self { awr, precomputed }
+        Self {
+            awr,
+            smooth: &data.smooth,
+            precomputed,
+        }
     }
 
-    /// Cross-sections at one energy, summed over every range covering it.
+    /// Cross-sections at one energy, summed over every range covering it, plus
+    /// File 3's.
     ///
     /// # Panics
     /// Panics if `energy_ev` is non-finite or non-positive — the same
@@ -509,12 +537,16 @@ impl<'a> CrossSectionPlan<'a> {
             fission += f;
         }
 
-        CrossSections {
-            total,
-            elastic,
-            capture,
-            fission,
-        }
+        with_smooth(
+            self.smooth,
+            energy_ev,
+            CrossSections {
+                total,
+                elastic,
+                capture,
+                fission,
+            },
+        )
     }
 
     /// Cross-sections at every energy of `energies`, in order.
@@ -1805,6 +1837,7 @@ mod tests {
             isotope: nereids_core::types::Isotope::new(94, 239).unwrap(),
             za: 94239,
             awr: 236.998,
+            smooth: Default::default(),
             ranges: vec![ResonanceRange {
                 energy_low: 1e-5,
                 energy_high: 1e4,
@@ -2094,6 +2127,7 @@ mod tests {
             isotope: nereids_core::types::Isotope::new(26, 56).unwrap(),
             za: 26056,
             awr,
+            smooth: Default::default(),
             ranges: vec![ResonanceRange {
                 energy_low: 1e-5,
                 energy_high: 1e5,
@@ -2127,6 +2161,7 @@ mod tests {
             isotope: nereids_core::types::Isotope::new(26, 56).unwrap(),
             za: 26056,
             awr,
+            smooth: Default::default(),
             ranges: vec![ResonanceRange {
                 energy_low: 1e-5,
                 energy_high: 1e5,

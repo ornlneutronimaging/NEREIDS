@@ -1,4 +1,5 @@
-//! ENDF-6 File 2 resonance parameter and File 32 covariance parser.
+//! ENDF-6 File 2 resonance parameter, File 3 cross section and File 32
+//! covariance parser.
 //!
 //! Parses the fixed-width 80-character ENDF-6 format to extract resolved
 //! resonance region (RRR) parameters.
@@ -34,9 +35,12 @@ use nereids_core::elements::isotope_from_za;
 ///   `FillSammyRmatrixFromRMat.cpp` line 422: `newChannel->getApe() * 10.0`
 const ENDF_RADIUS_TO_FM: f64 = 10.0;
 
-/// Parse ENDF-6 File 2 resonance parameters from raw ENDF text.
+/// Parse ENDF-6 File 2 resonance parameters, and File 3's cross sections
+/// when the text holds them, from raw ENDF text.
 ///
-/// Extracts all MF=2, MT=151 lines and parses the resolved resonance region.
+/// Extracts all MF=2, MT=151 lines and parses the resolved resonance region;
+/// File 3's sections MT=1, 2, 102 and 18 become [`ResonanceData::smooth`].
+/// An evaluation File 1 marks LRP=2 is refused.
 ///
 /// # Arguments
 /// * `endf_text` — Full ENDF file contents as a string.
@@ -325,10 +329,23 @@ pub fn parse_endf_file2(endf_text: &str) -> Result<ResonanceData, EndfParseError
         ));
     }
 
+    if let Some(lrp) = section(endf_text, "1", "451")
+        .first()
+        .map(|line| parse_endf_int(line, 2))
+        .transpose()?
+        && lrp == 2
+    {
+        return Err(EndfParseError::UnsupportedFormat(
+            "LRP=2: File 3 holds the whole cross section and its resonance parameters are not \
+             to be added to it; only LRP=1 evaluations are supported"
+                .into(),
+        ));
+    }
     let data = ResonanceData {
         isotope,
         za,
         awr,
+        smooth: parse_file3(endf_text)?,
         ranges: all_ranges,
     };
 
@@ -360,10 +377,34 @@ pub fn parse_endf_file2(endf_text: &str) -> Result<ResonanceData, EndfParseError
 }
 
 fn section_151<'a>(endf_text: &'a str, mf: &str) -> Vec<&'a str> {
+    section(endf_text, mf, "151")
+}
+
+/// The lines of section `mt` of file `mf`.
+fn section<'a>(endf_text: &'a str, mf: &str, mt: &str) -> Vec<&'a str> {
     endf_text
         .lines()
-        .filter(|line| line.len() >= 75 && line[70..72].trim() == mf && &line[72..75] == "151")
+        .filter(|line| line.len() >= 75 && line[70..72].trim() == mf && line[72..75].trim() == mt)
         .collect()
+}
+
+/// File 3's cross sections of the reactions [`SmoothCrossSections`] holds,
+/// each the TAB1 record that follows its section's HEAD record.
+fn parse_file3(endf_text: &str) -> Result<SmoothCrossSections, EndfParseError> {
+    let table = |mt: &str| -> Result<Option<Tab1>, EndfParseError> {
+        let lines = section(endf_text, "3", mt);
+        if lines.is_empty() {
+            return Ok(None);
+        }
+        let mut pos = 1;
+        parse_tab1_with(&lines, &mut pos, true).map(Some)
+    };
+    Ok(SmoothCrossSections {
+        total: table("1")?,
+        elastic: table("2")?,
+        capture: table("102")?,
+        fission: table("18")?,
+    })
 }
 
 const FILE32_TOLERANCE: f64 = 1e-5;
@@ -1456,6 +1497,12 @@ fn skip_urr_range(lines: &[&str], pos: &mut usize, lrf: i32) -> Result<(f64, f64
 ///
 /// INT codes: 1=histogram, 2=lin-lin, 3=log-x/lin-y, 4=lin-x/log-y, 5=log-log.
 fn parse_tab1(lines: &[&str], pos: &mut usize) -> Result<Tab1, EndfParseError> {
+    parse_tab1_with(lines, pos, false)
+}
+
+/// A TAB1 record; with `jumps`, an x may appear twice in a row, the second
+/// value holding from it on.
+fn parse_tab1_with(lines: &[&str], pos: &mut usize, jumps: bool) -> Result<Tab1, EndfParseError> {
     let cont = parse_cont(lines, pos)?;
     let nr = checked_count(cont.n1, "NR")?; // number of interpolation regions
     let np = checked_count(cont.n2, "NP")?; // number of data points
@@ -1540,9 +1587,14 @@ fn parse_tab1(lines: &[&str], pos: &mut usize) -> Result<Tab1, EndfParseError> {
     for i in 0..np {
         let x = data_raw[i * 2];
         let y = data_raw[i * 2 + 1];
-        // x-values must be strictly increasing; Tab1::evaluate() relies on this.
+        // x-values must be strictly increasing, or repeat once at a jump;
+        // Tab1::evaluate() relies on this.
+        let jump = jumps
+            && points.last().is_some_and(|&(x_prev, _)| x == x_prev)
+            && points.len().checked_sub(2).is_none_or(|k| points[k].0 < x);
         if let Some(&(x_prev, _)) = points.last()
             && x <= x_prev
+            && !jump
         {
             return Err(EndfParseError::UnsupportedFormat(format!(
                 "TAB1 x[{}]={} is not greater than x[{}]={} (x must be strictly increasing)",

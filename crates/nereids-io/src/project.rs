@@ -2305,6 +2305,7 @@ mod tests {
             isotope: nereids_core::types::Isotope::new(74, 182).unwrap(),
             za: 74182,
             awr: 180.948,
+            smooth: Default::default(),
             ranges: vec![],
         };
         snap.endf_cache = vec![("W-182".into(), rd)];
@@ -2673,6 +2674,7 @@ mod tests {
             isotope: nereids_core::types::Isotope::new(92, 238).unwrap(),
             za: 92238,
             awr: 236.006,
+            smooth: Default::default(),
             ranges: vec![ResonanceRange {
                 energy_low: 1e-5,
                 energy_high: 1e4,
@@ -2726,6 +2728,7 @@ mod tests {
             isotope: nereids_core::types::Isotope::new(40, 90).unwrap(),
             za: 40090,
             awr: 89.132,
+            smooth: Default::default(),
             ranges: vec![ResonanceRange {
                 energy_low: 1e-5,
                 energy_high: 1e4,
@@ -2763,6 +2766,7 @@ mod tests {
             isotope: nereids_core::types::Isotope::new(92, 238).unwrap(),
             za: 92238,
             awr: 236.006,
+            smooth: Default::default(),
             ranges: vec![ResonanceRange {
                 energy_low: 1e-5,
                 energy_high: 1e4,
