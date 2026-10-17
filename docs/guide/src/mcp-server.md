@@ -205,8 +205,9 @@ in pixels.
 
 Map workflows take `fit.time_background` and `fit.room_background` per
 pixel, shared by every patch, and `fit.gamma_transmission` for every sample
-patch. The map's `trusted`
-array reports numerical status, not physical or thermometry validation. Masks are cropped with the counts when an ROI or
+patch. The map's `identified`
+array marks the patches whose fitted densities and temperature each have a
+finite standard deviation; it is not physical or thermometry validation. Masks are cropped with the counts when an ROI or
 pixel limit is selected.
 
 Paired arrays must have matching shapes, and the time-bin edge count must be

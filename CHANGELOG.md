@@ -93,11 +93,14 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
   Unsupported fit settings are rejected.
 - PLEIADES test data are no longer a Git submodule. The local directory is
   ignored. The test suite does not require it.
+- The map's `trusted` array is `identified`, in Rust, Python and the MCP
+  map files: where the counts determine every fitted density and the fitted
+  temperature of a converged patch.
 
 ### Limitations
 
-- The map's `trusted` array records numerical status only. It does not
-  validate the physical model or the inferred temperature.
+- The map's `identified` array and overdispersion maps do not validate the
+  physical model or the inferred temperature.
 - The GUI holds temperature and pulse numbers at their supplied values.
   Isotope-group members have separate fitted densities. Legacy project
   result fields remain readable but are not restored as counts-fit results.
