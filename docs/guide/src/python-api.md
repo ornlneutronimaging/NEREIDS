@@ -88,14 +88,31 @@ broadening has the lattice's variance.
 #### Material
 
 Material(isotopes, temperature_k, library="endf8.1", thickness_variance=None,
-lattice=None) takes a list of (ResonanceData, Value) pairs, each density in
+lattice=None, covariances=[]) takes a list of (ResonanceData, Value) pairs, each density in
 atoms/barn, a temperature Value in K, and the relative variance v of the areal
 density over the region's pixels, known 0 by default: the region transmits
 (1 + v*D)**(-1/v), the mean for a Gamma-distributed areal density, D the
 optical depth at the mean density. lattice is the PhononSpectrum the nuclei
 vibrate with: the cross sections are broadened by the harmonic lattice and
 temperature_k is the thermodynamic temperature. None broadens by the free gas,
-for which a solid's temperature is its effective one.
+for which a solid's temperature is its effective one. covariances pairs an
+index into isotopes with that isotope's ResonanceCovariance, which the fit's
+covariance carries.
+
+#### ResonanceCovariance
+
+ResonanceCovariance holds the covariance of the energy, neutron width and
+capture width, in that order, of each listed resonance of one evaluation.
+resonances lists them as (range, L-group, resonance) indices into the
+ResonanceData it was read with, and covariance is the matrix over the
+3 * len(resonances) parameters, in eV**2.
+
+load_resonance_covariance(data, window_ev, path=None, library="endf8.1",
+mat=None) reads the File 32 covariance of the energy, neutron width and
+capture width of data's Reich-Moore resonances between window_ev = (low, high)
+eV, from the ENDF file at path or from the library's evaluation of data's
+isotope, and returns None when the evaluation has none. Read it with the same
+evaluation as data: its resonances are indices into data.
 
 #### Region
 
@@ -151,6 +168,10 @@ held or fitted.
 
 Calibration(t0_us, flight_path_m, pulse) gives the timing offset in
 microseconds and the flight path in metres. Both are Values, known or fitted.
+Calibration.from_pulse_calibration_file(path) reads a pulse calibration file:
+t0 and the flight path are fitted from the calibrated ones, and the fitted
+pulse numbers are fitted from theirs under the calibration's prior, its mean
+and covariance (Pulse.has_prior); the others are known.
 
 #### RegionFit and CountsFit
 

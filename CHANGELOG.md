@@ -13,6 +13,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
   terms, gamma transmission and overdispersions, and the fit's spread share;
   density-map .npz files hold each patch's timing offset, gamma transmission
   and background terms.
+- Python reads a pulse calibration file into a `Calibration` whose fitted
+  pulse numbers are fitted under the calibration's prior
+  (`Calibration.from_pulse_calibration_file`), and a File 32 resonance
+  covariance (`load_resonance_covariance`) that `Material(covariances=...)`
+  carries into the fit's covariance.
 - `fit_map` fits the time background `[C, A, tau]` per pixel as a quantity
   shared by every patch, and each patch's gamma transmission.
   `MapMeasurement` gains `time_background` and `gamma_transmission`;
