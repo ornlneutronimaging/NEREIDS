@@ -42,7 +42,8 @@ pub struct Tab1 {
     pub boundaries: Vec<usize>,
     /// Interpolation law codes (INT) for each region.
     pub interp_codes: Vec<u32>,
-    /// Data points as (x, y) pairs, sorted ascending in x.
+    /// Data points as (x, y) pairs, ascending in x; an x given twice in a
+    /// row is a jump, the second value holding from it on.
     pub points: Vec<(f64, f64)>,
 }
 
@@ -82,7 +83,7 @@ impl Tab1 {
                 pts[0].1
             };
         }
-        if x <= pts[0].0 {
+        if x < pts[0].0 || (x == pts[0].0 && pts.get(1).is_none_or(|&(next, _)| next > x)) {
             return pts[0].1;
         }
         if x >= pts[pts.len() - 1].0 {
@@ -195,8 +196,35 @@ pub struct ResonanceData {
     pub za: u32,
     /// Atomic weight ratio (mass of target / neutron mass).
     pub awr: f64,
+    /// File 3's smooth cross sections, added to those of the resonance
+    /// parameters at every energy.
+    pub smooth: SmoothCrossSections,
     /// Energy ranges containing resonance parameters.
     pub ranges: Vec<ResonanceRange>,
+}
+
+/// An evaluation's File 3 cross sections in barn, each a function of the
+/// neutron energy in eV, which add to the cross sections its resonance
+/// parameters give (LRP = 1).  `None` for a reaction File 3 does not give.
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+pub struct SmoothCrossSections {
+    /// Total, MT = 1.
+    pub total: Option<Tab1>,
+    /// Elastic scattering, MT = 2.
+    pub elastic: Option<Tab1>,
+    /// Radiative capture, MT = 102.
+    pub capture: Option<Tab1>,
+    /// Fission, MT = 18.
+    pub fission: Option<Tab1>,
+}
+
+impl SmoothCrossSections {
+    /// Each table given.
+    pub fn tables(&self) -> impl Iterator<Item = &Tab1> {
+        [&self.total, &self.elastic, &self.capture, &self.fission]
+            .into_iter()
+            .flatten()
+    }
 }
 
 /// A single energy range within the resolved resonance region.
@@ -611,6 +639,18 @@ mod tests {
         assert_eq!(table.evaluate(8.0), 15.0, "at high bound");
     }
 
+    #[test]
+    fn a_repeated_energy_is_a_jump_to_its_second_value() {
+        let first = make_linlin_table(vec![(1.0, 0.0), (1.0, 5.0), (2.0, 7.0)]);
+        assert_eq!(first.evaluate(0.5), 0.0);
+        assert_eq!(first.evaluate(1.0), 5.0);
+        assert_eq!(first.evaluate(1.5), 6.0);
+        let inside = make_linlin_table(vec![(0.0, 0.0), (1.0, 1.0), (1.0, 5.0), (2.0, 7.0)]);
+        assert_eq!(inside.evaluate(0.5), 0.5);
+        assert_eq!(inside.evaluate(1.0), 5.0);
+        assert_eq!(inside.evaluate(1.5), 6.0);
+    }
+
     /// Histogram interpolation (INT=1): y stays constant from left endpoint.
     #[test]
     fn test_tab1_histogram() {
@@ -936,6 +976,7 @@ pub mod test_support {
             isotope: Isotope::new(z, a).unwrap(),
             za: z * 1000 + a,
             awr,
+            smooth: Default::default(),
             ranges: vec![range],
         }
     }

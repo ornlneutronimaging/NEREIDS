@@ -64,16 +64,13 @@
 //! caller that needs the error certificate can see it was not met rather than
 //! having to assume it was.
 //!
-//! ## Not implemented here
+//! ## File 3
 //!
-//! A range carrying a File-3 (MF=3) smooth background is integrated without
-//! it, because only File 2 is parsed and nothing can answer whether a range
-//! has one. Whichever change adds MF=3 parsing owes this.
-//!
-//! Below a resolved range's lower bound the dispatcher returns zero, while
-//! [`crate::doppler`] extrapolates 1/v. The two therefore disagree about a
-//! window reaching under that bound. Both are approximations of a File-3
-//! background neither can see.
+//! The integrand is the dispatcher's cross section, File 3's included, so a
+//! File-3 cross section is broadened with the resonances and enters the
+//! temperature derivative; its knots inside the window are panel edges.
+//! Below a resolved range's lower bound, data without File 3 give zero here,
+//! while [`crate::doppler`] extrapolates 1/v.
 
 use std::cmp::Ordering;
 use std::collections::BinaryHeap;
@@ -468,6 +465,15 @@ impl TargetContext<'_, '_> {
                 }
             }
             for &(knot_energy, _) in range.ap_table.iter().flat_map(|table| &table.points) {
+                push_source_energy(knot_energy);
+            }
+        }
+        for table in data.smooth.tables() {
+            let start = table.points.partition_point(|&(e, _)| e < low_energy);
+            for &(knot_energy, _) in table.points[start..]
+                .iter()
+                .take_while(|&&(e, _)| e <= high_energy)
+            {
                 push_source_energy(knot_energy);
             }
         }

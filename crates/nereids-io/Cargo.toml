@@ -23,3 +23,4 @@ nereids-endf = { workspace = true, optional = true }
 
 [dev-dependencies]
 tempfile = "3"
+nereids-endf = { workspace = true, features = ["test-support"] }

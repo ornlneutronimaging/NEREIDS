@@ -1474,6 +1474,7 @@ mod tests {
             isotope: Isotope::new(1, 10).unwrap(),
             za: 1010,
             awr: 10.0,
+            smooth: Default::default(),
             ranges: vec![ResonanceRange {
                 energy_low: 0.0,
                 energy_high: 100.0,

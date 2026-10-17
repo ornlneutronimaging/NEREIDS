@@ -582,6 +582,7 @@ mod tests {
             isotope: nereids_core::types::Isotope::new(26, 56).unwrap(),
             za: 26056,
             awr,
+            smooth: Default::default(),
             ranges: vec![ResonanceRange {
                 energy_low: 1e-5,
                 energy_high: 1e5,
@@ -615,6 +616,7 @@ mod tests {
             isotope: nereids_core::types::Isotope::new(26, 56).unwrap(),
             za: 26056,
             awr,
+            smooth: Default::default(),
             ranges: vec![ResonanceRange {
                 energy_low: 1e-5,
                 energy_high: 1e5,
@@ -671,6 +673,7 @@ mod tests {
             isotope: nereids_core::types::Isotope::new(26, 56).unwrap(),
             za: 26056,
             awr,
+            smooth: Default::default(),
             ranges: vec![ResonanceRange {
                 energy_low: 1e-5,
                 energy_high: 1e5,
