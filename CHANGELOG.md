@@ -120,6 +120,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
 - A channel of an SLBW, MLBW or Reich–Moore L-group that holds no resonance
   scatters as a hard sphere, `pi/k^2 * g_J * 4 sin^2(phi_l)`; its
   potential scattering was left out.
+- When the counts reject a fit, `fit_counts` fits each fitted temperature
+  again from 2,500 K and keeps the fit that describes the counts better. A
+  thin sample hotter than about 1,500 K, fitted from room temperature, ended
+  in a false minimum near the start.
 
 ### Limitations
 
