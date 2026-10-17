@@ -133,6 +133,7 @@
 //! applies its `psr_fwhm_ns` fold to the IC family only, never to
 //! tabulated/UDR kernels).
 
+use std::ops::RangeInclusive;
 use std::sync::Arc;
 
 use crate::resolution::{ResolutionParseError, TOF_FACTOR, TabulatedResolution};
@@ -146,6 +147,9 @@ const LAMBDA_ANGSTROM_FACTOR: f64 = 0.285_993;
 
 /// Rates below this (1/µs) are clamped to keep the pulse well-defined.
 const MIN_RATE: f64 = 1e-9;
+
+/// The detector tail's mean delays `τ_D`, in µs, that the pulse accepts.
+pub const DETECTOR_TAIL_DECAY_US: RangeInclusive<f64> = 1e-9..=1e9;
 
 /// Relative-to-peak weight below which kernel tails are trimmed.
 const TRIM_REL: f64 = 1e-7;
@@ -368,8 +372,6 @@ fn ic_cdf_slopes(alpha: f64, beta: f64, r: f64, tau: f64) -> [f64; 3] {
     if tau.is_nan() || tau <= 0.0 || tau == f64::INFINITY {
         return [0.0; 3];
     }
-    let alpha = alpha.max(MIN_RATE);
-    let beta = beta.max(MIN_RATE);
     let at = alpha * tau;
     let fast = 0.5 * tau * at * at * (-at).exp();
     const CDF_TAIL_LIMIT: f64 = 1.0e100;
@@ -755,7 +757,7 @@ pub struct IkedaCarpenterParams {
 pub struct DetectorTail {
     /// `f`, within 0–1.
     pub fraction: f64,
-    /// `τ_D` in µs, above 0 and at most 1e9.
+    /// `τ_D` in µs, from 1e-9 to 1e9.
     pub decay_us: f64,
 }
 
@@ -779,13 +781,13 @@ impl IkedaCarpenterParams {
             return Ok(None);
         };
         if !((0.0..=1.0).contains(&tail.fraction)
-            && tail.decay_us > 0.0
-            && tail.decay_us <= 1.0 / MIN_RATE)
+            && DETECTOR_TAIL_DECAY_US.contains(&tail.decay_us))
         {
             return Err(ResolutionParseError::InvalidFormat(format!(
-                "a detector tail needs a fraction within 0–1 and a decay above 0 and at most \
-                 {} µs, got {tail:?}",
-                1.0 / MIN_RATE
+                "a detector tail needs a fraction within 0–1 and a decay from {:e} to {:e} µs, \
+                 got {tail:?}",
+                DETECTOR_TAIL_DECAY_US.start(),
+                DETECTOR_TAIL_DECAY_US.end()
             )));
         }
         Ok(Some((tail.fraction, 1.0 / tail.decay_us)))
@@ -1356,7 +1358,7 @@ impl DetectorPulse {
     /// [`ResolutionParseError::InvalidFormat`] unless `0 < low < high` are
     /// finite, `n_tau` is at least 8, the triangle's FWHM is finite and 0 or
     /// more, the pulse has no Gaussian burst, a detector tail has its
-    /// fraction within 0–1 and its decay above 0 and at most 1e9 µs, and the
+    /// fraction within 0–1 and its decay from 1e-9 to 1e9 µs, and the
     /// laws are valid at both ends of the span: `α` and `β` finite and at
     /// least 1e-9 µs⁻¹, `R` within 0–1.
     pub fn new(

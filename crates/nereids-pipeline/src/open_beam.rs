@@ -10,7 +10,7 @@ use nereids_fitting::parameters::{FitParameter, ParameterSet};
 use nereids_fitting::poisson::{PoissonConfig, PoissonResult, Prior, poisson_fit};
 use nereids_physics::flight_time_grid::{FlightTimeGrid, FlightTimeGridError};
 use nereids_physics::ikeda_carpenter::{
-    DetectorPulse, DetectorTail, EnergyLaw, IkedaCarpenterParams,
+    DETECTOR_TAIL_DECAY_US, DetectorPulse, DetectorTail, EnergyLaw, IkedaCarpenterParams,
 };
 
 use crate::beam::BeamSpline;
@@ -58,7 +58,7 @@ impl Calibration {
             RATE,
             FRACTION,
             FRACTION,
-            (f64::MIN_POSITIVE..=1e9, "above 0 and at most 1e9"),
+            (DETECTOR_TAIL_DECAY_US, "from 1e-9 to 1e9"),
         ];
         let mut parameters = vec![
             self.t0_us
@@ -100,8 +100,8 @@ pub struct Pulse {
     /// `energy_span_ev`, linear in `√E` from `R`.  `None` holds it at `R`.
     pub r_high: Option<Value>,
     /// `[f, τ_D]`: the detector records a fraction `f` (0–1) of the counts
-    /// late by an exponential delay of mean `τ_D` µs (above 0 and at most
-    /// 1e9), and the rest at their arrival; the time background is recorded
+    /// late by an exponential delay of mean `τ_D` µs (from 1e-9 to 1e9),
+    /// and the rest at their arrival; the time background is recorded
     /// as it arrives.  `None` records every count at its arrival.
     pub detector_tail: Option<[Value; 2]>,
     /// `(low, high)`, the energies in eV the laws hold over; a window that

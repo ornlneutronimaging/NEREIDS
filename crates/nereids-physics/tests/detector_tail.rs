@@ -1,6 +1,6 @@
 use nereids_physics::flight_time_grid::FlightTimeGrid;
 use nereids_physics::ikeda_carpenter::{
-    DetectorPulse, DetectorTail, IkedaCarpenter, IkedaCarpenterParams,
+    DETECTOR_TAIL_DECAY_US, DetectorPulse, DetectorTail, IkedaCarpenter, IkedaCarpenterParams,
     NEGLIGIBLE_ARRIVAL_PROBABILITY, SynthesisGrid,
 };
 use nereids_physics::resolution::TOF_FACTOR;
@@ -37,8 +37,8 @@ fn probabilities(params: &IkedaCarpenterParams, arrival_us: f64) -> Vec<f64> {
 
 /// `[α, β, R]`, the triangle's FWHM and `τ_D`: `1/τ_D` apart from `β`,
 /// equal to it, within a relative 1e-3 of it and just beyond that, with no
-/// storage, and above `α`.
-const CASES: [([f64; 3], f64, f64); 8] = [
+/// storage, above `α`, and equal to both.
+const CASES: [([f64; 3], f64, f64); 9] = [
     ([2.0, 0.3, 0.2], 0.0, 1.5),
     ([2.0, 0.3, 0.2], 0.4, 1.5),
     ([2.0, 0.5, 0.3], 0.0, 2.0),
@@ -47,6 +47,7 @@ const CASES: [([f64; 3], f64, f64); 8] = [
     ([2.0, 0.5, 0.3], 0.0, 1.0 / (0.5 * 1.003)),
     ([2.0, 0.3, 0.0], 0.0, 0.8),
     ([2.0, 3.0, 0.4], 0.4, 0.25),
+    ([1.0, 1.0, 0.3], 0.0, 1.0),
 ];
 
 #[test]
@@ -174,6 +175,94 @@ fn the_slopes_are_those_of_the_probabilities() {
     }
 }
 
+fn everything_at(laws: &IkedaCarpenterParams, edges: &[f64]) -> Vec<Vec<f64>> {
+    let mut all = vec![
+        laws.bin_probabilities_at(ENERGY_EV, 0.0, edges)
+            .expect("probabilities"),
+    ];
+    all.extend(
+        laws.bin_pulse_slopes_at(ENERGY_EV, 0.0, edges)
+            .expect("pulse slopes"),
+    );
+    all.extend(
+        laws.bin_tail_slopes_at(ENERGY_EV, 0.0, edges)
+            .expect("tail slopes"),
+    );
+    all.push(arrival_slopes(laws, 0.0, edges));
+    all
+}
+
+fn arrival_slopes(laws: &IkedaCarpenterParams, arrival_us: f64, edges: &[f64]) -> Vec<f64> {
+    laws.bin_arrival_slopes_at(ENERGY_EV, arrival_us, edges)
+        .expect("arrival slopes")
+}
+
+fn assert_close(got: &[f64], expected: &[f64], tolerance: f64, name: &str) {
+    let scale = expected.iter().fold(0.0_f64, |m, v| m.max(v.abs()));
+    for (got, expected) in got.iter().zip(expected) {
+        assert!(
+            (got - expected).abs() <= tolerance * scale,
+            "{name}: {got} against {expected}"
+        );
+    }
+}
+
+#[test]
+fn the_pulse_at_the_lowest_rates_is_the_same_pulse_in_slower_time() {
+    let ([alpha, beta, r], _, decay_us) = CASES[8];
+    let slower = *DETECTOR_TAIL_DECAY_US.end();
+    let at = |by: f64| {
+        let laws = params(
+            [alpha / by, beta / by, r],
+            0.0,
+            tail(FRACTION, decay_us * by),
+        );
+        let edges: Vec<f64> = edges().iter().map(|e| (e - ARRIVAL_US) * by).collect();
+        everything_at(&laws, &edges)
+    };
+    let names = ["probability", "α", "β", "R", "h²", "f", "τ_D", "arrival"];
+    let powers = [0, 1, 1, 0, -2, 0, -1, -1];
+    for (((fast, slow), power), name) in at(1.0).iter().zip(at(slower)).zip(powers).zip(names) {
+        let slow: Vec<f64> = slow.iter().map(|v| v * slower.powi(-power)).collect();
+        assert_close(&slow, fast, 1e-8, name);
+    }
+}
+
+#[test]
+fn the_shortest_decay_moves_the_counts_by_its_mean() {
+    let (rates, fwhm_us, _) = CASES[1];
+    let decay_us = *DETECTOR_TAIL_DECAY_US.start();
+    let tailed = params(rates, fwhm_us, tail(FRACTION, decay_us));
+    let plain = params(rates, fwhm_us, None);
+    let slopes = arrival_slopes(&plain, ARRIVAL_US, &edges());
+    let moved: Vec<f64> = probabilities(&tailed, ARRIVAL_US)
+        .iter()
+        .zip(probabilities(&plain, ARRIVAL_US))
+        .map(|(t, p)| (t - p) / (FRACTION * decay_us))
+        .collect();
+    let [by_f, by_decay] = tailed
+        .bin_tail_slopes_at(ENERGY_EV, ARRIVAL_US, &edges())
+        .expect("tail slopes");
+    let by_f: Vec<f64> = by_f.iter().map(|v| v / decay_us).collect();
+    let by_decay: Vec<f64> = by_decay.iter().map(|v| v / FRACTION).collect();
+    let recorded = arrival_slopes(&tailed, ARRIVAL_US, &edges());
+    for (got, name) in [
+        (moved, "moved"),
+        (by_f, "f"),
+        (by_decay, "τ_D"),
+        (recorded, "arrival"),
+    ] {
+        assert_close(&got, &slopes, 1e-4, name);
+    }
+    let pulse = |laws: &IkedaCarpenterParams| {
+        laws.bin_pulse_slopes_at(ENERGY_EV, ARRIVAL_US, &edges())
+            .expect("pulse slopes")
+    };
+    for (got, expected) in pulse(&tailed).iter().zip(pulse(&plain)) {
+        assert_close(got, &expected, 1e-4, "pulse");
+    }
+}
+
 #[test]
 fn no_fraction_leaves_the_pulse_as_it_is() {
     let (rates, fwhm_us, decay_us) = CASES[1];
@@ -229,6 +318,7 @@ fn a_tail_out_of_range_is_refused() {
         (-0.1, 1.0),
         (f64::NAN, 1.0),
         (0.2, 0.0),
+        (0.2, 1e-10),
         (0.2, 2e9),
     ] {
         let laws = params([2.0, 0.3, 0.2], 0.0, tail(fraction, decay_us));
