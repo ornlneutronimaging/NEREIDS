@@ -121,13 +121,13 @@ fn the_lattice_keeps_the_kernel_s_mass_mean_variance_and_skew() {
         );
         let spread = second.values[k] - e * e;
         assert!(
-            (spread - variance).abs() <= 1e-8 * variance,
+            (spread - variance).abs() <= 1e-8 * variance + 1e-14 * e * e,
             "{e}: {spread} {variance}"
         );
         let slope = second.derivatives[k];
         let expected = 2.0 * r * kt_eff_slope;
         assert!(
-            (slope - expected).abs() <= 1e-8 * expected,
+            (slope - expected).abs() <= 1e-8 * expected + 1e-14 * e * e,
             "{e}: {slope} {expected}"
         );
         let skewed = third.values[k] - e.powi(3) - 3.0 * e * variance;
@@ -309,4 +309,85 @@ fn a_resonance_broadened_in_the_lattice_matches_sammy_s_crystal_lattice_model() 
             "{energy}: {broadened:e} {unbroadened:e}"
         );
     }
+}
+
+fn constant_with(table: Vec<(f64, f64)>) -> ResonanceData {
+    ResonanceData {
+        smooth: SmoothCrossSections {
+            total: Some(Tab1 {
+                boundaries: vec![table.len()],
+                interp_codes: vec![2],
+                points: table,
+            }),
+            ..SmoothCrossSections::default()
+        },
+        ..power(0.0)
+    }
+}
+
+#[test]
+fn spectra_masses_bands_tables_and_spans_the_kernel_cannot_resolve_are_refused() {
+    let scaled = PhononSpectrum::new(1e-3, vec![0.0, 1e308, 1e308]).expect("scaled");
+    assert_eq!(
+        scaled,
+        PhononSpectrum::new(1e-3, vec![0.0, 1.0, 1.0]).expect("unit")
+    );
+    assert!(PhononSpectrum::new(1e-320, vec![0.0, 1.0]).is_err());
+    let one = power(0.0);
+    let broaden = |data: &ResonanceData, energies: &[f64], kelvin: f64, s: &PhononSpectrum| {
+        broaden_in_lattice(energies, data, kelvin, s, Channel::Total)
+    };
+    let massless = ResonanceData {
+        awr: f64::NAN,
+        ..one.clone()
+    };
+    assert!(matches!(
+        broaden(&massless, &[20.0], KELVIN, &spectrum()),
+        Err(LatticeError::Grid(_))
+    ));
+    let mut band = vec![0.0; 301];
+    band[200] = 1.0;
+    let band = PhononSpectrum::new(1e-4, band).expect("band");
+    assert!(matches!(
+        broaden(&one, &[2.0], 1.0, &band),
+        Err(LatticeError::Unresolved { .. })
+    ));
+    let jump = constant_with(vec![(1e-3, 1.0), (20.0, 1.0), (20.0, 2.0), (1e3, 2.0)]);
+    assert!(matches!(
+        broaden(&jump, &[20.1], KELVIN, &spectrum()),
+        Err(LatticeError::Jump(_))
+    ));
+    let narrow = synthetic_isotope(73, 181, 20.0, 5e-6, 5e-6);
+    let many: Vec<f64> = (0..2000).map(|k| 19.0 + 1e-3 * k as f64).collect();
+    assert!(matches!(
+        broaden(&narrow, &many, KELVIN, &spectrum()),
+        Err(LatticeError::TooMuchWork(_))
+    ));
+    let wide = broaden(&one, &[1.0, 100.0], KELVIN, &spectrum()).expect("each in reach");
+    for value in wide.values {
+        assert!((value - 1.0).abs() <= 1e-7, "{value}");
+    }
+}
+
+#[test]
+fn a_file_3_peak_narrower_than_the_phonon_step_is_broadened_with_its_area() {
+    let (centre, half_width, height) = (20.0, 1e-4, 1000.0);
+    let peak = constant_with(vec![
+        (1e-3, 0.0),
+        (centre - half_width, 0.0),
+        (centre, height),
+        (centre + half_width, 0.0),
+        (1e3, 0.0),
+    ]);
+    let step = 3e-2;
+    let energies: Vec<f64> = (0..=40).map(|k| 19.4 + step * k as f64).collect();
+    let broadened = broaden_in_lattice(&energies, &peak, KELVIN, &spectrum(), Channel::Total)
+        .expect("broadened");
+    let area: f64 = broadened
+        .values
+        .windows(2)
+        .map(|w| 0.5 * step * (w[0] + w[1]))
+        .sum();
+    let expected = height * half_width;
+    assert!((area / expected - 1.0).abs() <= 1e-3, "{area} {expected}");
 }

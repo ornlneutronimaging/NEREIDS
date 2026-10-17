@@ -23,10 +23,11 @@
 //! `σ` is sampled once on a uniform grid of step `h`, the integral is the
 //! trapezoid rule on that grid, and `P_c` comes on the grid's nodes from a
 //! fast Fourier transform of `Φ − e^{−2W}`, sampled at `t = j·dt` up to
-//! `π/h`.  A resonance of total width `Γ` makes the trapezoid rule's error
-//! `≈ e^{−πΓ/h}`, so `h ≤ πΓ/30` for every resonance the kernel reaches;
-//! and `h ≤ π·ω_max/100` resolves the phonon spectrum's structure, whose
-//! weight `e^{−2W}·2W` the one-phonon term carries.
+//! `100/ω_max`, which resolves the phonon spectrum's structure, whose weight
+//! `e^{−2W}·2W` the one-phonon term carries.  A resonance of total width `Γ`
+//! makes the trapezoid rule's error `≈ e^{−πΓ/h}`, so `h ≤ πΓ/30` for every
+//! resonance the kernel reaches, `h ≤ π·ω_max/100`, and `h` is a tenth of
+//! every File-3 knot interval within reach.
 
 use std::f64::consts::PI;
 
@@ -36,7 +37,7 @@ use num_complex::Complex64;
 use rayon::prelude::*;
 
 use crate::continuous_doppler::{Channel, TierOneBroadening};
-use crate::doppler::{DopplerError, validate_doppler_grid};
+use crate::doppler::{DopplerError, DopplerParams, validate_doppler_grid};
 use crate::reich_moore::CrossSectionPlan;
 
 /// Standard deviations of the kernel, and phonon energies beyond them, its
@@ -46,6 +47,16 @@ const KERNEL_PHONONS: f64 = 10.0;
 
 /// Most points of the cross section's grid, or of one transform.
 const MAX_POINTS: usize = 1 << 22;
+
+/// Most terms of the phonon sums and the transforms together.
+const MAX_WORK: f64 = 1e10;
+
+/// Most departure from 1 of a kernel's weights: the zero-phonon line's and
+/// `h` times its sampled values over its window.
+const MASS_TOLERANCE: f64 = 1e-7;
+
+/// Grid steps per File-3 knot interval within the kernel's reach.
+const STEPS_PER_KNOT: f64 = 10.0;
 
 /// Gauss–Legendre 8-point nodes and weights on `[−1, 1]`, non-negative half.
 const GAUSS_LEGENDRE_8: [(f64, f64); 4] = [
@@ -66,8 +77,19 @@ pub enum LatticeError {
     Grid(DopplerError),
     /// The kernel reaches energies at or below zero.
     BelowZero(f64),
+    /// File 3 jumps at this energy, within the kernel's reach.
+    Jump(f64),
+    /// The kernel at this energy is not resolved: its weights sum to `mass`.
+    Unresolved {
+        /// The target energy, eV.
+        energy_ev: f64,
+        /// The kernel's weights' sum.
+        mass: f64,
+    },
     /// The cross section's grid or a transform would exceed 2²² points.
     TooManyPoints(usize),
+    /// The phonon sums and transforms would take more than 10¹⁰ terms.
+    TooMuchWork(f64),
 }
 
 impl std::fmt::Display for LatticeError {
@@ -89,6 +111,17 @@ impl std::fmt::Display for LatticeError {
                     f,
                     "lattice broadening needs {n} points, more than {MAX_POINTS}"
                 )
+            }
+            Self::Jump(e) => write!(
+                f,
+                "File 3 jumps at {e} eV, within the lattice kernel's reach"
+            ),
+            Self::Unresolved { energy_ev, mass } => write!(
+                f,
+                "the lattice kernel at {energy_ev} eV is not resolved: its weights sum to {mass}"
+            ),
+            Self::TooMuchWork(work) => {
+                write!(f, "lattice broadening needs {work:e} terms, more than 1e10")
             }
         }
     }
@@ -117,8 +150,8 @@ impl PhononSpectrum {
     ///
     /// # Errors
     /// [`LatticeError::InvalidSpectrum`] unless `step_ev` is finite and
-    /// positive and `density` holds at least two finite values, 0 or more,
-    /// the first 0 and another positive.
+    /// positive, `density` holds at least two finite values, 0 or more, the
+    /// first 0 and another positive, and the scaled values are finite.
     pub fn new(step_ev: f64, mut density: Vec<f64>) -> Result<Self, LatticeError> {
         if !(step_ev.is_finite() && step_ev > 0.0)
             || density.len() < 2
@@ -132,6 +165,10 @@ impl PhononSpectrum {
                 density.len()
             )));
         }
+        let peak = density.iter().fold(0.0_f64, |m, &r| m.max(r));
+        for r in &mut density {
+            *r /= peak;
+        }
         let area = step_ev * density[1] / 3.0
             + step_ev
                 * density[1..]
@@ -140,6 +177,11 @@ impl PhononSpectrum {
                     .sum::<f64>();
         for r in &mut density {
             *r /= area;
+        }
+        if !(area.is_finite() && area > 0.0 && density.iter().all(|r| r.is_finite())) {
+            return Err(LatticeError::InvalidSpectrum(format!(
+                "its area {area} eV after scaling to a peak of 1 leaves values that are not finite"
+            )));
         }
         Ok(Self { step_ev, density })
     }
@@ -172,6 +214,27 @@ impl PhononSpectrum {
         self.step_ev * (self.density.len() - 1) as f64
     }
 
+    /// `T_eff`, the free gas's temperature with the kernel's variance at
+    /// `temperature_k`: `k·T_eff = ½∫ρ·ω·coth(ω/2kT) dω`.
+    #[must_use]
+    pub fn effective_temperature_k(&self, temperature_k: f64) -> f64 {
+        Phonons::new(&self.nodes(0.0), temperature_k, 0.0, 0).kt_eff / BOLTZMANN_EV_PER_K
+    }
+
+    /// How far in energy, eV, the kernel of a nucleus of mass ratio `awr` at
+    /// `energy_ev` and `temperature_k` reaches on either side of `E`: the
+    /// span [`broaden_in_lattice`] reads the cross section over.
+    #[must_use]
+    pub fn reach_ev(&self, energy_ev: f64, temperature_k: f64, awr: f64) -> f64 {
+        let kt_eff = BOLTZMANN_EV_PER_K * self.effective_temperature_k(temperature_k);
+        reach(energy_ev / (awr + 1.0), kt_eff, self.max_ev())
+    }
+
+    /// The number of quadrature nodes [`Self::nodes`] gives for `t_max`.
+    fn node_count(&self, t_max: f64) -> f64 {
+        (self.density.len() - 1) as f64 * (self.step_ev * t_max).ceil().max(1.0) * 16.0
+    }
+
     /// Quadrature nodes `(ω, w·ρ(ω))` over the spectrum, each panel spanning
     /// at most one radian of `ω·t` up to `t_max`.
     fn nodes(&self, t_max: f64) -> Vec<(f64, f64)> {
@@ -199,6 +262,11 @@ impl PhononSpectrum {
         }
         nodes
     }
+}
+
+/// The kernel's reach on either side of its mean, eV, at recoil `r`.
+fn reach(r: f64, kt_eff: f64, omega_max: f64) -> f64 {
+    KERNEL_SIGMAS * (2.0 * r * kt_eff).sqrt() + KERNEL_PHONONS * omega_max
 }
 
 /// The spectrum's sums at one temperature: `G(t_j)` and `∂G/∂T` at
@@ -281,8 +349,12 @@ fn dft(values: &mut [Complex64]) {
 /// values; nothing is roundoff-limited.
 ///
 /// # Errors
-/// [`LatticeError::InvalidTemperature`], [`LatticeError::Grid`] for an empty
-/// or invalid grid, [`LatticeError::BelowZero`], [`LatticeError::TooManyPoints`].
+/// [`LatticeError::InvalidTemperature`]; [`LatticeError::Grid`] for an empty
+/// or invalid grid or a mass ratio that is not finite and positive;
+/// [`LatticeError::BelowZero`]; [`LatticeError::Jump`] for a File-3 jump
+/// within a kernel's reach; [`LatticeError::TooManyPoints`] and
+/// [`LatticeError::TooMuchWork`]; [`LatticeError::Unresolved`] for a kernel
+/// whose weights do not sum to 1 within 1e-7.
 pub fn broaden_in_lattice(
     energies: &[f64],
     data: &ResonanceData,
@@ -293,42 +365,71 @@ pub fn broaden_in_lattice(
     if !(temperature_k.is_finite() && temperature_k > 0.0) {
         return Err(LatticeError::InvalidTemperature(temperature_k));
     }
+    DopplerParams::new(temperature_k, data.awr).map_err(DopplerError::from)?;
     validate_doppler_grid(energies)?;
     if energies.is_empty() {
         return Err(DopplerError::EmptyGrid.into());
     }
     let recoil = |energy: f64| energy / (data.awr + 1.0);
-    let (lowest, highest) = (energies[0], energies[energies.len() - 1]);
     let omega_max = spectrum.max_ev();
-    let probe = Phonons::new(&spectrum.nodes(0.0), temperature_k, 0.0, 0);
-    let reach =
-        KERNEL_SIGMAS * (2.0 * recoil(highest) * probe.kt_eff).sqrt() + KERNEL_PHONONS * omega_max;
+    let kt_eff = BOLTZMANN_EV_PER_K * spectrum.effective_temperature_k(temperature_k);
+    let reach_at = |energy: f64| reach(recoil(energy), kt_eff, omega_max);
+    let lowest = energies
+        .iter()
+        .map(|&e| e - reach_at(e))
+        .fold(f64::INFINITY, f64::min);
+    let highest = energies
+        .iter()
+        .map(|&e| e + reach_at(e))
+        .fold(f64::NEG_INFINITY, f64::max);
+    if lowest <= 0.0 {
+        return Err(LatticeError::BelowZero(lowest));
+    }
     let narrowest = data
         .ranges
         .iter()
         .filter(|range| range.is_evaluable())
         .flat_map(|range| &range.l_groups)
         .flat_map(|group| &group.resonances)
-        .filter(|r| r.energy >= lowest - reach - 1.0 && r.energy <= highest + reach + 1.0)
+        .filter(|r| r.energy >= lowest - 1.0 && r.energy <= highest + 1.0)
         .map(|r| r.gn.abs() + r.gg.abs() + r.gfa.abs() + r.gfb.abs())
         .filter(|&width| width > 0.0)
         .fold(f64::INFINITY, f64::min);
-    let h = (PI * narrowest / 30.0).min(PI * omega_max / 100.0);
-    let points = (2.0 * reach / h).ceil() as usize + 1;
-    let transform = points.next_power_of_two();
-    let origin = lowest - reach - 2.0 * h;
+    let mut h = (PI * narrowest / 30.0).min(PI * omega_max / 100.0);
+    for table in data.smooth.tables() {
+        let start = table.points.partition_point(|&(e, _)| e < lowest);
+        let stop = table.points.partition_point(|&(e, _)| e <= highest);
+        let around = &table.points[start.saturating_sub(1)..(stop + 1).min(table.points.len())];
+        for pair in around.windows(2) {
+            let spacing = pair[1].0 - pair[0].0;
+            if spacing == 0.0 {
+                return Err(LatticeError::Jump(pair[0].0));
+            }
+            h = h.min(spacing / STEPS_PER_KNOT);
+        }
+    }
+    let widest = energies.iter().map(|&e| reach_at(e)).fold(0.0, f64::max);
+    let transform = ((2.0 * widest / h).ceil() as usize + 1).next_power_of_two();
+    let origin = lowest - 2.0 * h;
     if origin <= 0.0 {
         return Err(LatticeError::BelowZero(origin));
     }
-    let grid_points = ((highest + reach - origin) / h).ceil() as usize + 3;
+    let grid_points = ((highest - origin) / h).ceil() as usize + 3;
     for needed in [transform, grid_points] {
         if needed > MAX_POINTS {
             return Err(LatticeError::TooManyPoints(needed));
         }
     }
-    let dt = 2.0 * PI / (transform as f64 * h);
     let half = transform / 2;
-    let phonons = Phonons::new(&spectrum.nodes(PI / h), temperature_k, dt, half);
+    let dt = 2.0 * PI / (transform as f64 * h);
+    let t_max = (100.0 / omega_max).min(PI / h);
+    let samples = half.min((t_max / dt).ceil() as usize);
+    let work = spectrum.node_count(t_max) * (samples + 1) as f64
+        + energies.len() as f64 * transform as f64 * (transform as f64).log2();
+    if work > MAX_WORK {
+        return Err(LatticeError::TooMuchWork(work));
+    }
+    let phonons = Phonons::new(&spectrum.nodes(t_max), temperature_k, dt, samples);
     let plan = CrossSectionPlan::new(data);
     let sigma = |energy: f64| channel.pick(&plan.evaluate_one(energy));
     let grid: Vec<f64> = (0..grid_points)
@@ -337,7 +438,7 @@ pub fn broaden_in_lattice(
         .collect();
     let g0 = phonons.g[0].re;
     let g0_slope = phonons.g_slope[0];
-    let results: Vec<(f64, f64)> = energies
+    let results: Vec<Result<(f64, f64), LatticeError>> = energies
         .par_iter()
         .map(|&energy| {
             let r = recoil(energy);
@@ -345,7 +446,7 @@ pub fn broaden_in_lattice(
             let zero_slope = -zero * r * g0_slope;
             let shift = energy + r - origin;
             let mut buffer = vec![Complex64::new(0.0, 0.0); transform];
-            for j in 0..half {
+            for j in 0..samples.min(half) {
                 let phi = (r * (phonons.g[j] - g0)).exp();
                 let value = phi - zero;
                 let slope = phi * r * (phonons.g_slope[j] - g0_slope) - zero_slope;
@@ -358,22 +459,34 @@ pub fn broaden_in_lattice(
                 }
             }
             dft(&mut buffer);
-            let first = ((energy - reach - origin) / h).floor().max(0.0) as usize;
-            let last = (((energy + reach - origin) / h).ceil() as usize).min(grid_points - 1);
-            let (mut value, mut slope) = (0.0, 0.0);
+            let own = reach_at(energy);
+            let first = ((energy - own - origin) / h).floor().max(0.0) as usize;
+            let last = (((energy + own - origin) / h).ceil() as usize).min(grid_points - 1);
+            let (mut mass, mut value, mut slope) = (zero, 0.0, 0.0);
             for (m, &s) in grid.iter().enumerate().take(last + 1).skip(first) {
                 let kernel = buffer[m % transform];
+                mass += h * kernel.re;
                 value += kernel.re * s;
                 slope += kernel.im * s;
             }
+            if (mass - 1.0).abs() > MASS_TOLERANCE {
+                return Err(LatticeError::Unresolved {
+                    energy_ev: energy,
+                    mass,
+                });
+            }
             let at_recoil = sigma(energy + r);
-            (
+            Ok((
                 h * value + zero * at_recoil,
                 h * slope + zero_slope * at_recoil,
-            )
+            ))
         })
         .collect();
-    let (values, derivatives): (Vec<f64>, Vec<f64>) = results.into_iter().unzip();
+    let (values, derivatives): (Vec<f64>, Vec<f64>) = results
+        .into_iter()
+        .collect::<Result<Vec<_>, _>>()?
+        .into_iter()
+        .unzip();
     if let Some((k, &value)) = values
         .iter()
         .chain(&derivatives)
