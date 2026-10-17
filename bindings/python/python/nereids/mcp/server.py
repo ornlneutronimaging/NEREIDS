@@ -999,7 +999,7 @@ def _validate_workflow(manifest: dict[str, Any]) -> dict[str, Any]:
         "fit_domain", "normalization", "background", "empty_background",
         "temperature", "temperature_k", "fit_temperature",
         "gamma_transmission", "time_background", "room_background",
-        "thickness_variance", "capture_gammas", "in_scatter",
+        "thickness_variance", "capture_gammas", "in_scatter", "debye_temperature_k",
     }
     unsupported_fit = sorted(set(fit_config) - supported_fit)
     if unsupported_fit:
