@@ -112,6 +112,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
   evaluated, like an LRF=7 range: the width's energy dependence needs the l of
   the exit channel, which ENDF does not give. It was evaluated with the
   competitive width left out of the total width.
+- A channel of an SLBW, MLBW or Reich–Moore L-group that holds no resonance
+  scatters as a hard sphere, `pi/k^2 * g_J * 4 sin^2(phi_l)`; its
+  potential scattering was left out.
 
 ### Limitations
 

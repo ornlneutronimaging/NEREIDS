@@ -275,8 +275,14 @@ pub fn slbw_cross_sections_for_range(
         let (t, e, c, f) = slbw_evaluate_with_cached_jgroups(
             &j_groups, energy_ev, pi_over_k2, p_at_e, sin_phi, cos_phi, sin2_phi,
         );
-        total += t;
-        elastic += e;
+        let uncovered = channel::uncovered_channel_weight(
+            l,
+            target_spin,
+            l_group.resonances.iter().map(|r| r.j),
+        );
+        let hard_sphere = pi_over_k2 * uncovered * 4.0 * sin2_phi;
+        total += t + hard_sphere;
+        elastic += e + hard_sphere;
         capture += c;
         fission += f;
     }

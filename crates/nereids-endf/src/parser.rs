@@ -702,11 +702,9 @@ fn parse_bw_range(
 
     // A resolved range whose L-groups are all empty (every NRS=0) is accepted
     // by reference readers (SAMMY, OpenScale), so it is NOT a hard error here.
-    // NEREIDS cannot evaluate it: its J-groups (and the hard-sphere
-    // potential-scattering term) derive from the resonance list, while SAMMY
-    // builds channels from quantum numbers and would retain hard-sphere
-    // scattering for the shape — a declared limitation. `is_evaluable()`
-    // therefore classifies it non-evaluable: a warn-and-skip placeholder like
+    // NEREIDS treats it as a placeholder, although SAMMY gives its channels
+    // hard-sphere scattering: `is_evaluable()` classifies it non-evaluable,
+    // a warn-and-skip placeholder like
     // LRF=7/LRU=2/LRU=0, so a mixed file keeps its populated ranges, and a
     // file where this is the only range fails the no-evaluable-content guard
     // (fail-closed beats silently reporting zero as physics).
@@ -816,11 +814,9 @@ fn parse_reich_moore_range(
 
     // A resolved range whose L-groups are all empty (every NRS=0) is accepted
     // by reference readers (SAMMY, OpenScale), so it is NOT a hard error here.
-    // NEREIDS cannot evaluate it: its J-groups (and the hard-sphere
-    // potential-scattering term) derive from the resonance list, while SAMMY
-    // builds channels from quantum numbers and would retain hard-sphere
-    // scattering for the shape — a declared limitation. `is_evaluable()`
-    // therefore classifies it non-evaluable: a warn-and-skip placeholder like
+    // NEREIDS treats it as a placeholder, although SAMMY gives its channels
+    // hard-sphere scattering: `is_evaluable()` classifies it non-evaluable,
+    // a warn-and-skip placeholder like
     // LRF=7/LRU=2/LRU=0, so a mixed file keeps its populated ranges, and a
     // file where this is the only range fails the no-evaluable-content guard
     // (fail-closed beats silently reporting zero as physics).

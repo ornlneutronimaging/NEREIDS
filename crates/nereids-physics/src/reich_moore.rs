@@ -591,6 +591,9 @@ enum PrecomputedRmLGroupData {
         /// Precomputed penetrability radius (fm): APL when set, else
         /// NAPS=0 formula. 0.0 means fall back to `scatt_radius`.
         pen_radius_override: f64,
+        /// Σ g_J of the channels no J-group holds; see
+        /// [`channel::uncovered_channel_weight`].
+        uncovered: f64,
         jgroups: Vec<PrecomputedJGroupSingle>,
     },
     /// One fission channel (gfa != 0, gfb == 0).
@@ -599,6 +602,7 @@ enum PrecomputedRmLGroupData {
         awr_l: f64,
         apl: f64,
         pen_radius_override: f64,
+        uncovered: f64,
         jgroups: Vec<PrecomputedJGroup2ch>,
     },
     /// Two fission channels (both gfa and gfb != 0).
@@ -607,6 +611,7 @@ enum PrecomputedRmLGroupData {
         awr_l: f64,
         apl: f64,
         pen_radius_override: f64,
+        uncovered: f64,
         jgroups: Vec<PrecomputedJGroup3ch>,
     },
 }
@@ -620,6 +625,9 @@ struct PrecomputedSlbwLGroupData {
     /// Precomputed penetrability radius (fm): APL when set, else
     /// NAPS=0 formula. 0.0 means fall back to `scatt_radius`.
     pen_radius_override: f64,
+    /// Σ g_J of the channels no J-group holds; see
+    /// [`channel::uncovered_channel_weight`].
+    uncovered: f64,
     jgroups: Vec<slbw::PrecomputedSlbwJGroup>,
 }
 
@@ -730,6 +738,11 @@ fn precompute_range_data<'a>(
                     awr_l,
                     apl: l_group.apl,
                     pen_radius_override,
+                    uncovered: channel::uncovered_channel_weight(
+                        l,
+                        range.target_spin,
+                        l_group.resonances.iter().map(|r| r.j),
+                    ),
                     jgroups,
                 }
             })
@@ -783,6 +796,11 @@ fn precompute_range_data<'a>(
                     .iter()
                     .any(|r| r.gfa.abs() > PIVOT_FLOOR || r.gfb.abs() > PIVOT_FLOOR);
                 let has_two_fission = l_group.resonances.iter().any(|r| r.gfb.abs() > PIVOT_FLOOR);
+                let uncovered = channel::uncovered_channel_weight(
+                    l,
+                    range.target_spin,
+                    l_group.resonances.iter().map(|r| r.j),
+                );
 
                 if !has_fission {
                     let jgroups = precompute_jgroups_single(
@@ -798,6 +816,7 @@ fn precompute_range_data<'a>(
                         awr_l,
                         apl: l_group.apl,
                         pen_radius_override,
+                        uncovered,
                         jgroups,
                     }
                 } else if !has_two_fission {
@@ -815,6 +834,7 @@ fn precompute_range_data<'a>(
                         awr_l,
                         apl: l_group.apl,
                         pen_radius_override,
+                        uncovered,
                         jgroups,
                     }
                 } else {
@@ -832,6 +852,7 @@ fn precompute_range_data<'a>(
                         awr_l,
                         apl: l_group.apl,
                         pen_radius_override,
+                        uncovered,
                         jgroups,
                     }
                 }
@@ -899,8 +920,9 @@ fn evaluate_precomputed_range(
                     cos_phi,
                     sin2_phi,
                 );
-                total += t;
-                elastic += e;
+                let hard_sphere = pi_over_k2 * lg.uncovered * 4.0 * sin2_phi;
+                total += t + hard_sphere;
+                elastic += e + hard_sphere;
                 capture += c;
                 fission += f;
             }
@@ -941,8 +963,9 @@ fn evaluate_precomputed_range(
                     p_at_e,
                     phi,
                 );
-                total += t;
-                elastic += e;
+                let hard_sphere = pi_over_k2 * lg.uncovered * 4.0 * phi.sin().powi(2);
+                total += t + hard_sphere;
+                elastic += e + hard_sphere;
                 capture += c;
                 fission += f;
             }
@@ -957,28 +980,31 @@ fn evaluate_precomputed_range(
             let mut fission = 0.0;
 
             for lg in l_groups {
-                let (l, awr_l, apl, pen_ovr) = match lg {
+                let (l, awr_l, apl, pen_ovr, uncovered) = match lg {
                     PrecomputedRmLGroupData::Single {
                         l,
                         awr_l,
                         apl,
                         pen_radius_override,
+                        uncovered,
                         ..
-                    } => (*l, *awr_l, *apl, *pen_radius_override),
+                    } => (*l, *awr_l, *apl, *pen_radius_override, *uncovered),
                     PrecomputedRmLGroupData::TwoCh {
                         l,
                         awr_l,
                         apl,
                         pen_radius_override,
+                        uncovered,
                         ..
-                    } => (*l, *awr_l, *apl, *pen_radius_override),
+                    } => (*l, *awr_l, *apl, *pen_radius_override, *uncovered),
                     PrecomputedRmLGroupData::ThreeCh {
                         l,
                         awr_l,
                         apl,
                         pen_radius_override,
+                        uncovered,
                         ..
-                    } => (*l, *awr_l, *apl, *pen_radius_override),
+                    } => (*l, *awr_l, *apl, *pen_radius_override, *uncovered),
                 };
 
                 // Scattering radius for phase shift (always AP/APL).
@@ -1094,8 +1120,12 @@ fn evaluate_precomputed_range(
                     }
                 };
 
-                total += t;
-                elastic += e;
+                let hard_sphere = channel::pi_over_k_squared_barns(energy_ev, awr_l)
+                    * uncovered
+                    * 4.0
+                    * phi_l.sin().powi(2);
+                total += t + hard_sphere;
+                elastic += e + hard_sphere;
                 capture += c;
                 fission += f;
             }
@@ -1532,6 +1562,86 @@ mod tests {
         SingleResonanceParams, single_resonance, u238_single_resonance, u238_with_formalism,
     };
     use nereids_endf::resonance::{LGroup, Resonance, ResonanceRange};
+
+    fn weak(energy: f64, j: f64) -> Resonance {
+        Resonance {
+            energy,
+            j,
+            gn: 1e-25,
+            gg: 1e-3,
+            gfa: 0.0,
+            gfb: 0.0,
+        }
+    }
+
+    /// A target of spin ½ with s-wave resonances in J = 1 only and p-wave
+    /// resonances in one J = 1 channel only: J = 0 (l = 0) and J = 0, 2 and
+    /// the other J = 1 (l = 1) hold none.
+    fn spin_half_with_open_channels(formalism: ResonanceFormalism) -> ResonanceData {
+        let mut data = nereids_endf::resonance::test_support::hf177_mlbw_two_resonances_high_j();
+        let range = &mut data.ranges[0];
+        range.formalism = formalism;
+        range.target_spin = 0.5;
+        range.energy_high = 1e6;
+        for resonance in &mut range.l_groups[0].resonances {
+            resonance.j = 1.0;
+        }
+        let mut p_wave = range.l_groups[0].clone();
+        p_wave.l = 1;
+        p_wave.resonances = vec![Resonance {
+            energy: 3.0e4,
+            j: 1.0,
+            gn: 2.0,
+            gg: 0.1,
+            gfa: 0.0,
+            gfb: 0.0,
+        }];
+        range.l_groups.push(p_wave);
+        data
+    }
+
+    /// A channel no resonance is in scatters as a hard sphere: σ equals that
+    /// of the same evaluation with a resonance too weak and too far away to
+    /// matter in each such channel, whose J-group carries the hard-sphere
+    /// term itself.
+    #[test]
+    fn a_channel_without_resonances_scatters_as_a_hard_sphere() {
+        for formalism in [
+            ResonanceFormalism::SLBW,
+            ResonanceFormalism::MLBW,
+            ResonanceFormalism::ReichMoore,
+        ] {
+            let open = spin_half_with_open_channels(formalism);
+            let mut held = open.clone();
+            let groups = &mut held.ranges[0].l_groups;
+            groups[0].resonances.push(weak(9.0e5, 0.0));
+            for j in [0.0, -1.0, 2.0] {
+                groups[1].resonances.push(weak(9.0e5, j));
+            }
+            for energy in [2.0, 1.0e3, 1.0e5] {
+                let ours = cross_sections_at_energy(&open, energy);
+                let want = cross_sections_at_energy(&held, energy);
+                for (name, a, b) in [
+                    ("total", ours.total, want.total),
+                    ("elastic", ours.elastic, want.elastic),
+                ] {
+                    assert!(
+                        (a - b).abs() <= 1e-12 * b.abs(),
+                        "{formalism:?} {name} at {energy} eV: {a} against {b}"
+                    );
+                }
+                if formalism == ResonanceFormalism::SLBW {
+                    let alone = crate::slbw::slbw_cross_sections(&open, energy);
+                    assert!(
+                        (alone.elastic - want.elastic).abs() <= 1e-12 * want.elastic,
+                        "slbw_cross_sections elastic at {energy} eV: {} against {}",
+                        alone.elastic,
+                        want.elastic
+                    );
+                }
+            }
+        }
+    }
 
     #[test]
     fn test_capture_peak_single_resonance() {
