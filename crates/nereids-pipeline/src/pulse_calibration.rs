@@ -280,7 +280,7 @@ impl PulseCalibration {
             let lines = lines_in_window(
                 present,
                 &measurement.time_edges_us,
-                fit.t0_us,
+                fit.t0_us + fit.regions[0].timing_offset_us,
                 fit.flight_path_m,
             );
             if lines.is_empty() {
@@ -933,6 +933,7 @@ mod tests {
                 gamma_transmission: Value::Known(1.0),
                 capture_gammas: Value::Known(0.0),
                 in_scatter: Value::Known(0.0),
+                timing_offset_us: Value::Known(0.0),
                 material: Some(Material {
                     covariances: Vec::new(),
                     library: EndfLibrary::EndfB8_0,
@@ -1014,6 +1015,7 @@ mod tests {
                 gamma_transmission: 1.0,
                 capture_gammas: 0.0,
                 in_scatter: 0.0,
+                timing_offset_us: 0.0,
                 beam: BeamSpline::constant(200.0, 600.0, 1.0),
                 beam_at_limit: false,
                 predicted: [Vec::new(), Vec::new()],
@@ -1161,10 +1163,16 @@ mod tests {
             beta: [0.08, 0.01],
             ..fit(8)
         };
-        let fitted = calibrated(&measurement(None), &c, moderated)
+        let fitted = calibrated(&measurement(None), &c, moderated.clone())
             .unwrap()
             .calibration();
         assert_eq!(fitted.pulse.line_span_ev, Some((10.0, 50.0)));
+        let mut earlier = moderated;
+        earlier.regions[0].timing_offset_us = -20.0;
+        let earlier = calibrated(&measurement(None), &c, earlier)
+            .unwrap()
+            .calibration();
+        assert_eq!(earlier.pulse.line_span_ev, Some((10.0, 25.0)));
         let mut wider = measurement(Some(55.0));
         material(&mut wider).isotopes[1].1 = Value::Fitted(1e-4);
         match fit_counts(&wider, &fitted) {

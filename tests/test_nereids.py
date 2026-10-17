@@ -913,6 +913,16 @@ class TestCountsApi:
         f, decay = rising.detector_tail
         assert (f.kind, f.value, decay.kind, decay.value) == ("fitted", 0.1, "known", 1.5)
         assert region.in_scatter.value == 0.0
+        assert region.timing_offset_us.value == 0.0
+        late = nereids.Region(
+            open_counts=[100.0] * 4,
+            sample_counts=[80.0] * 4,
+            pixels=1.0,
+            background=[nereids.Value.known(0.0)] * 3,
+            gamma_transmission=nereids.Value.known(1.0),
+            timing_offset_us=nereids.Value.fitted(0.02),
+        )
+        assert (late.timing_offset_us.kind, late.timing_offset_us.value) == ("fitted", 0.02)
         assert measurement.spread is None
         spread = nereids.Spread(
             nereids.Value.fitted(0.1), [(1.0, 2.5)], (4, 4), [[(0, 0), (1, 1)]]

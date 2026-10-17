@@ -263,6 +263,7 @@ fn measurement(
             gamma_transmission: Value::Known(1.0),
             capture_gammas: Value::Known(0.0),
             in_scatter: Value::Known(0.0),
+            timing_offset_us: Value::Known(0.0),
             material: Some(Material {
                 covariances: Vec::new(),
                 library: EndfLibrary::EndfB8_0,
@@ -390,6 +391,7 @@ fn the_time_background_is_in_both_runs_of_every_region_by_its_pixels_and_gamma_t
                 },
                 capture_gammas: Value::Known(0.0),
                 in_scatter: Value::Known(0.0),
+                timing_offset_us: Value::Known(0.0),
                 material: (r == 0).then(|| Material {
                     covariances: Vec::new(),
                     library: EndfLibrary::EndfB8_0,
@@ -670,6 +672,7 @@ fn an_empty_area_with_a_known_background_adds_its_counts_information_on_the_norm
             gamma_transmission: Value::Known(1.0),
             capture_gammas: Value::Known(0.0),
             in_scatter: Value::Known(0.0),
+            timing_offset_us: Value::Known(0.0),
             material: None,
         },
     ];
@@ -983,6 +986,7 @@ fn a_map_recovers_each_patch_and_its_covariance_between_patches_is_the_shared_qu
             gamma_transmission: Value::Known(1.0),
             capture_gammas: Value::Known(0.0),
             in_scatter: Value::Known(0.0),
+            timing_offset_us: Value::Known(0.0),
             material,
         };
     let joint = fit_counts(
@@ -1075,6 +1079,7 @@ fn a_map_recovers_each_patch_and_its_covariance_between_patches_is_the_shared_qu
                 gamma_transmission: Value::Known(1.0),
                 capture_gammas: Value::Known(0.0),
                 in_scatter: Value::Known(0.0),
+                timing_offset_us: Value::Known(0.0),
                 material: Some(map.material.clone()),
             }],
         };
@@ -1226,6 +1231,7 @@ fn a_map_fits_the_time_background_its_patches_share_as_the_joint_fit_does() {
         },
         capture_gammas: Value::Known(0.0),
         in_scatter: Value::Known(0.0),
+        timing_offset_us: Value::Known(0.0),
         material,
     };
     let joint = fit_counts(
@@ -1390,6 +1396,7 @@ fn the_room_background_follows_each_run_s_frames_apart_from_the_time_background(
         gamma_transmission: Value::Known(if material.is_some() { gamma } else { 1.0 }),
         capture_gammas: Value::Known(0.0),
         in_scatter: Value::Known(0.0),
+        timing_offset_us: Value::Known(0.0),
         material,
     };
     let joint = |room_background| {
@@ -1867,6 +1874,7 @@ fn the_detector_spread_between_regions_is_recovered_with_the_density_and_tempera
                 gamma_transmission: Value::Known(1.0),
                 capture_gammas: Value::Known(0.0),
                 in_scatter: Value::Known(0.0),
+                timing_offset_us: Value::Known(0.0),
                 material: materials[r].map(|n| Material {
                     covariances: Vec::new(),
                     library: EndfLibrary::EndfB8_0,
@@ -1923,6 +1931,104 @@ fn the_detector_spread_between_regions_is_recovered_with_the_density_and_tempera
     );
     let recovered = without.converged && (t - TEMPERATURE_K).abs() <= 5.0 * sd;
     assert!(!recovered, "{t} ± {sd}");
+}
+
+#[test]
+fn a_region_recording_late_is_recovered_with_t0() {
+    let late_us = 0.3;
+    let (setup, late) = (
+        standard(),
+        Setup {
+            t0_us: T0_US + late_us,
+            ..standard()
+        },
+    );
+    let sample = [(hafnium_like(20.0), 5.0e-3)];
+    let regions: Vec<Region> = [&setup, &late]
+        .map(|setup| {
+            let (open, transmitted) = expected(setup, &beam(1.0e5), &sample);
+            measurement(setup, (rounded(&open), rounded(&transmitted)), &sample)
+                .regions
+                .remove(0)
+        })
+        .into();
+    let fit_with = |offset: Value, spread: Option<Spread>, regions: &[Region]| {
+        let mut m = measurement(&setup, (Vec::new(), Vec::new()), &sample);
+        m.regions = regions.to_vec();
+        m.regions[regions.len() - 1].timing_offset_us = offset;
+        m.spread = spread;
+        let calibration = Calibration {
+            t0_us: Value::Fitted(T0_US + 0.05),
+            ..calibration(&setup)
+        };
+        fit_counts(&m, &calibration)
+    };
+    let fit = fit_with(Value::Fitted(0.0), None, &regions).expect("fit");
+    assert!(fit.converged);
+    let pulls = [
+        (fit.regions[1].timing_offset_us, late_us, 2),
+        (fit.t0_us, T0_US, 3),
+    ]
+    .map(|(estimate, truth, i)| (estimate - truth) / error_bar(&fit, i));
+    assert!(pulls.iter().all(|p| p.abs() <= BOUND.sqrt()), "{pulls:?}");
+    let without = fit_with(Value::Known(0.0), None, &regions).expect("fit");
+    let noise = (2.0 * (4 * (setup.edges.len() - 1)) as f64).sqrt();
+    assert!(
+        without.deviance - fit.deviance > 3.0 * noise,
+        "{} {}",
+        without.deviance,
+        fit.deviance
+    );
+    let spread = Spread {
+        share: Value::Fitted(0.05),
+        kernel: vec![(1.0, 1.0)],
+        grid: [1, 2],
+        cells: vec![vec![[0, 0]], vec![[0, 1]]],
+    };
+    for refused in [
+        fit_with(Value::Fitted(0.0), None, &regions[..1]),
+        fit_with(Value::Fitted(0.0), Some(spread), &regions),
+    ] {
+        let message = refused.expect_err("refused").to_string();
+        assert!(message.contains("timing offset"), "{message}");
+    }
+}
+
+#[test]
+fn a_region_recording_early_meets_a_decaying_time_background_on_its_own_clock() {
+    let early_us = -3.0;
+    let [c, a, tau] = [0.0, 1.0e6, 10.0];
+    let sample = [(hafnium_like(20.0), 5.0e-3)];
+    let region = |setup: &Setup, late_us: f64| {
+        let background = time_background(&setup.edges, [c, a * (late_us / tau).exp(), tau]);
+        let plus = |counts: &[f64], scale: f64| -> Vec<f64> {
+            let counts = counts.iter().zip(&background);
+            counts.map(|(n, g)| (n + scale * g).round()).collect()
+        };
+        let (open, transmitted) = expected(setup, &beam(1.0e5), &sample);
+        let runs = (plus(&open, 1.0), plus(&transmitted, CHARGE_RATIO));
+        measurement(setup, runs, &sample).regions.remove(0)
+    };
+    let (setup, early) = (
+        standard(),
+        Setup {
+            t0_us: T0_US + early_us,
+            ..standard()
+        },
+    );
+    let mut m = measurement(&setup, (Vec::new(), Vec::new()), &sample);
+    m.time_background = [c, a, tau].map(Value::Known);
+    m.regions = vec![region(&setup, 0.0), region(&early, early_us)];
+    m.regions[1].timing_offset_us = Value::Known(early_us);
+    let fit = fit_counts(&m, &calibration(&setup)).expect("fit");
+    assert!(fit.converged);
+    for region in &fit.regions {
+        assert_eq!(region.overdispersion[0], Some(1.0));
+    }
+    let pulls: Vec<f64> = (0..2)
+        .map(|r| (fit.regions[r].densities[0] - sample[0].1) / error_bar(&fit, r))
+        .collect();
+    assert!(pulls.iter().all(|p| p.abs() <= BOUND.sqrt()), "{pulls:?}");
 }
 
 #[test]
@@ -3844,6 +3950,7 @@ fn density_temperature_timing_offset_and_flight_path_are_recovered_from_starts_o
             gamma_transmission: Value::Known(1.0),
             capture_gammas: Value::Known(0.0),
             in_scatter: Value::Known(0.0),
+            timing_offset_us: Value::Known(0.0),
             material: None,
         });
         let fit = fit_counts(&m, &calibration).expect("fit");
@@ -5160,6 +5267,7 @@ mod maps {
                 gamma_transmission: Value::Known(1.0),
                 capture_gammas: Value::Known(0.0),
                 in_scatter: Value::Known(0.0),
+                timing_offset_us: Value::Known(0.0),
                 material: Some(map.material.clone()),
             }
         }
@@ -5179,6 +5287,7 @@ mod maps {
                     gamma_transmission: Value::Known(1.0),
                     capture_gammas: Value::Known(0.0),
                     in_scatter: Value::Known(0.0),
+                    timing_offset_us: Value::Known(0.0),
                     material: None,
                 }))
                 .collect();
