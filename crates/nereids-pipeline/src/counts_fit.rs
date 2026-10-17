@@ -58,6 +58,10 @@ pub(crate) const TEMPERATURE_BOUNDS_K: (f64, f64) = (1.0, 5000.0);
 /// The start in K of a fitted temperature's second fit.
 const SECOND_START_K: f64 = TEMPERATURE_BOUNDS_K.1 / 2.0;
 
+/// The standard deviations under Poisson counts by which a sample run's
+/// overdispersion exceeds 1 when its counts reject a fit.
+const REJECTING_SDS: f64 = 3.0;
+
 /// A quantity the fit holds at a known value, fits from a starting value
 /// over the quantity's range, fits from `start` within `lower..=upper` inside
 /// that range, or fits over the range from a `value` measured elsewhere with
@@ -534,14 +538,16 @@ pub struct RegionFit {
 /// built at the fitted `t0`, `L` and pulse.  After twenty fits it is reported
 /// unconverged.
 ///
-/// The fitter finds a local minimum.  Where a temperature is fitted, the fit
-/// is made from the given starts and again with each fitted temperature
-/// started at 2,500 K, or at the bound nearest it.  Of the two, a converged
-/// fit beats one that did not converge; otherwise the second is returned only
-/// when its half Poisson deviance of every run's counts, outside the sample
-/// bins either fit leaves out, is lower by more than
-/// [`NEWTON_DECREMENT_TOL`].  When one fit fails the other is returned, and
-/// when both fail the first's error.  Where a black resonance
+/// The fitter finds a local minimum.  Where a temperature is fitted and the
+/// counts reject the fit, some region's sample-run overdispersion exceeding 1
+/// by more than three of its standard deviations under Poisson counts,
+/// `√(2/ν)` over the run's `ν` bins outside those left out, the fit is made
+/// again with each fitted temperature started at 2,500 K, or at the bound
+/// nearest it.  The second fit is returned when it converged and the first
+/// did not, or when both or neither converged and its half Poisson deviance
+/// of every run's counts, outside the sample bins either fit leaves out, is
+/// lower by more than [`NEWTON_DECREMENT_TOL`]; a second fit that fails is
+/// set aside.  Where a black resonance
 /// empties bins and the background is near zero, a fitted background with no
 /// lower bound can drive a black bin's prediction to zero, and the fit ends
 /// unconverged; with `b1` and `b2` known, `b0` bounded below by 0 ends on
@@ -609,19 +615,29 @@ pub fn fit_counts(
             "no region of the measurement holds a material to fit".into(),
         ));
     }
-    let first = fit_settled(measurement, calibration, MOST_PASSES);
-    let Some(started_hot) = started_hot(measurement) else {
-        return first;
+    let first = fit_settled(measurement, calibration, MOST_PASSES)?;
+    let Some(started_hot) = started_hot(measurement).filter(|_| rejected(measurement, &first))
+    else {
+        return Ok(first);
     };
-    match (first, fit_settled(&started_hot, calibration, MOST_PASSES)) {
-        (Ok(first), Ok(second)) => Ok(if better(measurement, &second, &first) {
-            second
-        } else {
-            first
-        }),
-        (Ok(fit), Err(_)) | (Err(_), Ok(fit)) => Ok(fit),
-        (Err(error), Err(_)) => Err(error),
-    }
+    Ok(match fit_settled(&started_hot, calibration, MOST_PASSES) {
+        Ok(second) if better(measurement, &second, &first) => second,
+        _ => first,
+    })
+}
+
+/// Whether some region's sample-run overdispersion at `fit` exceeds 1 by more
+/// than [`REJECTING_SDS`] of its standard deviations under Poisson counts,
+/// `√(2/ν)` over the run's `ν` bins outside those left out.
+fn rejected(measurement: &Measurement, fit: &CountsFit) -> bool {
+    measurement
+        .regions
+        .iter()
+        .zip(&fit.regions)
+        .any(|(region, at)| {
+            let bins = (region.sample_counts.len() - at.excluded_bins.len()) as f64;
+            at.overdispersion[1].is_some_and(|phi| phi > 1.0 + REJECTING_SDS * (2.0 / bins).sqrt())
+        })
 }
 
 /// `measurement` with each fitted temperature started at [`SECOND_START_K`],

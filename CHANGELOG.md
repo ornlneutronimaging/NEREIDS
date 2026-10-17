@@ -96,10 +96,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
 
 ### Fixed
 
-- `fit_counts` fits each fitted temperature again from 2,500 K and keeps the
-  fit that describes the counts better. A thin sample hotter than about
-  1,500 K, fitted from room temperature, ended in a false minimum near the
-  start.
+- When the counts reject a fit, `fit_counts` fits each fitted temperature
+  again from 2,500 K and keeps the fit that describes the counts better. A
+  thin sample hotter than about 1,500 K, fitted from room temperature, ended
+  in a false minimum near the start.
 
 ### Limitations
 
