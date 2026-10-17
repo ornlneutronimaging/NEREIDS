@@ -211,7 +211,7 @@ pub enum Channel {
 }
 
 impl Channel {
-    fn pick(self, xs: &CrossSections) -> f64 {
+    pub(crate) fn pick(self, xs: &CrossSections) -> f64 {
         match self {
             Channel::Total => xs.total,
             Channel::Elastic => xs.elastic,

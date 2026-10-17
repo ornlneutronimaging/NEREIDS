@@ -10,6 +10,7 @@
 //! - [`detector_spread`] - counts the detector records away from where they arrive
 //! - [`doppler`] - free-gas-model Doppler broadening
 //! - [`forward_scatter`] - neutrons scattered once in a slab that leave through its back face
+//! - [`lattice_doppler`] - Doppler broadening by nuclei bound in a harmonic crystal
 //! - [`penetrability`] - hard-sphere penetrability, shift and phase shift
 //! - [`reich_moore`] - Reich-Moore R-matrix cross-section formalism
 //! - [`resolution`] - instrument resolution broadening
@@ -32,6 +33,7 @@ pub mod doppler;
 pub mod flight_time_grid;
 pub mod forward_scatter;
 pub mod ikeda_carpenter;
+pub mod lattice_doppler;
 pub mod penetrability;
 pub mod reich_moore;
 pub mod resolution;

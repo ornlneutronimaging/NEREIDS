@@ -47,6 +47,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
   the default, records every count at its arrival. `fit_counts` and `fit_map`
   can fit both; results report `detector_tail`. A pulse calibration refuses a
   tail.
+- `lattice_doppler::broaden_in_lattice` Doppler-broadens a cross section by
+  nuclei bound in a harmonic crystal (Lamb's model, as SAMMY's crystal-lattice
+  model), from a `PhononSpectrum` (tabulated, or Debye) at the thermodynamic
+  temperature, with its temperature derivative.
 - ENDF File 3 is read with File 2: each channel's File-3 cross section
   (MT 1, 2, 102, 18) is added to the resonances' before Doppler
   broadening. An evaluation File 1 marks LRP=2 is refused.
