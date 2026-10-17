@@ -130,9 +130,9 @@ class ResonanceData:
         """Whether the evaluation carries parsed-but-not-evaluated ranges.
 
         True when any range is a parse-and-skip placeholder (LRF=7 R-Matrix
-        Limited, LRU=2 URR, or LRU=0 scattering-radius-only). Those spans
-        contribute zero cross-section; a ``UserWarning`` listing them is
-        emitted at load time by :func:`load_endf` / :func:`load_endf_file`.
+        Limited, LRU=2 URR, or LRU=0 scattering-radius-only). Their
+        resonances contribute no cross section; a ``UserWarning`` listing them
+        is emitted at load time by :func:`load_endf` / :func:`load_endf_file`.
         """
         ...
 
@@ -1069,13 +1069,40 @@ class PhononSpectrum:
     def max_ev(self) -> float: ...
     def effective_temperature_k(self, temperature_k: float) -> float: ...
 
+class ResonanceCovariance:
+    """The covariance of the energy, neutron width and capture width, in that
+    order, of each listed resonance of one evaluation, from its File 32."""
+
+    @property
+    def resonances(self) -> list[tuple[int, int, int]]:
+        """(range, L-group, resonance) indices into the ResonanceData it was read with."""
+        ...
+    @property
+    def covariance(self) -> NDArray[np.float64]:
+        """The covariance over the 3 * len(resonances) parameters, in eV**2."""
+        ...
+
+def load_resonance_covariance(
+    data: ResonanceData,
+    window_ev: tuple[float, float],
+    path: str | None = None,
+    library: str = "endf8.1",
+    mat: int | None = None,
+) -> ResonanceCovariance | None:
+    """The File 32 covariance of data's Reich-Moore resonances between
+    window_ev, from the ENDF file at path or the library's evaluation; None
+    when the evaluation has no File 32."""
+    ...
+
 class Material:
     """A material isotopes, each with an areal density in atoms/barn, and its
     temperature in K.  The library names the ENDF library the isotopes were
     read from; thickness_variance is the relative variance of the areal
     density over the region's pixels, known 0 by default; lattice is the
     PhononSpectrum the nuclei vibrate with, which makes temperature_k the
-    thermodynamic temperature, or None for the free gas."""
+    thermodynamic temperature, or None for the free gas; covariances pairs an
+    index into isotopes with that isotope's ResonanceCovariance, which the
+    fit's covariance carries."""
 
     def __init__(
         self,
@@ -1084,6 +1111,7 @@ class Material:
         library: str = "endf8.1",
         thickness_variance: Value | None = None,
         lattice: PhononSpectrum | None = None,
+        covariances: list[tuple[int, ResonanceCovariance]] = ...,
     ) -> None: ...
     @property
     def isotopes(self) -> list[tuple[ResonanceData, Value]]: ...
@@ -1093,6 +1121,8 @@ class Material:
     def thickness_variance(self) -> Value: ...
     @property
     def lattice(self) -> PhononSpectrum | None: ...
+    @property
+    def covariances(self) -> list[tuple[int, ResonanceCovariance]]: ...
 
 class Region:
     """The counts of a set of pixels in both runs, its background and the
@@ -1251,12 +1281,23 @@ class Pulse:
     def energy_span_ev(self) -> tuple[float, float]: ...
     @property
     def n_tau(self) -> int: ...
+    @property
+    def has_prior(self) -> bool:
+        """Whether a pulse calibration's prior fits the pulse numbers."""
+        ...
 
 class Calibration:
     """A neutron of flight time u over flight_path_m (m) arrives at
     t0_us + u (microseconds) plus a delay drawn from pulse."""
 
     def __init__(self, t0_us: Value, flight_path_m: Value, pulse: Pulse) -> None: ...
+    @staticmethod
+    def from_pulse_calibration_file(path: str) -> Calibration:
+        """The calibration of an experiment from a pulse calibration file: t0
+        and the flight path fitted from the calibrated ones, the fitted pulse
+        numbers fitted from theirs under the calibration's prior, and the
+        others known."""
+        ...
     @property
     def t0_us(self) -> Value: ...
     @property

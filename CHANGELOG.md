@@ -9,6 +9,15 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
 
 ### Added
 
+- MCP single_spectrum results return each region's timing offset, background
+  terms, gamma transmission and overdispersions, and the fit's spread share;
+  density-map .npz files hold each patch's timing offset, gamma transmission
+  and background terms.
+- Python reads a pulse calibration file into a `Calibration` whose fitted
+  pulse numbers are fitted under the calibration's prior
+  (`Calibration.from_pulse_calibration_file`), and a File 32 resonance
+  covariance (`load_resonance_covariance`) that `Material(covariances=...)`
+  carries into the fit's covariance.
 - `fit_map` fits the time background `[C, A, tau]` per pixel as a quantity
   shared by every patch, and each patch's gamma transmission.
   `MapMeasurement` gains `time_background` and `gamma_transmission`;
@@ -72,6 +81,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
   Calibration)` replace the typed-spectrum and spatial fitting APIs.
   The detector pulse acts on each count arm. An energy-center array or a
   transmission ratio cannot replace the original detector counts and edges.
+- Removed `nereids_io::rebin::rebin_centers` and `rebin_transmission`. A
+  merged bin's position depends on the widths of the bins it merges, which
+  centres do not give, and a transmission mean is not the ratio of the
+  summed counts. The GUI rebins a spectrum of bin edges only.
 - Removed transmission-LM fitting, the alternate joint-Poisson fitter,
   spatial regularization, legacy calibration and detectability interfaces,
   and the examples that require them. The Python quickstart describes the
@@ -96,6 +109,20 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
 - The map's `trusted` array is `identified`, in Rust, Python and the MCP
   map files: where the counts determine every fitted density and the fitted
   temperature of a converged patch.
+
+### Fixed
+
+- The Gaussian resolution with an exponential tail keeps its whole tail. The
+  kernel lost its tail more than 5.01 Gaussian widths from its peak (60% of
+  its area at `C = 0.05`), and `exerfc` lost its `exp(x^2)` factor below
+  `x = -5.01`.
+- An SLBW or MLBW range with a competitive width (LRX=1) is parsed but not
+  evaluated, like an LRF=7 range: the width's energy dependence needs the l of
+  the exit channel, which ENDF does not give. It was evaluated with the
+  competitive width left out of the total width.
+- A channel of an SLBW, MLBW or Reich–Moore L-group that holds no resonance
+  scatters as a hard sphere, `pi/k^2 * g_J * 4 sin^2(phi_l)`; its
+  potential scattering was left out.
 
 ### Limitations
 

@@ -45,7 +45,7 @@ pub struct SessionCache {
     /// KL background enabled (b₀ + b₁/√E).
     #[serde(default)]
     pub kl_background_enabled: bool,
-    /// Bounded multiplicative baseline enabled ().
+    /// Bounded multiplicative baseline enabled.
     #[serde(default)]
     pub baseline_enabled: bool,
     /// Counts-KL proton-charge ratio `c = Q_s / Q_ob`.
@@ -463,7 +463,7 @@ pub struct AppState {
     pub kl_c_ratio: f64,
     /// Retained project setting; the counts engine has no Nelder-Mead polish.
     pub kl_enable_polish_override: Option<bool>,
-    /// Bounded multiplicative baseline ():
+    /// Bounded multiplicative baseline:
     /// B(E) = b0 + b1·ln(E/E_ref) + b2·ln²(E/E_ref), applied OUTERMOST.
     /// When combined with a background, Anorm is held fixed (b0/Anorm are
     /// degenerate normalizations) — `build_fit_config` wires that.

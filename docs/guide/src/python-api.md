@@ -41,7 +41,7 @@ Important properties:
 | `target_spin` | `float` | Target spin from the first evaluable range (parse-and-skip placeholders are skipped). |
 | `scattering_radius` | `float` | Effective scattering radius in fm, from the first evaluable range. |
 | `l_values` | `list[int]` | Orbital angular momentum values present in the data. |
-| `has_unevaluated_ranges` | `bool` | True when the file carries parsed-but-not-evaluated spans (LRF=7 / URR / LRU=0); those spans contribute zero cross-section. |
+| `has_unevaluated_ranges` | `bool` | True when the file carries parsed-but-not-evaluated spans (LRF=7 / URR / LRU=0); their resonances contribute no cross section. |
 | `skipped_ranges` | `list[str]` | One description per parsed-but-not-evaluated span. |
 
 ### Counts Fit Objects
@@ -88,14 +88,31 @@ broadening has the lattice's variance.
 #### Material
 
 Material(isotopes, temperature_k, library="endf8.1", thickness_variance=None,
-lattice=None) takes a list of (ResonanceData, Value) pairs, each density in
+lattice=None, covariances=[]) takes a list of (ResonanceData, Value) pairs, each density in
 atoms/barn, a temperature Value in K, and the relative variance v of the areal
 density over the region's pixels, known 0 by default: the region transmits
 (1 + v*D)**(-1/v), the mean for a Gamma-distributed areal density, D the
 optical depth at the mean density. lattice is the PhononSpectrum the nuclei
 vibrate with: the cross sections are broadened by the harmonic lattice and
 temperature_k is the thermodynamic temperature. None broadens by the free gas,
-for which a solid's temperature is its effective one.
+for which a solid's temperature is its effective one. covariances pairs an
+index into isotopes with that isotope's ResonanceCovariance, which the fit's
+covariance carries.
+
+#### ResonanceCovariance
+
+ResonanceCovariance holds the covariance of the energy, neutron width and
+capture width, in that order, of each listed resonance of one evaluation.
+resonances lists them as (range, L-group, resonance) indices into the
+ResonanceData it was read with, and covariance is the matrix over the
+3 * len(resonances) parameters, in eV**2.
+
+load_resonance_covariance(data, window_ev, path=None, library="endf8.1",
+mat=None) reads the File 32 covariance of the energy, neutron width and
+capture width of data's Reich-Moore resonances between window_ev = (low, high)
+eV, from the ENDF file at path or from the library's evaluation of data's
+isotope, and returns None when the evaluation has none. Read it with the same
+evaluation as data: its resonances are indices into data.
 
 #### Region
 
@@ -151,6 +168,10 @@ held or fitted.
 
 Calibration(t0_us, flight_path_m, pulse) gives the timing offset in
 microseconds and the flight path in metres. Both are Values, known or fitted.
+Calibration.from_pulse_calibration_file(path) reads a pulse calibration file:
+t0 and the flight path are fitted from the calibrated ones, and the fitted
+pulse numbers are fitted from theirs under the calibration's prior, its mean
+and covariance (Pulse.has_prior); the others are known.
 
 #### RegionFit and CountsFit
 
@@ -219,7 +240,8 @@ names include `endf8.0`, `endf8.1`, `jeff3.3`, `jendl5`, `tendl2023`, and
 afterwards. `load_endf_file(...)` parses a local ENDF file and does not
 download data.
 
-Both loaders evaluate resolved LRF=1/2/3 ranges only. A file with **no**
+Both loaders evaluate resolved LRF=1/2/3 ranges only, and LRF=1/2 ranges only
+without a competitive width (LRX=0). A file with **no**
 evaluable range (for example a pure LRF=7 evaluation such as W-182) raises
 `ValueError` — loading it would yield zero cross-section everywhere. A mixed
 evaluation loads, emits a `UserWarning` naming the skipped spans, and flags

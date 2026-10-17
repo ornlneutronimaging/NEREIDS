@@ -48,7 +48,7 @@ use std::fmt;
 
 use nereids_core::constants::{self, DIVISION_FLOOR, NEAR_ZERO_FLOOR};
 
-use crate::resolution::exerfc;
+use crate::resolution::erfc;
 
 /// Number of standard deviations beyond the velocity range for the FGM
 /// integration window.  The Gaussian kernel exp(-arg²) contributes less
@@ -373,26 +373,8 @@ impl DopplerParams {
     }
 }
 
-/// √π constant for erfc computation.
+/// √π.
 const SQRT_PI: f64 = 1.772_453_850_905_516;
-
-/// Complementary error function erfc(x) = 1 - erf(x).
-///
-/// For x ≥ 0: uses the scaled complementary error function `exerfc`
-/// (SAMMY `fnc/exerfc.f90`):
-///   erfc(x) = exp(-x²) · exerfc(x) / √π
-///
-/// For x < 0: uses the identity erfc(-|x|) = 2 - erfc(|x|) to avoid
-/// the `exerfc` negative-argument branch, which has a numerical issue
-/// for |x| > 5.01 (missing exp(x²) factor in the large-|x| path).
-fn erfc_val(x: f64) -> f64 {
-    if x >= 0.0 {
-        (-x * x).exp() * exerfc(x) / SQRT_PI
-    } else {
-        let xp = -x;
-        2.0 - (-xp * xp).exp() * exerfc(xp) / SQRT_PI
-    }
-}
 
 /// Build the extended velocity grid and the FGM integrand Y(w) = w²·s(w)
 /// shared by [`doppler_broaden`] and [`doppler_broaden_with_derivative`] —
@@ -691,8 +673,8 @@ pub fn doppler_broaden(
 
             // J₀ = ∫_{b_{j+1}}^{b_j} exp(−t²) dt
             //     = (√π/2)(erfc(b_{j+1}) − erfc(b_j))
-            let erfc_bj = erfc_val(b_j);
-            let erfc_bj1 = erfc_val(b_j1);
+            let erfc_bj = erfc(b_j);
+            let erfc_bj1 = erfc(b_j1);
             let j0 = SQRT_PI * 0.5 * (erfc_bj1 - erfc_bj);
 
             if j0 < NEAR_ZERO_FLOOR {
@@ -893,8 +875,8 @@ pub fn doppler_broaden_with_derivative(
             let b_j = (v - w_j) / u;
             let b_j1 = (v - w_j1) / u;
 
-            let erfc_bj = erfc_val(b_j);
-            let erfc_bj1 = erfc_val(b_j1);
+            let erfc_bj = erfc(b_j);
+            let erfc_bj1 = erfc(b_j1);
             let j0 = SQRT_PI * 0.5 * (erfc_bj1 - erfc_bj);
 
             if j0 < NEAR_ZERO_FLOOR {

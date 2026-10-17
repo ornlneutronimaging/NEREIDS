@@ -349,6 +349,10 @@ class TestCountsManifest:
             thickness_variance=0.04,
             capture_gammas=0.2,
             in_scatter=0.6,
+            timing_offset_us=0.25,
+            background=[0.01, 0.02, 0.0, 0.0, 0.0],
+            gamma_transmission=0.7,
+            overdispersion=[1.0, None],
         )
         return SimpleNamespace(
             regions=[region],
@@ -366,6 +370,7 @@ class TestCountsManifest:
             fwhm_squared_us2=0.0,
             r_high=0.3,
             detector_tail=(0.1, 1.5),
+            spread_share=0.05,
         )
 
     def test_extract_and_validate_manifest(self, tmp_path):
@@ -429,6 +434,11 @@ class TestCountsManifest:
         assert result["results"]["thickness_variance"] == 0.04
         assert result["results"]["capture_gammas"] == 0.2
         assert result["results"]["in_scatter"] == 0.6
+        assert result["results"]["timing_offset_us"] == 0.25
+        assert result["results"]["background"] == [0.01, 0.02, 0.0, 0.0, 0.0]
+        assert result["results"]["gamma_transmission"] == 0.7
+        assert result["results"]["overdispersion"] == [1.0, None]
+        assert result["results"]["spread_share"] == 0.05
         assert result["results"]["r_high"] == 0.3
         assert calls["calibration"].pulse.r_high is None
         f, decay = calls["calibration"].pulse.detector_tail
@@ -591,13 +601,23 @@ class TestCountsManifest:
                 fits=[
                     [
                         SimpleNamespace(
-                            thickness_variance=0.03, capture_gammas=0.1, in_scatter=0.5
+                            thickness_variance=0.03,
+                            capture_gammas=0.1,
+                            in_scatter=0.5,
+                            timing_offset_us=0.0,
+                            gamma_transmission=0.8,
+                            background=[0.01, 0.02, 0.03],
                         ),
                         None,
                     ],
                     [
                         SimpleNamespace(
-                            thickness_variance=None, capture_gammas=0.0, in_scatter=0.0
+                            thickness_variance=None,
+                            capture_gammas=0.0,
+                            in_scatter=0.0,
+                            timing_offset_us=0.0,
+                            gamma_transmission=1.0,
+                            background=[0.0, 0.0, 0.0],
                         ),
                         None,
                     ],
@@ -647,3 +667,8 @@ class TestCountsManifest:
         np.testing.assert_array_equal(
             saved["in_scatter"], [[0.5, np.nan], [0.0, np.nan]]
         )
+        np.testing.assert_array_equal(
+            saved["gamma_transmission"], [[0.8, np.nan], [1.0, np.nan]]
+        )
+        np.testing.assert_array_equal(saved["background"][0, 0], [0.01, 0.02, 0.03])
+        assert np.isnan(saved["background"][0, 1]).all()
