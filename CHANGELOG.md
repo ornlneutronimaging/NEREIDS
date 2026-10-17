@@ -94,6 +94,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
 - PLEIADES test data are no longer a Git submodule. The local directory is
   ignored. The test suite does not require it.
 
+### Fixed
+
+- When the counts reject a fit, `fit_counts` fits each fitted temperature
+  again from 2,500 K and keeps the fit that describes the counts better. A
+  thin sample hotter than about 1,500 K, fitted from room temperature, ended
+  in a false minimum near the start.
+
 ### Limitations
 
 - The map's `trusted` array records numerical status only. It does not
