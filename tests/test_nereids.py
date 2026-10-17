@@ -897,6 +897,9 @@ class TestCountsApi:
             lattice=debye,
         )
         assert crystal.lattice.effective_temperature_k(300.0) > 300.0
+        for kelvin in (-300.0, 0.0, float("nan"), float("inf")):
+            with pytest.raises(ValueError, match="finite and positive"):
+                debye.effective_temperature_k(kelvin)
         with pytest.raises(ValueError, match="phonon spectrum"):
             nereids.PhononSpectrum(1e-3, [1.0, 2.0])
         uneven = nereids.Material(

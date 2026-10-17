@@ -3129,9 +3129,14 @@ impl PyPhononSpectrum {
     }
 
     /// The free gas's temperature whose broadening has the lattice's variance
-    /// at temperature_k.
-    fn effective_temperature_k(&self, temperature_k: f64) -> f64 {
-        self.inner.effective_temperature_k(temperature_k)
+    /// at temperature_k, finite and positive.
+    fn effective_temperature_k(&self, temperature_k: f64) -> PyResult<f64> {
+        if !(temperature_k.is_finite() && temperature_k > 0.0) {
+            return Err(pyo3::exceptions::PyValueError::new_err(format!(
+                "the temperature must be finite and positive, got {temperature_k} K"
+            )));
+        }
+        Ok(self.inner.effective_temperature_k(temperature_k))
     }
 }
 
