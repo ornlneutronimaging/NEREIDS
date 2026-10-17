@@ -29,7 +29,7 @@
 //! | FGM + Gauss, sparse | tr004 | <3.4% | Sparse-grid convolution |
 //! | HEGA Doppler + Gaussian | tr006 | <3.3% | Doppler method mismatch |
 //! | FGM + HEGA, no Doppler | tr008 | <3.0% | HEGA vs FGM difference |
-//! | FGM + Gauss + Exp tail | tr007, tr047 | <2.9% | Resonance peak sampling |
+//! | FGM + Gauss + Exp tail | tr007, tr047 | <1.8% | Resonance peak sampling |
 //! | FGM + Gauss + Exp, sparse | tr029, tr030 | <2.5% | Sparse grid + exp tail |
 //! | 3-ch fission, unbroadened | tr028, tr018 | <0.1% | Direct R-matrix (exact) |
 //! | 3-ch fission, broadened | tr019 | <1.7% | Resonance peak sampling |
@@ -513,10 +513,10 @@ fn test_tr007_fe56_broadened() {
     // FGM Doppler + Gaussian+exponential resolution broadening.
     // Dense grid at low energy (1.13-1.17 keV) means quadrature error is
     // negligible.  Remaining error is from FGM vs HEGA Doppler difference.
-    // Measured: 2.9% mean.
+    // Measured: 1.6% mean.
     assert!(
-        result.mean_rel_error < 0.04,
-        "broadened mean error {:.4} > 4%",
+        result.mean_rel_error < 0.02,
+        "broadened mean error {:.4} > 2%",
         result.mean_rel_error
     );
 }
@@ -2181,9 +2181,7 @@ fn test_tr122_fe56_broadened() {
     // Same physics as tr007 (Fe-56, 3 resonances) but uses the new spin group
     // format with explicit channel definitions.  Dense grid at 1.13-1.17 keV.
     // FGM vs HEGA Doppler difference is the dominant error source.
-    // Measured: 4.1% mean (slightly higher than tr007's 2.9% due to lower
-    // temperature — 181K vs 329K — making the Doppler kernel narrower and
-    // the HEGA approximation less accurate near the sharp resonance peak).
+    // Measured: 4.1% mean.
     assert!(
         result.mean_rel_error < 0.05,
         "broadened mean error {:.4} > 5%",
