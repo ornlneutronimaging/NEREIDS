@@ -204,7 +204,11 @@ fn a_point_repeated_exactly_is_read_once() {
     closing.points.insert(m, table.points[m - 1]);
     closing.boundaries = vec![m, m + 1, np + 1];
     closing.interp_codes = vec![2, 5, 2];
-    for on_tape in [tripled, closing] {
+    let mut leading = table.clone();
+    leading.points.insert(0, table.points[0]);
+    leading.boundaries = vec![2, np / 2 + 1, np + 1];
+    leading.interp_codes = vec![5, 2, 2];
+    for on_tape in [tripled, closing, leading] {
         let text = edited("1", |section| {
             let head = section[0].clone();
             *section = written("1", &head, &on_tape);
