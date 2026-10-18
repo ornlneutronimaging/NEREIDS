@@ -39,13 +39,14 @@
 //! | Multi-isotope (3 sp), HEGA | tr010 | <0.62% | Doppler method mismatch |
 //! | Unbroadened reconstruction | tr037 | <0.1% | Direct R-matrix (exact) |
 //! | Multi-isotope + R-ext, Gauss | tr040 | <1.1% | R-external + multi-isotope |
-//! | New spin group fmt, HEGA | tr122 | <4.1% | HEGA/FGM + low temp (181K) |
+//! | New spin group fmt, HEGA | tr122 | <1.8% | HEGA/FGM + low temp (181K) |
 //! | 3-ch fission, Pu-239, HEGA | tr009 | <0.2% | Exact R-matrix fission |
 //! | 3-ch fission, Am-241, HEGA | tr005 | <1.9% | HEGA/FGM + wide range |
 //!
 //! ## Reference
 //! SAMMY source: `../SAMMY/SAMMY/sammy/samtry/`
 
+use nereids_core::constants::NEUTRON_MASS_AMU;
 use nereids_endf::parser::parse_endf_file2;
 use nereids_endf::resonance::{ResonanceData, ResonanceFormalism};
 use nereids_endf::sammy::{
@@ -123,6 +124,12 @@ fn load_samtry_case(
             }
         }
         // else: plt is already in keV (the standard assumption).
+    }
+    if let Some(tzero) = par.tzero {
+        let flight_path_m = tzero.flight_path_m.unwrap_or(inp.flight_path_m);
+        for rec in &mut plt {
+            rec.energy_kev = tzero.energy_ev(rec.energy_kev * 1000.0, flight_path_m) / 1000.0;
+        }
     }
 
     (inp, par, plt)
@@ -462,7 +469,7 @@ fn test_tr007_fe56_parse() {
 
     // Verify isotope info.
     assert_eq!(inp.isotope_symbol, "FE56");
-    assert!((inp.awr - 55.9).abs() < 0.1);
+    assert!((inp.awr * NEUTRON_MASS_AMU - 55.9).abs() < 0.1);
     assert!((inp.temperature_k - 329.0).abs() < 1.0);
 }
 
@@ -1311,6 +1318,7 @@ fn test_tr024_natfe_parse() {
     assert_eq!(inp.spin_groups.len(), 11);
     assert!(!inp.no_broadening);
     assert_eq!(inp.isotope_symbol, "NatFE");
+    assert_eq!(sammy_to_resonance_data(&inp, &par).unwrap().za, 26056);
 
     // Verify broadening parameters.
     assert!(
@@ -1337,6 +1345,7 @@ fn test_tr024_natfe_parse() {
 
     // Group 1: Fe-56 (abundance=0.918, target_spin=0.0, 6 spin groups).
     assert!((multi[0].1 - 0.918).abs() < 1e-3, "Fe-56 abundance");
+    assert_eq!(multi[0].0.za, 26056);
 
     // Group 2: Fe-57 (abundance=0.058, target_spin=0.0, 3 spin groups).
     assert!((multi[1].1 - 0.058).abs() < 1e-3, "Fe-57 abundance");
@@ -1942,12 +1951,12 @@ fn test_tr055_natfe_parse() {
         "expected 4 isotopic mass entries"
     );
     assert!(
-        (par.isotopic_masses[0].awr - 55.454).abs() < 1e-3,
-        "Fe-56 AWR"
+        (par.isotopic_masses[0].awr * NEUTRON_MASS_AMU - 55.454).abs() < 1e-3,
+        "Fe-56 mass"
     );
     assert!(
-        (par.isotopic_masses[1].awr - 54.0).abs() < 1e-3,
-        "Fe-54 AWR"
+        (par.isotopic_masses[1].awr * NEUTRON_MASS_AMU - 54.0).abs() < 1e-3,
+        "Fe-54 mass"
     );
     assert!(
         (par.isotopic_masses[1].abundance - 0.0485).abs() < 1e-4,
@@ -1971,10 +1980,9 @@ fn test_tr055_natfe_parse() {
         "Fe-54 multi abundance should use par file value (0.0485), got {}",
         multi[1].1
     );
-    // Per-isotope AWR from ISOTOPIC MASSES.
     assert!(
-        (multi[1].0.awr - 54.0).abs() < 1e-3,
-        "Fe-54 AWR should be 54.0 from ISOTOPIC MASSES, got {}",
+        (multi[1].0.awr * NEUTRON_MASS_AMU - 54.0).abs() < 1e-3,
+        "Fe-54 mass should be 54.0 amu from ISOTOPIC MASSES, got AWR {}",
         multi[1].0.awr
     );
 }
@@ -2139,7 +2147,7 @@ fn test_tr122_fe56_parse() {
         "raa.plt",
     );
     assert_eq!(inp.isotope_symbol, "FE56");
-    assert!((inp.awr - 55.9).abs() < 0.1);
+    assert!((inp.awr * NEUTRON_MASS_AMU - 55.9).abs() < 0.1);
     assert!((inp.temperature_k - 181.0).abs() < 1.0);
     // New spin group format: 2 spin groups with J=0.5 and J=-0.5.
     assert_eq!(inp.spin_groups.len(), 2);
@@ -2181,10 +2189,10 @@ fn test_tr122_fe56_broadened() {
     // Same physics as tr007 (Fe-56, 3 resonances) but uses the new spin group
     // format with explicit channel definitions.  Dense grid at 1.13-1.17 keV.
     // FGM vs HEGA Doppler difference is the dominant error source.
-    // Measured: 4.1% mean.
+    // Measured: 1.8% mean.
     assert!(
-        result.mean_rel_error < 0.05,
-        "broadened mean error {:.4} > 5%",
+        result.mean_rel_error < 0.02,
+        "broadened mean error {:.4} > 2%",
         result.mean_rel_error
     );
 }
@@ -2330,7 +2338,7 @@ fn test_tr009_pu239_parse() {
         "raa.plt",
     );
     assert_eq!(inp.isotope_symbol, "PU239");
-    assert!((inp.awr - 239.0).abs() < 1.0);
+    assert!((inp.awr * NEUTRON_MASS_AMU - 239.0).abs() < 1.0);
     assert!((inp.temperature_k - 300.0).abs() < 1.0);
     assert!((inp.scattering_radius_fm - 9.011).abs() < 0.01);
     // 2 spin groups: J=0 (3 channels) and J=1 (3 channels).
@@ -2402,7 +2410,7 @@ fn test_tr005_am241_parse() {
         "raa.plt",
     );
     assert_eq!(inp.isotope_symbol, "AMERICIUM");
-    assert!((inp.awr - 241.0).abs() < 1.0);
+    assert!((inp.awr * NEUTRON_MASS_AMU - 241.0).abs() < 1.0);
     assert!((inp.temperature_k - 300.0).abs() < 1.0);
     // 2 spin groups: J=2 (3 channels) and J=3 (3 channels).
     assert_eq!(inp.spin_groups.len(), 2);

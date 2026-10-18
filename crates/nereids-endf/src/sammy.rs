@@ -12,6 +12,7 @@
 
 use std::fmt;
 
+use nereids_core::constants::{NEUTRON_MASS_AMU, energy_to_tof, tof_to_energy};
 use nereids_core::types::Isotope;
 
 use crate::resonance::{
@@ -95,6 +96,31 @@ pub struct SammyParFile {
     ///
     /// SAMMY Ref: `IsotopicMassesAndAbundances.cpp`
     pub isotopic_masses: Vec<IsotopicMass>,
+    /// The `TZERO` line of the miscellaneous parameters, if given.
+    pub tzero: Option<Tzero>,
+}
+
+/// The `TZERO` line of a `.par` file's miscellaneous parameters: SAMMY
+/// evaluates the theory of a data point at energy `E` at
+/// `L₀² m L²/(2 (t − t₀)²)`, `t` the flight time of `E` over the flight path
+/// `L`.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct Tzero {
+    /// `t₀` in µs.
+    pub t0_us: f64,
+    /// `L₀`, dimensionless.
+    pub l0: f64,
+    /// The flight path in m the line gives, if it gives one.
+    pub flight_path_m: Option<f64>,
+}
+
+impl Tzero {
+    /// The energy in eV at which SAMMY evaluates the theory of a data point at
+    /// `energy_ev`, over a flight path of `flight_path_m` m.
+    pub fn energy_ev(&self, energy_ev: f64, flight_path_m: f64) -> f64 {
+        let flight_time_us = energy_to_tof(energy_ev, flight_path_m);
+        self.l0 * self.l0 * tof_to_energy(flight_time_us - self.t0_us, flight_path_m)
+    }
 }
 
 // ─── .inp file types ───────────────────────────────────────────────────────────
@@ -643,12 +669,13 @@ pub fn parse_sammy_par(content: &str) -> Result<SammyParFile, SammyParseError> {
                 continue;
             }
 
-            let awr: f64 = iso_line[..10].trim().parse().map_err(|_| {
+            let mass_amu: f64 = iso_line[..10].trim().parse().map_err(|_| {
                 SammyParseError::new(format!(
-                    "ISOTOPIC MASSES: bad AWR field '{}'",
+                    "ISOTOPIC MASSES: bad mass field '{}'",
                     iso_line[..10].trim()
                 ))
             })?;
+            let awr = mass_amu / NEUTRON_MASS_AMU;
             let abundance: f64 = iso_line[10..20].trim().parse().map_err(|_| {
                 SammyParseError::new(format!(
                     "ISOTOPIC MASSES: bad abundance field '{}'",
@@ -702,11 +729,34 @@ pub fn parse_sammy_par(content: &str) -> Result<SammyParFile, SammyParseError> {
         }
     }
 
+    let tzero = match lines_vec
+        .iter()
+        .find(|l| l.trim_start().to_uppercase().starts_with("TZERO"))
+    {
+        Some(line) => {
+            let field = |start: usize, end: usize| {
+                line.get(start..end.min(line.len()))
+                    .map(str::trim)
+                    .filter(|s| !s.is_empty())
+                    .map(parse_fortran_float)
+                    .transpose()
+                    .map_err(|e| SammyParseError::new(format!("TZERO: {e}")))
+            };
+            Some(Tzero {
+                t0_us: field(10, 20)?.unwrap_or(0.0),
+                l0: field(30, 40)?.unwrap_or(1.0),
+                flight_path_m: field(50, 60)?,
+            })
+        }
+        None => None,
+    };
+
     Ok(SammyParFile {
         resonances,
         radius_overrides,
         r_external,
         isotopic_masses,
+        tzero,
     })
 }
 
@@ -747,7 +797,8 @@ pub fn parse_sammy_inp(content: &str) -> Result<SammyInpConfig, SammyParseError>
     let awr = iso_line[10..20.min(iso_line.len())]
         .trim()
         .parse::<f64>()
-        .map_err(|e| SammyParseError::new(format!("line 2: AWR: {e}")))?;
+        .map_err(|e| SammyParseError::new(format!("line 2: AW: {e}")))?
+        / NEUTRON_MASS_AMU;
     let energy_min_ev = iso_line[20..30.min(iso_line.len())]
         .trim()
         .parse::<f64>()
@@ -842,10 +893,12 @@ pub fn parse_sammy_inp(content: &str) -> Result<SammyInpConfig, SammyParseError>
 
     if card5_present && idx < lines.len() {
         let card5_fields: Vec<&str> = lines[idx].split_whitespace().collect();
-        if card5_fields.len() >= 2 {
-            temperature_k = card5_fields[0]
+        if let Some(temperature) = card5_fields.first() {
+            temperature_k = temperature
                 .parse::<f64>()
                 .map_err(|e| SammyParseError::new(format!("Card 5: temperature: {e}")))?;
+        }
+        if card5_fields.len() >= 2 {
             flight_path_m = card5_fields[1]
                 .parse::<f64>()
                 .map_err(|e| SammyParseError::new(format!("Card 5: flight_path: {e}")))?;
@@ -1308,9 +1361,9 @@ pub fn sammy_to_resonance_data(
     // Infer Z and A from the isotope symbol (e.g. "60NI" → Z=28, A=60;
     // "FE56" → Z=26, A=56; "58NI" → Z=28, A=58; "NatFE" → Z=26, A=0).
     let (z, mut a) = parse_isotope_symbol(&inp.isotope_symbol)?;
-    // For natural-element symbols (A=0), approximate A from AWR.
+    // For natural-element symbols (A=0), approximate A from the mass in amu.
     if a == 0 {
-        a = inp.awr.round() as u32;
+        a = (inp.awr * NEUTRON_MASS_AMU).round() as u32;
     }
     let za = z * 1000 + a;
 
@@ -1558,9 +1611,9 @@ pub fn sammy_to_resonance_data_multi(
         } else {
             (card2_z, card2_a)
         };
-        // For natural-element symbols (A=0), approximate A from AWR.
+        // For natural-element symbols (A=0), approximate A from the mass in amu.
         if a == 0 {
-            a = isotope_awr.round() as u32;
+            a = (isotope_awr * NEUTRON_MASS_AMU).round() as u32;
         }
         let za = z * 1000 + a;
 
@@ -1945,6 +1998,40 @@ mod tests {
     }
 
     #[test]
+    fn a_tzero_line_moves_the_energy_scale() {
+        let content = "\
+27650.     1400.      1480000.   0.         0.          1 0 1 0 0 1
+
+MISCEllaneous parameters follow
+TZERO 1 1 -.01000000 .00100000 .99800000 .10000000 100.00000
+";
+        let tzero = parse_sammy_par(content).unwrap().tzero.expect("TZERO");
+        assert_eq!(
+            tzero,
+            Tzero {
+                t0_us: -0.01,
+                l0: 0.998,
+                flight_path_m: Some(100.0)
+            }
+        );
+        let unmoved = Tzero {
+            t0_us: 0.0,
+            l0: 0.998,
+            flight_path_m: None,
+        };
+        assert!((unmoved.energy_ev(1000.0, 100.0) / (1000.0 * 0.998 * 0.998) - 1.0).abs() < 1e-12);
+        let t = energy_to_tof(1000.0, 100.0);
+        let expected = 0.998 * 0.998 * 1000.0 * (t / (t + 0.01)).powi(2);
+        assert!((tzero.energy_ev(1000.0, 100.0) / expected - 1.0).abs() < 1e-12);
+        assert!(
+            parse_sammy_par(content.split("\n\n").next().unwrap())
+                .unwrap()
+                .tzero
+                .is_none()
+        );
+    }
+
+    #[test]
     fn test_parse_par_tr007() {
         let content = "\
 -2070.     1450.      186600.    0.         0.          0 0 0 0 0 1
@@ -1993,7 +2080,7 @@ EXPLICIT
     fn test_parse_inp_tr007() {
         let inp = parse_sammy_inp(FE56_TR007_INP).unwrap();
         assert_eq!(inp.isotope_symbol, "FE56");
-        assert!((inp.awr - 55.9).abs() < 1e-6);
+        assert!((inp.awr * NEUTRON_MASS_AMU - 55.9).abs() < 1e-9);
         assert!((inp.energy_min_ev - 1133.01).abs() < 1e-6);
         assert!((inp.energy_max_ev - 1170.517).abs() < 1e-6);
         assert!((inp.temperature_k - 329.0).abs() < 1e-6);
@@ -2105,6 +2192,7 @@ EXPLICIT
             radius_overrides: std::collections::HashMap::new(),
             r_external: std::collections::HashMap::new(),
             isotopic_masses: Vec::new(),
+            tzero: None,
         };
         let rd = sammy_to_resonance_data(&inp, &par).unwrap();
         assert_eq!(rd.za, 26056); // Fe-56
