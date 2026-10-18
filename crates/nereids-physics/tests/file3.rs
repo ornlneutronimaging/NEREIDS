@@ -151,6 +151,69 @@ fn file_3_of_another_material_or_malformed_is_never_read() {
     }
 }
 
+/// The lines of File 3's section `mt` holding `table` after its HEAD record.
+fn written(mt: &str, head: &str, table: &Tab1) -> Vec<String> {
+    let tail = format!("{MAT} 3{mt:>3}");
+    let line = |fields: &[String]| format!("{:<66}{tail}", fields.concat());
+    let float = |x: f64| format!("{:>11}", format!("{x:.6e}"));
+    let int = |n: usize| format!("{n:>11}");
+    let mut lines = vec![head.to_string()];
+    lines.push(line(&[
+        float(0.0),
+        float(0.0),
+        int(0),
+        int(0),
+        int(table.boundaries.len()),
+        int(table.points.len()),
+    ]));
+    let laws: Vec<String> = table
+        .boundaries
+        .iter()
+        .zip(&table.interp_codes)
+        .flat_map(|(&b, &c)| [int(b), int(c as usize)])
+        .collect();
+    lines.extend(laws.chunks(6).map(line));
+    let values: Vec<String> = table
+        .points
+        .iter()
+        .flat_map(|&(x, y)| [float(x), float(y)])
+        .collect();
+    lines.extend(values.chunks(6).map(line));
+    lines
+}
+
+#[test]
+fn a_point_repeated_exactly_is_read_once() {
+    let mut table = read(&tape(), 1);
+    table.points = table
+        .points
+        .iter()
+        .map(|&(x, y)| (number(&format!("{x:.6e}")), number(&format!("{y:.6e}"))))
+        .collect();
+    let np = table.points.len();
+    table.boundaries = vec![np / 2, np];
+    table.interp_codes = vec![2, 2];
+    let mut tripled = table.clone();
+    let k = np / 4;
+    tripled
+        .points
+        .splice(k..k, [table.points[k], table.points[k]]);
+    tripled.boundaries = vec![np / 2 + 2, np + 2];
+    let text = edited("1", |section| {
+        let head = section[0].clone();
+        *section = written("1", &head, &tripled);
+    });
+    let total = parse_endf_file2(&text)
+        .expect("tape")
+        .smooth
+        .total
+        .expect("MT1");
+    assert_eq!(
+        (&total.boundaries, &total.interp_codes, &total.points),
+        (&table.boundaries, &table.interp_codes, &table.points)
+    );
+}
+
 #[test]
 fn an_evaluation_whose_file_3_holds_the_whole_cross_section_is_refused() {
     let mut lines: Vec<String> = tape().lines().map(str::to_string).collect();
