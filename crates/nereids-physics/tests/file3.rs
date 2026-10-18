@@ -199,19 +199,28 @@ fn a_point_repeated_exactly_is_read_once() {
         .points
         .splice(k..k, [table.points[k], table.points[k]]);
     tripled.boundaries = vec![np / 2 + 2, np + 2];
-    let text = edited("1", |section| {
-        let head = section[0].clone();
-        *section = written("1", &head, &tripled);
-    });
-    let total = parse_endf_file2(&text)
-        .expect("tape")
-        .smooth
-        .total
-        .expect("MT1");
-    assert_eq!(
-        (&total.boundaries, &total.interp_codes, &total.points),
-        (&table.boundaries, &table.interp_codes, &table.points)
-    );
+    let mut closing = table.clone();
+    let m = np / 2;
+    closing.points.insert(m, table.points[m - 1]);
+    closing.boundaries = vec![m, m + 1, np + 1];
+    closing.interp_codes = vec![2, 5, 2];
+    for on_tape in [tripled, closing] {
+        let text = edited("1", |section| {
+            let head = section[0].clone();
+            *section = written("1", &head, &on_tape);
+        });
+        let total = parse_endf_file2(&text)
+            .expect("tape")
+            .smooth
+            .total
+            .expect("MT1");
+        assert_eq!(
+            (&total.boundaries, &total.interp_codes, &total.points),
+            (&table.boundaries, &table.interp_codes, &table.points),
+            "{:?}",
+            on_tape.boundaries
+        );
+    }
 }
 
 #[test]
