@@ -1514,7 +1514,8 @@ fn parse_tab1(lines: &[&str], pos: &mut usize) -> Result<Tab1, EndfParseError> {
 }
 
 /// A TAB1 record; with `jumps`, an x may appear twice in a row, the second
-/// value holding from it on.
+/// value holding from it on, and a point repeated exactly is read once, with
+/// an interpolation region it leaves empty dropped.
 fn parse_tab1_with(lines: &[&str], pos: &mut usize, jumps: bool) -> Result<Tab1, EndfParseError> {
     let cont = parse_cont(lines, pos)?;
     let nr = checked_count(cont.n1, "NR")?; // number of interpolation regions
@@ -1604,6 +1605,22 @@ fn parse_tab1_with(lines: &[&str], pos: &mut usize, jumps: bool) -> Result<Tab1,
             return Err(EndfParseError::UnsupportedFormat(format!(
                 "TAB1 point {i} ({x}, {y}) is not finite"
             )));
+        }
+        if jumps && points.last() == Some(&(x, y)) {
+            for nbt in boundaries.iter_mut().filter(|nbt| **nbt > points.len()) {
+                *nbt -= 1;
+            }
+            // A region left with no interval: NBT = 1 or NBT equal to the one before.
+            let empty = if boundaries.first() == Some(&1) {
+                Some(0)
+            } else {
+                (1..boundaries.len()).find(|&r| boundaries[r] == boundaries[r - 1])
+            };
+            if let Some(empty) = empty {
+                boundaries.remove(empty);
+                interp_codes.remove(empty);
+            }
+            continue;
         }
         // x-values must be strictly increasing, or repeat once at a jump;
         // Tab1::evaluate() relies on this.

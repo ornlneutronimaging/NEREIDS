@@ -116,6 +116,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
 
 ### Fixed
 
+- File 3 reads a point its table repeats exactly as one point, so an
+  evaluation such as JENDL-5 Ta-181, whose MT1 and MT2 repeat 6635.89 eV
+  three times, loads again.
 - The SAMMY reader divides card 2's atomic weight and each isotopic mass,
   given in amu, by the neutron mass; reads a card 5 that gives only the
   temperature; and reads a TZERO line's `t0`, `L0` and flight path into
