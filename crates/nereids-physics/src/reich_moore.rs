@@ -17,6 +17,7 @@
 //! | 1        | SLBW                       | `slbw::slbw_evaluate_with_cached_jgroups`         |
 //! | 2        | MLBW                       | `slbw::mlbw_evaluate_with_cached_jgroups`         |
 //! | 3        | Reich-Moore                | `reich_moore_spin_group_precomputed` (+ 2ch/3ch)  |
+//! | 7        | R-Matrix Limited (KRM=3)   | `rmatrix_limited::RmlPlan::evaluate`              |
 //!
 //! ## Reich-Moore Approximation
 //! In the full R-matrix, all channels (neutron, capture, fission) appear
@@ -45,6 +46,7 @@ use nereids_endf::resonance::{
 
 use crate::channel;
 use crate::penetrability;
+use crate::rmatrix_limited::RmlPlan;
 use crate::slbw;
 
 // ─── Per-resonance precomputed invariants ─────────────────────────────────────
@@ -296,7 +298,7 @@ fn precompute_jgroups_3ch(
 }
 
 /// Cross-section results at a single energy point.
-#[derive(Debug, Clone, Copy)]
+#[derive(Debug, Clone, Copy, Default)]
 pub struct CrossSections {
     /// Total cross-section (barns).
     pub total: f64,
@@ -306,14 +308,27 @@ pub struct CrossSections {
     pub capture: f64,
     /// Fission cross-section (barns).
     pub fission: f64,
+    /// Particle reactions other than elastic scattering and fission, such as
+    /// inelastic scattering (barns).
+    pub reaction: f64,
+}
+
+impl std::ops::AddAssign for CrossSections {
+    fn add_assign(&mut self, other: Self) {
+        self.total += other.total;
+        self.elastic += other.elastic;
+        self.capture += other.capture;
+        self.fission += other.fission;
+        self.reaction += other.reaction;
+    }
 }
 
 /// Compute cross-sections at a single energy.
 ///
 /// Dispatches each resonance range to the appropriate formalism-specific
-/// calculator (SLBW, MLBW, Reich-Moore) based on the formalism stored in
-/// that range; non-evaluable ranges (LRF=7, LRU=2) resolve to `Skip` and
-/// contribute zero.  See the module-level table for the full dispatch map.
+/// calculator (SLBW, MLBW, Reich-Moore, R-Matrix Limited) based on the
+/// formalism stored in that range; non-evaluable ranges (LRU=2, LRU=0)
+/// resolve to `Skip` and contribute zero.  See the module-level table for the full dispatch map.
 /// Each channel adds File 3's cross section, [`ResonanceData::smooth`].
 ///
 /// Adjacent ranges that share a boundary energy use half-open intervals
@@ -360,10 +375,7 @@ pub fn cross_sections_at_energy(data: &ResonanceData, energy_ev: f64) -> CrossSe
 
     let awr = data.awr;
 
-    let mut total = 0.0;
-    let mut elastic = 0.0;
-    let mut capture = 0.0;
-    let mut fission = 0.0;
+    let mut resonances = CrossSections::default();
 
     for (range_idx, range) in data.ranges.iter().enumerate() {
         // Cheap interval check FIRST — precompute is O(n_resonances) per range,
@@ -380,23 +392,10 @@ pub fn cross_sections_at_energy(data: &ResonanceData, energy_ev: f64) -> CrossSe
         }
 
         let plan = precompute_range_data(range, range_idx, data, awr);
-        let (t, e, c, f) = evaluate_precomputed_range(&plan, energy_ev, awr);
-        total += t;
-        elastic += e;
-        capture += c;
-        fission += f;
+        resonances += evaluate_precomputed_range(&plan, energy_ev, awr);
     }
 
-    with_smooth(
-        &data.smooth,
-        energy_ev,
-        CrossSections {
-            total,
-            elastic,
-            capture,
-            fission,
-        },
-    )
+    with_smooth(&data.smooth, energy_ev, resonances)
 }
 
 /// `resonances` plus each channel's File 3 cross section at `energy_ev`.
@@ -411,6 +410,7 @@ fn with_smooth(
         elastic: resonances.elastic + at(&smooth.elastic),
         capture: resonances.capture + at(&smooth.capture),
         fission: resonances.fission + at(&smooth.fission),
+        reaction: resonances.reaction,
     }
 }
 
@@ -520,33 +520,17 @@ impl<'a> CrossSectionPlan<'a> {
             "expected positive finite energy_ev, got {energy_ev}"
         );
 
-        let mut total = 0.0;
-        let mut elastic = 0.0;
-        let mut capture = 0.0;
-        let mut fission = 0.0;
+        let mut resonances = CrossSections::default();
 
         for pc in &self.precomputed {
             if !covers(pc.energy_low, pc.energy_high, pc.half_open_upper, energy_ev) {
                 continue;
             }
 
-            let (t, e, c, f) = evaluate_precomputed_range(pc, energy_ev, self.awr);
-            total += t;
-            elastic += e;
-            capture += c;
-            fission += f;
+            resonances += evaluate_precomputed_range(pc, energy_ev, self.awr);
         }
 
-        with_smooth(
-            self.smooth,
-            energy_ev,
-            CrossSections {
-                total,
-                elastic,
-                capture,
-                fission,
-            },
-        )
+        with_smooth(self.smooth, energy_ev, resonances)
     }
 
     /// Cross-sections at every energy of `energies`, in order.
@@ -672,6 +656,8 @@ enum PrecomputedRangeKind<'a> {
         range: &'a ResonanceRange,
         l_groups: Vec<PrecomputedSlbwLGroupData>,
     },
+    /// R-Matrix Limited (LRF=7, KRM=3): spin groups with explicit channels.
+    RMatrixLimited(RmlPlan),
     /// Not evaluable (skip).
     Skip,
 }
@@ -702,6 +688,10 @@ fn precompute_range_data<'a>(
     // arrive via legacy serialized caches or direct Rust construction.
     if !range.is_evaluable() {
         return make(PrecomputedRangeKind::Skip);
+    }
+
+    if let Some(rml) = &range.r_matrix_limited {
+        return make(PrecomputedRangeKind::RMatrixLimited(RmlPlan::new(rml)));
     }
 
     // SLBW and MLBW share the precomputed-J-group layout but evaluate
@@ -877,9 +867,11 @@ fn evaluate_precomputed_range(
     pc: &PrecomputedRangeData,
     energy_ev: f64,
     awr: f64,
-) -> (f64, f64, f64, f64) {
-    match &pc.kind {
+) -> CrossSections {
+    let (total, elastic, capture, fission) = match &pc.kind {
         PrecomputedRangeKind::Skip => (0.0, 0.0, 0.0, 0.0),
+
+        PrecomputedRangeKind::RMatrixLimited(plan) => return plan.evaluate(energy_ev),
 
         PrecomputedRangeKind::Slbw { range, l_groups } => {
             let pi_over_k2 = channel::pi_over_k_squared_barns(energy_ev, awr);
@@ -1132,14 +1124,21 @@ fn evaluate_precomputed_range(
 
             (total, elastic, capture, fission)
         }
+    };
+    CrossSections {
+        total,
+        elastic,
+        capture,
+        fission,
+        reaction: 0.0,
     }
 }
 
 /// Can this range actually produce non-zero cross-sections?
 ///
 /// Delegates to [`ResonanceRange::is_evaluable`]: evaluable = resolved
-/// LRF=1/2/3 (SLBW, MLBW, Reich-Moore). LRF=7 and LRU=2 ranges are
-/// parse-and-skip placeholders and are never evaluated.
+/// LRF=1/2/3 (SLBW, MLBW, Reich-Moore) or LRF=7 with parameters. LRU=2 and
+/// LRU=0 ranges are parse-and-skip placeholders and are never evaluated.
 ///
 /// **In literal sync with `precompute_range_data`**: both key on
 /// [`ResonanceRange::is_evaluable`] (`precompute_range_data` returns its Skip
@@ -1993,7 +1992,7 @@ mod tests {
     /// its span, through both evaluation entry points.
     ///
     /// This pins the branch's central safety property: a non-evaluable
-    /// placeholder range (LRU=2 URR / LRF=7 RML / LRU=0) reached by real mixed
+    /// placeholder range (LRU=2 URR / LRU=0) reached by real mixed
     /// tapes must add nothing to the four components, so the load-time
     /// warnings ("these spans contribute zero cross-section") are honoured at
     /// evaluation time — not just at parse time. The data has one evaluable

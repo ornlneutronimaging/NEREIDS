@@ -66,8 +66,8 @@ pub fn wave_number(energy_ev: f64, awr: f64) -> f64 {
 ///
 /// k_c = √(2·m_n·μ·E_cm) / ℏc
 ///
-/// Used for non-elastic channels in LRF=7 (R-Matrix Limited) where each
-/// channel may have a different particle pair (masses, Q-value).
+/// Used for LRF=7 (R-Matrix Limited) channels, whose particle pairs have
+/// their own masses and Q-values.
 ///
 /// For the elastic channel (MA=1 neutron, MB=AWR target):
 ///   μ = AWR/(1+AWR),  E_cm = E_lab·AWR/(1+AWR)

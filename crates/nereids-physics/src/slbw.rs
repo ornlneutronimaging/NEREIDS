@@ -194,6 +194,7 @@ pub fn slbw_cross_sections(data: &ResonanceData, energy_ev: f64) -> CrossSection
         elastic,
         capture,
         fission,
+        reaction: 0.0,
     }
 }
 

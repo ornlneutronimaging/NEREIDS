@@ -104,20 +104,17 @@ class TestLoadEndf:
                      "target_spin", "l_values", "has_unevaluated_ranges"):
             assert key in result, f"Missing key: {key}"
 
-    def test_pure_lrf7_isotope_rejected(self):
-        """W-182 (pure LRF=7 + URR) has no evaluable range and must be rejected.
-
-        LRF=7/URR evaluation was removed; a file whose every range is a
-        parse-and-skip placeholder fails to load with a ValueError rather than
-        loading as a silent zero-cross-section isotope.
+    def test_lrf7_isotope_loads(self):
+        """W-182 (LRF=7 + URR in ENDF/B-VIII.1) loads; its URR span is flagged.
 
         The library is pinned so this asserts against a fixed evaluation
-        (W-182 is pure LRF=7 + URR in ENDF/B-VIII.1) rather than whatever the
-        tool's default library becomes; requires network on a cold cache, like
-        the other live-download tests in this suite.
+        rather than whatever the tool's default library becomes; requires
+        network on a cold cache, like the other live-download tests in this
+        suite.
         """
-        with pytest.raises(ValueError, match="No evaluable resonance ranges"):
-            _load_endf_or_skip(isotope="W-182", library="endf8.1")
+        result = _load_endf_or_skip(isotope="W-182", library="endf8.1")
+        assert result["n_resonances"] == 312
+        assert result["has_unevaluated_ranges"] is True
 
     def test_mixed_evaluation_reports_skipped_ranges(self):
         """A mixed evaluation (U-238: resolved RM + URR) flags its skipped span.

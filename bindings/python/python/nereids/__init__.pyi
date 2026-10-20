@@ -108,10 +108,10 @@ class ResonanceData:
     def n_resonances(self) -> int:
         """Total number of discrete resonances across all evaluable ranges.
 
-        Counts LRF=1/2/3 L-group resonances only. LRF=7 (R-Matrix Limited)
-        and LRU=2 (URR) ranges are parsed-and-skipped — not evaluated — so
-        they contribute 0. A file with NO evaluable range at all fails to
-        load with a ValueError instead of reporting 0 here.
+        Counts the resonances of LRF=1/2/3 and LRF=7 ranges. LRU=2 (URR)
+        ranges are parsed-and-skipped — not evaluated — so they contribute 0.
+        A file with NO evaluable range at all fails to load with a ValueError
+        instead of reporting 0 here.
         """
         ...
 
@@ -120,8 +120,8 @@ class ResonanceData:
         """Total resonance count across all ranges.
 
         Explicit alias for :attr:`n_resonances`; both delegate to the Rust
-        ``ResonanceData::total_resonance_count()`` (skipped LRF=7 / LRU=2
-        ranges contribute 0).
+        ``ResonanceData::total_resonance_count()`` (skipped LRU=2 ranges
+        contribute 0).
         """
         ...
 
@@ -129,8 +129,8 @@ class ResonanceData:
     def has_unevaluated_ranges(self) -> bool:
         """Whether the evaluation carries parsed-but-not-evaluated ranges.
 
-        True when any range is a parse-and-skip placeholder (LRF=7 R-Matrix
-        Limited, LRU=2 URR, or LRU=0 scattering-radius-only). Their
+        True when any range is a parse-and-skip placeholder (LRU=2 URR or
+        LRU=0 scattering-radius-only). Their
         resonances contribute no cross section; a ``UserWarning`` listing them
         is emitted at load time by :func:`load_endf` / :func:`load_endf_file`.
         """
@@ -140,7 +140,7 @@ class ResonanceData:
     def skipped_ranges(self) -> list[str]:
         """One-line descriptions of the parse-and-skip placeholder ranges.
 
-        One string per non-evaluable range (LRF=7, LRU=2, or LRU=0), using the
+        One string per non-evaluable range (LRU=2 or LRU=0), using the
         same text as the load-time ``UserWarning`` and the parser's rejection
         message. Empty when :attr:`has_unevaluated_ranges` is ``False``.
         """
@@ -150,7 +150,7 @@ class ResonanceData:
     def target_spin(self) -> float:
         """Target nuclear spin (I) of the first evaluable resonance range.
 
-        Parse-and-skip placeholder ranges (LRU=0 / LRF=7 / URR) are skipped.
+        Parse-and-skip placeholder ranges (LRU=0 / URR) are skipped.
         """
         ...
 
@@ -158,13 +158,16 @@ class ResonanceData:
     def scattering_radius(self) -> float:
         """Effective scattering radius in fm, from the first evaluable range.
 
-        Parse-and-skip placeholder ranges (LRU=0 / LRF=7 / URR) are skipped.
+        Parse-and-skip placeholder ranges (LRU=0 / URR) are skipped. For an
+        LRF=7 range with AP=0 this is the phase radius APE of the first
+        neutron channel.
         """
         ...
 
     @property
     def l_values(self) -> list[int]:
-        """Orbital angular momentum values (L) present in the data."""
+        """Orbital angular momentum values (L) present in the data; for LRF=7,
+        those of the neutron channels."""
         ...
 
 class TabulatedResolution:
@@ -390,7 +393,9 @@ def cross_sections(
 ) -> dict[str, NDArray[np.float64]]:
     """Compute cross-sections at given energies for an isotope.
 
-    Returns a dict with keys 'total', 'elastic', 'capture', 'fission'.
+    Returns a dict with keys 'total', 'elastic', 'capture', 'fission' and
+    'reaction' (particle reactions other than elastic scattering, capture and
+    fission, such as inelastic scattering).
 
     Note: MLBW (Multi-Level Breit-Wigner) ranges use SLBW approximation
     (resonance-resonance interference is ignored).

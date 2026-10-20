@@ -47,8 +47,8 @@ struct PyResonanceData {
 impl PyResonanceData {
     /// String representation.
     fn __repr__(&self) -> String {
-        // Discrete-resonance count over evaluable LRF=1/2/3 ranges; skipped
-        // LRF=7 / LRU=2 placeholder ranges contribute 0.
+        // Discrete-resonance count over LRF=1/2/3 and LRF=7 ranges; LRU=2
+        // placeholder ranges contribute 0.
         let n_res: usize = self.inner.total_resonance_count();
         format!(
             "ResonanceData(Z={}, A={}, AWR={:.3}, n_resonances={})",
@@ -80,9 +80,8 @@ impl PyResonanceData {
     /// Number of discrete resonances (across all evaluable ranges).
     ///
     /// Delegates to [`ResonanceData::total_resonance_count`], which counts the
-    /// L-grouped resonances of evaluable LRF=1/2/3 ranges. LRF=7 (and LRU=2)
-    /// ranges are parsed-and-skipped — NEREIDS does not evaluate them — so they
-    /// contribute 0.
+    /// resonances of LRF=1/2/3 and LRF=7 ranges. LRU=2 ranges are not
+    /// evaluated and contribute 0.
     #[getter]
     fn n_resonances(&self) -> usize {
         self.inner.total_resonance_count()
@@ -91,8 +90,8 @@ impl PyResonanceData {
     /// Total resonance count across all ranges.
     ///
     /// Explicit alias for [`Self::n_resonances`]; both delegate to the Rust
-    /// `ResonanceData::total_resonance_count()`, which counts LRF=1/2/3
-    /// L-group resonances only (skipped LRF=7 / LRU=2 ranges contribute 0).
+    /// `ResonanceData::total_resonance_count()`, which counts LRF=1/2/3 and
+    /// LRF=7 resonances (skipped LRU=2 ranges contribute 0).
     #[getter]
     fn total_resonance_count(&self) -> usize {
         self.inner.total_resonance_count()
@@ -100,8 +99,8 @@ impl PyResonanceData {
 
     /// Whether the evaluation carries parsed-but-not-evaluated ranges.
     ///
-    /// `True` when any range is a parse-and-skip placeholder (LRF=7
-    /// R-Matrix Limited, LRU=2 URR, or LRU=0 scattering-radius-only). Those
+    /// `True` when any range is a parse-and-skip placeholder (LRU=2 URR or
+    /// LRU=0 scattering-radius-only). Those
     /// spans contribute zero
     /// cross-section — a `UserWarning` listing them is emitted at load time
     /// by `load_endf` / `load_endf_file`. Files with NO evaluable range at
@@ -113,8 +112,8 @@ impl PyResonanceData {
 
     /// One-line descriptions of the parse-and-skip placeholder ranges.
     ///
-    /// One string per non-evaluable range (LRF=7 R-Matrix Limited, LRU=2 URR,
-    /// or LRU=0 scattering-radius-only), formatted by the shared Rust
+    /// One string per non-evaluable range (LRU=2 URR or LRU=0
+    /// scattering-radius-only), formatted by the shared Rust
     /// `ResonanceRange::skip_description` — the same text used in the load-time
     /// `UserWarning` and the parser's rejection message. Empty when
     /// [`Self::has_unevaluated_ranges`] is `False`.
@@ -129,7 +128,7 @@ impl PyResonanceData {
 
     /// Target spin (I) of the first evaluable resonance range.
     ///
-    /// Parse-and-skip placeholders (LRU=0 / LRF=7 / URR) may precede the
+    /// Parse-and-skip placeholders (LRU=0 / URR) may precede the
     /// evaluable ranges on mixed tapes; their SPI describes a span the
     /// cross-section code never evaluates, so the getter skips them (falling
     /// back to the first range only if nothing is evaluable).
@@ -149,7 +148,8 @@ impl PyResonanceData {
     /// Returns the global AP from the first evaluable range (skipping
     /// parse-and-skip placeholders, as for `target_spin`). If AP=0 (common in
     /// ENDF Reich-Moore data that uses energy-dependent radii), falls back
-    /// to the first L-group's channel radius APL.
+    /// to the first L-group's channel radius APL, or for LRF=7 to the phase
+    /// radius APE of the first neutron channel.
     #[getter]
     fn scattering_radius(&self) -> f64 {
         self.inner
@@ -160,23 +160,37 @@ impl PyResonanceData {
             .map(|r| {
                 if r.scattering_radius != 0.0 {
                     r.scattering_radius
+                } else if let Some(rml) = &r.r_matrix_limited {
+                    rml.spin_groups
+                        .iter()
+                        .flat_map(|g| &g.channels)
+                        .find(|c| c.pair == rml.incident_pair)
+                        .map_or(0.0, |c| c.radius_phase)
                 } else {
-                    // Fall back to first L-group's channel radius
                     r.l_groups.first().map(|lg| lg.apl).unwrap_or(0.0)
                 }
             })
             .unwrap_or(0.0)
     }
 
-    /// Orbital angular momentum values (L) present in the data.
+    /// Orbital angular momentum values (L) present in the data; for LRF=7,
+    /// those of the neutron channels.
     #[getter]
     fn l_values(&self) -> Vec<u32> {
         let mut ls: Vec<u32> = self
             .inner
             .ranges
             .iter()
-            .flat_map(|r| &r.l_groups)
-            .map(|lg| lg.l)
+            .flat_map(|r| {
+                let rml_ls = r.r_matrix_limited.iter().flat_map(|rml| {
+                    rml.spin_groups
+                        .iter()
+                        .flat_map(|g| &g.channels)
+                        .filter(|c| c.pair == rml.incident_pair)
+                        .map(|c| c.l)
+                });
+                r.l_groups.iter().map(|lg| lg.l).chain(rml_ls)
+            })
             .collect();
         ls.sort();
         ls.dedup();
@@ -237,8 +251,8 @@ fn load_and_parse_endf(
 }
 
 /// Emit a Python ``UserWarning`` when parsed ENDF data contains
-/// parse-and-skip placeholder ranges (LRF=7 R-Matrix Limited, LRU=2 URR, or
-/// LRU=0 scattering-radius-only).
+/// parse-and-skip placeholder ranges (LRU=2 URR or LRU=0
+/// scattering-radius-only).
 ///
 /// Those spans' resonances contribute no cross section, so any physics
 /// computed over them reflects only the evaluation's other ranges and its
@@ -763,7 +777,9 @@ impl PyIkedaCarpenter {
 ///     data: ResonanceData for the isotope.
 ///
 /// Returns:
-///     Dictionary with 'total', 'elastic', 'capture', 'fission' arrays.
+///     Dictionary with 'total', 'elastic', 'capture', 'fission' and
+///     'reaction' arrays; 'reaction' holds particle reactions other than
+///     elastic scattering, capture and fission, such as inelastic scattering.
 ///
 /// Raises:
 ///     ValueError: If the grid contains NaN/∞, non-positive entries, or
@@ -788,19 +804,21 @@ fn cross_sections<'py>(
     // Release the GIL for the cross-section computation.
     // Use cross_sections_on_grid() which precomputes J-group data once,
     // rather than recomputing per energy point via cross_sections_at_energy().
-    let (total, elastic, capture, fission) = py.detach(move || {
+    let (total, elastic, capture, fission, reaction) = py.detach(move || {
         let results = nereids_physics::reich_moore::cross_sections_on_grid(&res_data, &e_owned);
         let mut total = Vec::with_capacity(results.len());
         let mut elastic = Vec::with_capacity(results.len());
         let mut capture = Vec::with_capacity(results.len());
         let mut fission = Vec::with_capacity(results.len());
+        let mut reaction = Vec::with_capacity(results.len());
         for xs in results {
             total.push(xs.total);
             elastic.push(xs.elastic);
             capture.push(xs.capture);
             fission.push(xs.fission);
+            reaction.push(xs.reaction);
         }
-        (total, elastic, capture, fission)
+        (total, elastic, capture, fission, reaction)
     });
 
     let dict = pyo3::types::PyDict::new(py);
@@ -808,6 +826,7 @@ fn cross_sections<'py>(
     dict.set_item("elastic", PyArray1::from_vec(py, elastic))?;
     dict.set_item("capture", PyArray1::from_vec(py, capture))?;
     dict.set_item("fission", PyArray1::from_vec(py, fission))?;
+    dict.set_item("reaction", PyArray1::from_vec(py, reaction))?;
     Ok(dict)
 }
 

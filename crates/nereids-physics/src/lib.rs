@@ -12,7 +12,7 @@
 //! - [`forward_scatter`] - neutrons scattered once in a slab that leave through its back face
 //! - [`lattice_doppler`] - Doppler broadening by nuclei bound in a harmonic crystal
 //! - [`penetrability`] - hard-sphere penetrability, shift and phase shift
-//! - [`reich_moore`] - Reich-Moore R-matrix cross-section formalism
+//! - [`reich_moore`] - resolved cross sections: Reich-Moore (LRF=3) and R-Matrix Limited (LRF=7)
 //! - [`resolution`] - instrument resolution broadening
 //! - [`slbw`] - single- and multi-level Breit-Wigner (LRF=1/2)
 //! - [`thickness`] - transmission of a sample whose areal density varies
@@ -37,6 +37,7 @@ pub mod lattice_doppler;
 pub mod penetrability;
 pub mod reich_moore;
 pub mod resolution;
+mod rmatrix_limited;
 pub mod slbw;
 pub mod thickness;
 pub mod transmission;

@@ -168,8 +168,8 @@ pub enum ResonanceFormalism {
     /// Reich-Moore (LRF=3). Primary formalism for light and actinide isotopes.
     ReichMoore,
     /// R-Matrix Limited (LRF=7), Reich-Moore form (KRM=3). The parameters are
-    /// in [`ResonanceRange::r_matrix_limited`]. The range is not evaluated and
-    /// resolves to Skip.
+    /// in [`ResonanceRange::r_matrix_limited`]; a range without them is not
+    /// evaluated.
     RMatrixLimited,
     /// Unresolved Resonance Region (LRU=2). Parsed for cursor alignment but not
     /// evaluated: NEREIDS does not compute URR average cross sections. The
@@ -560,8 +560,8 @@ impl RmlBackground {
 impl ResonanceData {
     /// Total number of resonances across all ranges and groups.
     ///
-    /// Counts the L-grouped resonances of evaluable LRF=1/2/3 ranges. LRF=7
-    /// and LRU=2 ranges have empty `l_groups` and contribute 0.
+    /// Counts the resonances of LRF=1/2/3 and LRF=7 ranges. LRU=2 ranges
+    /// contribute 0.
     ///
     /// A low count for a given evaluation reflects that evaluation's
     /// resolved-resonance-region (RRR) extent, **not** a dropped energy range.
@@ -577,9 +577,9 @@ impl ResonanceData {
 
     /// Ranges that are parsed but NOT evaluated (non-evaluable placeholders).
     ///
-    /// These are the LRF=7 (R-Matrix Limited), LRU=2 (unresolved), and LRU=0
-    /// (scattering-radius-only) ranges. They contribute exactly zero to every
-    /// cross-section. Any physics computed over their energy span reflects
+    /// These are the LRU=2 (unresolved) and LRU=0 (scattering-radius-only)
+    /// ranges, and resolved ranges without evaluable parameters. They
+    /// contribute exactly zero to every cross-section. Any physics computed over their energy span reflects
     /// only the *other* ranges of the evaluation. Callers that surface data
     /// to users should warn when this list is non-empty.
     pub fn unevaluated_ranges(&self) -> Vec<&ResonanceRange> {
@@ -627,24 +627,37 @@ impl ResonanceRange {
 
     /// Total discrete-resonance count for this range.
     ///
-    /// Counts the L-grouped resonances of an evaluable LRF=1/2/3 range. LRF=7
-    /// and LRU=2 ranges have empty `l_groups` and contribute 0.
+    /// Counts the L-grouped resonances of an LRF=1/2/3 range and the
+    /// spin-group resonances of an LRF=7 range. LRU=2 ranges contribute 0.
     pub fn resonance_count(&self) -> usize {
-        self.l_groups.iter().map(|lg| lg.resonances.len()).sum()
+        self.l_groups
+            .iter()
+            .map(|lg| lg.resonances.len())
+            .sum::<usize>()
+            + self
+                .r_matrix_limited
+                .as_ref()
+                .map_or(0, RmlRange::resonance_count)
     }
 
     /// Can this range actually produce non-zero cross-sections?
     ///
-    /// Evaluable means a resolved (LRU=1) range using one of the implemented
-    /// formalisms — SLBW (LRF=1), MLBW (LRF=2), or Reich-Moore (LRF=3) — with
-    /// at least one resonance-bearing L-group and no competitive width
-    /// (LRX = 0 in every L-group). A resolved range whose L-groups are all
-    /// empty is a placeholder: it is not evaluated and contributes zero
-    /// cross-section, although SAMMY gives its channels hard-sphere
-    /// scattering. LRF=7 (R-Matrix Limited), LRU=2 (unresolved), and LRU=0
-    /// (scattering-radius-only) ranges are not evaluated, so they return
-    /// `false` and contribute zero cross-section over their energy span.
+    /// Evaluable means a resolved (LRU=1) range with either R-Matrix Limited
+    /// (LRF=7) parameters in at least one spin group, or an SLBW (LRF=1),
+    /// MLBW (LRF=2) or Reich-Moore (LRF=3) formalism with at least one
+    /// resonance-bearing L-group and no competitive width (LRX = 0 in every
+    /// L-group). A resolved LRF=1/2/3 range whose L-groups are all empty is a
+    /// placeholder: it is not evaluated and contributes zero cross-section,
+    /// although SAMMY gives its channels hard-sphere scattering. LRU=2
+    /// (unresolved) and LRU=0 (scattering-radius-only) ranges are not
+    /// evaluated, so they return `false` and contribute zero cross-section
+    /// over their energy span.
     pub fn is_evaluable(&self) -> bool {
+        if let Some(rml) = &self.r_matrix_limited {
+            return self.resolved
+                && self.formalism == ResonanceFormalism::RMatrixLimited
+                && !rml.spin_groups.is_empty();
+        }
         self.resolved
             && matches!(
                 self.formalism,
