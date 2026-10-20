@@ -250,7 +250,7 @@ download data.
 
 Both loaders evaluate resolved LRF=1/2/3 ranges, LRF=1/2 ranges only without
 a competitive width (LRX=0), and LRF=7 ranges in the Reich-Moore form (KRM=3)
-without charged-particle or fission pairs. A file with **no** evaluable range
+without fission pairs. A file with **no** evaluable range
 (for example one whose only range is unresolved) raises
 `ValueError` — loading it would yield zero cross-section everywhere. A mixed
 evaluation loads, emits a `UserWarning` naming the skipped spans, and flags

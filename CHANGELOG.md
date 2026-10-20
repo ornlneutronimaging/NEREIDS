@@ -10,12 +10,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
 ### Added
 
 - R-Matrix Limited (LRF=7) ranges in the Reich-Moore form (KRM=3) are
-  evaluated: neutron, eliminated-capture and neutral exit channels (such as
-  inelastic), shift factors on open channels, and logarithmic background
-  R-functions (LBK=2). W-182/183/184/186, Fe-54, Fe-57, Si-28/29/30, Rh-103,
-  Cu-63, Cu-65, V-51 and Sr-88 of ENDF/B-VIII.1 load and match SAMRML and
-  SAMMY within 1e-6 of the total. Charged-particle channels (Cl-35, Ca-40)
-  and fission channels are still refused, by name.
+  evaluated: neutron, eliminated-capture, neutral exit (such as inelastic)
+  and charged-particle exit channels, the last with Coulomb penetrabilities
+  and shift factors; shift factors on open channels; and logarithmic
+  background R-functions (LBK=2). All 16 LRF=7 evaluations of ENDF/B-VIII.1
+  (W-182/183/184/186, Fe-54, Fe-57, Si-28/29/30, Rh-103, Cu-63, Cu-65, V-51,
+  Sr-88, Cl-35, Ca-40) load and match SAMRML and SAMMY within 1e-6 of the
+  total. Fission channels in LRF=7 are still refused, by name.
 - Cross sections gain `reaction`, particle reactions other than elastic
   scattering, capture and fission; Python's `cross_sections` dict has the key.
 

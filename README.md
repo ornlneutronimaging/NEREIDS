@@ -20,8 +20,9 @@ output spatially resolved isotopic composition maps.
 
 - **R-matrix cross-sections** -- resolved Breit-Wigner (single- and
   multi-level, LRF=1/2), Reich-Moore (LRF=3), and R-Matrix Limited (LRF=7)
-  in its Reich-Moore form (KRM=3) without charged-particle or fission
-  channels; unresolved (LRU=2) ranges are parsed-and-skipped, not evaluated
+  in its Reich-Moore form (KRM=3), with Coulomb penetrabilities for
+  charged-particle channels and without fission channels; unresolved (LRU=2)
+  ranges are parsed-and-skipped, not evaluated
 - **Doppler broadening** -- Free Gas Model (crystal-lattice model planned, not yet implemented)
 - **Resolution broadening** -- Gaussian (channel width + flight path) and
   tabulated instrument functions
