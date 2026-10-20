@@ -1513,9 +1513,14 @@ fn parse_tab1(lines: &[&str], pos: &mut usize) -> Result<Tab1, EndfParseError> {
     parse_tab1_with(lines, pos, false)
 }
 
-/// A TAB1 record; with `jumps`, an x may appear twice in a row, the second
-/// value holding from it on, and a point repeated exactly is read once, with
-/// an interpolation region it leaves empty dropped.
+/// A TAB1 record, with `jumps` read as File 3 is.
+///
+/// With `jumps`, points at one x are a jump from the first value to the last,
+/// which holds from x on, and a point repeated exactly is read once. A region
+/// left with no interval is dropped.
+///
+/// # References
+/// ENDF-6 Formats Manual (ENDF-102, 2023), §0.5.2.1 and §3.3.1.
 fn parse_tab1_with(lines: &[&str], pos: &mut usize, jumps: bool) -> Result<Tab1, EndfParseError> {
     let cont = parse_cont(lines, pos)?;
     let nr = checked_count(cont.n1, "NR")?; // number of interpolation regions
@@ -1606,27 +1611,23 @@ fn parse_tab1_with(lines: &[&str], pos: &mut usize, jumps: bool) -> Result<Tab1,
                 "TAB1 point {i} ({x}, {y}) is not finite"
             )));
         }
+        // A jump has two values; one between them holds over no interval.
+        if jumps
+            && let &[.., (x_first, _), (x_last, y_last)] = points.as_slice()
+            && x_first == x
+            && x_last == x
+            && y_last != y
+        {
+            points.pop();
+            drop_point(&mut boundaries, &mut interp_codes, points.len());
+        }
         if jumps && points.last() == Some(&(x, y)) {
-            for nbt in boundaries.iter_mut().filter(|nbt| **nbt > points.len()) {
-                *nbt -= 1;
-            }
-            // A region left with no interval: NBT = 1 or NBT equal to the one before.
-            let empty = if boundaries.first() == Some(&1) {
-                Some(0)
-            } else {
-                (1..boundaries.len()).find(|&r| boundaries[r] == boundaries[r - 1])
-            };
-            if let Some(empty) = empty {
-                boundaries.remove(empty);
-                interp_codes.remove(empty);
-            }
+            drop_point(&mut boundaries, &mut interp_codes, points.len());
             continue;
         }
         // x-values must be strictly increasing, or repeat once at a jump;
         // Tab1::evaluate() relies on this.
-        let jump = jumps
-            && points.last().is_some_and(|&(x_prev, _)| x == x_prev)
-            && points.len().checked_sub(2).is_none_or(|k| points[k].0 < x);
+        let jump = jumps && points.last().is_some_and(|&(x_prev, _)| x == x_prev);
         if let Some(&(x_prev, _)) = points.last()
             && x <= x_prev
             && !jump
@@ -1647,6 +1648,24 @@ fn parse_tab1_with(lines: &[&str], pos: &mut usize, jumps: bool) -> Result<Tab1,
         interp_codes,
         points,
     })
+}
+
+/// Remove the 0-based point `index` from a TAB1's interpolation regions, and
+/// drop a region it leaves with no interval.
+fn drop_point(boundaries: &mut Vec<usize>, interp_codes: &mut Vec<u32>, index: usize) {
+    for nbt in boundaries.iter_mut().filter(|nbt| **nbt > index) {
+        *nbt -= 1;
+    }
+    // A region left with no interval: NBT = 1 or NBT equal to the one before.
+    let empty = if boundaries.first() == Some(&1) {
+        Some(0)
+    } else {
+        (1..boundaries.len()).find(|&r| boundaries[r] == boundaries[r - 1])
+    };
+    if let Some(empty) = empty {
+        boundaries.remove(empty);
+        interp_codes.remove(empty);
+    }
 }
 
 /// Errors from ENDF parsing.
