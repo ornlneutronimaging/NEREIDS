@@ -1497,6 +1497,7 @@ mod tests {
                 }],
                 ap_table: None,
                 r_external: vec![],
+                r_matrix_limited: None,
             }],
         };
 

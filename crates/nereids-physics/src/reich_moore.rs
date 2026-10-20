@@ -1971,6 +1971,7 @@ mod tests {
                 }],
                 ap_table: None,
                 r_external: vec![],
+                r_matrix_limited: None,
             }],
         };
 
@@ -2021,6 +2022,7 @@ mod tests {
             ap_table: None,
             l_groups: vec![],
             r_external: vec![],
+            r_matrix_limited: None,
         });
 
         assert!(data.has_unevaluated_ranges());
@@ -2261,6 +2263,7 @@ mod tests {
                 }],
                 ap_table: None,
                 r_external: vec![],
+                r_matrix_limited: None,
             }],
         };
 
@@ -2295,6 +2298,7 @@ mod tests {
                 }],
                 ap_table: None,
                 r_external: vec![],
+                r_matrix_limited: None,
             }],
         };
 

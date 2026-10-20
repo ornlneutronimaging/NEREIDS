@@ -1184,6 +1184,7 @@ fn create_resonance_data(
                 l_groups: groups,
                 ap_table: None,
                 r_external: vec![],
+                r_matrix_limited: None,
             }],
         }),
     })

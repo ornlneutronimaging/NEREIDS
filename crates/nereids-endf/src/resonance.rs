@@ -167,11 +167,9 @@ pub enum ResonanceFormalism {
     MLBW,
     /// Reich-Moore (LRF=3). Primary formalism for light and actinide isotopes.
     ReichMoore,
-    /// R-Matrix Limited (LRF=7). General multi-channel formalism (W, Ta, Zr,
-    /// etc. in ENDF/B-VIII.0). Parsed for cursor alignment but not evaluated:
-    /// incomplete (the Coulomb/SHF=1 closed-channel shift was unimplemented)
-    /// and the evaluator was never validated against SAMMY. Ranges tagged
-    /// `RMatrixLimited` are non-evaluable and resolve to Skip.
+    /// R-Matrix Limited (LRF=7), Reich-Moore form (KRM=3). The parameters are
+    /// in [`ResonanceRange::r_matrix_limited`]. The range is not evaluated and
+    /// resolves to Skip.
     RMatrixLimited,
     /// Unresolved Resonance Region (LRU=2). Parsed for cursor alignment but not
     /// evaluated: NEREIDS does not compute URR average cross sections. The
@@ -267,8 +265,7 @@ pub struct ResonanceRange {
     /// Reference: ENDF-6 Formats Manual §2.2.1; SAMMY `mlb/mmlb1.f90`
     #[serde(default)]
     pub ap_table: Option<Tab1>,
-    /// Spin groups for LRF=1/2/3 (L-grouped). Empty for LRF=7 and LRU=2 (both
-    /// parsed-and-skipped, non-evaluable).
+    /// Spin groups for LRF=1/2/3 (L-grouped). Empty for LRF=7 and LRU=2.
     pub l_groups: Vec<LGroup>,
     /// R-external (background R-matrix) entries per spin group.
     ///
@@ -281,6 +278,9 @@ pub struct ResonanceRange {
     /// SAMMY Ref: Manual Section II.B.1.d, mpar03.f90 Readrx
     #[serde(default)]
     pub r_external: Vec<RExternalEntry>,
+    /// R-Matrix Limited parameters; `Some` only for a parsed LRF=7 range.
+    #[serde(default)]
+    pub r_matrix_limited: Option<RmlRange>,
 }
 
 /// Parameters grouped by orbital angular momentum L.
@@ -424,12 +424,144 @@ impl RExternalEntry {
     }
 }
 
+// ─── R-Matrix Limited (LRF=7) ─────────────────────────────────────────────────
+
+/// Parameters of one R-Matrix Limited (LRF=7) range in the Reich-Moore form (KRM=3).
+///
+/// Widths are channel widths in eV (IFG=0). The photon pair's channel is the
+/// eliminated capture channel; the incident pair is the neutron plus target.
+///
+/// # References
+/// ENDF-6 Formats Manual, ENDF-102 (2023), §2.2.1.6 and Appendix D.1.7.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct RmlRange {
+    /// Particle pairs, in file order.
+    pub pairs: Vec<ParticlePair>,
+    /// Index in `pairs` of the incident neutron pair.
+    pub incident_pair: usize,
+    /// Index in `pairs` of the photon pair, whose channel is eliminated.
+    pub photon_pair: usize,
+    /// Spin groups, in file order.
+    pub spin_groups: Vec<RmlSpinGroup>,
+}
+
+impl RmlRange {
+    /// Number of resonances over all spin groups.
+    pub fn resonance_count(&self) -> usize {
+        self.spin_groups.iter().map(|g| g.resonances.len()).sum()
+    }
+}
+
+/// One particle pair of an LRF=7 range.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct ParticlePair {
+    /// Mass of the first particle in neutron masses (MA).
+    pub mass_a: f64,
+    /// Mass of the second particle in neutron masses (MB).
+    pub mass_b: f64,
+    /// Charge number of the first particle (ZA).
+    pub charge_a: f64,
+    /// Charge number of the second particle (ZB).
+    pub charge_b: f64,
+    /// Spin of the first particle; a negative sign gives negative parity (IA).
+    pub spin_a: f64,
+    /// Spin of the second particle; a negative sign gives negative parity (IB).
+    pub spin_b: f64,
+    /// Q-value of the pair in eV.
+    pub q_value: f64,
+    /// ENDF reaction type of the pair (MT).
+    pub mt: u32,
+    /// Whether the penetrability is calculated (PNT, with PNT=0 resolved by MT).
+    pub penetrability: bool,
+    /// Whether the shift factor is calculated (SHF=1).
+    pub shift: bool,
+}
+
+/// One channel of an LRF=7 spin group.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct RmlChannel {
+    /// Index in [`RmlRange::pairs`] (PPI − 1).
+    pub pair: usize,
+    /// Orbital angular momentum.
+    pub l: u32,
+    /// Channel spin (SCH).
+    pub channel_spin: f64,
+    /// Boundary condition B (BND); used only when the pair calculates the shift factor.
+    pub boundary: f64,
+    /// Effective radius for the phase shift in fm (APE).
+    pub radius_phase: f64,
+    /// True radius for the penetrability and shift factor in fm (APT).
+    pub radius_true: f64,
+}
+
+/// One spin group (J, π) of an LRF=7 range.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct RmlSpinGroup {
+    /// Total angular momentum J (non-negative).
+    pub j: f64,
+    /// Parity, +1 or −1.
+    pub parity: i32,
+    /// Channels, in the order of the resonance widths.
+    pub channels: Vec<RmlChannel>,
+    /// Resonances of the group.
+    pub resonances: Vec<RmlResonance>,
+    /// Background R-function terms (KBK records with LBK=2).
+    pub background: Vec<RmlBackground>,
+}
+
+/// One resonance of an LRF=7 spin group.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct RmlResonance {
+    /// Resonance energy in eV.
+    pub energy: f64,
+    /// Width per channel in channel order, in eV; a negative width gives the
+    /// sign of the reduced-width amplitude.
+    pub widths: Vec<f64>,
+}
+
+/// Logarithmic background R-function of one channel (LBK=2).
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct RmlBackground {
+    /// Index of the channel in [`RmlSpinGroup::channels`].
+    pub channel: usize,
+    /// Lower singularity energy in eV (ED).
+    pub e_down: f64,
+    /// Upper singularity energy in eV (EU).
+    pub e_up: f64,
+    /// Constant term (R0).
+    pub r_con: f64,
+    /// Linear term in eV⁻¹ (R1).
+    pub r_lin: f64,
+    /// Quadratic term in eV⁻² (R2).
+    pub r_quad: f64,
+    /// Constant coefficient of the logarithm (S0).
+    pub s_con: f64,
+    /// Linear coefficient of the logarithm in eV⁻¹ (S1).
+    pub s_lin: f64,
+}
+
+impl RmlBackground {
+    /// Background R-function at the lab energy `energy_ev` in eV.
+    ///
+    /// Defined for `e_down < energy_ev < e_up`; the parser requires the range
+    /// to lie inside that interval.
+    ///
+    /// # References
+    /// ENDF-102 (2023) Eq. (D.77); SAMMY manual ORNL/TM-9179/R8 Eq. (II B1 d.1).
+    pub fn evaluate(&self, energy_ev: f64) -> f64 {
+        let e = energy_ev;
+        let log = ((self.e_up - e) / (e - self.e_down)).ln();
+        self.r_con + self.r_lin * e + self.r_quad * e * e
+            - self.s_lin * (self.e_up - self.e_down)
+            - (self.s_con + self.s_lin * e) * log
+    }
+}
+
 impl ResonanceData {
     /// Total number of resonances across all ranges and groups.
     ///
     /// Counts the L-grouped resonances of evaluable LRF=1/2/3 ranges. LRF=7
-    /// (and LRU=2) ranges are parsed-and-skipped with empty `l_groups`, so
-    /// they contribute 0 — NEREIDS does not evaluate them.
+    /// and LRU=2 ranges have empty `l_groups` and contribute 0.
     ///
     /// A low count for a given evaluation reflects that evaluation's
     /// resolved-resonance-region (RRR) extent, **not** a dropped energy range.
@@ -446,10 +578,7 @@ impl ResonanceData {
     /// Ranges that are parsed but NOT evaluated (non-evaluable placeholders).
     ///
     /// These are the LRF=7 (R-Matrix Limited), LRU=2 (unresolved), and LRU=0
-    /// (scattering-radius-only) ranges: the parser consumes their records for
-    /// cursor alignment and discards any resonance parameters they carry in
-    /// the file (LRF=7 and LRU=2 tapes do carry them; LRU=0 has none), so the
-    /// stored placeholder holds none and contributes exactly zero to every
+    /// (scattering-radius-only) ranges. They contribute exactly zero to every
     /// cross-section. Any physics computed over their energy span reflects
     /// only the *other* ranges of the evaluation. Callers that surface data
     /// to users should warn when this list is non-empty.
@@ -499,8 +628,7 @@ impl ResonanceRange {
     /// Total discrete-resonance count for this range.
     ///
     /// Counts the L-grouped resonances of an evaluable LRF=1/2/3 range. LRF=7
-    /// (and LRU=2) ranges are parsed-and-skipped with empty `l_groups`, so they
-    /// contribute 0 — NEREIDS does not evaluate them.
+    /// and LRU=2 ranges have empty `l_groups` and contribute 0.
     pub fn resonance_count(&self) -> usize {
         self.l_groups.iter().map(|lg| lg.resonances.len()).sum()
     }
@@ -513,11 +641,9 @@ impl ResonanceRange {
     /// (LRX = 0 in every L-group). A resolved range whose L-groups are all
     /// empty is a placeholder: it is not evaluated and contributes zero
     /// cross-section, although SAMMY gives its channels hard-sphere
-    /// scattering. LRF=7 (R-Matrix Limited), LRU=2
-    /// (unresolved), and LRU=0 (scattering-radius-only) ranges are
-    /// parse-and-skip placeholders — consumed for cursor alignment, never
-    /// evaluated — so they return `false` and contribute zero cross-section
-    /// over their energy span.
+    /// scattering. LRF=7 (R-Matrix Limited), LRU=2 (unresolved), and LRU=0
+    /// (scattering-radius-only) ranges are not evaluated, so they return
+    /// `false` and contribute zero cross-section over their energy span.
     pub fn is_evaluable(&self) -> bool {
         self.resolved
             && matches!(
@@ -722,6 +848,7 @@ mod tests {
             ap_table: None,
             l_groups: vec![],
             r_external: vec![],
+            r_matrix_limited: None,
         };
         assert_eq!(range.scattering_radius_at(1.0), 9.4285);
         assert_eq!(range.scattering_radius_at(1000.0), 9.4285);
@@ -751,6 +878,7 @@ mod tests {
                 resonances: vec![],
             }],
             r_external: vec![],
+            r_matrix_limited: None,
         };
         assert!(!range.is_evaluable(), "all-empty L-groups must be inert");
         range.l_groups[0].resonances.push(Resonance {
@@ -788,6 +916,7 @@ mod tests {
             ap_table: Some(table),
             l_groups: vec![],
             r_external: vec![],
+            r_matrix_limited: None,
         };
         // At 1 eV: 8.0 fm
         assert!((range.scattering_radius_at(1.0) - 8.0).abs() < 1e-10);
@@ -979,6 +1108,7 @@ pub mod test_support {
             }],
             ap_table: None,
             r_external: vec![],
+            r_matrix_limited: None,
         }
     }
 

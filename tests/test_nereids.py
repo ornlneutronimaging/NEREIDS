@@ -295,20 +295,14 @@ class TestResonanceData:
             )
 
     def test_pure_lrf7_file_rejected_no_evaluable_ranges(self):
-        """A pure-LRF=7 evaluation is rejected at load, not silently zeroed.
+        """A file with no evaluated range is rejected at load, not silently zeroed.
 
-        NEREIDS removed the LRF=7 cross-section physics (its closed-channel
-        treatment was incomplete — the Coulomb/SHF=1 closed-channel shift was
-        unimplemented — and it was never validated against SAMMY), so LRF=7
-        ranges are parse-and-skip placeholders. A
-        file whose ONLY range is LRF=7 would produce zero cross-sections
-        everywhere (transmission = 1) — the parser now rejects it loudly
-        instead of loading it with ``n_resonances == 0``.
+        W-182 (ENDF/B-VIII.1) holds an LRF=7 range and a URR range. Neither is
+        evaluated, so the file would give zero cross-sections everywhere
+        (transmission = 1); the parser rejects it instead.
         """
         root = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
-        fixture = os.path.join(
-            root, "tests/data/synthetic/lrf7_krm3_resonance_column_order.endf"
-        )
+        fixture = os.path.join(root, "tests/data/endf/mf2/W-182.endf")
         # The fixture is committed to the repo, so a missing file is a
         # packaging/path regression that MUST fail — not a skip that would
         # silently disable this no-evaluable-content guard.

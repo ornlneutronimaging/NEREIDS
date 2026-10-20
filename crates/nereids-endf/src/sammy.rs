@@ -1402,6 +1402,7 @@ pub fn sammy_to_resonance_data(
         ap_table: None,
         l_groups,
         r_external: vec![],
+        r_matrix_limited: None,
     };
 
     Ok(ResonanceData {
@@ -1661,6 +1662,7 @@ pub fn sammy_to_resonance_data_multi(
             ap_table: None,
             l_groups,
             r_external: r_external_entries,
+            r_matrix_limited: None,
         };
 
         let resonance_data = ResonanceData {
