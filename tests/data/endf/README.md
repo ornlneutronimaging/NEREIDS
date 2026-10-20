@@ -35,8 +35,9 @@ File 3 is absent, so these files give File 2 cross sections only.
 
 | Files | Formalism | Used by |
 |---|---|---|
-| `W-182`, `W-183`, `W-184`, `W-186`, `Fe-54`, `Fe-57`, `Si-28`, `Si-29`, `Si-30`, `Rh-103`, `Cu-63`, `Cu-65`, `V-51`, `Sr-88` | R-Matrix Limited (LRF=7, KRM=3) | LRF=7 parser tests in `nereids-endf/src/parser.rs`; LRF=7 cross-section tests |
+| `W-182`, `W-183`, `W-184`, `W-186`, `Fe-54`, `Fe-57`, `Si-28`, `Si-29`, `Si-30`, `Rh-103`, `Cu-63`, `Cu-65`, `V-51`, `Sr-88`, `Cl-35`, `Ca-40` | R-Matrix Limited (LRF=7, KRM=3) | LRF=7 parser tests in `nereids-endf/src/parser.rs`; LRF=7 cross-section tests |
 | `Fe-56` | Reich-Moore (LRF=3) | LRF=3 against LRF=7 consistency test |
 
 Source MD5 sums of the full files: W-182 `f2e0f35558086efbfa607938f8887ddd`,
-Sr-88 `d770aaf49c6e9856c9d0539dc4da966c`.
+Sr-88 `d770aaf49c6e9856c9d0539dc4da966c`, Cl-35 `e8348054180f45b26cc0a9ed558a9108`,
+Ca-40 `9d92ca32027e9fd1a85d68b7778b499f`.

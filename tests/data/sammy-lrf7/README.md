@@ -18,7 +18,8 @@ SAMRML, the LRF=7 point cross-section program, and the SAMMY main program with
 ## Columns
 
 Energy in eV; SAMRML elastic and nonelastic, then one reaction column per
-particle pair beyond the second (Fe-57: inelastic, MT=51); SAMMY main total,
+particle pair beyond the second (Fe-57: inelastic, MT=51; Cl-35: (n,p);
+Ca-40: (n,α), then (n,p)); SAMMY main total,
 elastic and capture. Cross sections are in barn. SAMRML prints 13 significant
 digits; SAMMY main prints 10 decimals.
 

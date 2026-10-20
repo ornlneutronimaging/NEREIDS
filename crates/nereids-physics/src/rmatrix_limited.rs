@@ -1,7 +1,8 @@
 //! R-Matrix Limited (LRF=7) cross sections in the Reich-Moore form (KRM=3).
 //!
 //! Each spin group uses X = P^½ (I − R L)⁻¹ R P^½, which equals Eq. (D.47)
-//! without a division by P, over its open particle channels.
+//! without a division by P, over its open particle channels. Charged-particle
+//! channels take Coulomb penetrabilities and shift factors (Eq. D.84).
 //!
 //! # References
 //! - ENDF-6 Formats Manual, ENDF-102 (2023), Appendix D.1.7, Eqs. (D.37)–(D.54),
@@ -13,6 +14,7 @@ use num_complex::Complex64;
 use nereids_endf::resonance::{RmlBackground, RmlRange};
 
 use crate::channel;
+use crate::coulomb;
 use crate::penetrability;
 use crate::reich_moore::CrossSections;
 
@@ -43,6 +45,9 @@ struct ChannelPlan {
     threshold: f64,
     /// Reduced mass of the pair in neutron masses.
     reduced_mass: f64,
+    /// Sommerfeld parameter times the wave number, η·k, in fm⁻¹; 0 for a
+    /// neutral pair.
+    eta_k: f64,
     l: u32,
     penetrability: bool,
     /// Boundary condition B when the pair calculates the shift factor.
@@ -67,6 +72,19 @@ impl ChannelPlan {
             (energy_ev - self.threshold) * cm_fraction,
             self.reduced_mass,
         )
+    }
+
+    /// Penetrability and shift factor at wave number `k` (fm⁻¹), Table D.1 or Eq. (D.84).
+    fn penetrability_shift(&self, k: f64) -> (f64, f64) {
+        let rho = k * self.radius_true;
+        if self.eta_k > 0.0 {
+            coulomb::penetrability_shift(self.l, self.eta_k / k, rho)
+        } else {
+            (
+                penetrability::penetrability(self.l, rho),
+                penetrability::shift_factor(self.l, rho),
+            )
+        }
     }
 }
 
@@ -93,12 +111,19 @@ impl RmlPlan {
                         continue;
                     }
                     let pair = &rml.pairs[ch.pair];
+                    let reduced_mass = pair.mass_a * pair.mass_b / (pair.mass_a + pair.mass_b);
+                    let charges = pair.charge_a * pair.charge_b;
                     channels.push((
                         index,
                         ChannelPlan {
                             entrance: ch.pair == rml.incident_pair,
                             threshold: -pair.q_value / cm_fraction,
-                            reduced_mass: pair.mass_a * pair.mass_b / (pair.mass_a + pair.mass_b),
+                            reduced_mass,
+                            eta_k: if charges == 0.0 {
+                                0.0
+                            } else {
+                                coulomb::eta_times_k(charges, reduced_mass)
+                            },
                             l: ch.l,
                             penetrability: pair.penetrability,
                             boundary: pair.shift.then_some(ch.boundary),
@@ -173,14 +198,14 @@ impl RmlPlan {
                 let ch = &group.channels[c];
                 if ch.penetrability {
                     let k = ch.wave_number(energy_ev, cm_fraction);
-                    let rho = k * ch.radius_true;
-                    let p = penetrability::penetrability(ch.l, rho);
-                    let s_minus_b = ch
-                        .boundary
-                        .map_or(0.0, |b| penetrability::shift_factor(ch.l, rho) - b);
+                    let (p, s) = ch.penetrability_shift(k);
+                    let s_minus_b = ch.boundary.map_or(0.0, |b| s - b);
                     sqrt_p[i] = p.sqrt();
                     l_matrix[i] = Complex64::new(s_minus_b, p);
-                    phase[i] = penetrability::phase_shift(ch.l, k * ch.radius_phase);
+                    // Only entrance channels, which are neutral, use a phase (D.50, D.51).
+                    if ch.entrance {
+                        phase[i] = penetrability::phase_shift(ch.l, k * ch.radius_phase);
+                    }
                 } else {
                     sqrt_p[i] = 1.0;
                     l_matrix[i] = Complex64::new(0.0, 1.0);
@@ -272,7 +297,7 @@ fn amplitude(width: f64, energy: f64, ch: &ChannelPlan, cm_fraction: f64) -> f64
             (energy - ch.threshold).abs() * cm_fraction,
             ch.reduced_mass,
         );
-        penetrability::penetrability(ch.l, k * ch.radius_true)
+        ch.penetrability_shift(k).0
     } else {
         1.0
     };
@@ -608,6 +633,47 @@ mod tests {
             assert!((xs.total - parts).abs() <= 1e-12 * xs.total, "{e}: {xs:?}");
             assert!(xs.capture >= 0.0 && xs.elastic > 0.0, "{e}: {xs:?}");
         }
+    }
+
+    /// An open (n,p) channel takes the Coulomb penetrability: the parts sum to
+    /// the total and the proton channel carries flux.
+    #[test]
+    fn charged_exit_channel_conserves_flux() {
+        let proton = ParticlePair {
+            mass_a: 0.9986,
+            mass_b: A,
+            charge_a: 1.0,
+            charge_b: 73.0,
+            q_value: 6.0e5,
+            mt: 600,
+            ..neutron()
+        };
+        let rml = RmlRange {
+            pairs: vec![photon(), neutron(), proton],
+            incident_pair: 1,
+            photon_pair: 0,
+            spin_groups: vec![group(
+                0.5,
+                vec![channel(0, 0, 0.0), channel(1, 0, 7.0), channel(2, 0, 6.0)],
+                vec![RmlResonance {
+                    energy: 30.0,
+                    widths: vec![0.05, 0.01, 1e-4],
+                }],
+            )],
+        };
+        let plan = RmlPlan::new(&rml);
+        for e in [0.5, 29.9, 30.0, 30.1, 200.0] {
+            let xs = plan.evaluate(e);
+            assert!(xs.reaction > 0.0, "{e}: {xs:?}");
+            let parts = xs.elastic + xs.capture + xs.reaction;
+            assert!((xs.total - parts).abs() <= 1e-12 * xs.total, "{e}: {xs:?}");
+        }
+        // At the peak the (n,p) to capture ratio is Γ_p(E)/Γ_γ = 1e-4/0.05.
+        let peak = plan.evaluate(30.0);
+        assert!(
+            (peak.reaction / peak.capture / 2e-3 - 1.0).abs() < 1e-9,
+            "{peak:?}"
+        );
     }
 
     /// An l = 3 channel at 0.5 eV has P ≈ 1e-20; the result stays finite.

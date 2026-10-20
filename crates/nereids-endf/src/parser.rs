@@ -851,8 +851,8 @@ fn parse_reich_moore_range(
 ///
 /// # Errors
 /// Returns [`EndfParseError::UnsupportedFormat`] for a flag outside that set, a
-/// charged-particle or fission pair, a shift factor on a channel that closes
-/// inside the range, and any record whose counts or values are inconsistent.
+/// fission pair, a shift factor on a channel that closes inside the range, and
+/// any record whose counts or values are inconsistent.
 ///
 /// # References
 /// ENDF-6 Formats Manual, ENDF-102 (2023), §2.2.1.6 and Appendix D.1.7.
@@ -1061,12 +1061,6 @@ fn parse_particle_pair(number: usize, values: &[f64]) -> Result<ParticlePair, En
                 "{location}: a penetrating pair needs positive masses (MA={ma}, MB={mb})"
             )));
         }
-    }
-    if za != 0.0 && zb != 0.0 {
-        return Err(rml_error(format!(
-            "{location}: charged-particle pair (ZA={za}, ZB={zb}, MT={mt}) is not supported; \
-             Coulomb penetrabilities are not implemented"
-        )));
     }
     if matches!(mt, 18..=21 | 38) {
         return Err(rml_error(format!(
@@ -3253,7 +3247,7 @@ mod rml_tests {
     }
 
     #[test]
-    fn rejects_charged_and_fission_pairs() {
+    fn accepts_charged_and_rejects_fission_pairs() {
         let mut fixture = Fixture::basic();
         let mut proton = NEUTRON;
         proton[0] = 0.9986235;
@@ -3262,7 +3256,9 @@ mod rml_tests {
         proton[6] = 6.15e5;
         proton[9] = 600.0;
         fixture.pairs.push(proton);
-        assert_rejects(&fixture, "charged-particle pair");
+        let data = fixture.parse().unwrap();
+        let pair = &rml(&data).pairs[2];
+        assert_eq!((pair.charge_a, pair.charge_b, pair.mt), (1.0, 73.0, 600));
         let mut fixture = Fixture::basic();
         let mut fission = PHOTON;
         fission[0] = 1.0;
@@ -3472,6 +3468,8 @@ mod rml_tests {
             ("Cu-65", 6, 969),
             ("V-51", 6, 136),
             ("Sr-88", 7, 443),
+            ("Cl-35", 8, 272),
+            ("Ca-40", 5, 246),
         ];
         for (name, groups, resonances) in cases {
             let data =

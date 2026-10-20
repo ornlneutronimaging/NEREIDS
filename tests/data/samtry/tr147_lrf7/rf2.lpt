@@ -1,0 +1,49 @@
+The following Chspin value will become negative 
+to maintain SAMMY convention sign=chspin parity:
+     Group and channel #    1    2
+     Spin, L, Chspin =    0.5   1    0.5
+The following Chspin value will become negative 
+to maintain SAMMY convention sign=chspin parity:
+     Group and channel #    2    2
+     Spin, L, Chspin =   -0.5   0    0.5
+The following Chspin value will become negative 
+to maintain SAMMY convention sign=chspin parity:
+     Group and channel #    3    2
+     Spin, L, Chspin =   -1.5   2    0.5
+The following Chspin value will become negative 
+to maintain SAMMY convention sign=chspin parity:
+     Group and channel #    4    2
+     Spin, L, Chspin =    1.5   1    0.5
+The following Chspin value will become negative 
+to maintain SAMMY convention sign=chspin parity:
+     Group and channel #    5    2
+     Spin, L, Chspin =    2.5   3    0.5
+The following Chspin value will become negative 
+to maintain SAMMY convention sign=chspin parity:
+     Group and channel #    6    2
+     Spin, L, Chspin =   -2.5   2    0.5
+The following Chspin value will become negative 
+to maintain SAMMY convention sign=chspin parity:
+     Group and channel #    7    2
+     Spin, L, Chspin =   -3.5   4    0.5
+The following Chspin value will become negative 
+to maintain SAMMY convention sign=chspin parity:
+     Group and channel #    8    2
+     Spin, L, Chspin =    3.5   3    0.5
+The following Chspin value will become negative 
+to maintain SAMMY convention sign=chspin parity:
+     Group and channel #    9    2
+     Spin, L, Chspin =    4.5   5    0.5
+The following Chspin value will become negative 
+to maintain SAMMY convention sign=chspin parity:
+     Group and channel #   10    2
+     Spin, L, Chspin =   -4.5   4    0.5
+          Energy              elastic             nonelastic                           0
+       1  1.000000000000D+04  3.880225737959D+00  7.439260652270D-07  0.000000000000D+00
+       2  1.000000000000D+05  3.680361710121D+00  2.190695934101D-06  0.000000000000D+00
+       3  1.000000000000D+06  8.144899579095D+00  1.634364510148D-05  0.000000000000D+00
+       4  2.000000000000D+06  1.605968274411D+00  8.773153570644D-07  0.000000000000D+00
+       5  3.000000000000D+06  1.174705678402D+00  6.090204072951D-06  4.577400910706D-06
+       6  4.000000000000D+06  2.043726489051D+00  6.756422225863D-02  6.756171789305D-02
+       7  5.000000000000D+06  7.701385117250D-01  2.057360040645D-01  2.057345416755D-01
+       8  6.000000000000D+06  1.743286375989D+00  1.762999619296D-02  1.761569661887D-02

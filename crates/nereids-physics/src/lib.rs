@@ -28,6 +28,7 @@
 pub mod auxiliary_grid;
 pub mod channel;
 pub mod continuous_doppler;
+mod coulomb;
 pub mod detector_spread;
 pub mod doppler;
 pub mod flight_time_grid;

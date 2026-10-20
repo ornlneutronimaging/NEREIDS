@@ -122,35 +122,44 @@ fn compare_with(name: &str, samrml: bool) {
     );
 }
 
-/// SAMMY's own LRF=7 case (samtry tr147): Al-27 with several neutron
-/// channels, of different l and channel spin, in one spin group.
+/// SAMMY's own LRF=7 cases (samtry tr147): Al-27 with several neutron
+/// channels, of different l and channel spin, in one spin group (a, b), and
+/// O-16 with an (n,α) channel that opens at 2.36 MeV (f).
 #[test]
-fn tr147_al27() {
-    let dir = data_dir().join("samtry/tr147_al27_lrf7");
-    for case in ["a", "b"] {
+fn tr147() {
+    let dir = data_dir().join("samtry/tr147_lrf7");
+    for (case, energies) in [("a", 13), ("b", 13), ("f", 8)] {
         let read = |file: String| {
             let path = dir.join(file);
             std::fs::read_to_string(&path).unwrap_or_else(|e| panic!("{path:?}: {e}"))
         };
         let data = parse_endf_file2(&read(format!("r{case}1.ndf")))
             .unwrap_or_else(|e| panic!("tr147 {case}: {e}"));
-        let rows: Vec<[f64; 3]> = read(format!("r{case}2.lpt"))
+        // Energy, elastic, nonelastic, then one reaction per pair beyond the second.
+        let rows: Vec<Vec<f64>> = read(format!("r{case}2.lpt"))
             .lines()
             .filter_map(|line| {
                 let f: Vec<&str> = line.split_whitespace().collect();
                 f.first()?.parse::<usize>().ok()?;
-                let v = |i: usize| f[i].replace('D', "E").parse::<f64>().unwrap();
-                Some([v(1), v(2), v(3)])
+                let v = f[1..]
+                    .iter()
+                    .map(|x| x.replace('D', "E").parse::<f64>())
+                    .collect::<Result<Vec<f64>, _>>()
+                    .ok()?;
+                Some(v)
             })
             .collect();
-        assert_eq!(rows.len(), 13, "tr147 {case}");
-        let energies: Vec<f64> = rows.iter().map(|r| r[0]).collect();
-        let ours = cross_sections_on_grid(&data, &energies);
+        assert_eq!(rows.len(), energies, "tr147 {case}");
+        let grid: Vec<f64> = rows.iter().map(|r| r[0]).collect();
+        let ours = cross_sections_on_grid(&data, &grid);
         let mut worst = Worst::default();
-        for ([e, elastic, nonelastic], xs) in rows.iter().zip(&ours) {
-            worst.check("total", *e, xs.total, xs.total, elastic + nonelastic);
-            worst.check("elastic", *e, xs.total, xs.elastic, *elastic);
-            worst.check("capture", *e, xs.total, xs.capture, *nonelastic);
+        for (row, xs) in rows.iter().zip(&ours) {
+            let (e, elastic, nonelastic) = (row[0], row[1], row[2]);
+            let reactions: f64 = row[3..].iter().sum();
+            worst.check("total", e, xs.total, xs.total, elastic + nonelastic);
+            worst.check("elastic", e, xs.total, xs.elastic, elastic);
+            worst.check("capture", e, xs.total, xs.capture, nonelastic - reactions);
+            worst.check("reaction", e, xs.total, xs.reaction, reactions);
         }
         eprintln!(
             "tr147 {case}: SAMRML {:.3e} of allowance ({} at {} eV)",
@@ -166,10 +175,6 @@ fn tr147_al27() {
     }
 }
 
-/// W-182 at 1e-4 atoms/barn, free-gas Doppler broadened at 296 K with no
-/// resolution function: −ln(T)/n differs by less than 1e-3, in the mean and
-/// at each energy, the budget of the dense-grid free-gas SAMMY cases tr015
-/// and tr016. The grid resolves the Doppler width, which SAMMY needs.
 #[test]
 fn w182_doppler_broadened() {
     let path = data_dir().join("sammy-lrf7/W-182-transmission.txt");
@@ -298,4 +303,17 @@ fn v51() {
 #[test]
 fn sr88() {
     compare("Sr-88");
+}
+
+/// Coulomb exit channel: (n,p), Q = +615 keV.
+#[test]
+fn cl35() {
+    compare("Cl-35");
+}
+
+/// Coulomb exit channels: (n,α), Q = +1.75 MeV, open; (n,p), Q = −529 keV,
+/// closed below 543 keV.
+#[test]
+fn ca40() {
+    compare("Ca-40");
 }
