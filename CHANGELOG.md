@@ -9,6 +9,16 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
 
 ### Added
 
+- R-Matrix Limited (LRF=7) ranges in the Reich-Moore form (KRM=3) are
+  evaluated: neutron, eliminated-capture and neutral exit channels (such as
+  inelastic), shift factors on open channels, and logarithmic background
+  R-functions (LBK=2). W-182/183/184/186, Fe-54, Fe-57, Si-28/29/30, Rh-103,
+  Cu-63, Cu-65, V-51 and Sr-88 of ENDF/B-VIII.1 load and match SAMRML and
+  SAMMY within 1e-6 of the total. Charged-particle channels (Cl-35, Ca-40)
+  and fission channels are still refused, by name.
+- Cross sections gain `reaction`, particle reactions other than elastic
+  scattering, capture and fission; Python's `cross_sections` dict has the key.
+
 - MCP single_spectrum results return each region's timing offset, background
   terms, gamma transmission and overdispersions, and the fit's spread share;
   density-map .npz files hold each patch's timing offset, gamma transmission
@@ -129,9 +139,14 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
   its area at `C = 0.05`), and `exerfc` lost its `exp(x^2)` factor below
   `x = -5.01`.
 - An SLBW or MLBW range with a competitive width (LRX=1) is parsed but not
-  evaluated, like an LRF=7 range: the width's energy dependence needs the l of
-  the exit channel, which ENDF does not give. It was evaluated with the
-  competitive width left out of the total width.
+  evaluated: the width's energy dependence needs the l of the exit channel,
+  which ENDF does not give. It was evaluated with the competitive width left
+  out of the total width.
+- The LRF=7 parser accepts PNT=-1, which ENDF-6 defines as "do not calculate
+  the penetrability", and resolves PNT=0 by MT. It refused PNT=-1, so Cu-63,
+  Cu-65, V-51 and Sr-88 of ENDF/B-VIII.1 failed to load. It finds the
+  eliminated capture channel by its photon pair, not by its row, and reads
+  background R-function records (KBK) in the ENDF-102 layout.
 - A channel of an SLBW, MLBW or Reich–Moore L-group that holds no resonance
   scatters as a hard sphere, `pi/k^2 * g_J * 4 sin^2(phi_l)`; its
   potential scattering was left out.
