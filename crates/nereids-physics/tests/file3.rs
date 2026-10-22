@@ -182,14 +182,37 @@ fn written(mt: &str, head: &str, table: &Tab1) -> Vec<String> {
     lines
 }
 
-#[test]
-fn a_point_repeated_exactly_is_read_once() {
+/// File 3's MT1 of the tape, rounded as [`written`] writes it.
+fn rounded_total() -> Tab1 {
     let mut table = read(&tape(), 1);
     table.points = table
         .points
         .iter()
-        .map(|&(x, y)| (number(&format!("{x:.6e}")), number(&format!("{y:.6e}"))))
+        .map(|&(x, y)| (rounded(x), rounded(y)))
         .collect();
+    table
+}
+
+fn rounded(value: f64) -> f64 {
+    number(&format!("{value:.6e}"))
+}
+
+/// MT1 as [`parse_endf_file2`] reads it from the tape with `on_tape` in its place.
+fn total_read_from(on_tape: &Tab1) -> Tab1 {
+    let text = edited("1", |section| {
+        let head = section[0].clone();
+        *section = written("1", &head, on_tape);
+    });
+    parse_endf_file2(&text)
+        .expect("tape")
+        .smooth
+        .total
+        .expect("MT1")
+}
+
+#[test]
+fn a_point_repeated_exactly_is_read_once() {
+    let mut table = rounded_total();
     let np = table.points.len();
     table.boundaries = vec![np / 2, np];
     table.interp_codes = vec![2, 2];
@@ -209,21 +232,65 @@ fn a_point_repeated_exactly_is_read_once() {
     leading.boundaries = vec![2, np / 2 + 1, np + 1];
     leading.interp_codes = vec![5, 2, 2];
     for on_tape in [tripled, closing, leading] {
-        let text = edited("1", |section| {
-            let head = section[0].clone();
-            *section = written("1", &head, &on_tape);
-        });
-        let total = parse_endf_file2(&text)
-            .expect("tape")
-            .smooth
-            .total
-            .expect("MT1");
+        let total = total_read_from(&on_tape);
         assert_eq!(
             (&total.boundaries, &total.interp_codes, &total.points),
             (&table.boundaries, &table.interp_codes, &table.points),
             "{:?}",
             on_tape.boundaries
         );
+    }
+}
+
+/// The background, then two values, at the resolved range's upper energy.
+///
+/// ENDF/B-VIII.1 Ca-42 and Pb-204 and ENDF/B-VIII.0 Er-168 give MT1, MT2 and
+/// MT102 this shape, and ENDF/B-VIII.1 Ca-43 gives MT1 and MT2.
+#[test]
+fn values_at_one_energy_are_a_jump_from_the_first_to_the_last() {
+    let mut table = rounded_total();
+    let np = table.points.len();
+    table.boundaries = vec![np];
+    table.interp_codes = vec![2];
+    let k = np / 4;
+    let (x, y) = table.points[k];
+    let (middle, last) = (rounded(3.0 * y + 1.0), rounded(2.0 * y + 1.0));
+    let mut jump = table.clone();
+    jump.points.insert(k + 1, (x, last));
+    jump.boundaries = vec![np + 1];
+    let mut three = table.clone();
+    three.points.splice(k + 1..k + 1, [(x, middle), (x, last)]);
+    three.boundaries = vec![np + 2];
+    let mut four = three.clone();
+    four.points.insert(k + 2, (x, rounded(4.0 * y + 1.0)));
+    four.boundaries = vec![np + 3];
+    let mut laws = three.clone();
+    laws.boundaries = vec![k + 2, np + 2];
+    laws.interp_codes = vec![2, 5];
+    let mut jump_laws = jump.clone();
+    jump_laws.boundaries = vec![k + 1, np + 1];
+    jump_laws.interp_codes = vec![2, 5];
+    let mut back = three.clone();
+    back.points[k + 2] = (x, y);
+    for (on_tape, expected, held) in [
+        (three, &jump, last),
+        (four, &jump, last),
+        (laws, &jump_laws, last),
+        (back, &table, y),
+    ] {
+        let total = total_read_from(&on_tape);
+        assert_eq!(
+            (&total.boundaries, &total.interp_codes, &total.points),
+            (
+                &expected.boundaries,
+                &expected.interp_codes,
+                &expected.points
+            ),
+            "{:?}",
+            &on_tape.points[k..k + 4]
+        );
+        // Log-log at x returns exp(ln y).
+        assert!((total.evaluate(x) - held).abs() <= 1e-12 * held, "{held}");
     }
 }
 
