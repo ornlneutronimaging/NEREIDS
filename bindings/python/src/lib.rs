@@ -994,6 +994,9 @@ fn energy_to_tof(energy_ev: f64, flight_path_m: f64) -> PyResult<f64> {
 /// Load ENDF resonance data for an isotope, downloading the evaluation on
 /// first use and caching it in the user's cache directory.
 ///
+/// Mixed evaluations load with a UserWarning naming the
+/// parsed-but-not-evaluated spans.
+///
 /// Args:
 ///     z: Atomic number (e.g. 92 for uranium).
 ///     a: Mass number (e.g. 238).
@@ -1014,7 +1017,9 @@ fn energy_to_tof(energy_ev: f64, flight_path_m: f64) -> PyResult<f64> {
 ///         download is not a valid archive.
 ///     ValueError: an unknown library, an invalid isotope or MAT, a file for
 ///         another isotope, or ENDF text that does not parse, uses an
-///         unsupported LRF=7 option, or has no evaluable resolved range.
+///         unsupported LRF=7 option, or has no evaluable resolved range:
+///         LRF=3, LRF=1/2 without a competitive width (LRX=0), or LRF=7 in
+///         the Reich-Moore form (KRM=3).
 #[pyfunction]
 #[pyo3(signature = (z, a, library="endf8.1", mat=None))]
 fn load_endf(
@@ -1052,11 +1057,21 @@ fn load_endf(
 
 /// Load ENDF resonance data from a local file.
 ///
+/// Mixed evaluations load with a UserWarning naming the
+/// parsed-but-not-evaluated spans.
+///
 /// Args:
 ///     path: Path to an ENDF-format file on disk.
 ///
 /// Returns:
 ///     ResonanceData parsed from the file.
+///
+/// Raises:
+///     OSError: the file cannot be read.
+///     ValueError: the ENDF text does not parse, uses an unsupported LRF=7
+///         option, or has no evaluable resolved range: LRF=3, LRF=1/2
+///         without a competitive width (LRX=0), or LRF=7 in the Reich-Moore
+///         form (KRM=3).
 #[pyfunction]
 fn load_endf_file(py: Python<'_>, path: &str) -> PyResult<PyResonanceData> {
     // Release the GIL for the file I/O and ENDF parsing.

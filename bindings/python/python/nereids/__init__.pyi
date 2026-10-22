@@ -468,11 +468,15 @@ def load_endf(
 def load_endf_file(path: str) -> ResonanceData:
     """Load ENDF resonance data from a local file.
 
-    Raises ``ValueError`` when the file uses an unsupported LRF=7 option or
-    has no evaluable resolved range — LRF=3, LRF=1/2 without a competitive
-    width (LRX=0), or LRF=7 in the Reich-Moore form (KRM=3); loading it would
-    yield zero cross-section everywhere. Mixed evaluations load with a ``UserWarning`` naming the
+    Mixed evaluations load with a ``UserWarning`` naming the
     parsed-but-not-evaluated spans.
+
+    Raises:
+        OSError: the file cannot be read.
+        ValueError: the ENDF text does not parse, uses an unsupported LRF=7
+            option, or has no evaluable resolved range: LRF=3, LRF=1/2
+            without a competitive width (LRX=0), or LRF=7 in the Reich-Moore
+            form (KRM=3).
     """
     ...
 
