@@ -12,6 +12,7 @@
 use std::path::{Path, PathBuf};
 
 use nereids_endf::parser::parse_endf_file2;
+use nereids_physics::continuous_doppler::{Channel, broaden_channel};
 use nereids_physics::reich_moore::{CrossSections, cross_sections_on_grid};
 use nereids_physics::transmission;
 
@@ -221,6 +222,51 @@ fn w182_doppler_broadened() {
     assert!(
         worst.0 < 1e-3,
         "W-182 Doppler: relative difference {:.3e} at {} eV",
+        worst.0,
+        worst.1
+    );
+}
+
+/// The counts fit's continuous free-gas integral on W-182 at 296 K agrees
+/// with SAMMY within the same 1e-3 budget, in the mean and at each energy.
+#[test]
+fn w182_continuous_doppler() {
+    let path = data_dir().join("sammy-lrf7/W-182-transmission.txt");
+    let text = std::fs::read_to_string(&path).unwrap_or_else(|e| panic!("{path:?}: {e}"));
+    let rows: Vec<[f64; 2]> = text
+        .lines()
+        .filter(|line| !line.starts_with('#'))
+        .map(|line| {
+            let v: Vec<f64> = line
+                .split_whitespace()
+                .map(|x| x.parse().unwrap())
+                .collect();
+            [v[0], v[1]]
+        })
+        .collect();
+    let energies: Vec<f64> = rows.iter().map(|r| r[0]).collect();
+    let fixture = data_dir().join("endf/mf2/W-182.endf");
+    let data = parse_endf_file2(&std::fs::read_to_string(fixture).unwrap()).unwrap();
+    let sigma = broaden_channel(&energies, &data, 296.0, Channel::Total).unwrap();
+
+    let mut sum = 0.0;
+    let mut worst = (0.0_f64, 0.0);
+    for (row, s) in rows.iter().zip(&sigma) {
+        let rel = (s - row[1]).abs() / row[1];
+        sum += rel;
+        if rel > worst.0 {
+            worst = (rel, row[0]);
+        }
+    }
+    let mean = sum / rows.len() as f64;
+    eprintln!(
+        "W-182 continuous Doppler: mean relative {mean:.3e}, max {:.3e} at {} eV",
+        worst.0, worst.1
+    );
+    assert!(mean < 1e-3, "W-182 continuous Doppler: mean {mean:.3e}");
+    assert!(
+        worst.0 < 1e-3,
+        "W-182 continuous Doppler: {:.3e} at {} eV",
         worst.0,
         worst.1
     );

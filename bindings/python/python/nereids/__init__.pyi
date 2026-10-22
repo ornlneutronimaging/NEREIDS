@@ -129,9 +129,9 @@ class ResonanceData:
     def has_unevaluated_ranges(self) -> bool:
         """Whether the evaluation carries parsed-but-not-evaluated ranges.
 
-        True when any range is a parse-and-skip placeholder (LRU=2 URR or
-        LRU=0 scattering-radius-only). Their
-        resonances contribute no cross section; a ``UserWarning`` listing them
+        True when any range is a parse-and-skip placeholder (LRU=2 URR,
+        LRU=0 scattering-radius-only, or LRF=1/2 with a competitive width,
+        LRX=1). Their resonances contribute no cross section; a ``UserWarning`` listing them
         is emitted at load time by :func:`load_endf` / :func:`load_endf_file`.
         """
         ...
@@ -140,7 +140,8 @@ class ResonanceData:
     def skipped_ranges(self) -> list[str]:
         """One-line descriptions of the parse-and-skip placeholder ranges.
 
-        One string per non-evaluable range (LRU=2 or LRU=0), using the
+        One string per non-evaluable range (LRU=2, LRU=0, or LRF=1/2 with
+        LRX=1), using the
         same text as the load-time ``UserWarning`` and the parser's rejection
         message. Empty when :attr:`has_unevaluated_ranges` is ``False``.
         """
@@ -457,17 +458,20 @@ def load_endf(
         RuntimeError: the isotope is absent from the library (HTTP 404), or
             the download is not a valid archive.
         ValueError: an unknown library, an invalid isotope or MAT, a file for
-            another isotope, or ENDF text that does not parse or has no
-            evaluable resolved (LRF=1/2/3) range.
+            another isotope, or ENDF text that does not parse, uses an
+            unsupported LRF=7 option, or has no evaluable resolved range:
+            LRF=3, LRF=1/2 without a competitive width (LRX=0), or LRF=7 in
+            the Reich-Moore form (KRM=3).
     """
     ...
 
 def load_endf_file(path: str) -> ResonanceData:
     """Load ENDF resonance data from a local file.
 
-    Raises ``ValueError`` when the file has no evaluable resolved
-    (LRF=1/2/3) range — loading it would yield zero cross-section
-    everywhere. Mixed evaluations load with a ``UserWarning`` naming the
+    Raises ``ValueError`` when the file uses an unsupported LRF=7 option or
+    has no evaluable resolved range — LRF=3, LRF=1/2 without a competitive
+    width (LRX=0), or LRF=7 in the Reich-Moore form (KRM=3); loading it would
+    yield zero cross-section everywhere. Mixed evaluations load with a ``UserWarning`` naming the
     parsed-but-not-evaluated spans.
     """
     ...

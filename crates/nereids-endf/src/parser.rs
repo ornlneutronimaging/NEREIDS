@@ -68,9 +68,11 @@ pub fn parse_endf_file2(endf_text: &str) -> Result<ResonanceData, EndfParseError
             )
         };
         return Err(EndfParseError::UnsupportedFormat(format!(
-            "No evaluable resonance ranges: NEREIDS evaluates resolved LRF=1/2/3 \
-             (SLBW/MLBW/Reich-Moore) only, and {detail}. No resonance would \
-             contribute a cross section anywhere on the energy grid."
+            "No evaluable resonance ranges: NEREIDS evaluates resolved LRF=3 \
+             (Reich-Moore) ranges, LRF=1/2 (SLBW/MLBW) ranges without a competitive \
+             width (LRX=0), and LRF=7 (R-Matrix Limited) ranges in the Reich-Moore \
+             form (KRM=3); {detail}. No resonance would contribute a cross section \
+             anywhere on the energy grid."
         )));
     }
 
@@ -918,10 +920,8 @@ fn parse_rmatrix_limited_range(
             incident.mass_a, incident.charge_a, incident.q_value
         )));
     }
-    // Lab threshold of each pair, E_c = −Q·(A+1)/A with A = MB/MA of the incident pair.
-    let mass_ratio = incident.mass_b / incident.mass_a;
     for (i, pair) in pairs.iter().enumerate() {
-        let threshold = -pair.q_value * (mass_ratio + 1.0) / mass_ratio;
+        let threshold = pair.threshold(incident);
         if pair.shift && threshold > ctx.energy_low {
             return Err(rml_error(format!(
                 "particle pair {}: SHF=1 on a channel with threshold {threshold:.6e} eV inside \
@@ -939,7 +939,6 @@ fn parse_rmatrix_limited_range(
             &pairs,
             photon_pair,
             incident_pair,
-            mass_ratio,
         )?);
     }
 
@@ -1088,7 +1087,6 @@ fn parse_rml_spin_group(
     pairs: &[ParticlePair],
     photon_pair: usize,
     incident_pair: usize,
-    mass_ratio: f64,
 ) -> Result<RmlSpinGroup, EndfParseError> {
     let location = format!("spin group {group}");
 
@@ -1202,8 +1200,10 @@ fn parse_rml_spin_group(
             // A width at the channel threshold has P = 0 and no finite amplitude.
             for (channel, &width) in channels.iter().zip(&widths) {
                 let pair = &pairs[channel.pair];
-                let threshold = -pair.q_value * (mass_ratio + 1.0) / mass_ratio;
-                if pair.penetrability && width != 0.0 && energy == threshold {
+                if pair.penetrability
+                    && width != 0.0
+                    && energy == pair.threshold(&pairs[incident_pair])
+                {
                     return Err(rml_error(format!(
                         "{location}: resonance at ER={energy} eV sits on the threshold of a \
                          penetrating channel with width {width} eV"

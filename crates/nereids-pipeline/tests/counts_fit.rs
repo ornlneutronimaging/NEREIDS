@@ -5744,4 +5744,15 @@ fn tungsten_lrf7_densities_are_recovered() {
         let pull = (fit.regions[0].densities[i] - sample[i].1) / error_bar(&fit, k);
         assert!(pull.abs() <= BOUND.sqrt(), "isotope {i}: pull {pull}");
     }
+
+    let rml = m.material_mut().isotopes[0].0.ranges[0]
+        .r_matrix_limited
+        .as_mut()
+        .expect("LRF=7");
+    rml.spin_groups[0].resonances[0].widths[0] = f64::NAN;
+    let refused = fit_counts(&m, &calibration(&setup)).expect_err("a width is NaN");
+    assert!(
+        matches!(&refused, PipelineError::InvalidParameter(message) if message.contains("not finite")),
+        "{refused}"
+    );
 }

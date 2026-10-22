@@ -102,8 +102,8 @@ fn build_aux_grid(
 /// Extract (energy_eV, gd_eV) pairs from resonance data for fine-structure
 /// grid densification.
 ///
-/// For LRF=1/2/3 (BW and Reich-Moore): `gd = |Γn| + |Γγ| + |Γf1| + |Γf2|`,
-/// walked from the `l_groups` of each range that
+/// `gd` is a level's total width, the sum of its absolute widths
+/// ([`nereids_endf::resonance::ResonanceRange::levels`]), over each range that
 /// [`nereids_endf::resonance::ResonanceRange::is_evaluable`] accepts.
 ///
 /// SAMMY Ref: dat/mdat4.f90 Fspken — uses total width to define the region
@@ -115,14 +115,7 @@ fn extract_resonance_widths(resonance_data: &[&ResonanceData]) -> Vec<(f64, f64)
             if !range.is_evaluable() {
                 continue;
             }
-            for lg in &range.l_groups {
-                for res in &lg.resonances {
-                    let gd = res.gn.abs() + res.gg.abs() + res.gfa.abs() + res.gfb.abs();
-                    if gd > 0.0 {
-                        pairs.push((res.energy, gd));
-                    }
-                }
-            }
+            pairs.extend(range.levels().filter(|&(_, gd)| gd > 0.0));
         }
     }
     pairs
@@ -1272,6 +1265,25 @@ mod tests {
     use nereids_core::types::Isotope;
     use nereids_endf::resonance::test_support::u238_single_resonance;
     use nereids_endf::resonance::{LGroup, Resonance, ResonanceFormalism, ResonanceRange};
+
+    /// The levels of an LRF=7 evaluation are resonance centres, as LRF=3 levels are.
+    #[test]
+    fn resonance_centres_include_lrf7_levels() {
+        let path = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("../../tests/data/endf/mf2/W-182.endf");
+        let text = std::fs::read_to_string(&path).unwrap_or_else(|e| panic!("{path:?}: {e}"));
+        let data = nereids_endf::parser::parse_endf_file2(&text).expect("W-182");
+        let rml = data.ranges[0].r_matrix_limited.as_ref().expect("LRF=7");
+        let mut expected: Vec<f64> = rml
+            .spin_groups
+            .iter()
+            .flat_map(|g| g.resonances.iter().map(|r| r.energy))
+            .collect();
+        expected.sort_by(f64::total_cmp);
+        expected.dedup();
+        assert!(!expected.is_empty());
+        assert_eq!(resonance_center_energies(&[&data]), expected);
+    }
 
     /// The spatial pipeline builds the working-grid σ
     /// (`broadened_cross_sections_on_working_grid`) and the shared layout

@@ -99,9 +99,9 @@ impl PyResonanceData {
 
     /// Whether the evaluation carries parsed-but-not-evaluated ranges.
     ///
-    /// `True` when any range is a parse-and-skip placeholder (LRU=2 URR or
-    /// LRU=0 scattering-radius-only). Those
-    /// spans contribute zero
+    /// `True` when any range is a parse-and-skip placeholder (LRU=2 URR,
+    /// LRU=0 scattering-radius-only, or LRF=1/2 with a competitive width,
+    /// LRX=1). Those spans contribute zero
     /// cross-section — a `UserWarning` listing them is emitted at load time
     /// by `load_endf` / `load_endf_file`. Files with NO evaluable range at
     /// all fail to load instead (ValueError).
@@ -112,8 +112,8 @@ impl PyResonanceData {
 
     /// One-line descriptions of the parse-and-skip placeholder ranges.
     ///
-    /// One string per non-evaluable range (LRU=2 URR or LRU=0
-    /// scattering-radius-only), formatted by the shared Rust
+    /// One string per non-evaluable range (LRU=2 URR, LRU=0
+    /// scattering-radius-only, or LRF=1/2 with LRX=1), formatted by the shared Rust
     /// `ResonanceRange::skip_description` — the same text used in the load-time
     /// `UserWarning` and the parser's rejection message. Empty when
     /// [`Self::has_unevaluated_ranges`] is `False`.
@@ -251,8 +251,8 @@ fn load_and_parse_endf(
 }
 
 /// Emit a Python ``UserWarning`` when parsed ENDF data contains
-/// parse-and-skip placeholder ranges (LRU=2 URR or LRU=0
-/// scattering-radius-only).
+/// parse-and-skip placeholder ranges (LRU=2 URR, LRU=0
+/// scattering-radius-only, or LRF=1/2 with a competitive width).
 ///
 /// Those spans' resonances contribute no cross section, so any physics
 /// computed over them reflects only the evaluation's other ranges and its
@@ -275,8 +275,9 @@ fn warn_unevaluated_ranges(py: Python<'_>, data: &ResonanceData, origin: &str) -
     let spans: Vec<String> = skipped.iter().map(|r| r.skip_description()).collect();
     let msg = format!(
         "{origin}: {} of {} resonance range(s) are parsed but NOT evaluated: {}. \
-         Their resonances contribute no cross section; NEREIDS \
-         evaluates resolved LRF=1/2/3 ranges without a competitive width only.",
+         Their resonances contribute no cross section; NEREIDS evaluates \
+         resolved LRF=3 ranges, LRF=1/2 ranges without a competitive width \
+         and LRF=7 ranges in the Reich-Moore form (KRM=3).",
         skipped.len(),
         data.ranges.len(),
         spans.join("; ")
@@ -1012,8 +1013,8 @@ fn energy_to_tof(energy_ev: f64, flight_path_m: f64) -> PyResult<f64> {
 ///     RuntimeError: the isotope is absent from the library (HTTP 404), or the
 ///         download is not a valid archive.
 ///     ValueError: an unknown library, an invalid isotope or MAT, a file for
-///         another isotope, or ENDF text that does not parse or has no
-///         evaluable resolved range.
+///         another isotope, or ENDF text that does not parse, uses an
+///         unsupported LRF=7 option, or has no evaluable resolved range.
 #[pyfunction]
 #[pyo3(signature = (z, a, library="endf8.1", mat=None))]
 fn load_endf(

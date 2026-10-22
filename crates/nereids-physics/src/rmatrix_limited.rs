@@ -11,6 +11,7 @@
 
 use num_complex::Complex64;
 
+use nereids_core::constants::DIVISION_FLOOR;
 use nereids_endf::resonance::{RmlBackground, RmlRange};
 
 use crate::channel;
@@ -93,8 +94,8 @@ impl RmlPlan {
     /// reduced-width amplitudes, γ = sign(Γ)·√(|Γ| / 2P(|E_λ − E_c|)).
     ///
     /// # Panics
-    /// Panics if an amplitude is not finite, which the parser's threshold
-    /// check excludes.
+    /// Panics if an amplitude is not finite: a nonzero width whose penetrability at
+    /// |E_λ − E_c| underflows to zero. The parser rejects a level on its channel's threshold.
     pub(crate) fn new(rml: &RmlRange) -> Self {
         let incident = &rml.pairs[rml.incident_pair];
         let awr = incident.mass_b / incident.mass_a;
@@ -117,7 +118,7 @@ impl RmlPlan {
                         index,
                         ChannelPlan {
                             entrance: ch.pair == rml.incident_pair,
-                            threshold: -pair.q_value / cm_fraction,
+                            threshold: pair.threshold(incident),
                             reduced_mass,
                             eta_k: if charges == 0.0 {
                                 0.0
@@ -218,10 +219,11 @@ impl RmlPlan {
                 let de = level.energy - energy_ev;
                 let hw = level.half_photon_width;
                 let denominator = de * de + hw * hw;
-                assert!(
-                    denominator > 0.0,
-                    "LRF=7 energy {energy_ev} eV hits a level with zero photon width"
-                );
+                // A level with zero photon width has no finite pole at its own energy;
+                // the LRF=3 path drops it there too.
+                if denominator <= DIVISION_FLOOR {
+                    continue;
+                }
                 let pole = Complex64::new(de / denominator, hw / denominator);
                 for (i, &ci) in open.iter().enumerate() {
                     let gi = level.amplitudes[ci];
@@ -694,6 +696,31 @@ mod tests {
         };
         let xs = RmlPlan::new(&rml).evaluate(0.5);
         assert!(xs.total.is_finite() && xs.capture.is_finite() && xs.total > 0.0);
+    }
+
+    /// At the energy of a level with zero photon width the level drops out,
+    /// as in the LRF=3 path, leaving hard-sphere scattering.
+    #[test]
+    fn zero_photon_width_at_the_level_energy_is_hard_sphere() {
+        let (e0, radius) = (21.1, 7.64);
+        let rml = RmlRange {
+            pairs: vec![photon(), neutron()],
+            incident_pair: 1,
+            photon_pair: 0,
+            spin_groups: vec![group(
+                0.5,
+                vec![channel(0, 0, 0.0), channel(1, 0, radius)],
+                vec![RmlResonance {
+                    energy: e0,
+                    widths: vec![0.0, 0.04],
+                }],
+            )],
+        };
+        let xs = RmlPlan::new(&rml).evaluate(e0);
+        let phi = penetrability::phase_shift(0, channel::wave_number(e0, A) * radius);
+        let expected = 4.0 * channel::pi_over_k_squared_barns(e0, A) * phi.sin().powi(2);
+        assert!((xs.total - expected).abs() <= 1e-13 * expected, "{xs:?}");
+        assert_eq!(xs.capture, 0.0);
     }
 
     fn mf2_fixture(name: &str) -> ResonanceData {

@@ -389,10 +389,9 @@ pub fn broaden_in_lattice(
         .ranges
         .iter()
         .filter(|range| range.is_evaluable())
-        .flat_map(|range| &range.l_groups)
-        .flat_map(|group| &group.resonances)
-        .filter(|r| r.energy >= lowest - 1.0 && r.energy <= highest + 1.0)
-        .map(|r| r.gn.abs() + r.gg.abs() + r.gfa.abs() + r.gfb.abs())
+        .flat_map(|range| range.levels())
+        .filter(|&(energy, _)| energy >= lowest - 1.0 && energy <= highest + 1.0)
+        .map(|(_, width)| width)
         .filter(|&width| width > 0.0)
         .fold(f64::INFINITY, f64::min);
     let mut h = (PI * narrowest / 30.0).min(PI * omega_max / 100.0);

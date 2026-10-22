@@ -783,15 +783,13 @@ pub(crate) fn draw_resonance_dips(
         });
     for res_data in all_resonance_data {
         for range in &res_data.ranges {
-            for lg in &range.l_groups {
-                for res in &lg.resonances {
-                    if res.energy >= x_min && res.energy <= x_max {
-                        plot_ui.vline(
-                            VLine::new("", res.energy)
-                                .color(RESONANCE_DIP_COLOR)
-                                .width(0.5_f32),
-                        );
-                    }
+            for (energy, _) in range.levels() {
+                if energy >= x_min && energy <= x_max {
+                    plot_ui.vline(
+                        VLine::new("", energy)
+                            .color(RESONANCE_DIP_COLOR)
+                            .width(0.5_f32),
+                    );
                 }
             }
         }

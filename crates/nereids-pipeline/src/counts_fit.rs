@@ -10,7 +10,7 @@ use std::ops::{Range, RangeInclusive};
 use std::sync::Arc;
 
 use faer::{Mat, Side};
-use nereids_endf::resonance::{ResonanceCovariance, ResonanceData};
+use nereids_endf::resonance::{ResonanceCovariance, ResonanceData, RmlRange};
 use nereids_endf::retrieval::EndfLibrary;
 use nereids_fitting::error::FittingError;
 use nereids_fitting::lm::{FitModel, FlatMatrix};
@@ -578,7 +578,7 @@ pub struct RegionFit {
 /// path and pulse, or at the fitted ones of any pass that rebuilds it, at the
 /// region's known temperature or at the upper bound of a fitted one, down to
 /// zero for a window within the thermal spread of zero energy, are not inside
-/// a single one of its evaluated (SLBW, MLBW or Reich–Moore) resolved ranges,
+/// a single one of its evaluated resolved ranges,
 /// or, in a region with in-scatter, an isotope has a resonance below that
 /// grid's lowest energy and above the lowest energy a neutron scattered forward
 /// leaves with;
@@ -1318,8 +1318,8 @@ fn in_span(
                     }) {
                         return Err(PipelineError::InvalidParameter(format!(
                             "the Doppler-broadened cross section of {} in region {} reads \
-                             {:.6e}–{:.6e} eV, which no single one of its evaluated (SLBW, \
-                             MLBW or Reich–Moore) resolved ranges holds",
+                             {:.6e}–{:.6e} eV, which no single one of its evaluated resolved \
+                             ranges holds",
                             isotope.isotope, lines.region, read.0, read.1
                         )));
                     }
@@ -2508,6 +2508,7 @@ fn finite(isotope: &ResonanceData) -> bool {
                         .flat_map(|r| [r.energy, r.j, r.gn, r.gg, r.gfa, r.gfb]),
                 )
             });
+            let rml = range.r_matrix_limited.iter().flat_map(rml_values);
             [
                 range.energy_low,
                 range.energy_high,
@@ -2518,8 +2519,38 @@ fn finite(isotope: &ResonanceData) -> bool {
             .chain(radii)
             .chain(external)
             .chain(groups)
+            .chain(rml)
             .all(f64::is_finite)
         })
+}
+
+/// Every floating-point parameter of an LRF=7 range.
+fn rml_values(rml: &RmlRange) -> impl Iterator<Item = f64> + '_ {
+    let pairs = rml.pairs.iter().flat_map(|p| {
+        [
+            p.mass_a, p.mass_b, p.charge_a, p.charge_b, p.spin_a, p.spin_b, p.q_value,
+        ]
+    });
+    let groups = rml.spin_groups.iter().flat_map(|g| {
+        let channels = g
+            .channels
+            .iter()
+            .flat_map(|c| [c.channel_spin, c.boundary, c.radius_phase, c.radius_true]);
+        let levels = g
+            .resonances
+            .iter()
+            .flat_map(|r| std::iter::once(r.energy).chain(r.widths.iter().copied()));
+        let background = g.background.iter().flat_map(|b| {
+            [
+                b.e_down, b.e_up, b.r_con, b.r_lin, b.r_quad, b.s_con, b.s_lin,
+            ]
+        });
+        std::iter::once(g.j)
+            .chain(channels)
+            .chain(levels)
+            .chain(background)
+    });
+    pairs.chain(groups)
 }
 
 struct Lines<'a> {

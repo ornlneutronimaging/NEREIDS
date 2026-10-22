@@ -1137,8 +1137,9 @@ fn evaluate_precomputed_range(
 /// Can this range actually produce non-zero cross-sections?
 ///
 /// Delegates to [`ResonanceRange::is_evaluable`]: evaluable = resolved
-/// LRF=1/2/3 (SLBW, MLBW, Reich-Moore) or LRF=7 with parameters. LRU=2 and
-/// LRU=0 ranges are parse-and-skip placeholders and are never evaluated.
+/// LRF=3 (Reich-Moore), LRF=1/2 (SLBW, MLBW) without a competitive width, or
+/// LRF=7, each with parameters. LRU=2 and LRU=0 ranges are parse-and-skip
+/// placeholders and are never evaluated.
 ///
 /// **In literal sync with `precompute_range_data`**: both key on
 /// [`ResonanceRange::is_evaluable`] (`precompute_range_data` returns its Skip

@@ -19,7 +19,6 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
   total. Fission channels in LRF=7 are still refused, by name.
 - Cross sections gain `reaction`, particle reactions other than elastic
   scattering, capture and fission; Python's `cross_sections` dict has the key.
-
 - MCP single_spectrum results return each region's timing offset, background
   terms, gamma transmission and overdispersions, and the fit's spread share;
   density-map .npz files hold each patch's timing offset, gamma transmission
@@ -106,7 +105,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
   The counts engine excludes the Ta-181 VIII.1 window at 13.6–14.2 eV and
   reports excluded bins. Library choice can change fitted densities and
   temperatures.
-- ENDF loading evaluates resolved LRF=1/2/3 ranges. URR, RML and
+- ENDF loading evaluates resolved LRF=3 ranges and LRF=1/2 ranges without
+  a competitive width (LRX=0). URR, competitive-width LRF=1/2 and
   scattering-radius-only ranges are parsed but not evaluated. A source
   with no supported range is rejected. Mixed sources report skipped ranges.
   Source composition still omits File-3 contributions.

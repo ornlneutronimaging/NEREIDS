@@ -477,6 +477,15 @@ pub struct ParticlePair {
     pub shift: bool,
 }
 
+impl ParticlePair {
+    /// Lab-frame threshold energy in eV, −Q·(A+1)/A, with A = MB/MA of the
+    /// incident pair `incident`; the pair's channels are open above it.
+    pub fn threshold(&self, incident: &ParticlePair) -> f64 {
+        let mass_ratio = incident.mass_b / incident.mass_a;
+        -self.q_value * (mass_ratio + 1.0) / mass_ratio
+    }
+}
+
 /// One channel of an LRF=7 spin group.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct RmlChannel {
@@ -578,8 +587,9 @@ impl ResonanceData {
     /// Ranges that are parsed but NOT evaluated (non-evaluable placeholders).
     ///
     /// These are the LRU=2 (unresolved) and LRU=0 (scattering-radius-only)
-    /// ranges, and resolved ranges without evaluable parameters. They
-    /// contribute exactly zero to every cross-section. Any physics computed over their energy span reflects
+    /// ranges, resolved LRF=1/2 ranges with a competitive width (LRX=1), and
+    /// resolved ranges without resonances. They contribute exactly zero to
+    /// every cross-section. Any physics computed over their energy span reflects
     /// only the *other* ranges of the evaluation. Callers that surface data
     /// to users should warn when this list is non-empty.
     pub fn unevaluated_ranges(&self) -> Vec<&ResonanceRange> {
@@ -623,6 +633,24 @@ impl ResonanceRange {
         } else {
             self.scattering_radius
         }
+    }
+
+    /// Energy and total width, both in eV, of every level of the range: the
+    /// L-grouped resonances of LRF=1/2/3 and the spin-group resonances of LRF=7.
+    pub fn levels(&self) -> impl Iterator<Item = (f64, f64)> + '_ {
+        let grouped = self.l_groups.iter().flat_map(|lg| &lg.resonances).map(|r| {
+            (
+                r.energy,
+                r.gn.abs() + r.gg.abs() + r.gfa.abs() + r.gfb.abs(),
+            )
+        });
+        let rml = self
+            .r_matrix_limited
+            .iter()
+            .flat_map(|rml| &rml.spin_groups)
+            .flat_map(|g| &g.resonances)
+            .map(|r| (r.energy, r.widths.iter().map(|w| w.abs()).sum::<f64>()));
+        grouped.chain(rml)
     }
 
     /// Total discrete-resonance count for this range.
