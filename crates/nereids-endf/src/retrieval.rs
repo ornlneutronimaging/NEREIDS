@@ -624,7 +624,7 @@ fn nndc_endf_url(isotope: &Isotope, library: EndfLibrary) -> Option<String> {
     };
     let sym = elements::element_symbol(isotope.z())?;
     Some(format!(
-        "{NNDC_ENDF_BASE_URL}/{version}/n-{z:03}_{sym}_{a}.endf",
+        "{NNDC_ENDF_BASE_URL}/{version}/n-{z:03}_{sym}_{a:03}.endf",
         z = isotope.z(),
         a = isotope.a()
     ))
@@ -702,6 +702,30 @@ mod tests {
             Some("https://www.nndc.bnl.gov/endf-data/ENDF/ENDF-B-VIII.1/n-056_Ba_138.endf")
         );
         assert!(nndc_endf_url(&ba138, EndfLibrary::Cendl3_2).is_none());
+
+        let fe56 = Isotope::new(26, 56).unwrap();
+        assert_eq!(
+            nndc_endf_url(&fe56, EndfLibrary::EndfB8_1).as_deref(),
+            Some("https://www.nndc.bnl.gov/endf-data/ENDF/ENDF-B-VIII.1/n-026_Fe_056.endf")
+        );
+        let h1 = Isotope::new(1, 1).unwrap();
+        assert_eq!(
+            nndc_endf_url(&h1, EndfLibrary::EndfB8_0).as_deref(),
+            Some("https://www.nndc.bnl.gov/endf-data/ENDF/ENDF-B-VIII.0/n-001_H_001.endf")
+        );
+    }
+
+    #[test]
+    fn iaea_zip_filename_keeps_mass_unpadded() {
+        let fe56 = Isotope::new(26, 56).unwrap();
+        assert_eq!(
+            EndfLibrary::EndfB8_1.zip_filename(&fe56, 2631),
+            "n_026-Fe-56_2631.zip"
+        );
+        assert_eq!(
+            EndfLibrary::EndfB8_0.zip_filename(&fe56, 2631),
+            "n_2631_26-Fe-56.zip"
+        );
     }
 
     #[test]

@@ -127,6 +127,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
 
 ### Fixed
 
+- NNDC file names pad the mass number to three digits, so ENDF/B-VIII.0 and
+  VIII.1 isotopes with A < 100 download from NNDC again instead of only from
+  IAEA.
 - File 3 reads a point its table repeats exactly as one point, so an
   evaluation such as JENDL-5 Ta-181, whose MT1 and MT2 repeat 6635.89 eV
   three times, loads again.
