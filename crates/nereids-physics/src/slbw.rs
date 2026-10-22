@@ -194,6 +194,7 @@ pub fn slbw_cross_sections(data: &ResonanceData, energy_ev: f64) -> CrossSection
         elastic,
         capture,
         fission,
+        reaction: 0.0,
     }
 }
 
@@ -634,6 +635,7 @@ mod tests {
                 }],
                 ap_table: None,
                 r_external: vec![],
+                r_matrix_limited: None,
             }],
         };
 
@@ -668,6 +670,7 @@ mod tests {
                 }],
                 ap_table: None,
                 r_external: vec![],
+                r_matrix_limited: None,
             }],
         };
 
@@ -725,6 +728,7 @@ mod tests {
                 }],
                 ap_table: None,
                 r_external: vec![],
+                r_matrix_limited: None,
             }],
         };
         let xs_diff = slbw_cross_sections(&data_naps0_diff_ap, e);

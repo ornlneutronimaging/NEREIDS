@@ -47,8 +47,8 @@ struct PyResonanceData {
 impl PyResonanceData {
     /// String representation.
     fn __repr__(&self) -> String {
-        // Discrete-resonance count over evaluable LRF=1/2/3 ranges; skipped
-        // LRF=7 / LRU=2 placeholder ranges contribute 0.
+        // Discrete-resonance count over LRF=1/2/3 and LRF=7 ranges; LRU=2
+        // placeholder ranges contribute 0.
         let n_res: usize = self.inner.total_resonance_count();
         format!(
             "ResonanceData(Z={}, A={}, AWR={:.3}, n_resonances={})",
@@ -80,9 +80,8 @@ impl PyResonanceData {
     /// Number of discrete resonances (across all evaluable ranges).
     ///
     /// Delegates to [`ResonanceData::total_resonance_count`], which counts the
-    /// L-grouped resonances of evaluable LRF=1/2/3 ranges. LRF=7 (and LRU=2)
-    /// ranges are parsed-and-skipped — NEREIDS does not evaluate them — so they
-    /// contribute 0.
+    /// resonances of LRF=1/2/3 and LRF=7 ranges. LRU=2 ranges are not
+    /// evaluated and contribute 0.
     #[getter]
     fn n_resonances(&self) -> usize {
         self.inner.total_resonance_count()
@@ -91,8 +90,8 @@ impl PyResonanceData {
     /// Total resonance count across all ranges.
     ///
     /// Explicit alias for [`Self::n_resonances`]; both delegate to the Rust
-    /// `ResonanceData::total_resonance_count()`, which counts LRF=1/2/3
-    /// L-group resonances only (skipped LRF=7 / LRU=2 ranges contribute 0).
+    /// `ResonanceData::total_resonance_count()`, which counts LRF=1/2/3 and
+    /// LRF=7 resonances (skipped LRU=2 ranges contribute 0).
     #[getter]
     fn total_resonance_count(&self) -> usize {
         self.inner.total_resonance_count()
@@ -100,9 +99,9 @@ impl PyResonanceData {
 
     /// Whether the evaluation carries parsed-but-not-evaluated ranges.
     ///
-    /// `True` when any range is a parse-and-skip placeholder (LRF=7
-    /// R-Matrix Limited, LRU=2 URR, or LRU=0 scattering-radius-only). Those
-    /// spans contribute zero
+    /// `True` when any range is a parse-and-skip placeholder (LRU=2 URR,
+    /// LRU=0 scattering-radius-only, or LRF=1/2 with a competitive width,
+    /// LRX=1). Those spans contribute zero
     /// cross-section — a `UserWarning` listing them is emitted at load time
     /// by `load_endf` / `load_endf_file`. Files with NO evaluable range at
     /// all fail to load instead (ValueError).
@@ -113,8 +112,8 @@ impl PyResonanceData {
 
     /// One-line descriptions of the parse-and-skip placeholder ranges.
     ///
-    /// One string per non-evaluable range (LRF=7 R-Matrix Limited, LRU=2 URR,
-    /// or LRU=0 scattering-radius-only), formatted by the shared Rust
+    /// One string per non-evaluable range (LRU=2 URR, LRU=0
+    /// scattering-radius-only, or LRF=1/2 with LRX=1), formatted by the shared Rust
     /// `ResonanceRange::skip_description` — the same text used in the load-time
     /// `UserWarning` and the parser's rejection message. Empty when
     /// [`Self::has_unevaluated_ranges`] is `False`.
@@ -129,7 +128,7 @@ impl PyResonanceData {
 
     /// Target spin (I) of the first evaluable resonance range.
     ///
-    /// Parse-and-skip placeholders (LRU=0 / LRF=7 / URR) may precede the
+    /// Parse-and-skip placeholders (LRU=0 / URR) may precede the
     /// evaluable ranges on mixed tapes; their SPI describes a span the
     /// cross-section code never evaluates, so the getter skips them (falling
     /// back to the first range only if nothing is evaluable).
@@ -149,7 +148,8 @@ impl PyResonanceData {
     /// Returns the global AP from the first evaluable range (skipping
     /// parse-and-skip placeholders, as for `target_spin`). If AP=0 (common in
     /// ENDF Reich-Moore data that uses energy-dependent radii), falls back
-    /// to the first L-group's channel radius APL.
+    /// to the first L-group's channel radius APL, or for LRF=7 to the phase
+    /// radius APE of the first neutron channel.
     #[getter]
     fn scattering_radius(&self) -> f64 {
         self.inner
@@ -160,23 +160,37 @@ impl PyResonanceData {
             .map(|r| {
                 if r.scattering_radius != 0.0 {
                     r.scattering_radius
+                } else if let Some(rml) = &r.r_matrix_limited {
+                    rml.spin_groups
+                        .iter()
+                        .flat_map(|g| &g.channels)
+                        .find(|c| c.pair == rml.incident_pair)
+                        .map_or(0.0, |c| c.radius_phase)
                 } else {
-                    // Fall back to first L-group's channel radius
                     r.l_groups.first().map(|lg| lg.apl).unwrap_or(0.0)
                 }
             })
             .unwrap_or(0.0)
     }
 
-    /// Orbital angular momentum values (L) present in the data.
+    /// Orbital angular momentum values (L) present in the data; for LRF=7,
+    /// those of the neutron channels.
     #[getter]
     fn l_values(&self) -> Vec<u32> {
         let mut ls: Vec<u32> = self
             .inner
             .ranges
             .iter()
-            .flat_map(|r| &r.l_groups)
-            .map(|lg| lg.l)
+            .flat_map(|r| {
+                let rml_ls = r.r_matrix_limited.iter().flat_map(|rml| {
+                    rml.spin_groups
+                        .iter()
+                        .flat_map(|g| &g.channels)
+                        .filter(|c| c.pair == rml.incident_pair)
+                        .map(|c| c.l)
+                });
+                r.l_groups.iter().map(|lg| lg.l).chain(rml_ls)
+            })
             .collect();
         ls.sort();
         ls.dedup();
@@ -237,8 +251,8 @@ fn load_and_parse_endf(
 }
 
 /// Emit a Python ``UserWarning`` when parsed ENDF data contains
-/// parse-and-skip placeholder ranges (LRF=7 R-Matrix Limited, LRU=2 URR, or
-/// LRU=0 scattering-radius-only).
+/// parse-and-skip placeholder ranges (LRU=2 URR, LRU=0
+/// scattering-radius-only, or LRF=1/2 with a competitive width).
 ///
 /// Those spans' resonances contribute no cross section, so any physics
 /// computed over them reflects only the evaluation's other ranges and its
@@ -261,8 +275,9 @@ fn warn_unevaluated_ranges(py: Python<'_>, data: &ResonanceData, origin: &str) -
     let spans: Vec<String> = skipped.iter().map(|r| r.skip_description()).collect();
     let msg = format!(
         "{origin}: {} of {} resonance range(s) are parsed but NOT evaluated: {}. \
-         Their resonances contribute no cross section; NEREIDS \
-         evaluates resolved LRF=1/2/3 ranges without a competitive width only.",
+         Their resonances contribute no cross section; NEREIDS evaluates \
+         resolved LRF=3 ranges, LRF=1/2 ranges without a competitive width \
+         and LRF=7 ranges in the Reich-Moore form (KRM=3).",
         skipped.len(),
         data.ranges.len(),
         spans.join("; ")
@@ -763,7 +778,9 @@ impl PyIkedaCarpenter {
 ///     data: ResonanceData for the isotope.
 ///
 /// Returns:
-///     Dictionary with 'total', 'elastic', 'capture', 'fission' arrays.
+///     Dictionary with 'total', 'elastic', 'capture', 'fission' and
+///     'reaction' arrays; 'reaction' holds particle reactions other than
+///     elastic scattering, capture and fission, such as inelastic scattering.
 ///
 /// Raises:
 ///     ValueError: If the grid contains NaN/∞, non-positive entries, or
@@ -788,19 +805,21 @@ fn cross_sections<'py>(
     // Release the GIL for the cross-section computation.
     // Use cross_sections_on_grid() which precomputes J-group data once,
     // rather than recomputing per energy point via cross_sections_at_energy().
-    let (total, elastic, capture, fission) = py.detach(move || {
+    let (total, elastic, capture, fission, reaction) = py.detach(move || {
         let results = nereids_physics::reich_moore::cross_sections_on_grid(&res_data, &e_owned);
         let mut total = Vec::with_capacity(results.len());
         let mut elastic = Vec::with_capacity(results.len());
         let mut capture = Vec::with_capacity(results.len());
         let mut fission = Vec::with_capacity(results.len());
+        let mut reaction = Vec::with_capacity(results.len());
         for xs in results {
             total.push(xs.total);
             elastic.push(xs.elastic);
             capture.push(xs.capture);
             fission.push(xs.fission);
+            reaction.push(xs.reaction);
         }
-        (total, elastic, capture, fission)
+        (total, elastic, capture, fission, reaction)
     });
 
     let dict = pyo3::types::PyDict::new(py);
@@ -808,6 +827,7 @@ fn cross_sections<'py>(
     dict.set_item("elastic", PyArray1::from_vec(py, elastic))?;
     dict.set_item("capture", PyArray1::from_vec(py, capture))?;
     dict.set_item("fission", PyArray1::from_vec(py, fission))?;
+    dict.set_item("reaction", PyArray1::from_vec(py, reaction))?;
     Ok(dict)
 }
 
@@ -974,6 +994,9 @@ fn energy_to_tof(energy_ev: f64, flight_path_m: f64) -> PyResult<f64> {
 /// Load ENDF resonance data for an isotope, downloading the evaluation on
 /// first use and caching it in the user's cache directory.
 ///
+/// Mixed evaluations load with a UserWarning naming the
+/// parsed-but-not-evaluated spans.
+///
 /// Args:
 ///     z: Atomic number (e.g. 92 for uranium).
 ///     a: Mass number (e.g. 238).
@@ -993,8 +1016,10 @@ fn energy_to_tof(energy_ev: f64, flight_path_m: f64) -> PyResult<f64> {
 ///     RuntimeError: the isotope is absent from the library (HTTP 404), or the
 ///         download is not a valid archive.
 ///     ValueError: an unknown library, an invalid isotope or MAT, a file for
-///         another isotope, or ENDF text that does not parse or has no
-///         evaluable resolved range.
+///         another isotope, or ENDF text that does not parse, uses an
+///         unsupported LRF=7 option, or has no evaluable resolved range:
+///         LRF=3, LRF=1/2 without a competitive width (LRX=0), or LRF=7 in
+///         the Reich-Moore form (KRM=3).
 #[pyfunction]
 #[pyo3(signature = (z, a, library="endf8.1", mat=None))]
 fn load_endf(
@@ -1032,11 +1057,21 @@ fn load_endf(
 
 /// Load ENDF resonance data from a local file.
 ///
+/// Mixed evaluations load with a UserWarning naming the
+/// parsed-but-not-evaluated spans.
+///
 /// Args:
 ///     path: Path to an ENDF-format file on disk.
 ///
 /// Returns:
 ///     ResonanceData parsed from the file.
+///
+/// Raises:
+///     OSError: the file cannot be read.
+///     ValueError: the ENDF text does not parse, uses an unsupported LRF=7
+///         option, or has no evaluable resolved range: LRF=3, LRF=1/2
+///         without a competitive width (LRX=0), or LRF=7 in the Reich-Moore
+///         form (KRM=3).
 #[pyfunction]
 fn load_endf_file(py: Python<'_>, path: &str) -> PyResult<PyResonanceData> {
     // Release the GIL for the file I/O and ENDF parsing.
@@ -1184,6 +1219,7 @@ fn create_resonance_data(
                 l_groups: groups,
                 ap_table: None,
                 r_external: vec![],
+                r_matrix_limited: None,
             }],
         }),
     })

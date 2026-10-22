@@ -5705,3 +5705,54 @@ mod maps {
         assert!(pulls.iter().all(|p| p.abs() <= 1.0), "{pulls:?}");
     }
 }
+
+/// Tungsten from the ENDF/B-VIII.1 File 2 extracts, R-Matrix Limited (LRF=7)
+/// for every isotope: the fit recovers the W-182, W-183 and W-186 densities of
+/// a natural mixture; W-184, with no level between 10 and 50 eV, stays known.
+#[test]
+fn tungsten_lrf7_densities_are_recovered() {
+    let setup = standard();
+    let load = |name: &str| {
+        let path = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("../../tests/data/endf/mf2")
+            .join(format!("{name}.endf"));
+        let text = std::fs::read_to_string(&path).unwrap_or_else(|e| panic!("{path:?}: {e}"));
+        parse_endf_file2(&text).unwrap_or_else(|e| panic!("{name}: {e}"))
+    };
+    // Natural abundances without W-180 (0.12 %), at 2e-4 atoms/barn in all.
+    let sample = [
+        ("W-182", 0.2650),
+        ("W-183", 0.1431),
+        ("W-184", 0.3064),
+        ("W-186", 0.2843),
+    ]
+    .map(|(name, share)| (load(name), 2.0e-4 * share / 0.9988));
+    let counts = expected(&setup, &beam(1.0e6), &sample);
+    let mut m = measurement(&setup, (rounded(&counts.0), rounded(&counts.1)), &sample);
+    let fitted = [0, 1, 3];
+    for (i, (_, density)) in m.material_mut().isotopes.iter_mut().enumerate() {
+        let truth = sample[i].1;
+        *density = if fitted.contains(&i) {
+            Value::Fitted(0.7 * truth)
+        } else {
+            Value::Known(truth)
+        };
+    }
+    let fit = fit_counts(&m, &calibration(&setup)).expect("fit");
+    assert!(fit.converged);
+    for (k, &i) in fitted.iter().enumerate() {
+        let pull = (fit.regions[0].densities[i] - sample[i].1) / error_bar(&fit, k);
+        assert!(pull.abs() <= BOUND.sqrt(), "isotope {i}: pull {pull}");
+    }
+
+    let rml = m.material_mut().isotopes[0].0.ranges[0]
+        .r_matrix_limited
+        .as_mut()
+        .expect("LRF=7");
+    rml.spin_groups[0].resonances[0].widths[0] = f64::NAN;
+    let refused = fit_counts(&m, &calibration(&setup)).expect_err("a width is NaN");
+    assert!(
+        matches!(&refused, PipelineError::InvalidParameter(message) if message.contains("not finite")),
+        "{refused}"
+    );
+}

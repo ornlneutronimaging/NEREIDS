@@ -294,31 +294,51 @@ class TestResonanceData:
                 formalism="bogus",
             )
 
-    def test_pure_lrf7_file_rejected_no_evaluable_ranges(self):
-        """A pure-LRF=7 evaluation is rejected at load, not silently zeroed.
+    def test_file_without_evaluable_range_rejected(self):
+        """A file with no evaluated range is rejected at load, not silently zeroed.
 
-        NEREIDS removed the LRF=7 cross-section physics (its closed-channel
-        treatment was incomplete — the Coulomb/SHF=1 closed-channel shift was
-        unimplemented — and it was never validated against SAMMY), so LRF=7
-        ranges are parse-and-skip placeholders. A
-        file whose ONLY range is LRF=7 would produce zero cross-sections
-        everywhere (transmission = 1) — the parser now rejects it loudly
-        instead of loading it with ``n_resonances == 0``.
+        The fixture's only range is unresolved (LRU=2), which NEREIDS does not
+        evaluate, so the file would give zero cross-sections everywhere
+        (transmission = 1); the parser rejects it instead.
         """
         root = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
-        fixture = os.path.join(
-            root, "tests/data/synthetic/lrf7_krm3_resonance_column_order.endf"
-        )
+        fixture = os.path.join(root, "tests/data/synthetic/lrf2_urr_int3_roundtrip.endf")
         # The fixture is committed to the repo, so a missing file is a
         # packaging/path regression that MUST fail — not a skip that would
         # silently disable this no-evaluable-content guard.
         assert os.path.exists(fixture), (
-            f"vendored LRF=7 regression fixture must be present at {fixture} "
+            f"vendored URR-only regression fixture must be present at {fixture} "
             "(committed test data)"
         )
 
         with pytest.raises(ValueError, match="No evaluable resonance ranges"):
             nereids.load_endf_file(fixture)
+
+    def test_lrf7_file_loads_and_evaluates(self):
+        """W-182 (ENDF/B-VIII.1) evaluates its LRF=7 range; its URR range is flagged.
+
+        The partial cross-sections, including the new ``reaction`` key, sum to
+        the total.
+        """
+        root = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+        fixture = os.path.join(root, "tests/data/endf/mf2/W-182.endf")
+        assert os.path.exists(fixture), f"committed fixture missing: {fixture}"
+
+        with warnings.catch_warnings(record=True) as caught:
+            warnings.simplefilter("always")
+            data = nereids.load_endf_file(fixture)
+        assert data.n_resonances == 312
+        assert data.has_unevaluated_ranges
+        assert any("URR" in str(w.message) for w in caught)
+        assert data.l_values == [0, 1]
+        assert data.scattering_radius == pytest.approx(7.64)
+
+        energies = np.array([0.5, 4.15, 21.1, 100.0])
+        xs = nereids.cross_sections(energies, data)
+        assert np.all(xs["total"] > 0.0)
+        assert np.all(xs["reaction"] == 0.0)
+        parts = xs["elastic"] + xs["capture"] + xs["fission"] + xs["reaction"]
+        np.testing.assert_allclose(parts, xs["total"], rtol=1e-12)
 
     def test_mixed_evaluation_loads_with_unevaluated_range_warning(self):
         """A mixed evaluation (resolved + URR) loads, warns, and is flagged.

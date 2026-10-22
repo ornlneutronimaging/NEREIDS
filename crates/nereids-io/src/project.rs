@@ -2706,6 +2706,7 @@ mod tests {
                     }],
                 }],
                 r_external: vec![],
+                r_matrix_limited: None,
             }],
         };
         snap.endf_cache = vec![("U-238".into(), rd)];
@@ -2746,6 +2747,7 @@ mod tests {
                 ap_table: None,
                 l_groups: vec![],
                 r_external: vec![],
+                r_matrix_limited: None,
             }],
         };
 
@@ -2798,6 +2800,7 @@ mod tests {
                     }],
                 }],
                 r_external: vec![],
+                r_matrix_limited: None,
             }],
         };
 

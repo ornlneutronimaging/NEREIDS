@@ -646,7 +646,8 @@ pub fn load_project_from_path(state: &mut AppState, path: &Path) {
 }
 
 /// Log a warning when parsed ENDF data carries parse-and-skip placeholder
-/// ranges (LRF=7 R-Matrix Limited, LRU=2 URR, or LRU=0 scattering-radius-only).
+/// ranges (LRU=2 URR, LRU=0 scattering-radius-only, or LRF=1/2 with a
+/// competitive width, LRX=1).
 ///
 /// Those spans contribute exactly zero cross-section, so any physics computed
 /// over them reflects only the evaluation's other ranges. Shared by the ENDF

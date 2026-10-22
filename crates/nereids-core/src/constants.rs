@@ -25,6 +25,9 @@ pub const HBAR_EV_S: f64 = 6.582_119_569e-16;
 /// Speed of light in m/s.
 pub const SPEED_OF_LIGHT: f64 = 2.997_924_58e8;
 
+/// Fine-structure constant α.
+pub const FINE_STRUCTURE: f64 = 7.297_352_569_3e-3;
+
 /// 1 eV in joules.
 pub const EV_TO_JOULES: f64 = 1.602_176_634e-19;
 

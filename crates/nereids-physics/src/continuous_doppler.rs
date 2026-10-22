@@ -445,23 +445,17 @@ impl TargetContext<'_, '_> {
             // starts, so the edges are panel boundaries.
             push_source_energy(range.energy_low);
             push_source_energy(range.energy_high);
-            for group in &range.l_groups {
-                for resonance in &group.resonances {
-                    let total_width = resonance.gn.abs()
-                        + resonance.gg.abs()
-                        + resonance.gfa.abs()
-                        + resonance.gfb.abs();
-                    // Skip resonances whose Lorentzian cannot reach the
-                    // window; their breakpoints would all be clipped anyway.
-                    if total_width <= 0.0
-                        || resonance.energy + 4.0 * total_width < low_energy
-                        || resonance.energy - 4.0 * total_width > high_energy
-                    {
-                        continue;
-                    }
-                    for multiplier in BREAKPOINT_WIDTHS {
-                        push_source_energy(resonance.energy + multiplier * total_width);
-                    }
+            for (energy, total_width) in range.levels() {
+                // Skip resonances whose Lorentzian cannot reach the
+                // window; their breakpoints would all be clipped anyway.
+                if total_width <= 0.0
+                    || energy + 4.0 * total_width < low_energy
+                    || energy - 4.0 * total_width > high_energy
+                {
+                    continue;
+                }
+                for multiplier in BREAKPOINT_WIDTHS {
+                    push_source_energy(energy + multiplier * total_width);
                 }
             }
             for &(knot_energy, _) in range.ap_table.iter().flat_map(|table| &table.points) {

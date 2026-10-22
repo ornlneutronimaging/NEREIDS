@@ -1,7 +1,10 @@
 use nereids_core::constants::BOLTZMANN_EV_PER_K;
 use nereids_core::types::Isotope;
 use nereids_endf::resonance::test_support::synthetic_isotope;
-use nereids_endf::resonance::{ResonanceData, SmoothCrossSections, Tab1};
+use nereids_endf::resonance::{
+    ParticlePair, ResonanceData, ResonanceFormalism, ResonanceRange, RmlChannel, RmlRange,
+    RmlResonance, RmlSpinGroup, SmoothCrossSections, Tab1,
+};
 use nereids_endf::sammy::{parse_sammy_inp, parse_sammy_par, sammy_to_resonance_data};
 use nereids_physics::continuous_doppler::Channel;
 use nereids_physics::lattice_doppler::{LatticeError, PhononSpectrum, broaden_in_lattice};
@@ -396,4 +399,69 @@ fn a_file_3_peak_narrower_than_the_phonon_step_is_broadened_with_its_area() {
         .sum();
     let expected = height * half_width;
     assert!((area / expected - 1.0).abs() <= 1e-3, "{area} {expected}");
+}
+
+/// A level narrower than the phonon step, written as LRF=3 and as LRF=7,
+/// broadens the same: the lattice step resolves the narrowest level of both forms.
+#[test]
+fn a_narrow_lrf7_level_broadens_as_its_lrf3_form() {
+    let (e0, gn, gg, radius) = (20.0, 1e-4, 1e-4, 6.0);
+    let lrf3 = synthetic_isotope(73, 181, e0, gn, gg);
+    let awr = lrf3.awr;
+    let pair = |mass_a: f64, mass_b: f64, spin_a: f64, mt: u32| ParticlePair {
+        mass_a,
+        mass_b,
+        charge_a: 0.0,
+        charge_b: 73.0,
+        spin_a,
+        spin_b: 0.0,
+        q_value: 0.0,
+        mt,
+        penetrability: mt == 2,
+        shift: false,
+    };
+    let channel = |pair: usize, radius: f64| RmlChannel {
+        pair,
+        l: 0,
+        channel_spin: 0.5,
+        boundary: 0.0,
+        radius_phase: radius,
+        radius_true: radius,
+    };
+    let rml = RmlRange {
+        pairs: vec![pair(0.0, awr + 1.0, 1.0, 102), pair(1.0, awr, 0.5, 2)],
+        incident_pair: 1,
+        photon_pair: 0,
+        spin_groups: vec![RmlSpinGroup {
+            j: 0.5,
+            parity: 1,
+            channels: vec![channel(0, 0.0), channel(1, radius)],
+            resonances: vec![RmlResonance {
+                energy: e0,
+                widths: vec![gg, gn],
+            }],
+            background: vec![],
+        }],
+    };
+    let lrf7 = ResonanceData {
+        ranges: vec![ResonanceRange {
+            formalism: ResonanceFormalism::RMatrixLimited,
+            scattering_radius: 0.0,
+            naps: 0,
+            l_groups: vec![],
+            r_external: vec![],
+            r_matrix_limited: Some(rml),
+            ..lrf3.ranges[0].clone()
+        }],
+        ..lrf3.clone()
+    };
+    let energies = [19.8, 19.95, 20.0, 20.05, 20.2];
+    let broaden = |data: &ResonanceData| {
+        broaden_in_lattice(&energies, data, KELVIN, &spectrum(), Channel::Capture)
+            .expect("broadened")
+            .values
+    };
+    for (a, b) in broaden(&lrf3).iter().zip(broaden(&lrf7)) {
+        assert!((a - b).abs() <= 1e-9 * a, "{a} {b}");
+    }
 }

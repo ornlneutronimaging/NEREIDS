@@ -48,6 +48,39 @@ const ENDF_RADIUS_TO_FM: f64 = 10.0;
 /// # Returns
 /// `ResonanceData` containing all parsed resonance parameters.
 pub fn parse_endf_file2(endf_text: &str) -> Result<ResonanceData, EndfParseError> {
+    let data = parse_file2_records(endf_text)?;
+
+    // Fail loudly when the evaluation carries NO evaluable content. A file
+    // whose every range is a parse-and-skip placeholder (LRU=2, or an
+    // LRU=0 scattering-radius-only stanza) would otherwise "load" with zero
+    // resonances and add no resonance cross section anywhere, with no signal
+    // to the caller. Files with at least one evaluable range still load:
+    // parse-and-skip exists for real mixed tapes
+    // (e.g. Ta-181, U-238, Pu-240) whose resolved ranges remain fully usable.
+    if !data.has_evaluable_range() {
+        let detail = if data.ranges.is_empty() {
+            "the file carries no resonance-parameter ranges at all".to_string()
+        } else {
+            let skipped: Vec<String> = data.ranges.iter().map(|r| r.skip_description()).collect();
+            format!(
+                "every range in this file is a parse-and-skip placeholder: {}",
+                skipped.join("; ")
+            )
+        };
+        return Err(EndfParseError::UnsupportedFormat(format!(
+            "No evaluable resonance ranges: NEREIDS evaluates resolved LRF=3 \
+             (Reich-Moore) ranges, LRF=1/2 (SLBW/MLBW) ranges without a competitive \
+             width (LRX=0), and LRF=7 (R-Matrix Limited) ranges in the Reich-Moore \
+             form (KRM=3); {detail}. No resonance would contribute a cross section \
+             anywhere on the energy grid."
+        )));
+    }
+
+    Ok(data)
+}
+
+/// Parse File 2 (and File 3) records without the evaluable-range check.
+fn parse_file2_records(endf_text: &str) -> Result<ResonanceData, EndfParseError> {
     let lines = section_151(endf_text, "2");
 
     if lines.is_empty() {
@@ -128,9 +161,9 @@ pub fn parse_endf_file2(endf_text: &str) -> Result<ResonanceData, EndfParseError
                 let nro_urr = range_cont.n1; // energy-dependent scattering radius flag
                 let naps_urr = range_cont.n2; // scattering radius calculation flag
                 // A TAB1 AP(E) record precedes the URR body when NRO != 0.
-                // Store it (converted to fm) on the placeholder, mirroring the
-                // LRF=7 skip: the placeholder preserves everything the header
-                // carries even though the range is never evaluated.
+                // Store it (converted to fm) on the placeholder: the placeholder
+                // preserves everything the header carries even though the range
+                // is never evaluated.
                 let ap_table_urr = if nro_urr != 0 {
                     let mut tab = parse_tab1(&lines, &mut pos)?;
                     for pt in &mut tab.points {
@@ -172,6 +205,7 @@ pub fn parse_endf_file2(endf_text: &str) -> Result<ResonanceData, EndfParseError
                     ap_table: ap_table_urr,
                     l_groups: Vec::new(),
                     r_external: vec![],
+                    r_matrix_limited: None,
                 });
                 continue;
             }
@@ -243,6 +277,7 @@ pub fn parse_endf_file2(endf_text: &str) -> Result<ResonanceData, EndfParseError
                     ap_table: ap_table_lru0,
                     l_groups: Vec::new(),
                     r_external: vec![],
+                    r_matrix_limited: None,
                 });
                 continue;
             }
@@ -303,7 +338,7 @@ pub fn parse_endf_file2(endf_text: &str) -> Result<ResonanceData, EndfParseError
                     parse_bw_range(&mut ctx, formalism)?
                 }
                 ResonanceFormalism::ReichMoore => parse_reich_moore_range(&mut ctx)?,
-                ResonanceFormalism::RMatrixLimited => skip_rmatrix_limited_range(&mut ctx)?,
+                ResonanceFormalism::RMatrixLimited => parse_rmatrix_limited_range(&mut ctx)?,
                 ResonanceFormalism::Unresolved => {
                     // Unreachable: Unresolved is only assigned in the LRU=2 branch above.
                     unreachable!("Unresolved formalism should not appear in LRU=1 dispatch");
@@ -342,39 +377,13 @@ pub fn parse_endf_file2(endf_text: &str) -> Result<ResonanceData, EndfParseError
                 .into(),
         ));
     }
-    let data = ResonanceData {
+    Ok(ResonanceData {
         isotope,
         za,
         awr,
         smooth: parse_file3(endf_text, mat)?,
         ranges: all_ranges,
-    };
-
-    // Fail loudly when the evaluation carries NO evaluable content. A file
-    // whose every range is a parse-and-skip placeholder (LRF=7, LRU=2, or an
-    // LRU=0 scattering-radius-only stanza) would otherwise "load" with zero
-    // resonances and add no resonance cross section anywhere, with no signal
-    // to the caller. Files with at least one evaluable range still load:
-    // parse-and-skip exists for real mixed tapes
-    // (e.g. Ta-181, U-238, Pu-240) whose resolved ranges remain fully usable.
-    if !data.has_evaluable_range() {
-        let detail = if data.ranges.is_empty() {
-            "the file carries no resonance-parameter ranges at all".to_string()
-        } else {
-            let skipped: Vec<String> = data.ranges.iter().map(|r| r.skip_description()).collect();
-            format!(
-                "every range in this file is a parse-and-skip placeholder: {}",
-                skipped.join("; ")
-            )
-        };
-        return Err(EndfParseError::UnsupportedFormat(format!(
-            "No evaluable resonance ranges: NEREIDS evaluates resolved LRF=1/2/3 \
-             (SLBW/MLBW/Reich-Moore) only, and {detail}. No resonance would \
-             contribute a cross section anywhere on the energy grid."
-        )));
-    }
-
-    Ok(data)
+    })
 }
 
 fn section_151<'a>(endf_text: &'a str, mf: &str) -> Vec<&'a str> {
@@ -720,6 +729,7 @@ fn parse_bw_range(
         ap_table: ctx.ap_table.take(),
         l_groups,
         r_external: vec![],
+        r_matrix_limited: None,
     })
 }
 
@@ -832,299 +842,104 @@ fn parse_reich_moore_range(
         ap_table: ctx.ap_table.take(),
         l_groups,
         r_external: vec![],
+        r_matrix_limited: None,
     })
 }
 
-/// Consume (skip) an R-Matrix Limited (LRF=7) resolved resonance range,
-/// advancing the line cursor past the particle-pair, channel, and resonance
-/// LIST records so any following range/material stays aligned.
+/// Parse an R-Matrix Limited (LRF=7) resolved range in the Reich-Moore form.
 ///
-/// (its closed-channel treatment was incomplete: the Coulomb/SHF=1 closed-channel
-/// shift was unimplemented, and the evaluator was never validated against SAMMY)
-/// — so the parameters are discarded and the range is tagged
-/// `ResonanceFormalism::RMatrixLimited` (non-evaluable → Skip).
+/// Accepts KRM=3 with widths in eV (IFG=0), KRL=0, hard-sphere phase shifts
+/// (KPS=0), constant AP (NRO=0), and background R-functions with LBK=0 or 2.
 ///
-/// Record advancement and every guard of the removed evaluator are preserved
-/// verbatim, for two distinct reasons. Structural guards (KRM — it sets the
-/// NCH+1 vs NCH+2 row stride — and the NCH, IPP-range, NRS/NX/NPL checks)
-/// reject records that would otherwise misalign the stream. The quantum-flag
-/// guards (IFG/KRL, the PNT/mass particle-pair guards, KBK/KPS) do NOT
-/// affect the byte layout; they are retained as deliberate strictness parity
-/// with the removed evaluator — a file carrying flags the evaluator never
-/// supported is rejected rather than silently consumed.
-/// Only the RmlData/ParticlePair/RmlChannel/RmlResonance/SpinGroup construction
-/// is gone.
+/// # Errors
+/// Returns [`EndfParseError::UnsupportedFormat`] for a flag outside that set, a
+/// fission pair, a shift factor on a channel that closes inside the range, and
+/// any record whose counts or values are inconsistent.
 ///
-/// Reference: ENDF-6 Formats Manual §2.2.1.6; SAMMY rml/mrml01.f
-fn skip_rmatrix_limited_range(
+/// # References
+/// ENDF-6 Formats Manual, ENDF-102 (2023), §2.2.1.6 and Appendix D.1.7.
+fn parse_rmatrix_limited_range(
     ctx: &mut RangeParseContext<'_>,
 ) -> Result<ResonanceRange, EndfParseError> {
-    // CONT: [SPI, AP, IFG, KRM, NJS, KRL]
-    // ENDF AP is in 10⁻¹² cm; convert to fm (×10).
+    if ctx.ap_table.is_some() {
+        return Err(rml_error(
+            "NRO=1 (energy-dependent AP) is not supported; LRF=7 gives radii per channel",
+        ));
+    }
+
+    // CONT: [SPI, AP, IFG, KRM, NJS, KRL]; AP in 10⁻¹² cm.
     let cont = parse_cont(ctx.lines, ctx.pos)?;
     let target_spin = cont.c1;
     let scattering_radius = cont.c2 * ENDF_RADIUS_TO_FM;
-    // IFG (L1): GAM representation flag (ENDF-6 §2.2.1.6). IFG=0 means channel
-    // widths GAM are given in eV; IFG=1 means reduced-width amplitudes (√eV).
-    // Only IFG=0 is supported; SAMMY's ENDF reader makes the same distinction.
-    let ifg = cont.l1;
-    if ifg != 0 {
-        return Err(EndfParseError::UnsupportedFormat(format!(
-            "LRF=7 IFG={ifg} (reduced-width amplitudes) is not supported (only \
-             IFG=0, channel widths in eV)"
+    if cont.l1 != 0 {
+        return Err(rml_error(format!(
+            "IFG={} (reduced-width amplitudes) is not supported; only IFG=0 (widths in eV)",
+            cont.l1
         )));
     }
-    let krm = cont.l2 as u32; // R-matrix type: 2=standard, 3=Reich-Moore approx
-    // KRM=0/1/4 are defined in the ENDF spec but not supported here.
-    if krm != 2 && krm != 3 {
-        return Err(EndfParseError::UnsupportedFormat(format!(
-            "LRF=7 KRM={krm} is not supported (only KRM=2 and KRM=3)"
+    if cont.l2 != 3 {
+        return Err(rml_error(format!(
+            "KRM={} is not supported; only KRM=3 (Reich-Moore) is evaluated",
+            cont.l2
         )));
     }
-    let njs = checked_count(cont.n1, "NJS")?; // number of spin groups
-    // KRL (N2): kinematics flag. KRL=0 (non-relativistic) is universal;
-    // KRL=1 (relativistic) is not supported. SAMMY always writes 0.
-    let krl = cont.n2;
-    if krl != 0 {
-        return Err(EndfParseError::UnsupportedFormat(format!(
-            "LRF=7 KRL={krl} (relativistic kinematics) is not supported (only KRL=0)"
+    let njs = checked_count(cont.n1, "NJS")?;
+    if cont.n2 != 0 {
+        return Err(rml_error(format!(
+            "KRL={} (relativistic kinematics) is not supported; only KRL=0",
+            cont.n2
         )));
     }
 
-    // LIST: [0, 0, NPP, 0, 12*NPP, NPP]  — particle pair definitions.
-    // NPP is authoritative in L1. Reference: ENDF-6 §2.2.1.6 Table 2.1.
-    let pp_cont = parse_cont(ctx.lines, ctx.pos)?;
-    let npp = checked_count(pp_cont.l1, "NPP")?;
-    let pp_values = parse_list_values(ctx.lines, ctx.pos, npp * 12)?;
+    // LIST: [0, 0, NPP, 0, 12*NPP, 2*NPP] with 12 values per pair.
+    let pair_head = parse_cont(ctx.lines, ctx.pos)?;
+    let npp = checked_count(pair_head.l1, "NPP")?;
+    let npl = checked_count(pair_head.n1, "NPL")?;
+    if npl != 12 * npp {
+        return Err(rml_error(format!(
+            "particle-pair LIST: NPL={npl} != 12*NPP={}",
+            12 * npp
+        )));
+    }
+    let pair_values = parse_list_values(ctx.lines, ctx.pos, npl)?;
+    let pairs = pair_values
+        .chunks_exact(12)
+        .enumerate()
+        .map(|(i, values)| parse_particle_pair(i + 1, values))
+        .collect::<Result<Vec<_>, _>>()?;
 
-    // Validate-and-narrow an ENDF integer-coded particle-pair flag (PNT/SHF).
-    // A fractional or non-finite f64 is a malformed record and must not be
-    // silently truncated/saturated (PNT=1.7→1, PNT=NaN→0 would bypass the {0,1}
-    // check below).
-    fn pp_int_flag(value: f64, field: &str, idx: usize) -> Result<i32, EndfParseError> {
-        if !value.is_finite() || value.fract() != 0.0 {
-            return Err(EndfParseError::UnsupportedFormat(format!(
-                "LRF=7 particle pair {idx}: {field}={value} is not a finite integer"
+    let photon_pair = sole_index(&pairs, |p| p.mass_a == 0.0 && p.mt == 102).ok_or_else(|| {
+        rml_error("KRM=3 needs exactly one photon pair (MA=0, MT=102) for the eliminated channel")
+    })?;
+    let incident_pair = sole_index(&pairs, |p| p.mt == 2)
+        .ok_or_else(|| rml_error("exactly one particle pair must have MT=2 (neutron + target)"))?;
+    let incident = &pairs[incident_pair];
+    if incident.mass_a != 1.0 || incident.charge_a != 0.0 || incident.q_value != 0.0 {
+        return Err(rml_error(format!(
+            "the MT=2 pair must be a neutron with Q=0 (MA={}, ZA={}, Q={})",
+            incident.mass_a, incident.charge_a, incident.q_value
+        )));
+    }
+    for (i, pair) in pairs.iter().enumerate() {
+        let threshold = pair.threshold(incident);
+        if pair.shift && threshold > ctx.energy_low {
+            return Err(rml_error(format!(
+                "particle pair {}: SHF=1 on a channel with threshold {threshold:.6e} eV inside \
+                 the range is not supported (closed-channel shift factor)",
+                i + 1
             )));
         }
-        Ok(value as i32)
     }
 
-    // Particle-pair validation. Values are discarded (the pair defs are not
-    // stored), but every quantum-flag guard is applied so malformed records are
-    // rejected exactly as before.
-    for i in 0..npp {
-        let b = i * 12;
-        let ma = pp_values[b];
-        let mb = pp_values[b + 1];
-        let pnt = pp_int_flag(pp_values[b + 7], "PNT", i)?;
-        // SHF is validated-and-narrowed (must be 0 or 1) but otherwise unused
-        // in the skip path — see the Coulomb note below.
-        pp_int_flag(pp_values[b + 8], "SHF", i)?;
-        // PNT (Lpent) must be 0 or 1 (SAMMY rml/mrml03.f:22 Check_Quantum rejects
-        // Lpent ∉ {0,1}; PNT=2 "ASSIGN" is unimplemented).
-        if pnt != 0 && pnt != 1 {
-            return Err(EndfParseError::UnsupportedFormat(format!(
-                "LRF=7 particle pair {i}: PNT={pnt} is not supported (only PNT=0 \
-                 and PNT=1; SAMMY rejects Lpent outside {{0,1}})"
-            )));
-        }
-        // A massless pair (photon/eliminated channel, MA=0) must carry PNT=0.
-        if ma < 0.5 && pnt != 0 {
-            return Err(EndfParseError::UnsupportedFormat(format!(
-                "LRF=7 particle pair {i}: massless pair (MA={ma}) with PNT={pnt} is \
-                 invalid; a photon/eliminated channel must have PNT=0"
-            )));
-        }
-        // PNT=1 requires finite positive masses yielding a finite reduced mass
-        // μ = MA·MB/(MA+MB) (computed exactly as the physics did); catches
-        // overflow of MA·MB to ∞ and the MA+MB=0 / sign cases.
-        if pnt == 1 {
-            let reduced_mass = ma * mb / (ma + mb);
-            if !(ma.is_finite()
-                && mb.is_finite()
-                && ma > 0.0
-                && mb > 0.0
-                && reduced_mass.is_finite()
-                && reduced_mass > 0.0)
-            {
-                return Err(EndfParseError::UnsupportedFormat(format!(
-                    "LRF=7 particle pair {i}: PNT=1 requires finite positive masses \
-                     yielding a finite reduced mass (MA={ma}, MB={mb})"
-                )));
-            }
-        }
-        // Coulomb + SHF=1 is valid ENDF and SAMMY accepts it (mrml03.f rejects
-        // only SHF outside {0,1}; mrml07.f passes Ishift into the open-channel
-        // Coulomb calculation). The removed evaluator could not compute the
-        // closed-channel Coulomb shift and rejected the combination; with the
-        // parameters now discarded there is nothing to protect, and rejecting
-        // would fail a whole mixed file over a range that is skipped anyway.
-        // SHF is still validated-and-narrowed above (pp_int_flag), so a
-        // malformed flag remains a hard error.
-    }
-
-    for _ in 0..njs {
-        // LIST: [AJ, PJ, KBK, KPS, 6*(NCH+1), NCH+1]
-        let sg_cont = parse_cont(ctx.lines, ctx.pos)?;
-        let kbk = sg_cont.l1; // background R-matrix flag
-        let kps = sg_cont.l2; // phase shift flag
-
-        // KBK: background R-matrix correction (R-external function on a
-        // subset of channels). Per the printed ENDF-6 §2.2.1.6 Tables 2.4/2.5
-        // KBK is described as a nonzero flag with NCH background records,
-        // while the reference reader OpenScale
-        // (external/openScale/repo/packages/ScaleUtils/EndfLib/endf/File2.cpp:444-524)
-        // treats KBK as a sparse record count, with each subrecord's L1 holding
-        // the 1-based channel index and L2 holding the LBK formalism flag
-        // (LBK ∈ {0=no payload, 1=two TAB1, 2=LIST(5), 3=LIST(3)}). The two
-        // conventions disagree on (a) the loop bound, (b) the per-subrecord
-        // control-field positions, and (c) the payload shape per LBK value.
-        //
-        // No ENDF/B-VIII.0 evaluation in the local cache has nonzero KBK or
-        // KPS to disambiguate, and the only nonzero example located on disk
-        // is OpenScale's synthetic F-19 R-external test fixture
-        // (Ampx/TestRunner/test/data/polident/f19_rext.endf), which follows
-        // the OpenScale convention. NEREIDS's previous layout matched neither
-        // convention. Until a policy decision is made (strict-manual vs.
-        // OpenScale-compat) and a real ENDF/B-VIII.0 evaluation with R-external
-        // is available to validate against, reject nonzero KBK explicitly so
-        // the parser cannot silently misalign the stream past this spin group.
-        //
-        // The reject runs immediately after reading the spin-group CONT —
-        // before parsing the (potentially large) channel and resonance LISTs —
-        // so that unsupported files fail fast without wasting allocation and
-        // parsing work on records that will be discarded.
-        if kbk != 0 {
-            let nch_plus_one_raw = sg_cont.n2;
-            return Err(EndfParseError::UnsupportedFormat(format!(
-                "LRF=7 KBK={kbk} != 0 (R-external background) for spin group with \
-                 NCH+1={nch_plus_one_raw}: \
-                 the ENDF-6 manual vs. OpenScale layout dispute is unresolved and NEREIDS \
-                 does not yet parse nonzero KBK. Use the SAMMY .par/.inp converter \
-                 (sammy_to_resonance_data_multi) if R-external is required."
-            )));
-        }
-
-        // KPS: tabulated penetrability/phase-shift override per channel.
-        // Same documentation-vs-implementation dispute as KBK above
-        // (OpenScale File2.cpp:439-441 throws "kps > 0 for lrf=7 not yet
-        // supported" and never reads the subrecords). NEREIDS rejects nonzero
-        // KPS for the same reason: no validated reference layout, no real
-        // evaluation to test against.
-        if kps != 0 {
-            let nch_plus_one_raw = sg_cont.n2;
-            return Err(EndfParseError::UnsupportedFormat(format!(
-                "LRF=7 KPS={kps} != 0 (tabulated penetrability/phase-shift override) \
-                 for spin group with NCH+1={nch_plus_one_raw}: \
-                 NEREIDS does not yet parse nonzero KPS. \
-                 OpenScale itself rejects this case (\"kps > 0 for lrf=7 not yet supported\")."
-            )));
-        }
-
-        let npl = checked_count(sg_cont.n1, "NPL")?; // 6*(NCH+1)
-        let nch_plus_one = checked_count(sg_cont.n2, "NCH+1")?; // NCH+1
-
-        // NCH+1 <= 1 would imply zero physical channels (NCH = 0), which is
-        // meaningless for a resonance range — every spin group must have at
-        // least one channel. Reference: ENDF-6 §2.2.1.6; SAMMY rml/mrml01.f.
-        if nch_plus_one <= 1 {
-            return Err(EndfParseError::UnsupportedFormat(format!(
-                "RML spin-group LIST: NCH+1 must be >= 2, got NCH+1={nch_plus_one}"
-            )));
-        }
-        let nch = nch_plus_one - 1;
-
-        let sg_values = parse_list_values(ctx.lines, ctx.pos, npl)?;
-
-        // The LIST must carry at least 6*(NCH+1) values: the first row is the
-        // eliminated capture (gamma) channel — SAMMY reads all NCH+1 rows as
-        // channels, the first being the eliminated one — followed by the NCH
-        // particle channels.
-        // Reference: ENDF-6 §2.2.1.6 Table 2.3; SAMMY rml/mrml01.f lines
-        // 104-107, 381; ndf/WriteRrEndf.cpp:1033.
-        let expected_npl = 6 * (nch + 1);
-        if npl < expected_npl {
-            return Err(EndfParseError::UnsupportedFormat(format!(
-                "LRF=7 spin-group LIST: NPL={npl} < 6*(NCH+1)={expected_npl}"
-            )));
-        }
-
-        // Validate each particle channel's IPP (1-based particle-pair index)
-        // is in range; the channel definitions [IPP, L, SCH, BND, APE, APT]
-        // are otherwise discarded (LRF=7 is not evaluated). The first 6-value
-        // row is the eliminated capture channel, which carries no particle
-        // pair and is exempt from the IPP check.
-        // Reference: ENDF-6 §2.2.1.6; SAMMY rml/mrml01.f (Ippx test).
-        for c in 0..nch {
-            let b = 6 + c * 6; // skip the eliminated-capture-channel row
-            let ipp_raw = sg_values[b] as usize;
-            if ipp_raw == 0 || ipp_raw > npp {
-                return Err(EndfParseError::UnsupportedFormat(format!(
-                    "LRF=7 spin-group channel IPP={ipp_raw} is out of range 1..={npp}"
-                )));
-            }
-        }
-
-        // LIST: [0, 0, 0, NRS, 6*NX, NX]  — resonance parameters.
-        //
-        // ENDF-6 §2.2.1.6 fixes the control fields as [0, 0, 0, L2=NRS, N1=6*NX,
-        // N2=NX]: NRS (resonance count) is in L2; NX (packed 6-float row count =
-        // NRS·ceil(stride/6), stride NCH+1 for KRM=2 / NCH+2 for KRM=3) is in N2;
-        // N1 = 6*NX. For wide spin groups (e.g. F-19, NCH≥5) NX > NRS, so NRS
-        // MUST be read from L2 and NX from N2 — mixing them mis-sizes the block.
-        // SAMMY mrml01.f:413-415; OpenScale File2.cpp:415,686-697.
-        let res_cont = parse_cont(ctx.lines, ctx.pos)?;
-        let nrs = checked_count(res_cont.l2, "NRS")?;
-        let nx = checked_count(res_cont.n2, "NX")?;
-        let res_npl = checked_count(res_cont.n1, "NPL")?;
-        if res_npl != 6 * nx {
-            return Err(EndfParseError::UnsupportedFormat(format!(
-                "LRF=7 resonance LIST: N1 ({res_npl}) != 6 * N2 ({}); ENDF-6 §2.2.1.6 \
-                 requires NPL = 6*NX for the packed-row layout",
-                6 * nx
-            )));
-        }
-        // The per-resonance row count is constant within a spin group, so NX is
-        // always an integer multiple of NRS; a non-multiple would yield a
-        // fractional stride and mis-align resonance reads.
-        if nrs > 0 && nx % nrs != 0 {
-            return Err(EndfParseError::UnsupportedFormat(format!(
-                "LRF=7 resonance LIST: N2/NX ({nx}) is not a multiple of L2/NRS ({nrs}); \
-                 ENDF-6 §2.2.1.6 requires NX = NRS * ceil(stride/6) where stride is \
-                 NCH+1 for KRM=2 and NCH+2 for KRM=3"
-            )));
-        }
-        // Canonical empty spin group (ENDF-6 §2.2.1.6 + OpenScale File2.cpp:
-        // 683-697): NRS=0 carries a single zero-filler row, so NX must be 1.
-        if nrs == 0 && nx != 1 {
-            return Err(EndfParseError::UnsupportedFormat(format!(
-                "LRF=7 resonance LIST: NRS=0 requires NX=1 (single zero-filler row \
-                 per ENDF-6 §2.2.1.6 + OpenScale File2.cpp:683-697); got NX={nx}"
-            )));
-        }
-        // Consume the resonance block, then validate the KRM-dependent stride so
-        // a malformed row layout is rejected rather than silently accepted.
-        // KRM=2 per-resonance row = [ER, γ_1..γ_NCH, pad] → stride ≥ NCH+1;
-        // KRM=3 = [ER, Γγ, Γ_1..Γ_NCH, pad] → stride ≥ NCH+2.
-        // Reference: ENDF-6 §2.2.1.6; SAMMY rml/mrml01.f ENDF123.
-        parse_list_values(ctx.lines, ctx.pos, res_npl)?;
-        if nrs > 0 {
-            let min_stride = if krm == 3 { nch + 2 } else { nch + 1 };
-            if res_npl % nrs != 0 {
-                return Err(EndfParseError::UnsupportedFormat(format!(
-                    "LRF=7 resonance block NPL={res_npl} is not divisible by NRS={nrs}"
-                )));
-            }
-            let s = res_npl / nrs;
-            if s < min_stride {
-                return Err(EndfParseError::UnsupportedFormat(format!(
-                    "LRF=7 resonance stride={s} < {}={min_stride} \
-                     (KRM={krm}, NPL={res_npl}, NRS={nrs})",
-                    if krm == 3 { "NCH+2" } else { "NCH+1" }
-                )));
-            }
-        }
+    let mut spin_groups = Vec::with_capacity(njs);
+    for group in 1..=njs {
+        spin_groups.push(parse_rml_spin_group(
+            ctx,
+            group,
+            &pairs,
+            photon_pair,
+            incident_pair,
+        )?);
     }
 
     Ok(ResonanceRange {
@@ -1135,9 +950,344 @@ fn skip_rmatrix_limited_range(
         target_spin,
         scattering_radius,
         naps: ctx.naps,
-        ap_table: ctx.ap_table.take(),
+        ap_table: None,
         l_groups: Vec::new(),
         r_external: vec![],
+        r_matrix_limited: Some(RmlRange {
+            pairs,
+            incident_pair,
+            photon_pair,
+            spin_groups,
+        }),
+    })
+}
+
+/// Error for an LRF=7 record NEREIDS does not accept.
+fn rml_error(message: impl std::fmt::Display) -> EndfParseError {
+    EndfParseError::UnsupportedFormat(format!("LRF=7 {message}"))
+}
+
+/// Index of the only item matching `predicate`, or `None` for zero or several.
+fn sole_index<T>(items: &[T], predicate: impl Fn(&T) -> bool) -> Option<usize> {
+    let mut found = None;
+    for (i, item) in items.iter().enumerate() {
+        if predicate(item) {
+            if found.is_some() {
+                return None;
+            }
+            found = Some(i);
+        }
+    }
+    found
+}
+
+/// Read an integer stored in an ENDF float field; fractions and non-finite values fail.
+fn rml_integer(value: f64, field: &str, location: &str) -> Result<i64, EndfParseError> {
+    if !value.is_finite() || value.fract() != 0.0 || value.abs() > f64::from(MAX_ENDF_COUNT) {
+        return Err(rml_error(format!(
+            "{location}: {field}={value} is not an integer"
+        )));
+    }
+    Ok(value as i64)
+}
+
+/// Parse one 12-value particle-pair entry, `number` counting from 1.
+///
+/// PNT=0 takes the ENDF-6 default: no penetrability for MT=102 and MT=19,
+/// penetrability for every other MT.
+fn parse_particle_pair(number: usize, values: &[f64]) -> Result<ParticlePair, EndfParseError> {
+    let location = format!("particle pair {number}");
+    let &[ma, mb, za, zb, ia, ib, q, pnt, shf, mt, _pa, _pb] = values else {
+        return Err(rml_error(format!("{location}: expected 12 values")));
+    };
+    for (field, value) in [
+        ("MA", ma),
+        ("MB", mb),
+        ("ZA", za),
+        ("ZB", zb),
+        ("IA", ia),
+        ("IB", ib),
+        ("Q", q),
+    ] {
+        if !value.is_finite() {
+            return Err(rml_error(format!(
+                "{location}: {field}={value} is not finite"
+            )));
+        }
+    }
+    let pnt = rml_integer(pnt, "PNT", &location)?;
+    let shf = rml_integer(shf, "SHF", &location)?;
+    let mt = rml_integer(mt, "MT", &location)?;
+    if mt <= 0 {
+        return Err(rml_error(format!(
+            "{location}: MT={mt} is not a reaction type"
+        )));
+    }
+    let mt = mt as u32;
+    let penetrability = match pnt {
+        1 => true,
+        -1 => false,
+        0 => !(mt == 102 || mt == 19),
+        _ => {
+            return Err(rml_error(format!(
+                "{location}: PNT={pnt} is not defined (ENDF-6 allows -1, 0 and 1)"
+            )));
+        }
+    };
+    let shift = match shf {
+        0 => false,
+        1 => true,
+        _ => {
+            return Err(rml_error(format!(
+                "{location}: SHF={shf} is not defined (ENDF-6 allows 0 and 1)"
+            )));
+        }
+    };
+    if ma == 0.0 && penetrability {
+        return Err(rml_error(format!(
+            "{location}: a photon pair (MA=0) cannot calculate the penetrability (PNT={pnt}, MT={mt})"
+        )));
+    }
+    if shift && !penetrability {
+        return Err(rml_error(format!(
+            "{location}: SHF=1 needs the penetrability calculated (PNT={pnt}, MT={mt})"
+        )));
+    }
+    if penetrability {
+        let reduced_mass = ma * mb / (ma + mb);
+        if !(ma > 0.0 && mb > 0.0 && reduced_mass.is_finite() && reduced_mass > 0.0) {
+            return Err(rml_error(format!(
+                "{location}: a penetrating pair needs positive masses (MA={ma}, MB={mb})"
+            )));
+        }
+    }
+    if matches!(mt, 18..=21 | 38) {
+        return Err(rml_error(format!(
+            "{location}: fission pair (MT={mt}) is not supported"
+        )));
+    }
+    Ok(ParticlePair {
+        mass_a: ma,
+        mass_b: mb,
+        charge_a: za,
+        charge_b: zb,
+        spin_a: ia,
+        spin_b: ib,
+        q_value: q,
+        mt,
+        penetrability,
+        shift,
+    })
+}
+
+/// Parse one spin group: channel LIST, resonance LIST and KBK background records.
+fn parse_rml_spin_group(
+    ctx: &mut RangeParseContext<'_>,
+    group: usize,
+    pairs: &[ParticlePair],
+    photon_pair: usize,
+    incident_pair: usize,
+) -> Result<RmlSpinGroup, EndfParseError> {
+    let location = format!("spin group {group}");
+
+    // LIST: [AJ, PJ, KBK, KPS, 6*NCH, NCH] with 6 values per channel.
+    let head = parse_cont(ctx.lines, ctx.pos)?;
+    let (aj, pj) = (head.c1, head.c2);
+    if head.l2 != 0 {
+        return Err(rml_error(format!(
+            "{location}: KPS={} (tabulated phase shifts) is not supported",
+            head.l2
+        )));
+    }
+    let kbk = checked_count(head.l1, "KBK")?;
+    let nch = checked_count(head.n2, "NCH")?;
+    let npl = checked_count(head.n1, "NPL")?;
+    if npl != 6 * nch {
+        return Err(rml_error(format!(
+            "{location}: channel LIST NPL={npl} != 6*NCH={}",
+            6 * nch
+        )));
+    }
+    if !aj.is_finite() || (2.0 * aj).fract() != 0.0 {
+        return Err(rml_error(format!(
+            "{location}: AJ={aj} is not a multiple of 1/2"
+        )));
+    }
+    let parity = if aj < 0.0 || (aj == 0.0 && pj < 0.0) {
+        -1
+    } else {
+        1
+    };
+
+    let channel_values = parse_list_values(ctx.lines, ctx.pos, npl)?;
+    let mut channels = Vec::with_capacity(nch);
+    for (c, v) in channel_values.chunks_exact(6).enumerate() {
+        let channel_location = format!("{location} channel {}", c + 1);
+        let ppi = rml_integer(v[0], "PPI", &channel_location)?;
+        if ppi < 1 || ppi as usize > pairs.len() {
+            return Err(rml_error(format!(
+                "{channel_location}: PPI={ppi} is out of range 1..={}",
+                pairs.len()
+            )));
+        }
+        let l = rml_integer(v[1], "L", &channel_location)?;
+        if l < 0 {
+            return Err(rml_error(format!("{channel_location}: L={l} is negative")));
+        }
+        let (sch, bnd, ape, apt) = (v[2], v[3], v[4], v[5]);
+        if ![sch, bnd, ape, apt].iter().all(|x| x.is_finite()) || ape < 0.0 || apt < 0.0 {
+            return Err(rml_error(format!(
+                "{channel_location}: SCH={sch}, BND={bnd}, APE={ape}, APT={apt} must be finite \
+                 with non-negative radii"
+            )));
+        }
+        let pair = ppi as usize - 1;
+        if pairs[pair].penetrability && apt == 0.0 {
+            return Err(rml_error(format!(
+                "{channel_location}: APT=0 for a pair that calculates the penetrability"
+            )));
+        }
+        channels.push(RmlChannel {
+            pair,
+            l: l as u32,
+            channel_spin: sch,
+            boundary: bnd,
+            radius_phase: ape * ENDF_RADIUS_TO_FM,
+            radius_true: apt * ENDF_RADIUS_TO_FM,
+        });
+    }
+    if channels.iter().filter(|c| c.pair == photon_pair).count() != 1 {
+        return Err(rml_error(format!(
+            "{location}: needs exactly one channel of the photon pair (the eliminated channel)"
+        )));
+    }
+    if !channels.iter().any(|c| c.pair == incident_pair) {
+        return Err(rml_error(format!(
+            "{location}: has no neutron entrance channel"
+        )));
+    }
+
+    // LIST: [0, 0, 0, NRS, 6*NX, NX]; each resonance holds ER and NCH widths on
+    // NCH/6+1 lines (ENDF-102 §2.2.1.6), and NRS=0 still carries one line.
+    let res_head = parse_cont(ctx.lines, ctx.pos)?;
+    let nrs = checked_count(res_head.l2, "NRS")?;
+    let nx = checked_count(res_head.n2, "NX")?;
+    let res_npl = checked_count(res_head.n1, "NPL")?;
+    let lines_per_resonance = nch / 6 + 1;
+    let expected_nx = if nrs == 0 {
+        1
+    } else {
+        nrs * lines_per_resonance
+    };
+    if nx != expected_nx || res_npl != 6 * nx {
+        return Err(rml_error(format!(
+            "{location}: resonance LIST NX={nx}, NPL={res_npl}; NRS={nrs} and NCH={nch} need \
+             NX={expected_nx} and NPL={}",
+            6 * expected_nx
+        )));
+    }
+    let res_values = parse_list_values(ctx.lines, ctx.pos, res_npl)?;
+    let mut resonances = Vec::with_capacity(nrs);
+    if nrs > 0 {
+        for row in res_values.chunks_exact(6 * lines_per_resonance) {
+            let energy = row[0];
+            let widths = row[1..=nch].to_vec();
+            if !energy.is_finite() || !widths.iter().all(|w| w.is_finite()) {
+                return Err(rml_error(format!(
+                    "{location}: resonance at ER={energy} has a non-finite value"
+                )));
+            }
+            // A width at the channel threshold has P = 0 and no finite amplitude.
+            for (channel, &width) in channels.iter().zip(&widths) {
+                let pair = &pairs[channel.pair];
+                if pair.penetrability
+                    && width != 0.0
+                    && energy == pair.threshold(&pairs[incident_pair])
+                {
+                    return Err(rml_error(format!(
+                        "{location}: resonance at ER={energy} eV sits on the threshold of a \
+                         penetrating channel with width {width} eV"
+                    )));
+                }
+            }
+            resonances.push(RmlResonance { energy, widths });
+        }
+    }
+
+    // KBK records: [0, 0, LCH, LBK, 0, 0] then the LBK body.
+    let mut background = Vec::new();
+    let mut seen = vec![false; nch];
+    for _ in 0..kbk {
+        let record = parse_cont(ctx.lines, ctx.pos)?;
+        let lch = checked_count(record.l1, "LCH")?;
+        if lch == 0 || lch > nch {
+            return Err(rml_error(format!(
+                "{location}: background LCH={lch} is out of range 1..={nch}"
+            )));
+        }
+        let channel = lch - 1;
+        if seen[channel] {
+            return Err(rml_error(format!(
+                "{location}: background given twice for channel {lch}"
+            )));
+        }
+        seen[channel] = true;
+        if channels[channel].pair == photon_pair {
+            return Err(rml_error(format!(
+                "{location}: background on the eliminated photon channel {lch}"
+            )));
+        }
+        match record.l2 {
+            0 => {}
+            2 => {
+                // LIST: [ED, EU, 0, 0, 5, 0 / R0, R1, R2, S0, S1].
+                let list = parse_cont(ctx.lines, ctx.pos)?;
+                if list.n1 != 5 {
+                    return Err(rml_error(format!(
+                        "{location}: LBK=2 LIST has NPL={}, expected 5",
+                        list.n1
+                    )));
+                }
+                let v = parse_list_values(ctx.lines, ctx.pos, 5)?;
+                let (e_down, e_up) = (list.c1, list.c2);
+                let valid = e_down < ctx.energy_low
+                    && e_up > ctx.energy_high
+                    && v.iter().all(|x| x.is_finite());
+                if !valid {
+                    return Err(rml_error(format!(
+                        "{location}: LBK=2 needs finite terms and ED < EL, EU > EH \
+                         (ED={e_down}, EU={e_up})"
+                    )));
+                }
+                background.push(RmlBackground {
+                    channel,
+                    e_down,
+                    e_up,
+                    r_con: v[0],
+                    r_lin: v[1],
+                    r_quad: v[2],
+                    s_con: v[3],
+                    s_lin: v[4],
+                });
+            }
+            1 | 3 => {
+                return Err(rml_error(format!(
+                    "{location}: LBK={} background is not supported (only LBK=0 and 2)",
+                    record.l2
+                )));
+            }
+            lbk => {
+                return Err(rml_error(format!("{location}: LBK={lbk} is not defined")));
+            }
+        }
+    }
+
+    Ok(RmlSpinGroup {
+        j: aj.abs(),
+        parity,
+        channels,
+        resonances,
+        background,
     })
 }
 
@@ -1948,57 +2098,6 @@ mod tests {
         }
     }
 
-    /// A valid KRM=3 LRF=7 range is parsed-and-skipped, and because it is the
-    /// file's ONLY range the parse is rejected with the no-evaluable-ranges
-    /// error (a pure-LRF=7 evaluation would yield zero cross-sections
-    /// everywhere). The fixture is a minimal but fully valid ENDF MF=2/MT=151
-    /// block (1 isotope, 1 range, LRF=7, KRM=3, 1 particle pair, 1 spin group,
-    /// 2 resonances, NCH=1); reaching the no-evaluable-ranges error (rather
-    /// than a misalignment error) exercises the KRM=3 stride (NCH+2) in the
-    /// skip's resonance-block consumption.
-    #[test]
-    fn test_lrf7_krm3_rejected_no_evaluable_ranges() {
-        const ENDF: &str =
-            include_str!("../../../tests/data/synthetic/lrf7_krm3_resonance_column_order.endf");
-        assert_rejected_no_evaluable_ranges(ENDF);
-    }
-
-    /// The no-evaluable-ranges rejection must NAME each skipped range's
-    /// formalism and energy span so the user can see exactly what was in the
-    /// file and why it cannot be evaluated.
-    #[test]
-    fn test_lrf7_rejection_names_formalism_and_span() {
-        const ENDF: &str =
-            include_str!("../../../tests/data/synthetic/lrf7_krm3_resonance_column_order.endf");
-        let err = parse_endf_file2(ENDF).unwrap_err();
-        let msg = err.to_string();
-        assert!(
-            msg.contains("LRF=7 (R-Matrix Limited)"),
-            "rejection must name the skipped formalism, got: {msg}"
-        );
-        assert!(
-            msg.contains("eV"),
-            "rejection must state the skipped energy span, got: {msg}"
-        );
-        assert!(
-            msg.contains("LRF=1/2/3"),
-            "rejection must state what NEREIDS evaluates, got: {msg}"
-        );
-    }
-
-    /// A KRM=2 LRF=7 range with an explicit photon capture channel (IPP=2,
-    /// MA=0, MT=102) passes every particle-pair, IPP-range, and stride guard
-    /// during the skip — then the file is rejected because the LRF=7 range is
-    /// its only range (no evaluable content).
-    #[test]
-    fn test_lrf7_krm2_photon_channel_rejected_no_evaluable_ranges() {
-        // Two particle pairs: pair 1 = n+W184 (MT=2), pair 2 = γ+W185 (MT=102, MA=0);
-        // one spin group with 2 channels (elastic + photon); one resonance.
-        const ENDF: &str =
-            include_str!("../../../tests/data/synthetic/lrf7_krm2_explicit_photon_channel.endf");
-        assert_rejected_no_evaluable_ranges(ENDF);
-    }
-
     /// Parse a minimal hand-crafted ENDF snippet with NRO=1 (energy-dependent
     /// scattering radius).
     ///
@@ -2669,174 +2768,6 @@ mod tests {
         }
     }
 
-    /// LRF=7 resonance LIST carries NRS in L2 and NX (packed-row count) in N2.
-    ///
-    /// ENDF-6 §2.2.1.6: the resonance LIST control record is
-    /// `[C1=0, C2=0, L1=0, L2=NRS, N1=6*NX, N2=NX]`. For spin groups whose
-    /// per-resonance row fits in one 6-float ENDF line (NCH+1 ≤ 6 for KRM=2,
-    /// NCH+2 ≤ 6 for KRM=3), NX numerically equals NRS, so the field
-    /// confusion is invisible. This fixture stresses the case where the
-    /// per-resonance row requires *more than one* 6-float row, giving
-    /// NX > NRS and L2 ≠ N2.
-    ///
-    /// Construction: KRM=3, NCH=5 (5 elastic channels in a single spin
-    /// group), NRS=2.
-    ///   per-resonance values = NCH+2 = 7 → 2 packed rows of 6 floats (12
-    ///     values per resonance, last 5 are padding zeros).
-    ///   NX = NRS · 2 = 4 packed rows.
-    ///   NPL = 6·NX = 24 floats.
-    ///   resonance LIST control = `[0.0, 0.0, 0, NRS=2, 24, NX=4]`.
-    ///
-    /// Under the (pre-fix) buggy reader that took NRS from N2, this fixture
-    /// would set NRS=4, recompute stride = NPL/NRS = 6, and trip the
-    /// min_stride guard (6 < NCH+2 = 7) with a misleading
-    /// "stride too small" UnsupportedFormat error. With the fix the skip reads
-    /// NRS=2 (from L2), so stride = NPL/NRS = 24/2 = 12 ≥ NCH+2 = 7 and the
-    /// range parses end-to-end (loading as a skipped RMatrixLimited range).
-    #[test]
-    fn test_parse_lrf7_l2_holds_nrs_with_nx_neq_nrs() {
-        const ENDF: &str =
-            include_str!("../../../tests/data/synthetic/lrf7_l2_holds_nrs_with_nx_neq_nrs.endf");
-
-        // Reading NRS from L2 keeps the stride guard satisfied, so the skip
-        // consumes the wide-spin-group range cleanly and the parse reaches the
-        // no-evaluable-ranges rejection (the LRF=7 range is the file's only
-        // range) instead of the misleading "stride too small" error the
-        // NRS-from-N2 misread would produce.
-        assert_rejected_no_evaluable_ranges(ENDF);
-    }
-
-    /// LRF=7 spin group with nonzero KBK (R-external background) is rejected.
-    ///
-    /// The ENDF-6 §2.2.1.6 manual prose treats KBK as a nonzero flag with NCH
-    /// background records; OpenScale's reference reader
-    /// (File2.cpp:444-524) treats KBK as a sparse record count with each
-    /// subrecord carrying the channel index in L1 and the LBK formalism flag
-    /// in L2. The two conventions disagree on loop bound, per-subrecord
-    /// control-field positions, and payload shape per LBK value. No local
-    /// ENDF/B-VIII.0 evaluation has nonzero KBK to validate against.
-    /// Until a policy decision resolves the dispute, NEREIDS hard-rejects
-    /// nonzero KBK so the parser cannot silently misalign the stream past
-    /// the offending spin group.
-    #[test]
-    fn test_parse_lrf7_rejects_nonzero_kbk() {
-        const ENDF: &str =
-            include_str!("../../../tests/data/synthetic/lrf7_nonzero_kbk_rejected.endf");
-
-        let err = parse_endf_file2(ENDF).unwrap_err();
-        match &err {
-            EndfParseError::UnsupportedFormat(msg) => {
-                assert!(
-                    msg.contains("KBK=1"),
-                    "expected KBK=1 in error message, got: {msg}"
-                );
-            }
-            other => panic!("expected UnsupportedFormat for KBK != 0, got {other:?}"),
-        }
-    }
-
-    /// LRF=7 spin group with nonzero KPS (tabulated phase-shift override) is
-    /// rejected. Same documentation-vs-implementation dispute as KBK;
-    /// OpenScale itself refuses to read KPS > 0
-    /// (File2.cpp:439-441 throws "kps > 0 for lrf=7 not yet supported"), so
-    /// NEREIDS adopts the same behaviour rather than guess at a layout.
-    #[test]
-    fn test_parse_lrf7_rejects_nonzero_kps() {
-        const ENDF: &str =
-            include_str!("../../../tests/data/synthetic/lrf7_nonzero_kps_rejected.endf");
-
-        let err = parse_endf_file2(ENDF).unwrap_err();
-        match &err {
-            EndfParseError::UnsupportedFormat(msg) => {
-                assert!(
-                    msg.contains("KPS=1"),
-                    "expected KPS=1 in error message, got: {msg}"
-                );
-            }
-            other => panic!("expected UnsupportedFormat for KPS != 0, got {other:?}"),
-        }
-    }
-
-    /// LRF=7 particle pair with PNT=2 ("ASSIGN") is rejected at parse time.
-    /// SAMMY's Check_Quantum (rml/mrml03.f:22) rejects Lpent outside {0,1};
-    /// neither SAMMY nor NEREIDS implements PNT=2.  Validating up front keeps
-    /// the unknown penetrability flag out of the physics evaluator.
-    #[test]
-    fn test_parse_lrf7_rejects_pnt_two() {
-        const ENDF: &str = include_str!("../../../tests/data/synthetic/lrf7_pnt2_rejected.endf");
-
-        let err = parse_endf_file2(ENDF).unwrap_err();
-        match &err {
-            EndfParseError::UnsupportedFormat(msg) => {
-                assert!(
-                    msg.contains("PNT=2"),
-                    "expected PNT=2 in error message, got: {msg}"
-                );
-            }
-            other => panic!("expected UnsupportedFormat for PNT=2, got {other:?}"),
-        }
-    }
-
-    /// LRF=7 massless particle pair (MA=0, photon/eliminated channel) declared
-    /// with PNT=1 is rejected: SAMMY always assigns Lpent=0 to the photon
-    /// channel, and the physics evaluator's PNT=1 penetrability branch would
-    /// otherwise divide by a zero reduced mass.
-    #[test]
-    fn test_parse_lrf7_rejects_massless_pnt_one() {
-        const ENDF: &str =
-            include_str!("../../../tests/data/synthetic/lrf7_massless_pnt1_rejected.endf");
-
-        let err = parse_endf_file2(ENDF).unwrap_err();
-        match &err {
-            EndfParseError::UnsupportedFormat(msg) => {
-                assert!(
-                    msg.contains("must have PNT=0"),
-                    "expected massless-PNT consistency message, got: {msg}"
-                );
-            }
-            other => panic!("expected UnsupportedFormat for massless PNT=1, got {other:?}"),
-        }
-    }
-
-    /// LRF=7 particle pair with a fractional PNT (1.5) is rejected before the
-    /// f64→i32 narrowing can truncate it into a spurious 0/1 that would bypass
-    /// the {0,1} range check.
-    #[test]
-    fn test_parse_lrf7_rejects_fractional_pnt() {
-        const ENDF: &str =
-            include_str!("../../../tests/data/synthetic/lrf7_pnt_fractional_rejected.endf");
-
-        let err = parse_endf_file2(ENDF).unwrap_err();
-        match &err {
-            EndfParseError::UnsupportedFormat(msg) => {
-                assert!(
-                    msg.contains("PNT=1.5") && msg.contains("not a finite integer"),
-                    "expected fractional-PNT message, got: {msg}"
-                );
-            }
-            other => panic!("expected UnsupportedFormat for fractional PNT, got {other:?}"),
-        }
-    }
-
-    /// LRF=7 PNT=1 pair with a non-positive mass (MB=0) is rejected up front:
-    /// the penetrability path would otherwise form a non-finite reduced mass.
-    #[test]
-    fn test_parse_lrf7_rejects_pnt1_zero_mass() {
-        const ENDF: &str =
-            include_str!("../../../tests/data/synthetic/lrf7_pnt1_zero_mass_rejected.endf");
-
-        let err = parse_endf_file2(ENDF).unwrap_err();
-        match &err {
-            EndfParseError::UnsupportedFormat(msg) => {
-                assert!(
-                    msg.contains("finite positive masses"),
-                    "expected PNT=1 mass-validation message, got: {msg}"
-                );
-            }
-            other => panic!("expected UnsupportedFormat for PNT=1 zero mass, got {other:?}"),
-        }
-    }
-
     /// MF=2 NIS=0 (no isotopes declared) is rejected up-front.
     ///
     /// ENDF-6 §2.1 requires NIS >= 1 for a valid resonance evaluation.
@@ -2866,109 +2797,6 @@ mod tests {
                 );
             }
             other => panic!("expected UnsupportedFormat for NIS=0, got {other:?}"),
-        }
-    }
-
-    /// LRF=7 resonance LIST with N2/NX not divisible by L2/NRS is rejected.
-    ///
-    /// ENDF-6 §2.2.1.6 fixes NX = NRS · ceil(stride/6) where stride is NCH+1
-    /// for KRM=2 and NCH+2 for KRM=3, so NX must be an integer multiple of
-    /// NRS (the per-resonance packed-row count is constant within a spin
-    /// group). A fixture with NRS=4 and NX=2 yields a fractional stride
-    /// 6·NX/NRS = 3 floats per resonance, which would mis-align the
-    /// resonance reads. Without the divisibility check, the existing
-    /// `res_npl == 6*nx` guard passes (12 == 6·2) and the downstream
-    /// `res_npl % nrs != 0` would also pass (12 % 4 == 0), producing the
-    /// bogus stride. The new guard catches this directly.
-    #[test]
-    fn test_parse_lrf7_rejects_nx_not_multiple_of_nrs() {
-        const ENDF: &str =
-            include_str!("../../../tests/data/synthetic/lrf7_nx_not_multiple_of_nrs_rejected.endf");
-
-        let err = parse_endf_file2(ENDF).unwrap_err();
-        match &err {
-            EndfParseError::UnsupportedFormat(msg) => {
-                assert!(
-                    msg.contains("not a multiple"),
-                    "expected 'not a multiple' in error message, got: {msg}"
-                );
-                assert!(
-                    msg.contains("NX (2)") || msg.contains("(2)"),
-                    "expected NX=2 to appear in error message, got: {msg}"
-                );
-                assert!(
-                    msg.contains("NRS (4)") || msg.contains("(4)"),
-                    "expected NRS=4 to appear in error message, got: {msg}"
-                );
-            }
-            other => {
-                panic!("expected UnsupportedFormat for NX not multiple of NRS, got {other:?}")
-            }
-        }
-    }
-
-    /// LRF=7 spin group with zero resonances must be accepted when written in
-    /// the canonical ENDF-6 §2.2.1.6 form NRS=0, NX=1, NPL=6 (a single
-    /// six-float zero-filler row in the LIST body).
-    ///
-    /// OpenScale's reference writer at
-    /// `external/openScale/repo/packages/ScaleUtils/EndfLib/endf/File2.cpp:683-697`
-    /// pads the resonance LIST for empty spin groups:
-    ///
-    /// ```cpp
-    /// list.setL2(spin->getNres());        // L2 = NRS = 0
-    /// ...
-    /// // nx must be at least 1, even if nres=0
-    /// if (spin->getNres() == 0)
-    ///     nx = 1;
-    /// list.setN1(6 * nx);                  // N1 = 6
-    /// list.setN2(nx);                      // N2 = 1
-    /// ```
-    ///
-    /// A naive guard `if nrs == 0 && nx != 0 { reject }` would reject this
-    /// canonical pattern (NX=1 ≠ 0). The relaxed guard
-    /// `if nrs == 0 && nx != 1 { reject }` accepts it while still rejecting
-    /// malformed shapes such as NRS=0/NX=2.
-    #[test]
-    fn test_parse_lrf7_nrs_zero_nx_one_canonical_empty_passes_guard() {
-        const ENDF: &str =
-            include_str!("../../../tests/data/synthetic/lrf7_nrs_zero_nx_one_canonical_empty.endf");
-
-        // The canonical empty spin group (NRS=0/NX=1) passes the relaxed
-        // guard, so the skip consumes the range cleanly and the parse reaches
-        // the no-evaluable-ranges rejection (the LRF=7 range is the file's
-        // only range) rather than the NRS=0/NX guard error a stricter check
-        // would raise.
-        assert_rejected_no_evaluable_ranges(ENDF);
-    }
-
-    /// LRF=7 spin group with NRS=0 but NX≠1 is rejected as malformed.
-    ///
-    /// OpenScale's writer (File2.cpp:683-697) explicitly pads NX to 1 when
-    /// NRS=0, so any NRS=0 record with NX=0 (no filler row) or NX>1 (phantom
-    /// filler rows with nothing to anchor them) is not a valid ENDF-6 emission.
-    /// The previous over-permissive guard accepted NRS=0/NX=2 silently,
-    /// leaving the parser to read two zero-filled rows as "no resonances"
-    /// while the LIST body did contain data that some other reader might
-    /// interpret as resonance parameters.
-    #[test]
-    fn test_parse_lrf7_rejects_nrs_zero_nx_two_malformed() {
-        const ENDF: &str =
-            include_str!("../../../tests/data/synthetic/lrf7_nrs_zero_nx_two_malformed.endf");
-
-        let err = parse_endf_file2(ENDF).unwrap_err();
-        match &err {
-            EndfParseError::UnsupportedFormat(msg) => {
-                assert!(
-                    msg.contains("NRS=0"),
-                    "expected 'NRS=0' in error message, got: {msg}"
-                );
-                assert!(
-                    msg.contains("NX=2"),
-                    "expected 'NX=2' in error message, got: {msg}"
-                );
-            }
-            other => panic!("expected UnsupportedFormat for NRS=0/NX!=1, got {other:?}"),
         }
     }
 
@@ -3142,5 +2970,583 @@ mod tests {
             let expected = shared.count() as f64 * all.covariance[12 * a + b];
             assert_eq!(summed.covariance[9 * a + b], expected, "{a}, {b}");
         }
+    }
+}
+
+#[cfg(test)]
+mod rml_tests {
+    use super::*;
+
+    const PHOTON: [f64; 12] = [
+        0.0, 183.37, 0.0, 74.0, 1.0, 0.0, 0.0, 0.0, 0.0, 102.0, 0.0, 0.0,
+    ];
+    const NEUTRON: [f64; 12] = [
+        1.0, 182.37, 0.0, 74.0, 0.5, 0.0, 0.0, 1.0, 0.0, 2.0, 0.0, 1.0,
+    ];
+
+    /// One KBK record: LCH, LBK and the LBK=2 list [ED, EU, R0, R1, R2, S0, S1].
+    struct Background {
+        lch: i64,
+        lbk: i64,
+        list: Option<[f64; 7]>,
+    }
+
+    struct Group {
+        aj: f64,
+        pj: f64,
+        kps: i64,
+        channels: Vec<[f64; 6]>,
+        resonances: Vec<Vec<f64>>,
+        nx: Option<usize>,
+        background: Vec<Background>,
+    }
+
+    /// One-range LRF=7 MF=2 section written in the ENDF-102 §2.2.1.6 layout.
+    struct Fixture {
+        krm: i64,
+        ifg: i64,
+        krl: i64,
+        nro: bool,
+        pairs: Vec<[f64; 12]>,
+        groups: Vec<Group>,
+    }
+
+    impl Fixture {
+        /// W-184-like evaluation: photon pair 1, neutron pair 2, one s-wave group.
+        fn basic() -> Self {
+            Self {
+                krm: 3,
+                ifg: 0,
+                krl: 0,
+                nro: false,
+                pairs: vec![PHOTON, NEUTRON],
+                groups: vec![Group {
+                    aj: 0.5,
+                    pj: 0.0,
+                    kps: 0,
+                    channels: vec![
+                        [1.0, 0.0, 0.0, 0.0, 0.0, 0.0],
+                        [2.0, 0.0, 0.5, 0.0, 0.764, 0.75],
+                    ],
+                    resonances: vec![vec![-12.0, 0.05, 0.3], vec![101.9, 0.06, -0.02]],
+                    nx: None,
+                    background: vec![],
+                }],
+            }
+        }
+
+        fn text(&self) -> String {
+            fn float(x: f64) -> String {
+                format!("{:>11}", format!("{x:.5E}"))
+            }
+            fn int(n: i64) -> String {
+                format!("{n:>11}")
+            }
+            fn list(record: &mut dyn FnMut(Vec<String>), values: &[f64]) {
+                for chunk in values.chunks(6) {
+                    let mut fields: Vec<String> = chunk.iter().map(|&v| float(v)).collect();
+                    fields.resize(6, " ".repeat(11));
+                    record(fields);
+                }
+            }
+            let mut lines: Vec<String> = Vec::new();
+            let mut record = |fields: Vec<String>| {
+                let seq = lines.len() + 1;
+                lines.push(format!("{:66}7437 2151{seq:>5}", fields.concat()));
+            };
+            let zero = || float(0.0);
+            record(vec![
+                float(74184.0),
+                float(182.37),
+                int(0),
+                int(0),
+                int(1),
+                int(0),
+            ]);
+            record(vec![
+                float(74184.0),
+                float(1.0),
+                int(0),
+                int(0),
+                int(1),
+                int(0),
+            ]);
+            record(vec![
+                float(1e-5),
+                float(1e4),
+                int(1),
+                int(7),
+                int(i64::from(self.nro)),
+                int(0),
+            ]);
+            if self.nro {
+                record(vec![zero(), zero(), int(0), int(0), int(1), int(2)]);
+                record(vec![
+                    int(2),
+                    int(2),
+                    " ".repeat(11),
+                    " ".repeat(11),
+                    " ".repeat(11),
+                    " ".repeat(11),
+                ]);
+                list(&mut record, &[1e-5, 0.7, 1e4, 0.7]);
+            }
+            record(vec![
+                zero(),
+                zero(),
+                int(self.ifg),
+                int(self.krm),
+                int(self.groups.len() as i64),
+                int(self.krl),
+            ]);
+            let npp = self.pairs.len() as i64;
+            record(vec![
+                zero(),
+                zero(),
+                int(npp),
+                int(0),
+                int(12 * npp),
+                int(2 * npp),
+            ]);
+            list(&mut record, &self.pairs.concat());
+            for g in &self.groups {
+                let nch = g.channels.len();
+                record(vec![
+                    float(g.aj),
+                    float(g.pj),
+                    int(g.background.len() as i64),
+                    int(g.kps),
+                    int(6 * nch as i64),
+                    int(nch as i64),
+                ]);
+                list(&mut record, &g.channels.concat());
+                let per = 6 * (nch / 6 + 1);
+                let mut values: Vec<f64> = Vec::new();
+                for r in &g.resonances {
+                    let mut row = r.clone();
+                    row.resize(per, 0.0);
+                    values.extend(row);
+                }
+                if g.resonances.is_empty() {
+                    values.resize(6, 0.0);
+                }
+                let nx = g.nx.unwrap_or(values.len() / 6);
+                values.resize(6 * nx, 0.0);
+                record(vec![
+                    zero(),
+                    zero(),
+                    int(0),
+                    int(g.resonances.len() as i64),
+                    int(6 * nx as i64),
+                    int(nx as i64),
+                ]);
+                list(&mut record, &values);
+                for b in &g.background {
+                    record(vec![zero(), zero(), int(b.lch), int(b.lbk), int(0), int(0)]);
+                    if let Some(v) = b.list {
+                        record(vec![
+                            float(v[0]),
+                            float(v[1]),
+                            int(0),
+                            int(0),
+                            int(5),
+                            int(0),
+                        ]);
+                        list(&mut record, &v[2..]);
+                    }
+                }
+            }
+            lines.join("\n")
+        }
+
+        fn parse(&self) -> Result<ResonanceData, EndfParseError> {
+            parse_file2_records(&self.text())
+        }
+    }
+
+    fn rml(data: &ResonanceData) -> &RmlRange {
+        data.ranges[0]
+            .r_matrix_limited
+            .as_ref()
+            .expect("parsed LRF=7 payload")
+    }
+
+    fn assert_rejects(fixture: &Fixture, needle: &str) {
+        match fixture.parse() {
+            Err(EndfParseError::UnsupportedFormat(msg)) => {
+                assert!(msg.contains(needle), "expected '{needle}' in: {msg}");
+            }
+            other => panic!("expected UnsupportedFormat with '{needle}', got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn parses_pairs_channels_and_widths() {
+        let data = Fixture::basic().parse().unwrap();
+        let range = &data.ranges[0];
+        assert_eq!(range.formalism, ResonanceFormalism::RMatrixLimited);
+        let rml = rml(&data);
+        assert_eq!((rml.photon_pair, rml.incident_pair), (0, 1));
+        assert!(
+            !rml.pairs[0].penetrability,
+            "PNT=0 on MT=102 means no penetrability"
+        );
+        assert!(rml.pairs[1].penetrability);
+        let group = &rml.spin_groups[0];
+        assert_eq!((group.j, group.parity), (0.5, 1));
+        assert_eq!(group.channels[1].pair, 1);
+        assert!((group.channels[1].radius_phase - 7.64).abs() < 1e-12);
+        assert!((group.channels[1].radius_true - 7.5).abs() < 1e-12);
+        assert_eq!(group.resonances.len(), 2);
+        assert_eq!(group.resonances[1].energy, 101.9);
+        assert_eq!(group.resonances[1].widths, vec![0.06, -0.02]);
+        assert_eq!(rml.resonance_count(), 2);
+    }
+
+    /// ENDF-6 defines PNT=-1 as "do not calculate the penetrability".
+    #[test]
+    fn accepts_pnt_minus_one_on_photon_pair() {
+        let mut fixture = Fixture::basic();
+        fixture.pairs[0][7] = -1.0;
+        let data = fixture.parse().unwrap();
+        assert!(!rml(&data).pairs[0].penetrability);
+    }
+
+    #[test]
+    fn pnt_zero_takes_the_mt_default() {
+        let mut fixture = Fixture::basic();
+        fixture.pairs[1][7] = 0.0;
+        let data = fixture.parse().unwrap();
+        assert!(rml(&data).pairs[1].penetrability, "MT=2 defaults to PNT=1");
+    }
+
+    #[test]
+    fn rejects_undefined_or_fractional_pnt() {
+        let mut fixture = Fixture::basic();
+        fixture.pairs[1][7] = 2.0;
+        assert_rejects(&fixture, "PNT=2 is not defined");
+        fixture.pairs[1][7] = 1.5;
+        assert_rejects(&fixture, "PNT=1.5 is not an integer");
+    }
+
+    #[test]
+    fn rejects_penetrability_on_photon_pair() {
+        let mut fixture = Fixture::basic();
+        fixture.pairs[0][7] = 1.0;
+        assert_rejects(
+            &fixture,
+            "photon pair (MA=0) cannot calculate the penetrability",
+        );
+    }
+
+    #[test]
+    fn rejects_penetrating_pair_without_mass() {
+        let mut fixture = Fixture::basic();
+        fixture.pairs[1][1] = 0.0;
+        assert_rejects(&fixture, "needs positive masses");
+    }
+
+    #[test]
+    fn rejects_unsupported_header_flags() {
+        let mut fixture = Fixture::basic();
+        fixture.krm = 2;
+        assert_rejects(&fixture, "KRM=2 is not supported");
+        let mut fixture = Fixture::basic();
+        fixture.ifg = 1;
+        assert_rejects(&fixture, "IFG=1");
+        let mut fixture = Fixture::basic();
+        fixture.krl = 1;
+        assert_rejects(&fixture, "KRL=1");
+        let mut fixture = Fixture::basic();
+        fixture.nro = true;
+        assert_rejects(&fixture, "NRO=1");
+        let mut fixture = Fixture::basic();
+        fixture.groups[0].kps = 1;
+        assert_rejects(&fixture, "KPS=1");
+    }
+
+    #[test]
+    fn accepts_charged_and_rejects_fission_pairs() {
+        let mut fixture = Fixture::basic();
+        let mut proton = NEUTRON;
+        proton[0] = 0.9986235;
+        proton[2] = 1.0;
+        proton[3] = 73.0;
+        proton[6] = 6.15e5;
+        proton[9] = 600.0;
+        fixture.pairs.push(proton);
+        let data = fixture.parse().unwrap();
+        let pair = &rml(&data).pairs[2];
+        assert_eq!((pair.charge_a, pair.charge_b, pair.mt), (1.0, 73.0, 600));
+        let mut fixture = Fixture::basic();
+        let mut fission = PHOTON;
+        fission[0] = 1.0;
+        fission[9] = 18.0;
+        fission[7] = -1.0;
+        fixture.pairs.push(fission);
+        assert_rejects(&fixture, "fission pair (MT=18)");
+    }
+
+    #[test]
+    fn shift_factor_needs_an_open_channel() {
+        let mut fixture = Fixture::basic();
+        fixture.pairs[1][8] = 1.0;
+        let data = fixture.parse().unwrap();
+        assert!(
+            rml(&data).pairs[1].shift,
+            "SHF=1 on the incident pair is open everywhere"
+        );
+
+        let mut fixture = Fixture::basic();
+        let mut inelastic = NEUTRON;
+        inelastic[6] = -1.0e3;
+        inelastic[8] = 1.0;
+        inelastic[9] = 51.0;
+        fixture.pairs.push(inelastic);
+        assert_rejects(&fixture, "SHF=1 on a channel with threshold");
+    }
+
+    /// The eliminated channel is the photon pair's channel at any position.
+    #[test]
+    fn finds_photon_channel_by_pair_not_position() {
+        let mut fixture = Fixture::basic();
+        fixture.groups[0].channels.swap(0, 1);
+        for r in &mut fixture.groups[0].resonances {
+            r.swap(1, 2);
+        }
+        let data = fixture.parse().unwrap();
+        let group = &rml(&data).spin_groups[0];
+        assert_eq!(group.channels[1].pair, 0);
+        assert_eq!(group.resonances[1].widths, vec![-0.02, 0.06]);
+    }
+
+    #[test]
+    fn rejects_missing_or_duplicate_photon_and_entrance_channels() {
+        let mut fixture = Fixture::basic();
+        fixture.pairs[0][7] = -1.0;
+        fixture.pairs[0][9] = 103.0;
+        assert_rejects(&fixture, "exactly one photon pair");
+        let mut fixture = Fixture::basic();
+        fixture.groups[0].channels.truncate(1);
+        for r in &mut fixture.groups[0].resonances {
+            r.truncate(2);
+        }
+        assert_rejects(&fixture, "has no neutron entrance channel");
+        let mut fixture = Fixture::basic();
+        fixture.groups[0].channels[0] = fixture.groups[0].channels[1];
+        assert_rejects(&fixture, "exactly one channel of the photon pair");
+        let mut fixture = Fixture::basic();
+        fixture.groups[0].channels[1][0] = 1.0;
+        assert_rejects(&fixture, "needs exactly one channel of the photon pair");
+        let mut fixture = Fixture::basic();
+        fixture.groups[0].channels[1][0] = 3.0;
+        assert_rejects(&fixture, "PPI=3 is out of range");
+    }
+
+    #[test]
+    fn rejects_resonance_on_a_penetrating_threshold() {
+        let mut fixture = Fixture::basic();
+        fixture.groups[0].resonances[0][0] = 0.0;
+        assert_rejects(&fixture, "sits on the threshold");
+    }
+
+    #[test]
+    fn negative_aj_and_pj_give_negative_parity() {
+        let mut fixture = Fixture::basic();
+        fixture.groups[0].aj = -1.5;
+        let data = fixture.parse().unwrap();
+        assert_eq!(
+            (
+                rml(&data).spin_groups[0].j,
+                rml(&data).spin_groups[0].parity
+            ),
+            (1.5, -1)
+        );
+        let mut fixture = Fixture::basic();
+        fixture.groups[0].aj = 0.0;
+        fixture.groups[0].pj = -1.0;
+        let data = fixture.parse().unwrap();
+        assert_eq!(rml(&data).spin_groups[0].parity, -1);
+    }
+
+    #[test]
+    fn empty_group_keeps_one_filler_line() {
+        let mut fixture = Fixture::basic();
+        fixture.groups[0].resonances.clear();
+        let data = fixture.parse().unwrap();
+        assert!(rml(&data).spin_groups[0].resonances.is_empty());
+        fixture.groups[0].nx = Some(2);
+        assert_rejects(&fixture, "NX=2");
+    }
+
+    /// Six or more channels put each resonance on NCH/6+1 lines.
+    #[test]
+    fn wide_group_reads_two_lines_per_resonance() {
+        let mut fixture = Fixture::basic();
+        let mut channels = vec![[1.0, 0.0, 0.0, 0.0, 0.0, 0.0]];
+        for l in 0..5 {
+            channels.push([2.0, f64::from(l), 0.5, 0.0, 0.7, 0.7]);
+        }
+        let group = &mut fixture.groups[0];
+        group.channels = channels;
+        group.resonances = vec![
+            vec![5.0, 0.04, 1.0, 2.0, 3.0, 4.0, 5.0],
+            vec![9.0, 0.05, 6.0, 7.0, 8.0, 9.0, 10.0],
+        ];
+        let data = fixture.parse().unwrap();
+        let group = &rml(&data).spin_groups[0];
+        assert_eq!(group.resonances[1].energy, 9.0);
+        assert_eq!(
+            group.resonances[1].widths,
+            vec![0.05, 6.0, 7.0, 8.0, 9.0, 10.0]
+        );
+        fixture.groups[0].nx = Some(2);
+        assert_rejects(&fixture, "need NX=4");
+    }
+
+    #[test]
+    fn reads_logarithmic_background() {
+        let mut fixture = Fixture::basic();
+        fixture.groups[0].background = vec![Background {
+            lch: 2,
+            lbk: 2,
+            list: Some([0.0, 2.0e4, -0.043, 1.0e-6, 2.0e-9, 0.01, 3.0e-7]),
+        }];
+        let data = fixture.parse().unwrap();
+        let background = &rml(&data).spin_groups[0].background;
+        assert_eq!(background.len(), 1);
+        let b = &background[0];
+        assert_eq!(b.channel, 1);
+        assert_eq!((b.e_down, b.e_up), (0.0, 2.0e4));
+        assert_eq!(
+            [b.r_con, b.r_lin, b.r_quad, b.s_con, b.s_lin],
+            [-0.043, 1.0e-6, 2.0e-9, 0.01, 3.0e-7]
+        );
+    }
+
+    #[test]
+    fn lbk_zero_adds_no_term() {
+        let mut fixture = Fixture::basic();
+        fixture.groups[0].background = vec![Background {
+            lch: 2,
+            lbk: 0,
+            list: None,
+        }];
+        let data = fixture.parse().unwrap();
+        assert!(rml(&data).spin_groups[0].background.is_empty());
+    }
+
+    #[test]
+    fn rejects_unsupported_or_misplaced_background() {
+        let background = |lch, lbk, list| {
+            let mut fixture = Fixture::basic();
+            fixture.groups[0].background = vec![Background { lch, lbk, list }];
+            fixture
+        };
+        let list = Some([0.0, 2.0e4, 0.1, 0.0, 0.0, 0.0, 0.0]);
+        assert_rejects(&background(2, 1, None), "LBK=1 background is not supported");
+        assert_rejects(&background(2, 3, None), "LBK=3 background is not supported");
+        assert_rejects(&background(1, 2, list), "eliminated photon channel");
+        assert_rejects(&background(3, 2, list), "LCH=3 is out of range");
+        assert_rejects(
+            &background(2, 2, Some([1.0, 2.0e4, 0.1, 0.0, 0.0, 0.0, 0.0])),
+            "ED < EL, EU > EH",
+        );
+        let mut fixture = background(2, 0, None);
+        fixture.groups[0].background.push(Background {
+            lch: 2,
+            lbk: 2,
+            list,
+        });
+        assert_rejects(&fixture, "given twice for channel 2");
+    }
+
+    fn mf2_fixture(name: &str) -> String {
+        let path = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("../../tests/data/endf/mf2")
+            .join(format!("{name}.endf"));
+        std::fs::read_to_string(&path).unwrap_or_else(|e| panic!("{path:?}: {e}"))
+    }
+
+    /// Each ENDF/B-VIII.1 LRF=7 fixture parses to the end with the counts its
+    /// records state (resonances per isotope, from the files' NRS fields).
+    #[test]
+    fn parses_endf_b_viii_1_lrf7_evaluations() {
+        let cases = [
+            ("W-182", 3, 312),
+            ("W-183", 5, 374),
+            ("W-184", 3, 218),
+            ("W-186", 3, 175),
+            ("Fe-54", 5, 737),
+            ("Fe-57", 5, 123),
+            ("Si-28", 7, 55),
+            ("Si-29", 10, 31),
+            ("Si-30", 5, 30),
+            ("Rh-103", 5, 555),
+            ("Cu-63", 6, 1172),
+            ("Cu-65", 6, 969),
+            ("V-51", 6, 136),
+            ("Sr-88", 7, 443),
+            ("Cl-35", 8, 272),
+            ("Ca-40", 5, 246),
+        ];
+        for (name, groups, resonances) in cases {
+            let data =
+                parse_file2_records(&mf2_fixture(name)).unwrap_or_else(|e| panic!("{name}: {e}"));
+            let rml = data
+                .ranges
+                .iter()
+                .find_map(|r| r.r_matrix_limited.as_ref())
+                .unwrap_or_else(|| panic!("{name}: no LRF=7 range"));
+            assert_eq!(rml.spin_groups.len(), groups, "{name}");
+            assert_eq!(rml.resonance_count(), resonances, "{name}");
+            assert_eq!(rml.pairs[rml.photon_pair].mt, 102, "{name}");
+            assert!(!rml.pairs[rml.photon_pair].penetrability, "{name}");
+        }
+    }
+
+    /// Sr-88 gives a logarithmic background (KBK=1, LBK=2) in every group.
+    #[test]
+    fn parses_sr88_backgrounds() {
+        let data = parse_file2_records(&mf2_fixture("Sr-88")).unwrap();
+        let rml = rml(&data);
+        assert_eq!(rml.pairs[0].mt, 102);
+        assert!(
+            !rml.pairs[0].penetrability,
+            "Sr-88 writes PNT=-1 on the photon pair"
+        );
+        for group in &rml.spin_groups {
+            assert_eq!(group.background.len(), 1);
+            assert_eq!(group.channels[group.background[0].channel].pair, 1);
+        }
+        let first = &rml.spin_groups[0].background[0];
+        assert_eq!((first.e_down, first.e_up), (0.0, 9.55e5));
+        assert_eq!((first.r_con, first.s_con, first.s_lin), (-0.043, 0.01, 0.0));
+    }
+
+    /// Cu-63 calculates the shift factor on its neutron pair with B = -1 for l = 1.
+    #[test]
+    fn parses_cu63_shift_and_boundary() {
+        let data = parse_file2_records(&mf2_fixture("Cu-63")).unwrap();
+        let rml = rml(&data);
+        assert!(rml.pairs[rml.incident_pair].shift);
+        let p_wave = rml
+            .spin_groups
+            .iter()
+            .flat_map(|g| &g.channels)
+            .find(|c| c.pair == rml.incident_pair && c.l == 1)
+            .unwrap();
+        assert_eq!(p_wave.boundary, -1.0);
+    }
+
+    /// Fe-57's inelastic pair (MT=51, Q = -14.413 keV) is a closed channel
+    /// over the VENUS band and carries no shift factor.
+    #[test]
+    fn parses_fe57_inelastic_pair() {
+        let data = parse_file2_records(&mf2_fixture("Fe-57")).unwrap();
+        let rml = rml(&data);
+        let inelastic = rml.pairs.iter().find(|p| p.mt == 51).unwrap();
+        assert_eq!(inelastic.q_value, -14413.0);
+        assert!(inelastic.penetrability && !inelastic.shift);
     }
 }
