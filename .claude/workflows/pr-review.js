@@ -3,7 +3,7 @@ export const meta = {
   description:
     'One review round for a NEREIDS pull request: the CodeRabbit review and a Claude and a Codex review in one fix table, cross-family checks, fix-depth assessment, a fix plan, and a Codex risk review of the plan. Changes no files.',
   whenToUse:
-    'Run from the pr-review skill after CodeRabbit has reviewed the PR head. args: {pr, repoRoot, scratch, repo?, since?, sinceSha?, sammyRoot?}.',
+    'Run from the pr-review skill after CodeRabbit has reviewed the PR head. args: {pr, repoRoot, scratch, repo?, sammyRoot?}.',
   phases: [
     { title: 'Collect', detail: 'PR facts, the CodeRabbit review, a Claude and a Codex review' },
     { title: 'Verify', detail: 'another model family checks each single-source P0 and P1 finding' },
@@ -17,16 +17,10 @@ const PR = Number(A.pr)
 const ROOT = typeof A.repoRoot === 'string' ? A.repoRoot : ''
 const REPO = A.repo || 'ornlneutronimaging/NEREIDS'
 const SCRATCH = A.scratch || `/tmp/nereids-pr-review-${PR}`
-// ISO 8601 UTC time; CodeRabbit items posted before it belong to an earlier round.
-const SINCE = A.since || ''
-// PR head that the earlier round reviewed; this round reviews the commits after it.
-const SINCE_SHA = A.sinceSha || ''
 const SAMMY = A.sammyRoot || ''
 if (!Number.isInteger(PR) || PR < 1) throw new Error('pr-review: args.pr must be a pull request number')
 if (!ROOT) throw new Error('pr-review: args.repoRoot must be a clean checkout of the PR head')
 if (!/^[\w.-]+\/[\w.-]+$/.test(REPO)) throw new Error('pr-review: args.repo must be owner/name')
-if (SINCE && !/^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}(\.\d+)?Z$/.test(SINCE)) throw new Error('pr-review: args.since must be an ISO 8601 UTC time')
-if (SINCE_SHA && !/^[0-9a-f]{7,40}$/.test(SINCE_SHA)) throw new Error('pr-review: args.sinceSha must be a commit SHA')
 
 const q = (s) => `'${String(s).replace(/'/g, `'\\''`)}'`
 
@@ -182,13 +176,13 @@ const factsPrompt = `Gather facts for a review of pull request #${PR} of ${REPO}
 
 const CR_DIR = `${SCRATCH}/coderabbit`
 const crFile = (name) => q(`${CR_DIR}/${name}`)
-const coderabbitPrompt = `Collect the CodeRabbit review of pull request #${PR} of ${REPO}${SINCE ? `, only the items posted after ${SINCE}` : ''}. Use \`gh\` and \`jq\`. Read only: do not post, reply or resolve.
+const coderabbitPrompt = `Collect the CodeRabbit review of pull request #${PR} of ${REPO}. Use \`gh\` and \`jq\`. Read only: do not post, reply or resolve.
 
 1. Save the raw data:
    mkdir -p ${q(CR_DIR)}
    gh api repos/${REPO}/issues/${PR}/comments --paginate --jq '.[] | select(.user.login == "coderabbitai[bot]")' > ${crFile('issue.jsonl')}
-   gh api repos/${REPO}/pulls/${PR}/reviews --paginate --jq '.[] | select(.user.login == "coderabbitai[bot]"${SINCE ? ` and .submitted_at > "${SINCE}"` : ''})' > ${crFile('reviews.jsonl')}
-   gh api repos/${REPO}/pulls/${PR}/comments --paginate --jq '.[] | select(.user.login == "coderabbitai[bot]" and .in_reply_to_id == null${SINCE ? ` and .created_at > "${SINCE}"` : ''})' > ${crFile('inline.jsonl')}
+   gh api repos/${REPO}/pulls/${PR}/reviews --paginate --jq '.[] | select(.user.login == "coderabbitai[bot]")' > ${crFile('reviews.jsonl')}
+   gh api repos/${REPO}/pulls/${PR}/comments --paginate --jq '.[] | select(.user.login == "coderabbitai[bot]" and .in_reply_to_id == null)' > ${crFile('inline.jsonl')}
    gh pr checks ${PR} --repo ${REPO} --json name,state --jq '.[] | select(.name == "CodeRabbit")' > ${crFile('check.json')}
 2. status, reviewedSha and note. The walkthrough is the issue comment that contains "summarize by coderabbit.ai".
    - reviewed: the CodeRabbit check state is SUCCESS, and the walkthrough names the reviewed commits ("between <sha> and <sha>"). reviewedSha is the second SHA.
@@ -204,13 +198,10 @@ const coderabbitPrompt = `Collect the CodeRabbit review of pull request #${PR} o
 4. counts: inline = the output of \`jq -s length ${crFile('inline.jsonl')}\`; nitpick, outsideDiff and duplicate = the sums of the N in those section titles; preMerge = the number of checks with the status Warning or Error.`
 
 function auditPrompt(f) {
-  const scope = SINCE_SHA
-    ? `This round reviews the commits after ${SINCE_SHA}: \`git diff ${SINCE_SHA} HEAD\`. Use the full PR diff, \`git diff ${f.mergeBase} HEAD\`, as context.`
-    : `The change is \`git diff ${f.mergeBase} HEAD\`.`
   const sammy = SAMMY
     ? `The SAMMY source is at ${SAMMY}.`
     : 'No SAMMY source tree is available; check against the cited equations, and say so in the finding.'
-  return `Review pull request #${PR} of ${REPO}, "${f.title}". The checkout ${ROOT} is at the PR head ${f.headSha}. ${scope} Changed files: ${f.changedFiles.join(', ')}.
+  return `Review pull request #${PR} of ${REPO}, "${f.title}". The checkout ${ROOT} is at the PR head ${f.headSha}. The change is \`git diff ${f.mergeBase} HEAD\`. Changed files: ${f.changedFiles.join(', ')}.
 
 PR description:
 ${f.body}

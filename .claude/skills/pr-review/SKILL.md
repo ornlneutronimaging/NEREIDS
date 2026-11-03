@@ -32,8 +32,6 @@ Call the Workflow tool with `name: "pr-review"` and these args:
 | `pr` | The PR number. |
 | `repoRoot` | The absolute path of the worktree from step 1. |
 | `scratch` | A new directory in the session scratchpad for each round. |
-| `since` | Round 2 and later: the time of the previous round's push (ISO 8601). |
-| `sinceSha` | Round 2 and later: the PR head that the previous round reviewed. |
 | `sammyRoot` | The SAMMY source tree, when one is available. |
 
 The workflow changes no repository file. When a check before the review
