@@ -41,8 +41,9 @@ counts on detector time-bin edges. State which result a change supports.
 
 ## Pull request review
 
-Each PR gets one review round. The maintainer decides if it needs another.
-In Claude Code, the `pr-review` skill runs the round.
+Each PR gets one review round. The maintainer asks for it, and this request
+authorizes its commits and its push. The maintainer decides if the PR needs
+another round. In Claude Code, the `pr-review` skill runs the round.
 
 1. Open the PR. When CodeRabbit skips or rate-limits its review, a maintainer
    asks for it with `@coderabbitai review`.

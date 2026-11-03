@@ -1,6 +1,6 @@
 ---
 name: pr-review
-description: Run one review round on a NEREIDS pull request. Collect the CodeRabbit review and a Claude and a Codex review in one fix table, assess each fix for root cause and recursion risk, get a Codex risk review of the fix plan, apply the plan, push, and report to the maintainer. Use when the user asks to review a PR, to run the review process, or to address review comments.
+description: Run one review round on a NEREIDS pull request. The round collects the CodeRabbit, Claude and Codex findings in one fix table, plans and applies the fixes, and reports to the maintainer. Use only when the maintainer asks to run the review round on a PR.
 ---
 
 # PR review round
@@ -56,6 +56,7 @@ missing, or when CodeRabbit has not reviewed the PR head. It returns:
 ## 3. Apply the plan
 
 Apply the plan only when `status` is `approved`. Otherwise go to step 4.
+Before the first edit, give the maintainer the short plan.
 
 1. Apply the items in order, in the worktree from step 1. Add no work that the
    plan does not contain.
