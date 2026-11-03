@@ -58,14 +58,15 @@ missing, or when CodeRabbit has not reviewed the PR head. It returns:
 Apply the plan only when `status` is `approved`. Otherwise go to step 4.
 Before the first edit, give the maintainer the short plan.
 
-1. Apply the items in order, in the worktree from step 1. Add no work that the
-   plan does not contain.
-2. For each item, write or select the test that the item names, and confirm
-   that it fails without the change. When the item names another check
-   because no test applies, run that check.
-3. Run the checks in AGENTS.md.
-4. Make one signed commit for each item, with the item's commit subject.
-5. Push the branch once, after all items pass.
+Do these steps for each item in order, in the worktree from step 1:
+
+1. Write or select the test that the item names. Confirm that it fails. When
+   no test applies, run the check that the item names.
+2. Apply the item. Add no work that the plan does not contain.
+3. Confirm that the test passes. Run the checks in AGENTS.md.
+4. Make one signed commit with the item's commit subject.
+
+Push the branch once, after all items pass.
 
 Rows with the choice `decide` go to the maintainer. Rows with the choice
 `defer` get a follow-up task. Do not reply to or resolve review threads

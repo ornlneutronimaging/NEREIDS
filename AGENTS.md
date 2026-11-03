@@ -56,7 +56,8 @@ another round. In Claude Code, the `pr-review` skill runs the round.
    code again. Give one fix to findings that have one cause.
 5. Write the fix plan. Get a Codex risk review of the plan, and revise the
    plan for each high risk.
-6. Apply the plan, run the checks, and push one atomic commit for each fix.
+6. Apply, check and commit one fix at a time. Push once, after the last
+   commit.
 7. Report the fix table to the maintainer, and stop. CodeRabbit does not
    review new commits automatically.
 
