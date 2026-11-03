@@ -16,10 +16,11 @@ const A = args && typeof args === 'object' ? args : {}
 const PR = Number(A.pr)
 const ROOT = typeof A.repoRoot === 'string' ? A.repoRoot : ''
 const REPO = A.repo || 'ornlneutronimaging/NEREIDS'
-const SCRATCH = A.scratch || `/tmp/nereids-pr-review-${PR}`
+const SCRATCH = typeof A.scratch === 'string' ? A.scratch : ''
 const SAMMY = A.sammyRoot || ''
 if (!Number.isInteger(PR) || PR < 1) throw new Error('pr-review: args.pr must be a pull request number')
 if (!ROOT) throw new Error('pr-review: args.repoRoot must be a clean checkout of the PR head')
+if (!SCRATCH) throw new Error('pr-review: args.scratch must be a new directory outside args.repoRoot')
 if (!/^[\w.-]+\/[\w.-]+$/.test(REPO)) throw new Error('pr-review: args.repo must be owner/name')
 
 const q = (s) => `'${String(s).replace(/'/g, `'\\''`)}'`
