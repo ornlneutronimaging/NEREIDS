@@ -12,6 +12,8 @@ env:
 permissions:
   contents: read
 
+# Rust caches are saved on main only: PR runs restore them, and PR copies
+# would fill the 10 GB repository cache limit and evict them.
 jobs:
   # ── Fast compilation gate ──────────────────────────────────────────
   check:
@@ -23,6 +25,8 @@ jobs:
         with:
           toolchain: "1.96.1" # keep in sync with rust-toolchain.toml
       - uses: Swatinem/rust-cache@c8037a86dde8214a8310e9f54a8fc61ab362aa31 # v2
+        with:
+          save-if: ${{ github.ref == 'refs/heads/main' }}
       - run: cargo check --workspace --exclude nereids-python
       # Compile-check workspace examples so docs snippets cannot drift
       # out of sync with the live crate APIs (see `crates/nereids-fitting/
@@ -75,6 +79,8 @@ jobs:
           toolchain: "1.96.1" # keep in sync with rust-toolchain.toml
           components: clippy
       - uses: Swatinem/rust-cache@c8037a86dde8214a8310e9f54a8fc61ab362aa31 # v2
+        with:
+          save-if: ${{ github.ref == 'refs/heads/main' }}
       - run: cargo clippy --workspace --exclude nereids-python --all-targets -- -D warnings
 
   # ── Tests (cross-platform) ─────────────────────────────────────────
@@ -96,6 +102,9 @@ jobs:
         with:
           toolchain: "1.96.1" # keep in sync with rust-toolchain.toml
       - uses: Swatinem/rust-cache@c8037a86dde8214a8310e9f54a8fc61ab362aa31 # v2
+        with:
+          shared-key: test # nightly.yml restores this cache
+          save-if: ${{ github.ref == 'refs/heads/main' }}
       - name: Build
         run: cargo build --workspace --exclude nereids-python
       - name: Run tests
@@ -114,6 +123,8 @@ jobs:
         with:
           toolchain: "1.96.1" # keep in sync with rust-toolchain.toml
       - uses: Swatinem/rust-cache@c8037a86dde8214a8310e9f54a8fc61ab362aa31 # v2
+        with:
+          save-if: ${{ github.ref == 'refs/heads/main' }}
       - name: Build docs
         run: cargo doc --workspace --no-deps --exclude nereids-python
         env:
@@ -149,6 +160,8 @@ jobs:
         with:
           toolchain: "1.96.1" # keep in sync with rust-toolchain.toml
       - uses: Swatinem/rust-cache@c8037a86dde8214a8310e9f54a8fc61ab362aa31 # v2
+        with:
+          save-if: ${{ github.ref == 'refs/heads/main' }}
       - name: Install pixi
         uses: prefix-dev/setup-pixi@ad1da6449d9e506fd127fd67ab2d054a769f6a94 # v0.11.2
         with:
