@@ -12,8 +12,8 @@ permissions:
   contents: read
 
 jobs:
-  # The shards balance the measured run times of the tests. libtest filters
-  # match substrings, so "rest" also runs each new or renamed ignored test.
+  # The shards balance the measured run times of the tests. "rest" skips the
+  # tests that the other shards select and runs all other ignored tests.
   slow-tests:
     name: Slow tests (${{ matrix.os }}, ${{ matrix.shard }})
     runs-on: ${{ matrix.os }}
