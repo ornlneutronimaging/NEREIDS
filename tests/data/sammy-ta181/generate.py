@@ -38,7 +38,7 @@ TEMPERATURES_K = (299, 300, 301, 1099, 1100, 1101)
 ALPHAS_PER_US = (2, 8)
 CHANNEL_NS = 160.0
 # A burst selects SAMMY's general RPI routine. Without one, SAMMY's chi-squared
-# and channel routine multiplies the term by an extra X = t/Lambda below X = 0.5.
+# and channel routine loses kernel weight at the shortest delays.
 BURST_NS = 1.0
 NXTRA = 29
 # eps_S is the largest change of a transmission from NXTRA to NXTRA_CHECK.

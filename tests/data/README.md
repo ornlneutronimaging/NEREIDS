@@ -130,12 +130,16 @@ CHANN00000    1000.0     160.0       0.0
 ### The burst
 
 Without a burst, SAMMY computes the moderator and channel terms in its routine
-`Chantd` (`src/rpi/mrpi6.f90`, line 758 at `0aa6ee20` and at `339d9f83`). For
-X = (t_m − t′ + C/2)/Λ < 0.5 and t_m − t′ + C/2 ≤ C, that routine gives
-(X/C)·F(X), where its other branch and the RPI definition give F(X)/C, with
-F(X) = 1 − e^(−X)(1 + X + X²/2). The expansion of SAMMY's `Abcexp`
-coefficients shows that (C(1 + X) − B·X/2)·X³ = F(X), so the extra factor is
-X. The kernel then loses weight at the shortest delays.
+`Chantd` (`src/rpi/mrpi6.f90`, line 758 at `0aa6ee20` and at `339d9f83`). Let
+t_m be the flight time at the bin-centre energy, t′ the flight time at an
+energy of SAMMY's auxiliary grid, w = 160 ns the channel width and Λ = 1/α.
+For this τ = 0 case, X = (t_m − t′ + w/2)/Λ. Where 0 < t_m − t′ + w/2 ≤ w and
+X < 0.5, `Chantd` gives (X/w)·(c(1 + X) − b·X/2)·X³. Here
+b = (e^(−X) − 1 + X)/X² and c = (1 − X + X²/2 − e^(−X))/X³ are the `B` and
+`C` that SAMMY's `Abcexp` (`src/fnc/abcexp.f90`) returns at the argument −X.
+Then (c(1 + X) − b·X/2)·X³ = F(X) = 1 − e^(−X)(1 + X + X²/2). The other
+branch and the RPI definition give F(X)/w, so the extra factor is X. The
+kernel then loses weight at the shortest delays.
 
 A 1 ns Gaussian burst selects SAMMY's general RPI routine, which has no such
 branch. `generate.py diagnose` runs S2 at 300 K with a 1 ns burst, without a
