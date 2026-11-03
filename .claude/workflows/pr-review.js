@@ -87,8 +87,6 @@ const FACTS = obj({
   prHeadSha: str,
   clean: { type: 'boolean' },
   state: str,
-  title: str,
-  body: str,
   baseRef: str,
   baseSha: str,
   baseAvailable: { type: 'boolean' },
@@ -151,7 +149,7 @@ function codexHarness(name, prompt, schema) {
   return `You run the Codex CLI, a reviewer of another model family, and return its answer. Do not do its task yourself, and do not change its answer.
 
 1. Run: mkdir -p ${q(SCRATCH)} && rm -f ${q(rc)} ${q(out)}
-2. With the Write tool, write the text between the marker lines to ${p}:
+2. With the Write tool, write the text between the PROMPT START line and the last PROMPT END line to ${p}:
 ----- PROMPT START -----
 ${prompt}
 ----- PROMPT END -----
@@ -169,7 +167,7 @@ ${JSON.stringify(schema)}
 const factsPrompt = `Gather facts for a review of pull request #${PR} of ${REPO}. The review checkout is ${ROOT}. Run these commands in it:
 - \`git rev-parse HEAD\`: headSha (full SHA).
 - \`git status --porcelain\`: clean is true when the output is empty.
-- \`gh pr view ${PR} --repo ${REPO} --json state,title,body,headRefOid,baseRefName,baseRefOid\`: state, title, body, prHeadSha (headRefOid), baseRef (baseRefName), baseSha (baseRefOid).
+- \`gh pr view ${PR} --repo ${REPO} --json state,headRefOid,baseRefName,baseRefOid\`: state, prHeadSha (headRefOid), baseRef (baseRefName), baseSha (baseRefOid).
 - \`git cat-file -e <baseSha>^{commit}\`: baseAvailable is true when it succeeds. When it fails, return the facts that you have, with mergeBase "", changedFiles [] and shortstat "".
 - \`git merge-base HEAD <baseSha>\`: mergeBase (full SHA).
 - \`git diff --name-only <mergeBase> HEAD\`: changedFiles. \`git diff --shortstat <mergeBase> HEAD\`: shortstat.
@@ -192,7 +190,7 @@ const coderabbitPrompt = `Collect the CodeRabbit review of pull request #${PR} o
    - not-reviewed: none of the above.
    note: the walkthrough's words about the review status and coverage.
 3. findings: transcribe every item. Drop none.
-   - inline: each object in inline.jsonl. file = .path; line = .line, or .original_line when .line is null; url = .html_url. The first line of the body has labels; severity is critical, major, minor or trivial from them, or unknown. title = the bold title. claim = the explanation, without the "Prompt for AI Agents" block. suggestedFix = the suggested change, or the text of the "Prompt for AI Agents" block.
+   - inline: each object in inline.jsonl. file = .path; line = .line, or .original_line when .line is null; url = .html_url. The first line of the body has labels; severity is critical, major, minor or trivial from them, or unknown. title = the bold title. claim = the explanation, without the "Prompt for AI Agents" block. suggestedFix = the suggested change, or "".
    - nitpick, outside-diff and duplicate: each item in the sections "Nitpick comments (N)", "Outside diff range comments (N)" and "Duplicate comments (N)" of each review body in reviews.jsonl. Section titles can start with an emoji. Each item names a file and a line range; line = the first line of the range. severity = nitpick for nitpick items; for the other two kinds, read it from the item's labels as for inline, or unknown. url = the .html_url of the review.
    - pre-merge: each pre-merge check in the walkthrough with the status Warning or Error. file = "", line = 0, severity = warning or error, title = the check name, claim = the explanation, suggestedFix = the resolution, url = the .html_url of the walkthrough.
    Do not include "Additional comments" items, the walkthrough summary or tips.
@@ -202,10 +200,7 @@ function auditPrompt(f) {
   const sammy = SAMMY
     ? `The SAMMY source is at ${SAMMY}.`
     : 'No SAMMY source tree is available; check against the cited equations, and say so in the finding.'
-  return `Review pull request #${PR} of ${REPO}, "${f.title}". The checkout ${ROOT} is at the PR head ${f.headSha}. The change is \`git diff ${f.mergeBase} HEAD\`. Changed files: ${f.changedFiles.join(', ')}.
-
-PR description:
-${f.body}
+  return `Review pull request #${PR} of ${REPO}. The checkout ${ROOT} is at the PR head ${f.headSha}. The change is \`git diff ${f.mergeBase} HEAD\`. Changed files: ${f.changedFiles.join(', ')}.
 
 Read AGENTS.md and CONTRIBUTING.md first: their rules are review criteria. Read each changed file in full, and the code that the change calls or that calls it.
 
@@ -256,10 +251,7 @@ function assessPrompt(f, batch) {
     const votes = r.votes.map((v) => `${v.family} ${v.verdict}: ${clip(v.reasoning, 500)}`).join('; ')
     return `${rowText(r)}\n  check: ${r.status}${votes ? `\n  votes: ${votes}` : ''}`
   })
-  return `Assess how to fix the findings from the review of pull request #${PR} of ${REPO}, "${f.title}". The checkout ${ROOT} is at the PR head ${f.headSha}; the change is \`git diff ${f.mergeBase} HEAD\`. Read AGENTS.md, then the code of each row.
-
-PR description:
-${f.body}
+  return `Assess how to fix the findings from the review of pull request #${PR} of ${REPO}. The checkout ${ROOT} is at the PR head ${f.headSha}; the change is \`git diff ${f.mergeBase} HEAD\`. Read AGENTS.md, then the code of each row.
 
 For each row, put the row id in "row" and give:
 1. valid: "yes" when the defect is real. A corroborated or confirmed row is "no" only with evidence from the code.
@@ -295,7 +287,7 @@ function planPrompt(f, planRows) {
   recursion risk: ${a.recursionRisk}: ${a.recursionReason}
   test: ${a.test}`
   })
-  return `Write the fix plan for pull request #${PR} of ${REPO}, "${f.title}". The checkout ${ROOT} is at the PR head ${f.headSha}. Read AGENTS.md and the code that the rows name.
+  return `Write the fix plan for pull request #${PR} of ${REPO}. The checkout ${ROOT} is at the PR head ${f.headSha}. Read AGENTS.md and the code that the rows name.
 
 Rules:
 - One item for each root cause. One item can fix several rows. Put each row below in exactly one item, or in notFixed with the reason.
