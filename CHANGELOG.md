@@ -9,10 +9,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
 
 ### Added
 
-- `sammy_ta181_oracle` tests the Ta-181 forward model of `fit_counts` against
-  SAMMY at the VENUS bins, 300 K and 1100 K: the unbroadened and free-gas
-  cross sections, the Ikeda-Carpenter pulse fold, and a temperature fit. The
-  references and their generator are in `tests/data/sammy-ta181`.
+- `sammy_ta181_oracle` compares NEREIDS with SAMMY for Ta-181. It compares the
+  unbroadened total cross section at the VENUS bin-centre energies, and the
+  free-gas transmission at those energies at 300 K and 1100 K. It also compares
+  that transmission folded over the bins with only the prompt Ikeda-Carpenter
+  term (R = 0, constant α), and a `fit_counts` temperature fit to counts made
+  from SAMMY's transmission. The references and their generator are in
+  `tests/data/sammy-ta181`.
 - R-Matrix Limited (LRF=7) ranges in the Reich-Moore form (KRM=3) are
   evaluated: neutron, eliminated-capture, neutral exit (such as inelastic)
   and charged-particle exit channels, the last with Coulomb penetrabilities

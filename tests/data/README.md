@@ -34,10 +34,17 @@ end-to-end counts-fitting validation fixture.
 
 ## sammy-ta181
 
-`sammy-ta181/` holds SAMMY references for the forward model that
-`counts_fit::fit_counts` uses for VENUS Ta-181 resonance thermometry.
+`sammy-ta181/` holds SAMMY references for VENUS Ta-181 resonance thermometry.
 `crates/nereids-pipeline/tests/sammy_ta181_oracle.rs` compares NEREIDS with
-them. Its criteria detect a 1 K error at 300 K.
+them in four stages. S0 compares the unbroadened total cross section at the
+bin-centre energies. S1 compares the free-gas transmission at 7.04e-4 atoms/b
+and its slope per K at those energies, at 300 K and 1100 K. S2 compares that
+transmission and slope folded over the bins with only the prompt
+Ikeda-Carpenter term (α = 2 and 8 per µs, R = 0), with a unit beam on the
+test's own flight-time grids. S2b fits the temperature with `fit_counts` to
+counts made from the S2 references at α = 2 per µs, and checks its error,
+convergence and σ_T. No stage compares the counts that `fit_counts` predicts
+with SAMMY. The test's criteria detect a 1 K error at 300 K.
 
 | File | Content |
 |---|---|

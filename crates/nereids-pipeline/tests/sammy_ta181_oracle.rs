@@ -1,4 +1,5 @@
-//! The Ta-181 transmission that `fit_counts` uses, against SAMMY.
+//! The functions that `fit_counts` calls for Ta-181, and a `fit_counts`
+//! temperature fit, against SAMMY.
 //!
 //! The SAMMY references in `tests/data/sammy-ta181` are for the File 2
 //! extract `Ta-181-mf2.endf` at the bin-centre energies of `bins.txt`.
@@ -468,6 +469,8 @@ fn compare(
     failures
 }
 
+/// S0: the unbroadened total cross section of `CrossSectionPlan` at the
+/// bin-centre energies.
 #[test]
 fn s0_unbroadened_total_cross_section_matches_sammy() {
     let data = ta181();
@@ -493,6 +496,8 @@ fn s0_unbroadened_total_cross_section_matches_sammy() {
     assert_eq!(over, 0, "S0: {over} energies exceed the bound");
 }
 
+/// S1: the free-gas transmission at 7.04e-4 atoms/b and its slope per K at the
+/// bin-centre energies, at 300 K and 1100 K.
 #[test]
 fn s1_free_gas_transmission_matches_sammy() {
     let data = ta181();
@@ -518,6 +523,8 @@ fn s1_free_gas_transmission_matches_sammy() {
     assert!(failures.is_empty(), "{}", failures.join("\n"));
 }
 
+/// S2: the S1 transmission and slope folded over the bins with only the prompt
+/// Ikeda-Carpenter term (α = 2 and 8 per µs, R = 0), with a unit beam on the `resolved` grids.
 #[test]
 #[ignore = "slow; runs nightly"]
 fn s2_ikeda_carpenter_transmission_matches_sammy_rpi() {
@@ -550,6 +557,8 @@ fn s2_ikeda_carpenter_transmission_matches_sammy_rpi() {
     assert!(failures.is_empty(), "{}", failures.join("\n"));
 }
 
+/// S2b: the temperature, convergence and finite σ_T of a `fit_counts` fit to counts made
+/// from the SAMMY S2 transmission at α = 2 per µs.
 #[test]
 #[ignore = "slow; runs nightly"]
 fn s2b_fit_counts_recovers_the_temperature_of_sammy_rpi_counts() {
