@@ -103,7 +103,7 @@ const CODERABBIT = obj({
   counts: obj({ inline: int, nitpick: int, outsideDiff: int, duplicate: int, preMerge: int }),
   findings: arr(
     obj({
-      kind: oneOf(...CR_KINDS),
+      kind: oneOf(...CR_KINDS, 'walkthrough'),
       severity: oneOf('critical', 'major', 'minor', 'trivial', 'nitpick', 'warning', 'error', 'unknown'),
       title: str,
       file: str,
@@ -193,7 +193,8 @@ const coderabbitPrompt = `Collect the CodeRabbit review of pull request #${PR} o
    - inline: each object in inline.jsonl. file = .path; line = .line, or .original_line when .line is null; url = .html_url. severity is critical, major, minor or trivial from the labels in the body, or unknown. title = the bold title sentence, not a bold label. claim = the explanation, without the "Prompt for AI Agents" block. suggestedFix = the suggested change, or "".
    - nitpick, outside-diff and duplicate: each item in the sections "Nitpick comments (N)", "Outside diff range comments (N)" and "Duplicate comments (N)" of each review body in reviews.jsonl. Section titles can start with an emoji. Each item names a file and a line range; line = the first line of the range. severity = nitpick for nitpick items; for the other two kinds, read it from the item's labels as for inline, or unknown. url = the .html_url of the review.
    - pre-merge: each pre-merge check in the walkthrough with the status Warning or Error. file = "", line = 0, severity = warning or error, title = the check name, claim = the explanation, suggestedFix = the resolution, url = the .html_url of the walkthrough.
-   Do not include "Additional comments" items, the walkthrough summary or tips.
+   - walkthrough: each defect or risk that the walkthrough states outside the pre-merge checks, for example under "Merge Risk". file and line from the text, or "" and 0; severity = unknown; url = the .html_url of the walkthrough.
+   Do not include "Additional comments" items, the summary of the changes or tips.
 4. counts: inline = the output of \`jq -s length ${crFile('inline.jsonl')}\`; nitpick, outsideDiff and duplicate = the sums of the N in those section titles; preMerge = the number of checks with the status Warning or Error.`
 
 function auditPrompt(f) {
