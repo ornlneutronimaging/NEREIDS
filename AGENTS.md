@@ -28,7 +28,8 @@ counts on detector time-bin edges. State which result a change supports.
 - Give a short plan before edits. An approved task permits its routine fixes
   and checks. Ask again only for a new scientific choice or destructive work.
 - Preserve user files, local data, and audit evidence. Use one feature branch
-  for a sequential change. Use additional agents only when requested.
+  for a sequential change. Use additional agents only when requested, or for
+  a review round.
 - Run `cargo fmt --all`,
   `cargo clippy --workspace --exclude nereids-python --all-targets -- -D warnings`,
   and `cargo test --workspace --exclude nereids-python` before a code commit.
@@ -37,6 +38,25 @@ counts on detector time-bin edges. State which result a change supports.
 - Use signed commits. Keep commits focused. Keep the PR description to two
   sentences. Ask before publishing or merging unless the user has authorized
   that action. Do not infer merge approval from review approval.
+
+## Pull request review
+
+Each PR gets one review round. The maintainer decides if it needs another.
+In Claude Code, the `pr-review` skill runs the round.
+
+1. Open the PR. CodeRabbit reviews it automatically.
+2. Review the PR diff with Claude and with Codex.
+3. Collect the CodeRabbit, Claude and Codex findings in one fix table. Do not
+   fix a comment when it arrives.
+4. For each valid finding, compare the smallest fix with the fix of the root
+   cause. Do not accept a fix that adds a special case, a guard for one input,
+   a duplicate path, or a looser tolerance: the next review must check that
+   code again. Give one fix to findings that have one cause.
+5. Write the fix plan. Get a Codex risk review of the plan, and revise the
+   plan for each high risk.
+6. Apply the plan, run the checks, and push one atomic commit for each fix.
+7. Report the fix table to the maintainer, and stop. CodeRabbit does not
+   review new commits automatically.
 
 ## Text and files
 
