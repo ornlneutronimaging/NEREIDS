@@ -252,7 +252,7 @@ function assessPrompt(f, batch) {
   return `Assess how to fix the findings from the review of pull request #${PR} of ${REPO}. The checkout ${ROOT} is at the PR head ${f.headSha}; the change is \`git diff ${f.mergeBase} HEAD\`. Read AGENTS.md, then the code of each row.
 
 For each row, put the row id in "row" and give:
-1. valid: "yes" when the defect is real. A corroborated or confirmed row is "no" only with evidence from the code.
+1. valid: "yes" when the defect is real. A corroborated or confirmed row is "no", and a refuted row is "yes", only with evidence from the code.
 2. validReason: the evidence.
 3. rootCause: why the defect exists.
 4. smallestFix: the smallest change that makes the finding go away.
@@ -268,7 +268,7 @@ For each row, put the row id in "row" and give:
    When valid is "no", the choice is no-change.
 9. test: the test that fails before the fix and passes after it, or why no test applies and which other check shows the fix.
 
-check: corroborated means two reviewers found the row; confirmed or uncertain is the result of a check by another model family; not-checked means that only you check the row (P2 and PR-level rows).
+check: corroborated means two reviewers found the row; confirmed, refuted or uncertain is the result of a check by another model family; not-checked means that only you check the row (P2 and PR-level rows).
 
 ${batch.map(rowText).join('\n\n')}`
 }
@@ -505,24 +505,23 @@ for (const r of rows.filter((x) => x.status === 'pending')) {
 log(`rows: ${rows.length}; ${rows.filter((r) => r.status === 'refuted').length} refuted`)
 
 phase('Assess')
-const toAssess = rows.filter((r) => r.status !== 'refuted')
 const assessed = await parallel(
-  chunks(toAssess, 8).map((batch, i) => () =>
+  chunks(rows, 8).map((batch, i) => () =>
     agent(assessPrompt(facts, batch) + READ_ONLY, { label: `assess:${i + 1}`, phase: 'Assess', schema: ASSESS }),
   ),
 )
 for (const out of assessed) {
   for (const a of (out && out.rows) || []) {
     const r = rowById.get(a.row.trim())
-    if (r && r.status !== 'refuted' && !r.assessment) r.assessment = a
+    if (r && !r.assessment) r.assessment = a
   }
 }
-const unassessed = toAssess.filter((r) => !r.assessment)
+const unassessed = rows.filter((r) => !r.assessment)
 if (unassessed.length) gaps.push(`No assessment for ${unassessed.map((r) => r.id).join(', ')}`)
 
 phase('Plan')
 const isFix = (r) => r.assessment && r.assessment.valid === 'yes' && FIX_CHOICES.includes(r.assessment.choice)
-let planRows = toAssess.filter(isFix)
+let planRows = rows.filter(isFix)
 const normalize = (p) => ({
   items: p.items.map((it) => ({ ...it, id: it.id.trim(), rows: it.rows.map((id) => id.trim()) })),
   notFixed: p.notFixed.map((x) => ({ ...x, row: x.row.trim() })),
@@ -573,7 +572,7 @@ for (let round = 1; codexUsable && !planGaps.length && round <= 2; round++) {
   }
   if (round === 2) break
   const flagged = new Set(review.risks.map((x) => x.item.trim()))
-  const reopened = toAssess.filter((r) => r.assessment && r.assessment.choice !== 'decide' && flagged.has(r.id) && !planRows.includes(r))
+  const reopened = rows.filter((r) => r.assessment && r.assessment.choice !== 'decide' && flagged.has(r.id) && !planRows.includes(r))
   planRows = [...planRows, ...reopened]
   if (!planRows.length) break
   const revised = await makePlan('plan:revise', revisePrompt(facts, plan, review, planRows))
@@ -585,7 +584,7 @@ for (let round = 1; codexUsable && !planGaps.length && round <= 2; round++) {
   planGaps = coverageGaps(plan)
 }
 gaps.push(...planGaps)
-const decide = toAssess.some((r) => r.assessment && r.assessment.choice === 'decide')
+const decide = rows.some((r) => r.assessment && r.assessment.choice === 'decide')
 const status = !accepted ? 'plan-rejected' : plan.items.length ? 'approved' : decide ? 'needs-decision' : 'nothing-to-fix'
 log(`plan: ${plan.items.length} commits, ${gaps.length ? 'incomplete' : status}`)
 return result(status, rows, plan, planReviews)
