@@ -3913,7 +3913,6 @@ struct PyRegionFit {
     predicted_open: Vec<f64>,
     predicted_sample: Vec<f64>,
     overdispersion: [Option<f64>; 2],
-    excluded_bins: Vec<usize>,
 }
 
 impl PyRegionFit {
@@ -3931,7 +3930,6 @@ impl PyRegionFit {
             predicted_open: region.predicted[0].clone(),
             predicted_sample: region.predicted[1].clone(),
             overdispersion: region.overdispersion,
-            excluded_bins: region.excluded_bins.clone(),
         }
     }
 }
@@ -4008,12 +4006,6 @@ impl PyRegionFit {
     #[getter]
     fn overdispersion(&self) -> Vec<Option<f64>> {
         self.overdispersion.to_vec()
-    }
-
-    /// Indices of the sample run's bins the material's library leaves out.
-    #[getter]
-    fn excluded_bins(&self) -> Vec<usize> {
-        self.excluded_bins.clone()
     }
 
     fn __repr__(&self) -> String {

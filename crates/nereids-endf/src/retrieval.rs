@@ -58,18 +58,6 @@ pub enum EndfLibrary {
 }
 
 impl EndfLibrary {
-    /// The energy windows, in eV, that counts fits and maps using this
-    /// library's evaluation of `isotope` leave out, because its resonance
-    /// energies there disagree with measured transmission.  The resonances'
-    /// wings and the instrument's pulse carry part of a window's counts outside
-    /// it, where at high counts per bin they raise the fit's overdispersion.
-    pub fn excluded_windows_ev(self, isotope: &Isotope) -> &'static [(f64, f64)] {
-        match (self, isotope.z(), isotope.a()) {
-            (Self::EndfB8_1, 73, 181) => &[(13.6, 14.2)],
-            _ => &[],
-        }
-    }
-
     /// URL path component for this library.
     fn url_path(&self) -> &'static str {
         match self {

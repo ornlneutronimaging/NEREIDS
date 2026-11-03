@@ -178,9 +178,8 @@ and covariance (Pulse.has_prior); the others are known.
 RegionFit.densities are the fitted areal densities in atoms/barn,
 temperature_k the temperature in K (None without a material), predicted_open
 and predicted_sample the counts per bin the fit predicts, overdispersion the
-[open-beam, sample] values (None when unmeasured), excluded_bins the
-sample bins the material's library leaves out, and timing_offset_us the
-region's timing offset in microseconds.
+[open-beam, sample] values (None when unmeasured), and timing_offset_us
+the region's timing offset in microseconds.
 
 CountsFit.regions holds one RegionFit per region. normalization, t0_us,
 flight_path_m, alpha, beta, r, fwhm_squared_us2, r_high and detector_tail (each
