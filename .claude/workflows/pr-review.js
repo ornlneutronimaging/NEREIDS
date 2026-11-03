@@ -481,11 +481,12 @@ if (codexUsable) {
         label: `verify:codex:${i + 1}`,
         phase: 'Verify',
         schema: harnessSchema(VERDICTS),
-      }).then((v) => ({ family: 'codex', v: v && v.ok && v.result ? v.result : null })),
+      }).then((v) => ({ family: 'codex', v: v && v.ok && v.result ? v.result : null, failure: v && v.failure })),
     ),
   )
 }
 for (const out of await parallel(verifyJobs)) {
+  if (out && out.failure) warnings.push(`A Codex check failed: ${out.failure}`)
   if (!out || !out.v) continue
   for (const v of out.v.verdicts) {
     const r = rowById.get(v.row.trim())
