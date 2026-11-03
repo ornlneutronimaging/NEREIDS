@@ -230,7 +230,8 @@ function rowText(r) {
     if (m.suggestedFix) lines.push(`    suggested fix: ${clip(m.suggestedFix, 800)}`)
     return lines.join('\n')
   })
-  return `${r.id} [${r.tier}] ${r.file || '(PR)'}:${r.line}: ${r.title}\n${members.join('\n')}`
+  const votes = r.votes.map((v) => `${v.family} ${v.verdict}: ${clip(v.reasoning, 500)}`).join('; ')
+  return `${r.id} [${r.tier}] ${r.file || '(PR)'}:${r.line}: ${r.title}\n${members.join('\n')}\n  check: ${r.status}${votes ? `\n  votes: ${votes}` : ''}`
 }
 
 function groupPrompt(list) {
@@ -248,10 +249,6 @@ ${batch.map(rowText).join('\n\n')}`
 }
 
 function assessPrompt(f, batch) {
-  const rows = batch.map((r) => {
-    const votes = r.votes.map((v) => `${v.family} ${v.verdict}: ${clip(v.reasoning, 500)}`).join('; ')
-    return `${rowText(r)}\n  check: ${r.status}${votes ? `\n  votes: ${votes}` : ''}`
-  })
   return `Assess how to fix the findings from the review of pull request #${PR} of ${REPO}. The checkout ${ROOT} is at the PR head ${f.headSha}; the change is \`git diff ${f.mergeBase} HEAD\`. Read AGENTS.md, then the code of each row.
 
 For each row, put the row id in "row" and give:
@@ -273,7 +270,7 @@ For each row, put the row id in "row" and give:
 
 check: corroborated means two reviewers found the row; confirmed or uncertain is the result of a check by another model family; not-checked means that only you check the row (P2 and PR-level rows).
 
-${rows.join('\n\n')}`
+${batch.map(rowText).join('\n\n')}`
 }
 
 function planPrompt(f, planRows) {
@@ -305,9 +302,8 @@ function decision(r, plan) {
   if (items.length) return `fixed by ${items.join(', ')}`
   const nf = plan.notFixed.find((x) => x.row === r.id)
   if (nf) return `left in notFixed: ${clip(nf.reason, 500)}`
-  if (r.status === 'refuted') return `refuted: ${r.votes.map((v) => `${v.family}: ${clip(v.reasoning, 400)}`).join('; ')}`
   if (!r.assessment) return 'not assessed'
-  return `${r.assessment.valid === 'yes' ? 'valid' : 'not valid'}, ${r.assessment.choice}: ${clip(r.assessment.choiceReason, 500)}`
+  return `${r.assessment.valid === 'yes' ? 'valid' : `not valid (${clip(r.assessment.validReason, 500)})`}, ${r.assessment.choice}: ${clip(r.assessment.choiceReason, 500)}`
 }
 
 function riskPrompt(f, plan, rows) {
@@ -318,7 +314,7 @@ For each row that the plan does not fix, find the risk of that decision: a real 
 Give a mitigation for each risk. In "item", give the plan item id or the row id. Set approve to false when any risk is high.
 
 Rows and decisions:
-${rows.map((r) => `${r.id} [${r.tier}] ${r.file || '(PR)'}:${r.line}: ${r.title}: ${decision(r, plan)}`).join('\n')}
+${rows.map((r) => `${rowText(r)}\n  decision: ${decision(r, plan)}`).join('\n\n')}
 
 Plan items:
 ${JSON.stringify(plan.items, null, 2)}`
