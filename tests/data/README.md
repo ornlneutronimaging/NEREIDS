@@ -75,10 +75,9 @@ t0 = 0. e_center_ev = (m_n/2)(L/t_c)² at the bin centre t_c, with the CODATA
 
 ### SAMMY build
 
-The executable is `/SNS/users/8cz/code.ornl.gov/SAMMY/install/bin/sammy` on
-bxa6. It prints `SAMMY Version 8.1.pre-b1 - 0aa6ee20`, commit `0aa6ee20` of
-code.ornl.gov `RNSD/SAMMY` (2025-09-03), built on 2025-09-04 (`sammy` MD5
-`ef403c81ef531ae3511eb007f6c0080e`, `libsammyLib.so` MD5
+The SAMMY executable prints `SAMMY Version 8.1.pre-b1 - 0aa6ee20`, commit
+`0aa6ee20` of code.ornl.gov `RNSD/SAMMY` (2025-09-03), built on 2025-09-04
+(`sammy` MD5 `ef403c81ef531ae3511eb007f6c0080e`, `libsammyLib.so` MD5
 `666adae132f0bf3b012559c2a5c7cdcd`). It ran with the MKL libraries of the SAMMY
 8.1.pre-b1 bundle and one thread per run. `generate.py` stops on an executable
 with another MD5 or a SAMMY.LPT with another version, and `generate.py endf`
@@ -147,12 +146,6 @@ the change is 6.6e-4 (α = 2, at 99.32 eV)
 and 4.9e-4 (α = 8, at 99.50 eV). With a 2 ns burst it is 2.0e-7 (α = 2) and
 2.2e-6 (α = 8).
 
-A separate check, not kept in this folder, used 3 bins near 99.36 eV
-(α = 8, 300 K). An exact flight-time integral of the Gamma(3) delay over each
-bin, applied to a fine-grid SAMMY S1 transmission, agreed with NEREIDS to the
-1e-7 that the printed residuals resolve. It differed from the result without a
-burst by 3.7e-4 to 4.9e-4.
-
 ### Checks
 
 `generate.py` stops if a check fails. In each SAMMY.LPT it finds the build
@@ -192,7 +185,7 @@ LD_LIBRARY_PATH=<SAMMY MKL directory> OMP_NUM_THREADS=1 MKL_NUM_THREADS=1 \
     python3 generate.py diagnose <sammy executable> <work directory> --jobs 6
 ```
 
-The `sammy` command runs 37 SAMMY cases (about 11 minutes with 8 jobs on
-bxa6), checks each SAMMY.LPT, and writes the four `s*` files and `eps_s.txt`.
+The `sammy` command runs 37 SAMMY cases, checks each SAMMY.LPT, and writes the
+four `s*` files and `eps_s.txt`.
 The `diagnose` command runs 6 cases in the work directory and does not change
 the reference files.
