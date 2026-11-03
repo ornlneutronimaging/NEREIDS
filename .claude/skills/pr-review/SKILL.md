@@ -7,7 +7,7 @@ description: Run one review round on a NEREIDS pull request. The round collects 
 
 One round collects all review findings, plans the fixes, applies them, and
 stops. The maintainer decides if another round is necessary. Do not fix a
-review comment when it arrives, also when the desktop app relays it: add it
+review comment when it arrives, also when the desktop app relays it. Add it
 to the round. Do not reply to or resolve review threads unless the
 maintainer asks.
 

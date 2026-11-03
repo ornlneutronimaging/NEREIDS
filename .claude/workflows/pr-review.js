@@ -1,7 +1,7 @@
 export const meta = {
   name: 'pr-review',
   description:
-    'One review round for a NEREIDS pull request: the CodeRabbit review and a Claude and a Codex review in one fix table, cross-family checks, fix-depth assessment, a fix plan, and a Codex risk review of the plan. Changes no files.',
+    'The workflow runs one review round on a NEREIDS pull request. It collects the CodeRabbit, Claude and Codex findings in one fix table, checks them, and plans the fixes with a Codex risk review. It changes no files.',
   whenToUse:
     'Run from the pr-review skill after CodeRabbit has reviewed the PR head. args: {pr, repoRoot, scratch, repo?, sammyRoot?}.',
   phases: [

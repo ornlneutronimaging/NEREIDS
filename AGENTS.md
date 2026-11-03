@@ -51,14 +51,14 @@ another round. In Claude Code, the `pr-review` skill runs the round.
 3. Collect the CodeRabbit, Claude and Codex findings in one fix table. Do not
    fix a comment when it arrives.
 4. For each valid finding, compare the smallest fix with the fix of the root
-   cause. Do not accept a fix that adds a special case, a guard for one input,
-   a duplicate path, or a looser tolerance: the next review must check that
+   cause. Reject a fix that adds a special case, a guard for one input, a
+   duplicate path, or a looser tolerance. The next review must check that
    code again. Give one fix to findings that have one cause.
-5. Write the fix plan. Get a Codex risk review of the plan, and revise the
-   plan for each high risk.
+5. Write the fix plan. Get a Codex risk review of the plan. Revise the plan
+   for each high risk.
 6. Apply, check and commit one fix at a time. Push once, after the last
    commit.
-7. Report the fix table to the maintainer, and stop. CodeRabbit does not
+7. Report the fix table to the maintainer. Then stop. CodeRabbit does not
    review new commits automatically.
 
 ## Text and files
