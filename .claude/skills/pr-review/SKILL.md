@@ -66,7 +66,9 @@ Do these steps for each item in order, in the worktree from step 1:
 3. Confirm that the test passes. Run the checks in AGENTS.md.
 4. Make one signed commit with the item's commit subject.
 
-Push the branch once, after all items pass.
+Push the branch once, after all items pass. When the PR adds or changes an
+`#[ignore]` test, run `nightly.yml` on the PR branch after the push. Report
+the result of each such test on each OS.
 
 Rows with the choice `decide` go to the maintainer. Rows with the choice
 `defer` get a follow-up task. Do not reply to or resolve review threads
