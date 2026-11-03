@@ -516,13 +516,8 @@ fn s2b_fit_counts_recovers_the_temperature_of_sammy_rpi_counts() {
         eprintln!(
             "{label}: T_fit = {fitted:.4} K, T_fit - T = {error:+.4} K (limit {} K), \
              sigma_T = {sigma_t:.3e} K, converged {}, overdispersion {:?}, \
-             {} sample bins left out, step {:.2e} µs, {} points",
-            case.fit_limit_k,
-            fit.converged,
-            region.overdispersion,
-            region.excluded_bins.len(),
-            fit.step_us,
-            fit.points
+             step {:.2e} µs, {} points",
+            case.fit_limit_k, fit.converged, region.overdispersion, fit.step_us, fit.points
         );
         if !within(error.abs(), case.fit_limit_k) {
             failures.push(format!(

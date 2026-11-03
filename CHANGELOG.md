@@ -104,9 +104,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
   and the examples that require them. The Python quickstart describes the
   counts API. The GUI and MCP workflows call the same counts engine.
 - The GUI uses ENDF/B-VIII.1 by default. A saved project keeps its library.
-  The counts engine excludes the Ta-181 VIII.1 window at 13.6–14.2 eV and
-  reports excluded bins. Library choice can change fitted densities and
-  temperatures.
+  Library choice can change fitted densities and temperatures.
 - ENDF loading evaluates resolved LRF=3 ranges and LRF=1/2 ranges without
   a competitive width (LRX=0). URR, competitive-width LRF=1/2 and
   scattering-radius-only ranges are parsed but not evaluated. A source

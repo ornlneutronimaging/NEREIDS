@@ -1013,7 +1013,6 @@ mod tests {
         };
         CountsFit {
             regions: vec![RegionFit {
-                excluded_bins: Vec::new(),
                 densities: vec![2e-3],
                 temperature_k: Some(300.0),
                 thickness_variance: Some(0.0),
