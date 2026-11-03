@@ -23,3 +23,7 @@ tests/data/samtry/**/*.plt text eol=lf
 tests/data/samtry/**/*.dcv text eol=lf
 tests/data/endf/**/*.endf text eol=lf
 tests/data/synthetic/**/*.endf text eol=lf
+# The Ta-181 File 2 extract keeps the CRLF bytes of the ENDF/B-VIII.1 tape
+# that SAMMY read; the SAMMY reference tables are LF.
+tests/data/sammy-ta181/*.endf -text
+tests/data/sammy-ta181/*.txt text eol=lf

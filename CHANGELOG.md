@@ -9,6 +9,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
 
 ### Added
 
+- `sammy_ta181_oracle` tests the Ta-181 forward model of `fit_counts` against
+  SAMMY at the VENUS bins, 300 K and 1100 K: the unbroadened and free-gas
+  cross sections, the Ikeda-Carpenter pulse fold, and a temperature fit. The
+  references and their generator are in `tests/data/sammy-ta181`.
 - R-Matrix Limited (LRF=7) ranges in the Reich-Moore form (KRM=3) are
   evaluated: neutron, eliminated-capture, neutral exit (such as inelastic)
   and charged-particle exit channels, the last with Coulomb penetrabilities
