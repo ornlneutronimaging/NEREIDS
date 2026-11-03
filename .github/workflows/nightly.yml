@@ -12,8 +12,8 @@ permissions:
   contents: read
 
 jobs:
-  # The shards balance the measured run times of the tests. libtest filters
-  # match substrings, so "rest" also runs each new or renamed ignored test.
+  # The shards balance the measured run times of the tests. "rest" skips the
+  # tests that the other shards select and runs all other ignored tests.
   slow-tests:
     name: Slow tests (${{ matrix.os }}, ${{ matrix.shard }})
     runs-on: ${{ matrix.os }}
@@ -53,7 +53,7 @@ jobs:
           save-if: false
       # One test at a time: each test gets the whole rayon pool, and the log
       # gives the run time of each test.
-      - run: cargo test --workspace --exclude nereids-python -- --ignored --test-threads=1 ${{ matrix.filter }}
+      - run: cargo test --workspace --exclude nereids-python --no-fail-fast -- --ignored --test-threads=1 ${{ matrix.filter }}
 
   coverage:
     name: Coverage
