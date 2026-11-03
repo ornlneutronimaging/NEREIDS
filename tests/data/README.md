@@ -31,3 +31,30 @@ The retained aggregated VENUS Hf spectrum has `energies_ev`, `sample_counts`,
 cube. An energy-center array is not a substitute for the original time-bin
 edges required by the counts API; this archive is research evidence, not an
 end-to-end counts-fitting validation fixture.
+
+## sammy-ta181
+
+`crates/nereids-pipeline/tests/sammy_ta181_oracle.rs` compares NEREIDS with
+these SAMMY references for VENUS Ta-181 thermometry. S2 compares the free-gas
+transmission and its slope per K, folded over the bins with only the prompt
+Ikeda-Carpenter term (α = 2 per µs, R = 0). S2b fits the temperature with
+`fit_counts` to counts made from the S2 references. No test compares the counts
+that `fit_counts` predicts.
+
+| File | Content |
+|---|---|
+| `Ta-181-mf2.endf` | MF1 MT451 and MF2 MT151 of ENDF/B-VIII.1 MAT 7328, with the CRLF bytes of the tape (MD5 `e9cae860785d7ea503430300e4428663`). |
+| `s2_rpi_alpha2.txt` | SAMMY transmission at each VENUS bin centre, at 299, 300, 301, 1099, 1100 and 1101 K. |
+| `eps_s.txt` | SAMMY's convergence at 300 K and 1100 K. |
+| `generate.py` | Writes the files above. |
+
+The bins are t_j = 1.12 + 0.16 j µs (L = 25 m) with a centre energy from 7.8 to
+200 eV. SAMMY is `8.1.pre-b1 - 0aa6ee20` (`sammy` MD5
+`ef403c81ef531ae3511eb007f6c0080e`). Its RPI input has a 1 ns burst, which
+selects the general RPI routine. Without a burst, `Chantd`
+(`src/rpi/mrpi6.f90`, line 758) multiplies the small-delay kernel by an extra X.
+
+```sh
+python3 tests/data/sammy-ta181/generate.py endf <ENDF/B-VIII.1 Ta-181 tape>
+python3 tests/data/sammy-ta181/generate.py sammy <sammy executable> <work directory> --jobs 8
+```

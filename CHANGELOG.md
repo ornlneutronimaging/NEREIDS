@@ -9,6 +9,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
 
 ### Added
 
+- `sammy_ta181_oracle` compares the pulse-folded Ta-181 transmission and a
+  `fit_counts` temperature fit with SAMMY at the VENUS bins.
 - R-Matrix Limited (LRF=7) ranges in the Reich-Moore form (KRM=3) are
   evaluated: neutron, eliminated-capture, neutral exit (such as inelastic)
   and charged-particle exit channels, the last with Coulomb penetrabilities

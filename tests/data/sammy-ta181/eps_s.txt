@@ -1,0 +1,4 @@
+# SAMMY 8.1.pre-b1 - 0aa6ee20: eps_S = max|T(NXTRA = 29) - T(NXTRA = 99)| over the bins.
+# Columns: temperature (K), eps_S.
+300 9.750000e-08
+1100 9.390000e-08
