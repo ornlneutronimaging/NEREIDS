@@ -53,7 +53,7 @@ jobs:
           save-if: false
       # One test at a time: each test gets the whole rayon pool, and the log
       # gives the run time of each test.
-      - run: cargo test --workspace --exclude nereids-python -- --ignored --test-threads=1 ${{ matrix.filter }}
+      - run: cargo test --workspace --exclude nereids-python --no-fail-fast -- --ignored --test-threads=1 ${{ matrix.filter }}
 
   coverage:
     name: Coverage
