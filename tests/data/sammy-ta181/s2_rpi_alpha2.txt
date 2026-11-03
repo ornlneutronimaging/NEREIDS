@@ -1,5 +1,5 @@
 # SAMMY 8.1.pre-b1 - 0aa6ee20; Ta-181-mf2.endf (ENDF/B-VIII.1 MAT 7328, Reich-Moore) at the
-# e_center_ev of bins.txt, in bins.txt order. Written by generate.py sammy.
+# VENUS bin-centre energies, in time order. Written by generate.py sammy.
 # Transmission, n = 7.04e-4 atoms/b, free-gas Doppler and the RPI resolution
 # function: chi-squared term only, Lambda0 = 500.0 ns (alpha = 2 per us), a 1 ns
 # Gaussian burst, square channel 160 ns, not shifted to centre, L = 25 m; NXTRA = 29; SAMMY.LST column 8.

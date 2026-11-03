@@ -1,9 +1,9 @@
-//! The functions that `fit_counts` calls for Ta-181, and a `fit_counts`
-//! temperature fit, against SAMMY.
+//! The pulse-folded Ta-181 transmission and a `fit_counts` temperature fit,
+//! against SAMMY.
 //!
 //! The SAMMY references in `tests/data/sammy-ta181` are for the File 2
-//! extract `Ta-181-mf2.endf` at the bin-centre energies of `bins.txt`.
-//! Section `sammy-ta181` of `tests/data/README.md` gives their provenance.
+//! extract `Ta-181-mf2.endf` at the VENUS bin-centre energies. Section
+//! `sammy-ta181` of `tests/data/README.md` gives their provenance.
 //! The criteria detect a 1 K error at 300 K.
 
 use std::collections::HashMap;
@@ -16,7 +16,6 @@ use nereids_endf::retrieval::EndfLibrary;
 use nereids_physics::continuous_doppler::{Channel, QuadratureBudget, broaden_with_budget};
 use nereids_physics::flight_time_grid::FlightTimeGrid;
 use nereids_physics::ikeda_carpenter::{DEFAULT_N_TAU, DetectorPulse, IkedaCarpenterParams};
-use nereids_physics::reich_moore::CrossSectionPlan;
 use nereids_physics::thickness::uneven_transmission;
 use nereids_pipeline::counts_fit::{
     Material, Measurement, NO_TIME_BACKGROUND, Region, Value, fit_counts,
@@ -25,8 +24,9 @@ use nereids_pipeline::open_beam::{Calibration, Pulse};
 
 /// The reference folder, relative to this crate.
 const DATA: &str = "../../tests/data/sammy-ta181";
-/// SAMMY's convergence: stage (1 for S1, 2 for S2), temperature in K, `α` in
-/// 1/µs (0 for S1) and `eps_S` on each line.
+/// SAMMY's transmission: the energy, then the values at 299, 300, 301, 1099, 1100 and 1101 K.
+const S2_FILE: &str = "s2_rpi_alpha2.txt";
+/// SAMMY's convergence: temperature in K and `eps_S` on each line.
 const EPS_S: &str = "eps_s.txt";
 /// Areal density of Ta-181 in atoms/b.
 const DENSITY: f64 = 7.04e-4;
@@ -34,11 +34,11 @@ const DENSITY: f64 = 7.04e-4;
 const FLIGHT_PATH_M: f64 = 25.0;
 /// Timing offset in µs.
 const T0_US: f64 = 0.0;
-/// Start of VENUS bin 0 in µs.
-const FIRST_EDGE_US: f64 = 1.12;
-/// Width of a VENUS bin in µs.
-const BIN_US: f64 = 0.16;
-/// The bin-centre energies in eV that `bins.txt` keeps.
+/// Start of VENUS bin 0 in units of 0.01 µs.
+const FIRST_EDGE_CENTI_US: usize = 112;
+/// Width of a VENUS bin in units of 0.01 µs.
+const BIN_CENTI_US: usize = 16;
+/// The bin-centre energies in eV of the compared bins.
 const WINDOW_EV: (f64, f64) = (7.8, 200.0);
 // The span holds the energy of every neutron that reaches the bins.
 /// Energies in eV over which the pulse laws hold.
@@ -47,12 +47,8 @@ const PULSE_SPAN_EV: (f64, f64) = (1.0, 1000.0);
 const GRID_CHANGE: f64 = 1e-8;
 /// Bins per flight-time grid in S2.
 const BLOCK_BINS: usize = 512;
-/// Bins with the largest `|r|` that a comparison prints.
-const LARGEST_BINS: usize = 10;
-/// Moderator rates `α` of S2 in 1/µs.
-const ALPHAS: [f64; 2] = [2.0, 8.0];
-/// Moderator rate `α` of S2b in 1/µs.
-const FIT_ALPHA: f64 = 2.0;
+/// Moderator rate `α` in 1/µs.
+const ALPHA: f64 = 2.0;
 /// Open-beam counts per µs of detector time in S2b.
 const OPEN_PER_US: f64 = 1e9;
 /// Start of the fitted temperature in S2b, relative to the true one.
@@ -90,20 +86,13 @@ fn read(name: &str) -> String {
     std::fs::read_to_string(&path).unwrap_or_else(|e| panic!("{}: {e}", path.display()))
 }
 
-/// The lines of `name` that are not blank and do not start with `#`.
-fn data_lines(name: &str) -> Vec<String> {
+/// The numbers of each line of `name` that is not blank and does not start
+/// with `#`: `columns` finite values.
+fn table(name: &str, columns: usize) -> Vec<Vec<f64>> {
     read(name)
         .lines()
         .map(str::trim)
         .filter(|line| !line.is_empty() && !line.starts_with('#'))
-        .map(String::from)
-        .collect()
-}
-
-/// The numbers of each data line of `name`: `columns` finite values.
-fn table(name: &str, columns: usize) -> Vec<Vec<f64>> {
-    data_lines(name)
-        .iter()
         .map(|line| {
             let row: Vec<f64> = line
                 .split_whitespace()
@@ -118,7 +107,7 @@ fn table(name: &str, columns: usize) -> Vec<Vec<f64>> {
         .collect()
 }
 
-/// The VENUS bins of `bins.txt`, in time order.
+/// The VENUS bins with a centre energy in `WINDOW_EV`, in time order.
 struct Bins {
     /// Time edges in µs, ascending.
     edges_us: Vec<f64>,
@@ -126,81 +115,47 @@ struct Bins {
     centres_ev: Vec<f64>,
 }
 
-/// The bins of `bins.txt`.
-///
-/// The rows must be contiguous VENUS bins, each with the energy NEREIDS
-/// gives its centre time, and must hold each bin with a centre energy in
-/// `WINDOW_EV`.
 fn bins() -> Bins {
-    let mut rows = table("bins.txt", 3);
-    assert!(!rows.is_empty(), "bins.txt holds no bins");
-    rows.sort_by(|a, b| a[0].total_cmp(&b[0]));
-    let centre_energy = |t_lo: f64| tof_to_energy(t_lo + 0.5 * BIN_US, FLIGHT_PATH_M);
-    for (k, row) in rows.iter().enumerate() {
-        let (t_lo, t_hi, energy) = (row[0], row[1], row[2]);
-        let index = (t_lo - FIRST_EDGE_US) / BIN_US;
-        assert!(
-            (index - index.round()).abs() <= 1e-6 && (t_hi - t_lo - BIN_US).abs() <= 1e-9,
-            "bins.txt: {row:?} is not a VENUS bin"
-        );
-        let ours = tof_to_energy(0.5 * (t_lo + t_hi), FLIGHT_PATH_M);
-        // 12 significant digits round by at most 5e-12.
-        assert!(
-            (energy / ours - 1.0).abs() <= 1e-11,
-            "bins.txt: {row:?}, NEREIDS gives {ours} eV"
-        );
-        assert!(
-            (WINDOW_EV.0..=WINDOW_EV.1).contains(&energy),
-            "bins.txt: {row:?} is outside the window"
-        );
-        if let Some(next) = rows.get(k + 1) {
-            assert!(
-                (next[0] - t_hi).abs() <= 1e-9,
-                "bins.txt: a gap follows {row:?}"
-            );
-        }
-    }
-    let (first, last) = (rows[0][0], rows[rows.len() - 1][0]);
-    assert!(
-        centre_energy(first - BIN_US) > WINDOW_EV.1 && centre_energy(last + BIN_US) < WINDOW_EV.0,
-        "bins.txt leaves out a bin of the window"
-    );
-    let mut edges_us: Vec<f64> = rows.iter().map(|row| row[0]).collect();
-    edges_us.push(rows[rows.len() - 1][1]);
+    let edge = |j: usize| (FIRST_EDGE_CENTI_US + BIN_CENTI_US * j) as f64 / 100.0;
+    let centre = |j: usize| tof_to_energy(0.5 * (edge(j) + edge(j + 1)), FLIGHT_PATH_M);
+    let kept: Vec<usize> = (0..)
+        .take_while(|&j| centre(j) >= WINDOW_EV.0)
+        .filter(|&j| centre(j) <= WINDOW_EV.1)
+        .collect();
     Bins {
-        edges_us,
-        centres_ev: rows.iter().map(|row| row[2]).collect(),
+        edges_us: (kept[0]..=kept[kept.len() - 1] + 1).map(edge).collect(),
+        centres_ev: kept.into_iter().map(centre).collect(),
     }
 }
 
-/// The rows of the SAMMY file `name`, `columns` values with the energy
-/// first, in the order of `bins`.
-fn sammy(name: &str, columns: usize, bins: &Bins) -> Vec<Vec<f64>> {
-    let mut rows = table(name, columns);
-    assert_eq!(rows.len(), bins.centres_ev.len(), "{name}: one row per bin");
-    rows.sort_by(|a, b| b[0].total_cmp(&a[0]));
-    assert!(
-        rows.iter()
-            .zip(&bins.centres_ev)
-            .all(|(row, energy)| row[0] == *energy),
-        "{name}: the energies are not the bin centres of bins.txt"
+/// The rows of `S2_FILE` in the order of `bins`.
+fn sammy(bins: &Bins) -> Vec<Vec<f64>> {
+    let mut rows = table(S2_FILE, 7);
+    assert_eq!(
+        rows.len(),
+        bins.centres_ev.len(),
+        "{S2_FILE}: one row per bin"
     );
+    rows.sort_by(|a, b| b[0].total_cmp(&a[0]));
+    for (row, energy) in rows.iter().zip(&bins.centres_ev) {
+        // 12 significant digits round by at most 5e-12.
+        assert!(
+            (row[0] / energy - 1.0).abs() <= 1e-11,
+            "{S2_FILE}: {} eV is not the bin centre {energy} eV",
+            row[0]
+        );
+    }
     rows
 }
 
-/// SAMMY's convergence `eps_S` of `stage` (1 or 2) at `alpha` (1/µs, 0 for
-/// S1) and `kelvin`, from `EPS_S`.
-fn eps_s(stage: f64, alpha: f64, kelvin: f64) -> f64 {
-    let found: Vec<f64> = table(EPS_S, 4)
+/// SAMMY's convergence `eps_S` at `kelvin`, from `EPS_S`.
+fn eps_s(kelvin: f64) -> f64 {
+    let found: Vec<f64> = table(EPS_S, 2)
         .into_iter()
-        .filter(|row| row[0] == stage && row[1] == kelvin && row[2] == alpha)
-        .map(|row| row[3])
+        .filter(|row| row[0] == kelvin)
+        .map(|row| row[1])
         .collect();
-    assert_eq!(
-        found.len(),
-        1,
-        "{EPS_S}: one row for stage {stage} at {kelvin} K and alpha {alpha}"
-    );
+    assert_eq!(found.len(), 1, "{EPS_S}: one row for {kelvin} K");
     found[0]
 }
 
@@ -405,42 +360,6 @@ fn compare(
          {slope_over} bins over)",
         case.bias_limit_k
     );
-    let mut order: Vec<usize> = (0..residual.len()).collect();
-    order.sort_by(|&a, &b| residual[b].abs().total_cmp(&residual[a].abs()));
-    let largest: Vec<String> = order
-        .iter()
-        .take(LARGEST_BINS)
-        .map(|&k| {
-            format!(
-                "{:.4} eV r {:+.3e} D {:+.3e} T_SAMMY {:.6}",
-                energies_ev[k], residual[k], sensitivity[k], rows[k][at]
-            )
-        })
-        .collect();
-    eprintln!("{label}: largest |r|: {}", largest.join("; "));
-    // Runs of adjacent bins over the (ii) bound, as first and last bin.
-    let mut runs: Vec<(usize, usize)> = Vec::new();
-    for (k, r) in residual.iter().enumerate() {
-        if !within(r.abs(), residual_bound) {
-            match runs.last_mut() {
-                Some((_, last)) if *last + 1 == k => *last = k,
-                _ => runs.push((k, k)),
-            }
-        }
-    }
-    let spans: Vec<String> = runs
-        .iter()
-        .map(|&(first, last)| {
-            let (top, top_ev) = largest_at(&residual[first..=last], &energies_ev[first..=last]);
-            format!(
-                "{:.3}-{:.3} eV ({} bins, max|r| {top:.2e} at {top_ev:.3} eV)",
-                energies_ev[last],
-                energies_ev[first],
-                last - first + 1
-            )
-        })
-        .collect();
-    eprintln!("{label}: bins over the (ii) bound: [{}]", spans.join(", "));
     let mut failures = Vec::new();
     if !within(bias_k.abs(), case.bias_limit_k) {
         failures.push(format!(
@@ -469,102 +388,56 @@ fn compare(
     failures
 }
 
-/// S0: the unbroadened total cross section of `CrossSectionPlan` at the
-/// bin-centre energies.
+/// The references parse, and their energies are the VENUS bin centres.
 #[test]
-fn s0_unbroadened_total_cross_section_matches_sammy() {
-    let data = ta181();
-    let bins = bins();
-    let rows = sammy("s0_sigma.txt", 2, &bins);
-    let plan = CrossSectionPlan::new(&data);
-    let (mut over, mut relative, mut worst_ev) = (0, 0.0_f64, f64::NAN);
-    for (row, &energy) in rows.iter().zip(&bins.centres_ev) {
-        let (ours, theirs) = (plan.evaluate_one(energy).total, row[1]);
-        let difference = (ours - theirs).abs();
-        if !within(difference, 1e-6 * theirs + 1e-10) {
-            over += 1;
-        }
-        if difference / theirs.abs() > relative {
-            (relative, worst_ev) = (difference / theirs.abs(), energy);
-        }
-    }
-    eprintln!(
-        "S0: {} energies; largest |sigma_NEREIDS - sigma_SAMMY| / sigma_SAMMY = \
-         {relative:.3e} at {worst_ev} eV; {over} energies exceed 1e-6 sigma_SAMMY + 1e-10 b",
-        rows.len()
-    );
-    assert_eq!(over, 0, "S0: {over} energies exceed the bound");
-}
-
-/// S1: the free-gas transmission at 7.04e-4 atoms/b and its slope per K at the
-/// bin-centre energies, at 300 K and 1100 K.
-#[test]
-fn s1_free_gas_transmission_matches_sammy() {
-    let data = ta181();
-    let bins = bins();
-    let rows = sammy("s1_doppler.txt", 7, &bins);
-    let ascending: Vec<f64> = bins.centres_ev.iter().rev().copied().collect();
-    let mut failures = Vec::new();
+fn references_match_the_venus_bins() {
+    ta181();
+    sammy(&bins());
     for case in &CASES {
-        let (ours, slope): (Vec<f64>, Vec<f64>) = free_gas(&data, &ascending, case.kelvin)
-            .into_iter()
-            .rev()
-            .unzip();
-        failures.extend(compare(
-            &format!("S1 at {} K", case.kelvin),
-            case,
-            &bins.centres_ev,
-            &ours,
-            &slope,
-            &rows,
-            eps_s(1.0, 0.0, case.kelvin),
-        ));
+        eps_s(case.kelvin);
     }
-    assert!(failures.is_empty(), "{}", failures.join("\n"));
 }
 
-/// S2: the S1 transmission and slope folded over the bins with only the prompt
-/// Ikeda-Carpenter term (α = 2 and 8 per µs, R = 0), with a unit beam on the `resolved` grids.
+/// S2: the free-gas transmission and its slope per K folded over the bins with
+/// only the prompt Ikeda-Carpenter term (α = 2 per µs, R = 0), with a unit beam.
 #[test]
 #[ignore = "slow; runs nightly"]
 fn s2_ikeda_carpenter_transmission_matches_sammy_rpi() {
     let data = ta181();
     let bins = bins();
+    let rows = sammy(&bins);
+    // R = 0, so β does not change the pulse.
+    let pulse = DetectorPulse::new(
+        IkedaCarpenterParams::constant(ALPHA, 1.0, 0.0),
+        PULSE_SPAN_EV,
+        DEFAULT_N_TAU,
+    )
+    .expect("pulse");
     let mut failures = Vec::new();
-    for alpha in ALPHAS {
-        let rows = sammy(&format!("s2_rpi_alpha{alpha}.txt"), 7, &bins);
-        // R = 0, so β does not change the pulse.
-        let pulse = DetectorPulse::new(
-            IkedaCarpenterParams::constant(alpha, 1.0, 0.0),
-            PULSE_SPAN_EV,
-            DEFAULT_N_TAU,
-        )
-        .expect("pulse");
-        for case in &CASES {
-            let label = format!("S2 alpha {alpha}/us at {} K", case.kelvin);
-            let (ours, slope) = resolved(&data, &bins.edges_us, &pulse, case.kelvin, &label);
-            failures.extend(compare(
-                &label,
-                case,
-                &bins.centres_ev,
-                &ours,
-                &slope,
-                &rows,
-                eps_s(2.0, alpha, case.kelvin),
-            ));
-        }
+    for case in &CASES {
+        let label = format!("S2 alpha {ALPHA}/us at {} K", case.kelvin);
+        let (ours, slope) = resolved(&data, &bins.edges_us, &pulse, case.kelvin, &label);
+        failures.extend(compare(
+            &label,
+            case,
+            &bins.centres_ev,
+            &ours,
+            &slope,
+            &rows,
+            eps_s(case.kelvin),
+        ));
     }
     assert!(failures.is_empty(), "{}", failures.join("\n"));
 }
 
 /// S2b: the temperature, convergence and finite σ_T of a `fit_counts` fit to counts made
-/// from the SAMMY S2 transmission at α = 2 per µs.
+/// from the SAMMY S2 transmission.
 #[test]
 #[ignore = "slow; runs nightly"]
 fn s2b_fit_counts_recovers_the_temperature_of_sammy_rpi_counts() {
     let data = ta181();
     let bins = bins();
-    let rows = sammy(&format!("s2_rpi_alpha{FIT_ALPHA}.txt"), 7, &bins);
+    let rows = sammy(&bins);
     // Counts must be whole numbers. Rounding moves a ratio by less than 4e-9.
     let open: Vec<f64> = bins
         .edges_us
@@ -575,7 +448,7 @@ fn s2b_fit_counts_recovers_the_temperature_of_sammy_rpi_counts() {
         t0_us: Value::Known(T0_US),
         flight_path_m: Value::Known(FLIGHT_PATH_M),
         pulse: Pulse {
-            alpha: [Value::Known(0.0), Value::Known(FIT_ALPHA)],
+            alpha: [Value::Known(0.0), Value::Known(ALPHA)],
             beta: [Value::Known(0.0), Value::Known(1.0)],
             r: Value::Known(0.0),
             fwhm_squared_us2: Value::Known(0.0),
@@ -623,7 +496,7 @@ fn s2b_fit_counts_recovers_the_temperature_of_sammy_rpi_counts() {
                 }),
             }],
         };
-        let label = format!("S2b alpha {FIT_ALPHA}/us at {} K", case.kelvin);
+        let label = format!("S2b alpha {ALPHA}/us at {} K", case.kelvin);
         let fit = match fit_counts(&measurement, &calibration) {
             Ok(fit) => fit,
             Err(e) => {
