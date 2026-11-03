@@ -44,7 +44,8 @@ counts on detector time-bin edges. State which result a change supports.
 Each PR gets one review round. The maintainer decides if it needs another.
 In Claude Code, the `pr-review` skill runs the round.
 
-1. Open the PR. CodeRabbit reviews it automatically.
+1. Open the PR. When CodeRabbit skips or rate-limits its review, a maintainer
+   asks for it with `@coderabbitai review`.
 2. Review the PR diff with Claude and with Codex.
 3. Collect the CodeRabbit, Claude and Codex findings in one fix table. Do not
    fix a comment when it arrives.

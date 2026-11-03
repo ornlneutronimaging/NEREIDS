@@ -17,10 +17,10 @@ to the round.
 2. Use a clean worktree at the PR head (`gh pr view <N> --json headRefOid`).
    Fetch the PR base branch in it, so that the base commit is present.
 3. Wait for CodeRabbit. Its review of the PR head is complete when the
-   `CodeRabbit` check passes (`gh pr checks <N> --json name,state`).
-   CodeRabbit reviews a new PR automatically. When its walkthrough comment
-   says that the review was skipped or rate-limited, tell the maintainer.
-   Post `@coderabbitai review` only with the maintainer's approval.
+   `CodeRabbit` check passes (`gh pr checks <N> --json name,state`). When
+   its walkthrough comment says that the review was skipped or rate-limited,
+   tell the maintainer. Post `@coderabbitai review` only with the
+   maintainer's approval.
 
 ## 2. Run the review workflow
 
