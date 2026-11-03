@@ -91,7 +91,10 @@ invariants and `# Safety`/`# Errors`/`# Panics`. See `AGENTS.md`.
 2. Make your changes with atomic, well-described commits
 3. Ensure all three pre-commit checks pass (fmt, clippy, test)
 4. Open a PR against `main`
-5. PRs go through automated CI and code review before merge
+5. CI runs, and CodeRabbit reviews the PR. The maintainers add
+   a Claude and a Codex review and answer all findings in one round of fixes
+6. A maintainer asks for a second round with `@coderabbitai review` when one
+   is necessary; CodeRabbit does not review new commits automatically
 
 ### Branch Naming
 
