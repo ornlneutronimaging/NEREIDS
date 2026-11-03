@@ -17,3 +17,7 @@ reviews:
       enabled: false
     autofix:
       enabled: false
+    fix_ci:
+      enabled: false
+    resolve_merge_conflict:
+      enabled: false
