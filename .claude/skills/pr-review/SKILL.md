@@ -8,7 +8,8 @@ description: Run one review round on a NEREIDS pull request. The round collects 
 One round collects all review findings, plans the fixes, applies them, and
 stops. The maintainer decides if another round is necessary. Do not fix a
 review comment when it arrives, also when the desktop app relays it: add it
-to the round.
+to the round. Do not reply to or resolve review threads unless the
+maintainer asks.
 
 ## 1. Prepare
 
@@ -35,22 +36,23 @@ Call the Workflow tool with `name: "pr-review"` and these args:
 | `sinceSha` | Round 2 and later: the PR head that the previous round reviewed. |
 | `sammyRoot` | The SAMMY source tree, when one is available. |
 
-The workflow changes no repository file. It stops with an error when the
-worktree is not a clean checkout of the PR head, when the base commit is
-missing, or when CodeRabbit has not reviewed the PR head. It returns:
+The workflow changes no repository file. When a check before the review
+fails, it stops with an error that names the cause. It returns:
 
 - `table`: one row for each defect, with the original findings, the check by
   another model family, and the fix assessment.
 - `plan`: the fix items, one commit each, and the rows in `notFixed`.
-- `planReviews`: the Codex risk reviews of the plan.
+- `planReviews`: the Codex risk reviews of the plan and of each decision to
+  leave a row unfixed.
 - `status`:
-  - `approved`: the Codex risk review accepts the plan, and each decision
-    to leave a row unfixed.
-  - `plan-rejected`: the risk review still finds a high risk after one
-    revision.
+  - `approved`: the last risk review approves the plan, and the plan has
+    items.
+  - `plan-rejected`: the last risk review does not approve the plan.
   - `incomplete`: a step failed or lost data; `gaps` gives each cause.
-  - `needs-decision`: the plan is empty, and some rows need a decision.
-  - `nothing-to-fix`: the risk review accepts that no row needs a change.
+  - `needs-decision`: the risk review approves an empty plan, and some rows
+    need a decision.
+  - `nothing-to-fix`: there are no findings, or the risk review approves an
+    empty plan and no row needs a decision.
 - `gaps` and `warnings`: report each one.
 
 ## 3. Apply the plan
@@ -70,10 +72,6 @@ Push the branch once, after all items pass. When the PR adds or changes an
 `#[ignore]` test, run `nightly.yml` on the PR branch after the push. Report
 the result of each such test on each OS.
 
-Rows with the choice `decide` go to the maintainer. Rows with the choice
-`defer` get a follow-up task. Do not reply to or resolve review threads
-unless the maintainer asks.
-
 ## 4. Report and stop
 
 Send the maintainer:
@@ -88,6 +86,7 @@ Send the maintainer:
    Fix depth gives the recursion risk, and whether the fix is the root fix
    or the smallest fix.
 3. Each `decide` row, as a question with at most two options.
-4. The gaps and the warnings.
+4. Each `defer` row, with its follow-up task.
+5. The gaps and the warnings.
 
 Then stop. The maintainer decides if a second round is necessary.
