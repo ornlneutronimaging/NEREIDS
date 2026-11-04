@@ -324,14 +324,9 @@ fn a_resonance_broadened_in_the_lattice_matches_sammy_s_crystal_lattice_model() 
         Channel::Total,
     )
     .expect("broadened");
-    let plan = CrossSectionPlan::new(&data);
-    for (k, &[energy, lattice, bare]) in answers.iter().enumerate() {
-        let broadened = ours.values[k] / lattice - 1.0;
-        let unbroadened = plan.evaluate_one(energy).total / bare - 1.0;
-        assert!(
-            (broadened - unbroadened).abs() <= 1e-5,
-            "{energy}: {broadened:e} {unbroadened:e}"
-        );
+    for (k, &[energy, lattice, _]) in answers.iter().enumerate() {
+        let residual = ours.values[k] / lattice - 1.0;
+        assert!(residual.abs() <= 1e-5, "{energy}: {residual:e}");
     }
 }
 
